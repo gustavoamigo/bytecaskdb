@@ -965,10 +965,13 @@ struct bc_ctx {
   // Bytes, which a move of the vector keeps where it is.
   // Each group's key is held once, in `index`; `order` points at it, in
   // first-appearance order (a map node never moves). Group i's slots are
-  // values[i * slots, (i + 1) * slots).
+  // values[i * slots, (i + 1) * slots). A group's handle is first + i:
+  // bc_agg_clear moves `first` past every group it drops, so a handle of
+  // one is stale, never another group's.
   struct Agg {
     std::uint64_t gen{0};
     std::uint32_t slots{0};
+    std::uint32_t first{0};
     std::map<Bytes, std::uint32_t, BytesLess> index;
     std::vector<const Bytes*> order;
     std::vector<SlotKind> kinds;  // per slot, the same in every group
@@ -4121,6 +4124,12 @@ bool bc_hash_next(bc_ctx* cx, bc_hash_iter h, bc_view* payload) {
 
 static_assert(2 * sizeof(bc_ctx::Agg) <= kAggBytes);
 
+// What a group of `a` whose key is `key_bytes` long is charged, and
+// released by bc_agg_clear.
+static auto group_bytes(const bc_ctx::Agg& a, std::size_t key_bytes) -> std::uint64_t {
+  return key_bytes + kGroupEntryBytes + std::uint64_t{a.slots} * kAggSlotBytes;
+}
+
 // A group's handle names its index in the aggregate, with the aggregate's
 // generation. Opening one charges kAggBytes and its slots' kinds; a new
 // group charges its key's bytes, kGroupEntryBytes, the
@@ -4139,19 +4148,42 @@ bc_agg bc_agg_open(bc_ctx* cx, uint32_t slots) {
   BC_GUARD_END(cx)
   return {};
 }
+// Drops every group, and releases what each was charged; the slots keep
+// their kinds. Refused once bc_agg_next has started on it.
+void bc_agg_clear(bc_ctx* cx, bc_agg a) {
+  BC_GUARD_BEGIN
+  auto* agg = cx->resolve_handle(a, cx->aggs, "aggregate");
+  if (agg == nullptr || !cx->ok()) return;
+  if (agg->next != 0) {
+    cx->fail(BC_E_HANDLE, "an aggregate cleared after bc_agg_next");
+    return;
+  }
+  std::uint64_t released = 0;
+  for (const auto& [key, i] : agg->index) released += group_bytes(*agg, key.size());
+  agg->first += static_cast<std::uint32_t>(agg->order.size());
+  agg->index.clear();
+  agg->order.clear();
+  agg->values.clear();
+  cx->release(released);
+  BC_GUARD_END(cx)
+}
 bc_group bc_agg_group(bc_ctx* cx, bc_agg a, bc_view group_key) {
   BC_GUARD_BEGIN
   auto* agg = cx->resolve_handle(a, cx->aggs, "aggregate");
   if (agg == nullptr) return {};
   auto key = cx->resolve(group_key);
   if (!key || !cx->ok()) return {};
-  if (auto it = agg->index.find(*key); it != agg->index.end()) return {it->second, agg->gen};
-  if (!cx->take(key->size() + kGroupEntryBytes + std::uint64_t{agg->slots} * kAggSlotBytes)) return {};
+  if (auto it = agg->index.find(*key); it != agg->index.end()) return {agg->first + it->second, agg->gen};
   auto i = static_cast<std::uint32_t>(agg->order.size());
+  if (i >= kNoEntry - agg->first) {
+    cx->fail(BC_E_LIMIT, "an aggregate of 2^32 groups");
+    return {};
+  }
+  if (!cx->take(group_bytes(*agg, key->size()))) return {};
   agg->values.resize(agg->values.size() + agg->slots);
   auto it = agg->index.emplace(Bytes(key->begin(), key->end()), i).first;
   agg->order.push_back(&it->first);
-  return {i, agg->gen};
+  return {agg->first + i, agg->gen};
   BC_GUARD_END(cx)
   return {};
 }
@@ -4164,7 +4196,7 @@ namespace {
 auto group_agg(bc_ctx* cx, bc_group g) -> bc_ctx::Agg* {
   if (!cx->ok()) return nullptr;
   auto it = std::ranges::lower_bound(cx->aggs, g.g, {}, &bc_ctx::Agg::gen);
-  if (it == cx->aggs.end() || it->gen != g.g || g.i >= it->order.size()) {
+  if (it == cx->aggs.end() || it->gen != g.g || g.i < it->first || g.i - it->first >= it->order.size()) {
     cx->fail(BC_E_HANDLE, "stale or foreign group");
     return nullptr;
   }
@@ -4198,7 +4230,7 @@ auto fold_slot(bc_ctx* cx, bc_group g, std::uint32_t slot, SlotKind kind) -> Slo
     return nullptr;
   }
   k = kind;
-  return &agg->values[std::size_t{g.i} * agg->slots + slot];
+  return &agg->values[std::size_t{g.i - agg->first} * agg->slots + slot];
 }
 
 // The slot a read goes to, with its kind; nullptr and BC_E_HANDLE for a
@@ -4216,7 +4248,7 @@ auto read_slot(bc_ctx* cx, bc_group g, std::uint32_t slot, std::optional<bool> f
                               (*f64 ? "a double" : "an integer"));
     return nullptr;
   }
-  return &agg->values[std::size_t{g.i} * agg->slots + slot];
+  return &agg->values[std::size_t{g.i - agg->first} * agg->slots + slot];
 }
 
 }  // namespace
@@ -4288,7 +4320,7 @@ bool bc_agg_next(bc_ctx* cx, bc_agg a, bc_view* group_key, bc_group* g) {
   cx->begin_step(a.i, bc_ctx::Loop::Agg, agg->scope);
   const auto& k = *agg->order[i];
   if (group_key != nullptr) *group_key = cx->make_view(k.data(), k.size());
-  if (g != nullptr) *g = {static_cast<std::uint32_t>(i), agg->gen};
+  if (g != nullptr) *g = {agg->first + static_cast<std::uint32_t>(i), agg->gen};
   return cx->ok();
   BC_GUARD_END(cx)
   return {};

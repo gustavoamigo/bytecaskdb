@@ -101,8 +101,12 @@ kind the transformer doesn't take is refused with its position.
   DISTINCT`.
 - A column the select list, `ORDER BY` or `HAVING` names must be grouped,
   or of a table whose whole primary key is grouped: PostgreSQL's
-  functional dependency, which the binder honours by grouping by it too.
-  Anything else is 42803, PostgreSQL's message.
+  functional dependency. Every row of a group holds the same value of such
+  a column, so the binder lists it apart (`Aggregate::dependent`), read
+  from the group's rows, and the `GROUP BY` stays as written. Grouping by
+  it too, as this slice first did, made the same groups but could keep an
+  index's order from streaming them. Anything else is 42803, PostgreSQL's
+  message.
 - `HAVING` is a conjunction of comparisons of a grouped column or an
   aggregate with a parameter. The parameter takes the column's type, or the
   aggregate's: `COUNT`'s and an integer `SUM`'s `bigint`, a `SUM` of a

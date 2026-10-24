@@ -1392,6 +1392,42 @@ TEST_CASE("embedded API: a structure of groups compiled while its table was smal
   }
 }
 
+TEST_CASE("embedded API: a streamed COUNT(DISTINCT) holds only its group's values; a structure's count takes their bytes",
+          "[sql][api][group][memory]") {
+  sql_test::TempDir dir{"api_group_distinct"};
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  db->execute("CREATE TABLE g (k BIGINT PRIMARY KEY, a BIGINT, v BIGINT)");
+  db->execute("CREATE INDEX g_a ON g (a)");
+  auto insert = [&](std::int64_t from, std::int64_t to) {
+    for (auto k = from; k <= to; ++k) db->execute("INSERT INTO g VALUES ($1, $1, $1)", {k});
+  };
+  insert(1, 10);
+  // Compiled at 10 rows: the structure below a count of k's range of 137,
+  // each row at least a group and a value of 476 bytes; from it g_a's order,
+  // streamed. The fixed amounts alone would count against 232.
+  // HAVING keeps the groups of more than $2 values: none at 1, so no result
+  // row is held.
+  const std::string sql = "SELECT a, count(DISTINCT v) FROM g WHERE k >= $1 GROUP BY a HAVING count(DISTINCT v) > $2";
+  const auto& st = db->prepare(sql);
+  REQUIRE(st.plan_source().find(", lo0, hi0, 137);") != std::string::npos);
+  CHECK(db->execute(st, {std::int64_t{1}, std::int64_t{0}}).rows.size() == 10);
+  // 200 rows, each its own group and value, hold about 100 KB in the
+  // structure: the count takes the stream.
+  insert(11, 200);
+  CHECK(db->execute(st, {std::int64_t{1}, std::int64_t{0}}).rows.size() == 200);
+  // 2,000: the stream clears its values as each group ends, so it holds
+  // one group's, where every group's pairs would pass 64 KiB.
+  insert(201, 2000);
+  CHECK(db->execute(st, {std::int64_t{1}, std::int64_t{1}}).rows.empty());
+  // The structure's branch, forced: 54000.
+  try {
+    (void)db->alternatives_for_testing(sql, {std::int64_t{1}, std::int64_t{1}});
+    FAIL("every plan ran");
+  } catch (const ExecError& e) {
+    CHECK(e.code() == BC_E_LIMIT);
+  }
+}
+
 TEST_CASE("embedded API: an allocation failure in a grouped plan is BC_E_MEMORY or its rows", "[sql][api][alloc][group]") {
   if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
   sql_test::TempDir dir{"api_group_faults"};

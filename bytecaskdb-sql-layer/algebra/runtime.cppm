@@ -333,6 +333,7 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_agg_max_i64", fn_addr(bc_agg_max_i64)},
       {"bc_agg_count", fn_addr(bc_agg_count)},
       {"bc_agg_next", fn_addr(bc_agg_next)},
+      {"bc_agg_clear", fn_addr(bc_agg_clear)},
       {"bc_agg_i64", fn_addr(bc_agg_i64)},
       {"bc_agg_f64", fn_addr(bc_agg_f64)},
       {"bc_agg_null", fn_addr(bc_agg_null)},

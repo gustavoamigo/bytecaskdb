@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -52,7 +53,7 @@ auto count_star(logical::NodePtr in) -> logical::NodePtr {
   agg.fn = Expr::Fn::Count;
   std::vector<logical::Output> outs;
   outs.push_back({std::move(agg), "count"});
-  return logical::node(logical::Aggregate{std::move(in), std::move(outs), {}, false});
+  return logical::node(logical::Aggregate{std::move(in), std::move(outs), {}, false, {}});
 }
 
 auto decimal(std::int64_t v, std::uint8_t scale) -> Expr {
@@ -1273,4 +1274,149 @@ TEST_CASE("search: a structure of groups that may pass the memory budget is a ch
   auto alone = generate_plan(bound::bind(ast::parse(by_v), cat), cat, by_v, counts, 10'000);
   CHECK(has(alone, "bc_agg_open"));
   CHECK_FALSE(has(alone, "bc_count_range"));
+}
+
+TEST_CASE("search: a grouped query over a hash join takes the build's choice by the budget, as the join alone does",
+          "[sql][search][cost][group][hash][memory][choice]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"t0", {Fixture::col("k", PhysType::I64, false), Fixture::col("c1", PhysType::I64, true),
+                              Fixture::col("c2", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateTableDdl{"t1", {Fixture::col("k", PhysType::I64, false), Fixture::col("c1", PhysType::I64, true)}, {"k"}});
+  const auto& cat = f.cat();
+  RowCounts counts = [](const Table& t) -> std::optional<std::uint64_t> { return t.name == "t0" ? 40 : 100; };
+  auto plan = [&](const std::string& sql, std::uint64_t budget) {
+    return generate_plan(bound::bind(ast::parse(sql), cat), cat, sql, counts, budget);
+  };
+  const std::string joined = "SELECT t0.c2 FROM t0 JOIN t1 ON t0.c1 = t1.c1";
+  const std::string grouped = "SELECT t0.c2, count(*) FROM t0 JOIN t1 ON t0.c1 = t1.c1 GROUP BY t0.c2";
+  // Built on t0's whole table, counted when the plan runs: below the count
+  // the hash join, from it t1 read once per row of t0. Grouped, the same
+  // choice, inside the structure's input.
+  const auto alone = threshold(plan(joined, 10'000));
+  REQUIRE(alone > 0);
+  auto g = plan(grouped, 10'000);
+  CHECK(threshold(g) == alone);
+  const auto below = g.source.find("if (count0 < ");
+  const auto other = g.source.find("} else {", below);
+  REQUIRE(other != std::string::npos);
+  CHECK(g.source.find("bc_agg_open") < below);
+  CHECK(g.source.find("bc_hash_open", below) < other);
+  CHECK(g.source.find("bc_hash_open", other) == std::string::npos);
+  // Under 192 bytes no hash table fits: left out, grouped or not.
+  CHECK_FALSE(has(plan(joined, 100), "bc_hash"));
+  CHECK_FALSE(has(plan(grouped, 100), "bc_hash"));
+  // With no budget, the hash join, and no count.
+  auto unbounded = plan(grouped, 0);
+  CHECK(has(unbounded, "bc_hash_open"));
+  CHECK_FALSE(has(unbounded, "bc_count_range"));
+}
+
+TEST_CASE("search: a choice point counts a NULL split of no prefix as its whole index, a hash join's build among them",
+          "[sql][search][hash][memory][choice]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"t0", {Fixture::col("k", PhysType::I64, false), Fixture::col("c1", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateTableDdl{"t1", {Fixture::col("k", PhysType::I64, false), Fixture::col("c1", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateIndexDdl{"t1_c1", "t1", {{"c1"}}});
+  const auto& cat = f.cat();
+  RowCounts counts = [](const Table& t) -> std::optional<std::uint64_t> { return t.name == "t0" ? 40 : 100; };
+  // t1_c1 in ORDER BY c1's order, NULLs last: its present values, then its
+  // NULLs. A hash join built on it counts the whole index, every plan
+  // passing check.
+  const std::string sql = "SELECT t1.k FROM t0, t1 WHERE t1.c1 = t0.c1 ORDER BY t1.c1";
+  std::vector<GeneratedPlan> all;
+  REQUIRE_NOTHROW(all = generate_alternatives(bound::bind(ast::parse(sql), cat), cat, sql, counts, 10'000));
+  auto counted = std::ranges::any_of(all, [](const GeneratedPlan& g) {
+    return has(g, "bc_view lo0 = bc_empty(cx);\n  bc_view hi0 = bc_empty(cx);\n  int64_t count0 = bc_count_range(cx, IDX_") &&
+           has(g, "built on TBL_");
+  });
+  CHECK(counted);
+}
+
+TEST_CASE("search: a column the GROUP BY's primary key determines is read from the group, never a key",
+          "[sql][search][group]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"g", {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+                             Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateIndexDdl{"g_a", "g", {{"a"}}});
+  const auto& cat = f.cat();
+  // Grouped by k, the primary key: v is the group's, and the primary key's
+  // order streams the groups, which a GROUP BY of k and v would not.
+  auto by_k = plan_sql(cat, "SELECT k, v, count(*) FROM g GROUP BY k", {{"g", 1000}});
+  CHECK(has(by_k, "bool st0 = false;"));
+  CHECK_FALSE(has(by_k, "bc_agg_open"));
+  CHECK(by_k.cost == Catch::Approx(1000));
+  // In a structure, an integer is a slot set on the group's first row,
+  // and the group's key is k's alone.
+  auto held = plan_sql(cat, "SELECT k, v, count(*) FROM g WHERE a < $1 GROUP BY k ORDER BY v", {{"g", 1000}});
+  CHECK(has(held, "bc_agg a0 = bc_agg_open(cx, 3);"));
+  CHECK(has(held, "bc_agg_min_i64(cx, gg0, 2, bc_col_i64(cx, row, COL_"));
+  std::size_t parts = 0;
+  for (auto at = held.source.find("(cx, gb0, "); at != std::string::npos; at = held.source.find("(cx, gb0, ", at + 1)) ++parts;
+  CHECK(parts == 1);
+}
+
+TEST_CASE("search: a stream reads a BOOLEAN key from a covering entry; a structure reads it from a row it holds",
+          "[sql][search][group]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"b", {Fixture::col("k", PhysType::I64, false), Fixture::col("f", PhysType::Bool, true),
+                             Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateIndexDdl{"b_f", "b", {{"f"}}});
+  const auto& cat = f.cat();
+  const std::string sql = "SELECT f, count(*) FROM b GROUP BY f";
+  RowCounts counts = [](const Table&) -> std::optional<std::uint64_t> { return 1000; };
+  auto streamed = plan_sql(cat, sql, {{"b", 1000}});
+  CHECK(has(streamed, "bc_key_part_bool"));
+  CHECK_FALSE(has(streamed, "bc_scan_row"));
+  CHECK(streamed.cost == Catch::Approx(1000));
+  // Every plan passes check: the structure over the same scan reads rows.
+  for (const auto& g : generate_alternatives(bound::bind(ast::parse(sql), cat), cat, sql, counts, 0)) {
+    if (has(g, "bc_agg_open")) CHECK(has(g, "bc_scan_row"));
+  }
+}
+
+TEST_CASE("search: with no GROUP BY, no path is built for the groups; the groups count only non-constant keys",
+          "[sql][search][cost][group]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"g", {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+                             Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateIndexDdl{"g_a", "g", {{"a"}}});
+  const auto& cat = f.cat();
+  RowCounts counts = [](const Table&) -> std::optional<std::uint64_t> { return 1000; };
+  auto all = [&](const std::string& sql) {
+    return generate_alternatives(bound::bind(ast::parse(sql), cat), cat, sql, counts, 0);
+  };
+  // One group of every row: g_a's full scan, which only an ORDER BY or a
+  // GROUP BY builds, is not a path.
+  for (const auto& g : all("SELECT count(*), max(a) FROM g")) CHECK_FALSE(has(g, "IDX_"));
+  // a = $1 makes a constant: one group. Its structure over g_a's range,
+  // covering, 100 entries: 100 + 100 x 1.3 + 1, not + 10.
+  auto least = std::numeric_limits<double>::max();
+  for (const auto& g : all("SELECT a, count(*) FROM g WHERE a = $1 GROUP BY a")) {
+    if (has(g, "bc_agg_open")) least = std::min(least, g.cost);
+  }
+  CHECK(least == Catch::Approx(100 + 100 * (1 + kHashWeight) + 1));
+}
+
+TEST_CASE("search: a structure's threshold counts its keys', held rows' and distinct values' bytes",
+          "[sql][search][group][memory]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"g", {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+                             Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateIndexDdl{"g_a", "g", {{"a"}}});
+  const auto& cat = f.cat();
+  RowCounts counts = [](const Table&) -> std::optional<std::uint64_t> { return 1000; };
+  auto plan = [&](const std::string& sql) {
+    return generate_plan(bound::bind(ast::parse(sql), cat), cat, sql, counts, 10'000);
+  };
+  // 3 slots, one COUNT(DISTINCT): 320 + 3 + 321 bytes, and per row a group,
+  // its key a's NULL marker at least, 1 + 136 + 3 x 48, and a value new to
+  // it, its key the group's (1 + 1) and v's (9), 136 + 48: past 10,000 from
+  // (10,000 - 644) / 476 + 1 = 20 rows. The fixed amounts alone would give 34.
+  CHECK(threshold(plan("SELECT a, count(DISTINCT v) FROM g WHERE k < $1 GROUP BY a")) == 20);
 }

@@ -351,7 +351,7 @@ TEST_CASE("physical: check refuses a grouped aggregate codegen can't print", "[s
   auto count = logical::expr(logical::Expr::Kind::Aggregate, SqlType{SqlKind::BigInt});
   auto rows = [] { return node(scan({p(0)}, std::monostate{})); };
   auto grouped = [&](std::vector<logical::ColumnRef> keys, bool streamed, std::vector<logical::Expr> outputs) {
-    auto g = node(physical::GroupAggregate{rows(), std::move(keys), {count}, streamed});
+    auto g = node(physical::GroupAggregate{rows(), std::move(keys), {count}, streamed, {}});
     return plan(node(physical::GroupEmit{std::move(g), std::move(outputs)}), {0});
   };
   auto key = logical::column(kId, SqlType{SqlKind::BigInt});
@@ -363,11 +363,11 @@ TEST_CASE("physical: check refuses a grouped aggregate codegen can't print", "[s
   refused(grouped({kId}, true, {logical::column(name, SqlType{SqlKind::Bytea})}), "no key or aggregate of its groups");
   // A key not an I64 is read from the row its group holds: never a covering
   // scan's entry.
-  auto covered = node(physical::GroupAggregate{node(scan({p(0)}, std::monostate{}, true)), {name}, {count}, false});
+  auto covered = node(physical::GroupAggregate{node(scan({p(0)}, std::monostate{}, true)), {name}, {count}, false, {}});
   refused(plan(node(physical::GroupEmit{std::move(covered), {count}}), {0}), "holds a covering scan's entry");
   // A HAVING compares a key or an aggregate of the groups with a parameter.
   auto having = [&](logical::Expr lhs) {
-    auto g = node(physical::GroupAggregate{rows(), {kId}, {count}, false});
+    auto g = node(physical::GroupAggregate{rows(), {kId}, {count}, false, {}});
     auto f = node(physical::Filter{std::move(g), {logical::compare(ast::Compare::Op::Gt, std::move(lhs), p(1))}});
     return plan(node(physical::GroupEmit{std::move(f), {count}}), {0});
   };
@@ -375,11 +375,31 @@ TEST_CASE("physical: check refuses a grouped aggregate codegen can't print", "[s
   refused(having(logical::column(name, SqlType{SqlKind::Bytea})), "compares no key or aggregate");
   // A sort holds a structure's groups, by its keys.
   auto sorted = [&](bool streamed, logical::ColumnRef by) {
-    auto g = node(physical::GroupAggregate{rows(), {kId}, {count}, streamed});
+    auto g = node(physical::GroupAggregate{rows(), {kId}, {count}, streamed, {}});
     auto s = node(physical::Sort{std::move(g), {{by, false, false}}, 0, {}, {}, true});
     return plan(node(physical::GroupEmit{std::move(s), {count}}), {0});
   };
   CHECK(refusal(sorted(false, kId)).empty());
   refused(sorted(true, kId), "a sort of groups not over a structure of them");
-  refused(sorted(false, name), "a sort of groups by a column not a key");
+  refused(sorted(false, name), "a sort of groups by a column not of them");
+  // A stream holds no row: its BOOLEAN key read from a covering scan's
+  // entry, as an I64's is. A structure reads it from the row it holds.
+  const logical::ColumnRef flag{1, 3, PhysType::Bool, true};
+  auto over_entry = [&](bool streamed) {
+    auto g = node(physical::GroupAggregate{node(scan({p(0)}, std::monostate{}, true)), {flag}, {count}, streamed, {}});
+    return plan(node(physical::GroupEmit{std::move(g), {count}}), {0});
+  };
+  CHECK(refusal(over_entry(true)).empty());
+  refused(over_entry(false), "holds a covering scan's entry");
+  // A dependent column is given, sorted by and compared like a key, and is
+  // none: a group of every row has none.
+  auto dependent = [&](std::vector<logical::ColumnRef> keys, std::vector<logical::ColumnRef> dep, bool streamed) {
+    auto g = node(physical::GroupAggregate{rows(), std::move(keys), {count}, streamed, std::move(dep)});
+    auto s = streamed ? std::move(g) : node(physical::Sort{std::move(g), {{name, false, false}}, 0, {}, {}, true});
+    return plan(node(physical::GroupEmit{std::move(s), {logical::column(name, SqlType{SqlKind::Bytea}), count}}), {0});
+  };
+  CHECK(refusal(dependent({kId}, {name}, false)).empty());
+  refused(dependent({kId}, {name}, true), "a streamed GROUP BY key held in no local");
+  refused(dependent({}, {name}, true), "a dependent column of one group of every row");
+  refused(dependent({kId, name}, {name}, false), "a dependent column that is a key");
 }

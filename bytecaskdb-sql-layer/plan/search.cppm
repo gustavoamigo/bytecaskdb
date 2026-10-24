@@ -473,6 +473,15 @@ auto least_past(std::uint64_t budget, std::uint64_t fixed, std::uint64_t per_ent
   return std::min<std::uint64_t>((budget - fixed) / per_entry + 1, std::uint64_t{1} << 62);
 }
 
+// The fewest bytes a sort key part of `c` holds (plan_api_design.md, *Sort
+// keys*): its marker alone where it may be NULL, else the marker and the
+// least value, 8 bytes for an integer or a DOUBLE, 1 for a BOOLEAN, 2 for an
+// empty byte string.
+auto least_part_bytes(const ColumnRef& c, bool may_be_null) -> std::uint64_t {
+  if (may_be_null) return 1;
+  return 1 + (c.type == PhysType::Bool ? 1 : c.type == PhysType::Bytes ? 2 : 8);
+}
+
 // The fewest bytes a stored row of `t` holds: its header, bitmap and fixed
 // columns, in the smallest layout its rows may have.
 auto least_row_bytes(const Table& t) -> std::uint64_t {
@@ -1424,12 +1433,16 @@ private:
   };
 
   // A choice point counting the whole range of `counted`, a NULL split's
-  // prefix: `below` under the threshold, `at_or_above` from it.
+  // prefix, which holds both of its ranges, or with no prefix the whole
+  // object (physical::check's counts_first): `below` under the threshold,
+  // `at_or_above` from it. Every choice point is made here.
   static auto choice(const Access& counted, std::int64_t threshold, physical::NodePtr below,
                      physical::NodePtr at_or_above) -> physical::NodePtr {
     physical::Choice ch;
     ch.counted = *scan_of(counted);
-    if (std::holds_alternative<physical::NullSplitScan>(counted.path)) ch.counted.rest = std::monostate{};
+    if (std::holds_alternative<physical::NullSplitScan>(counted.path)) {
+      ch.counted.rest = ch.counted.prefix.empty() ? physical::ScanRest{physical::Range{}} : physical::ScanRest{};
+    }
     ch.threshold = threshold;
     ch.below = std::move(below);
     ch.at_or_above = std::move(at_or_above);
@@ -1671,24 +1684,37 @@ private:
     return best;
   }
 
+  // What a choice point's second plan must keep of the first's: the ORDER
+  // BY's order, which a plan gives rather than sorts (`order`); the groups a
+  // streamed GROUP BY reads (`groups`); and rows, not a covering scan's
+  // entries, of the tables `rows` names, by position in FROM order, whose
+  // rows a structure of groups holds.
+  struct Needs {
+    bool order{false};
+    bool groups{false};
+    std::vector<std::size_t> rows;
+  };
+
   // The plan's choice points, at most kMaxChoices: at each table it reads by
   // a scan, outer first, the second plan is the cheapest other range of the
   // table whose cost crosses the first one's within the count of its range.
   // Never at a point lookup, nor at a scan whose bounds name at most one
   // row, nor at a full scan, whose count no parameter changes, nor at a scan
   // read once per outer row; and the second plan is never a full scan. In a
-  // plan that gives the ORDER BY by its order (`needs_order`), the loop's
+  // plan that gives the ORDER BY by its order (`needs.order`), the loop's
   // second plan gives it too, and in one that streams groups
-  // (`needs_groups`), the loop's second plan gives them in groups. A sorted
+  // (`needs.groups`), the loop's second plan gives them in groups. A sorted
   // plan of one table takes the choice by the budget (by_budget) there
   // instead, at a full scan too, its second plan any that gives the order.
   // In a sorted plan, the second plan of a loop a sorter holds reads rows,
-  // as its first does. `tried` is each table's access paths.
+  // as its first does, and so does one of a table in `needs.rows`. `tried`
+  // is each table's access paths.
   auto choose(const Query& q, const Candidate& c, const Sink& sink, const std::vector<std::vector<Tried>>& tried,
-              bool needs_order, const SortSpec* sort, bool needs_groups = false) const -> std::vector<ChoiceAt> {
+              const Needs& needs, const SortSpec* sort) const -> std::vector<ChoiceAt> {
     std::vector<ChoiceAt> out;
     const auto loop = c.driving();
-    const auto held = sort != nullptr ? held_rels(q, c) : std::vector<std::size_t>{};
+    auto held = sort != nullptr ? held_rels(q, c) : std::vector<std::size_t>{};
+    held.insert(held.end(), needs.rows.begin(), needs.rows.end());
     for (std::size_t at = 0; at <= c.steps.size() && out.size() < kMaxChoices; ++at) {
       const auto* ne = at == 0 ? nullptr : std::get_if<Nested>(&c.steps[at - 1]);
       if (at > 0 && (ne == nullptr || ne->rescan)) continue;  // a lookup by key, or a count per outer row
@@ -1707,8 +1733,8 @@ private:
       auto best_cost = 0.0;
       for (const auto& t : tried[rel]) {
         if (t.failed || t.one_row() || full_scan(t.access)) continue;
-        if (needs_order && at == loop && !t.access.ordered) continue;
-        if (needs_groups && at == loop && !t.access.grouped) continue;
+        if (needs.order && at == loop && !t.access.ordered) continue;
+        if (needs.groups && at == loop && !t.access.grouped) continue;
         const auto* sb = scan_of(t.access);
         if (sb->object == scan_of(a)->object && t.access.keyed == a.keyed) continue;  // the same range
         auto b = ne == nullptr ? t.access : read_once(t.access, ne->on);
@@ -1793,9 +1819,7 @@ private:
   auto hash_past(const Query& q, const Candidate& c, const Hashed& h) const -> std::uint64_t {
     const auto& held = q.rels[h.build_inner ? h.rel : c.first].table();
     std::uint64_t key = 0;
-    for (const auto& k : h.keys) {
-      key += 1 + (k.build.type == PhysType::Bool ? 1 : k.build.type == PhysType::Bytes ? 2 : 8);
-    }
+    for (const auto& k : h.keys) key += least_part_bytes(k.build, false);  // a NULL key is never put
     return least_past(memory_, kHashBytes, kHashEntryBytes + least_row_bytes(held) + key);
   }
 
@@ -1813,7 +1837,7 @@ private:
     auto out_cost = 0.0;
     for (auto o : searched.plans) {
       if (o.hash() != nullptr) continue;
-      auto s = Sink{sink.limit, sink.distinct};
+      auto s = sink;
       prepare(q, o, s, order);
       auto oc = finished_cost(s, measure(o));
       if (!out || oc < out_cost) {
@@ -1833,12 +1857,32 @@ private:
   auto finish(const Query& q, Candidate c, Sink sink, const Searched& searched, const SortSpec* order,
               const std::optional<Avoiding>& avoiding, const Wrap& wrap) const -> std::optional<Finished> {
     auto sorts = prepare(q, c, sink, order);
-    const auto* sort = sorts ? order : nullptr;
+    return finish_prepared(q, std::move(c), sink, searched, sorts ? order : nullptr, Needs{order != nullptr && !sorts, false, {}},
+                           avoiding, wrap);
+  }
+
+  // A candidate made ready (prepare, or a GROUP BY's own), finished: sorted
+  // by `sort` above it, or not; a hash join by finish_hash, any other plan
+  // its choice points by costs chosen (choose), keeping what `needs` says.
+  // Its rows built and wrapped, its cost the sink's plus each count's.
+  template <typename Wrap>
+  auto finish_prepared(const Query& q, Candidate c, const Sink& sink, const Searched& searched, const SortSpec* sort,
+                       Needs needs, const std::optional<Avoiding>& avoiding, const Wrap& wrap) const
+      -> std::optional<Finished> {
     if (c.hash() != nullptr) return finish_hash(q, std::move(c), sink, sort, avoiding, wrap);
-    auto choices = choose(q, c, sink, searched.tried, order != nullptr && !sorts, sort);
+    auto choices = choose(q, c, sink, searched.tried, needs, sort);
     auto b = build(q, c, choices, sort);
     auto cost = finished_cost(sink, measure(c)) + kCountCost * static_cast<double>(choices.size());
     return Finished{wrap(std::move(b.rows)), std::move(b.null_checks), std::move(b.computed), cost};
+  }
+
+  // The parameters `from`'s rows test for NULL and the values it computes,
+  // added to `into`'s: a choice point's two plans run under one check.
+  static void merge_params(Built& into, const Built& from) {
+    for (auto p : from.null_checks) add_param(into.null_checks, p);
+    for (const auto& v : from.computed) {
+      if (std::ranges::find(into.computed, v) == into.computed.end()) into.computed.push_back(v);
+    }
   }
 
   // A hash join finished (*Memory*, the planner uses the budget): its build
@@ -1865,10 +1909,7 @@ private:
     }
     if (known) return std::nullopt;
     auto ob = build(q, avoiding->plan, {}, avoiding->sort);
-    for (auto p : ob.null_checks) add_param(b.null_checks, p);
-    for (const auto& v : ob.computed) {
-      if (std::ranges::find(b.computed, v) == b.computed.end()) b.computed.push_back(v);
-    }
+    merge_params(b, ob);
     auto rows = choice(built, static_cast<std::int64_t>(past), std::move(b.rows), std::move(ob.rows));
     return Finished{wrap(std::move(rows)), std::move(b.null_checks), std::move(b.computed), cost + kCountCost};
   }
@@ -2088,29 +2129,50 @@ private:
     return g;
   }
 
-  // The least count of groups a structure of them holds past the memory
-  // budget: an aggregate of n groups holds at least kAggBytes, a byte per
-  // slot, and n × (kGroupEntryBytes and kAggSlotBytes per slot), a hash
-  // table per table whose row a group holds, kHashBytes and kHashEntryBytes
-  // per group, an aggregate per COUNT(DISTINCT), and a sorter of the groups,
-  // kSorterBytes and kSortEntryBytes per group; 0 for a budget under an
-  // empty one's.
-  auto group_past(const physical::GroupLayout& l, bool sorted) const -> std::uint64_t {
-    const std::uint64_t held = l.held.size();
-    auto fixed = kAggBytes + l.slots + held * kHashBytes + l.distinct.size() * (kAggBytes + 1) + (sorted ? kSorterBytes : 0);
-    auto per = kGroupEntryBytes + l.slots * kAggSlotBytes + held * kHashEntryBytes + (sorted ? kSortEntryBytes : 0);
-    if (memory_ < fixed) return 0;
-    return std::min<std::uint64_t>((memory_ - fixed) / per + 1, std::uint64_t{1} << 62);
+  // The least count of its input's rows past which a structure of groups
+  // may not fit the memory budget (*Memory*); 0 for a budget under an empty
+  // one's. It holds kAggBytes and a byte per slot, kHashBytes per table
+  // whose row a group holds, kAggBytes and a slot per COUNT(DISTINCT), and
+  // kSorterBytes where it sorts its groups; and per row, as if each started
+  // a group of its own and gave each COUNT(DISTINCT) a new value:
+  // - the group: its key, kGroupEntryBytes and kAggSlotBytes per slot;
+  // - per held table: the row, kHashEntryBytes and the key, new to it;
+  // - per COUNT(DISTINCT): the group's key and the value's part, as one key,
+  //   kGroupEntryBytes and one slot;
+  // - in a sort: its sort key, the group's key as payload, kSortEntryBytes.
+  // Each key part is at least least_part_bytes, each row least_row_bytes.
+  // Counting each row a group and a new value is conservative: where rows
+  // share groups or values, it switches at fewer rows than the least that
+  // would pass, never at more. Under it a structure fits whenever its rows
+  // and key parts are no larger than those bounds.
+  auto group_past(const Query& q, const physical::GroupLayout& l, const std::vector<ColumnRef>& keys,
+                  const SortSpec* sort) const -> std::uint64_t {
+    std::uint64_t key = 0;
+    for (const auto& k : keys) key += least_part_bytes(k, k.nullable);
+    auto fixed = kAggBytes + l.slots + l.held.size() * kHashBytes + l.distinct.size() * (kAggBytes + 1) +
+                 (sort != nullptr ? kSorterBytes : 0);
+    auto per = key + kGroupEntryBytes + l.slots * kAggSlotBytes;
+    for (auto t : l.held) per += least_row_bytes(q.rels[q.index_of(t)].table()) + kHashEntryBytes + key;
+    // The group's key is one byte-string part of the value's key: at least
+    // its marker and its bytes.
+    for (const auto& d : l.distinct) per += 1 + key + least_part_bytes(d, false) + kGroupEntryBytes + kAggSlotBytes;
+    if (sort != nullptr) {
+      per += kSortEntryBytes + key;
+      for (const auto& part : sort->keys) per += least_part_bytes(part.col, part.col.nullable);
+    }
+    return least_past(memory_, fixed, per);
   }
 
   // An aggregated SELECT (docs/planner_design.md, *GROUP BY as built*). For
   // each plan of its rows, the groups in a structure (bc_agg_*), and, where
   // the plan's rows come in groups, streamed with none; with no GROUP BY one
   // group, streamed. Its HAVING filters the groups, an ORDER BY its plan's
-  // order does not give sorts them, and its LIMIT counts them. A structure
-  // whose groups may pass the memory budget, where a streamed plan avoids
-  // it, is the first plan of a choice point by the count of its input's
-  // range, the cheapest streamed plan the second.
+  // order does not give sorts them, and its LIMIT counts them. Each plan is
+  // finished as an ungrouped one is (finish_prepared): a hash join takes the
+  // choice by the budget at its build, any other plan its choice points by
+  // costs. A structure whose groups may pass the memory budget, where a
+  // streamed plan avoids it, is instead the first plan of a choice point by
+  // the count of its input's range, the cheapest streamed plan the second.
   auto group_select(const logical::Node& root) -> std::vector<Finished> {
     const auto g = group_parts(root);
     const auto& agg = *g.aggregate;
@@ -2118,11 +2180,21 @@ private:
       result_.push_back({o.name, o.expr.type, o.expr.phys(),
                          o.expr.kind == Expr::Kind::Aggregate && o.expr.fn == Expr::Fn::Avg});
     }
-    std::vector<ColumnRef> keys;
-    for (const auto& e : agg.group_by) {
-      if (e.kind != Expr::Kind::Column) no_plan("a GROUP BY key that is not a column");
-      keys.push_back(e.col);
-    }
+    auto columns_of_exprs = [](const std::vector<Expr>& in, const char* what) {
+      std::vector<ColumnRef> out;
+      for (const auto& e : in) {
+        if (e.kind != Expr::Kind::Column) no_plan(what);
+        out.push_back(e.col);
+      }
+      return out;
+    };
+    const auto keys = columns_of_exprs(agg.group_by, "a GROUP BY key that is not a column");
+    const auto dependent = columns_of_exprs(agg.dependent, "a dependent column that is not a column");
+    // What a group gives of its rows: its keys, then the columns they
+    // determine.
+    auto columns = keys;
+    columns.insert(columns.end(), dependent.begin(), dependent.end());
+    auto of_group = [&](const ColumnRef& c) { return std::ranges::find(columns, c) != columns.end(); };
     std::vector<Expr> aggs;
     auto add_agg = [&](const Expr& e) {
       if (std::ranges::find(aggs, e) == aggs.end()) aggs.push_back(e);
@@ -2131,7 +2203,7 @@ private:
     for (const auto& o : agg.aggs) {
       if (o.expr.kind == Expr::Kind::Aggregate) {
         add_agg(o.expr);
-      } else if (o.expr.kind != Expr::Kind::Column || std::ranges::find(keys, o.expr.col) == keys.end()) {
+      } else if (o.expr.kind != Expr::Kind::Column || !of_group(o.expr.col)) {
         no_plan("a result column that is not grouped");
       }
       outputs.push_back(o.expr);
@@ -2142,7 +2214,7 @@ private:
       const auto& lhs = c.args[0];
       if (lhs.kind == Expr::Kind::Aggregate) {
         add_agg(lhs);
-      } else if (lhs.kind != Expr::Kind::Column || std::ranges::find(keys, lhs.col) == keys.end()) {
+      } else if (lhs.kind != Expr::Kind::Column || !of_group(lhs.col)) {
         no_plan("a HAVING conjunct that compares no grouped column or aggregate");
       }
     }
@@ -2154,16 +2226,14 @@ private:
     std::vector<OrderItem> order_by;
     if (g.sort != nullptr && (!g.limit || *g.limit > 0)) {
       for (const auto& k : g.sort->keys) {
-        if (k.expr.kind != Expr::Kind::Column || std::ranges::find(keys, k.expr.col) == keys.end()) {
-          no_plan("an ORDER BY key that is not grouped");
-        }
+        if (k.expr.kind != Expr::Kind::Column || !of_group(k.expr.col)) no_plan("an ORDER BY key that is not grouped");
         order_by.push_back({k.expr.col, k.desc, k.nulls_first});
       }
     }
     // The rows of the groups: GroupEmit over Limit? over the branch, or a
     // choice point between two.
     auto branch = [&](physical::NodePtr rows, bool streamed, const SortSpec* sort) {
-      auto n = physical::node(physical::GroupAggregate{std::move(rows), keys, aggs, streamed});
+      auto n = physical::node(physical::GroupAggregate{std::move(rows), keys, aggs, streamed, dependent});
       if (!having.empty()) n = physical::node(physical::Filter{std::move(n), having});
       if (sort != nullptr) n = physical::node(physical::Sort{std::move(n), sort->keys, sort->keep, {}, {}, true});
       return n;
@@ -2184,7 +2254,7 @@ private:
     for (const auto& rel : q.rels) constants(rel.table());
     const Tables tables = tables_of(q, 0);
     auto of_tables = [&](const ColumnRef& c) { return std::ranges::find(tables, c.table) != tables.end(); };
-    if (!std::ranges::all_of(keys, of_tables)) no_plan("a GROUP BY key that is not a column of its tables");
+    if (!std::ranges::all_of(columns, of_tables)) no_plan("a GROUP BY key that is not a column of its tables");
     for (const auto& a : aggs) {
       if (!a.args.empty() && !of_tables(a.args[0].col)) no_plan("an aggregate call that does not take a column of its tables");
     }
@@ -2199,80 +2269,88 @@ private:
     SortSpec sort{{}, g.limit.value_or(0)};
     for (const auto& o : ordered) sort.keys.push_back({o.col, o.desc, o.nulls_first});
     // The keys the WHERE does not make constant, which a stream's rows come
-    // grouped by.
+    // grouped by, and which number the groups. With no GROUP BY, no
+    // grouping: one group of every row, which any plan gives.
     std::vector<ColumnRef> grouping;
     for (const auto& k : keys) {
       const auto& where = q.rels[q.index_of(k.table)].where;
       if (std::ranges::none_of(where, [&](const auto& w) { return on_col(w, k.col) && w.op == Op::Eq; })) grouping.push_back(k);
     }
     auto distinct = std::ranges::any_of(aggs, [](const Expr& a) { return a.distinct; });
-    // A COUNT(DISTINCT) keys each value, and a key that is not an I64 is read
-    // from a row its group holds: both read rows.
-    auto may_cover = !distinct && std::ranges::all_of(keys, [](const ColumnRef& k) { return k.type == PhysType::I64; });
-    auto searched = candidates(q, ordered, agg.input->output, may_cover, false, grouping);
-    const auto layout = physical::group_layout(keys, aggs);
-    auto kept = selectivity(having);
-    auto sink_of = [&](bool hash, bool sorted) {
-      return Sink{g.limit, distinct, false, 0, 0, GroupCost{true, hash, keys.size(), kept, sorted}};
-    };
-    // Streamed: every plan whose rows come in groups, in the ORDER BY's order
-    // where it has one, since nothing holds its groups to sort them.
-    // A streamed group's keys are held in locals: integers and booleans.
-    auto streamable = std::ranges::all_of(keys, [](const ColumnRef& k) {
+    // A stream keeps its columns in locals, integers and booleans, read from
+    // a row or a covering scan's entry. A COUNT(DISTINCT) keys each value
+    // from its row; a structure's columns other than integers are read from
+    // a row its group holds, so its plan reads those tables' rows.
+    auto in_locals = std::ranges::all_of(columns, [](const ColumnRef& k) {
       return k.type == PhysType::I64 || k.type == PhysType::Bool;
     });
+    auto may_cover = !distinct && in_locals;
+    auto searched =
+        candidates(q, ordered, agg.input->output, may_cover, false, keys.empty() ? Grouping{} : Grouping{grouping});
+    const auto layout = physical::group_layout(columns, aggs);
+    std::vector<std::size_t> held;
+    for (auto t : layout.held) held.push_back(q.index_of(t));
+    auto kept = selectivity(having);
+    auto sink_of = [&](bool hash, bool sorted) {
+      return Sink{g.limit, distinct, false, 0, 0, GroupCost{true, hash, grouping.size(), kept, sorted}};
+    };
+    const auto hashes = std::ranges::any_of(searched.plans, [](const Candidate& c) { return c.hash() != nullptr; });
+    // A hash join streams only one group, of no key.
+    const auto avoiding = hashes && keys.empty() ? without_hash(q, searched, sink_of(false, false), nullptr) : std::nullopt;
+    // Streamed: every plan whose rows come in groups, in the ORDER BY's order
+    // where it has one, since nothing holds its groups to sort them.
     const Candidate* stream = nullptr;
     auto stream_cost = 0.0;
     for (const auto& c : searched.plans) {
-      if (!(keys.empty() || (streamable && c.streams())) || (!ordered.empty() && !c.ordered())) continue;
+      if (!(keys.empty() || (in_locals && c.streams())) || (!ordered.empty() && !c.ordered())) continue;
       auto sink = sink_of(false, false);
-      auto choices = choose(q, c, sink, searched.tried, !ordered.empty(), nullptr, !keys.empty());
-      auto b = build(q, c, choices, nullptr);
+      auto f = finish_prepared(q, c, sink, searched, nullptr, Needs{!ordered.empty(), !keys.empty(), {}}, avoiding,
+                               [&](physical::NodePtr rows) { return rooted(branch(std::move(rows), true, nullptr)); });
+      if (!f) continue;
       auto cost = finished_cost(sink, measure(c));
-      if (stream == nullptr || cost < stream_cost) {
+      if (c.hash() == nullptr && (stream == nullptr || cost < stream_cost)) {
         stream = &c;
         stream_cost = cost;
       }
-      out.push_back({rooted(branch(std::move(b.rows), true, nullptr)), std::move(b.null_checks), std::move(b.computed),
-                     cost + kCountCost * static_cast<double>(choices.size())});
+      out.push_back(std::move(*f));
     }
     if (keys.empty()) return out;
     // In a structure: every plan, sorted where it does not give the ORDER BY,
-    // since groups come in the order their first rows do.
-    for (const auto& c : searched.plans) {
+    // since groups come in the order their first rows do, each table whose
+    // row it holds read by rows; a hash join's other plan, by the budget, of
+    // those plans too.
+    auto structured = searched;
+    if (!held.empty()) {
+      for (auto& c : structured.plans) {
+        read_rows(c, held);
+        costed(c);
+      }
+    }
+    const auto avoiding_structure = hashes ? without_hash(q, structured, sink_of(true, false), nullptr) : std::nullopt;
+    for (const auto& c : structured.plans) {
       auto sorts = !ordered.empty() && !c.ordered();
       auto sink = sink_of(true, sorts);
-      auto cost = finished_cost(sink, measure(c));
       const auto* in = sorts ? &sort : nullptr;
-      const auto past = group_past(layout, sorts);
+      const auto past = group_past(q, layout, keys, in);
       const auto known = past == 0 || c.access.max_entries <= 1;
       // The choice by the budget counts one table's range, which holds every
       // row the structure groups.
       auto countable = c.steps.empty() && scan_of(c.access) != nullptr && memory_ != 0;
       if (stream == nullptr || !countable || (known && c.access.max_entries < static_cast<double>(past))) {
-        auto choices = choose(q, c, sink, searched.tried, !ordered.empty() && !sorts, nullptr);
-        auto b = build(q, c, choices, nullptr);
-        out.push_back({rooted(branch(std::move(b.rows), false, in)), std::move(b.null_checks), std::move(b.computed),
-                       cost + kCountCost * static_cast<double>(choices.size())});
+        auto f = finish_prepared(q, c, sink, structured, nullptr, Needs{!ordered.empty() && !sorts, false, held},
+                                 avoiding_structure,
+                                 [&](physical::NodePtr rows) { return rooted(branch(std::move(rows), false, in)); });
+        if (f) out.push_back(std::move(*f));
         continue;
       }
       if (known) continue;  // past the budget, where the stream avoids it
+      auto cost = finished_cost(sink, measure(c));
       auto b = build(q, c, {}, nullptr);
       auto sb = build(q, *stream, {}, nullptr);
-      physical::Choice ch;
-      ch.counted = *scan_of(c.access);
-      if (std::holds_alternative<physical::NullSplitScan>(c.access.path)) {
-        // The split's whole prefix; of none, the whole index.
-        ch.counted.rest = ch.counted.prefix.empty() ? physical::ScanRest{physical::Range{}} : physical::ScanRest{};
-      }
-      ch.threshold = static_cast<std::int64_t>(past);
-      ch.below = branch(std::move(b.rows), false, in);
-      ch.at_or_above = branch(std::move(sb.rows), true, nullptr);
-      for (auto p : sb.null_checks) add_param(b.null_checks, p);
-      for (const auto& v : sb.computed) {
-        if (std::ranges::find(b.computed, v) == b.computed.end()) b.computed.push_back(v);
-      }
-      out.push_back({rooted(physical::node(std::move(ch))), std::move(b.null_checks), std::move(b.computed), cost + kCountCost});
+      merge_params(b, sb);
+      auto rows = choice(c.access, static_cast<std::int64_t>(past), branch(std::move(b.rows), false, in),
+                         branch(std::move(sb.rows), true, nullptr));
+      out.push_back({rooted(std::move(rows)), std::move(b.null_checks), std::move(b.computed), cost + kCountCost});
     }
     return out;
   }

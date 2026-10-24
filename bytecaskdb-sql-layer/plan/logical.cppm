@@ -163,11 +163,16 @@ struct Join {
 // NULL equal to NULL, of `aggs`: aggregate calls and grouped columns, in the
 // select list's order. Not `grouped` (no GROUP BY): one row over all the
 // input's rows, none of `aggs` a column. A HAVING is a Filter above it.
+// `dependent` holds the columns selected, ordered by or compared in HAVING
+// that are not grouped but whose table's whole primary key is: equal in
+// every row of a group (PostgreSQL's functional dependency), so read from
+// any one, never grouped by.
 struct Aggregate {
   NodePtr input;
   std::vector<Output> aggs;
-  std::vector<Expr> group_by;  // columns, each once
+  std::vector<Expr> group_by;  // columns, each once, as the GROUP BY writes them
   bool grouped{false};
+  std::vector<Expr> dependent;  // columns, each once, none of group_by
 };
 
 // A key, its direction and where its NULLs go: as NULLS FIRST or NULLS

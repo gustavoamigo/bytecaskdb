@@ -21,12 +21,12 @@ void plan(bc_ctx *cx) {
       bc_emit_i64(cx, x0_0);
       bc_emit_end(cx);
       x0_0 = 0;
+      bc_agg_clear(cx, d0_0);
     }
     kv0_0 = rk0_0;
     st0 = true;
     if (!bc_col_null(cx, row, COL_4_2)) {
       bc_sort_key dk0_0 = bc_sort_key_begin(cx);
-      bc_sort_key_col(cx, dk0_0, row, COL_4_0, BC_SORT_ASC, BC_SORT_NULLS_FIRST);
       bc_sort_key_col(cx, dk0_0, row, COL_4_2, BC_SORT_ASC, BC_SORT_NULLS_FIRST);
       bc_group dg0_0 = bc_agg_group(cx, d0_0, bc_sort_key_end(cx, dk0_0));
       if (bc_agg_null(cx, dg0_0, 0)) {

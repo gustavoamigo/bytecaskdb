@@ -784,6 +784,52 @@ TEST_CASE("plan API: an aggregate group is charged its key and the aggregate's o
 }
 
 namespace {
+// Every row of t a group of its own, keyed by its id, with a count slot,
+// the aggregate cleared after each: the bytes held after each clear, and
+// whether a dropped group's handle reads, which it must not.
+void group_then_clear(bc_ctx* cx) {
+  bc_agg a = bc_agg_open(cx, 1);
+  bc_group last{};
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    bc_group g = bc_agg_group(cx, a, bc_col_key(cx, row, kIdCol));
+    bc_agg_count(cx, g, 0);
+    bc_agg_clear(cx, a);
+    held_at_step.push_back(bc_ctx_held_for_testing(cx));
+    last = g;
+  }
+  (void)bc_agg_i64(cx, last, 0);
+}
+
+// A group, then bc_agg_next on its aggregate, then a clear: refused.
+void clear_after_next(bc_ctx* cx) {
+  bc_agg a = bc_agg_open(cx, 0);
+  (void)bc_agg_group(cx, a, bc_param_bytes(cx, 0));
+  bc_view k = bc_empty(cx);
+  while (bc_agg_next(cx, a, &k, nullptr)) {
+  }
+  bc_agg_clear(cx, a);
+}
+}  // namespace
+
+TEST_CASE("plan API: bc_agg_clear drops every group and releases its bytes", "[sql][algebra][structures][memory]") {
+  Fixture f;
+  for (std::int64_t id = 1; id <= 200; ++id) {
+    REQUIRE(run(f, insert_plan_ok, {id, bytes("name"), id}) == BC_COMMITTED);
+  }
+  held_at_step.clear();
+  // Each row's group is dropped before the next: the bytes held after each
+  // clear are the same, then the last group's handle is stale.
+  CHECK(run(f, group_then_clear, {}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  REQUIRE(held_at_step.size() == 200);
+  CHECK(std::ranges::all_of(held_at_step, [&](std::uint64_t b) { return b == held_at_step[0]; }));
+  CHECK(run(f, clear_after_next, {bytes("k")}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+}
+
+namespace {
 // Every row of t, its qty plus one: a write set that grows with the table.
 void bump_all(bc_ctx* cx) {
   bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);

@@ -584,9 +584,14 @@ TEST_CASE("binder: GROUP BY, HAVING and the aggregates, as PostgreSQL binds them
     CHECK(sql_type_name(a.aggs[4].expr.type) == "numeric");
     CHECK(a.aggs[5].expr.type.scale == 2);
   }
-  // A column of a table its primary key groups is grouped too: PostgreSQL's
-  // functional dependency.
-  CHECK(grouped("SELECT k, s, count(*) FROM g GROUP BY k").group_by.size() == 2);
+  // A column of a table its primary key groups is dependent: PostgreSQL's
+  // functional dependency. It is read from a group's row, not grouped by.
+  {
+    const auto& a = grouped("SELECT k, s, count(*) FROM g GROUP BY k");
+    CHECK(a.group_by.size() == 1);
+    REQUIRE(a.dependent.size() == 1);  // each once
+    CHECK(a.dependent[0] == a.aggs[1].expr);
+  }
   // HAVING's parameter takes the aggregate's type, or the column's: a Filter
   // above the Aggregate.
   {

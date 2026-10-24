@@ -234,32 +234,45 @@ struct Aggregate {
 // input's rows come in groups, each group's rows together, so each group is
 // kept in locals and given when the next one starts, with no structure.
 // With no keys it is one group, given even over no rows, and is streamed. A
-// COUNT(DISTINCT) holds each group's distinct values either way.
+// COUNT(DISTINCT) holds each group's distinct values either way; streamed,
+// only the group in hand's. `dependent` are columns the keys determine,
+// equal in every row of a group: each group gives its first row's, and
+// they never key it.
 struct GroupAggregate {
   NodePtr input;
   std::vector<ColumnRef> keys;
   std::vector<Expr> aggs;
   bool streamed{false};
+  std::vector<ColumnRef> dependent;
+
+  // What a group gives of its rows' columns: its keys, then its dependent
+  // columns.
+  [[nodiscard]] auto columns() const -> std::vector<ColumnRef> {
+    auto out = keys;
+    out.insert(out.end(), dependent.begin(), dependent.end());
+    return out;
+  }
 };
 
 // Where a GroupAggregate keeps what it gives for a group, by bc_agg_* slots
-// (group_layout): slot 0 counts its rows; a BIGINT-like key column (an
-// I64) takes a slot holding its value, folded once; any other key column is
-// read from a row of its table, the group's first, held in a hash table
-// under the group's key, one per such table (`held`); each aggregate takes
+// (group_layout, of its columns()): slot 0 counts its rows; a BIGINT-like
+// column (an I64), a key or dependent, takes a slot holding its value,
+// folded once; any other is read from a row of its table, the group's
+// first, held in a hash table under the group's key, one per such table
+// (`held`); each aggregate takes
 // a slot, AVG two (its sum, then its count), COUNT(*) slot 0. A
 // COUNT(DISTINCT) also keeps a structure of its own, one per argument.
 struct GroupLayout {
   std::uint32_t slots{1};
-  std::vector<std::optional<std::uint32_t>> key_slot;  // per key: its slot, or nullopt for one read from a held row
+  std::vector<std::optional<std::uint32_t>> key_slot;  // per column: its slot, or nullopt for one read from a held row
   std::vector<std::uint32_t> agg_slot;                 // per aggregate
   std::vector<std::uint32_t> held;                     // the tables whose first row each group holds
   std::vector<ColumnRef> distinct;                     // each COUNT(DISTINCT)'s argument, once
 };
 
-[[nodiscard]] auto group_layout(const std::vector<ColumnRef>& keys, const std::vector<Expr>& aggs) -> GroupLayout {
+[[nodiscard]] auto group_layout(const std::vector<ColumnRef>& columns, const std::vector<Expr>& aggs) -> GroupLayout {
   GroupLayout l;
-  for (const auto& k : keys) {
+  for (const auto& k : columns) {
     if (k.type == PhysType::I64) {
       l.key_slot.emplace_back(l.slots++);
       continue;
@@ -317,6 +330,15 @@ struct Node {
 template <typename T>
 [[nodiscard]] auto node(T op) -> NodePtr {
   return std::make_unique<Node>(Node{std::move(op)});
+}
+
+// The GroupAggregate whose groups a node gives, under its HAVING and a sort
+// of its groups, or null.
+[[nodiscard]] inline auto group_below(const Node& n) -> const GroupAggregate* {
+  if (const auto* g = std::get_if<GroupAggregate>(&n.op)) return g;
+  if (const auto* f = std::get_if<Filter>(&n.op)) return group_below(*f->input);
+  if (const auto* o = std::get_if<Sort>(&n.op); o != nullptr && o->groups) return group_below(*o->input);
+  return nullptr;
 }
 
 // $param + offset as an INTEGER, computed once before anything is read:
@@ -475,15 +497,6 @@ private:
     if (const auto* l = std::get_if<Limit>(&n.op)) return scan_below(*l->input);
     if (const auto* o = std::get_if<Sort>(&n.op)) return scan_below(*o->input);
     if (const auto* g = std::get_if<GroupAggregate>(&n.op)) return scan_below(*g->input);
-    return nullptr;
-  }
-
-  // The GroupAggregate whose groups a node gives, under its HAVING and a
-  // sort of its groups, or null.
-  static auto group_below(const Node& n) -> const GroupAggregate* {
-    if (const auto* g = std::get_if<GroupAggregate>(&n.op)) return g;
-    if (const auto* f = std::get_if<Filter>(&n.op)) return group_below(*f->input);
-    if (const auto* o = std::get_if<Sort>(&n.op); o != nullptr && o->groups) return group_below(*o->input);
     return nullptr;
   }
 
@@ -794,7 +807,7 @@ private:
               auto b = tables_of(*op.at_or_above);
               std::ranges::sort(a);
               std::ranges::sort(b);
-              if (a != b || g->keys != other->keys || g->aggs != other->aggs) {
+              if (a != b || g->keys != other->keys || g->dependent != other->dependent || g->aggs != other->aggs) {
                 broken("a choice point at a grouped aggregate whose other plan groups other rows");
               }
               node(taken(op), parent);
@@ -815,7 +828,8 @@ private:
             if (const auto* g = group_below(*op.input)) {
               for (const auto& c : op.conjuncts) {
                 const auto& lhs = c.args[0];
-                auto known = lhs.kind == Expr::Kind::Column ? std::ranges::find(g->keys, lhs.col) != g->keys.end()
+                const auto columns = g->columns();
+                auto known = lhs.kind == Expr::Kind::Column ? std::ranges::find(columns, lhs.col) != columns.end()
                                                             : std::ranges::find(g->aggs, lhs) != g->aggs.end();
                 if (!known || c.args[1].kind != Expr::Kind::Param) broken("a HAVING that compares no key or aggregate of its groups");
                 if (lhs.kind == Expr::Kind::Column && lhs.col.type == PhysType::F64) broken("a filter on a DOUBLE column");
@@ -841,7 +855,8 @@ private:
               const auto* g = group_below(*op.input);
               if (g == nullptr || g->streamed) broken("a sort of groups not over a structure of them");
               for (const auto& k : op.keys) {
-                if (std::ranges::find(g->keys, k.col) == g->keys.end()) broken("a sort of groups by a column not a key");
+                const auto columns = g->columns();
+                if (std::ranges::find(columns, k.col) == columns.end()) broken("a sort of groups by a column not of them");
               }
               node(*op.input, &n);
               return;
@@ -889,14 +904,22 @@ private:
             auto in = tables_of(*op.input);
             auto of_input = [&](const ColumnRef& c) { return std::ranges::find(in, c.table) != in.end(); };
             if (!op.streamed && op.keys.empty()) broken("a structure of groups with no key");
-            for (const auto& k : op.keys) {
+            if (op.keys.empty() && !op.dependent.empty()) broken("a dependent column of one group of every row");
+            const auto columns = op.columns();
+            for (const auto& k : columns) {
               if (!of_input(k)) broken("a GROUP BY key outside its input's tables");
               if (op.streamed && k.type != PhysType::I64 && k.type != PhysType::Bool) broken("a streamed GROUP BY key held in no local");
               read(k);
             }
-            auto layout = group_layout(op.keys, op.aggs);
-            for (auto t : layout.held) {
-              if (std::ranges::find(covering_, t) != covering_.end()) broken("a structure of groups that holds a covering scan's entry");
+            for (const auto& d : op.dependent) {
+              if (std::ranges::find(op.keys, d) != op.keys.end()) broken("a dependent column that is a key");
+            }
+            // A structure holds a row per group for each column it reads
+            // from one; a stream holds no row.
+            if (!op.streamed) {
+              for (auto t : group_layout(columns, op.aggs).held) {
+                if (std::ranges::find(covering_, t) != covering_.end()) broken("a structure of groups that holds a covering scan's entry");
+              }
             }
             for (const auto& a : op.aggs) {
               if (a.kind != Expr::Kind::Aggregate) broken("an aggregate that is not an aggregate call");
@@ -914,8 +937,9 @@ private:
             for (const auto* b : below) {
               const auto* g = group_below(*b);
               if (g == nullptr) broken("rows of groups over no grouped aggregate");
+              const auto columns = g->columns();
               for (const auto& o : op.outputs) {
-                auto known = o.kind == Expr::Kind::Column ? std::ranges::find(g->keys, o.col) != g->keys.end()
+                auto known = o.kind == Expr::Kind::Column ? std::ranges::find(columns, o.col) != columns.end()
                                                           : std::ranges::find(g->aggs, o) != g->aggs.end();
                 if (!known) broken("a grouped output that is no key or aggregate of its groups");
               }

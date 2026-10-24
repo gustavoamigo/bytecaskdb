@@ -652,7 +652,8 @@ public:
   // A query is aggregated by a GROUP BY, a HAVING or an aggregate call. Then
   // a column it selects, orders by or compares in HAVING must be grouped,
   // or of a table whose primary key is (42803): PostgreSQL's functional
-  // dependency, so it is grouped by too, which makes the same groups.
+  // dependency, so it is the same in every row of a group, read from any
+  // one (Aggregate::dependent), and the GROUP BY stays as written.
   auto select(const ast::Select& s) -> logical::NodePtr {
     auto joined = !s.join.empty();
     const Table* sides[2]{table(s.table, joined ? s.table_pos : s.pos), nullptr};
@@ -679,8 +680,9 @@ public:
       auto g = logical::column_of(t->id, *c);
       if (std::ranges::find(group_by, g) == group_by.end()) group_by.push_back(std::move(g));
     }
-    // A column of an aggregated query: grouped, or grouped by now as its
-    // table's primary key determines it; else 42803.
+    // A column of an aggregated query: grouped, or dependent, as its
+    // table's grouped primary key determines it; else 42803.
+    std::vector<logical::Expr> dependent;
     auto grouped = [&](const Table& t, const Column& c, std::int32_t pos) -> logical::Expr {
       auto g = logical::column_of(t.id, c);
       if (std::ranges::find(group_by, g) != group_by.end()) return g;
@@ -688,7 +690,7 @@ public:
         return std::ranges::find(group_by, logical::column_of(t.id, *t.column(id))) != group_by.end();
       });
       if (!by_key) ungrouped(t, c.name, pos);
-      group_by.push_back(g);
+      if (std::ranges::find(dependent, g) == dependent.end()) dependent.push_back(g);
       return g;
     };
     std::vector<logical::Output> targets;
@@ -725,7 +727,8 @@ public:
                        : logical::node(logical::Get{sides[0], s.for_update});
     if (!conjuncts.empty()) rows = logical::node(logical::Filter{std::move(rows), std::move(conjuncts)});
     if (aggregated) {
-      rows = logical::node(logical::Aggregate{std::move(rows), std::move(targets), std::move(group_by), !s.group_by.empty()});
+      rows = logical::node(logical::Aggregate{std::move(rows), std::move(targets), std::move(group_by), !s.group_by.empty(),
+                                              std::move(dependent)});
       if (!having.empty()) rows = logical::node(logical::Filter{std::move(rows), std::move(having)});
       if (!keys.empty()) rows = logical::node(logical::Sort{std::move(rows), std::move(keys)});
     } else {

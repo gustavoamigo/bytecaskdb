@@ -621,7 +621,7 @@ private:
     loop_ = outer;
     rows_.pop_back();
     w_.close();
-    if (!guard_.empty()) w_.line("bc_scan_close(cx, " + cursor_ + ");");
+    if (!limit_.empty()) w_.line("bc_scan_close(cx, " + cursor_ + ");");
   }
 
   void produce(const physical::Scan& sc, const Consume& k) {
@@ -808,6 +808,7 @@ private:
     // The build side is named in the plan text.
     w_.line("bc_hash " + table + " = bc_hash_open(cx);  // built on " + w_.tbl(h.held) + "'s rows");
     auto guard = std::exchange(guard_, "");
+    auto limit = std::exchange(limit_, "");
     w_.open("");
     produce(*h.build, [&] {
       auto key = hash_key(i, build_cols);
@@ -815,6 +816,7 @@ private:
     });
     w_.close();
     guard_ = guard;
+    limit_ = limit;
     produce(*h.probe, [&] {
       auto key = hash_key(i, probe_cols);
       const auto probe = "q" + i;
@@ -852,6 +854,7 @@ private:
       w_.line("bc_sorter s" + i + " = bc_sorter_open(cx, " + std::to_string(s.keep) + ");");
     }
     auto guard = std::exchange(guard_, "");
+    auto limit = std::exchange(limit_, "");
     std::vector<Binding> in_hand;
     produce(*s.input, [&] {
       std::vector<ColumnRef> checked;
@@ -881,6 +884,7 @@ private:
       }
     });
     guard_ = guard;
+    limit_ = limit;
     for (auto& b : in_hand) {
       auto at = std::ranges::find(s.payloads, b.table);
       if (at != s.payloads.end()) b.row = "p" + ids[static_cast<std::size_t>(at - s.payloads.begin())];
@@ -926,7 +930,7 @@ private:
   }
 
   void produce(const physical::Filter& f, const Consume& k) {
-    if (group_below(*f.input)) {
+    if (physical::group_below(*f.input)) {
       // A HAVING: the group's consumer runs only for a group that passes,
       // in a block, since a streamed group is given inside its input's loop.
       produce(*f.input, [&] {
@@ -958,7 +962,8 @@ private:
       return;
     }
     w_.line("int64_t n = 0;");
-    guard_ = "n < " + std::to_string(l.n) + " && ";
+    limit_ = "n < " + std::to_string(l.n);
+    guard_ = limit_ + " && ";
     produce(*l.input, [&] {
       k();
       w_.line("++n;");
@@ -1149,21 +1154,16 @@ private:
   // a SUM, MIN or MAX saw one) and xc<i>_<j> (an AVG's count).
   struct Group {
     const physical::GroupAggregate* op{nullptr};
+    std::vector<ColumnRef> columns;  // its keys, then its dependent columns
     physical::GroupLayout layout;
     std::string i;
     std::string handle;  // g<i>, in a structure
   };
 
-  // The GroupAggregate whose groups a node gives, or null.
-  static auto group_below(const physical::Node& n) -> const physical::GroupAggregate* {
-    if (const auto* g = std::get_if<physical::GroupAggregate>(&n.op)) return g;
-    if (const auto* f = std::get_if<physical::Filter>(&n.op)) return group_below(*f->input);
-    if (const auto* o = std::get_if<physical::Sort>(&n.op); o != nullptr && o->groups) return group_below(*o->input);
-    return nullptr;
-  }
-
-  auto key_index(const Group& g, const ColumnRef& c) const -> std::size_t {
-    return static_cast<std::size_t>(std::ranges::find(g.op->keys, c) - g.op->keys.begin());
+  // A column's index in the group's columns, which number its slots and
+  // locals.
+  static auto key_index(const Group& g, const ColumnRef& c) -> std::size_t {
+    return static_cast<std::size_t>(std::ranges::find(g.columns, c) - g.columns.begin());
   }
   auto agg_index(const Group& g, const Expr& a) const -> std::size_t {
     return static_cast<std::size_t>(std::ranges::find(g.op->aggs, a) - g.op->aggs.begin());
@@ -1172,8 +1172,8 @@ private:
     return kind + g.i + "_" + std::to_string(j);
   }
 
-  // A key read from the row its group holds: a structure's key that is not
-  // an I64.
+  // A column read from the row its group holds: a structure's key or
+  // dependent column that is not an I64.
   auto held_row(const Group& g, const ColumnRef& c) const -> std::optional<std::string> {
     if (g.op->streamed || g.layout.key_slot[key_index(g, c)]) return std::nullopt;
     auto j = static_cast<std::size_t>(std::ranges::find(g.layout.held, c.table) - g.layout.held.begin());
@@ -1326,7 +1326,8 @@ private:
   }
 
   // The row in hand folded into the group the structure holds for its key,
-  // gg<i>: on the group's first row, the held rows and the keys' values.
+  // gg<i>: on the group's first row, the held rows and the values of its
+  // keys and dependent columns.
   void fold_into_structure(const Group& g) {
     const auto& op = *g.op;
     const auto gb = "gb" + g.i;
@@ -1342,11 +1343,12 @@ private:
       for (std::size_t j = 0; j < g.layout.held.size(); ++j) {
         w_.line("bc_hash_put(cx, " + local("f", g, j) + ", " + gr + ", " + binding(g.layout.held[j]).row + ");");
       }
-      for (std::size_t j = 0; j < op.keys.size(); ++j) {
+      for (std::size_t j = 0; j < g.columns.size(); ++j) {
         const auto& slot = g.layout.key_slot[j];
         if (!slot) continue;
-        auto put = "bc_agg_min_i64(cx, " + gg + ", " + std::to_string(*slot) + ", " + read_col(op.keys[j]) + ");";
-        w_.line(op.keys[j].nullable ? "if (!" + col_null(op.keys[j]) + ") " + put : put);
+        const auto& c = g.columns[j];
+        auto put = "bc_agg_min_i64(cx, " + gg + ", " + std::to_string(*slot) + ", " + read_col(c) + ");";
+        w_.line(c.nullable ? "if (!" + col_null(c) + ") " + put : put);
       }
       w_.close();
     }
@@ -1375,20 +1377,16 @@ private:
     }
   }
 
-  // A COUNT(DISTINCT) of `arg` in the group in hand: its value's pair with
-  // the group, keyed in the argument's structure d<i>_<m> after the group's
-  // key `group_key` (a key built for it, or "" to build the keys' parts from
-  // the row); `counted` runs when the pair is new.
+  // A COUNT(DISTINCT) of `arg` in the group in hand: its value, keyed in the
+  // argument's structure d<i>_<m>; in a structure after the group's key
+  // `group_key`, streamed alone, since the stream clears d<i>_<m> as each
+  // group ends. `counted` runs when the value is new to the group.
   void distinct_value(const Group& g, const ColumnRef& arg, const std::string& group_key, const std::string& counted) {
     auto m = static_cast<std::size_t>(std::ranges::find(g.layout.distinct, arg) - g.layout.distinct.begin());
     const auto dk = local("dk", g, m);
     const auto dg = local("dg", g, m);
     w_.line("bc_sort_key " + dk + " = bc_sort_key_begin(cx);");
-    if (!group_key.empty()) {
-      w_.line("bc_sort_key_bytes(cx, " + dk + ", " + group_key + ", BC_SORT_ASC, BC_SORT_NULLS_FIRST);");
-    } else {
-      for (const auto& k : g.op->keys) sort_key_part(dk, k);
-    }
+    if (!group_key.empty()) w_.line("bc_sort_key_bytes(cx, " + dk + ", " + group_key + ", BC_SORT_ASC, BC_SORT_NULLS_FIRST);");
     sort_key_part(dk, arg);
     w_.line("bc_group " + dg + " = bc_agg_group(cx, " + local("d", g, m) + ", bc_sort_key_end(cx, " + dk + "));");
     w_.open("if (bc_agg_null(cx, " + dg + ", 0))");
@@ -1419,19 +1417,22 @@ private:
   // counter is that loop's, never the input's. Streamed, the groups are
   // given one at a time (stream).
   void produce(const physical::GroupAggregate& op, const Consume& k) {
-    Group g{&op, physical::group_layout(op.keys, op.aggs), std::to_string(groups_++), {}};
+    const auto columns = op.columns();
+    Group g{&op, columns, physical::group_layout(columns, op.aggs), std::to_string(groups_++), {}};
     open_structures(g);
     if (op.streamed) {
       stream(g, k);
       return;
     }
     auto guard = std::exchange(guard_, "");
+    auto limit = std::exchange(limit_, "");
     if (!std::holds_alternative<physical::Empty>(op.input->op)) {
       w_.open("");
       produce(*op.input, [&] { fold_into_structure(g); });
       w_.close();
     }
     guard_ = guard;
+    limit_ = limit;
     const auto gk = "gk" + g.i;
     w_.line("bc_view " + gk + " = bc_empty(cx);");
     w_.open("while (" + guard_ + "bc_agg_next(cx, a" + g.i + ", &" + gk + ", 0))");
@@ -1441,15 +1442,18 @@ private:
 
   // The groups streamed: the input's rows come with each group's together,
   // so the group is kept in locals, given (k) inside the input's loop when a
-  // row of another group starts the next, and after it for the last. With
-  // no key, one group, given after the input, over no rows too. A LIMIT's
-  // counter is the input loop's, and the last group's.
+  // row of another group starts the next, and after it for the last. Each
+  // dependent column is read from every row and kept as a key is: every row
+  // of a group holds the same value. A COUNT(DISTINCT)'s values are cleared as
+  // each group ends: the stream holds only the group in hand's. With no key,
+  // one group, given after the input, over no rows too. A LIMIT's counter is
+  // the input loop's, and the last group's.
   void stream(const Group& g, const Consume& k) {
     const auto& op = *g.op;
     const auto st = "st" + g.i;
     if (!op.keys.empty()) w_.line("bool " + st + " = false;");
-    for (std::size_t j = 0; j < op.keys.size(); ++j) {
-      const auto& c = op.keys[j];
+    for (std::size_t j = 0; j < g.columns.size(); ++j) {
+      const auto& c = g.columns[j];
       w_.line(c.type == PhysType::Bool ? "bool " + local("kv", g, j) + " = false;" : "int64_t " + local("kv", g, j) + " = 0;");
       if (c.nullable) w_.line("bool " + local("kn", g, j) + " = false;");
     }
@@ -1471,10 +1475,11 @@ private:
     if (!std::holds_alternative<physical::Empty>(op.input->op)) {
       produce(*op.input, [&] {
         if (!op.keys.empty()) {
-          // The row's keys, then whether they start another group.
+          // The row's keys and dependent columns, then whether its keys
+          // start another group.
           std::string changed;
-          for (std::size_t j = 0; j < op.keys.size(); ++j) {
-            const auto& c = op.keys[j];
+          for (std::size_t j = 0; j < g.columns.size(); ++j) {
+            const auto& c = g.columns[j];
             const auto rk = local("rk", g, j);
             const auto rn = local("rn", g, j);
             const auto kv = local("kv", g, j);
@@ -1487,6 +1492,7 @@ private:
             } else {
               w_.line(type + rk + " = " + read_col(c) + ";");
             }
+            if (j >= op.keys.size()) continue;
             auto differs = c.type == PhysType::Bool ? "(" + rk + " && !" + kv + ") || (" + kv + " && !" + rk + ")"
                                                     : rk + " != " + kv;
             changed += (changed.empty() ? "" : " || ") + differs;
@@ -1495,10 +1501,12 @@ private:
           w_.open("if (" + st + " && (" + changed + "))");
           give();
           reset(false);
+          // The group's distinct values go with it.
+          for (std::size_t m = 0; m < g.layout.distinct.size(); ++m) w_.line("bc_agg_clear(cx, " + local("d", g, m) + ");");
           w_.close();
-          for (std::size_t j = 0; j < op.keys.size(); ++j) {
+          for (std::size_t j = 0; j < g.columns.size(); ++j) {
             w_.line(local("kv", g, j) + " = " + local("rk", g, j) + ";");
-            if (op.keys[j].nullable) w_.line(local("kn", g, j) + " = " + local("rn", g, j) + ";");
+            if (g.columns[j].nullable) w_.line(local("kn", g, j) + " = " + local("rn", g, j) + ";");
           }
           w_.line(st + " = true;");
         }
@@ -1506,8 +1514,7 @@ private:
       });
     }
     // The last group, or the one group of no key.
-    auto limit = guard_.empty() ? std::string{} : guard_.substr(0, guard_.size() - 4);
-    std::string cond = op.keys.empty() ? limit : (limit.empty() ? st : limit + " && " + st);
+    std::string cond = op.keys.empty() ? limit_ : (limit_.empty() ? st : limit_ + " && " + st);
     if (cond.empty()) {
       give();
       return;
@@ -1569,6 +1576,7 @@ private:
     const auto held = "p" + i;
     w_.line("bc_sorter " + sorter + " = bc_sorter_open(cx, " + std::to_string(s.keep) + ");");
     auto guard = std::exchange(guard_, "");
+    auto limit = std::exchange(limit_, "");
     std::optional<Group> sorted;
     produce(*s.input, [&] {
       w_.line("bc_sort_key sk = bc_sort_key_begin(cx);");
@@ -1577,6 +1585,7 @@ private:
       sorted = *group_;
     });
     guard_ = guard;
+    limit_ = limit;
     w_.line("bc_view " + held + " = bc_empty(cx);");
     w_.open("while (" + guard_ + "bc_sorter_next(cx, " + sorter + ", &" + held + "))");
     in_group(*sorted, held, k);
@@ -1601,7 +1610,7 @@ private:
       if (l->n == 0) return {};
       n = l->input.get();
     }
-    const auto* g = group_below(*n);
+    const auto* g = physical::group_below(*n);
     if (g == nullptr || !g->keys.empty()) return {};
     std::string cond;
     if (const auto* f = std::get_if<physical::Filter>(&n->op)) {
@@ -1719,7 +1728,8 @@ private:
   std::string row_name_{"row"};  // the row a leaf reads into: "old" for a write
   std::vector<Binding> rows_;    // the rows in hand, outer first
   bool loop_{false};             // inside a loop: a miss is `continue`
-  std::string guard_;            // a LIMIT's condition on the scan loop
+  std::string limit_;            // a LIMIT's condition, n < its count, or empty
+  std::string guard_;            // the loop condition's prefix it makes: limit_ and " && ", or empty
   std::string* hit_{nullptr};    // a one-row aggregate: a miss joins this condition instead
   int choices_{0};               // the choice points printed: each counts into count<i>, over lo<i> and hi<i>
   int sorts_{0};                 // the sorts printed: each into sorter s<i>, its row p<i>
