@@ -3,4 +3,16 @@
   // OpenCode only auto-discovers AGENTS.md; load the shared project guidance
   // from CLAUDE.md as configured instructions alongside it.
   "instructions": ["CLAUDE.md"],
+  // clangd reads compile_commands.json, which is generated rather than
+  // checked in. Run `xmake build bytecask_tests` first (the commands point at
+  // the module BMIs under build/.gens), then scripts/gen_compile_commands.sh.
+  // Without it the engine's modules are unresolved and every `import
+  // bytecask.*` reports errors. The extensions are listed explicitly because
+  // the sources are modules (.cppm), not just .cpp.
+  "lsp": {
+    "clangd": {
+      "command": ["clangd", "--background-index"],
+      "extensions": [".c", ".h", ".cpp", ".cppm", ".ixx", ".hpp", ".hxx", ".cc", ".cxx"],
+    },
+  },
 }
