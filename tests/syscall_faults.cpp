@@ -326,6 +326,12 @@ auto ScopedSyscallFaults::report() -> SyscallFaultReport {
           .failed = s.failed};
 }
 
+auto ScopedSyscallFaults::fired() const -> bool {
+  auto &s = state();
+  const std::lock_guard<std::mutex> lk{s.mu};
+  return s.fired;
+}
+
 }  // namespace bytecask::testing
 
 extern "C" {

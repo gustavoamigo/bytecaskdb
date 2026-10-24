@@ -414,4 +414,42 @@ inline auto resume_torn_operation() -> Operation {
           .transition = [](KeyValues kv) { return kv; }};
 }
 
+// Every data file a returned manifest lists exists. A hint may not, when the
+// worker failed to write it (#349): copying what is there must still open to
+// the manifest's state, the missing hint rebuilt by the open. Checked once
+// the fault is disarmed, since the check's own calls would otherwise count.
+inline auto manifest_operation() -> Operation {
+  auto listed = std::make_shared<std::vector<bytecask::FileInfo>>();
+  return {.name = "create_manifest",
+          .setup = seed,
+          .run =
+              [listed](DB &db) {
+                auto m = db.create_manifest();
+                *listed = std::move(m.files);
+                return !listed->empty();
+              },
+          .transition = [](KeyValues kv) { return kv; },
+          .returned =
+              [listed](const KeyValues &expected) {
+                REQUIRE_FALSE(listed->empty());
+                const auto dest =
+                    listed->front().data_path.parent_path().parent_path() /
+                    "from_manifest";
+                std::filesystem::remove_all(dest);
+                std::filesystem::create_directories(dest);
+                for (const auto &f : *listed) {
+                  INFO("manifest file " << f.file_id);
+                  REQUIRE(std::filesystem::exists(f.data_path));
+                  std::filesystem::copy_file(f.data_path,
+                                             dest / f.data_path.filename());
+                  if (std::filesystem::exists(f.hint_path))
+                    std::filesystem::copy_file(f.hint_path,
+                                               dest / f.hint_path.filename());
+                }
+                auto copy = DB::open(dest, {});
+                check_key_values(key_values(copy), expected,
+                                 "a DB opened from the manifest's files");
+              }};
+}
+
 }  // namespace bytecask::testing::sweep_ops
