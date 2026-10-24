@@ -320,6 +320,31 @@ TEST_CASE("key codec: a prefix's successor bounds every key under it", "[sql][co
   CHECK(key_successor(Bytes{std::byte{0xFF}}).empty());
 }
 
+TEST_CASE("key codec: key_part_size is the bytes each writer appends", "[sql][codec]") {
+  const Bytes zeros{std::byte{0}, std::byte{'a'}, std::byte{0}, std::byte{0}};
+  for (auto nullable : {false, true}) {
+    for (auto desc : {false, true}) {
+      INFO("nullable " << nullable << ", desc " << desc);
+      auto appended = [](auto put) {
+        Bytes k{std::byte{9}};  // a part is appended after what is there
+        put(k);
+        return k.size() - 1;
+      };
+      const KeyPart i{PhysType::I64, nullable, desc}, f{PhysType::F64, nullable, desc};
+      const KeyPart b{PhysType::Bool, nullable, desc}, y{PhysType::Bytes, nullable, desc};
+      CHECK(key_part_size(i) == appended([&](Bytes& k) { key_put_i64(k, -3, i); }));
+      CHECK(key_part_size(f) == appended([&](Bytes& k) { key_put_f64(k, 2.5, f); }));
+      CHECK(key_part_size(b) == appended([&](Bytes& k) { key_put_bool(k, true, b); }));
+      CHECK(key_part_size(y, {}) == appended([&](Bytes& k) { key_put_bytes(k, {}, y); }));
+      CHECK(key_part_size(y, zeros) == appended([&](Bytes& k) { key_put_bytes(k, zeros, y); }));
+      if (nullable) CHECK(kKeyNullBytes == appended([&](Bytes& k) { key_put_null(k, y); }));
+    }
+  }
+  Bytes p;
+  key_put_prefix(p, kNsRow, 7);
+  CHECK(p.size() == kKeyPrefixBytes);
+}
+
 TEST_CASE("key codec: malformed keys are reported, not over-read", "[sql][codec]") {
   // Every part type, cut at every byte.
   for (auto part : {KeyPart{PhysType::I64, true, false}, KeyPart{PhysType::F64, true, true},
