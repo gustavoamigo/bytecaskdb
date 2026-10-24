@@ -2804,6 +2804,19 @@ cache then lost is `:info`; everything durable is held to the cross-check and
 Elle ([`isolation_checking_design.md`](isolation_checking_design.md),
 *Chaos*).
 
+Range guards, dels and range deletes have no list-append model, so they get a
+workload of their own (#302): `run_isolation_check.py --workload range` runs
+point reads, scans, puts, dels and one-key range deletes over 32 fixed-width
+keys, with ranges that overlap, and checks the history against the commit
+order the engine assigned rather than with Elle. A guarded run must show
+every read and scan matching the state its transaction should have seen at
+its commit; an unguarded run must show reads behind that state, or it proved
+nothing. The kill mode and the chaos rig run it too. Three mutations of the
+range check, applied by hand, are each caught by a guarded history: skipping
+the deleted-keys pass, skipping the changed-keys pass, and treating a write
+above the snapshot's sequence as unchanged (what validating against the
+published state amounts to).
+
 ---
 
 ## Durability sites

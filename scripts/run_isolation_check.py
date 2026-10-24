@@ -116,9 +116,17 @@ def cross_check(history: list[dict], require_sequence: bool = True) -> list[str]
     transaction completed :ok before the reading transaction was invoked.
     """
     ok_appends: dict[int, list[tuple[int, int, int]]] = defaultdict(list)
-    failed: set[int] = set()
-    invoked: set[int] = set()
+    # Per key: an element id is unique to a write within one process, and a
+    # process counter restarts with each epoch, so the same id names another
+    # key's write in another life.
+    failed: dict[int, set[int]] = defaultdict(set)
+    invoked: dict[int, set[int]] = defaultdict(set)
+    # Per key, the element and invoking transaction of every append that was
+    # acknowledged, whoever completed the transaction.
+    invoked_at: dict[int, dict[int, int]] = defaultdict(dict)
     reads: dict[int, list[list[int]]] = defaultdict(list)
+    # Per key, the last read's (invoke index, elements) in history order.
+    last_read_at: dict[int, tuple[int, list[int]]] = {}
     # (invoke index, list read) per key, and (completion index, element) per
     # key for the real-time check.
     timed_reads: dict[int, list[tuple[int, list[int]]]] = defaultdict(list)
@@ -129,7 +137,9 @@ def cross_check(history: list[dict], require_sequence: bool = True) -> list[str]
     for op in history:
         appends = [m for m in op["value"] if m[0] == "append"]
         if op["type"] == "invoke":
-            invoked.update(m[2] for m in appends)
+            for m in appends:
+                invoked[m[1]].add(m[2])
+                invoked_at[m[1]][m[2]] = op["index"]
             invoke_index[op["process"]] = op["index"]
         elif op["type"] == "ok":
             seq = op.get("sequence")
@@ -141,10 +151,12 @@ def cross_check(history: list[dict], require_sequence: bool = True) -> list[str]
             for m in op["value"]:
                 if m[0] == "r":
                     reads[m[1]].append(m[2])
-                    timed_reads[m[1]].append(
-                        (invoke_index[op["process"]], m[2]))
+                    at = invoke_index[op["process"]]
+                    timed_reads[m[1]].append((at, m[2]))
+                    last_read_at[m[1]] = (at, m[2])
         elif op["type"] == "fail":
-            failed.update(m[2] for m in appends)
+            for m in appends:
+                failed[m[1]].add(m[2])
 
     problems: list[str] = []
     if missing_sequence:
@@ -161,16 +173,40 @@ def cross_check(history: list[dict], require_sequence: bool = True) -> list[str]
                     f"key {key}: read {r} is not a prefix of final {final}")
                 break
         for e in final:
-            if e in failed:
+            if e in failed[key]:
                 problems.append(f"key {key}: element {e} of a failed txn read")
-            elif e not in invoked:
+            elif e not in invoked[key]:
                 problems.append(f"key {key}: element {e} was never appended")
         committed = sorted(ok_appends[key], key=lambda a: (a[0] or 0, a[1], a[2]))
-        missing = [e for _, _, e in committed if e not in where]
+        # An append is lost, not missing, when a later read of its key
+        # returned a value without it: that read saw the acknowledgement
+        # undone, which only a crash the history does not model can do, so the
+        # engine must have dropped it (durable false in a life that ended in a
+        # power cut, absorb_epoch's rule). Everything else the final read lacks
+        # is missing.
+        lost = set()
+        for e in where:
+            at = invoked_at[key].get(e)
+            if at is not None and last_read_at.get(key, (0, []))[0] > at:
+                lost.add(e)
+        missing = [e for _, _, e in committed if e not in where and e not in lost]
         if missing:
             problems.append(
                 f"key {key}: committed appends {missing[:8]} missing from "
                 f"final read ({len(missing)} total)")
+        # The lost appends keep their order among themselves and before the
+        # appends after them, since sequences are assigned in commit order.
+        for pos, (seq, _, e) in enumerate(committed):
+            # Order comes from the sequence alone, so this needs every
+            # transaction to carry one (a SQL history's do not).
+            if e not in lost or not require_sequence:
+                continue
+            after = [f for _, _, f in committed[pos + 1:] if f in where]
+            if after and where[after[0]] < where[e]:
+                problems.append(
+                    f"key {key}: lost append {e} is ordered after the appends "
+                    f"that follow it in commit sequence")
+                break
         present = [e for seq, _, e in committed if e in where and seq is not None]
         positions = [where[e] for e in present]
         if positions != sorted(positions):
@@ -179,13 +215,355 @@ def cross_check(history: list[dict], require_sequence: bool = True) -> list[str]
                 f"sequence order of {present}")
         for started, r in timed_reads[key]:
             seen = set(r)
-            stale = [e for done, e in acked[key] if done < started and e not in seen]
+            stale = [e for done, e in acked[key]
+                     if done < started and e not in seen and e not in lost]
             if stale:
                 problems.append(
                     f"key {key}: read {r} started after appends {stale[:8]} "
                     f"were acknowledged but does not see them")
                 break
     return problems
+
+
+# ---------------------------------------------------------------------------
+# Range workload history check (#302)
+#
+# A range history's transactions read point keys and ranges, and write puts,
+# dels and one-key range deletes. Every put's value is unique to it,
+# "w<session>.<n>", so a later read names the exact version it saw without
+# this script having to know which transaction wrote it, even when that
+# transaction is :info.
+#
+# The engine assigns a monotonic commit sequence to every write that
+# commits. So the committed transactions of a history, sorted by sequence, are
+# the order in which their writes reached the database; the check replays them
+# against a map of the key space and holds every read to that map. See
+# docs/isolation_checking_design.md, *Range workload*.
+# ---------------------------------------------------------------------------
+
+VERSION = re.compile(r"^w([0-9a-f]+)\.([0-9a-f]+)$")
+
+
+class Op:
+    """One transaction: its invoke and its completion."""
+
+    __slots__ = ("process", "invoke", "index", "type", "value", "sequence",
+                 "epoch", "role")
+
+    def __init__(self, invoke: dict, done: dict):
+        self.process = invoke["process"]
+        self.invoke = invoke["index"]
+        self.index = done["index"]
+        self.type = done["type"]
+        self.value = done["value"]
+        self.sequence = done.get("sequence")
+        self.epoch = done.get("epoch", 0)
+        self.role = done.get("role", "leader")
+
+    def writes(self):
+        """[(key, version)] this transaction invokes, a put's version unique
+        to it and a del's None. A key written twice in one transaction holds
+        its last write: the plan applies its mops in order."""
+        out = {}
+        for m in self.value:
+            if m[0] == "put":
+                out[m[1]] = f"w{m[2] >> 32:x}.{m[2] & 0xffffffff:x}"
+            elif m[0] == "del":
+                # ["del", key] is a point delete; ["del", from, to) a range,
+                # `to` exclusive as the engine's bounds are.
+                for k in range(m[1], m[2] if len(m) > 2 else m[1] + 1):
+                    out[k] = None
+        return list(out.items())
+
+    def scans(self):
+        """[(from, to, [(key, version)])]: the scans this transaction ran."""
+        out = []
+        for m in self.value:
+            parts = m if isinstance(m[0], list) else [m]
+            for part in parts:
+                if part[0] == "scan":
+                    out.append((part[1], part[2], [tuple(p) for p in part[3]]))
+        return out
+
+    def reads(self):
+        """[(from, (key, version))]: a point read, then each pair a scan
+        returned, with the range it was read in. A scan is one group holding
+        its point read and its scan (`[["r", k, v], ["scan", pairs]]`), so
+        the group is flattened."""
+        def pairs(m):
+            # A range workload read's result is a list of [key, version];
+            # the append workload's is a list of integers, which this check
+            # has nothing to say about.
+            result = m[2] if len(m) > 2 else None
+            if (m[0] in ("r", "scan") and isinstance(result, list)
+                    and all(isinstance(p, list) for p in result)):
+                return [(m[1], tuple(p)) for p in result]
+            return []
+
+        out = []
+        for m in self.value:
+            if isinstance(m[0], list):
+                for part in m:
+                    out.extend(pairs(part))
+            else:
+                out.extend(pairs(m))
+        return out
+
+
+def ops_from_history(history: list[dict]) -> list[Op]:
+    """The transactions: invoke and completion matched by process, which a
+    client runs one transaction at a time, in invoke order. A kill's or a
+    chaos episode's lives reuse a process id, but a killed transaction has no
+    completion, so the invokes and completions stay paired."""
+    pending: dict[int, dict] = {}
+    ops = []
+    for e in sorted(history, key=lambda e: e["index"]):
+        key = e["process"]
+        if e["type"] == "invoke":
+            pending[key] = e
+        elif e["type"] in ("ok", "info", "fail"):
+            ops.append(Op(pending.pop(key), e))
+    return ops
+
+
+class RangeModel:
+    """The key space as a map from key to version."""
+
+    def __init__(self):
+        self.state: dict[int, str | None] = {}
+
+    def apply(self, op: Op) -> None:
+        for k, v in op.writes():
+            self.state[k] = v
+
+
+def history_check(history: list[dict], config: str) -> tuple[list[str], dict]:
+    """Replays a range history against the commit order the engine
+    enforced (#302), and returns the violations and a summary.
+
+    A committed transaction carries the highest sequence it was assigned, and
+    the engine assigns sequences in commit order, so sorting the committed
+    transactions by it is the order their writes reached the database. The
+    check replays them onto a map of the key space and holds every read to a
+    state of that map.
+
+    Two things the history cannot pin down:
+
+    -   An :info transaction may or may not have committed; a crash may lose
+        it and resume() may replay it. Each key its write named is placed
+        only where a committed read named that key's exact value, just
+        before that reader. A key whose last unplaced :info write is still
+        the newest thing the history knows about it is unknown, and reads
+        of it are not judged: the database may or may not hold it. A
+        committed write of the key settles it again.
+    -   A plan's entries span sequences below the one it reports, and another
+        transaction's write can fall inside that span. A read is therefore
+        held to the state at any point across its own transaction's window.
+
+    guarded    every read and scan matches the order at the reading
+               transaction's position.
+    unguarded  every read and scan matches the order at its position or
+               earlier, and at least one transaction read a state behind its
+               own position: that is the exposure the range guards close. A
+               run in which no read is exposed proves nothing.
+
+    The state the database started from, s<k>, is the value at every key
+    before the first write, and a read of it is judged against that. A kill
+    may lose it, and the re-seed that follows one is not a transaction, so
+    after the first epoch only a version this history wrote is judged.
+
+    A final read, taken after every client stopped, must hold the state the
+    order ends in: this is what catches an acknowledged write that was then
+    lost, when no later read happened to touch its key.
+    """
+    ops = ops_from_history(history)
+    # A transaction that wrote nothing committed nothing and carries no
+    # sequence. Its snapshot may be anywhere, so it is not placed; it is
+    # counted only.
+    committed = sorted((op for op in ops
+                        if op.type == "ok" and op.sequence is not None),
+                       key=lambda op: op.sequence)
+    if not committed:
+        return (["no transaction committed"], {})
+
+    info = [op for op in ops if op.type == "info"]
+    # key -> version -> the first committed transaction that read it.
+    first_reader: dict[int, dict[str, Op]] = defaultdict(dict)
+    for c in committed:
+        for _, (k, v) in c.reads():
+            if isinstance(v, str) and VERSION.match(v):
+                first_reader[k].setdefault(v, c)
+    info_before: dict[int, dict[int, str]] = defaultdict(dict)
+    # (the :info, the key) a committed read placed, by the value it wrote.
+    placed_infos: set[tuple[int, int]] = set()
+    unplaced = 0
+    for iw in info:
+        for k, v in iw.writes():
+            if v is None:
+                continue
+            reader = first_reader.get(k, {}).get(v)
+            if reader is None:
+                unplaced += 1
+            else:
+                info_before[id(reader)][k] = v
+                placed_infos.add((id(iw), k))
+
+    # The generator writes s<k> to every key before the run, so each key the
+    # history names starts there. A read that shows another s value names it.
+    # A kill may lose a seed, so after the first epoch only a write of this
+    # history is judged.
+    seed: dict[int, str] = {}
+    for op in ops:
+        for k, _ in op.writes():
+            seed.setdefault(k, f"s{k}")
+        for _, (k, _) in op.reads():
+            seed.setdefault(k, f"s{k}")
+        for _, (k, v) in op.reads():
+            if isinstance(v, str) and v.startswith("s"):
+                seed[k] = v
+
+    problems: list[str] = []
+    exposures = 0
+    placed_info = 0
+    model = RangeModel()
+    model.state.update(seed)
+    # key -> the invoke index of the last :info transaction that wrote it,
+    # when no committed read has named that write's value.
+    info_wrote: dict[int, int] = {}
+    # key -> every version the order has held for it, so an unguarded read
+    # that names none of them is a violation, not an exposure.
+    seen: dict[int, set[str]] = defaultdict(set)
+    for k, v in seed.items():
+        seen[k].add(v)
+    # The last few states of the order, oldest first: what a transaction
+    # whose plan spans several sequences may have seen.
+    recent: list[dict[int, str | None]] = [dict(seed)]
+    for c in committed:
+        for k, v in info_before[id(c)].items():
+            model.state[k] = v
+            placed_info += 1
+        before = dict(model.state)
+        model.apply(c)
+        after = dict(model.state)
+        # Every version the order has held, including one written and replaced
+        # within a transaction's own plan.
+        for k, v in c.writes():
+            seen[k].add(v)
+            info_wrote.pop(k, None)
+        for iw in info:
+            if iw.invoke < c.index:
+                for k, v in iw.writes():
+                    seen[k].add(v)
+        for op in info:
+            if op.invoke >= c.index:
+                continue
+            for k, _ in op.writes():
+                if (id(op), k) not in placed_infos:
+                    info_wrote[k] = op.invoke
+        # A key whose last unplaced :info write is still the newest thing the
+        # history knows about it is unknown: that :info may or may not have
+        # committed.
+        unknown = set(info_wrote)
+        # What this transaction writes is not in its own snapshot.
+        settles = {k for k, _ in c.writes()}
+        # The plan's entries span sequences below the one it reports: one per
+        # write, and the markers a plan of more than one write is framed by.
+        span = len(c.writes())
+        if span > 1:
+            span += 2
+        states = recent[-span:] + [after]
+
+        for _, (k, v) in c.reads():
+            if not isinstance(v, str):
+                continue
+            if k in unknown or k in settles:
+                continue
+            # A seed value is only judgeable in the first epoch: a kill may
+            # lose it, and the re-seed that follows one is not a transaction.
+            if v.startswith("s") and c.epoch != 0:
+                continue
+            if any(state.get(k) == v for state in states):
+                continue
+            # Unguarded: a read may be behind its own position, but only to a
+            # value the order has held for the key.
+            if config == "unguarded" and v in seen.get(k, ()):
+                exposures += 1
+                continue
+            if v in seen.get(k, ()):
+                problems.append(
+                    f"process {c.process} (sequence {c.sequence}) read key {k} "
+                    f"= {v}, a state the order has already left "
+                    f"({before.get(k)} there)")
+            else:
+                problems.append(
+                    f"process {c.process} (sequence {c.sequence}) read key {k} "
+                    f"= {v}, which the order never holds there "
+                    f"({before.get(k)})")
+        for from_, to_, pairs in c.scans():
+            shown = {k for k, _ in pairs}
+            # Only a version this history wrote can be judged: a key holding
+            # its seed may have survived a kill or not, and the re-seed that
+            # follows one is not a transaction of the history.
+            held = {k for k, v in before.items()
+                    if from_ <= k < to_ and isinstance(v, str)
+                    and VERSION.match(v) and k not in settles and k not in unknown}
+            missed = sorted(held - shown)
+            if not missed:
+                continue
+            if config == "guarded":
+                problems.append(
+                    f"process {c.process} (sequence {c.sequence}) scanned "
+                    f"[{from_}, {to_}) and missed keys {missed[:8]} the order "
+                    f"has live there")
+            else:
+                exposures += 1
+        recent.append(after)
+        if len(recent) > 8:
+            del recent[0]
+
+    # The final read, taken after every client stopped, is the state the
+    # database kept: every write the order holds has to be in it, and nothing
+    # else. It is what catches a lost acknowledged write no later read
+    # happened to touch.
+    # A seed value counts here: a key the order ends with deleted reads as
+    # its seed again only where the delete was lost. Every key the final read
+    # names a value for is compared, seed or version.
+    unknown = set(info_wrote)
+    for fin in (op for op in ops if op.role == "final" and op.type == "ok"):
+        for _, (k, v) in fin.reads():
+            if not isinstance(v, str):
+                continue
+            if k in unknown and not v.startswith("s"):
+                continue
+            if model.state.get(k) != v:
+                problems.append(
+                    f"final read (process {fin.process}) has key {k} = {v}, "
+                    f"but the order ends with {model.state.get(k)} there")
+
+    # A transaction that committed nothing carries no sequence, so the
+    # engine's order does not place it. Its snapshot is the state of every
+    # committed transaction whose completion preceded its invoke: a read of
+    # anything the order held by then is valid, and beyond it is not.
+    # A transaction that committed nothing is not judged: it carries no
+    # sequence, and a value it read can carry one above its own completion
+    # time, since a plan's entries span the sequences below the one it
+    # reports. The history cannot place it, so it is counted only.
+
+    reads_only = [op for op in ops if op.type == "ok" and op.sequence is None]
+    summary = {
+        "committed": len(committed),
+        "read_only": len(reads_only),
+        "info": len(info),
+        "info_placed": placed_info,
+        "info_unplaced": unplaced,
+        "reads": sum(len(c.reads()) for c in committed),
+        "exposures": exposures,
+    }
+    if config == "unguarded" and exposures == 0:
+        problems.append(
+            "unguarded: no read or scan saw a state behind its own commit; "
+            "the run is not shown to reach write skew")
+    return problems[:20], summary
 
 
 def run_elle(jar: Path, history: Path, models: str, out_dir: Path) -> dict:
@@ -579,7 +957,46 @@ def check_cluster_round(args: argparse.Namespace, seed: int,
                 f"ahead of its source")
 
 
+def check_range_round(args: argparse.Namespace, seed: int,
+                      round_dir: Path) -> None:
+    """The range workload (#302): guarded and unguarded histories checked
+    against the commit order, by history_check. Elle's models have no
+    counterpart for a scan, a del or a range delete, so it does not run."""
+    for config in KILL_CONFIGS:
+        history_path = round_dir / f"{config}.json"
+        cmd = [str(args.binary), "--config", config, "--workload", "range",
+               "--seed", str(seed), "--txns", str(args.txns),
+               "--threads", str(args.threads),
+               "--dir", str(round_dir / f"db-{config}"),
+               "--out", str(history_path)]
+        if args.no_vacuum:
+            cmd.append("--no-vacuum")
+        if args.no_degrade:
+            cmd.append("--no-degrade")
+        if args.kill:
+            cmd += ["--kill-epochs", str(args.kill_epochs)]
+        subprocess.run(cmd, check=True)
+        shutil.rmtree(round_dir / f"db-{config}", ignore_errors=True)
+        if args.kill:
+            kill = json.loads(
+                Path(str(history_path) + ".kill.json").read_text())
+            args.group_kills += kill["group_kills"]
+
+        history = json.loads(history_path.read_text())
+        problems, summary = history_check(history, config)
+        verdict = "clean" if not problems else f"{len(problems)} violations"
+        print(f"  {config}: history {summary}; {verdict}")
+        for p in problems[:10]:
+            print(f"    {p}")
+        if config == "unguarded":
+            args.exposed_seen |= summary.get("exposures", 0) > 0
+        if problems:
+            raise CheckFailed(f"{config}: range history check failed")
+
+
 def check_round(args: argparse.Namespace, seed: int, round_dir: Path) -> None:
+    if args.workload == "range":
+        return check_range_round(args, seed, round_dir)
     for config in KILL_CONFIGS if args.kill else CONFIGS:
         history_path = round_dir / f"{config}.json"
         cmd = [str(args.binary), "--config", config, "--seed", str(seed),
@@ -665,9 +1082,16 @@ def main() -> int:
                         help="SIGKILL the writer process and reopen, "
                              "--kill-epochs times per history (#176)")
     parser.add_argument("--kill-epochs", type=int, default=10)
+    parser.add_argument("--workload", choices=("append", "range"),
+                        default="append",
+                        help="range: point reads, scans, puts, dels and "
+                             "one-key range deletes, checked against the "
+                             "commit order (#302)")
     args = parser.parse_args()
     if args.kill and (args.cluster or args.topology):
         parser.error("--kill runs a single node")
+    if args.workload == "range" and (args.cluster or args.topology):
+        parser.error("--workload range runs a single node")
 
     seed = args.seed if args.seed is not None else random.SystemRandom().getrandbits(63)
     print(f"run_isolation_check: seed={seed} rounds={args.rounds} "
@@ -677,6 +1101,7 @@ def main() -> int:
           f"--seed {seed} --rounds {args.rounds} --txns {args.txns} "
           f"--threads {args.threads}"
           + (f" --elle-jar {args.elle_jar}" if args.elle_jar else "")
+          + (" --workload range" if args.workload == "range" else "")
           + (" --cluster" if args.cluster else "")
           + (" --topology" if args.topology else "")
           + (f" --kill --kill-epochs {args.kill_epochs}"
@@ -685,6 +1110,7 @@ def main() -> int:
 
     shutil.rmtree(args.out, ignore_errors=True)
     args.write_skew_seen = False
+    args.exposed_seen = False
     args.v168_seen = False
     args.fork_seen = False
     args.group_kills = 0
@@ -712,7 +1138,13 @@ def main() -> int:
             raise CheckFailed(
                 "kill: no kill landed with two or more sync writers in "
                 "flight; the run never reached a shared fdatasync")
+        if (args.workload == "range" and not args.exposed_seen):
+            raise CheckFailed(
+                "unguarded: no range transaction read a state behind its own "
+                "commit in any round; the run is not shown to reach write "
+                "skew")
         if (args.elle_jar and not args.cluster and not args.topology
+                and args.workload != "range"
                 and not args.write_skew_seen):
             raise CheckFailed(
                 "unguarded: Elle reported no write skew in any round; the "

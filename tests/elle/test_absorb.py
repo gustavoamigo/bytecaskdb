@@ -34,12 +34,12 @@ def find_binary() -> Path | None:
 LIFE0 = """O
 I 0 100 0 1 A 0 5
 C 0 101 ok 1 0 1 A 0 5
-I 1 102 0 1 N 0
-C 1 103 ok 0 0 1 R 0 1 5
+I 1 102 0 1 N 0 0
+C 1 103 ok 0 0 1 R 0 0 1 5
 """
 LIFE1 = """O
-I 2 400 0 1 N 0
-C 2 401 ok 0 0 1 R 0 1 5
+I 2 400 0 1 N 0 0
+C 2 401 ok 0 0 1 R 0 0 1 5
 """
 
 

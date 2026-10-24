@@ -237,6 +237,8 @@ The isolation check ([`isolation_checking_design.md`](isolation_checking_design.
 - The same plan without read guards is **snapshot-isolated**. Its only serializability anomaly is write skew (G2-item).
 - Plans without a snapshot lose updates, as expected.
 
+Range guards and range deletes are checked by the same harness's range workload: concurrent scans, reads, `put`s, `del`s and `del_range`s over overlapping ranges, replayed against the commit order. A guarded plan must see exactly the state its transaction should have seen; without the guards, reads behind that state show up. See `isolation_checking_design.md`, *Range workload*.
+
 The check covers point reads and writes. `ensure_range_unchanged`, `del_range` and phantoms are not part of it yet.
 
 ### Read committed

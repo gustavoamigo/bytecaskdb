@@ -133,6 +133,86 @@ def sql_history(final: list[int]) -> list[dict]:
     return ops
 
 
+def append_txn(index: int, process: int, kind: str, key: int, element: int,
+               seq: int | None = None) -> list[dict]:
+    """An append to key, seen from its invoke to its completion."""
+    value = [["append", key, element]]
+    done = {"index": index + 1, "process": process, "type": kind,
+            "value": value}
+    if seq is not None:
+        done["sequence"] = seq
+    return [{"index": index, "process": process, "type": "invoke",
+             "value": value}, done]
+
+
+def read_txn(index: int, process: int, key: int, lst: list) -> list[dict]:
+    return [{"index": index, "process": process, "type": "invoke",
+             "value": [["r", key, None]]},
+            {"index": index + 1, "process": process, "type": "ok",
+             "value": [["r", key, lst]]}]
+
+
+class FailedElementKeyTest(unittest.TestCase):
+    """An element id names a write on one key. A process counter restarts
+    with each epoch, so the same id appears on another key in another life:
+    that is a different write, not the failed one."""
+
+    def test_the_same_id_on_another_key_throughout(self):
+        history = (append_txn(0, 0, "fail", 1, 7)
+                   + append_txn(2, 0, "ok", 2, 7, 10)
+                   + read_txn(4, 1, 2, [7]))
+        self.assertEqual(ric.cross_check(history), [])
+
+    def test_a_failed_element_read_on_its_own_key_fails(self):
+        history = (append_txn(0, 0, "fail", 1, 7)
+                   + read_txn(2, 1, 1, [7]))
+        problems = ric.cross_check(history)
+        self.assertTrue(any("element 7 of a failed txn read" in p
+                            for p in problems), problems)
+
+    def test_an_element_never_appended_on_its_key_fails(self):
+        history = (append_txn(0, 0, "ok", 2, 7, 10)
+                   + read_txn(2, 1, 2, [7])
+                   + read_txn(4, 1, 1, [7]))
+        problems = ric.cross_check(history)
+        self.assertTrue(any("key 1: element 7 was never appended" in p
+                            for p in problems), problems)
+
+
+class LostWriteTest(unittest.TestCase):
+    """An append the final read lacks after a later read of its key showed it
+    gone was lost by a crash, not left unflushed as a caller would see: a
+    chaos life that ends in a power cut acknowledges writes durable says may
+    not survive it."""
+
+    def test_a_lost_write_is_not_reported_as_missing(self):
+        # 7 is acknowledged and lost; a later read shows the key without it,
+        # which is the loss. The final read then lacks 9, which is a separate
+        # violation, not swallowed by the loss.
+        history = (append_txn(0, 0, "ok", 1, 7, 1)
+                   + append_txn(0, 0, "ok", 1, 9, 2)
+                   + read_txn(4, 1, 1, [7])
+                   + read_txn(6, 1, 1, []))
+        problems = ric.cross_check(history)
+        self.assertFalse(any("appends [7] missing" in p for p in problems),
+                         problems)
+
+    def test_a_write_a_later_read_showed_gone_is_lost_not_missing(self):
+        # 7 is acknowledged; a read invoked after it shows the key without
+        # it, and every read from then on does too, the final one included.
+        history = (append_txn(0, 0, "ok", 1, 7, 1)
+                   + read_txn(2, 1, 1, [7])
+                   + read_txn(4, 1, 1, [])
+                   + read_txn(6, 1, 1, []))
+        self.assertEqual(ric.cross_check(history), [])
+
+    def test_a_write_the_final_read_lacks_with_no_later_read_is_missing(self):
+        history = (append_txn(0, 0, "ok", 1, 7, 1) + read_txn(2, 1, 1, []))
+        problems = ric.cross_check(history)
+        self.assertTrue(any("key 1: committed appends [7] missing" in p
+                            for p in problems), problems)
+
+
 class NoSequenceTest(unittest.TestCase):
     def test_a_missing_sequence_fails_by_default(self):
         problems = ric.cross_check(sql_history([20, 10]))
@@ -144,6 +224,211 @@ class NoSequenceTest(unittest.TestCase):
     def test_a_missing_append_is_still_found_when_opted_out(self):
         problems = ric.cross_check(sql_history([20]), require_sequence=False)
         self.assertTrue(any("missing from final read" in p for p in problems), problems)
+
+
+def txn(index: int, process: int, seq: int | None, puts: dict[int, int],
+        reads: dict[int, list] | None = None, kind: str = "ok",
+        deletes: list[int] | None = None) -> list[dict]:
+    """A range workload transaction: a put per (key, write id), then a point
+    read and a scan per start key in reads, the value being the
+    (key, version) pairs it returned. `index` is the invoke's index; the
+    completion follows it."""
+    value = [["put", k, wid] for k, wid in puts.items()]
+    for start, pairs in (reads or {}).items():
+        value.append([["r", start, pairs], ["scan", start, start + 4, pairs]])
+    value += [["del", k] for k in (deletes or [])]
+    inv = {"index": index, "process": process, "type": "invoke", "epoch": 0,
+           "value": [["put", k, wid] for k, wid in puts.items()]
+           + [["del", k] for k in (deletes or [])]
+           + [[["r", start, []], ["scan", start, start + 4, []]]
+              for start in (reads or {})]}
+    done = {"index": index + 1, "process": process, "type": kind, "epoch": 0,
+            "value": value}
+    if kind == "ok":
+        done["sequence"] = seq
+    return [inv, done]
+
+
+def final_read(index: int, values: dict[int, str]) -> list[dict]:
+    """The read every client stopped for, holding one key's value per entry.
+    [["r", k, null], ["scan", k, k + 1, null]] going out, as the generator
+    writes it, and the values coming back."""
+    value = [[["r", k, None], ["scan", k, k + 1, None]] for k in values]
+    done = [[["r", k, [[k, v]]], ["scan", k, k + 1, [[k, v]]]]
+            for k, v in values.items()]
+    return [{"index": index, "process": 9, "type": "invoke", "epoch": 0,
+             "role": "final", "value": value},
+            {"index": index + 1, "process": 9, "type": "ok", "epoch": 0,
+             "role": "final", "value": done}]
+
+
+def info(index: int, process: int, puts: dict[int, int],
+         dels: list[list] | None = None) -> list[dict]:
+    """A range workload transaction whose outcome is unknown (an exception:
+    a failed fdatasync, a kill)."""
+    value = [["put", k, wid] for k, wid in puts.items()] + (dels or [])
+    return [{"index": index, "process": process, "type": "invoke", "epoch": 0,
+             "value": value},
+            {"index": index + 1, "process": process, "type": "info",
+             "epoch": 0, "value": value}]
+
+
+def version(session: int, n: int) -> str:
+    """The version a value stores for write id (session, n)."""
+    ident = (session << 32) | n
+    return f"w{ident >> 32:x}.{ident & 0xffffffff:x}"
+
+
+class HistoryCheckTest(unittest.TestCase):
+    """history_check: the range workload's replay against the commit order
+    (#302). Each test is a history that is right or wrong for one reason."""
+
+    def check(self, history, config="guarded"):
+        return ric.history_check(history, config)[0]
+
+    def base(self) -> list[dict]:
+        """Key 5 holds version (1, 0), committed at sequence 10."""
+        return txn(0, 0, 10, {5: 1 << 32}, {5: [[5, "s5"]]})
+
+    def test_a_consistent_history_passes(self):
+        history = self.base() + txn(10, 1, 20, {6: 2 << 32},
+                                    {5: [[5, version(1, 0)]]})
+        self.assertEqual(self.check(history), [])
+
+    def test_a_read_of_a_version_the_order_does_not_hold_fails(self):
+        history = self.base() + txn(10, 1, 20, {6: 2 << 32},
+                                    {5: [[5, version(3, 0)]]})
+        problems = self.check(history)
+        self.assertTrue(any("read key 5" in p for p in problems), problems)
+
+    def test_a_stale_read_is_an_exposure_unguarded_and_a_violation_guarded(self):
+        # Process 0 replaces key 5 at sequence 20; process 1 reads the version
+        # from sequence 10: a read behind its own position.
+        history = (self.base()
+                   + txn(10, 0, 20, {5: 2 << 32}, {5: [[5, version(1, 0)]]})
+                   + txn(20, 1, 30, {6: 3 << 32},
+                         {5: [[5, version(1, 0)]]}))
+        self.assertTrue(self.check(history, "guarded"))
+        problems, summary = ric.history_check(history, "unguarded")
+        self.assertEqual(problems, [])
+        self.assertGreater(summary["exposures"], 0)
+
+    def test_unguarded_needs_an_exposure_to_prove_anything(self):
+        history = self.base() + txn(10, 1, 20, {6: 2 << 32},
+                                    {6: [[6, version(2, 0)]]})
+        problems = self.check(history, "unguarded")
+        self.assertTrue(any("not shown to reach write skew" in p
+                            for p in problems), problems)
+
+    def test_a_scan_that_misses_a_live_key_fails(self):
+        history = self.base() + txn(10, 1, 20, {6: 2 << 32},
+                                    {5: [[6, version(2, 0)]]})
+        problems = self.check(history)
+        self.assertTrue(any("missed keys [5]" in p for p in problems),
+                        problems)
+
+    def test_a_scan_cannot_show_the_key_the_transaction_inserts(self):
+        # The transaction puts key 5 and scans [5, 9) of the snapshot it made
+        # before the put: its own insert is not there to show.
+        history = self.base() + txn(10, 1, 20, {5: 2 << 32}, {5: []})
+        self.assertEqual(self.check(history), [])
+
+    def test_an_info_write_placed_by_a_later_read_stands_in_the_order(self):
+        # The :info put of (9, 0) on key 5 was there before process 1 read it,
+        # so it is placed just before that read, over the earlier write.
+        history = (self.base() + info(10, 9, {5: 9 << 32})
+                   + txn(20, 1, 20, {6: 1 << 32},
+                         {5: [[5, version(9, 0)]]}))
+        self.assertEqual(self.check(history), [])
+
+    def test_a_key_an_unplaced_info_write_touched_is_not_judged(self):
+        # No committed read named (9, 0): whether it committed is unknown, so
+        # key 5 is unknown from the :info transaction on and a read of either
+        # value is accepted.
+        for read in (version(1, 0), version(9, 0)):
+            history = (self.base() + info(10, 9, {5: 9 << 32})
+                       + txn(20, 1, 20, {6: 1 << 32}, {5: [[5, read]]}))
+            self.assertEqual(self.check(history), [])
+
+    def test_an_unplaced_info_write_does_not_judge_the_read_after_it(self):
+        # Only the :info's own value being read back places it (the test
+        # above); until then a read of the key names a version no committed
+        # transaction wrote, and is not judged either way.
+        history = (self.base() + info(10, 9, {5: 9 << 32})
+                   + txn(20, 1, 20, {5: 2 << 32})
+                   + txn(30, 2, 30, {6: 3 << 32},
+                         {5: [[5, version(4, 0)]]}))
+        self.assertEqual(self.check(history), [])
+
+    def test_a_committed_write_settles_a_key_an_info_touched(self):
+        # Whether the :info at index 11 committed is unknown, but the write
+        # at sequence 20 is a committed transaction of the order, so the key
+        # has a known state from then on: a read of the :info's value is a
+        # state the order has left.
+        history = (self.base() + info(11, 9, {5: 9 << 32})
+                   + txn(20, 1, 20, {6: 2 << 32}, {5: [[5, version(9, 0)]]},
+                         deletes=[5])
+                   + txn(30, 2, 30, {6: 3 << 32},
+                         {5: [[5, version(9, 0)]]}))
+        problems = self.check(history)
+        self.assertTrue(any("read key 5" in p for p in problems), problems)
+
+    def test_an_info_placed_by_one_key_leaves_its_other_keys_unknown(self):
+        # The :info wrote keys 5 and 6; only key 5's value is read back. Key
+        # 6 stays unknown, so a read of a version no transaction wrote there
+        # is accepted rather than reported.
+        history = (self.base() + info(11, 9, {5: 9 << 32, 6: 9 << 32})
+                   + txn(20, 1, 20, {}, {5: [[5, version(9, 0)]]})
+                   + txn(30, 2, 30, {7: 3 << 32},
+                         {6: [[6, version(2, 0)]]}))
+        self.assertEqual(self.check(history), [])
+
+    def test_a_committed_read_of_the_seeded_state_is_judged(self):
+        # Key 5 starts at s5 and the order deletes the seed at sequence 10:
+        # a committed transaction reading s5 afterwards has left the order.
+        history = (txn(0, 0, 10, {5: 1 << 32},
+                       {5: [[5, version(1, 0)]]}, deletes=[5])
+                   + txn(10, 1, 20, {7: 2 << 32}, {5: [[5, "s5"]]}))
+        problems = self.check(history)
+        self.assertTrue(any("read key 5" in p and "s5" in p
+                            for p in problems), problems)
+
+    def test_a_read_only_transaction_is_not_judged(self):
+        # It carries no sequence, and a value it read can carry one above
+        # its own completion time, so the history cannot place it.
+        history = (self.base() + txn(10, 1, None, {}, {5: [[5, "s5"]]})
+                   + txn(20, 2, 30, {7: 2 << 32}, {5: [[5, version(1, 0)]]}))
+        self.assertEqual(self.check(history), [])
+
+    def test_the_final_read_must_hold_the_end_of_the_order(self):
+        # Process 0's put of (2, 0) is acknowledged and the order holds it,
+        # but the final read shows the seeded value: a lost acknowledged
+        # write, which no later read has to touch to be caught.
+        history = (self.base() + txn(10, 1, 20, {5: 2 << 32})
+                   + final_read(20, {5: "s5"}))
+        problems = self.check(history)
+        self.assertTrue(any("final read" in p for p in problems), problems)
+
+    def test_the_final_read_matching_the_order_passes(self):
+        history = (self.base()
+                   + txn(10, 1, 20, {5: 2 << 32}, {5: [[5, version(1, 0)]]})
+                   + final_read(20, {5: version(2, 0)}))
+        self.assertEqual(self.check(history), [])
+
+    def test_an_invoke_without_a_completion_is_ignored(self):
+        history = self.base() + [{"index": 10, "process": 7, "type": "invoke",
+                                  "epoch": 0, "value": [["put", 6, 7 << 32]]}]
+        self.assertEqual(self.check(history), [])
+
+    def test_the_lives_of_a_kill_share_process_ids(self):
+        # A transaction killed at the end of epoch 0 has no completion; the
+        # first completion of epoch 1 belongs to its own invoke.
+        history = (self.base()
+                   + [{"index": 10, "process": 1, "type": "invoke",
+                       "epoch": 1, "value": [["put", 7, 2 << 32]]}]
+                   + txn(20, 0, 20, {6: 1 << 32},
+                         {5: [[5, version(1, 0)]]}))
+        self.assertEqual(self.check(history), [])
 
 
 if __name__ == "__main__":

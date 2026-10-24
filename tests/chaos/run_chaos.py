@@ -196,9 +196,9 @@ class ElleStream:
         self._thread.join(timeout)
 
 
-def elle_bases(stream: bytes, max_element: int, max_key: int) -> tuple[int, int]:
-    """The highest element and key an isolation_history child's stream names:
-    the next life must use fresh elements and continue on its keys."""
+def elle_max_key(stream: bytes, max_key: int) -> int:
+    """The highest key an isolation_history child's stream names: the next
+    life continues on those keys."""
     for line in stream.splitlines():
         parts = line.split()
         if not parts or parts[0] not in (b"I", b"C"):
@@ -209,17 +209,18 @@ def elle_bases(stream: bytes, max_element: int, max_key: int) -> tuple[int, int]
             while i < len(parts):
                 kind, key = parts[i], int(parts[i + 1])
                 max_key = max(max_key, key)
-                if kind == b"A":
-                    max_element = max(max_element, int(parts[i + 2]))
+                if kind == b"A" or kind == b"P":
                     i += 3
                 elif kind == b"R":
                     n = int(parts[i + 2])
                     i += 3 + n
+                elif kind == b"D":
+                    i += 3
                 else:  # N <key>
                     i += 2
         except (IndexError, ValueError):
             continue  # a line cut short by the end of the life
-    return max_element, max_key
+    return max_key
 
 
 def log_uniform(rng: random.Random, lo: float, hi: float) -> float:
@@ -583,9 +584,10 @@ class Rig:
                 "--seed", str(life["seed"]), "--threads", str(self.args.threads),
                 "--dir", str(life["db"]), "--fd", str(wfd),
                 "--process-base", str(e["epoch"] * self.args.threads),
-                "--element-base", str(e["max_element"] + 1),
                 # The KeyPool starts on the keys the last life was appending to.
                 "--key-base", str(max(0, e["max_key"] + 1 - 8))]
+        if self.args.elle_workload != "append":
+            argv += ["--workload", self.args.elle_workload]
         if "vacuum" in self.args.disable:
             argv.append("--no-vacuum")
         return argv
@@ -594,7 +596,7 @@ class Rig:
         if ep_root.exists():
             shutil.rmtree(ep_root)
         ep_root.mkdir(parents=True)
-        self.elle = {"epoch": 0, "max_element": -1, "max_key": -1,
+        self.elle = {"epoch": 0, "max_key": -1,
                      "root": ep_root, "manifest": [f"start {time.monotonic_ns()}"]}
 
     def elle_after_life(self, life: dict, outcome: dict, hist_raw: bytes) -> dict:
@@ -602,8 +604,7 @@ class Rig:
         e = self.elle
         stream = e["root"] / f"epoch{e['epoch']}.txt"
         stream.write_bytes(hist_raw)
-        e["max_element"], e["max_key"] = elle_bases(hist_raw, e["max_element"],
-                                                    e["max_key"])
+        e["max_key"] = elle_max_key(hist_raw, e["max_key"])
         power = outcome["terminator"] == "power" and not outcome["exited_early"]
         text = hist_raw.decode(errors="replace")
         opened = "\nO\n" in "\n" + text
@@ -638,17 +639,29 @@ class Rig:
             [self.args.worker, "--absorb", str(e["root"] / "manifest.txt"),
              "--config", self.args.config, "--seed", "1",
              "--threads", str(self.args.threads), "--dir", str(final),
-             "--out", str(history_path)],
+             "--out", str(history_path)]
+            + ([] if self.args.elle_workload == "append"
+               else ["--workload", self.args.elle_workload]),
             capture_output=True, text=True, timeout=1200)
         if r.returncode != 0:
             raise Failure(f"--absorb failed: {r.stderr.strip()[-600:]}")
         summary = json.loads(Path(str(history_path) + ".chaos.json").read_text())
         history = json.loads(history_path.read_text())
-        problems = ISOLATION.cross_check(history)
-        if problems:
-            raise Failure("cross-check: " + "; ".join(problems[:5]))
-        verdict = "cross-check clean"
-        if self.args.elle_jar:
+        if self.args.elle_workload == "range":
+            # The range workload has no list-append model: the script's
+            # history checker replays the commit order instead.
+            problems, summary_range = ISOLATION.history_check(
+                history, self.args.config)
+            if problems:
+                raise Failure("history check: " + "; ".join(problems[:5]))
+            verdict = (f"history clean ({summary_range['committed']} committed, "
+                       f"{summary_range['exposures']} exposures)")
+        else:
+            problems = ISOLATION.cross_check(history)
+            if problems:
+                raise Failure("cross-check: " + "; ".join(problems[:5]))
+            verdict = "cross-check clean"
+        if self.args.elle_jar and self.args.elle_workload == "append":
             models = ("strict-serializable" if self.args.config == "guarded"
                       else "snapshot-isolation")
             a = ISOLATION.run_elle(Path(self.args.elle_jar), history_path, models,
@@ -847,6 +860,11 @@ def main() -> int:
                     help="chaos: the single-writer workload, checked per life; "
                          "elle: isolation_history's concurrent writers, checked "
                          "per episode by the cross-check and Elle (#232)")
+    ap.add_argument("--elle-workload", choices=("append", "range"),
+                    default="append",
+                    help="elle: isolation_history's generators. range has no "
+                         "Elle model and is checked by run_isolation_check's "
+                         "history_check (#302)")
     ap.add_argument("--config", choices=("guarded", "unguarded"), default="guarded",
                     help="elle: which isolation configuration to run")
     ap.add_argument("--threads", type=int, default=16, help="elle: writer threads")

@@ -73,14 +73,106 @@ need short lists. There are 8 active keys, and a key retires after 64
 appends, when a fresh key takes its slot. This is the same scheme Jepsen's
 `list-append` generator uses.
 
-**Not modelled in this pass.** `del`, `del_range`, and
-`ensure_range_unchanged` have no counterpart in `list-append`, and Elle
-checks items, not predicates. The conflict check behind range guards and
-planned range deletes is tested against a model of the key range
-(`tests/range_conflict_test.cpp`), including against a write in the same
-group commit, but one write at a time: no concurrent history runs a range
-guard against a write it has to lose to while that write is in flight (#287).
-That gap is stated here rather than worked around.
+**Not modelled by `list-append`.** `del`, `del_range` and
+`ensure_range_unchanged` have no counterpart in Elle's models, which check
+items and not predicates. The history checker has no model to put them in
+either, and a read through a range guard is not a list append. They get a
+workload of their own, below.
+
+## Range workload
+
+`--workload range` (#302) runs the operations Elle cannot model: scans, point
+reads, puts, dels and range deletes, with range guards, over keys narrow
+enough that the ranges overlap. The invariant is a range that held a key
+keeps one.
+
+**The key space.** 32 keys, `k00`–`k31`, of fixed width, so byte order is key
+order and a range is a pair of ids. Every write stores a value unique to it,
+`w<session>.<n>`, where the session is the writer's thread in the in-process
+run, or its process id in a kill's or a chaos episode's lives. A later read
+therefore names exactly the version it saw without the checker having to know
+which transaction wrote it.
+
+**A transaction.** It scans a range of 2–7 keys and, when the scan holds two
+or more live keys, deletes one: a `del` or a one-key `del_range`, alternating.
+Now and then it first inserts a fresh key into the range. Two transactions on
+overlapping ranges that each delete a key the other scanned, and each only
+read the other's key, are write skew: with no range guard both commit and the
+range loses a key.
+
+**The two configurations.**
+
+- `guarded` reads through the snapshot, adds `ensure_unchanged` for every key
+  read and not written and `ensure_range_unchanged` for every range scanned
+  and not deleted, and commits a snapshot plan. The engine refuses the
+  transaction whose read set another thread changed, in the same serial
+  section as the head it validates.
+- `unguarded` reads through the head with no guards, and takes its delete
+  decision on a scan of the head taken after its snapshot, which puts its read
+  set behind its plan. Snapshot isolation admits it; the range guards are what
+  a serializable plan adds.
+
+**The check.** `history_check` in `run_isolation_check.py` replays the
+history against the order the engine enforced. A committed transaction carries
+the highest sequence it was assigned, and the engine assigns sequences in
+commit order, so sorting the committed transactions by it is the order their
+writes reached the database. Each is applied to a map of the key space, and
+every read and scan is held to that map:
+
+- `guarded`: the version a read returns is the one at its key, and a scan
+  shows every key its range holds, at the transaction's own position.
+- `unguarded`: a read or scan may be behind its own position, but only to a
+  value the key has held: reading a value the order never held is a
+  violation, not an exposure. At least one transaction has to have read a
+  state behind its own, or the run is not shown to reach write skew at all.
+
+A final read, taken after every client stopped, is held to the end of the
+replayed order. This is what catches a write that was acknowledged and then
+lost, when no later read happened to touch its key.
+
+Two things the history cannot pin down, and how the check handles them:
+
+- An `:info` transaction may or may not have committed. Each key its write
+  named is placed only where a committed read named that key's exact value,
+  just before that reader: placement is per key, so an `:info` placed by one
+  key's value leaves its other keys unknown. A key whose last unplaced
+  `:info` write is still the newest thing the history knows about it is not
+  judged; a committed write of the key makes it judgeable again. This is
+  what a kill leaves behind; a kill-mode round is about a hundred live
+  `:info` transactions.
+- A plan's entries span sequences below the one it reports, so another
+  transaction's write can fall inside that span. A read is held to the state
+  at any point across its own transaction's window, which is as wide as the
+  plan has entries.
+- A transaction that committed nothing carries no sequence, and the value it
+  read can carry one above its own completion: the span above is why. Its
+  reads are counted but not judged. A read-only transaction is roughly half
+  the history, so this is the check's largest gap.
+
+The state the database started with, `s<k>`, is the value at every key before
+the first write of the history, and a read of it is judged against that. A
+kill may lose it and the re-seed that follows is not a transaction, so after
+the first epoch only versions this history wrote are judged.
+
+The kill mode and the chaos rig run the same workload, which is where most of
+the `:info` transactions come from, and so does the nemesis mix of vacuum and
+degrade.
+
+**Mutations.** Three breaks of the range check, each applied by hand and
+caught by a `guarded` history in a run of 6,000 transactions on 16 threads,
+with the mutation in place (20 or more violations each; the `unguarded`
+history of the same seed keeps showing its exposures):
+
+| Mutation | What the guarded history reports |
+|---|---|
+| skip the "deleted since the snapshot" pass of `range_changed` | reads of a state the order has already left: a delete went unseen |
+| skip the "changed or inserted" pass | reads of a state the order has left, and scans that miss a key the order has live in the range |
+| treat a write above the snapshot's sequence as unchanged, as validating against the published state does | both: scans that miss live keys, and reads of replaced versions |
+
+The last is the effect of validating against the published state rather than
+the head; replacing the head with the published state in `execute_group`
+hangs the run instead, since the head then disagrees with the file it writes
+to.
 
 ## Configurations
 
@@ -121,11 +213,22 @@ transaction. After all clients finish, the generator reads every key once
 more, so the longest read of a key is its final value. Before calling Elle,
 the script checks, per key:
 
-- every read is a prefix of the final value;
+- every read is a prefix of the final value, a lost append's reads
+  included, in the order they named;
 - the final value holds every `:ok` append, in ascending commit sequence
-  (`:info` elements may appear anywhere, or not at all);
+  (`:info` elements may appear anywhere, or not at all). An append is *lost*
+  when a later read of its key returned a value without it: that read saw
+  the acknowledgement undone, which only a crash does, and a chaos life may
+  end in one (see *Chaos*). A lost append keeps its place in commit order
+  among the appends the final read holds, and is not expected in it. The
+  history records an acknowledged write that lost its `durable` as `:info`,
+  so a write that is dropped but never read again still shows up as a
+  missing append;
 - no element comes from a `:fail` transaction, none is duplicated, and
-  every element was invoked;
+  every element was invoked. Ids are unique across the whole run: each
+  writer thread draws from its own block of values, so an id reused on
+  another key in another life cannot occur (the job the parent's highest-id
+  bookkeeping used to do);
 - a read sees every append whose transaction completed `:ok` before the
   reading transaction was invoked (real-time visibility). The first CI run
   showed why this belongs here as well as in Elle: see *Findings*.
@@ -189,8 +292,10 @@ itself and reads every key as one final transaction.
 - `nullopt`: `:fail`.
 
 Every epoch uses fresh Elle process ids (a process with an `:info` cannot
-go on), elements unique across the run, and the keys the last epoch was
-appending to, so reads after a recovery see what the kill left. Times are
+go on) and the keys the last epoch was appending to, so reads after a
+recovery see what the kill left. An epoch's writer threads draw element
+ids from blocks fixed by process id, so no id is reused across epochs even
+when a killed epoch never reported the highest one it used. Times are
 `CLOCK_MONOTONIC`, one clock for every process, so real-time order holds
 across kills.
 
@@ -265,6 +370,18 @@ chaosfs's count only once it sees the `O` line, so a late sample can only
 count an eviction after the open as one before it. Reads of durable data are
 checked in full.
 
+**An acknowledged write a crash may lose is `:info` in a chaos life too.**
+`CommitResult.durable` is the engine's promise per #231: what it returns is
+what a recovery keeps, while a process that is killed keeps what the page
+cache holds whether or not it was flushed. The kill mode may therefore treat
+an acknowledged, not durable write as `:ok`, since it survives SIGKILL. A
+chaos life may end in a power cut, which keeps only the durable part, and the
+rule above ("a survival that returns but the next recovery does not will turn
+a clean run red") applies. So an acknowledged write with `durable` false in a
+chaos life is `:info`, and every read that saw it is `:info` with its result
+cleared. A crash that kept the page also allows it to appear, which `:info`
+permits.
+
 **Sensitivity.** With `commit_skips_fdatasync` from `tests/chaos_mutations/`
 applied (the commit flush skips its `fdatasync` and still reports durable),
 the first guarded episode fails the cross-check: committed appends are
@@ -297,7 +414,8 @@ Files:
 - `scripts/run_isolation_check.py` — runs the binary for each configuration,
   runs the commit-sequence cross-check, calls `elle-cli` with the models
   above, reads the anomaly types Elle reports, and fails on anything outside
-  the expected set. It prints the seed first.
+  the expected set. It prints the seed first. With `--workload range` it
+  skips Elle and checks the history itself instead (`history_check`).
 
 **History recording.** Each client thread is an Elle `:process`. A global
 atomic counter stamps `:index` at invoke (before `snapshot()`) and at
@@ -331,7 +449,14 @@ python3 scripts/run_isolation_check.py \
   --elle-jar elle-cli.jar --rounds 4
 ```
 
-Without `--elle-jar` only the cross-check runs.
+Without `--elle-jar` only the cross-check runs. The range workload needs no
+jar:
+
+```
+python3 scripts/run_isolation_check.py \
+  --binary build/linux/x86_64/releasedbg/isolation_history \
+  --workload range --kill --rounds 4
+```
 
 ## Findings
 
@@ -393,6 +518,8 @@ timestamp, which also replaces the `state_time_` advance in `commit_wait`
   `G2-item` variants under `strict-serializable`, at least once per run.
   `blind` is invalid.
 - The commit-sequence cross-check passes in all three configurations.
+- `guarded` range histories pass `history_check` on every nightly run, and
+  `unguarded` ones show at least one stale read per run.
 - The seed is printed, and a failure uploads the history.
 - The README's isolation paragraph and `transaction_design.md` cite this
   check.
