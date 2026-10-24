@@ -179,6 +179,40 @@ class FailedElementKeyTest(unittest.TestCase):
                             for p in problems), problems)
 
 
+class LostWriteTest(unittest.TestCase):
+    """An append the final read lacks after a later read of its key showed it
+    gone was lost by a crash, not left unflushed as a caller would see: a
+    chaos life that ends in a power cut acknowledges writes durable says may
+    not survive it."""
+
+    def test_a_lost_write_is_not_reported_as_missing(self):
+        # 7 is acknowledged and lost; a later read shows the key without it,
+        # which is the loss. The final read then lacks 9, which is a separate
+        # violation, not swallowed by the loss.
+        history = (append_txn(0, 0, "ok", 1, 7, 1)
+                   + append_txn(0, 0, "ok", 1, 9, 2)
+                   + read_txn(4, 1, 1, [7])
+                   + read_txn(6, 1, 1, []))
+        problems = ric.cross_check(history)
+        self.assertFalse(any("appends [7] missing" in p for p in problems),
+                         problems)
+
+    def test_a_write_a_later_read_showed_gone_is_lost_not_missing(self):
+        # 7 is acknowledged; a read invoked after it shows the key without
+        # it, and every read from then on does too, the final one included.
+        history = (append_txn(0, 0, "ok", 1, 7, 1)
+                   + read_txn(2, 1, 1, [7])
+                   + read_txn(4, 1, 1, [])
+                   + read_txn(6, 1, 1, []))
+        self.assertEqual(ric.cross_check(history), [])
+
+    def test_a_write_the_final_read_lacks_with_no_later_read_is_missing(self):
+        history = (append_txn(0, 0, "ok", 1, 7, 1) + read_txn(2, 1, 1, []))
+        problems = ric.cross_check(history)
+        self.assertTrue(any("key 1: committed appends [7] missing" in p
+                            for p in problems), problems)
+
+
 class NoSequenceTest(unittest.TestCase):
     def test_a_missing_sequence_fails_by_default(self):
         problems = ric.cross_check(sql_history([20, 10]))

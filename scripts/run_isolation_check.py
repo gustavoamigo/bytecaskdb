@@ -121,7 +121,12 @@ def cross_check(history: list[dict], require_sequence: bool = True) -> list[str]
     # key's write in another life.
     failed: dict[int, set[int]] = defaultdict(set)
     invoked: dict[int, set[int]] = defaultdict(set)
+    # Per key, the element and invoking transaction of every append that was
+    # acknowledged, whoever completed the transaction.
+    invoked_at: dict[int, dict[int, int]] = defaultdict(dict)
     reads: dict[int, list[list[int]]] = defaultdict(list)
+    # Per key, the last read's (invoke index, elements) in history order.
+    last_read_at: dict[int, tuple[int, list[int]]] = {}
     # (invoke index, list read) per key, and (completion index, element) per
     # key for the real-time check.
     timed_reads: dict[int, list[tuple[int, list[int]]]] = defaultdict(list)
@@ -134,6 +139,7 @@ def cross_check(history: list[dict], require_sequence: bool = True) -> list[str]
         if op["type"] == "invoke":
             for m in appends:
                 invoked[m[1]].add(m[2])
+                invoked_at[m[1]][m[2]] = op["index"]
             invoke_index[op["process"]] = op["index"]
         elif op["type"] == "ok":
             seq = op.get("sequence")
@@ -145,8 +151,9 @@ def cross_check(history: list[dict], require_sequence: bool = True) -> list[str]
             for m in op["value"]:
                 if m[0] == "r":
                     reads[m[1]].append(m[2])
-                    timed_reads[m[1]].append(
-                        (invoke_index[op["process"]], m[2]))
+                    at = invoke_index[op["process"]]
+                    timed_reads[m[1]].append((at, m[2]))
+                    last_read_at[m[1]] = (at, m[2])
         elif op["type"] == "fail":
             for m in appends:
                 failed[m[1]].add(m[2])
@@ -171,11 +178,35 @@ def cross_check(history: list[dict], require_sequence: bool = True) -> list[str]
             elif e not in invoked[key]:
                 problems.append(f"key {key}: element {e} was never appended")
         committed = sorted(ok_appends[key], key=lambda a: (a[0] or 0, a[1], a[2]))
-        missing = [e for _, _, e in committed if e not in where]
+        # An append is lost, not missing, when a later read of its key
+        # returned a value without it: that read saw the acknowledgement
+        # undone, which only a crash the history does not model can do, so the
+        # engine must have dropped it (durable false in a life that ended in a
+        # power cut, absorb_epoch's rule). Everything else the final read lacks
+        # is missing.
+        lost = set()
+        for e in where:
+            at = invoked_at[key].get(e)
+            if at is not None and last_read_at.get(key, (0, []))[0] > at:
+                lost.add(e)
+        missing = [e for _, _, e in committed if e not in where and e not in lost]
         if missing:
             problems.append(
                 f"key {key}: committed appends {missing[:8]} missing from "
                 f"final read ({len(missing)} total)")
+        # The lost appends keep their order among themselves and before the
+        # appends after them, since sequences are assigned in commit order.
+        for pos, (seq, _, e) in enumerate(committed):
+            # Order comes from the sequence alone, so this needs every
+            # transaction to carry one (a SQL history's do not).
+            if e not in lost or not require_sequence:
+                continue
+            after = [f for _, _, f in committed[pos + 1:] if f in where]
+            if after and where[after[0]] < where[e]:
+                problems.append(
+                    f"key {key}: lost append {e} is ordered after the appends "
+                    f"that follow it in commit sequence")
+                break
         present = [e for seq, _, e in committed if e in where and seq is not None]
         positions = [where[e] for e in present]
         if positions != sorted(positions):
@@ -184,7 +215,8 @@ def cross_check(history: list[dict], require_sequence: bool = True) -> list[str]
                 f"sequence order of {present}")
         for started, r in timed_reads[key]:
             seen = set(r)
-            stale = [e for done, e in acked[key] if done < started and e not in seen]
+            stale = [e for done, e in acked[key]
+                     if done < started and e not in seen and e not in lost]
             if stale:
                 problems.append(
                     f"key {key}: read {r} started after appends {stale[:8]} "

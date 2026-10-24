@@ -213,9 +213,17 @@ transaction. After all clients finish, the generator reads every key once
 more, so the longest read of a key is its final value. Before calling Elle,
 the script checks, per key:
 
-- every read is a prefix of the final value;
+- every read is a prefix of the final value, a lost append's reads
+  included, in the order they named;
 - the final value holds every `:ok` append, in ascending commit sequence
-  (`:info` elements may appear anywhere, or not at all);
+  (`:info` elements may appear anywhere, or not at all). An append is *lost*
+  when a later read of its key returned a value without it: that read saw
+  the acknowledgement undone, which only a crash does, and a chaos life may
+  end in one (see *Chaos*). A lost append keeps its place in commit order
+  among the appends the final read holds, and is not expected in it. The
+  history records an acknowledged write that lost its `durable` as `:info`,
+  so a write that is dropped but never read again still shows up as a
+  missing append;
 - no element comes from a `:fail` transaction, none is duplicated, and
   every element was invoked. Ids are unique across the whole run: each
   writer thread draws from its own block of values, so an id reused on
@@ -361,6 +369,18 @@ came after the open and are not touched by it. The orchestrator samples
 chaosfs's count only once it sees the `O` line, so a late sample can only
 count an eviction after the open as one before it. Reads of durable data are
 checked in full.
+
+**An acknowledged write a crash may lose is `:info` in a chaos life too.**
+`CommitResult.durable` is the engine's promise per #231: what it returns is
+what a recovery keeps, while a process that is killed keeps what the page
+cache holds whether or not it was flushed. The kill mode may therefore treat
+an acknowledged, not durable write as `:ok`, since it survives SIGKILL. A
+chaos life may end in a power cut, which keeps only the durable part, and the
+rule above ("a survival that returns but the next recovery does not will turn
+a clean run red") applies. So an acknowledged write with `durable` false in a
+chaos life is `:info`, and every read that saw it is `:info` with its result
+cleared. A crash that kept the page also allows it to appear, which `:info`
+permits.
 
 **Sensitivity.** With `commit_skips_fdatasync` from `tests/chaos_mutations/`
 applied (the commit flush skips its `fdatasync` and still reports durable),

@@ -1895,11 +1895,16 @@ struct KillStats {
 // gets an :info completion at the kill.
 // not_durable, when given, receives every element appended by an operation
 // that ends up :info: a power cut may still take it (#232).
+//
+// power_cut, set by a chaos life, drops a completion to :info whatever its
+// process lived to do: the life's terminator is drawn after it ends, so one
+// that ends in a power cut keeps only what durable says. A SIGKILL, which
+// the kill mode always ends in, keeps the page cache, so there an
+// acknowledged write that is not durable is still :ok.
 auto absorb_epoch(std::string_view stream, int epoch, std::int64_t killed_at,
                   std::int64_t start_ns, std::vector<Event> &events,
                   std::uint64_t &next_index, std::int64_t &max_key,
-                  bool range_workload,
-                  KillStats &stats,
+                  bool range_workload, bool power_cut, KillStats &stats,
                   std::vector<std::int64_t> *not_durable = nullptr) -> void {
   struct Pending {
     std::vector<Mop> mops;
@@ -2016,12 +2021,14 @@ auto absorb_epoch(std::string_view stream, int epoch, std::int64_t killed_at,
       if (m.kind == Mop::Kind::Append) not_durable->push_back(m.element);
   };
   for (auto &[event, invoked, dur] : completions) {
-    if (event.type == EventType::Ok && event.sequence != 0 && !dur &&
-        event.sequence > durable) {
+    const auto lost = event.type == EventType::Ok && event.sequence != 0 &&
+                      !dur && (power_cut || event.sequence > durable);
+    if (lost) {
       event.type = EventType::Info;
       event.value = invoked;
       event.sequence = 0;
-      event.error = "acknowledged, not durable at the kill";
+      event.error = power_cut ? "acknowledged, not durable at the power cut"
+                              : "acknowledged, not durable at the kill";
       ++stats.downgraded;
     }
     if (event.type == EventType::Info) note_not_durable(invoked);
@@ -2084,7 +2091,7 @@ auto run_kill(const RunOptions &o) -> int {
                                      share * 85 / 100 + 1));
     const auto [stream, killed_at] = run_and_kill(child, epoch, kill_after);
     absorb_epoch(stream, epoch, killed_at, start_ns, events, next_index,
-                 max_key, o.workload == Workload::Range, stats);
+                 max_key, o.workload == Workload::Range, false, stats);
   }
 
   // One more recovery, then every key in one read-only transaction.
@@ -2346,14 +2353,17 @@ auto read_whole(const fs::path &p) -> std::string {
 // Builds one history from a chaos episode's lives, then reads every key once
 // from --dir (a copy of the directory the last life left).
 //
-// The kill mode's rules hold per life: operations in flight at the end, and
-// acknowledged writes not durable then, are :info. One rule is added for
-// lives whose page cache lost data. Such a loss takes writes that were
-// visible but never durable, so a read that returned one of them is :info:
-// its result is not one the database had to keep. A write stays "not durable
-// on the mount" until a later life's open completes (open makes what it
-// trusts durable, #240), or a close() returns. An eviction while that open
-// runs comes first: it takes what the earlier lives left (#437).
+// The kill mode's rules hold per life: operations in flight at the end are
+// :info, and so is every acknowledged write that is not durable, since the
+// life's terminator (drawn only after it ended) may be a power cut. Further
+// rules cover lives whose page cache lost data. Such a loss takes writes that
+// were visible but never durable, so a read that returned one of them is
+// :info: its result is not one the database had to keep. A write stays "not
+// durable on the mount" until a later life's open completes (open makes what
+// it trusts durable, #240), or a close() returns. An eviction while that open
+// runs comes first: it takes what the earlier lives left (#437), and it may
+// drop a write from an earlier life too, so a read of one is then judged only
+// on how it ends.
 auto run_absorb(const RunOptions &o) -> int {
   std::int64_t start_ns = 0;
   const auto epochs = read_manifest(o.absorb, start_ns);
@@ -2363,32 +2373,39 @@ auto run_absorb(const RunOptions &o) -> int {
   KillStats stats;
   std::map<std::int64_t, std::vector<std::size_t>> readers_of;
   std::set<std::int64_t> unsynced;
+  // :info elements from this life's operations: a power cut may take any of
+  // them, so reads of them are judged only on how they end below.
+  std::set<std::int64_t> undecided;
   std::int64_t lost_reads = 0;
   int cache_losses = 0;
 
-  // Every :ok read of an element in unsynced, among events before `end`,
-  // becomes :info.
-  auto lose_unsynced = [&](std::size_t end) {
-    for (const auto e : unsynced) {
+  // Every :ok read of an element at risk, among events before `end`, becomes
+  // :info: it saw a write the next recovery may not have.
+  auto lose_reads_of = [&](const std::set<std::int64_t> &at_risk,
+                           std::size_t end, std::string_view why) -> int {
+    auto lost = 0;
+    for (const auto e : at_risk) {
       const auto it = readers_of.find(e);
       if (it == readers_of.end()) continue;
       for (const auto i : it->second) {
         if (i >= end || events[i].type != EventType::Ok) continue;
         events[i].type = EventType::Info;
         events[i].sequence = 0;
-        events[i].error = "read a write the page cache lost";
+        events[i].error = why;
         clear_reads(events[i].value);
-        ++lost_reads;
+        ++lost;
       }
     }
-    unsynced.clear();
+    return lost;
   };
 
   for (const auto &ep : epochs) {
     const auto first = events.size();
     std::vector<std::int64_t> not_durable;
+    // A life may end in a power cut, so nothing it acknowledged is trusted
+    // beyond its durable flag; a read of one becomes :info below.
     absorb_epoch(read_whole(ep.stream), ep.epoch, ep.ended_at, start_ns, events,
-                 next_index, max_key, o.workload == Workload::Range, stats,
+                 next_index, max_key, o.workload == Workload::Range, true, stats,
                  &not_durable);
     for (auto i = first; i < events.size(); ++i) {
       if (events[i].type != EventType::Ok) continue;
@@ -2396,16 +2413,44 @@ auto run_absorb(const RunOptions &o) -> int {
         if (m.read)
           for (const auto e : *m.read) readers_of[e].push_back(i);
     }
-    // Before the open below could make them durable. This life's reads
-    // came after it: what they saw, the open recovered and made durable.
-    if (ep.lost_before_open) lose_unsynced(first);
-    if (ep.opened) unsynced.clear();
+    // The open below, or the eviction before it, settles what the earlier
+    // lives acknowledged but had not flushed. This life's reads came after
+    // it: what they saw, the open recovered and made durable.
+    if (ep.lost_before_open) {
+      lost_reads += lose_reads_of(unsynced, first,
+                                  "read a write the page cache lost");
+      lost_reads += lose_reads_of(undecided, first,
+                                  "read a write a power cut may take");
+    }
+    if (ep.opened) {
+      unsynced.clear();
+      undecided.clear();
+    }
     unsynced.insert(not_durable.begin(), not_durable.end());
     if (ep.cache_lost) {
       ++cache_losses;
-      lose_unsynced(events.size());
+      lost_reads += lose_reads_of(unsynced, events.size(),
+                                  "read a write the page cache lost");
+      // Unless an eviction took the pages since, the next open found what
+      // this life wrote and made it durable. One that took them may have
+      // dropped an unflushed write too, which clear_reads accepts.
+      for (const auto e : not_durable) {
+        const auto it = readers_of.find(e);
+        if (it == readers_of.end()) continue;
+        for (const auto i : it->second) {
+          if (i < first || events[i].type != EventType::Ok) continue;
+          events[i].value.clear();
+          events[i].error = "read a write a power cut may take";
+          ++lost_reads;
+        }
+      }
+    } else {
+      undecided.insert(not_durable.begin(), not_durable.end());
     }
-    if (ep.closed_ok) unsynced.clear();
+    if (ep.closed_ok) {
+      unsynced.clear();
+      undecided.clear();
+    }
   }
 
   {
