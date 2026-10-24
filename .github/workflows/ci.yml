@@ -10,9 +10,9 @@ on:
   # request or as a push to main: no job reads Markdown. Nor does one confined
   # to the SQL layer: no job here configures it (option sql_layer), and
   # sql-layer.yml runs its tests. Nor does one to the files only other
-  # workflows read: the contract vocabulary check (contract.yml) and the SQL
-  # layer's and contract's own workflows. A change that also touches anything
-  # else runs everything.
+  # workflows read: the contract vocabulary check, and every workflow file but
+  # this one and sanitizers.yml, which it calls. A change that also touches
+  # anything else runs everything.
   push:
     branches: [main]
     paths-ignore:
@@ -21,7 +21,15 @@ on:
       - "bytecaskdb-sql-layer/**"
       - "scripts/check_contract_vocabulary.py"
       - "scripts/test_check_contract_vocabulary.py"
+      - ".github/workflows/build-wheels.yml"
+      - ".github/workflows/chaos-nightly.yml"
       - ".github/workflows/contract.yml"
+      - ".github/workflows/crash-nightly.yml"
+      - ".github/workflows/fuzz-nightly.yml"
+      - ".github/workflows/isolation-nightly.yml"
+      - ".github/workflows/node-nightly.yml"
+      - ".github/workflows/python-nightly.yml"
+      - ".github/workflows/soak-nightly.yml"
       - ".github/workflows/sql-layer.yml"
       - ".github/workflows/sql-layer-hammerdb-nightly.yml"
   pull_request:
@@ -32,7 +40,15 @@ on:
       - "bytecaskdb-sql-layer/**"
       - "scripts/check_contract_vocabulary.py"
       - "scripts/test_check_contract_vocabulary.py"
+      - ".github/workflows/build-wheels.yml"
+      - ".github/workflows/chaos-nightly.yml"
       - ".github/workflows/contract.yml"
+      - ".github/workflows/crash-nightly.yml"
+      - ".github/workflows/fuzz-nightly.yml"
+      - ".github/workflows/isolation-nightly.yml"
+      - ".github/workflows/node-nightly.yml"
+      - ".github/workflows/python-nightly.yml"
+      - ".github/workflows/soak-nightly.yml"
       - ".github/workflows/sql-layer.yml"
       - ".github/workflows/sql-layer-hammerdb-nightly.yml"
   workflow_dispatch:
