@@ -4,10 +4,10 @@
 // The sort-key builder (bc_sort_key_*, #579): memcmp order on the keys it
 // builds is PostgreSQL's ORDER BY order, for every type, direction and NULL
 // placement and for keys of several parts; equal values give equal keys.
-// The expected orders are PostgreSQL 16's, from the queries quoted with
-// them; the random cases check against a comparator written from
-// PostgreSQL's rules. Then the builder's own: a column with its NULL, a
-// sorter fed by it, the charge, and the calls it refuses.
+// The expected orders are what PostgreSQL 16.15 returned for the queries
+// quoted with them; the random cases check against a comparator written
+// from PostgreSQL's rules. Then the builder's own: a column with its NULL, a
+// sorter fed by it, the charge, the limit, and the calls it refuses.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -21,6 +21,8 @@
 #include <random>
 #include <span>
 #include <string>
+#include <tuple>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -38,7 +40,6 @@ using bytecask::sql::PhysType;
 namespace {
 
 constexpr std::uint32_t kTbl = 1;
-constexpr std::uint32_t kIdx = 3;
 constexpr std::uint32_t kIdCol = 0, kNameCol = 1;
 
 constexpr auto kNaN = std::numeric_limits<double>::quiet_NaN();
@@ -70,7 +71,7 @@ std::size_t g_rows = 0;
 void encode_keys(bc_ctx* cx) {
   const auto n = static_cast<std::uint32_t>(g_parts.size());
   for (std::uint32_t r = 0; r < g_rows; ++r) {
-    bc_key k = bc_sort_key_begin(cx);
+    bc_sort_key k = bc_sort_key_begin(cx);
     for (std::uint32_t p = 0; p < n; ++p) {
       const auto i = r * n + p;
       const auto [type, dir, nulls] = g_parts[p];
@@ -348,6 +349,40 @@ TEST_CASE("sort key: random keys of one to three parts sort as PostgreSQL's rule
 
 namespace {
 
+// m (id BIGINT, d DOUBLE PRECISION, b BOOLEAN), its table id in $1.
+constexpr std::uint32_t kMIdCol = 0, kMDoubleCol = 1, kMBoolCol = 2;
+void insert_m(bc_ctx* cx) {
+  auto table = static_cast<uint32_t>(bc_param_i64(cx, 0));
+  bc_row r = bc_row_begin(cx, table);
+  bc_row_set_param(cx, r, kMIdCol, 1);
+  bc_row_set_param(cx, r, kMDoubleCol, 2);
+  bc_row_set_param(cx, r, kMBoolCol, 3);
+  bc_insert(cx, table, bc_row_end(cx, r));
+}
+
+// SELECT id FROM m ORDER BY <column $2> <$3> NULLS <$4>, id DESC.
+void order_m_by(bc_ctx* cx) {
+  auto table = static_cast<uint32_t>(bc_param_i64(cx, 0));
+  auto col = static_cast<uint32_t>(bc_param_i64(cx, 1));
+  auto dir = static_cast<uint32_t>(bc_param_i64(cx, 2));
+  auto nulls = static_cast<uint32_t>(bc_param_i64(cx, 3));
+  bc_sorter s = bc_sorter_open(cx, 0);
+  bc_cursor c = bc_scan_open(cx, table, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    bc_sort_key k = bc_sort_key_begin(cx);
+    bc_sort_key_col(cx, k, row, col, dir, nulls);
+    bc_sort_key_col(cx, k, row, kMIdCol, BC_SORT_DESC, BC_SORT_NULLS_FIRST);
+    bc_sorter_add(cx, s, bc_sort_key_end(cx, k), row);
+  }
+  bc_view p = bc_empty(cx);
+  while (bc_sorter_next(cx, s, &p)) {
+    bc_emit_begin(cx);
+    bc_emit_col(cx, p, kMIdCol);
+    bc_emit_end(cx);
+  }
+}
+
 void insert_t(bc_ctx* cx) {
   bc_row r = bc_row_begin(cx, kTbl);
   bc_row_set_param(cx, r, kIdCol, 0);
@@ -364,7 +399,7 @@ void order_by_name(bc_ctx* cx) {
   bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
   while (bc_scan_next(cx, c)) {
     bc_view row = bc_scan_row(cx, c);
-    bc_key k = bc_sort_key_begin(cx);
+    bc_sort_key k = bc_sort_key_begin(cx);
     bc_sort_key_col(cx, k, row, kNameCol, dir, nulls);
     bc_sort_key_col(cx, k, row, kIdCol, BC_SORT_DESC, BC_SORT_NULLS_FIRST);
     bc_sorter_add(cx, s, bc_sort_key_end(cx, k), row);
@@ -389,7 +424,7 @@ void sort_key_charges(bc_ctx* cx) {
   bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
   while (bc_scan_next(cx, c)) {
     auto before = bc_ctx_held_for_testing(cx);
-    bc_key k = bc_sort_key_begin(cx);
+    bc_sort_key k = bc_sort_key_begin(cx);
     bc_sort_key_bool(cx, k, true, BC_SORT_ASC, BC_SORT_NULLS_LAST);
     bc_sort_key_i64(cx, k, 7, BC_SORT_DESC, BC_SORT_NULLS_LAST);
     bc_sort_key_null(cx, k, BC_SORT_ASC, BC_SORT_NULLS_FIRST);
@@ -400,34 +435,20 @@ void sort_key_charges(bc_ctx* cx) {
     bc_emit_end(cx);
   }
 }
-// A sort key over the budget: its builder fits, its part does not.
+// A sort key over the budget, or past its length limit: its builder fits,
+// its part does not.
 void sort_key_over_budget(bc_ctx* cx) {
-  bc_key k = bc_sort_key_begin(cx);
+  bc_sort_key k = bc_sort_key_begin(cx);
   bc_sort_key_bytes(cx, k, bc_param_bytes(cx, 0), BC_SORT_ASC, BC_SORT_NULLS_LAST);
 }
 
-void sort_key_on_index_key(bc_ctx* cx) {
-  bc_key k = bc_key_begin(cx, kIdx);
-  bc_sort_key_i64(cx, k, 1, BC_SORT_ASC, BC_SORT_NULLS_LAST);
-}
-void index_part_on_sort_key(bc_ctx* cx) {
-  bc_key k = bc_sort_key_begin(cx);
-  bc_key_i64(cx, k, 1);
-}
-void index_null_on_sort_key(bc_ctx* cx) {
-  bc_key k = bc_sort_key_begin(cx);
-  bc_key_null(cx, k);
-}
-void key_end_on_sort_key(bc_ctx* cx) { (void)bc_key_end(cx, bc_sort_key_begin(cx)); }
-void key_fits_on_sort_key(bc_ctx* cx) { (void)bc_key_fits(cx, bc_sort_key_begin(cx)); }
-void sort_end_on_index_key(bc_ctx* cx) { (void)bc_sort_key_end(cx, bc_key_begin(cx, kTbl)); }
 void sort_key_ended_twice(bc_ctx* cx) {
-  bc_key k = bc_sort_key_begin(cx);
+  bc_sort_key k = bc_sort_key_begin(cx);
   (void)bc_sort_key_end(cx, k);
   (void)bc_sort_key_end(cx, k);
 }
 void sort_part_after_end(bc_ctx* cx) {
-  bc_key k = bc_sort_key_begin(cx);
+  bc_sort_key k = bc_sort_key_begin(cx);
   (void)bc_sort_key_end(cx, k);
   bc_sort_key_null(cx, k, BC_SORT_ASC, BC_SORT_NULLS_LAST);
 }
@@ -438,7 +459,7 @@ void sort_key_after_step(bc_ctx* cx) {
   bc_view key = bc_empty(cx);
   bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
   while (bc_scan_next(cx, c)) {
-    bc_key k = bc_sort_key_begin(cx);
+    bc_sort_key k = bc_sort_key_begin(cx);
     bc_sort_key_i64(cx, k, 1, BC_SORT_ASC, BC_SORT_NULLS_LAST);
     key = bc_sort_key_end(cx, k);
   }
@@ -446,7 +467,7 @@ void sort_key_after_step(bc_ctx* cx) {
 }
 // A key past the engine's key ceiling: a sort key never reaches the engine.
 void long_sort_key(bc_ctx* cx) {
-  bc_key k = bc_sort_key_begin(cx);
+  bc_sort_key k = bc_sort_key_begin(cx);
   bc_sort_key_bytes(cx, k, bc_param_bytes(cx, 0), BC_SORT_DESC, BC_SORT_NULLS_LAST);
   bc_emit_begin(cx);
   bc_emit_bytes(cx, bc_sort_key_end(cx, k));
@@ -474,6 +495,44 @@ TEST_CASE("sort key: bc_sort_key_col keys a column with its NULL, and a sorter o
   CHECK(order(BC_SORT_DESC, BC_SORT_NULLS_LAST) == ids({3, 4, 1, 5, 2}));
 }
 
+TEST_CASE("sort key: bc_sort_key_col keys a DOUBLE PRECISION column as float8 and a BOOLEAN column",
+          "[sql][algebra][sort_key][structures]") {
+  Fixture f;
+  using bytecask::sql::CreateTableDdl;
+  f.ddl(CreateTableDdl{"m",
+                       {Fixture::col("id", PhysType::I64, false), Fixture::col("d", PhysType::F64, true),
+                        Fixture::col("b", PhysType::Bool, true)},
+                       {"id"}});
+  const auto m = std::int64_t{f.cat().table("m")->id};
+  const auto negative_nan = std::bit_cast<double>(std::uint64_t{0xFFF8'0000'0000'0000});
+  for (const auto& [id, d, b] : std::vector<std::tuple<std::int64_t, bc_value, bc_value>>{
+           {1, f64(-0.0), boolean(true)},
+           {2, f64(0.0), boolean(false)},
+           {3, f64(kNaN), kNull},
+           {4, kNull, boolean(true)},
+           {5, f64(-1.5), kNull},
+           {6, f64(kInf), boolean(false)},
+           {7, f64(negative_nan), boolean(true)}}) {
+    REQUIRE(run(f, insert_m, {m, id, d, b}) == BC_COMMITTED);
+  }
+  auto order = [&](std::uint32_t col, std::int64_t dir, std::int64_t nulls) {
+    REQUIRE(run(f, order_m_by, {m, std::int64_t{col}, dir, nulls}, kI64Row) == BC_COMMITTED);
+    return f.results(kI64Row);
+  };
+  // INSERT INTO m VALUES (1,'-0',true),(2,'0',false),(3,'NaN',NULL),(4,NULL,true),(5,-1.5,NULL),
+  // (6,'Infinity',false),(7,'-NaN',true); SELECT string_agg(id::text, ',' ORDER BY d, id DESC) FROM m;
+  // -0 and 0 tie, and so do the two NaNs: id DESC orders each pair.
+  CHECK(order(kMDoubleCol, BC_SORT_ASC, BC_SORT_NULLS_LAST) == ids({5, 2, 1, 6, 7, 3, 4}));
+  CHECK(order(kMDoubleCol, BC_SORT_ASC, BC_SORT_NULLS_FIRST) == ids({4, 5, 2, 1, 6, 7, 3}));
+  CHECK(order(kMDoubleCol, BC_SORT_DESC, BC_SORT_NULLS_FIRST) == ids({4, 7, 3, 6, 2, 1, 5}));
+  CHECK(order(kMDoubleCol, BC_SORT_DESC, BC_SORT_NULLS_LAST) == ids({7, 3, 6, 2, 1, 5, 4}));
+  // ORDER BY b <dir> NULLS <placement>, id DESC.
+  CHECK(order(kMBoolCol, BC_SORT_ASC, BC_SORT_NULLS_LAST) == ids({6, 2, 7, 4, 1, 5, 3}));
+  CHECK(order(kMBoolCol, BC_SORT_ASC, BC_SORT_NULLS_FIRST) == ids({5, 3, 6, 2, 7, 4, 1}));
+  CHECK(order(kMBoolCol, BC_SORT_DESC, BC_SORT_NULLS_FIRST) == ids({5, 3, 7, 4, 1, 6, 2}));
+  CHECK(order(kMBoolCol, BC_SORT_DESC, BC_SORT_NULLS_LAST) == ids({7, 4, 1, 6, 2, 5, 3}));
+}
+
 TEST_CASE("sort key: charged as its parts are added, and owned by its step", "[sql][algebra][sort_key][memory]") {
   Fixture f;
   REQUIRE(run(f, insert_t, {std::int64_t{1}, bytes("a")}) == BC_COMMITTED);
@@ -483,13 +542,16 @@ TEST_CASE("sort key: charged as its parts are added, and owned by its step", "[s
   REQUIRE(run(f, sort_key_charges, {}, kI64Row) == BC_COMMITTED);
   const auto each = static_cast<std::int64_t>(kKeyEntryBytes + (1 + 1) + (1 + 8) + 1 + kViewEntryBytes);
   CHECK(f.results(kI64Row) == ids({each, each}));
-  // Past the budget, at the part that passes it.
+  // Past the budget, at the part that passes it, before the part is built:
+  // the part is charged the most it can take, its marker, every byte
+  // escaped and the terminator, 2,003 bytes for these 1,000, and then the
+  // 1,003 it took.
   Bytes value(1000, std::byte{0x61});
-  const auto budget = kViewEntryBytes + kKeyEntryBytes + 1000;
-  CHECK(run(f, sort_key_over_budget, {value}, {}, {.max_reads = 0, .max_bytes = budget, .deadline_ns = 0}) ==
+  const auto budget = kViewEntryBytes + kKeyEntryBytes + 1 + 2 * 1000 + 2;
+  CHECK(run(f, sort_key_over_budget, {value}, {}, {.max_reads = 0, .max_bytes = budget - 1, .deadline_ns = 0}) ==
         BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LIMIT);
-  CHECK(run(f, sort_key_over_budget, {value}, {}, {.max_reads = 0, .max_bytes = budget + 3, .deadline_ns = 0}) ==
+  CHECK(run(f, sort_key_over_budget, {value}, {}, {.max_reads = 0, .max_bytes = budget, .deadline_ns = 0}) ==
         BC_COMMITTED);
   // A view from a step that ended is stale.
   CHECK(run(f, sort_key_after_step, {}) == BC_FAILED);
@@ -500,12 +562,32 @@ TEST_CASE("sort key: charged as its parts are added, and owned by its step", "[s
   CHECK(std::get<Bytes>(f.results(kBytesRow)[0][0]).size() == big.size() + 3);
 }
 
-TEST_CASE("sort key: a sort key and an index's key do not take each other's calls; bad arguments are BC_E_HANDLE",
+TEST_CASE("sort key: a part that could take the key past 4 GiB is BC_E_LIMIT, before it is built",
+          "[sql][algebra][sort_key][memory]") {
+  Fixture f;
+  // 2^31 - 1 bytes: escaped, at most 2^32 + 1 with the marker and the
+  // terminator, past a view's 32-bit length. No budget: the limit refuses it.
+  std::vector<bc_value> p;
+  p.emplace_back(std::in_place_type<Bytes>, std::size_t{std::numeric_limits<std::int32_t>::max()}, std::byte{0x61});
+  CHECK(run(f, sort_key_over_budget, std::move(p)) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LIMIT);
+  CHECK(std::string{bc_error_message(f.cx)}.starts_with("sort key over its limit"));
+}
+
+// A sort key and a table's or index's key are different handle types: a
+// plan that passes one where the other is taken does not compile.
+static_assert(!std::is_convertible_v<bc_sort_key, bc_key> && !std::is_convertible_v<bc_key, bc_sort_key>);
+static_assert(!std::is_invocable_v<decltype(bc_key_i64), bc_ctx*, bc_sort_key, std::int64_t>);
+static_assert(!std::is_invocable_v<decltype(bc_key_end), bc_ctx*, bc_sort_key>);
+static_assert(!std::is_invocable_v<decltype(bc_key_fits), bc_ctx*, bc_sort_key>);
+static_assert(!std::is_invocable_v<decltype(bc_sort_key_i64), bc_ctx*, bc_key, std::int64_t, std::uint32_t,
+                                   std::uint32_t>);
+static_assert(!std::is_invocable_v<decltype(bc_sort_key_end), bc_ctx*, bc_key>);
+
+TEST_CASE("sort key: a builder ended twice, a part after its end and bad arguments are BC_E_HANDLE",
           "[sql][algebra][sort_key]") {
   Fixture f;
-  for (auto plan : {sort_key_on_index_key, index_part_on_sort_key, index_null_on_sort_key, key_end_on_sort_key,
-                    key_fits_on_sort_key, sort_end_on_index_key, sort_key_ended_twice, sort_part_after_end,
-                    sort_key_bad_dir, sort_key_bad_nulls}) {
+  for (auto plan : {sort_key_ended_twice, sort_part_after_end, sort_key_bad_dir, sort_key_bad_nulls}) {
     CHECK(run(f, plan, {}) == BC_FAILED);
     CHECK(bc_error(f.cx) == BC_E_HANDLE);
   }

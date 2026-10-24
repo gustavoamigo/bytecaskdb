@@ -634,26 +634,26 @@ Text compares bytewise, the layer's one collation (`types_design.md`,
 ```c
 enum bc_sort_dir   { BC_SORT_ASC = 0, BC_SORT_DESC = 1 };
 enum bc_sort_nulls { BC_SORT_NULLS_LAST = 0, BC_SORT_NULLS_FIRST = 1 };
-bc_key   bc_sort_key_begin(bc_ctx *);
-void     bc_sort_key_i64(bc_ctx *, bc_key, int64_t, uint32_t dir, uint32_t nulls);
-void     bc_sort_key_f64(bc_ctx *, bc_key, double, uint32_t dir, uint32_t nulls);   /* -0.0 is 0.0; NaN above +inf */
-void     bc_sort_key_bool(bc_ctx *, bc_key, bool, uint32_t dir, uint32_t nulls);
-void     bc_sort_key_bytes(bc_ctx *, bc_key, bc_view, uint32_t dir, uint32_t nulls);
-void     bc_sort_key_null(bc_ctx *, bc_key, uint32_t dir, uint32_t nulls);
-void     bc_sort_key_col(bc_ctx *, bc_key, bc_view row, uint32_t col, uint32_t dir, uint32_t nulls);  /* NULL included */
-bc_view  bc_sort_key_end(bc_ctx *, bc_key);
+bc_sort_key bc_sort_key_begin(bc_ctx *);
+void     bc_sort_key_i64(bc_ctx *, bc_sort_key, int64_t, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_f64(bc_ctx *, bc_sort_key, double, uint32_t dir, uint32_t nulls);   /* -0.0 is 0.0; NaN above +inf */
+void     bc_sort_key_bool(bc_ctx *, bc_sort_key, bool, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_bytes(bc_ctx *, bc_sort_key, bc_view, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_null(bc_ctx *, bc_sort_key, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_col(bc_ctx *, bc_sort_key, bc_view row, uint32_t col, uint32_t dir, uint32_t nulls);  /* NULL included */
+bc_view  bc_sort_key_end(bc_ctx *, bc_sort_key);
 ```
 
 | Function | What it does |
 |---|---|
-| `bc_sort_key_begin` | Starts an empty sort key: no namespace, no id and no layout. Returns a key builder handle, charged `kKeyEntryBytes` and owned by its step as any key builder. |
-| `bc_sort_key_i64`, `bc_sort_key_f64`, `bc_sort_key_bool`, `bc_sort_key_bytes`, `bc_sort_key_null` | Appends one part: a value, or NULL, with its direction and NULL placement. Every call of one part takes the same `dir` and `nulls`, a NULL's too, so the plan writes a part's placement once. A `DOUBLE` orders as PostgreSQL's `float8`: `-0.0` and `0.0` make one key, every NaN one key above `+∞`. The bytes are charged as the part is added. A `dir` or `nulls` outside its enum is `BC_E_HANDLE`. |
+| `bc_sort_key_begin` | Starts an empty sort key: no namespace, no id and no layout. Returns a `bc_sort_key`, a handle type of its own, charged `kKeyEntryBytes` and owned by its step as a key builder is. |
+| `bc_sort_key_i64`, `bc_sort_key_f64`, `bc_sort_key_bool`, `bc_sort_key_bytes`, `bc_sort_key_null` | Appends one part: a value, or NULL, with its direction and NULL placement. Every call of one part takes the same `dir` and `nulls`, a NULL's too, so the plan writes a part's placement once. A `DOUBLE` orders as PostgreSQL's `float8`: `-0.0` and `0.0` make one key, every NaN one key above `+∞`. Before a part is built it is charged the most it can take (a `BYTES` value with every byte escaped: its marker, twice its length and the terminator), and a part that could take the key past `UINT32_MAX` bytes, a view's length, is `BC_E_LIMIT`; once built, the key is charged the bytes it holds. A `dir` or `nulls` outside its enum is `BC_E_HANDLE`. |
 | `bc_sort_key_col` | Appends a row's column as the next part, NULL included: what a plan uses for `ORDER BY col`. A column the plan's `bc_schema_ref` does not declare is `BC_E_HANDLE`, as for every column decoder. |
-| `bc_sort_key_end` | Finalizes the key and returns its view, the step's. There is no key ceiling: a sort key never reaches the engine, and its bytes are bounded by the memory budget. |
+| `bc_sort_key_end` | Finalizes the key and returns its view, the step's. The engine's key ceiling does not apply: a sort key never reaches the engine, and its bytes are bounded by the memory budget and the 4 GiB limit on its parts. |
 
-A sort key and a table's or index's key do not mix: `bc_key_*` parts,
-`bc_key_end` and `bc_key_fits` on a sort key's builder, and `bc_sort_key_*`
-on a table's or index's, are `BC_E_HANDLE`. The type of a part is the
+A sort key and a table's or index's key do not mix: `bc_sort_key` and
+`bc_key` are distinct handle types, so a plan that passes one to the
+other's calls does not compile. The type of a part is the
 plan's to keep the same in every row: the key holds no type tag.
 
 ### Reads

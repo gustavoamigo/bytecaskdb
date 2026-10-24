@@ -126,7 +126,7 @@ void sort_by_sort_key(bc_ctx* cx) {
   bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
   while (bc_scan_next(cx, c)) {
     bc_view row = bc_scan_row(cx, c);
-    bc_key k = bc_sort_key_begin(cx);
+    bc_sort_key k = bc_sort_key_begin(cx);
     bc_sort_key_col(cx, k, row, kQtyCol, BC_SORT_DESC, BC_SORT_NULLS_FIRST);
     bc_sort_key_col(cx, k, row, kNameCol, BC_SORT_ASC, BC_SORT_NULLS_FIRST);
     bc_sort_key_i64(cx, k, bc_col_i64(cx, row, kIdCol), BC_SORT_ASC, BC_SORT_NULLS_LAST);
