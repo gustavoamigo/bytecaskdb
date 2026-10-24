@@ -376,8 +376,10 @@ mapping — where a failed read is a `SIGBUS`, not an error (#237):
     the next. The `[model]` many-frames test fails reads 1–150 in turn and
     checks each against the serial baseline, file stats included, and
     `DB::open rebuilds a hint file a read fails on` checks both outcomes
-    directly. Both run at `recovery_threads = 1`: the injector is
-    thread-local, and at one thread recovery runs on the thread that opens.
+    directly. The generated `[prove_recovery]` matrix covers both phases too
+    (`*hint_read_fails_while_verified*`, `*hint_read_fails_during_scan*`).
+    Every one of them runs where recovery reads on the thread that opens:
+    the injector is thread-local (see *recovery* below for what that allows).
 
 ### Orphaned BulkBegin degrade
 
@@ -1095,10 +1097,12 @@ more — `crc` and `entry_type` at every position but the first, where the
 scan throws opening the file, before the iterator takes a step it could
 catch.
 
-### recovery — 40 tests
+### recovery — 56 tests
 
-40 generated Catch2 tests (`[prove_recovery]` tag) cover five state shapes
-× four failure classes × `recovery_threads ∈ {1, 4}`.
+56 generated Catch2 tests (`[prove_recovery]` tag): five state shapes
+× four failure classes × `recovery_threads ∈ {1, 4}` — the 40 cells that
+fail the hint write — plus the two phases a hint read fails in (16 cells:
+one-file shapes at both thread counts, multi-file ones at one).
 
 `hint_file.cppm` had 19 syscall sites and no fault points, and `DB::open`
 had no matrix at all — recovery was proven by the `[model]` tests, every
@@ -1114,6 +1118,44 @@ so a failure generating one may cost recovery time and must not cost keys.
 `recovery_prepare_files` calls `flush_hints_for` without a catch, so the
 failure propagates out of `DB::open`; each cell then reopens with the
 fault cleared and checks every key back, by value.
+
+A read failure is the one fault whose outcome is *not* the same in every
+cell, which is why the generator carries an expectation per phase of a hint
+read rather than one per fault point. `io_hint_read` (#237) is one
+checkpoint over two phases:
+
+| Failure class | Phase the failed read lands in | Expected `DB::open` |
+|---|---|---|
+| `hint_read_fails_while_verified` | the pass that opens and checks a hint | succeeds: the hint is an index, so it is rebuilt from its data file and every key comes back under the fault |
+| `hint_read_fails_during_scan` | the scan of a hint that verified | throws `std::system_error`: entries of the hint were applied as it scanned, so the open fails and the next one recovers |
+
+What a failed read costs does not vary with the thread count, but the read
+has to be failed where it can be seen: the injector is thread-local, and
+recovery's workers are `min(files, threads)` — one of them the thread that
+opens. So the read cells run at `recovery_threads = 1`, and at 4 wherever a
+shape's writes fit one data file and that worker is the only one. Arming the
+injector across the workers — and with that what a failed read costs a
+multi-file open recovered in parallel — is deferred to #599.
+
+A hint file's first read is always in the pass that verifies it, so the
+verified cell fails read 1. The scan cell finds its read at run time:
+`first_hint_scan_read` (tests/proof/hint_reads.h) walks the file set the way
+the open does — one hint per data file, in name order, each opened and then
+scanned — counts the reads that open each one and skips those whose scan has
+no units (an empty hint scans none), and the fault goes one read past them.
+Opening is twice when recovery first replaces the hint: a damaged one is
+read whole to find it damaged, and a missing one is generated from its data
+file. Those replacements are read off a copy of the directory that recovery
+has run over once, since the cell may have damaged every hint itself.
+
+Then the cell says why its read is a scan read. A wrong target cannot pass
+silently on a hint recovery replaces: the pass that verifies the rebuilt hint
+throws like a scan does in the default mode. So the same read is failed again
+with `fail_recovery_on_crc_errors = false`, where a failure in one of the
+opens above the scan lets `open` return without that file's keys, while one
+in the scan fails the open in every mode — an open that throws there was
+reading the hint's entries, not opening the hint. If the count and the open
+ever disagree about where a scan begins, one of the two runs fails there.
 
 #### State shapes
 
@@ -1354,9 +1396,9 @@ write on new leader → backward sync → verify convergence).
 
 | File | Role |
 |------|------|
-| `scenario_matrix.py` | RecoveryStateShape (damage kind, batches, range deletes), RecoveryFailureClass (SUCCESS, RC1–RC3), `recovery_threads` axis |
-| `fault_point_resolver.py` | Maps failure class → `io_hint_write` / `io_hint_sync` / `io_hint_rename` |
-| `expected_delta.py` | Reference model: does `DB::open` throw, and (always) do all keys come back |
+| `scenario_matrix.py` | RecoveryStateShape (damage kind, batches, range deletes), RecoveryFailureClass (SUCCESS, RC1–RC3: the three hint writes, RC4–RC5: the two phases a hint read fails in), `recovery_threads` axis |
+| `fault_point_resolver.py` | Maps failure class → `io_hint_write` / `io_hint_sync` / `io_hint_rename` / `io_hint_read`, and which read of a hint file fails |
+| `expected_delta.py` | Reference model: the expectation per phase — does `DB::open` throw — and (always) do all keys come back |
 | `generate_tests.py` | Generates `prove_recovery.cpp` |
 
 **group_commit module** (`tests/proof/group_commit/`):
@@ -1390,6 +1432,7 @@ write on new leader → backward sync → verify convergence).
 
 | File | Role |
 |------|------|
+| [`hint_reads.h`](../tests/proof/hint_reads.h) | `hint_reads`, `first_hint_of`, `hint_identity`, `first_hint_scan_read` — where the reads of a hint file fall, for a test that fails one of them (needs `import bytecask.hint_file`) |
 | [`invariants.h`](../tests/proof/invariants.h) | `capture_baseline`, `assert_consistent`, `assert_delta`, `assert_recoverable`, `assert_resumable`, `assert_keys_recoverable`, `VacuumBaseline`, `capture_vacuum_baseline`, `find_vacuum_target`, `count_structural_entries`, `assert_structural_entries_preserved`, `assert_vacuum_success`, `assert_vacuum_no_change`, `assert_vacuum_recoverable`, `OwnedEntries`, `collect_changes`, `ReplicationBaseline`, `capture_replication_baseline`, `assert_replication_match`, `assert_replication_no_change`, `assert_replication_recovery`, `assert_durable_boundary`, `make_durable`, `durable_watermark`, `apply_delta`, `assert_power_loss_outcome`, `assert_hints_durable`, `assert_stream_survives_power_loss` |
 
 ### Fault injection modes
@@ -2681,7 +2724,7 @@ A site whose break nothing has to catch says why instead.
 | `flush_hints_for`: the directory sync after the rename | not needed: a lost rename leaves the file hint-less, and the next open rebuilds the hint (`directory sync: a hint rebuilt at open is synced` checks the call is made) | — | #199 |
 | `flush_hints_for`: batch markers are kept, so a restart's `next_seq` covers them | `a write after a restart does not reuse a batch marker's sequence` | `hint_skips_batch_markers` | 362cc590 |
 | `open_hint_or_rebuild`: a hint that fails its CRC is rebuilt, not skipped | `DB recovery: a corrupt hint is rebuilt from its data file` | `corrupt_hint_not_rebuilt` | #123 |
-| `open_hint_or_rebuild`: a hint a read fails on is rebuilt | `DB::open rebuilds a hint file a read fails on` | `hint_read_error_kills_process` (chaos) | #255 (#237) |
+| `open_hint_or_rebuild`: a hint a read fails on is rebuilt, and one that fails while a hint that verified is scanned is not swallowed — its entries were applied, so the open throws | `DB::open rebuilds a hint file a read fails on`, `*hint_read_fails_while_verified*`, `*hint_read_fails_during_scan*` (`prove_recovery`) | `hint_read_error_kills_process` (chaos) | #255 (#237) |
 | `open_hint_or_rebuild`: an error that says nothing about the bytes leaves the hint alone | `DB::open leaves a hint alone on an error that says nothing about …` | `hint_rebuilt_on_any_error` | #270 (#262) |
 
 ### Vacuum
@@ -2774,6 +2817,7 @@ tests/
     fault_point_resolver.py        ← apply_batch fault configs
     scenario_matrix.py             ← apply_batch input matrix
     invariants.h                   ← shared assert helpers for all proof suites
+    hint_reads.h                   ← locating the reads of a hint file, to fail one
     resume/
       __init__.py
       scenario_matrix.py

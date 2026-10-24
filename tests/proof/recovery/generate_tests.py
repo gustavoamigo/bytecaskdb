@@ -17,8 +17,16 @@ _project_root = Path(__file__).resolve().parent.parent.parent.parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from tests.proof.recovery.expected_delta import RecoveryDelta, recovery_delta
-from tests.proof.recovery.fault_point_resolver import resolve_recovery_fault
+from tests.proof.recovery.expected_delta import (
+    HintReadPhase,
+    RecoveryDelta,
+    recovery_delta,
+)
+from tests.proof.recovery.fault_point_resolver import (
+    FaultTarget,
+    RecoveryFault,
+    resolve_recovery_fault,
+)
 from tests.proof.recovery.scenario_matrix import (
     Damage,
     RecoveryFailureClass,
@@ -39,11 +47,17 @@ def _write_opts(state: RecoveryStateShape) -> str:
     return ""
 
 
-def _open_opts(state: RecoveryStateShape, threads: int) -> str:
+def _open_opts(
+    state: RecoveryStateShape, threads: int, lenient: bool = False
+) -> str:
     parts: List[str] = []
     if state.max_file_bytes is not None:
         parts.append(f".max_file_bytes = {state.max_file_bytes}")
     parts.append(f".recovery_threads = {threads}")
+    # Field order follows Options: max_file_bytes, recovery_threads,
+    # fail_recovery_on_crc_errors.
+    if lenient:
+        parts.append(".fail_recovery_on_crc_errors = false")
     return "{" + ", ".join(parts) + "}"
 
 
@@ -97,36 +111,9 @@ def absent_keys(state: RecoveryStateShape) -> List[str]:
     return [f"k{i}" for i in range(state.num_keys) if "k1" <= f"k{i}" < "k3"]
 
 
-def gen_test(
-    state: RecoveryStateShape, failure: RecoveryFailureClass, threads: int
-) -> str:
-    delta = recovery_delta(state, failure)
-    fault = resolve_recovery_fault(failure)
-    name = f"prove_recovery__{state.label}__{failure.value}__t{threads}"
-    opts = _open_opts(state, threads)
-
+def gen_key_checks(state: RecoveryStateShape) -> List[str]:
+    """Every key that must be back, checked on an open DB."""
     p: List[str] = []
-    p.append(f'TEST_CASE("{name}", "[prove_recovery]") {{')
-    p.append("  TempDir td;")
-    p.append('  auto dir = td.path / "db";')
-    p.extend(gen_setup(state))
-    p.append("")
-    p.append(f"  // Damage: {state.damage.value}")
-    p.append(f"  {_DAMAGE_CALL[state.damage]}")
-    p.append("")
-    if delta.open_throws:
-        p.append("  // A hint cannot be regenerated. recovery_prepare_files calls")
-        p.append("  // flush_hints_for without a catch, so open fails.")
-        p.append("  {")
-        p.append(f'    bytecask::testing::ScopedFaultInjector fi{{"{fault}"}};')
-        p.append(f"    REQUIRE_THROWS(bytecask::DB::open(dir, {opts}));")
-        p.append("  }")
-        p.append("")
-        p.append("  // The fault clears. A hint is an index, not the record: the")
-        p.append("  // failure cost recovery time and must have cost no keys.")
-    p.append("  {")
-    p.append(f"    auto db = bytecask::DB::open(dir, {opts});")
-    p.append("    CHECK_FALSE(db.is_degraded());")
     for key, value in expected_keys(state):
         p.append("    {")
         p.append("      bytecask::Bytes out;")
@@ -139,7 +126,136 @@ def gen_test(
             f'    CHECK_FALSE(db.contains_key({{}}, to_bytes("{key}")));'
         )
     p.append("    assert_consistent(db);")
+    return p
+
+
+def gen_recovered_block(state: RecoveryStateShape, opts: str) -> List[str]:
+    """An open with no fault running, and every key inside it."""
+    p = [
+        "  {",
+        f"    auto db = bytecask::DB::open(dir, {opts});",
+        "    CHECK_FALSE(db.is_degraded());",
+    ]
+    p.extend(gen_key_checks(state))
     p.append("  }")
+    return p
+
+
+def _arm_fault(fault: RecoveryFault, opts: str) -> List[str]:
+    """Which read fails, and the injector armed to fail it.
+
+    The read to fail is computed before the injector is armed: measuring a
+    hint takes reads of its own, under an injector of its own.
+    """
+    p: List[str] = []
+    if fault.target == FaultTarget.FIRST_CALL:
+        # A hint file's first read is the one in the pass that verifies it.
+        p.append("    const int fail_on = 1;")
+    elif fault.target == FaultTarget.FIRST_SCAN_READ:
+        p.append(f"    const int fail_on = first_hint_scan_read(dir, {opts});")
+    p.append(f'    bytecask::testing::ScopedFaultInjector fi{{"{fault.name}"}};')
+    if fault.target != FaultTarget.EVERY_CALL:
+        p.append("    fi.inj.fail_on_nth_match = fail_on;")
+    return p
+
+
+def _throw_block(fault: RecoveryFault, opts: str) -> List[str]:
+    """A faulted open that must throw.
+
+    What it throws does not vary by phase: a hint write failure propagates
+    out of open untouched, and a read failure that is not answered by a
+    rebuild propagates as the read's own error.
+    """
+    p = ["  {"]
+    p.extend(_arm_fault(fault, opts))
+    p.append(f"    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {opts}),")
+    p.append("                      std::system_error);")
+    if fault.target != FaultTarget.EVERY_CALL:
+        p.append("    REQUIRE(fi.inj.name_matches >= fail_on);")
+    p.append("  }")
+    return p
+
+
+def gen_fault_block(
+    state: RecoveryStateShape,
+    delta: RecoveryDelta,
+    fault: RecoveryFault,
+    opts: str,
+    lenient_opts: str,
+) -> List[str]:
+    """The open under the fault, and what the phase it lands in costs."""
+    p: List[str] = []
+    if delta.phase == HintReadPhase.VERIFIED:
+        p.append("  // A read that fails while the first hint is verified has the")
+        p.append("  // hint rebuilt around it: it is an index, so recovery throws it")
+        p.append("  // away and indexes its data file again. The open succeeds and")
+        p.append("  // every key is in it. A hint's first read is the one that")
+        p.append("  // verifies it.")
+    elif delta.phase == HintReadPhase.SCAN:
+        p.append("  // A read that fails during the scan of a hint that verified is")
+        p.append("  // not answered by a rebuild: the entries of a hint are applied as")
+        p.append("  // it scans, so the open throws. Recovery opens and scans the hint")
+        p.append("  // of one data file at a time, in name order, so the read after")
+        p.append("  // those that open the first hint with anything to scan is a read")
+        p.append("  // of its scan.")
+    else:
+        p.append("  // A hint cannot be regenerated. recovery_prepare_files calls")
+        p.append("  // flush_hints_for without a catch, so open fails.")
+    if delta.open_throws:
+        p.extend(_throw_block(fault, opts))
+        if delta.phase == HintReadPhase.SCAN:
+            p.append("")
+            p.append("  // The same failure in the mode that answers a hint read it")
+            p.append("  // cannot use with a skip of the file behind it. A read that")
+            p.append("  // fails in one of the opens above the scan lets open return")
+            p.append("  // without that file's keys; one that fails in the scan fails the")
+            p.append("  // open in every mode. So an open that throws here says the")
+            p.append("  // fault went where this cell says it did.")
+            p.extend(_throw_block(fault, lenient_opts))
+    else:
+        p.append("  {")
+        p.extend(_arm_fault(fault, opts))
+        p.append("    const auto hint = first_hint_of(dir);")
+        p.append("    const auto replaced = hint_identity(hint);")
+        p.append(f"    auto db = bytecask::DB::open(dir, {opts});")
+        if fault.target != FaultTarget.EVERY_CALL:
+            p.append("    REQUIRE(fi.inj.name_matches >= fail_on);")
+        p.append("    // Where a hint stood before the open the rebuild replaced it —")
+        p.append("    // a hint that cannot be read is removed and its data file")
+        p.append("    // indexed again — and where the cell left none, the keys below")
+        p.append("    // are the proof: after a read failed, only the data files could")
+        p.append("    // have supplied them.")
+        p.append("    CHECK(hint_identity(hint) != replaced);")
+        p.append("    CHECK_FALSE(db.is_degraded());")
+        p.extend(gen_key_checks(state))
+        p.append("  }")
+    return p
+
+
+def gen_test(
+    state: RecoveryStateShape, failure: RecoveryFailureClass, threads: int
+) -> str:
+    delta = recovery_delta(state, failure)
+    fault = resolve_recovery_fault(failure)
+    name = f"prove_recovery__{state.label}__{failure.value}__t{threads}"
+    opts = _open_opts(state, threads)
+    lenient_opts = _open_opts(state, threads, lenient=True)
+
+    p: List[str] = []
+    p.append(f'TEST_CASE("{name}", "[prove_recovery]") {{')
+    p.append("  TempDir td;")
+    p.append('  auto dir = td.path / "db";')
+    p.extend(gen_setup(state))
+    p.append("")
+    p.append(f"  // Damage: {state.damage.value}")
+    p.append(f"  {_DAMAGE_CALL[state.damage]}")
+    p.append("")
+    if fault is not None:
+        p.extend(gen_fault_block(state, delta, fault, opts, lenient_opts))
+        p.append("")
+        p.append("  // The fault clears. A hint is an index, not the record: the")
+        p.append("  // failure cost recovery time and must have cost no keys.")
+    p.extend(gen_recovered_block(state, opts))
     p.append("}")
     return "\n".join(p)
 
@@ -153,8 +269,11 @@ FILE_HEADER = """\
 // Correctness proof tests for DB::open's recovery and hint generation. Each
 // test writes a known state, damages the hint files the way a crash or bad
 // hardware would, optionally faults one of the three steps of the hint write
-// (write -> fdatasync -> rename), and verifies that once the fault clears
-// every key comes back. A hint file is a rebuildable index, not the record.
+// (write -> fdatasync -> rename) or a read of a hint file, and verifies that
+// once the fault clears every key comes back. A hint file is a rebuildable
+// index, not the record. One fault's outcome is an exception to that: a read
+// failing while a hint is verified is answered by a rebuild, while one
+// failing during the scan of a hint that verified fails the open.
 
 #include <system_error>
 
@@ -164,7 +283,9 @@ FILE_HEADER = """\
 #include <catch2/catch_test_macros.hpp>
 
 import bytecask;
+import bytecask.hint_file;
 
+#include "proof/hint_reads.h"
 #include "proof/invariants.h"
 
 namespace {
@@ -173,6 +294,9 @@ using bytecask::testing::assert_consistent;
 using bytecask::testing::corrupt_newest_hint;
 using bytecask::testing::drop_all_hints;
 using bytecask::testing::drop_newest_hint;
+using bytecask::testing::first_hint_of;
+using bytecask::testing::first_hint_scan_read;
+using bytecask::testing::hint_identity;
 using bytecask::testing::to_bytes;
 using bytecask::testing::to_string;
 

@@ -490,17 +490,46 @@ inline auto sorted_paths(const std::filesystem::path &dir,
   for (const auto &e : std::filesystem::directory_iterator{dir}) {
     if (e.path().extension() == ext) out.push_back(e.path());
   }
-  std::ranges::sort(out);  // stems lead with a timestamp
+  std::ranges::sort(out);  // names lead with a timestamp, trail with a salt
   return out;
 }
 
-// Removes the newest data file's hint, leaving the state a crash does: the
-// file active when the process died has none, and recovery_prepare_files
+// The newest data file of a directory: the one that starts at the highest
+// sequence. Names lead with a timestamp that is one second coarse and trail
+// with a random salt, so within one second they order the files of one test
+// no better than chance. Sequences always order them — it is the rule
+// recovery reads "written last" off (recovery_check_tail) — and a file with
+// nothing in it starts at 0 and is never the newest. Its first record's
+// sequence opens the 15-byte little-endian entry header (data_entry.cppm).
+inline auto newest_data_file(const std::filesystem::path &dir)
+    -> std::optional<std::filesystem::path> {
+  std::optional<std::filesystem::path> newest;
+  auto top = std::uint64_t{0};
+  for (const auto &p : sorted_paths(dir, ".data")) {
+    std::string raw(8, '\0');
+    {
+      std::ifstream f{p, std::ios::binary};
+      f.read(raw.data(), static_cast<std::streamsize>(raw.size()));
+      if (f.gcount() != static_cast<std::streamsize>(raw.size())) continue;
+    }
+    auto seq = std::uint64_t{0};
+    for (auto i = std::size_t{8}; i-- > 0;)
+      seq = (seq << 8) | static_cast<unsigned char>(raw[i]);
+    if (!newest || seq > top) {
+      newest = p;
+      top = seq;
+    }
+  }
+  return newest;
+}
+
+// Removes the hint of the newest data file, leaving the state a crash does:
+// the file active when the process died has none, and recovery_prepare_files
 // regenerates it at the next open. A clean close writes it.
 inline auto drop_newest_hint(const std::filesystem::path &dir) -> bool {
-  const auto data = sorted_paths(dir, ".data");
-  if (data.empty()) return false;
-  auto hint = data.back();
+  const auto newest = newest_data_file(dir);
+  if (!newest) return false;
+  auto hint = *newest;
   hint.replace_extension(".hint");
   std::error_code ec;
   return std::filesystem::remove(hint, ec);
@@ -516,13 +545,15 @@ inline auto drop_all_hints(const std::filesystem::path &dir) -> int {
   return dropped;
 }
 
-// Flips a byte inside the newest hint file so its CRC-32C trailer no longer
-// matches. open_hint_or_rebuild must notice, discard it, and rebuild from the
-// data file rather than dropping the keys behind it.
+// Flips a byte inside the newest data file's hint, so it no longer verifies:
+// its magic is wrong from the first read. open_hint_or_rebuild must notice,
+// discard it, and rebuild from the data file rather than dropping the keys
+// behind it.
 inline auto corrupt_newest_hint(const std::filesystem::path &dir) -> bool {
-  const auto hints = sorted_paths(dir, ".hint");
-  if (hints.empty()) return false;
-  const auto &path = hints.back();
+  const auto newest = newest_data_file(dir);
+  if (!newest) return false;
+  auto path = *newest;
+  path.replace_extension(".hint");
   std::error_code ec;
   const auto size = std::filesystem::file_size(path, ec);
   if (ec || size == 0) return false;
