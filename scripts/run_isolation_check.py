@@ -116,8 +116,11 @@ def cross_check(history: list[dict], require_sequence: bool = True) -> list[str]
     transaction completed :ok before the reading transaction was invoked.
     """
     ok_appends: dict[int, list[tuple[int, int, int]]] = defaultdict(list)
-    failed: set[int] = set()
-    invoked: set[int] = set()
+    # Per key: an element id is unique to a write within one process, and a
+    # process counter restarts with each epoch, so the same id names another
+    # key's write in another life.
+    failed: dict[int, set[int]] = defaultdict(set)
+    invoked: dict[int, set[int]] = defaultdict(set)
     reads: dict[int, list[list[int]]] = defaultdict(list)
     # (invoke index, list read) per key, and (completion index, element) per
     # key for the real-time check.
@@ -129,7 +132,8 @@ def cross_check(history: list[dict], require_sequence: bool = True) -> list[str]
     for op in history:
         appends = [m for m in op["value"] if m[0] == "append"]
         if op["type"] == "invoke":
-            invoked.update(m[2] for m in appends)
+            for m in appends:
+                invoked[m[1]].add(m[2])
             invoke_index[op["process"]] = op["index"]
         elif op["type"] == "ok":
             seq = op.get("sequence")
@@ -144,7 +148,8 @@ def cross_check(history: list[dict], require_sequence: bool = True) -> list[str]
                     timed_reads[m[1]].append(
                         (invoke_index[op["process"]], m[2]))
         elif op["type"] == "fail":
-            failed.update(m[2] for m in appends)
+            for m in appends:
+                failed[m[1]].add(m[2])
 
     problems: list[str] = []
     if missing_sequence:
@@ -161,9 +166,9 @@ def cross_check(history: list[dict], require_sequence: bool = True) -> list[str]
                     f"key {key}: read {r} is not a prefix of final {final}")
                 break
         for e in final:
-            if e in failed:
+            if e in failed[key]:
                 problems.append(f"key {key}: element {e} of a failed txn read")
-            elif e not in invoked:
+            elif e not in invoked[key]:
                 problems.append(f"key {key}: element {e} was never appended")
         committed = sorted(ok_appends[key], key=lambda a: (a[0] or 0, a[1], a[2]))
         missing = [e for _, _, e in committed if e not in where]

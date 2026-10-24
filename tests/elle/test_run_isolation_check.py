@@ -133,6 +133,52 @@ def sql_history(final: list[int]) -> list[dict]:
     return ops
 
 
+def append_txn(index: int, process: int, kind: str, key: int, element: int,
+               seq: int | None = None) -> list[dict]:
+    """An append to key, seen from its invoke to its completion."""
+    value = [["append", key, element]]
+    done = {"index": index + 1, "process": process, "type": kind,
+            "value": value}
+    if seq is not None:
+        done["sequence"] = seq
+    return [{"index": index, "process": process, "type": "invoke",
+             "value": value}, done]
+
+
+def read_txn(index: int, process: int, key: int, lst: list) -> list[dict]:
+    return [{"index": index, "process": process, "type": "invoke",
+             "value": [["r", key, None]]},
+            {"index": index + 1, "process": process, "type": "ok",
+             "value": [["r", key, lst]]}]
+
+
+class FailedElementKeyTest(unittest.TestCase):
+    """An element id names a write on one key. A process counter restarts
+    with each epoch, so the same id appears on another key in another life:
+    that is a different write, not the failed one."""
+
+    def test_the_same_id_on_another_key_throughout(self):
+        history = (append_txn(0, 0, "fail", 1, 7)
+                   + append_txn(2, 0, "ok", 2, 7, 10)
+                   + read_txn(4, 1, 2, [7]))
+        self.assertEqual(ric.cross_check(history), [])
+
+    def test_a_failed_element_read_on_its_own_key_fails(self):
+        history = (append_txn(0, 0, "fail", 1, 7)
+                   + read_txn(2, 1, 1, [7]))
+        problems = ric.cross_check(history)
+        self.assertTrue(any("element 7 of a failed txn read" in p
+                            for p in problems), problems)
+
+    def test_an_element_never_appended_on_its_key_fails(self):
+        history = (append_txn(0, 0, "ok", 2, 7, 10)
+                   + read_txn(2, 1, 2, [7])
+                   + read_txn(4, 1, 1, [7]))
+        problems = ric.cross_check(history)
+        self.assertTrue(any("key 1: element 7 was never appended" in p
+                            for p in problems), problems)
+
+
 class NoSequenceTest(unittest.TestCase):
     def test_a_missing_sequence_fails_by_default(self):
         problems = ric.cross_check(sql_history([20, 10]))

@@ -1716,20 +1716,25 @@ auto run_kill_child(const RunOptions &o) -> int {
       RangeGenerator ranges{static_cast<std::uint64_t>(process)};
       while (remaining.fetch_sub(1, std::memory_order_relaxed) > 0) {
         auto mops = make_txns(o.workload, rng, keys, ranges, next_element);
-        // What a range transaction will run is settled by its scan, so it is
-        // read before the invoke goes out: the stream names the plan it ran,
-        // which is what a killed operation is judged on.
-        auto snap = o.workload == Workload::Range
-                        ? plan_range_txn(db, o.mode, mops)
-                        : std::optional<bytecask::Snapshot>{};
         const auto sync =
             static_cast<int>(rng() % 100) < cfg.sync_percent;
-        std::string line = std::format("I {} {} {}", process, monotonic_ns(),
-                                       sync ? 1 : 0);
-        append_mops(line, mops, false);
-        out.write(line + "\n");
         TxnOutcome r;
+        std::string line;
+        bool started = false;
+        // What a range transaction will run is settled by its scan, so it is
+        // read before the invoke goes out: the stream names the plan it ran,
+        // which is what a killed operation is judged on. Both steps sit in
+        // one try, so an I/O fault during the scan fails the transaction
+        // rather than the child.
         try {
+          auto snap = o.workload == Workload::Range
+                          ? plan_range_txn(db, o.mode, mops)
+                          : std::optional<bytecask::Snapshot>{};
+          line = std::format("I {} {} {}", process, monotonic_ns(),
+                             sync ? 1 : 0);
+          append_mops(line, mops, false);
+          out.write(line + "\n");
+          started = true;
           r = o.workload == Workload::Range
                   ? apply_range_txn(db, o.mode, mops, std::move(snap),
                                     {.sync = sync})
@@ -1738,6 +1743,7 @@ auto run_kill_child(const RunOptions &o) -> int {
           r = {.type = EventType::Info, .sequence = 0, .error = e.what(),
                .durable = false};
         }
+        if (!started) continue;
         line = std::format("C {} {} {} {} {}", process, monotonic_ns(),
                            event_type_name(r.type), r.sequence,
                            r.durable ? 1 : 0);
@@ -2173,17 +2179,22 @@ auto chaos_child_body(bytecask::DB &db, const RunOptions &o, const Config &cfg,
           continue;
         }
         auto mops = make_txns(o.workload, rng, keys, ranges, next_element);
-        // As in the kill child: the plan is settled before the invoke.
-        auto snap = o.workload == Workload::Range
-                        ? plan_range_txn(db, o.mode, mops)
-                        : std::optional<bytecask::Snapshot>{};
         const auto sync = static_cast<int>(rng() % 100) < cfg.sync_percent;
-        std::string line = std::format("I {} {} {}", process, monotonic_ns(),
-                                       sync ? 1 : 0);
-        append_mops(line, mops, false);
-        out.write(line + "\n");
         TxnOutcome r;
+        std::string line;
+        bool started = false;
+        // The range plan is settled before the invoke, so the invoke names
+        // what the transaction ran. Both steps sit in one try: an injected
+        // I/O fault during the scan is a failed transaction, not a fatal one.
         try {
+          auto snap = o.workload == Workload::Range
+                          ? plan_range_txn(db, o.mode, mops)
+                          : std::optional<bytecask::Snapshot>{};
+          line = std::format("I {} {} {}", process, monotonic_ns(),
+                             sync ? 1 : 0);
+          append_mops(line, mops, false);
+          out.write(line + "\n");
+          started = true;
           r = o.workload == Workload::Range
                   ? apply_range_txn(db, o.mode, mops, std::move(snap),
                                     {.sync = sync})
@@ -2192,6 +2203,9 @@ auto chaos_child_body(bytecask::DB &db, const RunOptions &o, const Config &cfg,
           r = {.type = EventType::Info, .sequence = 0, .error = e.what(),
                .durable = false};
         }
+        // A fault before the invoke went out leaves no transaction to
+        // complete: writing one would be a completion without an invoke.
+        if (!started) continue;
         if (r.type == EventType::Ok) {
           auto seen = max_ok.load();
           while (r.sequence > seen && !max_ok.compare_exchange_weak(seen, r.sequence)) {

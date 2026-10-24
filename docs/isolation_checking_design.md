@@ -217,7 +217,9 @@ the script checks, per key:
 - the final value holds every `:ok` append, in ascending commit sequence
   (`:info` elements may appear anywhere, or not at all);
 - no element comes from a `:fail` transaction, none is duplicated, and
-  every element was invoked;
+  every element was invoked. Both hold per key: an element id is unique to
+  a write within one process, and a process counter restarts with each
+  epoch, so the same id names another key's write in another life;
 - a read sees every append whose transaction completed `:ok` before the
   reading transaction was invoked (real-time visibility). The first CI run
   showed why this belongs here as well as in Elle: see *Findings*.
