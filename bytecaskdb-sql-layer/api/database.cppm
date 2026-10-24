@@ -148,15 +148,10 @@ public:
 
 // A statement the layer does not support where it was given: SQLSTATE
 // 0A000. A DDL statement given to a transaction is one: DDL is its own
-// atomic operation. Thrown before anything runs; in a transaction it aborts
-// the transaction, as every error does in PostgreSQL.
-class FeatureNotSupported : public std::logic_error {
-public:
-  using std::logic_error::logic_error;
-  FeatureNotSupported(const FeatureNotSupported&) = default;
-  FeatureNotSupported& operator=(const FeatureNotSupported&) = default;
-  ~FeatureNotSupported() override;  // out of line: anchors the vtable (-Wweak-vtables)
-};
+// atomic operation. A statement the planner can't plan is another, its
+// message starting "no plan:". Thrown before anything runs; in a
+// transaction it aborts the transaction, as every error does in PostgreSQL.
+using FeatureNotSupported = ast::FeatureNotSupported;
 
 // Parameters a statement does not take: the wrong number, or a value not of
 // its parameter's type. Thrown before the plan runs.
@@ -543,7 +538,6 @@ constexpr std::uint32_t kMaxRetries = 3;
 ExecError::~ExecError() = default;
 SerializationFailure::~SerializationFailure() = default;
 TransactionAborted::~TransactionAborted() = default;
-FeatureNotSupported::~FeatureNotSupported() = default;
 TransactionResolutionUnknown::~TransactionResolutionUnknown() = default;
 auto TransactionResolutionUnknown::what() const noexcept -> const char* {
   return "the transaction's outcome is unknown: its commit failed after its batch may have reached the data file "
@@ -856,20 +850,13 @@ auto Database::catalog() const -> std::shared_ptr<const Catalog> {
 auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
   auto cat = live_->current();
   auto bound = bound::bind(s.ast_, *cat);
-  // Every statement but DDL reads or writes a table, a join two; DDL has no
-  // plan.
-  const auto* table = std::visit(
-      [](const auto& st) -> const Table* {
-        if constexpr (std::is_same_v<std::decay_t<decltype(st)>, Ddl>) {
-          return nullptr;
-        } else {
-          return st.table;
-        }
-      },
-      bound.stmt);
-  if (table == nullptr) return nullptr;
+  // DDL has no plan.
+  if (std::holds_alternative<Ddl>(bound.stmt)) return nullptr;
   auto c = std::make_shared<Compiled>();
-  c->plan = std::make_unique<GeneratedPlan>(generate_plan(bound, *cat, s.sql_));
+  c->param_sql = std::move(bound.param_sql);
+  c->param_table = std::move(bound.param_table);
+  c->params = std::move(bound.params);
+  c->plan = std::make_unique<GeneratedPlan>(generate_plan(std::move(bound), *cat, s.sql_));
   c->columns = c->plan->result_names;
   c->column_types = c->plan->result_sql;
   c->result_codes = result_type_codes(c->plan->result_types);
@@ -881,9 +868,6 @@ auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
   for (const auto& col : c->plan->columns) {
     c->col_refs.push_back({col.table, col.col, static_cast<std::uint8_t>(col.type)});
   }
-  c->param_sql = std::move(bound.param_sql);
-  c->param_table = std::move(bound.param_table);
-  c->params = std::move(bound.params);
   auto n = [](const auto& v) { return narrow<std::uint32_t>(v.size()); };
   const auto& p = *c->plan;
   c->ref = {p.catalog_version,

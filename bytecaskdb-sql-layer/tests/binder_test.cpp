@@ -13,6 +13,7 @@
 
 import bytecask.sql.binder;
 import bytecask.sql.parser;
+import bytecask.sql.rewrite;
 import bytecask.sql.tests.fixture;
 
 using namespace bytecask::sql;
@@ -20,6 +21,27 @@ using namespace bytecask::sql;
 namespace {
 
 auto bind_sql(const Catalog& cat, std::string_view sql) -> bound::Bound { return bound::bind(ast::parse(sql), cat); }
+
+auto root(const bound::Bound& b) -> logical::Node& { return *std::get<logical::NodePtr>(b.stmt); }
+
+// The first operator of type T at or below n, the left side of a join first.
+template <typename T>
+auto find(const logical::Node& n) -> const T* {
+  if (const auto* op = std::get_if<T>(&n.op)) return op;
+  if (const auto* j = std::get_if<logical::Join>(&n.op)) {
+    const auto* left = find<T>(*j->left);
+    return left != nullptr ? left : find<T>(*j->right);
+  }
+  const auto* in = logical::input_of(n);
+  return in != nullptr && *in ? find<T>(**in) : nullptr;
+}
+
+template <typename T>
+auto get(const bound::Bound& b) -> const T& {
+  const auto* op = find<T>(root(b));
+  REQUIRE(op != nullptr);
+  return *op;
+}
 
 auto rejected(const Catalog& cat, std::string_view sql) -> std::pair<std::string, std::int32_t> {
   try {
@@ -47,7 +69,7 @@ TEST_CASE("binder: names become ids, parameters get types from use", "[sql][bind
   }
   {
     auto b = bind_sql(cat, "INSERT INTO t VALUES ($1, $2, $3)");
-    auto& s = std::get<bound::Insert>(b.stmt);
+    const auto& s = get<logical::Insert>(b);
     CHECK(s.table->id == 1);
     CHECK(b.param_types == std::vector<PhysType>{PhysType::I64, PhysType::Bytes, PhysType::I64});
     REQUIRE(s.values.size() == 3);
@@ -55,7 +77,7 @@ TEST_CASE("binder: names become ids, parameters get types from use", "[sql][bind
   }
   {
     auto b = bind_sql(cat, "INSERT INTO t (qty, id) VALUES ($1, $2)");
-    auto& s = std::get<bound::Insert>(b.stmt);
+    const auto& s = get<logical::Insert>(b);
     CHECK(b.param_types == std::vector<PhysType>{PhysType::I64, PhysType::I64});
     CHECK(s.values[0]->param == 1);
     CHECK_FALSE(s.values[1].has_value());  // name is not given: its default, NULL
@@ -63,29 +85,37 @@ TEST_CASE("binder: names become ids, parameters get types from use", "[sql][bind
   }
   {
     auto b = bind_sql(cat, "SELECT id, qty FROM t WHERE id = $1");
-    auto& s = std::get<bound::Select>(b.stmt);
-    CHECK(s.targets == std::vector<std::uint32_t>{0, 2});
-    REQUIRE(s.where.size() == 1);
-    CHECK(s.where[0].col_id == 0);
+    const auto& p = get<logical::Project>(b);
+    REQUIRE(p.exprs.size() == 2);
+    CHECK(p.exprs[0].expr.col.col == 0);
+    CHECK(p.exprs[1].expr.col.col == 2);
+    CHECK(p.exprs[1].name == "qty");
+    const auto& where = get<logical::Filter>(b).conjuncts;
+    REQUIRE(where.size() == 1);
+    CHECK(where[0].args[0].col.col == 0);
+    CHECK(get<logical::Get>(b).table->name == "t");
     CHECK(b.param_types == std::vector<PhysType>{PhysType::I64});
   }
   {
     auto b = bind_sql(cat, "SELECT id FROM t WHERE $1 <= name AND name < $2");
-    auto& s = std::get<bound::Select>(b.stmt);
-    CHECK(s.where[0].op == ast::Compare::Op::Ge);  // normalised: column on the left
+    const auto& w = get<logical::Filter>(b).conjuncts;
+    CHECK(w[0].op == ast::Compare::Op::Ge);  // normalised: column on the left
+    CHECK(w[0].args[0].kind == logical::Expr::Kind::Column);
+    CHECK(w[0].type.kind == SqlKind::Boolean);
     CHECK(b.param_types == std::vector<PhysType>{PhysType::Bytes, PhysType::Bytes});
   }
   {
     auto b = bind_sql(cat, "UPDATE t SET qty = qty - $2 WHERE id = $1");
-    auto& s = std::get<bound::Update>(b.stmt);
+    const auto& s = get<logical::Update>(b);
     REQUIRE(s.set.size() == 1);
-    CHECK(s.set[0].first == 2);
-    CHECK(s.set[0].second.kind == bound::Expr::Kind::Sub);
+    CHECK(s.set[0].first.col == 2);
+    CHECK(s.set[0].second.kind == logical::Expr::Kind::Sub);
     CHECK(b.param_types == std::vector<PhysType>{PhysType::I64, PhysType::I64});
   }
   {
     auto b = bind_sql(cat, "DELETE FROM t WHERE id = $1");
-    CHECK(std::get<bound::Delete>(b.stmt).where.size() == 1);
+    CHECK(get<logical::Delete>(b).table->name == "t");
+    CHECK(get<logical::Filter>(b).conjuncts.size() == 1);
   }
 }
 
@@ -286,24 +316,28 @@ TEST_CASE("binder: COUNT, ORDER BY and column + parameter", "[sql][binder]") {
   sql_test::Fixture f;
   const auto& cat = f.cat();
   {
-    auto s = std::get<bound::Select>(bind_sql(cat, "SELECT count(qty) FROM t WHERE name = $1").stmt);
-    CHECK(s.targets.empty());
-    REQUIRE(s.aggregate);
-    CHECK(s.aggregate->col_id == 2u);
-    auto star = std::get<bound::Select>(bind_sql(cat, "SELECT count(*) FROM t WHERE name = $1").stmt);
-    CHECK_FALSE(star.aggregate->col_id);
+    auto b = bind_sql(cat, "SELECT count(qty) FROM t WHERE name = $1");
+    CHECK(find<logical::Project>(root(b)) == nullptr);
+    const auto& a = get<logical::Aggregate>(b).aggs.at(0);
+    REQUIRE(a.expr.args.size() == 1);
+    CHECK(a.expr.args[0].col.col == 2u);
+    CHECK(a.name == "count");
+    CHECK(a.expr.type.kind == SqlKind::BigInt);
+    auto star = bind_sql(cat, "SELECT count(*) FROM t WHERE name = $1");
+    CHECK(get<logical::Aggregate>(star).aggs.at(0).expr.args.empty());
   }
   {
-    auto s = std::get<bound::Select>(bind_sql(cat, "SELECT id FROM t WHERE name = $1 ORDER BY qty DESC LIMIT 2").stmt);
-    REQUIRE(s.order_by.size() == 1);
-    CHECK(s.order_by[0].col_id == 2u);
-    CHECK(s.order_by[0].desc);
-    CHECK(s.limit == 2);
+    auto b = bind_sql(cat, "SELECT id FROM t WHERE name = $1 ORDER BY qty DESC LIMIT 2");
+    const auto& keys = get<logical::Sort>(b).keys;
+    REQUIRE(keys.size() == 1);
+    CHECK(keys[0].expr.col.col == 2u);
+    CHECK(keys[0].desc);
+    CHECK(std::get<logical::Limit>(root(b).op).n == 2);
   }
   {
     // The operand is typed and range-checked as the column it is added to.
     auto b = bind_sql(cat, "UPDATE t SET qty = qty + $2 WHERE id = $1");
-    CHECK(std::get<bound::Update>(b.stmt).set[0].second.kind == bound::Expr::Kind::Add);
+    CHECK(get<logical::Update>(b).set[0].second.kind == logical::Expr::Kind::Add);
     CHECK(b.param_sql[1].has_value());
     // An UPDATE's assigned $n is checked against the column's whole type,
     // an INSERT's by the row builder.
@@ -333,8 +367,13 @@ TEST_CASE("binder: COUNT, ORDER BY and column + parameter", "[sql][binder]") {
   CHECK(rejected(cat, "SELECT id FROM t WHERE id = $1 ORDER BY nope").first == "column \"nope\" does not exist");
   CHECK(rejected(cat, "UPDATE t SET qty = count(*) WHERE id = $1").first == "aggregate functions are not allowed here");
   // SUM and MIN take a column held as an int64_t; SUM an exact number.
-  CHECK(std::get<bound::Select>(bind_sql(cat, "SELECT sum(qty) FROM t WHERE name = $1").stmt).aggregate->fn ==
-        ast::Expr::Fn::Sum);
+  {
+    auto b = bind_sql(cat, "SELECT sum(qty) FROM t WHERE name = $1");
+    const auto& sum = get<logical::Aggregate>(b).aggs.at(0);
+    CHECK(sum.expr.fn == logical::Expr::Fn::Sum);
+    CHECK(sum.name == "sum");
+    CHECK(sql_type_name(sum.expr.type) == "numeric");  // of a BIGINT: no declared precision
+  }
   CHECK(rejected(cat, "SELECT sum(name) FROM t WHERE id = $1") ==
         std::pair<std::string, std::int32_t>{"SUM of a bytea column is not supported", 7});
   CHECK(rejected(cat, "SELECT min(name) FROM t WHERE id = $1").first == "MIN of a bytea column is not supported");
@@ -361,13 +400,25 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
   f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE u (k BIGINT PRIMARY KEY, qty BIGINT, d NUMERIC(10, 2))").stmt));
   const auto& cat = f.cat();
   {
-    auto j = std::get<bound::Join>(bind_sql(cat, "SELECT name, u.qty FROM t, u WHERE id = $1 AND k = $2").stmt);
-    CHECK(j.table->name == "t");
-    CHECK(j.second->name == "u");
-    REQUIRE(j.targets.size() == 2);
-    CHECK(j.targets[1].side == 1);
-    CHECK(j.where[0].size() == 1);
-    CHECK(j.where[1].size() == 1);
+    auto b = bind_sql(cat, "SELECT name, u.qty FROM t, u WHERE id = $1 AND k = $2");
+    const auto& bound_join = get<logical::Join>(b);
+    CHECK(std::get<logical::Get>(bound_join.left->op).table->name == "t");
+    CHECK(std::get<logical::Get>(bound_join.right->op).table->name == "u");
+    const auto& targets = get<logical::Project>(b).exprs;
+    REQUIRE(targets.size() == 2);
+    CHECK(targets[1].expr.col.table == cat.table("u")->id);
+    // The WHERE is one Filter above the join; pushdown moves each conjunct
+    // onto the table it reads.
+    CHECK(get<logical::Filter>(b).conjuncts.size() == 2);
+    logical::rewrite(root(b));
+    const auto& j = get<logical::Join>(b);  // the Filter above it is gone
+    CHECK(find<logical::Filter>(root(b)) == &std::get<logical::Filter>(j.left->op));
+    CHECK(std::get<logical::Filter>(j.left->op).conjuncts.size() == 1);
+    CHECK(std::get<logical::Filter>(j.right->op).conjuncts.size() == 1);
+    CHECK(j.predicate.empty());
+    // Pruning: the join reads t.name and u.qty, and each side's filter its own key column too.
+    CHECK(j.left->output.size() == 1);
+    CHECK(std::get<logical::Filter>(j.left->op).input->output.size() == 2);
   }
   {
     // $n ± k compared with an INTEGER column: $n is an INTEGER, the literal
@@ -375,10 +426,13 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
     sql_test::Fixture g;
     g.ddl(std::get<Ddl>(bind_sql(g.cat(), "CREATE TABLE ol (w INTEGER, o INTEGER, s SMALLINT, PRIMARY KEY (w, o))").stmt));
     auto b = bind_sql(g.cat(), "SELECT o FROM ol WHERE w = $1 AND o < $2 AND o >= $2 - 20");
-    const auto& sel = std::get<bound::Select>(b.stmt);
-    CHECK(sel.where[2].param == 1u);
-    CHECK(sel.where[2].offset == -20);
-    CHECK_FALSE(sel.where[1].offset);
+    const auto& w = get<logical::Filter>(b).conjuncts;
+    const auto& sum = w[2].args[1];
+    CHECK(sum.kind == logical::Expr::Kind::Sub);
+    CHECK(sum.type.kind == SqlKind::Integer);
+    CHECK(sum.args[0].param == 1u);
+    CHECK(sum.args[1].constant == 20);
+    CHECK(w[1].args[1].kind == logical::Expr::Kind::Param);
     CHECK(rejected(g.cat(), "SELECT o FROM ol WHERE w = $1 AND s < $2 + 1").first ==
           "$n + n and $n - n are supported only compared with an INTEGER column yet");
     CHECK(rejected(g.cat(), "SELECT o FROM ol WHERE w = $1 AND o < $2 + 2147483648").first ==
@@ -386,9 +440,10 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
   }
   {
     // A literal is in its column's representation: a DECIMAL's scaled.
-    auto up = std::get<bound::Update>(bind_sql(cat, "UPDATE u SET d = d + 1, qty = qty - 2 WHERE k = $1").stmt);
-    CHECK(up.set[0].second.constant == 100);
-    CHECK(up.set[1].second.constant == 2);
+    auto b = bind_sql(cat, "UPDATE u SET d = d + 1, qty = qty - 2 WHERE k = $1");
+    const auto& up = get<logical::Update>(b);
+    CHECK(up.set[0].second.args[1].constant == 100);
+    CHECK(up.set[1].second.args[1].constant == 2);
   }
   //                       0         1         2         3         4
   //                       01234567890123456789012345678901234567890123456789
@@ -402,13 +457,16 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
   {
     // A column of one table equal to one of the other joins them; an
     // aggregate on a join takes either table's column.
-    auto j = std::get<bound::Join>(bind_sql(cat, "SELECT count(DISTINCT u.qty) FROM t JOIN u ON u.qty = id WHERE id >= $1").stmt);
-    REQUIRE(j.on.size() == 1);
-    CHECK(j.on[0].col[0] == 0u);  // t.id
-    CHECK(j.on[0].col[1] == 1u);  // u.qty
-    REQUIRE(j.aggregate);
-    CHECK(j.aggregate->distinct);
-    CHECK(j.aggregate->side == 1);
+    auto b = bind_sql(cat, "SELECT count(DISTINCT u.qty) FROM t JOIN u ON u.qty = id WHERE id >= $1");
+    logical::rewrite(root(b));
+    const auto& on = get<logical::Join>(b).predicate;
+    REQUIRE(on.size() == 1);  // pushed down onto the join: it reads both tables
+    CHECK(on[0].args[0].col.table == cat.table("u")->id);
+    CHECK(on[0].args[0].col.col == 1u);  // u.qty
+    CHECK(on[0].args[1].col.col == 0u);  // t.id
+    const auto& a = get<logical::Aggregate>(b).aggs.at(0).expr;
+    CHECK(a.distinct);
+    CHECK(a.args.at(0).col.table == cat.table("u")->id);
   }
   CHECK(rejected(cat, "SELECT id FROM t, u WHERE id = k AND qty = id").first ==
         "column reference \"qty\" is ambiguous");

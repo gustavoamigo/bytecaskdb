@@ -35,6 +35,16 @@ RANGE_STATES = frozenset(state for _, state in bytecask_sql._range_messages())
 # A statement in a transaction an earlier statement failed in.
 ABORTED = "25P02"
 
+# A statement the layer does not support: the planner's refusal among them,
+# its message starting "no plan:" (planner_design.md, *What the search
+# refuses*).
+NOT_SUPPORTED = "0A000"
+
+
+def is_no_plan(out: "Outcome") -> bool:
+    """Whether the layer refused the statement as the planner refuses one."""
+    return out.error == "refused" and out.detail.startswith("no plan:") and out.sqlstate == NOT_SUPPORTED
+
 
 def layer_sqlstate(e: bytecask_sql.ExecError) -> str:
     """The SQLSTATE PostgreSQL gives the layer's refusal, or "refused"."""
@@ -95,8 +105,9 @@ class Outcome:
     """What one statement did: rows and the affected count, or a refusal.
 
     `error` is None when it ran, a SQLSTATE for a constraint both sides
-    name, or "refused" for any other error: the layer's SqlError, and any
-    other PostgreSQL error. `affected` is the rows an INSERT, UPDATE or
+    name, or "refused" for any other error: the layer's SqlError (its
+    FeatureNotSupported, the planner's refusal, among them), and any other
+    PostgreSQL error. `affected` is the rows an INSERT, UPDATE or
     DELETE changed, None for any other statement.
     """
 

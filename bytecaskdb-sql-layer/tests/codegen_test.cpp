@@ -115,7 +115,7 @@ TEST_CASE("codegen: the other bound forms produce plans; no rule, no plan", "[sq
   CHECK(set.find("bc_row_set_param(cx, r, COL_1_1, 1);\n  bc_update(cx, TBL_1, old, bc_row_end(cx, r));") !=
         std::string::npos);
 
-  CHECK_THROWS_AS(generate(f.cat(), "SELECT id FROM t WHERE qty = $1"), ast::SqlError);
+  CHECK_THROWS_AS(generate(f.cat(), "SELECT id FROM t WHERE qty = $1"), ast::FeatureNotSupported);
   // A conjunct the key does not express filters each row: NULL on either side
   // rejects it.
   auto point = generate(f.cat(), "SELECT id FROM t WHERE id = $1 AND qty = $2").source;
@@ -124,7 +124,7 @@ TEST_CASE("codegen: the other bound forms produce plans; no rule, no plan", "[sq
   auto range = generate(f.cat(), "SELECT id FROM t WHERE name > $1 AND name > $2").source;
   CHECK(range.find("|| !(bc_bytes_cmp(cx, bc_col_bytes(cx, row, COL_1_1), bc_param_bytes(cx, 1)) > 0)) continue;") !=
         std::string::npos);
-  CHECK_THROWS_AS(generate(f.cat(), "DELETE FROM t WHERE qty = $1"), ast::SqlError);
+  CHECK_THROWS_AS(generate(f.cat(), "DELETE FROM t WHERE qty = $1"), ast::FeatureNotSupported);
 }
 
 TEST_CASE("codegen: UPDATE and DELETE write each row their key reaches, and count them", "[sql][codegen]") {
@@ -145,7 +145,7 @@ TEST_CASE("codegen: UPDATE and DELETE write each row their key reaches, and coun
   auto refusal = [&](std::string_view sql) -> std::string {
     try {
       (void)generate(f.cat(), sql);
-    } catch (const ast::SqlError& e) {
+    } catch (const ast::FeatureNotSupported& e) {
       return e.what();
     }
     return "accepted";
@@ -223,7 +223,7 @@ TEST_CASE("codegen: what the planner refuses, with its message", "[sql][codegen]
   auto refusal = [&](std::string_view sql) -> std::string {
     try {
       (void)generate(f.cat(), sql);
-    } catch (const ast::SqlError& e) {
+    } catch (const ast::FeatureNotSupported& e) {
       return e.what();
     }
     return "accepted";
@@ -273,7 +273,7 @@ TEST_CASE("codegen: a join is of two point lookups, in FROM order", "[sql][codeg
   auto refusal = [&](std::string_view sql) -> std::string {
     try {
       (void)generate(f.cat(), sql);
-    } catch (const ast::SqlError& e) {
+    } catch (const ast::FeatureNotSupported& e) {
       return e.what();
     }
     return "accepted";
