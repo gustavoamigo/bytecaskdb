@@ -37,6 +37,9 @@ jobs:
     timeout-minutes: 75
     container:
       image: fedora:43
+      # TSan needs personality(ADDR_NO_RANDOMIZE), which Docker's default
+      # seccomp profile refuses; see sanitizers.yml (#558).
+      options: ${{ matrix.sanitizer == 'thread' && '--security-opt seccomp=unconfined' || '' }}
     env:
       BYTECASK_MARCH: x86-64-v3
       XMAKE_ROOT: "y"
