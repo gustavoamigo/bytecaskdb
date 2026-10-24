@@ -57,6 +57,8 @@ import bytecask.hint_file;
 import bytecask.serialization;
 import bytecask.types;
 
+#include "proof/hint_reads.h"
+
 namespace {
 
 auto to_bytes(std::string_view sv) -> bytecask::BytesView {
@@ -2714,13 +2716,8 @@ TEST_CASE("DB::open rebuilds a hint file a read fails on",
       if (e.path().extension() == ".hint") hints.push_back(e.path());
     REQUIRE(hints.size() == 1);
     // The read after those that open the hint is the first of its scan.
-    int open_reads = 0;
-    {
-      bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
-      fi.inj.fail_on_nth_match = std::numeric_limits<int>::max();
-      (void)bytecask::HintFile::OpenForRead(hints[0]);
-      open_reads = fi.inj.name_matches;
-    }
+    const auto open_reads =
+        bytecask::testing::hint_reads(hints[0]).open_pass;
     REQUIRE(open_reads > 0);
     const auto hint_size = std::filesystem::file_size(hints[0]);
     {

@@ -6,8 +6,11 @@
 // Correctness proof tests for DB::open's recovery and hint generation. Each
 // test writes a known state, damages the hint files the way a crash or bad
 // hardware would, optionally faults one of the three steps of the hint write
-// (write -> fdatasync -> rename), and verifies that once the fault clears
-// every key comes back. A hint file is a rebuildable index, not the record.
+// (write -> fdatasync -> rename) or a read of a hint file, and verifies that
+// once the fault clears every key comes back. A hint file is a rebuildable
+// index, not the record. One fault's outcome is an exception to that: a read
+// failing while a hint is verified is answered by a rebuild, while one
+// failing during the scan of a hint that verified fails the open.
 
 #include <system_error>
 
@@ -17,7 +20,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 import bytecask;
+import bytecask.hint_file;
 
+#include "proof/hint_reads.h"
 #include "proof/invariants.h"
 
 namespace {
@@ -26,6 +31,7 @@ using bytecask::testing::assert_consistent;
 using bytecask::testing::corrupt_newest_hint;
 using bytecask::testing::drop_all_hints;
 using bytecask::testing::drop_newest_hint;
+using bytecask::testing::first_hint_scan_read;
 using bytecask::testing::to_bytes;
 using bytecask::testing::to_string;
 
@@ -534,6 +540,196 @@ TEST_CASE("prove_recovery__crash_hintless__hint_rename_fails__t4", "[prove_recov
   // failure cost recovery time and must have cost no keys.
   {
     auto db = bytecask::DB::open(dir, {.recovery_threads = 4});
+    CHECK_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k1");
+      CHECK(db.get({}, to_bytes("k1"), out));
+      CHECK(to_string(out) == "v1");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k2");
+      CHECK(db.get({}, to_bytes("k2"), out));
+      CHECK(to_string(out) == "v2");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k3");
+      CHECK(db.get({}, to_bytes("k3"), out));
+      CHECK(to_string(out) == "v3");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k4");
+      CHECK(db.get({}, to_bytes("k4"), out));
+      CHECK(to_string(out) == "v4");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k5");
+      CHECK(db.get({}, to_bytes("k5"), out));
+      CHECK(to_string(out) == "v5");
+    }
+    assert_consistent(db);
+  }
+}
+
+TEST_CASE("prove_recovery__crash_hintless__hint_read_fails_while_verified__t1", "[prove_recovery]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = true}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = true}, to_bytes("k5"), to_bytes("v5"));
+  }
+
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
+
+  // A read that fails while the first hint is verified has the
+  // hint rebuilt around it: it is an index, so recovery throws it
+  // away and indexes its data file again. The open succeeds and
+  // every key is in it. A hint's first read is the one that
+  // verifies it.
+  {
+    const int fail_on = 1;
+    bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
+    fi.inj.fail_on_nth_match = fail_on;
+    auto db = bytecask::DB::open(dir, {.recovery_threads = 1});
+    // The reads after the failure are the rebuild re-reading the
+    // hint it replaced: no file went unindexed behind its hint.
+    REQUIRE(fi.inj.name_matches > fail_on);
+    CHECK_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k1");
+      CHECK(db.get({}, to_bytes("k1"), out));
+      CHECK(to_string(out) == "v1");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k2");
+      CHECK(db.get({}, to_bytes("k2"), out));
+      CHECK(to_string(out) == "v2");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k3");
+      CHECK(db.get({}, to_bytes("k3"), out));
+      CHECK(to_string(out) == "v3");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k4");
+      CHECK(db.get({}, to_bytes("k4"), out));
+      CHECK(to_string(out) == "v4");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k5");
+      CHECK(db.get({}, to_bytes("k5"), out));
+      CHECK(to_string(out) == "v5");
+    }
+    assert_consistent(db);
+  }
+
+  // The fault clears. A hint is an index, not the record: the
+  // failure cost recovery time and must have cost no keys.
+  {
+    auto db = bytecask::DB::open(dir, {.recovery_threads = 1});
+    CHECK_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k1");
+      CHECK(db.get({}, to_bytes("k1"), out));
+      CHECK(to_string(out) == "v1");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k2");
+      CHECK(db.get({}, to_bytes("k2"), out));
+      CHECK(to_string(out) == "v2");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k3");
+      CHECK(db.get({}, to_bytes("k3"), out));
+      CHECK(to_string(out) == "v3");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k4");
+      CHECK(db.get({}, to_bytes("k4"), out));
+      CHECK(to_string(out) == "v4");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k5");
+      CHECK(db.get({}, to_bytes("k5"), out));
+      CHECK(to_string(out) == "v5");
+    }
+    assert_consistent(db);
+  }
+}
+
+TEST_CASE("prove_recovery__crash_hintless__hint_read_fails_during_scan__t1", "[prove_recovery]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = true}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = true}, to_bytes("k5"), to_bytes("v5"));
+  }
+
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
+
+  // A read that fails during the scan of a hint that verified is
+  // not answered by a rebuild: the entries of a hint are applied as
+  // it scans, so the open throws. Recovery opens and scans the hint
+  // of one data file at a time, in name order, so the read after
+  // those that open the first hint with anything to scan is a read
+  // of its scan.
+  {
+    const int fail_on = first_hint_scan_read(dir);
+    bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
+    fi.inj.fail_on_nth_match = fail_on;
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 1}),
+                      std::system_error);
+    REQUIRE(fi.inj.name_matches >= fail_on);
+  }
+
+  // The fault clears. A hint is an index, not the record: the
+  // failure cost recovery time and must have cost no keys.
+  {
+    auto db = bytecask::DB::open(dir, {.recovery_threads = 1});
     CHECK_FALSE(db.is_degraded());
     {
       bytecask::Bytes out;
@@ -1101,6 +1297,196 @@ TEST_CASE("prove_recovery__multi_file_hintless__hint_rename_fails__t4", "[prove_
   }
 }
 
+TEST_CASE("prove_recovery__multi_file_hintless__hint_read_fails_while_verified__t1", "[prove_recovery]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120});
+    db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = true}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = true}, to_bytes("k5"), to_bytes("v5"));
+  }
+
+  // Damage: drop_all_hints
+  REQUIRE(drop_all_hints(dir) > 0);
+
+  // A read that fails while the first hint is verified has the
+  // hint rebuilt around it: it is an index, so recovery throws it
+  // away and indexes its data file again. The open succeeds and
+  // every key is in it. A hint's first read is the one that
+  // verifies it.
+  {
+    const int fail_on = 1;
+    bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
+    fi.inj.fail_on_nth_match = fail_on;
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1});
+    // The reads after the failure are the rebuild re-reading the
+    // hint it replaced: no file went unindexed behind its hint.
+    REQUIRE(fi.inj.name_matches > fail_on);
+    CHECK_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k1");
+      CHECK(db.get({}, to_bytes("k1"), out));
+      CHECK(to_string(out) == "v1");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k2");
+      CHECK(db.get({}, to_bytes("k2"), out));
+      CHECK(to_string(out) == "v2");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k3");
+      CHECK(db.get({}, to_bytes("k3"), out));
+      CHECK(to_string(out) == "v3");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k4");
+      CHECK(db.get({}, to_bytes("k4"), out));
+      CHECK(to_string(out) == "v4");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k5");
+      CHECK(db.get({}, to_bytes("k5"), out));
+      CHECK(to_string(out) == "v5");
+    }
+    assert_consistent(db);
+  }
+
+  // The fault clears. A hint is an index, not the record: the
+  // failure cost recovery time and must have cost no keys.
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1});
+    CHECK_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k1");
+      CHECK(db.get({}, to_bytes("k1"), out));
+      CHECK(to_string(out) == "v1");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k2");
+      CHECK(db.get({}, to_bytes("k2"), out));
+      CHECK(to_string(out) == "v2");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k3");
+      CHECK(db.get({}, to_bytes("k3"), out));
+      CHECK(to_string(out) == "v3");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k4");
+      CHECK(db.get({}, to_bytes("k4"), out));
+      CHECK(to_string(out) == "v4");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k5");
+      CHECK(db.get({}, to_bytes("k5"), out));
+      CHECK(to_string(out) == "v5");
+    }
+    assert_consistent(db);
+  }
+}
+
+TEST_CASE("prove_recovery__multi_file_hintless__hint_read_fails_during_scan__t1", "[prove_recovery]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120});
+    db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = true}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = true}, to_bytes("k5"), to_bytes("v5"));
+  }
+
+  // Damage: drop_all_hints
+  REQUIRE(drop_all_hints(dir) > 0);
+
+  // A read that fails during the scan of a hint that verified is
+  // not answered by a rebuild: the entries of a hint are applied as
+  // it scans, so the open throws. Recovery opens and scans the hint
+  // of one data file at a time, in name order, so the read after
+  // those that open the first hint with anything to scan is a read
+  // of its scan.
+  {
+    const int fail_on = first_hint_scan_read(dir);
+    bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
+    fi.inj.fail_on_nth_match = fail_on;
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}),
+                      std::system_error);
+    REQUIRE(fi.inj.name_matches >= fail_on);
+  }
+
+  // The fault clears. A hint is an index, not the record: the
+  // failure cost recovery time and must have cost no keys.
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1});
+    CHECK_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k1");
+      CHECK(db.get({}, to_bytes("k1"), out));
+      CHECK(to_string(out) == "v1");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k2");
+      CHECK(db.get({}, to_bytes("k2"), out));
+      CHECK(to_string(out) == "v2");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k3");
+      CHECK(db.get({}, to_bytes("k3"), out));
+      CHECK(to_string(out) == "v3");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k4");
+      CHECK(db.get({}, to_bytes("k4"), out));
+      CHECK(to_string(out) == "v4");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k5");
+      CHECK(db.get({}, to_bytes("k5"), out));
+      CHECK(to_string(out) == "v5");
+    }
+    assert_consistent(db);
+  }
+}
+
 TEST_CASE("prove_recovery__damaged_hint__success__t1", "[prove_recovery]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -1586,6 +1972,196 @@ TEST_CASE("prove_recovery__damaged_hint__hint_rename_fails__t4", "[prove_recover
   // failure cost recovery time and must have cost no keys.
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4});
+    CHECK_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k1");
+      CHECK(db.get({}, to_bytes("k1"), out));
+      CHECK(to_string(out) == "v1");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k2");
+      CHECK(db.get({}, to_bytes("k2"), out));
+      CHECK(to_string(out) == "v2");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k3");
+      CHECK(db.get({}, to_bytes("k3"), out));
+      CHECK(to_string(out) == "v3");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k4");
+      CHECK(db.get({}, to_bytes("k4"), out));
+      CHECK(to_string(out) == "v4");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k5");
+      CHECK(db.get({}, to_bytes("k5"), out));
+      CHECK(to_string(out) == "v5");
+    }
+    assert_consistent(db);
+  }
+}
+
+TEST_CASE("prove_recovery__damaged_hint__hint_read_fails_while_verified__t1", "[prove_recovery]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120});
+    db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = true}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = true}, to_bytes("k5"), to_bytes("v5"));
+  }
+
+  // Damage: corrupt_newest_hint
+  REQUIRE(corrupt_newest_hint(dir));
+
+  // A read that fails while the first hint is verified has the
+  // hint rebuilt around it: it is an index, so recovery throws it
+  // away and indexes its data file again. The open succeeds and
+  // every key is in it. A hint's first read is the one that
+  // verifies it.
+  {
+    const int fail_on = 1;
+    bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
+    fi.inj.fail_on_nth_match = fail_on;
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1});
+    // The reads after the failure are the rebuild re-reading the
+    // hint it replaced: no file went unindexed behind its hint.
+    REQUIRE(fi.inj.name_matches > fail_on);
+    CHECK_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k1");
+      CHECK(db.get({}, to_bytes("k1"), out));
+      CHECK(to_string(out) == "v1");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k2");
+      CHECK(db.get({}, to_bytes("k2"), out));
+      CHECK(to_string(out) == "v2");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k3");
+      CHECK(db.get({}, to_bytes("k3"), out));
+      CHECK(to_string(out) == "v3");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k4");
+      CHECK(db.get({}, to_bytes("k4"), out));
+      CHECK(to_string(out) == "v4");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k5");
+      CHECK(db.get({}, to_bytes("k5"), out));
+      CHECK(to_string(out) == "v5");
+    }
+    assert_consistent(db);
+  }
+
+  // The fault clears. A hint is an index, not the record: the
+  // failure cost recovery time and must have cost no keys.
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1});
+    CHECK_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k1");
+      CHECK(db.get({}, to_bytes("k1"), out));
+      CHECK(to_string(out) == "v1");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k2");
+      CHECK(db.get({}, to_bytes("k2"), out));
+      CHECK(to_string(out) == "v2");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k3");
+      CHECK(db.get({}, to_bytes("k3"), out));
+      CHECK(to_string(out) == "v3");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k4");
+      CHECK(db.get({}, to_bytes("k4"), out));
+      CHECK(to_string(out) == "v4");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k5");
+      CHECK(db.get({}, to_bytes("k5"), out));
+      CHECK(to_string(out) == "v5");
+    }
+    assert_consistent(db);
+  }
+}
+
+TEST_CASE("prove_recovery__damaged_hint__hint_read_fails_during_scan__t1", "[prove_recovery]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120});
+    db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = true}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = true}, to_bytes("k5"), to_bytes("v5"));
+  }
+
+  // Damage: corrupt_newest_hint
+  REQUIRE(corrupt_newest_hint(dir));
+
+  // A read that fails during the scan of a hint that verified is
+  // not answered by a rebuild: the entries of a hint are applied as
+  // it scans, so the open throws. Recovery opens and scans the hint
+  // of one data file at a time, in name order, so the read after
+  // those that open the first hint with anything to scan is a read
+  // of its scan.
+  {
+    const int fail_on = first_hint_scan_read(dir);
+    bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
+    fi.inj.fail_on_nth_match = fail_on;
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}),
+                      std::system_error);
+    REQUIRE(fi.inj.name_matches >= fail_on);
+  }
+
+  // The fault clears. A hint is an index, not the record: the
+  // failure cost recovery time and must have cost no keys.
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1});
     CHECK_FALSE(db.is_degraded());
     {
       bytecask::Bytes out;
@@ -2209,6 +2785,210 @@ TEST_CASE("prove_recovery__hintless_batched__hint_rename_fails__t4", "[prove_rec
   }
 }
 
+TEST_CASE("prove_recovery__hintless_batched__hint_read_fails_while_verified__t1", "[prove_recovery]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir);
+    // Markers have to survive hint regeneration: a hint file
+    // carries BulkBegin/BulkEnd so recovery can compute
+    // durable_seq across a batch.
+    {
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("k0"), to_bytes("v0"));
+      plan.put(to_bytes("k1"), to_bytes("v1"));
+      plan.put(to_bytes("k2"), to_bytes("v2"));
+      plan.put(to_bytes("k3"), to_bytes("v3"));
+      plan.put(to_bytes("k4"), to_bytes("v4"));
+      plan.put(to_bytes("k5"), to_bytes("v5"));
+      REQUIRE(db.apply_batch({.sync = true}, std::move(plan)));
+    }
+  }
+
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
+
+  // A read that fails while the first hint is verified has the
+  // hint rebuilt around it: it is an index, so recovery throws it
+  // away and indexes its data file again. The open succeeds and
+  // every key is in it. A hint's first read is the one that
+  // verifies it.
+  {
+    const int fail_on = 1;
+    bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
+    fi.inj.fail_on_nth_match = fail_on;
+    auto db = bytecask::DB::open(dir, {.recovery_threads = 1});
+    // The reads after the failure are the rebuild re-reading the
+    // hint it replaced: no file went unindexed behind its hint.
+    REQUIRE(fi.inj.name_matches > fail_on);
+    CHECK_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k1");
+      CHECK(db.get({}, to_bytes("k1"), out));
+      CHECK(to_string(out) == "v1");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k2");
+      CHECK(db.get({}, to_bytes("k2"), out));
+      CHECK(to_string(out) == "v2");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k3");
+      CHECK(db.get({}, to_bytes("k3"), out));
+      CHECK(to_string(out) == "v3");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k4");
+      CHECK(db.get({}, to_bytes("k4"), out));
+      CHECK(to_string(out) == "v4");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k5");
+      CHECK(db.get({}, to_bytes("k5"), out));
+      CHECK(to_string(out) == "v5");
+    }
+    assert_consistent(db);
+  }
+
+  // The fault clears. A hint is an index, not the record: the
+  // failure cost recovery time and must have cost no keys.
+  {
+    auto db = bytecask::DB::open(dir, {.recovery_threads = 1});
+    CHECK_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k1");
+      CHECK(db.get({}, to_bytes("k1"), out));
+      CHECK(to_string(out) == "v1");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k2");
+      CHECK(db.get({}, to_bytes("k2"), out));
+      CHECK(to_string(out) == "v2");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k3");
+      CHECK(db.get({}, to_bytes("k3"), out));
+      CHECK(to_string(out) == "v3");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k4");
+      CHECK(db.get({}, to_bytes("k4"), out));
+      CHECK(to_string(out) == "v4");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k5");
+      CHECK(db.get({}, to_bytes("k5"), out));
+      CHECK(to_string(out) == "v5");
+    }
+    assert_consistent(db);
+  }
+}
+
+TEST_CASE("prove_recovery__hintless_batched__hint_read_fails_during_scan__t1", "[prove_recovery]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir);
+    // Markers have to survive hint regeneration: a hint file
+    // carries BulkBegin/BulkEnd so recovery can compute
+    // durable_seq across a batch.
+    {
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("k0"), to_bytes("v0"));
+      plan.put(to_bytes("k1"), to_bytes("v1"));
+      plan.put(to_bytes("k2"), to_bytes("v2"));
+      plan.put(to_bytes("k3"), to_bytes("v3"));
+      plan.put(to_bytes("k4"), to_bytes("v4"));
+      plan.put(to_bytes("k5"), to_bytes("v5"));
+      REQUIRE(db.apply_batch({.sync = true}, std::move(plan)));
+    }
+  }
+
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
+
+  // A read that fails during the scan of a hint that verified is
+  // not answered by a rebuild: the entries of a hint are applied as
+  // it scans, so the open throws. Recovery opens and scans the hint
+  // of one data file at a time, in name order, so the read after
+  // those that open the first hint with anything to scan is a read
+  // of its scan.
+  {
+    const int fail_on = first_hint_scan_read(dir);
+    bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
+    fi.inj.fail_on_nth_match = fail_on;
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 1}),
+                      std::system_error);
+    REQUIRE(fi.inj.name_matches >= fail_on);
+  }
+
+  // The fault clears. A hint is an index, not the record: the
+  // failure cost recovery time and must have cost no keys.
+  {
+    auto db = bytecask::DB::open(dir, {.recovery_threads = 1});
+    CHECK_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k1");
+      CHECK(db.get({}, to_bytes("k1"), out));
+      CHECK(to_string(out) == "v1");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k2");
+      CHECK(db.get({}, to_bytes("k2"), out));
+      CHECK(to_string(out) == "v2");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k3");
+      CHECK(db.get({}, to_bytes("k3"), out));
+      CHECK(to_string(out) == "v3");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k4");
+      CHECK(db.get({}, to_bytes("k4"), out));
+      CHECK(to_string(out) == "v4");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k5");
+      CHECK(db.get({}, to_bytes("k5"), out));
+      CHECK(to_string(out) == "v5");
+    }
+    assert_consistent(db);
+  }
+}
+
 TEST_CASE("prove_recovery__hintless_range_del__success__t1", "[prove_recovery]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -2648,6 +3428,172 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_rename_fails__t4", "[prove_r
   // failure cost recovery time and must have cost no keys.
   {
     auto db = bytecask::DB::open(dir, {.recovery_threads = 4});
+    CHECK_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k3");
+      CHECK(db.get({}, to_bytes("k3"), out));
+      CHECK(to_string(out) == "v3");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k4");
+      CHECK(db.get({}, to_bytes("k4"), out));
+      CHECK(to_string(out) == "v4");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k5");
+      CHECK(db.get({}, to_bytes("k5"), out));
+      CHECK(to_string(out) == "v5");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("k1")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("k2")));
+    assert_consistent(db);
+  }
+}
+
+TEST_CASE("prove_recovery__hintless_range_del__hint_read_fails_while_verified__t1", "[prove_recovery]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = true}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = true}, to_bytes("k5"), to_bytes("v5"));
+    // A range tombstone has to survive it too — recovery reads
+    // it back out of the regenerated hint to suppress the range.
+    db.del_range({.sync = true}, to_bytes("k1"), to_bytes("k3"));
+  }
+
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
+
+  // A read that fails while the first hint is verified has the
+  // hint rebuilt around it: it is an index, so recovery throws it
+  // away and indexes its data file again. The open succeeds and
+  // every key is in it. A hint's first read is the one that
+  // verifies it.
+  {
+    const int fail_on = 1;
+    bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
+    fi.inj.fail_on_nth_match = fail_on;
+    auto db = bytecask::DB::open(dir, {.recovery_threads = 1});
+    // The reads after the failure are the rebuild re-reading the
+    // hint it replaced: no file went unindexed behind its hint.
+    REQUIRE(fi.inj.name_matches > fail_on);
+    CHECK_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k3");
+      CHECK(db.get({}, to_bytes("k3"), out));
+      CHECK(to_string(out) == "v3");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k4");
+      CHECK(db.get({}, to_bytes("k4"), out));
+      CHECK(to_string(out) == "v4");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k5");
+      CHECK(db.get({}, to_bytes("k5"), out));
+      CHECK(to_string(out) == "v5");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("k1")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("k2")));
+    assert_consistent(db);
+  }
+
+  // The fault clears. A hint is an index, not the record: the
+  // failure cost recovery time and must have cost no keys.
+  {
+    auto db = bytecask::DB::open(dir, {.recovery_threads = 1});
+    CHECK_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k3");
+      CHECK(db.get({}, to_bytes("k3"), out));
+      CHECK(to_string(out) == "v3");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k4");
+      CHECK(db.get({}, to_bytes("k4"), out));
+      CHECK(to_string(out) == "v4");
+    }
+    {
+      bytecask::Bytes out;
+      INFO("key must survive recovery: k5");
+      CHECK(db.get({}, to_bytes("k5"), out));
+      CHECK(to_string(out) == "v5");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("k1")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("k2")));
+    assert_consistent(db);
+  }
+}
+
+TEST_CASE("prove_recovery__hintless_range_del__hint_read_fails_during_scan__t1", "[prove_recovery]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = true}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = true}, to_bytes("k5"), to_bytes("v5"));
+    // A range tombstone has to survive it too — recovery reads
+    // it back out of the regenerated hint to suppress the range.
+    db.del_range({.sync = true}, to_bytes("k1"), to_bytes("k3"));
+  }
+
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
+
+  // A read that fails during the scan of a hint that verified is
+  // not answered by a rebuild: the entries of a hint are applied as
+  // it scans, so the open throws. Recovery opens and scans the hint
+  // of one data file at a time, in name order, so the read after
+  // those that open the first hint with anything to scan is a read
+  // of its scan.
+  {
+    const int fail_on = first_hint_scan_read(dir);
+    bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
+    fi.inj.fail_on_nth_match = fail_on;
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 1}),
+                      std::system_error);
+    REQUIRE(fi.inj.name_matches >= fail_on);
+  }
+
+  // The fault clears. A hint is an index, not the record: the
+  // failure cost recovery time and must have cost no keys.
+  {
+    auto db = bytecask::DB::open(dir, {.recovery_threads = 1});
     CHECK_FALSE(db.is_degraded());
     {
       bytecask::Bytes out;

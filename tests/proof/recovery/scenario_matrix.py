@@ -21,6 +21,14 @@
 # worked around: a fault armed here would have to outlive the stack frame that
 # set it, and the failure it models (a missing hint) is already the state the
 # hintless_* shapes below start from.
+#
+# The read side is one fault point, io_hint_read, over two phases of a hint
+# file's life, and the phase decides what the open does: a read that fails
+# while a hint is verified is answered by a rebuild from its data file, so the
+# open succeeds; one that fails while a hint that verified is scanned comes
+# after entries were applied, so the open throws. The two phases are two
+# failure classes, and they run at one thread only: the injector is
+# thread-local and at one thread recovery reads on the thread that opens.
 
 from __future__ import annotations
 
@@ -34,6 +42,10 @@ class RecoveryFailureClass(Enum):
     RC1 = "hint_write_fails"    # io_hint_write
     RC2 = "hint_sync_fails"     # io_hint_sync
     RC3 = "hint_rename_fails"   # io_hint_rename
+    # io_hint_read, one per phase a hint read lands in: the expected open is
+    # an outcome of the phase, not of the fault point.
+    RC4 = "hint_read_fails_while_verified"  # the pass that opens a hint
+    RC5 = "hint_read_fails_during_scan"     # the scan of a hint that verified
 
 
 class Damage(Enum):
@@ -79,6 +91,12 @@ RECOVERY_STATE_SHAPES = [
 
 RECOVERY_FAILURE_CLASSES = list(RecoveryFailureClass)
 
+# The classes that fail a read of a hint file. They run at one thread only.
+READ_FAILURE_CLASSES = {
+    RecoveryFailureClass.RC4,
+    RecoveryFailureClass.RC5,
+}
+
 # Serial and parallel recovery diverging is the specific risk the [model]
 # tests were built around, so every shape is recovered both ways.
 RECOVERY_THREAD_COUNTS = [1, 4]
@@ -88,8 +106,12 @@ def is_valid_combination(
     state: RecoveryStateShape, failure: RecoveryFailureClass, threads: int
 ) -> bool:
     # A hint that is present and valid is never regenerated, so there is no
-    # hint write to fault. Every shape here damages something, so all
-    # combinations are reachable.
+    # hint write to fault. Every shape here damages something, so all the
+    # write-failure combinations are reachable. The read failures are the
+    # exception: recovery reads hint files on its workers, and the injector
+    # is thread-local, so at threads > 1 the fault armed here never fires.
+    if failure in READ_FAILURE_CLASSES and threads != 1:
+        return False
     return True
 
 
