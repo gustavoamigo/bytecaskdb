@@ -14,6 +14,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import decimal
+import math
 import re
 import struct
 
@@ -134,11 +135,23 @@ def strict(rows) -> tuple:
     return tuple(tuple(one(v) for v in row) for row in rows)
 
 
+# A NaN in a sort key: PostgreSQL orders every NaN equal to every other.
+_NAN = ("NaN",)
+
+
+def ordering(k: tuple) -> tuple:
+    """A sort key as PostgreSQL compares it: a NaN equal to any other NaN,
+    -0.0 equal to 0.0 as in Python."""
+    return tuple(_NAN if isinstance(v, float) and math.isnan(v) else v for v in k)
+
+
 def same_rows(layer: tuple, full: tuple, key, limit: int | None) -> str | None:
     """Whether the layer's rows are a correct answer, given PostgreSQL's
     rows without the LIMIT: in order of `key` (None: no ORDER BY), each run
-    of equal keys the same multiset, and the run LIMIT cuts drawn from
-    PostgreSQL's. A reason when they are not."""
+    of equal keys, as PostgreSQL orders them, the same multiset, and the run
+    LIMIT cuts drawn from PostgreSQL's. A reason when they are not."""
+    if key is not None:
+        key = (lambda k: lambda r: ordering(k(r)))(key)
     want = len(full) if limit is None else min(limit, len(full))
     if len(layer) != want:
         return f"{len(layer)} rows, expected {want}"

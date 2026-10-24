@@ -61,6 +61,8 @@ struct Expr {
   std::vector<Expr> args;       // Add, Sub, Compare: two; Aggregate: none (COUNT(*)) or its argument
 
   [[nodiscard]] auto phys() const -> PhysType { return phys_type(type); }
+
+  friend auto operator==(const Expr&, const Expr&) -> bool = default;
 };
 
 // An expression of `kind` and `type`, its operands to be set.
@@ -163,12 +165,13 @@ struct Aggregate {
   std::vector<Output> aggs;
 };
 
-// A key and its direction. Its NULLs go where PostgreSQL's default puts
-// them for the direction, last for ASC and first for DESC: the dialect has
-// no NULLS FIRST or NULLS LAST.
+// A key, its direction and where its NULLs go: as NULLS FIRST or NULLS
+// LAST says, or where PostgreSQL's default puts them for the direction,
+// last for ASC and first for DESC.
 struct SortKey {
   Expr expr;
   bool desc{false};
+  bool nulls_first{false};
 };
 
 struct Sort {

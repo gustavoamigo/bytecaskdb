@@ -8,21 +8,14 @@ void plan(bc_ctx *cx) {
   if (bc_param_null(cx, 0) || bc_param_null(cx, 1)) {
     return;
   }
-  int64_t count0 = 0;
-  {
-    bc_key k0 = bc_key_begin(cx, IDX_6);
-    bc_key_param(cx, k0, 1);
-    bc_key_param(cx, k0, 0);
-    bc_view lo = bc_key_end(cx, k0);
-    bc_view hi = bc_key_successor(cx, lo);
-    count0 = bc_count_range(cx, IDX_6, lo, hi, 50001);
-  }
+  bc_key k0 = bc_key_begin(cx, IDX_6);
+  bc_key_param(cx, k0, 1);
+  bc_key_param(cx, k0, 0);
+  bc_view lo0 = bc_key_end(cx, k0);
+  bc_view hi0 = bc_key_successor(cx, lo0);
+  int64_t count0 = bc_count_range(cx, IDX_6, lo0, hi0, 50001);
   if (count0 < 50001) {
-    bc_key k1 = bc_key_begin(cx, IDX_6);
-    bc_key_param(cx, k1, 1);
-    bc_key_param(cx, k1, 0);
-    bc_view lo = bc_key_end(cx, k1);
-    bc_cursor c = bc_scan_open(cx, IDX_6, lo, lo, BC_SCAN_PREFIX);
+    bc_cursor c = bc_scan_open(cx, IDX_6, lo0, lo0, BC_SCAN_PREFIX);
     while (bc_scan_next(cx, c)) {
       bc_view row = bc_scan_row(cx, c);
       bc_emit_begin(cx);

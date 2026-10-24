@@ -1,11 +1,11 @@
 # The planner: a logical algebra, a search, and compiled pipelines
 
-Status: **design, approved (owner, 2026-10-24); slices 1, 2 and 3 built**
-(*Slice 1 as built*, *Slice 2 as built*): the pipeline, then System R's
-search with the cost model and the choice points (*Choice points as
-built*), and slice 3, *Memory*: the statement budget and the lifetime rule
-(`plan_api_design.md`, revision 7), and #551 with it. Slices 4 and 5 are
-not built. The first of the post-MVP designs (#487, *Next*). The parser,
+Status: **design, approved (owner, 2026-10-24); slices 1 to 4 built**
+(*Slice 1 as built*, *Slice 2 as built*, *Slice 4 as built*): the
+pipeline, then System R's search with the cost model and the choice points
+(*Choice points as built*), slice 3, *Memory*: the statement budget and the
+lifetime rule (`plan_api_design.md`, revision 7), and #551 with it, and
+slice 4, full scans and sorts (#533). Slice 5 is not built. The first of the post-MVP designs (#487, *Next*). The parser,
 the plan API and TinyCC are unchanged; the binder's output changed.
 
 ## Why
@@ -160,7 +160,7 @@ will charge.
   probe.
 - **A sort or hash build:** the rows it holds, plus a weight per row for
   the CPU and the memory. The weight is a constant, measured once and
-  stated in this document.
+  stated in this document: 0.5 (*Slice 4 as built*).
 
 **Cardinalities** come from `bc_count_range`, which is exact and costs at
 most two record reads whatever the range holds.
@@ -321,10 +321,16 @@ existing guarantee (*Bounded in memory*), kept.
 - Spilling (an external sort, a partitioned hash join) is a separate design
   for when a workload needs it.
 
-**The planner uses the budget.** A sort or hash build whose known size is
-past the budget isn't chosen when another plan avoids it, such as an index
-that gives the order. A size that depends on `$n` falls under *Choosing at
-run time*.
+**The planner uses the budget.** Where another plan avoids a sort or a
+hash build, such as an index that gives the order, the structure's size is
+an unknown count, and the two plans are a choice point (*Choosing at run
+time*), within its caps. The count is of the range the structure's input
+reads, a full scan's being the table's, by `bc_count_range` when the plan
+runs, limited to the least count at which the structure would pass the
+budget: below it the structure, from it the other plan. The count bounds
+the rows held whatever the filters keep, since they can't be fewer than
+none nor more than the range holds. No count read at compile time decides
+it: a plan is kept while its tables grow.
 
 **Not covered.** Memory across statements and sessions, a global cap,
 belongs with the thread-model design. So does the result buffer. Results
@@ -760,7 +766,8 @@ keeps, its parameter drawn as a row's own value:
   their place, no golden plan moves.
 - A range's 1/3 is the number to revisit when a workload's choice turns on
   it.
-- The per-row weight of a sort or hash build waits for slice 4.
+- The per-row weight of a sort or hash build is slice 4's (*Slice 4 as
+  built*).
 
 ### Choice points as built
 
@@ -795,18 +802,25 @@ and gets none.
   each scan reaches 1,000 entries and fetches each row, 2,000. Past 1,000
   of `a`'s entries its scan costs more than `b`'s: threshold 1,001.
 - The plan's cost is its first plan's plus the count's 2.
+- `crossing()` finds the threshold by binary search, so it assumes the
+  difference of the two costs changes sign at most once between 1 and the
+  table's rows. Both costs grow with the count, one of them linearly, the
+  other at most so where a `LIMIT` or a sort's top-n flattens it, and that
+  holds for every pair the search forms. A debug build checks it at counts
+  spread over the range (1, 2, 3, 4, 6, 9, … and the table's rows), and a
+  pair that crosses twice is a `std::logic_error`, a compiler bug.
+  Superseded in #591's review: a sorted cost and `entries_beside`'s clamps
+  can cross twice, so such a pair gets no choice point, in every build
+  (*Slice 4 as built*).
 
 **The plan text.**
 
 ```c
-int64_t count0 = 0;
-{
-  bc_view lo = …;                     /* the first plan's range, a NULL split's whole prefix */
-  bc_view hi = …;
-  count0 = bc_count_range(cx, IDX_6, lo, hi, 50001);
-}
+bc_view lo0 = …;                      /* the first plan's range, a NULL split's whole prefix */
+bc_view hi0 = …;
+int64_t count0 = bc_count_range(cx, IDX_6, lo0, hi0, 50001);
 if (count0 < 50001) {
-  /* the first plan's scan and filters, then the consumer */
+  /* the first plan's scan, opened on lo0 and hi0, its filters, then the consumer */
 } else {
   /* the second plan's, then the consumer again */
 }
@@ -817,8 +831,12 @@ charged like any read. The consumer, from a join's lookup to the sink, is
 printed once per branch. Each plan's parameters are checked for NULL and
 its `$n ± k` computed before anything is read, as any plan's.
 
-**What `check()` adds.** A choice point counts its first plan's range, with
-a threshold of 0 or more; each plan is a scan of the counted table.
+**What `check()` adds.** A choice point counts exactly its first plan's
+range: its object, its prefix's parameters, its bounds and its direction,
+or for a NULL split its whole prefix. Its threshold is 0 or more, and each
+plan is a scan of the counted table. The counted range's key is built once:
+the first plan's scan opens on it (a NULL split builds its own two
+ranges).
 
 **Golden plans.** None of TPROC-C's gains one. Three statements have two
 ranges of one table: O1 and P5 count `customer`'s by `bc_count_range`,
@@ -887,7 +905,10 @@ PostgreSQL runs each of these; it is the one entry of `frontend_design.md`'s
   and a plan with choice points twice, its thresholds overridden
   (`physical::override_thresholds`): INT64_MAX takes every first plan, 0
   every second. `Database::alternatives_for_testing` (the test build) runs
-  each on its own snapshot. The proof machine runs
+  each on its own snapshot. Slice 4 forces each choice point on its own
+  (`override_thresholds` takes one threshold per choice point), so a plan
+  of k choice points is run once per combination of branches, 2^k times,
+  k at most 4. The proof machine runs
   them after every `SELECT`, aggregate and join it compares with
   PostgreSQL, in autocommit, and checks each plan's rows as it checks the
   layer's. An embedded-API test does the same in C++. The machine
@@ -918,6 +939,213 @@ PostgreSQL runs each of these; it is the one entry of `frontend_design.md`'s
   says whether some plan serves a statement, as the search now does.
 - **The harness**, 2 warehouses, 4 threads, 30 s: 237,014 TPM, 106,092
   NOPM, and the consistency conditions hold after the run and in `check`.
+
+## Slice 4 as built
+
+Full scans and sorts, and #533's refusals lifted. Every TPROC-C golden plan
+regenerated unchanged, so no TPROC-C statement's reads changed.
+
+**Full scans.** A full scan of the primary key is an access path when
+nothing bounds the table, costed at the table's rows; it is chosen when it
+is cheapest or nothing else is usable. A full scan of an index is one only
+when its order gives the `ORDER BY`, its NULLs placed as asked: the "index
+that gives the order" of *Memory*. Each is budgeted as every read, guards
+each row it returns under `FOR UPDATE`, and serves `UPDATE` and `DELETE`
+too. The plan text is `bc_scan_open(cx, TBL_n, bc_empty, bc_empty, …)`.
+No choice point by costs is at a full scan, whose count no parameter
+changes, and none takes a full scan as its second plan. The choice by the
+budget is at one, counting the table, and may take one.
+
+**Sorts.** A plan whose rows are not in the `ORDER BY`'s order is wrapped in
+a `Sort` over `bc_sorter_*`, and compared with the plans in the order.
+- The sort key is built with `bc_sort_key_col` per part, in its direction
+  and NULL placement. The dialect takes `NULLS FIRST` and `NULLS LAST` in
+  `ORDER BY` (not in `CREATE INDEX`); without them, PostgreSQL's defaults:
+  `ASC NULLS LAST`, `DESC NULLS FIRST`.
+- The order includes NULL placement. An index part's key order puts NULLs
+  first for an `ASC` part and last for a `DESC` one, the other way round in
+  a reverse scan. A part whose requested placement is that key order needs
+  nothing. The two-range form gives the other placement for the first
+  ordered part after the prefix, an `ASC` one. Every other placement is
+  sorted.
+- `ORDER BY … LIMIT n` opens the sorter with `keep = n`, and its loop keeps
+  the `LIMIT`'s counter. `LIMIT 0` needs no order and sorts nothing.
+- A sorter holds one view per row, so a sorted plan reads one table in a
+  loop, the `Sort`'s payload: the sorter holds that row, as `bc_pin` would,
+  and never a covering scan's entry, so the loop's scan reads rows. Rows of
+  tables read once before the loop stay in hand. A table looked up by key
+  after it is looked up again above the `Sort`, from the row held: the same
+  key on the same snapshot, so the same row, its filters held already. A
+  plan of two loops, one inside the other, cannot be sorted, and is refused
+  when a sort is all that would give its order.
+- Codegen prints the pipeline breaker as *The physical plan and codegen*
+  shows: the input's loop builds each row's sort key and calls
+  `bc_sorter_add`; the sort's produce is `while (bc_sorter_next(cx, s0,
+  &p0))`, the consumer inside.
+
+```c
+bc_sorter s0 = bc_sorter_open(cx, 10);
+/* the input's loop */
+  bc_sort_key sk = bc_sort_key_begin(cx);
+  bc_sort_key_col(cx, sk, row, COL_1_2, BC_SORT_ASC, BC_SORT_NULLS_FIRST);
+  bc_sorter_add(cx, s0, bc_sort_key_end(cx, sk), row);
+bc_view p0 = bc_empty(cx);
+while (n < 10 && bc_sorter_next(cx, s0, &p0)) {
+  /* lookups by key again, from p0; emit */
+}
+```
+
+**Joins.** A table no key reaches from the other's rows is read by its own
+scan, the join's conjuncts filtering its rows: once under at most one outer
+row, as before, and now also once per outer row, a nested loop of two
+scans whose inner cursor is `c<d>`. That plan costs the outer plan's plus
+the outer rows times the inner scan's, and it is refused where a hash join
+(slice 5) would cost less: the inner scan once, plus the smaller side's
+rows at the sort's weight, plus the larger side's probes. So it is planned
+only over an outer side of a row or two. A refusal names the table and the
+hash join. No choice point counts a table read once per outer row.
+
+**The weight, measured** (*Decisions*, 9). On the harness's two-warehouse
+load, `order_line` by `(ol_w_id, ol_d_id)`, 20 ranges of about 30,000 rows,
+600,251 in all, each statement run seven times, median per run:
+- one unit, a cursor step and its row read, as `SELECT sum(ol_quantity)`
+  spends it: 700 to 750 ns;
+- a row through a sort, `ORDER BY ol_amount, ol_o_id` against the same
+  `SELECT` unsorted, both emitting every row: 920 to 1,100 ns;
+- `ORDER BY ol_dist_info DESC`, a `VARCHAR(24)` key: 1,070 to 1,150 ns.
+
+That is 1.23 to 1.58 units per row held, its `bc_sorter_next` step
+included: a weight of 0.23 to 0.58 beyond it, over three runs. The search
+takes 0.5 (`kSortWeight`). A sort costs its input's cost, unreduced by a
+`LIMIT`, plus each row it holds × (1 + 0.5), plus one per lookup by key
+repeated above it.
+
+**The planner uses the budget.** The search is given the statement's
+memory budget (`bc_budget::max_bytes`, `Database`'s statement memory), and
+builds *Memory*'s rule so:
+- A sorter of n entries holds at least `kSorterBytes` + n ×
+  `kSortEntryBytes` (192 and 128 bytes), so the least count past the
+  budget is (`max_bytes` − 192) / 128 + 1; 0 for a budget under 192.
+- A sorted plan of one table, where another plan of it gives the `ORDER
+  BY`, gets a choice point by the budget, within the cap of 4: the count of
+  the sorted range, a full scan's the whole table (`bc_count_range` over
+  `bc_empty` and `bc_empty`), limited to that least count. Below it, the
+  sort; from it, the cheapest plan that gives the order, which may be a
+  full scan of an index, and may cover. The first plan's branch holds the
+  `Sort`. Its filters only make the count an upper bound on the rows held.
+- None under a `LIMIT` the budget holds, and none where nothing else gives
+  the order: that sort runs, and past the budget fails with 54000.
+- No count read at compile time decides it. Slice 4 first left out a sort
+  of a whole table whose rows, counted at compile time, passed the budget,
+  and only counted a range at run time where its count depended on `$n`:
+  a plan compiled while its table was small then failed with 54000 on
+  every run once the table had grown, though an index scan in the order
+  would have run (#591's review).
+- `SELECT k FROM w WHERE y >= $1 ORDER BY x`, an index on x, compiled at
+  10 rows with a 100,000-byte budget: the full scan, filtered and sorted,
+  costs 10 + 3.3 × 1.5, less than the index's 2 × 10, and the plan counts
+  `w` against 780 when it runs.
+
+**Interesting orders.** The search keeps the cheapest plan per set of
+tables, per row count (at most one, or more) and per order (the `ORDER
+BY`'s, or none). A plan in the order keeps its choice points among plans in
+the order; a sorted one takes any range of its loop's table, under the
+sort, which reads rows.
+
+**Carried over from #582's review.**
+1. `physical::check` compares a choice point's whole counted range with
+   its first plan's: prefix parameters, bounds, direction, and a NULL
+   split's whole prefix.
+2. It refuses a `DOUBLE` read from a key wherever codegen reads one: a
+   result column, an index join's inner key, a filter's operands, an
+   aggregate's argument, `MIN` from the first entry.
+3. Codegen builds a choice point's counted range once; its first plan's
+   scan opens on it.
+4. The proof machine's `join_read_once_on_keys` links the scanned table's
+   primary-key columns, which an index holds as its key suffix, beside
+   `join_read_once`.
+5. `choose()` takes each table's access paths as an argument, from
+   `candidates()`'s result.
+6. `override_thresholds` takes a threshold per choice point; alternatives
+   agree runs every combination.
+7. `crossing()`'s assumption is stated above (*Choice points as built*),
+   with its debug check.
+
+**Carried over from #591's review.**
+1. `physical::check` checks each combination of a plan's choice-point
+   branches as the plan it runs: a covering scan in one branch no longer
+   refuses a sort in the other, as the choice by the budget forms (a sort
+   of `ix_a`'s range, or `ix_ab`'s covering scan in the order).
+2. The choice by the budget counts a full scan's table, filtered or not,
+   and no count read at compile time decides a sort (*The planner uses the
+   budget*, above).
+3. `crossing()` checks, in every build, that the first plan costs more from
+   one count on, at the counts it samples; where two costs cross more than
+   once it returns none, and the search keeps its compile-time choice.
+4. The proof machine generates NaN, `Infinity` and `-Infinity` for DOUBLE
+   and REAL, and `oracle.same_rows` compares sort keys as PostgreSQL orders
+   them, every NaN equal to every other.
+5. Where the statement sorts a plan not in its order, the search keeps and
+   prunes each candidate at the cost of the plan it becomes: its loop's
+   access uncovered, at 2 reads per entry of an index.
+6. A plan that reaches every table and passes every filter but needs a
+   hash join is refused at a stage past the filters, so the refusal names
+   the hash join, not another plan's DOUBLE filter. Nothing produced the
+   order stage, which is gone.
+7. Codegen passes a choice point's counted range to the scan of its first
+   plan by that scan, not to whichever scan opens next.
+8. `logical::Expr` and `physical::KeyBound` have a defaulted `operator==`,
+   which `check` uses.
+
+### What the search refuses
+
+| # | Refused | Message |
+|---|---|---|
+| 1 | Every plan leaves a filter on a DOUBLE or REAL column | `no plan: a filter on column "<column>", a REAL or DOUBLE PRECISION, is not supported yet` |
+| 2 | A join that no key reaches either way, where every plan reading a table once per row of the other costs more than a hash join | `no plan: no key of <table> is reached from the other table's rows, and reading it once per row costs more than a hash join, which is not planned yet` |
+| 3 | An `ORDER BY` only a sort gives, over plans of two loops | `no plan: ORDER BY <columns> over a nested loop of two scans: a sort holds one table's rows` |
+
+Where plans fail for different reasons, the refusal is the first one of
+the furthest stage a plan of every table reached: its tables, its filters
+(row 1), then the hash join it lacks (row 2), which only a plan past every
+filter can. Row 3 is the refusal when every complete plan needs it. A table, an `ORDER BY` no index gives,
+an `ORDER BY` on a join and a NULL placement no index gives are no longer
+refused. The shapes the search does not plan are refused as before (*What
+the search refuses*, slice 2).
+
+### Tests
+
+- **Golden plans.** `choice_pk_or_index`, `choice_read_once` and
+  `choice_update` moved: the counted range is built once and the first
+  branch opens on it. The count's two reads and the scan's are the same; two
+  key builds fewer. New: `full_scan`, `full_scan_count`,
+  `full_scan_for_update`, `update_full_scan`, `delete_full_scan`,
+  `order_full_index` (a full index scan in the order, its NULLs by two
+  ranges), `order_read_once`, `sort_parts`, `sort_top_n`,
+  `sort_full_scan`, `sort_double`, `sort_join` (the lookup repeated above
+  the sort) and `sort_read_once`.
+- **Search** (`search_test`): a sorted plan beside the one in the order, by
+  cost and under `LIMIT`; full scans; a table read once per outer row
+  against a hash join, and its refusal, past another plan's DOUBLE filter;
+  the budget by a choice point, a range's and a full scan's compiled while
+  the table was small, its counted range opening only its first plan's
+  scan; a choice between a sort and a covering scan in the order, which
+  `check` passes; an unordered plan of a join kept at its cost uncovered;
+  `crossing()` where two costs cross more than once.
+- **The budget at run time** (`api_transaction_test`): a sort compiled at
+  10 rows under a 64 KiB budget, run at 1,000, takes the index in its
+  order by the count, with no recompile.
+- **`physical::check`** (`physical_test`): sorts, full scans, the counted
+  range and `DOUBLE` reads from a key; a sort in one branch of a choice
+  point beside a covering scan in the other.
+- **The allocation-fault sweep** fails each allocation of four compiled
+  sorted plans in turn (`embedded API: an allocation failure in a sorted
+  plan is BC_E_MEMORY or its rows`).
+- **The proof machine** generates full scans, `UPDATE` and `DELETE` over
+  them, `ORDER BY` on any columns, several parts, mixed directions, `NULLS
+  FIRST`/`LAST` and `LIMIT`, and `ORDER BY` on joins. Its `served` model is
+  down to the `DOUBLE` filter, and `join_served` says "either" where the
+  cost model decides between a nested loop and a refusal.
 
 ## Proposed `CONTRACT.md` changes
 

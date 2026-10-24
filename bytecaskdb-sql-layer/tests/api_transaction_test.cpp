@@ -11,6 +11,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -18,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -275,6 +277,41 @@ constexpr std::int64_t kBulkScale = 1;
 #else
 constexpr std::int64_t kBulkScale = 10;
 #endif
+
+TEST_CASE("embedded API: a sort compiled while its table was small gives way, as the table grows, to the index in its "
+          "order",
+          "[sql][api][memory]") {
+  sql_test::TempDir dir{"api_mem_grow"};
+  // A sorter of n rows holds at least 192 + 128 n bytes: past 511 rows, 64 KiB.
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  db->execute("CREATE TABLE g (id BIGINT PRIMARY KEY, x BIGINT NOT NULL, y BIGINT NOT NULL)");
+  db->execute("CREATE INDEX g_x ON g (x)");
+  auto insert = [&](std::int64_t from, std::int64_t to) {
+    for (auto i = from; i <= to; ++i) db->execute("INSERT INTO g VALUES ($1, $2, $3)", {i, (i * 7919) % 1000, i % 2});
+  };
+  insert(1, 10);
+  // Compiled at 10 rows: the full scan, filtered and sorted, costs less than
+  // g_x's scan, which fetches each row. The table's count picks between them
+  // each time the plan runs.
+  const auto& st = db->prepare("SELECT id FROM g WHERE y >= $1 ORDER BY x, id");
+  auto compiled = db->compilations();
+  auto in_order = [&] {
+    auto rows = db->execute(st, {std::int64_t{0}}).rows;
+    std::vector<std::pair<std::int64_t, std::int64_t>> got;
+    for (const auto& r : rows) {
+      auto id = std::get<std::int64_t>(r[0]);
+      got.emplace_back((id * 7919) % 1000, id);
+    }
+    return got.size() == rows.size() && std::ranges::is_sorted(got) ? got.size() : std::size_t{0};
+  };
+  CHECK(in_order() == 10);
+  REQUIRE(st.plan_source().find("int64_t count0 = bc_count_range(cx, TBL_") != std::string::npos);
+  // 1,000 rows: sorted, they would pass the budget (54000); the count takes
+  // g_x's scan, which holds a row at a time. Nothing recompiled.
+  insert(11, 1000);
+  CHECK(in_order() == 1000);
+  CHECK(db->compilations() == compiled);
+}
 
 TEST_CASE("embedded API: a bulk UPDATE of 200K rows passes the default memory budget, is 54000 and commits nothing",
           "[sql][api][memory]") {
@@ -681,6 +718,63 @@ TEST_CASE("embedded API: an allocation failure in an autocommit statement never 
   }
   db->conflict_on_every_commit_for_testing(false);
   CHECK(balance(*db, 1) == 100);
+}
+
+TEST_CASE("embedded API: an allocation failure in a sorted plan is BC_E_MEMORY or its rows", "[sql][api][alloc]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
+  sql_test::TempDir dir{"api_sort_faults"};
+  auto db = open_db(dir);
+  db->execute("CREATE TABLE owner (id BIGINT PRIMARY KEY, acct BIGINT, name BYTEA)");
+  for (std::int64_t k = 1; k <= 12; ++k) {
+    db->execute("INSERT INTO acct VALUES ($1, $2)", {k, (k * 7) % 5});
+    db->execute("INSERT INTO owner VALUES ($1, $2, $3)",
+                {k, k % 4 == 0 ? Value{} : Value{(k * 5) % 13}, Value{std::vector<std::byte>(static_cast<std::size_t>(k % 3), std::byte{'x'})}});
+  }
+  // Each a plan the compiler sorts (a full scan or a range, under a LIMIT
+  // or not, on a join, FOR UPDATE), every allocation of an execute failed in
+  // turn: BC_E_MEMORY, or the rows of a run no failure reached; bad_alloc
+  // only before the plan runs.
+  const std::vector<std::string> sorted{
+      "SELECT id, bal FROM acct WHERE bal >= $1 ORDER BY bal DESC, id",
+      "SELECT id FROM owner WHERE id > $1 ORDER BY acct NULLS FIRST, name DESC LIMIT 3",
+      "SELECT owner.id, bal FROM owner, acct WHERE owner.id > $1 AND acct.id = owner.acct ORDER BY bal, owner.id",
+      "SELECT id, bal FROM acct WHERE id > $1 ORDER BY bal LIMIT 4 FOR UPDATE",
+  };
+  for (const auto& sql : sorted) {
+    INFO(sql);
+    const auto& st = db->prepare(sql);
+    const std::vector<Value> params{std::int64_t{1}};
+    auto want = db->execute(st, params).rows;
+    REQUIRE(st.plan_source().find("bc_sorter_open") != std::string::npos);
+    auto failed = 0;
+    for (long nth = 1;; ++nth) {
+      REQUIRE(nth < 100000);
+      std::string outcome;
+      std::optional<decltype(want)> got;
+      auto fired = false;
+      {
+        bytecask::testing::ScopedAllocFaults faults{nth, false};
+        try {
+          got = db->execute(st, params).rows;
+          outcome = "ran";
+        } catch (const ExecError& e) {
+          outcome = e.code() == BC_E_MEMORY ? "memory" : "error";
+        } catch (const std::bad_alloc&) {
+          outcome = "bad_alloc";
+        }
+        fired = faults.report().fired;
+      }
+      INFO("allocation " << nth << ": " << outcome);
+      CHECK((outcome == "ran" || outcome == "memory" || outcome == "bad_alloc"));
+      if (got) CHECK(*got == want);
+      if (!fired) {
+        CHECK(outcome == "ran");
+        break;
+      }
+      ++failed;
+    }
+    CHECK(failed > 0);
+  }
 }
 
 TEST_CASE("embedded API: a DDL whose commit may have reached the engine is 08007", "[sql][api][alloc]") {

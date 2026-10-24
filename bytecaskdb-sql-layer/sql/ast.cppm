@@ -142,6 +142,9 @@ struct OrderItem {
   bool desc{false};
   std::int32_t pos{-1};
   std::string table;  // the table it is qualified by, "" for none
+  // NULLS FIRST (true) or NULLS LAST (false); nullopt for PostgreSQL's
+  // default, last under ASC and first under DESC.
+  std::optional<bool> nulls_first;
 };
 
 struct Select {

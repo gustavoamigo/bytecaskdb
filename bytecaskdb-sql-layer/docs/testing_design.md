@@ -45,7 +45,9 @@ every rule, the invariants are checked.
 - **Counts agree.** An INSERT, UPDATE or DELETE changes as many rows on both.
 - **Rows agree.** A lookup returns the same rows. After every step, each
   table holds the same rows on both. The layer's rows are read from the
-  engine by `table_rows`, since SQL has no full scan. PostgreSQL's come from
+  engine by `table_rows`, not by a plan, so the check does not depend on
+  the planner it checks (a full scan in SQL is one of its plans).
+  PostgreSQL's come from
   `SELECT … ORDER BY` the primary key. `table_rows` is test only: it is
   compiled into `sql_layer_testing`, the build of the library with
   `BYTECASK_SQL_TESTING` that the tests and `bytecask_sql` link, and is not
@@ -53,7 +55,10 @@ every rule, the invariants are checked.
 - **Values compare as values.** `bytecask_sql` converts each value by its
   column's SQL type, and the oracle (`tests/proof/oracle.py`) converts
   PostgreSQL's the same way. Values compare by type too: `True` is not `1`,
-  `1` is not `1.0`, and `-0.0` is not `0.0`. Text columns are `COLLATE "C"`
+  `1` is not `1.0`, and `-0.0` is not `0.0`. A DOUBLE or REAL takes NaN,
+  `Infinity` and `-Infinity` too. An `ORDER BY`'s keys compare as
+  PostgreSQL orders them: every NaN equal to every other, and `-0.0` equal
+  to `0.0`, so their ties form one run (`oracle.same_rows`). Text columns are `COLLATE "C"`
   in PostgreSQL, so its order is byte order, the order of the layer's keys.
   A REAL comes from PostgreSQL as the shortest text naming its float; the
   oracle packs it back to that float, which is what the layer stores. A
@@ -107,9 +112,14 @@ The rules, by what they test.
   values outside the type included, the conjuncts shuffled; maybe an
   `ORDER BY` of the parts after the prefix, in the key's direction or
   against it, an equality-compared column now and then, one item flipped
-  now and then; maybe a `LIMIT`. A model of the planner (`served`) says
-  whether some plan serves it: if not, the layer must refuse it with
-  `no plan:` and SQLSTATE 0A000, and PostgreSQL is not asked. If it does,
+  now and then, one item's `NULLS FIRST` or `LAST` now and then; or of one
+  to three of any columns, each `ASC` or `DESC`, `NULLS FIRST`, `LAST` or
+  neither, which a sort mostly gives; maybe a `LIMIT`. Now and then no key
+  conjunct at all, only filters or none: a full scan. A model of the
+  planner (`served`) says whether some plan serves it: if not, the layer
+  must refuse it with `no plan:` and SQLSTATE 0A000, and PostgreSQL is not
+  asked. Since planner slice 4 it refuses only a filter on a DOUBLE or REAL
+  column no key takes. If it does,
   the rows are compared in `ORDER BY` order, as a multiset within each run
   of equal sort keys, and a run the `LIMIT` cuts must be drawn from
   PostgreSQL's (`oracle.same_rows`, against PostgreSQL's rows without the
@@ -156,8 +166,15 @@ The rules, by what they test.
 - **A join on a column**: two tables, each of the second's key parts equal
   to a column of the first of its type or to a parameter, the first's
   conjuncts from a key path, maybe a filter on the second; targets with a
-  `LIMIT`, or `COUNT(DISTINCT)` of either table's column. `join_served`
-  says whether either table can be the outer one.
+  `LIMIT`, or `COUNT(DISTINCT)` of either table's column, and now and then
+  an `ORDER BY` of either table's columns. `join_served` says whether
+  either table can be the outer one; where only a nested loop reading a
+  table once per row of the other would serve it, the cost model decides,
+  and the layer must run it or refuse it for the hash join (slice 5).
+- **A table read once**: one named by its key in parameters, the other
+  scanned by parameters, linked by equalities of columns neither key takes
+  (`join_read_once`) or of the scanned table's primary-key columns, which
+  its index holds as its key's suffix (`join_read_once_on_keys`).
 
 `test_tprocc.py` runs TPROC-C's five transactions through SQL against
 PostgreSQL: a small fixture (one warehouse, two
