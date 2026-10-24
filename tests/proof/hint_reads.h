@@ -14,8 +14,10 @@
 #include "fault_injector.h"
 #include <algorithm>
 #include <filesystem>
+#include <format>
 #include <limits>
 #include <optional>
+#include <string>
 #include <sys/stat.h>
 #include <vector>
 
@@ -81,14 +83,22 @@ inline auto first_hint_of(const std::filesystem::path &dir)
   return hint;
 }
 
-// The inode of a hint file, or nullopt when there is none: a rebuild removes
-// the hint and writes a new one, so the number says whether the file was
-// replaced rather than kept.
-inline auto hint_identity(const std::filesystem::path &hint)
-    -> std::optional<std::uint64_t> {
+// What says a hint file now is the file it was before an open: the inode it
+// took, its size, and the time it was written — as text, so a CHECK that
+// fails shows both sides. The inode alone is not identity.
+// open_hint_or_rebuild removes a hint and flush_hints_for writes another one,
+// and a create near a remove can take the inode the remove just freed (ext4
+// does), leaving the same number to a different file. A rebuild then changes
+// nothing a stat of the inode sees; the write time is what says the file was
+// made again.
+inline auto hint_identity(const std::filesystem::path &hint) -> std::string {
   struct stat st{};
-  if (::stat(hint.c_str(), &st) != 0) return std::nullopt;
-  return static_cast<std::uint64_t>(st.st_ino);
+  if (::stat(hint.c_str(), &st) != 0) return "<absent>";
+  return std::format("{}-{}.{:09}-{}",
+                     static_cast<std::uint64_t>(st.st_ino),
+                     static_cast<std::int64_t>(st.st_mtim.tv_sec),
+                     static_cast<long>(st.st_mtim.tv_nsec),
+                     static_cast<std::uint64_t>(st.st_size));
 }
 
 // A sibling directory of a database, for a probe run of it. Removed when it
