@@ -2,13 +2,12 @@
 
 Status: **built**, revision 8 (revision 7 with the sorters, the hash
 tables and the aggregates' slots built, `bc_sorter_open`'s `keep`, and
-`bc_agg_null`;
-revision 7 added the lifetime rule of a loop's storage, `planner_design.md`,
-*Memory*, 64-bit handle generations, and the write set bounded as it
-grows). This specifies the plan API of `bytecaskdb-sql-layer`: the calls a
-generated plan makes, the guarantees they give, and the language plans are
-written in. `algebra/` implements all of it. Nothing in the engine changes
-for it.
+`bc_agg_null`, and the write set charged to the statement budget as it
+grows; revision 7 added the lifetime rule of a loop's storage,
+`planner_design.md`, *Memory*, and 64-bit handle generations). This
+specifies the plan API of `bytecaskdb-sql-layer`: the calls a generated
+plan makes, the guarantees they give, and the language plans are written
+in. `algebra/` implements all of it. Nothing in the engine changes for it.
 
 **Plans are only ever ours** (owner decision, 2026-10-20). The layer runs
 only plans its own compiler generates, and nothing is designed for plan
@@ -137,8 +136,10 @@ tables, each wrapped in its own struct type so the C compiler rejects a
 cursor passed as a sorter, with a generation tag so the API rejects a handle
 whose owner has moved on. A stale or foreign handle sets `BC_E_HANDLE`. The
 generation is 64 bits, drawn once per handle from a counter the context
-never resets, so it never repeats: a stale handle never matches a slot a
-later handle reuses. Plans are regenerated from SQL, never stored, so the
+never resets, so it never repeats within a context: a stale handle never
+matches a slot a later handle reuses. Another context's handle is not
+checked for: plans are the compiler's, and use only their own context's
+handles. Plans are regenerated from SQL, never stored, so the
 handles' layout can change with the API.
 
 **Views are handles with a lifetime the API tracks.** A view names bytes
@@ -253,33 +254,76 @@ when its step ends or the context is reset:
   bytes, and one that refuses an entry nothing;
 - each hash table payload, and `kHashEntryBytes` for its node, and each key
   once, when it is new to the table;
-- each result row, with its 4-byte length.
+- each result row, with its 4-byte length;
+- the write set, below.
 
-It counts bytes requested and the fixed amounts, not the allocator's
-overhead, so the accounting is deterministic: a plan holds the same bytes
-on every run over the same data. Two things are not charged:
-- **The write set.** A row passed to `bc_insert`, `bc_update` or
-  `bc_delete` is copied into it; its built copy is released with its step
-  like any other. The write set has a bound of its own instead, below.
-- **A row still being built**, until `bc_row_end` finishes it.
+It counts fixed amounts, not what the allocator reports, so the accounting
+is deterministic: a plan holds the same bytes on every run over the same
+data. The items above are charged the bytes requested and their fixed
+amounts. The write set's items are charged a conservative bound instead:
+each buffer at its capacity plus `kAllocBytes`, each slot at twice its
+size, as listed below. One thing is not charged: **a row still
+being built**, until `bc_row_end` finishes it.
 
-**The write set is bounded as it grows.** It is what the statement keeps
-until commit: its effects (puts, deletes, range deletes and guards), its
-insert claims and locked rows, and the row keys, unique prefixes and
-ranges it wrote. The call that adds to it counts what it adds, as a
-transaction counts what it holds: each buffer's size plus the allocator's
-overhead, and each entry's node or its slot at twice its vector's size, a
-conservative bound on the memory. The bound is:
-- in autocommit, the engine's 1 GiB batch limit;
-- in a transaction, its `max_bytes`, less what its earlier statements
-  hold. `bc_txn_add` checks the whole again before it takes the statement
-  in.
+**The write set is statement memory.** It is what the statement keeps until
+commit: its effects (puts, deletes, range deletes and guards, FOR UPDATE's
+included, and a unique index's range guards), its insert claims and its
+locked rows, with the tables it writes. Beside it the statement keeps the
+row keys, unique prefixes and ranges it wrote, to refuse a second write.
+All of it is charged to the statement budget as the call adds it, before
+the item is pushed, and a count the budget refuses leaves nothing charged
+and nothing added. A copy of a view is counted by the view's size, its
+capacity, before it is made. A key the runtime encoded is moved in and
+counted by its capacity; the encoders reserve its exact size, so nothing
+trims it. One helper, `push_write`, does the count and the push for
+effects, claims and locks. A throw fails the statement, and a failed
+statement's charges go at reset: none is released on the way out of a
+throw. The reset also frees the write set's vectors' storage, so a pooled
+context keeps none of a large statement's slots.
 
-The call that passes it fails with `BC_E_LIMIT` (SQLSTATE 54000), as the
-statement budget does, so a 20M-row `UPDATE` stops at the row that passes
-1 GiB rather than build several first. A bulk `UPDATE` of 100 MB in
-autocommit runs under the 64 MiB statement budget, since only the step's
-rows are charged to it.
+The count is a conservative bound on the memory held, by fixed amounts
+(`algebra/runtime.cppm`, which `plan_api.cpp` checks against what they
+stand for), so it is the same on every build:
+- each buffer, its capacity plus `kAllocBytes` for the allocator's header
+  (`held_bytes`, the one size of a buffer, the overlay's included);
+- each effect, claim and lock, its slot in its vector at twice its size
+  (`kEffectSlotBytes`, `kClaimSlotBytes`, `kLockSlotBytes`), since a vector
+  grows to at most that, and a table's first write `kTableSlotBytes`;
+- in autocommit, each effect's entry in the commit's `WritePlan`, which
+  copies its buffers: the copies, and its slot or node
+  (`kPlanWriteSlotBytes`, `kPlanKeyGuardNodeBytes`,
+  `kPlanRangeGuardSlotBytes`), and a table's first write the commit's guard
+  on its record. The commit builds the plan while the effects are alive, so
+  both are counted, and a plan that would pass the budget fails at the
+  call that passes it, with nothing committed;
+- in a transaction, each write's node in the overlay (`kOverlayNodeBytes`),
+  and no plan entry: the transaction's commit counts its plan;
+- each row, prefix or range written, its node (`kWrittenRowNodeBytes`,
+  `kUniqueNodeBytes`, `kRangeNodeBytes`).
+
+`effect_bytes`, `table_bytes`, `claim_bytes` and `lock_bytes` are the one
+size of an item, for both bounds. In a transaction, `bc_txn_add` moves the
+statement's write set to the transaction: it releases it from the statement
+budget and adds it to what the transaction holds against
+`TransactionOptions::max_bytes`, counted by the same functions
+(`docs/transaction_design.md`, *Limits*). Each call of a transaction's
+statement checks the transaction's room for the write set it would reach,
+so `bc_txn_add` needs no check of its own. `bc_txn_commit` counts its
+`WritePlan`, built from the overlay while the overlay still holds the
+writes, against `max_bytes` beside what the transaction holds before it
+builds it: past it, `BC_E_LIMIT` and nothing committed.
+
+There is no other bound on the write set. The engine refuses a write plan
+over its 1 GiB batch limit at commit, with `std::invalid_argument`, which
+is `BC_E_LIMIT` (SQLSTATE 54000) with nothing written; under the default
+64 MiB budget a statement's write set never reaches it.
+
+So a bulk write is bounded by the statement budget, as any other memory
+is: an autocommit `UPDATE` holds about 720 bytes a row of 100 bytes until commit, and
+one of 200K rows passes 64 MiB and fails with `BC_E_LIMIT` at the row that
+passes it, with nothing committed. With the budget raised to 1 GiB, one of
+1M rows runs. An autocommit `SELECT … FOR UPDATE` is bounded the same way,
+by its guards.
 
 A charge past the budget is `BC_E_LIMIT` (SQLSTATE 54000), a limit
 the layer sets: checked before the bytes are allocated wherever their size
@@ -353,7 +397,8 @@ detection.
 typedef struct bc_ctx bc_ctx;                       /* opaque; one per executing plan */
 
 /* Handles: an index and a generation, each in its own struct type. The
-   generation is 64 bits: one is drawn per handle, and it never repeats. */
+   generation is 64 bits: one is drawn per handle, and it never repeats
+   within a context. */
 typedef struct { uint32_t i; uint64_t g; } bc_view;   /* bytes the API owns */
 typedef struct { uint32_t i; uint64_t g; } bc_cursor;
 typedef struct { uint32_t i; uint64_t g; } bc_sorter;
@@ -863,8 +908,9 @@ void bc_raise(bc_ctx *, uint32_t constraint, uint32_t object_id);   /* a user er
 
 A plan under snapshot isolation emits no guards. The two plans for the same
 SQL differ only in guard calls, which is how isolation reads in the text.
-The write plan is bounded by the engine's 1 GiB plan limit, counted as it
-grows (*Memory is the statement's*); exceeding it is `BC_E_LIMIT`.
+The write plan is charged to the statement budget as it grows (*The write
+set is statement memory*), and the engine refuses one over its 1 GiB plan
+limit at commit; either is `BC_E_LIMIT`.
 
 ## The language
 

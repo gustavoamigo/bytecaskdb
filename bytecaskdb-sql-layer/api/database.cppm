@@ -257,8 +257,10 @@ private:
 
 struct TransactionOptions {
   // The most a transaction may hold: its writes' keys and values, the
-  // structures they are kept in, and its guards. A statement that would take
-  // it past is BC_E_LIMIT (SQLSTATE 54000), and aborts the transaction.
+  // structures they are kept in, its guards, claims and locks. Each
+  // statement's write set moves here from its statement budget when the
+  // statement ends. A statement that would take it past is BC_E_LIMIT
+  // (SQLSTATE 54000), and aborts the transaction.
   std::uint64_t max_bytes{64u << 20};
 };
 
@@ -379,8 +381,9 @@ struct DatabaseOptions {
   IoBackend io_backend{IoBackend::Pread};
   BufferPoolOptions buffer_pool{};
   // The most memory one statement may hold: the keys and rows it builds or
-  // reads, its pinned values, its groups and its result rows, counted as
-  // bytes requested. Past it the statement fails with BC_E_LIMIT (SQLSTATE
+  // reads, its pinned values, its groups, its result rows and its write set
+  // (what it keeps until commit or, in a transaction, until the statement
+  // ends). Past it the statement fails with BC_E_LIMIT (SQLSTATE
   // 54000), never a spill; open refuses 0.
   std::uint64_t statement_memory_bytes{64u << 20};
 };
