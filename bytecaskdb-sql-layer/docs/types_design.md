@@ -173,6 +173,7 @@ the compiler emits the helpers, which set `BC_E_ARITH` and return zero on:
 | Helper | Raises on |
 |---|---|
 | `bc_add`, `bc_sub`, `bc_mul` | the mathematical result outside `i64` |
+| `bc_add_bigint`, `bc_sub_bigint` | the same, for a BIGINT column's `SET col = col ± $n`: `BC_C_RANGE` "bigint out of range" (22003), as the row builder's check of a narrower type |
 | `bc_div` | a zero divisor; `INT64_MIN / −1`. Truncates toward zero, as C and PostgreSQL do. |
 | `bc_mod` | a zero divisor. The result takes the dividend's sign; `INT64_MIN % −1` is 0. |
 | `bc_neg` | `INT64_MIN` |

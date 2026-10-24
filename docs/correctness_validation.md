@@ -1951,7 +1951,12 @@ operation's inputs are left out, as they are of the I/O sweep. The
 operations are the I/O sweep's, shared through
 [`tests/sweep_operations.h`](../tests/sweep_operations.h). `malloc` is not
 counted: zstd allocates with it and reports a failure as an error code,
-which the hint paths already handle.
+which the hint paths already handle. Key directory nodes come from
+`NodePool`, which hands a freed node to the next allocation without
+`operator new`, so outside ASan and MSan, where the pool is off, which of
+a write's node allocations are counted depends on what earlier tests left
+in the pool. Emptying it before each run is #583: it exposes a durable
+write lost after `resume()` and a reopen.
 
 **Passes.** *one* fails only the n-th allocation, a transient spike;
 *every one from N on* fails it and every allocation after it until the
@@ -1990,6 +1995,7 @@ for lack of memory is not settled, and the sweep is how it will be.
 | `del` | 14 | 10 threw unchanged, 3 degraded, 1 completed (both) |
 | `del_range` | 25 | 21 threw unchanged, 3 degraded, 1 completed (both) |
 | `apply_batch` | 27 | 23 threw unchanged, 3 degraded, 1 completed (both) |
+| `apply_batch` of 80 puts that split the leaf its first put copied | 176 | 172 threw unchanged, 3 degraded, 1 completed (both) |
 | a put that fills the active file | 119 | 72 / 56 returned, 34 / 50 degraded, 12 threw unchanged |
 | `vacuum` | 159 | 157 / 158 threw unchanged, 1 / 0 returned |
 | `ingest` | 27 | 23 threw unchanged, 3 degraded (both) |
@@ -2035,6 +2041,24 @@ each allocation it failed.
   whole because it could not be split is split when its holder dies, into
   nodes still reached and nodes reached by nothing; `alloc sweep: a parcel
   held whole is split when its holder dies` builds that case.
+
+Later, the SQL layer's own sweep, whose transactions commit batches large
+enough to split nodes, found what the engine's missed:
+
+- *A split freed a node the root still reached.* A write freed an owned
+  node as soon as a split or rebuild replaced it, before the root or the
+  node's parent reached the replacement. An allocation failing in between —
+  `make_root` after a root leaf split, a parent's split after its rebuild —
+  left the transient's root on the freed node, and dropping the transient
+  walked it and freed it again: heap-use-after-free under ASan. The engine's
+  sweep seeds one leaf of eight keys that no operation fills, so no split
+  ever replaced a node the transient owned; and outside ASan its node
+  allocations came from the pool, uncounted. `apply_batch` of 80 puts, which
+  splits the leaf its first put copied, and `alloc sweep: a transient whose
+  write fails partway is freed once`, which splits leaves, inner nodes and
+  the inner root under each failed allocation, reach it; `alloc sweep: a
+  keyed transient whose write fails partway is freed once` runs the same
+  sweep on the keyed tree.
 
 The fixes are in `bytecask_design.md`, *A failure after the append that no
 handler degrades for*. Each has a deterministic test, driven by a test hook
@@ -2631,6 +2655,7 @@ A site whose break nothing has to catch says why instead.
 | Key directory: a dropped transient is freed without allocating | `alloc sweep: a transient tree is freed when nothing can be allocated` | `free_subtree_allocates` | #364 |
 | Key directory: `publish` reserves its record before it links the base | `alloc sweep: a failed publication leaves the base derivable` | `publish_links_before_reserving` | #364 |
 | Key directory: releasing a version never throws for want of memory | `alloc sweep: a version is released when nothing can be allocated` | `release_queue_allocates` | #390 |
+| Key directory: a write frees the nodes it replaced only after the root reaches their replacement | `alloc sweep: a transient whose write fails partway is freed once`, under ASan: elsewhere the node pool takes a double free without a report (#583) | `replaced_node_freed_at_once` | #585 |
 
 ### Rotation and new files
 

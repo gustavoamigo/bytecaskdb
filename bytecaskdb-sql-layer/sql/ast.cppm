@@ -14,24 +14,32 @@ module;
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
 export module bytecask.sql.ast;
 
+export import bytecask.sql.sqlstate;
+
 export namespace bytecask::sql::ast {
 
-// A failure to parse, or a form outside the prototype's scope.
+// A failure to parse, or a form outside the prototype's scope. Carries the
+// SQLSTATE PostgreSQL reports for the same fault; 42601 (syntax_error) is the
+// default, for a syntax error and for a form the layer does not support yet.
 class SqlError : public std::runtime_error {
 public:
-  SqlError(const std::string& what, std::int32_t pos) : std::runtime_error{what}, pos_{pos} {}
+  SqlError(const std::string& what, std::int32_t pos, SqlState sqlstate = kSyntaxError)
+      : std::runtime_error{what}, pos_{pos}, sqlstate_{sqlstate} {}
   SqlError(const SqlError&) = default;
   SqlError& operator=(const SqlError&) = default;
   ~SqlError() override;  // out of line: anchors the vtable (-Wweak-vtables)
   [[nodiscard]] auto pos() const noexcept -> std::int32_t { return pos_; }
+  [[nodiscard]] auto sqlstate() const noexcept -> std::string_view { return sqlstate_.view(); }
 
 private:
   std::int32_t pos_;
+  SqlState sqlstate_;
 };
 
 // A statement the layer does not support where it was given, the API's

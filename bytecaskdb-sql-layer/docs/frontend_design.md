@@ -127,9 +127,9 @@ A parameter's range is checked against the narrowest of its uses before
 the plan runs, and a refusal names that use's table.
 
 **Errors.** A parse or bind error is an `ast::SqlError` with a message and a
-position. `sqlstate()` reports it as 42601 for now; PostgreSQL's own codes
-for binder errors (42P01, 42703, 42804, 42P18) are #548. The planner's
-refusals are `FeatureNotSupported`, 0A000 (`planner_design.md`, *What the
+position, and the SQLSTATE PostgreSQL refuses the same statement with, or
+42601 for a form the layer does not support (`server_design.md`, *Errors*).
+The planner's refusals are `FeatureNotSupported`, 0A000 (`planner_design.md`, *What the
 search refuses*).
 
 ## Tests
@@ -199,8 +199,8 @@ fail on them.
   PostgreSQL computes the sum and fails only when it doesn't fit the
   column. The machine's literals stay inside 18 digits.
 - **A SUM whose running total leaves `int64_t` fails** (`BC_E_ARITH`). The
-  layer adds in 64 bits, a DECIMAL's scaled integer included; PostgreSQL's
-  `SUM` of a BIGINT or NUMERIC is an unbounded `numeric`. Below that the
+  layer adds in 64 bits, a BIGINT's or a DECIMAL's scaled integer, and the
+  statement fails as 22003; PostgreSQL's `SUM` of a BIGINT or NUMERIC is an unbounded `numeric`. Below that the
   sums agree exactly (`test_sum_past_int64_is_an_error`). The machine sums
   no BIGINT column; no TPROC-C sum comes near.
 - **MIN of a REAL or DOUBLE PRECISION column is refused.** PostgreSQL's

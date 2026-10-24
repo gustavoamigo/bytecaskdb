@@ -15,6 +15,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -63,13 +64,22 @@ void emit_names(bc_ctx* cx) {
     bc_emit_end(cx);
   }
 }
-// UPDATE t SET qty = qty + 1 WHERE id = $1: decoders, bc_row_from, bc_update.
+// UPDATE t SET qty = qty + 1 WHERE id = $1, qty BIGINT: decoders, bc_row_from, bc_update.
 void bump_qty(bc_ctx* cx) {
   bool found = false;
   bc_view old = bc_get(cx, bc_key_params(cx, kTbl, 0, 1), &found);
   if (!found) return;
   bc_row r = bc_row_from(cx, kTbl, old);
-  bc_row_set_i64(cx, r, kQtyCol, bc_add(cx, bc_col_i64(cx, old, kQtyCol), 1));
+  bc_row_set_i64(cx, r, kQtyCol, bc_add_bigint(cx, bc_col_i64(cx, old, kQtyCol), 1, kTbl));
+  bc_update(cx, kTbl, old, bc_row_end(cx, r));
+}
+// UPDATE t SET qty = qty + $2 WHERE id = $1: past BIGINT, the range error.
+void add_to_qty(bc_ctx* cx) {
+  bool found = false;
+  bc_view old = bc_get(cx, bc_key_params(cx, kTbl, 0, 1), &found);
+  if (!found) return;
+  bc_row r = bc_row_from(cx, kTbl, old);
+  bc_row_set_i64(cx, r, kQtyCol, bc_add_bigint(cx, bc_col_i64(cx, old, kQtyCol), bc_param_i64(cx, 1), kTbl));
   bc_update(cx, kTbl, old, bc_row_end(cx, r));
 }
 // Copies past one arena chunk: the arena grows by another, freed at reset.
@@ -261,6 +271,11 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
        {PhysType::I64, PhysType::I64, PhysType::I64},
        BC_OK,
        {{std::int64_t{1}, std::int64_t{10}, std::int64_t{10}}, {std::int64_t{2}, std::int64_t{50}, std::int64_t{30}}}},
+      {"update, qty leaves BIGINT",
+       add_to_qty,
+       {std::int64_t{3}, std::numeric_limits<std::int64_t>::max()},
+       {},
+       BC_E_CONSTRAINT},
       {"bc_row_set_param NULL", null_id_param, {bc_value{}}, {}, BC_E_CONSTRAINT},
       {"bc_row_set_null", null_id_set, {}, {}, BC_E_CONSTRAINT},
       {"bc_row_end, a column unset", id_unset, {}, {}, BC_E_CONSTRAINT},
