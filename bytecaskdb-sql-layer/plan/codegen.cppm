@@ -281,8 +281,9 @@ auto computed(std::uint32_t i) -> std::string { return "v" + std::to_string(i); 
 // Each computed value, once, before anything is read: as PostgreSQL folds
 // $n ± k when it binds, one that leaves INTEGER fails the statement whatever
 // the other parameters are; a NULL $n gives NULL, never an error. $n is
-// checked as an INTEGER before the plan runs, so the addition itself cannot
-// overflow int64.
+// checked as an INTEGER before the plan runs (the proof test
+// test_a_computed_bound_past_integer_is_22003_before_the_plan_runs), so the
+// addition itself cannot overflow int64.
 void print_computed(Writer& w) {
   const auto& comp = w.p().computed;
   for (std::size_t i = 0; i < comp.size(); ++i) {
@@ -856,10 +857,11 @@ void print_set(Writer& w, const ir::Update& s) {
       value = read_col(w, e.col, "old");
       null_if = null_src;
     } else {
-      auto fn = std::string{e.kind == ir::Expr::Kind::Add ? "bc_add" : "bc_sub"} + (e.col.bigint ? "_bigint" : "");
-      value = fn + "(cx, " + read_col(w, e.col, "old") + ", " +
-              (e.constant ? constant(*e.constant) : param(PhysType::I64, e.param)) +
-              (e.col.bigint ? ", " + w.tbl() : "") + ")";
+      auto fn = std::string{e.kind == ir::Expr::Kind::Add ? "bc_add" : "bc_sub"};
+      // A BIGINT's helper also names the table its range error is raised on.
+      auto [name, table_arg] = e.bigint ? std::pair{fn + "_bigint", ", " + w.tbl()} : std::pair{fn, std::string{}};
+      value = name + "(cx, " + read_col(w, e.col, "old") + ", " +
+              (e.constant ? constant(*e.constant) : param(PhysType::I64, e.param)) + table_arg + ")";
       if (!e.constant) null_if = (null_src.empty() ? "" : null_src + " || ") + param_null(e.param);
       else null_if = null_src;
     }

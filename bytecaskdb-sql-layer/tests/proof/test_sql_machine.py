@@ -1389,8 +1389,18 @@ def test_every_range_message_maps_to_its_sqlstate(tmp_path):
         except bytecask_sql.ExecError as e:
             assert e.constraint == "range" and o.layer_sqlstate(e) == "22003", str(e)
             seen.update(start for start, _ in messages if str(e).startswith(start))
+            assert str(e).startswith("bigint out of range"), str(e)
         else:
             raise AssertionError("b + 1 past BIGINT's range was written")
+        # bc_sub_bigint: the other direction, from the low edge.
+        db.execute("INSERT INTO rb VALUES ($1, $2)", (2, BIGINT_LOW))
+        try:
+            db.execute("UPDATE rb SET b = b - $1 WHERE k = $2", (1, 2))
+        except bytecask_sql.ExecError as e:
+            assert e.constraint == "range" and o.layer_sqlstate(e) == "22003", str(e)
+            assert str(e).startswith("bigint out of range"), str(e)
+        else:
+            raise AssertionError("b - 1 below BIGINT's range was written")
         assert seen == {start for start, _ in messages}, {start for start, _ in messages} - seen
     finally:
         db.close()
@@ -1610,6 +1620,26 @@ def test_column_plus_parameter_across_bigint_and_scale_0_decimal(dsn):
         m.teardown()
 
 
+def test_a_computed_bound_past_integer_is_22003_before_the_plan_runs(dsn):
+    """WHERE c > $1 - k: $n is an INTEGER, so a $n past INTEGER, int64's edge
+    included, is 22003 before the plan runs and its addition (bc_add) never
+    sees an int64 overflow. Only the layer is asked: the oracle's driver sends
+    a $n past INTEGER as a bigint, which PostgreSQL then takes."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False)], ["c0"]))
+        m.insert("t0", {"c0": 1}, all_columns=True)
+        types = [o.INTEGER]
+        for op in ("-", "+"):
+            sql = f"SELECT c0 FROM t0 WHERE c0 > $1 {op} 15"
+            for edge in (BIGINT_HIGH, BIGINT_LOW, 2**31, -(2**31) - 1):
+                assert m.layer(sql, (edge,), types).error == "22003", (op, edge)
+            assert m.both(sql, (0,), types=types).error is None
+        m.check()
+    finally:
+        m.teardown()
+
+
 def test_a_parameter_used_with_two_types_is_refused(dsn):
     """SET c1 = $1, c2 = c2 + $1, with c1 BIGINT and c2 SMALLINT: the layer
     refuses a $n used with two SQL types, in either order (docs/testing_design.md,
@@ -1726,9 +1756,9 @@ def test_sum_and_min_over_rows_nulls_and_none(dsn):
 
 
 def test_sum_past_int64_is_an_error(tmp_path):
-    """A SUM whose running total leaves int64 fails the statement, where
-    PostgreSQL's numeric would hold it (docs/testing_design.md, *Known
-    differences*)."""
+    """A SUM whose running total leaves int64, a BIGINT's or a DECIMAL's in its
+    scaled integer, fails the statement as SQLSTATE 22003, where PostgreSQL's
+    numeric would hold it (docs/testing_design.md, *Known differences*)."""
     db = bytecask_sql.open(str(tmp_path))
     try:
         db.execute("CREATE TABLE t (k BIGINT, n BIGINT NOT NULL, v BIGINT, PRIMARY KEY (k, n))")
@@ -1738,9 +1768,18 @@ def test_sum_past_int64_is_an_error(tmp_path):
         try:
             db.execute("SELECT sum(v) FROM t WHERE k = $1", (1,))
         except bytecask_sql.ExecError as e:
-            assert e.constraint is None and "out of range" in str(e), e
+            assert e.constraint is None and "out of range" in str(e) and e.sqlstate == "22003", e
         else:
             raise AssertionError("a sum past int64 was returned")
+        db.execute("CREATE TABLE d (g BIGINT, k BIGINT, v NUMERIC(18, 0), PRIMARY KEY (g, k))")
+        for k in range(10):  # ten of 10^18 - 1: 9.99 * 10^18 > 2^63
+            db.execute("INSERT INTO d VALUES ($1, $2, $3)", (1, k, 10**18 - 1))
+        try:
+            db.execute("SELECT sum(v) FROM d WHERE g = $1", (1,))
+        except bytecask_sql.ExecError as e:
+            assert e.constraint is None and e.sqlstate == "22003", e
+        else:
+            raise AssertionError("a DECIMAL sum past int64 was returned")
     finally:
         db.close()
 
