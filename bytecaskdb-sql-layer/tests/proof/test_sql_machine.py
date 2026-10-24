@@ -61,6 +61,7 @@ import array
 import collections
 import dataclasses
 import decimal
+import math
 import os
 import shutil
 import sys
@@ -204,14 +205,17 @@ def values(t: o.Type) -> st.SearchStrategy:
     if t.kind == "int":
         edges = st.sampled_from([t.low, t.high, t.low - 1, t.high + 1]).filter(lambda v: BIGINT_LOW <= v <= BIGINT_HIGH)
         return st.one_of(st.integers(-3, 3), st.integers(t.low, t.high), edges, st.integers(BIGINT_LOW, BIGINT_HIGH))
+    # NaN, which PostgreSQL orders above every other value and equal to
+    # itself, and the infinities, in either type.
+    special = st.sampled_from([math.nan, math.inf, -math.inf])
     if t.kind == "float":
-        return st.floats(allow_nan=False, allow_infinity=False)
+        return st.one_of(st.floats(allow_nan=False, allow_infinity=False), special)
     if t.kind == "real":
         # Floats, doubles that round to one, and doubles past float's range
         # at either end (22003 on both).
         inside = st.one_of(st.floats(width=32, allow_nan=False, allow_infinity=False),
                            st.floats(-1e38, 1e38).filter(lambda v: v == 0 or abs(v) > 1e-37))
-        return st.one_of(inside, st.sampled_from([1e39, -1e39, 1e-50, -1e-50]))
+        return st.one_of(inside, st.sampled_from([1e39, -1e39, 1e-50, -1e-50]), special)
     if t.kind == "decimal":
         # At its scale, so both sides hold it exactly; past its precision now
         # and then (22003 on both).
@@ -2086,6 +2090,47 @@ def test_a_join_ordered_by_its_first_tables_scan(dsn):
             for limit in (None, 2):
                 ordered(f"SELECT t0.c1, t1.c1 FROM t0, t1 WHERE t0.c0 = $1 AND t1.c0 = t0.c2 ORDER BY t1.c1 DESC{nulls}, t0.c1",
                         [1], lambda r: (r[1], r[0]), limit)
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_same_rows_compares_sort_keys_as_postgresql_orders_them():
+    """Two rows tied on NaN are one run, in either order; -0.0 ties 0.0."""
+    nan = math.nan
+    pg = ((1, 2.0), (2, float("nan")), (3, float("nan")))
+    key = lambda r: (r[1],)  # noqa: E731
+    assert o.same_rows(((1, 2.0), (3, float("nan")), (2, nan)), pg, key, None) is None
+    assert o.same_rows(((1, 2.0), (3, nan)), pg, key, 2) is None
+    assert o.same_rows(((2, nan), (1, 2.0), (3, nan)), pg, key, None) == "a different order"
+    assert o.same_rows(((1, -0.0), (2, 0.0)), ((2, 0.0), (1, -0.0)), key, None) is None
+
+
+def test_nan_and_infinities_order_as_postgresql_orders_them(dsn):
+    """NaN, Infinity and -Infinity in DOUBLE and REAL columns, sorted, keyed
+    and looked up: PostgreSQL orders NaN above every other value and every
+    NaN equal to every other, so rows tied on NaN form one run of equal keys
+    (oracle.same_rows)."""
+    nan, inf = math.nan, math.inf
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.DOUBLE), Column("c2", o.REAL)],
+                       ["c0"]))
+        m.create(Table("t1", [Column("c0", o.DOUBLE, nullable=False), Column("c1", o.INTEGER)], ["c0"]))
+        rows = [(nan, inf), (-inf, nan), (inf, -inf), (nan, nan), (0.0, 1.5), (None, inf), (-0.0, None), (nan, -inf)]
+        for k, (c1, c2) in enumerate(rows):
+            m.insert("t0", {"c0": k, "c1": c1, "c2": c2}, all_columns=True)
+        for k, v in enumerate([nan, inf, -inf, 2.5, -0.0]):
+            m.insert("t1", {"c0": v, "c1": k}, all_columns=True)
+        assert m.insert("t1", {"c0": nan, "c1": 9}, all_columns=True).error == "23505"  # one NaN key
+        for limit in (None, 1, 3):
+            m.select("t0", ["c0", "c1"], [], [("c1", False, None)], limit)
+            m.select("t0", ["c0", "c1", "c2"], [], [("c1", True, None), ("c2", False, True)], limit)
+            m.select("t0", ["c0", "c2"], [("c0", ">=", 1)], [("c2", True, False)], limit)
+            m.select("t1", ["c0", "c1"], [], [("c0", True, None)], limit)
+        for v in (nan, inf, -inf):
+            assert len(m.lookup("t1", (v,)).rows) == 1
+            m.select("t1", ["c0", "c1"], [("c0", ">=", v)], [("c0", False, None)])
         m.check()
     finally:
         m.teardown()

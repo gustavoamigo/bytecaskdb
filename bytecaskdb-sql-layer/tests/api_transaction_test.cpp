@@ -11,6 +11,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -18,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -275,6 +277,41 @@ constexpr std::int64_t kBulkScale = 1;
 #else
 constexpr std::int64_t kBulkScale = 10;
 #endif
+
+TEST_CASE("embedded API: a sort compiled while its table was small gives way, as the table grows, to the index in its "
+          "order",
+          "[sql][api][memory]") {
+  sql_test::TempDir dir{"api_mem_grow"};
+  // A sorter of n rows holds at least 192 + 128 n bytes: past 511 rows, 64 KiB.
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  db->execute("CREATE TABLE g (id BIGINT PRIMARY KEY, x BIGINT NOT NULL, y BIGINT NOT NULL)");
+  db->execute("CREATE INDEX g_x ON g (x)");
+  auto insert = [&](std::int64_t from, std::int64_t to) {
+    for (auto i = from; i <= to; ++i) db->execute("INSERT INTO g VALUES ($1, $2, $3)", {i, (i * 7919) % 1000, i % 2});
+  };
+  insert(1, 10);
+  // Compiled at 10 rows: the full scan, filtered and sorted, costs less than
+  // g_x's scan, which fetches each row. The table's count picks between them
+  // each time the plan runs.
+  const auto& st = db->prepare("SELECT id FROM g WHERE y >= $1 ORDER BY x, id");
+  auto compiled = db->compilations();
+  auto in_order = [&] {
+    auto rows = db->execute(st, {std::int64_t{0}}).rows;
+    std::vector<std::pair<std::int64_t, std::int64_t>> got;
+    for (const auto& r : rows) {
+      auto id = std::get<std::int64_t>(r[0]);
+      got.emplace_back((id * 7919) % 1000, id);
+    }
+    return got.size() == rows.size() && std::ranges::is_sorted(got) ? got.size() : std::size_t{0};
+  };
+  CHECK(in_order() == 10);
+  REQUIRE(st.plan_source().find("int64_t count0 = bc_count_range(cx, TBL_") != std::string::npos);
+  // 1,000 rows: sorted, they would pass the budget (54000); the count takes
+  // g_x's scan, which holds a row at a time. Nothing recompiled.
+  insert(11, 1000);
+  CHECK(in_order() == 1000);
+  CHECK(db->compilations() == compiled);
+}
 
 TEST_CASE("embedded API: a bulk UPDATE of 200K rows passes the default memory budget, is 54000 and commits nothing",
           "[sql][api][memory]") {

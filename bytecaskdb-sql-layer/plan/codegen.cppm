@@ -20,6 +20,7 @@ module;
 #include <functional>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -541,13 +542,15 @@ private:
             ", BC_SCAN_PREFIX" + (sc.reverse ? " | BC_SCAN_REVERSE" : "") + ");");
   }
 
-  // `bc_view lo`, `bc_view hi` and `bc_cursor c` of the scan; for a choice
-  // point's first plan, `c` alone, on the range its count built.
-  void open_scan(const physical::Scan& sc) {
+  // A choice point's counted range, as the names of its bounds.
+  using Counted = std::pair<std::string, std::string>;
+
+  // `bc_view lo`, `bc_view hi` and `bc_cursor c` of the scan; with `counted`,
+  // a choice point's first plan, `c` alone, on the range its count built.
+  void open_scan(const physical::Scan& sc, const Counted* counted = nullptr) {
     w_.reads(sc.object);
-    auto counted = std::exchange(counted_, std::nullopt);
-    auto lo = counted ? counted->first : std::string{"lo"};
-    auto hi = counted ? counted->second : std::string{"hi"};
+    auto lo = counted != nullptr ? counted->first : std::string{"lo"};
+    auto hi = counted != nullptr ? counted->second : std::string{"hi"};
     if (const auto* r = std::get_if<physical::Range>(&sc.rest)) {
       if (!counted) print_range(sc, *r);
       w_.line("bc_cursor " + cursor_ + " = bc_scan_open(cx, " + w_.obj(sc.object) + ", " + lo + ", " + hi + ", " +
@@ -588,15 +591,14 @@ private:
   }
 
   void produce(const physical::Scan& sc, const Consume& k) {
-    open_scan(sc);
+    auto it = counted_.find(&sc);
+    open_scan(sc, it == counted_.end() ? nullptr : &it->second);
     scan_loop(sc, k);
   }
 
   // The present values and the NULL part, each in its own block, in
   // PostgreSQL's order; one LIMIT counter across both.
   void produce(const physical::NullSplitScan& split, const Consume& k) {
-    // Its ranges are its own, not a choice point's count of its prefix.
-    counted_.reset();
     const auto& sc = split.present;
     for (auto nulls : sc.reverse ? std::vector<bool>{true, false} : std::vector<bool>{false, true}) {
       w_.open("");
@@ -630,6 +632,15 @@ private:
     if (cr.emits) emit_count("n");
   }
 
+  // The scan a plan's rows come from, under its filters and sort; null for a
+  // NULL split.
+  static auto plain_scan(const physical::Node& n) -> const physical::Scan* {
+    if (const auto* sc = std::get_if<physical::Scan>(&n.op)) return sc;
+    if (const auto* f = std::get_if<physical::Filter>(&n.op)) return plain_scan(*f->input);
+    if (const auto* o = std::get_if<physical::Sort>(&n.op)) return plain_scan(*o->input);
+    return nullptr;
+  }
+
   // The count of the first plan's range, limited to the threshold; then
   // each plan, under the condition that picks it, with the consume printed
   // once in each. The first plan's scan opens on the range the count built.
@@ -642,7 +653,8 @@ private:
     w_.line("int64_t " + n + " = bc_count_range(cx, " + w_.obj(ch.counted.object) + ", lo" + i + ", hi" + i + ", " + t +
             ");");
     w_.open("if (" + n + " < " + t + ")");
-    counted_ = std::pair{"lo" + i, "hi" + i};
+    // A NULL split's ranges are its own, not the count of its prefix.
+    if (const auto* first = plain_scan(*ch.below)) counted_.emplace(first, Counted{"lo" + i, "hi" + i});
     produce(*ch.below, k);
     w_.otherwise();
     produce(*ch.at_or_above, k);
@@ -1045,9 +1057,9 @@ private:
   int choices_{0};               // the choice points printed: each counts into count<i>, over lo<i> and hi<i>
   int sorts_{0};                 // the sorts printed: each into sorter s<i>, its row p<i>
   std::string cursor_{"c"};      // the cursor a scan opens
-  // A choice point's counted range, lo<i> and hi<i>, which its first plan's
-  // scan opens on.
-  std::optional<std::pair<std::string, std::string>> counted_;
+  // Each choice point's first plan's scan, and the counted range, lo<i> and
+  // hi<i>, it opens on.
+  std::map<const physical::Scan*, Counted> counted_;
 };
 
 // Prints a searched plan, checked first.

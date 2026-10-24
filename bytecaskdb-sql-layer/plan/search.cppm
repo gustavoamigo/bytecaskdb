@@ -83,21 +83,56 @@ inline constexpr std::size_t kMaxChoices = 4;
 
 // The cheapest plan for a rewritten logical plan, its cost in Plan::cost.
 // `memory_bytes` is the statement's memory budget, bc_budget::max_bytes (0:
-// none): a sort known to pass it is not chosen where another plan avoids
-// it. Throws FeatureNotSupported, its message starting "no plan:", when no
+// none): a sort that may pass it, where another plan avoids the sort, is
+// the first plan of a choice point by the count it holds, the other its
+// second. Throws FeatureNotSupported, its message starting "no plan:", when no
 // plan computes it or the logical plan has a shape the search does not plan.
 [[nodiscard]] auto search(const logical::Node& root, const Catalog& cat, const RowCounts& counts = {},
                           std::uint64_t memory_bytes = 0) -> physical::Plan;
 
-// Every plan the search costs for the statement, none pruned but those a
-// sort known to pass the budget leaves out, cheapest first (*Tests*,
-// alternatives agree). Refuses what search refuses.
+// Every plan the search costs for the statement, none pruned, cheapest first
+// (*Tests*, alternatives agree). Refuses what search refuses.
 [[nodiscard]] auto search_all(const logical::Node& root, const Catalog& cat, const RowCounts& counts = {},
                               std::uint64_t memory_bytes = 0) -> std::vector<physical::Plan>;
+
+// The threshold of a choice point between two plans whose costs, at a count
+// x of the first plan's range, are first(x) and second(x): the least x in
+// [1, max] at which the first costs more. nullopt where they don't cross
+// within the range, so the count could not pick either: where they only meet,
+// cross past `max` or at 1, or cross more than once at counts spread over the
+// range (1, 2, 3, 4, 6, 9, … and max), as a sort's cost and entries_beside's
+// clamps can. There the search keeps its compile-time choice.
+[[nodiscard]] auto crossing(const std::function<double(double)>& first, const std::function<double(double)>& second,
+                            double max) -> std::optional<std::int64_t>;
 
 }  // namespace bytecask::sql
 
 namespace bytecask::sql {
+
+auto crossing(const std::function<double(double)>& first, const std::function<double(double)>& second, double max)
+    -> std::optional<std::int64_t> {
+  auto reached = [&](std::int64_t x) { return first(static_cast<double>(x)) > second(static_cast<double>(x)); };
+  // A count past INT64_MAX is no count a table holds.
+  auto hi = static_cast<std::int64_t>(std::min(std::floor(max), 0x1p62));
+  std::int64_t lo = 1;
+  if (hi <= lo || reached(lo) || !reached(hi)) return std::nullopt;
+  // The binary search below assumes the first costs more from one count on.
+  auto changes = 0;
+  auto last = false;
+  for (std::int64_t x = 2;; x = std::max(x + 1, x + x / 2)) {
+    x = std::min(x, hi);
+    auto now = reached(x);
+    changes += now != last ? 1 : 0;
+    last = now;
+    if (x == hi) break;
+  }
+  if (changes > 1) return std::nullopt;
+  while (hi - lo > 1) {
+    auto mid = lo + (hi - lo) / 2;
+    (reached(mid) ? hi : lo) = mid;
+  }
+  return hi;
+}
 
 namespace {
 
@@ -336,9 +371,10 @@ auto in_key(const Table& t, const Path& p, std::uint32_t col) -> bool {
   return std::ranges::any_of(p.parts, [&](const Part& q) { return q.col == col; });
 }
 
-// Where a plan stopped. A plan reaches its tables (Reach), takes every
-// filter (Filter), and gives the ORDER BY, by its order or a sort (Order).
-enum class Stage { Reach, Filter, Order };
+// Where a plan stopped: at reaching its tables (Reach), at a filter it
+// can't run (Filter), or past both, at the join that would join its tables,
+// a hash join not planned yet (Join).
+enum class Stage { Reach, Filter, Join };
 
 // Why one plan failed: the stage it stopped at.
 struct Refusal {
@@ -549,7 +585,6 @@ struct Finished {
   std::vector<std::uint32_t> null_checks;
   std::vector<physical::Computed> computed;
   double cost{0};
-  double min_bytes{0};  // the least its sort is known to hold, 0 for none known
 };
 
 class Search {
@@ -560,10 +595,6 @@ public:
   // The statement's plans, cheapest first: one, or every one costed.
   auto plans(const logical::Node& root) -> std::vector<physical::Plan> {
     auto finished = statement(root);
-    // A sort known to pass the memory budget is not chosen where another
-    // plan avoids it (docs/planner_design.md, *Memory*).
-    auto over = [&](const Finished& f) { return memory_ > 0 && f.min_bytes > static_cast<double>(memory_); };
-    if (!std::ranges::all_of(finished, over)) std::erase_if(finished, over);
     std::ranges::stable_sort(finished, {}, &Finished::cost);
     if (!all_) finished.resize(1);
     std::vector<physical::Plan> out;
@@ -624,14 +655,7 @@ private:
     if (counts_) n = counts_(t);
     auto rows = n ? static_cast<double>(*n) : kUncountedRows;
     rows_.emplace(t.id, rows);
-    if (n) counted_.push_back(t.id);
     return rows;
-  }
-
-  // A table's rows as counted when the plan was compiled, or nullopt.
-  auto counted_rows(const Table& t) const -> std::optional<double> {
-    if (std::ranges::find(counted_, t.id) == counted_.end()) return std::nullopt;
-    return rows_.at(t.id);
   }
 
   auto name_of(const ColumnRef& c) const -> std::string { return cat_.table(c.table)->column(c.col)->name; }
@@ -1054,7 +1078,7 @@ private:
     auto loop = std::max(outer.rows, 1.0) * inner;
     auto hash = inner + (1 + kSortWeight) * std::min(outer.rows, rows) + std::max(outer.rows, rows);
     if (loop <= hash) return std::nullopt;
-    return Refusal{Stage::Reach, "no key of " + t.name +
+    return Refusal{Stage::Join, "no key of " + t.name +
                                      " is reached from the other table's rows, and reading it once per row costs more "
                                      "than a hash join, which is not planned yet"};
   }
@@ -1071,9 +1095,17 @@ private:
   // refused if none. A plan that fails is carried on as far as it reaches,
   // so the refusal names the failure of the furthest stage a plan of every
   // table reached. `ordered` is the ORDER BY without the columns the WHERE
-  // makes constant.
+  // makes constant. With `sorts`, a plan not in its order sorts its rows, its
+  // loop reading them (finish): each candidate is kept and pruned at the cost
+  // of the plan it becomes.
   auto candidates(const Query& q, const std::vector<OrderItem>& ordered, const std::vector<ColumnRef>& used,
-                  bool may_cover) -> Searched {
+                  bool may_cover, bool sorts) -> Searched {
+    auto cost = [&](Candidate& c) {
+      if (sorts && !c.ordered()) {
+        if (auto d = c.driving()) c.access_at(*d) = uncovered(c.access_at(*d));
+      }
+      costed(c);
+    };
     const auto n = q.rels.size();
     const auto full = n == 32 ? ~0u : (1u << n) - 1;
     std::map<std::uint32_t, std::vector<Candidate>> best;
@@ -1087,7 +1119,7 @@ private:
         c.set = 1u << i;
         c.access = a.access;
         c.failed = a.failed;
-        costed(c);
+        cost(c);
         keep(best, std::move(c), full);
       }
     }
@@ -1111,7 +1143,7 @@ private:
             c.set = set | (1u << t);
             c.failed = earlier(o.failed, pr ? std::nullopt : std::optional{pr.error()});
             if (!c.failed) c.steps.emplace_back(*pr);
-            costed(c);
+            cost(c);
             keep(best, std::move(c), full);
           }
           // t by its own scan, the join's conjuncts filtering its rows: read
@@ -1125,7 +1157,7 @@ private:
             c.failed = earlier(o.failed, a.failed ? a.failed : on_double);
             if (!c.failed && rescan) c.failed = hashed(o, a.access, q.rels[t].table());
             c.steps.emplace_back(Nested{t, read_once(a.access, on), on, rescan});
-            costed(c);
+            cost(c);
             keep(best, std::move(c), full);
           }
         }
@@ -1340,61 +1372,22 @@ private:
     return std::min(e, b.max_entries);
   }
 
-  // The least count of the first plan's range, in [1, max], at which it
-  // costs more than the second: the threshold, when the costs cross within
-  // the range, so the count can pick either. Costs that only meet, as where
-  // one range holds the other's rows, never cross. It assumes the
-  // difference of the two costs changes sign at most once in the range, as
-  // two costs that grow with the count, one of them linearly, do; a debug
-  // build checks it.
-  static auto crossing(const std::function<double(double)>& first, const std::function<double(double)>& second,
-                       double max) -> std::optional<std::int64_t> {
-    auto reached = [&](std::int64_t x) { return first(static_cast<double>(x)) > second(static_cast<double>(x)); };
-    // A count past INT64_MAX is no count a table holds.
-    auto hi = static_cast<std::int64_t>(std::min(std::floor(max), 0x1p62));
-    std::int64_t lo = 1;
-#ifndef NDEBUG
-    crosses_once(reached, hi);
-#endif
-    if (hi <= lo || reached(lo) || !reached(hi)) return std::nullopt;
-    while (hi - lo > 1) {
-      auto mid = lo + (hi - lo) / 2;
-      (reached(mid) ? hi : lo) = mid;
-    }
-    return hi;
-  }
-
-#ifndef NDEBUG
-  // crossing()'s assumption, at counts 1, 2, 3, 4, 6, 9, … and `max`: whether
-  // the first plan costs more changes at most once.
-  template <typename F>
-  static void crosses_once(const F& reached, std::int64_t max) {
-    auto changes = 0;
-    auto last = reached(1);
-    for (std::int64_t x = 2;; x = std::max(x + 1, x + x / 2)) {
-      x = std::min(x, max);
-      if (x <= 1) break;
-      auto now = reached(x);
-      changes += now != last ? 1 : 0;
-      last = now;
-      if (x == max) break;
-    }
-    if (changes > 1) throw std::logic_error{"search: the costs of a choice point's two plans cross more than once"};
-  }
-#endif
-
-  // The sort's choice by the memory budget, for a table alone: where its
-  // range holds rows enough that the sorter would pass the budget, the
-  // cheapest plan that gives the ORDER BY instead. The rows held are the
-  // range's count when no filter takes any, and a sorter of n entries holds
-  // at least kSorterBytes and n × kSortEntryBytes, so the threshold is the
-  // least count past the budget. None under a LIMIT the budget holds.
+  // The sort's choice by the memory budget, for a table alone, where another
+  // plan gives the ORDER BY: below the least count of the sorted range past
+  // the budget, the sort; from it, the cheapest plan that gives the order
+  // instead. The rows held are at most the range's count, a full scan's the
+  // table's, whatever the filters keep, and that count is read when the plan
+  // runs, so it holds as the table grows. A sorter of n entries holds at
+  // least kSorterBytes and n × kSortEntryBytes. None under a LIMIT the budget
+  // holds.
   auto by_budget(const Candidate& c, const std::vector<Tried>& tried, const SortSpec& sort, const Sink& sink) const
       -> std::optional<ChoiceAt> {
-    if (memory_ <= kSorterBytes || !c.steps.empty() || !c.access.filters.empty()) return std::nullopt;
-    auto past = std::min<std::uint64_t>((memory_ - kSorterBytes) / kSortEntryBytes + 1, std::uint64_t{1} << 62);
+    if (memory_ == 0 || !c.steps.empty()) return std::nullopt;
+    // A budget below an empty sorter's: no count of rows fits it.
+    auto past = memory_ < kSorterBytes ? 0
+                                       : std::min<std::uint64_t>((memory_ - kSorterBytes) / kSortEntryBytes + 1,
+                                                                 std::uint64_t{1} << 62);
     if (sort.keep > 0 && static_cast<std::uint64_t>(sort.keep) < past) return std::nullopt;
-    if (static_cast<double>(past) > c.access.max_entries) return std::nullopt;
     const auto* sa = scan_of(c.access);
     std::optional<ChoiceAt> best;
     auto best_cost = 0.0;
@@ -1420,9 +1413,9 @@ private:
   // row, nor at a full scan, whose count no parameter changes, nor at a scan
   // read once per outer row; and the second plan is never a full scan. In a
   // plan that gives the ORDER BY by its order (`needs_order`), the loop's
-  // second plan gives it too. A sorted plan of one table whose range may
-  // hold more rows than the budget takes the choice by the budget (by_budget)
-  // there instead. `tried` is each table's access paths.
+  // second plan gives it too. A sorted plan of one table takes the choice by
+  // the budget (by_budget) there instead, at a full scan too, its second plan
+  // any that gives the order. `tried` is each table's access paths.
   auto choose(const Candidate& c, const Sink& sink, const std::vector<std::vector<Tried>>& tried, bool needs_order,
               const SortSpec* sort) const -> std::vector<ChoiceAt> {
     std::vector<ChoiceAt> out;
@@ -1432,13 +1425,14 @@ private:
       if (at > 0 && (ne == nullptr || ne->rescan)) continue;  // a lookup by key, or a count per outer row
       const auto& a = c.access_at(at);
       const auto rel = at == 0 ? c.first : ne->rel;
-      if (scan_of(a) == nullptr || a.max_entries <= 1 || full_scan(a)) continue;
+      if (scan_of(a) == nullptr || a.max_entries <= 1) continue;
       if (sort != nullptr && at == loop) {
         if (auto b = by_budget(c, tried[rel], *sort, sink)) {
           out.push_back(std::move(*b));
           continue;
         }
       }
+      if (full_scan(a)) continue;
       auto first = [&](double x) { return finished_cost(sink, measure(c, Entries{at, x})); };
       std::optional<ChoiceAt> best;
       auto best_cost = 0.0;
@@ -1482,16 +1476,7 @@ private:
     auto choices = choose(c, sink, tried, needs_order, sort);
     auto b = build(q, c, choices, sort);
     auto cost = finished_cost(sink, measure(c)) + kCountCost * static_cast<double>(choices.size());
-    Finished f{wrap(std::move(b.rows)), std::move(b.null_checks), std::move(b.computed), cost};
-    // A sort of a whole table, counted when the plan was compiled, holds a
-    // known number of rows.
-    if (sort != nullptr && c.steps.empty() && full_scan(c.access) && c.access.filters.empty()) {
-      if (auto n = counted_rows(q.rels[c.first].table())) {
-        auto held = sort->keep > 0 ? std::min(*n, static_cast<double>(sort->keep)) : *n;
-        f.min_bytes = static_cast<double>(kSorterBytes) + held * static_cast<double>(kSortEntryBytes);
-      }
-    }
-    return f;
+    return {wrap(std::move(b.rows)), std::move(b.null_checks), std::move(b.computed), cost};
   }
 
   // The rows an UPDATE or DELETE writes: each row whole, by a point lookup or
@@ -1506,7 +1491,7 @@ private:
     Query q;
     flatten(in, q);
     if (q.rels.size() != 1) no_plan("a Join where the search plans a table");
-    auto searched = candidates(q, {}, {}, false);
+    auto searched = candidates(q, {}, {}, false, false);
     for (const auto& c : searched.plans) out.push_back(finish(q, c, Sink{}, searched.tried, nullptr, false, wrap));
     return out;
   }
@@ -1601,7 +1586,8 @@ private:
     // FOR UPDATE reads each row, whose key it guards; COUNT(DISTINCT) keys
     // each value from its row.
     auto distinct = agg != nullptr && agg->distinct;
-    auto searched = candidates(q, ordered, s.below->output, !for_update && !distinct);
+    auto sorting = agg == nullptr && !ordered.empty();
+    auto searched = candidates(q, ordered, s.below->output, !for_update && !distinct, sorting);
     auto emits = !s.limit || *s.limit > 0;
     std::vector<Finished> out;
     std::optional<std::string> unsorted;
@@ -1673,7 +1659,6 @@ private:
   std::uint64_t memory_;  // the statement's memory budget, 0 for none
   bool all_;
   std::map<std::uint32_t, double> rows_;
-  std::vector<std::uint32_t> counted_;  // the tables whose rows counts_ gave
   std::vector<Catalog::PlanConstant> constants_;
   std::vector<physical::ResultColumn> result_;
 };

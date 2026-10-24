@@ -247,6 +247,17 @@ TEST_CASE("physical: a sort holds the row of its input's one loop, keyed by colu
   refused(plan(sort(get({p(0)}), by_id, 0, 1)), "input is not one loop");
   refused(plan(sort(node(scan({p(0)}, {})), by_id, 0, 2)), "another row than its loop's");
   refused(plan(sort(node(scan({p(0)}, {}, true)), by_id, 0, 1)), "a sort over a covering scan");
+  // A choice by the budget: the sort in its first plan, a covering scan in
+  // the order in its second. Each plan is checked as it runs, so the second's
+  // key is no reason to refuse the first's sort; a sort over a covering scan
+  // in its own branch still is.
+  auto by_budget = [&](bool sort_covers) {
+    auto sorted = node(physical::Sort{node(scan({p(0)}, {}, sort_covers)), by_id, 0, 1});
+    auto in_order = node(physical::Scan{1, 5, {p(1)}, {}, false, true, false});
+    return emit(node(physical::Choice{scan({p(0)}, {}, sort_covers), 9, std::move(sorted), std::move(in_order)}));
+  };
+  CHECK(refusal(plan(by_budget(false))).empty());
+  refused(plan(by_budget(true)), "a sort over a covering scan");
   refused(plan(sort(node(scan({p(0)}, {})), {{{2, 0, PhysType::I64, false}, false, false}}, 0, 1)),
           "a sort key outside its input's tables");
   // Two loops, one inside the other: a sorter holds one row per entry.

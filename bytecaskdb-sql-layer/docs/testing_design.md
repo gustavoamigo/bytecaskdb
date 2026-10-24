@@ -45,7 +45,9 @@ every rule, the invariants are checked.
 - **Counts agree.** An INSERT, UPDATE or DELETE changes as many rows on both.
 - **Rows agree.** A lookup returns the same rows. After every step, each
   table holds the same rows on both. The layer's rows are read from the
-  engine by `table_rows`, since SQL has no full scan. PostgreSQL's come from
+  engine by `table_rows`, not by a plan, so the check does not depend on
+  the planner it checks (a full scan in SQL is one of its plans).
+  PostgreSQL's come from
   `SELECT … ORDER BY` the primary key. `table_rows` is test only: it is
   compiled into `sql_layer_testing`, the build of the library with
   `BYTECASK_SQL_TESTING` that the tests and `bytecask_sql` link, and is not
@@ -53,7 +55,10 @@ every rule, the invariants are checked.
 - **Values compare as values.** `bytecask_sql` converts each value by its
   column's SQL type, and the oracle (`tests/proof/oracle.py`) converts
   PostgreSQL's the same way. Values compare by type too: `True` is not `1`,
-  `1` is not `1.0`, and `-0.0` is not `0.0`. Text columns are `COLLATE "C"`
+  `1` is not `1.0`, and `-0.0` is not `0.0`. A DOUBLE or REAL takes NaN,
+  `Infinity` and `-Infinity` too. An `ORDER BY`'s keys compare as
+  PostgreSQL orders them: every NaN equal to every other, and `-0.0` equal
+  to `0.0`, so their ties form one run (`oracle.same_rows`). Text columns are `COLLATE "C"`
   in PostgreSQL, so its order is byte order, the order of the layer's keys.
   A REAL comes from PostgreSQL as the shortest text naming its float; the
   oracle packs it back to that float, which is what the layer stores. A

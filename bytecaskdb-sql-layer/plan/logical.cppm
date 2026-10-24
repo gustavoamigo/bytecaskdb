@@ -61,6 +61,8 @@ struct Expr {
   std::vector<Expr> args;       // Add, Sub, Compare: two; Aggregate: none (COUNT(*)) or its argument
 
   [[nodiscard]] auto phys() const -> PhysType { return phys_type(type); }
+
+  friend auto operator==(const Expr&, const Expr&) -> bool = default;
 };
 
 // An expression of `kind` and `type`, its operands to be set.

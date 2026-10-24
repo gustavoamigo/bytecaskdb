@@ -448,6 +448,17 @@ TEST_CASE("search: a refusal names the failure of a plan of every table, not of 
   f.ddl(CreateTableDdl{"d", {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::F64, true)}, {"k"}});
   CHECK(refused("SELECT a.k FROM a, d WHERE a.x = $1 AND d.k = a.z AND d.v < $2") ==
         "no plan: a filter on column \"v\", a REAL or DOUBLE PRECISION, is not supported yet");
+  // e's index takes the DOUBLE bound, and its full scan leaves it a filter.
+  // The plans by e_v pass every filter and lack only the hash join: that is
+  // the refusal, past the full scan's DOUBLE filter.
+  f.ddl(CreateTableDdl{"e",
+                       {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::F64, true),
+                        Fixture::col("y", PhysType::I64, true)},
+                       {"k"}});
+  f.ddl(CreateIndexDdl{"e_v", "e", {{"v"}}});
+  auto why = refused("SELECT a.k FROM a, e WHERE a.x = $1 AND e.v < $2 AND e.y = a.z");
+  INFO(why);
+  CHECK(why.find("reading it once per row costs more than a hash join, which is not planned yet") != std::string::npos);
 }
 
 TEST_CASE("search: COUNT from the keys or by a loop, by the count of the range", "[sql][search][cost]") {
@@ -757,7 +768,16 @@ TEST_CASE("search: the planner uses the memory budget", "[sql][search][cost][mem
   auto sorts = [](const GeneratedPlan& g) { return has(g, "bc_sorter_open"); };
   CHECK(std::ranges::any_of(plans(0), sorts));
   CHECK(std::ranges::any_of(plans(200'000), sorts));
-  CHECK_FALSE(std::ranges::any_of(plans(100'000), sorts));
+  // The count read at compile time ages as the table grows: the full scan
+  // sorted is a choice point by the whole table's count, read when the plan
+  // runs. Past (100,000 - 192) / 128 + 1 = 780 rows, o_c's scan in order
+  // instead, whatever the table held at compile time.
+  for (auto budget : {100'000, 200'000}) {
+    for (const auto& g : plans(static_cast<std::uint64_t>(budget))) {
+      if (sorts(g)) CHECK(has(g, "int64_t count0 = bc_count_range(cx, TBL_"));
+    }
+  }
+  CHECK(threshold(plan(all, 10, 100'000)) == -1);  // the index costs less: no sort to choose by
   CHECK(plan(all, 1000, 100'000).cost == Catch::Approx(2000));
   // A range whose count depends on $n: a choice point by the budget. Past
   // (100,000 - 192) / 128 + 1 = 780 entries, o_c's scan in order instead.
@@ -770,4 +790,126 @@ TEST_CASE("search: the planner uses the memory budget", "[sql][search][cost][mem
   CHECK(by_a.source.find("bc_sorter", other) == std::string::npos);
   // With no budget, no such choice.
   CHECK_FALSE(has(plan("SELECT k FROM o WHERE a = $1 ORDER BY c", 100'000, 0), "count0"));
+  // Nor under a LIMIT the budget holds.
+  CHECK(threshold(plan("SELECT k FROM o WHERE a = $1 ORDER BY c LIMIT 10", 100'000, 100'000)) == -1);
+}
+
+TEST_CASE("search: a sort of a whole table, compiled while it was small, is chosen by its count as it runs",
+          "[sql][search][cost][memory][choice]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"w",
+                       {Fixture::col("k", PhysType::I64, false), Fixture::col("x", PhysType::I64, false),
+                        Fixture::col("y", PhysType::I64, true)},
+                       {"k"}});
+  f.ddl(CreateIndexDdl{"w_x", "w", {{"x"}}});
+  const auto& cat = f.cat();
+  const auto table = "TBL_" + std::to_string(cat.table("w")->id);
+  const auto index = "IDX_" + std::to_string(cat.table("w")->indexes[0].id);
+  auto plan = [&](std::string_view sql, std::uint64_t rows, std::uint64_t budget) {
+    RowCounts counts = [rows](const Table& t) -> std::optional<std::uint64_t> {
+      return t.name == "w" ? std::optional{rows} : std::nullopt;
+    };
+    return generate_plan(bound::bind(ast::parse(sql), cat), cat, sql, counts, budget);
+  };
+  // 10 rows when compiled: the full scan, filtered, sorted, 10 + 3.3 x 1.5,
+  // costs less than w_x's scan in order, 2 x 10. Its rows can't be fewer
+  // than none nor more than the table's, so the table's count picks: from
+  // 780, the sorter would pass the budget, and w_x's scan runs instead.
+  auto g = plan("SELECT k FROM w WHERE y >= $1 ORDER BY x", 10, 100'000);
+  CHECK(threshold(g) == 780);
+  CHECK(has(g, "bc_view lo0 = bc_empty(cx);\n  bc_view hi0 = bc_empty(cx);\n  int64_t count0 = bc_count_range(cx, " +
+                   table + ", lo0, hi0, 780);"));
+  auto below = g.source.find("if (count0 < 780) {");
+  auto other = g.source.find("} else {", below);
+  REQUIRE(other != std::string::npos);
+  CHECK(g.source.find("bc_sorter_open", below) < other);
+  CHECK(g.source.find("bc_scan_open(cx, " + table + ", lo0, hi0, BC_SCAN_FORWARD)", below) < other);
+  CHECK(g.source.find("bc_scan_open(cx, " + index, other) != std::string::npos);
+  CHECK(g.source.find("bc_sorter", other) == std::string::npos);
+  CHECK(g.cost == Catch::Approx(10 + 10.0 / 3 * 1.5 + 2));
+  INFO(g.source);
+  // The counted range is passed to the scan it belongs to, under the sort:
+  // that scan, and no other, opens on lo0 and hi0.
+  auto on_counted = [](const std::string& src) {
+    std::size_t n = 0;
+    constexpr std::string_view kOpen = ", lo0, hi0, BC_SCAN_";
+    for (auto at = src.find(kOpen); at != std::string::npos; at = src.find(kOpen, at + 1)) ++n;
+    return n;
+  };
+  CHECK(on_counted(g.source) == 1);
+  CHECK(has(g, "bc_view lo = bc_empty(cx);\n    bc_view hi = bc_empty(cx);\n    bc_cursor c = bc_scan_open(cx, " +
+                   index));
+}
+
+TEST_CASE("search: a choice point between a sort and a covering scan in the order passes check",
+          "[sql][search][choice]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"v",
+                       {Fixture::col("id", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+                        Fixture::col("b", PhysType::I64, true)},
+                       {"id"}});
+  f.ddl(CreateIndexDdl{"ix_a", "v", {{"a"}}});
+  f.ddl(CreateIndexDdl{"ix_ab", "v", {{"a"}, {"b"}}});
+  const auto& cat = f.cat();
+  const std::string sql = "SELECT a, b FROM v WHERE a = $1 ORDER BY b";
+  RowCounts counts = [](const Table& t) -> std::optional<std::uint64_t> {
+    return t.name == "v" ? std::optional<std::uint64_t>{1000} : std::nullopt;
+  };
+  // ix_a's range sorted, below the count past the budget; from it ix_ab's,
+  // in the order and covering. Each alternative is checked (generate_*
+  // runs physical::check): the covering scan is in the other branch.
+  auto plans = generate_alternatives(bound::bind(ast::parse(sql), cat), cat, sql, counts, 100'000);
+  const auto ix_ab = "IDX_" + std::to_string(cat.table("v")->indexes[1].id);
+  auto both = std::ranges::find_if(plans, [&](const GeneratedPlan& g) {
+    auto other = g.source.find("} else {");
+    return has(g, "if (count0 < ") && other != std::string::npos &&
+           g.source.find("bc_sorter_open") < other && g.source.find("bc_scan_key(cx, c)", other) != std::string::npos &&
+           g.source.find("bc_scan_open(cx, " + ix_ab, other) != std::string::npos;
+  });
+  CHECK(both != plans.end());
+  // The default budget's threshold, past 524K rows.
+  auto big = [](const Table& t) -> std::optional<std::uint64_t> {
+    return t.name == "v" ? std::optional<std::uint64_t>{600'000} : std::nullopt;
+  };
+  CHECK_NOTHROW(generate_alternatives(bound::bind(ast::parse(sql), cat), cat, sql, big, 64u << 20));
+}
+
+TEST_CASE("search: an unordered plan is kept at the cost of the plan it becomes, sorted and reading rows",
+          "[sql][search][cost]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  // w_ab covers w's a, b and k.
+  f.ddl(CreateTableDdl{"w",
+                       {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+                        Fixture::col("b", PhysType::I64, true)},
+                       {"k"}});
+  f.ddl(CreateIndexDdl{"w_ab", "w", {{"a"}, {"b"}}});
+  const auto& cat = f.cat();
+  const auto table = "TBL_" + std::to_string(cat.table("w")->id);
+  // 2 rows of w, then t by its key. w_ab's range, a = $1, reaches its first
+  // entry, 1 covering; the full scan reaches 2, a filtered. Neither gives
+  // ORDER BY k, b, so the plan of w is kept, for the join, at the cost it has
+  // sorted: a sorter holds a row, so w_ab's fetches each, 2, and the full
+  // scan, first of equals, is kept. Sorted, it holds 0.2 rows against 1:
+  // 2 + 0.2 lookups + 0.2 x (1.5 + a lookup again).
+  auto g = plan_sql(cat, "SELECT w.k FROM w, t WHERE w.a = $1 AND t.id = w.k ORDER BY w.k, w.b", {{"w", 2}, {"t", 10}});
+  INFO(g.source);
+  CHECK(has(g, "bc_sorter_open"));
+  CHECK(has(g, "bc_scan_open(cx, " + table + ", lo, hi, BC_SCAN_FORWARD)"));
+  CHECK(g.cost == Catch::Approx(2 + 0.2 + 0.2 * 2.5));
+}
+
+TEST_CASE("search: crossing() takes no threshold where two costs cross more than once", "[sql][search][choice]") {
+  auto first = [](double x) { return x; };
+  // Once: the first costs more from 6.
+  CHECK(crossing(first, [](double) { return 5.0; }, 1000) == 6);
+  // Three times: past 5, under 2x from 10, past 50 from 51, as a sort's cost
+  // and a clamp's can. No count picks either: no choice point.
+  auto twice = [](double x) { return x < 10 ? 5.0 : x < 100 ? 2 * x : 50.0; };
+  CHECK(crossing(first, twice, 1000) == std::nullopt);
+  // Where it ends below the first, or starts above it: none either.
+  CHECK(crossing(first, [](double) { return 0.5; }, 1000) == std::nullopt);
+  CHECK(crossing(first, [](double x) { return 2 * x; }, 1000) == std::nullopt);
 }

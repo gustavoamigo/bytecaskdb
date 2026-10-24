@@ -42,6 +42,8 @@ struct KeyBound {
   Kind kind{Kind::Open};
   std::optional<Expr> value;  // Value
   bool successor{false};
+
+  friend auto operator==(const KeyBound&, const KeyBound&) -> bool = default;
 };
 
 struct Range {
@@ -275,23 +277,6 @@ namespace {
 
 [[noreturn]] void broken(const std::string& rule) { throw std::logic_error{"physical plan: " + rule}; }
 
-// Whether two expressions are the same: kind, operands and values.
-auto same(const Expr& a, const Expr& b) -> bool {
-  if (a.kind != b.kind || a.param != b.param || a.constant != b.constant || !(a.col == b.col) || a.op != b.op ||
-      a.args.size() != b.args.size()) {
-    return false;
-  }
-  for (std::size_t i = 0; i < a.args.size(); ++i) {
-    if (!same(a.args[i], b.args[i])) return false;
-  }
-  return true;
-}
-
-auto same(const KeyBound& a, const KeyBound& b) -> bool {
-  return a.kind == b.kind && a.successor == b.successor && a.value.has_value() == b.value.has_value() &&
-         (!a.value || same(*a.value, *b.value));
-}
-
 class Checker {
 public:
   explicit Checker(const Plan& p) : p_{p} {}
@@ -300,8 +285,20 @@ public:
     if (p_.constants.empty()) broken("a plan with no constants");
     if (!p_.root) broken("a plan with no operator");
     for (auto n : p_.null_checks) param(n);
-    covering_tables(*p_.root, covering_);
-    node(*p_.root, nullptr);
+    // Each combination of the choice points' branches is checked as the plan
+    // it runs: what one branch's covering scan reads from a key says nothing
+    // of the other's.
+    std::vector<const Choice*> all;
+    each_choice(*p_.root, all);
+    for (std::uint64_t pick = 0; pick < (std::uint64_t{1} << all.size()); ++pick) {
+      second_.clear();
+      for (std::size_t i = 0; i < all.size(); ++i) {
+        if ((pick >> i & 1) != 0) second_.push_back(all[i]);
+      }
+      covering_.clear();
+      covering_tables(*p_.root);
+      node(*p_.root, nullptr);
+    }
   }
 
 private:
@@ -441,24 +438,50 @@ private:
     return {0, std::nullopt};
   }
 
-  // The tables whose rows come from a covering scan's key, not a row.
-  static void covering_tables(const Node& n, std::vector<std::uint32_t>& out) {
-    if (const auto* s = scan_below(n); s != nullptr && s->covering) out.push_back(s->table);
+  // Every choice point under n, outer first.
+  static void each_choice(const Node& n, std::vector<const Choice*>& out) {
+    std::visit(
+        [&](const auto& op) {
+          using T = std::decay_t<decltype(op)>;
+          if constexpr (std::is_same_v<T, Choice>) {
+            out.push_back(&op);
+            each_choice(*op.below, out);
+            each_choice(*op.at_or_above, out);
+          } else if constexpr (std::is_same_v<T, IndexJoin>) {
+            each_choice(*op.outer, out);
+          } else if constexpr (std::is_same_v<T, NestedLoop>) {
+            each_choice(*op.outer, out);
+            each_choice(*op.inner, out);
+          } else if constexpr (requires { op.input; }) {
+            each_choice(*op.input, out);
+          }
+        },
+        n.op);
+  }
+
+  // The branch of a choice point the combination being checked takes.
+  auto taken(const Choice& c) const -> const Node& {
+    return std::ranges::find(second_, &c) == second_.end() ? *c.below : *c.at_or_above;
+  }
+
+  // The tables whose rows come from a covering scan's key, not a row, in the
+  // branches taken.
+  void covering_tables(const Node& n) {
+    if (const auto* s = scan_below(n); s != nullptr && s->covering) covering_.push_back(s->table);
     std::visit(
         [&](const auto& op) {
           using T = std::decay_t<decltype(op)>;
           if constexpr (std::is_same_v<T, MinFirstEntry>) {
-            if (op.scan.covering) out.push_back(op.scan.table);
+            if (op.scan.covering) covering_.push_back(op.scan.table);
           } else if constexpr (std::is_same_v<T, IndexJoin>) {
-            covering_tables(*op.outer, out);
+            covering_tables(*op.outer);
           } else if constexpr (std::is_same_v<T, NestedLoop>) {
-            covering_tables(*op.outer, out);
-            covering_tables(*op.inner, out);
+            covering_tables(*op.outer);
+            covering_tables(*op.inner);
           } else if constexpr (std::is_same_v<T, Choice>) {
-            covering_tables(*op.below, out);
-            covering_tables(*op.at_or_above, out);
+            covering_tables(taken(op));
           } else if constexpr (requires { op.input; }) {
-            covering_tables(*op.input, out);
+            covering_tables(*op.input);
           }
         },
         n.op);
@@ -493,11 +516,10 @@ private:
       const auto* a = std::get_if<Range>(&c.counted.rest);
       const auto* b = std::get_if<Range>(&first.rest);
       if (a == nullptr || b == nullptr) return a == b;
-      return same(a->lo, b->lo) && same(a->hi, b->hi);
+      return a->lo == b->lo && a->hi == b->hi;
     };
-    auto same_prefix = c.counted.prefix.size() == first.prefix.size() &&
-                       std::ranges::equal(c.counted.prefix, first.prefix, [](const Expr& a, const Expr& b) { return same(a, b); });
-    if (c.counted.object != first.object || !same_prefix || c.counted.reverse != first.reverse || !same_range()) {
+    if (c.counted.object != first.object || c.counted.prefix != first.prefix || c.counted.reverse != first.reverse ||
+        !same_range()) {
       broken("a choice point that counts another range than its first plan's");
     }
   }
@@ -556,8 +578,7 @@ private:
               broken("a choice point whose plans read another table than the one counted");
             }
             counts_first(op, *first, split_below(*op.below));
-            node(*op.below, &n);
-            node(*op.at_or_above, &n);
+            node(taken(op), &n);
           } else if constexpr (std::is_same_v<T, Filter>) {
             for (const auto& c : op.conjuncts) {
               if (c.kind != Expr::Kind::Compare) continue;
@@ -616,7 +637,8 @@ private:
   }
 
   const Plan& p_;
-  std::vector<std::uint32_t> covering_;  // every table a covering scan reads, in any plan of a choice point
+  std::vector<const Choice*> second_;    // the choice points whose second plan is taken
+  std::vector<std::uint32_t> covering_;  // every table a covering scan reads, in the branches taken
 };
 
 }  // namespace
