@@ -315,11 +315,11 @@ TEST_CASE("embedded API: compatibility decides which cached plans recompile", "[
   // DROP INDEX recompiles the plans that scan it, which then have no plan;
   // the write plans keep running, uncompiled.
   (void)db->execute("DROP INDEX t_by_name");
-  CHECK_THROWS_AS(db->execute(by_name, {bytes("a"), bytes("b")}), ast::SqlError);
+  CHECK_THROWS_AS(db->execute(by_name, {bytes("a"), bytes("b")}), FeatureNotSupported);
   // A failed recompile keeps the statement's old plan whole and still
   // incompatible: the next execute tries again and fails the same way,
   // never running the old code (ASan checks the schema ref it reads).
-  CHECK_THROWS_AS(db->execute(by_name, {bytes("a"), bytes("b")}), ast::SqlError);
+  CHECK_THROWS_AS(db->execute(by_name, {bytes("a"), bytes("b")}), FeatureNotSupported);
   CHECK(by_name.plan_source().find("IDX_3") != std::string::npos);
   CHECK(db->execute(insert, {i(4), bytes("date"), i(40)}).affected == 1);
   CHECK(db->execute(by_id, {i(4)}).rows == Grid{{i(4), i(40)}});
@@ -1025,6 +1025,8 @@ TEST_CASE("embedded API: sqlstate reports PostgreSQL's SQLSTATE for each error",
   CHECK(state([&] { (void)db->execute("INSERT INTO s VALUES ($1, $2)", {i(2), kNull}); }) == "23502");
   CHECK(state([&] { (void)db->execute("INSERT INTO s VALUES ($1, $2)", {i(3), i(1 << 16)}); }) == "22003");
   CHECK(state([&] { (void)db->execute("SELEC 1"); }) == "42601");
+  // The planner's refusal: a statement in the subset it can't plan.
+  CHECK(state([&] { (void)db->execute("SELECT k FROM s WHERE n = $1", {i(1)}); }) == "0A000");
   CHECK(state([&] { (void)db->execute("CREATE TABLE s (k BIGINT PRIMARY KEY)"); }) == "42P07");
   CHECK(state([&] { (void)db->execute("DROP TABLE nope"); }) == "42P01");
   CHECK(state([&] { (void)db->execute("SELECT n FROM s WHERE k = $1", {}); }) == "08P01");

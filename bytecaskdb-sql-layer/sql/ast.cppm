@@ -34,6 +34,17 @@ private:
   std::int32_t pos_;
 };
 
+// A statement the layer does not support where it was given, the API's
+// FeatureNotSupported (api/database.cppm): SQLSTATE 0A000. Here, below the
+// planner, so the planner can refuse with it.
+class FeatureNotSupported : public std::logic_error {
+public:
+  using std::logic_error::logic_error;
+  FeatureNotSupported(const FeatureNotSupported&) = default;
+  FeatureNotSupported& operator=(const FeatureNotSupported&) = default;
+  ~FeatureNotSupported() override;  // out of line: anchors the vtable (-Wweak-vtables)
+};
+
 // A select-list, SET or comparison operand: a column, a parameter, an
 // integer literal, a sum or difference of two, or an aggregate: COUNT(*),
 // COUNT([DISTINCT] column), SUM(column) or MIN(column).
@@ -172,5 +183,6 @@ using Statement =
 namespace bytecask::sql::ast {
 
 SqlError::~SqlError() = default;
+FeatureNotSupported::~FeatureNotSupported() = default;
 
 }  // namespace bytecask::sql::ast

@@ -119,7 +119,7 @@ SQL's three-valued logic, as PostgreSQL has it:
   the reverse. Today's plans give PostgreSQL's placement for one nullable
   ordered `ASC` index part directly after the equality prefix, by scanning
   its present values and its NULL part as two ranges
-  (`docs/frontend_design.md`, *NULLs in an ordered part*); other nullable
+  (`docs/planner_design.md`, *NULLs in an ordered part*); other nullable
   orders are refused (#533).
 - **A null parameter in a key lookup matches nothing**: `WHERE id = $1`
   with `$1` null returns no rows and `UPDATE`/`DELETE` affect none. The
