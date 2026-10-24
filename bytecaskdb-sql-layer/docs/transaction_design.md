@@ -273,18 +273,24 @@ duplicate.
   `bc_txn_add`, which appends them to the transaction's with its writes, so
   a failed statement leaves none. They count towards the transaction's
   buffer bound. At the check, a claim counts only while the transaction's
-  final writes still put its key or its index entry: a value a later
-  statement moved or deleted away claims nothing. An index claim is taken
+  final writes still put its key, or for an index some entry under its
+  value: a value a later statement moved or deleted away claims nothing. An index claim is taken
   only by another row's entry: two updates of one row to one value conflict
-  on the row, 40001, as in PostgreSQL. The same test prunes the guards: a
-  unique check's range guard records the index entry it checked, and the
-  commit submits it only while the final writes still put that entry
-  (`Overlay::puts`). A value a later statement moved or deleted away is
-  free to a concurrent commit, as in PostgreSQL (#537); one moved away and
-  back, or a row kept at its value, keeps its guard. A row re-inserted
-  under the value has its own statement's guard. Dropping a guard admits no
-  lost update or duplicate: the guard protects only a final entry this
+  on the row, 40001, as in PostgreSQL.
+  The same rule prunes the guards: a unique check's range guard covers the
+  value's prefix, and the commit submits it only while the final writes put
+  some entry under that prefix (`Overlay::puts_under`, which decides the
+  index claims too). The test is on the value, not the entry the check
+  recorded: an UPDATE that moves the row's primary key rewrites the entry
+  without checking the value again, and the guard must survive it. A value
+  a later statement moved or deleted away, with no row of the transaction
+  holding it, is free to a concurrent commit, as in PostgreSQL (#537); one
+  moved away and back, or a row kept at its value, keeps its guard. A row
+  re-inserted under the value has its own statement's guard. Dropping a
+  guard admits no lost update or duplicate: it protects only values this
   transaction writes, and the primary-key and row-lock guards are untouched.
+  The pruning depends on `Overlay::puts_under` and the entry-key layout (the
+  index prefix first).
 - **What it costs.** No read on a commit that succeeds: each claim is a
   copy of its key, kept until the commit, and each lock a copy of its key
   and a fingerprint, computed from bytes the statement already holds. On a

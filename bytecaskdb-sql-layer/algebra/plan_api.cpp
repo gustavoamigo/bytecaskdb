@@ -131,9 +131,10 @@ enum class EffectKind { Put, Del, DelRange, GuardUnchanged, GuardRange, GuardPre
 struct Effect {
   EffectKind kind;
   Bytes a, b;
-  // A unique check's range guard: the index entry the statement put. The
-  // guard counts at commit only while the final writes still put it.
-  Bytes unique_entry{};
+  // A unique check's range guard, over the checked value's prefix `a`. It
+  // counts at commit only while the final writes still put an entry under
+  // that prefix (Overlay::puts_under), the rule the insert claims follow.
+  bool unique{false};
 };
 
 [[nodiscard]] auto is_write(const Effect& e) -> bool {
@@ -260,6 +261,19 @@ struct Overlay {
   [[nodiscard]] auto puts(BytesView key) const -> bool {
     auto it = points.find(key);
     return it != points.end() && it->second;
+  }
+
+  // Whether the overlay puts a key that starts with `prefix`: the one test
+  // that decides whether a unique value still counts at commit, for its
+  // claims (conflict_or_duplicate) and its guards (bc_txn_commit). It looks
+  // at the prefix, not the entry: an UPDATE that moves the row's primary key
+  // rewrites the entry (prefix + primary key) without checking the value.
+  // Relies on the entry-key layout, the index prefix first.
+  [[nodiscard]] auto puts_under(BytesView prefix) const -> bool {
+    for (auto it = points.lower_bound(prefix); it != points.end() && has_prefix(it->first, prefix); ++it) {
+      if (it->second) return true;
+    }
+    return false;
   }
 
   // Whether the overlay decides `key`: nullopt if the snapshot does; else
@@ -775,6 +789,9 @@ struct bc_ctx {
 
   void push_effect(EffectKind kind, BytesView a, BytesView b = {}) {
     effects.push_back({kind, Bytes(a.begin(), a.end()), Bytes(b.begin(), b.end())});
+  }
+  void push_unique_guard(BytesView prefix, Bytes&& hi) {
+    effects.push_back({EffectKind::GuardRange, Bytes(prefix.begin(), prefix.end()), std::move(hi), true});
   }
   // For keys the runtime built and no longer needs: moved, not copied.
   void push_effect(EffectKind kind, Bytes&& a, BytesView b = {}) {
@@ -1328,6 +1345,8 @@ auto written_tables(const Catalog& cat, const std::vector<Effect>& effects) -> s
   return false;
 }
 
+// Which claims count depends on Overlay::puts_under and the entry-key layout,
+// as the pruning of the unique guards at bc_txn_commit does.
 // A commit that conflicted: the duplicate it is when the latest committed
 // state has taken one of its claims, the first in their order (BC_FAILED,
 // BC_C_UNIQUE on the claim's table or index), else the conflict. Nothing was
@@ -1337,9 +1356,11 @@ auto written_tables(const Catalog& cat, const std::vector<Effect>& effects) -> s
 // fails at that statement: before each claim, the locks of the statements
 // up to its own are checked, and one whose row changed is the conflict. A
 // row changed back to the same bytes counts as unchanged.
-// A transaction's claim counts while its writes still put the key: one a
-// later statement moved or deleted away claims nothing (`overlay`, null for
-// an execution, whose one statement writes a row once). An index claim is
+// A transaction's claim counts while its writes still put the key, or for an
+// index any entry under its value (Overlay::puts_under, which prunes the
+// unique guards at bc_txn_commit too: change the two together): one a later
+// statement moved or deleted away claims nothing (`overlay`, null for an
+// execution, whose one statement writes a row once). An index claim is
 // taken only by another row's entry: a concurrent update of the same row to
 // the same value is the conflict on that row, 40001.
 [[nodiscard]] auto conflict_or_duplicate(ErrorSink out, bytecask::DB& db, std::span<const Claim> claims,
@@ -1350,7 +1371,10 @@ auto written_tables(const Catalog& cat, const std::vector<Effect>& effects) -> s
     Bytes now;
     std::size_t checked = 0;
     for (const auto& c : claims) {
-      if (overlay != nullptr && !overlay->puts(c.key)) continue;
+      if (overlay != nullptr && !(c.prefix_len ? overlay->puts_under(BytesView{c.key}.first(*c.prefix_len))
+                                               : overlay->puts(c.key))) {
+        continue;
+      }
       for (; checked < c.locks_through; ++checked) {
         const auto& l = locks[checked];
         if (!latest.get({}, l.key, now) || row_fingerprint(now) != l.fingerprint) return BC_CONFLICT;
@@ -1724,8 +1748,13 @@ void lock_row(bc_ctx* cx, BytesView pk, BytesView row) {
 }
 
 // No entry has this unique index prefix in the view, and no earlier write
-// of this execution gave a row it, or BC_C_UNIQUE on the index; the range guard covers the race, since a duplicate is another
-// row's entry, a key this plan does not write.
+// of this execution gave a row it, or BC_C_UNIQUE on the index; the range
+// guard covers the race, since a duplicate is another row's entry, a key
+// this plan does not write.
+// The guard and the claim it records are pruned at commit by
+// Overlay::puts_under (bc_txn_commit, conflict_or_duplicate): they count only
+// while the transaction's final writes put an entry under this prefix. That
+// depends on the entry-key layout, the index prefix first.
 [[nodiscard]] auto unique_free(bc_ctx* cx, const Index& ix, const Entry& entry) -> bool {
   auto prefix = entry.prefix();
   if (!cx->charge()) return false;
@@ -1753,8 +1782,7 @@ void lock_row(bc_ctx* cx, BytesView pk, BytesView row) {
     cx->raise(BC_C_UNIQUE, ix.id);
     return false;
   }
-  auto hi = bytecask::sql::key_successor(prefix);
-  cx->effects.push_back({EffectKind::GuardRange, Bytes(prefix.begin(), prefix.end()), Bytes(hi.begin(), hi.end()), entry.key});
+  cx->push_unique_guard(prefix, bytecask::sql::key_successor(prefix));
   if (claim) cx->claims.push_back({ix.id, entry.key, entry.prefix_len});
   return true;
 }
@@ -2032,6 +2060,10 @@ namespace {
 // hold with the statement's effects in it, without merging them: a vector
 // grows at most to twice what it holds, each effect adds at most one node,
 // and an effect that replaces or erases others only frees.
+// What an effect holds, as the bound before a merge and guard_bytes after it
+// both count it.
+auto effect_bytes(const Effect& e) -> std::uint64_t { return held(e.a.capacity()) + held(e.b.capacity()); }
+
 auto txn_holds(const bc_txn& t, std::size_t more_guards, std::size_t more_claims, std::size_t more_locks,
                std::size_t more_written) -> std::uint64_t {
   auto vec = [](std::size_t cap, std::size_t size, std::size_t more, std::size_t elem) -> std::uint64_t {
@@ -2066,7 +2098,7 @@ bool bc_txn_add(bc_ctx* cx) {
   std::uint64_t pending = 0;
   std::size_t guards = 0;
   for (const auto& e : cx->effects) {
-    pending += held(e.a.capacity()) + held(e.b.capacity()) + kNodeBytes;
+    pending += effect_bytes(e) + kNodeBytes;
     if (!is_write(e)) ++guards;
   }
   for (const auto& c : cx->claims) pending += held(c.key.capacity());
@@ -2093,7 +2125,7 @@ bool bc_txn_add(bc_ctx* cx) {
       case EffectKind::GuardRange:
       case EffectKind::GuardPresent:
       case EffectKind::GuardAbsent:
-        txn->guard_bytes += held(e.a.capacity()) + held(e.b.capacity()) + held(e.unique_entry.capacity());
+        txn->guard_bytes += effect_bytes(e);
         txn->guards.push_back(std::move(e));
         break;
     }
@@ -2165,8 +2197,9 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
   }
   for (const auto& e : txn->guards) {
     // A unique check a later statement made stale guards nothing: the final
-    // writes hold no such entry, as conflict_or_duplicate decides for claims.
-    if (!e.unique_entry.empty() && !ov.puts(e.unique_entry)) continue;
+    // writes hold no entry under its value. The same Overlay::puts_under
+    // decides the claims in conflict_or_duplicate.
+    if (e.unique && !ov.puts_under(e.a)) continue;
     switch (e.kind) {
       case EffectKind::GuardUnchanged: plan.ensure_unchanged(e.a); break;
       case EffectKind::GuardRange: plan.ensure_range_unchanged(e.a, e.b); break;

@@ -86,6 +86,20 @@ void update_w(bc_ctx* cx) {
   bc_emit_count(cx, 1);
 }
 
+// UPDATE w SET id = $2 WHERE id = $1: the primary key moves, the unique b stays
+void move_w(bc_ctx* cx) {
+  bool found = false;
+  bc_view old = bc_get(cx, bc_key_params(cx, kW, 0, 1), &found);
+  if (!found) {
+    bc_emit_count(cx, 0);
+    return;
+  }
+  bc_row r = bc_row_from(cx, kW, old);
+  bc_row_set_param(cx, r, kId, 1);
+  bc_update(cx, kW, old, bc_row_end(cx, r));
+  bc_emit_count(cx, 1);
+}
+
 // DELETE FROM w WHERE id = $1
 void delete_w(bc_ctx* cx) {
   bool found = false;
@@ -754,6 +768,48 @@ TEST_CASE("transactions: a conflict at commit writes nothing", "[sql][txn]") {
   auto got = stored(f);
   CHECK(got.size() == 1);  // a's insert of row 2 went with its update
   CHECK(got[1].c == 20);
+}
+
+// #537: a unique check guards the commit while the final writes still put an
+// entry under its value, whichever row's, not only the entry it checked.
+TEST_CASE("transactions: a unique check guards the commit while the final writes hold its value", "[sql][txn]") {
+  Fixture f;
+  create_w(f);
+  auto row = [](std::int64_t id) {
+    return std::vector<bc_value>{id, bc_value{}, bytes("x"), std::int64_t{1}};
+  };
+  TxnPtr a{f};
+  REQUIRE(stmt(f, a.p, insert_w, row(1)).error == BC_OK);
+  SECTION("a primary key moved with the value kept: a racing insert of the value is the duplicate") {
+    REQUIRE(stmt(f, a.p, move_w, {std::int64_t{1}, std::int64_t{5}}).error == BC_OK);
+    REQUIRE(autocommit(f, insert_w, row(2)) == BC_COMMITTED);
+    CHECK(commit(f, a.p) == BC_FAILED);
+    CHECK(bc_txn_error(a.p) == BC_E_CONSTRAINT);
+    CHECK(bc_txn_error_detail(a.p) == unique_on(kWB));
+    check_indexes_exact(f);
+  }
+  SECTION("the row deleted, the value inserted under another key: still the duplicate") {
+    REQUIRE(stmt(f, a.p, delete_w, {std::int64_t{1}}).error == BC_OK);
+    REQUIRE(stmt(f, a.p, insert_w, row(5)).error == BC_OK);
+    REQUIRE(autocommit(f, insert_w, row(2)) == BC_COMMITTED);
+    CHECK(commit(f, a.p) == BC_FAILED);
+    CHECK(bc_txn_error_detail(a.p) == unique_on(kWB));
+    check_indexes_exact(f);
+  }
+  SECTION("the row deleted: the value is free to a racing commit, and both commit") {
+    REQUIRE(stmt(f, a.p, delete_w, {std::int64_t{1}}).error == BC_OK);
+    REQUIRE(autocommit(f, insert_w, row(2)) == BC_COMMITTED);
+    CHECK(commit(f, a.p) == BC_COMMITTED);
+    CHECK(stored(f).size() == 1);
+    check_indexes_exact(f);
+  }
+  SECTION("the row's value changed: the value is free to a racing commit, and both commit") {
+    REQUIRE(stmt(f, a.p, update_w, {std::int64_t{1}, bc_value{}, bytes("z"), std::int64_t{1}}).error == BC_OK);
+    REQUIRE(autocommit(f, insert_w, row(2)) == BC_COMMITTED);
+    CHECK(commit(f, a.p) == BC_COMMITTED);
+    CHECK(stored(f).size() == 2);
+    check_indexes_exact(f);
+  }
 }
 
 TEST_CASE("transactions: a statement past the buffer bound is BC_E_LIMIT and aborts the transaction",

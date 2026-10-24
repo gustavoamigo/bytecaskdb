@@ -750,6 +750,16 @@ TEST_CASE("embedded API: a key a transaction inserted that a concurrent commit t
     REQUIRE(d);
     CHECK(d->object_id == email_id);
   }
+  SECTION("a value deleted with its row, the same value inserted under another key: 23505") {
+    auto a = db->begin();
+    a.execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{1}, sql_test::bytes("x@y")});
+    a.execute("DELETE FROM person WHERE id = $1", {std::int64_t{1}});
+    a.execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{5}, sql_test::bytes("x@y")});
+    db->execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{2}, sql_test::bytes("x@y")});
+    auto d = duplicate(a);
+    REQUIRE(d);
+    CHECK(d->object_id == email_id);
+  }
   SECTION("a value moved away, then taken by another row of the transaction: that row's check guards it") {
     auto a = db->begin();
     a.execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{1}, sql_test::bytes("x@y")});
