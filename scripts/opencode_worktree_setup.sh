@@ -11,6 +11,12 @@
 # Never fails the worktree creation: OpenCode runs this with `bash -lc` and a
 # non-zero exit would surface as a creation error. Anything it cannot do here
 # is reported and left to the human, with the command to run.
+#
+# That covers every failure inside the script. The one failure a script cannot
+# catch — its own absence at a ref that predates it — is guarded one level up by
+# the `commands.start` wrapper in CONTRIBUTING.md: it runs this script from the
+# worktree checkout when the ref has one, from the main checkout otherwise, and
+# exits 0 either way.
 set -uo pipefail
 
 cd "${OPENCODE_WORKTREE_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}" || exit 0

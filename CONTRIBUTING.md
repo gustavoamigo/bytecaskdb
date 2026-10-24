@@ -48,11 +48,21 @@ sets it once, reading the project ID from the list below:
 
 ```bash
 opencode api get /api/project            # find the entry whose canonical path is this repo
-opencode api patch /api/project/<id> \
-  --data '{"commands":{"start":"scripts/opencode_worktree_setup.sh"}}'
+opencode api patch /api/project/<id> --data \
+  '{"commands":{"start":"s=scripts/opencode_worktree_setup.sh; test -f \"$s\" || s=\"$OPENCODE_WORKTREE_BASE/scripts/opencode_worktree_setup.sh\"; test -f \"$s\" && bash \"$s\"; exit 0"}}'
 ```
 
-Worktrees created before the script existed need it run by hand.
+The value is a wrapper rather than the bare script path because OpenCode runs it
+with `bash -lc` in the new worktree and fails the whole creation on any non-zero
+exit. A worktree checked out at a ref that predates the script makes `bash`
+itself exit 127 — a failure the script cannot catch, since it is not there to
+catch it, and a bare path turns every such worktree into a failed creation. The
+wrapper runs the worktree's own copy when the ref has one, the main checkout's
+(`$OPENCODE_WORKTREE_BASE`) otherwise, and exits 0 either way; the script
+reports what it could not do and leaves it to the human.
+
+A worktree made with plain `git worktree add` gets none of this: run the script
+by hand there.
 
 ## Making a change
 
