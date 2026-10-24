@@ -1287,6 +1287,10 @@ struct bc_ctx {
     push_effect_made(kind, a, a.capacity(), b.size(),
                      [&] { return Effect{kind, std::move(a), Bytes(b.begin(), b.end())}; });
   }
+  void push_effect(EffectKind kind, BytesView a, Bytes&& b) {
+    push_effect_made(kind, a, a.size(), b.capacity(),
+                     [&] { return Effect{kind, Bytes(a.begin(), a.end()), std::move(b)}; });
+  }
   void push_effect(EffectKind kind, Bytes&& a, Bytes&& b) {
     push_effect_made(kind, a, a.capacity(), b.capacity(), [&] { return Effect{kind, std::move(a), std::move(b)}; });
   }
@@ -2410,12 +2414,13 @@ void lock_row(bc_ctx* cx, BytesView pk, BytesView row) {
     return false;
   }
   auto in_snapshot = [&] { return holds_prefix(*cx->base, prefix); };
+  auto end = bytecask::sql::key_successor(prefix);
   // As pk_free: a claim when the snapshot holds the prefix free too.
   auto claim = true;
-  if (cx->overlay != nullptr && cx->overlay->meets(prefix, bytecask::sql::key_successor(prefix))) {
+  if (cx->overlay != nullptr && cx->overlay->meets(prefix, end)) {
     // The overlay holds entries with this prefix, or deleted some: the
     // first entry the view holds at or after it decides, each read charged.
-    ViewEntries entries{*cx->base, cx->overlay, prefix, bytecask::sql::key_successor(prefix), false};
+    ViewEntries entries{*cx->base, cx->overlay, prefix, end, false};
     auto taken = entries.next(cx);
     if (!cx->ok()) return false;
     if (taken) {
@@ -2428,7 +2433,7 @@ void lock_row(bc_ctx* cx, BytesView pk, BytesView row) {
     cx->raise(BC_C_UNIQUE, ix.id);
     return false;
   }
-  cx->push_effect(EffectKind::GuardUniqueRange, prefix, bytecask::sql::key_successor(prefix));
+  cx->push_effect(EffectKind::GuardUniqueRange, prefix, std::move(end));
   return !claim || cx->push_claim(ix.id, entry.key, entry.prefix_len);
 }
 
@@ -2820,6 +2825,8 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
   // The plan copies every write and guard while the overlay still holds
   // them, which a conflict reads back after the submit. Each copy was held
   // to max_bytes with the statement that made it (txn_holds): no check here.
+  // A unique guard pruned here stays in txn->held: the count only
+  // overstates what the plan copies, so it stays a bound.
   // The ranges before the points: a point is newer than any range over it,
   // and the engine applies a plan's operations in order.
   bytecask::WritePlan plan{std::move(*txn->snap)};

@@ -217,13 +217,18 @@ void id_unset(bc_ctx* cx) {
 TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an exception into the plan",
           "[sql][algebra][alloc]") {
   if (!bytecask::testing::kAllocFaultsAvailable) SKIP("operator new is the sanitizer's in this build");
-  Fixture f;
-  for (std::int64_t i = 1; i <= 3; ++i) {
-    auto ps = params({i, bytes("n" + std::to_string(i)), i * 10});
+  auto seed = [](Fixture& f, std::int64_t id, std::int64_t qty) {
+    auto ps = params({id, bytes("n" + std::to_string(id)), qty});
     SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
     auto ref = sr.get();
     REQUIRE(bc_execute(f.cx, insert_row, &ref, &ps, {}, false, 0) == BC_COMMITTED);
-  }
+  };
+  Fixture f;
+  for (std::int64_t i = 1; i <= 3; ++i) seed(f, i, i * 10);
+  // Its own fixture, so the sort and join cases keep their three rows: one
+  // row at the BIGINT maximum, so qty + 1, the constant form, overflows.
+  Fixture at_max;
+  seed(at_max, 4, std::numeric_limits<std::int64_t>::max());
   struct Case {
     const char* name;
     bc_plan_fn plan;
@@ -271,7 +276,7 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
        {PhysType::I64, PhysType::I64, PhysType::I64},
        BC_OK,
        {{std::int64_t{1}, std::int64_t{10}, std::int64_t{10}}, {std::int64_t{2}, std::int64_t{50}, std::int64_t{30}}}},
-      {"update, qty leaves BIGINT",
+      {"update, qty + $2 leaves BIGINT",
        add_to_qty,
        {std::int64_t{3}, std::numeric_limits<std::int64_t>::max()},
        {},
@@ -280,7 +285,10 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
       {"bc_row_set_null", null_id_set, {}, {}, BC_E_CONSTRAINT},
       {"bc_row_end, a column unset", id_unset, {}, {}, BC_E_CONSTRAINT},
   };
-  for (const auto& c : cases) {
+  const std::vector<Case> at_max_cases{
+      {"update, qty + 1 leaves BIGINT", bump_qty, {std::int64_t{4}}, {}, BC_E_CONSTRAINT},
+  };
+  auto fail_each_allocation = [](Fixture& f, const Case& c) {
     INFO(c.name);
     auto failed = 0;
     for (long nth = 1;; ++nth) {
@@ -321,7 +329,9 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
       ++failed;
     }
     CHECK(failed > 0);  // the plan allocates, and each allocation was failed once
-  }
+  };
+  for (const auto& c : cases) fail_each_allocation(f, c);
+  for (const auto& c : at_max_cases) fail_each_allocation(at_max, c);
 }
 
 TEST_CASE("plan API: a commit whose allocations fail is never BC_COMMITTED with an error set",

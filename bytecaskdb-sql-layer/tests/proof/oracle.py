@@ -36,15 +36,19 @@ RANGE_STATES = frozenset(state for _, state in bytecask_sql._range_messages())
 # A statement in a transaction an earlier statement failed in.
 ABORTED = "25P02"
 
-# A statement the layer does not support: the planner's refusal among them,
-# its message starting "no plan:" (planner_design.md, *What the search
-# refuses*).
+# A statement the layer does not support.
 NOT_SUPPORTED = "0A000"
+
+# The kind of the planner's refusal (planner_design.md, *What the search
+# refuses*): the layer raises bytecask_sql.FeatureNotSupported for it.
+# PostgreSQL never reports this kind, so a planner refusal never agrees
+# with PostgreSQL, whatever PostgreSQL did with the statement.
+NO_PLAN = "no plan"
 
 
 def is_no_plan(out: "Outcome") -> bool:
     """Whether the layer refused the statement as the planner refuses one."""
-    return out.error == "refused" and out.detail.startswith("no plan:") and out.sqlstate == NOT_SUPPORTED
+    return out.no_plan
 
 
 # The SQLSTATEs of the binder's and the catalog's refusals that PostgreSQL
@@ -60,24 +64,21 @@ BINDER_STATES = frozenset(
     }
 )
 
-# 0A000 is also two of the layer's own rules, which PostgreSQL does not have:
-# a table needs a PRIMARY KEY, and the planner refuses a statement it finds
-# no plan for (is_no_plan). The state alone cannot tell them from FOR UPDATE
-# with an aggregate, so the statement and the message do: a CREATE TABLE
-# refused with 0A000, or a refusal whose message starts "no plan:", is the
-# layer's rule, kind "refused", never compared.
-def layer_only(state: str, sql: str, message: str) -> bool:
+# 0A000 is also one of the layer's own rules, which PostgreSQL does not
+# have: a table needs a PRIMARY KEY. The state alone cannot tell it from FOR
+# UPDATE with an aggregate, so the statement does: a CREATE TABLE refused
+# with 0A000 is the layer's rule, kind "refused", never compared. The
+# planner's refusal, also 0A000, is told by its class (run_layer: NO_PLAN).
+def layer_only(state: str, sql: str) -> bool:
     """Whether a refusal with this SQLSTATE is one of the layer's own rules."""
-    if state != NOT_SUPPORTED:
-        return False
-    return sql.lstrip().upper().startswith("CREATE TABLE") or message.startswith("no plan:")
+    return state == NOT_SUPPORTED and sql.lstrip().upper().startswith("CREATE TABLE")
 
 
-def error_kind(state: str, sql: str, message: str = "") -> str:
-    """The comparable kind of a refusal of `sql` with this SQLSTATE and
-    message: the SQLSTATE where both sides name it, "refused" for any other
-    and for one of the layer's own rules (layer_only)."""
-    if layer_only(state, sql, message):
+def error_kind(state: str, sql: str) -> str:
+    """The comparable kind of a refusal of `sql` with this SQLSTATE: the
+    SQLSTATE where both sides name it, "refused" for any other and for one
+    of the layer's own rules (layer_only)."""
+    if layer_only(state, sql):
         return "refused"
     known = state in SQLSTATE.values() or state in RANGE_STATES or state in BINDER_STATES or state == ABORTED
     return state if known else "refused"
@@ -142,11 +143,11 @@ class Outcome:
     """What one statement did: rows and the affected count, or a refusal.
 
     `error` is None when it ran, a SQLSTATE for a constraint both sides
-    name (a constraint's, a binder refusal's: BINDER_STATES), or "refused"
-    for any other error: the layer's other SqlErrors and its own rules (the
-    planner's refusal among them: layer_only), and any other
-    PostgreSQL error. `affected` is the rows an INSERT, UPDATE or
-    DELETE changed, None for any other statement.
+    name (a constraint's, a binder refusal's: BINDER_STATES), NO_PLAN for
+    the planner's refusal, which nothing on PostgreSQL's side equals, or
+    "refused" for any other error: the layer's other SqlErrors and its own
+    rules (layer_only), and any other PostgreSQL error. `affected` is the
+    rows an INSERT, UPDATE or DELETE changed, None for any other statement.
     """
 
     error: str | None = None
@@ -159,6 +160,9 @@ class Outcome:
     # The rows as their text format's bytes, with each column's type OID:
     # what PostgreSQL and the server send. Empty from the embedded layer.
     text: tuple = ()
+    # The layer raised bytecask_sql.FeatureNotSupported: the planner found
+    # no plan. Set by run_layer only.
+    no_plan: bool = False
 
 
 def strict(rows) -> tuple:
@@ -286,8 +290,10 @@ def run_layer(db, sql: str, params=()) -> Outcome:
         if e.constraint is None:
             raise
         return Outcome(error=layer_sqlstate(e), detail=str(e), sqlstate=e.sqlstate)
+    except bytecask_sql.FeatureNotSupported as e:
+        return Outcome(error=NO_PLAN, detail=str(e), sqlstate=e.sqlstate, no_plan=True)
     except bytecask_sql.SqlError as e:
-        return Outcome(error=error_kind(e.sqlstate, sql, str(e)), detail=str(e), sqlstate=e.sqlstate)
+        return Outcome(error=error_kind(e.sqlstate, sql), detail=str(e), sqlstate=e.sqlstate)
     return Outcome(rows=tuple(r["rows"]), affected=r["affected"] if changes_rows(sql) else None)
 
 
@@ -319,7 +325,7 @@ def run_psycopg(conn, text: str, values, sql: str) -> Outcome:
         if not e.sqlstate:
             raise  # no SQLSTATE: not the server refusing the statement
         state = e.sqlstate
-        return Outcome(error=error_kind(state, sql, e.diag.message_primary or ""), detail=f"{state} {e}", sqlstate=state)
+        return Outcome(error=error_kind(state, sql), detail=f"{state} {e}", sqlstate=state)
     return Outcome(rows=tuple(tuple(from_pg(v, oid) for v, oid in zip(row, oids)) for row in rows), affected=affected,
                    text=raw)
 
