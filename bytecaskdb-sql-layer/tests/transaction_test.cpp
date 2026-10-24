@@ -818,6 +818,14 @@ TEST_CASE("transactions: a unique check guards the commit while the final writes
     CHECK(stored(f).size() == 2);
     check_indexes_exact(f);
   }
+  SECTION("the row range-deleted: the value is free to a racing commit, and both commit") {
+    // The racing row is outside the range, which would conflict on its own.
+    REQUIRE(stmt(f, a.p, del_range_w, {std::int64_t{0}, std::int64_t{2}}).error == BC_OK);
+    REQUIRE(autocommit(f, insert_w, row(2)) == BC_COMMITTED);
+    CHECK(commit(f, a.p) == BC_COMMITTED);
+    CHECK(stored(f).size() == 1);
+    check_indexes_exact(f);
+  }
   SECTION("the row's value changed: the value is free to a racing commit, and both commit") {
     REQUIRE(stmt(f, a.p, update_w, {std::int64_t{1}, bc_value{}, bytes("z"), std::int64_t{1}}).error == BC_OK);
     REQUIRE(autocommit(f, insert_w, row(2)) == BC_COMMITTED);

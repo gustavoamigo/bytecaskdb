@@ -2202,7 +2202,11 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
   // guard-only plan and writes nothing.
   // Guards a later statement made stale are pruned first: a transaction left
   // with none of them and no write sends the engine nothing.
-  if (ov.empty() && std::ranges::none_of(txn->guards, [&](const Effect& e) { return guard_counts(e, ov); })) {
+  std::vector<const Effect*> guards;
+  for (const auto& e : txn->guards) {
+    if (guard_counts(e, ov)) guards.push_back(&e);
+  }
+  if (ov.empty() && guards.empty()) {
     txn->snap.reset();
     return BC_COMMITTED;
   }
@@ -2218,14 +2222,13 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
       plan.del(key);
     }
   }
-  for (const auto& e : txn->guards) {
-    if (!guard_counts(e, ov)) continue;
-    switch (e.kind) {
-      case EffectKind::GuardUnchanged: plan.ensure_unchanged(e.a); break;
+  for (const auto* g : guards) {
+    switch (g->kind) {
+      case EffectKind::GuardUnchanged: plan.ensure_unchanged(g->a); break;
       case EffectKind::GuardRange:
-      case EffectKind::GuardUniqueRange: plan.ensure_range_unchanged(e.a, e.b); break;
-      case EffectKind::GuardPresent: plan.ensure_present(e.a); break;
-      case EffectKind::GuardAbsent: plan.ensure_absent(e.a); break;
+      case EffectKind::GuardUniqueRange: plan.ensure_range_unchanged(g->a, g->b); break;
+      case EffectKind::GuardPresent: plan.ensure_present(g->a); break;
+      case EffectKind::GuardAbsent: plan.ensure_absent(g->a); break;
       case EffectKind::Put:
       case EffectKind::Del:
       case EffectKind::DelRange: break;  // never kept as guards
