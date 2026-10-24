@@ -349,6 +349,8 @@ public:
 
   void plan(const physical::Node& root) {
     print_computed(w_);
+    // LIMIT 0 returns nothing, so nothing is read.
+    if (limit_zero(root)) return;
     no_rows_ = no_rows(root);
     if (!w_.p().null_checks.empty()) return_if_null(w_, w_.p().null_checks, no_rows_);
     produce(root, [] {});
@@ -382,6 +384,25 @@ private:
             return op.emits ? empty_row(Expr::Fn::Min) : std::vector<std::string>{};
           } else {
             return {};
+          }
+        },
+        root.op);
+  }
+
+  // Whether the root is under LIMIT 0: rows emitted under it, or an
+  // aggregate's row that is not emitted.
+  static auto limit_zero(const physical::Node& root) -> bool {
+    return std::visit(
+        [](const auto& op) -> bool {
+          using T = std::decay_t<decltype(op)>;
+          if constexpr (std::is_same_v<T, physical::Emit>) {
+            const auto* l = std::get_if<physical::Limit>(&op.input->op);
+            return l != nullptr && l->n == 0;
+          } else if constexpr (std::is_same_v<T, physical::Aggregate> || std::is_same_v<T, physical::CountRange> ||
+                               std::is_same_v<T, physical::MinFirstEntry>) {
+            return !op.emits;
+          } else {
+            return false;
           }
         },
         root.op);
@@ -741,13 +762,15 @@ private:
   }
 
   // A hash join's key for the row in hand, `hk<i>`, from each column's value:
-  // after a NULL in any of them, the next row, since `=` never holds for NULL.
+  // after a NULL in any of them, the next row, since `=` never holds for NULL;
+  // a column a sort below tested already is not tested again.
   // A value is a key part of its physical type, so equal values give equal
   // bytes on both sides, read from a row or from a covering scan's entry.
+  auto tested(const ColumnRef& c) const -> bool { return std::ranges::find(not_null_, c) != not_null_.end(); }
   auto hash_key(const std::string& i, const std::vector<ColumnRef>& cols) -> std::string {
     std::vector<ColumnRef> checked;
     for (const auto& c : cols) {
-      if (!c.nullable || std::ranges::find(checked, c) != checked.end()) continue;
+      if (!c.nullable || tested(c) || std::ranges::find(checked, c) != checked.end()) continue;
       miss(col_null(c));
       checked.push_back(c);
     }
@@ -797,39 +820,68 @@ private:
     });
   }
 
-  // A pipeline breaker: each row of its input added to a sorter, keyed by
+  // A pipeline breaker: each row of its input added to sorter s<i>, keyed by
   // bc_sort_key_* from the rows in hand, then a loop over the sorter in sort
-  // order, which binds the row it held. The rows read once before the
-  // input's loop stay in hand; a LIMIT's counter is the sorter loop's.
+  // order, which binds the row it held as p<i>. A sort of several loops has
+  // a sorter per loop, each given the same key and its loop's row, numbered
+  // on from i: the loop steps the first by bc_sorter_next and reads each
+  // other's entry at the same place, r<j>, by bc_sorter_nth. A row NULL in a
+  // `not_null` column is not added. The rows read once before the input's
+  // first loop stay in hand; a LIMIT's counter is the sorter loop's.
   void produce(const physical::Sort& s, const Consume& k) {
-    const auto i = std::to_string(sorts_++);
-    const auto sorter = "s" + i;
-    const auto held = "p" + i;
-    w_.line("bc_sorter " + sorter + " = bc_sorter_open(cx, " + std::to_string(s.keep) + ");");
+    std::vector<std::string> ids;
+    for (std::size_t j = 0; j < s.payloads.size(); ++j) ids.push_back(std::to_string(sorts_++));
+    for (const auto& i : ids) {
+      w_.line("bc_sorter s" + i + " = bc_sorter_open(cx, " + std::to_string(s.keep) + ");");
+    }
     auto guard = std::exchange(guard_, "");
     std::vector<Binding> in_hand;
     produce(*s.input, [&] {
+      for (const auto& c : s.not_null) {
+        if (c.nullable && !tested(c)) miss(col_null(c));
+      }
       w_.line("bc_sort_key sk = bc_sort_key_begin(cx);");
       for (const auto& part : s.keys) {
         w_.line("bc_sort_key_col(cx, sk, " + row_of(part.col) + ", " + w_.col(part.col) + ", " +
                 (part.desc ? "BC_SORT_DESC" : "BC_SORT_ASC") + ", " +
                 (part.nulls_first ? "BC_SORT_NULLS_FIRST" : "BC_SORT_NULLS_LAST") + ");");
       }
-      w_.line("bc_sorter_add(cx, " + sorter + ", bc_sort_key_end(cx, sk), " + binding(s.payload).row + ");");
-      // The rows in hand up to the loop's, whose row the sorter holds.
+      auto key = std::string{"bc_sort_key_end(cx, sk)"};
+      if (ids.size() > 1) {
+        w_.line("bc_view skv = " + key + ";");
+        key = "skv";
+      }
+      for (std::size_t j = 0; j < ids.size(); ++j) {
+        w_.line("bc_sorter_add(cx, s" + ids[j] + ", " + key + ", " + binding(s.payloads[j]).row + ");");
+      }
+      // The rows in hand before the first loop, and each loop's, whose row a
+      // sorter holds.
       in_hand.clear();
+      auto looped = false;
       for (const auto& b : rows_) {
-        in_hand.push_back(b);
-        if (b.table == s.payload) break;
+        auto held = std::ranges::find(s.payloads, b.table) != s.payloads.end();
+        looped = looped || held;
+        if (!looped || held) in_hand.push_back(b);
       }
     });
     guard_ = guard;
-    in_hand.back().row = held;
-    w_.line("bc_view " + held + " = bc_empty(cx);");
-    w_.open("while (" + guard_ + "bc_sorter_next(cx, " + sorter + ", &" + held + "))");
+    for (auto& b : in_hand) {
+      auto at = std::ranges::find(s.payloads, b.table);
+      if (at != s.payloads.end()) b.row = "p" + ids[static_cast<std::size_t>(at - s.payloads.begin())];
+    }
+    w_.line("bc_view p" + ids[0] + " = bc_empty(cx);");
+    for (std::size_t j = 1; j < ids.size(); ++j) w_.line("int64_t r" + ids[j] + " = 0;");
+    w_.open("while (" + guard_ + "bc_sorter_next(cx, s" + ids[0] + ", &p" + ids[0] + "))");
+    for (std::size_t j = 1; j < ids.size(); ++j) {
+      w_.line("bc_view p" + ids[j] + " = bc_sorter_nth(cx, s" + ids[j] + ", r" + ids[j] + ");");
+      w_.line("++r" + ids[j] + ";");
+    }
     auto outer_rows = std::exchange(rows_, in_hand);
     auto outer = std::exchange(loop_, true);
+    const auto tested_before = not_null_.size();
+    not_null_.insert(not_null_.end(), s.not_null.begin(), s.not_null.end());
     k();
+    not_null_.resize(tested_before);
     loop_ = outer;
     rows_ = outer_rows;
     w_.close();
@@ -849,10 +901,10 @@ private:
   }
 
   // Over a loop, a counter the loop's condition checks; over a single row,
-  // the row or, for LIMIT 0, nothing.
+  // the row. LIMIT 0 prints nothing (limit_zero).
   void produce(const physical::Limit& l, const Consume& k) {
     if (!loops(*l.input)) {
-      produce(*l.input, l.n > 0 ? k : Consume{[] {}});
+      produce(*l.input, k);
       return;
     }
     w_.line("int64_t n = 0;");
@@ -1127,6 +1179,9 @@ private:
   int sorts_{0};                 // the sorts printed: each into sorter s<i>, its row p<i>
   int hashes_{0};                // the hash joins printed: each into table h<i>, its row b<i>
   std::string cursor_{"c"};      // the cursor a scan opens
+  // The columns a sort below the rows in hand tested for NULL before it added
+  // their row: they hold none.
+  std::vector<ColumnRef> not_null_;
   // Each choice point's first plan's scan, and the counted range, lo<i> and
   // hi<i>, it opens on.
   std::map<const physical::Scan*, Counted> counted_;

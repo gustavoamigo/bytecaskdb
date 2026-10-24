@@ -235,38 +235,50 @@ TEST_CASE("physical: a DOUBLE column is never read from a key, wherever codegen 
   refused(plan(node(physical::Aggregate{covering(), min_d, true})), "DOUBLE column read from a key");
 }
 
-TEST_CASE("physical: a sort holds the row of its input's one loop, keyed by columns in hand", "[sql][physical]") {
+TEST_CASE("physical: a sort holds the row of each of its input's loops, keyed by columns in hand", "[sql][physical]") {
   auto by_id = std::vector<physical::SortPart>{{kId, true, true}};
-  auto sort = [&](physical::NodePtr in, std::vector<physical::SortPart> keys, std::int64_t keep, std::uint32_t payload) {
-    return emit(node(physical::Sort{std::move(in), std::move(keys), keep, payload}));
+  auto sort = [&](physical::NodePtr in, std::vector<physical::SortPart> keys, std::int64_t keep,
+                  std::vector<std::uint32_t> payloads, std::vector<logical::ColumnRef> not_null = {}) {
+    return emit(node(physical::Sort{std::move(in), std::move(keys), keep, std::move(payloads), std::move(not_null)}));
   };
-  CHECK(refusal(plan(sort(node(scan({p(0)}, {})), by_id, 0, 1))).empty());
-  CHECK(refusal(plan(sort(node(scan({p(0)}, {})), by_id, 5, 1))).empty());
-  refused(plan(sort(node(scan({p(0)}, {})), {}, 0, 1)), "a sort with no key");
-  refused(plan(sort(node(scan({p(0)}, {})), by_id, -1, 1)), "negative number of rows");
-  refused(plan(sort(get({p(0)}), by_id, 0, 1)), "input is not one loop");
-  refused(plan(sort(node(scan({p(0)}, {})), by_id, 0, 2)), "another row than its loop's");
-  refused(plan(sort(node(scan({p(0)}, {}, true)), by_id, 0, 1)), "a sort over a covering scan");
+  CHECK(refusal(plan(sort(node(scan({p(0)}, {})), by_id, 0, {1}))).empty());
+  CHECK(refusal(plan(sort(node(scan({p(0)}, {})), by_id, 5, {1}))).empty());
+  refused(plan(sort(node(scan({p(0)}, {})), {}, 0, {1})), "a sort with no key");
+  refused(plan(sort(node(scan({p(0)}, {})), by_id, -1, {1})), "negative number of rows");
+  refused(plan(sort(get({p(0)}), by_id, 0, {1})), "sorters hold other rows than its loops'");
+  refused(plan(sort(node(scan({p(0)}, {})), by_id, 0, {2})), "sorters hold other rows than its loops'");
+  refused(plan(sort(node(scan({p(0)}, {}, true)), by_id, 0, {1})), "a sort over a covering scan");
   // A choice by the budget: the sort in its first plan, a covering scan in
   // the order in its second. Each plan is checked as it runs, so the second's
   // key is no reason to refuse the first's sort; a sort over a covering scan
   // in its own branch still is.
   auto by_budget = [&](bool sort_covers) {
-    auto sorted = node(physical::Sort{node(scan({p(0)}, {}, sort_covers)), by_id, 0, 1});
+    auto sorted = node(physical::Sort{node(scan({p(0)}, {}, sort_covers)), by_id, 0, {1}, {}});
     auto in_order = node(physical::Scan{1, 5, {p(1)}, {}, false, true, false});
     return emit(node(physical::Choice{scan({p(0)}, {}, sort_covers), 9, std::move(sorted), std::move(in_order)}));
   };
   CHECK(refusal(plan(by_budget(false))).empty());
   refused(plan(by_budget(true)), "a sort over a covering scan");
-  refused(plan(sort(node(scan({p(0)}, {})), {{{2, 0, PhysType::I64, false}, false, false}}, 0, 1)),
+  refused(plan(sort(node(scan({p(0)}, {})), {{{2, 0, PhysType::I64, false}, false, false}}, 0, {1})),
           "a sort key outside its input's tables");
-  // Two loops, one inside the other: a sorter holds one row per entry.
-  auto inner = node(physical::Scan{2, 4, {p(1)}, {}, false, false, false});
-  refused(plan(sort(node(physical::NestedLoop{node(scan({p(0)}, {})), std::move(inner)}), by_id, 0, 2)),
-          "input is not one loop");
+  // Two loops, one inside the other: a sorter per loop, outer first.
+  auto two_loops = [] {
+    return node(physical::NestedLoop{node(scan({p(0)}, {})), node(physical::Scan{2, 4, {p(1)}, {}, false, false, false})});
+  };
+  CHECK(refusal(plan(sort(two_loops(), by_id, 0, {1, 2}))).empty());
+  refused(plan(sort(two_loops(), by_id, 0, {2})), "sorters hold other rows than its loops'");
+  refused(plan(sort(two_loops(), by_id, 0, {2, 1})), "sorters hold other rows than its loops'");
+  refused(plan(sort(node(physical::NestedLoop{node(scan({p(0)}, {})),
+                                              node(physical::Scan{2, 4, {p(1)}, {}, false, true, false})}),
+                    by_id, 0, {1, 2})),
+          "a sort over a covering scan");
   // Under one row read once, the inner scan's loop.
   auto once = node(physical::NestedLoop{get({p(0)}), node(physical::Scan{2, 4, {p(1)}, {}, false, false, false})});
-  CHECK(refusal(plan(sort(std::move(once), by_id, 0, 2))).empty());
+  CHECK(refusal(plan(sort(std::move(once), by_id, 0, {2}))).empty());
+  // A NULL test before a row is added reads a column of its input's tables.
+  CHECK(refusal(plan(sort(node(scan({p(0)}, {})), by_id, 0, {1}, {kId}))).empty());
+  refused(plan(sort(node(scan({p(0)}, {})), by_id, 0, {1}, {{2, 0, PhysType::I64, true}})),
+          "a sort's NULL test outside its input's tables");
 }
 
 TEST_CASE("physical: a hash join holds the row of its build side's one loop, keyed by columns of one type",
