@@ -317,15 +317,25 @@ TEST_CASE("embedded API: compatibility decides which cached plans recompile", "[
   CHECK(ids(db->execute("SELECT id FROM t WHERE qty >= $1", {i(15)})) == std::vector<std::int64_t>{2, 3});
   compiled = db->compilations();
 
-  // DROP INDEX recompiles the plans that scan it, which then have no plan;
-  // the write plans keep running, uncompiled.
+  // DROP INDEX recompiles the plans that scan it: by name, a full scan now.
   (void)db->execute("DROP INDEX t_by_name");
-  CHECK_THROWS_AS(db->execute(by_name, {bytes("a"), bytes("b")}), FeatureNotSupported);
+  CHECK(ids(db->execute(by_name, {bytes("a"), bytes("b")})) == std::vector<std::int64_t>{1});
+  CHECK(by_name.plan_source().find("IDX_3") == std::string::npos);
+  // One that then has no plan, a filter on a DOUBLE only its index took, is
+  // refused; the write plans keep running, uncompiled.
+  (void)db->execute("ALTER TABLE t ADD COLUMN d DOUBLE PRECISION DEFAULT 1.5");
+  (void)db->execute("CREATE INDEX t_by_d ON t (d)");
+  const auto& by_d = db->prepare("SELECT id FROM t WHERE d >= $1");
+  CHECK(ids(db->execute(by_d, {Value{1.0}})) == std::vector<std::int64_t>{1, 2, 3});
+  const auto by_d_index = "IDX_" + std::to_string(db->catalog()->index("t_by_d").second->id);
+  compiled = db->compilations();
+  (void)db->execute("DROP INDEX t_by_d");
+  CHECK_THROWS_AS(db->execute(by_d, {Value{1.0}}), FeatureNotSupported);
   // A failed recompile keeps the statement's old plan whole and still
   // incompatible: the next execute tries again and fails the same way,
   // never running the old code (ASan checks the schema ref it reads).
-  CHECK_THROWS_AS(db->execute(by_name, {bytes("a"), bytes("b")}), FeatureNotSupported);
-  CHECK(by_name.plan_source().find("IDX_3") != std::string::npos);
+  CHECK_THROWS_AS(db->execute(by_d, {Value{1.0}}), FeatureNotSupported);
+  CHECK(by_d.plan_source().find(by_d_index) != std::string::npos);
   CHECK(db->execute(insert, {i(4), bytes("date"), i(40)}).affected == 1);
   CHECK(db->execute(by_id, {i(4)}).rows == Grid{{i(4), i(40)}});
   CHECK(db->compilations() == compiled);
@@ -1030,8 +1040,10 @@ TEST_CASE("embedded API: sqlstate reports PostgreSQL's SQLSTATE for each error",
   CHECK(state([&] { (void)db->execute("INSERT INTO s VALUES ($1, $2)", {i(2), kNull}); }) == "23502");
   CHECK(state([&] { (void)db->execute("INSERT INTO s VALUES ($1, $2)", {i(3), i(1 << 16)}); }) == "22003");
   CHECK(state([&] { (void)db->execute("SELEC 1"); }) == "42601");
-  // The planner's refusal: a statement in the subset it can't plan.
-  CHECK(state([&] { (void)db->execute("SELECT k FROM s WHERE n = $1", {i(1)}); }) == "0A000");
+  // The planner's refusal: a statement in the subset it can't plan, a
+  // filter on a DOUBLE PRECISION column.
+  (void)db->execute("CREATE TABLE sd (k BIGINT PRIMARY KEY, d DOUBLE PRECISION)");
+  CHECK(state([&] { (void)db->execute("SELECT k FROM sd WHERE d < $1", {Value{1.0}}); }) == "0A000");
   CHECK(state([&] { (void)db->execute("CREATE TABLE s (k BIGINT PRIMARY KEY)"); }) == "42P07");
   CHECK(state([&] { (void)db->execute("DROP TABLE nope"); }) == "42P01");
   CHECK(state([&] { (void)db->execute("SELECT n FROM s WHERE k = $1", {}); }) == "08P01");

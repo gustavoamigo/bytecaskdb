@@ -115,7 +115,12 @@ TEST_CASE("codegen: the other bound forms produce plans; no rule, no plan", "[sq
   CHECK(set.find("bc_row_set_param(cx, r, COL_1_1, 1);\n  bc_update(cx, TBL_1, old, bc_row_end(cx, r));") !=
         std::string::npos);
 
-  CHECK_THROWS_AS(generate(f.cat(), "SELECT id FROM t WHERE qty = $1"), ast::FeatureNotSupported);
+  // Nothing bounds the table: a full scan of its primary key, the conjunct a
+  // filter on each row.
+  auto full = generate(f.cat(), "SELECT id FROM t WHERE qty = $1").source;
+  CHECK(full.find("bc_view lo = bc_empty(cx);\n  bc_view hi = bc_empty(cx);\n  bc_cursor c = bc_scan_open(cx, TBL_1, lo, "
+                  "hi, BC_SCAN_FORWARD);") != std::string::npos);
+  CHECK(full.find("bc_col_null(cx, row, COL_1_2) || bc_param_null(cx, 0)") != std::string::npos);
   // A conjunct the key does not express filters each row: NULL on either side
   // rejects it.
   auto point = generate(f.cat(), "SELECT id FROM t WHERE id = $1 AND qty = $2").source;
@@ -124,7 +129,9 @@ TEST_CASE("codegen: the other bound forms produce plans; no rule, no plan", "[sq
   auto range = generate(f.cat(), "SELECT id FROM t WHERE name > $1 AND name > $2").source;
   CHECK(range.find("|| !(bc_bytes_cmp(cx, bc_col_bytes(cx, row, COL_1_1), bc_param_bytes(cx, 1)) > 0)) continue;") !=
         std::string::npos);
-  CHECK_THROWS_AS(generate(f.cat(), "DELETE FROM t WHERE qty = $1"), ast::FeatureNotSupported);
+  auto del = generate(f.cat(), "DELETE FROM t WHERE qty = $1").source;
+  CHECK(del.find("bc_scan_open(cx, TBL_1, lo, hi, BC_SCAN_FORWARD);") != std::string::npos);
+  CHECK(del.find("bc_delete(cx, TBL_1, old);") != std::string::npos);
 }
 
 TEST_CASE("codegen: UPDATE and DELETE write each row their key reaches, and count them", "[sql][codegen]") {
@@ -142,15 +149,10 @@ TEST_CASE("codegen: UPDATE and DELETE write each row their key reaches, and coun
   CHECK(del.source.find("bc_delete(cx, TBL_1, old);\n    ++n;") != std::string::npos);
   // One row by the whole primary key, as before.
   CHECK(generate(f.cat(), "DELETE FROM t WHERE id = $1").source.find("bc_get(") != std::string::npos);
-  auto refusal = [&](std::string_view sql) -> std::string {
-    try {
-      (void)generate(f.cat(), sql);
-    } catch (const ast::FeatureNotSupported& e) {
-      return e.what();
-    }
-    return "accepted";
-  };
-  CHECK(refusal("UPDATE t SET qty = $1 WHERE qty = $2") == "no plan: a full scan of t");
+  // Nothing bounds it: a full scan, each row filtered, then written.
+  auto full = generate(f.cat(), "UPDATE t SET qty = $1 WHERE qty = $2").source;
+  CHECK(full.find("bc_cursor c = bc_scan_open(cx, TBL_1, lo, hi, BC_SCAN_FORWARD);\n  while (bc_scan_next(cx, c)) {\n    "
+                  "bc_view old = bc_scan_row(cx, c);\n    if (bc_col_null(cx, old, COL_1_2)") != std::string::npos);
   auto filtered = generate(f.cat(), "DELETE FROM t WHERE name = $1 AND qty = $2").source;
   CHECK(filtered.find("bc_view old = bc_scan_row(cx, c);\n    if (bc_col_null(cx, old, COL_1_2)") != std::string::npos);
 }
@@ -212,7 +214,7 @@ TEST_CASE("codegen: a composite key from parameters out of order takes the build
   CHECK(swapped.find("bc_get(cx, bc_key_end(cx, k0), &found);") != std::string::npos);
 }
 
-TEST_CASE("codegen: what the planner refuses, with its message", "[sql][codegen]") {
+TEST_CASE("codegen: what the planner refuses, with its message, and what it sorts", "[sql][codegen]") {
   sql_test::Fixture f;
   // o: an index whose second part is a nullable DESC part.
   f.ddl(CreateTableDdl{"o",
@@ -228,13 +230,21 @@ TEST_CASE("codegen: what the planner refuses, with its message", "[sql][codegen]
     }
     return "accepted";
   };
-  CHECK(refusal("SELECT id FROM t WHERE qty = $1") == "no plan: a full scan of t");
-  CHECK(refusal("SELECT id FROM t WHERE name = $1 ORDER BY qty") == "no plan: no index of t gives ORDER BY qty");
-  CHECK(refusal("SELECT k FROM o WHERE a = $1 ORDER BY b DESC") == "no plan: ORDER BY b would need its NULLs reordered");
-  // c is nullable, and its NULLs would fall within each value of b.
-  CHECK(refusal("SELECT k FROM o WHERE a = $1 AND b = $2 ORDER BY c, k") == "accepted");
-  CHECK(refusal("SELECT k FROM o WHERE a = $1 ORDER BY b DESC, c") ==
-        "no plan: ORDER BY b would need its NULLs reordered");
+  auto sorts = [&](std::string_view sql) { return generate(f.cat(), sql).source.find("bc_sorter_open") != std::string::npos; };
+  // No index gives the order: a sort.
+  CHECK(sorts("SELECT id FROM t WHERE name = $1 ORDER BY qty"));
+  // b's NULLs: o_ab's key puts a DESC part's last, PostgreSQL's DESC first;
+  // NULLS LAST is the key's order.
+  CHECK(sorts("SELECT k FROM o WHERE a = $1 ORDER BY b DESC"));
+  CHECK_FALSE(sorts("SELECT k FROM o WHERE a = $1 ORDER BY b DESC NULLS LAST"));
+  // b compared: c is the nullable part, ASC in the key, NULLS FIRST in it;
+  // PostgreSQL's default ASC puts them last, which two ranges give.
+  CHECK_FALSE(sorts("SELECT k FROM o WHERE a = $1 AND b = $2 ORDER BY c, k"));
+  CHECK_FALSE(sorts("SELECT k FROM o WHERE a = $1 AND b = $2 ORDER BY c NULLS FIRST, k"));
+  // c's NULLs fall within each value of b: the key's order only where the
+  // ORDER BY asks for it.
+  CHECK(sorts("SELECT k FROM o WHERE a = $1 ORDER BY b DESC, c"));
+  CHECK_FALSE(sorts("SELECT k FROM o WHERE a = $1 ORDER BY b DESC NULLS LAST, c NULLS FIRST"));
   // A DOUBLE or REAL column takes no filter yet.
   f.ddl(CreateTableDdl{"fd", {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("d", PhysType::F64, true)},
                        {"k"}});
@@ -243,7 +253,8 @@ TEST_CASE("codegen: what the planner refuses, with its message", "[sql][codegen]
   // $n + k bounds a range on a key, but compared by = it is a filter: it names no key.
   f.ddl(CreateTableDdl{"ik", {{"k", {SqlKind::Integer}, false, {}}}, {"k"}});
   CHECK(refusal("SELECT k FROM ik WHERE k >= $1 + 1") == "accepted");
-  CHECK(refusal("SELECT k FROM ik WHERE k = $1 + 1") == "no plan: a full scan of ik");
+  CHECK(generate(f.cat(), "SELECT k FROM ik WHERE k = $1 + 1").source.find("bc_empty(cx);\n  bc_cursor c = bc_scan_open(cx, TBL_") !=
+        std::string::npos);
 }
 
 TEST_CASE("codegen: FOR UPDATE guards the key of every row it returns, read from the row", "[sql][codegen][txn]") {
@@ -300,14 +311,25 @@ TEST_CASE("codegen: a join is of two point lookups, in FROM order", "[sql][codeg
   CHECK(loop.source.find("if (!found1) continue;") != std::string::npos);
   // FROM order first, then the other: u is the one its parameters reach.
   CHECK(refusal("SELECT v FROM t, u WHERE k = $1 AND id = v") == "accepted");
-  CHECK(refusal("SELECT v FROM t, u WHERE qty = $1 AND k = qty") == "no plan: a full scan of t");
-  CHECK(refusal("SELECT v FROM t, u WHERE id = $1 AND v = qty") == "no plan: no equality names u's key");
+  // t by a full scan, u looked up per row; t by its key, u scanned once.
+  CHECK(refusal("SELECT v FROM t, u WHERE qty = $1 AND k = qty") == "accepted");
+  auto once = generate(f.cat(), "SELECT v FROM t, u WHERE id = $1 AND v = qty").source;
+  CHECK(once.find("bc_view row1 = bc_scan_row(cx, c);") != std::string::npos);
   // An ORDER BY on a join is the first table's scan's order: a lookup per
   // row keeps it. A column of the other table is in no scan's order.
   auto ordered = generate(f.cat(), "SELECT v FROM t, u WHERE name >= $1 AND k = qty ORDER BY name DESC");
   CHECK(ordered.source.find("bc_scan_open(cx, IDX_3, lo, hi, BC_SCAN_REVERSE);") != std::string::npos);
-  CHECK(refusal("SELECT v FROM t, u WHERE name >= $1 AND k = qty ORDER BY v") ==
-        "no plan: no index of t gives ORDER BY v");
+  // A column of the other table is in no scan's order: the pairs are
+  // sorted, the sorter holding t's row, and u looked up again from it.
+  auto by_v = generate(f.cat(), "SELECT v FROM t, u WHERE name >= $1 AND k = qty ORDER BY v").source;
+  auto add = by_v.find("bc_sorter_add(cx, s0, bc_sort_key_end(cx, sk), row);");
+  auto next = by_v.find("while (bc_sorter_next(cx, s0, &p0)) {");
+  auto again = by_v.find("bc_key_i64(cx, k1, bc_col_i64(cx, p0, COL_1_2));");
+  REQUIRE(add != std::string::npos);
+  REQUIRE(next != std::string::npos);
+  REQUIRE(again != std::string::npos);
+  CHECK(add < next);
+  CHECK(next < again);
   // name compared for equality: the index's next part, id, gives the order.
   auto by_id = generate(f.cat(), "SELECT v FROM t, u WHERE name = $1 AND k = qty ORDER BY id");
   CHECK(by_id.source.find("bc_scan_open(cx, IDX_3, lo, lo, BC_SCAN_PREFIX);") != std::string::npos);
