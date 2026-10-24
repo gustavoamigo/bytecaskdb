@@ -84,7 +84,8 @@ export namespace bytecask::sql {
 // What the plan API charges a statement's memory budget for an entry of its
 // own, beside the bytes the entry holds (docs/plan_api_design.md, *Memory*):
 // each handle a plan is given (a view, a pin, a key or row builder, a
-// cursor), and each aggregate group's node. Fixed numbers, so a statement
+// cursor, a hash table probe), each aggregate group's node and slot, and
+// each sorter and hash table entry's node. Fixed numbers, so a statement
 // is charged the same on every run and every build; plan_api.cpp checks
 // that each is no less than what it stands for.
 inline constexpr std::uint64_t kViewEntryBytes = 40;
@@ -92,6 +93,10 @@ inline constexpr std::uint64_t kKeyEntryBytes = 64;
 inline constexpr std::uint64_t kRowEntryBytes = 152;
 inline constexpr std::uint64_t kCursorEntryBytes = 408;
 inline constexpr std::uint64_t kGroupEntryBytes = 136;
+inline constexpr std::uint64_t kAggSlotBytes = 24;
+inline constexpr std::uint64_t kSortEntryBytes = 128;
+inline constexpr std::uint64_t kHashEntryBytes = 240;
+inline constexpr std::uint64_t kHashIterEntryBytes = 32;
 
 // Every column of a row, by its layout: NULL, or the typed value; the id of
 // the first malformed column (row_column), never a plausible value. The one

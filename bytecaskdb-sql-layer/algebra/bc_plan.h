@@ -7,11 +7,7 @@
    and bc_params are opaque here and built by the runtime
    (algebra/runtime.cppm, module bytecask.sql.runtime).
 
-   Implemented: the runtime, parameters and results, arithmetic, keys, reads,
-   rows and columns, writes, guards, and the aggregates' groups (bc_agg_open
-   with no slots, bc_agg_group, bc_agg_next). The other ephemeral structures
-   (sorters, hash tables) and the aggregates' slots are not implemented yet:
-   each of their calls sets BC_E_HANDLE and returns a neutral value. */
+   Every call is implemented. */
 
 #ifndef BC_PLAN_H
 #define BC_PLAN_H
@@ -271,7 +267,7 @@ bc_view  bc_row_end(bc_ctx *, bc_row);
 bc_view  bc_pin(bc_ctx *, bc_view);                 /* a copy that lives until reset */
 
 /* Ephemeral structures */
-bc_sorter bc_sorter_open(bc_ctx *);
+bc_sorter bc_sorter_open(bc_ctx *, int64_t keep);        /* keep the first `keep` in sort order; 0 = all */
 void      bc_sorter_add(bc_ctx *, bc_sorter, bc_view sort_key, bc_view payload);
 int64_t   bc_sorter_count(bc_ctx *, bc_sorter);
 bc_view   bc_sorter_nth(bc_ctx *, bc_sorter, int64_t n);

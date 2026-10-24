@@ -330,8 +330,13 @@ to the client is part of the transport design.
     `bc_budget`, beside `max_reads`.
 - **Gains:**
   - the lifetime rule above, stated in `plan_api_design.md`;
-  - working `bc_sorter_*` and `bc_hash_*` calls, which `bc_plan.h`
-    declares and which set `BC_E_HANDLE` today.
+  - working `bc_sorter_*` and `bc_hash_*` calls and aggregate slots, which
+    `bc_plan.h` declared and which set `BC_E_HANDLE` until the plan-API half
+    of slices 4 and 5 built them (`plan_api_design.md`, revision 8);
+  - a `keep` argument for `bc_sorter_open`, where 0 keeps every entry: a
+    top-n sorter holds at most the first n in sort order, so
+    `ORDER BY … LIMIT n` (*The search*, Sort) holds n entries whatever the
+    input, and an entry that sorts after the n held is not copied.
 
 Plans are only ever ours and are regenerated from SQL, so changing these
 signatures breaks no stored plan.

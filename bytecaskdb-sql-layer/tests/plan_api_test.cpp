@@ -3,15 +3,18 @@
 //
 // The plan API's runtime guarantees, driven by small plans written as
 // captureless lambdas: handles are checked, errors are sticky, a cursor's
-// views die when it steps, the budget ends a plan, and nothing is committed
-// unless the plan finishes cleanly.
+// views die when it steps, the budget ends a plan, nothing is committed
+// unless the plan finishes cleanly, and the sorters, hash tables and
+// aggregates order, keep and charge what they are given.
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -23,9 +26,13 @@ import bytecask.sql.tests.fixture;
 using namespace sql_test;
 using bytecask::sql::Bytes;
 using bytecask::sql::kCursorEntryBytes;
+using bytecask::sql::kAggSlotBytes;
 using bytecask::sql::kGroupEntryBytes;
+using bytecask::sql::kHashEntryBytes;
+using bytecask::sql::kHashIterEntryBytes;
 using bytecask::sql::kKeyEntryBytes;
 using bytecask::sql::kRowEntryBytes;
+using bytecask::sql::kSortEntryBytes;
 using bytecask::sql::kViewEntryBytes;
 using bytecask::sql::PhysType;
 
@@ -131,8 +138,6 @@ void count_rows(bc_ctx* cx) {
   }
   bc_emit_count(cx, n);
 }
-
-void unimplemented_call(bc_ctx* cx) { bc_sorter_open(cx); }
 }  // namespace
 
 TEST_CASE("plan API: a cursor's views die when it steps", "[sql][algebra]") {
@@ -158,12 +163,6 @@ TEST_CASE("plan API: the budget ends a plan, and scans stay inside their table",
   CHECK(run(f, count_rows, {Bytes{}}, {.max_reads = 3, .max_bytes = 0, .deadline_ns = 0}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_BUDGET);
   CHECK(bc_ctx_affected(f.cx) == -1);
-}
-
-TEST_CASE("plan API: the ephemeral structures are not implemented yet and set BC_E_HANDLE", "[sql][algebra]") {
-  Fixture f;
-  CHECK(run(f, unimplemented_call, {bytes("x")}) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_HANDLE);
 }
 
 namespace {
@@ -860,5 +859,552 @@ TEST_CASE("plan API: an outer row's key read in an inner loop is the inner step'
   CHECK(bc_ctx_affected(f.cx) == kRows / 2);
   REQUIRE(held_at_step.size() == kRows);
   // Each inner step's keys, the outer row's included, went at the next step.
+  CHECK(std::ranges::all_of(held_at_step, [&](auto h) { return h == held_at_step.front(); }));
+}
+
+// ------------------------------------------------------ ephemeral structures
+
+namespace {
+
+// A run whose result rows have `types`.
+auto run_rows(Fixture& f, bc_plan_fn plan, std::vector<bc_value> p, std::vector<PhysType> types, bc_budget budget = {})
+    -> int {
+  auto ps = params(std::move(p));
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), type_codes(types), f.cat().version()};
+  auto ref = sr.get();
+  return bc_execute(f.cx, plan, &ref, &ps, budget, false, 0);
+}
+
+auto ids(Fixture& f) -> std::vector<std::int64_t> {
+  std::vector<std::int64_t> out;
+  for (const auto& r : f.results(std::vector{PhysType::I64})) out.push_back(std::get<std::int64_t>(r[0]));
+  return out;
+}
+
+// Rows (id, "n", qty) for qty in `qtys`, ids from 1; nullopt is NULL.
+void insert_qtys(Fixture& f, std::vector<std::optional<std::int64_t>> qtys) {
+  std::int64_t id = 0;
+  for (auto q : qtys) {
+    REQUIRE(run(f, insert_plan_ok, {++id, bytes("n"), q ? bc_value{*q} : bc_value{}}) == BC_COMMITTED);
+  }
+}
+
+// SELECT id FROM t ORDER BY qty, NULLs first as the key codec sorts them,
+// keeping the first $1 (0: all); the scan forward, or reverse with $2. The
+// count is the sorter's.
+void ids_by_qty(bc_ctx* cx) {
+  bc_sorter s = bc_sorter_open(cx, bc_param_i64(cx, 0));
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx),
+                             bc_param_bool(cx, 1) ? BC_SCAN_REVERSE : BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    bc_sorter_add(cx, s, bc_col_key(cx, row, kQtyCol), row);
+  }
+  bc_view p = bc_empty(cx);
+  while (bc_sorter_next(cx, s, &p)) {
+    bc_emit_begin(cx);
+    bc_emit_col(cx, p, kIdCol);  // the payload is still a row of t
+    bc_emit_end(cx);
+  }
+  bc_emit_count(cx, bc_sorter_count(cx, s));
+}
+
+// The same sort read by position: the id of the $2-th row, then the count.
+void nth_by_qty(bc_ctx* cx) {
+  bc_sorter s = bc_sorter_open(cx, bc_param_i64(cx, 0));
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    bc_sorter_add(cx, s, bc_col_key(cx, row, kQtyCol), row);
+  }
+  bc_view p = bc_sorter_nth(cx, s, bc_param_i64(cx, 1));
+  bc_emit_begin(cx);
+  bc_emit_col(cx, p, kIdCol);
+  bc_emit_end(cx);
+  bc_emit_count(cx, bc_sorter_count(cx, s));
+}
+
+// A sorter added to after it was read.
+void add_after_read(bc_ctx* cx) {
+  bc_sorter s = bc_sorter_open(cx, 0);
+  bc_sorter_add(cx, s, bc_param_bytes(cx, 0), bc_param_bytes(cx, 0));
+  (void)bc_sorter_nth(cx, s, 0);
+  bc_sorter_add(cx, s, bc_param_bytes(cx, 0), bc_param_bytes(cx, 0));
+}
+
+// A sorter's payload read after its loop moved on.
+void stale_sorted(bc_ctx* cx) {
+  bc_sorter s = bc_sorter_open(cx, 0);
+  bc_sorter_add(cx, s, bc_param_bytes(cx, 0), bc_param_bytes(cx, 0));
+  bc_sorter_add(cx, s, bc_param_bytes(cx, 0), bc_param_bytes(cx, 0));
+  bc_view first = bc_empty(cx);
+  bc_view p = bc_empty(cx);
+  bool started = false;
+  while (bc_sorter_next(cx, s, &p)) {
+    if (started) bc_emit_count(cx, bc_bytes_eq(cx, first, p) ? 1 : 0);
+    first = p;
+    started = true;
+  }
+}
+}  // namespace
+
+TEST_CASE("plan API: a sorter returns its payloads in sort key order, equal keys in the order added",
+          "[sql][algebra][structures]") {
+  Fixture f;
+  insert_qtys(f, {3, 1, std::nullopt, 1, 2, 3});
+  CHECK(run_rows(f, ids_by_qty, {std::int64_t{0}, false}, {PhysType::I64}) == BC_COMMITTED);
+  CHECK(ids(f) == std::vector<std::int64_t>{3, 2, 4, 5, 1, 6});
+  CHECK(bc_ctx_affected(f.cx) == 6);
+  // Added in reverse, equal keys come back in reverse: the order added, not
+  // the payloads'.
+  CHECK(run_rows(f, ids_by_qty, {std::int64_t{0}, true}, {PhysType::I64}) == BC_COMMITTED);
+  CHECK(ids(f) == std::vector<std::int64_t>{3, 4, 2, 5, 6, 1});
+
+  for (std::int64_t n = 0; n < 6; ++n) {
+    INFO("nth " << n);
+    REQUIRE(run_rows(f, nth_by_qty, {std::int64_t{0}, n}, {PhysType::I64}) == BC_COMMITTED);
+    CHECK(ids(f) == std::vector<std::int64_t>{std::vector<std::int64_t>{3, 2, 4, 5, 1, 6}[static_cast<std::size_t>(n)]});
+  }
+  CHECK(run_rows(f, nth_by_qty, {std::int64_t{0}, std::int64_t{6}}, {PhysType::I64}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(run_rows(f, nth_by_qty, {std::int64_t{0}, std::int64_t{-1}}, {PhysType::I64}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+
+  CHECK(run(f, add_after_read, {bytes("k")}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  // A payload is its step's: the next step makes it stale.
+  CHECK(run(f, stale_sorted, {bytes("k")}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+}
+
+TEST_CASE("plan API: a top-n sorter keeps the first n in sort order, the earliest of equal keys",
+          "[sql][algebra][structures]") {
+  Fixture f;
+  insert_qtys(f, {3, 1, std::nullopt, 1, 2, 3});
+  const std::vector<std::int64_t> all{3, 2, 4, 5, 1, 6};
+  for (std::int64_t keep = 1; keep <= 8; ++keep) {
+    INFO("keep " << keep);
+    auto held = std::min<std::int64_t>(keep, 6);
+    const std::vector<std::int64_t> first(all.begin(), all.begin() + held);
+    REQUIRE(run_rows(f, ids_by_qty, {keep, false}, {PhysType::I64}) == BC_COMMITTED);
+    CHECK(ids(f) == first);
+    CHECK(bc_ctx_affected(f.cx) == held);  // the count is what it holds
+    REQUIRE(run_rows(f, ids_by_qty, {keep, true}, {PhysType::I64}) == BC_COMMITTED);
+    std::vector<std::int64_t> rev{3, 4, 2, 5, 6, 1};
+    CHECK(ids(f) == std::vector<std::int64_t>(rev.begin(), rev.begin() + held));
+    REQUIRE(run_rows(f, nth_by_qty, {keep, held - 1}, {PhysType::I64}) == BC_COMMITTED);
+    CHECK(ids(f) == std::vector<std::int64_t>{first.back()});
+  }
+  CHECK(run_rows(f, ids_by_qty, {std::int64_t{-1}, false}, {PhysType::I64}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+}
+
+namespace {
+// A hash join of t to itself on qty, the build side keyed by qty's key with
+// the row as payload: per outer row, its id and each matching inner id, in
+// the order the build side put them. Then a probe of a key nobody put.
+void self_hash_join(bc_ctx* cx) {
+  bc_hash h = bc_hash_open(cx);
+  bc_cursor b = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, b)) {
+    bc_view row = bc_scan_row(cx, b);
+    bc_hash_put(cx, h, bc_col_key(cx, row, kQtyCol), row);
+  }
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_view outer = bc_scan_row(cx, c);
+    bc_hash_iter it = bc_hash_find(cx, h, bc_col_key(cx, outer, kQtyCol));
+    bc_view inner = bc_empty(cx);
+    while (bc_hash_next(cx, it, &inner)) {
+      bc_emit_begin(cx);
+      bc_emit_col(cx, outer, kIdCol);
+      bc_emit_col(cx, inner, kIdCol);  // the payload is still a row of t
+      bc_emit_end(cx);
+    }
+  }
+  int64_t none = 0;
+  bc_hash_iter miss = bc_hash_find(cx, h, bc_param_bytes(cx, 0));
+  while (bc_hash_next(cx, miss, nullptr)) none = bc_add(cx, none, 1);
+  bc_emit_count(cx, none);
+}
+
+// A probe's payload read after its loop moved on.
+void stale_probe(bc_ctx* cx) {
+  bc_hash h = bc_hash_open(cx);
+  bc_hash_put(cx, h, bc_param_bytes(cx, 0), bc_param_bytes(cx, 0));
+  bc_hash_put(cx, h, bc_param_bytes(cx, 0), bc_param_bytes(cx, 0));
+  bc_hash_iter it = bc_hash_find(cx, h, bc_param_bytes(cx, 0));
+  bc_view first = bc_empty(cx);
+  bc_view p = bc_empty(cx);
+  bool started = false;
+  while (bc_hash_next(cx, it, &p)) {
+    if (started) bc_emit_count(cx, bc_bytes_eq(cx, first, p) ? 1 : 0);
+    first = p;
+    started = true;
+  }
+}
+}  // namespace
+
+TEST_CASE("plan API: a hash table returns every payload of a key, in the order put", "[sql][algebra][structures]") {
+  Fixture f;
+  insert_qtys(f, {3, 1, std::nullopt, 1, 2, 3});
+  CHECK(run_rows(f, self_hash_join, {bytes("absent")}, {PhysType::I64, PhysType::I64}) == BC_COMMITTED);
+  using R = std::vector<bc_value>;
+  auto r = [](std::int64_t a, std::int64_t b) { return R{a, b}; };
+  CHECK(f.results(std::vector{PhysType::I64, PhysType::I64}) ==
+        std::vector<R>{r(1, 1), r(1, 6), r(2, 2), r(2, 4), r(3, 3), r(4, 2), r(4, 4), r(5, 5), r(6, 1), r(6, 6)});
+  CHECK(bc_ctx_affected(f.cx) == 0);  // a key never put finds nothing
+  CHECK(run(f, stale_probe, {bytes("k")}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+}
+
+namespace {
+// SELECT COUNT(*), COUNT(qty), SUM(qty), MIN(qty), MAX(qty), AVG(qty) FROM t
+// GROUP BY name, as a plan computes PostgreSQL's NULLs: a slot of a group
+// no value reached is NULL, which its COUNT(qty) slot tells. With $1 not
+// NULL, ungrouped over the rows named $1: its one group is made before the
+// scan, so it exists over no rows.
+void aggregates(bc_ctx* cx) {
+  bc_agg a = bc_agg_open(cx, 6);
+  bool grouped = bc_param_null(cx, 0);
+  bc_group all = grouped ? bc_group{} : bc_agg_group(cx, a, bc_empty(cx));
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    if (!grouped && !bc_bytes_eq(cx, bc_col_bytes(cx, row, kNameCol), bc_param_bytes(cx, 0))) continue;
+    bc_group g = grouped ? bc_agg_group(cx, a, bc_col_key(cx, row, kNameCol)) : all;
+    bc_agg_count(cx, g, 0);
+    if (bc_col_null(cx, row, kQtyCol)) continue;
+    int64_t q = bc_col_i64(cx, row, kQtyCol);
+    bc_agg_count(cx, g, 1);
+    bc_agg_add_i64(cx, g, 2, q);
+    bc_agg_min_i64(cx, g, 3, q);
+    bc_agg_max_i64(cx, g, 4, q);
+    bc_agg_add_f64(cx, g, 5, bc_i64_to_f64(q));
+  }
+  bc_group g = all;
+  while (bc_agg_next(cx, a, nullptr, &g)) {
+    bc_emit_begin(cx);
+    bc_emit_i64(cx, bc_agg_i64(cx, g, 0));
+    bool none = bc_agg_i64(cx, g, 1) == 0;
+    bc_emit_i64(cx, bc_agg_i64(cx, g, 1));
+    if (none) {
+      bc_emit_null(cx);
+      bc_emit_null(cx);
+      bc_emit_null(cx);
+      bc_emit_null(cx);
+    } else {
+      bc_emit_i64(cx, bc_agg_i64(cx, g, 2));
+      bc_emit_i64(cx, bc_agg_i64(cx, g, 3));
+      bc_emit_i64(cx, bc_agg_i64(cx, g, 4));
+      bc_emit_f64(cx, bc_agg_f64(cx, g, 5) / bc_i64_to_f64(bc_agg_i64(cx, g, 1)));
+    }
+    bc_emit_end(cx);
+  }
+}
+
+// $1 + $2 in an integer slot, $3 + $4 in a double one.
+void sum_two(bc_ctx* cx) {
+  bc_agg a = bc_agg_open(cx, 2);
+  bc_group g = bc_agg_group(cx, a, bc_empty(cx));
+  bc_agg_add_i64(cx, g, 0, bc_param_i64(cx, 0));
+  bc_agg_add_i64(cx, g, 0, bc_param_i64(cx, 1));
+  bc_agg_add_f64(cx, g, 1, bc_param_f64(cx, 2));
+  bc_agg_add_f64(cx, g, 1, bc_param_f64(cx, 3));
+  bc_emit_begin(cx);
+  bc_emit_i64(cx, bc_agg_i64(cx, g, 0));
+  bc_emit_f64(cx, bc_agg_f64(cx, g, 1));
+  bc_emit_end(cx);
+}
+
+// Wrong plans: a slot folded two ways, read as the other type, past the
+// aggregate's slots, and a group of another aggregate.
+void slot_two_ways(bc_ctx* cx) {
+  bc_agg a = bc_agg_open(cx, 1);
+  bc_group g = bc_agg_group(cx, a, bc_empty(cx));
+  bc_agg_add_i64(cx, g, 0, 1);
+  bc_agg_min_i64(cx, g, 0, 1);
+}
+void slot_read_as_double(bc_ctx* cx) {
+  bc_agg a = bc_agg_open(cx, 1);
+  bc_group g = bc_agg_group(cx, a, bc_empty(cx));
+  bc_agg_count(cx, g, 0);
+  bc_emit_count(cx, bc_f64_to_i64(cx, bc_agg_f64(cx, g, 0)));
+}
+void slot_past_end(bc_ctx* cx) {
+  bc_agg a = bc_agg_open(cx, 1);
+  bc_group g = bc_agg_group(cx, a, bc_empty(cx));
+  bc_agg_count(cx, g, 1);
+}
+void foreign_group(bc_ctx* cx) {
+  bc_agg a = bc_agg_open(cx, 1);
+  bc_agg b = bc_agg_open(cx, 1);
+  bc_group g = bc_agg_group(cx, a, bc_empty(cx));
+  (void)bc_agg_group(cx, b, bc_empty(cx));
+  bc_group other = {1, g.g};  // a's second group, which a does not have
+  bc_agg_count(cx, other, 0);
+}
+}  // namespace
+
+TEST_CASE("plan API: an aggregate's slots fold SUM, MIN, MAX and COUNT, and an integer sum that overflows is BC_E_ARITH",
+          "[sql][algebra][structures]") {
+  Fixture f;
+  auto row = [&](std::int64_t id, const char* name, std::optional<std::int64_t> qty) {
+    REQUIRE(run(f, insert_plan_ok, {id, bytes(name), qty ? bc_value{*qty} : bc_value{}}) == BC_COMMITTED);
+  };
+  row(1, "a", 5);
+  row(2, "b", std::nullopt);
+  row(3, "a", 7);
+  row(4, "b", std::nullopt);
+  row(5, "c", -2);
+  const std::vector<PhysType> types{PhysType::I64, PhysType::I64, PhysType::I64, PhysType::I64, PhysType::I64,
+                                    PhysType::F64};
+  using R = std::vector<bc_value>;
+  CHECK(run_rows(f, aggregates, {bc_value{}}, types) == BC_COMMITTED);
+  CHECK(f.results(types) == std::vector<R>{R{std::int64_t{2}, std::int64_t{2}, std::int64_t{12}, std::int64_t{5},
+                                             std::int64_t{7}, 6.0},
+                                           R{std::int64_t{2}, std::int64_t{0}, bc_value{}, bc_value{}, bc_value{},
+                                             bc_value{}},
+                                           R{std::int64_t{1}, std::int64_t{1}, std::int64_t{-2}, std::int64_t{-2},
+                                             std::int64_t{-2}, -2.0}});
+  // Ungrouped over no rows: one row, the counts 0 and the rest NULL.
+  CHECK(run_rows(f, aggregates, {bytes("zzz")}, types) == BC_COMMITTED);
+  CHECK(f.results(types) ==
+        std::vector<R>{R{std::int64_t{0}, std::int64_t{0}, bc_value{}, bc_value{}, bc_value{}, bc_value{}}});
+  CHECK(run_rows(f, aggregates, {bytes("a")}, types) == BC_COMMITTED);
+  CHECK(f.results(types) == std::vector<R>{R{std::int64_t{2}, std::int64_t{2}, std::int64_t{12}, std::int64_t{5},
+                                             std::int64_t{7}, 6.0}});
+
+  const std::vector<PhysType> two{PhysType::I64, PhysType::F64};
+  constexpr auto kMax = std::numeric_limits<std::int64_t>::max();
+  CHECK(run_rows(f, sum_two, {kMax, std::int64_t{-1}, 1.5, 2.0}, two) == BC_COMMITTED);
+  CHECK(f.results(two) == std::vector<R>{R{kMax - 1, 3.5}});
+  CHECK(run_rows(f, sum_two, {kMax, std::int64_t{1}, 1.5, 2.0}, two) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_ARITH);
+  CHECK(std::string{bc_error_message(f.cx)} == "bigint out of range");
+  // A double sum that overflows is an error, as PostgreSQL's; an infinite
+  // input carries through.
+  CHECK(run_rows(f, sum_two, {std::int64_t{0}, std::int64_t{0}, 1e308, 1e308}, two) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_ARITH);
+  CHECK(run_rows(f, sum_two, {std::int64_t{0}, std::int64_t{0}, HUGE_VAL, 1.0}, two) == BC_COMMITTED);
+  CHECK(f.results(two) == std::vector<R>{R{std::int64_t{0}, HUGE_VAL}});
+
+  for (auto plan : {slot_two_ways, slot_read_as_double, slot_past_end, foreign_group}) {
+    CHECK(run(f, plan, {}) == BC_FAILED);
+    CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  }
+}
+
+namespace {
+// What one add, put or group charged, and what each next one did.
+std::vector<std::uint64_t> charges;  // NOLINT: the plans are captureless
+
+void charge_of(bc_ctx* cx, std::uint64_t before) { charges.push_back(bc_ctx_held_for_testing(cx) - before); }
+
+// A sorter keeping $1: three adds of a 1-byte key and a 2-byte payload, the
+// third key sorting first, then one whose key ties the first.
+void sorter_charges(bc_ctx* cx) {
+  bc_sorter s = bc_sorter_open(cx, bc_param_i64(cx, 0));
+  bc_view k1 = bc_param_bytes(cx, 1), k0 = bc_param_bytes(cx, 2), p = bc_param_bytes(cx, 3),
+          q = bc_param_bytes(cx, 4);
+  auto before = bc_ctx_held_for_testing(cx);
+  bc_sorter_add(cx, s, k1, p);
+  charge_of(cx, before);
+  before = bc_ctx_held_for_testing(cx);
+  bc_sorter_add(cx, s, k1, p);
+  charge_of(cx, before);
+  before = bc_ctx_held_for_testing(cx);
+  bc_sorter_add(cx, s, k0, q);
+  charge_of(cx, before);
+}
+
+// Two puts under one 1-byte key, then a probe.
+void hash_charges(bc_ctx* cx) {
+  bc_hash h = bc_hash_open(cx);
+  bc_view k = bc_param_bytes(cx, 0), p = bc_param_bytes(cx, 1);
+  auto before = bc_ctx_held_for_testing(cx);
+  bc_hash_put(cx, h, k, p);
+  charge_of(cx, before);
+  before = bc_ctx_held_for_testing(cx);
+  bc_hash_put(cx, h, k, p);
+  charge_of(cx, before);
+  before = bc_ctx_held_for_testing(cx);
+  (void)bc_hash_find(cx, h, k);
+  charge_of(cx, before);
+}
+
+// A group of an aggregate of 3 slots, keyed by $1.
+void slot_charges(bc_ctx* cx) {
+  bc_agg a = bc_agg_open(cx, 3);
+  bc_view k = bc_param_bytes(cx, 0);
+  auto before = bc_ctx_held_for_testing(cx);
+  (void)bc_agg_group(cx, a, k);
+  charge_of(cx, before);
+}
+
+// INSERT INTO t VALUES ($1, 'x', 0), then every row of t into a sorter, a
+// hash table or an aggregate's groups ($2: 0, 1, 2), each row its own key.
+void insert_then_hold(bc_ctx* cx) {
+  bc_row r = bc_row_begin(cx, kTbl);
+  bc_row_set_param(cx, r, kIdCol, 0);
+  bc_row_set_bytes(cx, r, kNameCol, bc_param_bytes(cx, 2));
+  bc_row_set_i64(cx, r, kQtyCol, 0);
+  bc_insert(cx, kTbl, bc_row_end(cx, r));
+  int64_t which = bc_param_i64(cx, 1);
+  bc_sorter s = bc_sorter_open(cx, 0);
+  bc_hash h = bc_hash_open(cx);
+  bc_agg a = bc_agg_open(cx, 2);
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    bc_view key = bc_scan_key(cx, c);
+    if (which == 0) bc_sorter_add(cx, s, key, row);
+    if (which == 1) bc_hash_put(cx, h, key, row);
+    if (which == 2) bc_agg_count(cx, bc_agg_group(cx, a, key), 0);
+  }
+  bc_emit_count(cx, 1);
+}
+}  // namespace
+
+TEST_CASE("plan API: a sorter, hash table or aggregate entry is charged its bytes and a fixed amount",
+          "[sql][algebra][structures][memory]") {
+  Fixture f;
+  // Keep all: each add its key, payload and kSortEntryBytes.
+  charges.clear();
+  CHECK(run(f, sorter_charges, {std::int64_t{0}, bytes("b"), bytes("a"), bytes("pp"), bytes("qqqq")}) ==
+        BC_COMMITTED);
+  CHECK(charges == std::vector<std::uint64_t>{3 + kSortEntryBytes, 3 + kSortEntryBytes, 5 + kSortEntryBytes});
+  // Keep 2: the third add replaces the last of the two, charged the
+  // difference in bytes; an add that ties the last is refused, charged nothing.
+  charges.clear();
+  CHECK(run(f, sorter_charges, {std::int64_t{2}, bytes("b"), bytes("a"), bytes("pp"), bytes("qqqq")}) ==
+        BC_COMMITTED);
+  CHECK(charges == std::vector<std::uint64_t>{3 + kSortEntryBytes, 3 + kSortEntryBytes, 2});
+  charges.clear();
+  CHECK(run(f, sorter_charges, {std::int64_t{1}, bytes("b"), bytes("a"), bytes("pp"), bytes("qqqq")}) ==
+        BC_COMMITTED);
+  CHECK(charges == std::vector<std::uint64_t>{3 + kSortEntryBytes, 0, 2});
+  // A hash table charges a key once, each payload and kHashEntryBytes per
+  // put, and a probe its handle.
+  charges.clear();
+  CHECK(run(f, hash_charges, {bytes("k"), bytes("pp")}) == BC_COMMITTED);
+  CHECK(charges == std::vector<std::uint64_t>{1 + 2 + kHashEntryBytes, 2 + kHashEntryBytes, kHashIterEntryBytes});
+  // A group, its key, kGroupEntryBytes and its slots.
+  charges.clear();
+  CHECK(run(f, slot_charges, {bytes("kk")}) == BC_COMMITTED);
+  CHECK(charges == std::vector<std::uint64_t>{2 + kGroupEntryBytes + 3 * kAggSlotBytes});
+}
+
+TEST_CASE("plan API: a sorter, hash table or aggregate past the memory budget is BC_E_LIMIT, and leaves nothing behind",
+          "[sql][algebra][structures][memory]") {
+  Fixture f;
+  constexpr std::int64_t kRows = 200;
+  for (std::int64_t id = 1; id <= kRows; ++id) {
+    REQUIRE(run(f, insert_plan_ok, {id, bytes(std::string(100, 'n')), id}) == BC_COMMITTED);
+  }
+  auto key = [&](std::int64_t id) {
+    Bytes k;
+    bytecask::sql::key_put_prefix(k, bytecask::sql::kNsRow, kTbl);
+    bytecask::sql::key_put_i64(k, id, f.cat().key_layout(kTbl)->parts[0]);
+    return k;
+  };
+  for (std::int64_t which = 0; which <= 2; ++which) {
+    INFO("structure " << which);
+    // 200 rows of over 100 bytes pass 16 KiB in any of them.
+    CHECK(run(f, insert_then_hold, {std::int64_t{1000}, which, bytes("x")}, memory_budget(16u << 10)) == BC_FAILED);
+    CHECK(bc_error(f.cx) == BC_E_LIMIT);
+    CHECK(std::string{bc_error_message(f.cx)}.find("memory budget") != std::string::npos);
+    Bytes out;
+    CHECK_FALSE(f.db->get({}, key(1000), out));  // the insert before it is not committed
+    bc_ctx_reset(f.cx);
+    CHECK(bc_ctx_held_for_testing(f.cx) == 0);  // and the reset frees what it held
+  }
+  // Under a budget they fit, the same statement commits.
+  CHECK(run(f, insert_then_hold, {std::int64_t{1000}, std::int64_t{0}, bytes("x")}, memory_budget(4u << 20)) ==
+        BC_COMMITTED);
+  Bytes out;
+  CHECK(f.db->get({}, key(1000), out));
+}
+
+namespace {
+// Every row of t through a sorter keeping $1, then streamed: each step of the
+// stream builds a key, reads the payload's group key and pins nothing.
+void stream_sorted(bc_ctx* cx) {
+  bc_sorter s = bc_sorter_open(cx, bc_param_i64(cx, 0));
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx),
+                             bc_param_bool(cx, 1) ? BC_SCAN_REVERSE : BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    bc_sorter_add(cx, s, bc_col_key(cx, row, kQtyCol), row);
+    held_at_step.push_back(bc_ctx_held_for_testing(cx));
+  }
+  int64_t n = 0;
+  bc_view p = bc_empty(cx);
+  while (bc_sorter_next(cx, s, &p)) {
+    held_at_step.push_back(bc_ctx_held_for_testing(cx));
+    bc_key k = bc_key_begin(cx, kTbl);
+    bc_key_i64(cx, k, bc_col_i64(cx, p, kIdCol));
+    if (bc_bytes_eq(cx, bc_key_end(cx, k), bc_row_key(cx, kTbl, p)) && !bc_col_null(cx, p, kQtyCol)) {
+      n = bc_add(cx, n, 1);
+    }
+  }
+  bc_emit_count(cx, n);
+}
+
+// Every row of t into a hash table keyed by id, then probed by every row:
+// each outer step makes a key, a probe and a payload view.
+void stream_probes(bc_ctx* cx) {
+  bc_hash h = bc_hash_open(cx);
+  bc_cursor b = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, b)) bc_hash_put(cx, h, bc_scan_key(cx, b), bc_scan_row(cx, b));
+  int64_t n = 0;
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    held_at_step.push_back(bc_ctx_held_for_testing(cx));
+    bc_hash_iter it = bc_hash_find(cx, h, bc_row_key(cx, kTbl, bc_scan_row(cx, c)));
+    bc_view p = bc_empty(cx);
+    while (bc_hash_next(cx, it, &p)) {
+      if (bc_bytes_eq(cx, bc_col_key(cx, p, kIdCol), bc_col_key(cx, bc_scan_row(cx, c), kIdCol))) n = bc_add(cx, n, 1);
+    }
+  }
+  bc_emit_count(cx, n);
+}
+}  // namespace
+
+TEST_CASE("plan API: a structure's loops hold the same bytes at every step, and a top-n sorter holds n entries",
+          "[sql][algebra][structures][memory]") {
+  Fixture f;
+  constexpr std::int64_t kRows = 2000;
+  for (std::int64_t id = 1; id <= kRows; ++id) {
+    REQUIRE(run(f, insert_plan_ok, {id, bytes("name"), id}) == BC_COMMITTED);  // rows of one size
+  }
+  // The stream: each step's key, views and copies went at the next step.
+  held_at_step.clear();
+  CHECK(run(f, stream_sorted, {std::int64_t{0}, false}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == kRows);
+  REQUIRE(held_at_step.size() == 2 * kRows);
+  CHECK(std::all_of(held_at_step.begin() + kRows, held_at_step.end(),
+                    [&](auto h) { return h == held_at_step[kRows]; }));
+  // A top-n sorter holds n entries whatever it is given: in order, every
+  // later row is refused; in reverse, every later row replaces one.
+  for (bool reverse : {false, true}) {
+    INFO("reverse " << reverse);
+    held_at_step.clear();
+    CHECK(run(f, stream_sorted, {std::int64_t{5}, reverse}) == BC_COMMITTED);
+    CHECK(bc_ctx_affected(f.cx) == 5);
+    REQUIRE(held_at_step.size() == kRows + 5);
+    CHECK(std::all_of(held_at_step.begin() + 4, held_at_step.begin() + kRows,
+                      [&](auto h) { return h == held_at_step[4]; }));
+    // So it runs where keeping every row cannot.
+    const auto budget = held_at_step[4] + 4096;
+    CHECK(run(f, stream_sorted, {std::int64_t{5}, reverse}, memory_budget(budget)) == BC_COMMITTED);
+    CHECK(run(f, stream_sorted, {std::int64_t{0}, reverse}, memory_budget(budget)) == BC_FAILED);
+    CHECK(bc_error(f.cx) == BC_E_LIMIT);
+  }
+  // The probes: each outer step's probe, keys and payload views went with it.
+  held_at_step.clear();
+  CHECK(run(f, stream_probes, {}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == kRows);
+  REQUIRE(held_at_step.size() == kRows);
   CHECK(std::ranges::all_of(held_at_step, [&](auto h) { return h == held_at_step.front(); }));
 }
