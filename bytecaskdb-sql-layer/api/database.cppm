@@ -377,6 +377,11 @@ struct DatabaseOptions {
   // std::invalid_argument.
   IoBackend io_backend{IoBackend::Pread};
   BufferPoolOptions buffer_pool{};
+  // The most memory one statement may hold: the keys and rows it builds or
+  // reads, its pinned values, its groups and its result rows, counted as
+  // bytes requested. Past it the statement fails with BC_E_LIMIT (SQLSTATE
+  // 54000), never a spill; open refuses 0.
+  std::uint64_t statement_memory_bytes{64u << 20};
 };
 
 // Every call may be made from any thread, concurrently with any other but
@@ -387,8 +392,8 @@ struct DatabaseOptions {
 // between a DDL's batch reaching the engine and its catalog taking effect.
 class Database {
 public:
-  // Throws std::invalid_argument for a sync that is not a SyncMode, or a
-  // sync_interval_ms outside 1 to 60,000.
+  // Throws std::invalid_argument for a sync that is not a SyncMode, a
+  // sync_interval_ms outside 1 to 60,000, or a statement_memory_bytes of 0.
   [[nodiscard]] static auto open(const std::filesystem::path& dir, DatabaseOptions opts = {})
       -> std::unique_ptr<Database>;
   ~Database();
@@ -494,6 +499,7 @@ private:
   void release_context(bc_ctx* cx) noexcept;
 
   bool sync_commits_{true};  // set by open(); whether a commit waits for fdatasync
+  bc_budget budget_{};       // set by open(); every statement's
   std::mutex flush_mu_;
   std::condition_variable flush_cv_;
   bool flush_stop_{false};  // under flush_mu_
@@ -525,7 +531,6 @@ namespace bytecask::sql {
 
 namespace {
 
-constexpr std::uint32_t kArenaBytes = 4u << 20;
 constexpr std::uint32_t kMaxRetries = 3;
 
 }  // namespace
@@ -702,8 +707,10 @@ auto Database::open(const std::filesystem::path& dir, DatabaseOptions opts) -> s
   if (opts.sync_interval_ms < 1 || opts.sync_interval_ms > 60'000) {
     throw std::invalid_argument("sync_interval_ms is 1 to 60000");
   }
+  if (opts.statement_memory_bytes == 0) throw std::invalid_argument("statement_memory_bytes is at least 1");
   std::unique_ptr<Database> d{new Database};
   d->sync_commits_ = opts.sync == SyncMode::AtEveryCommit;
+  d->budget_ = {.max_reads = 0, .max_bytes = opts.statement_memory_bytes, .deadline_ns = 0};
   d->life_ = std::make_shared<DatabaseLife>();
   bytecask::Options engine;
   engine.io_backend = opts.io_backend;
@@ -807,7 +814,7 @@ auto Database::acquire_context() -> bc_ctx* {
       idle_.pop_back();
     }
   }
-  if (cx == nullptr) cx = bc_ctx_new(&bdb_, &bcat_, kArenaBytes);
+  if (cx == nullptr) cx = bc_ctx_new(&bdb_, &bcat_);
   if (cx == nullptr) throw std::bad_alloc();
 #ifdef BYTECASK_SQL_TESTING
   if (!conflict_every_commit_.load()) {
@@ -959,7 +966,7 @@ auto Database::fitting_plan(bc_ctx* cx, const Statement& stmt, const std::vector
   ++plan_checks_;
 #endif
   bc_params bp{params};
-  bc_ctx_begin(cx, &bp, {});
+  bc_ctx_begin(cx, &bp, budget_);
   auto fits = bc_ctx_check(cx, &c->ref);
   auto stale = !fits && bc_error(cx) == BC_E_LAYOUT && bc_error_detail(cx) == BC_L_INCOMPATIBLE;
   if (!fits && !stale) throw_context_error(cx);
@@ -1009,7 +1016,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
     // the snapshot as the first statement starts); and is otherwise a DDL
     // since the transaction began: 40001, as a commit after it would be.
     for (auto attempt = 0;; ++attempt) {
-      bc_ctx_begin_txn(cx, txn, &bp, {});
+      bc_ctx_begin_txn(cx, txn, &bp, budget_);
       auto pinned = bc_txn_catalog_version(txn);
 #ifdef BYTECASK_SQL_TESTING
       if (after_txn_pin_) after_txn_pin_();
@@ -1054,7 +1061,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
   }
   auto c = fitting_plan(cx, stmt, params);
   check_params(*c);
-  auto r = bc_execute(cx, c->code->fn(), &c->ref, &bp, {}, sync_commits_, kMaxRetries);
+  auto r = bc_execute(cx, c->code->fn(), &c->ref, &bp, budget_, sync_commits_, kMaxRetries);
   // bc_ctx_run checks the plan against the catalog it pinned. A plan a DDL
   // made incompatible (BC_E_LAYOUT with BC_L_INCOMPATIBLE) is recompiled
   // from its text and run once more; one a DDL left compatible keeps
@@ -1063,7 +1070,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
     bc_ctx_reset(cx);
     c = recompile(stmt);
     check_params(*c);
-    r = bc_execute(cx, c->code->fn(), &c->ref, &bp, {}, sync_commits_, kMaxRetries);
+    r = bc_execute(cx, c->code->fn(), &c->ref, &bp, budget_, sync_commits_, kMaxRetries);
   }
   if (r == BC_CONFLICT) {
     bc_ctx_reset(cx);
@@ -1121,7 +1128,7 @@ auto Database::begin(TransactionOptions opts) -> Transaction {
 
 Transaction::Transaction(Database& db, TransactionOptions opts)
     : life_{db.life_}, db_{&db}, h_{std::make_unique<TxnHandle>()} {
-  h_->cx = bc_ctx_new(&db.bdb_, &db.bcat_, kArenaBytes);
+  h_->cx = bc_ctx_new(&db.bdb_, &db.bcat_);
   h_->txn = h_->cx == nullptr ? nullptr : bc_txn_new(&db.bdb_, &db.bcat_, opts.max_bytes);
   if (h_->txn == nullptr) {
     h_->release();

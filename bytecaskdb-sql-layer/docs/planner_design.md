@@ -2,9 +2,10 @@
 
 Status: **design, approved (owner, 2026-10-24); slice 1 built** (*Slice 1
 as built*): the pipeline, at parity with the MVP's rule-based planner,
-which it replaced. Slices 2 to 5 are not built. The first of the post-MVP
-designs (#487, *Next*). The parser, the plan API and TinyCC are unchanged;
-the binder's output changed.
+which it replaced. The statement memory budget of *Memory* is built too
+(`plan_api_design.md`, revision 6); the lifetime rule and slices 2 to 5
+are not. The first of the post-MVP designs (#487, *Next*). The parser, the
+plan API and TinyCC are unchanged; the binder's output changed.
 
 ## Why
 

@@ -320,10 +320,6 @@ auto empty_row(Expr::Fn fn) -> std::vector<std::string> {
   return {"bc_emit_begin(cx);", "bc_emit_null(cx);", "bc_emit_end(cx);"};
 }
 
-// What a COUNT(DISTINCT) groups its values in: ample for any key set a
-// statement of the MVP reads; past it the statement fails (BC_E_MEMORY).
-constexpr std::uint32_t kGroupBytes = 16u << 20;
-
 // Prints a physical plan, operator by operator. produce(n, k) prints n's
 // code, and k at the point where each row n emits is in hand: inside the
 // loop over a cursor, or once for a single row. `k` is the parent's consume.
@@ -723,7 +719,7 @@ private:
   // whether a value was seen for SUM and MIN, groups for COUNT(DISTINCT).
   void open_aggregate(const Expr& a) {
     if (a.distinct) {
-      w_.line("bc_agg groups = bc_agg_open(cx, " + std::to_string(kGroupBytes) + "u, 0);");
+      w_.line("bc_agg groups = bc_agg_open(cx, 0);");
       return;
     }
     switch (a.fn) {

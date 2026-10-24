@@ -72,6 +72,12 @@ void bump_qty(bc_ctx* cx) {
   bc_row_set_i64(cx, r, kQtyCol, bc_add(cx, bc_col_i64(cx, old, kQtyCol), 1));
   bc_update(cx, kTbl, old, bc_row_end(cx, r));
 }
+// Copies past one arena chunk: the arena grows by another, freed at reset.
+void pin_many(bc_ctx* cx) {
+  bool found = false;
+  bc_view row = bc_get(cx, bc_key_params(cx, kTbl, 0, 1), &found);
+  for (int i = 0; found && i < 3000; ++i) (void)bc_pin(cx, row);
+}
 // NULL for the NOT NULL id: by parameter, by bc_row_set_null, left unset.
 void null_id_param(bc_ctx* cx) {
   bc_row r = bc_row_begin(cx, kTbl);
@@ -119,6 +125,7 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
        {{std::int64_t{2}, bytes("n2"), std::int64_t{20}}}},
       {"bc_emit_key_part", emit_names, {}, {PhysType::Bytes}, BC_OK},
       {"update", bump_qty, {std::int64_t{3}}, {}, BC_OK},
+      {"bc_pin, past one arena chunk", pin_many, {std::int64_t{1}}, {}, BC_OK},
       {"bc_row_set_param NULL", null_id_param, {bc_value{}}, {}, BC_E_CONSTRAINT},
       {"bc_row_set_null", null_id_set, {}, {}, BC_E_CONSTRAINT},
       {"bc_row_end, a column unset", id_unset, {}, {}, BC_E_CONSTRAINT},
