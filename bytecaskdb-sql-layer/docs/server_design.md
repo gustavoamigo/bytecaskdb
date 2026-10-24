@@ -135,11 +135,11 @@ decides only whether it waits for `fdatasync`:
   join before it closes the engine.
 
   A failed sync is logged to stderr. A failed `fdatasync` degrades the
-  engine: every later write fails, and `close()` throws `DbDegraded`, naming
-  the commits that are not durable (the server then exits non-zero). No sync
-  can succeed after that, so the flusher stops. Any other failure is logged
-  once and retried at the next interval. No test of the layer reaches this
-  path: its tests have no way to fail an `fdatasync`.
+  engine, as the engine's `CONTRACT.md` states (*Degraded*): every later
+  write fails, and `close()` throws `DbDegraded`, naming the commits that are
+  not durable (the server then exits non-zero). No sync can succeed after
+  that, so the flusher stops. Any other failure is logged once and retried
+  at the next interval.
 - `AT_FILE_ROTATION`: they pass `sync = false` and no flusher runs. Data
   reaches the disk when the active file rotates, and at `close()`.
 
