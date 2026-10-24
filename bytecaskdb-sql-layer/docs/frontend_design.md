@@ -93,7 +93,7 @@ kind the transformer doesn't take is refused with its position.
   - Of a `REAL` or `DOUBLE PRECISION` column they are refused too (*Known
     differences*), as are `SUM` and `AVG` of one (42601).
 
-**`GROUP BY` and `HAVING`** (`planner_design.md`, *GROUP BY as built*):
+**`GROUP BY` and `HAVING`** (`planner_design.md`, *Aggregates*):
 - `GROUP BY` takes a list of columns of the statement's tables, of any type.
   NULLs form one group, and a DOUBLE's `-0.0` and `0.0` one (its row shows
   the value of the group's first row, as PostgreSQL's hashed aggregate
@@ -103,10 +103,9 @@ kind the transformer doesn't take is refused with its position.
   or of a table whose whole primary key is grouped: PostgreSQL's
   functional dependency. Every row of a group holds the same value of such
   a column, so the binder lists it apart (`Aggregate::dependent`), read
-  from the group's rows, and the `GROUP BY` stays as written. Grouping by
-  it too, as this slice first did, made the same groups but could keep an
-  index's order from streaming them. Anything else is 42803, PostgreSQL's
-  message.
+  from the group's rows, and the `GROUP BY` stays as written, so an
+  index's order can still stream the groups. Anything else is 42803,
+  PostgreSQL's message.
 - `HAVING` is a conjunction of comparisons of a grouped column or an
   aggregate with a parameter. The parameter takes the column's type, or the
   aggregate's: `COUNT`'s and an integer `SUM`'s `bigint`, a `SUM` of a
@@ -264,12 +263,10 @@ fail on them.
   value are 23505 on both
   (`test_one_unique_value_given_to_two_rows_is_23505`). The machine adds to
   no column a unique index holds.
-- **A filter on a DOUBLE is refused** (`planner_design.md`, *Hash joins
-  as built*, *What the search refuses*): a filter on a REAL or DOUBLE
-  PRECISION column no key takes. PostgreSQL runs it. Full scans and sorts,
-  which #533 lifted, joins no key reaches, which hash joins lifted (#534),
-  and a sort of a join of two scans by both tables' columns, which a
-  sorter per loop lifted, are no longer refused.
+- **A filter on a DOUBLE is refused** (`planner_design.md`, *What the search refuses*): a filter on a REAL or DOUBLE
+  PRECISION column no key takes. PostgreSQL runs it. Everything else in
+  the dialect is planned: full scans, sorts and joins no key reaches
+  included.
 - **A sort, or a structure of groups, past the statement's memory budget
   fails** with 54000, where PostgreSQL spills it to disk
   (`planner_design.md`, *Memory*).
@@ -285,9 +282,9 @@ The owner's decisions on the front end (2026-10-21):
 - **The range check on computed values** is in the plan API, raising 22003
   as PostgreSQL's operators do, so no key is built from a value its column
   can't hold (*The range check on computed values*).
-- **The planner is rule-based, and refuses full scans and sorts no index
-  provides.** Both are superseded by `planner_design.md`: a cost-based
-  search, with sorts and full scans (#533).
+- **The planner was rule-based, and refused full scans and sorts no index
+  provided.** Superseded by `planner_design.md`: a cost-based search,
+  which plans both.
 
 The decisions on the TPROC-C statements are in `testing_design.md`, *The
 TPROC-C statements*. The decisions on the gate are in `server_design.md`.

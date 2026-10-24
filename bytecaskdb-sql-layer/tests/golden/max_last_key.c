@@ -11,16 +11,22 @@ void plan(bc_ctx *cx) {
     bc_emit_end(cx);
     return;
   }
-  bc_view lo = bc_key_params(cx, TBL_4, 0, 1);
-  bc_cursor c = bc_scan_open(cx, TBL_4, lo, lo, BC_SCAN_PREFIX | BC_SCAN_REVERSE);
-  if (bc_scan_next(cx, c)) {
-    bc_emit_begin(cx);
-    bc_emit_key_part(cx, TBL_4, bc_scan_key(cx, c), PART_4_1);
-    bc_emit_end(cx);
-  } else {
-    bc_emit_begin(cx);
-    bc_emit_null(cx);
-    bc_emit_end(cx);
+  int64_t kv0 = 0;
+  bool kn0 = true;
+  {
+    bc_view lo = bc_key_params(cx, TBL_4, 0, 1);
+    bc_cursor c = bc_scan_open(cx, TBL_4, lo, lo, BC_SCAN_PREFIX | BC_SCAN_REVERSE);
+    if (bc_scan_next(cx, c)) {
+      kv0 = bc_key_part_i64(cx, TBL_4, bc_scan_key(cx, c), PART_4_1);
+      kn0 = false;
+    }
+    bc_scan_close(cx, c);
   }
-  bc_scan_close(cx, c);
+  bc_emit_begin(cx);
+  if (kn0) {
+    bc_emit_null(cx);
+  } else {
+    bc_emit_i64(cx, kv0);
+  }
+  bc_emit_end(cx);
 }

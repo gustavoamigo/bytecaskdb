@@ -637,8 +637,7 @@ type whose sum can leave `int64`. An overflow is the same range error
 range", SQLSTATE 22003, #540), where `bc_add` stays `BC_E_ARITH` for
 aggregates and intermediates.
 
-`bc_check_int` is the range check of a computed integer (added in the
-front end's slice 5): it returns `v` when it is inside the SQL type the
+`bc_check_int` is the range check of a computed integer: it returns `v` when it is inside the SQL type the
 compiler resolved, `BC_SMALLINT` or `BC_INTEGER`, and otherwise sets
 `BC_E_CONSTRAINT` with `BC_C_RANGE` on `object_id` and PostgreSQL's words
 ("integer out of range"), SQLSTATE 22003. Which type an operation is in is
@@ -670,7 +669,7 @@ bc_view  bc_key_successor(bc_ctx *, bc_view key);     /* smallest key greater th
 | `bc_key_i64`, `bc_key_f64`, `bc_key_bool`, `bc_key_bytes`, `bc_key_null` | Appends one part. Nullability and direction come from the catalog entry for `table_or_index`, so the builder knows whether to write a null marker and whether to invert the bytes. A part of the wrong type, or more parts than the key has, is `BC_E_HANDLE`. |
 | `bc_key_param` | Appends parameter `i` as the next part: its value, or the null part when it is NULL. A type that is not the part's, or a NULL for a part that is not nullable, is `BC_E_HANDLE`. A `REAL` part is keyed as its float rounding. Whether the value is inside the column's type is checked before the plan runs, by the embedded API: every compared parameter has one SQL type, and a parameter compared with columns of two is refused at bind (`docs/types_design.md`). |
 | `bc_key_end` | Finalizes and returns the key. A partial key (fewer parts than the index has) is legal and is a prefix the compiler uses as a scan bound. A key over the engine's hard ceiling (65,535 bytes) is `BC_E_LIMIT`. |
-| `bc_key_fits` | Whether the key built so far is within the engine's key ceiling. A key past it names no row, so a join asks before `bc_key_end` and skips an outer row whose long value would make the inner key one: PostgreSQL finds no inner row there, where `bc_key_end` would fail the statement (front end slice 5). |
+| `bc_key_fits` | Whether the key built so far is within the engine's key ceiling. A key past it names no row, so a join asks before `bc_key_end` and skips an outer row whose long value would make the inner key one: PostgreSQL finds no inner row there, where `bc_key_end` would fail the statement. |
 | `bc_key_params` | The key, or prefix, of `table_or_index` whose first `n` parts are parameters `first` to `first + n - 1`, each as `bc_key_param` appends it: `bc_key_begin`, `n` parts and `bc_key_end` in one call. `(cx, TBL_9, 0, 3)` is a composite primary key `(w_id, d_id, c_id)`. The builder remains for keys whose parts come from anywhere else. |
 | `bc_key_successor` | The exclusive upper bound of the prefix `key`: its last byte incremented, carrying. Turns a prefix into a half-open range where `BC_SCAN_PREFIX` does not fit. |
 
@@ -799,7 +798,7 @@ bc_view  bc_pin(bc_ctx *, bc_view);                 /* a copy that lives until r
 | `bc_col_null` | True if column `col`'s bit in the bitmap is clear. The bitmap says *present*: a column set null and a column the row predates both have the bit clear, so one test covers both (`docs/types_design.md`, *Row format*). A set bit for a column the row does not hold, or a variable column whose two `var_end` words are out of order or past the row, is `BC_E_CORRUPT`: it reads the column through the one decoder every reader uses, so it never disagrees with them. A variable column's bytes are viewed, not copied. The compiler emits it in one place: an `UPDATE` that assigns from a nullable column (`SET c = src`, `SET c = src - $n`), before it reads `src`. |
 | `bc_col_i64`, `bc_col_f64`, `bc_col_bool` | Loads the 8-byte column. A null column, or one a shorter row predates, reads as zero; `bc_col_null` decides first and reports both as null. A column marked present that the row does not hold is `BC_E_CORRUPT`. Little-endian in the row. |
 | `bc_col_bytes` | The variable-length column, as a view with the row's lifetime. A column marked present whose slot the row does not hold, or whose `var_end` runs past the row, is `BC_E_CORRUPT`. |
-| `bc_col_key` | The column's value, NULL included, encoded as an ascending nullable key part of its type: equal values give equal bytes, a DOUBLE's `-0.0` and `0.0` and every NaN alike. A group key for `bc_agg_group` (front end slice 5), so it has no key ceiling. It is the innermost step's, whichever row it was read from, so a scan holds one entry's at a time, and an outer row's key read in an inner loop goes when the inner loop steps. |
+| `bc_col_key` | The column's value, NULL included, encoded as an ascending nullable key part of its type: equal values give equal bytes, a DOUBLE's `-0.0` and `0.0` and every NaN alike. A group key for `bc_agg_group`, so it has no key ceiling. It is the innermost step's, whichever row it was read from, so a scan holds one entry's at a time, and an outer row's key read in an inner loop goes when the inner loop steps. |
 | `bc_row_key` | The table's full primary key (namespace, table id, parts), encoded from the row's columns: for a `bc_get`, a guard, or a scan bound reached from a row. Built in the arena, the step's. |
 | `bc_row_begin` | Starts a row of `table`'s current layout with every column at its default: the catalog's default for a column that has one, null for the rest. A plan compiled before a column was added writes the column's default without naming it. |
 | `bc_row_from` | Starts a row of `table` as a copy of `old`, a row of that table and of its current layout generation (otherwise as for the writes below: `BC_L_ROW`, `BC_L_RETIRED` or `BC_E_CORRUPT`; a `REBUILD`, #503, widens this to any generation). The `UPDATE` pattern: copy, set the assigned columns, end. |
@@ -859,7 +858,7 @@ bool      bc_agg_null(bc_ctx *, bc_group, uint32_t slot);
 | `bc_agg_group` | Finds or creates the group for `group_key`, a mem-comparable byte string. Slots start at zero, with no value folded in. |
 | `bc_agg_add_*`, `bc_agg_min_*`, `bc_agg_max_*`, `bc_agg_count` | Folds a value into a slot: `SUM`, `MIN`, `MAX`, `COUNT`; `AVG` is a sum slot and a count slot divided at emit. A slot's first fold fixes its kind, the same for every group; a fold of another kind, or a slot past `slots`, is `BC_E_HANDLE`. An integer sum, or a count, that overflows is `BC_E_ARITH` ("bigint out of range"); a double sum that overflows from finite values is `BC_E_ARITH` ("value out of range: overflow"), as PostgreSQL's `float8` sum, and an infinite or NaN input carries through. |
 | `bc_agg_next` | Iterates groups in first-appearance order, one unit each. |
-| `bc_agg_clear` | Drops every group and releases what each was charged, its key, `kGroupEntryBytes` and its slots; the slots keep their kinds. The groups' indices start again at 0, under a new generation of the aggregate's groups, so a handle of a dropped group is stale (`BC_E_HANDLE`), never another group's, and the limit of 2^32 groups (`BC_E_LIMIT`) counts the groups held, not every group ever made. A streamed `COUNT(DISTINCT)` clears its values' aggregate as each group ends, so it holds only the current group's (`planner_design.md`, *GROUP BY as built*). Once `bc_agg_next` has started on it, `BC_E_HANDLE`. |
+| `bc_agg_clear` | Drops every group and releases what each was charged, its key, `kGroupEntryBytes` and its slots; the slots keep their kinds. The groups' indices start again at 0, under a new generation of the aggregate's groups, so a handle of a dropped group is stale (`BC_E_HANDLE`), never another group's, and the limit of 2^32 groups (`BC_E_LIMIT`) counts the groups held, not every group ever made. A streamed `COUNT(DISTINCT)` clears its values' aggregate as each group ends, so it holds only the current group's (`planner_design.md`, *Aggregates*). Once `bc_agg_next` has started on it, `BC_E_HANDLE`. |
 | `bc_agg_i64`, `bc_agg_f64` | Reads a slot: `bc_agg_f64` a double sum, `bc_agg_i64` any other. A slot read as the other type is `BC_E_HANDLE`; one never folded reads zero either way. |
 | `bc_agg_null` | True when no value was folded into the slot in this group, of any kind; a slot past `slots` is `BC_E_HANDLE`. |
 
@@ -872,9 +871,12 @@ NULL, so a plan keeps PostgreSQL's semantics this way:
   plan emits NULL where `bc_agg_null` is true for the slot; no count slot
   is needed for it. `AVG` still divides its sum slot by a count slot.
   `COUNT` of such a group is 0.
-- An aggregate without `GROUP BY` returns one row over no input: the plan
-  makes its group, with the empty key, before the input loop, so it exists
-  when none arrives. With `GROUP BY`, no input is no groups and no rows.
+- An aggregate without `GROUP BY` returns one row over no input. The
+  compiler keeps its one group in locals, not in an aggregate, and emits
+  the row after the loop, whether or not a row arrived (`planner_design.md`,
+  *Aggregates*); a plan that kept it in an aggregate would make the
+  group, with the empty key, before the loop. With `GROUP BY`, no input is
+  no groups and no rows.
 - `SUM` of a `BIGINT` is a `numeric` in PostgreSQL and never overflows;
   here an integer sum past 64 bits is `BC_E_ARITH`, SQLSTATE 22003. `SUM`
   of a `SMALLINT` or `INTEGER` is a `bigint` in both, and overflows alike.

@@ -776,8 +776,10 @@ The run script requires W ≥ the user count; the monitor is not a user.
   17; now every statement also goes through the server with psycopg, with
   every OID loaded as `str`. psycopg is set to send only what the server
   takes:
-  - text placeholders (`%t`), so parameters go in text format; psycopg's
-    default dumpers are binary for several types, which would be `0A000`;
+  - text placeholders (`%(pn)t`), so parameters go in text format; psycopg's
+    default dumpers are binary for several types, which would be `0A000`.
+    They are named by their `$n`, so a `$n` the statement uses twice is one
+    parameter, as written;
   - `prepare_threshold=None`, so it never prepares server-side or sends
     `DEALLOCATE ALL`;
   - no `SET` of any kind, `search_path` included. The wire results must match PostgreSQL's text,

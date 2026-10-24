@@ -1440,6 +1440,22 @@ TEST_CASE("search: COUNT(*), MIN and MAX of one group are answered from the rang
     CHECK_FALSE(has(g, "while ("));
   }
   CHECK(has(plan("SELECT count(*), min(a), max(a) FROM g WHERE a > $1"), "bc_count_range"));
+  // A lone MIN and a lone MAX take one route: each read into a local from
+  // its first entry, MIN forward and MAX in reverse, and over every row
+  // otherwise, as a group of every row.
+  for (const auto* sql : {"SELECT min(a) FROM g WHERE a > $1", "SELECT max(a) FROM g WHERE a > $1"}) {
+    INFO(sql);
+    auto g = plan(sql);
+    CHECK(has(g, "kv0 = bc_key_part_i64("));
+    CHECK(has(g, "BC_SCAN_REVERSE") == (std::string_view{sql}.find("max") != std::string_view::npos));
+    CHECK_FALSE(has(g, "while ("));
+  }
+  for (const auto* sql : {"SELECT min(v) FROM g WHERE a > $1", "SELECT max(v) FROM g WHERE a > $1"}) {
+    INFO(sql);
+    auto g = plan(sql);
+    CHECK(has(g, "x0_0"));
+    CHECK(has(g, "while ("));
+  }
   // A filter the range does not take, an aggregate other than these, a
   // second column, a GROUP BY or a HAVING: every row is read.
   for (const auto* sql : {"SELECT max(a) FROM g WHERE a > $1 AND v = $2", "SELECT max(a), count(v) FROM g WHERE a > $1",

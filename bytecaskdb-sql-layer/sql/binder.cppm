@@ -450,7 +450,7 @@ public:
   // declared precision (the total may take 19 digits), held at the column's
   // scale; MIN and MAX of the column's type; AVG a numeric of no declared
   // precision, its scale PostgreSQL's division's (the API computes it from
-  // the plan's sum and count, docs/planner_design.md, *GROUP BY as built*).
+  // the plan's sum and count, docs/planner_design.md, *Aggregates*).
   static auto aggregate(const Column* c, std::uint32_t table, const ast::Expr& e) -> logical::Output {
     using Fn = ast::Expr::Fn;
     auto agg = logical::expr(logical::Expr::Kind::Aggregate, SqlType{SqlKind::BigInt});

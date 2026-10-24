@@ -334,17 +334,17 @@ auto count_row(const std::string& n) -> std::vector<std::string> {
   return {"bc_emit_begin(cx);", "bc_emit_i64(cx, " + n + ");", "bc_emit_end(cx);"};
 }
 
-// The aggregate's row over no rows: COUNT 0, SUM and MIN NULL.
-auto empty_row(Expr::Fn fn) -> std::vector<std::string> {
-  if (fn == Expr::Fn::Count) return count_row("0");
-  return {"bc_emit_begin(cx);", "bc_emit_null(cx);", "bc_emit_end(cx);"};
-}
-
-// The row of aggregates over no rows: each COUNT 0, anything else NULL.
+// The row of aggregates over no rows: each COUNT 0, anything else NULL in
+// each of its plan's columns (physical::plan_columns).
 auto empty_row(const std::vector<Expr>& outputs) -> std::vector<std::string> {
-  if (outputs.size() == 1) return empty_row(outputs[0].fn);
   std::vector<std::string> out{"bc_emit_begin(cx);"};
-  for (const auto& o : outputs) out.emplace_back(o.fn == Expr::Fn::Count ? "bc_emit_i64(cx, 0);" : "bc_emit_null(cx);");
+  for (const auto& o : outputs) {
+    if (o.fn == Expr::Fn::Count) {
+      out.emplace_back("bc_emit_i64(cx, 0);");
+      continue;
+    }
+    for (std::size_t i = 0; i < physical::plan_columns(o.type).size(); ++i) out.emplace_back("bc_emit_null(cx);");
+  }
   out.emplace_back("bc_emit_end(cx);");
   return out;
 }
@@ -389,9 +389,9 @@ private:
           if constexpr (std::is_same_v<T, physical::Update> || std::is_same_v<T, physical::Delete>) {
             return {"bc_emit_count(cx, 0);"};
           } else if constexpr (std::is_same_v<T, physical::Aggregate>) {
-            return op.emits ? empty_row(op.agg.fn) : std::vector<std::string>{};
+            return op.emits ? empty_row({op.agg}) : std::vector<std::string>{};
           } else if constexpr (std::is_same_v<T, physical::CountRange>) {
-            return op.emits ? empty_row(Expr::Fn::Count) : std::vector<std::string>{};
+            return op.emits ? count_row("0") : std::vector<std::string>{};
           } else if constexpr (std::is_same_v<T, physical::KeyAggregates>) {
             return op.emits ? empty_row(op.outputs) : std::vector<std::string>{};
           } else if constexpr (std::is_same_v<T, physical::GroupEmit>) {
@@ -705,46 +705,13 @@ private:
     w_.close();
   }
 
-  // Aggregates from the keys. A lone MIN or MAX is emitted from the first
-  // entry of its range past the part's NULLs, forward or in reverse, none
-  // of them NULL: one step, never the scan's end, the cursor closed after
-  // it. With several, COUNT(*) counts the range, each MIN or MAX reads its
-  // entry into kv<i>, NULL while kn<i>, a block of its own, and then the
+  // Aggregates from the keys: COUNT(*) counts the range, and each MIN or
+  // MAX, once, reads the first entry of its range past the part's NULLs,
+  // forward or in reverse, into kv<i>, NULL while kn<i>: one step, never the
+  // scan's end, in a block of its own, the cursor closed after it. Then the
   // row is emitted.
   void produce(const physical::KeyAggregates& m, const Consume&) {
     if (!m.emits) return;
-    auto values_scan = [&](Expr::Fn fn) {
-      auto sc = m.values;
-      sc.reverse = fn == Expr::Fn::Max;
-      return sc;
-    };
-    auto entry_part = [&](const physical::Scan& sc, const std::string& kind) {
-      if (sc.covering) {
-        return "bc_key_part_" + kind + "(cx, " + w_.obj(sc.object) + ", bc_scan_key(cx, " + cursor_ + "), " +
-               w_.part(sc.object, *m.arg) + ")";
-      }
-      w_.reads(sc.table);
-      return "bc_col_" + kind + "(cx, bc_scan_row(cx, " + cursor_ + "), " + w_.col(*m.arg) + ")";
-    };
-    if (m.outputs.size() == 1 && m.outputs[0].fn != Expr::Fn::Count) {
-      const auto sc = values_scan(m.outputs[0].fn);
-      open_scan(sc);
-      w_.open("if (bc_scan_next(cx, " + cursor_ + "))");
-      w_.line("bc_emit_begin(cx);");
-      if (sc.covering) {
-        w_.line("bc_emit_key_part(cx, " + w_.obj(sc.object) + ", bc_scan_key(cx, " + cursor_ + "), " +
-                w_.part(sc.object, *m.arg) + ");");
-      } else {
-        w_.reads(sc.table);
-        w_.line("bc_emit_col(cx, bc_scan_row(cx, " + cursor_ + "), " + w_.col(*m.arg) + ");");
-      }
-      w_.line("bc_emit_end(cx);");
-      w_.otherwise();
-      for (const auto& line : no_rows_) w_.line(line);
-      w_.close();
-      w_.line("bc_scan_close(cx, " + cursor_ + ");");
-      return;
-    }
     if (std::ranges::any_of(m.outputs, [](const Expr& o) { return o.fn == Expr::Fn::Count; })) {
       print_count_range(m.counted);
       w_.line("int64_t n = bc_count_range(cx, " + w_.obj(m.counted.object) + ", lo, hi, INT64_MAX);");
@@ -758,10 +725,17 @@ private:
       w_.line("int64_t kv" + i + " = 0;");
       w_.line("bool kn" + i + " = true;");
       w_.open("");
-      const auto sc = values_scan(o.fn);
+      auto sc = m.values;
+      sc.reverse = o.fn == Expr::Fn::Max;
       open_scan(sc);
       w_.open("if (bc_scan_next(cx, " + cursor_ + "))");
-      w_.line("kv" + i + " = " + entry_part(sc, "i64") + ";");
+      if (sc.covering) {
+        w_.line("kv" + i + " = bc_key_part_i64(cx, " + w_.obj(sc.object) + ", bc_scan_key(cx, " + cursor_ + "), " +
+                w_.part(sc.object, *m.arg) + ");");
+      } else {
+        w_.reads(sc.table);
+        w_.line("kv" + i + " = bc_col_i64(cx, bc_scan_row(cx, " + cursor_ + "), " + w_.col(*m.arg) + ");");
+      }
       w_.line("kn" + i + " = false;");
       w_.close();
       w_.line("bc_scan_close(cx, " + cursor_ + ");");
@@ -1064,7 +1038,7 @@ private:
     for (const auto& line : count_row(n)) w_.line(line);
   }
 
-  // The SUM or MIN row: the value, or NULL when no row gave one.
+  // The SUM row: the value, or NULL when no row gave one.
   void emit_value_or_null(const std::string& value) {
     w_.line("bc_emit_begin(cx);");
     w_.open("if (seen)");
@@ -1087,8 +1061,8 @@ private:
     return {col_null(arg), read_col(arg)};
   }
 
-  // The accumulators an aggregate's loop keeps: n for COUNT, sum or m and
-  // whether a value was seen for SUM and MIN, groups for COUNT(DISTINCT).
+  // The accumulators an aggregate's loop keeps: n for COUNT, sum and whether
+  // a value was seen for SUM, groups for COUNT(DISTINCT).
   void open_aggregate(const Expr& a) {
     if (a.distinct) {
       w_.line("bc_agg groups = bc_agg_open(cx, 0);");
@@ -1097,7 +1071,7 @@ private:
     switch (a.fn) {
       case Expr::Fn::Count: w_.line("int64_t n = 0;"); break;
       case Expr::Fn::Sum: w_.line("int64_t sum = 0;"); break;
-      case Expr::Fn::Min: w_.line("int64_t m = 0;"); break;
+      case Expr::Fn::Min:
       case Expr::Fn::Max:
       case Expr::Fn::Avg: break;  // a GroupAggregate's
     }
@@ -1115,7 +1089,7 @@ private:
     switch (a.fn) {
       case Expr::Fn::Count: emit_count("n"); break;
       case Expr::Fn::Sum: emit_value_or_null("sum"); break;
-      case Expr::Fn::Min: emit_value_or_null("m"); break;
+      case Expr::Fn::Min:
       case Expr::Fn::Max:
       case Expr::Fn::Avg: break;  // a GroupAggregate's
     }
@@ -1144,12 +1118,6 @@ private:
         if (arg.nullable) w_.close();
         return;
       case Expr::Fn::Min:
-        if (arg.nullable) w_.open("if (!" + is_null + ")");
-        w_.line("int64_t v = " + value + ";");
-        w_.line("if (!seen || v < m) m = v;");
-        w_.line("seen = true;");
-        if (arg.nullable) w_.close();
-        return;
       case Expr::Fn::Max:
       case Expr::Fn::Avg: return;  // a GroupAggregate's
     }
@@ -1157,7 +1125,7 @@ private:
 
   // An aggregate over at most one row, read: its value when `hit` holds,
   // NULL as NULL (COUNT: 1, or 0 for a NULL argument); over none, COUNT 0 and
-  // SUM and MIN NULL.
+  // SUM NULL.
   void emit_one_row(const Expr& a, const std::string& hit) {
     if (a.fn != Expr::Fn::Count) {
       const auto& arg = a.args[0].col;
@@ -1206,7 +1174,7 @@ private:
 
   // ------------------------------------------------------------- GROUP BY
 
-  // The group in hand (docs/planner_design.md, *GROUP BY as built*): in a
+  // The group in hand (docs/planner_design.md, *Aggregates*): in a
   // structure, its handle g<i> and the row each held table's hash table holds
   // for it, fr<i>_<j>; streamed, the locals kv<i>_<j> (a key's value) and
   // kn<i>_<j> (its NULL), x<i>_<j> (an aggregate's value), xs<i>_<j> (whether
@@ -1677,16 +1645,7 @@ private:
                 param(PhysType::I64, p);
       }
     }
-    std::vector<std::string> row{"bc_emit_begin(cx);"};
-    for (const auto& o : e.outputs) {
-      if (o.fn == Expr::Fn::Count) {
-        row.emplace_back("bc_emit_i64(cx, 0);");
-      } else {
-        row.emplace_back("bc_emit_null(cx);");
-        if (o.fn == Expr::Fn::Avg) row.emplace_back("bc_emit_null(cx);");
-      }
-    }
-    row.emplace_back("bc_emit_end(cx);");
+    auto row = empty_row(e.outputs);
     if (cond.empty()) return row;
     std::vector<std::string> out{"if (" + cond + ") {"};
     for (const auto& r : row) out.push_back("  " + r);
@@ -1824,12 +1783,8 @@ auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std
       },
       p.root->op);
   for (const auto& r : p.result) {
-    // A NUMERIC's sum and count.
-    if (r.sql.kind == SqlKind::Numeric) {
-      out.result_types.insert(out.result_types.end(), {PhysType::I64, PhysType::I64});
-    } else {
-      out.result_types.push_back(r.type);
-    }
+    const auto columns = physical::plan_columns(r.sql);
+    out.result_types.insert(out.result_types.end(), columns.begin(), columns.end());
     out.result_names.push_back(r.name);
     out.result_sql.push_back(r.sql);
   }

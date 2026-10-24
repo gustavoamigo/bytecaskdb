@@ -36,6 +36,8 @@ auto p(std::uint32_t n) -> logical::Expr { return logical::param(n, SqlType{SqlK
 
 const logical::ColumnRef kId{1, 0, PhysType::I64, false};
 const logical::ColumnRef kD{1, 1, PhysType::F64, true};
+const logical::ColumnRef kV{1, 2, PhysType::I64, true};
+const logical::ColumnRef kB{1, 3, PhysType::Bytes, false};
 
 auto get(std::vector<logical::Expr> key, bool for_update = false) -> physical::NodePtr {
   return node(physical::PointGet{1, std::move(key), for_update});
@@ -126,6 +128,29 @@ TEST_CASE("physical: check refuses what codegen can't print", "[sql][physical]")
   refused(plan(node(physical::KeyAggregates{counted, forward, kD, {max_id}, true})), "MIN or MAX of its part");
   auto other_range = scan({p(0), p(1)}, past_nulls);
   refused(plan(node(physical::KeyAggregates{counted, other_range, kId, {count, min_id}, true})), "another range");
+  // Of a nullable part, the values' range starts past its NULLs whenever its
+  // low end is open: a prefix alone, a full scan's Range{}, or an upper
+  // bound alone would start at them.
+  const auto min_v = call(logical::Expr::Fn::Min, kV);
+  const auto max_v = call(logical::Expr::Fn::Max, kV);
+  CHECK(refusal(plan(node(physical::KeyAggregates{counted, forward, kV, {min_v, max_v}, true}))).empty());
+  const auto upper_past_nulls = physical::Range{{physical::KeyBound::Kind::NullPart, std::nullopt, true}, value(p(1))};
+  CHECK(refusal(plan(node(physical::KeyAggregates{counted, scan({p(0)}, upper_past_nulls), kV, {min_v}, true}))).empty());
+  CHECK(refusal(plan(node(physical::KeyAggregates{counted, scan({p(0)}, physical::Range{value(p(1)), {}}), kV, {min_v},
+                                                  true})))
+            .empty());
+  for (const auto& open : {scan({p(0)}, {}), scan({p(0)}, physical::Range{}), scan({p(0)}, physical::Range{{}, value(p(1))}),
+                           scan({p(0)}, physical::Range{{physical::KeyBound::Kind::NullPart, std::nullopt, false}, {}})}) {
+    refused(plan(node(physical::KeyAggregates{counted, open, kV, {min_v}, true})), "starts at its part's NULLs");
+    refused(plan(node(physical::KeyAggregates{counted, open, kV, {max_v}, true})), "starts at its part's NULLs");
+  }
+  // Not nullable: no NULLs to skip.
+  CHECK(refusal(plan(node(physical::KeyAggregates{counted, counted, kId, {min_id}, true}))).empty());
+  // Each MIN or MAX is read into an int64_t: a column held otherwise is refused.
+  const auto max_b = call(logical::Expr::Fn::Max, kB);
+  refused(plan(node(physical::KeyAggregates{counted, counted, kB, {max_b}, true})), "not held as I64");
+  // The aggregate row is COUNT's or SUM's; MIN and MAX are a GroupAggregate's.
+  refused(plan(node(physical::Aggregate{node(scan({p(0)}, {})), min_id, true})), "other than COUNT or SUM");
   refused(plan(node(physical::Limit{get({p(0)}), 1})), "LIMIT not under");
   CHECK(refusal(plan(emit(node(physical::Limit{get({p(0)}), 1})))).empty());
 
@@ -247,11 +272,11 @@ TEST_CASE("physical: a DOUBLE column is never read from a key, wherever codegen 
   refused(plan(emit(node(physical::Filter{node(physical::IndexJoin{covering(), 2, {p(1)}}), {by_double}}), {other})),
           "DOUBLE column read from a key");
   // An aggregate's argument.
-  auto min_d = logical::expr(logical::Expr::Kind::Aggregate, SqlType{SqlKind::Double});
-  min_d.fn = logical::Expr::Fn::Min;
-  min_d.args.push_back(col(kD, SqlKind::Double));
-  CHECK(refusal(plan(node(physical::Aggregate{node(scan({p(0)}, {})), min_d, true}))).empty());
-  refused(plan(node(physical::Aggregate{covering(), min_d, true})), "DOUBLE column read from a key");
+  auto count_d = logical::expr(logical::Expr::Kind::Aggregate, SqlType{SqlKind::BigInt});
+  count_d.fn = logical::Expr::Fn::Count;
+  count_d.args.push_back(col(kD, SqlKind::Double));
+  CHECK(refusal(plan(node(physical::Aggregate{node(scan({p(0)}, {})), count_d, true}))).empty());
+  refused(plan(node(physical::Aggregate{covering(), count_d, true})), "DOUBLE column read from a key");
 }
 
 TEST_CASE("physical: a sort holds the row of each of its input's loops read above it, keyed by columns in hand",
