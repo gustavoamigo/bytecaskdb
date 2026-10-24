@@ -418,7 +418,10 @@ differences*.
   counted with its entry in that copy from the statement that adds it
   (`effect_bytes`, `table_bytes`): a transaction never fails at COMMIT for
   memory its statements did not reserve, and the statement that would
-  take it past `max_bytes` fails instead. The rows, unique values and ranges the statement
+  take it past `max_bytes` fails instead. A unique check's range guard
+  that the commit prunes stays counted: the count is reserved when the
+  statement adds the guard, and the prune only leaves it above what the
+  commit copies. The rows, unique values and ranges the statement
   wrote stay statement memory, and go with the statement.
   The count is a conservative bound, never less than the memory held: each
   buffer's capacity plus an allocator overhead, each overlay node's full size,
