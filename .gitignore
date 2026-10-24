@@ -38,6 +38,7 @@ __pycache__/
 *.pyo
 .venv/
 *.so
+*.sym
 dist/
 
 # perf profiling data

@@ -289,7 +289,10 @@ auto computed(std::size_t i) -> std::string { return "v" + std::to_string(i); }
 
 // Each computed value, once, before anything is read: as PostgreSQL folds
 // $n ± k when it binds, one that leaves INTEGER fails the statement whatever
-// the other parameters are; a NULL $n gives NULL, never an error.
+// the other parameters are; a NULL $n gives NULL, never an error. $n is
+// checked as an INTEGER before the plan runs (the proof test
+// test_a_computed_bound_past_integer_is_22003_before_the_plan_runs), so the
+// addition itself cannot overflow int64.
 void print_computed(Writer& w) {
   const auto& comp = w.p().computed;
   for (std::size_t i = 0; i < comp.size(); ++i) {
@@ -1090,9 +1093,16 @@ private:
       null_if = null_src;
     } else {
       const auto& rhs = e.args[1];
-      auto fn = e.kind == Expr::Kind::Add ? "bc_add" : "bc_sub";
+      auto fn = std::string{e.kind == Expr::Kind::Add ? "bc_add" : "bc_sub"};
       auto by_const = rhs.kind == Expr::Kind::Const;
-      value = std::string{fn} + "(cx, " + read_col(src) + ", " + (by_const ? constant(rhs.constant) : param(PhysType::I64, rhs.param)) + ")";
+      // A BIGINT sum, the one integer sum that can leave int64, fails with
+      // the type's range error, on the table its helper names. PostgreSQL
+      // types the sum by the column read; a DECIMAL of scale 0 has BIGINT's
+      // physical type, but its operand is held to 18 digits.
+      auto bigint = e.type.kind == SqlKind::BigInt;
+      value = fn + (bigint ? "_bigint" : "") + "(cx, " + read_col(src) + ", " +
+              (by_const ? constant(rhs.constant) : param(PhysType::I64, rhs.param)) +
+              (bigint ? ", " + w_.tbl(col.table) : "") + ")";
       null_if = by_const ? null_src : (null_src.empty() ? "" : null_src + " || ") + param_null(rhs.param);
     }
     if (null_if.empty()) {

@@ -30,7 +30,22 @@ every rule, the invariants are checked.
   time, 22021 for text that is not UTF-8. The layer reports each with its
   SQLSTATE (`sqlstate()`, the exception's `sqlstate` in Python), and
   `test_every_range_message_maps_to_its_sqlstate` produces every range
-  message, so one that maps wrongly fails there. Any other refusal counts
+  message, so one that maps wrongly fails there.
+  A binder or catalog refusal
+  carries its own SQLSTATE (`SqlError.sqlstate`, `DdlRefused`), and those
+  PostgreSQL gives the same statement (`BINDER_STATES` in `oracle.py`: 42P01,
+  42703, 42804, 42P18, 42883, 42702, 42701, 42803, 0A000, 22003, and the
+  catalog's 42P07, 42704, 42809) must agree with PostgreSQL's. The one state
+  both sides use for different things is 0A000: on a `CREATE TABLE` it is the
+  layer's own rule that a table needs a primary key, which PostgreSQL does not
+  have, and on a message starting "no plan:" the planner's refusal; `layer_only`
+  in `oracle.py` classes both as a refusal, not compared. Any other statement
+  PostgreSQL runs that the layer refuses is 42601
+  and a refusal on both (`test_forms_the_layer_does_not_support_are_refused_without_a_sqlstate`
+  runs each on PostgreSQL to show it accepts it). A statement
+  with a repeated `$n` goes to PostgreSQL as written and untyped
+  (`run_pg_numbered`), since psycopg would send it as two parameters; so does
+  one whose `$1` no use types (42P18), which psycopg cannot express. Any other refusal counts
   as a refusal on both, whatever its message. The layer's refusals are
   `SqlError`: parse and bind errors, a DDL the catalog refuses, parameters
   of the wrong number or type; the planner's "no plan" refusal is one
@@ -131,10 +146,12 @@ The rules, by what they test.
   as the layer's are.
 - **COUNT** of `*` or of a column over the same `WHERE`, with `LIMIT 0`
   or 1 now and then.
-- **SET col = col ± $n** on SMALLINT, INTEGER and NUMERIC(6, 2) columns by
+- **SET col = col ± $n** on BIGINT, SMALLINT, INTEGER and NUMERIC(6, 2) columns by
   the primary key, operands at and past the type's edges and NULL; on
   PostgreSQL's side `$n` is cast to the column's type, as PostgreSQL
-  types it. BIGINT is left out until its overflow is 22003 (#540).
+  types it. BIGINT's edges are int64 itself. The machine does not draw a
+  target other than the column read; `test_column_plus_parameter_across_bigint_and_scale_0_decimal`
+  does, for a BIGINT beside a NUMERIC(18, 0).
 
 **Integer literals and joins by key:**
 - **SET col = col ± n**, n an integer literal, on the same columns: small

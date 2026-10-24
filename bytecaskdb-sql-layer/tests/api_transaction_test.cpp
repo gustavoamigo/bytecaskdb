@@ -1059,14 +1059,64 @@ TEST_CASE("embedded API: a key a transaction inserted that a concurrent commit t
     REQUIRE(d);
     CHECK(d->object_id == acct_id);
   }
-  SECTION("a unique value a later statement moved away claims nothing: not 23505") {
+  // #537: a unique check guards the commit only while the final writes
+  // still put the entry it checked.
+  SECTION("a unique value a later statement moved away claims and guards nothing: commits") {
     auto a = db->begin();
     a.execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{1}, sql_test::bytes("x@y")});
     a.execute("UPDATE person SET email = $2 WHERE id = $1", {std::int64_t{1}, sql_test::bytes("z@w")});
     db->execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{2}, sql_test::bytes("x@y")});
-    // The first statement's check of "x@y" still guards it, so the commit
-    // conflicts (#537); what it is not is a duplicate.
-    CHECK_FALSE(duplicate(a));
+    CHECK(a.commit() == CommitOutcome::Committed);
+    CHECK(db->table_rows("person").rows.size() == 2);
+  }
+  SECTION("a unique value a later statement deleted with its row: commits") {
+    auto a = db->begin();
+    a.execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{1}, sql_test::bytes("x@y")});
+    a.execute("DELETE FROM person WHERE id = $1", {std::int64_t{1}});
+    db->execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{2}, sql_test::bytes("x@y")});
+    CHECK(a.commit() == CommitOutcome::Committed);
+    CHECK(db->table_rows("person").rows.size() == 1);
+  }
+  SECTION("a unique value moved away and back keeps its guard: 23505") {
+    auto a = db->begin();
+    a.execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{1}, sql_test::bytes("x@y")});
+    a.execute("UPDATE person SET email = $2 WHERE id = $1", {std::int64_t{1}, sql_test::bytes("z@w")});
+    a.execute("UPDATE person SET email = $2 WHERE id = $1", {std::int64_t{1}, sql_test::bytes("x@y")});
+    db->execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{2}, sql_test::bytes("x@y")});
+    auto d = duplicate(a);
+    REQUIRE(d);
+    CHECK(d->object_id == email_id);
+    CHECK(db->table_rows("person").rows.size() == 1);
+  }
+  SECTION("an insert whose row a later statement updated but kept the value of keeps its guard: 23505") {
+    auto a = db->begin();
+    a.execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{1}, sql_test::bytes("x@y")});
+    a.execute("UPDATE person SET email = email WHERE id = $1", {std::int64_t{1}});
+    db->execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{2}, sql_test::bytes("x@y")});
+    auto d = duplicate(a);
+    REQUIRE(d);
+    CHECK(d->object_id == email_id);
+  }
+  SECTION("a value deleted with its row, the same value inserted under another key: 23505") {
+    auto a = db->begin();
+    a.execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{1}, sql_test::bytes("x@y")});
+    a.execute("DELETE FROM person WHERE id = $1", {std::int64_t{1}});
+    a.execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{5}, sql_test::bytes("x@y")});
+    db->execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{2}, sql_test::bytes("x@y")});
+    auto d = duplicate(a);
+    REQUIRE(d);
+    CHECK(d->object_id == email_id);
+  }
+  SECTION("a value moved away, then taken by another row of the transaction: that row's check guards it") {
+    auto a = db->begin();
+    a.execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{1}, sql_test::bytes("x@y")});
+    a.execute("DELETE FROM person WHERE id = $1", {std::int64_t{1}});
+    a.execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{3}, sql_test::bytes("x@y")});
+    db->execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{2}, sql_test::bytes("x@y")});
+    auto d = duplicate(a);
+    REQUIRE(d);
+    CHECK(d->object_id == email_id);
+    CHECK(db->table_rows("person").rows.size() == 1);
   }
   SECTION("two updates of one row to one unique value: the conflict on the row, 40001") {
     db->execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{1}, sql_test::bytes("a@b")});

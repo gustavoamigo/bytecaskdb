@@ -244,7 +244,20 @@ private:
   std::uint64_t bytes_{0};  // the copies' bytes, as requested
 };
 
-enum class EffectKind { Put, Del, DelRange, GuardUnchanged, GuardRange, GuardPresent, GuardAbsent };
+// GuardUniqueRange is a unique check's range guard, over the checked value's
+// prefix `a`. In a transaction it counts at commit only while the final
+// writes still put an entry under that prefix (Overlay::puts_under), the
+// rule the insert claims follow.
+enum class EffectKind {
+  Put,
+  Del,
+  DelRange,
+  GuardUnchanged,
+  GuardRange,
+  GuardUniqueRange,
+  GuardPresent,
+  GuardAbsent
+};
 
 struct Effect {
   EffectKind kind;
@@ -258,6 +271,7 @@ struct Effect {
     case EffectKind::DelRange: return true;
     case EffectKind::GuardUnchanged:
     case EffectKind::GuardRange:
+    case EffectKind::GuardUniqueRange:
     case EffectKind::GuardPresent:
     case EffectKind::GuardAbsent: return false;
   }
@@ -273,7 +287,8 @@ struct Effect {
     case EffectKind::GuardUnchanged:
     case EffectKind::GuardPresent:
     case EffectKind::GuardAbsent: return PlanEntry::KeyGuard;
-    case EffectKind::GuardRange: return PlanEntry::RangeGuard;
+    case EffectKind::GuardRange:
+    case EffectKind::GuardUniqueRange: return PlanEntry::RangeGuard;
   }
   return PlanEntry::Write;
 }
@@ -436,6 +451,19 @@ struct Overlay {
   [[nodiscard]] auto puts(BytesView key) const -> bool {
     auto it = points.find(key);
     return it != points.end() && it->second;
+  }
+
+  // Whether the overlay puts a key that starts with `prefix`: the one test
+  // that decides whether a unique value still counts at commit, for its
+  // claims (conflict_or_duplicate) and its guards (bc_txn_commit). It looks
+  // at the prefix, not the entry: an UPDATE that moves the row's primary key
+  // rewrites the entry (prefix + primary key) without checking the value.
+  // Relies on the entry-key layout, the index prefix first.
+  [[nodiscard]] auto puts_under(BytesView prefix) const -> bool {
+    for (auto it = points.lower_bound(prefix); it != points.end() && has_prefix(it->first, prefix); ++it) {
+      if (it->second) return true;
+    }
+    return false;
   }
 
   // Whether the overlay decides `key`: nullopt if the snapshot does; else
@@ -1959,6 +1987,8 @@ auto row_builder(bc_ctx* cx, bc_row r) -> RowBuilder* {
   return false;
 }
 
+// Which claims count depends on Overlay::puts_under and the entry-key layout,
+// as the pruning of the unique guards at bc_txn_commit does.
 // A commit that conflicted: the duplicate it is when the latest committed
 // state has taken one of its claims, the first in their order (BC_FAILED,
 // BC_C_UNIQUE on the claim's table or index), else the conflict. Nothing was
@@ -1968,9 +1998,11 @@ auto row_builder(bc_ctx* cx, bc_row r) -> RowBuilder* {
 // fails at that statement: before each claim, the locks of the statements
 // up to its own are checked, and one whose row changed is the conflict. A
 // row changed back to the same bytes counts as unchanged.
-// A transaction's claim counts while its writes still put the key: one a
-// later statement moved or deleted away claims nothing (`overlay`, null for
-// an execution, whose one statement writes a row once). An index claim is
+// A transaction's claim counts while its writes still put the key, or for an
+// index any entry under its value (Overlay::puts_under, which prunes the
+// unique guards at bc_txn_commit too: change the two together): one a later
+// statement moved or deleted away claims nothing (`overlay`, null for an
+// execution, whose one statement writes a row once). An index claim is
 // taken only by another row's entry: a concurrent update of the same row to
 // the same value is the conflict on that row, 40001.
 [[nodiscard]] auto conflict_or_duplicate(ErrorSink out, bytecask::DB& db, std::span<const Claim> claims,
@@ -1981,7 +2013,10 @@ auto row_builder(bc_ctx* cx, bc_row r) -> RowBuilder* {
     Bytes now;
     std::size_t checked = 0;
     for (const auto& c : claims) {
-      if (overlay != nullptr && !overlay->puts(c.key)) continue;
+      if (overlay != nullptr && !(c.prefix_len ? overlay->puts_under(BytesView{c.key}.first(*c.prefix_len))
+                                               : overlay->puts(c.key))) {
+        continue;
+      }
       for (; checked < c.locks_through; ++checked) {
         const auto& l = locks[checked];
         if (!latest.get({}, l.key, now) || row_fingerprint(now) != l.fingerprint) return BC_CONFLICT;
@@ -2355,8 +2390,13 @@ void lock_row(bc_ctx* cx, BytesView pk, BytesView row) {
 }
 
 // No entry has this unique index prefix in the view, and no earlier write
-// of this execution gave a row it, or BC_C_UNIQUE on the index; the range guard covers the race, since a duplicate is another
-// row's entry, a key this plan does not write.
+// of this execution gave a row it, or BC_C_UNIQUE on the index; the range
+// guard covers the race, since a duplicate is another row's entry, a key
+// this plan does not write.
+// The guard and the claim it records are pruned at commit by
+// Overlay::puts_under (bc_txn_commit, conflict_or_duplicate): they count only
+// while the transaction's final writes put an entry under this prefix. That
+// depends on the entry-key layout, the index prefix first.
 [[nodiscard]] auto unique_free(bc_ctx* cx, const Index& ix, const Entry& entry) -> bool {
   auto prefix = entry.prefix();
   if (!cx->charge()) return false;
@@ -2388,7 +2428,7 @@ void lock_row(bc_ctx* cx, BytesView pk, BytesView row) {
     cx->raise(BC_C_UNIQUE, ix.id);
     return false;
   }
-  cx->push_effect(EffectKind::GuardRange, prefix, bytecask::sql::key_successor(prefix));
+  cx->push_effect(EffectKind::GuardUniqueRange, prefix, bytecask::sql::key_successor(prefix));
   return !claim || cx->push_claim(ix.id, entry.key, entry.prefix_len);
 }
 
@@ -2587,7 +2627,8 @@ enum bc_commit_result bc_ctx_commit(bc_ctx* cx, bool sync) {
       case EffectKind::Del: plan.del(e.a); break;
       case EffectKind::DelRange: plan.del_range(e.a, e.b); break;
       case EffectKind::GuardUnchanged: plan.ensure_unchanged(e.a); break;
-      case EffectKind::GuardRange: plan.ensure_range_unchanged(e.a, e.b); break;
+      case EffectKind::GuardRange:
+      case EffectKind::GuardUniqueRange: plan.ensure_range_unchanged(e.a, e.b); break;
       case EffectKind::GuardPresent: plan.ensure_present(e.a); break;
       case EffectKind::GuardAbsent: plan.ensure_absent(e.a); break;
     }
@@ -2665,6 +2706,18 @@ bool bc_txn_repin(bc_txn* txn) {
   return true;
 }
 
+namespace {
+
+// Whether a guard of the transaction goes to the engine. A unique check a
+// later statement made stale guards nothing: the final writes hold no entry
+// under its value. The same Overlay::puts_under decides the claims in
+// conflict_or_duplicate.
+auto guard_counts(const Effect& e, const Overlay& final_writes) -> bool {
+  return e.kind != EffectKind::GuardUniqueRange || final_writes.puts_under(e.a);
+}
+
+}  // namespace
+
 bool bc_txn_add(bc_ctx* cx) {
   bc_txn* txn = nullptr;
   BC_GUARD_BEGIN
@@ -2697,6 +2750,7 @@ bool bc_txn_add(bc_ctx* cx) {
       case EffectKind::DelRange: txn->overlay.del_range(std::move(e.a), std::move(e.b)); break;
       case EffectKind::GuardUnchanged:
       case EffectKind::GuardRange:
+      case EffectKind::GuardUniqueRange:
       case EffectKind::GuardPresent:
       case EffectKind::GuardAbsent:
         txn->held += effect_bytes(true, e);
@@ -2756,7 +2810,10 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
   // only guarded (SELECT … FOR UPDATE) is still checked: a guarded row a
   // concurrent commit changed is its conflict. The engine checks a
   // guard-only plan and writes nothing.
-  if (ov.empty() && txn->guards.empty()) {
+  // Guards a later statement made stale are pruned first: a transaction left
+  // with none of them and no write sends the engine nothing.
+  auto counts = [&](const Effect& e) { return guard_counts(e, ov); };
+  if (ov.empty() && std::ranges::none_of(txn->guards, counts)) {
     txn->snap.reset();
     return BC_COMMITTED;
   }
@@ -2775,12 +2832,14 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
       plan.del(key);
     }
   }
-  for (const auto& e : txn->guards) {
-    switch (e.kind) {
-      case EffectKind::GuardUnchanged: plan.ensure_unchanged(e.a); break;
-      case EffectKind::GuardRange: plan.ensure_range_unchanged(e.a, e.b); break;
-      case EffectKind::GuardPresent: plan.ensure_present(e.a); break;
-      case EffectKind::GuardAbsent: plan.ensure_absent(e.a); break;
+  for (const auto& g : txn->guards) {
+    if (!counts(g)) continue;
+    switch (g.kind) {
+      case EffectKind::GuardUnchanged: plan.ensure_unchanged(g.a); break;
+      case EffectKind::GuardRange:
+      case EffectKind::GuardUniqueRange: plan.ensure_range_unchanged(g.a, g.b); break;
+      case EffectKind::GuardPresent: plan.ensure_present(g.a); break;
+      case EffectKind::GuardAbsent: plan.ensure_absent(g.a); break;
       case EffectKind::Put:
       case EffectKind::Del:
       case EffectKind::DelRange: break;  // never kept as guards
@@ -2862,8 +2921,14 @@ bool bc_param_null(bc_ctx* cx, uint32_t i) {
 void bc_emit_begin(bc_ctx* cx) {
   BC_GUARD_BEGIN
   if (!cx->ok()) return;
-  if (!cx->has_ref || cx->verified.result_types.empty()) {
-    cx->fail(BC_L_PLAN, "the plan's schema ref declares no result types");
+  if (!cx->has_ref) {
+    cx->fail(BC_E_HANDLE, "no plan is running: bc_ctx_run sets the schema ref that declares the result layout");
+    return;
+  }
+  // A SELECT may declare no result types (SELECT FROM t); a plan that writes
+  // tables and declares none returns no rows.
+  if (cx->verified.result_types.empty() && !cx->verified.written.empty()) {
+    cx->fail(BC_L_PLAN, "a plan that writes declares no result types, so it returns no rows");
     return;
   }
   if (cx->emit) {
@@ -3035,24 +3100,33 @@ auto arith_fail(bc_ctx* cx, const char* what) -> std::int64_t {
   cx->fail(BC_E_ARITH, what);
   return 0;
 }
-}  // namespace
 
-int64_t bc_add(bc_ctx* cx, int64_t a, int64_t b) {
+// a + b or a - b. An overflow is BC_E_ARITH or, for a value stored in a
+// BIGINT, that type's range error on `object_id`, as in PostgreSQL: the one
+// the row builder and bc_check_int raise for the narrower types.
+auto add_or_sub(bc_ctx* cx, bool subtract, std::int64_t a, std::int64_t b, bool bigint, std::uint32_t object_id)
+    -> std::int64_t {
   BC_GUARD_BEGIN
   if (!cx->ok()) return 0;
   std::int64_t r = 0;
-  return __builtin_add_overflow(a, b, &r) ? arith_fail(cx, "integer out of range") : r;
+  if (!(subtract ? __builtin_sub_overflow(a, b, &r) : __builtin_add_overflow(a, b, &r))) return r;
+  if (bigint) {
+    cx->raise(BC_C_RANGE, object_id, "bigint out of range");
+    return 0;
+  }
+  return arith_fail(cx, "integer out of range");
   BC_GUARD_END(cx)
   return {};
 }
+}  // namespace
 
-int64_t bc_sub(bc_ctx* cx, int64_t a, int64_t b) {
-  BC_GUARD_BEGIN
-  if (!cx->ok()) return 0;
-  std::int64_t r = 0;
-  return __builtin_sub_overflow(a, b, &r) ? arith_fail(cx, "integer out of range") : r;
-  BC_GUARD_END(cx)
-  return {};
+int64_t bc_add(bc_ctx* cx, int64_t a, int64_t b) { return add_or_sub(cx, false, a, b, false, 0); }
+int64_t bc_sub(bc_ctx* cx, int64_t a, int64_t b) { return add_or_sub(cx, true, a, b, false, 0); }
+int64_t bc_add_bigint(bc_ctx* cx, int64_t a, int64_t b, uint32_t object_id) {
+  return add_or_sub(cx, false, a, b, true, object_id);
+}
+int64_t bc_sub_bigint(bc_ctx* cx, int64_t a, int64_t b, uint32_t object_id) {
+  return add_or_sub(cx, true, a, b, true, object_id);
 }
 
 int64_t bc_mul(bc_ctx* cx, int64_t a, int64_t b) {
