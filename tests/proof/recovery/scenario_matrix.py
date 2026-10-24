@@ -110,10 +110,13 @@ def is_valid_combination(
     # A hint that is present and valid is never regenerated, so there is no
     # hint write to fault. Every shape here damages something, so all the
     # write-failure combinations are reachable. The read failures are the
-    # exception: recovery reads hint files on its workers, and the injector
-    # is thread-local, so at threads > 1 the fault armed here never fires.
+    # exception, and only for a shape with more than one data file: recovery's
+    # workers are min(files, threads) and one of them runs on the thread that
+    # opens, so a one-file shape reads where the injector — thread-local — can
+    # see it whatever the thread count, while a multi-file one at threads > 1
+    # reads on workers that have no injector. Arming it there is #599.
     if failure in READ_FAILURE_CLASSES and threads != 1:
-        return False
+        return state.max_file_bytes is None  # the writes fit one data file
     return True
 
 

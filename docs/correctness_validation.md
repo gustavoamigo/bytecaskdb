@@ -376,11 +376,10 @@ mapping — where a failed read is a `SIGBUS`, not an error (#237):
     the next. The `[model]` many-frames test fails reads 1–150 in turn and
     checks each against the serial baseline, file stats included, and
     `DB::open rebuilds a hint file a read fails on` checks both outcomes
-    directly. The generated `[prove_recovery]` matrix covers both phases too,
-    five shapes each at `recovery_threads = 1`
+    directly. The generated `[prove_recovery]` matrix covers both phases too
     (`*hint_read_fails_while_verified*`, `*hint_read_fails_during_scan*`).
-    All of them run at `recovery_threads = 1`: the injector is
-    thread-local, and at one thread recovery runs on the thread that opens.
+    Every one of them runs where recovery reads on the thread that opens:
+    the injector is thread-local (see *recovery* below for what that allows).
 
 ### Orphaned BulkBegin degrade
 
@@ -1098,12 +1097,12 @@ more — `crc` and `entry_type` at every position but the first, where the
 scan throws opening the file, before the iterator takes a step it could
 catch.
 
-### recovery — 50 tests
+### recovery — 56 tests
 
-50 generated Catch2 tests (`[prove_recovery]` tag): five state shapes
+56 generated Catch2 tests (`[prove_recovery]` tag): five state shapes
 × four failure classes × `recovery_threads ∈ {1, 4}` — the 40 cells that
-fail the hint write — plus five shapes × the two phases a hint read fails
-in, at `recovery_threads = 1` (10 cells).
+fail the hint write — plus the two phases a hint read fails in (16 cells:
+one-file shapes at both thread counts, multi-file ones at one).
 
 `hint_file.cppm` had 19 syscall sites and no fault points, and `DB::open`
 had no matrix at all — recovery was proven by the `[model]` tests, every
@@ -1130,10 +1129,14 @@ checkpoint over two phases:
 | `hint_read_fails_while_verified` | the pass that opens and checks a hint | succeeds: the hint is an index, so it is rebuilt from its data file and every key comes back under the fault |
 | `hint_read_fails_during_scan` | the scan of a hint that verified | throws `std::system_error`: entries of the hint were applied as it scanned, so the open fails and the next one recovers |
 
-Both run at `recovery_threads = 1` and no other thread count: the injector
-is thread-local and at one thread recovery reads on the thread that opens.
-Arming it across recovery's workers — and with that what a failed read costs
-parallel recovery — is deferred to #599.
+What a failed read costs does not vary with the thread count, but the read
+has to be failed where it can be seen: the injector is thread-local, and
+recovery's workers are `min(files, threads)` — one of them the thread that
+opens. So the read cells run at `recovery_threads = 1`, and at 4 wherever a
+shape's writes fit one data file and that worker is the only one. Arming the
+injector across the workers — and with that what a failed read costs a
+multi-file open recovered in parallel — is deferred to #599.
+
 A hint file's first read is always in the pass that verifies it, so the
 verified cell fails read 1. The scan cell finds its read at run time:
 `first_hint_scan_read` (tests/proof/hint_reads.h) walks the file set the way
@@ -1143,9 +1146,16 @@ no units (an empty hint scans none), and the fault goes one read past them.
 Opening is twice when recovery first replaces the hint: a damaged one is
 read whole to find it damaged, and a missing one is generated from its data
 file. Those replacements are read off a copy of the directory that recovery
-has run over once, since the cell may have damaged every hint itself. If the
-count and the open ever disagree about where a scan begins, the cell fails
-there, since the phases answer a failed read differently.
+has run over once, since the cell may have damaged every hint itself.
+
+Then the cell says why its read is a scan read. A wrong target cannot pass
+silently on a hint recovery replaces: the pass that verifies the rebuilt hint
+throws like a scan does in the default mode. So the same read is failed again
+with `fail_recovery_on_crc_errors = false`, where a failure in one of the
+opens above the scan lets `open` return without that file's keys, while one
+in the scan fails the open in every mode — an open that throws there was
+reading the hint's entries, not opening the hint. If the count and the open
+ever disagree about where a scan begins, one of the two runs fails there.
 
 #### State shapes
 
