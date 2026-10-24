@@ -9,7 +9,6 @@
 // bit, marker included.
 
 module;
-#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstddef>
@@ -64,11 +63,6 @@ void key_put_bool(Bytes& out, bool v, KeyPart part);
 void key_put_bytes(Bytes& out, BytesView v, KeyPart part);
 // A null part: the marker alone. Only a nullable part can be null.
 void key_put_null(Bytes& out, KeyPart part);
-// The bytes the writer of part.type appends for a value, `bytes` the value
-// of a Bytes part; key_put_null appends kKeyNullBytes. So an encoder can
-// reserve a key's exact size before it writes it.
-inline constexpr std::size_t kKeyNullBytes = 1;
-[[nodiscard]] auto key_part_size(KeyPart part, BytesView bytes = {}) -> std::size_t;
 
 // Reads parts back in order. A malformed key makes every later read fail:
 // ok() is false and reads return nullopt.
@@ -200,18 +194,6 @@ void key_put_bytes(Bytes& out, BytesView v, KeyPart part) {
 
 void key_put_null(Bytes& out, KeyPart part) {
   out.push_back(part.desc ? kNullMarker ^ kInvert : kNullMarker);
-}
-
-auto key_part_size(KeyPart part, BytesView bytes) -> std::size_t {
-  const std::size_t marker = part.nullable ? 1 : 0;
-  switch (part.type) {
-    case PhysType::I64:
-    case PhysType::F64: return marker + 8;
-    case PhysType::Bool: return marker + 1;
-    case PhysType::Bytes:
-      return marker + bytes.size() + static_cast<std::size_t>(std::ranges::count(bytes, std::byte{0})) + 2;
-  }
-  return 0;
 }
 
 auto KeyReader::next_byte(bool desc) -> std::optional<std::byte> {

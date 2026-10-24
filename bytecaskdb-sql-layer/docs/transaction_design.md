@@ -402,9 +402,11 @@ differences*.
   54000) without the transaction allocating for it, the transaction is
   aborted like any failed statement's, and what it held is freed with the
   abort. The commit copies the overlay and the guards into the engine's
-  `WritePlan` while they are still held, so it counts that copy against
-  `max_bytes` too, before building it: a commit past it is `BC_E_LIMIT`
-  with nothing committed. The rows, unique values and ranges the statement
+  `WritePlan` while they are still held, so each write, guard and table is
+  counted with its entry in that copy from the statement that adds it
+  (`effect_bytes`, `table_bytes`): a transaction never fails at COMMIT for
+  memory its statements did not reserve, and the statement that would
+  take it past `max_bytes` fails instead. The rows, unique values and ranges the statement
   wrote stay statement memory, and go with the statement.
   The count is a conservative bound, never less than the memory held: each
   buffer's capacity plus an allocator overhead, each overlay node's full size,

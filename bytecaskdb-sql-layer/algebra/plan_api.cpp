@@ -323,9 +323,21 @@ static_assert(2 * sizeof(std::pair<Bytes, Bytes>) <= kPlanRangeGuardSlotBytes);
 [[nodiscard]] auto effect_bytes(bool in_txn, const Effect& e) -> std::uint64_t {
   return effect_bytes(in_txn, e.kind, e.a.capacity(), e.b.capacity());
 }
-// A table's charge, in autocommit with the commit's guard on its record.
-[[nodiscard]] auto table_bytes(bool in_txn, std::uint32_t table) -> std::uint64_t {
-  return bytecask::sql::table_bytes(in_txn, in_txn ? 0 : bytecask::sql::table_record_key(table).size());
+// A table's charge, with the commit's guard on its record.
+[[nodiscard]] auto table_bytes(std::uint32_t table) -> std::uint64_t {
+  return bytecask::sql::table_bytes(bytecask::sql::table_record_key(table).size());
+}
+
+// Empties one of the write set's vectors at a reset: its storage is kept,
+// uncharged, up to kKeptWriteSlots, and freed past it, so a pooled context
+// keeps none of a large statement's slots.
+template <typename T>
+void clear_write_slots(std::vector<T>& v) noexcept {
+  if (v.capacity() > bytecask::sql::kKeptWriteSlots) {
+    std::vector<T>{}.swap(v);
+  } else {
+    v.clear();
+  }
 }
 
 // FNV-1a: stable, and only ever compared within one process.
@@ -396,7 +408,9 @@ auto as_u8(const std::byte* p) -> const std::uint8_t* {
 struct Overlay {
   std::map<Bytes, std::optional<Bytes>, BytesLess> points;
   std::map<Bytes, Bytes, BytesLess> ranges;  // lo -> hi: disjoint, none empty
-  std::uint64_t bytes{0};                    // a conservative bound on all it holds: keys, values and nodes
+  // A conservative bound on all it holds, keys, values and nodes, and on the
+  // commit's WritePlan entry for each node.
+  std::uint64_t bytes{0};
 
   [[nodiscard]] auto empty() const -> bool { return points.empty() && ranges.empty(); }
 
@@ -441,7 +455,7 @@ struct Overlay {
   // the points inside it.
   void del_range(Bytes lo, Bytes hi) {
     for (auto it = points.lower_bound(BytesView{lo}); it != points.end() && std::ranges::lexicographical_compare(it->first, hi);) {
-      bytes -= cost(it->first, it->second ? held_bytes(*it->second) : 0);
+      bytes -= cost(it->first, it->second);
       it = points.erase(it);
     }
     auto it = ranges.upper_bound(BytesView{lo});
@@ -449,28 +463,34 @@ struct Overlay {
     while (it != ranges.end() && !std::ranges::lexicographical_compare(hi, it->first)) {
       if (std::ranges::lexicographical_compare(it->first, lo)) lo = it->first;
       if (std::ranges::lexicographical_compare(hi, it->second)) hi = it->second;
-      bytes -= cost(it->first, held_bytes(it->second));
+      bytes -= cost(it->first, it->second);
       it = ranges.erase(it);
     }
-    auto add = cost(lo, held_bytes(hi));
+    auto add = cost(lo, hi);
     ranges.emplace(std::move(lo), std::move(hi));
     bytes += add;
   }
 
 private:
-  static auto cost(const Bytes& key, std::uint64_t value_bytes) -> std::uint64_t {
-    return held_bytes(key) + value_bytes + kOverlayNodeBytes;
+  // A node, its buffers, and its entry in the commit's WritePlan: no more
+  // than the effect_bytes of the write it came from.
+  static auto cost(const Bytes& key, std::size_t value_capacity) -> std::uint64_t {
+    return held_bytes(key) + buffer_bytes(value_capacity) + kOverlayNodeBytes +
+           plan_entry_bytes(PlanEntry::Write, key.capacity(), value_capacity);
+  }
+  static auto cost(const Bytes& key, const Bytes& value) -> std::uint64_t { return cost(key, value.capacity()); }
+  static auto cost(const Bytes& key, const std::optional<Bytes>& value) -> std::uint64_t {
+    return cost(key, value ? value->capacity() : 0);
   }
 
   void set(Bytes key, std::optional<Bytes> value) {
-    auto value_bytes = value ? held_bytes(*value) : 0;
     if (auto it = points.find(BytesView{key}); it != points.end()) {
-      bytes -= it->second ? held_bytes(*it->second) : 0;
+      bytes -= cost(it->first, it->second);
       it->second = std::move(value);
-      bytes += value_bytes;
+      bytes += cost(it->first, it->second);
       return;
     }
-    auto add = cost(key, value_bytes);
+    auto add = cost(key, value);
     points.emplace(std::move(key), std::move(value));
     bytes += add;
   }
@@ -1034,7 +1054,7 @@ struct bc_ctx {
   template <typename Make>
   void push_effect_made(EffectKind kind, BytesView key, std::size_t a_bytes, std::size_t b_bytes, Make&& make) {
     auto table = is_write(kind) ? written_table(key) : std::nullopt;
-    auto n = effect_bytes(txn != nullptr, kind, a_bytes, b_bytes) + (table ? table_bytes(txn != nullptr, *table) : 0);
+    auto n = effect_bytes(txn != nullptr, kind, a_bytes, b_bytes) + (table ? table_bytes(*table) : 0);
     (void)push_write(effects, n, [&] {
       if (table) written_tables.push_back(*table);
       return make();
@@ -1219,8 +1239,11 @@ struct bc_ctx {
     push_effect_made(kind, a, a.size(), b.size(),
                      [&] { return Effect{kind, Bytes(a.begin(), a.end()), Bytes(b.begin(), b.end())}; });
   }
-  // For keys the runtime built and no longer needs: moved, not copied. Their
-  // encoders reserve their exact size.
+  // For keys the runtime built and no longer needs: moved, not copied, and
+  // charged their capacity just after encoding. The budget can be passed by
+  // the keys of the one write being made, before they are charged: a
+  // bounded overshoot, since a key is bounded by the key ceiling
+  // (kMaxKeyBytes; the engine refuses a longer one).
   void push_effect(EffectKind kind, Bytes&& a, BytesView b = {}) {
     push_effect_made(kind, a, a.capacity(), b.size(),
                      [&] { return Effect{kind, std::move(a), Bytes(b.begin(), b.end())}; });
@@ -1267,7 +1290,7 @@ struct bc_ctx {
     auto refused_before_run = error == BC_E_LAYOUT && detail == BC_L_INCOMPATIBLE;
     auto abandoned = txn != nullptr && ((!ok() && !refused_before_run) || !effects.empty());
     drop_cursors();  // iterators before the snapshot and the overlay they read
-    std::vector<Effect>{}.swap(effects);  // its storage too, as the write set's other vectors at reset
+    clear_write_slots(effects);  // as the write set's other vectors at reset
     base = nullptr;
     overlay = nullptr;
     if (txn != nullptr) txn_detach(txn, this, abandoned);
@@ -1344,10 +1367,8 @@ struct bc_ctx {
     hashes.clear();
     hash_iters.clear();
     deleted_ranges.clear();
-    // The write set's vectors give their storage back: a pooled context
-    // keeps no slots of a large statement's that nothing charges.
-    std::vector<Claim>{}.swap(claims);
-    std::vector<Lock>{}.swap(locks);
+    clear_write_slots(claims);
+    clear_write_slots(locks);
     has_ref = false;  // set by the next run's verification
     key_slots.clear();
     key_parts.view = {};  // its view's slot is released
@@ -1361,7 +1382,7 @@ struct bc_ctx {
     pins.clear(false);
     mem_used = 0;
     write_held = 0;
-    std::vector<std::uint32_t>{}.swap(written_tables);
+    clear_write_slots(written_tables);
     reads = 0;
   }
 };
@@ -1386,7 +1407,8 @@ struct bc_txn {
   std::vector<Lock> locks;             // the statements' rows locked or written, in their order
   std::vector<std::uint32_t> written;  // the tables the writes are in
   // What the four above hold, each item as the statement counted it
-  // (effect_bytes, claim_bytes, lock_bytes, table_bytes).
+  // (effect_bytes, claim_bytes, lock_bytes, table_bytes), its WritePlan
+  // entry included.
   std::uint64_t held{0};
   std::uint64_t statements{0};         // statements wholly added
   // A statement failed: nothing but bc_txn_free is left. Set before any
@@ -1416,26 +1438,15 @@ void txn_abort(bc_txn* txn) noexcept;
 
 namespace {
 
-// What the transaction holds: its overlay, which counts each node as its
-// buffers and kOverlayNodeBytes, within the effect_bytes of the write it
-// came from, and its guards, claims, locks and tables. A statement's write
-// set would take it at most to this plus the write set's bytes: merging an
-// effect into the overlay adds at most one node, and one that replaces or
-// erases others only frees.
+// What the transaction holds, and its commit's WritePlan with it: its
+// overlay, which counts each node as its buffers, kOverlayNodeBytes and its
+// plan entry, within the effect_bytes of the write it came from, and its
+// guards, claims, locks and tables, each with its plan entry. A statement's
+// write set would take it at most to this plus the write set's bytes:
+// merging an effect into the overlay adds at most one node, and one that
+// replaces or erases others only frees. So the commit needs nothing its
+// statements were not held to.
 auto txn_holds(const bc_txn& t) -> std::uint64_t { return t.overlay.bytes + t.held; }
-
-// What the commit's WritePlan holds: an entry for each range and point of
-// the overlay, each guard, and each table's record guard.
-auto plan_bytes(const bc_txn& t) -> std::uint64_t {
-  std::uint64_t n = 0;
-  for (const auto& [lo, hi] : t.overlay.ranges) n += plan_entry_bytes(PlanEntry::Write, lo.size(), hi.size());
-  for (const auto& [key, value] : t.overlay.points) {
-    n += plan_entry_bytes(PlanEntry::Write, key.size(), value ? value->size() : 0);
-  }
-  for (const auto& e : t.guards) n += plan_entry_bytes(plan_entry(e.kind), e.a.size(), e.b.size());
-  for (auto id : t.written) n += plan_entry_bytes(PlanEntry::KeyGuard, bytecask::sql::table_record_key(id).size(), 0);
-  return n;
-}
 
 }  // namespace
 
@@ -2576,7 +2587,7 @@ bool bc_txn_add(bc_ctx* cx) {
   for (auto id : cx->written_tables) {
     if (std::ranges::find(txn->written, id) == txn->written.end()) {
       txn->written.push_back(id);
-      txn->held += table_bytes(true, id);
+      txn->held += table_bytes(id);
     }
   }
   for (auto& e : cx->effects) {
@@ -2650,14 +2661,8 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
     return BC_COMMITTED;
   }
   // The plan copies every write and guard while the overlay still holds
-  // them, which a conflict reads back after the submit: counted against
-  // max_bytes first, so a commit past it is BC_E_LIMIT and commits nothing.
-  if (txn_holds(*txn) + plan_bytes(*txn) > txn->max_bytes) {
-    txn->snap.reset();
-    out.fail(BC_E_LIMIT, "the transaction's commit would pass its bound of " + std::to_string(txn->max_bytes) +
-                             " bytes");
-    return BC_FAILED;
-  }
+  // them, which a conflict reads back after the submit. Each copy was held
+  // to max_bytes with the statement that made it (txn_holds): no check here.
   // The ranges before the points: a point is newer than any range over it,
   // and the engine applies a plan's operations in order.
   bytecask::WritePlan plan{std::move(*txn->snap)};
