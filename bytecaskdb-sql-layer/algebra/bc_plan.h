@@ -198,6 +198,9 @@ int64_t bc_div(bc_ctx *, int64_t, int64_t);     /* zero divisor, INT64_MIN / -1 
 int64_t bc_mod(bc_ctx *, int64_t, int64_t);
 int64_t bc_neg(bc_ctx *, int64_t);              /* INT64_MIN → error */
 int64_t bc_f64_to_i64(bc_ctx *, double);        /* NaN or out of range → error; truncates */
+int64_t bc_add_bigint(bc_ctx *, int64_t, int64_t, uint32_t object_id);   /* leaves BIGINT: BC_E_CONSTRAINT,
+                                                   BC_C_RANGE on object_id, "bigint out of range" */
+int64_t bc_sub_bigint(bc_ctx *, int64_t, int64_t, uint32_t object_id);
 enum bc_int_type { BC_SMALLINT = 2, BC_INTEGER = 4 };
 int64_t bc_check_int(bc_ctx *, int64_t v, uint32_t int_type, uint32_t object_id);  /* v outside the type:
                                                    BC_E_CONSTRAINT, BC_C_RANGE on object_id; else v */

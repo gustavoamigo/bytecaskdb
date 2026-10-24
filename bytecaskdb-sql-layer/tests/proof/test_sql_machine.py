@@ -70,7 +70,8 @@ from pgserver import Server, server_binary  # noqa: E402
 TYPES = [o.BIGINT, o.INTEGER, o.SMALLINT, o.DOUBLE, o.REAL, o.numeric(6, 2), o.BOOLEAN, o.TEXT, o.varchar(4), o.BYTEA]
 # Types a column + parameter is supported on, and how PostgreSQL types that
 # parameter: as the column's type (numeric without the modifier).
-ARITHMETIC = {"smallint": "smallint", "integer": "integer", "numeric(6,2)": "numeric"}
+ARITHMETIC = {"bigint": "bigint", "smallint": "smallint", "integer": "integer", "numeric(6,2)": "numeric",
+              "numeric(18,0)": "numeric"}
 # The columns SUM and MIN are generated over: the types the layer takes, but
 # BIGINT for SUM, whose sum leaves int64 (docs/frontend_design.md, *Known
 # differences*).
@@ -587,21 +588,24 @@ class SqlMachine(RuleBasedStateMachine):
             return None
         return self.both(sql, params, pg_sql=f"{pg_head} WHERE {' AND '.join(pg_conds)}", types=types)
 
-    def add(self, name: str, col: str, op: str, operand, key: tuple, literal: bool = False) -> o.Outcome:
-        """UPDATE … SET col = col op $1 WHERE the primary key; with `literal`,
-        the operand is an integer literal in the text, typed by both sides
-        as PostgreSQL types it."""
+    def add(self, name: str, col: str, op: str, operand, key: tuple, literal: bool = False,
+            target: str | None = None) -> o.Outcome:
+        """UPDATE … SET target = col op $1 WHERE the primary key (`target`
+        defaults to col); with `literal`, the operand is an integer literal in
+        the text, typed by both sides as PostgreSQL types it. The sum is in
+        col's type; `target` only checks it on assignment."""
         t = self.tables[name]
+        target = target or col
         first = 1 if literal else 2
         where = " AND ".join(f"{c} = ${i + first}" for i, c in enumerate(t.pk))
         pg_where = " AND ".join(f"{c} = {typed(t, c, i + first)}" for i, c in enumerate(t.pk))
         key_types = [t.column(c).type for c in t.pk]
         if literal:
-            return self.both(f"UPDATE {name} SET {col} = {col} {op} {operand} WHERE {where}", key,
-                             pg_sql=f"UPDATE {name} SET {col} = {col} {op} {operand} WHERE {pg_where}", types=key_types)
+            return self.both(f"UPDATE {name} SET {target} = {col} {op} {operand} WHERE {where}", key,
+                             pg_sql=f"UPDATE {name} SET {target} = {col} {op} {operand} WHERE {pg_where}", types=key_types)
         cast = ARITHMETIC[t.column(col).type.sql]
-        return self.both(f"UPDATE {name} SET {col} = {col} {op} $1 WHERE {where}", (operand, *key),
-                         pg_sql=f"UPDATE {name} SET {col} = {col} {op} $1::{cast} WHERE {pg_where}",
+        return self.both(f"UPDATE {name} SET {target} = {col} {op} $1 WHERE {where}", (operand, *key),
+                         pg_sql=f"UPDATE {name} SET {target} = {col} {op} $1::{cast} WHERE {pg_where}",
                          types=[t.column(col).type] + key_types)
 
     def join(self, names: tuple[str, str], targets: list[tuple[str, str]], keys: tuple[tuple, tuple],
@@ -973,9 +977,13 @@ class SqlMachine(RuleBasedStateMachine):
         else:
             key = tuple(data.draw(st.none() | values(t.column(c).type), label=c) for c in t.pk)
         # Integer literals, typed integer or, past it, bigint: small ones, and
-        # ones at and past SMALLINT's and INTEGER's edges.
-        literal = data.draw(st.one_of(st.integers(-5, 5), st.sampled_from([32767, 32768, -32768, 2**31 - 1, 2**31,
-                                                                           2**40])), label="literal")
+        # ones at and past SMALLINT's and INTEGER's edges. 2^63 - 1 only on a
+        # BIGINT: a SMALLINT, INTEGER or DECIMAL column refuses it before the
+        # plan runs.
+        edges = [32767, 32768, -32768, 2**31 - 1, 2**31, 2**40]
+        if t.column(col).type is o.BIGINT:
+            edges.append(2**63 - 1)
+        literal = data.draw(st.one_of(st.integers(-5, 5), st.sampled_from(edges)), label="literal")
         self.add(name, col, data.draw(st.sampled_from(["+", "-"]), label="op"), literal, key, literal=True)
 
     @precondition(lambda self: len(self.tables) >= 2)
@@ -1373,6 +1381,26 @@ def test_every_range_message_maps_to_its_sqlstate(tmp_path):
                 seen.update(start for start, _ in messages if str(e).startswith(start))
             else:
                 raise AssertionError(f"{col} = {value!r} was written")
+        # A BIGINT leaves its range only in arithmetic, never in a stored value.
+        db.execute("CREATE TABLE rb (k BIGINT PRIMARY KEY, b BIGINT)")
+        db.execute("INSERT INTO rb VALUES ($1, $2)", (1, BIGINT_HIGH))
+        try:
+            db.execute("UPDATE rb SET b = b + $1 WHERE k = $2", (1, 1))
+        except bytecask_sql.ExecError as e:
+            assert e.constraint == "range" and o.layer_sqlstate(e) == "22003", str(e)
+            seen.update(start for start, _ in messages if str(e).startswith(start))
+            assert str(e).startswith("bigint out of range"), str(e)
+        else:
+            raise AssertionError("b + 1 past BIGINT's range was written")
+        # bc_sub_bigint: the other direction, from the low edge.
+        db.execute("INSERT INTO rb VALUES ($1, $2)", (2, BIGINT_LOW))
+        try:
+            db.execute("UPDATE rb SET b = b - $1 WHERE k = $2", (1, 2))
+        except bytecask_sql.ExecError as e:
+            assert e.constraint == "range" and o.layer_sqlstate(e) == "22003", str(e)
+            assert str(e).startswith("bigint out of range"), str(e)
+        else:
+            raise AssertionError("b - 1 below BIGINT's range was written")
         assert seen == {start for start, _ in messages}, {start for start, _ in messages} - seen
     finally:
         db.close()
@@ -1514,14 +1542,17 @@ def test_count_from_the_keys_and_by_row(dsn):
 
 
 def test_column_plus_parameter_at_the_edges(dsn):
-    """SET col = col ± $1 on SMALLINT, INTEGER and NUMERIC(6, 2): a result
-    outside the column's type is 22003 on both sides, NULL stays NULL."""
+    """SET col = col ± $1 on BIGINT, SMALLINT, INTEGER and NUMERIC(6, 2): a
+    result outside the column's type is 22003 on both sides, NULL stays NULL.
+    BIGINT's is int64 itself, at both ends (#540)."""
     m = fixed(dsn)
     try:
         m.create(Table("t0", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.SMALLINT), Column("c2", o.INTEGER),
-                              Column("c3", o.numeric(6, 2))], ["c0"]))
-        m.insert("t0", {"c0": 1, "c1": 32760, "c2": -2147483640, "c3": decimal.Decimal("9999.00")}, all_columns=True)
-        m.insert("t0", {"c0": 2, "c1": None, "c2": None, "c3": None}, all_columns=True)
+                              Column("c3", o.numeric(6, 2)), Column("c4", o.BIGINT)], ["c0"]))
+        m.insert("t0", {"c0": 1, "c1": 32760, "c2": -2147483640, "c3": decimal.Decimal("9999.00"), "c4": BIGINT_HIGH},
+                 all_columns=True)
+        m.insert("t0", {"c0": 2, "c1": None, "c2": None, "c3": None, "c4": None}, all_columns=True)
+        m.insert("t0", {"c0": 5, "c1": 0, "c2": 0, "c3": decimal.Decimal("0.00"), "c4": BIGINT_LOW}, all_columns=True)
         for key in (1, 2, 3):
             assert m.add("t0", "c1", "+", 7, (key,)).error is None
             assert m.add("t0", "c1", "+", 1, (key,)).error == ("22003" if key == 1 else None)
@@ -1529,12 +1560,61 @@ def test_column_plus_parameter_at_the_edges(dsn):
             assert m.add("t0", "c3", "+", decimal.Decimal("0.99"), (key,)).error is None
             assert m.add("t0", "c3", "+", decimal.Decimal("0.01"), (key,)).error == ("22003" if key == 1 else None)
             assert m.add("t0", "c3", "-", None, (key,)).error is None
+            assert m.add("t0", "c4", "+", 1, (key,)).error == ("22003" if key == 1 else None)
+            assert m.add("t0", "c4", "-", 1, (key,)).error is None  # BIGINT_HIGH - 1; NULL stays NULL
+        assert m.add("t0", "c4", "+", BIGINT_HIGH, (1,)).error == "22003"  # (2^63 - 2) + (2^63 - 1)
+        # Row 5 starts at -2^63: nothing below it.
+        assert m.add("t0", "c4", "-", 1, (5,)).error == "22003"
+        assert m.add("t0", "c4", "+", -1, (5,)).error == "22003"
+        assert m.add("t0", "c4", "+", BIGINT_HIGH, (5,)).error is None  # -1
+        assert m.add("t0", "c4", "-", BIGINT_LOW, (5,)).error is None  # 2^63 - 1
+        assert m.add("t0", "c4", "-", BIGINT_LOW, (5,)).error == "22003"
         assert m.add("t0", "c2", "+", 2**31, (2,)).error == "22003"  # the operand is an INTEGER, on both
         # An operand of 18 digits or more is 22003 on the layer's side, before
         # the plan runs; PostgreSQL's NUMERIC takes it, and the sum overflows
         # NUMERIC(6, 2).
         m.insert("t0", {"c0": 4, "c1": 0, "c2": 0, "c3": decimal.Decimal("1.00")}, all_columns=True)
         assert m.add("t0", "c3", "+", decimal.Decimal(10**16), (4,)).error == "22003"
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_column_plus_parameter_across_bigint_and_scale_0_decimal(dsn):
+    """SET target = col ± $1: the sum is in col's type, as PostgreSQL's
+    operator types it, and the target only checks it on assignment. A BIGINT
+    col leaves int64 as "bigint out of range"; a NUMERIC(18, 0) col cannot,
+    its operand being held to 18 digits, so its overflow is the target's.
+    Both are 22003, a NUMERIC(18, 0) of scale 0 being a BIGINT to the layer
+    (#540). A SMALLINT or INTEGER target of a BIGINT col is refused."""
+    m = fixed(dsn)
+    big = 10**18 - 1
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.BIGINT),
+                              Column("c2", o.numeric(18, 0)), Column("c3", o.SMALLINT)], ["c0"]))
+        m.insert("t0", {"c0": 1, "c1": BIGINT_HIGH, "c2": decimal.Decimal(big), "c3": 0}, all_columns=True)
+        m.insert("t0", {"c0": 2, "c1": BIGINT_LOW, "c2": decimal.Decimal(-big), "c3": 0}, all_columns=True)
+        m.insert("t0", {"c0": 3, "c1": 5, "c2": decimal.Decimal(0), "c3": 0}, all_columns=True)
+        d = decimal.Decimal
+        # A NUMERIC(18, 0) col and target: past 18 digits, though not past int64.
+        assert m.add("t0", "c2", "+", d(1), (1,)).error == "22003"
+        assert m.add("t0", "c2", "+", d(big), (1,)).error == "22003"
+        assert m.add("t0", "c2", "-", d(1), (2,)).error == "22003"
+        assert m.add("t0", "c2", "-", d(big), (1,)).error is None  # 0
+        assert m.add("t0", "c2", "+", d(big), (1,)).error is None
+        # A BIGINT col into a NUMERIC(18, 0) target: int64's edge first, then 18 digits.
+        assert m.add("t0", "c1", "+", 1, (1,), target="c2").error == "22003"  # bigint out of range
+        assert m.add("t0", "c1", "-", 1, (2,), target="c2").error == "22003"
+        assert m.add("t0", "c1", "-", 1, (1,), target="c2").error == "22003"  # fits int64, not 18 digits
+        assert m.add("t0", "c1", "+", 1, (3,), target="c2").error is None  # 6
+        assert m.add("t0", "c1", "-", 7, (3,), target="c2").error is None  # -2
+        # A NUMERIC(18, 0) col into a BIGINT target: the sum fits int64 whatever the operand.
+        assert m.add("t0", "c2", "+", d(big), (1,), target="c1").error is None  # 2 * (10^18 - 1)
+        assert m.add("t0", "c2", "-", d(big), (2,), target="c1").error is None
+        assert m.add("t0", "c2", "+", None, (1,), target="c1").error is None
+        sql = "UPDATE t0 SET c3 = c1 + $1 WHERE c0 = $2"
+        out = o.run_layer(m.db, sql, (1, 3))
+        assert out.error == "refused" and "assigned column's type" in out.detail, out
         m.check()
     finally:
         m.teardown()
@@ -1595,6 +1675,26 @@ def test_binder_refusals_carry_postgresqls_sqlstate(dsn):
         layer = o.run_layer(m.db, sql, (1, 1))
         pg = o.run_pg_numbered(m.pg.conn, sql, (1, 1))
         assert layer.error == pg.error == "42P18", (sql, layer, pg)
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_a_computed_bound_past_integer_is_22003_before_the_plan_runs(dsn):
+    """WHERE c > $1 - k: $n is an INTEGER, so a $n past INTEGER, int64's edge
+    included, is 22003 before the plan runs and its addition (bc_add) never
+    sees an int64 overflow. Only the layer is asked: the oracle's driver sends
+    a $n past INTEGER as a bigint, which PostgreSQL then takes."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False)], ["c0"]))
+        m.insert("t0", {"c0": 1}, all_columns=True)
+        types = [o.INTEGER]
+        for op in ("-", "+"):
+            sql = f"SELECT c0 FROM t0 WHERE c0 > $1 {op} 15"
+            for edge in (BIGINT_HIGH, BIGINT_LOW, 2**31, -(2**31) - 1):
+                assert m.layer(sql, (edge,), types).error == "22003", (op, edge)
+            assert m.both(sql, (0,), types=types).error is None
         m.check()
     finally:
         m.teardown()
@@ -1767,9 +1867,9 @@ def test_sum_and_min_over_rows_nulls_and_none(dsn):
 
 
 def test_sum_past_int64_is_an_error(tmp_path):
-    """A SUM whose running total leaves int64 fails the statement, where
-    PostgreSQL's numeric would hold it (docs/frontend_design.md, *Known
-    differences*)."""
+    """A SUM whose running total leaves int64, a BIGINT's or a DECIMAL's in its
+    scaled integer, fails the statement as SQLSTATE 22003, where PostgreSQL's
+    numeric would hold it (docs/frontend_design.md, *Known differences*)."""
     db = bytecask_sql.open(str(tmp_path))
     try:
         db.execute("CREATE TABLE t (k BIGINT, n BIGINT NOT NULL, v BIGINT, PRIMARY KEY (k, n))")
@@ -1779,9 +1879,18 @@ def test_sum_past_int64_is_an_error(tmp_path):
         try:
             db.execute("SELECT sum(v) FROM t WHERE k = $1", (1,))
         except bytecask_sql.ExecError as e:
-            assert e.constraint is None and "out of range" in str(e), e
+            assert e.constraint is None and "out of range" in str(e) and e.sqlstate == "22003", e
         else:
             raise AssertionError("a sum past int64 was returned")
+        db.execute("CREATE TABLE d (g BIGINT, k BIGINT, v NUMERIC(18, 0), PRIMARY KEY (g, k))")
+        for k in range(10):  # ten of 10^18 - 1: 9.99 * 10^18 > 2^63
+            db.execute("INSERT INTO d VALUES ($1, $2, $3)", (1, k, 10**18 - 1))
+        try:
+            db.execute("SELECT sum(v) FROM d WHERE g = $1", (1,))
+        except bytecask_sql.ExecError as e:
+            assert e.constraint is None and e.sqlstate == "22003", e
+        else:
+            raise AssertionError("a DECIMAL sum past int64 was returned")
     finally:
         db.close()
 

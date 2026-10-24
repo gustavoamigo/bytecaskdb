@@ -239,7 +239,7 @@ needed; every pattern below uses calls `bc_plan.h` declares.
 | A nullable ordered part, its NULLs placed as PostgreSQL places them | `NullSplitScan` | two `bc_scan_open`s. Present values: `bc_scan_open(lo = bc_key_successor(prefix + NULL), hi = bc_key_successor(prefix))`, no `BC_SCAN_PREFIX`. NULL part: `bc_scan_open(prefix + NULL, prefix + NULL, BC_SCAN_PREFIX)`, where `prefix + NULL` is the prefix's key with `bc_key_null` appended. `ASC`: present values forward, then the NULL part; `DESC`: the NULL part reversed, then the present values reversed. One loop body, one `LIMIT` counter |
 | A covering read | `Scan::covering` | `bc_key_part_*` on `bc_scan_key`; otherwise `bc_scan_row` |
 | A residual filter | `Loop::residual` | `bc_col_*` or `bc_key_part_*`, compared in an `if` that `continue`s; a NULL operand rejects the row |
-| `+` / `-` | `Expr{Add, Sub}` | `bc_add` / `bc_sub`, then the range check of its type (*Additions*) |
+| `+` / `-` | `Expr{Add, Sub}` | `bc_add` / `bc_sub`, then the range check of its type (*Additions*); in a `SET` on a BIGINT read, `bc_add_bigint` / `bc_sub_bigint` (`Expr::bigint`), which raise "bigint out of range" on the table |
 | `SET col = col + $1` | `Update{set}` | `bc_row_from`, `bc_row_set_*` with the sum, `bc_update` |
 | UPDATE or DELETE of many rows | `Update{rows}`, `Delete{rows}` with a `Scan` | the scan, with `bc_update` / `bc_delete` per row; `bc_emit_count` with the rows written |
 | `ORDER BY` | the access path's order | none: the planner picks a path in that order |
@@ -271,6 +271,19 @@ sets `BC_C_RANGE` when the value is outside it.
     row builder's.
   - Assignments need no call: the row builder checks the stored value
     already (`CONTRACT.md`, the row on values outside their declared type).
+  - *`SET col = col ± $n` on a BIGINT:* the sum itself can leave `int64_t`,
+    so the plan adds with `bc_add_bigint` / `bc_sub_bigint`, which raise
+    `BC_C_RANGE`, "bigint out of range". The type is the SQL type of the
+    column read, as PostgreSQL's operator takes its result type from its
+    operands; the assigned column only checks the stored sum. The binder takes
+    a BIGINT and a `DECIMAL` of scale 0 as one type, the only crossing: a
+    `DECIMAL(p, 0)` read cannot leave `int64_t`, its operand held to 18
+    digits, so its overflow is the assigned column's ("numeric field
+    overflow"). `test_column_plus_parameter_across_bigint_and_scale_0_decimal`
+    runs both crossings against PostgreSQL.
+  - *`$n ± k` in a `WHERE`:* `$n` is checked as an `INTEGER` before the plan
+    runs, so `bc_add` cannot overflow `int64_t`
+    (`test_a_computed_bound_past_integer_is_22003_before_the_plan_runs`).
 
 `COUNT(DISTINCT)` uses the aggregate structure `bc_plan.h` declares
 (`bc_agg_open` with no slots, `bc_agg_group`, `bc_agg_next`).
@@ -465,8 +478,8 @@ fail on them.
   PostgreSQL computes the sum and fails only when it doesn't fit the
   column. The machine's literals stay inside 18 digits.
 - **A SUM whose running total leaves `int64_t` fails** (`BC_E_ARITH`). The
-  layer adds in 64 bits, a DECIMAL's scaled integer included; PostgreSQL's
-  `SUM` of a BIGINT or NUMERIC is an unbounded `numeric`. Below that the
+  layer adds in 64 bits, a BIGINT's or a DECIMAL's scaled integer, and the
+  statement fails as 22003; PostgreSQL's `SUM` of a BIGINT or NUMERIC is an unbounded `numeric`. Below that the
   sums agree exactly (`test_sum_past_int64_is_an_error`). The machine sums
   no BIGINT column; no TPROC-C sum comes near.
 - **MIN of a REAL or DOUBLE PRECISION column is refused.** PostgreSQL's

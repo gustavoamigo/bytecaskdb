@@ -160,6 +160,8 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_emit_count", fn_addr(bc_emit_count)},
       {"bc_add", fn_addr(bc_add)},
       {"bc_sub", fn_addr(bc_sub)},
+      {"bc_add_bigint", fn_addr(bc_add_bigint)},
+      {"bc_sub_bigint", fn_addr(bc_sub_bigint)},
       {"bc_mul", fn_addr(bc_mul)},
       {"bc_div", fn_addr(bc_div)},
       {"bc_mod", fn_addr(bc_mod)},

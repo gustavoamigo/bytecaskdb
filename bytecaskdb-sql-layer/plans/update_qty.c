@@ -19,7 +19,7 @@ void plan(bc_ctx *cx) {
   if (bc_col_null(cx, old, COL_1_2) || bc_param_null(cx, 1)) {
     bc_row_set_null(cx, r, COL_1_2);
   } else {
-    bc_row_set_i64(cx, r, COL_1_2, bc_sub(cx, bc_col_i64(cx, old, COL_1_2), bc_param_i64(cx, 1)));
+    bc_row_set_i64(cx, r, COL_1_2, bc_sub_bigint(cx, bc_col_i64(cx, old, COL_1_2), bc_param_i64(cx, 1), TBL_1));
   }
   bc_update(cx, TBL_1, old, bc_row_end(cx, r));
   bc_emit_count(cx, 1);

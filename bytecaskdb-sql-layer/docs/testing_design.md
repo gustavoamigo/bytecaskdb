@@ -130,10 +130,12 @@ The rules, by what they test.
   `LIMIT`).
 - **COUNT** of `*` or of a column over the same `WHERE`, with `LIMIT 0`
   or 1 now and then.
-- **SET col = col ± $n** on SMALLINT, INTEGER and NUMERIC(6, 2) columns by
+- **SET col = col ± $n** on BIGINT, SMALLINT, INTEGER and NUMERIC(6, 2) columns by
   the primary key, operands at and past the type's edges and NULL; on
   PostgreSQL's side `$n` is cast to the column's type, as PostgreSQL
-  types it. BIGINT is left out until its overflow is 22003 (#540).
+  types it. BIGINT's edges are int64 itself. The machine does not draw a
+  target other than the column read; `test_column_plus_parameter_across_bigint_and_scale_0_decimal`
+  does, for a BIGINT beside a NUMERIC(18, 0).
 
 **Integer literals and joins by key:**
 - **SET col = col ± n**, n an integer literal, on the same columns: small
