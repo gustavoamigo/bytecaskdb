@@ -15,9 +15,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <variant>
@@ -311,6 +313,47 @@ TEST_CASE("embedded API: a sort compiled while its table was small gives way, as
   insert(11, 1000);
   CHECK(in_order() == 1000);
   CHECK(db->compilations() == compiled);
+}
+
+TEST_CASE("embedded API: a hash join's choice by the budget counts each row's and key's bytes, so the build fits",
+          "[sql][api][memory][hash]") {
+  sql_test::TempDir dir{"api_mem_hash"};
+  // A row of b holds at least 12 + 8 + 9 x 8 = 92 bytes and its key 9, so a
+  // hash table of n of them at least 192 + n x (240 + 92 + 9): past 64 KiB
+  // from 192 rows. A threshold of the entries alone, 240 bytes each, would be
+  // 273.
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  db->execute("CREATE TABLE b (id BIGINT PRIMARY KEY, g BIGINT NOT NULL, j BIGINT, c1 BIGINT, c2 BIGINT, c3 BIGINT, "
+              "c4 BIGINT, c5 BIGINT, c6 BIGINT)");
+  db->execute("CREATE INDEX b_g ON b (g)");
+  db->execute("CREATE TABLE pr (id BIGINT PRIMARY KEY, v BIGINT)");
+  auto insert = [&](std::int64_t from, std::int64_t to) {
+    for (auto i = from; i <= to; ++i) {
+      db->execute("INSERT INTO b VALUES ($1, $2, $1, $1, $1, $1, $1, $1, $1)", {i, std::int64_t{1}});
+    }
+  };
+  insert(1, 20);
+  for (std::int64_t i = 1; i <= 30; ++i) db->execute("INSERT INTO pr VALUES ($1, $1)", {i});
+  // Compiled at 20 rows of b: the hash join built on b's range, which the
+  // plan counts against 192 when it runs.
+  const std::string sql = "SELECT b.id, pr.id FROM b, pr WHERE b.g = $1 AND pr.v = b.j";
+  const auto& st = db->prepare(sql);
+  auto compiled = db->compilations();
+  CHECK(db->execute(st, {std::int64_t{1}}).rows.size() == 20);
+  REQUIRE(st.plan_source().find("bc_hash_open") != std::string::npos);
+  REQUIRE(st.plan_source().find(", 192);") != std::string::npos);
+  // 230 rows: the hash join would pass the budget; the count takes pr read
+  // once per row of b, which holds a row at a time. Nothing recompiled.
+  insert(21, 230);
+  CHECK(db->execute(st, {std::int64_t{1}}).rows.size() == 30);
+  CHECK(db->compilations() == compiled);
+  // The hash join's branch, as a threshold of 273 would take it: 54000.
+  try {
+    (void)db->alternatives_for_testing(sql, {std::int64_t{1}});
+    FAIL("every plan ran");
+  } catch (const ExecError& e) {
+    CHECK(e.code() == BC_E_LIMIT);
+  }
 }
 
 TEST_CASE("embedded API: a bulk UPDATE of 200K rows passes the default memory budget, is 54000 and commits nothing",
@@ -720,9 +763,57 @@ TEST_CASE("embedded API: an allocation failure in an autocommit statement never 
   CHECK(balance(*db, 1) == 100);
 }
 
-TEST_CASE("embedded API: an allocation failure in a sorted plan is BC_E_MEMORY or its rows", "[sql][api][alloc]") {
-  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
-  sql_test::TempDir dir{"api_sort_faults"};
+namespace {
+
+// Every allocation of an execute of `sql`, with $1 = 1, failed in turn:
+// BC_E_MEMORY, or the rows of a run no failure reached; bad_alloc only before
+// the plan runs. Its plan holds `structure`. Compiled only where the seam
+// is, which a sanitizer runtime defining operator new leaves out.
+void sweep_plan_allocations(Database& db, const std::string& sql, std::string_view structure) {
+#ifdef BYTECASK_NO_ALLOC_FAULTS
+  (void)db;
+  (void)sql;
+  (void)structure;
+#else
+  INFO(sql);
+  const auto& st = db.prepare(sql);
+  const std::vector<Value> params{std::int64_t{1}};
+  auto want = db.execute(st, params).rows;
+  REQUIRE(st.plan_source().find(structure) != std::string::npos);
+  auto failed = 0;
+  for (long nth = 1;; ++nth) {
+    REQUIRE(nth < 100000);
+    std::string outcome;
+    std::optional<decltype(want)> got;
+    auto fired = false;
+    {
+      bytecask::testing::ScopedAllocFaults faults{nth, false};
+      try {
+        got = db.execute(st, params).rows;
+        outcome = "ran";
+      } catch (const ExecError& e) {
+        outcome = e.code() == BC_E_MEMORY ? "memory" : "error";
+      } catch (const std::bad_alloc&) {
+        outcome = "bad_alloc";
+      }
+      fired = faults.report().fired;
+    }
+    INFO("allocation " << nth << ": " << outcome);
+    CHECK((outcome == "ran" || outcome == "memory" || outcome == "bad_alloc"));
+    if (got) CHECK(*got == want);
+    if (!fired) {
+      CHECK(outcome == "ran");
+      break;
+    }
+    ++failed;
+  }
+  CHECK(failed > 0);
+#endif
+}
+
+// acct and owner, 12 rows each: owner.acct NULL in every fourth row, and
+// equal in several.
+auto open_owners(const sql_test::TempDir& dir) -> std::unique_ptr<Database> {
   auto db = open_db(dir);
   db->execute("CREATE TABLE owner (id BIGINT PRIMARY KEY, acct BIGINT, name BYTEA)");
   for (std::int64_t k = 1; k <= 12; ++k) {
@@ -730,51 +821,49 @@ TEST_CASE("embedded API: an allocation failure in a sorted plan is BC_E_MEMORY o
     db->execute("INSERT INTO owner VALUES ($1, $2, $3)",
                 {k, k % 4 == 0 ? Value{} : Value{(k * 5) % 13}, Value{std::vector<std::byte>(static_cast<std::size_t>(k % 3), std::byte{'x'})}});
   }
-  // Each a plan the compiler sorts (a full scan or a range, under a LIMIT
-  // or not, on a join, FOR UPDATE), every allocation of an execute failed in
-  // turn: BC_E_MEMORY, or the rows of a run no failure reached; bad_alloc
-  // only before the plan runs.
-  const std::vector<std::string> sorted{
-      "SELECT id, bal FROM acct WHERE bal >= $1 ORDER BY bal DESC, id",
-      "SELECT id FROM owner WHERE id > $1 ORDER BY acct NULLS FIRST, name DESC LIMIT 3",
-      "SELECT owner.id, bal FROM owner, acct WHERE owner.id > $1 AND acct.id = owner.acct ORDER BY bal, owner.id",
-      "SELECT id, bal FROM acct WHERE id > $1 ORDER BY bal LIMIT 4 FOR UPDATE",
-  };
-  for (const auto& sql : sorted) {
-    INFO(sql);
-    const auto& st = db->prepare(sql);
-    const std::vector<Value> params{std::int64_t{1}};
-    auto want = db->execute(st, params).rows;
-    REQUIRE(st.plan_source().find("bc_sorter_open") != std::string::npos);
-    auto failed = 0;
-    for (long nth = 1;; ++nth) {
-      REQUIRE(nth < 100000);
-      std::string outcome;
-      std::optional<decltype(want)> got;
-      auto fired = false;
-      {
-        bytecask::testing::ScopedAllocFaults faults{nth, false};
-        try {
-          got = db->execute(st, params).rows;
-          outcome = "ran";
-        } catch (const ExecError& e) {
-          outcome = e.code() == BC_E_MEMORY ? "memory" : "error";
-        } catch (const std::bad_alloc&) {
-          outcome = "bad_alloc";
-        }
-        fired = faults.report().fired;
-      }
-      INFO("allocation " << nth << ": " << outcome);
-      CHECK((outcome == "ran" || outcome == "memory" || outcome == "bad_alloc"));
-      if (got) CHECK(*got == want);
-      if (!fired) {
-        CHECK(outcome == "ran");
-        break;
-      }
-      ++failed;
-    }
-    CHECK(failed > 0);
+  return db;
+}
+
+}  // namespace
+
+TEST_CASE("embedded API: an allocation failure in a sorted plan is BC_E_MEMORY or its rows", "[sql][api][alloc]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
+  sql_test::TempDir dir{"api_sort_faults"};
+  auto db = open_owners(dir);
+  // Each a plan the compiler sorts: a full scan or a range, under a LIMIT or
+  // not, on a join, FOR UPDATE; then a join of two scans, a sorter per loop.
+  for (const auto* sql : {
+           "SELECT id, bal FROM acct WHERE bal >= $1 ORDER BY bal DESC, id",
+           "SELECT id FROM owner WHERE id > $1 ORDER BY acct NULLS FIRST, name DESC LIMIT 3",
+           "SELECT owner.id, bal FROM owner, acct WHERE owner.id > $1 AND acct.id = owner.acct ORDER BY bal, owner.id",
+           "SELECT id, bal FROM acct WHERE id > $1 ORDER BY bal LIMIT 4 FOR UPDATE",
+       }) {
+    sweep_plan_allocations(*db, sql, "bc_sorter_open");
   }
+  sweep_plan_allocations(
+      *db, "SELECT owner.id, acct.id FROM owner, acct WHERE owner.id > $1 AND acct.bal >= $1 ORDER BY acct.bal, owner.id",
+      "bc_sorter_nth");
+}
+
+TEST_CASE("embedded API: an allocation failure in a hash join plan is BC_E_MEMORY or its rows", "[sql][api][alloc]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
+  sql_test::TempDir dir{"api_hash_faults"};
+  auto db = open_owners(dir);
+  // Joined on a column no key holds, NULL in some rows and equal in several:
+  // a hash join, alone, sorted on its probe side, and under a LIMIT.
+  for (const auto* sql : {
+           "SELECT owner.id, acct.id FROM owner, acct WHERE owner.id > $1 AND acct.bal = owner.acct",
+           "SELECT owner.id, acct.id FROM owner, acct WHERE owner.id > $1 AND acct.bal = owner.acct ORDER BY acct.id DESC",
+           "SELECT count(DISTINCT owner.name) FROM owner, acct WHERE acct.bal > $1 AND owner.acct = acct.bal",
+           "SELECT acct.id FROM owner, acct WHERE owner.id > $1 AND acct.bal = owner.acct LIMIT 2",
+       }) {
+    sweep_plan_allocations(*db, sql, "bc_hash_open");
+  }
+  // Sorted above the join, a sorter of each table's rows.
+  sweep_plan_allocations(*db,
+                         "SELECT owner.id, acct.id FROM owner, acct WHERE owner.id > $1 AND acct.bal = owner.acct "
+                         "ORDER BY acct.id DESC, owner.id LIMIT 5",
+                         "bc_sorter_nth");
 }
 
 TEST_CASE("embedded API: a DDL whose commit may have reached the engine is 08007", "[sql][api][alloc]") {

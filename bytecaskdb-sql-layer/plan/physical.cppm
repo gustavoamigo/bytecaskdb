@@ -8,9 +8,9 @@
 // reads the catalog.
 //
 // The operators are Empty, the access paths, the joins (an index nested
-// loop, and a nested loop), the choice points, Filter, Sort, Limit,
-// Aggregate and the sinks: Emit for result rows, Insert, Update, Delete. No
-// hash join yet. check() enforces what the types can't express.
+// loop, a nested loop and a hash join), the choice points, Filter, Sort,
+// Limit, Aggregate and the sinks: Emit for result rows, Insert, Update,
+// Delete. check() enforces what the types can't express.
 
 module;
 #include <algorithm>
@@ -121,13 +121,37 @@ struct NestedLoop {
   NodePtr inner;
 };
 
+// One part of a hash join's key: a column of the build side's table and the
+// probe side's column it equals, of one physical type, never a DOUBLE.
+struct HashKey {
+  ColumnRef build;
+  ColumnRef probe;
+};
+
+// A hash join, a pipeline breaker: every row of `build` is put in a hash
+// table (bc_hash_*) under the key of its `keys` columns, then for each row of
+// `probe`, every row put under the same key. The key is built with
+// bc_sort_key_* from the columns' values, so equal values give equal bytes;
+// a row with a NULL key column is neither put nor probed, as `=` never holds
+// for NULL. The build side reads one table in one loop, `held`, whose row the
+// hash table holds; the probe side is any plan, and its order is the join's.
+struct HashJoin {
+  NodePtr build;
+  NodePtr probe;
+  std::vector<HashKey> keys;
+  std::uint32_t held{0};
+};
+
 // A choice point (docs/planner_design.md, *Choosing at run time*): one
 // table's rows by one of two plans, picked when the plan runs by
 // bc_count_range over the first one's range, limited to the threshold. A
 // count below it takes the first, `below`; one that reaches it, the second.
 // Each is a scan under its filters, or such a scan sorted: the choice by the
-// memory budget between a sort and a scan in the ORDER BY's order. A threshold of 0 always takes the
-// second, and INT64_MAX the first (override_thresholds).
+// memory budget between a sort and a scan in the ORDER BY's order. Or, for
+// the choice by the budget between a hash join and a plan without one, the
+// hash join, counted by its build side's range, and the other plan of the
+// same tables. A threshold of 0 always takes the second, and INT64_MAX the
+// first (override_thresholds).
 struct Choice {
   Scan counted;  // the range counted: the first plan's, its whole prefix for a NULL split
   std::int64_t threshold{0};
@@ -151,18 +175,26 @@ struct SortPart {
   bool nulls_first{false};
 };
 
-// A pipeline breaker: every row of its input added to a sorter, keyed by
+// A pipeline breaker: every row of its input added to sorters, keyed by
 // `keys` (bc_sort_key_*), then streamed in that order. A sorter holds one
-// view per row, so the input reads one table in a loop, `payload`, whose
-// row is the one held; the rows of tables read once before that loop stay
-// in hand, and a table looked up per row after it is looked up again above
-// the Sort. With keep n > 0 the sorter holds only the first n (ORDER BY …
-// LIMIT n); 0 holds all.
+// view per row, so there is one per loop of the input whose row is read
+// above the Sort, each holding the row of its loop's table, `payloads`,
+// outer first, all fed the same key; with none, one holds the keys alone. A
+// sorter is stable, and a top-n one keeps the earliest of equal keys, so the
+// sorters hold rows of the same input rows in the same order, and are read
+// in step. The rows of tables read once before the first loop stay in hand,
+// and a table looked up per row after it is looked up again above the Sort.
+// Another loop's row is read only below it, its sort key built from it or
+// from a covering scan's entry.
+// With keep n > 0 each sorter holds only the first n (ORDER BY … LIMIT n); 0
+// holds all. A row NULL in a column of `not_null` is not added: a hash
+// join's probe key, which matches nothing.
 struct Sort {
   NodePtr input;
   std::vector<SortPart> keys;
   std::int64_t keep{0};
-  std::uint32_t payload{0};
+  std::vector<std::uint32_t> payloads;
+  std::vector<ColumnRef> not_null;
 };
 
 // The first n rows of Emit's input.
@@ -207,8 +239,8 @@ struct Delete {
 };
 
 struct Node {
-  std::variant<Empty, PointGet, Scan, NullSplitScan, CountRange, MinFirstEntry, IndexJoin, NestedLoop, Choice, Filter,
-               Sort, Limit, Emit, Aggregate, Insert, Update, Delete>
+  std::variant<Empty, PointGet, Scan, NullSplitScan, CountRange, MinFirstEntry, IndexJoin, NestedLoop, HashJoin, Choice,
+               Filter, Sort, Limit, Emit, Aggregate, Insert, Update, Delete>
       op;
 };
 
@@ -378,6 +410,15 @@ private:
     return false;
   }
 
+  // The hash join a node's rows come from, under the filters on its pairs
+  // and a sort of them, or null.
+  static auto hash_below(const Node& n) -> const HashJoin* {
+    if (const auto* h = std::get_if<HashJoin>(&n.op)) return h;
+    if (const auto* f = std::get_if<Filter>(&n.op)) return hash_below(*f->input);
+    if (const auto* o = std::get_if<Sort>(&n.op)) return hash_below(*o->input);
+    return nullptr;
+  }
+
   // The plans a node's rows may come from: a choice point's two, or itself.
   static auto branches(const Node& n) -> std::vector<const Node*> {
     if (const auto* c = std::get_if<Choice>(&n.op)) return {c->below.get(), c->at_or_above.get()};
@@ -414,6 +455,10 @@ private:
       tables_of(*j->outer, out);
       tables_of(*j->inner, out);
     }
+    if (const auto* h = std::get_if<HashJoin>(&n.op)) {
+      tables_of(*h->probe, out);
+      tables_of(*h->build, out);
+    }
   }
   static auto tables_of(const Node& n) -> std::vector<std::uint32_t> {
     std::vector<std::uint32_t> out;
@@ -421,21 +466,29 @@ private:
     return out;
   }
 
-  // The loops over a cursor or a sorter that a node's rows come from, one
-  // inside another; and the table the innermost one reads, if any.
-  static auto loops(const Node& n) -> std::pair<std::size_t, std::optional<std::uint32_t>> {
-    if (const auto* s = scan_below(n); s != nullptr && !std::holds_alternative<Sort>(n.op)) return {1, s->table};
-    if (const auto* o = std::get_if<Sort>(&n.op)) return {1, o->payload};
+  // The tables whose rows the loops over a cursor or a sorter that a node's
+  // rows come from bind, one loop inside another, outer first; a sort's loop
+  // binds each of its sorters' rows.
+  static auto loops(const Node& n) -> std::vector<std::uint32_t> {
+    if (const auto* s = scan_below(n); s != nullptr && !std::holds_alternative<Sort>(n.op)) return {s->table};
+    if (const auto* o = std::get_if<Sort>(&n.op)) return o->payloads;
     if (const auto* f = std::get_if<Filter>(&n.op)) return loops(*f->input);
     if (const auto* l = std::get_if<Limit>(&n.op)) return loops(*l->input);
     if (const auto* c = std::get_if<Choice>(&n.op)) return loops(*c->below);
     if (const auto* j = std::get_if<IndexJoin>(&n.op)) return loops(*j->outer);
     if (const auto* j = std::get_if<NestedLoop>(&n.op)) {
-      auto [outer, table] = loops(*j->outer);
-      auto [inner, inner_table] = loops(*j->inner);
-      return {outer + inner, inner_table ? inner_table : table};
+      auto out = loops(*j->outer);
+      auto inner = loops(*j->inner);
+      out.insert(out.end(), inner.begin(), inner.end());
+      return out;
     }
-    return {0, std::nullopt};
+    // The probe side's loops, and inside them the loop over a probe's rows.
+    if (const auto* h = std::get_if<HashJoin>(&n.op)) {
+      auto out = loops(*h->probe);
+      out.push_back(h->held);
+      return out;
+    }
+    return {};
   }
 
   // Every choice point under n, outer first.
@@ -452,6 +505,9 @@ private:
           } else if constexpr (std::is_same_v<T, NestedLoop>) {
             each_choice(*op.outer, out);
             each_choice(*op.inner, out);
+          } else if constexpr (std::is_same_v<T, HashJoin>) {
+            each_choice(*op.build, out);
+            each_choice(*op.probe, out);
           } else if constexpr (requires { op.input; }) {
             each_choice(*op.input, out);
           }
@@ -478,6 +534,9 @@ private:
           } else if constexpr (std::is_same_v<T, NestedLoop>) {
             covering_tables(*op.outer);
             covering_tables(*op.inner);
+          } else if constexpr (std::is_same_v<T, HashJoin>) {
+            covering_tables(*op.build);
+            covering_tables(*op.probe);
           } else if constexpr (std::is_same_v<T, Choice>) {
             covering_tables(taken(op));
           } else if constexpr (requires { op.input; }) {
@@ -485,6 +544,26 @@ private:
           }
         },
         n.op);
+  }
+
+  // The sort a node's rows come from, through the lookups by key repeated
+  // above it, in the branches taken; or null.
+  auto sort_below(const Node& n) const -> const Sort* {
+    if (const auto* o = std::get_if<Sort>(&n.op)) return o;
+    if (const auto* f = std::get_if<Filter>(&n.op)) return sort_below(*f->input);
+    if (const auto* l = std::get_if<Limit>(&n.op)) return sort_below(*l->input);
+    if (const auto* j = std::get_if<IndexJoin>(&n.op)) return sort_below(*j->outer);
+    if (const auto* c = std::get_if<Choice>(&n.op)) return sort_below(taken(*c));
+    return nullptr;
+  }
+
+  // A column read above the sort `n`'s rows come from is of a row in hand:
+  // never of a loop no sorter holds, whose row the sorter loop has not.
+  void held_above(const Node& n, const ColumnRef& c) const {
+    const auto* o = sort_below(n);
+    if (o == nullptr || std::ranges::find(o->payloads, c.table) != o->payloads.end()) return;
+    auto in = loops(*o->input);
+    if (std::ranges::find(in, c.table) != in.end()) broken("a column read above a sort from a loop no sorter holds");
   }
 
   // The inner side of a nested loop, one of its plans: a scan under filters
@@ -552,23 +631,62 @@ private:
             for (const auto& e : op.inner_key) {
               null_checked(e);
               reads(e);
+              if (e.kind == Expr::Kind::Column) held_above(*op.outer, e.col);
             }
             node(*op.outer, &n);
           } else if constexpr (std::is_same_v<T, NestedLoop>) {
             auto outer = one_row_tables(*op.outer);
             if (!outer) {
               // Read once per outer row: no count of its own per row.
-              if (loops(*op.outer).first == 0) broken("a nested loop whose outer side is neither one row nor a loop");
+              if (loops(*op.outer).empty()) broken("a nested loop whose outer side is neither one row nor a loop");
               if (std::holds_alternative<Choice>(op.inner->op)) broken("a choice point read once per outer row");
               outer = tables_of(*op.outer);
             }
             for (const auto* b : branches(*op.inner)) inner_side(*b, *outer);
             node(*op.outer, &n);
             node(*op.inner, &n);
+          } else if constexpr (std::is_same_v<T, HashJoin>) {
+            if (op.keys.empty()) broken("a hash join with no key");
+            // The hash table holds the row of the build side's one loop.
+            if (loops(*op.build) != std::vector<std::uint32_t>{op.held}) {
+              broken("a hash join whose build side is not one loop over the table it holds");
+            }
+            if (std::ranges::find(covering_, op.held) != covering_.end()) broken("a hash join that holds a covering scan's entry");
+            auto probed = tables_of(*op.probe);
+            if (std::ranges::find(probed, op.held) != probed.end()) broken("a hash join that holds a table its probe side reads");
+            for (const auto& k : op.keys) {
+              if (k.build.table != op.held) broken("a hash key outside the table held");
+              if (std::ranges::find(probed, k.probe.table) == probed.end()) broken("a hash key outside the probe side");
+              if (k.build.type != k.probe.type) broken("a hash key of two types");
+              if (k.build.type == PhysType::F64) broken("a hash key on a DOUBLE column");
+              read(k.probe);
+            }
+            node(*op.build, &n);
+            node(*op.probe, &n);
           } else if constexpr (std::is_same_v<T, Choice>) {
             scan(op.counted);
             if (op.threshold < 0) broken("a choice point with a negative threshold");
             if (!op.below || !op.at_or_above) broken("a choice point without two plans");
+            // The choice by the budget at a hash join counts its build side's
+            // range; its other plan reads the same tables.
+            if (const auto* h = hash_below(*op.below)) {
+              const auto* built = scan_below(*h->build);
+              if (built == nullptr || built->table != op.counted.table) {
+                broken("a choice point at a hash join that counts another range than its build side's");
+              }
+              counts_first(op, *built, split_below(*h->build));
+              // A table looked up again above a sort is read twice.
+              auto distinct = [](std::vector<std::uint32_t> v) {
+                std::ranges::sort(v);
+                v.erase(std::ranges::unique(v).begin(), v.end());
+                return v;
+              };
+              if (distinct(tables_of(*op.below)) != distinct(tables_of(*op.at_or_above))) {
+                broken("a choice point at a hash join whose other plan reads other tables");
+              }
+              node(taken(op), &n);
+              return;
+            }
             const auto* first = scan_below(*op.below);
             const auto* second = scan_below(*op.at_or_above);
             if (first == nullptr || second == nullptr) {
@@ -592,21 +710,35 @@ private:
           } else if constexpr (std::is_same_v<T, Sort>) {
             if (op.keys.empty()) broken("a sort with no key");
             if (op.keep < 0) broken("a sort that keeps a negative number of rows");
-            auto [depth, table] = loops(*op.input);
-            if (depth != 1) broken("a sort whose input is not one loop");
-            if (table != op.payload) broken("a sort that holds another row than its loop's");
-            // The sorter holds the row; a covering scan's entry has none.
-            if (std::ranges::find(covering_, op.payload) != covering_.end()) broken("a sort over a covering scan");
+            // A sorter per loop it holds, outer first, each holding its
+            // loop's row; a covering scan's entry has none.
+            auto held = op.payloads.begin();
+            for (auto t : loops(*op.input)) {
+              if (held != op.payloads.end() && *held == t) ++held;
+            }
+            if (held != op.payloads.end()) broken("a sort whose sorters hold other rows than its loops'");
+            for (auto t : op.payloads) {
+              if (std::ranges::find(covering_, t) != covering_.end()) broken("a sort over a covering scan");
+            }
             auto in = tables_of(*op.input);
             for (const auto& k : op.keys) {
               if (std::ranges::find(in, k.col.table) == in.end()) broken("a sort key outside its input's tables");
+              read(k.col);
+            }
+            // A row's NULL is tested before it is added, from a row in hand.
+            for (const auto& c : op.not_null) {
+              if (std::ranges::find(in, c.table) == in.end()) broken("a sort's NULL test outside its input's tables");
+              read(c);
             }
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Limit>) {
             if (parent == nullptr || !std::holds_alternative<Emit>(parent->op)) broken("a LIMIT not under the rows emitted");
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Emit>) {
-            for (const auto& t : op.targets) read(t);
+            for (const auto& t : op.targets) {
+              read(t);
+              held_above(*op.input, t);
+            }
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Aggregate>) {
             if (op.agg.kind != Expr::Kind::Aggregate) broken("an aggregate that is not an aggregate call");
@@ -662,6 +794,9 @@ void each_choice(Node& n, const F& f) {
         } else if constexpr (std::is_same_v<T, NestedLoop>) {
           each_choice(*op.outer, f);
           each_choice(*op.inner, f);
+        } else if constexpr (std::is_same_v<T, HashJoin>) {
+          each_choice(*op.build, f);
+          each_choice(*op.probe, f);
         } else if constexpr (requires { op.input; }) {
           each_choice(*op.input, f);
         }
