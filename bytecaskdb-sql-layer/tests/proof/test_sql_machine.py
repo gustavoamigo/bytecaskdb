@@ -1679,10 +1679,12 @@ def test_a_key_outside_its_type_is_refused(dsn):
 
 
 def test_a_parameter_compared_with_two_types_is_refused(dsn):
-    # Known difference. PostgreSQL gets the value as two float8 parameters
-    # (pg_params gives each $1 its own %s) and returns no row; the layer
-    # refuses a $n compared with columns of two SQL types, where it would
-    # have keyed 1e39 for the REAL column as infinity and returned the inf row.
+    # Known difference. PostgreSQL gets the value as one float8 parameter
+    # (pg_params maps the reused $1 to one named parameter), compares the
+    # REAL column with it as a float8, where inf is not 1e39, and returns no
+    # row; the layer refuses a $n compared with columns of two SQL types,
+    # where it would have keyed 1e39 for the REAL column as infinity and
+    # returned the inf row.
     m = fixed(dsn)
     try:
         m.create(Table("t0", [Column("c0", o.DOUBLE), Column("c1", o.REAL)], ["c0", "c1"]))
@@ -2093,8 +2095,8 @@ def binder_machine(dsn) -> SqlMachine:
 def test_binder_refusals_carry_postgresqls_sqlstate(dsn):
     """A statement the binder refuses for a fault PostgreSQL also refuses gets
     PostgreSQL's SQLSTATE (#548). PostgreSQL gets each statement with its $n as
-    written and untyped (run_pg_numbered), as the layer reads it: psycopg
-    would send a repeated $1 as two parameters."""
+    written and untyped (run_pg_numbered), as the layer reads it: run_pg
+    would send each typed as psycopg adapts it."""
     m = binder_machine(dsn)
     try:
         for sql, params, state in (

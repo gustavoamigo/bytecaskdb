@@ -690,8 +690,9 @@ outputs are each `COUNT(*)`, or `MIN` or `MAX` of one column held as
 filtering a row after the range: `KeyAggregates(counted, values, arg,
 outputs)`. `COUNT(*)` is `bc_count_range` of `counted`. `MIN` is the first
 entry of `values`, which is `counted` started past the part's NULLs
-wherever its low end is open (no range on the part, an upper bound alone,
-or a full scan) and the argument is nullable; `MAX` is its last, read as
+wherever it starts at them (`physical::starts_at_nulls`: its low end open,
+with no range on the part, an upper bound alone or a full scan, or the NULL
+part as is) and the argument is nullable; `MAX` is its last, read as
 the first entry of `values` scanned in reverse. Each `MIN` or `MAX` is read
 once into `kv<i>`, NULL while `kn<i>`, by one step in a block of its own,
 the cursor closed after it; then the row is emitted. A `DESC` part, another

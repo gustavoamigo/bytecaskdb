@@ -21,8 +21,9 @@ void plan(bc_ctx *cx) {
   bc_view hi = bc_key_end(cx, k0);
   bc_cursor c = bc_scan_open(cx, IDX_9, lo, hi, BC_SCAN_FORWARD);
   while (bc_scan_next(cx, c)) {
-    if (!bc_key_part_null(cx, IDX_9, bc_scan_key(cx, c), PART_9_1)) {
-      int64_t v0_0 = bc_key_part_i64(cx, IDX_9, bc_scan_key(cx, c), PART_9_1);
+    bc_view key = bc_scan_key(cx, c);
+    if (!bc_key_part_null(cx, IDX_9, key, PART_9_1)) {
+      int64_t v0_0 = bc_key_part_i64(cx, IDX_9, key, PART_9_1);
       if (!xs0_0 || v0_0 > x0_0) x0_0 = v0_0;
       xs0_0 = true;
     }

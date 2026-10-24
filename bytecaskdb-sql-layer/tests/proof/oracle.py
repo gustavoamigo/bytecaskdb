@@ -335,8 +335,9 @@ def run_psycopg(conn, text: str, values, sql: str) -> Outcome:
 
 def run_pg_numbered(conn, sql: str, params=()) -> Outcome:
     """A statement on PostgreSQL with its $n as written, every parameter
-    untyped. psycopg numbers a placeholder by its position, so run_pg cannot
-    send a statement whose $1 no use gives a type (42P18)."""
+    untyped, so PostgreSQL types each $n by its uses, as the layer does, and
+    refuses one no use types (42P18). run_pg sends each parameter typed as
+    psycopg adapts it, so it cannot send an untyped $1."""
     import psycopg
 
     res = conn.pgconn.exec_params(sql.encode(), [None if v is None else str(v).encode() for v in params])

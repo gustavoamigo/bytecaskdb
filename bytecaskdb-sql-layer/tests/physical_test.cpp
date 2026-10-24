@@ -139,11 +139,26 @@ TEST_CASE("physical: check refuses what codegen can't print", "[sql][physical]")
   CHECK(refusal(plan(node(physical::KeyAggregates{counted, scan({p(0)}, physical::Range{value(p(1)), {}}), kV, {min_v},
                                                   true})))
             .empty());
+  const auto at_nulls = physical::KeyBound{physical::KeyBound::Kind::NullPart, std::nullopt, false};
   for (const auto& open : {scan({p(0)}, {}), scan({p(0)}, physical::Range{}), scan({p(0)}, physical::Range{{}, value(p(1))}),
-                           scan({p(0)}, physical::Range{{physical::KeyBound::Kind::NullPart, std::nullopt, false}, {}})}) {
+                           scan({p(0)}, physical::Range{at_nulls, {}}), scan({p(0)}, physical::Range{at_nulls, value(p(1))})}) {
     refused(plan(node(physical::KeyAggregates{counted, open, kV, {min_v}, true})), "starts at its part's NULLs");
     refused(plan(node(physical::KeyAggregates{counted, open, kV, {max_v}, true})), "starts at its part's NULLs");
+    // past_nulls, what the search starts the values at, moves each past the
+    // NULLs, keeping its high end.
+    auto past = open;
+    past.rest = physical::past_nulls(open.rest);
+    CHECK(!physical::starts_at_nulls(past.rest));
+    const auto* r = std::get_if<physical::Range>(&past.rest);
+    REQUIRE(r != nullptr);
+    CHECK(r->lo == physical::KeyBound{physical::KeyBound::Kind::NullPart, std::nullopt, true});
+    const auto* was = std::get_if<physical::Range>(&open.rest);
+    CHECK(r->hi == (was == nullptr ? physical::KeyBound{} : was->hi));
+    CHECK(refusal(plan(node(physical::KeyAggregates{counted, past, kV, {min_v, max_v}, true}))).empty());
   }
+  // A range that starts past the NULLs, or at a value, is kept as it is.
+  CHECK(std::get<physical::Range>(physical::past_nulls(upper_past_nulls)).hi == value(p(1)));
+  CHECK(std::get<physical::Range>(physical::past_nulls(physical::Range{value(p(1)), {}})).lo == value(p(1)));
   // Not nullable: no NULLs to skip.
   CHECK(refusal(plan(node(physical::KeyAggregates{counted, counted, kId, {min_id}, true}))).empty());
   // Each MIN or MAX is read into an int64_t: a column held otherwise is refused.

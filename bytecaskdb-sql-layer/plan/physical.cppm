@@ -53,6 +53,24 @@ struct Range {
 
 using ScanRest = std::variant<std::monostate, Range>;
 
+// Whether a scan starts at its part's NULLs, ASC's first entries: its low
+// end is open (a prefix alone, or no lower bound) or the NULL part as is.
+[[nodiscard]] auto starts_at_nulls(const ScanRest& rest) -> bool {
+  const auto* r = std::get_if<Range>(&rest);
+  return r == nullptr || r->lo.kind == KeyBound::Kind::Open ||
+         (r->lo.kind == KeyBound::Kind::NullPart && !r->lo.successor);
+}
+
+// `rest` started past its part's NULLs, at the NULL part's successor, where
+// it starts at them; its high end kept. What MIN or MAX of a nullable part
+// from the keys reads (KeyAggregates).
+[[nodiscard]] auto past_nulls(ScanRest rest) -> ScanRest {
+  if (!starts_at_nulls(rest)) return rest;
+  auto r = std::holds_alternative<Range>(rest) ? std::get<Range>(rest) : Range{};
+  r.lo = {KeyBound::Kind::NullPart, std::nullopt, true};
+  return r;
+}
+
 // No rows, and nothing read: the input a conjunct always false leaves.
 struct Empty {};
 
@@ -757,10 +775,7 @@ private:
               // Each is read into an int64_t.
               if (op.arg->type != PhysType::I64) broken("MIN or MAX from the keys of a column not held as I64");
               if (op.values.reverse) broken("MIN or MAX from the first entry of a reverse scan");
-              // An open low end starts at the part's NULLs, ASC's first.
-              const auto* r = std::get_if<Range>(&op.values.rest);
-              if (op.arg->nullable && (r == nullptr || r->lo.kind == KeyBound::Kind::Open ||
-                                       (r->lo.kind == KeyBound::Kind::NullPart && !r->lo.successor))) {
+              if (op.arg->nullable && starts_at_nulls(op.values.rest)) {
                 broken("MIN or MAX from a range that starts at its part's NULLs");
               }
               if (op.values.object != op.counted.object || op.values.prefix != op.counted.prefix) {

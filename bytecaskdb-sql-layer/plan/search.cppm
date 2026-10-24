@@ -2420,19 +2420,16 @@ private:
 
   // MIN(arg) from the scan's first entry: arg is the ASC part after its
   // prefix, so the first entry past that part's NULLs holds the least value,
-  // and the last the greatest. Where the scan's low end is open (no range on
-  // the part, or one with no lower bound, a full scan's among them) and arg
-  // is nullable, it starts past the NULLs instead.
+  // and the last the greatest. Where the scan starts at the NULLs
+  // (physical::starts_at_nulls) and arg is nullable, it starts past them
+  // instead.
   static auto min_from_first_entry(const Table& t, physical::Scan& sc, const ColumnRef& arg) -> bool {
     const auto all = paths(t);
     const auto& path = *std::ranges::find_if(all, [&](const Path& p) { return p.object == sc.object; });
     if (sc.prefix.size() >= path.parts.size()) return false;
     const auto& part = path.parts[sc.prefix.size()];
     if (part.col != arg.col || part.desc) return false;
-    if (!arg.nullable) return true;
-    if (std::holds_alternative<std::monostate>(sc.rest)) sc.rest = physical::Range{};
-    auto& lo = std::get<physical::Range>(sc.rest).lo;
-    if (lo.kind == physical::KeyBound::Kind::Open) lo = {physical::KeyBound::Kind::NullPart, std::nullopt, true};
+    if (arg.nullable) sc.rest = physical::past_nulls(std::move(sc.rest));
     return true;
   }
 

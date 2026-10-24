@@ -86,6 +86,11 @@ struct GeneratedPlan {
                                          const RowCounts& counts = {}, std::uint64_t memory_bytes = 0)
     -> std::vector<GeneratedPlan>;
 
+// The lines a plan rooted at `root` prints for when no row can match: a
+// write's count of 0, an aggregate's row over no rows, or none. A test seam:
+// it reads `root` unchecked, so a test can hand it what check refuses.
+[[nodiscard]] auto no_rows_lines(const physical::Node& root) -> std::vector<std::string>;
+
 }  // namespace bytecask::sql
 
 namespace bytecask::sql {
@@ -339,7 +344,7 @@ auto count_row(const std::string& n) -> std::vector<std::string> {
 auto empty_row(const std::vector<Expr>& outputs) -> std::vector<std::string> {
   std::vector<std::string> out{"bc_emit_begin(cx);"};
   for (const auto& o : outputs) {
-    if (o.fn == Expr::Fn::Count) {
+    if (o.kind == Expr::Kind::Aggregate && o.fn == Expr::Fn::Count) {
       out.emplace_back("bc_emit_i64(cx, 0);");
       continue;
     }
@@ -367,19 +372,6 @@ public:
     produce(root, [] {});
   }
 
-private:
-  // A row in hand: its variable, or, for a covering scan, the entry its
-  // cursor is on.
-  struct Binding {
-    std::uint32_t table;
-    std::string row;
-    bool covering{false};
-    std::uint32_t object{0};
-    bool for_update{false};
-    std::string cursor{"c"};  // a covering scan's
-    bool looped{false};       // bound by a loop: a scan's, or a hash join's over the rows it holds
-  };
-
   // What the root reports when no row can match: nothing for result rows,
   // a count of 0 for a write, the empty row for an aggregate.
   static auto no_rows(const physical::Node& root) -> std::vector<std::string> {
@@ -402,6 +394,19 @@ private:
         },
         root.op);
   }
+
+private:
+  // A row in hand: its variable, or, for a covering scan, the entry its
+  // cursor is on.
+  struct Binding {
+    std::uint32_t table;
+    std::string row;
+    bool covering{false};
+    std::uint32_t object{0};
+    bool for_update{false};
+    std::string cursor{"c"};  // a covering scan's
+    bool looped{false};       // bound by a loop: a scan's, or a hash join's over the rows it holds
+  };
 
   // Whether the root is under LIMIT 0: rows or groups emitted under it, or
   // an aggregate's row that is not emitted.
@@ -465,7 +470,8 @@ private:
   // "<object>, bc_scan_key(cx, c), <part>)": the arguments that name c's part
   // of the entry the covering scan is on.
   auto key_part(const Binding& b, const ColumnRef& c) -> std::string {
-    return w_.obj(b.object) + ", bc_scan_key(cx, " + b.cursor + "), " + w_.part(b.object, c) + ")";
+    const auto key = &b == keyed_ ? std::string{"key"} : "bc_scan_key(cx, " + b.cursor + ")";
+    return w_.obj(b.object) + ", " + key + ", " + w_.part(b.object, c) + ")";
   }
 
   // The index of $n ± k, compared with a column of `table`, in the values
@@ -1553,6 +1559,16 @@ private:
   // skipped.
   void fold_into_locals(const Group& g) {
     const auto& op = *g.op;
+    // A covering scan's entry is bound once for the row, as arg_of_row binds
+    // it, however many reads of its arguments follow.
+    auto covered = std::ranges::find_if(rows_, [&](const Binding& b) {
+      return b.covering &&
+             std::ranges::any_of(op.aggs, [&](const Expr& a) { return !a.args.empty() && a.args[0].col.table == b.table; });
+    });
+    if (covered != rows_.end()) {
+      w_.line("bc_view key = bc_scan_key(cx, " + covered->cursor + ");");
+      keyed_ = &*covered;
+    }
     for (std::size_t j = 0; j < op.aggs.size(); ++j) {
       const auto& a = op.aggs[j];
       const auto x = local("x", g, j);
@@ -1589,6 +1605,7 @@ private:
       }
       if (arg.nullable) w_.close();
     }
+    keyed_ = nullptr;
   }
 
   // A sort of a structure's groups: each group that passes its HAVING added
@@ -1744,6 +1761,7 @@ private:
   std::vector<std::string> no_rows_;
   std::string row_name_{"row"};  // the row a leaf reads into: "old" for a write
   std::vector<Binding> rows_;    // the rows in hand, outer first
+  const Binding* keyed_{nullptr};  // the covering scan whose entry the row has bound as `key`, or null
   bool loop_{false};             // inside a loop: a miss is `continue`
   std::string limit_;            // a LIMIT's condition, n < its count, or empty
   std::string* hit_{nullptr};    // a one-row aggregate: a miss joins this condition instead
@@ -1806,6 +1824,8 @@ auto rewritten(bound::Bound& b) -> logical::Node& {
 }
 
 }  // namespace
+
+auto no_rows_lines(const physical::Node& root) -> std::vector<std::string> { return Gen::no_rows(root); }
 
 auto generate_plan(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts,
                    std::uint64_t memory_bytes) -> GeneratedPlan {

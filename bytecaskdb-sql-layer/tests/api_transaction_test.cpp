@@ -1363,6 +1363,16 @@ TEST_CASE("embedded API: AVG is PostgreSQL's numeric quotient, at the scale its 
   CHECK(std::get<std::int64_t>(sums.rows[0][0]) == 3500);
   CHECK(sums.types[1].kind == SqlKind::Numeric);
   CHECK(text_of(sums.rows[0][1]) == "5.0000000000000000");
+  // A NUMERIC between other columns is one value of the row; the columns
+  // after it are where they belong.
+  auto mixed = db->execute("SELECT avg(k), count(*), avg(d), a FROM g WHERE k >= $1 GROUP BY a ORDER BY a NULLS FIRST",
+                           {std::int64_t{1}});
+  REQUIRE(mixed.rows.size() == 3);
+  REQUIRE(mixed.rows[1].size() == 4);
+  CHECK(text_of(mixed.rows[1][0]) == "3.0000000000000000");
+  CHECK(std::get<std::int64_t>(mixed.rows[1][1]) == 2);
+  CHECK(text_of(mixed.rows[1][2]) == "3.7500000000000000");
+  CHECK(std::get<std::int64_t>(mixed.rows[1][3]) == 0);
   // No rows: no groups; without GROUP BY, one row, COUNT 0 and AVG NULL.
   CHECK(db->execute("SELECT a, avg(k) FROM g WHERE k > $1 GROUP BY a", {std::int64_t{7}}).rows.empty());
   auto none = db->execute("SELECT count(*), avg(k) FROM g WHERE k > $1", {std::int64_t{7}});
