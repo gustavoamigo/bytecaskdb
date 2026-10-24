@@ -16,6 +16,7 @@ import shutil
 import socket
 import struct
 import signal
+import subprocess
 import tempfile
 import time
 
@@ -330,6 +331,21 @@ def test_a_syntax_error_carries_its_position_in_characters(server):
     out = c.until_ready()
     f = fields(out[0][1])
     assert f["C"] == "42601" and int(f["P"]) > 0
+
+
+def test_a_binder_error_carries_its_sqlstate_on_the_wire(server):
+    c = connect(server)
+    c.send(query("CREATE TABLE bound_err (k BIGINT PRIMARY KEY)"))
+    c.until_ready()
+    for sql, state in (
+        ("SELECT k FROM no_such_table WHERE k = $1", "42P01"),
+        ("SELECT no_such_column FROM bound_err WHERE k = $1", "42703"),
+        ("SELECT k FROM bound_err WHERE k = $2", "42P18"),
+    ):
+        c.send(query(sql))
+        out = c.until_ready()
+        f = fields(out[0][1])
+        assert f["C"] == state and int(f["P"]) > 0, (sql, f)
 
 
 # ---------------------------------------------------------------- extended query
@@ -692,3 +708,64 @@ def test_a_compared_decimal_finer_than_its_scale_and_nan_are_refused(server):
         with pytest.raises(psycopg.Error) as e:
             c.execute("INSERT INTO m VALUES (%t, %t)", ("2.00", "NaN"))
         assert e.value.sqlstate == "22P02"
+
+
+@pytest.mark.parametrize("flags", [
+    ["--sync", "AT_EVERY_COMMIT"],
+    ["--sync", "at_interval", "--sync-interval-ms", "50"],
+    ["--sync", "AT_FILE_ROTATION"],
+    ["--io-backend", "buffer_pool", "--buffer-pool-size", str(256 << 20), "--buffer-pool-direct-io", "on"],
+    ["--io-backend", "MMAP"],
+])
+def test_sync_modes_and_io_backends_serve_and_keep_commits(flags):
+    """--sync names the plugin's bytecaskdb_sync modes and --io-backend its
+    backends (docs/server_design.md, *Durability* and *Reads*). Under each,
+    rows written are read back, and are there again after SIGTERM and a
+    restart with the same flags."""
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_sync_")
+    try:
+        s = Server(directory, extra_args=flags)
+        try:
+            c = connect(s)
+            table(c)
+            for k in ("1", "2", "3"):
+                assert states(run(c, "INSERT INTO t VALUES ($1, $2)", [k, "10"])) == []
+            assert keys(c) == ["1", "2", "3"]
+            c.close()
+        finally:
+            assert s.stop() == 0
+        s = Server(directory, extra_args=flags)
+        try:
+            c = connect(s)
+            assert keys(c) == ["1", "2", "3"]
+            c.close()
+        finally:
+            assert s.stop() == 0
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+@pytest.mark.parametrize("flags, says", [
+    (["--sync", "SOMETIMES"], "--sync"),
+    (["--sync-interval-ms", "0"], "sync_interval_ms is 1 to 60000"),
+    (["--sync-interval-ms", "60001"], "sync_interval_ms is 1 to 60000"),
+    (["--sync-interval-ms", "soon"], "--sync-interval-ms"),
+    (["--io-backend", "tape"], "--io-backend"),
+    (["--buffer-pool-size", "big"], "--buffer-pool-size"),
+    (["--buffer-pool-direct-io", "maybe"], "--buffer-pool-direct-io"),
+    (["--io-backend", "buffer_pool", "--buffer-pool-size", "1"], "buffer"),
+])
+def test_sync_and_io_flags_are_validated(flags, says):
+    binary = server_binary()
+    if not binary:
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_sync_")
+    try:
+        r = subprocess.run([binary, "--dir", directory, *flags], capture_output=True, text=True, timeout=60)
+        assert r.returncode != 0
+        assert says in r.stderr, r.stderr
+        assert "ready on" not in r.stdout
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)

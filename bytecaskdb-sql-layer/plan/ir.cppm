@@ -48,6 +48,9 @@ struct Expr {
   std::uint32_t param{0};  // Param, and Add's and Sub's right operand
   Column col{};            // Column, and Add's and Sub's left operand
   std::optional<std::int64_t> constant;  // Add's and Sub's right operand instead of the parameter
+  // Add and Sub: the column read is a SQL BIGINT, the one integer type whose
+  // sum can leave int64. PostgreSQL types the sum by it, not by the target.
+  bool bigint{false};
 };
 
 // The whole primary key by equality: the parameter of each part, in key

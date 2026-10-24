@@ -2307,8 +2307,14 @@ bool bc_param_null(bc_ctx* cx, uint32_t i) {
 void bc_emit_begin(bc_ctx* cx) {
   BC_GUARD_BEGIN
   if (!cx->ok()) return;
-  if (!cx->has_ref || cx->verified.result_types.empty()) {
-    cx->fail(BC_L_PLAN, "the plan's schema ref declares no result types");
+  if (!cx->has_ref) {
+    cx->fail(BC_E_HANDLE, "no plan is running: bc_ctx_run sets the schema ref that declares the result layout");
+    return;
+  }
+  // A SELECT may declare no result types (SELECT FROM t); a plan that writes
+  // tables and declares none returns no rows.
+  if (cx->verified.result_types.empty() && !cx->verified.written.empty()) {
+    cx->fail(BC_L_PLAN, "a plan that writes declares no result types, so it returns no rows");
     return;
   }
   if (cx->emit) {
@@ -2476,24 +2482,33 @@ auto arith_fail(bc_ctx* cx, const char* what) -> std::int64_t {
   cx->fail(BC_E_ARITH, what);
   return 0;
 }
-}  // namespace
 
-int64_t bc_add(bc_ctx* cx, int64_t a, int64_t b) {
+// a + b or a - b. An overflow is BC_E_ARITH or, for a value stored in a
+// BIGINT, that type's range error on `object_id`, as in PostgreSQL: the one
+// the row builder and bc_check_int raise for the narrower types.
+auto add_or_sub(bc_ctx* cx, bool subtract, std::int64_t a, std::int64_t b, bool bigint, std::uint32_t object_id)
+    -> std::int64_t {
   BC_GUARD_BEGIN
   if (!cx->ok()) return 0;
   std::int64_t r = 0;
-  return __builtin_add_overflow(a, b, &r) ? arith_fail(cx, "integer out of range") : r;
+  if (!(subtract ? __builtin_sub_overflow(a, b, &r) : __builtin_add_overflow(a, b, &r))) return r;
+  if (bigint) {
+    cx->raise(BC_C_RANGE, object_id, "bigint out of range");
+    return 0;
+  }
+  return arith_fail(cx, "integer out of range");
   BC_GUARD_END(cx)
   return {};
 }
+}  // namespace
 
-int64_t bc_sub(bc_ctx* cx, int64_t a, int64_t b) {
-  BC_GUARD_BEGIN
-  if (!cx->ok()) return 0;
-  std::int64_t r = 0;
-  return __builtin_sub_overflow(a, b, &r) ? arith_fail(cx, "integer out of range") : r;
-  BC_GUARD_END(cx)
-  return {};
+int64_t bc_add(bc_ctx* cx, int64_t a, int64_t b) { return add_or_sub(cx, false, a, b, false, 0); }
+int64_t bc_sub(bc_ctx* cx, int64_t a, int64_t b) { return add_or_sub(cx, true, a, b, false, 0); }
+int64_t bc_add_bigint(bc_ctx* cx, int64_t a, int64_t b, uint32_t object_id) {
+  return add_or_sub(cx, false, a, b, true, object_id);
+}
+int64_t bc_sub_bigint(bc_ctx* cx, int64_t a, int64_t b, uint32_t object_id) {
+  return add_or_sub(cx, true, a, b, true, object_id);
 }
 
 int64_t bc_mul(bc_ctx* cx, int64_t a, int64_t b) {

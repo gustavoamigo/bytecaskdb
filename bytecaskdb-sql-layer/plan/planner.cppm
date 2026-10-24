@@ -537,8 +537,13 @@ auto plan_statement(const bound::Bound& b, const Catalog& cat) -> ir::Plan {
             switch (e.kind) {
               case bound::Expr::Kind::Param: v = {ir::Expr::Kind::Param, e.param, {}}; break;
               case bound::Expr::Kind::Column: v = {ir::Expr::Kind::Column, 0, column(t, e.col_id)}; break;
-              case bound::Expr::Kind::Add: v = {ir::Expr::Kind::Add, e.param, column(t, e.col_id), e.constant}; break;
-              case bound::Expr::Kind::Sub: v = {ir::Expr::Kind::Sub, e.param, column(t, e.col_id), e.constant}; break;
+              // Only a BIGINT read can overflow int64: a DECIMAL of scale 0 has
+              // BIGINT's physical type, but its operand is held to 18 digits.
+              case bound::Expr::Kind::Add:
+              case bound::Expr::Kind::Sub:
+                v = {e.kind == bound::Expr::Kind::Add ? ir::Expr::Kind::Add : ir::Expr::Kind::Sub, e.param,
+                     column(t, e.col_id), e.constant, t.column(e.col_id)->sql.kind == SqlKind::BigInt};
+                break;
             }
             up.set.emplace_back(column(t, id), v);
           }

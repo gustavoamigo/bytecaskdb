@@ -1,23 +1,21 @@
 # Plan API: a physical algebra for generated plans
 
-Status: design, revision 5 (#487, stage 2.1). Nothing in the engine
-changes; this document specifies the plan API of `bytecaskdb-sql-layer`, a
-top-level component beside the MariaDB plugin, built on the public engine
-API and MIT-licensed like the core. `bytecaskdb-sql-layer/algebra/`
-implements it, except the ephemeral structures; the revisions that the
-prototype (#497, merged as #498) and the layers after it forced are listed
-under *Revision history*.
+Status: **built**, revision 5. This specifies the plan API of
+`bytecaskdb-sql-layer`: the calls a generated plan makes, the guarantees
+they give, and the language plans are written in. `algebra/` implements
+it, except the sorters, the hash tables and the aggregates' slots, whose
+calls set `BC_E_HANDLE` (`bc_plan.h`'s header comment lists what is
+implemented). Nothing in the engine changes for it. `planner_design.md`
+proposes the next changes: a statement memory budget and working sorters
+and hash tables.
 
-**Plans are only ever ours** (owner decision, 2026-10-20; #487, *MVP*).
-The layer runs only plans its own compiler generates. Nothing is designed
-for plan text from anywhere else: the checker for the subset, which this
-document describes, is not planned, and no tier will run hand-written or
-user-supplied plans. An interpreter for the compiler's own plans stays
-possible, for a target the embedded C compiler lacks (TinyCC has no WASM
-backend). The guarantees below still hold for
-the compiler's plans, and the runtime's checks (handles, the budget, sticky
-errors, the arithmetic helpers, `BC_E_CORRUPT`) stay, as a guard against
-the compiler's own bugs and against damaged data.
+**Plans are only ever ours** (owner decision, 2026-10-20). The layer runs
+only plans its own compiler generates, and nothing is designed for plan
+text from anywhere else: there is no checker for the subset, and the
+runtime runs only the compiler's plans. Plans written by hand for the
+plan API's own tests are ours too, and are fine there. The runtime's checks (handles,
+the budget, sticky errors, the arithmetic helpers, `BC_E_CORRUPT`) guard
+against the compiler's own bugs and against damaged data.
 
 ## Purpose
 
@@ -37,11 +35,11 @@ The API is the only boundary between the two halves of a SQL engine:
   No planning happens here. A plan says `bc_scan_open` on an index; the
   executor opens that index.
 
-The subset compiles with any C compiler, so the first execution tier is
-clang linking plans into the test binary. Later tiers load the same text at
-run time: an embedded C compiler, or, should a target need one (a WASM
-build), an interpreter. Every tier runs only the compiler's plans. The API
-and the guarantees are the same in every tier.
+The subset compiles with any C compiler. TinyCC, linked into the layer,
+compiles each plan at run time (`plan/tcc_loader.cppm`), and the plan API's
+tests link a few hand-written plans with clang (`plans/`). An interpreter,
+should a target need one (a WASM build: TinyCC has no WASM backend), is not
+built. The API and the guarantees are the same whatever compiles the plan.
 
 What it is not: a general C API for the engine, a wire protocol, or a place
 for SQL semantics. Collations, decimals and dates are the compiler's problem;
@@ -74,8 +72,8 @@ it, has these properties in every tier, whatever its logic does:
   row, whatever the plan does.
 
 A wrong plan can therefore do two things: return an error code, or return
-or write a wrong answer. The second is what the oracle tests in *Validation* exist to
-catch. Neither crashes the server, corrupts the engine, or holds a snapshot
+or write a wrong answer. The second is what the proof machine's comparison
+with PostgreSQL exists to catch (`testing_design.md`). Neither crashes the server, corrupts the engine, or holds a snapshot
 past the budget. The only code that can still fault is the API's own
 implementation, which is ordinary C++ under the engine's sanitizer and test
 regime, and a plan cannot steer it except through checked arguments.
@@ -214,10 +212,10 @@ plan, and each derives the entries it removes from the snapshot's row, so
 a row written by one run and again by a later one would keep both runs'
 entries. In a transaction the tracking spans one statement: a later
 statement reads the earlier one's row through the transaction's view and
-derives its entries from that. The affected-row count is each run's own. A unique
-secondary key two of one statement's inserts share is not caught yet: a
-stage-2 limit, unreachable from the stage-1 compiler, which emits one write
-per plan (#507).
+derives its entries from that. The affected-row count is each run's own.
+Two writes of one execution that give two rows one unique value are
+`BC_C_UNIQUE` too: the runtime records each unique prefix the execution
+writes, which its snapshot can't see.
 Read-your-own-writes across statements in an interactive transaction is an
 overlay the reads and cursors read through: `docs/transaction_design.md`,
 *The transaction's view*.
@@ -435,7 +433,7 @@ void     bc_emit_count(bc_ctx *, int64_t affected);   /* write statements: the r
 | Function | What it does |
 |---|---|
 | `bc_param_*` | Reads parameter `i` as bound by `bc_ctx_begin`. A wrong index or type is `BC_E_HANDLE` and a neutral value. Parameter views live until reset. |
-| `bc_emit_begin` … `bc_emit_end` | Appends one result row, in the row format, with the types the plan's `bc_schema_ref` declares in `result_types`. Columns are emitted in that order; a count or type that does not match is `BC_E_LAYOUT`. The row is copied into the result buffer, which is part of the arena. |
+| `bc_emit_begin` … `bc_emit_end` | Appends one result row, in the row format, with the types the plan's `bc_schema_ref` declares in `result_types`. Columns are emitted in that order; a count or type that does not match is `BC_E_LAYOUT`. A ref that declares no `result_types` allows rows of no columns (`SELECT FROM t`), unless it also lists tables written: a write plan returns no rows, and `bc_emit_begin` fails it with `BC_L_PLAN`. Called outside a run, where no ref is set, it is `BC_E_HANDLE`. The row is copied into the result buffer, which is part of the arena. |
 | `bc_emit_col` | Emits column `col` of a row view: its value, or NULL when the column is null or the row predates it; `BC_E_CORRUPT` for a column marked present that the row does not hold. The type is the column's, and must be the next result column's. One call where a nullable column took an `if` and two emits. |
 | `bc_emit_key_part` | Emits part `part` of an encoded key of `table_or_index`, NULL as NULL: a covering read's column, from `bc_scan_key`, with no row read. A `DOUBLE` part is `BC_E_HANDLE`: the key canonicalises `-0.0` and NaN, so the value comes from the row. |
 | `bc_emit_count` | Records the affected-row count a write statement reports. At most once per plan. |
@@ -449,6 +447,8 @@ return zero.
 ```c
 int64_t bc_add(bc_ctx *, int64_t, int64_t);     /* overflow → error */
 int64_t bc_sub(bc_ctx *, int64_t, int64_t);
+int64_t bc_add_bigint(bc_ctx *, int64_t, int64_t, uint32_t object_id);  /* overflow: BC_C_RANGE on object_id */
+int64_t bc_sub_bigint(bc_ctx *, int64_t, int64_t, uint32_t object_id);
 int64_t bc_mul(bc_ctx *, int64_t, int64_t);
 int64_t bc_div(bc_ctx *, int64_t, int64_t);     /* zero divisor, INT64_MIN / -1 → error */
 int64_t bc_mod(bc_ctx *, int64_t, int64_t);
@@ -470,6 +470,13 @@ compiler to handle. Byte comparisons are for encoded or binary columns; the
 compiler emits comparisons on sort keys it built, never on raw text, and on
 TEXT and VARCHAR columns compared under `COLLATE "C"`, byte order.
 
+`bc_add_bigint` and `bc_sub_bigint` are `bc_add` and `bc_sub` for a value
+that is stored in a BIGINT column (`SET col = col ± $n`): the only integer
+type whose sum can leave `int64`. An overflow is the same range error
+`bc_check_int` raises, on `object_id`, with PostgreSQL's words ("bigint out of
+range", SQLSTATE 22003, #540), where `bc_add` stays `BC_E_ARITH` for
+aggregates and intermediates.
+
 `bc_check_int` is the range check of a computed integer (added in the
 front end's slice 5): it returns `v` when it is inside the SQL type the
 compiler resolved, `BC_SMALLINT` or `BC_INTEGER`, and otherwise sets
@@ -480,8 +487,8 @@ runtime's.
 
 ### Keys
 
-Keys are built in the arena in the mem-comparable encoding of *Key encoding*
-below. A builder is finalized once; its view lives until reset.
+Keys are built in the arena in the mem-comparable encoding of *Keys and
+rows* below. A builder is finalized once; its view lives until reset.
 
 ```c
 bc_key   bc_key_begin(bc_ctx *, uint32_t table_or_index);
@@ -557,7 +564,7 @@ as `0.0` and every NaN as one, so only the row holds the exact value.
 
 ### Rows and columns
 
-Rows use the format in *Row format*. A plan names a column by its permanent
+Rows use the format in *Keys and rows*. A plan names a column by its permanent
 id (`COL_<t>_<c>`), and only the columns its `bc_schema_ref` declares; the
 runtime maps the id to the offset or slot in the row's layout generation,
 from the map it built when it verified the reference. A decoder resolves the
@@ -749,7 +756,7 @@ catalog constants; one function `void plan(bc_ctx *cx)`. A plan file is its
 own compilation unit, and `plan` is the only symbol it exports; a loader
 compiles one file per plan, and a build that links several plans into one
 binary renames the symbol per file (`-Dplan=plan_<name>`), as the
-prototype's tests do. No other
+tests' clang-linked plans do. No other
 declarations: no globals, no `static`, no other functions, no macros, no
 `typedef`.
 
@@ -784,10 +791,11 @@ unsequenced modification. Handles in distinct struct types: the C compiler
 itself rejects a handle of the wrong kind.
 
 **Tiers.** Every tier runs plans produced by the SQL compiler; the C
-compiler is trusted as the engine's own compiler is. No tier runs
-hand-written or user-supplied plans. An interpreter for the compiler's
-plans, with a fuel counter on loop back-edges, stays possible for a target
-the C compiler lacks (WASM), and is not built.
+compiler is trusted as the engine's own compiler is. Nothing runs
+user-supplied plans; hand-written ones exist only in the plan API's tests.
+An interpreter for the compiler's plans, with a fuel counter on loop
+back-edges, stays possible for a target the C compiler lacks (WASM), and is
+not built.
 
 ### Example
 
@@ -831,351 +839,53 @@ A reader sees the index, the direction, one record read per entry plus one
 per row, the sort and its bound, the guard, and the result. The cost model
 is on the page, and nothing on it can fault.
 
-## Key encoding
+## Keys and rows
 
-Every key is `namespace(1) table_or_index_id(4, big-endian) parts…`. Parts
-are encoded so that `memcmp` order is the typed order, and so that a key can
-be parsed back into its parts without a length prefix.
+Every key is `namespace(1) table_or_index_id(4, big-endian) parts…`, with
+parts encoded so that `memcmp` order is the typed order and a key parses back
+into its parts without a length prefix. A secondary index key is the index
+columns followed by the primary key's parts, which `bc_scan_row` turns into
+the row's key. Namespaces: `0x01` catalog, `0x02` table rows, `0x03` index
+entries, as in the MariaDB plugin. Rows carry a header (layout generation,
+bitmap size, the variable region's table, length), a null bitmap indexed by
+permanent column id, fixed columns and variable data, and a row shorter than
+its layout reads the missing columns as null.
 
-| Part type | Encoding |
-|---|---|
-| Nullable part | A marker byte first: `0x00` null, `0x01` present. Nulls sort first. Non-nullable parts have no marker. |
-| `i64` | 8 bytes big-endian with the sign bit flipped. Narrower integers, decimals and times are `i64` by the time they reach the API. |
-| `f64` | IEEE 754 bits, big-endian; positive values have the sign bit flipped, negative values have every bit flipped. `-0.0` is encoded as `0.0` and every NaN as one canonical NaN, above `+inf`. |
-| `bool` | One byte, `0x00` or `0x01`. |
-| `bytes` | Escaped: each `0x00` becomes `0x00 0xFF`, followed by the terminator `0x00 0x00`. Self-delimiting, and a prefix of a longer string sorts first. |
-| `DESC` part | The encoded bytes above, marker included, with every bit inverted. Nulls sort last. |
+Both formats are specified in full, with their reasons, in
+`types_design.md` (*Key encoding*, *Row format*).
 
-A secondary index key is the index columns followed by the primary key's
-parts. The primary key suffix is what `bc_scan_row` turns into the row's
-key. Because every part is self-delimiting, the suffix is
-found by skipping the index columns with the index's catalog layout.
+## Source layout
 
-Namespaces: `0x01` catalog, `0x02` table rows, `0x03` index entries, as in
-the MariaDB plugin. Text columns are compared as bytes in stage 1; under a
-collation they are not stored as text in keys: the compiler encodes the
-collation's sort key (weights) as `bytes`, as the plugin does, and the row
-carries the original value. The encoding is specified in full, with the
-reasons, in `docs/types_design.md`.
-
-## Row format
-
-```
-u16   layout_generation     ; which offset table decodes this row (see below)
-u16   bitmap_bytes          ; size of the null bitmap; a multiple of 8
-u16   var_table             ; offset of var_end: where this row's fixed region ends
-u16   nvar                  ; entries in var_end
-u32   row_bytes             ; length of the row; columns beyond it are null
-u8[]  null_bitmap           ; bit set = present, indexed by permanent column id; sized at create
-      fixed columns         ; 8 bytes each, at permanent offsets, little-endian
-u32[] var_end               ; nvar end offsets, relative to the start of var data
-u8[]  var data
-```
-
-Fixed columns are `i64`, `f64` and `bool`, one 8-byte word each. A variable
-column `k` occupies `[var_end[k-1], var_end[k])`.
-
-`bitmap_bytes`, `var_table` and `nvar` are in the header because the
-short-row rule below needs them: appending a fixed column lengthens the
-fixed region, so a reader holding an older layout's constants cannot find
-`var_end` from them alone. The row says where it is. The null bitmap is
-sized when the layout is created, with room to spare (64 bits at least), so
-that appending a column does not move the fixed offsets either; a layout
-whose bitmap is full needs a `REBUILD`. The bitmap's bit means *present*, so
-a column the row predates reads as null by the same test as one set null. A
-trailer at the row's end was weighed against these header fields and
-rejected; the row's length is 32 bits so that the row's ceiling is the
-engine's value limit. The format is specified in full, with the reasons, in
-`docs/types_design.md`, *Row format*.
-
-**Columns have permanent ids.** A column is given a small integer id when it
-is created, and the id is never reused, even after the column is dropped.
-Plans, rows and the catalog speak ids; names exist only in the compiler's
-binder. This is protobuf's field number, and it is what lets several schema
-versions of one table be served at once (see *Deferred*).
-
-**Positions are permanent and rows may be short.** Within a layout
-generation, a column's byte offset or variable slot is assigned when the
-column is created and never changes. New columns append; a dropped column
-leaves its offset or slot reserved. A row may be shorter than the current
-layout: a column the row predates, a fixed column past its fixed region or
-a variable slot past the end of `var_end`, has its bit clear and reads as
-null; with its bit set the row is damaged, and reading the column is
-`BC_E_CORRUPT`. So a plan compiled against an
-older version of the table decodes rows written by a newer one, ignoring
-the bytes it does not know, and a plan compiled against a newer version
-decodes older rows, seeing null where the column did not yet exist. Both
-use the same offsets, which the runtime maps from column ids once per
-verified plan, and no per-row indirection; this is Cap'n Proto's evolution
-rule rather than FlatBuffers' per-row offset table.
-
-**Generations bound the cost of the rule.** Dropped fixed columns leave
-holes in every new row, and a type cannot change in place: a type change is
-a new column id. When the holes are worth reclaiming, an explicit
-`ALTER TABLE … REBUILD` starts a new layout generation with fresh offsets.
-`layout_generation` in the header says which generation's offsets decode
-the row. A plan names columns by id, not by position, so a new generation
-invalidates no plan: the runtime maps ids to the current generation's
-offsets when it verifies the plan, and a row of another generation takes
-the slow path, mapping each column id through that generation's offset
-table in the catalog. Rebuilds are rare and explicit,
-and updates and vacuum rewrite rows into the current generation, so the
-slow path stays rare.
-
-One decoder, `row_column`, reads every column and checks every access
-against `row_bytes` and the offset table: a column whose bit is clear is
-null, a row whose header does not parse and a present column the row does
-not hold (outside its regions, or a `var_end` past the row) are
-`BC_E_CORRUPT` on every path, and a column the plan's reference does not
-declare is `BC_E_HANDLE`; never a read past the end, and never 0, empty or
-null for damage. Values over the engine's limit are refused at
-`bc_row_end` with `BC_E_LIMIT`; the engine's value ceiling applies to the
-whole row.
-
-## Validation plan
-
-The end-to-end prototype (#497, merged as #498) came first: seven statements
-from SQL text through libpg_query, a binder, a three-rule planner, a
-template code generator and TinyCC to `bc_execute`, surviving a reopen, with
-the codec, a minimal catalog and this API's subset implemented in
-`bytecaskdb-sql-layer/`. Its write-up produced the revisions in *Revision
-history*. The validation phase proper follows, against the revised API, with
-hand-written plans before any compiler, compiled by clang and linked into
-the test binary. CI must build and run `sql_layer_tests`; the prototype
-merged without a job doing so.
-
-1. The checker for the subset, with a corpus of rejected files: one per
-   rule, each a plan that would be undefined or unbounded without it. Not
-   planned: only the compiler's plans are supported.
-2. The key codec and row format, with property tests: encode, decode, and
-   `memcmp` order equal to typed order, for each type, for composite keys,
-   and with nulls.
-3. The TPROC-C schema, created through SQL DDL by the catalog
-   (`tests/tprocc_test.cpp`); a plan's constants are what
-   `Catalog::constants` gives for its tables.
-4. Ten hand-written plans covering each API surface once: primary-key
-   select; secondary range with lookup, sort and limit; a sum over a range;
-   an index nested-loop join; an insert into a table with two indexes; an
-   update changing an indexed column; a delete; a range delete; a count by `bc_count_range`; one update under
-   snapshot isolation and the same with a guard. Then New Order and Payment
-   as whole procedures.
-5. A result oracle for the hand-written plans: something independent that
-   runs the SQL in each plan's header over the same rows, so result rows and
-   post-write table contents can be compared. Which one is not decided and
-   does not need to be yet. Candidates: an existing SQL engine loaded with
-   the same data, or hand-computed expected results for the fixture, which
-   is enough for ten plans and two procedures. The Python reference
-   implementation is not extended to the relational layer. The first plans
-   can be checked by hand while the choice is made.
-6. Fault tests for the guarantee: each plan run with a stale view, a wrong
-   column offset, an exhausted budget, an exhausted arena and an injected
-   I/O error, under the sanitizers, asserting an error code and untouched
-   engine state every time.
-7. A harness in the shape of `commit_probe`: closed-loop threads running a
-   plan through `bc_execute`, reporting plan time, record reads per plan
-   from the engine's counters, and commits per second at 1, 16 and 48
-   threads. The remainder after subtracting the engine's own reads and
-   commit is what this API costs, checks included.
-8. Only then, run-time loaders for the same files (`libtcc`, MIR). An
-   interpreter for the compiler's plans only if a target needs one (WASM).
-
-Layout: `bytecaskdb-sql-layer/algebra/` holds `bc_plan.h` and its C++
+`bytecaskdb-sql-layer/algebra/` holds `bc_plan.h` and its C++
 implementation; `codec/` the key and row codecs; `catalog/` the catalog
-(`docs/catalog_design.md`); `plans/` the hand-written plan files, each with its SQL
-in the header comment; `sql/` the parser transformer and binder; `plan/` the
+(`catalog_design.md`); `plans/` the hand-written plans the tests link with
+clang, each with its SQL in the header comment; `sql/` the parser transformer and binder; `plan/` the
 planner, code generator and loader; `api/` the embedded API; `tests/` the property tests, fault tests, the harness and the
 TPROC-C schema fixture (`tests/tprocc_schema.cppm`). Files
 marked `// prototype:` are disposable and are replaced in place. The C++ is
 organized as C++23 modules (`bytecask.sql.*`), as the engine is; `bc_plan.h`
-is a header because C reads it, and the only other headers are the ones
-another toolchain consumes: the C ABI for the bindings and the header bridge
+is a header because C reads it. The only other headers would be ones
+another toolchain consumes: a C ABI for the bindings, and a header bridge
 for the plugin, the counterpart of `include/bytecask.hpp`. The catalog, transaction and codec directories are the half the
 MariaDB plugin links: the plugin depends on the sql-layer, never the
 reverse, and nothing under `bytecaskdb-sql-layer/` includes a MariaDB header.
-The plugin keeps its own key and row codecs until the shared ones are
-proven, then adopts them through its per-table format versions.
-
-Questions the hand-written plans settle: whether `bc_pin` appears at all
-(the prototype's five plans needed it zero times); whether the budget and
-ephemeral bounds a compiler would choose are predictable; whether the
-checked decoders and the per-row copy cost anything measurable beside the
-record read.
+The plugin keeps its own key and row codecs, and would adopt the shared
+ones through its per-table format versions (`types_design.md`, *What the
+plugin adopts*; #488).
 
 ## Deferred
 
 - **Several schema versions served at once.** The row format and the
-  permanent column ids above are the storage half, and are in the first
-  phase. The rest is catalog and DDL: the catalog keeps every version of a
-  table; a session declares the version it speaks and the binder resolves
-  that version's names and defaults; generated plans always write the
-  current layout and maintain the current indexes, filling defaults for
-  columns the client's version does not know, and read rows of any version
-  by the short-row rule. `ADD COLUMN` with a default and `DROP COLUMN` are
-  compatible changes and bump the version; `ALTER TABLE … REBUILD` starts a
-  layout generation; the catalog records which versions are still served so
-  an old one can be retired. Nothing is migrated for a client to keep
-  working.
+  permanent column ids are its storage half; the rest is the catalog's
+  (`catalog_design.md`, *Several schema versions*).
 - **Sequence allocation.** Auto-increment is a runtime service invoked at
   commit, outside the plan, so the plan stays pure. Until then ids come from
   rows the plan reads and guards.
 - **Streaming results.** The result buffer lives in the arena, so a result
   set is bounded by it. A statement that returns more than the arena holds
-  is `BC_E_MEMORY`; streaming rows to the client as they are emitted is a
-  session-layer change behind the same `bc_emit_*` calls.
-- **Spilling sorters and hash tables.** Bounds without spill are right for
-  OLTP. An analytic workload would add a spilling variant behind the same
+  is `BC_E_MEMORY`. Streaming rows to the client as they are emitted is
+  part of the transport design (#487, *Next*), behind the same `bc_emit_*`
   calls.
-
-## Revision history
-
-**Revision 2, after the prototype (#497).** Every item below came from a
-plan the prototype's generator wrote or a test it ran.
-
-- `bc_empty`: a plan could not make an empty view, so an open scan bound
-  and an index entry's empty value were unreachable.
-- `bc_key_part_*`: no call decoded a key part, so a covering index read was
-  impossible and every index scan fetched the row.
-- `bc_raise`, `BC_E_CONSTRAINT`, `bc_constraint`, `bc_error_detail`: a
-  duplicate key failed `bc_guard_absent` and surfaced as `BC_CONFLICT`,
-  retried in vain and misreported. The engine cannot tell a failed
-  precondition from a race, so the plan checks the snapshot first and
-  raises.
-- The result layout moved from the catalog to the plan's `bc_schema_ref`;
-  `bc_emit_begin` takes no layout id. Interning result layouts in the
-  catalog gave ids stable only within a process.
-- Row header: `var_table` and `nvar` added, bitmap sized at create, for the
-  short-row rule to hold with variable columns.
-- `bc_col_null` takes the column's position, so it can see past the end of
-  a shorter row.
-- `BC_SCAN_LO_EXCLUSIVE` and `BC_SCAN_HI_INCLUSIVE` removed: wrong on a
-  partial key, since the primary-key suffix follows the bound.
-- `bc_db`, `bc_catalog`, `bc_params` declared; `bc_ctx_affected` added.
-- Plan naming: one symbol per file, renamed per file when linked together.
-- Views copy by default, as the prototype implemented them; lending the
-  engine's buffers is a later optimization behind the same calls.
-
-**Revision 3, with the types and codec design (#490,
-`docs/types_design.md`).** The row and key formats are complete,
-and the API changed where implementing them showed a gap.
-
-- The null bitmap's bit means *present*, so a column the row predates reads
-  as null with no further test; `bc_col_null` loses the position argument
-  revision 2 gave it, which could not tell a fixed offset from a variable
-  slot anyway.
-- Row header: `row_bytes` is 32 bits, so the row's ceiling is the engine's
-  value limit, not 64 KiB; `bitmap_bytes` is in the header, so every
-  structural check is local to the row. The header is 12 bytes.
-- `bool` had a type code and no calls: `bc_param_bool`, `bc_emit_bool`,
-  `bc_key_bool`, `bc_key_part_bool`, `bc_col_bool`, `bc_row_set_bool`.
-- `bc_col_i32` removed: every integer is widened to `i64` before it reaches
-  a row, so there is no 4-byte column to read.
-- `BC_C_RANGE`: a value outside its declared type (`INTEGER`, `VARCHAR(n)`,
-  `DECIMAL(p, s)`) is a constraint of its own kind, not a `CHECK`.
-- `bc_error_detail` packs the constraint kind in the high byte and the
-  object id in the low 24 bits; catalog object ids stay below 2^24, and
-  `bc_raise` with an unknown kind or a wider id is `BC_E_HANDLE`.
-- `BC_SCAN_PREFIX` keeps bit 3: revision 2 moved it to bit 1, the bit
-  `LO_EXCLUSIVE` had, so a plan still passing that flag would have scanned a
-  prefix silently instead of being refused.
-- A row a column decoder cannot parse is `BC_E_CORRUPT`, not null: before,
-  `bc_col_null` read a damaged row as null and the query returned NULL for
-  data that was there. The empty view passed as a row is `BC_E_HANDLE`.
-- `bc_key_part_bytes` unescapes into the arena rather than lending a
-  sub-view: an escaped part is not a sub-range of the key.
-- `bc_del_range` refuses an empty bound (`BC_E_HANDLE`): it names no
-  table, so an open bound would reach the whole keyspace. `bc_del_range` and
-  `bc_guard_range` treat `lo >= hi` as an empty range, as SQL does, rather
-  than letting the engine refuse the commit.
-
-**Revision 4, with the catalog (#489, `docs/catalog_design.md`).**
-
-- `bc_schema_ref` lists what a plan depends on (objects read, tables
-  written and the indexes it maintains, columns with their positions and
-  types, as `bc_col_ref`) instead of a catalog version to match: the
-  version-equality check recompiled every plan on every DDL, and the
-  per-column rule the design always stated needs the columns. The
-  embedded API skips the walk for a cached plan while the version is
-  unchanged; `bc_ctx_run` always walks.
-- `bc_ctx_begin` pins a catalog version with its snapshot, and
-  `bc_ctx_commit` guards the catalog record of every table it writes, so a
-  plan never commits rows shaped by a catalog the engine has moved past.
-- `bc_row_begin` fills the catalog's defaults, so `ADD COLUMN … DEFAULT`
-  invalidates no plan.
-- A unique secondary index is checked on its prefix (a prefix scan, then
-  `bc_guard_range`): its entries carry the primary key, so `bc_exists` and
-  `bc_guard_absent` on one key cannot see a duplicate.
-- Secondary keys stay `0x03 index_id`; the plugin's table-id prefix is not
-  adopted.
-- A plan's constants are named from ids (`TBL_<table>`, `LAY_<layout>`,
-  `IDX_<index>`, `COL_<table>_<column>_OFF|_SLOT|_COL`), with the objects
-  they stand for listed in the header: a SQL name need not be a C
-  identifier, and two names cannot produce the same constant. The header
-  is `//` lines with user bytes outside printable ASCII, `\` and `?`
-  escaped as `\xNN`, so no name or SQL text can end or splice it.
-
-**Revision 5, a plan carries decisions, not mechanics (#487, stage 2.1).**
-The rule in *Decisions, not mechanics* replaces the choice, made in
-revision 1, to show index maintenance in the plan. That choice bought no
-optimization: every call costs a handle resolution, a generation check, a
-sticky-error check and a type check whatever its size, and `insert.c` made
-about twenty of them for one row. It existed because the C subset has no
-arrays, structs or varargs. It also left a gap: a plan declared the indexes
-it maintained in `bc_schema_ref`, and nothing checked that its code wrote
-them.
-
-- `bc_insert`, `bc_update`, `bc_delete` and `bc_row_key`: writes are
-  table-level, and the runtime writes the index entries, runs the unique
-  checks (a prefix probe, `BC_C_UNIQUE`, a range guard; for the primary key,
-  existence) and moves only the entries whose keys changed, encoding no
-  entry of an index whose columns did not change. The unique
-  checks no longer show in the text; they are still charged to the budget.
-  `bc_update` and `bc_delete` take a stored row, so the entries they remove
-  are the snapshot's.
-- `bc_put`, `bc_del`, `bc_lookup`, `bc_scan_value`, `bc_scan_pk`,
-  `bc_key_pk` and `bc_row_pk` removed. Rows and index entries are the whole
-  keyspace a plan writes, and both go through the calls above; the others
-  served index maintenance by hand, or the fetch `bc_scan_row` makes.
-- `bc_del_range` names its table and deletes the rows' index entries too:
-  a range delete of rows alone would leave entries without rows. Its empty
-  bounds now mean the table's start and end, as for the scans, instead of
-  being refused.
-- `bc_insert` writes no `ensure_absent` on the primary key. The engine's
-  check of the plan's own write set already makes a concurrent insert of the
-  key a conflict, and a test shows it.
-- A NULL set into a NOT NULL column, or a NOT NULL column left unset with
-  no default, is `BC_E_CONSTRAINT` with `BC_C_NOT_NULL` and the table's id,
-  never retried. It was a `BC_E_LAYOUT` at `bc_row_end`, and an explicit
-  NULL cleared the column's default until then.
-- `bc_scan_row`: an index entry to its row. A missing row is `BC_E_CORRUPT`;
-  the prototype's generated range plan skipped it, which hid damage.
-- `bc_key_param`, `bc_key_params`, `bc_row_set_param`, `bc_emit_col`,
-  `bc_emit_key_part`: a parameter or a column copied with its NULL, where a
-  plan wrote an `if` and two calls.
-- Columns are named by id, one constant per column (`COL_<t>_<c>`, the
-  column id), instead of an offset or slot constant and a column constant.
-  The runtime maps ids to positions when it verifies the reference, so a
-  layout generation never reaches a plan, and `REBUILD` will invalidate
-  none. `bc_col_ref` loses `layout` and `pos` and gains `table`.
-  `bc_row_begin` and `bc_row_from` take the table, not a layout id, and the
-  `LAY_` constants are gone; `PART_<k>_<c>` constants name key parts.
-- Every table, index and column a plan names must be declared in its
-  reference, a table it writes in `tables_written`, and a row view knows its
-  table: a decoder on another view, another table's
-  column or another type is `BC_E_HANDLE`. A setter of another type was
-  `BC_E_LAYOUT`.
-- `bc_schema_ref` loses `indexes_written`, and `CREATE INDEX` invalidates no
-  plan: the runtime maintains whatever indexes the pinned version has.
-  Every run still verifies its reference; the cost is measured and stated
-  in *Runtime*, and caching is deferred. `BC_E_LAYOUT` gains a detail on every error:
-  `BC_L_INCOMPATIBLE` for the check's refusal, `BC_L_ROW`, `BC_L_PLAN` and
-  `BC_L_RETIRED` for the rest, so the embedded API no longer
-  checks a compatible plan itself: it recompiles exactly when `bc_ctx_run`
-  refuses one, or, when the catalog version has moved, when `bc_ctx_check`
-  refuses it before the run. Only then does it check the parameters, their
-  types and their ranges, so they are checked against the plan that runs
-  and the catalog it was verified against: a key recreated from INTEGER as
-  BIGINT takes a BIGINT the stale plan's types would have refused. A plan
-  that still fits is marked with the version it was checked against, so it
-  is checked once per catalog version, not on every run after a DDL.
-- The compiler emits covering reads: a range plan whose result columns are
-  all in the index key, none of them `DOUBLE`, reads no row.
+- **Spilling sorters and hash tables.** Bounds without spill are right for
+  OLTP (`planner_design.md`, *Memory*). An analytic workload would add a
+  spilling variant behind the same calls.

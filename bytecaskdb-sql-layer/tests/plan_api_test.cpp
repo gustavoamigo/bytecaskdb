@@ -171,6 +171,37 @@ TEST_CASE("plan API: bc_sub reports overflow instead of wrapping", "[sql][algebr
 }
 
 namespace {
+void add_bigint(bc_ctx* cx) {
+  bc_emit_count(cx, bc_add_bigint(cx, bc_param_i64(cx, 0), bc_param_i64(cx, 1), kTbl));
+}
+void sub_bigint(bc_ctx* cx) {
+  bc_emit_count(cx, bc_sub_bigint(cx, bc_param_i64(cx, 0), bc_param_i64(cx, 1), kTbl));
+}
+}  // namespace
+
+TEST_CASE("plan API: a BIGINT sum or difference that leaves int64 is a range error", "[sql][algebra]") {
+  constexpr auto kMax = std::numeric_limits<std::int64_t>::max();
+  constexpr auto kMin = std::numeric_limits<std::int64_t>::min();
+  Fixture f;
+  CHECK(run(f, add_bigint, {kMax - 1, std::int64_t{1}}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == kMax);
+  CHECK(run(f, sub_bigint, {kMin + 1, std::int64_t{1}}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == kMin);
+  struct Case {
+    void (*plan)(bc_ctx*);
+    std::int64_t a, b;
+  };
+  for (auto [plan, a, b] : {Case{add_bigint, kMax, 1}, Case{add_bigint, kMin, -1}, Case{sub_bigint, kMin, 1},
+                            Case{sub_bigint, kMax, -1}, Case{sub_bigint, 0, kMin}}) {
+    CAPTURE(a, b);
+    CHECK(run(f, plan, {a, b}) == BC_FAILED);
+    CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);
+    CHECK(bc_error_detail(f.cx) == ((std::uint32_t{BC_C_RANGE} << 24) | kTbl));
+    CHECK(std::string{bc_error_message(f.cx)}.starts_with("bigint out of range"));
+  }
+}
+
+namespace {
 // Every id in t_by_name order, from the index key alone.
 void scan_index(bc_ctx* cx) {
   bc_cursor c = bc_scan_open(cx, kIdx, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);

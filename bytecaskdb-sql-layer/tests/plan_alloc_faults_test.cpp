@@ -15,6 +15,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -63,13 +64,13 @@ void emit_names(bc_ctx* cx) {
     bc_emit_end(cx);
   }
 }
-// UPDATE t SET qty = qty + 1 WHERE id = $1: decoders, bc_row_from, bc_update.
+// UPDATE t SET qty = qty + 1 WHERE id = $1, qty BIGINT: decoders, bc_row_from, bc_update.
 void bump_qty(bc_ctx* cx) {
   bool found = false;
   bc_view old = bc_get(cx, bc_key_params(cx, kTbl, 0, 1), &found);
   if (!found) return;
   bc_row r = bc_row_from(cx, kTbl, old);
-  bc_row_set_i64(cx, r, kQtyCol, bc_add(cx, bc_col_i64(cx, old, kQtyCol), 1));
+  bc_row_set_i64(cx, r, kQtyCol, bc_add_bigint(cx, bc_col_i64(cx, old, kQtyCol), 1, kTbl));
   bc_update(cx, kTbl, old, bc_row_end(cx, r));
 }
 // NULL for the NOT NULL id: by parameter, by bc_row_set_null, left unset.
@@ -94,8 +95,10 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
           "[sql][algebra][alloc]") {
   if (!bytecask::testing::kAllocFaultsAvailable) SKIP("operator new is the sanitizer's in this build");
   Fixture f;
-  for (std::int64_t i = 1; i <= 3; ++i) {
-    auto ps = params({i, bytes("n" + std::to_string(i)), i * 10});
+  // Row 4 holds the BIGINT maximum, so adding to its qty raises the range error.
+  for (std::int64_t i = 1; i <= 4; ++i) {
+    auto qty = i == 4 ? std::numeric_limits<std::int64_t>::max() : i * 10;
+    auto ps = params({i, bytes("n" + std::to_string(i)), qty});
     SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
     auto ref = sr.get();
     REQUIRE(bc_execute(f.cx, insert_row, &ref, &ps, {}, false, 0) == BC_COMMITTED);
@@ -119,6 +122,7 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
        {{std::int64_t{2}, bytes("n2"), std::int64_t{20}}}},
       {"bc_emit_key_part", emit_names, {}, {PhysType::Bytes}, BC_OK},
       {"update", bump_qty, {std::int64_t{3}}, {}, BC_OK},
+      {"update, qty leaves BIGINT", bump_qty, {std::int64_t{4}}, {}, BC_E_CONSTRAINT},
       {"bc_row_set_param NULL", null_id_param, {bc_value{}}, {}, BC_E_CONSTRAINT},
       {"bc_row_set_null", null_id_set, {}, {}, BC_E_CONSTRAINT},
       {"bc_row_end, a column unset", id_unset, {}, {}, BC_E_CONSTRAINT},

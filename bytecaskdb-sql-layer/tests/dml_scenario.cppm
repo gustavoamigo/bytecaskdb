@@ -113,7 +113,9 @@ inline void run_dml_scenario(Fixture& f, PlanSet plans) {
   CHECK(p.by_id(std::int64_t{4}) == std::vector<Row>{{std::int64_t{4}, kNull}});
   CHECK(p.affected(p.plans.update_qty, {std::int64_t{9}, std::int64_t{3}}) == 0);
   CHECK(p.exec(p.plans.update_qty, {std::int64_t{1}, std::numeric_limits<std::int64_t>::min()}) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_ARITH);
+  CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);  // qty is BIGINT: 7 - INT64_MIN leaves it
+  CHECK(bc_error_detail(f.cx) == ((std::uint32_t{BC_C_RANGE} << 24) | kTbl));
+  CHECK(std::string{bc_error_message(f.cx)}.starts_with("bigint out of range"));
   CHECK(p.by_id(std::int64_t{1}) == std::vector<Row>{{std::int64_t{1}, std::int64_t{7}}});
 
   CHECK(p.affected(p.plans.delete_by_id, {std::int64_t{2}}) == 1);
