@@ -593,7 +593,7 @@ void     bc_emit_count(bc_ctx *, int64_t affected);   /* write statements: the r
 | Function | What it does |
 |---|---|
 | `bc_param_*` | Reads parameter `i` as bound by `bc_ctx_begin`. A wrong index or type is `BC_E_HANDLE` and a neutral value. A parameter view is a handle like any other: made in a loop, it goes with the step. |
-| `bc_emit_begin` … `bc_emit_end` | Appends one result row, in the row format, with the types the plan's `bc_schema_ref` declares in `result_types`. Columns are emitted in that order; a count or type that does not match is `BC_E_LAYOUT`. The row is copied into the result buffer and charged to the memory budget. |
+| `bc_emit_begin` … `bc_emit_end` | Appends one result row, in the row format, with the types the plan's `bc_schema_ref` declares in `result_types`. Columns are emitted in that order; a count or type that does not match is `BC_E_LAYOUT`. A ref that declares no `result_types` allows rows of no columns (`SELECT FROM t`), unless it also lists tables written: a write plan returns no rows, and `bc_emit_begin` fails it with `BC_L_PLAN`. Called outside a run, where no ref is set, it is `BC_E_HANDLE`. The row is copied into the result buffer and charged to the memory budget. |
 | `bc_emit_col` | Emits column `col` of a row view: its value, or NULL when the column is null or the row predates it; `BC_E_CORRUPT` for a column marked present that the row does not hold. The type is the column's, and must be the next result column's. One call where a nullable column took an `if` and two emits. |
 | `bc_emit_key_part` | Emits part `part` of an encoded key of `table_or_index`, NULL as NULL: a covering read's column, from `bc_scan_key`, with no row read. A `DOUBLE` part is `BC_E_HANDLE`: the key canonicalises `-0.0` and NaN, so the value comes from the row. |
 | `bc_emit_count` | Records the affected-row count a write statement reports. At most once per plan. |
@@ -607,6 +607,8 @@ return zero.
 ```c
 int64_t bc_add(bc_ctx *, int64_t, int64_t);     /* overflow → error */
 int64_t bc_sub(bc_ctx *, int64_t, int64_t);
+int64_t bc_add_bigint(bc_ctx *, int64_t, int64_t, uint32_t object_id);  /* overflow: BC_C_RANGE on object_id */
+int64_t bc_sub_bigint(bc_ctx *, int64_t, int64_t, uint32_t object_id);
 int64_t bc_mul(bc_ctx *, int64_t, int64_t);
 int64_t bc_div(bc_ctx *, int64_t, int64_t);     /* zero divisor, INT64_MIN / -1 → error */
 int64_t bc_mod(bc_ctx *, int64_t, int64_t);
@@ -627,6 +629,13 @@ defined for every input, and NaN and infinities propagate as SQL expects the
 compiler to handle. Byte comparisons are for encoded or binary columns; the
 compiler emits comparisons on sort keys it built, never on raw text, and on
 TEXT and VARCHAR columns compared under `COLLATE "C"`, byte order.
+
+`bc_add_bigint` and `bc_sub_bigint` are `bc_add` and `bc_sub` for a value
+that is stored in a BIGINT column (`SET col = col ± $n`): the only integer
+type whose sum can leave `int64`. An overflow is the same range error
+`bc_check_int` raises, on `object_id`, with PostgreSQL's words ("bigint out of
+range", SQLSTATE 22003, #540), where `bc_add` stays `BC_E_ARITH` for
+aggregates and intermediates.
 
 `bc_check_int` is the range check of a computed integer (added in the
 front end's slice 5): it returns `v` when it is inside the SQL type the

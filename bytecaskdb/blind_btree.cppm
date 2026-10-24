@@ -550,71 +550,80 @@ class BlindSession : public btree_detail::BuildSession<BlindRef> {
 public:
   using Result = Base::Result;
 
+  // Each write runs through the base's write(), which moves `root`.
   template <BlindKeyResolver R, typename Pred>
-  auto upsert(N *root, Bytes key, BlindRef ref, R &res, Pred &should_replace)
+  auto upsert(N *&root, Bytes key, BlindRef ref, R &res, Pred &should_replace)
       -> Result {
-    displaced_.reset();
-    const auto fpq = fingerprint(key);
-    if (!root) {
-      auto *leaf = L::allocate(tag_);
-      L::write(L::arrays(leaf), 0, 0, fpq, ref);
-      leaf->count = 1;
-      L::build_index(leaf);
-      return {leaf, nullptr, true, true};
-    }
-    auto step = [&](N *leaf) {
-      return upsert_leaf(leaf, key, fpq, ref, res, should_replace);
-    };
-    return this->descend_upsert(root, key, step);
+    return this->write(root, [&]() -> Result {
+      displaced_.reset();
+      const auto fpq = fingerprint(key);
+      if (!root) {
+        auto *leaf = L::allocate(tag_);
+        L::write(L::arrays(leaf), 0, 0, fpq, ref);
+        leaf->count = 1;
+        L::build_index(leaf);
+        return {leaf, nullptr, true, true};
+      }
+      auto step = [&](N *leaf) {
+        return upsert_leaf(leaf, key, fpq, ref, res, should_replace);
+      };
+      return this->descend_upsert(root, key, step);
+    });
   }
 
   template <BlindKeyResolver R>
-  auto erase(N *root, Bytes key, R &res) -> Result {
-    displaced_.reset();
-    if (!root)
-      return {nullptr, nullptr, false, false};
-    const auto fpq = fingerprint(key);
-    auto step = [&](N *leaf) -> Result {
-      const auto idx = L::find(leaf, key, fpq, res);
-      if (!idx)
-        return {leaf, nullptr, false, false};
-      return remove_entry(leaf, *idx);
-    };
-    return this->descend_erase(root, key, step);
+  auto erase(N *&root, Bytes key, R &res) -> Result {
+    return this->write(root, [&]() -> Result {
+      displaced_.reset();
+      if (!root)
+        return {nullptr, nullptr, false, false};
+      const auto fpq = fingerprint(key);
+      auto step = [&](N *leaf) -> Result {
+        const auto idx = L::find(leaf, key, fpq, res);
+        if (!idx)
+          return {leaf, nullptr, false, false};
+        return remove_entry(leaf, *idx);
+      };
+      return this->descend_erase(root, key, step);
+    });
   }
 
   // Points key's entry at `to` if it points at `from`; otherwise changes
   // nothing. No read: see Leaf::find_at.
-  auto replace_at(N *root, Bytes key, BlindRef from, BlindRef to) -> Result {
-    displaced_.reset();
-    if (!root)
-      return {nullptr, nullptr, false, false};
-    const auto fpq = fingerprint(key);
-    auto step = [&](N *leaf) -> Result {
-      const auto idx = L::find_at(leaf, fpq, from);
-      if (!idx)
-        return {leaf, nullptr, false, false};
-      auto *n = own_leaf(leaf);
-      L::set_ref(n, *idx, to);
-      displaced_ = from;
-      return {n, nullptr, true, false};
-    };
-    return this->descend_upsert(root, key, step);
+  auto replace_at(N *&root, Bytes key, BlindRef from, BlindRef to) -> Result {
+    return this->write(root, [&]() -> Result {
+      displaced_.reset();
+      if (!root)
+        return {nullptr, nullptr, false, false};
+      const auto fpq = fingerprint(key);
+      auto step = [&](N *leaf) -> Result {
+        const auto idx = L::find_at(leaf, fpq, from);
+        if (!idx)
+          return {leaf, nullptr, false, false};
+        auto *n = own_leaf(leaf);
+        L::set_ref(n, *idx, to);
+        displaced_ = from;
+        return {n, nullptr, true, false};
+      };
+      return this->descend_upsert(root, key, step);
+    });
   }
 
   // Erases key's entry if it points at `from`; otherwise changes nothing.
-  auto erase_at(N *root, Bytes key, BlindRef from) -> Result {
-    displaced_.reset();
-    if (!root)
-      return {nullptr, nullptr, false, false};
-    const auto fpq = fingerprint(key);
-    auto step = [&](N *leaf) -> Result {
-      const auto idx = L::find_at(leaf, fpq, from);
-      if (!idx)
-        return {leaf, nullptr, false, false};
-      return remove_entry(leaf, *idx);
-    };
-    return this->descend_erase(root, key, step);
+  auto erase_at(N *&root, Bytes key, BlindRef from) -> Result {
+    return this->write(root, [&]() -> Result {
+      displaced_.reset();
+      if (!root)
+        return {nullptr, nullptr, false, false};
+      const auto fpq = fingerprint(key);
+      auto step = [&](N *leaf) -> Result {
+        const auto idx = L::find_at(leaf, fpq, from);
+        if (!idx)
+          return {leaf, nullptr, false, false};
+        return remove_entry(leaf, *idx);
+      };
+      return this->descend_erase(root, key, step);
+    });
   }
 
 private:
@@ -1216,7 +1225,6 @@ public:
     if (!r.changed)
       return false;
     changed_ = true;
-    root_ = r.node;
     (void)session_.take_displaced();
     return true;
   }
@@ -1225,7 +1233,8 @@ public:
     const auto r = session_.erase_at(root_, key, from);
     if (!r.changed)
       return false;
-    apply_erase(r);
+    changed_ = true;
+    --size_;
     return true;
   }
 
@@ -1240,7 +1249,6 @@ public:
     if (!r.changed)
       return std::nullopt;
     changed_ = true;
-    root_ = r.right ? session_.make_root(r.node, r.right) : r.node;
     if (r.inserted)
       ++size_;
     return session_.take_displaced();
@@ -1253,7 +1261,8 @@ public:
     const auto r = session_.erase(root_, key, res);
     if (!r.changed)
       return std::nullopt;
-    apply_erase(r);
+    changed_ = true;
+    --size_;
     return session_.take_displaced();
   }
 
@@ -1294,20 +1303,9 @@ private:
       : base_{base}, root_{base.root_}, size_{base.size_} {}
 
   void ensure_active() const {
-    if (session_.tag() == 0) [[unlikely]]
-      throw std::logic_error{"TransientBlindBTree already consumed"};
-  }
-
-  // The root after an erase that removed an entry.
-  void apply_erase(const typename blind_detail::BlindSession<LeafBytes>::Result &r) {
-    changed_ = true;
-    root_ = r.node;
-    while (root_ && !root_->is_leaf && root_->count == 0) {
-      auto *old = root_;
-      root_ = old->first_child;
-      session_.discard(old);
-    }
-    --size_;
+    if (!session_.usable()) [[unlikely]]
+      throw std::logic_error{
+          "TransientBlindBTree already consumed, or a write to it failed"};
   }
 
   void discard() noexcept {

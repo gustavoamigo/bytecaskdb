@@ -63,6 +63,7 @@
 
 import bytecask;
 import bytecask.blind_btree;
+import bytecask.btree;
 
 #include "proof/invariants.h"
 #include "sweep_operations.h"
@@ -510,6 +511,11 @@ TEST_CASE("alloc sweep: apply_batch", "[alloc_sweep]") {
   alloc_sweep(apply_batch_operation());
 }
 
+TEST_CASE("alloc sweep: apply_batch that splits what it changed",
+          "[alloc_sweep]") {
+  alloc_sweep(splitting_batch_operation());
+}
+
 TEST_CASE("alloc sweep: write across a rotation", "[alloc_sweep]") {
   alloc_sweep(rotation_operation());
 }
@@ -599,6 +605,118 @@ TEST_CASE("alloc sweep: a transient tree is freed when nothing can be "
       every_allocation_fails.emplace(1, true);
     }  // tr frees its nodes here
   }));
+}
+
+// A write that fails partway leaves the transient's root on nodes that are
+// all alive, and dropping the transient frees each of them once. Each
+// allocation of a run of inserts into an empty tree is failed in turn, once
+// and from there on. Neighbouring keys share 103 bytes and a node's keys
+// far fewer, so separators are long and inner nodes few to a page: the run
+// splits its root leaf, then inner nodes and the inner root, and shrinks
+// inner prefixes, all on nodes it created. A split frees the node it
+// replaces; it used to do so before the root, or a rebuilt node's parent,
+// reached the replacement, and a failure in between left the root on a
+// freed node, which the drop walked and freed again (heap-use-after-free
+// under ASan). Under ASan the node pool is off, so every node allocation is
+// failed. Elsewhere the pool is emptied before each run, so the first
+// splits and the roots over them reach operator new and are counted; nodes
+// the run frees are reused from the pool uncounted (#583).
+//
+// `fresh()` makes an empty transient, `insert(tr, i)` writes the i-th key,
+// and `check(tr)` publishes a completed run and validates it.
+namespace {
+
+template <typename Fresh, typename Insert, typename Check>
+void sweep_partial_writes(int inserts, const Fresh &fresh,
+                          const Insert &insert, const Check &check) {
+  for (const bool cascade : {false, true}) {
+    for (long n = 1;; ++n) {
+      REQUIRE(n <= kMaxAllocations);
+      INFO("allocation " << n << (cascade ? " and every one after it" : "")
+                         << " failed");
+      auto tr = fresh();
+      bytecask::btree_detail::node_pool_trim();
+      bool threw = false;
+      bool fired = false;
+      {
+        ScopedAllocFaults faults{n, cascade};
+        try {
+          for (int i = 0; i < inserts; ++i)
+            insert(tr, i);
+        } catch (const std::bad_alloc &) {
+          threw = true;
+        }
+        fired = faults.report().fired;
+      }
+      if (!fired) {
+        check(tr);
+        CHECK_THROWS_AS(insert(tr, 0), std::logic_error);  // consumed
+        break;
+      }
+      if (threw)
+        CHECK_THROWS_AS(insert(tr, 0), std::logic_error);
+    }  // tr is dropped at the end of each run, after the failure
+  }
+}
+
+auto partial_write_key(int i, int inserts) -> std::string {
+  const auto j = i * 7 % inserts;
+  return std::format("{:03}{}{:03}", j % 40, std::string(100, 'q'), j / 40);
+}
+
+}  // namespace
+
+TEST_CASE("alloc sweep: a transient whose write fails partway is freed once",
+          "[alloc_sweep]") {
+  // A node a failed write had not yet placed is leaked (#390).
+  const ExpectedLeaks leaks;
+  constexpr int kInserts = 1'000;
+  KeyStore res;
+  struct Insert {
+    std::string key;
+    bytecask::BlindRef ref;
+  };
+  std::vector<Insert> run;
+  for (int i = 0; i < kInserts; ++i) {
+    auto k = partial_write_key(i, kInserts);
+    const auto ref = res.ref(k);
+    run.push_back({std::move(k), ref});
+  }
+  sweep_partial_writes(
+      kInserts, [] { return Tree{}.transient(); },
+      [&](auto &tr, int i) {
+        const auto &ins = run[static_cast<std::size_t>(i)];
+        tr.set(to_bytes(ins.key), ins.ref, res);
+      },
+      [&](auto &tr) {
+        const auto t = std::move(tr).persistent();
+        (void)t.validate(res);
+        CHECK(t.size() == kInserts);
+      });
+}
+
+// The same sweep over the keyed tree (BYTECASK_KEYDIR=btree), whose
+// transient installs its root through the same BuildSession::write.
+TEST_CASE("alloc sweep: a keyed transient whose write fails partway is freed "
+          "once",
+          "[alloc_sweep]") {
+  const ExpectedLeaks leaks;
+  constexpr int kInserts = 1'000;
+  std::vector<std::string> keys;
+  for (int i = 0; i < kInserts; ++i)
+    keys.push_back(partial_write_key(i, kInserts));
+  using KeyedTree = bytecask::PersistentBTree<std::uint64_t>;
+  sweep_partial_writes(
+      kInserts, [] { return KeyedTree{}.transient(); },
+      [&](auto &tr, int i) {
+        tr.set(to_bytes(keys[static_cast<std::size_t>(i)]),
+               static_cast<std::uint64_t>(i));
+      },
+      [&](auto &tr) {
+        const auto t = std::move(tr).persistent();
+        (void)t.validate();
+        CHECK(t.size() == kInserts);
+      });
 }
 
 // A version whose publication fails leaves its base as it was, so the base

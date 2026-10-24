@@ -254,6 +254,34 @@ inline auto apply_batch_operation() -> Operation {
           .transition = mixed_transition};
 }
 
+// A batch that splits nodes its own earlier writes made the transient's: the
+// first put copies the seed's single leaf, and the puts after it fill that
+// copy until it splits, so the split replaces a node the transient owns and
+// the root over the halves is allocated after it. The seed alone is one
+// leaf that never fills, which is why no other operation reaches it.
+inline auto splitting_batch_operation() -> Operation {
+  constexpr int kPuts = 80;  // the seed's 8 keys and these overfill a leaf
+  auto key = [](int i) { return std::format("s{:02}", i * 37 % kPuts); };
+  return {.name = "apply_batch that splits what it changed",
+          .setup = seed,
+          .run =
+              [key](DB &db) {
+                auto plan = [&] {
+                  const SuspendSyscallFaults inputs;
+                  WritePlan p;
+                  for (int i = 0; i < kPuts; ++i)
+                    p.put(to_bytes(key(i)), to_bytes("s"));
+                  return p;
+                }();
+                const auto r = db.apply_batch({.sync = true}, std::move(plan));
+                return r && r->durable;
+              },
+          .transition = [key](KeyValues kv) {
+            for (int i = 0; i < kPuts; ++i) kv[key(i)] = bytes("s");
+            return kv;
+          }};
+}
+
 // A write that fills the active file: the append, the rotation it triggers,
 // and the sealed file's hint, written by the worker.
 inline auto rotation_operation() -> Operation {
