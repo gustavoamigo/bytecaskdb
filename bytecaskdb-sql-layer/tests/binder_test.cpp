@@ -372,8 +372,6 @@ TEST_CASE("binder: COUNT, ORDER BY and column + parameter", "[sql][binder]") {
             "column \"t.id\" must appear in the GROUP BY clause or be used in an aggregate function", 17});
   CHECK(rejected(cat, "SELECT count(*) FROM t WHERE id = $1 ORDER BY id").first ==
         "column \"t.id\" must appear in the GROUP BY clause or be used in an aggregate function");
-  CHECK(rejected(cat, "SELECT count(*), count(id) FROM t WHERE id = $1") ==
-        std::pair<std::string, std::int32_t>{"only one aggregate per SELECT is supported", 17});
   CHECK(rejected(cat, "SELECT id FROM t WHERE id = $1 ORDER BY nope").first == "column \"nope\" does not exist");
   CHECK(rejected(cat, "UPDATE t SET qty = count(*) WHERE id = $1").first == "aggregate functions are not allowed here");
   // SUM and MIN take a column held as an int64_t; SUM an exact number.
@@ -562,4 +560,80 @@ TEST_CASE("binder: each refusal carries PostgreSQL's SQLSTATE", "[sql][binder][s
   CHECK(state("SELEC 1") == "42601");
   CHECK(state("SELECT id FROM t WHERE id = qty") == "42601");
   CHECK(state("CREATE TABLE u2 (k BIGINT PRIMARY KEY, v TIMESTAMPTZ)") == "42601");
+}
+
+TEST_CASE("binder: GROUP BY, HAVING and the aggregates, as PostgreSQL binds them", "[sql][binder][group]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE g (k BIGINT PRIMARY KEY, a INTEGER, d NUMERIC(6,2), "
+                                        "f DOUBLE PRECISION, s TEXT, day DATE)").stmt));
+  const auto& cat = f.cat();
+  bound::Bound held;
+  auto grouped = [&](std::string_view sql) -> const logical::Aggregate& {
+    held = bind_sql(cat, sql);
+    return get<logical::Aggregate>(held);
+  };
+  {
+    const auto& a = grouped("SELECT a, count(*), sum(d), max(a), avg(a), avg(d) FROM g GROUP BY a, a");
+    CHECK(a.grouped);
+    CHECK(a.group_by.size() == 1);  // each once
+    REQUIRE(a.aggs.size() == 6);
+    CHECK(a.aggs[0].expr.kind == logical::Expr::Kind::Column);
+    CHECK(a.aggs[2].name == "sum");
+    CHECK(sql_type_name(a.aggs[3].expr.type) == "integer");
+    CHECK(a.aggs[4].name == "avg");
+    CHECK(sql_type_name(a.aggs[4].expr.type) == "numeric");
+    CHECK(a.aggs[5].expr.type.scale == 2);
+  }
+  // A column of a table its primary key groups is dependent: PostgreSQL's
+  // functional dependency. It is read from a group's row, not grouped by.
+  {
+    const auto& a = grouped("SELECT k, s, count(*) FROM g GROUP BY k");
+    CHECK(a.group_by.size() == 1);
+    REQUIRE(a.dependent.size() == 1);  // each once
+    CHECK(a.dependent[0] == a.aggs[1].expr);
+  }
+  // HAVING's parameter takes the aggregate's type, or the column's: a Filter
+  // above the Aggregate.
+  {
+    auto b = bind_sql(cat, "SELECT a FROM g GROUP BY a HAVING count(*) > $1 AND sum(d) < $2 AND min(day) = $3 AND $4 <= a");
+    REQUIRE(b.params.size() == 4);
+    CHECK(sql_type_name(b.params[0].type) == "bigint");
+    CHECK(b.params[1].type.kind == SqlKind::Decimal);
+    CHECK(b.params[1].type.scale == 2);
+    CHECK(sql_type_name(b.params[2].type) == "date");
+    CHECK(sql_type_name(b.params[3].type) == "integer");
+    const auto& having = std::get<logical::Filter>(root(b).op);
+    CHECK(std::holds_alternative<logical::Aggregate>(having.input->op));
+    CHECK(having.conjuncts[3].op == ast::Compare::Op::Ge);  // a >= $4
+  }
+  // A $n the WHERE types keeps its type in the HAVING, as PostgreSQL types
+  // it by its first use: an INTEGER compared with COUNT(*), a SUM or a key.
+  // A DECIMAL of scale 2 is no integer: compared with COUNT(*), refused.
+  {
+    auto b = bind_sql(cat, "SELECT a FROM g WHERE a > $1 GROUP BY a HAVING count(*) > $1 AND sum(a) < $1 AND a >= $1");
+    REQUIRE(b.params.size() == 1);
+    CHECK(sql_type_name(b.params[0].type) == "integer");
+    CHECK(rejected(cat, "SELECT a FROM g WHERE d > $1 GROUP BY a HAVING count(*) > $1").first ==
+          "parameter $1 is compared with d (numeric(6,2)) and count (bigint)");
+  }
+  // An ORDER BY sorts the groups, above the Aggregate.
+  CHECK(std::holds_alternative<logical::Sort>(root(bind_sql(cat, "SELECT a FROM g GROUP BY a ORDER BY a")).op));
+  // A column neither grouped nor of a table its primary key groups: 42803,
+  // in the select list, ORDER BY and HAVING.
+  const auto* not_grouped = "column \"g.s\" must appear in the GROUP BY clause or be used in an aggregate function";
+  CHECK(rejected(cat, "SELECT s, count(*) FROM g GROUP BY a") == std::pair<std::string, std::int32_t>{not_grouped, 7});
+  CHECK(rejected(cat, "SELECT a FROM g GROUP BY a ORDER BY s").first == not_grouped);
+  CHECK(rejected(cat, "SELECT a FROM g GROUP BY a HAVING s = $1").first == not_grouped);
+  CHECK(rejected(cat, "SELECT s FROM g HAVING count(*) > $1").first == not_grouped);
+  // FOR UPDATE, in PostgreSQL's order of checks.
+  CHECK(rejected(cat, "SELECT a FROM g GROUP BY a FOR UPDATE").first == "FOR UPDATE is not allowed with GROUP BY clause");
+  CHECK(rejected(cat, "SELECT count(*) FROM g HAVING count(*) > $1 FOR UPDATE").first ==
+        "FOR UPDATE is not allowed with HAVING clause");
+  // The aggregates' types, as PostgreSQL refuses them: 42883 where it has no
+  // such aggregate, 42601 where the layer does not take it yet.
+  CHECK(rejected(cat, "SELECT max(s) FROM g").first == "MAX of a text column is not supported");
+  CHECK(rejected(cat, "SELECT avg(day) FROM g").first == "AVG of a date column is not supported");
+  CHECK(rejected(cat, "SELECT avg(f) FROM g").first == "AVG of a double precision column is not supported");
+  CHECK(rejected(cat, "SELECT a FROM g GROUP BY a HAVING avg(a) > $1").first == "HAVING on AVG is not supported yet");
+  CHECK(rejected(cat, "SELECT a FROM g GROUP BY a + 1").first == "GROUP BY takes columns");
 }

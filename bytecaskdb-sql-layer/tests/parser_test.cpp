@@ -104,7 +104,7 @@ TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql]
   //                    01234567890123456789012345678901234567890123456789
   CHECK(rejected_at("SELECT id FROM t WHERE id = $1 LIMIT -1") == 37);
   CHECK(rejected_at("SELECT id FROM t WHERE id = $1 LIMIT 1.5") == 37);
-  CHECK(rejected_at("SELECT max(qty) FROM t WHERE id = $1") == 7);
+  CHECK(rejected_at("SELECT stddev(qty) FROM t WHERE id = $1") == 7);
   CHECK(rejected_at("SELECT sum(*) FROM t WHERE id = $1") == 7);
   CHECK(rejected_at("SELECT min(qty + $2) FROM t WHERE id = $1") == 7);
   CHECK(rejected_at("SELECT sum(DISTINCT qty) FROM t WHERE id = $1") == 7);

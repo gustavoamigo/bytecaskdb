@@ -1,12 +1,13 @@
 # The planner: a logical algebra, a search, and compiled pipelines
 
 Status: **design, approved (owner, 2026-10-24); slices 1 to 4 built, and
-slice 5's hash joins** (*Slice 1 as built*, *Slice 2 as built*, *Slice 4
-as built*, *Hash joins as built*): the pipeline, then System R's search
-with the cost model and the choice points (*Choice points as built*),
-slice 3, *Memory*: the statement budget and the lifetime rule
-(`plan_api_design.md`, revision 7), and #551 with it, slice 4, full scans
-and sorts (#533), and hash joins (#534). The rest of slice 5 is not built.
+slice 5's hash joins and GROUP BY** (*Slice 1 as built*, *Slice 2 as
+built*, *Slice 4 as built*, *Hash joins as built*, *GROUP BY as built*):
+the pipeline, then System R's search with the cost model and the choice
+points (*Choice points as built*), slice 3, *Memory*: the statement budget
+and the lifetime rule (`plan_api_design.md`, revision 7), and #551 with
+it, slice 4, full scans and sorts (#533), hash joins and `GROUP BY` (#534).
+The rest of slice 5 is not built.
 The first of the post-MVP designs (#487, *Next*). The parser, the plan API
 and TinyCC are unchanged; the binder's output changed.
 
@@ -66,7 +67,7 @@ compute, not how.
 | `Filter(input, predicate)` | the rows for which the predicate is true |
 | `Project(input, exprs)` | one output row per input row, of these expressions |
 | `Join(left, right, predicate, kind)` | inner first; outer joins with #534 |
-| `Aggregate(input, group_by, aggs)` | `COUNT`, `COUNT(DISTINCT)`, `SUM`, `MIN`, `MAX`; no `group_by` means one row |
+| `Aggregate(input, group_by, aggs)` | `COUNT`, `COUNT(DISTINCT)`, `SUM`, `MIN`, `MAX`, `AVG`; no `group_by` means one row |
 | `Sort(input, keys)` | each key with its direction and its NULL placement |
 | `Limit(input, n)` | the first n rows |
 | `Insert`, `Update`, `Delete` | writes, over the rows their input gives |
@@ -458,7 +459,7 @@ same API calls and reads as before.
 - `Empty`, no rows and no read: the sink reports what it gives for none;
 - the access paths `PointGet`, `Scan` and `NullSplitScan`;
 - `CountRange` and `MinFirstEntry`, the access paths that also produce the
-  aggregate;
+  aggregate (`MinFirstEntry` is now `KeyAggregates`, *GROUP BY as built*);
 - `IndexJoin`, the index nested loop;
 - `Filter` and `Limit`;
 - the sinks: `Emit`, `Aggregate`, `Insert`, `Update` and `Delete`.
@@ -504,7 +505,7 @@ needed; every pattern below uses calls `bc_plan.h` declares.
 | `COUNT(*)`, `COUNT(col NOT NULL)`, no residual | `CountRange` | `bc_count_range` over the access path's range |
 | `COUNT`, `SUM` otherwise | `Aggregate` | an accumulator local, `bc_add`; a "seen" `bool` for SUM's NULL |
 | `MIN` otherwise | `Aggregate` | a local holding the least non-NULL value, kept by comparison: `<` on integers, on doubles `<` with NaN taken as greater than every other value (`docs/types_design.md`, *Double arithmetic*); a "seen" `bool` for the NULL. Never a bytes column (`frontend_design.md`, *The dialect*) |
-| `MIN(col)`, `col` an `ASC` part directly after the equality prefix, no residual | `MinFirstEntry`, its `Scan` forward, its range from past the NULL part when `col` is nullable | the first entry of the scan, which starts past the NULL part when `col` is nullable. A `DESC` part (its first entry is the maximum) takes the `Aggregate` row |
+| `MIN(col)`, `col` an `ASC` part directly after the equality prefix, no residual | `MinFirstEntry` (now `KeyAggregates`), its `Scan` forward, its range from past the NULL part when `col` is nullable | the first entry of the scan, which starts past the NULL part when `col` is nullable. A `DESC` part (its first entry is the maximum) takes the `Aggregate` row |
 | `COUNT(DISTINCT col)` | `Aggregate` | `bc_agg_group` keyed by the column, then a count of `bc_agg_next` |
 | A join | `IndexJoin` | the inner key built from the outer row: `bc_key_*` of `bc_col_*`; nested in the outer loop |
 | `FOR UPDATE` | the access path's `for_update`, from the `Get`'s | `bc_guard_row` on each returned row: `bc_guard_unchanged` on its primary key |
@@ -1466,6 +1467,371 @@ whose tables no key reaches.
   NOPM, the conditions holding after it and in `check`; again no plan of
   its statements moved, so the difference is the container's, not the
   plans'.
+
+## GROUP BY as built
+
+The second part of slice 5 (#534): `GROUP BY` of columns, `HAVING`, `MAX`
+and `AVG`, and several aggregates in one select list. Every golden plan,
+TPROC-C's and the fixture's, regenerated unchanged.
+
+**The logical plan.** An aggregated `SELECT` is `Limit? → Sort? → Filter?
+→ Aggregate → Filter? → the tables`: the `Filter` above the `Aggregate` is
+its `HAVING`, and the `Sort` orders the groups. The `Aggregate`'s outputs
+are the select list, grouped columns and aggregate calls in its order; its
+`group_by` holds each column of the `GROUP BY` once, as written. A column
+not grouped whose table's whole primary key is, which every row of a group
+holds the same value of, is in `dependent` (`frontend_design.md`, *GROUP
+BY and HAVING*): a group gives it, and it never keys one.
+Slice 1's one-row aggregate (one `COUNT`, `SUM` or `MIN`, no `GROUP BY`
+or `HAVING`) keeps its plans: `CountRange`, the first entry and the loop
+with an accumulator. Everything else is a `GroupAggregate`, and, where its
+aggregates allow it, also answered from the keys (below).
+
+**Answered from the keys.** One group of every row, no `HAVING`, whose
+outputs are each `COUNT(*)`, or `MIN` or `MAX` of one column, the `ASC`
+part after the scan's equality prefix, with nothing filtering a row after
+the range: `KeyAggregates(counted, values, arg, outputs)`. `COUNT(*)` is
+`bc_count_range` of the range; `MIN` the first entry of `values`, the same
+range started past the part's NULLs where it is nullable and has no range;
+`MAX` its last, read as the first entry of the same range scanned in
+reverse. A lone `MIN` or `MAX` emits from its entry; with several, each is
+read into a local, in a block of its own, and the row emitted after. It
+costs a count's `kCountCost` and one read per `MIN` or `MAX`, two where the
+scan does not cover. Slice 1's `MinFirstEntry` was the lone `MIN`; it is
+this node now, its plan text the same. A `DESC` part, another aggregate, a
+second column, a residual filter, a `GROUP BY` or a `HAVING` reads every
+row, as before. Before, a `MAX`, or `MIN` beside another aggregate, read
+every row of the range.
+
+```c
+/* SELECT count(*), min(b), max(b) FROM p WHERE a = $1 */
+int64_t n = bc_count_range(cx, TBL_4, lo, hi, INT64_MAX);
+int64_t kv0 = 0;
+bool kn0 = true;
+{
+  /* the range forward: its first entry's b into kv0 */
+}
+/* kv1, kn1: the same range with BC_SCAN_REVERSE */
+```
+
+**The physical plan.** `GroupAggregate(input, keys, aggs, streamed,
+dependent)`, its rows the groups; above it a `Filter` of its `HAVING`, a
+`Sort` of its groups (`groups`: it holds each group's key), a `Limit`, and
+the sink, `GroupEmit`, whose outputs are its keys, dependent columns and
+aggregates. Its columns are its keys, then its dependent columns: a
+`HAVING`, a sort and the outputs may name any of them, and each is kept as
+below, but only the keys make the group's key or start a streamed group.
+
+**In a structure** (`streamed` false), the pipeline breaker of *The
+physical plan and codegen*: each input row's group is found by its key, a
+sort key of its key columns (`bc_sort_key_col`, ascending, NULLs first, so
+equal values, `-0.0` and `0.0`, and NULLs give equal bytes), and its values
+folded into the group's slots; then a loop over the groups in the order
+they first appeared. Where it keeps what it gives for a group
+(`GroupLayout`):
+- slot 0 counts the group's rows, `COUNT(*)` among them; on the group's
+  first row, `bc_agg_null` of slot 0 is true;
+- a column of physical type I64, a key or dependent, has a slot, its value
+  folded once, on the group's first row, by `bc_agg_min_i64`, NULL as
+  `bc_agg_null`;
+- any other (BOOLEAN, DOUBLE, a string) is read from the group's first
+  row of its table, put on that row in a hash table of the table's
+  (`bc_hash_*`) under the group's key: the plan API has no slot for it,
+  and a group key's bytes decode as no table's. So that table's loop reads
+  rows, never a covering scan's entries, and a choice point's second plan
+  there reads rows too;
+- each aggregate a slot: `COUNT` by `bc_agg_count`, `SUM` by
+  `bc_agg_add_i64`, `MIN` and `MAX` by `bc_agg_min_i64` and
+  `bc_agg_max_i64`, `AVG` two, its sum and its count; NULL inputs skipped,
+  and `SUM`, `MIN`, `MAX` and `AVG` NULL where `bc_agg_null`;
+- a `COUNT(DISTINCT col)` keeps an aggregate of its own, one slot, keyed by
+  the group's key and the value: a pair new to it counts in the group.
+
+```c
+bc_agg a0 = bc_agg_open(cx, 3);
+{
+  /* the input's loop */
+    bc_sort_key gb0 = bc_sort_key_begin(cx);
+    bc_sort_key_col(cx, gb0, row, COL_1_2, BC_SORT_ASC, BC_SORT_NULLS_FIRST);
+    bc_view gr0 = bc_sort_key_end(cx, gb0);
+    bc_group gg0 = bc_agg_group(cx, a0, gr0);
+    if (bc_agg_null(cx, gg0, 0)) {
+      if (!bc_col_null(cx, row, COL_1_2)) bc_agg_min_i64(cx, gg0, 1, bc_col_i64(cx, row, COL_1_2));
+    }
+    bc_agg_count(cx, gg0, 0);
+    bc_agg_max_i64(cx, gg0, 2, bc_col_i64(cx, row, COL_1_0));
+}
+bc_view gk0 = bc_empty(cx);
+while (bc_agg_next(cx, a0, &gk0, 0)) {
+  bc_group g0 = bc_agg_group(cx, a0, gk0);
+  /* HAVING, then the consumer: emit, or a sort of the groups */
+}
+```
+
+A group's handle is found again by its key (`bc_agg_group` finds an
+existing group and charges nothing), since a plan's locals are initialized
+where declared and no call gives an empty group. A `Sort` of the groups
+adds each one's key as its payload, and its loop finds the group again by
+the key it holds. A `LIMIT`'s counter is the loop over the groups or the
+sorter, never the input's.
+
+**Streamed** (`streamed` true), where the input's rows come with each
+group's together: the group is kept in locals, a key's value and NULL and
+each aggregate's accumulator, and given to the consumer inside the input's
+loop when a row of another group starts the next, then after the loop for
+the last. A dependent column is read from each row and kept beside the
+keys. Nothing is held but the group in hand's `COUNT(DISTINCT)` values:
+each argument's aggregate is keyed by the value alone and cleared
+(`bc_agg_clear`, `plan_api_design.md`) as each group ends, so a stream's
+memory does not grow with its groups. Before, it was keyed by every
+(group, value) pair and held them all to the end. With no key it is one
+group, given after the input, over no rows too, and its no-rows form (a
+NULL parameter, a point lookup that misses) is the row of no rows under its
+`HAVING`. A `HAVING` is an `if` block in either form, since a streamed
+group is given inside its input's loop. Its columns are I64 and BOOLEAN,
+the types a local holds, read from a row or from a covering scan's entry,
+as `bc_key_part_i64` or `bc_key_part_bool`: a stream holds no row, so it
+may cover where a structure may not.
+
+```c
+bool st0 = false;
+int64_t kv0_0 = 0;
+int64_t x0_0 = 0;
+bc_agg d0_0 = bc_agg_open(cx, 1);  // COUNT(DISTINCT) values seen per group
+/* the input's loop, in a's order */
+    int64_t rk0_0 = bc_col_i64(cx, row, COL_4_0);
+    if (st0 && (rk0_0 != kv0_0)) {
+      /* the group given */
+      x0_0 = 0;
+      bc_agg_clear(cx, d0_0);
+    }
+    kv0_0 = rk0_0;
+    st0 = true;
+    /* v's key alone, new to d0_0: ++x0_0 */
+```
+
+**Interesting orders.** A plan's rows come in groups (`Access::grouped`,
+`Candidate::streams`) when its first table's scan has the `GROUP BY`'s
+columns, but those its `WHERE` makes constant, as its parts after its
+equality prefix, in any order and direction, NULLs split or not, and each
+table after it is a lookup by key; or when it has at most one row. A full
+scan of an index is built for that order too; with no `GROUP BY` there is
+no such order, every plan gives the one group, and no full scan is built
+for it. The search keeps the
+cheapest plan per set of tables and per that property, as per the `ORDER
+BY`'s order. A streamed plan gives its groups in its rows' order, and a
+structure's groups come in the order of their first rows, which is also
+its rows' order: so either gives an `ORDER BY` of grouped columns where its
+rows come in that order, and a structure sorts its groups otherwise. A
+streamed plan that does not give it is not built.
+
+**Cost.**
+- Groups: the rows × 1/10 per key the `WHERE` does not make constant, at
+  least 1; 1 with none.
+- A structure: its input's cost, each row held at 1 + 0.3 (`kHashWeight`,
+  as a hash build), then a step per group; a `LIMIT` does not cut the
+  structure.
+- Streamed: its input's cost; under `LIMIT n` × n / the groups kept.
+- A `HAVING` keeps the groups at a filter's selectivity per conjunct; a
+  `COUNT(DISTINCT)` costs one per row; a sort of the groups, each at 1 +
+  0.5.
+- `SELECT a, count(*) FROM g GROUP BY a`, 1,000 rows, an index on a:
+  streamed in its order, covering, 1,000; the structure over any scan
+  costs more by 1,000 × 1.3 + 100.
+
+Each plan is finished as an ungrouped one is (`finish_prepared`). Choice
+points by costs are chosen as for any plan (*Choice points as built*), a
+streamed plan's second plan also giving the groups. A hash join takes the
+choice by the budget at its build, the cheapest plan without a hash join
+(of rows read where the structure holds them) its second plan, and none by
+costs at either side (*Hash joins as built*); one known not to fit is left
+out where another plan avoids it. Each branch gives the order the
+statement needs: where the groups are sorted, the sort is above the choice;
+where the hash join gives the `ORDER BY` by its order, its second plan
+sorts its rows by it, every row kept, since a structure's groups come in
+the order of their first rows, its sorters holding the rows of each table
+the groups read. Before, that second plan was never sorted, and past the
+count it gave the groups in its own order. So `SELECT t0.c2, count(*) FROM t0 JOIN
+t1 ON t0.c1 = t1.c1 GROUP BY t0.c2` under a small budget switches at the
+count the join alone does. Before, a grouped plan took its choice points
+by costs only, and a hash join under it ran past the budget.
+
+Every choice point counts its first plan's range as one rule says
+(`choice`, checked by `counts_first`): a NULL split counts its whole
+prefix, with no prefix its whole index, as a `Range` of two open bounds,
+since a scan of no prefix needs a range. A hash join built on a NULL split
+of no prefix used to count its prefix with none, which `check` refused.
+
+**The planner uses the budget** (*Memory*). The rows are at most the
+count of the input's range, so where a streamed plan of the statement
+avoids the structure, the structure over one table's range is the first
+plan of a choice point by the budget: the count of that range, a full
+scan's the whole table, limited to a count past which it may not fit.
+Below it the structure; from it the cheapest streamed plan. The count is
+`least_past` of what the structure holds, as a hash build's is: fixed,
+`kAggBytes` and a byte per slot, `kHashBytes` per table whose rows its
+groups hold, `kAggBytes` + 1 per `COUNT(DISTINCT)`, and `kSorterBytes`
+where it sorts its groups; and per row, as if each started a group and
+gave each `COUNT(DISTINCT)` a new value, what the plan API charges
+(`bc_agg_group`, `bc_hash_put`, `bc_sorter_add`):
+- the group: its key, `kGroupEntryBytes` and `kAggSlotBytes` per slot;
+- per held table: its row and `kHashEntryBytes`, and the group's key,
+  new to the hash table;
+- per `COUNT(DISTINCT)`: a key of the group's key, as a byte-string part,
+  and the value's part, `kGroupEntryBytes` and one slot;
+- in a sort: the sort key, the group's key as payload, `kSortEntryBytes`.
+
+A key part is at least its marker where it may be NULL, else the marker
+and its least value (`least_part_bytes`: 8 bytes for an integer, 1 for a
+BOOLEAN, 2 for an empty string), and a row at least `least_row_bytes`. So
+a structure under the count fits whenever its rows and key parts are no
+larger than those bounds. Counting each row a group and a new value is
+conservative, not the least count past the budget: where rows share groups
+or values, it switches to the stream at fewer rows than would fail, never
+at more. Counting the fixed amounts alone, as this slice first did, let a
+structure under the count fail with 54000 where the stream would have
+answered. One known to pass the budget, or a budget under the empty
+aggregate's, is left out there; where nothing streams, it runs, and past
+the budget fails with 54000.
+- `SELECT a, count(*) FROM g WHERE k < $1 GROUP BY a` under 10,000 bytes:
+  322 fixed and 233 per row (a's key at least its NULL marker), so k's
+  range counts against 42 when it runs.
+- `SELECT a, count(DISTINCT v) FROM g WHERE k < $1 GROUP BY a`: 644 fixed,
+  and per row 281 for the group and 195 for a value, against 20; the fixed
+  amounts alone gave 34.
+
+**AVG** is PostgreSQL's `numeric`: `numeric_div` of the sum by the count
+at the scale `select_div_scale` chooses, 16 significant digits or more,
+rounded half away from zero, which can pass 64 bits. So the plan emits the
+sum and the count, two `I64` result columns for one SQL column, and the
+API divides them as PostgreSQL does (`average_text`). Its type is a kind of
+its own, `SqlKind::Numeric`, PostgreSQL's numeric of no declared precision,
+which no column has; a result row carries its value as its text, and every
+reader of `Rows` (the Python binding, `pg_text`, the harness) decides by
+the kind. Before, it was a `Decimal` of precision 0 holding text, so a
+`Decimal` column had two representations, and a reader taking a `Decimal`
+as its scaled integer failed on an AVG. Its sum is
+an integer sum, as `SUM`'s, with its 64-bit limit (*Known differences*).
+
+### What the search refuses
+
+| # | Refused | Message |
+|---|---|---|
+| 1 | A `HAVING` comparison on a grouped DOUBLE or REAL column | `no plan: a filter on column "<column>", a REAL or DOUBLE PRECISION, is not supported yet` |
+
+Hash joins' refusals stand. A shape the search does not plan, which the
+binder never builds (an output or `ORDER BY` key not grouped, a `HAVING`
+that compares no key or aggregate), is refused as before (*What the
+search refuses*, slice 2).
+
+### Tests
+
+- **Golden plans.** None moved. New: `group_by_hash` (a structure, a
+  nullable key in a slot), `group_by_stream` (streamed in the primary
+  key's order), `group_by_stream_limit` (a key the `WHERE` makes constant,
+  and the `LIMIT` on the input loop and the last group), `group_by_held_row`
+  (a BYTEA key read from the group's first row), `group_by_having`
+  (`SUM`, `AVG`'s two columns, `HAVING count(*) > $2`), `group_by_sorted`
+  (the groups sorted, `keep` 3), `group_by_distinct`, `group_by_join`
+  (over a hash join), `group_by_double` and `aggregates_ungrouped` (one
+  group over no rows under its `HAVING`).
+- **Search** (`search_test`): fixed counts choose the stream in an index's
+  order or the structure; an `ORDER BY` the stream's order gives, reversed
+  or not, or a sort of the groups, and a `LIMIT` that makes the stream
+  cheaper; a key the `WHERE` makes constant; the choice by the budget, its
+  threshold, left out under the empty aggregate's bytes, and none where
+  nothing streams.
+- **`physical::check`** (`physical_test`): a structure needs a key, a
+  streamed key a local's type, a key read from a held row never a covering
+  scan's entry; a `HAVING`, a sort and the outputs name the groups' keys
+  and aggregates.
+- **The budget at run time** (`api_transaction_test`): compiled at 10 rows
+  under 64 KiB, run at 2,000 groups, the count takes the stream; grouped by
+  a column no index orders, 54000.
+- **AVG**: `average_text` against PostgreSQL 16's digits, and through the
+  API.
+- **The allocation-fault sweep** fails each allocation of four grouped
+  plans in turn (`embedded API: an allocation failure in a grouped plan is
+  BC_E_MEMORY or its rows`): a structure with a nullable key and `AVG`, a
+  held row with `COUNT(DISTINCT)`, `HAVING`, a sort and a `LIMIT`, one over
+  a hash join, and a stream.
+- **The proof machine** generates `GROUP BY` of one or two columns of any
+  type, mostly a key path's parts so that plans stream, with every
+  aggregate, `HAVING` of keys and aggregates, `ORDER BY` of the keys,
+  NULLS FIRST or LAST, and `LIMIT`; no `GROUP BY` with several
+  aggregates; and over joins (`group_by`, `group_by_join`). NULLs and
+  duplicates in keys and arguments come from the inserts, empty inputs from
+  the bounds. Alternatives agree runs every costed plan, both forms and
+  both branches of a choice point. The server's text, `AVG`'s digits
+  among it, must be PostgreSQL's. `test_group_by` runs the fixed cases.
+  Its model `join_served` now counts a second link on a key part as a
+  filter, which a DOUBLE refuses.
+- **The harness**, 2 warehouses, 4 threads, 30 s: 116,556 to 124,372 TPM
+  and 51,982 to 55,546 NOPM over three runs, and the consistency
+  conditions hold after each run and in `check`; the branch before it gave
+  124,922 TPM on the same container. Its statements' plans are unchanged.
+- **With the review's fixes**, after #600's final form was merged in:
+  - golden plans: `group_by_distinct` moved: its stream keys each value
+    alone and clears its values' aggregate as each group ends
+    (`bc_agg_clear`); its reads are the same. No other plan moved. New:
+    `group_by_dependent` (grouped by the primary key, a dependent integer
+    kept in locals, streamed in the key's order) and
+    `group_by_dependent_held` (a dependent string read from the group's
+    held row, the groups sorted by it, the group's key the primary key's
+    alone);
+  - search: a grouped query over a hash join takes the build's choice by
+    the budget at the join's threshold, and leaves a build known not to
+    fit out; a hash join built on a NULL split of no prefix counts the
+    whole index, and every plan passes `check`; a dependent column streams
+    by the primary key, and in a structure is a slot outside the group's
+    key; a BOOLEAN key streams from a covering entry, and the structure
+    over the same scan reads rows; with no `GROUP BY`, no index's full
+    scan is built for the groups; a key the `WHERE` makes constant is not
+    counted in the groups; a structure's threshold counts its keys', held
+    rows' and distinct values' bytes;
+  - `physical::check`: a stream may read a BOOLEAN key from a covering
+    entry, a structure may not; a dependent column is never a key, never
+    of a group of no key, and a sort, a `HAVING` and the outputs may name
+    it;
+  - plan API: `bc_agg_clear` drops every group, releases its bytes (held
+    flat across 200 groups) and makes their handles stale, and is refused
+    after `bc_agg_next`;
+  - the budget at run time: a streamed `COUNT(DISTINCT)` of 2,000 groups
+    runs under 64 KiB, which every group's values held would pass, and at
+    200 rows the count, at 137 by the values' bytes, takes the stream where
+    the fixed amounts' 232 would have taken the structure and failed;
+  - the harness, 2 warehouses, 4 threads, 30 s: 147,774 TPM and 65,848
+    NOPM, the consistency conditions holding after the run and in `check`;
+    no plan of its statements moved.
+- **With the second review's fixes:**
+  - golden plans: none moved, TPROC-C's included. New: `max_last_key` (a
+    lone `MAX`, one step of a reverse prefix scan), `aggregates_from_keys`
+    (`COUNT(*)`, `MIN` and `MAX` of one part: a count and two single
+    steps, no loop) and `max_desc_part` (a `DESC` part: still a loop over
+    the range);
+  - proof machine: a `GROUP BY` over a hash join, `ORDER BY` a grouped
+    column, every branch forced by alternatives agree; past the count the
+    nested loop sorts its rows (`test_a_grouped_hash_join_and_its_other_plan_both_order_the_groups`,
+    which returned the groups out of order before); a `HAVING` that
+    reuses the `WHERE`'s `$n` (`having_reuses_a_parameter`,
+    `test_a_having_parameter_typed_by_the_where`, refused before);
+  - search: `MAX`, and `COUNT(*)`, `MIN` and `MAX` together, answered from
+    the keys with no loop; a residual filter, another aggregate, a second
+    column, a `GROUP BY` or a `HAVING` loops;
+  - `physical::check`: `KeyAggregates`' outputs are `COUNT(*)`, or `MIN`
+    or `MAX` of its part, from a forward range of the object and prefix
+    counted; a grouped aggregate over a row sort reads only rows a sorter
+    holds;
+  - plan API: after `bc_agg_clear` a new group takes index 0 again, under
+    a new generation, and the dropped group's handle of the same index is
+    `BC_E_HANDLE`; so 2^32 limits the groups held, not those ever made;
+  - the allocation-fault sweep: a streamed `COUNT(DISTINCT)`, its values'
+    aggregate cleared per group, so `bc_agg_group` allocates after a clear;
+  - `AVG` is `SqlKind::Numeric` in `Rows`, a `SUM` of a DECIMAL a
+    `Decimal` and its scaled integer;
+  - the harness, 2 warehouses, 4 threads, 30 s: 168,956 TPM and 75,496
+    NOPM, the consistency conditions holding after the run and in `check`;
+    no plan of its statements moved.
 
 ## Proposed `CONTRACT.md` changes
 

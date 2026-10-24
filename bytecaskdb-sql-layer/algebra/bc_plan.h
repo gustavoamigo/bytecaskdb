@@ -304,6 +304,7 @@ bool         bc_hash_next(bc_ctx *, bc_hash_iter, bc_view *payload);
 
 bc_agg    bc_agg_open(bc_ctx *, uint32_t slots);
 bc_group  bc_agg_group(bc_ctx *, bc_agg, bc_view group_key);
+void      bc_agg_clear(bc_ctx *, bc_agg);                              /* drops every group, releasing its bytes */
 void      bc_agg_add_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);   /* overflow → BC_E_ARITH */
 void      bc_agg_add_f64(bc_ctx *, bc_group, uint32_t slot, double);
 void      bc_agg_min_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);

@@ -196,6 +196,41 @@ void slot_sums(bc_ctx* cx) {
     bc_emit_end(cx);
   }
 }
+// A streamed COUNT(DISTINCT), as codegen prints one: t's rows in id order
+// come in groups by qty > 10, each value, param 0 or empty, kept in an
+// aggregate keyed by the value alone and cleared as each group ends, so
+// bc_agg_group allocates again after a clear.
+void streamed_distinct(bc_ctx* cx) {
+  bc_agg d = bc_agg_open(cx, 1);
+  bool started = false;
+  int64_t key = 0;
+  int64_t seen = 0;
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    int64_t q = bc_col_i64(cx, row, kQtyCol);
+    int64_t k = q > 10 ? 1 : 0;
+    if (started && k != key) {
+      bc_emit_begin(cx);
+      bc_emit_i64(cx, key);
+      bc_emit_i64(cx, seen);
+      bc_emit_end(cx);
+      seen = 0;
+      bc_agg_clear(cx, d);
+    }
+    key = k;
+    started = true;
+    bc_group g = bc_agg_group(cx, d, q >= 20 ? bc_param_bytes(cx, 0) : bc_empty(cx));
+    if (bc_agg_null(cx, g, 0)) ++seen;
+    bc_agg_count(cx, g, 0);
+  }
+  if (started) {
+    bc_emit_begin(cx);
+    bc_emit_i64(cx, key);
+    bc_emit_i64(cx, seen);
+    bc_emit_end(cx);
+  }
+}
 // NULL for the NOT NULL id: by parameter, by bc_row_set_null, left unset.
 void null_id_param(bc_ctx* cx) {
   bc_row r = bc_row_begin(cx, kTbl);
@@ -276,6 +311,12 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
        {PhysType::I64, PhysType::I64, PhysType::I64},
        BC_OK,
        {{std::int64_t{1}, std::int64_t{10}, std::int64_t{10}}, {std::int64_t{2}, std::int64_t{50}, std::int64_t{30}}}},
+      {"a streamed COUNT(DISTINCT), its values cleared per group",
+       streamed_distinct,
+       {bytes("v")},
+       {PhysType::I64, PhysType::I64},
+       BC_OK,
+       {{std::int64_t{0}, std::int64_t{1}}, {std::int64_t{1}, std::int64_t{1}}}},
       {"update, qty + $2 leaves BIGINT",
        add_to_qty,
        {std::int64_t{3}, std::numeric_limits<std::int64_t>::max()},

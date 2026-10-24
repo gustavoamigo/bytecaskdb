@@ -79,7 +79,8 @@ auto exact_scale(const SqlType& t) -> std::optional<std::uint8_t> {
     case SqlKind::Varchar:
     case SqlKind::Timestamp:
     case SqlKind::Date:
-    case SqlKind::Time: return std::nullopt;
+    case SqlKind::Time:
+    case SqlKind::Numeric: return std::nullopt;
   }
   return std::nullopt;
 }
@@ -342,7 +343,10 @@ auto prune(Node& n, std::vector<ColumnRef> needed) -> bool {
         } else if constexpr (std::is_same_v<T, Aggregate>) {
           std::vector<ColumnRef> cols;
           for (const auto& o : op.aggs) columns_of(o.expr, cols);
-          changed = prune(*op.input, below(cols, false)) || changed;
+          for (const auto& g : op.group_by) columns_of(g, cols);
+          for (const auto& d : op.dependent) columns_of(d, cols);
+          // A HAVING above reads aggregates' arguments the select list may not.
+          changed = prune(*op.input, below(cols, true)) || changed;
         } else if constexpr (std::is_same_v<T, Sort>) {
           std::vector<ColumnRef> cols;
           for (const auto& k : op.keys) columns_of(k.expr, cols);

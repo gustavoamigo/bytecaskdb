@@ -176,7 +176,12 @@ def join_served(a: Table, conj_a: list[tuple], b: Table, conj_b: list[tuple], on
         inner_floats = any(is_float(it, c) for c in icols) or any(is_float(ot, c) for c in ocols)
         if not any(i is None and k not in icols for i, k in zip(keyed_by_param, it.pk)):
             inner_filters = [c for i, (c, _, _) in enumerate(norm) if i not in keyed_by_param]
-            unused_on = [ic for ic in icols if ic not in [k for i, k in zip(keyed_by_param, it.pk) if i is None]]
+            # A key part one link names keys it; a second link on the part
+            # is a filter.
+            unused_on = list(icols)
+            for i, k in zip(keyed_by_param, it.pk):
+                if i is None:
+                    unused_on.remove(k)
             if not any(is_float(it, c) for c in inner_filters + unused_on):
                 return True
         # The inner table by its own scan, the join's conjuncts filtering it.
@@ -271,6 +276,19 @@ class Calc:
 
     value: object
     k: int
+
+
+@dataclasses.dataclass(frozen=True)
+class Reuse:
+    """A HAVING conjunct's operand that is the WHERE's $n, typed there, as
+    PostgreSQL types a parameter by its first use."""
+
+    n: int
+
+
+# Integer types of scale 0: a $n of one compares exactly with a key or an
+# aggregate of another (docs/frontend_design.md, *GROUP BY and HAVING*).
+INTEGRAL = ("smallint", "integer", "bigint")
 
 
 def param_value(v):
@@ -736,6 +754,238 @@ class SqlMachine(RuleBasedStateMachine):
         why = o.same_rows(layer.rows, full.rows, key, limit)
         assert why is None, f"{sql} {params!r}: {why}: the layer returned {layer.rows}, PostgreSQL {full.rows}"
         self.alternatives_agree(sql, params, types, full.rows, key, limit)
+
+    def grouped(self, names: list[str], where: list[tuple[str, str, str, object]], group: list[tuple[str, str]],
+                aggs: list[tuple], having: list[tuple] = (), order: list[tuple] = (), limit: int | None = None,
+                links: list[tuple[str, str]] = ()) -> None:
+        """SELECT the GROUP BY's columns (table, column), then each aggregate
+        (fn, table, column or None for COUNT(*), DISTINCT), FROM one table or
+        two, the second's column equal to the first's in each link, WHERE each
+        (table, column, op, value), GROUP BY `group`, HAVING each (("col",
+        table, column) or ("agg", aggregate), op, value), ORDER BY each
+        (table, column, DESC, NULLS FIRST), LIMIT: on both sides when the
+        planner serves it, else the layer must refuse it with no plan. A
+        group of a DOUBLE or REAL key holding -0.0 and 0.0 shows either, as
+        PostgreSQL's does by its plan: both compare as 0.0."""
+        tables = [self.tables[n] for n in names]
+        by_name = {t.name: t for t in tables}
+        conds, pg_conds, params, types = [], [], [], []
+        def add(text, pg_text, v, ty):
+            conds.append(text)
+            pg_conds.append(pg_text)
+            params.append(param_value(v))
+            types.append(ty)
+        for tn, c, op, v in where:
+            t = by_name[tn]
+            n = len(params) + 1
+            add(compared(t, c, op, v, n, False, True), compared(t, c, op, v, n, True, True), v, t.column(c).type)
+        link_text = [f"{names[1]}.{c} = {names[0]}.{v}" for c, v in links]
+        def agg_text(a):
+            fn, tn, c, distinct = a
+            return f"{fn}(*)" if c is None else f"{fn}({'DISTINCT ' if distinct else ''}{tn}.{c})"
+        hav, pg_hav = [], []
+        for what, op, v in having:
+            n = len(params) + 1
+            if isinstance(v, Reuse):
+                lhs = f"{what[1]}.{what[2]}" if what[0] == "col" else agg_text(what[1])
+                hav.append(f"{lhs} {op} ${v.n}")
+                pg_hav.append(f"{lhs} {op} ${v.n}")
+                continue
+            if what[0] == "col":
+                t = by_name[what[1]]
+                hav.append(compared(t, what[2], op, v, n, False, True))
+                pg_hav.append(compared(t, what[2], op, v, n, True, True))
+                params.append(v)
+                types.append(t.column(what[2]).type)
+                continue
+            fn, tn, c, _ = what[1]
+            ty = o.BIGINT
+            pg_param = f"${n}"
+            if fn == "sum" and by_name[tn].column(c).type.kind == "decimal":
+                ty = by_name[tn].column(c).type
+            elif fn in ("min", "max"):
+                ty = by_name[tn].column(c).type
+                pg_param = typed(by_name[tn], c, n)
+            hav.append(f"{agg_text(what[1])} {op} ${n}")
+            pg_hav.append(f"{agg_text(what[1])} {op} {pg_param}")
+            params.append(v)
+            types.append(ty)
+        targets = [f"{tn}.{c}" for tn, c in group] + [agg_text(a) for a in aggs]
+        if not targets:
+            return
+        def text(cs, hs):
+            w = cs + link_text
+            out = f"SELECT {', '.join(targets)} FROM {', '.join(names)}" + (f" WHERE {' AND '.join(w)}" if w else "")
+            if group:
+                out += " GROUP BY " + ", ".join(f"{tn}.{c}" for tn, c in group)
+            if hs:
+                out += " HAVING " + " AND ".join(hs)
+            if order:
+                out += " ORDER BY " + order_text([(f"{tn}.{c}", *rest) for tn, c, *rest in order])
+            return out
+        tail = f" LIMIT {limit}" if limit is not None else ""
+        sql = text(conds, hav) + tail
+        pg_sql = text(pg_conds, pg_hav)
+        conj = {n: [(c, op, isinstance(v, Calc)) for tn, c, op, v in where if tn == n] for n in names}
+        if len(tables) == 1:
+            ok = served(tables[0], conj[names[0]])
+        else:
+            ok = join_served(tables[0], conj[names[0]], tables[1], conj[names[1]], [(v, c) for c, v in links])
+        # A HAVING on a DOUBLE or REAL key is a filter on one.
+        ok = ok and not any(w[0] == "col" and is_float(by_name[w[1]], w[2]) for w, _, _ in having)
+        if not ok:
+            self.no_plan(names[0], sql, params, types)
+            return
+        layer = self.layer(sql, params, types)
+        full = o.run_pg(self.pg.conn, pg_sql, params)
+        assert layer.error == full.error, (
+            f"{sql} {params!r}: the layer {layer.error or 'ran it'} ({layer.detail}), "
+            f"PostgreSQL {full.error or 'ran it'} ({full.detail})")
+        if layer.error is not None:
+            return
+        floats = [i for i, (tn, c) in enumerate(group) if is_float(by_name[tn], c)]
+        def norm(rows):
+            return tuple(tuple(0.0 if i in floats and v == 0 else v for i, v in enumerate(r)) for r in rows)
+        key = (lambda r: tuple(r[group.index((tn, c))] for tn, c, *_ in order)) if order else None
+        want = norm(full.rows)
+        why = o.same_rows(norm(layer.rows), want, key, limit)
+        assert why is None, f"{sql} {params!r}: {why}: the layer returned {layer.rows}, PostgreSQL {full.rows}"
+        if layer.text and full.text and limit is None and not floats:
+            # The server's text, an AVG's digits among it, is PostgreSQL's.
+            assert layer.text[0] == full.text[0], f"{sql}: type OIDs {layer.text[0]}, PostgreSQL {full.text[0]}"
+            assert collections.Counter(layer.text[1]) == collections.Counter(full.text[1]), (
+                f"{sql} {params!r}: the server sent {layer.text[1]}, PostgreSQL {full.text[1]}")
+        if self.txn is None:
+            layer_params = tuple(o.to_layer(v, t) for v, t in zip(params, types))
+            for i, alt in enumerate(self.db._alternatives(sql, layer_params)):
+                why = o.same_rows(norm(tuple(alt["rows"])), want, key, limit)
+                assert why is None, f"{sql} {params!r}: plan {i}: {why}: it returned {alt['rows']}, PostgreSQL {full.rows}"
+
+    def draw_aggs(self, data, tables: list[Table], most: int) -> list[tuple]:
+        """Up to `most` aggregates of the tables' columns: COUNT(*), COUNT and
+        COUNT(DISTINCT) of any column, SUM and AVG of the SUMMED types (a
+        BIGINT's total leaves int64), MIN and MAX of the MINIMISED ones."""
+        choices = [("count", None, None, False)]
+        for t in tables:
+            for c in t.columns:
+                choices += [("count", t.name, c.name, False), ("count", t.name, c.name, True)]
+                if c.type.sql in SUMMED:
+                    choices += [("sum", t.name, c.name, False), ("avg", t.name, c.name, False)]
+                if c.type.sql in MINIMISED:
+                    choices += [("min", t.name, c.name, False), ("max", t.name, c.name, False)]
+        return data.draw(st.lists(st.sampled_from(choices), max_size=most, unique=True), label="aggregates")
+
+    def draw_having(self, data, group: list[tuple[str, str]], aggs: list[tuple]) -> list[tuple]:
+        """Up to two HAVING conjuncts: a key, COUNT, SUM, MIN or MAX compared
+        with a parameter, of a value of its type, often from a row."""
+        options = [("col", tn, c) for tn, c in group] + [("agg", a) for a in aggs if a[0] != "avg"]
+        if not options:
+            return []
+        out = []
+        for i in range(data.draw(st.integers(0, 2), label="HAVING conjuncts")):
+            what = data.draw(st.sampled_from(options), label=f"having {i}")
+            op = data.draw(st.sampled_from(["=", "<", "<=", ">", ">="]), label=f"having {i} op")
+            if what[0] == "col":
+                ty = self.tables[what[1]].column(what[2]).type
+                rows = self.existing_rows(self.tables[what[1]])
+                at = [c.name for c in self.tables[what[1]].columns].index(what[2])
+                v = data.draw((st.sampled_from([r[at] for r in rows]) if rows else st.nothing()) | st.none() | values(ty),
+                              label=f"having {i} value")
+            else:
+                fn, tn, c, _ = what[1]
+                ty = self.tables[tn].column(c).type if c is not None else o.BIGINT
+                if fn == "count":
+                    v = data.draw(st.integers(-1, 6), label=f"having {i} count")
+                elif fn == "sum" and ty.kind == "decimal":
+                    v = data.draw(st.integers(-2000, 2000).map(lambda n: decimal.Decimal(n).scaleb(-ty.scale)), label="sum")
+                elif fn == "sum":
+                    v = data.draw(st.integers(-200000, 200000), label=f"having {i} sum")
+                else:
+                    v = data.draw(values(ty), label=f"having {i} value")
+            out.append((what, op, v))
+        return out
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
+    def group_by(self, data):
+        # GROUP BY one or two columns of one table, any of them, under a key
+        # path's conjuncts or a full scan: in a structure, or streamed where
+        # an index orders the groups; with HAVING, ORDER BY of the keys and a
+        # LIMIT. Or no GROUP BY: several aggregates, one row.
+        t = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="table")]
+        where, parts, run = self.where_on_a_path(data, t)
+        names = [c.name for c in t.columns]
+        if data.draw(st.integers(0, 4), label="grouped?"):
+            # Mostly a path's parts after its prefix: an order that streams.
+            if parts[run:] and data.draw(st.booleans(), label="the path's parts?"):
+                cols = [c for c, _ in parts[run:run + data.draw(st.integers(1, 2), label="keys")]]
+                cols = list(dict.fromkeys(cols))
+            else:
+                cols = data.draw(st.lists(st.sampled_from(names), min_size=1, max_size=2, unique=True), label="keys")
+        else:
+            cols = []
+        group = [(t.name, c) for c in data.draw(st.permutations(cols), label="key order")]
+        aggs = self.draw_aggs(data, [t], 3 if group else 4)
+        if not group and not aggs:
+            aggs = [("count", None, None, False)]
+        having = self.draw_having(data, group, aggs)
+        order = []
+        if group and data.draw(st.booleans(), label="ORDER BY?"):
+            keys = data.draw(st.lists(st.sampled_from(group), min_size=1, unique=True), label="order")
+            order = [(tn, c, data.draw(st.booleans(), label="desc"), data.draw(st.sampled_from([None, True, False]),
+                                                                              label="nulls")) for tn, c in keys]
+        limit = data.draw(st.none() | st.sampled_from([0, 1, 2, 5]), label="limit")
+        self.grouped([t.name], [(t.name, c, op, v) for c, op, v in where], group, aggs, having, order, limit)
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
+    def having_reuses_a_parameter(self, data):
+        # A HAVING that compares a key or an aggregate with a $n the WHERE
+        # compares an integer column with: typed by its first use, the
+        # WHERE's, on both sides.
+        t = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="table")]
+        where, _, _ = self.where_on_a_path(data, t)
+        reusable = [i for i, (c, _, v) in enumerate(where) if t.column(c).type.sql in INTEGRAL and not isinstance(v, Calc)]
+        if not reusable:
+            return
+        at = data.draw(st.sampled_from(reusable), label="reused")
+        names = [c.name for c in t.columns]
+        group = [(t.name, c) for c in data.draw(st.lists(st.sampled_from(names), max_size=2, unique=True), label="keys")]
+        aggs = self.draw_aggs(data, [t], 2)
+        options = [("col", tn, c) for tn, c in group if t.column(c).type.sql in INTEGRAL]
+        options += [("agg", a) for a in aggs + [("count", None, None, False)]
+                    if a[0] == "count" or (a[0] in ("sum", "min", "max") and t.column(a[2]).type.sql in INTEGRAL)]
+        what = data.draw(st.sampled_from(options), label="HAVING") if options else ("agg", ("count", None, None, False))
+        if what[0] == "agg" and what[1] not in aggs:
+            aggs = aggs + [what[1]]
+        op = data.draw(st.sampled_from(["=", "<", "<=", ">", ">="]), label="HAVING op")
+        self.grouped([t.name], [(t.name, c, o_, v) for c, o_, v in where], group, aggs, [(what, op, Reuse(at + 1))])
+
+    @precondition(lambda self: len(self.tables) >= 2)
+    @rule(data=st.data())
+    def group_by_join(self, data):
+        # A join no key reaches, or one by a key, linked by an equality of
+        # columns of one type, grouped by a column of either table.
+        a_name, b_name = data.draw(st.permutations(sorted(self.tables)), label="tables")[:2]
+        a, b = self.tables[a_name], self.tables[b_name]
+        pairs = [(x.name, y.name) for x in b.columns for y in a.columns if y.type.sql == x.type.sql]
+        if not pairs:
+            return
+        links = data.draw(st.lists(st.sampled_from(pairs), min_size=1, max_size=2, unique=True), label="links")
+        where_a, _, _ = self.where_on_a_path(data, a)
+        where_b, _, _ = self.where_on_a_path(data, b)
+        columns = [(t.name, x.name) for t in (a, b) for x in t.columns]
+        group = data.draw(st.lists(st.sampled_from(columns), max_size=2, unique=True), label="keys")
+        aggs = self.draw_aggs(data, [a, b], 3)
+        if not group and not aggs:
+            aggs = [("count", None, None, False)]
+        having = self.draw_having(data, group, aggs)
+        order = []
+        if group and data.draw(st.booleans(), label="ORDER BY?"):
+            order = [(tn, c, data.draw(st.booleans(), label="desc"), None) for tn, c in group[:1]]
+        where = [(a_name, c, op, v) for c, op, v in where_a] + [(b_name, c, op, v) for c, op, v in where_b]
+        self.grouped([a_name, b_name], where, group, aggs, having, order,
+                     data.draw(st.none() | st.sampled_from([0, 2]), label="limit"), links=links)
 
     def begin(self) -> None:
         # PostgreSQL's REPEATABLE READ, like the layer's, takes its snapshot
@@ -2512,5 +2762,92 @@ def test_full_scans_and_sorts(dsn):
         m.write("t0", [("c1", "<", "b")])
         m.write("t1", [], ("c1", "=", 7))
         m.check()
+    finally:
+        m.teardown()
+
+
+def test_group_by(dsn):
+    """GROUP BY one or two columns, NULLs and duplicates in the keys and the
+    aggregated columns, of every aggregate, with HAVING, ORDER BY of the keys
+    and LIMIT; in a structure or streamed in an index's order; over no rows;
+    without GROUP BY, one row; over a join. Every plan agrees."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER), Column("c2", o.TEXT),
+                              Column("c3", o.numeric(6, 2)), Column("c4", o.DOUBLE)], ["c0"]))
+        m.create_index("t0", Index("t0_c1", [("c1", False)]))
+        rows = ((1, 10, "a", decimal.Decimal("1.25"), 0.0), (2, 10, "b", None, -0.0), (3, None, "a", decimal.Decimal("-3.10"), math.nan),
+                (4, 20, None, decimal.Decimal("2.00"), 1.5), (5, None, "c", None, None), (6, 10, "a", decimal.Decimal("0.05"), 0.0))
+        for c0, c1, c2, c3, c4 in rows:
+            m.insert("t0", {"c0": c0, "c1": c1, "c2": c2, "c3": c3, "c4": c4}, all_columns=True)
+        m.create(Table("t1", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER)], ["c0"]))
+        for c0, c1 in ((1, 10), (2, 10), (3, None), (4, 20)):
+            m.insert("t1", {"c0": c0, "c1": c1}, all_columns=True)
+        every = [("count", None, None, False), ("count", "t0", "c2", False), ("count", "t0", "c2", True),
+                 ("sum", "t0", "c3", False), ("avg", "t0", "c1", False), ("avg", "t0", "c3", False),
+                 ("min", "t0", "c3", False), ("max", "t0", "c1", False)]
+        for where in ([], [("t0", "c0", ">=", 2)], [("t0", "c0", ">", 100)], [("t0", "c1", "=", 10)]):
+            for group in ([("t0", "c1")], [("t0", "c2")], [("t0", "c4")], [("t0", "c1"), ("t0", "c2")], []):
+                m.grouped(["t0"], where, group, every)
+                m.grouped(["t0"], where, group, every[:2], having=[(("agg", every[0]), ">", 1)])
+                if group:
+                    m.grouped(["t0"], where, group, every[3:5], order=[(*group[0], True, None)], limit=2)
+                    m.grouped(["t0"], where, group, [], having=[(("agg", every[6]), "<", decimal.Decimal("2.00"))],
+                              order=[(*g, False, True) for g in group])
+        m.grouped(["t0"], [], [("t0", "c1")], every[:1], having=[(("col", "t0", "c1"), ">=", 10)])
+        # A HAVING on a DOUBLE key is a filter on one: no plan.
+        m.grouped(["t0"], [], [("t0", "c4")], every[:1], having=[(("col", "t0", "c4"), ">", 0.0)])
+        for links in ([("c1", "c1")], [("c0", "c0")]):
+            m.grouped(["t0", "t1"], [], [("t1", "c1")], every[:4], links=links)
+            m.grouped(["t0", "t1"], [("t0", "c0", ">=", 2)], [("t0", "c2")], every[:2], links=links,
+                      order=[("t0", "c2", False, None)], limit=1)
+    finally:
+        m.teardown()
+
+
+def test_a_grouped_hash_join_and_its_other_plan_both_order_the_groups(dsn):
+    """GROUP BY over a hash join no key reaches, ORDER BY a grouped column:
+    the hash join probes t0 in its key's order, so its groups come in order,
+    and its choice point by the budget takes, past the count, the nested
+    loop, which reads t1 first. That branch sorts its rows too. Alternatives
+    agree forces both branches."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER)], ["c0"]))
+        m.create(Table("t1", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER)], ["c0"]))
+        for k in range(40):
+            m.insert("t0", {"c0": k * 7 % 40, "c1": k % 4}, all_columns=True)
+        for k in range(3):
+            m.insert("t1", {"c0": k, "c1": k}, all_columns=True)
+        count = ("count", None, None, False)
+        for desc in (False, True):
+            for limit in (None, 3):
+                m.grouped(["t0", "t1"], [], [("t0", "c0")], [count], order=[("t0", "c0", desc, None)], limit=limit,
+                          links=[("c1", "c1")])
+        assert len(m.db._alternatives(
+            "SELECT t0.c0, count(*) FROM t0, t1 WHERE t1.c1 = t0.c1 GROUP BY t0.c0 ORDER BY t0.c0", ())) >= 2
+    finally:
+        m.teardown()
+
+
+def test_a_having_parameter_typed_by_the_where(dsn):
+    """$1 compared with an INTEGER or SMALLINT column in the WHERE, then with
+    COUNT(*), a SUM, a MAX or a key in the HAVING: PostgreSQL types it by its
+    first use, the WHERE's, and so does the layer."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.SMALLINT), Column("c2", o.BIGINT)],
+                       ["c0"]))
+        for k in range(12):
+            m.insert("t0", {"c0": k, "c1": k % 3, "c2": None if k % 5 == 0 else k * 10}, all_columns=True)
+        count = ("count", None, None, False)
+        havings = (("agg", count), ("agg", ("sum", "t0", "c1", False)), ("agg", ("max", "t0", "c2", False)),
+                   ("col", "t0", "c1"))
+        for col, op in (("c0", ">"), ("c1", "<=")):
+            for v in (0, 1, 2, None):
+                for what in havings:
+                    aggs = [count] + ([what[1]] if what[0] == "agg" and what[1] != count else [])
+                    m.grouped(["t0"], [("t0", col, op, v)], [("t0", "c1")], aggs, [(what, ">", Reuse(1))])
+                m.grouped(["t0"], [("t0", col, op, v)], [], [count], [(("agg", count), ">", Reuse(1))])
     finally:
         m.teardown()

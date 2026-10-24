@@ -27,6 +27,7 @@ module;
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <algorithm>
 #include <functional>
 #include <limits>
 #include <map>
@@ -65,9 +66,18 @@ using Value = bc_value;  // NULL, BIGINT, DOUBLE PRECISION, BOOLEAN, BYTEA
 using bytecask::sql::DdlRefused;
 using bytecask::DbClosed;
 
+// PostgreSQL's AVG of an exact number, as numeric's text: its numeric_div
+// of the sum (the total at the argument's `scale`) by the count, the scale
+// select_div_scale chooses (at least 16 significant digits), rounded half
+// away from zero. More digits than 64 bits hold, so a result row carries it
+// as text (Rows).
+[[nodiscard]] auto average_text(std::int64_t sum, std::int64_t count, std::uint8_t scale) -> std::string;
+
 struct Rows {
   std::vector<std::string> columns;
-  std::vector<SqlType> types;  // each column's SQL type, as the catalog declares it
+  // Each column's SQL type, as the catalog declares it. A NUMERIC's value,
+  // an AVG's, is its text, as bytes: more digits than an int64_t holds.
+  std::vector<SqlType> types;
   std::vector<std::vector<Value>> rows;
   std::int64_t affected{-1};  // INSERT, UPDATE, DELETE: rows changed
 };
@@ -513,6 +523,7 @@ private:
   // BC_C_RANGE for a value outside its parameter's SQL type.
   static void check_params(const Compiled& c, const std::vector<Value>& params);
   static auto results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows;
+  static auto quotients(const GeneratedPlan& p, std::vector<Value> values) -> std::vector<Value>;
   // An autocommit context: one per call in flight, kept for the next.
   [[nodiscard]] auto acquire_context() -> bc_ctx*;
   void release_context(bc_ctx* cx) noexcept;
@@ -615,6 +626,61 @@ constexpr std::string_view kDdlInProgress = "could not serialize access: another
 constexpr int kTxnPlanAttempts = 3;
 
 }  // namespace
+
+auto average_text(std::int64_t sum, std::int64_t count, std::uint8_t scale) -> std::string {
+  // The magnitude, INT64_MIN's too.
+  const auto num = sum < 0 ? 0 - static_cast<std::uint64_t>(sum) : static_cast<std::uint64_t>(sum);
+  const auto den = static_cast<std::uint64_t>(count);
+  // select_div_scale's weights: of each operand's first non-zero base-10000
+  // digit, and that digit. A zero has weight 0 and digit 0.
+  auto weight_of = [](std::uint64_t v, std::uint8_t s) -> std::pair<int, std::uint64_t> {
+    if (v == 0) return {0, 0};
+    auto digits = std::to_string(v);
+    if (digits.size() > s) {
+      // An integer part: its base-10000 digits, aligned at the point.
+      auto whole = digits.substr(0, digits.size() - s);
+      auto w = static_cast<int>((whole.size() - 1) / 4);
+      return {w, std::stoull(whole.substr(0, whole.size() - static_cast<std::size_t>(w) * 4))};
+    }
+    // Only a fraction: its base-10000 digits after the point.
+    auto frac = std::string(s - digits.size(), '0') + digits;
+    frac.append((4 - frac.size() % 4) % 4, '0');
+    for (std::size_t i = 0; i < frac.size(); i += 4) {
+      auto d = std::stoull(frac.substr(i, 4));
+      if (d != 0) return {-static_cast<int>(i / 4) - 1, d};
+    }
+    return {0, 0};
+  };
+  auto [w1, d1] = weight_of(num, scale);
+  auto [w2, d2] = weight_of(den, 0);
+  auto qweight = w1 - w2;
+  if (d1 <= d2) --qweight;
+  auto rscale = std::clamp(std::max(16 - qweight * 4, static_cast<int>(scale)), 0, 1000);
+  // num / den's digits, the quotient's and then its fraction's, one past
+  // rscale once moved `scale` places: the last one rounds.
+  auto q = num / den;
+  unsigned __int128 r = num % den;
+  auto digits = std::to_string(q);
+  for (auto i = 0; i < rscale - static_cast<int>(scale) + 1; ++i) {
+    r *= 10;
+    digits.push_back(static_cast<char>('0' + static_cast<int>(r / den)));
+    r %= den;
+  }
+  auto up = digits.back() >= '5';
+  digits.pop_back();
+  for (auto i = digits.size(); up && i-- > 0;) {
+    up = digits[i] == '9';
+    digits[i] = up ? '0' : static_cast<char>(digits[i] + 1);
+  }
+  if (up) digits.insert(digits.begin(), '1');
+  auto frac_digits = static_cast<std::size_t>(rscale);
+  if (digits.size() <= frac_digits) digits.insert(0, frac_digits + 1 - digits.size(), '0');
+  auto whole = digits.substr(0, digits.size() - frac_digits);
+  whole.erase(0, std::min(whole.find_first_not_of('0'), whole.size() - 1));
+  auto text = whole + (frac_digits > 0 ? "." + digits.substr(digits.size() - frac_digits) : "");
+  auto zero = std::ranges::all_of(digits, [](char c) { return c == '0'; });
+  return (sum < 0 && !zero ? "-" : "") + text;
+}
 
 namespace {
 
@@ -1132,10 +1198,36 @@ auto Database::results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows {
         bc_ctx_reset(cx);
         throw ExecError("malformed result row: column " + std::to_string(values.error()), BC_E_CORRUPT);
       }
-      out.rows.push_back(std::move(*values));
+      out.rows.push_back(quotients(p, std::move(*values)));
     }
   }
   bc_ctx_reset(cx);
+  return out;
+}
+
+// A result row's NUMERICs, each two of the plan's columns, its sum and
+// count, as one: NULL, or its text.
+auto Database::quotients(const GeneratedPlan& p, std::vector<Value> values) -> std::vector<Value> {
+  auto numeric = [](const SqlType& t) { return t.kind == SqlKind::Numeric; };
+  if (std::ranges::none_of(p.result_sql, numeric)) return values;
+  std::vector<Value> out;
+  std::size_t at = 0;
+  for (const auto& t : p.result_sql) {
+    if (!numeric(t)) {
+      out.push_back(std::move(values[at++]));
+      continue;
+    }
+    const auto* sum = std::get_if<std::int64_t>(&values[at]);
+    const auto* count = std::get_if<std::int64_t>(&values[at + 1]);
+    at += 2;
+    if (sum == nullptr || count == nullptr || *count <= 0) {
+      out.emplace_back(std::monostate{});
+      continue;
+    }
+    auto text = average_text(*sum, *count, t.scale);
+    auto b = std::as_bytes(std::span{text.data(), text.size()});
+    out.emplace_back(Bytes(b.begin(), b.end()));
+  }
   return out;
 }
 
