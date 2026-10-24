@@ -62,9 +62,6 @@ struct bc_params {
 void bc_ctx_before_commit_for_testing(bc_ctx* cx, std::function<void()> hook);
 // Test only: the bytes the context's statement is charged now.
 std::uint64_t bc_ctx_held_for_testing(const bc_ctx* cx);
-// Test only: what the context's autocommit executions hold their write set
-// to, in place of the engine's 1 GiB batch limit, from now on.
-void bc_ctx_write_bound_for_testing(bc_ctx* cx, std::uint64_t bytes);
 #endif
 
 }  // extern "C++"
@@ -76,7 +73,6 @@ export using ::bc_ctx_affected;
 #ifdef BYTECASK_SQL_TESTING
 export using ::bc_ctx_before_commit_for_testing;
 export using ::bc_ctx_held_for_testing;
-export using ::bc_ctx_write_bound_for_testing;
 #endif
 
 export namespace bytecask::sql {
@@ -92,6 +88,37 @@ inline constexpr std::uint64_t kKeyEntryBytes = 64;
 inline constexpr std::uint64_t kRowEntryBytes = 152;
 inline constexpr std::uint64_t kCursorEntryBytes = 408;
 inline constexpr std::uint64_t kGroupEntryBytes = 136;
+
+// What the write set is charged for what it holds (docs/plan_api_design.md,
+// *The write set is statement memory*): a conservative bound, never less
+// than the memory used, and the one size both of its bounds count, the
+// statement budget as a call adds an item and a transaction's max_bytes as
+// bc_txn_add takes it in. Each heap block costs its capacity and
+// kAllocBytes, the allocator's header and rounding; each item a slot in its
+// vector, which grows to at most twice its size; a write, the node it takes
+// in a transaction's overlay; and each row, unique prefix or range the
+// statement wrote, to refuse a second write, the node it takes in its set.
+inline constexpr std::uint64_t kAllocBytes = 32;
+inline constexpr std::uint64_t kEffectSlotBytes = 112;
+inline constexpr std::uint64_t kClaimSlotBytes = 112;
+inline constexpr std::uint64_t kLockSlotBytes = 64;
+inline constexpr std::uint64_t kTableSlotBytes = 8;  // a table's, the first time it is written
+inline constexpr std::uint64_t kOverlayNodeBytes = 120;
+inline constexpr std::uint64_t kWrittenRowNodeBytes = 96;
+inline constexpr std::uint64_t kUniqueNodeBytes = 96;
+inline constexpr std::uint64_t kRangeNodeBytes = 112;
+
+[[nodiscard]] constexpr auto buffer_bytes(std::size_t capacity) -> std::uint64_t {
+  return capacity == 0 ? 0 : capacity + kAllocBytes;
+}
+// An effect, its buffers of these capacities; `write` for a put or delete.
+[[nodiscard]] constexpr auto effect_bytes(bool write, std::size_t a, std::size_t b) -> std::uint64_t {
+  return buffer_bytes(a) + buffer_bytes(b) + kEffectSlotBytes + (write ? kOverlayNodeBytes : 0);
+}
+[[nodiscard]] constexpr auto claim_bytes(std::size_t key) -> std::uint64_t {
+  return buffer_bytes(key) + kClaimSlotBytes;
+}
+[[nodiscard]] constexpr auto lock_bytes(std::size_t key) -> std::uint64_t { return buffer_bytes(key) + kLockSlotBytes; }
 
 // Every column of a row, by its layout: NULL, or the typed value; the id of
 // the first malformed column (row_column), never a plausible value. The one

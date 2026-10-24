@@ -72,6 +72,18 @@ using bytecask::sql::KeyReader;
 using bytecask::sql::LiveCatalog;
 using bytecask::sql::kRowEntryBytes;
 using bytecask::sql::kViewEntryBytes;
+using bytecask::sql::buffer_bytes;
+using bytecask::sql::claim_bytes;
+using bytecask::sql::kAllocBytes;
+using bytecask::sql::kClaimSlotBytes;
+using bytecask::sql::kEffectSlotBytes;
+using bytecask::sql::kLockSlotBytes;
+using bytecask::sql::kOverlayNodeBytes;
+using bytecask::sql::kRangeNodeBytes;
+using bytecask::sql::kTableSlotBytes;
+using bytecask::sql::kUniqueNodeBytes;
+using bytecask::sql::kWrittenRowNodeBytes;
+using bytecask::sql::lock_bytes;
 using bytecask::sql::PhysType;
 using bytecask::sql::RowLayout;
 using bytecask::sql::RowWriter;
@@ -104,30 +116,6 @@ constexpr std::uint32_t kPinnedView = 1u << 31;
 // The arena grows in chunks of this size, or one chunk per copy larger than
 // it.
 constexpr std::size_t kArenaChunk = 64u << 10;
-// What a transaction's bound counts for what it holds: a conservative bound,
-// never less than the memory used. Each heap block costs its capacity plus
-// the allocator's header and rounding (kAllocBytes, an over-estimate); a map
-// node its links and colour, its key and value objects, and its own block.
-// So a transaction of many small writes reaches its bound too.
-constexpr std::uint64_t kAllocBytes = 4 * sizeof(void*);
-template <typename V>
-constexpr std::uint64_t kMapNodeBytes = 4 * sizeof(void*) + sizeof(V) + kAllocBytes;
-constexpr std::uint64_t kNodeBytes = kMapNodeBytes<std::pair<const Bytes, std::optional<Bytes>>>;
-// The engine's limit on one write plan, on disk and with its batch markers
-// (its CONTRACT.md): what an autocommit execution's writes are held to as
-// they grow.
-constexpr std::uint64_t kEngineBatchBytes = std::uint64_t{1} << 30;
-// The bytes an entry takes on disk (docs/file_format.md): its 15-byte header,
-// key, value and 4-byte CRC. A range delete's value is its end key, and the
-// two batch markers around a plan of two writes or more are empty entries.
-// The engine's own rule (entry_size, as WritePlan sizes a plan against the
-// limit), which bytecask.hpp does not export (#576).
-[[nodiscard]] constexpr auto engine_entry_bytes(std::size_t key, std::size_t value) -> std::uint64_t {
-  return 15 + std::uint64_t{key} + value + 4;
-}
-[[nodiscard]] constexpr auto held(std::size_t capacity) -> std::uint64_t {
-  return capacity == 0 ? 0 : capacity + kAllocBytes;
-}
 constexpr std::uint32_t kScanFlagMask = BC_SCAN_REVERSE | BC_SCAN_PREFIX;
 
 // What a view is, beyond its bytes: a row read from the engine (a stored
@@ -238,8 +226,8 @@ struct Effect {
   Bytes a, b;
 };
 
-[[nodiscard]] auto is_write(const Effect& e) -> bool {
-  switch (e.kind) {
+[[nodiscard]] constexpr auto is_write(EffectKind k) -> bool {
+  switch (k) {
     case EffectKind::Put:
     case EffectKind::Del:
     case EffectKind::DelRange: return true;
@@ -250,20 +238,6 @@ struct Effect {
   }
   return false;
 }
-
-// What a statement's write set counts against its bound (bc_ctx::count_write).
-// In autocommit, `bytes` is what the engine's batch limit counts: each write's
-// entry on disk, and the batch markers once there are two writes; nothing
-// else. In a transaction it, with the counts, is what txn_holds adds to the
-// transaction, as bc_txn_add takes the statement in.
-struct WriteCount {
-  std::uint64_t bytes{0};
-  std::size_t writes{0};
-  std::size_t guards{0};
-  std::size_t claims{0};
-  std::size_t locks{0};
-  std::size_t tables{0};  // the distinct tables written
-};
 
 // An insert claim (docs/transaction_design.md, *Commit and conflicts*): a
 // primary key a write put into a key its snapshot held free, or a unique
@@ -290,6 +264,26 @@ struct Lock {
   Bytes key;
   std::uint64_t fingerprint;
 };
+
+// The write set's fixed charges cover what they stand for: a vector slot at
+// twice its element, and a map or set node's links and colour, its value
+// and its block.
+template <typename V>
+constexpr std::uint64_t kNodeBytesOf = 4 * sizeof(void*) + sizeof(V) + kAllocBytes;
+static_assert(sizeof(void*) <= kAllocBytes);
+static_assert(2 * sizeof(Effect) <= kEffectSlotBytes);
+static_assert(2 * sizeof(Claim) <= kClaimSlotBytes);
+static_assert(2 * sizeof(Lock) <= kLockSlotBytes);
+static_assert(2 * sizeof(std::uint32_t) <= kTableSlotBytes);
+static_assert(kNodeBytesOf<std::pair<const Bytes, std::optional<Bytes>>> <= kOverlayNodeBytes);
+static_assert(kNodeBytesOf<std::pair<const Bytes, Bytes>> <= kOverlayNodeBytes);  // an overlay range
+static_assert(kNodeBytesOf<std::pair<const Bytes, bool>> <= kWrittenRowNodeBytes);
+static_assert(kNodeBytesOf<std::pair<std::uint32_t, Bytes>> <= kUniqueNodeBytes);
+static_assert(kNodeBytesOf<std::pair<const Bytes, Bytes>> <= kRangeNodeBytes);
+
+[[nodiscard]] constexpr auto effect_bytes(EffectKind k, std::size_t a, std::size_t b) -> std::uint64_t {
+  return bytecask::sql::effect_bytes(is_write(k), a, b);
+}
 
 // FNV-1a: stable, and only ever compared within one process.
 [[nodiscard]] auto row_fingerprint(BytesView row) -> std::uint64_t {
@@ -404,7 +398,7 @@ struct Overlay {
   // the points inside it.
   void del_range(Bytes lo, Bytes hi) {
     for (auto it = points.lower_bound(BytesView{lo}); it != points.end() && std::ranges::lexicographical_compare(it->first, hi);) {
-      bytes -= cost(it->first, it->second ? held(it->second->capacity()) : 0);
+      bytes -= cost(it->first, it->second ? buffer_bytes(it->second->capacity()) : 0);
       it = points.erase(it);
     }
     auto it = ranges.upper_bound(BytesView{lo});
@@ -412,23 +406,23 @@ struct Overlay {
     while (it != ranges.end() && !std::ranges::lexicographical_compare(hi, it->first)) {
       if (std::ranges::lexicographical_compare(it->first, lo)) lo = it->first;
       if (std::ranges::lexicographical_compare(hi, it->second)) hi = it->second;
-      bytes -= cost(it->first, held(it->second.capacity()));
+      bytes -= cost(it->first, buffer_bytes(it->second.capacity()));
       it = ranges.erase(it);
     }
-    auto add = cost(lo, held(hi.capacity()));
+    auto add = cost(lo, buffer_bytes(hi.capacity()));
     ranges.emplace(std::move(lo), std::move(hi));
     bytes += add;
   }
 
 private:
   static auto cost(const Bytes& key, std::uint64_t value_bytes) -> std::uint64_t {
-    return held(key.capacity()) + value_bytes + kNodeBytes;
+    return buffer_bytes(key.capacity()) + value_bytes + kOverlayNodeBytes;
   }
 
   void set(Bytes key, std::optional<Bytes> value) {
-    auto value_bytes = value ? held(value->capacity()) : 0;
+    auto value_bytes = value ? buffer_bytes(value->capacity()) : 0;
     if (auto it = points.find(BytesView{key}); it != points.end()) {
-      bytes -= it->second ? held(it->second->capacity()) : 0;
+      bytes -= it->second ? buffer_bytes(it->second->capacity()) : 0;
       it->second = std::move(value);
       bytes += value_bytes;
       return;
@@ -685,17 +679,12 @@ struct bc_ctx {
   Arena pins;
   // The bytes the statement holds, as requested: what budget.max_bytes bounds.
   std::uint64_t mem_used{0};
-  // The write set (effects, insert claims, locks), counted at the call that
-  // adds to it and held to its bound there (count_write): the engine's batch
-  // limit in autocommit, the transaction's max_bytes in one. The statement's
-  // scratch beside it (the rows, unique prefixes and ranges written, and the
-  // vectors' slots) is statement memory, charged in a transaction to the
-  // budget (take_scratch).
-  WriteCount write_count;
+  // What of mem_used is the write set (effects, insert claims, locks and the
+  // tables written), each item as its *_bytes function counts it: what
+  // bc_txn_add moves from the statement budget to the transaction's bound.
+  std::uint64_t write_held{0};
   // The tables the writes are in, in first-write order.
   std::vector<std::uint32_t> written_tables;
-  // The autocommit bound; a test lowers it.
-  std::uint64_t autocommit_write_bound{kEngineBatchBytes};
   // The last handle generation drawn; 0 is the empty view's, never drawn.
   // 64 bits, so it never wraps: a generation never repeats within the
   // context's life, and a stale handle never matches a reused slot.
@@ -852,49 +841,42 @@ struct bc_ctx {
 
   void release(std::uint64_t n) noexcept { mem_used -= n; }
 
-  // Makes `next` the write set's count: false, and BC_E_LIMIT, past its
-  // bound, with the count as it was. Defined with bc_txn, whose bound it
-  // reads.
-  [[nodiscard]] auto count_write(const WriteCount& next) -> bool;
+  // Whether the transaction has room for the statement's write set grown to
+  // `bytes`: false, and BC_E_LIMIT, if not. Defined with bc_txn, whose bound
+  // it reads.
+  [[nodiscard]] auto txn_room(std::uint64_t bytes) -> bool;
 
-  // Charges n bytes of the statement's scratch: to the budget in a
-  // transaction. In autocommit nothing: the scratch grows with the writes,
-  // which the batch limit bounds, and charging it would refuse a bulk write
-  // the engine takes.
-  [[nodiscard]] auto take_scratch(std::uint64_t n) -> bool {
+  // Appends what `make` builds to `into`, an item of the write set of `n`
+  // bytes: charged to the statement budget and, in a transaction, held to
+  // the room its bound leaves, before `make` allocates it. Past either,
+  // false and BC_E_LIMIT, with nothing added and nothing charged; a `make`
+  // or append that throws leaves nothing charged either.
+  template <typename T, typename Make>
+  [[nodiscard]] auto push_write(std::vector<T>& into, std::uint64_t n, Make&& make) -> bool {
     if (!ok()) return false;
-    return txn == nullptr || take(n);
-  }
-
-  // Counts an effect into the write set, before it is added.
-  [[nodiscard]] auto count_effect(const Effect& e) -> bool {
-    // Its slot in `effects`, which grows at most to twice its size.
-    if (!take_scratch(2 * sizeof(Effect))) return false;
-    auto next = write_count;
-    std::optional<std::uint32_t> table;
-    if (!is_write(e)) {
-      ++next.guards;  // a guard appends nothing
-    } else {
-      table = written_table(e.a);
-      if (table) ++next.tables;
-      ++next.writes;
-      // As the engine sizes a write plan: an entry per write, its value the
-      // range's end for a range delete, and two markers around two or more.
-      if (txn == nullptr) {
-        next.bytes += engine_entry_bytes(e.a.size(), e.b.size());
-        if (next.writes == 2) next.bytes += 2 * engine_entry_bytes(0, 0);
-      }
+    if (txn != nullptr && !txn_room(write_held + n)) return false;
+    if (!take(n)) return false;
+    try {
+      into.push_back(make());
+    } catch (...) {
+      release(n);
+      throw;
     }
-    if (txn != nullptr) next.bytes += txn_effect_bytes(e);
-    if (!count_write(next)) return false;
-    if (table) written_tables.push_back(*table);
+    write_held += n;
     return true;
   }
 
-  // What a transaction counts for an effect: its buffers, and the node it
-  // takes in the overlay.
-  static auto txn_effect_bytes(const Effect& e) -> std::uint64_t {
-    return held(e.a.capacity()) + held(e.b.capacity()) + kNodeBytes;
+  // Adds an effect, its buffers `a_bytes` and `b_bytes` long: a table the
+  // writes had not touched is noted, before the effect, and its slot counted
+  // with it.
+  template <typename Make>
+  void push_effect_made(EffectKind kind, BytesView key, std::size_t a_bytes, std::size_t b_bytes, Make&& make) {
+    auto table = is_write(kind) ? written_table(key) : std::nullopt;
+    auto n = effect_bytes(kind, a_bytes, b_bytes) + (table ? kTableSlotBytes : 0);
+    (void)push_write(effects, n, [&] {
+      if (table) written_tables.push_back(*table);
+      return make();
+    });
   }
 
   // The table a write's key is in when it is one the writes have not yet
@@ -1056,28 +1038,34 @@ struct bc_ctx {
     return t;
   }
 
-  // Each adds to the write set, and past its bound adds nothing. The
-  // effect is made first: a transaction counts its buffers' capacities, as
-  // bc_txn_add does.
+  // Each adds to the write set, and past a bound adds nothing. Counted by
+  // the sizes of its keys and values, before they are copied; each buffer
+  // it keeps is that size, so the charge is the same on every build.
   void push_effect(EffectKind kind, BytesView a, BytesView b = {}) {
-    push_effect(Effect{kind, Bytes(a.begin(), a.end()), Bytes(b.begin(), b.end())});
+    push_effect_made(kind, a, a.size(), b.size(),
+                     [&] { return Effect{kind, Bytes(a.begin(), a.end()), Bytes(b.begin(), b.end())}; });
   }
-  // For keys the runtime built and no longer needs: moved, not copied.
+  // For keys the runtime built and no longer needs: moved, not copied, and
+  // trimmed to their size.
   void push_effect(EffectKind kind, Bytes&& a, BytesView b = {}) {
-    push_effect(Effect{kind, std::move(a), Bytes(b.begin(), b.end())});
+    push_effect_made(kind, a, a.size(), b.size(), [&] {
+      a.shrink_to_fit();
+      return Effect{kind, std::move(a), Bytes(b.begin(), b.end())};
+    });
   }
-  void push_effect(EffectKind kind, Bytes&& a, Bytes&& b) { push_effect(Effect{kind, std::move(a), std::move(b)}); }
-  void push_effect(Effect&& e) {
-    if (count_effect(e)) effects.push_back(std::move(e));
+  void push_effect(EffectKind kind, Bytes&& a, Bytes&& b) {
+    push_effect_made(kind, a, a.size(), b.size(), [&] {
+      a.shrink_to_fit();
+      b.shrink_to_fit();
+      return Effect{kind, std::move(a), std::move(b)};
+    });
   }
-  [[nodiscard]] auto push_claim(Claim c) -> bool {
-    if (!take_scratch(2 * sizeof(Claim))) return false;
-    auto next = write_count;
-    ++next.claims;
-    if (txn != nullptr) next.bytes += held(c.key.capacity());
-    if (!count_write(next)) return false;
-    claims.push_back(std::move(c));
-    return true;
+  [[nodiscard]] auto push_claim(std::uint32_t object, BytesView key, std::optional<std::size_t> prefix_len) -> bool {
+    return push_write(claims, claim_bytes(key.size()),
+                      [&] { return Claim{object, Bytes(key.begin(), key.end()), prefix_len}; });
+  }
+  [[nodiscard]] auto push_lock(BytesView key, std::uint64_t fingerprint) -> bool {
+    return push_write(locks, lock_bytes(key.size()), [&] { return Lock{Bytes(key.begin(), key.end()), fingerprint}; });
   }
 
   // Sets the constraint error: the kind in the detail's high byte, the
@@ -1196,7 +1184,7 @@ struct bc_ctx {
     arena.clear(true);  // one chunk kept for the next statement
     pins.clear(false);
     mem_used = 0;
-    write_count = {};
+    write_held = 0;
     written_tables.clear();
     reads = 0;
   }
@@ -1227,12 +1215,12 @@ struct bc_txn {
   // since every point in it is newer than any range over it.
   Overlay overlay;
   std::vector<Effect> guards;          // the statements' guards, in their order
-  std::uint64_t guard_bytes{0};        // what the guards' keys hold
   std::vector<Claim> claims;           // the statements' insert claims, in their order
-  std::uint64_t claim_bytes{0};        // what the claims' keys hold
   std::vector<Lock> locks;             // the statements' rows locked or written, in their order
-  std::uint64_t lock_bytes{0};         // what the locks' keys hold
   std::vector<std::uint32_t> written;  // the tables the writes are in
+  // What the four above hold, each item as the statement counted it
+  // (effect_bytes, claim_bytes, lock_bytes, kTableSlotBytes).
+  std::uint64_t held{0};
   std::uint64_t statements{0};         // statements wholly added
   // A statement failed: nothing but bc_txn_free is left. Set before any
   // part of a failing statement could reach the overlay or the guards, so
@@ -1261,35 +1249,22 @@ void txn_abort(bc_txn* txn) noexcept;
 
 namespace {
 
-// A conservative bound on what the transaction would hold with a
-// statement's write set in it, without merging them: a vector grows at most
-// to twice what it holds, each effect adds at most one node, and an effect
-// that replaces or erases others only frees. The one count both the
-// statement's calls (bc_ctx::count_write) and bc_txn_add hold to max_bytes.
-auto txn_holds(const bc_txn& t, const WriteCount& s) -> std::uint64_t {
-  auto vec = [](std::size_t cap, std::size_t size, std::size_t more, std::size_t elem) -> std::uint64_t {
-    return held(std::max(cap, 2 * (size + more)) * elem);
-  };
-  return t.overlay.bytes + t.guard_bytes + t.claim_bytes + t.lock_bytes + s.bytes +
-         vec(t.guards.capacity(), t.guards.size(), s.guards, sizeof(Effect)) +
-         vec(t.claims.capacity(), t.claims.size(), s.claims, sizeof(Claim)) +
-         vec(t.locks.capacity(), t.locks.size(), s.locks, sizeof(Lock)) +
-         vec(t.written.capacity(), t.written.size(), s.tables, sizeof(std::uint32_t));
-}
+// What the transaction holds: its overlay, which counts each node as its
+// buffers and kOverlayNodeBytes, within the effect_bytes of the write it
+// came from, and its guards, claims, locks and tables. A statement's write
+// set would take it at most to this plus the write set's bytes: merging an
+// effect into the overlay adds at most one node, and one that replaces or
+// erases others only frees.
+auto txn_holds(const bc_txn& t) -> std::uint64_t { return t.overlay.bytes + t.held; }
 
 }  // namespace
 
-auto bc_ctx::count_write(const WriteCount& next) -> bool {
-  if (!ok()) return false;
-  if (txn != nullptr ? txn_holds(*txn, next) > txn->max_bytes : next.bytes > autocommit_write_bound) {
-    fail(BC_E_LIMIT, txn != nullptr ? "the transaction's writes would pass its bound of " +
-                                          std::to_string(txn->max_bytes) + " bytes"
-                                    : "the statement's writes would pass the engine's batch limit of " +
-                                          std::to_string(autocommit_write_bound) + " bytes");
-    return false;
-  }
-  write_count = next;
-  return true;
+// The one check both a statement's calls (push_write) and bc_txn_add make,
+// on the write set as it would be and as it is.
+auto bc_ctx::txn_room(std::uint64_t bytes) -> bool {
+  if (txn_holds(*txn) + bytes <= txn->max_bytes) return true;
+  fail(BC_E_LIMIT, "the transaction's writes would pass its bound of " + std::to_string(txn->max_bytes) + " bytes");
+  return false;
 }
 
 void txn_detach(bc_txn* txn, bc_ctx* cx, bool abandoned) noexcept {
@@ -1316,12 +1291,10 @@ void txn_abort(bc_txn* txn) noexcept {
   txn->pinned.reset();
   txn->overlay = {};
   txn->guards = {};
-  txn->guard_bytes = 0;
   txn->claims = {};
-  txn->claim_bytes = 0;
   txn->locks = {};
-  txn->lock_bytes = 0;
   txn->written = {};
+  txn->held = 0;
 }
 
 }  // namespace
@@ -2042,7 +2015,7 @@ auto write_row(bc_ctx* cx, const Table& t, bc_view row, bool stored) -> std::opt
     cx->fail(BC_E_HANDLE, "a row of table " + t.name + " written twice in one statement");
     return false;
   }
-  if (!cx->take_scratch(held(pk.size()) + kMapNodeBytes<std::pair<const Bytes, bool>>)) return false;
+  if (!cx->take(buffer_bytes(pk.size()) + kWrittenRowNodeBytes)) return false;
   cx->written_rows.emplace(Bytes(pk.begin(), pk.end()), present);
   return true;
 }
@@ -2085,7 +2058,7 @@ struct Entry {
     if (!cx->charge()) return false;
     if (cx->base->contains_key({}, pk)) return true;
   }
-  return cx->push_claim({t.id, Bytes(pk.begin(), pk.end()), std::nullopt});
+  return cx->push_claim(t.id, pk, std::nullopt);
 }
 
 // A row a transaction's statement locks or writes, kept for the commit's
@@ -2094,13 +2067,7 @@ struct Entry {
 // no statements before it.
 void lock_row(bc_ctx* cx, BytesView pk, BytesView row) {
   if (cx->txn == nullptr || (cx->overlay != nullptr && cx->overlay->find(pk))) return;
-  if (!cx->take_scratch(2 * sizeof(Lock))) return;
-  Lock lock{Bytes(pk.begin(), pk.end()), row_fingerprint(row)};
-  auto next = cx->write_count;
-  ++next.locks;
-  next.bytes += held(lock.key.capacity());  // as bc_txn_add counts it
-  if (!cx->count_write(next)) return;
-  cx->locks.push_back(std::move(lock));
+  (void)cx->push_lock(pk, row_fingerprint(row));
 }
 
 // No entry has this unique index prefix in the view, and no earlier write
@@ -2109,14 +2076,22 @@ void lock_row(bc_ctx* cx, BytesView pk, BytesView row) {
 [[nodiscard]] auto unique_free(bc_ctx* cx, const Index& ix, const Entry& entry) -> bool {
   auto prefix = entry.prefix();
   if (!cx->charge()) return false;
-  // One this execution already gave a row: the view cannot see it.
-  auto written = std::pair{ix.id, Bytes(prefix.begin(), prefix.end())};
-  if (cx->unique_written.contains(written)) {
+  // Recorded, charged first; one this execution already gave a row, which
+  // the view cannot see, is not inserted again, and its charge goes.
+  const auto n = buffer_bytes(prefix.size()) + kUniqueNodeBytes;
+  if (!cx->take(n)) return false;
+  auto fresh = false;
+  try {
+    fresh = cx->unique_written.emplace(ix.id, Bytes(prefix.begin(), prefix.end())).second;
+  } catch (...) {
+    cx->release(n);
+    throw;
+  }
+  if (!fresh) {
+    cx->release(n);
     cx->raise(BC_C_UNIQUE, ix.id);
     return false;
   }
-  if (!cx->take_scratch(held(prefix.size()) + kMapNodeBytes<std::pair<std::uint32_t, Bytes>>)) return false;
-  cx->unique_written.insert(std::move(written));
   auto in_snapshot = [&] { return holds_prefix(*cx->base, prefix); };
   // As pk_free: a claim when the snapshot holds the prefix free too.
   auto claim = true;
@@ -2137,7 +2112,7 @@ void lock_row(bc_ctx* cx, BytesView pk, BytesView row) {
     return false;
   }
   cx->push_effect(EffectKind::GuardRange, prefix, bytecask::sql::key_successor(prefix));
-  return !claim || cx->push_claim({ix.id, entry.key, entry.prefix_len});
+  return !claim || cx->push_claim(ix.id, entry.key, entry.prefix_len);
 }
 
 
@@ -2315,7 +2290,7 @@ enum bc_commit_result bc_ctx_commit(bc_ctx* cx, bool sync) {
   // SELECT … FOR UPDATE in autocommit). The engine, which may be refusing
   // writes, is not asked. A transaction checks a guard-only commit instead:
   // its later statements may have acted on what it read.
-  if (std::ranges::none_of(cx->effects, is_write)) {
+  if (std::ranges::none_of(cx->effects, is_write, &Effect::kind)) {
     cx->effects.clear();
     return BC_COMMITTED;
   }
@@ -2379,9 +2354,6 @@ int64_t bc_ctx_affected(const bc_ctx* cx) { return cx->affected; }
 #ifdef BYTECASK_SQL_TESTING
 void bc_ctx_before_commit_for_testing(bc_ctx* cx, std::function<void()> hook) { cx->before_commit = std::move(hook); }
 std::uint64_t bc_ctx_held_for_testing(const bc_ctx* cx) { return cx->mem_used; }
-void bc_ctx_write_bound_for_testing(bc_ctx* cx, std::uint64_t bytes) {
-  cx->autocommit_write_bound = bytes;
-}
 #endif
 
 extern "C" {
@@ -2426,9 +2398,9 @@ bool bc_txn_add(bc_ctx* cx) {
     return false;
   }
   // The bound is checked before anything is merged, by the check each of the
-  // statement's writes passed, on the count they reached: a statement that
-  // would pass it is refused without the transaction allocating for it.
-  if (!cx->count_write(cx->write_count)) {
+  // statement's writes passed, on the write set they reached: a statement
+  // that would pass it is refused without the transaction allocating for it.
+  if (!cx->txn_room(cx->write_held)) {
     txn_abort(txn);
     return false;
   }
@@ -2436,7 +2408,10 @@ bool bc_txn_add(bc_ctx* cx) {
   // leaves an overlay no commit may use.
   txn->aborted = true;
   for (auto id : cx->written_tables) {
-    if (std::ranges::find(txn->written, id) == txn->written.end()) txn->written.push_back(id);
+    if (std::ranges::find(txn->written, id) == txn->written.end()) {
+      txn->written.push_back(id);
+      txn->held += kTableSlotBytes;
+    }
   }
   for (auto& e : cx->effects) {
     switch (e.kind) {
@@ -2447,7 +2422,7 @@ bool bc_txn_add(bc_ctx* cx) {
       case EffectKind::GuardRange:
       case EffectKind::GuardPresent:
       case EffectKind::GuardAbsent:
-        txn->guard_bytes += held(e.a.capacity()) + held(e.b.capacity());
+        txn->held += effect_bytes(e.kind, e.a.size(), e.b.size());
         txn->guards.push_back(std::move(e));
         break;
     }
@@ -2458,15 +2433,18 @@ bool bc_txn_add(bc_ctx* cx) {
   const auto locks_through = txn->locks.size() + cx->locks.size();
   for (auto& c : cx->claims) {
     c.locks_through = locks_through;
-    txn->claim_bytes += held(c.key.capacity());
+    txn->held += claim_bytes(c.key.size());
     txn->claims.push_back(std::move(c));
   }
   cx->claims.clear();
   for (auto& l : cx->locks) {
-    txn->lock_bytes += held(l.key.capacity());
+    txn->held += lock_bytes(l.key.size());
     txn->locks.push_back(std::move(l));
   }
   cx->locks.clear();
+  // The write set is the transaction's now, and off the statement's budget.
+  cx->release(cx->write_held);
+  cx->write_held = 0;
   ++txn->statements;
   txn->aborted = false;
   return true;
@@ -3753,7 +3731,7 @@ void bc_del_range(bc_ctx* cx, uint32_t table, bc_view lo, bc_view hi) {
     cx->fail(BC_E_HANDLE, "bc_del_range over a row of table " + t->name + " this plan already wrote");
     return;
   }
-  if (!cx->take_scratch(held(range->lo.size()) + held(range->hi.size()) + kMapNodeBytes<std::pair<const Bytes, Bytes>>)) {
+  if (!cx->take(buffer_bytes(range->lo.size()) + buffer_bytes(range->hi.size()) + kRangeNodeBytes)) {
     return;
   }
   cx->deleted_ranges.emplace(range->lo, range->hi);

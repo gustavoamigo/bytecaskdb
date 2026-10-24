@@ -281,7 +281,11 @@ state and to enforce.
 - keys and rows it builds or reads;
 - the contents of sorters, hash tables and aggregate groups;
 - pinned values;
-- the result rows it buffers.
+- the result rows it buffers;
+- the write set: what the statement keeps until commit, or in a
+  transaction until it ends, when it moves to the transaction's own bound
+  (`plan_api_design.md`, *The write set is statement memory*). So a bulk
+  write is bounded by the budget like any other statement.
 
 It counts bytes requested, not allocator overhead, so the accounting is
 deterministic and the allocation-fault sweep can test it.
@@ -291,15 +295,15 @@ deterministic and the allocation-fault sweep can test it.
   it is pinned or added to a structure. A key built for one probe, an
   inner row and a group key all go when the outer row moves on. That is
   the fix for #551.
-- What outlives a step: pins, the contents of blocking structures, and
-  result rows.
+- What outlives a step: pins, the contents of blocking structures, result
+  rows and the write set.
 
 How the API releases a step's storage (a mark on the arena per loop level,
 or storage held with the cursor) is the implementation PR's to choose; it
 marks the arena (`plan_api_design.md`, *A loop's step owns what it
 allocates*). This rule is the contract. Streaming
 operators therefore use memory bounded by the depth of the pipeline, not
-by the number of rows, and only pipeline breakers and results grow.
+by the number of rows, and only pipeline breakers, results and writes grow.
 
 **Past the budget, an error, never a spill.** This is the plan API's
 existing guarantee (*Bounded in memory*), kept.

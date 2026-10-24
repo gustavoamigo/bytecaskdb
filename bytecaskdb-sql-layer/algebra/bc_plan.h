@@ -46,7 +46,7 @@ enum bc_error_code {
   BC_E_CORRUPT,     /* CRC mismatch or unparseable record */
   BC_E_MEMORY,      /* an allocation failed (std::bad_alloc) */
   BC_E_BUDGET,      /* work budget or deadline exhausted */
-  BC_E_LIMIT,       /* key or value over the engine's limits, or the statement over its memory budget */
+  BC_E_LIMIT,       /* key, value or write plan over the engine's limits, or the statement over its memory budget */
   BC_E_HANDLE,      /* stale, foreign or out-of-range handle, or a table, index or column the plan's
                        bc_schema_ref does not declare, or not of the type used: a plan bug */
   BC_E_ARITH,       /* integer overflow, division by zero, out-of-range conversion */
