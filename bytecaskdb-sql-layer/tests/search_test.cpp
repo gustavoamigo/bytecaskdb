@@ -709,6 +709,123 @@ TEST_CASE("search: no choice point where the costs can't cross within the count'
   CHECK(threshold(plan_sql(cat, "SELECT k FROM c WHERE a = $1 AND v >= $2", rows)) > 1);
 }
 
+TEST_CASE("search: a choice point at a loop a sorter holds reads rows in both plans, though an index covers",
+          "[sql][search][cost][choice]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"p",
+                       {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true),
+                        Fixture::col("w", PhysType::I64, false)},
+                       {"k"}});
+  f.ddl(CreateIndexDdl{"p_w", "p", {{"w"}}});
+  const auto& cat = f.cat();
+  const auto p_w = "IDX_" + std::to_string(cat.table("p")->indexes[0].id);
+  // No equality between the sides: t by its key, then p by p_w's range or
+  // its primary key's, a choice point between them. p_w holds w and k, all
+  // p's columns the statement reads, so it could cover. Read above the sort,
+  // p's row is held by a sorter: each plan of the choice point reads it.
+  const std::string from = " FROM t, p WHERE t.id = $1 AND p.w = $2 AND p.k > $3 ORDER BY t.qty, p.k";
+  const std::map<std::string, std::uint64_t> rows{{"t", 100}, {"p", 100}};
+  auto held = plan_sql(cat, "SELECT t.id, p.w" + from, rows);
+  CHECK(threshold(held) == 11);
+  const auto other = held.source.find("} else {");
+  REQUIRE(other != std::string::npos);
+  CHECK(held.source.find("bc_view row1 = bc_scan_row(cx, c);") < other);
+  CHECK(held.source.find("bc_view row1 = bc_scan_row(cx, c);", other) != std::string::npos);
+  CHECK_FALSE(has(held, "bc_key_part_"));
+  CHECK(has(held, "bc_emit_col(cx, p0, COL_"));
+  // Every plan costed, with every combination of its choice points'
+  // branches, passes check: no sorter holds a covering scan's entry.
+  for (const auto* sql : {"SELECT t.id, p.w", "SELECT t.id"}) {
+    INFO(sql);
+    const auto text = sql + from;
+    CHECK_NOTHROW(generate_alternatives(bound::bind(ast::parse(text), cat), cat, text,
+                                        [&](const Table& t) { return std::optional{rows.at(t.name)}; }));
+  }
+  // Not read above the sort, p's row is held by none: p_w covers, and the
+  // sort key's part is read from its entry.
+  auto free = plan_sql(cat, "SELECT t.id" + from, rows);
+  CHECK(has(free, "bc_sort_key_i64(cx, sk, bc_key_part_i64(cx, " + p_w + ", bc_scan_key(cx, c), PART_"));
+  CHECK(has(free, "bc_sorter_add(cx, s0, bc_sort_key_end(cx, sk), bc_empty(cx));"));
+  CHECK(free.cost < held.cost);
+}
+
+TEST_CASE("search: a sort holds only the rows read above it; another loop's access may cover",
+          "[sql][search][cost]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"p",
+                       {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+                        Fixture::col("v", PhysType::I64, true), Fixture::col("w", PhysType::I64, false)},
+                       {"k"}});
+  // p_wva holds every column of p the statement reads but v, and does not
+  // give ORDER BY p.a under w = $2.
+  f.ddl(CreateIndexDdl{"p_wva", "p", {{"w"}, {"v"}, {"a"}}});
+  const auto& cat = f.cat();
+  const auto p_wva = "IDX_" + std::to_string(cat.table("p")->indexes[0].id);
+  const std::map<std::string, std::uint64_t> rows{{"t", 100}, {"p", 100}};
+  // The shape of golden/sort_cross_join: a nested loop of two scans, sorted
+  // by p's column, only t's read above the sort. One sorter, of t's rows; p
+  // covers, and the key's part, nullable, is read from its entry.
+  auto g = plan_sql(cat, "SELECT t.id FROM t, p WHERE t.name = $1 AND p.w = $2 ORDER BY p.a", rows);
+  CHECK(has(g, "bc_sorter s0 = bc_sorter_open(cx, 0);"));
+  CHECK_FALSE(has(g, "bc_sorter s1"));
+  CHECK_FALSE(has(g, "bc_sorter_nth"));
+  CHECK_FALSE(has(g, "bc_scan_row(cx, c1)"));
+  CHECK(has(g, "if (bc_key_part_null(cx, " + p_wva + ", bc_scan_key(cx, c1), PART_"));
+  CHECK(has(g, "bc_sort_key_null(cx, sk, BC_SORT_ASC, BC_SORT_NULLS_LAST);"));
+  CHECK(has(g, "bc_sorter_add(cx, s0, bc_sort_key_end(cx, sk), row);"));
+  // t's 10 rows under the name, each fetched; p's 10 under w, covered, per
+  // row of t; the 100 pairs held in one sorter.
+  CHECK(g.cost == Catch::Approx(2 * 10 + 10 * 10 + 100 * (1 + kSortWeight)));
+  // p's v read above the sort: a sorter of p's rows beside t's, and p reads
+  // them.
+  auto both = plan_sql(cat, "SELECT t.id, p.v FROM t, p WHERE t.name = $1 AND p.w = $2 ORDER BY p.a", rows);
+  CHECK(has(both, "bc_sorter_add(cx, s1, skv, row1);"));
+  CHECK(has(both, "bc_view row1 = bc_scan_row(cx, c1);"));
+  CHECK(both.cost == Catch::Approx(2 * 10 + 10 * 2 * 10 + 100 * (1 + kSortWeight) + 100 * kSortWeight));
+}
+
+TEST_CASE("search: a hash join that sorts its probe side reads only that side's rows for it",
+          "[sql][search][cost][hash]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"u",
+                       {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true),
+                        Fixture::col("x", PhysType::I64, true)},
+                       {"k"}});
+  // u_xv covers u's k, v and x, and does not give ORDER BY u.k under x = $1.
+  f.ddl(CreateIndexDdl{"u_xv", "u", {{"x"}, {"v"}}});
+  f.ddl(CreateTableDdl{"s",
+                       {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+                        Fixture::col("b", PhysType::I64, true)},
+                       {"k"}});
+  const auto& cat = f.cat();
+  const auto u_xv = "IDX_" + std::to_string(cat.table("u")->indexes[0].id);
+  const std::map<std::string, std::uint64_t> rows{{"t", 100}, {"u", 10'000}};
+  // ORDER BY u.k is all the probe side's: u is sorted before it probes,
+  // decided before any loop is made to read rows. Its sorter holds u's row,
+  // though nothing above reads one, so u_xv's range fetches each; t, held,
+  // reads its rows for the hash table. The plan is costed as it runs: t's
+  // 100 rows held, u's 1,000 entries fetched and sorted, 10,000 pairs.
+  auto g = plan_sql(cat, "SELECT t.id FROM t, u WHERE u.x = $1 AND u.v = t.qty ORDER BY u.k", rows);
+  CHECK(has(g, "// built on TBL_1's rows"));
+  CHECK(has(g, "bc_cursor c = bc_scan_open(cx, " + u_xv + ", lo, lo, BC_SCAN_PREFIX);"));
+  CHECK(g.source.find("bc_view row = bc_scan_row(cx, c);", g.source.find(u_xv + ", lo, lo")) <
+        g.source.find("bc_sorter_add"));
+  CHECK(has(g, "bc_sorter_add(cx, s0, bc_sort_key_end(cx, sk), row);"));
+  CHECK(g.cost == Catch::Approx(100 * (2 + kHashWeight) + 1000 * (2 + 1 + kSortWeight) + 100 * 1000 / 10));
+  // Two keys on one probe column: its NULL test, before the sort, once.
+  auto two = plan_sql(cat, "SELECT s.k FROM s, u WHERE u.x = $1 AND u.v = s.a AND u.v = s.b ORDER BY u.k",
+                      {{"s", 100}, {"u", 10'000}});
+  CHECK(has(two, "bc_hash_open"));
+  const auto u_v = "bc_col_null(cx, row, COL_" + std::to_string(cat.table("u")->id) + "_1)";
+  const auto first = two.source.find(u_v);
+  REQUIRE(first != std::string::npos);
+  CHECK(first < two.source.find("bc_sorter_add"));
+  CHECK(two.source.find(u_v, first + 1) == std::string::npos);
+}
+
 TEST_CASE("search: a table read once carries its choice point under the outer row", "[sql][search][cost][choice]") {
   sql_test::Fixture f;
   using sql_test::Fixture;

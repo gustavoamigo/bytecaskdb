@@ -366,6 +366,7 @@ private:
     std::uint32_t object{0};
     bool for_update{false};
     std::string cursor{"c"};  // a covering scan's
+    bool looped{false};       // bound by a loop: a scan's, or a hash join's over the rows it holds
   };
 
   // What the root reports when no row can match: nothing for result rows,
@@ -605,7 +606,7 @@ private:
       w_.reads(sc.table);
       w_.line("bc_view " + row_name_ + " = bc_scan_row(cx, " + cursor_ + ");");
     }
-    rows_.push_back({sc.table, row_name_, sc.covering, sc.object, sc.for_update, cursor_});
+    rows_.push_back({sc.table, row_name_, sc.covering, sc.object, sc.for_update, cursor_, true});
     auto outer = loop_;
     loop_ = true;
     k();
@@ -811,7 +812,7 @@ private:
       w_.line("bc_hash_iter " + probe + " = bc_hash_find(cx, " + table + ", " + key + ");");
       w_.line("bc_view " + held + " = bc_empty(cx);");
       w_.open("while (" + guard_ + "bc_hash_next(cx, " + probe + ", &" + held + "))");
-      rows_.push_back({h.held, held});
+      rows_.push_back({h.held, held, false, 0, false, "c", true});
       auto outer = std::exchange(loop_, true);
       k();
       loop_ = outer;
@@ -823,45 +824,47 @@ private:
   // A pipeline breaker: each row of its input added to sorter s<i>, keyed by
   // bc_sort_key_* from the rows in hand, then a loop over the sorter in sort
   // order, which binds the row it held as p<i>. A sort of several loops has
-  // a sorter per loop, each given the same key and its loop's row, numbered
-  // on from i: the loop steps the first by bc_sorter_next and reads each
-  // other's entry at the same place, r<j>, by bc_sorter_nth. A row NULL in a
-  // `not_null` column is not added. The rows read once before the input's
-  // first loop stay in hand; a LIMIT's counter is the sorter loop's.
+  // a sorter per loop whose row is read above it, `payloads`, each given the
+  // same key and its loop's row, numbered on from i: the loop steps the
+  // first by bc_sorter_next and reads each other's entry at the same place,
+  // r<j>, by bc_sorter_nth. With none, one sorter holds the keys alone. A
+  // row NULL in a `not_null` column is not added. The rows read once before
+  // the input's first loop stay in hand; a LIMIT's counter is the sorter
+  // loop's.
   void produce(const physical::Sort& s, const Consume& k) {
     std::vector<std::string> ids;
-    for (std::size_t j = 0; j < s.payloads.size(); ++j) ids.push_back(std::to_string(sorts_++));
+    for ([[maybe_unused]] auto t : s.payloads) ids.push_back(std::to_string(sorts_++));
+    if (ids.empty()) ids.push_back(std::to_string(sorts_++));
     for (const auto& i : ids) {
       w_.line("bc_sorter s" + i + " = bc_sorter_open(cx, " + std::to_string(s.keep) + ");");
     }
     auto guard = std::exchange(guard_, "");
     std::vector<Binding> in_hand;
     produce(*s.input, [&] {
+      std::vector<ColumnRef> checked;
       for (const auto& c : s.not_null) {
-        if (c.nullable && !tested(c)) miss(col_null(c));
+        if (!c.nullable || tested(c) || std::ranges::find(checked, c) != checked.end()) continue;
+        miss(col_null(c));
+        checked.push_back(c);
       }
       w_.line("bc_sort_key sk = bc_sort_key_begin(cx);");
-      for (const auto& part : s.keys) {
-        w_.line("bc_sort_key_col(cx, sk, " + row_of(part.col) + ", " + w_.col(part.col) + ", " +
-                (part.desc ? "BC_SORT_DESC" : "BC_SORT_ASC") + ", " +
-                (part.nulls_first ? "BC_SORT_NULLS_FIRST" : "BC_SORT_NULLS_LAST") + ");");
-      }
+      for (const auto& part : s.keys) sort_part(part);
       auto key = std::string{"bc_sort_key_end(cx, sk)"};
       if (ids.size() > 1) {
         w_.line("bc_view skv = " + key + ";");
         key = "skv";
       }
       for (std::size_t j = 0; j < ids.size(); ++j) {
-        w_.line("bc_sorter_add(cx, s" + ids[j] + ", " + key + ", " + binding(s.payloads[j]).row + ");");
+        const auto payload = s.payloads.empty() ? std::string{"bc_empty(cx)"} : binding(s.payloads[j]).row;
+        w_.line("bc_sorter_add(cx, s" + ids[j] + ", " + key + ", " + payload + ");");
       }
-      // The rows in hand before the first loop, and each loop's, whose row a
+      // The rows in hand before the first loop, and each loop's whose row a
       // sorter holds.
       in_hand.clear();
       auto looped = false;
       for (const auto& b : rows_) {
-        auto held = std::ranges::find(s.payloads, b.table) != s.payloads.end();
-        looped = looped || held;
-        if (!looped || held) in_hand.push_back(b);
+        looped = looped || b.looped;
+        if (!looped || std::ranges::find(s.payloads, b.table) != s.payloads.end()) in_hand.push_back(b);
       }
     });
     guard_ = guard;
@@ -884,6 +887,28 @@ private:
     not_null_.resize(tested_before);
     loop_ = outer;
     rows_ = outer_rows;
+    w_.close();
+  }
+
+  // One part of sort key `sk`: a row's column, NULL included, or a covering
+  // scan's entry's, never a DOUBLE (physical::check).
+  void sort_part(const physical::SortPart& part) {
+    const auto placed = std::string{part.desc ? "BC_SORT_DESC" : "BC_SORT_ASC"} + ", " +
+                        (part.nulls_first ? "BC_SORT_NULLS_FIRST" : "BC_SORT_NULLS_LAST") + ");";
+    const auto& c = part.col;
+    if (!binding(c.table).covering) {
+      w_.line("bc_sort_key_col(cx, sk, " + row_of(c) + ", " + w_.col(c) + ", " + placed);
+      return;
+    }
+    const auto value = "bc_sort_key_" + suffix(c.type) + "(cx, sk, " + read_col(c) + ", " + placed;
+    if (!c.nullable) {
+      w_.line(value);
+      return;
+    }
+    w_.open("if (" + col_null(c) + ")");
+    w_.line("bc_sort_key_null(cx, sk, " + placed);
+    w_.otherwise();
+    w_.line(value);
     w_.close();
   }
 

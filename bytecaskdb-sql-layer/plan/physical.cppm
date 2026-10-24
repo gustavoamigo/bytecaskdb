@@ -177,12 +177,15 @@ struct SortPart {
 
 // A pipeline breaker: every row of its input added to sorters, keyed by
 // `keys` (bc_sort_key_*), then streamed in that order. A sorter holds one
-// view per row, so there is one per loop of the input, each holding the row
-// of its loop's table, `payloads`, outer first, all fed the same key. A
+// view per row, so there is one per loop of the input whose row is read
+// above the Sort, each holding the row of its loop's table, `payloads`,
+// outer first, all fed the same key; with none, one holds the keys alone. A
 // sorter is stable, and a top-n one keeps the earliest of equal keys, so the
 // sorters hold rows of the same input rows in the same order, and are read
 // in step. The rows of tables read once before the first loop stay in hand,
 // and a table looked up per row after it is looked up again above the Sort.
+// Another loop's row is read only below it, its sort key built from it or
+// from a covering scan's entry.
 // With keep n > 0 each sorter holds only the first n (ORDER BY … LIMIT n); 0
 // holds all. A row NULL in a column of `not_null` is not added: a hash
 // join's probe key, which matches nothing.
@@ -543,6 +546,26 @@ private:
         n.op);
   }
 
+  // The sort a node's rows come from, through the lookups by key repeated
+  // above it, in the branches taken; or null.
+  auto sort_below(const Node& n) const -> const Sort* {
+    if (const auto* o = std::get_if<Sort>(&n.op)) return o;
+    if (const auto* f = std::get_if<Filter>(&n.op)) return sort_below(*f->input);
+    if (const auto* l = std::get_if<Limit>(&n.op)) return sort_below(*l->input);
+    if (const auto* j = std::get_if<IndexJoin>(&n.op)) return sort_below(*j->outer);
+    if (const auto* c = std::get_if<Choice>(&n.op)) return sort_below(taken(*c));
+    return nullptr;
+  }
+
+  // A column read above the sort `n`'s rows come from is of a row in hand:
+  // never of a loop no sorter holds, whose row the sorter loop has not.
+  void held_above(const Node& n, const ColumnRef& c) const {
+    const auto* o = sort_below(n);
+    if (o == nullptr || std::ranges::find(o->payloads, c.table) != o->payloads.end()) return;
+    auto in = loops(*o->input);
+    if (std::ranges::find(in, c.table) != in.end()) broken("a column read above a sort from a loop no sorter holds");
+  }
+
   // The inner side of a nested loop, one of its plans: a scan under filters
   // that each compare a column of the scan's table, read from its row, with
   // a parameter or a column of the outer side.
@@ -608,6 +631,7 @@ private:
             for (const auto& e : op.inner_key) {
               null_checked(e);
               reads(e);
+              if (e.kind == Expr::Kind::Column) held_above(*op.outer, e.col);
             }
             node(*op.outer, &n);
           } else if constexpr (std::is_same_v<T, NestedLoop>) {
@@ -686,15 +710,20 @@ private:
           } else if constexpr (std::is_same_v<T, Sort>) {
             if (op.keys.empty()) broken("a sort with no key");
             if (op.keep < 0) broken("a sort that keeps a negative number of rows");
-            // A sorter per loop, each holding its loop's row; a covering
-            // scan's entry has none.
-            if (loops(*op.input) != op.payloads) broken("a sort whose sorters hold other rows than its loops'");
+            // A sorter per loop it holds, outer first, each holding its
+            // loop's row; a covering scan's entry has none.
+            auto held = op.payloads.begin();
+            for (auto t : loops(*op.input)) {
+              if (held != op.payloads.end() && *held == t) ++held;
+            }
+            if (held != op.payloads.end()) broken("a sort whose sorters hold other rows than its loops'");
             for (auto t : op.payloads) {
               if (std::ranges::find(covering_, t) != covering_.end()) broken("a sort over a covering scan");
             }
             auto in = tables_of(*op.input);
             for (const auto& k : op.keys) {
               if (std::ranges::find(in, k.col.table) == in.end()) broken("a sort key outside its input's tables");
+              read(k.col);
             }
             // A row's NULL is tested before it is added, from a row in hand.
             for (const auto& c : op.not_null) {
@@ -706,7 +735,10 @@ private:
             if (parent == nullptr || !std::holds_alternative<Emit>(parent->op)) broken("a LIMIT not under the rows emitted");
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Emit>) {
-            for (const auto& t : op.targets) read(t);
+            for (const auto& t : op.targets) {
+              read(t);
+              held_above(*op.input, t);
+            }
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Aggregate>) {
             if (op.agg.kind != Expr::Kind::Aggregate) broken("an aggregate that is not an aggregate call");

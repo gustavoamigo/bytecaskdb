@@ -622,12 +622,14 @@ struct Candidate {
   }
 };
 
-// The candidate with every loop's rows read, for sorters to hold.
-void read_rows(Candidate& c) {
-  c.access = uncovered(c.access);
+// The candidate with the rows of the tables `rels` read by its own access
+// paths, for sorters to hold.
+void read_rows(Candidate& c, const std::vector<std::size_t>& rels) {
+  auto held = [&](std::size_t r) { return std::ranges::find(rels, r) != rels.end(); };
+  if (held(c.first)) c.access = uncovered(c.access);
   for (auto& s : c.steps) {
-    if (auto* ne = std::get_if<Nested>(&s)) ne->access = uncovered(ne->access);
-    if (auto* h = std::get_if<Hashed>(&s)) h->access = uncovered(h->access);
+    if (auto* ne = std::get_if<Nested>(&s); ne != nullptr && held(ne->rel)) ne->access = uncovered(ne->access);
+    if (auto* h = std::get_if<Hashed>(&s); h != nullptr && held(h->rel)) h->access = uncovered(h->access);
   }
 }
 
@@ -755,6 +757,8 @@ private:
   struct Query {
     std::vector<Rel> rels;
     Conjuncts on;
+    std::vector<ColumnRef> above;    // what a SELECT reads above a sort: its result's columns
+    std::vector<ColumnRef> sort_by;  // the ORDER BY's columns a sort keys on
 
     [[nodiscard]] auto index_of(std::uint32_t table) const -> std::size_t {
       for (std::size_t i = 0; i < rels.size(); ++i) {
@@ -1222,13 +1226,13 @@ private:
   // refused if none. A plan that fails is carried on as far as it reaches,
   // so the refusal names the failure of the furthest stage a plan of every
   // table reached. `ordered` is the ORDER BY without the columns the WHERE
-  // makes constant. With `sorts`, a plan not in its order sorts its rows, its
-  // loops reading them (finish): each candidate is kept and pruned at the cost
-  // of the plan it becomes.
+  // makes constant. With `sorts`, a plan not in its order sorts its rows, the
+  // loops its sorters hold reading them (read_for_sort): each candidate is
+  // kept and pruned at the cost of the plan it becomes.
   auto candidates(const Query& q, const std::vector<OrderItem>& ordered, const std::vector<ColumnRef>& used,
                   bool may_cover, bool sorts) -> Searched {
     auto cost = [&](Candidate& c) {
-      if (sorts && !c.ordered()) read_rows(c);
+      if (sorts && !c.ordered()) read_for_sort(q, c);
       costed(c);
     };
     auto cost_of = [&](Candidate c) {
@@ -1409,7 +1413,8 @@ private:
   }
 
   // The candidate's rows, with its choice points. With `sort`, they are
-  // sorted: a sorter per loop holds that loop's row, each fed the same key,
+  // sorted: a sorter per loop read above the sort holds that loop's row
+  // (held_rels), each fed the same key,
   // and each table looked up by key after the first loop is looked up again
   // from them, above the sort; its filters held already. A hash join's probe
   // side is sorted instead, where it probes in the order (probe_sorted),
@@ -1502,7 +1507,7 @@ private:
     auto in_choice = std::ranges::any_of(choices, &ChoiceAt::sorts_first);
     if (sort != nullptr && !in_choice && !c.probe_sorted) {
       std::vector<std::uint32_t> payloads;
-      for (auto r : c.loop_rels()) payloads.push_back(q.rels[r].table().id);
+      for (auto r : held_rels(q, c)) payloads.push_back(q.rels[r].table().id);
       out.rows = sorted(std::move(out.rows), *sort, std::move(payloads));
       for (auto i = c.after_first_loop(); i < c.steps.size(); ++i) {
         if (const auto* pr = std::get_if<Probe>(&c.steps[i])) {
@@ -1599,11 +1604,14 @@ private:
   // plan that gives the ORDER BY by its order (`needs_order`), the loop's
   // second plan gives it too. A sorted plan of one table takes the choice by
   // the budget (by_budget) there instead, at a full scan too, its second plan
-  // any that gives the order. `tried` is each table's access paths.
-  auto choose(const Candidate& c, const Sink& sink, const std::vector<std::vector<Tried>>& tried, bool needs_order,
-              const SortSpec* sort) const -> std::vector<ChoiceAt> {
+  // any that gives the order. In a sorted plan, the second plan of a loop a
+  // sorter holds reads rows, as its first does. `tried` is each table's
+  // access paths.
+  auto choose(const Query& q, const Candidate& c, const Sink& sink, const std::vector<std::vector<Tried>>& tried,
+              bool needs_order, const SortSpec* sort) const -> std::vector<ChoiceAt> {
     std::vector<ChoiceAt> out;
     const auto loop = c.driving();
+    const auto held = sort != nullptr ? held_rels(q, c) : std::vector<std::size_t>{};
     for (std::size_t at = 0; at <= c.steps.size() && out.size() < kMaxChoices; ++at) {
       const auto* ne = at == 0 ? nullptr : std::get_if<Nested>(&c.steps[at - 1]);
       if (at > 0 && (ne == nullptr || ne->rescan)) continue;  // a lookup by key, or a count per outer row
@@ -1626,7 +1634,7 @@ private:
         const auto* sb = scan_of(t.access);
         if (sb->object == scan_of(a)->object && t.access.keyed == a.keyed) continue;  // the same range
         auto b = ne == nullptr ? t.access : read_once(t.access, ne->on);
-        if (sort != nullptr && at == loop) b = uncovered(std::move(b));
+        if (std::ranges::find(held, rel) != held.end()) b = uncovered(std::move(b));
         auto other = c;
         other.access_at(at) = b;
         auto second = [&](double x) { return finished_cost(sink, measure(other, Entries{at, entries_beside(a, b, x)})); };
@@ -1644,20 +1652,15 @@ private:
   }
 
   // A candidate made ready for `order` (the statement's ORDER BY, or null):
-  // where it does not give it, its loops read rows, and the sink sorts them,
-  // a sorter per loop; or, for a hash join whose ORDER BY is all of its probe
-  // side's loop's table, its probe side is sorted. Whether it sorts.
+  // where it does not give it, it is sorted (read_for_sort), by the sink, a
+  // sorter per loop it holds, or, for a hash join, on its probe side. Whether
+  // it sorts.
   static auto prepare(const Query& q, Candidate& c, Sink& sink, const SortSpec* order) -> bool {
     if (order == nullptr || c.ordered()) return false;
-    read_rows(c);
-    const auto d = *c.driving();
-    const auto table = q.rels[d == 0 ? c.first : rel_of(c.steps[d - 1])].table().id;
-    if (c.hash() != nullptr &&
-        std::ranges::all_of(order->keys, [&](const physical::SortPart& k) { return k.col.table == table; })) {
-      c.probe_sorted = true;
-    } else {
+    read_for_sort(q, c);
+    if (!c.probe_sorted) {
       sink.sorted = true;
-      sink.copies = c.loop_rels().size() - 1;
+      sink.copies = std::max<std::size_t>(held_rels(q, c).size(), 1) - 1;
       sink.again = static_cast<std::size_t>(std::ranges::count_if(
           c.steps.begin() + static_cast<std::ptrdiff_t>(c.after_first_loop()), c.steps.end(),
           [](const Step& st) { return std::holds_alternative<Probe>(st); }));
@@ -1666,12 +1669,49 @@ private:
     return true;
   }
 
-  // The least count of rows past which a hash table of `h`'s build may not
-  // fit the memory budget: one of n rows holds at least kHashBytes, and per
-  // row kHashEntryBytes and its row and key, each no smaller than the
-  // fewest bytes it can hold (least_row_bytes; a marker and the value of
-  // each key part, an empty one's for a byte string). So a build under it
-  // fits whenever its rows and keys are no larger than that.
+  // The tables, by position in FROM order, of the loops whose rows a sort
+  // above the candidate holds, outer first: those read above it, by the
+  // result or by a lookup by key repeated there. Every other loop's row is
+  // read only below the sort, for its key, filters and joins, and is not
+  // held; with none held, one sorter holds the keys alone.
+  static auto held_rels(const Query& q, const Candidate& c) -> std::vector<std::size_t> {
+    auto read = q.above;
+    for (auto i = c.after_first_loop(); i < c.steps.size(); ++i) {
+      if (const auto* pr = std::get_if<Probe>(&c.steps[i])) {
+        for (const auto& e : pr->key) logical::columns_of(e, read);
+      }
+    }
+    std::vector<std::size_t> out;
+    for (auto r : c.loop_rels()) {
+      const auto id = q.rels[r].table().id;
+      if (std::ranges::any_of(read, [&](const ColumnRef& col) { return col.table == id; })) out.push_back(r);
+    }
+    return out;
+  }
+
+  // A candidate not in the ORDER BY's order made ready for its sort, decided
+  // before any access is uncovered: a hash join whose ORDER BY is all of its
+  // probe side's loop's table sorts its probe side (probe_sorted), whose loop
+  // alone reads rows; any other plan is sorted above, each loop a sorter
+  // holds (held_rels) reading rows.
+  static void read_for_sort(const Query& q, Candidate& c) {
+    const auto d = *c.driving();
+    const auto rel = d == 0 ? c.first : rel_of(c.steps[d - 1]);
+    const auto table = q.rels[rel].table().id;
+    c.probe_sorted = c.hash() != nullptr &&
+                     std::ranges::all_of(q.sort_by, [&](const ColumnRef& col) { return col.table == table; });
+    read_rows(c, c.probe_sorted ? std::vector<std::size_t>{rel} : held_rels(q, c));
+  }
+
+  // A count of rows past which a hash table of `h`'s build may not fit the
+  // memory budget: one of n rows holds kHashBytes, and per row
+  // kHashEntryBytes and its row, no smaller than the fewest bytes a row can
+  // hold (least_row_bytes), and per distinct key its bytes, here a marker
+  // and the value of each key part, an empty one's for a byte string. This
+  // counts a key's bytes per row, as if no two rows shared a key, so it is
+  // conservative: it may switch to the other plan at fewer rows than the
+  // least that would pass, never at more. A build under it fits whenever
+  // its rows and keys are no larger than those bounds.
   auto hash_past(const Query& q, const Candidate& c, const Hashed& h) const -> std::uint64_t {
     const auto& held = q.rels[h.build_inner ? h.rel : c.first].table();
     std::uint64_t key = 0;
@@ -1717,7 +1757,7 @@ private:
     auto sorts = prepare(q, c, sink, order);
     const auto* sort = sorts ? order : nullptr;
     if (c.hash() != nullptr) return finish_hash(q, std::move(c), sink, sort, avoiding, wrap);
-    auto choices = choose(c, sink, searched.tried, order != nullptr && !sorts, sort);
+    auto choices = choose(q, c, sink, searched.tried, order != nullptr && !sorts, sort);
     auto b = build(q, c, choices, sort);
     auto cost = finished_cost(sink, measure(c)) + kCountCost * static_cast<double>(choices.size());
     return Finished{wrap(std::move(b.rows)), std::move(b.null_checks), std::move(b.computed), cost};
@@ -1727,7 +1767,7 @@ private:
   // side's rows are held, so where they may pass the memory budget and
   // another plan of the statement avoids the hash table, `avoiding`, that
   // plan is the second plan of a choice point, counting the build side's
-  // range, a full scan's the whole table, limited to the least count past
+  // range, a full scan's the whole table, limited to a count past
   // which it may not fit (hash_past). A build known not to fit, of a range of
   // at most one row, is left out where another plan avoids it, and one known
   // to fit takes no choice point. Where none avoids it, the hash join runs,
@@ -1859,11 +1899,22 @@ private:
     // each value from its row.
     auto distinct = agg != nullptr && agg->distinct;
     auto sorting = agg == nullptr && !ordered.empty();
-    auto searched = candidates(q, ordered, s.below->output, !for_update && !distinct, sorting);
+    // A loop no sorter holds builds the sort key from its entry, which a
+    // covering scan's must hold.
+    auto used = s.below->output;
+    if (sorting) {
+      for (const auto& o : ordered) {
+        q.sort_by.push_back(o.col);
+        if (std::ranges::find(used, o.col) == used.end()) used.push_back(o.col);
+      }
+      for (const auto& o : s.project->exprs) q.above.push_back(o.expr.col);
+    }
+    auto searched = candidates(q, ordered, used, !for_update && !distinct, sorting);
     auto emits = !s.limit || *s.limit > 0;
     const auto sink = agg == nullptr ? Sink{s.limit} : Sink{std::nullopt, distinct};
     const auto* order = sorting ? &sort : nullptr;
-    const auto avoiding = without_hash(q, searched, sink, order);
+    const auto hashes = std::ranges::any_of(searched.plans, [](const Candidate& c) { return c.hash() != nullptr; });
+    const auto avoiding = hashes ? without_hash(q, searched, sink, order) : std::nullopt;
     std::vector<Finished> out;
     for (const auto& c : searched.plans) {
       if (agg == nullptr) {

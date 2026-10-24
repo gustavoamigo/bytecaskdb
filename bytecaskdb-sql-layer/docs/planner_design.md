@@ -1236,22 +1236,40 @@ row's pairs in the order their rows were put. So it gives the `ORDER BY`
 where its probe side's access does. Otherwise, where every `ORDER BY`
 column, but those the `WHERE` makes constant, is the probe side's table's,
 its probe side can be sorted before it probes, every row kept, since the
-join may drop any of them, and the `LIMIT` counted above.
+join may drop any of them, and the `LIMIT` counted above. That is decided
+before any loop is made to read rows: the probe side's sorter holds its
+row, read for the hash keys above it, so its loop reads rows, and nothing
+else does for it.
 
 Any plan can instead be sorted above it, a hash join's or a nested loop
 of two scans', whatever the `ORDER BY`'s columns. A sorter holds one view
-per entry, so there is a sorter per loop of the plan, each holding that
-loop's table's row, all fed the same sort key, built once per row; a
-hash join's loops are its probe side's and the one over the rows it holds.
-A sorter is stable and a top-n sorter keeps the earliest of equal keys
-(`plan_api_design.md`, *Sort keys*), so sorters fed the same keys in the
-same order hold the rows of the same pairs, in the same order, and under
-`LIMIT n` all keep n. The sorter loop steps the first with
+per entry, so there is a sorter per loop of the plan whose row is read
+above the sort, by the result or by a lookup by key repeated there, each
+holding that loop's table's row, all fed the same sort key, built once per
+row; a hash join's loops are its probe side's and the one over the rows it
+holds. A sorter is stable and a top-n sorter keeps the earliest of equal
+keys (`plan_api_design.md`, *Sort keys*), so sorters fed the same keys in
+the same order hold the rows of the same pairs, in the same order, and
+under `LIMIT n` all keep n. The sorter loop steps the first with
 `bc_sorter_next` and reads each other at the same place with
 `bc_sorter_nth`. Tables looked up by key after the first loop are looked
 up again above the sort, as for one loop.
 
+A loop whose row nothing above the sort reads has no sorter: its row is
+read only below it, for the sort key, its filters and the join, and its
+access is free to cover. Each `ORDER BY` column is then among the columns a
+covering scan's index must hold, and a sort key part read from its entry is
+`bc_sort_key_<type>` of `bc_key_part_<type>`, `bc_sort_key_null` where the
+entry's part is NULL; never a `DOUBLE`, which the key does not hold
+exactly. Where no loop's row is read above it, one sorter holds the keys
+alone, its payload `bc_empty`, and the rows read once before the first loop
+stay in hand. A choice point's second plan at a loop a sorter holds reads
+rows, as its first does, and at a loop none holds may cover. With the two
+tables the binder takes, a choice point is only ever at the loop that
+drives the plan: a table read once per outer row takes none.
+
 ```c
+/* SELECT t.id, p.a … ORDER BY p.v: both loops' rows read above the sort */
 bc_sorter s0 = bc_sorter_open(cx, 0);
 bc_sorter s1 = bc_sorter_open(cx, 0);
 /* the outer loop, then the inner one */
@@ -1279,7 +1297,12 @@ under `LIMIT 0`. Before, a hash join under `LIMIT 0` ran its whole build.
 as a nested loop counts its join conjuncts. A sorted probe side adds its
 rows × (1 + 0.5), the sort's. A sort above a plan of several loops costs
 the sort's per pair held in its first sorter, and 0.5 per pair in each
-further one, the weight of its copy: `bc_sorter_nth` steps no cursor. Under `LIMIT n` the build, and a sorted
+further one, the weight of its copy: `bc_sorter_nth` steps no cursor. Each
+loop a sorter holds is costed reading rows, at 2 reads per entry of an
+index, and each other one at its access's cost, covering or not; a probe
+side sorted before it probes, at its own loop's rows read. The search keeps
+and prunes each candidate at that cost, so it compares plans at the cost
+they run at. Under `LIMIT n` the build, and a sorted
 probe side, are not cut: the plan costs them, plus the rest × n / the
 rows. No choice point by costs is at either side of a hash join.
 
@@ -1304,13 +1327,16 @@ hash join over a nested loop by that much per probe row.
 
 **The planner uses the budget** (*Memory*). A hash table of n rows holds
 `kHashBytes` (192 bytes), and per row `kHashEntryBytes` (240) with the
-row, and each new key's bytes. A row holds at least its header, bitmap and
-fixed columns, in the smallest layout its table's rows may have, and a key
-at least a marker and the value of each part: 8 bytes for an integer, 1
-for a BOOLEAN, 2 for an empty byte string. So the threshold is
-(`max_bytes` − 192) / (240 + row + key) + 1, by the formula the sorter's
-uses (`least_past`): a build under it fits whenever its rows and keys are
-no larger than those bounds. Counting the entries alone, as this slice
+row, and each distinct key's bytes once (`bc_hash_put`). A row holds at
+least its header, bitmap and fixed columns, in the smallest layout its
+table's rows may have, and a key at least a marker and the value of each
+part: 8 bytes for an integer, 1 for a BOOLEAN, 2 for an empty byte string.
+The threshold is (`max_bytes` − 192) / (240 + row + key) + 1, by the
+formula the sorter's uses (`least_past`): a build under it fits whenever
+its rows and keys are no larger than those bounds. It charges a key's
+bytes per row, as if no two rows shared a key, so it is conservative, not
+the least count past the budget: where rows share keys, it switches to the
+other plan at fewer rows than would fail, never at more. Counting the entries alone, as this slice
 first did, let a build under the threshold fail with 54000 where the
 other plan would have answered.
 - Where another plan of the statement avoids the hash table, the hash join
@@ -1330,13 +1356,15 @@ other plan would have answered.
 - A sorted probe side, or a sort above the join, is not a choice by the
   budget: past it, it fails with 54000.
 - The cheapest plan without a hash join is found once per statement, and
-  is the second plan of every hash join's choice point.
+  only where some plan has a hash join, and is the second plan of every
+  hash join's choice point.
 - `SELECT u.k FROM t, u WHERE t.name = $1 AND u.v = t.qty`, t at 40 rows
   and u at 100, under a 10,000-byte budget: the hash join built on t's
   range costs 8 + 4 × 1.3 + 100 + 40. A row of t holds at least 36 bytes
-  (12 of header, 8 of bitmap, two fixed columns) and its key 9, so the plan
+  (12 of header, 8 of bitmap, two fixed columns) and a key 9, so the plan
   counts that range against 35 when it runs; under 35 it hashes, from 35 it
-  reads u once per row of t.
+  reads u once per row of t. Where t's rows share a `qty`, 35 rows hold
+  fewer bytes than that, and the switch comes early.
 
 ### What the search refuses
 
@@ -1370,7 +1398,14 @@ whose tables no key reaches.
   both tables' columns, `keep` 5 on both sorters),
   `hash_join_sorted_null_key` (a nullable probe key, its NULLs dropped
   before the sort and not tested again after it) and `hash_join_limit_zero`
-  (an empty plan). None of the others moved.
+  (an empty plan). None of the others moved. With the second review's
+  fixes, `sort_cross_join` moved: only t's `id` is read above the sort, so
+  it has one sorter, of t's rows, and no `bc_sorter_nth`; p's loop still
+  reads its rows, since `p_w` holds no `v`, the sort key. Its reads are the
+  same, and each pair holds one row in a sorter, not two. No other plan
+  moved. New: `sort_keys_alone` (t by its key, p's loop sorted by p's
+  column, nothing of p read above the sort: one sorter of the keys alone,
+  `bc_empty` its payload, t's row in hand above it).
 - **Search** (`search_test`): fixed counts choose a hash join over the
   nested loop and the other way round; the build side follows the counts,
   and under a `LIMIT`; an `ORDER BY` of one side's columns probes that
@@ -1379,7 +1414,15 @@ whose tables no key reaches.
   key's least bytes, one known not to fit is left out; a nested loop of two
   scans and a hash join sorted by one table's columns or both, a sorter per
   loop, under a `LIMIT` both keeping n; under `LIMIT 0` no plan reads
-  anything.
+  anything. Then, with the second review's fixes: a choice point at a loop
+  a sorter holds reads rows in both plans, though `p_w` covers, and every
+  plan costed passes `check` in every combination of its branches; not read
+  above the sort, the same loop covers and builds the sort key from its
+  entry; a nested loop of two scans sorted by p's column, only t's read
+  above it, has one sorter and p's covering index, a nullable key part
+  read from the entry, at one sorter's cost; a hash join sorting its probe
+  side holds its rows though nothing above reads one, and is costed so;
+  two keys on one probe column test it for NULL once before the sort.
 - **The budget at run time** (`api_transaction_test`): a hash join compiled
   at 20 rows of its build side under a 64 KiB budget, its rows at least 92
   bytes, counts its range against 192, not the 273 of its entries alone; at
@@ -1390,8 +1433,11 @@ whose tables no key reaches.
   the held table and one of the probe side, of one type, never DOUBLE; a
   choice point at a hash join counts its build side's range, and its other
   plan reads the same tables, a table looked up again above a sort counted
-  once; a sort has a sorter per loop of its input, outer first, each over a
-  row read, and tests for NULL only columns of its input's tables.
+  once; a sort has a sorter per loop of its input read above it, outer
+  first, each over a row read, and tests for NULL only columns of its
+  input's tables; a column read above it, by the result or a lookup by key,
+  is never of a loop no sorter holds; a sort key part read from a covering
+  scan's entry is never a `DOUBLE`.
 - **The allocation-fault sweep** fails each allocation of four compiled
   hash join plans in turn (`embedded API: an allocation failure in a hash
   join plan is BC_E_MEMORY or its rows`): alone, sorted on its probe side,
@@ -1416,7 +1462,10 @@ whose tables no key reaches.
   Its statements' plans are unchanged; the machine is a 4-core container,
   not slice 2's. After the review's fixes, the same run: 184,190 TPM, 82,280 NOPM,
   the conditions holding after it and in `check`; no plan of its
-  statements moved.
+  statements moved. After the second review's fixes: 149,504 TPM, 66,800
+  NOPM, the conditions holding after it and in `check`; again no plan of
+  its statements moved, so the difference is the container's, not the
+  plans'.
 
 ## Proposed `CONTRACT.md` changes
 

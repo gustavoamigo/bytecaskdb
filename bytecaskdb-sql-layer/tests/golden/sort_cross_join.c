@@ -9,7 +9,6 @@ void plan(bc_ctx *cx) {
     return;
   }
   bc_sorter s0 = bc_sorter_open(cx, 0);
-  bc_sorter s1 = bc_sorter_open(cx, 0);
   bc_view lo = bc_key_params(cx, IDX_3, 0, 1);
   bc_cursor c = bc_scan_open(cx, IDX_3, lo, lo, BC_SCAN_PREFIX);
   while (bc_scan_next(cx, c)) {
@@ -20,16 +19,11 @@ void plan(bc_ctx *cx) {
       bc_view row1 = bc_scan_row(cx, c1);
       bc_sort_key sk = bc_sort_key_begin(cx);
       bc_sort_key_col(cx, sk, row1, COL_4_2, BC_SORT_ASC, BC_SORT_NULLS_LAST);
-      bc_view skv = bc_sort_key_end(cx, sk);
-      bc_sorter_add(cx, s0, skv, row);
-      bc_sorter_add(cx, s1, skv, row1);
+      bc_sorter_add(cx, s0, bc_sort_key_end(cx, sk), row);
     }
   }
   bc_view p0 = bc_empty(cx);
-  int64_t r1 = 0;
   while (bc_sorter_next(cx, s0, &p0)) {
-    bc_view p1 = bc_sorter_nth(cx, s1, r1);
-    ++r1;
     bc_emit_begin(cx);
     bc_emit_col(cx, p0, COL_1_0);
     bc_emit_end(cx);
