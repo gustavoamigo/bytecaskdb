@@ -1,18 +1,16 @@
-# The PostgreSQL wire-protocol server: slice 1, for the MVP gate
+# The PostgreSQL wire-protocol server and the HammerDB gate
 
-Status: design, approved (owner, 2026-10-22). #494's first slice.
+Status: **built** (owner's approval, 2026-10-22). This covers
+`sql_layer_server`, the server HammerDB connects to; the HammerDB driver
+script that sends the layer's statements; and the gate that runs them,
+HammerDB's TPROC-C over the wire at 1, 16 and 48 virtual users (*Decisions*,
+11). The in-process harness of `testing_design.md` (*The TPROC-C harness*)
+checks the consistency conditions, runs Elle and the CI smoke test, and gives
+the no-network baseline.
 
-The MVP gate is HammerDB's TPROC-C driving the layer over PostgreSQL's
-wire protocol (`frontend_design.md`, *The MVP gate*). This slice is the
-server that HammerDB connects to and the HammerDB driver script that sends
-our statements. The harness of `testing_design.md` (*The TPROC-C
-harness*) stays: it checks the consistency conditions, runs Elle and the
-CI smoke test, and gives the no-network baseline. It is not the gate.
-
-#494 planned a gRPC server first, with the PostgreSQL protocol as a shim in
-front of it. The gate needs the PostgreSQL protocol and nothing else, so the
-protocol comes first, as a thin stateful front over the embedded API. gRPC
-stays in #494, after this slice.
+The server is a thin, stateful front over the embedded API. The thread
+model, the transport and the driver format are to be redesigned
+(#487, *Next*). What follows is what is built.
 
 Names: the benchmark is HammerDB's TPROC-C, and the layer's files and
 binaries use that name (the harness is `sql_layer_tprocc`,
@@ -93,7 +91,10 @@ costs one lookup in `Database::prepare`'s cache, keyed by the exact text.
 ## The server
 
 **Binary and modules.** `sql_layer_server --dir DIR [--listen
-127.0.0.1:5432] [--database NAME] [--max-connections 100]` serves one
+127.0.0.1:5432] [--database NAME] [--max-connections 100]
+[--sync AT_EVERY_COMMIT|AT_INTERVAL|AT_FILE_ROTATION] [--sync-interval-ms 1000]
+[--io-backend pread|mmap|buffer_pool] [--buffer-pool-size BYTES]
+[--buffer-pool-direct-io on|off]` serves one
 database directory under one database name, by default the directory's
 last component. It opens the directory with `Database::open`, so it holds
 the engine's directory lock. The code is in `bytecaskdb-sql-layer/server/`:
@@ -107,6 +108,51 @@ the engine's directory lock. The code is in `bytecaskdb-sql-layer/server/`:
 - `main.cpp`: arguments, the listener, signals.
 
 The layer is POSIX-only here: no WASM or Windows build of the server.
+
+**Durability.** `--sync` and `--sync-interval-ms` are `DatabaseOptions::sync`
+and `sync_interval_ms`, with the names and meanings of the MariaDB plugin's
+`bytecaskdb_sync` and `bytecaskdb_sync_interval_ms`
+(`bytecaskdb-mariadb-plugin/docs/mariadb_engine_design.md`, *Durability
+modes*). They are fixed at startup: unlike the plugin, the server has no
+`SET GLOBAL`.
+
+A commit goes to the data file before it returns, in every mode. The mode
+decides only whether it waits for `fdatasync`:
+- `AT_EVERY_COMMIT` (default): autocommit statements and transaction commits
+  pass `sync = true` to the engine, and concurrent commits share one
+  `fdatasync` through its group commit.
+- `AT_INTERVAL`: they pass `sync = false`. A flusher thread, started by
+  `Database::open`, waits `sync_interval_ms`, runs
+  `apply_batch({.sync = true}, WritePlan{})`, and repeats: a commit is
+  durable once the next sync ends, up to an interval plus a sync's own time
+  after it returns.
+  The engine returns from that empty synced plan once every earlier write is
+  durable, and does no `fdatasync` when none is waiting. `close()` stops and
+  joins the flusher before it takes the exclusive lock, so a last sync in
+  flight holds up no other call, and a concurrent `close()` waits for the
+  join before it closes the engine.
+
+  A failed sync is logged to stderr. A failed `fdatasync` degrades the
+  engine, as the engine's `CONTRACT.md` states (*Degraded*): every later
+  write fails, and `close()` throws `DbDegraded`, naming the commits that are
+  not durable (the server then exits non-zero). No sync can succeed after
+  that, so the flusher stops. Any other failure is logged once and retried
+  at the next interval.
+- `AT_FILE_ROTATION`: they pass `sync = false` and no flusher runs. Data
+  reaches the disk when the active file rotates, and at `close()`.
+
+DDL always passes `sync = true`, as the plugin's does. The engine counter
+`bytecask.fsyncs` shows the difference.
+
+**Reads.** `--io-backend`, `--buffer-pool-size` and `--buffer-pool-direct-io`
+are `DatabaseOptions::io_backend` and `buffer_pool`, with the names, values
+and defaults of the plugin's `bytecaskdb_io_backend`,
+`bytecaskdb_buffer_pool_size` and `bytecaskdb_buffer_pool_direct_io`: `pread`
+by default, and a pool of `--buffer-pool-size` bytes, total footprint, filled
+with `O_DIRECT` unless `--buffer-pool-direct-io off`. They change where
+sealed-file reads are served from, not what is read
+(`docs/buffer_pool_design.md`). The pool must hold at least twice the
+engine's file size (default 64 MiB); a smaller one is refused at startup.
 
 **Threading.** One thread per connection, and an acceptor thread. A
 connection's thread reads a message, runs it on the embedded API, which
@@ -182,12 +228,12 @@ nothing more. After startup, an invalid message length or type is `FATAL`.
    - `options` must be empty.
    - Any other parameter is `FATAL 42704` (`undefined_object`), as
      PostgreSQL refuses an unknown setting.
-3. **Authentication: trust only, and only for the MVP.**
+3. **Authentication: trust only.**
    `AuthenticationOk` is sent at once. Anyone who can reach the port is in,
    so the server listens on 127.0.0.1 unless `--listen` names another
    address, and it prints a warning when that address is not a loopback
-   one. Password and SCRAM authentication come with #494's authentication
-   item.
+   one. Password and SCRAM authentication come with the transport design
+   (#487, *Next*).
 4. **`ParameterStatus`**:
    - `server_version` `17.0`: the dialect the statements are proven
      against, which libpq and psycopg parse;
@@ -276,7 +322,7 @@ statement the session runs at `Execute`.
 - DDL inside a transaction is the layer's `0A000`.
 - Results: `RowDescription` (for a row-returning statement), one `DataRow`
   per row, then `CommandComplete`. The tag comes from the statement's
-  command (*API changes*, 3):
+  command (*What it uses from the embedded API*, 3):
   - `SELECT n`, where n is the row count;
   - `INSERT 0 n`, `UPDATE n` and `DELETE n`, where n is `Rows::affected`;
   - for DDL, its command words: `CREATE TABLE`, `CREATE INDEX`,
@@ -325,7 +371,7 @@ other statements is.
   - the type's OID, length and modifier;
   - format 0.
 
-  The column types are known before the statement runs (*API changes*, 2).
+  The column types are known before the statement runs (*What it uses from the embedded API*, 2).
 - **`Execute`** runs the portal and sends its rows and `CommandComplete`. A
   row limit above 0 is `0A000`; libpq sends 0.
 - **`Sync`** replies with `ReadyForQuery`.
@@ -405,12 +451,12 @@ A result column's type is the one the compiler gives it
 - `COUNT`, `BIGINT`;
 - `SUM` of a `SMALLINT` or `INTEGER`, `BIGINT`;
 - `SUM` of a `BIGINT` or `DECIMAL`, PostgreSQL's unconstrained `numeric`,
-  at the input's scale (`frontend_design.md`, *The dialect subset*).
+  at the input's scale (`frontend_design.md`, *The dialect*).
 
 Unconstrained `numeric` is OID 1700 with modifier -1, and its text has the
 input's scale: `123.45` for a sum of `DECIMAL(6, 2)`. `SqlType` writes it
-as a `DECIMAL` of precision 0 at that scale, the type slice 4's compiler
-gives `SUM`.
+as a `DECIMAL` of precision 0 at that scale, the type the compiler gives
+`SUM`.
 
 **Output** is PostgreSQL's text form, with the `ParameterStatus` settings
 above:
@@ -445,7 +491,7 @@ are:
       example, -1.00 + 0.995 rounds to -0.01, but -1.00 + 1.00 is 0.00.
 
     The server refuses rather than give either value. `ParamInfo` says
-    which use a parameter has (*API changes*, 1).
+    which use a parameter has (*What it uses from the embedded API*, 1).
   - `NaN` is `22P02`.
 - floats: what `strtod` reads, plus `NaN`, `Infinity`, `-Infinity`
   (`inf` too), any case. Rounding a `REAL` is the layer's.
@@ -475,7 +521,7 @@ difference: the driver writes ISO.
 Warnings are `NoticeResponse` with `S` `WARNING`.
 
 The SQLSTATE comes from one function in the API, `sqlstate(const
-std::exception&)` (*API changes*, 4). The server, the Python binding and
+std::exception&)` (*What it uses from the embedded API*, 4). The server, the Python binding and
 the proof oracle all use it, so the oracle's check of SQLSTATEs against
 PostgreSQL also checks the server's mapping. The mapping:
 
@@ -530,10 +576,10 @@ assigned to two columns of different types with `42P08` whatever the types.
 The planner's "no plan" refusals are among them (#541). HammerDB's driver sends
 no statement that fails to bind.
 
-## API changes
+## What it uses from the embedded API
 
-The server needs five things that `api/database.cppm` did not expose. All
-are read from what the binder and compiler already keep:
+Five calls of `api/database.cppm` exist for the server. All read what the
+binder and compiler already keep:
 1. `Statement::params() -> std::vector<ParamInfo>`, with `ParamInfo
    {SqlType type; bool assigned_only;}`.
    - `type` is the declared type of the column of the parameter's first
@@ -554,11 +600,10 @@ are read from what the binder and compiler already keep:
 4. `sqlstate(const std::exception&) noexcept -> std::string_view`: the
    table above. The range split moves into the catalog beside
    `out_of_range`, which writes every range message, so the split lives
-   where those messages are written. It is `RANGE_SQLSTATE` in
-   `tests/proof/oracle.py` today, matched by message prefix. The binding
-   exposes it as `ExecError.sqlstate`, and the oracle drops its own tables
-   for it. `test_every_range_message_maps_to_its_sqlstate` keeps proving
-   that every message maps.
+   where those messages are written. The binding exposes it as
+   `ExecError.sqlstate`, which the oracle reads.
+   `test_every_range_message_maps_to_its_sqlstate` proves that every
+   message maps.
 
 5. `Database::refit(stmt)`: recompiles a cached plan that the live catalog
    no longer fits, as its next run would, and runs nothing. A statement
@@ -578,8 +623,8 @@ script (`customscript`). It is a port of the client-side TPROC-C logic in
 HammerDB's MySQL driver, `src/mysql/mysqloltp.tcl`: the `neword`,
 `payment`, `ostat`, `delivery` and `slev` procedures of
 `insert_mysql_no_stored_procs`, and the timed driver's monitor. The ported
-script uses pgtcl and runs the statements of `frontend_design.md` (*The
-statements*), with `$n` parameters.
+script uses pgtcl and runs the statements of `testing_design.md` (*The
+TPROC-C statements*), with `$n` parameters.
 
 HammerDB's PostgreSQL driver cannot be used, because it calls PL/pgSQL
 procedures (or functions) through SQL `PREPARE`. Its monitor also reads
@@ -650,18 +695,25 @@ same population.
   runs them. That is how the driver itself is checked: the smoke test runs
 it against PostgreSQL as well, and the consistency conditions must hold
 there too. The gate reports only ByteCaskDB's numbers
-(`frontend_design.md`, *Decisions*, 7): PostgreSQL's throughput from these
+(*Decisions*, 10): PostgreSQL's throughput from these
 runs is not part of its output.
 
 ## Running the gate
 
 `bytecaskdb-sql-layer/hammerdb/run-gate.sh [--warehouses=48] [--vus=1,16,48]
 [--rampup=2] [--duration=5] [--mix="neword payment ostat delivery slev"]
-[--hammerdb-home=PATH] [--data-root=PATH] [--smoke --pg=CONNINFO]`. It
+[--hammerdb-home=PATH] [--data-root=PATH] [--server-flags="--sync AT_INTERVAL"]
+[--smoke --pg=CONNINFO]`. `--server-flags` goes to the server in every cell. It
 follows `run-hammerdb.sh` in the MariaDB plugin. `--smoke` is the short run
 of *Tests*, and `--pg` names the PostgreSQL it checks the driver on (its
 password in `PGPASSWORD`). `XMAKE_FLAGS` adds `xmake f` flags, as CI sets
 its toolchain.
+
+TinyCC is built with `--with-selinux` whenever SELinux is enabled on the
+build machine (`xmake.lua`): in enforcing mode its default way of making
+plan code executable, `mprotect`, is refused, and no plan links. It maps
+the code through a file in `/tmp` instead, which works in every SELinux
+mode but needs `/tmp` to allow executable mappings.
 
 1. **Build.** It builds `sql_layer_tprocc` and `sql_layer_server` in
    `releasedbg`; a debug engine walks the key directory on every commit.
@@ -741,7 +793,9 @@ The run script requires W ≥ the user count; the monitor is not a user.
     are `25P02`; `COMMIT` answers `ROLLBACK`, and nothing is committed;
   - after an error in an implicit block, `Sync` reports `I`;
   - the warnings;
-  - `--max-connections`.
+  - `--max-connections`;
+  - `--sync`, `--sync-interval-ms` and the I/O flags: each mode starts and
+    stops cleanly, and a bad value exits before the server listens.
 - **HammerDB smoke, nightly.** A scheduled workflow,
   `.github/workflows/sql-layer-hammerdb-nightly.yml`, runs `run-gate.sh --smoke`: two warehouses, two
   users, no ramp-up and a one-minute window, against the server and against
@@ -770,24 +824,11 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 - `Execute` with a row limit, several statements in one `Query`, SQL
   `PREPARE`, `SET`, `SHOW`, `COPY` and cancel are refused.
 - A result is built whole by the embedded API before its first `DataRow`
-  is sent. Streaming rows waits on the API streaming them (#494's
-  "results stream as `bc_emit` produces them").
+  is sent. Streaming rows waits on the API streaming them, part of the
+  transport design (#487, *Next*).
 - `Database::prepare`'s cache keeps every distinct text until close, so a
   client sending ever-new literal text grows it. The driver sends a fixed
   set (#549).
-
-## `CONTRACT.md` changes
-
-**Added (SQL):**
-- the server's startup: what it accepts and what it refuses, with trust
-  only;
-- the SQLSTATE each error is reported with, over the wire and through
-  `sqlstate()`;
-- the transaction-control statements' outcomes and tags;
-- the text forms, as PostgreSQL's for the types and forms listed.
-
-Each row names its tests: the wire proof, `test_wire.py` and the smoke
-test.
 
 ## Decisions
 
@@ -808,4 +849,7 @@ test.
    (owner, 2026-10-22).
 10. The gate reports ByteCaskDB's NOPM and TPM only. PostgreSQL 17 runs the
     driver to check it (the nightly smoke), and its throughput is not
-    reported (owner, 2026-10-22; `frontend_design.md`, *Decisions*, 7).
+    reported (owner, 2026-10-22).
+11. The gate is HammerDB's TPROC-C, with the layer's statements, through
+    this server at 1, 16 and 48 virtual users. It replaced the in-process
+    harness as the gate (owner, 2026-10-21).

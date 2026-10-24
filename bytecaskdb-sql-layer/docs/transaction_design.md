@@ -1,14 +1,9 @@
 # Transactions in the SQL layer
 
-Status: **design, approved by the owner (2026-10-20, #491); built.**
-Slice A built the transaction's view, statements inside a transaction,
-commit with 40001 on a conflict and 08007 when its outcome is unknown, and
-DDL during an open transaction. Slice B built insert claims (23505 at
-commit), 0A000 for DDL given to a transaction, and `FOR UPDATE`. It
-decides how the layer runs several statements as one
-transaction, which the MVP needs: TPROC-C's New-Order is about thirty
-statements that read their own writes (#487, *MVP*). Each decision is
-marked **MVP** or **later**.
+Status: **built** (owner's approval, 2026-10-20, #491). How the layer runs
+several statements as one transaction: TPROC-C's New-Order is about thirty
+statements that read their own writes. The parts not built are listed under
+*Later*.
 
 ## Two standing rules
 
@@ -30,7 +25,7 @@ bulk-copy mode, row counters, `HA_ERR_*` mapping), and it fixes the plugin's
 known faults: a read error taken as "absent" (#524), and the statement and
 reverse-scan gaps #491 listed.
 
-## What exists today
+## Autocommit statements
 
 `Database::execute` runs each DML statement as one *execution*:
 `bc_execute` takes a snapshot, runs the plan, and commits its effects as one
@@ -51,7 +46,7 @@ statements, adds a view that merges the snapshot with the earlier
 statements' writes, and moves the second-write rule from the execution to
 the statement.
 
-## Shape — MVP
+## Shape
 
 An in-process transaction handle on the embedded API:
 
@@ -71,10 +66,9 @@ auto Database::begin(TransactionOptions = {}) -> Transaction;
 - **One handle, one thread at a time.** Each handle owns its own `bc_ctx`,
   so transactions run concurrently on different threads. This is what the
   harness needs at 16 and 48 threads. Prepared statements are shared
-  read-only across handles; compiling one is serialised. This is the part
-  of #494's per-thread contexts the MVP needs.
-- **`Database::execute` stays autocommit,** a one-statement transaction
-  retried as today.
+  read-only across handles; compiling one is serialised.
+- **`Database::execute` is autocommit,** a one-statement transaction
+  retried as *Autocommit statements* says.
 - **The snapshot is taken at the first statement,** not at `begin()`, as
   PostgreSQL's REPEATABLE READ takes it: "a query in a repeatable read
   transaction sees a snapshot as of the start of the first
@@ -104,20 +98,22 @@ auto Database::begin(TransactionOptions = {}) -> Transaction;
   swaps in a new one. `close()` ends every open handle, and a handle may
   outlive its `Database`: it then touches nothing of it.
 
+**`BEGIN`, `COMMIT` and `ROLLBACK` as SQL text** are the server's: it keeps
+the session's block status and opens a handle at `BEGIN`
+(`server_design.md`, *A session*). Through the embedded API,
+`Database::execute("BEGIN")` is refused (0A000), since the handle is how a
+transaction is opened there.
+
 **Later:**
-- `BEGIN` / `COMMIT` / `ROLLBACK` as SQL text. The MVP has the handle
-  only, and `Database::execute("BEGIN")` is refused (0A000). Statement text
-  that opens a transaction needs per-session state, which principle 3 keeps
-  off the server, so it comes with the server;
-- the server's token form, where `BEGIN` returns a token naming a
-  snapshot and a pending log held with a TTL, and statements carry it
-  across requests on any thread (#494);
+- a token form, where `BEGIN` returns a token naming a snapshot and a
+  pending log held with a TTL, and statements carry it across requests on
+  any thread. It belongs to the transport design (#487, *Next*);
 - procedures that run a whole transaction inside the runtime and retry it
   there (#495).
 
 Both reuse this engine. The handle is the token's in-process half.
 
-## The transaction's view — MVP
+## The transaction's view
 
 Every read a plan makes inside a transaction goes through one view: the
 snapshot overlaid with the writes of the transaction's committed statements.
@@ -156,11 +152,11 @@ answer is:
   is #524. Here it is a requirement with a test: inject a read failure under
   each call in the table above.
 
-## Statements inside a transaction — MVP
+## Statements inside a transaction
 
 **A statement sees the snapshot plus the writes of earlier statements,
 never its own.** A statement's effects go to its own pending list, as an
-execution's do today. The view it reads is the overlay as it stood when the
+execution's do. The view it reads is the overlay as it stood when the
 statement began. When the statement succeeds, its effects are appended to
 the transaction's log and applied to the overlay.
 
@@ -180,7 +176,7 @@ transaction sees it".
 
 **The second-write rule applies per statement.** `written_rows` is cleared
 at each statement's start, not each transaction's. Within a statement it
-works as today: `BC_E_HANDLE`, or `BC_C_UNIQUE` for a second insert of one
+works as in autocommit: `BC_E_HANDLE`, or `BC_C_UNIQUE` for a second insert of one
 key. A later statement may write a row an earlier one wrote, and the
 cross-statement refusal that `docs/plan_api_design.md` describes is removed.
 
@@ -196,7 +192,7 @@ User `SAVEPOINT` / `ROLLBACK TO` are **later**: TPROC-C doesn't use them.
 When they come they are a mark in the log plus a copy of the overlay's
 state at the mark, as `MariaDBTxn` keeps them; nothing here blocks that.
 
-## Commit and conflicts — MVP
+## Commit and conflicts
 
 **Mechanism: commit builds one `WritePlan` on the transaction's snapshot
 from the overlay.** The overlay's range tombstones go first, then each
@@ -215,7 +211,7 @@ statements, needs no guard.
 |---|---|---|
 | Committed | Rows returned | Returns |
 | Conflict on a key the transaction inserted, now taken (below) | The retry's own unique check reports it: `ExecError`, `BC_C_UNIQUE`, **23505** | `ExecError`, `BC_C_UNIQUE`, SQLSTATE **23505**. Nothing written; the handle is closed. |
-| Any other conflict | Retried on a fresh snapshot, up to three times, as today; then `ExecError` with `conflict()` | `SerializationFailure`, SQLSTATE **40001**. Nothing written; the handle is closed. The caller reruns the transaction. The layer never retries it: it can't rerun the caller's logic. |
+| Any other conflict | Retried on a fresh snapshot, up to three times; then `ExecError` with `conflict()` | `SerializationFailure`, SQLSTATE **40001**. Nothing written; the handle is closed. The caller reruns the transaction. The layer never retries it: it can't rerun the caller's logic. |
 | Constraint or other error in a statement | `ExecError`, never retried | Raised by `execute()` for the failing statement; the transaction is then aborted (25P02) |
 | The commit failed and degraded the engine: its batch may have reached the data file | `TransactionResolutionUnknown`, SQLSTATE **08007**, never retried | The same, and the handle is closed. Never "nothing written": a reopen finds the writes whole or not at all. |
 
@@ -322,7 +318,7 @@ constraint into an engine error. The plugin gets this order wrong in the
 same way: `MariaDBTxn::commit` renders a duplicate inside its try block,
 before its cleanup.
 
-## Isolation — MVP
+## Isolation
 
 - **Snapshot isolation by default.** One snapshot per transaction. Writes
   are checked by the engine, and no guard is emitted for reads.
@@ -352,7 +348,7 @@ before its cleanup.
 Both are generated by the compiler from the isolation level. A plan's
 guards are the only text that differs between levels.
 
-## DDL during an open transaction — MVP
+## DDL during an open transaction
 
 **DDL never waits.** It commits at once, whatever transactions are open.
 The transaction keeps its pinned catalog and conflicts at commit if it
@@ -383,15 +379,14 @@ wrote a table the DDL changed.
   taking effect, never while the DDL writes or syncs.
 - A DDL statement given to `Transaction::execute` is refused with
   `FeatureNotSupported` (SQLSTATE 0A000; Python's
-  `bytecask_sql.FeatureNotSupported`, a `SqlError`) in the MVP, before
-  anything runs, and the transaction aborts, as any error aborts one in
+  `bytecask_sql.FeatureNotSupported`, a `SqlError`) before anything runs, and the transaction aborts, as any error aborts one in
   PostgreSQL. DDL stays its own atomic operation. Transactional DDL
   is later.
 
 PostgreSQL makes the DDL wait for the open transaction's locks; see *Known
 differences*.
 
-## Limits — MVP
+## Limits
 
 - **Buffer size.** What a transaction holds, its overlay and its guards,
   is bounded by `TransactionOptions::max_bytes`, default 64 MiB, well below
@@ -413,19 +408,19 @@ differences*.
   does for executions.
 - **Budget.** Each statement keeps its own `bc_budget`, as each execution
   does. A transaction-wide budget, or a request deadline turned into one,
-  is later (#491's *Budgets and deadlines*). Nothing here blocks it: the
+  is later (*Later*). Nothing here blocks it: the
   budget is passed per statement.
 - **Duration.** An open transaction holds a snapshot, which keeps the data
   files it references from vacuum. An idle handle therefore defers vacuum.
   The in-process handle is the caller's to close. The token form's TTL
-  (later) bounds this for remote clients.
+  (*Later*) would bound this for remote clients.
 
-## Changes to the plan API and the runtime
+## The plan API and the runtime
 
 - **Plan-visible calls: none.** `bc_get`, `bc_exists`, the cursors,
-  `bc_count_range` and the writes keep their signatures and contracts. The
-  *Model* section's "a pure function of its parameters and one snapshot"
-  becomes "… and the transaction's view".
+  `bc_count_range` and the writes are the same in a transaction. A plan is
+  a pure function of its parameters and the transaction's view
+  (`plan_api_design.md`, *Model*).
 - **Runtime calls, called by the embedded API and never by a plan:**
   - a transaction object holding the snapshot, the pinned catalog, the
     overlay and the guards;
@@ -447,14 +442,13 @@ differences*.
   checks it does make (a second context or a commit with a statement open
   refused as `BC_E_HANDLE`) are a debugging aid, not a guarantee.
 
-  Their exact C names are settled in the implementation PR, with
-  `bc_plan.h`'s runtime section. `bc_execute` keeps its signature for
-  autocommit.
-- **`written_rows` and `deleted_ranges`** move from per execution to per
-  statement.
+  They are declared in `bc_plan.h`'s runtime section. `bc_execute` keeps
+  its signature for autocommit.
+- **`written_rows` and `deleted_ranges`** are per statement, not per
+  execution.
 - **Keys and values in the transaction's own C++ API** are
-  `std::span<const std::uint8_t>`, or `BytesView`, as #522 drafted. They
-  are never a pointer and a length.
+  `std::span<const std::uint8_t>`, or `BytesView`, never a pointer and a
+  length.
 
 ## Tests
 
@@ -488,44 +482,13 @@ for their shape.
   - read failure injected under each call through the view;
   - an allocation-failure sweep over a multi-statement transaction;
   - `BC_E_LIMIT` at the buffer bound.
-- **Against PostgreSQL:** the proof machine (`docs/testing_design.md`) gains
+- **Against PostgreSQL:** the proof machine (`testing_design.md`) has
   `BEGIN` / statements / `COMMIT` / `ROLLBACK` rules, compared with
   PostgreSQL's REPEATABLE READ on one connection, aborted transactions and
   25P02 included.
-- **Concurrency:** Elle through SQL, at the MVP gate (#487, 2.6): the
-  harness's transactions as histories, checked as snapshot isolation, and
+- **Concurrency:** Elle through SQL (`testing_design.md`, *The TPROC-C
+  harness*): the harness's transactions as histories, checked as snapshot isolation, and
   as serializable where `FOR UPDATE` guards the reads that decide a write.
-
-## Proposed `CONTRACT.md` changes
-
-In `CONTRACT.md` since slices A and B, as their PRs named them; kept here
-as the design's record.
-
-**Added (Transactions):**
-| Guarantee | Proved by |
-|---|---|
-| A transaction from `Database::begin()` commits all its statements' writes atomically, or none: `commit()` returns, or throws having written nothing. Rollback, and destroying an open handle, write nothing. | to add |
-| A statement in a transaction reads the snapshot taken at the start of the transaction's first statement, not at `begin()`, plus the writes of its earlier statements, never its own: point reads, existence, counts, scans in both directions over tables and indexes, and the unique checks. | to add |
-| A statement that fails inside a transaction writes nothing, and aborts the transaction: every later `execute()` is SQLSTATE 25P02, and `commit()` rolls back. | to add |
-| A later statement may update or delete a row an earlier statement wrote; every index stays exact. | to add |
-| A transaction that conflicts at commit with a concurrent commit (a written key changed since its snapshot, a `FOR UPDATE` row changed, a written table's DDL) is a serialization failure, SQLSTATE 40001, with nothing written. The layer does not retry it. | to add |
-| A commit that conflicts because a key it inserted (a primary key, or a unique index value) was taken by a concurrent commit is `BC_C_UNIQUE`, SQLSTATE 23505, naming the table or index, with nothing written; an autocommit statement reports the same for the same race. | to add |
-| No statement, commit or DDL waits for another transaction: a conflict is reported at commit, and a DDL commits whatever transactions are open. | to add |
-| A read that fails with I/O, CRC or memory errors fails the statement; it is never taken as absent. | to add |
-| A statement that takes the transaction past its buffer bound (`TransactionOptions`, 64 MiB by default) is `BC_E_LIMIT`, SQLSTATE 54000, and aborts the transaction. | to add |
-
-**Widened:**
-- "Autocommit only" becomes: autocommit through `Database::execute`, and
-  transactions through `Database::begin()`.
-- "Snapshot isolation" covers transactions: one snapshot per transaction.
-
-**Narrowed:**
-- "A second write of one row within an execution is refused" becomes
-  *within a statement*.
-
-**Removed:**
-- The exclusion "Multi-statement transactions, and a statement reading what
-  an earlier statement of its transaction wrote" (#491).
 
 ## Known differences from PostgreSQL
 
@@ -539,12 +502,13 @@ Each comes from the rule *never wait*.
 | DDL waits for the locks of open transactions on its table. | DDL commits at once. An open transaction that wrote the table gets 40001 at commit. | DDL never waits. |
 | On a standby, `SELECT … FOR UPDATE` is refused at the statement (25006). | On a follower it runs, and a transaction that used it fails at commit with the engine's refusal of writes, as its writes would; in autocommit it reads as the `SELECT` does. | Its guards are checked by the engine at commit, which a follower refuses. |
 
-## Later, and why none of it blocks the MVP
+## Later
 
-| Later | Why the MVP doesn't block it |
+Not built. Each gets an issue when it is picked up.
+
+| Later | Why nothing built blocks it |
 |---|---|
-| `BEGIN` / `COMMIT` text (with the server) | The handle is what it opens; the text is the server's spelling of `begin()`. |
-| Token transactions across requests (#494) | The handle is the token's in-process half; a token names a handle held with a TTL. |
+| Token transactions across requests (the transport design, #487) | The handle is the token's in-process half; a token names a handle held with a TTL. |
 | Procedures retried in the runtime (#495) | A procedure is a transaction whose statements are all the runtime's, so its retry is a loop around `begin` … `commit`. |
 | Serializable and read committed | Guards are emitted per isolation level by the compiler, and the transaction already keeps guards. |
 | User `SAVEPOINT` / `ROLLBACK TO` | A log mark and an overlay copy, as statement rollback already is. |

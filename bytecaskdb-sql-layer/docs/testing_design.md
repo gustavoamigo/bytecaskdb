@@ -1,12 +1,20 @@
-# SQL layer — proof testing
+# Testing the SQL layer
 
-The SQL layer is checked against PostgreSQL 17 by one model-based test: a
-Hypothesis state machine that runs every statement on both and requires them
-to agree (#515). This document covers the approach, how to run it, and the
-differences from PostgreSQL found so far. Increment 1 of #515 built it; later
-increments add rules to the same machine.
+How the layer is checked:
+- **The proof machine.** One model-based test, a Hypothesis state machine,
+  runs every statement on the layer and on PostgreSQL 17 and requires them
+  to agree. What it doesn't cover yet is tracked in #515.
+- **The TPROC-C statements and the harness.** The statements the layer runs,
+  and the in-process harness that runs TPROC-C's mix through the embedded
+  API: the consistency conditions, Elle through SQL and the CI smoke test.
+- **The HammerDB gate**, which drives the layer over the wire, is in
+  `server_design.md`, *Running the gate*.
 
-## Approach
+The differences from PostgreSQL the machine expects are in
+`frontend_design.md`, `transaction_design.md` and `server_design.md`, each
+under *Known differences from PostgreSQL*.
+
+## The proof machine
 
 `tests/proof/test_sql_machine.py` holds one `RuleBasedStateMachine`. Each
 rule is an action: it runs one statement on the layer, through the
@@ -19,10 +27,11 @@ every rule, the invariants are checked.
   constraint violation must be the same one: a duplicate key is SQLSTATE
   23505 on both, a NULL in a NOT NULL column 23502, a value outside its
   declared type 22003, 22001 for a string too long, 22008 for a date or
-  time, 22021 for text that is not UTF-8. The layer has one kind for these,
-  `range`; the oracle tells them apart by how the message starts, in one
-  table (`RANGE_SQLSTATE` in `oracle.py`), and a test produces every
-  message, so a reworded one fails there. A binder or catalog refusal
+  time, 22021 for text that is not UTF-8. The layer reports each with its
+  SQLSTATE (`sqlstate()`, the exception's `sqlstate` in Python), and
+  `test_every_range_message_maps_to_its_sqlstate` produces every range
+  message, so one that maps wrongly fails there.
+  A binder or catalog refusal
   carries its own SQLSTATE (`SqlError.sqlstate`, `DdlRefused`), and those
   PostgreSQL gives the same statement (`BINDER_STATES` in `oracle.py`: 42P01,
   42703, 42804, 42P18, 42883, 42702, 42701, 42803, 0A000, 22003, and the
@@ -44,7 +53,7 @@ every rule, the invariants are checked.
   engine refusal at run time included, fails the test.
 - **Statements the planner serves.** The machine generates only statements
   the planner serves, and a "no plan" refusal
-  (`docs/frontend_design.md`, *What the planner refuses*) fails the test.
+  (`frontend_design.md`, *What the planner refuses*) fails the test.
   The planner's refusals are tested by their messages in
   `sql_layer_tests`.
 - **Counts agree.** An INSERT, UPDATE or DELETE changes as many rows on both.
@@ -66,7 +75,9 @@ every rule, the invariants are checked.
   on PostgreSQL's side: the layer types `$n` by its column, and psycopg
   tells PostgreSQL int8 or float8.
 
-Rules in increment 1:
+The rules, by what they test.
+
+**Tables and rows:**
 - **CREATE TABLE.** Up to four columns over BIGINT, INTEGER, SMALLINT, DOUBLE
   PRECISION, REAL, BOOLEAN, TEXT, VARCHAR(4) and BYTEA. Primary keys of one or two
   columns, NOT NULL and nullable columns, and DEFAULT literals. Refused
@@ -83,7 +94,7 @@ Rules in increment 1:
   nothing for one only longer than a VARCHAR(n).
 - **Reopen** of the layer's database.
 
-Rules for transactions (#491):
+**Transactions** (`transaction_design.md`):
 - **BEGIN**, then the inserts and lookups above inside the transaction,
   which read its own writes. PostgreSQL runs a real `REPEATABLE READ`
   transaction on its connection, which also takes its snapshot at the
@@ -98,7 +109,7 @@ Rules for transactions (#491):
   the reopen run only then. One connection on each side: nothing commits
   during a transaction, so no commit conflicts.
 
-Rules for slice 1 of the front end (#492, `docs/frontend_design.md`):
+**Indexes and reads by a key:**
 - **NUMERIC(6, 2)** joins the column types. The layer takes a DECIMAL
   parameter as its integer scaled by 10^2 (`oracle.to_layer`); values are
   drawn at that scale, so both sides hold them exactly.
@@ -124,7 +135,7 @@ Rules for slice 1 of the front end (#492, `docs/frontend_design.md`):
   PostgreSQL's side `$n` is cast to the column's type, as PostgreSQL
   types it. BIGINT is left out until its overflow is 22003 (#540).
 
-Rules for slice 3 (#492):
+**Integer literals and joins by key:**
 - **SET col = col ± n**, n an integer literal, on the same columns: small
   ones, ones at and past SMALLINT's and INTEGER's edges, and ones past
   INTEGER, which PostgreSQL types bigint.
@@ -132,18 +143,18 @@ Rules for slice 3 (#492):
   mostly, as `FROM a, b WHERE …` or `a JOIN b ON … WHERE …`, columns
   qualified by their table.
 
-Rules for slice 4 (#492):
+**Aggregates, UPDATE and DELETE of many rows:**
 - **SUM and MIN** over the same `WHERE` as `COUNT`, with `LIMIT 0` or 1
   now and then: `SUM` of SMALLINT, INTEGER and NUMERIC(6, 2) columns, `MIN`
   of those and BIGINT ones. `SUM` of BIGINT is left out: its running total
-  leaves `int64_t` (*Known differences*).
+  leaves `int64_t` (`frontend_design.md`, *Known differences*).
 - **UPDATE and DELETE by a key**: the same `WHERE` as `SELECT`, every row
   it matches; the `UPDATE` sets a non-key column to a parameter, or adds
   one to or subtracts one from a SMALLINT, INTEGER or NUMERIC(6, 2) column
   no unique index holds. `served` decides whether the layer plans it, as
   for a `SELECT` without `ORDER BY`; the counts must agree.
 
-Rules for slice 5 (#492):
+**Filters, computed bounds and joins on a column:**
 - **Filters**: zero to two conjuncts on any column, by any operator, beside
   the key's, in `SELECT`, `UPDATE` and `DELETE`. `served` refuses one on a
   DOUBLE or REAL column.
@@ -209,22 +220,148 @@ LSAN_OPTIONS=suppressions=$PWD/bytecaskdb-sql-layer/tests/lsan_alloc_sweeps.supp
   build/linux/x86_64/debug/sql_layer_tests "[alloc]"
 ```
 
+## The TPROC-C statements
+
+The statements the harness and the HammerDB driver send, and where they come
+from.
+
+### Where they come from
+
+HammerDB's PostgreSQL TPROC-C runs each transaction as one PL/pgSQL
+procedure. Those procedures are set-oriented: `UNNEST` over arrays,
+`array_agg`, DML inside CTEs, `UPDATE … FROM`, `RETURNING … INTO`. The
+layer has no procedures (#495) and none of those forms.
+
+HammerDB's MySQL driver also has a client-side mode
+(`mysql_no_stored_procs`, `src/mysql/mysqloltp.tcl`). The driver sends
+each statement itself and keeps the procedure's logic (the random choices,
+`s_quantity`'s wrap, `ol_amount`, the new `c_data`) in the client. These are
+the per-row statements of the benchmark specification's transaction profiles,
+the ones HammerDB's MySQL procedures run against InnoDB.
+
+**The layer runs a statement set of its own, written from those
+statements** (owner, 2026-10-21): in PostgreSQL's dialect, with `$n` parameters where HammerDB
+splices values into the text, and no stored procedures. The HammerDB driver
+script sends them over the wire (`server_design.md`), and the layer's harness through the
+embedded API, each with the client logic in itself; the proof suite checks
+them against PostgreSQL 17. HammerDB's PostgreSQL driver is not used: it
+calls PL/pgSQL procedures (`server_design.md`, *The HammerDB
+driver*). Two statements are rewritten to mean in
+PostgreSQL what they mean in HammerDB, and one table gains a key (owner,
+2026-10-21):
+- Delivery's `LIMIT 1` without `ORDER BY` relies on InnoDB returning the
+  primary key's order; it becomes `ORDER BY no_o_id LIMIT 1`, the
+  specification's "lowest `no_o_id`".
+- Order-Status's derived table, `SELECT … FROM (SELECT … ORDER BY o_id
+  DESC) AS sb LIMIT 1`, is flattened to `… ORDER BY o_id DESC LIMIT 1`.
+- `history` has no key in HammerDB. The schema fixture
+  (`tests/tprocc_schema.cppm`) gives it `h_id`, supplied by the harness until
+  sequences exist. Each `h_id` is unique across threads and runs:
+  `(run << 48) | (thread << 40) | n`, with `n` counted per thread from 0.
+  - `run` comes from a one-row table of the harness's own,
+    `harness_run (id INTEGER PRIMARY KEY, last_run BIGINT NOT NULL)`. At
+    start, outside the measured transactions, the harness runs `UPDATE
+    harness_run SET last_run = last_run + 1 WHERE id = 1` and reads the row
+    back in the same transaction.
+  - Distinct runs give disjoint `h_id`s, so harnesses may run at once. A
+    bump that loses to another harness's (40001) is retried in a new
+    transaction and gets a new run, up to 10 attempts, then the harness
+    stops with an error. Only that conflict retries. A bump that updates
+    no row (the load hasn't run) is an error.
+  - The load inserts the row `(1, 0)` and uses run 0.
+  - This gives 2^15 runs, the load's included, 256 threads and 2^40 rows
+    per thread per run. The harness refuses to start past the last run or
+    with more threads, and a thread refuses a row past its 2^40th.
+
+### The statements
+
+Each statement as the harness and the driver send it. A TPROC-C transaction
+runs its statements in one `Transaction` (`transaction_design.md`).
+
+**Payment** (43% of the mix):
+
+| # | Statement |
+|---|---|
+| P1 | `UPDATE warehouse SET w_ytd = w_ytd + $1 WHERE w_id = $2` |
+| P2 | `SELECT w_street_1, w_street_2, w_city, w_state, w_zip, w_name FROM warehouse WHERE w_id = $1` |
+| P3 | `UPDATE district SET d_ytd = d_ytd + $1 WHERE d_w_id = $2 AND d_id = $3` |
+| P4 | `SELECT d_street_1, …, d_name FROM district WHERE d_w_id = $1 AND d_id = $2` |
+| P5 | `SELECT count(c_id) FROM customer WHERE c_last = $1 AND c_d_id = $2 AND c_w_id = $3` |
+| P6 | `SELECT c_first, c_middle, c_id, c_street_1, …, c_balance, c_since FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_last = $3 ORDER BY c_first` |
+| P7 | `SELECT c_first, c_middle, c_last, …, c_since FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3` |
+| P8 | `SELECT c_data FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3` |
+| P9 | `UPDATE customer SET c_balance = $1, c_data = $2 WHERE c_w_id = $3 AND c_d_id = $4 AND c_id = $5` |
+| P10 | `UPDATE customer SET c_balance = $1 WHERE c_w_id = $2 AND c_d_id = $3 AND c_id = $4` |
+| P11 | `INSERT INTO history (h_id, h_c_d_id, h_c_w_id, h_c_id, h_d_id, h_w_id, h_date, h_amount, h_data) VALUES ($1, …, $9)` |
+
+**Order-Status** (4%):
+
+| # | Statement |
+|---|---|
+| O1 | `SELECT count(c_id) FROM customer WHERE c_last = $1 AND c_d_id = $2 AND c_w_id = $3` |
+| O2 | `SELECT c_balance, c_first, c_middle, c_id FROM customer WHERE c_last = $1 AND c_d_id = $2 AND c_w_id = $3 ORDER BY c_first` |
+| O3 | `SELECT c_balance, c_first, c_middle, c_last FROM customer WHERE c_id = $1 AND c_d_id = $2 AND c_w_id = $3` |
+| O4 | `SELECT o_id, o_carrier_id, o_entry_d FROM orders WHERE o_d_id = $1 AND o_w_id = $2 AND o_c_id = $3 ORDER BY o_id DESC LIMIT 1` |
+| O5 | `SELECT ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_delivery_d FROM order_line WHERE ol_o_id = $1 AND ol_d_id = $2 AND ol_w_id = $3` |
+
+**New-Order** (45%; N4 to N7 once per order line, 5 to 15 times):
+
+| # | Statement |
+|---|---|
+| N1 | `SELECT c_discount, c_last, c_credit, w_tax FROM customer, warehouse WHERE w_id = $1 AND c_w_id = $1 AND c_d_id = $2 AND c_id = $3` |
+| N2 | `SELECT d_next_o_id, d_tax FROM district WHERE d_id = $1 AND d_w_id = $2 FOR UPDATE` |
+| N3 | `UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_id = $1 AND d_w_id = $2` |
+| N4 | `SELECT i_price, i_name, i_data FROM item WHERE i_id = $1` |
+| N5 | `SELECT s_quantity, s_data, s_dist_01, …, s_dist_10 FROM stock WHERE s_i_id = $1 AND s_w_id = $2` |
+| N6 | `UPDATE stock SET s_quantity = $1 WHERE s_i_id = $2 AND s_w_id = $3` |
+| N7 | `INSERT INTO order_line (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_dist_info) VALUES ($1, …, $9)` |
+| N8 | `INSERT INTO orders (o_id, o_d_id, o_w_id, o_c_id, o_entry_d, o_ol_cnt, o_all_local) VALUES ($1, …, $7)` |
+| N9 | `INSERT INTO new_order (no_o_id, no_d_id, no_w_id) VALUES ($1, $2, $3)` |
+
+**Delivery** (4%; once per district, ten times):
+
+| # | Statement |
+|---|---|
+| D1 | `SELECT no_o_id FROM new_order WHERE no_w_id = $1 AND no_d_id = $2 ORDER BY no_o_id LIMIT 1` |
+| D2 | `DELETE FROM new_order WHERE no_w_id = $1 AND no_d_id = $2 AND no_o_id = $3` |
+| D3 | `SELECT o_c_id FROM orders WHERE o_id = $1 AND o_d_id = $2 AND o_w_id = $3` |
+| D4 | `UPDATE orders SET o_carrier_id = $1 WHERE o_id = $2 AND o_d_id = $3 AND o_w_id = $4` |
+| D5 | `UPDATE order_line SET ol_delivery_d = $1 WHERE ol_o_id = $2 AND ol_d_id = $3 AND ol_w_id = $4` |
+| D6 | `SELECT SUM(ol_amount) FROM order_line WHERE ol_o_id = $1 AND ol_d_id = $2 AND ol_w_id = $3` |
+| D7 | `UPDATE customer SET c_balance = c_balance + $1 WHERE c_id = $2 AND c_d_id = $3 AND c_w_id = $4` |
+
+HammerDB's PostgreSQL procedure finds D1's order with `min(no_o_id)`; D1's
+`ORDER BY no_o_id LIMIT 1` plans as the same scan.
+
+**Stock-Level** (4%):
+
+| # | Statement |
+|---|---|
+| S1 | `SELECT d_next_o_id FROM district WHERE d_w_id = $1 AND d_id = $2` |
+| S2 | `SELECT COUNT(DISTINCT s_i_id) FROM order_line, stock WHERE ol_w_id = $1 AND ol_d_id = $2 AND ol_o_id < $3 AND ol_o_id >= $3 - 20 AND s_w_id = $1 AND s_i_id = ol_i_id AND s_quantity < $4` |
+
+N4 finds no row for New-Order's 1% of orders that name an unused item, and
+the client rolls back.
+
+**The load.** HammerDB loads with multi-row `INSERT … VALUES` built as
+text. The harness's loader inserts one row per prepared statement, `INSERT
+INTO t (…) VALUES ($1, …)`, many rows to a transaction (*The TPROC-C
+harness*). Multi-row `VALUES` is #534.
+
+
 ## The TPROC-C harness
 
-Status: **design, approved (owner, 2026-10-21).** The harness runs
-TPROC-C's transaction mix through the embedded API: it checks the benchmark
-specification's consistency conditions, runs Elle through SQL and the CI smoke test, and
-gives the layer's numbers with no network. It is not the MVP gate, which is
-HammerDB over the wire (`docs/frontend_design.md`, *The MVP gate* and
-Decision 7). This section is what the harness does; the
-statements it sends and the `h_id` scheme are `frontend_design.md`'s
-(*Where the statements come from*, *The statements*), and are not
-repeated here.
+The harness runs TPROC-C's transaction mix through the embedded API. It
+checks the benchmark specification's consistency conditions, runs Elle
+through SQL and the CI smoke test, and gives the layer's numbers with no
+network. The HammerDB gate, over the wire, is `server_design.md`'s. The
+statements the harness sends and the `h_id` scheme are *The TPROC-C
+statements* above.
 
 **One binary, five commands.** `harness/main.cpp`, xmake target
 `sql_layer_tprocc` (not built by default, as `sql_layer_bench`):
 `sql_layer_tprocc load`, `sql_layer_tprocc run` and `sql_layer_tprocc elle`,
-and for the HammerDB gate (`docs/server_design.md`, *Running the gate*)
+and for the HammerDB gate (`server_design.md`, *Running the gate*)
 `check` (the consistency conditions alone, on what a run left), `next-run`
 (a `harness_run` for the driver's `h_id`s) and `load --sql-out` (the
 population as a psql script, for PostgreSQL). The
@@ -250,7 +387,7 @@ and shared by them.
   fit well inside its 64 MiB bound.
 - The loader creates `harness_run`, inserts its row `(1, 0)` and uses run
   0 for its `h_id`s. A run bumps it with `last_run = last_run + $1`, `$1`
-  being 1, until integer literals arrive with New-Order (slice 3).
+  being 1.
 - `w_ytd` and `d_ytd` start at what the history rows sum to: 300,000.00
   and 30,000.00 at the specification's scale, as clause 4.3.3.1 says, and
   proportionally less at a smaller one, so the consistency conditions hold
@@ -397,69 +534,3 @@ sql_layer_tprocc run --dir /tmp/tprocc --threads 1,16,48 --duration 300 --warmup
 python3 bytecaskdb-sql-layer/scripts/sql_isolation_check.py \
   --binary build/linux/x86_64/releasedbg/sql_layer_tprocc --elle-jar elle-cli.jar --rounds 4
 ```
-
-## Known differences
-
-Found so far. The machine expects each one, so it does not fail on them.
-
-- **A table needs a primary key.** The layer refuses `CREATE TABLE` without
-  one; PostgreSQL accepts it. The machine sends that variant to the layer
-  only and expects the refusal.
-- **A VARCHAR(n) value whose excess is only spaces is refused.**
-  PostgreSQL truncates it to n characters and stores it; the layer refuses
-  it as too long (22001). The machine does not generate one.
-- **A DEFAULT outside its column's type is refused by the DDL.** The layer
-  refuses `CREATE TABLE` (and `ADD COLUMN`) with, say, `SMALLINT DEFAULT
-  100000`, `REAL DEFAULT 1e39` or `VARCHAR(2) DEFAULT 'abc'`. PostgreSQL
-  accepts the DDL and refuses each INSERT that takes the default (22003,
-  22001; checked on 16.15). A DEFAULT that is not UTF-8 never reaches
-  either: PostgreSQL refuses the statement's text (22021). The machine's
-  defaults stay inside their types.
-- **A parameter compared with columns of two SQL types is refused.**
-  `WHERE a = $1 AND b = $1`, with `a DOUBLE PRECISION` and `b REAL`,
-  `INTEGER` and `BIGINT`, or `DECIMAL`s of two scales, is refused at bind:
-  a compared parameter has one SQL type, checked before the plan runs. A
-  `DECIMAL` of scale 0 counts as a `BIGINT`, so that pair is not refused.
-  PostgreSQL runs it. The oracle sends it two `float8` parameters, one per
-  `$1` (`pg_params`), and with `$1 = 0.1` PostgreSQL compares
-  `real::float8 = 0.1`, false, where a `REAL` key part keyed as the float
-  of 0.1 would match; a range check per comparison would not close that.
-  PostgreSQL given one `$1`, typed from its first use, could compare
-  differently again. Refusing is safe either way. The machine gives each
-  compared column its own parameter
-  (`test_a_parameter_compared_with_two_types_is_refused`; the DECIMAL
-  scales, which the oracle does not model, in the embedded API's test).
-- **A parameter used with columns of two SQL types is refused,** in any
-  use: compared with, assigned to, or added to or subtracted from them
-  (`SET b = $1, a = a + $1` with `b BIGINT` and `a SMALLINT`).
-  PostgreSQL infers one type for a `$n` from its use and runs it. The
-  machine gives each column its own parameter
-  (`test_a_parameter_used_with_two_types_is_refused`).
-- **A DECIMAL operand of `col ± $n` past 18 digits is 22003.** The layer's
-  DECIMAL is a scaled 64-bit integer, so the operand is checked against 18
-  digits at the column's scale before the plan runs, even when the column
-  is NULL; PostgreSQL's unconstrained `numeric` may still complete (NULL
-  plus anything is NULL). The machine's operands stay inside 18 digits.
-- **A DECIMAL literal operand of `col ± n` past 18 digits once scaled is
-  refused at bind** ("numeric field overflow"), whatever the column holds;
-  PostgreSQL computes the sum and fails only when it does not fit the
-  column. The machine's literals stay inside 18 digits.
-- **A unique value an UPDATE moves from one row to another is a
-  duplicate.** With a unique index on `u`, rows holding 1 and 2, `SET u =
-  u + 1` over both is refused (23505) here, whatever order the rows are
-  written in: each row's new value is checked against the snapshot, where
-  the other row still holds it. PostgreSQL checks each row as it writes
-  it, so its outcome depends on the order it visits them. Two rows given
-  one value are 23505 on both (`test_one_unique_value_given_to_two_rows_is_23505`).
-  The machine adds to no column a unique index holds.
-- **A SUM whose running total leaves `int64_t` fails.** The layer adds in
-  64 bits, a DECIMAL's scaled integer included, and an overflow fails the
-  statement; PostgreSQL's `SUM` of a BIGINT or NUMERIC is an unbounded
-  `numeric`. Below that the sums agree exactly
-  (`test_sum_past_int64_is_an_error`). The machine sums no BIGINT column.
-- **MIN of a REAL or DOUBLE PRECISION column is refused.** PostgreSQL's
-  `MIN` keeps the last of `-0.0` and `0.0` it meets, so its answer depends
-  on the order it reads the rows. The machine takes no `MIN` of a float.
-- **DML takes no literals but an integer after `+` or `-` in `SET`:** other
-  values are parameters (`$1`). The machine's
-  statements use parameters on both sides.
