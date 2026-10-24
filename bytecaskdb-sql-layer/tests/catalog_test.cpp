@@ -518,6 +518,12 @@ TEST_CASE("catalog: CREATE TABLE refuses in PostgreSQL's order", "[sql][catalog]
   CHECK(state({"t", {col("c", SqlKind::BigInt), col("c", SqlKind::BigInt)}, {"c"}}) == "42701");
   CHECK(state({"t", {col("c", SqlKind::BigInt)}, {"zz"}}) == "42703");
   CHECK(state({"t", {col("c", SqlKind::BigInt)}, {"c", "c"}}) == "42701");
+  // No columns: PostgreSQL accepts the list, so a key names a column that is not there (42703), ahead of
+  // an existing name too; with no key either, the layer's own rule applies after the name check.
+  CHECK(state({"t", {}, {"k"}}) == "42703");
+  CHECK(state({"u", {}, {"k"}}) == "42703");
+  CHECK(state({"t", {}, {}}) == "42P07");
+  CHECK(state({"u", {}, {}}) == "0A000");
   // A new name: the layer's own rules, which PostgreSQL does not have.
   CHECK(state({"u", {col("c", SqlKind::BigInt)}, {}}) == "0A000");
   CHECK(state({"u", {col("c", SqlKind::BigInt, true, 1.5)}, {"c"}}) == "42804");

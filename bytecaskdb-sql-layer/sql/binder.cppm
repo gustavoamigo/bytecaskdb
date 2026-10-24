@@ -444,16 +444,15 @@ public:
     // and refuses two assignments of one $n whatever their types (42P08):
     // any other pair is its answer to a different statement, so 42601.
     auto clash = [&] {
-      if (p.first_use != Use::Compared || use != Use::Compared) return kSyntaxError;
-      return type_refusal(p.first->sql.kind, col.sql.kind, false).value_or(kSyntaxError);
+      if (!p.first || p.first->use != Use::Compared || use != Use::Compared) return kSyntaxError;
+      return type_refusal(p.first->col->sql.kind, col.sql.kind, false).value_or(kSyntaxError);
     };
-    if (p.phys && *p.phys != t) {
-      throw SqlError{"parameter $" + std::to_string(n + 1) + " used as both " + type_name(*p.phys) + " and " +
+    if (p.first && p.first->phys != t) {
+      throw SqlError{"parameter $" + std::to_string(n + 1) + " used as both " + type_name(p.first->phys) + " and " +
                          type_name(t),
                      pos, clash()};
     }
-    p.phys = t;
-    if (p.first != nullptr && compared_type(p.first->sql).identity != compared_type(col.sql).identity) {
+    if (p.first && compared_type(p.first->col->sql).identity != compared_type(col.sql).identity) {
       auto verb = [](Use u) {
         switch (u) {
           case Use::Compared: return "compared with ";
@@ -464,15 +463,12 @@ public:
         return "";
       };
       auto named = [](const Column& c) { return c.name + " (" + sql_type_name(c.sql) + ")"; };
-      auto second = use == p.first_use ? named(col) : verb(use) + named(col);
-      throw SqlError{"parameter $" + std::to_string(n + 1) + " is " + verb(p.first_use) + named(*p.first) + " and " +
+      auto second = use == p.first->use ? named(col) : verb(use) + named(col);
+      throw SqlError{"parameter $" + std::to_string(n + 1) + " is " + verb(p.first->use) + named(*p.first->col) + " and " +
                          second,
                      pos, clash()};
     }
-    if (p.first == nullptr) {
-      p.first = &col;
-      p.first_use = use;
-    }
+    if (!p.first) p.first = ParamUse::FirstUse{t, &col, use};
     if (use == Use::Assigned) return;
     p.assigned_only = false;
     if (use != Use::Compared && col.sql.kind == SqlKind::Decimal) {
@@ -530,10 +526,19 @@ public:
     std::unreachable();
   }
 
+  static constexpr auto aggregate_name(ast::Expr::Fn fn) -> std::string_view {
+    switch (fn) {
+      case ast::Expr::Fn::Count: return "COUNT";
+      case ast::Expr::Fn::Sum: return "SUM";
+      case ast::Expr::Fn::Min: return "MIN";
+    }
+    std::unreachable();
+  }
+
   static auto aggregate(const Column& col, const ast::Expr& e) -> Aggregate {
     const auto* c = &col;
     if (auto s = aggregate_support(e.fn, *c); !s.supported) {
-      throw SqlError{std::string{e.fn == ast::Expr::Fn::Sum ? "SUM" : "MIN"} + " of a " + sql_type_name(c->sql) +
+      throw SqlError{std::string{aggregate_name(e.fn)} + " of a " + sql_type_name(c->sql) +
                          " column is not supported",
                      e.pos, s.sqlstate};
     }
@@ -746,8 +751,8 @@ public:
   auto param_types(std::int32_t pos) const -> std::vector<PhysType> {
     std::vector<PhysType> out;
     for (std::size_t i = 0; i < params_.size(); ++i) {
-      if (!params_[i].phys) throw SqlError{"could not determine data type of parameter $" + std::to_string(i + 1), pos, kIndeterminateDatatype};
-      out.push_back(*params_[i].phys);
+      if (!params_[i].first) throw SqlError{"could not determine data type of parameter $" + std::to_string(i + 1), pos, kIndeterminateDatatype};
+      out.push_back(params_[i].first->phys);
     }
     return out;
   }
@@ -765,7 +770,7 @@ public:
   // Every parameter has a first use once param_types() has passed.
   auto param_info() const -> std::vector<ParamInfo> {
     std::vector<ParamInfo> out;
-    for (const auto& p : params_) out.push_back({p.first->sql, p.assigned_only});
+    for (const auto& p : params_) out.push_back({p.first->col->sql, p.assigned_only});
     return out;
   }
 
@@ -778,9 +783,14 @@ public:
 private:
   // A parameter's type from its uses, which all agree.
   struct ParamUse {
-    std::optional<PhysType> phys;
-    const Column* first{nullptr};  // the column of its first use, for the SQL type
-    Use first_use{Use::Assigned};
+    // Its first use, which gives it its physical type and its SQL type. The
+    // three are set together, so a typed parameter always has a column.
+    struct FirstUse {
+      PhysType phys;
+      const Column* col;
+      Use use;
+    };
+    std::optional<FirstUse> first;
     std::optional<SqlType> range;  // what the pre-plan range check checks: none if only an INSERT assigns it
     std::uint32_t table{0};        // the table of the column `range` comes from
     bool assigned_only{true};      // every use an assignment
