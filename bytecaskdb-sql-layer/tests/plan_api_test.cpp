@@ -37,13 +37,35 @@ using bytecask::sql::kRowEntryBytes;
 using bytecask::sql::kSortEntryBytes;
 using bytecask::sql::kSorterBytes;
 using bytecask::sql::kViewEntryBytes;
+using bytecask::sql::buffer_bytes;
+using bytecask::sql::BytesView;
+using bytecask::sql::claim_bytes;
+using bytecask::sql::effect_bytes;
+using bytecask::sql::kOverlayNodeBytes;
+using bytecask::sql::kRangeNodeBytes;
+using bytecask::sql::kTableSlotBytes;
+using bytecask::sql::kUniqueNodeBytes;
+using bytecask::sql::kWrittenRowNodeBytes;
+using bytecask::sql::lock_bytes;
 using bytecask::sql::PhysType;
+using bytecask::sql::plan_entry_bytes;
+using bytecask::sql::PlanEntry;
+using bytecask::sql::table_bytes;
 
 namespace {
 
 constexpr std::uint32_t kTbl = 1;
 constexpr std::uint32_t kIdx = 3;
 constexpr std::uint32_t kIdCol = 0, kNameCol = 1, kQtyCol = 2;
+
+// An autocommit statement's charges: an effect with its entry in the
+// commit's WritePlan, and t's slot with the commit's guard on its record.
+auto write_charge(std::size_t a, std::size_t b = 0) -> std::uint64_t {
+  return effect_bytes(false, PlanEntry::Write, a, b);
+}
+auto table_charge(bool in_txn = false) -> std::uint64_t {
+  return table_bytes(in_txn, bytecask::sql::table_record_key(kTbl).size());
+}
 
 // Inserts (id, name, qty) from params 0..2, then sets qty from param 99,
 // which is unbound.
@@ -532,8 +554,9 @@ auto memory_budget(std::uint64_t bytes) -> bc_budget { return {.max_reads = 0, .
 TEST_CASE("plan API: a statement is charged the bytes it holds, exactly, and past its budget fails with BC_E_LIMIT",
           "[sql][algebra][memory]") {
   Fixture f;
-  // An insert holds the row it built, its builder and its view: its write
-  // set is not charged. Row 2 is row 1's size, and measures it.
+  // An insert holds the row it built, its builder and its view, and its
+  // write set: the row written, its key's claim, its put (t's first write)
+  // and its index entry's. Row 2 is row 1's size, and measures it.
   auto row_key = [&](std::int64_t id) {
     Bytes k;
     bytecask::sql::key_put_prefix(k, bytecask::sql::kNsRow, kTbl);
@@ -545,7 +568,14 @@ TEST_CASE("plan API: a statement is charged the bytes it holds, exactly, and pas
   REQUIRE(f.db->get({}, row_key(2), stored));
   const auto key = row_key(1);
   std::vector<bc_value> row1{std::int64_t{1}, bytes("alice"), std::int64_t{5}};
-  const auto insert_holds = kRowEntryBytes + stored.size() + kViewEntryBytes;
+  const auto& t = *f.cat().table(kTbl);
+  Bytes entry;
+  std::size_t prefix_len = 0;
+  bool has_null = false;
+  REQUIRE(bytecask::sql::encode_index_key_from_row(t, t.indexes.at(0), stored, entry, &prefix_len, &has_null));
+  const auto write_set = buffer_bytes(key.size()) + kWrittenRowNodeBytes + claim_bytes(key.size()) +
+                         write_charge(key.size(), stored.size()) + table_charge() + write_charge(entry.size());
+  const auto insert_holds = kRowEntryBytes + stored.size() + kViewEntryBytes + write_set;
   CHECK(run(f, insert_plan_ok, row1, memory_budget(insert_holds - 1)) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LIMIT);
   CHECK(std::string{bc_error_message(f.cx)}.find("memory budget") != std::string::npos);
@@ -741,31 +771,341 @@ auto qty_of(Fixture& f, std::int64_t id) -> std::int64_t {
 }
 }  // namespace
 
-TEST_CASE("plan API: an autocommit write set past the engine's batch limit is BC_E_LIMIT at the call that passes it",
+namespace {
+// Every row of t, its qty set to param 0: the rows it puts are the same size
+// whatever the qty was.
+void set_all(bc_ctx* cx) {
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  int64_t n = 0;
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    bc_row r = bc_row_from(cx, kTbl, row);
+    bc_row_set_param(cx, r, kQtyCol, 0);
+    bc_update(cx, kTbl, row, bc_row_end(cx, r));
+    n = bc_add(cx, n, 1);
+  }
+  bc_emit_count(cx, n);
+}
+
+// The bytes held right before and right after each write call a probed
+// plan makes.
+std::vector<std::pair<std::uint64_t, std::uint64_t>> held_around;
+
+// SELECT … FOR UPDATE over every row of t, each guard probed; it then sets
+// the qty of the row whose id is param 0, if one is, to 0.
+void lock_all(bc_ctx* cx) {
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  int64_t n = 0;
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    auto before = bc_ctx_held_for_testing(cx);
+    bc_guard_row(cx, kTbl, row);
+    held_around.emplace_back(before, bc_ctx_held_for_testing(cx));
+    if (bc_col_i64(cx, row, kIdCol) == bc_param_i64(cx, 0)) {
+      bc_row r = bc_row_from(cx, kTbl, row);
+      bc_row_set_i64(cx, r, kQtyCol, 0);
+      bc_update(cx, kTbl, row, bc_row_end(cx, r));
+    }
+    n = bc_add(cx, n, 1);
+  }
+  bc_emit_count(cx, n);
+}
+
+// insert_plan_ok, bc_insert probed.
+void probed_insert(bc_ctx* cx) {
+  bc_row r = bc_row_begin(cx, kTbl);
+  bc_row_set_param(cx, r, kIdCol, 0);
+  bc_row_set_param(cx, r, kNameCol, 1);
+  bc_row_set_param(cx, r, kQtyCol, 2);
+  bc_view row = bc_row_end(cx, r);
+  auto before = bc_ctx_held_for_testing(cx);
+  bc_insert(cx, kTbl, row);
+  held_around.emplace_back(before, bc_ctx_held_for_testing(cx));
+}
+
+// Deletes the row whose id is param 0, then the ids in [param 1, param 2)
+// by range; each call probed.
+void probed_deletes(bc_ctx* cx) {
+  bool found = false;
+  bc_view row = bc_get(cx, bc_key_params(cx, kTbl, 0, 1), &found);
+  auto before = bc_ctx_held_for_testing(cx);
+  if (found) bc_delete(cx, kTbl, row);
+  held_around.emplace_back(before, bc_ctx_held_for_testing(cx));
+  bc_view lo = bc_key_params(cx, kTbl, 1, 1);
+  bc_view hi = bc_key_params(cx, kTbl, 2, 1);
+  before = bc_ctx_held_for_testing(cx);
+  bc_del_range(cx, kTbl, lo, hi);
+  held_around.emplace_back(before, bc_ctx_held_for_testing(cx));
+}
+
+// Sets the qty of the row whose id is param 0 to param 1, bc_update probed.
+void probed_set_qty(bc_ctx* cx) {
+  bool found = false;
+  bc_view row = bc_get(cx, bc_key_params(cx, kTbl, 0, 1), &found);
+  if (!found) return;
+  bc_row r = bc_row_from(cx, kTbl, row);
+  bc_row_set_param(cx, r, kQtyCol, 1);
+  bc_view next = bc_row_end(cx, r);
+  auto before = bc_ctx_held_for_testing(cx);
+  bc_update(cx, kTbl, row, next);
+  held_around.emplace_back(before, bc_ctx_held_for_testing(cx));
+}
+
+auto pk_of(std::int64_t id) -> Bytes {
+  Bytes k;
+  bytecask::sql::key_put_prefix(k, bytecask::sql::kNsRow, kTbl);
+  bytecask::sql::key_put_i64(k, id, {PhysType::I64});
+  return k;
+}
+
+auto stored_row(Fixture& f, std::int64_t id) -> Bytes {
+  Bytes row;
+  REQUIRE(f.db->get({}, pk_of(id), row));
+  return row;
+}
+
+// The entry `row` has in t's index `i`, and the length of its prefix.
+auto entry_of(Fixture& f, std::size_t i, BytesView row) -> std::pair<Bytes, std::size_t> {
+  const auto& t = *f.cat().table(kTbl);
+  std::pair<Bytes, std::size_t> out;
+  bool has_null = false;
+  REQUIRE(bytecask::sql::encode_index_key_from_row(t, t.indexes.at(i), row, out.first, &out.second, &has_null));
+  return out;
+}
+
+auto index_count(Fixture& f) -> std::size_t { return f.cat().table(kTbl)->indexes.size(); }
+}  // namespace
+
+TEST_CASE("plan API: each item of an insert's write set is charged to the statement budget as it is added",
           "[sql][algebra][memory]") {
   Fixture f;
-  constexpr std::int64_t kRows = 200;
-  for (std::int64_t id = 1; id <= kRows; ++id) {
+  f.ddl(bytecask::sql::CreateIndexDdl{"t_by_qty", "t", {{"qty"}}, true});
+  REQUIRE(index_count(f) == 2);
+  held_around.clear();
+  REQUIRE(run(f, probed_insert, {std::int64_t{1}, bytes("alice"), std::int64_t{5}}) == BC_COMMITTED);
+  REQUIRE(held_around.size() == 1);
+  const auto [before, after] = held_around[0];
+  const auto pk = pk_of(1);
+  const auto row = stored_row(f, 1);
+  // The encoders reserve each key's exact size, so a key the write set keeps
+  // is charged its size, with no trim to copy it.
+  Bytes encoded;
+  REQUIRE(bytecask::sql::encode_pk_from_row(*f.cat().table(kTbl), row, encoded));
+  CHECK(encoded == pk);
+  CHECK(encoded.capacity() == encoded.size());
+  for (std::size_t i = 0; i < index_count(f); ++i) {
+    auto e = entry_of(f, i, row).first;
+    CHECK(e.capacity() == e.size());
+  }
+  std::uint64_t puts = 0;
+  for (std::size_t i = 0; i < index_count(f); ++i) puts += write_charge(entry_of(f, i, row).first.size());
+  const auto [unique_entry, prefix_len] = entry_of(f, 1, row);
+  const auto prefix = BytesView{unique_entry}.first(prefix_len);
+  const auto last_put = write_charge(entry_of(f, index_count(f) - 1, row).first.size());
+  const auto expected = buffer_bytes(pk.size()) + kWrittenRowNodeBytes  // the row written, to refuse a second write
+                        + claim_bytes(pk.size())                         // its key, free in the snapshot
+                        + buffer_bytes(prefix.size()) + kUniqueNodeBytes  // the unique prefix, likewise
+                        + effect_bytes(false, PlanEntry::RangeGuard, prefix.size(),
+                                       bytecask::sql::key_successor(prefix).size())  // its guard
+                        + claim_bytes(unique_entry.size())                            // and its claim
+                        + write_charge(pk.size(), row.size()) + table_charge()        // the row, t's first write
+                        + puts;                                           // and its index entries
+  CHECK(after - before == expected);
+
+  // Row 2 is row 1's size. A byte short, the last entry's put is refused:
+  // the statement fails, nothing is committed, and the refused put is not
+  // charged.
+  held_around.clear();
+  const std::vector<bc_value> row2{std::int64_t{2}, bytes("bobby"), std::int64_t{6}};
+  CHECK(run(f, probed_insert, row2, memory_budget(before + expected - 1)) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LIMIT);
+  CHECK(std::string{bc_error_message(f.cx)}.find("memory budget") != std::string::npos);
+  REQUIRE(held_around.size() == 1);
+  CHECK(held_around[0].first == before);
+  CHECK(held_around[0].second == before + expected - last_put);
+  Bytes out;
+  CHECK_FALSE(f.db->get({}, pk_of(2), out));
+  CHECK(run(f, probed_insert, row2, memory_budget(before + expected)) == BC_COMMITTED);
+  CHECK(f.db->get({}, pk_of(2), out));
+}
+
+TEST_CASE("plan API: a delete, a range delete and FOR UPDATE's guards are charged to the statement budget",
+          "[sql][algebra][memory]") {
+  Fixture f;
+  for (std::int64_t id = 1; id <= 10; ++id) {
+    REQUIRE(run(f, insert_plan_ok, {id, bytes("n"), id}) == BC_COMMITTED);
+  }
+  auto entry_put = [&](std::int64_t id) { return write_charge(entry_of(f, 0, stored_row(f, id)).first.size()); };
+  // A delete: the row written, its tombstone (t's first write) and its
+  // entry's. A range delete: the range, each row's entry's tombstone, and
+  // the range's own.
+  const auto pk1 = pk_of(1), lo = pk_of(5), hi = pk_of(8);
+  const auto one =
+      buffer_bytes(pk1.size()) + kWrittenRowNodeBytes + write_charge(pk1.size()) + table_charge() + entry_put(1);
+  const auto range = buffer_bytes(lo.size()) + buffer_bytes(hi.size()) + kRangeNodeBytes + entry_put(5) +
+                     entry_put(6) + entry_put(7) + write_charge(lo.size(), hi.size());
+  held_around.clear();
+  REQUIRE(run(f, probed_deletes, {std::int64_t{1}, std::int64_t{5}, std::int64_t{8}}) == BC_COMMITTED);
+  REQUIRE(held_around.size() == 2);
+  CHECK(held_around[0].second - held_around[0].first == one);
+  CHECK(held_around[1].second - held_around[1].first == range);
+  CHECK(bc_ctx_held_for_testing(f.cx) == held_around[1].second);
+
+  // An autocommit SELECT … FOR UPDATE: each guard is its key's.
+  held_around.clear();
+  REQUIRE(run(f, lock_all, {std::int64_t{0}}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == 6);
+  REQUIRE(held_around.size() == 6);
+  for (const auto& [b, a] : held_around) CHECK(a - b == effect_bytes(false, PlanEntry::KeyGuard, pk1.size(), 0));
+  // A byte short of the last guard: it is refused and charges nothing.
+  const auto last = held_around.back();
+  held_around.clear();
+  CHECK(run(f, lock_all, {std::int64_t{0}}, memory_budget(last.second - 1)) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LIMIT);
+  REQUIRE(held_around.size() == 6);
+  CHECK(held_around.back().first == last.first);
+  CHECK(held_around.back().second == last.first);
+}
+
+TEST_CASE("plan API: a reset gives back the write set's storage, so a pooled context keeps none",
+          "[sql][algebra][memory]") {
+  Fixture f;
+  for (std::int64_t id = 1; id <= 100; ++id) {
+    REQUIRE(run(f, insert_plan_ok, {id, bytes("n"), id}) == BC_COMMITTED);
+  }
+  // An update of every row: its effects, locks and tables, committed, then
+  // reset. The commit empties the effects but leaves their slots.
+  REQUIRE(run(f, bump_all, {}) == BC_COMMITTED);
+  CHECK(bc_ctx_write_set_slots_for_testing(f.cx) >= 100);
+  bc_ctx_reset(f.cx);
+  CHECK(bc_ctx_write_set_slots_for_testing(f.cx) == 0);
+  CHECK(bc_ctx_held_for_testing(f.cx) == 0);
+
+  // In a transaction: bc_txn_add moves the items out, and the reset frees
+  // the slots they leave.
+  auto* txn = bc_txn_new(&f.bdb, &f.bcat, 64u << 20);
+  REQUIRE(txn != nullptr);
+  auto ps = params({});
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+  auto ref = sr.get();
+  bc_ctx_begin_txn(f.cx, txn, &ps, {});
+  bc_ctx_run(f.cx, bump_all, &ref);
+  REQUIRE(bc_txn_add(f.cx));
+  CHECK(bc_ctx_write_set_slots_for_testing(f.cx) >= 200);  // effects, and the locks only a transaction keeps
+  bc_ctx_reset(f.cx);
+  CHECK(bc_ctx_write_set_slots_for_testing(f.cx) == 0);
+  CHECK(bc_txn_commit(txn, false) == BC_COMMITTED);
+  bc_txn_free(txn);
+  CHECK(qty_of(f, 100) == 102);
+}
+
+namespace {
+// Runs probed_set_qty for each (id, qty) as a statement of one transaction
+// under max_bytes, adding each and committing after the last: the error of
+// the first statement that failed, or BC_OK; the bytes the context held
+// before and after each bc_txn_add; and the commit's result.
+struct TxnSteps {
+  bc_error_code error{BC_OK};
+  std::string message;
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> held_at_add;
+  int committed{BC_FAILED};
+  bc_error_code commit_error{BC_OK};
+};
+auto txn_set_qtys(Fixture& f, std::uint64_t max_bytes, std::vector<std::pair<std::int64_t, std::int64_t>> sets)
+    -> TxnSteps {
+  bc_ctx_reset(f.cx);
+  auto* txn = bc_txn_new(&f.bdb, &f.bcat, max_bytes);
+  REQUIRE(txn != nullptr);
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+  auto ref = sr.get();
+  TxnSteps out;
+  for (const auto& [id, qty] : sets) {
+    auto ps = params({id, qty});
+    bc_ctx_begin_txn(f.cx, txn, &ps, {});
+    bc_ctx_run(f.cx, probed_set_qty, &ref);
+    auto before = bc_ctx_held_for_testing(f.cx);
+    if (bc_error(f.cx) != BC_OK) {
+      out.error = bc_error(f.cx);
+      out.message = bc_error_message(f.cx);
+    }
+    auto added = bc_txn_add(f.cx);
+    out.held_at_add.emplace_back(before, bc_ctx_held_for_testing(f.cx));
+    bc_ctx_reset(f.cx);
+    if (!added) break;
+  }
+  if (out.error == BC_OK) {
+    out.committed = bc_txn_commit(txn, false);
+    out.commit_error = bc_txn_error(txn);
+  }
+  bc_txn_free(txn);
+  return out;
+}
+}  // namespace
+
+TEST_CASE("plan API: bc_txn_add moves the write set from the statement budget to the transaction's bound",
+          "[sql][algebra][memory][txn]") {
+  Fixture f;
+  for (std::int64_t id = 1; id <= 3; ++id) {
     REQUIRE(run(f, insert_plan_ok, {id, bytes("name"), id}) == BC_COMMITTED);
   }
-  // The write set is not the statement budget's: 200 updates hold far more
-  // than 16 KiB, and each row built goes with its step.
-  CHECK(run(f, bump_all, {}, memory_budget(16u << 10)) == BC_COMMITTED);
-  CHECK(bc_ctx_affected(f.cx) == kRows);
+  // An update of one row's qty in a transaction: the row written (statement
+  // scratch, which stays), and the write set: its lock, its put (t's first
+  // write) with its overlay node. No index entry moves.
+  const auto pk = pk_of(1);
+  const auto row = stored_row(f, 1);  // qty 1 and 7 encode alike
+  const auto write_set =
+      lock_bytes(pk.size()) + effect_bytes(true, PlanEntry::Write, pk.size(), row.size()) + table_charge(true);
+  // What the transaction holds once it is added: the row in the overlay, its
+  // lock and t's slot; and what its commit's WritePlan adds: the put and the
+  // guard on t's record.
+  const auto txn_holds = buffer_bytes(pk.size()) + buffer_bytes(row.size()) + kOverlayNodeBytes +
+                         lock_bytes(pk.size()) + table_charge(true);
+  const auto plan = plan_entry_bytes(PlanEntry::Write, pk.size(), row.size()) + table_charge() - kTableSlotBytes;
+  REQUIRE(txn_holds + plan > write_set);
+  held_around.clear();
+  auto at = txn_set_qtys(f, write_set, {{1, 7}});
+  CHECK(at.error == BC_OK);
+  REQUIRE(held_around.size() == 1);
+  CHECK(held_around[0].second - held_around[0].first == write_set + buffer_bytes(pk.size()) + kWrittenRowNodeBytes);
+  // bc_txn_add releases the write set from the statement, and takes it in
+  // at a bound of exactly its size.
+  REQUIRE(at.held_at_add.size() == 1);
+  CHECK(at.held_at_add[0].first - at.held_at_add[0].second == write_set);
+  // The commit's copy is counted too: at that bound it is BC_E_LIMIT, and
+  // nothing commits.
+  CHECK(at.committed == BC_FAILED);
+  CHECK(at.commit_error == BC_E_LIMIT);
+  CHECK(qty_of(f, 1) == 1);
+  // A byte below, the update fails at the call, and nothing commits.
+  auto below = txn_set_qtys(f, write_set - 1, {{1, 8}});
+  CHECK(below.error == BC_E_LIMIT);
+  CHECK(below.message.find("transaction's writes would pass its bound of " + std::to_string(write_set - 1)) !=
+        std::string::npos);
+  CHECK(qty_of(f, 1) == 1);
+  // The commit fits what the transaction holds and its plan, exactly.
+  auto commit_short = txn_set_qtys(f, txn_holds + plan - 1, {{1, 7}});
+  CHECK(commit_short.error == BC_OK);
+  CHECK(commit_short.commit_error == BC_E_LIMIT);
+  CHECK(qty_of(f, 1) == 1);
+  auto commits = txn_set_qtys(f, txn_holds + plan, {{1, 7}});
+  CHECK(commits.committed == BC_COMMITTED);
+  CHECK(qty_of(f, 1) == 7);
+
+  // A second statement's write set, the same as the first's, is held to
+  // what the transaction holds, counted by the same sizes.
+  auto both = txn_set_qtys(f, txn_holds + write_set, {{1, 2}, {2, 3}});
+  CHECK(both.error == BC_OK);
+  REQUIRE(both.held_at_add.size() == 2);
+  CHECK(both.held_at_add[1].first - both.held_at_add[1].second == write_set);
+  CHECK(both.commit_error == BC_E_LIMIT);  // the plan of two puts does not fit beside them
+  auto short_of = txn_set_qtys(f, txn_holds + write_set - 1, {{1, 4}, {2, 5}});
+  CHECK(short_of.error == BC_E_LIMIT);
+  // Two rows held and their plan: t's slot and record guard once.
+  const auto both_fit = 2 * txn_holds - kTableSlotBytes + 2 * plan - (table_charge() - kTableSlotBytes);
+  auto two = txn_set_qtys(f, both_fit, {{1, 2}, {2, 3}});
+  CHECK(two.committed == BC_COMMITTED);
   CHECK(qty_of(f, 1) == 2);
-  // The batch limit, lowered to 16 KiB: the update that passes it fails the
-  // statement, whatever its budget, and nothing is committed.
-  bc_ctx_write_bound_for_testing(f.cx, 16u << 10);
-  CHECK(run(f, bump_all, {}) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_LIMIT);
-  CHECK(std::string{bc_error_message(f.cx)}.find("batch limit of 16384 bytes") != std::string::npos);
-  CHECK(bc_ctx_affected(f.cx) == -1);
-  CHECK(qty_of(f, 1) == 2);
-  CHECK(qty_of(f, kRows) == kRows + 1);
-  // Under it, the same update commits.
-  bc_ctx_write_bound_for_testing(f.cx, 1u << 20);
-  CHECK(run(f, bump_all, {}) == BC_COMMITTED);
-  CHECK(qty_of(f, kRows) == kRows + 2);
+  CHECK(qty_of(f, 2) == 3);
 }
 
 TEST_CASE("plan API: a transaction statement's write set past the room left in its bound fails at the call",
@@ -793,6 +1133,76 @@ TEST_CASE("plan API: a transaction statement's write set past the room left in i
   bc_txn_free(txn);
   CHECK(qty_of(f, 1) == 1);
   CHECK(qty_of(f, kRows) == kRows);
+}
+
+namespace {
+// set_all as a transaction's one statement under max_bytes: the statement's
+// error, whether bc_txn_add took it in, and, with `commit`, the commit's
+// result (else the transaction is rolled back).
+struct TxnRun {
+  bc_error_code run;
+  std::string message;
+  bool added;
+  int committed;
+};
+auto txn_set_all(Fixture& f, std::uint64_t max_bytes, std::int64_t qty, bool commit, bc_budget budget = {})
+    -> TxnRun {
+  bc_ctx_reset(f.cx);
+  auto* txn = bc_txn_new(&f.bdb, &f.bcat, max_bytes);
+  REQUIRE(txn != nullptr);
+  auto ps = params({qty});
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+  auto ref = sr.get();
+  bc_ctx_begin_txn(f.cx, txn, &ps, budget);
+  bc_ctx_run(f.cx, set_all, &ref);
+  TxnRun out{bc_error(f.cx), bc_error_message(f.cx), false, BC_FAILED};
+  out.added = bc_txn_add(f.cx);
+  bc_ctx_reset(f.cx);
+  if (commit && out.added) out.committed = bc_txn_commit(txn, false);
+  bc_txn_free(txn);
+  return out;
+}
+}  // namespace
+
+TEST_CASE("plan API: a transaction statement's writes and bc_txn_add agree on the bound at its boundary",
+          "[sql][algebra][memory][txn]") {
+  Fixture f;
+  constexpr std::int64_t kRows = 200;
+  for (std::int64_t id = 1; id <= kRows; ++id) {
+    REQUIRE(run(f, insert_plan_ok, {id, bytes("name"), id}) == BC_COMMITTED);
+  }
+  // The least bound the statement runs under, found by bisection.
+  std::uint64_t lo = 1, hi = 64u << 20;
+  REQUIRE(txn_set_all(f, hi, 7, false).run == BC_OK);
+  while (lo < hi) {
+    auto mid = lo + (hi - lo) / 2;
+    if (txn_set_all(f, mid, 7, false).run == BC_OK) {
+      hi = mid;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  // At it, bc_txn_add takes the statement in; the commit, which counts its
+  // plan's copy too, does not fit and commits nothing. A byte below it, the
+  // statement fails at the write that passes it, before bc_txn_add, which
+  // then refuses it.
+  auto at = txn_set_all(f, lo, 7, true);
+  CHECK(at.run == BC_OK);
+  CHECK(at.added);
+  CHECK(at.committed == BC_FAILED);
+  CHECK(qty_of(f, kRows) == kRows);
+  auto below = txn_set_all(f, lo - 1, 8, true);
+  CHECK(below.run == BC_E_LIMIT);
+  CHECK(below.message.find("transaction's writes would pass its bound of " + std::to_string(lo - 1)) !=
+        std::string::npos);
+  CHECK_FALSE(below.added);
+  CHECK(qty_of(f, kRows) == kRows);
+  // The statement's scratch (the rows it wrote, its vectors' slots) is
+  // statement memory: under a bound with room, a budget it passes refuses it.
+  auto budgeted = txn_set_all(f, 1u << 30, 8, false, memory_budget(16u << 10));
+  CHECK(budgeted.run == BC_E_LIMIT);
+  CHECK(budgeted.message.find("memory budget") != std::string::npos);
+  CHECK_FALSE(budgeted.added);
 }
 
 namespace {
