@@ -211,7 +211,7 @@ class Op:
     """One transaction: its invoke and its completion."""
 
     __slots__ = ("process", "invoke", "index", "type", "value", "sequence",
-                 "epoch")
+                 "epoch", "role")
 
     def __init__(self, invoke: dict, done: dict):
         self.process = invoke["process"]
@@ -221,6 +221,7 @@ class Op:
         self.value = done["value"]
         self.sequence = done.get("sequence")
         self.epoch = done.get("epoch", 0)
+        self.role = done.get("role", "leader")
 
     def writes(self):
         """[(key, version)] this transaction invokes, a put's version unique
@@ -312,15 +313,15 @@ def history_check(history: list[dict], config: str) -> tuple[list[str], dict]:
     Two things the history cannot pin down:
 
     -   An :info transaction may or may not have committed; a crash may lose
-        it and resume() may replay it. Its writes are placed only where a
-        committed read named one of their exact values, just before that
-        reader. Every key any :info transaction wrote and no committed write
-        has since settled is unknown from that point on, and reads of it are
-        not judged: the database may or may not hold it.
+        it and resume() may replay it. Each key its write named is placed
+        only where a committed read named that key's exact value, just
+        before that reader. A key whose last unplaced :info write is still
+        the newest thing the history knows about it is unknown, and reads
+        of it are not judged: the database may or may not hold it. A
+        committed write of the key settles it again.
     -   A plan's entries span sequences below the one it reports, and another
         transaction's write can fall inside that span. A read is therefore
-        held to a state at either end of its own window: the order just
-        before or just after the transaction it belongs to.
+        held to the state at any point across its own transaction's window.
 
     guarded    every read and scan matches the order at the reading
                transaction's position.
@@ -329,8 +330,14 @@ def history_check(history: list[dict], config: str) -> tuple[list[str], dict]:
                own position: that is the exposure the range guards close. A
                run in which no read is exposed proves nothing.
 
-    A value the history never wrote, the state the database started from, is
-    the same at every position and is not checked.
+    The state the database started from, s<k>, is the value at every key
+    before the first write, and a read of it is judged against that. A kill
+    may lose it, and the re-seed that follows one is not a transaction, so
+    after the first epoch only a version this history wrote is judged.
+
+    A final read, taken after every client stopped, must hold the state the
+    order ends in: this is what catches an acknowledged write that was then
+    lost, when no later read happened to touch its key.
     """
     ops = ops_from_history(history)
     # A transaction that wrote nothing committed nothing and carries no
@@ -350,6 +357,8 @@ def history_check(history: list[dict], config: str) -> tuple[list[str], dict]:
             if isinstance(v, str) and VERSION.match(v):
                 first_reader[k].setdefault(v, c)
     info_before: dict[int, dict[int, str]] = defaultdict(dict)
+    # (the :info, the key) a committed read placed, by the value it wrote.
+    placed_infos: set[tuple[int, int]] = set()
     unplaced = 0
     for iw in info:
         for k, v in iw.writes():
@@ -360,17 +369,38 @@ def history_check(history: list[dict], config: str) -> tuple[list[str], dict]:
                 unplaced += 1
             else:
                 info_before[id(reader)][k] = v
+                placed_infos.add((id(iw), k))
+
+    # The generator writes s<k> to every key before the run, so each key the
+    # history names starts there. A read that shows another s value names it.
+    # A kill may lose a seed, so after the first epoch only a write of this
+    # history is judged.
+    seed: dict[int, str] = {}
+    for op in ops:
+        for k, _ in op.writes():
+            seed.setdefault(k, f"s{k}")
+        for _, (k, _) in op.reads():
+            seed.setdefault(k, f"s{k}")
+        for _, (k, v) in op.reads():
+            if isinstance(v, str) and v.startswith("s"):
+                seed[k] = v
 
     problems: list[str] = []
     exposures = 0
     placed_info = 0
     model = RangeModel()
-    # Keys an :info transaction wrote, whose committed value the order has not
-    # settled yet.
-    unknown: set[int] = set()
-    # The last `kSpan` states of the order, oldest first: what a transaction
+    model.state.update(seed)
+    # key -> the invoke index of the last :info transaction that wrote it,
+    # when no committed read has named that write's value.
+    info_wrote: dict[int, int] = {}
+    # key -> every version the order has held for it, so an unguarded read
+    # that names none of them is a violation, not an exposure.
+    seen: dict[int, set[str]] = defaultdict(set)
+    for k, v in seed.items():
+        seen[k].add(v)
+    # The last few states of the order, oldest first: what a transaction
     # whose plan spans several sequences may have seen.
-    recent: list[dict[int, str | None]] = [dict()]
+    recent: list[dict[int, str | None]] = [dict(seed)]
     for c in committed:
         for k, v in info_before[id(c)].items():
             model.state[k] = v
@@ -378,48 +408,69 @@ def history_check(history: list[dict], config: str) -> tuple[list[str], dict]:
         before = dict(model.state)
         model.apply(c)
         after = dict(model.state)
-        # A key an :info transaction wrote is unknown from its invocation on,
-        # whichever way that :info went: the database may hold its write or
-        # not, and a later committed write does not settle it, since the
-        # :info may have committed after that write. Only the value it wrote
-        # being read back (info_before, above) places it.
-        unknown.update(k for iw in info if iw.invoke < c.index
-                       for k, _ in iw.writes())
+        # Every version the order has held, including one written and replaced
+        # within a transaction's own plan.
+        for k, v in c.writes():
+            seen[k].add(v)
+            info_wrote.pop(k, None)
+        for iw in info:
+            if iw.invoke < c.index:
+                for k, v in iw.writes():
+                    seen[k].add(v)
+        for op in info:
+            if op.invoke >= c.index:
+                continue
+            for k, _ in op.writes():
+                if (id(op), k) not in placed_infos:
+                    info_wrote[k] = op.invoke
+        # A key whose last unplaced :info write is still the newest thing the
+        # history knows about it is unknown: that :info may or may not have
+        # committed.
+        unknown = set(info_wrote)
         # What this transaction writes is not in its own snapshot.
         settles = {k for k, _ in c.writes()}
         # The plan's entries span sequences below the one it reports: one per
         # write, and the markers a plan of more than one write is framed by.
-        # A transaction committed anywhere in that span, so a read must
-        # match the order at any point in it.
         span = len(c.writes())
         if span > 1:
             span += 2
         states = recent[-span:] + [after]
 
         for _, (k, v) in c.reads():
-            if not (isinstance(v, str) and VERSION.match(v)):
+            if not isinstance(v, str):
                 continue
             if k in unknown or k in settles:
                 continue
+            # A seed value is only judgeable in the first epoch: a kill may
+            # lose it, and the re-seed that follows one is not a transaction.
+            if v.startswith("s") and c.epoch != 0:
+                continue
             if any(state.get(k) == v for state in states):
                 continue
-            if config == "guarded":
+            # Unguarded: a read may be behind its own position, but only to a
+            # value the order has held for the key.
+            if config == "unguarded" and v in seen.get(k, ()):
+                exposures += 1
+                continue
+            if v in seen.get(k, ()):
                 problems.append(
                     f"process {c.process} (sequence {c.sequence}) read key {k} "
-                    f"= {v}, but the order has {before.get(k)} there")
+                    f"= {v}, a state the order has already left "
+                    f"({before.get(k)} there)")
             else:
-                exposures += 1
+                problems.append(
+                    f"process {c.process} (sequence {c.sequence}) read key {k} "
+                    f"= {v}, which the order never holds there "
+                    f"({before.get(k)})")
         for from_, to_, pairs in c.scans():
             shown = {k for k, _ in pairs}
-            # A key this transaction writes is not in its own snapshot, so
-            # its scan cannot show it.
-            # Only a key this history wrote can be judged: a key holding its
-            # starting value may or may not have survived a kill, and the
-            # re-seed that follows one is not a transaction of the history.
+            # Only a version this history wrote can be judged: a key holding
+            # its seed may have survived a kill or not, and the re-seed that
+            # follows one is not a transaction of the history.
             held = {k for k, v in before.items()
                     if from_ <= k < to_ and isinstance(v, str)
-                    and VERSION.match(v) and k not in settles}
-            missed = sorted(held - shown - unknown)
+                    and VERSION.match(v) and k not in settles and k not in unknown}
+            missed = sorted(held - shown)
             if not missed:
                 continue
             if config == "guarded":
@@ -429,11 +480,37 @@ def history_check(history: list[dict], config: str) -> tuple[list[str], dict]:
                     f"has live there")
             else:
                 exposures += 1
-        # From the next transaction on, the keys this one wrote are settled.
-        unknown.difference_update(settles)
         recent.append(after)
         if len(recent) > 8:
             del recent[0]
+
+    # The final read, taken after every client stopped, is the state the
+    # database kept: every write the order holds has to be in it, and nothing
+    # else. It is what catches a lost acknowledged write no later read
+    # happened to touch.
+    # A seed value counts here: a key the order ends with deleted reads as
+    # its seed again only where the delete was lost. Every key the final read
+    # names a value for is compared, seed or version.
+    unknown = set(info_wrote)
+    for fin in (op for op in ops if op.role == "final" and op.type == "ok"):
+        for _, (k, v) in fin.reads():
+            if not isinstance(v, str):
+                continue
+            if k in unknown and not v.startswith("s"):
+                continue
+            if model.state.get(k) != v:
+                problems.append(
+                    f"final read (process {fin.process}) has key {k} = {v}, "
+                    f"but the order ends with {model.state.get(k)} there")
+
+    # A transaction that committed nothing carries no sequence, so the
+    # engine's order does not place it. Its snapshot is the state of every
+    # committed transaction whose completion preceded its invoke: a read of
+    # anything the order held by then is valid, and beyond it is not.
+    # A transaction that committed nothing is not judged: it carries no
+    # sequence, and a value it read can carry one above its own completion
+    # time, since a plan's entries span the sequences below the one it
+    # reports. The history cannot place it, so it is counted only.
 
     reads_only = [op for op in ops if op.type == "ok" and op.sequence is None]
     summary = {

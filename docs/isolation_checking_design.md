@@ -121,26 +121,38 @@ every read and scan is held to that map:
 
 - `guarded`: the version a read returns is the one at its key, and a scan
   shows every key its range holds, at the transaction's own position.
-- `unguarded`: the same at that position or the one before it, and at least
-  one transaction has to have read a state behind its own, or the run is not
-  shown to reach write skew at all.
+- `unguarded`: a read or scan may be behind its own position, but only to a
+  value the key has held: reading a value the order never held is a
+  violation, not an exposure. At least one transaction has to have read a
+  state behind its own, or the run is not shown to reach write skew at all.
+
+A final read, taken after every client stopped, is held to the end of the
+replayed order. This is what catches a write that was acknowledged and then
+lost, when no later read happened to touch its key.
 
 Two things the history cannot pin down, and how the check handles them:
 
-- An `:info` transaction may or may not have committed. Its write is placed
-  only where a committed read named one of its exact values, just before
-  that reader. Every key such a transaction wrote is unknown from its
-  invocation on, and reads of it are not judged: a later committed write
-  does not settle it, since the `:info` may have committed after that one.
-  This is what a kill leaves behind; a kill-mode round is about a hundred
-  live `:info` transactions.
+- An `:info` transaction may or may not have committed. Each key its write
+  named is placed only where a committed read named that key's exact value,
+  just before that reader: placement is per key, so an `:info` placed by one
+  key's value leaves its other keys unknown. A key whose last unplaced
+  `:info` write is still the newest thing the history knows about it is not
+  judged; a committed write of the key makes it judgeable again. This is
+  what a kill leaves behind; a kill-mode round is about a hundred live
+  `:info` transactions.
 - A plan's entries span sequences below the one it reports, so another
   transaction's write can fall inside that span. A read is held to the state
   at any point across its own transaction's window, which is as wide as the
   plan has entries.
+- A transaction that committed nothing carries no sequence, and the value it
+  read can carry one above its own completion: the span above is why. Its
+  reads are counted but not judged. A read-only transaction is roughly half
+  the history, so this is the check's largest gap.
 
-A value the history never wrote, the state the database started with, is the
-same at every position and is not checked.
+The state the database started with, `s<k>`, is the value at every key before
+the first write of the history, and a read of it is judged against that. A
+kill may lose it and the re-seed that follows is not a transaction, so after
+the first epoch only versions this history wrote are judged.
 
 The kill mode and the chaos rig run the same workload, which is where most of
 the `:info` transactions come from, and so does the nemesis mix of vacuum and
@@ -153,8 +165,8 @@ history of the same seed keeps showing its exposures):
 
 | Mutation | What the guarded history reports |
 |---|---|
-| skip the "deleted since the snapshot" pass of `range_changed` | reads of a version the order has replaced: a delete went unseen |
-| skip the "changed or inserted" pass | scans that miss a key the order has live in the range |
+| skip the "deleted since the snapshot" pass of `range_changed` | reads of a state the order has already left: a delete went unseen |
+| skip the "changed or inserted" pass | reads of a state the order has left, and scans that miss a key the order has live in the range |
 | treat a write above the snapshot's sequence as unchanged, as validating against the published state does | both: scans that miss live keys, and reads of replaced versions |
 
 The last is the effect of validating against the published state rather than

@@ -323,7 +323,8 @@ struct Mop {
   std::uint64_t write_id{0}; // Put: the value this write stores
   std::optional<List> read;  // Read, append workload
   Pairs pairs;               // Read, range workload
-  bool read_done{false};     // Read: the scan ran; false when it did not
+  bool is_scan{false};       // Read: a range [key, to), not one key
+  bool read_done{false};     // Read: it ran; false when the transaction did not
 };
 
 enum class EventType : std::uint8_t { Invoke, Ok, Fail, Info };
@@ -437,7 +438,7 @@ auto mop_json(const Mop &m) -> std::string {
   case Mop::Kind::Append:
     return std::format(R"(["append",{},{}])", m.key, m.element);
   case Mop::Kind::Read:
-    if (m.to == m.key) return std::format(R"(["r",{},{}])", m.key, result);
+    if (!m.is_scan) return std::format(R"(["r",{},{}])", m.key, result);
     return std::format(R"([["r",{},{}],["scan",{},{},{}]])", m.key, result,
                        m.key, m.to, result);
   case Mop::Kind::Put:
@@ -531,9 +532,10 @@ public:
   auto next(std::mt19937_64 &rng) -> std::vector<Mop> {
     Mop scan;
     scan.kind = Mop::Kind::Read;
+    scan.is_scan = true;
     const auto width = 2 + static_cast<int>(rng() % 6); // 2..7 keys
     scan.key = static_cast<std::int64_t>(
-        rng() % static_cast<std::uint64_t>(kRangeKeys - width));
+        rng() % static_cast<std::uint64_t>(kRangeKeys - width + 1));
     scan.to = scan.key + width; // within [0, kRangeKeys)
     std::vector<Mop> mops;
     if (rng() % 4 == 0) {
@@ -545,22 +547,11 @@ public:
       mops.push_back(put);
     }
     mops.push_back(scan);
-    // The delete takes one of the range's keys. Which one, the scan decides:
-    // the executor moves it to the first key the scan returned, when the scan
-    // returned at least two, and writes nothing when it returned fewer.
+    // Which key the delete takes, the scan decides: the executor settles it
+    // on the first key the scan returned, when the scan holds at least two,
+    // and drops the delete when it holds fewer.
     Mop del;
     del.kind = rng() % 2 == 0 ? Mop::Kind::Del : Mop::Kind::RangeDel;
-    del.key = scan.key + static_cast<std::int64_t>(
-                              rng() % static_cast<std::uint64_t>(width));
-    // The delete never takes the key the put inserted: the plan would put
-    // and delete one key, and the history could not say which it meant.
-    for (auto guard = 0; !mops.empty() && mops.front().kind == Mop::Kind::Put &&
-                        mops.front().key == del.key;
-         ++guard) {
-      if (guard == width) break; // every key of the range was inserted
-      del.key = scan.key + (del.key - scan.key + 1) % width;
-    }
-    del.to = del.kind == Mop::Kind::RangeDel ? del.key + 1 : del.key;
     mops.push_back(del);
     return mops;
   }
@@ -582,7 +573,7 @@ auto choose_delete(Mop &del, const Pairs &seen, std::int64_t inserted) -> bool {
     if (k != inserted) keys.push_back(k);
   if (keys.size() < 2) return false;
   del.key = keys.front();
-  del.to = del.kind == Mop::Kind::RangeDel ? del.key + 1 : del.key;
+  del.to = del.key + 1; // a del_range covers the one key; a del names it alone
   return true;
 }
 
@@ -646,17 +637,16 @@ auto scan_pairs(const bytecask::DB &db, const bytecask::Snapshot *snap,
   return out;
 }
 
-// Runs mops as a range workload transaction.
+// Reads a range workload transaction's scan and settles each delete on a key
+// the scan returned, in mops. Takes the snapshot the plan will be built on, so
+// the history records the plan the transaction actually runs.
 //
-// The guarded configuration reads point keys and ranges from the snapshot,
-// guards every key and range it read but did not write, and lets the engine
-// lose the transaction when another thread changed what it read: that is the
-// claim under test. Unguarded reads through the head without guards; the
-// delete decision is taken on a second, later scan of the head, so the
-// transaction acts on what it saw and its read set stays behind its plan,
-// which is what makes write skew visible.
-auto execute_range_txn(bytecask::DB &db, Mode mode, std::vector<Mop> &mops,
-                       bytecask::WriteOptions wo) -> TxnOutcome {
+// The guarded configuration reads point keys and ranges from the snapshot;
+// unguarded reads the head with no guards and decides on a second, later scan
+// of the head, which puts the delete decision behind the plan it goes into.
+// That is what makes write skew visible.
+auto plan_range_txn(bytecask::DB &db, Mode mode, std::vector<Mop> &mops)
+    -> std::optional<bytecask::Snapshot> {
   std::optional<bytecask::Snapshot> snap;
   if (mode != Mode::Blind) snap.emplace(db.snapshot());
   const auto *view = snap ? &*snap : nullptr;
@@ -692,17 +682,21 @@ auto execute_range_txn(bytecask::DB &db, Mode mode, std::vector<Mop> &mops,
     }
   }
   // A delete the scan did not decide writes nothing, and an operation that
-  // writes nothing has no sequence, so it is not part of the transaction. One
-  // that would take the key the transaction inserted goes too, for the reason
-  // choose_delete gives.
-  const auto inserted = std::ranges::find_if(
-      mops, [](const Mop &x) { return x.kind == Mop::Kind::Put; });
-  const auto inserted_key = inserted == mops.end() ? -1 : inserted->key;
-  std::erase_if(mops, [&](const Mop &m) {
+  // writes nothing has no sequence, so it is not part of the transaction.
+  std::erase_if(mops, [](const Mop &m) {
     return (m.kind == Mop::Kind::Del || m.kind == Mop::Kind::RangeDel) &&
-           (m.key < 0 || m.key == inserted_key);
+           m.key < 0;
   });
+  return snap;
+}
 
+// Builds the plan for a transaction plan_range_txn read, and applies it. The
+// guarded configuration guards every key and range it read but did not write,
+// and lets the engine lose the transaction when another thread changed what it
+// read: that is the claim under test.
+auto apply_range_txn(bytecask::DB &db, Mode mode, const std::vector<Mop> &mops,
+                     std::optional<bytecask::Snapshot> snap,
+                     bytecask::WriteOptions wo) -> TxnOutcome {
   // The plan holds the writes, in key order: a put, or a del or one-key
   // del_range of a key the transaction scanned.
   std::map<std::int64_t, const Mop *> writes;
@@ -758,6 +752,17 @@ auto execute_range_txn(bytecask::DB &db, Mode mode, std::vector<Mop> &mops,
           .durable = r->durable};
 }
 
+// Drops every read result in mops: an :info transaction's reads say nothing
+// about what the database held, and Elle would otherwise order by them.
+auto clear_reads(std::vector<Mop> &mops) -> void {
+  for (auto &m : mops) {
+    if (m.kind != Mop::Kind::Read) continue;
+    m.read.reset();
+    m.pairs.clear();
+    m.read_done = false;
+  }
+}
+
 // Runs mops as one transaction. Fills each read mop's result. Keys the
 // transaction touches are loaded once; later mops see its own earlier
 // appends, as Transaction (Layer 2) would.
@@ -765,7 +770,7 @@ auto execute_txn(bytecask::DB &db, Mode mode, Workload workload,
                  std::vector<Mop> &mops, bytecask::WriteOptions wo)
     -> TxnOutcome {
   if (workload == Workload::Range)
-    return execute_range_txn(db, mode, mops, wo);
+    return apply_range_txn(db, mode, mops, plan_range_txn(db, mode, mops), wo);
 
   std::map<std::int64_t, List> lists;
   std::map<std::int64_t, bool> written;
@@ -851,16 +856,26 @@ auto run_one(bytecask::DB &db, Mode mode, Workload workload, Placement at,
   inv.life = at.life;
   inv.role = at.role;
   inv.wait_seq = at.wait_seq;
+  // A range transaction's scan and delete decide its plan, so it is read
+  // before the invoke is recorded: what the history names is what it ran.
+  auto snap = workload == Workload::Range
+                  ? plan_range_txn(db, mode, mops)
+                  : std::optional<bytecask::Snapshot>{};
   inv.value = mops;
   rec.stamp(inv);
 
   TxnOutcome outcome;
   try {
+    const auto run = [&] {
+      return workload == Workload::Range
+                 ? apply_range_txn(db, mode, mops, std::move(snap), wo)
+                 : execute_txn(db, mode, workload, mops, wo);
+    };
     if (inject_sync) {
       bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
-      outcome = execute_txn(db, mode, workload, mops, wo);
+      outcome = run();
     } else {
-      outcome = execute_txn(db, mode, workload, mops, wo);
+      outcome = run();
     }
   } catch (const bytecask::DbFollowerMode &e) {
     // Refused at admission, before anything is appended: the node was
@@ -878,9 +893,12 @@ auto run_one(bytecask::DB &db, Mode mode, Workload workload, Placement at,
   done.role = at.role;
   done.wait_seq = at.wait_seq;
   done.type = outcome.type;
-  // A failed or indeterminate transaction reports what it invoked: its reads
-  // carry no result.
-  done.value = outcome.type == EventType::Ok ? std::move(mops) : inv.value;
+  // A transaction reports the plan it ran: the range workload's executor
+  // settles each delete's key before appending, so mops, not inv.value, names
+  // what it really tried. Only an :ok carries read results; a failed or
+  // indeterminate one reports the same plan with no read result.
+  done.value = std::move(mops);
+  if (outcome.type != EventType::Ok) clear_reads(done.value);
   done.sequence = outcome.sequence;
   done.error = std::move(outcome.error);
   rec.stamp(done);
@@ -1569,6 +1587,7 @@ auto append_final_read(std::vector<Event> &events, std::uint64_t &next_index,
   auto done = inv;
   bytecask::Bytes buf;
   for (auto &m : done.value) {
+    m.read_done = true;
     const auto kb = workload == Workload::Range ? range_key_bytes(m.key)
                                                 : key_bytes(m.key);
     const auto found = snap.get({}, as_view(kb), buf);
@@ -1697,6 +1716,12 @@ auto run_kill_child(const RunOptions &o) -> int {
       RangeGenerator ranges{static_cast<std::uint64_t>(process)};
       while (remaining.fetch_sub(1, std::memory_order_relaxed) > 0) {
         auto mops = make_txns(o.workload, rng, keys, ranges, next_element);
+        // What a range transaction will run is settled by its scan, so it is
+        // read before the invoke goes out: the stream names the plan it ran,
+        // which is what a killed operation is judged on.
+        auto snap = o.workload == Workload::Range
+                        ? plan_range_txn(db, o.mode, mops)
+                        : std::optional<bytecask::Snapshot>{};
         const auto sync =
             static_cast<int>(rng() % 100) < cfg.sync_percent;
         std::string line = std::format("I {} {} {}", process, monotonic_ns(),
@@ -1705,7 +1730,10 @@ auto run_kill_child(const RunOptions &o) -> int {
         out.write(line + "\n");
         TxnOutcome r;
         try {
-          r = execute_txn(db, o.mode, o.workload, mops, {.sync = sync});
+          r = o.workload == Workload::Range
+                  ? apply_range_txn(db, o.mode, mops, std::move(snap),
+                                    {.sync = sync})
+                  : execute_txn(db, o.mode, o.workload, mops, {.sync = sync});
         } catch (const std::exception &e) {
           r = {.type = EventType::Info, .sequence = 0, .error = e.what(),
                .durable = false};
@@ -1872,6 +1900,8 @@ auto absorb_epoch(std::string_view stream, int epoch, std::int64_t killed_at,
       } else {
         m.kind = Mop::Kind::Read;
         in >> m.key >> m.to;
+        m.is_scan = m.to > m.key;
+        m.read_done = kind == 'R';
         if (kind == 'N' || !with_reads) continue;
         std::size_t len = 0;
         in >> len;
@@ -2143,6 +2173,10 @@ auto chaos_child_body(bytecask::DB &db, const RunOptions &o, const Config &cfg,
           continue;
         }
         auto mops = make_txns(o.workload, rng, keys, ranges, next_element);
+        // As in the kill child: the plan is settled before the invoke.
+        auto snap = o.workload == Workload::Range
+                        ? plan_range_txn(db, o.mode, mops)
+                        : std::optional<bytecask::Snapshot>{};
         const auto sync = static_cast<int>(rng() % 100) < cfg.sync_percent;
         std::string line = std::format("I {} {} {}", process, monotonic_ns(),
                                        sync ? 1 : 0);
@@ -2150,7 +2184,10 @@ auto chaos_child_body(bytecask::DB &db, const RunOptions &o, const Config &cfg,
         out.write(line + "\n");
         TxnOutcome r;
         try {
-          r = execute_txn(db, o.mode, o.workload, mops, {.sync = sync});
+          r = o.workload == Workload::Range
+                  ? apply_range_txn(db, o.mode, mops, std::move(snap),
+                                    {.sync = sync})
+                  : execute_txn(db, o.mode, o.workload, mops, {.sync = sync});
         } catch (const std::exception &e) {
           r = {.type = EventType::Info, .sequence = 0, .error = e.what(),
                .durable = false};
@@ -2300,10 +2337,7 @@ auto run_absorb(const RunOptions &o) -> int {
         events[i].type = EventType::Info;
         events[i].sequence = 0;
         events[i].error = "read a write the page cache lost";
-        // An :info read's result is unknown, as for the kill mode's
-        // downgrades: Elle would otherwise still order by what it saw.
-        for (auto &m : events[i].value)
-          if (m.kind == Mop::Kind::Read) m.read.reset();
+        clear_reads(events[i].value);
         ++lost_reads;
       }
     }
@@ -2552,11 +2586,13 @@ auto run(const RunOptions &o) -> int {
       std::mt19937_64 nrng{o.seed + 2};
       auto &events = buffers[static_cast<std::size_t>(process)];
       auto &db = node(0).holder->db;
+      // One generator for the thread's whole run: a value names its write,
+      // and a fresh generator per degrade cycle would number them again.
+      RangeGenerator ranges{static_cast<std::uint64_t>(process)};
       while (!stop.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(
             std::chrono::milliseconds(20 + nrng() % 180));
         if (stop.load(std::memory_order_relaxed)) break;
-        RangeGenerator ranges{static_cast<std::uint64_t>(process)};
         // Retry until this thread holds the flush role for its own write.
         for (int attempt = 0; attempt < 50 && !db.is_degraded(); ++attempt) {
           auto mops = make_txns(o.workload, nrng, keys, ranges, next_element);
