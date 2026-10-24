@@ -196,9 +196,9 @@ class ElleStream:
         self._thread.join(timeout)
 
 
-def elle_bases(stream: bytes, max_element: int, max_key: int) -> tuple[int, int]:
-    """The highest element and key an isolation_history child's stream names:
-    the next life must use fresh elements and continue on its keys."""
+def elle_max_key(stream: bytes, max_key: int) -> int:
+    """The highest key an isolation_history child's stream names: the next
+    life continues on those keys."""
     for line in stream.splitlines():
         parts = line.split()
         if not parts or parts[0] not in (b"I", b"C"):
@@ -209,17 +209,18 @@ def elle_bases(stream: bytes, max_element: int, max_key: int) -> tuple[int, int]
             while i < len(parts):
                 kind, key = parts[i], int(parts[i + 1])
                 max_key = max(max_key, key)
-                if kind == b"A":
-                    max_element = max(max_element, int(parts[i + 2]))
+                if kind == b"A" or kind == b"P":
                     i += 3
                 elif kind == b"R":
                     n = int(parts[i + 2])
                     i += 3 + n
+                elif kind == b"D":
+                    i += 3
                 else:  # N <key>
                     i += 2
         except (IndexError, ValueError):
             continue  # a line cut short by the end of the life
-    return max_element, max_key
+    return max_key
 
 
 def log_uniform(rng: random.Random, lo: float, hi: float) -> float:
@@ -583,7 +584,6 @@ class Rig:
                 "--seed", str(life["seed"]), "--threads", str(self.args.threads),
                 "--dir", str(life["db"]), "--fd", str(wfd),
                 "--process-base", str(e["epoch"] * self.args.threads),
-                "--element-base", str(e["max_element"] + 1),
                 # The KeyPool starts on the keys the last life was appending to.
                 "--key-base", str(max(0, e["max_key"] + 1 - 8))]
         if self.args.elle_workload != "append":
@@ -596,7 +596,7 @@ class Rig:
         if ep_root.exists():
             shutil.rmtree(ep_root)
         ep_root.mkdir(parents=True)
-        self.elle = {"epoch": 0, "max_element": -1, "max_key": -1,
+        self.elle = {"epoch": 0, "max_key": -1,
                      "root": ep_root, "manifest": [f"start {time.monotonic_ns()}"]}
 
     def elle_after_life(self, life: dict, outcome: dict, hist_raw: bytes) -> dict:
@@ -604,8 +604,7 @@ class Rig:
         e = self.elle
         stream = e["root"] / f"epoch{e['epoch']}.txt"
         stream.write_bytes(hist_raw)
-        e["max_element"], e["max_key"] = elle_bases(hist_raw, e["max_element"],
-                                                    e["max_key"])
+        e["max_key"] = elle_max_key(hist_raw, e["max_key"])
         power = outcome["terminator"] == "power" and not outcome["exited_early"]
         text = hist_raw.decode(errors="replace")
         opened = "\nO\n" in "\n" + text

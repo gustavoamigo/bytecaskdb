@@ -41,7 +41,7 @@
 //                     [--followers N] [--follower-readers N] [--lag]
 //                     [--kill-epochs N]
 //   isolation_history --chaos-child --config C --seed S --threads N --dir D
-//                     --fd N --process-base P --element-base E --key-base K
+//                     --fd N --process-base P --key-base K
 //   isolation_history --absorb MANIFEST --config C --seed S --threads N
 //                     --dir D --out history.json
 //
@@ -153,7 +153,6 @@ struct RunOptions {
   fs::path absorb;         // #232: a chaos episode's manifest
   int child_fd{-1};
   int process_base{0};
-  std::int64_t element_base{0};
   std::int64_t key_base{0};
 };
 
@@ -489,17 +488,52 @@ auto write_history(const fs::path &path, std::vector<Event> events) -> void {
 // Transactions
 // ---------------------------------------------------------------------------
 
-auto random_txn(std::mt19937_64 &rng, KeyPool &keys,
-                std::atomic<std::int64_t> &next_element) -> std::vector<Mop> {
+// The keys an append-workload transaction picks: one to four.
+auto append_keys(std::mt19937_64 &rng, KeyPool &keys)
+    -> std::vector<std::int64_t> {
   const auto n = 1 + static_cast<int>(rng() % 4);
+  std::vector<std::int64_t> out(static_cast<std::size_t>(n));
+  for (auto &k : out) k = keys.pick(rng, true);
+  return out;
+}
+
+// A thread's write block: kElementsPerThread values, far more than any
+// thread's transaction count, so a block never runs out. A block is the
+// thread's whole allocation whether or not its process survived, so the
+// history's values are unique without the parent tracking the highest one.
+constexpr std::int64_t kElementsPerThread = 1 << 22;
+
+auto block_base(int process) -> std::int64_t {
+  return static_cast<std::int64_t>(process) * kElementsPerThread;
+}
+
+// One writer thread's transactions: appends from the key pool, or the range
+// workload's from its generator. `next_element` is the thread's own write
+// block (see block_base). Defined after RangeGenerator.
+class RangeGenerator;
+auto make_txns(Workload w, std::mt19937_64 &rng, KeyPool &keys,
+               RangeGenerator &ranges, std::int64_t &next_element)
+    -> std::vector<Mop>;
+
+auto append_txn(std::mt19937_64 &rng, KeyPool &keys, std::int64_t &next_element)
+    -> std::vector<Mop> {
   std::vector<Mop> mops;
-  for (int i = 0; i < n; ++i) {
+  auto append = [&](std::int64_t key) {
     Mop m;
-    m.kind = rng() % 2 == 0 ? Mop::Kind::Append : Mop::Kind::Read;
-    m.key = keys.pick(rng, m.kind == Mop::Kind::Append);
-    if (m.kind == Mop::Kind::Append)
-      m.element = next_element.fetch_add(1, std::memory_order_relaxed);
+    m.kind = Mop::Kind::Append;
+    m.key = key;
+    m.element = next_element++;
     mops.push_back(m);
+  };
+  for (const auto key : append_keys(rng, keys)) {
+    if (rng() % 2 == 0) {
+      append(key);
+    } else {
+      Mop m;
+      m.kind = Mop::Kind::Read;
+      m.key = key;
+      mops.push_back(m);
+    }
   }
   return mops;
 }
@@ -561,6 +595,13 @@ private:
   std::uint64_t next_count_{0}; // one thread owns a generator
 };
 
+auto make_txns(Workload w, std::mt19937_64 &rng, KeyPool &keys,
+               RangeGenerator &ranges, std::int64_t &next_element)
+    -> std::vector<Mop> {
+  if (w == Workload::Range) return ranges.next(rng);
+  return append_txn(rng, keys, next_element);
+}
+
 // Points a delete at the first key the scan returned, as a del or a one-key
 // del_range, when the scan holds two live keys other than the one this
 // transaction inserted. A plan that put and deleted one key would leave
@@ -588,20 +629,6 @@ auto seed_range_workload(bytecask::DB &db) -> void {
     if (db.get({}, as_view(kb), buf)) continue;
     db.put({}, as_view(kb), as_view(std::format("s{}", k)));
   }
-}
-
-// The transaction a writer runs next: the append workload's from the key
-// pool, the range workload's from its generator.
-auto make_txns(Workload w, std::mt19937_64 &rng, KeyPool &keys,
-               RangeGenerator &ranges, std::atomic<std::int64_t> &next_element)
-    -> std::vector<Mop> {
-  switch (w) {
-  case Workload::Append:
-    return random_txn(rng, keys, next_element);
-  case Workload::Range:
-    return ranges.next(rng);
-  }
-  return {};
 }
 
 struct TxnOutcome {
@@ -1572,35 +1599,37 @@ auto kill_config(std::uint64_t seed) -> Config {
 // final value is recorded in pairs, the append workload's in read.
 auto append_final_read(std::vector<Event> &events, std::uint64_t &next_index,
                        std::int64_t start_ns, Workload workload,
-                       std::int64_t max_key, const bytecask::Snapshot &snap,
-                       Event inv) -> void {
-  const auto last = workload == Workload::Range ? kRangeKeys - 1 : max_key;
-  for (std::int64_t k = 0; k <= last; ++k) {
+                       const bytecask::Snapshot &snap, Event inv) -> void {
+  const auto last = workload == Workload::Range ? kRangeKeys - 1 : INT64_MAX;
+  // The keys come from the snapshot, not from a key id: a started process
+  // spends ids without ever writing them, so the ids run far above the keys
+  // a final read could enumerate between 0 and the highest.
+  std::vector<Mop> mops;
+  for (const auto &e : snap.iter_from({}, {})) {
+    const auto key = std::string_view{
+        reinterpret_cast<const char *>(e.key.data()), e.key.size()};
+    const auto prefix = workload == Workload::Range ? 'r' : 'k';
+    if (key.empty() || key.front() != prefix) continue;
     Mop m;
-    m.key = k;
-    m.to = k;
-    inv.value.push_back(m);
+    m.key = std::stoll(std::string{key.substr(1)});
+    if (m.key > last) continue;
+    m.to = m.key;
+    m.read_done = true;
+    if (workload == Workload::Range) {
+      m.pairs.emplace_back(m.key, std::string{reinterpret_cast<const char *>(
+                                          e.value.data()),
+                                      e.value.size()});
+    } else {
+      m.read = decode_list(e.value);
+    }
+    mops.push_back(std::move(m));
   }
+  std::ranges::sort(mops, {}, &Mop::key);
+  inv.value = std::move(mops);
   inv.index = next_index++;
   inv.time_ns = monotonic_ns() - start_ns;
   inv.type = EventType::Invoke;
   auto done = inv;
-  bytecask::Bytes buf;
-  for (auto &m : done.value) {
-    m.read_done = true;
-    const auto kb = workload == Workload::Range ? range_key_bytes(m.key)
-                                                : key_bytes(m.key);
-    const auto found = snap.get({}, as_view(kb), buf);
-    if (workload == Workload::Range) {
-      if (found)
-        m.pairs.emplace_back(m.key, std::string{
-                                        reinterpret_cast<const char *>(
-                                            buf.data()),
-                                        buf.size()});
-    } else {
-      m.read = found ? decode_list(buf) : List{};
-    }
-  }
   done.type = EventType::Ok;
   done.index = next_index++;
   done.time_ns = monotonic_ns() - start_ns;
@@ -1677,7 +1706,6 @@ auto run_kill_child(const RunOptions &o) -> int {
   if (o.workload == Workload::Range) seed_range_workload(db);
   LineWriter out{o.child_fd};
   KeyPool keys{o.key_base};
-  std::atomic<std::int64_t> next_element{o.element_base};
   std::atomic<int> remaining{o.txns};
   std::atomic<bool> stop{false};
 
@@ -1714,6 +1742,8 @@ auto run_kill_child(const RunOptions &o) -> int {
       // The process counts every thread of every earlier process too, so a
       // write's value names it uniquely across the whole history.
       RangeGenerator ranges{static_cast<std::uint64_t>(process)};
+      // This thread's writes come from its own block (block_base above).
+      std::int64_t next_element = block_base(process);
       while (remaining.fetch_sub(1, std::memory_order_relaxed) > 0) {
         auto mops = make_txns(o.workload, rng, keys, ranges, next_element);
         const auto sync =
@@ -1769,7 +1799,6 @@ auto spawn_kill_child(const RunOptions &o, int epoch, int write_fd) -> pid_t {
       "--dir", o.dir.string(),
       "--fd", std::to_string(write_fd),
       "--process-base", std::to_string(o.process_base),
-      "--element-base", std::to_string(o.element_base),
       "--key-base", std::to_string(o.key_base)};
   std::vector<char *> argv;
   for (auto &a : args) argv.push_back(a.data());
@@ -1868,8 +1897,8 @@ struct KillStats {
 // that ends up :info: a power cut may still take it (#232).
 auto absorb_epoch(std::string_view stream, int epoch, std::int64_t killed_at,
                   std::int64_t start_ns, std::vector<Event> &events,
-                  std::uint64_t &next_index, std::int64_t &max_element,
-                  std::int64_t &max_key, bool range_workload,
+                  std::uint64_t &next_index, std::int64_t &max_key,
+                  bool range_workload,
                   KillStats &stats,
                   std::vector<std::int64_t> *not_durable = nullptr) -> void {
   struct Pending {
@@ -1896,7 +1925,6 @@ auto absorb_epoch(std::string_view stream, int epoch, std::int64_t killed_at,
       if (kind == 'A') {
         m.kind = Mop::Kind::Append;
         in >> m.key >> m.element;
-        max_element = std::max(max_element, m.element);
       } else if (kind == 'P') {
         m.kind = Mop::Kind::Put;
         in >> m.key >> m.write_id;
@@ -2039,15 +2067,14 @@ auto run_kill(const RunOptions &o) -> int {
   const auto start_ns = monotonic_ns();
   std::vector<Event> events;
   std::uint64_t next_index = 0;
-  std::int64_t max_element = -1;
   std::int64_t max_key = -1;
   KillStats stats;
   auto child = o;
   for (int epoch = 0; epoch < o.kill_epochs; ++epoch) {
     // A process that saw an :info cannot be reused, so every child gets
-    // fresh process ids, fresh elements, and the keys the last one was on.
+    // fresh process ids, hence fresh element blocks, and the keys the last
+    // one was on.
     child.process_base = epoch * o.threads;
-    child.element_base = max_element + 1;
     child.key_base = std::max<std::int64_t>(0, max_key + 1 - KeyPool::kSlots);
     // Somewhere between 10% and 95% of the child's transactions.
     const auto share = std::max(1, o.txns / o.kill_epochs);
@@ -2057,7 +2084,7 @@ auto run_kill(const RunOptions &o) -> int {
                                      share * 85 / 100 + 1));
     const auto [stream, killed_at] = run_and_kill(child, epoch, kill_after);
     absorb_epoch(stream, epoch, killed_at, start_ns, events, next_index,
-                 max_element, max_key, o.workload == Workload::Range, stats);
+                 max_key, o.workload == Workload::Range, stats);
   }
 
   // One more recovery, then every key in one read-only transaction.
@@ -2067,7 +2094,7 @@ auto run_kill(const RunOptions &o) -> int {
     inv.process = o.kill_epochs * o.threads;
     inv.epoch = o.kill_epochs;
     auto snap = db.snapshot();
-    append_final_read(events, next_index, start_ns, o.workload, max_key, snap,
+    append_final_read(events, next_index, start_ns, o.workload, snap,
                       inv);
   }
 
@@ -2081,11 +2108,10 @@ auto run_kill(const RunOptions &o) -> int {
       stats.epochs, stats.in_flight, stats.downgraded, stats.group_kills,
       stats.ok, stats.fail);
   std::printf("  kill: epochs=%d ok=%lld fail=%lld in_flight=%d "
-              "downgraded=%d group_kills=%d keys=%lld -> %s\n",
+              "downgraded=%d group_kills=%d -> %s\n",
               stats.epochs, static_cast<long long>(stats.ok),
               static_cast<long long>(stats.fail), stats.in_flight,
-              stats.downgraded, stats.group_kills,
-              static_cast<long long>(max_key + 1), o.out.c_str());
+              stats.downgraded, stats.group_kills, o.out.c_str());
   return 0;
 }
 
@@ -2116,7 +2142,6 @@ auto chaos_child_body(bytecask::DB &db, const RunOptions &o, const Config &cfg,
                       LineWriter &out) -> int {
   out.write("O\n");
   KeyPool keys{o.key_base};
-  std::atomic<std::int64_t> next_element{o.element_base};
   std::atomic<std::uint64_t> max_ok{0};
   std::atomic<bool> stop{false};
 
@@ -2173,6 +2198,8 @@ auto chaos_child_body(bytecask::DB &db, const RunOptions &o, const Config &cfg,
       std::mt19937_64 rng{o.seed + 100 + static_cast<std::uint64_t>(t)};
       const auto process = o.process_base + t;
       RangeGenerator ranges{static_cast<std::uint64_t>(process)};
+      // This thread's writes come from its own block (block_base above).
+      std::int64_t next_element = block_base(process);
       while (!stop.load(std::memory_order_relaxed)) {
         if (db.is_degraded()) {
           std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -2332,7 +2359,6 @@ auto run_absorb(const RunOptions &o) -> int {
   const auto epochs = read_manifest(o.absorb, start_ns);
   std::vector<Event> events;
   std::uint64_t next_index = 0;
-  std::int64_t max_element = -1;
   std::int64_t max_key = -1;
   KillStats stats;
   std::map<std::int64_t, std::vector<std::size_t>> readers_of;
@@ -2362,8 +2388,8 @@ auto run_absorb(const RunOptions &o) -> int {
     const auto first = events.size();
     std::vector<std::int64_t> not_durable;
     absorb_epoch(read_whole(ep.stream), ep.epoch, ep.ended_at, start_ns, events,
-                 next_index, max_element, max_key,
-                 o.workload == Workload::Range, stats, &not_durable);
+                 next_index, max_key, o.workload == Workload::Range, stats,
+                 &not_durable);
     for (auto i = first; i < events.size(); ++i) {
       if (events[i].type != EventType::Ok) continue;
       for (const auto &m : events[i].value)
@@ -2388,7 +2414,7 @@ auto run_absorb(const RunOptions &o) -> int {
     inv.process = static_cast<int>(epochs.size()) * o.threads;
     inv.epoch = static_cast<int>(epochs.size());
     auto snap = db.snapshot();
-    append_final_read(events, next_index, start_ns, o.workload, max_key, snap,
+    append_final_read(events, next_index, start_ns, o.workload, snap,
                       inv);
   }
 
@@ -2397,10 +2423,10 @@ auto run_absorb(const RunOptions &o) -> int {
   summary += ".chaos.json";
   std::ofstream{summary} << std::format(
       R"({{"epochs":{},"in_flight":{},"downgraded":{},"group_kills":{},)"
-      R"("ok":{},"fail":{},"cache_losses":{},"lost_reads":{},"keys":{}}})"
+      R"("ok":{},"fail":{},"cache_losses":{},"lost_reads":{}}})"
       "\n",
       stats.epochs, stats.in_flight, stats.downgraded, stats.group_kills,
-      stats.ok, stats.fail, cache_losses, lost_reads, max_key + 1);
+      stats.ok, stats.fail, cache_losses, lost_reads);
   return 0;
 }
 
@@ -2464,8 +2490,6 @@ auto parse_args(int argc, char **argv) -> RunOptions {
       o.child_fd = std::stoi(std::string{next()});
     } else if (a == "--process-base") {
       o.process_base = std::stoi(std::string{next()});
-    } else if (a == "--element-base") {
-      o.element_base = std::stoll(std::string{next()});
     } else if (a == "--key-base") {
       o.key_base = std::stoll(std::string{next()});
     } else if (a == "--workload") {
@@ -2543,7 +2567,6 @@ auto run(const RunOptions &o) -> int {
   const auto start = Clock::now();
   Recorder rec{start};
   KeyPool keys;
-  std::atomic<std::int64_t> next_element{1};
   std::atomic<int> remaining{o.txns};
   std::atomic<bool> stop{false};
   Totals totals;
@@ -2603,6 +2626,7 @@ auto run(const RunOptions &o) -> int {
       // One generator for the thread's whole run: a value names its write,
       // and a fresh generator per degrade cycle would number them again.
       RangeGenerator ranges{static_cast<std::uint64_t>(process)};
+      std::int64_t next_element = block_base(process);
       while (!stop.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(
             std::chrono::milliseconds(20 + nrng() % 180));
@@ -2784,6 +2808,7 @@ auto run(const RunOptions &o) -> int {
       clients.emplace_back([&, p] {
         std::mt19937_64 crng{o.seed + 100 + static_cast<std::uint64_t>(p)};
         RangeGenerator ranges{static_cast<std::uint64_t>(p)};
+        std::int64_t next_element = block_base(p);
         auto &events = buffers[static_cast<std::size_t>(p)];
         while (remaining.fetch_sub(1, std::memory_order_relaxed) > 0) {
           for (;;) {

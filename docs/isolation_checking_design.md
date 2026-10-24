@@ -217,9 +217,10 @@ the script checks, per key:
 - the final value holds every `:ok` append, in ascending commit sequence
   (`:info` elements may appear anywhere, or not at all);
 - no element comes from a `:fail` transaction, none is duplicated, and
-  every element was invoked. Both hold per key: an element id is unique to
-  a write within one process, and a process counter restarts with each
-  epoch, so the same id names another key's write in another life;
+  every element was invoked. Ids are unique across the whole run: each
+  writer thread draws from its own block of values, so an id reused on
+  another key in another life cannot occur (the job the parent's highest-id
+  bookkeeping used to do);
 - a read sees every append whose transaction completed `:ok` before the
   reading transaction was invoked (real-time visibility). The first CI run
   showed why this belongs here as well as in Elle: see *Findings*.
@@ -283,8 +284,10 @@ itself and reads every key as one final transaction.
 - `nullopt`: `:fail`.
 
 Every epoch uses fresh Elle process ids (a process with an `:info` cannot
-go on), elements unique across the run, and the keys the last epoch was
-appending to, so reads after a recovery see what the kill left. Times are
+go on) and the keys the last epoch was appending to, so reads after a
+recovery see what the kill left. An epoch's writer threads draw element
+ids from blocks fixed by process id, so no id is reused across epochs even
+when a killed epoch never reported the highest one it used. Times are
 `CLOCK_MONOTONIC`, one clock for every process, so real-time order holds
 across kills.
 
