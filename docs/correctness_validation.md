@@ -2633,6 +2633,8 @@ Every place where a mistake loses or corrupts acknowledged data, or leaves a dat
 
 Each mutation is a patch that breaks one site. Its `Guarded-by:` header names the test, as a Catch2 test spec; when the patch was written, that test was run with the patch applied and failed. Mutations the chaos rig reaches live in `tests/chaos_mutations/` (*Chaos rig*, *Mutations*), and their `Expected:` header still says what the rig sees. The rest live in `tests/durability_mutations/`. `ci.yml` checks that every patch still applies, and that every `Guarded-by:` spec still selects a test (`scripts/check_guarded_by.py`, against `bytecask_tests` or, for a patch to the MariaDB plugin, `mariadb_proof_tests`). Catch2 reads an unescaped `,` in a spec as OR, so a comma that belongs to a test name is written `\,`; the check runs each OR fragment on its own, so neither a name split at its comma nor an OR with one dead side gets through (#463).
 
+The commit path's coordination protocols have one more guard, of a different shape: `verify/transition/` models the write group's slot hand-over (`WriteGroup::submit`) and the fdatasync role (`commit_wait`, `flush_once`, `finish_flush`) as transition tables, checks their invariants over every interleaving of the writers, and requires each of #589's four mutants to fail the check — the check running them all, in `ci.yml`, in under a second. The same technique `docs/single_wait_commit_design.md` § *Tests* asked for, applied to the protocol that runs. `flush_role_kept_on_throw` below is one of the four: the model catches it as a state violation in 10 states, where the engine test catches it by hanging.
+
 A site whose break nothing has to catch says why instead.
 
 ### Commit path
