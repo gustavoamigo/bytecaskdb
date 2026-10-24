@@ -118,6 +118,14 @@ jobs:
           xmake build isolation_history
           xmake build chaos_worker
 
+      - name: Transition-table checks on the commit path
+        # verify/transition/: the write group's slot hand-over and the flush
+        # role, modelled and checked over every interleaving of the writers,
+        # with each mutant of #589 required to fail the check. Sub-second.
+        run: |
+          xmake build transition_check
+          build/linux/x86_64/release/transition_check
+
       - name: Run tests and generate JUnit reports
         run: |
           mkdir -p test-results
