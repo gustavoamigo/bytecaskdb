@@ -7,7 +7,7 @@
 // Every id, type and constant name the printer needs is here, so it never
 // reads the catalog.
 //
-// The operators are the access paths, the joins, Filter, Limit, Aggregate
+// The operators are Empty, the access paths, the joins, Filter, Limit, Aggregate
 // and the sinks: Emit for result rows, Insert, Update, Delete. Slice 1 of the
 // design: the access paths and choices of the MVP's planner, no sort and no
 // hash join. check() enforces what the types can't express.
@@ -46,6 +46,9 @@ struct KeyBound {
 struct Range {
   KeyBound lo, hi;
 };
+
+// No rows, and nothing read: the input a conjunct always false leaves.
+struct Empty {};
 
 // The whole primary key by equality, each part a parameter: at most one row.
 struct PointGet {
@@ -154,8 +157,8 @@ struct Delete {
 };
 
 struct Node {
-  std::variant<PointGet, Scan, NullSplitScan, CountRange, MinFirstEntry, IndexJoin, Filter, Limit, Emit, Aggregate,
-               Insert, Update, Delete>
+  std::variant<Empty, PointGet, Scan, NullSplitScan, CountRange, MinFirstEntry, IndexJoin, Filter, Limit, Emit,
+               Aggregate, Insert, Update, Delete>
       op;
 };
 
@@ -283,7 +286,9 @@ private:
     std::visit(
         [&](const auto& op) {
           using T = std::decay_t<decltype(op)>;
-          if constexpr (std::is_same_v<T, PointGet>) {
+          if constexpr (std::is_same_v<T, Empty>) {
+            // Reads nothing.
+          } else if constexpr (std::is_same_v<T, PointGet>) {
             if (op.key.empty()) broken("a point lookup with no key part");
             for (const auto& e : op.key) null_checked(e);
           } else if constexpr (std::is_same_v<T, Scan>) {

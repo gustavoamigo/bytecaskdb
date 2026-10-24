@@ -9,8 +9,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 import bytecask.sql.codegen;
@@ -22,12 +24,15 @@ using namespace bytecask::sql;
 
 namespace {
 
+constexpr int kRuns = 25;
+
+// The median of kRuns calls of f(i), i the run.
 template <typename F>
 auto median_us(F&& f) -> double {
   std::vector<double> us;
-  for (int i = 0; i < 25; ++i) {
+  for (int i = 0; i < kRuns; ++i) {
     auto start = std::chrono::steady_clock::now();
-    f();
+    f(i);
     us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count());
   }
   std::ranges::sort(us);
@@ -47,15 +52,20 @@ TEST_CASE("timing: prepare, stage by stage", "[.][timing]") {
   };
   std::printf("%-50s %9s %9s %9s %9s\n", "statement", "parse", "bind", "generate", "tcc");
   for (const auto* sql : stmts) {
-    auto parse = median_us([&] { (void)ast::parse(sql); });
+    auto parse = median_us([&](int) { (void)ast::parse(sql); });
     auto tree = ast::parse(sql);
-    auto bind = median_us([&] { (void)bound::bind(tree, f.cat()); });
-    auto gen = median_us([&] { (void)generate_plan(bound::bind(tree, f.cat()), f.cat(), sql); }) - bind;
+    auto bind = median_us([&](int) { (void)bound::bind(tree, f.cat()); });
+    // generate_plan consumes its bound statement: one bound per run, before
+    // the clock starts.
+    std::vector<bound::Bound> bound;
+    for (int i = 0; i < kRuns; ++i) bound.push_back(bound::bind(tree, f.cat()));
+    auto gen = median_us(
+        [&](int i) { (void)generate_plan(std::move(bound[static_cast<std::size_t>(i)]), f.cat(), sql); });
     auto src = generate_plan(bound::bind(tree, f.cat()), f.cat(), sql).source;
-    auto tcc = median_us([&] { (void)TccPlan::compile(src); });
+    auto tcc = median_us([&](int) { (void)TccPlan::compile(src); });
     std::printf("%-50s %7.1fus %7.1fus %7.1fus %7.1fus\n", sql, parse, bind, gen, tcc);
   }
   // TinyCC's floor: a plan that only includes the header.
-  auto empty = median_us([] { (void)TccPlan::compile("#include \"bc_plan.h\"\nvoid plan(bc_ctx *cx) {}\n"); });
+  auto empty = median_us([](int) { (void)TccPlan::compile("#include \"bc_plan.h\"\nvoid plan(bc_ctx *cx) {}\n"); });
   std::printf("%-50s %39.1fus\n", "empty plan (bc_plan.h only)", empty);
 }

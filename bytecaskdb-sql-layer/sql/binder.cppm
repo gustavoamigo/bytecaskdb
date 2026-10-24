@@ -380,7 +380,7 @@ public:
     if (e.fn == Fn::Min && !exact_number(*c) && !temporal) {
       throw SqlError{"MIN of a " + sql_type_name(c->sql) + " column is not supported", e.pos};
     }
-    agg.args.push_back(ref(*c, table));
+    agg.args.push_back(logical::column_of(table, *c));
     switch (e.fn) {
       case Fn::Count: return {std::move(agg), "count"};
       case Fn::Sum:
@@ -391,11 +391,6 @@ public:
       case Fn::Min: agg.type = c->sql; return {std::move(agg), "min"};
     }
     return {std::move(agg), ""};
-  }
-
-  // A column of `table` as an expression.
-  static auto ref(const Column& c, std::uint32_t table) -> logical::Expr {
-    return logical::column({table, c.id, c.type, c.nullable}, c.sql);
   }
 
   // An integer literal added to or subtracted from `c`, in c's
@@ -433,7 +428,7 @@ public:
       case ast::Expr::Kind::Column: {
         const auto* c = column(t, e);
         if (c->type != want) throw SqlError{"column \"" + c->name + "\" is " + type_name(c->type), e.pos};
-        return ref(*c, t.id);
+        return logical::column_of(t.id, *c);
       }
       case ast::Expr::Kind::Add:
       case ast::Expr::Kind::Sub: {
@@ -454,11 +449,12 @@ public:
         }
         auto kind = e.kind == ast::Expr::Kind::Add ? logical::Expr::Kind::Add : logical::Expr::Kind::Sub;
         if (e.rhs->kind == ast::Expr::Kind::Const) {
-          return logical::binary(kind, ref(*c, t.id), logical::constant(literal(*c, *e.rhs), c->sql), c->sql);
+          return logical::binary(kind, logical::column_of(t.id, *c), logical::constant(literal(*c, *e.rhs), c->sql),
+                                 c->sql);
         }
         use_param(e.rhs->param, PhysType::I64, e.rhs->pos, *c, t.id,
                   e.kind == ast::Expr::Kind::Add ? Use::Added : Use::Subtracted);
-        return logical::binary(kind, ref(*c, t.id), logical::param(e.rhs->param, c->sql), c->sql);
+        return logical::binary(kind, logical::column_of(t.id, *c), logical::param(e.rhs->param, c->sql), c->sql);
       }
       case ast::Expr::Kind::Aggregate: throw SqlError{"aggregate functions are not allowed here", e.pos};
       case ast::Expr::Kind::Const: throw SqlError{"an integer literal is supported only after + or - yet", e.pos};
@@ -498,7 +494,7 @@ public:
     auto [table, c] = resolve(*col);
     if (rhs->kind == ast::Expr::Kind::Param) {
       use_param(rhs->param, c->type, rhs->pos, *c, table, Use::Compared);
-      return logical::compare(op, ref(*c, table), logical::param(rhs->param, c->sql));
+      return logical::compare(op, logical::column_of(table, *c), logical::param(rhs->param, c->sql));
     }
     if (c->sql.kind != SqlKind::Integer) {
       throw SqlError{"$n + n and $n - n are supported only compared with an INTEGER column yet", rhs->pos};
@@ -510,7 +506,7 @@ public:
     use_param(rhs->lhs->param, c->type, rhs->lhs->pos, *c, table, Use::Compared);
     auto kind = rhs->kind == ast::Expr::Kind::Add ? logical::Expr::Kind::Add : logical::Expr::Kind::Sub;
     auto operand = logical::binary(kind, logical::param(rhs->lhs->param, c->sql), logical::constant(k, c->sql), c->sql);
-    return logical::compare(op, ref(*c, table), std::move(operand));
+    return logical::compare(op, logical::column_of(table, *c), std::move(operand));
   }
 
   // $1 < x is x > $1.
@@ -553,7 +549,8 @@ public:
                          sql_type_name(rc->sql) + ") is not supported: a join compares columns of one type",
                      w.pos};
     }
-    return logical::compare(ast::Compare::Op::Eq, ref(*lc, sides[ls]->id), ref(*rc, sides[rs]->id));
+    return logical::compare(ast::Compare::Op::Eq, logical::column_of(sides[ls]->id, *lc),
+                            logical::column_of(sides[rs]->id, *rc));
   }
 
   // A SELECT of one table, or of two joined: Limit? -> Project | Aggregate
@@ -596,7 +593,7 @@ public:
       }
       if (e.kind != ast::Expr::Kind::Column) throw SqlError{"only columns and aggregates can be selected", e.pos};
       auto [t, c] = resolve(e);
-      targets.push_back({ref(*c, t->id), c->name});
+      targets.push_back({logical::column_of(t->id, *c), c->name});
       bare = &e;
       bare_table = t;
     }
@@ -607,7 +604,7 @@ public:
     for (const auto& o : s.order_by) {
       auto [t, c] = resolve(column_ref(o));
       if (agg) ungrouped(*t, c->name, o.pos);
-      keys.push_back({ref(*c, t->id), o.desc});
+      keys.push_back({logical::column_of(t->id, *c), o.desc});
     }
 
     auto rows = joined ? logical::node(logical::Join{logical::node(logical::Get{sides[0], false}),
@@ -786,7 +783,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
             }
             auto v = b.value(*t, a.value, *c);
             if (v.kind == logical::Expr::Kind::Param) b.check_assigned(v.param, *c, t->id);
-            set.emplace_back(Binder::ref(*c, t->id).col, std::move(v));
+            set.emplace_back(logical::column_of(t->id, *c).col, std::move(v));
           }
           auto rows = Binder::rows(*t, b.where(*t, s.where));
           return {logical::node(logical::Update{std::move(rows), t, std::move(set)}), s.pos};

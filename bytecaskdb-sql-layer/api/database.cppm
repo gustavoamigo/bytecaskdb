@@ -148,15 +148,10 @@ public:
 
 // A statement the layer does not support where it was given: SQLSTATE
 // 0A000. A DDL statement given to a transaction is one: DDL is its own
-// atomic operation. Thrown before anything runs; in a transaction it aborts
-// the transaction, as every error does in PostgreSQL.
-class FeatureNotSupported : public std::logic_error {
-public:
-  using std::logic_error::logic_error;
-  FeatureNotSupported(const FeatureNotSupported&) = default;
-  FeatureNotSupported& operator=(const FeatureNotSupported&) = default;
-  ~FeatureNotSupported() override;  // out of line: anchors the vtable (-Wweak-vtables)
-};
+// atomic operation. A statement the planner can't plan is another, its
+// message starting "no plan:". Thrown before anything runs; in a
+// transaction it aborts the transaction, as every error does in PostgreSQL.
+using FeatureNotSupported = ast::FeatureNotSupported;
 
 // Parameters a statement does not take: the wrong number, or a value not of
 // its parameter's type. Thrown before the plan runs.
@@ -538,7 +533,6 @@ constexpr std::uint32_t kMaxRetries = 3;
 ExecError::~ExecError() = default;
 SerializationFailure::~SerializationFailure() = default;
 TransactionAborted::~TransactionAborted() = default;
-FeatureNotSupported::~FeatureNotSupported() = default;
 TransactionResolutionUnknown::~TransactionResolutionUnknown() = default;
 auto TransactionResolutionUnknown::what() const noexcept -> const char* {
   return "the transaction's outcome is unknown: its commit failed after its batch may have reached the data file "

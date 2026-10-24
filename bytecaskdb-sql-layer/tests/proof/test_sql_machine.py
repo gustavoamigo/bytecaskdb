@@ -515,7 +515,7 @@ class SqlMachine(RuleBasedStateMachine):
         out = self.layer(sql, params, types)
         if out.error == o.ABORTED:
             return  # the transaction was aborted before: nothing was planned
-        assert out.error == "refused" and out.detail.startswith("no plan:"), f"{sql}: planned, expected no plan ({out})"
+        assert o.is_no_plan(out), f"{sql}: planned, expected no plan ({out})"
         if self.txn is not None and not self.pg_aborted():
             # A refused statement aborts the transaction on both sides, as
             # any statement PostgreSQL refuses does.
@@ -1488,7 +1488,7 @@ def test_order_by_places_nulls_as_postgresql(dsn):
         m.select("t0", ["c1"], [("c1", ">", "a")], [("c1", False)])
         assert not served(m.tables["t0"], [("c0", ">")], [("c1", False)], ["c1"])
         out = o.run_layer(m.db, "SELECT c1 FROM t0 WHERE c0 > $1 ORDER BY c1", (0,))
-        assert out.error == "refused" and out.detail.startswith("no plan:"), out
+        assert o.is_no_plan(out), out
         m.check()
     finally:
         m.teardown()

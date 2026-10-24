@@ -5,10 +5,11 @@
 // each turns a logical plan into an equivalent one, the same plan every
 // time, and none needs a cost. Applied in order, each to a fixpoint:
 //   1. constant folding: an expression of constants becomes a constant; a
-//      conjunct always true is dropped, one always false is all its Filter
-//      keeps;
+//      conjunct always true is dropped, and one always false makes its input
+//      Empty, as does an empty side of a Join;
 //   2. predicate pushdown: a conjunct moves to the lowest operator whose
-//      columns it reads, a Filter on one Get or a Join's predicate;
+//      columns it reads, a Filter on one Get or a Join's predicate; two
+//      Filters in a row become one, so a Get has at most one;
 //   3. projection pruning: each operator's `output` is the columns
 //      something above it reads.
 
@@ -62,24 +63,81 @@ auto holds(Op op, std::int64_t a, std::int64_t b) -> bool {
   return false;
 }
 
+// A SMALLINT, INTEGER, BIGINT or DECIMAL constant's scale: the power of ten
+// its int64_t is scaled by. nullopt for any other type.
+auto exact_scale(const SqlType& t) -> std::optional<std::uint8_t> {
+  switch (t.kind) {
+    case SqlKind::SmallInt:
+    case SqlKind::Integer:
+    case SqlKind::BigInt: return std::uint8_t{0};
+    case SqlKind::Decimal: return t.scale;
+    case SqlKind::Real:
+    case SqlKind::Double:
+    case SqlKind::Boolean:
+    case SqlKind::Bytea:
+    case SqlKind::Text:
+    case SqlKind::Varchar:
+    case SqlKind::Timestamp:
+    case SqlKind::Date:
+    case SqlKind::Time: return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+// v scaled up by 10^by, or nullopt where it leaves int64_t.
+auto rescale(std::int64_t v, std::uint8_t by) -> std::optional<std::int64_t> {
+  for (std::uint8_t i = 0; i < by; ++i) {
+    if (__builtin_mul_overflow(v, std::int64_t{10}, &v)) return std::nullopt;
+  }
+  return v;
+}
+
+// The two constants' values in one representation, so comparing the int64_t
+// values compares what they stand for: exact numbers at the larger scale; a
+// BOOLEAN, DATE, TIMESTAMP or TIME only with one of its own kind. nullopt
+// when they have none, left for the plan.
+auto comparable(const Expr& a, const Expr& b) -> std::optional<std::pair<std::int64_t, std::int64_t>> {
+  auto sa = exact_scale(a.type);
+  auto sb = exact_scale(b.type);
+  if (sa && sb) {
+    auto scale = std::max(*sa, *sb);
+    auto va = rescale(a.constant, static_cast<std::uint8_t>(scale - *sa));
+    auto vb = rescale(b.constant, static_cast<std::uint8_t>(scale - *sb));
+    if (!va || !vb) return std::nullopt;
+    return std::pair{*va, *vb};
+  }
+  auto ordinal = [](SqlKind k) {
+    return k == SqlKind::Boolean || k == SqlKind::Date || k == SqlKind::Timestamp || k == SqlKind::Time;
+  };
+  if (a.type.kind == b.type.kind && ordinal(a.type.kind)) return std::pair{a.constant, b.constant};
+  return std::nullopt;
+}
+
 // Folds e bottom up. True if it changed.
 auto fold(Expr& e) -> bool {
   auto changed = false;
   for (auto& a : e.args) changed = fold(a) || changed;
   if (e.args.size() != 2 || !is_const(e.args[0]) || !is_const(e.args[1])) return changed;
-  const auto lhs = e.args[0].constant;
-  const auto rhs = e.args[1].constant;
   switch (e.kind) {
     case Kind::Add:
     case Kind::Sub: {
-      // Of the expression's own type, so a SMALLINT or INTEGER result
-      // outside it is the plan's to refuse.
-      auto v = add(lhs, rhs, e.kind == Kind::Sub);
+      // Only of operands in the result's representation, and of the
+      // expression's own type, so a SMALLINT or INTEGER result outside it is
+      // the plan's to refuse.
+      auto scale = exact_scale(e.type);
+      auto same = [&](const Expr& a) { return scale && exact_scale(a.type) == scale; };
+      if (!same(e.args[0]) || !same(e.args[1])) return changed;
+      auto v = add(e.args[0].constant, e.args[1].constant, e.kind == Kind::Sub);
       if (!v || out_of_range(e.type, *v)) return changed;
       e = constant(*v, e.type);
       return true;
     }
-    case Kind::Compare: e = constant(holds(e.op, lhs, rhs) ? 1 : 0, SqlType{SqlKind::Boolean}); return true;
+    case Kind::Compare: {
+      auto v = comparable(e.args[0], e.args[1]);
+      if (!v) return changed;
+      e = constant(holds(e.op, v->first, v->second) ? 1 : 0, SqlType{SqlKind::Boolean});
+      return true;
+    }
     case Kind::Column:
     case Kind::Param:
     case Kind::Const:
@@ -88,33 +146,40 @@ auto fold(Expr& e) -> bool {
   return changed;
 }
 
-auto fold_conjuncts(std::vector<Expr>& conjuncts) -> bool {
+// Folds each conjunct and drops those always true. True in `never` when one
+// is always false.
+auto fold_conjuncts(std::vector<Expr>& conjuncts, bool& never) -> bool {
   auto changed = false;
   for (auto& c : conjuncts) changed = fold(c) || changed;
-  if (auto it = std::ranges::find_if(conjuncts, [](const Expr& c) { return is_bool(c, false); }); it != conjuncts.end()) {
-    if (conjuncts.size() > 1) {
-      auto never = std::move(*it);
-      conjuncts.clear();
-      conjuncts.push_back(std::move(never));
-      changed = true;
-    }
-    return changed;
-  }
+  never = std::ranges::any_of(conjuncts, [](const Expr& c) { return is_bool(c, false); });
   auto dropped = std::erase_if(conjuncts, [](const Expr& c) { return is_bool(c, true); });
   return changed || dropped > 0;
 }
 
+// The tables a subtree reads.
+void tables_of(const Node& n, std::vector<const Table*>& out);
+
+auto empty_of(const Node& n) -> Node {
+  Empty e;
+  tables_of(n, e.tables);
+  return Node{std::move(e), {}};
+}
+
 auto fold_constants(Node& n) -> bool {
+  auto never = false;
   auto changed = std::visit(
       [&](auto& op) {
         using T = std::decay_t<decltype(op)>;
         auto c = false;
         if constexpr (std::is_same_v<T, Filter>) {
-          c = fold_conjuncts(op.conjuncts);
+          c = fold_conjuncts(op.conjuncts, never);
+          never = never || std::holds_alternative<Empty>(op.input->op);
         } else if constexpr (std::is_same_v<T, Join>) {
-          c = fold_conjuncts(op.predicate);
+          c = fold_conjuncts(op.predicate, never);
           c = fold_constants(*op.left) || c;
           c = fold_constants(*op.right) || c;
+          // An inner join with an empty side is empty.
+          never = never || std::holds_alternative<Empty>(op.left->op) || std::holds_alternative<Empty>(op.right->op);
         } else if constexpr (std::is_same_v<T, Project> || std::is_same_v<T, Aggregate>) {
           auto& outs = [&]() -> std::vector<Output>& {
             if constexpr (std::is_same_v<T, Project>) {
@@ -134,6 +199,11 @@ auto fold_constants(Node& n) -> bool {
         return c;
       },
       n.op);
+  // A conjunct always false: no rows, and nothing to read.
+  if (never) {
+    n = empty_of(n);
+    return true;
+  }
   // A Filter left with no conjunct is its input.
   if (auto* f = std::get_if<Filter>(&n.op); f != nullptr && f->conjuncts.empty()) {
     auto input = std::move(f->input);
@@ -144,10 +214,13 @@ auto fold_constants(Node& n) -> bool {
   return changed;
 }
 
-// The tables a subtree reads.
-void tables_of(const Node& n, std::vector<std::uint32_t>& out) {
+void tables_of(const Node& n, std::vector<const Table*>& out) {
   if (const auto* g = std::get_if<Get>(&n.op)) {
-    out.push_back(g->table->id);
+    out.push_back(g->table);
+    return;
+  }
+  if (const auto* e = std::get_if<Empty>(&n.op)) {
+    out.insert(out.end(), e->tables.begin(), e->tables.end());
     return;
   }
   if (const auto* j = std::get_if<Join>(&n.op)) {
@@ -158,10 +231,12 @@ void tables_of(const Node& n, std::vector<std::uint32_t>& out) {
   if (const auto* in = input_of(n); in != nullptr && *in) tables_of(**in, out);
 }
 
-auto reads_only(const Expr& e, const std::vector<std::uint32_t>& tables) -> bool {
+auto reads_only(const Expr& e, const std::vector<const Table*>& tables) -> bool {
   std::vector<ColumnRef> cols;
   columns_of(e, cols);
-  return !cols.empty() && std::ranges::all_of(cols, [&](const ColumnRef& c) { return std::ranges::find(tables, c.table) != tables.end(); });
+  return !cols.empty() && std::ranges::all_of(cols, [&](const ColumnRef& c) {
+    return std::ranges::find(tables, c.table, &Table::id) != tables.end();
+  });
 }
 
 // Appends conjuncts to a Filter directly above `side`, made if there is none.
@@ -176,9 +251,19 @@ void push_onto(NodePtr& side, std::vector<Expr> conjuncts) {
 
 auto push_down(Node& n) -> bool {
   auto changed = false;
+  // Two Filters in a row are one, the lower one's conjuncts first: a Get has
+  // at most one.
+  while (auto* f = std::get_if<Filter>(&n.op)) {
+    auto* below = std::get_if<Filter>(&f->input->op);
+    if (below == nullptr) break;
+    for (auto& c : f->conjuncts) below->conjuncts.push_back(std::move(c));
+    auto input = std::move(f->input);
+    n = std::move(*input);
+    changed = true;
+  }
   if (auto* f = std::get_if<Filter>(&n.op); f != nullptr && std::holds_alternative<Join>(f->input->op)) {
     auto& j = std::get<Join>(f->input->op);
-    std::vector<std::uint32_t> left, right;
+    std::vector<const Table*> left, right;
     tables_of(*j.left, left);
     tables_of(*j.right, right);
     auto both = left;
@@ -226,7 +311,7 @@ auto columns(const std::vector<Expr>& es) -> std::vector<ColumnRef> {
 
 auto all_columns(const Table& t) -> std::vector<ColumnRef> {
   std::vector<ColumnRef> out;
-  for (const auto& c : t.columns) out.push_back({t.id, c.id, c.type, c.nullable});
+  for (const auto& c : t.columns) out.push_back(column_of(t.id, c).col);
   return out;
 }
 
@@ -263,11 +348,11 @@ auto prune(Node& n, std::vector<ColumnRef> needed) -> bool {
         } else if constexpr (std::is_same_v<T, Join>) {
           auto all = below(columns(op.predicate), true);
           for (auto* side : {&op.left, &op.right}) {
-            std::vector<std::uint32_t> tables;
+            std::vector<const Table*> tables;
             tables_of(**side, tables);
             std::vector<ColumnRef> mine;
             for (const auto& c : all) {
-              if (std::ranges::find(tables, c.table) != tables.end()) mine.push_back(c);
+              if (std::ranges::find(tables, c.table, &Table::id) != tables.end()) mine.push_back(c);
             }
             changed = prune(**side, mine) || changed;
           }

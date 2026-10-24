@@ -109,7 +109,8 @@ The rules, by what they test.
   against it, an equality-compared column now and then, one item flipped
   now and then; maybe a `LIMIT`. A model of the planner's rules
   (`served`) says whether the layer plans it: if not, the layer must
-  refuse it with `no plan:`, and PostgreSQL is not asked. If it does, the
+  refuse it with `no plan:` and SQLSTATE 0A000, and PostgreSQL is not
+  asked. If it does, the
   rows are compared in `ORDER BY` order, as a multiset within each run of
   equal sort keys, and a run the `LIMIT` cuts must be drawn from
   PostgreSQL's (`oracle.same_rows`, against PostgreSQL's rows without the

@@ -64,9 +64,9 @@ struct GeneratedPlan {
 };
 
 // Plans a bound DML statement, its logical plan rewritten, then searched,
-// and prints the plan. Throws ast::SqlError (position -1) when no rule
-// applies, and std::logic_error if the physical plan fails physical::check,
-// a compiler bug.
+// and prints the plan. Throws FeatureNotSupported ("no plan: ...") when no
+// rule applies, and std::logic_error if the physical plan fails
+// physical::check, a compiler bug.
 [[nodiscard]] auto generate_plan(bound::Bound b, const Catalog& cat, std::string_view sql) -> GeneratedPlan;
 
 }  // namespace bytecask::sql
@@ -230,6 +230,13 @@ struct KeySrc {
   PhysType type{PhysType::I64};
 };
 
+// The parts of a key whose every part is a parameter.
+auto param_parts(const std::vector<Expr>& params) -> std::vector<KeySrc> {
+  std::vector<KeySrc> parts;
+  for (const auto& e : params) parts.push_back({e.param, {}, PhysType::I64});
+  return parts;
+}
+
 // A key of `object` from its leading parts, as an expression. One
 // bc_key_params when they are consecutive parameters, a builder otherwise.
 // In a loop, `miss_if_long` skips to the next iteration when a byte string
@@ -308,8 +315,8 @@ auto count_row(const std::string& n) -> std::vector<std::string> {
 }
 
 // The aggregate's row over no rows: COUNT 0, SUM and MIN NULL.
-auto empty_row(const Expr& a) -> std::vector<std::string> {
-  if (a.fn == Expr::Fn::Count) return count_row("0");
+auto empty_row(Expr::Fn fn) -> std::vector<std::string> {
+  if (fn == Expr::Fn::Count) return count_row("0");
   return {"bc_emit_begin(cx);", "bc_emit_null(cx);", "bc_emit_end(cx);"};
 }
 
@@ -353,12 +360,11 @@ private:
           if constexpr (std::is_same_v<T, physical::Update> || std::is_same_v<T, physical::Delete>) {
             return {"bc_emit_count(cx, 0);"};
           } else if constexpr (std::is_same_v<T, physical::Aggregate>) {
-            return op.emits ? empty_row(op.agg) : std::vector<std::string>{};
+            return op.emits ? empty_row(op.agg.fn) : std::vector<std::string>{};
           } else if constexpr (std::is_same_v<T, physical::CountRange>) {
-            return op.emits ? count_row("0") : std::vector<std::string>{};
+            return op.emits ? empty_row(Expr::Fn::Count) : std::vector<std::string>{};
           } else if constexpr (std::is_same_v<T, physical::MinFirstEntry>) {
-            return op.emits ? std::vector<std::string>{"bc_emit_begin(cx);", "bc_emit_null(cx);", "bc_emit_end(cx);"}
-                            : std::vector<std::string>{};
+            return op.emits ? empty_row(Expr::Fn::Min) : std::vector<std::string>{};
           } else {
             return {};
           }
@@ -453,14 +459,17 @@ private:
     std::visit([&](const auto& op) { produce(op, k); }, n.op);
   }
 
+  // No rows: nothing is read, and the root reports none.
+  void produce(const physical::Empty&, const Consume&) {
+    for (const auto& line : no_rows_) w_.line(line);
+  }
+
   // The single row a point lookup names. In a one-row aggregate a missing
   // row is a condition, `hit_`, not an end.
   void produce(const physical::PointGet& g, const Consume& k) {
     w_.reads(g.table);
-    std::vector<KeySrc> parts;
-    for (const auto& e : g.key) parts.push_back({e.param, {}, PhysType::I64});
     w_.line("bool found = false;");
-    w_.line("bc_view " + row_name_ + " = bc_get(cx, " + key(w_, g.table, parts) + ", &found);");
+    w_.line("bc_view " + row_name_ + " = bc_get(cx, " + key(w_, g.table, param_parts(g.key)) + ", &found);");
     if (hit_) {
       *hit_ = "found";
     } else {
@@ -492,11 +501,7 @@ private:
     return b.successor ? successor(k) : k;
   }
 
-  static auto prefix(const physical::Scan& sc) -> std::vector<KeySrc> {
-    std::vector<KeySrc> parts;
-    for (const auto& e : sc.prefix) parts.push_back({e.param, {}, PhysType::I64});
-    return parts;
-  }
+  static auto prefix(const physical::Scan& sc) -> std::vector<KeySrc> { return param_parts(sc.prefix); }
 
   // `bc_view lo` and `bc_view hi` of a scan's range.
   void print_range(const physical::Scan& sc, const physical::Range& r) {
@@ -803,9 +808,7 @@ private:
     if (g != nullptr && a.agg.fn == Expr::Fn::Count && a.agg.args.empty()) {
       // COUNT(*) of one row: whether it exists.
       w_.reads(g->table);
-      std::vector<KeySrc> parts;
-      for (const auto& e : g->key) parts.push_back({e.param, {}, PhysType::I64});
-      auto k = key(w_, g->table, parts);
+      auto k = key(w_, g->table, param_parts(g->key));
       w_.line("int64_t n = 0;");
       w_.line("if (bc_exists(cx, " + k + ")) n = 1;");
       if (a.emits) emit_count("n");
@@ -819,6 +822,7 @@ private:
         hit_ = nullptr;
         emit_one_row(a.agg, hit);
       });
+      hit_ = nullptr;  // an Empty input calls no consume
       return;
     }
     open_aggregate(a.agg);

@@ -16,12 +16,14 @@
 // reads; an equality with $n ± k is always one, never a key part. A join of
 // two tables reads them in FROM order by two point lookups, or scans one and
 // reads the other by its whole primary key from the scanned row's columns.
-// No full scan and no sort: a statement that needs one is refused.
+// No full scan and no sort: a statement that needs one is refused. A
+// conjunct always false leaves an Empty input, planned as no rows.
 
 module;
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -36,7 +38,8 @@ export import bytecask.sql.physical;
 
 export namespace bytecask::sql {
 
-// Throws ast::SqlError (position -1) when no rule applies.
+// Throws FeatureNotSupported, its message starting "no plan:", when no rule
+// applies or the logical plan has a shape the search does not plan.
 [[nodiscard]] auto search(const logical::Node& root, const Catalog& cat) -> physical::Plan;
 
 }  // namespace bytecask::sql
@@ -45,13 +48,21 @@ namespace bytecask::sql {
 
 namespace {
 
-using ast::SqlError;
+using ast::FeatureNotSupported;
 using logical::ColumnRef;
 using logical::Expr;
 using Op = ast::Compare::Op;
 using Conjuncts = std::vector<Expr>;
 
-[[noreturn]] void no_plan(const std::string& why) { throw SqlError{"no plan: " + why, -1}; }
+[[noreturn]] void no_plan(const std::string& why) { throw FeatureNotSupported{"no plan: " + why}; }
+
+// An operator's name, for a refusal of a shape the search does not plan.
+auto op_name(const logical::Node& n) -> std::string {
+  constexpr const char* kNames[] = {"Get",  "Empty", "Filter", "Project", "Join",  "Aggregate",
+                                    "Sort", "Limit", "Insert", "Update",  "Delete"};
+  static_assert(std::size(kNames) == std::variant_size_v<decltype(n.op)>);
+  return kNames[n.op.index()];
+}
 
 // A WHERE conjunct, as the binder builds it: column <op> operand, the
 // operand a parameter, $n ± k, or a column of the other table.
@@ -72,12 +83,17 @@ auto key_eq(const Expr& c) -> bool {
 }
 auto on_col(const Expr& c, std::uint32_t col) -> bool { return is_compare(c) && col_of(c).col == col; }
 
-auto column(const Table& t, std::uint32_t id) -> ColumnRef {
-  const auto& c = *t.column(id);
-  return {t.id, c.id, c.type, c.nullable};
+// The operator of c with its operands swapped: a < b is b > a.
+auto mirrored(Op op) -> Op {
+  switch (op) {
+    case Op::Eq: return Op::Eq;
+    case Op::Lt: return Op::Gt;
+    case Op::Le: return Op::Ge;
+    case Op::Gt: return Op::Lt;
+    case Op::Ge: return Op::Le;
+  }
+  return op;
 }
-
-auto column_expr(const Table& t, std::uint32_t id) -> Expr { return logical::column(column(t, id), t.column(id)->sql); }
 
 // $n ± k's place in the plan's computed values, added if new.
 void add_computed(std::vector<physical::Computed>& comp, const Expr& c, std::uint32_t table) {
@@ -366,13 +382,36 @@ struct Table1 {
   Conjuncts where;
 };
 
+// A conjunct the search plans on one table: a column of it compared with a
+// parameter, $n ± k or another column.
+auto plannable(const Expr& c, std::uint32_t table) -> bool {
+  if (!is_compare(c) || c.args[0].kind != Expr::Kind::Column || col_of(c).table != table) return false;
+  const auto& o = operand_of(c);
+  switch (o.kind) {
+    case Expr::Kind::Param:
+    case Expr::Kind::Column: return true;
+    case Expr::Kind::Add:
+    case Expr::Kind::Sub: return o.args[0].kind == Expr::Kind::Param && o.args[1].kind == Expr::Kind::Const;
+    case Expr::Kind::Const:
+    case Expr::Kind::Compare:
+    case Expr::Kind::Aggregate: return false;
+  }
+  return false;
+}
+
 auto table_of(const logical::Node& n) -> Table1 {
   if (const auto* f = std::get_if<logical::Filter>(&n.op)) {
     auto t = table_of(*f->input);
-    t.where = f->conjuncts;
+    t.where.insert(t.where.end(), f->conjuncts.begin(), f->conjuncts.end());
+    for (const auto& c : t.where) {
+      const auto& table = *t.get->table;
+      if (!plannable(c, table.id)) no_plan("a conjunct on " + table.name + " the search does not plan yet");
+    }
     return t;
   }
-  return {&std::get<logical::Get>(n.op), {}};
+  const auto* g = std::get_if<logical::Get>(&n.op);
+  if (g == nullptr) no_plan("a " + op_name(n) + " where the search plans a table");
+  return {g, {}};
 }
 
 auto is_count(const Expr& a) -> bool { return a.fn == Expr::Fn::Count; }
@@ -397,9 +436,11 @@ auto select_parts(const logical::Node& root) -> SelectParts {
   if (const auto* p = std::get_if<logical::Project>(&n->op)) {
     s.project = p;
     n = p->input.get();
+  } else if (const auto* a = std::get_if<logical::Aggregate>(&n->op)) {
+    s.aggregate = a;
+    n = a->input.get();
   } else {
-    s.aggregate = &std::get<logical::Aggregate>(n->op);
-    n = s.aggregate->input.get();
+    no_plan("a " + op_name(*n) + " where the search plans a Project or an Aggregate");
   }
   s.below = n;
   if (const auto* o = std::get_if<logical::Sort>(&n->op)) {
@@ -422,7 +463,8 @@ public:
             constants(*op.table);
             physical::Insert ins{op.table->id, {}};
             for (std::size_t i = 0; i < op.table->columns.size(); ++i) {
-              if (op.values[i]) ins.values.emplace_back(column(*op.table, op.table->columns[i].id), *op.values[i]);
+              const auto& c = op.table->columns[i];
+              if (op.values[i]) ins.values.emplace_back(logical::column_of(op.table->id, c).col, *op.values[i]);
             }
             return physical::node(std::move(ins));
           } else if constexpr (std::is_same_v<T, logical::Update>) {
@@ -451,8 +493,9 @@ private:
   }
 
   // The rows an UPDATE or DELETE writes: by a point lookup, or a scan, which
-  // reads each row whole; and the filters on them.
+  // reads each row whole; and the filters on them. None from an Empty input.
   auto write_rows(const logical::Node& in) -> physical::NodePtr {
+    if (std::holds_alternative<logical::Empty>(in.op)) return physical::node(physical::Empty{});
     auto t = table_of(in);
     auto rows = rows_of(*t.get->table, t.where, {}, {}, false, out_.computed);
     out_.null_checks = std::move(rows.null_checks);
@@ -471,9 +514,24 @@ private:
     for (const auto& o : outs) out_.result.push_back({o.name, o.expr.type, o.expr.phys()});
   }
 
+  // A SELECT over no rows: nothing is read, and the sink gives what it gives
+  // for none.
+  auto nothing(const SelectParts& s, const logical::Empty& e) -> physical::NodePtr {
+    for (const auto* t : e.tables) constants(*t);
+    auto leaf = physical::node(physical::Empty{});
+    if (s.aggregate != nullptr) {
+      auto emits = !s.limit || *s.limit > 0;
+      return physical::node(physical::Aggregate{std::move(leaf), s.aggregate->aggs[0].expr, emits});
+    }
+    std::vector<ColumnRef> targets;
+    for (const auto& o : s.project->exprs) targets.push_back(o.expr.col);
+    return output(s, std::move(leaf), std::move(targets));
+  }
+
   auto select(const logical::Node& root) -> physical::NodePtr {
     auto s = select_parts(root);
     result(s);
+    if (const auto* e = std::get_if<logical::Empty>(&s.source->op)) return nothing(s, *e);
     if (const auto* j = std::get_if<logical::Join>(&s.source->op)) return join(s, *j);
     auto [get, where] = table_of(*s.source);
     const auto& t = *get->table;
@@ -559,9 +617,12 @@ private:
         k.used.push_back(&*it);
         continue;
       }
-      auto jt = std::ranges::find_if(on, [&](const Expr& j) { return side_col(j, sides[inner]->id).col == id; });
+      // Only an equality keys the inner side.
+      auto jt = std::ranges::find_if(
+          on, [&](const Expr& j) { return j.op == Op::Eq && side_col(j, sides[inner]->id).col == id; });
       if (jt == on.end()) return std::nullopt;
-      k.parts.push_back(column_expr(*sides[outer], other_col(*jt, sides[inner]->id).col));
+      const auto* col = sides[outer]->column(other_col(*jt, sides[inner]->id).col);
+      k.parts.push_back(logical::column_of(sides[outer]->id, *col));
       k.on.push_back(&*jt);
     }
     return k;
@@ -581,6 +642,13 @@ private:
     const Table* const sides[2]{left.get->table, right.get->table};
     const Conjuncts where[2]{left.where, right.where};
     const auto& on = j.predicate;
+    // Each conjunct compares a column of one side with one of the other.
+    for (const auto& c : on) {
+      auto columns = is_compare(c) && c.args[0].kind == Expr::Kind::Column && c.args[1].kind == Expr::Kind::Column;
+      if (!columns || c.args[0].col.table == c.args[1].col.table) {
+        no_plan("a join conjunct the search does not plan yet");
+      }
+    }
     constants(*sides[0]);
     constants(*sides[1]);
     std::vector<ColumnRef> targets;
@@ -632,22 +700,29 @@ private:
         }
       }
       auto inner_filters = filters(*sides[inner], where[inner], k.used, into);
+      // Every conjunct the key does not take is a filter with its own
+      // operator, the inner column first.
       for (const auto& c : on) {
         if (std::ranges::find(k.on, &c) != k.on.end()) continue;
-        const auto& col = side_col(c, sides[inner]->id);
-        if (col.type == PhysType::F64) {
-          no_plan("a filter on column \"" + sides[inner]->column(col.col)->name +
-                  "\", a REAL or DOUBLE PRECISION, is not supported yet");
+        for (const auto* side : {sides[inner], sides[outer]}) {
+          const auto& col = side_col(c, side->id);
+          if (col.type == PhysType::F64) {
+            no_plan("a filter on column \"" + side->column(col.col)->name +
+                    "\", a REAL or DOUBLE PRECISION, is not supported yet");
+          }
         }
-        inner_filters.push_back(logical::compare(Op::Eq, column_expr(*sides[inner], col.col),
-                                                 column_expr(*sides[outer], other_col(c, sides[inner]->id).col)));
+        if (c.args[0].col.table == sides[inner]->id) {
+          inner_filters.push_back(c);
+        } else {
+          inner_filters.push_back(logical::compare(mirrored(c.op), c.args[1], c.args[0]));
+        }
       }
       out_.null_checks = std::move(null_checks);
       auto outer_rows = filtered(physical::node(std::move(scan)), std::move(rows.filters));
       auto pairs = physical::node(physical::IndexJoin{std::move(outer_rows), sides[inner]->id, std::move(k.parts)});
       return filtered(std::move(pairs), std::move(inner_filters));
     };
-    std::optional<SqlError> refused;
+    std::optional<FeatureNotSupported> refused;
     for (std::uint32_t outer : {0u, 1u}) {
       if (!reachable(*sides[outer], where[outer])) continue;
       auto k = inner_key(sides, where, on, 1 - outer);
@@ -656,7 +731,7 @@ private:
       physical::NodePtr pairs;
       try {
         pairs = loop_join(outer, std::move(*k), tried);
-      } catch (const SqlError& e) {
+      } catch (const FeatureNotSupported& e) {
         if (!refused) refused = e;
         continue;
       }

@@ -413,14 +413,22 @@ same API calls and reads as before.
 **The rewrites.**
 - Constant folding finds nothing to fold in today's dialect: a `WHERE`
   compares a column with a parameter, and a literal follows a column or a
-  parameter.
+  parameter. It compares two constants by their SQL types: exact numbers
+  at the larger of their scales, a `BOOLEAN`, `DATE`, `TIMESTAMP` or `TIME`
+  only with one of its own type, and anything else not at all. It adds two
+  only when both are in the result's representation.
+- A conjunct always false replaces its `Filter`, and what it reads, with an
+  `Empty` naming the tables it replaced; a `Join` with an `Empty` side is
+  `Empty`. The search plans it as no rows, read from nothing.
 - Pushdown moves a join's conjuncts onto the table each reads, and its
-  column equalities onto the `Join`.
+  column comparisons onto the `Join`. Two `Filter`s in a row become one, the
+  lower one's conjuncts first, so a `Get` has at most one.
 - Pruning sets each operator's output columns. A read is covering when
   every column the `Project` or `Aggregate` takes is in the key, so a
   column only a key bound reads need not be.
 
 **The physical plan.** Its operators:
+- `Empty`, no rows and no read: the sink reports what it gives for none;
 - the access paths `PointGet`, `Scan` and `NullSplitScan`;
 - `CountRange` and `MinFirstEntry`, the access paths that also produce the
   aggregate;
@@ -589,7 +597,9 @@ operator. Sorters (`bc_sorter_*`) are slice 4 (#533).
 **Joins.** Index nested loop only, two tables only.
 - The outer table is the one reachable from parameters alone, a point
   lookup over a scan. The inner one must be reachable by its whole primary
-  key from the outer row's columns and parameters.
+  key from the outer row's columns and parameters. Only an equality keys
+  it; every other comparison of the two tables' columns is a filter on the
+  pair, with its own operator.
 - An `ORDER BY` on a join is refused. No TPROC-C join has one.
 - N1: both are point lookups; the order is the `FROM` order.
 - S2: `order_line` is outer (a prefix and a range from parameters), and
@@ -617,12 +627,16 @@ statement's only one:
 | 5 | A single table whose usable paths don't give its `ORDER BY` (a point lookup on the whole primary key always does) | `no plan: no index of <table> gives ORDER BY <columns>` |
 | 6 | A single table whose chosen path can't place the NULLs of its `ORDER BY` as PostgreSQL does (*NULLs in an ordered part*) | `no plan: ORDER BY <column> would need its NULLs reordered` |
 
-The refusal is a SQL error whose message starts `no plan:`, raised after
-binding and before anything runs. It carries no position: the search works
-on the logical plan, which keeps none. Its SQLSTATE is the binder errors'
-42601 until #541 gives it 0A000 (`CONTRACT.md`, *Known gaps*). PostgreSQL
-runs each of these; it is the one entry of `frontend_design.md`'s *Known
-differences* that is a feature gap.
+The refusal is a `FeatureNotSupported`, SQLSTATE 0A000, whose message
+starts `no plan:`, raised after binding and before anything runs. It
+carries no position: the search works on the logical plan, which keeps
+none. A logical plan of a shape the search does not plan, which today's
+binder never builds, is refused the same way, never with another
+exception: an operator where the search plans another (`no plan: a Join
+where the search plans a table`), or a conjunct that does not compare one
+of its table's columns (`no plan: a conjunct on <table> the search does not
+plan yet`). PostgreSQL runs each of these; it is the one entry of
+`frontend_design.md`'s *Known differences* that is a feature gap.
 
 ## Proposed `CONTRACT.md` changes
 

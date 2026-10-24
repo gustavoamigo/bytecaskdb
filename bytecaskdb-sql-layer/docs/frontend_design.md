@@ -127,7 +127,8 @@ the plan runs, and a refusal names that use's table.
 **Errors.** A parse or bind error is an `ast::SqlError` with a message and a
 position. `sqlstate()` reports it as 42601 for now; PostgreSQL's own codes
 for binder errors (42P01, 42703, 42804, 42P18) are #548. The planner's
-refusals are `ast::SqlError`s too, so 42601 as well; 0A000 is #541.
+refusals are `FeatureNotSupported`, 0A000 (`planner_design.md`, *What the
+search refuses*).
 
 ## Tests
 
