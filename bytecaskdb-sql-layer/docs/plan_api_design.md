@@ -274,12 +274,15 @@ All of it is charged to the statement budget as the call adds it, before
 the item is pushed, and a count the budget refuses leaves nothing charged
 and nothing added. A copy of a view is counted by the view's size, its
 capacity, before it is made. A key the runtime encoded is moved in and
-counted by its capacity; the encoders reserve its exact size, so nothing
-trims it. One helper, `push_write`, does the count and the push for
+charged its capacity just after it is encoded, so the budget can be passed
+by the keys of the one write being made: a bounded overshoot, since a key
+is bounded by the key ceiling. One helper, `push_write`, does the count and the push for
 effects, claims and locks. A throw fails the statement, and a failed
 statement's charges go at reset: none is released on the way out of a
-throw. The reset also frees the write set's vectors' storage, so a pooled
-context keeps none of a large statement's slots.
+throw. The reset clears the write set's vectors; one whose capacity is
+above `kKeptWriteSlots` it frees, so a pooled context keeps none of a large
+statement's slots, and one at or below it keeps its storage, uncharged, as
+bounded scratch for the next statement.
 
 The count is a conservative bound on the memory held, by fixed amounts
 (`algebra/runtime.cppm`, which `plan_api.cpp` checks against what they
@@ -289,15 +292,15 @@ stand for), so it is the same on every build:
 - each effect, claim and lock, its slot in its vector at twice its size
   (`kEffectSlotBytes`, `kClaimSlotBytes`, `kLockSlotBytes`), since a vector
   grows to at most that, and a table's first write `kTableSlotBytes`;
-- in autocommit, each effect's entry in the commit's `WritePlan`, which
-  copies its buffers: the copies, and its slot or node
-  (`kPlanWriteSlotBytes`, `kPlanKeyGuardNodeBytes`,
-  `kPlanRangeGuardSlotBytes`), and a table's first write the commit's guard
-  on its record. The commit builds the plan while the effects are alive, so
-  both are counted, and a plan that would pass the budget fails at the
-  call that passes it, with nothing committed;
-- in a transaction, each write's node in the overlay (`kOverlayNodeBytes`),
-  and no plan entry: the transaction's commit counts its plan;
+- each effect's entry in the commit's `WritePlan`, which copies its
+  buffers: the copies, and its slot or node (`kPlanWriteSlotBytes`,
+  `kPlanKeyGuardNodeBytes`, `kPlanRangeGuardSlotBytes`), and a table's
+  first write the commit's guard on its record. The commit builds the plan
+  while the effects, or a transaction's overlay and guards, are alive, so
+  both are counted, and a plan that would pass the bound fails at the
+  call that passes it, with nothing committed. In a transaction too, so its
+  commit needs nothing its statements were not held to;
+- in a transaction, each write's node in the overlay (`kOverlayNodeBytes`);
 - each row, prefix or range written, its node (`kWrittenRowNodeBytes`,
   `kUniqueNodeBytes`, `kRangeNodeBytes`).
 
@@ -308,10 +311,10 @@ budget and adds it to what the transaction holds against
 `TransactionOptions::max_bytes`, counted by the same functions
 (`docs/transaction_design.md`, *Limits*). Each call of a transaction's
 statement checks the transaction's room for the write set it would reach,
-so `bc_txn_add` needs no check of its own. `bc_txn_commit` counts its
-`WritePlan`, built from the overlay while the overlay still holds the
-writes, against `max_bytes` beside what the transaction holds before it
-builds it: past it, `BC_E_LIMIT` and nothing committed.
+so `bc_txn_add` needs no check of its own. What the transaction holds
+includes each item's entry in the commit's `WritePlan` (an overlay node
+counts its own), so `bc_txn_commit` needs no check either: no transaction
+fails at commit for memory its statements did not reserve.
 
 There is no other bound on the write set. The engine refuses a write plan
 over its 1 GiB batch limit at commit, with `std::invalid_argument`, which
