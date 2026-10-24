@@ -300,9 +300,9 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
       bc_ctx_reset(f.cx);  // nothing is committed: the engine is never asked to write
       CHECK((error == BC_E_MEMORY || error == c.clean));
       // A failed statement's charges go at reset, whatever the throw left
-      // charged, and so does the write set's storage.
+      // charged, and so does the write set's storage past what a reset keeps.
       CHECK(bc_ctx_held_for_testing(f.cx) == 0);
-      CHECK(bc_ctx_write_set_slots_for_testing(f.cx) == 0);
+      CHECK(bc_ctx_write_set_slots_for_testing(f.cx) <= 4 * bytecask::sql::kKeptWriteSlots);
       ++failed;
     }
     CHECK(failed > 0);  // the plan allocates, and each allocation was failed once

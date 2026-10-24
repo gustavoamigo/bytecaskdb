@@ -110,15 +110,19 @@ inline constexpr std::uint64_t kAggBytes = 320;
 // kAllocBytes, the allocator's header and rounding; each item a slot in its
 // vector, which grows to at most twice its size; and each row, unique prefix
 // or range the statement wrote, to refuse a second write, the node it takes
-// in its set. A write also costs where it goes next: in a transaction, the
-// node it takes in the overlay; in autocommit, its entry in the commit's
-// WritePlan, which copies its buffers. A transaction's commit counts its
-// WritePlan against max_bytes as it builds it.
+// in its set. Each effect and table also costs its entry in the commit's
+// WritePlan, which copies its buffers, in autocommit and in a transaction
+// alike, so no commit needs memory its statements were not charged; and a
+// write in a transaction the node it takes in the overlay.
 inline constexpr std::uint64_t kAllocBytes = 32;
 inline constexpr std::uint64_t kEffectSlotBytes = 112;
 inline constexpr std::uint64_t kClaimSlotBytes = 112;
 inline constexpr std::uint64_t kLockSlotBytes = 64;
 inline constexpr std::uint64_t kTableSlotBytes = 8;  // a table's, the first time it is written
+// The most slots each of the write set's vectors keeps across a reset,
+// cleared and uncharged: bounded scratch, so small statements on a pooled
+// context do not regrow them. A vector grown past it is freed.
+inline constexpr std::size_t kKeptWriteSlots = 32;
 inline constexpr std::uint64_t kOverlayNodeBytes = 120;
 inline constexpr std::uint64_t kWrittenRowNodeBytes = 96;
 inline constexpr std::uint64_t kUniqueNodeBytes = 96;
@@ -148,18 +152,16 @@ enum class PlanEntry : std::uint8_t { Write, KeyGuard, RangeGuard };
   }
   return buffer_bytes(a) + buffer_bytes(b) + slot;
 }
-// An effect with buffers of these capacities, whose plan entry is `e`. In a
-// transaction it takes no plan entry yet: a write takes an overlay node, and
-// a guard nothing more until the commit.
+// An effect with buffers of these capacities, whose plan entry is `e`, and
+// in a transaction a write's overlay node.
 [[nodiscard]] constexpr auto effect_bytes(bool in_txn, PlanEntry e, std::size_t a, std::size_t b) -> std::uint64_t {
-  auto own = buffer_bytes(a) + buffer_bytes(b) + kEffectSlotBytes;
-  if (!in_txn) return own + plan_entry_bytes(e, a, b);
-  return own + (e == PlanEntry::Write ? kOverlayNodeBytes : 0);
+  auto own = buffer_bytes(a) + buffer_bytes(b) + kEffectSlotBytes + plan_entry_bytes(e, a, b);
+  return own + (in_txn && e == PlanEntry::Write ? kOverlayNodeBytes : 0);
 }
-// A table the writes are in: its slot and, in autocommit, the commit's guard
-// on its record, a key of `record_key` bytes.
-[[nodiscard]] constexpr auto table_bytes(bool in_txn, std::size_t record_key) -> std::uint64_t {
-  return kTableSlotBytes + (in_txn ? 0 : plan_entry_bytes(PlanEntry::KeyGuard, record_key, 0));
+// A table the writes are in: its slot and the commit's guard on its record,
+// a key of `record_key` bytes.
+[[nodiscard]] constexpr auto table_bytes(std::size_t record_key) -> std::uint64_t {
+  return kTableSlotBytes + plan_entry_bytes(PlanEntry::KeyGuard, record_key, 0);
 }
 [[nodiscard]] constexpr auto claim_bytes(std::size_t key) -> std::uint64_t {
   return buffer_bytes(key) + kClaimSlotBytes;

@@ -1125,3 +1125,47 @@ TEST_CASE("embedded API: every plan the search costed returns the same rows", "[
     }
   }
 }
+
+TEST_CASE("embedded API: a choice point's plan text shows both plans, and each returns the same rows",
+          "[sql][api][search][choice]") {
+  sql_test::TempDir dir{"api_choice"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE c (k BIGINT PRIMARY KEY, a BIGINT, b BIGINT, v BIGINT)");
+  (void)db->execute("CREATE INDEX c_a ON c (a)");
+  (void)db->execute("CREATE INDEX c_b ON c (b)");
+  // a = 0 on 150 of the 200 rows, b = 0 on 10 of them; NULLs in both.
+  for (std::int64_t k = 0; k < 200; ++k) {
+    auto a = k % 4 == 3 ? i(k % 7) : i(0);
+    auto b = k % 20 == 0 ? i(0) : (k % 11 == 0 ? Value{} : i(k % 9 + 1));
+    (void)db->execute("INSERT INTO c VALUES ($1, $2, $3, $4)", {i(k), k % 50 == 49 ? Value{} : a, b, i(k)});
+  }
+  const std::string sql = "SELECT k, v FROM c WHERE a = $1 AND b = $2";
+  // Counted when compiled: 200 rows, 20 entries under each index. The plan
+  // counts c_a's range and scans it below 21 entries, c_b's from there.
+  const auto& src = db->prepare(sql).plan_source();
+  INFO(src);
+  CHECK(src.find("count0 = bc_count_range(cx, IDX_") != std::string::npos);
+  CHECK(src.find("if (count0 < 21) {") != std::string::npos);
+  CHECK(src.find("} else {") != std::string::npos);
+  auto sorted = [](Grid g) {
+    std::ranges::sort(g);
+    return g;
+  };
+  for (const auto& params : std::vector<std::vector<Value>>{{i(0), i(0)}, {i(3), i(0)}, {i(0), i(5)}, {i(6), i(9)}}) {
+    Grid want;
+    for (std::int64_t k = 0; k < 200; ++k) {
+      auto a = k % 50 == 49 ? std::optional<std::int64_t>{} : (k % 4 == 3 ? k % 7 : 0);
+      auto b = k % 20 == 0 ? std::optional<std::int64_t>{0} : (k % 11 == 0 ? std::nullopt : std::optional{k % 9 + 1});
+      if (a == std::get<std::int64_t>(params[0]) && b == std::get<std::int64_t>(params[1])) want.push_back({i(k), i(k)});
+    }
+    INFO(std::get<std::int64_t>(params[0]) << ", " << std::get<std::int64_t>(params[1]));
+    CHECK(sorted(db->execute(sql, params).rows) == sorted(want));
+    // The cheapest plan forced to each branch, then each other plan.
+    auto all = db->alternatives_for_testing(sql, params);
+    CHECK(all.size() >= 2);
+    for (std::size_t n = 0; n < all.size(); ++n) {
+      INFO("plan " << n);
+      CHECK(sorted(all[n].rows) == sorted(want));
+    }
+  }
+}

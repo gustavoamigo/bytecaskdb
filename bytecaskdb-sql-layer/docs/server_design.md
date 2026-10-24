@@ -470,7 +470,10 @@ above:
 - floats as the shortest text that reads back to the same value, as
   `float8out` and `float4out` write it with `extra_float_digits` 1:
   exponent form below 1e-4 and from 1e15 (1e6 for `REAL`), `NaN`,
-  `Infinity` and `-Infinity`;
+  `Infinity` and `-Infinity`. Like PostgreSQL's Ryu, the digits must be
+  strictly closer to the value than to either neighbour: text that reads
+  back only by rounding a tie to even takes one more digit (`1e23` is
+  `9.999999999999999e+22`);
 - `t` and `f`;
 - `bytea` as `\x` and lower-case hex;
 - text as its bytes;
