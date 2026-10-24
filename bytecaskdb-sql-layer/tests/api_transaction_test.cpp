@@ -159,6 +159,35 @@ TEST_CASE("embedded API: a transaction past its buffer bound is BC_E_LIMIT and a
   CHECK(balance(*db, 0) == std::nullopt);
 }
 
+TEST_CASE("embedded API: a transaction statement whose write set passes the transaction's bound is 54000 at the "
+          "statement",
+          "[sql][api][txn][memory]") {
+  sql_test::TempDir dir{"api_txn_ws"};
+  auto db = open_db(dir);
+  for (std::int64_t i = 1; i <= 200; ++i) db->execute("INSERT INTO acct VALUES ($1, $2)", {i, i});
+  auto t = db->begin({.max_bytes = 16u << 10});
+  t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1000}, std::int64_t{1}});
+  // One UPDATE of 200 rows: its write set passes 16 KiB as it grows, and the
+  // statement fails there, the transaction with it.
+  try {
+    (void)t.execute("UPDATE acct SET bal = bal + 1 WHERE id >= $1", {std::int64_t{1}});
+    FAIL("the statement passed the transaction's bound");
+  } catch (const ExecError& e) {
+    CHECK(e.code() == BC_E_LIMIT);
+    CHECK(sqlstate(e) == std::string_view{"54000"});
+  }
+  CHECK(t.is_aborted());
+  CHECK(t.commit() == CommitOutcome::RolledBack);
+  CHECK(balance(*db, 1000) == std::nullopt);
+  CHECK(balance(*db, 1) == 1);
+  CHECK(balance(*db, 200) == 200);
+  // Ten rows fit.
+  auto u = db->begin({.max_bytes = 16u << 10});
+  u.execute("UPDATE acct SET bal = bal + 1 WHERE id >= $1", {std::int64_t{191}});
+  CHECK(u.commit() == CommitOutcome::Committed);
+  CHECK(balance(*db, 200) == 201);
+}
+
 TEST_CASE("embedded API: a statement over its memory budget is 54000 and leaves nothing behind, alone or in a transaction",
           "[sql][api][txn][memory]") {
   CHECK_THROWS_AS(Database::open(sql_test::TempDir{"api_mem0"}.path(), {.statement_memory_bytes = 0}),
@@ -175,23 +204,102 @@ TEST_CASE("embedded API: a statement over its memory budget is 54000 and leaves 
     }
     return "00000";
   };
-  // 200 result rows, and 200 rows built, each pass 4 KiB.
+  // 200 result rows pass 4 KiB: a result row is held until the statement ends.
   CHECK(state([&] { (void)db->execute("SELECT id, bal FROM acct WHERE id >= $1", {std::int64_t{1}}); }) == "54000");
+  // 200 rows built do not: each goes when its scan step ends, and the write
+  // set it joins is not charged.
   CHECK(state([&] { (void)db->execute("UPDATE acct SET bal = bal + 1 WHERE id >= $1", {std::int64_t{1}}); }) ==
-        "54000");
-  CHECK(balance(*db, 1) == 1);
-  CHECK(balance(*db, 200) == 200);
+        "00000");
+  CHECK(balance(*db, 1) == 2);
+  CHECK(balance(*db, 200) == 201);
   // In a transaction it aborts the transaction: the earlier statement's write goes too.
   auto t = db->begin();
   t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1000}, std::int64_t{1}});
-  CHECK(state([&] { (void)t.execute("UPDATE acct SET bal = bal + 1 WHERE id >= $1", {std::int64_t{1}}); }) ==
-        "54000");
+  CHECK(state([&] { (void)t.execute("SELECT id, bal FROM acct WHERE id >= $1", {std::int64_t{1}}); }) == "54000");
   CHECK(t.is_aborted());
   CHECK(t.commit() == CommitOutcome::RolledBack);
   CHECK(balance(*db, 1000) == std::nullopt);
-  CHECK(balance(*db, 1) == 1);
+  CHECK(balance(*db, 1) == 2);
   // The budget is each statement's: one under it runs.
   CHECK(db->execute("SELECT id, bal FROM acct WHERE id >= $1", {std::int64_t{191}}).rows.size() == 10);
+}
+
+TEST_CASE("embedded API: a bulk UPDATE of 1M rows of 100 bytes runs in the default memory budget",
+          "[sql][api][memory]") {
+  // An optimised build, as CI's release run, runs it as stated. A debug
+  // build, as the sanitizers run, takes a tenth of the rows under a tenth of
+  // the budget: the same ratio of rows to budget, at a minute's less work.
+#ifdef NDEBUG
+  constexpr std::int64_t kRows = 1'000'000;
+  const DatabaseOptions opts{};
+#else
+  constexpr std::int64_t kRows = 100'000;
+  const DatabaseOptions opts{.statement_memory_bytes = DatabaseOptions{}.statement_memory_bytes / 10};
+#endif
+  sql_test::TempDir dir{"api_bulk"};
+  auto db = Database::open(dir.path(), opts);
+  db->execute("CREATE TABLE wide (id BIGINT PRIMARY KEY, n BIGINT NOT NULL, pad VARCHAR(100) NOT NULL)");
+  // Seeded through the engine in the layer's own encoding: a million INSERT
+  // statements would cost the test far more than the UPDATE it is about.
+  {
+    auto cat = db->live_catalog_for_testing().current();
+    const auto* t = cat->table("wide");
+    REQUIRE(t != nullptr);
+    const auto part = cat->key_layout(t->id)->parts[0];
+    const auto pad = sql_test::bytes(std::string(64, 'p'));
+    auto encoded = true;
+    std::size_t row_bytes = 0;
+    for (std::int64_t first = 0; first < kRows; first += 10'000) {
+      bytecask::WritePlan plan;
+      for (auto id = first; id < first + 10'000; ++id) {
+        RowWriter w{t->layout};
+        Bytes row, key;
+        encoded = encoded && w.set_i64(0, id) && w.set_i64(1, id) && w.set_bytes(2, pad) && w.finish(row);
+        row_bytes = row.size();
+        key_put_prefix(key, kNsRow, t->id);
+        key_put_i64(key, id, part);
+        plan.put(key, row);
+      }
+      REQUIRE(db->engine_for_testing().apply_batch({.sync = false}, std::move(plan)));
+    }
+    REQUIRE(encoded);
+    CHECK(row_bytes >= 90);
+    CHECK(row_bytes <= 110);
+  }
+  // Each built row goes when its step ends: 1M of them, 100 MB, pass 64 MiB.
+  // The write set they join is held to the engine's 1 GiB batch limit
+  // instead, and is within it.
+  auto r = db->execute("UPDATE wide SET n = n + 1 WHERE id >= $1", {std::int64_t{0}});
+  CHECK(r.affected == kRows);
+  for (std::int64_t id : {std::int64_t{0}, kRows / 2, kRows - 1}) {
+    auto row = db->execute("SELECT n FROM wide WHERE id = $1", {id});
+    REQUIRE(row.rows.size() == 1);
+    CHECK(std::get<std::int64_t>(row.rows[0][0]) == id + 1);
+  }
+}
+
+TEST_CASE("embedded API: a join over many outer rows runs in a small memory budget (#551)", "[sql][api][memory]") {
+  sql_test::TempDir dir{"api_join"};
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  db->execute("CREATE TABLE ol (w BIGINT, id BIGINT, item BIGINT NOT NULL, PRIMARY KEY (w, id))");
+  db->execute("CREATE TABLE st (i BIGINT, w BIGINT, pad VARCHAR(300) NOT NULL, PRIMARY KEY (i, w))");
+  constexpr std::int64_t kItems = 10;
+  constexpr std::int64_t kOuter = 5000;
+  const Value pad = sql_test::bytes(std::string(300, 's'));
+  for (std::int64_t i = 0; i < kItems; ++i) db->execute("INSERT INTO st VALUES ($1, $2, $3)", {i, std::int64_t{1}, pad});
+  for (std::int64_t first = 0; first < kOuter; first += 1000) {
+    auto t = db->begin();
+    for (auto id = first; id < first + 1000; ++id) {
+      t.execute("INSERT INTO ol VALUES ($1, $2, $3)", {std::int64_t{1}, id, id % kItems});
+    }
+    REQUIRE(t.commit() == CommitOutcome::Committed);
+  }
+  // Each outer row reads an inner row of over 300 bytes, and builds its key
+  // and a group key: 5,000 of them pass 1.5 MB, the budget is 64 KiB.
+  auto r = db->execute("SELECT COUNT(DISTINCT st.i) FROM ol, st WHERE ol.w = $1 AND st.i = ol.item AND st.w = $1",
+                       {std::int64_t{1}});
+  REQUIRE(r.rows.size() == 1);
+  CHECK(std::get<std::int64_t>(r.rows[0][0]) == kItems);
 }
 
 TEST_CASE("embedded API: destroying an open transaction rolls it back; close() ends the open ones",

@@ -2,10 +2,10 @@
 
 Status: **design, approved (owner, 2026-10-24); slice 1 built** (*Slice 1
 as built*): the pipeline, at parity with the MVP's rule-based planner,
-which it replaced. The statement memory budget of *Memory* is built too
-(`plan_api_design.md`, revision 6); the lifetime rule and slices 2 to 5
-are not. The first of the post-MVP designs (#487, *Next*). The parser, the
-plan API and TinyCC are unchanged; the binder's output changed.
+which it replaced. *Memory* is built too: the statement budget and the
+lifetime rule (`plan_api_design.md`, revision 7), and #551 with it; slices
+2 to 5 are not. The first of the post-MVP designs (#487, *Next*). The
+parser, the plan API and TinyCC are unchanged; the binder's output changed.
 
 ## Why
 
@@ -295,8 +295,9 @@ deterministic and the allocation-fault sweep can test it.
   result rows.
 
 How the API releases a step's storage (a mark on the arena per loop level,
-or storage held with the cursor, as `bc_col_key`'s is today) is the
-implementation PR's to choose. This rule is the contract. Streaming
+or storage held with the cursor) is the implementation PR's to choose; it
+marks the arena (`plan_api_design.md`, *A loop's step owns what it
+allocates*). This rule is the contract. Streaming
 operators therefore use memory bounded by the depth of the pipeline, not
 by the number of rows, and only pipeline breakers and results grow.
 
