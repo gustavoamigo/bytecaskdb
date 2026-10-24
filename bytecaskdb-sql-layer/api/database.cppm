@@ -1205,21 +1205,21 @@ auto Database::results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows {
   return out;
 }
 
-// A result row's NUMERICs, each two of the plan's columns, its sum and
-// count, as one: NULL, or its text.
+// A result row's NUMERICs, each its plan's columns (physical::plan_columns),
+// its sum and count, as one: NULL, or its text.
 auto Database::quotients(const GeneratedPlan& p, std::vector<Value> values) -> std::vector<Value> {
   auto numeric = [](const SqlType& t) { return t.kind == SqlKind::Numeric; };
   if (std::ranges::none_of(p.result_sql, numeric)) return values;
   std::vector<Value> out;
   std::size_t at = 0;
   for (const auto& t : p.result_sql) {
+    const auto first = std::exchange(at, at + physical::plan_columns(t).size());
     if (!numeric(t)) {
-      out.push_back(std::move(values[at++]));
+      out.push_back(std::move(values[first]));
       continue;
     }
-    const auto* sum = std::get_if<std::int64_t>(&values[at]);
-    const auto* count = std::get_if<std::int64_t>(&values[at + 1]);
-    at += 2;
+    const auto* sum = std::get_if<std::int64_t>(&values[first]);
+    const auto* count = std::get_if<std::int64_t>(&values[first + 1]);
     if (sum == nullptr || count == nullptr || *count <= 0) {
       out.emplace_back(std::monostate{});
       continue;

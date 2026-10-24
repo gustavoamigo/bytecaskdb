@@ -187,6 +187,20 @@ TEST_CASE("codegen: MIN from the first entry past the NULLs, or a loop; SUM by a
   CHECK(generate(f.cat(), "SELECT min(x) FROM m WHERE g = $1").result_names == std::vector<std::string>{"min"});
 }
 
+TEST_CASE("codegen: over no rows, only a COUNT call is 0; anything else is NULL", "[sql][codegen][group]") {
+  // Expr::fn defaults to Count: a column output is NULL whatever its fn.
+  // Hand-built, since check refuses a column of one group of every row.
+  const logical::ColumnRef v{1, 2, PhysType::I64, true};
+  auto count = logical::expr(logical::Expr::Kind::Aggregate, SqlType{SqlKind::BigInt});
+  auto column = logical::column(v, SqlType{SqlKind::BigInt});
+  REQUIRE(column.fn == logical::Expr::Fn::Count);
+  physical::Scan rows{1, 3, {}, physical::Range{}, false, false, false};
+  auto g = physical::node(physical::GroupAggregate{physical::node(std::move(rows)), {}, {count}, true, {}});
+  auto root = physical::node(physical::GroupEmit{std::move(g), {column, count}});
+  CHECK(no_rows_lines(*root) ==
+        std::vector<std::string>{"bc_emit_begin(cx);", "bc_emit_null(cx);", "bc_emit_i64(cx, 0);", "bc_emit_end(cx);"});
+}
+
 TEST_CASE("codegen: a DOUBLE result column is read from the row, never the index key", "[sql][codegen]") {
   // The key encoding writes -0.0 as 0.0 and every NaN as one NaN: a covering
   // read would return a value the row does not hold.
