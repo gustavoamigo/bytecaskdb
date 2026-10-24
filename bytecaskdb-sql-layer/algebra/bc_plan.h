@@ -217,6 +217,24 @@ bool     bc_key_fits(bc_ctx *, bc_key);  /* the key so far is within the engine'
 bc_view  bc_key_params(bc_ctx *, uint32_t table_or_index, uint32_t first, uint32_t n);  /* parts from params first.. */
 bc_view  bc_key_successor(bc_ctx *, bc_view key);     /* smallest key greater than every key with this prefix */
 
+/* Sort keys: what a sorter orders by, built from parts the plan chooses, each
+   with a direction and a NULL placement. memcmp order on the key is
+   PostgreSQL's ORDER BY order, part by part, with text compared bytewise
+   (the layer's one collation). Each part is a marker byte, never inverted,
+   then the value, inverted under DESC: NULLS FIRST or LAST whatever the
+   direction. A sort key is no table's or index's: bc_key_* parts and
+   bc_key_end refuse it, as bc_sort_key_* refuse theirs. */
+enum bc_sort_dir   { BC_SORT_ASC = 0, BC_SORT_DESC = 1 };
+enum bc_sort_nulls { BC_SORT_NULLS_LAST = 0, BC_SORT_NULLS_FIRST = 1 };
+bc_key   bc_sort_key_begin(bc_ctx *);
+void     bc_sort_key_i64(bc_ctx *, bc_key, int64_t, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_f64(bc_ctx *, bc_key, double, uint32_t dir, uint32_t nulls);   /* -0.0 is 0.0; NaN above +inf */
+void     bc_sort_key_bool(bc_ctx *, bc_key, bool, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_bytes(bc_ctx *, bc_key, bc_view, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_null(bc_ctx *, bc_key, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_col(bc_ctx *, bc_key, bc_view row, uint32_t col, uint32_t dir, uint32_t nulls);  /* NULL included */
+bc_view  bc_sort_key_end(bc_ctx *, bc_key);
+
 /* Reads */
 bc_view   bc_get(bc_ctx *, bc_view key, bool *found);
 bool      bc_exists(bc_ctx *, bc_view key);

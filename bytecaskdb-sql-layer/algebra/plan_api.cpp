@@ -148,7 +148,7 @@ struct ViewEntry {
 // The finished key's view reads buf, which a move of the builder keeps
 // where it is: a key costs its bytes once, charged as its parts are added.
 struct KeyBuilder {
-  const KeyLayout* layout;
+  const KeyLayout* layout;  // nullptr: a sort key (bc_sort_key_begin), whose parts the plan chooses
   Bytes buf;
   std::uint64_t gen;
   std::size_t next_part{0};
@@ -1663,6 +1663,10 @@ auto key_view(bc_ctx* cx, BytesView key) -> bc_view {
 auto key_builder_part(bc_ctx* cx, bc_key k, std::optional<PhysType> type, bool is_null) -> KeyBuilder* {
   auto* b = cx->resolve_handle(k, cx->keys, "key builder");
   if (b == nullptr) return nullptr;
+  if (b->layout == nullptr) {
+    cx->fail(BC_E_HANDLE, "a sort key's parts are added with bc_sort_key_*");
+    return nullptr;
+  }
   if (b->done || b->next_part >= b->layout->parts.size()) {
     cx->fail(BC_E_HANDLE, "more key parts than the key has");
     return nullptr;
@@ -1681,6 +1685,58 @@ auto current_part(const KeyBuilder& b) -> KeyPart { return b.layout->parts[b.nex
 
 // Charges a builder's key as it now stands, after a part was added.
 void key_held(bc_ctx* cx, KeyBuilder& b) { (void)cx->rehold(b.held, b.buf.size()); }
+
+// The builder of a key of a table or index, refusing a sort key's.
+auto index_key_builder(bc_ctx* cx, bc_key k) -> KeyBuilder* {
+  auto* b = cx->resolve_handle(k, cx->keys, "key builder");
+  if (b != nullptr && b->layout == nullptr) {
+    cx->fail(BC_E_HANDLE, "a sort key is ended with bc_sort_key_end");
+    return nullptr;
+  }
+  return b;
+}
+
+// The sort key builder k, open for a part placed by dir and nulls, with
+// the part's marker written: the null one when is_null, else a value's.
+auto sort_key_part(bc_ctx* cx, bc_key k, std::uint32_t dir, std::uint32_t nulls, bool is_null) -> KeyBuilder* {
+  auto* b = cx->resolve_handle(k, cx->keys, "key builder");
+  if (b == nullptr) return nullptr;
+  if (b->layout != nullptr) {
+    cx->fail(BC_E_HANDLE, "a table's or index's key takes bc_key_* parts, not a sort key's");
+    return nullptr;
+  }
+  if (b->done) {
+    cx->fail(BC_E_HANDLE, "key builder already ended");
+    return nullptr;
+  }
+  if (dir != BC_SORT_ASC && dir != BC_SORT_DESC) {
+    cx->fail(BC_E_HANDLE, "unknown sort direction");
+    return nullptr;
+  }
+  if (nulls != BC_SORT_NULLS_LAST && nulls != BC_SORT_NULLS_FIRST) {
+    cx->fail(BC_E_HANDLE, "unknown NULL placement");
+    return nullptr;
+  }
+  if (is_null) {
+    bytecask::sql::sort_put_null(b->buf, nulls == BC_SORT_NULLS_FIRST);
+  } else {
+    bytecask::sql::sort_put_present(b->buf);
+  }
+  return b;
+}
+
+// A sort key value's part: the value alone, inverted under DESC.
+auto sort_value_part(PhysType type, std::uint32_t dir) -> KeyPart { return {type, false, dir == BC_SORT_DESC}; }
+
+// Appends a column's value, read present, as `part`.
+void key_put_column(Bytes& out, const bytecask::sql::ColumnRead& v, KeyPart part) {
+  switch (part.type) {
+    case PhysType::I64: bytecask::sql::key_put_i64(out, v.i64(), part); break;
+    case PhysType::F64: bytecask::sql::key_put_f64(out, v.f64(), part); break;
+    case PhysType::Bool: bytecask::sql::key_put_bool(out, v.boolean(), part); break;
+    case PhysType::Bytes: bytecask::sql::key_put_bytes(out, v.bytes, part); break;
+  }
+}
 
 // A reader positioned on part `part` of `key`, which must be a key of
 // `table_or_index` and, when `want` is given, have a part of that type there.
@@ -3044,7 +3100,7 @@ void bc_key_param(bc_ctx* cx, bc_key k, uint32_t i) {
 
 bc_view bc_key_end(bc_ctx* cx, bc_key k) {
   BC_GUARD_BEGIN
-  auto* b = cx->resolve_handle(k, cx->keys, "key builder");
+  auto* b = index_key_builder(cx, k);
   if (b == nullptr) return {};
   if (b->done) {
     cx->fail(BC_E_HANDLE, "key builder already ended");
@@ -3059,7 +3115,7 @@ bc_view bc_key_end(bc_ctx* cx, bc_key k) {
 
 bool bc_key_fits(bc_ctx* cx, bc_key k) {
   BC_GUARD_BEGIN
-  const auto* b = cx->resolve_handle(k, cx->keys, "key builder");
+  const auto* b = index_key_builder(cx, k);
   return b != nullptr && b->buf.size() <= bytecask::sql::kMaxKeyBytes;
   BC_GUARD_END(cx)
   return false;
@@ -3092,6 +3148,100 @@ bc_view bc_key_successor(bc_ctx* cx, bc_view key) {
   auto k = cx->resolve(key);
   if (!k) return {};
   return cx->arena_view(bytecask::sql::key_successor(*k));
+  BC_GUARD_END(cx)
+  return {};
+}
+
+// ----------------------------------------------------------------- sort keys
+
+// A sort key is the plan's, not a table's or index's: no prefix, no layout
+// and no key ceiling, since it never reaches the engine. Charged and owned
+// by its step as any key builder.
+bc_key bc_sort_key_begin(bc_ctx* cx) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return {};
+  KeyBuilder b{nullptr, {}, cx->next_gen()};
+  auto gen = b.gen;
+  if (cx->push_charged(cx->keys, std::move(b), kKeyEntryBytes) == nullptr) return {};
+  return {static_cast<std::uint32_t>(cx->keys.size() - 1), gen};
+  BC_GUARD_END(cx)
+  return {};
+}
+
+void bc_sort_key_i64(bc_ctx* cx, bc_key k, int64_t v, uint32_t dir, uint32_t nulls) {
+  BC_GUARD_BEGIN
+  auto* b = sort_key_part(cx, k, dir, nulls, false);
+  if (b == nullptr) return;
+  bytecask::sql::key_put_i64(b->buf, v, sort_value_part(PhysType::I64, dir));
+  key_held(cx, *b);
+  BC_GUARD_END(cx)
+}
+
+void bc_sort_key_f64(bc_ctx* cx, bc_key k, double v, uint32_t dir, uint32_t nulls) {
+  BC_GUARD_BEGIN
+  auto* b = sort_key_part(cx, k, dir, nulls, false);
+  if (b == nullptr) return;
+  bytecask::sql::key_put_f64(b->buf, v, sort_value_part(PhysType::F64, dir));
+  key_held(cx, *b);
+  BC_GUARD_END(cx)
+}
+
+void bc_sort_key_bool(bc_ctx* cx, bc_key k, bool v, uint32_t dir, uint32_t nulls) {
+  BC_GUARD_BEGIN
+  auto* b = sort_key_part(cx, k, dir, nulls, false);
+  if (b == nullptr) return;
+  bytecask::sql::key_put_bool(b->buf, v, sort_value_part(PhysType::Bool, dir));
+  key_held(cx, *b);
+  BC_GUARD_END(cx)
+}
+
+void bc_sort_key_bytes(bc_ctx* cx, bc_key k, bc_view v, uint32_t dir, uint32_t nulls) {
+  BC_GUARD_BEGIN
+  auto bytes = cx->resolve(v);
+  if (!bytes) return;
+  auto* b = sort_key_part(cx, k, dir, nulls, false);
+  if (b == nullptr) return;
+  bytecask::sql::key_put_bytes(b->buf, *bytes, sort_value_part(PhysType::Bytes, dir));
+  key_held(cx, *b);
+  BC_GUARD_END(cx)
+}
+
+void bc_sort_key_null(bc_ctx* cx, bc_key k, uint32_t dir, uint32_t nulls) {
+  BC_GUARD_BEGIN
+  auto* b = sort_key_part(cx, k, dir, nulls, true);
+  if (b == nullptr) return;
+  key_held(cx, *b);
+  BC_GUARD_END(cx)
+}
+
+void bc_sort_key_col(bc_ctx* cx, bc_key k, bc_view row, uint32_t col, uint32_t dir, uint32_t nulls) {
+  BC_GUARD_BEGIN
+  auto rc = row_col(cx, row, col, std::nullopt);
+  if (!rc) return;
+  auto v = read_column(cx, *rc);
+  if (!v) return;
+  auto is_null = v->state == bytecask::sql::ColumnState::Absent;
+  auto* b = sort_key_part(cx, k, dir, nulls, is_null);
+  if (b == nullptr) return;
+  if (!is_null) key_put_column(b->buf, *v, sort_value_part(rc->slot->type, dir));
+  key_held(cx, *b);
+  BC_GUARD_END(cx)
+}
+
+bc_view bc_sort_key_end(bc_ctx* cx, bc_key k) {
+  BC_GUARD_BEGIN
+  auto* b = cx->resolve_handle(k, cx->keys, "key builder");
+  if (b == nullptr) return {};
+  if (b->layout != nullptr) {
+    cx->fail(BC_E_HANDLE, "a table's or index's key is ended with bc_key_end");
+    return {};
+  }
+  if (b->done) {
+    cx->fail(BC_E_HANDLE, "key builder already ended");
+    return {};
+  }
+  b->done = true;
+  return cx->make_view(b->buf.data(), b->buf.size());
   BC_GUARD_END(cx)
   return {};
 }
@@ -3377,12 +3527,7 @@ bc_view bc_col_key(bc_ctx* cx, bc_view row, uint32_t col) {
   if (v->state == bytecask::sql::ColumnState::Absent) {
     bytecask::sql::key_put_null(key, part);
   } else {
-    switch (rc->slot->type) {
-      case PhysType::I64: bytecask::sql::key_put_i64(key, v->i64(), part); break;
-      case PhysType::F64: bytecask::sql::key_put_f64(key, v->f64(), part); break;
-      case PhysType::Bool: bytecask::sql::key_put_bool(key, v->boolean(), part); break;
-      case PhysType::Bytes: bytecask::sql::key_put_bytes(key, v->bytes, part); break;
-    }
+    key_put_column(key, *v, part);
   }
   // A group key, not an engine key: no key ceiling. It is the innermost
   // step's, whichever row it was read from: an outer row's key made in an
