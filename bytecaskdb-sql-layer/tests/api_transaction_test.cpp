@@ -1353,7 +1353,16 @@ TEST_CASE("embedded API: AVG is PostgreSQL's numeric quotient, at the scale its 
   CHECK(std::get<std::int64_t>(r.rows[1][0]) == 0);  // k = 2, 4
   CHECK(text_of(r.rows[1][2]) == "3.0000000000000000");
   CHECK(std::get<std::int64_t>(r.rows[2][1]) == 3);  // k = 1, 5, 7
-  CHECK(r.types[2].kind == SqlKind::Decimal);
+  // AVG is a NUMERIC, its value its text; a DECIMAL's value, a SUM's
+  // among them, is always its scaled integer.
+  CHECK(r.types[2].kind == SqlKind::Numeric);
+  CHECK(r.types[3].kind == SqlKind::Numeric);
+  auto sums = db->execute("SELECT sum(d), avg(d) FROM g WHERE k >= $1", {std::int64_t{1}});
+  REQUIRE(sums.rows.size() == 1);
+  CHECK(sums.types[0].kind == SqlKind::Decimal);
+  CHECK(std::get<std::int64_t>(sums.rows[0][0]) == 3500);
+  CHECK(sums.types[1].kind == SqlKind::Numeric);
+  CHECK(text_of(sums.rows[0][1]) == "5.0000000000000000");
   // No rows: no groups; without GROUP BY, one row, COUNT 0 and AVG NULL.
   CHECK(db->execute("SELECT a, avg(k) FROM g WHERE k > $1 GROUP BY a", {std::int64_t{7}}).rows.empty());
   auto none = db->execute("SELECT count(*), avg(k) FROM g WHERE k > $1", {std::int64_t{7}});

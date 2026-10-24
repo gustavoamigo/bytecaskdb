@@ -75,9 +75,9 @@ using bytecask::DbClosed;
 
 struct Rows {
   std::vector<std::string> columns;
-  std::vector<SqlType> types;  // each column's SQL type, as the catalog declares it
-  // An AVG's value, a numeric of no declared precision, is its text, as
-  // bytes: more digits than an int64_t holds.
+  // Each column's SQL type, as the catalog declares it. A NUMERIC's value,
+  // an AVG's, is its text, as bytes: more digits than an int64_t holds.
+  std::vector<SqlType> types;
   std::vector<std::vector<Value>> rows;
   std::int64_t affected{-1};  // INSERT, UPDATE, DELETE: rows changed
 };
@@ -1205,14 +1205,15 @@ auto Database::results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows {
   return out;
 }
 
-// A result row's AVGs, each two of the plan's columns, its sum and count,
-// as one: NULL, or its text.
+// A result row's NUMERICs, each two of the plan's columns, its sum and
+// count, as one: NULL, or its text.
 auto Database::quotients(const GeneratedPlan& p, std::vector<Value> values) -> std::vector<Value> {
-  if (std::ranges::none_of(p.result_quotient, std::identity{})) return values;
+  auto numeric = [](const SqlType& t) { return t.kind == SqlKind::Numeric; };
+  if (std::ranges::none_of(p.result_sql, numeric)) return values;
   std::vector<Value> out;
   std::size_t at = 0;
-  for (std::size_t i = 0; i < p.result_quotient.size(); ++i) {
-    if (!p.result_quotient[i]) {
+  for (const auto& t : p.result_sql) {
+    if (!numeric(t)) {
       out.push_back(std::move(values[at++]));
       continue;
     }
@@ -1223,7 +1224,7 @@ auto Database::quotients(const GeneratedPlan& p, std::vector<Value> values) -> s
       out.emplace_back(std::monostate{});
       continue;
     }
-    auto text = average_text(*sum, *count, p.result_sql[i].scale);
+    auto text = average_text(*sum, *count, t.scale);
     auto b = std::as_bytes(std::span{text.data(), text.size()});
     out.emplace_back(Bytes(b.begin(), b.end()));
   }

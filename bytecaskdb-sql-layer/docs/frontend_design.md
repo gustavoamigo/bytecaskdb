@@ -111,8 +111,17 @@ kind the transformer doesn't take is refused with its position.
   aggregate with a parameter. The parameter takes the column's type, or the
   aggregate's: `COUNT`'s and an integer `SUM`'s `bigint`, a `SUM` of a
   BIGINT or DECIMAL its numeric, checked as a BIGINT at its scale, `MIN`'s
-  and `MAX`'s their column's. `HAVING` on `AVG` is refused (42601): its
-  quotient is no type a plan holds.
+  and `MAX`'s their column's. A parameter an earlier use typed, in the
+  `WHERE` or an earlier conjunct, keeps that type, as PostgreSQL types a
+  `$n` by its first use: `WHERE a > $1 GROUP BY a HAVING count(*) > $1`,
+  `a` an INTEGER, compares `count(*)` with an INTEGER `$1`. The layer runs
+  it where both are integers of scale 0 (SMALLINT, INTEGER, BIGINT, a
+  DECIMAL of scale 0), which compare exactly; any other pair is refused, as
+  two uses of one `$n` are (*Known differences*). `HAVING` on `AVG` is
+  refused (42601): its quotient is no type a plan holds.
+- `AVG`'s result is PostgreSQL's numeric of no declared precision, a SQL
+  type of its own (`SqlKind::Numeric`): no column has it, and a result row
+  carries its value as its text.
 - `ORDER BY` takes grouped columns; it sorts the groups, and `LIMIT` counts
   them.
 
@@ -211,7 +220,10 @@ fail on them.
   `WHERE a = $1 AND b = $1`, with `a DOUBLE PRECISION` and `b REAL`,
   `INTEGER` and `BIGINT`, or `DECIMAL`s of two scales, is refused, and so
   is `SET b = $1, a = a + $1` with `b BIGINT` and `a SMALLINT`. PostgreSQL
-  runs both.
+  runs both. A `HAVING` comparing an integer with a `$n` an earlier use
+  typed as an integer runs, as PostgreSQL's (*GROUP BY and HAVING*); with
+  a `$n` the `WHERE` typed as a `DECIMAL` of scale 2, `HAVING count(*) >
+  $1` is refused, where PostgreSQL casts the count to numeric.
   - Refusing is the safe choice. With `$1 = 0.1`, PostgreSQL compares
     `real::float8 = 0.1`, which is false, where a `REAL` key part keyed as
     the float of 0.1 would match. A range check per comparison wouldn't

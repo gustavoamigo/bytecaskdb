@@ -811,7 +811,43 @@ void clear_after_next(bc_ctx* cx) {
   }
   bc_agg_clear(cx, a);
 }
+
+// A group, a clear, another group: their handles, then the second's count
+// emitted, and, given param 2 true, the first's read, which is stale.
+std::vector<bc_group> cleared_handles;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables): written by the plan
+void group_clear_group(bc_ctx* cx) {
+  bc_agg a = bc_agg_open(cx, 1);
+  bc_group g0 = bc_agg_group(cx, a, bc_param_bytes(cx, 0));
+  bc_agg_count(cx, g0, 0);
+  bc_agg_clear(cx, a);
+  bc_group g1 = bc_agg_group(cx, a, bc_param_bytes(cx, 1));
+  bc_agg_count(cx, g1, 0);
+  cleared_handles = {g0, g1};
+  bc_emit_count(cx, bc_agg_i64(cx, g1, 0));
+  if (bc_param_bool(cx, 2)) (void)bc_agg_i64(cx, g0, 0);
+}
 }  // namespace
+
+TEST_CASE("plan API: bc_agg_clear reuses its groups' indices, and a handle from before it is stale",
+          "[sql][algebra][structures]") {
+  // The 2^32 limit counts the groups held: a clear starts the indices at 0
+  // again, under a new generation, so the dropped group's handle, of the
+  // same index, resolves to no group.
+  Fixture f;
+  for (auto stale : {false, true}) {
+    cleared_handles.clear();
+    CHECK(run(f, group_clear_group, {bytes("a"), bytes("b"), stale}) == (stale ? BC_FAILED : BC_COMMITTED));
+    REQUIRE(cleared_handles.size() == 2);
+    CHECK(cleared_handles[0].i == 0);
+    CHECK(cleared_handles[1].i == 0);
+    CHECK(cleared_handles[0].g != cleared_handles[1].g);
+    if (stale) {
+      CHECK(bc_error(f.cx) == BC_E_HANDLE);
+    } else {
+      CHECK(bc_ctx_affected(f.cx) == 1);
+    }
+  }
+}
 
 TEST_CASE("plan API: bc_agg_clear drops every group and releases its bytes", "[sql][algebra][structures][memory]") {
   Fixture f;

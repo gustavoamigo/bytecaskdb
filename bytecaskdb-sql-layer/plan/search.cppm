@@ -2061,14 +2061,8 @@ private:
           out.push_back({physical::node(physical::CountRange{*scan, emits}), std::move(b.null_checks), std::move(b.computed),
                          kCountCost});
         }
-      } else if (scan != nullptr && !agg->distinct && agg->fn == Expr::Fn::Min && !scan->reverse) {
-        auto first = *scan;
-        if (min_from_first_entry(q.rels[0].table(), first, agg->args[0].col)) {
-          auto b = build(q, c, {}, nullptr);
-          auto cost = first.covering || first.object == first.table ? 1.0 : 2.0;
-          out.push_back({physical::node(physical::MinFirstEntry{std::move(first), agg->args[0].col, emits}),
-                         std::move(b.null_checks), std::move(b.computed), cost});
-        }
+      } else if (scan != nullptr && !agg->distinct && agg->fn == Expr::Fn::Min) {
+        if (auto f = from_keys(q, c, {*agg}, emits)) out.push_back(std::move(*f));
       }
       auto f = finish(q, c, sink, searched, nullptr, avoiding, [&](physical::NodePtr rows) {
         return physical::node(physical::Aggregate{std::move(rows), *agg, emits});
@@ -2177,8 +2171,7 @@ private:
     const auto g = group_parts(root);
     const auto& agg = *g.aggregate;
     for (const auto& o : agg.aggs) {
-      result_.push_back({o.name, o.expr.type, o.expr.phys(),
-                         o.expr.kind == Expr::Kind::Aggregate && o.expr.fn == Expr::Fn::Avg});
+      result_.push_back({o.name, o.expr.type, o.expr.phys()});
     }
     auto columns_of_exprs = [](const std::vector<Expr>& in, const char* what) {
       std::vector<ColumnRef> out;
@@ -2294,6 +2287,13 @@ private:
     auto sink_of = [&](bool hash, bool sorted) {
       return Sink{g.limit, distinct, false, 0, 0, GroupCost{true, hash, grouping.size(), kept, sorted}};
     };
+    // One group of COUNT(*), MIN and MAX alone, nothing filtering a row
+    // after its range: answered from the keys.
+    if (keys.empty() && having.empty()) {
+      for (const auto& c : searched.plans) {
+        if (auto f = from_keys(q, c, outputs, !g.limit || *g.limit > 0)) out.push_back(std::move(*f));
+      }
+    }
     const auto hashes = std::ranges::any_of(searched.plans, [](const Candidate& c) { return c.hash() != nullptr; });
     // A hash join streams only one group, of no key.
     const auto avoiding = hashes && keys.empty() ? without_hash(q, searched, sink_of(false, false), nullptr) : std::nullopt;
@@ -2307,10 +2307,9 @@ private:
       auto f = finish_prepared(q, c, sink, searched, nullptr, Needs{!ordered.empty(), !keys.empty(), {}}, avoiding,
                                [&](physical::NodePtr rows) { return rooted(branch(std::move(rows), true, nullptr)); });
       if (!f) continue;
-      auto cost = finished_cost(sink, measure(c));
-      if (c.hash() == nullptr && (stream == nullptr || cost < stream_cost)) {
+      if (c.hash() == nullptr && (stream == nullptr || f->cost < stream_cost)) {
         stream = &c;
-        stream_cost = cost;
+        stream_cost = f->cost;
       }
       out.push_back(std::move(*f));
     }
@@ -2319,16 +2318,38 @@ private:
     // since groups come in the order their first rows do, each table whose
     // row it holds read by rows; a hash join's other plan, by the budget, of
     // those plans too.
-    auto structured = searched;
+    std::optional<Searched> read;
     if (!held.empty()) {
-      for (auto& c : structured.plans) {
+      read = searched;
+      for (auto& c : read->plans) {
         read_rows(c, held);
         costed(c);
       }
     }
-    const auto avoiding_structure = hashes ? without_hash(q, structured, sink_of(true, false), nullptr) : std::nullopt;
+    const auto& structured = read ? *read : searched;
+    // A hash join's other plan is sorted above the groups where the hash
+    // join is; where the hash join gives the ORDER BY by its order, its
+    // other plan sorts its rows by it, every row kept, since a structure's
+    // groups come in the order of their first rows. Its sorters hold the
+    // rows of every table whose columns the groups read.
+    const SortSpec rows_sort{sort.keys, 0};
+    if (!ordered.empty()) {
+      q.sort_by.clear();
+      for (const auto& o : ordered) q.sort_by.push_back(o.col);
+      q.above = columns;
+      for (const auto& a : aggs) {
+        if (!a.args.empty()) q.above.push_back(a.args[0].col);
+      }
+    }
+    std::optional<Avoiding> avoiding_unordered;
+    std::optional<Avoiding> avoiding_ordered;
+    if (hashes) {
+      avoiding_unordered = without_hash(q, structured, sink_of(true, false), nullptr);
+      if (!ordered.empty()) avoiding_ordered = without_hash(q, structured, sink_of(true, false), &rows_sort);
+    }
     for (const auto& c : structured.plans) {
       auto sorts = !ordered.empty() && !c.ordered();
+      const auto& avoiding_structure = !ordered.empty() && !sorts ? avoiding_ordered : avoiding_unordered;
       auto sink = sink_of(true, sorts);
       const auto* in = sorts ? &sort : nullptr;
       const auto past = group_past(q, layout, keys, in);
@@ -2355,9 +2376,44 @@ private:
     return out;
   }
 
+  // Aggregates of one group of every row answered from the keys of `c`'s
+  // range (KeyAggregates), where each is COUNT(*), or MIN or MAX of one
+  // column, the ASC part after the scan's prefix, and nothing filters a
+  // row: COUNT(*) its count, MIN its first entry past the part's NULLs, MAX
+  // its last. nullopt where they are not. Its cost: a count's, and a read of
+  // an entry, and of its row where the scan does not cover, per MIN or MAX.
+  auto from_keys(const Query& q, const Candidate& c, const std::vector<Expr>& outputs, bool emits) const
+      -> std::optional<Finished> {
+    const auto* scan = c.steps.empty() && c.access.filters.empty() ? std::get_if<physical::Scan>(&c.access.path) : nullptr;
+    if (scan == nullptr || scan->reverse || outputs.empty()) return std::nullopt;
+    std::optional<ColumnRef> arg;
+    auto cost = 0.0;
+    for (const auto& o : outputs) {
+      if (o.kind != Expr::Kind::Aggregate || o.distinct) return std::nullopt;
+      if (o.fn == Expr::Fn::Count && o.args.empty()) {
+        cost = kCountCost;
+        continue;
+      }
+      if ((o.fn != Expr::Fn::Min && o.fn != Expr::Fn::Max) || o.args[0].kind != Expr::Kind::Column) return std::nullopt;
+      if (arg && *arg != o.args[0].col) return std::nullopt;
+      arg = o.args[0].col;
+    }
+    auto values = *scan;
+    if (arg) {
+      if (!min_from_first_entry(q.rels[0].table(), values, *arg)) return std::nullopt;
+      auto has = [&](Expr::Fn fn) { return std::ranges::any_of(outputs, [&](const Expr& o) { return o.fn == fn; }); };
+      auto reads = (has(Expr::Fn::Min) ? 1.0 : 0.0) + (has(Expr::Fn::Max) ? 1.0 : 0.0);
+      cost += reads * (values.covering || values.object == values.table ? 1.0 : 2.0);
+    }
+    auto b = build(q, c, {}, nullptr);
+    return Finished{physical::node(physical::KeyAggregates{*scan, std::move(values), arg, outputs, emits}),
+                    std::move(b.null_checks), std::move(b.computed), cost};
+  }
+
   // MIN(arg) from the scan's first entry: arg is the ASC part after its
-  // prefix, so the first entry past that part's NULLs holds the least value.
-  // A scan with no range on the part is given one from past its NULLs.
+  // prefix, so the first entry past that part's NULLs holds the least value,
+  // and the last the greatest. A scan with no range on the part is given one
+  // from past its NULLs.
   static auto min_from_first_entry(const Table& t, physical::Scan& sc, const ColumnRef& arg) -> bool {
     const auto all = paths(t);
     const auto& path = *std::ranges::find_if(all, [&](const Path& p) { return p.object == sc.object; });

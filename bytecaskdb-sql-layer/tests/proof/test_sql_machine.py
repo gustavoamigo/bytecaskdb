@@ -278,6 +278,19 @@ class Calc:
     k: int
 
 
+@dataclasses.dataclass(frozen=True)
+class Reuse:
+    """A HAVING conjunct's operand that is the WHERE's $n, typed there, as
+    PostgreSQL types a parameter by its first use."""
+
+    n: int
+
+
+# Integer types of scale 0: a $n of one compares exactly with a key or an
+# aggregate of another (docs/frontend_design.md, *GROUP BY and HAVING*).
+INTEGRAL = ("smallint", "integer", "bigint")
+
+
 def param_value(v):
     return v.value if isinstance(v, Calc) else v
 
@@ -773,6 +786,11 @@ class SqlMachine(RuleBasedStateMachine):
         hav, pg_hav = [], []
         for what, op, v in having:
             n = len(params) + 1
+            if isinstance(v, Reuse):
+                lhs = f"{what[1]}.{what[2]}" if what[0] == "col" else agg_text(what[1])
+                hav.append(f"{lhs} {op} ${v.n}")
+                pg_hav.append(f"{lhs} {op} ${v.n}")
+                continue
             if what[0] == "col":
                 t = by_name[what[1]]
                 hav.append(compared(t, what[2], op, v, n, False, True))
@@ -918,6 +936,30 @@ class SqlMachine(RuleBasedStateMachine):
                                                                               label="nulls")) for tn, c in keys]
         limit = data.draw(st.none() | st.sampled_from([0, 1, 2, 5]), label="limit")
         self.grouped([t.name], [(t.name, c, op, v) for c, op, v in where], group, aggs, having, order, limit)
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
+    def having_reuses_a_parameter(self, data):
+        # A HAVING that compares a key or an aggregate with a $n the WHERE
+        # compares an integer column with: typed by its first use, the
+        # WHERE's, on both sides.
+        t = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="table")]
+        where, _, _ = self.where_on_a_path(data, t)
+        reusable = [i for i, (c, _, v) in enumerate(where) if t.column(c).type.sql in INTEGRAL and not isinstance(v, Calc)]
+        if not reusable:
+            return
+        at = data.draw(st.sampled_from(reusable), label="reused")
+        names = [c.name for c in t.columns]
+        group = [(t.name, c) for c in data.draw(st.lists(st.sampled_from(names), max_size=2, unique=True), label="keys")]
+        aggs = self.draw_aggs(data, [t], 2)
+        options = [("col", tn, c) for tn, c in group if t.column(c).type.sql in INTEGRAL]
+        options += [("agg", a) for a in aggs + [("count", None, None, False)]
+                    if a[0] == "count" or (a[0] in ("sum", "min", "max") and t.column(a[2]).type.sql in INTEGRAL)]
+        what = data.draw(st.sampled_from(options), label="HAVING") if options else ("agg", ("count", None, None, False))
+        if what[0] == "agg" and what[1] not in aggs:
+            aggs = aggs + [what[1]]
+        op = data.draw(st.sampled_from(["=", "<", "<=", ">", ">="]), label="HAVING op")
+        self.grouped([t.name], [(t.name, c, o_, v) for c, o_, v in where], group, aggs, [(what, op, Reuse(at + 1))])
 
     @precondition(lambda self: len(self.tables) >= 2)
     @rule(data=st.data())
@@ -2759,5 +2801,53 @@ def test_group_by(dsn):
             m.grouped(["t0", "t1"], [], [("t1", "c1")], every[:4], links=links)
             m.grouped(["t0", "t1"], [("t0", "c0", ">=", 2)], [("t0", "c2")], every[:2], links=links,
                       order=[("t0", "c2", False, None)], limit=1)
+    finally:
+        m.teardown()
+
+
+def test_a_grouped_hash_join_and_its_other_plan_both_order_the_groups(dsn):
+    """GROUP BY over a hash join no key reaches, ORDER BY a grouped column:
+    the hash join probes t0 in its key's order, so its groups come in order,
+    and its choice point by the budget takes, past the count, the nested
+    loop, which reads t1 first. That branch sorts its rows too. Alternatives
+    agree forces both branches."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER)], ["c0"]))
+        m.create(Table("t1", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER)], ["c0"]))
+        for k in range(40):
+            m.insert("t0", {"c0": k * 7 % 40, "c1": k % 4}, all_columns=True)
+        for k in range(3):
+            m.insert("t1", {"c0": k, "c1": k}, all_columns=True)
+        count = ("count", None, None, False)
+        for desc in (False, True):
+            for limit in (None, 3):
+                m.grouped(["t0", "t1"], [], [("t0", "c0")], [count], order=[("t0", "c0", desc, None)], limit=limit,
+                          links=[("c1", "c1")])
+        assert len(m.db._alternatives(
+            "SELECT t0.c0, count(*) FROM t0, t1 WHERE t1.c1 = t0.c1 GROUP BY t0.c0 ORDER BY t0.c0", ())) >= 2
+    finally:
+        m.teardown()
+
+
+def test_a_having_parameter_typed_by_the_where(dsn):
+    """$1 compared with an INTEGER or SMALLINT column in the WHERE, then with
+    COUNT(*), a SUM, a MAX or a key in the HAVING: PostgreSQL types it by its
+    first use, the WHERE's, and so does the layer."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.SMALLINT), Column("c2", o.BIGINT)],
+                       ["c0"]))
+        for k in range(12):
+            m.insert("t0", {"c0": k, "c1": k % 3, "c2": None if k % 5 == 0 else k * 10}, all_columns=True)
+        count = ("count", None, None, False)
+        havings = (("agg", count), ("agg", ("sum", "t0", "c1", False)), ("agg", ("max", "t0", "c2", False)),
+                   ("col", "t0", "c1"))
+        for col, op in (("c0", ">"), ("c1", "<=")):
+            for v in (0, 1, 2, None):
+                for what in havings:
+                    aggs = [count] + ([what[1]] if what[0] == "agg" and what[1] != count else [])
+                    m.grouped(["t0"], [("t0", col, op, v)], [("t0", "c1")], aggs, [(what, ">", Reuse(1))])
+                m.grouped(["t0"], [("t0", col, op, v)], [], [count], [(("agg", count), ">", Reuse(1))])
     finally:
         m.teardown()

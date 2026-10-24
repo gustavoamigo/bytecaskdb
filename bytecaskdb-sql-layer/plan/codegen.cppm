@@ -54,12 +54,11 @@ struct GeneratedPlan {
   bool returns_rows{false};
   std::vector<PhysType> result_types;  // the plan's result layout, for its bc_schema_ref
   // Each result column's name and SQL type, as PostgreSQL names and types
-  // it: a column's own, or "count", a bigint.
+  // it: a column's own, or "count", a bigint. A NUMERIC, an AVG, is two of
+  // result_types, its sum and its count, that the API divides as
+  // PostgreSQL's numeric division does.
   std::vector<std::string> result_names;
   std::vector<SqlType> result_sql;
-  // Per result column: an AVG, two of result_types (its sum and its count)
-  // that the API divides as PostgreSQL's numeric division does.
-  std::vector<bool> result_quotient;
   // What its bc_schema_ref lists (docs/catalog_design.md,
   // *Compatibility*): the objects and columns it depends on.
   std::uint64_t catalog_version{0};
@@ -341,6 +340,15 @@ auto empty_row(Expr::Fn fn) -> std::vector<std::string> {
   return {"bc_emit_begin(cx);", "bc_emit_null(cx);", "bc_emit_end(cx);"};
 }
 
+// The row of aggregates over no rows: each COUNT 0, anything else NULL.
+auto empty_row(const std::vector<Expr>& outputs) -> std::vector<std::string> {
+  if (outputs.size() == 1) return empty_row(outputs[0].fn);
+  std::vector<std::string> out{"bc_emit_begin(cx);"};
+  for (const auto& o : outputs) out.emplace_back(o.fn == Expr::Fn::Count ? "bc_emit_i64(cx, 0);" : "bc_emit_null(cx);");
+  out.emplace_back("bc_emit_end(cx);");
+  return out;
+}
+
 // Prints a physical plan, operator by operator. produce(n, k) prints n's
 // code, and k at the point where each row n emits is in hand: inside the
 // loop over a cursor, or once for a single row. `k` is the parent's consume.
@@ -384,8 +392,8 @@ private:
             return op.emits ? empty_row(op.agg.fn) : std::vector<std::string>{};
           } else if constexpr (std::is_same_v<T, physical::CountRange>) {
             return op.emits ? empty_row(Expr::Fn::Count) : std::vector<std::string>{};
-          } else if constexpr (std::is_same_v<T, physical::MinFirstEntry>) {
-            return op.emits ? empty_row(Expr::Fn::Min) : std::vector<std::string>{};
+          } else if constexpr (std::is_same_v<T, physical::KeyAggregates>) {
+            return op.emits ? empty_row(op.outputs) : std::vector<std::string>{};
           } else if constexpr (std::is_same_v<T, physical::GroupEmit>) {
             return empty_group(op);
           } else {
@@ -405,7 +413,7 @@ private:
             const auto* l = std::get_if<physical::Limit>(&op.input->op);
             return l != nullptr && l->n == 0;
           } else if constexpr (std::is_same_v<T, physical::Aggregate> || std::is_same_v<T, physical::CountRange> ||
-                               std::is_same_v<T, physical::MinFirstEntry>) {
+                               std::is_same_v<T, physical::KeyAggregates>) {
             return !op.emits;
           } else {
             return false;
@@ -609,7 +617,7 @@ private:
   // ends that step (docs/plan_api_design.md, *A loop's step owns what it
   // allocates*).
   void scan_loop(const physical::Scan& sc, const Consume& k) {
-    w_.open("while (" + guard_ + "bc_scan_next(cx, " + cursor_ + "))");
+    w_.open("while (" + guard() + "bc_scan_next(cx, " + cursor_ + "))");
     if (!sc.covering) {
       w_.reads(sc.table);
       w_.line("bc_view " + row_name_ + " = bc_scan_row(cx, " + cursor_ + ");");
@@ -697,26 +705,82 @@ private:
     w_.close();
   }
 
-  // MIN from the scan's first entry, past the part's NULLs; none is NULL.
-  // One step, never the scan's end: the cursor is closed after it.
-  void produce(const physical::MinFirstEntry& m, const Consume&) {
+  // Aggregates from the keys. A lone MIN or MAX is emitted from the first
+  // entry of its range past the part's NULLs, forward or in reverse, none
+  // of them NULL: one step, never the scan's end, the cursor closed after
+  // it. With several, COUNT(*) counts the range, each MIN or MAX reads its
+  // entry into kv<i>, NULL while kn<i>, a block of its own, and then the
+  // row is emitted.
+  void produce(const physical::KeyAggregates& m, const Consume&) {
     if (!m.emits) return;
-    const auto& sc = m.scan;
-    open_scan(sc);
-    w_.open("if (bc_scan_next(cx, " + cursor_ + "))");
-    w_.line("bc_emit_begin(cx);");
-    if (sc.covering) {
-      w_.line("bc_emit_key_part(cx, " + w_.obj(sc.object) + ", bc_scan_key(cx, " + cursor_ + "), " +
-              w_.part(sc.object, m.arg) + ");");
-    } else {
+    auto values_scan = [&](Expr::Fn fn) {
+      auto sc = m.values;
+      sc.reverse = fn == Expr::Fn::Max;
+      return sc;
+    };
+    auto entry_part = [&](const physical::Scan& sc, const std::string& kind) {
+      if (sc.covering) {
+        return "bc_key_part_" + kind + "(cx, " + w_.obj(sc.object) + ", bc_scan_key(cx, " + cursor_ + "), " +
+               w_.part(sc.object, *m.arg) + ")";
+      }
       w_.reads(sc.table);
-      w_.line("bc_emit_col(cx, bc_scan_row(cx, " + cursor_ + "), " + w_.col(m.arg) + ");");
+      return "bc_col_" + kind + "(cx, bc_scan_row(cx, " + cursor_ + "), " + w_.col(*m.arg) + ")";
+    };
+    if (m.outputs.size() == 1 && m.outputs[0].fn != Expr::Fn::Count) {
+      const auto sc = values_scan(m.outputs[0].fn);
+      open_scan(sc);
+      w_.open("if (bc_scan_next(cx, " + cursor_ + "))");
+      w_.line("bc_emit_begin(cx);");
+      if (sc.covering) {
+        w_.line("bc_emit_key_part(cx, " + w_.obj(sc.object) + ", bc_scan_key(cx, " + cursor_ + "), " +
+                w_.part(sc.object, *m.arg) + ");");
+      } else {
+        w_.reads(sc.table);
+        w_.line("bc_emit_col(cx, bc_scan_row(cx, " + cursor_ + "), " + w_.col(*m.arg) + ");");
+      }
+      w_.line("bc_emit_end(cx);");
+      w_.otherwise();
+      for (const auto& line : no_rows_) w_.line(line);
+      w_.close();
+      w_.line("bc_scan_close(cx, " + cursor_ + ");");
+      return;
+    }
+    if (std::ranges::any_of(m.outputs, [](const Expr& o) { return o.fn == Expr::Fn::Count; })) {
+      print_count_range(m.counted);
+      w_.line("int64_t n = bc_count_range(cx, " + w_.obj(m.counted.object) + ", lo, hi, INT64_MAX);");
+    }
+    // Each MIN or MAX once: its index in `read`.
+    std::vector<Expr::Fn> read;
+    for (const auto& o : m.outputs) {
+      if (o.fn == Expr::Fn::Count || std::ranges::find(read, o.fn) != read.end()) continue;
+      const auto i = std::to_string(read.size());
+      read.push_back(o.fn);
+      w_.line("int64_t kv" + i + " = 0;");
+      w_.line("bool kn" + i + " = true;");
+      w_.open("");
+      const auto sc = values_scan(o.fn);
+      open_scan(sc);
+      w_.open("if (bc_scan_next(cx, " + cursor_ + "))");
+      w_.line("kv" + i + " = " + entry_part(sc, "i64") + ";");
+      w_.line("kn" + i + " = false;");
+      w_.close();
+      w_.line("bc_scan_close(cx, " + cursor_ + ");");
+      w_.close();
+    }
+    w_.line("bc_emit_begin(cx);");
+    for (const auto& o : m.outputs) {
+      if (o.fn == Expr::Fn::Count) {
+        w_.line("bc_emit_i64(cx, n);");
+        continue;
+      }
+      const auto i = std::to_string(std::ranges::find(read, o.fn) - read.begin());
+      w_.open("if (kn" + i + ")");
+      w_.line("bc_emit_null(cx);");
+      w_.otherwise();
+      w_.line("bc_emit_i64(cx, kv" + i + ");");
+      w_.close();
     }
     w_.line("bc_emit_end(cx);");
-    w_.otherwise();
-    for (const auto& line : no_rows_) w_.line(line);
-    w_.close();
-    w_.line("bc_scan_close(cx, " + cursor_ + ");");
   }
 
   // For each outer row, the inner row its key names. Of an outer column, a
@@ -807,7 +871,6 @@ private:
     }
     // The build side is named in the plan text.
     w_.line("bc_hash " + table + " = bc_hash_open(cx);  // built on " + w_.tbl(h.held) + "'s rows");
-    auto guard = std::exchange(guard_, "");
     auto limit = std::exchange(limit_, "");
     w_.open("");
     produce(*h.build, [&] {
@@ -815,14 +878,13 @@ private:
       w_.line("bc_hash_put(cx, " + table + ", " + key + ", " + binding(h.held).row + ");");
     });
     w_.close();
-    guard_ = guard;
     limit_ = limit;
     produce(*h.probe, [&] {
       auto key = hash_key(i, probe_cols);
       const auto probe = "q" + i;
       w_.line("bc_hash_iter " + probe + " = bc_hash_find(cx, " + table + ", " + key + ");");
       w_.line("bc_view " + held + " = bc_empty(cx);");
-      w_.open("while (" + guard_ + "bc_hash_next(cx, " + probe + ", &" + held + "))");
+      w_.open("while (" + guard() + "bc_hash_next(cx, " + probe + ", &" + held + "))");
       rows_.push_back({h.held, held, false, 0, false, "c", true});
       auto outer = std::exchange(loop_, true);
       k();
@@ -853,7 +915,6 @@ private:
     for (const auto& i : ids) {
       w_.line("bc_sorter s" + i + " = bc_sorter_open(cx, " + std::to_string(s.keep) + ");");
     }
-    auto guard = std::exchange(guard_, "");
     auto limit = std::exchange(limit_, "");
     std::vector<Binding> in_hand;
     produce(*s.input, [&] {
@@ -883,7 +944,6 @@ private:
         if (!looped || std::ranges::find(s.payloads, b.table) != s.payloads.end()) in_hand.push_back(b);
       }
     });
-    guard_ = guard;
     limit_ = limit;
     for (auto& b : in_hand) {
       auto at = std::ranges::find(s.payloads, b.table);
@@ -891,7 +951,7 @@ private:
     }
     w_.line("bc_view p" + ids[0] + " = bc_empty(cx);");
     for (std::size_t j = 1; j < ids.size(); ++j) w_.line("int64_t r" + ids[j] + " = 0;");
-    w_.open("while (" + guard_ + "bc_sorter_next(cx, s" + ids[0] + ", &p" + ids[0] + "))");
+    w_.open("while (" + guard() + "bc_sorter_next(cx, s" + ids[0] + ", &p" + ids[0] + "))");
     for (std::size_t j = 1; j < ids.size(); ++j) {
       w_.line("bc_view p" + ids[j] + " = bc_sorter_nth(cx, s" + ids[j] + ", r" + ids[j] + ");");
       w_.line("++r" + ids[j] + ";");
@@ -963,7 +1023,6 @@ private:
     }
     w_.line("int64_t n = 0;");
     limit_ = "n < " + std::to_string(l.n);
-    guard_ = limit_ + " && ";
     produce(*l.input, [&] {
       k();
       w_.line("++n;");
@@ -1424,18 +1483,16 @@ private:
       stream(g, k);
       return;
     }
-    auto guard = std::exchange(guard_, "");
     auto limit = std::exchange(limit_, "");
     if (!std::holds_alternative<physical::Empty>(op.input->op)) {
       w_.open("");
       produce(*op.input, [&] { fold_into_structure(g); });
       w_.close();
     }
-    guard_ = guard;
     limit_ = limit;
     const auto gk = "gk" + g.i;
     w_.line("bc_view " + gk + " = bc_empty(cx);");
-    w_.open("while (" + guard_ + "bc_agg_next(cx, a" + g.i + ", &" + gk + ", 0))");
+    w_.open("while (" + guard() + "bc_agg_next(cx, a" + g.i + ", &" + gk + ", 0))");
     in_group(g, gk, k);
     w_.close();
   }
@@ -1575,7 +1632,6 @@ private:
     const auto sorter = "s" + i;
     const auto held = "p" + i;
     w_.line("bc_sorter " + sorter + " = bc_sorter_open(cx, " + std::to_string(s.keep) + ");");
-    auto guard = std::exchange(guard_, "");
     auto limit = std::exchange(limit_, "");
     std::optional<Group> sorted;
     produce(*s.input, [&] {
@@ -1584,10 +1640,9 @@ private:
       w_.line("bc_sorter_add(cx, " + sorter + ", bc_sort_key_end(cx, sk), gk" + group_->i + ");");
       sorted = *group_;
     });
-    guard_ = guard;
     limit_ = limit;
     w_.line("bc_view " + held + " = bc_empty(cx);");
-    w_.open("while (" + guard_ + "bc_sorter_next(cx, " + sorter + ", &" + held + "))");
+    w_.open("while (" + guard() + "bc_sorter_next(cx, " + sorter + ", &" + held + "))");
     in_group(*sorted, held, k);
     w_.close();
   }
@@ -1723,13 +1778,15 @@ private:
     w_.close();
   }
 
+  // The loop condition's prefix a LIMIT makes: limit_ and " && ", or empty.
+  [[nodiscard]] auto guard() const -> std::string { return limit_.empty() ? std::string{} : limit_ + " && "; }
+
   Writer& w_;
   std::vector<std::string> no_rows_;
   std::string row_name_{"row"};  // the row a leaf reads into: "old" for a write
   std::vector<Binding> rows_;    // the rows in hand, outer first
   bool loop_{false};             // inside a loop: a miss is `continue`
   std::string limit_;            // a LIMIT's condition, n < its count, or empty
-  std::string guard_;            // the loop condition's prefix it makes: limit_ and " && ", or empty
   std::string* hit_{nullptr};    // a one-row aggregate: a miss joins this condition instead
   int choices_{0};               // the choice points printed: each counts into count<i>, over lo<i> and hi<i>
   int sorts_{0};                 // the sorts printed: each into sorter s<i>, its row p<i>
@@ -1767,11 +1824,14 @@ auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std
       },
       p.root->op);
   for (const auto& r : p.result) {
-    out.result_types.push_back(r.type);
-    if (r.quotient) out.result_types.push_back(PhysType::I64);
+    // A NUMERIC's sum and count.
+    if (r.sql.kind == SqlKind::Numeric) {
+      out.result_types.insert(out.result_types.end(), {PhysType::I64, PhysType::I64});
+    } else {
+      out.result_types.push_back(r.type);
+    }
     out.result_names.push_back(r.name);
     out.result_sql.push_back(r.sql);
-    out.result_quotient.push_back(r.quotient);
   }
   out.source = comment_line(sql) +
                comment_line("isolation: snapshot   schema: catalog v" + std::to_string(p.catalog_version)) +

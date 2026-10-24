@@ -621,6 +621,7 @@ auto type_info(SqlType t) -> TypeInfo {
     case SqlKind::Timestamp: return {1114, 8, -1};
     case SqlKind::Date: return {1082, 4, -1};
     case SqlKind::Time: return {1083, 8, -1};
+    case SqlKind::Numeric: return {1700, -1, -1};
   }
   return {25, -1, -1};
 }
@@ -638,7 +639,7 @@ auto to_text(const Value& v, SqlType t) -> std::string {
           return float_text(x, 15);
         } else if constexpr (std::is_same_v<V, Bytes>) {
           if (t.kind == SqlKind::Bytea) return bytea_text(x);
-          std::string out;  // TEXT and VARCHAR: their UTF-8 bytes
+          std::string out;  // TEXT and VARCHAR: their UTF-8 bytes; a NUMERIC: its text
           out.reserve(x.size());
           for (auto b : x) out.push_back(static_cast<char>(b));
           return out;
@@ -656,7 +657,8 @@ auto to_text(const Value& v, SqlType t) -> std::string {
             case SqlKind::Boolean:
             case SqlKind::Bytea:
             case SqlKind::Text:
-            case SqlKind::Varchar: return std::to_string(x);
+            case SqlKind::Varchar:
+            case SqlKind::Numeric: return std::to_string(x);
           }
           return std::to_string(x);
         }
@@ -679,6 +681,7 @@ auto from_text(std::string_view text, const ParamInfo& p) -> Value {
     case SqlKind::Timestamp: return timestamp_from(text);
     case SqlKind::Date: return date_from(text);
     case SqlKind::Time: return time_from(text);
+    case SqlKind::Numeric: break;  // no parameter has it: HAVING on AVG is refused
   }
   return text_bytes(text);
 }

@@ -106,7 +106,26 @@ TEST_CASE("physical: check refuses what codegen can't print", "[sql][physical]")
   CHECK(refusal(plan(emit(node(physical::NullSplitScan{scan({p(0)}, past_nulls)})))).empty());
   auto reverse = scan({p(0)}, past_nulls);
   reverse.reverse = true;
-  refused(plan(node(physical::MinFirstEntry{reverse, kId, true})), "reverse scan");
+  // Aggregates from the keys: COUNT(*) of the range, MIN and MAX of the
+  // one part after its prefix, from a forward scan past its NULLs.
+  auto call = [](logical::Expr::Fn fn, std::optional<logical::ColumnRef> arg) {
+    auto e = logical::expr(logical::Expr::Kind::Aggregate, SqlType{SqlKind::BigInt});
+    e.fn = fn;
+    if (arg) e.args.push_back(logical::column(*arg, SqlType{SqlKind::BigInt}));
+    return e;
+  };
+  const auto count = call(logical::Expr::Fn::Count, std::nullopt);
+  const auto min_id = call(logical::Expr::Fn::Min, kId);
+  const auto max_id = call(logical::Expr::Fn::Max, kId);
+  const auto counted = scan({p(0)}, {});
+  const auto forward = scan({p(0)}, past_nulls);
+  CHECK(refusal(plan(node(physical::KeyAggregates{counted, forward, kId, {count, max_id, min_id}, true}))).empty());
+  CHECK(refusal(plan(node(physical::KeyAggregates{counted, counted, std::nullopt, {count}, true}))).empty());
+  refused(plan(node(physical::KeyAggregates{counted, reverse, kId, {min_id}, true})), "reverse scan");
+  refused(plan(node(physical::KeyAggregates{counted, forward, std::nullopt, {max_id}, true})), "MIN or MAX of its part");
+  refused(plan(node(physical::KeyAggregates{counted, forward, kD, {max_id}, true})), "MIN or MAX of its part");
+  auto other_range = scan({p(0), p(1)}, past_nulls);
+  refused(plan(node(physical::KeyAggregates{counted, other_range, kId, {count, min_id}, true})), "another range");
   refused(plan(node(physical::Limit{get({p(0)}), 1})), "LIMIT not under");
   CHECK(refusal(plan(emit(node(physical::Limit{get({p(0)}), 1})))).empty());
 

@@ -29,6 +29,12 @@ bind error with the position of the type name.
 | `DATE` | `i64` | Days since 1970-01-01, in PostgreSQL's range: 4714-11-24 BC to 5874897-12-31. |
 | `TIME` | `i64` | Microseconds since midnight, in [0, 86 400 000 000]: 24:00:00 included, as in PostgreSQL. |
 
+A result has one more type no column has: `NUMERIC` of no declared
+precision (`SqlKind::Numeric`), `AVG`'s, carried in a result row as its
+text, since its digits can pass 64 bits (`planner_design.md`, *GROUP BY as
+built*). A `SUM` of a `BIGINT` or `DECIMAL` is a `DECIMAL` of no declared
+precision, its scaled `i64`.
+
 Rejected, each for a reason that is not "later": `NUMERIC` with
 no precision or with p > 18 (does not fit `i64`); `CHAR(n)` (its
 blank-padded comparison is a collation rule, and there are no collations

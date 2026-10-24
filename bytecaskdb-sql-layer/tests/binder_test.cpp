@@ -606,6 +606,16 @@ TEST_CASE("binder: GROUP BY, HAVING and the aggregates, as PostgreSQL binds them
     CHECK(std::holds_alternative<logical::Aggregate>(having.input->op));
     CHECK(having.conjuncts[3].op == ast::Compare::Op::Ge);  // a >= $4
   }
+  // A $n the WHERE types keeps its type in the HAVING, as PostgreSQL types
+  // it by its first use: an INTEGER compared with COUNT(*), a SUM or a key.
+  // A DECIMAL of scale 2 is no integer: compared with COUNT(*), refused.
+  {
+    auto b = bind_sql(cat, "SELECT a FROM g WHERE a > $1 GROUP BY a HAVING count(*) > $1 AND sum(a) < $1 AND a >= $1");
+    REQUIRE(b.params.size() == 1);
+    CHECK(sql_type_name(b.params[0].type) == "integer");
+    CHECK(rejected(cat, "SELECT a FROM g WHERE d > $1 GROUP BY a HAVING count(*) > $1").first ==
+          "parameter $1 is compared with d (numeric(6,2)) and count (bigint)");
+  }
   // An ORDER BY sorts the groups, above the Aggregate.
   CHECK(std::holds_alternative<logical::Sort>(root(bind_sql(cat, "SELECT a FROM g GROUP BY a ORDER BY a")).op));
   // A column neither grouped nor of a table its primary key groups: 42803,

@@ -94,12 +94,19 @@ struct CountRange {
   bool emits{true};  // false under LIMIT 0
 };
 
-// MIN answered from the keys: the scan's first entry, `arg` being the ASC
-// part after its prefix and its range starting past that part's NULLs.
-struct MinFirstEntry {
-  Scan scan;
-  ColumnRef arg;
-  bool emits{true};
+// Aggregates of one group of every row answered from a range's keys
+// alone, `outputs` in the select list's order: COUNT(*) the count of
+// `counted`'s range; MIN the first entry of `values`, `arg` being the ASC
+// part after its prefix and its range starting past that part's NULLs; MAX
+// its last, the first of the same range scanned in reverse. `values` is
+// `counted` but for that start, and `arg` is set where a MIN or MAX reads
+// it. Slice 1's MIN of one row is one, with a single output.
+struct KeyAggregates {
+  Scan counted;
+  Scan values;
+  std::optional<ColumnRef> arg;
+  std::vector<Expr> outputs;
+  bool emits{true};  // false under LIMIT 0
 };
 
 struct Node;
@@ -322,7 +329,7 @@ struct Delete {
 };
 
 struct Node {
-  std::variant<Empty, PointGet, Scan, NullSplitScan, CountRange, MinFirstEntry, IndexJoin, NestedLoop, HashJoin, Choice,
+  std::variant<Empty, PointGet, Scan, NullSplitScan, CountRange, KeyAggregates, IndexJoin, NestedLoop, HashJoin, Choice,
                Filter, Sort, Limit, Emit, Aggregate, GroupAggregate, GroupEmit, Insert, Update, Delete>
       op;
 };
@@ -352,14 +359,13 @@ struct Computed {
   friend auto operator==(const Computed&, const Computed&) -> bool = default;
 };
 
-// A result column as PostgreSQL names and types it. An AVG is two of the
-// plan's columns, its sum and its count, both I64, which the API divides as
-// PostgreSQL's numeric division does (`quotient`).
+// A result column as PostgreSQL names and types it. A NUMERIC, an AVG, is
+// two of the plan's columns, its sum and its count, both I64, which the API
+// divides as PostgreSQL's numeric division does.
 struct ResultColumn {
   std::string name;
   SqlType sql;
   PhysType type{PhysType::I64};
-  bool quotient{false};
 };
 
 struct Plan {
@@ -625,8 +631,8 @@ private:
     std::visit(
         [&](const auto& op) {
           using T = std::decay_t<decltype(op)>;
-          if constexpr (std::is_same_v<T, MinFirstEntry>) {
-            if (op.scan.covering) covering_.push_back(op.scan.table);
+          if constexpr (std::is_same_v<T, KeyAggregates>) {
+            if (op.arg && op.values.covering) covering_.push_back(op.values.table);
           } else if constexpr (std::is_same_v<T, IndexJoin>) {
             covering_tables(*op.outer);
           } else if constexpr (std::is_same_v<T, NestedLoop>) {
@@ -726,10 +732,28 @@ private:
             }
           } else if constexpr (std::is_same_v<T, CountRange>) {
             scan(op.scan);
-          } else if constexpr (std::is_same_v<T, MinFirstEntry>) {
-            scan(op.scan);
-            if (op.scan.reverse) broken("MIN from the first entry of a reverse scan");
-            if (op.scan.covering) read(op.arg);
+          } else if constexpr (std::is_same_v<T, KeyAggregates>) {
+            // Each output COUNT(*), or MIN or MAX of the one part `arg`.
+            auto counts = false;
+            for (const auto& o : op.outputs) {
+              if (o.kind != Expr::Kind::Aggregate || o.distinct) broken("an aggregate from the keys that is not a plain call");
+              if (o.fn == Expr::Fn::Count && o.args.empty()) {
+                counts = true;
+              } else if ((o.fn != Expr::Fn::Min && o.fn != Expr::Fn::Max) || o.args.size() != 1 || !op.arg ||
+                         o.args[0].kind != Expr::Kind::Column || o.args[0].col != *op.arg) {
+                broken("an aggregate from the keys other than COUNT(*), or MIN or MAX of its part");
+              }
+            }
+            if (op.outputs.empty()) broken("aggregates from the keys with no output");
+            if (counts) scan(op.counted);
+            if (op.arg) {
+              scan(op.values);
+              if (op.values.reverse) broken("MIN or MAX from the first entry of a reverse scan");
+              if (op.values.object != op.counted.object || op.values.prefix != op.counted.prefix) {
+                broken("MIN or MAX from another range than the one counted");
+              }
+              if (op.values.covering) read(*op.arg);
+            }
           } else if constexpr (std::is_same_v<T, IndexJoin>) {
             if (op.inner_key.empty()) broken("a join whose inner key has no part");
             for (const auto& e : op.inner_key) {
@@ -826,9 +850,9 @@ private:
           } else if constexpr (std::is_same_v<T, Filter>) {
             // A HAVING compares a key or an aggregate of the groups below.
             if (const auto* g = group_below(*op.input)) {
+              const auto columns = g->columns();
               for (const auto& c : op.conjuncts) {
                 const auto& lhs = c.args[0];
-                const auto columns = g->columns();
                 auto known = lhs.kind == Expr::Kind::Column ? std::ranges::find(columns, lhs.col) != columns.end()
                                                             : std::ranges::find(g->aggs, lhs) != g->aggs.end();
                 if (!known || c.args[1].kind != Expr::Kind::Param) broken("a HAVING that compares no key or aggregate of its groups");
@@ -854,8 +878,8 @@ private:
               // The sorter holds each group's key: the groups of a structure.
               const auto* g = group_below(*op.input);
               if (g == nullptr || g->streamed) broken("a sort of groups not over a structure of them");
+              const auto columns = g->columns();
               for (const auto& k : op.keys) {
-                const auto columns = g->columns();
                 if (std::ranges::find(columns, k.col) == columns.end()) broken("a sort of groups by a column not of them");
               }
               node(*op.input, &n);
@@ -910,6 +934,7 @@ private:
               if (!of_input(k)) broken("a GROUP BY key outside its input's tables");
               if (op.streamed && k.type != PhysType::I64 && k.type != PhysType::Bool) broken("a streamed GROUP BY key held in no local");
               read(k);
+              held_above(*op.input, k);
             }
             for (const auto& d : op.dependent) {
               if (std::ranges::find(op.keys, d) != op.keys.end()) broken("a dependent column that is a key");
@@ -925,6 +950,7 @@ private:
               if (a.kind != Expr::Kind::Aggregate) broken("an aggregate that is not an aggregate call");
               if ((a.fn != Expr::Fn::Count || a.distinct) && a.args.empty()) broken("an aggregate call with no argument");
               if (!a.args.empty() && !of_input(a.args[0].col)) broken("an aggregate's argument outside its input's tables");
+              if (!a.args.empty()) held_above(*op.input, a.args[0].col);
               reads(a);
             }
             node(*op.input, &n);

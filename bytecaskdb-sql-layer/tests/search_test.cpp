@@ -1420,3 +1420,33 @@ TEST_CASE("search: a structure's threshold counts its keys', held rows' and dist
   // (10,000 - 644) / 476 + 1 = 20 rows. The fixed amounts alone would give 34.
   CHECK(threshold(plan("SELECT a, count(DISTINCT v) FROM g WHERE k < $1 GROUP BY a")) == 20);
 }
+
+TEST_CASE("search: COUNT(*), MIN and MAX of one group are answered from the range's keys alone",
+          "[sql][search][group]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"g", {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+                             Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateIndexDdl{"g_a", "g", {{"a"}}});
+  const auto& cat = f.cat();
+  auto plan = [&](const std::string& sql) { return plan_sql(cat, sql, {{"g", 1000}}); };
+  // MAX the last entry, read as a reverse scan's first; with COUNT(*) and
+  // MIN, a count and two steps, never a loop over the range.
+  for (const auto* sql : {"SELECT max(a) FROM g WHERE a > $1", "SELECT count(*), min(a), max(a) FROM g WHERE a > $1",
+                          "SELECT max(k), min(k), count(*) FROM g WHERE k >= $1"}) {
+    INFO(sql);
+    auto g = plan(sql);
+    CHECK(has(g, "BC_SCAN_REVERSE"));
+    CHECK_FALSE(has(g, "while ("));
+  }
+  CHECK(has(plan("SELECT count(*), min(a), max(a) FROM g WHERE a > $1"), "bc_count_range"));
+  // A filter the range does not take, an aggregate other than these, a
+  // second column, a GROUP BY or a HAVING: every row is read.
+  for (const auto* sql : {"SELECT max(a) FROM g WHERE a > $1 AND v = $2", "SELECT max(a), count(v) FROM g WHERE a > $1",
+                          "SELECT max(a), sum(a) FROM g WHERE a > $1", "SELECT max(a), min(k) FROM g WHERE a > $1",
+                          "SELECT a, max(a) FROM g WHERE a > $1 GROUP BY a",
+                          "SELECT max(a) FROM g WHERE a > $1 HAVING count(*) > $2"}) {
+    INFO(sql);
+    CHECK(has(plan(sql), "while ("));
+  }
+}

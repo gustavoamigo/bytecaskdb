@@ -212,6 +212,7 @@ auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
     case SqlKind::Timestamp:
     case SqlKind::Date:
     case SqlKind::Time:
+    case SqlKind::Numeric:
       throw SqlError{"a DEFAULT for type " + sql_type_name(t) + " is not supported yet", l.pos};
   }
   bad();
@@ -229,7 +230,8 @@ constexpr auto type_class(SqlKind k) -> TypeClass {
     case SqlKind::BigInt:
     case SqlKind::Decimal:
     case SqlKind::Real:
-    case SqlKind::Double: return TypeClass::Number;
+    case SqlKind::Double:
+    case SqlKind::Numeric: return TypeClass::Number;
     case SqlKind::Timestamp:
     case SqlKind::Date:
     case SqlKind::Time: return TypeClass::Temporal;
@@ -267,7 +269,8 @@ auto exact_number(const Column& c) -> bool {
     case SqlKind::Varchar:
     case SqlKind::Timestamp:
     case SqlKind::Date:
-    case SqlKind::Time: return false;
+    case SqlKind::Time:
+    case SqlKind::Numeric: return false;  // no column has it
   }
   return false;
 }
@@ -419,6 +422,7 @@ public:
       case SqlKind::Timestamp:
       case SqlKind::Date: return {!sum, kUndefinedFunction};
       case SqlKind::Time: return {!sum, kSyntaxError};
+      case SqlKind::Numeric: return {false, kSyntaxError};  // no column has it
     }
     std::unreachable();
   }
@@ -474,7 +478,7 @@ public:
         return {std::move(agg), "sum"};
       case Fn::Min: agg.type = c->sql; return {std::move(agg), "min"};
       case Fn::Max: agg.type = c->sql; return {std::move(agg), "max"};
-      case Fn::Avg: agg.type = SqlType{SqlKind::Decimal, 0, 0, c->sql.scale}; return {std::move(agg), "avg"};
+      case Fn::Avg: agg.type = SqlType{SqlKind::Numeric, 0, 0, c->sql.scale}; return {std::move(agg), "avg"};
     }
     return {std::move(agg), ""};
   }
@@ -760,8 +764,8 @@ public:
     if (lhs->kind == ast::Expr::Kind::Column) {
       auto [t, c] = resolve(*lhs);
       auto g = grouped(*t, *c, lhs->pos);
-      use_param(rhs->param, c->type, rhs->pos, *c, t->id, Use::Compared);
-      return logical::compare(op, std::move(g), logical::param(rhs->param, c->sql));
+      auto sql = having_param(rhs->param, c->type, rhs->pos, *c, t->id);
+      return logical::compare(op, std::move(g), logical::param(rhs->param, sql));
     }
     logical::Output agg;
     const Column* arg = nullptr;
@@ -780,8 +784,28 @@ public:
       synthetic_.push_back(Column{0, agg.name, agg.expr.type, PhysType::I64, true, {}});
       as = &synthetic_.back();
     }
-    use_param(rhs->param, PhysType::I64, rhs->pos, *as, table_id, Use::Compared);
-    return logical::compare(op, std::move(agg.expr), logical::param(rhs->param, as->sql));
+    auto sql = having_param(rhs->param, PhysType::I64, rhs->pos, *as, table_id);
+    return logical::compare(op, std::move(agg.expr), logical::param(rhs->param, sql));
+  }
+
+  // A HAVING parameter is typed by its first use, as PostgreSQL types it:
+  // the WHERE is bound first, so a $n it compares already has its type, and
+  // the HAVING compares its key or aggregate with that. Where both are
+  // integers of scale 0 (SMALLINT, INTEGER, BIGINT, a DECIMAL of scale 0) the
+  // comparison is exact whatever the value, so it takes the first use's type
+  // and range check; any other pair is refused, as two uses of one $n are
+  // (use_param). Its SQL type.
+  auto having_param(std::uint32_t n, PhysType t, std::int32_t pos, const Column& as, std::uint32_t table) -> SqlType {
+    auto integral = [](SqlType s) {
+      return s.kind == SqlKind::SmallInt || s.kind == SqlKind::Integer || s.kind == SqlKind::BigInt ||
+             (s.kind == SqlKind::Decimal && s.scale == 0);
+    };
+    if (n < params_.size() && params_[n].first && params_[n].first->phys == PhysType::I64 && t == PhysType::I64 &&
+        integral(params_[n].first->col->sql) && integral(as.sql)) {
+      return params_[n].first->col->sql;
+    }
+    use_param(n, t, pos, as, table, Use::Compared);
+    return as.sql;
   }
 
   // The rows an UPDATE or DELETE writes: its table's, by its WHERE.
