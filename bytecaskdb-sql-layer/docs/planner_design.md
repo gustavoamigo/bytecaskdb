@@ -1,11 +1,9 @@
 # The planner: a logical algebra, a search, and compiled pipelines
 
-Status: **design, for review.** The first of the post-MVP designs (#487,
-*Next*). The direction was agreed with the owner on 2026-10-23
-(*Decisions*); the rest is for review before anything is built. It
-replaces the planner `frontend_design.md` describes under *The current
-planner*. The parser, the plan API and TinyCC are unchanged; the
-binder's output changes.
+Status: **design, approved (owner, 2026-10-24); not built.** The first of
+the post-MVP designs (#487, *Next*). It replaces the planner
+`frontend_design.md` describes under *The current planner*. The parser,
+the plan API and TinyCC are unchanged; the binder's output changes.
 
 ## Why
 
@@ -166,8 +164,9 @@ most two record reads whatever the range holds.
 - **Bounds that depend on `$n`** are unknown at compile time. The plan
   carries the choice instead (*Choosing at run time*).
 - **Where neither works,** for example a filter on a column no key holds,
-  a fixed selectivity applies: 1/3 for a range comparison and 1/10 for an
-  equality, constants stated here.
+  a fixed selectivity applies. It starts at System R's 1/3 for a range
+  comparison and 1/10 for an equality, and is checked on the harness with
+  the weights (*Decisions*, 9).
 
 A plan is compiled once per statement and kept until the catalog changes,
 as today. Counts read at compile time age as tables grow. That's accepted:
@@ -404,15 +403,14 @@ The owner's answers in the planner discussion (2026-10-23):
 6. One memory budget per statement, with per-row storage released per loop
    step, and an error past the budget rather than a spill.
 
-## Open questions
-
-1. **The default memory budget.** A proposal: 64 MiB per statement,
-   configurable per database.
-2. **SQLSTATE past the budget:** 54000 as proposed, or 53200
-   (`out_of_memory`).
-3. **The cost weights:** the per-row weight of a sort or hash build, and
-   the fixed selectivities. A proposal: measure them once on the harness
-   and state them here.
-4. **Recompiling when counts age.** A proposal: not until a workload shows
-   a plan going stale.
-5. **The limit on choice points per plan.** A proposal: 4.
+The owner's answers to the open questions (2026-10-24):
+7. **The default memory budget** is 64 MiB per statement, configurable per
+   database.
+8. **Past the budget, SQLSTATE 54000** (`program_limit_exceeded`): a limit
+   the layer sets, not the machine running out of memory.
+9. **The cost weights** (the per-row weight of a sort or hash build, and the
+   fixed selectivities) are measured once on the harness and stated here,
+   in the slice that adds the cost model.
+10. **No recompiling when counts age**, until a workload shows a plan going
+    stale.
+11. **At most 4 choice points per plan.**
