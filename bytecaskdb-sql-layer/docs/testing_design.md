@@ -30,7 +30,21 @@ every rule, the invariants are checked.
   time, 22021 for text that is not UTF-8. The layer reports each with its
   SQLSTATE (`sqlstate()`, the exception's `sqlstate` in Python), and
   `test_every_range_message_maps_to_its_sqlstate` produces every range
-  message, so one that maps wrongly fails there. Any other refusal counts
+  message, so one that maps wrongly fails there.
+  A binder or catalog refusal
+  carries its own SQLSTATE (`SqlError.sqlstate`, `DdlRefused`), and those
+  PostgreSQL gives the same statement (`BINDER_STATES` in `oracle.py`: 42P01,
+  42703, 42804, 42P18, 42883, 42702, 42701, 42803, 0A000, 22003, and the
+  catalog's 42P07, 42704, 42809) must agree with PostgreSQL's. The one state
+  both sides use for different things is 0A000: on a `CREATE TABLE` it is the
+  layer's own rule that a table needs a primary key, which PostgreSQL does not
+  have, and `LAYER_ONLY` in `oracle.py` classes it as a refusal, not
+  compared. A statement PostgreSQL runs that the layer refuses is 42601
+  and a refusal on both (`test_forms_the_layer_does_not_support_are_refused_without_a_sqlstate`
+  runs each on PostgreSQL to show it accepts it). A statement
+  with a repeated `$n` goes to PostgreSQL as written and untyped
+  (`run_pg_numbered`), since psycopg would send it as two parameters; so does
+  one whose `$1` no use types (42P18), which psycopg cannot express. Any other refusal counts
   as a refusal on both, whatever its message. The layer's refusals are
   `SqlError`: parse and bind errors, a DDL the catalog refuses, parameters
   of the wrong number or type; the planner's "no plan" refusal is one

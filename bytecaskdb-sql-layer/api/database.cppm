@@ -642,7 +642,7 @@ auto sqlstate(const std::exception& e) noexcept -> std::string_view {
   if (dynamic_cast<const FeatureNotSupported*>(&e) != nullptr) return "0A000";
   if (dynamic_cast<const ParamError*>(&e) != nullptr) return "08P01";
   if (const auto* x = dynamic_cast<const DdlRefused*>(&e)) return x->sqlstate();
-  if (dynamic_cast<const ast::SqlError*>(&e) != nullptr) return "42601";
+  if (const auto* x = dynamic_cast<const ast::SqlError*>(&e)) return x->sqlstate();
   if (dynamic_cast<const DdlInProgress*>(&e) != nullptr) return "40001";
   if (dynamic_cast<const DbClosed*>(&e) != nullptr) return "57P01";
   if (dynamic_cast<const std::bad_alloc*>(&e) != nullptr) return "53200";
@@ -1274,7 +1274,7 @@ auto Database::table_rows(std::string_view table) const -> Rows {
   auto lock = enter();
   auto [cat, snap] = live_->pin();
   const auto* t = cat->table(table);
-  if (t == nullptr) throw ast::SqlError("relation \"" + std::string{table} + "\" does not exist", -1);
+  if (t == nullptr) throw ast::SqlError("relation \"" + std::string{table} + "\" does not exist", -1, kUndefinedTable);
   Rows out;
   // The table's layout with its slots in column order, the order the rows
   // are read in. A column a row's bitmap has no bit for reads as NULL.

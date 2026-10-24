@@ -53,6 +53,7 @@ module;
 export module bytecask.sql.catalog;
 
 export import bytecask.sql.key_codec;
+export import bytecask.sql.sqlstate;
 export import bytecask.sql.row_codec;
 
 export namespace bytecask::sql {
@@ -110,16 +111,15 @@ private:
 // refusal; the API's sqlstate() reports it.
 class DdlRefused : public std::invalid_argument {
 public:
-  // `sqlstate` is a literal: five characters, kept for the exception's life.
-  explicit DdlRefused(const std::string& what, const char* sqlstate = "42601")
+  explicit DdlRefused(const std::string& what, SqlState sqlstate = kSyntaxError)
       : std::invalid_argument{what}, sqlstate_{sqlstate} {}
   DdlRefused(const DdlRefused&) = default;
   DdlRefused& operator=(const DdlRefused&) = default;
   ~DdlRefused() override;  // out of line: anchors the vtable (-Wweak-vtables)
-  [[nodiscard]] auto sqlstate() const noexcept -> std::string_view { return sqlstate_; }
+  [[nodiscard]] auto sqlstate() const noexcept -> std::string_view { return sqlstate_.view(); }
 
 private:
-  const char* sqlstate_;
+  SqlState sqlstate_;
 };
 
 // A DDL that found another DDL of the same catalog in progress, and so did
@@ -752,7 +752,7 @@ auto reserve_ids(std::uint64_t& next_id, std::uint32_t n) -> std::uint32_t {
 void check_column_spec(const ColumnSpec& c) {
   if (!sql_type_valid(c.sql)) throw DdlRefused("column " + c.name + " has an invalid type");
   if (!datum_fits(c.default_value, phys_type(c.sql))) {
-    throw DdlRefused("default of column " + c.name + " is not of its type", "42804");
+    throw DdlRefused("default of column " + c.name + " is not of its type", kDatatypeMismatch);
   }
 }
 
@@ -1410,39 +1410,51 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     return std::shared_ptr<const Catalog>{std::move(next)};
   };
   auto name_free = [&](const std::string& name) {
-    if (names_.contains(name)) throw DdlRefused("relation \"" + name + "\" already exists", "42P07");
+    if (names_.contains(name)) throw DdlRefused("relation \"" + name + "\" already exists", kDuplicateTable);
   };
   auto find_table = [&](const std::string& name) -> const Table& {
     const auto* t = table(name);
-    if (t == nullptr) throw DdlRefused("relation \"" + std::string{name} + "\" does not exist", "42P01");
+    if (t == nullptr) throw DdlRefused("relation \"" + std::string{name} + "\" does not exist", kUndefinedTable);
     return *t;
   };
   backfill = false;
 
   if (const auto* ct = std::get_if<CreateTableDdl>(&ddl)) {
     auto name = std::string{ct->name};
+    // PostgreSQL's order: the statement's own columns and key parts are
+    // refused before a name already taken (42701, 42703 over 42P07); a table
+    // without a key and a column of an unsupported type or default, which
+    // PostgreSQL runs, after it.
+    std::vector<std::string> names;
+    for (const auto& spec : ct->columns) {
+      auto cname = std::string{spec.name};
+      if (std::ranges::find(names, cname) != names.end()) {
+        throw DdlRefused("column \"" + cname + "\" specified more than once", kDuplicateColumn);
+      }
+      names.push_back(std::move(cname));
+    }
+    for (const auto& p : ct->pk) {
+      if (std::ranges::find(names, p) == names.end()) {
+        throw DdlRefused("primary key column \"" + p + "\" does not exist", kUndefinedColumn);
+      }
+      if (std::ranges::count(ct->pk, p) > 1) {
+        throw DdlRefused("column \"" + p + "\" appears twice in the primary key", kDuplicateColumn);
+      }
+    }
     name_free(name);
-    if (ct->columns.empty() || ct->pk.empty()) throw DdlRefused("a table needs columns and a primary key", "0A000");
+    if (ct->columns.empty() || ct->pk.empty()) throw DdlRefused("a table needs columns and a primary key", kFeatureNotSupported);
     Table t;
     t.name = name;
     std::vector<ColumnDef> defs;
     for (const auto& spec : ct->columns) {
       check_column_spec(spec);
       auto cname = std::string{spec.name};
-      if (t.column(cname) != nullptr) throw DdlRefused("column \"" + cname + "\" specified more than once", "42701");
       auto in_pk = std::ranges::any_of(ct->pk, [&](const std::string& p) { return std::string{p} == cname; });
       Column c{t.next_col_id++, cname, spec.sql, phys_type(spec.sql), spec.nullable && !in_pk, spec.default_value};
       defs.emplace_back(c.id, c.sql, c.nullable);
       t.columns.push_back(std::move(c));
     }
-    for (const auto& p : ct->pk) {
-      const auto* c = t.column(p);
-      if (c == nullptr) throw DdlRefused("primary key column \"" + std::string{p} + "\" does not exist", "42703");
-      if (std::ranges::find(t.pk_col_ids, c->id) != t.pk_col_ids.end()) {
-        throw DdlRefused("column \"" + c->name + "\" appears twice in the primary key", "42701");
-      }
-      t.pk_col_ids.push_back(c->id);
-    }
+    for (const auto& p : ct->pk) t.pk_col_ids.push_back(t.column(p)->id);
     t.layout = make_layout(defs);
     t.id = reserve_ids(next->next_id_, 2);
     t.layout_id = t.id + 1;
@@ -1463,9 +1475,9 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     ix.unique = ci->unique;
     for (const auto& c : ci->columns) {
       const auto* col = t.column(c.name);
-      if (col == nullptr) throw DdlRefused("column \"" + std::string{c.name} + "\" does not exist", "42703");
+      if (col == nullptr) throw DdlRefused("column \"" + std::string{c.name} + "\" does not exist", kUndefinedColumn);
       if (std::ranges::find(ix.parts, col->id, &IndexPart::col_id) != ix.parts.end()) {
-        throw DdlRefused("column \"" + col->name + "\" appears twice in the index", "42701");
+        throw DdlRefused("column \"" + col->name + "\" appears twice in the index", kDuplicateColumn);
       }
       ix.parts.push_back({col->id, c.desc});
     }
@@ -1503,9 +1515,9 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   if (const auto* dt = std::get_if<DropTableDdl>(&ddl)) {
     const auto* found = table(dt->name);
     if (found == nullptr) {
-      if (index(dt->name).first != nullptr) throw DdlRefused("\"" + std::string{dt->name} + "\" is an index", "42809");
+      if (index(dt->name).first != nullptr) throw DdlRefused("\"" + std::string{dt->name} + "\" is an index", kWrongObjectType);
       if (dt->if_exists) return nullptr;
-      throw DdlRefused("table \"" + std::string{dt->name} + "\" does not exist", "42P01");
+      throw DdlRefused("table \"" + std::string{dt->name} + "\" does not exist", kUndefinedTable);
     }
     const auto& t = *found;
     put_op(ops, DdlOp::Kind::Del, table_record_key(t.id));
@@ -1524,9 +1536,9 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   if (const auto* di = std::get_if<DropIndexDdl>(&ddl)) {
     auto [owner, found] = index(di->name);
     if (found == nullptr) {
-      if (table(di->name) != nullptr) throw DdlRefused("\"" + std::string{di->name} + "\" is not an index", "42809");
+      if (table(di->name) != nullptr) throw DdlRefused("\"" + std::string{di->name} + "\" is not an index", kWrongObjectType);
       if (di->if_exists) return nullptr;
-      throw DdlRefused("index \"" + std::string{di->name} + "\" does not exist", "42704");
+      throw DdlRefused("index \"" + std::string{di->name} + "\" does not exist", kUndefinedObject);
     }
     auto t = *owner;
     auto id = found->id;
@@ -1545,11 +1557,11 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   check_column_spec(ac.column);
   auto cname = std::string{ac.column.name};
   if (t.column(cname) != nullptr) {
-    throw DdlRefused("column \"" + cname + "\" of relation \"" + t.name + "\" already exists", "42701");
+    throw DdlRefused("column \"" + cname + "\" of relation \"" + t.name + "\" already exists", kDuplicateColumn);
   }
   auto has_default = !std::holds_alternative<std::monostate>(ac.column.default_value);
   if (!ac.column.nullable && !has_default) {
-    throw DdlRefused("column \"" + cname + "\" is NOT NULL and has no default for the existing rows", "23502");
+    throw DdlRefused("column \"" + cname + "\" is NOT NULL and has no default for the existing rows", kNotNullViolation);
   }
   Column c{t.next_col_id, cname, ac.column.sql, phys_type(ac.column.sql), ac.column.nullable, ac.column.default_value};
   auto old_layout = t.layout;
