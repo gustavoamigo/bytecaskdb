@@ -726,8 +726,14 @@ namespace {
 
 // Every allocation of an execute of `sql`, with $1 = 1, failed in turn:
 // BC_E_MEMORY, or the rows of a run no failure reached; bad_alloc only before
-// the plan runs. Its plan holds `structure`.
+// the plan runs. Its plan holds `structure`. Compiled only where the seam
+// is, which a sanitizer runtime defining operator new leaves out.
 void sweep_plan_allocations(Database& db, const std::string& sql, std::string_view structure) {
+#ifdef BYTECASK_NO_ALLOC_FAULTS
+  (void)db;
+  (void)sql;
+  (void)structure;
+#else
   INFO(sql);
   const auto& st = db.prepare(sql);
   const std::vector<Value> params{std::int64_t{1}};
@@ -761,6 +767,7 @@ void sweep_plan_allocations(Database& db, const std::string& sql, std::string_vi
     ++failed;
   }
   CHECK(failed > 0);
+#endif
 }
 
 // acct and owner, 12 rows each: owner.acct NULL in every fourth row, and
