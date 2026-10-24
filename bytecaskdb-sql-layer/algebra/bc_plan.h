@@ -25,16 +25,17 @@ extern "C" {
 
 typedef struct bc_ctx bc_ctx;                       /* opaque; one per executing plan */
 
-/* Handles: an index and a generation, each in its own struct type. */
-typedef struct { uint32_t i, g; } bc_view;          /* bytes the API owns */
-typedef struct { uint32_t i, g; } bc_cursor;
-typedef struct { uint32_t i, g; } bc_sorter;
-typedef struct { uint32_t i, g; } bc_hash;
-typedef struct { uint32_t i, g; } bc_hash_iter;
-typedef struct { uint32_t i, g; } bc_agg;
-typedef struct { uint32_t i, g; } bc_group;
-typedef struct { uint32_t i, g; } bc_key;           /* a key under construction */
-typedef struct { uint32_t i, g; } bc_row;           /* a row under construction */
+/* Handles: an index and a generation, each in its own struct type. The
+   generation is 64 bits: one is drawn per handle, and it never repeats. */
+typedef struct { uint32_t i; uint64_t g; } bc_view;   /* bytes the API owns */
+typedef struct { uint32_t i; uint64_t g; } bc_cursor;
+typedef struct { uint32_t i; uint64_t g; } bc_sorter;
+typedef struct { uint32_t i; uint64_t g; } bc_hash;
+typedef struct { uint32_t i; uint64_t g; } bc_hash_iter;
+typedef struct { uint32_t i; uint64_t g; } bc_agg;
+typedef struct { uint32_t i; uint64_t g; } bc_group;
+typedef struct { uint32_t i; uint64_t g; } bc_key;    /* a key under construction */
+typedef struct { uint32_t i; uint64_t g; } bc_row;    /* a row under construction */
 
 typedef void (*bc_plan_fn)(bc_ctx *);               /* every plan has this signature */
 

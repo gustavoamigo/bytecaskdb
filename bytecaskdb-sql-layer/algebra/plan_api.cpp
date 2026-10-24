@@ -84,6 +84,14 @@ static_assert(static_cast<int>(PhysType::I64) == BC_T_I64);
 static_assert(static_cast<int>(PhysType::F64) == BC_T_F64);
 static_assert(static_cast<int>(PhysType::Bool) == BC_T_BOOL);
 static_assert(static_cast<int>(PhysType::Bytes) == BC_T_BYTES);
+// A handle's generation never repeats: one is drawn per handle, and at one a
+// nanosecond 64 bits last five centuries. Step rollback reuses slots, so a
+// counter that wrapped would let a stale handle resolve to another entry.
+template <typename H>
+constexpr bool kWideGeneration = std::is_same_v<decltype(H::g), std::uint64_t>;
+static_assert(kWideGeneration<bc_view> && kWideGeneration<bc_cursor> && kWideGeneration<bc_sorter> &&
+              kWideGeneration<bc_hash> && kWideGeneration<bc_hash_iter> && kWideGeneration<bc_agg> &&
+              kWideGeneration<bc_group> && kWideGeneration<bc_key> && kWideGeneration<bc_row>);
 
 namespace {
 
@@ -101,8 +109,12 @@ constexpr std::size_t kArenaChunk = 64u << 10;
 // node its links and colour, its key and value objects, and its own block.
 // So a transaction of many small writes reaches its bound too.
 constexpr std::uint64_t kAllocBytes = 4 * sizeof(void*);
-constexpr std::uint64_t kNodeBytes =
-    4 * sizeof(void*) + sizeof(std::pair<const Bytes, std::optional<Bytes>>) + kAllocBytes;
+template <typename V>
+constexpr std::uint64_t kMapNodeBytes = 4 * sizeof(void*) + sizeof(V) + kAllocBytes;
+constexpr std::uint64_t kNodeBytes = kMapNodeBytes<std::pair<const Bytes, std::optional<Bytes>>>;
+// The engine's limit on one write plan (its CONTRACT.md): what an autocommit
+// execution's write set is held to as it grows.
+constexpr std::uint64_t kEngineBatchBytes = std::uint64_t{1} << 30;
 [[nodiscard]] constexpr auto held(std::size_t capacity) -> std::uint64_t {
   return capacity == 0 ? 0 : capacity + kAllocBytes;
 }
@@ -116,10 +128,10 @@ enum class RowKind : std::uint8_t { None, Stored, Built };
 struct ViewEntry {
   const std::byte* data;
   std::uint64_t step;    // the cursor's step when the view was made
+  std::uint64_t gen;     // the handle's generation
   std::uint32_t len;
   std::uint32_t cursor;  // kNoCursor: lives as long as its entry
   std::uint32_t table;   // the row's table; 0 unless kind is a row
-  std::uint32_t gen;     // the handle's generation
   RowKind kind;
 };
 
@@ -128,17 +140,17 @@ struct ViewEntry {
 struct KeyBuilder {
   const KeyLayout* layout;
   Bytes buf;
-  std::uint32_t gen;
+  std::uint64_t gen;
   std::size_t next_part{0};
   bool done{false};
   std::uint64_t held{0};  // what buf is charged to the statement's memory budget
 };
 
 struct RowBuilder {
-  std::uint32_t table;
-  std::uint32_t gen;
+  std::uint64_t gen;
   const RowLayout* layout;
   RowWriter writer;
+  std::uint32_t table;
   bool done{false};
   // The finished row bc_row_end's view reads, and charges to the statement's
   // memory budget. Moving a builder keeps this buffer where it is.
@@ -160,7 +172,7 @@ public:
 
   // Throws std::bad_alloc, with nothing changed: a push_back that cannot
   // grow leaves the spare it was given where it was.
-  auto copy(BytesView b) -> const std::byte* {
+  [[nodiscard]] auto copy(BytesView b) -> const std::byte* {
     if (chunks_.empty() || chunks_.back().size - used_ < b.size()) {
       if (spare_.data != nullptr && b.size() <= spare_.size) {
         chunks_.push_back(std::move(spare_));
@@ -449,7 +461,7 @@ private:
 };
 
 struct Cursor {
-  std::uint32_t gen{0};
+  std::uint64_t gen{0};
   std::uint32_t scope{kNoStep};  // its loop's step in bc_ctx::steps, while it is on an entry
   const KeyLayout* layout{nullptr};
   Bytes prefix;  // every key of this table or index starts with it
@@ -463,7 +475,6 @@ struct Cursor {
   Bytes row;      // on an index: the current entry's row, once bc_scan_row fetched it
   Bytes row_key;  // the row's key, rebuilt in place: no allocation per entry
   std::uint64_t row_step{0};  // the step `row` was fetched at; 0: none
-  std::vector<Bytes> col_keys;  // bc_col_key's keys of the current entry, dropped when it moves
   std::uint64_t held{0};  // what the buffers above are charged to the statement's memory budget
 };
 
@@ -483,7 +494,6 @@ auto cursor_bytes(const Cursor& c) -> std::uint64_t {
   std::uint64_t n = c.prefix.size() + c.lo.size() + c.hi.size() + c.key.size() + c.value.size() + c.row.size() +
                     c.row_key.size();
   if (c.entries) n += c.entries->bound_bytes();
-  for (const auto& k : c.col_keys) n += k.size();
   return n;
 }
 
@@ -651,8 +661,21 @@ struct bc_ctx {
   Arena pins;
   // The bytes the statement holds, as requested: what budget.max_bytes bounds.
   std::uint64_t mem_used{0};
+  // The write set (effects, insert claims, locks, the rows, unique prefixes
+  // and ranges written), counted at the call that adds to it, as a
+  // transaction counts what it holds: a conservative bound on its memory.
+  // Not the statement budget's: it is held to write_bound, the engine's
+  // batch limit in autocommit, the room left under the transaction's bound
+  // in one. write_limit is the bound a refusal names.
+  std::uint64_t write_used{0};
+  std::uint64_t write_bound{kEngineBatchBytes};
+  std::uint64_t write_limit{kEngineBatchBytes};
+  // What bc_ctx_begin holds an execution's write set to; a test lowers it.
+  std::uint64_t autocommit_write_bound{kEngineBatchBytes};
   // The last handle generation drawn; 0 is the empty view's, never drawn.
-  std::uint32_t serial{0};
+  // 64 bits, so it never wraps: a generation never repeats within the
+  // context's life, and a stale handle never matches a reused slot.
+  std::uint64_t serial{0};
 
   const bc_params* params{nullptr};
   bc_budget budget{};
@@ -713,7 +736,7 @@ struct bc_ctx {
   // Each group's key is held once, in `index`; `order` points at it, in
   // first-appearance order (a map node never moves).
   struct Agg {
-    std::uint32_t gen;
+    std::uint64_t gen;
     std::map<Bytes, std::uint32_t, BytesLess> index;
     std::vector<const Bytes*> order;
     std::size_t next{0};
@@ -722,7 +745,8 @@ struct bc_ctx {
   std::vector<Agg> aggs;
   // Where each part of the last key a key-part decoder read starts, so the
   // next part of the same key is found without skipping the earlier ones
-  // again. Keyed by the view handle, unique within an execution.
+  // again. Keyed by the view handle, unique within an execution; dropped
+  // when the view's slot is released, so it never outlives the view.
   struct {
     bc_view view{};
     std::uint32_t object{0};
@@ -804,15 +828,34 @@ struct bc_ctx {
 
   void release(std::uint64_t n) noexcept { mem_used -= n; }
 
-  [[nodiscard]] auto next_gen() noexcept -> std::uint32_t {
-    if (++serial == 0) serial = 1;
-    return serial;
+  // Counts n bytes into the write set: false, and BC_E_LIMIT, past its
+  // bound. Checked before the bytes are allocated wherever their size is
+  // known first.
+  [[nodiscard]] auto take_write(std::uint64_t n) -> bool {
+    if (!ok()) return false;
+    if (n > write_bound - std::min(write_used, write_bound)) {
+      fail(BC_E_LIMIT, txn != nullptr ? "the transaction's writes would pass its bound of " +
+                                            std::to_string(write_limit) + " bytes"
+                                      : "the statement's writes would pass the engine's batch limit of " +
+                                            std::to_string(write_limit) + " bytes");
+      return false;
+    }
+    write_used += n;
+    return true;
   }
+
+  // An effect's count: its buffers, the node it takes in a transaction's
+  // overlay, and its slot in `effects`, which grows at most to twice its size.
+  static auto effect_bytes(std::size_t a, std::size_t b) -> std::uint64_t {
+    return held(a) + held(b) + kNodeBytes + 2 * sizeof(Effect);
+  }
+
+  [[nodiscard]] auto next_gen() noexcept -> std::uint64_t { return ++serial; }
 
   // Appends an entry to a handle table and charges it, with what it holds:
   // nullptr, and nothing appended, past the budget.
   template <typename T>
-  auto push_charged(std::vector<T>& table, T&& e, std::uint64_t charge) -> T* {
+  [[nodiscard]] auto push_charged(std::vector<T>& table, T&& e, std::uint64_t charge) -> T* {
     table.push_back(std::move(e));
     if (!take(charge)) {
       table.pop_back();
@@ -831,7 +874,7 @@ struct bc_ctx {
   auto make_view(const std::byte* p, std::size_t len, std::uint32_t cursor = kNoCursor, std::uint64_t step = 0,
                  std::uint32_t table = 0, RowKind kind = RowKind::None) -> bc_view {
     auto gen = next_gen();
-    if (push_charged(views, ViewEntry{p, step, static_cast<std::uint32_t>(len), cursor, table, gen, kind},
+    if (push_charged(views, ViewEntry{p, step, gen, static_cast<std::uint32_t>(len), cursor, table, kind},
                      kViewEntryBytes) == nullptr) {
       return {};
     }
@@ -954,12 +997,24 @@ struct bc_ctx {
     return t;
   }
 
+  // Each adds to the write set, and past its bound adds nothing.
   void push_effect(EffectKind kind, BytesView a, BytesView b = {}) {
+    if (!take_write(effect_bytes(a.size(), b.size()))) return;
     effects.push_back({kind, Bytes(a.begin(), a.end()), Bytes(b.begin(), b.end())});
   }
   // For keys the runtime built and no longer needs: moved, not copied.
   void push_effect(EffectKind kind, Bytes&& a, BytesView b = {}) {
+    if (!take_write(effect_bytes(a.capacity(), b.size()))) return;
     effects.push_back({kind, std::move(a), Bytes(b.begin(), b.end())});
+  }
+  void push_effect(EffectKind kind, Bytes&& a, Bytes&& b) {
+    if (!take_write(effect_bytes(a.capacity(), b.capacity()))) return;
+    effects.push_back({kind, std::move(a), std::move(b)});
+  }
+  [[nodiscard]] auto push_claim(Claim c) -> bool {
+    if (!take_write(held(c.key.capacity()) + 2 * sizeof(Claim))) return false;
+    claims.push_back(std::move(c));
+    return true;
   }
 
   // Sets the constraint error: the kind in the detail's high byte, the
@@ -1007,6 +1062,7 @@ struct bc_ctx {
   // Releases what was allocated since `m`, and its charge. Allocates nothing.
   void roll_back(const Mark& m) noexcept {
     auto released = arena.roll_back(m.arena) + (views.size() - m.views) * kViewEntryBytes;
+    if ((key_parts.view.i & kPinnedView) == 0 && key_parts.view.i >= m.views) key_parts.view = {};
     views.erase(views.begin() + static_cast<std::ptrdiff_t>(m.views), views.end());
     for (auto i = m.keys; i < keys.size(); ++i) released += keys[i].held + kKeyEntryBytes;
     keys.erase(keys.begin() + static_cast<std::ptrdiff_t>(m.keys), keys.end());
@@ -1067,7 +1123,7 @@ struct bc_ctx {
     locks.clear();
     has_ref = false;  // set by the next run's verification
     key_slots.clear();
-    key_parts.view = {};  // handles repeat once the generation counter wraps
+    key_parts.view = {};  // its view's slot is released
     key_parts.at.clear();
     results.clear();
     result_pos = 0;
@@ -1077,6 +1133,8 @@ struct bc_ctx {
     arena.clear(true);  // one chunk kept for the next statement
     pins.clear(false);
     mem_used = 0;
+    write_used = 0;
+    write_bound = write_limit = autocommit_write_bound;
     reads = 0;
   }
 
@@ -1136,6 +1194,26 @@ struct bc_txn {
 
 namespace {
 void txn_abort(bc_txn* txn) noexcept;
+}  // namespace
+
+namespace {
+
+// A conservative bound on what the transaction holds, and on what it would
+// hold with the statement's effects in it, without merging them: a vector
+// grows at most to twice what it holds, each effect adds at most one node,
+// and an effect that replaces or erases others only frees.
+auto txn_holds(const bc_txn& t, std::size_t more_guards, std::size_t more_claims, std::size_t more_locks,
+               std::size_t more_written) -> std::uint64_t {
+  auto vec = [](std::size_t cap, std::size_t size, std::size_t more, std::size_t elem) -> std::uint64_t {
+    return held(std::max(cap, 2 * (size + more)) * elem);
+  };
+  return t.overlay.bytes + t.guard_bytes + t.claim_bytes + t.lock_bytes +
+         vec(t.guards.capacity(), t.guards.size(), more_guards, sizeof(Effect)) +
+         vec(t.claims.capacity(), t.claims.size(), more_claims, sizeof(Claim)) +
+         vec(t.locks.capacity(), t.locks.size(), more_locks, sizeof(Lock)) +
+         vec(t.written.capacity(), t.written.size(), more_written, sizeof(std::uint32_t));
+}
+
 }  // namespace
 
 void txn_detach(bc_txn* txn, bc_ctx* cx, bool abandoned) noexcept {
@@ -1366,7 +1444,6 @@ void leave_entry(bc_ctx* cx, Cursor& c) noexcept {
   if (c.scope != kNoStep) cx->end_steps_from(c.scope);
   ++c.step;
   c.positioned = false;
-  c.col_keys.clear();
   c.key.clear();
   c.value.clear();
   c.row.clear();
@@ -1916,6 +1993,7 @@ auto write_row(bc_ctx* cx, const Table& t, bc_view row, bool stored) -> std::opt
     cx->fail(BC_E_HANDLE, "a row of table " + t.name + " written twice in one statement");
     return false;
   }
+  if (!cx->take_write(held(pk.size()) + kMapNodeBytes<std::pair<const Bytes, bool>>)) return false;
   cx->written_rows.emplace(Bytes(pk.begin(), pk.end()), present);
   return true;
 }
@@ -1958,8 +2036,7 @@ struct Entry {
     if (!cx->charge()) return false;
     if (cx->base->contains_key({}, pk)) return true;
   }
-  cx->claims.push_back({t.id, Bytes(pk.begin(), pk.end()), std::nullopt});
-  return true;
+  return cx->push_claim({t.id, Bytes(pk.begin(), pk.end()), std::nullopt});
 }
 
 // A row a transaction's statement locks or writes, kept for the commit's
@@ -1968,6 +2045,7 @@ struct Entry {
 // no statements before it.
 void lock_row(bc_ctx* cx, BytesView pk, BytesView row) {
   if (cx->txn == nullptr || (cx->overlay != nullptr && cx->overlay->find(pk))) return;
+  if (!cx->take_write(held(pk.size()) + 2 * sizeof(Lock))) return;
   cx->locks.push_back({Bytes(pk.begin(), pk.end()), row_fingerprint(row)});
 }
 
@@ -1982,6 +2060,7 @@ void lock_row(bc_ctx* cx, BytesView pk, BytesView row) {
     cx->raise(BC_C_UNIQUE, ix.id);
     return false;
   }
+  if (!cx->take_write(held(prefix.size()) + kMapNodeBytes<std::pair<std::uint32_t, Bytes>>)) return false;
   auto in_snapshot = [&] { return holds_prefix(*cx->base, prefix); };
   // As pk_free: a claim when the snapshot holds the prefix free too.
   auto claim = true;
@@ -2002,8 +2081,7 @@ void lock_row(bc_ctx* cx, BytesView pk, BytesView row) {
     return false;
   }
   cx->push_effect(EffectKind::GuardRange, prefix, bytecask::sql::key_successor(prefix));
-  if (claim) cx->claims.push_back({ix.id, entry.key, entry.prefix_len});
-  return true;
+  return !claim || cx->push_claim({ix.id, entry.key, entry.prefix_len});
 }
 
 
@@ -2144,6 +2222,10 @@ void bc_ctx_begin_txn(bc_ctx* cx, bc_txn* txn, const bc_params* params, bc_budge
   cx->cat = cx->pinned.get();
   cx->base = &*txn->snap;
   cx->overlay = &txn->overlay;
+  // The statement's write set is held to the room the transaction has left;
+  // bc_txn_add checks the whole again before it takes the statement in.
+  cx->write_limit = txn->max_bytes;
+  cx->write_bound = txn->max_bytes - std::min(txn_holds(*txn, 0, 0, 0, 0), txn->max_bytes);
   BC_GUARD_END(cx)
 }
 
@@ -2245,6 +2327,9 @@ int64_t bc_ctx_affected(const bc_ctx* cx) { return cx->affected; }
 #ifdef BYTECASK_SQL_TESTING
 void bc_ctx_before_commit_for_testing(bc_ctx* cx, std::function<void()> hook) { cx->before_commit = std::move(hook); }
 std::uint64_t bc_ctx_held_for_testing(const bc_ctx* cx) { return cx->mem_used; }
+void bc_ctx_write_bound_for_testing(bc_ctx* cx, std::uint64_t bytes) {
+  cx->autocommit_write_bound = cx->write_bound = cx->write_limit = bytes;
+}
 #endif
 
 extern "C" {
@@ -2273,26 +2358,6 @@ bool bc_txn_repin(bc_txn* txn) {
   txn->pinned.reset();
   return true;
 }
-
-namespace {
-
-// A conservative bound on what the transaction holds, and on what it would
-// hold with the statement's effects in it, without merging them: a vector
-// grows at most to twice what it holds, each effect adds at most one node,
-// and an effect that replaces or erases others only frees.
-auto txn_holds(const bc_txn& t, std::size_t more_guards, std::size_t more_claims, std::size_t more_locks,
-               std::size_t more_written) -> std::uint64_t {
-  auto vec = [](std::size_t cap, std::size_t size, std::size_t more, std::size_t elem) -> std::uint64_t {
-    return held(std::max(cap, 2 * (size + more)) * elem);
-  };
-  return t.overlay.bytes + t.guard_bytes + t.claim_bytes + t.lock_bytes +
-         vec(t.guards.capacity(), t.guards.size(), more_guards, sizeof(Effect)) +
-         vec(t.claims.capacity(), t.claims.size(), more_claims, sizeof(Claim)) +
-         vec(t.locks.capacity(), t.locks.size(), more_locks, sizeof(Lock)) +
-         vec(t.written.capacity(), t.written.size(), more_written, sizeof(std::uint32_t));
-}
-
-}  // namespace
 
 bool bc_txn_add(bc_ctx* cx) {
   bc_txn* txn = nullptr;
@@ -3184,16 +3249,10 @@ bc_view bc_col_key(bc_ctx* cx, bc_view row, uint32_t col) {
       case PhysType::Bytes: bytecask::sql::key_put_bytes(key, v->bytes, part); break;
     }
   }
-  // A group key, not an engine key: no key ceiling. A cursor's row keeps
-  // its keys until the cursor moves, so a scan holds one entry's at a time;
-  // any other row's go in the arena with it.
-  auto [cursor, step] = cx->owner(row);
-  if (cursor == kNoCursor) return cx->arena_view(key);
-  auto& c = cx->cursors[cursor];
-  if (!cx->take(key.size())) return {};
-  c.held += key.size();
-  c.col_keys.push_back(std::move(key));
-  return cx->make_view(c.col_keys.back().data(), c.col_keys.back().size(), cursor, step);
+  // A group key, not an engine key: no key ceiling. It is the innermost
+  // step's, whichever row it was read from: an outer row's key made in an
+  // inner loop goes when that loop steps, not when the outer one does.
+  return cx->arena_view(key);
   BC_GUARD_END(cx)
   return {};
 }
@@ -3245,7 +3304,7 @@ namespace {
 class PushedBuilder {
 public:
   PushedBuilder(bc_ctx* cx, const Table& t) : cx_{cx}, i_{cx->rows.size()} {
-    cx_->rows.push_back(RowBuilder{t.id, cx->next_gen(), &t.layout, RowWriter{t.layout}, false, {}, 0});
+    cx_->rows.push_back(RowBuilder{cx->next_gen(), &t.layout, RowWriter{t.layout}, t.id, false, {}, 0});
   }
   PushedBuilder(const PushedBuilder&) = delete;
   auto operator=(const PushedBuilder&) -> PushedBuilder& = delete;
@@ -3401,7 +3460,7 @@ bc_view bc_pin(bc_ctx* cx, bc_view v) {
   if (p == nullptr) return {};
   auto gen = cx->next_gen();
   if (cx->push_charged(cx->pinned_views,
-                       ViewEntry{p, 0, static_cast<std::uint32_t>(b->size()), kNoCursor, table, gen, kind},
+                       ViewEntry{p, 0, gen, static_cast<std::uint32_t>(b->size()), kNoCursor, table, kind},
                        kViewEntryBytes) == nullptr) {
     return {};
   }
@@ -3653,6 +3712,9 @@ void bc_del_range(bc_ctx* cx, uint32_t table, bc_view lo, bc_view hi) {
     cx->fail(BC_E_HANDLE, "bc_del_range over a row of table " + t->name + " this plan already wrote");
     return;
   }
+  if (!cx->take_write(held(range->lo.size()) + held(range->hi.size()) + kMapNodeBytes<std::pair<const Bytes, Bytes>>)) {
+    return;
+  }
   cx->deleted_ranges.emplace(range->lo, range->hi);
   if (!t->indexes.empty()) {
     // Each row in the range takes its entries with it. A row inserted into
@@ -3701,7 +3763,7 @@ void bc_guard_range(bc_ctx* cx, uint32_t table_or_index, bc_view lo, bc_view hi)
   auto range = resolve_range(cx, table_or_index, lo, hi);
   if (!range) return;
   if (std::is_gteq(bytes_cmp(range->lo, range->hi))) return;  // an empty range cannot change
-  cx->effects.push_back({EffectKind::GuardRange, std::move(range->lo), std::move(range->hi)});
+  cx->push_effect(EffectKind::GuardRange, std::move(range->lo), std::move(range->hi));
   BC_GUARD_END(cx)
 }
 

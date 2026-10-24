@@ -62,6 +62,9 @@ struct bc_params {
 void bc_ctx_before_commit_for_testing(bc_ctx* cx, std::function<void()> hook);
 // Test only: the bytes the context's statement is charged now.
 std::uint64_t bc_ctx_held_for_testing(const bc_ctx* cx);
+// Test only: what the context's autocommit executions hold their write set
+// to, in place of the engine's 1 GiB batch limit, from now on.
+void bc_ctx_write_bound_for_testing(bc_ctx* cx, std::uint64_t bytes);
 #endif
 
 }  // extern "C++"
@@ -73,6 +76,7 @@ export using ::bc_ctx_affected;
 #ifdef BYTECASK_SQL_TESTING
 export using ::bc_ctx_before_commit_for_testing;
 export using ::bc_ctx_held_for_testing;
+export using ::bc_ctx_write_bound_for_testing;
 #endif
 
 export namespace bytecask::sql {

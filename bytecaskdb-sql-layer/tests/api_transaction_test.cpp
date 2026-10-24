@@ -159,6 +159,35 @@ TEST_CASE("embedded API: a transaction past its buffer bound is BC_E_LIMIT and a
   CHECK(balance(*db, 0) == std::nullopt);
 }
 
+TEST_CASE("embedded API: a transaction statement whose write set passes the transaction's bound is 54000 at the "
+          "statement",
+          "[sql][api][txn][memory]") {
+  sql_test::TempDir dir{"api_txn_ws"};
+  auto db = open_db(dir);
+  for (std::int64_t i = 1; i <= 200; ++i) db->execute("INSERT INTO acct VALUES ($1, $2)", {i, i});
+  auto t = db->begin({.max_bytes = 16u << 10});
+  t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1000}, std::int64_t{1}});
+  // One UPDATE of 200 rows: its write set passes 16 KiB as it grows, and the
+  // statement fails there, the transaction with it.
+  try {
+    (void)t.execute("UPDATE acct SET bal = bal + 1 WHERE id >= $1", {std::int64_t{1}});
+    FAIL("the statement passed the transaction's bound");
+  } catch (const ExecError& e) {
+    CHECK(e.code() == BC_E_LIMIT);
+    CHECK(sqlstate(e) == std::string_view{"54000"});
+  }
+  CHECK(t.is_aborted());
+  CHECK(t.commit() == CommitOutcome::RolledBack);
+  CHECK(balance(*db, 1000) == std::nullopt);
+  CHECK(balance(*db, 1) == 1);
+  CHECK(balance(*db, 200) == 200);
+  // Ten rows fit.
+  auto u = db->begin({.max_bytes = 16u << 10});
+  u.execute("UPDATE acct SET bal = bal + 1 WHERE id >= $1", {std::int64_t{191}});
+  CHECK(u.commit() == CommitOutcome::Committed);
+  CHECK(balance(*db, 200) == 201);
+}
+
 TEST_CASE("embedded API: a statement over its memory budget is 54000 and leaves nothing behind, alone or in a transaction",
           "[sql][api][txn][memory]") {
   CHECK_THROWS_AS(Database::open(sql_test::TempDir{"api_mem0"}.path(), {.statement_memory_bytes = 0}),
@@ -238,6 +267,8 @@ TEST_CASE("embedded API: a bulk UPDATE of 1M rows of 100 bytes runs in the defau
     CHECK(row_bytes <= 110);
   }
   // Each built row goes when its step ends: 1M of them, 100 MB, pass 64 MiB.
+  // The write set they join is held to the engine's 1 GiB batch limit
+  // instead, and is within it.
   auto r = db->execute("UPDATE wide SET n = n + 1 WHERE id >= $1", {std::int64_t{0}});
   CHECK(r.affected == kRows);
   for (std::int64_t id : {std::int64_t{0}, kRows / 2, kRows - 1}) {

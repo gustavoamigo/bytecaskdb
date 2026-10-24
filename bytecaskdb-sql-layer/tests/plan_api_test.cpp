@@ -712,3 +712,153 @@ TEST_CASE("plan API: an aggregate group is charged its key and the aggregate's o
   // Finding the group again charges nothing.
   CHECK(bc_ctx_affected(f.cx) == static_cast<std::int64_t>(kIntGroupKey + kGroupEntryBytes));
 }
+
+namespace {
+// Every row of t, its qty plus one: a write set that grows with the table.
+void bump_all(bc_ctx* cx) {
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  int64_t n = 0;
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    bc_row r = bc_row_from(cx, kTbl, row);
+    bc_row_set_i64(cx, r, kQtyCol, bc_add(cx, bc_col_i64(cx, row, kQtyCol), 1));
+    bc_update(cx, kTbl, row, bc_row_end(cx, r));
+    n = bc_add(cx, n, 1);
+  }
+  bc_emit_count(cx, n);
+}
+
+auto qty_of(Fixture& f, std::int64_t id) -> std::int64_t {
+  Bytes k, row;
+  bytecask::sql::key_put_prefix(k, bytecask::sql::kNsRow, kTbl);
+  bytecask::sql::key_put_i64(k, id, {PhysType::I64});
+  REQUIRE(f.db->get({}, k, row));
+  auto cols = bytecask::sql::decode_row(f.cat().table(kTbl)->layout, row);
+  REQUIRE(cols);
+  return std::get<std::int64_t>((*cols)[kQtyCol]);
+}
+}  // namespace
+
+TEST_CASE("plan API: an autocommit write set past the engine's batch limit is BC_E_LIMIT at the call that passes it",
+          "[sql][algebra][memory]") {
+  Fixture f;
+  constexpr std::int64_t kRows = 200;
+  for (std::int64_t id = 1; id <= kRows; ++id) {
+    REQUIRE(run(f, insert_plan_ok, {id, bytes("name"), id}) == BC_COMMITTED);
+  }
+  // The write set is not the statement budget's: 200 updates hold far more
+  // than 16 KiB, and each row built goes with its step.
+  CHECK(run(f, bump_all, {}, memory_budget(16u << 10)) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == kRows);
+  CHECK(qty_of(f, 1) == 2);
+  // The batch limit, lowered to 16 KiB: the update that passes it fails the
+  // statement, whatever its budget, and nothing is committed.
+  bc_ctx_write_bound_for_testing(f.cx, 16u << 10);
+  CHECK(run(f, bump_all, {}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LIMIT);
+  CHECK(std::string{bc_error_message(f.cx)}.find("batch limit of 16384 bytes") != std::string::npos);
+  CHECK(bc_ctx_affected(f.cx) == -1);
+  CHECK(qty_of(f, 1) == 2);
+  CHECK(qty_of(f, kRows) == kRows + 1);
+  // Under it, the same update commits.
+  bc_ctx_write_bound_for_testing(f.cx, 1u << 20);
+  CHECK(run(f, bump_all, {}) == BC_COMMITTED);
+  CHECK(qty_of(f, kRows) == kRows + 2);
+}
+
+TEST_CASE("plan API: a transaction statement's write set past the room left in its bound fails at the call",
+          "[sql][algebra][memory][txn]") {
+  Fixture f;
+  constexpr std::int64_t kRows = 200;
+  for (std::int64_t id = 1; id <= kRows; ++id) {
+    REQUIRE(run(f, insert_plan_ok, {id, bytes("name"), id}) == BC_COMMITTED);
+  }
+  bc_ctx_reset(f.cx);
+  auto* txn = bc_txn_new(&f.bdb, &f.bcat, 16u << 10);
+  REQUIRE(txn != nullptr);
+  auto ps = params({});
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+  auto ref = sr.get();
+  bc_ctx_begin_txn(f.cx, txn, &ps, {});
+  bc_ctx_run(f.cx, bump_all, &ref);
+  // The plan stopped at the update that passed it, before bc_txn_add.
+  CHECK(bc_error(f.cx) == BC_E_LIMIT);
+  CHECK(std::string{bc_error_message(f.cx)}.find("transaction's writes would pass its bound of 16384") !=
+        std::string::npos);
+  CHECK_FALSE(bc_txn_add(f.cx));
+  bc_ctx_reset(f.cx);
+  CHECK(bc_txn_commit(txn, false) == BC_FAILED);  // aborted: nothing to commit
+  bc_txn_free(txn);
+  CHECK(qty_of(f, 1) == 1);
+  CHECK(qty_of(f, kRows) == kRows);
+}
+
+namespace {
+// A loop left after one step, its cursor closed right after it, as codegen
+// emits for MIN and LIMIT; a view made after it, outside every loop, read
+// after another loop has run. With `close` false the cursor is left on its
+// entry, and the view is that step's.
+template <bool close>
+void early_exit(bc_ctx* cx) {
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  int64_t first = 0;
+  if (bc_scan_next(cx, c)) first = bc_col_i64(cx, bc_scan_row(cx, c), kIdCol);
+  if (close) bc_scan_close(cx, c);
+  bc_view after = bc_key_params(cx, kTbl, 0, 1);
+  bc_cursor d = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, d)) {
+  }
+  if (!close) bc_scan_close(cx, c);
+  bool found = false;
+  (void)bc_get(cx, after, &found);
+  bc_emit_count(cx, found ? first : -1);
+}
+}  // namespace
+
+TEST_CASE("plan API: a view made after a loop left early and closed stays valid", "[sql][algebra][memory]") {
+  Fixture f;
+  for (std::int64_t id = 1; id <= 5; ++id) {
+    REQUIRE(run(f, insert_plan_ok, {id, bytes("name"), id}) == BC_COMMITTED);
+  }
+  CHECK(run(f, early_exit<true>, {std::int64_t{3}}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == 1);
+  // Left on its entry, the cursor's step is still open: the view made after
+  // the loop is that step's, and goes when the cursor closes.
+  CHECK(run(f, early_exit<false>, {std::int64_t{3}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+}
+
+namespace {
+// For the first outer row, an inner scan that reads the outer row's group
+// key at every step: what the statement held at each inner step.
+void outer_key_in_inner_loop(bc_ctx* cx) {
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  int64_t n = 0;
+  if (bc_scan_next(cx, c)) {
+    bc_view outer = bc_scan_row(cx, c);
+    bc_cursor ic = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+    while (bc_scan_next(cx, ic)) {
+      held_at_step.push_back(bc_ctx_held_for_testing(cx));
+      if (bc_bytes_eq(cx, bc_col_key(cx, outer, kQtyCol), bc_col_key(cx, bc_scan_row(cx, ic), kQtyCol))) {
+        n = bc_add(cx, n, 1);
+      }
+    }
+  }
+  bc_scan_close(cx, c);
+  bc_emit_count(cx, n);
+}
+}  // namespace
+
+TEST_CASE("plan API: an outer row's key read in an inner loop is the inner step's", "[sql][algebra][memory]") {
+  Fixture f;
+  constexpr std::int64_t kRows = 500;
+  for (std::int64_t id = 1; id <= kRows; ++id) {
+    REQUIRE(run(f, insert_plan_ok, {id, bytes("name"), id % 2}) == BC_COMMITTED);
+  }
+  held_at_step.clear();
+  CHECK(run(f, outer_key_in_inner_loop, {}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == kRows / 2);
+  REQUIRE(held_at_step.size() == kRows);
+  // Each inner step's keys, the outer row's included, went at the next step.
+  CHECK(std::ranges::all_of(held_at_step, [&](auto h) { return h == held_at_step.front(); }));
+}
