@@ -1540,29 +1540,112 @@ def test_column_plus_parameter_at_the_edges(dsn):
         m.teardown()
 
 
+def binder_machine(dsn) -> SqlMachine:
+    """A machine with one table of every type a binder fault needs, and a row."""
+    m = fixed(dsn)
+    m.create(Table("t0", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.TEXT), Column("c2", o.DOUBLE),
+                          Column("c3", o.BOOLEAN), Column("c4", o.BYTEA), Column("c5", o.numeric(6, 2)),
+                          Column("c6", o.BIGINT)], ["c0"]))
+    m.create(Table("t1", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.TEXT)], ["c0"]))
+    m.insert("t0", {"c0": 1, "c1": "a", "c2": 1.5, "c3": True, "c4": b"x", "c5": decimal.Decimal("1.50"), "c6": 7},
+             all_columns=True)
+    return m
+
+
 def test_binder_refusals_carry_postgresqls_sqlstate(dsn):
-    """A statement the binder refuses for a fault PostgreSQL also names gets
-    PostgreSQL's SQLSTATE (#548). 42P18 needs a protocol-level parameter, so
-    the unit and wire tests cover it."""
+    """A statement the binder refuses for a fault PostgreSQL also refuses gets
+    PostgreSQL's SQLSTATE (#548). PostgreSQL gets each statement with its $n as
+    written and untyped (run_pg_numbered), as the layer reads it: psycopg
+    would send a repeated $1 as two parameters."""
+    m = binder_machine(dsn)
+    try:
+        for sql, params, state in (
+            ("SELECT c0 FROM nope WHERE c0 = $1", (1,), "42P01"),
+            ("SELECT c0 FROM t0 WHERE t9.c0 = $1", (1,), "42P01"),
+            ("SELECT zz FROM t0 WHERE c0 = $1", (1,), "42703"),
+            ("UPDATE t0 SET zz = $1 WHERE c0 = $2", (1, 2), "42703"),
+            ("SELECT c1 FROM t0, t1 WHERE t0.c0 = $1 AND t1.c0 = $2", (1, 2), "42702"),
+            ("INSERT INTO t0 (c0, c0) VALUES ($1, $2)", (1, 2), "42701"),
+            ("SELECT c1, count(*) FROM t0 WHERE c0 = $1", (1,), "42803"),
+            ("UPDATE t0 SET c1 = count(*) WHERE c0 = $1", (1,), "42803"),
+            # No aggregate of that type: 42883.
+            ("SELECT sum(c1) FROM t0 WHERE c0 = $1", (1,), "42883"),
+            ("SELECT sum(c3) FROM t0 WHERE c0 = $1", (1,), "42883"),
+            ("SELECT min(c4) FROM t0 WHERE c0 = $1", (1,), "42883"),
+            # A $n compared with two columns no operator relates: 42883.
+            ("SELECT c0 FROM t0 WHERE c1 = $1 AND c0 = $1", ("a",), "42883"),
+            ("SELECT c0 FROM t0 WHERE c0 = $1 AND c1 = $1", (1,), "42883"),
+            ("SELECT c0 FROM t0 WHERE c3 = $1 AND c0 = $1", (True,), "42883"),
+            ("SELECT c0 FROM t0 WHERE c2 = $1 AND c3 = $1", (1.5,), "42883"),
+            # A column assigned from a column of a type that has no assignment cast to it: 42804.
+            ("UPDATE t0 SET c6 = c1 WHERE c0 = $1", (1,), "42804"),
+            ("UPDATE t0 SET c6 = c3 WHERE c0 = $1", (1,), "42804"),
+            ("UPDATE t0 SET c3 = c6 WHERE c0 = $1", (1,), "42804"),
+            ("UPDATE t0 SET c2 = c3 WHERE c0 = $1", (1,), "42804"),
+            ("UPDATE t0 SET c4 = c6 WHERE c0 = $1", (1,), "42804"),
+            # 0A000 and 22003.
+            ("SELECT sum(c6) FROM t0 WHERE c0 = $1 FOR UPDATE", (1,), "0A000"),
+            ("UPDATE t0 SET c5 = c5 + 100000000000000000 WHERE c0 = $1", (1,), "22003"),
+        ):
+            layer = o.run_layer(m.db, sql, params)
+            pg = o.run_pg_numbered(m.pg.conn, sql, params)
+            assert layer.error == pg.error == state, (sql, layer, pg)
+        # 42P18, in the same loop: $1 has no use to type it.
+        sql = "SELECT c0 FROM t0 WHERE c0 = $2"
+        layer = o.run_layer(m.db, sql, (1, 1))
+        pg = o.run_pg_numbered(m.pg.conn, sql, (1, 1))
+        assert layer.error == pg.error == "42P18", (sql, layer, pg)
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_forms_the_layer_does_not_support_are_refused_without_a_sqlstate(dsn):
+    """A statement PostgreSQL runs, which the layer refuses as a form it does not
+    support, is 42601: the layer claims PostgreSQL's code only where
+    PostgreSQL refuses the statement with it. No row matches a WHERE here, so
+    PostgreSQL's run leaves the two sides alike."""
+    m = binder_machine(dsn)
+    try:
+        for sql, params in (
+            ("UPDATE t0 SET c2 = c6 WHERE c0 = $1", (99,)),  # bigint to double precision
+            ("UPDATE t0 SET c6 = c2 WHERE c0 = $1", (99,)),
+            ("UPDATE t0 SET c1 = c6 WHERE c0 = $1", (99,)),  # any type to text
+            ("UPDATE t0 SET c1 = c3 WHERE c0 = $1", (99,)),
+            ("SELECT c0 FROM t0 WHERE c5 = $1 AND c2 = $1", (1,)),  # numeric and double precision
+            ("SELECT c0 FROM t0 WHERE c2 = $1 AND c6 = $1", (1.5,)),
+            ("UPDATE t0 SET c1 = $1 WHERE c6 = $1 AND c0 = $2", (1, 99)),  # PostgreSQL types the WHERE's $1 first
+            ("UPDATE t0 SET c6 = c6 + $1 WHERE c0 = $2 AND c2 = $1", (1, 99)),
+            ("SELECT sum(c2) FROM t0 WHERE c0 = $1", (1,)),
+            ("SELECT min(c2) FROM t0 WHERE c0 = $1", (1,)),
+            ("SELECT min(c1) FROM t0 WHERE c0 = $1", (1,)),
+        ):
+            layer = o.run_layer(m.db, sql, params)
+            pg = o.run_pg_numbered(m.pg.conn, sql, params)
+            assert pg.error is None, (sql, pg)
+            assert layer.error == "refused" and layer.sqlstate == "42601", (sql, layer)
+        # PostgreSQL refuses an untyped $1 assigned to two columns of different types
+        # (42P08, not 42804): the layer does not claim a code for it either.
+        sql = "UPDATE t0 SET c2 = $1, c6 = $1 WHERE c0 = $2"
+        layer = o.run_layer(m.db, sql, (2.0, 99))
+        pg = o.run_pg_numbered(m.pg.conn, sql, (2.0, 99))
+        assert layer.sqlstate == "42601" and pg.sqlstate == "42P08", (sql, layer, pg)
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_create_table_of_an_existing_name_refuses_in_postgresqls_order(dsn):
+    """A repeated column or a missing key column is refused before an existing
+    name, as PostgreSQL does. (A table without a key, or with a column of an
+    unsupported type or default, never reaches the catalog: the binder refuses
+    it first, 42601, where PostgreSQL says 42P07. The catalog's own order for
+    those is its unit test's.)"""
     m = fixed(dsn)
     try:
-        m.create(Table("t0", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.TEXT)], ["c0"]))
-        m.create(Table("t1", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.TEXT)], ["c0"]))
-        for sql, state in (
-            ("SELECT c0 FROM nope WHERE c0 = $1", "42P01"),
-            ("SELECT c0 FROM t0 WHERE t9.c0 = $1", "42P01"),
-            ("SELECT zz FROM t0 WHERE c0 = $1", "42703"),
-            ("UPDATE t0 SET zz = $1 WHERE c0 = $2", "42703"),
-            ("SELECT c1 FROM t0, t1 WHERE t0.c0 = $1 AND t1.c0 = $2", "42702"),
-            ("INSERT INTO t0 (c0, c0) VALUES ($1, $2)", "42701"),
-            ("SELECT sum(c1) FROM t0 WHERE c0 = $1", "42883"),
-            ("SELECT c1, count(*) FROM t0 WHERE c0 = $1", "42803"),
-            ("UPDATE t0 SET c1 = count(*) WHERE c0 = $1", "42803"),
-        ):
-            params = (1, 2) if "$2" in sql else (1,)
-            layer = o.run_layer(m.db, sql, params)
-            pg = o.run_pg(m.pg.conn, sql, params)
-            assert layer.error == pg.error == state, (sql, layer, pg)
+        m.create(Table("t0", [Column("c0", o.BIGINT, nullable=False)], ["c0"]))
+        assert m.create(Table("t0", [Column("c0", o.BIGINT), Column("c0", o.TEXT)], ["c0"])).error == "42701"
+        assert m.create(Table("t0", [Column("c0", o.BIGINT)], ["zz"])).error == "42703"
         m.check()
     finally:
         m.teardown()

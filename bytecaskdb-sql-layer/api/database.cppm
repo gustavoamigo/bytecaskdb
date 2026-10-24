@@ -1182,7 +1182,7 @@ auto Database::table_rows(std::string_view table) const -> Rows {
   auto lock = enter();
   auto [cat, snap] = live_->pin();
   const auto* t = cat->table(table);
-  if (t == nullptr) throw ast::SqlError("relation \"" + std::string{table} + "\" does not exist", -1, "42P01");
+  if (t == nullptr) throw ast::SqlError("relation \"" + std::string{table} + "\" does not exist", -1, kUndefinedTable);
   Rows out;
   // The table's layout with its slots in column order, the order the rows
   // are read in. A column a row's bitmap has no bit for reads as NULL.

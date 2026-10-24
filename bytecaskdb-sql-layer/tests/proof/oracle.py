@@ -37,16 +37,30 @@ ABORTED = "25P02"
 
 # The SQLSTATEs of the binder's and the catalog's refusals that PostgreSQL
 # gives the same statement (SqlError.sqlstate): a statement both refuse must
-# be refused with the same one. Any other refusal is "refused": a form the
-# layer does not support yet (42601, 0A000), which PostgreSQL may well run.
+# be refused with the same one. The layer claims one only where PostgreSQL
+# refuses the statement with it; a form the layer does not support, which
+# PostgreSQL may well run, is 42601, and any other state is "refused".
 BINDER_STATES = frozenset(
-    {"42P01", "42P07", "42703", "42704", "42804", "42P18", "42883", "42702", "42701", "42803", "42809"}
+    {
+        "42P01", "42P07", "42703", "42704", "42804", "42P18", "42883", "42702", "42701", "42803", "42809",
+        "0A000",  # FOR UPDATE with an aggregate; but see LAYER_ONLY
+        "22003",  # a literal operand past DECIMAL's digits, as a stored value past its column
+    }
 )
 
+# 0A000 is also the layer's own rule that a table needs a PRIMARY KEY, which
+# PostgreSQL does not have. The state alone cannot tell the two apart, so the
+# statement does: a CREATE TABLE refused with 0A000 is the layer's rule, kind
+# "refused", never compared.
+LAYER_ONLY = (("0A000", "CREATE TABLE"),)
 
-def error_kind(state: str) -> str:
-    """The comparable kind of a refusal with this SQLSTATE: the SQLSTATE where
-    both sides name it, "refused" for any other."""
+
+def error_kind(state: str, sql: str) -> str:
+    """The comparable kind of a refusal of `sql` with this SQLSTATE: the
+    SQLSTATE where both sides name it, "refused" for any other and for a
+    LAYER_ONLY one."""
+    if any(state == s and sql.lstrip().upper().startswith(prefix) for s, prefix in LAYER_ONLY):
+        return "refused"
     known = state in SQLSTATE.values() or state in RANGE_STATES or state in BINDER_STATES or state == ABORTED
     return state if known else "refused"
 
@@ -242,7 +256,7 @@ def run_layer(db, sql: str, params=()) -> Outcome:
             raise
         return Outcome(error=layer_sqlstate(e), detail=str(e), sqlstate=e.sqlstate)
     except bytecask_sql.SqlError as e:
-        return Outcome(error=error_kind(e.sqlstate), detail=str(e), sqlstate=e.sqlstate)
+        return Outcome(error=error_kind(e.sqlstate, sql), detail=str(e), sqlstate=e.sqlstate)
     return Outcome(rows=tuple(r["rows"]), affected=r["affected"] if changes_rows(sql) else None)
 
 
@@ -273,9 +287,22 @@ def run_psycopg(conn, text: str, values, sql: str) -> Outcome:
         if not e.sqlstate:
             raise  # no SQLSTATE: not the server refusing the statement
         state = e.sqlstate
-        return Outcome(error=error_kind(state), detail=f"{state} {e}", sqlstate=state)
+        return Outcome(error=error_kind(state, sql), detail=f"{state} {e}", sqlstate=state)
     return Outcome(rows=tuple(tuple(from_pg(v, oid) for v, oid in zip(row, oids)) for row in rows), affected=affected,
                    text=raw)
+
+
+def run_pg_numbered(conn, sql: str, params=()) -> Outcome:
+    """A statement on PostgreSQL with its $n as written, every parameter
+    untyped. psycopg numbers a placeholder by its position, so run_pg cannot
+    send a statement whose $1 no use gives a type (42P18)."""
+    import psycopg
+
+    res = conn.pgconn.exec_params(sql.encode(), [None if v is None else str(v).encode() for v in params])
+    if res.status == psycopg.pq.ExecStatus.FATAL_ERROR:
+        state = res.error_field(psycopg.pq.DiagnosticField.SQLSTATE).decode()
+        return Outcome(error=error_kind(state, sql), detail=f"{state} {res.error_message.decode()}", sqlstate=state)
+    return Outcome(rows=(), affected=None)
 
 
 def run_pg(conn, sql: str, params=()) -> Outcome:

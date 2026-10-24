@@ -498,26 +498,37 @@ PostgreSQL also checks the server's mapping. The mapping:
 | anything else | `XX000` |
 
 `SqlError` carries its SQLSTATE the way `DdlRefused` does, set where it is
-thrown. The binder gives PostgreSQL's code for what PostgreSQL also refuses:
+thrown. Both take it from one flat set of constants (`sql/sqlstate.cppm`),
+so a throw site cannot name a code that is not in it. The layer claims
+PostgreSQL's code only for a statement PostgreSQL also refuses with it:
 
 | Fault | SQLSTATE |
 |---|---|
 | unknown table, or a qualifier naming no table of the statement | `42P01` |
 | unknown column | `42703` |
-| a column assigned from a column of another type; a `$n` assigned to a column after it was typed by another type | `42804` |
-| a `$n` compared with or added to a column after it was typed by another type; `SUM` or `MIN` of a type PostgreSQL has no such aggregate for | `42883` |
+| a column assigned from a column of a type PostgreSQL has no assignment cast from (a number to or from a boolean, a string to a number, ...) | `42804` |
+| one `$n` compared with two columns no operator relates (a string and a number, a boolean and anything else, ...) | `42883` |
+| `SUM` or `MIN` of a type PostgreSQL has no such aggregate for | `42883` |
 | a `$n` no use gives a type | `42P18` |
 | a column reference both joined tables have | `42702` |
 | a column listed twice in an `INSERT` | `42701` |
 | an aggregate beside a bare column or in `ORDER BY`, or in an `UPDATE` | `42803` |
 | `FOR UPDATE` with an aggregate | `0A000` |
-| an operand that overflows a `DECIMAL` | `22003` |
+| an operand that overflows a `DECIMAL` (PostgreSQL raises it when a row is updated; the layer, before the plan runs) | `22003` |
 
 Every other `SqlError` is `42601`: a syntax error, and a form the layer
-does not support where PostgreSQL would run the statement (a `$n` used
-with two SQL types of one physical type, a join on columns of two types, an
-unsupported `DEFAULT` or type). The planner's "no plan" refusals are among
-them (#541). HammerDB's driver sends no statement that fails to bind.
+does not support where PostgreSQL would run the statement. Those include a
+column assigned from a number of another width or any type into a string
+(`SET dbl = bigint_col`, `SET text_col = int_col`), a number compared with
+another number of a different physical type (`d = $1 AND dbl = $1`), `SUM` of a
+`REAL`, `DOUBLE PRECISION` or `TIME` column, `MIN` of a `REAL`, `DOUBLE PRECISION`
+or string column, a join on columns of two types, and an unsupported
+`DEFAULT` or type. So are a `$n` used with two types when either use
+assigns it: PostgreSQL types a `$n` by its first use, which for `UPDATE` is
+its `WHERE` before the `SET` the layer binds first, and refuses an untyped `$n`
+assigned to two columns of different types with `42P08` whatever the types.
+The planner's "no plan" refusals are among them (#541). HammerDB's driver sends
+no statement that fails to bind.
 
 ## API changes
 

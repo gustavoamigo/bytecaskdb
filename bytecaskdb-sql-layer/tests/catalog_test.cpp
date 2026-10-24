@@ -497,6 +497,32 @@ TEST_CASE("catalog: refused DDL writes nothing", "[sql][catalog]") {
   CHECK(again.current()->next_object_id() == before->next_object_id());
 }
 
+TEST_CASE("catalog: CREATE TABLE refuses in PostgreSQL's order", "[sql][catalog][sqlstate]") {
+  sql_test::TempDir dir{"catalog_create_order"};
+  auto db = DB::open(dir.path());
+  LiveCatalog live{db};
+  (void)live.apply(create_t());
+  auto state = [&](const CreateTableDdl& ddl) -> std::string {
+    try {
+      (void)live.apply(ddl);
+    } catch (const DdlRefused& e) {
+      return std::string{e.sqlstate()};
+    }
+    return "created";
+  };
+  // PostgreSQL's code for an existing name, with a column list it accepts.
+  CHECK(state({"t", {col("c", SqlKind::BigInt)}, {"c"}}) == "42P07");
+  CHECK(state({"t", {col("c", SqlKind::BigInt)}, {}}) == "42P07");                          // no key
+  CHECK(state({"t", {col("c", SqlKind::BigInt, true, 1.5)}, {"c"}}) == "42P07");            // a default not of its type
+  // Its own columns and key, which PostgreSQL checks first.
+  CHECK(state({"t", {col("c", SqlKind::BigInt), col("c", SqlKind::BigInt)}, {"c"}}) == "42701");
+  CHECK(state({"t", {col("c", SqlKind::BigInt)}, {"zz"}}) == "42703");
+  CHECK(state({"t", {col("c", SqlKind::BigInt)}, {"c", "c"}}) == "42701");
+  // A new name: the layer's own rules, which PostgreSQL does not have.
+  CHECK(state({"u", {col("c", SqlKind::BigInt)}, {}}) == "0A000");
+  CHECK(state({"u", {col("c", SqlKind::BigInt, true, 1.5)}, {"c"}}) == "42804");
+}
+
 TEST_CASE("catalog: a DDL the engine refuses leaves nothing on disk or in memory", "[sql][catalog]") {
   sql_test::TempDir dir{"catalog_inject"};
   {

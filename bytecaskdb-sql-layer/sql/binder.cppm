@@ -310,6 +310,41 @@ auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
   bad();
 }
 
+// The groups PostgreSQL's casts and operators sort the types into. Numbers
+// compare with and assign to each other; a string takes a value of any type
+// on assignment; no other pair meets.
+enum class TypeClass { Number, Temporal, Boolean, String, Bytea };
+
+constexpr auto type_class(SqlKind k) -> TypeClass {
+  switch (k) {
+    case SqlKind::SmallInt:
+    case SqlKind::Integer:
+    case SqlKind::BigInt:
+    case SqlKind::Decimal:
+    case SqlKind::Real:
+    case SqlKind::Double: return TypeClass::Number;
+    case SqlKind::Timestamp:
+    case SqlKind::Date:
+    case SqlKind::Time: return TypeClass::Temporal;
+    case SqlKind::Boolean: return TypeClass::Boolean;
+    case SqlKind::Text:
+    case SqlKind::Varchar: return TypeClass::String;
+    case SqlKind::Bytea: return TypeClass::Bytea;
+  }
+  std::unreachable();
+}
+
+// The SQLSTATE PostgreSQL refuses a value of type `from` meeting a column of
+// type `to` with: 42804 for an assignment, 42883 for a comparison (no such
+// operator). None where PostgreSQL casts, and the layer, which holds the two
+// as different physical types, does not yet: that stays 42601.
+auto type_refusal(SqlKind from, SqlKind to, bool assignment) -> std::optional<SqlState> {
+  auto a = type_class(from);
+  auto b = type_class(to);
+  if (a == b || (assignment && b == TypeClass::String)) return std::nullopt;
+  return assignment ? kDatatypeMismatch : kUndefinedFunction;
+}
+
 // An integer or DECIMAL column: one whose arithmetic is exact in int64_t.
 auto exact_number(const Column& c) -> bool {
   switch (c.sql.kind) {
@@ -342,13 +377,13 @@ public:
 
   auto table(const std::string& name, std::int32_t pos) const -> const Table* {
     const auto* t = cat_.table(name);
-    if (t == nullptr) throw SqlError{"relation \"" + name + "\" does not exist", pos, "42P01"};
+    if (t == nullptr) throw SqlError{"relation \"" + name + "\" does not exist", pos, kUndefinedTable};
     return t;
   }
 
   static auto column(const Table& t, const std::string& name, std::int32_t pos) -> const Column* {
     const auto* c = t.column(name);
-    if (c == nullptr) throw SqlError{"column \"" + name + "\" does not exist", pos, "42703"};
+    if (c == nullptr) throw SqlError{"column \"" + name + "\" does not exist", pos, kUndefinedColumn};
     return c;
   }
 
@@ -363,7 +398,7 @@ public:
   // name, or not at all.
   static auto column(const Table& t, const ast::Expr& e) -> const Column* {
     if (!e.table.empty() && e.table != t.name) {
-      throw SqlError{"missing FROM-clause entry for table \"" + e.table + "\"", e.pos, "42P01"};
+      throw SqlError{"missing FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable};
     }
     return column(t, e.column, e.pos);
   }
@@ -376,14 +411,14 @@ public:
       if (!e.table.empty() && e.table != sides[side]->name) continue;
       const auto* c = sides[side]->column(e.column);
       if (c == nullptr) continue;
-      if (found) throw SqlError{"column reference \"" + e.column + "\" is ambiguous", e.pos, "42702"};
+      if (found) throw SqlError{"column reference \"" + e.column + "\" is ambiguous", e.pos, kAmbiguousColumn};
       found = {side, c};
     }
     if (found) return *found;
     if (!e.table.empty() && e.table != sides[0]->name && e.table != sides[1]->name) {
-      throw SqlError{"missing FROM-clause entry for table \"" + e.table + "\"", e.pos, "42P01"};
+      throw SqlError{"missing FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable};
     }
-    throw SqlError{"column \"" + e.column + "\" does not exist", e.pos, "42703"};
+    throw SqlError{"column \"" + e.column + "\" does not exist", e.pos, kUndefinedColumn};
   }
 
   // How a statement uses a parameter: compared with a column (WHERE),
@@ -404,10 +439,18 @@ public:
   void use_param(std::uint32_t n, PhysType t, std::int32_t pos, const Column& col, std::uint32_t table, Use use) {
     if (params_.size() <= n) params_.resize(n + 1);
     auto& p = params_[n];
+    // PostgreSQL's code only for two comparisons. It types a $n by its first
+    // use, which for UPDATE is a WHERE before the SET the layer binds first,
+    // and refuses two assignments of one $n whatever their types (42P08):
+    // any other pair is its answer to a different statement, so 42601.
+    auto clash = [&] {
+      if (p.first_use != Use::Compared || use != Use::Compared) return kSyntaxError;
+      return type_refusal(p.first->sql.kind, col.sql.kind, false).value_or(kSyntaxError);
+    };
     if (p.phys && *p.phys != t) {
       throw SqlError{"parameter $" + std::to_string(n + 1) + " used as both " + type_name(*p.phys) + " and " +
                          type_name(t),
-                     pos, use == Use::Assigned ? "42804" : "42883"};
+                     pos, clash()};
     }
     p.phys = t;
     if (p.first != nullptr && compared_type(p.first->sql).identity != compared_type(col.sql).identity) {
@@ -424,7 +467,7 @@ public:
       auto second = use == p.first_use ? named(col) : verb(use) + named(col);
       throw SqlError{"parameter $" + std::to_string(n + 1) + " is " + verb(p.first_use) + named(*p.first) + " and " +
                          second,
-                     pos};
+                     pos, clash()};
     }
     if (p.first == nullptr) {
       p.first = &col;
@@ -456,38 +499,43 @@ public:
     return aggregate(*column(t, e), e);
   }
 
-  // The SQLSTATE of an aggregate the layer does not take of `c`: 42883 where
-  // PostgreSQL has no such function either, 42601 where it has and the layer
-  // does not yet (SUM of a REAL or DOUBLE PRECISION column, MIN of those or of
-  // a string).
-  static auto no_aggregate(ast::Expr::Fn fn, const Column& c) -> const char* {
+  // Whether the layer takes `fn` of `c`, and if not the SQLSTATE of the
+  // refusal: 42883 where PostgreSQL has no such aggregate either, 42601 where
+  // it has and the layer does not yet (SUM of a REAL, DOUBLE PRECISION or
+  // TIME column, which PostgreSQL sums as an interval; MIN of a REAL, DOUBLE
+  // PRECISION or string column).
+  struct AggregateSupport {
+    bool supported;
+    SqlState sqlstate;
+  };
+  static auto aggregate_support(ast::Expr::Fn fn, const Column& c) -> AggregateSupport {
+    using Fn = ast::Expr::Fn;
+    if (fn == Fn::Count) return {true, kSyntaxError};
+    auto sum = fn == Fn::Sum;
     switch (c.sql.kind) {
-      case SqlKind::Real:
-      case SqlKind::Double: return "42601";
-      case SqlKind::Text:
-      case SqlKind::Varchar: return fn == ast::Expr::Fn::Min ? "42601" : "42883";
       case SqlKind::SmallInt:
       case SqlKind::Integer:
       case SqlKind::BigInt:
-      case SqlKind::Decimal:
+      case SqlKind::Decimal: return {true, kSyntaxError};
+      case SqlKind::Real:
+      case SqlKind::Double: return {false, kSyntaxError};
+      case SqlKind::Text:
+      case SqlKind::Varchar: return {false, sum ? kUndefinedFunction : kSyntaxError};
       case SqlKind::Boolean:
-      case SqlKind::Bytea:
+      case SqlKind::Bytea: return {false, kUndefinedFunction};
       case SqlKind::Timestamp:
-      case SqlKind::Date:
-      case SqlKind::Time: return "42883";
+      case SqlKind::Date: return {!sum, kUndefinedFunction};
+      case SqlKind::Time: return {!sum, kSyntaxError};
     }
-    return "42601";
+    std::unreachable();
   }
 
   static auto aggregate(const Column& col, const ast::Expr& e) -> Aggregate {
-    using Fn = ast::Expr::Fn;
     const auto* c = &col;
-    auto temporal = c->sql.kind == SqlKind::Date || c->sql.kind == SqlKind::Timestamp || c->sql.kind == SqlKind::Time;
-    if (e.fn == Fn::Sum && !exact_number(*c)) {
-      throw SqlError{"SUM of a " + sql_type_name(c->sql) + " column is not supported", e.pos, no_aggregate(e.fn, *c)};
-    }
-    if (e.fn == Fn::Min && !exact_number(*c) && !temporal) {
-      throw SqlError{"MIN of a " + sql_type_name(c->sql) + " column is not supported", e.pos, no_aggregate(e.fn, *c)};
+    if (auto s = aggregate_support(e.fn, *c); !s.supported) {
+      throw SqlError{std::string{e.fn == ast::Expr::Fn::Sum ? "SUM" : "MIN"} + " of a " + sql_type_name(c->sql) +
+                         " column is not supported",
+                     e.pos, s.sqlstate};
     }
     return Aggregate{e.fn, c->id, e.distinct, 0};
   }
@@ -509,10 +557,10 @@ public:
     if (c.sql.kind != SqlKind::Decimal) return e.constant;
     std::int64_t v = e.constant;
     for (std::uint8_t i = 0; i < c.sql.scale; ++i) {
-      if (v > kDecimalBound / 10 || v < -(kDecimalBound / 10)) throw SqlError{"numeric field overflow", e.pos, "22003"};
+      if (v > kDecimalBound / 10 || v < -(kDecimalBound / 10)) throw SqlError{"numeric field overflow", e.pos, kNumericValueOutOfRange};
       v *= 10;
     }
-    if (v >= kDecimalBound || v <= -kDecimalBound) throw SqlError{"numeric field overflow", e.pos, "22003"};
+    if (v >= kDecimalBound || v <= -kDecimalBound) throw SqlError{"numeric field overflow", e.pos, kNumericValueOutOfRange};
     return v;
   }
   static constexpr std::int64_t kDecimalBound = 1'000'000'000'000'000'000;  // 10^18: DECIMAL's 18 digits
@@ -526,7 +574,10 @@ public:
         return Expr{Expr::Kind::Param, 0, e.param, want};
       case ast::Expr::Kind::Column: {
         const auto* c = column(t, e);
-        if (c->type != want) throw SqlError{"column \"" + c->name + "\" is " + type_name(c->type), e.pos, "42804"};
+        if (c->type != want) {
+          throw SqlError{"column \"" + c->name + "\" is " + type_name(c->type), e.pos,
+                         type_refusal(c->sql.kind, target.sql.kind, true).value_or(kSyntaxError)};
+        }
         return Expr{Expr::Kind::Column, c->id, 0, want};
       }
       case ast::Expr::Kind::Add:
@@ -552,7 +603,7 @@ public:
                   e.kind == ast::Expr::Kind::Add ? Use::Added : Use::Subtracted);
         return Expr{kind, c->id, e.rhs->param, PhysType::I64, std::nullopt};
       }
-      case ast::Expr::Kind::Aggregate: throw SqlError{"aggregate functions are not allowed here", e.pos, "42803"};
+      case ast::Expr::Kind::Aggregate: throw SqlError{"aggregate functions are not allowed here", e.pos, kGroupingError};
       case ast::Expr::Kind::Const: throw SqlError{"an integer literal is supported only after + or - yet", e.pos};
     }
     throw SqlError{"expression not supported", e.pos};
@@ -688,14 +739,14 @@ public:
   // 42803, in PostgreSQL's words.
   [[noreturn]] static void ungrouped(const Table& t, const std::string& col, std::int32_t pos) {
     throw SqlError{"column \"" + t.name + "." + col + "\" must appear in the GROUP BY clause or be used in an aggregate function",
-                   pos, "42803"};
+                   pos, kGroupingError};
   }
 
   // Every parameter from $1 to the highest used must have a type.
   auto param_types(std::int32_t pos) const -> std::vector<PhysType> {
     std::vector<PhysType> out;
     for (std::size_t i = 0; i < params_.size(); ++i) {
-      if (!params_[i].phys) throw SqlError{"could not determine data type of parameter $" + std::to_string(i + 1), pos, "42P18"};
+      if (!params_[i].phys) throw SqlError{"could not determine data type of parameter $" + std::to_string(i + 1), pos, kIndeterminateDatatype};
       out.push_back(*params_[i].phys);
     }
     return out;
@@ -816,7 +867,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           }
           for (std::size_t i = 0; i < targets.size(); ++i) {
             auto at = static_cast<std::size_t>(targets[i] - t->columns.data());
-            if (out.values[at]) throw SqlError{"column \"" + targets[i]->name + "\" specified more than once", s.pos, "42701"};
+            if (out.values[at]) throw SqlError{"column \"" + targets[i]->name + "\" specified more than once", s.pos, kDuplicateColumn};
             out.values[at] = b.value(*t, s.values[i], *targets[i]);
             if (out.values[at]->kind != Expr::Kind::Param) {
               throw SqlError{"INSERT values must be parameters", s.values[i].pos};
@@ -843,7 +894,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           }
           if (out.aggregate && bare != nullptr) Binder::ungrouped(*t, bare->column, bare->pos);
           // 0A000, as PostgreSQL refuses it.
-          if (out.aggregate && s.for_update) throw SqlError{"FOR UPDATE is not allowed with aggregate functions", s.pos, "0A000"};
+          if (out.aggregate && s.for_update) throw SqlError{"FOR UPDATE is not allowed with aggregate functions", s.pos, kFeatureNotSupported};
           for (const auto& o : s.order_by) {
             const auto* c = Binder::column(*t, Binder::column_ref(o));
             if (out.aggregate) Binder::ungrouped(*t, c->name, o.pos);
