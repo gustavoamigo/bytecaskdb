@@ -46,11 +46,16 @@ $n, to sql_layer_server on a database of its own, through psycopg with
 text-format parameters. The server must agree with the layer exactly
 (the same SQLSTATE, rows, count and block status), and its rows' text must
 be PostgreSQL's, byte for byte, with the same type OIDs.
+Hash joins: a join no key reaches, linked by equalities of any columns,
+each table scanned by parameters or in full, with NULLs and duplicates in
+the join columns (rows inserted with another table's value), under ORDER BY
+and LIMIT.
+
 A model of the planner's rules (`served`, `join_served`) keeps the machine
 to statements the layer plans; the rest must be refused with "no plan".
 What is left of it is the dialect's own limit, a filter on a DOUBLE or REAL
-column no key takes, and a join no key reaches, which the cost model plans
-or leaves to a hash join (slice 5).
+column no key takes, and a sort of a join of two scans by both tables'
+columns, since a sorter holds one table's rows.
 
 The fixed cases at the end call the same steps in a set order.
 """
@@ -151,18 +156,18 @@ class Table:
 
 
 def join_served(a: Table, conj_a: list[tuple], b: Table, conj_b: list[tuple], on: list[tuple[str, str]],
-                order: list = ()) -> bool | None:
+                order: list = ()) -> bool:
     """Whether the planner plans a join of a and b on `on` (a's column, b's)
-    with these conjuncts: True when some order reads the outer table by any
+    with these conjuncts: when some order reads the outer table by any
     access path and the inner one by its whole primary key from parameters
-    and outer columns, or, under an outer table named by its key, by its own
-    scan; every other conjunct a filter, none on a DOUBLE or REAL. None when
-    only a nested loop that reads the inner table once per outer row does,
-    which the cost model plans only where it costs no more than a hash join
-    (slice 5), and only without an ORDER BY of the inner table's columns,
-    since a sort holds one table's rows; False otherwise."""
+    and outer columns, or by its own scan: under an outer table named by its
+    key, read once; under any other, read once per outer row or hash joined,
+    which a sort holds only when the ORDER BY's columns, but those the WHERE
+    makes constant, are one table's. Every other conjunct a filter, none on
+    a DOUBLE or REAL."""
     sides = [(a, conj_a, [x for x, _ in on]), (b, conj_b, [y for _, y in on])]
-    maybe = False
+    conj = {a.name: conj_a, b.name: conj_b}
+    sorted_by = {t for t, c, *_ in order if not any(q[0] == c and q[1] == "=" for q in conj[t])}
     for o in (0, 1):
         (ot, oconj, ocols), (it, iconj, icols) = sides[o], sides[1 - o]
         if not served(ot, oconj):
@@ -180,10 +185,9 @@ def join_served(a: Table, conj_a: list[tuple], b: Table, conj_b: list[tuple], on
         if served(it, iconj) and not inner_floats:
             outer_keyed = all(any(q == k and op == "=" and not calc for q, op, calc in
                                   [(c[0], c[1], len(c) > 2 and c[2]) for c in oconj]) for k in ot.pk)
-            if outer_keyed:
+            if outer_keyed or len(sorted_by) <= 1:
                 return True
-            maybe = maybe or not any(t == it.name for t, *_ in order)
-    return None if maybe else False
+    return False
 
 
 def typed(t: Table, c: str, n: int) -> str:
@@ -676,7 +680,7 @@ class SqlMachine(RuleBasedStateMachine):
         column, a's) an equality of a column b's key does not hold with a
         column of a, ORDER BY each (table, column, DESC, NULLS FIRST): on both
         sides when the planner serves it, else the layer must refuse it with
-        no plan; where the cost model decides, either."""
+        no plan."""
         a, b = self.tables[a_name], self.tables[b_name]
         conds, pg_conds, params, types = [], [], [], []
         def add(t, c, op, v):
@@ -707,22 +711,11 @@ class SqlMachine(RuleBasedStateMachine):
         sql = f"SELECT {select} FROM {a_name}, {b_name} WHERE {' AND '.join(conds)}{ordered}{tail}"
         pg_sql = f"SELECT {select} FROM {a_name}, {b_name} WHERE {' AND '.join(pg_conds)}{ordered}"
         conj_b = [(c, "=", False) for c, (kind, _) in keys_b if kind == "param"] + conjuncts(filters_b)
-        verdict = join_served(a, conjuncts(where_a), b, conj_b, on, order)
-        if verdict is False:
+        # LIMIT 0 returns no row, in any order.
+        if not join_served(a, conjuncts(where_a), b, conj_b, on, order if limit != 0 else ()):
             self.no_plan(a_name, sql, params, types)
             return
-        if verdict is None:
-            # The cost model reads a table once per row of the other, or
-            # leaves the join to a hash join (slice 5). Not in a transaction,
-            # which a refusal would abort on the layer alone.
-            if self.txn is not None:
-                return
-            out = self.layer(sql, params, types)
-            if o.is_no_plan(out):
-                assert "hash join" in out.detail or "nested loop of two scans" in out.detail, out
-                return
-        else:
-            out = None
+        out = None
         if distinct:
             out = self.both(sql, params, pg_sql=pg_sql + tail, types=types)
             if out.error is None:
@@ -1165,6 +1158,54 @@ class SqlMachine(RuleBasedStateMachine):
         order = self.join_order(data, columns, targets)
         self.join_on(a_name, b_name, where_a, keys_b, [], targets, links=links,
                      limit=data.draw(st.none() | st.sampled_from([0, 1, 3]), label="limit"), order=order)
+
+    @precondition(lambda self: len(self.tables) >= 2)
+    @rule(data=st.data())
+    def join_no_key(self, data):
+        # Two tables, each scanned by parameters or in full, linked by one or
+        # two equalities of columns of one type, key columns or not: mostly
+        # no key reaches either, so the join is hashed, built on either side,
+        # or one table read once per row of the other.
+        a_name, b_name = data.draw(st.permutations(sorted(self.tables)), label="tables")[:2]
+        a, b = self.tables[a_name], self.tables[b_name]
+        pairs = [(x.name, y.name) for x in b.columns for y in a.columns if y.type.sql == x.type.sql]
+        if not pairs:
+            return
+        links = data.draw(st.lists(st.sampled_from(pairs), min_size=1, max_size=2, unique=True), label="links")
+        where_a, _, _ = self.where_on_a_path(data, a)
+        where_b, _, _ = self.where_on_a_path(data, b)
+        columns = [(t.name, x.name) for t in (a, b) for x in t.columns]
+        if data.draw(st.integers(0, 3), label="COUNT(DISTINCT)?") == 0:
+            t = data.draw(st.sampled_from([a, b]), label="distinct of")
+            self.join_on(a_name, b_name, where_a, [], where_b, [], links=links,
+                         distinct=(t.name, data.draw(st.sampled_from([x.name for x in t.columns]), label="column")))
+            return
+        targets = data.draw(st.lists(st.sampled_from(columns), min_size=1, max_size=3, unique=True), label="targets")
+        order = self.join_order(data, columns, targets)
+        self.join_on(a_name, b_name, where_a, [], where_b, targets, links=links,
+                     limit=data.draw(st.none() | st.sampled_from([0, 1, 3]), label="limit"), order=order)
+
+    @precondition(lambda self: len(self.tables) >= 2 and self.txn is None)
+    @rule(data=st.data())
+    def insert_a_match(self, data):
+        # A row of b whose column holds a value of a column of a, of its type,
+        # from one of a's rows: duplicate join keys on both sides.
+        a_name, b_name = data.draw(st.permutations(sorted(self.tables)), label="tables")[:2]
+        a, b = self.tables[a_name], self.tables[b_name]
+        rows = self.existing_rows(a)
+        pairs = [(x.name, y) for x in b.columns for y, ya in enumerate(a.columns) if ya.type.sql == x.type.sql]
+        if not rows or not pairs:
+            return
+        col, at = data.draw(st.sampled_from(pairs), label="column")
+        row = {}
+        for c in b.columns:
+            if c.name == col:
+                row[c.name] = data.draw(st.sampled_from(rows), label="a row")[at]
+            elif b.nullable(c.name) and data.draw(st.integers(0, 4), label=f"{c.name} null?") == 0:
+                row[c.name] = None
+            else:
+                row[c.name] = data.draw(values(c.type), label=c.name)
+        self.insert(b_name, row, all_columns=True)
 
     @precondition(lambda self: self.txn is None)
     @rule()
@@ -1951,7 +1992,7 @@ def test_a_join_on_a_column(dsn):
                 m.join_on("t0", "t1", where, keys, filters, [("t0", "c1"), ("t1", "c2")])
                 m.join_on("t0", "t1", where, keys, filters, [], distinct=("t1", "c0"))
             m.join_on("t0", "t1", where, keys, [], [("t1", "c0")], limit=2)
-        # t0 is not reached from its parameters, nor t1 from its: no plan.
+        # t0 scanned in full, filtered, and t1 looked up by key per row.
         m.join_on("t0", "t1", [("c2", "=", 1)], [("c0", ("col", "c2")), ("c1", ("col", "c1"))], [], [("t0", "c1")])
         # An outer value too long for any key joins nothing, as in PostgreSQL;
         # it still counts as a distinct value.
@@ -1993,6 +2034,41 @@ def test_a_table_read_once_joined_on_columns_neither_key_takes(dsn):
                 m.join_on("t1", "t0", where, keys, [], targets, links=[("c1", "c2")], limit=1)
             # On DOUBLE columns: no plan.
             m.join_on("t1", "t0", [("c0", "=", 1)], keys, [], targets, links=[("c2", "c3")])
+    finally:
+        m.teardown()
+
+
+def test_hash_joins(dsn):
+    """FROM a, b linked by equalities of columns no key takes, each table
+    scanned by parameters or in full: a hash join, built on either side, or
+    a table read once per row of the other. A NULL join column matches
+    nothing; duplicate keys on both sides give every pair; under ORDER BY of
+    either table's columns, LIMIT and COUNT(DISTINCT). Every plan agrees; an
+    ORDER BY of both tables' columns has no plan."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER), Column("c2", o.TEXT)],
+                       ["c0"]))
+        m.create(Table("t1", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER), Column("c2", o.TEXT)],
+                       ["c0"]))
+        for c0, c1, c2 in ((1, 10, "a"), (2, 10, "b"), (3, None, "a"), (4, 20, None), (5, 30, "c"), (6, 10, "a")):
+            m.insert("t0", {"c0": c0, "c1": c1, "c2": c2}, all_columns=True)
+        for c0, c1, c2 in ((1, 10, "a"), (2, 10, "a"), (3, 20, "b"), (4, None, None), (5, 40, "a")):
+            m.insert("t1", {"c0": c0, "c1": c1, "c2": c2}, all_columns=True)
+        targets = [("t0", "c0"), ("t1", "c0")]
+        for where_a in ([], [("c0", ">=", 2)], [("c0", "<", 6), ("c1", ">", 0)]):
+            for where_b in ([], [("c0", "<=", 4)]):
+                for links in ([("c1", "c1")], [("c1", "c1"), ("c2", "c2")], [("c2", "c2")]):
+                    m.join_on("t0", "t1", where_a, [], where_b, targets, links=links)
+                    m.join_on("t0", "t1", where_a, [], where_b, targets, links=links, limit=2)
+                    m.join_on("t0", "t1", where_a, [], where_b, targets + [("t1", "c2")], links=links, limit=3,
+                              order=[("t1", "c2", True, None), ("t1", "c0", False, None)])
+                    m.join_on("t0", "t1", where_a, [], where_b, targets + [("t0", "c2")], links=links,
+                              order=[("t0", "c2", False, True)])
+                    m.join_on("t0", "t1", where_a, [], where_b, [], links=links, distinct=("t1", "c2"))
+        # A sorter holds one table's rows: no plan sorts by both tables'.
+        m.join_on("t0", "t1", [("c0", ">=", 1)], [], [], targets, links=[("c1", "c1")],
+                  order=[("t0", "c0", False, None), ("t1", "c0", False, None)])
     finally:
         m.teardown()
 

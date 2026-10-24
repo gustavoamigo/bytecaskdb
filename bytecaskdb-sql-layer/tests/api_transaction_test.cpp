@@ -15,9 +15,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <variant>
@@ -720,9 +722,50 @@ TEST_CASE("embedded API: an allocation failure in an autocommit statement never 
   CHECK(balance(*db, 1) == 100);
 }
 
-TEST_CASE("embedded API: an allocation failure in a sorted plan is BC_E_MEMORY or its rows", "[sql][api][alloc]") {
-  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
-  sql_test::TempDir dir{"api_sort_faults"};
+namespace {
+
+// Every allocation of an execute of `sql`, with $1 = 1, failed in turn:
+// BC_E_MEMORY, or the rows of a run no failure reached; bad_alloc only before
+// the plan runs. Its plan holds `structure`.
+void sweep_plan_allocations(Database& db, const std::string& sql, std::string_view structure) {
+  INFO(sql);
+  const auto& st = db.prepare(sql);
+  const std::vector<Value> params{std::int64_t{1}};
+  auto want = db.execute(st, params).rows;
+  REQUIRE(st.plan_source().find(structure) != std::string::npos);
+  auto failed = 0;
+  for (long nth = 1;; ++nth) {
+    REQUIRE(nth < 100000);
+    std::string outcome;
+    std::optional<decltype(want)> got;
+    auto fired = false;
+    {
+      bytecask::testing::ScopedAllocFaults faults{nth, false};
+      try {
+        got = db.execute(st, params).rows;
+        outcome = "ran";
+      } catch (const ExecError& e) {
+        outcome = e.code() == BC_E_MEMORY ? "memory" : "error";
+      } catch (const std::bad_alloc&) {
+        outcome = "bad_alloc";
+      }
+      fired = faults.report().fired;
+    }
+    INFO("allocation " << nth << ": " << outcome);
+    CHECK((outcome == "ran" || outcome == "memory" || outcome == "bad_alloc"));
+    if (got) CHECK(*got == want);
+    if (!fired) {
+      CHECK(outcome == "ran");
+      break;
+    }
+    ++failed;
+  }
+  CHECK(failed > 0);
+}
+
+// acct and owner, 12 rows each: owner.acct NULL in every fourth row, and
+// equal in several.
+auto open_owners(const sql_test::TempDir& dir) -> std::unique_ptr<Database> {
   auto db = open_db(dir);
   db->execute("CREATE TABLE owner (id BIGINT PRIMARY KEY, acct BIGINT, name BYTEA)");
   for (std::int64_t k = 1; k <= 12; ++k) {
@@ -730,50 +773,40 @@ TEST_CASE("embedded API: an allocation failure in a sorted plan is BC_E_MEMORY o
     db->execute("INSERT INTO owner VALUES ($1, $2, $3)",
                 {k, k % 4 == 0 ? Value{} : Value{(k * 5) % 13}, Value{std::vector<std::byte>(static_cast<std::size_t>(k % 3), std::byte{'x'})}});
   }
-  // Each a plan the compiler sorts (a full scan or a range, under a LIMIT
-  // or not, on a join, FOR UPDATE), every allocation of an execute failed in
-  // turn: BC_E_MEMORY, or the rows of a run no failure reached; bad_alloc
-  // only before the plan runs.
-  const std::vector<std::string> sorted{
-      "SELECT id, bal FROM acct WHERE bal >= $1 ORDER BY bal DESC, id",
-      "SELECT id FROM owner WHERE id > $1 ORDER BY acct NULLS FIRST, name DESC LIMIT 3",
-      "SELECT owner.id, bal FROM owner, acct WHERE owner.id > $1 AND acct.id = owner.acct ORDER BY bal, owner.id",
-      "SELECT id, bal FROM acct WHERE id > $1 ORDER BY bal LIMIT 4 FOR UPDATE",
-  };
-  for (const auto& sql : sorted) {
-    INFO(sql);
-    const auto& st = db->prepare(sql);
-    const std::vector<Value> params{std::int64_t{1}};
-    auto want = db->execute(st, params).rows;
-    REQUIRE(st.plan_source().find("bc_sorter_open") != std::string::npos);
-    auto failed = 0;
-    for (long nth = 1;; ++nth) {
-      REQUIRE(nth < 100000);
-      std::string outcome;
-      std::optional<decltype(want)> got;
-      auto fired = false;
-      {
-        bytecask::testing::ScopedAllocFaults faults{nth, false};
-        try {
-          got = db->execute(st, params).rows;
-          outcome = "ran";
-        } catch (const ExecError& e) {
-          outcome = e.code() == BC_E_MEMORY ? "memory" : "error";
-        } catch (const std::bad_alloc&) {
-          outcome = "bad_alloc";
-        }
-        fired = faults.report().fired;
-      }
-      INFO("allocation " << nth << ": " << outcome);
-      CHECK((outcome == "ran" || outcome == "memory" || outcome == "bad_alloc"));
-      if (got) CHECK(*got == want);
-      if (!fired) {
-        CHECK(outcome == "ran");
-        break;
-      }
-      ++failed;
-    }
-    CHECK(failed > 0);
+  return db;
+}
+
+}  // namespace
+
+TEST_CASE("embedded API: an allocation failure in a sorted plan is BC_E_MEMORY or its rows", "[sql][api][alloc]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
+  sql_test::TempDir dir{"api_sort_faults"};
+  auto db = open_owners(dir);
+  // Each a plan the compiler sorts: a full scan or a range, under a LIMIT or
+  // not, on a join, FOR UPDATE.
+  for (const auto* sql : {
+           "SELECT id, bal FROM acct WHERE bal >= $1 ORDER BY bal DESC, id",
+           "SELECT id FROM owner WHERE id > $1 ORDER BY acct NULLS FIRST, name DESC LIMIT 3",
+           "SELECT owner.id, bal FROM owner, acct WHERE owner.id > $1 AND acct.id = owner.acct ORDER BY bal, owner.id",
+           "SELECT id, bal FROM acct WHERE id > $1 ORDER BY bal LIMIT 4 FOR UPDATE",
+       }) {
+    sweep_plan_allocations(*db, sql, "bc_sorter_open");
+  }
+}
+
+TEST_CASE("embedded API: an allocation failure in a hash join plan is BC_E_MEMORY or its rows", "[sql][api][alloc]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
+  sql_test::TempDir dir{"api_hash_faults"};
+  auto db = open_owners(dir);
+  // Joined on a column no key holds, NULL in some rows and equal in several:
+  // a hash join, alone, sorted on its probe side, and under a LIMIT.
+  for (const auto* sql : {
+           "SELECT owner.id, acct.id FROM owner, acct WHERE owner.id > $1 AND acct.bal = owner.acct",
+           "SELECT owner.id, acct.id FROM owner, acct WHERE owner.id > $1 AND acct.bal = owner.acct ORDER BY acct.id DESC",
+           "SELECT count(DISTINCT owner.name) FROM owner, acct WHERE acct.bal > $1 AND owner.acct = acct.bal",
+           "SELECT acct.id FROM owner, acct WHERE owner.id > $1 AND acct.bal = owner.acct LIMIT 2",
+       }) {
+    sweep_plan_allocations(*db, sql, "bc_hash_open");
   }
 }
 

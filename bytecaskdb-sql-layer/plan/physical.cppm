@@ -8,9 +8,9 @@
 // reads the catalog.
 //
 // The operators are Empty, the access paths, the joins (an index nested
-// loop, and a nested loop), the choice points, Filter, Sort, Limit,
-// Aggregate and the sinks: Emit for result rows, Insert, Update, Delete. No
-// hash join yet. check() enforces what the types can't express.
+// loop, a nested loop and a hash join), the choice points, Filter, Sort,
+// Limit, Aggregate and the sinks: Emit for result rows, Insert, Update,
+// Delete. check() enforces what the types can't express.
 
 module;
 #include <algorithm>
@@ -121,13 +121,37 @@ struct NestedLoop {
   NodePtr inner;
 };
 
+// One part of a hash join's key: a column of the build side's table and the
+// probe side's column it equals, of one physical type, never a DOUBLE.
+struct HashKey {
+  ColumnRef build;
+  ColumnRef probe;
+};
+
+// A hash join, a pipeline breaker: every row of `build` is put in a hash
+// table (bc_hash_*) under the key of its `keys` columns, then for each row of
+// `probe`, every row put under the same key. The key is built with
+// bc_sort_key_* from the columns' values, so equal values give equal bytes;
+// a row with a NULL key column is neither put nor probed, as `=` never holds
+// for NULL. The build side reads one table in one loop, `held`, whose row the
+// hash table holds; the probe side is any plan, and its order is the join's.
+struct HashJoin {
+  NodePtr build;
+  NodePtr probe;
+  std::vector<HashKey> keys;
+  std::uint32_t held{0};
+};
+
 // A choice point (docs/planner_design.md, *Choosing at run time*): one
 // table's rows by one of two plans, picked when the plan runs by
 // bc_count_range over the first one's range, limited to the threshold. A
 // count below it takes the first, `below`; one that reaches it, the second.
 // Each is a scan under its filters, or such a scan sorted: the choice by the
-// memory budget between a sort and a scan in the ORDER BY's order. A threshold of 0 always takes the
-// second, and INT64_MAX the first (override_thresholds).
+// memory budget between a sort and a scan in the ORDER BY's order. Or, for
+// the choice by the budget between a hash join and a plan without one, the
+// hash join, counted by its build side's range, and the other plan of the
+// same tables. A threshold of 0 always takes the second, and INT64_MAX the
+// first (override_thresholds).
 struct Choice {
   Scan counted;  // the range counted: the first plan's, its whole prefix for a NULL split
   std::int64_t threshold{0};
@@ -207,8 +231,8 @@ struct Delete {
 };
 
 struct Node {
-  std::variant<Empty, PointGet, Scan, NullSplitScan, CountRange, MinFirstEntry, IndexJoin, NestedLoop, Choice, Filter,
-               Sort, Limit, Emit, Aggregate, Insert, Update, Delete>
+  std::variant<Empty, PointGet, Scan, NullSplitScan, CountRange, MinFirstEntry, IndexJoin, NestedLoop, HashJoin, Choice,
+               Filter, Sort, Limit, Emit, Aggregate, Insert, Update, Delete>
       op;
 };
 
@@ -378,6 +402,14 @@ private:
     return false;
   }
 
+  // The hash join a node's rows come from, under the filters on its pairs,
+  // or null.
+  static auto hash_below(const Node& n) -> const HashJoin* {
+    if (const auto* h = std::get_if<HashJoin>(&n.op)) return h;
+    if (const auto* f = std::get_if<Filter>(&n.op)) return hash_below(*f->input);
+    return nullptr;
+  }
+
   // The plans a node's rows may come from: a choice point's two, or itself.
   static auto branches(const Node& n) -> std::vector<const Node*> {
     if (const auto* c = std::get_if<Choice>(&n.op)) return {c->below.get(), c->at_or_above.get()};
@@ -414,6 +446,10 @@ private:
       tables_of(*j->outer, out);
       tables_of(*j->inner, out);
     }
+    if (const auto* h = std::get_if<HashJoin>(&n.op)) {
+      tables_of(*h->probe, out);
+      tables_of(*h->build, out);
+    }
   }
   static auto tables_of(const Node& n) -> std::vector<std::uint32_t> {
     std::vector<std::uint32_t> out;
@@ -435,6 +471,8 @@ private:
       auto [inner, inner_table] = loops(*j->inner);
       return {outer + inner, inner_table ? inner_table : table};
     }
+    // The probe side's loops, and inside them the loop over a probe's rows.
+    if (const auto* h = std::get_if<HashJoin>(&n.op)) return {loops(*h->probe).first + 1, h->held};
     return {0, std::nullopt};
   }
 
@@ -452,6 +490,9 @@ private:
           } else if constexpr (std::is_same_v<T, NestedLoop>) {
             each_choice(*op.outer, out);
             each_choice(*op.inner, out);
+          } else if constexpr (std::is_same_v<T, HashJoin>) {
+            each_choice(*op.build, out);
+            each_choice(*op.probe, out);
           } else if constexpr (requires { op.input; }) {
             each_choice(*op.input, out);
           }
@@ -478,6 +519,9 @@ private:
           } else if constexpr (std::is_same_v<T, NestedLoop>) {
             covering_tables(*op.outer);
             covering_tables(*op.inner);
+          } else if constexpr (std::is_same_v<T, HashJoin>) {
+            covering_tables(*op.build);
+            covering_tables(*op.probe);
           } else if constexpr (std::is_same_v<T, Choice>) {
             covering_tables(taken(op));
           } else if constexpr (requires { op.input; }) {
@@ -565,10 +609,44 @@ private:
             for (const auto* b : branches(*op.inner)) inner_side(*b, *outer);
             node(*op.outer, &n);
             node(*op.inner, &n);
+          } else if constexpr (std::is_same_v<T, HashJoin>) {
+            if (op.keys.empty()) broken("a hash join with no key");
+            // The hash table holds the row of the build side's one loop.
+            if (loops(*op.build) != std::pair<std::size_t, std::optional<std::uint32_t>>{1, op.held}) {
+              broken("a hash join whose build side is not one loop over the table it holds");
+            }
+            if (std::ranges::find(covering_, op.held) != covering_.end()) broken("a hash join that holds a covering scan's entry");
+            auto probed = tables_of(*op.probe);
+            if (std::ranges::find(probed, op.held) != probed.end()) broken("a hash join that holds a table its probe side reads");
+            for (const auto& k : op.keys) {
+              if (k.build.table != op.held) broken("a hash key outside the table held");
+              if (std::ranges::find(probed, k.probe.table) == probed.end()) broken("a hash key outside the probe side");
+              if (k.build.type != k.probe.type) broken("a hash key of two types");
+              if (k.build.type == PhysType::F64) broken("a hash key on a DOUBLE column");
+              read(k.probe);
+            }
+            node(*op.build, &n);
+            node(*op.probe, &n);
           } else if constexpr (std::is_same_v<T, Choice>) {
             scan(op.counted);
             if (op.threshold < 0) broken("a choice point with a negative threshold");
             if (!op.below || !op.at_or_above) broken("a choice point without two plans");
+            // The choice by the budget at a hash join counts its build side's
+            // range; its other plan reads the same tables.
+            if (const auto* h = hash_below(*op.below)) {
+              const auto* built = scan_below(*h->build);
+              if (built == nullptr || built->table != op.counted.table) {
+                broken("a choice point at a hash join that counts another range than its build side's");
+              }
+              counts_first(op, *built, split_below(*h->build));
+              auto a = tables_of(*op.below);
+              auto b = tables_of(*op.at_or_above);
+              std::ranges::sort(a);
+              std::ranges::sort(b);
+              if (a != b) broken("a choice point at a hash join whose other plan reads other tables");
+              node(taken(op), &n);
+              return;
+            }
             const auto* first = scan_below(*op.below);
             const auto* second = scan_below(*op.at_or_above);
             if (first == nullptr || second == nullptr) {
@@ -662,6 +740,9 @@ void each_choice(Node& n, const F& f) {
         } else if constexpr (std::is_same_v<T, NestedLoop>) {
           each_choice(*op.outer, f);
           each_choice(*op.inner, f);
+        } else if constexpr (std::is_same_v<T, HashJoin>) {
+          each_choice(*op.build, f);
+          each_choice(*op.probe, f);
         } else if constexpr (requires { op.input; }) {
           each_choice(*op.input, f);
         }

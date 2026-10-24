@@ -268,3 +268,45 @@ TEST_CASE("physical: a sort holds the row of its input's one loop, keyed by colu
   auto once = node(physical::NestedLoop{get({p(0)}), node(physical::Scan{2, 4, {p(1)}, {}, false, false, false})});
   CHECK(refusal(plan(sort(std::move(once), by_id, 0, 2))).empty());
 }
+
+TEST_CASE("physical: a hash join holds the row of its build side's one loop, keyed by columns of one type",
+          "[sql][physical][hash]") {
+  // t (table 1) built from its scan of index 3, probed by u's (table 2)
+  // scan of index 4.
+  const logical::ColumnRef t_v{1, 2, PhysType::I64, true};
+  const logical::ColumnRef u_v{2, 1, PhysType::I64, true};
+  const logical::ColumnRef u_b{2, 2, PhysType::Bytes, true};
+  const logical::ColumnRef u_d{2, 3, PhysType::F64, true};
+  auto u_scan = [](bool covering = false) {
+    return node(physical::Scan{2, 4, {p(1)}, {}, false, covering, false});
+  };
+  auto hash = [&](physical::NodePtr build, physical::NodePtr probe, std::vector<physical::HashKey> keys,
+                  std::uint32_t held = 1) {
+    return emit(node(physical::HashJoin{std::move(build), std::move(probe), std::move(keys), held}), {kId, u_v});
+  };
+  CHECK(refusal(plan(hash(node(scan({p(0)}, {})), u_scan(), {{t_v, u_v}}))).empty());
+  // The probe side's key may come from a covering scan's entry; the build
+  // side's row is the one held.
+  CHECK(refusal(plan(hash(node(scan({p(0)}, {})), u_scan(true), {{t_v, u_v}}))).empty());
+  refused(plan(hash(node(scan({p(0)}, {}, true)), u_scan(), {{t_v, u_v}})), "holds a covering scan's entry");
+  refused(plan(hash(node(scan({p(0)}, {})), u_scan(), {})), "with no key");
+  refused(plan(hash(node(scan({p(0)}, {})), u_scan(), {{t_v, u_v}}, 2)), "not one loop over the table it holds");
+  refused(plan(hash(node(scan({p(0)}, {})), u_scan(), {{u_v, t_v}})), "outside the table held");
+  refused(plan(hash(node(scan({p(0)}, {})), u_scan(), {{t_v, t_v}})), "outside the probe side");
+  refused(plan(hash(node(scan({p(0)}, {})), u_scan(), {{t_v, u_b}})), "of two types");
+  refused(plan(hash(node(scan({p(0)}, {})), u_scan(), {{kD, u_d}})), "on a DOUBLE column");
+  // One table read once per row of the other, as a build side: two loops.
+  auto twice = node(physical::NestedLoop{node(scan({p(0)}, {})), u_scan()});
+  refused(plan(hash(std::move(twice), u_scan(), {{t_v, u_v}})), "not one loop");
+  // A choice by the budget counts the build side's range; its other plan
+  // reads the same tables.
+  auto choice = [&](physical::Scan counted, physical::NodePtr other) {
+    auto first = node(physical::HashJoin{node(scan({p(0)}, {})), u_scan(), {{t_v, u_v}}, 1});
+    return emit(node(physical::Choice{std::move(counted), 41, std::move(first), std::move(other)}), {kId, u_v});
+  };
+  auto loop = [&] { return node(physical::NestedLoop{node(scan({p(0)}, {})), u_scan()}); };
+  CHECK(refusal(plan(choice(scan({p(0)}, {}), loop()))).empty());
+  refused(plan(choice(physical::Scan{2, 4, {p(1)}, {}, false, false, false}, loop())),
+          "counts another range than its build side's");
+  refused(plan(choice(scan({p(0)}, {}), node(scan({p(0)}, {})))), "whose other plan reads other tables");
+}

@@ -435,12 +435,9 @@ TEST_CASE("search: a refusal names the failure of a plan of every table, not of 
     }
     return "accepted";
   };
-  // Nothing names b's key from a, nor a's from b: each order reads its
-  // inner table once per outer row, which costs more than a hash join, not
-  // planned yet (#534).
-  CHECK(refused("SELECT a.k FROM a, b WHERE a.x = $1 AND b.y = $2 AND a.z = b.y ORDER BY a.z") ==
-        "no plan: no key of b is reached from the other table's rows, and reading it once per row costs more than a "
-        "hash join, which is not planned yet");
+  // Nothing names b's key from a, nor a's from b: a hash join, or each
+  // order reading its inner table once per outer row.
+  CHECK(refused("SELECT a.k FROM a, b WHERE a.x = $1 AND b.y = $2 AND a.z = b.y ORDER BY a.z") == "accepted");
   // Keyed by a.z, b joins a, sorted by a.k.
   CHECK(refused("SELECT a.k FROM a, b WHERE b.y = $1 AND b.k = a.z AND a.x = $2 ORDER BY a.k") == "accepted");
   // A filter on a DOUBLE in every plan of both tables, past a plan of one
@@ -448,17 +445,18 @@ TEST_CASE("search: a refusal names the failure of a plan of every table, not of 
   f.ddl(CreateTableDdl{"d", {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::F64, true)}, {"k"}});
   CHECK(refused("SELECT a.k FROM a, d WHERE a.x = $1 AND d.k = a.z AND d.v < $2") ==
         "no plan: a filter on column \"v\", a REAL or DOUBLE PRECISION, is not supported yet");
-  // e's index takes the DOUBLE bound, and its full scan leaves it a filter.
-  // The plans by e_v pass every filter and lack only the hash join: that is
-  // the refusal, past the full scan's DOUBLE filter.
+  // e's index takes the DOUBLE bound, and its full scan leaves it a filter:
+  // the plans by e_v are planned, past the full scan's DOUBLE filter.
   f.ddl(CreateTableDdl{"e",
                        {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::F64, true),
                         Fixture::col("y", PhysType::I64, true)},
                        {"k"}});
   f.ddl(CreateIndexDdl{"e_v", "e", {{"v"}}});
-  auto why = refused("SELECT a.k FROM a, e WHERE a.x = $1 AND e.v < $2 AND e.y = a.z");
-  INFO(why);
-  CHECK(why.find("reading it once per row costs more than a hash join, which is not planned yet") != std::string::npos);
+  CHECK(refused("SELECT a.k FROM a, e WHERE a.x = $1 AND e.v < $2 AND e.y = a.z") == "accepted");
+  // A sorter holds one table's rows: no plan of a join of two scans sorts
+  // by both tables' columns.
+  CHECK(refused("SELECT a.k FROM a, b WHERE a.x = $1 AND b.y = $2 AND a.z = b.y ORDER BY b.k, a.k") ==
+        "no plan: ORDER BY k, k over a join of two scans: a sort holds one table's rows");
 }
 
 TEST_CASE("search: COUNT from the keys or by a loop, by the count of the range", "[sql][search][cost]") {
@@ -706,36 +704,107 @@ TEST_CASE("search: a full scan is the plan when nothing bounds the table, or whe
   CHECK(threshold(plan_sql(cat, "SELECT qty FROM t WHERE name = $1", {{"t", 1000}})) == -1);
 }
 
-TEST_CASE("search: a table no key reaches is read once per outer row where that costs less than a hash join",
-          "[sql][search][cost]") {
+TEST_CASE("search: a table no key reaches is hash joined, or read once per outer row, by their costs",
+          "[sql][search][cost][hash]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
   f.ddl(CreateTableDdl{"u", {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
   const auto& cat = f.cat();
   const std::string sql = "SELECT u.k FROM t, u WHERE t.name = $1 AND u.v = t.qty";
-  // 20 rows of t, 2 under the name, each fetched for qty; 100 of u: reading
-  // u once per row of t, 2 x 100, costs no more than a hash join's 100 + 2 x
-  // 1.5 + 100.
-  auto loop = plan_sql(cat, sql, {{"t", 20}, {"u", 100}});
+  // 10 rows of t, 1 under the name, fetched for qty; 100 of u. Reading u once
+  // per row of t, 2 + 100, costs less than a hash join: the same reads, plus
+  // the row it holds and the pairs it probes.
+  auto loop = plan_sql(cat, sql, {{"t", 10}, {"u", 100}});
   CHECK(has(loop, "bc_cursor c1 = bc_scan_open(cx, TBL_4, lo, hi, BC_SCAN_FORWARD);"));
   CHECK(has(loop, "while (bc_scan_next(cx, c1)) {"));
-  CHECK(loop.cost == Catch::Approx(4 + 2 * 100));
-  // 40 rows of t, 4 under the name: the hash join would cost less.
-  try {
-    (void)plan_sql(cat, sql, {{"t", 40}, {"u", 100}});
-    FAIL("planned");
-  } catch (const ast::FeatureNotSupported& e) {
-    CHECK(std::string{e.what()}.find("costs more than a hash join") != std::string::npos);
-  }
-  // A sort holds one row per entry: not over two loops.
-  try {
-    (void)plan_sql(cat, sql + " ORDER BY u.v", {{"t", 20}, {"u", 100}});
-    FAIL("planned");
-  } catch (const ast::FeatureNotSupported& e) {
-    CHECK(std::string{e.what()} == "no plan: ORDER BY v over a nested loop of two scans: a sort holds one table's rows");
-  }
-  // In the outer loop's order, no sort is needed.
-  CHECK_FALSE(has(plan_sql(cat, sql + " ORDER BY t.id", {{"t", 20}, {"u", 100}}), "bc_sorter"));
+  CHECK_FALSE(has(loop, "bc_hash"));
+  CHECK(loop.cost == Catch::Approx(2 + 100));
+  // 40 rows of t, 4 under the name: u once per row costs 8 + 4 x 100; the
+  // hash join reads each side once, holds t's 4 rows and steps through 4 x
+  // 100 / 10 pairs.
+  auto hashed = plan_sql(cat, sql, {{"t", 40}, {"u", 100}});
+  CHECK(has(hashed, "bc_hash h0 = bc_hash_open(cx);  // built on TBL_1's rows"));
+  CHECK(hashed.cost == Catch::Approx(8 + 4 * (1 + kHashWeight) + 100 + 40));
+  // The build side's loop puts each row, in a block of its own; then the probe
+  // side's loop finds, and steps through the rows held under its key. A NULL
+  // key column is neither put nor probed.
+  const auto put = hashed.source.find("bc_hash_put(cx, h0, bc_sort_key_end(cx, hk0), row);");
+  const auto find = hashed.source.find("bc_hash_iter q0 = bc_hash_find(cx, h0, bc_sort_key_end(cx, hk0));");
+  REQUIRE(put != std::string::npos);
+  REQUIRE(find != std::string::npos);
+  CHECK(put < find);
+  CHECK(hashed.source.find("bc_cursor c = bc_scan_open(cx, TBL_4, lo, hi, BC_SCAN_FORWARD);", put) < find);
+  CHECK(has(hashed, "if (bc_col_null(cx, row, COL_1_2)) continue;"));
+  CHECK(has(hashed, "bc_sort_key_i64(cx, hk0, bc_col_i64(cx, row, COL_1_2), BC_SORT_ASC, BC_SORT_NULLS_FIRST);"));
+  CHECK(has(hashed, "if (bc_col_null(cx, row, COL_4_1)) continue;"));
+  CHECK(has(hashed, "while (bc_hash_next(cx, q0, &b0)) {"));
+  CHECK(has(hashed, "bc_emit_col(cx, row, COL_4_0);"));
+}
+
+TEST_CASE("search: a hash join builds on the side the counts make smaller", "[sql][search][cost][hash]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"u", {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  const auto& cat = f.cat();
+  const std::string sql = "SELECT t.id, u.k FROM t, u WHERE u.v = t.qty";
+  // Both tables read in full: the hash table holds the smaller one's rows,
+  // and the larger one probes it. Each costs both scans, the rows held and
+  // 1,000 x 10 / 10 pairs.
+  auto on_u = plan_sql(cat, sql, {{"t", 1000}, {"u", 10}});
+  CHECK(has(on_u, "// built on TBL_4's rows"));
+  CHECK(has(on_u, "bc_emit_col(cx, b0, COL_4_0);"));
+  CHECK(on_u.cost == Catch::Approx(1000 + 10 + 10 * (1 + kHashWeight) + 1000));
+  auto on_t = plan_sql(cat, sql, {{"t", 10}, {"u", 1000}});
+  CHECK(has(on_t, "// built on TBL_1's rows"));
+  CHECK(has(on_t, "bc_emit_col(cx, b0, COL_1_0);"));
+  CHECK(on_t.cost == Catch::Approx(on_u.cost));
+  // Under a LIMIT the build still holds every row; only the probes stop.
+  auto limited = plan_sql(cat, sql + " LIMIT 10", {{"t", 1000}, {"u", 10}});
+  CHECK(has(limited, "// built on TBL_4's rows"));
+  CHECK(has(limited, "while (n < 10 && bc_hash_next(cx, q0, &b0)) {"));
+  CHECK(limited.cost == Catch::Approx(10 + 10 * (1 + kHashWeight) + (1000 + 1000) * 10 / 1000.0));
+  // A sorter holds the probe side's rows, sorted before it probes, every row
+  // kept, the LIMIT counted above: so the side ORDER BY names is probed, and
+  // the hash table holds the other's, whichever is smaller.
+  auto sorted = plan_sql(cat, sql + " ORDER BY u.v LIMIT 3", {{"t", 1000}, {"u", 10}});
+  CHECK(has(sorted, "// built on TBL_1's rows"));
+  CHECK(has(sorted, "bc_sorter s0 = bc_sorter_open(cx, 0);"));
+  CHECK(sorted.source.find("bc_sorter_open") < sorted.source.find("bc_hash_find"));
+  CHECK(has(sorted, "while (n < 3 && bc_hash_next(cx, q0, &b0)) {"));
+  CHECK(has(plan_sql(cat, sql + " ORDER BY t.id DESC", {{"t", 1000}, {"u", 10}}), "// built on TBL_4's rows"));
+}
+
+TEST_CASE("search: a hash build that may pass the memory budget is a choice point, or left out",
+          "[sql][search][cost][hash][memory][choice]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"u", {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  const auto& cat = f.cat();
+  const std::string sql = "SELECT u.k FROM t, u WHERE t.name = $1 AND u.v = t.qty";
+  RowCounts counts = [](const Table& t) -> std::optional<std::uint64_t> { return t.name == "t" ? 40 : 100; };
+  auto plan = [&](std::uint64_t budget) {
+    return generate_plan(bound::bind(ast::parse(sql), cat), cat, sql, counts, budget);
+  };
+  // A hash table of n rows holds at least 192 + n x 240 bytes: past 10,000
+  // from 41 rows. The rows t's range holds when the plan runs decide: below
+  // 41 the hash join, from it u read once per row of t, which holds nothing.
+  auto choice = plan(10'000);
+  CHECK(has(choice, "int64_t count0 = bc_count_range(cx, IDX_3, lo0, hi0, 41);"));
+  CHECK(has(choice, "bc_cursor c = bc_scan_open(cx, IDX_3, lo0, lo0, BC_SCAN_PREFIX);"));
+  const auto other = choice.source.find("} else {");
+  REQUIRE(other != std::string::npos);
+  CHECK(choice.source.find("bc_hash_open") < other);
+  CHECK(choice.source.find("bc_cursor c1 = bc_scan_open(cx, TBL_4, lo, hi, BC_SCAN_FORWARD);", other) != std::string::npos);
+  CHECK(choice.cost == Catch::Approx(8 + 4 * (1 + kHashWeight) + 100 + 40 + 2));
+  CHECK(threshold(choice) == 41);
+  // Under 192 bytes no hash table fits: the plan avoids it.
+  auto avoided = plan(100);
+  CHECK_FALSE(has(avoided, "bc_hash"));
+  CHECK(has(avoided, "while (bc_scan_next(cx, c1)) {"));
+  // With no budget, the hash join alone.
+  auto unbounded = plan(0);
+  CHECK(has(unbounded, "bc_hash_open"));
+  CHECK_FALSE(has(unbounded, "bc_count_range"));
 }
 
 TEST_CASE("search: the planner uses the memory budget", "[sql][search][cost][memory]") {

@@ -168,9 +168,15 @@ The rules, by what they test.
   conjuncts from a key path, maybe a filter on the second; targets with a
   `LIMIT`, or `COUNT(DISTINCT)` of either table's column, and now and then
   an `ORDER BY` of either table's columns. `join_served` says whether
-  either table can be the outer one; where only a nested loop reading a
-  table once per row of the other would serve it, the cost model decides,
-  and the layer must run it or refuse it for the hash join (slice 5).
+  either table can be the outer one; where no key reaches either table, a
+  hash join or a nested loop reading one once per row of the other serves
+  it, unless its `ORDER BY` sorts by both tables' columns.
+- **A join no key reaches**: two tables, each scanned by parameters or in
+  full, linked by one or two equalities of columns of one type, key
+  columns or not (`join_no_key`), with targets, `ORDER BY`, `LIMIT` or
+  `COUNT(DISTINCT)`; and rows inserted with another table's join value
+  (`insert_a_match`), so join columns hold NULLs and duplicates on both
+  sides.
 - **A table read once**: one named by its key in parameters, the other
   scanned by parameters, linked by equalities of columns neither key takes
   (`join_read_once`) or of the scanned table's primary-key columns, which

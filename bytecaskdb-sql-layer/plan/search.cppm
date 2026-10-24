@@ -12,11 +12,12 @@
 //   2. Joins: each set of tables from the sets one smaller, the new table
 //      read by its whole primary key from parameters and the other tables'
 //      columns (an index nested loop), or by its own scan from parameters
-//      alone, the join's conjuncts filtering its rows (a nested loop): read
-//      once under at most one row, else once per outer row, where that costs
-//      no more than a hash join would (#534); keeping the cheapest plan per
-//      set and per interesting order. A plan's order is that of the one loop
-//      its rows come from; a key lookup per row keeps it.
+//      alone: the join's conjuncts filtering its rows (a nested loop), read
+//      once under at most one row, else once per outer row; or, where no key
+//      reaches it and the join has an equality between the sides, a hash
+//      join, built on either side; keeping the cheapest plan per set and per
+//      interesting order. A plan's order is that of the one loop its rows
+//      come from, a hash join's probe side's; a key lookup per row keeps it.
 //   3. The statement on top: the rows emitted, under LIMIT, or aggregated,
 //      COUNT and MIN also answered from the keys (bc_count_range, a scan's
 //      first entry) where nothing filters the rows. A plan not in the ORDER
@@ -25,8 +26,9 @@
 //   4. Choice points (*Choosing at run time*): where another range of a
 //      table a plan scans would cost less past some count of the plan's own
 //      range, the plan carries both, picked by bc_count_range when it runs;
-//      and where a sort of one table's range would pass the memory budget
-//      past some count, the plan in the ORDER BY's order beside it.
+//      where a sort of one table's range would pass the memory budget past
+//      some count, the plan in the ORDER BY's order beside it; and where a
+//      hash join's build would, the cheapest plan without one.
 // The interesting order is the ORDER BY's, NULL placement included. A
 // conjunct a key does not express is a filter on the row it reads; an
 // equality with $n ± k is always one. A conjunct always false leaves an
@@ -77,6 +79,10 @@ inline constexpr double kCountCost = 2;
 // the CPU and memory of adding and sorting it, in record reads. Measured on
 // the harness (*Decisions*, 9; docs/planner_design.md, *Slice 4 as built*).
 inline constexpr double kSortWeight = 0.5;
+// What a hash join's build costs per row it holds, beyond 1: the CPU and
+// memory of building its key and putting it. Measured on the harness
+// (*Decisions*, 9; docs/planner_design.md, *Hash joins as built*).
+inline constexpr double kHashWeight = 0.3;
 // The most choice points one plan carries (*Decisions*, 11); past them the
 // search takes its compile-time choice.
 inline constexpr std::size_t kMaxChoices = 4;
@@ -371,10 +377,9 @@ auto in_key(const Table& t, const Path& p, std::uint32_t col) -> bool {
   return std::ranges::any_of(p.parts, [&](const Part& q) { return q.col == col; });
 }
 
-// Where a plan stopped: at reaching its tables (Reach), at a filter it
-// can't run (Filter), or past both, at the join that would join its tables,
-// a hash join not planned yet (Join).
-enum class Stage { Reach, Filter, Join };
+// Where a plan stopped: at reaching its tables (Reach), or at a filter it
+// can't run (Filter).
+enum class Stage { Reach, Filter };
 
 // Why one plan failed: the stage it stopped at.
 struct Refusal {
@@ -491,7 +496,21 @@ struct Nested {
   bool rescan{false};
 };
 
-using Step = std::variant<Probe, Nested>;
+// The inner side of a hash join: a table by its own access path, from
+// parameters alone, read once; the join's equalities key the hash table, and
+// its other conjuncts filter the pairs. With `build_inner` the hash table
+// holds the inner table's rows, probed by the outer plan's; otherwise it
+// holds the outer table's, the plan's first and only one before it, probed
+// by the inner one's.
+struct Hashed {
+  std::size_t rel{0};
+  Access access;
+  std::vector<physical::HashKey> keys;  // each the held table's column, then the probe side's
+  Conjuncts filters;
+  bool build_inner{true};
+};
+
+using Step = std::variant<Probe, Nested, Hashed>;
 
 // A left-deep plan for a set of tables: the first by an access path, then
 // each other one by a step. A plan the search could not complete is kept,
@@ -504,6 +523,7 @@ struct Candidate {
   double cost{0};
   double rows{0};
   std::optional<Refusal> failed;  // the stage it stopped at, the earliest of its parts'
+  bool probe_sorted{false};       // a hash join's probe side is sorted before it probes
 
   // A point lookup, then lookups by key: at most one row.
   [[nodiscard]] auto one_row() const -> bool {
@@ -512,16 +532,28 @@ struct Candidate {
   }
 
   // The loops its rows come from, one inside another: the first table's scan
-  // and each table read by its own scan.
+  // and each table read by its own scan, a hash join's build side aside.
   [[nodiscard]] auto loops() const -> std::size_t {
     auto n = std::holds_alternative<physical::PointGet>(access.path) ? 0u : 1u;
     for (const auto& s : steps) n += std::holds_alternative<Nested>(s) ? 1u : 0u;
     return n;
   }
 
-  // Where its one loop is: 0 the first table's access, i + 1 step i's; nullopt
-  // for at most one row.
+  // Its hash join, or null.
+  [[nodiscard]] auto hash() const -> const Hashed* {
+    for (const auto& s : steps) {
+      if (const auto* h = std::get_if<Hashed>(&s)) return h;
+    }
+    return nullptr;
+  }
+
+  // Where its one loop is, the one its order is: 0 the first table's
+  // access, i + 1 step i's; a hash join built on the first table, its probe
+  // side's; nullopt for at most one row.
   [[nodiscard]] auto driving() const -> std::optional<std::size_t> {
+    for (std::size_t i = 0; i < steps.size(); ++i) {
+      if (const auto* h = std::get_if<Hashed>(&steps[i]); h != nullptr && !h->build_inner) return i + 1;
+    }
     if (!std::holds_alternative<physical::PointGet>(access.path)) return 0;
     for (std::size_t i = 0; i < steps.size(); ++i) {
       if (std::holds_alternative<Nested>(steps[i])) return i + 1;
@@ -529,11 +561,17 @@ struct Candidate {
     return std::nullopt;
   }
 
+  // The access path of the first table (0), or of step at - 1's table, read
+  // by its own scan.
   [[nodiscard]] auto access_at(std::size_t at) const -> const Access& {
-    return at == 0 ? access : std::get<Nested>(steps[at - 1]).access;
+    if (at == 0) return access;
+    if (const auto* h = std::get_if<Hashed>(&steps[at - 1])) return h->access;
+    return std::get<Nested>(steps[at - 1]).access;
   }
   [[nodiscard]] auto access_at(std::size_t at) -> Access& {
-    return at == 0 ? access : std::get<Nested>(steps[at - 1]).access;
+    if (at == 0) return access;
+    if (auto* h = std::get_if<Hashed>(&steps[at - 1])) return h->access;
+    return std::get<Nested>(steps[at - 1]).access;
   }
 
   // Its rows come in the ORDER BY's order: its loop's order, which a lookup
@@ -1040,47 +1078,87 @@ private:
 
   // The cost and rows of a candidate, each part's from its entries: the
   // first table's access, then for each step one key lookup per outer row,
-  // or the access read once, or once per outer row. `at`, if given, replaces
-  // one access's entries (0 the first table's, i + 1 step i's).
+  // or the access read once, or once per outer row, or a hash join; and the
+  // part of the cost a LIMIT does not cut, what a hash join does before its
+  // first pair. `at`, if given, replaces one access's entries (0 the first
+  // table's, i + 1 step i's).
   struct Entries {
     std::size_t at{0};
     double entries{0};
   };
-  static auto measure(const Candidate& c, std::optional<Entries> at = std::nullopt) -> std::pair<double, double> {
+  struct Measured {
+    double cost{0};
+    double rows{0};
+    double fixed{0};
+  };
+  static auto measure(const Candidate& c, std::optional<Entries> at = std::nullopt) -> Measured {
     auto entries = [&](std::size_t i, const Access& a) { return at && at->at == i ? at->entries : a.entries; };
-    auto cost = access_cost(c.access, entries(0, c.access));
-    auto rows = access_rows(c.access, entries(0, c.access));
+    Measured m;
+    m.cost = access_cost(c.access, entries(0, c.access));
+    m.rows = access_rows(c.access, entries(0, c.access));
     for (std::size_t i = 0; i < c.steps.size(); ++i) {
       if (const auto* pr = std::get_if<Probe>(&c.steps[i])) {
-        cost += rows;
-        rows *= selectivity(pr->filters);
+        m.cost += m.rows;
+        m.rows *= selectivity(pr->filters);
+      } else if (const auto* ne = std::get_if<Nested>(&c.steps[i])) {
+        auto x = entries(i + 1, ne->access);
+        m.cost += (ne->rescan ? std::max(m.rows, 1.0) : 1.0) * access_cost(ne->access, x);
+        m.rows *= access_rows(ne->access, x);
       } else {
-        const auto& ne = std::get<Nested>(c.steps[i]);
-        auto x = entries(i + 1, ne.access);
-        cost += (ne.rescan ? std::max(rows, 1.0) : 1.0) * access_cost(ne.access, x);
-        rows *= access_rows(ne.access, x);
+        const auto& h = std::get<Hashed>(c.steps[i]);
+        auto x = entries(i + 1, h.access);
+        // Each side read once. The build side's rows are held, each at the
+        // hash weight; a sorted probe side's, at the sort's, before it probes.
+        Measured inner{access_cost(h.access, x), access_rows(h.access, x), 0};
+        auto& built = h.build_inner ? inner : m;
+        auto& probed = h.build_inner ? m : inner;
+        built.cost += built.rows * (1 + kHashWeight);
+        if (c.probe_sorted) probed.cost += probed.rows * (1 + kSortWeight);
+        // Each pair is a step of bc_hash_next.
+        auto pairs = m.rows * inner.rows * std::pow(kEqSelectivity, static_cast<double>(h.keys.size()));
+        m.fixed = built.cost + (c.probe_sorted ? probed.cost : 0);
+        m.cost = built.cost + probed.cost + pairs;
+        m.rows = pairs * selectivity(h.filters);
       }
     }
-    return {cost, rows};
+    return m;
   }
 
   static void costed(Candidate& c) {
     if (c.failed) return;
-    std::tie(c.cost, c.rows) = measure(c);
+    auto m = measure(c);
+    c.cost = m.cost;
+    c.rows = m.rows;
   }
 
-  // A nested loop that reads `a` once per row of `outer`, refused where a
-  // hash join (#534), not planned yet, would cost less: it reads each side
-  // once and holds the smaller one's rows, each at the sort's weight.
-  auto hashed(const Candidate& outer, const Access& a, const Table& t) const -> std::optional<Refusal> {
-    auto inner = access_cost(a, a.entries);
-    auto rows = access_rows(a, a.entries);
-    auto loop = std::max(outer.rows, 1.0) * inner;
-    auto hash = inner + (1 + kSortWeight) * std::min(outer.rows, rows) + std::max(outer.rows, rows);
-    if (loop <= hash) return std::nullopt;
-    return Refusal{Stage::Join, "no key of " + t.name +
-                                     " is reached from the other table's rows, and reading it once per row costs more "
-                                     "than a hash join, which is not planned yet"};
+  // A hash join of the outer plan `o` and `q.rels[t]`, by the access `a`, on
+  // the join's equalities in `on`, built on t's rows or, when the plan is one
+  // table's access alone, on its rows; nullopt where `on` has no equality or
+  // the outer plan is more than one access. The built side's rows are read,
+  // for the hash table to hold. A DOUBLE in `on`, `on_double`, refuses it as
+  // it refuses a nested loop.
+  static auto hash_join(const Candidate& o, std::size_t t, const Tried& a, const Conjuncts& on,
+                        const std::optional<Refusal>& on_double, bool build_inner) -> std::optional<Candidate> {
+    if (!build_inner && !o.steps.empty()) return std::nullopt;
+    Hashed h;
+    h.rel = t;
+    h.build_inner = build_inner;
+    h.access = build_inner ? uncovered(a.access) : a.access;
+    for (const auto& j : on) {
+      if (j.op == Op::Eq) {
+        h.keys.push_back(build_inner ? physical::HashKey{col_of(j), operand_of(j).col}
+                                     : physical::HashKey{operand_of(j).col, col_of(j)});
+      } else {
+        h.filters.push_back(j);
+      }
+    }
+    if (h.keys.empty()) return std::nullopt;
+    Candidate c = o;
+    c.set |= 1u << t;
+    if (!build_inner) c.access = uncovered(c.access);
+    c.failed = earlier(o.failed, a.failed ? a.failed : on_double);
+    c.steps.emplace_back(std::move(h));
+    return c;
   }
 
   // The plans of the whole statement's set of tables, and each table's access
@@ -1105,6 +1183,10 @@ private:
         if (auto d = c.driving()) c.access_at(*d) = uncovered(c.access_at(*d));
       }
       costed(c);
+    };
+    auto cost_of = [&](Candidate c) {
+      cost(c);
+      return c;
     };
     const auto n = q.rels.size();
     const auto full = n == 32 ? ~0u : (1u << n) - 1;
@@ -1155,10 +1237,16 @@ private:
             c.set = set | (1u << t);
             auto rescan = !o.one_row();
             c.failed = earlier(o.failed, a.failed ? a.failed : on_double);
-            if (!c.failed && rescan) c.failed = hashed(o, a.access, q.rels[t].table());
             c.steps.emplace_back(Nested{t, read_once(a.access, on), on, rescan});
             cost(c);
             keep(best, std::move(c), full);
+            // Where no key reaches t, a hash join on the join's equalities,
+            // built on t or on the outer table. Under at most one outer row,
+            // reading t once costs less.
+            if (pr || pr.error().stage != Stage::Reach || o.one_row()) continue;
+            for (auto build_inner : {true, false}) {
+              if (auto h = hash_join(o, t, a, on, on_double, build_inner)) keep(best, cost_of(std::move(*h)), full);
+            }
           }
         }
       }
@@ -1256,37 +1344,50 @@ private:
     return physical::node(std::move(ch));
   }
 
+  // The table a step reads by its own access path.
+  static auto rel_of(const Step& s) -> std::size_t {
+    if (const auto* h = std::get_if<Hashed>(&s)) return h->rel;
+    return std::get<Nested>(s).rel;
+  }
+
   // The candidate's rows, with its choice points. With `sort`, they are
   // sorted: the sorter holds the row of the plan's one loop, and each table
   // looked up by key after the loop is looked up again from it, above the
-  // sort; its filters held already.
+  // sort; its filters held already. A hash join's probe side is sorted
+  // instead, before it probes, every row kept: the join may drop any.
   static auto build(const Query& q, const Candidate& c, const std::vector<ChoiceAt>& choices, const SortSpec* sort)
       -> Built {
     Built out;
     access_computed(out.computed, c.access, q.rels[c.first].table().id);
     auto by_column = false;
     auto nested = false;
-    for (const auto& step : c.steps) {
-      if (const auto* pr = std::get_if<Probe>(&step)) {
+    for (std::size_t i = 0; i < c.steps.size(); ++i) {
+      if (const auto* pr = std::get_if<Probe>(&c.steps[i])) {
         for (const auto& f : pr->filters) add_computed(out.computed, operand_of(f), q.rels[pr->rel].table().id);
         by_column = by_column || pr->by_column;
       } else {
-        const auto& ne = std::get<Nested>(step);
-        access_computed(out.computed, ne.access, q.rels[ne.rel].table().id);
+        access_computed(out.computed, c.access_at(i + 1), q.rels[rel_of(c.steps[i])].table().id);
         nested = true;
       }
     }
+    const auto* hash = c.hash();
+    const auto probe_sort = sort != nullptr && hash != nullptr ? std::optional{SortSpec{sort->keys, 0}} : std::nullopt;
+    auto leaf_of = [&](const Access& a, std::size_t at, std::size_t rel) {
+      auto rows = leaf_at(a, at, choices, sort);
+      if (probe_sort && c.driving() == at) rows = sorted(std::move(rows), *probe_sort, q.rels[rel].table().id);
+      return rows;
+    };
     const auto* g = std::get_if<physical::PointGet>(&c.access.path);
     if (!by_column) {
       out.null_checks = c.access.null_checks;
-      for (const auto& step : c.steps) {
-        if (const auto* pr = std::get_if<Probe>(&step)) {
+      for (std::size_t i = 0; i < c.steps.size(); ++i) {
+        if (const auto* pr = std::get_if<Probe>(&c.steps[i])) {
           for (auto p : key_params(pr->key)) add_param(out.null_checks, p);
         } else {
-          for (auto p : std::get<Nested>(step).access.null_checks) add_param(out.null_checks, p);
+          for (auto p : c.access_at(i + 1).null_checks) add_param(out.null_checks, p);
         }
       }
-      out.rows = leaf_at(c.access, 0, choices, sort);
+      out.rows = leaf_of(c.access, 0, c.first);
     } else if (g != nullptr && !nested) {
       // One outer row: a scan of its whole key's prefix, so one loop serves
       // and each inner key is built only from a row read.
@@ -1297,7 +1398,7 @@ private:
       out.rows = filtered(physical::node(std::move(sc)), c.access.filters);
     } else {
       out.null_checks = c.access.null_checks;
-      out.rows = leaf_at(c.access, 0, choices, sort);
+      out.rows = leaf_of(c.access, 0, c.first);
     }
     // A NULL parameter on any table matches no row.
     if (by_column) {
@@ -1306,13 +1407,27 @@ private:
     // The second plan of each choice point checks and computes what it reads.
     for (const auto& ch : choices) {
       for (auto p : ch.other.null_checks) add_param(out.null_checks, p);
-      const auto rel = ch.at == 0 ? c.first : std::get<Nested>(c.steps[ch.at - 1]).rel;
+      const auto rel = ch.at == 0 ? c.first : rel_of(c.steps[ch.at - 1]);
       access_computed(out.computed, ch.other, q.rels[rel].table().id);
     }
     for (std::size_t i = 0; i < c.steps.size(); ++i) {
       if (const auto* pr = std::get_if<Probe>(&c.steps[i])) {
         auto pairs = physical::node(physical::IndexJoin{std::move(out.rows), q.rels[pr->rel].table().id, pr->key});
         out.rows = filtered(std::move(pairs), pr->filters);
+      } else if (const auto* h = std::get_if<Hashed>(&c.steps[i])) {
+        auto inner = leaf_of(h->access, i + 1, h->rel);
+        physical::HashJoin hj;
+        hj.keys = h->keys;
+        if (h->build_inner) {
+          hj.build = std::move(inner);
+          hj.probe = std::move(out.rows);
+          hj.held = q.rels[h->rel].table().id;
+        } else {
+          hj.build = std::move(out.rows);
+          hj.probe = std::move(inner);
+          hj.held = q.rels[c.first].table().id;
+        }
+        out.rows = filtered(physical::node(std::move(hj)), h->filters);
       } else {
         out.rows = physical::node(physical::NestedLoop{
             std::move(out.rows), leaf_at(std::get<Nested>(c.steps[i]).access, i + 1, choices, sort)});
@@ -1320,7 +1435,7 @@ private:
     }
     // A choice by the budget sorts in its first plan's branch.
     auto in_choice = std::ranges::any_of(choices, &ChoiceAt::sorts_first);
-    if (sort != nullptr && !in_choice) {
+    if (sort != nullptr && !in_choice && hash == nullptr) {
       const auto d = *c.driving();
       const auto loop = d == 0 ? c.first : std::get<Nested>(c.steps[d - 1]).rel;
       out.rows = sorted(std::move(out.rows), *sort, q.rels[loop].table().id);
@@ -1345,8 +1460,8 @@ private:
     std::size_t again{0};
   };
 
-  static auto finished_cost(const Sink& s, std::pair<double, double> m) -> double {
-    auto [cost, rows] = m;
+  static auto finished_cost(const Sink& s, const Measured& m) -> double {
+    auto [cost, rows, fixed] = m;
     // COUNT(DISTINCT) steps through its groups once more.
     if (s.distinct) cost += rows;
     // A sort holds its rows, each a step of bc_sorter_next and its weight.
@@ -1354,8 +1469,9 @@ private:
       auto held = s.limit ? std::min(rows, static_cast<double>(*s.limit)) : rows;
       return cost + held * (1 + kSortWeight + static_cast<double>(s.again));
     }
-    // A LIMIT stops the loop once it has its rows.
-    if (s.limit && rows > static_cast<double>(*s.limit)) cost *= static_cast<double>(*s.limit) / rows;
+    // A LIMIT stops the loop once it has its rows, past what a hash join
+    // does before its first.
+    if (s.limit && rows > static_cast<double>(*s.limit)) cost = fixed + (cost - fixed) * static_cast<double>(*s.limit) / rows;
     return cost;
   }
 
@@ -1459,24 +1575,108 @@ private:
     return out;
   }
 
-  // A candidate finished: sorted by `sort` when given, its loop then reading
-  // rows; its choice points chosen, its rows built and wrapped by the sink,
-  // its cost the sink's plus each count's. `needs_order`: it gives the ORDER
-  // BY by its order.
-  template <typename Wrap>
-  auto finish(const Query& q, Candidate c, Sink sink, const std::vector<std::vector<Tried>>& tried, const SortSpec* sort,
-              bool needs_order, const Wrap& wrap) const -> Finished {
-    if (sort != nullptr) {
-      const auto d = *c.driving();
-      c.access_at(d) = uncovered(c.access_at(d));
-      costed(c);
+  // Whether a candidate can be sorted by `order`: a sorter holds one view
+  // per row, the row of the plan's one loop, or of a hash join's probe side
+  // when every ORDER BY column is that side's table's.
+  static auto sortable(const Query& q, const Candidate& c, const SortSpec& order) -> bool {
+    if (c.hash() == nullptr) return c.loops() <= 1;
+    const auto d = *c.driving();
+    const auto table = q.rels[d == 0 ? c.first : rel_of(c.steps[d - 1])].table().id;
+    return std::ranges::all_of(order.keys, [&](const physical::SortPart& k) { return k.col.table == table; });
+  }
+
+  // A candidate made ready for `order` (the statement's ORDER BY, or null):
+  // where it does not give it, its loop reads rows, and the sink sorts them,
+  // or, for a hash join, its probe side is sorted. Whether it sorts.
+  static auto prepare(Candidate& c, Sink& sink, const SortSpec* order) -> bool {
+    if (order == nullptr || c.ordered()) return false;
+    const auto d = *c.driving();
+    c.access_at(d) = uncovered(c.access_at(d));
+    if (c.hash() != nullptr) {
+      c.probe_sorted = true;
+    } else {
       sink.sorted = true;
       sink.again = c.steps.size() - d;
     }
-    auto choices = choose(c, sink, tried, needs_order, sort);
+    costed(c);
+    return true;
+  }
+
+  // The least count of rows a hash table holds past the memory budget: one of
+  // n rows holds at least kHashBytes and n × kHashEntryBytes; 0 for a budget
+  // under an empty one's.
+  auto hash_past() const -> std::uint64_t {
+    if (memory_ < kHashBytes) return 0;
+    return std::min<std::uint64_t>((memory_ - kHashBytes) / kHashEntryBytes + 1, std::uint64_t{1} << 62);
+  }
+
+  // A candidate finished, for `order`, the statement's ORDER BY or null: sorted
+  // where it does not give it (prepare); its choice points chosen, its rows
+  // built and wrapped by the sink, its cost the sink's plus each count's. A
+  // hash join takes the choice by the budget instead (finish_hash); nullopt
+  // when it is left out.
+  template <typename Wrap>
+  auto finish(const Query& q, Candidate c, Sink sink, const Searched& searched, const SortSpec* order,
+              const Wrap& wrap) const -> std::optional<Finished> {
+    auto sorts = prepare(c, sink, order);
+    const auto* sort = sorts ? order : nullptr;
+    if (c.hash() != nullptr) return finish_hash(q, std::move(c), sink, searched, order, wrap);
+    auto choices = choose(c, sink, searched.tried, order != nullptr && !sorts, sort);
     auto b = build(q, c, choices, sort);
     auto cost = finished_cost(sink, measure(c)) + kCountCost * static_cast<double>(choices.size());
-    return {wrap(std::move(b.rows)), std::move(b.null_checks), std::move(b.computed), cost};
+    return Finished{wrap(std::move(b.rows)), std::move(b.null_checks), std::move(b.computed), cost};
+  }
+
+  // A hash join finished (*Memory*, the planner uses the budget): its build
+  // side's rows are held, so where they may pass the memory budget and
+  // another plan of the statement avoids the hash table, the cheapest such
+  // plan is the second plan of a choice point, counting the build side's
+  // range, a full scan's the whole table, limited to the least count past the
+  // budget. A build known to pass it, of a range of at most one row, is left
+  // out where another plan avoids it, and one known to fit takes no choice
+  // point. Where none avoids it, the hash join runs, and past the budget
+  // fails with 54000. No choice point by costs is at either side.
+  template <typename Wrap>
+  auto finish_hash(const Query& q, Candidate c, const Sink& sink, const Searched& searched, const SortSpec* order,
+                   const Wrap& wrap) const -> std::optional<Finished> {
+    const auto& h = *c.hash();
+    const auto& built = h.build_inner ? h.access : c.access;
+    auto b = build(q, c, {}, c.probe_sorted ? order : nullptr);
+    auto cost = finished_cost(sink, measure(c));
+    std::optional<std::pair<Candidate, Sink>> other;
+    auto other_cost = 0.0;
+    if (memory_ != 0) {
+      for (auto o : searched.plans) {
+        if (o.hash() != nullptr || (order != nullptr && !o.ordered() && !sortable(q, o, *order))) continue;
+        auto s = Sink{sink.limit, sink.distinct};
+        prepare(o, s, order);
+        auto oc = finished_cost(s, measure(o));
+        if (!other || oc < other_cost) {
+          other = std::pair{std::move(o), s};
+          other_cost = oc;
+        }
+      }
+    }
+    const auto past = hash_past();
+    const auto known = past == 0 || built.max_entries <= 1;
+    if (!other || (known && built.max_entries < static_cast<double>(past))) {
+      return Finished{wrap(std::move(b.rows)), std::move(b.null_checks), std::move(b.computed), cost};
+    }
+    if (known) return std::nullopt;
+    auto& [oc, os] = *other;
+    auto ob = build(q, oc, {}, os.sorted ? order : nullptr);
+    physical::Choice ch;
+    ch.counted = *scan_of(built);
+    if (std::holds_alternative<physical::NullSplitScan>(built.path)) ch.counted.rest = std::monostate{};
+    ch.threshold = static_cast<std::int64_t>(past);
+    ch.below = std::move(b.rows);
+    ch.at_or_above = std::move(ob.rows);
+    for (auto p : ob.null_checks) add_param(b.null_checks, p);
+    for (const auto& v : ob.computed) {
+      if (std::ranges::find(b.computed, v) == b.computed.end()) b.computed.push_back(v);
+    }
+    return Finished{wrap(physical::node(std::move(ch))), std::move(b.null_checks), std::move(b.computed),
+                    cost + kCountCost};
   }
 
   // The rows an UPDATE or DELETE writes: each row whole, by a point lookup or
@@ -1492,7 +1692,9 @@ private:
     flatten(in, q);
     if (q.rels.size() != 1) no_plan("a Join where the search plans a table");
     auto searched = candidates(q, {}, {}, false, false);
-    for (const auto& c : searched.plans) out.push_back(finish(q, c, Sink{}, searched.tried, nullptr, false, wrap));
+    for (const auto& c : searched.plans) {
+      if (auto f = finish(q, c, Sink{}, searched, nullptr, wrap)) out.push_back(std::move(*f));
+    }
     return out;
   }
 
@@ -1596,14 +1798,15 @@ private:
         std::vector<ColumnRef> targets;
         for (const auto& o : s.project->exprs) targets.push_back(o.expr.col);
         // A plan not in the ORDER BY's order sorts its rows: a sorter holds
-        // one row per entry, of the plan's one loop.
-        auto sorts = !ordered.empty() && !c.ordered();
-        if (sorts && c.loops() > 1) {
-          unsorted = "ORDER BY " + names(order_by) + " over a nested loop of two scans: a sort holds one table's rows";
+        // one row per entry, of the plan's one loop or a hash join's probe
+        // side.
+        if (!ordered.empty() && !c.ordered() && !sortable(q, c, sort)) {
+          unsorted = "ORDER BY " + names(order_by) + " over a join of two scans: a sort holds one table's rows";
           continue;
         }
-        out.push_back(finish(q, c, Sink{s.limit}, searched.tried, sorts ? &sort : nullptr, !ordered.empty() && !sorts,
-                             [&](physical::NodePtr rows) { return emit(s, std::move(rows), std::move(targets)); }));
+        auto f = finish(q, c, Sink{s.limit}, searched, ordered.empty() ? nullptr : &sort,
+                        [&](physical::NodePtr rows) { return emit(s, std::move(rows), std::move(targets)); });
+        if (f) out.push_back(std::move(*f));
         continue;
       }
       // The keys answer an aggregate when nothing filters a row.
@@ -1630,10 +1833,10 @@ private:
                          std::move(b.null_checks), std::move(b.computed), cost});
         }
       }
-      out.push_back(finish(q, c, Sink{std::nullopt, agg->distinct}, searched.tried, nullptr, false,
-                           [&](physical::NodePtr rows) {
-                             return physical::node(physical::Aggregate{std::move(rows), *agg, emits});
-                           }));
+      auto f = finish(q, c, Sink{std::nullopt, agg->distinct}, searched, nullptr, [&](physical::NodePtr rows) {
+        return physical::node(physical::Aggregate{std::move(rows), *agg, emits});
+      });
+      if (f) out.push_back(std::move(*f));
     }
     if (out.empty()) no_plan(*unsorted);
     return out;

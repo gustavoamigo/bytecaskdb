@@ -394,7 +394,8 @@ private:
             return true;
           } else if constexpr (std::is_same_v<T, physical::IndexJoin>) {
             return loops(*op.outer);
-          } else if constexpr (std::is_same_v<T, physical::NestedLoop> || std::is_same_v<T, physical::Choice>) {
+          } else if constexpr (std::is_same_v<T, physical::NestedLoop> || std::is_same_v<T, physical::HashJoin> ||
+                               std::is_same_v<T, physical::Choice>) {
             return true;
           } else if constexpr (requires { op.input; }) {
             return loops(*op.input);
@@ -632,12 +633,13 @@ private:
     if (cr.emits) emit_count("n");
   }
 
-  // The scan a plan's rows come from, under its filters and sort; null for a
-  // NULL split.
+  // The scan a plan's rows come from, under its filters and sort, or a hash
+  // join's build side; null for a NULL split.
   static auto plain_scan(const physical::Node& n) -> const physical::Scan* {
     if (const auto* sc = std::get_if<physical::Scan>(&n.op)) return sc;
     if (const auto* f = std::get_if<physical::Filter>(&n.op)) return plain_scan(*f->input);
     if (const auto* o = std::get_if<physical::Sort>(&n.op)) return plain_scan(*o->input);
+    if (const auto* h = std::get_if<physical::HashJoin>(&n.op)) return plain_scan(*h->build);
     return nullptr;
   }
 
@@ -732,6 +734,63 @@ private:
       produce(*j.inner, k);
       row_name_ = outer_row;
       cursor_ = outer_cursor;
+    });
+  }
+
+  // A hash join's key for the row in hand, `hk<i>`, from each column's value:
+  // after a NULL in any of them, the next row, since `=` never holds for NULL.
+  // A value is a key part of its physical type, so equal values give equal
+  // bytes on both sides, read from a row or from a covering scan's entry.
+  auto hash_key(const std::string& i, const std::vector<ColumnRef>& cols) -> std::string {
+    std::vector<ColumnRef> checked;
+    for (const auto& c : cols) {
+      if (!c.nullable || std::ranges::find(checked, c) != checked.end()) continue;
+      miss(col_null(c));
+      checked.push_back(c);
+    }
+    const auto k = "hk" + i;
+    w_.line("bc_sort_key " + k + " = bc_sort_key_begin(cx);");
+    for (const auto& c : cols) {
+      w_.line("bc_sort_key_" + suffix(c.type) + "(cx, " + k + ", " + read_col(c) + ", BC_SORT_ASC, BC_SORT_NULLS_FIRST);");
+    }
+    return "bc_sort_key_end(cx, " + k + ")";
+  }
+
+  // A pipeline breaker: the build side's loop, in a block of its own, puts
+  // each row under its key in hash table h<i>; then, for each row of the probe
+  // side, a loop over the rows put under its key, the held one bound as b<i>.
+  // A LIMIT's counter is the probe side's and that loop's, never the build's.
+  void produce(const physical::HashJoin& h, const Consume& k) {
+    const auto i = std::to_string(hashes_++);
+    const auto table = "h" + i;
+    const auto held = "b" + i;
+    std::vector<ColumnRef> build_cols, probe_cols;
+    for (const auto& key : h.keys) {
+      build_cols.push_back(key.build);
+      probe_cols.push_back(key.probe);
+    }
+    // The build side is named in the plan text.
+    w_.line("bc_hash " + table + " = bc_hash_open(cx);  // built on " + w_.tbl(h.held) + "'s rows");
+    auto guard = std::exchange(guard_, "");
+    w_.open("");
+    produce(*h.build, [&] {
+      auto key = hash_key(i, build_cols);
+      w_.line("bc_hash_put(cx, " + table + ", " + key + ", " + binding(h.held).row + ");");
+    });
+    w_.close();
+    guard_ = guard;
+    produce(*h.probe, [&] {
+      auto key = hash_key(i, probe_cols);
+      const auto probe = "q" + i;
+      w_.line("bc_hash_iter " + probe + " = bc_hash_find(cx, " + table + ", " + key + ");");
+      w_.line("bc_view " + held + " = bc_empty(cx);");
+      w_.open("while (" + guard_ + "bc_hash_next(cx, " + probe + ", &" + held + "))");
+      rows_.push_back({h.held, held});
+      auto outer = std::exchange(loop_, true);
+      k();
+      loop_ = outer;
+      rows_.pop_back();
+      w_.close();
     });
   }
 
@@ -1056,6 +1115,7 @@ private:
   std::string* hit_{nullptr};    // a one-row aggregate: a miss joins this condition instead
   int choices_{0};               // the choice points printed: each counts into count<i>, over lo<i> and hi<i>
   int sorts_{0};                 // the sorts printed: each into sorter s<i>, its row p<i>
+  int hashes_{0};                // the hash joins printed: each into table h<i>, its row b<i>
   std::string cursor_{"c"};      // the cursor a scan opens
   // Each choice point's first plan's scan, and the counted range, lo<i> and
   // hi<i>, it opens on.
