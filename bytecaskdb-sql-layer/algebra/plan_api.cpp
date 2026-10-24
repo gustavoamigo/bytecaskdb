@@ -126,15 +126,24 @@ struct RowBuilder {
   Bytes built;
 };
 
-enum class EffectKind { Put, Del, DelRange, GuardUnchanged, GuardRange, GuardPresent, GuardAbsent };
+// GuardUniqueRange is a unique check's range guard, over the checked value's
+// prefix `a`. In a transaction it counts at commit only while the final
+// writes still put an entry under that prefix (Overlay::puts_under), the
+// rule the insert claims follow.
+enum class EffectKind {
+  Put,
+  Del,
+  DelRange,
+  GuardUnchanged,
+  GuardRange,
+  GuardUniqueRange,
+  GuardPresent,
+  GuardAbsent
+};
 
 struct Effect {
   EffectKind kind;
   Bytes a, b;
-  // A unique check's range guard, over the checked value's prefix `a`. It
-  // counts at commit only while the final writes still put an entry under
-  // that prefix (Overlay::puts_under), the rule the insert claims follow.
-  bool unique{false};
 };
 
 [[nodiscard]] auto is_write(const Effect& e) -> bool {
@@ -144,6 +153,7 @@ struct Effect {
     case EffectKind::DelRange: return true;
     case EffectKind::GuardUnchanged:
     case EffectKind::GuardRange:
+    case EffectKind::GuardUniqueRange:
     case EffectKind::GuardPresent:
     case EffectKind::GuardAbsent: return false;
   }
@@ -791,7 +801,7 @@ struct bc_ctx {
     effects.push_back({kind, Bytes(a.begin(), a.end()), Bytes(b.begin(), b.end())});
   }
   void push_unique_guard(BytesView prefix, Bytes&& hi) {
-    effects.push_back({EffectKind::GuardRange, Bytes(prefix.begin(), prefix.end()), std::move(hi), true});
+    effects.push_back({EffectKind::GuardUniqueRange, Bytes(prefix.begin(), prefix.end()), std::move(hi)});
   }
   // For keys the runtime built and no longer needs: moved, not copied.
   void push_effect(EffectKind kind, Bytes&& a, BytesView b = {}) {
@@ -1326,6 +1336,7 @@ auto written_tables(const Catalog& cat, const std::vector<Effect>& effects) -> s
       case EffectKind::DelRange: note(e.a); break;
       case EffectKind::GuardUnchanged:
       case EffectKind::GuardRange:
+      case EffectKind::GuardUniqueRange:
       case EffectKind::GuardPresent:
       case EffectKind::GuardAbsent: break;
     }
@@ -1980,7 +1991,8 @@ enum bc_commit_result bc_ctx_commit(bc_ctx* cx, bool sync) {
       case EffectKind::Del: plan.del(e.a); break;
       case EffectKind::DelRange: plan.del_range(e.a, e.b); break;
       case EffectKind::GuardUnchanged: plan.ensure_unchanged(e.a); break;
-      case EffectKind::GuardRange: plan.ensure_range_unchanged(e.a, e.b); break;
+      case EffectKind::GuardRange:
+      case EffectKind::GuardUniqueRange: plan.ensure_range_unchanged(e.a, e.b); break;
       case EffectKind::GuardPresent: plan.ensure_present(e.a); break;
       case EffectKind::GuardAbsent: plan.ensure_absent(e.a); break;
     }
@@ -2056,14 +2068,22 @@ bool bc_txn_repin(bc_txn* txn) {
 
 namespace {
 
-// A conservative bound on what the transaction holds, and on what it would
-// hold with the statement's effects in it, without merging them: a vector
-// grows at most to twice what it holds, each effect adds at most one node,
-// and an effect that replaces or erases others only frees.
 // What an effect holds, as the bound before a merge and guard_bytes after it
 // both count it.
 auto effect_bytes(const Effect& e) -> std::uint64_t { return held(e.a.capacity()) + held(e.b.capacity()); }
 
+// Whether a guard of the transaction goes to the engine. A unique check a
+// later statement made stale guards nothing: the final writes hold no entry
+// under its value. The same Overlay::puts_under decides the claims in
+// conflict_or_duplicate.
+auto guard_counts(const Effect& e, const Overlay& final_writes) -> bool {
+  return e.kind != EffectKind::GuardUniqueRange || final_writes.puts_under(e.a);
+}
+
+// A conservative bound on what the transaction holds, and on what it would
+// hold with the statement's effects in it, without merging them: a vector
+// grows at most to twice what it holds, each effect adds at most one node,
+// and an effect that replaces or erases others only frees.
 auto txn_holds(const bc_txn& t, std::size_t more_guards, std::size_t more_claims, std::size_t more_locks,
                std::size_t more_written) -> std::uint64_t {
   auto vec = [](std::size_t cap, std::size_t size, std::size_t more, std::size_t elem) -> std::uint64_t {
@@ -2123,6 +2143,7 @@ bool bc_txn_add(bc_ctx* cx) {
       case EffectKind::DelRange: txn->overlay.del_range(std::move(e.a), std::move(e.b)); break;
       case EffectKind::GuardUnchanged:
       case EffectKind::GuardRange:
+      case EffectKind::GuardUniqueRange:
       case EffectKind::GuardPresent:
       case EffectKind::GuardAbsent:
         txn->guard_bytes += effect_bytes(e);
@@ -2179,7 +2200,9 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
   // only guarded (SELECT … FOR UPDATE) is still checked: a guarded row a
   // concurrent commit changed is its conflict. The engine checks a
   // guard-only plan and writes nothing.
-  if (ov.empty() && txn->guards.empty()) {
+  // Guards a later statement made stale are pruned first: a transaction left
+  // with none of them and no write sends the engine nothing.
+  if (ov.empty() && std::ranges::none_of(txn->guards, [&](const Effect& e) { return guard_counts(e, ov); })) {
     txn->snap.reset();
     return BC_COMMITTED;
   }
@@ -2196,13 +2219,11 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
     }
   }
   for (const auto& e : txn->guards) {
-    // A unique check a later statement made stale guards nothing: the final
-    // writes hold no entry under its value. The same Overlay::puts_under
-    // decides the claims in conflict_or_duplicate.
-    if (e.unique && !ov.puts_under(e.a)) continue;
+    if (!guard_counts(e, ov)) continue;
     switch (e.kind) {
       case EffectKind::GuardUnchanged: plan.ensure_unchanged(e.a); break;
-      case EffectKind::GuardRange: plan.ensure_range_unchanged(e.a, e.b); break;
+      case EffectKind::GuardRange:
+      case EffectKind::GuardUniqueRange: plan.ensure_range_unchanged(e.a, e.b); break;
       case EffectKind::GuardPresent: plan.ensure_present(e.a); break;
       case EffectKind::GuardAbsent: plan.ensure_absent(e.a); break;
       case EffectKind::Put:

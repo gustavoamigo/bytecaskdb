@@ -803,6 +803,21 @@ TEST_CASE("transactions: a unique check guards the commit while the final writes
     CHECK(stored(f).size() == 1);
     check_indexes_exact(f);
   }
+  SECTION("the row inserted and deleted: commits, and writes no row") {
+    REQUIRE(stmt(f, a.p, delete_w, {std::int64_t{1}}).error == BC_OK);
+    CHECK(commit(f, a.p) == BC_COMMITTED);
+    CHECK(stored(f).empty());
+    check_indexes_exact(f);
+  }
+  // The encoded value ends with its own terminator, so a value that is a
+  // prefix of another ("x" of "xy") is not a prefix of its entries (types_design.md).
+  SECTION("a value that is a prefix of another is not guarded by it") {
+    REQUIRE(stmt(f, a.p, update_w, {std::int64_t{1}, bc_value{}, bytes("xy"), std::int64_t{1}}).error == BC_OK);
+    REQUIRE(autocommit(f, insert_w, row(2)) == BC_COMMITTED);  // takes "x", which a left
+    CHECK(commit(f, a.p) == BC_COMMITTED);
+    CHECK(stored(f).size() == 2);
+    check_indexes_exact(f);
+  }
   SECTION("the row's value changed: the value is free to a racing commit, and both commit") {
     REQUIRE(stmt(f, a.p, update_w, {std::int64_t{1}, bc_value{}, bytes("z"), std::int64_t{1}}).error == BC_OK);
     REQUIRE(autocommit(f, insert_w, row(2)) == BC_COMMITTED);
