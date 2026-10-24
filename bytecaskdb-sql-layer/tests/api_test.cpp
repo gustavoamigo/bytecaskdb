@@ -7,6 +7,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <cstdint>
@@ -46,12 +47,16 @@ auto ids(const Rows& r) -> std::vector<std::int64_t> {
   return out;
 }
 
-// The SqlError a statement is refused with, or "" if it runs.
+// What a statement is refused with before it runs, or "" if it runs: an
+// ast::SqlError, or a FeatureNotSupported (0A000), the planner's "no plan:"
+// among them.
 template <typename Stmt>
 auto sql_refusal(Database& db, const Stmt& stmt, const std::vector<Value>& params) -> std::string {
   try {
     (void)db.execute(stmt, params);
   } catch (const ast::SqlError& e) {
+    return e.what();
+  } catch (const FeatureNotSupported& e) {
     return e.what();
   }
   return "";
@@ -1055,4 +1060,55 @@ TEST_CASE("embedded API: refit describes a cached statement against the live cat
   CHECK(select.params().at(0).type == SqlType{SqlKind::Double});
   CHECK(select.columns().at(0).type == SqlType{SqlKind::Text});
   CHECK(db->execute(select, {2.5}).rows.empty());
+}
+
+TEST_CASE("embedded API: every plan the search costed returns the same rows", "[sql][api][search]") {
+  sql_test::TempDir dir{"api_alternatives"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE o (k BIGINT PRIMARY KEY, a BIGINT NOT NULL, b BIGINT, c BIGINT)");
+  (void)db->execute("CREATE INDEX o_a ON o (a)");
+  (void)db->execute("CREATE INDEX o_ab ON o (a, b)");
+  (void)db->execute("CREATE TABLE p (k BIGINT PRIMARY KEY, v BIGINT)");
+  for (std::int64_t k = 0; k < 40; ++k) {
+    auto b = k % 3 == 0 ? Value{} : i(k % 5);
+    (void)db->execute("INSERT INTO o VALUES ($1, $2, $3, $4)", {i(k), i(k % 4), b, i(k % 7)});
+    if (k < 7 && k != 3) (void)db->execute("INSERT INTO p VALUES ($1, $2)", {i(k), i(k % 4)});
+  }
+  // The rows as a multiset, and in order where the statement orders them.
+  auto sorted = [](Grid g) {
+    std::ranges::sort(g);
+    return g;
+  };
+  struct Case {
+    std::string sql;
+    std::vector<Value> params;
+    bool ordered;
+    std::size_t at_least;  // plans the search costs for it
+  };
+  const std::vector<Case> cases{
+      {"SELECT k, b FROM o WHERE a = $1", {i(1)}, false, 2},
+      {"SELECT k FROM o WHERE a = $1 AND b >= $2", {i(2), i(1)}, false, 2},
+      {"SELECT count(*) FROM o WHERE a = $1", {i(3)}, false, 4},
+      {"SELECT count(b) FROM o WHERE a = $1 AND k < $2", {i(0), i(30)}, false, 3},
+      {"SELECT min(b) FROM o WHERE a = $1", {i(1)}, false, 3},
+      {"SELECT sum(c) FROM o WHERE a = $1 AND k >= $2", {i(2), i(5)}, false, 3},
+      {"SELECT k FROM o WHERE a = $1 ORDER BY k DESC", {i(1)}, true, 1},
+      {"SELECT k, b FROM o WHERE a = $1 ORDER BY b, k", {i(2)}, true, 1},
+      {"SELECT o.k, p.v FROM o, p WHERE a = $1 AND p.k = o.c", {i(1)}, false, 2},
+      {"SELECT count(DISTINCT p.v) FROM o, p WHERE a = $1 AND p.k = o.c", {i(3)}, false, 2},
+  };
+  for (const auto& c : cases) {
+    INFO(c.sql);
+    auto want = db->execute(c.sql, c.params).rows;
+    auto all = db->alternatives_for_testing(c.sql, c.params);
+    CHECK(all.size() >= c.at_least);
+    for (std::size_t n = 0; n < all.size(); ++n) {
+      INFO("plan " << n);
+      if (c.ordered) {
+        CHECK(all[n].rows == want);
+      } else {
+        CHECK(sorted(all[n].rows) == sorted(want));
+      }
+    }
+  }
 }

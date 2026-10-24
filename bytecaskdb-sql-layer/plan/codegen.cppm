@@ -36,8 +36,8 @@ module;
 export module bytecask.sql.codegen;
 
 export import bytecask.sql.binder;
+export import bytecask.sql.search;
 import bytecask.sql.rewrite;
-import bytecask.sql.search;
 
 export namespace bytecask::sql {
 
@@ -61,13 +61,22 @@ struct GeneratedPlan {
   std::uint64_t catalog_version{0};
   std::vector<std::uint32_t> objects_read, tables_written;
   std::vector<ColumnDep> columns;
+  double cost{0};  // what the search predicted the plan charges the work budget
 };
 
 // Plans a bound DML statement, its logical plan rewritten, then searched,
-// and prints the plan. Throws FeatureNotSupported ("no plan: ...") when no
-// rule applies, and std::logic_error if the physical plan fails
-// physical::check, a compiler bug.
-[[nodiscard]] auto generate_plan(bound::Bound b, const Catalog& cat, std::string_view sql) -> GeneratedPlan;
+// its tables costed at `counts`, and prints the cheapest plan. Throws
+// FeatureNotSupported ("no plan: ...") when the search finds none, and
+// std::logic_error if the physical plan fails physical::check, a compiler
+// bug.
+[[nodiscard]] auto generate_plan(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts = {})
+    -> GeneratedPlan;
+
+// Every plan the search costs for the statement, cheapest first, each
+// printed as generate_plan prints the one it picks (*Tests*, alternatives
+// agree). Throws what generate_plan throws.
+[[nodiscard]] auto generate_alternatives(bound::Bound b, const Catalog& cat, std::string_view sql,
+                                         const RowCounts& counts = {}) -> std::vector<GeneratedPlan>;
 
 }  // namespace bytecask::sql
 
@@ -605,9 +614,13 @@ private:
   }
 
   // For each outer row, the inner row its key names. Of an outer column, a
-  // NULL names no row, nor does a byte string too long for any key.
+  // NULL names no row, nor does a byte string too long for any key. The
+  // inner row of the d-th join from the first table is row<d>, found<d>.
   void produce(const physical::IndexJoin& j, const Consume& k) {
     produce(*j.outer, [&] {
+      const auto d = std::to_string(rows_.size());
+      const auto row = "row" + d;
+      const auto found = "found" + d;
       std::vector<KeySrc> parts;
       for (const auto& e : j.inner_key) {
         if (e.kind == Expr::Kind::Param) {
@@ -618,18 +631,20 @@ private:
         parts.push_back({std::nullopt, read_col(e.col), e.col.type});
       }
       w_.reads(j.inner);
-      w_.line("bool found1 = false;");
+      w_.line("bool " + found + " = false;");
       auto inner_key = key(w_, j.inner, parts, true);
       if (hit_) {
-        // No pair without the outer row: the inner one is not read.
-        w_.line("bc_view row1 = bc_empty(cx);");
-        w_.line("if (found) row1 = bc_get(cx, " + inner_key + ", &found1);");
-        *hit_ += " && found1";
+        // No row without the rows before it: the inner one is not read.
+        std::string before = "found";
+        for (std::size_t i = 1; i < rows_.size(); ++i) before += " && found" + std::to_string(i);
+        w_.line("bc_view " + row + " = bc_empty(cx);");
+        w_.line("if (" + before + ") " + row + " = bc_get(cx, " + inner_key + ", &" + found + ");");
+        *hit_ += " && " + found;
       } else {
-        w_.line("bc_view row1 = bc_get(cx, " + inner_key + ", &found1);");
-        miss("!found1");
+        w_.line("bc_view " + row + " = bc_get(cx, " + inner_key + ", &" + found + ");");
+        miss("!" + found);
       }
-      rows_.push_back({j.inner, "row1"});
+      rows_.push_back({j.inner, row});
       k();
       rows_.pop_back();
     });
@@ -912,14 +927,9 @@ private:
   std::string* hit_{nullptr};    // a one-row aggregate: a miss joins this condition instead
 };
 
-}  // namespace
-
-auto generate_plan(bound::Bound b, const Catalog& cat, std::string_view sql) -> GeneratedPlan {
-  auto* stmt = std::get_if<logical::NodePtr>(&b.stmt);
-  if (stmt == nullptr) throw ast::SqlError{"DDL has no plan", -1};
-  logical::rewrite(**stmt);
-  auto p = search(**stmt, cat);
-  p.param_types = b.param_types;
+// Prints a searched plan, checked first.
+auto print_plan(physical::Plan p, const std::vector<PhysType>& param_types, std::string_view sql) -> GeneratedPlan {
+  p.param_types = param_types;
   physical::check(p);
   GeneratedPlan out;
   out.param_types = p.param_types;
@@ -949,6 +959,27 @@ auto generate_plan(bound::Bound b, const Catalog& cat, std::string_view sql) -> 
                "\n\nvoid plan(bc_ctx *cx) {\n" + w.body() + "}\n";
   out.objects_read = w.objects_read();
   out.columns = w.columns_used();
+  out.cost = p.cost;
+  return out;
+}
+
+auto rewritten(bound::Bound& b) -> logical::Node& {
+  auto* stmt = std::get_if<logical::NodePtr>(&b.stmt);
+  if (stmt == nullptr) throw ast::SqlError{"DDL has no plan", -1};
+  logical::rewrite(**stmt);
+  return **stmt;
+}
+
+}  // namespace
+
+auto generate_plan(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts) -> GeneratedPlan {
+  return print_plan(search(rewritten(b), cat, counts), b.param_types, sql);
+}
+
+auto generate_alternatives(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts)
+    -> std::vector<GeneratedPlan> {
+  std::vector<GeneratedPlan> out;
+  for (auto& p : search_all(rewritten(b), cat, counts)) out.push_back(print_plan(std::move(p), b.param_types, sql));
   return out;
 }
 

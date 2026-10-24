@@ -278,9 +278,12 @@ TEST_CASE("codegen: a join is of two point lookups, in FROM order", "[sql][codeg
     }
     return "accepted";
   };
-  CHECK(refusal("SELECT v FROM u, t WHERE k = $1 AND id = $2 ORDER BY v") == "no plan: ORDER BY on a join");
-  CHECK(refusal("SELECT v FROM u, t WHERE k = $1 AND name = $2") ==
-        "no plan: a join must name the row of each table by its whole primary key yet");
+  // Two point lookups give at most one row: any ORDER BY.
+  CHECK(refusal("SELECT v FROM u, t WHERE k = $1 AND id = $2 ORDER BY v") == "accepted");
+  // t by its index, u by its key from a parameter: a lookup per t row.
+  auto cross = generate(f.cat(), "SELECT v FROM u, t WHERE k = $1 AND name = $2");
+  CHECK(cross.source.find("bc_scan_open(cx, IDX_3, lo, lo, BC_SCAN_PREFIX);") != std::string::npos);
+  CHECK(cross.source.find("bc_view row1 = bc_get(cx, bc_key_params(cx, TBL_4, 0, 1), &found1);") != std::string::npos);
   // A join on a column: the outer table reached from its parameters, the
   // inner one read by its whole primary key from the outer row.
   auto loop = generate(f.cat(), "SELECT v FROM t, u WHERE name >= $1 AND k = qty");
@@ -290,7 +293,16 @@ TEST_CASE("codegen: a join is of two point lookups, in FROM order", "[sql][codeg
   // FROM order first, then the other: u is the one its parameters reach.
   CHECK(refusal("SELECT v FROM t, u WHERE k = $1 AND id = v") == "accepted");
   CHECK(refusal("SELECT v FROM t, u WHERE qty = $1 AND k = qty") == "no plan: a full scan of t");
-  CHECK(refusal("SELECT v FROM t, u WHERE id = $1 AND v = qty") == "no plan: no index of u joins on v");
+  CHECK(refusal("SELECT v FROM t, u WHERE id = $1 AND v = qty") == "no plan: no equality names u's key");
+  // An ORDER BY on a join is the first table's scan's order: a lookup per
+  // row keeps it. A column of the other table is in no scan's order.
+  auto ordered = generate(f.cat(), "SELECT v FROM t, u WHERE name >= $1 AND k = qty ORDER BY name DESC");
+  CHECK(ordered.source.find("bc_scan_open(cx, IDX_3, lo, hi, BC_SCAN_REVERSE);") != std::string::npos);
+  CHECK(refusal("SELECT v FROM t, u WHERE name >= $1 AND k = qty ORDER BY v") ==
+        "no plan: no index of t gives ORDER BY v");
+  // name compared for equality: the index's next part, id, gives the order.
+  auto by_id = generate(f.cat(), "SELECT v FROM t, u WHERE name = $1 AND k = qty ORDER BY id");
+  CHECK(by_id.source.find("bc_scan_open(cx, IDX_3, lo, lo, BC_SCAN_PREFIX);") != std::string::npos);
   // FROM order would leave x.f = y.f a filter on a DOUBLE PRECISION; the
   // other order keys x by it.
   using sql_test::Fixture;

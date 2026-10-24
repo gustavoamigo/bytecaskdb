@@ -8,9 +8,8 @@
 // reads the catalog.
 //
 // The operators are Empty, the access paths, the joins, Filter, Limit, Aggregate
-// and the sinks: Emit for result rows, Insert, Update, Delete. Slice 1 of the
-// design: the access paths and choices of the MVP's planner, no sort and no
-// hash join. check() enforces what the types can't express.
+// and the sinks: Emit for result rows, Insert, Update, Delete. No sort and no
+// hash join yet. check() enforces what the types can't express.
 
 module;
 #include <algorithm>
@@ -195,6 +194,9 @@ struct Plan {
   std::vector<std::uint32_t> null_checks;
   std::vector<Computed> computed;    // what the statement's $n ± k evaluate to
   std::vector<ResultColumn> result;  // empty for a write
+  // What the cost model predicts the plan charges the work budget: record
+  // reads plus cursor steps (docs/planner_design.md, *The cost model*).
+  double cost{0};
 };
 
 // $n ± k, as the Computed it evaluates to, compared with a column of `table`.

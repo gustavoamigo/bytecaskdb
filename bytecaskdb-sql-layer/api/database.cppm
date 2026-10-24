@@ -28,6 +28,7 @@ module;
 #include <cstdio>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -404,10 +405,12 @@ public:
   // once close() was called, as the engine's calls do.
 
   // Parses, binds and (for DML) plans and compiles; cached by the exact text.
-  // Throws ast::SqlError. The reference is valid until close().
+  // Throws ast::SqlError, or FeatureNotSupported ("no plan: ...") for a
+  // statement the planner can't plan. The reference is valid until close().
   auto prepare(std::string_view sql) -> const Statement&;
   // Throws ParamError for parameters of the wrong number or type,
-  // ast::SqlError if a recompile fails, ExecError if the plan fails,
+  // ast::SqlError or FeatureNotSupported if a recompile fails, as prepare
+  // does, ExecError if the plan fails,
   // TransactionResolutionUnknown if its commit's outcome is unknown,
   // std::logic_error for a statement another Database prepared, and for
   // DDL, what LiveCatalog::apply throws (DdlRefused for a statement the
@@ -440,6 +443,11 @@ public:
   // with the oracle's; SQL has no full scan. Throws ast::SqlError for a
   // table that does not exist, as a statement naming it would.
   [[nodiscard]] auto table_rows(std::string_view table) const -> Rows;
+  // Test only: runs every plan the search costs for a SELECT, autocommit,
+  // each on its own snapshot, and returns each one's rows, the cheapest
+  // plan's first (docs/planner_design.md, *Tests*, alternatives agree).
+  // Throws what prepare and execute throw.
+  [[nodiscard]] auto alternatives_for_testing(std::string_view sql, const std::vector<Value>& params) -> std::vector<Rows>;
   // Test only: while on, every autocommit plan that writes a table
   // conflicts. Before each commit reaches the engine, every table's catalog
   // record is written back unchanged, which such a plan guards, so execute
@@ -485,6 +493,11 @@ private:
   // A DML statement's plan for the live catalog; null for DDL. Throws what
   // binding, planning and compiling throw.
   [[nodiscard]] auto build(const Statement& s) -> std::shared_ptr<const Compiled>;
+  // What the search costs plans with: each table's row count, counted on a
+  // snapshot taken now.
+  [[nodiscard]] auto row_counts() const -> RowCounts;
+  // Compiles a plan's text and sets what a run needs from it.
+  void link(Compiled& c);
   auto recompile(const Statement& stmt) -> std::shared_ptr<const Compiled>;
   // The statement's plan, checked against the live catalog and recompiled
   // if it no longer fits.
@@ -847,6 +860,17 @@ auto Database::catalog() const -> std::shared_ptr<const Catalog> {
   return live_->current();
 }
 
+auto Database::row_counts() const -> RowCounts {
+  // One snapshot for every table the search counts. Each count is
+  // bc_count_range's: at most two record reads, whatever the table holds.
+  auto snap = std::make_shared<Snapshot>(db_->snapshot());
+  return [snap](const Table& t) -> std::optional<std::uint64_t> {
+    auto lo = row_prefix(t.id);
+    auto hi = key_successor(lo);
+    return snap->count_keys(lo, hi, std::numeric_limits<std::size_t>::max());
+  };
+}
+
 auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
   auto cat = live_->current();
   auto bound = bound::bind(s.ast_, *cat);
@@ -856,7 +880,14 @@ auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
   c->param_sql = std::move(bound.param_sql);
   c->param_table = std::move(bound.param_table);
   c->params = std::move(bound.params);
-  c->plan = std::make_unique<GeneratedPlan>(generate_plan(std::move(bound), *cat, s.sql_));
+  c->plan = std::make_unique<GeneratedPlan>(generate_plan(std::move(bound), *cat, s.sql_, row_counts()));
+  link(*c);
+  ++compilations_;
+  return c;
+}
+
+void Database::link(Compiled& compiled) {
+  auto* c = &compiled;
   c->columns = c->plan->result_names;
   c->column_types = c->plan->result_sql;
   c->result_codes = result_type_codes(c->plan->result_types);
@@ -880,8 +911,6 @@ auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
             c->result_codes.data(),
             n(c->result_codes)};
   c->checked.store(p.catalog_version);
-  ++compilations_;
-  return c;
 }
 
 auto Database::recompile(const Statement& stmt) -> std::shared_ptr<const Compiled> {
@@ -1259,6 +1288,43 @@ auto Transaction::commit() -> CommitOutcome {
 void Database::conflict_on_every_commit_for_testing(bool on) {
   auto lock = enter();
   conflict_every_commit_.store(on);  // each autocommit context takes it up when it is next taken
+}
+
+auto Database::alternatives_for_testing(std::string_view sql, const std::vector<Value>& params) -> std::vector<Rows> {
+  auto lock = enter();
+  auto cat = live_->current();
+  auto bound = bound::bind(ast::parse(sql), *cat);
+  if (std::holds_alternative<Ddl>(bound.stmt)) throw std::logic_error("DDL has no plan");
+  auto param_sql = bound.param_sql;
+  auto param_table = bound.param_table;
+  std::vector<Rows> out;
+  for (auto& plan : generate_alternatives(std::move(bound), *cat, sql, row_counts())) {
+    if (!plan.returns_rows) throw std::logic_error("alternatives of a statement that writes");
+    const auto& types = plan.param_types;
+    if (params.size() != types.size()) throw ParamError("statement takes " + std::to_string(types.size()) + " parameters");
+    for (std::size_t i = 0; i < params.size(); ++i) {
+      if (!datum_fits(params[i], types[i])) throw ParamError("parameter $" + std::to_string(i + 1) + " has the wrong type");
+    }
+    Compiled c;
+    c.param_sql = param_sql;
+    c.param_table = param_table;
+    c.plan = std::make_unique<GeneratedPlan>(std::move(plan));
+    link(c);
+    auto* cx = acquire_context();
+    try {
+      bc_params bp{params};
+      auto r = bc_execute(cx, c.code->fn(), &c.ref, &bp, budget_, sync_commits_, kMaxRetries);
+      if (r == BC_CONFLICT) throw ExecError::conflicted("conflict: a guard failed on every attempt");
+      if (r == BC_FAILED) throw_context_error(cx);
+      out.push_back(results(cx, c, Rows{}));
+      release_context(cx);
+    } catch (...) {
+      bc_ctx_reset(cx);
+      release_context(cx);
+      throw;
+    }
+  }
+  return out;
 }
 
 auto Database::table_rows(std::string_view table) const -> Rows {

@@ -1,11 +1,13 @@
 # The planner: a logical algebra, a search, and compiled pipelines
 
-Status: **design, approved (owner, 2026-10-24); slice 1 built** (*Slice 1
-as built*): the pipeline, at parity with the MVP's rule-based planner,
-which it replaced. The statement memory budget of *Memory* is built too
-(`plan_api_design.md`, revision 6); the lifetime rule and slices 2 to 5
-are not. The first of the post-MVP designs (#487, *Next*). The parser, the
-plan API and TinyCC are unchanged; the binder's output changed.
+Status: **design, approved (owner, 2026-10-24); slices 1 and 2 built,
+slice 2 without its choice points** (*Slice 1 as built*, *Slice 2 as
+built*): the pipeline, then System R's search with the cost model. The
+statement memory budget of *Memory* is built too (`plan_api_design.md`,
+revision 6); the choice points (*Choosing at run time*), the lifetime rule
+and slices 3 to 5 are not. The first of the post-MVP designs (#487,
+*Next*). The parser, the plan API and TinyCC are unchanged; the binder's
+output changed.
 
 ## Why
 
@@ -509,8 +511,10 @@ sets `BC_C_RANGE` when the value is outside it.
 
 ### The search's choices
 
-The MVP planner's rules, which slice 1's search keeps: no cost model,
+The MVP planner's rules, which slice 1's search kept: no cost model,
 chosen so every TPROC-C statement gets the plan a person would write.
+Slice 2 replaced them with costs (*Slice 2 as built*), and its refusals
+are there.
 
 **Access path, per table.** A path is the primary key or one of the
 table's indexes. It is *usable* when its first part is compared for
@@ -525,7 +529,7 @@ at most one row.
 
 1. Every primary-key column compared for equality: a point lookup.
 2. Otherwise, with an `ORDER BY`, only the usable paths that serve it
-   remain. None remaining: refused (*What the search refuses*, row 5).
+   remain. None remaining: refused (*What the search refused*).
 3. Of those, the one with the longest leading run of equality-compared
    parts wins; at equal runs, one with a range part after the run beats
    one without. Remaining ties go to the primary key, then to the covering
@@ -613,31 +617,182 @@ as it stood at the statement's start (`docs/transaction_design.md`,
 *Statements inside a transaction*), so its own writes never feed back into
 its scan.
 
-#### What the search refuses
+#### What the search refused
 
-The search refuses a statement inside the subset that it can't answer
-from an index scan in PostgreSQL's order (#533). It checks in this order, and the first refusal is the
-statement's only one:
+Slice 1 refused, in this order: an `ORDER BY` on a join; a join where
+neither table is reachable from parameters alone, or whose inner table no
+key reaches from the outer row; a table with no usable path; usable paths
+none of which gives the `ORDER BY`; and a chosen path that can't place its
+`ORDER BY`'s NULLs as PostgreSQL does. *Slice 2 as built* has what
+replaced it.
+
+## Slice 2 as built
+
+System R's search and the cost model, without the choice points: a bound
+that depends on `$n` takes the fixed selectivities. Every golden plan,
+TPROC-C's and the fixture's, regenerated unchanged, byte for byte, so no
+statement's reads changed. The TPROC-C statements compiled on the
+harness's loaded database, with its counts, give their golden plans too.
+
+**The source.** The search flattens what the statement reads into its
+tables, in `FROM` order, each with the conjuncts on it, and the join's
+conjuncts between two of them. One validator, `use_of`, decides what the
+search can use, for a table's `Filter` and a `Join`'s predicate alike: a
+column of the table compared with a parameter or with `$n ± k`, or with a
+column of another table only in a `Join`'s predicate and only when that
+table is on the `Join`'s other side. A predicate conjunct that compares a
+column with a parameter goes to its table, as pushdown would put it.
+Anything else is refused (*What the search refuses*).
+
+**Access paths, per table.**
+- The point lookup, when the whole primary key is compared for equality.
+- A scan of the primary key and of each index whose first part is
+  compared: the equality prefix, the range on the next part, forward or
+  reverse, covering when every column read is in the key and no filter
+  reads the row. A scan of the whole primary key by equality is the point
+  lookup, not built twice.
+- No full scan (slice 4).
+
+**Joins.** Left-deep, bottom up over sets of tables: each set of k tables
+from each set of k − 1 and one more table, read by its whole primary key
+from parameters and the columns of the tables already read. The search
+keeps the cheapest plan per set, the first of equals, so `FROM` order
+breaks ties. The whole statement's plans are all finished, emitted under
+`LIMIT` or aggregated, before they are compared, since a `LIMIT` changes
+which is cheaper. Sets are bit masks of up to 32 tables; the dialect has
+two.
+
+**Interesting orders.** No sort exists yet, so the `ORDER BY`'s order is
+the only interesting one, and a path that doesn't give it is not built:
+the cheapest plan per set is the cheapest per set and order.
+- A plan's order is its first table's scan's, and a key lookup per row
+  keeps it. So an `ORDER BY` on a join is planned when the first table's
+  scan gives it, on that table's columns.
+- The order includes NULL placement. A nullable ordered part gives
+  PostgreSQL's order only in the two-range form: first after the prefix,
+  `ASC`, every later ordered part `NOT NULL`.
+- A point lookup gives any order.
+
+**Answered from the keys.** `COUNT` over a scan with no filter is
+`bc_count_range`; `MIN` over a forward scan whose next part is the
+argument's `ASC` part, with no filter, is the scan's first entry. Each is
+a plan beside the loop over the same scan, and costs decide between them.
+
+### The cost model as built
+
+| Plan | Cost |
+|---|---|
+| A point lookup | 1 |
+| A scan | its entries; twice that for an index scan that fetches each row |
+| `COUNT` by `bc_count_range` | 2 |
+| `MIN` from the first entry | 1; 2 when it fetches the row |
+| A join | the outer plan's cost, plus 1 per outer row |
+| `COUNT(DISTINCT)` | its input's, plus 1 per row (`bc_agg_next`) |
+| Under `LIMIT n` | the cost × n / the rows, when there are more than n |
+
+- **Entries.** A scan reaches the table's rows × 1/10 per
+  equality-compared part × 1/3 per range bound. It reaches at most 1 when
+  the prefix covers a unique index's columns, and at least 1.
+- **Rows.** A plan's entries, or 1 for a point lookup, × 1/10 per filter by
+  `=` and 1/3 per other filter.
+- **A table's rows** are counted when the plan is compiled: `Database`
+  counts each table's primary key on one snapshot, as `bc_count_range`
+  does, at most two record reads each. Every `WHERE` operand in today's
+  dialect is `$n` or `$n ± k`, so the whole table is the only constant
+  bound. A plan compiled with no database, as the golden plans are, costs a
+  table at 1,000,000 rows. That is large enough that a key read beats a
+  loop, as it does on a table where the choice matters.
+
+**The selectivities, measured** (*Decisions*, 9). On the harness's
+two-warehouse load, the fraction of a table's rows each TPROC-C key bound
+keeps, its parameter drawn as a row's own value:
+
+| Bound | Statements | Rows | Kept | Per conjunct |
+|---|---|---:|---:|---:|
+| `new_order (w, d)` | D1, D2 | 18,000 | 5.0e-2 | 0.224 |
+| `orders (w, d)` | O4 | 60,000 | 5.0e-2 | 0.224 |
+| `order_line (w, d)` | S2 | 600,251 | 5.0e-2 | 0.224 |
+| `customer (w, d, c_last)` | O1, O2, P5, P6 | 60,000 | 1.6e-4 | 0.055 |
+| `order_line (w, d, o_id)` | D5, D6, O5 | 600,251 | 1.8e-5 | 0.026 |
+| `orders (w, d, o_c_id)` | O4 | 60,000 | 1.7e-5 | 0.026 |
+| `ol_o_id` in `[next − 20, next)`, within `(w, d)` | S2 | 600,251 | 6.6e-3 | 0.081 per bound |
+| `s_quantity < 10..20` | S2's filter | 200,000 | 5.6e-2 | 0.056 |
+
+- An equality keeps 0.026 to 0.224 per conjunct, 0.087 by their geometric
+  mean: close to 1/10.
+- A range keeps far less than 1/3: 0.081 per bound, 0.056 for the filter.
+- The constants stay System R's. With the measured 0.087 and 0.081 in
+  their place, no golden plan moves.
+- A range's 1/3 is the number to revisit when a workload's choice turns on
+  it.
+- The per-row weight of a sort or hash build waits for slice 4.
+
+### What the search refuses
+
+A statement is refused only when no plan computes it. Slice 1 chose one
+path and refused the statement when that path failed; slice 2 tries each.
+So these are planned now, where slice 1 refused them:
+- a table whose first-choice path left a DOUBLE filter or could not place
+  its NULLs, but which another path serves;
+- an `ORDER BY` on a join that the first table's scan gives;
+- a join whose second table is keyed by parameters alone, the first one
+  scanned: a key lookup per row of the first.
 
 | # | Refused | Message |
 |---|---|---|
-| 1 | A join with an `ORDER BY` | `no plan: ORDER BY on a join` |
-| 2 | A join where neither table is reachable from parameters alone | `no plan: a full scan of <first table in FROM>` |
-| 3 | A join whose inner table no key reaches from the outer row and the parameters | `no plan: no index of <inner table> joins on <columns>` |
-| 4 | A single table with no usable path | `no plan: a full scan of <table>` |
-| 5 | A single table whose usable paths don't give its `ORDER BY` (a point lookup on the whole primary key always does) | `no plan: no index of <table> gives ORDER BY <columns>` |
-| 6 | A single table whose chosen path can't place the NULLs of its `ORDER BY` as PostgreSQL does (*NULLs in an ordered part*) | `no plan: ORDER BY <column> would need its NULLs reordered` |
+| 1 | A table no key reaches; a join none of whose tables a key reaches | `no plan: a full scan of <table, or the first table in FROM>` |
+| 2 | A join where no order reads a table by its whole primary key | `no plan: no equality names <table>'s key`, or `no plan: no equality names <columns> of <table>'s key` |
+| 3 | No access path in the `ORDER BY`'s order | `no plan: no index of <table> gives ORDER BY <columns>` |
+| 4 | Every path in that order puts its NULLs where PostgreSQL doesn't (*NULLs in an ordered part*) | `no plan: ORDER BY <column> would need its NULLs reordered` |
+| 5 | Every plan leaves a filter on a DOUBLE or REAL column | `no plan: a filter on column "<column>", a REAL or DOUBLE PRECISION, is not supported yet` |
+
+Where plans fail for different reasons, the refusal is the first one of
+the furthest stage a plan reached: its tables (rows 1 and 2), then the
+order (3), its NULLs (4), and its filters (5). Row 2 names the first table
+in `FROM` order that the largest set planned lacks, and the key columns no
+equality names.
 
 The refusal is a `FeatureNotSupported`, SQLSTATE 0A000, whose message
 starts `no plan:`, raised after binding and before anything runs. It
 carries no position: the search works on the logical plan, which keeps
-none. A logical plan of a shape the search does not plan, which today's
-binder never builds, is refused the same way, never with another
-exception: an operator where the search plans another (`no plan: a Join
-where the search plans a table`), or a conjunct that does not compare one
-of its table's columns (`no plan: a conjunct on <table> the search does not
-plan yet`). PostgreSQL runs each of these; it is the one entry of
-`frontend_design.md`'s *Known differences* that is a feature gap.
+none. A logical plan the search can't use, which today's binder never
+builds, is refused the same way, never with another exception and never
+with uncompilable C:
+- an operator where the search plans another (`no plan: a Filter over a
+  Filter where the search plans a table`, `an Empty where …`);
+- a conjunct `use_of` refuses (`no plan: a conjunct on <table> that does
+  not compare one of its columns`, `… compares two columns outside a
+  join`, `a join conjunct that does not compare a column of each side`,
+  `a conjunct that reads no column`);
+- a result, aggregate or `ORDER BY` column that is not a column of the
+  statement's tables.
+
+PostgreSQL runs each of these; it is the one entry of `frontend_design.md`'s
+*Known differences* that is a feature gap.
+
+### Tests
+
+- **Alternatives agree.** `search_all` returns every plan the search
+  costed, none pruned, cheapest first. `Database::alternatives_for_testing`
+  (the test build) runs each on its own snapshot. The proof machine runs
+  them after every `SELECT`, aggregate and join it compares with
+  PostgreSQL, in autocommit, and checks each plan's rows as it checks the
+  layer's. An embedded-API test does the same in C++.
+- **Choices** (`search_test`). Fixed counts choose the join order; a
+  range's count chooses `COUNT` from the keys or by a loop; an `ORDER BY`
+  keeps the plan in its order where another costs less, and a `LIMIT`
+  cuts its cost; a point lookup beats a unique index's one entry, and a
+  covering scan a fetching one.
+- **The search's model** in the proof machine (`served`, `join_served`)
+  says whether some plan serves a statement, as the search now does.
+- **The harness**, 2 warehouses, 4 threads, 30 s: 237,014 TPM, 106,092
+  NOPM, and the consistency conditions hold after the run and in `check`.
+
+### Not built
+
+The choice points (*Choosing at run time*): the search takes the fixed
+selectivities where they would go, and alternatives-agree has no branches
+to run yet.
 
 ## Proposed `CONTRACT.md` changes
 
