@@ -395,16 +395,19 @@ differences*.
   (`plan_api_design.md`, *The write set is statement memory*). `bc_txn_add`
   moves it to the transaction: it releases it from the statement budget
   and counts it against `max_bytes` by the same size functions
-  (`effect_bytes`, `claim_bytes`, `lock_bytes`). Each of the statement's
-  calls checks the transaction's room for the write set it would reach,
-  and `bc_txn_add` checks the same before it merges anything: a statement
-  that would take the transaction past it fails with `BC_E_LIMIT`
-  (SQLSTATE 54000) without the transaction allocating for it, the
-  transaction is aborted like any failed statement's, and what it held is
-  freed with the abort. The rows, unique values and ranges the statement
+  (`effect_bytes`, `table_bytes`, `claim_bytes`, `lock_bytes`). Each of the
+  statement's calls checks the transaction's room for the write set it
+  would reach, so `bc_txn_add` merges only what fits: a statement that
+  would take the transaction past it fails with `BC_E_LIMIT` (SQLSTATE
+  54000) without the transaction allocating for it, the transaction is
+  aborted like any failed statement's, and what it held is freed with the
+  abort. The commit copies the overlay and the guards into the engine's
+  `WritePlan` while they are still held, so it counts that copy against
+  `max_bytes` too, before building it: a commit past it is `BC_E_LIMIT`
+  with nothing committed. The rows, unique values and ranges the statement
   wrote stay statement memory, and go with the statement.
   The count is a conservative bound, never less than the memory held: each
-  buffer's size plus an allocator overhead, each overlay node's full size,
+  buffer's capacity plus an allocator overhead, each overlay node's full size,
   and each guard, claim, lock and table's slot at twice its size, the most
   its vector grows to. So a transaction of small writes can't exhaust
   memory through overhead.

@@ -267,7 +267,7 @@ auto n_of(Database& db, std::int64_t id) -> std::int64_t {
 }  // namespace
 
 // A debug build, as the sanitizers run, takes a tenth of the rows under a
-// tenth of the budget in the two bulk tests: the same ratio of rows to
+// tenth of the budget in the bulk tests: the same ratio of rows to
 // budget, at a minute's less work. An optimised build, as CI's release run,
 // runs them as stated.
 #ifdef NDEBUG
@@ -310,10 +310,14 @@ TEST_CASE("embedded API: a commit past the engine's 1 GiB batch limit is 54000 a
           "[sql][api][memory]") {
   // 260 rows of a value just under the engine's 4 MiB value limit: one
   // UPDATE putting all of them is a write plan over 1 GiB. The statement
-  // budget and the transaction's bound are raised past it, so the engine's
-  // own limit is what refuses it, at commit.
+  // budget and the transaction's bound are raised past it and the plan's
+  // copy of it, so the engine's own limit is what refuses it, at commit.
+  // The engine's limit does not scale, so a debug build, as the sanitizers
+  // run, which takes a tenth of the bulk tests, skips it: it holds over
+  // 2 GiB.
+  if (kBulkScale != 1) SKIP("runs in optimised builds only: the engine's 1 GiB batch limit does not scale");
   constexpr std::int64_t kRows = 260;
-  constexpr std::uint64_t kRoom = std::uint64_t{2} << 30;
+  constexpr std::uint64_t kRoom = std::uint64_t{3} << 30;
   sql_test::TempDir dir{"api_batch_limit"};
   auto db = Database::open(dir.path(), {.sync = SyncMode::AtFileRotation, .statement_memory_bytes = kRoom});
   db->execute("CREATE TABLE big (id BIGINT PRIMARY KEY, v BYTEA NOT NULL)");

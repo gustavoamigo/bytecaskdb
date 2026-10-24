@@ -257,9 +257,12 @@ when its step ends or the context is reset:
 - each result row, with its 4-byte length;
 - the write set, below.
 
-It counts bytes requested and the fixed amounts, not the allocator's
-overhead, so the accounting is deterministic: a plan holds the same bytes
-on every run over the same data. One thing is not charged: **a row still
+It counts fixed amounts, not what the allocator reports, so the accounting
+is deterministic: a plan holds the same bytes on every run over the same
+data. The items above are charged the bytes requested and their fixed
+amounts. The write set's items are charged a conservative bound instead:
+each buffer at its capacity plus `kAllocBytes`, each slot at twice its
+size, as listed below. One thing is not charged: **a row still
 being built**, until `bc_row_end` finishes it.
 
 **The write set is statement memory.** It is what the statement keeps until
@@ -267,31 +270,48 @@ commit: its effects (puts, deletes, range deletes and guards, FOR UPDATE's
 included, and a unique index's range guards), its insert claims and its
 locked rows, with the tables it writes. Beside it the statement keeps the
 row keys, unique prefixes and ranges it wrote, to refuse a second write.
-All of it is charged to the statement budget as the call adds it, counted
-before it is allocated (the sizes of its keys and values are in hand), and
-a count the budget refuses leaves nothing charged and nothing added. One
-helper, `push_write`, does the count and the push for effects, claims and
-locks.
+All of it is charged to the statement budget as the call adds it, before
+the item is pushed, and a count the budget refuses leaves nothing charged
+and nothing added. A copy of a view is counted by the view's size, its
+capacity, before it is made. A key the runtime encoded is moved in and
+counted by its capacity; the encoders reserve its exact size, so nothing
+trims it. One helper, `push_write`, does the count and the push for
+effects, claims and locks. A throw fails the statement, and a failed
+statement's charges go at reset: none is released on the way out of a
+throw. The reset also frees the write set's vectors' storage, so a pooled
+context keeps none of a large statement's slots.
 
 The count is a conservative bound on the memory held, by fixed amounts
 (`algebra/runtime.cppm`, which `plan_api.cpp` checks against what they
 stand for), so it is the same on every build:
-- each buffer, its size plus `kAllocBytes` for the allocator's header;
+- each buffer, its capacity plus `kAllocBytes` for the allocator's header
+  (`held_bytes`, the one size of a buffer, the overlay's included);
 - each effect, claim and lock, its slot in its vector at twice its size
   (`kEffectSlotBytes`, `kClaimSlotBytes`, `kLockSlotBytes`), since a vector
   grows to at most that, and a table's first write `kTableSlotBytes`;
-- each write, the node it takes in a transaction's overlay
-  (`kOverlayNodeBytes`);
+- in autocommit, each effect's entry in the commit's `WritePlan`, which
+  copies its buffers: the copies, and its slot or node
+  (`kPlanWriteSlotBytes`, `kPlanKeyGuardNodeBytes`,
+  `kPlanRangeGuardSlotBytes`), and a table's first write the commit's guard
+  on its record. The commit builds the plan while the effects are alive, so
+  both are counted, and a plan that would pass the budget fails at the
+  call that passes it, with nothing committed;
+- in a transaction, each write's node in the overlay (`kOverlayNodeBytes`),
+  and no plan entry: the transaction's commit counts its plan;
 - each row, prefix or range written, its node (`kWrittenRowNodeBytes`,
   `kUniqueNodeBytes`, `kRangeNodeBytes`).
 
-`effect_bytes`, `claim_bytes` and `lock_bytes` are the one size of an item,
-for both bounds. In a transaction, `bc_txn_add` moves the statement's write
-set to the transaction: it releases it from the statement budget and holds
-what the transaction would then hold to `TransactionOptions::max_bytes`,
-counted by the same functions (`docs/transaction_design.md`, *Limits*).
-Each call of a transaction's statement makes the same check on the write
-set it would reach, so the two agree at the boundary.
+`effect_bytes`, `table_bytes`, `claim_bytes` and `lock_bytes` are the one
+size of an item, for both bounds. In a transaction, `bc_txn_add` moves the
+statement's write set to the transaction: it releases it from the statement
+budget and adds it to what the transaction holds against
+`TransactionOptions::max_bytes`, counted by the same functions
+(`docs/transaction_design.md`, *Limits*). Each call of a transaction's
+statement checks the transaction's room for the write set it would reach,
+so `bc_txn_add` needs no check of its own. `bc_txn_commit` counts its
+`WritePlan`, built from the overlay while the overlay still holds the
+writes, against `max_bytes` beside what the transaction holds before it
+builds it: past it, `BC_E_LIMIT` and nothing committed.
 
 There is no other bound on the write set. The engine refuses a write plan
 over its 1 GiB batch limit at commit, with `std::invalid_argument`, which
@@ -299,7 +319,7 @@ is `BC_E_LIMIT` (SQLSTATE 54000) with nothing written; under the default
 64 MiB budget a statement's write set never reaches it.
 
 So a bulk write is bounded by the statement budget, as any other memory
-is: an `UPDATE` holds about 540 bytes a row of 100 bytes until commit, and
+is: an autocommit `UPDATE` holds about 720 bytes a row of 100 bytes until commit, and
 one of 200K rows passes 64 MiB and fails with `BC_E_LIMIT` at the row that
 passes it, with nothing committed. With the budget raised to 1 GiB, one of
 1M rows runs. An autocommit `SELECT … FOR UPDATE` is bounded the same way,

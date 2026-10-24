@@ -62,6 +62,9 @@ struct bc_params {
 void bc_ctx_before_commit_for_testing(bc_ctx* cx, std::function<void()> hook);
 // Test only: the bytes the context's statement is charged now.
 std::uint64_t bc_ctx_held_for_testing(const bc_ctx* cx);
+// Test only: the capacity, in elements, of the write set's vectors (effects,
+// claims, locks, the tables written).
+std::size_t bc_ctx_write_set_slots_for_testing(const bc_ctx* cx);
 #endif
 
 }  // extern "C++"
@@ -73,6 +76,7 @@ export using ::bc_ctx_affected;
 #ifdef BYTECASK_SQL_TESTING
 export using ::bc_ctx_before_commit_for_testing;
 export using ::bc_ctx_held_for_testing;
+export using ::bc_ctx_write_set_slots_for_testing;
 #endif
 
 export namespace bytecask::sql {
@@ -104,9 +108,12 @@ inline constexpr std::uint64_t kAggBytes = 320;
 // statement budget as a call adds an item and a transaction's max_bytes as
 // bc_txn_add takes it in. Each heap block costs its capacity and
 // kAllocBytes, the allocator's header and rounding; each item a slot in its
-// vector, which grows to at most twice its size; a write, the node it takes
-// in a transaction's overlay; and each row, unique prefix or range the
-// statement wrote, to refuse a second write, the node it takes in its set.
+// vector, which grows to at most twice its size; and each row, unique prefix
+// or range the statement wrote, to refuse a second write, the node it takes
+// in its set. A write also costs where it goes next: in a transaction, the
+// node it takes in the overlay; in autocommit, its entry in the commit's
+// WritePlan, which copies its buffers. A transaction's commit counts its
+// WritePlan against max_bytes as it builds it.
 inline constexpr std::uint64_t kAllocBytes = 32;
 inline constexpr std::uint64_t kEffectSlotBytes = 112;
 inline constexpr std::uint64_t kClaimSlotBytes = 112;
@@ -116,13 +123,43 @@ inline constexpr std::uint64_t kOverlayNodeBytes = 120;
 inline constexpr std::uint64_t kWrittenRowNodeBytes = 96;
 inline constexpr std::uint64_t kUniqueNodeBytes = 96;
 inline constexpr std::uint64_t kRangeNodeBytes = 112;
+// A WritePlan's: a put, delete or range delete's slot in its writes; a point
+// guard's node in its map of guards; a range guard's slot in its list.
+inline constexpr std::uint64_t kPlanWriteSlotBytes = 112;
+inline constexpr std::uint64_t kPlanKeyGuardNodeBytes = 96;
+inline constexpr std::uint64_t kPlanRangeGuardSlotBytes = 96;
 
 [[nodiscard]] constexpr auto buffer_bytes(std::size_t capacity) -> std::uint64_t {
   return capacity == 0 ? 0 : capacity + kAllocBytes;
 }
-// An effect, its buffers of these capacities; `write` for a put or delete.
-[[nodiscard]] constexpr auto effect_bytes(bool write, std::size_t a, std::size_t b) -> std::uint64_t {
-  return buffer_bytes(a) + buffer_bytes(b) + kEffectSlotBytes + (write ? kOverlayNodeBytes : 0);
+// The one size of a buffer the write set holds: its capacity, whatever its
+// size. A copy made from a view has its size as its capacity.
+[[nodiscard]] constexpr auto held_bytes(const Bytes& b) -> std::uint64_t { return buffer_bytes(b.capacity()); }
+
+// A WritePlan entry's slot or node: the engine copies its key, and its value
+// or range end, into buffers of their size.
+enum class PlanEntry : std::uint8_t { Write, KeyGuard, RangeGuard };
+[[nodiscard]] constexpr auto plan_entry_bytes(PlanEntry e, std::size_t a, std::size_t b) -> std::uint64_t {
+  std::uint64_t slot = 0;
+  switch (e) {
+    case PlanEntry::Write: slot = kPlanWriteSlotBytes; break;
+    case PlanEntry::KeyGuard: slot = kPlanKeyGuardNodeBytes; break;
+    case PlanEntry::RangeGuard: slot = kPlanRangeGuardSlotBytes; break;
+  }
+  return buffer_bytes(a) + buffer_bytes(b) + slot;
+}
+// An effect with buffers of these capacities, whose plan entry is `e`. In a
+// transaction it takes no plan entry yet: a write takes an overlay node, and
+// a guard nothing more until the commit.
+[[nodiscard]] constexpr auto effect_bytes(bool in_txn, PlanEntry e, std::size_t a, std::size_t b) -> std::uint64_t {
+  auto own = buffer_bytes(a) + buffer_bytes(b) + kEffectSlotBytes;
+  if (!in_txn) return own + plan_entry_bytes(e, a, b);
+  return own + (e == PlanEntry::Write ? kOverlayNodeBytes : 0);
+}
+// A table the writes are in: its slot and, in autocommit, the commit's guard
+// on its record, a key of `record_key` bytes.
+[[nodiscard]] constexpr auto table_bytes(bool in_txn, std::size_t record_key) -> std::uint64_t {
+  return kTableSlotBytes + (in_txn ? 0 : plan_entry_bytes(PlanEntry::KeyGuard, record_key, 0));
 }
 [[nodiscard]] constexpr auto claim_bytes(std::size_t key) -> std::uint64_t {
   return buffer_bytes(key) + kClaimSlotBytes;

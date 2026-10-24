@@ -693,6 +693,22 @@ auto put_part_from_row(const Table& t, std::uint32_t col_id, KeyPart part, Bytes
   return false;
 }
 
+// The bytes put_part_from_row appends for the same column, or nullopt where
+// it would fail.
+auto part_size_from_row(const Table& t, std::uint32_t col_id, KeyPart part, BytesView row) -> std::optional<std::size_t> {
+  const auto* slot = t.layout.find(col_id);
+  if (slot == nullptr) return std::nullopt;
+  auto v = row_column(row, *slot);
+  switch (v.state) {
+    case ColumnState::Malformed: return std::nullopt;
+    case ColumnState::Absent:
+      if (!part.nullable) return std::nullopt;
+      return kKeyNullBytes;
+    case ColumnState::Value: break;
+  }
+  return key_part_size(part, slot->type == PhysType::Bytes ? v.bytes : BytesView{});
+}
+
 auto put_op(std::vector<DdlOp>& ops, DdlOp::Kind kind, Bytes a, Bytes b = {}) -> void {
   ops.push_back(DdlOp{kind, std::move(a), std::move(b)});
 }
@@ -1701,7 +1717,25 @@ auto LiveCatalog::apply(const Ddl& ddl) -> std::shared_ptr<const Catalog> {
 
 // ------------------------------------------------------------------- keys
 
+namespace {
+// The bytes a row's primary key parts take, or nullopt where encoding fails.
+auto pk_size_from_row(const Table& t, BytesView row) -> std::optional<std::size_t> {
+  std::size_t size = 0;
+  for (auto id : t.pk_col_ids) {
+    auto n = part_size_from_row(t, id, key_part(*t.column(id)), row);
+    if (!n) return std::nullopt;
+    size += *n;
+  }
+  return size;
+}
+}  // namespace
+
+// Both encoders reserve the key's exact size first: the write set counts a
+// key it keeps by its capacity, and a trim would copy it.
 auto encode_pk_from_row(const Table& t, BytesView row, Bytes& out) -> bool {
+  auto pk = pk_size_from_row(t, row);
+  if (!pk) return false;
+  out.reserve(out.size() + kKeyPrefixBytes + *pk);
   key_put_prefix(out, kNsRow, t.id);
   for (auto id : t.pk_col_ids) {
     if (!put_part_from_row(t, id, key_part(*t.column(id)), row, out)) return false;
@@ -1711,6 +1745,16 @@ auto encode_pk_from_row(const Table& t, BytesView row, Bytes& out) -> bool {
 
 auto encode_index_key_from_row(const Table& t, const Index& ix, BytesView row, Bytes& out, std::size_t* prefix_len,
                                bool* has_null) -> bool {
+  auto size = out.size() + kKeyPrefixBytes;
+  for (const auto& p : ix.parts) {
+    const auto* c = t.column(p.col_id);
+    auto n = part_size_from_row(t, p.col_id, key_part(*c, c->nullable, p.desc), row);
+    if (!n) return false;
+    size += *n;
+  }
+  auto pk = pk_size_from_row(t, row);
+  if (!pk) return false;
+  out.reserve(size + *pk);
   key_put_prefix(out, kNsIndex, ix.id);
   bool any_null = false;
   for (const auto& p : ix.parts) {

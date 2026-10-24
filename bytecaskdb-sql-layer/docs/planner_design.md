@@ -289,8 +289,13 @@ state and to enforce.
   (`plan_api_design.md`, *The write set is statement memory*). So a bulk
   write is bounded by the budget like any other statement.
 
-It counts bytes requested, not allocator overhead, so the accounting is
-deterministic and the allocation-fault sweep can test it.
+It counts fixed amounts, not what the allocator reports, so the accounting
+is deterministic and the allocation-fault sweep can test it. Scratch
+copies, results and structure entries are charged the bytes requested plus
+a fixed amount per node. The write set is charged more, a conservative
+bound: each buffer at its capacity plus `kAllocBytes` for the allocator's
+header, each slot at twice its size, and each node in full, as
+`plan_api_design.md` lists.
 
 **Ownership decides what is held.**
 - A view returned inside a loop lives until that loop's next step, unless
