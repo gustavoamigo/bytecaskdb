@@ -72,7 +72,7 @@ TYPES = [o.BIGINT, o.INTEGER, o.SMALLINT, o.DOUBLE, o.REAL, o.numeric(6, 2), o.B
 # parameter: as the column's type (numeric without the modifier).
 ARITHMETIC = {"smallint": "smallint", "integer": "integer", "numeric(6,2)": "numeric"}
 # The columns SUM and MIN are generated over: the types the layer takes, but
-# BIGINT for SUM, whose sum leaves int64 (docs/testing_design.md, *Known
+# BIGINT for SUM, whose sum leaves int64 (docs/frontend_design.md, *Known
 # differences*).
 SUMMED = ("smallint", "integer", "numeric(6,2)")
 MINIMISED = SUMMED + ("bigint",)
@@ -209,7 +209,7 @@ def values(t: o.Type) -> st.SearchStrategy:
         if not t.length:
             return st.text(chars, max_size=6)
         # PostgreSQL truncates a VARCHAR(n) whose excess is only spaces; the
-        # layer refuses it (docs/testing_design.md, *Known differences*).
+        # layer refuses it (docs/frontend_design.md, *Known differences*).
         n = t.length
         return st.text(chars, max_size=n + 2).filter(lambda v: len(v) <= n or v[n:].strip(" "))
     return st.binary(max_size=6)
@@ -1657,7 +1657,7 @@ def test_sum_and_min_over_rows_nulls_and_none(dsn):
 
 def test_sum_past_int64_is_an_error(tmp_path):
     """A SUM whose running total leaves int64 fails the statement, where
-    PostgreSQL's numeric would hold it (docs/testing_design.md, *Known
+    PostgreSQL's numeric would hold it (docs/frontend_design.md, *Known
     differences*)."""
     db = bytecask_sql.open(str(tmp_path))
     try:
