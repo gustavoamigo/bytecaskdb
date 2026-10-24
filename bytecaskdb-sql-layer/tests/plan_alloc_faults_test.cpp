@@ -118,6 +118,31 @@ void sort_rows(bc_ctx* cx) {
     bc_emit_end(cx);
   }
 }
+// SELECT id FROM t ORDER BY qty DESC, name NULLS FIRST, id, the first $1
+// (0: all): a sort key of every kind of part built per row, its view and
+// its builder released with the step.
+void sort_by_sort_key(bc_ctx* cx) {
+  bc_sorter s = bc_sorter_open(cx, bc_param_i64(cx, 0));
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    bc_sort_key k = bc_sort_key_begin(cx);
+    bc_sort_key_col(cx, k, row, kQtyCol, BC_SORT_DESC, BC_SORT_NULLS_FIRST);
+    bc_sort_key_col(cx, k, row, kNameCol, BC_SORT_ASC, BC_SORT_NULLS_FIRST);
+    bc_sort_key_i64(cx, k, bc_col_i64(cx, row, kIdCol), BC_SORT_ASC, BC_SORT_NULLS_LAST);
+    bc_sort_key_f64(cx, k, 0.5, BC_SORT_DESC, BC_SORT_NULLS_LAST);
+    bc_sort_key_bool(cx, k, true, BC_SORT_ASC, BC_SORT_NULLS_LAST);
+    bc_sort_key_bytes(cx, k, bc_col_bytes(cx, row, kNameCol), BC_SORT_DESC, BC_SORT_NULLS_LAST);
+    bc_sort_key_null(cx, k, BC_SORT_ASC, BC_SORT_NULLS_LAST);
+    bc_sorter_add(cx, s, bc_sort_key_end(cx, k), row);
+  }
+  bc_view p = bc_empty(cx);
+  while (bc_sorter_next(cx, s, &p)) {
+    bc_emit_begin(cx);
+    bc_emit_col(cx, p, kIdCol);
+    bc_emit_end(cx);
+  }
+}
 // A hash join of t to itself on qty: a hash table's keys and payloads, and
 // a probe per outer row.
 void hash_join(bc_ctx* cx) {
@@ -217,6 +242,18 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
        BC_OK,
        {{std::int64_t{1}}, {std::int64_t{2}}, {std::int64_t{3}}}},
       {"a top-n sorter", sort_rows, {std::int64_t{2}}, {PhysType::I64}, BC_OK, {{std::int64_t{1}}, {std::int64_t{2}}}},
+      {"a sorter keyed by bc_sort_key_*",
+       sort_by_sort_key,
+       {std::int64_t{0}},
+       {PhysType::I64},
+       BC_OK,
+       {{std::int64_t{3}}, {std::int64_t{2}}, {std::int64_t{1}}}},
+      {"a top-n sorter keyed by bc_sort_key_*",
+       sort_by_sort_key,
+       {std::int64_t{1}},
+       {PhysType::I64},
+       BC_OK,
+       {{std::int64_t{3}}}},
       {"a hash join", hash_join, {}, {PhysType::I64}, BC_OK, {{std::int64_t{120}}}},
       {"an aggregate's slots",
        slot_sums,

@@ -31,7 +31,8 @@ typedef struct { uint32_t i; uint64_t g; } bc_hash;
 typedef struct { uint32_t i; uint64_t g; } bc_hash_iter;
 typedef struct { uint32_t i; uint64_t g; } bc_agg;
 typedef struct { uint32_t i; uint64_t g; } bc_group;
-typedef struct { uint32_t i; uint64_t g; } bc_key;    /* a key under construction */
+typedef struct { uint32_t i; uint64_t g; } bc_key;    /* a table's or index's key under construction */
+typedef struct { uint32_t i; uint64_t g; } bc_sort_key;  /* a sort key under construction */
 typedef struct { uint32_t i; uint64_t g; } bc_row;    /* a row under construction */
 
 typedef void (*bc_plan_fn)(bc_ctx *);               /* every plan has this signature */
@@ -217,6 +218,25 @@ bc_view  bc_key_end(bc_ctx *, bc_key);
 bool     bc_key_fits(bc_ctx *, bc_key);  /* the key so far is within the engine's key ceiling: past it, no row has it */
 bc_view  bc_key_params(bc_ctx *, uint32_t table_or_index, uint32_t first, uint32_t n);  /* parts from params first.. */
 bc_view  bc_key_successor(bc_ctx *, bc_view key);     /* smallest key greater than every key with this prefix */
+
+/* Sort keys: what a sorter orders by, built from parts the plan chooses, each
+   with a direction and a NULL placement. memcmp order on the key is
+   PostgreSQL's ORDER BY order, part by part, with text compared bytewise
+   (the layer's one collation). Each part is a marker byte, never inverted,
+   then the value, inverted under DESC: NULLS FIRST or LAST whatever the
+   direction. A sort key is no table's or index's: its handle is its own
+   type, which bc_key_* do not take. A part that could take the key past
+   UINT32_MAX bytes is BC_E_LIMIT. */
+enum bc_sort_dir   { BC_SORT_ASC = 0, BC_SORT_DESC = 1 };
+enum bc_sort_nulls { BC_SORT_NULLS_LAST = 0, BC_SORT_NULLS_FIRST = 1 };
+bc_sort_key bc_sort_key_begin(bc_ctx *);
+void     bc_sort_key_i64(bc_ctx *, bc_sort_key, int64_t, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_f64(bc_ctx *, bc_sort_key, double, uint32_t dir, uint32_t nulls);   /* -0.0 is 0.0; NaN above +inf */
+void     bc_sort_key_bool(bc_ctx *, bc_sort_key, bool, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_bytes(bc_ctx *, bc_sort_key, bc_view, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_null(bc_ctx *, bc_sort_key, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_col(bc_ctx *, bc_sort_key, bc_view row, uint32_t col, uint32_t dir, uint32_t nulls);  /* NULL included */
+bc_view  bc_sort_key_end(bc_ctx *, bc_sort_key);
 
 /* Reads */
 bc_view   bc_get(bc_ctx *, bc_view key, bool *found);

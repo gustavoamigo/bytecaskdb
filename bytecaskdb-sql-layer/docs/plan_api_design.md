@@ -1,9 +1,9 @@
 # Plan API: a physical algebra for generated plans
 
-Status: **built**, revision 8 (revision 7 with the sorters, the hash
-tables and the aggregates' slots built, `bc_sorter_open`'s `keep`, and
-`bc_agg_null`, and the write set charged to the statement budget as it
-grows; revision 7 added the lifetime rule of a loop's storage,
+Status: **built**, revision 9 (revision 8 with the sort-key builder,
+`bc_sort_key_*` (#579); revision 8 built the sorters, the hash tables and
+the aggregates' slots, `bc_sorter_open`'s `keep`, and `bc_agg_null`, and
+charged the write set to the statement budget as it grows; revision 7 added the lifetime rule of a loop's storage,
 `planner_design.md`, *Memory*, and 64-bit handle generations). This
 specifies the plan API of `bytecaskdb-sql-layer`: the calls a generated
 plan makes, the guarantees they give, and the language plans are written
@@ -665,6 +665,43 @@ bc_view  bc_key_successor(bc_ctx *, bc_view key);     /* smallest key greater th
 | `bc_key_params` | The key, or prefix, of `table_or_index` whose first `n` parts are parameters `first` to `first + n - 1`, each as `bc_key_param` appends it: `bc_key_begin`, `n` parts and `bc_key_end` in one call. `(cx, TBL_9, 0, 3)` is a composite primary key `(w_id, d_id, c_id)`. The builder remains for keys whose parts come from anywhere else. |
 | `bc_key_successor` | The exclusive upper bound of the prefix `key`: its last byte incremented, carrying. Turns a prefix into a half-open range where `BC_SCAN_PREFIX` does not fit. |
 
+### Sort keys
+
+A sort key is what a sorter orders by (`bc_sorter_add`), built from parts
+the plan chooses, each with its own direction and NULL placement: `ORDER
+BY a DESC, b` over any columns, whatever index the table has. `memcmp`
+order on the key is PostgreSQL's `ORDER BY` order, part by part, for
+every type the layer has, and equal values make equal keys, so the
+sorter's stable sort keeps the rows PostgreSQL ties in the order added.
+Text compares bytewise, the layer's one collation (`types_design.md`,
+*Text is valid UTF-8*): the order of PostgreSQL's `COLLATE "C"`. The encoding is
+`types_design.md`, *Sort keys*.
+
+```c
+enum bc_sort_dir   { BC_SORT_ASC = 0, BC_SORT_DESC = 1 };
+enum bc_sort_nulls { BC_SORT_NULLS_LAST = 0, BC_SORT_NULLS_FIRST = 1 };
+bc_sort_key bc_sort_key_begin(bc_ctx *);
+void     bc_sort_key_i64(bc_ctx *, bc_sort_key, int64_t, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_f64(bc_ctx *, bc_sort_key, double, uint32_t dir, uint32_t nulls);   /* -0.0 is 0.0; NaN above +inf */
+void     bc_sort_key_bool(bc_ctx *, bc_sort_key, bool, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_bytes(bc_ctx *, bc_sort_key, bc_view, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_null(bc_ctx *, bc_sort_key, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_col(bc_ctx *, bc_sort_key, bc_view row, uint32_t col, uint32_t dir, uint32_t nulls);  /* NULL included */
+bc_view  bc_sort_key_end(bc_ctx *, bc_sort_key);
+```
+
+| Function | What it does |
+|---|---|
+| `bc_sort_key_begin` | Starts an empty sort key: no namespace, no id and no layout. Returns a `bc_sort_key`, a handle type of its own, charged `kKeyEntryBytes` and owned by its step as a key builder is. |
+| `bc_sort_key_i64`, `bc_sort_key_f64`, `bc_sort_key_bool`, `bc_sort_key_bytes`, `bc_sort_key_null` | Appends one part: a value, or NULL, with its direction and NULL placement. Every call of one part takes the same `dir` and `nulls`, a NULL's too, so the plan writes a part's placement once. A `DOUBLE` orders as PostgreSQL's `float8`: `-0.0` and `0.0` make one key, every NaN one key above `+∞`. Before a part is built it is charged the most it can take (a `BYTES` value with every byte escaped: its marker, twice its length and the terminator), and a part that could take the key past `UINT32_MAX` bytes, a view's length, is `BC_E_LIMIT`; once built, the key is charged the bytes it holds. A `dir` or `nulls` outside its enum is `BC_E_HANDLE`. |
+| `bc_sort_key_col` | Appends a row's column as the next part, NULL included: what a plan uses for `ORDER BY col`. A column the plan's `bc_schema_ref` does not declare is `BC_E_HANDLE`, as for every column decoder. |
+| `bc_sort_key_end` | Finalizes the key and returns its view, the step's. The engine's key ceiling does not apply: a sort key never reaches the engine, and its bytes are bounded by the memory budget and the 4 GiB limit on its parts. |
+
+A sort key and a table's or index's key do not mix: `bc_sort_key` and
+`bc_key` are distinct handle types, so a plan that passes one to the
+other's calls does not compile. The type of a part is the
+plan's to keep the same in every row: the key holds no type tag.
+
 ### Reads
 
 Every read goes through the context's snapshot and charges the budget.
@@ -802,7 +839,7 @@ bool      bc_agg_null(bc_ctx *, bc_group, uint32_t slot);
 | Function | What it does |
 |---|---|
 | `bc_sorter_open` | A sorter for `ORDER BY` the plan cannot get from an index. With `keep` n above 0 it holds at most the first n entries in sort order: `ORDER BY … LIMIT n` (with `OFFSET m`, `keep` is n + m), held in n entries whatever the input. An entry that sorts after the last of n held is neither copied nor charged; one before it takes the last one's place. `keep` 0 holds every entry, so `LIMIT 0` is the plan's to answer without a sorter; a negative `keep` is `BC_E_HANDLE`. |
-| `bc_sorter_add` | Adds a row with its sort key. Entries are ordered by the sort key's bytes, `memcmp` order. The key codec puts NULLs first in an ascending part and last in a descending one, the reverse of PostgreSQL's defaults (`ASC` puts NULLs last, `DESC` first). `bc_col_key` is an ascending part, so it gives `ORDER BY col ASC NULLS FIRST`. For PostgreSQL's `ORDER BY col` (`ASC NULLS LAST`), the plan splits on `bc_col_null`, as `NullSplitScan` splits an index scan: rows with a value go to one sorter keyed `bc_col_key`, rows whose column is NULL to a second keyed `bc_empty`, and the plan reads the first sorter, then the second. For a `DESC` part, or a key of several parts, `bc_key_*` builds it only on an index whose layout declares those parts and directions; the split then places NULLs as PostgreSQL does on the first part only. A sort key with a direction and NULL placement per part, chosen by the plan, has no builder yet (#579). Equal keys keep the order they were added in: the sort is stable, and a top-n sorter keeps the earliest of equal keys. Both are copied; a payload that is a row view comes back from the sorter a row of its table, as `bc_pin` keeps it one. |
+| `bc_sorter_add` | Adds a row with its sort key. Entries are ordered by the sort key's bytes, `memcmp` order. Plans build sort keys with `bc_sort_key_*` (*Sort keys*), whose order is PostgreSQL's `ORDER BY` order with each part's direction and NULL placement. Equal keys keep the order they were added in: the sort is stable, and a top-n sorter keeps the earliest of equal keys. Both are copied; a payload that is a row view comes back from the sorter a row of its table, as `bc_pin` keeps it one. |
 | `bc_sorter_count` | The entries held: those added, or at most `keep`. |
 | `bc_sorter_nth` | The payload of the `n`-th entry in sort order, zero-based; out of range is `BC_E_HANDLE` and an empty view. The view lives until the next `bc_sorter_nth` on the same sorter, which takes its slot, so a loop over `nth` holds one view. The first `nth` or `next` sorts; adding after that is `BC_E_HANDLE`. |
 | `bc_sorter_next` | Streams payloads in sort order, once: a loop, each step its own. Each call charges one unit of budget. A plan runs it to its end; one it leaves early keeps its step open until reset, as a scan left without `bc_scan_close` does. |

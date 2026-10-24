@@ -145,7 +145,8 @@ here more than usual: an index order is often the cheapest way to answer
 - Bushy trees and merge joins wait for a workload that needs them.
 
 **Sort.** Where no path gives the order, a `Sort` over `bc_sorter_*`, with
-NULLs placed by its keys. `ORDER BY … LIMIT n` keeps only the first n.
+NULLs placed by its keys, which `bc_sort_key_*` builds with each part's
+direction and NULL placement (`plan_api_design.md`, *Sort keys*). `ORDER BY … LIMIT n` keeps only the first n.
 
 ### The cost model
 

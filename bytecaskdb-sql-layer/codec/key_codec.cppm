@@ -6,7 +6,8 @@
 // big-endian) parts…, each part encoded so that memcmp order is the typed
 // order and the key parses back without a length prefix. A nullable part has
 // a marker byte (0x00 null, 0x01 present); a DESC part is inverted bit for
-// bit, marker included.
+// bit, marker included. A sort key (*Sort keys*) has a marker before every
+// part that is never inverted, so its NULL placement is its own.
 
 module;
 #include <bit>
@@ -64,6 +65,13 @@ void key_put_bytes(Bytes& out, BytesView v, KeyPart part);
 // A null part: the marker alone. Only a nullable part can be null.
 void key_put_null(Bytes& out, KeyPart part);
 
+// A sort key's part (docs/types_design.md, *Sort keys*): a marker byte,
+// never inverted, then for a value the value as a non-nullable key part,
+// inverted under DESC. 0x01 marks a value; a null is its marker alone, 0x00
+// to sort before every value of the part or 0x02 after.
+void sort_put_present(Bytes& out);
+void sort_put_null(Bytes& out, bool nulls_first);
+
 // Reads parts back in order. A malformed key makes every later read fail:
 // ok() is false and reads return nullopt.
 class KeyReader {
@@ -108,6 +116,7 @@ namespace {
 
 constexpr std::byte kNullMarker{0x00};
 constexpr std::byte kPresentMarker{0x01};
+constexpr std::byte kSortNullLast{0x02};
 constexpr std::byte kEscape{0xFF};
 constexpr std::byte kInvert{0xFF};
 constexpr auto kSignBit = std::uint64_t{1} << 63;
@@ -194,6 +203,12 @@ void key_put_bytes(Bytes& out, BytesView v, KeyPart part) {
 
 void key_put_null(Bytes& out, KeyPart part) {
   out.push_back(part.desc ? kNullMarker ^ kInvert : kNullMarker);
+}
+
+void sort_put_present(Bytes& out) { out.push_back(kPresentMarker); }
+
+void sort_put_null(Bytes& out, bool nulls_first) {
+  out.push_back(nulls_first ? kNullMarker : kSortNullLast);
 }
 
 auto KeyReader::next_byte(bool desc) -> std::optional<std::byte> {
