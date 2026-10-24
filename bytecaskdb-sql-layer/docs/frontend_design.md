@@ -214,10 +214,11 @@ fail on them.
   (`test_one_unique_value_given_to_two_rows_is_23505`). The machine adds to
   no column a unique index holds.
 - **A statement no index scan answers in its order is refused**
-  (`planner_design.md`, *What the search refuses*): a full scan, a sort of the rows read, an `ORDER BY` on
-  a join, or one whose NULLs the chosen index can't place as PostgreSQL
-  does. PostgreSQL runs it. This is the one feature gap in the list; #533
-  closes it.
+  (`planner_design.md`, *What the search refuses*): a full scan, a sort of
+  the rows read, an `ORDER BY` no scan of a join's first table gives, or
+  one whose NULLs no index that gives it can place as PostgreSQL does.
+  PostgreSQL runs it. This is the one feature gap in the list; #533 closes
+  it.
 
 Each is a refusal or an error, not a different answer. Everything else in
 the dialect matches PostgreSQL, and the proof machine checks that it does.

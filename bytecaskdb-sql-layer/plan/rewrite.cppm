@@ -172,7 +172,10 @@ auto fold_constants(Node& n) -> bool {
         using T = std::decay_t<decltype(op)>;
         auto c = false;
         if constexpr (std::is_same_v<T, Filter>) {
-          c = fold_conjuncts(op.conjuncts, never);
+          // The input first, so an input it folds to Empty empties this
+          // Filter in the same pass.
+          c = fold_constants(*op.input);
+          c = fold_conjuncts(op.conjuncts, never) || c;
           never = never || std::holds_alternative<Empty>(op.input->op);
         } else if constexpr (std::is_same_v<T, Join>) {
           c = fold_conjuncts(op.predicate, never);
@@ -210,6 +213,7 @@ auto fold_constants(Node& n) -> bool {
     n = std::move(*input);
     return true;
   }
+  if (std::holds_alternative<Filter>(n.op)) return changed;  // its input is folded
   if (auto* in = input_of(n); in != nullptr && *in) changed = fold_constants(**in) || changed;
   return changed;
 }
@@ -280,7 +284,7 @@ auto push_down(Node& n) -> bool {
         kept.push_back(std::move(c));  // reads no column
       }
     }
-    changed = kept.size() != f->conjuncts.size();
+    changed = changed || kept.size() != f->conjuncts.size();
     push_onto(j.left, std::move(to_left));
     push_onto(j.right, std::move(to_right));
     f->conjuncts = std::move(kept);

@@ -80,7 +80,9 @@ export namespace bytecask::sql {
 // What the plan API charges a statement's memory budget for an entry of its
 // own, beside the bytes the entry holds (docs/plan_api_design.md, *Memory*):
 // each handle a plan is given (a view, a pin, a key or row builder, a
-// cursor), and each aggregate group's node. Fixed numbers, so a statement
+// cursor, a hash table probe), each sorter, hash table and aggregate the
+// plan opens, each aggregate group's node and slot, and each sorter and
+// hash table entry's node. Fixed numbers, so a statement
 // is charged the same on every run and every build; plan_api.cpp checks
 // that each is no less than what it stands for.
 inline constexpr std::uint64_t kViewEntryBytes = 40;
@@ -88,6 +90,13 @@ inline constexpr std::uint64_t kKeyEntryBytes = 64;
 inline constexpr std::uint64_t kRowEntryBytes = 152;
 inline constexpr std::uint64_t kCursorEntryBytes = 408;
 inline constexpr std::uint64_t kGroupEntryBytes = 136;
+inline constexpr std::uint64_t kAggSlotBytes = 48;
+inline constexpr std::uint64_t kSortEntryBytes = 128;
+inline constexpr std::uint64_t kHashEntryBytes = 240;
+inline constexpr std::uint64_t kHashIterEntryBytes = 32;
+inline constexpr std::uint64_t kSorterBytes = 192;
+inline constexpr std::uint64_t kHashBytes = 192;
+inline constexpr std::uint64_t kAggBytes = 320;
 
 // What the write set is charged for what it holds (docs/plan_api_design.md,
 // *The write set is statement memory*): a conservative bound, never less
@@ -277,6 +286,7 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_agg_next", fn_addr(bc_agg_next)},
       {"bc_agg_i64", fn_addr(bc_agg_i64)},
       {"bc_agg_f64", fn_addr(bc_agg_f64)},
+      {"bc_agg_null", fn_addr(bc_agg_null)},
       {"bc_insert", fn_addr(bc_insert)},
       {"bc_update", fn_addr(bc_update)},
       {"bc_delete", fn_addr(bc_delete)},

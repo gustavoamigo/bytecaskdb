@@ -7,11 +7,7 @@
    and bc_params are opaque here and built by the runtime
    (algebra/runtime.cppm, module bytecask.sql.runtime).
 
-   Implemented: the runtime, parameters and results, arithmetic, keys, reads,
-   rows and columns, writes, guards, and the aggregates' groups (bc_agg_open
-   with no slots, bc_agg_group, bc_agg_next). The other ephemeral structures
-   (sorters, hash tables) and the aggregates' slots are not implemented yet:
-   each of their calls sets BC_E_HANDLE and returns a neutral value. */
+   Every call is implemented. */
 
 #ifndef BC_PLAN_H
 #define BC_PLAN_H
@@ -272,7 +268,7 @@ bc_view  bc_row_end(bc_ctx *, bc_row);
 bc_view  bc_pin(bc_ctx *, bc_view);                 /* a copy that lives until reset */
 
 /* Ephemeral structures */
-bc_sorter bc_sorter_open(bc_ctx *);
+bc_sorter bc_sorter_open(bc_ctx *, int64_t keep);        /* keep the first `keep` in sort order; 0 = all */
 void      bc_sorter_add(bc_ctx *, bc_sorter, bc_view sort_key, bc_view payload);
 int64_t   bc_sorter_count(bc_ctx *, bc_sorter);
 bc_view   bc_sorter_nth(bc_ctx *, bc_sorter, int64_t n);
@@ -293,6 +289,7 @@ void      bc_agg_count(bc_ctx *, bc_group, uint32_t slot);
 bool      bc_agg_next(bc_ctx *, bc_agg, bc_view *group_key, bc_group *g);
 int64_t   bc_agg_i64(bc_ctx *, bc_group, uint32_t slot);
 double    bc_agg_f64(bc_ctx *, bc_group, uint32_t slot);
+bool      bc_agg_null(bc_ctx *, bc_group, uint32_t slot);   /* no value folded in: SUM, MIN, MAX, AVG are NULL */
 
 /* Writes: rows, with every index entry the runtime derives from them */
 void bc_insert(bc_ctx *, uint32_t table, bc_view row);

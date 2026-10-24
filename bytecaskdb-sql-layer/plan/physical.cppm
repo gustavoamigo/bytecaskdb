@@ -7,10 +7,10 @@
 // Every id, type and constant name the printer needs is here, so it never
 // reads the catalog.
 //
-// The operators are Empty, the access paths, the joins, Filter, Limit, Aggregate
-// and the sinks: Emit for result rows, Insert, Update, Delete. Slice 1 of the
-// design: the access paths and choices of the MVP's planner, no sort and no
-// hash join. check() enforces what the types can't express.
+// The operators are Empty, the access paths, the joins (an index nested
+// loop, and a nested loop read once), Filter, Limit, Aggregate and the
+// sinks: Emit for result rows, Insert, Update, Delete. No sort and no hash
+// join yet. check() enforces what the types can't express.
 
 module;
 #include <algorithm>
@@ -107,6 +107,16 @@ struct IndexJoin {
   std::vector<Expr> inner_key;  // in the inner primary key's order
 };
 
+// A nested loop whose inner side reads parameters alone: for the outer side's
+// one row, if it has one, every row of the inner scan, so the inner side is
+// read at most once. The outer side is a point lookup and lookups by key;
+// the inner side a scan, under the filters on its own table and the join's,
+// which compare its columns with the outer side's.
+struct NestedLoop {
+  NodePtr outer;
+  NodePtr inner;
+};
+
 // The rows every conjunct holds for, run as soon as the row is read. NULL
 // on either side of a comparison rejects the row. Never on a DOUBLE or REAL
 // column.
@@ -157,8 +167,8 @@ struct Delete {
 };
 
 struct Node {
-  std::variant<Empty, PointGet, Scan, NullSplitScan, CountRange, MinFirstEntry, IndexJoin, Filter, Limit, Emit,
-               Aggregate, Insert, Update, Delete>
+  std::variant<Empty, PointGet, Scan, NullSplitScan, CountRange, MinFirstEntry, IndexJoin, NestedLoop, Filter, Limit,
+               Emit, Aggregate, Insert, Update, Delete>
       op;
 };
 
@@ -195,6 +205,9 @@ struct Plan {
   std::vector<std::uint32_t> null_checks;
   std::vector<Computed> computed;    // what the statement's $n ± k evaluate to
   std::vector<ResultColumn> result;  // empty for a write
+  // What the cost model predicts the plan charges the work budget: record
+  // reads plus cursor steps (docs/planner_design.md, *The cost model*).
+  double cost{0};
 };
 
 // $n ± k, as the Computed it evaluates to, compared with a column of `table`.
@@ -282,6 +295,22 @@ private:
     return nullptr;
   }
 
+  // At most one row, read once: a point lookup, then lookups by key.
+  static auto one_row(const Node& n) -> bool {
+    if (std::holds_alternative<PointGet>(n.op)) return true;
+    if (const auto* j = std::get_if<IndexJoin>(&n.op)) return one_row(*j->outer);
+    if (const auto* f = std::get_if<Filter>(&n.op)) return one_row(*f->input);
+    return false;
+  }
+
+  // Whether a one-row side reads `table`.
+  static auto reads_table(const Node& n, std::uint32_t table) -> bool {
+    if (const auto* g = std::get_if<PointGet>(&n.op)) return g->table == table;
+    if (const auto* j = std::get_if<IndexJoin>(&n.op)) return j->inner == table || reads_table(*j->outer, table);
+    if (const auto* f = std::get_if<Filter>(&n.op)) return reads_table(*f->input, table);
+    return false;
+  }
+
   void node(const Node& n, const Node* parent) const {
     std::visit(
         [&](const auto& op) {
@@ -308,6 +337,19 @@ private:
             if (op.inner_key.empty()) broken("a join whose inner key has no part");
             for (const auto& e : op.inner_key) null_checked(e);
             node(*op.outer, &n);
+          } else if constexpr (std::is_same_v<T, NestedLoop>) {
+            if (!one_row(*op.outer)) broken("a nested loop whose outer side is not one row");
+            if (scan_below(*op.inner) == nullptr) broken("a nested loop whose inner side is not a scan");
+            for (const auto* in = op.inner.get(); const auto* f = std::get_if<Filter>(&in->op); in = f->input.get()) {
+              for (const auto& c : f->conjuncts) {
+                if (c.kind == Expr::Kind::Compare && c.args[1].kind == Expr::Kind::Column &&
+                    !reads_table(*op.outer, c.args[1].col.table)) {
+                  broken("a nested loop whose inner filter reads a column outside its outer side");
+                }
+              }
+            }
+            node(*op.outer, &n);
+            node(*op.inner, &n);
           } else if constexpr (std::is_same_v<T, Filter>) {
             for (const auto& c : op.conjuncts) {
               if (c.kind != Expr::Kind::Compare) continue;
