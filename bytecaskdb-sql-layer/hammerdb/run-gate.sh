@@ -11,7 +11,8 @@
 # Usage:
 #   bytecaskdb-sql-layer/hammerdb/run-gate.sh [--warehouses=W] [--vus=1,16,48]
 #       [--rampup=MIN] [--duration=MIN] [--mix="neword payment ostat delivery slev"]
-#       [--hammerdb-home=PATH] [--data-root=PATH] [--smoke --pg="libpq conninfo"]
+#       [--hammerdb-home=PATH] [--data-root=PATH] [--server-flags="--sync AT_INTERVAL"]
+#       [--smoke --pg="libpq conninfo"]
 #
 #   --warehouses: warehouses loaded (default 48). Every user count must be at
 #                 most W: each user has its own home warehouse.
@@ -23,6 +24,8 @@
 #                 or PATH). HammerDB 5.0's Linux release bundles Tcl and pgtcl.
 #   --data-root:  where the load and each cell's copy live (default a temporary
 #                 directory, removed at exit).
+#   --server-flags: more flags for sql_layer_server in every cell (default
+#                 none), e.g. "--sync AT_INTERVAL --sync-interval-ms 1000".
 #   --smoke:      the nightly smoke: 2 warehouses, 2 users, no ramp-up, a
 #                 one-minute window; and the same run on PostgreSQL, through
 #                 --pg, to check the driver itself (its consistency, never its
@@ -47,6 +50,7 @@ DURATION=5
 MIX="neword payment ostat delivery slev"
 HAMMERDB_HOME="${HAMMERDB_HOME:-}"
 DATA_ROOT=""
+SERVER_FLAGS=()
 SMOKE=0
 PG=""
 
@@ -59,6 +63,7 @@ for arg in "$@"; do
     --mix=*) MIX="${arg#*=}" ;;
     --hammerdb-home=*) HAMMERDB_HOME="${arg#*=}" ;;
     --data-root=*) DATA_ROOT="${arg#*=}" ;;
+    --server-flags=*) read -r -a SERVER_FLAGS <<<"${arg#*=}" ;;
     --smoke) SMOKE=1 ;;
     --pg=*) PG="${arg#*=}" ;;
     *) echo "run-gate.sh: unknown argument $arg" >&2; exit 2 ;;
@@ -177,7 +182,7 @@ for vu in "${VU_LIST[@]}"; do
   cp -a --reflink=auto "$PRISTINE" "$cell"
   run="$("$TPROCC" next-run --dir "$cell")"
   port="$(free_port)"
-  "$SERVER" --dir "$cell" --listen "127.0.0.1:$port" --database tprocc >"$DATA_ROOT/server.log" 2>&1 &
+  "$SERVER" --dir "$cell" --listen "127.0.0.1:$port" --database tprocc ${SERVER_FLAGS[@]+"${SERVER_FLAGS[@]}"} >"$DATA_ROOT/server.log" 2>&1 &
   server=$!
   for _ in $(seq 100); do grep -q "ready on" "$DATA_ROOT/server.log" && break; sleep 0.1; done
   grep -q "ready on" "$DATA_ROOT/server.log" || { cat "$DATA_ROOT/server.log" >&2; exit 1; }

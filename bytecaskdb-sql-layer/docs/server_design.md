@@ -93,7 +93,10 @@ costs one lookup in `Database::prepare`'s cache, keyed by the exact text.
 ## The server
 
 **Binary and modules.** `sql_layer_server --dir DIR [--listen
-127.0.0.1:5432] [--database NAME] [--max-connections 100]` serves one
+127.0.0.1:5432] [--database NAME] [--max-connections 100]
+[--sync AT_EVERY_COMMIT|AT_INTERVAL|AT_FILE_ROTATION] [--sync-interval-ms 1000]
+[--io-backend pread|mmap|buffer_pool] [--buffer-pool-size BYTES]
+[--buffer-pool-direct-io on|off]` serves one
 database directory under one database name, by default the directory's
 last component. It opens the directory with `Database::open`, so it holds
 the engine's directory lock. The code is in `bytecaskdb-sql-layer/server/`:
@@ -107,6 +110,51 @@ the engine's directory lock. The code is in `bytecaskdb-sql-layer/server/`:
 - `main.cpp`: arguments, the listener, signals.
 
 The layer is POSIX-only here: no WASM or Windows build of the server.
+
+**Durability.** `--sync` and `--sync-interval-ms` are `DatabaseOptions::sync`
+and `sync_interval_ms`, with the names and meanings of the MariaDB plugin's
+`bytecaskdb_sync` and `bytecaskdb_sync_interval_ms`
+(`bytecaskdb-mariadb-plugin/docs/mariadb_engine_design.md`, *Durability
+modes*). They are fixed at startup: unlike the plugin, the server has no
+`SET GLOBAL`.
+
+A commit goes to the data file before it returns, in every mode. The mode
+decides only whether it waits for `fdatasync`:
+- `AT_EVERY_COMMIT` (default): autocommit statements and transaction commits
+  pass `sync = true` to the engine, and concurrent commits share one
+  `fdatasync` through its group commit.
+- `AT_INTERVAL`: they pass `sync = false`. A flusher thread, started by
+  `Database::open`, waits `sync_interval_ms`, runs
+  `apply_batch({.sync = true}, WritePlan{})`, and repeats: a commit is
+  durable once the next sync ends, up to an interval plus a sync's own time
+  after it returns.
+  The engine returns from that empty synced plan once every earlier write is
+  durable, and does no `fdatasync` when none is waiting. `close()` stops and
+  joins the flusher before it takes the exclusive lock, so a last sync in
+  flight holds up no other call, and a concurrent `close()` waits for the
+  join before it closes the engine.
+
+  A failed sync is logged to stderr. A failed `fdatasync` degrades the
+  engine, as the engine's `CONTRACT.md` states (*Degraded*): every later
+  write fails, and `close()` throws `DbDegraded`, naming the commits that are
+  not durable (the server then exits non-zero). No sync can succeed after
+  that, so the flusher stops. Any other failure is logged once and retried
+  at the next interval.
+- `AT_FILE_ROTATION`: they pass `sync = false` and no flusher runs. Data
+  reaches the disk when the active file rotates, and at `close()`.
+
+DDL always passes `sync = true`, as the plugin's does. The engine counter
+`bytecask.fsyncs` shows the difference.
+
+**Reads.** `--io-backend`, `--buffer-pool-size` and `--buffer-pool-direct-io`
+are `DatabaseOptions::io_backend` and `buffer_pool`, with the names, values
+and defaults of the plugin's `bytecaskdb_io_backend`,
+`bytecaskdb_buffer_pool_size` and `bytecaskdb_buffer_pool_direct_io`: `pread`
+by default, and a pool of `--buffer-pool-size` bytes, total footprint, filled
+with `O_DIRECT` unless `--buffer-pool-direct-io off`. They change where
+sealed-file reads are served from, not what is read
+(`docs/buffer_pool_design.md`). The pool must hold at least twice the
+engine's file size (default 64 MiB); a smaller one is refused at startup.
 
 **Threading.** One thread per connection, and an acceptor thread. A
 connection's thread reads a message, runs it on the embedded API, which
@@ -630,7 +678,8 @@ runs is not part of its output.
 
 `bytecaskdb-sql-layer/hammerdb/run-gate.sh [--warehouses=48] [--vus=1,16,48]
 [--rampup=2] [--duration=5] [--mix="neword payment ostat delivery slev"]
-[--hammerdb-home=PATH] [--data-root=PATH] [--smoke --pg=CONNINFO]`. It
+[--hammerdb-home=PATH] [--data-root=PATH] [--server-flags="--sync AT_INTERVAL"]
+[--smoke --pg=CONNINFO]`. `--server-flags` goes to the server in every cell. It
 follows `run-hammerdb.sh` in the MariaDB plugin. `--smoke` is the short run
 of *Tests*, and `--pg` names the PostgreSQL it checks the driver on (its
 password in `PGPASSWORD`). `XMAKE_FLAGS` adds `xmake f` flags, as CI sets
@@ -714,7 +763,9 @@ The run script requires W ≥ the user count; the monitor is not a user.
     are `25P02`; `COMMIT` answers `ROLLBACK`, and nothing is committed;
   - after an error in an implicit block, `Sync` reports `I`;
   - the warnings;
-  - `--max-connections`.
+  - `--max-connections`;
+  - `--sync`, `--sync-interval-ms` and the I/O flags: each mode starts and
+    stops cleanly, and a bad value exits before the server listens.
 - **HammerDB smoke, nightly.** A scheduled workflow,
   `.github/workflows/sql-layer-hammerdb-nightly.yml`, runs `run-gate.sh --smoke`: two warehouses, two
   users, no ramp-up and a one-minute window, against the server and against
@@ -752,6 +803,10 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 ## `CONTRACT.md` changes
 
 **Added (SQL):**
+- `DatabaseOptions` and the three sync modes: when a commit reaches the
+  disk, `AtEveryCommit` as before and the default;
+- `DatabaseOptions`' I/O backend and buffer pool, `Pread` as before and the
+  default;
 - the server's startup: what it accepts and what it refuses, with trust
   only;
 - the SQLSTATE each error is reported with, over the wire and through
