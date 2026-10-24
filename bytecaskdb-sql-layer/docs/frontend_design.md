@@ -248,14 +248,12 @@ fail on them.
   value are 23505 on both
   (`test_one_unique_value_given_to_two_rows_is_23505`). The machine adds to
   no column a unique index holds.
-- **A sort of a join of two scans by both tables' columns, and a filter
-  on a DOUBLE, are refused** (`planner_design.md`, *Hash joins as built*,
-  *What the search refuses*): an `ORDER BY` only a sort gives, of columns
-  of both tables of a join no key reaches, since a sorter holds one
-  table's rows, and a filter on a REAL or DOUBLE PRECISION column no key
-  takes. PostgreSQL runs them. Full scans and sorts, which #533 lifted, and
-  joins no key reaches, which hash joins lifted (#534), are no longer
-  refused.
+- **A filter on a DOUBLE is refused** (`planner_design.md`, *Hash joins
+  as built*, *What the search refuses*): a filter on a REAL or DOUBLE
+  PRECISION column no key takes. PostgreSQL runs it. Full scans and sorts,
+  which #533 lifted, joins no key reaches, which hash joins lifted (#534),
+  and a sort of a join of two scans by both tables' columns, which a
+  sorter per loop lifted, are no longer refused.
 - **A sort, or a structure of groups, past the statement's memory budget
   fails** with 54000, where PostgreSQL spills it to disk
   (`planner_design.md`, *Memory*).

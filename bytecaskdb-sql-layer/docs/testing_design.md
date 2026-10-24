@@ -187,10 +187,11 @@ The rules, by what they test.
   an `ORDER BY` of either table's columns. `join_served` says whether
   either table can be the outer one; where no key reaches either table, a
   hash join or a nested loop reading one once per row of the other serves
-  it, unless its `ORDER BY` sorts by both tables' columns.
+  it, whatever its `ORDER BY`.
 - **A join no key reaches**: two tables, each scanned by parameters or in
-  full, linked by one or two equalities of columns of one type, key
-  columns or not (`join_no_key`), with targets, `ORDER BY`, `LIMIT` or
+  full, linked by up to two equalities of columns of one type, key
+  columns or not, or by none, a cross join (`join_no_key`), with targets,
+  `ORDER BY` of either table's columns or both, `LIMIT` or
   `COUNT(DISTINCT)`; and rows inserted with another table's join value
   (`insert_a_match`), so join columns hold NULLs and duplicates on both
   sides.
