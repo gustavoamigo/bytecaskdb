@@ -12,7 +12,9 @@
 // See docs/correctness_validation.md, "Counted fault sweep".
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -20,7 +22,10 @@
 #include <fstream>
 #include <functional>
 #include <initializer_list>
+#include <map>
 #include <memory>
+#include <optional>
+#include <random>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -423,39 +428,7 @@ TEST_CASE("fault sweep: vacuum", "[fault_sweep]") {
 }
 
 TEST_CASE("fault sweep: create_manifest", "[fault_sweep]") {
-  auto listed = std::make_shared<std::vector<bytecask::FileInfo>>();
-  sweep({.name = "create_manifest",
-         .setup = seed,
-         .run =
-             [listed](DB &db) {
-               auto m = db.create_manifest();
-               *listed = std::move(m.files);
-               return !listed->empty();
-             },
-         // Every listed data file exists. A hint may not, when the worker
-         // failed to write it (#349): copying what is there must still open
-         // to the manifest's state, the missing hint rebuilt by the open.
-         .returned =
-             [listed](const KeyValues &expected) {
-               REQUIRE_FALSE(listed->empty());
-               const auto dest =
-                   listed->front().data_path.parent_path().parent_path() /
-                   "from_manifest";
-               std::filesystem::create_directories(dest);
-               for (const auto &f : *listed) {
-                 INFO("manifest file " << f.file_id);
-                 REQUIRE(std::filesystem::exists(f.data_path));
-                 std::filesystem::copy_file(f.data_path,
-                                            dest / f.data_path.filename());
-                 if (std::filesystem::exists(f.hint_path))
-                   std::filesystem::copy_file(f.hint_path,
-                                              dest / f.hint_path.filename());
-               }
-               auto copy = DB::open(dest, {});
-               check_key_values(key_values(copy), expected,
-                                "a DB opened from the manifest's files");
-             },
-         .transition = [](KeyValues kv) { return kv; }});
+  sweep(manifest_operation());
 }
 
 TEST_CASE("fault sweep: ingest", "[fault_sweep]") {
@@ -628,4 +601,404 @@ TEST_CASE("fault sweep: open after a crash", "[fault_sweep]") {
              with_backend("open (crashed, serial)", backend));
   sweep_open(shape, expected, parallel,
              with_backend("open (crashed, parallel)", backend));
+}
+
+// ---- Chained counted faults (#355) ---------------------------------------
+//
+// The sweep above starts every step from a fresh database: one fault, one
+// resume, done. This keeps one database and applies a seeded sequence of
+// faults to it, so the state a fault meets is the state earlier faults left:
+// files sealed by resume(), sequences advanced through failures, file_stats
+// built across truncations, hints of cut files, and a fault landing inside
+// resume() itself.
+//
+// A cycle arms one fault (a mode and a gap of counted calls) and runs
+// operations from the sweep's table until it fires. A cycle that leaves the
+// engine degraded is not resumed until the next cycle, whose armed fault is
+// therefore counted through resume(); a resume the fault interrupted is
+// retried with the fault lifted, bounded. After each fault the live state
+// must be the baseline or the whole transition, and every kChainReopenEvery-th
+// a cut is checked against the watermark rule and its settled state reopened
+// serial and parallel, file_stats included.
+//
+// The gap is log-uniform over 1..kMaxGap so a run reaches both faults inside
+// one operation and faults several operations apart. The seed and fault
+// count come from BYTECASK_SWEEP_CHAIN_SEED and
+// BYTECASK_SWEEP_CHAIN_FAULTS; BYTECASK_SWEEP_CHAIN_TRACE=1 prints each
+// fault. The (call, mode) histogram at the end shows what the run reached.
+
+namespace {
+
+constexpr int kDefaultChainFaults = 60;
+constexpr int kChainReopenEvery = 20;
+constexpr int kMaxGap = 1000;
+// The most operations one fault window runs before its gap is recorded as not
+// reached, or the gap itself when that is larger.
+constexpr int kMaxOpsPerFault = 256;
+// A resume() a fault interrupted is retried with the fault lifted; this many
+// failures in a row is a bug, not a retry.
+constexpr int kMaxResumeRetries = 5;
+
+// Unset is the default; a set value that is not an integer is a typo in a
+// test knob, not a reason to run something else silently.
+auto env_int(const char *name) -> std::optional<int> {
+  const char *v = std::getenv(name);  // NOLINT(concurrency-mt-unsafe)
+  if (v == nullptr || *v == '\0') return std::nullopt;
+  std::size_t used = 0;
+  int value = 0;
+  try {
+    value = std::stoi(v, &used);
+  } catch (const std::exception &) {
+    used = 0;
+  }
+  if (used == 0 || v[used] != '\0')
+    throw std::invalid_argument{
+        std::format("{} must be an integer, got '{}'", name, v)};
+  return value;
+}
+
+// The call a report names: "fdatasync" from "fdatasync(/db/x.data)".
+auto call_of(std::string_view what) -> std::string {
+  return std::string{what.substr(0, what.find('('))};
+}
+
+auto mode_name(SyscallFault mode) -> const char * {
+  switch (mode) {
+    case SyscallFault::none:
+      return "none";
+    case SyscallFault::before:
+      return "before";
+    case SyscallFault::after:
+      return "after";
+    case SyscallFault::short_io:
+      return "short";
+  }
+  return "none";
+}
+
+struct FaultPlan {
+  SyscallFault mode;
+  int gap;
+};
+
+// Log-uniform over 1..kMaxGap: every order of magnitude is equally likely, so
+// a run reaches a fault on the next call and one a thousand calls away.
+auto draw_fault(std::mt19937_64 &rng) -> FaultPlan {
+  constexpr std::array<SyscallFault, 3> kModes = {
+      SyscallFault::before, SyscallFault::after, SyscallFault::short_io};
+  const auto mode = kModes[std::uniform_int_distribution<std::size_t>{
+      0, kModes.size() - 1}(rng)];
+  const auto exponent =
+      std::uniform_real_distribution<double>{0.0, std::log2(kMaxGap)}(rng);
+  const auto gap = static_cast<int>(std::llround(std::pow(2.0, exponent)));
+  return {.mode = mode, .gap = std::clamp(gap, 1, kMaxGap)};
+}
+
+// The state is read through the engine, so its calls must not count against
+// the armed fault: a check would otherwise consume the gap it measures.
+auto suspended_key_values(const DB &db) -> KeyValues {
+  const bytecask::testing::SuspendSyscallFaults uncounted;
+  return key_values(db);
+}
+
+// One operation under the armed fault: what it started from, the whole
+// transition it owes, and the last sequence it assigned.
+struct Step {
+  KeyValues before;
+  KeyValues after;
+  std::uint64_t last_seq{0};
+  bool threw{false};
+  const Operation *op{nullptr};
+};
+
+auto run_step(DB &db, const Operation &op, const KeyValues &model) -> Step {
+  Step s{.before = model, .after = op.transition(model), .op = &op};
+  const auto seq_before = db.engine_state()->next_seq;
+  try {
+    (void)op.run(db);
+  } catch (const std::exception &) {
+    s.threw = true;
+  }
+  const auto seq_after = db.engine_state()->next_seq;
+  s.last_seq = seq_after > seq_before ? seq_after - 1 : 0;
+  return s;
+}
+
+// What the engine may hold between cycles: the visible state, and the pair a
+// degraded resume() may still settle it between.
+struct ChainState {
+  KeyValues model;
+  bool pending{false};
+  KeyValues pending_after;
+  std::uint64_t pending_last_seq{0};
+};
+
+// Checks what a step left and narrows `state` to it. A degraded engine that
+// still shows the pre-step state may complete the transition in resume(), so
+// the pair stays allowed until then; a published transition stays required.
+void settle(DB &db, const Step &s, ChainState &state) {
+  const auto live = suspended_key_values(db);
+  if (s.threw) {
+    INFO("a faulted step leaves the baseline or the whole transition");
+    REQUIRE((live == s.before || live == s.after));
+  } else {
+    check_key_values(live, s.after, "the operation's whole transition");
+    REQUIRE(live == s.after);
+  }
+  state.model = live;
+  state.pending = db.is_degraded() && live == s.before;
+  if (state.pending) {
+    state.pending_after = s.after;
+    state.pending_last_seq = s.last_seq;
+  }
+}
+
+// One armed fault window: the step it left, whether it interrupted resume(),
+// and its report.
+struct Window {
+  Step step;
+  bool fault_in_resume{false};
+  SyscallFaultReport report;
+};
+
+// Arms one fault and runs operations until it fires. A degraded engine's
+// resume() is the first operation, so the gap counts through it; a fault that
+// interrupts it is retried by the caller with the fault lifted.
+auto run_window(DB &db, const std::filesystem::path &dir,
+                const std::vector<Operation> &ops, const FaultPlan &plan,
+                bool degraded, ChainState &state, std::mt19937_64 &rng)
+    -> Window {
+  Window w;
+  w.step = {.before = state.model,
+            .after = state.pending ? state.pending_after : state.model,
+            .last_seq = state.pending ? state.pending_last_seq : 0};
+  ScopedSyscallFaults faults{dir, plan.mode, plan.gap};
+  if (degraded) {
+    try {
+      db.resume();
+    } catch (const std::exception &) {
+      w.step.threw = true;
+    }
+    w.fault_in_resume = w.step.threw;
+    if (w.step.threw && !faults.fired())
+      FAIL("resume() threw without the armed fault firing");
+    if (!w.step.threw) {
+      const auto live = suspended_key_values(db);
+      INFO("resume() keeps or completes the transition");
+      REQUIRE((live == w.step.before || live == w.step.after));
+      state.model = live;
+      state.pending = false;
+      w.step = {.before = state.model, .after = state.model, .last_seq = 0};
+    }
+  }
+  if (!w.step.threw) {
+    const auto max_ops = std::max(kMaxOpsPerFault, plan.gap);
+    for (int i = 0; i < max_ops && !faults.fired(); ++i) {
+      if (db.is_degraded()) break;
+      const auto &op = ops[std::uniform_int_distribution<std::size_t>{
+          0, ops.size() - 1}(rng)];
+      w.step = run_step(db, op, state.model);
+      if (faults.fired()) break;
+      if (w.step.threw)
+        FAIL("an operation threw without the armed fault firing");
+      settle(db, w.step, state);
+    }
+  }
+  wait_hints_idle(db);
+  w.report = faults.report();
+  return w;
+}
+
+// A write after the fault lands, and the sequence a dropped transition
+// advanced is represented on disk: recovery reconstructs next_seq from the
+// highest sequence it finds, so a probe at the current next_seq keeps the
+// settled cut's next_seq equal to the live one. The hint worker must finish
+// before the probe syncs the file a resume() sealed, or the probe's sync hides
+// a hint written over pages the device did not hold.
+void probe_after_fault(DB &db, ChainState &state,
+                       bytecask::testing::PageCacheModel &cache) {
+  wait_hints_idle(db);
+  assert_hints_durable(cache);
+  const auto r = db.put({.sync = true}, to_bytes("~probe"), to_bytes("p"));
+  REQUIRE(r.durable);
+  state.model["~probe"] = bytes("p");
+  wait_hints_idle(db);
+}
+
+// A resume() the fault interrupted is retried with the fault lifted; one that
+// still fails is a bug, not a retry.
+void retry_resume(DB &db) {
+  for (int attempt = 0; attempt < kMaxResumeRetries; ++attempt) {
+    try {
+      db.resume();
+      return;
+    } catch (const std::exception &) {
+    }
+  }
+  FAIL("resume() did not recover with the fault lifted");
+}
+
+void run_chain(const Backend &backend, std::uint64_t seed, int faults) {
+  TempDir td;
+  const auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto opts = on_backend(Options{.max_file_bytes = 512}, backend);
+  std::mt19937_64 rng{seed};
+
+  const std::vector<Operation> ops = {
+      put_operation(),     del_operation(),     del_range_operation(),
+      apply_batch_operation(), rotation_operation(), vacuum_operation(),
+      manifest_operation()};
+
+  std::map<std::string, int> histogram;
+  int reached = 0;
+  int missed = 0;
+  int resume_faults = 0;
+  ChainState state;
+  KeyValues &model = state.model;
+  std::uint64_t next_seq = 0;
+
+  {
+    auto db = open_db(dir, opts);
+    bytecask::testing::sweep_ops::seed(*db);
+    wait_hints_idle(*db);
+    model = suspended_key_values(*db);
+    next_seq = db->engine_state()->next_seq;
+
+    for (int cycle = 0; reached < faults && cycle < faults * 8; ++cycle) {
+      // A faulted write leaves the engine degraded for the next cycle, whose
+      // resume is then the first operation the armed fault counts through.
+      const bool degraded = db->is_degraded();
+
+      const auto plan = draw_fault(rng);
+      const auto window =
+          run_window(*db, dir, ops, plan, degraded, state, rng);
+      const Step &step = window.step;
+      const bool fault_in_resume = window.fault_in_resume;
+      const auto &rep = window.report;
+
+      if (!rep.fired) {
+        ++missed;
+        INFO("fault [" << mode_name(plan.mode) << "] gap " << plan.gap
+                       << " was not reached");
+        CHECK_FALSE(db->is_degraded());
+        continue;
+      }
+
+      ++reached;
+      if (fault_in_resume) ++resume_faults;
+      histogram[std::format("{} [{}]", call_of(rep.what),
+                            mode_name(plan.mode))]++;
+      if (std::getenv("BYTECASK_SWEEP_CHAIN_TRACE") != nullptr) {  // NOLINT
+        std::fprintf(stderr, "chain %s fault %d [%s] gap=%d %s%s\n",
+                     backend.name, reached, mode_name(plan.mode), plan.gap,
+                     rep.what.c_str(), fault_in_resume ? " (resume)" : "");
+      }
+
+      // Every kChainReopenEvery-th fault, a cut taken before resume(): the
+      // baseline or the whole transition, under the watermark rule.
+      const bool sampled = reached % kChainReopenEvery == 0;
+      if (sampled) {
+        const auto cut = td.path / std::format("cut_{}", reached);
+        cache.model.copy_device(dir, cut);
+        INFO("fault " << reached << " [" << mode_name(plan.mode) << "] "
+                      << rep.what);
+        assert_power_loss_outcome(
+            cut,
+            {.baseline = step.before,
+             .after = step.after,
+             .transition_last_seq = step.last_seq,
+             .watermark = durable_watermark(*db)},
+            opts);
+      }
+
+      // What a returned operation produced, once its calls no longer count.
+      if (step.op != nullptr && !step.threw && step.op->returned)
+        step.op->returned(step.after);
+
+      assert_consistent(*db);
+      settle(*db, step, state);
+
+      // A fault that interrupted resume() is retried with the fault lifted.
+      // One that interrupted a write is not: the next cycle's resume runs
+      // under a fresh fault, so a fault can land inside it from the state the
+      // earlier faults built.
+      if (fault_in_resume && db->is_degraded()) {
+        retry_resume(*db);
+        const auto live = suspended_key_values(*db);
+        REQUIRE((live == model ||
+                 (state.pending && live == state.pending_after)));
+        model = live;
+        state.pending = false;
+      }
+
+      // A write after the fault lands, and the sequence a dropped transition
+      // advanced is represented on disk.
+      if (!db->is_degraded()) probe_after_fault(*db, state, cache.model);
+      next_seq = db->engine_state()->next_seq;
+
+      if (sampled && !db->is_degraded()) {
+        const auto settled = td.path / std::format("settled_{}", reached);
+        cache.model.copy_device(dir, settled);
+        INFO("the settled state after " << reached << " faults");
+        assert_reopens(settled, model, next_seq, opts);
+      }
+    }
+
+    if (db->is_degraded()) {
+      INFO("the chain ends degraded; resume() must recover it");
+      assert_resumable(*db);
+      const auto live = suspended_key_values(*db);
+      REQUIRE((live == model ||
+               (state.pending && live == state.pending_after)));
+      model = live;
+      const auto r =
+          db->put({.sync = true}, to_bytes("~probe"), to_bytes("p"));
+      REQUIRE(r.durable);
+      model["~probe"] = bytes("p");
+    }
+    wait_hints_idle(*db);
+    next_seq = db->engine_state()->next_seq;
+
+    // A power cut at the end, through the page-cache model, then the settled
+    // state reopened serial and parallel.
+    {
+      const auto cut = td.path / "cut_end";
+      cache.model.copy_device(dir, cut);
+      assert_power_loss_outcome(cut, {.baseline = model, .after = model},
+                                opts);
+    }
+    {
+      const auto settled = td.path / "settled_end";
+      cache.model.copy_device(dir, settled);
+      assert_reopens(settled, model, next_seq, opts);
+    }
+  }
+
+  assert_hints_durable(cache.model);
+  assert_reopens(dir, model, next_seq, opts);
+  CHECK(reached == faults);
+
+  std::fprintf(stderr,
+               "chained sweep (%s): seed=%llu faults=%d reached=%d missed=%d "
+               "resume=%d\n",
+               backend.name, static_cast<unsigned long long>(seed), faults,
+               reached, missed, resume_faults);
+  for (const auto &[what, n] : histogram)
+    std::fprintf(stderr, "  %-24s %d\n", what.c_str(), n);
+}
+
+}  // namespace
+
+TEST_CASE("fault sweep: a chained run of faults",
+          "[fault_sweep][fault_sweep_chain]") {
+  const auto seed = static_cast<std::uint64_t>(
+      env_int("BYTECASK_SWEEP_CHAIN_SEED").value_or(355));
+  const auto faults =
+      env_int("BYTECASK_SWEEP_CHAIN_FAULTS").value_or(kDefaultChainFaults);
+  REQUIRE(faults > 0);
+  for (const auto &backend : kBackends) {
+    INFO("backend " << backend.name);
+    run_chain(backend, seed, faults);
+  }
 }

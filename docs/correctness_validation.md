@@ -1941,6 +1941,65 @@ site is reached: read as an empty file, a failed `file_size` in
 `rewrite_durably` lets `resume()` build a hint over pages the device does
 not hold, and the sweep rejects it.
 
+**Chained faults (#355).** Every step above starts from a fresh database: one
+fault, one `resume()`, done. A bug that needs the state earlier faults built —
+several small files sealed by `resume()`, sequences and file ids advanced
+through failures, `file_stats` built across truncations, hints of cut files,
+buffer-pool frames of those files, vacuum over all of it — is out of its reach.
+The chaos rig reaches that state, but nightly and timing-dependent: an engine
+PR that breaks `resume()` can merge green.
+
+`[fault_sweep_chain]` keeps one database and applies a seeded sequence of
+faults to it ([`tests/fault_sweep_test.cpp`](../tests/fault_sweep_test.cpp)).
+One thread. Each cycle draws a mode (`before`, `after`, `short`) and a gap of
+counted calls, log-uniform over 1..1000, arms `ScopedSyscallFaults`, and runs
+operations from the table above (`put`, `del`, `del_range`, `apply_batch`, a
+rotation, `vacuum`, `create_manifest`) until the gap is reached. The gap
+therefore spans whole operations as well as landing inside one.
+
+A cycle that leaves the engine degraded is not resumed until the next cycle:
+that cycle's armed fault is counted through `resume()`, so a fault can land
+inside it from the state the earlier faults built. A resume the fault
+interrupted is retried with the fault lifted, up to a bound. After every fault
+the live state must be the pre-operation state or the whole transition, and
+`assert_consistent` holds; while the engine is degraded and still shows the
+pre-state, the pair stays allowed until `resume()` settles it.
+
+Every 20th fault, and at the end, the page-cache model takes a cut. The cut
+taken before `resume()` is checked against the watermark rule; once the state
+is settled it is reopened serial and parallel, with key values and `file_stats`
+compared. A durable write after each fault (`~probe`) keeps the recovered
+`next_seq` equal to the live one when a dropped transition advanced it.
+
+`BYTECASK_SWEEP_CHAIN_SEED` and `BYTECASK_SWEEP_CHAIN_FAULTS` set the seed and
+the budget; the default is seed 355 and 60 faults on each back-end, about 3.5 s
+on an unsanitized release build, with three cuts and three serial/parallel
+reopens per back-end. `BYTECASK_SWEEP_CHAIN_TRACE=1` prints each fault.
+Seeded, not bit-reproducible: the hint worker's calls count against the same
+gap, and the standard distributions are not portable, so a seed fixes the
+operation and gap draws, not which call a fault lands on. The (call, mode)
+histogram the run prints is the record of what it reached, e.g.
+
+```
+chained sweep (buffer pool): seed=355 faults=60 reached=60 missed=0 resume=6
+  fdatasync [after]        6
+  fdatasync [before]       4
+  fsync [after]            1
+  ...
+```
+
+With that budget the chained run catches `resume_trusts_page_cache.patch`:
+without `rewrite_durably`, `resume()` publishes and seals an entry whose pages
+a failed `fdatasync` left off the device, and `assert_hints_durable` rejects
+the hint written over them. It does not catch
+`truncate_lowers_end_after.patch` or `no_sync_before_degrade.patch`, and the
+chaos rig does not either. The first needs a failed `fdatasync` and then an
+eviction, which the page-cache model does not perform while the process runs;
+the second changes nothing `resume()` publishes, because `resume()` rewrites
+and syncs the tail before trusting it (#240). Both keep their
+`Expected: NOT caught` headers, and the `prove_resume` cell that fails
+`io_resume_truncate` after the cut lands remains the guard for the first.
+
 **Limits.**
 
 - *Calls glibc makes inside itself are not counted.* `--wrap` sees the
@@ -1968,9 +2027,15 @@ not hold, and the sweep rejects it.
 - *The oracle is weaker than the matrix's.* "Baseline or the whole
   transition" does not say which of the two a given fault must produce. The
   proof cells keep that job, and the named checkpoints stay for them.
-- *One fault, one small operation, one thread.* Volume, concurrency, real
-  power loss, resource limits and faults across process lives stay with the
-  chaos rig.
+- *`returned` is checked for the step that ends a window.* The chained run
+  calls an operation's post-fault check only for the step the fault lands on,
+  not for the operations that complete earlier in the same window, so
+  `create_manifest`'s manifest check covers a sample of its calls. The
+  dedicated `create_manifest` sweep checks every call.
+- *One fault at a time, one thread, no process lives.* The chained variant
+  carries state across faults, but each fault is still one call, the run is
+  single-threaded, and volume, concurrency, real power loss, resource limits
+  and faults across process lives stay with the chaos rig.
 - `close`, `flock`, `posix_fadvise`, `madvise` and `munmap` are not
   wrapped: the engine acts on none of their results but `flock`'s, which
   the lock tests cover.

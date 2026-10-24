@@ -78,6 +78,11 @@ public:
 
   // Disarms, so nothing after it is counted or failed.
   auto report() -> SyscallFaultReport;
+
+  // Whether a rule has reached its N-th call, without disarming. A run that
+  // arms once and keeps operating until the fault fires polls this; the
+  // report comes once it stops.
+  [[nodiscard]] auto fired() const -> bool;
 };
 
 }  // namespace bytecask::testing
