@@ -119,3 +119,25 @@ TEST_CASE("physical: check refuses what codegen can't print", "[sql][physical]")
   no_constants.constants.clear();
   refused(no_constants, "no constants");
 }
+
+TEST_CASE("physical: a nested loop reads its inner scan once, under one outer row", "[sql][physical]") {
+  const logical::ColumnRef inner_col{2, 1, PhysType::I64, true};
+  const logical::ColumnRef other{3, 0, PhysType::I64, false};
+  auto col = [](const logical::ColumnRef& c) { return logical::column(c, SqlType{SqlKind::BigInt}); };
+  auto inner = [] { return node(physical::Scan{2, 4, {p(1)}, {}, false, false, false}); };
+  auto loop = [](physical::NodePtr outer, physical::NodePtr in) {
+    return emit(node(physical::NestedLoop{std::move(outer), std::move(in)}));
+  };
+  // The inner scan under a join conjunct: its column, then one of `c`'s.
+  auto joined = [&](const logical::ColumnRef& c) {
+    return node(physical::Filter{inner(), {logical::compare(ast::Compare::Op::Eq, col(inner_col), col(c))}});
+  };
+  CHECK(refusal(plan(loop(get({p(0)}), inner()))).empty());
+  refused(plan(loop(node(scan({p(0)}, {})), inner())), "outer side is not one row");
+  refused(plan(loop(get({p(0)}), get({p(1)}))), "inner side is not a scan");
+  // A join conjunct reads a column of the outer side: of its point lookup,
+  // or of a table it looks up by key.
+  CHECK(refusal(plan(loop(get({p(0)}), joined(kId)))).empty());
+  refused(plan(loop(get({p(0)}), joined(other))), "reads a column outside its outer side");
+  CHECK(refusal(plan(loop(node(physical::IndexJoin{get({p(0)}), 3, {p(0)}}), joined(other)))).empty());
+}

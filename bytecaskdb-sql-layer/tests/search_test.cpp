@@ -5,10 +5,13 @@
 // binder does not build from today's SQL, but that the rewrites or another
 // front end may hand the search.
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -16,6 +19,7 @@
 #include <vector>
 
 import bytecask.sql.codegen;
+import bytecask.sql.parser;
 import bytecask.sql.rewrite;
 import bytecask.sql.search;
 import bytecask.sql.tests.fixture;
@@ -65,20 +69,36 @@ auto generate(const Catalog& cat, logical::NodePtr root, std::size_t params) -> 
 
 auto has(const GeneratedPlan& g, std::string_view text) -> bool { return g.source.find(text) != std::string::npos; }
 
-// The message a plan is refused with; any other exception, a
-// std::bad_variant_access among them, fails the test.
-auto refusal(const Catalog& cat, logical::NodePtr root, std::size_t params) -> std::string {
+// The message a plan is refused with, rewritten first or not; any other
+// exception, a std::bad_variant_access among them, fails the test.
+auto refusal(const Catalog& cat, logical::NodePtr root, std::size_t params, bool rewrite = true) -> std::string {
   try {
-    (void)generate(cat, std::move(root), params);
+    if (rewrite) {
+      (void)generate(cat, std::move(root), params);
+    } else {
+      (void)search(*root, cat);
+    }
   } catch (const ast::FeatureNotSupported& e) {
     return e.what();
   }
   return "accepted";
 }
 
+// The plan of a SQL statement against `cat`, its tables costed at `rows`
+// each, by name; a table not named is uncounted.
+auto plan_sql(const Catalog& cat, std::string_view sql, std::map<std::string, std::uint64_t> rows = {})
+    -> GeneratedPlan {
+  RowCounts counts = [named = std::move(rows)](const Table& t) -> std::optional<std::uint64_t> {
+    auto it = named.find(t.name);
+    if (it == named.end()) return std::nullopt;
+    return it->second;
+  };
+  return generate_plan(bound::bind(ast::parse(sql), cat), cat, sql, counts);
+}
+
 }  // namespace
 
-TEST_CASE("search: a Filter over a Filter keeps both conjunct lists, merged by the rewrites", "[sql][search]") {
+TEST_CASE("search: a Filter over a Filter is merged by the rewrites, and only then planned", "[sql][search]") {
   sql_test::Fixture f;
   const auto& t = *f.cat().table("t");
   auto two = [&] {
@@ -95,13 +115,14 @@ TEST_CASE("search: a Filter over a Filter keeps both conjunct lists, merged by t
   CHECK(merged.conjuncts[1].args[0].col == col(t, "qty").col);
   CHECK(std::holds_alternative<logical::Get>(merged.input->op));
 
-  // The search, given both Filters, reads both: the key from the lower one,
-  // the filter from the upper.
-  auto plan = search(*two(), f.cat());
+  // The search plans the merged Filter: the key from one conjunct, the
+  // filter from the other. Given both Filters, it refuses rather than guess.
+  auto plan = search(*root, f.cat());
   const auto& emit = std::get<physical::Emit>(plan.root->op);
   const auto& residual = std::get<physical::Filter>(emit.input->op);
   CHECK(residual.conjuncts.size() == 1);
   CHECK(std::holds_alternative<physical::PointGet>(residual.input->op));
+  CHECK(refusal(f.cat(), two(), 2, false) == "no plan: a Filter over a Filter where the search plans a table");
 
   auto g = generate(f.cat(), two(), 2);
   CHECK(has(g, "bc_get(cx, bc_key_params(cx, TBL_1, 0, 1), &found)"));
@@ -122,13 +143,39 @@ TEST_CASE("search: a shape it does not plan is refused with no plan, never a var
                                                    logical::compare(Op::Eq, col(t, "qty"), col(u, "k")),
                                                    logical::compare(Op::Eq, p(1), p(2))}),
                            {col(u, "v")});
-  CHECK(refusal(f.cat(), std::move(over_join), 3) == "no plan: a Join where the search plans a table");
+  CHECK(refusal(f.cat(), std::move(over_join), 3) == "no plan: a conjunct that reads no column");
 
   // On one table, it stays on the table's Filter.
   auto on_table = project(
       filter(get(t), {logical::compare(Op::Eq, col(t, "id"), p(0)), logical::compare(Op::Eq, p(1), p(2))}),
       {col(t, "id")});
-  CHECK(refusal(f.cat(), std::move(on_table), 3) == "no plan: a conjunct on t the search does not plan yet");
+  CHECK(refusal(f.cat(), std::move(on_table), 3) == "no plan: a conjunct on t that does not compare one of its columns");
+
+  // A column compared with another of its own table, outside a join.
+  auto two_columns = project(filter(get(t), {logical::compare(Op::Eq, col(t, "id"), p(0)),
+                                             logical::compare(Op::Eq, col(t, "qty"), col(t, "id"))}),
+                             {col(t, "id")});
+  CHECK(refusal(f.cat(), std::move(two_columns), 1) == "no plan: a conjunct on t compares two columns outside a join");
+  // A column of another table outside the join's predicate: it is not on
+  // either side of a join, so never usable on t's Filter.
+  auto stray = project(filter(get(t), {logical::compare(Op::Eq, col(t, "id"), p(0)),
+                                       logical::compare(Op::Eq, col(t, "qty"), col(u, "k"))}),
+                       {col(t, "id")});
+  CHECK(refusal(f.cat(), std::move(stray), 1, false) == "no plan: a conjunct on t compares two columns outside a join");
+  // A join conjunct whose columns are both of one side.
+  auto one_side = project(logical::node(logical::Join{get(t), get(u), {logical::compare(Op::Eq, col(t, "qty"), col(t, "id"))}}),
+                          {col(u, "v")});
+  CHECK(refusal(f.cat(), std::move(one_side), 0, false) ==
+        "no plan: a join conjunct that does not compare a column of each side");
+  // A result column of a table the statement does not read.
+  auto foreign = project(filter(get(t), {logical::compare(Op::Eq, col(t, "id"), p(0))}), {col(u, "v")});
+  CHECK(refusal(f.cat(), std::move(foreign), 1) == "no plan: a result column that is not a column of its tables");
+
+  // An operator where the search plans another, named with its article.
+  auto empty_side = project(logical::node(logical::Join{logical::node(logical::Empty{{&t}}), get(u), {}}), {col(u, "v")});
+  CHECK(refusal(f.cat(), std::move(empty_side), 0, false) == "no plan: an Empty where the search plans a table");
+  auto agg_source = project(count_star(filter(get(t), {logical::compare(Op::Eq, col(t, "id"), p(0))})), {col(t, "id")});
+  CHECK(refusal(f.cat(), std::move(agg_source), 1, false) == "no plan: an Aggregate where the search plans a table");
 
   // No Project or Aggregate at the top of the rows.
   auto bare = filter(get(t), {logical::compare(Op::Eq, col(t, "id"), p(0))});
@@ -220,7 +267,7 @@ TEST_CASE("search: only an equality conjunct of a join keys the inner side", "[s
 
   // u.k < t.qty names no row of u by its key.
   CHECK(refusal(f.cat(), join({logical::compare(Op::Lt, col(u, "k"), col(t, "qty"))}), 1) ==
-        "no plan: no index of u joins on k");
+        "no plan: no equality names u's key");
 
   // u.k = t.qty keys u; t.qty < u.v is a filter with its own operator, the
   // inner column first.
@@ -230,4 +277,252 @@ TEST_CASE("search: only an equality conjunct of a join keys the inner side", "[s
                     1);
   CHECK(has(g, "bc_key_i64(cx, k0, bc_col_i64(cx, row, COL_1_2));"));
   CHECK(has(g, "!(bc_col_i64(cx, row1, COL_4_1) > bc_col_i64(cx, row, COL_1_2))"));
+}
+
+TEST_CASE("rewrite: an input folded to Empty empties the Filter above it; Filters over a Join merge", "[sql][search]") {
+  sql_test::Fixture f;
+  f.ddl(CreateTableDdl{"u", {sql_test::Fixture::col("k", PhysType::I64, false)}, {"k"}});
+  const auto& t = *f.cat().table("t");
+  const auto& u = *f.cat().table("u");
+  auto never = logical::compare(Op::Eq, decimal(1, 0), decimal(2, 0));
+  auto root = project(filter(filter(get(t), {std::move(never)}), {logical::compare(Op::Eq, col(t, "id"), p(0))}),
+                      {col(t, "id")});
+  logical::rewrite(*root);
+  CHECK(std::holds_alternative<logical::Empty>(std::get<logical::Project>(root->op).input->op));
+
+  // Two Filters over a Join, of conjuncts that read no column, become one.
+  auto pair = logical::node(logical::Join{get(t), get(u), {logical::compare(Op::Eq, col(t, "qty"), col(u, "k"))}});
+  auto over = project(filter(filter(std::move(pair), {logical::compare(Op::Eq, p(0), p(1))}),
+                             {logical::compare(Op::Eq, p(1), p(2))}),
+                      {col(u, "k")});
+  logical::rewrite(*over);
+  const auto& top = std::get<logical::Filter>(std::get<logical::Project>(over->op).input->op);
+  CHECK(top.conjuncts.size() == 2);
+  CHECK(std::holds_alternative<logical::Join>(top.input->op));
+}
+
+TEST_CASE("search: costs choose the join order, from the tables' counts", "[sql][search][cost]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"a", {Fixture::col("k", PhysType::I64, false), Fixture::col("x", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateIndexDdl{"a_x", "a", {{"x"}}});
+  f.ddl(CreateTableDdl{"b", {Fixture::col("k", PhysType::I64, false), Fixture::col("y", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateIndexDdl{"b_y", "b", {{"y"}}});
+  const auto& cat = f.cat();
+  const auto a_x = std::to_string(cat.table("a")->indexes[0].id);
+  const auto b_y = std::to_string(cat.table("b")->indexes[0].id);
+  // Either table is reached by its index, and either keys the other by k.
+  const std::string sql = "SELECT a.k FROM a, b WHERE x = $1 AND y = $2 AND a.k = b.k";
+  auto scans = [](const GeneratedPlan& g, const std::string& index) {
+    return has(g, "bc_scan_open(cx, IDX_" + index + ", lo, lo, BC_SCAN_PREFIX)");
+  };
+
+  // a small: scan a's 100 entries for x, fetch each row, and look up b by
+  // its key for each of the 100: 2 * 100 + 100.
+  auto small_a = plan_sql(cat, sql, {{"a", 1000}, {"b", 1'000'000}});
+  CHECK(scans(small_a, a_x));
+  CHECK_FALSE(scans(small_a, b_y));
+  CHECK(small_a.cost == Catch::Approx(300));
+  // b small: the other order.
+  auto small_b = plan_sql(cat, sql, {{"a", 1'000'000}, {"b", 1000}});
+  CHECK(scans(small_b, b_y));
+  CHECK_FALSE(scans(small_b, a_x));
+  CHECK(small_b.cost == Catch::Approx(300));
+  // Equal: FROM order.
+  CHECK(scans(plan_sql(cat, sql, {{"a", 1000}, {"b", 1000}}), a_x));
+}
+
+TEST_CASE("search: a table keyed by parameters alone is read once, before the other table's scan",
+          "[sql][search][cost]") {
+  sql_test::Fixture f;
+  f.ddl(CreateTableDdl{"u", {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},
+                       {"k"}});
+  const auto& cat = f.cat();
+  const std::string sql = "SELECT v FROM u, t WHERE k = $1 AND name = $2";
+  // u by its point lookup, 1; then t's 100 entries under name, no row
+  // fetched, since nothing reads t's columns: 1 + 100. Scanning t first and
+  // looking u up for each of its 100 rows would be 200 + 100.
+  auto once = plan_sql(cat, sql, {{"t", 1000}, {"u", 1000}});
+  CHECK(once.cost == Catch::Approx(101));
+  CHECK_FALSE(has(once, "bc_scan_row"));
+  auto get = once.source.find("bc_view row = bc_get(cx, bc_key_params(cx, TBL_");
+  auto missing = once.source.find("if (!found) {\n    return;\n  }");
+  auto scan = once.source.find("bc_scan_open(cx, IDX_");
+  REQUIRE(get != std::string::npos);
+  REQUIRE(missing != std::string::npos);
+  REQUIRE(scan != std::string::npos);
+  // No row of u: the plan ends before t is scanned.
+  CHECK(get < missing);
+  CHECK(missing < scan);
+  CHECK_FALSE(has(once, "found1"));
+  // Both orders are costed; the other is the loop with a lookup per row.
+  auto b = bound::bind(ast::parse(sql), cat);
+  auto all = generate_alternatives(std::move(b), cat, sql, [](const Table& t) -> std::optional<std::uint64_t> {
+    return t.name == "t" || t.name == "u" ? std::optional<std::uint64_t>{1000} : std::nullopt;
+  });
+  REQUIRE(all.size() == 2);
+  CHECK(all[0].source == once.source);
+  CHECK(has(all[1], "bc_view row1 = bc_get(cx, bc_key_params(cx, TBL_"));
+  CHECK(all[1].cost == Catch::Approx(300));
+}
+
+TEST_CASE("search: a table read once is filtered by the join's conjuncts, which its cost and rows count",
+          "[sql][search][cost]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"u",
+                       {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true),
+                        Fixture::col("dv", PhysType::F64, true)},
+                       {"k"}});
+  f.ddl(CreateTableDdl{"w",
+                       {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+                        Fixture::col("d", PhysType::F64, true)},
+                       {"k"}});
+  f.ddl(CreateIndexDdl{"w_a", "w", {{"a"}}});
+  const auto& cat = f.cat();
+  // u by its point lookup, then t's 100 entries under name, each row fetched
+  // for the join's conjunct: 1 + 200, and 1 x 100 x 1/10 rows. Under LIMIT 5
+  // that is 201 x 5 / 10. Scanning t first and looking u up for each of its
+  // rows: (200 + 100) x 5 / 10.
+  const std::string sql = "SELECT qty FROM u, t WHERE k = $1 AND name = $2 AND t.qty = u.v";
+  auto once = plan_sql(cat, sql, {{"t", 1000}, {"u", 1000}});
+  CHECK(once.cost == Catch::Approx(201));
+  CHECK(plan_sql(cat, sql + " LIMIT 5", {{"t", 1000}, {"u", 1000}}).cost == Catch::Approx(100.5));
+  // t's rows compared with u's row, inside t's loop.
+  auto scan = once.source.find("bc_view row1 = bc_scan_row(cx, c);");
+  auto joined = once.source.find("bc_col_i64(cx, row1, COL_");
+  REQUIRE(scan != std::string::npos);
+  REQUIRE(joined != std::string::npos);
+  CHECK(scan < joined);
+  CHECK(once.source.find("bc_col_i64(cx, row, COL_", joined) != std::string::npos);
+  // A join conjunct on DOUBLE columns is a filter neither order takes: w's
+  // key is named by nothing, and the conjunct filters w read once, or u
+  // looked up per row.
+  try {
+    (void)plan_sql(cat, "SELECT w.k FROM u, w WHERE u.k = $1 AND w.a = $2 AND w.d = u.dv");
+    FAIL("planned");
+  } catch (const ast::FeatureNotSupported& e) {
+    CHECK(std::string{e.what()} ==
+          "no plan: a filter on column \"d\", a REAL or DOUBLE PRECISION, is not supported yet");
+  }
+}
+
+TEST_CASE("search: a refusal names the failure of a plan of every table, not of one table's access",
+          "[sql][search]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"a",
+                       {Fixture::col("k", PhysType::I64, false), Fixture::col("x", PhysType::I64, true),
+                        Fixture::col("z", PhysType::I64, true)},
+                       {"k"}});
+  f.ddl(CreateIndexDdl{"a_xz", "a", {{"x"}, {"z"}}});
+  f.ddl(CreateTableDdl{"b", {Fixture::col("k", PhysType::I64, false), Fixture::col("y", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateIndexDdl{"b_y", "b", {{"y"}}});
+  auto refused = [&](std::string_view sql) -> std::string {
+    try {
+      (void)plan_sql(f.cat(), sql);
+    } catch (const ast::FeatureNotSupported& e) {
+      return e.what();
+    }
+    return "accepted";
+  };
+  // b's scan by y is not in a.z's order, but no plan reaches both tables:
+  // nothing names b's key from a, nor a's from b.
+  CHECK(refused("SELECT a.k FROM a, b WHERE a.x = $1 AND b.y = $2 AND a.z = b.y ORDER BY a.z") ==
+        "no plan: no equality names b's key");
+  // Keyed by a.z, b joins a, and the plan of both fails on its order alone.
+  CHECK(refused("SELECT a.k FROM a, b WHERE b.y = $1 AND b.k = a.z AND a.x = $2 ORDER BY a.k") ==
+        "no plan: no index of a gives ORDER BY k");
+}
+
+TEST_CASE("search: COUNT from the keys or by a loop, by the count of the range", "[sql][search][cost]") {
+  sql_test::Fixture f;
+  const auto& cat = f.cat();
+  const std::string sql = "SELECT count(*) FROM t WHERE name = $1";
+  // 10 rows: about one under a name, one cursor step against
+  // bc_count_range's two record reads.
+  auto few = plan_sql(cat, sql, {{"t", 10}});
+  CHECK(has(few, "while (bc_scan_next(cx, c))"));
+  CHECK_FALSE(has(few, "bc_count_range"));
+  CHECK(few.cost == Catch::Approx(1));
+  // A thousand: a hundred steps against two reads.
+  auto many = plan_sql(cat, sql, {{"t", 1000}});
+  CHECK(has(many, "bc_count_range"));
+  CHECK(many.cost == Catch::Approx(2));
+  // Uncounted (no database): costed as kUncountedRows, so from the keys.
+  CHECK(has(plan_sql(cat, sql), "bc_count_range"));
+}
+
+TEST_CASE("search: an ORDER BY keeps the plan in its order, even where another costs less", "[sql][search][cost]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"o",
+                       {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, false),
+                        Fixture::col("b", PhysType::I64, false), Fixture::col("c", PhysType::I64, false)},
+                       {"k"}});
+  f.ddl(CreateIndexDdl{"o_ab", "o", {{"a"}, {"b"}}});
+  f.ddl(CreateIndexDdl{"o_ac", "o", {{"a"}, {"c"}}});
+  const auto& cat = f.cat();
+  const auto& o = *cat.table("o");
+  const auto ab = "IDX_" + std::to_string(o.indexes[0].id);
+  const auto ac = "IDX_" + std::to_string(o.indexes[1].id);
+  // Without an order, the longer prefix: o_ab, two parts compared.
+  auto any = plan_sql(cat, "SELECT k FROM o WHERE a = $1 AND b = $2", {{"o", 10'000}});
+  CHECK(has(any, "bc_key_params(cx, " + ab + ", 0, 2)"));
+  CHECK(any.cost == Catch::Approx(100));  // 10,000 / 10 / 10 entries, covering
+  // ORDER BY c: only o_ac gives it, b a filter on each of its rows.
+  auto ordered = plan_sql(cat, "SELECT k FROM o WHERE a = $1 AND b = $2 ORDER BY c", {{"o", 10'000}});
+  CHECK(has(ordered, "bc_scan_open(cx, " + ac + ", lo, lo, BC_SCAN_PREFIX)"));
+  CHECK(ordered.cost == Catch::Approx(2000));  // 1,000 entries, each row fetched for its filter
+  // A LIMIT stops the scan early: 1 of the 100 rows the filter keeps.
+  auto limited = plan_sql(cat, "SELECT k FROM o WHERE a = $1 AND b = $2 ORDER BY c LIMIT 1", {{"o", 10'000}});
+  CHECK(has(limited, ac));
+  CHECK(limited.cost == Catch::Approx(20));
+}
+
+TEST_CASE("search: a point lookup beats a unique index's one entry; a covering scan beats a fetching one",
+          "[sql][search][cost]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"w", {Fixture::col("k", PhysType::I64, false), Fixture::col("u", PhysType::I64, false),
+                             Fixture::col("v", PhysType::I64, true)},
+                       {"k"}});
+  f.ddl(CreateIndexDdl{"w_u", "w", {{"u"}}, true});
+  const auto& cat = f.cat();
+  auto both = plan_sql(cat, "SELECT v FROM w WHERE k = $1 AND u = $2", {{"w", 1000}});
+  CHECK(has(both, "bc_get(cx, bc_key_params(cx, TBL_"));
+  CHECK(both.cost == Catch::Approx(1));
+  // The unique index names at most one entry, and fetches its row.
+  auto by_u = plan_sql(cat, "SELECT v FROM w WHERE u = $1", {{"w", 1000}});
+  CHECK(has(by_u, "bc_scan_row"));
+  CHECK(by_u.cost == Catch::Approx(2));
+  // k is in every index key: no row fetched.
+  auto covered = plan_sql(cat, "SELECT k FROM w WHERE u = $1", {{"w", 1000}});
+  CHECK_FALSE(has(covered, "bc_scan_row"));
+  CHECK(covered.cost == Catch::Approx(1));
+}
+
+TEST_CASE("search: search_all returns every plan it costed, cheapest first, the one search picks among them",
+          "[sql][search][cost]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"o",
+                       {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, false),
+                        Fixture::col("b", PhysType::I64, false)},
+                       {"k"}});
+  f.ddl(CreateIndexDdl{"o_a", "o", {{"a"}}});
+  f.ddl(CreateIndexDdl{"o_ab", "o", {{"a"}, {"b"}}});
+  const auto& cat = f.cat();
+  auto all = [&](std::string_view sql) {
+    auto b = bound::bind(ast::parse(sql), cat);
+    return generate_alternatives(std::move(b), cat, sql);
+  };
+  // o_a and o_ab reach a; and COUNT from the keys or by a loop over each.
+  auto plans = all("SELECT count(*) FROM o WHERE a = $1");
+  REQUIRE(plans.size() == 4);
+  for (std::size_t i = 1; i < plans.size(); ++i) CHECK(plans[i - 1].cost <= plans[i].cost);
+  CHECK(plans[0].source == plan_sql(cat, "SELECT count(*) FROM o WHERE a = $1").source);
+  // k by the primary key, by o_a and by o_ab; a point lookup keeps its one plan.
+  CHECK(all("SELECT a FROM o WHERE k = $1").size() == 1);
+  CHECK(all("SELECT b FROM o WHERE a = $1 AND k >= $2").size() == 3);
 }

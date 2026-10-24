@@ -107,14 +107,18 @@ The rules, by what they test.
   values outside the type included, the conjuncts shuffled; maybe an
   `ORDER BY` of the parts after the prefix, in the key's direction or
   against it, an equality-compared column now and then, one item flipped
-  now and then; maybe a `LIMIT`. A model of the planner's rules
-  (`served`) says whether the layer plans it: if not, the layer must
-  refuse it with `no plan:` and SQLSTATE 0A000, and PostgreSQL is not
-  asked. If it does, the
-  rows are compared in `ORDER BY` order, as a multiset within each run of
-  equal sort keys, and a run the `LIMIT` cuts must be drawn from
+  now and then; maybe a `LIMIT`. A model of the planner (`served`) says
+  whether some plan serves it: if not, the layer must refuse it with
+  `no plan:` and SQLSTATE 0A000, and PostgreSQL is not asked. If it does,
+  the rows are compared in `ORDER BY` order, as a multiset within each run
+  of equal sort keys, and a run the `LIMIT` cuts must be drawn from
   PostgreSQL's (`oracle.same_rows`, against PostgreSQL's rows without the
   `LIMIT`).
+- **Alternatives agree** (`planner_design.md`, *Tests*): after each
+  `SELECT`, aggregate and join compared with PostgreSQL, in autocommit,
+  every plan the search costed for it runs on the same data
+  (`Database::alternatives_for_testing`), and each one's rows are checked
+  as the layer's are.
 - **COUNT** of `*` or of a column over the same `WHERE`, with `LIMIT 0`
   or 1 now and then.
 - **SET col = col ± $n** on SMALLINT, INTEGER and NUMERIC(6, 2) columns by
@@ -153,7 +157,7 @@ The rules, by what they test.
   to a column of the first of its type or to a parameter, the first's
   conjuncts from a key path, maybe a filter on the second; targets with a
   `LIMIT`, or `COUNT(DISTINCT)` of either table's column. `join_served`
-  models the planner's choice of outer table.
+  says whether either table can be the outer one.
 
 `test_tprocc.py` runs TPROC-C's five transactions through SQL against
 PostgreSQL: a small fixture (one warehouse, two
