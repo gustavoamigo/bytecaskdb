@@ -2056,7 +2056,9 @@ enough to split nodes, found what the engine's missed:
   allocations came from the pool, uncounted. `apply_batch` of 80 puts, which
   splits the leaf its first put copied, and `alloc sweep: a transient whose
   write fails partway is freed once`, which splits leaves, inner nodes and
-  the inner root under each failed allocation, reach it.
+  the inner root under each failed allocation, reach it; `alloc sweep: a
+  keyed transient whose write fails partway is freed once` runs the same
+  sweep on the keyed tree.
 
 The fixes are in `bytecask_design.md`, *A failure after the append that no
 handler degrades for*. Each has a deterministic test, driven by a test hook
@@ -2653,7 +2655,7 @@ A site whose break nothing has to catch says why instead.
 | Key directory: a dropped transient is freed without allocating | `alloc sweep: a transient tree is freed when nothing can be allocated` | `free_subtree_allocates` | #364 |
 | Key directory: `publish` reserves its record before it links the base | `alloc sweep: a failed publication leaves the base derivable` | `publish_links_before_reserving` | #364 |
 | Key directory: releasing a version never throws for want of memory | `alloc sweep: a version is released when nothing can be allocated` | `release_queue_allocates` | #390 |
-| Key directory: a write frees the nodes it replaced only after the root reaches their replacement | `alloc sweep: a transient whose write fails partway is freed once` | `replaced_node_freed_at_once` | #585 |
+| Key directory: a write frees the nodes it replaced only after the root reaches their replacement | `alloc sweep: a transient whose write fails partway is freed once`, under ASan: elsewhere the node pool takes a double free without a report (#583) | `replaced_node_freed_at_once` | #585 |
 
 ### Rotation and new files
 

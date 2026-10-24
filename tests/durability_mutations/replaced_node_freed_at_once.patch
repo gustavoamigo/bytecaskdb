@@ -1,7 +1,8 @@
 A write frees an owned node as soon as a split or rebuild replaces it,
 before the root reaches the replacement: an allocation failing between a
 split and make_root leaves the root on a freed node, which dropping the
-transient frees again.
+transient frees again. Caught under ASan only: elsewhere the pool takes the
+second free without a report (#583).
 Guarded-by: "alloc sweep: a transient whose write fails partway is freed once"
 
 diff --git a/bytecaskdb/btree.cppm b/bytecaskdb/btree.cppm

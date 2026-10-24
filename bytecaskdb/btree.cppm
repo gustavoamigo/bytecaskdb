@@ -20,6 +20,7 @@ module;
 #include <cstring>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -815,8 +816,10 @@ public:
   // (blind_btree.cppm): they route through the same inner nodes and supply
   // their own leaf step to the descent.
 protected:
-  // Marks a replaced node during discard_all(). Session tags start at 1.
-  static constexpr std::uint64_t kReplacedTag = 0;
+  // Marks a replaced node during discard_all(). No session or node takes it:
+  // tags count up from 1, and 0 is a node's default and a finished session's.
+  static constexpr auto kReplacedTag =
+      std::numeric_limits<std::uint64_t>::max();
 
   std::uint64_t tag_;
   std::vector<N *> retired_;
@@ -2267,6 +2270,9 @@ private:
 // the session created are edited in place; everything else is copied on
 // first touch. A transient nothing was written to publishes nothing and
 // hands back its base. Single-use: any call after persistent() throws.
+// After a write throws, for whatever reason and whether or not it had changed
+// anything, every call but the destructor throws std::logic_error: the tree
+// may be missing what the write was moving.
 // ---------------------------------------------------------------------------
 export template <typename V> class TransientBTree {
   using N = btree_detail::Node<V>;
