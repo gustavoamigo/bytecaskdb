@@ -52,40 +52,9 @@ GitHub Issues are the repository's task tracker, for work not already captured b
 - If the repository does not yet have the necessary test seam, create the smallest practical test harness first.
 - If tests cannot be run, state why clearly and record the blocker in the PR description or a GitHub issue.
 
-### Fault sweeps must reach every structural transition
+### Engine tests (`tests/`)
 
-A fault sweep proves only the paths its workload reaches with the fault armed. Line and MC/DC coverage show a branch ran, not that it ran with each of its allocations failed. The engine's sweep missed #580 because its seed was one leaf no operation filled (#588).
-
-- A sweep over a tree, or over anything else that restructures itself (split, rebuild, collapse, a join of parts built in parallel), includes writes that make every such transition while the structure owns the nodes involved, and writes that make it on nodes it must first copy.
-- The sweep asserts its own reach rather than trusting the seed: it counts the transitions its writes make (`btree_detail::Transition`) and requires each to happen in a write that an injected failure then ended (`sweep_partial_writes` in `tests/alloc_sweep_test.cpp`). A workload that stops reaching one fails the test instead of passing silently.
-- A new structural transition gets a `Transition` value and joins a sweep's required set.
-
-### Model-based recovery tests
-
-The `[model]` test cases in `tests/bytecask_test.cpp` (random, batch-heavy, delete-heavy, range-delete, and many-frame-hint workloads, plus the vacuum tombstone model) are the primary soundness checks for the DB engine. They run thousands of random operations, close the DB, then reopen under serial and parallel recovery and verify that all key/values and per-file `file_stats` (live_bytes, total_bytes) match a serial baseline.
-
-Update or extend the model-based tests when a change could affect what a recovered DB contains or reports. Common examples:
-- Alters recovery logic (parsing, merging, fan-in, file_stats computation).
-- Adds a new write-path feature (new operation type, new on-disk format field) that must survive recovery.
-- Changes how `file_stats` are computed or propagated.
-- Modifies the parallel merge strategy (thread counts, merge order, tombstone handling).
-
-This list is not exhaustive — use judgment. If a change touches anything that could make serial and parallel recovery diverge, add or update coverage.
-
-When extending, follow the existing pattern: collect a serial baseline outside the SECTIONs, copy the sealed DB to an isolated directory per SECTION, reopen with the target thread count, and CHECK both key/values and `collect_stats(db) == serial_stats_vals`.
-
-### Mutation sets
-
-`tests/soak_mutations/` and `tests/chaos_mutations/` hold deliberate engine breaks that prove the soak and the chaos rig still catch what they should (`scripts/soak_mutation_check.sh`, `scripts/chaos_mutation_check.sh`). `tests/durability_mutations/` holds breaks of durability sites the rig does not reach. `docs/correctness_validation.md`, *Durability sites*, lists every site with the test that guards it and its mutation. Keep them current:
-- A new durability site (an `fdatasync`, directory sync, rename, truncate or unlink of a data or hint file, a sync-before-publish ordering, a degrade on an I/O error) gets a row in that table: the test that fails if it breaks and a mutation proving it, or why neither is needed.
-- Every mutation names its test with a `Guarded-by: "<Catch2 test spec>"` header (a comma in a test name is written `\,`: Catch2 reads a bare one as OR; `scripts/check_guarded_by.py` checks in CI that every spec selects a test), and the test is run once with the patch applied to show it fails; say so in the PR. A durability fix adds that test, a patch reverting the fix (in `tests/durability_mutations/`, or `tests/chaos_mutations/` if the rig reaches it) and a table row.
-- A fix for a bug the soak or the chaos rig found adds a patch that reverts the fix, with `Expected: caught.` and one line on what the rig then sees.
-- Patches apply by three-way merge (`scripts/mutation_patch.sh`, used by both check scripts and `ci.yml`), so a change elsewhere in the file, or to lines a little way off, merges. A patch needs regenerating only when the merge conflicts: when the targeted code changed, or a line directly next to it did. Regenerate it by making the same break and saving `git diff` (the `index` line is what lets it merge later), or delete it if its target is gone; `ci.yml` fails on a conflicting patch. When code moves verbatim to another file, the merge cannot follow it: `scripts/mutation_follow_move.sh <base> <from> <to> <patch>...` regenerates the stranded patches.
-- Run the mutation check when a change could alter what it proves, and put its summary in the PR description:
-  - a change to the rig (`tests/chaos/`, `tests/crash/crash_model.h`) or to the mutations themselves runs the whole set: `scripts/chaos_mutation_check.sh`;
-  - a change to engine code a mutation patches runs that mutation: `scripts/chaos_mutation_check.sh 5 tests/chaos_mutations/<name>.patch` (a soak mutation: `scripts/soak_mutation_check.sh <address|thread> 120 tests/soak_mutations/<name>.patch`).
-  Other changes need no run: the set only goes stale when the rig or the code it mutates changes, which is why it is not scheduled.
-- A mutation whose result changes gets its `Expected:` header updated with the reason. One that other code now covers is kept as `Expected: NOT caught` with that reason, not deleted.
+Fault sweeps, the model-based recovery tests and the mutation sets have their own rules in `tests/CLAUDE.md`. Read them when a change touches recovery, a key directory tree, a durability site (`fdatasync`, rename, unlink, directory sync of a data or hint file), the chaos rig, or anything that restructures itself. A fault sweep must reach every structural transition of what it sweeps, and a durability fix adds the test that fails without it and a mutation that reverts the fix.
 
 ## Commit rules
 
@@ -135,7 +104,6 @@ These four principles govern every design decision in the codebase, in priority 
 - Wrap checked narrowing conversions in a `narrow<To>(From)` helper that calls `std::in_range` and throws on overflow, rather than scattering `if (!std::in_range<T>) throw` / `static_cast` pairs at every call site.
 - Wrap ugly or unsafe low-level calls (e.g. `reinterpret_cast` through a legacy C-style API) in a small named function so the cast appears once and call sites stay readable (C++ Core Guidelines ES.50 / T.69).
 - Use `std::ssize` (C++20) instead of casting `.size()` to a signed type.
-- Prefer `std::filesystem` utilities over manual file-handle tricks (e.g. `std::filesystem::file_size`). The exception is listing a directory on a path that must survive a failed allocation: libstdc++'s `directory_iterator` allocates inside a `noexcept` function, so the failure ends the process (#598). Recovery uses `list_directory` (`data_file.cppm`) instead; `alloc sweep: open` and the `recovery_lists_with_directory_iterator` mutation hold it there.
 
 ### Safety through abstraction — compile-time first, runtime second
 
@@ -148,69 +116,9 @@ Avoid designs where correctness depends on programmer discipline alone (e.g. "ne
 
 **Example — the P4 Node/InternalNode split**: Rather than allocating leaf nodes at a smaller size and relying on discipline to never access the `children_` field (heap buffer overflow if violated), we split into `Node` (base, no `children_` field) and `InternalNode : Node` (derived, has `children_`). Accessing `children_` through a `Node*` is a compile error. Child accessor methods on `Node` check a tag bit before downcasting and return safe defaults ("no children") when the tag is absent.
 
-### Iterator laziness — correctness requirement
+### Engine code (`bytecaskdb/`)
 
-Iterators must fetch and process data lazily unless explicitly documented otherwise. An iterator that eagerly materializes all results into memory is a correctness bug: the result set may exceed available memory (e.g. a `changes_since` scan over millions of entries). The correct pattern is to hold at most one unit of work in memory at a time (one batch, one entry) and advance on demand.
-
-When implementing an iterator over data files:
-- Build the file/partition list eagerly (it is O(num_files), small).
-- Scan one batch at a time within each file.
-- Cache only the current entry; release previous data on advance.
-- If global ordering is required across files, exploit the engine's sequence-disjoint file property (files sorted by min_sequence yield globally ascending order) rather than collecting and sorting all entries.
-
-### Lifetime and view safety — spans, iterators, and non-owning views
-
-The hardest class of bugs in this codebase involves returning non-owning views (`std::span`, `std::string_view`, raw pointers) into an object's own internal buffer. These are correct as long as the owning object stays alive, but silently become dangling references — confirmed by ASan as heap-use-after-free — if:
-
-- The owning object is a temporary (destroyed at end of a full expression).
-- The owning object is moved, reallocated, or goes out of scope while the view is still held.
-- A standard library adaptor (e.g. `std::reverse_iterator`) creates a copy of your type internally.
-
-**Rule: never compose an iterator whose `operator*` returns a span-into-`*this` with `std::reverse_iterator`.**
-
-`std::reverse_iterator<T>::operator*` is specified as:
-```cpp
-auto operator*() const { auto tmp = cur_; return *--tmp; }
-```
-It creates a temporary copy, decrements it, and dereferences it. If `T::operator*` returns a span into `this->buffer_`, that buffer is destroyed when the temporary is destroyed — at the end of the expression — leaving the caller with a dangling span. This also causes a heap alloc+free on every dereference (a performance penalty on top of the UB).
-
-**The correct pattern — hold the cursor alive as a member (lesson from BC-122):**
-
-```cpp
-// WRONG: std::reverse_iterator creates temporaries — dangling span, heap alloc per dereference
-using reverse_iterator = std::reverse_iterator<RadixTreeIterator<V>>;
-
-// CORRECT: custom reverse iterator holds the cursor alive, operator* returns *cur_
-export template <typename V> class ReverseRadixTreeIterator {
-public:
-  explicit ReverseRadixTreeIterator(RadixTreeIterator<V> past_pos)
-      : cur_{std::move(past_pos)} { --cur_; }   // pre-decrement once in ctor
-
-  auto operator*() const { return *cur_; }       // span into cur_'s live buffer — never dangling
-  auto operator++() -> ReverseRadixTreeIterator& { --cur_; return *this; }
-  auto operator==(std::default_sentinel_t) const noexcept -> bool { return cur_ == std::default_sentinel; }
-
-private:
-  RadixTreeIterator<V> cur_;   // owned — keeps the key buffer alive
-};
-```
-
-**General rules for non-owning views:**
-
-- A function returning `std::span` or `std::string_view` is lending a view. If the owning object's lifetime is not obvious from the call site, document it with a comment: `// returned span valid until next write`.
-- Never return a span or view into a local variable, a value parameter, or a temporary.
-- Never store a `std::span` or `std::string_view` in a struct unless you can guarantee the owner outlives the struct, and document that guarantee explicitly.
-- If you see a `// WARNING:` comment excusing a lifetime hazard, treat it as a required design fix, not permanent documentation. Removing the hazard is always the goal.
-- When in doubt, return an owned value (`std::vector<std::byte>`, `std::string`). The borrow optimisation is only worth it when profiling identifies it as a real bottleneck.
-
-### Ownership through failure — prepare, commit, then release
-
-Every owning raw pointer (a key directory node, a buffer, a parcel) has exactly one owner at every instant, including while an exception unwinds. #580 freed a node that the root still reached; #588 found a bulk join that left leaves owned by two loaders. Each became a use-after-free when an allocation failed in that window.
-
-- A mutation of a structure that others can reach, or that its destructor walks, runs in three steps: **prepare** (every allocation, every call that can throw), **commit** (install the result and hand ownership over with operations that cannot throw), **release** (free what was replaced, once nothing reachable points to it). Freeing before the commit point, or allocating after it, is the bug class.
-- The structure enforces the order, not its callers: one commit function moves the root and frees what was replaced (`BuildSession::write`), and a commit step that must not throw is `noexcept` (`BulkLoader::adopt_runs`), so a throw there ends the process rather than leaving a pointer with two owners.
-- A mutation that fails partway and cannot be rolled back leaves the object refusing every use except destruction (`BuildSession::usable`). Never let a caller keep writing to half-changed state.
-- Moving ownership of a batch of pointers is one non-throwing step, or one pointer at a time with the source cleared as each moves. Never copy pointers to the new owner and clear the old owner afterwards, with a throwing call in between.
+Rules specific to the engine's code (lazy iterators, non-owning views, ownership through failure, batch markers) are in `bytecaskdb/CLAUDE.md`. Read them before changing code in that folder.
 
 ### Thread-local state
 
@@ -224,10 +132,6 @@ A `thread_local` outlives every DB its thread touches, so one holding a DB's sta
 - **Sign-conversion on array indexing** (`-Wsign-conversion`): When indexing an array/string with the result of a signed distribution or function, wrap the index in `static_cast<std::size_t>(...)`.
 - **Missing `[[noreturn]]` on lambdas** (`-Wmissing-noreturn`): Add `[[noreturn]]` to lambdas that unconditionally throw: `[][[noreturn]] { throw ...; }`.
 - **Unused functions/variables** (`-Wunused-function`, `-Wunused-variable`): Remove helper functions and variables that are no longer referenced after a refactor rather than leaving them in place.
-
-### Batch marker invariants
-
-BulkBegin/BulkEnd markers must NOT be skipped by vacuum or ChangeIterator — they are structural markers that preserve batch atomicity on disk. Only hint generation skips them (hints do not have the concept).
 
 ## Documentation writing guidelines
 
