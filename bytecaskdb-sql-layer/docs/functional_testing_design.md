@@ -1,66 +1,182 @@
 # The functional suite
 
-A black-box test of the SQL layer. It starts `sql_layer_server`, talks
-to it as a client does, over the PostgreSQL wire protocol, and checks
-what each statement returns. Every case goes through every layer: the
-wire protocol and the session, the parser, binder, planner and code
-generator, the plan API and the engine, and the files on disk when a
-case restarts the server.
+A black-box test of the SQL layer, and its conformance report. It starts
+`sql_layer_server`, talks to it as a client does, over the PostgreSQL
+wire protocol, and checks what each statement does. Every case goes
+through every layer: the wire protocol and the session, the parser,
+binder, planner and code generator, the plan API and the engine, and the
+files on disk when a case restarts the server.
 
-The cases also set the scope. The suite is the SQL the layer is meant
-to run. A case the layer can't run yet stays in the suite, marked
-`unimplemented`, so the run shows how far the layer is from it.
+Several suites run this way, our own cases and suites from elsewhere, and
+one report says how much of each the layer passes:
+
+| Suite | Coverage | Tests | Checks |
+|---|---|---|---|
+| SQL:2016 Core | x% | n/739 sqltest | statement accepted |
+| SQLLogicTest | x% | n files (~7.4M queries) | results |
+| PostgreSQL features | x% | n/N cases | results |
+| ByteCaskDB features | x% | n/N cases | results |
+| TPC-H-derived | x% | n/22 queries | results |
+| TPC-DS-derived | x% | n/99 queries and their variants | results |
+| TPROC-C | x% | 5 transactions | consistency conditions 1–9 |
+
+The suites also set the scope. They are the SQL the layer is meant to
+run. A case the layer can't run yet stays in, marked not implemented, so
+the report shows how far the layer is from it.
 
 How it differs from the other tests (`testing_design.md`):
-- **The proof machine** generates random statements within its grammar
-  and compares the layer with PostgreSQL as it runs. The functional
-  suite is named cases written by hand, and it runs without PostgreSQL.
-- **`tests/server/test_wire.py`** tests the protocol: startup, the
-  extended protocol, errors on the wire, shutdown. The functional suite
-  tests what the statements do.
+- **The proof machine** generates random statements and compares the
+  layer with PostgreSQL as it runs. The functional suite is fixed cases,
+  and runs without PostgreSQL.
+- **`tests/server/test_wire.py`** tests the protocol. The functional
+  suite tests what the statements do.
 - **The C++ tests and the golden files** test one layer at a time, and
   fix each plan's shape.
 
-## Layout
-
-The machinery is the MariaDB plugin's
-(`bytecaskdb-mariadb-plugin/tests/functional/`), copied and adapted. The
-case queries are not: the plugin's were taken from MariaDB's MTR suite,
-and every case here is written for this layer.
+## How a run works
 
 ```
-bytecaskdb-sql-layer/tests/functional/
-  conftest.py          the server fixture
-  runner.py            runs one case
-  test_yaml_cases.py   collects every case in cases/ as a test
-  record.py            fills expected results from PostgreSQL
-  requirements.txt
-  cases/<area>.yaml
+BYTECASK_SQL_SERVER=build/linux/x86_64/release/sql_layer_server \
+  python3 -m pytest bytecaskdb-sql-layer/tests/functional --results=results.json
+python3 bytecaskdb-sql-layer/tests/functional/report.py results.json > report.md
 ```
 
-- **The client** is psycopg. The suite imports nothing from the layer,
-  not even the `bytecask_sql` module, so it sees what a client sees.
+`--suite=postgresql` runs one suite, `-k F041` the cases of one feature,
+`-k "several NULLs"` one case.
+
+- **One case model.** A case is a list of steps. Each step is SQL and
+  one expectation: it succeeds, it returns these rows (in order, or
+  sorted), its rows hash to a value, or it fails with an error (a given
+  SQLSTATE, or any error). A case has an id, the suite it belongs to,
+  the features it covers, and whether it is implemented yet.
+- **A loader per suite** reads that suite's files in their own format
+  and yields cases, when the run starts. Nothing is converted by hand or
+  committed in our format. The loaders change the format, never the SQL:
+  a statement runs as its suite wrote it, so the number measures that
+  suite and not our edit of it.
+- **pytest runs the cases.** Each case is a test. The client is
+  psycopg, and the suite imports nothing from the layer, not even the
+  `bytecask_sql` module, so it sees what a client sees.
 - **The server** is started with `tests/server/pgserver.py`'s `Server`,
-  on a fresh directory and a free port. `BYTECASK_SQL_SERVER` names the
-  binary, and the suite skips when it is unset, as the other wire tests
-  do.
-- **Python tests** beside the YAML, written by hand, are allowed when
-  YAML can't express a check. They use the same fixtures and still talk
-  only over the wire. None exist yet.
+  on a fresh directory and a free port, and stopped at the end; its log
+  is kept when a case fails. `BYTECASK_SQL_SERVER` names the binary, and
+  the suite skips when it is unset.
+- **The results** go to `results.json`, one entry per case with its
+  suite, id, features and outcome, and to the usual JUnit file.
+- **`report.py`** reads `results.json` and the feature manifest, and
+  prints the table above and a table per SQL feature (*The feature
+  manifest*).
 
-## A case
+## Not implemented
 
-A YAML file is a list of cases. It keeps the plugin's shape:
+- **Our cases** carry `unimplemented: true`.
+- **Another suite's cases** can't be edited, so each suite has a list
+  of the ids the layer doesn't pass yet: `not_implemented/<suite>.txt`.
+  A list starts from a first run and is kept by hand after.
+- **Both are strict.** A not-implemented case is expected to fail, and
+  is reported as not implemented. One that passes fails the run, so
+  whoever builds the feature removes the flag or the line in the same
+  change, and the lists stay true.
+- **No issue per case.** The flags and the lists are the record of
+  what's missing.
+- **A limitation is a gap, not a difference.** What the layer can't do
+  is marked not implemented. A case's expected value differs from its
+  suite's only where a recorded decision says the layer differs on
+  purpose, and a comment beside it names the decision.
+
+## The suites
+
+### SQL:2016 Core: sqltest
+
+[sqltest](https://github.com/elliotchance/sqltest) (MIT) has tests for
+the mandatory features of the SQL:2016 standard, by feature id: about
+740 tests over 134 subfeatures, in `standards/2016/{E,F}/*.tests.yml`.
+Core SQL was defined in SQL:1999; the tests are the 2016 edition's, so
+the row says 2016.
+
+- **Source:** in the repository, pinned to one commit, with its MIT
+  notice.
+- **Loader:** each test is a case with sqltest's id (`f041_03_01_04`)
+  and its feature (`F041-03`), and each of its statements a step that
+  must succeed.
+- **Checks:** that the statements are accepted. sqltest has no expected
+  results, and keeping its rule keeps the number comparable with other
+  projects'. Its tables have no primary key, which the layer doesn't
+  support yet, so many cases start not implemented.
+
+### SQLLogicTest
+
+The sqllogictest files (public domain): about 620 files and 7.4 million
+queries, each with the results several databases agreed on.
+
+- **Source:** fetched at a pinned commit when the suite runs, and
+  cached. Not committed: it is large.
+- **Loader:** a file is parsed record by record.
+  - `statement ok` and `statement error` are steps that must succeed or
+    fail; the files give no SQLSTATE.
+  - `query <types> <sort>` is a step with expected rows. `nosort` keeps
+    their order; `rowsort` and `valuesort` sort first, as sqllogictest
+    defines them.
+  - "N values hashing to H" is a hash expectation, computed as
+    sqllogictest computes it: values formatted by column type (`R` to
+    three decimals), NULL as `NULL`, the empty string as `(empty)`.
+  - `skipif` and `onlyif` are evaluated with the layer as `postgresql`.
+  - A case is one file and the line of its record.
+- **Checks:** results.
+
+### PostgreSQL features and ByteCaskDB features: our cases
+
+Cases we write, in YAML, in `cases/`.
+- **PostgreSQL features:** what PostgreSQL has beyond the standard, such
+  as `LIMIT` and `OFFSET`, `RETURNING`, `ON CONFLICT`, `$n` parameters,
+  `NULLS FIRST` and `LAST`, and `::` casts; and the standard features
+  sqltest only parses, where the answer matters (NULL in aggregates and
+  joins, overflow, a type's edges).
+- **ByteCaskDB features:** the layer's own behaviour: what survives a
+  restart, the sync modes and I/O backends, the statement memory
+  budget, `FOR UPDATE`'s guards.
+
+Their format is in *Our cases*, below.
+
+### TPC-H-derived and TPC-DS-derived
+
+The two benchmarks' query sets: 22 queries, and 99 with their variants.
+
+- **Data:** generated at a small scale with TPC's own generators,
+  downloaded when the suite runs under TPC's licence. Neither the tools
+  nor the data are committed.
+- **Expected results:** recorded from PostgreSQL on the same data.
+- **Checks:** results.
+- **Names:** TPC's fair-use policy keeps the benchmarks' names for
+  audited results, the reason the layer says TPROC-C. These two rows'
+  names are open (*Open questions*).
+
+### TPROC-C
+
+The in-process harness (`testing_design.md`, *The TPROC-C harness*),
+run as cases of the suite: the five transactions on a small load, then
+`sql_layer_tprocc check`, the nine consistency conditions. The HammerDB
+gate stays where it is (`server_design.md`, *Running the gate*).
+
+## Our cases
+
+A YAML file is a list of cases, one file per area (`joins.yaml`,
+`types.yaml`). The format is the MariaDB plugin's
+(`bytecaskdb-mariadb-plugin/tests/functional/`), whose runner and
+fixtures this suite starts from. Its case queries are not reused: they
+were taken from MariaDB's MTR suite. Every case here is written for this
+layer.
 
 ```yaml
 # Unique constraints and NULL.
 
 - name: a UNIQUE column takes several NULLs
+  features: [pg:unique-nulls-distinct]
   setup:
     - CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER UNIQUE)
   steps:
-    - sql: INSERT INTO u VALUES (1, NULL), (2, NULL)
-      rowcount: 2
+    - sql: INSERT INTO u VALUES (1, NULL)
+    - sql: INSERT INTO u VALUES (2, NULL)
     - sql: INSERT INTO u VALUES (3, 7)
     - sql: INSERT INTO u VALUES (4, 7)
       error: "23505"
@@ -70,190 +186,160 @@ A YAML file is a list of cases. It keeps the plugin's shape:
     - DROP TABLE u
 ```
 
-- **`name`** is the test's id, with the file's name: `unique/a UNIQUE
-  column takes several NULLs`.
-- **`setup`** runs before the case, and every statement in it must
-  succeed. **`teardown`** always runs after it, and its errors are
-  ignored.
+- **`name`** is the case's id, with its file: `unique/a UNIQUE column
+  takes several NULLs`.
+- **`features`** lists the features the case covers: SQL feature ids
+  (`F041-03`), or our own for what the standard doesn't number
+  (`pg:returning`, `layer:restart`). Every id must be in the manifest,
+  or the run fails.
+- **`setup`** runs before the case, and must succeed. **`teardown`**
+  always runs after it, and its errors are ignored.
 - **`query` and `expected`** are the short form of a case with one
   query. **`steps`** is the long form: each step has `sql`, and may have
   `expected`, `rowcount` or `error`. A step with none of them must
-  succeed, and what it returns is not checked.
-- **`expected`** is the rows, each a list of values. A value is compared
-  as PostgreSQL's text form for its type: `7`, `1.50`, `t`, `2026-10-25`.
-  YAML's `null` is SQL's NULL. The plugin wrote NULL as the string
-  `"NULL"`, which can't be told from a text value `'NULL'`.
-- **`rowcount`** is the number of rows an `INSERT`, `UPDATE` or `DELETE`
-  changed, from the command tag.
-- **`error`** is a SQLSTATE, as a string: `"23505"`. The step must fail
-  with it. The message is not compared. Inside `BEGIN`, an error fails
-  the transaction as it does in PostgreSQL, and the steps that follow
-  have to account for that.
-- **`params`**, on a step, is a list of values sent separately, through
-  the extended protocol, for a statement written with `$1`, `$2` and so
-  on.
-- **Comments** (`#`) carry anything a reader should know: why a case is
-  unimplemented, or why its expected value is ours and not PostgreSQL's.
-  The runner ignores them, and the recorder keeps them.
+  succeed.
+- **`expected`** is rows, each a list of values, compared as
+  PostgreSQL's text form for its type (`7`, `1.50`, `t`, `2026-10-25`).
+  YAML's `null` is SQL's NULL.
+- **`rowcount`** is the rows an `INSERT`, `UPDATE` or `DELETE` changed.
+- **`error`** is a SQLSTATE, as a string. The message is not compared.
+- **`params`** is a list of values sent through the extended protocol,
+  for a statement written with `$1`, `$2`.
+- **`ordered: true`**, on a case or a step, compares rows in order.
+  Without it both lists are sorted first, since SQL gives no order
+  without `ORDER BY`. A case sets it when the order is what it checks,
+  and only when its `ORDER BY` gives every row one place. A case doesn't
+  use `LIMIT` without `ORDER BY`.
+- **`restart`**, a step on its own, stops the server cleanly and starts
+  it again on the same directory.
+- **`server_flags`**, on a case, are flags for the server, such as
+  `["--sync", "AT_INTERVAL"]`.
+- **`unimplemented: true`**: see *Not implemented*.
+- **Comments** (`#`) say anything a reader should know. The runner
+  ignores them, and the recorder keeps them.
 
-### Three additions
+A file's cases share one server, and each drops what it made in its
+`teardown`. A case with `restart` or `server_flags` gets a server of
+its own.
 
-- **`restart`**, a step on its own (`- restart`), stops the server
-  cleanly and starts it again on the same directory. The steps after it
-  see what recovery brought back: the catalog, the rows, the indexes.
-- **`server_flags`**, on a case, is a list of flags for the server:
-  `["--sync", "AT_INTERVAL"]`, `["--io-backend", "buffer_pool", ...]`.
-  The expected results are the same with any flags. A case uses them to
-  check that they are.
-- **`unimplemented: true`**, on a case, says the layer doesn't run it
-  yet. See *Scope*, below.
+### Recording expected results
 
-## Comparing rows
+Nobody writes expected values by hand. `record.py` runs a file's cases
+on a PostgreSQL 17 and writes what it returned into `expected`,
+`rowcount` and `error`; the file is reviewed and committed.
 
-- **Without `ordered`,** both lists of rows are sorted before they are
-  compared, so only which rows came back counts, duplicates included.
-  SQL gives no order without `ORDER BY`, and the layer's order (often
-  the key's) need not be PostgreSQL's, nor stay the same when a plan
-  changes.
-- **With `ordered: true`,** on a case or a step, the lists are compared
-  as they are. A case sets it when the order is what it checks, and
-  only when its `ORDER BY` gives every row one place. Rows that tie on
-  the sort key can come back either way, on both systems.
-- The runner does not look for `ORDER BY` in the SQL. It can appear
-  where it orders nothing the client sees: in a subquery, or in an
-  aggregate's `ORDER BY`.
-- A case does not use `LIMIT` without `ORDER BY`, since which rows it
-  returns is undefined. Counting them (`SELECT count(*) FROM (...)`) is
-  fine.
-
-## Servers
-
-- **One server per file.** Each case drops what it made, in its
-  `teardown`. A case that leaves something behind breaks the cases after
-  it, which shows where the leak is.
-- **A server of its own** for a case with `restart` or `server_flags`,
-  started on a fresh directory and stopped when the case ends.
-
-## Expected results come from PostgreSQL
-
-Nobody writes expected rows by hand. `record.py` runs a file's cases on
-a PostgreSQL 17 and writes what PostgreSQL returned into `expected`,
-`rowcount` and `error`. The file is then reviewed and committed.
+```
+python3 bytecaskdb-sql-layer/tests/functional/record.py \
+  --pg "host=localhost user=postgres password=... dbname=postgres" cases/joins.yaml
+```
 
 - **The test never touches PostgreSQL.** The YAML is the expected
-  result. We may choose to differ from PostgreSQL, and a reader sees the
-  answer in the file, not in another database.
-- **It fills only what is missing.** A step with an expected result is
-  left alone. Re-recording a case is a deliberate run on that case
-  (`record.py --case NAME`). So a value edited by hand, where the layer
-  differs from PostgreSQL on purpose, is not overwritten by the next
-  recording. Such a value carries a comment saying why.
-- **It keeps the file as written.** It reads and writes with
-  `ruamel.yaml`, which keeps comments, key order and layout. The runner
-  only reads, with PyYAML.
-- **What PostgreSQL can't answer:** a `restart` step is skipped on
-  PostgreSQL, since rows after a restart are the rows before it.
-  `server_flags` are not PostgreSQL's and are ignored.
-- **Each case gets a schema of its own** on PostgreSQL, dropped after
-  it.
-- **`unimplemented` cases are recorded too.** The answer the layer
-  should give is known before the feature exists.
+  result, so the layer can differ from PostgreSQL on purpose and the
+  file shows it.
+- **It fills only what is missing.** Re-recording a case is a run on
+  that case (`--case NAME`), so a value written by hand, where the layer
+  differs on purpose, is not overwritten.
+- **It keeps the file as written,** with `ruamel.yaml`: comments, key
+  order and layout. The runner only reads, with PyYAML.
+- `restart` steps are skipped on PostgreSQL and `server_flags` ignored.
+  Each case gets a schema of its own there.
+- **Not-implemented cases are recorded too,** so the answer is known
+  before the feature exists.
 
-The connection is a libpq conninfo: `record.py --pg "host=localhost
-user=postgres password=... dbname=postgres" cases/unique.yaml`.
+When a case is written, sqltest's file for its feature, and PostgreSQL's
+regression tests (`src/test/regress`), are checklists of the forms and
+edges worth covering. Their SQL is not copied into our cases.
 
-## Scope
+## The feature manifest
 
-The cases in `cases/` are the dialect we want the layer to run. Adding a
-case says "the layer should do this". Something we decide never to
-support is not added.
+`tests/functional/features.yaml` is every feature the suites may name:
+- each SQL subfeature, with its id and name, from sqltest's
+  `features.yml` (the SQL:2016 taxonomy, MIT), whether it is mandatory,
+  and whether PostgreSQL supports it (PostgreSQL's documentation,
+  *SQL Conformance*);
+- our own ids for the rest (`pg:…`, `layer:…`), each with a line saying
+  what it is;
+- a comment on any feature we leave out of scope, saying why.
 
-- **`unimplemented: true`** marks a case the layer doesn't run yet. The
-  run expects it to fail: a wrong answer, or a refusal such as 0A000.
-  It is reported as unimplemented, not as a failure.
-- **A case marked `unimplemented` that passes fails the run.** Whoever
-  builds the feature removes the flag in the same change. So the flags
-  stay true.
-- **No issue per case.** The YAML is the list of what's missing. A case
-  may name the work it waits on in a comment.
-- **The run reports completeness:** per file, how many cases pass and
-  how many are unimplemented. A failing case that is not marked is a
-  bug.
+The per-feature table in the report gives, for each feature: the layer
+passes all its cases, some, or none; PostgreSQL supports it; or no case
+covers it yet.
 
-### Areas
+## CI
 
-One file per area. The first set:
+In `sql-layer.yml`:
+- **Every PR:** builds the server and runs every suite but
+  SQLLogicTest, with a small TPROC-C load. A failing case, or a
+  not-implemented case that passes, fails the job. The report goes to
+  the job's summary page; `results.json` and `report.md` are uploaded.
+- **Nightly:** the same, and SQLLogicTest, which takes hours over the
+  wire. The PR report shows its last nightly result and the date.
 
-- **DDL:** `CREATE TABLE` for each type, `PRIMARY KEY`, `UNIQUE`,
-  `NOT NULL`, `DEFAULT`, `CREATE INDEX`, `ALTER TABLE`, `DROP`.
-- **Inserts, updates and deletes:** `INSERT` forms (one row, many
-  rows, `INSERT … SELECT`, `RETURNING`), `UPDATE`, key columns included,
-  `DELETE`, row counts.
-- **`SELECT`:** `WHERE`, `ORDER BY` with `NULLS FIRST` and `LAST`,
-  `LIMIT` and `OFFSET`, `DISTINCT`, `GROUP BY` and `HAVING`, aggregates.
-- **Joins:** inner, cross, outer, more than two tables, aliases,
-  self-joins.
-- **Subqueries:** scalar, `IN`, `EXISTS`, derived tables, CTEs.
-- **Set operations:** `UNION`, `INTERSECT`, `EXCEPT`.
-- **Expressions:** arithmetic and its overflow, comparisons, `AND`,
-  `OR`, `NOT`, `IS NULL`, `CASE`, `COALESCE`, `NULLIF`, casts.
-- **Functions:** string, math, date and time.
-- **Types:** literal forms, each type's range, text output, `DECIMAL`
-  scales.
-- **Parameters:** how a `$n` is typed, and its errors.
-- **Transaction statements:** `BEGIN`, `COMMIT`, `ROLLBACK`,
-  `SAVEPOINT`, `RELEASE`, `ROLLBACK TO`, isolation levels.
-- **Unique constraints and NULL.**
-- **Indexes:** the rows a query returns through an index, ascending and
-  descending, after updates and deletes. PostgreSQL has no `FORCE
-  INDEX`, so a case can't pick the path: it checks the rows.
-- **Restart:** what the catalog, rows and indexes hold after a restart.
-
-### What the plugin's suite contributes
-
-The plugin's cases (39 files, 220 cases) and Python tests (27) are read
-for what they check, not for their SQL. Each behaviour is listed under
-its area with one of:
-- **recreate:** in scope, and a case is written for it;
-- **not applicable:** MariaDB's, such as `AUTO_INCREMENT`, `REPLACE`,
-  system variables, `CHECK TABLE`, collation weights and debug-only
-  indexes;
-- **covered:** by another of the layer's tests, which is named.
+No job needs PostgreSQL: the expected values are in the files.
 
 ## Out of this suite
 
-- **Concurrency:** a second class of tests, designed when it is needed.
-  The plugin's are Python tests with threads (`test_concurrency.py`). A
+- **Concurrency:** a class of tests of its own, when it is needed. A
   concurrent case can't be recorded from PostgreSQL: PostgreSQL makes a
-  second writer wait for the first, and the layer never waits, so one of
-  them fails at commit with 40001.
+  second writer wait, and the layer never waits, so one of them fails
+  at commit with 40001.
 - **Plan shapes:** the golden files fix them, and the proof machine
   checks that a statement's alternative plans agree.
 
-## Running
+## Plan
 
-```
-BYTECASK_SQL_SERVER=build/linux/x86_64/release/sql_layer_server \
-  python3 -m pytest bytecaskdb-sql-layer/tests/functional
-```
+One PR each. Every step leaves the run and the report working.
 
-`-k unique` runs one file. `-k "several NULLs"` runs one case.
-`sql-layer.yml` runs the suite in the job that builds the server, with
-JUnit output like the other suites. The job's PostgreSQL is not used.
+1. **The machinery, with our cases.** The case model, the YAML loader,
+   the runner and server fixtures, `record.py`, `report.py`, the feature
+   manifest, the not-implemented checks and the CI job. A first set of
+   PostgreSQL-features and ByteCaskDB-features cases, recorded from
+   PostgreSQL. The TPROC-C row.
+2. **SQL:2016 Core.** sqltest in the repository, its loader, and its
+   not-implemented list from a first run.
+3. **TPC-H-derived and TPC-DS-derived.** The data generation, the
+   queries, their results recorded from PostgreSQL.
+4. **SQLLogicTest.** Its loader, the fetch and cache, the nightly job,
+   its not-implemented list.
+5. **More of our cases,** area by area, through the manifest's features
+   that no case covers yet.
+
+Also: `frontend_design.md` lists "a table needs a primary key" under
+*Known differences from PostgreSQL*. It is a gap, not a decision, and
+moves to what the layer doesn't do yet.
+
+## Open questions
+
+1. **The names of the TPC-H-derived and TPC-DS-derived rows.** HammerDB
+   calls its H workload TPROC-H; DS has no such name yet.
+2. **SQLLogicTest nightly only?** Its 7.4 million queries take hours.
+3. **The loaders change the format only.** Proposed above: another
+   suite's SQL runs as written, so a sqltest table without a primary key
+   is not implemented until the layer supports one. The alternative is
+   to adapt their SQL (add a primary key) so more of it runs today.
 
 ## Decisions
 
 The owner's, 2026-10-25:
-1. **One black-box suite, in Python, over the wire, with YAML cases.**
-   The plugin's machinery is reused; its MTR-derived queries are not.
-2. **PostgreSQL writes the expected results, and is not part of the
-   test.** The YAML is the expected result, so the layer can diverge
-   from PostgreSQL on purpose, and the file shows it.
-3. **The suite is the scope.** A case the layer can't run yet is marked
-   `unimplemented: true`, and one that passes with the flag fails the
-   run.
-4. **No issue per unimplemented case.** The flags are the list.
-5. **Order is compared only when a case says `ordered: true`.**
-6. **One server per file**, and a server of its own for a case with
+1. **One black-box framework, in Python, over the wire.** The MariaDB
+   plugin's machinery is reused; its MTR-derived queries are not.
+2. **Several suites, one report:** SQL:2016 Core (sqltest),
+   SQLLogicTest, PostgreSQL features, ByteCaskDB features, the two
+   decision-support query sets, and TPROC-C. The SQL Core row is labelled
+   by the edition its tests come from.
+3. **Other suites are loaded in their own format and turned into our
+   cases at run time** (whether only the format changes: *Open
+   questions*).
+4. **PostgreSQL writes our cases' expected results, and is not part of
+   the test.**
+5. **The suites are the scope.** What the layer can't run yet is marked
+   not implemented, and a marked case that passes fails the run.
+6. **No issue per not-implemented case.**
+7. **Cases name the SQL features they cover, as metadata.** File names
+   stay by area.
+8. **Order is compared only when a case says `ordered: true`.**
+9. **One server per file**, and a server of its own for a case with
    `restart` or `server_flags`.
-7. **Concurrency and plan shapes are other classes of tests.**
+10. **Concurrency and plan shapes are other classes of tests.**
+11. **A table without a primary key is a gap.** The layer's refusal is
+    not a recorded decision.
