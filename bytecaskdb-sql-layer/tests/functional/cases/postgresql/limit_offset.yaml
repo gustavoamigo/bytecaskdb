@@ -1,0 +1,83 @@
+# LIMIT and OFFSET, over an ORDER BY that gives every row one place.
+
+- name: LIMIT takes the first rows
+  features: [pg:limit-offset]
+  ordered: true
+  setup:
+    - CREATE TABLE lo (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO lo VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO lo VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: INSERT INTO lo VALUES ($1, $2)
+      params: [3, 30]
+      rowcount: 1
+    - sql: INSERT INTO lo VALUES ($1, $2)
+      params: [4, 40]
+      rowcount: 1
+    - sql: SELECT id FROM lo WHERE id >= $1 ORDER BY id LIMIT 2
+      params: [0]
+      expected: [[1], [2]]
+    - sql: SELECT id FROM lo WHERE id >= $1 ORDER BY id LIMIT 0
+      params: [0]
+      expected: []
+    - sql: SELECT id FROM lo WHERE id >= $1 ORDER BY id LIMIT 10
+      params: [0]
+      expected: [[1], [2], [3], [4]]
+  teardown:
+    - DROP TABLE lo
+
+- name: LIMIT with a descending ORDER BY
+  features: [pg:limit-offset]
+  ordered: true
+  setup:
+    - CREATE TABLE lo3 (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO lo3 VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO lo3 VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: INSERT INTO lo3 VALUES ($1, $2)
+      params: [3, 30]
+      rowcount: 1
+    - sql: SELECT id FROM lo3 WHERE id >= $1 ORDER BY id DESC LIMIT 2
+      params: [0]
+      expected: [[3], [2]]
+  teardown:
+    - DROP TABLE lo3
+
+- name: OFFSET skips rows before LIMIT counts
+  features: [pg:limit-offset]
+  unimplemented: true
+  ordered: true
+  setup:
+    - CREATE TABLE lo2 (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO lo2 VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO lo2 VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: INSERT INTO lo2 VALUES ($1, $2)
+      params: [3, 30]
+      rowcount: 1
+    - sql: INSERT INTO lo2 VALUES ($1, $2)
+      params: [4, 40]
+      rowcount: 1
+    - sql: SELECT id FROM lo2 WHERE id >= $1 ORDER BY id LIMIT 2 OFFSET 1
+      params: [0]
+      expected: [[2], [3]]
+    - sql: SELECT id FROM lo2 WHERE id >= $1 ORDER BY id OFFSET 3
+      params: [0]
+      expected: [[4]]
+    - sql: SELECT id FROM lo2 WHERE id >= $1 ORDER BY id LIMIT 2 OFFSET 10
+      params: [0]
+      expected: []
+  teardown:
+    - DROP TABLE lo2

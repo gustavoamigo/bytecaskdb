@@ -1,0 +1,2035 @@
+# Every feature a case may name (docs/functional_testing_design.md, *The feature manifest*).
+#
+# The SQL features are the leaves of sqltest's taxonomy of SQL:2016
+# (standards/2016/features.yml, MIT, Copyright (c) 2023 Elliot Chance,
+# https://github.com/elliotchance/sqltest at 1951ddf: Annex F of the standard), with whether
+# the feature is mandatory (Core) and whether PostgreSQL 17 supports it
+# (PostgreSQL's documentation, *SQL Conformance*, D.1 supported and D.2
+# unsupported; a subfeature PostgreSQL's tables don't list takes its
+# parent's, and with no parent listed `pg` is left out). Below them are our
+# own ids, for what the standard doesn't number.
+#
+# out_of_scope names the reason a feature is not a gap for the layer.
+
+B0111:
+  name: Embedded Ada
+  mandatory: false
+  pg: false
+  out_of_scope: host-language binding, not SQL a wire client sends
+B0121:
+  name: Embedded C
+  mandatory: false
+  pg: true
+  out_of_scope: host-language binding, not SQL a wire client sends
+B0131:
+  name: Embedded COBOL
+  mandatory: false
+  pg: false
+  out_of_scope: host-language binding, not SQL a wire client sends
+B0141:
+  name: Embedded Fortran
+  mandatory: false
+  pg: false
+  out_of_scope: host-language binding, not SQL a wire client sends
+B0151:
+  name: Embedded MUMPS
+  mandatory: false
+  pg: false
+  out_of_scope: host-language binding, not SQL a wire client sends
+B0161:
+  name: Embedded Pascal
+  mandatory: false
+  pg: false
+  out_of_scope: host-language binding, not SQL a wire client sends
+B0171:
+  name: Embedded PL/I
+  mandatory: false
+  pg: false
+  out_of_scope: host-language binding, not SQL a wire client sends
+B021:
+  name: Direct SQL
+  mandatory: false
+  pg: true
+B031:
+  name: Basic dynamic SQL
+  mandatory: false
+  pg: false
+B032-01:
+  name: <describe input statement>
+  mandatory: false
+  pg: false
+B033:
+  name: Untyped SQL-invoked function arguments
+  mandatory: false
+  pg: false
+B034:
+  name: Dynamic specification of cursor attributes
+  mandatory: false
+  pg: false
+B035:
+  name: Non-extended descriptor names
+  mandatory: false
+  pg: false
+B041:
+  name: Extensions to embedded SQL exception declarations
+  mandatory: false
+  pg: false
+B051:
+  name: Enhanced execution rights
+  mandatory: false
+  pg: false
+B1111:
+  name: Module language Ada
+  mandatory: false
+  pg: false
+  out_of_scope: host-language binding, not SQL a wire client sends
+B1121:
+  name: Module language C
+  mandatory: false
+  pg: false
+  out_of_scope: host-language binding, not SQL a wire client sends
+B1131:
+  name: Module language COBOL
+  mandatory: false
+  pg: false
+  out_of_scope: host-language binding, not SQL a wire client sends
+B1141:
+  name: Module language Fortran
+  mandatory: false
+  pg: false
+  out_of_scope: host-language binding, not SQL a wire client sends
+B1151:
+  name: Module language MUMPS
+  mandatory: false
+  pg: false
+  out_of_scope: host-language binding, not SQL a wire client sends
+B1161:
+  name: Module language Pascal
+  mandatory: false
+  pg: false
+  out_of_scope: host-language binding, not SQL a wire client sends
+B1171:
+  name: Module language PL/I
+  mandatory: false
+  pg: false
+  out_of_scope: host-language binding, not SQL a wire client sends
+B121:
+  name: Routine language Ada
+  mandatory: false
+  pg: false
+B122:
+  name: Routine language C
+  mandatory: false
+  pg: false
+B123:
+  name: Routine language COBOL
+  mandatory: false
+  pg: false
+B124:
+  name: Routine language Fortran
+  mandatory: false
+  pg: false
+B125:
+  name: Routine language MUMPS
+  mandatory: false
+  pg: false
+B126:
+  name: Routine language Pascal
+  mandatory: false
+  pg: false
+B127:
+  name: Routine language PL/I
+  mandatory: false
+  pg: false
+B128:
+  name: Routine language SQL
+  mandatory: false
+  pg: true
+B200:
+  name: Polymorphic table functions
+  mandatory: false
+  pg: false
+B201:
+  name: More than one PTF generic table parameter
+  mandatory: false
+  pg: false
+B202:
+  name: PTF Copartitioning
+  mandatory: false
+  pg: false
+B203:
+  name: More than one copartition specification
+  mandatory: false
+  pg: false
+B204:
+  name: PRUNE WHEN EMPTY
+  mandatory: false
+  pg: false
+B205:
+  name: Pass-through columns
+  mandatory: false
+  pg: false
+B206:
+  name: PTF descriptor parameters
+  mandatory: false
+  pg: false
+B207:
+  name: Cross products of partitionings
+  mandatory: false
+  pg: false
+B208:
+  name: PTF component procedure interface
+  mandatory: false
+  pg: false
+B209:
+  name: PTF extended names
+  mandatory: false
+  pg: false
+B211:
+  name: 'Module language Ada: VARCHAR and NUMERIC support'
+  mandatory: false
+  pg: false
+  out_of_scope: host-language binding, not SQL a wire client sends
+B221:
+  name: 'Routine language Ada: VARCHAR and NUMERIC support'
+  mandatory: false
+  pg: false
+E011-01:
+  name: INTEGER and SMALLINT data types (including all spellings)
+  mandatory: true
+  pg: true
+E011-02:
+  name: REAL, DOUBLE PRECISON, and FLOAT data types
+  mandatory: true
+  pg: true
+E011-03:
+  name: DECIMAL and NUMERIC data types
+  mandatory: true
+  pg: true
+E011-04:
+  name: Arithmetic operators
+  mandatory: true
+  pg: true
+E011-05:
+  name: Numeric comparison
+  mandatory: true
+  pg: true
+E011-06:
+  name: Implicit casting among the numeric data types
+  mandatory: true
+  pg: true
+E021-01:
+  name: CHARACTER data type (including all its spellings)
+  mandatory: true
+  pg: true
+E021-02:
+  name: CHARACTER VARYING data type (including all its spellings)
+  mandatory: true
+  pg: true
+E021-03:
+  name: Character literals
+  mandatory: true
+  pg: true
+E021-04:
+  name: CHARACTER_LENGTH function
+  mandatory: true
+  pg: true
+E021-05:
+  name: OCTET_LENGTH function
+  mandatory: true
+  pg: true
+E021-06:
+  name: SUBSTRING function
+  mandatory: true
+  pg: true
+E021-07:
+  name: Character concatenation
+  mandatory: true
+  pg: true
+E021-08:
+  name: UPPER and LOWER functions
+  mandatory: true
+  pg: true
+E021-09:
+  name: TRIM function
+  mandatory: true
+  pg: true
+E021-10:
+  name: Implicit casting among the fixed-length and variable-length character string types
+  mandatory: true
+  pg: true
+E021-11:
+  name: POSITION function
+  mandatory: true
+  pg: true
+E021-12:
+  name: Character comparison
+  mandatory: true
+  pg: true
+E031-01:
+  name: Delimited identifiers
+  mandatory: true
+  pg: true
+E031-02:
+  name: Lower case identifiers
+  mandatory: true
+  pg: true
+E031-03:
+  name: Trailing underscore
+  mandatory: true
+  pg: true
+E051-01:
+  name: SELECT DISTINCT
+  mandatory: true
+  pg: true
+E051-02:
+  name: GROUP BY clause
+  mandatory: true
+  pg: true
+E051-04:
+  name: GROUP BY can contain columns not in <select list>
+  mandatory: true
+  pg: true
+E051-05:
+  name: Select list items can be renamed
+  mandatory: true
+  pg: true
+E051-06:
+  name: HAVING clause
+  mandatory: true
+  pg: true
+E051-07:
+  name: Qualified * in select list
+  mandatory: true
+  pg: true
+E051-08:
+  name: Correlation names in the FROM clause
+  mandatory: true
+  pg: true
+E051-09:
+  name: Rename columns in the FROM clause
+  mandatory: true
+  pg: true
+E061-01:
+  name: Comparison predicate
+  mandatory: true
+  pg: true
+E061-02:
+  name: BETWEEN predicate
+  mandatory: true
+  pg: true
+E061-03:
+  name: IN predicate with list of values
+  mandatory: true
+  pg: true
+E061-04:
+  name: LIKE predicate
+  mandatory: true
+  pg: true
+E061-05:
+  name: 'LIKE predicate: ESCAPE clause'
+  mandatory: true
+  pg: true
+E061-06:
+  name: NULL predicate
+  mandatory: true
+  pg: true
+E061-07:
+  name: Quantified comparison predicate
+  mandatory: true
+  pg: true
+E061-08:
+  name: EXISTS predicate
+  mandatory: true
+  pg: true
+E061-09:
+  name: Subqueries in comparison predicate
+  mandatory: true
+  pg: true
+E061-11:
+  name: Subqueries in IN predicate
+  mandatory: true
+  pg: true
+E061-12:
+  name: Subqueries in quantified comparison predicate
+  mandatory: true
+  pg: true
+E061-13:
+  name: Correlated subqueries
+  mandatory: true
+  pg: true
+E061-14:
+  name: Search condition
+  mandatory: true
+  pg: true
+E071-01:
+  name: UNION DISTINCT table operator
+  mandatory: true
+  pg: true
+E071-02:
+  name: UNION ALL table operator
+  mandatory: true
+  pg: true
+E071-03:
+  name: EXCEPT DISTINCT table operator
+  mandatory: true
+  pg: true
+E071-05:
+  name: Columns combined via table operators need not have exactly the same data type
+  mandatory: true
+  pg: true
+E071-06:
+  name: Table operators in subqueries
+  mandatory: true
+  pg: true
+E081-01:
+  name: SELECT privilege at the table level
+  mandatory: true
+  pg: true
+E081-02:
+  name: DELETE privilege
+  mandatory: true
+  pg: true
+E081-03:
+  name: INSERT privilege at the table level
+  mandatory: true
+  pg: true
+E081-04:
+  name: UPDATE privilege at the table level
+  mandatory: true
+  pg: true
+E081-05:
+  name: UPDATE privilege at the column level
+  mandatory: true
+  pg: true
+E081-06:
+  name: REFERENCES privilege at the table level
+  mandatory: true
+  pg: true
+E081-07:
+  name: REFERENCES privilege at the column level
+  mandatory: true
+  pg: true
+E081-08:
+  name: WITH GRANT OPTION
+  mandatory: true
+  pg: true
+E081-09:
+  name: USAGE privilege
+  mandatory: true
+  pg: true
+E081-10:
+  name: EXECUTE privilege
+  mandatory: true
+  pg: true
+E091-01:
+  name: AVG
+  mandatory: true
+  pg: true
+E091-02:
+  name: COUNT
+  mandatory: true
+  pg: true
+E091-03:
+  name: MAX
+  mandatory: true
+  pg: true
+E091-04:
+  name: MIN
+  mandatory: true
+  pg: true
+E091-05:
+  name: SUM
+  mandatory: true
+  pg: true
+E091-06:
+  name: ALL quantifier
+  mandatory: true
+  pg: true
+E091-07:
+  name: DISTINCT quantifier
+  mandatory: true
+  pg: true
+E101-01:
+  name: INSERT statement
+  mandatory: true
+  pg: true
+E101-03:
+  name: Searched UPDATE statement
+  mandatory: true
+  pg: true
+E101-04:
+  name: Searched DELETE statement
+  mandatory: true
+  pg: true
+E111:
+  name: Single row SELECT statement
+  mandatory: true
+  pg: true
+E121-01:
+  name: DECLARE CURSOR
+  mandatory: true
+  pg: true
+E121-02:
+  name: ORDER BY columns need not be in select list
+  mandatory: true
+  pg: true
+E121-03:
+  name: Value expressions in ORDER BY clause
+  mandatory: true
+  pg: true
+E121-04:
+  name: OPEN statement
+  mandatory: true
+  pg: true
+E121-06:
+  name: Positioned UPDATE statement
+  mandatory: true
+  pg: true
+E121-07:
+  name: Positioned DELETE statement
+  mandatory: true
+  pg: true
+E121-08:
+  name: CLOSE statement
+  mandatory: true
+  pg: true
+E121-10:
+  name: 'FETCH statement: implicit NEXT'
+  mandatory: true
+  pg: true
+E121-17:
+  name: WITH HOLD cursors
+  mandatory: true
+  pg: true
+E131:
+  name: Null value support (nulls in lieu of values)
+  mandatory: true
+  pg: true
+E141-01:
+  name: NOT NULL constraints
+  mandatory: true
+  pg: true
+E141-02:
+  name: UNIQUE constraints of NOT NULL columns
+  mandatory: true
+  pg: true
+E141-03:
+  name: PRIMARY KEY constraints
+  mandatory: true
+  pg: true
+E141-04:
+  name: Basic FOREIGN KEY constraint with the NO ACTION default for both referential delete action and referential update action
+  mandatory: true
+  pg: true
+E141-06:
+  name: CHECK constraints
+  mandatory: true
+  pg: true
+E141-07:
+  name: Column defaults
+  mandatory: true
+  pg: true
+E141-08:
+  name: NOT NULL inferred on PRIMARY KEY
+  mandatory: true
+  pg: true
+E141-10:
+  name: Names in a foreign key can be specified in any order
+  mandatory: true
+  pg: true
+E151-01:
+  name: COMMIT statement
+  mandatory: true
+  pg: true
+E151-02:
+  name: ROLLBACK statement
+  mandatory: true
+  pg: true
+E152-01:
+  name: 'SET TRANSACTION statement: ISOLATION LEVEL SERIALIZABLE clause'
+  mandatory: true
+  pg: true
+E152-02:
+  name: 'SET TRANSACTION statement: READ ONLY and READ WRITE clauses'
+  mandatory: true
+  pg: true
+E153:
+  name: Updatable queries with subqueries
+  mandatory: true
+  pg: true
+E161:
+  name: SQL comments using leading double minus
+  mandatory: true
+  pg: true
+E171:
+  name: SQLSTATE support
+  mandatory: true
+  pg: true
+E182:
+  name: Host language binding
+  mandatory: true
+  pg: true
+F031-01:
+  name: CREATE TABLE statement to create persistent base tables
+  mandatory: true
+  pg: true
+F031-02:
+  name: CREATE VIEW statement
+  mandatory: true
+  pg: true
+F031-03:
+  name: GRANT statement
+  mandatory: true
+  pg: true
+F031-04:
+  name: 'ALTER TABLE statement: ADD COLUMN clause'
+  mandatory: true
+  pg: true
+F031-13:
+  name: 'DROP TABLE statement: RESTRICT clause'
+  mandatory: true
+  pg: true
+F031-16:
+  name: 'DROP VIEW statement: RESTRICT clause'
+  mandatory: true
+  pg: true
+F031-19:
+  name: 'REVOKE statement: RESTRICT clause'
+  mandatory: true
+  pg: true
+F032:
+  name: CASCADE drop behavior
+  mandatory: false
+  pg: true
+F033:
+  name: 'ALTER TABLE statement: DROP COLUMN clause'
+  mandatory: false
+  pg: true
+F034-01:
+  name: REVOKE statement performed by other than the owner of a schema object
+  mandatory: false
+  pg: true
+F034-02:
+  name: 'REVOKE statement: GRANT OPTION FOR clause'
+  mandatory: false
+  pg: true
+F034-03:
+  name: REVOKE statement to revoke a privilege that the grantee has WITH GRANT OPTION
+  mandatory: false
+  pg: true
+F041-01:
+  name: Inner join (but not necessarily the INNER keyword)
+  mandatory: true
+  pg: true
+F041-02:
+  name: INNER keyword
+  mandatory: true
+  pg: true
+F041-03:
+  name: LEFT OUTER JOIN
+  mandatory: true
+  pg: true
+F041-04:
+  name: RIGHT OUTER JOIN
+  mandatory: true
+  pg: true
+F041-05:
+  name: Outer joins can be nested
+  mandatory: true
+  pg: true
+F041-07:
+  name: The inner table in a left or right outer join can also be used in an inner join
+  mandatory: true
+  pg: true
+F041-08:
+  name: All comparison operators are supported (rather than just =)
+  mandatory: true
+  pg: true
+F051-01:
+  name: DATE data type (including support of DATE literal)
+  mandatory: true
+  pg: true
+F051-02:
+  name: TIME data type (including support of TIME literal) with fractional seconds precision of at least 0
+  mandatory: true
+  pg: true
+F051-03:
+  name: TIMESTAMP data type (including support of TIMESTAMP literal) with fractional seconds precision of at least 0 and 6
+  mandatory: true
+  pg: true
+F051-04:
+  name: Comparison predicate on DATE, TIME, and TIMESTAMP data types
+  mandatory: true
+  pg: true
+F051-05:
+  name: Explicit CAST between datetime types and character string types
+  mandatory: true
+  pg: true
+F051-06:
+  name: CURRENT_DATE
+  mandatory: true
+  pg: true
+F051-07:
+  name: LOCALTIME
+  mandatory: true
+  pg: true
+F051-08:
+  name: LOCALTIMESTAMP
+  mandatory: true
+  pg: true
+F052:
+  name: Intervals and datetime arithmetic
+  mandatory: false
+  pg: true
+F053:
+  name: OVERLAPS predicate
+  mandatory: false
+  pg: true
+F054:
+  name: TIMESTAMP in DATE type precedence list
+  mandatory: false
+  pg: false
+F081:
+  name: UNION and EXCEPT in views
+  mandatory: true
+  pg: true
+F111-01:
+  name: READ UNCOMMITTED isolation level
+  mandatory: false
+  pg: true
+F111-02:
+  name: READ COMMITTED isolation level
+  mandatory: false
+  pg: true
+F111-03:
+  name: REPEATABLE READ isolation level
+  mandatory: false
+  pg: true
+F121-01:
+  name: GET DIAGNOSTICS statement
+  mandatory: false
+  pg: false
+F121-02:
+  name: 'SET TRANSACTION statement: DIAGNOSTICS SIZE clause'
+  mandatory: false
+  pg: false
+F122:
+  name: Enhanced diagnostics management
+  mandatory: false
+  pg: false
+F123:
+  name: All diagnostics
+  mandatory: false
+  pg: false
+F131-01:
+  name: WHERE, GROUP BY, and HAVING clauses supported in queries with grouped views
+  mandatory: true
+  pg: true
+F131-02:
+  name: Multiple tables supported in queries with grouped views
+  mandatory: true
+  pg: true
+F131-03:
+  name: Set functions supported in queries with grouped views
+  mandatory: true
+  pg: true
+F131-04:
+  name: Subqueries with GROUP BY and HAVING clauses and grouped views
+  mandatory: true
+  pg: true
+F131-05:
+  name: Single row SELECT with GROUP BY and HAVING clauses and grouped views
+  mandatory: true
+  pg: true
+F171:
+  name: Multiple schemas per user
+  mandatory: false
+  pg: true
+F181:
+  name: Multiple module support
+  mandatory: true
+  pg: true
+F191:
+  name: Referential delete actions
+  mandatory: false
+  pg: true
+F200:
+  name: TRUNCATE TABLE statement
+  mandatory: false
+  pg: true
+F201:
+  name: CAST function
+  mandatory: true
+  pg: true
+F202:
+  name: 'TRUNCATE TABLE: identity column restart option'
+  mandatory: false
+  pg: true
+F221:
+  name: Explicit defaults
+  mandatory: true
+  pg: true
+F222:
+  name: 'INSERT statement: DEFAULT VALUES clause'
+  mandatory: false
+  pg: true
+F251:
+  name: Domain support
+  mandatory: false
+  pg: true
+F261-01:
+  name: Simple CASE
+  mandatory: true
+  pg: true
+F261-02:
+  name: Searched CASE
+  mandatory: true
+  pg: true
+F261-03:
+  name: NULLIF
+  mandatory: true
+  pg: true
+F261-04:
+  name: COALESCE
+  mandatory: true
+  pg: true
+F262:
+  name: Extended CASE expression
+  mandatory: false
+  pg: true
+F263:
+  name: Comma-separated predicates in simple CASE expression
+  mandatory: false
+  pg: false
+F271:
+  name: Compound character literals
+  mandatory: false
+  pg: true
+F281:
+  name: LIKE enhancements
+  mandatory: false
+  pg: true
+F291:
+  name: UNIQUE predicate
+  mandatory: false
+  pg: false
+F301:
+  name: CORRESPONDING in query expressions
+  mandatory: false
+  pg: false
+F302-01:
+  name: INTERSECT DISTINCT table operator
+  mandatory: false
+  pg: true
+F302-02:
+  name: INTERSECT ALL table operator
+  mandatory: false
+  pg: true
+F304:
+  name: EXCEPT ALL table operator
+  mandatory: false
+  pg: true
+F311-01:
+  name: CREATE SCHEMA
+  mandatory: true
+  pg: true
+F311-02:
+  name: CREATE TABLE for persistent base tables
+  mandatory: true
+  pg: true
+F311-03:
+  name: CREATE VIEW
+  mandatory: true
+  pg: true
+F311-04:
+  name: 'CREATE VIEW: WITH CHECK OPTION'
+  mandatory: true
+  pg: true
+F311-05:
+  name: GRANT statement
+  mandatory: true
+  pg: true
+F312:
+  name: MERGE statement
+  mandatory: false
+  pg: true
+F313:
+  name: Enhanced MERGE statement
+  mandatory: false
+  pg: true
+F314:
+  name: MERGE statement with DELETE branch
+  mandatory: false
+  pg: true
+F321:
+  name: User authorization
+  mandatory: false
+  pg: true
+F361:
+  name: Subprogram support
+  mandatory: false
+  pg: true
+F381-01:
+  name: 'ALTER TABLE statement: ALTER COLUMN clause'
+  mandatory: false
+  pg: true
+F381-02:
+  name: 'ALTER TABLE statement: ADD CONSTRAINT clause'
+  mandatory: false
+  pg: true
+F381-03:
+  name: 'ALTER TABLE statement: DROP CONSTRAINT clause'
+  mandatory: false
+  pg: true
+F382:
+  name: Alter column data type
+  mandatory: false
+  pg: true
+F383:
+  name: Set column not null clause
+  mandatory: false
+  pg: true
+F384:
+  name: Drop identity property clause
+  mandatory: false
+  pg: true
+F385:
+  name: Drop column generation expression clause
+  mandatory: false
+  pg: true
+F386:
+  name: Set identity column generation clause
+  mandatory: false
+  pg: true
+F391:
+  name: Long identifiers
+  mandatory: false
+  pg: true
+F392:
+  name: Unicode escapes in identifiers
+  mandatory: false
+  pg: true
+F393:
+  name: Unicode escapes in literals
+  mandatory: false
+  pg: true
+F394:
+  name: Optional normal form specification
+  mandatory: false
+  pg: true
+F401-01:
+  name: NATURAL JOIN
+  mandatory: false
+  pg: true
+F401-02:
+  name: FULL OUTER JOIN
+  mandatory: false
+  pg: true
+F401-04:
+  name: CROSS JOIN
+  mandatory: false
+  pg: true
+F402:
+  name: Named column joins for LOBs, arrays, and multisets
+  mandatory: false
+  pg: true
+F403:
+  name: Partitioned join tables
+  mandatory: false
+  pg: false
+F404:
+  name: Range variable for common column names
+  mandatory: false
+  pg: true
+F411:
+  name: Time zone specification
+  mandatory: false
+  pg: true
+F421:
+  name: National character
+  mandatory: false
+  pg: true
+F431-01:
+  name: FETCH with explicit NEXT
+  mandatory: false
+  pg: true
+F431-02:
+  name: FETCH FIRST
+  mandatory: false
+  pg: true
+F431-03:
+  name: FETCH LAST
+  mandatory: false
+  pg: true
+F431-04:
+  name: FETCH PRIOR
+  mandatory: false
+  pg: true
+F431-05:
+  name: FETCH ABSOLUTE
+  mandatory: false
+  pg: true
+F431-06:
+  name: FETCH RELATIVE
+  mandatory: false
+  pg: true
+F441:
+  name: Extended set function support
+  mandatory: false
+  pg: true
+F442:
+  name: Mixed column references in set functions
+  mandatory: false
+  pg: true
+F451:
+  name: Character set definition
+  mandatory: false
+  pg: false
+F461:
+  name: Named character sets
+  mandatory: false
+  pg: false
+F471:
+  name: Scalar subquery values
+  mandatory: true
+  pg: true
+F481:
+  name: Expanded NULL predicate
+  mandatory: true
+  pg: true
+F491:
+  name: Constraint management
+  mandatory: false
+  pg: true
+F492:
+  name: Optional table constraint enforcement
+  mandatory: false
+  pg: false
+F521:
+  name: Assertions
+  mandatory: false
+  pg: false
+F531:
+  name: Temporary tables
+  mandatory: false
+  pg: true
+F555:
+  name: Enhanced seconds precision
+  mandatory: false
+  pg: true
+F561:
+  name: Full value expressions
+  mandatory: false
+  pg: true
+F571:
+  name: Truth value tests
+  mandatory: false
+  pg: true
+F591:
+  name: Derived tables
+  mandatory: false
+  pg: true
+F611:
+  name: Indicator data types
+  mandatory: false
+  pg: true
+F641:
+  name: Row and table constructors
+  mandatory: false
+  pg: true
+F651:
+  name: Catalog name qualifiers
+  mandatory: false
+  pg: true
+F661:
+  name: Simple tables
+  mandatory: false
+  pg: true
+F671:
+  name: Subqueries in CHECK constraints
+  mandatory: false
+  pg: false
+F672:
+  name: Retrospective check constraints
+  mandatory: false
+  pg: true
+F673:
+  name: Reads SQL-data routine invocations in CHECK constraints
+  mandatory: false
+  pg: false
+F690:
+  name: Collation support
+  mandatory: false
+  pg: true
+F692:
+  name: Enhanced collation support
+  mandatory: false
+  pg: true
+F693:
+  name: SQL-session and client module collations
+  mandatory: false
+  pg: false
+F695:
+  name: Translation support
+  mandatory: false
+  pg: false
+F701:
+  name: Referential update actions
+  mandatory: false
+  pg: true
+F711:
+  name: ALTER domain
+  mandatory: false
+  pg: true
+F721:
+  name: Deferrable constraints
+  mandatory: false
+  pg: false
+F731:
+  name: INSERT column privileges
+  mandatory: false
+  pg: true
+F741:
+  name: Referential MATCH types
+  mandatory: false
+  pg: false
+F751:
+  name: View CHECK enhancements
+  mandatory: false
+  pg: true
+F761:
+  name: Session management
+  mandatory: false
+  pg: true
+F762:
+  name: CURRENT_CATALOG
+  mandatory: false
+  pg: true
+F763:
+  name: CURRENT_SCHEMA
+  mandatory: false
+  pg: true
+F771:
+  name: Connection management
+  mandatory: false
+  pg: true
+F781:
+  name: Self-referencing operations
+  mandatory: false
+  pg: true
+F791:
+  name: Insensitive cursors
+  mandatory: false
+  pg: true
+F801:
+  name: Full set function
+  mandatory: false
+  pg: true
+F812:
+  name: Basic flagging
+  mandatory: true
+  pg: false
+F813:
+  name: Extended flagging
+  mandatory: false
+  pg: false
+F821:
+  name: Local table references
+  mandatory: false
+  pg: false
+F831-01:
+  name: Updateable scROLEable cursors
+  mandatory: false
+  pg: false
+F831-02:
+  name: Updateable ordered cursors
+  mandatory: false
+  pg: false
+F841:
+  name: LIKE_REGEX predicate
+  mandatory: false
+  pg: false
+F842:
+  name: OCCURRENCES_REGEX function
+  mandatory: false
+  pg: false
+F843:
+  name: POSITION_REGEX function
+  mandatory: false
+  pg: false
+F844:
+  name: SUBSTRING_REGEX
+  mandatory: false
+  pg: false
+F845:
+  name: TRANSLATE_REGEX
+  mandatory: false
+  pg: false
+F846:
+  name: Octet support in regular expression operators
+  mandatory: false
+  pg: false
+F847:
+  name: Nonconstant regular expressions
+  mandatory: false
+  pg: false
+F850:
+  name: Top-level <order by clause> in <query expression>
+  mandatory: false
+  pg: true
+F851:
+  name: <order by clause> in subqueries
+  mandatory: false
+  pg: true
+F852:
+  name: Top-level <order by clause> in views
+  mandatory: false
+  pg: true
+F855:
+  name: Nested <order by clause> in <query expression>
+  mandatory: false
+  pg: true
+F856:
+  name: Nested <fetch first clause> in <query expression>
+  mandatory: false
+  pg: true
+F857:
+  name: Top-level <fetch first clause> in <query expression>
+  mandatory: false
+  pg: true
+F858:
+  name: <fetch first clause> in subqueries
+  mandatory: false
+  pg: true
+F859:
+  name: Top-level <fetch first clause> in views
+  mandatory: false
+  pg: true
+F860:
+  name: dynamic <fetch first row count> in <fetch first clause>
+  mandatory: false
+  pg: true
+F861:
+  name: Top-level <result offset clause> in <query expression>
+  mandatory: false
+  pg: true
+F862:
+  name: <result offset clause> in subqueries
+  mandatory: false
+  pg: true
+F863:
+  name: Nested <result offset clause> in <query expression>
+  mandatory: false
+  pg: true
+F864:
+  name: Top-level <result offset clause> in views
+  mandatory: false
+  pg: true
+F865:
+  name: dynamic <offset row count> in <result offset clause>
+  mandatory: false
+  pg: true
+F866:
+  name: 'FETCH FIRST clause: PERCENT option'
+  mandatory: false
+  pg: false
+F867:
+  name: 'FETCH FIRST clause: WITH TIES option'
+  mandatory: false
+  pg: true
+R010:
+  name: 'Row pattern recognition: FROM clause'
+  mandatory: false
+  pg: false
+R020:
+  name: 'Row pattern recognition: WINDOW clause'
+  mandatory: false
+  pg: false
+R030:
+  name: 'Row pattern recognition: full aggregate support'
+  mandatory: false
+  pg: false
+S011:
+  name: Distinct data types
+  mandatory: true
+  pg: false
+S023:
+  name: Basic structured types
+  mandatory: false
+  pg: false
+S024:
+  name: Enhanced structured types
+  mandatory: false
+  pg: false
+S025:
+  name: Final structured types
+  mandatory: false
+  pg: false
+S026:
+  name: Self-referencing structured types
+  mandatory: false
+  pg: false
+S027:
+  name: Create method by specific method name
+  mandatory: false
+  pg: false
+S028:
+  name: Permutable UDT options list
+  mandatory: false
+  pg: false
+S041:
+  name: Basic reference types
+  mandatory: false
+  pg: false
+S043:
+  name: Enhanced reference types
+  mandatory: false
+  pg: false
+S051:
+  name: Create table of type
+  mandatory: false
+  pg: false
+S071:
+  name: SQL paths in function and type name resolution
+  mandatory: false
+  pg: true
+S081:
+  name: Subtables
+  mandatory: false
+  pg: false
+S091-01:
+  name: Arrays of built-in data types
+  mandatory: false
+  pg: false
+S091-02:
+  name: Arrays of distinct types
+  mandatory: false
+  pg: false
+S091-03:
+  name: Array expressions
+  mandatory: false
+  pg: false
+S092:
+  name: Arrays of user-defined types
+  mandatory: false
+  pg: true
+S094:
+  name: Arrays of reference types
+  mandatory: false
+  pg: false
+S095:
+  name: Array constructors by query
+  mandatory: false
+  pg: true
+S096:
+  name: Optional array bounds
+  mandatory: false
+  pg: true
+S097:
+  name: Array element assignment
+  mandatory: false
+  pg: false
+S098:
+  name: ARRAY_AGG
+  mandatory: false
+  pg: true
+S111:
+  name: ONLY in query expressions
+  mandatory: false
+  pg: true
+S151:
+  name: Type predicate
+  mandatory: false
+  pg: false
+S161:
+  name: Subtype treatment
+  mandatory: false
+  pg: false
+S162:
+  name: Subtype treatment for references
+  mandatory: false
+  pg: false
+S201-01:
+  name: Array parameters
+  mandatory: false
+  pg: true
+S201-02:
+  name: Array as result type of functions
+  mandatory: false
+  pg: true
+S202:
+  name: SQL-invoked routines on multisets
+  mandatory: false
+  pg: false
+S211:
+  name: User-defined cast functions
+  mandatory: false
+  pg: true
+S231:
+  name: Structured type locators
+  mandatory: false
+  pg: false
+S232:
+  name: Array locators
+  mandatory: false
+  pg: false
+S233:
+  name: Multiset locators
+  mandatory: false
+  pg: false
+S241:
+  name: Transform functions
+  mandatory: false
+  pg: false
+S242:
+  name: Alter transform statement
+  mandatory: false
+  pg: false
+S251:
+  name: User-defined orderings
+  mandatory: false
+  pg: false
+S261:
+  name: Specific type method
+  mandatory: false
+  pg: false
+S271:
+  name: Basic multiset support
+  mandatory: false
+  pg: false
+S272:
+  name: Multisets of user-defined types
+  mandatory: false
+  pg: false
+S274:
+  name: Multisets of reference types
+  mandatory: false
+  pg: false
+S275:
+  name: Advanced multiset support
+  mandatory: false
+  pg: false
+S281:
+  name: Nested collection types
+  mandatory: false
+  pg: false
+S291:
+  name: Unique constraint on entire row
+  mandatory: false
+  pg: false
+S301:
+  name: Enhanced UNNEST
+  mandatory: false
+  pg: true
+S401:
+  name: Distinct types based on array types
+  mandatory: false
+  pg: false
+S402:
+  name: Distinct types based on multiset types
+  mandatory: false
+  pg: false
+S403:
+  name: ARRAY_MAX_CARDINALITY
+  mandatory: false
+  pg: false
+S404:
+  name: TRIM_ARRAY
+  mandatory: false
+  pg: true
+T021:
+  name: BINARY and VARBINARY data types
+  mandatory: false
+  pg: false
+T022:
+  name: Advanced support for BINARY and VARBINARY data types
+  mandatory: false
+  pg: false
+T023:
+  name: Compound binary literals
+  mandatory: false
+  pg: false
+T024:
+  name: Spaces in binary literals
+  mandatory: false
+  pg: false
+T031:
+  name: BOOLEAN data type
+  mandatory: false
+  pg: true
+T041-01:
+  name: BLOB data type
+  mandatory: false
+  pg: false
+T041-02:
+  name: CLOB data type
+  mandatory: false
+  pg: false
+T041-03:
+  name: POSITION, LENGTH, LOWER, TRIM, UPPER, and SUBSTRING functions for LOB data types
+  mandatory: false
+  pg: false
+T041-04:
+  name: Concatenation of LOB data types
+  mandatory: false
+  pg: false
+T041-05:
+  name: 'LOB locator: non-holdable'
+  mandatory: false
+  pg: false
+T042:
+  name: Extended LOB data type support
+  mandatory: false
+  pg: false
+T043:
+  name: Multiplier T
+  mandatory: false
+  pg: false
+T044:
+  name: Multiplier P
+  mandatory: false
+  pg: false
+T051:
+  name: Row types
+  mandatory: false
+  pg: false
+T053:
+  name: Explicit aliases for all-fields reference
+  mandatory: false
+  pg: false
+T061:
+  name: UCS support
+  mandatory: false
+  pg: true
+T071:
+  name: BIGINT data type
+  mandatory: false
+  pg: true
+T076:
+  name: DECFLOAT data type
+  mandatory: false
+  pg: false
+T101:
+  name: Enhanced nullability determination
+  mandatory: false
+  pg: false
+T111:
+  name: Updatable joins, unions, and columns
+  mandatory: false
+  pg: false
+T121:
+  name: WITH (excluding RECURSIVE) in query expression
+  mandatory: false
+  pg: true
+T122:
+  name: WITH (excluding RECURSIVE) in subquery
+  mandatory: false
+  pg: true
+T131:
+  name: Recursive query
+  mandatory: false
+  pg: true
+T132:
+  name: Recursive query in subquery
+  mandatory: false
+  pg: true
+T141:
+  name: SIMILAR predicate
+  mandatory: false
+  pg: true
+T151:
+  name: DISTINCT predicate
+  mandatory: false
+  pg: true
+T152:
+  name: DISTINCT predicate with negation
+  mandatory: false
+  pg: true
+T171:
+  name: LIKE clause in table definition
+  mandatory: false
+  pg: true
+T172:
+  name: AS subquery clause in table definition
+  mandatory: false
+  pg: true
+T173:
+  name: Extended LIKE clause in table definition
+  mandatory: false
+  pg: true
+T174:
+  name: Identity columns
+  mandatory: false
+  pg: true
+T175:
+  name: Generated columns
+  mandatory: false
+  pg: false
+T176:
+  name: Sequence generator support
+  mandatory: false
+  pg: false
+T177:
+  name: 'Sequence generator support: simple restart option'
+  mandatory: false
+  pg: true
+T178:
+  name: 'Identity columns: simple restart option'
+  mandatory: false
+  pg: true
+T180:
+  name: System-versioned tables
+  mandatory: false
+  pg: false
+T181:
+  name: Application-time period tables
+  mandatory: false
+  pg: false
+T191:
+  name: Referential action RESTRICT
+  mandatory: false
+  pg: true
+T201:
+  name: Comparable data types for referential constraints
+  mandatory: false
+  pg: true
+T211-01:
+  name: Triggers activated on UPDATE, INSERT, or DELETE of one base table
+  mandatory: false
+  pg: false
+T211-02:
+  name: BEFORE triggers
+  mandatory: false
+  pg: false
+T211-03:
+  name: AFTER triggers
+  mandatory: false
+  pg: false
+T211-04:
+  name: FOR EACH ROW triggers
+  mandatory: false
+  pg: false
+T211-05:
+  name: Ability to specify a search condition that shall be True before the trigger is invoked
+  mandatory: false
+  pg: false
+T211-06:
+  name: Support for run-time rules for the interaction of triggers and constraints
+  mandatory: false
+  pg: false
+T211-07:
+  name: TRIGGER privilege
+  mandatory: false
+  pg: false
+T211-08:
+  name: Multiple triggers for the same event are executed in the order in which they were created in the catalog
+  mandatory: false
+  pg: false
+T212:
+  name: Enhanced trigger capability
+  mandatory: false
+  pg: true
+T213:
+  name: INSTEAD OF triggers
+  mandatory: false
+  pg: true
+T231:
+  name: Sensitive cursors
+  mandatory: false
+  pg: false
+T241:
+  name: START TRANSACTION statement
+  mandatory: false
+  pg: true
+T251:
+  name: 'SET TRANSACTION statement: LOCAL option'
+  mandatory: false
+  pg: false
+T261:
+  name: Chained transactions
+  mandatory: false
+  pg: true
+T271:
+  name: Savepoints
+  mandatory: false
+  pg: true
+T272:
+  name: Enhanced savepoint management
+  mandatory: false
+  pg: false
+T281:
+  name: SELECT privilege with column granularity
+  mandatory: false
+  pg: true
+T285:
+  name: Enhanced derived column names
+  mandatory: false
+  pg: true
+T301:
+  name: Functional dependencies
+  mandatory: false
+  pg: false
+T312:
+  name: OVERLAY function
+  mandatory: false
+  pg: true
+T321-01:
+  name: User-defined functions with no overloading
+  mandatory: true
+  pg: true
+T321-02:
+  name: User-defined stored procedures with no overloading
+  mandatory: true
+  pg: true
+T321-03:
+  name: Function invocation
+  mandatory: true
+  pg: true
+T321-04:
+  name: CALL statement
+  mandatory: true
+  pg: true
+T321-05:
+  name: RETURN statement
+  mandatory: true
+  pg: true
+T323:
+  name: Explicit security for external routines
+  mandatory: false
+  pg: true
+T324:
+  name: Explicit security for SQL routines
+  mandatory: false
+  pg: false
+T325:
+  name: Qualified SQL parameter references
+  mandatory: false
+  pg: true
+T326:
+  name: Table functions
+  mandatory: false
+  pg: false
+T331:
+  name: Basic roles
+  mandatory: false
+  pg: true
+T332:
+  name: Extended roles
+  mandatory: false
+  pg: true
+T341:
+  name: Overloading of SQL-invoked functions and SQL-invoked procedures
+  mandatory: false
+  pg: true
+T351:
+  name: Bracketed comments
+  mandatory: false
+  pg: true
+T431:
+  name: Extended grouping capabilities
+  mandatory: false
+  pg: true
+T432:
+  name: Nested and concatenated GROUPING SETS
+  mandatory: false
+  pg: true
+T433:
+  name: Multiargument GROUPING function
+  mandatory: false
+  pg: true
+T434:
+  name: GROUP BY DISINCT
+  mandatory: false
+  pg: true
+T441:
+  name: ABS and MOD functions
+  mandatory: false
+  pg: true
+T461:
+  name: Symmetric BETWEEN predicate
+  mandatory: false
+  pg: true
+T471:
+  name: Result sets return value
+  mandatory: false
+  pg: false
+T472:
+  name: DESCRIBE CURSOR
+  mandatory: false
+  pg: false
+T491:
+  name: LATERAL derived table
+  mandatory: false
+  pg: true
+T495:
+  name: Combined data change and retrieval
+  mandatory: false
+  pg: false
+T501:
+  name: Enhanced EXISTS predicate
+  mandatory: false
+  pg: true
+T502:
+  name: Period predicates
+  mandatory: false
+  pg: false
+T511:
+  name: Transaction counts
+  mandatory: false
+  pg: false
+T521:
+  name: Named arguments in CALL statement
+  mandatory: false
+  pg: true
+T522:
+  name: Default values for IN parameters of SQL-invoked procedures
+  mandatory: false
+  pg: false
+T523:
+  name: Default values for INOUT parameters of SQL-invoked procedures
+  mandatory: false
+  pg: true
+T524:
+  name: Named arguments in routine invocations other than a CALL statement
+  mandatory: false
+  pg: true
+T525:
+  name: Default values for parameters of SQL-invoked functions
+  mandatory: false
+  pg: true
+T551:
+  name: Optional key words for default syntax
+  mandatory: false
+  pg: true
+T561:
+  name: Holdable locators
+  mandatory: false
+  pg: false
+T571:
+  name: Array-returning external SQL-invoked functions
+  mandatory: false
+  pg: false
+T572:
+  name: Multiset-returning external SQL-invoked functions
+  mandatory: false
+  pg: false
+T581:
+  name: Regular expression substring function
+  mandatory: false
+  pg: true
+T591:
+  name: UNIQUE constraints of possibly null columns
+  mandatory: false
+  pg: true
+T601:
+  name: Local cursor references
+  mandatory: false
+  pg: false
+T611:
+  name: Elementary OLAP operations
+  mandatory: false
+  pg: true
+T612:
+  name: Advanced OLAP operations
+  mandatory: false
+  pg: true
+T613:
+  name: Sampling
+  mandatory: false
+  pg: true
+T614:
+  name: NTILE function
+  mandatory: false
+  pg: true
+T615:
+  name: LEAD and LAG functions
+  mandatory: false
+  pg: true
+T616:
+  name: Null treatment option for LEAD and LAG functions
+  mandatory: false
+  pg: false
+T617:
+  name: FIRST_VALUE and LAST_VALUE functions
+  mandatory: false
+  pg: true
+T618:
+  name: NTH_VALUE function
+  mandatory: false
+  pg: false
+T619:
+  name: Nested window functions
+  mandatory: false
+  pg: false
+T620:
+  name: 'WINDOW clause: GROUPS option'
+  mandatory: false
+  pg: true
+T621:
+  name: Enhanced numeric functions
+  mandatory: false
+  pg: true
+T622:
+  name: Trigonometric functions
+  mandatory: false
+  pg: true
+T623:
+  name: General logarithm functions
+  mandatory: false
+  pg: true
+T624:
+  name: Common logarithm functions
+  mandatory: false
+  pg: true
+T625:
+  name: LISTAGG
+  mandatory: false
+  pg: false
+T631:
+  name: IN predicate with one list element
+  mandatory: true
+  pg: true
+T641:
+  name: Multiple column assignment
+  mandatory: false
+  pg: false
+T651:
+  name: SQL-schema statements in SQL routines
+  mandatory: false
+  pg: true
+T652:
+  name: SQL-dynamic statements in SQL routines
+  mandatory: false
+  pg: false
+T653:
+  name: SQL-schema statements in external routines
+  mandatory: false
+  pg: true
+T654:
+  name: SQL-dynamic statements in external routines
+  mandatory: false
+  pg: false
+T655:
+  name: Cyclically dependent routines
+  mandatory: false
+  pg: true
+T811:
+  name: Basic SQL/JSON constructor functions
+  mandatory: false
+  pg: true
+T812:
+  name: 'SQL/JSON: JSON_OBJECTAGG'
+  mandatory: false
+  pg: true
+T813:
+  name: 'SQL/JSON: JSON_ARRAYAGG with ORDER BY'
+  mandatory: false
+  pg: true
+T814:
+  name: Colon in JSON_OBJECT or JSON_OBJECTAGG
+  mandatory: false
+  pg: true
+T821:
+  name: Basic SQL/JSON query operators
+  mandatory: false
+  pg: true
+T822:
+  name: 'SQL/JSON: IS JSON WITH UNIQUE KEYS predicate'
+  mandatory: false
+  pg: true
+T823:
+  name: 'SQL/JSON: PASSING clause'
+  mandatory: false
+  pg: true
+T824:
+  name: 'JSON_TABLE: specific PLAN clause'
+  mandatory: false
+  pg: false
+T825:
+  name: 'SQL/JSON: ON EMPTY and ON ERROR clauses'
+  mandatory: false
+  pg: true
+T826:
+  name: General value expression in ON ERROR or ON EMPTY clauses
+  mandatory: false
+  pg: true
+T827:
+  name: 'JSON_TABLE: sibling NESTED COLUMNS clauses'
+  mandatory: false
+  pg: true
+T828:
+  name: JSON_QUERY
+  mandatory: false
+  pg: true
+T829:
+  name: 'JSON_QUERY: array wrapper options'
+  mandatory: false
+  pg: true
+T830:
+  name: Enforcing unique keys in SQL/JSON constructor functions
+  mandatory: false
+  pg: true
+T831:
+  name: 'SQL/JSON path language: strict mode'
+  mandatory: false
+  pg: true
+T832:
+  name: 'SQL/JSON path language: item method'
+  mandatory: false
+  pg: true
+T833:
+  name: 'SQL/JSON path language: multiple subscripts'
+  mandatory: false
+  pg: true
+T834:
+  name: 'SQL/JSON path language: wildcard member accessor'
+  mandatory: false
+  pg: true
+T835:
+  name: 'SQL/JSON path language: filter expressions'
+  mandatory: false
+  pg: true
+T836:
+  name: 'SQL/JSON path language: starts with predicate'
+  mandatory: false
+  pg: true
+T837:
+  name: 'SQL/JSON path language: regex_like predicate'
+  mandatory: false
+  pg: true
+T838:
+  name: 'JSON_TABLE: PLAN DEFAULT clause'
+  mandatory: false
+  pg: false
+T839:
+  name: Formatted cast of datetimes to/from character strings
+  mandatory: false
+  pg: false
+
+# Our own ids, for what the standard doesn't number.
+
+pg:unique-nulls-distinct:
+  description: a UNIQUE column takes several NULLs
+layer:tprocc:
+  description: the five TPROC-C transactions, and the consistency conditions they leave
+pg:returning:
+  description: INSERT, UPDATE and DELETE ... RETURNING
+pg:limit-offset:
+  description: LIMIT and OFFSET
+pg:on-conflict:
+  description: INSERT ... ON CONFLICT DO NOTHING and DO UPDATE
+pg:parameters:
+  description: $n parameters through the extended protocol
+pg:cast-operator:
+  description: "the :: cast"
+pg:nulls-first-last:
+  description: NULLS FIRST and NULLS LAST in ORDER BY
+layer:restart:
+  description: what a clean stop and start on the same directory keeps
+layer:sync-modes:
+  description: the --sync modes
+layer:io-backends:
+  description: the --io-backend choices
+layer:for-update:
+  description: FOR UPDATE's guards and refusals

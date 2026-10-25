@@ -1,0 +1,39 @@
+# FOR UPDATE on a single table: the rows it returns are guarded until the
+# commit (a concurrent change makes the commit fail with 40001: that needs two
+# sessions, and is not a case here).
+
+- name: FOR UPDATE returns the rows, and the row can then be updated
+  features: [layer:for-update]
+  setup:
+    - CREATE TABLE fu (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO fu VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO fu VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: BEGIN
+    - sql: SELECT id, v FROM fu WHERE id = $1 FOR UPDATE
+      params: [1]
+      expected: [[1, 10]]
+    - sql: UPDATE fu SET v = $2 WHERE id = $1
+      params: [1, 11]
+      rowcount: 1
+    - sql: COMMIT
+    - sql: SELECT id, v FROM fu WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 11], [2, 20]]
+  teardown:
+    - ROLLBACK
+    - DROP TABLE fu
+
+- name: FOR UPDATE with an aggregate is refused
+  features: [layer:for-update]
+  setup:
+    - CREATE TABLE fu2 (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: SELECT COUNT(*) FROM fu2 FOR UPDATE
+      error: "0A000"
+  teardown:
+    - DROP TABLE fu2

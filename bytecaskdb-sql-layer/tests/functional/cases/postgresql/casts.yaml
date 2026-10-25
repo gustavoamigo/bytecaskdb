@@ -1,0 +1,43 @@
+# The :: cast, and what a cast refuses.
+
+- name: text to integer and back
+  features: [pg:cast-operator]
+  unimplemented: true
+  steps:
+    - sql: SELECT '42'::integer
+      expected: [[42]]
+    - sql: SELECT 42::text
+      expected: [[42]]
+    - sql: SELECT '  7 '::integer
+      expected: [[7]]
+
+- name: a cast that overflows its type
+  features: [pg:cast-operator, E011-01]
+  unimplemented: true
+  steps:
+    - sql: SELECT 40000::smallint
+      error: "22003"
+    - sql: SELECT 3000000000::integer
+      error: "22003"
+    - sql: SELECT 32767::smallint
+      expected: [[32767]]
+
+- name: text that isn't a number
+  features: [pg:cast-operator, E011-01]
+  unimplemented: true
+  steps:
+    - sql: SELECT 'x'::integer
+      error: "22P02"
+    - sql: SELECT ''::integer
+      error: "22P02"
+
+- name: numeric rounds to its scale
+  features: [pg:cast-operator, E011-03]
+  unimplemented: true
+  steps:
+    - sql: SELECT 1.005::numeric(4,2)
+      expected: [["1.01"]]
+    - sql: SELECT 2.5::numeric(2,0)
+      expected: [[3]]
+    - sql: SELECT 99.99::numeric(3,1)
+      error: "22003"

@@ -155,6 +155,43 @@ jobs:
           python3 -m pytest bytecaskdb-sql-layer/tests/proof bytecaskdb-sql-layer/tests/server -v -p no:cacheprovider \
             --junitxml=test-results/sql_layer_proof.xml
 
+      # The functional suite (docs/functional_testing_design.md): the gate,
+      # then a conformance run that makes the report and never fails the job.
+      # No PostgreSQL: the expected values are in the case files. Nothing under
+      # tests/functional may name the MariaDB plugin (Decision 12 there).
+      - name: Functional suite, the gate
+        env:
+          BYTECASK_SQL_SERVER: build/linux/x86_64/release/sql_layer_server
+          BYTECASK_SQL_TPROCC: build/linux/x86_64/release/sql_layer_tprocc
+        run: |
+          if grep -rniE "mariadb" bytecaskdb-sql-layer/tests/functional --include=*.py --include=*.yaml --include=*.txt; then
+            echo "the functional suite must not reference the MariaDB plugin" >&2
+            exit 1
+          fi
+          xmake build -y sql_layer_tprocc
+          pip3 install -r bytecaskdb-sql-layer/tests/functional/requirements.txt
+          python3 -m pytest bytecaskdb-sql-layer/tests/functional -v -p no:cacheprovider \
+            --junitxml=test-results/sql_layer_functional.xml
+
+      - name: Functional suite, the conformance report
+        if: ${{ always() && !cancelled() }}
+        env:
+          BYTECASK_SQL_SERVER: build/linux/x86_64/release/sql_layer_server
+          BYTECASK_SQL_TPROCC: build/linux/x86_64/release/sql_layer_tprocc
+        run: |
+          mkdir -p conformance
+          python3 -m pytest bytecaskdb-sql-layer/tests/functional -q -p no:cacheprovider --conformance \
+            --results=conformance/results.json
+          python3 bytecaskdb-sql-layer/tests/functional/report.py conformance/results.json > conformance/report.md
+          cat conformance/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the conformance report
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sql-layer-conformance
+          path: conformance/
+
       - name: Enrich JUnit report with source metadata
         if: ${{ always() && !cancelled() }}
         run: |

@@ -1,0 +1,204 @@
+# Where the answer is a NULL: sorting, aggregates, joins and arithmetic.
+
+- name: NULLS FIRST and NULLS LAST
+  features: [pg:nulls-first-last]
+  unimplemented: true
+  ordered: true
+  setup:
+    - CREATE TABLE n (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO n VALUES (1, 20)
+    - INSERT INTO n VALUES (2, NULL)
+    - INSERT INTO n VALUES (3, 10)
+  steps:
+    - sql: SELECT id FROM n ORDER BY v NULLS FIRST, id
+      expected: [[2], [3], [1]]
+    - sql: SELECT id FROM n ORDER BY v NULLS LAST, id
+      expected: [[3], [1], [2]]
+    - sql: SELECT id FROM n ORDER BY v DESC NULLS LAST, id
+      expected: [[1], [3], [2]]
+    - sql: SELECT id FROM n ORDER BY v, id
+      expected: [[3], [1], [2]]
+    - sql: SELECT id FROM n ORDER BY v DESC, id
+      expected: [[2], [1], [3]]
+  teardown:
+    - DROP TABLE n
+
+- name: aggregates ignore NULL
+  features: [E091-02, E091-04, E091-05]
+  setup:
+    - CREATE TABLE na (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO na VALUES ($1, $2)
+      params: [1, 20]
+      rowcount: 1
+    - sql: INSERT INTO na VALUES ($1, $2)
+      params: [2, null]
+      rowcount: 1
+    - sql: INSERT INTO na VALUES ($1, $2)
+      params: [3, 10]
+      rowcount: 1
+    - sql: SELECT COUNT(*) FROM na WHERE id >= $1
+      params: [0]
+      expected: [[3]]
+    - sql: SELECT COUNT(v) FROM na WHERE id >= $1
+      params: [0]
+      expected: [[2]]
+    - sql: SELECT SUM(v) FROM na WHERE id >= $1
+      params: [0]
+      expected: [[30]]
+    - sql: SELECT MIN(v) FROM na WHERE id >= $1
+      params: [0]
+      expected: [[10]]
+  teardown:
+    - DROP TABLE na
+
+- name: aggregates over no rows, and over only NULLs
+  features: [E091-02, E091-04, E091-05]
+  setup:
+    - CREATE TABLE ne (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: SELECT COUNT(v) FROM ne WHERE id >= $1
+      params: [0]
+      expected: [[0]]
+    - sql: SELECT SUM(v) FROM ne WHERE id >= $1
+      params: [0]
+      expected: [[null]]
+    - sql: INSERT INTO ne VALUES ($1, $2)
+      params: [1, null]
+      rowcount: 1
+    - sql: SELECT COUNT(*) FROM ne WHERE id >= $1
+      params: [0]
+      expected: [[1]]
+    - sql: SELECT COUNT(v) FROM ne WHERE id >= $1
+      params: [0]
+      expected: [[0]]
+    - sql: SELECT SUM(v) FROM ne WHERE id >= $1
+      params: [0]
+      expected: [[null]]
+    - sql: SELECT MIN(v) FROM ne WHERE id >= $1
+      params: [0]
+      expected: [[null]]
+  teardown:
+    - DROP TABLE ne
+
+- name: a join on the inner table's primary key never matches a NULL
+  features: [F041-01]
+  setup:
+    - CREATE TABLE jc (id INTEGER PRIMARY KEY, k INTEGER)
+    - CREATE TABLE jd (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO jc VALUES ($1, $2)
+      params: [1, 5]
+      rowcount: 1
+    - sql: INSERT INTO jc VALUES ($1, $2)
+      params: [2, null]
+      rowcount: 1
+    - sql: INSERT INTO jd VALUES ($1, $2)
+      params: [5, 50]
+      rowcount: 1
+    - sql: SELECT jc.id, jd.v FROM jc JOIN jd ON jc.k = jd.id WHERE jc.id >= $1
+      params: [0]
+      expected: [[1, 50]]
+  teardown:
+    - DROP TABLE jc
+    - DROP TABLE jd
+
+- name: a join never matches NULL keys
+  features: [F041-01]
+  # the layer reads a join's inner table only by its whole primary key, so a join on
+  # jb.k is refused although jb has an index on k (#628)
+  unimplemented: true
+  setup:
+    - CREATE TABLE ja (id INTEGER PRIMARY KEY, k INTEGER)
+    - CREATE TABLE jb (id INTEGER PRIMARY KEY, k INTEGER)
+    - CREATE INDEX jb_k ON jb (k)
+  steps:
+    - sql: INSERT INTO ja VALUES ($1, $2)
+      params: [1, 5]
+      rowcount: 1
+    - sql: INSERT INTO ja VALUES ($1, $2)
+      params: [2, null]
+      rowcount: 1
+    - sql: INSERT INTO jb VALUES ($1, $2)
+      params: [1, 5]
+      rowcount: 1
+    - sql: INSERT INTO jb VALUES ($1, $2)
+      params: [2, null]
+      rowcount: 1
+    - sql: SELECT ja.id, jb.id FROM ja JOIN jb ON ja.k = jb.k WHERE ja.id >= $1
+      params: [0]
+      expected: [[1, 1]]
+  teardown:
+    - DROP TABLE ja
+    - DROP TABLE jb
+
+- name: NULL in comparison
+  features: [E061-01]
+  setup:
+    - CREATE TABLE nc (id INTEGER PRIMARY KEY, v INTEGER)
+    - CREATE INDEX nc_v ON nc (v)
+  steps:
+    - sql: INSERT INTO nc VALUES ($1, $2)
+      params: [1, null]
+      rowcount: 1
+    - sql: INSERT INTO nc VALUES ($1, $2)
+      params: [2, 5]
+      rowcount: 1
+    - sql: SELECT id FROM nc WHERE v = $1
+      params: [5]
+      expected: [[2]]
+    - sql: SELECT id FROM nc WHERE v < $1
+      params: [5]
+      expected: []
+    - sql: SELECT id FROM nc WHERE v >= $1
+      params: [5]
+      expected: [[2]]
+    - sql: SELECT id FROM nc WHERE v = $1
+      params: [null]
+      expected: []
+  teardown:
+    - DROP TABLE nc
+
+- name: NULL in arithmetic
+  features: [E011-04]
+  unimplemented: true
+  setup:
+    - CREATE TABLE na2 (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO na2 VALUES (1, NULL)
+    - INSERT INTO na2 VALUES (2, 5)
+  steps:
+    - sql: SELECT id, v + 1 FROM na2
+      expected: [[1, null], [2, 6]]
+  teardown:
+    - DROP TABLE na2
+
+- name: integer overflow in arithmetic
+  features: [E011-01, E011-04]
+  unimplemented: true
+  steps:
+    - sql: SELECT 2147483647 + 1
+      error: "22003"
+    - sql: SELECT 2147483647::bigint + 1
+      expected: [[2147483648]]
+    - sql: SELECT 32767::smallint + 1::smallint
+      error: "22003"
+
+- name: an UPDATE that overflows its column
+  features: [E011-01, E011-04]
+  setup:
+    - CREATE TABLE ov (id INTEGER PRIMARY KEY, v SMALLINT)
+  steps:
+    - sql: INSERT INTO ov VALUES ($1, $2)
+      params: [1, 32767]
+      rowcount: 1
+    - sql: UPDATE ov SET v = v + $2 WHERE id = $1
+      params: [1, 1]
+      error: "22003"
+    - sql: UPDATE ov SET v = v - $2 WHERE id = $1
+      params: [1, 1]
+      rowcount: 1
+    - sql: SELECT id, v FROM ov WHERE id = $1
+      params: [1]
+      expected: [[1, 32766]]
+  teardown:
+    - DROP TABLE ov

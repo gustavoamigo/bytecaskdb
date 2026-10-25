@@ -1,0 +1,99 @@
+# UNIQUE and NULL: PostgreSQL treats NULLs as distinct, so a unique key takes
+# any number of rows whose key is NULL.
+#
+# Rows go in by parameter and are read by key range: the SQL the layer runs
+# today, so that what these cases measure is the unique key.
+
+- name: a UNIQUE column takes several NULLs
+  features: [pg:unique-nulls-distinct]
+  # the layer refuses a column constraint: CREATE UNIQUE INDEX is the only way to a unique key
+  unimplemented: true
+  setup:
+    - CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER UNIQUE)
+  steps:
+    - sql: INSERT INTO u VALUES ($1, $2)
+      params: [1, null]
+      rowcount: 1
+    - sql: INSERT INTO u VALUES ($1, $2)
+      params: [2, null]
+      rowcount: 1
+    - sql: INSERT INTO u VALUES ($1, $2)
+      params: [3, 7]
+      rowcount: 1
+    - sql: INSERT INTO u VALUES ($1, $2)
+      params: [4, 7]
+      error: "23505"
+    - sql: SELECT id, k FROM u WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, null], [2, null], [3, 7]]
+  teardown:
+    - DROP TABLE u
+
+- name: a unique index takes several NULLs
+  features: [pg:unique-nulls-distinct]
+  setup:
+    - CREATE TABLE ui (id INTEGER PRIMARY KEY, k INTEGER)
+    - CREATE UNIQUE INDEX ui_k ON ui (k)
+  steps:
+    - sql: INSERT INTO ui VALUES ($1, $2)
+      params: [1, null]
+      rowcount: 1
+    - sql: INSERT INTO ui VALUES ($1, $2)
+      params: [2, null]
+      rowcount: 1
+    - sql: INSERT INTO ui VALUES ($1, $2)
+      params: [3, 7]
+      rowcount: 1
+    - sql: INSERT INTO ui VALUES ($1, $2)
+      params: [4, 7]
+      error: "23505"
+    - sql: SELECT id, k FROM ui WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, null], [2, null], [3, 7]]
+  teardown:
+    - DROP TABLE ui
+
+- name: a two-column unique index is unique only where no column is NULL
+  features: [pg:unique-nulls-distinct]
+  setup:
+    - CREATE TABLE u2 (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)
+    - CREATE UNIQUE INDEX u2_ab ON u2 (a, b)
+  steps:
+    - sql: INSERT INTO u2 VALUES ($1, $2, $3)
+      params: [1, 1, null]
+      rowcount: 1
+    - sql: INSERT INTO u2 VALUES ($1, $2, $3)
+      params: [2, 1, null]
+      rowcount: 1
+    - sql: INSERT INTO u2 VALUES ($1, $2, $3)
+      params: [3, 1, 2]
+      rowcount: 1
+    - sql: INSERT INTO u2 VALUES ($1, $2, $3)
+      params: [4, 1, 2]
+      error: "23505"
+  teardown:
+    - DROP TABLE u2
+
+- name: an UPDATE to a key another row has is refused
+  features: [pg:unique-nulls-distinct, E101-03]
+  setup:
+    - CREATE TABLE uu (id INTEGER PRIMARY KEY, k INTEGER)
+    - CREATE UNIQUE INDEX uu_k ON uu (k)
+  steps:
+    - sql: INSERT INTO uu VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO uu VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: UPDATE uu SET k = $2 WHERE id = $1
+      params: [2, 10]
+      error: "23505"
+    - sql: UPDATE uu SET k = $2 WHERE id = $1
+      params: [2, null]
+      rowcount: 1
+    - sql: SELECT id, k FROM uu WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 10], [2, null]]
+  teardown:
+    - DROP TABLE uu

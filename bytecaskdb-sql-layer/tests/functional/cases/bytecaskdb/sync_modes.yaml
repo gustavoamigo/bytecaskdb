@@ -1,0 +1,44 @@
+# The three sync modes (--sync): each takes a write and keeps it across a
+# clean restart.
+
+- name: AT_EVERY_COMMIT keeps a commit across a restart
+  features: [layer:sync-modes]
+  server_flags: ["--sync", "AT_EVERY_COMMIT"]
+  setup:
+    - CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO s VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - restart: true
+    - sql: SELECT id, v FROM s WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 10]]
+
+- name: AT_INTERVAL keeps a commit across a restart
+  features: [layer:sync-modes]
+  server_flags: ["--sync", "AT_INTERVAL", "--sync-interval-ms", "50"]
+  setup:
+    - CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO s VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - restart: true
+    - sql: SELECT id, v FROM s WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 10]]
+
+- name: AT_FILE_ROTATION keeps a commit across a restart
+  features: [layer:sync-modes]
+  server_flags: ["--sync", "AT_FILE_ROTATION"]
+  setup:
+    - CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO s VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - restart: true
+    - sql: SELECT id, v FROM s WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 10]]

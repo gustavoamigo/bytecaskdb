@@ -44,7 +44,7 @@ python3 bytecaskdb-sql-layer/tests/functional/report.py results.json > report.md
 ```
 
 `--suite=postgresql` runs one suite, `-k F041` the cases of one feature,
-`-k "several NULLs"` one case.
+`-k "several and NULLs"` one case (`-k` takes `and`, not spaces).
 
 - **One case model.** A case is a list of steps. Each step is SQL and
   one expectation: it succeeds, it returns these rows (in order, or
