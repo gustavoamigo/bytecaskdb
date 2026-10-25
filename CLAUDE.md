@@ -138,28 +138,14 @@ Avoid designs where correctness depends on programmer discipline alone (e.g. "ne
 
 **Example — the P4 Node/InternalNode split**: Rather than allocating leaf nodes at a smaller size and relying on discipline to never access the `children_` field (heap buffer overflow if violated), we split into `Node` (base, no `children_` field) and `InternalNode : Node` (derived, has `children_`). Accessing `children_` through a `Node*` is a compile error. Child accessor methods on `Node` check a tag bit before downcasting and return safe defaults ("no children") when the tag is absent.
 
-### Iterator laziness — correctness requirement
+### Engine code (`bytecaskdb/`)
 
-Iterators must fetch and process data lazily unless explicitly documented otherwise. An iterator that eagerly materializes all results into memory is a correctness bug: the result set may exceed available memory (e.g. a `changes_since` scan over millions of entries). The correct pattern is to hold at most one unit of work in memory at a time (one batch, one entry) and advance on demand.
+The full rules are in `bytecaskdb/CLAUDE.md`; read them before changing engine code. The four that nothing else catches:
 
-When implementing an iterator over data files:
-- Build the file/partition list eagerly (it is O(num_files), small).
-- Scan one batch at a time within each file.
-- Cache only the current entry; release previous data on advance.
-- If global ordering is required across files, exploit the engine's sequence-disjoint file property (files sorted by min_sequence yield globally ascending order) rather than collecting and sorting all entries.
-
-### Lifetime and view safety
-
-Never return or store a non-owning view (`std::span`, `std::string_view`, raw pointer) into an object's own buffer unless its owner provably outlives it; when in doubt, return an owned value. Never compose an iterator whose `operator*` returns a span-into-`*this` with `std::reverse_iterator`: it dangles (BC-122). The full rules, with the correct reverse-iterator pattern, are in `bytecaskdb/CLAUDE.md`; read them before writing code that lends a view.
-
-### Ownership through failure — prepare, commit, then release
-
-Every owning raw pointer (a key directory node, a buffer, a parcel) has exactly one owner at every instant, including while an exception unwinds. #580 freed a node that the root still reached; #588 found a bulk join that left leaves owned by two loaders. Each became a use-after-free when an allocation failed in that window.
-
-- A mutation of a structure that others can reach, or that its destructor walks, runs in three steps: **prepare** (every allocation, every call that can throw), **commit** (install the result and hand ownership over with operations that cannot throw), **release** (free what was replaced, once nothing reachable points to it). Freeing before the commit point, or allocating after it, is the bug class.
-- The structure enforces the order, not its callers: one commit function moves the root and frees what was replaced (`BuildSession::write`), and a commit step that must not throw is `noexcept` (`BulkLoader::adopt_runs`), so a throw there ends the process rather than leaving a pointer with two owners.
-- A mutation that fails partway and cannot be rolled back leaves the object refusing every use except destruction (`BuildSession::usable`). Never let a caller keep writing to half-changed state.
-- Moving ownership of a batch of pointers is one non-throwing step, or one pointer at a time with the source cleared as each moves. Never copy pointers to the new owner and clear the old owner afterwards, with a throwing call in between.
+- **Iterators are lazy.** Hold at most one unit of work (a batch, an entry) in memory; never materialize all results.
+- **Views.** Never return or store a non-owning view (`std::span`, `std::string_view`, raw pointer) into an object's own buffer unless its owner provably outlives it; when in doubt, return an owned value. Never compose a span-returning iterator with `std::reverse_iterator`: it dangles (BC-122).
+- **Ownership through failure.** Every owning raw pointer has one owner at every instant. Mutate shared structures in three steps: prepare (everything that allocates or throws), commit (install with operations that cannot throw), release (free what was replaced). Never free before the commit point.
+- **Batch markers.** Vacuum and `ChangeIterator` must not skip `BulkBegin`/`BulkEnd`; only hint generation does.
 
 ### Thread-local state
 
@@ -173,10 +159,6 @@ A `thread_local` outlives every DB its thread touches, so one holding a DB's sta
 - **Sign-conversion on array indexing** (`-Wsign-conversion`): When indexing an array/string with the result of a signed distribution or function, wrap the index in `static_cast<std::size_t>(...)`.
 - **Missing `[[noreturn]]` on lambdas** (`-Wmissing-noreturn`): Add `[[noreturn]]` to lambdas that unconditionally throw: `[][[noreturn]] { throw ...; }`.
 - **Unused functions/variables** (`-Wunused-function`, `-Wunused-variable`): Remove helper functions and variables that are no longer referenced after a refactor rather than leaving them in place.
-
-### Batch marker invariants
-
-BulkBegin/BulkEnd markers must NOT be skipped by vacuum or ChangeIterator — they are structural markers that preserve batch atomicity on disk. Only hint generation skips them (hints do not have the concept).
 
 ## Documentation writing guidelines
 

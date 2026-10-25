@@ -1,6 +1,16 @@
 # Engine source (`bytecaskdb/`)
 
-> `AGENTS.md` is a symlink to this file. The root `CLAUDE.md` has the rules for the whole repository; this file adds the ones for engine code, and is read when you work in this folder.
+> `AGENTS.md` is a symlink to this file. The root `CLAUDE.md` has the rules for the whole repository; this file adds the ones specific to the engine's code, and is read when you work in this folder.
+
+## Iterator laziness — correctness requirement
+
+Iterators must fetch and process data lazily unless explicitly documented otherwise. An iterator that eagerly materializes all results into memory is a correctness bug: the result set may exceed available memory (e.g. a `changes_since` scan over millions of entries). The correct pattern is to hold at most one unit of work in memory at a time (one batch, one entry) and advance on demand.
+
+When implementing an iterator over data files:
+- Build the file/partition list eagerly (it is O(num_files), small).
+- Scan one batch at a time within each file.
+- Cache only the current entry; release previous data on advance.
+- If global ordering is required across files, exploit the engine's sequence-disjoint file property (files sorted by min_sequence yield globally ascending order) rather than collecting and sorting all entries.
 
 ## Lifetime and view safety — spans, iterators, and non-owning views
 
@@ -46,3 +56,16 @@ private:
 - Never store a `std::span` or `std::string_view` in a struct unless you can guarantee the owner outlives the struct, and document that guarantee explicitly.
 - If you see a `// WARNING:` comment excusing a lifetime hazard, treat it as a required design fix, not permanent documentation. Removing the hazard is always the goal.
 - When in doubt, return an owned value (`std::vector<std::byte>`, `std::string`). The borrow optimisation is only worth it when profiling identifies it as a real bottleneck.
+
+## Ownership through failure — prepare, commit, then release
+
+Every owning raw pointer (a key directory node, a buffer, a parcel) has exactly one owner at every instant, including while an exception unwinds. #580 freed a node that the root still reached; #588 found a bulk join that left leaves owned by two loaders. Each became a use-after-free when an allocation failed in that window.
+
+- A mutation of a structure that others can reach, or that its destructor walks, runs in three steps: **prepare** (every allocation, every call that can throw), **commit** (install the result and hand ownership over with operations that cannot throw), **release** (free what was replaced, once nothing reachable points to it). Freeing before the commit point, or allocating after it, is the bug class.
+- The structure enforces the order, not its callers: one commit function moves the root and frees what was replaced (`BuildSession::write`), and a commit step that must not throw is `noexcept` (`BulkLoader::adopt_runs`), so a throw there ends the process rather than leaving a pointer with two owners.
+- A mutation that fails partway and cannot be rolled back leaves the object refusing every use except destruction (`BuildSession::usable`). Never let a caller keep writing to half-changed state.
+- Moving ownership of a batch of pointers is one non-throwing step, or one pointer at a time with the source cleared as each moves. Never copy pointers to the new owner and clear the old owner afterwards, with a throwing call in between.
+
+## Batch marker invariants
+
+BulkBegin/BulkEnd markers must NOT be skipped by vacuum or ChangeIterator — they are structural markers that preserve batch atomicity on disk. Only hint generation skips them (hints do not have the concept).
