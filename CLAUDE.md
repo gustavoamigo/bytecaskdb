@@ -8,6 +8,7 @@ ByteCaskDB: an embedded key-value store in C++23 (Bitcask-style append-only file
 - `docs/bytecask_design.md`: design reference and the complete feature list.
 - `CONTRACT.md`: what the engine guarantees, with the test proving each row.
 - `include/bytecask.hpp`, `docs/api_reference.md`: the public API and usage examples.
+- `docs/code_map.md`: where each concern lives in the engine and which test covers it. Start here to find code.
 - `docs/project_organization.md`: repository layout, build systems, license boundaries.
 - `docs/performance.md`: benchmark tables and methodology.
 

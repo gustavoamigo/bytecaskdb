@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: MIT
+# docs/code_map.md is how coding agents find code without searching, so a
+# path in it that no longer exists is worse than none (#630).
+#
+# No paths filter, unlike the other documentation checks: a rename or delete
+# anywhere in the tree can break the map, and this runs in seconds. ci.yml
+# ignores Markdown, so it needs its own workflow.
+
+name: Code map
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  code-map:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every path in docs/code_map.md exists
+        run: python3 scripts/check_code_map.py
+      - name: The checker itself
+        run: python3 scripts/test_check_code_map.py
