@@ -86,7 +86,7 @@ Gaps in LSN are safe — contiguity is not required  — gaps
 
 ---
 
-## Problem Statement
+## Problem statement: validating state transitions under I/O failure
 
 Given a storage engine with a single write path, validate that for any
 I/O failure at any point during a state transition, the resulting state
@@ -119,7 +119,7 @@ Was the transition fully persisted?
 
 ---
 
-## Key Principle
+## Key principle: the transition delta is finite
 
 The state space is infinite — keys, values, and LSNs can be anything.
 But the transition delta is finite and bounded by the operation. The
@@ -292,7 +292,7 @@ It provides:
 If I/O fails, the transient copy is discarded — the published state
 is never modified.
 
-### Behavioral contract
+### Behavioral contract: where the guarantees live (`CONTRACT.md`)
 
 [`CONTRACT.md`](../CONTRACT.md) defines the guarantees for
 `apply_batch`, `vacuum_compact`, and hint files.
@@ -399,7 +399,7 @@ to callers. Degrading forces `resume()` before further writes are accepted;
 
 ---
 
-## Proof Test Generator
+## Proof Test Generator, and the other validation layers: MC/DC, fault sweeps, sanitizers, fuzzing, chaos, isolation checking
 
 ### Power-loss axis
 
@@ -1367,7 +1367,7 @@ write on new leader → backward sync → verify convergence).
   I_G). The test framework uses try-catch with `bool threw` tracking to
   handle both outcomes.
 
-### Source files
+### Proof generator source files and their roles
 
 **apply_batch module** (root of `tests/proof/`):
 
@@ -1562,7 +1562,7 @@ fails calls by count as well, to reach the ones no site names; see
 12 test cases (`[invariants]` tag) in `tests/invariants_test.cpp`
 smoke-test the helpers themselves.
 
-### Test coverage
+### Proof test coverage of the failure classes
 
 All ten failure classes for `apply_batch` (SUCCESS, NOSYNC, A, B1, B2, B3,
 C, F, G, H) are covered by the 2082 `[prove]` tests. Each class is exercised
@@ -2962,7 +2962,7 @@ A site whose break nothing has to catch says why instead.
 
 The radix key directory's leak on a failed recovery merge (#203), before the radix tree was removed, was not a durability site; LeakSanitizer caught it in CI.
 
-## Output Structure
+## Output structure of the generated proof tests
 
 ```
 tests/
@@ -3016,7 +3016,7 @@ and reviewable.
 
 ---
 
-## `rename()` Handling
+## `rename()` handling: atomicity assumption, EINTR retry, orphaned files
 
 `rename()` on a consistent local filesystem (ext4, xfs, btrfs) is
 atomic. The engine assumes the filesystem handles rename consistently.
@@ -3078,7 +3078,7 @@ model this section used to spell out in prose.
 
 ---
 
-## What This Validates
+## What the proof matrix validates, and what it does not
 
 ```
 For every (S1, P, F) in the scenario matrix:
@@ -3159,7 +3159,7 @@ control:
 
 ---
 
-## Why This Approach
+## Why this approach: finite failure classes instead of an infinite state space
 
 The failure classes reduce an infinite problem space to a finite
 and tractable one. What matters is not which specific operation
@@ -3327,7 +3327,7 @@ uses it as published.
 
 ## Property-Based Validation of the Independence Assumption
 
-### The assumption
+### The independence assumption
 
 The proof matrix makes a structural independence assumption: the
 correctness of a transition depends only on operation types and their
@@ -3342,7 +3342,7 @@ The testing literature calls this a uniformity hypothesis
 ([*Prior Art*](#prior-art)): one representative stands for its whole
 class.
 
-### Approach
+### Independence check approach
 
 Only a transition that lands has values to be independent of: the
 SUCCESS, NOSYNC and H cells, 535 of the 2,082. Their deltas differ only
@@ -3404,7 +3404,7 @@ What is generated is chosen for the code that could depend on it:
   default file size or 64 KiB files, where the setup rotates and the
   plan lands on a DB of several sealed files.
 
-### Scope
+### Independence check scope
 
 SUCCESS only. Class H (the write commits, the rotation after it fails)
 and NOSYNC take other paths through the engine and are not covered:
@@ -3424,7 +3424,7 @@ all state shapes). The property tests complement it by sampling the
 value space for each behavioral equivalence class — validating the
 assumption that lets the deterministic matrix use symbolic values.
 
-### Implementation
+### Independence check implementation (Hypothesis tests)
 
 13 Hypothesis property tests in `tests/proof/test_independence.py`, 50
 examples each, run on every pull request (`ci.yml`) and against each
