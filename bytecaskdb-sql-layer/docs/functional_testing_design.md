@@ -80,8 +80,8 @@ The flags and the lists are for the build, and only for it:
 - **The gate** (the default, and what CI and the build run): a
   not-implemented case is skipped. Every other case must pass, so
   removing a flag or a line makes that case a test the layer must pass
-  from then on (whether the gate runs a marked case and expects it to
-  fail: *Open questions*).
+  from then on. A marked case is never run by the gate, so a gap that
+  closes is seen in the conformance report, not as a failed build.
 - **Conformance** (`--conformance`): the flags and the lists are
   ignored. Every case runs as a test, and its real outcome is recorded.
   A failure doesn't fail the run: this run measures, and the report is
@@ -316,23 +316,7 @@ moves to what the layer doesn't do yet.
 
    The first keeps the licence position clear. The second keeps every
    suite on every PR. Step 3 waits on this.
-3. **Does the gate skip a not-implemented case, or run it and expect it
-   to fail?** The text above skips it, and the conformance run lists
-   the marked cases that pass, without failing. A mark that outlives its
-   gap then goes unnoticed until someone reads the report. The
-   alternative is `xfail(strict)`: the gate runs every marked case, and
-   one that passes fails the build, so the mark must come off. It costs:
-   - **Time.** The gate runs every marked case: hundreds of sqltest
-     cases, and most of TPC-DS.
-   - **Isolation.** A marked case that crashes or hangs
-     `sql_layer_server` also breaks the unmarked cases that share its
-     file's server (Decision 9). Skipping never started it.
-
-   It needs a per-case timeout, and a server restart after a crash,
-   with the unmarked cases rerun. Recommended: skip in the gate, and
-   let the report list the marks that pass; take the strict gate only if
-   that proves too easy to ignore.
-4. **How a TPC case compares results.** These sets return `numeric` and
+3. **How a TPC case compares results.** These sets return `numeric` and
    `double` aggregates, and `ORDER BY` often leaves ties, so a
    text-for-text comparison is too tight. Proposed: a TPC case compares
    numbers within a relative tolerance and sorts rows that tie on the
@@ -354,7 +338,7 @@ The owner's, 2026-10-25:
 5. **The suites are the scope.** What the layer can't run yet is marked
    not implemented. The build skips marked cases, and must pass the
    rest; a conformance run ignores the marks and runs everything, for
-   the report (whether the gate runs them: *Open questions*).
+   the report, which lists the marked cases that pass, so their marks can come off.
 6. **No issue per not-implemented case.**
 7. **Cases name the SQL features they cover, as metadata.** File names
    stay by area.
