@@ -34,11 +34,18 @@ void DB::sync_active_file(TransientEngineState &t,
     counters_.fsyncs.fetch_add(1, std::memory_order_relaxed);
   } catch (...) {
     counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
-    t.apply_degrade(std::format(
-        "{} fdatasync failed on '{}': writes acknowledged without sync are "
-        "not confirmed durable. Call resume() to recover.",
-        caller, t.active_file().path().string()));
-    store_state(current, std::move(t).persistent());
+    // Publishing the degraded state allocates: without the memory, the flag
+    // refuses writes, and the caller still gets the I/O error, not a
+    // std::bad_alloc in its place.
+    try {
+      t.apply_degrade(std::format(
+          "{} fdatasync failed on '{}': writes acknowledged without sync are "
+          "not confirmed durable. Call resume() to recover.",
+          caller, t.active_file().path().string()));
+      store_state(current, std::move(t).persistent());
+    } catch (...) {
+      refuse_writes();
+    }
     throw;
   }
   t.apply_sync(t.next_seq() > 0 ? t.next_seq() - 1 : 0);

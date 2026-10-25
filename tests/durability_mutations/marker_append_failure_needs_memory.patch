@@ -1,0 +1,17 @@
+A promotion whose marker append fails, with no memory to publish the degraded
+state, leaves a follower that accepts writes, with a marker in the file that
+no state holds. Reverts #618.
+Guarded-by: "alloc sweep: set_mode(Leader) whose marker append fails"
+
+diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
+index b7640e8..453bf12 100644
+--- a/bytecaskdb/db_replication.cpp
++++ b/bytecaskdb/db_replication.cpp
+@@ -88,7 +88,6 @@ void DB::set_mode(Mode mode) {
+             "set_mode(Leader) marker append IO error: call resume() to "
+             "recover."));
+       } catch (...) {
+-        refuse_writes();
+       }
+       std::rethrow_exception(ex);
+     }

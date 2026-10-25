@@ -65,6 +65,7 @@ struct FaultInjector {
   int         fail_at    = -1; // fail after this many checkpoints (-1 = never)
   int         call_count = 0;  // number of checkpoints passed so far
   std::string last_checkpoint; // name of the last checkpoint that fired
+  bool        fired = false;   // an injected failure was thrown
 
   // Count-based skip set — checkpoints matching these names pass even
   // when call_count exceeds fail_at. Allows testing scenarios where some
@@ -87,6 +88,7 @@ struct FaultInjector {
         post_write_mode == PostWriteMode::none) {
       ++name_matches;
       if (fail_on_nth_match == 0 || name_matches == fail_on_nth_match) {
+        fired = true;
         throw std::system_error{error,
             std::string{"fault injection at: "} + name};
       }
@@ -96,6 +98,7 @@ struct FaultInjector {
     if (fail_at >= 0 && call_count > fail_at
         && std::find(skip_names.begin(), skip_names.end(), name)
                == skip_names.end()) {
+      fired = true;
       throw std::system_error{error,
           std::string{"fault injection at: "} + name};
     }
@@ -136,6 +139,7 @@ inline void io_post_write_checkpoint(const char* name, int fd,
   }
   // For throw_after: data stays fully on disk — simulates writev
   // success followed by a failure before offset_ advances.
+  inj.fired = true;
   throw std::system_error{inj.error,
       std::string{"fault injection (post-write) at: "} + name};
 }

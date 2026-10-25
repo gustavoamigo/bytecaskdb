@@ -2115,6 +2115,13 @@ for lack of memory is not settled, and the sweep is how it will be.
 Counts are from a release build; a debug build under ASan allocates a
 little more (`put` takes 19 runs, not 17).
 
+The four operations that follow also inject an I/O failure while they run,
+so that the handler for it has to allocate under the fault. The sweep then
+requires that an engine whose injected failure was thrown refuses writes,
+whichever allocation failed (`Operation::io_fault`). A handler that loses
+its allocation to the sweep, and with it the degraded state, fails that
+check; none of these showed damage to the data in any other check.
+
 | Operation | Runs per pass | Outcomes, one / every one from N on |
 |---|---:|---|
 | `put` | 17 | 13 threw unchanged, 3 degraded, 1 completed (both) |
@@ -2126,6 +2133,10 @@ little more (`put` takes 19 runs, not 17).
 | a put that fills the active file | 121 | 71 returned, 36 degraded, 13 threw unchanged (both) |
 | `vacuum` | 161 | 159 / 160 threw unchanged, 1 / 0 returned |
 | `ingest` | 29 | 24 / 25 threw unchanged, 4 / 3 degraded, 1 completed (both) |
+| `ingest` with its append failing after the write | 33 | 24 threw unchanged, 9 degraded (both) |
+| `set_mode(Leader)` with its marker append failing after the write | 9 | 9 degraded (both) |
+| `set_mode(Follower)` with an unsynced write and its `fdatasync` failing | 9 | 9 degraded (both) |
+| `create_manifest` with its `fdatasync` failing | 9 | 9 degraded (both) |
 | `resume()`, unsynced entry | 162 | 91 / 113 degraded, 70 / 48 returned |
 | `resume()`, torn entry | 157 | 91 / 111 degraded, 65 / 45 returned |
 | `DB::open` of two or more data files and their hints, 1,350 keys, 1 recovery thread | 301 | 298 / 300 threw, 3 / 1 opened |
@@ -2189,6 +2200,15 @@ each allocation it failed.
   the batch (#583). Found once the sweep stopped depending on the node pool:
   a warm pool had hidden the allocations that reach it. The handler now
   refuses writes by the flag when it cannot publish the degraded state.
+- *Three more handlers had the same gap* (#618). Running the I/O failures of
+  ingest's append, the promotion's marker append and `sync_active_file`'s
+  `fdatasync` under the allocation sweep found each one leaving the engine
+  writable after it had reported the failure, whenever the allocation that
+  failed was the handler's own: 2 to 3 runs with one failure and 7 under
+  sustained pressure, per operation. A failed `fdatasync` whose handler lost
+  its allocation also threw `std::bad_alloc` in the I/O error's place. No
+  other check in the sweep noticed, since these operations take no write
+  afterwards that a reopen could lose; the proof is the refusal itself.
 - *Freeing memory needed memory.* A transient dropped without publishing
   freed its nodes through `free_node_subtree_if`, in a `noexcept`
   destructor, with a heap-allocated work list: under sustained pressure,
@@ -2856,6 +2876,9 @@ A site whose break nothing has to catch says why instead.
 | `execute_slots`: a failed append syncs what it can before it degrades | not needed: `resume()` rewrites and syncs the file before trusting it (#240) | `no_sync_before_degrade` (chaos, not caught) | — |
 | `execute_slots`: a rotation behind a failed flush stays degraded | `pipeline: rotation behind a failed flush stays degraded` | `rotation_publishes_over_degrade` | #170 |
 | `execute_slots`: a sync write that appends nothing makes earlier unsynced writes durable | `apply_batch: an empty sync plan makes earlier unsynced writes …` | `sync_only_write_skips_sync` | #192 |
+| `ingest`: a failed append refuses writes when the degraded state cannot be published | `alloc sweep: ingest whose append fails` | `ingest_append_failure_not_refused` | #618 |
+| `set_mode(Leader)`: a failed marker append refuses writes when the degraded state cannot be published | `alloc sweep: set_mode(Leader) whose marker append fails` | `marker_append_failure_needs_memory` | #618 |
+| `sync_active_file`: a failed `fdatasync` refuses writes, and throws its own error, when the degraded state cannot be published | `alloc sweep: set_mode(Follower) whose fdatasync fails` (and `create_manifest`'s) | `sync_failure_refusal_needs_memory` | #618 |
 | `execute_group`: a failed append refuses writes when the degraded state cannot be published | `alloc sweep: apply_batch` | `append_failure_refusal_needs_memory` | #583 |
 | `execute_group`: a throw after the append refuses writes | `refuse writes: a throw after the append refuses writes until resume()` | `post_append_failure_not_refused` | #364 |
 | `refuse_writes`: the flag refuses when the degraded state cannot be published | `refuse writes: the refusal holds when the degraded state cannot be published` | `refusal_needs_published_state` | #364 |
