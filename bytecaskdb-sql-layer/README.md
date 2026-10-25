@@ -28,7 +28,7 @@ How much of each suite the layer passes, from the functional suite's conformance
 | TPC-DS-derived | not run yet | | results |
 | TPROC-C | 100% | 1/1 case: five transactions, then consistency conditions 1–9 | consistency conditions 1–9 |
 
-The suite is young: its cases are the first of the plan in `docs/functional_testing_design.md`, so a high percentage means few cases, not wide coverage. Most of sqltest's tests fail at their first statement: their tables have no primary key, which the layer refuses (Open question 2 of the design). The TPC rows come with their own step of that plan.
+The suite is young: its cases are the first of the plan in `docs/functional_testing_design.md`, so a high percentage means few cases, not wide coverage. Most of sqltest's tests fail at their first statement: their tables have no primary key, which the layer refuses (a gap, not a decision: `docs/functional_testing_design.md`, Decision 11). The TPC rows come with their own step of that plan.
 
 ## Current state
 

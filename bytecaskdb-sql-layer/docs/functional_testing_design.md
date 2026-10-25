@@ -304,11 +304,7 @@ moves to what the layer doesn't do yet.
 
 1. **The names of the TPC-H-derived and TPC-DS-derived rows.** HammerDB
    calls its H workload TPROC-H; DS has no such name yet.
-2. **The loaders change the format only.** Proposed above: another
-   suite's SQL runs as written, so a sqltest table without a primary key
-   is not implemented until the layer supports one. The alternative is
-   to adapt their SQL (add a primary key) so more of it runs today.
-3. **Where TPC's tools and data come from.** TPC's tools (`dbgen`,
+2. **Where TPC's tools and data come from.** TPC's tools (`dbgen`,
    `qgen`, `dsdgen`, `dsqgen`) are free but need a registration and an
    agreement to TPC's licence; there is no URL a CI job can fetch. So
    "downloaded when the suite runs" doesn't hold. Options:
@@ -320,7 +316,7 @@ moves to what the layer doesn't do yet.
 
    The first keeps the licence position clear. The second keeps every
    suite on every PR. Step 3 waits on this.
-4. **Does the gate skip a not-implemented case, or run it and expect it
+3. **Does the gate skip a not-implemented case, or run it and expect it
    to fail?** The text above skips it, and the conformance run lists
    the marked cases that pass, without failing. A mark that outlives its
    gap then goes unnoticed until someone reads the report. The
@@ -336,7 +332,7 @@ moves to what the layer doesn't do yet.
    with the unmarked cases rerun. Recommended: skip in the gate, and
    let the report list the marks that pass; take the strict gate only if
    that proves too easy to ignore.
-5. **How a TPC case compares results.** These sets return `numeric` and
+4. **How a TPC case compares results.** These sets return `numeric` and
    `double` aggregates, and `ORDER BY` often leaves ties, so a
    text-for-text comparison is too tight. Proposed: a TPC case compares
    numbers within a relative tolerance and sorts rows that tie on the
@@ -351,8 +347,8 @@ The owner's, 2026-10-25:
    decision-support query sets, and TPROC-C. The SQL Core row is labelled
    by the edition its tests come from.
 3. **Other suites are loaded in their own format and turned into our
-   cases at run time** (whether only the format changes: *Open
-   questions*).
+   cases at run time**, and only the format changes: a suite's SQL
+   runs as it wrote it (Decision 13).
 4. **PostgreSQL writes our cases' expected results, and is not part of
    the test.**
 5. **The suites are the scope.** What the layer can't run yet is marked
@@ -371,3 +367,7 @@ The owner's, 2026-10-25:
     not a recorded decision.
 12. **The suite's runner is the owner's own work and carries an MIT
     header.**
+13. **A loader changes the format, never the SQL** (2026-10-25). A sqltest
+    table without a primary key is not implemented until the layer
+    supports one; adding a key to it would make the row measure our edit
+    of the suite, and hide the gap Decision 11 names.
