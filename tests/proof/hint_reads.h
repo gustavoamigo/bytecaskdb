@@ -102,10 +102,15 @@ inline auto hint_identity(const std::filesystem::path &hint) -> std::string {
            std::strerror(errno));
     return "<absent>";
   }
+#ifdef __APPLE__
+  const auto &mtime = st.st_mtimespec;
+#else
+  const auto &mtime = st.st_mtim;
+#endif
   return std::format("{}-{}.{:09}-{}",
                      static_cast<std::uint64_t>(st.st_ino),
-                     static_cast<std::int64_t>(st.st_mtim.tv_sec),
-                     static_cast<long>(st.st_mtim.tv_nsec),
+                     static_cast<std::int64_t>(mtime.tv_sec),
+                     static_cast<long>(mtime.tv_nsec),
                      static_cast<std::uint64_t>(st.st_size));
 }
 
