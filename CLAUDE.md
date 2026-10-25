@@ -1,3 +1,5 @@
+> `AGENTS.md` is a symlink to this file, so every coding agent reads the same instructions. Edit `CLAUDE.md`; don't replace the symlink with a copy.
+
 # Project Overview
 
 ByteCaskDB: an embedded key-value store in C++23 (Bitcask-style append-only files, in-memory persistent B+ tree key directory). Read the file you need, not all of them:
