@@ -1,0 +1,309 @@
+# Numeric comparison and arithmetic across the numeric types.
+
+- name: an integer column compared with a DECIMAL parameter
+  features: [E011-05, E011-06]
+  setup:
+    - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
+  steps:
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [1, 1, 1.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [2, 2, 2.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [3, 3, 0.5, "10.00"]
+      rowcount: 1
+    - sql: SELECT id FROM n WHERE i < $1 AND id >= $2
+      params: ["2.5", 0]
+      error: "22P02"
+  teardown:
+    - DROP TABLE n
+
+- name: a DECIMAL column compared with an integer parameter
+  features: [E011-05, E011-06]
+  setup:
+    - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
+  steps:
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [1, 1, 1.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [2, 2, 2.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [3, 3, 0.5, "10.00"]
+      rowcount: 1
+    - sql: SELECT id FROM n WHERE d > $1 AND id >= $2
+      params: [3, 0]
+      expected: [[3]]
+  teardown:
+    - DROP TABLE n
+
+- name: a DOUBLE column compared with an integer parameter
+  features: [E011-05]
+  # no plan: a filter on column "f", a REAL or DOUBLE PRECISION, is not supported yet
+  unimplemented: true
+  setup:
+    - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
+  steps:
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [1, 1, 1.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [2, 2, 2.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [3, 3, 0.5, "10.00"]
+      rowcount: 1
+    - sql: SELECT id FROM n WHERE f >= $1 AND id >= $2
+      params: [1, 0]
+      expected: [[1], [2]]
+  teardown:
+    - DROP TABLE n
+
+- name: two columns of the same type compared
+  features: [E011-05]
+  # WHERE must compare a column with a parameter
+  unimplemented: true
+  setup:
+    - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
+  steps:
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [1, 1, 1.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [2, 2, 2.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [3, 3, 0.5, "10.00"]
+      rowcount: 1
+    - sql: SELECT id FROM n WHERE i >= f AND id >= $1
+      params: [0]
+      expected: [[3]]
+  teardown:
+    - DROP TABLE n
+
+- name: an integer column compared with a DOUBLE column
+  features: [E011-06]
+  # WHERE must compare a column with a parameter
+  unimplemented: true
+  setup:
+    - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
+  steps:
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [1, 1, 1.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [2, 2, 2.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [3, 3, 0.5, "10.00"]
+      rowcount: 1
+    - sql: SELECT id FROM n WHERE i > f AND id >= $1
+      params: [0]
+      expected: [[3]]
+  teardown:
+    - DROP TABLE n
+
+- name: DECIMAL plus DECIMAL of the same scale
+  features: [E011-04, E011-03]
+  # only columns and aggregates can be selected
+  unimplemented: true
+  ordered: true
+  setup:
+    - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
+  steps:
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [1, 1, 1.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [2, 2, 2.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [3, 3, 0.5, "10.00"]
+      rowcount: 1
+    - sql: SELECT id, d + d FROM n WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, "5.00"], [2, "5.00"], [3, "20.00"]]
+  teardown:
+    - DROP TABLE n
+
+- name: DECIMAL plus an integer column
+  features: [E011-04, E011-06]
+  # only columns and aggregates can be selected
+  unimplemented: true
+  ordered: true
+  setup:
+    - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
+  steps:
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [1, 1, 1.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [2, 2, 2.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [3, 3, 0.5, "10.00"]
+      rowcount: 1
+    - sql: SELECT id, d + i FROM n WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, "3.50"], [2, "4.50"], [3, "13.00"]]
+  teardown:
+    - DROP TABLE n
+
+- name: multiplication
+  features: [E011-04]
+  # only + and - are supported here
+  unimplemented: true
+  ordered: true
+  setup:
+    - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
+  steps:
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [1, 1, 1.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [2, 2, 2.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [3, 3, 0.5, "10.00"]
+      rowcount: 1
+    - sql: SELECT id, i * i FROM n WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 1], [2, 4], [3, 9]]
+  teardown:
+    - DROP TABLE n
+
+- name: division of integers truncates
+  features: [E011-04]
+  # only + and - are supported here
+  unimplemented: true
+  ordered: true
+  setup:
+    - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
+  steps:
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [1, 1, 1.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [2, 2, 2.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [3, 3, 0.5, "10.00"]
+      rowcount: 1
+    - sql: SELECT id, i / 2 FROM n WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 0], [2, 1], [3, 1]]
+  teardown:
+    - DROP TABLE n
+
+- name: modulo
+  features: [E011-04]
+  # only + and - are supported here
+  unimplemented: true
+  ordered: true
+  setup:
+    - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
+  steps:
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [1, 1, 1.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [2, 2, 2.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [3, 3, 0.5, "10.00"]
+      rowcount: 1
+    - sql: SELECT id, i % 2 FROM n WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 1], [2, 0], [3, 1]]
+  teardown:
+    - DROP TABLE n
+
+- name: division by zero
+  features: [E011-04]
+  # only + and - are supported here
+  unimplemented: true
+  setup:
+    - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
+  steps:
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [1, 1, 1.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [2, 2, 2.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [3, 3, 0.5, "10.00"]
+      rowcount: 1
+    - sql: SELECT id, i / $1 FROM n WHERE id >= $2
+      params: [0, 0]
+      error: "22012"
+  teardown:
+    - DROP TABLE n
+
+- name: unary minus and ABS
+  features: [E011-04]
+  # only + and - are supported here
+  unimplemented: true
+  ordered: true
+  setup:
+    - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
+  steps:
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [1, 1, 1.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [2, 2, 2.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [3, 3, 0.5, "10.00"]
+      rowcount: 1
+    - sql: SELECT id, -i, ABS(f) FROM n WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, -1, "1.5"], [2, -2, "2.5"], [3, -3, "0.5"]]
+  teardown:
+    - DROP TABLE n
+
+- name: SUM of a DOUBLE and of a DECIMAL
+  features: [E091-05, E011-02, E011-03]
+  # SUM of a double precision column is not supported
+  unimplemented: true
+  setup:
+    - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
+  steps:
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [1, 1, 1.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [2, 2, 2.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [3, 3, 0.5, "10.00"]
+      rowcount: 1
+    - sql: SELECT SUM(f), SUM(d) FROM n WHERE id >= $1
+      params: [0]
+      expected: [["4.5", "15.00"]]
+  teardown:
+    - DROP TABLE n
+
+- name: AVG of an integer column
+  features: [E091-01]
+  setup:
+    - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
+  steps:
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [1, 1, 1.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [2, 2, 2.5, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2, $3, $4)
+      params: [3, 3, 0.5, "10.00"]
+      rowcount: 1
+    - sql: SELECT AVG(i) FROM n WHERE id >= $1
+      params: [0]
+      expected: [["2.0000000000000000"]]
+  teardown:
+    - DROP TABLE n

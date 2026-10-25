@@ -2027,6 +2027,16 @@ pg:parameters:
   description: $n parameters through the extended protocol
 pg:cast-operator:
   description: "the :: cast"
+pg:ilike:
+  description: ILIKE, the case-insensitive LIKE
+pg:extract:
+  description: EXTRACT of a date or time field
+pg:end-transaction:
+  description: END as another name for COMMIT
+pg:savepoint:
+  description: SAVEPOINT, ROLLBACK TO and RELEASE
+pg:transactional-ddl:
+  description: DDL statements inside a transaction
 pg:nulls-first-last:
   description: NULLS FIRST and NULLS LAST in ORDER BY
 layer:restart:

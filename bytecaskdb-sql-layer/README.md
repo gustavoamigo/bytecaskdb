@@ -22,7 +22,7 @@ How much of each suite the layer passes, from the functional suite's conformance
 | Suite | Coverage | Tests | Checks |
 |---|---|---|---|
 | SQL:2016 Core (sqltest) | 2% | 16/743 tests | statement accepted |
-| PostgreSQL features | 71% | 80/112 cases | results |
+| PostgreSQL features | 60% | 104/172 cases | results |
 | ByteCaskDB features | 100% | 12/12 cases | results |
 | TPROC-C | 100% | 1/1 case: five transactions, then consistency conditions 1–9 | consistency conditions 1–9 |
 
@@ -44,9 +44,10 @@ Not built yet (each is refused, with a message):
 - three or more tables, table aliases, outer joins, joins on anything but `=`, subqueries, set operations, `DISTINCT`;
 - `OR`, `NOT`, `IN`, `BETWEEN`, `IS NULL`;
 - `OFFSET`, `RETURNING`, `ON CONFLICT`, multi-row `VALUES`, the `::` cast;
-- `SELECT *`, multiplication, division, string functions and operators; literals other than integers (strings and decimals travel as parameters);
+- `SELECT *`, multiplication, division, modulo, unary minus, `LIKE`/`ILIKE`, `||`, string and date functions (`UPPER`, `LOWER`, `SUBSTRING`, `TRIM`, `POSITION`, `CHARACTER_LENGTH`, `EXTRACT`), `CAST`, date literals and `CURRENT_DATE`, date arithmetic; literals other than integers (strings and decimals travel as parameters);
 - a table without a primary key, column-level `UNIQUE`, `CHECK` and `REFERENCES` (use `CREATE UNIQUE INDEX`), views, `CREATE TABLE IF NOT EXISTS` (refused with 42P07), `TRUNCATE`, an `UPDATE` of a primary-key column;
-- `SELECT` without a `FROM`, `EXPLAIN`, `SAVEPOINT`, sequences, serializable and read-committed isolation, transactional DDL.
+- `SELECT` without a `FROM`, `EXPLAIN`, `SAVEPOINT`, `SET TRANSACTION` and `BEGIN READ ONLY`, sequences, serializable and read-committed isolation, transactional DDL;
+- a comparison of two columns, `SUM`/`AVG` and comparison of a `DOUBLE PRECISION` column, a timestamp with a seventh fractional digit (PostgreSQL rounds it).
 
 The functional suite (`tests/functional/`) marks what a case needs but the layer lacks, so its report shows the distance to PostgreSQL; the list above is the same gap seen from the dialect.
 
