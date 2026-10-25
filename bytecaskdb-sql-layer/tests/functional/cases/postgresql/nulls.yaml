@@ -105,9 +105,6 @@
 
 - name: a join never matches NULL keys
   features: [F041-01]
-  # the layer reads a join's inner table only by its whole primary key, so a join on
-  # jb.k is refused although jb has an index on k (#628)
-  unimplemented: true
   setup:
     - CREATE TABLE ja (id INTEGER PRIMARY KEY, k INTEGER)
     - CREATE TABLE jb (id INTEGER PRIMARY KEY, k INTEGER)
