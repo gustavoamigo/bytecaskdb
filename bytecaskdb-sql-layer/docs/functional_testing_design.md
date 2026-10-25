@@ -35,8 +35,11 @@ How it differs from the other tests (`testing_design.md`):
 ## How a run works
 
 ```
-BYTECASK_SQL_SERVER=build/linux/x86_64/release/sql_layer_server \
-  python3 -m pytest bytecaskdb-sql-layer/tests/functional --results=results.json
+export BYTECASK_SQL_SERVER=build/linux/x86_64/release/sql_layer_server
+# the gate: what must pass
+python3 -m pytest bytecaskdb-sql-layer/tests/functional
+# conformance: everything, for the report
+python3 -m pytest bytecaskdb-sql-layer/tests/functional --conformance --results=results.json
 python3 bytecaskdb-sql-layer/tests/functional/report.py results.json > report.md
 ```
 
@@ -45,8 +48,9 @@ python3 bytecaskdb-sql-layer/tests/functional/report.py results.json > report.md
 
 - **One case model.** A case is a list of steps. Each step is SQL and
   one expectation: it succeeds, it returns these rows (in order, or
-  sorted), or it fails with a given SQLSTATE. A case has an id, the suite it belongs to,
-  the features it covers, and whether it is implemented yet.
+  sorted), or it fails with a given SQLSTATE. A case has an id, the
+  suite it belongs to, the features it covers, and whether it is
+  implemented yet.
 - **A loader per suite** reads that suite's files in their own format
   and yields cases, when the run starts. Nothing is converted by hand or
   committed in our format. The loaders change the format, never the SQL:
@@ -65,16 +69,23 @@ python3 bytecaskdb-sql-layer/tests/functional/report.py results.json > report.md
   prints the table above and a table per SQL feature (*The feature
   manifest*).
 
-## Not implemented
+## Not implemented, and the two ways to run
 
 - **Our cases** carry `unimplemented: true`.
 - **Another suite's cases** can't be edited, so each suite has a list
   of the ids the layer doesn't pass yet: `not_implemented/<suite>.txt`.
   A list starts from a first run and is kept by hand after.
-- **Both are strict.** A not-implemented case is expected to fail, and
-  is reported as not implemented. One that passes fails the run, so
-  whoever builds the feature removes the flag or the line in the same
-  change, and the lists stay true.
+
+The flags and the lists are for the build, and only for it:
+- **The gate** (the default, and what CI and the build run): a
+  not-implemented case is skipped. Every other case must pass, so
+  removing a flag or a line makes that case a test the layer must pass
+  from then on.
+- **Conformance** (`--conformance`): the flags and the lists are
+  ignored. Every case runs as a test, and its real outcome is recorded.
+  A failure doesn't fail the run: this run measures, and the report is
+  made from it. It also lists the cases still marked not implemented
+  that pass, whose flags can come off.
 - **No issue per case.** The flags and the lists are the record of
   what's missing.
 - **A limitation is a gap, not a difference.** What the layer can't do
@@ -246,10 +257,11 @@ covers it yet.
 ## CI
 
 In `sql-layer.yml`:
-- **Every PR:** builds the server and runs every suite, with a small
-  TPROC-C load. A failing case, or a not-implemented case that passes,
-  fails the job. The report goes to the job's summary page;
-  `results.json` and `report.md` are uploaded.
+- **Every PR:** builds the server and runs the gate over every suite,
+  with a small TPROC-C load. A failing case fails the job. Then a
+  conformance run makes the report, which goes to the job's summary
+  page; `results.json` and `report.md` are uploaded. The conformance
+  run never fails the job.
 
 No job needs PostgreSQL: the expected values are in the files.
 
@@ -308,7 +320,9 @@ The owner's, 2026-10-25:
 4. **PostgreSQL writes our cases' expected results, and is not part of
    the test.**
 5. **The suites are the scope.** What the layer can't run yet is marked
-   not implemented, and a marked case that passes fails the run.
+   not implemented. The build skips marked cases, and must pass the
+   rest; a conformance run ignores the marks and runs everything, for
+   the report.
 6. **No issue per not-implemented case.**
 7. **Cases name the SQL features they cover, as metadata.** File names
    stay by area.
