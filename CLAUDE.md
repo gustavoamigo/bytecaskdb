@@ -5,7 +5,7 @@
 ByteCaskDB: an embedded key-value store in C++23 (Bitcask-style append-only files, in-memory persistent B+ tree key directory). Read the file you need, not all of them:
 
 - `README.md`: what the project is, quick start, build commands. Kept short on purpose.
-- `docs/bytecask_design.md`: design reference and the complete feature list.
+- `docs/bytecask_design.md`: design reference and the complete feature list. Large: list its sections with `grep -n '^##' docs/bytecask_design.md` (headings say what each section covers), then read the range you need.
 - `CONTRACT.md`: what the engine guarantees, with the test proving each row.
 - `include/bytecask.hpp`, `docs/api_reference.md`: the public API and usage examples.
 - `docs/project_organization.md`: repository layout, build systems, license boundaries.
