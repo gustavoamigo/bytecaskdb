@@ -1,0 +1,406 @@
+# Types: what each column type keeps, rounds and refuses. Values go in by
+# parameter as text, and come back in PostgreSQL's text form.
+
+- name: SMALLINT, INTEGER and BIGINT keep their values
+  features: [E011-01]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v BIGINT)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, "9223372036854775807"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "-9223372036854775808"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [3, "0"]
+      rowcount: 1
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, "9223372036854775807"], [2, "-9223372036854775808"], [3, 0]]
+  teardown:
+    - DROP TABLE t
+
+- name: an INTEGER column refuses a value past 2147483647
+  features: [E011-01]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, "2147483647"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "2147483648"]
+      error: "22003"
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 2147483647]]
+  teardown:
+    - DROP TABLE t
+
+- name: a SMALLINT column refuses a value past 32767
+  features: [E011-01]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v SMALLINT)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, "32767"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "-32768"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [3, "32768"]
+      error: "22003"
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 32767], [2, -32768]]
+  teardown:
+    - DROP TABLE t
+
+- name: an integer parameter that isn't a number is refused
+  features: [E011-01]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, "12"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "x"]
+      error: "22P02"
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 12]]
+  teardown:
+    - DROP TABLE t
+
+- name: DECIMAL keeps its scale
+  features: [E011-03]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v DECIMAL(5,2))
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, "1.5"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "0.01"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [3, "-999.99"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [4, "100"]
+      rowcount: 1
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, "1.50"], [2, "0.01"], [3, "-999.99"], [4, "100.00"]]
+  teardown:
+    - DROP TABLE t
+
+- name: DECIMAL rounds a longer fraction to its scale
+  features: [E011-03]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v DECIMAL(5,2))
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, "1.005"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "2.994"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [3, "-1.005"]
+      rowcount: 1
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, "1.01"], [2, "2.99"], [3, "-1.01"]]
+  teardown:
+    - DROP TABLE t
+
+- name: DECIMAL refuses a value that needs more digits than it has
+  features: [E011-03]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v DECIMAL(5,2))
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, "999.99"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "1000"]
+      error: "22003"
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, "999.99"]]
+  teardown:
+    - DROP TABLE t
+
+- name: DOUBLE PRECISION keeps what a double can hold
+  features: [E011-02]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v DOUBLE PRECISION)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, "1.5"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "-0.25"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [3, "1e100"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [4, "0"]
+      rowcount: 1
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, "1.5"], [2, "-0.25"], [3, "1e+100"], [4, 0]]
+  teardown:
+    - DROP TABLE t
+
+- name: REAL keeps a float's precision
+  features: [E011-02]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v REAL)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, "1.5"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "0.1"]
+      rowcount: 1
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, "1.5"], [2, "0.1"]]
+  teardown:
+    - DROP TABLE t
+
+- name: a VARCHAR(n) column refuses a longer value
+  features: [E021-02]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR(3))
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, "abc"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "ab"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [3, "abcd"]
+      error: "22001"
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, abc], [2, ab]]
+  teardown:
+    - DROP TABLE t
+
+- name: VARCHAR(n) counts characters, not bytes
+  features: [E021-02]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR(3))
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, "ééé"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "éééé"]
+      error: "22001"
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, ééé]]
+  teardown:
+    - DROP TABLE t
+
+- name: TEXT keeps any length and UTF-8
+  features: [pg:text-type]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, ""]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "a longer string with spaces"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [3, "日本語"]
+      rowcount: 1
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, ""], [2, a longer string with spaces], [3, 日本語]]
+  teardown:
+    - DROP TABLE t
+
+- name: text compares as bytes (C collation)
+  features: [E021-12]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR(5))
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, "a"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "B"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [3, "b"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [4, "A"]
+      rowcount: 1
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY v, id
+      params: [0]
+      # Written by hand: PostgreSQL orders by the database's locale; the layer compares
+      # text as bytes (types_design.md, Types), so capital letters come first.
+      expected: [[4, A], [2, B], [1, a], [3, b]]
+  teardown:
+    - DROP TABLE t
+
+- name: BOOLEAN reads back as t and f
+  features: [T031]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v BOOLEAN)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, "true"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "false"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [3, null]
+      rowcount: 1
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, t], [2, f], [3, null]]
+  teardown:
+    - DROP TABLE t
+
+- name: DATE keeps a day and orders by it
+  features: [F051-01]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v DATE)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, "2026-10-25"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "0001-01-01"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [3, "2026-02-28"]
+      rowcount: 1
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY v
+      params: [0]
+      expected: [[2, "0001-01-01"], [3, "2026-02-28"], [1, "2026-10-25"]]
+  teardown:
+    - DROP TABLE t
+
+- name: a DATE that isn't a date is refused
+  features: [F051-01]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v DATE)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, "2026-10-25"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "2026-02-30"]
+      error: "22008"
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, "2026-10-25"]]
+  teardown:
+    - DROP TABLE t
+
+- name: TIMESTAMP keeps microseconds
+  features: [F051-03]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v TIMESTAMP)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, "2026-10-25 12:34:56.123456"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "2026-10-25 00:00:00"]
+      rowcount: 1
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, "2026-10-25 12:34:56.123456"], [2, "2026-10-25 00:00:00"]]
+  teardown:
+    - DROP TABLE t
+
+- name: TIME keeps a time of day
+  features: [F051-02]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v TIME)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, "12:34:56"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "23:59:59.5"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [3, "24:00:00"]
+      rowcount: 1
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, "12:34:56"], [2, 23:59:59.5], [3, "24:00:00"]]
+  teardown:
+    - DROP TABLE t
+
+- name: BYTEA keeps its bytes
+  features: [pg:bytea]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v BYTEA)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, "\\x00ff"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "\\x"]
+      rowcount: 1
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, \x00ff], [2, \x]]
+  teardown:
+    - DROP TABLE t
+
+- name: a NULL in every type
+  features: [E131]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, null]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, null]
+      rowcount: 1
+    - sql: SELECT id, v FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, null], [2, null]]
+  teardown:
+    - DROP TABLE t

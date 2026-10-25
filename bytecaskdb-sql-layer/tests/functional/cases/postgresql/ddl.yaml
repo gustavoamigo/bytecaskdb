@@ -1,0 +1,293 @@
+# DDL: tables, columns, defaults, constraints and indexes, and what the layer
+# refuses.
+
+- name: CREATE TABLE then DROP TABLE
+  features: [F031-01, F031-13]
+  steps:
+    - sql: CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 1]
+      rowcount: 1
+    - sql: DROP TABLE t
+    - sql: SELECT id FROM t WHERE id = $1
+      params: [1]
+      error: "42P01"
+  teardown:
+    - DROP TABLE t
+
+- name: CREATE TABLE of a name in use is refused
+  features: [F031-01]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: CREATE TABLE t (id INTEGER PRIMARY KEY)
+      error: "42P07"
+  teardown:
+    - DROP TABLE t
+
+- name: DROP TABLE of a table that is not there is refused
+  features: [F031-13]
+  steps:
+    - sql: DROP TABLE nope
+      error: "42P01"
+
+- name: DROP TABLE IF EXISTS of a table that is not there
+  features: [pg:if-exists]
+  steps:
+    - sql: DROP TABLE IF EXISTS nope
+
+- name: CREATE TABLE IF NOT EXISTS of a name in use does nothing
+  features: [pg:if-not-exists]
+  # the layer refuses it with 42P07; PostgreSQL skips the statement with a notice
+  unimplemented: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 1]
+      rowcount: 1
+    - sql: CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)
+    - sql: SELECT id, v FROM t WHERE id = $1
+      params: [1]
+      expected: [[1, 1]]
+  teardown:
+    - DROP TABLE t
+
+- name: ADD COLUMN gives existing rows NULL
+  features: [F031-04]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: ALTER TABLE t ADD COLUMN z INTEGER
+    - sql: SELECT id, z FROM t WHERE id >= $1
+      params: [0]
+      expected: [[1, null], [2, null]]
+    - sql: UPDATE t SET z = $1 WHERE id = $2
+      params: [5, 1]
+      rowcount: 1
+    - sql: SELECT id, z FROM t WHERE id >= $1
+      params: [0]
+      expected: [[1, 5], [2, null]]
+  teardown:
+    - DROP TABLE t
+
+- name: ADD COLUMN with a DEFAULT fills existing rows
+  features: [F031-04, E141-04]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: ALTER TABLE t ADD COLUMN z INTEGER DEFAULT 7
+    - sql: SELECT id, z FROM t WHERE id >= $1
+      params: [0]
+      expected: [[1, 7], [2, 7]]
+  teardown:
+    - DROP TABLE t
+
+- name: ADD COLUMN of a name in use is refused
+  features: [F031-04]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: ALTER TABLE t ADD COLUMN v INTEGER
+      error: "42701"
+  teardown:
+    - DROP TABLE t
+
+- name: a DEFAULT fills an omitted column
+  features: [E141-04]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER DEFAULT 5)
+  steps:
+    - sql: INSERT INTO t (id) VALUES ($1)
+      params: [1]
+      rowcount: 1
+    - sql: SELECT id, v FROM t WHERE id = $1
+      params: [1]
+      expected: [[1, 5]]
+  teardown:
+    - DROP TABLE t
+
+- name: NOT NULL refuses a NULL, on INSERT and UPDATE
+  features: [E141-01]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 1]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, null]
+      error: "23502"
+    - sql: UPDATE t SET v = $1 WHERE id = $2
+      params: [null, 1]
+      error: "23502"
+    - sql: SELECT id, v FROM t WHERE id >= $1
+      params: [0]
+      expected: [[1, 1]]
+  teardown:
+    - DROP TABLE t
+
+- name: an omitted NOT NULL column with no DEFAULT is refused
+  features: [E141-01]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)
+  steps:
+    - sql: INSERT INTO t (id) VALUES ($1)
+      params: [1]
+      error: "23502"
+  teardown:
+    - DROP TABLE t
+
+- name: a primary key column takes no NULL
+  features: [E141-08]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [null, 1]
+      error: "23502"
+  teardown:
+    - DROP TABLE t
+
+- name: a dropped index is gone, and the table still works
+  features: [F031-01]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - CREATE INDEX t_v ON t (v)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [3, 30]
+      rowcount: 1
+    - sql: DROP INDEX t_v
+    - sql: SELECT id FROM t WHERE v = $1
+      params: [20]
+      expected: [[2]]
+    - sql: DROP INDEX t_v
+      error: "42704"
+  teardown:
+    - DROP TABLE t
+
+- name: an index on an existing table covers its rows
+  features: [F031-01]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [3, 30]
+      rowcount: 1
+    - sql: CREATE INDEX t_v ON t (v)
+    - sql: SELECT id FROM t WHERE v = $1
+      params: [20]
+      expected: [[2]]
+  teardown:
+    - DROP TABLE t
+
+- name: a UNIQUE index on a column that already holds duplicates is refused
+  features: [pg:unique-nulls-distinct]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 5]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, 5]
+      rowcount: 1
+    - sql: CREATE UNIQUE INDEX t_v ON t (v)
+      error: "23505"
+  teardown:
+    - DROP TABLE t
+
+- name: a table with no primary key
+  features: [F031-01]
+  # a table needs a PRIMARY KEY (frontend_design.md, What the layer doesn't do yet)
+  unimplemented: true
+  steps:
+    - sql: CREATE TABLE n (a INTEGER)
+  teardown:
+    - DROP TABLE n
+
+- name: a CHECK constraint
+  features: [E141-06]
+  # column constraint not supported
+  unimplemented: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v > 0))
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 1]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, -1]
+      error: "23514"
+  teardown:
+    - DROP TABLE t
+
+- name: a FOREIGN KEY constraint
+  features: [E141-04]
+  # column constraint not supported
+  unimplemented: true
+  setup:
+    - CREATE TABLE r (id INTEGER PRIMARY KEY)
+    - CREATE TABLE f (id INTEGER PRIMARY KEY, r INTEGER REFERENCES r (id))
+  steps:
+    - sql: INSERT INTO r VALUES ($1)
+      params: [1]
+      rowcount: 1
+    - sql: INSERT INTO f VALUES ($1, $2)
+      params: [1, 1]
+      rowcount: 1
+    - sql: INSERT INTO f VALUES ($1, $2)
+      params: [2, 9]
+      error: "23503"
+  teardown:
+    - DROP TABLE f
+    - DROP TABLE r
+
+- name: a view
+  features: [F031-02]
+  # statement not supported
+  unimplemented: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [3, 30]
+      rowcount: 1
+    - sql: CREATE VIEW vw AS SELECT id FROM t WHERE id >= 1
+    - sql: SELECT id FROM vw WHERE id >= $1
+      params: [0]
+      expected: [[1], [2], [3]]
+  teardown:
+    - DROP VIEW vw
+    - DROP TABLE t
