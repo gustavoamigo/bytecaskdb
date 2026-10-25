@@ -1,0 +1,1 @@
+SELECT a, count(DISTINCT v) FROM p GROUP BY a

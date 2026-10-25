@@ -14,6 +14,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import decimal
+import math
 import re
 import struct
 
@@ -35,6 +36,21 @@ RANGE_STATES = frozenset(state for _, state in bytecask_sql._range_messages())
 # A statement in a transaction an earlier statement failed in.
 ABORTED = "25P02"
 
+# A statement the layer does not support.
+NOT_SUPPORTED = "0A000"
+
+# The kind of the planner's refusal (planner_design.md, *What the search
+# refuses*): the layer raises bytecask_sql.FeatureNotSupported for it.
+# PostgreSQL never reports this kind, so a planner refusal never agrees
+# with PostgreSQL, whatever PostgreSQL did with the statement.
+NO_PLAN = "no plan"
+
+
+def is_no_plan(out: "Outcome") -> bool:
+    """Whether the layer refused the statement as the planner refuses one."""
+    return out.no_plan
+
+
 # The SQLSTATEs of the binder's and the catalog's refusals that PostgreSQL
 # gives the same statement (SqlError.sqlstate): a statement both refuse must
 # be refused with the same one. The layer claims one only where PostgreSQL
@@ -43,23 +59,26 @@ ABORTED = "25P02"
 BINDER_STATES = frozenset(
     {
         "42P01", "42P07", "42703", "42704", "42804", "42P18", "42883", "42702", "42701", "42803", "42809",
-        "0A000",  # FOR UPDATE with an aggregate; but see LAYER_ONLY
+        "0A000",  # FOR UPDATE with an aggregate; but see layer_only
         "22003",  # a literal operand past DECIMAL's digits, as a stored value past its column
     }
 )
 
-# 0A000 is also the layer's own rule that a table needs a PRIMARY KEY, which
-# PostgreSQL does not have. The state alone cannot tell the two apart, so the
-# statement does: a CREATE TABLE refused with 0A000 is the layer's rule, kind
-# "refused", never compared.
-LAYER_ONLY = (("0A000", "CREATE TABLE"),)
+# 0A000 is also one of the layer's own rules, which PostgreSQL does not
+# have: a table needs a PRIMARY KEY. The state alone cannot tell it from FOR
+# UPDATE with an aggregate, so the statement does: a CREATE TABLE refused
+# with 0A000 is the layer's rule, kind "refused", never compared. The
+# planner's refusal, also 0A000, is told by its class (run_layer: NO_PLAN).
+def layer_only(state: str, sql: str) -> bool:
+    """Whether a refusal with this SQLSTATE is one of the layer's own rules."""
+    return state == NOT_SUPPORTED and sql.lstrip().upper().startswith("CREATE TABLE")
 
 
 def error_kind(state: str, sql: str) -> str:
     """The comparable kind of a refusal of `sql` with this SQLSTATE: the
-    SQLSTATE where both sides name it, "refused" for any other and for a
-    LAYER_ONLY one."""
-    if any(state == s and sql.lstrip().upper().startswith(prefix) for s, prefix in LAYER_ONLY):
+    SQLSTATE where both sides name it, "refused" for any other and for one
+    of the layer's own rules (layer_only)."""
+    if layer_only(state, sql):
         return "refused"
     known = state in SQLSTATE.values() or state in RANGE_STATES or state in BINDER_STATES or state == ABORTED
     return state if known else "refused"
@@ -124,10 +143,11 @@ class Outcome:
     """What one statement did: rows and the affected count, or a refusal.
 
     `error` is None when it ran, a SQLSTATE for a constraint both sides
-    name (a constraint's, a binder refusal's: BINDER_STATES), or "refused"
-    for any other error: the layer's other SqlErrors, and any other
-    PostgreSQL error. `affected` is the rows an INSERT, UPDATE or
-    DELETE changed, None for any other statement.
+    name (a constraint's, a binder refusal's: BINDER_STATES), NO_PLAN for
+    the planner's refusal, which nothing on PostgreSQL's side equals, or
+    "refused" for any other error: the layer's other SqlErrors and its own
+    rules (layer_only), and any other PostgreSQL error. `affected` is the
+    rows an INSERT, UPDATE or DELETE changed, None for any other statement.
     """
 
     error: str | None = None
@@ -140,6 +160,9 @@ class Outcome:
     # The rows as their text format's bytes, with each column's type OID:
     # what PostgreSQL and the server send. Empty from the embedded layer.
     text: tuple = ()
+    # The layer raised bytecask_sql.FeatureNotSupported: the planner found
+    # no plan. Set by run_layer only.
+    no_plan: bool = False
 
 
 def strict(rows) -> tuple:
@@ -153,11 +176,23 @@ def strict(rows) -> tuple:
     return tuple(tuple(one(v) for v in row) for row in rows)
 
 
+# A NaN in a sort key: PostgreSQL orders every NaN equal to every other.
+_NAN = ("NaN",)
+
+
+def ordering(k: tuple) -> tuple:
+    """A sort key as PostgreSQL compares it: a NaN equal to any other NaN,
+    -0.0 equal to 0.0 as in Python."""
+    return tuple(_NAN if isinstance(v, float) and math.isnan(v) else v for v in k)
+
+
 def same_rows(layer: tuple, full: tuple, key, limit: int | None) -> str | None:
     """Whether the layer's rows are a correct answer, given PostgreSQL's
     rows without the LIMIT: in order of `key` (None: no ORDER BY), each run
-    of equal keys the same multiset, and the run LIMIT cuts drawn from
-    PostgreSQL's. A reason when they are not."""
+    of equal keys, as PostgreSQL orders them, the same multiset, and the run
+    LIMIT cuts drawn from PostgreSQL's. A reason when they are not."""
+    if key is not None:
+        key = (lambda k: lambda r: ordering(k(r)))(key)
     want = len(full) if limit is None else min(limit, len(full))
     if len(layer) != want:
         return f"{len(layer)} rows, expected {want}"
@@ -209,22 +244,25 @@ def literal(t: Type, v) -> str:
 TOKEN = re.compile(r"'(?:[^']|'')*'|\$(\d+)|%|[^'$%]+|.", re.S)
 
 
-def pg_params(sql: str, params, placeholder: str = "%s") -> tuple[str, list | None]:
-    """$n placeholders to psycopg's (%s, or %t for text format), the
-    parameters in their order. With parameters, psycopg reads every % as a
-    placeholder's, so a literal % becomes %%; a $n inside a string literal
-    is text. A statement without parameters goes as written."""
+def pg_params(sql: str, params, placeholder: str = "s") -> tuple[str, dict | None]:
+    """$n placeholders to psycopg's named ones (%(pn)s, or %(pn)t for text
+    format), and the parameters by name. A name used twice is one parameter,
+    so a $n the statement reuses stays one $n, typed by its first use, as
+    written. With parameters, psycopg reads every % as a placeholder's, so a
+    literal % becomes %%; a $n inside a string literal is text. A statement
+    without parameters goes as written."""
     if not params:
         return sql, None
-    out, order = [], []
+    out, values = [], {}
     for m in TOKEN.finditer(sql):
         token = m.group(0)
         if m.group(1) is not None:
-            order.append(int(m.group(1)) - 1)
-            out.append(placeholder)
+            n = int(m.group(1))
+            values[f"p{n}"] = params[n - 1]
+            out.append(f"%(p{n}){placeholder}")
         else:
             out.append(token.replace("%", "%%"))
-    return "".join(out), [params[i] for i in order]
+    return "".join(out), values
 
 
 FLOAT4_OID = 700
@@ -255,6 +293,8 @@ def run_layer(db, sql: str, params=()) -> Outcome:
         if e.constraint is None:
             raise
         return Outcome(error=layer_sqlstate(e), detail=str(e), sqlstate=e.sqlstate)
+    except bytecask_sql.FeatureNotSupported as e:
+        return Outcome(error=NO_PLAN, detail=str(e), sqlstate=e.sqlstate, no_plan=True)
     except bytecask_sql.SqlError as e:
         return Outcome(error=error_kind(e.sqlstate, sql), detail=str(e), sqlstate=e.sqlstate)
     return Outcome(rows=tuple(r["rows"]), affected=r["affected"] if changes_rows(sql) else None)
@@ -295,8 +335,9 @@ def run_psycopg(conn, text: str, values, sql: str) -> Outcome:
 
 def run_pg_numbered(conn, sql: str, params=()) -> Outcome:
     """A statement on PostgreSQL with its $n as written, every parameter
-    untyped. psycopg numbers a placeholder by its position, so run_pg cannot
-    send a statement whose $1 no use gives a type (42P18)."""
+    untyped, so PostgreSQL types each $n by its uses, as the layer does, and
+    refuses one no use types (42P18). run_pg sends each parameter typed as
+    psycopg adapts it, so it cannot send an untyped $1."""
     import psycopg
 
     res = conn.pgconn.exec_params(sql.encode(), [None if v is None else str(v).encode() for v in params])
@@ -315,5 +356,5 @@ def run_wire(conn, sql: str, params=()) -> Outcome:
     """A statement on sql_layer_server, as the layer's text with its $n: each
     parameter goes as text (%t), so the server reads it as the type it
     inferred, as it reads HammerDB's."""
-    text, values = pg_params(sql, params, "%t")
+    text, values = pg_params(sql, params, "t")
     return run_psycopg(conn, text, values, sql)

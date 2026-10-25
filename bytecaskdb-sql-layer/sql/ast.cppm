@@ -42,12 +42,23 @@ private:
   SqlState sqlstate_;
 };
 
+// A statement the layer does not support where it was given, the API's
+// FeatureNotSupported (api/database.cppm): SQLSTATE 0A000. Here, below the
+// planner, so the planner can refuse with it.
+class FeatureNotSupported : public std::logic_error {
+public:
+  using std::logic_error::logic_error;
+  FeatureNotSupported(const FeatureNotSupported&) = default;
+  FeatureNotSupported& operator=(const FeatureNotSupported&) = default;
+  ~FeatureNotSupported() override;  // out of line: anchors the vtable (-Wweak-vtables)
+};
+
 // A select-list, SET or comparison operand: a column, a parameter, an
 // integer literal, a sum or difference of two, or an aggregate: COUNT(*),
-// COUNT([DISTINCT] column), SUM(column) or MIN(column).
+// COUNT([DISTINCT] column), SUM, MIN, MAX or AVG of a column.
 struct Expr {
   enum class Kind { Column, Param, Const, Add, Sub, Aggregate };
-  enum class Fn { Count, Sum, Min };
+  enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind;
   std::string column;       // Column; Aggregate's argument, "" for COUNT(*)
   std::uint32_t param{0};   // Param: zero-based ($1 is 0)
@@ -139,6 +150,9 @@ struct OrderItem {
   bool desc{false};
   std::int32_t pos{-1};
   std::string table;  // the table it is qualified by, "" for none
+  // NULLS FIRST (true) or NULLS LAST (false); nullopt for PostgreSQL's
+  // default, last under ASC and first under DESC.
+  std::optional<bool> nulls_first;
 };
 
 struct Select {
@@ -151,6 +165,8 @@ struct Select {
   std::int32_t pos{-1};
   bool for_update{false};  // FOR UPDATE: a guard on each row returned, never a lock
   std::int32_t table_pos{-1}, join_pos{-1};  // where table and join are named
+  std::vector<Expr> group_by;  // GROUP BY's columns, as written
+  std::vector<Compare> having;  // HAVING's conjuncts
 };
 
 struct Assignment {
@@ -180,5 +196,6 @@ using Statement =
 namespace bytecask::sql::ast {
 
 SqlError::~SqlError() = default;
+FeatureNotSupported::~FeatureNotSupported() = default;
 
 }  // namespace bytecask::sql::ast

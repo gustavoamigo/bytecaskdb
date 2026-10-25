@@ -1,17 +1,13 @@
 /* SPDX-License-Identifier: MIT
    Copyright (c) 2026 Gustavo Amigo
 
-   bc_plan.h — the plan API of docs/plan_api_design.md (revision 5). A plan is
+   bc_plan.h — the plan API of docs/plan_api_design.md (revision 7). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
    and bc_params are opaque here and built by the runtime
    (algebra/runtime.cppm, module bytecask.sql.runtime).
 
-   Implemented: the runtime, parameters and results, arithmetic, keys, reads,
-   rows and columns, writes, guards, and the aggregates' groups (bc_agg_open
-   with no slots, bc_agg_group, bc_agg_next). The other ephemeral structures
-   (sorters, hash tables) and the aggregates' slots are not implemented yet:
-   each of their calls sets BC_E_HANDLE and returns a neutral value. */
+   Every call is implemented. */
 
 #ifndef BC_PLAN_H
 #define BC_PLAN_H
@@ -25,16 +21,19 @@ extern "C" {
 
 typedef struct bc_ctx bc_ctx;                       /* opaque; one per executing plan */
 
-/* Handles: an index and a generation, each in its own struct type. */
-typedef struct { uint32_t i, g; } bc_view;          /* bytes the API owns */
-typedef struct { uint32_t i, g; } bc_cursor;
-typedef struct { uint32_t i, g; } bc_sorter;
-typedef struct { uint32_t i, g; } bc_hash;
-typedef struct { uint32_t i, g; } bc_hash_iter;
-typedef struct { uint32_t i, g; } bc_agg;
-typedef struct { uint32_t i, g; } bc_group;
-typedef struct { uint32_t i, g; } bc_key;           /* a key under construction */
-typedef struct { uint32_t i, g; } bc_row;           /* a row under construction */
+/* Handles: an index and a generation, each in its own struct type. The
+   generation is 64 bits: one is drawn per handle, and it never repeats
+   within a context. */
+typedef struct { uint32_t i; uint64_t g; } bc_view;   /* bytes the API owns */
+typedef struct { uint32_t i; uint64_t g; } bc_cursor;
+typedef struct { uint32_t i; uint64_t g; } bc_sorter;
+typedef struct { uint32_t i; uint64_t g; } bc_hash;
+typedef struct { uint32_t i; uint64_t g; } bc_hash_iter;
+typedef struct { uint32_t i; uint64_t g; } bc_agg;
+typedef struct { uint32_t i; uint64_t g; } bc_group;
+typedef struct { uint32_t i; uint64_t g; } bc_key;    /* a table's or index's key under construction */
+typedef struct { uint32_t i; uint64_t g; } bc_sort_key;  /* a sort key under construction */
+typedef struct { uint32_t i; uint64_t g; } bc_row;    /* a row under construction */
 
 typedef void (*bc_plan_fn)(bc_ctx *);               /* every plan has this signature */
 
@@ -42,9 +41,9 @@ enum bc_error_code {
   BC_OK = 0,
   BC_E_IO,          /* std::system_error from the engine */
   BC_E_CORRUPT,     /* CRC mismatch or unparseable record */
-  BC_E_MEMORY,      /* arena exhausted or an ephemeral bound exceeded */
+  BC_E_MEMORY,      /* an allocation failed (std::bad_alloc) */
   BC_E_BUDGET,      /* work budget or deadline exhausted */
-  BC_E_LIMIT,       /* key or value over the engine's limits */
+  BC_E_LIMIT,       /* key, value or write plan over the engine's limits, or the statement over its memory budget */
   BC_E_HANDLE,      /* stale, foreign or out-of-range handle, or a table, index or column the plan's
                        bc_schema_ref does not declare, or not of the type used: a plan bug */
   BC_E_ARITH,       /* integer overflow, division by zero, out-of-range conversion */
@@ -87,7 +86,8 @@ enum bc_layout_detail {  /* the detail of BC_E_LAYOUT; every BC_E_LAYOUT carries
 enum bc_commit_result { BC_COMMITTED, BC_CONFLICT, BC_FAILED /* see bc_error */ };
 
 typedef struct {
-  uint64_t max_reads;       /* record reads and cursor steps, together */
+  uint64_t max_reads;       /* record reads and cursor steps, together; 0 = none */
+  uint64_t max_bytes;       /* memory the statement holds, as bytes requested; 0 = none */
   uint64_t deadline_ns;     /* monotonic; 0 = none */
 } bc_budget;
 
@@ -120,7 +120,7 @@ typedef struct {
 enum bc_type { BC_T_I64 = 1, BC_T_F64 = 2, BC_T_BOOL = 3, BC_T_BYTES = 4 };
 
 /* Runtime: creating, running and committing. Called by the server, never by a plan. */
-bc_ctx *bc_ctx_new(bc_db *db, const bc_catalog *cat, uint32_t arena_bytes);
+bc_ctx *bc_ctx_new(bc_db *db, const bc_catalog *cat);
 void    bc_ctx_free(bc_ctx *);
 void    bc_ctx_begin(bc_ctx *, const bc_params *params, bc_budget budget);  /* takes the snapshot */
 void    bc_ctx_run(bc_ctx *, bc_plan_fn plan, const bc_schema_ref *checked_against);
@@ -222,6 +222,25 @@ bool     bc_key_fits(bc_ctx *, bc_key);  /* the key so far is within the engine'
 bc_view  bc_key_params(bc_ctx *, uint32_t table_or_index, uint32_t first, uint32_t n);  /* parts from params first.. */
 bc_view  bc_key_successor(bc_ctx *, bc_view key);     /* smallest key greater than every key with this prefix */
 
+/* Sort keys: what a sorter orders by, built from parts the plan chooses, each
+   with a direction and a NULL placement. memcmp order on the key is
+   PostgreSQL's ORDER BY order, part by part, with text compared bytewise
+   (the layer's one collation). Each part is a marker byte, never inverted,
+   then the value, inverted under DESC: NULLS FIRST or LAST whatever the
+   direction. A sort key is no table's or index's: its handle is its own
+   type, which bc_key_* do not take. A part that could take the key past
+   UINT32_MAX bytes is BC_E_LIMIT. */
+enum bc_sort_dir   { BC_SORT_ASC = 0, BC_SORT_DESC = 1 };
+enum bc_sort_nulls { BC_SORT_NULLS_LAST = 0, BC_SORT_NULLS_FIRST = 1 };
+bc_sort_key bc_sort_key_begin(bc_ctx *);
+void     bc_sort_key_i64(bc_ctx *, bc_sort_key, int64_t, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_f64(bc_ctx *, bc_sort_key, double, uint32_t dir, uint32_t nulls);   /* -0.0 is 0.0; NaN above +inf */
+void     bc_sort_key_bool(bc_ctx *, bc_sort_key, bool, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_bytes(bc_ctx *, bc_sort_key, bc_view, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_null(bc_ctx *, bc_sort_key, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_col(bc_ctx *, bc_sort_key, bc_view row, uint32_t col, uint32_t dir, uint32_t nulls);  /* NULL included */
+bc_view  bc_sort_key_end(bc_ctx *, bc_sort_key);
+
 /* Reads */
 bc_view   bc_get(bc_ctx *, bc_view key, bool *found);
 bool      bc_exists(bc_ctx *, bc_view key);
@@ -269,22 +288,23 @@ void     bc_row_set_bytes(bc_ctx *, bc_row, uint32_t col, bc_view);
 void     bc_row_set_null(bc_ctx *, bc_row, uint32_t col);
 void     bc_row_set_param(bc_ctx *, bc_row, uint32_t col, uint32_t i);   /* parameter i, NULL included */
 bc_view  bc_row_end(bc_ctx *, bc_row);
-bc_view  bc_pin(bc_ctx *, bc_view);                 /* copy into the arena: lives until reset */
+bc_view  bc_pin(bc_ctx *, bc_view);                 /* a copy that lives until reset */
 
 /* Ephemeral structures */
-bc_sorter bc_sorter_open(bc_ctx *, uint32_t bytes);
+bc_sorter bc_sorter_open(bc_ctx *, int64_t keep);        /* keep the first `keep` in sort order; 0 = all */
 void      bc_sorter_add(bc_ctx *, bc_sorter, bc_view sort_key, bc_view payload);
 int64_t   bc_sorter_count(bc_ctx *, bc_sorter);
 bc_view   bc_sorter_nth(bc_ctx *, bc_sorter, int64_t n);
 bool      bc_sorter_next(bc_ctx *, bc_sorter, bc_view *payload);
 
-bc_hash      bc_hash_open(bc_ctx *, uint32_t bytes);
+bc_hash      bc_hash_open(bc_ctx *);
 void         bc_hash_put(bc_ctx *, bc_hash, bc_view key, bc_view payload);
 bc_hash_iter bc_hash_find(bc_ctx *, bc_hash, bc_view key);
 bool         bc_hash_next(bc_ctx *, bc_hash_iter, bc_view *payload);
 
-bc_agg    bc_agg_open(bc_ctx *, uint32_t bytes, uint32_t slots);
+bc_agg    bc_agg_open(bc_ctx *, uint32_t slots);
 bc_group  bc_agg_group(bc_ctx *, bc_agg, bc_view group_key);
+void      bc_agg_clear(bc_ctx *, bc_agg);                              /* drops every group, releasing its bytes */
 void      bc_agg_add_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);   /* overflow → BC_E_ARITH */
 void      bc_agg_add_f64(bc_ctx *, bc_group, uint32_t slot, double);
 void      bc_agg_min_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);
@@ -293,6 +313,7 @@ void      bc_agg_count(bc_ctx *, bc_group, uint32_t slot);
 bool      bc_agg_next(bc_ctx *, bc_agg, bc_view *group_key, bc_group *g);
 int64_t   bc_agg_i64(bc_ctx *, bc_group, uint32_t slot);
 double    bc_agg_f64(bc_ctx *, bc_group, uint32_t slot);
+bool      bc_agg_null(bc_ctx *, bc_group, uint32_t slot);   /* no value folded in: SUM, MIN, MAX, AVG are NULL */
 
 /* Writes: rows, with every index entry the runtime derives from them */
 void bc_insert(bc_ctx *, uint32_t table, bc_view row);

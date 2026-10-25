@@ -94,7 +94,7 @@ costs one lookup in `Database::prepare`'s cache, keyed by the exact text.
 127.0.0.1:5432] [--database NAME] [--max-connections 100]
 [--sync AT_EVERY_COMMIT|AT_INTERVAL|AT_FILE_ROTATION] [--sync-interval-ms 1000]
 [--io-backend pread|mmap|buffer_pool] [--buffer-pool-size BYTES]
-[--buffer-pool-direct-io on|off]` serves one
+[--buffer-pool-direct-io on|off] [--statement-memory-bytes 67108864]` serves one
 database directory under one database name, by default the directory's
 last component. It opens the directory with `Database::open`, so it holds
 the engine's directory lock. The code is in `bytecaskdb-sql-layer/server/`:
@@ -153,6 +153,11 @@ with `O_DIRECT` unless `--buffer-pool-direct-io off`. They change where
 sealed-file reads are served from, not what is read
 (`docs/buffer_pool_design.md`). The pool must hold at least twice the
 engine's file size (default 64 MiB); a smaller one is refused at startup.
+
+**Memory.** `--statement-memory-bytes` is `DatabaseOptions::
+statement_memory_bytes`: the memory budget of every statement the server
+runs, 64 MiB by default (`plan_api_design.md`, *Memory*). A statement past
+it fails with 54000. 0 is refused at startup.
 
 **Threading.** One thread per connection, and an acceptor thread. A
 connection's thread reads a message, runs it on the embedded API, which
@@ -465,7 +470,10 @@ above:
 - floats as the shortest text that reads back to the same value, as
   `float8out` and `float4out` write it with `extra_float_digits` 1:
   exponent form below 1e-4 and from 1e15 (1e6 for `REAL`), `NaN`,
-  `Infinity` and `-Infinity`;
+  `Infinity` and `-Infinity`. Like PostgreSQL's Ryu, the digits must be
+  strictly closer to the value than to either neighbour: text that reads
+  back only by rounding a tie to even takes one more digit (`1e23` is
+  `9.999999999999999e+22`);
 - `t` and `f`;
 - `bytea` as `\x` and lower-case hex;
 - text as its bytes;
@@ -573,7 +581,9 @@ or string column, a join on columns of two types, and an unsupported
 assigns it: PostgreSQL types a `$n` by its first use, which for `UPDATE` is
 its `WHERE` before the `SET` the layer binds first, and refuses an untyped `$n`
 assigned to two columns of different types with `42P08` whatever the types.
-The planner's "no plan" refusals are among them (#541). HammerDB's driver sends
+The planner's "no plan" refusals are not among them: they are
+`FeatureNotSupported`, `0A000`, though PostgreSQL runs each statement
+(`planner_design.md`, *What the search refuses*). HammerDB's driver sends
 no statement that fails to bind.
 
 ## What it uses from the embedded API
@@ -766,8 +776,10 @@ The run script requires W ≥ the user count; the monitor is not a user.
   17; now every statement also goes through the server with psycopg, with
   every OID loaded as `str`. psycopg is set to send only what the server
   takes:
-  - text placeholders (`%t`), so parameters go in text format; psycopg's
-    default dumpers are binary for several types, which would be `0A000`;
+  - text placeholders (`%(pn)t`), so parameters go in text format; psycopg's
+    default dumpers are binary for several types, which would be `0A000`.
+    They are named by their `$n`, so a `$n` the statement uses twice is one
+    parameter, as written;
   - `prepare_threshold=None`, so it never prepares server-side or sends
     `DEALLOCATE ALL`;
   - no `SET` of any kind, `search_path` included. The wire results must match PostgreSQL's text,

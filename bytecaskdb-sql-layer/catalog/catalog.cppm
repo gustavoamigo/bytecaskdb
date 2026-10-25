@@ -848,6 +848,7 @@ auto sql_type_valid(SqlType t) -> bool {
     case SqlKind::Timestamp:
     case SqlKind::Date:
     case SqlKind::Time: return t.length == 0 && t.precision == 0 && t.scale == 0;
+    case SqlKind::Numeric: return false;  // AVG's result: no column is declared one
   }
   return false;  // a kind no build knows
 }
@@ -870,6 +871,7 @@ auto sql_type_name(SqlType t) -> std::string {
     case SqlKind::Timestamp: return "timestamp";
     case SqlKind::Date: return "date";
     case SqlKind::Time: return "time";
+    case SqlKind::Numeric: return "numeric";
   }
   return "?";
 }
@@ -926,7 +928,8 @@ auto compared_type(SqlType t) -> ComparedType {
     case SqlKind::Text:
     case SqlKind::Timestamp:
     case SqlKind::Date:
-    case SqlKind::Time: return same(t);
+    case SqlKind::Time:
+    case SqlKind::Numeric: return same(t);
   }
   return same(t);
 }
@@ -960,7 +963,8 @@ auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string> {
     case SqlKind::Boolean:
     case SqlKind::Bytea:
     case SqlKind::Text:
-    case SqlKind::Varchar: break;
+    case SqlKind::Varchar:
+    case SqlKind::Numeric: break;
   }
   return std::nullopt;
 }

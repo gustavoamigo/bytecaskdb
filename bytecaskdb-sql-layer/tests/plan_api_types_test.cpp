@@ -995,7 +995,7 @@ TEST_CASE("plan API: a charge of several units does not step over the deadline c
   // No read budget, and a deadline long past: the first check must fail.
   SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
   auto ref = sr.get();
-  CHECK(bc_execute(f.cx, step_by_five, &ref, &ps, {.max_reads = 0, .deadline_ns = 1}, false, 0) == BC_FAILED);
+  CHECK(bc_execute(f.cx, step_by_five, &ref, &ps, {.max_reads = 0, .max_bytes = 0, .deadline_ns = 1}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_BUDGET);
   CHECK(std::string{bc_error_message(f.cx)}.find("deadline") != std::string::npos);
 }

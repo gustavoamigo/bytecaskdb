@@ -11,8 +11,8 @@ void plan(bc_ctx *cx) {
     bc_emit_end(cx);
     return;
   }
-  int64_t m = 0;
-  bool seen = false;
+  int64_t x0_0 = 0;
+  bool xs0_0 = false;
   bc_view lo = bc_key_successor(cx, bc_key_params(cx, IDX_9, 0, 1));
   bc_key k0 = bc_key_begin(cx, IDX_9);
   bc_key_null(cx, k0);
@@ -21,16 +21,16 @@ void plan(bc_ctx *cx) {
   while (bc_scan_next(cx, c)) {
     bc_view key = bc_scan_key(cx, c);
     if (!bc_key_part_null(cx, IDX_9, key, PART_9_1)) {
-      int64_t v = bc_key_part_i64(cx, IDX_9, key, PART_9_1);
-      if (!seen || v < m) m = v;
-      seen = true;
+      int64_t v0_0 = bc_key_part_i64(cx, IDX_9, key, PART_9_1);
+      if (!xs0_0 || v0_0 < x0_0) x0_0 = v0_0;
+      xs0_0 = true;
     }
   }
   bc_emit_begin(cx);
-  if (seen) {
-    bc_emit_i64(cx, m);
-  } else {
+  if (!xs0_0) {
     bc_emit_null(cx);
+  } else {
+    bc_emit_i64(cx, x0_0);
   }
   bc_emit_end(cx);
 }

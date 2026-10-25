@@ -28,7 +28,8 @@
 // bytecask_sql.TransactionAborted (SQLSTATE 25P02) for a statement on a
 // transaction a statement failed in; bytecask_sql.TransactionResolutionUnknown
 // (08007) for a commit whose outcome is unknown; bytecask_sql.FeatureNotSupported
-// (0A000), a SqlError, for a DDL statement given to a transaction. A transaction whose commit
+// (0A000), a SqlError, for a DDL statement given to a transaction and for a
+// statement the planner can't plan ("no plan: ..."). A transaction whose commit
 // conflicts raises ExecError with conflict set (40001). All
 // derive from bytecask_sql.Error. Anything else, an engine refusal at run
 // time included, is nanobind's translation of the C++ exception.
@@ -144,6 +145,8 @@ auto bytes_view(const sql::Bytes& b) -> std::string_view {
 auto to_python(const sql::Value& v, sql::SqlType t) -> nb::object {
   if (std::holds_alternative<std::monostate>(v)) return nb::none();
   if (const auto* b = std::get_if<sql::Bytes>(&v)) {
+    // A NUMERIC: its text (sql::Rows).
+    if (t.kind == sql::SqlKind::Numeric) return nb::borrow(decimal_type)(nb::str(bytes_view(*b).data(), b->size()));
     if (t.kind == sql::SqlKind::Text || t.kind == sql::SqlKind::Varchar) {
       auto s = bytes_view(*b);
       auto* o = PyUnicode_DecodeUTF8(s.data(), std::ssize(s), "strict");
@@ -343,6 +346,16 @@ NB_MODULE(bytecask_sql, m) {
             (void)db.engine_for_testing().put({}, view(key), view(value));
           },
           "key"_a, "value"_a, "Test only: writes a key and value straight to the engine, past the layer's checks.")
+      .def(
+          "_alternatives",
+          [](sql::Database& db, std::string_view text, const nb::object& params) {
+            nb::list out;
+            for (const auto& r : db.alternatives_for_testing(text, to_values(params))) out.append(to_python(r));
+            return out;
+          },
+          "sql"_a, "params"_a = nb::tuple(),
+          "Test only: runs every plan the search costs for a SELECT, autocommit, and returns each one's result, "
+          "the cheapest plan's first.")
       .def("_conflict_on_every_commit", &sql::Database::conflict_on_every_commit_for_testing, "on"_a,
            "Test only: while on, every commit conflicts, so execute raises ExecError with conflict set.");
 

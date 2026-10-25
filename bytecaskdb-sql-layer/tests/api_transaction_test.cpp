@@ -11,13 +11,17 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -157,6 +161,295 @@ TEST_CASE("embedded API: a transaction past its buffer bound is BC_E_LIMIT and a
   CHECK(t.is_aborted());
   t.rollback();
   CHECK(balance(*db, 0) == std::nullopt);
+}
+
+TEST_CASE("embedded API: a transaction statement whose write set passes the transaction's bound is 54000 at the "
+          "statement",
+          "[sql][api][txn][memory]") {
+  sql_test::TempDir dir{"api_txn_ws"};
+  auto db = open_db(dir);
+  for (std::int64_t i = 1; i <= 200; ++i) db->execute("INSERT INTO acct VALUES ($1, $2)", {i, i});
+  auto t = db->begin({.max_bytes = 16u << 10});
+  t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1000}, std::int64_t{1}});
+  // One UPDATE of 200 rows: its write set passes 16 KiB as it grows, and the
+  // statement fails there, the transaction with it.
+  try {
+    (void)t.execute("UPDATE acct SET bal = bal + 1 WHERE id >= $1", {std::int64_t{1}});
+    FAIL("the statement passed the transaction's bound");
+  } catch (const ExecError& e) {
+    CHECK(e.code() == BC_E_LIMIT);
+    CHECK(sqlstate(e) == std::string_view{"54000"});
+  }
+  CHECK(t.is_aborted());
+  CHECK(t.commit() == CommitOutcome::RolledBack);
+  CHECK(balance(*db, 1000) == std::nullopt);
+  CHECK(balance(*db, 1) == 1);
+  CHECK(balance(*db, 200) == 200);
+  // Ten rows fit.
+  auto u = db->begin({.max_bytes = 16u << 10});
+  u.execute("UPDATE acct SET bal = bal + 1 WHERE id >= $1", {std::int64_t{191}});
+  CHECK(u.commit() == CommitOutcome::Committed);
+  CHECK(balance(*db, 200) == 201);
+}
+
+TEST_CASE("embedded API: a statement over its memory budget is 54000 and leaves nothing behind, alone or in a transaction",
+          "[sql][api][txn][memory]") {
+  CHECK_THROWS_AS(Database::open(sql_test::TempDir{"api_mem0"}.path(), {.statement_memory_bytes = 0}),
+                  std::invalid_argument);
+  sql_test::TempDir dir{"api_mem"};
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 4096});
+  db->execute("CREATE TABLE acct (id BIGINT PRIMARY KEY, bal BIGINT NOT NULL)");
+  for (std::int64_t i = 1; i <= 200; ++i) db->execute("INSERT INTO acct VALUES ($1, $2)", {i, i});
+  auto state = [](auto&& run) -> std::string {
+    try {
+      run();
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "00000";
+  };
+  // 200 result rows pass 4 KiB: a result row is held until the statement ends.
+  CHECK(state([&] { (void)db->execute("SELECT id, bal FROM acct WHERE id >= $1", {std::int64_t{1}}); }) == "54000");
+  // So do 200 rows updated: each built row goes when its scan step ends, but
+  // the write set it joins is held until commit. Nothing is committed.
+  CHECK(state([&] { (void)db->execute("UPDATE acct SET bal = bal + 1 WHERE id >= $1", {std::int64_t{1}}); }) ==
+        "54000");
+  CHECK(balance(*db, 1) == 1);
+  CHECK(balance(*db, 200) == 200);
+  // Two rows do not.
+  CHECK(state([&] { (void)db->execute("UPDATE acct SET bal = bal + 1 WHERE id >= $1", {std::int64_t{199}}); }) ==
+        "00000");
+  CHECK(balance(*db, 200) == 201);
+  // In a transaction it aborts the transaction: the earlier statement's write goes too.
+  auto t = db->begin();
+  t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1000}, std::int64_t{1}});
+  CHECK(state([&] { (void)t.execute("SELECT id, bal FROM acct WHERE id >= $1", {std::int64_t{1}}); }) == "54000");
+  CHECK(t.is_aborted());
+  CHECK(t.commit() == CommitOutcome::RolledBack);
+  CHECK(balance(*db, 1000) == std::nullopt);
+  CHECK(balance(*db, 1) == 1);
+  // The budget is each statement's: one under it runs.
+  CHECK(db->execute("SELECT id, bal FROM acct WHERE id >= $1", {std::int64_t{191}}).rows.size() == 10);
+}
+
+namespace {
+// A table `wide` of `rows` rows of about 100 bytes, n = id, seeded through
+// the engine in the layer's own encoding: a million INSERT statements would
+// cost a test far more than the UPDATE it is about.
+void seed_wide(Database& db, std::int64_t rows) {
+  db.execute("CREATE TABLE wide (id BIGINT PRIMARY KEY, n BIGINT NOT NULL, pad VARCHAR(100) NOT NULL)");
+  auto cat = db.live_catalog_for_testing().current();
+  const auto* t = cat->table("wide");
+  REQUIRE(t != nullptr);
+  const auto part = cat->key_layout(t->id)->parts[0];
+  const auto pad = sql_test::bytes(std::string(64, 'p'));
+  auto encoded = true;
+  std::size_t row_bytes = 0;
+  for (std::int64_t first = 0; first < rows; first += 10'000) {
+    bytecask::WritePlan plan;
+    for (auto id = first; id < std::min(rows, first + 10'000); ++id) {
+      RowWriter w{t->layout};
+      Bytes row, key;
+      encoded = encoded && w.set_i64(0, id) && w.set_i64(1, id) && w.set_bytes(2, pad) && w.finish(row);
+      row_bytes = row.size();
+      key_put_prefix(key, kNsRow, t->id);
+      key_put_i64(key, id, part);
+      plan.put(key, row);
+    }
+    REQUIRE(db.engine_for_testing().apply_batch({.sync = false}, std::move(plan)));
+  }
+  REQUIRE(encoded);
+  CHECK(row_bytes >= 90);
+  CHECK(row_bytes <= 110);
+}
+
+auto n_of(Database& db, std::int64_t id) -> std::int64_t {
+  auto row = db.execute("SELECT n FROM wide WHERE id = $1", {id});
+  REQUIRE(row.rows.size() == 1);
+  return std::get<std::int64_t>(row.rows[0][0]);
+}
+}  // namespace
+
+// A debug build, as the sanitizers run, takes a tenth of the rows under a
+// tenth of the budget in the bulk tests: the same ratio of rows to
+// budget, at a minute's less work. An optimised build, as CI's release run,
+// runs them as stated.
+#ifdef NDEBUG
+constexpr std::int64_t kBulkScale = 1;
+#else
+constexpr std::int64_t kBulkScale = 10;
+#endif
+
+TEST_CASE("embedded API: a sort compiled while its table was small gives way, as the table grows, to the index in its "
+          "order",
+          "[sql][api][memory]") {
+  sql_test::TempDir dir{"api_mem_grow"};
+  // A sorter of n rows holds at least 192 + 128 n bytes: past 511 rows, 64 KiB.
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  db->execute("CREATE TABLE g (id BIGINT PRIMARY KEY, x BIGINT NOT NULL, y BIGINT NOT NULL)");
+  db->execute("CREATE INDEX g_x ON g (x)");
+  auto insert = [&](std::int64_t from, std::int64_t to) {
+    for (auto i = from; i <= to; ++i) db->execute("INSERT INTO g VALUES ($1, $2, $3)", {i, (i * 7919) % 1000, i % 2});
+  };
+  insert(1, 10);
+  // Compiled at 10 rows: the full scan, filtered and sorted, costs less than
+  // g_x's scan, which fetches each row. The table's count picks between them
+  // each time the plan runs.
+  const auto& st = db->prepare("SELECT id FROM g WHERE y >= $1 ORDER BY x, id");
+  auto compiled = db->compilations();
+  auto in_order = [&] {
+    auto rows = db->execute(st, {std::int64_t{0}}).rows;
+    std::vector<std::pair<std::int64_t, std::int64_t>> got;
+    for (const auto& r : rows) {
+      auto id = std::get<std::int64_t>(r[0]);
+      got.emplace_back((id * 7919) % 1000, id);
+    }
+    return got.size() == rows.size() && std::ranges::is_sorted(got) ? got.size() : std::size_t{0};
+  };
+  CHECK(in_order() == 10);
+  REQUIRE(st.plan_source().find("int64_t count0 = bc_count_range(cx, TBL_") != std::string::npos);
+  // 1,000 rows: sorted, they would pass the budget (54000); the count takes
+  // g_x's scan, which holds a row at a time. Nothing recompiled.
+  insert(11, 1000);
+  CHECK(in_order() == 1000);
+  CHECK(db->compilations() == compiled);
+}
+
+TEST_CASE("embedded API: a hash join's choice by the budget counts each row's and key's bytes, so the build fits",
+          "[sql][api][memory][hash]") {
+  sql_test::TempDir dir{"api_mem_hash"};
+  // A row of b holds at least 12 + 8 + 9 x 8 = 92 bytes and its key 9, so a
+  // hash table of n of them at least 192 + n x (240 + 92 + 9): past 64 KiB
+  // from 192 rows. A threshold of the entries alone, 240 bytes each, would be
+  // 273.
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  db->execute("CREATE TABLE b (id BIGINT PRIMARY KEY, g BIGINT NOT NULL, j BIGINT, c1 BIGINT, c2 BIGINT, c3 BIGINT, "
+              "c4 BIGINT, c5 BIGINT, c6 BIGINT)");
+  db->execute("CREATE INDEX b_g ON b (g)");
+  db->execute("CREATE TABLE pr (id BIGINT PRIMARY KEY, v BIGINT)");
+  auto insert = [&](std::int64_t from, std::int64_t to) {
+    for (auto i = from; i <= to; ++i) {
+      db->execute("INSERT INTO b VALUES ($1, $2, $1, $1, $1, $1, $1, $1, $1)", {i, std::int64_t{1}});
+    }
+  };
+  insert(1, 20);
+  for (std::int64_t i = 1; i <= 30; ++i) db->execute("INSERT INTO pr VALUES ($1, $1)", {i});
+  // Compiled at 20 rows of b: the hash join built on b's range, which the
+  // plan counts against 192 when it runs.
+  const std::string sql = "SELECT b.id, pr.id FROM b, pr WHERE b.g = $1 AND pr.v = b.j";
+  const auto& st = db->prepare(sql);
+  auto compiled = db->compilations();
+  CHECK(db->execute(st, {std::int64_t{1}}).rows.size() == 20);
+  REQUIRE(st.plan_source().find("bc_hash_open") != std::string::npos);
+  REQUIRE(st.plan_source().find(", 192);") != std::string::npos);
+  // 230 rows: the hash join would pass the budget; the count takes pr read
+  // once per row of b, which holds a row at a time. Nothing recompiled.
+  insert(21, 230);
+  CHECK(db->execute(st, {std::int64_t{1}}).rows.size() == 30);
+  CHECK(db->compilations() == compiled);
+  // The hash join's branch, as a threshold of 273 would take it: 54000.
+  try {
+    (void)db->alternatives_for_testing(sql, {std::int64_t{1}});
+    FAIL("every plan ran");
+  } catch (const ExecError& e) {
+    CHECK(e.code() == BC_E_LIMIT);
+  }
+}
+
+TEST_CASE("embedded API: a bulk UPDATE of 200K rows passes the default memory budget, is 54000 and commits nothing",
+          "[sql][api][memory]") {
+  constexpr std::int64_t kRows = 200'000 / kBulkScale;
+  sql_test::TempDir dir{"api_bulk_over"};
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = DatabaseOptions{}.statement_memory_bytes / kBulkScale});
+  seed_wide(*db, kRows);
+  // Each built row goes when its step ends, but the write set holds every
+  // row it puts until commit, about 540 bytes a row: 200K of them pass
+  // 64 MiB.
+  try {
+    (void)db->execute("UPDATE wide SET n = n + 1 WHERE id >= $1", {std::int64_t{0}});
+    FAIL("the UPDATE ran within the statement budget");
+  } catch (const ExecError& e) {
+    CHECK(e.code() == BC_E_LIMIT);
+    CHECK(sqlstate(e) == std::string_view{"54000"});
+  }
+  for (std::int64_t id : {std::int64_t{0}, kRows / 2, kRows - 1}) CHECK(n_of(*db, id) == id);
+}
+
+TEST_CASE("embedded API: a bulk UPDATE of 1M rows of 100 bytes runs with the memory budget raised to 1 GiB",
+          "[sql][api][memory]") {
+  constexpr std::int64_t kRows = 1'000'000 / kBulkScale;
+  sql_test::TempDir dir{"api_bulk"};
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = (std::uint64_t{1} << 30) / kBulkScale});
+  seed_wide(*db, kRows);
+  auto r = db->execute("UPDATE wide SET n = n + 1 WHERE id >= $1", {std::int64_t{0}});
+  CHECK(r.affected == kRows);
+  for (std::int64_t id : {std::int64_t{0}, kRows / 2, kRows - 1}) CHECK(n_of(*db, id) == id + 1);
+}
+
+TEST_CASE("embedded API: a commit past the engine's 1 GiB batch limit is 54000 and commits nothing",
+          "[sql][api][memory]") {
+  // 260 rows of a value just under the engine's 4 MiB value limit: one
+  // UPDATE putting all of them is a write plan over 1 GiB. The statement
+  // budget and the transaction's bound are raised past it and the plan's
+  // copy of it, so the engine's own limit is what refuses it, at commit.
+  // The engine's limit does not scale, so a debug build, as the sanitizers
+  // run, which takes a tenth of the bulk tests, skips it: it holds over
+  // 2 GiB.
+  if (kBulkScale != 1) SKIP("runs in optimised builds only: the engine's 1 GiB batch limit does not scale");
+  constexpr std::int64_t kRows = 260;
+  constexpr std::uint64_t kRoom = std::uint64_t{3} << 30;
+  sql_test::TempDir dir{"api_batch_limit"};
+  auto db = Database::open(dir.path(), {.sync = SyncMode::AtFileRotation, .statement_memory_bytes = kRoom});
+  db->execute("CREATE TABLE big (id BIGINT PRIMARY KEY, v BYTEA NOT NULL)");
+  for (std::int64_t id = 0; id < kRows; ++id) db->execute("INSERT INTO big VALUES ($1, $2)", {id, sql_test::bytes("v")});
+  const Value value = sql_test::bytes(std::string((std::size_t{4} << 20) - 1024, 'v'));
+  auto expect_54000 = [](auto&& run) {
+    try {
+      run();
+      FAIL("the engine took a write plan over 1 GiB");
+    } catch (const ExecError& e) {
+      CHECK(e.code() == BC_E_LIMIT);
+      CHECK(sqlstate(e) == std::string_view{"54000"});
+      CHECK(std::string_view{e.what()}.find("exceeds the limit of 1073741824 bytes per write") !=
+            std::string_view::npos);
+    }
+  };
+  auto untouched = [&] {
+    auto rows = db->execute("SELECT id, v FROM big WHERE id >= $1", {std::int64_t{0}});
+    CHECK(std::ssize(rows.rows) == kRows);
+    for (const auto& row : rows.rows) CHECK(row[1] == Value{sql_test::bytes("v")});
+  };
+  expect_54000([&] { (void)db->execute("UPDATE big SET v = $1 WHERE id >= $2", {value, std::int64_t{0}}); });
+  untouched();
+  // A transaction's commit is refused alike, and rolled back.
+  auto t = db->begin({.max_bytes = kRoom});
+  t.execute("UPDATE big SET v = $1 WHERE id >= $2", {value, std::int64_t{0}});
+  expect_54000([&] { (void)t.commit(); });
+  untouched();
+}
+
+TEST_CASE("embedded API: a join over many outer rows runs in a small memory budget (#551)", "[sql][api][memory]") {
+  sql_test::TempDir dir{"api_join"};
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  db->execute("CREATE TABLE ol (w BIGINT, id BIGINT, item BIGINT NOT NULL, PRIMARY KEY (w, id))");
+  db->execute("CREATE TABLE st (i BIGINT, w BIGINT, pad VARCHAR(300) NOT NULL, PRIMARY KEY (i, w))");
+  constexpr std::int64_t kItems = 10;
+  constexpr std::int64_t kOuter = 5000;
+  const Value pad = sql_test::bytes(std::string(300, 's'));
+  for (std::int64_t i = 0; i < kItems; ++i) db->execute("INSERT INTO st VALUES ($1, $2, $3)", {i, std::int64_t{1}, pad});
+  for (std::int64_t first = 0; first < kOuter; first += 1000) {
+    auto t = db->begin();
+    for (auto id = first; id < first + 1000; ++id) {
+      t.execute("INSERT INTO ol VALUES ($1, $2, $3)", {std::int64_t{1}, id, id % kItems});
+    }
+    REQUIRE(t.commit() == CommitOutcome::Committed);
+  }
+  // Each outer row reads an inner row of over 300 bytes, and builds its key
+  // and a group key: 5,000 of them pass 1.5 MB, the budget is 64 KiB.
+  auto r = db->execute("SELECT COUNT(DISTINCT st.i) FROM ol, st WHERE ol.w = $1 AND st.i = ol.item AND st.w = $1",
+                       {std::int64_t{1}});
+  REQUIRE(r.rows.size() == 1);
+  CHECK(std::get<std::int64_t>(r.rows[0][0]) == kItems);
 }
 
 TEST_CASE("embedded API: destroying an open transaction rolls it back; close() ends the open ones",
@@ -468,6 +761,109 @@ TEST_CASE("embedded API: an allocation failure in an autocommit statement never 
   }
   db->conflict_on_every_commit_for_testing(false);
   CHECK(balance(*db, 1) == 100);
+}
+
+namespace {
+
+// Every allocation of an execute of `sql`, with $1 = 1, failed in turn:
+// BC_E_MEMORY, or the rows of a run no failure reached; bad_alloc only before
+// the plan runs. Its plan holds `structure`. Compiled only where the seam
+// is, which a sanitizer runtime defining operator new leaves out.
+void sweep_plan_allocations(Database& db, const std::string& sql, std::string_view structure) {
+#ifdef BYTECASK_NO_ALLOC_FAULTS
+  (void)db;
+  (void)sql;
+  (void)structure;
+#else
+  INFO(sql);
+  const auto& st = db.prepare(sql);
+  const std::vector<Value> params{std::int64_t{1}};
+  auto want = db.execute(st, params).rows;
+  REQUIRE(st.plan_source().find(structure) != std::string::npos);
+  auto failed = 0;
+  for (long nth = 1;; ++nth) {
+    REQUIRE(nth < 100000);
+    std::string outcome;
+    std::optional<decltype(want)> got;
+    auto fired = false;
+    {
+      bytecask::testing::ScopedAllocFaults faults{nth, false};
+      try {
+        got = db.execute(st, params).rows;
+        outcome = "ran";
+      } catch (const ExecError& e) {
+        outcome = e.code() == BC_E_MEMORY ? "memory" : "error";
+      } catch (const std::bad_alloc&) {
+        outcome = "bad_alloc";
+      }
+      fired = faults.report().fired;
+    }
+    INFO("allocation " << nth << ": " << outcome);
+    CHECK((outcome == "ran" || outcome == "memory" || outcome == "bad_alloc"));
+    if (got) CHECK(*got == want);
+    if (!fired) {
+      CHECK(outcome == "ran");
+      break;
+    }
+    ++failed;
+  }
+  CHECK(failed > 0);
+#endif
+}
+
+// acct and owner, 12 rows each: owner.acct NULL in every fourth row, and
+// equal in several.
+auto open_owners(const sql_test::TempDir& dir) -> std::unique_ptr<Database> {
+  auto db = open_db(dir);
+  db->execute("CREATE TABLE owner (id BIGINT PRIMARY KEY, acct BIGINT, name BYTEA)");
+  for (std::int64_t k = 1; k <= 12; ++k) {
+    db->execute("INSERT INTO acct VALUES ($1, $2)", {k, (k * 7) % 5});
+    db->execute("INSERT INTO owner VALUES ($1, $2, $3)",
+                {k, k % 4 == 0 ? Value{} : Value{(k * 5) % 13}, Value{std::vector<std::byte>(static_cast<std::size_t>(k % 3), std::byte{'x'})}});
+  }
+  return db;
+}
+
+}  // namespace
+
+TEST_CASE("embedded API: an allocation failure in a sorted plan is BC_E_MEMORY or its rows", "[sql][api][alloc]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
+  sql_test::TempDir dir{"api_sort_faults"};
+  auto db = open_owners(dir);
+  // Each a plan the compiler sorts: a full scan or a range, under a LIMIT or
+  // not, on a join, FOR UPDATE; then a join of two scans, a sorter per loop.
+  for (const auto* sql : {
+           "SELECT id, bal FROM acct WHERE bal >= $1 ORDER BY bal DESC, id",
+           "SELECT id FROM owner WHERE id > $1 ORDER BY acct NULLS FIRST, name DESC LIMIT 3",
+           "SELECT owner.id, bal FROM owner, acct WHERE owner.id > $1 AND acct.id = owner.acct ORDER BY bal, owner.id",
+           "SELECT id, bal FROM acct WHERE id > $1 ORDER BY bal LIMIT 4 FOR UPDATE",
+       }) {
+    sweep_plan_allocations(*db, sql, "bc_sorter_open");
+  }
+  sweep_plan_allocations(
+      *db, "SELECT owner.id, acct.id FROM owner, acct WHERE owner.id > $1 AND acct.bal >= $1 ORDER BY acct.bal, owner.id",
+      "bc_sorter_nth");
+}
+
+TEST_CASE("embedded API: an allocation failure in a hash join plan is BC_E_MEMORY or its rows", "[sql][api][alloc]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
+  sql_test::TempDir dir{"api_hash_faults"};
+  auto db = open_owners(dir);
+  // Joined on a column no key holds, NULL in some rows and equal in several:
+  // a hash join, alone, sorted on its probe side, and under a LIMIT.
+  for (const auto* sql : {
+           "SELECT owner.id, acct.id FROM owner, acct WHERE owner.id > $1 AND acct.bal = owner.acct",
+           "SELECT owner.id, acct.id FROM owner, acct WHERE owner.id > $1 AND acct.bal = owner.acct ORDER BY acct.id DESC",
+           "SELECT count(DISTINCT owner.name) FROM owner, acct WHERE acct.bal > $1 AND owner.acct = acct.bal",
+           "SELECT acct.id FROM owner, acct WHERE owner.id > $1 AND acct.bal = owner.acct LIMIT 2",
+       }) {
+    sweep_plan_allocations(*db, sql, "bc_hash_open");
+  }
+  // Sorted above the join, a sorter of each table's rows.
+  sweep_plan_allocations(*db,
+                         "SELECT owner.id, acct.id FROM owner, acct WHERE owner.id > $1 AND acct.bal = owner.acct "
+                         "ORDER BY acct.id DESC, owner.id LIMIT 5",
+                         "bc_sorter_nth");
 }
 
 TEST_CASE("embedded API: a DDL whose commit may have reached the engine is 08007", "[sql][api][alloc]") {
@@ -914,4 +1310,159 @@ TEST_CASE("embedded API: SELECT … FOR UPDATE makes the commit 40001 if a row i
     REQUIRE(r.rows.size() == 1);
     CHECK(std::get<std::int64_t>(r.rows[0][0]) == 20);
   }
+}
+
+namespace {
+
+auto text_of(const Value& v) -> std::string {
+  const auto& b = std::get<std::vector<std::byte>>(v);
+  return {reinterpret_cast<const char*>(b.data()), b.size()};  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+}
+
+}  // namespace
+
+TEST_CASE("embedded API: AVG is PostgreSQL's numeric quotient, at the scale its division takes", "[sql][api][group]") {
+  // numeric_div's scale: 16 significant digits at least, more for a quotient
+  // under 1, the argument's scale at least; rounded half away from zero.
+  // Each as PostgreSQL 16 prints it.
+  CHECK(average_text(3, 2, 0) == "1.5000000000000000");
+  CHECK(average_text(4, 3, 0) == "1.3333333333333333");
+  CHECK(average_text(5, 3, 0) == "1.6666666666666667");
+  CHECK(average_text(1, 2, 0) == "0.50000000000000000000");
+  CHECK(average_text(0, 2, 0) == "0.00000000000000000000");
+  CHECK(average_text(-3, 2, 0) == "-1.5000000000000000");
+  CHECK(average_text(-1, 3, 0) == "-0.33333333333333333333");
+  CHECK(average_text(200000, 2, 0) == "100000.000000000000");
+  CHECK(average_text(125, 1, 2) == "1.25000000000000000000");
+  CHECK(average_text(-310, 4, 2) == "-0.77500000000000000000");
+  CHECK(average_text(INT64_MIN, 1, 0) == "-9223372036854775808");
+  CHECK(average_text(INT64_MAX, 3, 0) == "3074457345618258602");
+
+  sql_test::TempDir dir{"api_group"};
+  auto db = open_db(dir);
+  db->execute("CREATE TABLE g (k BIGINT PRIMARY KEY, a BIGINT, d NUMERIC(6,2))");
+  for (std::int64_t k = 1; k <= 7; ++k) {
+    db->execute("INSERT INTO g VALUES ($1, $2, $3)", {k, k % 3 == 0 ? Value{} : Value{k % 2}, Value{k * 125}});
+  }
+  auto r = db->execute("SELECT a, count(*), avg(k), avg(d) FROM g WHERE k >= $1 GROUP BY a ORDER BY a NULLS FIRST",
+                       {std::int64_t{1}});
+  REQUIRE(r.rows.size() == 3);
+  CHECK(std::holds_alternative<std::monostate>(r.rows[0][0]));  // k = 3, 6
+  CHECK(text_of(r.rows[0][2]) == "4.5000000000000000");
+  CHECK(text_of(r.rows[0][3]) == "5.6250000000000000");
+  CHECK(std::get<std::int64_t>(r.rows[1][0]) == 0);  // k = 2, 4
+  CHECK(text_of(r.rows[1][2]) == "3.0000000000000000");
+  CHECK(std::get<std::int64_t>(r.rows[2][1]) == 3);  // k = 1, 5, 7
+  // AVG is a NUMERIC, its value its text; a DECIMAL's value, a SUM's
+  // among them, is always its scaled integer.
+  CHECK(r.types[2].kind == SqlKind::Numeric);
+  CHECK(r.types[3].kind == SqlKind::Numeric);
+  auto sums = db->execute("SELECT sum(d), avg(d) FROM g WHERE k >= $1", {std::int64_t{1}});
+  REQUIRE(sums.rows.size() == 1);
+  CHECK(sums.types[0].kind == SqlKind::Decimal);
+  CHECK(std::get<std::int64_t>(sums.rows[0][0]) == 3500);
+  CHECK(sums.types[1].kind == SqlKind::Numeric);
+  CHECK(text_of(sums.rows[0][1]) == "5.0000000000000000");
+  // A NUMERIC between other columns is one value of the row; the columns
+  // after it are where they belong.
+  auto mixed = db->execute("SELECT avg(k), count(*), avg(d), a FROM g WHERE k >= $1 GROUP BY a ORDER BY a NULLS FIRST",
+                           {std::int64_t{1}});
+  REQUIRE(mixed.rows.size() == 3);
+  REQUIRE(mixed.rows[1].size() == 4);
+  CHECK(text_of(mixed.rows[1][0]) == "3.0000000000000000");
+  CHECK(std::get<std::int64_t>(mixed.rows[1][1]) == 2);
+  CHECK(text_of(mixed.rows[1][2]) == "3.7500000000000000");
+  CHECK(std::get<std::int64_t>(mixed.rows[1][3]) == 0);
+  // No rows: no groups; without GROUP BY, one row, COUNT 0 and AVG NULL.
+  CHECK(db->execute("SELECT a, avg(k) FROM g WHERE k > $1 GROUP BY a", {std::int64_t{7}}).rows.empty());
+  auto none = db->execute("SELECT count(*), avg(k) FROM g WHERE k > $1", {std::int64_t{7}});
+  REQUIRE(none.rows.size() == 1);
+  CHECK(std::get<std::int64_t>(none.rows[0][0]) == 0);
+  CHECK(std::holds_alternative<std::monostate>(none.rows[0][1]));
+  // A NULL WHERE parameter matches no row, so the one row still comes, if
+  // its HAVING holds of it.
+  CHECK(db->execute("SELECT count(*) FROM g WHERE k > $1 HAVING count(*) < $2", {Value{}, std::int64_t{1}}).rows.size() == 1);
+  CHECK(db->execute("SELECT count(*) FROM g WHERE k > $1 HAVING count(*) > $2", {Value{}, std::int64_t{1}}).rows.empty());
+}
+
+TEST_CASE("embedded API: a structure of groups compiled while its table was small streams by the count as it runs",
+          "[sql][api][group][memory]") {
+  sql_test::TempDir dir{"api_group_budget"};
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  db->execute("CREATE TABLE g (k BIGINT PRIMARY KEY, a BIGINT, v BIGINT)");
+  db->execute("CREATE INDEX g_a ON g (a)");
+  for (std::int64_t k = 1; k <= 10; ++k) db->execute("INSERT INTO g VALUES ($1, $2, $3)", {k, k, k});
+  // Compiled at 10 rows: the structure, below a count of k's range at which
+  // its groups would pass 64 KiB; from it, g_a's order, streamed.
+  const auto& by_a = db->prepare("SELECT a, count(*) FROM g WHERE k >= $1 GROUP BY a HAVING count(*) > $2");
+  CHECK(by_a.plan_source().find("bc_count_range") != std::string::npos);
+  CHECK(db->execute(by_a, {std::int64_t{1}, std::int64_t{0}}).rows.size() == 10);
+  for (std::int64_t k = 11; k <= 2000; ++k) db->execute("INSERT INTO g VALUES ($1, $2, $3)", {k, k, k});
+  // 2,000 groups would hold more than 64 KiB: the count takes the stream.
+  CHECK(db->execute(by_a, {std::int64_t{1}, std::int64_t{1}}).rows.empty());
+  // Grouped by v, which no index orders, the structure runs, and past the
+  // budget is 54000.
+  try {
+    (void)db->execute("SELECT v, count(*) FROM g WHERE k >= $1 GROUP BY v HAVING count(*) > $2",
+                      {std::int64_t{1}, std::int64_t{1}});
+    FAIL("ran past the budget");
+  } catch (const std::exception& e) {
+    CHECK(sqlstate(e) == "54000");
+  }
+}
+
+TEST_CASE("embedded API: a streamed COUNT(DISTINCT) holds only its group's values; a structure's count takes their bytes",
+          "[sql][api][group][memory]") {
+  sql_test::TempDir dir{"api_group_distinct"};
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  db->execute("CREATE TABLE g (k BIGINT PRIMARY KEY, a BIGINT, v BIGINT)");
+  db->execute("CREATE INDEX g_a ON g (a)");
+  auto insert = [&](std::int64_t from, std::int64_t to) {
+    for (auto k = from; k <= to; ++k) db->execute("INSERT INTO g VALUES ($1, $1, $1)", {k});
+  };
+  insert(1, 10);
+  // Compiled at 10 rows: the structure below a count of k's range of 137,
+  // each row at least a group and a value of 476 bytes; from it g_a's order,
+  // streamed. The fixed amounts alone would count against 232.
+  // HAVING keeps the groups of more than $2 values: none at 1, so no result
+  // row is held.
+  const std::string sql = "SELECT a, count(DISTINCT v) FROM g WHERE k >= $1 GROUP BY a HAVING count(DISTINCT v) > $2";
+  const auto& st = db->prepare(sql);
+  REQUIRE(st.plan_source().find(", lo0, hi0, 137);") != std::string::npos);
+  CHECK(db->execute(st, {std::int64_t{1}, std::int64_t{0}}).rows.size() == 10);
+  // 200 rows, each its own group and value, hold about 100 KB in the
+  // structure: the count takes the stream.
+  insert(11, 200);
+  CHECK(db->execute(st, {std::int64_t{1}, std::int64_t{0}}).rows.size() == 200);
+  // 2,000: the stream clears its values as each group ends, so it holds
+  // one group's, where every group's pairs would pass 64 KiB.
+  insert(201, 2000);
+  CHECK(db->execute(st, {std::int64_t{1}, std::int64_t{1}}).rows.empty());
+  // The structure's branch, forced: 54000.
+  try {
+    (void)db->alternatives_for_testing(sql, {std::int64_t{1}, std::int64_t{1}});
+    FAIL("every plan ran");
+  } catch (const ExecError& e) {
+    CHECK(e.code() == BC_E_LIMIT);
+  }
+}
+
+TEST_CASE("embedded API: an allocation failure in a grouped plan is BC_E_MEMORY or its rows", "[sql][api][alloc][group]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
+  sql_test::TempDir dir{"api_group_faults"};
+  auto db = open_owners(dir);
+  // In a structure: a nullable key, a key read from a held row, with
+  // COUNT(DISTINCT), HAVING, a sort of the groups and a LIMIT, over a hash
+  // join; and streamed.
+  sweep_plan_allocations(*db, "SELECT acct, count(*), sum(id), avg(id), max(id) FROM owner WHERE id > $1 GROUP BY acct",
+                         "bc_agg_open");
+  sweep_plan_allocations(*db,
+                         "SELECT name, count(DISTINCT acct) FROM owner WHERE id >= $1 GROUP BY name HAVING count(*) > $1 "
+                         "ORDER BY name LIMIT 2",
+                         "bc_hash_open");
+  sweep_plan_allocations(*db,
+                         "SELECT acct.bal, count(*) FROM owner, acct WHERE owner.id > $1 AND acct.bal = owner.acct "
+                         "GROUP BY acct.bal",
+                         "bc_agg_open");
+  sweep_plan_allocations(*db, "SELECT id, max(bal), count(DISTINCT bal) FROM acct WHERE id >= $1 GROUP BY id", "bool st0");
 }

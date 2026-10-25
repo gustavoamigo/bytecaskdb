@@ -21,4 +21,5 @@ void plan(bc_ctx *cx) {
     bc_emit_end(cx);
     ++n;
   }
+  bc_scan_close(cx, c);
 }

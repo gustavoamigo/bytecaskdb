@@ -41,8 +41,9 @@ every rule, the invariants are checked.
   catalog's 42P07, 42704, 42809) must agree with PostgreSQL's. The one state
   both sides use for different things is 0A000: on a `CREATE TABLE` it is the
   layer's own rule that a table needs a primary key, which PostgreSQL does not
-  have, and `LAYER_ONLY` in `oracle.py` classes it as a refusal, not
-  compared. A statement PostgreSQL runs that the layer refuses is 42601
+  have, and on a message starting "no plan:" the planner's refusal; `layer_only`
+  in `oracle.py` classes both as a refusal, not compared. Any other statement
+  PostgreSQL runs that the layer refuses is 42601
   and a refusal on both (`test_forms_the_layer_does_not_support_are_refused_without_a_sqlstate`
   runs each on PostgreSQL to show it accepts it). A statement
   with a repeated `$n` goes to PostgreSQL as written and untyped
@@ -56,13 +57,15 @@ every rule, the invariants are checked.
   engine refusal at run time included, fails the test.
 - **Statements the planner serves.** The machine generates only statements
   the planner serves, and a "no plan" refusal
-  (`frontend_design.md`, *What the planner refuses*) fails the test.
+  (`planner_design.md`, *What the search refuses*) fails the test.
   The planner's refusals are tested by their messages in
   `sql_layer_tests`.
 - **Counts agree.** An INSERT, UPDATE or DELETE changes as many rows on both.
 - **Rows agree.** A lookup returns the same rows. After every step, each
   table holds the same rows on both. The layer's rows are read from the
-  engine by `table_rows`, since SQL has no full scan. PostgreSQL's come from
+  engine by `table_rows`, not by a plan, so the check does not depend on
+  the planner it checks (a full scan in SQL is one of its plans).
+  PostgreSQL's come from
   `SELECT … ORDER BY` the primary key. `table_rows` is test only: it is
   compiled into `sql_layer_testing`, the build of the library with
   `BYTECASK_SQL_TESTING` that the tests and `bytecask_sql` link, and is not
@@ -70,7 +73,10 @@ every rule, the invariants are checked.
 - **Values compare as values.** `bytecask_sql` converts each value by its
   column's SQL type, and the oracle (`tests/proof/oracle.py`) converts
   PostgreSQL's the same way. Values compare by type too: `True` is not `1`,
-  `1` is not `1.0`, and `-0.0` is not `0.0`. Text columns are `COLLATE "C"`
+  `1` is not `1.0`, and `-0.0` is not `0.0`. A DOUBLE or REAL takes NaN,
+  `Infinity` and `-Infinity` too. An `ORDER BY`'s keys compare as
+  PostgreSQL orders them: every NaN equal to every other, and `-0.0` equal
+  to `0.0`, so their ties form one run (`oracle.same_rows`). Text columns are `COLLATE "C"`
   in PostgreSQL, so its order is byte order, the order of the layer's keys.
   A REAL comes from PostgreSQL as the shortest text naming its float; the
   oracle packs it back to that float, which is what the layer stores. A
@@ -113,9 +119,11 @@ The rules, by what they test.
   during a transaction, so no commit conflicts.
 
 **Indexes and reads by a key:**
-- **NUMERIC(6, 2)** joins the column types. The layer takes a DECIMAL
-  parameter as its integer scaled by 10^2 (`oracle.to_layer`); values are
-  drawn at that scale, so both sides hold them exactly.
+- **NUMERIC(6, 2) and NUMERIC(18, 0)** join the column types. The layer
+  takes a DECIMAL parameter as its integer scaled by 10^scale
+  (`oracle.to_layer`); values are drawn at that scale, so both sides hold
+  them exactly. A NUMERIC(18, 0) is an integer of scale 0 to the layer, as
+  a BIGINT is.
 - **CREATE INDEX** of one or two columns, each `ASC` or `DESC`, unique or
   not; a unique one over duplicates is 23505 on both.
 - **SELECT by a key**: an equality prefix of the primary key or of an
@@ -124,13 +132,23 @@ The rules, by what they test.
   values outside the type included, the conjuncts shuffled; maybe an
   `ORDER BY` of the parts after the prefix, in the key's direction or
   against it, an equality-compared column now and then, one item flipped
-  now and then; maybe a `LIMIT`. A model of the planner's rules
-  (`served`) says whether the layer plans it: if not, the layer must
-  refuse it with `no plan:`, and PostgreSQL is not asked. If it does, the
-  rows are compared in `ORDER BY` order, as a multiset within each run of
-  equal sort keys, and a run the `LIMIT` cuts must be drawn from
+  now and then, one item's `NULLS FIRST` or `LAST` now and then; or of one
+  to three of any columns, each `ASC` or `DESC`, `NULLS FIRST`, `LAST` or
+  neither, which a sort mostly gives; maybe a `LIMIT`. Now and then no key
+  conjunct at all, only filters or none: a full scan. A model of the
+  planner (`served`) says whether some plan serves it: if not, the layer
+  must refuse it with `no plan:` and SQLSTATE 0A000, and PostgreSQL is not
+  asked. It refuses only a filter on a DOUBLE or REAL column no key takes,
+  and a `HAVING` on a grouped one. If it does,
+  the rows are compared in `ORDER BY` order, as a multiset within each run
+  of equal sort keys, and a run the `LIMIT` cuts must be drawn from
   PostgreSQL's (`oracle.same_rows`, against PostgreSQL's rows without the
   `LIMIT`).
+- **Alternatives agree** (`planner_design.md`, *Tests*): after each
+  `SELECT`, aggregate and join compared with PostgreSQL, in autocommit,
+  every plan the search costed for it runs on the same data
+  (`Database::alternatives_for_testing`), and each one's rows are checked
+  as the layer's are.
 - **COUNT** of `*` or of a column over the same `WHERE`, with `LIMIT 0`
   or 1 now and then.
 - **SET col = col ± $n** on BIGINT, SMALLINT, INTEGER and NUMERIC(6, 2) columns by
@@ -151,8 +169,9 @@ The rules, by what they test.
 **Aggregates, UPDATE and DELETE of many rows:**
 - **SUM and MIN** over the same `WHERE` as `COUNT`, with `LIMIT 0` or 1
   now and then: `SUM` of SMALLINT, INTEGER and NUMERIC(6, 2) columns, `MIN`
-  of those and BIGINT ones. `SUM` of BIGINT is left out: its running total
-  leaves `int64_t` (`frontend_design.md`, *Known differences*).
+  of those and BIGINT and NUMERIC(18, 0) ones. `SUM` of BIGINT and
+  NUMERIC(18, 0) is left out: its running total leaves `int64_t`
+  (`frontend_design.md`, *Known differences*).
 - **UPDATE and DELETE by a key**: the same `WHERE` as `SELECT`, every row
   it matches; the `UPDATE` sets a non-key column to a parameter, or adds
   one to or subtracts one from a SMALLINT, INTEGER or NUMERIC(6, 2) column
@@ -170,8 +189,39 @@ The rules, by what they test.
 - **A join on a column**: two tables, each of the second's key parts equal
   to a column of the first of its type or to a parameter, the first's
   conjuncts from a key path, maybe a filter on the second; targets with a
-  `LIMIT`, or `COUNT(DISTINCT)` of either table's column. `join_served`
-  models the planner's choice of outer table.
+  `LIMIT`, or `COUNT(DISTINCT)` of either table's column, and now and then
+  an `ORDER BY` of either table's columns. `join_served` says whether
+  either table can be the outer one; where no key reaches either table, a
+  hash join or a nested loop reading one once per row of the other serves
+  it, whatever its `ORDER BY`.
+- **A join no key reaches**: two tables, each scanned by parameters or in
+  full, linked by up to two equalities of columns of one type, key
+  columns or not, or by none, a cross join (`join_no_key`), with targets,
+  `ORDER BY` of either table's columns or both, `LIMIT` or
+  `COUNT(DISTINCT)`; and rows inserted with another table's join value
+  (`insert_a_match`), so join columns hold NULLs and duplicates on both
+  sides.
+- **A table read once**: one named by its key in parameters, the other
+  scanned by parameters, linked by equalities of columns neither key takes
+  (`join_read_once`) or of the scanned table's primary-key columns, which
+  its index holds as its key's suffix (`join_read_once_on_keys`).
+
+**GROUP BY and HAVING:**
+- **GROUP BY** of one or two columns of one table, any type, mostly an
+  index's parts after the prefix, so groups stream, under a key path's
+  conjuncts or a full scan; up to three aggregates (`COUNT`, `COUNT(DISTINCT)`,
+  `SUM`, `AVG`, `MIN`, `MAX`), up to two `HAVING` conjuncts on a key or an
+  aggregate, an `ORDER BY` of the keys and a `LIMIT` (`group_by`). With no
+  `GROUP BY`, several aggregates in one row, which the keys answer where
+  they can.
+- **A HAVING parameter the WHERE typed**: `$n` compared with an integer
+  column of scale 0 (SMALLINT, INTEGER, BIGINT or NUMERIC(18, 0)) in the
+  `WHERE`, then with a key or an aggregate of one in the `HAVING`
+  (`having_reuses_a_parameter`).
+- **GROUP BY over a join**: two tables linked by one or two equalities of
+  columns of one type, whatever reaches them, grouped by up to two columns
+  of either table, with the same aggregates, `HAVING`, `ORDER BY` and
+  `LIMIT` (`group_by_join`).
 
 `test_tprocc.py` runs TPROC-C's five transactions through SQL against
 PostgreSQL: a small fixture (one warehouse, two

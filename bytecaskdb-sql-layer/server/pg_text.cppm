@@ -421,27 +421,92 @@ auto decimal_text(std::int64_t v, std::uint8_t scale) -> std::string {
   return (negative ? "-" : "") + digits.substr(0, cut) + "." + digits.substr(cut);
 }
 
-// PostgreSQL's float output with extra_float_digits 1: the shortest digits
-// that read back to the value, fixed form for a decimal exponent in
-// [-4, fixed_below), exponent form ("1e+15", "1.5e-05") otherwise.
+// v's significant digits and decimal exponent, in scientific form: the
+// shortest that read back to v when precision is negative, else precision
+// digits after the first, correctly rounded; trailing zeros dropped.
 template <typename F>
-auto float_text(F v, int fixed_below) -> std::string {
-  if (std::isnan(v)) return "NaN";
-  if (std::isinf(v)) return v < 0 ? "-Infinity" : "Infinity";
+auto sci_digits(F v, int precision) -> std::pair<std::string, int> {
   std::array<char, 64> buf{};
-  auto r = std::to_chars(buf.data(), buf.data() + buf.size(), v, std::chars_format::scientific);
+  auto r = precision < 0
+               ? std::to_chars(buf.data(), buf.data() + buf.size(), v, std::chars_format::scientific)
+               : std::to_chars(buf.data(), buf.data() + buf.size(), v, std::chars_format::scientific, precision);
   std::string_view sci{buf.data(), static_cast<std::size_t>(r.ptr - buf.data())};
-  auto negative = sci.front() == '-';
-  if (negative) sci.remove_prefix(1);
+  if (sci.front() == '-') sci.remove_prefix(1);
   auto e_at = sci.find('e');
   std::string digits;
   for (auto ch : sci.substr(0, e_at)) {
     if (ch != '.') digits.push_back(ch);
   }
+  while (digits.size() > 1 && digits.back() == '0') digits.pop_back();
   int exp = 0;
   auto exp_text = sci.substr(e_at + 1);
   if (!exp_text.empty() && exp_text.front() == '+') exp_text.remove_prefix(1);
   (void)std::from_chars(exp_text.data(), exp_text.data() + exp_text.size(), exp);
+  return {std::move(digits), exp};
+}
+
+// Whether the decimal `digits` x 10^exp_last (exp_last the last digit's
+// exponent) is exactly halfway between |v| and a neighbour, so that reading
+// it back depends on rounding ties to even. Exact, in 128-bit integers: a
+// midpoint is an odd multiple of a power of two below 2^(digits + 2), which
+// a decimal of at most 17 digits reaches only for |exp_last| <= 27.
+template <typename F>
+auto is_midpoint(F v, const std::string& digits, int exp_last) -> bool {
+  if (!std::isnormal(v) || exp_last < -27 || exp_last > 27) return false;
+  constexpr int kBits = std::numeric_limits<F>::digits;
+  int ex = 0;
+  auto f = std::frexp(std::abs(v), &ex);
+  auto m = static_cast<std::uint64_t>(std::ldexp(f, kBits));  // |v| = m x 2^e, m of kBits bits
+  auto e = ex - kBits;
+  using U = unsigned __int128;
+  U d = 0;
+  for (auto ch : digits) d = d * 10 + static_cast<U>(ch - '0');
+  U pow5 = 1;
+  for (int i = 0; i < std::abs(exp_last); ++i) pow5 *= 5;
+  if (exp_last >= 0) {
+    d *= pow5;
+  } else {
+    if (d % pow5 != 0) return false;
+    d /= pow5;
+  }
+  if (d == 0) return false;
+  auto twos = exp_last;
+  while ((d & 1) == 0) {
+    d >>= 1;
+    ++twos;
+  }
+  auto at = [&](U odd, int t) { return d == odd && twos == t; };
+  if (at(2 * U{m} + 1, e - 1)) return true;
+  // Below a power of two the neighbour is half as far.
+  if (m == std::uint64_t{1} << (kBits - 1)) return at(4 * U{m} - 1, e - 2);
+  return at(2 * U{m} - 1, e - 1);
+}
+
+// PostgreSQL's float output with extra_float_digits 1: the shortest digits
+// strictly closer to the value than to either neighbour, so they read back
+// to it without relying on ties to even (Ryu, as PostgreSQL builds it:
+// 1e23 is 9.999999999999999e+22); fixed form for a decimal exponent in
+// [-4, fixed_below), exponent form ("1e+15", "1.5e-05") otherwise.
+template <typename F>
+auto float_text(F v, int fixed_below) -> std::string {
+  if (std::isnan(v)) return "NaN";
+  if (std::isinf(v)) return v < 0 ? "-Infinity" : "Infinity";
+  auto negative = std::signbit(v);
+  auto [digits, exp] = sci_digits(v, -1);
+  auto last = [](const std::string& ds, int x) { return x - static_cast<int>(ds.size()) + 1; };
+  if (is_midpoint(v, digits, last(digits, exp))) {
+    for (auto p = static_cast<int>(digits.size()); p < std::numeric_limits<F>::max_digits10; ++p) {
+      auto [ds, x] = sci_digits(v, p);
+      auto text = ds.substr(0, 1) + "." + ds.substr(1) + "e" + std::to_string(x);
+      F back{};
+      (void)std::from_chars(text.data(), text.data() + text.size(), back);
+      if (back == std::abs(v) && !is_midpoint(v, ds, last(ds, x))) {
+        digits = std::move(ds);
+        exp = x;
+        break;
+      }
+    }
+  }
   std::string out = negative ? "-" : "";
   if (digits == "0") return out + "0";
   if (exp >= -4 && exp < fixed_below) {
@@ -556,6 +621,7 @@ auto type_info(SqlType t) -> TypeInfo {
     case SqlKind::Timestamp: return {1114, 8, -1};
     case SqlKind::Date: return {1082, 4, -1};
     case SqlKind::Time: return {1083, 8, -1};
+    case SqlKind::Numeric: return {1700, -1, -1};
   }
   return {25, -1, -1};
 }
@@ -573,7 +639,7 @@ auto to_text(const Value& v, SqlType t) -> std::string {
           return float_text(x, 15);
         } else if constexpr (std::is_same_v<V, Bytes>) {
           if (t.kind == SqlKind::Bytea) return bytea_text(x);
-          std::string out;  // TEXT and VARCHAR: their UTF-8 bytes
+          std::string out;  // TEXT and VARCHAR: their UTF-8 bytes; a NUMERIC: its text
           out.reserve(x.size());
           for (auto b : x) out.push_back(static_cast<char>(b));
           return out;
@@ -591,7 +657,8 @@ auto to_text(const Value& v, SqlType t) -> std::string {
             case SqlKind::Boolean:
             case SqlKind::Bytea:
             case SqlKind::Text:
-            case SqlKind::Varchar: return std::to_string(x);
+            case SqlKind::Varchar:
+            case SqlKind::Numeric: return std::to_string(x);
           }
           return std::to_string(x);
         }
@@ -614,6 +681,7 @@ auto from_text(std::string_view text, const ParamInfo& p) -> Value {
     case SqlKind::Timestamp: return timestamp_from(text);
     case SqlKind::Date: return date_from(text);
     case SqlKind::Time: return time_from(text);
+    case SqlKind::Numeric: break;  // no parameter has it: HAVING on AVG is refused
   }
   return text_bytes(text);
 }

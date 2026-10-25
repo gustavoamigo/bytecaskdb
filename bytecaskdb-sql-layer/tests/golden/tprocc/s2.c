@@ -13,7 +13,7 @@ void plan(bc_ctx *cx) {
     bc_emit_end(cx);
     return;
   }
-  bc_agg groups = bc_agg_open(cx, 16777216u, 0);
+  bc_agg groups = bc_agg_open(cx, 0);
   bc_key k0 = bc_key_begin(cx, TBL_18);
   bc_key_param(cx, k0, 0);
   bc_key_param(cx, k0, 1);
