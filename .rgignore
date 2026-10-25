@@ -1,0 +1,4 @@
+# ripgrep (and so an agent's Grep) skips generated proof tests: 5 MB, one file
+# of 116k lines. Edit the generators (tests/proof/generate_tests.py), not the
+# output. Read a file directly, or search with `rg --no-ignore`, when needed.
+generated/
