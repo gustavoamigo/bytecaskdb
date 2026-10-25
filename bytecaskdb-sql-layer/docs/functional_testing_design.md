@@ -12,11 +12,9 @@ one report says how much of each the layer passes:
 
 | Suite | Coverage | Tests | Checks |
 |---|---|---|---|
-| SQL:2016 Core | x% | n/739 sqltest | statement accepted |
+| SQL:2016 Core | x% | n/743 sqltest | statement accepted |
 | PostgreSQL features | x% | n/N cases | results |
 | ByteCaskDB features | x% | n/N cases | results |
-| TPC-H-derived | x% | n/22 queries | results |
-| TPC-DS-derived | x% | n/99 queries and their variants | results |
 | TPROC-C | x% | 5 transactions | consistency conditions 1–9 |
 
 The suites also set the scope. They are the SQL the layer is meant to
@@ -80,8 +78,8 @@ The flags and the lists are for the build, and only for it:
 - **The gate** (the default, and what CI and the build run): a
   not-implemented case is skipped. Every other case must pass, so
   removing a flag or a line makes that case a test the layer must pass
-  from then on (whether the gate runs a marked case and expects it to
-  fail: *Open questions*).
+  from then on. A marked case is never run by the gate, so a gap that
+  closes is seen in the conformance report, not as a failed build.
 - **Conformance** (`--conformance`): the flags and the lists are
   ignored. Every case runs as a test, and its real outcome is recorded.
   A failure doesn't fail the run: this run measures, and the report is
@@ -99,12 +97,13 @@ The flags and the lists are for the build, and only for it:
 ### SQL:2016 Core: sqltest
 
 [sqltest](https://github.com/elliotchance/sqltest) (MIT) has tests for
-the mandatory features of the SQL:2016 standard, by feature id: about
-740 tests over 134 subfeatures, in `standards/2016/{E,F}/*.tests.yml`.
+the mandatory features of the SQL:2016 standard, by feature id: 743
+tests over 134 features, in `standards/2016/{E,F,S,T}/*.tests.yml`.
 Core SQL was defined in SQL:1999; the tests are the 2016 edition's, so
 the row says 2016.
 
-- **Source:** in the repository, pinned to one commit, with its MIT
+- **Source:** the generated `*.tests.yml` files, unchanged, in
+  `tests/functional/suites/sqltest/`, pinned to one commit, with its MIT
   notice.
 - **Loader:** each test is a case with sqltest's id (`f041_03_01_04`)
   and its feature (`F041-03`), and each of its statements a step that
@@ -112,7 +111,10 @@ the row says 2016.
 - **Checks:** that the statements are accepted. sqltest has no expected
   results, and keeping its rule keeps the number comparable with other
   projects'. Its tables have no primary key, which the layer doesn't
-  support yet, so many cases start not implemented.
+  support yet, so most cases start not implemented. A first run passed
+  16 of the 743: 374 stop at that refusal, and the rest at other forms
+  the dialect leaves out. The list is
+  `tests/functional/not_implemented/sqltest.txt`.
 
 ### PostgreSQL features and ByteCaskDB features: our cases
 
@@ -127,21 +129,6 @@ Cases we write, in YAML, in `cases/`.
   budget, `FOR UPDATE`'s guards.
 
 Their format is in *Our cases*, below.
-
-### TPC-H-derived and TPC-DS-derived
-
-The two benchmarks' query sets: 22 queries, and 99 with their variants.
-
-- **Data and queries:** generated at a small scale with TPC's own
-  generators. Neither the tools nor the data are committed, and the
-  tools need TPC's registration, so where they come from is open
-  (*Open questions*). The query text runs as the generator writes it.
-- **Expected results:** recorded from PostgreSQL on the same data, in
-  files beside the queries, not in YAML.
-- **Checks:** results (how they are compared: *Open questions*).
-- **Names:** TPC's fair-use policy keeps the benchmarks' names for
-  audited results, the reason the layer says TPROC-C. These two rows'
-  names are open (*Open questions*).
 
 ### TPROC-C
 
@@ -274,6 +261,9 @@ No job needs PostgreSQL: the expected values are in the files.
   checks that a statement's alternative plans agree.
 - **SQLLogicTest:** left out for now. Its files could be loaded the same
   way later, but it is about 7.4 million queries, hours over the wire.
+- **TPC-H and TPC-DS:** left out for now (2026-10-25). Their tools need
+  TPC's registration, so a CI job can't fetch them, and a generator and
+  queries of our own would measure something other than the benchmarks.
 
 ## Plan
 
@@ -286,75 +276,29 @@ One PR each. Every step leaves the run and the report working.
    PostgreSQL. The TPROC-C row.
 2. **SQL:2016 Core.** sqltest in the repository, its loader, and its
    not-implemented list from a first run.
-3. **TPC-H-derived and TPC-DS-derived.** The data generation and the
-   queries, once their source is settled (*Open questions*), and their
-   results recorded from PostgreSQL.
-4. **More of our cases,** area by area, through the manifest's features
+3. **More of our cases,** area by area, through the manifest's features
    that no case covers yet.
 
 Also: `frontend_design.md` lists "a table needs a primary key" under
 *Known differences from PostgreSQL*. It is a gap, not a decision, and
 moves to what the layer doesn't do yet.
 
-## Open questions
-
-1. **The names of the TPC-H-derived and TPC-DS-derived rows.** HammerDB
-   calls its H workload TPROC-H; DS has no such name yet.
-2. **The loaders change the format only.** Proposed above: another
-   suite's SQL runs as written, so a sqltest table without a primary key
-   is not implemented until the layer supports one. The alternative is
-   to adapt their SQL (add a primary key) so more of it runs today.
-3. **Where TPC's tools and data come from.** TPC's tools (`dbgen`,
-   `qgen`, `dsdgen`, `dsqgen`) are free but need a registration and an
-   agreement to TPC's licence; there is no URL a CI job can fetch. So
-   "downloaded when the suite runs" doesn't hold. Options:
-   - the tools kept by the owner, who registered, in a place CI can
-     read, with the TPC rows run nightly or on demand, not on every PR;
-   - DuckDB's `tpch` and `tpcds` extensions, which need no
-     registration and run on every PR, but derive from TPC's generators,
-     so their licence needs reading before use.
-
-   The first keeps the licence position clear. The second keeps every
-   suite on every PR. Step 3 waits on this.
-4. **Does the gate skip a not-implemented case, or run it and expect it
-   to fail?** The text above skips it, and the conformance run lists
-   the marked cases that pass, without failing. A mark that outlives its
-   gap then goes unnoticed until someone reads the report. The
-   alternative is `xfail(strict)`: the gate runs every marked case, and
-   one that passes fails the build, so the mark must come off. It costs:
-   - **Time.** The gate runs every marked case: hundreds of sqltest
-     cases, and most of TPC-DS.
-   - **Isolation.** A marked case that crashes or hangs
-     `sql_layer_server` also breaks the unmarked cases that share its
-     file's server (Decision 9). Skipping never started it.
-
-   It needs a per-case timeout, and a server restart after a crash,
-   with the unmarked cases rerun. Recommended: skip in the gate, and
-   let the report list the marks that pass; take the strict gate only if
-   that proves too easy to ignore.
-5. **How a TPC case compares results.** These sets return `numeric` and
-   `double` aggregates, and `ORDER BY` often leaves ties, so a
-   text-for-text comparison is too tight. Proposed: a TPC case compares
-   numbers within a relative tolerance and sorts rows that tie on the
-   `ORDER BY` columns; every other suite compares text.
-
 ## Decisions
 
 The owner's, 2026-10-25:
 1. **One black-box framework, in Python, over the wire.**
 2. **Several suites, one report:** SQL:2016 Core (sqltest),
-   PostgreSQL features, ByteCaskDB features, the two
-   decision-support query sets, and TPROC-C. The SQL Core row is labelled
-   by the edition its tests come from.
+   PostgreSQL features, ByteCaskDB features, and TPROC-C. The SQL Core
+   row is labelled by the edition its tests come from.
 3. **Other suites are loaded in their own format and turned into our
-   cases at run time** (whether only the format changes: *Open
-   questions*).
+   cases at run time**, and only the format changes: a suite's SQL
+   runs as it wrote it (Decision 13).
 4. **PostgreSQL writes our cases' expected results, and is not part of
    the test.**
 5. **The suites are the scope.** What the layer can't run yet is marked
    not implemented. The build skips marked cases, and must pass the
    rest; a conformance run ignores the marks and runs everything, for
-   the report (whether the gate runs them: *Open questions*).
+   the report, which lists the marked cases that pass, so their marks can come off.
 6. **No issue per not-implemented case.**
 7. **Cases name the SQL features they cover, as metadata.** File names
    stay by area.
@@ -362,8 +306,12 @@ The owner's, 2026-10-25:
 9. **One server per file**, and a server of its own for a case with
    `restart` or `server_flags`.
 10. **Concurrency and plan shapes are other classes of tests.**
-    SQLLogicTest is left out for now.
+    SQLLogicTest, TPC-H and TPC-DS are left out for now.
 11. **A table without a primary key is a gap.** The layer's refusal is
     not a recorded decision.
 12. **The suite's runner is the owner's own work and carries an MIT
     header.**
+13. **A loader changes the format, never the SQL** (2026-10-25). A sqltest
+    table without a primary key is not implemented until the layer
+    supports one; adding a key to it would make the row measure our edit
+    of the suite, and hide the gap Decision 11 names.

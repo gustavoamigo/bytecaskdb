@@ -20,7 +20,7 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "server"))
 import pgserver  # noqa: E402  (tests/server/pgserver.py)
 
-SUITES = ("postgresql", "bytecaskdb", "tprocc")
+SUITES = ("sqltest", "postgresql", "bytecaskdb", "tprocc")
 DATABASE = "functional"
 
 

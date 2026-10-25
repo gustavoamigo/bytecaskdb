@@ -278,6 +278,10 @@ E031-03:
   name: Trailing underscore
   mandatory: true
   pg: true
+E051:
+  name: Basic query specification
+  mandatory: true
+  pg: true
 E051-01:
   name: SELECT DISTINCT
   mandatory: true

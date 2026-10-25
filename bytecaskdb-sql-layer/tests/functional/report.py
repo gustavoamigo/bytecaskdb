@@ -22,8 +22,6 @@ SUITES = {
     "sqltest": ("SQL:2016 Core", "sqltest tests", "statement accepted"),
     "postgresql": ("PostgreSQL features", "cases", "results"),
     "bytecaskdb": ("ByteCaskDB features", "cases", "results"),
-    "tpch": ("TPC-H-derived", "queries", "results"),
-    "tpcds": ("TPC-DS-derived", "queries and their variants", "results"),
     "tprocc": ("TPROC-C", "cases", "consistency conditions 1-9"),
 }
 
