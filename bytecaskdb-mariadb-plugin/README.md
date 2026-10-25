@@ -289,6 +289,14 @@ the warehouse count.
 ./bytecaskdb-mariadb-plugin/benchmarks/run-hammerdb.sh --warehouses=50 --vus=8,16,32 --data-root=/mnt/bench --reuse-data
 ```
 
+To compare builds, `compare-refs.sh` checks each branch or commit out into a
+worktree of its own and runs them alternately in one session, with one summary
+table (options in the script's header):
+
+```bash
+./bytecaskdb-mariadb-plugin/benchmarks/compare-refs.sh --rounds=2 --innodb main my-branch
+```
+
 `--capture` profiles the server for the first two minutes of each cell's
 measured window and packs the result into
 `benchmarks/captures/capture_<engine>_w<N>_vu<N>_<run start>.tar.gz`, for

@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: MIT
+# README.md is the entry point for new readers and for coding agents, so it
+# stays short: detail lives in docs/ (CLAUDE.md, README guidelines).
+#
+# Its own workflow, because ci.yml ignores Markdown: a README change alone
+# must still run this.
+
+name: README size
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - README.md
+      - scripts/check_readme_size.py
+  pull_request:
+    paths:
+      - README.md
+      - scripts/check_readme_size.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  readme-size:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: README.md stays an entry point
+        run: python3 scripts/check_readme_size.py
