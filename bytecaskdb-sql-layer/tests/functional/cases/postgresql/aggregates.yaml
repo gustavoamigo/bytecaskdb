@@ -1,0 +1,381 @@
+# GROUP BY, HAVING and the aggregates, and the query forms around them that the
+# layer refuses.
+
+- name: GROUP BY sums each group, and NULL is a group
+  features: [E051-02, E091-05]
+  setup:
+    - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
+  steps:
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [4, 2, null]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [5, null, 50]
+      rowcount: 1
+    - sql: SELECT k, SUM(v) FROM g WHERE id >= $1 GROUP BY k
+      params: [0]
+      expected: [[null, 50], [1, 30], [2, 30]]
+  teardown:
+    - DROP TABLE g
+
+- name: GROUP BY with COUNT(*) and COUNT(v)
+  features: [E051-02, E091-02]
+  setup:
+    - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
+  steps:
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [4, 2, null]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [5, null, 50]
+      rowcount: 1
+    - sql: SELECT k, COUNT(*), COUNT(v) FROM g WHERE id >= $1 GROUP BY k
+      params: [0]
+      expected: [[null, 1, 1], [1, 2, 2], [2, 2, 1]]
+  teardown:
+    - DROP TABLE g
+
+- name: MIN and MAX of each group
+  features: [E051-02, E091-03, E091-04]
+  setup:
+    - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
+  steps:
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [4, 2, null]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [5, null, 50]
+      rowcount: 1
+    - sql: SELECT k, MIN(v), MAX(v) FROM g WHERE id >= $1 GROUP BY k
+      params: [0]
+      expected: [[null, 50, 50], [1, 10, 20], [2, 30, 30]]
+  teardown:
+    - DROP TABLE g
+
+- name: AVG of each group
+  features: [E091-01]
+  setup:
+    - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
+  steps:
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [4, 2, null]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [5, null, 50]
+      rowcount: 1
+    - sql: SELECT k, AVG(v) FROM g WHERE id >= $1 GROUP BY k
+      params: [0]
+      expected:
+        - [null, "50.0000000000000000"]
+        - [1, "15.0000000000000000"]
+        - [2, "30.0000000000000000"]
+  teardown:
+    - DROP TABLE g
+
+- name: HAVING keeps the groups that pass
+  features: [E051-06]
+  setup:
+    - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
+  steps:
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [4, 2, null]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [5, null, 50]
+      rowcount: 1
+    - sql: SELECT k, COUNT(*) FROM g WHERE id >= $1 GROUP BY k HAVING COUNT(*) > $2
+      params: [0, 1]
+      expected: [[1, 2], [2, 2]]
+  teardown:
+    - DROP TABLE g
+
+- name: COUNT(DISTINCT) of a column
+  features: [E091-07]
+  setup:
+    - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
+  steps:
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [4, 2, null]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [5, null, 50]
+      rowcount: 1
+    - sql: SELECT COUNT(DISTINCT k) FROM g WHERE id >= $1
+      params: [0]
+      expected: [[2]]
+  teardown:
+    - DROP TABLE g
+
+- name: a grouped query read in order, with LIMIT
+  features: [E051-02]
+  setup:
+    - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
+  steps:
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [4, 2, null]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [5, null, 50]
+      rowcount: 1
+    - sql: SELECT k, SUM(v) FROM g WHERE id >= $1 GROUP BY k ORDER BY k LIMIT 2
+      params: [0]
+      expected: [[1, 30], [2, 30]]
+  teardown:
+    - DROP TABLE g
+
+- name: SUM of nothing is NULL, COUNT of nothing is 0
+  features: [E091-02, E091-05]
+  setup:
+    - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
+  steps:
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [4, 2, null]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [5, null, 50]
+      rowcount: 1
+    - sql: SELECT COUNT(*), SUM(v) FROM g WHERE id >= $1
+      params: [100]
+      expected: [[0, null]]
+  teardown:
+    - DROP TABLE g
+
+- name: SELECT DISTINCT
+  features: [E051-01]
+  # DISTINCT on the select list is refused
+  unimplemented: true
+  setup:
+    - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
+  steps:
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [4, 2, null]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [5, null, 50]
+      rowcount: 1
+    - sql: SELECT DISTINCT k FROM g WHERE id >= $1
+      params: [0]
+      expected: [[null], [1], [2]]
+  teardown:
+    - DROP TABLE g
+
+- name: an aggregate over an expression
+  features: [E091-05]
+  # * is not supported in an expression
+  unimplemented: true
+  setup:
+    - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
+  steps:
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [4, 2, null]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [5, null, 50]
+      rowcount: 1
+    - sql: SELECT SUM(v * 2) FROM g WHERE id >= $1
+      params: [0]
+      expected: [[220]]
+  teardown:
+    - DROP TABLE g
+
+- name: IS NULL in WHERE
+  features: [E061-06]
+  # WHERE must compare a column
+  unimplemented: true
+  setup:
+    - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
+  steps:
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [4, 2, null]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [5, null, 50]
+      rowcount: 1
+    - sql: SELECT id FROM g WHERE v IS NULL AND id >= $1
+      params: [0]
+      expected: [[4]]
+  teardown:
+    - DROP TABLE g
+
+- name: IN and BETWEEN in WHERE
+  features: [E061-03, E061-02]
+  # WHERE must compare a column
+  unimplemented: true
+  setup:
+    - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
+  steps:
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [4, 2, null]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [5, null, 50]
+      rowcount: 1
+    - sql: SELECT id FROM g WHERE id BETWEEN $1 AND $2
+      params: [2, 3]
+      expected: [[2], [3]]
+  teardown:
+    - DROP TABLE g
+
+- name: a scalar subquery
+  features: [F471]
+  # subqueries are refused
+  unimplemented: true
+  setup:
+    - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
+  steps:
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [4, 2, null]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [5, null, 50]
+      rowcount: 1
+    - sql: SELECT id FROM g WHERE v = (SELECT MAX(v) FROM g) AND id >= $1
+      params: [0]
+      expected: [[5]]
+  teardown:
+    - DROP TABLE g
+
+- name: UNION of two selects
+  features: [E071-01]
+  # set operations are refused
+  unimplemented: true
+  setup:
+    - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
+  steps:
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [4, 2, null]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [5, null, 50]
+      rowcount: 1
+    - sql: SELECT id FROM g WHERE id = $1 UNION SELECT id FROM g WHERE id = $2
+      params: [1, 2]
+      expected: [[1], [2]]
+  teardown:
+    - DROP TABLE g

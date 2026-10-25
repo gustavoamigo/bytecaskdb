@@ -1,0 +1,425 @@
+# Joins: the pairs a join returns, with filters, aggregates, order and the forms
+# the layer doesn't take yet.
+
+- name: an inner join returns the matching pairs
+  features: [F041-01]
+  setup:
+    - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, v VARCHAR(10))
+    - CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, w INTEGER)
+    - CREATE INDEX b_a ON b (a_id)
+  steps:
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [1, 1, "x"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [2, 2, "y"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [3, 3, null]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [4, null, 40]
+      rowcount: 1
+    - sql: SELECT a.id, b.w FROM a JOIN b ON a.id = b.a_id
+      expected: [[1, 10], [1, 20], [2, 30]]
+  teardown:
+    - DROP TABLE a
+    - DROP TABLE b
+
+- name: the INNER keyword gives the same join
+  features: [F041-02]
+  setup:
+    - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, v VARCHAR(10))
+    - CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, w INTEGER)
+    - CREATE INDEX b_a ON b (a_id)
+  steps:
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [1, 1, "x"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [2, 2, "y"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [3, 3, null]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [4, null, 40]
+      rowcount: 1
+    - sql: SELECT a.id, b.w FROM a INNER JOIN b ON a.id = b.a_id
+      expected: [[1, 10], [1, 20], [2, 30]]
+  teardown:
+    - DROP TABLE a
+    - DROP TABLE b
+
+- name: a comma join with the condition in WHERE
+  features: [F041-01]
+  setup:
+    - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, v VARCHAR(10))
+    - CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, w INTEGER)
+    - CREATE INDEX b_a ON b (a_id)
+  steps:
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [1, 1, "x"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [2, 2, "y"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [3, 3, null]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [4, null, 40]
+      rowcount: 1
+    - sql: SELECT a.id, b.w FROM a, b WHERE a.id = b.a_id
+      expected: [[1, 10], [1, 20], [2, 30]]
+  teardown:
+    - DROP TABLE a
+    - DROP TABLE b
+
+- name: a join with a filter on each side
+  features: [F041-01]
+  setup:
+    - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, v VARCHAR(10))
+    - CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, w INTEGER)
+    - CREATE INDEX b_a ON b (a_id)
+  steps:
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [1, 1, "x"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [2, 2, "y"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [3, 3, null]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [4, null, 40]
+      rowcount: 1
+    - sql: SELECT a.id, b.w FROM a JOIN b ON a.id = b.a_id WHERE b.w > $1 AND a.k < $2
+      params: [10, 2]
+      expected: [[1, 20]]
+  teardown:
+    - DROP TABLE a
+    - DROP TABLE b
+
+- name: a join read in order, with LIMIT
+  features: [F041-01]
+  ordered: true
+  setup:
+    - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, v VARCHAR(10))
+    - CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, w INTEGER)
+    - CREATE INDEX b_a ON b (a_id)
+  steps:
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [1, 1, "x"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [2, 2, "y"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [3, 3, null]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [4, null, 40]
+      rowcount: 1
+    - sql: SELECT a.id, b.w FROM a JOIN b ON a.id = b.a_id ORDER BY b.w DESC LIMIT 2
+      expected: [[2, 30], [1, 20]]
+  teardown:
+    - DROP TABLE a
+    - DROP TABLE b
+
+- name: a CROSS JOIN pairs every row with every row
+  features: [F041-01]
+  setup:
+    - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, v VARCHAR(10))
+    - CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, w INTEGER)
+    - CREATE INDEX b_a ON b (a_id)
+  steps:
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [1, 1, "x"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [2, 2, "y"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [3, 3, null]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [4, null, 40]
+      rowcount: 1
+    - sql: SELECT a.id, b.id FROM a CROSS JOIN b
+      expected:
+        - [1, 1]
+        - [1, 2]
+        - [1, 3]
+        - [1, 4]
+        - [2, 1]
+        - [2, 2]
+        - [2, 3]
+        - [2, 4]
+        - [3, 1]
+        - [3, 2]
+        - [3, 3]
+        - [3, 4]
+  teardown:
+    - DROP TABLE a
+    - DROP TABLE b
+
+- name: COUNT over a join
+  features: [F041-01, E091-02]
+  setup:
+    - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, v VARCHAR(10))
+    - CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, w INTEGER)
+    - CREATE INDEX b_a ON b (a_id)
+  steps:
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [1, 1, "x"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [2, 2, "y"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [3, 3, null]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [4, null, 40]
+      rowcount: 1
+    - sql: SELECT COUNT(*) FROM a JOIN b ON a.id = b.a_id
+      expected: [[3]]
+  teardown:
+    - DROP TABLE a
+    - DROP TABLE b
+
+- name: GROUP BY over a join
+  features: [F041-01, E051-02, E091-05]
+  setup:
+    - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, v VARCHAR(10))
+    - CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, w INTEGER)
+    - CREATE INDEX b_a ON b (a_id)
+  steps:
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [1, 1, "x"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [2, 2, "y"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [3, 3, null]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [4, null, 40]
+      rowcount: 1
+    - sql: SELECT a.k, SUM(b.w) FROM a JOIN b ON a.id = b.a_id GROUP BY a.k
+      expected: [[1, 30], [2, 30]]
+  teardown:
+    - DROP TABLE a
+    - DROP TABLE b
+
+- name: a LEFT JOIN keeps the rows with no match
+  features: [F041-03]
+  # outer joins are refused: only an inner join of two tables, by ON
+  unimplemented: true
+  setup:
+    - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, v VARCHAR(10))
+    - CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, w INTEGER)
+    - CREATE INDEX b_a ON b (a_id)
+  steps:
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [1, 1, "x"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [2, 2, "y"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [3, 3, null]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [4, null, 40]
+      rowcount: 1
+    - sql: SELECT a.id, b.w FROM a LEFT JOIN b ON a.id = b.a_id
+      expected: [[1, 10], [1, 20], [2, 30], [3, null]]
+  teardown:
+    - DROP TABLE a
+    - DROP TABLE b
+
+- name: a join on a condition that is not equality
+  features: [F041-08]
+  # a join compares two columns with = only
+  unimplemented: true
+  setup:
+    - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, v VARCHAR(10))
+    - CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, w INTEGER)
+    - CREATE INDEX b_a ON b (a_id)
+  steps:
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [1, 1, "x"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [2, 2, "y"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [3, 3, null]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [4, null, 40]
+      rowcount: 1
+    - sql: SELECT a.id, b.id FROM a JOIN b ON a.id < b.a_id
+      expected: [[1, 3]]
+  teardown:
+    - DROP TABLE a
+    - DROP TABLE b
+
+- name: a join of three tables
+  features: [F041-01]
+  # three or more tables are refused
+  unimplemented: true
+  setup:
+    - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, v VARCHAR(10))
+    - CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, w INTEGER)
+    - CREATE INDEX b_a ON b (a_id)
+    - CREATE TABLE c (id INTEGER PRIMARY KEY, b_id INTEGER)
+  steps:
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [1, 1, "x"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [2, 2, "y"]
+      rowcount: 1
+    - sql: INSERT INTO a VALUES ($1, $2, $3)
+      params: [3, 3, null]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [2, 1, 20]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [3, 2, 30]
+      rowcount: 1
+    - sql: INSERT INTO b VALUES ($1, $2, $3)
+      params: [4, null, 40]
+      rowcount: 1
+    - sql: INSERT INTO c VALUES ($1, $2)
+      params: [1, 1]
+      rowcount: 1
+    - sql: INSERT INTO c VALUES ($1, $2)
+      params: [2, 3]
+      rowcount: 1
+    - sql: SELECT a.id, b.w, c.id FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id
+      expected: [[1, 10, 1], [2, 30, 2]]
+  teardown:
+    - DROP TABLE a
+    - DROP TABLE b
+    - DROP TABLE c
+
+- name: a table joined to itself
+  features: [F041-01]
+  # table aliases are refused
+  unimplemented: true
+  setup:
+    - CREATE TABLE s (id INTEGER PRIMARY KEY, parent INTEGER)
+  steps:
+    - sql: INSERT INTO s VALUES ($1, $2)
+      params: [1, null]
+      rowcount: 1
+    - sql: INSERT INTO s VALUES ($1, $2)
+      params: [2, 1]
+      rowcount: 1
+    - sql: INSERT INTO s VALUES ($1, $2)
+      params: [3, 1]
+      rowcount: 1
+    - sql: SELECT x.id, y.id FROM s x JOIN s y ON x.id = y.parent
+      expected: [[1, 2], [1, 3]]
+  teardown:
+    - DROP TABLE s

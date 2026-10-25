@@ -2037,3 +2037,11 @@ layer:io-backends:
   description: the --io-backend choices
 layer:for-update:
   description: FOR UPDATE's guards and refusals
+pg:if-exists:
+  description: DROP TABLE IF EXISTS
+pg:if-not-exists:
+  description: CREATE TABLE IF NOT EXISTS
+pg:text-type:
+  description: the TEXT type
+pg:bytea:
+  description: the BYTEA type

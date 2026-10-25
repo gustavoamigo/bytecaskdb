@@ -22,7 +22,7 @@ How much of each suite the layer passes, from the functional suite's conformance
 | Suite | Coverage | Tests | Checks |
 |---|---|---|---|
 | SQL:2016 Core (sqltest) | 2% | 16/743 tests | statement accepted |
-| PostgreSQL features | 53% | 16/30 cases | results |
+| PostgreSQL features | 71% | 80/112 cases | results |
 | ByteCaskDB features | 100% | 12/12 cases | results |
 | TPROC-C | 100% | 1/1 case: five transactions, then consistency conditions 1–9 | consistency conditions 1–9 |
 
@@ -41,11 +41,11 @@ Built and tested:
 
 Not built yet (each is refused, with a message):
 
-- three or more tables, table aliases, outer joins, subqueries, set operations, `DISTINCT`;
+- three or more tables, table aliases, outer joins, joins on anything but `=`, subqueries, set operations, `DISTINCT`;
 - `OR`, `NOT`, `IN`, `BETWEEN`, `IS NULL`;
 - `OFFSET`, `RETURNING`, `ON CONFLICT`, multi-row `VALUES`, the `::` cast;
-- `*`, `/`, string functions and operators; literals other than integers (strings and decimals travel as parameters);
-- a table without a primary key, and a column-level `UNIQUE` (use `CREATE UNIQUE INDEX`);
+- `SELECT *`, multiplication, division, string functions and operators; literals other than integers (strings and decimals travel as parameters);
+- a table without a primary key, column-level `UNIQUE`, `CHECK` and `REFERENCES` (use `CREATE UNIQUE INDEX`), views, `CREATE TABLE IF NOT EXISTS` (refused with 42P07), `TRUNCATE`, an `UPDATE` of a primary-key column;
 - `SELECT` without a `FROM`, `EXPLAIN`, `SAVEPOINT`, sequences, serializable and read-committed isolation, transactional DDL.
 
 The functional suite (`tests/functional/`) marks what a case needs but the layer lacks, so its report shows the distance to PostgreSQL; the list above is the same gap seen from the dialect.
