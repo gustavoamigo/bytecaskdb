@@ -12,6 +12,8 @@ A test checks what the engine promises, not what its code happens to do. Find th
 
 When a test and the code disagree, decide which is wrong. Never edit an expectation to match the output. If the code is wrong, fix the code. If the contract is wrong, change its row in the same PR and name the change: added, widened, narrowed or removed. A test that matches no row and no design section has no spec: say what it checks, or delete it.
 
+CI checks that every test name, tag and script a contract row cites exists (`scripts/check_contract_tests.py`). It cannot check that the test proves the row; that is for the author and the reviewer. Renaming or deleting a test that a row cites means updating the row in the same PR.
+
 ## Fault sweeps must reach every structural transition
 
 A fault sweep proves only the paths its workload reaches with the fault armed. Line and MC/DC coverage show a branch ran, not that it ran with each of its allocations failed. The engine's sweep missed #580 because its seed was one leaf no operation filled (#588).

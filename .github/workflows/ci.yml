@@ -140,6 +140,12 @@ jobs:
         # mariadb-plugin.
         run: python3 scripts/check_guarded_by.py --scope engine build/linux/x86_64/release/bytecask_tests
 
+      - name: Every test CONTRACT.md names exists
+        # A renamed or deleted test leaves its row pointing at nothing; see
+        # scripts/check_contract_tests.py. Not run for a change to CONTRACT.md
+        # alone: this workflow ignores Markdown.
+        run: python3 scripts/check_contract_tests.py CONTRACT.md build/linux/x86_64/release/bytecask_tests build/linux/x86_64/release/btree_tests
+
       - name: Run chaosfs model tests
         # The chaos rig's filesystem model, without FUSE; the rig itself runs
         # in chaos-nightly.yml.
