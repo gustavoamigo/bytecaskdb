@@ -14,32 +14,35 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 
 ## Features
 
-- **Flat read latency** — lock-free reads, one record read per lookup: p50 728 ns, p99 1.01 µs at 1M keys, 14.0 Mops/s at 32 threads.
+- **Flat read latency** — lock-free reads, one record read per lookup: p50 172 ns, p99 378 ns at 1M keys, 62.9 Mops/s at 32 threads.
 - **Small, predictable memory** — 14–19 bytes of RAM per key, independent of key length.
 - **Ordered iteration** — forward and reverse prefix scans, key-only scans, O(1) snapshots, and `del_range` as a single append.
 - **Transactions** — atomic batches, snapshot isolation, and serializable conflict detection through read and range guards.
 - **Durable by construction** — append-only, CRC-checked records, group commit for synchronous writers, and online vacuum; `close()` throws if any acknowledged write is not durable.
-- **Fast recovery** — parallel rebuild from compressed hint files: 10M keys in 0.33 s from a cold start on a SATA SSD.
+- **Fast recovery** — parallel rebuild from compressed hint files: 10M keys in 0.47 s from a cold start on a SATA SSD.
 - **Failure-tested correctness** — model-based, bounded exhaustive testing of every failure class of each write-path operation. Guarantees are stated explicitly in [`CONTRACT.md`](CONTRACT.md), each row naming the tests that prove it, alongside fault sweeps that fail every I/O call and allocation in turn, a chaos rig that cuts the power, and [Elle](https://github.com/jepsen-io/elle) checking isolation. [How it is validated](docs/correctness_validation.md).
 
 Also: a bounded `O_DIRECT` buffer pool, replication primitives with fork detection, and operational counters. The complete list, with mechanisms, is in [`docs/bytecask_design.md`](docs/bytecask_design.md#features); the guarantees, each with the test that proves it, are in [`CONTRACT.md`](CONTRACT.md).
 
 ## Performance
 
-1M keys, against [RocksDB](https://rocksdb.org/). Per-value CRC verification is off for reads; hint file CRC is always verified during recovery.
+1M keys, 245-byte values, mean of 5 runs. Per-value CRC verification is off for reads; hint file CRC is always verified during recovery.
 
-| Operation | ByteCaskDB | RocksDB |
-|-----------|-----------:|--------:|
-| Put (NoSync) | 134 Kops/s | 163 Kops/s |
-| Put (Sync) | 139 ops/s | 148 ops/s |
-| Get | 1.29 Mops/s | 431 Kops/s |
-| Del (Sync) | 184 ops/s | 2 ops/s |
-| Range-50 | 28 K scans/s | 68 K scans/s |
-| MixedBatch (Sync) | 14 Kops/s | 13 Kops/s |
+| Operation | Result |
+|-----------|-------:|
+| Get | 4.72 Mops/s (p50 172 ns, p99 378 ns) |
+| Get, 32 threads | 62.9 Mops/s |
+| Put (NoSync) | 99.0 Kops/s |
+| Put (Sync) | 161.8 ops/s |
+| Put (Sync), 64 threads | 8.4 Kops/s |
+| Del (Sync) | 157.8 ops/s |
+| Range-50 | 441.4 K scans/s |
+| MixedBatch (Sync) | 14.6 Kops/s |
+| Recovery, 10M keys, cold start, 8 threads | 0.47 s |
 
-Range scans over values are slower: each value is fetched individually from its record, where LSM engines pack values contiguously in sorted runs. Key-only iteration (`keys_from`) skips the value.
+Sync writes are bound by `fdatasync` latency; concurrent writers share one (group commit). Unsynced puts slow down as the dataset grows: 149.7 Kops/s at 50k keys, 99.0 Kops/s at 1M. A scan reads each value from its own record, and the benchmark dataset fits in memory, so scans over larger data were not measured. Key-only iteration (`keys_from`) skips the value.
 
-_AMD Ryzen 7 3700X, SATA SSD, 31 GiB RAM, mean of 5 runs. Most figures predate the blind-leaf key directory and the buffer-pool default of `engine_bench`; the recovery figures are current. Concurrent-read, sync-write and recovery tables, and the full caveat, are in [`docs/performance.md`](docs/performance.md)._
+_AMD Ryzen 7 3700X (8C/16T), SATA SSD, 31 GiB RAM; run of 2026-10-07 at commit `e62d83f`. Other thread counts, dataset sizes and the recovery table: [`docs/performance.md`](docs/performance.md)._
 
 ## Quick Start
 
