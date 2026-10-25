@@ -1,6 +1,6 @@
 # ByteCaskDB Design
 
-## Purpose
+## Purpose and core design choice
 
 ByteCaskDB is a [Bitcask](https://riak.com/assets/bitcask-intro.pdf) implementation with a key architectural difference: it uses an immutable **persistent B+ tree** for the Key Directory instead of a Hash Table. This design choice enables efficient **range queries** and **prefix searches** while maintaining Bitcask's core strengths of fast writes and simple recovery. The name "ByteCaskDB" reflects this hybrid approach: **Bitcask algorithm** + **tree index** = **ByteCaskDB**.
 
@@ -12,7 +12,7 @@ Canonical location: `docs/bytecask_design.md`.
 
 For a first-pass overview focused on the main write loop, see `docs/bytecask_intro.md`.
 
-## Repository Tooling Notes
+## Repository tooling notes: host info script and CI coverage job
 
 `scripts/sys-info.sh` reports host hardware characteristics for the current execution context. The memory section is intentionally minimal and privilege-free: it reports the machine's installed RAM capacity from `/proc/meminfo` instead of attempting detailed DIMM inventory. The disk section resolves the filesystem mounted at an optional target path argument (default `./.tmp`) via `findmnt --target`, strips any bracketed subvolume suffix from the reported source, and then maps partitions/LVM-style block devices back to their parent physical disk with `lsblk -no PKNAME`. This keeps the output focused on the disk that backs the benchmark data directory instead of listing every block device on the host. The target path is also where the `fio` sequential read/write probes run, and it is echoed as `Measured path` in the output. `benchmark_showcase.py` passes its `--tmpdir` here: the reported hardware must be the disk the benchmarks actually wrote to, not the one holding the repository.
 
@@ -154,7 +154,7 @@ It does not give the engine's other guarantees:
 
 A second test runs one `ext.py` script on both backends and compares the results. Because `ext.py` is shared, the differential test cannot see a bug in it; `ext.py`'s own tests (`test_safety.py`) cover it. File-format tests cover both directions. It all runs in `ci.yml`.
 
-## Design Principles
+## Design Principles: correctness, simplicity, predictable latency, performance
 
 The design follows these core tenets in order of priority:
 
@@ -163,7 +163,7 @@ The design follows these core tenets in order of priority:
 3. **Predictable latency over peak throughput**: Write-path operations must have bounded, predictable latency. Work that can be deferred without compromising correctness must be deferred. A steady 1 ms per write is preferable to an average of 0.1 ms with occasional 500 ms spikes. This directly influences decisions like deferring hint file writes out of the rotation path.
 4. **Performance**: Optimizations require a real use case. Without one, correctness and simplicity take priority.
 
-## System Architecture
+## System Architecture: key directory, concurrency, read and write paths, file registry, vacuum
 
 ### Key Directory
 
@@ -942,20 +942,20 @@ A zero byte in the `EntryType` field is unambiguous corruption or an uninitializ
 
 CRC is at the **end** of the entry so both write and read can be done in a single pass: write all fields and accumulate CRC in one loop, then append the checksum.
 
-### Size constants
+### Data entry size constants
 
 - `kHeaderSize = 15` — fixed leading fields (sequence + entry_type + key_size + value_size)
 - `kCrcSize = 4` — trailing CRC
 - Total entry size: `kHeaderSize + key_size + value_size + kCrcSize`
 
-### Serialization
+### Data entry serialization and byte order
 
 - Little-endian byte order throughout.
 - Serialization uses an internal cursor-based API (`ByteWriter` / `ByteReader` in `serialization.cppm`). Both wrap the low-level `write_le` / `read_le` helpers with an auto-advancing offset so callers never compute byte positions by hand. `ByteWriter` optionally accepts a `Crc32*`; when non-null every `put()` / `put_bytes()` call also feeds the written bytes into the CRC accumulator, giving one-pass write + checksum with zero ceremony.
 - CRC-32C uses the Castagnoli polynomial `0x1EDC6F41` via the [google/crc32c](https://github.com/google/crc32c) library, which auto-detects hardware acceleration at runtime (SSE4.2 on x86-64, CRC instructions on AArch64) and falls back to a software implementation when neither is available.
 - CRC32 is computed over **all bytes of the entry except the trailing CRC field itself** (i.e., the leading header + key data + value data).
 
-### Sequence Number
+### Global sequence number
 
 The sequence is a **globally monotonic** counter across all data files and all engine sessions — not a per-file counter. This is a correctness invariant: recovery determines which of two entries for the same key is fresher by comparing sequences from potentially different files. Any per-file counter reset would silently allow stale data to overwrite live data.
 
@@ -1079,7 +1079,7 @@ We use fine-grained C++20 modules:
 - `bytecask.version_chain`: `VersionChain<Traits>` — per-version node reclamation shared by both trees.
 - `bytecask`: The engine — `DB`, `Snapshot`, `WritePlan`, the iterators and options. `bytecask.cppm` is its interface: every declaration, and the few helpers more than one implementation unit uses (`file_ids_exhausted`, `make_data_file_stem`, `recovery_key_cmp`, `kWriteFaultReason`), with module linkage. The definitions live in module implementation units (`module bytecask;`), one per area (#331): `engine_state.cpp` (`TransientEngineState`), `db.cpp` (construction, lifecycle, primary operations, the `apply_batch` entry, `mode` and `stats`), `db_commit.cpp` (writer executors, pipeline stage 2, `durable_sequence`), `db_state.cpp` (the read cache, state loading and publication), `db_read.cpp` (snapshot reads, range iteration), `db_degraded.cpp` (`sync_active_file`, degrading, `resume`), `db_rotation.cpp` (file rotation, hint generation), `db_vacuum.cpp`, `db_recovery.cpp` (the `recovery_*` members `open` runs) and `db_replication.cpp` (`set_mode`, `create_manifest`, `changes_since`, `ingest`). A unit sees the interface's non-exported declarations and imports, but not its global module fragment, so it carries its own `#include` block, complete for libc++, which makes nothing visible through other headers. A helper used by one unit stays in that unit's anonymous namespace. `xmake.lua`'s `add_engine_files()` is the one source list every target compiles the engine from.
 
-### Current scope boundaries
+### DataFile scope boundaries
 
 - `EntryType` is written and read back on `DataFile::read()`; atomic bulk semantics are enforced at a layer above `DataFile`.
 - No file rotation or size limits.
@@ -1140,9 +1140,9 @@ The reader reads only the zstd-framed layout. A hint in the uncompressed layout 
 
 `HintEntry.key` is a `std::span<const std::byte>` with no allocation per entry. In a framed file it points into the frame the scanner has decoded, so it is valid only until the scanner's next `next()` or `seek()`. A reader that keeps an entry longer copies it into a `HintRecord`, which owns its key and reuses its capacity: the merge cursors of `recovery_build_sorted` and `recovery_load_streams` hold their current entry and lookahead that way, and a blind fence owns its key. Testing builds give every decoded frame a fresh allocation, so a reader that breaks the rule reads freed memory, and ASan reports it instead of the reader silently seeing the next frame's bytes.
 
-## Hint File Format (.hint)
+## Hint File Format (.hint) and recovery from hints
 
-### Purpose
+### Hint file purpose
 
 Hint files are compact companion files to sealed (rotated) data files. Each hint entry summarises one data file entry — just enough metadata and the full key — so that the in-memory Key Directory can be rebuilt at startup by scanning the smaller hint files instead of the raw data files. Only sealed data files have a corresponding hint file; the active data file is recovered by scanning its raw bytes if needed.
 
@@ -1196,14 +1196,14 @@ A hint file is a derived index, not the records it points at, so a CRC failure i
 
 A read can also fail after the open pass succeeded: a scan reads the file again, and the second read can fail where the first did not. By then some of the file's entries have been applied, so neither a rebuild nor a skip is safe, and in both modes `DB::open` throws the `std::system_error`. Nothing has been written by then; the next open recovers. The lenient skip covers only a file that could not be opened, in every recovery path. The skip happens inside the worker that opens the file (`open_hint_or_skip`), so an error that escapes a recovery worker is one no mode answers, and every recovery path rethrows it whatever the mode.
 
-### Size Constants
+### Hint entry size constants
 
 - `kHintHeaderSize = 23` — fixed header fields (no per-entry CRC)
 - Total entry size: `kHintHeaderSize + key_len` (variable), before compression
 - `kHintFrameBytes = 16 KiB` — entry bytes after which a frame is closed
 - File overhead: 16-byte header, 4-byte file CRC trailer
 
-### Scanner API
+### Hint file `Scanner` API
 
 `HintFile::make_scanner()` returns a `Scanner` object that iterates over entries sequentially, reading and decoding one unit at a time into a buffer it owns; each thread shares one zstd decompression context, and one buffer for compressed bytes, among all its scanners. A failed read throws `std::system_error`. `HintEntry.key` is valid until the scanner's next `next()` or `seek()`.
 
@@ -1214,7 +1214,7 @@ while (auto he = scanner.next()) { /* use he->key, he->sequence, … */ }
 
 `position()` names where the next entry starts — the index of its unit and its offset in the decoded unit — and `seek()` returns there. Positions order like the entries they name. The blind recovery path records its fences as positions.
 
-### Recovery
+### Recovery from hint files at startup
 
 On engine startup:
 
@@ -1341,7 +1341,7 @@ A filesystem that cannot sync a directory returns `EINVAL`, which is taken as do
 
 On ext4 and XFS, metadata is journaled in order, so none of these entries is likely to be lost without the sync. The engine does not depend on that. Each site passes its own fault injection checkpoint to `sync_directory` (`io_dir_sync_*`), and the `[dir_sync]` tests fail each one: each shows its site still syncs, and that nothing the sync guards goes ahead when it fails.
 
-### Module Plan
+### `HintFile` module plan
 
 `HintFile` lives in the `bytecask.hint_file` C++20 module (`bytecaskdb/hint_file.cppm`), symmetric with `DataFile`:
 
@@ -1359,14 +1359,14 @@ Read API:
 
 `HintEntry` is a plain struct holding `{uint64_t sequence, EntryType entry_type, uint64_t file_offset, std::span<const std::byte> key, uint32_t value_size}`.
 
-## Range Scan: `iter_from`
+## Public API: types, iterators, `WritePlan`, `DB` and usage examples
 
 `iter_from` returns a lazy input range of `(Key, Bytes)` pairs in ascending key order. Each dereference issues a single `pread` via `DataFile::read_value_into()` — the caller-supplied `key_size` and `value_size` (from `KeyDirEntry`) let the engine compute the total entry size upfront, where a whole-file sweep, which does not know sizes in advance, reads 1 MiB chunks instead (`DataFileIterator`). The iterator reuses an internal I/O buffer and the cached value vector across advances, so sequential scans incur zero allocations after the first dereference.
 
 Results are always in ascending key order (key directory iteration order).
 
 
-### Type Aliases
+### Public type aliases
 
 ```cpp
 // Owned byte buffer — used for return values and batch storage.
@@ -1389,7 +1389,7 @@ using BytesView = std::span<const std::byte>;
 
 `WritePlan` is move-only and single-use; `DB::apply_batch` consumes it by move. See *Snapshots and conditional writes* below and `docs/transaction_design.md` for the full type definition and guard semantics.
 
-### Iterators
+### Iterators: `iter_from`, `keys_from` and reverse scans
 
 Forward scans use `iter_from` / `keys_from` (keys >= `from`); reverse scans use `riter_from` / `rkeys_from` (keys <= `from` in descending order). Both are available on `DB` and `Snapshot`. RocksDB equivalents: `Seek` + `Next` ↔ `iter_from`; `SeekForPrev` + `Prev` ↔ `riter_from`.
 
@@ -1451,7 +1451,7 @@ struct ReadOptions {
 
 **`sync` default of `true`**: preserves the pre-existing crash-safe behaviour. Callers that deliberately trade durability for throughput (e.g., bulk import, benchmarks) opt out explicitly by setting `sync = false`. `close()` (which the destructor calls) syncs before it returns, so `sync = false` on individual writes does not risk losing data on clean shutdown — only on an OS/power failure between the last write and the close. If that sync fails, `close()` throws, so the caller learns the writes are not durable.
 
-### Bytecask
+### `Bytecask` class (public API)
 
 ```cpp
 class Bytecask {
@@ -1535,7 +1535,7 @@ private:
 };
 ```
 
-### Usage Examples
+### Public API usage examples
 
 ```cpp
 // Open (or create) a database.
@@ -1573,11 +1573,11 @@ for (auto& key : db.rkeys_from(as_bytes("user:~"))) { ... }
 
 > `as_bytes` is a small helper that converts a string literal or `std::string_view` to `BytesView`. Its exact form is TBD.
 
-## Background Worker
+## Background Worker: deferred hint writes and `close()`
 
 `BackgroundWorker` is a non-exported internal class in `bytecask.engine`. It maintains a single persistent background thread that processes tasks in FIFO order.
 
-### API
+### `BackgroundWorker` API
 
 ```cpp
 class BackgroundWorker {
@@ -1591,11 +1591,11 @@ public:
 };
 ```
 
-### Lifetime invariant
+### `BackgroundWorker` lifetime invariant
 
 `BackgroundWorker` is declared as the **last member** of `Bytecask`. C++ destruction order is reverse of declaration order, so `worker_` destructs first — its destructor sets `stop_ = true`, notifies the worker thread, and joins it. This guarantees the background thread has finished all tasks before any other `Bytecask` member (`dir_`, `state_`, `write_mu_`, etc.) is destroyed. There is no risk of the background thread accessing freed memory.
 
-### Exception handling
+### `BackgroundWorker` exception handling
 
 Exceptions thrown by background tasks are caught per-task, logged to `stderr`, and swallowed. Hint file writes are correctness-safe to drop: recovery always falls back to scanning the raw `.data` file if no `.hint` companion exists.
 
@@ -1633,7 +1633,7 @@ The bindings report it too. Python: `DB.close()`, and `DB` is a context manager;
 
 To directly test correctness paths that only activate on IO failures (BC-131, BC-133), `bytecask.data_file` exposes a thread-local fault injection API compiled exclusively when `BYTECASK_TESTING` is defined.
 
-### API
+### Fault injection API
 
 ```cpp
 // Fail the Nth next append() call. n=0 fails immediately; n=1 lets one through, etc.
@@ -1652,7 +1652,7 @@ Fault state is per-thread (`thread_local FaultHooks`), so tests on different thr
 
 The checkpoints above fail the calls someone named. `bytecask_tests` also fails calls nobody named: it is linked with `-Wl,--wrap` for each I/O call it references, and the `[fault_sweep]` tests fail the 1st, 2nd, …, n-th call of each operation in turn, on each I/O back-end, and check generic invariants after each. It links the C++ standard library statically, so the calls the engine makes through `std::filesystem` (the hint's rename, vacuum's removes, `file_size`, `exists`, the directory scan at open) are counted like its own. A new I/O call is covered the day it is added, from the engine or from the standard library; one whose spelling has no interposer fails the link, except on glibc older than 2.33 (the manylinux wheels), where that guard is off. The sweep is Linux-only (Apple's linker has no `--wrap`). See `docs/correctness_validation.md`, *Counted fault sweep*.
 
-### Intended use
+### Fault injection: intended use and tests it enables
 
 The `FaultGuard` RAII helper in `bytecask_test.cpp` calls `fault_inject_reset()` on destruction, so the fault state is always cleared even when a test assertion fails.
 
@@ -1664,7 +1664,7 @@ Tests enabled by this seam:
 
 `PageCacheModel` (`fault_injector.h`, activated by `ScopedPageCacheModel`) models which bytes of a data file the device holds, so a test can cut the power after a failed `fdatasync` with Linux semantics. Per 4 KiB page it keeps the device's bytes while the cache holds others: a data file write records the page as it read before the write and marks it dirty, a successful sync forgets the dirty pages' images, and an injected sync failure (`FAULT_INJECTION_SYNC`) only clears their dirty marks, so later syncs keep them too. `restore_device(dir)` writes every image back — a power cut, or the kernel evicting the pages — and `mark_unsynced(path)` models a process killed before its sync; both are for a directory no engine has open. `copy_device(dir, dst)` is the cut for a live engine: it copies the directory and overlays the images on the copy, leaving the engine and its files untouched, so the proof generators cut the power after every cell and recover the copy against the durable watermark ([`correctness_validation.md`](correctness_validation.md), *Power-loss axis*). Hint files are not modelled; what they depend on is checked instead. A hint may only index bytes the device holds, which the engine keeps by ordering — a file is synced before it is sealed and hinted, a hint-less file is rewritten and synced before open hints it — and `hint_written`, called as each hint's trailer is written, records a violation if a page of the hint's data file has an image that differs from its current bytes (an image equal to them is a rewrite of durable data in flight, which the device holds either way). The `[fsyncgate]` tests and the generators use it.
 
-### Design notes
+### Fault injection: design notes
 
 The seam is intentionally minimal:
 - Zero production overhead: the `#ifdef BYTECASK_TESTING` blocks compile away entirely in non-test builds.
@@ -1773,7 +1773,7 @@ Read-path counters (`disk_reads`, `disk_read_bytes`, `pool_hits`, `pool_misses`)
 
 Counters are per-DB instance (`Counters` struct owned by `DB`). Two open databases have independent counter sets.
 
-## Design Decisions
+## Design Decisions log (numbered table)
 
 | # | Decision |
 |---|----------|
@@ -1797,13 +1797,13 @@ Counters are per-DB instance (`Counters` struct owned by `DB`). Two open databas
 | D18 | **Sequence-disjoint files**: All data files must have non-overlapping sequence ranges — no two files contain entries with the same sequence number. Active file rotation naturally preserves this (sealed files have contiguous sequence ranges). Vacuum compact must ensure compacted files maintain disjoint ranges; the one exception, a compacted file whose source outlived a kill, is removed at the next open (see *Vacuum → Crash safety*), and recovery refuses any other overlap. This invariant enables efficient replication (linear scan instead of min-heap merge), supports future file merging operations, and allows skipping entire files based on sequence bounds. |
 | D19 | **MariaDB insert hot path**: Handler-open state caches secondary-index metadata and direct catalog counter pointers. Per-row INSERT processing must not take catalog map locks for stable table metadata, row-count increments, or AUTO_INCREMENT reservations once the handler has opened the table. |
 
-## Replication Primitives
+## Replication Primitives: modes, `changes_since`, `ingest`, change markers
 
 ByteCaskDB exposes a minimal set of primitives for building leader-follower replication on top of the engine. The design avoids embedding a replication protocol — instead it provides the read and write building blocks that an external coordinator composes.
 
 See [`replication_primitives_design.md`](replication_primitives_design.md) for the full design reference.
 
-### Mode
+### Replication mode (`Mode::Leader` and `Mode::Follower`)
 
 ```cpp
 enum class Mode { Leader, Follower };
@@ -1873,7 +1873,7 @@ Divergence starts only at a promotion, so that is where the identity is recorded
 - **Unknown entry types are damage.** The data file parser used to cast the type byte without checking it, and every switch over `EntryType` is exhaustive with no default, so an unknown type would have fallen through. The file sweep now refuses a type byte outside the known set as it refuses a failed CRC: in the newest file it is cut with the tail, anywhere else the open is refused.
 - **Harness.** The topology replication check (`replication_checking_design.md`) promotes the least advanced follower on purpose in `topology-behind`; the fork now shows as `DbChangeMarkerMismatch` on the follower that was ahead, which the harness counts and answers with a re-bootstrap. The Python reference implements the same marker and checks, and `bytecaskdb-python/tests/test_reference_replication.py` runs a cluster model over it with an oracle on the histories; `test_reference.py` runs one scripted scenario on the reference and the engine and compares every outcome.
 
-## Working agreement
+## Working agreement: when to update this document
 
 For each repository change, this file should be updated when the change affects one of the following:
 
