@@ -21,18 +21,18 @@ How much of each suite the layer passes, from the functional suite's conformance
 
 | Suite | Coverage | Tests | Checks |
 |---|---|---|---|
-| SQL:2016 Core (sqltest) | 2% | 16/743 tests | statement accepted |
-| PostgreSQL features | 60% | 104/172 cases | results |
+| SQL:2016 Core (sqltest) | 8% | 62/743 tests | statement accepted |
+| PostgreSQL features | 61% | 105/172 cases | results |
 | ByteCaskDB features | 100% | 12/12 cases | results |
 | TPROC-C | 100% | 1/1 case: five transactions, then consistency conditions 1–9 | consistency conditions 1–9 |
 
-The suite is young: its cases are the first of the plan in `docs/functional_testing_design.md`, so a high percentage means few cases, not wide coverage. Most of sqltest's tests fail at their first statement: their tables have no primary key, which the layer refuses (a gap, not a decision: `docs/functional_testing_design.md`, Decision 11).
+The suite is young: its cases are the first of the plan in `docs/functional_testing_design.md`, so a high percentage means few cases, not wide coverage. Most of the sqltest tests that fail stop at a `SELECT` without `FROM`, a role, a view or schema, a table constraint, or a literal.
 
 ## Current state
 
 Built and tested:
 
-- **Statements:** `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `ALTER TABLE … ADD COLUMN`; `INSERT` of one row; `SELECT`; `UPDATE` and `DELETE` of any number of rows; `BEGIN`/`COMMIT`/`ROLLBACK`.
+- **Statements:** `CREATE TABLE`, with or without a primary key (a table without one keeps duplicate rows), `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `ALTER TABLE … ADD COLUMN`; `INSERT` of one row; `SELECT`; `UPDATE` and `DELETE` of any number of rows; `BEGIN`/`COMMIT`/`ROLLBACK`.
 - **Queries:** one table, or two joined (index nested loop or hash); `WHERE` as a conjunction of comparisons; `ORDER BY` with `NULLS FIRST`/`LAST`; `LIMIT`; `GROUP BY` and `HAVING`; `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`; `FOR UPDATE` on one table. Full scans and sorts are served.
 - **Types:** `SMALLINT`, `INTEGER`, `BIGINT`, `REAL`, `DOUBLE PRECISION`, `BOOLEAN`, `TEXT`, `VARCHAR(n)`, `BYTEA`, `DECIMAL(p, s)` with p ≤ 18, `DATE`, `TIME`, `TIMESTAMP`.
 - **Transactions:** statements read their own writes; DDL is its own statement, not transactional.
@@ -45,7 +45,7 @@ Not built yet (each is refused, with a message):
 - `OR`, `NOT`, `IN`, `BETWEEN`, `IS NULL`;
 - `OFFSET`, `RETURNING`, `ON CONFLICT`, multi-row `VALUES`, the `::` cast;
 - `SELECT *`, multiplication, division, modulo, unary minus, `LIKE`/`ILIKE`, `||`, string and date functions (`UPPER`, `LOWER`, `SUBSTRING`, `TRIM`, `POSITION`, `CHARACTER_LENGTH`, `EXTRACT`), `CAST`, date literals and `CURRENT_DATE`, date arithmetic; literals other than integers (strings and decimals travel as parameters);
-- a table without a primary key, column-level `UNIQUE`, `CHECK` and `REFERENCES` (use `CREATE UNIQUE INDEX`), views, `CREATE TABLE IF NOT EXISTS` (refused with 42P07), `TRUNCATE`, an `UPDATE` of a primary-key column;
+- a table of no columns, column-level `UNIQUE`, `CHECK` and `REFERENCES` (use `CREATE UNIQUE INDEX`), views, `CREATE TABLE IF NOT EXISTS` (refused with 42P07), `TRUNCATE`, an `UPDATE` of a primary-key column;
 - `SELECT` without a `FROM`, `EXPLAIN`, `SAVEPOINT`, `SET TRANSACTION` and `BEGIN READ ONLY`, sequences, serializable and read-committed isolation, transactional DDL;
 - a comparison of two columns, `SUM`/`AVG` and comparison of a `DOUBLE PRECISION` column, a timestamp with a seventh fractional digit (PostgreSQL rounds it).
 

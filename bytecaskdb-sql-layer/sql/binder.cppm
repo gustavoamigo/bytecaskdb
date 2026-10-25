@@ -908,7 +908,6 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
             out.columns.push_back(column_spec(c));
             if (c.primary_key) out.pk.push_back(c.name);
           }
-          if (out.pk.empty()) throw SqlError{"a table needs a PRIMARY KEY", s.pos};
           return {Ddl{std::move(out)}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::CreateIndex>) {
           const auto* t = b.table(s.table, s.pos);
@@ -938,10 +937,12 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           if (s.columns.empty()) {
             // As PostgreSQL: the values fill the leading columns and the rest
             // take their defaults, so a column added later changes nothing.
-            for (std::size_t i = 0; i < std::min(s.values.size(), t->columns.size()); ++i) {
-              targets.push_back(&t->columns[i]);
+            // The hidden row id is no column a statement fills.
+            for (const auto& c : t->columns) {
+              if (targets.size() == s.values.size()) break;
+              if (!c.hidden) targets.push_back(&c);
             }
-            if (s.values.size() > t->columns.size()) {
+            if (s.values.size() > targets.size()) {
               throw SqlError{"INSERT has more expressions than target columns", s.pos};
             }
           } else {

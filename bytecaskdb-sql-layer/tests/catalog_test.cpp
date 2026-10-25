@@ -166,7 +166,7 @@ TEST_CASE("catalog: a damaged or foreign-format record is refused", "[sql][catal
   };
   CHECK(format(1).find("earlier SQL-layer build") != std::string::npos);
   CHECK(format(2).find("earlier SQL-layer build") != std::string::npos);
-  CHECK(format(4).find("later SQL-layer build") != std::string::npos);
+  CHECK(format(5).find("later SQL-layer build") != std::string::npos);
 
   // Records that parse but break an invariant.
   auto broken = [](auto&& mutate) {
@@ -189,6 +189,160 @@ TEST_CASE("catalog: a damaged or foreign-format record is refused", "[sql][catal
   CHECK_THROWS_AS(parse_table(broken([](Table& t) { t.pk_col_ids = {0, 0}; })), std::runtime_error);
   CHECK_THROWS_AS(parse_table(broken([](Table& t) { t.indexes[0].parts = {{2, false}, {2, true}}; })),
                   std::runtime_error);
+}
+
+namespace {
+
+// `rec`, a format-4 record, as format 3 wrote it: no hidden flag at the end
+// of each column entry.
+auto as_format_3(const Bytes& rec) -> Bytes {
+  auto u16 = [&](std::size_t at) {
+    return std::to_integer<std::size_t>(rec[at]) | std::to_integer<std::size_t>(rec[at + 1]) << 8;
+  };
+  auto u32 = [&](std::size_t at) { return u16(at) | u16(at + 2) << 16; };
+  Bytes out{std::byte{3}, std::byte{0}};
+  auto at = std::size_t{2};
+  auto copy = [&](std::size_t n) {
+    auto from = rec.begin() + static_cast<std::ptrdiff_t>(at);
+    out.insert(out.end(), from, from + static_cast<std::ptrdiff_t>(n));
+    at += n;
+  };
+  copy(4);              // id
+  copy(2 + u16(at));    // name
+  copy(8);              // version, next_col_id
+  auto ncols = u16(at);
+  copy(2);
+  for (std::size_t i = 0; i < ncols; ++i) {
+    auto len = u32(at) - 1;  // the entry without its last byte, the hidden flag
+    for (std::size_t b = 0; b < 4; ++b) out.push_back(static_cast<std::byte>(len >> (8 * b)));
+    at += 4;
+    copy(len);
+    ++at;
+  }
+  copy(rec.size() - at);
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("catalog: a table without a primary key has a hidden row id as its key", "[sql][catalog]") {
+  sql_test::TempDir dir{"catalog_row_id"};
+  auto db = DB::open(dir.path());
+  LiveCatalog live{db};
+  (void)live.apply(CreateTableDdl{"k", {col("a", SqlKind::Integer), col("b", SqlKind::Text)}, {}});
+  auto cat = live.current();  // held: t is in it
+  const auto& t = *cat->table("k");
+  const auto* rid = t.row_id();
+  REQUIRE(rid != nullptr);
+  CHECK(rid->hidden);
+  CHECK(rid->sql == SqlType{SqlKind::BigInt});
+  CHECK_FALSE(rid->nullable);
+  CHECK(&t.columns.back() == rid);  // after the declared columns
+  CHECK(t.pk_col_ids == std::vector{rid->id});
+  CHECK(t.column("") == nullptr);  // no name resolves to it
+  CHECK(t.column("a")->id == 0);
+  // A table with a declared key has none.
+  (void)live.apply(create_t());
+  CHECK(live.current()->table("t")->row_id() == nullptr);
+
+  // The record round-trips the flag, and a format-3 record, which has none,
+  // reads with no hidden column; a format-3 entry read as format 4 runs one
+  // byte short.
+  auto rec = serialize_table(t);
+  auto u = parse_table(rec);
+  REQUIRE(u.row_id() != nullptr);
+  CHECK(u.row_id()->id == rid->id);
+  CHECK(serialize_table(u) == rec);
+  auto old = parse_table(as_format_3(serialize_table(rich_table())));
+  CHECK(std::ranges::none_of(old.columns, &Column::hidden));
+  CHECK(old.columns.size() == rich_table().columns.size());
+  auto short_entries = as_format_3(rec);
+  short_entries[0] = std::byte{4};
+  CHECK_THROWS_AS(parse_table(short_entries), std::runtime_error);
+
+  // A hidden column is only ever the whole key: a BIGINT with no name, no
+  // default and no index part, the table's only one.
+  auto broken = [&](auto&& mutate) {
+    auto v = t;
+    mutate(v);
+    return serialize_table(v);
+  };
+  auto hidden = [](Table& v) -> Column& { return *std::ranges::find_if(v.columns, &Column::hidden); };
+  CHECK_NOTHROW(parse_table(broken([](Table&) {})));
+  CHECK_THROWS_AS(parse_table(broken([&](Table& v) { hidden(v).name = "rid"; })), std::runtime_error);
+  CHECK_THROWS_AS(parse_table(broken([&](Table& v) { hidden(v).default_value = std::int64_t{1}; })),
+                  std::runtime_error);
+  CHECK_THROWS_AS(parse_table(broken([&](Table& v) {
+                    hidden(v).sql = {SqlKind::Integer};
+                    hidden(v).type = PhysType::I64;
+                  })),
+                  std::runtime_error);
+  CHECK_THROWS_AS(parse_table(broken([&](Table& v) { v.pk_col_ids = {0}; v.columns[0].nullable = false; })),
+                  std::runtime_error);
+  CHECK_THROWS_AS(parse_table(broken([&](Table& v) { v.pk_col_ids.push_back(0); v.columns[0].nullable = false; })),
+                  std::runtime_error);
+  CHECK_THROWS_AS(parse_table(broken([&](Table& v) { v.columns[0].hidden = true; })), std::runtime_error);
+  CHECK_THROWS_AS(
+      parse_table(broken([&](Table& v) { v.indexes.push_back({99, "k_rid", false, {{hidden(v).id, false}}}); })),
+      std::runtime_error);
+}
+
+TEST_CASE("catalog: row ids start past the greatest the data holds and are never handed out twice", "[sql][catalog]") {
+  sql_test::TempDir dir{"catalog_row_ids"};
+  auto put_row = [](DB& db, const Table& t, std::int64_t id) {
+    RowWriter w{t.layout};
+    REQUIRE(w.set_i64(t.row_id()->id, id));
+    Bytes row, pk;
+    REQUIRE(w.finish(row));
+    REQUIRE(encode_pk_from_row(t, row, pk));
+    db.put({}, pk, row);
+  };
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    (void)live.apply(CreateTableDdl{"a", {col("v", SqlKind::BigInt)}, {}});
+    (void)live.apply(CreateTableDdl{"b", {col("v", SqlKind::BigInt)}, {}});
+    (void)live.apply(CreateTableDdl{"c", {col("v", SqlKind::BigInt)}, {}});
+    auto cat = live.current();
+    const auto& a = *cat->table("a");
+    const auto& b = *cat->table("b");
+    // An empty table starts at 1; each table counts on its own.
+    CHECK(live.next_row_id(a) == 1);
+    CHECK(live.next_row_id(a) == 2);
+    // A table's first draw reads the greatest id the engine holds, not the
+    // neighbouring table's.
+    put_row(db, b, 41);
+    put_row(db, b, 7);
+    put_row(db, *cat->table("c"), 1000);
+    CHECK(live.next_row_id(b) == 42);
+    // Seeded once: a row written behind the counter's back is not read again.
+    put_row(db, a, 500);
+    CHECK(live.next_row_id(a) == 3);
+
+    // Concurrent draws never repeat.
+    constexpr int kThreads = 4;
+    constexpr int kEach = 500;
+    std::vector<std::vector<std::int64_t>> drawn(kThreads);
+    {
+      std::vector<std::jthread> threads;
+      for (auto& d : drawn) {
+        threads.emplace_back([&] {
+          for (int i = 0; i < kEach; ++i) d.push_back(live.next_row_id(b));
+        });
+      }
+    }
+    std::set<std::int64_t> all;
+    for (const auto& d : drawn) all.insert(d.begin(), d.end());
+    CHECK(all.size() == std::size_t{kThreads} * kEach);
+    CHECK(*all.begin() == 43);
+  }
+  // Reopened: past the greatest id the data holds, whatever was drawn.
+  auto db = DB::open(dir.path());
+  LiveCatalog live{db};
+  auto cat = live.current();
+  CHECK(live.next_row_id(*cat->table("a")) == 501);
+  CHECK(live.next_row_id(*cat->table("b")) == 42);
+  CHECK(live.next_row_id(*cat->table("c")) == 1001);
 }
 
 TEST_CASE("catalog: counters of the wrong width or past the id ceiling are refused at load", "[sql][catalog]") {
@@ -519,14 +673,15 @@ TEST_CASE("catalog: CREATE TABLE refuses in PostgreSQL's order", "[sql][catalog]
   CHECK(state({"t", {col("c", SqlKind::BigInt)}, {"zz"}}) == "42703");
   CHECK(state({"t", {col("c", SqlKind::BigInt)}, {"c", "c"}}) == "42701");
   // No columns: PostgreSQL accepts the list, so a key names a column that is not there (42703), ahead of
-  // an existing name too; with no key either, the layer's own rule applies after the name check.
+  // an existing name too; with no key either, the layer's own rule (a table needs columns) applies after
+  // the name check.
   CHECK(state({"t", {}, {"k"}}) == "42703");
   CHECK(state({"u", {}, {"k"}}) == "42703");
   CHECK(state({"t", {}, {}}) == "42P07");
   CHECK(state({"u", {}, {}}) == "0A000");
-  // A new name: the layer's own rules, which PostgreSQL does not have.
-  CHECK(state({"u", {col("c", SqlKind::BigInt)}, {}}) == "0A000");
+  // A new name: the layer's own rule, which PostgreSQL does not have; with no key, a row id is the key.
   CHECK(state({"u", {col("c", SqlKind::BigInt, true, 1.5)}, {"c"}}) == "42804");
+  CHECK(state({"u", {col("c", SqlKind::BigInt)}, {}}) == "created");
 }
 
 TEST_CASE("catalog: a DDL the engine refuses leaves nothing on disk or in memory", "[sql][catalog]") {

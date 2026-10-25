@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Gustavo Amigo
-"""The SQL layer against PostgreSQL: one Hypothesis state machine (#515).
+"""The SQL layer against PostgreSQL: Hypothesis state machines (#515).
 
 Each rule runs one statement on both sides and checks that they agree:
 both accept it, changing as many rows and returning the same rows, values
@@ -56,6 +56,11 @@ A model of the planner's rules (`served`, `join_served`) keeps the machine
 to statements the layer plans; the rest must be refused with "no plan".
 What is left of it is the dialect's own limit, a filter on a DOUBLE or REAL
 column no key takes.
+
+Tables without a primary key: a second machine, KeylessMachine, as this
+one reaches a table by its key. Inserts weighted towards copies of rows
+the table holds, UPDATE, DELETE and SELECT by full scans, COUNT(*) per
+group, and a reopen, each table and result compared as a bag of rows.
 
 The fixed cases at the end call the same steps in a set order.
 """
@@ -376,11 +381,14 @@ def draw_order(data, columns: list[str], label: str) -> list[tuple]:
              data.draw(st.sampled_from([None, True, False]), label=f"{label} {c} nulls")) for c in cols]
 
 
-class SqlMachine(RuleBasedStateMachine):
+class Sides:
+    """The two sides a machine runs each statement on, the layer (and the
+    server, when the wire target runs) and PostgreSQL, and the checks that
+    they agree. A state machine mixes it in and calls open_sides() first."""
+
     dsn: str = ""  # set by the test that runs the machine
 
-    def __init__(self):
-        super().__init__()
+    def open_sides(self):
         # PostgreSQL first: if it cannot connect, nothing else is open yet.
         self.pg = Oracle(self.dsn)
         try:
@@ -391,7 +399,6 @@ class SqlMachine(RuleBasedStateMachine):
             if hasattr(self, "dir"):
                 shutil.rmtree(self.dir, ignore_errors=True)
             raise
-        self.tables: dict[str, Table] = {}
         self.txn = None  # the layer's open transaction, if any
         self.wire = None  # the server's connection, when the wire target runs
         if server_binary():
@@ -512,6 +519,20 @@ class SqlMachine(RuleBasedStateMachine):
 
         return self.pg.conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR
 
+    def reopen(self) -> None:
+        self.db.close()
+        self.db = bytecask_sql.open(self.dir)
+        if self.wire is not None:  # the server stopped by SIGTERM and started again, on its data
+            self.stop_wire()
+            self.connect_wire(Server(self.wire_dir))
+
+
+class SqlMachine(Sides, RuleBasedStateMachine):
+    def __init__(self):
+        super().__init__()
+        self.tables: dict[str, Table] = {}
+        self.open_sides()
+
     def existing_keys(self, t: Table) -> list[tuple]:
         if self.txn is not None and self.txn.is_aborted:
             return []  # PostgreSQL answers nothing until the rollback
@@ -538,11 +559,6 @@ class SqlMachine(RuleBasedStateMachine):
         if out.error is None:
             self.tables[t.name] = t
         return out
-
-    def create_without_pk(self, t: Table) -> None:
-        # Known difference: the layer needs a primary key; PostgreSQL does not.
-        out = self.layer(t.ddl(pg=False))
-        assert out.error == "refused", f"{t.ddl(pg=False)}: a table without a primary key was accepted"
 
     def drop(self, name: str, if_exists: bool) -> o.Outcome:
         out = self.both(f"DROP TABLE {'IF EXISTS ' if if_exists else ''}{name}")
@@ -1032,13 +1048,6 @@ class SqlMachine(RuleBasedStateMachine):
         if self.wire is not None:
             assert o.run_wire(self.wire, "ROLLBACK").error is None
 
-    def reopen(self) -> None:
-        self.db.close()
-        self.db = bytecask_sql.open(self.dir)
-        if self.wire is not None:  # the server stopped by SIGTERM and started again, on its data
-            self.stop_wire()
-            self.connect_wire(Server(self.wire_dir))
-
     def check(self) -> None:
         names = sorted(t["name"] for t in self.db.catalog())
         assert names == sorted(self.tables), f"the layer's tables are {names}, expected {sorted(self.tables)}"
@@ -1090,8 +1099,11 @@ class SqlMachine(RuleBasedStateMachine):
         elif variant == "unknown pk column":
             t.pk = ["zz"]
         elif variant == "no pk":
+            # Both take it; this machine's steps reach a table by its key, so
+            # it is dropped again. KeylessMachine runs the tables without one.
             t.pk = []
-            self.create_without_pk(t)
+            if self.both(t.ddl(pg=False), pg_sql=t.ddl(pg=True)).error is None:
+                assert self.both(f"DROP TABLE {t.name}").error is None
             return
         self.create(t)
 
@@ -1513,6 +1525,182 @@ def test_sql_machine(dsn):
     run_state_machine_as_test(machine(dsn))
 
 
+# Tables without a primary key ------------------------------------------------
+
+KEYLESS_NAMES = ["k0", "k1"]
+
+
+class KeylessMachine(Sides, RuleBasedStateMachine):
+    """Tables declared without a primary key, which PostgreSQL and the layer
+    both take: every row inserted is kept, duplicates included, and UPDATE,
+    DELETE, SELECT and GROUP BY reach them by full scans. Rows have no key
+    to order them by, so a table, and each result, is compared as a bag of
+    rows. Reopening the layer keeps the rows, and the inserts after it add
+    rows rather than overwrite one."""
+
+    def __init__(self):
+        super().__init__()
+        self.tables: dict[str, Table] = {}
+        self.open_sides()
+
+    def rows(self, t: Table) -> list[tuple]:
+        """PostgreSQL's rows, in an order fixed by their values, so a draw
+        from them is reproducible from its seed."""
+        out = o.run_pg(self.pg.conn, f"{t.select_all} ORDER BY {', '.join(c.name for c in t.columns)}")
+        assert out.error is None, out.detail
+        return list(out.rows)
+
+    def bag(self, sql: str, params, pg_sql: str, types) -> None:
+        """A SELECT on both sides: the same rows, in any order."""
+        layer = self.served(sql, params, self.layer(sql, params, types))
+        pg = o.run_pg(self.pg.conn, pg_sql, params)
+        assert layer.error == pg.error, f"{sql} {params!r}: the layer {layer.error} ({layer.detail}), PostgreSQL {pg.error}"
+        assert collections.Counter(o.strict(layer.rows)) == collections.Counter(o.strict(pg.rows)), (
+            f"{sql} {params!r}: the layer returned {layer.rows}, PostgreSQL {pg.rows}")
+
+    @invariant()
+    def check(self) -> None:
+        catalog = {t["name"]: t for t in self.db.catalog()}
+        assert sorted(catalog) == sorted(self.tables), f"the layer's tables are {sorted(catalog)}, expected {sorted(self.tables)}"
+        for t in self.tables.values():
+            # Its columns, and no primary key: the row id is no column.
+            assert [c["name"] for c in catalog[t.name]["columns"]] == [c.name for c in t.columns]
+            assert catalog[t.name]["primary_key"] == []
+            layer = self.db.table_rows(t.name)["rows"]
+            pg = o.run_pg(self.pg.conn, t.select_all)
+            assert collections.Counter(o.strict(layer)) == collections.Counter(o.strict(pg.rows)), (
+                f"table {t.name}: the layer holds {layer}, PostgreSQL {list(pg.rows)}")
+
+    def draw_table(self, data) -> Table:
+        return self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="table")]
+
+    @staticmethod
+    def filterable(t: Table) -> list[str]:
+        """The columns a filter may compare: not a DOUBLE or REAL, which the
+        planner does not filter on (docs/frontend_design.md, *Known
+        differences*)."""
+        return [c.name for c in t.columns if c.type.kind not in ("float", "real")]
+
+    def draw_where(self, data, t: Table, first: int) -> tuple[str, str, list, list]:
+        """No WHERE, or col = $first on a filterable column, its value often
+        one a row holds: the layer's text, PostgreSQL's, the parameters and
+        their types."""
+        cols = self.filterable(t)
+        if not cols or data.draw(st.integers(0, 3), label="no where?") == 0:
+            return "", "", [], []
+        c = data.draw(st.sampled_from(cols), label="where column")
+        held = [r[[x.name for x in t.columns].index(c)] for r in self.rows(t)]
+        v = data.draw(st.sampled_from(held) if held and data.draw(st.booleans(), label="held?") else values(t.column(c).type),
+                      label="where value")
+        return f" WHERE {c} = ${first}", f" WHERE {c} = {typed(t, c, first)}", [v], [t.column(c).type]
+
+    @precondition(lambda self: len(self.tables) < len(KEYLESS_NAMES))
+    @rule(data=st.data())
+    def create_table(self, data):
+        free = [n for n in KEYLESS_NAMES if n not in self.tables]
+        n = data.draw(st.integers(1, 3), label="columns")
+        cols = [Column(f"c{i}", data.draw(st.sampled_from(TYPES), label=f"c{i} type"),
+                       nullable=data.draw(st.booleans(), label=f"c{i} nullable")) for i in range(n)]
+        t = Table(data.draw(st.sampled_from(free), label="name"), cols, [])
+        if self.both(t.ddl(pg=False), pg_sql=t.ddl(pg=True)).error is None:
+            self.tables[t.name] = t
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
+    def drop_table(self, data):
+        t = self.draw_table(data)
+        assert self.both(f"DROP TABLE {t.name}").error is None
+        del self.tables[t.name]
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
+    def insert(self, data):
+        """A row, often a copy of one the table holds; all its columns, or
+        some, the rest NULL."""
+        t = self.draw_table(data)
+        held = self.rows(t)
+        if held and data.draw(st.integers(0, 2), label="duplicate?") == 0:
+            row = dict(zip((c.name for c in t.columns), data.draw(st.sampled_from(held), label="copied row")))
+        else:
+            row = {c.name: data.draw(st.none() | values(c.type), label=c.name) for c in t.columns}
+        all_columns = data.draw(st.booleans(), label="all columns?")
+        if not all_columns:
+            keep = data.draw(st.lists(st.sampled_from(list(row)), min_size=1, unique=True), label="given")
+            row = {c: v for c, v in row.items() if c in keep}
+        cols = list(row)
+        target = "" if all_columns else f" ({', '.join(cols)})"
+        marks = ", ".join(f"${i + 1}" for i in range(len(cols)))
+        self.both(f"INSERT INTO {t.name}{target} VALUES ({marks})", [row[c] for c in cols],
+                  types=[t.column(c).type for c in cols])
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
+    def update(self, data):
+        t = self.draw_table(data)
+        c = data.draw(st.sampled_from([x.name for x in t.columns]), label="set column")
+        v = data.draw(st.none() | values(t.column(c).type), label="set value")
+        where, pg_where, params, types = self.draw_where(data, t, 2)
+        self.both(f"UPDATE {t.name} SET {c} = $1{where}", [v, *params], pg_sql=f"UPDATE {t.name} SET {c} = $1{pg_where}",
+                  types=[t.column(c).type, *types])
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
+    def delete(self, data):
+        t = self.draw_table(data)
+        where, pg_where, params, types = self.draw_where(data, t, 1)
+        self.both(f"DELETE FROM {t.name}{where}", params, pg_sql=f"DELETE FROM {t.name}{pg_where}", types=types)
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
+    def select(self, data):
+        t = self.draw_table(data)
+        cols = data.draw(st.lists(st.sampled_from([c.name for c in t.columns]), min_size=1, unique=True), label="selected")
+        where, pg_where, params, types = self.draw_where(data, t, 1)
+        self.bag(f"SELECT {', '.join(cols)} FROM {t.name}{where}", params,
+                 f"SELECT {', '.join(cols)} FROM {t.name}{pg_where}", types)
+
+    @precondition(lambda self: any(KeylessMachine.filterable(t) for t in self.tables.values()))
+    @rule(data=st.data())
+    def count_groups(self, data):
+        """COUNT(*) per value of a column: duplicates are counted, never merged."""
+        t = self.tables[data.draw(st.sampled_from(sorted(n for n, t in self.tables.items() if self.filterable(t))),
+                                  label="table")]
+        c = data.draw(st.sampled_from(self.filterable(t)), label="group column")
+        sql = f"SELECT {c}, COUNT(*) FROM {t.name} GROUP BY {c}"
+        self.bag(sql, [], sql, [])
+
+    @rule()
+    def reopen_layer(self):
+        self.reopen()
+
+
+def keyless_machine(dsn: str) -> type[KeylessMachine]:
+    return type("KeylessMachineWithOracle", (KeylessMachine,), {"dsn": dsn})
+
+
+def test_keyless_machine(dsn):
+    run_state_machine_as_test(keyless_machine(dsn))
+
+
+def test_a_table_without_a_primary_key_keeps_duplicates_across_a_reopen(dsn):
+    """Row ids after a reopen start past the rows the data holds: an insert
+    then adds a row, never collides with one (23505) or replaces it."""
+    m = keyless_machine(dsn)()
+    try:
+        t = Table("k0", [Column("c0", o.INTEGER), Column("c1", o.TEXT)], [])
+        assert m.both(t.ddl(pg=False), pg_sql=t.ddl(pg=True)).error is None
+        m.tables[t.name] = t
+        for row in ([1, "a"], [1, "a"], [None, "b"]):
+            assert m.both("INSERT INTO k0 VALUES ($1, $2)", row, types=[o.INTEGER, o.TEXT]).error is None
+        m.reopen()
+        for row in ([1, "a"], [2, None]):
+            assert m.both("INSERT INTO k0 VALUES ($1, $2)", row, types=[o.INTEGER, o.TEXT]).error is None
+        assert m.both("DELETE FROM k0 WHERE c0 = $1", [1], types=[o.INTEGER]).affected == 3
+        m.check()
+    finally:
+        m.teardown()
+
+
 # Fixed cases: the machine's steps in a set order. ---------------------------
 
 
@@ -1611,7 +1799,8 @@ def test_create_and_drop_refusals(dsn):
         assert m.create(t).error == "42P07"  # already exists
         assert m.create(Table("t1", [Column("c0", o.BIGINT), Column("c0", o.TEXT)], ["c0"])).error == "42701"
         assert m.create(Table("t1", [Column("c0", o.BIGINT)], ["zz"])).error == "42703"
-        m.create_without_pk(Table("t1", [Column("c0", o.BIGINT)], []))
+        assert m.both(Table("t1", [Column("c0", o.BIGINT)], []).ddl(pg=False)).error is None  # no key: a row id
+        assert m.both("DROP TABLE t1").error is None
         assert m.drop("t2", if_exists=False).error == "42P01"
         assert m.drop("t2", if_exists=True).error is None
         assert m.drop("t0", if_exists=False).error is None

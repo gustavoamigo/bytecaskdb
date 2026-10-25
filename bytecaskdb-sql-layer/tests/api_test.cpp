@@ -15,6 +15,7 @@
 #include <string>
 #include <type_traits>
 #include <variant>
+#include <thread>
 #include <vector>
 
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
@@ -644,6 +645,77 @@ TEST_CASE("embedded API: table_rows reads a table in key order; errors carry the
     CHECK(e.code() == BC_E_CORRUPT);
   }
   fourth->close();
+}
+
+TEST_CASE("embedded API: a table without a primary key keeps every row, duplicates included, under hidden row ids",
+          "[sql][api]") {
+  sql_test::TempDir dir{"api_row_id"};
+  auto rows_of = [](Database& d) {
+    auto r = d.table_rows("k");
+    CHECK(r.columns == std::vector<std::string>{"a", "b"});  // never the row id
+    return r.rows;
+  };
+  {
+    auto db = Database::open(dir.path());
+    (void)db->execute("CREATE TABLE k (a INTEGER, b TEXT)");
+    const auto& ins = db->prepare("INSERT INTO k VALUES ($1, $2)");
+    CHECK(ins.param_types() == std::vector<PhysType>{PhysType::I64, PhysType::Bytes});  // the row id is no parameter
+    CHECK(db->execute(ins, {i(1), bytes("x")}).affected == 1);
+    CHECK(db->execute(ins, {i(1), bytes("x")}).affected == 1);  // a duplicate is another row
+    CHECK(db->execute("INSERT INTO k (b) VALUES ($1)", {bytes("b only")}).affected == 1);
+    CHECK(sql_refusal(*db, "INSERT INTO k VALUES ($1, $2, $3)", {i(1), bytes("x"), i(3)}) ==
+          "INSERT has more expressions than target columns");
+    // Rows come back in the order they were inserted: the row id's.
+    CHECK(rows_of(*db) == Grid{{i(1), bytes("x")}, {i(1), bytes("x")}, {kNull, bytes("b only")}});
+
+    // A rolled-back insert leaves a gap, never a row.
+    {
+      auto t = db->begin();
+      (void)t.execute(ins, {i(9), bytes("gone")});
+      t.rollback();
+    }
+    // Two transactions inserting into the table both commit: their row ids
+    // differ, so no write conflicts.
+    auto t1 = db->begin();
+    auto t2 = db->begin();
+    (void)t1.execute(ins, {i(2), bytes("t1")});
+    (void)t2.execute(ins, {i(2), bytes("t2")});
+    CHECK(t1.commit() == CommitOutcome::Committed);
+    CHECK(t2.commit() == CommitOutcome::Committed);
+
+    // Concurrent autocommit inserts all land.
+    {
+      std::vector<std::jthread> threads;
+      for (int w = 0; w < 4; ++w) {
+        threads.emplace_back([&, w] {
+          for (int n = 0; n < 50; ++n) (void)db->execute(ins, {i(100 + w), bytes("c")});
+        });
+      }
+    }
+    CHECK(db->execute("SELECT COUNT(*) FROM k WHERE b = $1", {bytes("c")}).rows == Grid{{i(200)}});
+
+    CHECK(db->execute("UPDATE k SET b = $1 WHERE a = $2", {bytes("y"), i(1)}).affected == 2);
+    CHECK(db->execute("DELETE FROM k WHERE a >= $1", {i(100)}).affected == 200);
+    // No primary key is grouped, so no column depends on the group.
+    try {
+      (void)db->execute("SELECT a, b FROM k GROUP BY a");
+      FAIL("an ungrouped column was accepted");
+    } catch (const ast::SqlError& e) {
+      CHECK(e.sqlstate() == "42803");
+    }
+    CHECK(db->execute("SELECT a, COUNT(*) FROM k GROUP BY a ORDER BY a").rows ==
+          Grid{{i(1), i(2)}, {i(2), i(2)}, {kNull, i(1)}});
+    // A unique index on a column holds as on any table.
+    (void)db->execute("CREATE TABLE u (v INTEGER)");
+    (void)db->execute("CREATE UNIQUE INDEX u_v ON u (v)");
+    CHECK(db->execute("INSERT INTO u VALUES ($1)", {i(1)}).affected == 1);
+    CHECK_THROWS_AS(db->execute("INSERT INTO u VALUES ($1)", {i(1)}), ExecError);
+  }
+  // Reopened: the rows are all there, and the next row id is past them.
+  auto db = Database::open(dir.path());
+  CHECK(db->execute("INSERT INTO k VALUES ($1, $2)", {i(3), bytes("after")}).affected == 1);
+  CHECK(rows_of(*db) == Grid{{i(1), bytes("y")}, {i(1), bytes("y")}, {kNull, bytes("b only")}, {i(2), bytes("t1")},
+                             {i(2), bytes("t2")}, {i(3), bytes("after")}});
 }
 
 TEST_CASE("embedded API: a stored column that does not decode is BC_E_CORRUPT, never 0, empty or NULL",

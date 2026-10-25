@@ -31,7 +31,10 @@ kind the transformer doesn't take is refused with its position.
 
 **Statements.**
 - `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX` and
-  `ALTER TABLE … ADD COLUMN` (`catalog_design.md`, *DDL*).
+  `ALTER TABLE … ADD COLUMN` (`catalog_design.md`, *DDL*). A table
+  declared without a primary key keeps every row, duplicates included,
+  under a hidden row id no statement sees (`catalog_design.md`, *Tables
+  without a primary key*).
 - `INSERT … VALUES` of one row, with or without a column list.
 - `SELECT` targets: columns, `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT
   col)`, `SUM(col)`, `MIN(col)`, `MAX(col)` and `AVG(col)`, several of
@@ -279,9 +282,8 @@ Gaps, not decisions: PostgreSQL runs each, and the layer refuses it until
 it is built. The functional suite marks the cases that need one as not
 implemented (`functional_testing_design.md`).
 
-- **A table needs a primary key.** The layer refuses `CREATE TABLE` without
-  one; PostgreSQL accepts it. The proof machine sends that variant to the
-  layer only and expects the refusal.
+- **A table needs columns.** The layer refuses `CREATE TABLE t ()` (0A000);
+  PostgreSQL accepts a table of no columns.
 
 ## Decisions
 
