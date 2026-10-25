@@ -1551,14 +1551,16 @@ private:
   // degraded, and needs no flush role. For a failure after an append that no
   // I/O handler degraded for, and the last step of every degrade.
   void refuse_writes() noexcept;
-  // For a failure after bytes may have reached the file. Refuses writes
-  // first, then runs publish, which builds and stores the handler's degraded
-  // state; building it allocates, and if it cannot, the refusal stands on
-  // the flag. Never throws: the handler throws its own error after it,
-  // never the allocation's. publish runs under the caller's flush role.
+  // For a failure after bytes may have reached the file. Runs publish,
+  // which builds and stores the handler's degraded state, then refuses
+  // writes by the flag (refuse_writes) whether or not it could: building the
+  // state allocates. Never throws: the handler throws its own error after
+  // it, never the allocation's. The flag goes up after the publish, so no
+  // reader sees the generic reason before the handler's, and a quiesce()
+  // inside publish still lands the flush in flight. publish runs under the
+  // caller's flush role, or takes it.
   template <typename Publish>
   void degrade(Publish &&publish) noexcept {
-    write_fault_.store(true, std::memory_order_release);
     try {
 #ifdef BYTECASK_TESTING
       if (test_before_degrade_publish_) test_before_degrade_publish_();

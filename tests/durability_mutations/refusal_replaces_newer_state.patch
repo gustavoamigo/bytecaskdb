@@ -1,7 +1,7 @@
 refuse_writes stores its degraded copy whatever was published since it
 loaded the state, so a publication that landed in between, a flush's, is
 replaced by an older state. Reverts #623.
-Guarded-by: "refuse writes: the refusal keeps a state published while it was built"
+Guarded-by: "refuse writes: the refusal keeps a state published while it was built, refuse writes: the refusal retries on a healthy state published while it was built"
 
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
 index a57774b..2978387 100644

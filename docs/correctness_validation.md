@@ -2230,8 +2230,8 @@ each allocation it failed.
   threw `std::bad_alloc` in the I/O error's place, which the engine's own
   `refuse_writes()` outside the handler did not undo. No other check in
   the sweep noticed, whether or not a durable write followed. The fix is one
-  helper, `degrade`, in every handler of the three kinds. It refuses by the
-  flag first and then publishes what it can. The commit path's handlers
+  helper, `degrade`, in every handler of the three kinds. It publishes what
+  it can and then refuses by the flag. The commit path's handlers
   (`commit_appended`'s three and `flush_failed`) had the same gap, found by
   the sweeps of a sync `put` and a write that crosses a rotation.
 - *The refusal could publish an older state.* `refuse_writes()` loaded the
@@ -2914,7 +2914,8 @@ A site whose break nothing has to catch says why instead.
 | `execute_slots`: a rotation behind a failed flush stays degraded | `pipeline: rotation behind a failed flush stays degraded` | `rotation_publishes_over_degrade` | #170 |
 | `execute_slots`: a sync write that appends nothing makes earlier unsynced writes durable | `apply_batch: an empty sync plan makes earlier unsynced writes …` | `sync_only_write_skips_sync` | #192 |
 | `degrade`: writes are refused by the flag, whether or not the degraded state can be built | `alloc sweep: set_mode(Leader) whose marker append fails` (and every other I/O sweep) | `degrade_does_not_refuse` | #583, #618 |
-| `refuse_writes`: the refusal never replaces a state published after it loaded its own | `refuse writes: the refusal keeps a state published while it was built` | `refusal_replaces_newer_state` | #623 |
+| `degrade`: the flag goes up after the publish, so `execute_group`'s `quiesce()` lands the writes appended before a failed append | `refuse writes: a failed append lands the writes appended before it` | `degrade_refuses_before_flush_lands` | #623 |
+| `refuse_writes`: the refusal never replaces a state published after it loaded its own | `refuse writes: the refusal keeps a state published while it was built`, `refuse writes: the refusal retries on a healthy state published while it was built` | `refusal_replaces_newer_state` | #623 |
 | `commit_wait`: a waiter that sees a failed flush's refusal reports its I/O error, not `DbDegraded` | none: the window is between two loads in one waiter, which no test hook reaches; the order is the one `flush_failed` and `flush_threw` write in | — | #623 |
 | `flush_failed`: a failed group-commit `fdatasync` throws its own error when the degraded state cannot be published | `alloc sweep: put whose fdatasync fails` | `flush_failure_not_rethrown` | #623 |
 | `commit_appended`: a failed rotation `fdatasync` throws its own error | `alloc sweep: rotation-crossing write whose rotation fdatasync fails` | `commit_rotation_sync_failure_not_rethrown` | #623 |

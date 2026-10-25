@@ -5,18 +5,10 @@ writable. Reverts #583, #618.
 Guarded-by: "alloc sweep: set_mode(Leader) whose marker append fails"
 
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index a57774b..900ff74 100644
+index 17ad7c8..e4eac4d 100644
 --- a/bytecaskdb/bytecask.cppm
 +++ b/bytecaskdb/bytecask.cppm
-@@ -1558,7 +1558,6 @@ private:
-   // never the allocation's. publish runs under the caller's flush role.
-   template <typename Publish>
-   void degrade(Publish &&publish) noexcept {
--    write_fault_.store(true, std::memory_order_release);
-     try {
- #ifdef BYTECASK_TESTING
-       if (test_before_degrade_publish_) test_before_degrade_publish_();
-@@ -1568,7 +1567,6 @@ private:
+@@ -1570,7 +1570,6 @@ private:
        // No memory to say why: the flag refuses, and refuse_writes publishes
        // the generic reason if it can.
      }

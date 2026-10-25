@@ -1,0 +1,18 @@
+degrade refuses writes by the flag before it publishes, so the quiesce() in
+execute_group's append handler finds writes refused and its flush publishes
+nothing: the writers appended before the failure, whose writes succeeded,
+are told DbDegraded.
+Guarded-by: "refuse writes: a failed append lands the writes appended before it"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index 17ad7c8..bcf1e9e 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -1561,6 +1561,7 @@ private:
+   // caller's flush role, or takes it.
+   template <typename Publish>
+   void degrade(Publish &&publish) noexcept {
++    write_fault_.store(true, std::memory_order_release);
+     try {
+ #ifdef BYTECASK_TESTING
+       if (test_before_degrade_publish_) test_before_degrade_publish_();

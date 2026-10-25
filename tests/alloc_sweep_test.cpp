@@ -1804,6 +1804,68 @@ TEST_CASE("refuse writes: the refusal keeps a state published while it was "
   expect_refused_then_resumed(db, dir, {}, "k1", "over");
 }
 
+// A failed append degrades only after the flush in flight lands: the
+// writers appended before it succeeded and must be told so, not DbDegraded.
+// Writer A has appended and not yet waited; writer B's append fails.
+TEST_CASE("refuse writes: a failed append lands the writes appended before "
+          "it",
+          "[refuse_writes]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = open_db(dir, {});
+  seed(*db);
+  bool b_threw = false;
+  bool once = true;
+  db->test_before_commit_wait_ = [&] {
+    if (!once) return;
+    once = false;
+    bytecask::testing::ScopedFaultInjector fi{
+        "io_data_file_append_partial",
+        bytecask::testing::PostWriteMode::throw_after};
+    try {
+      (void)db->put({.sync = true}, to_bytes("k2"), to_bytes("b"));
+    } catch (const std::system_error &) {
+      b_threw = true;
+    }
+  };
+  const auto a = db->put({.sync = true}, to_bytes("k1"), to_bytes("a"));
+  db->test_before_commit_wait_ = nullptr;
+  CHECK(b_threw);
+  CHECK(a.durable);
+  CHECK(value_of(*db, "k1") == "a");
+  CHECK(db->is_degraded());
+  expect_refused_then_resumed(db, dir, {}, "k1", "a");
+}
+
+// The same when what lands in between is healthy, as a flush's publication
+// is: the refusal retries on it, so the state it degrades is the newer one.
+TEST_CASE("refuse writes: the refusal retries on a healthy state published "
+          "while it was built",
+          "[refuse_writes]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = open_db(dir, {});
+  seed(*db);
+  db->test_after_append_ = [] { throw std::bad_alloc{}; };
+  int builds = 0;
+  std::shared_ptr<const bytecask::EngineState> newer;
+  db->test_before_refusal_swap_ = [&] {
+    if (++builds > 1) return;
+    auto s = std::make_shared<bytecask::EngineState>(*db->engine_state());
+    newer = s;
+    db->test_publish_unchecked(std::move(s));
+  };
+  CHECK_THROWS_AS(db->put({.sync = true}, to_bytes("k1"), to_bytes("over")),
+                  std::bad_alloc);
+  db->test_after_append_ = nullptr;
+  db->test_before_refusal_swap_ = nullptr;
+  CHECK(builds == 2);
+  const auto published = db->engine_state();
+  CHECK(published != newer);
+  CHECK(published->degraded);
+  expect_refused_then_resumed(db, dir, {}, "k1", "over");
+}
+
 // A flush that throws before it publishes must give the flush role back, or
 // every later writer waits for it forever.
 TEST_CASE("refuse writes: a flush that throws releases the flush role",
@@ -2038,4 +2100,57 @@ TEST_CASE("refuse writes: set_mode(Leader)'s rotation cannot create a file",
   auto reopened = DB::open(dir, {});
   CHECK(value_of(reopened, "late") == "x");
   bytecask::testing::assert_consistent(reopened);
+}
+
+// A slice that rotates and then fails its next rotation: the degraded state
+// is the one before the slice, which does not know the file the slice
+// created. resume() replays the active file it does know, and re-delivery
+// writes the rest again into a new file, so the first copy stays on disk
+// outside the state until a reopen reads it. Nothing is lost or seen twice.
+TEST_CASE("refuse writes: a slice that fails its second rotation resumes, "
+          "takes re-delivery and reopens whole",
+          "[refuse_writes]") {
+  const auto checkpoint = GENERATE(std::string{"io_rotate_file_creation"},
+                                   std::string{"io_data_file_sync"});
+  TempDir td;
+  bytecask::testing::OwnedEntries slice;
+  {
+    auto leader = DB::open(td.path / "leader");
+    for (int i = 0; i < 12; ++i)
+      leader.put({.sync = true}, to_bytes(std::format("r{:02}", i)),
+                 to_bytes(std::string(60, static_cast<char>('a' + i))));
+    const auto snap = leader.snapshot();
+    slice = bytecask::testing::collect_changes(leader.changes_since(snap, 0));
+  }
+  const Options opts{.max_file_bytes = 200, .initial_mode = bytecask::Mode::Follower};
+  const auto dir = td.path / "follower";
+  {
+    auto db = open_db(dir, opts);
+    {
+      bytecask::testing::ScopedFaultInjector fi{checkpoint};
+      fi.inj.fail_on_nth_match = 2;
+      CHECK_THROWS(db->ingest(slice.header, slice.views()));
+      CHECK(fi.inj.fired);
+    }
+    INFO(checkpoint);
+    CHECK(value_of(*db, "r00") == "<absent>");
+    std::size_t on_disk = 0;
+    for (const auto &e : std::filesystem::directory_iterator{dir})
+      if (e.path().extension() == ".data") ++on_disk;
+    CHECK(on_disk > db->file_stats().size());  // the file the slice created
+    REQUIRE_NOTHROW(db->resume());
+    bytecask::testing::assert_consistent(*db);
+    db->ingest(slice.header, slice.views());
+    for (int i = 0; i < 12; ++i)
+      CHECK(value_of(*db, std::format("r{:02}", i)) == std::string(60, static_cast<char>('a' + i)));
+    db->close();
+  }
+  auto reopened = DB::open(dir, opts);
+  bytecask::testing::assert_consistent(reopened);
+  for (int i = 0; i < 12; ++i)
+    CHECK(value_of(reopened, std::format("r{:02}", i)) == std::string(60, static_cast<char>('a' + i)));
+  std::size_t files = 0;
+  for (const auto &e : std::filesystem::directory_iterator{dir})
+    if (e.path().extension() == ".data") ++files;
+  CHECK(files == reopened.file_stats().size());
 }
