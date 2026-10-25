@@ -1,0 +1,226 @@
+# DATE, TIME and TIMESTAMP: comparison, order, arithmetic and the forms the
+# layer refuses. Values go in by parameter, as text.
+
+- name: DATE compared with a parameter
+  features: [F051-04]
+  setup:
+    - CREATE TABLE dt (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)
+  steps:
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [1, "2026-10-25", "2026-10-25 12:00:00"]
+      rowcount: 1
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [2, "2026-02-28", "2026-02-28 23:59:59.999999"]
+      rowcount: 1
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [3, "1999-12-31", "1999-12-31 00:00:00"]
+      rowcount: 1
+    - sql: SELECT id FROM dt WHERE d > $1 AND id >= $2
+      params: ["2026-01-01", 0]
+      expected: [[1], [2]]
+  teardown:
+    - DROP TABLE dt
+
+- name: TIMESTAMP compared with a parameter
+  features: [F051-04]
+  setup:
+    - CREATE TABLE dt (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)
+  steps:
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [1, "2026-10-25", "2026-10-25 12:00:00"]
+      rowcount: 1
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [2, "2026-02-28", "2026-02-28 23:59:59.999999"]
+      rowcount: 1
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [3, "1999-12-31", "1999-12-31 00:00:00"]
+      rowcount: 1
+    - sql: SELECT id FROM dt WHERE ts <= $1 AND id >= $2
+      params: ["2026-02-28 23:59:59.999999", 0]
+      expected: [[2], [3]]
+  teardown:
+    - DROP TABLE dt
+
+- name: ORDER BY a DATE and a TIMESTAMP
+  features: [F051-04]
+  ordered: true
+  setup:
+    - CREATE TABLE dt (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)
+  steps:
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [1, "2026-10-25", "2026-10-25 12:00:00"]
+      rowcount: 1
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [2, "2026-02-28", "2026-02-28 23:59:59.999999"]
+      rowcount: 1
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [3, "1999-12-31", "1999-12-31 00:00:00"]
+      rowcount: 1
+    - sql: SELECT id FROM dt WHERE id >= $1 ORDER BY ts DESC
+      params: [0]
+      expected: [[1], [2], [3]]
+  teardown:
+    - DROP TABLE dt
+
+- name: MIN and MAX of a DATE
+  features: [F051-01, E091-03, E091-04]
+  setup:
+    - CREATE TABLE dt (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)
+  steps:
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [1, "2026-10-25", "2026-10-25 12:00:00"]
+      rowcount: 1
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [2, "2026-02-28", "2026-02-28 23:59:59.999999"]
+      rowcount: 1
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [3, "1999-12-31", "1999-12-31 00:00:00"]
+      rowcount: 1
+    - sql: SELECT MIN(d), MAX(d) FROM dt WHERE id >= $1
+      params: [0]
+      expected: [["1999-12-31", "2026-10-25"]]
+  teardown:
+    - DROP TABLE dt
+
+- name: the difference of two DATEs
+  features: [F051-01]
+  # only columns and aggregates can be selected
+  unimplemented: true
+  ordered: true
+  setup:
+    - CREATE TABLE dt (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)
+  steps:
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [1, "2026-10-25", "2026-10-25 12:00:00"]
+      rowcount: 1
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [2, "2026-02-28", "2026-02-28 23:59:59.999999"]
+      rowcount: 1
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [3, "1999-12-31", "1999-12-31 00:00:00"]
+      rowcount: 1
+    - sql: SELECT id, d - $1 FROM dt WHERE id >= $2 ORDER BY id
+      params: ["2026-01-01", 0]
+      expected: [[1, 297], [2, 58], [3, -9498]]
+  teardown:
+    - DROP TABLE dt
+
+- name: CAST of a string to a DATE
+  features: [F051-05]
+  # expression not supported
+  unimplemented: true
+  setup:
+    - CREATE TABLE dt (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)
+  steps:
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [1, "2026-10-25", "2026-10-25 12:00:00"]
+      rowcount: 1
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [2, "2026-02-28", "2026-02-28 23:59:59.999999"]
+      rowcount: 1
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [3, "1999-12-31", "1999-12-31 00:00:00"]
+      rowcount: 1
+    - sql: SELECT id FROM dt WHERE d = CAST($1 AS DATE) AND id >= $2
+      params: ["2026-10-25", 0]
+      expected: [[1]]
+  teardown:
+    - DROP TABLE dt
+
+- name: a DATE literal
+  features: [F051-01]
+  # expression not supported
+  unimplemented: true
+  setup:
+    - CREATE TABLE dt (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)
+  steps:
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [1, "2026-10-25", "2026-10-25 12:00:00"]
+      rowcount: 1
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [2, "2026-02-28", "2026-02-28 23:59:59.999999"]
+      rowcount: 1
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [3, "1999-12-31", "1999-12-31 00:00:00"]
+      rowcount: 1
+    - sql: SELECT id FROM dt WHERE d = DATE '2026-10-25' AND id >= $1
+      params: [0]
+      expected: [[1]]
+  teardown:
+    - DROP TABLE dt
+
+- name: CURRENT_DATE has no row to compare, but is a DATE
+  features: [F051-06]
+  # expression not supported
+  unimplemented: true
+  setup:
+    - CREATE TABLE dt (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)
+  steps:
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [1, "2026-10-25", "2026-10-25 12:00:00"]
+      rowcount: 1
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [2, "2026-02-28", "2026-02-28 23:59:59.999999"]
+      rowcount: 1
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [3, "1999-12-31", "1999-12-31 00:00:00"]
+      rowcount: 1
+    - sql: SELECT id FROM dt WHERE d < CURRENT_DATE AND id >= $1
+      params: [0]
+      expected: [[2], [3]]
+  teardown:
+    - DROP TABLE dt
+
+- name: EXTRACT of the year
+  features: [pg:extract]
+  # function extract is not supported
+  unimplemented: true
+  ordered: true
+  setup:
+    - CREATE TABLE dt (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)
+  steps:
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [1, "2026-10-25", "2026-10-25 12:00:00"]
+      rowcount: 1
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [2, "2026-02-28", "2026-02-28 23:59:59.999999"]
+      rowcount: 1
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [3, "1999-12-31", "1999-12-31 00:00:00"]
+      rowcount: 1
+    - sql: SELECT id, EXTRACT(YEAR FROM d) FROM dt WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 2026], [2, 2026], [3, 1999]]
+  teardown:
+    - DROP TABLE dt
+
+- name: TIMESTAMP rounds a seventh digit
+  features: [F051-03]
+  # the layer refuses a seventh fractional digit (22007); PostgreSQL rounds to microseconds
+  unimplemented: true
+  ordered: true
+  setup:
+    - CREATE TABLE dt (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)
+  steps:
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [1, "2026-10-25", "2026-10-25 12:00:00.1234565"]
+      rowcount: 1
+    - sql: SELECT id, ts FROM dt WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, "2026-10-25 12:00:00.123456"]]
+  teardown:
+    - DROP TABLE dt
+
+- name: a TIMESTAMP outside the range is refused
+  features: [F051-03]
+  setup:
+    - CREATE TABLE dt (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)
+  steps:
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [1, "2026-10-25", "294277-01-01 00:00:00"]
+      error: "22008"
+    - sql: SELECT id FROM dt WHERE id >= $1
+      params: [0]
+      expected: []
+  teardown:
+    - DROP TABLE dt

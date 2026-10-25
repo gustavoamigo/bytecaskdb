@@ -1,0 +1,62 @@
+# Identifiers: case folding, quoting and reserved words.
+
+- name: an unquoted name is folded to lower case
+  features: [E031-02]
+  steps:
+    - sql: CREATE TABLE MixedCase (Id INTEGER PRIMARY KEY, Val INTEGER)
+    - sql: INSERT INTO mixedcase VALUES ($1, $2)
+      params: [1, 1]
+      rowcount: 1
+    - sql: SELECT id, val FROM MIXEDCASE WHERE ID >= $1
+      params: [0]
+      expected: [[1, 1]]
+  teardown:
+    - DROP TABLE mixedcase
+
+- name: a quoted name keeps its case
+  features: [E031-01]
+  steps:
+    - sql: CREATE TABLE "Q" ("Id" INTEGER PRIMARY KEY, "v" INTEGER)
+    - sql: INSERT INTO "Q" VALUES ($1, $2)
+      params: [1, 1]
+      rowcount: 1
+    - sql: SELECT "Id", "v" FROM "Q" WHERE "Id" >= $1
+      params: [0]
+      expected: [[1, 1]]
+  teardown:
+    - DROP TABLE "Q"
+
+- name: a quoted name can be a reserved word
+  features: [E031-01]
+  steps:
+    - sql: CREATE TABLE "select" ("from" INTEGER PRIMARY KEY)
+    - sql: INSERT INTO "select" VALUES ($1)
+      params: [1]
+      rowcount: 1
+    - sql: SELECT "from" FROM "select" WHERE "from" >= $1
+      params: [0]
+      expected: [[1]]
+  teardown:
+    - DROP TABLE "select"
+
+- name: a name with a trailing underscore
+  features: [E031-03]
+  steps:
+    - sql: CREATE TABLE t_ (a_ INTEGER PRIMARY KEY)
+    - sql: INSERT INTO t_ VALUES ($1)
+      params: [1]
+      rowcount: 1
+    - sql: SELECT a_ FROM t_ WHERE a_ >= $1
+      params: [0]
+      expected: [[1]]
+  teardown:
+    - DROP TABLE t_
+
+- name: two quoted names that differ only in case are two tables
+  features: [E031-01]
+  steps:
+    - sql: CREATE TABLE "T" (id INTEGER PRIMARY KEY)
+    - sql: CREATE TABLE "t" (id INTEGER PRIMARY KEY)
+  teardown:
+    - DROP TABLE "T"
+    - DROP TABLE "t"
