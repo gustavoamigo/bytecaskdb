@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Gustavo Amigo
-"""Our cases (cases/<suite>/*.yaml), one test each."""
+"""Our cases (cases/<suite>/*.yaml) and sqltest's tests, one test each."""
 
 from __future__ import annotations
 
 import pytest
 
 from executor import run_case
+from loaders.sqltest import load_sqltest
 from loaders.yaml_cases import load_suite
 from manifest import load_manifest
 
@@ -16,6 +17,7 @@ def pytest_generate_tests(metafunc):
         return
     features = set(load_manifest())
     cases = [c for suite in ("postgresql", "bytecaskdb") for c in load_suite(suite, features=features)]
+    cases += load_sqltest(features)
     metafunc.parametrize("case", [
         pytest.param(c, id=f"{c.suite}/{c.id}", marks=[getattr(pytest.mark, f) for f in c.features])
         for c in cases

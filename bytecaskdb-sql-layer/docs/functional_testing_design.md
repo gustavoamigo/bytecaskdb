@@ -12,7 +12,7 @@ one report says how much of each the layer passes:
 
 | Suite | Coverage | Tests | Checks |
 |---|---|---|---|
-| SQL:2016 Core | x% | n/739 sqltest | statement accepted |
+| SQL:2016 Core | x% | n/743 sqltest | statement accepted |
 | PostgreSQL features | x% | n/N cases | results |
 | ByteCaskDB features | x% | n/N cases | results |
 | TPC-H-derived | x% | n/22 queries | results |
@@ -99,12 +99,13 @@ The flags and the lists are for the build, and only for it:
 ### SQL:2016 Core: sqltest
 
 [sqltest](https://github.com/elliotchance/sqltest) (MIT) has tests for
-the mandatory features of the SQL:2016 standard, by feature id: about
-740 tests over 134 subfeatures, in `standards/2016/{E,F}/*.tests.yml`.
+the mandatory features of the SQL:2016 standard, by feature id: 743
+tests over 134 features, in `standards/2016/{E,F,S,T}/*.tests.yml`.
 Core SQL was defined in SQL:1999; the tests are the 2016 edition's, so
 the row says 2016.
 
-- **Source:** in the repository, pinned to one commit, with its MIT
+- **Source:** the generated `*.tests.yml` files, unchanged, in
+  `tests/functional/suites/sqltest/`, pinned to one commit, with its MIT
   notice.
 - **Loader:** each test is a case with sqltest's id (`f041_03_01_04`)
   and its feature (`F041-03`), and each of its statements a step that
@@ -112,7 +113,10 @@ the row says 2016.
 - **Checks:** that the statements are accepted. sqltest has no expected
   results, and keeping its rule keeps the number comparable with other
   projects'. Its tables have no primary key, which the layer doesn't
-  support yet, so many cases start not implemented.
+  support yet, so most cases start not implemented. A first run passed
+  16 of the 743: 374 stop at that refusal, and the rest at other forms
+  the dialect leaves out. The list is
+  `tests/functional/not_implemented/sqltest.txt`.
 
 ### PostgreSQL features and ByteCaskDB features: our cases
 
