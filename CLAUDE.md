@@ -143,6 +143,8 @@ A `thread_local` outlives every DB its thread touches, so one holding a DB's sta
 - Be honest about weaknesses. Acknowledging a real limitation earns more trust than hiding it.
 - Don't extrapolate benchmark results beyond what has actually been measured.
 - `CONTRACT.md` states what the engine guarantees, not how it works. A sentence that could change while every guarantee stays the same is mechanism and belongs in `docs/bytecask_design.md`. Every name in it is declared in `include/bytecask.hpp`; `scripts/check_contract_vocabulary.py` fails CI on a private name (#399). Each row names the tests that prove it, or `none`; a change to a guarantee is named in the PR that makes it. `bytecaskdb-sql-layer/CONTRACT.md` follows the same rules for the SQL layer, against `bytecaskdb-sql-layer/algebra/bc_plan.h` and `bytecaskdb-sql-layer/api/database.cppm`, with its mechanism in `bytecaskdb-sql-layer/docs/`.
+- Headings in `docs/` say what their section covers, because an agent routes by `grep -n '^##' <doc>` and reads a range. "Data File Format (.data)" and "Operational Counters" are the model; "Purpose", "API" and "Scope" are not. Name the subject, and qualify a heading that repeats under another parent (``### `BackgroundWorker` API``, not `### API`).
+- Before renaming a heading, search the repo for its name and its anchor (`#slug`), in other docs, source comments and `tests/*_mutations/` patches. Leave a cited heading as it is, or fix every citation in the same PR.
 
 ## README guidelines
 
