@@ -13,7 +13,6 @@ one report says how much of each the layer passes:
 | Suite | Coverage | Tests | Checks |
 |---|---|---|---|
 | SQL:2016 Core | x% | n/739 sqltest | statement accepted |
-| SQLLogicTest | x% | n files (~7.4M queries) | results |
 | PostgreSQL features | x% | n/N cases | results |
 | ByteCaskDB features | x% | n/N cases | results |
 | TPC-H-derived | x% | n/22 queries | results |
@@ -46,8 +45,7 @@ python3 bytecaskdb-sql-layer/tests/functional/report.py results.json > report.md
 
 - **One case model.** A case is a list of steps. Each step is SQL and
   one expectation: it succeeds, it returns these rows (in order, or
-  sorted), its rows hash to a value, or it fails with an error (a given
-  SQLSTATE, or any error). A case has an id, the suite it belongs to,
+  sorted), or it fails with a given SQLSTATE. A case has an id, the suite it belongs to,
   the features it covers, and whether it is implemented yet.
 - **A loader per suite** reads that suite's files in their own format
   and yields cases, when the run starts. Nothing is converted by hand or
@@ -103,26 +101,6 @@ the row says 2016.
   results, and keeping its rule keeps the number comparable with other
   projects'. Its tables have no primary key, which the layer doesn't
   support yet, so many cases start not implemented.
-
-### SQLLogicTest
-
-The sqllogictest files (public domain): about 620 files and 7.4 million
-queries, each with the results several databases agreed on.
-
-- **Source:** fetched at a pinned commit when the suite runs, and
-  cached. Not committed: it is large.
-- **Loader:** a file is parsed record by record.
-  - `statement ok` and `statement error` are steps that must succeed or
-    fail; the files give no SQLSTATE.
-  - `query <types> <sort>` is a step with expected rows. `nosort` keeps
-    their order; `rowsort` and `valuesort` sort first, as sqllogictest
-    defines them.
-  - "N values hashing to H" is a hash expectation, computed as
-    sqllogictest computes it: values formatted by column type (`R` to
-    three decimals), NULL as `NULL`, the empty string as `(empty)`.
-  - `skipif` and `onlyif` are evaluated with the layer as `postgresql`.
-  - A case is one file and the line of its record.
-- **Checks:** results.
 
 ### PostgreSQL features and ByteCaskDB features: our cases
 
@@ -268,12 +246,10 @@ covers it yet.
 ## CI
 
 In `sql-layer.yml`:
-- **Every PR:** builds the server and runs every suite but
-  SQLLogicTest, with a small TPROC-C load. A failing case, or a
-  not-implemented case that passes, fails the job. The report goes to
-  the job's summary page; `results.json` and `report.md` are uploaded.
-- **Nightly:** the same, and SQLLogicTest, which takes hours over the
-  wire. The PR report shows its last nightly result and the date.
+- **Every PR:** builds the server and runs every suite, with a small
+  TPROC-C load. A failing case, or a not-implemented case that passes,
+  fails the job. The report goes to the job's summary page;
+  `results.json` and `report.md` are uploaded.
 
 No job needs PostgreSQL: the expected values are in the files.
 
@@ -285,6 +261,8 @@ No job needs PostgreSQL: the expected values are in the files.
   at commit with 40001.
 - **Plan shapes:** the golden files fix them, and the proof machine
   checks that a statement's alternative plans agree.
+- **SQLLogicTest:** left out for now. Its files could be loaded the same
+  way later, but it is about 7.4 million queries, hours over the wire.
 
 ## Plan
 
@@ -299,9 +277,7 @@ One PR each. Every step leaves the run and the report working.
    not-implemented list from a first run.
 3. **TPC-H-derived and TPC-DS-derived.** The data generation, the
    queries, their results recorded from PostgreSQL.
-4. **SQLLogicTest.** Its loader, the fetch and cache, the nightly job,
-   its not-implemented list.
-5. **More of our cases,** area by area, through the manifest's features
+4. **More of our cases,** area by area, through the manifest's features
    that no case covers yet.
 
 Also: `frontend_design.md` lists "a table needs a primary key" under
@@ -312,8 +288,7 @@ moves to what the layer doesn't do yet.
 
 1. **The names of the TPC-H-derived and TPC-DS-derived rows.** HammerDB
    calls its H workload TPROC-H; DS has no such name yet.
-2. **SQLLogicTest nightly only?** Its 7.4 million queries take hours.
-3. **The loaders change the format only.** Proposed above: another
+2. **The loaders change the format only.** Proposed above: another
    suite's SQL runs as written, so a sqltest table without a primary key
    is not implemented until the layer supports one. The alternative is
    to adapt their SQL (add a primary key) so more of it runs today.
@@ -324,7 +299,7 @@ The owner's, 2026-10-25:
 1. **One black-box framework, in Python, over the wire.** The MariaDB
    plugin's machinery is reused; its MTR-derived queries are not.
 2. **Several suites, one report:** SQL:2016 Core (sqltest),
-   SQLLogicTest, PostgreSQL features, ByteCaskDB features, the two
+   PostgreSQL features, ByteCaskDB features, the two
    decision-support query sets, and TPROC-C. The SQL Core row is labelled
    by the edition its tests come from.
 3. **Other suites are loaded in their own format and turned into our
@@ -341,5 +316,6 @@ The owner's, 2026-10-25:
 9. **One server per file**, and a server of its own for a case with
    `restart` or `server_flags`.
 10. **Concurrency and plan shapes are other classes of tests.**
+    SQLLogicTest is left out for now.
 11. **A table without a primary key is a gap.** The layer's refusal is
     not a recorded decision.
