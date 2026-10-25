@@ -53,6 +53,7 @@
 #include "alloc_faults.h"
 #include "fault_injector.h"
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #ifndef BYTECASK_NO_ALLOC_FAULTS
 #include <csignal>
@@ -1856,4 +1857,112 @@ TEST_CASE("refuse writes: ingest is refused by the flag alone",
     CHECK(value_of(*db, std::format("r{}", i)) ==
           std::string(300, static_cast<char>('a' + i)));
   bytecask::testing::assert_consistent(*db);
+}
+
+// An I/O failure whose handler cannot build the degraded state: the handler
+// still throws its own error, and the flag alone refuses writes. The sweeps
+// cover every handler in forked children; these run in-process for the
+// handlers no other in-process test reaches.
+namespace {
+
+enum class DegradeMemory { available, exhausted };
+
+// Five puts that cross a 100-byte file only with the last, so ingest
+// rotates after its loop, not inside it.
+auto post_loop_rotation_slice() -> bytecask::testing::OwnedEntries {
+  TempDir td;
+  auto leader = DB::open(td.path / "leader");
+  for (char c = 'a'; c <= 'e'; ++c)
+    leader.put({.sync = true}, to_bytes(std::string(1, c)), to_bytes("x"));
+  const auto snap = leader.snapshot();
+  return bytecask::testing::collect_changes(leader.changes_since(snap, 0));
+}
+
+// Exhausted: neither the handler's degraded state nor the refusal's
+// fallback state can be built.
+void arm_degrade_memory(DB &db, DegradeMemory memory) {
+  if (memory == DegradeMemory::available) return;
+  db.test_before_degrade_publish_ = [] { throw std::bad_alloc{}; };
+  db.test_before_refusal_publish_ = [] { throw std::bad_alloc{}; };
+}
+
+// The handler threw the I/O error and refused writes, through its own
+// degraded state when it could build one.
+void expect_io_failure_refused(DB &db, DegradeMemory memory,
+                               std::string_view reason) {
+  db.test_before_degrade_publish_ = nullptr;
+  db.test_before_refusal_publish_ = nullptr;
+  CHECK(db.is_degraded());
+  if (memory == DegradeMemory::available) {
+    CHECK(db.degraded_reason().find(reason) != std::string::npos);
+  } else {
+    CHECK_FALSE(db.engine_state()->degraded);
+  }
+}
+
+void ingest_post_loop_rotation_fails(const char *checkpoint,
+                                     std::string_view reason) {
+  const auto memory = GENERATE(DegradeMemory::available,
+                               DegradeMemory::exhausted);
+  TempDir td;
+  const auto slice = post_loop_rotation_slice();
+  auto db = open_db(td.path / "follower",
+                    {.max_file_bytes = 100,
+                     .initial_mode = bytecask::Mode::Follower});
+  arm_degrade_memory(*db, memory);
+  {
+    bytecask::testing::ScopedFaultInjector fi{checkpoint};
+    CHECK_THROWS_AS(db->ingest(slice.header, slice.views()),
+                    std::system_error);
+    CHECK(fi.inj.fired);
+  }
+  expect_io_failure_refused(*db, memory, reason);
+  CHECK_THROWS_AS(db->ingest(slice.header, slice.views()), DbDegraded);
+  REQUIRE_NOTHROW(db->resume());
+  db->ingest(slice.header, slice.views());
+  for (char c = 'a'; c <= 'e'; ++c)
+    CHECK(value_of(*db, std::string(1, c)) == "x");
+  bytecask::testing::assert_consistent(*db);
+}
+
+}  // namespace
+
+TEST_CASE("refuse writes: ingest's post-loop rotation fdatasync fails",
+          "[refuse_writes]") {
+  ingest_post_loop_rotation_fails("io_data_file_sync",
+                                  "ingest rotation fdatasync failed");
+}
+
+TEST_CASE("refuse writes: ingest's post-loop rotation cannot create a file",
+          "[refuse_writes]") {
+  ingest_post_loop_rotation_fails("io_rotate_file_creation",
+                                  "ingest post-rotation file creation failed");
+}
+
+TEST_CASE("refuse writes: set_mode(Leader)'s rotation cannot create a file",
+          "[refuse_writes]") {
+  const auto memory = GENERATE(DegradeMemory::available,
+                               DegradeMemory::exhausted);
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto op = promotion_failed_rotation_operation();
+  auto db = open_db(dir, op.opts);
+  op.setup(*db);
+  arm_degrade_memory(*db, memory);
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+    CHECK_THROWS_AS(db->set_mode(bytecask::Mode::Leader), std::system_error);
+    CHECK(fi.inj.fired);
+  }
+  expect_io_failure_refused(*db, memory,
+                            "set_mode(Leader) rotation file creation failed");
+  CHECK(db->mode() == bytecask::Mode::Follower);
+  REQUIRE_NOTHROW(db->resume());
+  db->set_mode(bytecask::Mode::Leader);
+  CHECK(db->put({.sync = true}, to_bytes("late"), to_bytes("x")).durable);
+  db->close();
+  db.reset();
+  auto reopened = DB::open(dir, {});
+  CHECK(value_of(reopened, "late") == "x");
+  bytecask::testing::assert_consistent(reopened);
 }

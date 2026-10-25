@@ -2897,10 +2897,10 @@ A site whose break nothing has to catch says why instead.
 | `execute_group`: a failed append refuses writes when the degraded state cannot be published | `alloc sweep: apply_batch` | `append_failure_refusal_needs_memory` | #583 |
 | `ingest`: a failed append throws its own error, and refuses writes, when the degraded state cannot be published | `alloc sweep: ingest whose append fails` | `ingest_append_failure_not_refused` | #618 |
 | `ingest`: a failed final `fdatasync` throws its own error | `alloc sweep: ingest whose fdatasync fails` | `ingest_sync_failure_not_rethrown` | #618 |
-| `ingest`: a failed rotation `fdatasync` throws its own error | `alloc sweep: ingest whose rotation fdatasync fails` | `ingest_rotation_sync_failure_not_rethrown` | #618 |
-| `ingest`: a file that cannot be created throws its own error | `alloc sweep: ingest whose rotation cannot create a file` | `ingest_rotation_failure_not_rethrown` | #618 |
+| `ingest`: a failed rotation `fdatasync` throws its own error | `alloc sweep: ingest whose rotation fdatasync fails`, `refuse writes: ingest's post-loop rotation fdatasync fails` | `ingest_rotation_sync_failure_not_rethrown` | #618 |
+| `ingest`: a file that cannot be created throws its own error | `alloc sweep: ingest whose rotation cannot create a file`, `refuse writes: ingest's post-loop rotation cannot create a file` | `ingest_rotation_failure_not_rethrown` | #618 |
 | `set_mode(Leader)`: a failed marker append refuses writes when the degraded state cannot be published | `alloc sweep: set_mode(Leader) whose marker append fails` | `marker_append_failure_needs_memory` | #618 |
-| `set_mode(Leader)`: a file that cannot be created throws its own error | `alloc sweep: set_mode(Leader) whose rotation cannot create a file` | `promotion_rotation_failure_not_rethrown` | #618 |
+| `set_mode(Leader)`: a file that cannot be created throws its own error | `alloc sweep: set_mode(Leader) whose rotation cannot create a file`, `refuse writes: set_mode(Leader)'s rotation cannot create a file` | `promotion_rotation_failure_not_rethrown` | #618 |
 | `sync_active_file`: a failed `fdatasync` refuses writes, and throws its own error, when the degraded state cannot be published | `alloc sweep: set_mode(Follower) whose fdatasync fails` (and `create_manifest`'s) | `sync_failure_refusal_needs_memory` | #618 |
 | `create_manifest`: a file that cannot be created throws its own error | `alloc sweep: create_manifest whose rotation cannot create a file` | `manifest_rotation_failure_not_rethrown` | #618 |
 | `execute_group`: a throw after the append refuses writes | `refuse writes: a throw after the append refuses writes until resume()` | `post_append_failure_not_refused` | #364 |

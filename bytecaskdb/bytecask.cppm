@@ -1556,6 +1556,9 @@ private:
   template <typename Publish>
   void degrade_or_refuse(Publish &&publish) noexcept {
     try {
+#ifdef BYTECASK_TESTING
+      if (test_before_degrade_publish_) test_before_degrade_publish_();
+#endif
       publish();
     } catch (...) {
       refuse_writes();
@@ -1810,6 +1813,9 @@ public:
   // Called by refuse_writes before it publishes the degraded state. A test
   // throws from it to leave the flag as the only refusal.
   std::function<void()> test_before_refusal_publish_;
+  // Called by degrade_or_refuse before it builds the degraded state. A test
+  // throws from it to leave the I/O handler with the flag alone.
+  std::function<void()> test_before_degrade_publish_;
   // Called by finish_rotation before it installs the new files in the
   // transient. A test throws from it to fail the rotation's in-memory step.
   std::function<void()> test_in_finish_rotation_;
