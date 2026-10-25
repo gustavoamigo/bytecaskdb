@@ -1,0 +1,235 @@
+# Transaction control: COMMIT, ROLLBACK, savepoints and the statements around
+# them. Two sessions at once are a class of tests of their own.
+
+- name: a committed transaction is seen by the next statement
+  features: [E151-01]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: COMMIT
+    - sql: SELECT id, v FROM t WHERE id >= $1
+      params: [0]
+      expected: [[1, 10], [2, 20]]
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: START TRANSACTION and END
+  features: [E151-01, pg:end-transaction]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: START TRANSACTION
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: END
+    - sql: SELECT id, v FROM t WHERE id >= $1
+      params: [0]
+      expected: [[1, 10], [2, 20]]
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: COMMIT with no transaction is accepted
+  features: [E151-01]
+  steps:
+    - sql: COMMIT
+
+- name: ROLLBACK with no transaction is accepted
+  features: [E151-02]
+  steps:
+    - sql: ROLLBACK
+
+- name: BEGIN inside a transaction is accepted
+  features: [E151-01]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: BEGIN
+    - sql: BEGIN
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a SAVEPOINT and ROLLBACK TO it
+  features: [pg:savepoint]
+  # SAVEPOINT is not supported
+  unimplemented: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: SAVEPOINT s
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: ROLLBACK TO SAVEPOINT s
+    - sql: COMMIT
+    - sql: SELECT id, v FROM t WHERE id >= $1
+      params: [0]
+      expected: [[1, 10]]
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: RELEASE SAVEPOINT keeps the work
+  features: [pg:savepoint]
+  # SAVEPOINT is not supported
+  unimplemented: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: BEGIN
+    - sql: SAVEPOINT s
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: RELEASE SAVEPOINT s
+    - sql: COMMIT
+    - sql: SELECT id, v FROM t WHERE id >= $1
+      params: [0]
+      expected: [[1, 10]]
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
+  features: [E152-01]
+  # SET is not supported
+  unimplemented: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: BEGIN
+    - sql: SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: COMMIT
+    - sql: SELECT id FROM t WHERE id >= $1
+      params: [0]
+      expected: [[1], [2]]
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a READ ONLY transaction refuses a write
+  features: [E152-02]
+  # BEGIN with options is not supported
+  unimplemented: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: BEGIN READ ONLY
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 10]
+      error: "25006"
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, 20]
+      error: "25P02"
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: DDL inside a transaction
+  features: [pg:transactional-ddl]
+  # DDL inside a transaction is not supported: run it outside one
+  unimplemented: true
+  steps:
+    - sql: BEGIN
+    - sql: CREATE TABLE t (id INTEGER PRIMARY KEY)
+    - sql: ROLLBACK
+    - sql: SELECT id FROM t WHERE id >= $1
+      params: [0]
+      error: "42P01"
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a failed statement leaves the transaction aborted
+  features: [E151-02]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: BEGIN
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 11]
+      error: "23505"
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, 20]
+      error: "25P02"
+    - sql: COMMIT
+    - sql: SELECT id, v FROM t WHERE id >= $1
+      params: [0]
+      expected: [[1, 10]]
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: an autocommit statement is its own transaction
+  features: [E151-01]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 11]
+      error: "23505"
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: SELECT id, v FROM t WHERE id >= $1
+      params: [0]
+      expected: [[1, 10], [2, 20]]
+  teardown:
+    - DROP TABLE t
+
+- name: a transaction reads its own delete
+  features: [E151-02, E101-04]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: BEGIN
+    - sql: DELETE FROM t WHERE id = $1
+      params: [1]
+      rowcount: 1
+    - sql: SELECT id FROM t WHERE id >= $1
+      params: [0]
+      expected: [[2]]
+    - sql: ROLLBACK
+    - sql: SELECT id FROM t WHERE id >= $1
+      params: [0]
+      expected: [[1], [2]]
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
