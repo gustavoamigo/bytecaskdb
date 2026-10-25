@@ -69,3 +69,11 @@ Every owning raw pointer (a key directory node, a buffer, a parcel) has exactly 
 ## Batch marker invariants
 
 BulkBegin/BulkEnd markers must NOT be skipped by vacuum or ChangeIterator — they are structural markers that preserve batch atomicity on disk. Only hint generation skips them (hints do not have the concept).
+
+## Directory listing on a failure path
+
+Prefer `std::filesystem` utilities over manual file-handle tricks (e.g. `std::filesystem::file_size`). The exception is listing a directory on a path that must survive a failed allocation: libstdc++'s `directory_iterator` allocates inside a `noexcept` function, so the failure ends the process (#598). Recovery uses `list_directory` (`data_file.cppm`) instead; `alloc sweep: open` and the `recovery_lists_with_directory_iterator` mutation hold it there.
+
+## Tests
+
+A change to recovery, the key directory trees, a durability site or the write path usually needs test changes: read `tests/CLAUDE.md` (fault sweeps, model-based recovery tests, mutation sets) before finishing it.
