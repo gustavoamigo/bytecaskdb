@@ -108,12 +108,7 @@ Avoid designs where correctness depends on programmer discipline alone (e.g. "ne
 
 ### Engine code (`bytecaskdb/`)
 
-The full rules are in `bytecaskdb/CLAUDE.md`; read them before changing engine code. The four that nothing else catches:
-
-- **Iterators are lazy.** Hold at most one unit of work (a batch, an entry) in memory; never materialize all results.
-- **Views.** Never return or store a non-owning view (`std::span`, `std::string_view`, raw pointer) into an object's own buffer unless its owner provably outlives it; when in doubt, return an owned value. Never compose a span-returning iterator with `std::reverse_iterator`: it dangles (BC-122).
-- **Ownership through failure.** Every owning raw pointer has one owner at every instant. Mutate shared structures in three steps: prepare (everything that allocates or throws), commit (install with operations that cannot throw), release (free what was replaced). Never free before the commit point.
-- **Batch markers.** Vacuum and `ChangeIterator` must not skip `BulkBegin`/`BulkEnd`; only hint generation does.
+Rules specific to the engine's code (lazy iterators, non-owning views, ownership through failure, batch markers) are in `bytecaskdb/CLAUDE.md`. Read them before changing code in that folder.
 
 ### Thread-local state
 
