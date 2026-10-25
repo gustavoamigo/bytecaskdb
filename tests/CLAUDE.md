@@ -2,6 +2,16 @@
 
 > `AGENTS.md` is a symlink to this file. The root `CLAUDE.md` has the rules for the whole repository (testing basics, workflow, commits); this file adds the ones specific to the engine's tests, and is read when you work in this folder.
 
+## Test the spec, not the code
+
+A test checks what the engine promises, not what its code happens to do. Find the spec first, in this order:
+
+1. **`CONTRACT.md`.** If a guarantee covers the behavior, the test proves that row: it is named in the row's second cell, and the row's wording is the assertion. A new or changed test names the row it proves. Take expected values from the contract or from an independent model (`tests/crash/crash_model.h`, `bytecaskdb-python/reference/bytecask_ref.py`), never from running the code under test and copying what it returns.
+2. **`docs/bytecask_design.md`.** If the contract is silent and the behavior is mechanism or an internal invariant (node layout, recovery order, file lifecycle), test it against the design doc and name the section in a comment. If a caller could observe the behavior, it is a gap in the contract: add the row, and say "added" in the PR, instead of leaving it covered only by a design-doc test.
+3. **Behavior the contract says it does not guarantee.** Do not pin it. A test that depends on it turns an accident into a guarantee.
+
+When a test and the code disagree, decide which is wrong. Never edit an expectation to match the output. If the code is wrong, fix the code. If the contract is wrong, change its row in the same PR and name the change: added, widened, narrowed or removed. A test that matches no row and no design section has no spec: say what it checks, or delete it.
+
 ## Fault sweeps must reach every structural transition
 
 A fault sweep proves only the paths its workload reaches with the fault armed. Line and MC/DC coverage show a branch ran, not that it ran with each of its allocations failed. The engine's sweep missed #580 because its seed was one leaf no operation filled (#588).
