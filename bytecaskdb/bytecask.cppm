@@ -1549,6 +1549,18 @@ private:
   // allows, and wakes every waiter. Allocates nothing to refuse. For a
   // failure after an append that no I/O handler degraded for.
   void refuse_writes() noexcept;
+  // For a failure after bytes may have reached the file: runs publish, which
+  // builds and stores a degraded state. Building it allocates, so if publish
+  // throws, the flag alone refuses writes (refuse_writes). Never throws: the
+  // handler rethrows its own error after it, never the allocation's.
+  template <typename Publish>
+  void degrade_or_refuse(Publish &&publish) noexcept {
+    try {
+      publish();
+    } catch (...) {
+      refuse_writes();
+    }
+  }
   // Releases the flush role and wakes commit_wait / quiesce / durable_sequence
   // waiters. The empty durable_mu_ critical section orders the release
   // before the notify for waiters that checked the predicate and are about

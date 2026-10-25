@@ -1,0 +1,37 @@
+An ingest whose next file cannot be created, with no memory to publish the
+degraded state, throws std::bad_alloc in the I/O error's place. Both the
+mid-slice rotation and the one after the last chunk. Reverts #618.
+Guarded-by: "alloc sweep: ingest whose rotation cannot create a file"
+
+diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
+index 0eac211..618c757 100644
+--- a/bytecaskdb/db_replication.cpp
++++ b/bytecaskdb/db_replication.cpp
+@@ -431,11 +431,11 @@ void DB::ingest(const ChangeHeader &header,
+         try {
+           rotation = prepare_rotation(t);
+         } catch (...) {
+-          degrade_or_refuse([&] {
++          [&] {
+             t.apply_degrade(
+                 "ingest post-rotation file creation failed: call resume().");
+             store_state(current, std::move(t).persistent());
+-          });
++          }();
+           throw;
+         }
+         finish_rotation(t, std::move(rotation));
+@@ -461,11 +461,11 @@ void DB::ingest(const ChangeHeader &header,
+       try {
+         rotation = prepare_rotation(t);
+       } catch (...) {
+-        degrade_or_refuse([&] {
++        [&] {
+           t.apply_degrade(
+               "ingest post-rotation file creation failed: call resume().");
+           store_state(current, std::move(t).persistent());
+-        });
++        }();
+         throw;
+       }
+       finish_rotation(t, std::move(rotation));

@@ -1,26 +1,22 @@
 An ingest whose append_entries fails, with no memory to publish the degraded
-state, leaves the engine writable with the chunks it wrote in the file: the
-flag that makes the outer handler refuse is set only after the append returns.
-Reverts #618.
+state, leaves the engine writable with the chunks it wrote in the file, and a
+std::bad_alloc in the I/O error's place. Reverts #618.
 Guarded-by: "alloc sweep: ingest whose append fails"
 
 diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
-index b7640e8..1c58405 100644
+index 0eac211..0ab8bf4 100644
 --- a/bytecaskdb/db_replication.cpp
 +++ b/bytecaskdb/db_replication.cpp
-@@ -403,7 +403,6 @@ void DB::ingest(const ChangeHeader &header,
- 
-       // Phase 2: writev chunk to active file.
-       std::vector<std::uint64_t> io_offsets(chunk.size());
--      appended = true;
-       try {
-         file.append_entries(chunk, io_offsets, scratch_bytes_);
+@@ -406,10 +406,10 @@ void DB::ingest(const ChangeHeader &header,
        } catch (...) {
-@@ -414,6 +413,7 @@ void DB::ingest(const ChangeHeader &header,
-         store_state(std::move(err_s));
+         auto ex = std::current_exception();
+         try { file.sync(); } catch (...) {}
+-        degrade_or_refuse([&] {
++        [&] {
+           store_state(current->degraded_copy(
+               "ingest append IO error: call resume() to recover."));
+-        });
++        }();
          std::rethrow_exception(ex);
        }
-+      appended = true;
- 
-       // Phase 3: if rotation needed, sync before sealing.
-       if (needs_rotation) {
+       appended = true;

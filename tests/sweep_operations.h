@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <format>
@@ -404,10 +405,52 @@ inline auto failed_sync_fault() -> std::unique_ptr<ScopedFaultInjector> {
   return std::make_unique<ScopedFaultInjector>("io_data_file_sync");
 }
 
+inline auto failed_rotation_fault() -> std::unique_ptr<ScopedFaultInjector> {
+  return std::make_unique<ScopedFaultInjector>("io_rotate_file_creation");
+}
+
+// After the fault, the follower is delivered the slice again and promoted,
+// and a durable write follows: what an engine that took the failed ingest's
+// bytes for its own would lose.
+inline void promote_after_retry(Operation &op) {
+  op.takes_writes = true;
+  op.retry = [retry = op.retry](DB &db) {
+    retry(db);
+    db.set_mode(Mode::Leader);
+  };
+}
+
 inline auto ingest_failed_append_operation() -> Operation {
   auto op = ingest_operation();
   op.name = "ingest whose append fails";
   op.io_fault = failed_append_fault;
+  promote_after_retry(op);
+  return op;
+}
+
+inline auto ingest_failed_sync_operation() -> Operation {
+  auto op = ingest_operation();
+  op.name = "ingest whose fdatasync fails";
+  op.io_fault = failed_sync_fault;
+  promote_after_retry(op);
+  return op;
+}
+
+// A file small enough that the slice rotates it, and the rotation's new
+// file cannot be created.
+inline auto ingest_failed_rotation_operation() -> Operation {
+  auto op = ingest_operation();
+  op.name = "ingest whose rotation cannot create a file";
+  op.opts.max_file_bytes = 300;
+  op.io_fault = failed_rotation_fault;
+  promote_after_retry(op);
+  return op;
+}
+
+inline auto ingest_failed_rotation_sync_operation() -> Operation {
+  auto op = ingest_failed_rotation_operation();
+  op.name = "ingest whose rotation fdatasync fails";
+  op.io_fault = failed_sync_fault;
   return op;
 }
 
@@ -423,9 +466,28 @@ inline auto promotion_failed_append_operation() -> Operation {
                 return db.mode() == Mode::Leader;
               },
           .transition = [](KeyValues kv) { return kv; },
-          .takes_writes = false,
           .retry = [](DB &db) { db.set_mode(Mode::Leader); },
           .io_fault = failed_append_fault};
+}
+
+// A promotion whose marker takes the follower's file past its limit, and the
+// next file cannot be created. The limit is one byte past what the slice
+// leaves in the file, measured on a copy.
+inline auto promotion_failed_rotation_operation() -> Operation {
+  const auto first = ingest_slices().first;
+  std::uint64_t slice_bytes = 0;
+  {
+    TempDir td;
+    auto probe = DB::open(td.path / "probe", {.initial_mode = Mode::Follower});
+    probe.ingest(first->header, first->views());
+    for (const auto &[id, fs] : probe.file_stats())
+      slice_bytes = std::max(slice_bytes, fs.total_bytes);
+  }
+  auto op = promotion_failed_append_operation();
+  op.name = "set_mode(Leader) whose rotation cannot create a file";
+  op.opts.max_file_bytes = slice_bytes + 1;
+  op.io_fault = failed_rotation_fault;
+  return op;
 }
 
 // A leader holding an unsynced write steps down, which syncs it; the sync
@@ -519,6 +581,13 @@ inline auto manifest_operation() -> Operation {
                 check_key_values(key_values(copy), expected,
                                  "a DB opened from the manifest's files");
               }};
+}
+
+inline auto manifest_failed_rotation_operation() -> Operation {
+  auto op = manifest_operation();
+  op.name = "create_manifest whose rotation cannot create a file";
+  op.io_fault = failed_rotation_fault;
+  return op;
 }
 
 inline auto manifest_failed_sync_operation() -> Operation {

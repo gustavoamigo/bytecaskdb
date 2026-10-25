@@ -123,10 +123,12 @@ struct Outcome {
   std::string kind;    // see the file comment; "error" for a failed check
   std::string detail;  // what failed, for "error"
   bool fired{false};
+  bool io_fired{false};  // the injected I/O failure was thrown
 };
 
 auto encode(const Outcome &o) -> std::string {
-  return std::format("{}\t{}\t{}\n", o.kind, o.fired ? 1 : 0, o.detail);
+  return std::format("{}\t{}\t{}\t{}\n", o.kind, o.fired ? 1 : 0,
+                     o.io_fired ? 1 : 0, o.detail);
 }
 
 auto decode(std::string_view line) -> std::optional<Outcome> {
@@ -134,11 +136,14 @@ auto decode(std::string_view line) -> std::optional<Outcome> {
   if (a == std::string_view::npos) return std::nullopt;
   const auto b = line.find('\t', a + 1);
   if (b == std::string_view::npos) return std::nullopt;
-  auto detail = line.substr(b + 1);
+  const auto c = line.find('\t', b + 1);
+  if (c == std::string_view::npos) return std::nullopt;
+  auto detail = line.substr(c + 1);
   while (!detail.empty() && detail.back() == '\n') detail.remove_suffix(1);
   return Outcome{.kind = std::string{line.substr(0, a)},
                  .detail = std::string{detail},
-                 .fired = line.substr(a + 1, b - a - 1) == "1"};
+                 .fired = line.substr(a + 1, b - a - 1) == "1",
+                 .io_fired = line.substr(b + 1, c - b - 1) == "1"};
 }
 
 // Thrown in the child by a check that fails; caught at the top of the child.
@@ -278,17 +283,33 @@ auto run_in_child(const Operation &op, const Pass &pass, long n,
         op.partial ? op.partial(baseline) : std::vector<KeyValues>{};
 
     bool threw = false;
+    bool threw_system_error = false;
     bool did_work = false;
     // A warm pool hands out nodes without operator new, so which node
     // allocations the sweep counts would depend on the tests that ran
     // before (#583).
     bytecask::btree_detail::node_pool_trim();
     bool io_failed = false;
+    // Whether the injected failure came before the allocation failed: only
+    // then is it the error the caller must see (a handler may swallow it
+    // after the allocation failed first).
+    bool io_first = false;
     {
       const auto io = op.io_fault ? op.io_fault() : nullptr;
+      // Set before the faults are armed: the callback's own allocation is
+      // not the engine's.
+      const ScopedAllocFaults *armed = nullptr;
+      if (io)
+        io->inj.on_fire = [&io_first, &armed, n] {
+          io_first = io_first || (armed != nullptr && armed->allocations() < n);
+        };
       ScopedAllocFaults faults{n, pass.cascade};
+      armed = &faults;
       try {
         did_work = op.run(*db);
+      } catch (const std::system_error &) {
+        threw = true;
+        threw_system_error = true;
       } catch (...) {
         threw = true;
       }
@@ -296,11 +317,17 @@ auto run_in_child(const Operation &op, const Pass &pass, long n,
       out.fired = faults.report().fired;
       io_failed = io && io->inj.fired;
     }
+    out.io_fired = io_failed;
 
     const auto live = key_values(*db);
     const bool degraded = db->is_degraded();
-    if (io_failed)
+    if (io_failed) {
+      expect(threw, "an I/O failure was injected, yet the operation returned");
+      if (io_first)
+        expect(threw_system_error,
+               "the operation threw something else in the I/O failure's place");
       expect(degraded, "an I/O failure was reported, yet the engine accepts writes");
+    }
     if (!out.fired && !io_failed) {
       expect(!threw, "the fault was not reached, yet the operation threw");
       expect(did_work, "the fault was not reached, yet the operation did nothing");
@@ -389,6 +416,8 @@ auto judge_terminated(const Operation &op, const Expected &x,
 
 struct Tally {
   std::map<std::string, long> counts;
+  long io_runs{0};        // runs the injected I/O failure was thrown in
+  long io_only_runs{0};   // and no allocation had failed in
   std::vector<std::string> failures;
   std::vector<std::string> terminations;
 };
@@ -502,6 +531,10 @@ auto run_forked(
                     label, status, got));
   }
   ++tally.counts[out.kind];
+  if (out.io_fired) {
+    ++tally.io_runs;
+    if (!out.fired) ++tally.io_only_runs;
+  }
   if (env_flag("BYTECASK_ALLOC_SWEEP_TRACE"))
     std::fprintf(stderr, "alloc sweep %s: %s\n", label.c_str(), out.kind.c_str());
   return out.fired;
@@ -525,11 +558,14 @@ auto run_case(const Operation &op, const Expected &x, const Pass &pass, long n,
 // the fault never reached, and reports what the runs found.
 // `strict`: a termination fails the test, as with
 // BYTECASK_ALLOC_SWEEP_STRICT, for an operation whose contract says it ends
-// nothing.
+// nothing. `needs_io`: the runs inject an I/O failure, and each pass must
+// reach it, with and without an allocation failing before it: a sweep whose
+// injection stops reaching the engine fails instead of passing as a plain
+// allocation sweep.
 void sweep_passes(
     const std::string &name,
     const std::function<bool(const Pass &, long, Tally &)> &run_n,
-    bool strict = false) {
+    bool strict = false, bool needs_io = false) {
   const auto step = stride();
   Tally tally;
   const char *pass_filter = std::getenv("BYTECASK_ALLOC_SWEEP_PASS");
@@ -552,6 +588,18 @@ void sweep_passes(
     std::fprintf(stderr, "alloc sweep %s [%s]: %ld runs: %s\n", name.c_str(),
                  pass.name, (n - 1) / step + 1, summary.c_str());
     tally.counts.clear();
+    if (needs_io) {
+      if (tally.io_runs == 0)
+        tally.failures.push_back(std::format(
+            "{} [{}]: no run reached the injected I/O failure", name, pass.name));
+      else if (tally.io_only_runs == 0)
+        tally.failures.push_back(std::format(
+            "{} [{}]: the injected I/O failure was never reached without an "
+            "allocation failing first",
+            name, pass.name));
+    }
+    tally.io_runs = 0;
+    tally.io_only_runs = 0;
   }
   for (const auto &f : tally.failures) FAIL_CHECK(f);
   if (!tally.terminations.empty()) {
@@ -568,9 +616,12 @@ void sweep_passes(
 
 void alloc_sweep(const Operation &op) {
   const auto x = expected_of(op);
-  sweep_passes(op.name, [&](const Pass &pass, long n, Tally &tally) {
-    return run_case(op, x, pass, n, tally);
-  });
+  sweep_passes(
+      op.name,
+      [&](const Pass &pass, long n, Tally &tally) {
+        return run_case(op, x, pass, n, tally);
+      },
+      false, static_cast<bool>(op.io_fault));
 }
 
 }  // namespace
@@ -640,9 +691,33 @@ TEST_CASE("alloc sweep: ingest whose append fails", "[alloc_sweep]") {
   alloc_sweep(ingest_failed_append_operation());
 }
 
+TEST_CASE("alloc sweep: ingest whose fdatasync fails", "[alloc_sweep]") {
+  alloc_sweep(ingest_failed_sync_operation());
+}
+
+TEST_CASE("alloc sweep: ingest whose rotation cannot create a file",
+          "[alloc_sweep]") {
+  alloc_sweep(ingest_failed_rotation_operation());
+}
+
+TEST_CASE("alloc sweep: ingest whose rotation fdatasync fails",
+          "[alloc_sweep]") {
+  alloc_sweep(ingest_failed_rotation_sync_operation());
+}
+
+TEST_CASE("alloc sweep: create_manifest whose rotation cannot create a file",
+          "[alloc_sweep]") {
+  alloc_sweep(manifest_failed_rotation_operation());
+}
+
 TEST_CASE("alloc sweep: set_mode(Leader) whose marker append fails",
           "[alloc_sweep]") {
   alloc_sweep(promotion_failed_append_operation());
+}
+
+TEST_CASE("alloc sweep: set_mode(Leader) whose rotation cannot create a file",
+          "[alloc_sweep]") {
+  alloc_sweep(promotion_failed_rotation_operation());
 }
 
 TEST_CASE("alloc sweep: set_mode(Follower) whose fdatasync fails",

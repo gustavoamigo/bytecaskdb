@@ -3,15 +3,15 @@ write appends after the bytes the failed one left. Reverts BC-163.
 Guarded-by: "*__group_append_fails"
 
 diff --git a/bytecaskdb/db_commit.cpp b/bytecaskdb/db_commit.cpp
-index 19d0fcb..7e7fc4e 100644
+index 23e02a8..ca57446 100644
 --- a/bytecaskdb/db_commit.cpp
 +++ b/bytecaskdb/db_commit.cpp
-@@ -220,7 +220,7 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
+@@ -217,7 +217,7 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
+       // If this throws, the flag holds without the role: a flush that then
+       // publishes a state without the degrade does not lift it.
+       auto role = quiesce();
+-      store_state(load_state()->degraded_copy(std::format(
++      (void)(load_state()->degraded_copy(std::format(
            "append IO error on '{}': call resume() to recover.",
-           file.path().string()));
-       counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
--      store_state(std::move(err_s));
-+      (void)err_s;
-     } catch (...) {
-       refuse_writes();
-     }
+           file.path().string())));
+     });

@@ -1,17 +1,27 @@
-A failed append that cannot publish its degraded state, for want of memory,
+A failed append whose degraded state cannot be published, for want of memory,
 leaves the engine writable, so the next write is appended after the chunks the
 failed one wrote and is lost on reopen. Reverts #583.
 Guarded-by: "alloc sweep: apply_batch"
 
 diff --git a/bytecaskdb/db_commit.cpp b/bytecaskdb/db_commit.cpp
-index 19d0fcb..a0ba6c1 100644
+index 23e02a8..bbfa7b0 100644
 --- a/bytecaskdb/db_commit.cpp
 +++ b/bytecaskdb/db_commit.cpp
-@@ -222,7 +222,6 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
-       counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
-       store_state(std::move(err_s));
-     } catch (...) {
--      refuse_writes();
-     }
+@@ -211,7 +211,7 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
+     counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
+     // An append that failed partway leaves the chunks it wrote in the file,
+     // unpublished: the next write must not be appended after them.
+-    degrade_or_refuse([&] {
++    [&] {
+       // Publishing needs the flush role: an in-flight flush must land (or
+       // fail) first, so its publication cannot overwrite the degraded state.
+       // If this throws, the flag holds without the role: a flush that then
+@@ -220,7 +220,7 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
+       store_state(load_state()->degraded_copy(std::format(
+           "append IO error on '{}': call resume() to recover.",
+           file.path().string())));
+-    });
++    }();
      for (auto *s : batch) {
        if (!s->err) s->err = ex;
+     }

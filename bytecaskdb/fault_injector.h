@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <fcntl.h>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
@@ -37,6 +38,28 @@ namespace bytecask::testing {
 //   throw_after — throw without truncating (full entry on disk)
 // ---------------------------------------------------------------------------
 enum class PostWriteMode { none, short_write, throw_after };
+
+// ---------------------------------------------------------------------------
+// SuspendSyscallFaults
+//
+// The counted fault sweep (tests/syscall_faults.h) counts and fails the
+// engine's I/O calls from below, in the test binary's --wrap interposers.
+// Test instrumentation that does I/O of its own from inside the engine — the
+// PageCacheModel's hooks — holds one of these, so its calls are neither
+// counted nor failed. Thread-local: only the calling thread is exempt.
+// ---------------------------------------------------------------------------
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunique-object-duplication"
+// TLS: process — test instrumentation for whatever this thread drives.
+inline thread_local int syscall_faults_suspended = 0;
+#pragma clang diagnostic pop
+
+struct SuspendSyscallFaults {
+  SuspendSyscallFaults() { ++syscall_faults_suspended; }
+  ~SuspendSyscallFaults() { --syscall_faults_suspended; }
+  SuspendSyscallFaults(const SuspendSyscallFaults&) = delete;
+  SuspendSyscallFaults& operator=(const SuspendSyscallFaults&) = delete;
+};
 
 // ---------------------------------------------------------------------------
 // FaultInjector
@@ -66,6 +89,13 @@ struct FaultInjector {
   int         call_count = 0;  // number of checkpoints passed so far
   std::string last_checkpoint; // name of the last checkpoint that fired
   bool        fired = false;   // an injected failure was thrown
+  // Called as each is thrown, before it is. A test reads what it needs to
+  // know about that moment, such as how many allocations came before.
+  std::function<void()> on_fire;
+  void fire() {
+    fired = true;
+    if (on_fire) on_fire();
+  }
 
   // Count-based skip set — checkpoints matching these names pass even
   // when call_count exceeds fail_at. Allows testing scenarios where some
@@ -77,7 +107,11 @@ struct FaultInjector {
   PostWriteMode post_write_mode{PostWriteMode::none};
   ssize_t       short_write_bytes{0};   // bytes to keep for short_write mode
 
+  // Test instrumentation: its own allocations (the checkpoint name, the
+  // exception's message) are neither counted nor failed by the allocation
+  // sweep, so an injected failure is the one the engine's handler sees.
   void checkpoint(const char* name) {
+    const SuspendSyscallFaults exempt;
     last_checkpoint = name;
     ++call_count;
 
@@ -88,7 +122,7 @@ struct FaultInjector {
         post_write_mode == PostWriteMode::none) {
       ++name_matches;
       if (fail_on_nth_match == 0 || name_matches == fail_on_nth_match) {
-        fired = true;
+        fire();
         throw std::system_error{error,
             std::string{"fault injection at: "} + name};
       }
@@ -98,7 +132,7 @@ struct FaultInjector {
     if (fail_at >= 0 && call_count > fail_at
         && std::find(skip_names.begin(), skip_names.end(), name)
                == skip_names.end()) {
-      fired = true;
+      fire();
       throw std::system_error{error,
           std::string{"fault injection at: "} + name};
     }
@@ -126,6 +160,7 @@ inline void io_post_write_checkpoint(const char* name, int fd,
                                       std::uint64_t offset,
                                       std::size_t /*total*/) {
   if (!active_injector) return;
+  const SuspendSyscallFaults exempt;
   auto& inj = *active_injector;
   inj.last_checkpoint = name;
 
@@ -139,7 +174,7 @@ inline void io_post_write_checkpoint(const char* name, int fd,
   }
   // For throw_after: data stays fully on disk — simulates writev
   // success followed by a failure before offset_ advances.
-  inj.fired = true;
+  inj.fire();
   throw std::system_error{inj.error,
       std::string{"fault injection (post-write) at: "} + name};
 }
@@ -190,28 +225,6 @@ struct ScopedFaultInjector {
   ScopedFaultInjector& operator=(const ScopedFaultInjector&) = delete;
   ScopedFaultInjector(ScopedFaultInjector&&) = delete;
   ScopedFaultInjector& operator=(ScopedFaultInjector&&) = delete;
-};
-
-// ---------------------------------------------------------------------------
-// SuspendSyscallFaults
-//
-// The counted fault sweep (tests/syscall_faults.h) counts and fails the
-// engine's I/O calls from below, in the test binary's --wrap interposers.
-// Test instrumentation that does I/O of its own from inside the engine — the
-// PageCacheModel's hooks — holds one of these, so its calls are neither
-// counted nor failed. Thread-local: only the calling thread is exempt.
-// ---------------------------------------------------------------------------
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wunique-object-duplication"
-// TLS: process — test instrumentation for whatever this thread drives.
-inline thread_local int syscall_faults_suspended = 0;
-#pragma clang diagnostic pop
-
-struct SuspendSyscallFaults {
-  SuspendSyscallFaults() { ++syscall_faults_suspended; }
-  ~SuspendSyscallFaults() { --syscall_faults_suspended; }
-  SuspendSyscallFaults(const SuspendSyscallFaults&) = delete;
-  SuspendSyscallFaults& operator=(const SuspendSyscallFaults&) = delete;
 };
 
 // ---------------------------------------------------------------------------

@@ -81,15 +81,11 @@ void DB::set_mode(Mode mode) {
     } catch (...) {
       auto ex = std::current_exception();
       try { file.sync(); } catch (...) {}
-      // Publishing the degraded state allocates: without the memory, the
-      // flag refuses writes, and the caller still gets the I/O error.
-      try {
+      degrade_or_refuse([&] {
         store_state(current->degraded_copy(
             "set_mode(Leader) marker append IO error: call resume() to "
             "recover."));
-      } catch (...) {
-        refuse_writes();
-      }
+      });
       std::rethrow_exception(ex);
     }
     // From here the marker is in the file. A failure below that no handler
@@ -112,10 +108,12 @@ void DB::set_mode(Mode mode) {
         try {
           rotation = prepare_rotation(t);
         } catch (...) {
-          t.apply_degrade(
-              "set_mode(Leader) rotation file creation failed: call "
-              "resume().");
-          store_state(current, std::move(t).persistent());
+          degrade_or_refuse([&] {
+            t.apply_degrade(
+                "set_mode(Leader) rotation file creation failed: call "
+                "resume().");
+            store_state(current, std::move(t).persistent());
+          });
           throw;
         }
         finish_rotation(t, std::move(rotation));
@@ -154,10 +152,12 @@ auto DB::create_manifest() -> FileManifest {
     try {
       rotation = prepare_rotation(t);
     } catch (...) {
-      t.apply_degrade(
-          "create_manifest rotation failed: active file is sealed "
-          "but new file could not be created. Call resume() to recover.");
-      store_state(current, std::move(t).persistent());
+      degrade_or_refuse([&] {
+        t.apply_degrade(
+            "create_manifest rotation failed: active file is sealed "
+            "but new file could not be created. Call resume() to recover.");
+        store_state(current, std::move(t).persistent());
+      });
       throw;
     }
     try {
@@ -373,11 +373,9 @@ void DB::ingest(const ChangeHeader &header,
 
   // Chunk-and-rotate loop: write entries in chunks, rotating between chunks
   // at safe boundaries (never inside BulkBegin..BulkEnd).
-  // From the first append call, a throw that no handler below degraded
-  // for — an allocation, typically, including the one that builds a
-  // handler's own degraded state — may leave bytes nothing published, and
-  // writes are refused until resume() reconciles them. append_entries
-  // writes a chunk at a time, so a failed call may have written some.
+  // Once a chunk is in the file, a throw that no handler below degraded
+  // for — an allocation, typically — leaves bytes nothing published, and
+  // writes are refused until resume() reconciles them.
   auto appended = false;
   try {
     while (!remaining.empty()) {
@@ -403,17 +401,18 @@ void DB::ingest(const ChangeHeader &header,
 
       // Phase 2: writev chunk to active file.
       std::vector<std::uint64_t> io_offsets(chunk.size());
-      appended = true;
       try {
         file.append_entries(chunk, io_offsets, scratch_bytes_);
       } catch (...) {
         auto ex = std::current_exception();
         try { file.sync(); } catch (...) {}
-        auto err_s = current->degraded_copy(
-            "ingest append IO error: call resume() to recover.");
-        store_state(std::move(err_s));
+        degrade_or_refuse([&] {
+          store_state(current->degraded_copy(
+              "ingest append IO error: call resume() to recover."));
+        });
         std::rethrow_exception(ex);
       }
+      appended = true;
 
       // Phase 3: if rotation needed, sync before sealing.
       if (needs_rotation) {
@@ -421,18 +420,22 @@ void DB::ingest(const ChangeHeader &header,
           file.sync();
           t.apply_sync(chunk_max_seq);
         } catch (...) {
-          auto err_s = current->degraded_copy(
-              "ingest rotation fdatasync failed: call resume() to recover.");
-          store_state(std::move(err_s));
+          degrade_or_refuse([&] {
+            store_state(current->degraded_copy(
+                "ingest rotation fdatasync failed: call resume() to "
+                "recover."));
+          });
           throw;
         }
         PreparedRotation rotation;
         try {
           rotation = prepare_rotation(t);
         } catch (...) {
-          t.apply_degrade(
-              "ingest post-rotation file creation failed: call resume().");
-          store_state(current, std::move(t).persistent());
+          degrade_or_refuse([&] {
+            t.apply_degrade(
+                "ingest post-rotation file creation failed: call resume().");
+            store_state(current, std::move(t).persistent());
+          });
           throw;
         }
         finish_rotation(t, std::move(rotation));
@@ -448,18 +451,21 @@ void DB::ingest(const ChangeHeader &header,
         t.active_file().sync();
         t.apply_sync(t.next_seq() - 1);
       } catch (...) {
-        auto err_s = current->degraded_copy(
-            "ingest rotation fdatasync failed: call resume() to recover.");
-        store_state(std::move(err_s));
+        degrade_or_refuse([&] {
+          store_state(current->degraded_copy(
+              "ingest rotation fdatasync failed: call resume() to recover."));
+        });
         throw;
       }
       PreparedRotation rotation;
       try {
         rotation = prepare_rotation(t);
       } catch (...) {
-        t.apply_degrade(
-            "ingest post-rotation file creation failed: call resume().");
-        store_state(current, std::move(t).persistent());
+        degrade_or_refuse([&] {
+          t.apply_degrade(
+              "ingest post-rotation file creation failed: call resume().");
+          store_state(current, std::move(t).persistent());
+        });
         throw;
       }
       finish_rotation(t, std::move(rotation));
@@ -470,9 +476,10 @@ void DB::ingest(const ChangeHeader &header,
       t.active_file().sync();
       t.apply_sync(t.next_seq() - 1);
     } catch (...) {
-      auto err_s = current->degraded_copy(
-          "ingest fdatasync failed: call resume() to recover.");
-      store_state(std::move(err_s));
+      degrade_or_refuse([&] {
+        store_state(current->degraded_copy(
+            "ingest fdatasync failed: call resume() to recover."));
+      });
       throw;
     }
 
