@@ -6,9 +6,9 @@
 [![CI](https://github.com/gustavoamigo/bytecaskdb/actions/workflows/ci.yml/badge.svg)](https://github.com/gustavoamigo/bytecaskdb/actions/workflows/ci.yml)
 [![Coverage](https://codecov.io/gh/gustavoamigo/bytecaskdb/branch/main/graph/badge.svg)](https://app.codecov.io/gh/gustavoamigo/bytecaskdb)
 
-**ByteCaskDB** is a fast, predictable embedded key-value store written in C++. Reads and writes have flat, predictable latency from thousands of keys to hundreds of millions.
+**ByteCaskDB** is a fast, predictable embedded key-value store written in C++, designed for flat read and write latency as the dataset grows.
 
-Every key has an entry in memory at all times — a deliberate design choice that removes an entire class of complexity that exists solely to minimise disk access, and gives every point lookup an in-memory traversal followed by one read at a known offset. The entry holds no key bytes, which stay in the data file, so a key costs 14–19 bytes of RAM whatever its length (measured at 1M keys, structured to random): 100 million keys need 1.4–1.9 GB for the directory. An in-memory key directory and an append-only data file are the only moving parts.
+Every key has an entry in memory at all times — a deliberate design choice that removes an entire class of complexity that exists solely to minimise disk access, and gives every point lookup an in-memory traversal followed by one read at a known offset. The entry holds no key bytes, which stay in the data file, so a key costs 14–19 bytes of RAM whatever its length (measured at 1M keys, structured to random): 100 million keys come to 1.4–1.9 GB, by arithmetic from that figure, not measured at that size. An in-memory key directory and an append-only data file are the only moving parts.
 
 Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only foundation, ByteCaskDB replaces the original hash-table key directory with a **[persistent B+ tree with blind leaves](docs/blind_leaf_btree_design.md)**. It gives ordered range queries, prefix scans and O(1) snapshots while keeping the simplicity that makes Bitcask fast. Full MVCC and serializable conflict detection need no separate transaction type.
 
