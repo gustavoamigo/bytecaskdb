@@ -2,14 +2,19 @@
 
 - name: NULLS FIRST and NULLS LAST
   features: [pg:nulls-first-last]
-  unimplemented: true
   ordered: true
   setup:
     - CREATE TABLE n (id INTEGER PRIMARY KEY, v INTEGER)
-    - INSERT INTO n VALUES (1, 20)
-    - INSERT INTO n VALUES (2, NULL)
-    - INSERT INTO n VALUES (3, 10)
   steps:
+    - sql: INSERT INTO n VALUES ($1, $2)
+      params: [1, 20]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2)
+      params: [2, null]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2)
+      params: [3, 10]
+      rowcount: 1
     - sql: SELECT id FROM n ORDER BY v NULLS FIRST, id
       expected: [[2], [3], [1]]
     - sql: SELECT id FROM n ORDER BY v NULLS LAST, id
@@ -161,9 +166,13 @@
   unimplemented: true
   setup:
     - CREATE TABLE na2 (id INTEGER PRIMARY KEY, v INTEGER)
-    - INSERT INTO na2 VALUES (1, NULL)
-    - INSERT INTO na2 VALUES (2, 5)
   steps:
+    - sql: INSERT INTO na2 VALUES ($1, $2)
+      params: [1, null]
+      rowcount: 1
+    - sql: INSERT INTO na2 VALUES ($1, $2)
+      params: [2, 5]
+      rowcount: 1
     - sql: SELECT id, v + 1 FROM na2
       expected: [[1, null], [2, 6]]
   teardown:
