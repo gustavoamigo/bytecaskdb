@@ -171,7 +171,8 @@ TEST_CASE("binder: anything outside the scope is rejected with a message and pos
   CHECK(rejected(cat, "INSERT INTO t (id, qty) VALUES ($1)").first == "INSERT has 1 values for 2 columns");
   CHECK(rejected(cat, "CREATE TABLE u (k CHAR(5) PRIMARY KEY)") ==
         std::pair<std::string, std::int32_t>{"CHAR(n) is not supported; use VARCHAR(n)", 16});
-  CHECK(rejected(cat, "CREATE TABLE u (k BIGINT)").first == "a table needs a PRIMARY KEY");
+  // No primary key: the catalog gives the table a row id.
+  CHECK(std::get<CreateTableDdl>(std::get<Ddl>(bind_sql(cat, "CREATE TABLE u (k BIGINT)").stmt)).pk.empty());
   CHECK(rejected(cat, "SELECT id FROM t WHERE id = qty").first == "WHERE must compare a column with a parameter");
 }
 
