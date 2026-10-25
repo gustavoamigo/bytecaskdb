@@ -24,11 +24,9 @@ How much of each suite the layer passes, from the functional suite's conformance
 | SQL:2016 Core (sqltest) | 2% | 16/743 tests | statement accepted |
 | PostgreSQL features | 53% | 16/30 cases | results |
 | ByteCaskDB features | 100% | 12/12 cases | results |
-| TPC-H-derived | not run yet | | results |
-| TPC-DS-derived | not run yet | | results |
 | TPROC-C | 100% | 1/1 case: five transactions, then consistency conditions 1–9 | consistency conditions 1–9 |
 
-The suite is young: its cases are the first of the plan in `docs/functional_testing_design.md`, so a high percentage means few cases, not wide coverage. Most of sqltest's tests fail at their first statement: their tables have no primary key, which the layer refuses (a gap, not a decision: `docs/functional_testing_design.md`, Decision 11). The TPC rows come with their own step of that plan.
+The suite is young: its cases are the first of the plan in `docs/functional_testing_design.md`, so a high percentage means few cases, not wide coverage. Most of sqltest's tests fail at their first statement: their tables have no primary key, which the layer refuses (a gap, not a decision: `docs/functional_testing_design.md`, Decision 11).
 
 ## Current state
 

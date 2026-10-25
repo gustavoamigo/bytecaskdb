@@ -15,8 +15,6 @@ one report says how much of each the layer passes:
 | SQL:2016 Core | x% | n/743 sqltest | statement accepted |
 | PostgreSQL features | x% | n/N cases | results |
 | ByteCaskDB features | x% | n/N cases | results |
-| TPC-H-derived | x% | n/22 queries | results |
-| TPC-DS-derived | x% | n/99 queries and their variants | results |
 | TPROC-C | x% | 5 transactions | consistency conditions 1–9 |
 
 The suites also set the scope. They are the SQL the layer is meant to
@@ -131,21 +129,6 @@ Cases we write, in YAML, in `cases/`.
   budget, `FOR UPDATE`'s guards.
 
 Their format is in *Our cases*, below.
-
-### TPC-H-derived and TPC-DS-derived
-
-The two benchmarks' query sets: 22 queries, and 99 with their variants.
-
-- **Data and queries:** generated at a small scale with TPC's own
-  generators. Neither the tools nor the data are committed, and the
-  tools need TPC's registration, so where they come from is open
-  (*Open questions*). The query text runs as the generator writes it.
-- **Expected results:** recorded from PostgreSQL on the same data, in
-  files beside the queries, not in YAML.
-- **Checks:** results (how they are compared: *Open questions*).
-- **Names:** TPC's fair-use policy keeps the benchmarks' names for
-  audited results, the reason the layer says TPROC-C. These two rows'
-  names are open (*Open questions*).
 
 ### TPROC-C
 
@@ -278,6 +261,9 @@ No job needs PostgreSQL: the expected values are in the files.
   checks that a statement's alternative plans agree.
 - **SQLLogicTest:** left out for now. Its files could be loaded the same
   way later, but it is about 7.4 million queries, hours over the wire.
+- **TPC-H and TPC-DS:** left out for now (2026-10-25). Their tools need
+  TPC's registration, so a CI job can't fetch them, and a generator and
+  queries of our own would measure something other than the benchmarks.
 
 ## Plan
 
@@ -290,46 +276,20 @@ One PR each. Every step leaves the run and the report working.
    PostgreSQL. The TPROC-C row.
 2. **SQL:2016 Core.** sqltest in the repository, its loader, and its
    not-implemented list from a first run.
-3. **TPC-H-derived and TPC-DS-derived.** The data generation and the
-   queries, once their source is settled (*Open questions*), and their
-   results recorded from PostgreSQL.
-4. **More of our cases,** area by area, through the manifest's features
+3. **More of our cases,** area by area, through the manifest's features
    that no case covers yet.
 
 Also: `frontend_design.md` lists "a table needs a primary key" under
 *Known differences from PostgreSQL*. It is a gap, not a decision, and
 moves to what the layer doesn't do yet.
 
-## Open questions
-
-1. **The names of the TPC-H-derived and TPC-DS-derived rows.** HammerDB
-   calls its H workload TPROC-H; DS has no such name yet.
-2. **Where TPC's tools and data come from.** TPC's tools (`dbgen`,
-   `qgen`, `dsdgen`, `dsqgen`) are free but need a registration and an
-   agreement to TPC's licence; there is no URL a CI job can fetch. So
-   "downloaded when the suite runs" doesn't hold. Options:
-   - the tools kept by the owner, who registered, in a place CI can
-     read, with the TPC rows run nightly or on demand, not on every PR;
-   - DuckDB's `tpch` and `tpcds` extensions, which need no
-     registration and run on every PR, but derive from TPC's generators,
-     so their licence needs reading before use.
-
-   The first keeps the licence position clear. The second keeps every
-   suite on every PR. Step 3 waits on this.
-3. **How a TPC case compares results.** These sets return `numeric` and
-   `double` aggregates, and `ORDER BY` often leaves ties, so a
-   text-for-text comparison is too tight. Proposed: a TPC case compares
-   numbers within a relative tolerance and sorts rows that tie on the
-   `ORDER BY` columns; every other suite compares text.
-
 ## Decisions
 
 The owner's, 2026-10-25:
 1. **One black-box framework, in Python, over the wire.**
 2. **Several suites, one report:** SQL:2016 Core (sqltest),
-   PostgreSQL features, ByteCaskDB features, the two
-   decision-support query sets, and TPROC-C. The SQL Core row is labelled
-   by the edition its tests come from.
+   PostgreSQL features, ByteCaskDB features, and TPROC-C. The SQL Core
+   row is labelled by the edition its tests come from.
 3. **Other suites are loaded in their own format and turned into our
    cases at run time**, and only the format changes: a suite's SQL
    runs as it wrote it (Decision 13).
@@ -346,7 +306,7 @@ The owner's, 2026-10-25:
 9. **One server per file**, and a server of its own for a case with
    `restart` or `server_flags`.
 10. **Concurrency and plan shapes are other classes of tests.**
-    SQLLogicTest is left out for now.
+    SQLLogicTest, TPC-H and TPC-DS are left out for now.
 11. **A table without a primary key is a gap.** The layer's refusal is
     not a recorded decision.
 12. **The suite's runner is the owner's own work and carries an MIT
