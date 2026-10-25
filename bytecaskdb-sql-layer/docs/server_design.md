@@ -91,21 +91,21 @@ costs one lookup in `Database::prepare`'s cache, keyed by the exact text.
 ## The server
 
 **Binary and modules.** `sql_layer_server --dir DIR [--listen
-127.0.0.1:5432] [--database NAME] [--max-connections 100]
+127.0.0.1:5432] [--database NAME] [--max-connections 100] [--workers N]
 [--sync AT_EVERY_COMMIT|AT_INTERVAL|AT_FILE_ROTATION] [--sync-interval-ms 1000]
 [--io-backend pread|mmap|buffer_pool] [--buffer-pool-size BYTES]
 [--buffer-pool-direct-io on|off] [--statement-memory-bytes 67108864]` serves one
 database directory under one database name, by default the directory's
 last component. It opens the directory with `Database::open`, so it holds
 the engine's directory lock. The code is in `bytecaskdb-sql-layer/server/`:
-- `pg_wire.cppm` (`bytecask.sql.pg_wire`): message framing. It reads a
-  message from a buffer and writes one into a buffer; it does no I/O and has
-  no policy.
+- `pg_wire.cppm` (`bytecask.sql.pg_wire`): message framing (`Framer`),
+  reading a message from a buffer (`Body`) and writing one into a buffer
+  (`Out`); it does no I/O and has no policy.
 - `pg_text.cppm` (`bytecask.sql.pg_text`): each SQL type's OID, its text
   input and its text output.
-- `pg_session.cppm` (`bytecask.sql.pg_session`): one connection's protocol
-  state machine, over a file descriptor.
-- `main.cpp`: arguments, the listener, signals.
+- `pg_session.cppm` (`bytecask.sql.pg_session`): one session's protocol and
+  SQL state machine (`Session`), and the worker pool (`Pool`).
+- `main.cpp`: arguments, the libuv event loop, connections and signals.
 
 The layer is POSIX-only here: no WASM or Windows build of the server.
 
@@ -159,53 +159,44 @@ statement_memory_bytes`: the memory budget of every statement the server
 runs, 64 MiB by default (`plan_api_design.md`, *Memory*). A statement past
 it fails with 54000. 0 is refused at startup.
 
-**Threading.** One thread per connection, and an acceptor thread. A
-connection's thread reads a message, runs it on the embedded API, which
-borrows the thread as it does for any caller, and writes the reply. The
-layer never makes one caller wait for another:
-- a transaction takes no locks;
-- `FOR UPDATE` is a guard checked at commit;
-- a conflict is a `40001` at commit, not a wait.
+**Threading, sessions and the worker pool** (`docs/session_design.md`). Three
+things, each with one owner:
+- **Connection**: a non-blocking socket, its input and output buffers, and
+  message framing (`Framer`), owned by the libuv event loop.
+- **Session**: a plain data structure holding the protocol's and SQL's state,
+  with no thread and no lock, owned by whichever worker is running it.
+- **Worker**: a thread in a fixed pool (`--workers`, by default twice the
+  cores, minimum 2).
 
-So the server adds no waits either. A thread blocks only on its own
-socket, and on its own commit's `fdatasync`, which the engine's group commit
-shares with concurrent commits.
-
-No state is shared between connections but the `Database`, which is
-thread-safe, and the registry of live connections, whose mutex is held only
-to add or remove one.
-
-A worker pool is rejected. It would make a connection wait for a worker
-another connection's `fdatasync` holds, and the per-statement work is a
-call, not something a queue could batch.
+The loop cuts complete messages from a connection's input buffer, appends them
+to the session's queue, and schedules an idle session onto the worker pool. A
+worker runs one session's queued messages up to the next `ReadyForQuery` (after
+startup, a `Query` or a `Sync`), then puts the session behind the others if
+more messages are queued. The pool's queue lock is the only lock.
 
 A connection past `--max-connections` gets `FATAL 53300`
 (`too_many_connections`) and is closed, as PostgreSQL does. The default,
 100, is PostgreSQL's, and covers the gate's 48 virtual users and its
 monitor.
 
-**I/O.** Blocking sockets with `TCP_NODELAY`. Replies are buffered and
-written when the server next has to read: at `ReadyForQuery`, at `Flush`,
-or when the buffer passes 64 KiB. A libpq round trip is then one read and
-one write.
+**I/O.** Non-blocking sockets on libuv with `TCP_NODELAY`. A worker appends
+reply bytes to the connection's output buffer at `ReadyForQuery`, at `Flush`,
+or when its buffer passes 64 KiB, and wakes the loop (`uv_async_send`), which
+writes them in 64 KiB chunks. A slow reader never holds a worker.
 
 A message longer than 64 MiB is `FATAL 08P01` and closes the connection.
 That bound sits well above the engine's 4 MiB default value limit plus a
 statement's text.
 
-**Shutdown.** `SIGINT` or `SIGTERM` closes the listener. The server then
-calls `shutdown(fd, SHUT_RD)` on every registered connection, so a thread
-blocked in `read` wakes at once, idle or not. A statement in flight finishes
-first: its reply still goes out, since the write side stays open. The
-thread then sends `FATAL 57P01` (`admin_shutdown`), rolls back an open
-transaction and exits. A send never blocks in the kernel: it waits in
-`poll` a second at a time, so it sees the stop. A client that has stopped
-reading takes no bytes; once the stop has begun, a send that makes no
-progress for ten seconds drops the connection without the `57P01`. One that
-is still reading, however slowly and however large its result, gets its
-reply and then the `57P01`, so it learns whether its last statement
-committed. When every thread has ended, the server calls
-`Database::close()`.
+**Shutdown.** `SIGINT` or `SIGTERM` closes the listener and stops reading on
+every connection. A turn in flight on a worker finishes first, and its reply
+still goes out. Queued messages and idle sessions are answered with `FATAL
+57P01` (`admin_shutdown`), and open transactions are rolled back. Once the
+stop has begun, a connection whose write makes no progress for ten seconds is
+dropped; one whose client keeps reading, however slowly and however large its
+result, gets its reply and then the `57P01`, so it learns whether its last
+statement committed. When every connection and session has ended, the server
+shuts down the worker pool and calls `Database::close()`.
 
 **After a `FATAL`** the session ends: it reads no more messages and runs
 nothing more. After startup, an invalid message length or type is `FATAL`.
@@ -805,9 +796,14 @@ The run script requires W ≥ the user count; the monitor is not a user.
     are `25P02`; `COMMIT` answers `ROLLBACK`, and nothing is committed;
   - after an error in an implicit block, `Sync` reports `I`;
   - the warnings;
-  - `--max-connections`;
+  - `--max-connections` and `--workers`;
+  - a slow reader on `--workers 1` holding no worker, and a long pipeline
+    yielding at `ReadyForQuery`;
   - `--sync`, `--sync-interval-ms` and the I/O flags: each mode starts and
     stops cleanly, and a bad value exits before the server listens.
+- **`tests/pg_session_test.cpp`** (`sql_layer_tests "[sql][server]"`):
+  sessions moving across worker threads while keeping message order (under
+  ThreadSanitizer in CI), `Execute` lookahead parking, and pipeline fairness.
 - **HammerDB smoke, nightly.** A scheduled workflow,
   `.github/workflows/sql-layer-hammerdb-nightly.yml`, runs `run-gate.sh --smoke`: two warehouses, two
   users, no ramp-up and a one-minute window, against the server and against
@@ -845,7 +841,9 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 ## Decisions
 
 1. The PostgreSQL protocol before gRPC, as a front over the embedded API.
-2. One thread per connection, no pool.
+2. Originally one thread per connection; replaced by `session_design.md`
+   (sessions as plain data structures scheduled onto a worker pool by a
+   libuv loop).
 3. Trust only, loopback by default.
 4. A ported pgtcl driver script, with `PQexecParams` per statement and no
    SQL `PREPARE`.

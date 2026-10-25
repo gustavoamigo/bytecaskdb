@@ -1,10 +1,10 @@
 # Sessions, the worker pool and the transport
 
-Status: **approved, in progress** (design approved by the owner, 2026-10-25;
-tracked in #642). The second of the post-MVP designs (#487, *Next*). Once
-built, it replaces *Threading*, *I/O* and *Shutdown* in `server_design.md`.
-The protocol the server speaks, and everything a client sees, stays as
-`server_design.md` describes it.
+Status: **slice 1 built; slices 2–3 next** (design approved by the owner,
+2026-10-25; tracked in #642). The second of the post-MVP designs (#487,
+*Next*). Slice 1 replaced *Threading*, *I/O* and *Shutdown* in
+`server_design.md`. The protocol the server speaks, and everything a client
+sees, stays as `server_design.md` describes it.
 
 ## Why
 
@@ -288,7 +288,7 @@ vacuum. The connection-to-session map then goes.
 
 ## Slices
 
-1. **The model at parity.** The libuv loop, the session structure, the
+1. **The model at parity (built).** The libuv loop, the session structure, the
    per-session queue and the worker pool. The protocol and everything
    observable are unchanged, and `test_wire.py` passes as it is. The thread
    per connection is removed in the same PR.
