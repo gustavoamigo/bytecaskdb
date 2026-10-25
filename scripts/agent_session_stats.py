@@ -33,6 +33,7 @@ def is_exploration(name, tool_input):
 
 def analyse(path):
     first_ctx = None
+    model = version = None
     cost = 0.0
     tools = Counter()
     explore_before_edit = 0
@@ -43,11 +44,13 @@ def analyse(path):
             rec = json.loads(line)
         except json.JSONDecodeError:
             continue
+        version = version or rec.get("version")
         msg = rec.get("message")
         if rec.get("type") != "assistant" or not isinstance(msg, dict):
             continue
         if rec.get("isSidechain"):
             continue
+        model = model or msg.get("model")
         usage = msg.get("usage") or {}
         created = usage.get("cache_creation_input_tokens", 0)
         read = usage.get("cache_read_input_tokens", 0)
@@ -68,6 +71,8 @@ def analyse(path):
                     explore_before_edit += 1
     return {
         "file": path.name[:8],
+        "model": model,
+        "version": version,
         "first_ctx": first_ctx,
         "explore_before_edit": explore_before_edit,
         "explore_total": explore_total,
@@ -82,6 +87,8 @@ def main():
     parser.add_argument("transcripts", nargs="*", type=Path)
     parser.add_argument("--project-dir", type=Path,
                         help="a directory of .jsonl transcripts (default: ~/.claude/projects)")
+    parser.add_argument("--latest", action="store_true",
+                        help="report only the newest transcript, as a markdown block to paste into an issue")
     parser.add_argument("--match", default="bytecaskdb-rc",
                         help="keep transcripts whose path contains this (default: bytecaskdb-rc)")
     args = parser.parse_args()
@@ -91,9 +98,21 @@ def main():
         root = args.project_dir or DEFAULT_DIR
         paths = sorted((p for p in root.rglob("*.jsonl") if args.match in str(p)),
                        key=lambda p: p.stat().st_mtime)
+    if args.latest:
+        paths = [max(paths, key=lambda p: p.stat().st_mtime)]
     rows = [r for r in (analyse(p) for p in paths if p.stat().st_size) if r["first_ctx"]]
     if not rows:
         sys.exit("no transcripts with usage data")
+
+    if args.latest:
+        r = rows[0]
+        print(f"- model: {r['model']}\n- Claude Code version: {r['version']}\n"
+              f"- first-call context: {r['first_ctx']}\n"
+              f"- exploration calls before first edit: {r['explore_before_edit']}"
+              f" (total {r['explore_total']})\n- tool calls: {r['tool_calls']}\n"
+              f"- weighted cost: {r['cost']}\n- top tools: "
+              + ", ".join(f"{n}:{c}" for n, c in r["top_tools"]))
+        return
 
     print(f"{'session':9}{'first_ctx':>10}{'expl<edit':>10}{'expl_all':>9}{'calls':>7}{'cost':>13}  top tools")
     for r in rows:
