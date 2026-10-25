@@ -78,14 +78,15 @@ python3 bytecaskdb-sql-layer/tests/functional/report.py results.json > report.md
 
 The flags and the lists are for the build, and only for it:
 - **The gate** (the default, and what CI and the build run): a
-  not-implemented case is skipped. Every other case must pass, so
-  removing a flag or a line makes that case a test the layer must pass
-  from then on.
+  not-implemented case runs, and is expected to fail. If it passes, the
+  run fails and says which mark to remove. Every other case must pass.
+  Removing a flag or a line makes that case a test the layer must pass
+  from then on, and a mark that outlives its gap can't hide.
 - **Conformance** (`--conformance`): the flags and the lists are
   ignored. Every case runs as a test, and its real outcome is recorded.
   A failure doesn't fail the run: this run measures, and the report is
   made from it. It also lists the cases still marked not implemented
-  that pass, whose flags can come off.
+  that pass.
 - **No issue per case.** The flags and the lists are the record of
   what's missing.
 - **A limitation is a gap, not a difference.** What the layer can't do
@@ -131,11 +132,16 @@ Their format is in *Our cases*, below.
 
 The two benchmarks' query sets: 22 queries, and 99 with their variants.
 
-- **Data:** generated at a small scale with TPC's own generators,
-  downloaded when the suite runs under TPC's licence. Neither the tools
-  nor the data are committed.
-- **Expected results:** recorded from PostgreSQL on the same data.
-- **Checks:** results.
+- **Data and queries:** generated at a small scale with TPC's own
+  generators. Neither the tools nor the data are committed, and the
+  tools need TPC's registration, so where they come from is open
+  (*Open questions*). The query text runs as the generator writes it.
+- **Expected results:** recorded from PostgreSQL on the same data, in
+  files beside the queries, not in YAML.
+- **Checks:** results. These sets return `numeric` and `double`
+  aggregates, and `ORDER BY` often leaves ties. A TPC case compares
+  numbers within a relative tolerance, and sorts rows that tie on the
+  `ORDER BY` columns. Every other suite compares text.
 - **Names:** TPC's fair-use policy keeps the benchmarks' names for
   audited results, the reason the layer says TPROC-C. These two rows'
   names are open (*Open questions*).
@@ -151,10 +157,11 @@ gate stays where it is (`server_design.md`, *Running the gate*).
 
 A YAML file is a list of cases, one file per area (`joins.yaml`,
 `types.yaml`). The format is the MariaDB plugin's
-(`bytecaskdb-mariadb-plugin/tests/functional/`), whose runner and
-fixtures this suite starts from. Its case queries are not reused: they
-were taken from MariaDB's MTR suite. Every case here is written for this
-layer.
+(`bytecaskdb-mariadb-plugin/tests/functional/`), whose runner this suite
+copies and extends (Decision 12); its fixtures start a MariaDB server
+and are not copied, because this suite starts `sql_layer_server`. Its
+case queries are not reused: they were taken from MariaDB's MTR suite.
+Every case here is written for this layer.
 
 ```yaml
 # Unique constraints and NULL.
@@ -287,8 +294,9 @@ One PR each. Every step leaves the run and the report working.
    PostgreSQL. The TPROC-C row.
 2. **SQL:2016 Core.** sqltest in the repository, its loader, and its
    not-implemented list from a first run.
-3. **TPC-H-derived and TPC-DS-derived.** The data generation, the
-   queries, their results recorded from PostgreSQL.
+3. **TPC-H-derived and TPC-DS-derived.** The data generation and the
+   queries, once their source is settled (*Open questions*), and their
+   results recorded from PostgreSQL.
 4. **More of our cases,** area by area, through the manifest's features
    that no case covers yet.
 
@@ -304,6 +312,18 @@ moves to what the layer doesn't do yet.
    suite's SQL runs as written, so a sqltest table without a primary key
    is not implemented until the layer supports one. The alternative is
    to adapt their SQL (add a primary key) so more of it runs today.
+3. **Where TPC's tools and data come from.** TPC's tools (`dbgen`,
+   `qgen`, `dsdgen`, `dsqgen`) are free but need a registration and an
+   agreement to TPC's licence; there is no URL a CI job can fetch. So
+   "downloaded when the suite runs" doesn't hold. Options:
+   - the tools kept by the owner, who registered, in a place CI can
+     read, with the TPC rows run nightly or on demand, not on every PR;
+   - DuckDB's `tpch` and `tpcds` extensions, which need no
+     registration and run on every PR, but derive from TPC's generators,
+     so their licence needs reading before use.
+
+   The first keeps the licence position clear. The second keeps every
+   suite on every PR. Step 3 waits on this.
 
 ## Decisions
 
@@ -320,9 +340,10 @@ The owner's, 2026-10-25:
 4. **PostgreSQL writes our cases' expected results, and is not part of
    the test.**
 5. **The suites are the scope.** What the layer can't run yet is marked
-   not implemented. The build skips marked cases, and must pass the
-   rest; a conformance run ignores the marks and runs everything, for
-   the report.
+   not implemented. The build runs a marked case expecting it to fail,
+   and a marked case that passes fails the build, so the mark comes off
+   when the layer catches up. A conformance run ignores the marks and
+   runs everything, for the report.
 6. **No issue per not-implemented case.**
 7. **Cases name the SQL features they cover, as metadata.** File names
    stay by area.
@@ -333,3 +354,10 @@ The owner's, 2026-10-25:
     SQLLogicTest is left out for now.
 11. **A table without a primary key is a gap.** The layer's refusal is
     not a recorded decision.
+12. **The runner is copied from the plugin, and licensed MIT here.** The
+    plugin's runner and test collection are the owner's own work, so the
+    copy in `bytecaskdb-sql-layer/tests/functional/` carries an MIT
+    header. The layer's tree never imports from, or names a path in,
+    `bytecaskdb-mariadb-plugin/`: the plugin may depend on the layer,
+    never the reverse (`project_organization.md`). The plugin's MTR-derived
+    queries are not copied.
