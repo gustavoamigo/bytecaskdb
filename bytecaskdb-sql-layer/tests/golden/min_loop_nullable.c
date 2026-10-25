@@ -11,23 +11,23 @@ void plan(bc_ctx *cx) {
     bc_emit_end(cx);
     return;
   }
-  int64_t m = 0;
-  bool seen = false;
+  int64_t x0_0 = 0;
+  bool xs0_0 = false;
   bc_view lo = bc_key_params(cx, TBL_4, 0, 1);
   bc_cursor c = bc_scan_open(cx, TBL_4, lo, lo, BC_SCAN_PREFIX);
   while (bc_scan_next(cx, c)) {
     bc_view row = bc_scan_row(cx, c);
     if (!bc_col_null(cx, row, COL_4_2)) {
-      int64_t v = bc_col_i64(cx, row, COL_4_2);
-      if (!seen || v < m) m = v;
-      seen = true;
+      int64_t v0_0 = bc_col_i64(cx, row, COL_4_2);
+      if (!xs0_0 || v0_0 < x0_0) x0_0 = v0_0;
+      xs0_0 = true;
     }
   }
   bc_emit_begin(cx);
-  if (seen) {
-    bc_emit_i64(cx, m);
-  } else {
+  if (!xs0_0) {
     bc_emit_null(cx);
+  } else {
+    bc_emit_i64(cx, x0_0);
   }
   bc_emit_end(cx);
 }

@@ -7,6 +7,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <cstdint>
@@ -46,12 +47,16 @@ auto ids(const Rows& r) -> std::vector<std::int64_t> {
   return out;
 }
 
-// The SqlError a statement is refused with, or "" if it runs.
+// What a statement is refused with before it runs, or "" if it runs: an
+// ast::SqlError, or a FeatureNotSupported (0A000), the planner's "no plan:"
+// among them.
 template <typename Stmt>
 auto sql_refusal(Database& db, const Stmt& stmt, const std::vector<Value>& params) -> std::string {
   try {
     (void)db.execute(stmt, params);
   } catch (const ast::SqlError& e) {
+    return e.what();
+  } catch (const FeatureNotSupported& e) {
     return e.what();
   }
   return "";
@@ -312,15 +317,25 @@ TEST_CASE("embedded API: compatibility decides which cached plans recompile", "[
   CHECK(ids(db->execute("SELECT id FROM t WHERE qty >= $1", {i(15)})) == std::vector<std::int64_t>{2, 3});
   compiled = db->compilations();
 
-  // DROP INDEX recompiles the plans that scan it, which then have no plan;
-  // the write plans keep running, uncompiled.
+  // DROP INDEX recompiles the plans that scan it: by name, a full scan now.
   (void)db->execute("DROP INDEX t_by_name");
-  CHECK_THROWS_AS(db->execute(by_name, {bytes("a"), bytes("b")}), ast::SqlError);
+  CHECK(ids(db->execute(by_name, {bytes("a"), bytes("b")})) == std::vector<std::int64_t>{1});
+  CHECK(by_name.plan_source().find("IDX_3") == std::string::npos);
+  // One that then has no plan, a filter on a DOUBLE only its index took, is
+  // refused; the write plans keep running, uncompiled.
+  (void)db->execute("ALTER TABLE t ADD COLUMN d DOUBLE PRECISION DEFAULT 1.5");
+  (void)db->execute("CREATE INDEX t_by_d ON t (d)");
+  const auto& by_d = db->prepare("SELECT id FROM t WHERE d >= $1");
+  CHECK(ids(db->execute(by_d, {Value{1.0}})) == std::vector<std::int64_t>{1, 2, 3});
+  const auto by_d_index = "IDX_" + std::to_string(db->catalog()->index("t_by_d").second->id);
+  compiled = db->compilations();
+  (void)db->execute("DROP INDEX t_by_d");
+  CHECK_THROWS_AS(db->execute(by_d, {Value{1.0}}), FeatureNotSupported);
   // A failed recompile keeps the statement's old plan whole and still
   // incompatible: the next execute tries again and fails the same way,
   // never running the old code (ASan checks the schema ref it reads).
-  CHECK_THROWS_AS(db->execute(by_name, {bytes("a"), bytes("b")}), ast::SqlError);
-  CHECK(by_name.plan_source().find("IDX_3") != std::string::npos);
+  CHECK_THROWS_AS(db->execute(by_d, {Value{1.0}}), FeatureNotSupported);
+  CHECK(by_d.plan_source().find(by_d_index) != std::string::npos);
   CHECK(db->execute(insert, {i(4), bytes("date"), i(40)}).affected == 1);
   CHECK(db->execute(by_id, {i(4)}).rows == Grid{{i(4), i(40)}});
   CHECK(db->compilations() == compiled);
@@ -1025,6 +1040,10 @@ TEST_CASE("embedded API: sqlstate reports PostgreSQL's SQLSTATE for each error",
   CHECK(state([&] { (void)db->execute("INSERT INTO s VALUES ($1, $2)", {i(2), kNull}); }) == "23502");
   CHECK(state([&] { (void)db->execute("INSERT INTO s VALUES ($1, $2)", {i(3), i(1 << 16)}); }) == "22003");
   CHECK(state([&] { (void)db->execute("SELEC 1"); }) == "42601");
+  // The planner's refusal: a statement in the subset it can't plan, a
+  // filter on a DOUBLE PRECISION column.
+  (void)db->execute("CREATE TABLE sd (k BIGINT PRIMARY KEY, d DOUBLE PRECISION)");
+  CHECK(state([&] { (void)db->execute("SELECT k FROM sd WHERE d < $1", {Value{1.0}}); }) == "0A000");
   CHECK(state([&] { (void)db->execute("CREATE TABLE s (k BIGINT PRIMARY KEY)"); }) == "42P07");
   CHECK(state([&] { (void)db->execute("DROP TABLE nope"); }) == "42P01");
   CHECK(state([&] { (void)db->execute("SELECT n FROM nope WHERE k = $1", {i(1)}); }) == "42P01");
@@ -1057,4 +1076,112 @@ TEST_CASE("embedded API: refit describes a cached statement against the live cat
   CHECK(select.params().at(0).type == SqlType{SqlKind::Double});
   CHECK(select.columns().at(0).type == SqlType{SqlKind::Text});
   CHECK(db->execute(select, {2.5}).rows.empty());
+}
+
+TEST_CASE("embedded API: every plan the search costed returns the same rows", "[sql][api][search]") {
+  sql_test::TempDir dir{"api_alternatives"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE o (k BIGINT PRIMARY KEY, a BIGINT NOT NULL, b BIGINT, c BIGINT)");
+  (void)db->execute("CREATE INDEX o_a ON o (a)");
+  (void)db->execute("CREATE INDEX o_ab ON o (a, b)");
+  (void)db->execute("CREATE TABLE p (k BIGINT PRIMARY KEY, v BIGINT)");
+  for (std::int64_t k = 0; k < 40; ++k) {
+    auto b = k % 3 == 0 ? Value{} : i(k % 5);
+    (void)db->execute("INSERT INTO o VALUES ($1, $2, $3, $4)", {i(k), i(k % 4), b, i(k % 7)});
+    if (k < 7 && k != 3) (void)db->execute("INSERT INTO p VALUES ($1, $2)", {i(k), i(k % 4)});
+  }
+  // The rows as a multiset, and in order where the statement orders them.
+  auto sorted = [](Grid g) {
+    std::ranges::sort(g);
+    return g;
+  };
+  struct Case {
+    std::string sql;
+    std::vector<Value> params;
+    bool ordered;
+    std::size_t at_least;  // plans the search costs for it
+  };
+  const std::vector<Case> cases{
+      {"SELECT k, b FROM o WHERE a = $1", {i(1)}, false, 2},
+      {"SELECT k FROM o WHERE a = $1 AND b >= $2", {i(2), i(1)}, false, 2},
+      {"SELECT count(*) FROM o WHERE a = $1", {i(3)}, false, 4},
+      {"SELECT count(b) FROM o WHERE a = $1 AND k < $2", {i(0), i(30)}, false, 3},
+      {"SELECT min(b) FROM o WHERE a = $1", {i(1)}, false, 3},
+      {"SELECT sum(c) FROM o WHERE a = $1 AND k >= $2", {i(2), i(5)}, false, 3},
+      {"SELECT k FROM o WHERE a = $1 ORDER BY k DESC", {i(1)}, true, 1},
+      {"SELECT k, b FROM o WHERE a = $1 ORDER BY b, k", {i(2)}, true, 1},
+      {"SELECT o.k, p.v FROM o, p WHERE a = $1 AND p.k = o.c", {i(1)}, false, 2},
+      {"SELECT count(DISTINCT p.v) FROM o, p WHERE a = $1 AND p.k = o.c", {i(3)}, false, 2},
+      // p keyed by a parameter alone: read once, then o's scan; or o's scan
+      // with a lookup of p per row. p's key 3 has no row.
+      {"SELECT o.k, p.v FROM p, o WHERE p.k = $1 AND a = $2", {i(1), i(2)}, false, 4},
+      {"SELECT o.k, p.v FROM p, o WHERE p.k = $1 AND a = $2", {i(3), i(2)}, false, 4},
+      {"SELECT count(*) FROM p, o WHERE p.k = $1 AND a = $2", {i(1), i(2)}, false, 4},
+      {"SELECT o.k FROM p, o WHERE p.k = $1 AND a = $2 ORDER BY o.k LIMIT 3", {i(5), i(1)}, true, 1},
+  };
+  const std::string cross = "SELECT o.k, p.v FROM p, o WHERE p.k = $1 AND a = $2";
+  CHECK(db->execute(cross, {i(1), i(2)}).rows.size() == 10);
+  CHECK(db->execute(cross, {i(3), i(2)}).rows.empty());
+  // The parameters execute refuses, out of their column's type among them.
+  (void)db->execute("CREATE TABLE q (k INTEGER PRIMARY KEY)");
+  CHECK_THROWS_AS(db->alternatives_for_testing("SELECT k FROM q WHERE k = $1", {i(std::int64_t{1} << 40)}), ExecError);
+  CHECK_THROWS_AS(db->alternatives_for_testing("SELECT k FROM q WHERE k = $1", {}), ParamError);
+  for (const auto& c : cases) {
+    INFO(c.sql);
+    auto want = db->execute(c.sql, c.params).rows;
+    auto all = db->alternatives_for_testing(c.sql, c.params);
+    CHECK(all.size() >= c.at_least);
+    for (std::size_t n = 0; n < all.size(); ++n) {
+      INFO("plan " << n);
+      if (c.ordered) {
+        CHECK(all[n].rows == want);
+      } else {
+        CHECK(sorted(all[n].rows) == sorted(want));
+      }
+    }
+  }
+}
+
+TEST_CASE("embedded API: a choice point's plan text shows both plans, and each returns the same rows",
+          "[sql][api][search][choice]") {
+  sql_test::TempDir dir{"api_choice"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE c (k BIGINT PRIMARY KEY, a BIGINT, b BIGINT, v BIGINT)");
+  (void)db->execute("CREATE INDEX c_a ON c (a)");
+  (void)db->execute("CREATE INDEX c_b ON c (b)");
+  // a = 0 on 150 of the 200 rows, b = 0 on 10 of them; NULLs in both.
+  for (std::int64_t k = 0; k < 200; ++k) {
+    auto a = k % 4 == 3 ? i(k % 7) : i(0);
+    auto b = k % 20 == 0 ? i(0) : (k % 11 == 0 ? Value{} : i(k % 9 + 1));
+    (void)db->execute("INSERT INTO c VALUES ($1, $2, $3, $4)", {i(k), k % 50 == 49 ? Value{} : a, b, i(k)});
+  }
+  const std::string sql = "SELECT k, v FROM c WHERE a = $1 AND b = $2";
+  // Counted when compiled: 200 rows, 20 entries under each index. The plan
+  // counts c_a's range and scans it below 21 entries, c_b's from there.
+  const auto& src = db->prepare(sql).plan_source();
+  INFO(src);
+  CHECK(src.find("count0 = bc_count_range(cx, IDX_") != std::string::npos);
+  CHECK(src.find("if (count0 < 21) {") != std::string::npos);
+  CHECK(src.find("} else {") != std::string::npos);
+  auto sorted = [](Grid g) {
+    std::ranges::sort(g);
+    return g;
+  };
+  for (const auto& params : std::vector<std::vector<Value>>{{i(0), i(0)}, {i(3), i(0)}, {i(0), i(5)}, {i(6), i(9)}}) {
+    Grid want;
+    for (std::int64_t k = 0; k < 200; ++k) {
+      auto a = k % 50 == 49 ? std::optional<std::int64_t>{} : (k % 4 == 3 ? k % 7 : 0);
+      auto b = k % 20 == 0 ? std::optional<std::int64_t>{0} : (k % 11 == 0 ? std::nullopt : std::optional{k % 9 + 1});
+      if (a == std::get<std::int64_t>(params[0]) && b == std::get<std::int64_t>(params[1])) want.push_back({i(k), i(k)});
+    }
+    INFO(std::get<std::int64_t>(params[0]) << ", " << std::get<std::int64_t>(params[1]));
+    CHECK(sorted(db->execute(sql, params).rows) == sorted(want));
+    // The cheapest plan forced to each branch, then each other plan.
+    auto all = db->alternatives_for_testing(sql, params);
+    CHECK(all.size() >= 2);
+    for (std::size_t n = 0; n < all.size(); ++n) {
+      INFO("plan " << n);
+      CHECK(sorted(all[n].rows) == sorted(want));
+    }
+  }
 }

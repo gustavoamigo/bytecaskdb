@@ -60,6 +60,11 @@ struct bc_params {
 // context, after the plan ran and before its batch reaches the engine, so a
 // test can make the commit conflict. An empty function removes it.
 void bc_ctx_before_commit_for_testing(bc_ctx* cx, std::function<void()> hook);
+// Test only: the bytes the context's statement is charged now.
+std::uint64_t bc_ctx_held_for_testing(const bc_ctx* cx);
+// Test only: the capacity, in elements, of the write set's vectors (effects,
+// claims, locks, the tables written).
+std::size_t bc_ctx_write_set_slots_for_testing(const bc_ctx* cx);
 #endif
 
 }  // extern "C++"
@@ -70,9 +75,98 @@ export using ::bc_params;
 export using ::bc_ctx_affected;
 #ifdef BYTECASK_SQL_TESTING
 export using ::bc_ctx_before_commit_for_testing;
+export using ::bc_ctx_held_for_testing;
+export using ::bc_ctx_write_set_slots_for_testing;
 #endif
 
 export namespace bytecask::sql {
+
+// What the plan API charges a statement's memory budget for an entry of its
+// own, beside the bytes the entry holds (docs/plan_api_design.md, *Memory*):
+// each handle a plan is given (a view, a pin, a key or row builder, a
+// cursor, a hash table probe), each sorter, hash table and aggregate the
+// plan opens, each aggregate group's node and slot, and each sorter and
+// hash table entry's node. Fixed numbers, so a statement
+// is charged the same on every run and every build; plan_api.cpp checks
+// that each is no less than what it stands for.
+inline constexpr std::uint64_t kViewEntryBytes = 40;
+inline constexpr std::uint64_t kKeyEntryBytes = 64;
+inline constexpr std::uint64_t kRowEntryBytes = 152;
+inline constexpr std::uint64_t kCursorEntryBytes = 408;
+inline constexpr std::uint64_t kGroupEntryBytes = 136;
+inline constexpr std::uint64_t kAggSlotBytes = 48;
+inline constexpr std::uint64_t kSortEntryBytes = 128;
+inline constexpr std::uint64_t kHashEntryBytes = 240;
+inline constexpr std::uint64_t kHashIterEntryBytes = 32;
+inline constexpr std::uint64_t kSorterBytes = 192;
+inline constexpr std::uint64_t kHashBytes = 192;
+inline constexpr std::uint64_t kAggBytes = 320;
+
+// What the write set is charged for what it holds (docs/plan_api_design.md,
+// *The write set is statement memory*): a conservative bound, never less
+// than the memory used, and the one size both of its bounds count, the
+// statement budget as a call adds an item and a transaction's max_bytes as
+// bc_txn_add takes it in. Each heap block costs its capacity and
+// kAllocBytes, the allocator's header and rounding; each item a slot in its
+// vector, which grows to at most twice its size; and each row, unique prefix
+// or range the statement wrote, to refuse a second write, the node it takes
+// in its set. Each effect and table also costs its entry in the commit's
+// WritePlan, which copies its buffers, in autocommit and in a transaction
+// alike, so no commit needs memory its statements were not charged; and a
+// write in a transaction the node it takes in the overlay.
+inline constexpr std::uint64_t kAllocBytes = 32;
+inline constexpr std::uint64_t kEffectSlotBytes = 112;
+inline constexpr std::uint64_t kClaimSlotBytes = 112;
+inline constexpr std::uint64_t kLockSlotBytes = 64;
+inline constexpr std::uint64_t kTableSlotBytes = 8;  // a table's, the first time it is written
+// The most slots each of the write set's vectors keeps across a reset,
+// cleared and uncharged: bounded scratch, so small statements on a pooled
+// context do not regrow them. A vector grown past it is freed.
+inline constexpr std::size_t kKeptWriteSlots = 32;
+inline constexpr std::uint64_t kOverlayNodeBytes = 120;
+inline constexpr std::uint64_t kWrittenRowNodeBytes = 96;
+inline constexpr std::uint64_t kUniqueNodeBytes = 96;
+inline constexpr std::uint64_t kRangeNodeBytes = 112;
+// A WritePlan's: a put, delete or range delete's slot in its writes; a point
+// guard's node in its map of guards; a range guard's slot in its list.
+inline constexpr std::uint64_t kPlanWriteSlotBytes = 112;
+inline constexpr std::uint64_t kPlanKeyGuardNodeBytes = 96;
+inline constexpr std::uint64_t kPlanRangeGuardSlotBytes = 96;
+
+[[nodiscard]] constexpr auto buffer_bytes(std::size_t capacity) -> std::uint64_t {
+  return capacity == 0 ? 0 : capacity + kAllocBytes;
+}
+// The one size of a buffer the write set holds: its capacity, whatever its
+// size. A copy made from a view has its size as its capacity.
+[[nodiscard]] constexpr auto held_bytes(const Bytes& b) -> std::uint64_t { return buffer_bytes(b.capacity()); }
+
+// A WritePlan entry's slot or node: the engine copies its key, and its value
+// or range end, into buffers of their size.
+enum class PlanEntry : std::uint8_t { Write, KeyGuard, RangeGuard };
+[[nodiscard]] constexpr auto plan_entry_bytes(PlanEntry e, std::size_t a, std::size_t b) -> std::uint64_t {
+  std::uint64_t slot = 0;
+  switch (e) {
+    case PlanEntry::Write: slot = kPlanWriteSlotBytes; break;
+    case PlanEntry::KeyGuard: slot = kPlanKeyGuardNodeBytes; break;
+    case PlanEntry::RangeGuard: slot = kPlanRangeGuardSlotBytes; break;
+  }
+  return buffer_bytes(a) + buffer_bytes(b) + slot;
+}
+// An effect with buffers of these capacities, whose plan entry is `e`, and
+// in a transaction a write's overlay node.
+[[nodiscard]] constexpr auto effect_bytes(bool in_txn, PlanEntry e, std::size_t a, std::size_t b) -> std::uint64_t {
+  auto own = buffer_bytes(a) + buffer_bytes(b) + kEffectSlotBytes + plan_entry_bytes(e, a, b);
+  return own + (in_txn && e == PlanEntry::Write ? kOverlayNodeBytes : 0);
+}
+// A table the writes are in: its slot and the commit's guard on its record,
+// a key of `record_key` bytes.
+[[nodiscard]] constexpr auto table_bytes(std::size_t record_key) -> std::uint64_t {
+  return kTableSlotBytes + plan_entry_bytes(PlanEntry::KeyGuard, record_key, 0);
+}
+[[nodiscard]] constexpr auto claim_bytes(std::size_t key) -> std::uint64_t {
+  return buffer_bytes(key) + kClaimSlotBytes;
+}
+[[nodiscard]] constexpr auto lock_bytes(std::size_t key) -> std::uint64_t { return buffer_bytes(key) + kLockSlotBytes; }
 
 // Every column of a row, by its layout: NULL, or the typed value; the id of
 // the first malformed column (row_column), never a plausible value. The one
@@ -183,6 +277,14 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_key_fits", fn_addr(bc_key_fits)},
       {"bc_key_params", fn_addr(bc_key_params)},
       {"bc_key_successor", fn_addr(bc_key_successor)},
+      {"bc_sort_key_begin", fn_addr(bc_sort_key_begin)},
+      {"bc_sort_key_i64", fn_addr(bc_sort_key_i64)},
+      {"bc_sort_key_f64", fn_addr(bc_sort_key_f64)},
+      {"bc_sort_key_bool", fn_addr(bc_sort_key_bool)},
+      {"bc_sort_key_bytes", fn_addr(bc_sort_key_bytes)},
+      {"bc_sort_key_null", fn_addr(bc_sort_key_null)},
+      {"bc_sort_key_col", fn_addr(bc_sort_key_col)},
+      {"bc_sort_key_end", fn_addr(bc_sort_key_end)},
       {"bc_get", fn_addr(bc_get)},
       {"bc_exists", fn_addr(bc_exists)},
       {"bc_scan_open", fn_addr(bc_scan_open)},
@@ -231,8 +333,10 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_agg_max_i64", fn_addr(bc_agg_max_i64)},
       {"bc_agg_count", fn_addr(bc_agg_count)},
       {"bc_agg_next", fn_addr(bc_agg_next)},
+      {"bc_agg_clear", fn_addr(bc_agg_clear)},
       {"bc_agg_i64", fn_addr(bc_agg_i64)},
       {"bc_agg_f64", fn_addr(bc_agg_f64)},
+      {"bc_agg_null", fn_addr(bc_agg_null)},
       {"bc_insert", fn_addr(bc_insert)},
       {"bc_update", fn_addr(bc_update)},
       {"bc_delete", fn_addr(bc_delete)},

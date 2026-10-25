@@ -1,0 +1,1 @@
+SELECT id, d FROM r WHERE id >= $1 ORDER BY d DESC LIMIT 3

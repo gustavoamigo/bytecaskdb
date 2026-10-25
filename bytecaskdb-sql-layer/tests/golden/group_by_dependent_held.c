@@ -1,0 +1,52 @@
+// SELECT id, name, count(*) FROM t GROUP BY id ORDER BY name
+// isolation: snapshot   schema: catalog v7
+// objects: TBL_1 t, COL_1_0 t.id, COL_1_1 t.name
+#include "bc_plan.h"
+enum { TBL_1 = 1, COL_1_0 = 0, COL_1_1 = 1 };
+
+void plan(bc_ctx *cx) {
+  bc_sorter s0 = bc_sorter_open(cx, 0);
+  bc_agg a0 = bc_agg_open(cx, 2);
+  bc_hash f0_0 = bc_hash_open(cx);  // each group's first row of TBL_1
+  {
+    bc_view lo = bc_empty(cx);
+    bc_view hi = bc_empty(cx);
+    bc_cursor c = bc_scan_open(cx, TBL_1, lo, hi, BC_SCAN_FORWARD);
+    while (bc_scan_next(cx, c)) {
+      bc_view row = bc_scan_row(cx, c);
+      bc_sort_key gb0 = bc_sort_key_begin(cx);
+      bc_sort_key_col(cx, gb0, row, COL_1_0, BC_SORT_ASC, BC_SORT_NULLS_FIRST);
+      bc_view gr0 = bc_sort_key_end(cx, gb0);
+      bc_group gg0 = bc_agg_group(cx, a0, gr0);
+      if (bc_agg_null(cx, gg0, 0)) {
+        bc_hash_put(cx, f0_0, gr0, row);
+        bc_agg_min_i64(cx, gg0, 1, bc_col_i64(cx, row, COL_1_0));
+      }
+      bc_agg_count(cx, gg0, 0);
+    }
+  }
+  bc_view gk0 = bc_empty(cx);
+  while (bc_agg_next(cx, a0, &gk0, 0)) {
+    bc_group g0 = bc_agg_group(cx, a0, gk0);
+    bc_hash_iter fq0_0 = bc_hash_find(cx, f0_0, gk0);
+    bc_view fr0_0 = bc_empty(cx);
+    while (bc_hash_next(cx, fq0_0, &fr0_0)) {
+      bc_sort_key sk = bc_sort_key_begin(cx);
+      bc_sort_key_col(cx, sk, fr0_0, COL_1_1, BC_SORT_ASC, BC_SORT_NULLS_LAST);
+      bc_sorter_add(cx, s0, bc_sort_key_end(cx, sk), gk0);
+    }
+  }
+  bc_view p0 = bc_empty(cx);
+  while (bc_sorter_next(cx, s0, &p0)) {
+    bc_group g0 = bc_agg_group(cx, a0, p0);
+    bc_hash_iter fq0_0 = bc_hash_find(cx, f0_0, p0);
+    bc_view fr0_0 = bc_empty(cx);
+    while (bc_hash_next(cx, fq0_0, &fr0_0)) {
+      bc_emit_begin(cx);
+      bc_emit_i64(cx, bc_agg_i64(cx, g0, 1));
+      bc_emit_col(cx, fr0_0, COL_1_1);
+      bc_emit_i64(cx, bc_agg_i64(cx, g0, 0));
+      bc_emit_end(cx);
+    }
+  }
+}

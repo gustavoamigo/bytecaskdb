@@ -400,26 +400,41 @@ differences*.
 
 ## Limits
 
-- **Buffer size.** What a transaction holds, its overlay and its guards,
-  is bounded by `TransactionOptions::max_bytes`, default 64 MiB, well below
-  the engine's 1 GiB plan limit. The bound is checked before a statement's
-  writes are taken in, from the statement's own pending effects: one that
+- **Buffer size.** What a transaction holds, its overlay, its guards,
+  claims and locks, is bounded by `TransactionOptions::max_bytes`, default
+  64 MiB, well below the engine's 1 GiB plan limit. A statement's write set
+  is statement memory, charged to its statement budget as it grows
+  (`plan_api_design.md`, *The write set is statement memory*). `bc_txn_add`
+  moves it to the transaction: it releases it from the statement budget
+  and counts it against `max_bytes` by the same size functions
+  (`effect_bytes`, `table_bytes`, `claim_bytes`, `lock_bytes`). Each of the
+  statement's calls checks the transaction's room for the write set it
+  would reach, so `bc_txn_add` merges only what fits: a statement that
   would take the transaction past it fails with `BC_E_LIMIT` (SQLSTATE
   54000) without the transaction allocating for it, the transaction is
   aborted like any failed statement's, and what it held is freed with the
-  abort.
+  abort. The commit copies the overlay and the guards into the engine's
+  `WritePlan` while they are still held, so each write, guard and table is
+  counted with its entry in that copy from the statement that adds it
+  (`effect_bytes`, `table_bytes`): a transaction never fails at COMMIT for
+  memory its statements did not reserve, and the statement that would
+  take it past `max_bytes` fails instead. A unique check's range guard
+  that the commit prunes stays counted: the count is reserved when the
+  statement adds the guard, and the prune only leaves it above what the
+  commit copies. The rows, unique values and ranges the statement
+  wrote stay statement memory, and go with the statement.
   The count is a conservative bound, never less than the memory held: each
-  buffer's capacity plus an allocator overhead, each map node's full size,
-  and the guards' and written tables' vectors at the size they could grow
-  to. So a transaction of small writes can't exhaust memory through
-  overhead.
+  buffer's capacity plus an allocator overhead, each overlay node's full size,
+  and each guard, claim, lock and table's slot at twice its size, the most
+  its vector grows to. So a transaction of small writes can't exhaust
+  memory through overhead.
 - **Memory.** The overlay allocates from the heap. A failed allocation is
   `BC_E_MEMORY` for the statement, never an abort and never an exception
   into a plan (`CONTRACT.md`, *Plan safety*). An allocation-failure sweep
   over a transaction's statements proves it, as `plan_alloc_faults_test`
   does for executions.
-- **Budget.** Each statement keeps its own `bc_budget`, as each execution
-  does. A transaction-wide budget, or a request deadline turned into one,
+- **Budget.** Each statement keeps its own `bc_budget`, its work and its
+  memory, as each execution does. A transaction-wide budget, or a request deadline turned into one,
   is later (*Later*). Nothing here blocks it: the
   budget is passed per statement.
 - **Duration.** An open transaction holds a snapshot, which keeps the data

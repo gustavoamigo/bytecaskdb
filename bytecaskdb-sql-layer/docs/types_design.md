@@ -29,6 +29,11 @@ bind error with the position of the type name.
 | `DATE` | `i64` | Days since 1970-01-01, in PostgreSQL's range: 4714-11-24 BC to 5874897-12-31. |
 | `TIME` | `i64` | Microseconds since midnight, in [0, 86 400 000 000]: 24:00:00 included, as in PostgreSQL. |
 
+A result has one more type no column has: `NUMERIC` of no declared
+precision (`SqlKind::Numeric`), `AVG`'s, carried in a result row as its
+text, since its digits can pass 64 bits (`planner_design.md`, *Aggregates*). A `SUM` of a `BIGINT` or `DECIMAL` is a `DECIMAL` of no declared
+precision, its scaled `i64`.
+
 Rejected, each for a reason that is not "later": `NUMERIC` with
 no precision or with p > 18 (does not fit `i64`); `CHAR(n)` (its
 blank-padded comparison is a collation rule, and there are no collations
@@ -83,8 +88,10 @@ that is not well-formed UTF-8, or holds a NUL, when it is written
 (`BC_C_RANGE`, 22021), as it refuses any value outside its type; the
 compiler never emits a validity check. A key value that is not UTF-8 is
 refused the same way. Comparison and ordering are bytewise,
-which is code-point order for well-formed UTF-8. Collation sort keys come
-later, in the slot the MariaDB plugin uses them: the key encoder writes a
+which is code-point order for well-formed UTF-8. That is the layer's one
+collation, PostgreSQL's `COLLATE "C"`: an `ORDER BY` on text gives that
+order, which a PostgreSQL database with another default collation does
+not. Other collations' sort keys come later, in the slot the MariaDB plugin uses them: the key encoder writes a
 text key part as the collation's weights, as `bytes`, and the row keeps the
 original text (*Key encoding*, below). Nothing else changes when they arrive.
 
@@ -119,8 +126,10 @@ SQL's three-valued logic, as PostgreSQL has it:
   the reverse. Today's plans give PostgreSQL's placement for one nullable
   ordered `ASC` index part directly after the equality prefix, by scanning
   its present values and its NULL part as two ranges
-  (`docs/frontend_design.md`, *NULLs in an ordered part*); other nullable
-  orders are refused (#533).
+  (`docs/planner_design.md`, *NULLs in an ordered part*); other nullable
+  orders are refused (#533). A sort key (*Key encoding*, *Sort keys*)
+  places each part's NULLs where the plan says, `FIRST` or `LAST` in
+  either direction.
 - **A null parameter in a key lookup matches nothing**: `WHERE id = $1`
   with `$1` null returns no rows and `UPDATE`/`DELETE` affect none. The
   compiler emits the null test before building the key.
@@ -261,6 +270,22 @@ collations arrive, a text part under a non-binary collation is the collation's s
 the slot the plugin's `key_format` 2 uses for `CHARSET_INFO::strnxfrm`
 weights, and the decoder for such a part returns the weights, not the text:
 a covering read of a collated text column goes to the row.
+
+**Sort keys.** A sort key (`bc_sort_key_*`, `plan_api_design.md`, *Sort
+keys*) is what a sorter orders by, never stored and never an engine key: no
+namespace or id, and parts the plan chooses, each with a direction and a
+NULL placement. Every part starts with a marker byte that is never
+inverted: `0x01` before a value, and a NULL is its marker alone, `0x00`
+for `NULLS FIRST` or `0x02` for `NULLS LAST`. The value follows as a
+non-nullable part of the table above, inverted under `DESC`. So NULL
+placement does not depend on direction, and `memcmp` order on the key is
+PostgreSQL's `ORDER BY` order part by part: `i64` in integer order, `f64`
+in PostgreSQL's `float8` order (`−0.0` equal to `0.0`, NaN equal to NaN
+and above `+∞`), `false` before `true`, and `bytes` bytewise, a value
+before every value it is a prefix of, as `BYTEA` and `TEXT COLLATE "C"`
+order. The `bytes` terminator keeps a part's end its own, so a tie on one
+part leaves the order to the next. A sort key does not parse back: the
+plan keeps each part's type and placement the same in every row.
 
 **Why not the plugin's variable-length formats.** The plugin has been
 through three: a 2-byte length prefix before the bytes, which sorted by
@@ -437,6 +462,11 @@ values with the edges mixed in:
   for composite keys with ties on the leading parts: negative integers,
   negative and special doubles (`±0.0`, `±∞`, NaN), prefixes of byte
   strings, nulls first under `ASC` and last under `DESC`;
+- sort keys (`tests/plan_sort_key_test.cpp`) sort as PostgreSQL's `ORDER
+  BY` orders, for each type, direction and NULL placement and for keys of
+  several parts, with `±0.0`, NaN, `±∞`, the empty string, embedded zero
+  bytes and prefixes among the values, and equal keys exactly where
+  PostgreSQL sees equal values;
 - `bc_key_successor` bounds every key under its prefix;
 - a key cut at any byte, or with a bad marker or escape, is reported, not
   over-read;

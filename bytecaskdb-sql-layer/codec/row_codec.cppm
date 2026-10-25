@@ -73,6 +73,11 @@ enum class SqlKind : std::uint8_t {
   Timestamp,
   Date,
   Time,
+  // PostgreSQL's numeric of no declared precision, of any digits: AVG's
+  // result. No column is declared one, so no record holds it; a result row
+  // carries its value as its text (Rows), and its scale is the scale of
+  // the integer sum it divides.
+  Numeric,
 };
 
 // DECIMAL(p, s) is a scaled i64: p of at most 18 digits fits.
@@ -338,7 +343,8 @@ auto phys_type(SqlType t) -> PhysType {
     case SqlKind::Boolean: return PhysType::Bool;
     case SqlKind::Bytea:
     case SqlKind::Text:
-    case SqlKind::Varchar: return PhysType::Bytes;
+    case SqlKind::Varchar:
+    case SqlKind::Numeric: return PhysType::Bytes;
   }
   return PhysType::Bytes;
 }

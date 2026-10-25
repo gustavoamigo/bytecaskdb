@@ -1,0 +1,1 @@
+SELECT qty, max(id) FROM t GROUP BY qty ORDER BY qty DESC LIMIT 3

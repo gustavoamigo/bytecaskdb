@@ -27,7 +27,9 @@ module;
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <algorithm>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -64,9 +66,18 @@ using Value = bc_value;  // NULL, BIGINT, DOUBLE PRECISION, BOOLEAN, BYTEA
 using bytecask::sql::DdlRefused;
 using bytecask::DbClosed;
 
+// PostgreSQL's AVG of an exact number, as numeric's text: its numeric_div
+// of the sum (the total at the argument's `scale`) by the count, the scale
+// select_div_scale chooses (at least 16 significant digits), rounded half
+// away from zero. More digits than 64 bits hold, so a result row carries it
+// as text (Rows).
+[[nodiscard]] auto average_text(std::int64_t sum, std::int64_t count, std::uint8_t scale) -> std::string;
+
 struct Rows {
   std::vector<std::string> columns;
-  std::vector<SqlType> types;  // each column's SQL type, as the catalog declares it
+  // Each column's SQL type, as the catalog declares it. A NUMERIC's value,
+  // an AVG's, is its text, as bytes: more digits than an int64_t holds.
+  std::vector<SqlType> types;
   std::vector<std::vector<Value>> rows;
   std::int64_t affected{-1};  // INSERT, UPDATE, DELETE: rows changed
 };
@@ -148,15 +159,10 @@ public:
 
 // A statement the layer does not support where it was given: SQLSTATE
 // 0A000. A DDL statement given to a transaction is one: DDL is its own
-// atomic operation. Thrown before anything runs; in a transaction it aborts
-// the transaction, as every error does in PostgreSQL.
-class FeatureNotSupported : public std::logic_error {
-public:
-  using std::logic_error::logic_error;
-  FeatureNotSupported(const FeatureNotSupported&) = default;
-  FeatureNotSupported& operator=(const FeatureNotSupported&) = default;
-  ~FeatureNotSupported() override;  // out of line: anchors the vtable (-Wweak-vtables)
-};
+// atomic operation. A statement the planner can't plan is another, its
+// message starting "no plan:". Thrown before anything runs; in a
+// transaction it aborts the transaction, as every error does in PostgreSQL.
+using FeatureNotSupported = ast::FeatureNotSupported;
 
 // Parameters a statement does not take: the wrong number, or a value not of
 // its parameter's type. Thrown before the plan runs.
@@ -261,8 +267,10 @@ private:
 
 struct TransactionOptions {
   // The most a transaction may hold: its writes' keys and values, the
-  // structures they are kept in, and its guards. A statement that would take
-  // it past is BC_E_LIMIT (SQLSTATE 54000), and aborts the transaction.
+  // structures they are kept in, its guards, claims and locks. Each
+  // statement's write set moves here from its statement budget when the
+  // statement ends. A statement that would take it past is BC_E_LIMIT
+  // (SQLSTATE 54000), and aborts the transaction.
   std::uint64_t max_bytes{64u << 20};
 };
 
@@ -382,6 +390,12 @@ struct DatabaseOptions {
   // std::invalid_argument.
   IoBackend io_backend{IoBackend::Pread};
   BufferPoolOptions buffer_pool{};
+  // The most memory one statement may hold: the keys and rows it builds or
+  // reads, its pinned values, its groups, its result rows and its write set
+  // (what it keeps until commit or, in a transaction, until the statement
+  // ends). Past it the statement fails with BC_E_LIMIT (SQLSTATE
+  // 54000), never a spill; open refuses 0.
+  std::uint64_t statement_memory_bytes{64u << 20};
 };
 
 // Every call may be made from any thread, concurrently with any other but
@@ -392,8 +406,8 @@ struct DatabaseOptions {
 // between a DDL's batch reaching the engine and its catalog taking effect.
 class Database {
 public:
-  // Throws std::invalid_argument for a sync that is not a SyncMode, or a
-  // sync_interval_ms outside 1 to 60,000.
+  // Throws std::invalid_argument for a sync that is not a SyncMode, a
+  // sync_interval_ms outside 1 to 60,000, or a statement_memory_bytes of 0.
   [[nodiscard]] static auto open(const std::filesystem::path& dir, DatabaseOptions opts = {})
       -> std::unique_ptr<Database>;
   ~Database();
@@ -404,10 +418,12 @@ public:
   // once close() was called, as the engine's calls do.
 
   // Parses, binds and (for DML) plans and compiles; cached by the exact text.
-  // Throws ast::SqlError. The reference is valid until close().
+  // Throws ast::SqlError, or FeatureNotSupported ("no plan: ...") for a
+  // statement the planner can't plan. The reference is valid until close().
   auto prepare(std::string_view sql) -> const Statement&;
   // Throws ParamError for parameters of the wrong number or type,
-  // ast::SqlError if a recompile fails, ExecError if the plan fails,
+  // ast::SqlError or FeatureNotSupported if a recompile fails, as prepare
+  // does, ExecError if the plan fails,
   // TransactionResolutionUnknown if its commit's outcome is unknown,
   // std::logic_error for a statement another Database prepared, and for
   // DDL, what LiveCatalog::apply throws (DdlRefused for a statement the
@@ -440,6 +456,11 @@ public:
   // with the oracle's; SQL has no full scan. Throws ast::SqlError for a
   // table that does not exist, as a statement naming it would.
   [[nodiscard]] auto table_rows(std::string_view table) const -> Rows;
+  // Test only: runs every plan the search costs for a SELECT, autocommit,
+  // each on its own snapshot, and returns each one's rows, the cheapest
+  // plan's first (docs/planner_design.md, *Tests*, alternatives agree).
+  // Throws what prepare and execute throw.
+  [[nodiscard]] auto alternatives_for_testing(std::string_view sql, const std::vector<Value>& params) -> std::vector<Rows>;
   // Test only: while on, every autocommit plan that writes a table
   // conflicts. Before each commit reaches the engine, every table's catalog
   // record is written back unchanged, which such a plan guards, so execute
@@ -485,6 +506,11 @@ private:
   // A DML statement's plan for the live catalog; null for DDL. Throws what
   // binding, planning and compiling throw.
   [[nodiscard]] auto build(const Statement& s) -> std::shared_ptr<const Compiled>;
+  // What the search costs plans with: each table's row count, counted on a
+  // snapshot taken now.
+  [[nodiscard]] auto row_counts() const -> RowCounts;
+  // Compiles a plan's text and sets what a run needs from it.
+  void link(Compiled& c);
   auto recompile(const Statement& stmt) -> std::shared_ptr<const Compiled>;
   // The statement's plan, checked against the live catalog and recompiled
   // if it no longer fits.
@@ -493,12 +519,17 @@ private:
   // Runs a DML statement on `cx`: autocommit, retried on a conflict, when
   // `txn` is null; else as a statement of `txn`, its writes added to it.
   auto run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn) -> Rows;
+  // Throws ParamError for parameters the plan does not take, and ExecError
+  // BC_C_RANGE for a value outside its parameter's SQL type.
+  static void check_params(const Compiled& c, const std::vector<Value>& params);
   static auto results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows;
+  static auto quotients(const GeneratedPlan& p, std::vector<Value> values) -> std::vector<Value>;
   // An autocommit context: one per call in flight, kept for the next.
   [[nodiscard]] auto acquire_context() -> bc_ctx*;
   void release_context(bc_ctx* cx) noexcept;
 
   bool sync_commits_{true};  // set by open(); whether a commit waits for fdatasync
+  bc_budget budget_{};       // set by open(); every statement's
   std::mutex flush_mu_;
   std::condition_variable flush_cv_;
   bool flush_stop_{false};  // under flush_mu_
@@ -530,7 +561,6 @@ namespace bytecask::sql {
 
 namespace {
 
-constexpr std::uint32_t kArenaBytes = 4u << 20;
 constexpr std::uint32_t kMaxRetries = 3;
 
 }  // namespace
@@ -538,7 +568,6 @@ constexpr std::uint32_t kMaxRetries = 3;
 ExecError::~ExecError() = default;
 SerializationFailure::~SerializationFailure() = default;
 TransactionAborted::~TransactionAborted() = default;
-FeatureNotSupported::~FeatureNotSupported() = default;
 TransactionResolutionUnknown::~TransactionResolutionUnknown() = default;
 auto TransactionResolutionUnknown::what() const noexcept -> const char* {
   return "the transaction's outcome is unknown: its commit failed after its batch may have reached the data file "
@@ -597,6 +626,61 @@ constexpr std::string_view kDdlInProgress = "could not serialize access: another
 constexpr int kTxnPlanAttempts = 3;
 
 }  // namespace
+
+auto average_text(std::int64_t sum, std::int64_t count, std::uint8_t scale) -> std::string {
+  // The magnitude, INT64_MIN's too.
+  const auto num = sum < 0 ? 0 - static_cast<std::uint64_t>(sum) : static_cast<std::uint64_t>(sum);
+  const auto den = static_cast<std::uint64_t>(count);
+  // select_div_scale's weights: of each operand's first non-zero base-10000
+  // digit, and that digit. A zero has weight 0 and digit 0.
+  auto weight_of = [](std::uint64_t v, std::uint8_t s) -> std::pair<int, std::uint64_t> {
+    if (v == 0) return {0, 0};
+    auto digits = std::to_string(v);
+    if (digits.size() > s) {
+      // An integer part: its base-10000 digits, aligned at the point.
+      auto whole = digits.substr(0, digits.size() - s);
+      auto w = static_cast<int>((whole.size() - 1) / 4);
+      return {w, std::stoull(whole.substr(0, whole.size() - static_cast<std::size_t>(w) * 4))};
+    }
+    // Only a fraction: its base-10000 digits after the point.
+    auto frac = std::string(s - digits.size(), '0') + digits;
+    frac.append((4 - frac.size() % 4) % 4, '0');
+    for (std::size_t i = 0; i < frac.size(); i += 4) {
+      auto d = std::stoull(frac.substr(i, 4));
+      if (d != 0) return {-static_cast<int>(i / 4) - 1, d};
+    }
+    return {0, 0};
+  };
+  auto [w1, d1] = weight_of(num, scale);
+  auto [w2, d2] = weight_of(den, 0);
+  auto qweight = w1 - w2;
+  if (d1 <= d2) --qweight;
+  auto rscale = std::clamp(std::max(16 - qweight * 4, static_cast<int>(scale)), 0, 1000);
+  // num / den's digits, the quotient's and then its fraction's, one past
+  // rscale once moved `scale` places: the last one rounds.
+  auto q = num / den;
+  unsigned __int128 r = num % den;
+  auto digits = std::to_string(q);
+  for (auto i = 0; i < rscale - static_cast<int>(scale) + 1; ++i) {
+    r *= 10;
+    digits.push_back(static_cast<char>('0' + static_cast<int>(r / den)));
+    r %= den;
+  }
+  auto up = digits.back() >= '5';
+  digits.pop_back();
+  for (auto i = digits.size(); up && i-- > 0;) {
+    up = digits[i] == '9';
+    digits[i] = up ? '0' : static_cast<char>(digits[i] + 1);
+  }
+  if (up) digits.insert(digits.begin(), '1');
+  auto frac_digits = static_cast<std::size_t>(rscale);
+  if (digits.size() <= frac_digits) digits.insert(0, frac_digits + 1 - digits.size(), '0');
+  auto whole = digits.substr(0, digits.size() - frac_digits);
+  whole.erase(0, std::min(whole.find_first_not_of('0'), whole.size() - 1));
+  auto text = whole + (frac_digits > 0 ? "." + digits.substr(digits.size() - frac_digits) : "");
+  auto zero = std::ranges::all_of(digits, [](char c) { return c == '0'; });
+  return (sum < 0 && !zero ? "-" : "") + text;
+}
 
 namespace {
 
@@ -708,8 +792,10 @@ auto Database::open(const std::filesystem::path& dir, DatabaseOptions opts) -> s
   if (opts.sync_interval_ms < 1 || opts.sync_interval_ms > 60'000) {
     throw std::invalid_argument("sync_interval_ms is 1 to 60000");
   }
+  if (opts.statement_memory_bytes == 0) throw std::invalid_argument("statement_memory_bytes is at least 1");
   std::unique_ptr<Database> d{new Database};
   d->sync_commits_ = opts.sync == SyncMode::AtEveryCommit;
+  d->budget_ = {.max_reads = 0, .max_bytes = opts.statement_memory_bytes, .deadline_ns = 0};
   d->life_ = std::make_shared<DatabaseLife>();
   bytecask::Options engine;
   engine.io_backend = opts.io_backend;
@@ -813,7 +899,7 @@ auto Database::acquire_context() -> bc_ctx* {
       idle_.pop_back();
     }
   }
-  if (cx == nullptr) cx = bc_ctx_new(&bdb_, &bcat_, kArenaBytes);
+  if (cx == nullptr) cx = bc_ctx_new(&bdb_, &bcat_);
   if (cx == nullptr) throw std::bad_alloc();
 #ifdef BYTECASK_SQL_TESTING
   if (!conflict_every_commit_.load()) {
@@ -846,23 +932,34 @@ auto Database::catalog() const -> std::shared_ptr<const Catalog> {
   return live_->current();
 }
 
+auto Database::row_counts() const -> RowCounts {
+  // One snapshot for every table the search counts. Each count is
+  // bc_count_range's: at most two record reads, whatever the table holds.
+  auto snap = std::make_shared<Snapshot>(db_->snapshot());
+  return [snap](const Table& t) -> std::optional<std::uint64_t> {
+    auto lo = row_prefix(t.id);
+    auto hi = key_successor(lo);
+    return snap->count_keys(lo, hi, std::numeric_limits<std::size_t>::max());
+  };
+}
+
 auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
   auto cat = live_->current();
   auto bound = bound::bind(s.ast_, *cat);
-  // Every statement but DDL reads or writes a table, a join two; DDL has no
-  // plan.
-  const auto* table = std::visit(
-      [](const auto& st) -> const Table* {
-        if constexpr (std::is_same_v<std::decay_t<decltype(st)>, Ddl>) {
-          return nullptr;
-        } else {
-          return st.table;
-        }
-      },
-      bound.stmt);
-  if (table == nullptr) return nullptr;
+  // DDL has no plan.
+  if (std::holds_alternative<Ddl>(bound.stmt)) return nullptr;
   auto c = std::make_shared<Compiled>();
-  c->plan = std::make_unique<GeneratedPlan>(generate_plan(bound, *cat, s.sql_));
+  c->param_sql = std::move(bound.param_sql);
+  c->param_table = std::move(bound.param_table);
+  c->params = std::move(bound.params);
+  c->plan = std::make_unique<GeneratedPlan>(generate_plan(std::move(bound), *cat, s.sql_, row_counts(), budget_.max_bytes));
+  link(*c);
+  ++compilations_;
+  return c;
+}
+
+void Database::link(Compiled& compiled) {
+  auto* c = &compiled;
   c->columns = c->plan->result_names;
   c->column_types = c->plan->result_sql;
   c->result_codes = result_type_codes(c->plan->result_types);
@@ -874,9 +971,6 @@ auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
   for (const auto& col : c->plan->columns) {
     c->col_refs.push_back({col.table, col.col, static_cast<std::uint8_t>(col.type)});
   }
-  c->param_sql = std::move(bound.param_sql);
-  c->param_table = std::move(bound.param_table);
-  c->params = std::move(bound.params);
   auto n = [](const auto& v) { return narrow<std::uint32_t>(v.size()); };
   const auto& p = *c->plan;
   c->ref = {p.catalog_version,
@@ -889,8 +983,6 @@ auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
             c->result_codes.data(),
             n(c->result_codes)};
   c->checked.store(p.catalog_version);
-  ++compilations_;
-  return c;
 }
 
 auto Database::recompile(const Statement& stmt) -> std::shared_ptr<const Compiled> {
@@ -975,7 +1067,7 @@ auto Database::fitting_plan(bc_ctx* cx, const Statement& stmt, const std::vector
   ++plan_checks_;
 #endif
   bc_params bp{params};
-  bc_ctx_begin(cx, &bp, {});
+  bc_ctx_begin(cx, &bp, budget_);
   auto fits = bc_ctx_check(cx, &c->ref);
   auto stale = !fits && bc_error(cx) == BC_E_LAYOUT && bc_error_detail(cx) == BC_L_INCOMPATIBLE;
   if (!fits && !stale) throw_context_error(cx);
@@ -987,35 +1079,32 @@ auto Database::fitting_plan(bc_ctx* cx, const Statement& stmt, const std::vector
   return c;
 }
 
+// A value outside its parameter's SQL type is refused before the plan runs,
+// as PostgreSQL refuses a $n it cannot coerce at bind: even one a plan would
+// not read (a key whose other part is NULL). The parameters are checked
+// against the plan that will run, and so against the catalog it was
+// verified against: a DDL since the plan was compiled may have changed what
+// they are (an INTEGER key recreated as BIGINT).
+void Database::check_params(const Compiled& c, const std::vector<Value>& params) {
+  const auto& types = c.plan->param_types;
+  if (params.size() != types.size()) {
+    throw ParamError("statement takes " + std::to_string(types.size()) + " parameters, got " +
+                     std::to_string(params.size()));
+  }
+  for (std::size_t i = 0; i < params.size(); ++i) {
+    if (!datum_fits(params[i], types[i])) throw ParamError("parameter $" + std::to_string(i + 1) + " has the wrong type");
+  }
+  for (std::size_t i = 0; i < params.size(); ++i) {
+    const auto& sql = c.param_sql.at(i);
+    if (!sql) continue;  // assigned only: the row builder checks it, in column order
+    if (auto range = out_of_range(*sql, params[i])) {
+      throw ExecError(*range + " for parameter $" + std::to_string(i + 1), BC_E_CONSTRAINT,
+                      ConstraintDetail{BC_C_RANGE, c.param_table.at(i)}.encode());
+    }
+  }
+}
+
 auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn) -> Rows {
-  // Throws ParamError for parameters the plan does not take.
-  auto mismatch = [&](const Compiled& c) -> std::string {
-    const auto& types = c.plan->param_types;
-    if (params.size() != types.size()) {
-      return "statement takes " + std::to_string(types.size()) + " parameters, got " + std::to_string(params.size());
-    }
-    for (std::size_t i = 0; i < params.size(); ++i) {
-      if (!datum_fits(params[i], types[i])) return "parameter $" + std::to_string(i + 1) + " has the wrong type";
-    }
-    return {};
-  };
-  // A value outside its parameter's SQL type is refused before the plan
-  // runs, as PostgreSQL refuses a $n it cannot coerce at bind: even one a
-  // plan would not read (a key whose other part is NULL). The parameters are
-  // checked against the plan that will run, and so against the catalog it
-  // was verified against: a DDL since the plan was compiled may have changed
-  // what they are (an INTEGER key recreated as BIGINT).
-  auto check_params = [&](const Compiled& c) {
-    if (auto why = mismatch(c); !why.empty()) throw ParamError(why);
-    for (std::size_t i = 0; i < params.size(); ++i) {
-      const auto& sql = c.param_sql.at(i);
-      if (!sql) continue;  // assigned only: the row builder checks it, in column order
-      if (auto range = out_of_range(*sql, params[i])) {
-        throw ExecError(*range + " for parameter $" + std::to_string(i + 1), BC_E_CONSTRAINT,
-                        ConstraintDetail{BC_C_RANGE, c.param_table.at(i)}.encode());
-      }
-    }
-  };
   bc_params bp{params};
   if (txn != nullptr) {
     // The plan must fit the catalog the transaction pinned at its first
@@ -1025,7 +1114,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
     // the snapshot as the first statement starts); and is otherwise a DDL
     // since the transaction began: 40001, as a commit after it would be.
     for (auto attempt = 0;; ++attempt) {
-      bc_ctx_begin_txn(cx, txn, &bp, {});
+      bc_ctx_begin_txn(cx, txn, &bp, budget_);
       auto pinned = bc_txn_catalog_version(txn);
 #ifdef BYTECASK_SQL_TESTING
       if (after_txn_pin_) after_txn_pin_();
@@ -1047,7 +1136,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
       };
       auto incompatible = [&] { return bc_error(cx) == BC_E_LAYOUT && bc_error_detail(cx) == BC_L_INCOMPATIBLE; };
       try {
-        check_params(*c);
+        check_params(*c, params);
       } catch (...) {
         // Parameters a stale plan refuses may fit the plan it recompiles
         // to: only then is it checked before running.
@@ -1069,8 +1158,8 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
     }
   }
   auto c = fitting_plan(cx, stmt, params);
-  check_params(*c);
-  auto r = bc_execute(cx, c->code->fn(), &c->ref, &bp, {}, sync_commits_, kMaxRetries);
+  check_params(*c, params);
+  auto r = bc_execute(cx, c->code->fn(), &c->ref, &bp, budget_, sync_commits_, kMaxRetries);
   // bc_ctx_run checks the plan against the catalog it pinned. A plan a DDL
   // made incompatible (BC_E_LAYOUT with BC_L_INCOMPATIBLE) is recompiled
   // from its text and run once more; one a DDL left compatible keeps
@@ -1078,8 +1167,8 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
   if (r == BC_FAILED && bc_error(cx) == BC_E_LAYOUT && bc_error_detail(cx) == BC_L_INCOMPATIBLE) {
     bc_ctx_reset(cx);
     c = recompile(stmt);
-    check_params(*c);
-    r = bc_execute(cx, c->code->fn(), &c->ref, &bp, {}, sync_commits_, kMaxRetries);
+    check_params(*c, params);
+    r = bc_execute(cx, c->code->fn(), &c->ref, &bp, budget_, sync_commits_, kMaxRetries);
   }
   if (r == BC_CONFLICT) {
     bc_ctx_reset(cx);
@@ -1109,10 +1198,36 @@ auto Database::results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows {
         bc_ctx_reset(cx);
         throw ExecError("malformed result row: column " + std::to_string(values.error()), BC_E_CORRUPT);
       }
-      out.rows.push_back(std::move(*values));
+      out.rows.push_back(quotients(p, std::move(*values)));
     }
   }
   bc_ctx_reset(cx);
+  return out;
+}
+
+// A result row's NUMERICs, each its plan's columns (physical::plan_columns),
+// its sum and count, as one: NULL, or its text.
+auto Database::quotients(const GeneratedPlan& p, std::vector<Value> values) -> std::vector<Value> {
+  auto numeric = [](const SqlType& t) { return t.kind == SqlKind::Numeric; };
+  if (std::ranges::none_of(p.result_sql, numeric)) return values;
+  std::vector<Value> out;
+  std::size_t at = 0;
+  for (const auto& t : p.result_sql) {
+    const auto first = std::exchange(at, at + physical::plan_columns(t).size());
+    if (!numeric(t)) {
+      out.push_back(std::move(values[first]));
+      continue;
+    }
+    const auto* sum = std::get_if<std::int64_t>(&values[first]);
+    const auto* count = std::get_if<std::int64_t>(&values[first + 1]);
+    if (sum == nullptr || count == nullptr || *count <= 0) {
+      out.emplace_back(std::monostate{});
+      continue;
+    }
+    auto text = average_text(*sum, *count, t.scale);
+    auto b = std::as_bytes(std::span{text.data(), text.size()});
+    out.emplace_back(Bytes(b.begin(), b.end()));
+  }
   return out;
 }
 
@@ -1137,7 +1252,7 @@ auto Database::begin(TransactionOptions opts) -> Transaction {
 
 Transaction::Transaction(Database& db, TransactionOptions opts)
     : life_{db.life_}, db_{&db}, h_{std::make_unique<TxnHandle>()} {
-  h_->cx = bc_ctx_new(&db.bdb_, &db.bcat_, kArenaBytes);
+  h_->cx = bc_ctx_new(&db.bdb_, &db.bcat_);
   h_->txn = h_->cx == nullptr ? nullptr : bc_txn_new(&db.bdb_, &db.bcat_, opts.max_bytes);
   if (h_->txn == nullptr) {
     h_->release();
@@ -1268,6 +1383,39 @@ auto Transaction::commit() -> CommitOutcome {
 void Database::conflict_on_every_commit_for_testing(bool on) {
   auto lock = enter();
   conflict_every_commit_.store(on);  // each autocommit context takes it up when it is next taken
+}
+
+auto Database::alternatives_for_testing(std::string_view sql, const std::vector<Value>& params) -> std::vector<Rows> {
+  auto lock = enter();
+  auto cat = live_->current();
+  auto bound = bound::bind(ast::parse(sql), *cat);
+  if (std::holds_alternative<Ddl>(bound.stmt)) throw std::logic_error("DDL has no plan");
+  auto param_sql = bound.param_sql;
+  auto param_table = bound.param_table;
+  std::vector<Rows> out;
+  for (auto& plan : generate_alternatives(std::move(bound), *cat, sql, row_counts(), budget_.max_bytes)) {
+    if (!plan.returns_rows) throw std::logic_error("alternatives of a statement that writes");
+    Compiled c;
+    c.param_sql = param_sql;
+    c.param_table = param_table;
+    c.plan = std::make_unique<GeneratedPlan>(std::move(plan));
+    check_params(c, params);
+    link(c);
+    auto* cx = acquire_context();
+    try {
+      bc_params bp{params};
+      auto r = bc_execute(cx, c.code->fn(), &c.ref, &bp, budget_, sync_commits_, kMaxRetries);
+      if (r == BC_CONFLICT) throw ExecError::conflicted("conflict: a guard failed on every attempt");
+      if (r == BC_FAILED) throw_context_error(cx);
+      out.push_back(results(cx, c, Rows{}));
+      release_context(cx);
+    } catch (...) {
+      bc_ctx_reset(cx);
+      release_context(cx);
+      throw;
+    }
+  }
+  return out;
 }
 
 auto Database::table_rows(std::string_view table) const -> Rows {

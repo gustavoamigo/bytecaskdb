@@ -7,6 +7,7 @@
 //   sql_layer_server --dir D [--listen 127.0.0.1:5432] [--database NAME] [--max-connections 100]
 //                     [--sync AT_EVERY_COMMIT|AT_INTERVAL|AT_FILE_ROTATION] [--sync-interval-ms 1000]
 //                     [--io-backend pread|mmap|buffer_pool] [--buffer-pool-size BYTES] [--buffer-pool-direct-io on|off]
+//                     [--statement-memory-bytes 67108864]
 //
 // Serves one database directory under one name, by default the directory's
 // last component. Trust authentication only: anyone who reaches the port is
@@ -65,7 +66,8 @@ auto flags(int argc, char** argv) -> std::map<std::string, std::string> {
   for (const auto& [k, v] : out) {
     if (k != "dir" && k != "listen" && k != "database" && k != "max-connections" && k != "sync" &&
         k != "sync-interval-ms" &&
-        k != "io-backend" && k != "buffer-pool-size" && k != "buffer-pool-direct-io") {
+        k != "io-backend" && k != "buffer-pool-size" && k != "buffer-pool-direct-io" &&
+        k != "statement-memory-bytes") {
       throw std::invalid_argument("unknown flag --" + k);
     }
   }
@@ -101,6 +103,16 @@ auto on_off(const std::string& flag, const std::string& value) -> bool {
   if (v == "on") return true;
   if (v == "off") return false;
   throw std::invalid_argument("--" + flag + " takes on or off");
+}
+
+// A numeric flag's value, all of it, into `out`; std::invalid_argument
+// otherwise, saying what the flag takes. Ranges are the caller's to check.
+template <typename T>
+void number(const std::string& flag, const std::string& value, const char* takes, T& out) {
+  auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), out);
+  if (ec != std::errc{} || end != value.data() + value.size()) {
+    throw std::invalid_argument("--" + flag + " takes " + takes);
+  }
 }
 
 auto system_error(const char* what) -> std::system_error { return {errno, std::generic_category(), what}; }
@@ -158,34 +170,28 @@ int main(int argc, char** argv) {
     pg::SessionConfig cfg{f.contains("database") ? f["database"] : named.filename().string()};
     std::size_t max_connections = 100;
     if (f.contains("max-connections")) {
-      const auto& v = f["max-connections"];
-      auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), max_connections);
-      if (ec != std::errc{} || end != v.data() + v.size() || max_connections == 0) {
-        throw std::invalid_argument("--max-connections takes a positive number");
-      }
+      number("max-connections", f["max-connections"], "a positive number", max_connections);
+      if (max_connections == 0) throw std::invalid_argument("--max-connections takes a positive number");
     }
 
     bytecask::sql::DatabaseOptions db_opts;
     if (f.contains("sync")) db_opts.sync = sync_mode(f["sync"]);
     if (f.contains("sync-interval-ms")) {
-      const auto& v = f["sync-interval-ms"];
-      auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), db_opts.sync_interval_ms);
-      if (ec != std::errc{} || end != v.data() + v.size()) {
-        throw std::invalid_argument("--sync-interval-ms takes a number");
-      }
       // Its range is Database::open's to check, which refuses it before the server listens.
+      number("sync-interval-ms", f["sync-interval-ms"], "a number", db_opts.sync_interval_ms);
     }
 
     if (f.contains("io-backend")) db_opts.io_backend = io_backend(f["io-backend"]);
     if (f.contains("buffer-pool-size")) {
-      const auto& v = f["buffer-pool-size"];
-      auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), db_opts.buffer_pool.capacity_bytes);
-      if (ec != std::errc{} || end != v.data() + v.size()) {
-        throw std::invalid_argument("--buffer-pool-size takes a number of bytes");
-      }
+      number("buffer-pool-size", f["buffer-pool-size"], "a number of bytes", db_opts.buffer_pool.capacity_bytes);
     }
     if (f.contains("buffer-pool-direct-io")) {
       db_opts.buffer_pool.direct_io = on_off("buffer-pool-direct-io", f["buffer-pool-direct-io"]);
+    }
+    if (f.contains("statement-memory-bytes")) {
+      // 0 is Database::open's to refuse, before the server listens.
+      number("statement-memory-bytes", f["statement-memory-bytes"], "a number of bytes",
+             db_opts.statement_memory_bytes);
     }
 
     // SIGINT and SIGTERM go to one thread, which wakes the accept loop

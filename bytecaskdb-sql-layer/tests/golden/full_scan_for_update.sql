@@ -1,0 +1,1 @@
+SELECT id FROM t WHERE qty > $1 FOR UPDATE
