@@ -1,8 +1,7 @@
 # UNIQUE and NULL: PostgreSQL treats NULLs as distinct, so a unique key takes
 # any number of rows whose key is NULL.
 #
-# Rows go in by parameter and are read by key range: the SQL the layer runs
-# today, so that what these cases measure is the unique key.
+# Rows go in by parameter, because the layer refuses a literal in VALUES.
 
 - name: a UNIQUE column takes several NULLs
   features: [pg:unique-nulls-distinct]
