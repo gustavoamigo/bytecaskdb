@@ -1,0 +1,27 @@
+A write whose rotation cannot create the next file, with no memory to
+publish the degraded state, gets std::bad_alloc in the I/O error's place.
+Reverts #623.
+Guarded-by: "alloc sweep: rotation-crossing write whose next file cannot be created"
+
+diff --git a/bytecaskdb/db_commit.cpp b/bytecaskdb/db_commit.cpp
+index 4093733..b5d49ad 100644
+--- a/bytecaskdb/db_commit.cpp
++++ b/bytecaskdb/db_commit.cpp
+@@ -317,12 +317,11 @@ void DB::commit_appended(TransientEngineState &t,
+   } catch (...) {
+     auto ex = std::current_exception();
+     counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
+-    degrade_transient(t, published, [&] {
+-      return std::format(
+-          "post-write rotation failed for '{}': active file is sealed "
+-          "but new file could not be created. Call resume() to recover.",
+-          file.path().string());
+-    });
++    t.apply_degrade(std::format(
++        "post-write rotation failed for '{}': active file is sealed "
++        "but new file could not be created. Call resume() to recover.",
++        file.path().string()));
++    store_state(published, std::move(t).persistent());
+     for (auto *s : batch) {
+       if (!s->err) s->err = ex;
+     }

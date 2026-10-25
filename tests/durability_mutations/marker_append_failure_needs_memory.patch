@@ -4,20 +4,19 @@ no state holds. Reverts #618.
 Guarded-by: "alloc sweep: set_mode(Leader) whose marker append fails"
 
 diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
-index 0eac211..11c88fb 100644
+index 8b83e51..72135f1 100644
 --- a/bytecaskdb/db_replication.cpp
 +++ b/bytecaskdb/db_replication.cpp
-@@ -81,11 +81,11 @@ void DB::set_mode(Mode mode) {
+@@ -81,9 +81,9 @@ void DB::set_mode(Mode mode) {
      } catch (...) {
        auto ex = std::current_exception();
        try { file.sync(); } catch (...) {}
--      degrade_or_refuse([&] {
-+      [&] {
-         store_state(current->degraded_copy(
-             "set_mode(Leader) marker append IO error: call resume() to "
-             "recover."));
--      });
-+      }();
+-      degrade_from(current,
+-                   "set_mode(Leader) marker append IO error: call resume() to "
+-                   "recover.");
++      store_state(current->degraded_copy(
++          "set_mode(Leader) marker append IO error: call resume() to "
++          "recover."));
        std::rethrow_exception(ex);
      }
      // From here the marker is in the file. A failure below that no handler

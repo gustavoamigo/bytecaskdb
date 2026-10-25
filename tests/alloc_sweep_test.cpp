@@ -328,8 +328,14 @@ auto run_in_child(const Operation &op, const Pass &pass, long n,
         expect(threw_system_error,
                "the operation threw something else in the I/O failure's place");
       expect(degraded, "an I/O failure was reported, yet the engine accepts writes");
-      expect(live == baseline,
-             "an I/O failure was thrown, yet what the operation did is visible");
+      if (op.io_fault_after_durable) {
+        expect(one_of(live, {&baseline, &after}),
+               "an I/O failure was thrown after the write was durable, and "
+               "the state is neither the baseline nor the transition");
+      } else {
+        expect(live == baseline,
+               "an I/O failure was thrown, yet what the operation did is visible");
+      }
     }
     if (!out.fired && !io_failed) {
       expect(!threw, "the fault was not reached, yet the operation threw");
@@ -680,6 +686,28 @@ TEST_CASE("alloc sweep: apply_batch that splits what it changed",
 
 TEST_CASE("alloc sweep: write across a rotation", "[alloc_sweep]") {
   alloc_sweep(rotation_operation());
+}
+
+TEST_CASE("alloc sweep: put whose fdatasync fails", "[alloc_sweep]") {
+  alloc_sweep(put_failed_sync_operation());
+}
+
+TEST_CASE("alloc sweep: rotation-crossing write whose rotation fdatasync "
+          "fails",
+          "[alloc_sweep]") {
+  alloc_sweep(rotation_failed_sync_operation());
+}
+
+TEST_CASE("alloc sweep: rotation-crossing write whose next file cannot be "
+          "created",
+          "[alloc_sweep]") {
+  alloc_sweep(rotation_failed_creation_operation());
+}
+
+TEST_CASE("alloc sweep: rotation-crossing write whose sync after the "
+          "rotation fails",
+          "[alloc_sweep]") {
+  alloc_sweep(rotation_failed_second_sync_operation());
 }
 
 TEST_CASE("alloc sweep: vacuum", "[alloc_sweep]") {
@@ -1747,6 +1775,32 @@ TEST_CASE("refuse writes: the refusal holds when the degraded state cannot be "
   CHECK_FALSE(db->engine_state()->degraded);
   CHECK(db->degraded_reason().find("could not be published") !=
         std::string::npos);
+  expect_refused_then_resumed(db, dir, {}, "k1", "over");
+}
+
+// refuse_writes runs without the flush role, so a state can be published
+// between its load and its store: it must not be replaced by an older one.
+TEST_CASE("refuse writes: the refusal keeps a state published while it was "
+          "built",
+          "[refuse_writes]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = open_db(dir, {});
+  seed(*db);
+  db->test_after_append_ = [] { throw std::bad_alloc{}; };
+  bool published = false;
+  db->test_before_refusal_swap_ = [&] {
+    if (published) return;
+    published = true;
+    db->test_publish_unchecked(
+        db->engine_state()->degraded_copy("published in between"));
+  };
+  CHECK_THROWS_AS(db->put({.sync = true}, to_bytes("k1"), to_bytes("over")),
+                  std::bad_alloc);
+  db->test_after_append_ = nullptr;
+  db->test_before_refusal_swap_ = nullptr;
+  CHECK(published);
+  CHECK(db->degraded_reason() == "published in between");
   expect_refused_then_resumed(db, dir, {}, "k1", "over");
 }
 

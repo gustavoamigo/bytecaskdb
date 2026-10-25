@@ -2,17 +2,14 @@ ingest ignores a failed final fdatasync and publishes the slice as durable.
 Guarded-by: "prove_repl__*"
 
 diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
-index 0eac211..e6cf65a 100644
+index 8b83e51..4bdac82 100644
 --- a/bytecaskdb/db_replication.cpp
 +++ b/bytecaskdb/db_replication.cpp
-@@ -476,11 +476,7 @@ void DB::ingest(const ChangeHeader &header,
+@@ -444,8 +444,7 @@ void DB::ingest(const ChangeHeader &header,
        t.active_file().sync();
        t.apply_sync(t.next_seq() - 1);
      } catch (...) {
--      degrade_or_refuse([&] {
--        store_state(current->degraded_copy(
--            "ingest fdatasync failed: call resume() to recover."));
--      });
+-      degrade_from(current, "ingest fdatasync failed: call resume() to recover.");
 -      throw;
 +      t.apply_sync(t.next_seq() - 1);
      }

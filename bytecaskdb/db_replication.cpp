@@ -81,11 +81,9 @@ void DB::set_mode(Mode mode) {
     } catch (...) {
       auto ex = std::current_exception();
       try { file.sync(); } catch (...) {}
-      degrade_or_refuse([&] {
-        store_state(current->degraded_copy(
-            "set_mode(Leader) marker append IO error: call resume() to "
-            "recover."));
-      });
+      degrade_from(current,
+                   "set_mode(Leader) marker append IO error: call resume() to "
+                   "recover.");
       std::rethrow_exception(ex);
     }
     // From here the marker is in the file. A failure below that no handler
@@ -108,12 +106,9 @@ void DB::set_mode(Mode mode) {
         try {
           rotation = prepare_rotation(t);
         } catch (...) {
-          degrade_or_refuse([&] {
-            t.apply_degrade(
-                "set_mode(Leader) rotation file creation failed: call "
-                "resume().");
-            store_state(current, std::move(t).persistent());
-          });
+          degrade_transient(t, current,
+                            "set_mode(Leader) rotation file creation failed: "
+                            "call resume().");
           throw;
         }
         finish_rotation(t, std::move(rotation));
@@ -152,12 +147,10 @@ auto DB::create_manifest() -> FileManifest {
     try {
       rotation = prepare_rotation(t);
     } catch (...) {
-      degrade_or_refuse([&] {
-        t.apply_degrade(
-            "create_manifest rotation failed: active file is sealed "
-            "but new file could not be created. Call resume() to recover.");
-        store_state(current, std::move(t).persistent());
-      });
+      degrade_transient(t, current,
+                        "create_manifest rotation failed: active file is "
+                        "sealed but new file could not be created. Call "
+                        "resume() to recover.");
       throw;
     }
     try {
@@ -219,6 +212,29 @@ auto DB::ingest_chunk(std::span<const DataEntryView> entries,
   }
   return {.end = entries.size(), .needs_rotation = false,
           .end_size = file_size};
+}
+
+// Seals ingest's active file once what it holds is synced, and opens the
+// next. Its failures degrade from `current`, the state before the slice.
+void DB::ingest_rotate(TransientEngineState &t,
+                       const std::shared_ptr<const EngineState> &current) {
+  try {
+    t.active_file().sync();
+    t.apply_sync(t.next_seq() - 1);
+  } catch (...) {
+    degrade_from(current,
+                 "ingest rotation fdatasync failed: call resume() to recover.");
+    throw;
+  }
+  PreparedRotation rotation;
+  try {
+    rotation = prepare_rotation(t);
+  } catch (...) {
+    degrade_from(current,
+                 "ingest post-rotation file creation failed: call resume().");
+    throw;
+  }
+  finish_rotation(t, std::move(rotation));
 }
 
 void DB::ingest(const ChangeHeader &header,
@@ -399,7 +415,6 @@ void DB::ingest(const ChangeHeader &header,
       }
 
       t.apply_ingest(chunk, offsets);
-      auto chunk_max_seq = chunk.back().sequence;
 
       // Phase 2: writev chunk to active file.
       std::vector<std::uint64_t> io_offsets(chunk.size());
@@ -408,78 +423,28 @@ void DB::ingest(const ChangeHeader &header,
       } catch (...) {
         auto ex = std::current_exception();
         try { file.sync(); } catch (...) {}
-        degrade_or_refuse([&] {
-          store_state(current->degraded_copy(
-              "ingest append IO error: call resume() to recover."));
-        });
+        degrade_from(current,
+                     "ingest append IO error: call resume() to recover.");
         std::rethrow_exception(ex);
       }
       appended = true;
 
       // Phase 3: if rotation needed, sync before sealing.
-      if (needs_rotation) {
-        try {
-          file.sync();
-          t.apply_sync(chunk_max_seq);
-        } catch (...) {
-          degrade_or_refuse([&] {
-            store_state(current->degraded_copy(
-                "ingest rotation fdatasync failed: call resume() to "
-                "recover."));
-          });
-          throw;
-        }
-        PreparedRotation rotation;
-        try {
-          rotation = prepare_rotation(t);
-        } catch (...) {
-          degrade_or_refuse([&] {
-            store_state(current->degraded_copy(
-                "ingest post-rotation file creation failed: call resume()."));
-          });
-          throw;
-        }
-        finish_rotation(t, std::move(rotation));
-      }
+      if (needs_rotation) ingest_rotate(t, current);
 
       remaining = remaining.subspan(chunk_end);
     }
 
     // Post-loop rotation: if the last chunk pushed the active file past the
     // threshold, rotate now so the invariant (active file <= threshold) holds.
-    if (t.is_rotation_needed(rotation_threshold_)) {
-      try {
-        t.active_file().sync();
-        t.apply_sync(t.next_seq() - 1);
-      } catch (...) {
-        degrade_or_refuse([&] {
-          store_state(current->degraded_copy(
-              "ingest rotation fdatasync failed: call resume() to recover."));
-        });
-        throw;
-      }
-      PreparedRotation rotation;
-      try {
-        rotation = prepare_rotation(t);
-      } catch (...) {
-        degrade_or_refuse([&] {
-          store_state(current->degraded_copy(
-              "ingest post-rotation file creation failed: call resume()."));
-        });
-        throw;
-      }
-      finish_rotation(t, std::move(rotation));
-    }
+    if (t.is_rotation_needed(rotation_threshold_)) ingest_rotate(t, current);
 
     // Final sync: ensure last chunk is durable before publishing.
     try {
       t.active_file().sync();
       t.apply_sync(t.next_seq() - 1);
     } catch (...) {
-      degrade_or_refuse([&] {
-        store_state(current->degraded_copy(
-            "ingest fdatasync failed: call resume() to recover."));
-      });
+      degrade_from(current, "ingest fdatasync failed: call resume() to recover.");
       throw;
     }
 

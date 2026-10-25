@@ -4,19 +4,17 @@ std::bad_alloc in the I/O error's place. Reverts #618.
 Guarded-by: "alloc sweep: ingest whose append fails"
 
 diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
-index 0eac211..0ab8bf4 100644
+index 8b83e51..f88079a 100644
 --- a/bytecaskdb/db_replication.cpp
 +++ b/bytecaskdb/db_replication.cpp
-@@ -406,10 +406,10 @@ void DB::ingest(const ChangeHeader &header,
+@@ -423,8 +423,8 @@ void DB::ingest(const ChangeHeader &header,
        } catch (...) {
          auto ex = std::current_exception();
          try { file.sync(); } catch (...) {}
--        degrade_or_refuse([&] {
-+        [&] {
-           store_state(current->degraded_copy(
-               "ingest append IO error: call resume() to recover."));
--        });
-+        }();
+-        degrade_from(current,
+-                     "ingest append IO error: call resume() to recover.");
++        store_state(current->degraded_copy(
++            "ingest append IO error: call resume() to recover."));
          std::rethrow_exception(ex);
        }
        appended = true;

@@ -107,6 +107,11 @@ struct Operation {
   // handler for it allocates too. An engine whose injected failure was
   // thrown must refuse writes after, whatever else failed.
   std::function<std::unique_ptr<ScopedFaultInjector>()> io_fault{};
+  // The injected failure comes once the operation's own write is durable:
+  // a run where it was thrown may show the whole transition (CONTRACT.md,
+  // a write whose rotation failed after it was synced), or the baseline when
+  // there was no memory to publish it. Otherwise only the baseline.
+  bool io_fault_after_durable{false};
 };
 
 // Six keys, a delete and a batch in one file, all durable.
@@ -407,6 +412,47 @@ inline auto failed_sync_fault() -> std::unique_ptr<ScopedFaultInjector> {
 
 inline auto failed_rotation_fault() -> std::unique_ptr<ScopedFaultInjector> {
   return std::make_unique<ScopedFaultInjector>("io_rotate_file_creation");
+}
+
+// The second fdatasync fails: for a write that crosses a rotation, the one
+// of the next file, after the rotation's own.
+inline auto failed_second_sync_fault() -> std::unique_ptr<ScopedFaultInjector> {
+  auto fi = std::make_unique<ScopedFaultInjector>("io_data_file_sync");
+  fi->inj.fail_on_nth_match = 2;
+  return fi;
+}
+
+// The group commit's fdatasync of a sync write fails (flush_failed).
+inline auto put_failed_sync_operation() -> Operation {
+  auto op = put_operation();
+  op.name = "put whose fdatasync fails";
+  op.io_fault = failed_sync_fault;
+  return op;
+}
+
+// The rotation's fdatasync, before the file is sealed, fails.
+inline auto rotation_failed_sync_operation() -> Operation {
+  auto op = rotation_operation();
+  op.name = "rotation-crossing write whose rotation fdatasync fails";
+  op.io_fault = failed_sync_fault;
+  return op;
+}
+
+// The write is synced and the file sealed; the next file cannot be created.
+inline auto rotation_failed_creation_operation() -> Operation {
+  auto op = rotation_operation();
+  op.name = "rotation-crossing write whose next file cannot be created";
+  op.io_fault = failed_rotation_fault;
+  op.io_fault_after_durable = true;
+  return op;
+}
+
+// The rotation succeeds; the sync that follows it fails.
+inline auto rotation_failed_second_sync_operation() -> Operation {
+  auto op = rotation_operation();
+  op.name = "rotation-crossing write whose sync after the rotation fails";
+  op.io_fault = failed_second_sync_fault;
+  return op;
 }
 
 // After the fault, the follower is delivered the slice again and promoted,

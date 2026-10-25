@@ -2118,13 +2118,18 @@ for lack of memory is not settled, and the sweep is how it will be.
 Counts are from a release build; a debug build under ASan allocates a
 little more (`put` takes 19 runs, not 17).
 
-The ten operations after `ingest` also inject an I/O failure while they
-run (`Operation::io_fault`), so that the handler for it has to allocate
-under the fault: a failed `writev` that leaves its bytes in the file, a
-failed `fdatasync`, a file that cannot be created. Allocations of the
-injector itself are not counted. A run in which the injected failure was
-thrown must end with the operation having thrown, nothing it did visible,
-the engine refusing writes, and, when the injected failure came before any allocation failed,
+Fourteen operations also inject an I/O failure while they run
+(`Operation::io_fault`), so that the handler for it has to allocate under
+the fault: a failed `writev` that leaves its bytes in the file, a failed
+`fdatasync`, a file that cannot be created. They cover every handler that
+degrades: a sync `put` (the group commit's `fdatasync`), a write that
+crosses a rotation (the rotation's `fdatasync`, the next file's creation,
+the sync after it), ingest, promotion, stepping down, `create_manifest` and
+`vacuum`. Allocations of the injector itself are not counted. A run in
+which the injected failure was thrown must end with the operation having
+thrown, nothing it did visible (a write whose next file could not be
+created, once it was synced, may also show the whole write, as the contract
+allows: `io_fault_after_durable`), the engine refusing writes, and, when the injected failure came before any allocation failed,
 the operation's exception a `std::system_error` and not a `std::bad_alloc`
 in its place. Each pass must also reach the injected failure, and reach it
 in a run where no allocation failed first, or the sweep fails instead of
@@ -2225,7 +2230,16 @@ each allocation it failed.
   threw `std::bad_alloc` in the I/O error's place, which the engine's own
   `refuse_writes()` outside the handler did not undo. No other check in
   the sweep noticed, whether or not a durable write followed. The fix is one
-  helper, `degrade_or_refuse`, in every handler of the three kinds.
+  helper, `degrade`, in every handler of the three kinds. It refuses by the
+  flag first and then publishes what it can. The commit path's handlers
+  (`commit_appended`'s three and `flush_failed`) had the same gap, found by
+  the sweeps of a sync `put` and a write that crosses a rotation.
+- *The refusal could publish an older state.* `refuse_writes()` loaded the
+  state and stored a degraded copy of it unchecked, without the flush role,
+  so a flush that published in between was replaced by the older state:
+  `next_seq` and `durable_seq` went backwards. It now publishes by
+  compare-and-swap (`refuse writes: the refusal keeps a state published
+  while it was built`).
 - *A thrown slice was visible.* ingest's handlers for a file that cannot be
   created published the transient, which already held every chunk applied,
   so readers saw the slice the call threw on before `resume()`. The sweep
@@ -2899,7 +2913,13 @@ A site whose break nothing has to catch says why instead.
 | `execute_slots`: a failed append syncs what it can before it degrades | not needed: `resume()` rewrites and syncs the file before trusting it (#240) | `no_sync_before_degrade` (chaos, not caught) | — |
 | `execute_slots`: a rotation behind a failed flush stays degraded | `pipeline: rotation behind a failed flush stays degraded` | `rotation_publishes_over_degrade` | #170 |
 | `execute_slots`: a sync write that appends nothing makes earlier unsynced writes durable | `apply_batch: an empty sync plan makes earlier unsynced writes …` | `sync_only_write_skips_sync` | #192 |
-| `degrade_or_refuse`: when the degraded state cannot be built, the flag refuses writes | `alloc sweep: set_mode(Leader) whose marker append fails` (and every other I/O sweep) | `degrade_or_refuse_swallows` | #583, #618 |
+| `degrade`: writes are refused by the flag, whether or not the degraded state can be built | `alloc sweep: set_mode(Leader) whose marker append fails` (and every other I/O sweep) | `degrade_does_not_refuse` | #583, #618 |
+| `refuse_writes`: the refusal never replaces a state published after it loaded its own | `refuse writes: the refusal keeps a state published while it was built` | `refusal_replaces_newer_state` | #623 |
+| `commit_wait`: a waiter that sees a failed flush's refusal reports its I/O error, not `DbDegraded` | none: the window is between two loads in one waiter, which no test hook reaches; the order is the one `flush_failed` and `flush_threw` write in | — | #623 |
+| `flush_failed`: a failed group-commit `fdatasync` throws its own error when the degraded state cannot be published | `alloc sweep: put whose fdatasync fails` | `flush_failure_not_rethrown` | #623 |
+| `commit_appended`: a failed rotation `fdatasync` throws its own error | `alloc sweep: rotation-crossing write whose rotation fdatasync fails` | `commit_rotation_sync_failure_not_rethrown` | #623 |
+| `commit_appended`: a next file that cannot be created throws its own error | `alloc sweep: rotation-crossing write whose next file cannot be created` | `commit_rotation_failure_not_rethrown` | #623 |
+| `commit_appended`: a failed sync after the rotation throws its own error | `alloc sweep: rotation-crossing write whose sync after the rotation fails` | `commit_post_rotation_sync_failure_not_rethrown` | #623 |
 | `execute_group`: a failed append refuses writes when the degraded state cannot be published | `alloc sweep: apply_batch` | `append_failure_refusal_needs_memory` | #583 |
 | `ingest`: a failed append throws its own error, and refuses writes, when the degraded state cannot be published | `alloc sweep: ingest whose append fails` | `ingest_append_failure_not_refused` | #618 |
 | `ingest`: a failed final `fdatasync` throws its own error | `alloc sweep: ingest whose fdatasync fails` | `ingest_sync_failure_not_rethrown` | #618 |

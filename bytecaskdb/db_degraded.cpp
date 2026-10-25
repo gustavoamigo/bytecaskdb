@@ -34,12 +34,11 @@ void DB::sync_active_file(TransientEngineState &t,
     counters_.fsyncs.fetch_add(1, std::memory_order_relaxed);
   } catch (...) {
     counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
-    degrade_or_refuse([&] {
-      t.apply_degrade(std::format(
+    degrade_transient(t, current, [&] {
+      return std::format(
           "{} fdatasync failed on '{}': writes acknowledged without sync are "
           "not confirmed durable. Call resume() to recover.",
-          caller, t.active_file().path().string()));
-      store_state(current, std::move(t).persistent());
+          caller, t.active_file().path().string());
     });
     throw;
   }

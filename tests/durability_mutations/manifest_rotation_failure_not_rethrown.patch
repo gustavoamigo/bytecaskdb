@@ -4,21 +4,21 @@ Reverts #618.
 Guarded-by: "alloc sweep: create_manifest whose rotation cannot create a file"
 
 diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
-index 0eac211..42b863a 100644
+index 8b83e51..22bc1cf 100644
 --- a/bytecaskdb/db_replication.cpp
 +++ b/bytecaskdb/db_replication.cpp
-@@ -152,12 +152,12 @@ auto DB::create_manifest() -> FileManifest {
+@@ -147,10 +147,10 @@ auto DB::create_manifest() -> FileManifest {
      try {
        rotation = prepare_rotation(t);
      } catch (...) {
--      degrade_or_refuse([&] {
-+      [&] {
-         t.apply_degrade(
-             "create_manifest rotation failed: active file is sealed "
-             "but new file could not be created. Call resume() to recover.");
-         store_state(current, std::move(t).persistent());
--      });
-+      }();
+-      degrade_transient(t, current,
+-                        "create_manifest rotation failed: active file is "
+-                        "sealed but new file could not be created. Call "
+-                        "resume() to recover.");
++      t.apply_degrade(
++          "create_manifest rotation failed: active file is sealed but new "
++          "file could not be created. Call resume() to recover.");
++      store_state(current, std::move(t).persistent());
        throw;
      }
      try {

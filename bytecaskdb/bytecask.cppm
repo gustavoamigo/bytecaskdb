@@ -1546,22 +1546,53 @@ private:
   // so, or write_fault_ is set.
   [[nodiscard]] auto refused(const EngineState &s) const noexcept -> bool;
   // Refuses writes from now on, then publishes the degraded state if memory
-  // allows, and wakes every waiter. Allocates nothing to refuse. For a
-  // failure after an append that no I/O handler degraded for.
+  // allows, and wakes every waiter. Allocates nothing to refuse. Publishes
+  // by compare-and-swap, so it never replaces a state newer than the one it
+  // degraded, and needs no flush role. For a failure after an append that no
+  // I/O handler degraded for, and the last step of every degrade.
   void refuse_writes() noexcept;
-  // For a failure after bytes may have reached the file: runs publish, which
-  // builds and stores a degraded state. Building it allocates, so if publish
-  // throws, the flag alone refuses writes (refuse_writes). Never throws: the
-  // handler rethrows its own error after it, never the allocation's.
+  // For a failure after bytes may have reached the file. Refuses writes
+  // first, then runs publish, which builds and stores the handler's degraded
+  // state; building it allocates, and if it cannot, the refusal stands on
+  // the flag. Never throws: the handler throws its own error after it,
+  // never the allocation's. publish runs under the caller's flush role.
   template <typename Publish>
-  void degrade_or_refuse(Publish &&publish) noexcept {
+  void degrade(Publish &&publish) noexcept {
+    write_fault_.store(true, std::memory_order_release);
     try {
 #ifdef BYTECASK_TESTING
       if (test_before_degrade_publish_) test_before_degrade_publish_();
 #endif
       publish();
     } catch (...) {
-      refuse_writes();
+      // No memory to say why: the flag refuses, and refuse_writes publishes
+      // the generic reason if it can.
+    }
+    refuse_writes();
+  }
+  // The two shapes of degrade: the published state degraded, or the
+  // transient with what it applied. reason is a string literal, or a
+  // callable that builds it, so that its allocation is inside degrade too.
+  template <typename Reason>
+  void degrade_from(const std::shared_ptr<const EngineState> &current,
+                    const Reason &reason) noexcept {
+    degrade([&] { store_state(current->degraded_copy(make_reason(reason))); });
+  }
+  template <typename Reason>
+  void degrade_transient(TransientEngineState &t,
+                         const std::shared_ptr<const EngineState> &current,
+                         const Reason &reason) noexcept {
+    degrade([&] {
+      t.apply_degrade(make_reason(reason));
+      store_state(current, std::move(t).persistent());
+    });
+  }
+  template <typename Reason>
+  static auto make_reason(const Reason &reason) -> std::string {
+    if constexpr (std::is_invocable_v<const Reason &>) {
+      return std::string{reason()};
+    } else {
+      return std::string{reason};
     }
   }
   // Releases the flush role and wakes commit_wait / quiesce / durable_sequence
@@ -1614,6 +1645,10 @@ private:
   [[nodiscard]] auto ingest_chunk(std::span<const DataEntryView> entries,
                                   std::uint64_t file_size) const
       -> IngestChunk;
+  // Syncs and seals ingest's active file and opens the next, between
+  // chunks and after the last. A failure degrades from current and throws.
+  void ingest_rotate(TransientEngineState &t,
+                     const std::shared_ptr<const EngineState> &current);
 
   // Recovery
   // Runs recovery, undoing an interrupted vacuum it finds on the way.
@@ -1675,6 +1710,31 @@ private:
     // state_ is never null: it starts as an empty state (see open).
     if (degraded && !old->degraded) {
       counters_.degraded_transitions.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  // refuse_writes' publication, which runs without the flush role: the
+  // current state degraded, swapped in only if no publication landed since
+  // it was loaded, and otherwise retried on the newer one, so no state is
+  // replaced by an older one. A state degraded already keeps its own reason.
+  // Throws std::bad_alloc.
+  void publish_degraded_if_healthy(std::string_view reason) {
+    auto current = std::atomic_load(&state_);
+    while (!current->degraded) {
+      auto s = current->degraded_copy(std::string{reason});
+#ifdef BYTECASK_TESTING
+      if (test_before_refusal_swap_) test_before_refusal_swap_();
+#endif
+      publishing_.fetch_add(1, std::memory_order_acq_rel);
+      const bool swapped =
+          std::atomic_compare_exchange_strong(&state_, &current, s);
+      if (swapped)
+        state_gen_.store(next_state_gen(), std::memory_order_release);
+      publishing_.fetch_sub(1, std::memory_order_release);
+      if (swapped) {
+        counters_.degraded_transitions.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+      // current now holds the state that landed in between.
     }
   }
   auto load_head() const -> std::shared_ptr<EngineState> {
@@ -1813,9 +1873,16 @@ public:
   // Called by refuse_writes before it publishes the degraded state. A test
   // throws from it to leave the flag as the only refusal.
   std::function<void()> test_before_refusal_publish_;
-  // Called by degrade_or_refuse before it builds the degraded state. A test
+  // Called by degrade before it builds the handler's degraded state. A test
   // throws from it to leave the I/O handler with the flag alone.
   std::function<void()> test_before_degrade_publish_;
+  // Called by refuse_writes once it has built its degraded state, before it
+  // swaps it in. A test publishes there (test_publish_unchecked) as a flush
+  // would, which the swap must not replace.
+  std::function<void()> test_before_refusal_swap_;
+  void test_publish_unchecked(std::shared_ptr<EngineState> s) {
+    store_state(std::move(s));
+  }
   // Called by finish_rotation before it installs the new files in the
   // transient. A test throws from it to fail the rotation's in-memory step.
   std::function<void()> test_in_finish_rotation_;

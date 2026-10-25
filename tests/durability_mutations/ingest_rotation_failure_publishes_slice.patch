@@ -1,33 +1,22 @@
 An ingest whose next file cannot be created publishes the transient, which
 holds every chunk applied so far, so the slice that threw is visible before
-resume(). Both the mid-slice rotation and the one after the last chunk.
-Guarded-by: "refuse writes: ingest's post-loop rotation cannot create a file", "alloc sweep: ingest whose rotation cannot create a file"
+resume(). ingest_rotate serves both the mid-slice rotation and the one after
+the last chunk.
+Guarded-by: "refuse writes: ingest's post-loop rotation cannot create a file, alloc sweep: ingest whose rotation cannot create a file"
 
 diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
-index 7d31f75..cbc0c1d 100644
+index 8b83e51..65af3a6 100644
 --- a/bytecaskdb/db_replication.cpp
 +++ b/bytecaskdb/db_replication.cpp
-@@ -434,8 +434,9 @@ void DB::ingest(const ChangeHeader &header,
-           rotation = prepare_rotation(t);
-         } catch (...) {
-           degrade_or_refuse([&] {
--            store_state(current->degraded_copy(
--                "ingest post-rotation file creation failed: call resume()."));
-+            t.apply_degrade(
-+                "ingest post-rotation file creation failed: call resume().");
-+            store_state(current, std::move(t).persistent());
-           });
-           throw;
-         }
-@@ -463,8 +464,9 @@ void DB::ingest(const ChangeHeader &header,
-         rotation = prepare_rotation(t);
-       } catch (...) {
-         degrade_or_refuse([&] {
--          store_state(current->degraded_copy(
--              "ingest post-rotation file creation failed: call resume()."));
-+          t.apply_degrade(
-+              "ingest post-rotation file creation failed: call resume().");
-+          store_state(current, std::move(t).persistent());
-         });
-         throw;
-       }
+@@ -230,8 +230,9 @@ void DB::ingest_rotate(TransientEngineState &t,
+   try {
+     rotation = prepare_rotation(t);
+   } catch (...) {
+-    degrade_from(current,
+-                 "ingest post-rotation file creation failed: call resume().");
++    degrade_transient(t, current,
++                      "ingest post-rotation file creation failed: call "
++                      "resume().");
+     throw;
+   }
+   finish_rotation(t, std::move(rotation));
