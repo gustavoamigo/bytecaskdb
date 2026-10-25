@@ -9,6 +9,9 @@ How the layer is checked:
   API: the consistency conditions, Elle through SQL and the CI smoke test.
 - **The HammerDB gate**, which drives the layer over the wire, is in
   `server_design.md`, *Running the gate*.
+- **The functional suite** runs our cases and other suites (sqltest, the
+  decision-support query sets, TPROC-C) over the wire
+  against the server, and reports conformance: `functional_testing_design.md`.
 
 The differences from PostgreSQL the machine expects are in
 `frontend_design.md`, `transaction_design.md` and `server_design.md`, each

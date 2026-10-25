@@ -199,9 +199,6 @@ search refuses*).
 The proof machine expects each one, or doesn't generate it, so it doesn't
 fail on them.
 
-- **A table needs a primary key.** The layer refuses `CREATE TABLE` without
-  one; PostgreSQL accepts it. The machine sends that variant to the layer
-  only and expects the refusal.
 - **A VARCHAR(n) value whose excess is only spaces is refused.**
   PostgreSQL truncates it to n characters and stores it; the layer refuses
   it as too long (22001). The machine doesn't generate one.
@@ -275,6 +272,16 @@ fail on them.
 
 Each is a refusal or an error, not a different answer. Everything else in
 the dialect matches PostgreSQL, and the proof machine checks that it does.
+
+## What the layer doesn't do yet
+
+Gaps, not decisions: PostgreSQL runs each, and the layer refuses it until
+it is built. The functional suite marks the cases that need one as not
+implemented (`functional_testing_design.md`).
+
+- **A table needs a primary key.** The layer refuses `CREATE TABLE` without
+  one; PostgreSQL accepts it. The proof machine sends that variant to the
+  layer only and expects the refusal.
 
 ## Decisions
 

@@ -1,0 +1,49 @@
+# RETURNING sends back the rows a statement wrote.
+
+- name: INSERT RETURNING returns the row inserted
+  features: [pg:returning]
+  unimplemented: true
+  setup:
+    - CREATE TABLE r (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO r VALUES ($1, $2) RETURNING id, v
+      params: [1, 10]
+      expected: [[1, 10]]
+  teardown:
+    - DROP TABLE r
+
+- name: UPDATE RETURNING returns each row as updated
+  features: [pg:returning]
+  unimplemented: true
+  setup:
+    - CREATE TABLE r2 (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO r2 VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO r2 VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: UPDATE r2 SET v = v + 1 WHERE id >= 1 RETURNING id, v
+      expected: [[1, 11], [2, 21]]
+  teardown:
+    - DROP TABLE r2
+
+- name: DELETE RETURNING returns each row as it was
+  features: [pg:returning]
+  unimplemented: true
+  setup:
+    - CREATE TABLE r3 (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO r3 VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO r3 VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: DELETE FROM r3 WHERE id = 2 RETURNING id, v
+      expected: [[2, 20]]
+    - sql: SELECT id, v FROM r3
+      expected: [[1, 10]]
+  teardown:
+    - DROP TABLE r3

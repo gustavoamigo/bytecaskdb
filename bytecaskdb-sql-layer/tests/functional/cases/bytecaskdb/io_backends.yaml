@@ -1,0 +1,53 @@
+# The I/O backends (--io-backend): each reads back what it wrote, before and
+# after a clean restart.
+
+- name: pread reads back its writes
+  features: [layer:io-backends]
+  server_flags: ["--io-backend", "pread"]
+  setup:
+    - CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO b VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: SELECT id, v FROM b WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 10]]
+    - restart: true
+    - sql: SELECT id, v FROM b WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 10]]
+
+- name: mmap reads back its writes
+  features: [layer:io-backends]
+  server_flags: ["--io-backend", "mmap"]
+  setup:
+    - CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO b VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: SELECT id, v FROM b WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 10]]
+    - restart: true
+    - sql: SELECT id, v FROM b WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 10]]
+
+- name: buffer_pool reads back its writes
+  features: [layer:io-backends]
+  server_flags: ["--io-backend", "buffer_pool", "--buffer-pool-size", "134217728", "--buffer-pool-direct-io", "off"]
+  setup:
+    - CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO b VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: SELECT id, v FROM b WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 10]]
+    - restart: true
+    - sql: SELECT id, v FROM b WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 10]]

@@ -1,0 +1,59 @@
+# $n parameters, through the extended protocol.
+
+- name: a parameter in WHERE
+  features: [pg:parameters]
+  setup:
+    - CREATE TABLE p (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO p VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO p VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: SELECT id, v FROM p WHERE id = $1
+      params: [2]
+      expected: [[2, 20]]
+    - sql: SELECT id, v FROM p WHERE id = $1
+      params: [3]
+      expected: []
+  teardown:
+    - DROP TABLE p
+
+- name: parameters in INSERT and UPDATE
+  features: [pg:parameters]
+  setup:
+    - CREATE TABLE p2 (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO p2 VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: UPDATE p2 SET v = $2 WHERE id = $1
+      params: [1, 11]
+      rowcount: 1
+    - sql: SELECT id, v FROM p2 WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 11]]
+  teardown:
+    - DROP TABLE p2
+
+- name: a NULL parameter
+  features: [pg:parameters]
+  setup:
+    - CREATE TABLE p3 (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO p3 VALUES ($1, $2)
+      params: [1, null]
+      rowcount: 1
+    - sql: SELECT id, v FROM p3 WHERE id = $1
+      params: [1]
+      expected: [[1, null]]
+  teardown:
+    - DROP TABLE p3
+
+- name: a parameter with a cast
+  features: [pg:parameters, pg:cast-operator]
+  unimplemented: true
+  query: SELECT $1::integer + 1
+  params: ["41"]
+  expected: [[42]]

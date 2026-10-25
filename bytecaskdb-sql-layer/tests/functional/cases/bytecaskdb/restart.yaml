@@ -1,0 +1,83 @@
+# What survives a clean stop and a start on the same directory.
+
+- name: committed rows survive a restart
+  features: [layer:restart]
+  setup:
+    - CREATE TABLE d (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO d VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: UPDATE d SET v = $2 WHERE id = $1
+      params: [2, 21]
+      rowcount: 1
+    - sql: DELETE FROM d WHERE id = $1
+      params: [1]
+      rowcount: 1
+    - restart: true
+    - sql: SELECT id, v FROM d WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[2, 21]]
+  teardown:
+    - DROP TABLE d
+
+- name: tables, indexes and unique keys survive a restart
+  features: [layer:restart]
+  setup:
+    - CREATE TABLE di (id INTEGER PRIMARY KEY, k INTEGER)
+    - CREATE UNIQUE INDEX di_k ON di (k)
+  steps:
+    - sql: INSERT INTO di VALUES ($1, $2)
+      params: [1, 100]
+      rowcount: 1
+    - restart: true
+    - sql: INSERT INTO di VALUES ($1, $2)
+      params: [2, 100]
+      error: "23505"
+    - sql: INSERT INTO di VALUES ($1, $2)
+      params: [2, 200]
+      rowcount: 1
+    - sql: SELECT id, k FROM di WHERE k = $1
+      params: [200]
+      expected: [[2, 200]]
+  teardown:
+    - DROP TABLE di
+
+- name: a dropped table stays dropped after a restart
+  features: [layer:restart]
+  setup:
+    - CREATE TABLE dd (id INTEGER PRIMARY KEY)
+  steps:
+    - sql: INSERT INTO dd VALUES ($1)
+      params: [1]
+      rowcount: 1
+    - sql: DROP TABLE dd
+    - restart: true
+    - sql: SELECT id FROM dd WHERE id >= $1 ORDER BY id
+      params: [0]
+      error: "42P01"
+
+- name: a transaction left open is rolled back by the stop
+  features: [layer:restart]
+  setup:
+    - CREATE TABLE dt (id INTEGER PRIMARY KEY)
+  steps:
+    - sql: INSERT INTO dt VALUES ($1)
+      params: [1]
+      rowcount: 1
+    - sql: BEGIN
+    - sql: INSERT INTO dt VALUES ($1)
+      params: [2]
+      rowcount: 1
+    - restart: true
+    # On PostgreSQL the transaction is still open and sees its own row, so this
+    # one is written by hand: after the restart, row 2 is gone.
+    - sql: SELECT id FROM dt WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1]]
+  teardown:
+    - ROLLBACK
+    - DROP TABLE dt

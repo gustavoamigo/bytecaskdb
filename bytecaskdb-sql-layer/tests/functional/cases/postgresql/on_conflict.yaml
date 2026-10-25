@@ -1,0 +1,60 @@
+# ON CONFLICT: what an INSERT does when a row with its key exists.
+
+- name: ON CONFLICT DO NOTHING skips the row
+  features: [pg:on-conflict]
+  unimplemented: true
+  setup:
+    - CREATE TABLE oc (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO oc VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO oc VALUES ($1, $2) ON CONFLICT DO NOTHING
+      params: [1, 99]
+      rowcount: 0
+    - sql: INSERT INTO oc VALUES ($1, $2) ON CONFLICT DO NOTHING
+      params: [2, 20]
+      rowcount: 1
+    - sql: SELECT id, v FROM oc WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 10], [2, 20]]
+  teardown:
+    - DROP TABLE oc
+
+- name: ON CONFLICT DO UPDATE changes the row there
+  features: [pg:on-conflict]
+  unimplemented: true
+  setup:
+    - CREATE TABLE oc2 (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO oc2 VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO oc2 VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v
+      params: [1, 99]
+      rowcount: 1
+    - sql: INSERT INTO oc2 VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v
+      params: [2, 20]
+      rowcount: 1
+    - sql: SELECT id, v FROM oc2 WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 99], [2, 20]]
+  teardown:
+    - DROP TABLE oc2
+
+- name: without ON CONFLICT a duplicate key is refused
+  features: [E101-01]
+  setup:
+    - CREATE TABLE oc3 (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: INSERT INTO oc3 VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO oc3 VALUES ($1, $2)
+      params: [1, 99]
+      error: "23505"
+    - sql: SELECT id, v FROM oc3 WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 10]]
+  teardown:
+    - DROP TABLE oc3
