@@ -1,5 +1,13 @@
 # Project Overview
-See @README.md for setup instructions and link to project documentation
+
+ByteCaskDB: an embedded key-value store in C++23 (Bitcask-style append-only files, in-memory persistent B+ tree key directory). Read the file you need, not all of them:
+
+- `README.md`: what the project is, quick start, build commands. Kept short on purpose.
+- `docs/bytecask_design.md`: design reference and the complete feature list.
+- `CONTRACT.md`: what the engine guarantees, with the test proving each row.
+- `include/bytecask.hpp`, `docs/api_reference.md`: the public API and usage examples.
+- `docs/project_organization.md`: repository layout, build systems, license boundaries.
+- `docs/performance.md`: benchmark tables and methodology.
 
 # Development Guidelines
 
@@ -14,7 +22,7 @@ These instructions apply to every repository work request in this workspace.
 
 1. Update `docs/bytecask_design.md` to reflect any behavior, architecture, constraints, or invariants changed by the work. If a guarantee changes, update the row in `CONTRACT.md` with the test that proves it, and name the change in the PR description: added, widened, narrowed or removed. Work on the SQL layer updates its own documents instead: `bytecaskdb-sql-layer/docs/` and `bytecaskdb-sql-layer/CONTRACT.md`, not the engine's design doc and contract.
 2. Track any follow-up work as a GitHub issue. Don't open an issue for the PR's own task — the PR is its own record; use an issue when work is being deferred, discovered mid-implementation, or otherwise won't be covered by a PR opened now.
-3. Update `README.md` to keep it in sync with the project: if a feature is added or changed, update the Features list, Quick Start examples, API Reference, and Architecture sections as needed. The README targets an external audience — avoid internal implementation details; focus on user-visible characteristics and behavior.
+3. Update `README.md` only when the project's pitch changes: one of its six headline features, a headline number, or the quick-start path. A feature added or changed goes in the Features section of `docs/bytecask_design.md`; API changes go in `docs/api_reference.md`; performance figures go in `docs/performance.md`. The README stays under 150 lines (`scripts/check_readme_size.py` fails CI above that). It targets an external audience — avoid internal implementation details; focus on user-visible characteristics and behavior.
 4. Always validate design before moving to implementation
 5. After design approval, move to the implementation
 6. Add or update tests that cover the behavior being changed.
@@ -232,7 +240,7 @@ BulkBegin/BulkEnd markers must NOT be skipped by vacuum or ChangeIterator — th
 
 ## README guidelines
 
-The README targets an experienced systems/database engineering audience. They know what block caches, compaction, and B-tree rebalancing are. They will scroll past the intro to check for transactions. Write accordingly.
+The README targets an experienced systems/database engineering audience. They know what block caches, compaction, and B-tree rebalancing are. They will scroll past the intro to check for transactions. Write accordingly. It is an entry point, not a reference: it is also what a new reader opens first, so detail belongs in `docs/` and the README links to it.
 
 **Framing**
 - The core argument is that ByteCaskDB is designed for current hardware reality, not a reaction against other engines. Don't frame it as LSM vs B-tree vs Bitcask. Frame it as: what would you design if you started today?
