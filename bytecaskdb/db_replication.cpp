@@ -81,9 +81,15 @@ void DB::set_mode(Mode mode) {
     } catch (...) {
       auto ex = std::current_exception();
       try { file.sync(); } catch (...) {}
-      store_state(current->degraded_copy(
-          "set_mode(Leader) marker append IO error: call resume() to "
-          "recover."));
+      // Publishing the degraded state allocates: without the memory, the
+      // flag refuses writes, and the caller still gets the I/O error.
+      try {
+        store_state(current->degraded_copy(
+            "set_mode(Leader) marker append IO error: call resume() to "
+            "recover."));
+      } catch (...) {
+        refuse_writes();
+      }
       std::rethrow_exception(ex);
     }
     // From here the marker is in the file. A failure below that no handler
@@ -367,9 +373,11 @@ void DB::ingest(const ChangeHeader &header,
 
   // Chunk-and-rotate loop: write entries in chunks, rotating between chunks
   // at safe boundaries (never inside BulkBegin..BulkEnd).
-  // Once a chunk is in the file, a throw that no handler below degraded
-  // for — an allocation, typically — leaves bytes nothing published, and
-  // writes are refused until resume() reconciles them.
+  // From the first append call, a throw that no handler below degraded
+  // for — an allocation, typically, including the one that builds a
+  // handler's own degraded state — may leave bytes nothing published, and
+  // writes are refused until resume() reconciles them. append_entries
+  // writes a chunk at a time, so a failed call may have written some.
   auto appended = false;
   try {
     while (!remaining.empty()) {
@@ -395,6 +403,7 @@ void DB::ingest(const ChangeHeader &header,
 
       // Phase 2: writev chunk to active file.
       std::vector<std::uint64_t> io_offsets(chunk.size());
+      appended = true;
       try {
         file.append_entries(chunk, io_offsets, scratch_bytes_);
       } catch (...) {
@@ -405,7 +414,6 @@ void DB::ingest(const ChangeHeader &header,
         store_state(std::move(err_s));
         std::rethrow_exception(ex);
       }
-      appended = true;
 
       // Phase 3: if rotation needed, sync before sealing.
       if (needs_rotation) {

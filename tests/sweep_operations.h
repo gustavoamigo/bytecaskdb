@@ -102,6 +102,10 @@ struct Operation {
   // once the fault is disarmed: a check run under it would have its own
   // calls counted and failed.
   std::function<void(const KeyValues &)> returned{};
+  // An I/O failure injected while `run` runs, with the allocation fault: the
+  // handler for it allocates too. An engine whose injected failure was
+  // thrown must refuse writes after, whatever else failed.
+  std::function<std::unique_ptr<ScopedFaultInjector>()> io_fault{};
 };
 
 // Six keys, a delete and a batch in one file, all durable.
@@ -329,9 +333,13 @@ inline auto vacuum_operation() -> Operation {
 // and a failed ingest publishes none of it; but on disk only each unit is
 // atomic, so resume() may replay the put without the batch. Delivering the
 // slice again then completes it (CONTRACT.md, ingest).
-inline auto ingest_operation() -> Operation {
-  auto first = std::make_shared<OwnedEntries>();
-  auto second = std::make_shared<OwnedEntries>();
+struct IngestSlices {
+  std::shared_ptr<OwnedEntries> first = std::make_shared<OwnedEntries>();
+  std::shared_ptr<OwnedEntries> second = std::make_shared<OwnedEntries>();
+};
+
+inline auto ingest_slices() -> IngestSlices {
+  IngestSlices slices;
   {
     TempDir td;
     auto leader = DB::open(td.path / "leader");
@@ -339,15 +347,20 @@ inline auto ingest_operation() -> Operation {
     const auto upto = leader.durable_sequence();
     {
       const auto snap = leader.snapshot();
-      *first = collect_changes(leader.changes_since(snap, 0));
+      *slices.first = collect_changes(leader.changes_since(snap, 0));
     }
     leader.put({.sync = true}, to_bytes("k1"), to_bytes("over"));
     REQUIRE(leader.apply_batch({.sync = true}, mixed_plan()));
     const auto snap = leader.snapshot();
-    *second = collect_changes(leader.changes_since(snap, upto));
+    *slices.second = collect_changes(leader.changes_since(snap, upto));
   }
-  REQUIRE_FALSE(first->entries.empty());
-  REQUIRE_FALSE(second->entries.empty());
+  REQUIRE_FALSE(slices.first->entries.empty());
+  REQUIRE_FALSE(slices.second->entries.empty());
+  return slices;
+}
+
+inline auto ingest_operation() -> Operation {
+  const auto [first, second] = ingest_slices();
 
   return {.name = "ingest",
           .opts = {.initial_mode = Mode::Follower},
@@ -377,6 +390,62 @@ inline auto ingest_operation() -> Operation {
                 return std::vector<KeyValues>{put_only};
               },
           .retry = [second](DB &db) { db.ingest(second->header, second->views()); }};
+}
+
+// An append that fails with its bytes in the file, as a failed writev does
+// once it has written: the engine must refuse writes, with or without the
+// memory to say why.
+inline auto failed_append_fault() -> std::unique_ptr<ScopedFaultInjector> {
+  return std::make_unique<ScopedFaultInjector>("io_data_file_append_partial",
+                                               PostWriteMode::throw_after);
+}
+
+inline auto failed_sync_fault() -> std::unique_ptr<ScopedFaultInjector> {
+  return std::make_unique<ScopedFaultInjector>("io_data_file_sync");
+}
+
+inline auto ingest_failed_append_operation() -> Operation {
+  auto op = ingest_operation();
+  op.name = "ingest whose append fails";
+  op.io_fault = failed_append_fault;
+  return op;
+}
+
+// A follower's promotion appends its ChangeMarker; the append fails.
+inline auto promotion_failed_append_operation() -> Operation {
+  const auto first = ingest_slices().first;
+  return {.name = "set_mode(Leader) whose marker append fails",
+          .opts = {.initial_mode = Mode::Follower},
+          .setup = [first](DB &db) { db.ingest(first->header, first->views()); },
+          .run =
+              [](DB &db) {
+                db.set_mode(Mode::Leader);
+                return db.mode() == Mode::Leader;
+              },
+          .transition = [](KeyValues kv) { return kv; },
+          .takes_writes = false,
+          .retry = [](DB &db) { db.set_mode(Mode::Leader); },
+          .io_fault = failed_append_fault};
+}
+
+// A leader holding an unsynced write steps down, which syncs it; the sync
+// fails.
+inline auto step_down_failed_sync_operation() -> Operation {
+  return {.name = "set_mode(Follower) whose fdatasync fails",
+          .setup =
+              [](DB &db) {
+                seed(db);
+                db.put({.sync = false}, to_bytes("u1"), to_bytes("unsynced"));
+              },
+          .run =
+              [](DB &db) {
+                db.set_mode(Mode::Follower);
+                return db.mode() == Mode::Follower;
+              },
+          .transition = [](KeyValues kv) { return kv; },
+          .takes_writes = false,
+          .retry = [](DB &db) { db.set_mode(Mode::Follower); },
+          .io_fault = failed_sync_fault};
 }
 
 // resume() itself under fault, from each state a failed write leaves: the
@@ -450,6 +519,13 @@ inline auto manifest_operation() -> Operation {
                 check_key_values(key_values(copy), expected,
                                  "a DB opened from the manifest's files");
               }};
+}
+
+inline auto manifest_failed_sync_operation() -> Operation {
+  auto op = manifest_operation();
+  op.name = "create_manifest whose fdatasync fails";
+  op.io_fault = failed_sync_fault;
+  return op;
 }
 
 }  // namespace bytecask::testing::sweep_ops

@@ -279,7 +279,13 @@ auto run_in_child(const Operation &op, const Pass &pass, long n,
 
     bool threw = false;
     bool did_work = false;
+    // A warm pool hands out nodes without operator new, so which node
+    // allocations the sweep counts would depend on the tests that ran
+    // before (#583).
+    bytecask::btree_detail::node_pool_trim();
+    bool io_failed = false;
     {
+      const auto io = op.io_fault ? op.io_fault() : nullptr;
       ScopedAllocFaults faults{n, pass.cascade};
       try {
         did_work = op.run(*db);
@@ -288,11 +294,14 @@ auto run_in_child(const Operation &op, const Pass &pass, long n,
       }
       wait_hints_idle(*db);
       out.fired = faults.report().fired;
+      io_failed = io && io->inj.fired;
     }
 
     const auto live = key_values(*db);
     const bool degraded = db->is_degraded();
-    if (!out.fired) {
+    if (io_failed)
+      expect(degraded, "an I/O failure was reported, yet the engine accepts writes");
+    if (!out.fired && !io_failed) {
       expect(!threw, "the fault was not reached, yet the operation threw");
       expect(did_work, "the fault was not reached, yet the operation did nothing");
       expect(!degraded, "the fault was not reached, yet the engine degraded");
@@ -625,6 +634,25 @@ TEST_CASE("alloc sweep: vacuum", "[alloc_sweep]") {
 
 TEST_CASE("alloc sweep: ingest", "[alloc_sweep]") {
   alloc_sweep(ingest_operation());
+}
+
+TEST_CASE("alloc sweep: ingest whose append fails", "[alloc_sweep]") {
+  alloc_sweep(ingest_failed_append_operation());
+}
+
+TEST_CASE("alloc sweep: set_mode(Leader) whose marker append fails",
+          "[alloc_sweep]") {
+  alloc_sweep(promotion_failed_append_operation());
+}
+
+TEST_CASE("alloc sweep: set_mode(Follower) whose fdatasync fails",
+          "[alloc_sweep]") {
+  alloc_sweep(step_down_failed_sync_operation());
+}
+
+TEST_CASE("alloc sweep: create_manifest whose fdatasync fails",
+          "[alloc_sweep]") {
+  alloc_sweep(manifest_failed_sync_operation());
 }
 
 TEST_CASE("alloc sweep: resume after a failed sync", "[alloc_sweep]") {
