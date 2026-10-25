@@ -2064,11 +2064,11 @@ operations are the I/O sweep's, shared through
 counted: zstd allocates with it and reports a failure as an error code,
 which the hint paths already handle. Key directory nodes come from
 `NodePool`, which hands a freed node to the next allocation without
-`operator new`, so outside ASan and MSan, where the pool is off, which of
-a write's node allocations are counted depends on what earlier tests left
-in the pool. Emptying it before each run is #583: it exposes a durable
-write lost after `resume()` and a reopen. The tree-level sweeps below empty
-it before each run already; their reach check is required only under ASan.
+`operator new`. Each run empties the pool before it arms the fault, so
+every node allocation of a write is counted in every build and does not
+depend on what earlier tests left in the pool (#583). The tree-level sweeps
+below empty it before each run too; their reach check is required only
+under ASan.
 Where the pool is on, test builds stamp a node the pool keeps when it is
 freed, and end the process with their own exit code on freeing, walking or
 asking the owner of a stamped node, so a node freed twice fails the run
@@ -2112,19 +2112,22 @@ parent's `--out` file. A termination is counted and reported, and fails the test
 `BYTECASK_ALLOC_SWEEP_STRICT=1`: whether the engine may end the process
 for lack of memory is not settled, and the sweep is how it will be.
 
+Counts are from a release build; a debug build under ASan allocates a
+little more (`put` takes 19 runs, not 17).
+
 | Operation | Runs per pass | Outcomes, one / every one from N on |
 |---|---:|---|
 | `put` | 17 | 13 threw unchanged, 3 degraded, 1 completed (both) |
 | `put` while a snapshot taken before it is held, and released under the fault | 17 | 13 threw unchanged, 3 degraded, 1 completed (both) |
-| `del` | 14 | 10 threw unchanged, 3 degraded, 1 completed (both) |
-| `del_range` | 25 | 21 threw unchanged, 3 degraded, 1 completed (both) |
-| `apply_batch` | 27 | 23 threw unchanged, 3 degraded, 1 completed (both) |
-| `apply_batch` of 80 puts that split the leaf its first put copied | 176 | 172 threw unchanged, 3 degraded, 1 completed (both) |
-| a put that fills the active file | 119 | 72 / 56 returned, 34 / 50 degraded, 12 threw unchanged |
-| `vacuum` | 159 | 157 / 158 threw unchanged, 1 / 0 returned |
-| `ingest` | 27 | 23 threw unchanged, 3 degraded (both) |
-| `resume()`, unsynced entry | 162 | 90 / 113 degraded, 71 / 48 returned |
-| `resume()`, torn entry | 156 | 86 / 111 degraded, 69 / 44 returned |
+| `del` | 15 | 11 threw unchanged, 3 degraded, 1 completed (both) |
+| `del_range` | 26 | 22 threw unchanged, 3 degraded, 1 completed (both) |
+| `apply_batch` | 28 | 24 threw unchanged, 3 degraded, 1 completed (both) |
+| `apply_batch` of 80 puts that split the leaf its first put copied | 180 | 176 threw unchanged, 3 degraded, 1 completed (both) |
+| a put that fills the active file | 121 | 71 returned, 36 degraded, 13 threw unchanged (both) |
+| `vacuum` | 161 | 159 / 160 threw unchanged, 1 / 0 returned |
+| `ingest` | 29 | 24 / 25 threw unchanged, 4 / 3 degraded, 1 completed (both) |
+| `resume()`, unsynced entry | 162 | 91 / 113 degraded, 70 / 48 returned |
+| `resume()`, torn entry | 157 | 91 / 111 degraded, 65 / 45 returned |
 | `DB::open` of two or more data files and their hints, 1,350 keys, 1 recovery thread | 301 | 298 / 300 threw, 3 / 1 opened |
 | the same, 4 recovery threads | 354 | 351 / 353 threw, 3 / 1 opened |
 
@@ -2177,6 +2180,15 @@ each allocation it failed.
   were in the file, the engine stayed writable, and the next write reused
   the failed one's sequences after them. Reads showed the old value; a
   reopen replayed the failed write.
+- *A durable write was lost on a clean close.* `append_entries` writes a
+  batch a chunk at a time. An allocation that failed for a later chunk left
+  the earlier ones in the file, and the handler that degrades the engine for
+  a failed append allocates the degraded state. Under sustained pressure it
+  threw, the engine stayed writable, and the next write, acknowledged as
+  durable, was appended after an open `BulkBegin`. Recovery dropped it with
+  the batch (#583). Found once the sweep stopped depending on the node pool:
+  a warm pool had hidden the allocations that reach it. The handler now
+  refuses writes by the flag when it cannot publish the degraded state.
 - *Freeing memory needed memory.* A transient dropped without publishing
   freed its nodes through `free_node_subtree_if`, in a `noexcept`
   destructor, with a heap-allocated work list: under sustained pressure,
@@ -2844,6 +2856,7 @@ A site whose break nothing has to catch says why instead.
 | `execute_slots`: a failed append syncs what it can before it degrades | not needed: `resume()` rewrites and syncs the file before trusting it (#240) | `no_sync_before_degrade` (chaos, not caught) | — |
 | `execute_slots`: a rotation behind a failed flush stays degraded | `pipeline: rotation behind a failed flush stays degraded` | `rotation_publishes_over_degrade` | #170 |
 | `execute_slots`: a sync write that appends nothing makes earlier unsynced writes durable | `apply_batch: an empty sync plan makes earlier unsynced writes …` | `sync_only_write_skips_sync` | #192 |
+| `execute_group`: a failed append refuses writes when the degraded state cannot be published | `alloc sweep: apply_batch` | `append_failure_refusal_needs_memory` | #583 |
 | `execute_group`: a throw after the append refuses writes | `refuse writes: a throw after the append refuses writes until resume()` | `post_append_failure_not_refused` | #364 |
 | `refuse_writes`: the flag refuses when the degraded state cannot be published | `refuse writes: the refusal holds when the degraded state cannot be published` | `refusal_needs_published_state` | #364 |
 | `flush_once`: a `flush_pending` that throws gives the flush role back | `refuse writes: a flush that throws releases the flush role` | `flush_role_kept_on_throw` (hangs) | #364 |

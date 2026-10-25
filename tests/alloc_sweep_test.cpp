@@ -279,6 +279,10 @@ auto run_in_child(const Operation &op, const Pass &pass, long n,
 
     bool threw = false;
     bool did_work = false;
+    // A warm pool hands out nodes without operator new, so which node
+    // allocations the sweep counts would depend on the tests that ran
+    // before (#583).
+    bytecask::btree_detail::node_pool_trim();
     {
       ScopedAllocFaults faults{n, pass.cascade};
       try {

@@ -1,0 +1,17 @@
+A failed append that cannot publish its degraded state, for want of memory,
+leaves the engine writable, so the next write is appended after the chunks the
+failed one wrote and is lost on reopen. Reverts #583.
+Guarded-by: "alloc sweep: apply_batch"
+
+diff --git a/bytecaskdb/db_commit.cpp b/bytecaskdb/db_commit.cpp
+index 19d0fcb..a0ba6c1 100644
+--- a/bytecaskdb/db_commit.cpp
++++ b/bytecaskdb/db_commit.cpp
+@@ -222,7 +222,6 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
+       counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
+       store_state(std::move(err_s));
+     } catch (...) {
+-      refuse_writes();
+     }
+     for (auto *s : batch) {
+       if (!s->err) s->err = ex;
