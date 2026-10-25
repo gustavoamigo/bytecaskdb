@@ -2118,13 +2118,13 @@ for lack of memory is not settled, and the sweep is how it will be.
 Counts are from a release build; a debug build under ASan allocates a
 little more (`put` takes 19 runs, not 17).
 
-The nine operations after `ingest` also inject an I/O failure while they
+The ten operations after `ingest` also inject an I/O failure while they
 run (`Operation::io_fault`), so that the handler for it has to allocate
 under the fault: a failed `writev` that leaves its bytes in the file, a
 failed `fdatasync`, a file that cannot be created. Allocations of the
 injector itself are not counted. A run in which the injected failure was
-thrown must end with the operation having thrown, the engine refusing
-writes, and, when the injected failure came before any allocation failed,
+thrown must end with the operation having thrown, nothing it did visible,
+the engine refusing writes, and, when the injected failure came before any allocation failed,
 the operation's exception a `std::system_error` and not a `std::bad_alloc`
 in its place. Each pass must also reach the injected failure, and reach it
 in a run where no allocation failed first, or the sweep fails instead of
@@ -2226,6 +2226,12 @@ each allocation it failed.
   `refuse_writes()` outside the handler did not undo. No other check in
   the sweep noticed, whether or not a durable write followed. The fix is one
   helper, `degrade_or_refuse`, in every handler of the three kinds.
+- *A thrown slice was visible.* ingest's handlers for a file that cannot be
+  created published the transient, which already held every chunk applied,
+  so readers saw the slice the call threw on before `resume()`. The sweep
+  accepted it as the transition; it now requires the baseline whenever the
+  injected I/O failure was thrown. They degrade from the state published
+  before the slice, as the `fdatasync` handlers beside them did.
 - *Freeing memory needed memory.* A transient dropped without publishing
   freed its nodes through `free_node_subtree_if`, in a `noexcept`
   destructor, with a heap-allocated work list: under sustained pressure,
@@ -2899,9 +2905,10 @@ A site whose break nothing has to catch says why instead.
 | `ingest`: a failed final `fdatasync` throws its own error | `alloc sweep: ingest whose fdatasync fails` | `ingest_sync_failure_not_rethrown` | #618 |
 | `ingest`: a failed rotation `fdatasync` throws its own error | `alloc sweep: ingest whose rotation fdatasync fails`, `refuse writes: ingest's post-loop rotation fdatasync fails` | `ingest_rotation_sync_failure_not_rethrown` | #618 |
 | `ingest`: a file that cannot be created throws its own error | `alloc sweep: ingest whose rotation cannot create a file`, `refuse writes: ingest's post-loop rotation cannot create a file` | `ingest_rotation_failure_not_rethrown` | #618 |
+| `ingest`: a file that cannot be created publishes the state before the slice, not the chunks applied so far | `refuse writes: ingest's post-loop rotation cannot create a file`, `alloc sweep: ingest whose rotation cannot create a file` (a thrown I/O failure must leave the baseline) | `ingest_rotation_failure_publishes_slice` | #619 |
 | `set_mode(Leader)`: a failed marker append refuses writes when the degraded state cannot be published | `alloc sweep: set_mode(Leader) whose marker append fails` | `marker_append_failure_needs_memory` | #618 |
 | `set_mode(Leader)`: a file that cannot be created throws its own error | `alloc sweep: set_mode(Leader) whose rotation cannot create a file`, `refuse writes: set_mode(Leader)'s rotation cannot create a file` | `promotion_rotation_failure_not_rethrown` | #618 |
-| `sync_active_file`: a failed `fdatasync` refuses writes, and throws its own error, when the degraded state cannot be published | `alloc sweep: set_mode(Follower) whose fdatasync fails` (and `create_manifest`'s) | `sync_failure_refusal_needs_memory` | #618 |
+| `sync_active_file`: a failed `fdatasync` refuses writes, and throws its own error, when the degraded state cannot be published | `alloc sweep: set_mode(Follower) whose fdatasync fails` (and `create_manifest`'s and `vacuum`'s) | `sync_failure_refusal_needs_memory` | #618 |
 | `create_manifest`: a file that cannot be created throws its own error | `alloc sweep: create_manifest whose rotation cannot create a file` | `manifest_rotation_failure_not_rethrown` | #618 |
 | `execute_group`: a throw after the append refuses writes | `refuse writes: a throw after the append refuses writes until resume()` | `post_append_failure_not_refused` | #364 |
 | `refuse_writes`: the flag refuses when the degraded state cannot be published | `refuse writes: the refusal holds when the degraded state cannot be published` | `refusal_needs_published_state` | #364 |

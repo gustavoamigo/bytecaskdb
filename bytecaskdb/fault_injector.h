@@ -160,9 +160,11 @@ inline void io_post_write_checkpoint(const char* name, int fd,
                                       std::uint64_t offset,
                                       std::size_t /*total*/) {
   if (!active_injector) return;
-  const SuspendSyscallFaults exempt;
   auto& inj = *active_injector;
-  inj.last_checkpoint = name;
+  {
+    const SuspendSyscallFaults exempt;
+    inj.last_checkpoint = name;
+  }
 
   if (inj.post_write_mode == PostWriteMode::none) return;
   if (inj.fail_at_name != name) return;
@@ -173,7 +175,10 @@ inline void io_post_write_checkpoint(const char* name, int fd,
     (void)::ftruncate(fd, static_cast<off_t>(offset + static_cast<std::uint64_t>(inj.short_write_bytes)));
   }
   // For throw_after: data stays fully on disk — simulates writev
-  // success followed by a failure before offset_ advances.
+  // success followed by a failure before offset_ advances. The ftruncate
+  // above is counted like any other call; the throw's own allocations are
+  // not.
+  const SuspendSyscallFaults exempt;
   inj.fire();
   throw std::system_error{inj.error,
       std::string{"fault injection (post-write) at: "} + name};

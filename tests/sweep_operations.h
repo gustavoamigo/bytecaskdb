@@ -510,6 +510,27 @@ inline auto step_down_failed_sync_operation() -> Operation {
           .io_fault = failed_sync_fault};
 }
 
+// Vacuum makes the overwrites it judged by durable before it drops the old
+// file; that fdatasync fails. Two durable values, then two unsynced
+// overwrites: the whole-file path writes no staging copy, so the first data
+// file sync is that one.
+inline auto vacuum_failed_sync_operation() -> Operation {
+  return {.name = "vacuum whose fdatasync fails",
+          .opts = {.max_file_bytes = 50},
+          .setup =
+              [](DB &db) {
+                db.put({.sync = true}, to_bytes("k0"), to_bytes("v_k0"));
+                db.put({.sync = true}, to_bytes("k1"), to_bytes("v_k1"));
+                db.put({.sync = false}, to_bytes("k0"), to_bytes("n0"));
+                db.put({.sync = false}, to_bytes("k1"), to_bytes("n1"));
+              },
+          .run = [](DB &db) {
+            return db.vacuum({.fragmentation_threshold = 0.0});
+          },
+          .transition = [](KeyValues kv) { return kv; },
+          .io_fault = failed_sync_fault};
+}
+
 // resume() itself under fault, from each state a failed write leaves: the
 // whole entry in the file but unsynced, and a torn one.
 inline auto resume_unsynced_operation() -> Operation {

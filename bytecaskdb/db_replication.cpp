@@ -375,7 +375,9 @@ void DB::ingest(const ChangeHeader &header,
   // at safe boundaries (never inside BulkBegin..BulkEnd).
   // Once a chunk is in the file, a throw that no handler below degraded
   // for — an allocation, typically — leaves bytes nothing published, and
-  // writes are refused until resume() reconciles them.
+  // writes are refused until resume() reconciles them. Every I/O handler
+  // degrades from `current`, not from t: t holds the chunks applied so far,
+  // and a thrown slice is unseen until resume().
   auto appended = false;
   try {
     while (!remaining.empty()) {
@@ -432,9 +434,8 @@ void DB::ingest(const ChangeHeader &header,
           rotation = prepare_rotation(t);
         } catch (...) {
           degrade_or_refuse([&] {
-            t.apply_degrade(
-                "ingest post-rotation file creation failed: call resume().");
-            store_state(current, std::move(t).persistent());
+            store_state(current->degraded_copy(
+                "ingest post-rotation file creation failed: call resume()."));
           });
           throw;
         }
@@ -462,9 +463,8 @@ void DB::ingest(const ChangeHeader &header,
         rotation = prepare_rotation(t);
       } catch (...) {
         degrade_or_refuse([&] {
-          t.apply_degrade(
-              "ingest post-rotation file creation failed: call resume().");
-          store_state(current, std::move(t).persistent());
+          store_state(current->degraded_copy(
+              "ingest post-rotation file creation failed: call resume()."));
         });
         throw;
       }

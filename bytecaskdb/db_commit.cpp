@@ -211,16 +211,20 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
     counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
     // An append that failed partway leaves the chunks it wrote in the file,
     // unpublished: the next write must not be appended after them.
-    degrade_or_refuse([&] {
-      // Publishing needs the flush role: an in-flight flush must land (or
-      // fail) first, so its publication cannot overwrite the degraded state.
-      // If this throws, the flag holds without the role: a flush that then
-      // publishes a state without the degrade does not lift it.
-      auto role = quiesce();
-      store_state(load_state()->degraded_copy(std::format(
-          "append IO error on '{}': call resume() to recover.",
-          file.path().string())));
-    });
+    // Publishing needs the flush role: an in-flight flush must land (or
+    // fail) first, so its publication cannot overwrite the degraded state.
+    // The role is held through the fallback too, whose refusal loads and
+    // stores the state unchecked: no flush may publish in between. A
+    // quiesce() that throws has refused writes itself (flush_threw).
+    try {
+      const auto role = quiesce();
+      degrade_or_refuse([&] {
+        store_state(load_state()->degraded_copy(std::format(
+            "append IO error on '{}': call resume() to recover.",
+            file.path().string())));
+      });
+    } catch (...) {
+    }
     for (auto *s : batch) {
       if (!s->err) s->err = ex;
     }

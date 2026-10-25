@@ -328,6 +328,8 @@ auto run_in_child(const Operation &op, const Pass &pass, long n,
         expect(threw_system_error,
                "the operation threw something else in the I/O failure's place");
       expect(degraded, "an I/O failure was reported, yet the engine accepts writes");
+      expect(live == baseline,
+             "an I/O failure was thrown, yet what the operation did is visible");
     }
     if (!out.fired && !io_failed) {
       expect(!threw, "the fault was not reached, yet the operation threw");
@@ -682,6 +684,10 @@ TEST_CASE("alloc sweep: write across a rotation", "[alloc_sweep]") {
 
 TEST_CASE("alloc sweep: vacuum", "[alloc_sweep]") {
   alloc_sweep(vacuum_operation());
+}
+
+TEST_CASE("alloc sweep: vacuum whose fdatasync fails", "[alloc_sweep]") {
+  alloc_sweep(vacuum_failed_sync_operation());
 }
 
 TEST_CASE("alloc sweep: ingest", "[alloc_sweep]") {
@@ -1867,15 +1873,28 @@ namespace {
 
 enum class DegradeMemory { available, exhausted };
 
+constexpr Options kPostLoopFollower{.max_file_bytes = 100,
+                                    .initial_mode = bytecask::Mode::Follower};
+
 // Five puts that cross a 100-byte file only with the last, so ingest
-// rotates after its loop, not inside it.
+// rotates after its loop, not inside it: checked on a copy, where the slice
+// fills one file and leaves the next empty (inside the loop, the last put
+// would have gone to the next file).
 auto post_loop_rotation_slice() -> bytecask::testing::OwnedEntries {
   TempDir td;
-  auto leader = DB::open(td.path / "leader");
-  for (char c = 'a'; c <= 'e'; ++c)
-    leader.put({.sync = true}, to_bytes(std::string(1, c)), to_bytes("x"));
-  const auto snap = leader.snapshot();
-  return bytecask::testing::collect_changes(leader.changes_since(snap, 0));
+  auto slice = [&] {
+    auto leader = DB::open(td.path / "leader");
+    for (char c = 'a'; c <= 'e'; ++c)
+      leader.put({.sync = true}, to_bytes(std::string(1, c)), to_bytes("x"));
+    const auto snap = leader.snapshot();
+    return bytecask::testing::collect_changes(leader.changes_since(snap, 0));
+  }();
+  auto probe = DB::open(td.path / "probe", kPostLoopFollower);
+  probe.ingest(slice.header, slice.views());
+  const auto stats = probe.file_stats();
+  REQUIRE(stats.size() == 2);
+  REQUIRE(stats.rbegin()->second.total_bytes == 0);
+  return slice;
 }
 
 // Exhausted: neither the handler's degraded state nor the refusal's
@@ -1906,9 +1925,7 @@ void ingest_post_loop_rotation_fails(const char *checkpoint,
                                DegradeMemory::exhausted);
   TempDir td;
   const auto slice = post_loop_rotation_slice();
-  auto db = open_db(td.path / "follower",
-                    {.max_file_bytes = 100,
-                     .initial_mode = bytecask::Mode::Follower});
+  auto db = open_db(td.path / "follower", kPostLoopFollower);
   arm_degrade_memory(*db, memory);
   {
     bytecask::testing::ScopedFaultInjector fi{checkpoint};
@@ -1917,6 +1934,8 @@ void ingest_post_loop_rotation_fails(const char *checkpoint,
     CHECK(fi.inj.fired);
   }
   expect_io_failure_refused(*db, memory, reason);
+  for (char c = 'a'; c <= 'e'; ++c)
+    CHECK(value_of(*db, std::string(1, c)) == "<absent>");
   CHECK_THROWS_AS(db->ingest(slice.header, slice.views()), DbDegraded);
   REQUIRE_NOTHROW(db->resume());
   db->ingest(slice.header, slice.views());
