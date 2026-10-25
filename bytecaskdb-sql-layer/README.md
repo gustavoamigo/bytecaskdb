@@ -2,7 +2,7 @@
 
 A PostgreSQL-dialect SQL layer over the ByteCaskDB engine. SQL is parsed, bound, planned, and compiled to native code in process, and the compiled plan runs against the engine through a small plan API. It is built for TPROC-C first, so its dialect is a growing subset of PostgreSQL 17, not all of it.
 
-MIT, like the engine. It uses the engine's public API only (`include/bytecask.hpp`) and includes no MariaDB header.
+MIT, like the engine. It uses the engine's public API only (`include/bytecask.hpp`).
 
 ## How it works
 
@@ -39,7 +39,7 @@ Built and tested:
 - **Types:** `SMALLINT`, `INTEGER`, `BIGINT`, `REAL`, `DOUBLE PRECISION`, `BOOLEAN`, `TEXT`, `VARCHAR(n)`, `BYTEA`, `DECIMAL(p, s)` with p ≤ 18, `DATE`, `TIME`, `TIMESTAMP`.
 - **Transactions:** statements read their own writes; DDL is its own statement, not transactional.
 - **Interfaces:** the embedded C++ API (`api/database.cppm`), and `sql_layer_server`, a PostgreSQL wire-protocol server that psql, psycopg and HammerDB connect to. Trust authentication only: it listens on loopback unless told otherwise.
-- **Gate:** HammerDB's TPROC-C over the wire at 1, 16 and 48 virtual users, nightly in CI.
+- **HammerDB gate:** TPROC-C over the wire, driven by HammerDB (`hammerdb/run-gate.sh`; its defaults are 48 warehouses at 1, 16 and 48 virtual users). Nightly CI runs its smoke: 2 warehouses, 2 users, one minute, then the consistency conditions.
 
 Not built yet (each is refused, with a message):
 
@@ -74,7 +74,7 @@ The layer is part of the build only with `--sql_layer=y`, so building the engine
 | Wire protocol | `BYTECASK_SQL_SERVER=... pytest tests/server` |
 | Functional suite: fixed cases over the wire, and a conformance report | `BYTECASK_SQL_SERVER=... pytest tests/functional`, then `--conformance --results=results.json` and `tests/functional/report.py` |
 | TPROC-C in process: five transactions, consistency conditions 1–9, Elle histories | `sql_layer_tprocc` |
-| HammerDB gate | `hammerdb/run-gate.sh`, nightly in CI |
+| HammerDB gate | `hammerdb/run-gate.sh`; `--smoke` nightly in CI |
 
 CI is `.github/workflows/sql-layer.yml`, with the sanitizers (ASan, TSan, UBSan) on the C++ tests.
 

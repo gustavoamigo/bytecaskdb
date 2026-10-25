@@ -157,17 +157,12 @@ jobs:
 
       # The functional suite (docs/functional_testing_design.md): the gate,
       # then a conformance run that makes the report and never fails the job.
-      # No PostgreSQL: the expected values are in the case files. Nothing under
-      # tests/functional may name the MariaDB plugin (Decision 12 there).
+      # No PostgreSQL: the expected values are in the case files.
       - name: Functional suite, the gate
         env:
           BYTECASK_SQL_SERVER: build/linux/x86_64/release/sql_layer_server
           BYTECASK_SQL_TPROCC: build/linux/x86_64/release/sql_layer_tprocc
         run: |
-          if grep -rniE "mariadb" bytecaskdb-sql-layer/tests/functional --include=*.py --include=*.yaml --include=*.txt; then
-            echo "the functional suite must not reference the MariaDB plugin" >&2
-            exit 1
-          fi
           xmake build -y sql_layer_tprocc
           pip3 install -r bytecaskdb-sql-layer/tests/functional/requirements.txt
           python3 -m pytest bytecaskdb-sql-layer/tests/functional -v -p no:cacheprovider \

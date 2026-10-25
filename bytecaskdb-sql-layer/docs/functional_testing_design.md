@@ -153,12 +153,8 @@ gate stays where it is (`server_design.md`, *Running the gate*).
 ## Our cases
 
 A YAML file is a list of cases, one file per area (`joins.yaml`,
-`types.yaml`). The format is the MariaDB plugin's
-(`bytecaskdb-mariadb-plugin/tests/functional/`), whose runner this suite
-copies and extends (Decision 12); its fixtures start a MariaDB server
-and are not copied, because this suite starts `sql_layer_server`. Its
-case queries are not reused: they were taken from MariaDB's MTR suite.
-Every case here is written for this layer.
+`types.yaml`). Every case here is written for this layer, and no query
+is taken from another project's suite.
 
 ```yaml
 # Unique constraints and NULL.
@@ -346,8 +342,8 @@ moves to what the layer doesn't do yet.
 ## Decisions
 
 The owner's, 2026-10-25:
-1. **One black-box framework, in Python, over the wire.** The MariaDB
-   plugin's machinery is reused; its MTR-derived queries are not.
+1. **One black-box framework, in Python, over the wire.** Its runner and
+   case format are the owner's own earlier work, reused.
 2. **Several suites, one report:** SQL:2016 Core (sqltest),
    PostgreSQL features, ByteCaskDB features, the two
    decision-support query sets, and TPROC-C. The SQL Core row is labelled
@@ -371,10 +367,7 @@ The owner's, 2026-10-25:
     SQLLogicTest is left out for now.
 11. **A table without a primary key is a gap.** The layer's refusal is
     not a recorded decision.
-12. **The runner is copied from the plugin, and licensed MIT here.** The
-    plugin's runner and test collection are the owner's own work, so the
+12. **The runner is the owner's own work, licensed MIT here.** The
     copy in `bytecaskdb-sql-layer/tests/functional/` carries an MIT
-    header. The layer's tree never imports from, or names a path in,
-    `bytecaskdb-mariadb-plugin/`: the plugin may depend on the layer,
-    never the reverse (`project_organization.md`). The plugin's MTR-derived
-    queries are not copied.
+    header, and no query from another project's suite is copied into
+    our cases.

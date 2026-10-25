@@ -24,7 +24,7 @@ These instructions apply to every repository work request in this workspace.
 
 1. Update `docs/bytecask_design.md` to reflect any behavior, architecture, constraints, or invariants changed by the work. If a guarantee changes, update the row in `CONTRACT.md` with the test that proves it, and name the change in the PR description: added, widened, narrowed or removed. Work on the SQL layer updates its own documents instead: `bytecaskdb-sql-layer/docs/` and `bytecaskdb-sql-layer/CONTRACT.md`, not the engine's design doc and contract.
 2. Track any follow-up work as a GitHub issue. Don't open an issue for the PR's own task — the PR is its own record; use an issue when work is being deferred, discovered mid-implementation, or otherwise won't be covered by a PR opened now.
-3. Update `README.md` only when the project's pitch changes: a headline feature, a headline number, or the quick-start path. A feature added or changed goes in the Features section of `docs/bytecask_design.md`; API changes go in `docs/api_reference.md`; performance figures go in `docs/performance.md`. The README is an entry point and stays short (`scripts/check_readme_size.py` fails CI past its limit). It targets an external audience — avoid internal implementation details; focus on user-visible characteristics and behavior.
+3. Update the root `README.md` only when the project's pitch changes: a headline feature, a headline number, or the quick-start path. (`bytecaskdb-sql-layer/README.md` is the exception: it is that layer's status page, updated with every feature, per `bytecaskdb-sql-layer/CLAUDE.md`.) A feature added or changed goes in the Features section of `docs/bytecask_design.md`; API changes go in `docs/api_reference.md`; performance figures go in `docs/performance.md`. The README is an entry point and stays short (`scripts/check_readme_size.py` fails CI past its limit). It targets an external audience — avoid internal implementation details; focus on user-visible characteristics and behavior.
 4. Always validate design before moving to implementation
 5. After design approval, move to the implementation
 6. Add or update tests that cover the behavior being changed.
@@ -119,6 +119,10 @@ Avoid designs where correctness depends on programmer discipline alone (e.g. "ne
 ### Engine code (`bytecaskdb/`)
 
 Rules specific to the engine's code (lazy iterators, non-owning views, ownership through failure, batch markers) are in `bytecaskdb/CLAUDE.md`. Read them before changing code in that folder.
+
+### SQL layer code (`bytecaskdb-sql-layer/`)
+
+Rules specific to the SQL layer are in `bytecaskdb-sql-layer/CLAUDE.md`. Read them before changing code in that folder. They include keeping `bytecaskdb-sql-layer/README.md` current: it is updated in every PR that changes what the layer does or refuses.
 
 ### Thread-local state
 
