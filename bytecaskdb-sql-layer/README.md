@@ -13,7 +13,7 @@ SQL ─▶ libpg_query ─▶ AST ─▶ binder ─▶ logical plan ─▶ rewri
 - **Plans are C.** The compiler writes each statement as a C program against `algebra/bc_plan.h` and loads it with TinyCC. Only plans the layer generates run.
 - **PostgreSQL decides semantics.** Results, errors (SQLSTATE) and NULL placement follow PostgreSQL 17; a model-based test compares the two statement by statement.
 - **Never waits.** Nothing blocks on a lock. Snapshot isolation by default; a write-write conflict is retried (autocommit) or fails with 40001 (transaction).
-- **Refuses rather than guesses.** A statement outside the dialect is refused with a message and its position (42601); one the planner can't plan, or a guard it can't give, is refused with 0A000. Nothing runs first.
+- **Refuses rather than guesses.** A statement outside the dialect is refused with a message and its position (42601); one the planner can't plan, or a guard it can't give, is refused with 0A000.
 
 ## Conformance
 

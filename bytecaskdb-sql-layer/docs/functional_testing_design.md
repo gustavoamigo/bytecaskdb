@@ -153,8 +153,7 @@ gate stays where it is (`server_design.md`, *Running the gate*).
 ## Our cases
 
 A YAML file is a list of cases, one file per area (`joins.yaml`,
-`types.yaml`). Every case here is written for this layer, and no query
-is taken from another project's suite.
+`types.yaml`). Every case here is written for this layer.
 
 ```yaml
 # Unique constraints and NULL.
@@ -342,8 +341,7 @@ moves to what the layer doesn't do yet.
 ## Decisions
 
 The owner's, 2026-10-25:
-1. **One black-box framework, in Python, over the wire.** Its runner and
-   case format are the owner's own earlier work, reused.
+1. **One black-box framework, in Python, over the wire.**
 2. **Several suites, one report:** SQL:2016 Core (sqltest),
    PostgreSQL features, ByteCaskDB features, the two
    decision-support query sets, and TPROC-C. The SQL Core row is labelled
@@ -367,7 +365,5 @@ The owner's, 2026-10-25:
     SQLLogicTest is left out for now.
 11. **A table without a primary key is a gap.** The layer's refusal is
     not a recorded decision.
-12. **The runner is the owner's own work, licensed MIT here.** The
-    copy in `bytecaskdb-sql-layer/tests/functional/` carries an MIT
-    header, and no query from another project's suite is copied into
-    our cases.
+12. **The suite's runner is the owner's own work and carries an MIT
+    header.**
