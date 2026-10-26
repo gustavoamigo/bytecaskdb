@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -597,6 +598,74 @@ TEST_CASE("binder: LIKE of a text column, its pattern TEXT, its escape one chara
   CHECK(state("SELECT k FROM lk WHERE k LIKE '1%'") == "42883");
   CHECK(rejected(cat, "SELECT k FROM lk WHERE b LIKE 'a%'").first == "LIKE of a BYTEA column is not supported yet");
   CHECK(rejected(cat, "SELECT k FROM lk WHERE v ILIKE 'a%'").first == "ILIKE is not supported: its case folding is a locale's");
+}
+
+TEST_CASE("binder: a FOREIGN KEY is checked against the referenced table's keys, then not kept", "[sql][binder][catalog]") {
+  sql_test::Fixture f;
+  for (auto ddl : {"CREATE TABLE p (k INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL, s TEXT, UNIQUE (a, b))",
+                   "CREATE TABLE n (a INTEGER)"}) {
+    f.ddl(std::get<Ddl>(bind_sql(f.cat(), ddl).stmt));
+  }
+  const auto& cat = f.cat();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what();
+    }
+    return "bound";
+  };
+  // The primary key, by name or by default; a unique index's columns in any order.
+  CHECK(state("CREATE TABLE c (x BIGINT REFERENCES p (k))") == "bound");
+  CHECK(state("CREATE TABLE c (x SMALLINT REFERENCES p)") == "bound");
+  CHECK(state("CREATE TABLE c (x INT, y INT, CONSTRAINT f FOREIGN KEY (x, y) REFERENCES p (b, a))") == "bound");
+  CHECK(state("CREATE TABLE c (x VARCHAR(4) REFERENCES p (s))") ==
+        "42830 there is no unique constraint matching given keys for referenced table \"p\"");
+  CHECK(state("CREATE TABLE c (x INT REFERENCES p (a))") ==
+        "42830 there is no unique constraint matching given keys for referenced table \"p\"");
+  CHECK(state("CREATE TABLE c (x INT REFERENCES n)") == "42704 there is no primary key for referenced table \"n\"");
+  CHECK(state("CREATE TABLE c (x INT REFERENCES nope)") == "42P01 relation \"nope\" does not exist");
+  CHECK(state("CREATE TABLE c (x INT REFERENCES p (z))") ==
+        "42703 column \"z\" referenced in foreign key constraint does not exist");
+  CHECK(state("CREATE TABLE c (x INT, FOREIGN KEY (w) REFERENCES p)") ==
+        "42703 column \"w\" referenced in foreign key constraint does not exist");
+  CHECK(state("CREATE TABLE c (x INT, FOREIGN KEY (x) REFERENCES p (a, b))") ==
+        "42830 number of referencing and referenced columns for foreign key disagree");
+  CHECK(state("CREATE TABLE c (x INT, FOREIGN KEY (x, x) REFERENCES p (a, b))") == "bound");  // as PostgreSQL takes it
+  CHECK(state("CREATE TABLE c (x INT, y INT, FOREIGN KEY (x, y) REFERENCES p (a, a))") ==
+        "42830 foreign key referenced-columns list must not contain duplicates");
+  CHECK(state("CREATE TABLE c (x TEXT REFERENCES p (k))") == "42804 foreign key constraint \"c_x_fkey\" cannot be implemented");
+  // Each pair of types PostgreSQL 17 takes, a column's type and its key's.
+  const std::vector<std::string> types{"SMALLINT", "INTEGER", "BIGINT", "REAL", "DOUBLE PRECISION", "NUMERIC(6,2)",
+                                        "NUMERIC(8,0)", "TEXT", "VARCHAR(4)", "BYTEA", "BOOLEAN", "DATE", "TIMESTAMP", "TIME"};
+  const std::set<std::pair<std::size_t, std::size_t>> takes{  // (column, key), by index in types
+      {0, 0}, {1, 0}, {2, 0}, {0, 1}, {1, 1}, {2, 1}, {0, 2}, {1, 2}, {2, 2}, {0, 3}, {1, 3}, {2, 3},
+      {3, 3}, {4, 3}, {5, 3}, {6, 3}, {0, 4}, {1, 4}, {2, 4}, {3, 4}, {4, 4}, {5, 4}, {6, 4}, {0, 5},
+      {1, 5}, {2, 5}, {5, 5}, {6, 5}, {0, 6}, {1, 6}, {2, 6}, {5, 6}, {6, 6}, {7, 7}, {8, 7}, {7, 8},
+      {8, 8}, {9, 9}, {10, 10}, {11, 11}, {12, 11}, {11, 12}, {12, 12}, {13, 13}};
+  for (std::size_t key = 0; key < types.size(); ++key) {
+    sql_test::Fixture g;
+    g.ddl(std::get<Ddl>(bind_sql(g.cat(), "CREATE TABLE k (v " + types[key] + " PRIMARY KEY)").stmt));
+    for (std::size_t col = 0; col < types.size(); ++col) {
+      INFO(types[col] << " REFERENCES " << types[key]);
+      auto taken = true;
+      try {
+        (void)bind_sql(g.cat(), "CREATE TABLE c (x " + types[col] + " REFERENCES k)");
+      } catch (const ast::SqlError& e) {
+        CHECK(std::string{e.sqlstate()} == "42804");
+        taken = false;
+      }
+      CHECK(taken == takes.contains({col, key}));
+    }
+  }
+  // A table may reference itself, by the keys it is created with.
+  CHECK(state("CREATE TABLE c (id INT PRIMARY KEY, up INT REFERENCES c)") == "bound");
+  CHECK(state("CREATE TABLE c (id INT, up INT REFERENCES c (id))") ==
+        "42830 there is no unique constraint matching given keys for referenced table \"c\"");
+  CHECK(state("ALTER TABLE n ADD COLUMN x INT REFERENCES p").starts_with("42601"));
+  // Not kept: the DDL is the table's, as it would be without it.
+  auto ddl = std::get<CreateTableDdl>(std::get<Ddl>(bind_sql(cat, "CREATE TABLE c (x INT REFERENCES p)").stmt));
+  CHECK(ddl.unique.empty());
 }
 
 TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][binder][catalog]") {

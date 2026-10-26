@@ -36,7 +36,15 @@ kind the transformer doesn't take is refused with its position.
   under a hidden row id no statement sees (`catalog_design.md`, *Tables
   without a primary key*). `UNIQUE` on a column or on the table, named or
   not, is a unique index created with the table (`catalog_design.md`,
-  *UNIQUE constraints*).
+  *UNIQUE constraints*). `REFERENCES` on a column and `FOREIGN KEY … REFERENCES`
+  on the table, named or not, `ON DELETE` and `ON UPDATE` `NO ACTION` or
+  `RESTRICT`, are checked as PostgreSQL checks them when it creates them:
+  the referenced table and columns exist, and are its primary key (the
+  default) or a unique index's columns in any order, of types it compares
+  (an INTEGER references a DECIMAL or a REAL key, not the reverse), with
+  its SQLSTATE where they are not. Then nothing is kept: the constraint is
+  not enforced (*Known differences*). `CASCADE`, `SET NULL`, `SET DEFAULT`,
+  `MATCH FULL` and `PARTIAL`, `DEFERRABLE` and `NOT VALID` are refused.
 - `INSERT … VALUES` of one row, with or without a column list, of
   parameters and constants.
 - `SELECT` targets: columns, constants (*Literals*), `COUNT(*)`,
@@ -393,6 +401,12 @@ fail on them.
   it, and the constraint with it. PostgreSQL refuses (2BP01: the constraint
   requires the index) and drops it only with its table or `ALTER TABLE …
   DROP CONSTRAINT`.
+- **A FOREIGN KEY is not enforced.** It is checked when its table is
+  created, then dropped: a row whose key no parent row holds is written,
+  a parent row with children can be deleted or have its key changed, and
+  the parent table or the index it references can be dropped. PostgreSQL
+  refuses each (23503, 2BP01). The owner postponed enforcement, as several
+  databases have shipped without it; its design is in #657.
 - **Strings compare bytewise, as `COLLATE "C"`**, constants as columns
   do: `'B' < 'a'` is true. PostgreSQL orders them by the database's
   collation, under which `'a' < 'B'` may be true instead. The layer has one

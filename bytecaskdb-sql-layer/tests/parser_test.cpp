@@ -84,6 +84,27 @@ TEST_CASE("parser: the seven statements of the prototype", "[sql][parser]") {
   }
 }
 
+TEST_CASE("parser: REFERENCES and FOREIGN KEY, NO ACTION or RESTRICT only, in the order written", "[sql][parser]") {
+  auto t = std::get<CreateTable>(parse("CREATE TABLE c (a INT REFERENCES p (x), b INT CONSTRAINT bp REFERENCES p, "
+                                       "CONSTRAINT ab FOREIGN KEY (a, b) REFERENCES q (y, x) ON DELETE NO ACTION "
+                                       "ON UPDATE RESTRICT)"));
+  REQUIRE(t.foreign_keys.size() == 3);
+  const auto& f = t.foreign_keys;
+  CHECK((f[0].name.empty() && f[0].columns == std::vector<std::string>{"a"} && f[0].table == "p" &&
+         f[0].ref_columns == std::vector<std::string>{"x"}));
+  CHECK((f[1].name == "bp" && f[1].columns == std::vector<std::string>{"b"} && f[1].ref_columns.empty()));
+  CHECK((f[2].name == "ab" && f[2].columns == std::vector<std::string>{"a", "b"} && f[2].table == "q" &&
+         f[2].ref_columns == std::vector<std::string>{"y", "x"}));
+  CHECK(t.columns[0].references.empty());  // moved to the table's list
+  for (auto sql : {"CREATE TABLE c (a INT REFERENCES p ON DELETE CASCADE)", "CREATE TABLE c (a INT REFERENCES p ON UPDATE SET NULL)",
+                   "CREATE TABLE c (a INT REFERENCES p ON DELETE SET DEFAULT)", "CREATE TABLE c (a INT REFERENCES p MATCH FULL)",
+                   "CREATE TABLE c (a INT REFERENCES p DEFERRABLE)",
+                   "CREATE TABLE c (a INT, FOREIGN KEY (a) REFERENCES p INITIALLY DEFERRED)"}) {
+    INFO(sql);
+    CHECK_THROWS_AS(parse(sql), SqlError);
+  }
+}
+
 TEST_CASE("parser: UNIQUE on a column or the table, in the order written", "[sql][parser]") {
   auto t = std::get<CreateTable>(parse("CREATE TABLE u (a INT UNIQUE, b INT CONSTRAINT bu UNIQUE, "
                                        "CONSTRAINT ab UNIQUE (a, b), UNIQUE (b))"));

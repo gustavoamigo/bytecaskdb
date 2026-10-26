@@ -844,6 +844,108 @@ auto column_spec(const ast::ColumnDefAst& c) -> ColumnSpec {
                     c.default_value ? fold_default(*c.default_value, t) : Datum{}};
 }
 
+// The keys a FOREIGN KEY may reference: a table's columns, its primary
+// key, and the column sets of its unique indexes.
+struct ReferencedKeys {
+  std::vector<std::pair<std::string, SqlType>> columns;
+  std::vector<std::string> pk;  // empty: no primary key
+  std::vector<std::vector<std::string>> unique;
+};
+
+auto referenced_keys(const Table& t) -> ReferencedKeys {
+  ReferencedKeys k;
+  for (const auto& c : t.columns) {
+    if (!c.hidden) k.columns.emplace_back(c.name, c.sql);
+  }
+  if (t.row_id() == nullptr) {
+    for (auto id : t.pk_col_ids) k.pk.push_back(t.column(id)->name);
+  }
+  for (const auto& ix : t.indexes) {
+    if (!ix.unique) continue;
+    auto& cols = k.unique.emplace_back();
+    for (const auto& p : ix.parts) cols.push_back(t.column(p.col_id)->name);
+  }
+  return k;
+}
+
+// The keys of the table CREATE TABLE makes, for a FOREIGN KEY on itself.
+auto referenced_keys(const CreateTableDdl& t) -> ReferencedKeys {
+  ReferencedKeys k;
+  for (const auto& c : t.columns) k.columns.emplace_back(c.name, c.sql);
+  k.pk = t.pk;
+  for (const auto& u : t.unique) k.unique.push_back(u.columns);
+  return k;
+}
+
+// Whether a column of type `fk` may reference one of type `key`, as
+// PostgreSQL decides it: by an equality of the key's type, the column cast
+// to it implicitly where they differ. So it goes one way: an INTEGER
+// references a DECIMAL or a REAL key, not the reverse.
+auto references_type(SqlType fk, SqlType key) -> bool {
+  auto is_date = [](SqlType t) { return t.kind == SqlKind::Date || t.kind == SqlKind::Timestamp; };
+  if (is_integer(key)) return is_integer(fk);
+  if (key.kind == SqlKind::Decimal) return is_integer(fk) || fk.kind == SqlKind::Decimal;
+  if (is_float(key)) return is_integer(fk) || fk.kind == SqlKind::Decimal || is_float(fk);
+  if (is_string(key)) return is_string(fk);
+  if (is_date(key)) return is_date(fk);
+  return fk.kind == key.kind;
+}
+
+// PostgreSQL's checks of a FOREIGN KEY when it is created: its columns,
+// those it references, and a primary key or unique index of exactly those
+// columns, in any order, of types an equality compares. Nothing is kept:
+// the constraint is not enforced (docs/frontend_design.md, *Known
+// differences*).
+void check_foreign_key(const CreateTableDdl& t, const ast::ForeignKeyAst& f, const ReferencedKeys& ref) {
+  auto type_of = [&](const auto& cols, const std::string& name) -> std::optional<SqlType> {
+    for (const auto& [n, ty] : cols) {
+      if (n == name) return ty;
+    }
+    return std::nullopt;
+  };
+  std::vector<std::pair<std::string, SqlType>> own;
+  for (const auto& c : t.columns) own.emplace_back(c.name, c.sql);
+  auto missing = [&](const std::string& c) {
+    throw SqlError{"column \"" + c + "\" referenced in foreign key constraint does not exist", f.pos, kUndefinedColumn};
+  };
+  for (const auto& c : f.columns) {
+    if (!type_of(own, c)) missing(c);  // one named twice is taken, as PostgreSQL takes it
+  }
+  auto refs = f.ref_columns;
+  if (refs.empty()) {
+    if (ref.pk.empty()) throw SqlError{"there is no primary key for referenced table \"" + f.table + "\"", f.pos, kUndefinedObject};
+    refs = ref.pk;
+  } else {
+    for (const auto& c : refs) {
+      if (!type_of(ref.columns, c)) missing(c);
+      if (std::ranges::count(refs, c) > 1) {
+        throw SqlError{"foreign key referenced-columns list must not contain duplicates", f.pos, kInvalidForeignKey};
+      }
+    }
+  }
+  if (refs.size() != f.columns.size()) {
+    throw SqlError{"number of referencing and referenced columns for foreign key disagree", f.pos, kInvalidForeignKey};
+  }
+  auto same_set = [&](const std::vector<std::string>& key) {
+    return key.size() == refs.size() && std::ranges::all_of(refs, [&](const auto& c) { return std::ranges::contains(key, c); });
+  };
+  if (!same_set(ref.pk) && std::ranges::none_of(ref.unique, same_set)) {
+    throw SqlError{"there is no unique constraint matching given keys for referenced table \"" + f.table + "\"", f.pos,
+                   kInvalidForeignKey};
+  }
+  for (std::size_t i = 0; i < refs.size(); ++i) {
+    if (!references_type(*type_of(own, f.columns[i]), *type_of(ref.columns, refs[i]))) {
+      auto name = f.name;
+      if (name.empty()) {
+        name = t.name;
+        for (const auto& c : f.columns) name += "_" + c;
+        name += "_fkey";
+      }
+      throw SqlError{"foreign key constraint \"" + name + "\" cannot be implemented", f.pos, kDatatypeMismatch};
+    }
+  }
+}
+
 class Binder {
 public:
   // `own_params`: how many parameters the statement's text names, $1 to
@@ -1777,6 +1879,10 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
             if (c.primary_key) out.pk.push_back(c.name);
           }
           for (const auto& u : s.unique) out.unique.push_back({u.name, u.columns});
+          for (const auto& f : s.foreign_keys) {
+            // A table may reference itself, by the keys it is created with.
+            check_foreign_key(out, f, f.table == s.table ? referenced_keys(out) : referenced_keys(*b.table(f.table, f.pos)));
+          }
           return {Ddl{std::move(out)}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::CreateIndex>) {
           const auto* t = b.table(s.table, s.pos);
@@ -1794,6 +1900,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           (void)b.table(s.table, s.pos);
           if (s.column.primary_key) throw SqlError{"ADD COLUMN cannot add a primary key column", s.column.pos};
           if (!s.column.unique.empty()) not_yet("ADD COLUMN … UNIQUE", s.column.pos);
+          if (!s.column.references.empty()) not_yet("ADD COLUMN … REFERENCES", s.column.pos);
           auto spec = column_spec(s.column);
           if (!spec.nullable && std::holds_alternative<std::monostate>(spec.default_value)) {
             throw SqlError{"column \"" + s.column.name + "\" is NOT NULL and needs a DEFAULT for the existing rows",
