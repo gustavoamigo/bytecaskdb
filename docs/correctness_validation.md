@@ -3109,11 +3109,6 @@ control:
 - **Filesystem write reordering** — filesystems that reorder writes
   across `fdatasync` boundaries (some network/FUSE filesystems). The
   engine assumes `fdatasync` is a barrier.
-- **Silent `fdatasync` failures on Linux** — the "fsyncgate" issue
-  (PostgreSQL, 2018): on some kernel/filesystem combinations, `fsync`
-  can return success after an earlier async writeback error was consumed
-  by another fd. The engine trusts the return value (see "fdatasync
-  trust assumption" in `CONTRACT.md`).
 - **Bit rot at rest** — silent data corruption on disk between writes.
   CRC verification catches this on read when `verify_checksums` is
   enabled, but no periodic scrub is performed.
