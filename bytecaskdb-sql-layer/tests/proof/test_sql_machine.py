@@ -1624,6 +1624,9 @@ class KeylessMachine(Sides, RuleBasedStateMachine):
         v = data.draw(st.sampled_from(held) if held and data.draw(st.booleans(), label="held?") else values(t.column(c).type),
                       label="where value")
         ty = t.column(c).type
+        if data.draw(st.integers(0, 2), label="predicate?") == 0:
+            pred = self.draw_predicate(data, t, depth=2)
+            return f" WHERE {pred}", f" WHERE {pred}", [], []
         if data.draw(st.booleans(), label="literal?"):
             where = f" WHERE {c} = {o.sql_literal(ty, v)}"
             if not o.exact_literal(ty, v):
@@ -1632,6 +1635,33 @@ class KeylessMachine(Sides, RuleBasedStateMachine):
                 return None
             return where, where, [], []
         return f" WHERE {c} = ${first}", f" WHERE {c} = {typed(t, c, first)}", [v], [ty]
+
+    def draw_predicate(self, data, t: Table, depth: int) -> str:
+        """A predicate on filterable columns, as SQL both sides read alike:
+        AND, OR and NOT over =, <>, IS [NOT] NULL, [NOT] BETWEEN and [NOT]
+        IN, of literals the table holds or NULL, so each is one its column
+        holds exactly."""
+        if depth > 0 and data.draw(st.integers(0, 2), label="combine?") == 0:
+            op = data.draw(st.sampled_from(["AND", "OR", "NOT"]), label="combinator")
+            if op == "NOT":
+                return f"NOT ({self.draw_predicate(data, t, depth - 1)})"
+            return f"({self.draw_predicate(data, t, depth - 1)}) {op} ({self.draw_predicate(data, t, depth - 1)})"
+        c = data.draw(st.sampled_from(self.filterable(t)), label="predicate column")
+        ty = t.column(c).type
+        held = [r[[x.name for x in t.columns].index(c)] for r in self.rows(t)]
+        value = st.sampled_from(held + [None]) if held else st.just(None)
+        lit = lambda label: o.sql_literal(ty, data.draw(value, label=label))  # noqa: E731
+        form = data.draw(st.sampled_from(["=", "<>", "IS NULL", "IS NOT NULL", "BETWEEN", "NOT BETWEEN", "IN", "NOT IN"]),
+                         label="predicate form")
+        if form in ("IS NULL", "IS NOT NULL"):
+            return f"{c} {form}"
+        if form in ("BETWEEN", "NOT BETWEEN"):
+            sym = " SYMMETRIC" if data.draw(st.booleans(), label="symmetric?") else ""
+            return f"{c} {form}{sym} {lit('lo')} AND {lit('hi')}"
+        if form in ("IN", "NOT IN"):
+            n = data.draw(st.integers(1, 3), label="in size")
+            return f"{c} {form} ({', '.join(lit(f'in {i}') for i in range(n))})"
+        return f"{c} {form} {lit('operand')}"
 
     @precondition(lambda self: len(self.tables) < len(KEYLESS_NAMES))
     @rule(data=st.data())

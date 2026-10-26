@@ -18,6 +18,7 @@ module;
 #include <cstdint>
 #include <deque>
 #include <expected>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -804,13 +805,18 @@ void params_in(const ast::Expr& e, std::uint32_t& n) {
   if (e.rhs) params_in(*e.rhs, n);
 }
 
+void params_in(const ast::Compare& c, std::uint32_t& n) {
+  if (c.kind == ast::Compare::Kind::Compare || c.kind == ast::Compare::Kind::IsNull) {
+    params_in(c.lhs, n);
+    if (c.kind == ast::Compare::Kind::Compare) params_in(c.rhs, n);
+  }
+  for (const auto& a : c.args) params_in(a, n);
+}
+
 auto param_count(const ast::Statement& stmt) -> std::uint32_t {
   std::uint32_t n = 0;
   auto conjuncts = [&](const std::vector<ast::Compare>& cs) {
-    for (const auto& c : cs) {
-      params_in(c.lhs, n);
-      params_in(c.rhs, n);
-    }
+    for (const auto& c : cs) params_in(c, n);
   };
   std::visit(
       [&](const auto& s) {
@@ -1153,8 +1159,57 @@ public:
 
   auto where(const Table& t, const std::vector<ast::Compare>& in) -> std::vector<logical::Expr> {
     std::vector<logical::Expr> out;
-    for (const auto& w : in) out.push_back(compare(w, [&](const ast::Expr& e) { return std::pair{t.id, column(t, e)}; }));
+    for (const auto* w : top_level(in)) {
+      out.push_back(predicate(*w, [&](const ast::Expr& e) { return std::pair{t.id, column(t, e)}; }));
+    }
     return out;
+  }
+
+  // The conjuncts, each AND among them (a BETWEEN's) taken apart, so a key
+  // may take each comparison.
+  static auto top_level(const std::vector<ast::Compare>& in) -> std::vector<const ast::Compare*> {
+    std::vector<const ast::Compare*> out;
+    std::function<void(const ast::Compare&)> add = [&](const ast::Compare& c) {
+      if (c.kind != ast::Compare::Kind::And) {
+        out.push_back(&c);
+        return;
+      }
+      for (const auto& a : c.args) add(a);
+    };
+    for (const auto& c : in) add(c);
+    return out;
+  }
+
+  // A conjunct: a comparison, or a predicate's tree, each comparison in it
+  // bound as a WHERE's is and IS NULL of a column (docs/frontend_design.md,
+  // *WHERE*). In a tree, $n ± k is not taken yet.
+  auto predicate(const ast::Compare& w, const auto& resolve) -> logical::Expr {
+    using K = ast::Compare::Kind;
+    auto tree = [&](logical::Expr::Kind kind) {
+      auto e = logical::expr(kind, SqlType{SqlKind::Boolean});
+      for (const auto& a : w.args) {
+        auto computed = [](const ast::Expr& x) { return x.kind == ast::Expr::Kind::Add || x.kind == ast::Expr::Kind::Sub; };
+        if (a.kind == K::Compare && ((computed(a.lhs) && !is_constant(a.lhs)) || (computed(a.rhs) && !is_constant(a.rhs)))) {
+          not_yet("$n + k and $n - k inside AND, OR or NOT", a.pos);
+        }
+        e.args.push_back(predicate(a, resolve));
+      }
+      return e;
+    };
+    switch (w.kind) {
+      case K::Compare: return compare(w, resolve);
+      case K::IsNull: {
+        if (w.lhs.kind != ast::Expr::Kind::Column) not_yet("IS NULL of other than a column", w.pos);
+        auto [table, c] = resolve(w.lhs);
+        auto e = logical::expr(logical::Expr::Kind::IsNull, SqlType{SqlKind::Boolean});
+        e.args.push_back(logical::column_of(table, *c));
+        return e;
+      }
+      case K::And: return tree(logical::Expr::Kind::And);
+      case K::Or: return tree(logical::Expr::Kind::Or);
+      case K::Not: return tree(logical::Expr::Kind::Not);
+    }
+    std::unreachable();
   }
 
   // A comparison's operand other than a column: a parameter, or $n ± an
@@ -1231,12 +1286,14 @@ public:
   // a parameter, or a column of each, in WHERE order.
   auto where(const Table* (&sides)[2], const std::vector<ast::Compare>& in) -> std::vector<logical::Expr> {
     std::vector<logical::Expr> out;
-    for (const auto& w : in) {
-      if (w.lhs.kind == ast::Expr::Kind::Column && w.rhs.kind == ast::Expr::Kind::Column) {
+    for (const auto* c : top_level(in)) {
+      const auto& w = *c;
+      if (w.kind == ast::Compare::Kind::Compare && w.lhs.kind == ast::Expr::Kind::Column &&
+          w.rhs.kind == ast::Expr::Kind::Column) {
         out.push_back(join_on(sides, w));
         continue;
       }
-      out.push_back(compare(w, [&](const ast::Expr& e) {
+      out.push_back(predicate(w, [&](const ast::Expr& e) {
         auto [side, col] = column(sides, e);
         return std::pair{sides[side]->id, col};
       }));
@@ -1450,6 +1507,7 @@ public:
   // BIGINT is (compared_type), MIN's and MAX's their column's. HAVING on AVG
   // is not supported: its quotient is no type the plan holds.
   auto having_conjunct(const ast::Compare& w, const auto& resolve, const auto& grouped) -> logical::Expr {
+    if (w.kind != ast::Compare::Kind::Compare) not_yet("HAVING with AND, OR, NOT, IS NULL, <>, BETWEEN or IN", w.pos);
     const auto* lhs = &w.lhs;
     const auto* rhs = &w.rhs;
     auto op = w.op;
