@@ -3283,6 +3283,8 @@ the reason.
 from an observed history and reports the cycles; *Isolation checking*
 uses it as published.
 
+### Prior Art references
+
 1. M. Utting, A. Pretschner, B. Legeard. *A taxonomy of model-based
    testing approaches.* Software Testing, Verification and Reliability
    22(5), 2012.
