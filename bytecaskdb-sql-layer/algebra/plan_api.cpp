@@ -3991,6 +3991,23 @@ bc_view bc_row_end(bc_ctx* cx, bc_row r) {
   return {};
 }
 
+bc_view bc_null_row(bc_ctx* cx, uint32_t table) {
+  BC_GUARD_BEGIN
+  const auto* t = cx->table(table);
+  if (t == nullptr) return {};
+  // A writer given nothing: every column NULL, no default and no row id, as
+  // bc_row_begin would give. Not a row any write takes: a NOT NULL column's
+  // NULL is checked only by bc_row_end.
+  Bytes row;
+  if (!RowWriter{t->layout}.finish(row)) {
+    cx->fail(BC_E_LIMIT, "row over the engine's value limit");
+    return {};
+  }
+  return cx->arena_view(row, table, RowKind::Built);
+  BC_GUARD_END(cx)
+  return {};
+}
+
 bc_view bc_pin(bc_ctx* cx, bc_view v) {
   BC_GUARD_BEGIN
   auto b = cx->resolve(v);

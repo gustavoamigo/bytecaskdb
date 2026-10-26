@@ -52,7 +52,13 @@ kind the transformer doesn't take is refused with its position.
   share) compare their columns by `=`, as `ON` would, and name each alone
   as one column, the left table's, equal to the right's in every pair; the
   `USING` alias qualifies those columns only. A name missing from a side is
-  42703, one named twice 42701, as in PostgreSQL. Without `FROM`, a
+  42703, one named twice 42701, as in PostgreSQL. `LEFT [OUTER] JOIN` and
+  `RIGHT [OUTER] JOIN` take each of these forms: every row of the preserved
+  table, joined to each row of the other that `ON` matches, or to a row of
+  NULLs where it matches none. `ON` decides the pairs and `WHERE` filters
+  the joined rows, so `WHERE r.k IS NULL` keeps the rows nothing matched; a
+  `USING` column named alone is the preserved table's. `FULL JOIN` is
+  refused. Without `FROM`, a
   `SELECT` of constants returns one row of them, or none under `LIMIT 0`;
   it takes no `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` or `FOR UPDATE`
   yet.
@@ -186,7 +192,8 @@ That includes:
 - `DISTINCT ON`, `DISTINCT` of a constant or over groups it does not select
   every key of, `GROUP BY` of an expression, and `HAVING` of anything but
   the comparisons above;
-- outer joins, three or more tables, table aliases;
+- `FULL JOIN`, an outer join's `ON` comparing an expression of columns,
+  three or more tables, table aliases;
 - `OFFSET`, `RETURNING`, multi-row `VALUES`;
 - `*`, `/`, string concatenation and functions;
 - a cast of anything but a string literal or `NULL`, a numeric literal of
@@ -237,9 +244,10 @@ recompile after a DDL folds them again, to the types they meet then.
   scale (`2.5` stores 3), a number or a boolean assigned to a string column
   is its text (`2.2E-2` stores `0.022`), a REAL is read once as a float.
   A type PostgreSQL does not assign is 42804. The value's range is checked
-  where the row is written, in column order, as an assigned parameter's
-  is; an `UPDATE`'s constant is checked when the statement is compiled, as
-  PostgreSQL checks it when it plans it, whether or not a row matches.
+  when the statement is compiled, as PostgreSQL checks it when it plans
+  it, whether or not a row is written; of several out of range, the first
+  in the statement's order is the error, as there (a too-long string
+  before a later column's numeric overflow).
 - **Compared** (`WHERE`, `HAVING`): only a constant the column's type holds
   exactly. `smallint_col = 7.0` is `= 7`; `smallint_col = 40000`,
   `dec2_col = 1.005` and `real_col = 0.1` are refused (*Known differences*).

@@ -389,6 +389,12 @@ TEST_CASE("physical: a hash join holds the row of its build side's one loop, key
   refused(plan(hash(node(scan({p(0)}, {})), u_scan(), {{t_v, t_v}})), "outside the probe side");
   refused(plan(hash(node(scan({p(0)}, {})), u_scan(), {{t_v, u_b}})), "of two types");
   refused(plan(hash(node(scan({p(0)}, {})), u_scan(), {{kD, u_d}})), "on a DOUBLE column");
+  // A left outer loop's inner side reads rows: its row of NULLs is not an entry.
+  auto outer_loop = [&](bool covering) {
+    return emit(node(physical::NestedLoop{node(scan({p(0)}, {})), u_scan(covering), true, {}}), {kId, u_v});
+  };
+  CHECK(refusal(plan(outer_loop(false))).empty());
+  refused(plan(outer_loop(true)), "a left outer nested loop whose inner scan covers");
   // One table read once per row of the other, as a build side: two loops.
   auto twice = node(physical::NestedLoop{node(scan({p(0)}, {})), u_scan()});
   refused(plan(hash(std::move(twice), u_scan(), {{t_v, u_v}})), "not one loop");

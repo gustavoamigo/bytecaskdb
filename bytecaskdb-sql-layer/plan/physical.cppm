@@ -136,10 +136,15 @@ using NodePtr = std::unique_ptr<Node>;
 // An index nested loop: for each outer row, the inner table's row named by
 // its whole primary key, each part a parameter or a column of the outer row.
 // An outer row whose key column is NULL, or with no inner row, joins nothing.
+// Left outer: it joins the inner row where there is one and every conjunct
+// of `match` holds of the pair, and else a row of the inner table's NULLs
+// (bc_null_row); a NULL key part, parameter or column, matches no row.
 struct IndexJoin {
   NodePtr outer;
   std::uint32_t inner{0};
   std::vector<Expr> inner_key;  // in the inner primary key's order
+  bool left_outer{false};
+  std::vector<Expr> match;  // left outer: the conjuncts that make a pair; empty otherwise
 };
 
 // A nested loop whose inner side reads parameters alone: for each outer row,
@@ -147,9 +152,15 @@ struct IndexJoin {
 // join's, which compare its columns with the outer side's. Under an outer
 // side of at most one row (a point lookup and lookups by key) the inner
 // side is read at most once; under any other, once per outer row.
+// Left outer: an outer row the inner side gives no row for, its filters
+// the join's ON, is joined once to the inner table's NULLs (bc_null_row);
+// where a parameter of `guard` is NULL the inner side gives none, as an
+// inner join's plan checks before it reads anything.
 struct NestedLoop {
   NodePtr outer;
   NodePtr inner;
+  bool left_outer{false};
+  std::vector<std::uint32_t> guard;  // left outer: the inner side's compared parameters
 };
 
 // One part of a hash join's key: a column of the build side's table and the
@@ -496,6 +507,7 @@ private:
   void null_checked(const Expr& e) const {
     if (e.kind != Expr::Kind::Param) return;
     param(e.param);
+    if (std::ranges::contains(guarded_, e.param)) return;  // an outer join's inner side guards it
     if (std::ranges::find(p_.null_checks, e.param) == p_.null_checks.end()) {
       broken("a compared parameter the plan does not check for NULL");
     }
@@ -763,12 +775,16 @@ private:
   // The inner side of a nested loop, one of its plans: a scan under filters
   // that each compare a column of the scan's table, read from its row, with
   // a parameter or a column of the outer side.
-  static void inner_side(const Node& inner, const std::vector<std::uint32_t>& outer) {
+  // `left_outer`: the join's ON may also compare the outer side's columns
+  // alone, which decides the pairs.
+  static void inner_side(const Node& inner, const std::vector<std::uint32_t>& outer, bool left_outer) {
     const auto* sc = scan_below(inner);
     if (sc == nullptr || std::holds_alternative<Sort>(inner.op)) broken("a nested loop whose inner side is not a scan");
+    auto of_outer = [&](const Expr& e) { return e.kind == Expr::Kind::Column && std::ranges::contains(outer, e.col.table); };
     for (const auto* in = &inner; const auto* f = std::get_if<Filter>(&in->op); in = f->input.get()) {
       for (const auto& c : f->conjuncts) {
         if (c.kind != Expr::Kind::Compare) continue;
+        if (left_outer && of_outer(c.args[0]) && (c.args[1].kind != Expr::Kind::Column || of_outer(c.args[1]))) continue;
         if (c.args[0].kind != Expr::Kind::Column || c.args[0].col.table != sc->table) {
           broken("a nested loop whose inner filter compares a column outside its inner side");
         }
@@ -851,10 +867,28 @@ private:
             }
           } else if constexpr (std::is_same_v<T, IndexJoin>) {
             if (op.inner_key.empty()) broken("a join whose inner key has no part");
+            if (!op.left_outer && !op.match.empty()) broken("an inner index join with match conjuncts");
             for (const auto& e : op.inner_key) {
-              null_checked(e);
+              if (op.left_outer) {
+                params(e);  // a NULL part matches nothing: codegen does not probe
+              } else {
+                null_checked(e);
+              }
               reads(e);
               if (e.kind == Expr::Kind::Column) held_above(*op.outer, e.col);
+            }
+            // Left outer: its ON, the pair's, as a filter's conjuncts are.
+            for (const auto& c : op.match) {
+              if (logical::is_predicate(c)) {
+                predicate(c);
+                continue;
+              }
+              if (c.kind != Expr::Kind::Compare) continue;
+              if (c.args[0].kind == Expr::Kind::Column && c.args[0].col.type == PhysType::F64) {
+                broken("a match conjunct on a DOUBLE column");
+              }
+              operand(c.args[1], c.args[0].col.table);
+              reads(c);
             }
             node(*op.outer, &n);
           } else if constexpr (std::is_same_v<T, NestedLoop>) {
@@ -865,9 +899,21 @@ private:
               if (std::holds_alternative<Choice>(op.inner->op)) broken("a choice point read once per outer row");
               outer = tables_of(*op.outer);
             }
-            for (const auto* b : branches(*op.inner)) inner_side(*b, *outer);
+            for (const auto* b : branches(*op.inner)) inner_side(*b, *outer, op.left_outer);
+            // Left outer: its row of NULLs is a row, so the inner side reads rows.
+            for (const auto* b : branches(*op.inner)) {
+              if (const auto* sc = scan_below(*b); op.left_outer && sc != nullptr && sc->covering) {
+                broken("a left outer nested loop whose inner scan covers");
+              }
+            }
+            if (!op.left_outer && !op.guard.empty()) broken("an inner nested loop with a guard");
             node(*op.outer, &n);
+            // Left outer: the inner side's parameters are its guard's.
+            auto before = guarded_.size();
+            guarded_.insert(guarded_.end(), op.guard.begin(), op.guard.end());
+            for (auto g : op.guard) param(g);
             node(*op.inner, &n);
+            guarded_.resize(before);
           } else if constexpr (std::is_same_v<T, HashJoin>) {
             if (op.keys.empty()) broken("a hash join with no key");
             // The hash table holds the row of the build side's one loop.
@@ -1099,6 +1145,9 @@ private:
   const Plan& p_;
   std::vector<const Choice*> second_;    // the choice points whose second plan is taken
   std::vector<std::uint32_t> covering_;  // every table a covering scan reads, in the branches taken
+  // The parameters an outer nested loop's guard checks, while its inner
+  // side is checked.
+  mutable std::vector<std::uint32_t> guarded_;
 };
 
 }  // namespace

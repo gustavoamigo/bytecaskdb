@@ -1,6 +1,7 @@
 # Plan API: a physical algebra for generated plans
 
-Status: **built**, revision 10 (revision 9 with `bc_like` and
+Status: **built**, revision 11 (revision 10 with `bc_null_row`, for outer
+joins; revision 9 with `bc_like` and
 `BC_E_PATTERN`, for `LIKE`; revision 8 with the sort-key builder,
 `bc_sort_key_*` (#579); revision 8 built the sorters, the hash tables and
 the aggregates' slots, `bc_sorter_open`'s `keep`, and `bc_agg_null`, and
@@ -806,6 +807,8 @@ void     bc_row_set_null(bc_ctx *, bc_row, uint32_t col);
 void     bc_row_set_param(bc_ctx *, bc_row, uint32_t col, uint32_t i);   /* parameter i, NULL included */
 bc_view  bc_row_end(bc_ctx *, bc_row);
 bc_view  bc_pin(bc_ctx *, bc_view);                 /* a copy that lives until reset */
+bc_view  bc_null_row(bc_ctx *, uint32_t table);     /* a row of the table's layout, every column NULL: an outer
+                                                       join's inner side where it matches nothing; lives until reset */
 ```
 
 | Function | What it does |
@@ -821,6 +824,7 @@ bc_view  bc_pin(bc_ctx *, bc_view);                 /* a copy that lives until r
 | `bc_row_set_param` | Sets column `col` to parameter `i`: its value, or null when it is NULL. One call where a nullable column took an `if` and two sets. A parameter whose type is not the column's is `BC_E_HANDLE`; one outside the column's declared type is `BC_C_RANGE`, as above. |
 | `bc_row_end` | Finalizes the row and returns its view, a built row of the builder's table. The row is held with its builder, the step's, and charged to the memory budget; a write copies it into the write set, and it is released with its step. A NOT NULL column that is null, set so or never set and with no default, is `BC_E_CONSTRAINT` with `BC_C_NOT_NULL` and the table's id: checked here, after every value set passed its range check, so a row holding both is `BC_C_RANGE`, as PostgreSQL reports it. A row over the engine's value limit is `BC_E_LIMIT`. |
 | `bc_pin` | Copies a view, charged, so it outlives its step and its cursor and lives until reset, keeping what it is: a pinned row is still a row of its table. The compiler emits it where a plan keeps a step's bytes across the next. |
+| `bc_null_row` | A row of the table, every column NULL, a key column and a NOT NULL one too: what an outer join's inner side reads where it matches no row. Charged, it lives until reset; no write takes it, as `bc_row_end` checks its NOT NULL columns. A table the schema ref does not declare is `BC_E_HANDLE`, as any read of one. |
 
 ### Ephemeral structures
 

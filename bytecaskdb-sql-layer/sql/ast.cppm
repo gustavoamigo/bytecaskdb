@@ -219,6 +219,10 @@ struct Select {
   std::vector<std::string> using_columns;
   bool natural{false};
   std::string using_alias;
+  // The join's kind: LEFT keeps every row of `table`, RIGHT every row of
+  // `join`, each joined to NULLs where no row of the other matches.
+  enum class JoinKind { Inner, Left, Right };
+  JoinKind join_kind{JoinKind::Inner};
 };
 
 struct Assignment {
