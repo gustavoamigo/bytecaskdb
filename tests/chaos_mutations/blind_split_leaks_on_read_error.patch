@@ -1,0 +1,44 @@
+A blind leaf split allocates its two halves before it reads the separator
+key from the data file, so a read error there (EIO) leaks both leaves.
+Reverts #652's fix.
+Disable: power,sigkill
+Expected: NOT caught: the mutation check runs the release worker without
+LeakSanitizer, and a leaked node changes no result the rig compares. The
+nightly ASan isolation chaos run found it (run 40269378565); the unit test
+below catches it.
+Guarded-by: "blind tree: a read that fails during a write leaks no node"
+
+diff --git a/bytecaskdb/blind_btree.cppm b/bytecaskdb/blind_btree.cppm
+index 16ed503..f5fd1c0 100644
+--- a/bytecaskdb/blind_btree.cppm
++++ b/bytecaskdb/blind_btree.cppm
+@@ -716,15 +716,6 @@ private:
+       m = 1;
+     m = std::clamp<std::uint32_t>(m, 1, total - 1);
+ 
+-    // The separator read can throw (a read error) and so can its copy: both
+-    // run before the leaves are allocated, so a failure leaks neither.
+-    const auto cut = std::size_t{meta[m] >> 12 >> kPosShift} + 1;
+-    const Bytes first_right =
+-        m == p.idx ? key : res.key_at(L::ref_of(loc[m]));
+-    assert(cut <= first_right.size());
+-    sep_.assign(first_right.begin(),
+-                first_right.begin() + static_cast<std::ptrdiff_t>(cut));
+-
+     auto *left = L::allocate(tag_);
+     L::copy(L::arrays(left), 0, tmp, 0, m);
+     left->count = m;
+@@ -738,6 +729,13 @@ private:
+       left->last_pos = static_cast<std::uint16_t>(p.idx);
+     else
+       right->last_pos = static_cast<std::uint16_t>(p.idx - m);
++
++    const auto cut = std::size_t{meta[m] >> 12 >> kPosShift} + 1;
++    const Bytes first_right =
++        m == p.idx ? key : res.key_at(L::ref_of(loc[m]));
++    assert(cut <= first_right.size());
++    sep_.assign(first_right.begin(),
++                first_right.begin() + static_cast<std::ptrdiff_t>(cut));
+     discard(leaf);
+     return {left, right, true, true};
+   }
