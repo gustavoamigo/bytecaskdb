@@ -576,7 +576,7 @@ int main(int argc, char** argv) {
       if (max_connections == 0) throw std::invalid_argument("--max-connections takes a positive number");
     }
     auto cpus = available_cpus();
-    std::size_t workers = std::max<std::size_t>(48, 2 * cpus.size());
+    std::size_t workers = std::max<std::size_t>(4, 4 * cpus.size());
     if (f.contains("workers")) {
       number("workers", f["workers"], "a positive number", workers);
       if (workers == 0) throw std::invalid_argument("--workers takes a positive number");

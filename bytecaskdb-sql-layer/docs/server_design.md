@@ -165,8 +165,8 @@ things, each with one owner:
   message framing (`Framer`), owned by the libuv event loop.
 - **Session**: a plain data structure holding the protocol's and SQL's state,
   with no thread and no lock, owned by whichever worker is running it.
-- **Worker**: a thread in a fixed pool (`--workers`, by default twice the
-  cores, minimum 2).
+- **Worker**: a thread in a fixed pool (`--workers`, by default four times the
+  cores, minimum 4).
 
 The loop cuts complete messages from a connection's input buffer, appends them
 to the session's queue, and schedules an idle session onto the worker pool. A

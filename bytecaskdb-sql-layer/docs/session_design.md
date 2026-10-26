@@ -196,8 +196,8 @@ one that takes no bytes for ten seconds is dropped. Then the server calls
 None of them waits. A bound past its limit refuses, with the SQLSTATE
 PostgreSQL uses.
 - **Sessions.** `--max-connections`, as today: `FATAL 53300` past it.
-- **Workers.** A fixed pool (`--workers`, by default twice the cores,
-  minimum 2; *Decisions*, 6).
+- **Workers.** A fixed pool (`--workers`, by default four times the cores,
+  minimum 4; *Decisions*, 6).
 - **A session's input.** At most 64 MiB of unrun messages. Past it, the loop
   stops reading the socket until the session catches up. This is TCP
   backpressure, not an error.
@@ -324,9 +324,13 @@ The owner's, in the discussions of 2026-10-24 and 2026-10-25:
    callbacks rather than coroutines.
 5. No TLS and no authentication in the server: a terminating proxy in front
    owns both, and the server listens on loopback and trusts it.
-6. The worker pool's size is twice the cores by default (minimum 2) and
-   configurable (`--workers`), measured on the 48-user gate under
-   `AT_EVERY_COMMIT` before the default is locked.
+6. The worker pool's size is four times the cores by default (minimum 4) and
+   configurable (`--workers`): a worker waits on `fdatasync` under
+   `AT_EVERY_COMMIT`, and waits for the client's next statement between the
+   statements of an active burst, so the pool is larger than the cores.
+   Measured on the 48-user gate (48 warehouses, 2 + 5 min): `AT_EVERY_COMMIT`
+   57,109 NOPM against 39,530 with 48 workers, and `AT_INTERVAL` (1,000 ms)
+   150,208 NOPM at 48 users and 146,169 at 16.
 7. A global memory cap (`--max-memory-bytes`, by default half the machine's
    RAM) bounds the bytes every session's transaction buffers and statement
    budgets hold; passing it fails with `53200` (`out_of_memory`) and never
