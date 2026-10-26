@@ -13,6 +13,7 @@
 module;
 #include <charconv>
 #include <cstddef>
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -44,7 +45,9 @@ namespace bytecask::sql::ast {
 
 namespace {
 
-[[noreturn]] void reject(const std::string& what, std::int32_t pos) { throw SqlError{what, pos}; }
+[[noreturn]] void reject(const std::string& what, std::int32_t pos, SqlState state = kSyntaxError) {
+  throw SqlError{what, pos, state};
+}
 
 // protobuf-c gives an absent string field as "", never as NULL.
 auto empty(const char* s) -> bool { return s == nullptr || s[0] == '\0'; }
@@ -54,13 +57,26 @@ auto str(const PgQuery__Node* n) -> std::string {
   return n->string->sval;
 }
 
-auto relation(const PgQuery__RangeVar* rv) -> std::string {
+// A FROM item's table; its alias, if any, is read by select().
+auto from_relation(const PgQuery__RangeVar* rv) -> std::string {
   if (rv == nullptr) reject("expected a table", -1);
   if (!empty(rv->schemaname)) {
     reject("schema-qualified names are not supported", rv->location);
   }
-  if (rv->alias != nullptr) reject("table aliases are not supported", rv->location);
   return rv->relname;
+}
+
+auto relation(const PgQuery__RangeVar* rv) -> std::string {
+  auto name = from_relation(rv);
+  if (rv->alias != nullptr) reject("table aliases are not supported", rv->location);
+  return name;
+}
+
+// A FROM item's alias: "" for none. A column list (t AS x (a, b)) is refused.
+auto table_alias(const PgQuery__RangeVar* rv) -> std::string {
+  if (rv->alias == nullptr) return "";
+  if (rv->alias->n_colnames != 0) reject("column aliases of a table are not supported", rv->location);
+  return rv->alias->aliasname;
 }
 
 auto expr(const PgQuery__Node* n) -> Expr;
@@ -616,6 +632,71 @@ auto limit(const PgQuery__SelectStmt* s) -> std::optional<std::int64_t> {
   return v;
 }
 
+// Table aliases: a qualifier naming an alias is rewritten to its table, and
+// one naming an aliased table by its own name is refused, as the alias hides
+// it (42P01). An ORDER BY name that is a select-list item's AS name, and no
+// qualified one, orders by that item's column, as PostgreSQL resolves it
+// before the tables' columns. A subquery resolves its own.
+void requalify(Expr& e, const std::vector<std::string>& tables, const std::vector<std::string>& aliases) {
+  if (!e.table.empty()) {
+    for (std::size_t i = 0; i < aliases.size(); ++i) {
+      if (!aliases[i].empty() && e.table == aliases[i]) {
+        e.table = tables[i];
+        break;
+      }
+      if (!aliases[i].empty() && e.table == tables[i] && !std::ranges::contains(aliases, e.table)) {
+        reject("invalid reference to FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable);
+      }
+    }
+  }
+  if (e.lhs) requalify(*e.lhs, tables, aliases);
+  if (e.rhs) requalify(*e.rhs, tables, aliases);
+}
+
+void requalify(Compare& c, const std::vector<std::string>& tables, const std::vector<std::string>& aliases) {
+  requalify(c.lhs, tables, aliases);
+  requalify(c.rhs, tables, aliases);
+  for (auto& a : c.args) requalify(a, tables, aliases);
+}
+
+void resolve_aliases(Select& sel, const std::vector<std::string>& aliases) {
+  std::vector<std::string> tables{sel.table};
+  if (!sel.join.empty()) tables.push_back(sel.join);
+  for (std::size_t i = 0; i < aliases.size(); ++i) {
+    for (std::size_t j = 0; j < i; ++j) {
+      auto name = [&](std::size_t k) { return aliases[k].empty() ? tables[k] : aliases[k]; };
+      if (name(i) == name(j) && !(aliases[i].empty() && aliases[j].empty())) {
+        reject("table name \"" + name(i) + "\" specified more than once", i == 0 ? sel.table_pos : sel.join_pos,
+             kDuplicateAlias);
+      }
+    }
+  }
+  for (auto& o : sel.order_by) {
+    if (!o.table.empty()) continue;
+    const Expr* hit = nullptr;
+    for (const auto& t : sel.targets) {
+      if (t.alias != o.column) continue;
+      if (hit != nullptr) reject("ORDER BY \"" + o.column + "\" is ambiguous", o.pos);
+      hit = &t;
+    }
+    if (hit != nullptr && hit->kind == Expr::Kind::Column) {
+      o.column = hit->column;
+      o.table = hit->table;
+    }
+  }
+  if (std::ranges::all_of(aliases, [](const std::string& a) { return a.empty(); })) return;
+  for (auto& e : sel.targets) requalify(e, tables, aliases);
+  for (auto& c : sel.where) requalify(c, tables, aliases);
+  for (auto& c : sel.having) requalify(c, tables, aliases);
+  for (auto& e : sel.group_by) requalify(e, tables, aliases);
+  for (auto& o : sel.order_by) {
+    Expr e{Expr::Kind::Column, o.column, 0, nullptr, nullptr, o.pos};
+    e.table = o.table;
+    requalify(e, tables, aliases);
+    o.table = e.table;
+  }
+}
+
 auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   if (s->op != PG_QUERY__SET_OPERATION__SETOP_NONE) reject("set operations are not supported", pos);
   // No table, one, or two: FROM a, b, or a [INNER] JOIN b ON …, whose ON
@@ -667,8 +748,10 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
       s->n_window_clause != 0 || s->into_clause != nullptr) {
     reject("SELECT clause not supported", pos);
   }
-  Select sel{{}, tables.empty() ? "" : relation(tables[0]), tables.size() == 2 ? relation(tables[1]) : "", {}, {}, limit(s),
-             pos, false};
+  Select sel{{}, tables.empty() ? "" : from_relation(tables[0]), tables.size() == 2 ? from_relation(tables[1]) : "", {}, {},
+             limit(s), pos, false};
+  std::vector<std::string> aliases;  // each table's alias, "" for none
+  for (const auto* t : tables) aliases.push_back(table_alias(t));
   sel.distinct = distinct;
   sel.using_columns = std::move(using_columns);
   sel.natural = natural;
@@ -703,8 +786,8 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   }
   for (std::size_t i = 0; i < s->n_target_list; ++i) {
     const auto* rt = s->target_list[i]->res_target;
-    if (!empty(rt->name)) reject("column aliases are not supported", rt->location);
     sel.targets.push_back(expr(rt->val));
+    if (!empty(rt->name)) sel.targets.back().alias = rt->name;
   }
   where(on, sel.where, "ON", sel.join_pos);
   where(s->where_clause, sel.where);
@@ -715,6 +798,7 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
     sel.group_by.push_back(expr(g));
   }
   where(s->having_clause, sel.having, "HAVING", pos);
+  resolve_aliases(sel, aliases);
   return sel;
 }
 
