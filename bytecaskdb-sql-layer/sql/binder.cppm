@@ -631,7 +631,7 @@ auto compare_constants(Constant x, Constant y, ast::ValueCompare op, std::int32_
 // NULL of the type. A cast of anything else, and to VARCHAR(n), which
 // PostgreSQL's cast truncates, are not taken yet.
 auto cast_constant(const ast::Expr& e, const Constant& arg) -> Constant {
-  auto t = sql_type(ast::ColumnDefAst{"", e.cast_type, e.cast_typmods, false, false, std::nullopt, e.pos});
+  auto t = sql_type(ast::ColumnDefAst{"", e.cast_type, e.cast_typmods, false, false, std::nullopt, e.pos, {}});
   if (t.kind == SqlKind::Varchar) not_yet("a cast to VARCHAR(n)", e.pos);
   if (!arg.unknown) not_yet("a cast of other than a string literal or NULL", e.pos);
   if (std::holds_alternative<std::monostate>(arg.value)) return {std::monostate{}, t, false, {}, e.pos};
@@ -1284,8 +1284,34 @@ public:
     };
     auto aggregated = !s.group_by.empty() || !s.having.empty() ||
                       std::ranges::any_of(s.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Aggregate; });
+    // DISTINCT is a GROUP BY of the selected columns. Over a query already
+    // aggregated it is nothing more where every grouped column is
+    // selected, each group then one row; else not yet. Checked in
+    // PostgreSQL's order.
+    auto distinct_groups = s.distinct && !aggregated;
+    if (s.distinct) {
+      if (s.for_update) throw SqlError{"FOR UPDATE is not allowed with DISTINCT clause", s.pos, kFeatureNotSupported};
+      auto selected = [&](const ast::Expr& e) {
+        auto ref = resolve(e);
+        return std::ranges::any_of(s.targets, [&](const ast::Expr& t) { return t.kind == ast::Expr::Kind::Column && resolve(t) == ref; });
+      };
+      for (const auto& o : s.order_by) {
+        if (!selected(column_ref(o))) {
+          throw SqlError{"for SELECT DISTINCT, ORDER BY expressions must appear in select list", o.pos,
+                         kInvalidColumnReference};
+        }
+      }
+      if (aggregated && !std::ranges::all_of(s.group_by, selected)) {
+        not_yet("SELECT DISTINCT of groups it does not select every GROUP BY column of", s.pos);
+      }
+      for (const auto& e : s.targets) {
+        if (distinct_groups && e.kind != ast::Expr::Kind::Column) not_yet("SELECT DISTINCT of other than columns", e.pos);
+      }
+    }
+    aggregated = aggregated || distinct_groups;
+    auto grouping = !s.group_by.empty() || distinct_groups;
     std::vector<logical::Expr> group_by;
-    for (const auto& e : s.group_by) {
+    for (const auto& e : distinct_groups ? s.targets : s.group_by) {
       auto [t, c] = resolve(e);
       auto g = logical::column_of(t->id, *c);
       if (std::ranges::find(group_by, g) == group_by.end()) group_by.push_back(std::move(g));
@@ -1296,7 +1322,7 @@ public:
     auto grouped = [&](const Table& t, const Column& c, std::int32_t pos) -> logical::Expr {
       auto g = logical::column_of(t.id, c);
       if (std::ranges::find(group_by, g) != group_by.end()) return g;
-      auto by_key = !s.group_by.empty() && std::ranges::all_of(t.pk_col_ids, [&](std::uint32_t id) {
+      auto by_key = grouping && std::ranges::all_of(t.pk_col_ids, [&](std::uint32_t id) {
         return std::ranges::find(group_by, logical::column_of(t.id, *t.column(id))) != group_by.end();
       });
       if (!by_key) ungrouped(t, c.name, pos);
@@ -1342,7 +1368,7 @@ public:
                        : logical::node(logical::Get{sides[0], s.for_update});
     if (!conjuncts.empty()) rows = logical::node(logical::Filter{std::move(rows), std::move(conjuncts)});
     if (aggregated) {
-      rows = logical::node(logical::Aggregate{std::move(rows), std::move(targets), std::move(group_by), !s.group_by.empty(),
+      rows = logical::node(logical::Aggregate{std::move(rows), std::move(targets), std::move(group_by), grouping,
                                               std::move(dependent)});
       if (!having.empty()) rows = logical::node(logical::Filter{std::move(rows), std::move(having)});
       if (!keys.empty()) rows = logical::node(logical::Sort{std::move(rows), std::move(keys)});

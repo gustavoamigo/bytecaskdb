@@ -188,6 +188,7 @@ struct Select {
   std::int32_t table_pos{-1}, join_pos{-1};  // where table and join are named
   std::vector<Expr> group_by;  // GROUP BY's columns, as written
   std::vector<Compare> having;  // HAVING's conjuncts
+  bool distinct{false};         // SELECT DISTINCT, not DISTINCT ON
 };
 
 struct Assignment {

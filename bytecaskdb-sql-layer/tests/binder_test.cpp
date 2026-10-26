@@ -374,6 +374,39 @@ TEST_CASE("binder: comparisons of constants fold to a BOOLEAN; a string literal 
         "a timestamp without time zone constant assigned to a date column is not supported yet");
 }
 
+TEST_CASE("binder: SELECT DISTINCT is a GROUP BY of the selected columns", "[sql][binder]") {
+  sql_test::Fixture f;
+  const auto& cat = f.cat();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return "bound";
+  };
+  auto b = bind_sql(cat, "SELECT DISTINCT qty, name FROM t WHERE id > $1 ORDER BY name LIMIT 3");
+  const auto& agg = get<logical::Aggregate>(b);
+  CHECK(agg.grouped);
+  REQUIRE(agg.group_by.size() == 2);
+  CHECK(agg.group_by[0].col.col == f.cat().table("t")->column("qty")->id);
+  CHECK(agg.group_by[1].col.col == f.cat().table("t")->column("name")->id);
+  CHECK(agg.aggs.size() == 2);
+  CHECK(find<logical::Sort>(root(b)) != nullptr);
+  CHECK(find<logical::Limit>(root(b)) != nullptr);
+  // Over a query already grouped by what it selects: nothing more.
+  auto grouped = bind_sql(cat, "SELECT DISTINCT qty, COUNT(*) FROM t GROUP BY qty");
+  CHECK(get<logical::Aggregate>(grouped).group_by.size() == 1);
+  CHECK(state("SELECT DISTINCT COUNT(*) FROM t") == "bound");
+  // PostgreSQL's refusals, in its order, and what is not yet.
+  CHECK(state("SELECT DISTINCT qty FROM t ORDER BY name") == "42P10");
+  CHECK(state("SELECT DISTINCT qty FROM t FOR UPDATE") == "0A000");
+  CHECK(rejected(cat, "SELECT DISTINCT COUNT(*) FROM t GROUP BY qty").first ==
+        "SELECT DISTINCT of groups it does not select every GROUP BY column of is not supported yet");
+  CHECK(rejected(cat, "SELECT DISTINCT qty, 5 FROM t").first == "SELECT DISTINCT of other than columns is not supported yet");
+  CHECK(rejected(cat, "SELECT DISTINCT ON (qty) qty FROM t").first == "DISTINCT ON is not supported");
+}
+
 TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][binder][catalog]") {
   sql_test::Fixture f;
   const auto& cat = f.cat();
