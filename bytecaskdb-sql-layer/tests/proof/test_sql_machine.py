@@ -79,6 +79,7 @@ import tempfile
 
 import bytecask_sql
 import hypothesis.strategies as st
+import psycopg
 import pytest
 from hypothesis import note
 from hypothesis.control import currently_in_test_context
@@ -2040,6 +2041,38 @@ def test_left_and_right_join_null_extend_the_rows_nothing_matches(dsn):
                     "SELECT t1.c1, COUNT(*) FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 GROUP BY t1.c1 ORDER BY t1.c1"):
             assert m.both(sql).error is None
         m.check()
+    finally:
+        m.teardown()
+
+
+def test_a_foreign_key_is_checked_when_created_and_not_enforced(dsn):
+    """REFERENCES and FOREIGN KEY: created where PostgreSQL creates them,
+    refused with its SQLSTATE where it refuses them; then not enforced, a
+    row the parent does not hold written (frontend_design.md, *Known
+    differences*)."""
+    m = fixed(dsn)
+    try:
+        assert m.both("CREATE TABLE p (k INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL, UNIQUE (a, b))").error is None
+        assert m.both("CREATE TABLE n (a INTEGER)").error is None
+        for sql in ("CREATE TABLE c (x BIGINT REFERENCES p (k))",
+                    "CREATE TABLE c (x SMALLINT CONSTRAINT cx REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT)",
+                    "CREATE TABLE c (x INT, y INT, FOREIGN KEY (x, y) REFERENCES p (b, a) ON UPDATE NO ACTION)",
+                    "CREATE TABLE c (id INT PRIMARY KEY, up INT REFERENCES c)"):
+            assert m.both(sql).error is None
+            assert m.both("DROP TABLE c").error is None
+        for sql, state in (("CREATE TABLE c (x INT REFERENCES p (a))", "42830"),
+                           ("CREATE TABLE c (x INT REFERENCES n)", "42704"),
+                           ("CREATE TABLE c (x INT REFERENCES nope)", "42P01"),
+                           ("CREATE TABLE c (x INT REFERENCES p (z))", "42703"),
+                           ("CREATE TABLE c (x INT, FOREIGN KEY (x) REFERENCES p (a, b))", "42830"),
+                           ("CREATE TABLE c (x TEXT REFERENCES p)", "42804")):
+            assert m.both(sql).error == state, sql
+        assert m.both("CREATE TABLE c (x INT REFERENCES p)").error is None
+        assert m.layer("INSERT INTO c VALUES (9)").error is None  # no p row 9: not enforced
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):  # 23503
+            m.pg.conn.execute("INSERT INTO c VALUES (9)")
+        for t in ("c", "n", "p"):
+            assert m.both(f"DROP TABLE {t}").error is None
     finally:
         m.teardown()
 

@@ -123,6 +123,18 @@ struct Compare {
   return out;
 }
 
+// A FOREIGN KEY constraint of CREATE TABLE, on a column (REFERENCES) or
+// on the table: its name, "" for none, its columns, and the table and
+// columns it references, none for that table's primary key. Checked
+// against the referenced table's keys, then not enforced.
+struct ForeignKeyAst {
+  std::string name;
+  std::vector<std::string> columns;
+  std::string table;
+  std::vector<std::string> ref_columns;
+  std::int32_t pos{-1};
+};
+
 struct ColumnDefAst {
   std::string name;
   std::string type;                    // libpg_query's last type name: int8, varchar, numeric, …
@@ -133,6 +145,7 @@ struct ColumnDefAst {
   std::int32_t pos{-1};
   // Each UNIQUE constraint on the column: its name, "" for none.
   std::vector<std::string> unique;
+  std::vector<ForeignKeyAst> references;  // each REFERENCES on the column
 };
 
 // A UNIQUE constraint of CREATE TABLE, on a column or on the table, in the
@@ -149,6 +162,7 @@ struct CreateTable {
   std::vector<std::string> pk;  // a table-level PRIMARY KEY (…)
   std::int32_t pos{-1};
   std::vector<UniqueAst> unique;  // every UNIQUE constraint, columns' and the table's, in order
+  std::vector<ForeignKeyAst> foreign_keys;  // every FOREIGN KEY, columns' and the table's, in order
 };
 
 struct IndexColumnAst {

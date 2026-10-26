@@ -21,18 +21,18 @@ How much of each suite the layer passes, from the functional suite's conformance
 
 | Suite | Coverage | Tests | Checks |
 |---|---|---|---|
-| SQL:2016 Core (sqltest) | 37% | 278/743 tests | statement accepted |
+| SQL:2016 Core (sqltest) | 43% | 318/743 tests | statement accepted |
 | PostgreSQL features | 69% | 118/172 cases | results |
 | ByteCaskDB features | 100% | 12/12 cases | results |
 | TPROC-C | 100% | 1/1 case: five transactions, then consistency conditions 1–9 | consistency conditions 1–9 |
 
-The suite is young: its cases are the first of the plan in `docs/functional_testing_design.md`, so a high percentage means few cases, not wide coverage. Most of the sqltest tests that fail stop at a role, a subquery, a foreign key, or a view.
+The suite is young: its cases are the first of the plan in `docs/functional_testing_design.md`, so a high percentage means few cases, not wide coverage. Most of the sqltest tests that fail stop at a role, a subquery, or a view.
 
 ## Current state
 
 Built and tested:
 
-- **Statements:** `CREATE TABLE`, with or without a primary key (a table without one keeps duplicate rows) and with `UNIQUE` constraints, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `ALTER TABLE … ADD COLUMN`; `INSERT` of one row; `SELECT`; `UPDATE` and `DELETE` of any number of rows; `BEGIN`/`COMMIT`/`ROLLBACK`.
+- **Statements:** `CREATE TABLE`, with or without a primary key (a table without one keeps duplicate rows) and with `UNIQUE` constraints and `REFERENCES` (checked when created, not enforced), `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `ALTER TABLE … ADD COLUMN`; `INSERT` of one row; `SELECT`; `UPDATE` and `DELETE` of any number of rows; `BEGIN`/`COMMIT`/`ROLLBACK`.
 - **Queries:** one table, or two joined by `ON`, `USING` or `NATURAL`, inner (index nested loop or hash) or `LEFT`/`RIGHT` outer (nested loop), or none (`SELECT` of constants); `WHERE` of comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `<>`, `[NOT] BETWEEN`, `[NOT] IN` of a list, `[NOT] LIKE`; `ORDER BY` with `NULLS FIRST`/`LAST`; `LIMIT`; `SELECT DISTINCT`; `GROUP BY` and `HAVING`; `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`; `FOR UPDATE` on one table. Full scans and sorts are served.
 - **Literals:** integers, numerics of up to 18 digits, strings, `TRUE`/`FALSE`, `NULL` and casts of strings (`DATE '…'`, `CAST('5' AS INTEGER)`), typed as PostgreSQL types them, in `VALUES`, `SET`, `WHERE`, `HAVING` and the select list; `+`, `-` and comparisons of them folded.
 - **Types:** `SMALLINT`, `INTEGER`, `BIGINT`, `REAL`, `DOUBLE PRECISION`, `BOOLEAN`, `TEXT`, `VARCHAR(n)`, `BYTEA`, `DECIMAL(p, s)` with p ≤ 18, `DATE`, `TIME`, `TIMESTAMP`.
@@ -46,7 +46,7 @@ Not built yet (each is refused, with a message):
 - `ILIKE`, `IN` of a subquery, `IS DISTINCT FROM`, a predicate over both tables of a join or in `HAVING`;
 - `OFFSET`, `RETURNING`, `ON CONFLICT`, multi-row `VALUES`, the `::` cast;
 - `SELECT *`, multiplication, division, modulo, unary minus of a column, `||`, string and date functions (`UPPER`, `LOWER`, `SUBSTRING`, `TRIM`, `POSITION`, `CHARACTER_LENGTH`, `EXTRACT`), `CAST` of anything but a string literal, `CURRENT_DATE`, date arithmetic; a numeric literal past 18 digits, and a constant compared with a column whose type does not hold it exactly (`smallint_col = 40000`);
-- a table of no columns, `CHECK` and `REFERENCES`, `UNIQUE NULLS NOT DISTINCT` or `INCLUDE`, views, `CREATE TABLE IF NOT EXISTS` (refused with 42P07), `TRUNCATE`, an `UPDATE` of a primary-key column;
+- a table of no columns, `CHECK`, enforcing a foreign key, `ON DELETE CASCADE` and the other actions, `UNIQUE NULLS NOT DISTINCT` or `INCLUDE`, views, `CREATE TABLE IF NOT EXISTS` (refused with 42P07), `TRUNCATE`, an `UPDATE` of a primary-key column;
 - `SELECT` without `FROM` but of constants, a constant beside an aggregate, `EXPLAIN`, `SAVEPOINT`, `SET TRANSACTION` and `BEGIN READ ONLY`, sequences, serializable and read-committed isolation, transactional DDL;
 - a comparison of two columns, `SUM`/`AVG` and comparison of a `DOUBLE PRECISION` column, a timestamp with a seventh fractional digit (PostgreSQL rounds it).
 
