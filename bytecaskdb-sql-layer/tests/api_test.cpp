@@ -1391,6 +1391,42 @@ TEST_CASE("embedded API: an uncorrelated subquery runs once, on the statement's 
   }
 }
 
+TEST_CASE("embedded API: table aliases qualify columns and hide the table's name; AS names the output",
+          "[sql][api]") {
+  sql_test::TempDir dir{"api_alias"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE g (id INTEGER PRIMARY KEY, v INTEGER)");
+  (void)db->execute("CREATE TABLE h (k INTEGER PRIMARY KEY, w INTEGER)");
+  for (auto [id, v] : {std::pair<std::int64_t, std::int64_t>{1, 30}, {2, 10}, {3, 20}}) {
+    (void)db->execute("INSERT INTO g VALUES ($1, $2)", {i(id), i(v)});
+  }
+  (void)db->execute("INSERT INTO h VALUES (1, 7)");
+  auto r = db->execute("SELECT x.id AS ident, v total FROM g AS x WHERE x.v > 10 ORDER BY total");
+  CHECK(r.columns == std::vector<std::string>{"ident", "total"});
+  CHECK(r.rows == Grid{{i(3), i(20)}, {i(1), i(30)}});
+  // ORDER BY an output name, over the input column of that name.
+  CHECK(db->execute("SELECT id AS v, v AS id FROM g ORDER BY v DESC").rows ==
+        Grid{{i(3), i(20)}, {i(2), i(10)}, {i(1), i(30)}});
+  CHECK(db->execute("SELECT x.id, y.w FROM g x JOIN h AS y ON x.id = y.k").rows == Grid{{i(1), i(7)}});
+  CHECK(db->execute("SELECT COUNT(*) AS n, MAX(x.v) m FROM g x").columns == std::vector<std::string>{"n", "m"});
+  CHECK(db->execute("SELECT 1 AS one").columns == std::vector<std::string>{"one"});
+  CHECK(db->execute("SELECT x.v FROM g x GROUP BY x.v ORDER BY x.v").rows == Grid{{i(10)}, {i(20)}, {i(30)}});
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+  CHECK(state("SELECT g.id FROM g x") == "42P01");  // the alias hides the table's name
+  CHECK(state("SELECT id FROM g x JOIN h x ON x.id = x.k") == "42712");
+  CHECK(state("SELECT x.id FROM g x") == "ran");
+  CHECK(state("SELECT x.id FROM g AS x (a, b)") == "42601");  // renaming columns is not supported
+}
+
 TEST_CASE("embedded API: a choice point's plan text shows both plans, and each returns the same rows",
           "[sql][api][search][choice]") {
   sql_test::TempDir dir{"api_choice"};

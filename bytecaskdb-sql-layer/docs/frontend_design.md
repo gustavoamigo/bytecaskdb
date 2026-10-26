@@ -66,7 +66,17 @@ kind the transformer doesn't take is refused with its position.
   NULLs where it matches none. `ON` decides the pairs and `WHERE` filters
   the joined rows, so `WHERE r.k IS NULL` keeps the rows nothing matched; a
   `USING` column named alone is the preserved table's. `FULL JOIN` is
-  refused. Without `FROM`, a
+  refused. A table takes an alias, `t [AS] x`: the front end rewrites the
+  qualifier `x` to the table in every clause of that SELECT, so the binder
+  never sees an alias, and the table's own name qualifies nothing while it is
+  aliased (42P01, as PostgreSQL), nor may two FROM items share a name
+  (42712). A select-list item takes `[AS] name`, which names its output
+  column; an unqualified `ORDER BY name` that is such a name orders by that
+  item (PostgreSQL looks at output names first there, at input columns
+  first in `GROUP BY`, which takes no output name here). A subquery
+  resolves its own aliases; it cannot name the outer query's (correlation
+  is refused). `t AS x (c1, c2)`, an alias of a join, and a table joined
+  with itself under two aliases are refused. Without `FROM`, a
   `SELECT` of constants returns one row of them, or none under `LIMIT 0`;
   it takes no `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` or `FOR UPDATE`
   yet.
@@ -219,7 +229,9 @@ That includes:
   every key of, `GROUP BY` of an expression, and `HAVING` of anything but
   the comparisons above;
 - `FULL JOIN`, an outer join's `ON` comparing an expression of columns,
-  three or more tables, table aliases;
+  three or more tables, renaming a table's columns (`t AS x (a, b)`), an
+  alias of a join, an output name in `GROUP BY` or in `ORDER BY` of other
+  than a column;
 - `OFFSET`, `RETURNING`, multi-row `VALUES`;
 - `*`, `/`, string concatenation and functions;
 - a cast of anything but a string literal or `NULL`, a numeric literal of
