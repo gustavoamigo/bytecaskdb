@@ -896,8 +896,16 @@ public:
   }
 
   // A column reference of a join: the side whose table it names, or the one
-  // that has the column; one both have is ambiguous (42702).
-  static auto column(const Table* (&sides)[2], const ast::Expr& e) -> std::pair<std::uint32_t, const Column*> {
+  // that has the column; one both have is ambiguous (42702), but for a
+  // column of its USING, which is one column: the left side's, equal to the
+  // right's in every pair. The USING's alias names those columns alone.
+  auto column(const Table* (&sides)[2], const ast::Expr& e) const -> std::pair<std::uint32_t, const Column*> {
+    auto in_using = std::ranges::contains(using_, e.column);
+    if (!using_alias_.empty() && e.table == using_alias_) {
+      if (!in_using) throw SqlError{"column " + e.table + "." + e.column + " does not exist", e.pos, kUndefinedColumn};
+      return {0, sides[0]->column(e.column)};
+    }
+    if (e.table.empty() && in_using) return {0, sides[0]->column(e.column)};
     std::optional<std::pair<std::uint32_t, const Column*>> found;
     for (std::uint32_t side = 0; side < 2; ++side) {
       if (!e.table.empty() && e.table != sides[side]->name) continue;
@@ -1237,18 +1245,52 @@ public:
   }
 
   // A column of one table equal to a column of the other, of one SQL type.
-  static auto join_on(const Table* (&sides)[2], const ast::Compare& w) -> logical::Expr {
+  auto join_on(const Table* (&sides)[2], const ast::Compare& w) const -> logical::Expr {
     auto [ls, lc] = column(sides, w.lhs);
     auto [rs, rc] = column(sides, w.rhs);
     if (ls == rs) throw SqlError{"comparing two columns of one table is not supported yet", w.pos};
     if (w.op != ast::Compare::Op::Eq) throw SqlError{"a join compares two columns with = only yet", w.pos};
-    if (compared_type(lc->sql).identity != compared_type(rc->sql).identity) {
-      throw SqlError{"comparing " + lc->name + " (" + sql_type_name(lc->sql) + ") with " + rc->name + " (" +
-                         sql_type_name(rc->sql) + ") is not supported: a join compares columns of one type",
-                     w.pos};
+    return joined_equal(*sides[ls], *lc, *sides[rs], *rc, w.pos);
+  }
+
+  // l.lc = r.rc, columns of one SQL type: two of different ones are
+  // refused (docs/frontend_design.md, *Known differences*).
+  static auto joined_equal(const Table& l, const Column& lc, const Table& r, const Column& rc, std::int32_t pos)
+      -> logical::Expr {
+    if (compared_type(lc.sql).identity != compared_type(rc.sql).identity) {
+      throw SqlError{"comparing " + lc.name + " (" + sql_type_name(lc.sql) + ") with " + rc.name + " (" +
+                         sql_type_name(rc.sql) + ") is not supported: a join compares columns of one type",
+                     pos};
     }
-    return logical::compare(ast::Compare::Op::Eq, logical::column_of(sides[ls]->id, *lc),
-                            logical::column_of(sides[rs]->id, *rc));
+    return logical::compare(ast::Compare::Op::Eq, logical::column_of(l.id, lc), logical::column_of(r.id, rc));
+  }
+
+  // USING (…) or NATURAL: its columns, each of both tables and named once
+  // (NATURAL: every column name they share, in the left table's order), and
+  // the equality of each, in that order.
+  auto using_conjuncts(const Table* (&sides)[2], const ast::Select& s) -> std::vector<logical::Expr> {
+    using_ = s.using_columns;
+    if (s.natural) {
+      for (const auto& c : sides[0]->columns) {
+        if (!c.hidden && sides[1]->column(c.name) != nullptr) using_.push_back(c.name);
+      }
+    }
+    using_alias_ = s.using_alias;
+    std::vector<logical::Expr> out;
+    for (const auto& name : using_) {
+      if (std::ranges::count(using_, name) > 1) {
+        throw SqlError{"column name \"" + name + "\" appears more than once in USING clause", s.join_pos, kDuplicateColumn};
+      }
+      for (std::uint32_t side = 0; side < 2; ++side) {
+        if (sides[side]->column(name) == nullptr) {
+          throw SqlError{"column \"" + name + "\" specified in USING clause does not exist in " +
+                             (side == 0 ? "left" : "right") + " table",
+                         s.join_pos, kUndefinedColumn};
+        }
+      }
+      out.push_back(joined_equal(*sides[0], *sides[0]->column(name), *sides[1], *sides[1]->column(name), s.join_pos));
+    }
+    return out;
   }
 
   // A SELECT of one table, or of two joined: Limit? -> Project -> Sort? ->
@@ -1272,7 +1314,9 @@ public:
       sides[1] = table(s.join, s.join_pos);
       if (sides[0] == sides[1]) throw SqlError{"a table joined with itself is not supported", s.pos};
       if (s.for_update) throw SqlError{"FOR UPDATE on a join is not supported yet", s.pos};
-      conjuncts = where(sides, s.where);
+      conjuncts = using_conjuncts(sides, s);
+      auto rest = where(sides, s.where);
+      conjuncts.insert(conjuncts.end(), std::make_move_iterator(rest.begin()), std::make_move_iterator(rest.end()));
     } else {
       conjuncts = where(*sides[0], s.where);
     }
@@ -1551,6 +1595,8 @@ private:
 
   const Catalog& cat_;
   std::uint32_t own_params_;
+  std::vector<std::string> using_;  // a join's USING or NATURAL columns: one column each
+  std::string using_alias_;         // USING (…) AS alias
   std::vector<ParamUse> params_;
   std::vector<Datum> fixed_;  // the constants' values, $own_params_ + 1 onwards
   std::vector<PhysType> fixed_types_;

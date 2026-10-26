@@ -417,6 +417,9 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   if (s->n_from_clause > 2) reject("SELECT reads one or two tables", pos);
   std::vector<const PgQuery__RangeVar*> tables;
   const PgQuery__Node* on = nullptr;
+  std::vector<std::string> using_columns;
+  std::string using_alias;
+  auto natural = false;
   for (std::size_t i = 0; i < s->n_from_clause; ++i) {
     const auto* from = s->from_clause[i];
     if (from->node_case == PG_QUERY__NODE__NODE_JOIN_EXPR) {
@@ -424,13 +427,19 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
       // The join has no position of its own; report the table it joins.
       const auto* r = j->rarg;
       auto at = r != nullptr && r->node_case == PG_QUERY__NODE__NODE_RANGE_VAR ? r->range_var->location : pos;
-      if (s->n_from_clause != 1 || j->jointype != PG_QUERY__JOIN_TYPE__JOIN_INNER || j->is_natural ||
-          j->n_using_clause != 0 || j->alias != nullptr || j->larg == nullptr || r == nullptr ||
-          j->larg->node_case != PG_QUERY__NODE__NODE_RANGE_VAR || r->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) {
-        reject("only an inner join of two tables, by ON, is supported", at);
+      if (s->n_from_clause != 1 || j->jointype != PG_QUERY__JOIN_TYPE__JOIN_INNER || j->alias != nullptr ||
+          j->larg == nullptr || r == nullptr || j->larg->node_case != PG_QUERY__NODE__NODE_RANGE_VAR ||
+          r->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) {
+        reject("only an inner join of two tables, by ON, USING or NATURAL, is supported", at);
       }
       tables = {j->larg->range_var, r->range_var};
       on = j->quals;
+      natural = j->is_natural;
+      for (std::size_t k = 0; k < j->n_using_clause; ++k) using_columns.push_back(str(j->using_clause[k]));
+      if (j->join_using_alias != nullptr) {
+        if (j->join_using_alias->n_colnames != 0) reject("a USING alias takes no column list", at);
+        using_alias = j->join_using_alias->aliasname;
+      }
       continue;
     }
     if (from->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) reject("SELECT reads one or two tables", pos);
@@ -447,6 +456,9 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   Select sel{{}, tables.empty() ? "" : relation(tables[0]), tables.size() == 2 ? relation(tables[1]) : "", {}, {}, limit(s),
              pos, false};
   sel.distinct = distinct;
+  sel.using_columns = std::move(using_columns);
+  sel.natural = natural;
+  sel.using_alias = std::move(using_alias);
   if (!tables.empty()) sel.table_pos = tables[0]->location;
   if (tables.size() == 2) sel.join_pos = tables[1]->location;
   if (s->n_locking_clause == 1) {
