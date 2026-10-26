@@ -237,6 +237,10 @@ private:
     std::vector<std::optional<SqlType>> param_sql;
     std::vector<std::uint32_t> param_table;
     std::vector<ParamInfo> params;
+    // The statement's constants, folded when it was compiled
+    // (bound::Bound::fixed): bound after the caller's parameters, as the
+    // plan's last ones. A client never sees or sends them.
+    std::vector<Value> fixed;
     std::vector<std::uint8_t> result_codes;  // the plan's result_types as bc_type codes
     RowLayout result_layout;                 // how its result rows decode
     std::vector<bc_col_ref> col_refs;
@@ -522,6 +526,9 @@ private:
   // Throws ParamError for parameters the plan does not take, and ExecError
   // BC_C_RANGE for a value outside its parameter's SQL type.
   static void check_params(const Compiled& c, const std::vector<Value>& params);
+  // What the plan's parameters are bound to: the caller's, then the
+  // statement's constants.
+  static auto plan_params(const Compiled& c, const std::vector<Value>& params) -> std::vector<Value>;
   static auto results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows;
   static auto quotients(const GeneratedPlan& p, std::vector<Value> values) -> std::vector<Value>;
   // An autocommit context: one per call in flight, kept for the next.
@@ -735,7 +742,9 @@ auto sqlstate(const std::exception& e) noexcept -> std::string_view {
 
 auto Statement::param_types() const -> std::vector<PhysType> {
   auto c = compiled();
-  return c ? c->plan->param_types : std::vector<PhysType>{};
+  if (!c) return {};
+  const auto& all = c->plan->param_types;  // the constants' last: not the caller's to bind
+  return {all.begin(), all.end() - std::ssize(c->fixed)};
 }
 
 auto Statement::plan_source() const -> std::string {
@@ -952,6 +961,7 @@ auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
   c->param_sql = std::move(bound.param_sql);
   c->param_table = std::move(bound.param_table);
   c->params = std::move(bound.params);
+  c->fixed = std::move(bound.fixed);
   c->plan = std::make_unique<GeneratedPlan>(generate_plan(std::move(bound), *cat, s.sql_, row_counts(), budget_.max_bytes));
   link(*c);
   ++compilations_;
@@ -1087,8 +1097,8 @@ auto Database::fitting_plan(bc_ctx* cx, const Statement& stmt, const std::vector
 // they are (an INTEGER key recreated as BIGINT).
 void Database::check_params(const Compiled& c, const std::vector<Value>& params) {
   const auto& types = c.plan->param_types;
-  if (params.size() != types.size()) {
-    throw ParamError("statement takes " + std::to_string(types.size()) + " parameters, got " +
+  if (params.size() != types.size() - c.fixed.size()) {
+    throw ParamError("statement takes " + std::to_string(types.size() - c.fixed.size()) + " parameters, got " +
                      std::to_string(params.size()));
   }
   for (std::size_t i = 0; i < params.size(); ++i) {
@@ -1104,8 +1114,16 @@ void Database::check_params(const Compiled& c, const std::vector<Value>& params)
   }
 }
 
+auto Database::plan_params(const Compiled& c, const std::vector<Value>& params) -> std::vector<Value> {
+  auto out = params;
+  out.insert(out.end(), c.fixed.begin(), c.fixed.end());
+  return out;
+}
+
 auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn) -> Rows {
-  bc_params bp{params};
+  // The context reads the parameters through bp, filled once the plan that
+  // runs is known: the caller's, then its constants (plan_params).
+  bc_params bp;
   if (txn != nullptr) {
     // The plan must fit the catalog the transaction pinned at its first
     // statement. One that does not is recompiled when the pin is the live
@@ -1120,6 +1138,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
       if (after_txn_pin_) after_txn_pin_();
 #endif
       auto c = stmt.compiled();  // taken after the pin: the plan of a DDL that raced it, if one did
+      bp.values = plan_params(*c, params);
       // A plan that does not fit the pin has run nothing: bc_ctx_run
       // verifies it before the plan's body. Recompiled, pinned again, or
       // 40001.
@@ -1159,6 +1178,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
   }
   auto c = fitting_plan(cx, stmt, params);
   check_params(*c, params);
+  bp.values = plan_params(*c, params);
   auto r = bc_execute(cx, c->code->fn(), &c->ref, &bp, budget_, sync_commits_, kMaxRetries);
   // bc_ctx_run checks the plan against the catalog it pinned. A plan a DDL
   // made incompatible (BC_E_LAYOUT with BC_L_INCOMPATIBLE) is recompiled
@@ -1168,6 +1188,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
     bc_ctx_reset(cx);
     c = recompile(stmt);
     check_params(*c, params);
+    bp.values = plan_params(*c, params);
     r = bc_execute(cx, c->code->fn(), &c->ref, &bp, budget_, sync_commits_, kMaxRetries);
   }
   if (r == BC_CONFLICT) {
@@ -1392,18 +1413,20 @@ auto Database::alternatives_for_testing(std::string_view sql, const std::vector<
   if (std::holds_alternative<Ddl>(bound.stmt)) throw std::logic_error("DDL has no plan");
   auto param_sql = bound.param_sql;
   auto param_table = bound.param_table;
+  auto fixed = bound.fixed;
   std::vector<Rows> out;
   for (auto& plan : generate_alternatives(std::move(bound), *cat, sql, row_counts(), budget_.max_bytes)) {
     if (!plan.returns_rows) throw std::logic_error("alternatives of a statement that writes");
     Compiled c;
     c.param_sql = param_sql;
     c.param_table = param_table;
+    c.fixed = fixed;
     c.plan = std::make_unique<GeneratedPlan>(std::move(plan));
     check_params(c, params);
     link(c);
     auto* cx = acquire_context();
     try {
-      bc_params bp{params};
+      bc_params bp{plan_params(c, params)};
       auto r = bc_execute(cx, c.code->fn(), &c.ref, &bp, budget_, sync_commits_, kMaxRetries);
       if (r == BC_CONFLICT) throw ExecError::conflicted("conflict: a guard failed on every attempt");
       if (r == BC_FAILED) throw_context_error(cx);

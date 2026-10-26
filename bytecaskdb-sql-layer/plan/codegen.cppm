@@ -538,6 +538,9 @@ private:
     for (const auto& line : no_rows_) w_.line(line);
   }
 
+  // One row of no columns: the consumer, once.
+  void produce(const physical::OneRow&, const Consume& k) { k(); }
+
   // The single row a point lookup names. In a one-row aggregate a missing
   // row is a condition, `hit_`, not an end.
   void produce(const physical::PointGet& g, const Consume& k) {
@@ -1017,10 +1020,16 @@ private:
       if (rows_.size() == 1 && rows_[0].covering) {
         // Every result column from the entry's key: no row read.
         const auto& b = rows_[0];
-        if (!e.targets.empty()) w_.line("bc_view key = bc_scan_key(cx, " + b.cursor + ");");
+        if (std::ranges::any_of(e.targets, [](const auto& t) { return std::holds_alternative<ColumnRef>(t); })) {
+          w_.line("bc_view key = bc_scan_key(cx, " + b.cursor + ");");
+        }
         w_.line("bc_emit_begin(cx);");
         for (const auto& t : e.targets) {
-          w_.line("bc_emit_key_part(cx, " + w_.obj(b.object) + ", key, " + w_.part(b.object, t) + ");");
+          if (const auto* p = std::get_if<physical::ParamTarget>(&t)) {
+            emit_param(*p);
+            continue;
+          }
+          w_.line("bc_emit_key_part(cx, " + w_.obj(b.object) + ", key, " + w_.part(b.object, std::get<ColumnRef>(t)) + ");");
         }
         w_.line("bc_emit_end(cx);");
         return;
@@ -1029,7 +1038,12 @@ private:
         if (b.for_update) w_.line("bc_guard_row(cx, " + w_.tbl(b.table) + ", " + b.row + ");");
       }
       w_.line("bc_emit_begin(cx);");
-      for (const auto& t : e.targets) {
+      for (const auto& target : e.targets) {
+        if (const auto* p = std::get_if<physical::ParamTarget>(&target)) {
+          emit_param(*p);
+          continue;
+        }
+        const auto& t = std::get<ColumnRef>(target);
         if (const auto& b = binding(t.table); b.covering) {
           w_.line("bc_emit_key_part(cx, " + key_part(b, t) + ";");
         } else {
@@ -1038,6 +1052,15 @@ private:
       }
       w_.line("bc_emit_end(cx);");
     });
+  }
+
+  // A parameter as a result column, NULL as NULL.
+  void emit_param(const physical::ParamTarget& p) {
+    w_.open("if (" + param_null(p.param) + ")");
+    w_.line("bc_emit_null(cx);");
+    w_.otherwise();
+    w_.line("bc_emit_" + suffix(p.type) + "(cx, " + param(p.type, p.param) + ");");
+    w_.close();
   }
 
   void emit_count(const std::string& n) {

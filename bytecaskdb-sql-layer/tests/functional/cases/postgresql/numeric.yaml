@@ -64,7 +64,7 @@
 
 - name: two columns of the same type compared
   features: [E011-05]
-  # WHERE must compare a column with a parameter
+  # WHERE must compare a column with a parameter or a constant
   unimplemented: true
   setup:
     - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
@@ -86,7 +86,7 @@
 
 - name: an integer column compared with a DOUBLE column
   features: [E011-06]
-  # WHERE must compare a column with a parameter
+  # WHERE must compare a column with a parameter or a constant
   unimplemented: true
   setup:
     - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
@@ -108,7 +108,7 @@
 
 - name: DECIMAL plus DECIMAL of the same scale
   features: [E011-04, E011-03]
-  # only columns and aggregates can be selected
+  # only columns, constants and aggregates can be selected
   unimplemented: true
   ordered: true
   setup:
@@ -131,7 +131,7 @@
 
 - name: DECIMAL plus an integer column
   features: [E011-04, E011-06]
-  # only columns and aggregates can be selected
+  # only columns, constants and aggregates can be selected
   unimplemented: true
   ordered: true
   setup:
