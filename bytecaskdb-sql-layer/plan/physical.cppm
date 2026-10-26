@@ -521,6 +521,41 @@ private:
     for (const auto& a : e.args) reads(a);
   }
 
+  // A predicate filter: AND, OR and NOT of comparisons of a column with a
+  // parameter or a constant, none of a DOUBLE, and IS NULL of a column.
+  void predicate(const Expr& e) const {
+    switch (e.kind) {
+      case Expr::Kind::And:
+      case Expr::Kind::Or:
+        if (e.args.size() < 2) broken("an AND or OR of fewer than two");
+        for (const auto& a : e.args) predicate(a);
+        return;
+      case Expr::Kind::Not:
+        if (e.args.size() != 1) broken("a NOT of other than one");
+        predicate(e.args[0]);
+        return;
+      case Expr::Kind::IsNull:
+        if (e.args.size() != 1 || e.args[0].kind != Expr::Kind::Column) broken("IS NULL of other than a column");
+        reads(e);
+        return;
+      case Expr::Kind::Compare:
+        if (e.args[0].kind != Expr::Kind::Column || e.args[0].col.type == PhysType::F64 ||
+            (e.args[1].kind != Expr::Kind::Param && e.args[1].kind != Expr::Kind::Const)) {
+          broken("a predicate's comparison other than of a column, not a DOUBLE, with a parameter");
+        }
+        params(e.args[1]);
+        reads(e);
+        return;
+      case Expr::Kind::Const: return;  // a comparison folded
+      case Expr::Kind::Column:
+      case Expr::Kind::Param:
+      case Expr::Kind::Add:
+      case Expr::Kind::Sub:
+      case Expr::Kind::Aggregate: break;
+    }
+    broken("a predicate of an expression codegen does not print");
+  }
+
   void scan(const Scan& s) const {
     if (s.prefix.empty() && std::holds_alternative<std::monostate>(s.rest)) {
       broken("a scan needs an equality prefix or a range");
@@ -915,6 +950,10 @@ private:
               return;
             }
             for (const auto& c : op.conjuncts) {
+              if (logical::is_predicate(c)) {
+                predicate(c);
+                continue;
+              }
               if (c.kind != Expr::Kind::Compare) continue;
               if (c.args[0].kind == Expr::Kind::Column && c.args[0].col.type == PhysType::F64) {
                 broken("a filter on a DOUBLE column");

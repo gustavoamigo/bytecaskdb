@@ -268,8 +268,6 @@
 
 - name: IS NULL in WHERE
   features: [E061-06]
-  # WHERE must compare a column
-  unimplemented: true
   setup:
     - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
   steps:
@@ -296,8 +294,6 @@
 
 - name: IN and BETWEEN in WHERE
   features: [E061-03, E061-02]
-  # WHERE must compare a column
-  unimplemented: true
   setup:
     - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
   steps:

@@ -107,7 +107,7 @@ TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql]
   CHECK(rejected_at("SELECT id FROM t, u, v WHERE id = $1") >= 0);
   CHECK(rejected_at("SELECT id FROM t WHERE id = B'1'") == 28);  // a bit-string literal
   CHECK(rejected_at("VALUES (1)") == 0);
-  CHECK(rejected_at("SELECT id FROM t WHERE id = $1 OR id = $2") >= 0);
+  CHECK(rejected_at("SELECT id FROM t WHERE id LIKE $1") >= 0);
   CHECK(rejected_at("SELEC id FROM t") == 0);                   // PostgreSQL's own syntax error
   CHECK(rejected_at("SELECT id FROM t; SELECT id FROM t") == -1);
   CHECK(rejected_at("DROP VIEW v") == 0);
@@ -255,11 +255,11 @@ TEST_CASE("parser: two tables, qualified columns and integer literals", "[sql][p
   CHECK(literal_of(bare.targets[0]).text == "-5");
   CHECK(bare.targets[1].kind == Expr::Kind::Plus);
   CHECK(bare.targets[2].kind == Expr::Kind::Neg);
-  try {
-    (void)parse("SELECT id FROM t JOIN u ON id = $1 OR k = $2");
-    FAIL("accepted");
-  } catch (const SqlError& e) {
-    CHECK(std::string{e.what()} == "only AND is supported in ON");
-  }
+  // OR, in ON as in WHERE, is a predicate conjunct; ON's are marked so.
+  auto ors = std::get<Select>(parse("SELECT id FROM t JOIN u ON id = $1 OR k = $2"));
+  REQUIRE(ors.where.size() == 1);
+  CHECK(ors.where[0].kind == Compare::Kind::Or);
+  CHECK(ors.where[0].on);
+  CHECK(ors.where[0].args.size() == 2);
 }
 

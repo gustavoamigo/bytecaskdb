@@ -497,9 +497,45 @@ private:
   }
 
   // Whether the row fails the conjunct, as a C expression: NULL on either
-  // side, or the comparison false.
+  // side, or the comparison false; a predicate, unless it is true.
   auto fails(const Expr& c) -> std::string {
     if (c.kind == Expr::Kind::Const) return c.constant != 0 ? "0" : "1";  // folded: never, or always
+    if (logical::is_predicate(c)) return "!(" + truth(c, true) + ")";
+    auto [null, cmp] = comparison(c);
+    return null + " || !(" + cmp + ")";
+  }
+
+  // Whether predicate e is true (`want`) or false, as C: SQL's three-valued
+  // logic as two conditions, unknown being neither. NOT swaps them; AND is
+  // true when all are and false when one is, OR the mirror. Each node is
+  // printed once, in one of the two, and short-circuits.
+  auto truth(const Expr& e, bool want) -> std::string {
+    switch (e.kind) {
+      case Expr::Kind::Not: return truth(e.args[0], !want);
+      case Expr::Kind::And:
+      case Expr::Kind::Or: {
+        auto all = (e.kind == Expr::Kind::And) == want;
+        std::string out;
+        for (const auto& a : e.args) out += (out.empty() ? "(" : all ? " && (" : " || (") + truth(a, want) + ")";
+        return out;
+      }
+      case Expr::Kind::IsNull: return (want ? "" : "!") + col_null(e.args[0].col);  // never unknown
+      case Expr::Kind::Const: return (e.constant != 0) == want ? "1" : "0";
+      case Expr::Kind::Compare: {
+        auto [null, cmp] = comparison(e);
+        return "!(" + null + ") && " + (want ? "(" : "!(") + cmp + ")";
+      }
+      case Expr::Kind::Column:
+      case Expr::Kind::Param:
+      case Expr::Kind::Add:
+      case Expr::Kind::Sub:
+      case Expr::Kind::Aggregate: break;
+    }
+    throw std::logic_error{"physical plan: a predicate codegen does not print"};
+  }
+
+  // A comparison's NULL test (either side NULL) and the comparison, as C.
+  auto comparison(const Expr& c) -> std::pair<std::string, std::string> {
     const auto& lhs = c.args[0].col;
     const auto& rhs = c.args[1];
     auto out = col_null(lhs);
@@ -520,13 +556,17 @@ private:
         break;
       case Expr::Kind::Const:
       case Expr::Kind::Compare:
-      case Expr::Kind::Aggregate: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
+      case Expr::Kind::Aggregate:
+      case Expr::Kind::And:
+      case Expr::Kind::Or:
+      case Expr::Kind::Not:
+      case Expr::Kind::IsNull: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
     }
     auto col = read_col(lhs);
     // Text and bytes compare as bytes: COLLATE "C".
     auto cmp = lhs.type == PhysType::Bytes ? "bc_bytes_cmp(cx, " + col + ", " + value + ") " + op_text(c.op) + " 0"
                                            : col + " " + op_text(c.op) + " " + value;
-    return out + " || !(" + cmp + ")";
+    return {out, cmp};
   }
 
   void produce(const physical::Node& n, const Consume& k) {

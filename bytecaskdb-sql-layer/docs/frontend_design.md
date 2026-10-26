@@ -76,9 +76,23 @@ kind the transformer doesn't take is refused with its position.
 
 **`WHERE`** is a conjunction (`AND`) of comparisons (`=`, `<`, `<=`, `>`,
 `>=`) of a column with a parameter, a constant or `$n ± k`, in any order,
-on any columns.
+on any columns, and of predicates over them.
 - A comparison with NULL is not true, so it rejects the row, as in SQL's
   three-valued logic.
+- **Predicates:** `AND`, `OR` and `NOT` of comparisons and of `col IS [NOT]
+  NULL`, in SQL's three-valued logic: `NOT` of unknown is unknown, `AND` is
+  false when one side is, `OR` true when one side is. The parser writes the
+  rest with them: `a <> b` is `NOT (a = b)`; `a BETWEEN lo AND hi` is `a >=
+  lo AND a <= hi`, `SYMMETRIC` either way round, `NOT BETWEEN` its `NOT`; `a
+  IN (x, y)` is `a = x OR a = y` and `NOT IN` its `NOT`, so a NULL in the
+  list makes `NOT IN` true of no row, as in PostgreSQL.
+- The `AND`s at the top, a `BETWEEN`'s included, are separate conjuncts, so
+  a key takes each comparison it can. A predicate (`OR`, `NOT`, `IS NULL`)
+  is a filter, checked on each row a plan reads, never a key's bound
+  (`planner_design.md`, *The search*).
+- Not yet: a predicate comparing a REAL or DOUBLE column (`no plan:`, as
+  any filter on one), `$n ± k` inside one, one of both tables' columns in a
+  join, in `HAVING`, `IN` of a subquery, `LIKE`, `IS DISTINCT FROM`.
 - Comparing two columns of different SQL types is refused (*Known
   differences*).
 
@@ -158,7 +172,8 @@ and with a constant selected or `DISTINCT ON`, it is not taken yet.
 
 **Refused**, with a message and the node's position: everything not above.
 That includes:
-- `OR`, `NOT`, `IN`, `BETWEEN`, `IS NULL`;
+- `LIKE`, `IN` of a subquery, `IS DISTINCT FROM`, a predicate over both
+  tables of a join or in `HAVING`;
 - subqueries, derived tables, set operations;
 - `DISTINCT ON`, `DISTINCT` of a constant or over groups it does not select
   every key of, `GROUP BY` of an expression, and `HAVING` of anything but

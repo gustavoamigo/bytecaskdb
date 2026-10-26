@@ -78,8 +78,14 @@ Each expression carries its SQL type, which the binder resolves. The
 dialect's expressions are columns, parameters, integer constants, `+` and
 `-`, comparisons, their conjunction and aggregate calls. A literal is a
 parameter by then: the binder folds it and the API binds it after the
-statement's own (`frontend_design.md`, *Literals*); `*`, `/`, `OR`,
-`NOT` and `IS NULL` come with the dialect that accepts them (#534). The
+statement's own (`frontend_design.md`, *Literals*). A predicate (`And`,
+`Or`, `Not` of comparisons, and `IsNull` of a column) is a conjunct of its
+own: the search keeps a table's predicates apart from its comparisons
+(`Rel::preds`), no access path takes one, and each is a filter after the
+path's, refused (`no plan:`) where it compares a REAL or DOUBLE column, as a
+comparison is. Codegen prints one as two C conditions, true and false, SQL's
+three-valued logic with unknown neither; `*` and `/` come with the dialect
+that accepts them (#534). The
 binder's own rules are the frontend's: one SQL type per `$n`, and the
 errors it raises.
 
