@@ -412,6 +412,11 @@ def test_literals_are_no_parameters_and_their_columns_have_postgresqls_types(ser
     assert data(run(c, sql, ["7"])) == [["7", "x", "2.50", "5", None]]
     assert data(run(c, "SELECT -2.E-2, 1 + 1.5, TRUE")) == [["-0.02", "2.5", "t"]]
     assert states(run(c, "SELECT 2147483647 + 1")) == ["22003"]
+    # A cast is named by its type; a comparison of constants is a boolean.
+    sql = "SELECT DATE '2016-03-26', 3 < 5, CAST('5' AS INTEGER)"
+    c.send(parse(sql, "c"), describe("S", "c"), SYNC)
+    assert row_description(c.until_ready()[2][1]) == [("date", 1082), ("?column?", 16), ("int4", 23)]
+    assert data(run(c, sql)) == [["2016-03-26", "t", "5"]]
 
 
 def test_a_parameter_its_type_does_not_take_is_22p02(server):

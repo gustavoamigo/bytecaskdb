@@ -112,8 +112,8 @@ the row says 2016.
   results, and keeping its rule keeps the number comparable with other
   projects'. Its tables have no primary key. A first run passed 16 of
   the 743, 374 stopping at the layer's refusal of such a table; with
-  tables without a primary key, literals and `SELECT` without `FROM`
-  built, 151 pass, and the rest stop at forms the dialect leaves out. The list is
+  tables without a primary key, literals, `SELECT` without `FROM` and
+  comparisons of constants built, 217 pass, and the rest stop at forms the dialect leaves out. The list is
   `tests/functional/not_implemented/sqltest.txt`.
 
 ### PostgreSQL features and ByteCaskDB features: our cases
