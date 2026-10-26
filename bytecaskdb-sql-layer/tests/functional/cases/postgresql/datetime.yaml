@@ -84,7 +84,7 @@
 
 - name: the difference of two DATEs
   features: [F051-01]
-  # only columns and aggregates can be selected
+  # only columns, constants and aggregates can be selected
   unimplemented: true
   ordered: true
   setup:

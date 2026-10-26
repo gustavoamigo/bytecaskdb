@@ -89,7 +89,8 @@ TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql]
   //                    0123456789012345678901234567890123456789
   CHECK(rejected_at("SELECT id FROM t LEFT JOIN u ON t.id = u.id") == 27);
   CHECK(rejected_at("SELECT id FROM t, u, v WHERE id = $1") >= 0);
-  CHECK(rejected_at("SELECT id FROM t WHERE id = 1") == 28);   // a literal
+  CHECK(rejected_at("SELECT id FROM t WHERE id = B'1'") == 28);  // a bit-string literal
+  CHECK(rejected_at("VALUES (1)") == 0);
   CHECK(rejected_at("SELECT id FROM t WHERE id = $1 OR id = $2") >= 0);
   CHECK(rejected_at("SELEC id FROM t") == 0);                   // PostgreSQL's own syntax error
   CHECK(rejected_at("SELECT id FROM t; SELECT id FROM t") == -1);
@@ -217,9 +218,27 @@ TEST_CASE("parser: two tables, qualified columns and integer literals", "[sql][p
   CHECK(u.set[0].value.rhs->constant == 1);
   CHECK(std::get<Update>(parse("UPDATE t SET qty = qty - 10000000000 WHERE id = $1")).set[0].value.rhs->constant ==
         10000000000);
-  CHECK_THROWS_AS(parse("UPDATE t SET qty = qty + 1.5 WHERE id = $1"), SqlError);
-  CHECK_THROWS_AS(parse("UPDATE t SET qty = qty + 99999999999999999999 WHERE id = $1"), SqlError);
-  CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = 1"), SqlError);
+  // Any other literal is a Literal, as written, for the binder to fold or
+  // refuse.
+  auto literal_of = [](const Expr& e) {
+    REQUIRE(e.kind == Expr::Kind::Literal);
+    return e.literal;
+  };
+  auto number = literal_of(*std::get<Update>(parse("UPDATE t SET qty = qty + 1.5 WHERE id = $1")).set[0].value.rhs);
+  CHECK((number.kind == Literal::Kind::Number && number.text == "1.5"));
+  auto wide = literal_of(*std::get<Update>(parse("UPDATE t SET qty = qty + 99999999999999999999 WHERE id = $1")).set[0].value.rhs);
+  CHECK((wide.kind == Literal::Kind::Integer && wide.text == "99999999999999999999"));
+  CHECK(literal_of(std::get<Select>(parse("SELECT id FROM t WHERE id = 1")).where[0].rhs).text == "1");
+  auto string = literal_of(std::get<Insert>(parse("INSERT INTO t VALUES ('it''s', NULL, TRUE)")).values[0]);
+  CHECK((string.kind == Literal::Kind::String && string.text == "it's"));
+  // A SELECT without FROM; PostgreSQL's grammar folds - of a number into the
+  // literal, and leaves unary + an operator.
+  auto bare = std::get<Select>(parse("SELECT -5, +7.8, -(1 + 2)"));
+  CHECK(bare.table.empty());
+  REQUIRE(bare.targets.size() == 3);
+  CHECK(literal_of(bare.targets[0]).text == "-5");
+  CHECK(bare.targets[1].kind == Expr::Kind::Plus);
+  CHECK(bare.targets[2].kind == Expr::Kind::Neg);
   try {
     (void)parse("SELECT id FROM t JOIN u ON id = $1 OR k = $2");
     FAIL("accepted");

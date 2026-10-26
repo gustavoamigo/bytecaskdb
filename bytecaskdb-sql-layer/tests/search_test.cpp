@@ -171,7 +171,8 @@ TEST_CASE("search: a shape it does not plan is refused with no plan, never a var
         "no plan: a join conjunct that does not compare a column of each side");
   // A result column of a table the statement does not read.
   auto foreign = project(filter(get(t), {logical::compare(Op::Eq, col(t, "id"), p(0))}), {col(u, "v")});
-  CHECK(refusal(f.cat(), std::move(foreign), 1) == "no plan: a result column that is not a column of its tables");
+  CHECK(refusal(f.cat(), std::move(foreign), 1) ==
+        "no plan: a result column that is not a column of its tables or a constant");
 
   // An operator where the search plans another, named with its article.
   auto empty_side = project(logical::node(logical::Join{logical::node(logical::Empty{{&t}}), get(u), {}}), {col(u, "v")});

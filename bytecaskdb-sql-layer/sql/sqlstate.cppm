@@ -7,6 +7,7 @@
 // here, and the code outlives the error: every constant points at a literal.
 
 module;
+#include <optional>
 #include <string_view>
 
 export module bytecask.sql.sqlstate;
@@ -38,5 +39,25 @@ inline constexpr SqlState kDuplicateTable{"42P07"};
 inline constexpr SqlState kAmbiguousColumn{"42702"};
 inline constexpr SqlState kIndeterminateDatatype{"42P18"};
 inline constexpr SqlState kWrongObjectType{"42809"};
+// What an input function or a range check reports (sql/text.cppm,
+// range_sqlstate): text its type does not read, or a value outside it.
+inline constexpr SqlState kInvalidTextRepresentation{"22P02"};
+inline constexpr SqlState kStringDataRightTruncation{"22001"};
+inline constexpr SqlState kInvalidDatetimeFormat{"22007"};
+inline constexpr SqlState kDatetimeFieldOverflow{"22008"};
+inline constexpr SqlState kCharacterNotInRepertoire{"22021"};
+inline constexpr SqlState kInvalidParameterValue{"22023"};
+
+// The constant above whose code is `code`, or nullopt.
+[[nodiscard]] constexpr auto known_sqlstate(std::string_view code) noexcept -> std::optional<SqlState> {
+  for (auto s : {kSyntaxError, kFeatureNotSupported, kNumericValueOutOfRange, kNotNullViolation, kGroupingError,
+                 kDatatypeMismatch, kUndefinedFunction, kUndefinedColumn, kUndefinedTable, kUndefinedObject,
+                 kDuplicateColumn, kDuplicateTable, kAmbiguousColumn, kIndeterminateDatatype, kWrongObjectType,
+                 kInvalidTextRepresentation, kStringDataRightTruncation, kInvalidDatetimeFormat,
+                 kDatetimeFieldOverflow, kCharacterNotInRepertoire, kInvalidParameterValue}) {
+    if (s.view() == code) return s;
+  }
+  return std::nullopt;
+}
 
 }  // namespace bytecask::sql
