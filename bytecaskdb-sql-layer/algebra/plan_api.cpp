@@ -26,6 +26,8 @@
 // Standard library headers before the module imports, for the reason
 // bytecaskdb/bytecask_hpp.cpp gives (LLVM 22's abi_tag redeclaration error).
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <compare>
@@ -1008,6 +1010,25 @@ struct bc_ctx {
   std::uint32_t emit_col{0};
   std::int64_t affected{-1};
 
+  // A subquery's rows while it runs, bc_sub_begin to bc_sub_end: folded
+  // here, never a result row. Then what the subqueries left until reset:
+  // the parameters they set, by index, over the caller's NULLs, and each
+  // BC_SUB_SET's values, encoded by sub_key.
+  struct Sub {
+    std::uint32_t id{0};
+    std::int32_t kind{BC_SUB_VALUE};
+    PhysType type{PhysType::I64};
+    std::uint32_t param{0};
+    RowLayout layout;
+    std::int64_t rows{0};
+    bool saw_null{false};
+    Datum value;                   // BC_SUB_VALUE: its row's
+    std::optional<Datum> lo, hi;   // BC_SUB_BOUNDS: the non-NULL extremes
+  };
+  std::optional<Sub> sub;
+  std::vector<std::optional<Datum>> sub_params;  // sized once, so a parameter's address is stable
+  std::map<std::uint32_t, std::set<Bytes, BytesLess>> sub_sets;
+
   bc_ctx(bytecask::DB* d, LiveCatalog* l) : db{d}, live{l} {}
 
   auto ok() const -> bool { return error == BC_OK; }
@@ -1229,6 +1250,7 @@ struct bc_ctx {
       fail(BC_E_HANDLE, "parameter index out of range");
       return nullptr;
     }
+    if (i < sub_params.size() && sub_params[i]) return &*sub_params[i];  // a subquery's
     return &params->values[i];
   }
 
@@ -1428,6 +1450,9 @@ struct bc_ctx {
     emit.reset();
     emit_col = 0;
     affected = -1;
+    sub.reset();
+    sub_params.clear();
+    sub_sets.clear();
     arena.clear(true);  // one chunk kept for the next statement
     pins.clear(false);
     mem_used = 0;
@@ -2937,8 +2962,8 @@ void bc_emit_begin(bc_ctx* cx) {
     return;
   }
   // A SELECT may declare no result types (SELECT FROM t); a plan that writes
-  // tables and declares none returns no rows.
-  if (cx->verified.result_types.empty() && !cx->verified.written.empty()) {
+  // tables and declares none returns no rows, but for its subqueries'.
+  if (!cx->sub && cx->verified.result_types.empty() && !cx->verified.written.empty()) {
     cx->fail(BC_L_PLAN, "a plan that writes declares no result types, so it returns no rows");
     return;
   }
@@ -2946,7 +2971,7 @@ void bc_emit_begin(bc_ctx* cx) {
     cx->fail(BC_L_PLAN, "result row already begun");
     return;
   }
-  cx->emit.emplace(*cx->verified.result_layout);
+  cx->emit.emplace(cx->sub ? cx->sub->layout : *cx->verified.result_layout);
   cx->emit_col = 0;
   BC_GUARD_END(cx)
 }
@@ -2957,6 +2982,14 @@ namespace {
 // The next result column, which must be of `type` (any, when nullopt).
 auto emit_slot(bc_ctx* cx, std::optional<PhysType> type) -> bool {
   if (!cx->ok()) return false;
+  if (cx->sub) {  // a subquery's row: one column of its type, or EXISTS's of any, not kept
+    if (cx->emit && cx->sub->kind == BC_SUB_EXISTS) return false;
+    if (!cx->emit || cx->emit_col >= 1 || (type && cx->sub->type != *type)) {
+      cx->fail(BC_L_PLAN, "emitted column does not match the subquery's type");
+      return false;
+    }
+    return true;
+  }
   if (!cx->emit || cx->emit_col >= cx->verified.result_types.size() ||
       (type && cx->verified.result_types[cx->emit_col] != *type)) {
     cx->fail(BC_L_PLAN, "emitted column does not match the result layout");
@@ -2989,6 +3022,199 @@ void emit_decoded(bc_ctx* cx, const std::optional<T>& v, bool corrupt, bool has_
 }
 }  // namespace
 }  // extern "C++"
+
+// ---------------------------------------------------------------- subqueries
+
+extern "C++" {
+namespace {
+// A BC_SUB_SET's value as its set holds it: the value's word or bytes, a
+// DOUBLE's -0.0 as 0.0 and every NaN as one, as PostgreSQL's = compares them.
+auto sub_key(const Datum& v) -> Bytes {
+  auto word = [](std::uint64_t w) {
+    Bytes out(8);
+    std::memcpy(out.data(), &w, 8);
+    return out;
+  };
+  if (const auto* i = std::get_if<std::int64_t>(&v)) return word(std::bit_cast<std::uint64_t>(*i));
+  if (const auto* d = std::get_if<double>(&v)) {
+    auto x = std::isnan(*d) ? std::numeric_limits<double>::quiet_NaN() : (*d == 0.0 ? 0.0 : *d);
+    return word(std::bit_cast<std::uint64_t>(x));
+  }
+  if (const auto* b = std::get_if<bool>(&v)) return Bytes{std::byte{*b ? std::uint8_t{1} : std::uint8_t{0}}};
+  return std::get<Bytes>(v);
+}
+
+// a < b, both non-NULL values of one type, in PostgreSQL's order: bytes
+// bytewise, as the layer's strings compare, and NaN above every DOUBLE.
+auto sub_less(const Datum& a, const Datum& b) -> bool {
+  if (const auto* x = std::get_if<double>(&a)) {
+    auto y = std::get<double>(b);
+    return !std::isnan(*x) && (std::isnan(y) || *x < y);
+  }
+  if (const auto* x = std::get_if<Bytes>(&a)) return std::ranges::lexicographical_compare(*x, std::get<Bytes>(b));
+  return a < b;  // int64 or bool, one alternative
+}
+
+// The row a subquery emitted, folded as its kind says.
+void end_sub_row(bc_ctx* cx) {
+  auto& s = *cx->sub;
+  if (cx->emit && s.kind == BC_SUB_EXISTS) {
+    cx->emit.reset();
+    ++s.rows;
+    return;
+  }
+  if (!cx->emit || cx->emit_col != 1) {
+    cx->fail(BC_L_PLAN, "a subquery's row ended with the wrong number of columns");
+    return;
+  }
+  Bytes row;
+  if (!cx->emit->finish(row)) {
+    cx->fail(BC_E_LIMIT, "subquery row over the row format's limit");
+    return;
+  }
+  cx->emit.reset();
+  auto r = bytecask::sql::row_column(row, s.layout.columns[0]);
+  Datum v;
+  if (r.state == bytecask::sql::ColumnState::Malformed) {
+    cx->fail(BC_E_CORRUPT, "a subquery's row does not parse");
+    return;
+  }
+  if (r.state == bytecask::sql::ColumnState::Value) {
+    switch (s.type) {
+      case PhysType::I64: v = r.i64(); break;
+      case PhysType::F64: v = r.f64(); break;
+      case PhysType::Bool: v = r.boolean(); break;
+      case PhysType::Bytes: v = Bytes(r.bytes.begin(), r.bytes.end()); break;
+    }
+  }
+  ++s.rows;
+  auto null = std::holds_alternative<std::monostate>(v);
+  switch (s.kind) {
+    case BC_SUB_VALUE:
+      if (s.rows > 1) {
+        cx->fail(BC_E_CARDINALITY, "more than one row returned by a subquery used as an expression");
+        return;
+      }
+      s.value = std::move(v);
+      return;
+    case BC_SUB_EXISTS: return;
+    case BC_SUB_BOUNDS:
+      if (null) {
+        s.saw_null = true;
+        return;
+      }
+      if (!s.lo || sub_less(v, *s.lo)) s.lo = v;
+      if (!s.hi || sub_less(*s.hi, v)) s.hi = std::move(v);
+      return;
+    case BC_SUB_SET: {
+      if (null) {
+        s.saw_null = true;
+        return;
+      }
+      auto& set = cx->sub_sets[s.id];
+      auto k = sub_key(v);
+      if (set.contains(k) || !cx->take(k.size() + kHashEntryBytes)) return;
+      set.insert(std::move(k));
+      return;
+    }
+    default: cx->fail(BC_L_PLAN, "unknown subquery kind");
+  }
+}
+
+// How many parameters a kind sets.
+auto sub_params_of(std::int32_t kind) -> std::uint32_t {
+  return kind == BC_SUB_BOUNDS ? 4 : kind == BC_SUB_SET ? 2 : 1;
+}
+
+auto sub_has(bc_ctx* cx, std::uint32_t sub, const Datum& v) -> bool {
+  if (!cx->ok()) return false;
+  auto it = cx->sub_sets.find(sub);
+  if (it == cx->sub_sets.end()) {
+    // A set of no values is never put: one not run is a plan bug, as
+    // bc_sub_begin records each id it ran.
+    cx->fail(BC_E_HANDLE, "no BC_SUB_SET subquery " + std::to_string(sub) + " has run");
+    return false;
+  }
+  return it->second.contains(sub_key(v));
+}
+}  // namespace
+}  // extern "C++"
+
+void bc_sub_begin(bc_ctx* cx, uint32_t sub, int32_t kind, int32_t type, uint32_t param) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return;
+  auto t = type > 0 && type < 256 ? phys_type(static_cast<std::uint8_t>(type)) : std::nullopt;
+  if (cx->sub || cx->emit || !t || kind < BC_SUB_VALUE || kind > BC_SUB_SET || cx->params == nullptr ||
+      std::uint64_t{param} + sub_params_of(kind) > cx->params->values.size() || cx->sub_sets.contains(sub)) {
+    cx->fail(BC_E_HANDLE, "bc_sub_begin: a subquery running, a row begun, an unknown kind or type, its "
+                          "parameters past the given ones, or its id run before");
+    return;
+  }
+  std::array<PhysType, 1> types{*t};
+  cx->sub.emplace(bc_ctx::Sub{sub, kind, *t, param, bytecask::sql::make_result_layout(types)});
+  if (kind == BC_SUB_SET) cx->sub_sets[sub];  // run, so bc_sub_has_* knows it
+  BC_GUARD_END(cx)
+}
+
+void bc_sub_end(bc_ctx* cx) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return;
+  if (!cx->sub || cx->emit) {
+    cx->fail(BC_E_HANDLE, "bc_sub_end: no subquery running, or a row begun");
+    return;
+  }
+  auto s = std::move(*cx->sub);
+  cx->sub.reset();
+  if (cx->sub_params.empty()) cx->sub_params.resize(cx->params->values.size());
+  auto set = [&](std::uint32_t i, Datum d) { cx->sub_params[s.param + i] = std::move(d); };
+  auto flag = [&] { return s.saw_null ? Datum{} : Datum{false}; };
+  switch (s.kind) {
+    case BC_SUB_VALUE: set(0, std::move(s.value)); break;
+    case BC_SUB_EXISTS: set(0, s.rows > 0); break;
+    case BC_SUB_BOUNDS:
+      set(0, s.hi ? std::move(*s.hi) : Datum{});
+      set(1, s.lo ? std::move(*s.lo) : Datum{});
+      set(2, flag());
+      set(3, s.rows > 0);
+      break;
+    case BC_SUB_SET:
+      set(0, flag());
+      set(1, s.rows > 0);
+      break;
+    default: break;
+  }
+  BC_GUARD_END(cx)
+}
+
+bool bc_sub_has_i64(bc_ctx* cx, uint32_t sub, int64_t v) {
+  BC_GUARD_BEGIN
+  return sub_has(cx, sub, Datum{v});
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bool bc_sub_has_f64(bc_ctx* cx, uint32_t sub, double v) {
+  BC_GUARD_BEGIN
+  return sub_has(cx, sub, Datum{v});
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bool bc_sub_has_bool(bc_ctx* cx, uint32_t sub, bool v) {
+  BC_GUARD_BEGIN
+  return sub_has(cx, sub, Datum{v});
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bool bc_sub_has_bytes(bc_ctx* cx, uint32_t sub, bc_view v) {
+  BC_GUARD_BEGIN
+  auto b = cx->resolve(v);
+  if (!b) return false;
+  return sub_has(cx, sub, Datum{Bytes(b->begin(), b->end())});
+  BC_GUARD_END(cx)
+  return {};
+}
 
 void bc_emit_i64(bc_ctx* cx, int64_t v) {
   BC_GUARD_BEGIN
@@ -3070,6 +3296,10 @@ void bc_emit_key_part(bc_ctx* cx, uint32_t table_or_index, bc_view key, uint32_t
 void bc_emit_end(bc_ctx* cx) {
   BC_GUARD_BEGIN
   if (!cx->ok()) return;
+  if (cx->sub) {
+    end_sub_row(cx);
+    return;
+  }
   if (!cx->emit || cx->emit_col != cx->verified.result_types.size()) {
     cx->fail(BC_L_PLAN, "result row ended with the wrong number of columns");
     return;
@@ -3096,6 +3326,10 @@ void bc_emit_end(bc_ctx* cx) {
 void bc_emit_count(bc_ctx* cx, int64_t affected) {
   BC_GUARD_BEGIN
   if (!cx->ok()) return;
+  if (cx->sub) {
+    cx->fail(BC_L_PLAN, "a subquery counts no rows written");
+    return;
+  }
   if (cx->affected >= 0) {
     cx->fail(BC_E_HANDLE, "bc_emit_count called twice");
     return;

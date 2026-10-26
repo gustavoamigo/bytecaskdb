@@ -716,6 +716,7 @@ auto exec_sqlstate(const ExecError& e) noexcept -> std::string_view {
     case BC_E_MEMORY: return "53200";     // out_of_memory
     case BC_E_CLOSED: return "57P01";     // admin_shutdown
     case BC_E_PATTERN: return "22025";    // invalid_escape_sequence
+    case BC_E_CARDINALITY: return "21000";  // cardinality_violation
     case BC_E_IO:
     case BC_E_CORRUPT:
     case BC_E_DEGRADED: return "58030";   // io_error
@@ -1105,12 +1106,18 @@ void Database::check_params(const Compiled& c, const std::vector<Value>& params)
   for (std::size_t i = 0; i < params.size(); ++i) {
     if (!datum_fits(params[i], types[i])) throw ParamError("parameter $" + std::to_string(i + 1) + " has the wrong type");
   }
-  for (std::size_t i = 0; i < params.size(); ++i) {
-    const auto& sql = c.param_sql.at(i);
-    if (!sql) continue;  // assigned only: the row builder checks it, in column order
-    if (auto range = out_of_range(*sql, params[i])) {
-      throw ExecError(*range + " for parameter $" + std::to_string(i + 1), BC_E_CONSTRAINT,
-                      ConstraintDetail{BC_C_RANGE, c.param_table.at(i)}.encode());
+  // An UPDATE's SET values first, then the rest, as PostgreSQL folds a
+  // statement's target list before its WHERE: of two out of range, the
+  // first so reported.
+  for (auto set_first : {true, false}) {
+    for (std::size_t i = 0; i < params.size(); ++i) {
+      const auto& sql = c.param_sql.at(i);
+      if (!sql) continue;  // assigned only: the row builder checks it, in column order
+      if (c.params.at(i).assigned_only != set_first) continue;
+      if (auto range = out_of_range(*sql, params[i])) {
+        throw ExecError(*range + " for parameter $" + std::to_string(i + 1), BC_E_CONSTRAINT,
+                        ConstraintDetail{BC_C_RANGE, c.param_table.at(i)}.encode());
+      }
     }
   }
 }
@@ -1414,6 +1421,7 @@ auto Database::alternatives_for_testing(std::string_view sql, const std::vector<
   if (std::holds_alternative<Ddl>(bound.stmt)) throw std::logic_error("DDL has no plan");
   auto param_sql = bound.param_sql;
   auto param_table = bound.param_table;
+  auto param_info = bound.params;
   auto fixed = bound.fixed;
   std::vector<Rows> out;
   for (auto& plan : generate_alternatives(std::move(bound), *cat, sql, row_counts(), budget_.max_bytes)) {
@@ -1421,6 +1429,7 @@ auto Database::alternatives_for_testing(std::string_view sql, const std::vector<
     Compiled c;
     c.param_sql = param_sql;
     c.param_table = param_table;
+    c.params = param_info;
     c.fixed = fixed;
     c.plan = std::make_unique<GeneratedPlan>(std::move(plan));
     check_params(c, params);

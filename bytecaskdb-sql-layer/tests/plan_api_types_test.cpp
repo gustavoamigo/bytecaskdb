@@ -1109,3 +1109,128 @@ TEST_CASE("plan API: bc_null_row is a row of its table with every column NULL, a
   create_m(f);
   CHECK(value(f, null_rows, {}) == 6);
 }
+
+namespace {
+// A subquery of kind $1 over the values $2 (a list of up to three BIGINTs,
+// NULL ending it early: $2, $3, $4) and the NULL rows $5 says, then each
+// parameter it set, $6 on, as a row: VALUE and EXISTS one, BOUNDS four,
+// SET two, then for SET whether it holds 3 and 9.
+void sub_of_i64(bc_ctx* cx) {
+  auto kind = static_cast<int32_t>(bc_param_i64(cx, 0));
+  bc_sub_begin(cx, 7, kind, BC_T_I64, 5);
+  for (uint32_t i = 1; i <= 3 && !bc_param_null(cx, i); ++i) {
+    bc_emit_begin(cx);
+    bc_emit_i64(cx, bc_param_i64(cx, i));
+    bc_emit_end(cx);
+  }
+  for (int64_t n = bc_param_i64(cx, 4); n > 0; --n) {
+    bc_emit_begin(cx);
+    bc_emit_null(cx);
+    bc_emit_end(cx);
+  }
+  bc_sub_end(cx);
+  uint32_t set = kind == BC_SUB_BOUNDS ? 4 : kind == BC_SUB_SET ? 2 : 1;
+  bc_emit_begin(cx);
+  for (uint32_t i = 5; i < 9; ++i) {
+    if (i >= 5 + set || bc_param_null(cx, i)) {
+      bc_emit_null(cx);
+    } else if (kind == BC_SUB_EXISTS || (kind == BC_SUB_BOUNDS && i >= 7) || kind == BC_SUB_SET) {
+      bc_emit_i64(cx, bc_param_bool(cx, i) ? 1 : 0);
+    } else {
+      bc_emit_i64(cx, bc_param_i64(cx, i));
+    }
+  }
+  if (kind == BC_SUB_SET) {
+    bc_emit_i64(cx, bc_sub_has_i64(cx, 7, 3) ? 1 : 0);
+    bc_emit_i64(cx, bc_sub_has_i64(cx, 7, 9) ? 1 : 0);
+  } else {
+    bc_emit_null(cx);
+    bc_emit_null(cx);
+  }
+  bc_emit_end(cx);
+}
+constexpr std::array<PhysType, 6> kSubRow{PhysType::I64, PhysType::I64, PhysType::I64,
+                                          PhysType::I64, PhysType::I64, PhysType::I64};
+
+// A BC_SUB_SET of DOUBLEs 0.0 and NaN, then whether it holds -0.0, NaN and 1.
+void sub_of_f64(bc_ctx* cx) {
+  bc_sub_begin(cx, 0, BC_SUB_SET, BC_T_F64, 0);
+  for (double d : {0.0, std::numeric_limits<double>::quiet_NaN()}) {
+    bc_emit_begin(cx);
+    bc_emit_f64(cx, d);
+    bc_emit_end(cx);
+  }
+  bc_sub_end(cx);
+  bc_emit_begin(cx);
+  bc_emit_i64(cx, bc_sub_has_f64(cx, 0, -0.0) ? 1 : 0);
+  bc_emit_i64(cx, bc_sub_has_f64(cx, 0, -std::numeric_limits<double>::quiet_NaN()) ? 1 : 0);
+  bc_emit_i64(cx, bc_sub_has_f64(cx, 0, 1.0) ? 1 : 0);
+  bc_emit_null(cx);
+  bc_emit_null(cx);
+  bc_emit_null(cx);
+  bc_emit_end(cx);
+}
+
+void sub_nested(bc_ctx* cx) {
+  bc_sub_begin(cx, 0, BC_SUB_VALUE, BC_T_I64, 0);
+  bc_sub_begin(cx, 1, BC_SUB_VALUE, BC_T_I64, 0);
+}
+
+void sub_wrong_type(bc_ctx* cx) {
+  bc_sub_begin(cx, 0, BC_SUB_VALUE, BC_T_I64, 0);
+  bc_emit_begin(cx);
+  bc_emit_bool(cx, true);
+}
+}  // namespace
+
+TEST_CASE("plan API: a subquery's rows fold into the parameters and the set its kind names", "[sql][algebra]") {
+  Fixture f;
+  const bc_value n = kNull;
+  auto sub = [&](std::int32_t kind, std::vector<bc_value> values, std::int64_t nulls) -> std::vector<bc_value> {
+    values.resize(3, kNull);
+    std::vector<bc_value> p{std::int64_t{kind}};
+    p.insert(p.end(), values.begin(), values.end());
+    p.push_back(nulls);
+    for (int i = 0; i < 4; ++i) p.push_back(kNull);
+    INFO("kind " << kind);
+    auto st = run(f, sub_of_i64, p, kSubRow);
+    INFO(bc_error_message(f.cx));
+    REQUIRE(st == BC_COMMITTED);
+    auto rows = f.results(kSubRow);
+    REQUIRE(rows.size() == 1);
+    return rows[0];
+  };
+  using V = std::vector<bc_value>;
+  auto i = [](std::int64_t v) -> bc_value { return v; };
+  // VALUE: its row's value, NULL for none or a NULL row.
+  CHECK(sub(BC_SUB_VALUE, {}, 0) == V{n, n, n, n, n, n});
+  CHECK(sub(BC_SUB_VALUE, {i(5)}, 0) == V{i(5), n, n, n, n, n});
+  CHECK(sub(BC_SUB_VALUE, {}, 1) == V{n, n, n, n, n, n});
+  // EXISTS: whether it emitted a row, a NULL one too.
+  CHECK(sub(BC_SUB_EXISTS, {}, 0) == V{i(0), n, n, n, n, n});
+  CHECK(sub(BC_SUB_EXISTS, {}, 1) == V{i(1), n, n, n, n, n});
+  // BOUNDS: largest, smallest, NULL if a row was NULL else FALSE, any row.
+  CHECK(sub(BC_SUB_BOUNDS, {i(3), i(-2), i(7)}, 0) == V{i(7), i(-2), i(0), i(1), n, n});
+  CHECK(sub(BC_SUB_BOUNDS, {i(3)}, 2) == V{i(3), i(3), n, i(1), n, n});
+  CHECK(sub(BC_SUB_BOUNDS, {}, 1) == V{n, n, n, i(1), n, n});
+  CHECK(sub(BC_SUB_BOUNDS, {}, 0) == V{n, n, i(0), i(0), n, n});
+  // SET: its values, and the two flags.
+  CHECK(sub(BC_SUB_SET, {i(3), i(4), i(3)}, 0) == V{i(0), i(1), n, n, i(1), i(0)});
+  CHECK(sub(BC_SUB_SET, {}, 1) == V{n, i(1), n, n, i(0), i(0)});
+
+  // A second row of a VALUE subquery: 21000's error.
+  std::vector<bc_value> two{std::int64_t{BC_SUB_VALUE}, std::int64_t{1}, std::int64_t{2}, kNull, std::int64_t{0}};
+  for (int k = 0; k < 4; ++k) two.push_back(kNull);
+  CHECK(run(f, sub_of_i64, two, kSubRow) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CARDINALITY);
+
+  // A DOUBLE set compares as PostgreSQL's =: -0.0 is 0.0, NaN is NaN.
+  REQUIRE(run(f, sub_of_f64, {kNull, kNull}, kSubRow) == BC_COMMITTED);
+  CHECK(f.results(kSubRow)[0] == V{i(1), i(1), i(0), n, n, n});
+
+  // A plan bug is BC_E_HANDLE or BC_E_LAYOUT, never a result.
+  CHECK(run(f, sub_nested, {kNull, kNull}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(run(f, sub_wrong_type, {kNull}, kSubRow) == BC_FAILED);
+  CHECK(bc_error(f.cx) != BC_OK);
+}

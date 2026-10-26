@@ -111,10 +111,27 @@ on any columns, and of predicates over them.
   "C"`). The escape is a backslash, `ESCAPE`'s one character, or none for
   `ESCAPE ''`; a longer one is 22025, as is a pattern the match finds ending
   in its escape. A number column is 42883.
+- **Subqueries**, uncorrelated, in a `SELECT`'s and in an `UPDATE`'s or
+  `DELETE`'s `WHERE`: `col op (SELECT …)` of one value, `[NOT] EXISTS (SELECT
+  …)`, `col [NOT] IN (SELECT …)` and `col op ANY | SOME | ALL (SELECT …)`; and
+  `(SELECT …)` in a select list. Each runs once, before the statement's own
+  plan, on its snapshot (`planner_design.md`, *Subqueries*). Its semantics
+  are PostgreSQL's: a scalar subquery of no row is NULL, of two or more
+  21000; `IN` is `= ANY` and `NOT IN` its `NOT`; `ANY` is true where a row
+  makes the comparison true, else NULL where a row is NULL (or the column
+  is, over some rows), else false, over no rows too; `ALL` is `NOT ANY` of
+  the negated operator, so true over no rows. A subquery selects one column,
+  but for `EXISTS` (42601 otherwise), of a type the column compares with:
+  integers with integers, a DECIMAL of its scale, strings with strings, any
+  other type its own. A scalar one is a parameter to the plan, so
+  `id = (SELECT MAX(k) FROM u)` is a key lookup.
 - Not yet: a predicate comparing a REAL or DOUBLE column (`no plan:`, as
   any filter on one), `$n ± k` inside one, one of both tables' columns in a
-  join, in `HAVING`, `IN` of a subquery, `ILIKE` (its case folding is a
-  locale's), `LIKE` of a BYTEA column, `IS DISTINCT FROM`.
+  join, in `HAVING`, `ILIKE` (its case folding is a locale's), `LIKE` of a
+  BYTEA column, `IS DISTINCT FROM`; a subquery that reads a column of the
+  query around it (correlated), one inside another, in `FROM`, `FOR UPDATE`
+  in one, one of `AVG`, assigned by `SET` or `VALUES`, beside an aggregate,
+  or compared with other than a column.
 - Comparing two columns of different SQL types is refused (*Known
   differences*).
 
@@ -194,9 +211,10 @@ and with a constant selected or `DISTINCT ON`, it is not taken yet.
 
 **Refused**, with a message and the node's position: everything not above.
 That includes:
-- `ILIKE`, `IN` of a subquery, `IS DISTINCT FROM`, a predicate over both
-  tables of a join or in `HAVING`;
-- subqueries, derived tables, set operations;
+- `ILIKE`, `IS DISTINCT FROM`, a predicate over both tables of a join or
+  in `HAVING`;
+- correlated and nested subqueries and the others above, derived tables,
+  set operations;
 - `DISTINCT ON`, `DISTINCT` of a constant or over groups it does not select
   every key of, `GROUP BY` of an expression, and `HAVING` of anything but
   the comparisons above;

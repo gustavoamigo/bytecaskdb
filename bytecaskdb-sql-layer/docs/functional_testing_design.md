@@ -114,8 +114,8 @@ the row says 2016.
   the 743, 374 stopping at the layer's refusal of such a table; with
   tables without a primary key, literals, `SELECT` without `FROM` and
   comparisons of constants, UNIQUE constraints, SELECT DISTINCT, JOIN
-  USING, WHERE predicates, LIKE, outer joins and FOREIGN KEY accepted
-  (not enforced) built, 318 pass, and the
+  USING, WHERE predicates, LIKE, outer joins, FOREIGN KEY accepted (not
+  enforced) and uncorrelated subqueries built, 365 pass, and the
   rest stop at forms the dialect leaves out. The list is
   `tests/functional/not_implemented/sqltest.txt`.
 
