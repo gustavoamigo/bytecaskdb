@@ -107,6 +107,16 @@ struct ColumnDefAst {
   bool primary_key{false};
   std::optional<Literal> default_value;
   std::int32_t pos{-1};
+  // Each UNIQUE constraint on the column: its name, "" for none.
+  std::vector<std::string> unique;
+};
+
+// A UNIQUE constraint of CREATE TABLE, on a column or on the table, in the
+// order written: its name ("" for one the catalog chooses) and columns.
+struct UniqueAst {
+  std::string name;
+  std::vector<std::string> columns;
+  std::int32_t pos{-1};
 };
 
 struct CreateTable {
@@ -114,6 +124,7 @@ struct CreateTable {
   std::vector<ColumnDefAst> columns;
   std::vector<std::string> pk;  // a table-level PRIMARY KEY (…)
   std::int32_t pos{-1};
+  std::vector<UniqueAst> unique;  // every UNIQUE constraint, columns' and the table's, in order
 };
 
 struct IndexColumnAst {

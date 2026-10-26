@@ -5,8 +5,6 @@
 
 - name: a UNIQUE column takes several NULLs
   features: [pg:unique-nulls-distinct]
-  # the layer refuses a column constraint: CREATE UNIQUE INDEX is the only way to a unique key
-  unimplemented: true
   setup:
     - CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER UNIQUE)
   steps:
