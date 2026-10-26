@@ -184,11 +184,16 @@ auto fold_constants(Node& n) -> bool {
           c = fold_conjuncts(op.conjuncts, never) || c;
           never = never || std::holds_alternative<Empty>(op.input->op);
         } else if constexpr (std::is_same_v<T, Join>) {
-          c = fold_conjuncts(op.predicate, never);
+          // An inner join with an empty side, or a predicate never true, is
+          // empty. A left outer join keeps its left side's rows whatever its
+          // right side and its ON hold.
+          auto on_never = false;
+          c = fold_conjuncts(op.predicate, on_never);
+          never = never || (!op.left_outer && on_never);
           c = fold_constants(*op.left) || c;
           c = fold_constants(*op.right) || c;
-          // An inner join with an empty side is empty.
-          never = never || std::holds_alternative<Empty>(op.left->op) || std::holds_alternative<Empty>(op.right->op);
+          never = never || std::holds_alternative<Empty>(op.left->op) ||
+                  (!op.left_outer && std::holds_alternative<Empty>(op.right->op));
         } else if constexpr (std::is_same_v<T, Project> || std::is_same_v<T, Aggregate>) {
           auto& outs = [&]() -> std::vector<Output>& {
             if constexpr (std::is_same_v<T, Project>) {
@@ -282,6 +287,10 @@ auto push_down(Node& n) -> bool {
     for (auto& c : f->conjuncts) {
       if (reads_only(c, left)) {
         to_left.push_back(std::move(c));
+      } else if (j.left_outer) {
+        // Above a left outer join, a conjunct reading its right side filters
+        // the rows the join gives, its NULLs among them: it stays.
+        kept.push_back(std::move(c));
       } else if (reads_only(c, right)) {
         to_right.push_back(std::move(c));
       } else if (reads_only(c, both)) {
@@ -300,6 +309,18 @@ auto push_down(Node& n) -> bool {
     }
   }
   if (auto* j = std::get_if<Join>(&n.op)) {
+    // A left outer join's ON conjunct reading its right side alone filters
+    // that side; one reading its left side decides which pairs there are,
+    // never which left rows: it stays.
+    if (j->left_outer) {
+      std::vector<const Table*> right;
+      tables_of(*j->right, right);
+      std::vector<Expr> stays, to_right;
+      for (auto& c : j->predicate) (reads_only(c, right) ? to_right : stays).push_back(std::move(c));
+      changed = changed || !to_right.empty();
+      j->predicate = std::move(stays);
+      push_onto(j->right, std::move(to_right));
+    }
     changed = push_down(*j->left) || changed;
     return push_down(*j->right) || changed;
   }

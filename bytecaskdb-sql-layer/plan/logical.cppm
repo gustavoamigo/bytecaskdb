@@ -169,10 +169,13 @@ struct Project {
 };
 
 // The inner join: the pairs for which every conjunct of the predicate is
-// true.
+// true. Left outer: those, and each row of `left` none pairs with, once,
+// with `right`'s columns NULL; the predicate is its ON, which decides the
+// pairs, never which rows of `left` there are.
 struct Join {
   NodePtr left, right;
   std::vector<Expr> predicate;
+  bool left_outer{false};
 };
 
 // One row per group of the input's rows whose `group_by` columns are equal,

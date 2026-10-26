@@ -806,6 +806,12 @@ private:
   struct Query {
     std::vector<Rel> rels;
     Conjuncts on;
+    // A left outer join of rels[0] and rels[1]: rels[0] first, by any path,
+    // rels[1] probed or scanned under it, never hashed; the join's ON among
+    // rels[1]'s conjuncts and `on`; `post` the WHERE's conjuncts on rels[1]'s
+    // columns, which filter the rows the join gives, NULLs included.
+    bool left_outer{false};
+    Conjuncts post;
     std::vector<ColumnRef> above;    // what a SELECT reads above a sort: its result's columns
     std::vector<ColumnRef> sort_by;  // the ORDER BY's columns a sort keys on
 
@@ -826,6 +832,16 @@ private:
   void flatten(const logical::Node& n, Query& q) {
     if (const auto* f = std::get_if<logical::Filter>(&n.op)) {
       const auto* g = std::get_if<logical::Get>(&f->input->op);
+      if (const auto* j = std::get_if<logical::Join>(&f->input->op); j != nullptr && j->left_outer) {
+        for (const auto& c : f->conjuncts) {
+          // Of the join's rows: on a DOUBLE or REAL column, as any filter's.
+          const auto* fc = is_compare(c) ? (col_of(c).type == PhysType::F64 ? &col_of(c) : nullptr) : float_compared(c);
+          if (fc != nullptr) no_plan(double_filter(cat_.table(fc->table)->column(fc->col)->name).why);
+          q.post.push_back(c);
+        }
+        flatten(*f->input, q);
+        return;
+      }
       if (g == nullptr) {
         // What pushdown leaves above a Join reads no column.
         for (const auto& c : f->conjuncts) {
@@ -868,7 +884,21 @@ private:
     Tables left;
     for (auto i = split; i < right_from; ++i) left.push_back(q.rels[i].table().id);
     auto right = tables_of(q, right_from);
+    if (j->left_outer) {
+      if (q.rels.size() != 2) no_plan("a left outer join of other than two tables");
+      q.left_outer = true;
+    }
     for (const auto& c : j->predicate) {
+      // An outer join's ON conjunct on its left side alone decides its pairs:
+      // a filter of its right side's rows, which reads the left row too.
+      if (j->left_outer) {
+        std::vector<ColumnRef> cols;
+        logical::columns_of(c, cols);
+        if (!cols.empty() && std::ranges::all_of(cols, [&](const ColumnRef& r) { return reads(left, logical::column(r, {})); })) {
+          q.rels[right_from].preds.push_back(c);
+          continue;
+        }
+      }
       if (logical::is_predicate(c)) {
         // A filter of the one table whose columns it reads.
         std::vector<ColumnRef> cols;
@@ -1207,6 +1237,16 @@ private:
         if (col.table == id) out.push_back(col);
       }
     }
+    // An outer join's conjuncts that read both sides: its ON's on the left
+    // side alone, among the right side's, and the WHERE's above it.
+    std::vector<ColumnRef> cols;
+    for (const auto& r : q.rels) {
+      for (const auto& c : r.preds) logical::columns_of(c, cols);
+    }
+    for (const auto& c : q.post) logical::columns_of(c, cols);
+    for (const auto& col : cols) {
+      if (col.table == id) out.push_back(col);
+    }
     return out;
   }
 
@@ -1335,7 +1375,9 @@ private:
     Searched out;
     out.tried.assign(n, {});
     for (std::size_t i = 0; i < n; ++i) {
-      out.tried[i] = accesses(q.rels[i], ordered, read_set(q, i, used), may_cover, grouping);
+      // An outer join's right side reads rows: where it matches nothing its
+      // row is bc_null_row's, never an entry's key.
+      out.tried[i] = accesses(q.rels[i], ordered, read_set(q, i, used), may_cover && !(q.left_outer && i == 1), grouping);
       for (const auto& a : out.tried[i]) {
         Candidate c;
         c.first = i;
@@ -1355,6 +1397,7 @@ private:
         }
       }
       for (const auto& [set, t] : extend) {
+        if (q.left_outer && t == 0) continue;  // its left side first
         auto on = joins(q, t, set);
         auto pr = probe(q, t, on);
         // Read by its own scan, t's rows are filtered by every join conjunct.
@@ -1384,7 +1427,7 @@ private:
             // Where no key reaches t, a hash join on the join's equalities,
             // built on t or on the outer table. Under at most one outer row,
             // reading t once costs less.
-            if (pr || pr.error().stage != Stage::Reach || o.one_row()) continue;
+            if (q.left_outer || pr || pr.error().stage != Stage::Reach || o.one_row()) continue;
             for (auto build_inner : {true, false}) {
               if (auto h = hash_join(o, t, a, on, on_double, build_inner)) keep(best, cost_of(std::move(*h)), full);
             }
@@ -1572,14 +1615,28 @@ private:
     if (by_column) {
       for (const auto& rel : q.rels) add_params(out.null_checks, rel.where);
     }
+    // A left outer join keeps its left rows whatever its right side's
+    // parameters hold: a NULL among them is the inner side's to match
+    // nothing, by the join's guard, never the plan's to end on.
+    std::vector<std::uint32_t> guard;
+    if (q.left_outer) {
+      add_params(guard, q.rels[1].where);
+      std::erase_if(out.null_checks, [&](std::uint32_t p) { return std::ranges::contains(guard, p); });
+      add_params(out.null_checks, q.rels[0].where);
+    }
     // The second plan of each choice point checks and computes what it reads.
     for (const auto& ch : choices) {
-      for (auto p : ch.other.null_checks) add_param(out.null_checks, p);
+      for (auto p : ch.other.null_checks) add_param(q.left_outer && ch.at > 0 ? guard : out.null_checks, p);
       const auto rel = ch.at == 0 ? c.first : rel_of(c.steps[ch.at - 1]);
       access_computed(out.computed, ch.other, q.rels[rel].table().id);
     }
     for (std::size_t i = 0; i < c.steps.size(); ++i) {
       if (const auto* pr = std::get_if<Probe>(&c.steps[i])) {
+        if (q.left_outer) {
+          out.rows = physical::node(
+              physical::IndexJoin{std::move(out.rows), q.rels[pr->rel].table().id, pr->key, true, pr->filters});
+          continue;
+        }
         auto pairs = physical::node(physical::IndexJoin{std::move(out.rows), q.rels[pr->rel].table().id, pr->key});
         out.rows = filtered(std::move(pairs), pr->filters);
       } else if (const auto* h = std::get_if<Hashed>(&c.steps[i])) {
@@ -1598,8 +1655,17 @@ private:
         out.rows = filtered(physical::node(std::move(hj)), h->filters);
       } else {
         out.rows = physical::node(physical::NestedLoop{
-            std::move(out.rows), leaf_at(std::get<Nested>(c.steps[i]).access, i + 1, choices, sort)});
+            std::move(out.rows), leaf_at(std::get<Nested>(c.steps[i]).access, i + 1, choices, sort), q.left_outer,
+            q.left_outer ? guard : std::vector<std::uint32_t>{}});
       }
+    }
+    // An outer join's WHERE on its right side: of the rows it gives, before
+    // a sort, so a LIMIT counts the rows it keeps.
+    if (!q.post.empty()) {
+      for (const auto& f : q.post) {
+        if (is_compare(f)) add_computed(out.computed, operand_of(f), col_of(f).table);
+      }
+      out.rows = filtered(std::move(out.rows), q.post);
     }
     // A choice by the budget sorts in its first plan's branch.
     auto in_choice = std::ranges::any_of(choices, &ChoiceAt::sorts_first);
@@ -1609,7 +1675,8 @@ private:
       out.rows = sorted(std::move(out.rows), *sort, std::move(payloads));
       for (auto i = c.after_first_loop(); i < c.steps.size(); ++i) {
         if (const auto* pr = std::get_if<Probe>(&c.steps[i])) {
-          out.rows = physical::node(physical::IndexJoin{std::move(out.rows), q.rels[pr->rel].table().id, pr->key});
+          out.rows = physical::node(physical::IndexJoin{std::move(out.rows), q.rels[pr->rel].table().id, pr->key,
+                                                        q.left_outer, q.left_outer ? pr->filters : Conjuncts{}});
         }
       }
     }

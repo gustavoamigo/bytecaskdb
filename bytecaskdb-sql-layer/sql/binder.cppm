@@ -682,8 +682,7 @@ auto fold(const ast::Expr& e) -> Constant {
 // compares in a wider type, which the layer's keys don't
 // (docs/frontend_design.md, *Known differences*). A string literal or NULL
 // is read as c's type, as PostgreSQL reads an unknown literal. The range of
-// an assigned value is checked where the value is written, as an assigned
-// parameter's is.
+// an assigned value is its caller's to check.
 auto coerce(const Constant& k, const Column& c, bool assigned, std::string_view op) -> Datum {
   auto inexact = [&] [[noreturn]] {
     not_yet("comparing " + c.name + " (" + sql_type_name(c.sql) + ") with a constant its type does not hold exactly", k.pos);
@@ -1107,7 +1106,15 @@ public:
   // An expression whose type is fixed by its target (an assigned column).
   auto value(const Table& t, const ast::Expr& e, const Column& target) -> logical::Expr {
     auto want = target.type;
-    if (is_constant(e)) return fixed(coerce(fold(e), target, true, "="), target.sql);
+    if (is_constant(e)) {
+      // Out of the column's type, it is refused here, before anything runs,
+      // as PostgreSQL's planner folds its assignment cast: so of several the
+      // first in the statement's order, as there.
+      auto k = fold(e);
+      auto v = coerce(k, target, true, "=");
+      if (auto why = out_of_range(target.sql, v)) out_of_type(*why, k.pos);
+      return fixed(std::move(v), target.sql);
+    }
     switch (e.kind) {
       case ast::Expr::Kind::Param:
         use_param(e.param, want, e.pos, target, t.id, Use::Assigned);
@@ -1327,10 +1334,14 @@ public:
 
   // A join's WHERE: each conjunct a comparison of a column of one side with
   // a parameter, or a column of each, in WHERE order.
-  auto where(const Table* (&sides)[2], const std::vector<ast::Compare>& in) -> std::vector<logical::Expr> {
+  // A join's WHERE; with `on`, of its ON's conjuncts alone, or of the
+  // others alone.
+  auto where(const Table* (&sides)[2], const std::vector<ast::Compare>& in, std::optional<bool> on = std::nullopt)
+      -> std::vector<logical::Expr> {
     std::vector<logical::Expr> out;
     for (const auto* c : top_level(in)) {
       const auto& w = *c;
+      if (on && w.on != *on) continue;
       if (w.kind == ast::Compare::Kind::Compare && w.lhs.kind == ast::Expr::Kind::Column &&
           w.rhs.kind == ast::Expr::Kind::Column) {
         out.push_back(join_on(sides, w));
@@ -1410,13 +1421,27 @@ public:
     auto joined = !s.join.empty();
     const Table* sides[2]{table(s.table, joined ? s.table_pos : s.pos), nullptr};
     std::vector<logical::Expr> conjuncts;
+    auto outer = joined && s.join_kind != ast::Select::JoinKind::Inner;
+    std::vector<logical::Expr> on;  // an outer join's ON: its Join's predicate
     if (joined) {
       sides[1] = table(s.join, s.join_pos);
       if (sides[0] == sides[1]) throw SqlError{"a table joined with itself is not supported", s.pos};
       if (s.for_update) throw SqlError{"FOR UPDATE on a join is not supported yet", s.pos};
       conjuncts = using_conjuncts(sides, s);
-      auto rest = where(sides, s.where);
-      conjuncts.insert(conjuncts.end(), std::make_move_iterator(rest.begin()), std::make_move_iterator(rest.end()));
+      // An outer join's ON decides its pairs and its WHERE filters them, so
+      // the two stay apart; the table every row of which it keeps comes
+      // first: RIGHT is LEFT of the tables swapped, and a USING column named
+      // alone is that table's, as in PostgreSQL.
+      if (s.join_kind == ast::Select::JoinKind::Right) std::swap(sides[0], sides[1]);
+      if (outer) {
+        on = std::move(conjuncts);
+        auto rest = where(sides, s.where, true);
+        on.insert(on.end(), std::make_move_iterator(rest.begin()), std::make_move_iterator(rest.end()));
+        conjuncts = where(sides, s.where, false);
+      } else {
+        auto rest = where(sides, s.where);
+        conjuncts.insert(conjuncts.end(), std::make_move_iterator(rest.begin()), std::make_move_iterator(rest.end()));
+      }
     } else {
       conjuncts = where(*sides[0], s.where);
     }
@@ -1508,7 +1533,7 @@ public:
     }
 
     auto rows = joined ? logical::node(logical::Join{logical::node(logical::Get{sides[0], false}),
-                                                     logical::node(logical::Get{sides[1], false}), {}})
+                                                     logical::node(logical::Get{sides[1], false}), std::move(on), outer})
                        : logical::node(logical::Get{sides[0], s.for_update});
     if (!conjuncts.empty()) rows = logical::node(logical::Filter{std::move(rows), std::move(conjuncts)});
     if (aggregated) {
@@ -1521,7 +1546,39 @@ public:
       rows = logical::node(logical::Project{std::move(rows), std::move(targets)});
     }
     if (s.limit) rows = logical::node(logical::Limit{std::move(rows), *s.limit});
+    if (outer) nullable_above_join(*rows, sides[1]->id);
     return rows;
+  }
+
+  // Above a left outer join every column of its right table may be NULL, in
+  // the rows it NULL-extends, whatever the column's declaration: so marked,
+  // the plan tests it. The join's own predicate and inputs read real rows.
+  static void nullable_above_join(logical::Node& n, std::uint32_t table) {
+    std::function<void(logical::Expr&)> mark = [&](logical::Expr& e) {
+      if (e.kind == logical::Expr::Kind::Column && e.col.table == table) e.col.nullable = true;
+      for (auto& a : e.args) mark(a);
+    };
+    std::visit(
+        [&](auto& op) {
+          using T = std::decay_t<decltype(op)>;
+          if constexpr (std::is_same_v<T, logical::Join>) {
+            return;
+          } else {
+            if constexpr (std::is_same_v<T, logical::Filter>) {
+              for (auto& c : op.conjuncts) mark(c);
+            } else if constexpr (std::is_same_v<T, logical::Project>) {
+              for (auto& o : op.exprs) mark(o.expr);
+            } else if constexpr (std::is_same_v<T, logical::Aggregate>) {
+              for (auto& o : op.aggs) mark(o.expr);
+              for (auto& g : op.group_by) mark(g);
+              for (auto& g : op.dependent) mark(g);
+            } else if constexpr (std::is_same_v<T, logical::Sort>) {
+              for (auto& k : op.keys) mark(k.expr);
+            }
+            if constexpr (requires { op.input; }) nullable_above_join(*op.input, table);
+          }
+        },
+        n.op);
   }
 
   // A SELECT without FROM: its constants, one row of them, under its LIMIT.

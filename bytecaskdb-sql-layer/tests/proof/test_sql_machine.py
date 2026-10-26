@@ -166,16 +166,19 @@ class Table:
         return f"SELECT {', '.join(c.name for c in self.columns)} FROM {self.name}"
 
 
-def join_served(a: Table, conj_a: list[tuple], b: Table, conj_b: list[tuple], on: list[tuple[str, str]]) -> bool:
+def join_served(a: Table, conj_a: list[tuple], b: Table, conj_b: list[tuple], on: list[tuple[str, str]],
+                outer: bool = False) -> bool:
     """Whether the planner plans a join of a and b on `on` (a's column, b's)
     with these conjuncts: when some order reads the outer table by any
     access path and the inner one by its whole primary key from parameters
     and outer columns, or by its own scan: under an outer table named by its
     key, read once; under any other, read once per outer row or hash joined.
     Every other conjunct a filter, none on a DOUBLE or REAL. Any ORDER BY is
-    served: a sort holds a row of each loop in a sorter of its own."""
+    served: a sort holds a row of each loop in a sorter of its own. `outer`:
+    a LEFT JOIN of b, which keeps a the outer table and never hashes, the
+    same conditions in its one order."""
     sides = [(a, conj_a, [x for x, _ in on]), (b, conj_b, [y for _, y in on])]
-    for o in (0, 1):
+    for o in ((0,) if outer else (0, 1)):
         (ot, oconj, ocols), (it, iconj, icols) = sides[o], sides[1 - o]
         if not served(ot, oconj):
             continue
@@ -753,14 +756,18 @@ class SqlMachine(Sides, RuleBasedStateMachine):
     def join_on(self, a_name: str, b_name: str, where_a: list[tuple[str, str, object]],
                 keys_b: list[tuple[str, tuple[str, object]]], filters_b: list[tuple[str, str, object]],
                 targets: list[tuple[str, str]], limit: int | None = None, distinct: tuple[str, str] | None = None,
-                links: list[tuple[str, str]] = (), order: list[tuple] = ()) -> None:
+                links: list[tuple[str, str]] = (), order: list[tuple] = (), outer: str | None = None,
+                anti: bool = False) -> None:
         """SELECT targets (or COUNT(DISTINCT table.col)) FROM a, b WHERE a's
         conjuncts, each of b's key parts equal to a column of a ("col", name)
         or to a parameter ("param", value), b's filters, and each link (b's
         column, a's) an equality of a column b's key does not hold with a
         column of a, ORDER BY each (table, column, DESC, NULLS FIRST): on both
         sides when the planner serves it, else the layer must refuse it with
-        no plan."""
+        no plan. `outer` "LEFT" or "RIGHT": a outer joined to b, b's
+        conditions and the links its ON, a's its WHERE; `anti`: the WHERE
+        also takes the rows b matched none of, by b's first key column IS
+        NULL."""
         a, b = self.tables[a_name], self.tables[b_name]
         conds, pg_conds, params, types = [], [], [], []
         def add(t, c, op, v):
@@ -771,6 +778,7 @@ class SqlMachine(Sides, RuleBasedStateMachine):
             types.append(t.column(c).type)
         for c, op, v in where_a:
             add(a, c, op, v)
+        n_a = len(conds)
         on = []
         for c, (kind, v) in keys_b:
             if kind == "col":
@@ -788,10 +796,18 @@ class SqlMachine(Sides, RuleBasedStateMachine):
         select = f"count(DISTINCT {distinct[0]}.{distinct[1]})" if distinct else ", ".join(f"{t}.{c}" for t, c in targets)
         ordered = " ORDER BY " + order_text([(f"{t}.{c}", *rest) for t, c, *rest in order]) if order else ""
         tail = f" LIMIT {limit}" if limit is not None else ""
-        sql = f"SELECT {select} FROM {a_name}, {b_name}{self.where_text(conds)}{ordered}{tail}"
-        pg_sql = f"SELECT {select} FROM {a_name}, {b_name}{self.where_text(pg_conds)}{ordered}"
+        if outer and len(conds) > n_a:
+            def text(cs):
+                where = cs[:n_a] + ([f"{b_name}.{b.pk[0]} IS NULL"] if anti else [])
+                joined = (f"{a_name} LEFT JOIN {b_name}" if outer == "LEFT" else f"{b_name} RIGHT JOIN {a_name}")
+                return f"SELECT {select} FROM {joined} ON {' AND '.join(cs[n_a:])}{self.where_text(where)}"
+            sql, pg_sql = text(conds) + ordered + tail, text(pg_conds) + ordered
+        else:
+            outer = None
+            sql = f"SELECT {select} FROM {a_name}, {b_name}{self.where_text(conds)}{ordered}{tail}"
+            pg_sql = f"SELECT {select} FROM {a_name}, {b_name}{self.where_text(pg_conds)}{ordered}"
         conj_b = [(c, "=", False) for c, (kind, _) in keys_b if kind == "param"] + conjuncts(filters_b)
-        if not join_served(a, conjuncts(where_a), b, conj_b, on):
+        if not join_served(a, conjuncts(where_a), b, conj_b, on, outer=outer is not None):
             self.no_plan(a_name, sql, params, types)
             return
         out = None
@@ -1401,13 +1417,23 @@ class SqlMachine(Sides, RuleBasedStateMachine):
         if data.draw(st.integers(0, 3), label="COUNT(DISTINCT)?") == 0:
             t = data.draw(st.sampled_from([a, b]), label="distinct of")
             self.join_on(a_name, b_name, where_a, keys_b, filters_b, [],
-                         distinct=(t.name, data.draw(st.sampled_from([x.name for x in t.columns]), label="column")))
+                         distinct=(t.name, data.draw(st.sampled_from([x.name for x in t.columns]), label="column")),
+                         **self.draw_outer(data, b))
             return
         columns = [(t.name, x.name) for t in (a, b) for x in t.columns]
         targets = data.draw(st.lists(st.sampled_from(columns), min_size=1, max_size=3, unique=True), label="targets")
         order = self.join_order(data, columns, targets)
         self.join_on(a_name, b_name, where_a, keys_b, filters_b, targets,
-                     limit=data.draw(st.none() | st.sampled_from([0, 1, 3]), label="limit"), order=order)
+                     limit=data.draw(st.none() | st.sampled_from([0, 1, 3]), label="limit"), order=order,
+                     **self.draw_outer(data, b))
+
+    @staticmethod
+    def draw_outer(data, b: Table) -> dict:
+        """Now and then the join outer: LEFT, or RIGHT with its sides
+        written the other way round, the rows b matches none of alone now
+        and then."""
+        outer = data.draw(st.sampled_from([None, None, "LEFT", "RIGHT"]), label="outer join")
+        return {"outer": outer, "anti": outer is not None and data.draw(st.integers(0, 3), label="anti join?") == 0}
 
     @staticmethod
     def join_order(data, columns: list[tuple[str, str]], targets: list[tuple[str, str]]) -> list[tuple]:
@@ -1465,12 +1491,14 @@ class SqlMachine(Sides, RuleBasedStateMachine):
         if data.draw(st.integers(0, 3), label="COUNT(DISTINCT)?") == 0:
             t = data.draw(st.sampled_from([a, b]), label="distinct of")
             self.join_on(a_name, b_name, where_a, keys_b, [], [], links=links,
-                         distinct=(t.name, data.draw(st.sampled_from([x.name for x in t.columns]), label="column")))
+                         distinct=(t.name, data.draw(st.sampled_from([x.name for x in t.columns]), label="column")),
+                         **self.draw_outer(data, b))
             return
         targets = data.draw(st.lists(st.sampled_from(columns), min_size=1, max_size=3, unique=True), label="targets")
         order = self.join_order(data, columns, targets)
         self.join_on(a_name, b_name, where_a, keys_b, [], targets, links=links,
-                     limit=data.draw(st.none() | st.sampled_from([0, 1, 3]), label="limit"), order=order)
+                     limit=data.draw(st.none() | st.sampled_from([0, 1, 3]), label="limit"), order=order,
+                     **self.draw_outer(data, b))
 
     @precondition(lambda self: len(self.tables) >= 2)
     @rule(data=st.data())
@@ -1490,12 +1518,14 @@ class SqlMachine(Sides, RuleBasedStateMachine):
         if data.draw(st.integers(0, 3), label="COUNT(DISTINCT)?") == 0:
             t = data.draw(st.sampled_from([a, b]), label="distinct of")
             self.join_on(a_name, b_name, where_a, [], where_b, [], links=links,
-                         distinct=(t.name, data.draw(st.sampled_from([x.name for x in t.columns]), label="column")))
+                         distinct=(t.name, data.draw(st.sampled_from([x.name for x in t.columns]), label="column")),
+                         **self.draw_outer(data, b))
             return
         targets = data.draw(st.lists(st.sampled_from(columns), min_size=1, max_size=3, unique=True), label="targets")
         order = self.join_order(data, columns, targets)
         self.join_on(a_name, b_name, where_a, [], where_b, targets, links=links,
-                     limit=data.draw(st.none() | st.sampled_from([0, 1, 3]), label="limit"), order=order)
+                     limit=data.draw(st.none() | st.sampled_from([0, 1, 3]), label="limit"), order=order,
+                     **self.draw_outer(data, b))
 
     @precondition(lambda self: len(self.tables) >= 2 and self.txn is None)
     @rule(data=st.data())
@@ -1978,6 +2008,37 @@ def test_join_using_and_natural_join(dsn):
             assert m.both(sql).error is None
         assert m.both("SELECT c2 FROM t0 JOIN t1 USING (c1)").error == "42702"
         assert m.both("SELECT c0 FROM t0 JOIN t1 USING (c3)").error == "42703"
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_left_and_right_join_null_extend_the_rows_nothing_matches(dsn):
+    """LEFT and RIGHT JOIN: each row of the preserved side, NULL-extended
+    where ON matches nothing; WHERE filters the joined rows; a USING
+    column alone is the preserved side's."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT), Column("c1", o.INTEGER), Column("c2", o.TEXT)], ["c0"]))
+        m.create(Table("t1", [Column("c3", o.BIGINT), Column("c1", o.INTEGER, nullable=False), Column("c2", o.TEXT)],
+                       ["c3"]))
+        for row in ({"c0": 1, "c1": 1, "c2": "x"}, {"c0": 2, "c1": 2, "c2": "y"}, {"c0": 3, "c1": None, "c2": "z"},
+                    {"c0": 4, "c1": 4, "c2": None}):
+            assert m.insert("t0", row, all_columns=True).error is None
+        for row in ({"c3": 10, "c1": 1, "c2": "x"}, {"c3": 11, "c1": 2, "c2": "n"}, {"c3": 12, "c1": 5, "c2": "z"},
+                    {"c3": 13, "c1": 1, "c2": "x"}):
+            assert m.insert("t1", row, all_columns=True).error is None
+        for sql in ("SELECT t0.c0, t1.c3 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 ORDER BY t0.c0, t1.c3",
+                    "SELECT t0.c0, t1.c3 FROM t1 RIGHT JOIN t0 ON t0.c1 = t1.c1 AND t1.c2 = 'x' ORDER BY t0.c0, t1.c3",
+                    "SELECT t0.c0, t1.c3 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 AND t0.c2 = 'x' ORDER BY t0.c0, t1.c3",
+                    "SELECT t0.c0 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 WHERE t1.c3 IS NULL ORDER BY t0.c0",
+                    "SELECT t0.c0, t1.c3 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 WHERE t1.c2 = 'x' OR t0.c0 > 2 ORDER BY t0.c0, t1.c3",
+                    "SELECT c1, t0.c0, t1.c3 FROM t0 LEFT JOIN t1 USING (c1) ORDER BY t0.c0, t1.c3",
+                    "SELECT c1, t0.c0, t1.c3 FROM t0 RIGHT JOIN t1 USING (c1) ORDER BY t1.c3",
+                    "SELECT t0.c0, t1.c3 FROM t0 NATURAL LEFT JOIN t1 ORDER BY t0.c0",
+                    "SELECT t0.c0, COUNT(t1.c1), COUNT(*) FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 GROUP BY t0.c0 ORDER BY t0.c0",
+                    "SELECT t1.c1, COUNT(*) FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 GROUP BY t1.c1 ORDER BY t1.c1"):
+            assert m.both(sql).error is None
         m.check()
     finally:
         m.teardown()

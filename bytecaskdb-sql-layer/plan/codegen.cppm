@@ -816,7 +816,74 @@ private:
   // For each outer row, the inner row its key names. Of an outer column, a
   // NULL names no row, nor does a byte string too long for any key. The
   // inner row of the d-th join from the first table is row<d>, found<d>.
+  // A left outer join's row of the inner table's NULLs, nr<i>, made once
+  // before its outer side's loop.
+  auto null_row(std::uint32_t table) -> std::string {
+    auto n = "nr" + std::to_string(nulls_++);
+    w_.reads(table);
+    w_.line("bc_view " + n + " = bc_null_row(cx, " + w_.tbl(table) + ");");
+    return n;
+  }
+
+  // The table a nested loop's inner side reads.
+  static auto inner_table(const physical::Node& n) -> std::uint32_t {
+    return std::visit(
+        [](const auto& op) -> std::uint32_t {
+          using T = std::decay_t<decltype(op)>;
+          if constexpr (std::is_same_v<T, physical::Scan> || std::is_same_v<T, physical::PointGet>) {
+            return op.table;
+          } else if constexpr (std::is_same_v<T, physical::NullSplitScan>) {
+            return op.present.table;
+          } else if constexpr (std::is_same_v<T, physical::Choice>) {
+            return inner_table(*op.below);
+          } else if constexpr (requires { op.input; }) {
+            return inner_table(*op.input);
+          } else {
+            throw std::logic_error{"physical plan: a nested loop's inner side reads no one table"};
+          }
+        },
+        n.op);
+  }
+
+  // Left outer: the inner row where its key has no NULL part, the table
+  // holds it and every match conjunct holds of the pair; else the null row.
+  // The outer row is never dropped.
+  void outer_index_join(const physical::IndexJoin& j, const Consume& k) {
+    const auto nr = null_row(j.inner);
+    produce(*j.outer, [&] {
+      const auto d = std::to_string(rows_.size());
+      const auto row = "row" + d;
+      const auto found = "found" + d;
+      std::vector<KeySrc> parts;
+      std::string nulls;
+      for (const auto& e : j.inner_key) {
+        if (e.kind == Expr::Kind::Param) {
+          parts.push_back({e.param, {}, PhysType::I64});
+          nulls += (nulls.empty() ? "" : " || ") + param_null(e.param);
+          continue;
+        }
+        if (e.col.nullable) nulls += (nulls.empty() ? "" : " || ") + col_null(e.col);
+        parts.push_back({std::nullopt, read_col(e.col), e.col.type});
+      }
+      w_.reads(j.inner);
+      w_.line("bool " + found + " = false;");
+      auto inner_key = key(w_, j.inner, parts, true);
+      w_.line("bc_view " + row + " = bc_empty(cx);");
+      w_.line((nulls.empty() ? "" : "if (!(" + nulls + ")) ") + row + " = bc_get(cx, " + inner_key + ", &" + found + ");");
+      rows_.push_back({j.inner, row});
+      auto matched = found;
+      for (const auto& c : j.match) matched += " && !(" + fails(c) + ")";
+      w_.line("if (!(" + matched + ")) " + row + " = " + nr + ";");
+      k();
+      rows_.pop_back();
+    });
+  }
+
   void produce(const physical::IndexJoin& j, const Consume& k) {
+    if (j.left_outer) {
+      outer_index_join(j, k);
+      return;
+    }
     produce(*j.outer, [&] {
       const auto d = std::to_string(rows_.size());
       const auto row = "row" + d;
@@ -853,15 +920,40 @@ private:
   // The outer side's row, then, if it has one, the inner scan's loop: its
   // row is row<d>, as an index join's. Inside an outer loop, its cursor is
   // c<d>, so the outer one's stays in reach.
+  // Left outer: m<d> says whether the inner side gave a row for the outer
+  // one, its filters the join's ON; where it gave none, or its guard's
+  // parameters hold a NULL, the outer row once more, joined to the null row.
   void produce(const physical::NestedLoop& j, const Consume& k) {
     const auto outer_loops = loops(*j.outer);
+    const auto table = j.left_outer ? inner_table(*j.inner) : 0;
+    const auto nr = j.left_outer ? null_row(table) : std::string{};
     produce(*j.outer, [&] {
       const auto d = std::to_string(rows_.size());
       auto outer_row = std::exchange(row_name_, "row" + d);
       auto outer_cursor = outer_loops ? std::exchange(cursor_, "c" + d) : cursor_;
-      produce(*j.inner, k);
+      if (!j.left_outer) {
+        produce(*j.inner, k);
+        row_name_ = outer_row;
+        cursor_ = outer_cursor;
+        return;
+      }
+      const auto m = "m" + d;
+      w_.line("bool " + m + " = false;");
+      std::string guard;
+      for (auto p : j.guard) guard += (guard.empty() ? "" : " || ") + param_null(p);
+      if (!guard.empty()) w_.open("if (!(" + guard + "))");
+      produce(*j.inner, [&] {
+        w_.line(m + " = true;");
+        k();
+      });
+      if (!guard.empty()) w_.close();
       row_name_ = outer_row;
       cursor_ = outer_cursor;
+      w_.open("if (!" + m + ")");
+      rows_.push_back({table, nr});
+      k();
+      rows_.pop_back();
+      w_.close();
     });
   }
 
@@ -1838,6 +1930,7 @@ private:
   int choices_{0};               // the choice points printed: each counts into count<i>, over lo<i> and hi<i>
   int sorts_{0};                 // the sorts printed: each into sorter s<i>, its row p<i>
   int hashes_{0};                // the hash joins printed: each into table h<i>, its row b<i>
+  int nulls_{0};                 // the outer joins printed: each's null row nr<i>
   int groups_{0};                // the grouped aggregates printed: each into a<i>, its group g<i>
   const Group* group_{nullptr};  // the group in hand, for a grouped aggregate's consumer
   std::string cursor_{"c"};      // the cursor a scan opens
