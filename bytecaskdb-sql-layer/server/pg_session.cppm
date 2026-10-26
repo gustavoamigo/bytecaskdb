@@ -11,6 +11,9 @@
 // ReadyForQuery, then puts the session behind the others.
 
 module;
+#include <pthread.h>
+#include <sched.h>
+#include <poll.h>
 #include <sys/socket.h>
 
 #include <atomic>
@@ -287,7 +290,7 @@ struct Portal {
 
 export class Session {
 public:
-  Session(Database& db, const SessionConfig& cfg, std::function<void(std::string)> on_flush = {})
+  Session(Database& db, const SessionConfig& cfg, std::function<void(std::string_view)> on_flush = {})
       : db_{db}, cfg_{cfg}, on_flush_{std::move(on_flush)} {}
 
   Session(const Session&) = delete;
@@ -421,11 +424,16 @@ public:
     ended_ = true;
   }
 
+  [[nodiscard]] auto output() const noexcept -> std::string_view { return out_.data(); }
+  void clear_output() noexcept { out_.clear(); }
   [[nodiscard]] auto take_output() noexcept -> std::string { return out_.take(); }
 
 private:
   void flush() {
-    if (on_flush_ && out_.size() > 0) on_flush_(out_.take());
+    if (on_flush_ && out_.size() > 0) {
+      on_flush_(out_.data());
+      out_.clear();
+    }
   }
 
   // ------------------------------------------------------------ replies
@@ -1015,7 +1023,7 @@ private:
 
   Database& db_;
   const SessionConfig& cfg_;
-  std::function<void(std::string)> on_flush_;
+  std::function<void(std::string_view)> on_flush_;
   std::deque<Input> queue_;
   Out out_;
   std::string application_name_;
@@ -1042,21 +1050,30 @@ private:
 // with non-blocking MSG_DONTWAIT and only hands over to the loop on EAGAIN.
 export class Pool {
 public:
+  static constexpr std::size_t kNoPreference = static_cast<std::size_t>(-1);
+
   struct Slot {
     enum class State { Idle, Queued, Running };
 
-    Slot(Database& db, const SessionConfig& cfg, Pool& pool, int sock_fd, void* user_tag)
-        : session{db, cfg, [this, &pool](std::string bytes) { pool.write_or_queue(*this, std::move(bytes)); }},
+    Slot(Database& db, const SessionConfig& cfg, Pool& pool, int sock_fd, void* user_tag, std::size_t pref,
+         std::function<void(void*)> wake_cb)
+        : session{db, cfg, [this, &pool](std::string_view bytes) { pool.write_or_queue(*this, bytes); }},
           fd{sock_fd},
-          tag{user_tag} {}
+          tag{user_tag},
+          preferred_worker{pref},
+          on_wake{std::move(wake_cb)} {}
 
     Session session;  // owned by the running worker (State::Running), or idle
+    Framer framer{};  // owned by the running worker (State::Running), or idle
     std::mutex mu;
     State state{State::Idle};
+    std::string raw_in;
     std::deque<Input> inbox;
     std::string outbox;
     int fd{-1};
     void* tag{nullptr};
+    std::size_t preferred_worker{kNoPreference};
+    std::function<void(void*)> on_wake;
     bool loop_writing{false};
     bool in_woken{false};
     bool stopping{false};
@@ -1074,14 +1091,24 @@ public:
     std::size_t worker_migrations{0};
   };
 
-  Pool(Database& db, const SessionConfig& cfg, std::size_t workers, std::function<void()> on_wake = {})
+  Pool(Database& db, const SessionConfig& cfg, std::size_t workers, std::function<void()> on_wake = {},
+       std::span<const int> cpus = {})
       : db_{db}, cfg_{cfg}, on_wake_{std::move(on_wake)} {
     auto n = workers == 0 ? 1 : workers;
     wq_.reserve(n);
     for (std::size_t i = 0; i < n; ++i) wq_.push_back(std::make_unique<WorkerQueue>());
     workers_.reserve(n);
     for (std::size_t i = 0; i < n; ++i) {
-      workers_.emplace_back([this, i] { worker_loop(i); });
+      int cpu = cpus.empty() ? -1 : cpus[i % cpus.size()];
+      workers_.emplace_back([this, i, cpu] {
+        if (cpu >= 0) {
+          cpu_set_t set;
+          CPU_ZERO(&set);
+          CPU_SET(static_cast<std::size_t>(cpu), &set);
+          (void)pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+        }
+        worker_loop(i);
+      });
     }
   }
 
@@ -1089,37 +1116,17 @@ public:
   Pool& operator=(const Pool&) = delete;
   ~Pool() { shutdown(); }
 
-  [[nodiscard]] auto open(int fd = -1, void* tag = nullptr) -> std::shared_ptr<Slot> {
-    return std::make_shared<Slot>(db_, cfg_, *this, fd, tag);
+  [[nodiscard]] auto open(int fd = -1, void* tag = nullptr, std::size_t preferred_worker = kNoPreference,
+                          std::function<void(void*)> wake_cb = {}) -> std::shared_ptr<Slot> {
+    return std::make_shared<Slot>(db_, cfg_, *this, fd, tag, preferred_worker, std::move(wake_cb));
   }
 
   void detach(const std::shared_ptr<Slot>& slot) {
-    {
-      std::lock_guard<std::mutex> lock{slot->mu};
-      slot->fd = -1;
-      slot->tag = nullptr;
-    }
-    std::lock_guard<std::mutex> lock{woken_mu_};
-    if (slot->in_woken) {
-      std::erase(woken_, slot.get());
-      slot->in_woken = false;
-    }
+    std::lock_guard<std::mutex> lock{slot->mu};
+    slot->fd = -1;
+    slot->tag = nullptr;
+    slot->in_woken = false;
   }
-
-  void take_woken(std::vector<void*>& out) {
-    out.clear();
-    std::vector<Slot*> slots;
-    {
-      std::lock_guard<std::mutex> lock{woken_mu_};
-      slots.swap(woken_);
-      for (auto* s : slots) s->in_woken = false;
-    }
-    for (auto* s : slots) {
-      std::lock_guard<std::mutex> lock{s->mu};
-      if (s->tag != nullptr) out.push_back(s->tag);
-    }
-  }
-
   void submit(const std::shared_ptr<Slot>& slot, std::span<Input> inputs) {
     if (inputs.empty()) return;
     auto need_schedule = false;
@@ -1137,6 +1144,21 @@ public:
 
   void submit(const std::shared_ptr<Slot>& slot, Input in) {
     submit(slot, std::span<Input>{&in, 1});
+  }
+
+  void submit_bytes(const std::shared_ptr<Slot>& slot, std::string_view bytes) {
+    if (bytes.empty()) return;
+    auto need_schedule = false;
+    {
+      std::lock_guard<std::mutex> lock{slot->mu};
+      if (slot->dropped || slot->session_ended) return;
+      slot->raw_in.append(bytes);
+      if (slot->state == Slot::State::Idle) {
+        slot->state = Slot::State::Queued;
+        need_schedule = true;
+      }
+    }
+    if (need_schedule) enqueue_slot(slot);
   }
 
   void stop(const std::shared_ptr<Slot>& slot) {
@@ -1169,6 +1191,7 @@ public:
 
   [[nodiscard]] auto drain(const std::shared_ptr<Slot>& slot, std::string& out, bool write_in_flight = false) -> Status {
     std::lock_guard<std::mutex> lock{slot->mu};
+    slot->in_woken = false;
     if (!slot->outbox.empty()) {
       if (out.empty()) {
         out = std::move(slot->outbox);
@@ -1207,8 +1230,11 @@ private:
   };
 
   void enqueue_slot(const std::shared_ptr<Slot>& slot) {
+    queued_slots_.fetch_add(1, std::memory_order_relaxed);
     auto n = wq_.size();
-    auto start = next_worker_.fetch_add(1, std::memory_order_relaxed) % n;
+    auto start = slot->preferred_worker < n
+                     ? slot->preferred_worker
+                     : next_worker_.fetch_add(1, std::memory_order_relaxed) % n;
     auto chosen = start;
     for (std::size_t i = 0; i < n; ++i) {
       auto idx = (start + i) % n;
@@ -1236,6 +1262,7 @@ private:
           auto s = std::move(mine.queue.front());
           mine.queue.pop_front();
           mine.busy.store(true, std::memory_order_relaxed);
+          queued_slots_.fetch_sub(1, std::memory_order_relaxed);
           return s;
         }
       }
@@ -1246,6 +1273,7 @@ private:
           auto s = std::move(other.queue.front());
           other.queue.pop_front();
           mine.busy.store(true, std::memory_order_relaxed);
+          queued_slots_.fetch_sub(1, std::memory_order_relaxed);
           return s;
         }
       }
@@ -1259,17 +1287,24 @@ private:
   }
 
   void notify_loop(Slot& slot) {
+    std::function<void(void*)> cb;
+    void* t = nullptr;
     {
-      std::lock_guard<std::mutex> lock{woken_mu_};
+      std::lock_guard<std::mutex> lock{slot.mu};
       if (!slot.in_woken) {
         slot.in_woken = true;
-        woken_.push_back(&slot);
+        cb = slot.on_wake;
+        t = slot.tag;
       }
     }
-    if (on_wake_) on_wake_();
+    if (cb && t != nullptr) {
+      cb(t);
+    } else if (on_wake_) {
+      on_wake_();
+    }
   }
 
-  void write_or_queue(Slot& slot, std::string bytes) {
+  void write_or_queue(Slot& slot, std::string_view bytes) {
     if (bytes.empty()) return;
     int fd = -1;
     {
@@ -1308,15 +1343,35 @@ private:
         slot.dropped = true;
         slot.outbox.clear();
       } else if (!slot.dropped) {
-        slot.outbox.append(bytes, done, bytes.size() - done);
+        slot.outbox.append(bytes.substr(done));
         slot.loop_writing = true;
       }
     }
     notify_loop(slot);
   }
 
+  void feed_raw(Slot& slot, std::string_view raw, std::vector<Input>& scratch) {
+    if (raw.empty()) return;
+    scratch.clear();
+    slot.framer.push(raw, scratch);
+    for (auto& in : scratch) slot.session.push(std::move(in));
+    scratch.clear();
+  }
+
+  void flush_session_output(Slot& slot) {
+    auto rem = slot.session.output();
+    if (!rem.empty()) {
+      write_or_queue(slot, rem);
+      slot.session.clear_output();
+    }
+  }
+
   void worker_loop(std::size_t my_idx) {
     auto tid = std::this_thread::get_id();
+    std::string local_raw;
+    std::vector<Input> scratch;
+    char recv_buf[16 << 10];
+
     for (;;) {
       auto slot = pop_slot(my_idx);
       if (!slot) return;
@@ -1328,6 +1383,8 @@ private:
         if (slot->turns > 0 && slot->last_worker != tid) ++slot->worker_migrations;
         slot->last_worker = tid;
         ++slot->turns;
+        local_raw.swap(slot->raw_in);
+        slot->raw_in.clear();
         while (!slot->inbox.empty()) {
           slot->session.push(std::move(slot->inbox.front()));
           slot->inbox.pop_front();
@@ -1335,22 +1392,89 @@ private:
         dropped = slot->dropped;
         stopping = slot->stopping;
       }
+      feed_raw(*slot, local_raw, scratch);
+      local_raw.clear();
 
       if (dropped) {
         slot->session.close();
       } else if (stopping) {
         slot->session.stop();
+        flush_session_output(*slot);
       } else {
-        slot->session.step();
-      }
-      if (auto rem = slot->session.take_output(); !rem.empty()) {
-        write_or_queue(*slot, std::move(rem));
+        for (;;) {
+          slot->session.step();
+          flush_session_output(*slot);
+          if (slot->session.ended() || wq_.size() == 1 || queued_slots_.load(std::memory_order_relaxed) > 0 ||
+              shutdown_.load(std::memory_order_relaxed)) {
+            break;
+          }
+          int fd = -1;
+          {
+            std::lock_guard<std::mutex> lock{slot->mu};
+            if (slot->dropped || slot->stopping || slot->loop_writing) break;
+            fd = slot->fd;
+          }
+          if (slot->session.runnable()) {
+            std::lock_guard<std::mutex> lock{slot->mu};
+            ++slot->turns;
+            continue;
+          }
+          if (fd < 0) break;
+
+          // Active-session fast path: if the client sends its next statement
+          // promptly and no other session is queued, read and run it here
+          // without bouncing through the libuv loop.
+          auto got_bytes = false;
+          for (int attempt = 0; attempt < 10; ++attempt) {
+            auto n = ::recv(fd, recv_buf, sizeof recv_buf, MSG_DONTWAIT);
+            if (n > 0) {
+              feed_raw(*slot, std::string_view{recv_buf, static_cast<std::size_t>(n)}, scratch);
+              got_bytes = true;
+              if (slot->session.runnable()) break;
+              continue;
+            }
+            if (n == 0) {
+              slot->session.push({Input::Kind::EndOfStream, '\0', {}});
+              slot->session.step();
+              got_bytes = false;
+              break;
+            }
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+              std::lock_guard<std::mutex> lock{slot->mu};
+              slot->dropped = true;
+              got_bytes = false;
+              break;
+            }
+            if (queued_slots_.load(std::memory_order_relaxed) > 0 || shutdown_.load(std::memory_order_relaxed)) break;
+            {
+              std::lock_guard<std::mutex> lock{slot->mu};
+              if (slot->stopping || slot->dropped) break;
+            }
+            pollfd pfd{fd, POLLIN, 0};
+            (void)::poll(&pfd, 1, 1);
+          }
+          if (!got_bytes || !slot->session.runnable()) break;
+          {
+            std::lock_guard<std::mutex> lock{slot->mu};
+            if (slot->dropped || slot->stopping) break;
+            ++slot->turns;
+          }
+        }
       }
 
       auto requeue = false;
       auto need_loop_wake = false;
       {
         std::unique_lock<std::mutex> lock{slot->mu};
+        if (!slot->raw_in.empty()) {
+          local_raw.swap(slot->raw_in);
+          slot->raw_in.clear();
+          lock.unlock();
+          feed_raw(*slot, local_raw, scratch);
+          local_raw.clear();
+          lock.lock();
+        }
         while (!slot->inbox.empty()) {
           slot->session.push(std::move(slot->inbox.front()));
           slot->inbox.pop_front();
@@ -1363,15 +1487,13 @@ private:
         } else if (slot->stopping && !slot->session.ended()) {
           lock.unlock();
           slot->session.stop();
-          if (auto rem = slot->session.take_output(); !rem.empty()) {
-            write_or_queue(*slot, std::move(rem));
-          }
+          flush_session_output(*slot);
           lock.lock();
         }
         slot->session_ended = slot->session.ended();
         requeue = (!slot->dropped && !slot->session_ended && slot->session.runnable());
         slot->state = requeue ? Slot::State::Queued : Slot::State::Idle;
-        need_loop_wake = (slot->fd < 0 || !slot->outbox.empty() || slot->session_ended || slot->dropped || slot->stopping);
+        need_loop_wake = !requeue || !slot->outbox.empty() || slot->session_ended || slot->dropped || slot->stopping;
       }
       if (requeue) enqueue_slot(slot);
       if (need_loop_wake) notify_loop(*slot);
@@ -1384,8 +1506,7 @@ private:
   std::vector<std::unique_ptr<WorkerQueue>> wq_;
   std::vector<std::thread> workers_;
   std::atomic<std::size_t> next_worker_{0};
-  std::mutex woken_mu_;
-  std::vector<Slot*> woken_;
+  std::atomic<std::size_t> queued_slots_{0};
   std::atomic<bool> shutdown_{false};
 };
 auto too_many_connections() -> std::string {
