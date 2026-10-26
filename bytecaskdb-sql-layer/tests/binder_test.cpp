@@ -407,6 +407,52 @@ TEST_CASE("binder: SELECT DISTINCT is a GROUP BY of the selected columns", "[sql
   CHECK(rejected(cat, "SELECT DISTINCT ON (qty) qty FROM t").first == "DISTINCT ON is not supported");
 }
 
+TEST_CASE("binder: JOIN USING and NATURAL JOIN compare their columns by =, each named alone as one", "[sql][binder]") {
+  sql_test::Fixture f;
+  for (auto ddl : {"CREATE TABLE l (k INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
+                   "CREATE TABLE r (j INTEGER PRIMARY KEY, a INTEGER, b TEXT, c BIGINT)"}) {
+    f.ddl(std::get<Ddl>(bind_sql(f.cat(), ddl).stmt));
+  }
+  const auto& cat = f.cat();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return "bound";
+  };
+  const auto* l = cat.table("l");
+  const auto* r = cat.table("r");
+  auto equals = [&](std::string_view sql) {
+    auto b = bind_sql(cat, sql);
+    std::vector<std::string> out;
+    for (const auto& c : get<logical::Filter>(b).conjuncts) {
+      REQUIRE(c.kind == logical::Expr::Kind::Compare);
+      CHECK(c.args[0].col.table == l->id);
+      CHECK(c.args[1].col.table == r->id);
+      out.push_back(l->column(c.args[0].col.col)->name + "=" + r->column(c.args[1].col.col)->name);
+    }
+    return out;
+  };
+  CHECK(equals("SELECT a FROM l JOIN r USING (a)") == std::vector<std::string>{"a=a"});
+  CHECK(equals("SELECT a, b FROM l JOIN r USING (b, a)") == std::vector<std::string>{"b=b", "a=a"});
+  CHECK(equals("SELECT k FROM l NATURAL JOIN r") == std::vector<std::string>{"a=a", "b=b"});  // the shared names, in l's order
+  CHECK(equals("SELECT foo.a FROM l JOIN r USING (a) AS foo").size() == 1);
+  // A USING column alone is the left side's; the others stay ambiguous.
+  auto merged = bind_sql(cat, "SELECT a FROM l JOIN r USING (a)");
+  CHECK(get<logical::Project>(merged).exprs[0].expr.col.table == l->id);
+  CHECK(state("SELECT b FROM l JOIN r USING (a)") == "42702");
+  CHECK(state("SELECT foo.b FROM l JOIN r USING (a) AS foo") == "42703");
+  CHECK(rejected(cat, "SELECT k FROM l JOIN r USING (c)").first ==
+        "column \"c\" specified in USING clause does not exist in left table");
+  CHECK(rejected(cat, "SELECT k FROM l JOIN r USING (k)").first ==
+        "column \"k\" specified in USING clause does not exist in right table");
+  CHECK(state("SELECT k FROM l JOIN r USING (a, a)") == "42701");
+  CHECK(rejected(cat, "SELECT k FROM l LEFT JOIN r USING (a)").first ==
+        "only an inner join of two tables, by ON, USING or NATURAL, is supported");
+}
+
 TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][binder][catalog]") {
   sql_test::Fixture f;
   const auto& cat = f.cat();
