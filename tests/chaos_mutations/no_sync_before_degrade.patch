@@ -3,14 +3,14 @@ A failed append degrades without first syncing what the page cache holds
 it (#240), so nothing it publishes depends on that sync.
 Expected: NOT caught.
 diff --git a/bytecaskdb/db_commit.cpp b/bytecaskdb/db_commit.cpp
-index 07f87ad..80e223f 100644
+index 23e02a8..861a0db 100644
 --- a/bytecaskdb/db_commit.cpp
 +++ b/bytecaskdb/db_commit.cpp
 @@ -207,7 +207,6 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
-     file.append_entries(all_entries, io_offsets);
+     file.append_entries(all_entries, io_offsets, scratch_bytes_);
    } catch (...) {
      auto ex = std::current_exception();
 -    try { file.sync(); } catch (...) {}
-     // Publishing needs the flush role: an in-flight flush must land (or
-     // fail) first, so its publication cannot overwrite the degraded state.
-     auto role = quiesce();
+     counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
+     // An append that failed partway leaves the chunks it wrote in the file,
+     // unpublished: the next write must not be appended after them.

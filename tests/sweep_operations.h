@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <format>
@@ -102,6 +103,15 @@ struct Operation {
   // once the fault is disarmed: a check run under it would have its own
   // calls counted and failed.
   std::function<void(const KeyValues &)> returned{};
+  // An I/O failure injected while `run` runs, with the allocation fault: the
+  // handler for it allocates too. An engine whose injected failure was
+  // thrown must refuse writes after, whatever else failed.
+  std::function<std::unique_ptr<ScopedFaultInjector>()> io_fault{};
+  // The injected failure comes once the operation's own write is durable:
+  // a run where it was thrown may show the whole transition (CONTRACT.md,
+  // a write whose rotation failed after it was synced), or the baseline when
+  // there was no memory to publish it. Otherwise only the baseline.
+  bool io_fault_after_durable{false};
 };
 
 // Six keys, a delete and a batch in one file, all durable.
@@ -329,9 +339,13 @@ inline auto vacuum_operation() -> Operation {
 // and a failed ingest publishes none of it; but on disk only each unit is
 // atomic, so resume() may replay the put without the batch. Delivering the
 // slice again then completes it (CONTRACT.md, ingest).
-inline auto ingest_operation() -> Operation {
-  auto first = std::make_shared<OwnedEntries>();
-  auto second = std::make_shared<OwnedEntries>();
+struct IngestSlices {
+  std::shared_ptr<OwnedEntries> first = std::make_shared<OwnedEntries>();
+  std::shared_ptr<OwnedEntries> second = std::make_shared<OwnedEntries>();
+};
+
+inline auto ingest_slices() -> IngestSlices {
+  IngestSlices slices;
   {
     TempDir td;
     auto leader = DB::open(td.path / "leader");
@@ -339,15 +353,20 @@ inline auto ingest_operation() -> Operation {
     const auto upto = leader.durable_sequence();
     {
       const auto snap = leader.snapshot();
-      *first = collect_changes(leader.changes_since(snap, 0));
+      *slices.first = collect_changes(leader.changes_since(snap, 0));
     }
     leader.put({.sync = true}, to_bytes("k1"), to_bytes("over"));
     REQUIRE(leader.apply_batch({.sync = true}, mixed_plan()));
     const auto snap = leader.snapshot();
-    *second = collect_changes(leader.changes_since(snap, upto));
+    *slices.second = collect_changes(leader.changes_since(snap, upto));
   }
-  REQUIRE_FALSE(first->entries.empty());
-  REQUIRE_FALSE(second->entries.empty());
+  REQUIRE_FALSE(slices.first->entries.empty());
+  REQUIRE_FALSE(slices.second->entries.empty());
+  return slices;
+}
+
+inline auto ingest_operation() -> Operation {
+  const auto [first, second] = ingest_slices();
 
   return {.name = "ingest",
           .opts = {.initial_mode = Mode::Follower},
@@ -377,6 +396,185 @@ inline auto ingest_operation() -> Operation {
                 return std::vector<KeyValues>{put_only};
               },
           .retry = [second](DB &db) { db.ingest(second->header, second->views()); }};
+}
+
+// An append that fails with its bytes in the file, as a failed writev does
+// once it has written: the engine must refuse writes, with or without the
+// memory to say why.
+inline auto failed_append_fault() -> std::unique_ptr<ScopedFaultInjector> {
+  return std::make_unique<ScopedFaultInjector>("io_data_file_append_partial",
+                                               PostWriteMode::throw_after);
+}
+
+inline auto failed_sync_fault() -> std::unique_ptr<ScopedFaultInjector> {
+  return std::make_unique<ScopedFaultInjector>("io_data_file_sync");
+}
+
+inline auto failed_rotation_fault() -> std::unique_ptr<ScopedFaultInjector> {
+  return std::make_unique<ScopedFaultInjector>("io_rotate_file_creation");
+}
+
+// The second fdatasync fails: for a write that crosses a rotation, the one
+// of the next file, after the rotation's own.
+inline auto failed_second_sync_fault() -> std::unique_ptr<ScopedFaultInjector> {
+  auto fi = std::make_unique<ScopedFaultInjector>("io_data_file_sync");
+  fi->inj.fail_on_nth_match = 2;
+  return fi;
+}
+
+// The group commit's fdatasync of a sync write fails (flush_failed).
+inline auto put_failed_sync_operation() -> Operation {
+  auto op = put_operation();
+  op.name = "put whose fdatasync fails";
+  op.io_fault = failed_sync_fault;
+  return op;
+}
+
+// The rotation's fdatasync, before the file is sealed, fails.
+inline auto rotation_failed_sync_operation() -> Operation {
+  auto op = rotation_operation();
+  op.name = "rotation-crossing write whose rotation fdatasync fails";
+  op.io_fault = failed_sync_fault;
+  return op;
+}
+
+// The write is synced and the file sealed; the next file cannot be created.
+inline auto rotation_failed_creation_operation() -> Operation {
+  auto op = rotation_operation();
+  op.name = "rotation-crossing write whose next file cannot be created";
+  op.io_fault = failed_rotation_fault;
+  op.io_fault_after_durable = true;
+  return op;
+}
+
+// The rotation succeeds; the sync that follows it fails.
+inline auto rotation_failed_second_sync_operation() -> Operation {
+  auto op = rotation_operation();
+  op.name = "rotation-crossing write whose sync after the rotation fails";
+  op.io_fault = failed_second_sync_fault;
+  return op;
+}
+
+// After the fault, the follower is delivered the slice again and promoted,
+// and a durable write follows: what an engine that took the failed ingest's
+// bytes for its own would lose.
+inline void promote_after_retry(Operation &op) {
+  op.takes_writes = true;
+  op.retry = [retry = op.retry](DB &db) {
+    retry(db);
+    db.set_mode(Mode::Leader);
+  };
+}
+
+inline auto ingest_failed_append_operation() -> Operation {
+  auto op = ingest_operation();
+  op.name = "ingest whose append fails";
+  op.io_fault = failed_append_fault;
+  promote_after_retry(op);
+  return op;
+}
+
+inline auto ingest_failed_sync_operation() -> Operation {
+  auto op = ingest_operation();
+  op.name = "ingest whose fdatasync fails";
+  op.io_fault = failed_sync_fault;
+  promote_after_retry(op);
+  return op;
+}
+
+// A file small enough that the slice rotates it, and the rotation's new
+// file cannot be created.
+inline auto ingest_failed_rotation_operation() -> Operation {
+  auto op = ingest_operation();
+  op.name = "ingest whose rotation cannot create a file";
+  op.opts.max_file_bytes = 300;
+  op.io_fault = failed_rotation_fault;
+  promote_after_retry(op);
+  return op;
+}
+
+inline auto ingest_failed_rotation_sync_operation() -> Operation {
+  auto op = ingest_failed_rotation_operation();
+  op.name = "ingest whose rotation fdatasync fails";
+  op.io_fault = failed_sync_fault;
+  return op;
+}
+
+// A follower's promotion appends its ChangeMarker; the append fails.
+inline auto promotion_failed_append_operation() -> Operation {
+  const auto first = ingest_slices().first;
+  return {.name = "set_mode(Leader) whose marker append fails",
+          .opts = {.initial_mode = Mode::Follower},
+          .setup = [first](DB &db) { db.ingest(first->header, first->views()); },
+          .run =
+              [](DB &db) {
+                db.set_mode(Mode::Leader);
+                return db.mode() == Mode::Leader;
+              },
+          .transition = [](KeyValues kv) { return kv; },
+          .retry = [](DB &db) { db.set_mode(Mode::Leader); },
+          .io_fault = failed_append_fault};
+}
+
+// A promotion whose marker takes the follower's file past its limit, and the
+// next file cannot be created. The limit is one byte past what the slice
+// leaves in the file, measured on a copy.
+inline auto promotion_failed_rotation_operation() -> Operation {
+  const auto first = ingest_slices().first;
+  std::uint64_t slice_bytes = 0;
+  {
+    TempDir td;
+    auto probe = DB::open(td.path / "probe", {.initial_mode = Mode::Follower});
+    probe.ingest(first->header, first->views());
+    for (const auto &[id, fs] : probe.file_stats())
+      slice_bytes = std::max(slice_bytes, fs.total_bytes);
+  }
+  auto op = promotion_failed_append_operation();
+  op.name = "set_mode(Leader) whose rotation cannot create a file";
+  op.opts.max_file_bytes = slice_bytes + 1;
+  op.io_fault = failed_rotation_fault;
+  return op;
+}
+
+// A leader holding an unsynced write steps down, which syncs it; the sync
+// fails.
+inline auto step_down_failed_sync_operation() -> Operation {
+  return {.name = "set_mode(Follower) whose fdatasync fails",
+          .setup =
+              [](DB &db) {
+                seed(db);
+                db.put({.sync = false}, to_bytes("u1"), to_bytes("unsynced"));
+              },
+          .run =
+              [](DB &db) {
+                db.set_mode(Mode::Follower);
+                return db.mode() == Mode::Follower;
+              },
+          .transition = [](KeyValues kv) { return kv; },
+          .takes_writes = false,
+          .retry = [](DB &db) { db.set_mode(Mode::Follower); },
+          .io_fault = failed_sync_fault};
+}
+
+// Vacuum makes the overwrites it judged by durable before it drops the old
+// file; that fdatasync fails. Two durable values, then two unsynced
+// overwrites: the whole-file path writes no staging copy, so the first data
+// file sync is that one.
+inline auto vacuum_failed_sync_operation() -> Operation {
+  return {.name = "vacuum whose fdatasync fails",
+          .opts = {.max_file_bytes = 50},
+          .setup =
+              [](DB &db) {
+                db.put({.sync = true}, to_bytes("k0"), to_bytes("v_k0"));
+                db.put({.sync = true}, to_bytes("k1"), to_bytes("v_k1"));
+                db.put({.sync = false}, to_bytes("k0"), to_bytes("n0"));
+                db.put({.sync = false}, to_bytes("k1"), to_bytes("n1"));
+              },
+          .run = [](DB &db) {
+            return db.vacuum({.fragmentation_threshold = 0.0});
+          },
+          .transition = [](KeyValues kv) { return kv; },
+          .io_fault = failed_sync_fault};
 }
 
 // resume() itself under fault, from each state a failed write leaves: the
@@ -450,6 +648,20 @@ inline auto manifest_operation() -> Operation {
                 check_key_values(key_values(copy), expected,
                                  "a DB opened from the manifest's files");
               }};
+}
+
+inline auto manifest_failed_rotation_operation() -> Operation {
+  auto op = manifest_operation();
+  op.name = "create_manifest whose rotation cannot create a file";
+  op.io_fault = failed_rotation_fault;
+  return op;
+}
+
+inline auto manifest_failed_sync_operation() -> Operation {
+  auto op = manifest_operation();
+  op.name = "create_manifest whose fdatasync fails";
+  op.io_fault = failed_sync_fault;
+  return op;
 }
 
 }  // namespace bytecask::testing::sweep_ops

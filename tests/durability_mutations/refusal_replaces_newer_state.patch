@@ -1,0 +1,20 @@
+refuse_writes stores its degraded copy whatever was published since it
+loaded the state, so a publication that landed in between, a flush's, is
+replaced by an older state. Reverts #623.
+Guarded-by: "refuse writes: the refusal keeps a state published while it was built, refuse writes: the refusal retries on a healthy state published while it was built"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index a57774b..2978387 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -1725,8 +1725,8 @@ private:
+       if (test_before_refusal_swap_) test_before_refusal_swap_();
+ #endif
+       publishing_.fetch_add(1, std::memory_order_acq_rel);
+-      const bool swapped =
+-          std::atomic_compare_exchange_strong(&state_, &current, s);
++      std::atomic_store(&state_, s);
++      const bool swapped = true;
+       if (swapped)
+         state_gen_.store(next_state_gen(), std::memory_order_release);
+       publishing_.fetch_sub(1, std::memory_order_release);

@@ -97,6 +97,10 @@ ScopedAllocFaults::~ScopedAllocFaults() {
   g_armed.store(false, std::memory_order_release);
 }
 
+auto ScopedAllocFaults::allocations() const -> long {
+  return g_count.load(std::memory_order_relaxed);
+}
+
 auto ScopedAllocFaults::report() -> AllocFaultReport {
   g_armed.store(false, std::memory_order_release);
   return {.allocations = g_count.load(std::memory_order_relaxed),

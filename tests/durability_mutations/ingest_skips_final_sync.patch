@@ -3,14 +3,14 @@ power cut loses entries a follower reported durable.
 Guarded-by: "prove_repl__*"
 
 diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
-index dcda96c..6535d6d 100644
+index 0eac211..17da491 100644
 --- a/bytecaskdb/db_replication.cpp
 +++ b/bytecaskdb/db_replication.cpp
-@@ -455,7 +455,6 @@ void DB::ingest(const ChangeHeader &header,
+@@ -473,7 +473,6 @@ void DB::ingest(const ChangeHeader &header,
  
      // Final sync: ensure last chunk is durable before publishing.
      try {
 -      t.active_file().sync();
        t.apply_sync(t.next_seq() - 1);
      } catch (...) {
-       auto err_s = current->degraded_copy(
+       degrade_or_refuse([&] {

@@ -1,0 +1,18 @@
+degrade, the helper every handler publishes its degraded state through,
+neither refuses writes by the flag nor falls back to refuse_writes, so a
+handler that cannot build the state, for want of memory, leaves the engine
+writable. Reverts #583, #618.
+Guarded-by: "alloc sweep: set_mode(Leader) whose marker append fails"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index 17ad7c8..e4eac4d 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -1570,7 +1570,6 @@ private:
+       // No memory to say why: the flag refuses, and refuse_writes publishes
+       // the generic reason if it can.
+     }
+-    refuse_writes();
+   }
+   // The two shapes of degrade: the published state degraded, or the
+   // transient with what it applied. reason is a string literal, or a
