@@ -2754,6 +2754,7 @@ focuses the run with `Disable:`.
 | `hint_written_in_place`: hints written in place, not renamed | — | caught twice in ~45 min before #476, in 6 min after: rare |
 | `no_sync_before_degrade`: a failed append degrades without syncing | — | not caught: #240's rewrite in `resume()` covers it |
 | `truncate_lowers_end_after`: the logical end drops after `ftruncate`, not before | #248 (#236) | not caught: the stale end lasts one `resume()` retry; #248's `prove_resume` cell guards it |
+| `blind_split_leaks_on_read_error`: a blind leaf split allocates its halves before the separator read, so a read error leaks both | #652 | not caught: the check's release worker runs without LeakSanitizer; the nightly ASan isolation chaos run found it, and `blind tree: a read that fails during a write leaks no node` guards it |
 
 "Rare" (`Expected: caught (rare)`) marks a mutation the rig catches but not
 within a fixed budget: the script runs and reports it, and a survival is not a

@@ -716,6 +716,15 @@ private:
       m = 1;
     m = std::clamp<std::uint32_t>(m, 1, total - 1);
 
+    // The separator read can throw (a read error) and so can its copy: both
+    // run before the leaves are allocated, so a failure leaks neither.
+    const auto cut = std::size_t{meta[m] >> 12 >> kPosShift} + 1;
+    const Bytes first_right =
+        m == p.idx ? key : res.key_at(L::ref_of(loc[m]));
+    assert(cut <= first_right.size());
+    sep_.assign(first_right.begin(),
+                first_right.begin() + static_cast<std::ptrdiff_t>(cut));
+
     auto *left = L::allocate(tag_);
     L::copy(L::arrays(left), 0, tmp, 0, m);
     left->count = m;
@@ -729,13 +738,6 @@ private:
       left->last_pos = static_cast<std::uint16_t>(p.idx);
     else
       right->last_pos = static_cast<std::uint16_t>(p.idx - m);
-
-    const auto cut = std::size_t{meta[m] >> 12 >> kPosShift} + 1;
-    const Bytes first_right =
-        m == p.idx ? key : res.key_at(L::ref_of(loc[m]));
-    assert(cut <= first_right.size());
-    sep_.assign(first_right.begin(),
-                first_right.begin() + static_cast<std::ptrdiff_t>(cut));
     discard(leaf);
     return {left, right, true, true};
   }
