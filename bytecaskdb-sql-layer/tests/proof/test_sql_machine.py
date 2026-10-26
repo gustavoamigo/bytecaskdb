@@ -1528,6 +1528,66 @@ class SqlMachine(Sides, RuleBasedStateMachine):
                      limit=data.draw(st.none() | st.sampled_from([0, 1, 3]), label="limit"), order=order,
                      **self.draw_outer(data, b))
 
+    @precondition(lambda self: len(self.tables) >= 1)
+    @rule(data=st.data())
+    def subquery(self, data):
+        # A's rows by an uncorrelated subquery over b, a itself or another
+        # table: IN, NOT IN, op ANY or ALL, = or < of a scalar MIN, EXISTS or
+        # NOT EXISTS, its rows narrowed now and then by a parameter or IS
+        # [NOT] NULL. Of columns the layer compares, never a float, which
+        # no filter takes.
+        a = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="outer")]
+        b = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="inner")]
+        def comparable(x: o.Type, y: o.Type) -> bool:
+            if x.kind in ("float", "real") or y.kind in ("float", "real"):
+                return False
+            if x.kind == "decimal" or y.kind == "decimal":
+                return x.kind == y.kind and x.scale == y.scale
+            return x.kind == y.kind
+        pairs = [(x.name, y.name) for x in a.columns for y in b.columns if comparable(x.type, y.type)]
+        if not pairs:
+            return
+        ca, cb = data.draw(st.sampled_from(pairs), label="columns")
+        ty = b.column(cb).type
+        params, types, pg_params = [], [], []
+        where = data.draw(st.sampled_from(["", "not null", "null", "param"]), label="inner where")
+        inner_where, pg_inner_where = "", ""
+        if where == "not null":
+            inner_where = pg_inner_where = f" WHERE {cb} IS NOT NULL"
+        elif where == "null":
+            inner_where = pg_inner_where = f" WHERE {cb} IS NULL"
+        elif where == "param":
+            op = data.draw(st.sampled_from(["=", "<", ">="]), label="inner op")
+            v = data.draw(st.none() | values(ty), label="inner value")
+            inner_where = " WHERE " + compared(b, cb, op, v, 1, False)
+            pg_inner_where = " WHERE " + compared(b, cb, op, v, 1, True)
+            params.append(param_value(v))
+            types.append(ty)
+        form = data.draw(st.sampled_from(["in", "not in", "any", "all", "scalar", "exists", "not exists"]), label="form")
+        def text(w):
+            inner = f"SELECT {cb} FROM {b.name}{w}"
+            if form == "in":
+                return f"{ca} IN ({inner})"
+            if form == "not in":
+                return f"{ca} NOT IN ({inner})"
+            if form in ("any", "all"):
+                op = data.draw(st.sampled_from(["=", "<>", "<", "<=", ">", ">="]), label="quantified op")
+                quantifier = form.upper() if form == "all" else data.draw(st.sampled_from(["ANY", "SOME"]), label="any")
+                return f"{ca} {op} {quantifier} ({inner})"
+            if form == "scalar":
+                op = data.draw(st.sampled_from(["=", "<", ">="]), label="scalar op")
+                return f"{ca} {op} (SELECT MIN({cb}) FROM {b.name}{w})"
+            return f"{'NOT ' if form == 'not exists' else ''}EXISTS ({inner})"
+        if form == "scalar" and ty.kind not in ("int", "decimal"):
+            return  # the layer's MIN takes integers and DECIMALs
+        cond_layer = text(inner_where)
+        select = ", ".join(a.pk)
+        sql = f"SELECT {select} FROM {a.name} WHERE {cond_layer} ORDER BY {select}"
+        pg_sql = sql.replace(inner_where, pg_inner_where) if inner_where else sql
+        out = self.both(sql, params, pg_sql=pg_sql, types=types)
+        if out.error is None:
+            self.alternatives_agree(sql, params, types, out.rows, None, None)
+
     @precondition(lambda self: len(self.tables) >= 2 and self.txn is None)
     @rule(data=st.data())
     def insert_a_match(self, data):
@@ -2040,6 +2100,41 @@ def test_left_and_right_join_null_extend_the_rows_nothing_matches(dsn):
                     "SELECT t0.c0, COUNT(t1.c1), COUNT(*) FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 GROUP BY t0.c0 ORDER BY t0.c0",
                     "SELECT t1.c1, COUNT(*) FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 GROUP BY t1.c1 ORDER BY t1.c1"):
             assert m.both(sql).error is None
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_uncorrelated_subqueries_agree_with_postgresql(dsn):
+    """Each form, over a subquery with NULLs, one without, one of no rows
+    and one of one row: the three-valued IN, NOT IN, ANY and ALL, EXISTS, a
+    scalar subquery as a key and in a select list, and 21000 for one of
+    many rows."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER), Column("c1", o.INTEGER), Column("c2", o.TEXT)], ["c0"]))
+        m.create(Table("t1", [Column("c3", o.BIGINT), Column("c4", o.BIGINT), Column("c5", o.TEXT)], ["c3"]))
+        for row in ({"c0": 1, "c1": 10, "c2": "a"}, {"c0": 2, "c1": 20, "c2": "b"}, {"c0": 3, "c1": None, "c2": None},
+                    {"c0": 4, "c1": 20, "c2": "d"}, {"c0": 5, "c1": 30, "c2": "e"}):
+            assert m.insert("t0", row, all_columns=True).error is None
+        for row in ({"c3": 1, "c4": 20, "c5": "b"}, {"c3": 2, "c4": None, "c5": None}, {"c3": 3, "c4": 5, "c5": "zz"}):
+            assert m.insert("t1", row, all_columns=True).error is None
+        subs = ("SELECT c4 FROM t1", "SELECT c4 FROM t1 WHERE c4 IS NOT NULL", "SELECT c4 FROM t1 WHERE c3 > 9",
+                "SELECT c4 FROM t1 WHERE c3 = 1")
+        for sq in subs:
+            for form in ("IN", "NOT IN", "= ANY", "<> ALL", "< ALL", ">= ANY", "<> ANY", "= ALL", "> SOME"):
+                assert m.both(f"SELECT c0 FROM t0 WHERE c1 {form} ({sq}) ORDER BY c0").error is None
+            assert m.both(f"SELECT c0 FROM t0 WHERE EXISTS ({sq}) ORDER BY c0").error is None
+            assert m.both(f"SELECT c0 FROM t0 WHERE NOT EXISTS ({sq}) OR c0 = 3 ORDER BY c0").error is None
+        for sql in ("SELECT c0 FROM t0 WHERE c0 = (SELECT MAX(c3) FROM t1)",
+                    "SELECT c0 FROM t0 WHERE c1 >= (SELECT MIN(c4) FROM t1) ORDER BY c0",
+                    "SELECT c0 FROM t0 WHERE c1 = (SELECT c4 FROM t1 WHERE c3 = 2)",
+                    "SELECT c0 FROM t0 WHERE c2 IN (SELECT c5 FROM t1) ORDER BY c0",
+                    "SELECT c0, (SELECT c5 FROM t1 WHERE c3 = 3) FROM t0 ORDER BY c0",
+                    "SELECT (SELECT COUNT(*) FROM t1), (SELECT c4 FROM t1 WHERE c3 = 9)"):
+            assert m.both(sql).error is None, sql
+        assert m.both("SELECT c0 FROM t0 WHERE c1 = (SELECT c4 FROM t1)").error == "21000"
+        assert m.both("UPDATE t0 SET c1 = 0 WHERE c0 IN (SELECT c3 FROM t1)").error is None
         m.check()
     finally:
         m.teardown()

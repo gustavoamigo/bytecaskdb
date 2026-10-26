@@ -134,13 +134,16 @@ A fixed list, applied in order, each to a fixpoint. None needs a cost.
    rows, NULL-extended ones too, so it stays above. Of the join's own
    predicate, a conjunct on the right side alone moves onto that side's
    table; one on the left side alone stays, deciding which left rows find a
-   pair. Two `Filter`s in a row become one, the lower
+   pair. A predicate that reads no column, a subquery's `EXISTS` or its
+   flags (*Subqueries*), holds of every row or of none: above a join it
+   filters the left side, in an outer join's predicate the right one. Two
+   `Filter`s in a row become one, the lower
    one's conjuncts first, so a `Get` has at most one.
 3. **Projection pruning.** Each operator keeps only the columns something
    above it reads. A read is covering when every column the operators above
    take is in the key; a column only a key bound reads need not be.
 
-Subquery decorrelation joins the list when #534 brings subqueries. The two
+Subquery decorrelation joins the list with correlated subqueries. The two
 rewrites of TPROC-C statements (`testing_design.md`, *The TPROC-C
 statements*) are made by hand in the statement text.
 
@@ -721,6 +724,47 @@ inner join's plan would end with no rows. Probed by key, the right side is
 looked up only when no part is NULL and the key fits: a NULL, or a left
 value too long for any key, is a miss, and the left row goes on.
 
+### Subqueries
+
+An uncorrelated subquery is a statement of its own, run once before the
+statement's plan, on its snapshot and in its transaction: the binder binds
+its `SELECT` as any, and lists it beside the logical plan
+(`logical::Subquery`) with what its rows are folded into, in hidden
+parameters after the constants', NULL until it runs:
+
+| Kind | From | Its parameters |
+|---|---|---|
+| Value | `col op (SELECT …)`, `(SELECT …)` in a select list | its row's value; NULL for none, 21000 for a second |
+| Exists | `EXISTS` | a BOOLEAN, whether it gave a row; it reads one at most, under a `LIMIT 1` |
+| Bounds | `op ANY` and `op ALL` of other than `=` and `<>` `ALL` | its largest and smallest non-NULL values; then NULL if a row was NULL, else FALSE; then whether it gave a row |
+| Set | `IN`, `= ANY`, `<> ALL` | the two flags; its non-NULL values are a set the runtime holds |
+
+A Value is a parameter to the plan as a caller's is: it keys a lookup or
+bounds a range, and the plan ends when it is NULL. The others are a
+predicate the binder writes over two leaves: `Truth`, a BOOLEAN parameter,
+NULL as unknown; and `InSet`, whether a column's value is in a Set's set.
+`x op ANY S` is `(core OR f1) AND f2`, `core` being `x < max` (`<`, `<=`),
+`x > min` (`>`, `>=`), `x < max OR x > min` (`<>`) or `x InSet S` (`=`), `f1`
+the NULL flag and `f2` whether S gave a row: true where a value makes `x op`
+it true, NULL where none does and a row was NULL or x is, false otherwise
+and over no rows. `x op ALL S` is `NOT (x op' ANY S)`, `op'` the negation
+of `op`. So each outer row costs one comparison or one set lookup, whatever
+the subquery's size. Its value is compared as a parameter, of a type the
+column compares with: integers of any width with integers, a key encoding
+each as 64 bits (an out-of-range value matches nothing and bounds a range
+where it falls), a DECIMAL of the column's scale, strings with strings.
+
+Each subquery is searched alone, its cheapest plan kept for every plan of
+the statement (`physical::Sub`), and printed as a function of its own,
+`sub<i>`, so a miss in it returns from it. The statement's plan calls each
+first, between `bc_sub_begin` and `bc_sub_end`, which fold what it emits
+into its parameters and set (`plan_api_design.md`, *Subqueries*); then its
+computed values, NULL checks and pipeline run as without one.
+
+Not planned yet: a correlated subquery, one inside another, one in `FROM`
+(a derived table), and `IN (SELECT …)` as a semi-join that probes the outer
+table's key per value, which #659 tracks.
+
 ### Aggregates
 
 **One row of `COUNT` or `SUM`.** A lone `COUNT`, `COUNT(DISTINCT)` or
@@ -1165,7 +1209,7 @@ Each slice was one PR, or a few, with its tests.
    aggregates in one select list.
 
 The rest of the dialect stays in #534: three or more tables, aliases,
-expressions, `OFFSET`, `RETURNING` and multi-row `VALUES`, subqueries,
+expressions, `OFFSET`, `RETURNING` and multi-row `VALUES`, correlated subqueries,
 `FULL JOIN`, `FOR UPDATE` on joins, and `EXPLAIN`. The serializable guards,
 the plan cache and procedures (#495) keep their own designs.
 

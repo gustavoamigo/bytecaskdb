@@ -412,3 +412,27 @@ TEST_CASE("codegen: a join is of two point lookups, in FROM order", "[sql][codeg
   CHECK(loop.source.find("bc_key_fits") == std::string::npos);  // an integer key always fits
 }
 
+TEST_CASE("codegen: a subquery is a function of its own, run first into its parameters", "[sql][codegen]") {
+  sql_test::Fixture f;
+  f.ddl(CreateTableDdl{"u", {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},
+                       {"k"}});
+  auto has = [](const GeneratedPlan& p, std::string_view s) { return p.source.find(s) != std::string::npos; };
+  // A scalar subquery keys t's lookup: its value is a parameter, set first.
+  auto scalar = generate(f.cat(), "SELECT qty FROM t WHERE id = (SELECT MAX(k) FROM u)");
+  CHECK(has(scalar, "static void sub0(bc_ctx *cx) {"));
+  CHECK(has(scalar, "bc_sub_begin(cx, 0, BC_SUB_VALUE, BC_T_I64, 0);\n  sub0(cx);\n  bc_sub_end(cx);"));
+  CHECK(has(scalar, "bc_key_params(cx, TBL_1, 0, 1)"));
+  CHECK(scalar.objects_read == std::vector<std::uint32_t>{1, 4});  // the subquery's table among them
+  CHECK(scalar.source.find("sub0(cx);") < scalar.source.find("bc_param_null(cx, 0)"));  // its NULL ends the plan after
+  // IN tests the subquery's set, NULL where its flags say.
+  auto in = generate(f.cat(), "SELECT id FROM t WHERE qty IN (SELECT v FROM u)");
+  CHECK(has(in, "bc_sub_begin(cx, 0, BC_SUB_SET, BC_T_I64, 0);"));
+  CHECK(has(in, "bc_sub_has_i64(cx, 0, "));
+  // EXISTS reads at most one row, whatever its columns.
+  auto exists = generate(f.cat(), "SELECT id FROM t WHERE EXISTS (SELECT k, v FROM u)");
+  CHECK(has(exists, "bc_sub_begin(cx, 0, BC_SUB_EXISTS, BC_T_BOOL, 0);"));
+  CHECK(has(exists, "bc_param_bool(cx, 0)"));
+  // ALL and ANY of other than = read its bounds.
+  auto all = generate(f.cat(), "SELECT id FROM t WHERE qty < ALL (SELECT v FROM u)");
+  CHECK(has(all, "bc_sub_begin(cx, 0, BC_SUB_BOUNDS, BC_T_I64, 0);"));
+}

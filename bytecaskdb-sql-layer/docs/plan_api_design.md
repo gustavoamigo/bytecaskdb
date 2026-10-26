@@ -1,6 +1,7 @@
 # Plan API: a physical algebra for generated plans
 
-Status: **built**, revision 11 (revision 10 with `bc_null_row`, for outer
+Status: **built**, revision 12 (revision 11 with `bc_sub_*` and
+`BC_E_CARDINALITY`, for subqueries; revision 10 with `bc_null_row`, for outer
 joins; revision 9 with `bc_like` and
 `BC_E_PATTERN`, for `LIKE`; revision 8 with the sort-key builder,
 `bc_sort_key_*` (#579); revision 8 built the sorters, the hash tables and
@@ -434,6 +435,7 @@ enum bc_error_code {
   BC_E_UNKNOWN,     /* a commit failed and degraded the engine: its batch may have reached the data
                        file, so its outcome is unknown, never "nothing written" (SQLSTATE 08007) */
   BC_E_PATTERN,     /* bc_like reached a pattern's escape character at its end (SQLSTATE 22025) */
+  BC_E_CARDINALITY, /* a BC_SUB_VALUE subquery emitted a second row (SQLSTATE 21000) */
 };
 
 enum bc_scan_flags {
@@ -955,6 +957,35 @@ Raw `bc_put` and `bc_del` are gone from the language. The plan's keyspace
 holds rows and index entries, and both are written only through the calls
 above; the catalog's namespace is written only by DDL. A namespace added
 later gets calls of its own, decided by the same rule.
+
+### Subqueries
+
+A plan runs each uncorrelated subquery of its statement first, as a
+function of its own, and what that function emits between `bc_sub_begin`
+and `bc_sub_end` is folded, never a result row (`planner_design.md`,
+*Subqueries*):
+
+```c
+enum bc_sub_kind { BC_SUB_VALUE = 0, BC_SUB_EXISTS = 1, BC_SUB_BOUNDS = 2, BC_SUB_SET = 3 };
+void bc_sub_begin(bc_ctx *, uint32_t sub, int32_t kind, int32_t type, uint32_t param);  /* type: a bc_type */
+void bc_sub_end(bc_ctx *);
+bool bc_sub_has_i64(bc_ctx *, uint32_t sub, int64_t);
+bool bc_sub_has_f64(bc_ctx *, uint32_t sub, double);
+bool bc_sub_has_bool(bc_ctx *, uint32_t sub, bool);
+bool bc_sub_has_bytes(bc_ctx *, uint32_t sub, bc_view);
+```
+
+| Function | What it does |
+|---|---|
+| `bc_sub_begin` | Starts subquery `sub`: until `bc_sub_end`, each row emitted is one column of `type`, folded as `kind` says, or, for `BC_SUB_EXISTS`, a row of any columns, counted. One at a time; `sub` is each id once per run. Its parameters, from `param` on, are ones the caller passes as NULL. |
+| `bc_sub_end` | Sets its parameters, which every `bc_param_*` reads from then on until reset. `BC_SUB_VALUE`: its row's value, NULL for none; a second row fails the plan with `BC_E_CARDINALITY`. `BC_SUB_EXISTS`: a BOOL, whether a row came. `BC_SUB_BOUNDS`: the largest non-NULL value, then the smallest (NULL for none), then NULL if a row was NULL else FALSE, then whether a row came. `BC_SUB_SET`: the last two. |
+| `bc_sub_has_*` | Whether a `BC_SUB_SET` subquery's non-NULL values hold the value, as PostgreSQL's `=` compares: bytes bytewise, a DOUBLE's -0.0 equal to 0.0 and NaN to NaN. The set is charged and lives until reset; a `sub` not run is `BC_E_HANDLE`. |
+
+Values order as the layer compares them: integers and BOOLs numerically,
+bytes bytewise (`COLLATE "C"`), DOUBLEs with NaN above every other value.
+A misuse, a subquery begun inside another, a row begun when one starts or
+ends, an unknown kind or type, parameters past the ones given, is
+`BC_E_HANDLE`, a plan bug.
 
 ### Guards and raised errors
 

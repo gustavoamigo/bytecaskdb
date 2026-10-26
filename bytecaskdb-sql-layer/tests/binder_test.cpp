@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -507,6 +508,55 @@ TEST_CASE("binder: LEFT and RIGHT JOIN are a left outer join, ON its predicate, 
   CHECK(rejected(cat, "SELECT l.k FROM l FULL JOIN r ON l.a = r.a").first == "FULL JOIN is not supported");
 }
 
+TEST_CASE("binder: an uncorrelated subquery is bound to run first, its values in hidden parameters", "[sql][binder]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE u (k INTEGER PRIMARY KEY, w TEXT)").stmt));
+  const auto& cat = f.cat();
+  using SK = logical::Subquery::Kind;
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what();
+    }
+    return "bound";
+  };
+  // Each after the statement's parameters and constants, as many as its
+  // kind sets, NULL until it runs.
+  auto b = bind_sql(cat, "SELECT id FROM t WHERE qty = $1 AND id IN (SELECT k FROM u) AND name = 'x' AND "
+                         "qty > ALL (SELECT k FROM u) AND EXISTS (SELECT w, k FROM u) AND id = (SELECT MAX(k) FROM u)");
+  REQUIRE(b.subqueries.size() == 4);
+  CHECK(b.subqueries[0].kind == SK::Set);
+  CHECK(b.subqueries[0].param == 1);  // $1, then its two flags
+  CHECK(b.subqueries[1].kind == SK::Bounds);
+  CHECK(b.subqueries[1].param == 4);  // after the constant 'x' at 3
+  CHECK(b.subqueries[2].kind == SK::Exists);
+  CHECK(b.subqueries[2].param == 8);
+  CHECK(std::holds_alternative<logical::Limit>(b.subqueries[2].plan->op));  // a row at most
+  CHECK(b.subqueries[3].kind == SK::Value);
+  CHECK(b.subqueries[3].type.kind == SqlKind::Integer);
+  CHECK(b.param_types.size() == 10);
+  CHECK(std::ranges::all_of(b.fixed, [&](const Datum& d) { return &d == &b.fixed[2] || std::holds_alternative<std::monostate>(d); }));
+  // In a select list: its value, named as its column.
+  auto sel = bind_sql(cat, "SELECT (SELECT w FROM u WHERE k = 1), id FROM t");
+  CHECK(get<logical::Project>(sel).exprs[0].name == "w");
+  CHECK(get<logical::Project>(sel).exprs[0].expr.kind == logical::Expr::Kind::Param);
+  CHECK(state("SELECT (SELECT MAX(k) FROM u)") == "bound");
+  // Refused: correlated, nested, of two columns, FOR UPDATE, AVG, assigned,
+  // compared across types, beside an aggregate.
+  CHECK(state("SELECT id FROM t WHERE id IN (SELECT k FROM u WHERE k = qty)").starts_with("42601 a correlated subquery"));
+  CHECK(state("SELECT id FROM t WHERE id IN (SELECT k FROM u WHERE u.k = t.qty)").starts_with("42601 a correlated subquery"));
+  CHECK(state("SELECT id FROM t WHERE id IN (SELECT k FROM u WHERE k IN (SELECT k FROM u))") ==
+        "42601 a subquery inside a subquery is not supported yet");
+  CHECK(state("SELECT id FROM t WHERE id = (SELECT k, w FROM u)") == "42601 subquery must return only one column");
+  CHECK(state("SELECT id FROM t WHERE id IN (SELECT k FROM u FOR UPDATE)") == "42601 FOR UPDATE in a subquery is not supported yet");
+  CHECK(state("SELECT id FROM t WHERE id = (SELECT AVG(k) FROM u)") == "42601 a subquery of AVG is not supported yet");
+  CHECK(state("UPDATE t SET qty = (SELECT MAX(k) FROM u) WHERE id = 1") == "42601 a subquery assigned to a column is not supported yet");
+  CHECK(state("SELECT id FROM t WHERE id = (SELECT w FROM u)").starts_with("42601 comparing id (bigint) with a subquery of text"));
+  CHECK(state("SELECT COUNT(*), (SELECT 1) FROM t") == "42601 a subquery in the select list of an aggregated query is not supported yet");
+  CHECK(state("SELECT id FROM t WHERE (SELECT 1) IN (SELECT k FROM u)").starts_with("42601"));
+}
+
 TEST_CASE("binder: OR, NOT, IS NULL, <>, BETWEEN and IN are predicates over comparisons", "[sql][binder]") {
   sql_test::Fixture f;
   const auto& cat = f.cat();
@@ -520,6 +570,9 @@ TEST_CASE("binder: OR, NOT, IS NULL, <>, BETWEEN and IN are predicates over comp
         case K::Not: return "NOT";
         case K::IsNull: return "ISNULL";
         case K::Compare: return "CMP";
+        case K::Like: return "LIKE";
+        case K::Truth: return "TRUTH";
+        case K::InSet: return "INSET";
         case K::Column:
         case K::Param:
         case K::Const:
@@ -530,7 +583,7 @@ TEST_CASE("binder: OR, NOT, IS NULL, <>, BETWEEN and IN are predicates over comp
       return "?";
     };
     std::function<std::string(const logical::Expr&)> walk = [&](const logical::Expr& x) {
-      if (x.kind == K::Compare || x.kind == K::IsNull) return name(x.kind);
+      if (x.kind == K::Compare || x.kind == K::IsNull || x.args.empty()) return name(x.kind);
       std::string out = name(x.kind) + "(";
       for (std::size_t i = 0; i < x.args.size(); ++i) out += (i ? "," : "") + walk(x.args[i]);
       return out + ")";
@@ -555,6 +608,15 @@ TEST_CASE("binder: OR, NOT, IS NULL, <>, BETWEEN and IN are predicates over comp
   CHECK(conjuncts("qty IN (1, 2, 3)") == V{"OR(CMP,CMP,CMP)"});
   CHECK(conjuncts("qty IN (1)") == V{"CMP"});
   CHECK(conjuncts("qty NOT IN (1, 2)") == V{"NOT(OR(CMP,CMP))"});
+  // Of a subquery: IN tests its set; ANY and ALL its bounds, ALL as NOT ANY
+  // of the negated operator; each NULL where a row is, and over no rows
+  // false (TRUTH: the flags it sets).
+  CHECK(conjuncts("qty IN (SELECT qty FROM t)") == V{"AND(OR(INSET(?),TRUTH(?)),TRUTH(?))"});
+  CHECK(conjuncts("qty NOT IN (SELECT qty FROM t)") == V{"NOT(AND(OR(INSET(?),TRUTH(?)),TRUTH(?)))"});
+  CHECK(conjuncts("qty < ALL (SELECT qty FROM t)") == V{"NOT(AND(OR(CMP,TRUTH(?)),TRUTH(?)))"});
+  CHECK(conjuncts("qty <> SOME (SELECT qty FROM t)") == V{"AND(OR(OR(CMP,CMP),TRUTH(?)),TRUTH(?))"});
+  CHECK(conjuncts("EXISTS (SELECT 1 FROM t)") == V{"TRUTH(?)"});
+  CHECK(conjuncts("qty = (SELECT MAX(qty) FROM t)") == V{"CMP"});
   CHECK(conjuncts("id = $1 AND NOT (qty = 1 OR name IS NULL)") == V{"CMP", "NOT(OR(CMP,ISNULL))"});
   // Each comparison in a tree is a WHERE's: typed, folded, refused alike.
   CHECK(rejected(cat, "SELECT id FROM t WHERE qty = 1 OR qty = id").first ==

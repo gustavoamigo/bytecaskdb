@@ -105,6 +105,27 @@ TEST_CASE("parser: REFERENCES and FOREIGN KEY, NO ACTION or RESTRICT only, in th
   }
 }
 
+TEST_CASE("parser: subqueries as values, EXISTS, IN and ANY, SOME or ALL", "[sql][parser]") {
+  auto sel = std::get<Select>(parse("SELECT (SELECT a FROM u) FROM t WHERE id = (SELECT MAX(b) FROM u) AND "
+                                    "EXISTS (SELECT 1 FROM u) AND id IN (SELECT a FROM u) AND id NOT IN (SELECT a FROM u) "
+                                    "AND id < ALL (SELECT a FROM u) AND id <> SOME (SELECT a FROM u)"));
+  REQUIRE(sel.targets[0].kind == Expr::Kind::Subquery);
+  CHECK(sel.targets[0].subquery->table == "u");
+  REQUIRE(sel.where.size() == 6);
+  CHECK(sel.where[0].rhs.kind == Expr::Kind::Subquery);
+  CHECK(sel.where[1].kind == Compare::Kind::Exists);
+  const auto& in = sel.where[2];
+  CHECK((in.kind == Compare::Kind::Quantified && in.quantified == ValueCompare::Eq && !in.all));
+  CHECK((sel.where[3].kind == Compare::Kind::Not && sel.where[3].args[0].kind == Compare::Kind::Quantified));
+  CHECK((sel.where[4].quantified == ValueCompare::Lt && sel.where[4].all));
+  CHECK((sel.where[5].quantified == ValueCompare::Ne && !sel.where[5].all));
+  for (auto sql : {"SELECT id FROM t WHERE (SELECT 1)", "SELECT id FROM t WHERE (id, qty) IN (SELECT a, b FROM u)",
+                   "SELECT id FROM t WHERE id = ARRAY(SELECT a FROM u)", "SELECT id FROM t WHERE id IN (VALUES (1))"}) {
+    INFO(sql);
+    CHECK_THROWS_AS(parse(sql), SqlError);
+  }
+}
+
 TEST_CASE("parser: UNIQUE on a column or the table, in the order written", "[sql][parser]") {
   auto t = std::get<CreateTable>(parse("CREATE TABLE u (a INT UNIQUE, b INT CONSTRAINT bu UNIQUE, "
                                        "CONSTRAINT ab UNIQUE (a, b), UNIQUE (b))"));

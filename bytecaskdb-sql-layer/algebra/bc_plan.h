@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
    Copyright (c) 2026 Gustavo Amigo
 
-   bc_plan.h — the plan API of docs/plan_api_design.md (revision 11). A plan is
+   bc_plan.h — the plan API of docs/plan_api_design.md (revision 12). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
    and bc_params are opaque here and built by the runtime
@@ -55,6 +55,19 @@ enum bc_error_code {
   BC_E_UNKNOWN,     /* a commit failed and degraded the engine: its batch may have reached the data
                        file, so its outcome is unknown, never "nothing written" (SQLSTATE 08007) */
   BC_E_PATTERN,     /* bc_like reached a pattern's escape character at its end (SQLSTATE 22025) */
+  BC_E_CARDINALITY, /* a BC_SUB_VALUE subquery emitted a second row (SQLSTATE 21000) */
+};
+
+/* What a subquery's rows are folded into, from bc_sub_begin to bc_sub_end:
+   parameters from `param` on, which the caller passes as NULL, and for
+   BC_SUB_SET the set bc_sub_has_* tests. Each row is one column of `type`;
+   an EXISTS row of any columns, none of them kept. */
+enum bc_sub_kind {
+  BC_SUB_VALUE = 0,   /* param: its one row's value, NULL for none; a second row is BC_E_CARDINALITY */
+  BC_SUB_EXISTS = 1,  /* param: a BOOL, whether it emitted a row */
+  BC_SUB_BOUNDS = 2,  /* param: the largest non-NULL value, param+1 the smallest (NULL for none);
+                         param+2: NULL if a row was NULL, else FALSE; param+3: a BOOL, whether it emitted a row */
+  BC_SUB_SET = 3,     /* the set of its non-NULL values; param and param+1 as BC_SUB_BOUNDS's +2 and +3 */
 };
 
 enum bc_scan_flags {
@@ -296,6 +309,16 @@ bc_view  bc_row_end(bc_ctx *, bc_row);
 bc_view  bc_pin(bc_ctx *, bc_view);                 /* a copy that lives until reset */
 bc_view  bc_null_row(bc_ctx *, uint32_t table);     /* a row of the table's layout, every column NULL: an outer
                                                        join's inner side where it matches nothing; lives until reset */
+
+/* Subqueries: what the plan emits between bc_sub_begin and bc_sub_end is
+   folded as `kind` says (enum bc_sub_kind), never a result row. One at a
+   time; `sub` names its set for bc_sub_has_*, which lives until reset. */
+void bc_sub_begin(bc_ctx *, uint32_t sub, int32_t kind, int32_t type, uint32_t param);  /* type: a bc_type */
+void bc_sub_end(bc_ctx *);
+bool bc_sub_has_i64(bc_ctx *, uint32_t sub, int64_t);   /* whether the BC_SUB_SET holds the value */
+bool bc_sub_has_f64(bc_ctx *, uint32_t sub, double);    /* -0.0 is 0.0, and NaN is one value, as PostgreSQL's = */
+bool bc_sub_has_bool(bc_ctx *, uint32_t sub, bool);
+bool bc_sub_has_bytes(bc_ctx *, uint32_t sub, bc_view);
 
 /* Ephemeral structures */
 bc_sorter bc_sorter_open(bc_ctx *, int64_t keep);        /* keep the first `keep` in sort order; 0 = all */
