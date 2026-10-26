@@ -715,6 +715,7 @@ auto exec_sqlstate(const ExecError& e) noexcept -> std::string_view {
     case BC_E_BUDGET: return "57014";     // query_canceled
     case BC_E_MEMORY: return "53200";     // out_of_memory
     case BC_E_CLOSED: return "57P01";     // admin_shutdown
+    case BC_E_PATTERN: return "22025";    // invalid_escape_sequence
     case BC_E_IO:
     case BC_E_CORRUPT:
     case BC_E_DEGRADED: return "58030";   // io_error

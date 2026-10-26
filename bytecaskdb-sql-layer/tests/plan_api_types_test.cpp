@@ -465,6 +465,63 @@ void arith_error(Fixture& f, bc_plan_fn plan, std::vector<bc_value> p) {
 }
 }  // namespace
 
+namespace {
+// $1 LIKE $2 with escape $3, as a one-column BOOL row.
+void like_row(bc_ctx* cx) {
+  auto escape = static_cast<std::int32_t>(bc_param_i64(cx, 2));
+  bool m = bc_like(cx, bc_param_bytes(cx, 0), bc_param_bytes(cx, 1), escape);
+  bc_emit_begin(cx);
+  bc_emit_bool(cx, m);
+  bc_emit_end(cx);
+}
+constexpr std::array<PhysType, 1> kBoolRow{PhysType::Bool};
+}  // namespace
+
+TEST_CASE("plan API: bc_like is PostgreSQL's LIKE of UTF-8 text", "[sql][algebra]") {
+  Fixture f;
+  auto like = [&](std::string_view text, std::string_view pattern, std::int64_t escape = '\\') -> bool {
+    INFO(text << " LIKE " << pattern << " escape " << escape);
+    REQUIRE(run(f, like_row, {bytes(text), bytes(pattern), escape}, kBoolRow) == BC_COMMITTED);
+    auto rows = f.results(kBoolRow);
+    REQUIRE(rows.size() == 1);
+    return std::get<bool>(rows[0][0]);
+  };
+  CHECK(like("apple", "apple"));
+  CHECK_FALSE(like("apple", "Apple"));  // case matters
+  CHECK(like("apple", "a%"));
+  CHECK(like("apple", "%le"));
+  CHECK(like("apple", "%pp%"));
+  CHECK(like("apple", "a_p_e"));
+  CHECK_FALSE(like("apple", "a_p_"));
+  CHECK(like("", ""));
+  CHECK(like("", "%%"));
+  CHECK_FALSE(like("", "_"));
+  CHECK(like("aaa", "%a%a%a%"));
+  CHECK_FALSE(like("aa", "%a%a%a%"));
+  CHECK(like("abcabcabd", "%abd"));  // backtracks past a false start
+  CHECK(like("mississippi", "m%iss%ppi"));
+  // _ is one character, not one byte; literals compare byte for byte.
+  CHECK(like("h\xc3\xa9llo", "h_llo"));
+  CHECK_FALSE(like("h\xc3\xa9llo", "h__llo"));
+  CHECK(like("w\xc3\xb6rld", "%\xc3\xb6%"));
+  // The escape quotes the character after it.
+  CHECK(like("100%", "100\\%"));
+  CHECK_FALSE(like("1000", "100\\%"));
+  CHECK(like("a_b", "a\\_b"));
+  CHECK_FALSE(like("axb", "a\\_b"));
+  CHECK(like("a\\b", "a\\\\b"));
+  CHECK(like("100%", "100!%", '!'));
+  CHECK(like("a\\b", "a\\b", -1));          // no escape: the backslash is itself
+  CHECK(like("x\xc3\xa9", "x\xc3\xa9\xc3\xa9", 0xE9));                 // a two-byte escape: é quotes é
+  CHECK_FALSE(like("x\xc3\xa9", "x\xc3\xa9\xc3\xa9", 0xE9 + 1));  // é not the escape: two of them
+  // An escape at the pattern's end is an error only where the match gets
+  // to it, as in PostgreSQL.
+  CHECK_FALSE(like("apple", "x\\"));
+  CHECK_FALSE(like("appl", "appl\\"));  // the text ends first
+  REQUIRE(run(f, like_row, {bytes("apple"), bytes("appl\\"), std::int64_t{'\\'}}, kBoolRow) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_PATTERN);
+}
+
 TEST_CASE("plan API: the arithmetic helpers define what C leaves undefined", "[sql][algebra]") {
   Fixture f;
   CHECK(value(f, add_p, {std::int64_t{2}, std::int64_t{3}}) == 5);

@@ -47,22 +47,25 @@ struct ColumnRef {
 
 // A typed expression. Its SQL type is the binder's, by types_design.md's
 // rules: a comparison's is BOOLEAN, an aggregate's PostgreSQL's result type.
-// And, Or, Not and IsNull are a predicate's, a WHERE conjunct that is no
-// comparison of its own: three-valued, as SQL's logic is, over comparisons
-// and IS NULL of a column; a filter, never a key's bound.
+// And, Or, Not, IsNull and Like are a predicate's, a WHERE conjunct that is
+// no comparison of its own: three-valued, as SQL's logic is, over
+// comparisons, IS NULL of a column and a text column LIKE a pattern; a
+// filter, never a key's bound.
 struct Expr {
-  enum class Kind { Column, Param, Const, Add, Sub, Compare, Aggregate, And, Or, Not, IsNull };
+  enum class Kind { Column, Param, Const, Add, Sub, Compare, Aggregate, And, Or, Not, IsNull, Like };
   enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind{Kind::Param};
   SqlType type{};
   ColumnRef col{};              // Column
   std::uint32_t param{0};       // Param: zero-based ($1 is 0)
-  std::int64_t constant{0};     // Const: in its type's representation, a DECIMAL's scaled; a BOOLEAN's 0 or 1
+  std::int64_t constant{0};     // Const: in its type's representation, a DECIMAL's scaled; a BOOLEAN's 0 or 1;
+                                // Like: the escape's code point, -1 for none
   Op op{Op::Eq};                // Compare
   Fn fn{Fn::Count};             // Aggregate
   bool distinct{false};         // Aggregate: COUNT(DISTINCT arg)
   std::vector<Expr> args;       // Add, Sub, Compare: two; Aggregate: none (COUNT(*)) or its argument;
-                                // And, Or: two or more; Not: one; IsNull: its column
+                                // And, Or: two or more; Not: one; IsNull: its column; Like: the column and the
+                                // pattern, a parameter
 
   [[nodiscard]] auto phys() const -> PhysType { return phys_type(type); }
 
@@ -115,7 +118,8 @@ struct Expr {
 
 // Whether e is a predicate: And, Or, Not or IsNull.
 [[nodiscard]] auto is_predicate(const Expr& e) -> bool {
-  return e.kind == Expr::Kind::And || e.kind == Expr::Kind::Or || e.kind == Expr::Kind::Not || e.kind == Expr::Kind::IsNull;
+  return e.kind == Expr::Kind::And || e.kind == Expr::Kind::Or || e.kind == Expr::Kind::Not ||
+         e.kind == Expr::Kind::IsNull || e.kind == Expr::Kind::Like;
 }
 
 // Every column the expression reads, in the order it reads them.

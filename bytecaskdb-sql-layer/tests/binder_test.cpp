@@ -515,6 +515,38 @@ TEST_CASE("binder: OR, NOT, IS NULL, <>, BETWEEN and IN are predicates over comp
         std::vector<PhysType>{PhysType::I64, PhysType::I64});
 }
 
+TEST_CASE("binder: LIKE of a text column, its pattern TEXT, its escape one character", "[sql][binder]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE lk (k INTEGER PRIMARY KEY, v TEXT, w VARCHAR(4), b BYTEA)").stmt));
+  const auto& cat = f.cat();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return "bound";
+  };
+  auto like = [&](std::string_view where) {
+    auto b = bind_sql(cat, "SELECT k FROM lk WHERE " + std::string{where});
+    return get<logical::Filter>(b).conjuncts.at(0);
+  };
+  auto plain = like("v LIKE $1");
+  REQUIRE(plain.kind == logical::Expr::Kind::Like);
+  CHECK(plain.constant == '\\');
+  CHECK(plain.args[1].kind == logical::Expr::Kind::Param);
+  CHECK(plain.args[1].type == SqlType{SqlKind::Text});  // a TEXT, whatever the column's length
+  CHECK(bind_sql(cat, "SELECT k FROM lk WHERE w LIKE $1").params.at(0).type == SqlType{SqlKind::Text});
+  CHECK(like("v NOT LIKE 'a%'").kind == logical::Expr::Kind::Not);
+  CHECK(like("v LIKE 'a!%' ESCAPE '!'").constant == '!');
+  CHECK(like("v LIKE 'a%' ESCAPE ''").constant == -1);
+  CHECK(like("v LIKE 'a%' ESCAPE '\xc3\xa9'").constant == 0xE9);
+  CHECK(state("SELECT k FROM lk WHERE v LIKE 'a' ESCAPE 'ab'") == "22025");
+  CHECK(state("SELECT k FROM lk WHERE k LIKE '1%'") == "42883");
+  CHECK(rejected(cat, "SELECT k FROM lk WHERE b LIKE 'a%'").first == "LIKE of a BYTEA column is not supported yet");
+  CHECK(rejected(cat, "SELECT k FROM lk WHERE v ILIKE 'a%'").first == "ILIKE is not supported: its case folding is a locale's");
+}
+
 TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][binder][catalog]") {
   sql_test::Fixture f;
   const auto& cat = f.cat();

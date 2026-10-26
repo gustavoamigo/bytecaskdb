@@ -248,7 +248,8 @@ auto use_of(const Expr& c, const Tables& here, const Tables& other) -> Use {
     case Expr::Kind::And:
     case Expr::Kind::Or:
     case Expr::Kind::Not:
-    case Expr::Kind::IsNull: return Use::Operand;
+    case Expr::Kind::IsNull:
+    case Expr::Kind::Like: return Use::Operand;
   }
   return Use::Operand;
 }
@@ -415,7 +416,7 @@ auto double_filter(const std::string& column) -> Refusal {
 // needs no comparison.
 auto float_compared(const Expr& p) -> const ColumnRef* {
   if (p.kind == Expr::Kind::Compare) return col_of(p).type == PhysType::F64 ? &col_of(p) : nullptr;
-  if (p.kind == Expr::Kind::IsNull) return nullptr;
+  if (p.kind == Expr::Kind::IsNull || p.kind == Expr::Kind::Like) return nullptr;  // Like: of text
   for (const auto& a : p.args) {
     if (const auto* c = float_compared(a)) return c;
   }
