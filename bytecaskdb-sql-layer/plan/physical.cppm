@@ -538,6 +538,14 @@ private:
         if (e.args.size() != 1 || e.args[0].kind != Expr::Kind::Column) broken("IS NULL of other than a column");
         reads(e);
         return;
+      case Expr::Kind::Like:
+        if (e.args.size() != 2 || e.args[0].kind != Expr::Kind::Column || e.args[0].col.type != PhysType::Bytes ||
+            e.args[1].kind != Expr::Kind::Param) {
+          broken("LIKE of other than a text column and a parameter");
+        }
+        params(e.args[1]);
+        reads(e);
+        return;
       case Expr::Kind::Compare:
         if (e.args[0].kind != Expr::Kind::Column || e.args[0].col.type == PhysType::F64 ||
             (e.args[1].kind != Expr::Kind::Param && e.args[1].kind != Expr::Kind::Const)) {

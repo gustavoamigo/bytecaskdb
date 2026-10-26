@@ -90,9 +90,17 @@ on any columns, and of predicates over them.
   a key takes each comparison it can. A predicate (`OR`, `NOT`, `IS NULL`)
   is a filter, checked on each row a plan reads, never a key's bound
   (`planner_design.md`, *The search*).
+- **`LIKE`**: `col [NOT] LIKE pattern [ESCAPE 'c']`, of a TEXT or VARCHAR
+  column and a parameter or constant pattern, typed TEXT as PostgreSQL
+  types it; a predicate leaf, matched by `bc_like` (`plan_api_design.md`):
+  `%` any run, `_` one character, case-sensitive and bytewise (`COLLATE
+  "C"`). The escape is a backslash, `ESCAPE`'s one character, or none for
+  `ESCAPE ''`; a longer one is 22025, as is a pattern the match finds ending
+  in its escape. A number column is 42883.
 - Not yet: a predicate comparing a REAL or DOUBLE column (`no plan:`, as
   any filter on one), `$n ± k` inside one, one of both tables' columns in a
-  join, in `HAVING`, `IN` of a subquery, `LIKE`, `IS DISTINCT FROM`.
+  join, in `HAVING`, `IN` of a subquery, `ILIKE` (its case folding is a
+  locale's), `LIKE` of a BYTEA column, `IS DISTINCT FROM`.
 - Comparing two columns of different SQL types is refused (*Known
   differences*).
 
@@ -172,7 +180,7 @@ and with a constant selected or `DISTINCT ON`, it is not taken yet.
 
 **Refused**, with a message and the node's position: everything not above.
 That includes:
-- `LIKE`, `IN` of a subquery, `IS DISTINCT FROM`, a predicate over both
+- `ILIKE`, `IN` of a subquery, `IS DISTINCT FROM`, a predicate over both
   tables of a join or in `HAVING`;
 - subqueries, derived tables, set operations;
 - `DISTINCT ON`, `DISTINCT` of a constant or over groups it does not select

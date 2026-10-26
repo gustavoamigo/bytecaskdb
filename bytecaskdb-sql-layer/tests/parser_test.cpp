@@ -107,7 +107,7 @@ TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql]
   CHECK(rejected_at("SELECT id FROM t, u, v WHERE id = $1") >= 0);
   CHECK(rejected_at("SELECT id FROM t WHERE id = B'1'") == 28);  // a bit-string literal
   CHECK(rejected_at("VALUES (1)") == 0);
-  CHECK(rejected_at("SELECT id FROM t WHERE id LIKE $1") >= 0);
+  CHECK(rejected_at("SELECT id FROM t WHERE id ILIKE $1") >= 0);
   CHECK(rejected_at("SELEC id FROM t") == 0);                   // PostgreSQL's own syntax error
   CHECK(rejected_at("SELECT id FROM t; SELECT id FROM t") == -1);
   CHECK(rejected_at("DROP VIEW v") == 0);

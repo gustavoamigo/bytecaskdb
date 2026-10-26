@@ -1180,6 +1180,48 @@ public:
     return out;
   }
 
+  // col LIKE pattern: a TEXT or VARCHAR column, as PostgreSQL's ~~ takes
+  // them, and a pattern a parameter or a constant, of TEXT, as PostgreSQL
+  // types it; the escape a backslash, ESCAPE's one character, or none for
+  // ESCAPE ''.
+  auto like(const ast::Compare& w, const auto& resolve) -> logical::Expr {
+    if (w.lhs.kind != ast::Expr::Kind::Column) not_yet("LIKE of other than a column", w.pos);
+    auto [table, c] = resolve(w.lhs);
+    if (!is_string(c->sql)) {
+      if (c->sql.kind == SqlKind::Bytea) not_yet("LIKE of a BYTEA column", w.pos);
+      throw SqlError{"operator does not exist: " + pg_type_name(c->sql) + " ~~ unknown", w.pos, kUndefinedFunction};
+    }
+    synthetic_.push_back(Column{0, c->name, SqlType{SqlKind::Text}, PhysType::Bytes, true, {}});
+    const auto& text = synthetic_.back();
+    logical::Expr pattern;
+    if (w.rhs.kind == ast::Expr::Kind::Param) {
+      use_param(w.rhs.param, PhysType::Bytes, w.rhs.pos, text, table, Use::Compared);
+      pattern = logical::param(w.rhs.param, text.sql);
+    } else if (is_constant(w.rhs)) {
+      pattern = fixed(coerce(fold(w.rhs), text, false, "~~"), text.sql);
+    } else {
+      not_yet("LIKE of other than a parameter or a constant pattern", w.pos);
+    }
+    std::int64_t escape = '\\';
+    if (w.escape) {
+      auto b = std::as_bytes(std::span{w.escape->data(), w.escape->size()});
+      auto n = utf8_code_points(b);
+      if (!n || *n > 1) throw SqlError{"invalid escape string", w.pos, kInvalidEscapeSequence};
+      escape = -1;
+      if (*n == 1) {
+        auto lead = static_cast<unsigned char>((*w.escape)[0]);
+        std::int64_t cp = w.escape->size() == 1 ? lead : lead & (0x7F >> w.escape->size());
+        for (std::size_t k = 1; k < w.escape->size(); ++k) cp = (cp << 6) | (static_cast<unsigned char>((*w.escape)[k]) & 0x3F);
+        escape = cp;
+      }
+    }
+    auto e = logical::expr(logical::Expr::Kind::Like, SqlType{SqlKind::Boolean});
+    e.args.push_back(logical::column_of(table, *c));
+    e.args.push_back(std::move(pattern));
+    e.constant = escape;
+    return e;
+  }
+
   // A conjunct: a comparison, or a predicate's tree, each comparison in it
   // bound as a WHERE's is and IS NULL of a column (docs/frontend_design.md,
   // *WHERE*). In a tree, $n ± k is not taken yet.
@@ -1205,6 +1247,7 @@ public:
         e.args.push_back(logical::column_of(table, *c));
         return e;
       }
+      case K::Like: return like(w, resolve);
       case K::And: return tree(logical::Expr::Kind::And);
       case K::Or: return tree(logical::Expr::Kind::Or);
       case K::Not: return tree(logical::Expr::Kind::Not);

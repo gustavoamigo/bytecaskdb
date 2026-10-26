@@ -146,7 +146,8 @@ auto fold(Expr& e) -> bool {
     case Kind::And:
     case Kind::Or:
     case Kind::Not:
-    case Kind::IsNull: return changed;
+    case Kind::IsNull:
+    case Kind::Like: return changed;
   }
   return changed;
 }

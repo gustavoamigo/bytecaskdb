@@ -510,7 +510,7 @@ def test_a_query_inside_an_extended_block_joins_its_transaction_and_commits_it(s
     assert status(c.until_ready()) == "I"
     assert keys(c) == ["1"]
     # The Query fails: the Execute before it is rolled back with it.
-    for failing, state in (("SELECT k FROM t WHERE v LIKE 'a%'", "42601"),
+    for failing, state in (("SELECT k FROM t WHERE v ILIKE 'a%'", "42601"),
                            ("CREATE TABLE w (k BIGINT PRIMARY KEY)", "0A000")):
         c.send(parse(insert), bind(["2", "2"]), execute(), query(failing))
         out = c.until_ready()
