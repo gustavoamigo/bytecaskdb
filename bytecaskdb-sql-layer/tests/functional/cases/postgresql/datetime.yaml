@@ -129,8 +129,6 @@
 
 - name: a DATE literal
   features: [F051-01]
-  # expression not supported
-  unimplemented: true
   setup:
     - CREATE TABLE dt (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)
   steps:

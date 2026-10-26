@@ -150,9 +150,10 @@ That includes:
 - outer joins, three or more tables, table aliases;
 - `OFFSET`, `RETURNING`, multi-row `VALUES`;
 - `*`, `/`, string concatenation and functions;
-- a cast (`CAST`, `::`) and typed literals (`DATE '…'`), a numeric literal
-  of more than 18 digits, a string literal in arithmetic, unary `-` of
-  anything but a constant, and a constant beside an aggregate.
+- a cast of anything but a string literal or `NULL`, a numeric literal of
+  more than 18 digits, a string literal in arithmetic, unary `-` of
+  anything but a constant, a comparison of a column as a value, and a
+  constant beside an aggregate.
 
 The list and its order of work are #534.
 
@@ -176,7 +177,20 @@ recompile after a DDL folds them again, to the types they meet then.
 - Unary `+` and `-`, and `+` and `-` of constants, fold with PostgreSQL's
   result types and range checks: `2147483647 + 1` is "integer out of
   range" (22003), `1 + 1.5` the numeric 2.5, `1 + NULL` an integer NULL.
-- A select-list constant is named `?column?`.
+- A comparison of constants (`=`, `<>`, `<`, `<=`, `>`, `>=`) folds to a
+  `boolean`, NULL if either side is: numbers exactly whatever their
+  scales, a float with NaN above every value, strings and bytes bytewise
+  (*Known differences*), `FALSE` before `TRUE`, dates and times of one
+  type by value. A string literal beside a typed constant is read as that
+  constant's type (`1 < '2'`); two compare as text. Types PostgreSQL has no
+  operator for are 42883; a date beside a timestamp is not taken yet.
+- A cast of a string literal or `NULL`: `DATE '…'`, `'…'::date` and
+  `CAST('…' AS date)` alike read the string with the type's input function,
+  a `DECIMAL(p, s)` rounded to its scale and range-checked (22003), and are
+  of that type. A cast of anything else, and to `VARCHAR(n)`, which
+  PostgreSQL's cast truncates, are not taken yet.
+- A select-list constant is named `?column?`, a cast by its type's name
+  (`date`, `int4`, `numeric`), as PostgreSQL names them.
 
 **Where it meets a column.**
 - **Assigned** (`VALUES`, `SET`): PostgreSQL's assignment casts. A numeric
@@ -327,6 +341,10 @@ fail on them.
   its own key encoding, so it would have to rewrite the comparison
   (`= 40000` is never true, `< 40000` is `IS NOT NULL`); it refuses rather
   than guess. The machine expects the refusal (`oracle.exact_literal`).
+- **Strings compare bytewise, as `COLLATE "C"`**, constants as columns
+  do: `'B' < 'a'` is true. PostgreSQL orders them by the database's
+  collation, under which `'a' < 'B'` may be true instead. The layer has one
+  collation (`types_design.md`).
 - **A constant's error is raised when the statement is compiled**: `SELECT
   2147483647 + 1` and `UPDATE … SET smallint_col = 40000` fail at prepare
   (the wire's Parse), with PostgreSQL's SQLSTATE. PostgreSQL folds the same
