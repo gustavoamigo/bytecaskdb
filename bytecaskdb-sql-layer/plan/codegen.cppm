@@ -262,9 +262,11 @@ auto param_parts(const std::vector<Expr>& params) -> std::vector<KeySrc> {
 // A key of `object` from its leading parts, as an expression. One
 // bc_key_params when they are consecutive parameters, a builder otherwise.
 // In a loop, `miss_if_long` skips to the next iteration when a byte string
-// read from a row makes the key too long for any row to have.
-auto key(Writer& w, std::uint32_t object, const std::vector<KeySrc>& parts, bool miss_if_long = false)
-    -> std::string {
+// read from a row makes the key too long for any row to have; `fits`, when
+// given, is set to that test instead, for a caller where such a key is a
+// miss but the row goes on.
+auto key(Writer& w, std::uint32_t object, const std::vector<KeySrc>& parts, bool miss_if_long = false,
+         std::string* fits = nullptr) -> std::string {
   auto consecutive = !parts.empty() && parts[0].param.has_value();
   for (std::size_t i = 1; consecutive && i < parts.size(); ++i) {
     consecutive = parts[i].param.has_value() && *parts[i].param == *parts[0].param + i;
@@ -287,6 +289,7 @@ auto key(Writer& w, std::uint32_t object, const std::vector<KeySrc>& parts, bool
   auto long_value =
       std::ranges::any_of(parts, [](const KeySrc& p) { return !p.value.empty() && p.type == PhysType::Bytes; });
   if (miss_if_long && long_value) w.line("if (!bc_key_fits(cx, " + k + ")) continue;");
+  if (fits != nullptr && long_value) *fits = "bc_key_fits(cx, " + k + ")";
   return "bc_key_end(cx, " + k + ")";
 }
 
@@ -867,9 +870,14 @@ private:
       }
       w_.reads(j.inner);
       w_.line("bool " + found + " = false;");
-      auto inner_key = key(w_, j.inner, parts, true);
       w_.line("bc_view " + row + " = bc_empty(cx);");
-      w_.line((nulls.empty() ? "" : "if (!(" + nulls + ")) ") + row + " = bc_get(cx, " + inner_key + ", &" + found + ");");
+      // A NULL part, or a value too long for any key, names no row: the key
+      // is built only without one, and the outer row goes on either way.
+      if (!nulls.empty()) w_.open("if (!(" + nulls + "))");
+      std::string fits;
+      auto inner_key = key(w_, j.inner, parts, false, &fits);
+      w_.line((fits.empty() ? "" : "if (" + fits + ") ") + row + " = bc_get(cx, " + inner_key + ", &" + found + ");");
+      if (!nulls.empty()) w_.close();
       rows_.push_back({j.inner, row});
       auto matched = found;
       for (const auto& c : j.match) matched += " && !(" + fails(c) + ")";

@@ -1304,6 +1304,17 @@ TEST_CASE("embedded API: a left outer join NULL-extends each left row no right r
   CHECK(rows("SELECT l.k, r.j FROM l LEFT JOIN r ON r.j = 99 ORDER BY l.k") ==
         Grid{{i(1), Value{}}, {i(2), Value{}}, {i(3), Value{}}});
   CHECK_THROWS_AS(db->execute("SELECT l.k FROM l FULL JOIN r ON l.a = r.a"), ast::SqlError);
+  // The right side keyed by a parameter and a left column: a NULL parameter,
+  // or a left value too long for any key, matches nothing, and the left row
+  // stays, NULL-extended.
+  (void)db->execute("CREATE TABLE rc (a INTEGER NOT NULL, s TEXT NOT NULL, PRIMARY KEY (a, s))");
+  (void)db->execute("CREATE TABLE ls (k INTEGER PRIMARY KEY, s TEXT NOT NULL)");
+  (void)db->execute("INSERT INTO rc VALUES (1, 'x')");
+  (void)db->execute("INSERT INTO ls VALUES (1, 'x')");
+  (void)db->execute("INSERT INTO ls VALUES (2, $1)", {Value{Bytes(70000, std::byte{'y'})}});
+  const std::string keyed = "SELECT ls.k, rc.a FROM ls LEFT JOIN rc ON rc.s = ls.s AND rc.a = $1 ORDER BY ls.k";
+  CHECK(db->execute(keyed, {i(1)}).rows == Grid{{i(1), i(1)}, {i(2), Value{}}});
+  CHECK(db->execute(keyed, {Value{}}).rows == Grid{{i(1), Value{}}, {i(2), Value{}}});
 }
 
 TEST_CASE("embedded API: a choice point's plan text shows both plans, and each returns the same rows",

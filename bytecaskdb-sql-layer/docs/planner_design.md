@@ -717,7 +717,9 @@ aside: the binder marks it, and the plan tests the NULL.
 
 A NULL parameter of the right side's key matches no row: it is that side's
 guard, which skips its loop and leaves the left row NULL-extended, where an
-inner join's plan would end with no rows.
+inner join's plan would end with no rows. Probed by key, the right side is
+looked up only when no part is NULL and the key fits: a NULL, or a left
+value too long for any key, is a miss, and the left row goes on.
 
 ### Aggregates
 
