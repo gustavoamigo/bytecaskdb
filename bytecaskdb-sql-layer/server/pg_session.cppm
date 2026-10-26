@@ -455,9 +455,9 @@ private:
   void fatal(std::string_view state, std::string_view message) {
     fatal_sent_ = true;
     send_fields('E', "FATAL", state, message, 0);
-    flush();
     close();
   }
+
 
   // The exception in flight as an ErrorResponse. `text` is the statement an
   // ast::SqlError's position is into.
@@ -481,8 +481,8 @@ private:
     out_.begin('Z');
     out_.raw(status());
     out_.end();
-    flush();
   }
+
 
   void row_description(const std::vector<ResultColumn>& cols) {
     out_.begin('T');
@@ -1039,13 +1039,16 @@ public:
   struct Slot {
     enum class State { Idle, Queued, Running };
 
-    Slot(Database& db, const SessionConfig& cfg, Pool& pool)
-        : session{db, cfg, [this, &pool](std::string bytes) { pool.flush_from_worker(*this, std::move(bytes)); }} {}
+    Slot(Database& db, const SessionConfig& cfg, Pool& pool, void* user_tag)
+        : session{db, cfg, [this, &pool](std::string bytes) { pool.flush_from_worker(*this, std::move(bytes)); }},
+          tag{user_tag} {}
 
     Session session;  // owned by the running worker (State::Running), or idle
     State state{State::Idle};
     std::deque<Input> inbox;
     std::string outbox;
+    void* tag{nullptr};
+    bool in_woken{false};
     bool stopping{false};
     bool dropped{false};
     bool session_ended{false};
@@ -1074,7 +1077,28 @@ public:
   Pool& operator=(const Pool&) = delete;
   ~Pool() { shutdown(); }
 
-  [[nodiscard]] auto open() -> std::shared_ptr<Slot> { return std::make_shared<Slot>(db_, cfg_, *this); }
+  [[nodiscard]] auto open(void* tag = nullptr) -> std::shared_ptr<Slot> {
+    return std::make_shared<Slot>(db_, cfg_, *this, tag);
+  }
+
+  void detach(const std::shared_ptr<Slot>& slot) {
+    std::lock_guard<std::mutex> lock{mu_};
+    slot->tag = nullptr;
+    if (slot->in_woken) {
+      std::erase(woken_, slot.get());
+      slot->in_woken = false;
+    }
+  }
+
+  void take_woken(std::vector<void*>& out) {
+    out.clear();
+    std::lock_guard<std::mutex> lock{mu_};
+    for (auto* s : woken_) {
+      s->in_woken = false;
+      if (s->tag != nullptr) out.push_back(s->tag);
+    }
+    woken_.clear();
+  }
 
   void submit(const std::shared_ptr<Slot>& slot, std::span<Input> inputs) {
     if (inputs.empty()) return;
@@ -1136,11 +1160,21 @@ private:
     }
   }
 
+  void mark_woken(Slot& slot) {
+    if (!slot.in_woken && slot.tag != nullptr) {
+      slot.in_woken = true;
+      woken_.push_back(&slot);
+    }
+  }
+
   void flush_from_worker(Slot& slot, std::string bytes) {
     if (bytes.empty()) return;
     {
       std::lock_guard<std::mutex> lock{mu_};
-      if (!slot.dropped) slot.outbox.append(bytes);
+      if (!slot.dropped) {
+        slot.outbox.append(bytes);
+        mark_woken(slot);
+      }
     }
     wake();
   }
@@ -1207,6 +1241,7 @@ private:
         } else {
           slot->state = Slot::State::Idle;
         }
+        mark_woken(*slot);
       }
       wake();
     }
@@ -1219,6 +1254,7 @@ private:
   std::condition_variable cv_;
   std::deque<std::shared_ptr<Slot>> queue_;
   std::vector<std::thread> workers_;
+  std::vector<Slot*> woken_;
   bool shutdown_threads_{false};
 };
 

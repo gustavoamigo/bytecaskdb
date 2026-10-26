@@ -192,6 +192,7 @@ struct Server {
   std::size_t active_connections{0};
   pg::Pool pool;
   std::set<Connection*> conns;
+  std::vector<void*> woken_tags;
   bool stopping{false};
   bool listener_closed{false};
   bool signals_closed{false};
@@ -204,6 +205,7 @@ void pump(Connection* c);
 void on_conn_closed(uv_handle_t* h) {
   auto* c = static_cast<Connection*>(h->data);
   auto* s = c->server;
+  if (c->slot) s->pool.detach(c->slot);
   if (c->counted) --s->active_connections;
   s->conns.erase(c);
   delete c;
@@ -238,20 +240,34 @@ void pump(Connection* c) {
   }
   if (c->write_failed) c->write_queue.clear();
 
-  if (!c->write_in_flight && !c->write_queue.empty() && !c->write_failed) {
+  while (!c->write_in_flight && !c->write_queue.empty() && !c->write_failed) {
     auto n = std::min(c->write_queue.size(), kWriteChunk);
-    c->write_active.assign(c->write_queue, 0, n);
-    c->write_queue.erase(0, n);
-    c->write_in_flight = true;
-    c->last_progress = std::chrono::steady_clock::now();
-    auto wrbuf = uv_buf_init(c->write_active.data(), static_cast<unsigned int>(c->write_active.size()));
-    if (uv_write(&c->write_req, reinterpret_cast<uv_stream_t*>(&c->tcp), &wrbuf, 1, on_write) != 0) {
-      c->write_in_flight = false;
-      c->write_active.clear();
-      c->write_failed = true;
-      c->write_queue.clear();
-      if (c->slot) s->pool.drop(c->slot);
+    auto try_buf = uv_buf_init(c->write_queue.data(), static_cast<unsigned int>(n));
+    auto written = uv_try_write(reinterpret_cast<uv_stream_t*>(&c->tcp), &try_buf, 1);
+    if (written > 0) {
+      c->write_queue.erase(0, static_cast<std::size_t>(written));
+      c->last_progress = std::chrono::steady_clock::now();
+      continue;
     }
+    if (written == UV_EAGAIN || written == 0) {
+      c->write_active.assign(c->write_queue, 0, n);
+      c->write_queue.erase(0, n);
+      c->write_in_flight = true;
+      c->last_progress = std::chrono::steady_clock::now();
+      auto wrbuf = uv_buf_init(c->write_active.data(), static_cast<unsigned int>(c->write_active.size()));
+      if (uv_write(&c->write_req, reinterpret_cast<uv_stream_t*>(&c->tcp), &wrbuf, 1, on_write) != 0) {
+        c->write_in_flight = false;
+        c->write_active.clear();
+        c->write_failed = true;
+        c->write_queue.clear();
+        if (c->slot) s->pool.drop(c->slot);
+      }
+      break;
+    }
+    c->write_failed = true;
+    c->write_queue.clear();
+    if (c->slot) s->pool.drop(c->slot);
+    break;
   }
 
   auto done_writing = c->write_failed || (c->session_ended && c->write_queue.empty() && !c->write_in_flight);
@@ -332,7 +348,7 @@ void on_connect(uv_stream_t* server_stream, int status) {
 
   ++s->active_connections;
   c->counted = true;
-  c->slot = s->pool.open();
+  c->slot = s->pool.open(c);
   c->worker_idle = true;
   c->reading = true;
   (void)uv_read_start(reinterpret_cast<uv_stream_t*>(&c->tcp), on_alloc, on_read);
@@ -340,8 +356,9 @@ void on_connect(uv_stream_t* server_stream, int status) {
 
 void on_wake(uv_async_t* h) {
   auto* s = static_cast<Server*>(h->data);
-  std::vector<Connection*> snapshot{s->conns.begin(), s->conns.end()};
-  for (auto* c : snapshot) {
+  s->pool.take_woken(s->woken_tags);
+  for (auto* tag : s->woken_tags) {
+    auto* c = static_cast<Connection*>(tag);
     if (s->conns.contains(c)) pump(c);
   }
   check_shutdown_complete(s);
