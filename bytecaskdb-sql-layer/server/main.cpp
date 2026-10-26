@@ -230,7 +230,7 @@ void pump(Connection* c) {
   if (c->closing) return;
   auto* s = c->server;
   if (c->slot) {
-    auto st = s->pool.drain(c->slot, c->write_queue);
+    auto st = s->pool.drain(c->slot, c->write_queue, c->write_in_flight);
     c->session_ended = st.ended;
     c->worker_idle = st.idle;
     if (c->session_ended && c->reading) {
@@ -268,6 +268,11 @@ void pump(Connection* c) {
     c->write_queue.clear();
     if (c->slot) s->pool.drop(c->slot);
     break;
+  }
+  if (!c->write_in_flight && c->write_queue.empty() && c->slot && !c->write_failed) {
+    auto st = s->pool.drain(c->slot, c->write_queue, false);
+    c->session_ended = st.ended;
+    c->worker_idle = st.idle;
   }
 
   auto done_writing = c->write_failed || (c->session_ended && c->write_queue.empty() && !c->write_in_flight);
@@ -348,7 +353,9 @@ void on_connect(uv_stream_t* server_stream, int status) {
 
   ++s->active_connections;
   c->counted = true;
-  c->slot = s->pool.open(c);
+  uv_os_fd_t fd = -1;
+  (void)uv_fileno(reinterpret_cast<const uv_handle_t*>(&c->tcp), &fd);
+  c->slot = s->pool.open(fd, c);
   c->worker_idle = true;
   c->reading = true;
   (void)uv_read_start(reinterpret_cast<uv_stream_t*>(&c->tcp), on_alloc, on_read);
