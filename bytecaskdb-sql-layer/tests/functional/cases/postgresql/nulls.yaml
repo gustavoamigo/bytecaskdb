@@ -163,7 +163,6 @@
 
 - name: NULL in arithmetic
   features: [E011-04]
-  unimplemented: true
   setup:
     - CREATE TABLE na2 (id INTEGER PRIMARY KEY, v INTEGER)
   steps:

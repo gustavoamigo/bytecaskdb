@@ -26,6 +26,7 @@ module;
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -419,9 +420,13 @@ auto is_constant(const ast::Expr& e) -> bool {
     case K::Mul:
     case K::Div:
     case K::Compare: return is_constant(*e.lhs) && is_constant(*e.rhs);
-    case K::Cast: return is_constant(*e.rhs);
+    case K::Cast:
+    case K::IsNull: return is_constant(*e.rhs);
     case K::NullIf: return is_constant(*e.lhs) && is_constant(*e.rhs);
     case K::Coalesce:
+    case K::Not:
+    case K::And:
+    case K::Or:
     case K::Func: return std::ranges::all_of(e.args, is_constant);
     case K::Case:
       return (!e.lhs || is_constant(*e.lhs)) && (!e.rhs || is_constant(*e.rhs)) && std::ranges::all_of(e.args, is_constant);
@@ -440,7 +445,7 @@ struct Scaled {
   std::uint8_t scale;
 };
 
-auto scaled(const Constant& c) -> Scaled { return {std::get<std::int64_t>(c.value), c.type.kind == SqlKind::Decimal ? c.type.scale : std::uint8_t{0}}; }
+auto scaled(const Constant& c) -> Scaled { return {std::get<std::int64_t>(c.value), decimal_scale(c.type)}; }
 
 // v at a scale `up` places finer, or nullopt past 18 digits.
 auto rescale(std::int64_t v, std::uint8_t up) -> std::optional<std::int64_t> {
@@ -461,13 +466,88 @@ constexpr auto arith_text(Arith op) -> std::string_view {
   return "+";
 }
 
+// The integer type PostgreSQL's operators give two integers: the wider of
+// the two (int2 + int2 is int2, int2 + int4 int4).
+auto wider_integer(SqlType x, SqlType y) -> SqlType {
+  auto rank = [](SqlKind k) { return k == SqlKind::SmallInt ? 0 : k == SqlKind::Integer ? 1 : 2; };
+  return SqlType{rank(x.kind) >= rank(y.kind) ? x.kind : y.kind};
+}
+
+// The type of x op y for integers and DECIMALs as PostgreSQL's operators type
+// it, the one place the layer resolves it, for a constant and for columns
+// alike: the wider integer of two integers; with a numeric, + and - at the
+// finer scale and * at the sum of the scales. A numeric quotient's scale
+// depends on the operands' values (select_div_scale), so it has no type
+// here: nullopt.
+auto arith_type(Arith op, SqlType x, SqlType y) -> std::optional<SqlType> {
+  if (is_integer(x) && is_integer(y)) return wider_integer(x, y);
+  switch (op) {
+    case Arith::Add:
+    case Arith::Sub: return numeric_type(std::max(decimal_scale(x), decimal_scale(y)));
+    case Arith::Mul: return numeric_type(static_cast<std::uint8_t>(decimal_scale(x) + decimal_scale(y)));
+    case Arith::Div: return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+// PostgreSQL's select_div_scale: the scale of the quotient of two numerics,
+// from each operand's leading base-10000 digit (its value there and its
+// weight, in groups of four digits from the point) and their scales. At
+// least 16 significant digits, and at least the finer operand's scale.
+auto div_scale(Scaled x, Scaled y) -> int {
+  struct Leading {
+    int weight;
+    int first;
+  };
+  auto leading = [](Scaled v) -> Leading {
+    if (v.v == 0) return {0, 0};
+    auto magnitude = v.v < 0 ? -v.v : v.v;
+    auto digits = 0;
+    for (auto m = magnitude; m > 0; m /= 10) ++digits;
+    auto top = digits - 1 - static_cast<int>(v.scale);  // the power of ten of its first digit
+    auto weight = top >= 0 ? top / 4 : -((-top + 3) / 4);
+    auto shift = static_cast<int>(v.scale) + 4 * weight;  // in [-3, 17]
+    auto first = shift >= 0 ? magnitude / kPowersOfTen[static_cast<std::size_t>(shift)]
+                            : magnitude * kPowersOfTen[static_cast<std::size_t>(-shift)];
+    return {weight, static_cast<int>(first)};
+  };
+  auto a = leading(x);
+  auto b = leading(y);
+  auto qweight = a.weight - b.weight;
+  if (a.first <= b.first) --qweight;
+  constexpr auto kMinSignificantDigits = 16;
+  constexpr auto kMaxDisplayScale = 1000;
+  auto scale = kMinSignificantDigits - qweight * 4;
+  scale = std::max({scale, static_cast<int>(x.scale), static_cast<int>(y.scale), 0});
+  return std::min(scale, kMaxDisplayScale);
+}
+
+// x / y at scale `scale`, rounded half away from zero as PostgreSQL's
+// division rounds; nullopt past 18 digits.
+auto numeric_quotient(Scaled x, Scaled y, int scale) -> std::optional<std::int64_t> {
+  if (x.v == 0) return 0;
+  auto digits = [](std::int64_t v) {
+    auto n = 0;
+    for (auto m = v < 0 ? -v : v; m > 0; m /= 10) ++n;
+    return n;
+  };
+  auto up = scale + static_cast<int>(y.scale) - static_cast<int>(x.scale);  // x.v * 10^up / y.v
+  if (digits(x.v) + up - digits(y.v) >= static_cast<int>(kMaxDecimalPrecision) + 1) return std::nullopt;
+  __int128 num = x.v < 0 ? -static_cast<__int128>(x.v) : x.v;
+  for (auto i = 0; i < up; ++i) num *= 10;
+  __int128 den = y.v < 0 ? -static_cast<__int128>(y.v) : y.v;
+  auto q = (2 * num + den) / (2 * den);
+  if (q >= kDecimalLimit) return std::nullopt;
+  auto negative = (x.v < 0) != (y.v < 0);
+  return static_cast<std::int64_t>(negative ? -q : q);
+}
+
 // x op y, of integer or numeric constants, as PostgreSQL's operators type
-// it: INTEGER of two INTEGERs, BIGINT of two integers otherwise; with a
-// numeric, + and - at the finer scale and * at the sum of the scales; the
-// range checked as there (22003). Integer / truncates toward zero; a
-// numeric quotient has PostgreSQL's own scale rule, not taken yet. A zero
-// divisor is 22012, a NULL operand NULL (a divisor of NULL first: strict
-// operators do not run). NULL beside a number is NULL of the number's type.
+// it (arith_type); the range checked as there (22003). Integer / truncates
+// toward zero; a numeric quotient has PostgreSQL's own scale (div_scale),
+// within 18 digits. A zero divisor is 22012, a NULL operand NULL (a divisor
+// of NULL first: strict operators do not run). NULL beside a number is NULL
+// of the number's type.
 auto arithmetic(const Constant& x, const Constant& y, Arith op, std::int32_t pos) -> Constant {
   auto text = std::string{arith_text(op)};
   auto null_untyped = [](const Constant& c) { return c.unknown && std::holds_alternative<std::monostate>(c.value); };
@@ -480,22 +560,25 @@ auto arithmetic(const Constant& x, const Constant& y, Arith op, std::int32_t pos
     }
   }
   auto both_integer = !null_untyped(x) && !null_untyped(y) && is_integer(x.type) && is_integer(y.type);
-  auto type = [&] {
-    if (null_untyped(x)) return y.type;
-    if (null_untyped(y)) return x.type;
-    if (both_integer) {
-      return SqlType{x.type.kind == SqlKind::Integer && y.type.kind == SqlKind::Integer ? SqlKind::Integer : SqlKind::BigInt};
-    }
-    if (op == Arith::Mul) return numeric_type(static_cast<std::uint8_t>(scaled(x).scale + scaled(y).scale));
-    return numeric_type(std::max(scaled(x).scale, scaled(y).scale));
-  }();
   auto is_null = [](const Constant& c) { return std::holds_alternative<std::monostate>(c.value); };
   auto is_zero = [&](const Constant& c) { return !is_null(c) && std::get<std::int64_t>(c.value) == 0; };
   if (op == Arith::Div && !is_null(x) && is_zero(y)) throw SqlError{"division by zero", pos, kDivisionByZero};
-  if (is_null(x) || is_null(y)) {
-    if (op == Arith::Div && !both_integer && !null_untyped(x) && !null_untyped(y)) not_yet("division of numerics", pos);
-    return {std::monostate{}, type, false, {}, pos};
-  }
+  auto numeric_quotient_of = op == Arith::Div && !null_untyped(x) && !null_untyped(y) && !both_integer;
+  auto too_wide = [&] { not_yet("a numeric of more than 18 digits", pos); };
+  // The quotient of two numerics is typed by the values it divides, so a
+  // NULL operand leaves it a numeric of no scale.
+  auto type = [&] {
+    if (null_untyped(x)) return y.type;
+    if (null_untyped(y)) return x.type;
+    if (numeric_quotient_of) {
+      if (is_null(x) || is_null(y)) return numeric_type(0);
+      auto scale = div_scale(scaled(x), scaled(y));
+      if (scale > static_cast<int>(kMaxDecimalPrecision)) too_wide();
+      return numeric_type(static_cast<std::uint8_t>(scale));
+    }
+    return *arith_type(op, x.type, y.type);
+  }();
+  if (is_null(x) || is_null(y)) return {std::monostate{}, type, false, {}, pos};
   auto overflow_error = [&] {
     return SqlError{type.kind == SqlKind::Integer ? "integer out of range" : "bigint out of range", pos, kNumericValueOutOfRange};
   };
@@ -516,19 +599,24 @@ auto arithmetic(const Constant& x, const Constant& y, Arith op, std::int32_t pos
     if (overflow || (type.kind == SqlKind::Integer && !std::in_range<std::int32_t>(out))) throw overflow_error();
     return {out, type, false, {}, pos};
   }
-  if (op == Arith::Div) not_yet("division of numerics", pos);
+  if (op == Arith::Div) {
+    auto q = numeric_quotient(scaled(x), scaled(y), type.scale);
+    if (!q) too_wide();
+    return {*q, type, false, {}, pos};
+  }
   if (op == Arith::Mul) {
     // The product's scale is the sum of the scales: no rescaling, only the 18 digits.
-    if (__builtin_mul_overflow(scaled(x).v, scaled(y).v, &out) || out >= kDecimalLimit || out <= -kDecimalLimit) {
-      not_yet("a numeric of more than 18 digits", pos);
+    if (type.scale > kMaxDecimalPrecision || __builtin_mul_overflow(scaled(x).v, scaled(y).v, &out) || out >= kDecimalLimit ||
+        out <= -kDecimalLimit) {
+      too_wide();
     }
     return {out, type, false, {}, pos};
   }
   auto a = rescale(scaled(x).v, static_cast<std::uint8_t>(type.scale - scaled(x).scale));
   auto b = rescale(scaled(y).v, static_cast<std::uint8_t>(type.scale - scaled(y).scale));
-  if (!a || !b) not_yet("a numeric of more than 18 digits", pos);
+  if (!a || !b) too_wide();
   out = op == Arith::Sub ? *a - *b : *a + *b;  // each below 10^18: no overflow
-  if (out >= kDecimalLimit || out <= -kDecimalLimit) not_yet("a numeric of more than 18 digits", pos);
+  if (out >= kDecimalLimit || out <= -kDecimalLimit) too_wide();
   return {out, type, false, {}, pos};
 }
 
@@ -712,6 +800,44 @@ auto fold_branch(const ast::Expr& e) -> Branch {
     if (!err.sqlstate().starts_with("22")) throw;
     return {std::nullopt, err};
   }
+}
+
+// NOT, AND or OR of constants, in SQL's three-valued logic: AND is false
+// where an operand is, else NULL where one is, else true; OR the mirror. An
+// operand must be a BOOLEAN or an unknown literal (42804). A runtime error
+// of an operand is raised only if the result depends on it, as for a
+// conditional.
+auto fold_boolean(const ast::Expr& e) -> Constant {
+  using K = ast::Expr::Kind;
+  auto word = e.kind == K::Not ? "NOT" : e.kind == K::And ? "AND" : "OR";
+  std::vector<std::optional<bool>> values;  // nullopt: NULL
+  std::optional<SqlError> failed;
+  for (const auto& a : e.args) {
+    auto b = fold_branch(a);
+    if (b.error) {
+      failed = b.error;
+      continue;
+    }
+    auto c = *b.value;
+    if (c.unknown) c = resolved(c, SqlType{SqlKind::Boolean});
+    if (c.type.kind != SqlKind::Boolean) {
+      throw SqlError{std::string{"argument of "} + word + " must be type boolean, not type " + pg_type_name(c.type), a.pos,
+                     kDatatypeMismatch};
+    }
+    values.push_back(std::holds_alternative<std::monostate>(c.value) ? std::nullopt : std::optional{std::get<bool>(c.value)});
+  }
+  auto boolean = [&](std::optional<bool> v) -> Constant {
+    return {v ? Datum{*v} : Datum{std::monostate{}}, SqlType{SqlKind::Boolean}, false, {}, e.pos};
+  };
+  if (e.kind == K::Not) {
+    if (failed) throw *failed;
+    return boolean(values[0] ? std::optional{!*values[0]} : std::nullopt);
+  }
+  auto decisive = e.kind == K::Or;  // the value that settles the result
+  if (std::ranges::any_of(values, [&](const auto& v) { return v == decisive; })) return boolean(decisive);
+  if (failed) throw *failed;
+  if (std::ranges::any_of(values, [](const auto& v) { return !v; })) return boolean(std::nullopt);
+  return boolean(!decisive);
 }
 
 // The type of CASE, COALESCE or the branches of one, as PostgreSQL's union
@@ -1108,6 +1234,13 @@ auto fold(const ast::Expr& e) -> Constant {
     case K::Mul: return arithmetic(fold(*e.lhs), fold(*e.rhs), Arith::Mul, e.pos);
     case K::Div: return arithmetic(fold(*e.lhs), fold(*e.rhs), Arith::Div, e.pos);
     case K::Compare: return compare_constants(fold(*e.lhs), fold(*e.rhs), e.cmp, e.pos);
+    case K::IsNull: {
+      auto null = std::holds_alternative<std::monostate>(fold(*e.rhs).value);
+      return {null != e.negated, SqlType{SqlKind::Boolean}, false, {}, e.pos};
+    }
+    case K::Not:
+    case K::And:
+    case K::Or: return fold_boolean(e);
     case K::Cast: return cast_constant(e, fold(*e.rhs));
     case K::Case: return fold_case(e);
     case K::Coalesce: return fold_coalesce(e);
@@ -1629,6 +1762,10 @@ public:
         case ast::Expr::Kind::Plus:
         case ast::Expr::Kind::Neg:
         case ast::Expr::Kind::Compare:
+        case ast::Expr::Kind::IsNull:
+        case ast::Expr::Kind::Not:
+        case ast::Expr::Kind::And:
+        case ast::Expr::Kind::Or:
         case ast::Expr::Kind::Aggregate:
         case ast::Expr::Kind::Subquery: break;
       }
@@ -1642,6 +1779,211 @@ public:
   auto subquery_output(const ast::Expr& e) -> logical::Output {
     auto s = subquery(*e.subquery, logical::Subquery::Kind::Value, e.pos);
     return {logical::param(s.param, s.type), s.name};
+  }
+
+  // How a statement uses a parameter: compared with a column (WHERE or a
+  // select list), assigned to one (INSERT, SET), the operand of col + $n or
+  // col - $n, or an operand of another operator in a select list.
+  enum class Use { Compared, Assigned, Added, Subtracted, Operand };
+
+  // ------------------------------------------------------ expressions over columns
+
+  // A select-list expression over columns (docs/frontend_design.md,
+  // *Expressions over columns*): a tree of columns, constants (each a hidden
+  // parameter, folded first), scalar subqueries (the parameters they set),
+  // $n, + - * /, comparisons, IS [NOT] NULL, and AND, OR and NOT. The
+  // search plans it as a result column and codegen evaluates it per row.
+  using Resolve = std::function<std::pair<const Table*, const Column*>(const ast::Expr&)>;
+
+  // What a $n or an unknown literal takes its type from: the other operand
+  // of its operator. A $n needs a plain column there, as in a WHERE.
+  struct Peer {
+    SqlType type;
+    const Table* table{nullptr};
+    const Column* column{nullptr};
+    Use use{Use::Compared};
+  };
+
+  auto value(const ast::Expr& e, const Resolve& resolve, const std::optional<Peer>& peer = std::nullopt) -> logical::Expr {
+    using K = ast::Expr::Kind;
+    if (is_constant(e)) {
+      auto c = fold(e);
+      if (c.unknown && peer) c = resolved(c, peer->type);
+      return fixed(std::move(c.value), c.type);
+    }
+    switch (e.kind) {
+      case K::Column: {
+        auto [t, c] = resolve(e);
+        return logical::column_of(t->id, *c);
+      }
+      case K::Param:
+        if (!peer || peer->column == nullptr) not_yet("a parameter beside other than a column", e.pos);
+        use_param(e.param, phys_type(peer->column->sql), e.pos, *peer->column, peer->table->id, peer->use);
+        return logical::param(e.param, peer->column->sql);
+      case K::Subquery: return subquery_output(e).expr;
+      case K::Add:
+      case K::Sub:
+      case K::Mul:
+      case K::Div: return arithmetic_value(e, resolve);
+      case K::Compare: return comparison_value(e, resolve);
+      case K::IsNull: {
+        auto is_null = logical::expr(logical::Expr::Kind::IsNull, SqlType{SqlKind::Boolean});
+        is_null.args.push_back(value(*e.rhs, resolve));
+        return e.negated ? logical::predicate_of(logical::Expr::Kind::Not, {std::move(is_null)}) : is_null;
+      }
+      case K::Not:
+      case K::And:
+      case K::Or: return boolean_value(e, resolve);
+      case K::Aggregate: not_yet("an aggregate inside an expression", e.pos);
+      case K::Star: throw SqlError{"syntax error at or near \"*\"", e.pos};
+      case K::Plus:
+      case K::Neg: not_yet("unary + and - of other than a constant", e.pos);
+      case K::Cast: not_yet("a cast of other than a constant", e.pos);
+      case K::Case:
+      case K::Coalesce:
+      case K::NullIf: not_yet("CASE, COALESCE and NULLIF of other than constants", e.pos);
+      case K::Func: not_yet("|| and the string functions of other than constants", e.pos);
+      case K::Const:
+      case K::Literal: break;  // constants, above
+    }
+    throw SqlError{"expression not supported", e.pos};
+  }
+
+  // The two operands of an operator. One a $n or an unknown literal takes
+  // its type from the other, which is bound first.
+  auto operands(const ast::Expr& lhs, const ast::Expr& rhs, const Resolve& resolve, Use use)
+      -> std::pair<logical::Expr, logical::Expr> {
+    auto settled = [](const ast::Expr& x) { return x.kind != ast::Expr::Kind::Param && !is_constant(x); };
+    auto peer_of = [&](const logical::Expr& bound, const ast::Expr& written) {
+      Peer p{bound.type, nullptr, nullptr, use};
+      if (written.kind == ast::Expr::Kind::Column) std::tie(p.table, p.column) = resolve(written);
+      return p;
+    };
+    if (!settled(lhs) && !settled(rhs)) not_yet("a parameter or a constant with no column beside it to give it a type", lhs.pos);
+    if (settled(lhs) && settled(rhs)) {
+      auto l = value(lhs, resolve);
+      return {std::move(l), value(rhs, resolve)};
+    }
+    if (settled(lhs)) {
+      auto l = value(lhs, resolve);
+      auto r = value(rhs, resolve, peer_of(l, lhs));
+      return {std::move(l), std::move(r)};
+    }
+    auto r = value(rhs, resolve);
+    auto l = value(lhs, resolve, peer_of(r, rhs));
+    return {std::move(l), std::move(r)};
+  }
+
+  // The digits an operand can hold, for the rescaling an operator does to
+  // meet the finer scale of its other operand: it must stay within the 18
+  // digits a DECIMAL holds. A constant's are those of its value.
+  auto digits_of(const logical::Expr& x) const -> int {
+    if (x.kind == logical::Expr::Kind::Param && is_fixed(x.param)) {
+      const auto* v = std::get_if<std::int64_t>(&fixed_value(x.param));
+      auto digits = 0;
+      for (auto m = v == nullptr ? std::int64_t{0} : *v; m != 0; m /= 10) ++digits;
+      return digits;
+    }
+    switch (x.type.kind) {
+      case SqlKind::SmallInt: return 5;
+      case SqlKind::Integer: return 10;
+      case SqlKind::BigInt: return 19;
+      case SqlKind::Decimal: return x.type.precision == 0 ? int{kMaxDecimalPrecision} : static_cast<int>(x.type.precision);
+      case SqlKind::Real:
+      case SqlKind::Double:
+      case SqlKind::Boolean:
+      case SqlKind::Text:
+      case SqlKind::Varchar:
+      case SqlKind::Bytea:
+      case SqlKind::Timestamp:
+      case SqlKind::Date:
+      case SqlKind::Time:
+      case SqlKind::Numeric: break;
+    }
+    return 0;
+  }
+
+  // Both operands brought to scale `scale` by multiplying by a power of
+  // ten, which must not leave the 18 digits.
+  void rescalable(const logical::Expr& x, const logical::Expr& y, std::uint8_t scale, std::int32_t pos) const {
+    for (const auto* t : {&x, &y}) {
+      auto up = scale - decimal_scale(t->type);
+      if (up > 0 && digits_of(*t) + up > static_cast<int>(kMaxDecimalPrecision)) not_yet("a numeric of more than 18 digits", pos);
+    }
+  }
+
+  auto arithmetic_value(const ast::Expr& e, const Resolve& resolve) -> logical::Expr {
+    using K = ast::Expr::Kind;
+    auto op = e.kind == K::Add ? Arith::Add : e.kind == K::Sub ? Arith::Sub : e.kind == K::Mul ? Arith::Mul : Arith::Div;
+    auto [l, r] = operands(*e.lhs, *e.rhs, resolve, Use::Operand);
+    for (const auto* x : {&l, &r}) {
+      if (is_float(x->type)) not_yet("arithmetic of REAL and DOUBLE PRECISION", e.pos);
+      if (!is_number(x->type)) {
+        throw SqlError{"operator does not exist: " + pg_type_name(l.type) + " " + std::string{arith_text(op)} + " " +
+                           pg_type_name(r.type),
+                       e.pos, kUndefinedFunction};
+      }
+    }
+    auto type = arith_type(op, l.type, r.type);
+    if (!type) {
+      not_yet("the quotient of a numeric other than constants: its scale depends on the values (PostgreSQL's select_div_scale)",
+              e.pos);
+    }
+    if (type->kind == SqlKind::Decimal && type->scale > kMaxDecimalPrecision) not_yet("a numeric of more than 18 digits", e.pos);
+    if (op == Arith::Add || op == Arith::Sub) rescalable(l, r, decimal_scale(*type), e.pos);
+    auto kind = op == Arith::Add   ? logical::Expr::Kind::Add
+                : op == Arith::Sub ? logical::Expr::Kind::Sub
+                : op == Arith::Mul ? logical::Expr::Kind::Mul
+                                   : logical::Expr::Kind::Div;
+    return logical::binary(kind, std::move(l), std::move(r), *type);
+  }
+
+  // A comparison as a value: of operands of one class (42883 otherwise), as
+  // a WHERE's, with <> as NOT of =. Numbers meet at the finer scale.
+  auto comparison_value(const ast::Expr& e, const Resolve& resolve) -> logical::Expr {
+    auto [l, r] = operands(*e.lhs, *e.rhs, resolve, Use::Compared);
+    if (type_class(l.type.kind) != type_class(r.type.kind)) {
+      throw SqlError{"operator does not exist: " + pg_type_name(l.type) + " " + std::string{value_op_text(e.cmp)} + " " +
+                         pg_type_name(r.type),
+                     e.pos, kUndefinedFunction};
+    }
+    if (is_float(l.type) || is_float(r.type)) not_yet("a comparison of REAL and DOUBLE PRECISION as a value", e.pos);
+    if (type_class(l.type.kind) == TypeClass::Temporal && l.type.kind != r.type.kind) {
+      not_yet("a comparison of different date and time types as a value", e.pos);
+    }
+    if (is_number(l.type)) rescalable(l, r, std::max(decimal_scale(l.type), decimal_scale(r.type)), e.pos);
+    using Op = ast::Compare::Op;
+    auto op = [&] {
+      switch (e.cmp) {
+        case ast::ValueCompare::Eq:
+        case ast::ValueCompare::Ne: return Op::Eq;
+        case ast::ValueCompare::Lt: return Op::Lt;
+        case ast::ValueCompare::Le: return Op::Le;
+        case ast::ValueCompare::Gt: return Op::Gt;
+        case ast::ValueCompare::Ge: return Op::Ge;
+      }
+      return Op::Eq;
+    }();
+    auto compared = logical::compare(op, std::move(l), std::move(r));
+    if (e.cmp != ast::ValueCompare::Ne) return compared;
+    return logical::predicate_of(logical::Expr::Kind::Not, {std::move(compared)});
+  }
+
+  // AND, OR and NOT of BOOLEAN operands (42804 otherwise).
+  auto boolean_value(const ast::Expr& e, const Resolve& resolve) -> logical::Expr {
+    using K = ast::Expr::Kind;
+    auto word = e.kind == K::Not ? "NOT" : e.kind == K::And ? "AND" : "OR";
+    std::vector<logical::Expr> args;
+    for (const auto& a : e.args) {
+      auto v = value(a, resolve, Peer{SqlType{SqlKind::Boolean}, nullptr, nullptr, Use::Compared});
+      if (v.type.kind != SqlKind::Boolean) {
+        throw SqlError{std::string{"argument of "} + word + " must be type boolean, not type " + pg_type_name(v.type), a.pos,
+                       kDatatypeMismatch};
+      }
+      args.push_back(std::move(v));
+    }
+    auto kind = e.kind == K::Not ? logical::Expr::Kind::Not : e.kind == K::And ? logical::Expr::Kind::And : logical::Expr::Kind::Or;
+    return logical::predicate_of(kind, std::move(args));
   }
 
   auto table(const std::string& name, std::int32_t pos) const -> const Table* {
@@ -1701,9 +2043,6 @@ public:
     throw SqlError{"column \"" + e.column + "\" does not exist", e.pos, kUndefinedColumn};
   }
 
-  // How a statement uses a parameter: compared with a column (WHERE),
-  // assigned to one (INSERT, SET), or the operand of col + $n or col - $n.
-  enum class Use { Compared, Assigned, Added, Subtracted };
 
   // Gives parameter $n+1 a type from one use with `col`, which sets its
   // physical type and its SQL type. Every use must agree on both, whatever
@@ -1739,6 +2078,7 @@ public:
           case Use::Assigned: return "assigned to ";
           case Use::Added: return "added to ";
           case Use::Subtracted: return "subtracted from ";
+          case Use::Operand: return "combined with ";
         }
         return "";
       };
@@ -1935,6 +2275,10 @@ public:
       case ast::Expr::Kind::Plus:
       case ast::Expr::Kind::Neg: not_yet("unary + and - of other than a constant", e.pos);
       case ast::Expr::Kind::Compare: not_yet("a comparison of other than constants as a value", e.pos);
+      case ast::Expr::Kind::IsNull:
+      case ast::Expr::Kind::Not:
+      case ast::Expr::Kind::And:
+      case ast::Expr::Kind::Or: not_yet("IS NULL, AND, OR and NOT of other than constants as a value", e.pos);
       case ast::Expr::Kind::Cast: not_yet("a cast of other than a constant", e.pos);
       case ast::Expr::Kind::Subquery: not_yet("a subquery assigned to a column", e.pos);
       case ast::Expr::Kind::Case:
@@ -2337,7 +2681,11 @@ public:
         }
         continue;
       }
-      if (e.kind != ast::Expr::Kind::Column) throw SqlError{"only columns, constants and aggregates can be selected", e.pos};
+      if (e.kind != ast::Expr::Kind::Column) {
+        if (aggregated) not_yet("an expression in the select list of an aggregated query", e.pos);
+        targets.push_back({value(e, resolve), "?column?"});
+        continue;
+      }
       auto [t, c] = resolve(e);
       targets.push_back({aggregated ? grouped(*t, *c, e.pos) : logical::column_of(t->id, *c), c->name});
     }

@@ -255,9 +255,16 @@ struct ParamTarget {
   std::uint32_t param{0};
   PhysType type{PhysType::I64};
 };
+// A result column that is an expression over the row's columns, parameters
+// and constants, evaluated for each row (docs/planner_design.md,
+// *Expressions over columns*). Never a bare column or parameter, which have
+// targets of their own.
+struct ExprTarget {
+  Expr expr;
+};
 // A result column: a column, from the row or from the entry's key when the
-// scan covers, or a parameter.
-using EmitTarget = std::variant<ColumnRef, ParamTarget>;
+// scan covers, a parameter, or an expression.
+using EmitTarget = std::variant<ColumnRef, ParamTarget, ExprTarget>;
 
 // Result rows: the targets of each row. No target is a row of no columns, as
 // PostgreSQL's `SELECT FROM`.
@@ -602,6 +609,33 @@ private:
     for (const auto& a : e.args) reads(a);
   }
 
+  // A result column's expression: what codegen's eval prints, each operator
+  // with its operands.
+  void value(const Expr& e) const {
+    auto operands = [&](std::size_t at_least, std::size_t at_most) {
+      if (e.args.size() < at_least || e.args.size() > at_most) broken("an operator of the wrong number of operands");
+    };
+    switch (e.kind) {
+      case Expr::Kind::Column:
+      case Expr::Kind::Param:
+      case Expr::Kind::Const: operands(0, 0); break;
+      case Expr::Kind::Add:
+      case Expr::Kind::Sub:
+      case Expr::Kind::Mul:
+      case Expr::Kind::Div:
+      case Expr::Kind::Compare: operands(2, 2); break;
+      case Expr::Kind::IsNull:
+      case Expr::Kind::Not: operands(1, 1); break;
+      case Expr::Kind::And:
+      case Expr::Kind::Or: operands(2, e.args.size()); break;
+      case Expr::Kind::Aggregate:
+      case Expr::Kind::Like:
+      case Expr::Kind::Truth:
+      case Expr::Kind::InSet: broken("a result column of an expression codegen does not print");
+    }
+    for (const auto& a : e.args) value(a);
+  }
+
   // A predicate filter: AND, OR and NOT of comparisons of a column with a
   // parameter or a constant, none of a DOUBLE, and IS NULL of a column.
   void predicate(const Expr& e) const {
@@ -656,6 +690,8 @@ private:
       case Expr::Kind::Param:
       case Expr::Kind::Add:
       case Expr::Kind::Sub:
+      case Expr::Kind::Mul:
+      case Expr::Kind::Div:
       case Expr::Kind::Aggregate: break;
     }
     broken("a predicate of an expression codegen does not print");
@@ -1146,6 +1182,15 @@ private:
               if (const auto* c = std::get_if<ColumnRef>(&t)) {
                 read(*c);
                 held_above(*op.input, *c);
+              } else if (const auto* x = std::get_if<ExprTarget>(&t)) {
+                value(x->expr);
+                params(x->expr);
+                std::vector<ColumnRef> cols;
+                logical::columns_of(x->expr, cols);
+                for (const auto& c : cols) {
+                  read(c);
+                  held_above(*op.input, c);
+                }
               }
             }
             node(*op.input, &n);

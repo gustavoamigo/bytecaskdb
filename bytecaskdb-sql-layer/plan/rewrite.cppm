@@ -142,6 +142,8 @@ auto fold(Expr& e) -> bool {
     case Kind::Column:
     case Kind::Param:
     case Kind::Const:
+    case Kind::Mul:
+    case Kind::Div:
     case Kind::Aggregate:
     case Kind::And:
     case Kind::Or:

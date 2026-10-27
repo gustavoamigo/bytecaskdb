@@ -377,7 +377,8 @@ TEST_CASE("binder: comparisons of constants fold to a BOOLEAN; a string literal 
   CHECK(state("SELECT 'a'::text = 1") == "42883");
   CHECK(rejected(cat, "SELECT DATE '2016-03-26' < TIMESTAMP '2016-03-26 00:00:00'").first ==
         "comparing a date with a timestamp without time zone is not supported yet");
-  CHECK(rejected(cat, "SELECT k < 5 FROM ct").first == "only columns, constants and aggregates can be selected");
+  CHECK(rejected(cat, "SELECT k + k, COUNT(*) FROM ct").first ==
+        "an expression in the select list of an aggregated query is not supported yet");
 
   // A cast of a string literal: read as the type, named by it.
   CHECK(out("SELECT DATE '1970-01-02'") == std::tuple{std::string{"date"}, SqlType{SqlKind::Date}, Datum{std::int64_t{1}}});

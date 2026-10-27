@@ -607,7 +607,10 @@ void     bc_emit_count(bc_ctx *, int64_t affected);   /* write statements: the r
 
 The subset has no raw integer arithmetic (*The language*). These helpers
 define the cases C leaves undefined. On failure they set `BC_E_ARITH` and
-return zero.
+return zero. The error's message tells a zero divisor, `division by zero`
+(`bc_div`, `bc_mod`), from an overflow: SQL reports the first as SQLSTATE
+22012 and every other `BC_E_ARITH` as 22003, so that text is part of the
+helpers' contract (*Errors* in `server_design.md`).
 
 ```c
 int64_t bc_add(bc_ctx *, int64_t, int64_t);     /* overflow → error */
