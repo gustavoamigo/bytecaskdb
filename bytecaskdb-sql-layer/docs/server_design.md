@@ -94,7 +94,7 @@ costs one lookup in `Database::prepare`'s cache, keyed by the exact text.
 127.0.0.1:5432] [--database NAME] [--max-connections 100] [--workers N]
 [--sync AT_EVERY_COMMIT|AT_INTERVAL|AT_FILE_ROTATION] [--sync-interval-ms 1000]
 [--io-backend pread|mmap|buffer_pool] [--buffer-pool-size BYTES]
-[--buffer-pool-direct-io on|off] [--statement-memory-bytes 67108864]
+[--buffer-pool-direct-io on|off] [--statement-memory-bytes 67108864] [--max-memory-bytes BYTES]
 [--idle-in-transaction-timeout-ms 60000] [--statement-timeout-ms 0]
 [--transaction-timeout-ms 0] [--idle-session-timeout-ms 0]` serves one
 database directory under one database name, by default the directory's
@@ -161,6 +161,16 @@ statement_memory_bytes`: the memory budget of every statement the server
 runs, 64 MiB by default (`plan_api_design.md`, *Memory*). A statement past
 it fails with 54000. 0 is refused at startup.
 
+`--max-memory-bytes` is `DatabaseOptions::max_memory_bytes`, by default half
+the machine's RAM: what every running statement and open transaction hold
+together, as their budgets count it. A statement that would pass it fails at
+once with `53200` (`out of memory: the statements and transactions in
+progress would hold more than the memory cap of N bytes`), and in a block
+fails the block; nothing waits for memory. Each statement reserves it in
+steps of 1 MiB, so it can refuse up to 1 MiB per running statement early.
+It counts neither the connections' I/O buffers nor the snapshots
+transactions hold (`session_design.md`, *Bounds*). 0 is refused at startup.
+
 **Threading, sessions and the worker pool** (`docs/session_design.md`). Three
 things, each with one owner:
 - **Connection**: a non-blocking socket, its input and output buffers, and
@@ -190,6 +200,19 @@ writes them in 64 KiB chunks. A slow reader never holds a worker.
 A message longer than 64 MiB is `FATAL 08P01` and closes the connection.
 That bound sits well above the engine's 4 MiB default value limit plus a
 statement's text.
+
+Both directions are bounded, and neither bound is an error
+(`session_design.md`, *Bounds*):
+- **Input.** The loop reads a connection only while its session is idle, and
+  a session is idle only once it has run every complete message it was
+  given. So a session holds at most one read (64 KiB) and one partial
+  message of unrun input; past that the socket is not read, and TCP holds
+  the client back.
+- **Output.** Once a connection's client has not taken 64 MiB of replies, its
+  session runs no further statement, and so reads no further input, until
+  the client takes some. The check is between statements, so one statement's
+  reply can pass it; a reply is bounded too, by its rows counting against
+  the statement's memory budget before they are sent.
 
 **Shutdown.** `SIGINT` or `SIGTERM` closes the listener and stops reading on
 every connection. A turn in flight on a worker finishes first, and its reply
@@ -825,10 +848,15 @@ The run script requires W ≥ the user count; the monitor is not a user.
   - a slow reader on `--workers 1` holding no worker, and a long pipeline
     yielding at `ReadyForQuery`;
   - `--sync`, `--sync-interval-ms` and the I/O flags: each mode starts and
-    stops cleanly, and a bad value exits before the server listens.
+    stops cleanly, and a bad value exits before the server listens;
+  - a pipelining client that takes no replies: the session runs nothing past
+    64 MiB unsent, the server reads no more and holds far less than the
+    300 MB of replies, and every reply arrives once the client reads;
+  - `--max-memory-bytes`: a statement past it is `53200` and fails its block.
 - **`tests/pg_session_test.cpp`** (`sql_layer_tests "[sql][server]"`):
   sessions moving across worker threads while keeping message order (under
-  ThreadSanitizer in CI), `Execute` lookahead parking, and pipeline fairness.
+  ThreadSanitizer in CI), `Execute` lookahead parking, pipeline fairness, and
+  a session held back past `max_unsent_bytes` until its replies are taken.
 - **HammerDB smoke, nightly.** A scheduled workflow,
   `.github/workflows/sql-layer-hammerdb-nightly.yml`, runs `run-gate.sh --smoke`: two warehouses, two
   users, no ramp-up and a one-minute window, against the server and against
@@ -867,6 +895,14 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 - `Database::prepare`'s cache keeps every distinct text until close, so a
   client sending ever-new literal text grows it. The driver sends a fixed
   set (#549).
+- PostgreSQL has no server-wide memory cap: past `--max-memory-bytes` a
+  statement is `53200` where PostgreSQL would run it, or be ended by the
+  operating system.
+- The output bound is per connection and outside the memory cap: in the
+  worst case, every connection pipelining and none reading, the server holds
+  up to `--max-connections` × 64 MiB of replies besides the cap. Folding them
+  into the cap would let one client's unread replies fail another's
+  statements.
 
 ## Decisions
 

@@ -1,6 +1,6 @@
 # Sessions, the worker pool and the transport
 
-Status: **slices 1 and 2 built; slice 3 next** (design approved by the owner,
+Status: **built: slices 1, 2 and 3** (design approved by the owner,
 2026-10-25; tracked in #642). The second of the post-MVP designs (#487,
 *Next*). Slice 1 replaced *Threading*, *I/O* and *Shutdown* in
 `server_design.md`. The protocol the server speaks, and everything a client
@@ -219,16 +219,32 @@ PostgreSQL uses.
   minimum 4; *Decisions*, 6).
 - **A session's input.** At most 64 MiB of unrun messages. Past it, the loop
   stops reading the socket until the session catches up. This is TCP
-  backpressure, not an error.
+  backpressure, not an error. Built, it holds by construction: the loop
+  reads only while the session is idle, and a session is idle only once it
+  has run every complete message it holds, so unrun input is at most one
+  read (64 KiB) and one partial message, which the framer caps at 64 MiB.
 - **A connection's output.** At most 64 MiB unsent. Past it, the session is
-  not scheduled for its next turn until the client reads.
+  not scheduled for its next turn until the client reads. Built as
+  `SessionConfig::max_unsent_bytes`: unsent is the session's output buffer
+  and the loop's queued and in-flight bytes, which `Pool::drain` records. A
+  runnable session past it ends its turn held back, not idle, so the loop
+  reads nothing more from it either; the drain that brings unsent under the
+  bound queues it again. The check is between statements: one statement's
+  reply can pass it, bounded itself by its rows counting against the
+  statement budget. The bound is per connection and outside the memory cap.
 - **Memory across sessions.** Each session can hold a transaction buffer
   (64 MiB, `TransactionOptions::max_bytes`) and run a statement with its
   memory budget (64 MiB, `planner_design.md`). With many sessions that is
   more than the machine has, so a global cap (`--max-memory-bytes`, by
-  default half the machine's RAM; *Decisions*, 9) bounds the sum across
+  default half the machine's RAM; *Decisions*, 7) bounds the sum across
   sessions and fails with `53200` (`out_of_memory`). The planner design
-  left this cap to this one.
+  left this cap to this one. Built as one atomic counter per database
+  (`DatabaseOptions::max_memory_bytes`): a statement reserves from it in
+  steps of 1 MiB as its budget's count grows, never less than that count,
+  and returns its reservation when it ends; taking a statement into its
+  transaction moves the reservation for its writes to the transaction,
+  which returns it when it ends. Taking a statement in never fails on the
+  cap: the statement that would pass it does.
 - **Snapshots.** A transaction holds its snapshot from its first statement
   to its commit or rollback; an autocommit statement holds one while it
   runs, and a prepared statement none. Taking one is O(1), but holding one
@@ -318,7 +334,9 @@ vacuum. The connection-to-session map then goes.
    both read where the runtime charges its reads. Each connection has one
    libuv timer, armed while its session is idle; it schedules the session to
    end with the `FATAL`.
-3. **Bounds.** The input and output bounds, and the global memory cap.
+3. **Bounds (built).** The input and output bounds, and the global memory
+   cap. The input bound needed no code: slice 1's loop already reads only
+   an idle session.
 
 ## Proposed `CONTRACT.md` changes
 
@@ -326,8 +344,8 @@ vacuum. The connection-to-session map then goes.
   running statement with 57014, and cancels nothing else.
 - **Added (slice 2):** each timeout ends what it names with PostgreSQL's
   SQLSTATE; a transaction a timeout ends rolls back.
-- **Added:** a statement or transaction that would pass the server's memory
-  cap fails with 53200 (`out_of_memory`).
+- **Added (slice 3):** a statement or transaction that would pass the
+  server's memory cap fails with 53200 (`out_of_memory`).
 - **Narrowed (slice 2):** "A `CancelRequest` closes the connection with
   nothing done" goes.
 - **Unchanged:** startup, the block status, transaction control, the text

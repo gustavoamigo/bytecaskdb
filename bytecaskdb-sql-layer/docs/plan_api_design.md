@@ -337,6 +337,18 @@ did is committed, and inside a transaction it aborts at `bc_txn_add`.
 There is no spill. The embedded API passes `DatabaseOptions::
 statement_memory_bytes`, 64 MiB by default.
 
+**One cap across statements and transactions.** The context and the
+transaction built on one database share its memory cap (`DatabaseOptions::
+max_memory_bytes`; 0, none). Each charge that takes a statement past what it
+reserved reserves more, in steps of 1 MiB, with one atomic operation, and a
+charge the cap has no room for is `BC_E_MEMORY` (53200): an error like
+`BC_E_LIMIT`, set before the allocation, sticky, and never a wait. A
+statement returns its reservation when the context is reset. `bc_txn_add`
+moves to the transaction what of it covers the write set the transaction
+takes in, which the transaction returns when it is aborted or freed. Since
+the statement reserved at least what it held, taking it in never fails on
+the cap.
+
 **The API meters the work.** `bc_ctx_begin` sets a budget in record reads
 and cursor steps, a deadline and a cancel flag. Every read and every step
 charges the budget, and every 64 the API checks the flag, which another

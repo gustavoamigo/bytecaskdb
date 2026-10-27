@@ -113,6 +113,11 @@ struct SessionConfig {
   std::chrono::milliseconds transaction_timeout{0};               // FATAL 25P04
   std::chrono::milliseconds idle_session_timeout{0};              // FATAL 57P05
   CancelRegistry* cancels{nullptr};  // null: no BackendKeyData, and a CancelRequest cancels nothing
+  // docs/session_design.md, *Bounds*: past this many reply bytes the client
+  // has not taken, the session runs no further statement until it takes
+  // some. Checked between statements, so one statement's reply may pass it.
+  // 0: no bound.
+  std::size_t max_unsent_bytes{64u << 20};
 };
 
 // Once a stop has begun, how long a send waits on a client that takes no
@@ -1223,6 +1228,12 @@ public:
     std::size_t preferred_worker{kNoPreference};
     std::function<void(void*)> on_wake;
     bool loop_writing{false};
+    // The reply bytes the loop holds, queued and in flight, as of its last
+    // drain(); with outbox, what the client has not taken.
+    std::size_t loop_unsent{0};
+    // Runnable, but held back until the client takes enough of its reply
+    // (SessionConfig::max_unsent_bytes); a drain() under the bound queues it.
+    bool output_blocked{false};
     bool in_woken{false};
     bool stopping{false};
     bool dropped{false};
@@ -1299,7 +1310,7 @@ public:
       std::lock_guard<std::mutex> lock{slot->mu};
       if (slot->dropped || slot->session_ended) return;
       for (auto& in : inputs) slot->inbox.push_back(std::move(in));
-      if (slot->state == Slot::State::Idle) {
+      if (slot->state == Slot::State::Idle && !slot->output_blocked) {
         slot->state = Slot::State::Queued;
         need_schedule = true;
       }
@@ -1318,7 +1329,7 @@ public:
       std::lock_guard<std::mutex> lock{slot->mu};
       if (slot->dropped || slot->session_ended) return;
       slot->raw_in.append(bytes);
-      if (slot->state == Slot::State::Idle) {
+      if (slot->state == Slot::State::Idle && !slot->output_blocked) {
         slot->state = Slot::State::Queued;
         need_schedule = true;
       }
@@ -1351,7 +1362,7 @@ public:
   auto expire(const std::shared_ptr<Slot>& slot, Timeout kind) -> bool {
     {
       std::lock_guard<std::mutex> lock{slot->mu};
-      if (kind == Timeout::None || slot->dropped || slot->session_ended || slot->stopping) return false;
+      if (kind == Timeout::None || slot->dropped || slot->session_ended || slot->stopping || slot->output_blocked) return false;
       if (slot->state != Slot::State::Idle || !slot->raw_in.empty() || !slot->inbox.empty()) return false;
       if (slot->idle_kind != kind) return false;
       slot->expired = kind;
@@ -1379,22 +1390,40 @@ public:
     wake_parked(running_on);
   }
 
-  [[nodiscard]] auto drain(const std::shared_ptr<Slot>& slot, std::string& out, bool write_in_flight = false) -> Status {
-    std::lock_guard<std::mutex> lock{slot->mu};
-    slot->in_woken = false;
-    if (!slot->outbox.empty()) {
-      if (out.empty()) {
-        out = std::move(slot->outbox);
-      } else {
-        out.append(slot->outbox);
+  // The loop takes the reply bytes queued for it into `out`, and reports the
+  // session's state. `in_flight` is the bytes of its write in progress: with
+  // `out`, what it holds unsent. A session held back on its output is queued
+  // once that is under the bound.
+  [[nodiscard]] auto drain(const std::shared_ptr<Slot>& slot, std::string& out, std::size_t in_flight = 0) -> Status {
+    Status st;
+    auto resume = false;
+    {
+      std::lock_guard<std::mutex> lock{slot->mu};
+      slot->in_woken = false;
+      if (!slot->outbox.empty()) {
+        if (out.empty()) {
+          out = std::move(slot->outbox);
+        } else {
+          out.append(slot->outbox);
+        }
+        slot->outbox.clear();
+        slot->loop_writing = true;
+      } else if (out.empty() && in_flight == 0) {
+        slot->loop_writing = false;
       }
-      slot->outbox.clear();
-      slot->loop_writing = true;
-    } else if (out.empty() && !write_in_flight) {
-      slot->loop_writing = false;
+      slot->loop_unsent = out.size() + in_flight;
+      if (slot->output_blocked && slot->loop_unsent <= cfg_.max_unsent_bytes) {
+        slot->output_blocked = false;
+        if (!slot->dropped && !slot->session_ended && slot->state == Slot::State::Idle) {
+          slot->state = Slot::State::Queued;
+          resume = true;
+        }
+      }
+      st = {slot->session_ended, slot->state == Slot::State::Idle && !slot->output_blocked, slot->turns,
+            slot->worker_migrations, slot->idle_at, slot->idle_kind};
     }
-    return {slot->session_ended, slot->state == Slot::State::Idle, slot->turns, slot->worker_migrations, slot->idle_at,
-            slot->idle_kind};
+    if (resume) enqueue_slot(slot);
+    return st;
   }
 
   void shutdown() noexcept {
@@ -1743,7 +1772,12 @@ private:
         }
         slot->session_ended = slot->session.ended();
         std::tie(slot->idle_at, slot->idle_kind) = slot->session.idle_deadline(std::chrono::steady_clock::now());
-        requeue = (!slot->dropped && !slot->session_ended && slot->session.runnable());
+        const auto runnable = !slot->dropped && !slot->session_ended && slot->session.runnable();
+        // A client that takes no reply holds the next statement back, and
+        // the loop, seeing the session not idle, reads nothing more from it.
+        slot->output_blocked = runnable && cfg_.max_unsent_bytes != 0 &&
+                               slot->outbox.size() + slot->loop_unsent > cfg_.max_unsent_bytes;
+        requeue = runnable && !slot->output_blocked;
         slot->state = requeue ? Slot::State::Queued : Slot::State::Idle;
         need_loop_wake = !requeue || !slot->outbox.empty() || slot->session_ended || slot->dropped || slot->stopping;
       }
