@@ -22,7 +22,7 @@ How much of each suite the layer passes, from the functional suite's conformance
 | Suite | Coverage | Tests | Checks |
 |---|---|---|---|
 | SQL:2016 Core (sqltest) | 61% | 450/743 tests | statement accepted |
-| PostgreSQL features | 79% | 173/220 cases | results |
+| PostgreSQL features | 79% | 176/223 cases | results |
 | ByteCaskDB features | 100% | 13/13 cases | results |
 | TPROC-C | 100% | 1/1 case: five transactions, then consistency conditions 1–9 | consistency conditions 1–9 |
 
@@ -33,7 +33,7 @@ The suite is young: its cases are the first of the plan in `docs/functional_test
 Built and tested:
 
 - **Statements:** `CREATE TABLE`, with or without a primary key (a table without one keeps duplicate rows) and with `UNIQUE` constraints and `REFERENCES` (checked when created, not enforced), `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `ALTER TABLE … ADD COLUMN`, `CREATE VIEW` and `DROP VIEW`; `INSERT` of one row; `SELECT`; `UPDATE` and `DELETE` of any number of rows; `BEGIN`/`COMMIT`/`ROLLBACK`.
-- **Queries:** one table, or two joined by `ON`, `USING` or `NATURAL`, inner (index nested loop or hash) or `LEFT`/`RIGHT` outer (nested loop), or none (`SELECT` of constants); `WHERE` of comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `<>`, `[NOT] BETWEEN`, `[NOT] IN` of a list, `[NOT] LIKE`; uncorrelated subqueries: `(SELECT …)` as a value, `[NOT] EXISTS`, `[NOT] IN (SELECT …)`, `ANY`/`SOME`/`ALL`; table and column aliases (`AS`); views, read like tables (alone, joined, in a subquery) and read-only; `UNION`, `INTERSECT` and `EXCEPT`, with `ALL` or `DISTINCT`, of plain `SELECT`s, under `LIMIT`, in a subquery, and as a view's query (created, not read yet); `SELECT *` and `t.*`; `+`, `-`, `*`, `/`, comparisons, `IS [NOT] NULL`, `AND`, `OR` and `NOT` of integer and `DECIMAL` columns as select-list values (`/` by zero is 22012); `CASE` (searched and simple), `COALESCE` and `NULLIF` of constants; `||`, `UPPER`, `LOWER`, `SUBSTRING`, `TRIM`, `POSITION`, `CHAR_LENGTH`, `OCTET_LENGTH` and `OVERLAY` of constants; `ORDER BY` with `NULLS FIRST`/`LAST`; `LIMIT`; `SELECT DISTINCT`; `GROUP BY` and `HAVING`; `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`; `FOR UPDATE` on one table. Full scans and sorts are served.
+- **Queries:** one table, or two joined by `ON`, `USING` or `NATURAL`, inner (index nested loop or hash) or `LEFT`/`RIGHT` outer (nested loop), or none (`SELECT` of constants); `WHERE` of comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `<>`, `[NOT] BETWEEN`, `[NOT] IN` of a list, `[NOT] LIKE`; uncorrelated subqueries: `(SELECT …)` as a value, `[NOT] EXISTS`, `[NOT] IN (SELECT …)`, `ANY`/`SOME`/`ALL`; table and column aliases (`AS`); views, read like tables (alone, joined, in a subquery) and read-only; `UNION`, `INTERSECT` and `EXCEPT`, with `ALL` or `DISTINCT`, of plain `SELECT`s, under `LIMIT`, in a subquery, and as a view's query (created, not read yet); `SELECT *` and `t.*`; `+`, `-`, `*`, `/`, comparisons, `IS [NOT] NULL`, `AND`, `OR` and `NOT` of integer and `DECIMAL` columns as select-list values (`/` by zero is 22012); `CASE` (searched and simple), `COALESCE` and `NULLIF` of constants; `||`, `UPPER`, `LOWER`, `SUBSTRING`, `TRIM`, `POSITION`, `CHAR_LENGTH`, `OCTET_LENGTH` and `OVERLAY` of constants; `ORDER BY` of columns or select-list positions with `NULLS FIRST`/`LAST`, also of a set operation's rows; `LIMIT`; `SELECT DISTINCT`; `GROUP BY` and `HAVING`; `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`; `FOR UPDATE` on one table. Full scans and sorts are served.
 - **Literals:** integers, numerics of up to 18 digits, strings, `TRUE`/`FALSE`, `NULL` and casts of strings (`DATE '…'`, `CAST('5' AS INTEGER)`), typed as PostgreSQL types them, in `VALUES`, `SET`, `WHERE`, `HAVING` and the select list; `+`, `-`, `*`, `/` and comparisons of them folded (integer `/` truncates; a numeric quotient has PostgreSQL's scale; `/` by zero is 22012).
 - **Types:** `SMALLINT`, `INTEGER`, `BIGINT`, `REAL`, `DOUBLE PRECISION`, `BOOLEAN`, `TEXT`, `VARCHAR(n)`, `BYTEA`, `DECIMAL(p, s)` with p ≤ 18, `DATE`, `TIME`, `TIMESTAMP`.
 - **Transactions:** statements read their own writes; DDL is its own statement, not transactional.
@@ -43,7 +43,7 @@ Built and tested:
 Not built yet (each is refused, with a message):
 
 - updatable views, `WITH CHECK OPTION`, `CREATE OR REPLACE VIEW`, reading a view defined with a set operation, and an aggregate, `DISTINCT` or join over a grouped view;
-- `ORDER BY` of a set operation's rows, and a set operation of a query that groups, aggregates or is `DISTINCT`;
+- a set operation of a query that groups, aggregates or is `DISTINCT`, and `ORDER BY` inside a parenthesised set operation within another;
 - three or more tables, `t AS x (a, b)` and a table joined with itself, `FULL JOIN`, joins on anything but `=`, correlated or nested subqueries and subqueries in `FROM`, `DISTINCT ON`;
 - `ILIKE`, `IS DISTINCT FROM`, a predicate over both tables of a join or in `HAVING`;
 - `OFFSET`, `RETURNING`, `ON CONFLICT`, multi-row `VALUES`, the `::` cast;

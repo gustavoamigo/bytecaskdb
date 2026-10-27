@@ -21,6 +21,7 @@ module;
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <system_error>
 #include <vector>
 
@@ -760,6 +761,26 @@ void requalify(Compare& c, const std::vector<std::string>& tables, const std::ve
   for (auto& a : c.args) requalify(a, tables, aliases);
 }
 
+// ORDER BY 2 of a plain SELECT orders by the second select-list item, which
+// must be a column (the layer orders by columns); the item's AS name or its
+// column's is what ORDER BY then names. A position past the list is 42P10. An
+// item after a * has no position yet: the stars are expanded by the binder.
+void resolve_positions(Select& sel) {
+  for (auto& o : sel.order_by) {
+    if (o.position == 0) continue;
+    auto stars = std::ranges::any_of(sel.targets, [](const Expr& e) { return e.kind == Expr::Kind::Star; });
+    if (stars) reject("ORDER BY position with * in the select list is not supported yet", o.pos);
+    if (std::cmp_greater(o.position, sel.targets.size())) {
+      reject("ORDER BY position " + std::to_string(o.position) + " is not in select list", o.pos, kInvalidColumnReference);
+    }
+    const auto& t = sel.targets[static_cast<std::size_t>(o.position - 1)];
+    if (t.kind != Expr::Kind::Column) reject("ORDER BY position of other than a column is not supported yet", o.pos);
+    o.column = t.column;
+    o.table = t.table;
+    o.position = 0;
+  }
+}
+
 void resolve_aliases(Select& sel, const std::vector<std::string>& aliases) {
   std::vector<std::string> tables{sel.table};
   if (!sel.join.empty()) tables.push_back(sel.join);
@@ -804,16 +825,31 @@ auto order_items(const PgQuery__SelectStmt* s, std::int32_t pos) -> std::vector<
   for (std::size_t i = 0; i < s->n_sort_clause; ++i) {
     const auto* sb = s->sort_clause[i]->sort_by;
     // libpg_query records no position for a SortBy: report its column's.
-    if (sb->node == nullptr || sb->node->node_case != PG_QUERY__NODE__NODE_COLUMN_REF) {
+    auto is_const = sb->node != nullptr && sb->node->node_case == PG_QUERY__NODE__NODE_A_CONST;
+    if (sb->node == nullptr || (sb->node->node_case != PG_QUERY__NODE__NODE_COLUMN_REF && !is_const)) {
       reject("ORDER BY takes columns", pos);
     }
-    auto col = expr(sb->node);
+    Expr col;
+    std::int64_t position = 0;
+    if (is_const) {
+      // An integer is a select-list position, as PostgreSQL reads it; any
+      // other constant orders by nothing it accepts.
+      auto l = literal(sb->node);
+      auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), position);
+      if (l.kind != Literal::Kind::Integer || ec != std::errc{} || end != l.text.data() + l.text.size()) {
+        reject("non-integer constant in ORDER BY", l.pos);
+      }
+      if (position < 1) reject("ORDER BY position " + l.text + " is not in select list", l.pos, kInvalidColumnReference);
+      col.pos = l.pos;
+    } else {
+      col = expr(sb->node);
+    }
     if (sb->sortby_dir == PG_QUERY__SORT_BY_DIR__SORTBY_USING) reject("ORDER BY ... USING is not supported", col.pos);
     std::optional<bool> nulls_first;
     if (sb->sortby_nulls == PG_QUERY__SORT_BY_NULLS__SORTBY_NULLS_FIRST) nulls_first = true;
     if (sb->sortby_nulls == PG_QUERY__SORT_BY_NULLS__SORTBY_NULLS_LAST) nulls_first = false;
-    out.push_back({col.column, sb->sortby_dir == PG_QUERY__SORT_BY_DIR__SORTBY_DESC, col.pos, col.table,
-                            nulls_first});
+    out.push_back({col.column, position, sb->sortby_dir == PG_QUERY__SORT_BY_DIR__SORTBY_DESC, col.pos, col.table,
+                   nulls_first});
   }
   return out;
 }
@@ -927,6 +963,7 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
     sel.group_by.push_back(expr(g));
   }
   where(s->having_clause, sel.having, "HAVING", pos);
+  resolve_positions(sel);
   resolve_aliases(sel, aliases);
   return sel;
 }

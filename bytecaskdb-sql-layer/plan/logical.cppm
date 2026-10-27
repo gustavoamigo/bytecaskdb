@@ -259,13 +259,20 @@ struct Delete {
 // where each column is equal, NULL equal to NULL. `outputs` are its columns:
 // the names of the left arm's, the types the arms' resolve to, each expr a
 // Param of that type that stands for the column and is read by no one. Only
-// the root may sit under a Limit, and none has a Sort.
+// the root may sit under a Limit. The root alone has an `order`: ORDER BY of
+// the combined rows, by output columns only (a Sort has columns of a table).
 struct SetOp {
   using Kind = ast::SetOperation::Kind;
+  struct Order {
+    std::size_t column;  // index into `outputs`
+    bool desc;
+    bool nulls_first;
+  };
   NodePtr left, right;
   Kind kind{Kind::Union};
   bool all{false};
   std::vector<Output> outputs;
+  std::vector<Order> order;
 };
 
 struct Node {

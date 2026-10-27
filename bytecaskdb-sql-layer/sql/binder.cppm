@@ -2734,11 +2734,35 @@ public:
   // aggregate call or DISTINCT), because the plan streams an arm's rows into
   // the operation and has no group to stream. The columns' types resolve
   // pair by pair, as PostgreSQL resolves UNION's (set_type); the names are
-  // the left arm's. ORDER BY of the combined rows would need the plan to
-  // hold typed rows, which the plan API has no object for.
+  // the left arm's. An ORDER BY of the combined rows names output columns.
   auto set_operation(const ast::Select& s) -> logical::NodePtr {
     auto arm = set_arm(s, true);
     return std::move(arm.node);
+  }
+
+  // An ORDER BY item of a set operation's rows: an output column by name
+  // (the left arm's) or by position, as PostgreSQL takes them, and nothing
+  // else.
+  static auto set_order(const ast::OrderItem& o, const std::vector<logical::Output>& outputs) -> logical::SetOp::Order {
+    auto nulls_first = o.nulls_first.value_or(o.desc);
+    if (o.position != 0) {
+      if (std::cmp_greater(o.position, outputs.size())) {
+        throw SqlError{"ORDER BY position " + std::to_string(o.position) + " is not in select list", o.pos,
+                       kInvalidColumnReference};
+      }
+      return {static_cast<std::size_t>(o.position - 1), o.desc, nulls_first};
+    }
+    if (!o.table.empty()) {
+      throw SqlError{"missing FROM-clause entry for table \"" + o.table + "\"", o.pos, kUndefinedTable};
+    }
+    std::optional<std::size_t> hit;
+    for (std::size_t i = 0; i < outputs.size(); ++i) {
+      if (outputs[i].name != o.column) continue;
+      if (hit) throw SqlError{"ORDER BY \"" + o.column + "\" is ambiguous", o.pos, kAmbiguousColumn};
+      hit = i;
+    }
+    if (!hit) throw SqlError{"column \"" + o.column + "\" does not exist", o.pos, kUndefinedColumn};
+    return {*hit, o.desc, nulls_first};
   }
 
   static auto set_name(ast::SetOperation::Kind k) -> std::string {
@@ -2752,7 +2776,7 @@ public:
 
   auto set_arm(const ast::Select& q, bool root) -> Arm {
     if (q.set) {
-      if (!q.order_by.empty()) not_yet("ORDER BY on a set operation", q.pos);
+      if (!root && !q.order_by.empty()) not_yet("ORDER BY on a parenthesised set operation inside another", q.pos);
       if (!root && q.limit) not_yet("LIMIT on a parenthesised set operation inside another", q.pos);
       const auto& op = *q.set;
       auto l = set_arm(op.left, false);
@@ -2770,6 +2794,7 @@ public:
         out.outputs.push_back({logical::param(0, type), lo[i].name});
         arm.untyped.push_back(l.untyped[i] && r.untyped[i]);
       }
+      for (const auto& o : q.order_by) out.order.push_back(set_order(o, out.outputs));
       out.left = std::move(l.node);
       out.right = std::move(r.node);
       arm.node = logical::node(std::move(out));

@@ -2066,8 +2066,8 @@ TEST_CASE("embedded API: a set operation streams its arms, names its columns fro
   txn.rollback();
 
   // Refusals.
-  CHECK(sql_refusal(*db, "SELECT x FROM sa UNION ALL SELECT y FROM sb ORDER BY x", {}).find("ORDER BY on a set operation") !=
-        std::string::npos);
+  CHECK(sql_refusal(*db, "(SELECT x FROM sa UNION SELECT y FROM sb ORDER BY x) UNION SELECT 1", {})
+            .find("ORDER BY on a parenthesised set operation") != std::string::npos);
   CHECK(sql_refusal(*db, "SELECT DISTINCT x FROM sa UNION SELECT y FROM sb", {}).find("aggregated, grouped or DISTINCT") !=
         std::string::npos);
   CHECK(sql_refusal(*db, "SELECT x FROM sa UNION SELECT 'a'", {}).find("literal of no type") != std::string::npos);
@@ -2098,4 +2098,84 @@ TEST_CASE("embedded API: a set operation holds the keys of one side and fails pa
   CHECK(state("SELECT x FROM big WHERE id < 0 EXCEPT SELECT x FROM big") == "54000");
   CHECK(state("SELECT x FROM big WHERE id < 100 EXCEPT SELECT x FROM big WHERE id < 100") == "ran");
   CHECK(state("SELECT x FROM big UNION SELECT x FROM big WHERE id < 0") == "54000");
+}
+
+TEST_CASE("embedded API: ORDER BY of a set operation's rows sorts them as a SELECT's, and a LIMIT keeps the first", "[sql][api][setop]") {
+  sql_test::TempDir dir{"api_setop_order"};
+  auto db = Database::open(dir.path());
+  auto run = [&](std::string_view sql, const std::vector<Value>& params = {}) { return db->execute(sql, params).rows; };
+  (void)run("CREATE TABLE oa (id INTEGER PRIMARY KEY, x INTEGER, f DOUBLE PRECISION)");
+  (void)run("CREATE TABLE ob (id BIGINT PRIMARY KEY, y BIGINT, f DOUBLE PRECISION)");
+  for (auto [id, x] : std::vector<std::pair<int, std::optional<int>>>{{1, 3}, {2, 1}, {3, {}}, {4, 2}}) {
+    (void)db->execute("INSERT INTO oa VALUES ($1, $2, $3)", {i(id), x ? i(*x) : kNull, x ? Value{*x * 0.5} : kNull});
+  }
+  for (auto [id, y] : std::vector<std::pair<int, std::optional<int>>>{{1, 2}, {2, 5}, {3, {}}}) {
+    (void)db->execute("INSERT INTO ob VALUES ($1, $2, $3)", {i(id), y ? i(*y) : kNull, y ? Value{*y * 0.5} : kNull});
+  }
+  // NULLS LAST ascending, FIRST descending; an INTEGER meeting a BIGINT is BIGINT.
+  CHECK(run("SELECT x FROM oa UNION ALL SELECT y FROM ob ORDER BY x") ==
+        Grid{{i(1)}, {i(2)}, {i(2)}, {i(3)}, {i(5)}, {kNull}, {kNull}});
+  CHECK(run("SELECT x FROM oa UNION ALL SELECT y FROM ob ORDER BY 1 DESC") ==
+        Grid{{kNull}, {kNull}, {i(5)}, {i(3)}, {i(2)}, {i(2)}, {i(1)}});
+  CHECK(run("SELECT x FROM oa UNION ALL SELECT y FROM ob ORDER BY x DESC NULLS LAST LIMIT 3") ==
+        Grid{{i(5)}, {i(3)}, {i(2)}});
+  CHECK(run("SELECT x FROM oa UNION SELECT y FROM ob ORDER BY x") == Grid{{i(1)}, {i(2)}, {i(3)}, {i(5)}, {kNull}});
+  CHECK(run("SELECT x FROM oa EXCEPT SELECT y FROM ob ORDER BY x") == Grid{{i(1)}, {i(3)}});
+  CHECK(run("SELECT x FROM oa INTERSECT SELECT y FROM ob ORDER BY x") == Grid{{i(2)}, {kNull}});
+  // Two keys, the second descending; a column the key does not name rides along.
+  CHECK(run("SELECT f, x FROM oa UNION ALL SELECT f, y FROM ob ORDER BY 1 DESC, x") ==
+        Grid{{kNull, kNull}, {kNull, kNull}, {Value{2.5}, i(5)}, {Value{1.5}, i(3)}, {Value{1.0}, i(2)}, {Value{1.0}, i(2)},
+             {Value{0.5}, i(1)}});
+  // The plan sorts once, keeping only a LIMIT's rows.
+  CHECK(db->prepare("SELECT x FROM oa UNION ALL SELECT y FROM ob ORDER BY x LIMIT 3").plan_source().find("bc_sorter_open(cx, 3)") !=
+        std::string::npos);
+  CHECK(db->prepare("SELECT x FROM oa UNION ALL SELECT y FROM ob ORDER BY x").plan_source().find("bc_sorter_open(cx, 0)") !=
+        std::string::npos);
+  // A subquery's set operation orders its rows too.
+  CHECK(run("SELECT id FROM oa WHERE x = (SELECT y FROM ob UNION ALL SELECT 7 ORDER BY 1 LIMIT 1) ORDER BY id") ==
+        Grid{{i(4)}});
+  // A DOUBLE's sign of zero survives the sort.
+  (void)run("INSERT INTO oa VALUES (9, 0, $1)", {Value{-0.0}});
+  auto z = run("SELECT f FROM oa WHERE id = 9 UNION ALL SELECT f FROM ob WHERE id = 9 ORDER BY f");
+  REQUIRE(z.size() == 1);
+  CHECK(std::signbit(std::get<double>(z[0][0])));
+  // Names and positions are checked as PostgreSQL checks them.
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  CHECK(state("SELECT x FROM oa UNION SELECT y FROM ob ORDER BY 2") == "42P10");
+  CHECK(state("SELECT x FROM oa UNION SELECT y FROM ob ORDER BY y") == "42703");
+  CHECK(state("SELECT x FROM oa UNION SELECT y FROM ob ORDER BY oa.x") == "42P01");
+  CHECK(state("SELECT x, x FROM oa UNION SELECT y, y FROM ob ORDER BY x") == "42702");
+  CHECK(state("SELECT x FROM oa UNION SELECT y FROM ob ORDER BY x + 1") == "42601");
+}
+
+TEST_CASE("embedded API: ORDER BY of a set operation's rows is charged to the statement's budget, a LIMIT bounds it", "[sql][api][setop]") {
+  sql_test::TempDir dir{"api_setop_order_mem"};
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  (void)db->execute("CREATE TABLE big (id INTEGER PRIMARY KEY, x INTEGER)");
+  auto txn = db->begin();
+  for (int k = 0; k < 2000; ++k) (void)txn.execute("INSERT INTO big VALUES ($1, $1)", {i(k)});
+  (void)txn.commit();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  // The sorter holds every row of the combined arms; past the budget the statement fails, never spilling.
+  CHECK(state("SELECT x FROM big UNION ALL SELECT x FROM big ORDER BY x") == "54000");
+  // A LIMIT holds only its rows, though every row is read.
+  CHECK(state("SELECT x FROM big UNION ALL SELECT x FROM big ORDER BY x DESC LIMIT 5") == "ran");
+  CHECK(db->execute("SELECT x FROM big UNION ALL SELECT x FROM big ORDER BY x DESC LIMIT 3").rows ==
+        Grid{{i(1999)}, {i(1999)}, {i(1998)}});
 }
