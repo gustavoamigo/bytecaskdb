@@ -1,0 +1,18 @@
+Drops the wait a plan that appends nothing makes for the head entry its
+outcome rests on (#672). Expected: caught. The soak sees a del that finds
+nothing on a key whose last write threw, then a read that still holds the
+key's last confirmed value.
+Guarded-by: "pipeline: a del after a failed flush does not answer from the failed write before the degrade is published"
+
+diff --git a/bytecaskdb/db.cpp b/bytecaskdb/db.cpp
+index 5ac9e01..66e3637 100644
+--- a/bytecaskdb/db.cpp
++++ b/bytecaskdb/db.cpp
+@@ -391,7 +391,6 @@ auto DB::apply_batch(WriteOptions opts,
+   if (opts.sync)
+     last_synced_return = {instance_id_, std::chrono::steady_clock::now()};
+ 
+-  settle_unappended(slot);
+   return slot.result;
+ }
+ 

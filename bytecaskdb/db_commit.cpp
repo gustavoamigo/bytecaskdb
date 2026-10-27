@@ -41,15 +41,15 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
     return true;
   }
 
-  if (!t.validate_preconditions(slot.plan, slot.conflict_lost_to)) {
+  if (!t.validate_preconditions(slot.plan, slot.rests_on)) {
     slot.result = std::nullopt;
-    slot.conflict_snap_next =
-        slot.plan.snap_ ? slot.plan.snap_->state_->next_seq : 0;
     return false;
   }
 
   auto entries = t.prepare_write(slot.plan);
   if (entries.empty()) {
+    // Guards that held may have held on any entry the head holds.
+    slot.rests_on = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
     slot.result = CommitResult{};
     return true;
   }
@@ -562,6 +562,41 @@ void DB::commit_wait(EngineSlot &slot) {
                           : now->next_seq > target;
     });
   }
+}
+
+// Plans are validated against the head, which is right — two in-flight
+// writes to one key must not both pass — but the head holds writes not yet
+// published, and one of them may yet fail. A slot that appended something
+// waits for its own publication in commit_wait, which covers every entry
+// before it. One that appended nothing — a conflict, or guards that held
+// with nothing to write — has no entry to wait for, so it waits here for
+// the entry its outcome rests on. If that entry will never be published,
+// its write threw and is unseen, and an answer drawn from it would contradict
+// every read (CONTRACT.md, "A thrown write is unseen until resume()"), so
+// the slot throws DbDegraded instead.
+//
+// The wait is also when a conflict becomes useful to report: until the
+// write a plan lost to is published, every retry from a fresh snapshot
+// loses again. A caller's retry loop spun through the whole fdatasync of a
+// competing write — the CAS benchmark's average attempts went from 1.0 to
+// 7-350 when the commit was pipelined. The wait is for that write, not for
+// the whole head: under many writers the head always holds entries
+// appended after the flush in progress began, and waiting for those would
+// cost a second flush for nothing.
+//
+// A slot whose outcome the published state gives as well returns at once:
+// it rests on what readers already see, and a conflict there is one a
+// retry can see. This is the common case of a del that finds no key while
+// other writes are in flight.
+void DB::settle_unappended(const EngineSlot &slot) const {
+  if (slot.rests_on == 0) return;
+  const auto published = load_state();
+  if (published->next_seq > slot.rests_on) return;
+  const auto holds = published->transient().validate_preconditions(slot.plan);
+  if (holds == slot.result.has_value()) return;
+  wait_published(slot.rests_on);
+  if (load_state()->next_seq > slot.rests_on) return;
+  throw DbDegraded{degraded_reason()};
 }
 
 void DB::wait_published(std::uint64_t sequence) const {

@@ -1328,10 +1328,13 @@ public:
 private:
   explicit DB(std::filesystem::path dir, Options opts);
 
-  // Blocks until the published state covers sequence — a fresh snapshot
-  // can see the write a plan lost to — or the engine degrades or closes.
-  // See apply_batch.
+  // Blocks until the published state covers sequence, or the engine
+  // degrades or closes.
   void wait_published(std::uint64_t sequence) const;
+  // Returns once the outcome of a slot that appended nothing rests only on
+  // published writes. Throws DbDegraded when a write it rests on will never
+  // be published.
+  void settle_unappended(const EngineSlot &slot) const;
 
   // Drains background hint tasks then writes all sealed hint files.
   void flush_hints();
@@ -2208,12 +2211,11 @@ export struct EngineSlot : Slot {
   WritePlan plan;
   WriteOptions opts;
   std::optional<CommitResult> result;
-  // On a conflict: the sequence of the entry the plan lost to, and the
-  // plan's snapshot's next_seq. A snapshot that already covers every
-  // published write lost to something still in flight — see apply_batch,
-  // which then reports the conflict only once that write is published.
-  std::uint64_t conflict_lost_to{0};
-  std::uint64_t conflict_snap_next{0};
+  // A slot that appended nothing: the latest head entry its outcome may
+  // rest on — on a conflict, the entry the plan lost to; when its guards
+  // held, the head's latest. 0 when nothing was decided. apply_batch
+  // returns only once it is published (settle_unappended).
+  std::uint64_t rests_on{0};
   // A sync slot that appended nothing: the sequence every earlier write
   // reaches, which commit_wait makes durable before the slot returns. Its
   // result keeps sequence 0 — the write itself wrote nothing.

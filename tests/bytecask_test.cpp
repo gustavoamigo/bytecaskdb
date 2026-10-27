@@ -9159,12 +9159,13 @@ TEST_CASE("durable_sequence wakes a waiter when the DB closes",
   CHECK_THROWS_AS(std::rethrow_exception(err), bytecask::DbClosed);
 }
 
-TEST_CASE("a conflict waiting on a write whose flush fails returns when the "
-          "engine degrades",
+TEST_CASE("a conflict waiting on a write whose flush fails throws DbDegraded "
+          "when the engine degrades",
           "[pipeline][degraded][concurrency]") {
   // B's plan loses to A's write, which is in the head but not published; B
-  // waits for A's publication (wait_published). A's fdatasync then fails,
-  // so A's write is never published and only the degrade can release B.
+  // waits for A's publication. A's fdatasync then fails, so A's write is
+  // never published and only the degrade can release B. A's write is
+  // unseen, so B's conflict with it is no answer: B throws.
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
   db.put({}, to_bytes("k"), to_bytes("v0"));
@@ -9193,13 +9194,16 @@ TEST_CASE("a conflict waiting on a write whose flush fails returns when the "
 
   bytecask::WritePlan plan{std::move(snap)};
   plan.put(to_bytes("k"), to_bytes("v2"));
-  const auto r = db.apply_batch({.sync = false}, std::move(plan));
+  CHECK_THROWS_AS(db.apply_batch({.sync = false}, std::move(plan)),
+                  bytecask::DbDegraded);
+  const bool b_waited = released.load();
+  if (!released.exchange(true)) release.count_down();  // B returned at once
   a.join();
   db.test_before_flush_sync_ = nullptr;
   db.test_in_sequence_wait_ = nullptr;
 
-  CHECK_FALSE(r.has_value());
-  CHECK(released.load());  // B did wait
+  CHECK(b_waited);
+  CHECK(to_string(*get_val(db, to_bytes("k"))) == "v0");
   REQUIRE(ea);
   CHECK(db.is_degraded());
 }
@@ -14147,6 +14151,200 @@ TEST_CASE("pipeline: a plan whose snapshot is already behind the published "
   const auto t0 = std::chrono::steady_clock::now();
   CHECK_FALSE(db.apply_batch({.sync = true}, std::move(plan)).has_value());
   CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds{100});
+}
+
+// A plan that appends nothing answers from the head, which holds writes not
+// yet published. CONTRACT.md, apply_batch: "Isolation is what the plan
+// guards" (strict serializability), "A conflict is reported once a retry can
+// see what won" and "A guard-only plan commits nothing".
+TEST_CASE("pipeline: a plan that appends nothing returns once the write it "
+          "answered from is published",
+          "[pipeline][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("k"), to_bytes("0"));
+
+  // A: stage 1 done, its entry in the head, parked before its flush.
+  std::function<void()> a_write;
+  std::function<bool()> b_write;  // B's outcome: true if the plan applied
+  bool b_expected = false;
+  std::function<bool()> a_visible;
+  SECTION("a del finds the key deleted only in the head") {
+    a_write = [&] { (void)db.del({.sync = true}, to_bytes("k")); };
+    b_write = [&] { return db.del({.sync = false}, to_bytes("k")).has_value(); };
+    b_expected = false;
+    a_visible = [&] { return !db.contains_key({}, to_bytes("k")); };
+  }
+  SECTION("a guard-only plan holds on a put only the head holds") {
+    a_write = [&] { db.put({.sync = true}, to_bytes("n"), to_bytes("1")); };
+    b_write = [&] {
+      bytecask::WritePlan plan;
+      plan.ensure_present(to_bytes("n"));
+      return db.apply_batch({.sync = false}, std::move(plan)).has_value();
+    };
+    b_expected = true;
+    a_visible = [&] { return db.contains_key({}, to_bytes("n")); };
+  }
+  FlushGate before_wait;
+  db.test_before_commit_wait_ = before_wait.hook();
+  std::thread ta(a_write);
+  before_wait.wait_in_flush();
+
+  std::atomic<bool> b_returned{false};
+  bool rb = !b_expected;
+  std::thread tb([&] {
+    rb = b_write();
+    b_returned.store(true);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds{300});
+  CHECK_FALSE(b_returned.load());
+
+  before_wait.open();
+  ta.join();
+  tb.join();
+  db.test_before_commit_wait_ = nullptr;
+  CHECK(rb == b_expected);
+  CHECK(a_visible());  // what B answered from, readers now see
+}
+
+TEST_CASE("pipeline: a del of a key that neither the head nor the published "
+          "state holds returns at once behind a write in flight",
+          "[pipeline][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  FlushGate before_wait;
+  db.test_before_commit_wait_ = before_wait.hook();
+  std::thread ta([&] { db.put({.sync = true}, to_bytes("a"), to_bytes("1")); });
+  before_wait.wait_in_flush();
+
+  const auto t0 = std::chrono::steady_clock::now();
+  CHECK_FALSE(db.del({.sync = false}, to_bytes("missing")).has_value());
+  CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds{100});
+
+  before_wait.open();
+  ta.join();
+  db.test_before_commit_wait_ = nullptr;
+}
+
+// CONTRACT.md, apply_batch: "Isolation is what the plan guards" and "A
+// thrown write is unseen until resume()": an outcome drawn from a write that
+// threw would contradict every read, so the plan throws instead.
+TEST_CASE("pipeline: a plan that appends nothing throws DbDegraded when the "
+          "write it answered from fails its flush",
+          "[pipeline][degraded][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+
+  std::function<void()> a_write;
+  std::function<void()> b_write;
+  SECTION("a del finds the failed write's tombstone") {
+    a_write = [&] { (void)db.del({.sync = true}, to_bytes("k")); };
+    b_write = [&] { (void)db.del({.sync = false}, to_bytes("k")); };
+  }
+  SECTION("a guard-only plan holds on the failed write's put") {
+    a_write = [&] { db.put({.sync = true}, to_bytes("n"), to_bytes("1")); };
+    b_write = [&] {
+      bytecask::WritePlan plan;
+      plan.ensure_present(to_bytes("n"));
+      (void)db.apply_batch({.sync = false}, std::move(plan));
+    };
+  }
+  std::latch in_flush{1};
+  std::latch release{1};
+  db.test_before_flush_sync_ = [&] {
+    in_flush.count_down();
+    release.wait();
+  };
+  std::exception_ptr ea;
+  std::thread a{[&] {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+    try {
+      a_write();
+    } catch (...) {
+      ea = std::current_exception();
+    }
+  }};
+  in_flush.wait();
+  std::atomic<bool> released{false};
+  const auto release_once = [&] {
+    if (!released.exchange(true)) release.count_down();
+  };
+  db.test_in_sequence_wait_ = release_once;
+
+  CHECK_THROWS_AS(b_write(), bytecask::DbDegraded);
+  const bool b_waited = released.load();
+  release_once();  // B may have returned without waiting
+  a.join();
+  db.test_before_flush_sync_ = nullptr;
+  db.test_in_sequence_wait_ = nullptr;
+
+  CHECK(b_waited);
+  REQUIRE(ea);
+  CHECK(db.is_degraded());
+  CHECK(to_string(*get_val(db, to_bytes("k"))) == "v0");
+  CHECK_FALSE(db.contains_key({}, to_bytes("n")));
+}
+
+// #672: the soak's failure. A writer whose del threw on a failed flush
+// deletes the key again before the degrade is published. Its guard finds the
+// failed del's tombstone in the head; the published state still holds the
+// key. CONTRACT.md, apply_batch: "Isolation is what the plan guards" and "A
+// thrown write is unseen until resume()".
+TEST_CASE("pipeline: a del after a failed flush does not answer from the "
+          "failed write before the degrade is published",
+          "[pipeline][degraded][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("k"), to_bytes("v1"));
+
+  std::atomic<bool> second_waiting{false};
+  std::atomic<bool> second_done{false};
+  bool first_threw = false;
+  std::string second;
+  std::thread tb;
+  std::atomic<bool> hooked{false};
+  db.test_in_sequence_wait_ = [&] { second_waiting.store(true); };
+  // Runs on the failing flush's thread, between recording the flush error
+  // and publishing the degrade. It must not throw: degrade() swallows it.
+  db.test_before_degrade_publish_ = [&] {
+    if (hooked.exchange(true)) return;
+    tb = std::thread([&] {
+      try {
+        (void)db.del({.sync = false}, to_bytes("k"));
+      } catch (...) {
+        first_threw = true;
+      }
+      try {
+        second = db.del({.sync = false}, to_bytes("k")) ? "tombstone" : "found nothing";
+      } catch (const bytecask::DbDegraded &) {
+        second = "DbDegraded";
+      } catch (...) {
+        second = "other";
+      }
+      second_done.store(true);
+    });
+    // Hold the window open until the second del returned or waits on the
+    // degrade this thread is about to publish.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    while (!second_done.load() && !second_waiting.load() &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::microseconds{200});
+    }
+  };
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+    CHECK_THROWS(db.put({.sync = true}, to_bytes("other"), to_bytes("x")));
+  }
+  REQUIRE(hooked.load());
+  tb.join();
+  db.test_before_degrade_publish_ = nullptr;
+  db.test_in_sequence_wait_ = nullptr;
+
+  CHECK(first_threw);
+  CHECK(second == "DbDegraded");
+  CHECK(db.contains_key({}, to_bytes("k")));
 }
 
 TEST_CASE("pipeline: a batch admitted before a flush failure is rejected as "
