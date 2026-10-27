@@ -21,8 +21,8 @@ How much of each suite the layer passes, from the functional suite's conformance
 
 | Suite | Coverage | Tests | Checks |
 |---|---|---|---|
-| SQL:2016 Core (sqltest) | 67% | 498/743 tests | statement accepted |
-| PostgreSQL features | 84% | 215/257 cases | results |
+| SQL:2016 Core (sqltest) | 69% | 510/743 tests | statement accepted |
+| PostgreSQL features | 84% | 216/258 cases | results |
 | ByteCaskDB features | 100% | 13/13 cases | results |
 | TPROC-C | 100% | 1/1 case: five transactions, then consistency conditions 1–9 | consistency conditions 1–9 |
 
@@ -42,7 +42,7 @@ Built and tested:
 
 Not built yet (each is refused, with a message):
 
-- updatable views, `WITH CHECK OPTION`, `CREATE OR REPLACE VIEW`, reading a view defined with a set operation, and an aggregate, `DISTINCT` or join over a grouped view;
+- updatable views, `WITH CHECK OPTION`, `CREATE OR REPLACE VIEW`, reading a view defined with a set operation, and, over a grouped view, `SUM`, `COUNT`, `AVG`, an aggregate of its own aggregate, `DISTINCT` or a join (`MIN`/`MAX` of one with no aggregate work);
 - a set operation of a query that groups, aggregates or is `DISTINCT`, and `ORDER BY` inside a parenthesised set operation within another;
 - more than eight tables, `FULL JOIN`, `RIGHT JOIN` of more than two tables, `USING` or `NATURAL` after the first join, a join in parentheses, `FOR UPDATE` of a join, correlated or nested subqueries and subqueries in `FROM`, `DISTINCT ON`;
 - `ILIKE`, `IS DISTINCT FROM`, a predicate in `HAVING`;

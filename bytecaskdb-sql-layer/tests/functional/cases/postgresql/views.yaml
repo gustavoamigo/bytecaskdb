@@ -1,6 +1,6 @@
 # Views: CREATE VIEW and DROP VIEW, read like a table in FROM. A view is its
 # query, read again at each use. Updatable views, WITH CHECK OPTION, and a
-# query that groups or aggregates over a grouped view are not built.
+# query that aggregates over a grouped view, beyond MIN and MAX of one with no aggregate, are not built.
 
 - name: a view reads its table's rows as they are when it is read
   features: [F031-02]
@@ -230,3 +230,35 @@
   teardown:
     - DROP VIEW vw8_h
     - DROP TABLE vw8
+
+- name: MIN, MAX and COUNT(DISTINCT) over a grouped view that has no aggregate read the base rows' values
+  features: [F131-04]
+  setup:
+    - CREATE TABLE vw9 (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)
+    - CREATE VIEW vw9_g AS SELECT a, b FROM vw9 WHERE b > 0 GROUP BY a, b
+  steps:
+    - sql: INSERT INTO vw9 VALUES ($1, $2, $3)
+      params: [1, 1, 5]
+      rowcount: 1
+    - sql: INSERT INTO vw9 VALUES ($1, $2, $3)
+      params: [2, 1, 5]
+      rowcount: 1
+    - sql: INSERT INTO vw9 VALUES ($1, $2, $3)
+      params: [3, 2, 7]
+      rowcount: 1
+    - sql: INSERT INTO vw9 VALUES ($1, $2, $3)
+      params: [4, 3, -1]
+      rowcount: 1
+    - sql: SELECT MAX(a), MIN(b) FROM vw9_g
+      expected: [[2, 5]]
+    - sql: SELECT COUNT(DISTINCT a) FROM vw9_g WHERE a > 1
+      expected: [[1]]
+    - sql: SELECT a, MAX(b) FROM vw9_g GROUP BY a ORDER BY a
+      expected: [[1, 5], [2, 7]]
+      ordered: true
+    # SUM and COUNT count the view's rows, one per group: still refused
+    - sql: SELECT SUM(b) FROM vw9_g
+      error: "42601"
+  teardown:
+    - DROP VIEW vw9_g
+    - DROP TABLE vw9
