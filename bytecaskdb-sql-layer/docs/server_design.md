@@ -168,11 +168,12 @@ things, each with one owner:
 - **Worker**: a thread in a fixed pool (`--workers`, by default four times the
   cores, minimum 4).
 
-The loop cuts complete messages from a connection's input buffer, appends them
-to the session's queue, and schedules an idle session onto the worker pool. A
-worker runs one session's queued messages up to the next `ReadyForQuery` (after
-startup, a `Query` or a `Sync`), then puts the session behind the others if
-more messages are queued. The pool's queue lock is the only lock.
+The loop hands the bytes it reads to the connection's session and schedules an
+idle session onto the worker pool; the worker cuts them into messages
+(`Framer`). A worker runs one session's queued messages up to the next
+`ReadyForQuery` (after startup, a `Query` or a `Sync`), then puts the session
+behind the others if more messages are queued. Each session has a lock for
+its handoff with the loop, and each worker a queue with its own lock.
 
 A connection past `--max-connections` gets `FATAL 53300`
 (`too_many_connections`) and is closed, as PostgreSQL does. The default,

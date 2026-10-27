@@ -73,10 +73,11 @@ map.
 protocol is sequential per connection, and a client may pipeline
 `Parse`, `Bind`, `Execute` and `Sync` before reading anything. So a session
 is *idle*, *queued* or *running*:
-- the loop appends messages to the session's queue and makes an idle
+- the loop hands the bytes it reads to the session and makes an idle
   session queued;
-- a worker takes a queued session, makes it running, and runs its messages
-  through today's `pg_session` logic, synchronously and to completion;
+- a worker takes a queued session, makes it running, cuts its bytes into
+  messages, and runs them through today's `pg_session` logic, synchronously
+  and to completion;
 - when its queue is empty, the session goes back to idle. Otherwise it
   goes back to queued, behind the others.
 
@@ -93,9 +94,12 @@ is *idle*, *queued* or *running*:
   of the session's queue and the session returns to idle until the next
   message (or end of stream) arrives. A worker never blocks on the socket.
 
-The queue's lock is the only lock. Taking a session from it gives the
-worker exclusive access, and makes the previous worker's writes to the
-session visible to it. No lock exists inside a session. The embedded API
+Each session has a small lock that guards only its handoff with the loop:
+the bytes read for it, its unsent output and its state. Each worker has its
+own queue with its own lock, and an idle worker takes sessions from the
+others' queues. Taking a session gives the worker exclusive access to the
+session's protocol and SQL state, and makes the previous worker's writes
+to it visible; nothing inside that state is locked. The embedded API
 already allows this: every `Database` call may come from any thread, and a
 `Transaction` handle may move between threads as long as one thread uses
 it at a time (`transaction_design.md`, *Shape*).
