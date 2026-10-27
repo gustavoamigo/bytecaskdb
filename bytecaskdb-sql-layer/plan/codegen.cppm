@@ -166,7 +166,7 @@ public:
     return table ? tbl(id) : idx(id);
   }
   auto col(const ColumnRef& c) -> std::string {
-    cols_.emplace(c.table, c.col, c.type);
+    cols_.emplace(storage(c.table), c.col, c.type);
     return use("COL_" + std::to_string(c.table) + "_" + std::to_string(c.col));
   }
   // The position of a column in an index's key, for the key-part decoders.
@@ -174,7 +174,7 @@ public:
     return use("PART_" + std::to_string(index) + "_" + std::to_string(c.col));
   }
   // A table or index the plan reads.
-  void reads(std::uint32_t id) { reads_.insert(id); }
+  void reads(std::uint32_t id) { reads_.insert(storage(id)); }
   [[nodiscard]] auto objects_read() const -> std::vector<std::uint32_t> { return {reads_.begin(), reads_.end()}; }
   // Every column the plan reads or sets, with its type.
   [[nodiscard]] auto columns_used() const -> std::vector<ColumnDep> {
@@ -232,6 +232,14 @@ public:
   }
 
 private:
+  // The table whose rows a table of the plan reads: its own, or, for an
+  // instance of it (Table::source), the table it is an instance of. Any other
+  // object is itself.
+  auto storage(std::uint32_t id) const -> std::uint32_t {
+    auto it = std::ranges::find(p_.constants, "TBL_" + std::to_string(id), &Catalog::PlanConstant::name);
+    return it == p_.constants.end() ? id : it->value;
+  }
+
   // A name the plan's constants lack would fail at TinyCC: a compiler bug,
   // refused here instead.
   auto use(std::string name) -> std::string {
@@ -846,14 +854,17 @@ private:
     if (cr.emits) emit_count("n");
   }
 
-  // The scan a plan's rows come from, under its filters and sort, or a hash
-  // join's build side; null for a NULL split.
-  static auto plain_scan(const physical::Node& n) -> const physical::Scan* {
-    if (const auto* sc = std::get_if<physical::Scan>(&n.op)) return sc;
-    if (const auto* f = std::get_if<physical::Filter>(&n.op)) return plain_scan(*f->input);
-    if (const auto* o = std::get_if<physical::Sort>(&n.op)) return plain_scan(*o->input);
-    if (const auto* h = std::get_if<physical::HashJoin>(&n.op)) return plain_scan(*h->build);
-    if (const auto* g = std::get_if<physical::GroupAggregate>(&n.op)) return plain_scan(*g->input);
+  // The scan of the table a choice point counts that a plan's rows come from,
+  // under its filters and sort, or a hash join's build side, or a join whose
+  // outer side a hash join is; null for a NULL split.
+  static auto counted_scan(const physical::Node& n, const physical::Scan& counted) -> const physical::Scan* {
+    if (const auto* sc = std::get_if<physical::Scan>(&n.op)) return sc->table == counted.table ? sc : nullptr;
+    if (const auto* f = std::get_if<physical::Filter>(&n.op)) return counted_scan(*f->input, counted);
+    if (const auto* o = std::get_if<physical::Sort>(&n.op)) return counted_scan(*o->input, counted);
+    if (const auto* g = std::get_if<physical::GroupAggregate>(&n.op)) return counted_scan(*g->input, counted);
+    if (const auto* j = std::get_if<physical::IndexJoin>(&n.op)) return counted_scan(*j->outer, counted);
+    if (const auto* j = std::get_if<physical::NestedLoop>(&n.op)) return counted_scan(*j->outer, counted);
+    if (const auto* h = std::get_if<physical::HashJoin>(&n.op)) return counted_scan(*h->build, counted);
     return nullptr;
   }
 
@@ -870,7 +881,7 @@ private:
             ");");
     w_.open("if (" + n + " < " + t + ")");
     // A NULL split's ranges are its own, not the count of its prefix.
-    if (const auto* first = plain_scan(*ch.below)) counted_.emplace(first, Counted{"lo" + i, "hi" + i});
+    if (const auto* first = counted_scan(*ch.below, ch.counted)) counted_.emplace(first, Counted{"lo" + i, "hi" + i});
     produce(*ch.below, k);
     w_.otherwise();
     produce(*ch.at_or_above, k);

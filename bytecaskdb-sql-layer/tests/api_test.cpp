@@ -198,6 +198,36 @@ TEST_CASE("embedded API: a plan the catalog refuses is recompiled and run again"
   CHECK(db->execute(by_id, {i(6)}).rows == Grid{{i(6), i(60)}});
 }
 
+TEST_CASE("embedded API: a plan that reads a table twice is recompiled when the table's ids change", "[sql][api][catalog]") {
+  sql_test::TempDir dir{"api_instances"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE s (id BIGINT PRIMARY KEY, parent BIGINT)");
+  for (auto [id, parent] : {std::pair{1, 0}, {2, 1}, {3, 1}}) {
+    (void)db->execute("INSERT INTO s VALUES ($1, $2)", {i(id), i(parent)});
+  }
+  const auto& pairs = db->prepare("SELECT x.id, y.id FROM s x JOIN s y ON x.id = y.parent WHERE x.id >= $1 ORDER BY 2");
+  CHECK(db->execute(pairs, {i(0)}).rows == Grid{{i(1), i(2)}, {i(1), i(3)}});
+  // Both uses read the one table's rows, named in the plan by its ids and not an instance's: a plan that
+  // named the instances would never be found fit, or never refused.
+  CHECK(pairs.plan_source().find("// objects: ") != std::string::npos);
+  auto compiled = db->compilations();
+  // A DDL that leaves the plan compatible: no compile. An index: the plan keeps its table's key.
+  (void)db->execute("CREATE TABLE elsewhere (k BIGINT PRIMARY KEY)");
+  CHECK(db->execute(pairs, {i(0)}).rows == Grid{{i(1), i(2)}, {i(1), i(3)}});
+  (void)db->execute("ALTER TABLE s ADD COLUMN extra BIGINT");
+  CHECK(db->execute(pairs, {i(0)}).rows == Grid{{i(1), i(2)}, {i(1), i(3)}});
+  // The table dropped and created again, with other rows: new ids, so the plan is refused, compiled again,
+  // and reads the new table through both uses.
+  (void)db->execute("DROP TABLE s");
+  (void)db->execute("CREATE TABLE s (id BIGINT PRIMARY KEY, parent BIGINT)");
+  (void)db->execute("INSERT INTO s VALUES ($1, $2)", {i(7), i(0)});
+  (void)db->execute("INSERT INTO s VALUES ($1, $2)", {i(8), i(7)});
+  CHECK(db->execute(pairs, {i(0)}).rows == Grid{{i(7), i(8)}});
+  CHECK(db->compilations() > compiled);
+  (void)db->execute("DROP TABLE s");
+  CHECK_THROWS(db->execute(pairs, {i(0)}));
+}
+
 TEST_CASE("embedded API: parameters are checked against the plan that will run", "[sql][api][catalog]") {
   sql_test::TempDir dir{"api_stale_params"};
   auto db = Database::open(dir.path());
@@ -1267,6 +1297,22 @@ TEST_CASE("embedded API: every plan the search costed returns the same rows", "[
       {"SELECT p.k, o.k FROM p LEFT JOIN o ON o.a = p.v ORDER BY o.k, p.k", {}, true, 1},
       // o.c only in the WHERE above the join: o's index on a does not hold it.
       {"SELECT o.k FROM o LEFT JOIN p ON p.k = o.k WHERE a = $1 AND (p.v = $2 OR o.c = $3)", {i(1), i(1), i(2)}, false, 1},
+      // A table with itself, and three tables: the join order and the access of each table vary, as does a
+      // hash join of the first two on a column no key reaches, and each agrees.
+      {"SELECT x.k, y.k FROM o x JOIN o y ON x.b = y.b WHERE x.a = $1 AND y.a = $2", {i(1), i(2)}, false, 2},
+      {"SELECT x.k, y.k FROM o x JOIN o y ON x.a = y.a AND x.k < y.k WHERE x.k < $1 AND y.k > $2", {i(12), i(30)}, false, 1},
+      {"SELECT x.k, p.v, y.k FROM o x, p, o y WHERE x.a = $1 AND p.k = x.c AND y.c = p.k", {i(1)}, false, 2},
+      {"SELECT x.k, y.k, p.k FROM o x, o y, p WHERE x.b = y.b AND y.c = p.v AND x.a = $1", {i(2)}, false, 2},
+      {"SELECT x.k, y.k, p.k FROM o x, o y, p WHERE x.b = y.b AND y.c = p.v AND x.a = $1 ORDER BY x.k, y.k, p.k", {i(2)}, true, 1},
+      {"SELECT x.k, y.k, p.k FROM o x JOIN o y ON x.k < y.k JOIN p ON p.k <> y.c WHERE x.a = $1 AND y.a = $2", {i(1), i(3)}, false, 1},
+      // A comparison, a predicate over both sides of a join, and an outer join of three.
+      {"SELECT o.k, p.k FROM o JOIN p ON o.c <> p.k WHERE a = $1", {i(1)}, false, 1},
+      {"SELECT o.k, p.k FROM o JOIN p ON NOT (o.c = p.k) OR o.b IS NULL WHERE a = $1", {i(0)}, false, 1},
+      {"SELECT o.k, p.v, q.k FROM o LEFT JOIN p ON p.k = o.c LEFT JOIN o q ON q.k = p.v WHERE o.a = $1", {i(1)}, false, 1},
+      {"SELECT o.k, p.v, q.k FROM o LEFT JOIN p ON p.k = o.c AND p.v > $2 LEFT JOIN o q ON q.b = p.v AND q.k <> o.k WHERE o.a = $1",
+       {i(1), i(0)}, false, 1},
+      {"SELECT o.k, p.v, q.k FROM o LEFT JOIN p ON p.k = o.c JOIN o q ON q.k = p.v WHERE o.a = $1 ORDER BY 1, 2, 3", {i(2)}, true, 1},
+      {"SELECT o.k, q.v FROM o JOIN o x ON x.k = o.c LEFT JOIN p q ON q.k = x.k WHERE o.a = $1", {i(1)}, false, 1},
   };
   const std::string cross = "SELECT o.k, p.v FROM p, o WHERE p.k = $1 AND a = $2";
   CHECK(db->execute(cross, {i(1), i(2)}).rows.size() == 10);
@@ -1327,6 +1373,110 @@ TEST_CASE("embedded API: a left outer join NULL-extends each left row no right r
   const std::string keyed = "SELECT ls.k, rc.a FROM ls LEFT JOIN rc ON rc.s = ls.s AND rc.a = $1 ORDER BY ls.k";
   CHECK(db->execute(keyed, {i(1)}).rows == Grid{{i(1), i(1)}, {i(2), Value{}}});
   CHECK(db->execute(keyed, {Value{}}).rows == Grid{{i(1), Value{}}, {i(2), Value{}}});
+}
+
+// The rows below are PostgreSQL 16's, for the same statements on the same rows.
+TEST_CASE("embedded API: joins of three or more tables, a table with itself, and ON by any comparison", "[sql][api][join]") {
+  sql_test::TempDir dir{"api_joins"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE h1 (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)");
+  (void)db->execute("CREATE TABLE h2 (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER)");
+  (void)db->execute("CREATE INDEX h2_a ON h2 (a)");
+  (void)db->execute("CREATE TABLE h3 (k INTEGER PRIMARY KEY, a INTEGER)");
+  auto insert = [&](std::string_view table, std::initializer_list<std::initializer_list<Value>> rows) {
+    for (const auto& r : rows) {
+      auto sql = "INSERT INTO " + std::string{table} + (r.size() == 3 ? " VALUES ($1, $2, $3)" : " VALUES ($1, $2)");
+      (void)db->execute(sql, std::vector<Value>{r});
+    }
+  };
+  const Value n{};
+  // Each table has a row of key 0, which a row of NULLs would read as, if a join read a key from one.
+  insert("h1", {{i(0), i(3), i(5)}, {i(1), i(1), i(10)}, {i(2), i(2), i(20)}, {i(3), i(2), n}, {i(4), n, i(40)}, {i(5), i(5), i(50)}});
+  insert("h2", {{i(0), i(4), i(50)}, {i(1), i(1), i(100)}, {i(2), i(2), i(200)}, {i(3), i(2), n}, {i(4), n, i(400)}, {i(6), i(6), i(600)}});
+  insert("h3", {{i(0), i(4)}, {i(1), i(1)}, {i(2), i(2)}, {i(3), n}, {i(7), i(7)}});
+  auto rows = [&](std::string_view sql) { return db->execute(sql).rows; };
+  // three tables, inner
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1 JOIN h2 ON h1.a = h2.a JOIN h3 ON h2.a = h3.a ORDER BY 1, 2, 3") ==
+        Grid{{i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(2), i(3), i(2)}, {i(3), i(2), i(2)}, {i(3), i(3), i(2)}});
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1, h2, h3 WHERE h1.a < h2.a AND h2.a <> h3.a ORDER BY 1, 2, 3") ==
+        Grid{{i(0), i(0), i(1)}, {i(0), i(0), i(2)}, {i(0), i(0), i(7)}, {i(0), i(6), i(0)}, {i(0), i(6), i(1)}, {i(0), i(6), i(2)}, {i(0), i(6), i(7)}, {i(1), i(0), i(1)}, {i(1), i(0), i(2)}, {i(1), i(0), i(7)}, {i(1), i(2), i(0)}, {i(1), i(2), i(1)}, {i(1), i(2), i(7)}, {i(1), i(3), i(0)}, {i(1), i(3), i(1)}, {i(1), i(3), i(7)}, {i(1), i(6), i(0)}, {i(1), i(6), i(1)}, {i(1), i(6), i(2)}, {i(1), i(6), i(7)}, {i(2), i(0), i(1)}, {i(2), i(0), i(2)}, {i(2), i(0), i(7)}, {i(2), i(6), i(0)}, {i(2), i(6), i(1)}, {i(2), i(6), i(2)}, {i(2), i(6), i(7)}, {i(3), i(0), i(1)}, {i(3), i(0), i(2)}, {i(3), i(0), i(7)}, {i(3), i(6), i(0)}, {i(3), i(6), i(1)}, {i(3), i(6), i(2)}, {i(3), i(6), i(7)}, {i(5), i(6), i(0)}, {i(5), i(6), i(1)}, {i(5), i(6), i(2)}, {i(5), i(6), i(7)}});
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h3, h2, h1 WHERE h1.id = h2.id AND h3.k = h2.id ORDER BY 1") ==
+        Grid{{i(0), i(0), i(0)}, {i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(3), i(3), i(3)}});
+  CHECK(rows("SELECT count(*) FROM h1 JOIN h2 ON h1.a = h2.a JOIN h3 ON h2.a = h3.a") ==
+        Grid{{i(5)}});
+  // a chain of left joins
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1 LEFT JOIN h2 ON h1.a = h2.a LEFT JOIN h3 ON h2.a = h3.a ORDER BY 1, 2, 3") ==
+        Grid{{i(0), Value{}, Value{}}, {i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(2), i(3), i(2)}, {i(3), i(2), i(2)}, {i(3), i(3), i(2)}, {i(4), Value{}, Value{}}, {i(5), Value{}, Value{}}});
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1 LEFT JOIN h2 ON h1.a = h2.a LEFT JOIN h3 ON h1.a = h3.a AND h2.c > 100 ORDER BY 1, 2, 3") ==
+        Grid{{i(0), Value{}, Value{}}, {i(1), i(1), Value{}}, {i(2), i(2), i(2)}, {i(2), i(3), Value{}}, {i(3), i(2), i(2)}, {i(3), i(3), Value{}}, {i(4), Value{}, Value{}}, {i(5), Value{}, Value{}}});
+  CHECK(rows("SELECT h1.id, h3.k FROM h1 LEFT JOIN h2 ON h1.a = h2.a LEFT JOIN h3 ON h2.a = h3.a WHERE h3.k IS NULL ORDER BY 1, 2") ==
+        Grid{{i(0), Value{}}, {i(4), Value{}}, {i(5), Value{}}});
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1 LEFT JOIN h2 ON h1.a = h2.a JOIN h3 ON h2.a = h3.a ORDER BY 1, 2, 3") ==
+        Grid{{i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(2), i(3), i(2)}, {i(3), i(2), i(2)}, {i(3), i(3), i(2)}});
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1 JOIN h2 ON h1.id = h2.id LEFT JOIN h3 ON h2.a = h3.a ORDER BY 1, 2, 3") ==
+        Grid{{i(0), i(0), i(0)}, {i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(3), i(3), i(2)}, {i(4), i(4), Value{}}});
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1 LEFT JOIN h2 ON h1.a = h2.a LEFT JOIN h3 ON h2.id = h3.k ORDER BY 1, 2, 3") ==
+        Grid{{i(0), Value{}, Value{}}, {i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(2), i(3), i(3)}, {i(3), i(2), i(2)}, {i(3), i(3), i(3)}, {i(4), Value{}, Value{}}, {i(5), Value{}, Value{}}});
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1 LEFT JOIN h2 ON h1.a = h2.a JOIN h3 ON h2.id = h3.k ORDER BY 1, 2, 3") ==
+        Grid{{i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(2), i(3), i(3)}, {i(3), i(2), i(2)}, {i(3), i(3), i(3)}});
+  CHECK(rows("SELECT h1.a, count(h2.id), count(h3.k), count(*) FROM h1 LEFT JOIN h2 ON h1.a = h2.a LEFT JOIN h3 ON h2.a = h3.a GROUP BY h1.a ORDER BY 1") ==
+        Grid{{i(1), i(1), i(1), i(1)}, {i(2), i(4), i(4), i(4)}, {i(3), i(0), i(0), i(1)}, {i(5), i(0), i(0), i(1)}, {Value{}, i(0), i(0), i(1)}});
+  // a table joined with itself
+  CHECK(rows("SELECT x.id, y.id FROM h1 x JOIN h1 y ON x.a = y.a ORDER BY 1, 2") ==
+        Grid{{i(0), i(0)}, {i(1), i(1)}, {i(2), i(2)}, {i(2), i(3)}, {i(3), i(2)}, {i(3), i(3)}, {i(5), i(5)}});
+  CHECK(rows("SELECT x.id, y.id FROM h1 x JOIN h1 y ON x.id < y.id WHERE x.a = y.a ORDER BY 1, 2") ==
+        Grid{{i(2), i(3)}});
+  CHECK(rows("SELECT h1.id, y.id FROM h1 JOIN h1 AS y ON h1.id = y.id ORDER BY 1") ==
+        Grid{{i(0), i(0)}, {i(1), i(1)}, {i(2), i(2)}, {i(3), i(3)}, {i(4), i(4)}, {i(5), i(5)}});
+  CHECK(rows("SELECT x.id, y.id, z.id FROM h1 x JOIN h1 y ON x.id < y.id JOIN h1 z ON y.id < z.id ORDER BY 1, 2, 3") ==
+        Grid{{i(0), i(1), i(2)}, {i(0), i(1), i(3)}, {i(0), i(1), i(4)}, {i(0), i(1), i(5)}, {i(0), i(2), i(3)}, {i(0), i(2), i(4)}, {i(0), i(2), i(5)}, {i(0), i(3), i(4)}, {i(0), i(3), i(5)}, {i(0), i(4), i(5)}, {i(1), i(2), i(3)}, {i(1), i(2), i(4)}, {i(1), i(2), i(5)}, {i(1), i(3), i(4)}, {i(1), i(3), i(5)}, {i(1), i(4), i(5)}, {i(2), i(3), i(4)}, {i(2), i(3), i(5)}, {i(2), i(4), i(5)}, {i(3), i(4), i(5)}});
+  CHECK(rows("SELECT x.id, y.id FROM h1 x LEFT JOIN h1 y ON x.a = y.a AND x.id <> y.id ORDER BY 1, 2") ==
+        Grid{{i(0), Value{}}, {i(1), Value{}}, {i(2), i(3)}, {i(3), i(2)}, {i(4), Value{}}, {i(5), Value{}}});
+  CHECK(rows("SELECT x.id, y.id FROM h1 x RIGHT JOIN h1 y ON x.a < y.a ORDER BY 1, 2") ==
+        Grid{{i(0), i(5)}, {i(1), i(0)}, {i(1), i(2)}, {i(1), i(3)}, {i(1), i(5)}, {i(2), i(0)}, {i(2), i(5)}, {i(3), i(0)}, {i(3), i(5)}, {Value{}, i(1)}, {Value{}, i(4)}});
+  CHECK(rows("SELECT x.id, y.id FROM h1 x JOIN h2 z ON x.a = z.a JOIN h1 y ON z.a = y.a ORDER BY 1, 2") ==
+        Grid{{i(1), i(1)}, {i(2), i(2)}, {i(2), i(2)}, {i(2), i(3)}, {i(2), i(3)}, {i(3), i(2)}, {i(3), i(2)}, {i(3), i(3)}, {i(3), i(3)}});
+  // any comparison
+  CHECK(rows("SELECT h1.id, h2.id FROM h1 JOIN h2 ON h1.a < h2.a ORDER BY 1, 2") ==
+        Grid{{i(0), i(0)}, {i(0), i(6)}, {i(1), i(0)}, {i(1), i(2)}, {i(1), i(3)}, {i(1), i(6)}, {i(2), i(0)}, {i(2), i(6)}, {i(3), i(0)}, {i(3), i(6)}, {i(5), i(6)}});
+  CHECK(rows("SELECT h1.id, h2.id FROM h1 JOIN h2 ON h1.a <= h2.a ORDER BY 1, 2") ==
+        Grid{{i(0), i(0)}, {i(0), i(6)}, {i(1), i(0)}, {i(1), i(1)}, {i(1), i(2)}, {i(1), i(3)}, {i(1), i(6)}, {i(2), i(0)}, {i(2), i(2)}, {i(2), i(3)}, {i(2), i(6)}, {i(3), i(0)}, {i(3), i(2)}, {i(3), i(3)}, {i(3), i(6)}, {i(5), i(6)}});
+  CHECK(rows("SELECT h1.id, h2.id FROM h1 JOIN h2 ON h1.a > h2.a ORDER BY 1, 2") ==
+        Grid{{i(0), i(1)}, {i(0), i(2)}, {i(0), i(3)}, {i(2), i(1)}, {i(3), i(1)}, {i(5), i(0)}, {i(5), i(1)}, {i(5), i(2)}, {i(5), i(3)}});
+  CHECK(rows("SELECT h1.id, h2.id FROM h1 JOIN h2 ON h1.a >= h2.a ORDER BY 1, 2") ==
+        Grid{{i(0), i(1)}, {i(0), i(2)}, {i(0), i(3)}, {i(1), i(1)}, {i(2), i(1)}, {i(2), i(2)}, {i(2), i(3)}, {i(3), i(1)}, {i(3), i(2)}, {i(3), i(3)}, {i(5), i(0)}, {i(5), i(1)}, {i(5), i(2)}, {i(5), i(3)}});
+  CHECK(rows("SELECT h1.id, h2.id FROM h1 JOIN h2 ON h1.a <> h2.a ORDER BY 1, 2") ==
+        Grid{{i(0), i(0)}, {i(0), i(1)}, {i(0), i(2)}, {i(0), i(3)}, {i(0), i(6)}, {i(1), i(0)}, {i(1), i(2)}, {i(1), i(3)}, {i(1), i(6)}, {i(2), i(0)}, {i(2), i(1)}, {i(2), i(6)}, {i(3), i(0)}, {i(3), i(1)}, {i(3), i(6)}, {i(5), i(0)}, {i(5), i(1)}, {i(5), i(2)}, {i(5), i(3)}, {i(5), i(6)}});
+  CHECK(rows("SELECT h1.id, h2.id FROM h1 JOIN h2 ON h1.a = h2.a AND h1.b < h2.c ORDER BY 1, 2") ==
+        Grid{{i(1), i(1)}, {i(2), i(2)}});
+  CHECK(rows("SELECT h1.id, h2.id FROM h1 JOIN h2 ON h1.a = h2.a OR h1.b IS NULL ORDER BY 1, 2") ==
+        Grid{{i(1), i(1)}, {i(2), i(2)}, {i(2), i(3)}, {i(3), i(0)}, {i(3), i(1)}, {i(3), i(2)}, {i(3), i(3)}, {i(3), i(4)}, {i(3), i(6)}});
+  CHECK(rows("SELECT h1.id, h2.id FROM h1 LEFT JOIN h2 ON h1.a < h2.a ORDER BY 1, 2") ==
+        Grid{{i(0), i(0)}, {i(0), i(6)}, {i(1), i(0)}, {i(1), i(2)}, {i(1), i(3)}, {i(1), i(6)}, {i(2), i(0)}, {i(2), i(6)}, {i(3), i(0)}, {i(3), i(6)}, {i(4), Value{}}, {i(5), i(6)}});
+  CHECK(rows("SELECT h1.id, h2.id FROM h1 LEFT JOIN h2 ON h1.a = h2.a AND NOT (h1.b = h2.c) ORDER BY 1, 2") ==
+        Grid{{i(0), Value{}}, {i(1), i(1)}, {i(2), i(2)}, {i(3), Value{}}, {i(4), Value{}}, {i(5), Value{}}});
+
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+  // The names PostgreSQL requires: a table named twice needs aliases, and an ON sees the tables before it.
+  CHECK(state("SELECT id FROM h1 x JOIN h1 y ON x.id = y.id") == "42702");
+  CHECK(state("SELECT h1.id FROM h1 x JOIN h1 y ON x.id = y.id") == "42P01");
+  CHECK(state("SELECT 1 FROM h1, h1") == "42712");
+  CHECK(state("SELECT 1 FROM h1 x, h2 x") == "42712");
+  CHECK(state("SELECT 1 FROM h1 JOIN h2 ON h1.a = h3.a JOIN h3 ON h2.a = h3.a") == "42P01");
+  // What the layer does not take yet is refused, never answered wrongly.
+  CHECK(state("SELECT 1 FROM h1 x RIGHT JOIN h2 y ON x.a = y.a JOIN h3 z ON y.a = z.a") == "42601");
+  CHECK(state("SELECT 1 FROM h1 NATURAL JOIN h2 NATURAL JOIN h3") == "42601");
+  CHECK(state("SELECT 1 FROM h1 x, h1 y, h1 z, h1 w, h1 v, h1 u, h1 t, h1 s, h1 r") == "42601");  // nine tables
+  CHECK(state("SELECT 1 FROM h1 x JOIN h1 y ON x.id = y.id FOR UPDATE") == "42601");
 }
 
 TEST_CASE("embedded API: an uncorrelated subquery runs once, on the statement's snapshot, before its plan",
