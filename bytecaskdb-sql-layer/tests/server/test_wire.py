@@ -1115,7 +1115,9 @@ def test_a_client_that_takes_no_replies_holds_its_pipeline_back():
 
         statements = 3_000
         one = query("SELECT k, v FROM p" + " " * 20_000)
-        sender = threading.Thread(target=c.send, args=(one * statements,), daemon=True)
+        # One sendall per statement: a socket's timeout bounds a whole
+        # sendall, so one for all 60 MB would time out on a slow build.
+        sender = threading.Thread(target=lambda: [c.send(one) for _ in range(statements)], daemon=True)
         sender.start()
         time.sleep(3)
         assert sender.is_alive()  # the server stopped reading
