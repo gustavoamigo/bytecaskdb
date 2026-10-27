@@ -107,7 +107,7 @@ auto literal_expr(Literal l) -> Expr {
   return e;
 }
 
-// An operand of + or -: an expression, an integer literal within BIGINT,
+// An operand of an arithmetic operator: an expression, an integer literal within BIGINT,
 // as a Const, or any other literal (PostgreSQL types a larger integer as
 // numeric), for the binder to fold or refuse.
 auto operand(const PgQuery__Node* n) -> Expr {
@@ -130,7 +130,12 @@ auto expr(const PgQuery__Node* n) -> Expr {
     const auto* c = n->column_ref;
     if (c->n_fields != 1 && c->n_fields != 2) reject("column names take at most a table's name", c->location);
     const auto* last = c->fields[c->n_fields - 1];
-    if (last->node_case != PG_QUERY__NODE__NODE_STRING) reject("* is not supported", c->location);
+    if (last->node_case == PG_QUERY__NODE__NODE_A_STAR) {
+      Expr star{Expr::Kind::Star, {}, 0, nullptr, nullptr, c->location};
+      if (c->n_fields == 2) star.table = str(c->fields[0]);
+      return star;
+    }
+    if (last->node_case != PG_QUERY__NODE__NODE_STRING) reject("column reference not supported", c->location);
     Expr e{Expr::Kind::Column, str(last), 0, nullptr, nullptr, c->location};
     if (c->n_fields == 2) e.table = str(c->fields[0]);
     return e;
@@ -151,15 +156,20 @@ auto expr(const PgQuery__Node* n) -> Expr {
       e.rhs = std::make_unique<Expr>(operand(a->rexpr));
       return e;
     }
-    if (op != "+" && op != "-") reject("only + and - are supported here", a->location);
+    if (op != "+" && op != "-" && op != "*" && op != "/") reject("only +, -, * and / are supported here", a->location);
     // Unary: PostgreSQL's grammar folds - of a number into the literal, so
     // what is left is + of anything and - of an expression.
     if (a->lexpr == nullptr) {
+      if (op == "*" || op == "/") reject("operator " + op + " is not a prefix operator", a->location);
       Expr e{op == "+" ? Expr::Kind::Plus : Expr::Kind::Neg, {}, 0, nullptr, nullptr, a->location};
       e.rhs = std::make_unique<Expr>(operand(a->rexpr));
       return e;
     }
-    Expr e{op == "+" ? Expr::Kind::Add : Expr::Kind::Sub, {}, 0, nullptr, nullptr, a->location};
+    Expr e{op == "+"   ? Expr::Kind::Add
+           : op == "-" ? Expr::Kind::Sub
+           : op == "*" ? Expr::Kind::Mul
+                       : Expr::Kind::Div,
+           {}, 0, nullptr, nullptr, a->location};
     e.lhs = std::make_unique<Expr>(operand(a->lexpr));
     e.rhs = std::make_unique<Expr>(operand(a->rexpr));
     return e;

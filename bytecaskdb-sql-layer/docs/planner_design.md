@@ -84,8 +84,8 @@ own: the search keeps a table's predicates apart from its comparisons
 (`Rel::preds`), no access path takes one, and each is a filter after the
 path's, refused (`no plan:`) where it compares a REAL or DOUBLE column, as a
 comparison is. Codegen prints one as two C conditions, true and false, SQL's
-three-valued logic with unknown neither; `*` and `/` come with the dialect
-that accepts them (#534). The
+three-valued logic with unknown neither; `*` and `/` of columns come with
+the dialect that accepts them (#534). The
 binder's own rules are the frontend's: one SQL type per `$n`, and the
 errors it raises.
 

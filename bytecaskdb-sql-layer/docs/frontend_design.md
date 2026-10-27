@@ -47,10 +47,22 @@ kind the transformer doesn't take is refused with its position.
   `MATCH FULL` and `PARTIAL`, `DEFERRABLE` and `NOT VALID` are refused.
 - `INSERT … VALUES` of one row, with or without a column list, of
   parameters and constants.
-- `SELECT` targets: columns, constants (*Literals*), `COUNT(*)`,
+- `SELECT` targets: columns, `*` and `table.*` (below), constants (*Literals*), `COUNT(*)`,
   `COUNT(col)`, `COUNT(DISTINCT col)`, `SUM(col)`, `MIN(col)`, `MAX(col)` and
   `AVG(col)`, several of them in any order; a constant not beside an
   aggregate or a `GROUP BY`.
+- `SELECT *` and `table.*` are expanded by the binder, before it binds
+  anything else, into the columns they stand for: each FROM table's in
+  table order, hidden row ids left out, each named by its column's name.
+  Over a `USING` or `NATURAL` join `*` gives the `USING` columns first,
+  each once and named alone (so the preserved side's, as a column named
+  alone is), then the left table's other columns, then the right's; a
+  `table.*` is that table's columns, `USING` ones included. The
+  expansion is a select list of ordinary columns, so everything after it
+  (aggregation, `DISTINCT`, `ORDER BY`) treats it as the columns written
+  out. `*` without `FROM` is 42601, `x.*` for a name not in `FROM` 42P01,
+  `x.*` of a table an alias hides 42P01; `*` anywhere but the select list
+  is 42601, `* AS (c, d)` is not PostgreSQL and is a syntax error.
 - `GROUP BY` of columns, and `HAVING`, below. A query with a `GROUP BY`, a
   `HAVING` or an aggregate is aggregated; without `GROUP BY` it returns
   exactly one row, or none where its `HAVING` is false.
@@ -86,6 +98,16 @@ kind the transformer doesn't take is refused with its position.
 **Literals and expressions.**
 - **Literals** of every kind, typed and read as PostgreSQL types them
   (*Literals*, below).
+- **`*` and `/`** fold constants only, as `+` and `-` do, and are refused
+  on a column (42601, not supported yet): the select list holds no
+  arithmetic of columns. Integers take PostgreSQL's types (`integer *
+  integer` is `integer`, any wider operand makes `bigint`), the product
+  of numerics is at the sum of the scales within 18 digits, and the
+  result is range-checked (22003, `INT_MIN / -1` included). Integer `/`
+  truncates toward zero. A zero divisor is 22012, unless the dividend is
+  `NULL` (the operator is strict and never runs). A numeric quotient is
+  refused: its scale is PostgreSQL's division rule (`select_div_scale`),
+  not built yet. `%` is refused.
 - **`+` and `-`** on integers and on `DECIMAL`, with PostgreSQL's result
   type: `smallint + smallint` is `smallint`, `integer + bigint` is
   `bigint`, and so on.
@@ -233,7 +255,8 @@ That includes:
   alias of a join, an output name in `GROUP BY` or in `ORDER BY` of other
   than a column;
 - `OFFSET`, `RETURNING`, multi-row `VALUES`;
-- `*`, `/`, string concatenation and functions;
+- `*` and `/` of columns, a numeric quotient, `%`, string concatenation
+  and functions;
 - a cast of anything but a string literal or `NULL`, a numeric literal of
   more than 18 digits, a string literal in arithmetic, unary `-` of
   anything but a constant, a comparison of a column as a value, and a
@@ -258,8 +281,8 @@ recompile after a DDL folds them again, to the types they meet then.
   where it is used and reads a string with that type's input function: the
   same reading a parameter's text gets on the wire, from one module
   (`sql/text.cppm`). Alone in a select list each is `text`.
-- Unary `+` and `-`, and `+` and `-` of constants, fold with PostgreSQL's
-  result types and range checks: `2147483647 + 1` is "integer out of
+- Unary `+` and `-`, and `+`, `-`, `*` and `/` of constants, fold with
+  PostgreSQL's result types and range checks: `2147483647 + 1` is "integer out of
   range" (22003), `1 + 1.5` the numeric 2.5, `1 + NULL` an integer NULL.
 - A comparison of constants (`=`, `<>`, `<`, `<=`, `>`, `>=`) folds to a
   `boolean`, NULL if either side is: numbers exactly whatever their
