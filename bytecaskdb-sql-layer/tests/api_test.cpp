@@ -8,12 +8,14 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -1184,4 +1186,48 @@ TEST_CASE("embedded API: a choice point's plan text shows both plans, and each r
       CHECK(sorted(all[n].rows) == sorted(want));
     }
   }
+}
+
+TEST_CASE("embedded API: a cancel flag or a passed deadline fails a statement with 57014, and aborts its transaction",
+          "[sql][api]") {
+  sql_test::TempDir dir{"api_cancel"};
+  auto db = Database::open(dir.path());
+  (void)db->execute(kCreateTable);
+  const auto& insert = db->prepare(kInsert);
+  for (std::int64_t k = 0; k < 1000; ++k) (void)db->execute(insert, {i(k), bytes("x"), i(k)});
+  constexpr auto kScan = "SELECT id FROM t WHERE id >= $1";
+
+  auto failure = [](auto&& run) -> std::pair<std::string, std::string> {
+    try {
+      run();
+    } catch (const ExecError& e) {
+      return {std::string{sqlstate(e)}, e.what()};
+    }
+    return {"", ""};
+  };
+
+  CancelFlag flag;
+  ExecutionOptions cancelled{.cancel = &flag};
+  CHECK(db->execute(kScan, {i(0)}, cancelled).rows.size() == 1000);  // not set: runs to the end
+  flag.cancel();
+  CHECK(flag.cancelled());
+  CHECK(failure([&] { (void)db->execute(kScan, {i(0)}, cancelled); }) ==
+        std::pair<std::string, std::string>{"57014", "canceling statement due to user request"});
+  flag.reset();
+  CHECK(db->execute(kScan, {i(0)}, cancelled).rows.size() == 1000);
+
+  ExecutionOptions late{.deadline = std::chrono::steady_clock::now() - std::chrono::seconds{1}};
+  CHECK(failure([&] { (void)db->execute(kScan, {i(0)}, late); }) ==
+        std::pair<std::string, std::string>{"57014", "canceling statement due to statement timeout"});
+  ExecutionOptions roomy{.deadline = std::chrono::steady_clock::now() + std::chrono::hours{1}};
+  CHECK(db->execute(kScan, {i(0)}, roomy).rows.size() == 1000);
+
+  // In a transaction the cancelled statement aborts it, as any failed one.
+  auto t = db->begin();
+  CHECK(t.execute(kById, {i(1)}).rows.size() == 1);
+  flag.cancel();
+  CHECK(failure([&] { (void)t.execute(kScan, {i(0)}, cancelled); }).first == "57014");
+  CHECK(t.is_aborted());
+  CHECK_THROWS_AS(t.execute(kById, {i(1)}), TransactionAborted);
+  CHECK(t.commit() == CommitOutcome::RolledBack);
 }

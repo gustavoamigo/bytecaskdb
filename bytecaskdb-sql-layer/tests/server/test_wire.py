@@ -840,6 +840,10 @@ def test_statement_memory_bytes_is_every_statement_s_budget():
     (["--statement-memory-bytes", "0"], "statement_memory_bytes is at least 1"),
     (["--workers", "0"], "--workers"),
     (["--workers", "many"], "--workers"),
+    (["--statement-timeout-ms", "soon"], "--statement-timeout-ms"),
+    (["--idle-in-transaction-timeout-ms", "-1"], "--idle-in-transaction-timeout-ms"),
+    (["--transaction-timeout-ms", "1.5"], "--transaction-timeout-ms"),
+    (["--idle-session-timeout-ms", ""], "--idle-session-timeout-ms"),
 ])
 def test_sync_and_io_flags_are_validated(flags, says):
     binary = server_binary()
@@ -852,4 +856,224 @@ def test_sync_and_io_flags_are_validated(flags, says):
         assert says in r.stderr, r.stderr
         assert "ready on" not in r.stdout
     finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+# ------------------------------------------------- cancellation and timeouts
+# docs/session_design.md, *Lifetime, cancellation and shutdown*.
+
+CANCEL_REQUEST = 80877102
+SLOW = "SELECT count(*) FROM a JOIN b ON a.v = b.v"  # every row with every row: 400 million pairs, seconds
+
+
+def slow_tables(c: Client) -> None:
+    """Two tables of 20,000 rows whose join on v pairs every row with every row."""
+    for t in ("a", "b"):
+        c.send(query(f"CREATE TABLE {t} (k INTEGER PRIMARY KEY, v BIGINT)"))
+        assert states(c.until_ready()) == []
+        c.send(parse(f"INSERT INTO {t} VALUES ($1, $2)"),
+               *[m for k in range(20_000) for m in (bind([str(k), "0"]), execute())], SYNC)
+        assert states(c.until_ready()) == []
+
+
+def backend_key(messages) -> tuple[int, int]:
+    [body] = [b for k, b in messages if k == b"K"]
+    return struct.unpack("!ii", body)
+
+
+def cancel(server: Server, key: tuple[int, int]) -> None:
+    """A CancelRequest on a connection of its own, as libpq sends it: the
+    server closes that connection without a reply."""
+    with socket.create_connection(("127.0.0.1", server.port), timeout=30) as s:
+        s.sendall(struct.pack("!iiii", 16, CANCEL_REQUEST, *key))
+        assert s.recv(1) == b""
+
+
+def until_ready_or_fatal(c: Client) -> list[tuple[bytes, bytes]]:
+    """Messages up to ReadyForQuery, or up to a FATAL, after which there is none."""
+    out = []
+    while True:
+        m = c.message()
+        out.append(m)
+        if m[0] == b"Z" or (m[0] == b"E" and fields(m[1])["S"] == "FATAL"):
+            return out
+
+
+def fatal(messages) -> dict[str, str]:
+    kind, body = messages[-1]
+    assert kind == b"E", messages
+    f = fields(body)
+    assert f["S"] == "FATAL", f
+    return f
+
+
+def test_startup_sends_backend_key_data_once_and_distinct_per_session():
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory)
+    try:
+        first, second = Client(s).start(), Client(s).start()
+        for out in (first, second):
+            assert kinds(out).count(b"K") == 1
+            assert kinds(out).index(b"K") < kinds(out).index(b"Z")
+        assert backend_key(first)[0] != backend_key(second)[0]
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_a_cancel_request_fails_the_running_statement_with_57014_and_the_session_goes_on():
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory)
+    try:
+        c = Client(s)
+        key = backend_key(c.start())
+        slow_tables(c)
+
+        # A wrong secret cancels nothing: only the right key, sent later, does.
+        started = time.monotonic()
+        c.send(query(SLOW))
+        time.sleep(0.2)
+        cancel(s, (key[0], key[1] ^ 1))
+        time.sleep(0.6)
+        cancel(s, key)
+        out = c.until_ready()
+        assert states(out) == ["57014"]
+        assert [fields(b)["M"] for k, b in out if k == b"E"] == ["canceling statement due to user request"]
+        assert 0.8 <= time.monotonic() - started < 10
+        assert status(out) == "I"
+        assert data(run(c, "SELECT k FROM a WHERE k = $1", ["7"])) == [["7"]]
+
+        # Inside a block the cancelled statement fails the block, as any error.
+        c.send(query("BEGIN"))
+        assert status(c.until_ready()) == "T"
+        c.send(query(SLOW))
+        time.sleep(0.3)
+        cancel(s, key)
+        out = c.until_ready()
+        assert states(out) == ["57014"] and status(out) == "E"
+        c.send(query("ROLLBACK"))
+        assert status(c.until_ready()) == "I"
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_a_cancel_request_for_an_idle_session_cancels_nothing():
+    """It is not kept for the session's next statement."""
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory)
+    try:
+        c = Client(s)
+        key = backend_key(c.start())
+        slow_tables(c)
+        cancel(s, key)
+        time.sleep(0.2)
+        c.send(query("SELECT count(*) FROM a"))
+        out = c.until_ready()
+        assert states(out) == [] and data(out) == [["20000"]]
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_the_statement_timeout_fails_a_statement_with_57014_and_the_session_goes_on():
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory, extra_args=["--statement-timeout-ms", "300"])
+    try:
+        c = connect(s)
+        slow_tables(c)
+        started = time.monotonic()
+        c.send(query(SLOW))
+        out = c.until_ready()
+        assert states(out) == ["57014"]
+        assert [fields(b)["M"] for k, b in out if k == b"E"] == ["canceling statement due to statement timeout"]
+        assert 0.3 <= time.monotonic() - started < 10
+        assert data(run(c, "SELECT k FROM a WHERE k = $1", ["7"])) == [["7"]]
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_the_idle_in_transaction_timeout_rolls_back_and_closes_but_spares_a_busy_transaction():
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory, extra_args=["--idle-in-transaction-timeout-ms", "300"])
+    try:
+        c = connect(s)
+        table(c)
+        c.send(query("BEGIN"))
+        assert status(c.until_ready()) == "T"
+        assert states(run(c, "INSERT INTO t VALUES ($1, $2)", ["1", "1"])) == []
+        for _ in range(8):  # 100 ms apart: never idle for 300 ms, though open for longer
+            time.sleep(0.1)
+            assert status(run(c, "SELECT k FROM t WHERE k = $1", ["1"])) == "T"
+        time.sleep(1)
+        f = fatal([c.message()])
+        assert f["C"] == "25P03"
+        assert f["M"] == "terminating connection due to idle-in-transaction timeout"
+        assert c.closed()
+        assert keys(connect(s)) == []  # rolled back
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_the_transaction_timeout_ends_a_busy_transaction():
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory, extra_args=["--transaction-timeout-ms", "500"])
+    try:
+        c = connect(s)
+        table(c)
+        c.send(query("BEGIN"))
+        assert status(c.until_ready()) == "T"
+        started = time.monotonic()
+        assert states(run(c, "INSERT INTO t VALUES ($1, $2)", ["1", "1"])) == []
+        out = []
+        while time.monotonic() - started < 5:  # busy: a statement every 50 ms
+            time.sleep(0.05)
+            c.send(parse("SELECT k FROM t WHERE k = $1"), bind(["1"]), execute(), SYNC)
+            out = until_ready_or_fatal(c)
+            if out[-1][0] != b"Z":
+                break
+        f = fatal(out)
+        assert f["C"] == "25P04"
+        assert f["M"] == "terminating connection due to transaction timeout"
+        assert 0.5 <= time.monotonic() - started < 5
+        assert c.closed()
+        assert keys(connect(s)) == []  # rolled back
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_the_idle_session_timeout_closes_an_idle_session_but_not_one_in_a_transaction():
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory, extra_args=["--idle-session-timeout-ms", "300"])
+    try:
+        idle = connect(s)
+        in_block = connect(s)
+        table(in_block)
+        in_block.send(query("BEGIN"))
+        assert status(in_block.until_ready()) == "T"
+        time.sleep(1)
+        f = fatal([idle.message()])
+        assert f["C"] == "57P05"
+        assert f["M"] == "terminating connection due to idle-session timeout"
+        assert idle.closed()
+        assert status(run(in_block, "SELECT k FROM t WHERE k = $1", ["1"])) == "T"
+    finally:
+        s.stop()
         shutil.rmtree(directory, ignore_errors=True)

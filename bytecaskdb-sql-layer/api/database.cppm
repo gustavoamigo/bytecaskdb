@@ -274,6 +274,34 @@ struct TransactionOptions {
   std::uint64_t max_bytes{64u << 20};
 };
 
+// A flag another thread sets to cancel the statement running with it
+// (ExecutionOptions::cancel). Not copyable: a statement reads it by address
+// while it runs.
+class CancelFlag {
+public:
+  CancelFlag() = default;
+  CancelFlag(const CancelFlag&) = delete;
+  CancelFlag& operator=(const CancelFlag&) = delete;
+  void cancel() noexcept { __atomic_store_n(&v_, std::uint8_t{1}, __ATOMIC_RELAXED); }
+  void reset() noexcept { __atomic_store_n(&v_, std::uint8_t{0}, __ATOMIC_RELAXED); }
+  [[nodiscard]] auto cancelled() const noexcept -> bool { return __atomic_load_n(&v_, __ATOMIC_RELAXED) != 0; }
+
+private:
+  friend class Database;
+  // A plain byte, so the C runtime can read it (bc_budget::cancel), always
+  // through atomic operations.
+  std::uint8_t v_{0};
+};
+
+// What may end one statement early, per call. Either fails it with ExecError
+// BC_E_BUDGET (SQLSTATE 57014, query_canceled), checked where the runtime
+// charges its work: every 64 record reads or cursor steps. In a transaction,
+// the statement so failed aborts the transaction, as any failed statement.
+struct ExecutionOptions {
+  std::chrono::steady_clock::time_point deadline{};  // the clock's epoch: none
+  const CancelFlag* cancel{nullptr};
+};
+
 class Database;
 
 // What commit() did, as PostgreSQL's COMMIT reports it in its command tag.
@@ -342,8 +370,8 @@ public:
   // TransactionAborted if it already is. A DDL statement is refused. A
   // statement whose plan does not fit the catalog the transaction pinned
   // throws SerializationFailure, and the transaction has ended.
-  auto execute(const Statement& stmt, const std::vector<Value>& params) -> Rows;
-  auto execute(std::string_view sql, const std::vector<Value>& params = {}) -> Rows;
+  auto execute(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts = {}) -> Rows;
+  auto execute(std::string_view sql, const std::vector<Value>& params = {}, const ExecutionOptions& opts = {}) -> Rows;
   // Writes every statement's writes as one batch: Committed. After a failed
   // statement it writes nothing and returns RolledBack. Throws
   // SerializationFailure on a conflict and ExecError on an engine error,
@@ -362,7 +390,7 @@ private:
   // Under life_->mu, shared: refuses a call on a closed database or an
   // ended or aborted transaction.
   void check_usable() const;
-  auto run_locked(const Statement& stmt, const std::vector<Value>& params) -> Rows;
+  auto run_locked(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts) -> Rows;
   void end_locked() noexcept;  // under life_->mu, shared: forgets and frees it
 
   std::shared_ptr<DatabaseLife> life_;
@@ -423,15 +451,16 @@ public:
   auto prepare(std::string_view sql) -> const Statement&;
   // Throws ParamError for parameters of the wrong number or type,
   // ast::SqlError or FeatureNotSupported if a recompile fails, as prepare
-  // does, ExecError if the plan fails,
+  // does, ExecError if the plan fails (BC_E_BUDGET, 57014, once `opts`'s
+  // deadline passes or its flag is set; DDL runs to the end regardless),
   // TransactionResolutionUnknown if its commit's outcome is unknown,
   // std::logic_error for a statement another Database prepared, and for
   // DDL, what LiveCatalog::apply throws (DdlRefused for a statement the
   // catalog refuses), but a ConstraintViolation as an ExecError (a unique
   // index over duplicates is BC_E_CONSTRAINT, BC_C_UNIQUE and the table's
   // id) and another DDL in progress as SerializationFailure.
-  auto execute(const Statement& stmt, const std::vector<Value>& params) -> Rows;
-  auto execute(std::string_view sql, const std::vector<Value>& params = {}) -> Rows;
+  auto execute(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts = {}) -> Rows;
+  auto execute(std::string_view sql, const std::vector<Value>& params = {}, const ExecutionOptions& opts = {}) -> Rows;
   // Opens a transaction. Its snapshot is taken at its first statement.
   [[nodiscard]] auto begin(TransactionOptions opts = {}) -> Transaction;
   // Recompiles the statement's plan if the live catalog no longer fits it,
@@ -518,7 +547,10 @@ private:
       -> std::shared_ptr<const Compiled>;
   // Runs a DML statement on `cx`: autocommit, retried on a conflict, when
   // `txn` is null; else as a statement of `txn`, its writes added to it.
-  auto run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn) -> Rows;
+  auto run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn,
+           const ExecutionOptions& opts) -> Rows;
+  // The statement budget with a call's deadline and cancel flag.
+  [[nodiscard]] auto budget_for(const ExecutionOptions& opts) const noexcept -> bc_budget;
   // Throws ParamError for parameters the plan does not take, and ExecError
   // BC_C_RANGE for a value outside its parameter's SQL type.
   static void check_params(const Compiled& c, const std::vector<Value>& params);
@@ -795,7 +827,7 @@ auto Database::open(const std::filesystem::path& dir, DatabaseOptions opts) -> s
   if (opts.statement_memory_bytes == 0) throw std::invalid_argument("statement_memory_bytes is at least 1");
   std::unique_ptr<Database> d{new Database};
   d->sync_commits_ = opts.sync == SyncMode::AtEveryCommit;
-  d->budget_ = {.max_reads = 0, .max_bytes = opts.statement_memory_bytes, .deadline_ns = 0};
+  d->budget_ = {.max_reads = 0, .max_bytes = opts.statement_memory_bytes, .deadline_ns = 0, .cancel = nullptr};
   d->life_ = std::make_shared<DatabaseLife>();
   bytecask::Options engine;
   engine.io_backend = opts.io_backend;
@@ -1018,11 +1050,11 @@ auto Database::prepare_locked(std::string_view sql) -> const Statement& {
   return *cache_.try_emplace(s->sql_, std::move(s)).first->second;
 }
 
-auto Database::execute(std::string_view sql, const std::vector<Value>& params) -> Rows {
-  return execute(prepare(sql), params);
+auto Database::execute(std::string_view sql, const std::vector<Value>& params, const ExecutionOptions& opts) -> Rows {
+  return execute(prepare(sql), params, opts);
 }
 
-auto Database::execute(const Statement& stmt, const std::vector<Value>& params) -> Rows {
+auto Database::execute(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts) -> Rows {
   auto lock = enter();
   if (stmt.owner_ != this) throw std::logic_error("the statement was prepared on another database");
   if (stmt.is_ddl()) {
@@ -1043,7 +1075,7 @@ auto Database::execute(const Statement& stmt, const std::vector<Value>& params) 
   }
   auto* cx = acquire_context();
   try {
-    auto out = run(cx, stmt, params, nullptr);
+    auto out = run(cx, stmt, params, nullptr, opts);
     release_context(cx);
     return out;
   } catch (...) {
@@ -1104,8 +1136,19 @@ void Database::check_params(const Compiled& c, const std::vector<Value>& params)
   }
 }
 
-auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn) -> Rows {
+auto Database::budget_for(const ExecutionOptions& opts) const noexcept -> bc_budget {
+  bc_budget b = budget_;
+  // Counted from the steady clock's epoch, as the runtime reads it; 0 is none.
+  std::int64_t ns = std::chrono::nanoseconds{opts.deadline.time_since_epoch()}.count();
+  if (ns != 0) b.deadline_ns = ns > 0 ? static_cast<std::uint64_t>(ns) : 1;
+  if (opts.cancel != nullptr) b.cancel = &opts.cancel->v_;
+  return b;
+}
+
+auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn,
+                   const ExecutionOptions& opts) -> Rows {
   bc_params bp{params};
+  auto budget = budget_for(opts);
   if (txn != nullptr) {
     // The plan must fit the catalog the transaction pinned at its first
     // statement. One that does not is recompiled when the pin is the live
@@ -1114,7 +1157,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
     // the snapshot as the first statement starts); and is otherwise a DDL
     // since the transaction began: 40001, as a commit after it would be.
     for (auto attempt = 0;; ++attempt) {
-      bc_ctx_begin_txn(cx, txn, &bp, budget_);
+      bc_ctx_begin_txn(cx, txn, &bp, budget);
       auto pinned = bc_txn_catalog_version(txn);
 #ifdef BYTECASK_SQL_TESTING
       if (after_txn_pin_) after_txn_pin_();
@@ -1159,7 +1202,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
   }
   auto c = fitting_plan(cx, stmt, params);
   check_params(*c, params);
-  auto r = bc_execute(cx, c->code->fn(), &c->ref, &bp, budget_, sync_commits_, kMaxRetries);
+  auto r = bc_execute(cx, c->code->fn(), &c->ref, &bp, budget, sync_commits_, kMaxRetries);
   // bc_ctx_run checks the plan against the catalog it pinned. A plan a DDL
   // made incompatible (BC_E_LAYOUT with BC_L_INCOMPATIBLE) is recompiled
   // from its text and run once more; one a DDL left compatible keeps
@@ -1168,7 +1211,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
     bc_ctx_reset(cx);
     c = recompile(stmt);
     check_params(*c, params);
-    r = bc_execute(cx, c->code->fn(), &c->ref, &bp, budget_, sync_commits_, kMaxRetries);
+    r = bc_execute(cx, c->code->fn(), &c->ref, &bp, budget, sync_commits_, kMaxRetries);
   }
   if (r == BC_CONFLICT) {
     bc_ctx_reset(cx);
@@ -1304,11 +1347,12 @@ void Transaction::check_usable() const {
   if (state == TxnState::Aborted) throw TransactionAborted();
 }
 
-auto Transaction::run_locked(const Statement& stmt, const std::vector<Value>& params) -> Rows {
+auto Transaction::run_locked(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts)
+    -> Rows {
   try {
     // DDL is its own atomic operation, never part of a transaction.
     if (stmt.is_ddl()) throw FeatureNotSupported("DDL inside a transaction is not supported: run it outside one");
-    return db_->run(h_->cx, stmt, params, h_->txn);
+    return db_->run(h_->cx, stmt, params, h_->txn, opts);
   } catch (const SerializationFailure&) {
     end_locked();
     throw;
@@ -1320,16 +1364,18 @@ auto Transaction::run_locked(const Statement& stmt, const std::vector<Value>& pa
   }
 }
 
-auto Transaction::execute(const Statement& stmt, const std::vector<Value>& params) -> Rows {
+auto Transaction::execute(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts)
+    -> Rows {
   if (!h_) throw std::logic_error("the transaction has ended");
   std::shared_lock<std::shared_mutex> lock{life_->mu};
   check_usable();
   // A misuse of the handle, not a failed statement: the transaction stays as it was.
   if (stmt.owner_ != db_) throw std::logic_error("the statement was prepared on another database");
-  return run_locked(stmt, params);
+  return run_locked(stmt, params, opts);
 }
 
-auto Transaction::execute(std::string_view sql, const std::vector<Value>& params) -> Rows {
+auto Transaction::execute(std::string_view sql, const std::vector<Value>& params, const ExecutionOptions& opts)
+    -> Rows {
   if (!h_) throw std::logic_error("the transaction has ended");
   std::shared_lock<std::shared_mutex> lock{life_->mu};
   if (h_->state.load() == TxnState::Aborted && !life_->closed && !db_->cached(sql)) {
@@ -1345,7 +1391,7 @@ auto Transaction::execute(std::string_view sql, const std::vector<Value>& params
     h_->abort();  // a statement that does not parse or bind aborts it too
     throw;
   }
-  return run_locked(*stmt, params);
+  return run_locked(*stmt, params, opts);
 }
 
 auto Transaction::commit() -> CommitOutcome {

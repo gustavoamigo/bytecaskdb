@@ -28,16 +28,20 @@ module;
 #include <deque>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -51,8 +55,64 @@ import bytecask.sql.pg_text;
 
 export namespace bytecask::sql::pg {
 
+// The timeouts that end an idle session (docs/session_design.md, *Timeouts*).
+enum class Timeout : std::uint8_t { None, IdleInTransaction, Transaction, IdleSession };
+
+// Every session's cancel key, as BackendKeyData gave it to its client: a
+// CancelRequest naming one cancels that session's running statement. Shared
+// by every session of a server; one mutex, held only to add, remove or cancel.
+class CancelRegistry {
+public:
+  struct Key {
+    std::int32_t pid;
+    std::int32_t secret;
+  };
+
+  // Registers the flag under a process id no other session holds and a
+  // random secret.
+  auto add(CancelFlag& flag) -> Key {
+    std::lock_guard<std::mutex> lock{mu_};
+    for (;;) {
+      auto pid = next_pid_;
+      next_pid_ = next_pid_ == std::numeric_limits<std::int32_t>::max() ? 1 : next_pid_ + 1;
+      if (entries_.contains(pid)) continue;
+      auto secret = static_cast<std::int32_t>(random_());
+      entries_.emplace(pid, Entry{secret, &flag});
+      return {pid, secret};
+    }
+  }
+
+  void remove(std::int32_t pid) noexcept {
+    std::lock_guard<std::mutex> lock{mu_};
+    entries_.erase(pid);
+  }
+
+  // Sets the flag of the session the key names; does nothing for a key no
+  // session holds, or a wrong secret.
+  void cancel(std::int32_t pid, std::int32_t secret) noexcept {
+    std::lock_guard<std::mutex> lock{mu_};
+    if (auto it = entries_.find(pid); it != entries_.end() && it->second.secret == secret) it->second.flag->cancel();
+  }
+
+private:
+  struct Entry {
+    std::int32_t secret;
+    CancelFlag* flag;
+  };
+  std::mutex mu_;
+  std::unordered_map<std::int32_t, Entry> entries_;
+  std::int32_t next_pid_{1};
+  std::random_device random_;
+};
+
 struct SessionConfig {
   std::string database;  // the one name a client may connect to
+  // docs/session_design.md, *Timeouts*; 0 turns one off.
+  std::chrono::milliseconds idle_in_transaction_timeout{60'000};  // FATAL 25P03
+  std::chrono::milliseconds statement_timeout{0};                 // 57014
+  std::chrono::milliseconds transaction_timeout{0};               // FATAL 25P04
+  std::chrono::milliseconds idle_session_timeout{0};              // FATAL 57P05
+  CancelRegistry* cancels{nullptr};  // null: no BackendKeyData, and a CancelRequest cancels nothing
 };
 
 // Once a stop has begun, how long a send waits on a client that takes no
@@ -416,6 +476,39 @@ public:
     close();
   }
 
+  // Ends an idle session on the timeout its idle_deadline() named, as
+  // PostgreSQL does: FATAL, its transaction rolled back.
+  void expire(Timeout kind) {
+    switch (kind) {
+      case Timeout::IdleInTransaction:
+        fatal("25P03", "terminating connection due to idle-in-transaction timeout");
+        break;
+      case Timeout::Transaction: fatal("25P04", "terminating connection due to transaction timeout"); break;
+      case Timeout::IdleSession: fatal("57P05", "terminating connection due to idle-session timeout"); break;
+      case Timeout::None: break;
+    }
+  }
+
+  // When the session, idle from `now` on, is to be ended, and on which
+  // timeout: inside a transaction (explicit, failed or implicit) the
+  // earlier of idle-in-transaction and the transaction's own; outside one,
+  // idle-session. Timeout::None while none applies.
+  [[nodiscard]] auto idle_deadline(std::chrono::steady_clock::time_point now) const
+      -> std::pair<std::chrono::steady_clock::time_point, Timeout> {
+    if (!started_ || ended_) return {{}, Timeout::None};
+    if (!in_block_ && !implicit_) {
+      if (cfg_.idle_session_timeout.count() == 0) return {{}, Timeout::None};
+      return {now + cfg_.idle_session_timeout, Timeout::IdleSession};
+    }
+    std::pair<std::chrono::steady_clock::time_point, Timeout> at{{}, Timeout::None};
+    if (cfg_.idle_in_transaction_timeout.count() > 0) at = {now + cfg_.idle_in_transaction_timeout, Timeout::IdleInTransaction};
+    if (cfg_.transaction_timeout.count() > 0) {
+      auto t = txn_started_ + cfg_.transaction_timeout;
+      if (at.second == Timeout::None || t < at.first) at = {t, Timeout::Transaction};
+    }
+    return at;
+  }
+
   void close() noexcept {
     if (txn_) txn_->rollback();
     txn_.reset();
@@ -425,6 +518,8 @@ public:
     queue_.clear();
     waiting_for_lookahead_ = false;
     ended_ = true;
+    if (key_pid_ != 0 && cfg_.cancels != nullptr) cfg_.cancels->remove(key_pid_);  // before cancel_ goes
+    key_pid_ = 0;
   }
 
   [[nodiscard]] auto output() const noexcept -> std::string_view { return out_.data(); }
@@ -488,8 +583,38 @@ private:
     } catch (const ast::SqlError& e) {
       error(sqlstate(e), e.what(), e.pos() < 0 ? 0 : char_position(text, e.pos()));
     } catch (const std::exception& e) {
+      // A statement stopped by its transaction's deadline ends the session,
+      // as PostgreSQL's transaction_timeout does; otherwise 57014 is a
+      // cancel or the statement timeout, and the session goes on.
+      if (sqlstate(e) == "57014" && txn_deadline_passed()) {
+        fatal("25P04", "terminating connection due to transaction timeout");
+        return;
+      }
       error(sqlstate(e), e.what());
     }
+  }
+
+  // The options a statement runs with: the session's cancel flag, cleared
+  // first, so a CancelRequest that arrived while it was idle cancels
+  // nothing; and the earlier of the statement's and its transaction's
+  // deadlines. A statement outside a block is its own transaction.
+  auto run_options() -> ExecutionOptions {
+    cancel_.reset();
+    auto now = std::chrono::steady_clock::now();
+    ExecutionOptions opts{.deadline = {}, .cancel = &cancel_};
+    txn_deadline_ = {};
+    if (cfg_.statement_timeout.count() > 0) opts.deadline = now + cfg_.statement_timeout;
+    if (cfg_.transaction_timeout.count() > 0) {
+      txn_deadline_ = (in_block_ || implicit_ ? txn_started_ : now) + cfg_.transaction_timeout;
+      if (opts.deadline == std::chrono::steady_clock::time_point{} || txn_deadline_ < opts.deadline) {
+        opts.deadline = txn_deadline_;
+      }
+    }
+    return opts;
+  }
+
+  [[nodiscard]] auto txn_deadline_passed() const -> bool {
+    return txn_deadline_ != std::chrono::steady_clock::time_point{} && std::chrono::steady_clock::now() >= txn_deadline_;
   }
 
   void ready() {
@@ -562,7 +687,11 @@ private:
         return false;
       }
       if (code == kCancelRequest) {
-        close();  // there is no cancel yet (slice 2): nothing to do
+        // Its own connection, as the protocol sends it: no reply either way.
+        auto pid = body.i32();
+        auto secret = body.i32();
+        if (cfg_.cancels != nullptr) cfg_.cancels->cancel(pid, secret);
+        close();
         return false;
       }
       if ((code >> 16) != 3) {
@@ -646,6 +775,14 @@ private:
     status("is_superuser", "off");
     status("session_authorization", *user);
     status("application_name", application_name_);
+    if (cfg_.cancels != nullptr) {
+      auto key = cfg_.cancels->add(cancel_);
+      key_pid_ = key.pid;
+      out_.begin('K');  // BackendKeyData: what a CancelRequest names
+      out_.i32(key.pid);
+      out_.i32(key.secret);
+      out_.end();
+    }
     ready();
     return true;
   }
@@ -700,6 +837,7 @@ private:
           implicit_.reset();
         } else {
           txn_.emplace(db_.begin());
+          txn_started_ = std::chrono::steady_clock::now();
         }
         in_block_ = true;
         failed_ = false;
@@ -768,9 +906,10 @@ private:
           const auto& stmt = db_.prepare(c.sql);
           if (!stmt.params().empty()) throw SessionError("there is no parameter $1", "42P02");
           if (implicit_ && stmt.is_ddl()) refuse_ddl_beside_others();
-          auto rows = in_block_   ? txn_->execute(stmt, {})
-                      : implicit_ ? implicit_->execute(stmt, {})
-                                  : db_.execute(stmt, {});
+          auto opts = run_options();
+          auto rows = in_block_   ? txn_->execute(stmt, {}, opts)
+                      : implicit_ ? implicit_->execute(stmt, {}, opts)
+                                  : db_.execute(stmt, {}, opts);
           if (stmt.command() == Command::Select) {
             std::vector<ResultColumn> cols;
             for (std::size_t i = 0; i < rows.columns.size(); ++i) cols.push_back({rows.columns[i], rows.types.at(i)});
@@ -788,6 +927,7 @@ private:
       }
     } catch (...) {
       report(last_text_);
+      if (ended_) return;  // a transaction timeout's FATAL: no ReadyForQuery after it
       fail_block();
     }
     if (!in_block_) end_transaction();
@@ -973,9 +1113,9 @@ private:
     refuse_if_failed();
     Rows rows;
     if (in_block_) {
-      rows = txn_->execute(*p.stmt, portal.params);
+      rows = txn_->execute(*p.stmt, portal.params, run_options());
     } else if (implicit_) {
-      rows = implicit_->execute(*p.stmt, portal.params);
+      rows = implicit_->execute(*p.stmt, portal.params, run_options());
     } else {
       auto flush_after = false;
       switch (lookahead(flush_after)) {
@@ -986,13 +1126,14 @@ private:
         case Lookahead::Sync:
           // The block's one statement, as PQexecParams sends it: autocommit,
           // with its conflict retry, as a simple Query runs it.
-          rows = db_.execute(*p.stmt, portal.params);
+          rows = db_.execute(*p.stmt, portal.params, run_options());
           break;
         case Lookahead::Other:
           // Two or more: PostgreSQL's implicit transaction, committed at Sync.
           if (p.stmt->is_ddl()) refuse_ddl_beside_others();
           implicit_.emplace(db_.begin());
-          rows = implicit_->execute(*p.stmt, portal.params);
+          txn_started_ = std::chrono::steady_clock::now();
+          rows = implicit_->execute(*p.stmt, portal.params, run_options());
           reply(*p.stmt, rows);
           if (flush_after) flush();
           return true;
@@ -1043,6 +1184,10 @@ private:
   bool waiting_for_lookahead_{false};
   bool ended_{false};  // the stream ended, or a FATAL was sent: nothing more is read
   bool fatal_sent_{false};
+  CancelFlag cancel_;                                     // set by a CancelRequest naming key_pid_
+  std::int32_t key_pid_{0};                               // in cfg_.cancels while nonzero
+  std::chrono::steady_clock::time_point txn_started_{};  // of the open block, explicit or implicit
+  std::chrono::steady_clock::time_point txn_deadline_{}; // the running statement's transaction's; epoch: none
 };
 
 // Fixed worker pool scheduling sessions one turn at a time
@@ -1086,6 +1231,11 @@ public:
     std::size_t worker_migrations{0};
     std::thread::id last_worker{};
     std::size_t running_on{kNoPreference};  // the worker running it (State::Running)
+    Timeout expired{Timeout::None};          // set by expire(): the next turn ends the session on it
+    // Set by the worker at the end of each turn, read by the loop through
+    // drain(): when the session, if it stays idle, is to be ended, and why.
+    std::chrono::steady_clock::time_point idle_at{};
+    Timeout idle_kind{Timeout::None};
   };
 
   struct Status {
@@ -1093,6 +1243,8 @@ public:
     bool idle{false};
     std::size_t turns{0};
     std::size_t worker_migrations{0};
+    std::chrono::steady_clock::time_point idle_at{};
+    Timeout idle_kind{Timeout::None};
   };
 
   Pool(Database& db, const SessionConfig& cfg, std::size_t workers, std::function<void()> on_wake = {},
@@ -1192,6 +1344,23 @@ public:
     wake_parked(running_on);
   }
 
+  // The loop's timer for `kind` fired: ends the session on it, on a worker,
+  // if it is still idle on that same timeout. False, doing nothing, if the
+  // session ran or received bytes meanwhile; its next idle turn sets a new
+  // deadline.
+  auto expire(const std::shared_ptr<Slot>& slot, Timeout kind) -> bool {
+    {
+      std::lock_guard<std::mutex> lock{slot->mu};
+      if (kind == Timeout::None || slot->dropped || slot->session_ended || slot->stopping) return false;
+      if (slot->state != Slot::State::Idle || !slot->raw_in.empty() || !slot->inbox.empty()) return false;
+      if (slot->idle_kind != kind) return false;
+      slot->expired = kind;
+      slot->state = Slot::State::Queued;
+    }
+    enqueue_slot(slot);
+    return true;
+  }
+
   void drop(const std::shared_ptr<Slot>& slot) {
     auto need_schedule = false;
     auto running_on = kNoPreference;
@@ -1224,7 +1393,8 @@ public:
     } else if (out.empty() && !write_in_flight) {
       slot->loop_writing = false;
     }
-    return {slot->session_ended, slot->state == Slot::State::Idle, slot->turns, slot->worker_migrations};
+    return {slot->session_ended, slot->state == Slot::State::Idle, slot->turns, slot->worker_migrations, slot->idle_at,
+            slot->idle_kind};
   }
 
   void shutdown() noexcept {
@@ -1431,6 +1601,7 @@ private:
       if (!slot) return;
       auto dropped = false;
       auto stopping = false;
+      auto expired = Timeout::None;
       {
         std::lock_guard<std::mutex> lock{slot->mu};
         slot->state = Slot::State::Running;
@@ -1446,6 +1617,7 @@ private:
         }
         dropped = slot->dropped;
         stopping = slot->stopping;
+        expired = std::exchange(slot->expired, Timeout::None);
       }
       feed_raw(*slot, local_raw, scratch);
       local_raw.clear();
@@ -1454,6 +1626,9 @@ private:
         slot->session.close();
       } else if (stopping) {
         slot->session.stop();
+        flush_session_output(*slot);
+      } else if (expired != Timeout::None) {
+        slot->session.expire(expired);
         flush_session_output(*slot);
       } else {
         for (;;) {
@@ -1567,6 +1742,7 @@ private:
           lock.lock();
         }
         slot->session_ended = slot->session.ended();
+        std::tie(slot->idle_at, slot->idle_kind) = slot->session.idle_deadline(std::chrono::steady_clock::now());
         requeue = (!slot->dropped && !slot->session_ended && slot->session.runnable());
         slot->state = requeue ? Slot::State::Queued : Slot::State::Idle;
         need_loop_wake = !requeue || !slot->outbox.empty() || slot->session_ended || slot->dropped || slot->stopping;

@@ -1,6 +1,6 @@
 # Sessions, the worker pool and the transport
 
-Status: **slice 1 built; slices 2–3 next** (design approved by the owner,
+Status: **slices 1 and 2 built; slice 3 next** (design approved by the owner,
 2026-10-25; tracked in #642). The second of the post-MVP designs (#487,
 *Next*). Slice 1 replaced *Threading*, *I/O* and *Shutdown* in
 `server_design.md`. The protocol the server speaks, and everything a client
@@ -311,20 +311,25 @@ vacuum. The connection-to-session map then goes.
    per-session queue and the worker pool. The protocol and everything
    observable are unchanged, and `test_wire.py` passes as it is. The thread
    per connection is removed in the same PR.
-2. **Cancellation and timeouts.** `BackendKeyData`, `CancelRequest`, 57014,
-   and the four timeouts.
+2. **Cancellation and timeouts (built).** `BackendKeyData`, `CancelRequest`,
+   57014, and the four timeouts. A statement runs with `ExecutionOptions`
+   (`Database::execute`, `Transaction::execute`): its session's
+   `CancelFlag` and the earlier of its statement and transaction deadlines,
+   both read where the runtime charges its reads. Each connection has one
+   libuv timer, armed while its session is idle; it schedules the session to
+   end with the `FATAL`.
 3. **Bounds.** The input and output bounds, and the global memory cap.
 
 ## Proposed `CONTRACT.md` changes
 
-- **Added:** a `CancelRequest` with the session's key fails its running
-  statement with 57014, and cancels nothing else.
-- **Added:** each timeout ends what it names with PostgreSQL's SQLSTATE; an
-  idle-in-transaction timeout rolls the transaction back.
+- **Added (slice 2):** a `CancelRequest` with the session's key fails its
+  running statement with 57014, and cancels nothing else.
+- **Added (slice 2):** each timeout ends what it names with PostgreSQL's
+  SQLSTATE; a transaction a timeout ends rolls back.
 - **Added:** a statement or transaction that would pass the server's memory
   cap fails with 53200 (`out_of_memory`).
-- **Narrowed:** "A `CancelRequest` closes the connection with nothing done"
-  goes.
+- **Narrowed (slice 2):** "A `CancelRequest` closes the connection with
+  nothing done" goes.
 - **Unchanged:** startup, the block status, transaction control, the text
   forms and shutdown, as `server_design.md` states them.
 
