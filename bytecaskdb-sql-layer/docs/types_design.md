@@ -236,7 +236,7 @@ document fixes the set, not the signatures.
 | `OCTET_LENGTH` on bytes and text | a helper |
 | `LENGTH` (code points), `SUBSTRING` (by code point), `||`, `CONCAT` on text | helpers that walk UTF-8 in the API, not in the plan: the subset has no counted loop |
 | `SUBSTRING` by byte, `||` on `BYTEA` | the same helpers on bytes |
-| `CURRENT_TIMESTAMP`, `NOW()`, `CURRENT_DATE` | a hidden parameter the runtime binds at `bc_ctx_begin`: a plan cannot see the clock, so every call in one statement sees one instant |
+| `CURRENT_TIMESTAMP`, `NOW()`, `CURRENT_DATE` | a hidden parameter the runtime binds at `bc_ctx_begin`: a plan cannot see the clock, so every call in one statement sees one instant. Built for `CURRENT_DATE`, `LOCALTIME` and `LOCALTIMESTAMP`, as a hidden parameter bound by the API at each run, not by the plan API (`frontend_design.md`, *The time*); the WITH TIME ZONE forms wait for those types (#491) |
 | `EXTRACT(field FROM ts)` for `YEAR`…`SECOND`, `DATE_TRUNC` to a day or coarser | integer arithmetic on the microsecond value and a civil-date helper |
 | `CAST` | *Casts*, above |
 
