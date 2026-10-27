@@ -172,8 +172,10 @@ TEST_CASE("binder: anything outside the scope is rejected with a message and pos
   CHECK(rejected(cat, "UPDATE t SET id = $1 WHERE id = $2").second == 13);
   CHECK(rejected(cat, "INSERT INTO t VALUES ($1, $2, $3, $4)").first == "INSERT has more expressions than target columns");
   CHECK(rejected(cat, "INSERT INTO t (id, qty) VALUES ($1)").first == "INSERT has 1 values for 2 columns");
-  CHECK(rejected(cat, "CREATE TABLE u (k CHAR(5) PRIMARY KEY)") ==
-        std::pair<std::string, std::int32_t>{"CHAR(n) is not supported; use VARCHAR(n)", 16});
+  // CHAR(n) is a type; a CHAR of no length, which PostgreSQL leaves unbounded, and of length 0 are not.
+  CHECK(rejected(cat, "CREATE TABLE u (k BPCHAR)") == std::pair<std::string, std::int32_t>{"CHAR takes one positive length", 16});
+  CHECK(rejected(cat, "CREATE TABLE u (k CHAR(0))").first == "length for type char must be at least 1");
+  CHECK(rejected(cat, "SELECT CAST('a' AS CHAR(5))").first.find("CHAR(n)") != std::string::npos);
   // No primary key: the catalog gives the table a row id.
   CHECK(std::get<CreateTableDdl>(std::get<Ddl>(bind_sql(cat, "CREATE TABLE u (k BIGINT)").stmt)).pk.empty());
   CHECK(rejected(cat, "SELECT id FROM t WHERE id = qty").first == "WHERE must compare a column with a parameter or a constant");
