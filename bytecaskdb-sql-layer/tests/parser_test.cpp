@@ -152,7 +152,7 @@ TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql]
   CHECK(rejected_at("SELECT id FROM t WHERE id ILIKE $1") >= 0);
   CHECK(rejected_at("SELEC id FROM t") == 0);                   // PostgreSQL's own syntax error
   CHECK(rejected_at("SELECT id FROM t; SELECT id FROM t") == -1);
-  CHECK(rejected_at("DROP VIEW v") == 0);
+  CHECK(rejected_at("DROP SEQUENCE s") == 0);
   CHECK(rejected_at("DROP TABLE t CASCADE") == 0);
   CHECK(rejected_at("ALTER TABLE t DROP COLUMN x") == 0);
   CHECK_THROWS_AS(parse("CREATE INDEX u ON t (name NULLS LAST)"), SqlError);
@@ -244,6 +244,30 @@ TEST_CASE("parser: the stage-1 DDL forms", "[sql][parser][catalog]") {
   CHECK(a.column.name == "c");
   CHECK(a.column.default_value->kind == Literal::Kind::Integer);  // past 32 bits: PostgreSQL's Float node
   CHECK(a.column.default_value->text == "10000000000");
+}
+
+TEST_CASE("parser: CREATE VIEW and DROP VIEW", "[sql][parser][view]") {
+  const std::string text = "CREATE VIEW v (x, y) AS SELECT a, b FROM t WHERE a > 1";
+  auto v = std::get<CreateView>(parse(text));
+  CHECK(v.view == "v");
+  CHECK(v.columns == std::vector<std::string>{"x", "y"});
+  CHECK(v.query.table == "t");
+  CHECK(v.query.targets.size() == 2);
+  CHECK(v.definition == text);  // what the catalog stores and parses again
+  CHECK(std::get<CreateView>(parse("CREATE VIEW v AS SELECT 1")).columns.empty());
+  CHECK(std::get<DropView>(parse("DROP VIEW v")).view == "v");
+  CHECK(std::get<DropView>(parse("DROP VIEW IF EXISTS v")).if_exists);
+  // Updatable views, and what only a stored definition could change, are not supported.
+  CHECK_THROWS_AS(parse("CREATE VIEW v AS SELECT a FROM t WITH CHECK OPTION"), SqlError);
+  CHECK_THROWS_AS(parse("CREATE VIEW v AS SELECT a FROM t WITH LOCAL CHECK OPTION"), SqlError);
+  CHECK_THROWS_AS(parse("CREATE VIEW v AS SELECT a FROM t WITH CASCADED CHECK OPTION"), SqlError);
+  CHECK_THROWS_AS(parse("CREATE OR REPLACE VIEW v AS SELECT a FROM t"), SqlError);
+  CHECK_THROWS_AS(parse("CREATE TEMPORARY VIEW v AS SELECT a FROM t"), SqlError);
+  CHECK_THROWS_AS(parse("CREATE VIEW v WITH (security_barrier) AS SELECT a FROM t"), SqlError);
+  CHECK_THROWS_AS(parse("CREATE VIEW s.v AS SELECT a FROM t"), SqlError);
+  CHECK_THROWS_AS(parse("CREATE VIEW v AS SELECT a FROM t UNION SELECT a FROM u"), SqlError);
+  CHECK_THROWS_AS(parse("DROP VIEW a, b"), SqlError);
+  CHECK_THROWS_AS(parse("DROP VIEW v CASCADE"), SqlError);
 }
 
 TEST_CASE("parser: SELECT … FOR UPDATE, and no other locking clause", "[sql][parser][txn]") {

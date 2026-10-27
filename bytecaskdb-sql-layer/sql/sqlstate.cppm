@@ -43,6 +43,8 @@ inline constexpr SqlState kIndeterminateDatatype{"42P18"};
 inline constexpr SqlState kWrongObjectType{"42809"};
 inline constexpr SqlState kInvalidColumnReference{"42P10"};
 inline constexpr SqlState kInvalidForeignKey{"42830"};
+inline constexpr SqlState kDependentObjectsStillExist{"2BP01"};
+inline constexpr SqlState kUndefinedParameter{"42P02"};
 // What an input function or a range check reports (sql/text.cppm,
 // range_sqlstate): text its type does not read, or a value outside it.
 inline constexpr SqlState kInvalidTextRepresentation{"22P02"};
@@ -58,7 +60,7 @@ inline constexpr SqlState kSubstringError{"22011"};
 [[nodiscard]] constexpr auto known_sqlstate(std::string_view code) noexcept -> std::optional<SqlState> {
   for (auto s : {kSyntaxError, kFeatureNotSupported, kNumericValueOutOfRange, kDivisionByZero, kNotNullViolation, kGroupingError,
                  kDatatypeMismatch, kUndefinedFunction, kUndefinedColumn, kUndefinedTable, kUndefinedObject,
-                 kDuplicateColumn, kDuplicateTable, kAmbiguousColumn, kDuplicateAlias, kIndeterminateDatatype, kWrongObjectType, kInvalidColumnReference, kInvalidForeignKey,
+                 kDuplicateColumn, kDuplicateTable, kAmbiguousColumn, kDuplicateAlias, kIndeterminateDatatype, kWrongObjectType, kInvalidColumnReference, kInvalidForeignKey, kDependentObjectsStillExist, kUndefinedParameter,
                  kInvalidTextRepresentation, kStringDataRightTruncation, kInvalidDatetimeFormat,
                  kDatetimeFieldOverflow, kCharacterNotInRepertoire, kInvalidParameterValue, kInvalidEscapeSequence, kSubstringError}) {
     if (s.view() == code) return s;

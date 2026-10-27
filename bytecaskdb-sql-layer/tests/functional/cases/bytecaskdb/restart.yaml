@@ -81,3 +81,29 @@
   teardown:
     - ROLLBACK
     - DROP TABLE dt
+
+- name: a view survives a restart, and a dropped view stays dropped
+  features: [layer:restart]
+  ordered: true
+  setup:
+    - CREATE TABLE dv (id INTEGER PRIMARY KEY, v INTEGER)
+    - CREATE VIEW dv_big (k, n) AS SELECT id, v FROM dv WHERE v > 10
+    - CREATE VIEW dv_gone AS SELECT id FROM dv
+  steps:
+    - sql: INSERT INTO dv VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO dv VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: DROP VIEW dv_gone
+    - restart: true
+    - sql: SELECT k, n FROM dv_big
+      expected: [[2, 20]]
+    - sql: SELECT id FROM dv_gone
+      error: "42P01"
+    - sql: DROP TABLE dv
+      error: "2BP01"
+  teardown:
+    - DROP VIEW dv_big
+    - DROP TABLE dv

@@ -283,6 +283,19 @@ struct Table {
   [[nodiscard]] auto row_id() const -> const Column*;
 };
 
+// A view: the text of the CREATE VIEW statement that defined it, parsed and
+// bound again at each use, the names of its columns as they were when it
+// was created, and the tables and views it names directly. A use whose
+// columns are not these is refused: PostgreSQL keeps the columns a `SELECT *`
+// view had, so a view the tables have outgrown must not give more.
+struct View {
+  std::uint32_t id{0};
+  std::string name;
+  std::string definition;
+  std::vector<std::uint32_t> depends_on;  // table and view ids, each once
+  std::vector<std::string> columns;
+};
+
 struct ColumnSpec {
   std::string name;
   SqlType sql;
@@ -338,7 +351,18 @@ struct AddColumnDdl {
   std::string table;
   ColumnSpec column;
 };
-using Ddl = std::variant<CreateTableDdl, CreateIndexDdl, DropTableDdl, DropIndexDdl, AddColumnDdl>;
+struct CreateViewDdl {
+  std::string name;
+  std::string definition;
+  std::vector<std::uint32_t> depends_on;
+  std::vector<std::string> columns;
+};
+struct DropViewDdl {
+  std::string name;
+  bool if_exists{false};
+};
+using Ddl = std::variant<CreateTableDdl, CreateIndexDdl, DropTableDdl, DropIndexDdl, AddColumnDdl, CreateViewDdl,
+                         DropViewDdl>;
 
 class Catalog {
 public:
@@ -360,6 +384,9 @@ public:
   [[nodiscard]] auto tables() const -> const std::map<std::uint32_t, Table>& { return tables_; }
   [[nodiscard]] auto table(std::string_view name) const -> const Table*;
   [[nodiscard]] auto table(std::uint32_t id) const -> const Table*;
+  [[nodiscard]] auto views() const -> const std::map<std::uint32_t, View>& { return views_; }
+  [[nodiscard]] auto view(std::string_view name) const -> const View*;
+  [[nodiscard]] auto view(std::uint32_t id) const -> const View*;
   // An index by name, with its table.
   [[nodiscard]] auto index(std::string_view name) const -> std::pair<const Table*, const Index*>;
   // A table or an index: both draw ids from one counter.
@@ -411,11 +438,13 @@ private:
   void put_table(Table t);
   void erase_table(std::uint32_t id);
   void rebuild_lookups();
+  [[nodiscard]] auto find_view_dependent(std::uint32_t id) const -> const View*;
 
   std::uint64_t next_id_{1};
   std::uint64_t version_{0};
   std::map<std::uint32_t, Table> tables_;
-  std::map<std::string, std::uint32_t, std::less<>> names_;  // table or index name -> id
+  std::map<std::uint32_t, View> views_;
+  std::map<std::string, std::uint32_t, std::less<>> names_;  // table, index or view name -> id
   std::map<std::uint32_t, KeyLayout> key_layouts_;
 };
 
@@ -514,6 +543,7 @@ private:
 
 // The catalog record's key and a table's row-key range: for tests and tools.
 [[nodiscard]] auto table_record_key(std::uint32_t table_id) -> Bytes;
+[[nodiscard]] auto view_record_key(std::uint32_t view_id) -> Bytes;
 [[nodiscard]] auto name_entry_key(std::string_view name) -> Bytes;
 // Every row key of a table starts with its row prefix: kNsRow, the table id.
 [[nodiscard]] auto row_prefix(std::uint32_t table_id) -> Bytes;
@@ -533,6 +563,8 @@ void for_each_row(const Snapshot& snap, std::uint32_t table_id, Visit&& visit) {
 // std::runtime_error if it does not parse or breaks an invariant.
 [[nodiscard]] auto serialize_table(const Table& t) -> Bytes;
 [[nodiscard]] auto parse_table(BytesView record) -> Table;
+[[nodiscard]] auto serialize_view(const View& v) -> Bytes;
+[[nodiscard]] auto parse_view(BytesView record) -> View;
 
 // Encodes the primary key of `t` from a row: kNsRow, the table id, the parts.
 [[nodiscard]] auto encode_pk_from_row(const Table& t, BytesView row, Bytes& out) -> bool;
@@ -551,10 +583,13 @@ namespace {
 constexpr std::byte kSubCounter{0x01};
 constexpr std::byte kSubTable{0x02};
 constexpr std::byte kSubName{0x03};
+constexpr std::byte kSubView{0x04};
 constexpr std::byte kCounterNextId{0x01};
 constexpr std::byte kCounterVersion{0x02};
 constexpr std::uint8_t kKindTable = 1;
 constexpr std::uint8_t kKindIndex = 2;
+constexpr std::uint8_t kKindView = 3;
+constexpr std::uint16_t kViewRecordFormat = 1;
 
 using DdlOp = Catalog::DdlOp;
 
@@ -1133,6 +1168,13 @@ auto table_record_key(std::uint32_t id) -> Bytes {
   return k;
 }
 
+auto view_record_key(std::uint32_t id) -> Bytes {
+  auto k = Bytes{std::byte{kNsCatalog}, kSubView};
+  auto idb = be_bytes(id, 4);
+  k.insert(k.end(), idb.begin(), idb.end());
+  return k;
+}
+
 auto name_entry_key(std::string_view name) -> Bytes {
   Bytes k{std::byte{kNsCatalog}, kSubName};
   for (auto c : name) k.push_back(static_cast<std::byte>(c));
@@ -1225,6 +1267,41 @@ auto serialize_table(const Table& t) -> Bytes {
   for (const auto& [id, l] : t.retired_layouts) write_layout(w, id, l);
   write_layout(w, t.layout_id, t.layout);
   return w.bytes();
+}
+
+// A view record: u16 format, u32 id, str name, blob definition,
+// u16 ndeps { u32 id }, u16 ncols { str name }. Append-only, as a table's.
+auto serialize_view(const View& v) -> Bytes {
+  RecordWriter w;
+  w.u16(kViewRecordFormat);
+  w.u32(v.id);
+  w.str(v.name);
+  w.blob(std::as_bytes(std::span{v.definition}));
+  w.u16(v.depends_on.size());
+  for (auto id : v.depends_on) w.u32(id);
+  w.u16(v.columns.size());
+  for (const auto& c : v.columns) w.str(c);
+  return w.bytes();
+}
+
+auto parse_view(BytesView in) -> View {
+  RecordReader r{in};
+  auto format = r.u16();
+  if (format != kViewRecordFormat) {
+    throw std::runtime_error("catalog view record format " + std::to_string(format) + " is not " +
+                             std::to_string(kViewRecordFormat) + ": the database was written by a later SQL-layer build");
+  }
+  View v;
+  v.id = r.u32();
+  v.name = r.str();
+  v.definition = as_string(r.blob());
+  auto ndeps = r.u16();
+  for (std::uint32_t i = 0; i < ndeps; ++i) v.depends_on.push_back(r.u32());
+  auto ncols = r.u16();
+  for (std::uint32_t i = 0; i < ncols; ++i) v.columns.push_back(r.str());
+  r.expect_end("record of view " + v.name);
+  if (v.definition.empty() || v.columns.empty()) corrupt("view " + v.name + " has no definition or no columns");
+  return v;
 }
 
 auto parse_table(BytesView in) -> Table {
@@ -1379,6 +1456,15 @@ auto Catalog::load(const Snapshot& snap) -> Catalog {
     }
     cat.tables_.emplace(t.id, std::move(t));
   }
+  auto views = Bytes{std::byte{kNsCatalog}, kSubView};
+  for (const auto& e : snap.iter_from({}, views)) {
+    if (!has_prefix(e.key, views)) break;
+    auto parsed = parse_view(e.value);
+    if (e.key.size() != views.size() + 4 || be_value(e.key.subspan(views.size())) != parsed.id) {
+      corrupt("record of view " + parsed.name + " is under another id's key");
+    }
+    cat.views_.emplace(parsed.id, std::move(parsed));
+  }
   cat.rebuild_lookups();
 
   // Every id below the counter and used once; every name entry names its
@@ -1395,6 +1481,13 @@ auto Catalog::load(const Snapshot& snap) -> Catalog {
     for (const auto& ix : t.indexes) use(ix.id);
     objects += 1 + t.indexes.size();
   }
+  for (const auto& [id, def] : cat.views_) {
+    use(id);
+    for (auto dep : def.depends_on) {
+      if (!cat.tables_.contains(dep) && !cat.views_.contains(dep)) corrupt("view " + def.name + " depends on a missing object");
+    }
+  }
+  objects += cat.views_.size();
   std::size_t entries = 0;
   auto names = Bytes{std::byte{kNsCatalog}, kSubName};
   for (const auto& e : snap.iter_from({}, names)) {
@@ -1403,12 +1496,12 @@ auto Catalog::load(const Snapshot& snap) -> Catalog {
     auto it = cat.names_.find(name);
     auto kind = e.value.empty() ? 0 : std::to_integer<std::uint8_t>(e.value[0]);
     if (it == cat.names_.end() || e.value.size() != 5 || be_value(e.value.subspan(1)) != it->second ||
-        kind != (cat.tables_.contains(it->second) ? kKindTable : kKindIndex)) {
+        kind != (cat.tables_.contains(it->second) ? kKindTable : cat.views_.contains(it->second) ? kKindView : kKindIndex)) {
       corrupt("name entry " + name + " does not match the records");
     }
     ++entries;
   }
-  if (entries != objects || cat.names_.size() != objects) corrupt("a table or index has no name entry");
+  if (entries != objects || cat.names_.size() != objects) corrupt("a table, index or view has no name entry");
   return cat;
 }
 
@@ -1417,6 +1510,7 @@ auto Catalog::clone() const -> Catalog {
   c.next_id_ = next_id_;
   c.version_ = version_;
   c.tables_ = tables_;
+  c.views_ = views_;
   c.rebuild_lookups();
   return c;
 }
@@ -1431,10 +1525,14 @@ void Catalog::erase_table(std::uint32_t id) { tables_.erase(id); }
 void Catalog::rebuild_lookups() {
   names_.clear();
   key_layouts_.clear();
+  auto name_taken = [&](const std::string& n) {
+    if (names_.contains(n)) corrupt("name " + n + " is used twice");
+  };
+  for (const auto& [id, v] : views_) {
+    name_taken(v.name);
+    names_[v.name] = id;
+  }
   for (const auto& [id, t] : tables_) {
-    auto name_taken = [&](const std::string& n) {
-      if (names_.contains(n)) corrupt("name " + n + " is used twice");
-    };
     name_taken(t.name);
     names_[t.name] = id;
     std::vector<KeyPart> pk_parts;
@@ -1463,6 +1561,23 @@ auto Catalog::table(std::string_view name) const -> const Table* {
 auto Catalog::table(std::uint32_t id) const -> const Table* {
   auto it = tables_.find(id);
   return it == tables_.end() ? nullptr : &it->second;
+}
+
+auto Catalog::view(std::string_view name) const -> const View* {
+  auto it = names_.find(name);
+  return it == names_.end() ? nullptr : view(it->second);
+}
+
+auto Catalog::view(std::uint32_t id) const -> const View* {
+  auto it = views_.find(id);
+  return it == views_.end() ? nullptr : &it->second;
+}
+
+auto Catalog::find_view_dependent(std::uint32_t id) const -> const View* {
+  for (const auto& [vid, v] : views_) {
+    if (std::ranges::find(v.depends_on, id) != v.depends_on.end()) return &v;
+  }
+  return nullptr;
 }
 
 auto Catalog::index(std::string_view name) const -> std::pair<const Table*, const Index*> {
@@ -1525,6 +1640,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   };
   auto find_table = [&](const std::string& name) -> const Table& {
     const auto* t = table(name);
+    if (t == nullptr && view(name) != nullptr) throw DdlRefused("\"" + name + "\" is not a table", kWrongObjectType);
     if (t == nullptr) throw DdlRefused("relation \"" + std::string{name} + "\" does not exist", kUndefinedTable);
     return *t;
   };
@@ -1670,11 +1786,17 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   if (const auto* dt = std::get_if<DropTableDdl>(&ddl)) {
     const auto* found = table(dt->name);
     if (found == nullptr) {
+      if (view(dt->name) != nullptr) throw DdlRefused("\"" + std::string{dt->name} + "\" is not a table", kWrongObjectType);
       if (index(dt->name).first != nullptr) throw DdlRefused("\"" + std::string{dt->name} + "\" is an index", kWrongObjectType);
       if (dt->if_exists) return nullptr;
       throw DdlRefused("table \"" + std::string{dt->name} + "\" does not exist", kUndefinedTable);
     }
     const auto& t = *found;
+    if (const auto* dependent = find_view_dependent(t.id)) {
+      throw DdlRefused("cannot drop table " + t.name + " because other objects depend on it: view " + dependent->name +
+                           " depends on table " + t.name,
+                       kDependentObjectsStillExist);
+    }
     put_op(ops, DdlOp::Kind::Del, table_record_key(t.id));
     put_op(ops, DdlOp::Kind::Del, name_entry_key(t.name));
     auto rows = row_prefix(t.id);
@@ -1691,7 +1813,9 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   if (const auto* di = std::get_if<DropIndexDdl>(&ddl)) {
     auto [owner, found] = index(di->name);
     if (found == nullptr) {
-      if (table(di->name) != nullptr) throw DdlRefused("\"" + std::string{di->name} + "\" is not an index", kWrongObjectType);
+      if (table(di->name) != nullptr || view(di->name) != nullptr) {
+        throw DdlRefused("\"" + std::string{di->name} + "\" is not an index", kWrongObjectType);
+      }
       if (di->if_exists) return nullptr;
       throw DdlRefused("index \"" + std::string{di->name} + "\" does not exist", kUndefinedObject);
     }
@@ -1704,6 +1828,44 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     auto p = index_prefix(id);
     put_op(ops, DdlOp::Kind::DelRange, p, key_successor(p));
     next->put_table(std::move(t));
+    return finish();
+  }
+
+  if (const auto* cv = std::get_if<CreateViewDdl>(&ddl)) {
+    name_free(cv->name);
+    View v{0, cv->name, cv->definition, cv->depends_on, cv->columns};
+    std::ranges::sort(v.depends_on);
+    v.depends_on.erase(std::unique(v.depends_on.begin(), v.depends_on.end()), v.depends_on.end());
+    for (auto dep : v.depends_on) {
+      if (table(dep) == nullptr && view(dep) == nullptr) {
+        throw DdlRefused("a relation view \"" + cv->name + "\" reads does not exist", kUndefinedTable);
+      }
+    }
+    v.id = reserve_ids(next->next_id_, 1);
+    put_op(ops, DdlOp::Kind::EnsureAbsent, name_entry_key(v.name));
+    put_op(ops, DdlOp::Kind::Put, name_entry_key(v.name), name_value(kKindView, v.id));
+    put_op(ops, DdlOp::Kind::Put, view_record_key(v.id), serialize_view(v));
+    next->views_.emplace(v.id, std::move(v));
+    return finish();
+  }
+
+  if (const auto* dv = std::get_if<DropViewDdl>(&ddl)) {
+    const auto* found = view(dv->name);
+    if (found == nullptr) {
+      if (table(dv->name) != nullptr || index(dv->name).first != nullptr) {
+        throw DdlRefused("\"" + dv->name + "\" is not a view", kWrongObjectType);
+      }
+      if (dv->if_exists) return nullptr;
+      throw DdlRefused("view \"" + dv->name + "\" does not exist", kUndefinedTable);
+    }
+    if (const auto* dependent = find_view_dependent(found->id)) {
+      throw DdlRefused("cannot drop view " + found->name + " because other objects depend on it: view " +
+                           dependent->name + " depends on view " + found->name,
+                       kDependentObjectsStillExist);
+    }
+    put_op(ops, DdlOp::Kind::Del, view_record_key(found->id));
+    put_op(ops, DdlOp::Kind::Del, name_entry_key(found->name));
+    next->views_.erase(found->id);
     return finish();
   }
 
