@@ -2471,8 +2471,8 @@ def test_every_range_message_maps_to_its_sqlstate(tmp_path):
     db = bytecask_sql.open(str(tmp_path))
     try:
         db.execute("CREATE TABLE r (k BIGINT PRIMARY KEY, s SMALLINT, i INTEGER, f REAL, d NUMERIC(4, 2), "
-                   "v VARCHAR(2), x TEXT, dt DATE, ts TIMESTAMP, tm TIME)")
-        cols = ["s", "i", "f", "d", "v", "x", "dt", "ts", "tm"]
+                   "v VARCHAR(2), x TEXT, dt DATE, ts TIMESTAMP, tm TIME, c CHAR(2))")
+        cols = ["s", "i", "f", "d", "v", "x", "dt", "ts", "tm", "c"]
         cases = [
             ("s", 2**15, "22003"),
             ("i", 2**31, "22003"),
@@ -2480,6 +2480,7 @@ def test_every_range_message_maps_to_its_sqlstate(tmp_path):
             ("f", 1e-50, "22003"),
             ("d", 10_000, "22003"),
             ("v", "abc", "22001"),
+            ("c", "abc", "22001"),
             ("v", b"\xc3", "22021"),
             ("x", b"\x00", "22021"),
             ("dt", -2_440_589, "22008"),
