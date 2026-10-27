@@ -136,7 +136,21 @@ TEST_CASE("parser: UNIQUE on a column or the table, in the order written", "[sql
   CHECK((t.unique[3].name.empty() && t.unique[3].columns == std::vector<std::string>{"b"}));
   CHECK(t.columns[0].unique == std::vector<std::string>{""});
   for (auto sql : {"CREATE TABLE u (a INT UNIQUE NULLS NOT DISTINCT)", "CREATE TABLE u (a INT, b INT, UNIQUE (a) INCLUDE (b))",
-                   "CREATE TABLE u (a INT UNIQUE DEFERRABLE)", "CREATE TABLE u (a INT, CHECK (a > 0))"}) {
+                   "CREATE TABLE u (a INT UNIQUE DEFERRABLE)"}) {
+    INFO(sql);
+    CHECK_THROWS_AS(parse(sql), SqlError);
+  }
+}
+
+TEST_CASE("parser: CHECK on a column or the table keeps the text between its parentheses", "[sql][parser]") {
+  auto t = std::get<CreateTable>(parse("CREATE TABLE \"c(\" (a INT CHECK (a > 0), b INT CONSTRAINT bc CHECK ((b <> 'x)(') AND b < 9), "
+                                       "CONSTRAINT ab CHECK (a < b), CHECK (a IS NOT NULL))"));
+  REQUIRE(t.checks.size() == 4);
+  CHECK((t.checks[0].name.empty() && t.checks[0].column == "a" && t.checks[0].text == "a > 0"));
+  CHECK((t.checks[1].name == "bc" && t.checks[1].column == "b" && t.checks[1].text == "(b <> 'x)(') AND b < 9"));
+  CHECK((t.checks[2].name == "ab" && t.checks[2].column.empty() && t.checks[2].text == "a < b"));
+  CHECK((t.checks[3].name.empty() && t.checks[3].column.empty() && t.checks[3].text == "a IS NOT NULL"));
+  for (auto sql : {"CREATE TABLE u (a INT CHECK (a > 0) NO INHERIT)", "CREATE TABLE u (a INT, CHECK (a > 0) NOT VALID)"}) {
     INFO(sql);
     CHECK_THROWS_AS(parse(sql), SqlError);
   }

@@ -2272,6 +2272,26 @@ private:
     return out;
   }
 
+  // Ends the row `r` and writes it with `call` + the row + ");". With
+  // CHECK constraints the row is first tested: each is evaluated over the
+  // row as written, and one that is false (not NULL) raises 23514 before
+  // anything is written, so a refused row leaves no index entry.
+  void write_checked(std::uint32_t table, const std::vector<Expr>& checks, const std::string& call) {
+    if (checks.empty()) {
+      w_.line(call + "bc_row_end(cx, r));");
+      return;
+    }
+    w_.line("bc_view nr = bc_row_end(cx, r);");
+    auto outer = std::exchange(rows_, std::vector<Binding>{{table, "nr"}});
+    for (const auto& c : checks) {
+      auto v = eval(c);
+      auto unknown = v.null.empty() ? std::string{} : "!(" + v.null + ") && ";
+      w_.line("if (" + unknown + "!(" + v.value + ")) bc_raise(cx, BC_C_CHECK, " + std::to_string(table) + ");");
+    }
+    rows_ = std::move(outer);
+    w_.line(call + "nr);");
+  }
+
   void produce(const physical::Insert& s, const Consume&) {
     // bc_row_begin sets every column to its default; a column not given keeps
     // it. The runtime checks the keys and writes the index entries.
@@ -2279,7 +2299,7 @@ private:
     for (const auto& [col, e] : s.values) {
       w_.line("bc_row_set_param(cx, r, " + w_.col(col) + ", " + std::to_string(e.param) + ");");
     }
-    w_.line("bc_insert(cx, " + w_.tbl(s.table) + ", bc_row_end(cx, r));");
+    write_checked(s.table, s.checks, "bc_insert(cx, " + w_.tbl(s.table) + ", ");
     w_.line("bc_emit_count(cx, 1);");
   }
 
@@ -2309,7 +2329,7 @@ private:
       w_.line("bc_row r = bc_row_from(cx, " + w_.tbl(s.table) + ", old);");
       for (const auto& [col, e] : s.set) set(col, e);
       // The runtime moves the index entries whose keys changed.
-      w_.line("bc_update(cx, " + w_.tbl(s.table) + ", old, bc_row_end(cx, r));");
+      write_checked(s.table, s.checks, "bc_update(cx, " + w_.tbl(s.table) + ", old, ");
     });
   }
 

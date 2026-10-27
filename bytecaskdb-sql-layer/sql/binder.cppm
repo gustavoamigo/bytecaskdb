@@ -2199,6 +2199,65 @@ public:
     return logical::predicate_of(kind, std::move(args));
   }
 
+  // The condition of a CHECK constraint, from its text, over the columns of
+  // `t`: a BOOLEAN value of columns and constants, as a select list gives
+  // one. What a write cannot evaluate over the row it has built (a
+  // parameter, a subquery, the clock, an aggregate) is refused.
+  auto check(const Table& t, const std::string& text, std::int32_t pos) -> logical::Expr {
+    auto stmt = ast::parse("SELECT (" + text + "\n)");
+    const auto* q = std::get_if<ast::Select>(&stmt);
+    if (q == nullptr || q->targets.size() != 1 || !q->from.empty() || !q->where.empty() || q->set) {
+      throw SqlError{"syntax error in the CHECK constraint", pos};
+    }
+    refuse_in_check(q->targets[0]);
+    const Table* rels[] = {&t};
+    auto e = value(q->targets[0], [&](const ast::Expr& c) { return std::pair{&t, column(rels, c).second}; });
+    if (e.type.kind != SqlKind::Boolean) {
+      throw SqlError{"argument of CHECK must be type boolean, not type " + pg_type_name(e.type), pos, kDatatypeMismatch};
+    }
+    return e;
+  }
+
+  static void refuse_in_check(const ast::Expr& e) {
+    using K = ast::Expr::Kind;
+    switch (e.kind) {
+      case K::Param: throw SqlError{"there is no parameter $" + std::to_string(e.param + 1) + " in a CHECK constraint", e.pos, kUndefinedParameter};
+      case K::Subquery: not_yet("a subquery in a CHECK constraint", e.pos);
+      case K::Clock: not_yet("CURRENT_DATE, LOCALTIME and LOCALTIMESTAMP in a CHECK constraint", e.pos);
+      case K::Aggregate: throw SqlError{"aggregate functions are not allowed in check constraints", e.pos, kGroupingError};
+      case K::Star: throw SqlError{"syntax error at or near \"*\"", e.pos};
+      case K::Column:
+      case K::Const:
+      case K::Literal:
+      case K::Add:
+      case K::Sub:
+      case K::Mul:
+      case K::Div:
+      case K::Plus:
+      case K::Neg:
+      case K::Compare:
+      case K::IsNull:
+      case K::Not:
+      case K::And:
+      case K::Or:
+      case K::Cast:
+      case K::Case:
+      case K::Coalesce:
+      case K::NullIf:
+      case K::Func: break;
+    }
+    if (e.lhs) refuse_in_check(*e.lhs);
+    if (e.rhs) refuse_in_check(*e.rhs);
+    for (const auto& a : e.args) refuse_in_check(a);
+  }
+
+  // The table's CHECK constraints, bound for a write to it.
+  auto checks(const Table& t) -> std::vector<logical::Expr> {
+    std::vector<logical::Expr> out;
+    for (const auto& c : t.checks) out.push_back(check(t, c.expr, -1));
+    return out;
+  }
+
   auto table(const std::string& name, std::int32_t pos) const -> const Table* {
     const auto* t = cat_.table(name);
     if (t == nullptr && cat_.view(name) != nullptr) {
@@ -3984,12 +4043,26 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
       [&](const auto& s) -> std::pair<std::variant<Ddl, logical::NodePtr>, std::int32_t> {
         using T = std::decay_t<decltype(s)>;
         if constexpr (std::is_same_v<T, ast::CreateTable>) {
-          CreateTableDdl out{s.table, {}, s.pk, {}};
+          CreateTableDdl out{s.table, {}, s.pk, {}, {}};
           for (const auto& c : s.columns) {
             out.columns.push_back(column_spec(c));
             if (c.primary_key) out.pk.push_back(c.name);
           }
           for (const auto& u : s.unique) out.unique.push_back({u.name, u.columns});
+          if (!s.checks.empty()) {
+            // Bound over the table as it will be, to refuse what a write could not
+            // evaluate; the text is what the catalog keeps.
+            Table scratch;
+            scratch.name = s.table;
+            for (const auto& c : out.columns) {
+              scratch.columns.push_back({scratch.next_col_id++, c.name, c.sql, phys_type(c.sql), c.nullable, c.default_value});
+            }
+            Binder checker{cat, 0};
+            for (const auto& c : s.checks) {
+              (void)checker.check(scratch, c.text, c.pos);
+              out.checks.push_back({c.name, c.text, c.column});
+            }
+          }
           for (const auto& f : s.foreign_keys) {
             // A table may reference itself, by the keys it is created with.
             check_foreign_key(out, f, f.table == s.table ? referenced_keys(out) : referenced_keys(*b.table(f.table, f.pos)));
@@ -4016,6 +4089,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           if (s.column.primary_key) throw SqlError{"ADD COLUMN cannot add a primary key column", s.column.pos};
           if (!s.column.unique.empty()) not_yet("ADD COLUMN … UNIQUE", s.column.pos);
           if (!s.column.references.empty()) not_yet("ADD COLUMN … REFERENCES", s.column.pos);
+          if (!s.column.checks.empty()) not_yet("ADD COLUMN … CHECK", s.column.pos);
           auto spec = column_spec(s.column);
           if (!spec.nullable && std::holds_alternative<std::monostate>(spec.default_value)) {
             throw SqlError{"column \"" + s.column.name + "\" is NOT NULL and needs a DEFAULT for the existing rows",
@@ -4056,6 +4130,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           // A column left out takes its default. One that is NOT NULL with no
           // default, a primary key column among them, is refused when the
           // row is built (BC_C_NOT_NULL), as a NULL given for it is.
+          out.checks = b.checks(*t);
           return {logical::node(std::move(out)), s.pos};
         } else if constexpr (std::is_same_v<T, ast::Select>) {
           return {b.select(s), s.pos};
@@ -4079,7 +4154,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           }
           b.set_scope({t});
           auto rows = Binder::rows(*t, b.where(*t, s.where));
-          return {logical::node(logical::Update{std::move(rows), t, std::move(set)}), s.pos};
+          return {logical::node(logical::Update{std::move(rows), t, std::move(set), b.checks(*t)}), s.pos};
         } else {
           const auto* t = b.table(s.table, s.pos);
           b.set_scope({t});

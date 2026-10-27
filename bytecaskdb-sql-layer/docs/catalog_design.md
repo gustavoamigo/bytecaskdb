@@ -23,6 +23,7 @@ share this one only if it adopted the layer's formats (#488).
 | columns | Each: permanent `id`, `name`, SQL type (kind, `VARCHAR` length, `DECIMAL` precision and scale), nullability, default, and whether it is hidden: the row id of a table declared without a primary key (*Tables without a primary key*). The physical type follows from the SQL type (`types_design.md`, *Types*). |
 | primary key | Column ids, in key order. Always ascending; a primary key column is never null. For a table declared without one, its hidden row id. |
 | indexes | Each: permanent `id`, `name`, unique or not, parts as (column id, `ASC`/`DESC`). |
+| checks | Each `CHECK` constraint: its name and the text of its expression (*CHECK constraints*). Absent for most tables. |
 | layouts | Each layout generation: its object id, its generation number, `bitmap_bytes`, and its offset table (column id → byte offset or variable slot). The last is current. Each table has one until `REBUILD` exists, which appends one (#503). |
 
 A default is a constant of the column's physical type, or none (null).
@@ -38,7 +39,7 @@ Little-endian, every list counted, every string a `u16` length and its
 bytes:
 
 ```
-u16 format                   ; kRecordFormat, 4
+u16 format                   ; 4, or 5 where the table has a CHECK
 u32 id, str name, u32 version, u32 next_col_id
 u16 ncols   { u32 len, u32 id, str name, u8 kind, u32 length, u8 precision, u8 scale,
               u8 nullable, u8 default_tag, default, u8 hidden }
@@ -46,6 +47,7 @@ u16 npk     { u32 col_id }
 u16 nidx    { u32 len, u32 id, str name, u8 unique, u16 nparts { u32 col_id, u8 desc } }
 u16 nlayout { u32 len, u32 layout_id, u16 generation, u16 bitmap_bytes, u16 var_table, u16 nvar,
               u16 nslots { u32 col_id, u32 pos } }
+u16 nchecks { u32 len, str name, blob expression }   ; format 5 only, and never empty
 ```
 
 A layout records where its fixed region ends (`var_table`) and its slot
@@ -65,8 +67,13 @@ able to ignore safely, and an older one: format 1 holds the earliest build's row
 positions, format 2 (#490's) no SQL types. Both predate any database worth
 reading. Format 4 added `hidden` at the end of a column entry; a format-3
 record reads with no hidden column, as every table then had a declared
-primary key. The record format also names the row format its positions are
-for; formats 2, 3 and 4 share the 12-byte-header row format.
+primary key. Format 5 added the `CHECK` list at the end of the record. A table
+without a `CHECK` is still written as format 4, so a database is closed to
+an earlier build only once it holds one: that build refuses the record
+("written by a later SQL-layer build") and so refuses to open. Nothing
+else about a database changes. The record format also names the row format
+its positions are for; formats 2, 3, 4 and 5 share the 12-byte-header row
+format.
 
 **A record that does not parse is refused at load**, with the table's id:
 a truncated field, a type kind or tag outside its set, a physical type that
@@ -271,6 +278,43 @@ same catalog; the engine's directory lock keeps a second process out. A
 second `LiveCatalog` on the same open database (only tests open one)
 catches up at its next pin, so its DDL never builds on a stale version and
 never hands out an id twice.
+
+## CHECK constraints
+
+A `CHECK` constraint, on a column or on the table, is kept in the table's
+record, in the `CREATE TABLE`'s batch, so the table never exists with a
+constraint missing. A table has no object id for it, and no name entry:
+constraint names are the table's own (PostgreSQL's are too), so they are
+unique within a table and never collide with a relation.
+
+- **The text is the definition,** as a view's is (*Views*): the expression
+  as written between the parentheses. A write to the table binds it again,
+  so the binder and `Gen::eval` are the only evaluator and there is no
+  second form to version. A table's constraints are bound at each `INSERT`
+  and `UPDATE` of it, and the plan holds the result.
+- **Names** are as written, or as PostgreSQL's `ChooseConstraintName`:
+  `table_column_check` for a constraint written on a column,
+  `table_check` for the table's, then `1`, `2`… where the table has the
+  name. Named ones are taken first. A name used twice is 42710.
+- **Checked at creation.** The binder binds each expression over the table
+  as it will be, so a column the table lacks (42703) or a result that is
+  not `BOOLEAN` (42804) is refused with the table. What a write cannot
+  evaluate over the row it has built is refused (0A000 or its SQLSTATE): a
+  parameter, a subquery, an aggregate, `CURRENT_DATE`, `LOCALTIME` and
+  `LOCALTIMESTAMP`, and any expression the select list cannot evaluate.
+- **Evaluated on the row as written.** The generated plan builds the row,
+  evaluates each constraint over it, and raises `BC_C_CHECK` (23514) where
+  the result is false, before `bc_insert` or `bc_update`: nothing is
+  written, no index entry included. True and NULL pass. The row has its
+  defaults, so a constraint sees the value an omitted column gets, and an
+  `UPDATE` tests every constraint of the table, as PostgreSQL does.
+  Its cost is one evaluation of the expression per written row, in the plan's
+  C: column reads and comparisons, no allocation.
+- **The error** carries the table's id as `bc_raise`'s object. Its message
+  says "check constraint N violated", where PostgreSQL names the relation
+  and the constraint; the SQLSTATE is the same.
+- **Not built:** `ALTER TABLE ADD CONSTRAINT`, `ADD COLUMN … CHECK`,
+  `NO INHERIT`, `NOT VALID` and `DEFERRABLE`.
 
 ## Views
 

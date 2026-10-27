@@ -257,8 +257,6 @@
 
 - name: a CHECK constraint
   features: [E141-06]
-  # column constraint not supported
-  unimplemented: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v > 0))
   steps:
@@ -313,3 +311,77 @@
   teardown:
     - DROP VIEW vw
     - DROP TABLE t
+
+- name: a column CHECK refuses a row that makes it false and accepts one that makes it NULL
+  features: [E141-06]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER CHECK (a > 0))
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 5]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, 0]
+      error: "23514"
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [3, null]
+      rowcount: 1
+    - sql: INSERT INTO t (id) VALUES ($1)
+      params: [4]
+      rowcount: 1
+    - sql: SELECT id FROM t ORDER BY id
+      expected: [[1], [3], [4]]
+      ordered: true
+  teardown:
+    - DROP TABLE t
+
+- name: a table CHECK over two columns is tested on INSERT and on UPDATE
+  features: [E141-06]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, lo INTEGER, hi INTEGER, CONSTRAINT ordered CHECK (lo <= hi))
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2, $3)
+      params: [1, 1, 2]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2, $3)
+      params: [2, 3, 2]
+      error: "23514"
+    - sql: UPDATE t SET lo = $1 WHERE id = $2
+      params: [5, 1]
+      error: "23514"
+    - sql: UPDATE t SET hi = $1 WHERE id = $2
+      params: [9, 1]
+      rowcount: 1
+    - sql: SELECT lo, hi FROM t WHERE id = $1
+      params: [1]
+      expected: [[1, 9]]
+  teardown:
+    - DROP TABLE t
+
+- name: a CHECK is tested on the row with its DEFAULTs filled in
+  features: [E141-06, E141-07]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER DEFAULT 5 CHECK (b < 3 OR a IS NULL))
+  steps:
+    - sql: INSERT INTO t (id) VALUES ($1)
+      params: [1]
+      rowcount: 1
+    - sql: INSERT INTO t (id, a) VALUES ($1, $2)
+      params: [2, 1]
+      error: "23514"
+  teardown:
+    - DROP TABLE t
+
+- name: a CHECK with a column that is not the table's, or that is not boolean, is refused
+  features: [E141-06]
+  steps:
+    - sql: CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER CHECK (z > 0))
+      error: "42703"
+    - sql: CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER CHECK (a + 1))
+      error: "42804"
+
+- name: two constraints of one name on a table are refused
+  features: [E141-06]
+  steps:
+    - sql: CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, CONSTRAINT c CHECK (a > 0), CONSTRAINT c CHECK (a < 9))
+      error: "42710"

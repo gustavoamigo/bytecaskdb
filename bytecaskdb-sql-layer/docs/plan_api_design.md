@@ -1034,7 +1034,7 @@ void bc_raise(bc_ctx *, uint32_t constraint, uint32_t object_id);   /* a user er
 | `bc_guard_row` | `bc_guard_unchanged` on the primary key of `row`, a row of `table`, encoded into the guard without the arena: what `SELECT … FOR UPDATE` emits for each row it returns, however many. | `ensure_unchanged` |
 | `bc_guard_range` | The commit fails if any key in `[lo, hi)` changed. Serializable plans emit one per range scanned; it covers phantoms. Empty bounds are the start and end of `table_or_index`, as for `bc_scan_open`; `lo >= hi` guards nothing. | `ensure_range_unchanged` |
 | `bc_guard_present`, `bc_guard_absent` | Existence preconditions on a key the plan reads and does not write. | `ensure_present`, `ensure_absent` |
-| `bc_raise` | Sets `BC_E_CONSTRAINT` with a `bc_constraint` kind and the id of the constraint, column or index concerned, as the compiler emitted them; an unknown kind or an id of 2^24 or more is `BC_E_HANDLE`. The plan unwinds; the runtime reports it and does not retry. A `CHECK` the compiler evaluates is raised this way. | none: nothing reaches the engine |
+| `bc_raise` | Sets `BC_E_CONSTRAINT` with a `bc_constraint` kind and the id of the constraint, column or index concerned, as the compiler emitted them; an unknown kind or an id of 2^24 or more is `BC_E_HANDLE`. The plan unwinds; the runtime reports it and does not retry. A `CHECK` the compiler evaluates is raised this way, with the table's id, after `bc_row_end` and before `bc_insert` or `bc_update`. | none: nothing reaches the engine |
 
 A plan under snapshot isolation emits no guards. The two plans for the same
 SQL differ only in guard calls, which is how isolation reads in the text.
