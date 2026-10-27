@@ -1109,8 +1109,9 @@ TEST_CASE("binder: each refusal carries PostgreSQL's SQLSTATE", "[sql][binder][s
   CHECK(state("UPDATE u SET s = $1, qty = $1 WHERE k = $2") == "42601");
   CHECK(state("UPDATE u SET s = $1 WHERE qty = $1") == "42601");  // PostgreSQL types the WHERE's $1 first
   CHECK(state("UPDATE u SET qty = qty + $1 WHERE ts = $1") == "42601");
-  CHECK(state("SELECT sum(dbl) FROM u WHERE k = $1") == "42601");
-  CHECK(state("SELECT min(dbl) FROM u WHERE k = $1") == "42601");
+  CHECK(state("SELECT sum(dbl) FROM u WHERE k = $1") == "bound");
+  CHECK(state("SELECT min(DISTINCT dbl), avg(ALL dbl) FROM u WHERE k = $1") == "bound");
+  CHECK(state("SELECT sum(DISTINCT s) FROM u WHERE k = $1") == "42883");
   CHECK(state("SELECT min(s) FROM u WHERE k = $1") == "42601");
   CHECK(state("SELECT sum(tm) FROM u WHERE k = $1") == "42601");  // an interval sum there
   CHECK(state("SELEC 1") == "42601");
@@ -1280,7 +1281,19 @@ TEST_CASE("binder: GROUP BY, HAVING and the aggregates, as PostgreSQL binds them
   // such aggregate, 42601 where the layer does not take it yet.
   CHECK(rejected(cat, "SELECT max(s) FROM g").first == "MAX of a text column is not supported");
   CHECK(rejected(cat, "SELECT avg(day) FROM g").first == "AVG of a date column is not supported");
-  CHECK(rejected(cat, "SELECT avg(f) FROM g").first == "AVG of a double precision column is not supported");
+  {
+    // SUM, AVG, MIN and MAX of a DOUBLE are a DOUBLE; DISTINCT stays on SUM and AVG, and
+    // is no change to MIN and MAX.
+    const auto& agg = grouped("SELECT sum(f), avg(DISTINCT f), min(DISTINCT f), max(ALL f) FROM g");
+    REQUIRE(agg.aggs.size() == 4);
+    for (const auto& o : agg.aggs) CHECK(o.expr.type.kind == SqlKind::Double);
+    CHECK_FALSE(agg.aggs[0].expr.distinct);
+    CHECK(agg.aggs[1].expr.distinct);
+    CHECK_FALSE(agg.aggs[2].expr.distinct);
+    CHECK_FALSE(agg.aggs[3].expr.distinct);
+  }
+  CHECK(rejected(cat, "SELECT a FROM g GROUP BY a HAVING sum(f) > $1").first ==
+        "HAVING on an aggregate of a double precision column is not supported yet");
   CHECK(rejected(cat, "SELECT a FROM g GROUP BY a HAVING avg(a) > $1").first == "HAVING on AVG is not supported yet");
   CHECK(rejected(cat, "SELECT a FROM g GROUP BY a + 1").first == "GROUP BY takes columns");
 }

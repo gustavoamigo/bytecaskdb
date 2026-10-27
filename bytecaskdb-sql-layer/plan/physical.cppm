@@ -273,9 +273,9 @@ struct Emit {
   std::vector<EmitTarget> targets;
 };
 
-// One aggregate row, of COUNT(*), or COUNT, COUNT(DISTINCT) or SUM of its
-// argument's non-NULL values, each held as an int64_t. Any other aggregate
-// is a GroupAggregate's.
+// One aggregate row, of COUNT(*), or COUNT, COUNT(DISTINCT) or SUM of an
+// integer argument's non-NULL values, each held as an int64_t. Any other
+// aggregate is a GroupAggregate's.
 struct Aggregate {
   NodePtr input;
   Expr agg;
@@ -291,8 +291,8 @@ struct Aggregate {
 // input's rows come in groups, each group's rows together, so each group is
 // kept in locals and given when the next one starts, with no structure.
 // With no keys it is one group, given even over no rows, and is streamed. A
-// COUNT(DISTINCT) holds each group's distinct values either way; streamed,
-// only the group in hand's. `dependent` are columns the keys determine,
+// An aggregate of DISTINCT values holds each group's distinct values either
+// way; streamed, only the group in hand's. `dependent` are columns the keys determine,
 // equal in every row of a group: each group gives its first row's, and
 // they never key it.
 struct GroupAggregate {
@@ -317,14 +317,16 @@ struct GroupAggregate {
 // folded once; any other is read from a row of its table, the group's
 // first, held in a hash table under the group's key, one per such table
 // (`held`); each aggregate takes
-// a slot, AVG two (its sum, then its count), COUNT(*) slot 0. A
-// COUNT(DISTINCT) also keeps a structure of its own, one per argument.
+// a slot, AVG two (its sum, then its count), COUNT(*) slot 0; of a DOUBLE
+// the sum, minimum and maximum are in the slot's double. An aggregate of
+// DISTINCT values also keeps a structure of its own, one per argument,
+// that the aggregates over that argument share.
 struct GroupLayout {
   std::uint32_t slots{1};
   std::vector<std::optional<std::uint32_t>> key_slot;  // per column: its slot, or nullopt for one read from a held row
   std::vector<std::uint32_t> agg_slot;                 // per aggregate
   std::vector<std::uint32_t> held;                     // the tables whose first row each group holds
-  std::vector<ColumnRef> distinct;                     // each COUNT(DISTINCT)'s argument, once
+  std::vector<ColumnRef> distinct;                     // each DISTINCT aggregate's argument, once
 };
 
 [[nodiscard]] auto group_layout(const std::vector<ColumnRef>& columns, const std::vector<Expr>& aggs) -> GroupLayout {
@@ -1226,6 +1228,9 @@ private:
             }
             if ((op.agg.fn != Expr::Fn::Count || op.agg.distinct) && op.agg.args.empty()) {
               broken("SUM or COUNT(DISTINCT) with no argument");
+            }
+            if (op.agg.fn == Expr::Fn::Sum && (op.agg.distinct || op.agg.args[0].col.type == PhysType::F64)) {
+              broken("an aggregate row of a SUM of DISTINCT values or of a DOUBLE");
             }
             reads(op.agg);
             node(*op.input, &n);
