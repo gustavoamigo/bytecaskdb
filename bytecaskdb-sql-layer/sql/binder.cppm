@@ -414,7 +414,8 @@ auto is_constant(const ast::Expr& e) -> bool {
     case K::Compare: return is_constant(*e.lhs) && is_constant(*e.rhs);
     case K::Cast: return is_constant(*e.rhs);
     case K::NullIf: return is_constant(*e.lhs) && is_constant(*e.rhs);
-    case K::Coalesce: return std::ranges::all_of(e.args, is_constant);
+    case K::Coalesce:
+    case K::Func: return std::ranges::all_of(e.args, is_constant);
     case K::Case:
       return (!e.lhs || is_constant(*e.lhs)) && (!e.rhs || is_constant(*e.rhs)) && std::ranges::all_of(e.args, is_constant);
     case K::Column:
@@ -834,6 +835,243 @@ auto fold_nullif(const ast::Expr& e) -> Constant {
   return a;
 }
 
+// String functions and ||. Text is UTF-8 and counted in characters, as
+// PostgreSQL's is; UPPER and LOWER fold ASCII only, the layer's one
+// collation being COLLATE "C".
+
+auto utf8_width(std::string_view s, std::size_t i) -> std::size_t {
+  auto b = static_cast<unsigned char>(s[i]);
+  auto w = b < 0xC0 ? 1U : b < 0xE0 ? 2U : b < 0xF0 ? 3U : 4U;  // a stray continuation byte is a character of its own
+  return std::min<std::size_t>(w, s.size() - i);
+}
+
+auto char_count(std::string_view s) -> std::int64_t {
+  std::int64_t n = 0;
+  for (std::size_t i = 0; i < s.size(); i += utf8_width(s, i)) ++n;
+  return n;
+}
+
+// The byte offset of the character `n` characters in; s.size() past the end.
+auto char_offset(std::string_view s, std::int64_t n) -> std::size_t {
+  std::size_t i = 0;
+  while (n-- > 0 && i < s.size()) i += utf8_width(s, i);
+  return i;
+}
+
+[[noreturn]] void substring_error(std::int32_t pos) {
+  throw SqlError{"negative substring length not allowed", pos, kSubstringError};
+}
+
+// PostgreSQL's text_substring: `count` characters from the 1-based `start`
+// (a start before the first character takes from it, the characters before
+// it counting toward `count`), to the end where no count is given.
+auto substring_of(std::string_view s, std::int32_t start, std::optional<std::int32_t> count, std::int32_t pos) -> std::string {
+  auto first = std::max<std::int64_t>(start, 1);
+  std::optional<std::int64_t> chars;
+  if (count) {
+    if (*count < 0) substring_error(pos);
+    auto end = static_cast<std::int64_t>(start) + *count;
+    if (end <= std::numeric_limits<std::int32_t>::max()) {  // past that, to the end
+      if (end < 1) return {};
+      chars = end - first;
+    }
+  }
+  auto from = char_offset(s, first - 1);
+  auto to = chars ? from + char_offset(s.substr(from), *chars) : s.size();
+  return std::string{s.substr(from, to - from)};
+}
+
+auto overlay_of(std::string_view s, std::string_view replacement, std::int32_t start, std::optional<std::int32_t> count,
+                std::int32_t pos) -> std::string {
+  auto replaced = static_cast<std::int64_t>(count ? *count : static_cast<std::int32_t>(char_count(replacement)));
+  if (start <= 0) substring_error(pos);
+  auto resume = start + replaced;
+  if (!std::in_range<std::int32_t>(resume)) throw SqlError{"integer out of range", pos, kNumericValueOutOfRange};
+  return substring_of(s, 1, start - 1, pos) + std::string{replacement} +
+         substring_of(s, static_cast<std::int32_t>(resume), std::nullopt, pos);
+}
+
+// 1-based character position of the first `needle` in `s`, 0 if none; an
+// empty needle is found at 1.
+auto position_of(std::string_view needle, std::string_view s) -> std::int64_t {
+  auto at = s.find(needle);
+  return at == std::string_view::npos ? 0 : char_count(s.substr(0, at)) + 1;
+}
+
+// s without the characters of `set` from the front, the back, or both.
+auto trimmed(std::string_view s, std::string_view set, bool front, bool back) -> std::string {
+  auto in_set = [&](std::string_view ch) {
+    for (std::size_t i = 0; i < set.size(); i += utf8_width(set, i)) {
+      if (set.substr(i, utf8_width(set, i)) == ch) return true;
+    }
+    return false;
+  };
+  std::size_t b = 0;
+  std::size_t e = s.size();
+  while (front && b < e && in_set(s.substr(b, utf8_width(s, b)))) b += utf8_width(s, b);
+  while (back && e > b) {
+    auto i = e - 1;
+    while (i > b && (static_cast<unsigned char>(s[i]) & 0xC0) == 0x80) --i;
+    if (!in_set(s.substr(i, e - i))) break;
+    e = i;
+  }
+  return std::string{s.substr(b, e - b)};
+}
+
+auto ascii_case(std::string s, bool upper) -> std::string {
+  for (auto& ch : s) {
+    if (upper && ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 'a' + 'A');
+    if (!upper && ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+  }
+  return s;
+}
+
+[[noreturn]] void no_function(const std::string& name, const std::vector<Constant>& args, std::int32_t pos) {
+  std::string list;
+  for (const auto& a : args) list += (list.empty() ? "" : ", ") + (a.unknown ? std::string{"unknown"} : pg_type_name(a.type));
+  throw SqlError{"function " + name + "(" + list + ") does not exist", pos, kUndefinedFunction};
+}
+
+enum class Slot { Text, Int4 };
+
+// The arguments as the function's parameters, as PostgreSQL's resolution
+// reads them: an unknown literal is of the parameter's type, a string or
+// smallint/integer is taken as it is, anything else matches no function
+// (42883). `bytea_overload`: the function also takes bytea, not taken yet.
+auto bind_args(const std::string& name, std::vector<Constant> args, const std::vector<Slot>& slots, bool bytea_overload,
+               std::int32_t pos) -> std::vector<Constant> {
+  const auto original = args;
+  auto slot = slots.begin();
+  for (const auto& a : original) {
+    auto fits = a.unknown || (*slot == Slot::Text ? is_string(a.type) : a.type.kind == SqlKind::SmallInt || a.type.kind == SqlKind::Integer);
+    if (!fits && *slot == Slot::Text && a.type.kind == SqlKind::Bytea && bytea_overload) not_yet(name + " of bytea", pos);
+    if (!fits) no_function(name, original, pos);
+    ++slot;
+  }
+  slot = slots.begin();
+  for (auto& a : args) {
+    if (a.unknown) {
+      auto t = SqlType{*slot == Slot::Text ? SqlKind::Text : SqlKind::Integer};
+      if (!is_null(a) && *slot == Slot::Int4) a.value = read_as(a, t, false);
+      a.type = t;
+      a.unknown = false;
+    }
+    ++slot;
+  }
+  return args;
+}
+
+// A value as the text PostgreSQL's cast to text makes of it.
+auto text_of(const Constant& c) -> std::string {
+  if (c.unknown) return c.text;
+  if (c.type.kind == SqlKind::Boolean) return std::get<bool>(c.value) ? "true" : "false";
+  return to_text(c.value, c.type);
+}
+
+auto text_constant(std::string s, std::int32_t pos) -> Constant {
+  return {bytes_of(s), SqlType{SqlKind::Text}, false, {}, pos};
+}
+
+auto null_constant(SqlKind kind, std::int32_t pos) -> Constant { return {std::monostate{}, SqlType{kind}, false, {}, pos}; }
+
+auto int_of(const Constant& c) -> std::int32_t { return static_cast<std::int32_t>(std::get<std::int64_t>(c.value)); }
+
+// a || b: text with text, or with any other type through its text (so 'a' ||
+// 1 is 'a1'); bytea with bytea. Two values neither of which is a string
+// match no operator.
+auto fold_concat(const Constant& a, const Constant& b, std::int32_t pos) -> Constant {
+  auto is_bytea = [](const Constant& c) { return !c.unknown && c.type.kind == SqlKind::Bytea; };
+  if (is_bytea(a) && is_bytea(b)) {
+    if (is_null(a) || is_null(b)) return null_constant(SqlKind::Bytea, pos);
+    auto out = std::get<Bytes>(a.value);
+    const auto& tail = std::get<Bytes>(b.value);
+    out.insert(out.end(), tail.begin(), tail.end());
+    return {std::move(out), SqlType{SqlKind::Bytea}, false, {}, pos};
+  }
+  auto stringish = [](const Constant& c) { return c.unknown || is_string(c.type); };
+  if (!stringish(a) && !stringish(b)) {
+    throw SqlError{"operator does not exist: " + pg_type_name(a.type) + " || " + pg_type_name(b.type), pos, kUndefinedFunction};
+  }
+  for (const auto* c : {&a, &b}) {
+    if (is_bytea(*c)) not_yet("|| of bytea and a string", pos);
+    if (!c->unknown && is_float(c->type)) not_yet("|| of a floating-point value", pos);
+  }
+  if (is_null(a) || is_null(b)) return null_constant(SqlKind::Text, pos);
+  return text_constant(text_of(a) + text_of(b), pos);
+}
+
+// A call of one of the string functions on constants. All arguments are
+// evaluated and typed first; a NULL argument then gives NULL (the functions
+// are strict).
+auto fold_function(const ast::Expr& e) -> Constant {
+  std::vector<Constant> given;
+  for (const auto& a : e.args) given.push_back(fold(a));
+  const auto& name = e.func;
+  if (name == "||") return fold_concat(given[0], given[1], e.pos);
+  auto arity = [&](std::size_t lo, std::size_t hi) {
+    if (given.size() < lo || given.size() > hi) no_function(name, given, e.pos);
+  };
+  auto strict = [&](const std::vector<Constant>& args, SqlKind result) -> std::optional<Constant> {
+    if (std::ranges::any_of(args, is_null)) return null_constant(result, e.pos);
+    return std::nullopt;
+  };
+  if (name == "upper" || name == "lower") {
+    arity(1, 1);
+    auto args = bind_args(name, given, std::vector{Slot::Text}, false, e.pos);
+    if (auto n = strict(args, SqlKind::Text)) return *n;
+    return text_constant(ascii_case(text_of(args[0]), name == "upper"), e.pos);
+  }
+  if (name == "char_length" || name == "character_length" || name == "octet_length") {
+    arity(1, 1);
+    auto args = bind_args(name, given, std::vector{Slot::Text}, name == "octet_length", e.pos);
+    if (auto n = strict(args, SqlKind::Integer)) return *n;
+    auto s = text_of(args[0]);
+    return {name == "octet_length" ? static_cast<std::int64_t>(s.size()) : char_count(s), SqlType{SqlKind::Integer}, false, {}, e.pos};
+  }
+  if (name == "substring") {
+    arity(2, 3);
+    // SUBSTRING(s FROM 'x' [FOR '#']) is PostgreSQL's regular-expression
+    // substring: the only function that takes the operands where they are
+    // all strings or unknown literals.
+    auto rest = std::span{given}.subspan(1);
+    if (std::ranges::all_of(rest, [](const Constant& c) { return c.unknown || is_string(c.type); })) {
+      not_yet("SUBSTRING with a pattern (a regular expression)", e.pos);
+    }
+    auto args = bind_args(name, given, given.size() == 2 ? std::vector{Slot::Text, Slot::Int4} : std::vector{Slot::Text, Slot::Int4, Slot::Int4},
+                          true, e.pos);
+    if (auto n = strict(args, SqlKind::Text)) return *n;
+    return text_constant(substring_of(text_of(args[0]), int_of(args[1]),
+                                      args.size() == 3 ? std::optional{int_of(args[2])} : std::nullopt, e.pos),
+                         e.pos);
+  }
+  if (name == "btrim" || name == "ltrim" || name == "rtrim") {
+    arity(1, 2);
+    auto args = bind_args(name, given, given.size() == 1 ? std::vector{Slot::Text} : std::vector{Slot::Text, Slot::Text},
+                          true, e.pos);
+    if (auto n = strict(args, SqlKind::Text)) return *n;
+    auto set = args.size() == 2 ? text_of(args[1]) : std::string{" "};
+    return text_constant(trimmed(text_of(args[0]), set, name != "rtrim", name != "ltrim"), e.pos);
+  }
+  if (name == "position") {
+    arity(2, 2);
+    auto args = bind_args(name, given, std::vector{Slot::Text, Slot::Text}, true, e.pos);
+    if (auto n = strict(args, SqlKind::Integer)) return *n;
+    return {position_of(text_of(args[1]), text_of(args[0])), SqlType{SqlKind::Integer}, false, {}, e.pos};
+  }
+  if (name == "overlay") {
+    arity(3, 4);
+    auto args = bind_args(name, given,
+                          given.size() == 3 ? std::vector{Slot::Text, Slot::Text, Slot::Int4}
+                                            : std::vector{Slot::Text, Slot::Text, Slot::Int4, Slot::Int4},
+                          true, e.pos);
+    if (auto n = strict(args, SqlKind::Text)) return *n;
+    return text_constant(overlay_of(text_of(args[0]), text_of(args[1]), int_of(args[2]),
+                                    args.size() == 4 ? std::optional{int_of(args[3])} : std::nullopt, e.pos),
+                         e.pos);
+  }
+  no_function(name, given, e.pos);
+}
+
 // The constant expression e, folded.
 auto fold(const ast::Expr& e) -> Constant {
   using K = ast::Expr::Kind;
@@ -867,6 +1105,7 @@ auto fold(const ast::Expr& e) -> Constant {
     case K::Case: return fold_case(e);
     case K::Coalesce: return fold_coalesce(e);
     case K::NullIf: return fold_nullif(e);
+    case K::Func: return fold_function(e);
     case K::Column:
     case K::Param:
     case K::Aggregate:
@@ -1361,6 +1600,7 @@ public:
         case ast::Expr::Kind::Case: return "case";
         case ast::Expr::Kind::Coalesce: return "coalesce";
         case ast::Expr::Kind::NullIf: return "nullif";
+        case ast::Expr::Kind::Func: return e.func == "||" ? "?column?" : e.func;
         case ast::Expr::Kind::Column:
         case ast::Expr::Kind::Param:
         case ast::Expr::Kind::Const:
@@ -1681,6 +1921,7 @@ public:
       case ast::Expr::Kind::Case:
       case ast::Expr::Kind::Coalesce:
       case ast::Expr::Kind::NullIf: not_yet("CASE, COALESCE and NULLIF of other than constants", e.pos);
+      case ast::Expr::Kind::Func: not_yet("|| and the string functions of other than constants", e.pos);
       case ast::Expr::Kind::Const:
       case ast::Expr::Kind::Literal: break;  // constants, above
     }

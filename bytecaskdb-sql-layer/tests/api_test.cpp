@@ -1543,6 +1543,78 @@ TEST_CASE("embedded API: CASE, COALESCE and NULLIF of constants fold as PostgreS
   CHECK(state("SELECT NULLIF(v, 0) FROM cc") == "42601");
 }
 
+TEST_CASE("embedded API: || and the string functions of constants fold as PostgreSQL's do", "[sql][api]") {
+  sql_test::TempDir dir{"api_strfn"};
+  auto db = Database::open(dir.path());
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  auto one = [&](std::string_view sql) { return db->execute(sql).rows.front().front(); };
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+  // ||: strings, and any other type through its text; NULL on either side.
+  CHECK(one("SELECT 'foo' || 'bar' || 'é'") == text("foobaré"));
+  CHECK(one("SELECT 'a' || 1 || true || 2.50") == text("a1true2.50"));
+  CHECK(one("SELECT 1 || 'a'") == text("1a"));
+  CHECK(one("SELECT 'a' || NULL") == Value{});
+  CHECK(state("SELECT 1 || 2") == "42883");
+  // UPPER and LOWER fold ASCII (COLLATE "C").
+  CHECK(db->execute("SELECT UPPER('aé'), LOWER('AÉ'), UPPER(NULL)").rows == Grid{{text("Aé"), text("aÉ"), Value{}}});
+  // Lengths count characters and bytes.
+  CHECK(db->execute("SELECT CHAR_LENGTH('日本'), CHARACTER_LENGTH('ab'), OCTET_LENGTH('日本'), CHAR_LENGTH(NULL)").rows ==
+        Grid{{i(2), i(2), i(6), Value{}}});
+  // SUBSTRING: PostgreSQL's text_substring, a start before the string counting toward the length.
+  CHECK(db->execute("SELECT SUBSTRING('foobar' FROM 3), SUBSTRING('foobar' FROM 2 FOR 3), SUBSTRING('foobar' FROM -1 FOR 3), "
+                    "SUBSTRING('foobar' FROM 0), SUBSTRING('foobar' FROM 9), SUBSTRING('foobar' FROM 5 FOR 2147483647), "
+                    "SUBSTRING('日本語' FROM 2 FOR 1)")
+            .rows == Grid{{text("obar"), text("oob"), text("f"), text("foobar"), text(""), text("ar"), text("本")}});
+  CHECK(one("SELECT SUBSTRING('foobar' FROM 2 FOR NULL::integer)") == Value{});
+  CHECK(state("SELECT SUBSTRING('foobar' FROM 1 FOR -1)") == "22011");
+  CHECK(state("SELECT SUBSTRING('foobar' FROM 3000000000)") == "42883");
+  CHECK(state("SELECT SUBSTRING('foobar' FROM 1 FOR 'x')") == "22P02");
+  CHECK(state("SELECT SUBSTRING('foobar' FROM 'o+')") == "42601");  // the regular-expression form: not supported yet
+  // TRIM: spaces, or the characters given, by character.
+  CHECK(db->execute("SELECT TRIM('  a '), TRIM(LEADING FROM '  a '), TRIM(TRAILING FROM '  a '), TRIM('xy' FROM 'yxaxy'), "
+                    "TRIM('é' FROM 'éaé'), BTRIM('xa', 'x'), LTRIM('xxa', 'x'), RTRIM('axx', 'x'), TRIM('' FROM ' a ')")
+            .rows == Grid{{text("a"), text("a "), text("  a"), text("a"), text("a"), text("a"), text("a"), text("a"), text(" a ")}});
+  // POSITION: 1-based characters, 0 for none, 1 for an empty substring.
+  CHECK(db->execute("SELECT POSITION('an' IN 'banana'), POSITION('x' IN 'banana'), POSITION('' IN 'ab'), POSITION('本' IN '日本語')")
+            .rows == Grid{{i(2), i(0), i(1), i(2)}});
+  CHECK(one("SELECT POSITION(NULL IN 'a')") == Value{});
+  // OVERLAY.
+  CHECK(db->execute("SELECT OVERLAY('abcdef' PLACING 'XY' FROM 2), OVERLAY('abcdef' PLACING 'XY' FROM 2 FOR 3), "
+                    "OVERLAY('abc' PLACING 'XY' FROM 5)")
+            .rows == Grid{{text("aXYdef"), text("aXYef"), text("abcXY")}});
+  CHECK(state("SELECT OVERLAY('abc' PLACING 'x' FROM 0)") == "22011");
+  CHECK(state("SELECT OVERLAY('abc' PLACING 'x' FROM 2147483647 FOR 1)") == "22003");
+  // A type no function takes is 42883, a wrong number of arguments too.
+  CHECK(state("SELECT UPPER(1)") == "42883");
+  CHECK(state("SELECT UPPER(NULL::integer)") == "42883");
+  CHECK(state("SELECT UPPER('a', 'b')") == "42883");
+  CHECK(state("SELECT TRIM(1)") == "42883");
+  CHECK(state("SELECT POSITION(1 IN 'a')") == "42883");
+  // An error raised under CASE is raised if its branch is taken, and a branch not taken that raises is refused.
+  CHECK(state("SELECT CASE WHEN 1 = 2 THEN SUBSTRING('a' FROM 1 FOR -1) ELSE 'x' END") == "42601");
+  CHECK(state("SELECT CASE WHEN 1 = 1 THEN SUBSTRING('a' FROM 1 FOR -1) END") == "22011");
+  // The output column is named as PostgreSQL names it.
+  CHECK(db->execute("SELECT 'a' || 'b', TRIM('a'), POSITION('a' IN 'b'), SUBSTRING('a' FROM 1), CHARACTER_LENGTH('a'), OVERLAY('a' PLACING 'b' FROM 1)")
+            .columns == std::vector<std::string>{"?column?", "btrim", "position", "substring", "character_length", "overlay"});
+  (void)db->execute("CREATE TABLE sf (id INTEGER PRIMARY KEY, v VARCHAR(20))");
+  (void)db->execute("INSERT INTO sf VALUES (1, 'ab' || 'c')");
+  (void)db->execute("INSERT INTO sf VALUES (2, UPPER('x'))");
+  CHECK(db->execute("SELECT v FROM sf WHERE v = LOWER('ABC')").rows == Grid{{text("abc")}});
+  // Of a column, a parameter: not supported yet.
+  CHECK(state("SELECT v || 'x' FROM sf") == "42601");
+  CHECK(state("SELECT UPPER(v) FROM sf") == "42601");
+  CHECK(state("SELECT id FROM sf WHERE UPPER(v) = 'ABC'") == "42601");
+}
+
 TEST_CASE("embedded API: a choice point's plan text shows both plans, and each returns the same rows",
           "[sql][api][search][choice]") {
   sql_test::TempDir dir{"api_choice"};
