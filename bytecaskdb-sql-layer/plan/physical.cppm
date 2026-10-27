@@ -540,6 +540,7 @@ public:
       }
       covering_.clear();
       covering_tables(*p_.root);
+      hashes_ = 0;
       node(*p_.root, nullptr);
     }
   }
@@ -662,17 +663,30 @@ private:
   }
 
   // A predicate filter: AND, OR and NOT of comparisons of a column with a
-  // parameter or a constant, none of a DOUBLE, and IS NULL of a column.
-  void predicate(const Expr& e) const {
+  // parameter, a constant or a column of the same type, none of a DOUBLE, and
+  // IS NULL of a column. It reads rows in hand: the tables `here` gives rows
+  // to, and those of the loops outside it (outer_).
+  void predicate(const Expr& e, const std::vector<std::uint32_t>& here) const {
+    std::vector<ColumnRef> cols;
+    logical::columns_of(e, cols);
+    for (const auto& c : cols) {
+      if (std::ranges::find(here, c.table) == here.end() && std::ranges::find(outer_, c.table) == outer_.end()) {
+        broken("a predicate that reads a column of a table not in hand");
+      }
+    }
+    predicate_of(e);
+  }
+
+  void predicate_of(const Expr& e) const {
     switch (e.kind) {
       case Expr::Kind::And:
       case Expr::Kind::Or:
         if (e.args.size() < 2) broken("an AND or OR of fewer than two");
-        for (const auto& a : e.args) predicate(a);
+        for (const auto& a : e.args) predicate_of(a);
         return;
       case Expr::Kind::Not:
         if (e.args.size() != 1) broken("a NOT of other than one");
-        predicate(e.args[0]);
+        predicate_of(e.args[0]);
         return;
       case Expr::Kind::IsNull:
         if (e.args.size() != 1 || e.args[0].kind != Expr::Kind::Column) broken("IS NULL of other than a column");
@@ -688,8 +702,9 @@ private:
         return;
       case Expr::Kind::Compare:
         if (e.args[0].kind != Expr::Kind::Column || e.args[0].col.type == PhysType::F64 ||
-            (e.args[1].kind != Expr::Kind::Param && e.args[1].kind != Expr::Kind::Const)) {
-          broken("a predicate's comparison other than of a column, not a DOUBLE, with a parameter");
+            (e.args[1].kind != Expr::Kind::Param && e.args[1].kind != Expr::Kind::Const &&
+             (e.args[1].kind != Expr::Kind::Column || e.args[1].col.type != e.args[0].col.type))) {
+          broken("a predicate's comparison other than of a column, not a DOUBLE, with a parameter or a column of its type");
         }
         params(e.args[1]);
         reads(e);
@@ -763,12 +778,15 @@ private:
     return false;
   }
 
-  // The hash join a node's rows come from, under the filters on its pairs
-  // and a sort of them, or null.
+  // The hash join a node's rows come from, under the filters on its pairs, a
+  // sort of them, and the joins it is the outer side of; or null. A plan holds
+  // one (node).
   static auto hash_below(const Node& n) -> const HashJoin* {
     if (const auto* h = std::get_if<HashJoin>(&n.op)) return h;
     if (const auto* f = std::get_if<Filter>(&n.op)) return hash_below(*f->input);
     if (const auto* o = std::get_if<Sort>(&n.op)) return hash_below(*o->input);
+    if (const auto* j = std::get_if<IndexJoin>(&n.op)) return hash_below(*j->outer);
+    if (const auto* j = std::get_if<NestedLoop>(&n.op)) return hash_below(*j->outer);
     return nullptr;
   }
 
@@ -1026,9 +1044,11 @@ private:
               if (e.kind == Expr::Kind::Column) held_above(*op.outer, e.col);
             }
             // Left outer: its ON, the pair's, as a filter's conjuncts are.
+            auto here = tables_of(*op.outer);
+            here.push_back(op.inner);
             for (const auto& c : op.match) {
               if (logical::is_predicate(c)) {
-                predicate(c);
+                predicate(c, here);
                 continue;
               }
               if (c.kind != Expr::Kind::Compare) continue;
@@ -1060,9 +1080,15 @@ private:
             auto before = guarded_.size();
             guarded_.insert(guarded_.end(), op.guard.begin(), op.guard.end());
             for (auto g : op.guard) param(g);
+            // The inner side reads the outer side's rows too.
+            auto outside = outer_.size();
+            for (auto t : *outer) outer_.push_back(t);
             node(*op.inner, &n);
+            outer_.resize(outside);
             guarded_.resize(before);
           } else if constexpr (std::is_same_v<T, HashJoin>) {
+            // One hash table per plan: the choice by the budget counts one build side.
+            if (++hashes_ > 1) broken("a plan with more than one hash join");
             if (op.keys.empty()) broken("a hash join with no key");
             // The hash table holds the row of the build side's one loop.
             if (loops(*op.build) != std::vector<std::uint32_t>{op.held}) {
@@ -1151,9 +1177,10 @@ private:
               node(*op.input, &n);
               return;
             }
+            const auto here = tables_of(*op.input);
             for (const auto& c : op.conjuncts) {
               if (logical::is_predicate(c)) {
-                predicate(c);
+                predicate(c, here);
                 continue;
               }
               if (c.kind != Expr::Kind::Compare) continue;
@@ -1308,6 +1335,9 @@ private:
   // The parameters an outer nested loop's guard checks, while its inner
   // side is checked.
   mutable std::vector<std::uint32_t> guarded_;
+  // The tables of the loops outside the inner side being checked.
+  mutable std::vector<std::uint32_t> outer_;
+  mutable std::size_t hashes_{0};  // the hash joins of the combination being checked
 };
 
 }  // namespace

@@ -411,6 +411,52 @@ TEST_CASE("physical: a hash join holds the row of its build side's one loop, key
   refused(plan(choice(scan({p(0)}, {}), node(scan({p(0)}, {})))), "whose other plan reads other tables");
 }
 
+TEST_CASE("physical: a plan holds one hash join, and a predicate over two tables reads rows in hand",
+          "[sql][physical][hash][join]") {
+  const logical::ColumnRef t_v{1, 2, PhysType::I64, true};
+  const logical::ColumnRef u_v{2, 1, PhysType::I64, true};
+  const logical::ColumnRef w_v{3, 1, PhysType::I64, true};
+  const logical::ColumnRef u_b{2, 2, PhysType::Bytes, true};
+  auto scan_of = [](std::uint32_t table) { return node(physical::Scan{table, 4, {p(1)}, {}, false, false, false}); };
+  auto hash = [&](physical::NodePtr build, physical::NodePtr probe, logical::ColumnRef b, logical::ColumnRef pr,
+                  std::uint32_t held) {
+    return node(physical::HashJoin{std::move(build), std::move(probe), {{b, pr}}, held});
+  };
+  auto with = [&](physical::NodePtr rows) {
+    auto plan_of = plan(emit(std::move(rows), {kId, u_v}));
+    return plan_of;
+  };
+  // Two hash joins, one the other's probe side: the choice by the budget counts one build side.
+  refused(with(hash(scan_of(3), hash(node(scan({p(0)}, {})), scan_of(2), t_v, u_v, 1), w_v, u_v, 3)),
+          "a plan with more than one hash join");
+  // One hash join under a nested loop and an index join is a plan.
+  auto under = [&] {
+    return node(physical::NestedLoop{hash(node(scan({p(0)}, {})), scan_of(2), t_v, u_v, 1), scan_of(3)});
+  };
+  CHECK(refusal(with(under())).empty());
+  // A predicate over columns of two tables: both rows must be in hand where it is evaluated.
+  auto both_columns = [&](logical::ColumnRef a, logical::ColumnRef b) {
+    auto eq = logical::compare(ast::Compare::Op::Eq, logical::column(a, SqlType{SqlKind::BigInt}),
+                               logical::column(b, SqlType{SqlKind::BigInt}));
+    return logical::predicate_of(logical::Expr::Kind::Not, {std::move(eq)});
+  };
+  auto over = [&](logical::ColumnRef a, logical::ColumnRef b) {
+    return node(physical::Filter{hash(node(scan({p(0)}, {})), scan_of(2), t_v, u_v, 1), {both_columns(a, b)}});
+  };
+  CHECK(refusal(with(over(t_v, u_v))).empty());
+  refused(with(over(t_v, w_v)), "a predicate that reads a column of a table not in hand");
+  // Two columns of one type only, and never a DOUBLE.
+  refused(with(over(t_v, u_b)), "a column of its type");
+  refused(with(over(kD, u_v)), "a column of its type");
+  // The inner side of a nested loop reads the outer side's rows too: as a left outer join's match does.
+  auto inner = [&](logical::ColumnRef a, logical::ColumnRef b) {
+    auto filtered = node(physical::Filter{scan_of(2), {both_columns(a, b)}});
+    return node(physical::NestedLoop{node(scan({p(0)}, {})), std::move(filtered), true, {}});
+  };
+  CHECK(refusal(with(inner(t_v, u_v))).empty());
+  refused(with(inner(t_v, w_v)), "a predicate that reads a column of a table not in hand");
+}
+
 TEST_CASE("physical: check refuses an expression result column codegen can't print", "[sql][physical]") {
   using Kind = logical::Expr::Kind;
   using Op = ast::Compare::Op;

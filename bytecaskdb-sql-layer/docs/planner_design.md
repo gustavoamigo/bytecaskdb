@@ -7,9 +7,11 @@ and #584; `plan_api_design.md`, revision 7); the choice points (#582); the plan
 API's sorters, hash tables, aggregate slots and sort keys (#577, #581);
 full scans and sorts (#591, closing #533); hash joins (#600) and `GROUP
 BY` (#609); then the closing PR, which fixed #609's last review findings
-and wrote this document as built. The first of the post-MVP designs (#487,
-*Next*). The parser, the plan API and TinyCC are unchanged by it; the
-binder's output changed. The rest of the dialect is #534's (*Slices*).
+and wrote this document as built; then joins of up to eight tables, a table
+read twice and joins on any comparison (#663, *Joins of several tables*).
+The first of the post-MVP designs (#487, *Next*). The parser, the plan API
+and TinyCC are unchanged by it; the binder's output changed. The rest of
+the dialect is #534's (*Slices*).
 
 ## Why
 
@@ -91,7 +93,8 @@ errors it raises.
 
 **What the binder builds.**
 - A `SELECT` is `Limit? → Project → Sort? → Filter? → the tables`, the
-  tables a `Get`, or a `Join` of two `Get`s. A `Project`'s outputs are
+  tables a `Get`, or a left-deep tree of `Join`s over `Get`s, one per `FROM`
+  item (*Joins of several tables*). A `Project`'s outputs are
   columns, constants' parameters and expressions over columns. A `SELECT` without `FROM` is `Limit?
   → Project → OneRow`.
 - An aggregated `SELECT` is `Limit? → Sort? → Filter? → Aggregate →
@@ -128,8 +131,9 @@ A fixed list, applied in order, each to a fixpoint. None needs a cost.
    nothing. Today's dialect rarely gives it anything to fold: a `WHERE`
    compares a column with a parameter.
 2. **Predicate pushdown.** A conjunct moves to the lowest operator whose
-   columns it reads: onto the table it reads, or onto the `Join` when it
-   compares the two sides. Over a left outer join, only a conjunct on the
+   columns it reads: onto the table it reads, or onto the `Join` that has
+   every table it reads, whether it compares two columns or is a predicate
+   over both sides. Over a left outer join, only a conjunct on the
    left side alone moves below it: one on the right side filters the joined
    rows, NULL-extended ones too, so it stays above. Of the join's own
    predicate, a conjunct on the right side alone moves onto that side's
@@ -206,7 +210,8 @@ from each set of k − 1 and one more table, read one of four ways:
 The join's conjuncts between the new table and those already read filter
 its rows, or the pairs, refused on a DOUBLE or REAL column alike. Bushy
 trees and merge joins wait for a workload that needs them. Sets are bit
-masks of up to 32 tables; the binder takes two.
+masks of up to 32 tables; the front end takes eight, which bounds the
+search to 255 sets (*Joins of several tables*).
 
 The search keeps the cheapest plan per set of tables, per row count (at
 most one, or more), per order (the `ORDER BY`'s, or none) and per grouping
@@ -700,13 +705,89 @@ loop is made to read rows: the probe side's sorter holds its row, so its
 loop reads rows, and nothing else does for it. Any plan can instead be
 sorted above the join (*Sorts*).
 
+### Joins of several tables
+
+**The tree.** A `FROM` of tables is a left-deep tree of `Join`s, one per
+item after the first: `a JOIN b … JOIN c …`, or a comma list. The binder
+checks each `ON` against the items up to its own (a later table is 42P01, as
+PostgreSQL). An inner join's `ON` goes with the `WHERE`'s conjuncts and
+pushdown moves it to the lowest `Join` that has its tables; an outer join's
+stays its own. The front end takes at most eight tables
+(`kMaxFrom`): the search is a pass over the subsets of them, 255 sets
+at eight, each extended by each table left (the bit masks allow 32, which
+would be 2^32).
+
+**A table read twice.** `ColumnRef::table` names a table by id, and the plan
+reads by it, so two uses of a table need two ids. The binder gives each use
+named by an alias, and each repeat, an *instance*: a copy of the `Table`
+under the name the query gives it, with an id at or above
+`Table::kInstanceBase` and `Table::source`, the id of the table whose rows it
+reads. The bound statement owns the instances (`bound::Bound::instances`).
+The logical and physical plans see two tables; the plan text names each
+instance's constants by its own id, whose values are the one table's
+(`TBL_1073741825 = 1`), so codegen has nothing to know. What the rest of
+the system reads by the table's id reads `storage_id()`: the constants
+(`Catalog::constants`), the table's row counts, the table a failed range
+check names, and the objects and columns a plan declares to the runtime
+(`Writer::storage`), so a plan that reads a table twice is refused and
+recompiled when the table's ids change, as one that reads it once. An index
+and the parts of its key are named by the index, so two instances share
+those constants. A parser keeps an alias only where a table is named twice;
+elsewhere it rewrites the alias to the table (*the dialect*,
+`frontend_design.md`). Two views of one table, merged into the query under
+one name, are refused.
+
+**Outer joins in a chain.** A query with an outer join is planned in `FROM`
+order, each table joined to those before it, since a join's right side
+cannot move before its left. `Rel::outer` marks the right side of a left
+outer join; each outer table is read under the rows before it by a lookup
+on its key or a scan (*Outer joins*), and each inner join after it the usual
+ways, but never hashed. A column of a table an outer join may NULL-extend is
+NULL-able in the `ON` of every later join and everywhere above (the binder
+marks it; a key a later join builds from it keeps the mark, so a row of
+NULLs is a miss and never a key of whatever the column's bytes hold). So an
+inner join after an outer one drops the rows it NULL-extended where its `ON`
+reads them, and one before it does not. `RIGHT JOIN` is a left join of its
+two tables swapped, so it is taken only of two tables; `USING` and `NATURAL`
+only for the first join.
+
+**A comparison, and a predicate over both sides.** Any comparison of a
+column of each table joins them, as `=` does: `use_of` takes it, and where
+no equality keys the inner table, the comparison filters the pairs of a
+nested loop. A predicate over two tables' columns (`NOT (a.x = b.y)`, `OR`,
+`IS NULL` among comparisons) is a `Cross`: a filter of the pairs, run by the
+step that reads the last of its tables, or an outer join's `ON`, by that
+join's own step, as a match. It is refused on a DOUBLE or REAL column like
+any filter. `physical::check` takes such a predicate only over rows in hand
+(the loops' tables and the outer side's), so a plan that evaluated it early
+would not be printed.
+
+**What bounds each form.** Memory: a nested loop, an index join and an
+outer join hold the rows of one step per loop and nothing per row of
+either side (*Memory*), so a self-join, a chain and a join on a comparison
+run in a small budget whatever the tables hold
+(`embedded API: a join over many outer rows runs in a small memory
+budget`, and `… a self-join, a chain of joins and a join on a comparison run
+in a small memory budget`). A hash join holds its build side
+in the budget as before, and a plan holds at most one (`check`: `a plan with
+more than one hash join`): the choice by the budget (*Memory*) counts one
+build side and falls back to a plan with none, so a second hash table would
+be bounded by the budget alone (#696). The other joins of such a plan are
+nested loops. Time: a join no key reaches, a comparison among them, reads the
+inner table once per outer row, so its reads are the product of the sides,
+as a cross join's always were; the work budget (`max_reads`, off by
+default) is what bounds it. The statement's result is buffered, and its
+bytes count against the memory budget, so a join that returns a product
+fails with 54000 where PostgreSQL streams it.
+
 ### Outer joins
 
 A left outer join (`RIGHT JOIN` is one of its sides swapped, by the binder)
-is planned in one order: its left table first, by any access path, and its
-right table under it, by a lookup on its key or a scan, read once per left
-row. It is never hashed, as a build of the right side would lose the left
-rows it matches nothing of. Under each left row the plan sets a matched
+is planned in one order: its left tables first, by any access path, and its
+right table under them, by a lookup on its key or a scan, read once per left
+row; in a chain, each right table under the rows before it (*Joins of
+several tables*). It is never hashed, as a build of the right side would
+lose the left rows it matches nothing of. Under each left row the plan sets a matched
 flag; after the right side's loop, a row nothing matched is joined to
 `bc_null_row`'s row of NULLs, every column of the right table NULL, and the
 plan goes on with it as with any other.
@@ -716,7 +797,9 @@ the left side alone is a filter of the right side's rows too, which reads
 the left row. The `WHERE` conjuncts on the right side's columns filter the
 joined rows, before any sort, so `LIMIT` counts the rows they keep. Above
 the join every column of the right table is nullable, its declaration
-aside: the binder marks it, and the plan tests the NULL.
+aside: the binder marks it, and the plan tests the NULL. A conjunct of the
+`ON` that reads both sides and is no comparison with a key is the pair's
+match, tested after the row is read.
 
 A NULL parameter of the right side's key matches no row: it is that side's
 guard, which skips its loop and leaves the left row NULL-extended, where an
@@ -1170,7 +1253,10 @@ never at more.
   u.v = t.qty`, t at 40 rows and u at 100, under 10,000 bytes: the hash join
   built on t's range costs 8 + 4 × 1.3 + 100 + 40; a row of t holds at least
   36 bytes and a key 9, so the plan counts that range against 35. A sorted
-  probe side, or a sort above the join, is not a choice by the budget.
+  probe side, or a sort above the join, is not a choice by the budget. A
+  plan holds one hash table (*Joins of several tables*); the joins above or
+  below it in a join of three tables or more are streams, and both plans of
+  the choice read the same tables.
 - **A structure of groups** over one table's range, where a streamed plan
   avoids it: fixed `kAggBytes` and a byte per slot, `kHashBytes` per table
   whose rows its groups hold, `kAggBytes` + 1 per column with `DISTINCT` aggregates, and
@@ -1244,8 +1330,9 @@ with uncompilable C:
 - a conjunct `use_of` refuses (`no plan: a conjunct on <table> that does
   not compare one of its columns`, `… compares two columns outside a
   join`, `a join conjunct that does not compare a column of each side`,
-  `a conjunct that reads no column`); a table joined with itself; more than
-  32 tables;
+  `a conjunct that reads no column`, `a predicate (…) that reads no column`);
+  a table read twice with no instance for each use; a left outer join whose
+  right side is more than one table; more than 32 tables;
 - a result column that is not an expression of columns of the statement's
   tables; an aggregate, `GROUP BY` or `ORDER BY` column that is not a
   column of them; an output or `ORDER BY` key not grouped; a
@@ -1280,7 +1367,9 @@ join no key reaches and an `ORDER BY` over a plan of two loops are planned.
   `group_by_dependent`, `group_by_dependent_held`, `aggregates_ungrouped`)
   and set operations (`set_union_distinct`, `set_union_all_limit`,
   `set_union_all_scan_limit`, `set_except_all`, `set_intersect_double`,
-  `set_precedence`, `set_subquery`).
+  `set_precedence`, `set_subquery`) and joins of several tables
+  (`join_three_tables`, `join_self`, `join_left_chain`, `join_less_than`,
+  `join_not_equal`).
 - **Alternatives agree.** `search_all` returns every plan the search
   costed, none pruned, cheapest first. `generate_alternatives` prints each
   once per combination of its choice points' branches, 2^k for k choice
@@ -1308,10 +1397,15 @@ join no key reaches and an `ORDER BY` over a plan of two loops are planned.
   threshold, left out where known not to fit, a grouped hash join's choice;
   `COUNT(*)`, `MIN` and `MAX` from the keys, a lone `MIN` and a lone `MAX`
   by one route, and a loop where they don't apply; under `LIMIT 0` no plan
-  reads anything. Every plan the tests cost passes `check` in every
-  combination of its branches.
+  reads anything; joins of three tables in any order, one hash table at
+  most, a chain of left joins in `FROM` order with a row of NULLs for each,
+  a predicate over two tables filtering where the last is read, and the
+  constants of a table's two instances. Every plan the tests cost passes
+  `check` in every combination of its branches.
 - **`physical::check`** (`physical_test`): each refusal of *The physical
-  plan and codegen*, with a plan that passes beside it; among them a
+  plan and codegen*, with a plan that passes beside it; among them a plan of
+  two hash joins, and a predicate over two tables read outside the loops that
+  hold their rows, and a
   `KeyAggregates` of a nullable argument whose range starts at the NULLs
   (no range, a full scan's, an upper bound alone, the NULL part itself),
   and of an argument not held as `I64`.
@@ -1345,7 +1439,9 @@ join no key reaches and an `ORDER BY` over a plan of two loops are planned.
   BY` with several aggregates; and grouped joins (`group_by`,
   `group_by_join`). Its models `served` and `join_served` say whether some
   plan serves a statement: what they don't serve is the `DOUBLE` filter.
-  Fixed cases: `test_both_plans_of_a_choice_point_agree`,
+  Fixed cases: `test_joins_of_several_tables_with_themselves_and_on_any_comparison`
+  (three or more tables, a table with itself, any comparison, a chain of
+  left joins, through the layer, the server and every costed plan), `test_both_plans_of_a_choice_point_agree`,
   `test_hash_joins`, `test_group_by`,
   `test_a_grouped_hash_join_and_its_other_plan_both_order_the_groups`,
   `test_a_having_parameter_typed_by_the_where`.
@@ -1369,7 +1465,7 @@ Each slice was one PR, or a few, with its tests.
 5. **Hash joins and `GROUP BY`**, with `HAVING`, `MAX`, `AVG` and several
    aggregates in one select list.
 
-The rest of the dialect stays in #534: three or more tables, aliases,
+The rest of the dialect stays in #534: aliases of a join and of columns,
 expressions, `OFFSET`, `RETURNING` and multi-row `VALUES`, correlated subqueries,
 `FULL JOIN`, `FOR UPDATE` on joins, and `EXPLAIN`. The serializable guards,
 the plan cache and procedures (#495) keep their own designs.

@@ -66,32 +66,46 @@ kind the transformer doesn't take is refused with its position.
 - `GROUP BY` of columns, and `HAVING`, below. A query with a `GROUP BY`, a
   `HAVING` or an aggregate is aggregated; without `GROUP BY` it returns
   exactly one row, or none where its `HAVING` is false.
-- `FROM`: one table, or two joined by a comma, `[INNER] JOIN … ON`, `JOIN
-  … USING (cols) [AS alias]` or `NATURAL JOIN`. Columns may be qualified by
-  the table's name. `USING` and `NATURAL` (every column name both tables
-  share) compare their columns by `=`, as `ON` would, and name each alone
-  as one column, the left table's, equal to the right's in every pair; the
-  `USING` alias qualifies those columns only. A name missing from a side is
-  42703, one named twice 42701, as in PostgreSQL. `LEFT [OUTER] JOIN` and
-  `RIGHT [OUTER] JOIN` take each of these forms: every row of the preserved
-  table, joined to each row of the other that `ON` matches, or to a row of
-  NULLs where it matches none. `ON` decides the pairs and `WHERE` filters
-  the joined rows, so `WHERE r.k IS NULL` keeps the rows nothing matched; a
-  `USING` column named alone is the preserved table's. `FULL JOIN` is
-  refused. A table takes an alias, `t [AS] x`: the front end rewrites the
-  qualifier `x` to the table in every clause of that SELECT, so the binder
-  never sees an alias, and the table's own name qualifies nothing while it is
-  aliased (42P01, as PostgreSQL), nor may two FROM items share a name
-  (42712). A select-list item takes `[AS] name`, which names its output
-  column; an unqualified `ORDER BY name` that is such a name orders by that
-  item (PostgreSQL looks at output names first there, at input columns
-  first in `GROUP BY`, which takes no output name here). A subquery
-  resolves its own aliases; it cannot name the outer query's (correlation
-  is refused). `t AS x (c1, c2)`, an alias of a join, and a table joined
-  with itself under two aliases are refused. Without `FROM`, a
-  `SELECT` of constants returns one row of them, or none under `LIMIT 0`;
-  it takes no `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` or `FOR UPDATE`
-  yet.
+- `FROM`: one table, or up to eight joined by a comma list, `[INNER] JOIN …
+  ON`, `CROSS JOIN` or `LEFT [OUTER] JOIN … ON`, one after the other
+  (`a JOIN b ON … LEFT JOIN c ON …`, each join's right side a table and its
+  left side the tables before it), and for the first join `JOIN … USING
+  (cols) [AS alias]`, `NATURAL JOIN` and `RIGHT [OUTER] JOIN`. Columns may be
+  qualified by the table's name. Each `ON` sees the tables up to its own
+  (a later one is 42P01). It compares columns of two tables by any of `=`,
+  `<`, `<=`, `>`, `>=` and `<>`, or is a predicate (`AND`, `OR`, `NOT`, `IS
+  NULL`) over columns of both; NULL is true of none. `USING` and `NATURAL`
+  (every column name both tables share) compare their columns by `=`, as
+  `ON` would, and name each alone as one column, the left table's, equal to
+  the right's in every pair, unless a third table has the name too (42702);
+  the `USING` alias qualifies those columns only. A name missing from a side
+  is 42703, one named twice 42701, as in PostgreSQL. `LEFT` and `RIGHT` give
+  every row of the preserved table, joined to each row of the other that
+  `ON` matches, or to a row of NULLs where it matches none. `ON` decides the
+  pairs and `WHERE` filters the joined rows, so `WHERE r.k IS NULL` keeps
+  the rows nothing matched; a `USING` column named alone is the preserved
+  table's. In a chain, a left join NULL-extends its right table in the rows
+  before it: a later `ON` reading that table sees NULLs, so an inner join
+  after it drops those rows where it reads them, and a left join keeps
+  them. `RIGHT JOIN` is taken of two tables only, `USING` and `NATURAL` of
+  the first join only, and `FULL JOIN` not. A table takes an alias, `t [AS]
+  x`. A table named twice, `t JOIN t AS x`, is read twice, once under each
+  name; the planner reads it as two tables (`planner_design.md`, *Joins of
+  several tables*). The front end rewrites the qualifier `x` to the table
+  in every clause of that `SELECT` where no table is named twice, so the
+  binder never sees an alias, and keeps the aliases where one is, which are
+  then what tell the two apart. The table's own name qualifies nothing while
+  it is aliased (42P01, as PostgreSQL), nor may two `FROM` items share a name
+  (42712, `FROM t, t` among them). A select-list item takes `[AS] name`,
+  which names its output column; an unqualified `ORDER BY name` that is such
+  a name orders by that item (PostgreSQL looks at output names first there,
+  at input columns first in `GROUP BY`, which takes no output name here). A
+  subquery resolves its own aliases; it cannot name the outer query's
+  (correlation is refused). `t AS x (c1, c2)`, an alias of a join, a join in
+  parentheses or inside a comma list, and a view in a query that names a
+  table twice are refused. Without `FROM`, a `SELECT` of constants returns
+  one row of them, or none under `LIMIT 0`; it takes no `WHERE`, `GROUP BY`,
+  `HAVING`, `ORDER BY` or `FOR UPDATE` yet.
 - `UPDATE` and `DELETE` of any number of rows.
 - `ORDER BY`, `LIMIT` and `FOR UPDATE`, below.
 
@@ -410,16 +424,17 @@ EXISTS] name`:
 
 **Refused**, with a message and the node's position: everything not above.
 That includes:
-- `ILIKE`, `IS DISTINCT FROM`, a predicate over both tables of a join or
-  in `HAVING`;
+- `ILIKE`, `IS DISTINCT FROM`, and a predicate in `HAVING`;
 - correlated and nested subqueries and the others above, derived tables;
 - `DISTINCT ON`, `DISTINCT` of a constant or over groups it does not select
   every key of, `GROUP BY` of an expression, and `HAVING` of anything but
   the comparisons above;
 - `FULL JOIN`, an outer join's `ON` comparing an expression of columns,
-  three or more tables, renaming a table's columns (`t AS x (a, b)`), an
-  alias of a join, an output name in `GROUP BY` or in `ORDER BY` of other
-  than a column;
+  more than eight tables, a `RIGHT JOIN` of more than two, `USING` or
+  `NATURAL` after the first join, a join in parentheses or among commas,
+  `FOR UPDATE` of a join (#697), renaming a table's columns (`t AS x (a,
+  b)`), an alias of a join, an output name in `GROUP BY` or in `ORDER BY` of
+  other than a column;
 - `OFFSET`, `RETURNING`, multi-row `VALUES`;
 - `CASE` or `COALESCE` of a float beside another number, a `BETWEEN` or
   `IN` as a value, `GREATEST` and `LEAST`, `CASE` outside the plain select

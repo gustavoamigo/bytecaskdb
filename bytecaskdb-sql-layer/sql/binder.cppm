@@ -79,6 +79,9 @@ struct Bound {
   // included. A cached plan is good only while each still exists: ids are
   // never reused, so a dropped and recreated view is another id.
   std::vector<std::uint32_t> views;
+  // The instances of tables the plan reads (Table::source): the logical plan
+  // names them, so they live as long as it does.
+  std::vector<std::unique_ptr<Table>> instances;
 };
 
 // Throws ast::SqlError with a message and the position of the offending node.
@@ -1554,6 +1557,7 @@ public:
   [[nodiscard]] auto fixed_values() const -> const std::vector<Datum>& { return fixed_; }
   [[nodiscard]] auto fixed_types() const -> const std::vector<PhysType>& { return fixed_types_; }
   [[nodiscard]] auto take_subqueries() -> std::vector<logical::Subquery> { return std::move(subqueries_); }
+  [[nodiscard]] auto take_instances() -> std::vector<std::unique_ptr<Table>> { return std::move(instances_); }
   void set_scope(std::vector<const Table*> tables) { scope_ = std::move(tables); }
 
   // A subquery's SELECT, bound as any is, then listed to run before the
@@ -1633,12 +1637,12 @@ public:
   auto correlated(const ast::Select& q) const -> bool {
     if (q.set) return correlated(q.set->left) || correlated(q.set->right);
     std::vector<const Table*> own;
-    for (const auto& name : {q.table, q.join}) {
-      if (const auto* t = name.empty() ? nullptr : cat_.table(name)) own.push_back(t);
+    for (const auto& item : q.from) {
+      if (const auto* t = cat_.table(item.table)) own.push_back(t);
     }
     auto outer_names = [&](const ast::Expr& e) {
       if (!e.table.empty()) {
-        if (e.table == q.table || e.table == q.join) return false;
+        if (std::ranges::any_of(q.from, [&](const ast::FromItem& item) { return e.table == item.name(); })) return false;
         return std::ranges::any_of(scope_, [&](const Table* t) { return t->name == e.table; });
       }
       if (std::ranges::any_of(own, [&](const Table* t) { return t->column(e.column) != nullptr; })) return false;
@@ -2157,27 +2161,37 @@ public:
     return column(t, e.column, e.pos);
   }
 
-  // A column reference of a join: the side whose table it names, or the one
-  // that has the column; one both have is ambiguous (42702), but for a
-  // column of its USING, which is one column: the left side's, equal to the
-  // right's in every pair. The USING's alias names those columns alone.
-  auto column(const Table* (&sides)[2], const ast::Expr& e) const -> std::pair<std::uint32_t, const Column*> {
+  // A column reference of a join: the relation whose name it carries, or the
+  // one that has the column; one more than one have is ambiguous (42702), but
+  // for a column of the first join's USING, which is one column: the left
+  // relation's, equal to the right's in every pair, unless a third relation
+  // has a column of the name too. The USING's alias names those columns
+  // alone.
+  auto column(std::span<const Table* const> rels, const ast::Expr& e) const -> std::pair<std::uint32_t, const Column*> {
     auto in_using = std::ranges::contains(using_, e.column);
+    auto merged = [&]() -> std::pair<std::uint32_t, const Column*> {
+      for (std::size_t i = 2; i < rels.size(); ++i) {
+        if (rels[i]->column(e.column) != nullptr) {
+          throw SqlError{"column reference \"" + e.column + "\" is ambiguous", e.pos, kAmbiguousColumn};
+        }
+      }
+      return {0, rels[0]->column(e.column)};
+    };
     if (!using_alias_.empty() && e.table == using_alias_) {
       if (!in_using) throw SqlError{"column " + e.table + "." + e.column + " does not exist", e.pos, kUndefinedColumn};
-      return {0, sides[0]->column(e.column)};
+      return {0, rels[0]->column(e.column)};
     }
-    if (e.table.empty() && in_using) return {0, sides[0]->column(e.column)};
+    if (e.table.empty() && in_using) return merged();
     std::optional<std::pair<std::uint32_t, const Column*>> found;
-    for (std::uint32_t side = 0; side < 2; ++side) {
-      if (!e.table.empty() && e.table != sides[side]->name) continue;
-      const auto* c = sides[side]->column(e.column);
+    for (std::uint32_t side = 0; side < rels.size(); ++side) {
+      if (!e.table.empty() && e.table != rels[side]->name) continue;
+      const auto* c = rels[side]->column(e.column);
       if (c == nullptr) continue;
       if (found) throw SqlError{"column reference \"" + e.column + "\" is ambiguous", e.pos, kAmbiguousColumn};
       found = {side, c};
     }
     if (found) return *found;
-    if (!e.table.empty() && e.table != sides[0]->name && e.table != sides[1]->name) {
+    if (!e.table.empty() && std::ranges::none_of(rels, [&](const Table* t) { return t->name == e.table; })) {
       throw SqlError{"missing FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable};
     }
     throw SqlError{"column \"" + e.column + "\" does not exist", e.pos, kUndefinedColumn};
@@ -2570,6 +2584,13 @@ public:
       std::swap(col, rhs);
       op = mirrored(op);
     }
+    // A column of one relation against a column of another, inside AND, OR or
+    // NOT: <> is NOT =. Two columns of one relation are not taken yet.
+    if (col->kind == ast::Expr::Kind::Column && rhs->kind == ast::Expr::Kind::Column) {
+      auto [lt, lc] = resolve(*col);
+      auto [rt, rc] = resolve(*rhs);
+      if (lt != rt) return joined_compare(op, lt, *lc, rt, *rc, w.pos);
+    }
     // A scalar subquery: its value, a parameter it sets before the plan runs.
     if (col->kind == ast::Expr::Kind::Column && rhs->kind == ast::Expr::Kind::Subquery) {
       auto [table, c] = resolve(*col);
@@ -2627,90 +2648,123 @@ public:
     return op;
   }
 
-  // A join's WHERE: each conjunct a comparison of a column of one side with
-  // a parameter, or a column of each, in WHERE order.
-  // A join's WHERE; with `on`, of its ON's conjuncts alone, or of the
-  // others alone.
-  auto where(const Table* (&sides)[2], const std::vector<ast::Compare>& in, std::optional<bool> on = std::nullopt)
+  // The conjuncts of one clause of a join: the WHERE's (`join` 0) or the ON
+  // of from[join], each a comparison of a column of one relation with a
+  // parameter, or of columns of two relations, in the order written. An ON
+  // sees the relations up to its own; one it names later is 42P01.
+  auto conjuncts(std::span<const Table* const> rels, const std::vector<ast::Compare>& in, std::uint32_t join)
       -> std::vector<logical::Expr> {
+    auto visible = rels.first(join == 0 ? rels.size() : std::min<std::size_t>(join + 1, rels.size()));
     std::vector<logical::Expr> out;
     for (const auto* c : top_level(in)) {
       const auto& w = *c;
-      if (on && w.on != *on) continue;
+      if (w.on != join) continue;
       if (w.kind == ast::Compare::Kind::Compare && w.lhs.kind == ast::Expr::Kind::Column &&
           w.rhs.kind == ast::Expr::Kind::Column) {
-        out.push_back(join_on(sides, w));
+        out.push_back(join_on(visible, w));
         continue;
       }
       out.push_back(predicate(w, [&](const ast::Expr& e) {
-        auto [side, col] = column(sides, e);
-        return std::pair{sides[side]->id, col};
+        auto [side, col] = column(visible, e);
+        return std::pair{visible[side]->id, col};
       }));
     }
     return out;
   }
 
-  // A column of one table equal to a column of the other, of one SQL type.
-  auto join_on(const Table* (&sides)[2], const ast::Compare& w) const -> logical::Expr {
-    auto [ls, lc] = column(sides, w.lhs);
-    auto [rs, rc] = column(sides, w.rhs);
+  // A column of one relation compared with a column of another, of one SQL
+  // type, by any of the operators.
+  auto join_on(std::span<const Table* const> rels, const ast::Compare& w) const -> logical::Expr {
+    auto [ls, lc] = column(rels, w.lhs);
+    auto [rs, rc] = column(rels, w.rhs);
     if (ls == rs) throw SqlError{"comparing two columns of one table is not supported yet", w.pos};
-    if (w.op != ast::Compare::Op::Eq) throw SqlError{"a join compares two columns with = only yet", w.pos};
-    return joined_equal(*sides[ls], *lc, *sides[rs], *rc, w.pos);
+    return joined_compare(w.op, rels[ls]->id, *lc, rels[rs]->id, *rc, w.pos);
   }
 
-  // l.lc = r.rc, columns of one SQL type: two of different ones are
+  // l.lc <op> r.rc, columns of one SQL type: two of different ones are
   // refused (docs/frontend_design.md, *Known differences*).
-  static auto joined_equal(const Table& l, const Column& lc, const Table& r, const Column& rc, std::int32_t pos)
-      -> logical::Expr {
+  static auto joined_compare(ast::Compare::Op op, std::uint32_t l, const Column& lc, std::uint32_t r, const Column& rc,
+                             std::int32_t pos) -> logical::Expr {
     if (compared_type(lc.sql).identity != compared_type(rc.sql).identity) {
       throw SqlError{"comparing " + lc.name + " (" + sql_type_name(lc.sql) + ") with " + rc.name + " (" +
                          sql_type_name(rc.sql) + ") is not supported: a join compares columns of one type",
                      pos};
     }
-    return logical::compare(ast::Compare::Op::Eq, logical::column_of(l.id, lc), logical::column_of(r.id, rc));
+    return logical::compare(op, logical::column_of(l, lc), logical::column_of(r, rc));
   }
 
-  // USING (…) or NATURAL: its columns, each of both tables and named once
-  // (NATURAL: every column name they share, in the left table's order), and
-  // the equality of each, in that order.
-  // The columns a USING clause or NATURAL joins on, in order (NATURAL:
-  // every column name both tables share, in the left table's order).
-  static auto shared_columns(const Table* const (&sides)[2], const ast::Select& s) -> std::vector<std::string> {
-    auto names = s.using_columns;
-    if (s.natural) {
-      for (const auto& c : sides[0]->columns) {
-        if (!c.hidden && sides[1]->column(c.name) != nullptr) names.push_back(c.name);
+  // The columns the second FROM item's USING or NATURAL joins on, in order
+  // (NATURAL: every column name both tables share, in the left table's order).
+  static auto shared_columns(const Table& left, const Table& right, const ast::FromItem& item) -> std::vector<std::string> {
+    auto names = item.using_columns;
+    if (item.natural) {
+      for (const auto& c : left.columns) {
+        if (!c.hidden && right.column(c.name) != nullptr) names.push_back(c.name);
       }
     }
     return names;
   }
-  auto using_conjuncts(const Table* (&sides)[2], const ast::Select& s) -> std::vector<logical::Expr> {
-    using_ = shared_columns(sides, s);
-    using_alias_ = s.using_alias;
+
+  // The equality of each of the USING columns or NATURAL's, in order, each
+  // column of both tables and named once.
+  auto using_conjuncts(const Table& left, const Table& right, const ast::FromItem& item) -> std::vector<logical::Expr> {
+    using_ = shared_columns(left, right, item);
+    using_alias_ = item.using_alias;
     std::vector<logical::Expr> out;
     for (const auto& name : using_) {
       if (std::ranges::count(using_, name) > 1) {
-        throw SqlError{"column name \"" + name + "\" appears more than once in USING clause", s.join_pos, kDuplicateColumn};
+        throw SqlError{"column name \"" + name + "\" appears more than once in USING clause", item.pos, kDuplicateColumn};
       }
-      for (std::uint32_t side = 0; side < 2; ++side) {
-        if (sides[side]->column(name) == nullptr) {
+      for (const auto* side : {&left, &right}) {
+        if (side->column(name) == nullptr) {
           throw SqlError{"column \"" + name + "\" specified in USING clause does not exist in " +
-                             (side == 0 ? "left" : "right") + " table",
-                         s.join_pos, kUndefinedColumn};
+                             (side == &left ? "left" : "right") + " table",
+                         item.pos, kUndefinedColumn};
         }
       }
-      out.push_back(joined_equal(*sides[0], *sides[0]->column(name), *sides[1], *sides[1]->column(name), s.join_pos));
+      out.push_back(joined_compare(ast::Compare::Op::Eq, left.id, *left.column(name), right.id, *right.column(name), item.pos));
     }
     return out;
   }
 
-  // A SELECT of one table, or of two joined: Limit? -> Project -> Sort? ->
-  // Filter? -> Get, or a Join of two Gets; aggregated, Limit? -> Sort? ->
-  // Filter? -> Aggregate -> Filter? -> the tables, the Filter above the
-  // Aggregate its HAVING. The WHERE's conjuncts, a join's ON among them, sit
-  // in one Filter above the tables; predicate pushdown moves each down. No
-  // FOR UPDATE on a join yet.
+  // The tables the FROM items name, each read by an instance of its own
+  // (instance).
+  auto relations(const ast::Select& s) -> std::vector<const Table*> {
+    std::vector<const Table*> rels;
+    for (const auto& item : s.from) {
+      const auto pos = s.from.size() == 1 ? s.pos : item.pos;
+      rels.push_back(instance(*table(item.table, pos), item.name(), rels));
+      // Two views of one table are merged into the query under one name.
+      if (std::ranges::count_if(rels, [&](const Table* r) { return r->name == rels.back()->name; }) > 1) {
+        not_yet("a table joined with itself through views", pos);
+      }
+    }
+    return rels;
+  }
+
+  // The table to read for a use of `t` named `name`: the table itself, or,
+  // where the query reads it already or names it otherwise, an instance of
+  // it with an id of its own, which the plan reads the table's rows through
+  // (Table::source). The instance outlives the plan: the bound statement
+  // owns it.
+  auto instance(const Table& t, const std::string& name, const std::vector<const Table*>& read) -> const Table* {
+    auto again = std::ranges::any_of(read, [&](const Table* r) { return r->storage_id() == t.id; });
+    if (!again && name == t.name) return &t;
+    auto copy = std::make_unique<Table>(t);
+    copy->id = Table::kInstanceBase + bytecask::sql::narrow<std::uint32_t>(instances_.size());
+    copy->source = t.id;
+    copy->name = name;
+    instances_.push_back(std::move(copy));
+    return instances_.back().get();
+  }
+
+  // A SELECT of tables: Limit? -> Project -> Sort? -> Filter? -> a tree of
+  // Joins over Gets, left-deep, each Join's right side the next FROM item;
+  // aggregated, Limit? -> Sort? -> Filter? -> Aggregate -> Filter? -> the
+  // tables, the Filter above the Aggregate its HAVING. The WHERE's conjuncts,
+  // an inner join's ON among them, sit in one Filter above the tables;
+  // predicate pushdown moves each down. An outer join's ON stays its Join's.
+  // No FOR UPDATE on a join yet.
   //
   // A query is aggregated by a GROUP BY, a HAVING or an aggregate call. Then
   // a column it selects, orders by or compares in HAVING must be grouped,
@@ -2719,45 +2773,63 @@ public:
   // one (Aggregate::dependent), and the GROUP BY stays as written.
   auto select(const ast::Select& s) -> logical::NodePtr {
     if (s.set) return set_operation(s);
-    if (s.table.empty()) return select_without_from(s);
+    if (s.from.empty()) return select_without_from(s);
+    auto rels = relations(s);
     auto starred = std::ranges::any_of(s.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Star; });
     std::vector<ast::Expr> expanded;
-    if (starred) expanded = expand_stars(s);
+    if (starred) expanded = expand_stars(s, rels);
     const auto& list = starred ? expanded : s.targets;
-    auto joined = !s.join.empty();
-    const Table* sides[2]{table(s.table, joined ? s.table_pos : s.pos), nullptr};
-    std::vector<logical::Expr> conjuncts;
-    auto outer = joined && s.join_kind != ast::Select::JoinKind::Inner;
-    std::vector<logical::Expr> on;  // an outer join's ON: its Join's predicate
+    const auto n = rels.size();
+    auto joined = n > 1;
+    std::vector<logical::Expr> where_conjuncts;
+    // Join k's ON, for each outer join k.
+    std::vector<std::vector<logical::Expr>> on(n);
+    std::vector<bool> outer(n, false);
+    set_scope(rels);
     if (joined) {
-      sides[1] = table(s.join, s.join_pos);
-      set_scope({sides[0], sides[1]});
-      if (sides[0] == sides[1]) throw SqlError{"a table joined with itself is not supported", s.pos};
       if (s.for_update) throw SqlError{"FOR UPDATE on a join is not supported yet", s.pos};
-      conjuncts = using_conjuncts(sides, s);
+      for (std::size_t k = 1; k < n; ++k) {
+        outer[k] = s.from[k].kind != ast::JoinKind::Inner;
+        if (s.from[k].kind == ast::JoinKind::Right && n > 2) not_yet("a RIGHT JOIN of more than two tables", s.from[k].pos);
+      }
+      // USING and NATURAL join the first two tables.
+      auto first = using_conjuncts(*rels[0], *rels[1], s.from[1]);
+      for (std::size_t k = 2; k < n; ++k) {
+        if (s.from[k].natural || !s.from[k].using_columns.empty()) {
+          not_yet("USING or NATURAL after the first join", s.from[k].pos);
+        }
+      }
       // An outer join's ON decides its pairs and its WHERE filters them, so
       // the two stay apart; the table every row of which it keeps comes
       // first: RIGHT is LEFT of the tables swapped, and a USING column named
       // alone is that table's, as in PostgreSQL.
-      if (s.join_kind == ast::Select::JoinKind::Right) std::swap(sides[0], sides[1]);
-      if (outer) {
-        on = std::move(conjuncts);
-        auto rest = where(sides, s.where, true);
-        on.insert(on.end(), std::make_move_iterator(rest.begin()), std::make_move_iterator(rest.end()));
-        conjuncts = where(sides, s.where, false);
-      } else {
-        auto rest = where(sides, s.where);
-        conjuncts.insert(conjuncts.end(), std::make_move_iterator(rest.begin()), std::make_move_iterator(rest.end()));
+      if (s.from[1].kind == ast::JoinKind::Right) {
+        std::swap(rels[0], rels[1]);
+        set_scope(rels);
       }
+      for (std::size_t k = 1; k < n; ++k) {
+        auto here = conjuncts(rels, s.where, static_cast<std::uint32_t>(k));
+        if (k == 1) here.insert(here.begin(), std::make_move_iterator(first.begin()), std::make_move_iterator(first.end()));
+        // A column of a NULL-extended relation is NULL-able in the ON of every later join.
+        for (auto& e : here) {
+          for (std::size_t r = 1; r < k; ++r) {
+            if (outer[r]) mark_nullable(e, rels[r]->id);
+          }
+        }
+        auto& into = outer[k] ? on[k] : where_conjuncts;
+        into.insert(into.end(), std::make_move_iterator(here.begin()), std::make_move_iterator(here.end()));
+      }
+      auto rest = conjuncts(rels, s.where, 0);
+      where_conjuncts.insert(where_conjuncts.end(), std::make_move_iterator(rest.begin()), std::make_move_iterator(rest.end()));
     } else {
-      set_scope({sides[0]});
-      conjuncts = where(*sides[0], s.where);
+      where_conjuncts = where(*rels[0], s.where);
     }
-    // A column reference: of the one table, or of the side that has it.
+    auto from = std::span<const Table* const>{rels};
+    // A column reference: of the one table, or of the relation that has it.
     auto resolve = [&](const ast::Expr& e) -> std::pair<const Table*, const Column*> {
-      if (!joined) return {sides[0], column(*sides[0], e)};
-      auto [side, c] = column(sides, e);
-      return {sides[side], c};
+      if (!joined) return {from[0], column(*from[0], e)};
+      auto [side, c] = column(from, e);
+      return {from[side], c};
     };
     auto aggregated = !s.group_by.empty() || !s.having.empty() ||
                       std::ranges::any_of(list, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Aggregate; });
@@ -2853,10 +2925,11 @@ public:
       keys.push_back({std::move(key), o.desc, o.nulls_first.value_or(o.desc)});
     }
 
-    auto rows = joined ? logical::node(logical::Join{logical::node(logical::Get{sides[0], false}),
-                                                     logical::node(logical::Get{sides[1], false}), std::move(on), outer})
-                       : logical::node(logical::Get{sides[0], s.for_update});
-    if (!conjuncts.empty()) rows = logical::node(logical::Filter{std::move(rows), std::move(conjuncts)});
+    auto rows = logical::node(logical::Get{rels[0], !joined && s.for_update});
+    for (std::size_t k = 1; k < n; ++k) {
+      rows = logical::node(logical::Join{std::move(rows), logical::node(logical::Get{rels[k], false}), std::move(on[k]), outer[k]});
+    }
+    if (!where_conjuncts.empty()) rows = logical::node(logical::Filter{std::move(rows), std::move(where_conjuncts)});
     if (aggregated) {
       rows = logical::node(logical::Aggregate{std::move(rows), std::move(targets), std::move(group_by), grouping,
                                               std::move(dependent)});
@@ -2867,7 +2940,9 @@ public:
       rows = logical::node(logical::Project{std::move(rows), std::move(targets)});
     }
     if (s.limit) rows = logical::node(logical::Limit{std::move(rows), *s.limit});
-    if (outer) nullable_above_join(*rows, sides[1]->id);
+    for (std::size_t k = 1; k < n; ++k) {
+      if (outer[k]) nullable_above_join(*rows, rels[k]->id);
+    }
     return rows;
   }
 
@@ -3009,12 +3084,13 @@ public:
 
   // Above a left outer join every column of its right table may be NULL, in
   // the rows it NULL-extends, whatever the column's declaration: so marked,
-  // the plan tests it. The join's own predicate and inputs read real rows.
+  // the plan tests it. The join's own predicate and inputs read real rows;
+  // a later join's ON is marked where it is bound.
+  static void mark_nullable(logical::Expr& e, std::uint32_t table) {
+    if (e.kind == logical::Expr::Kind::Column && e.col.table == table) e.col.nullable = true;
+    for (auto& a : e.args) mark_nullable(a, table);
+  }
   static void nullable_above_join(logical::Node& n, std::uint32_t table) {
-    std::function<void(logical::Expr&)> mark = [&](logical::Expr& e) {
-      if (e.kind == logical::Expr::Kind::Column && e.col.table == table) e.col.nullable = true;
-      for (auto& a : e.args) mark(a);
-    };
     std::visit(
         [&](auto& op) {
           using T = std::decay_t<decltype(op)>;
@@ -3022,15 +3098,15 @@ public:
             return;
           } else {
             if constexpr (std::is_same_v<T, logical::Filter>) {
-              for (auto& c : op.conjuncts) mark(c);
+              for (auto& c : op.conjuncts) mark_nullable(c, table);
             } else if constexpr (std::is_same_v<T, logical::Project>) {
-              for (auto& o : op.exprs) mark(o.expr);
+              for (auto& o : op.exprs) mark_nullable(o.expr, table);
             } else if constexpr (std::is_same_v<T, logical::Aggregate>) {
-              for (auto& o : op.aggs) mark(o.expr);
-              for (auto& g : op.group_by) mark(g);
-              for (auto& g : op.dependent) mark(g);
+              for (auto& o : op.aggs) mark_nullable(o.expr, table);
+              for (auto& g : op.group_by) mark_nullable(g, table);
+              for (auto& g : op.dependent) mark_nullable(g, table);
             } else if constexpr (std::is_same_v<T, logical::Sort>) {
-              for (auto& k : op.keys) mark(k.expr);
+              for (auto& k : op.keys) mark_nullable(k.expr, table);
             }
             if constexpr (requires { op.input; }) nullable_above_join(*op.input, table);
           }
@@ -3048,10 +3124,8 @@ public:
   // The select list with each * and `table`.* replaced by the columns it
   // stands for, in table order, hidden ones left out. A * over a USING or
   // NATURAL join gives the USING columns first, each once, named alone.
-  auto expand_stars(const ast::Select& s) -> std::vector<ast::Expr> {
+  auto expand_stars(const ast::Select& s, const std::vector<const Table*>& from) -> std::vector<ast::Expr> {
     std::vector<ast::Expr> out;
-    const Table* from[2]{table(s.table, s.join.empty() ? s.pos : s.table_pos), nullptr};
-    if (!s.join.empty()) from[1] = table(s.join, s.join_pos);
     auto column_expr = [](const Table& t, const Column& c, std::int32_t pos) {
       ast::Expr e{ast::Expr::Kind::Column, c.name, 0, nullptr, nullptr, pos};
       e.table = t.name;
@@ -3065,19 +3139,28 @@ public:
       }
       if (!e.alias.empty()) throw SqlError{"syntax error at or near \"AS\"", e.pos};
       std::vector<std::string> merged;
-      if (e.table.empty() && from[1] != nullptr) {
-        merged = shared_columns(from, s);
+      if (e.table.empty() && from.size() > 1) {
+        merged = shared_columns(*from[0], *from[1], s.from[1]);
+        // Each is the preserved table's, named by it: a third table may
+        // have a column of the name too.
+        const auto& kept = s.from[1].kind == ast::JoinKind::Right ? *from[1] : *from[0];
         for (const auto& name : merged) {
           ast::Expr c{ast::Expr::Kind::Column, name, 0, nullptr, nullptr, e.pos};
+          if (from.size() > 2) c.table = kept.name;
           out.push_back(std::move(c));
         }
       }
       auto any = false;
-      for (const auto* t : from) {
-        if (t == nullptr || (!e.table.empty() && e.table != t->name)) continue;
+      for (std::size_t i = 0; i < from.size(); ++i) {
+        const auto* t = from[i];
+        if (!e.table.empty() && e.table != t->name) continue;
         any = true;
+        // The USING columns are the first two tables' alone.
+        auto joined_on = i < 2 ? &merged : nullptr;
         for (const auto& c : t->columns) {
-          if (!c.hidden && std::ranges::find(merged, c.name) == merged.end()) out.push_back(column_expr(*t, c, e.pos));
+          if (!c.hidden && (joined_on == nullptr || std::ranges::find(*joined_on, c.name) == joined_on->end())) {
+            out.push_back(column_expr(*t, c, e.pos));
+          }
         }
       }
       if (!any) throw SqlError{"missing FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable};
@@ -3230,7 +3313,10 @@ public:
 
   auto param_table() const -> std::vector<std::uint32_t> {
     std::vector<std::uint32_t> out;
-    for (const auto& p : params_) out.push_back(p.table);
+    for (const auto& p : params_) {
+      // A refusal names the table the rows are in, not an instance of it.
+      out.push_back(p.table >= Table::kInstanceBase ? instances_.at(p.table - Table::kInstanceBase)->source : p.table);
+    }
     return out;
   }
 
@@ -3272,6 +3358,7 @@ private:
   std::uint32_t own_params_;
   std::vector<std::string> using_;  // a join's USING or NATURAL columns: one column each
   std::string using_alias_;         // USING (…) AS alias
+  std::vector<std::unique_ptr<Table>> instances_;  // see instance()
   std::vector<ParamUse> params_;
   std::vector<Datum> fixed_;  // the constants' values, $own_params_ + 1 onwards
   std::vector<PhysType> fixed_types_;
@@ -3472,7 +3559,7 @@ public:
     Binder scratch{cat_, 0};
     if (!b.select.set &&
         std::ranges::any_of(b.select.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Star; })) {
-      b.select.targets = scratch.expand_stars(b.select);
+      b.select.targets = scratch.expand_stars(b.select, scratch.relations(b.select));
     }
     auto root = scratch.select(b.select);
     for (const auto& out : Binder::outputs_of(*root)) b.names.push_back(out.name);
@@ -3498,10 +3585,9 @@ public:
       relations(s.set->right, out);
       return;
     }
-    for (const auto* name : {&s.table, &s.join}) {
-      if (name->empty()) continue;
-      if (const auto* t = cat_.table(*name)) out.push_back(t->id);
-      if (const auto* v = cat_.view(*name)) out.push_back(v->id);
+    for (const auto& item : s.from) {
+      if (const auto* t = cat_.table(item.table)) out.push_back(t->id);
+      if (const auto* v = cat_.view(item.table)) out.push_back(v->id);
     }
     each_subquery(s, [&](const std::shared_ptr<const ast::Select>& q) { relations(*q, out); });
   }
@@ -3511,7 +3597,7 @@ private:
 
   [[nodiscard]] auto mentions(const ast::Select& s) const -> bool {
     if (s.set) return mentions(s.set->left) || mentions(s.set->right);
-    auto found = cat_.view(s.table) != nullptr || cat_.view(s.join) != nullptr;
+    auto found = std::ranges::any_of(s.from, [&](const ast::FromItem& item) { return cat_.view(item.table) != nullptr; });
     each_subquery(s, [&](const std::shared_ptr<const ast::Select>& q) { found = found || mentions(*q); });
     return found;
   }
@@ -3571,13 +3657,17 @@ private:
       if (mentions(*q)) q = std::make_shared<const ast::Select>(expand(*q));
     };
     each_subquery(s, expand_slot);
-    const auto* left = cat_.view(s.table);
-    const auto* right = cat_.view(s.join);
-    if (left == nullptr && right == nullptr) return s;
-    if (s.join.empty()) {
-      merge_one(s, body(*left));
+    auto views = std::ranges::count_if(s.from, [&](const ast::FromItem& item) { return cat_.view(item.table) != nullptr; });
+    if (views == 0) return s;
+    if (std::ranges::any_of(s.from, [](const ast::FromItem& item) { return !item.alias.empty(); })) {
+      not_yet("a view in a query that names a table twice", s.from[0].pos);
+    }
+    if (s.from.size() == 1) {
+      merge_one(s, body(*cat_.view(s.from[0].table)));
+    } else if (s.from.size() == 2) {
+      merge_two(s, cat_.view(s.from[0].table), cat_.view(s.from[1].table));
     } else {
-      merge_two(s, left, right);
+      not_yet("a view in a join of three or more tables", s.from[0].pos);
     }
     return s;
   }
@@ -3589,10 +3679,11 @@ private:
   // that cuts rows (DISTINCT, LIMIT).
   void merge_one(ast::Select& s, const ViewBody& v) {
     const auto& view = v.select;
-    if (view.set) not_yet("reading a view defined with a set operation", s.table_pos);
+    const auto& name = s.from[0].table;
+    if (view.set) not_yet("reading a view defined with a set operation", s.from[0].pos);
     auto grouped = aggregated(view);
-    if (view.distinct || view.limit) not_yet("a view defined with DISTINCT or LIMIT", s.table_pos);
-    if (view.for_update) not_yet("a view defined FOR UPDATE", s.table_pos);
+    if (view.distinct || view.limit) not_yet("a view defined with DISTINCT or LIMIT", s.from[0].pos);
+    if (view.for_update) not_yet("a view defined FOR UPDATE", s.from[0].pos);
     auto again = aggregated(s) || s.distinct;
     std::vector<ast::Expr> targets;
     for (auto& e : s.targets) {
@@ -3600,15 +3691,15 @@ private:
         targets.push_back(std::move(e));
         continue;
       }
-      if (!e.table.empty() && e.table != s.table) {
+      if (!e.table.empty() && e.table != name) {
         throw SqlError{"missing FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable};
       }
       if (!e.alias.empty()) throw SqlError{"syntax error at or near \"AS\"", e.pos};
-      for (const auto& name : v.names) targets.push_back(column_named(e, "", name));
+      for (const auto& column : v.names) targets.push_back(column_named(e, "", column));
     }
     s.targets = std::move(targets);
     auto swap = [&](ast::Expr& ref) -> std::optional<ast::Expr> {
-      if (!ref.table.empty() && ref.table != s.table) {
+      if (!ref.table.empty() && ref.table != name) {
         throw SqlError{"missing FROM-clause entry for table \"" + ref.table + "\"", ref.pos, kUndefinedTable};
       }
       auto at = std::ranges::find(v.names, ref.column);
@@ -3627,14 +3718,7 @@ private:
       for (const auto& g : view.group_by) s.group_by.push_back(ast::clone(g));
     }
     // The query takes the view's FROM, and its WHERE joins the query's.
-    s.table = view.table;
-    s.join = view.join;
-    s.table_pos = view.table_pos;
-    s.join_pos = view.join_pos;
-    s.using_columns = view.using_columns;
-    s.natural = view.natural;
-    s.using_alias = view.using_alias;
-    s.join_kind = view.join_kind;
+    s.from = view.from;
     std::vector<ast::Compare> where;
     for (const auto& c : view.where) where.push_back(ast::clone(c));
     for (auto& c : s.where) where.push_back(std::move(c));
@@ -3709,22 +3793,23 @@ private:
     const Table* table{nullptr};
   };
   void merge_two(ast::Select& s, const View* left, const View* right) {
-    Side sides[2]{{s.table, left != nullptr ? &body(*left) : nullptr, cat_.table(s.table)},
-                  {s.join, right != nullptr ? &body(*right) : nullptr, cat_.table(s.join)}};
+    const auto& join = s.from[1];
+    Side sides[2]{{s.from[0].table, left != nullptr ? &body(*left) : nullptr, cat_.table(s.from[0].table)},
+                  {join.table, right != nullptr ? &body(*right) : nullptr, cat_.table(join.table)}};
     for (auto i = 0; i < 2; ++i) {
       if (sides[i].view == nullptr && sides[i].table == nullptr) {
-        throw SqlError{"relation \"" + sides[i].name + "\" does not exist", i == 0 ? s.table_pos : s.join_pos, kUndefinedTable};
+        throw SqlError{"relation \"" + sides[i].name + "\" does not exist", s.from[static_cast<std::size_t>(i)].pos, kUndefinedTable};
       }
     }
-    auto outer = s.join_kind != ast::Select::JoinKind::Inner;
-    if (!s.using_columns.empty() || s.natural) not_yet("USING or NATURAL join of a view", s.join_pos);
+    auto outer = join.kind != ast::JoinKind::Inner;
+    if (!join.using_columns.empty() || join.natural) not_yet("USING or NATURAL join of a view", join.pos);
     for (const auto& side : sides) {
       if (side.view == nullptr) continue;
       const auto& v = side.view->select;
-      if (v.table.empty() || !v.join.empty() || aggregated(v) || v.distinct || v.limit || v.for_update) {
-        not_yet("a join of view \"" + side.name + "\", which is not a plain SELECT of one table", s.join_pos);
+      if (v.from.size() != 1 || aggregated(v) || v.distinct || v.limit || v.for_update) {
+        not_yet("a join of view \"" + side.name + "\", which is not a plain SELECT of one table", join.pos);
       }
-      if (outer && !v.where.empty()) not_yet("an outer join of view \"" + side.name + "\", which has a WHERE", s.join_pos);
+      if (outer && !v.where.empty()) not_yet("an outer join of view \"" + side.name + "\", which has a WHERE", join.pos);
     }
     auto has = [](const Side& side, const std::string& column) {
       if (side.view != nullptr) return std::ranges::find(side.view->names, column) != side.view->names.end();
@@ -3754,7 +3839,7 @@ private:
         throw SqlError{"column \"" + ref.column + "\" does not exist", ref.pos, kUndefinedColumn};
       }
       auto item = ast::clone(side.view->select.targets[static_cast<std::size_t>(at - side.view->names.begin())]);
-      qualify(item, side.view->select.table);
+      qualify(item, side.view->select.from[0].table);
       return item;
     };
     std::vector<ast::Expr> targets;
@@ -3784,11 +3869,11 @@ private:
       if (side.view == nullptr) continue;
       for (const auto& c : side.view->select.where) {
         s.where.push_back(ast::clone(c));
-        qualify(s.where.back(), side.view->select.table);
+        qualify(s.where.back(), side.view->select.from[0].table);
       }
     }
-    s.table = sides[0].view != nullptr ? sides[0].view->select.table : sides[0].name;
-    s.join = sides[1].view != nullptr ? sides[1].view->select.table : sides[1].name;
+    s.from[0].table = sides[0].view != nullptr ? sides[0].view->select.from[0].table : sides[0].name;
+    s.from[1].table = sides[1].view != nullptr ? sides[1].view->select.from[0].table : sides[1].name;
   }
 
   const Catalog& cat_;
@@ -3804,7 +3889,7 @@ auto bind_create_view(const ast::CreateView& cv, const Catalog& cat) -> Bound {
   ViewExpander views{cat};
   CreateViewDdl ddl{cv.view, cv.definition, {}, views.describe(cv.query, cv.columns).names};
   views.relations(cv.query, ddl.depends_on);
-  return Bound{Ddl{std::move(ddl)}, {}, {}, {}, {}, {}, {}, {}};
+  return Bound{Ddl{std::move(ddl)}, {}, {}, {}, {}, {}, {}, {}, {}};
 }
 
 }  // namespace
@@ -3925,7 +4010,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
   auto types = b.param_types(bound_stmt.second);
   types.insert(types.end(), b.fixed_types().begin(), b.fixed_types().end());
   return Bound{std::move(bound_stmt.first), std::move(types), b.param_sql(), b.param_table(), b.param_info(),
-               b.fixed_values(), b.take_subqueries(), views.used()};
+               b.fixed_values(), b.take_subqueries(), views.used(), b.take_instances()};
 }
 
 }  // namespace bytecask::sql::bound

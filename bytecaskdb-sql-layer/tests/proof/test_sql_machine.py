@@ -2105,6 +2105,97 @@ def test_left_and_right_join_null_extend_the_rows_nothing_matches(dsn):
         m.teardown()
 
 
+def test_joins_of_several_tables_with_themselves_and_on_any_comparison(dsn):
+    """Three or more tables, a table joined with itself under two aliases,
+    and ON by any comparison or by a predicate over both sides, inner and
+    left, in a chain: each pair NULL-extended or dropped as PostgreSQL does,
+    through the layer, the server and every plan the search costed."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER), Column("c1", o.INTEGER), Column("c2", o.INTEGER)], ["c0"]))
+        m.create(Table("t1", [Column("c3", o.INTEGER), Column("c1", o.INTEGER), Column("c4", o.INTEGER)], ["c3"]))
+        m.create_index("t1", Index("t1_c1", [("c1", False)]))
+        m.create(Table("t2", [Column("c5", o.INTEGER), Column("c1", o.INTEGER)], ["c5"]))
+        # Each table has a row of key 0: what a row of NULLs would read as, if a join read a key from one.
+        for row in ({"c0": 0, "c1": 3, "c2": 5}, {"c0": 1, "c1": 1, "c2": 10}, {"c0": 2, "c1": 2, "c2": 20},
+                    {"c0": 3, "c1": 2, "c2": None}, {"c0": 4, "c1": None, "c2": 40}, {"c0": 5, "c1": 5, "c2": 50}):
+            assert m.insert("t0", row, all_columns=True).error is None
+        for row in ({"c3": 0, "c1": 4, "c4": 50}, {"c3": 1, "c1": 1, "c4": 100}, {"c3": 2, "c1": 2, "c4": 200},
+                    {"c3": 3, "c1": 2, "c4": None}, {"c3": 4, "c1": None, "c4": 400}, {"c3": 6, "c1": 6, "c4": 600}):
+            assert m.insert("t1", row, all_columns=True).error is None
+        for row in ({"c5": 0, "c1": 4}, {"c5": 1, "c1": 1}, {"c5": 2, "c1": 2}, {"c5": 3, "c1": None}, {"c5": 7, "c1": 7}):
+            assert m.insert("t2", row, all_columns=True).error is None
+        statements = (
+            # Three tables and more, by JOIN or by a comma list, in any order the WHERE leaves.
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 JOIN t1 ON t0.c1 = t1.c1 JOIN t2 ON t1.c1 = t2.c1 ORDER BY 1, 2, 3",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0, t1, t2 WHERE t0.c1 = t1.c1 AND t1.c1 = t2.c1 ORDER BY 1, 2, 3",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 JOIN t1 ON t0.c0 = t1.c3 JOIN t2 ON t2.c5 = t0.c0 ORDER BY 1",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0, t1, t2 WHERE t0.c1 < t1.c1 AND t1.c1 <> t2.c1 ORDER BY 1, 2, 3",
+            "SELECT COUNT(*), MIN(t2.c5) FROM t0 JOIN t1 ON t0.c1 = t1.c1 JOIN t2 ON t1.c1 = t2.c1",
+            "SELECT t0.c1, COUNT(*) FROM t0 JOIN t1 ON t0.c1 = t1.c1 JOIN t2 ON t1.c1 = t2.c1 GROUP BY t0.c1 ORDER BY 1",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 JOIN t1 ON t0.c1 = t1.c1 JOIN t2 ON t1.c1 = t2.c1 ORDER BY 1, 2, 3 LIMIT 2",
+            # ON by any comparison, and by a predicate over both sides.
+            "SELECT t0.c0, t1.c3 FROM t0 JOIN t1 ON t0.c1 < t1.c1 ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0 JOIN t1 ON t0.c1 <= t1.c1 ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0 JOIN t1 ON t0.c1 > t1.c1 ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0 JOIN t1 ON t0.c1 >= t1.c1 ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0 JOIN t1 ON t0.c1 <> t1.c1 ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0 JOIN t1 ON t0.c1 = t1.c1 AND t0.c2 < t1.c4 ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0 JOIN t1 ON NOT (t0.c1 = t1.c1) ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0 JOIN t1 ON t0.c1 = t1.c1 OR t0.c2 = t1.c4 ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0 JOIN t1 ON t0.c1 < t1.c1 OR t1.c4 IS NULL ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0, t1 WHERE t0.c1 <> t1.c1 AND t0.c0 > 1 ORDER BY 1, 2",
+            # Left joins: a pair of the ON, or the row NULL-extended, again through a second join.
+            "SELECT t0.c0, t1.c3 FROM t0 LEFT JOIN t1 ON t0.c1 < t1.c1 ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 AND NOT (t0.c2 < t1.c4) ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 LEFT JOIN t2 ON t1.c1 = t2.c1 ORDER BY 1, 2, 3",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 LEFT JOIN t2 ON t1.c3 = t2.c5 ORDER BY 1, 2, 3",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 LEFT JOIN t1 ON t0.c1 < t1.c1 LEFT JOIN t2 ON t1.c1 <> t2.c1 ORDER BY 1, 2, 3",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 LEFT JOIN t2 ON t0.c1 = t2.c1 AND t1.c4 > 100 ORDER BY 1, 2, 3",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 LEFT JOIN t2 ON t1.c1 = t2.c1 WHERE t2.c5 IS NULL ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 LEFT JOIN t2 ON t1.c1 = t2.c1 WHERE t1.c3 IS NULL ORDER BY 1",
+            # An inner join after a left join drops the rows it NULL-extended; before it, it does not.
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 JOIN t2 ON t1.c1 = t2.c1 ORDER BY 1, 2, 3",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 JOIN t1 ON t0.c1 = t1.c1 LEFT JOIN t2 ON t1.c1 = t2.c1 ORDER BY 1, 2, 3",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 LEFT JOIN t1 ON t0.c0 = t1.c3 JOIN t2 ON t2.c5 = t1.c3 ORDER BY 1",
+            "SELECT t0.c1, COUNT(t1.c3), COUNT(t2.c5), COUNT(*) FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 LEFT JOIN t2 ON t1.c1 = t2.c1 GROUP BY t0.c1 ORDER BY 1",
+            # A table with itself, under two aliases, on its key, a column, a comparison or USING.
+            "SELECT x.c0, y.c0 FROM t0 x JOIN t0 y ON x.c0 = y.c0 ORDER BY 1",
+            "SELECT x.c0, y.c0 FROM t0 x JOIN t0 y ON x.c1 = y.c1 ORDER BY 1, 2",
+            "SELECT x.c0, y.c0 FROM t0 x JOIN t0 y ON x.c0 < y.c0 ORDER BY 1, 2",
+            "SELECT x.c0, y.c0 FROM t0 x, t0 y WHERE x.c1 <> y.c1 ORDER BY 1, 2",
+            "SELECT x.c0, y.c0 FROM t0 x LEFT JOIN t0 y ON x.c1 = y.c1 AND x.c0 <> y.c0 ORDER BY 1, 2",
+            "SELECT x.c0, y.c0 FROM t0 x RIGHT JOIN t0 y ON x.c2 < y.c2 ORDER BY 1, 2",
+            "SELECT t0.c0, y.c0 FROM t0 JOIN t0 AS y ON t0.c0 = y.c0 ORDER BY 1",
+            "SELECT x.c0, y.c0, z.c0 FROM t0 x JOIN t0 y ON x.c0 < y.c0 JOIN t0 z ON y.c0 < z.c0 ORDER BY 1, 2, 3",
+            "SELECT x.c0, y.c0, z.c0 FROM t0 x LEFT JOIN t0 y ON x.c0 = y.c1 LEFT JOIN t0 z ON y.c0 = z.c1 ORDER BY 1, 2, 3",
+            "SELECT x.c0, z.c3 FROM t0 x JOIN t1 z ON x.c1 = z.c1 JOIN t0 y ON z.c1 = y.c1 ORDER BY 1, 2",
+            "SELECT * FROM t0 JOIN t0 AS y USING (c1) ORDER BY t0.c0, y.c0",
+            "SELECT * FROM t0 JOIN t0 AS y USING (c1) AS u ORDER BY t0.c0, y.c0",
+            "SELECT u.c1, t0.c0 FROM t0 JOIN t0 AS y USING (c1) AS u ORDER BY 1, 2",
+            "SELECT * FROM t0 JOIN t1 USING (c1) JOIN t2 ON t2.c1 = t0.c1 ORDER BY t0.c0, t1.c3, t2.c5",
+            # A subquery that joins, and one in a self-join's WHERE.
+            "SELECT x.c0 FROM t0 x WHERE x.c1 IN (SELECT p.c1 FROM t1 p JOIN t1 q ON p.c3 < q.c3) ORDER BY 1",
+            "SELECT x.c0, y.c0 FROM t0 x JOIN t0 y ON x.c0 < y.c0 WHERE x.c1 IN (SELECT c1 FROM t2) ORDER BY 1, 2",
+        )
+        for sql in statements:
+            layer = m.both(sql)
+            assert layer.error is None, sql
+            if not sql.startswith("SELECT * "):
+                pg = o.run_pg(m.pg.conn, sql)
+                m.alternatives_agree(sql, (), [], pg.rows, None, None)
+        # The errors PostgreSQL gives for a name used wrongly (42712 is one the oracle
+        # calls "refused", as it does any state it does not compare).
+        for sql, state in (("SELECT c0 FROM t0 x JOIN t0 y ON x.c0 = y.c0", "42702"),
+                           ("SELECT t0.c0 FROM t0 x JOIN t0 y ON x.c0 = y.c0", "42P01"),
+                           ("SELECT x.c0 FROM t0 x JOIN t0 x ON x.c0 = x.c0", "refused"),
+                           ("SELECT 1 FROM t0 JOIN t1 ON t0.c1 = t2.c1 JOIN t2 ON t1.c1 = t2.c1", "42P01")):
+            assert m.both(sql).error == state, sql
+        m.check()
+    finally:
+        m.teardown()
+
+
 def test_uncorrelated_subqueries_agree_with_postgresql(dsn):
     """Each form, over a subquery with NULLs, one without, one of no rows
     and one of one row: the three-valued IN, NOT IN, ANY and ALL, EXISTS, a
