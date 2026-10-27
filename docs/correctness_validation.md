@@ -2718,6 +2718,7 @@ if a mutation expected to be caught survives.
 | `resume_without_write_barrier` — `resume()` without its `WriteBarrier` | caught |
 | `read_cache_release_relaxed` — `ReadCacheSlot::release` store weakened to relaxed | caught, under TSan (a data race); ASan cannot see it |
 | `sync_flag_read_after_queue` — a queued writer reads its slot's `sync` flag while the batch's executor writes the slot | caught, under TSan (a data race); also by `WriteGroup slots may be destroyed as soon as submit returns` |
+| `unappended_plan_answers_from_head` — a plan that appends nothing returns without waiting for the head entry its outcome rests on | survives, reliably: it restores the code the nightly failed on in #672, but a 1,500 s run did not hit the window again; caught every time by `pipeline: a del after a failed flush does not answer from the failed write before the degrade is published` |
 | `mmap_end_relaxed` — `mmap_end_` weakened from release/acquire to relaxed | survives, by construction |
 
 Both caught mutations surface first as the engine refusing to derive a

@@ -201,7 +201,7 @@ otherwise:   append entries, apply them to the head
 
 Comparisons are by `KeyDirEntry::sequence`. Vacuum moves a record but keeps its sequence, so a relocated key is not a conflict. A record location names one immutable record for the life of the process, so a written key whose head entry still points at the snapshot's record is unchanged and needs no further lookup. On the blind-leaf key directory that check reads no record; `docs/bytecask_design.md` (*Implicit W-W check on write keys*) has the detail.
 
-A plan that conflicts with a write the head holds but that is not yet published returns once that write is published. Until then a retry from a fresh snapshot would see the same state and lose again. A plan whose snapshot is already behind the published state returns at once.
+A plan that conflicts with a write the head holds but that is not yet published returns once that write is published. Until then a retry from a fresh snapshot would see the same state and lose again. If that write's flush fails, the plan throws `DbDegraded`: the write is unseen, and a conflict with it is no answer. A plan the published state refutes as well returns at once. The same holds for a plan whose guards hold with nothing to write: it returns once what they held on is published.
 
 ### Single-entry plans
 

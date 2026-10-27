@@ -67,16 +67,20 @@ void TransientEngineState::apply_change_marker(std::uint64_t sequence,
 }
 
 auto TransientEngineState::validate_preconditions(
-    const WritePlan &plan, std::uint64_t &lost_to) const -> bool {
+    const WritePlan &plan, std::uint64_t &rests_on) const -> bool {
   const auto *snap_state =
       plan.snap_ ? plan.snap_->state_.get() : nullptr;
-  // The head's latest sequence: what a retry must see when the entry the
-  // plan lost to has no sequence of its own (deleted, or absent).
+  // The head's latest sequence: what an outcome rests on when the entry it
+  // read has no sequence of its own (deleted, or absent).
   const auto head_latest = next_seq_ - 1;
+  const auto read_seq = [&](const std::optional<KeyDirEntry> &cur) {
+    return cur ? cur->sequence() : head_latest;
+  };
   const auto lost = [&](const std::optional<KeyDirEntry> &cur) {
-    lost_to = cur ? cur->sequence() : head_latest;
+    rests_on = read_seq(cur);
     return false;
   };
+  std::uint64_t held_on = 0;
 
   // 1. Point guards.
   for (const auto &[key, guard] : plan.guards_) {
@@ -86,9 +90,11 @@ auto TransientEngineState::validate_preconditions(
     switch (guard.precondition) {
     case WritePlan::Precondition::MustExist:
       if (!cur_entry) return lost(std::nullopt);
+      held_on = std::max(held_on, read_seq(cur_entry));
       break;
     case WritePlan::Precondition::MustBeAbsent:
       if (cur_entry) return lost(cur_entry);
+      held_on = std::max(held_on, read_seq(cur_entry));
       break;
     case WritePlan::Precondition::MustBeUnchanged: {
       // ensure_unchanged already enforced snap_ is present at build time.
@@ -96,6 +102,7 @@ auto TransientEngineState::validate_preconditions(
       const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence() : 0;
       const std::uint64_t cur_seq = cur_entry ? cur_entry->sequence() : 0;
       if (cur_seq != snap_seq) return lost(cur_entry);
+      held_on = std::max(held_on, read_seq(cur_entry));
       break;
     }
     case WritePlan::Precondition::None:
@@ -104,8 +111,12 @@ auto TransientEngineState::validate_preconditions(
   }
 
   // 2. Range guards (only present when snap_ is set — enforced at build time).
-  for (const auto &rg : plan.range_guards_)
-    if (range_changed(*snap_state, rg.from, rg.to, lost_to)) return false;
+  // One that holds read keys absent from both states too, which have no
+  // sequence: it rests on the head's latest.
+  for (const auto &rg : plan.range_guards_) {
+    if (range_changed(*snap_state, rg.from, rg.to, rests_on)) return false;
+    held_on = head_latest;
+  }
 
   // 3. Implicit W-W check on all write keys (only when snapshot present).
   if (snap_state) {
@@ -123,7 +134,7 @@ auto TransientEngineState::validate_preconditions(
       const bool modified = snap_entry && cur_entry &&
                             cur_entry->sequence() != snap_entry->sequence();
       if (!(appeared || deleted || modified)) return false;
-      lost_to = cur_entry ? cur_entry->sequence() : head_latest;
+      rests_on = read_seq(cur_entry);
       return true;
     };
     for (std::size_t i = 0; i < plan.writes_.size(); ++i) {
@@ -135,7 +146,7 @@ auto TransientEngineState::validate_preconditions(
                           std::is_same_v<T, WritePlan::PointDel>) {
               has_conflict = point_conflict(i, op.key);
             } else if constexpr (std::is_same_v<T, WritePlan::RangeDel>) {
-              has_conflict = range_changed(*snap_state, op.from, op.to, lost_to);
+              has_conflict = range_changed(*snap_state, op.from, op.to, rests_on);
             }
           },
           plan.writes_[i]);
@@ -143,13 +154,14 @@ auto TransientEngineState::validate_preconditions(
     }
   }
 
+  rests_on = held_on;
   return true;
 }
 
 auto TransientEngineState::range_changed(const EngineState &snap,
                                          std::span<const std::byte> from,
                                          std::span<const std::byte> to,
-                                         std::uint64_t &lost_to) const -> bool {
+                                         std::uint64_t &rests_on) const -> bool {
   // Keys changed or inserted since the snapshot: present in the head with a
   // sequence the snapshot does not hold for them. A key vacuum relocated
   // keeps its sequence, so it is not a change.
@@ -160,7 +172,7 @@ auto TransientEngineState::range_changed(const EngineState &snap,
     const auto snap_entry = kd_get(snap.key_dir, key_span, snap.kd_ctx());
     const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence() : 0;
     if (entry.sequence() != snap_seq) {
-      lost_to = entry.sequence();
+      rests_on = entry.sequence();
       return true;
     }
   }
@@ -172,7 +184,7 @@ auto TransientEngineState::range_changed(const EngineState &snap,
     auto [key_span, entry] = *it;
     if (Key{key_span} >= Key{to}) break;
     if (!kd_get(key_dir_, key_span, kd_ctx())) {
-      lost_to = next_seq_ - 1;
+      rests_on = next_seq_ - 1;
       return true;
     }
   }

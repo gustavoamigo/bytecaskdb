@@ -611,11 +611,12 @@ public:
     std::uint64_t ignored = 0;
     return validate_preconditions(plan, ignored);
   }
-  // On failure, lost_to is the highest sequence among the entries the plan
-  // lost to — what a retry has to be able to see — or, for a key the plan
-  // found deleted or absent, the head's latest sequence.
+  // rests_on is the head entry the outcome rests on. On failure, the entry
+  // the plan lost to — what a retry has to be able to see. On success, the
+  // latest entry its guards read; 0 for a plan without guards. For a key
+  // found deleted or absent, which has no entry, the head's latest sequence.
   [[nodiscard]] auto validate_preconditions(const WritePlan &plan,
-                                            std::uint64_t &lost_to) const
+                                            std::uint64_t &rests_on) const
       -> bool;
 
   // Prepare IO plan — pure read, no mutations.
@@ -728,13 +729,13 @@ public:
 
 private:
   // Returns true if [from, to) differs between snap and the head: a key
-  // changed, inserted or deleted since snap. Sets lost_to as
+  // changed, inserted or deleted since snap. Sets rests_on as
   // validate_preconditions documents. Shared by range guards and the
   // implicit W-W check of a planned del_range.
   [[nodiscard]] auto range_changed(const EngineState &snap,
                                    std::span<const std::byte> from,
                                    std::span<const std::byte> to,
-                                   std::uint64_t &lost_to) const -> bool;
+                                   std::uint64_t &rests_on) const -> bool;
   // Where key_dir_ reads the keys it does not store: this transient's files
   // and the records it has not written yet.
   [[nodiscard]] auto kd_ctx() const -> KeyDirCtx {
@@ -1328,10 +1329,13 @@ public:
 private:
   explicit DB(std::filesystem::path dir, Options opts);
 
-  // Blocks until the published state covers sequence — a fresh snapshot
-  // can see the write a plan lost to — or the engine degrades or closes.
-  // See apply_batch.
+  // Blocks until the published state covers sequence, or the engine
+  // degrades or closes.
   void wait_published(std::uint64_t sequence) const;
+  // Returns once the outcome of a slot that appended nothing rests only on
+  // published writes. Throws DbDegraded when a write it rests on will never
+  // be published.
+  void settle_unappended(const EngineSlot &slot) const;
 
   // Drains background hint tasks then writes all sealed hint files.
   void flush_hints();
@@ -2208,12 +2212,10 @@ export struct EngineSlot : Slot {
   WritePlan plan;
   WriteOptions opts;
   std::optional<CommitResult> result;
-  // On a conflict: the sequence of the entry the plan lost to, and the
-  // plan's snapshot's next_seq. A snapshot that already covers every
-  // published write lost to something still in flight — see apply_batch,
-  // which then reports the conflict only once that write is published.
-  std::uint64_t conflict_lost_to{0};
-  std::uint64_t conflict_snap_next{0};
+  // A slot that appended nothing: the head entry its outcome rests on (see
+  // validate_preconditions). 0 when it rests on nothing. apply_batch
+  // returns only once it is published (settle_unappended).
+  std::uint64_t rests_on{0};
   // A sync slot that appended nothing: the sequence every earlier write
   // reaches, which commit_wait makes durable before the slot returns. Its
   // result keeps sequence 0 — the write itself wrote nothing.
