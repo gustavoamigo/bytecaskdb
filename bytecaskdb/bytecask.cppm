@@ -611,11 +611,12 @@ public:
     std::uint64_t ignored = 0;
     return validate_preconditions(plan, ignored);
   }
-  // On failure, lost_to is the highest sequence among the entries the plan
-  // lost to — what a retry has to be able to see — or, for a key the plan
-  // found deleted or absent, the head's latest sequence.
+  // rests_on is the head entry the outcome rests on. On failure, the entry
+  // the plan lost to — what a retry has to be able to see. On success, the
+  // latest entry its guards read; 0 for a plan without guards. For a key
+  // found deleted or absent, which has no entry, the head's latest sequence.
   [[nodiscard]] auto validate_preconditions(const WritePlan &plan,
-                                            std::uint64_t &lost_to) const
+                                            std::uint64_t &rests_on) const
       -> bool;
 
   // Prepare IO plan — pure read, no mutations.
@@ -728,13 +729,13 @@ public:
 
 private:
   // Returns true if [from, to) differs between snap and the head: a key
-  // changed, inserted or deleted since snap. Sets lost_to as
+  // changed, inserted or deleted since snap. Sets rests_on as
   // validate_preconditions documents. Shared by range guards and the
   // implicit W-W check of a planned del_range.
   [[nodiscard]] auto range_changed(const EngineState &snap,
                                    std::span<const std::byte> from,
                                    std::span<const std::byte> to,
-                                   std::uint64_t &lost_to) const -> bool;
+                                   std::uint64_t &rests_on) const -> bool;
   // Where key_dir_ reads the keys it does not store: this transient's files
   // and the records it has not written yet.
   [[nodiscard]] auto kd_ctx() const -> KeyDirCtx {
@@ -2211,9 +2212,8 @@ export struct EngineSlot : Slot {
   WritePlan plan;
   WriteOptions opts;
   std::optional<CommitResult> result;
-  // A slot that appended nothing: the latest head entry its outcome may
-  // rest on — on a conflict, the entry the plan lost to; when its guards
-  // held, the head's latest. 0 when nothing was decided. apply_batch
+  // A slot that appended nothing: the head entry its outcome rests on (see
+  // validate_preconditions). 0 when it rests on nothing. apply_batch
   // returns only once it is published (settle_unappended).
   std::uint64_t rests_on{0};
   // A sync slot that appended nothing: the sequence every earlier write

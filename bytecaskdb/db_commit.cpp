@@ -41,15 +41,16 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
     return true;
   }
 
-  if (!t.validate_preconditions(slot.plan, slot.rests_on)) {
+  std::uint64_t rests_on = 0;
+  if (!t.validate_preconditions(slot.plan, rests_on)) {
+    slot.rests_on = rests_on;
     slot.result = std::nullopt;
     return false;
   }
 
   auto entries = t.prepare_write(slot.plan);
   if (entries.empty()) {
-    // Guards that held may have held on any entry the head holds.
-    slot.rests_on = t.next_seq() - 1;  // next_seq starts at 1
+    slot.rests_on = rests_on;
     slot.result = CommitResult{};
     return true;
   }
@@ -579,10 +580,11 @@ void DB::commit_wait(EngineSlot &slot) {
 // write a plan lost to is published, every retry from a fresh snapshot
 // loses again. A caller's retry loop spun through the whole fdatasync of a
 // competing write — the CAS benchmark's average attempts went from 1.0 to
-// 7-350 when the commit was pipelined. The wait is for that write, not for
-// the whole head: under many writers the head always holds entries
-// appended after the flush in progress began, and waiting for those would
-// cost a second flush for nothing.
+// 7-350 when the commit was pipelined. The wait is for the entry the
+// outcome read, not for the whole head, whether the guards failed or held:
+// under many writers the head always holds entries appended after the
+// flush in progress began, and waiting for those would cost a second flush
+// for nothing.
 //
 // A slot whose outcome the published state gives as well returns at once:
 // it rests on what readers already see, and a conflict there is one a

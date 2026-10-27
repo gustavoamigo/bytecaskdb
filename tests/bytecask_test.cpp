@@ -14217,13 +14217,77 @@ TEST_CASE("pipeline: a del of a key that neither the head nor the published "
   std::thread ta([&] { db.put({.sync = true}, to_bytes("a"), to_bytes("1")); });
   before_wait.wait_in_flush();
 
-  const auto t0 = std::chrono::steady_clock::now();
+  // "At once" is "never waits for a publication": the wait would call
+  // test_in_sequence_wait_ before it blocks.
+  std::atomic<bool> waited{false};
+  db.test_in_sequence_wait_ = [&] { waited.store(true); };
   CHECK_FALSE(db.del({.sync = false}, to_bytes("missing")).has_value());
-  CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds{100});
+  CHECK_FALSE(waited.load());
 
   before_wait.open();
   ta.join();
   db.test_before_commit_wait_ = nullptr;
+  db.test_in_sequence_wait_ = nullptr;
+}
+
+TEST_CASE("pipeline: a guard-only plan waits for the entry its guard read "
+          "and not for writes appended after it",
+          "[pipeline][concurrency]") {
+  // F1 flushes A's put of n. C's put of x is appended while F1 runs, so it
+  // lands in F2. B's guard read n only: it returns once F1 publishes, while
+  // F2 is still held.
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("k"), to_bytes("0"));
+
+  std::atomic<int> syncs{0};
+  std::latch in_f1{1};
+  std::latch release_f1{1};
+  std::latch in_f2{1};
+  std::latch release_f2{1};
+  db.test_before_flush_sync_ = [&] {
+    const auto n = ++syncs;
+    if (n == 1) {
+      in_f1.count_down();
+      release_f1.wait();
+    } else if (n == 2) {
+      in_f2.count_down();
+      release_f2.wait();
+    }
+  };
+  std::thread ta([&] { db.put({.sync = true}, to_bytes("n"), to_bytes("1")); });
+  in_f1.wait();
+
+  std::atomic<bool> c_appended{false};
+  db.test_before_commit_wait_ = [&] { c_appended.store(true); };
+  std::thread tc([&] { db.put({.sync = true}, to_bytes("x"), to_bytes("1")); });
+  wait_until([&] { return c_appended.load(); });
+
+  std::atomic<bool> b_returned{false};
+  bool rb = false;
+  std::thread tb([&] {
+    bytecask::WritePlan plan;
+    plan.ensure_present(to_bytes("n"));
+    rb = db.apply_batch({.sync = false}, std::move(plan)).has_value();
+    b_returned.store(true);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  CHECK_FALSE(b_returned.load());  // n is not published yet
+
+  release_f1.count_down();
+  in_f2.wait();
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{10};
+  while (!b_returned.load() && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  CHECK(b_returned.load());  // before F2, which holds x, is published
+  release_f2.count_down();
+  ta.join();
+  tc.join();
+  tb.join();
+  db.test_before_flush_sync_ = nullptr;
+  db.test_before_commit_wait_ = nullptr;
+  CHECK(rb);
 }
 
 // CONTRACT.md, apply_batch: "Isolation is what the plan guards" and "A

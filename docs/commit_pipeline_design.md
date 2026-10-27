@@ -229,8 +229,8 @@ something inherits the failure through `commit_wait`; one that appends
 nothing would otherwise return an answer drawn from a write that is then
 unseen. Before #672 a `del` that found only a failed `del`'s tombstone
 returned `nullopt`, and the key was still there. So the plan waits for the
-entry it rests on — the entry it lost to, or the head's latest when its
-guards held — and throws `DbDegraded` if the engine refuses writes before
+entry it rests on — the entry it lost to, or the latest entry its guards
+read — and throws `DbDegraded` if the engine refuses writes before
 that entry is published. When the published state gives the same outcome
 (a `del` of a key neither holds), the plan rests on what readers already
 see and returns at once.
