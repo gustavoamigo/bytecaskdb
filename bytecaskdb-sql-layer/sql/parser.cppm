@@ -574,9 +574,44 @@ auto foreign_key(const PgQuery__Constraint* c) -> ForeignKeyAst {
   return f;
 }
 
+// A CHECK constraint as it is accepted: not NO INHERIT, not NOT VALID. Its
+// expression is kept as the text written between the CHECK's parentheses
+// (the catalog stores the text, as a view stores its definition); `sql` is
+// the statement, and the constraint's location the start of its CONSTRAINT
+// or CHECK keyword, so the first parenthesis outside a quoted name opens it.
+auto check_constraint(const PgQuery__Constraint* c, std::string_view sql) -> CheckAst {
+  if (c->is_no_inherit || c->skip_validation || c->deferrable || c->initdeferred) {
+    reject("a CHECK that is NO INHERIT, NOT VALID or DEFERRABLE is not supported", c->location);
+  }
+  auto at = static_cast<std::size_t>(std::max(c->location, 0));
+  auto open = std::string_view::npos;
+  for (auto i = at; i < sql.size() && open == std::string_view::npos; ++i) {
+    if (sql[i] == '"') {
+      i = sql.find('"', i + 1);
+      if (i == std::string_view::npos) break;
+    } else if (sql[i] == '(') {
+      open = i;
+    }
+  }
+  if (open == std::string_view::npos) reject("CHECK without an expression", c->location);
+  auto depth = 0;
+  for (auto i = open; i < sql.size(); ++i) {
+    auto ch = sql[i];
+    if (ch == '\'' || ch == '"') {
+      i = sql.find(ch, i + 1);  // a doubled quote reads as two strings in a row, which is the same text
+      if (i == std::string_view::npos) break;
+    } else if (ch == '(') {
+      ++depth;
+    } else if (ch == ')' && --depth == 0) {
+      return {c->conname, std::string{sql.substr(open + 1, i - open - 1)}, c->location, {}};
+    }
+  }
+  reject("CHECK without a closing parenthesis", c->location);
+}
+
 // Adds each PRIMARY KEY constraint on the column to `primary_keys`, so a
 // repeated one counts twice.
-auto column_def(const PgQuery__ColumnDef* cd, int& primary_keys) -> ColumnDefAst {
+auto column_def(const PgQuery__ColumnDef* cd, int& primary_keys, std::string_view sql) -> ColumnDefAst {
   const auto* tn = cd->type_name;
   if (tn == nullptr || tn->n_names == 0 || tn->n_array_bounds != 0 || tn->setof || tn->pct_type) {
     reject("column type not supported", cd->location);
@@ -603,6 +638,9 @@ auto column_def(const PgQuery__ColumnDef* cd, int& primary_keys) -> ColumnDefAst
     } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_UNIQUE) {
       plain_unique(c);
       col.unique.emplace_back(c->conname);
+    } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_CHECK) {
+      col.checks.push_back(check_constraint(c, sql));
+      col.checks.back().column = col.name;
     } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_FOREIGN) {
       auto f = foreign_key(c);
       f.columns = {col.name};
@@ -614,7 +652,7 @@ auto column_def(const PgQuery__ColumnDef* cd, int& primary_keys) -> ColumnDefAst
   return col;
 }
 
-auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos) -> CreateTable {
+auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos, std::string_view sql) -> CreateTable {
   if (s->n_inh_relations != 0 || s->partspec != nullptr || s->of_typename != nullptr) {
     reject("CREATE TABLE option not supported", s->relation->location);
   }
@@ -640,6 +678,10 @@ auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos) -> CreateTable
         t.foreign_keys.push_back(foreign_key(c));
         continue;
       }
+      if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_CHECK) {
+        t.checks.push_back(check_constraint(c, sql));
+        continue;
+      }
       if (c->contype != PG_QUERY__CONSTR_TYPE__CONSTR_PRIMARY) reject("table constraint not supported", c->location);
       ++primary_keys;
       at_most_one(c->location);
@@ -647,11 +689,13 @@ auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos) -> CreateTable
       continue;
     }
     if (el->node_case != PG_QUERY__NODE__NODE_COLUMN_DEF) reject("table element not supported", -1);
-    t.columns.push_back(column_def(el->column_def, primary_keys));
+    t.columns.push_back(column_def(el->column_def, primary_keys, sql));
     at_most_one(t.columns.back().pos);
     for (const auto& name : t.columns.back().unique) t.unique.push_back({name, {t.columns.back().name}, t.columns.back().pos});
     for (auto& f : t.columns.back().references) t.foreign_keys.push_back(std::move(f));
     t.columns.back().references.clear();
+    for (auto& k : t.columns.back().checks) t.checks.push_back(std::move(k));
+    t.columns.back().checks.clear();
   }
   return t;
 }
@@ -699,7 +743,7 @@ auto drop(const PgQuery__DropStmt* s, std::int32_t pos) -> Statement {
   reject("only DROP TABLE, DROP INDEX and DROP VIEW are supported", pos);
 }
 
-auto alter_table(const PgQuery__AlterTableStmt* s, std::int32_t pos) -> AddColumn {
+auto alter_table(const PgQuery__AlterTableStmt* s, std::int32_t pos, std::string_view sql) -> AddColumn {
   if (s->objtype != PG_QUERY__OBJECT_TYPE__OBJECT_TABLE || s->n_cmds != 1 || s->missing_ok) {
     reject("only ALTER TABLE … ADD COLUMN is supported", pos);
   }
@@ -709,7 +753,7 @@ auto alter_table(const PgQuery__AlterTableStmt* s, std::int32_t pos) -> AddColum
     reject("only ALTER TABLE … ADD COLUMN is supported", pos);
   }
   auto primary_keys = 0;  // the binder refuses ADD COLUMN … PRIMARY KEY
-  return AddColumn{relation(s->relation), column_def(cmd->def->column_def, primary_keys), pos};
+  return AddColumn{relation(s->relation), column_def(cmd->def->column_def, primary_keys, sql), pos};
 }
 
 auto insert(const PgQuery__InsertStmt* s, std::int32_t pos) -> Insert {
@@ -1083,10 +1127,10 @@ auto parse(std::string_view sql) -> Statement {
   const auto* raw = res.tree->stmts[0];
   const auto* n = raw->stmt;
   auto pos = raw->stmt_location;
-  if (n->node_case == PG_QUERY__NODE__NODE_CREATE_STMT) return create_table(n->create_stmt, pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_CREATE_STMT) return create_table(n->create_stmt, pos, sql);
   if (n->node_case == PG_QUERY__NODE__NODE_INDEX_STMT) return create_index(n->index_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_DROP_STMT) return drop(n->drop_stmt, pos);
-  if (n->node_case == PG_QUERY__NODE__NODE_ALTER_TABLE_STMT) return alter_table(n->alter_table_stmt, pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_ALTER_TABLE_STMT) return alter_table(n->alter_table_stmt, pos, sql);
   if (n->node_case == PG_QUERY__NODE__NODE_VIEW_STMT) {
     auto view = create_view(n->view_stmt, pos);
     view.definition = std::string{sql};

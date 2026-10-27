@@ -45,6 +45,13 @@ kind the transformer doesn't take is refused with its position.
   its SQLSTATE where they are not. Then nothing is kept: the constraint is
   not enforced (*Known differences*). `CASCADE`, `SET NULL`, `SET DEFAULT`,
   `MATCH FULL` and `PARTIAL`, `DEFERRABLE` and `NOT VALID` are refused.
+  `CHECK (…)` on a column or on the table, named or not, is tested on every
+  `INSERT` and `UPDATE` of the table, over the row as written, and refuses
+  a row it makes false with 23514 (`catalog_design.md`, *CHECK
+  constraints*). Its expression is any BOOLEAN value the select list
+  evaluates over the table's columns and constants (*Expressions over
+  columns*); `NO INHERIT`, `NOT VALID`, `DEFERRABLE` and `ADD COLUMN …
+  CHECK` are refused.
 - `INSERT … VALUES` of one row, with or without a column list, of
   parameters and constants.
 - `SELECT` targets: columns, `*` and `table.*` (below), constants (*Literals*), `COUNT(*)`,

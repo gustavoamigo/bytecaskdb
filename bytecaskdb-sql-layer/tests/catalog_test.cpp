@@ -142,6 +142,63 @@ TEST_CASE("catalog: a table record round-trips every field", "[sql][catalog]") {
   CHECK(serialize_table(u) == rec);
 }
 
+TEST_CASE("catalog: a table's CHECK constraints are a format-5 tail; a table without any is still format 4", "[sql][catalog]") {
+  auto plain = rich_table();
+  auto rec4 = serialize_table(plain);
+  CHECK(rec4[0] == std::byte{4});  // an earlier build still opens a database without a CHECK
+  auto t = rich_table();
+  t.checks = {{"c1", "a > 0"}, {"c2", "a < b AND b <> 'x(y'"}};
+  auto rec = serialize_table(t);
+  CHECK(rec[0] == std::byte{5});
+  auto u = parse_table(rec);
+  REQUIRE(u.checks.size() == 2);
+  CHECK(u.checks[1].name == "c2");
+  CHECK(u.checks[1].expr == "a < b AND b <> 'x(y'");
+  CHECK(serialize_table(u) == rec);
+  // Every cut is refused, and so is a format-5 record that holds none and one that names a CHECK twice.
+  for (std::size_t n = 0; n < rec.size(); ++n) {
+    INFO(n);
+    CHECK_THROWS_AS(parse_table(BytesView{rec}.first(n)), std::runtime_error);
+  }
+  auto none = rec4;
+  none[0] = std::byte{5};
+  none.push_back(std::byte{0});
+  none.push_back(std::byte{0});
+  CHECK_THROWS_AS(parse_table(none), std::runtime_error);
+  t.checks = {{"c1", "a > 0"}, {"c1", "a < 9"}};
+  CHECK_THROWS_AS(parse_table(serialize_table(t)), std::runtime_error);
+}
+
+TEST_CASE("catalog: CHECK constraints are named as PostgreSQL names them and survive a reopen", "[sql][catalog]") {
+  sql_test::TempDir dir{"catalog_check"};
+  auto db = DB::open(dir.path());
+  {
+    LiveCatalog live{db};
+    auto cols = std::vector<ColumnSpec>{col("a", SqlKind::Integer), col("b", SqlKind::Integer)};
+    // Named ones first; an unnamed one is table_column_check, or table_check for the table's,
+    // then 1, 2… where the name is taken.
+    CreateTableDdl ddl{"c1", cols, {}, {}, {}};
+    ddl.checks = {{"", "a > 0", "a"}, {"", "a < b", ""}, {"named", "b > 0", "b"}, {"", "b < 9", "b"}, {"", "b < 10", "b"}};
+    (void)live.apply(ddl);
+    std::vector<std::string> names;
+    for (const auto& c : live.current()->table("c1")->checks) names.push_back(c.name);
+    CHECK(names == std::vector<std::string>{"named", "c1_a_check", "c1_check", "c1_b_check", "c1_b_check1"});
+    ddl.name = "c2";
+    ddl.checks = {{"x", "a > 0", ""}, {"x", "a > 1", ""}};
+    try {
+      (void)live.apply(ddl);
+      FAIL("a constraint name used twice");
+    } catch (const DdlRefused& e) {
+      CHECK(e.sqlstate() == "42710");
+    }
+    CHECK(live.current()->table("c2") == nullptr);
+  }
+  LiveCatalog again{db};
+  REQUIRE(again.current()->table("c1")->checks.size() == 5);
+  CHECK(again.current()->table("c1")->checks[1].expr == "a > 0");
+  db.close();
+}
+
 TEST_CASE("catalog: a damaged or foreign-format record is refused", "[sql][catalog]") {
   auto rec = serialize_table(rich_table());
   // Cut at every byte: always refused, never over-read.
@@ -166,7 +223,7 @@ TEST_CASE("catalog: a damaged or foreign-format record is refused", "[sql][catal
   };
   CHECK(format(1).find("earlier SQL-layer build") != std::string::npos);
   CHECK(format(2).find("earlier SQL-layer build") != std::string::npos);
-  CHECK(format(5).find("later SQL-layer build") != std::string::npos);
+  CHECK(format(6).find("later SQL-layer build") != std::string::npos);
 
   // Records that parse but break an invariant.
   auto broken = [](auto&& mutate) {

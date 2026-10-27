@@ -103,23 +103,19 @@ e121_10_01_07
 e121_10_01_08
 e121_17_01_01
 e121_17_01_02
-e141_06_01_01
-e141_06_01_02
-e141_06_02_01
-e141_06_02_02
-e141_07_01_01
-e141_07_02_01
-e141_07_03_01
-e141_07_04_01
-e141_07_05_01
-e141_07_06_01
-e141_07_07_01
-e141_07_08_01
-e141_07_09_01
-e141_07_10_01
-e141_07_11_01
-e141_07_12_01
-e141_07_13_01
+e141_07_01_01  # type NAME with DEFAULT CURRENT_CATALOG: no NAME type, and no DEFAULT but a constant
+e141_07_02_01  # DEFAULT CURRENT_DATE: the layer keeps constant defaults only; a default the clock fills is #701
+e141_07_03_01  # CURRENT_PATH is not PostgreSQL syntax
+e141_07_04_01  # type NAME with DEFAULT CURRENT_ROLE: no NAME type, and no DEFAULT but a constant
+e141_07_05_01  # type NAME with DEFAULT CURRENT_SCHEMA: no NAME type, and no DEFAULT but a constant
+e141_07_06_01  # type NAME with DEFAULT CURRENT_USER: no NAME type, and no DEFAULT but a constant
+e141_07_07_01  # type NAME with DEFAULT SESSION_USER: no NAME type, and no DEFAULT but a constant
+e141_07_08_01  # SYSTEM_USER is text in PostgreSQL, which refuses it as the DEFAULT of an INT column
+e141_07_09_01  # type NAME with DEFAULT USER: no NAME type, and no DEFAULT but a constant
+e141_07_10_01  # TIME WITH TIME ZONE: the layer has no WITH TIME ZONE types
+e141_07_11_01  # TIMESTAMP WITH TIME ZONE: the layer has no WITH TIME ZONE types
+e141_07_12_01  # TIME WITH TIME ZONE: the layer has no WITH TIME ZONE types
+e141_07_13_01  # TIMESTAMP WITH TIME ZONE: the layer has no WITH TIME ZONE types
 e152_01_01_01
 e152_01_01_02
 e152_02_01_01

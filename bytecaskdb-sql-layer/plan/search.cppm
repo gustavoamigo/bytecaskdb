@@ -775,7 +775,7 @@ private:
           using T = std::decay_t<decltype(op)>;
           if constexpr (std::is_same_v<T, logical::Insert>) {
             constants(*op.table);
-            physical::Insert ins{op.table->id, {}};
+            physical::Insert ins{op.table->id, {}, op.checks};
             for (std::size_t i = 0; i < op.table->columns.size(); ++i) {
               const auto& c = op.table->columns[i];
               if (op.values[i]) ins.values.emplace_back(logical::column_of(op.table->id, c).col, *op.values[i]);
@@ -786,7 +786,7 @@ private:
           } else if constexpr (std::is_same_v<T, logical::Update>) {
             constants(*op.table);
             return write_rows(*op.input, [&](physical::NodePtr rows) {
-              return physical::node(physical::Update{std::move(rows), op.table->id, op.set});
+              return physical::node(physical::Update{std::move(rows), op.table->id, op.set, op.checks});
             });
           } else if constexpr (std::is_same_v<T, logical::Delete>) {
             constants(*op.table);
