@@ -73,10 +73,11 @@ an earlier build only once it holds one: that build refuses the record
 ("written by a later SQL-layer build") and so refuses to open. Nothing
 else about a database changes. Format 6 is format 5 whose CHECK list may be
 empty: it is the record of a table with a `TIMESTAMP WITH TIME ZONE` column
-(type tag 15, which an earlier build would call corrupt), written only for
-such a table, so a database is closed to an earlier build ("written by a
+(type tag 15) or a `CHAR(n)` column (tag 16, length `n`), which an earlier
+build would call corrupt, written only for such a table, so a database is closed to an earlier build ("written by a
 later SQL-layer build") only once it holds one. No existing encoding changes:
-the column stores a `TIMESTAMP`'s microseconds and keys as one. The record
+the timestamptz column stores a `TIMESTAMP`'s microseconds and keys as one,
+and a `CHAR(n)` is stored as `TEXT` is, without its trailing spaces. The record
 format also names the row format its positions are for; formats 2, 3, 4, 5
 and 6 share the 12-byte-header row
 format.

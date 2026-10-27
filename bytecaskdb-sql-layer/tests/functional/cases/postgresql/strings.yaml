@@ -438,9 +438,7 @@
     - DROP TABLE t
 
 - name: a CHAR(n) column pads to n
-  features: [E021-01]
-  # CHAR(n) is not supported; use VARCHAR(n)
-  unimplemented: true
+  features: [E021-01, pg:char]
   ordered: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v CHAR(4))
@@ -468,5 +466,124 @@
     - sql: SELECT id FROM t WHERE v = $1 AND id >= $2
       params: ["", 0]
       expected: [[1]]
+  teardown:
+    - DROP TABLE t
+
+- name: a CHAR(n) ignores trailing spaces, in storage and in comparison
+  features: [E021-01, pg:char]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, c CHAR(5), v VARCHAR(8))
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2, $3)
+      params: [1, "ab", "ab"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2, $3)
+      params: [2, "ab   ", "ab "]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2, $3)
+      params: [3, "abcde      ", "x"]
+      rowcount: 1
+    - sql: SELECT id, c FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, "ab   "], [2, "ab   "], [3, "abcde"]]
+    - sql: SELECT id FROM t WHERE c = 'ab' AND id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1], [2]]
+    - sql: SELECT id FROM t WHERE c = 'ab      ' AND id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1], [2]]
+    - sql: SELECT id FROM t WHERE c > 'ab' AND id >= $1 ORDER BY id
+      params: [0]
+      expected: [[3]]
+  teardown:
+    - DROP TABLE t
+
+- name: a CHAR(n) refuses a value of more than n characters that are not spaces
+  features: [E021-01, pg:char]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, c CHAR(3))
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, "abc"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, "abcd"]
+      error: "22001"
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [3, "abc   "]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES (4, 'abcd')
+      error: "22001"
+    - sql: UPDATE t SET c = $1 WHERE id = $2
+      params: ["abcd", 1]
+      error: "22001"
+    - sql: SELECT id, c FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, "abc"], [3, "abc"]]
+  teardown:
+    - DROP TABLE t
+
+- name: CHAR and CHARACTER without a length are one character
+  features: [E021-01, pg:char]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, a CHAR, b CHARACTER, c CHARACTER(2))
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2, $3, $4)
+      params: [1, "x", "y", "z"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2, $3, $4)
+      params: [2, "xx", "y", "z"]
+      error: "22001"
+    - sql: SELECT id, a, b, c FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, "x", "y", "z "]]
+  teardown:
+    - DROP TABLE t
+
+- name: a CHAR(n) compared with a VARCHAR is compared as text, the CHAR's spaces cut
+  features: [E021-10, pg:char]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, c CHARACTER(10), v CHARACTER VARYING(15))
+  steps:
+    - sql: INSERT INTO t VALUES ($1, $2, $3)
+      params: [1, "foo", "bar"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2, $3)
+      params: [2, "foo", "foo"]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2, $3)
+      params: [3, "foo", "foo "]
+      rowcount: 1
+    - sql: SELECT id, c = v FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, false], [2, true], [3, false]]
+  teardown:
+    - DROP TABLE t
+
+- name: a CHAR(n) with a DEFAULT, a NULL and an updated value
+  features: [E021-01, pg:char]
+  ordered: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, c CHAR(4) DEFAULT 'ab')
+  steps:
+    - sql: INSERT INTO t (id) VALUES ($1)
+      params: [1]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, null]
+      rowcount: 1
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [3, "x"]
+      rowcount: 1
+    - sql: UPDATE t SET c = $1 WHERE id = $2
+      params: ["yy ", 3]
+      rowcount: 1
+    - sql: SELECT id, c FROM t WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, "ab  "], [2, null], [3, "yy  "]]
   teardown:
     - DROP TABLE t
