@@ -607,7 +607,8 @@ def test_a_stop_drops_a_client_that_stopped_reading():
 
 def test_a_stop_lets_a_client_still_reading_take_its_whole_reply():
     """A result that takes seconds to read, begun before the stop: the client
-    gets every row, CommandComplete and ReadyForQuery, then 57P01."""
+    gets every row, CommandComplete and ReadyForQuery, then 57P01. A second
+    SIGTERM while the stop runs changes nothing, and the server exits 0."""
     if not server_binary():
         pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
     directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
@@ -622,6 +623,8 @@ def test_a_stop_lets_a_client_still_reading_take_its_whole_reply():
         out = []
         while not out or out[-1][0] != b"Z":
             out.append(c.message())
+            if len(out) == 400:
+                s.proc.send_signal(signal.SIGTERM)  # the stop is still running
             if len(out) % 200 == 0:
                 time.sleep(0.03)  # a slow reader: the reply takes seconds
         assert time.monotonic() - started > 2

@@ -543,6 +543,14 @@ void on_signal(uv_signal_t* h, int /*signum*/) {
   }
   if (!s->signals_closed) {
     s->signals_closed = true;
+    // Further SIGINT or SIGTERM are ignored while the stop runs, as before:
+    // every other thread blocks them, so blocking them here too keeps them
+    // pending once closing the handles below restores their default action.
+    sigset_t stop_signals;
+    sigemptyset(&stop_signals);
+    sigaddset(&stop_signals, SIGINT);
+    sigaddset(&stop_signals, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &stop_signals, nullptr);
     (void)uv_signal_stop(&s->sigint);
     (void)uv_signal_stop(&s->sigterm);
     uv_close(reinterpret_cast<uv_handle_t*>(&s->sigint), nullptr);

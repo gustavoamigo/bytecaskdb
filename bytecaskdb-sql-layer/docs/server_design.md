@@ -195,8 +195,9 @@ still goes out. Queued messages and idle sessions are answered with `FATAL
 stop has begun, a connection whose write makes no progress for ten seconds is
 dropped; one whose client keeps reading, however slowly and however large its
 result, gets its reply and then the `57P01`, so it learns whether its last
-statement committed. When every connection and session has ended, the server
-shuts down the worker pool and calls `Database::close()`.
+statement committed. Another `SIGINT` or `SIGTERM` during the stop is
+ignored. When every connection and session has ended, the server shuts down
+the worker pool and calls `Database::close()`.
 
 **After a `FATAL`** the session ends: it reads no more messages and runs
 nothing more. After startup, an invalid message length or type is `FATAL`.
