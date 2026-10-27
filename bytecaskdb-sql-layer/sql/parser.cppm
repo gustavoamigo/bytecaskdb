@@ -74,11 +74,17 @@ auto relation(const PgQuery__RangeVar* rv) -> std::string {
   return name;
 }
 
-// A FROM item's alias: "" for none. A column list (t AS x (a, b)) is refused.
+// A FROM item's alias: "" for none.
 auto table_alias(const PgQuery__RangeVar* rv) -> std::string {
-  if (rv->alias == nullptr) return "";
-  if (rv->alias->n_colnames != 0) reject("column aliases of a table are not supported", rv->location);
-  return rv->alias->aliasname;
+  return rv->alias == nullptr ? "" : rv->alias->aliasname;
+}
+
+// The names a FROM item's alias gives its first columns (t AS x (a, b)).
+auto table_column_aliases(const PgQuery__RangeVar* rv) -> std::vector<std::string> {
+  std::vector<std::string> out;
+  if (rv->alias == nullptr) return out;
+  for (std::size_t i = 0; i < rv->alias->n_colnames; ++i) out.push_back(str(rv->alias->colnames[i]));
+  return out;
 }
 
 auto expr(const PgQuery__Node* n) -> Expr;
@@ -891,6 +897,8 @@ void resolve_aliases(Select& sel) {
       names.keep = names.keep || names.tables[i] == names.tables[j];
     }
   }
+  // Renamed columns exist only under the alias, which the binder reads.
+  for (const auto& item : sel.from) names.keep = names.keep || !item.column_aliases.empty();
   for (auto& o : sel.order_by) {
     if (!o.table.empty()) continue;
     const Expr* hit = nullptr;
@@ -984,6 +992,7 @@ auto from_item(const PgQuery__RangeVar* rv) -> FromItem {
   FromItem item;
   item.table = from_relation(rv);
   item.alias = table_alias(rv);
+  item.column_aliases = table_column_aliases(rv);
   item.pos = rv->location;
   return item;
 }

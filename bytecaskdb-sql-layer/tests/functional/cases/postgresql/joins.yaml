@@ -1379,3 +1379,32 @@
   teardown:
     - DROP TABLE al
     - DROP TABLE bl
+
+- name: a column list on a table alias renames the table's first columns
+  features: [E051-09]
+  setup:
+    - CREATE TABLE cl (a INTEGER PRIMARY KEY, b INTEGER, c INTEGER)
+    - CREATE TABLE cr (a INTEGER PRIMARY KEY, w INTEGER)
+    - INSERT INTO cl VALUES (1, 10, 100)
+    - INSERT INTO cl VALUES (2, 20, 200)
+    - INSERT INTO cr VALUES (1, 5)
+  steps:
+    - sql: SELECT m.x, y, c FROM cl AS m (x, y) ORDER BY x
+      expected: [[1, 10, 100], [2, 20, 200]]
+    - sql: SELECT DISTINCT m.y FROM cl m (x, y) WHERE m.x > 1
+      expected: [[20]]
+    - sql: SELECT * FROM cl AS m (x, y)
+      expected: [[1, 10, 100], [2, 20, 200]]
+    - sql: SELECT m.x, cr.w FROM cl AS m (x) JOIN cr ON m.x = cr.a
+      expected: [[1, 5]]
+    - sql: SELECT a FROM cl AS m (x)
+      error: "42703"
+    - sql: SELECT m.a FROM cl AS m (x)
+      error: "42703"
+    - sql: SELECT cl.x FROM cl AS m (x)
+      error: "42P01"
+    - sql: SELECT * FROM cl AS m (x, y, z, w)
+      error: "42P10"
+  teardown:
+    - DROP TABLE cl
+    - DROP TABLE cr

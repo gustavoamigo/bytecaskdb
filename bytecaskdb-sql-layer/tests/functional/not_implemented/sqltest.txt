@@ -31,21 +31,18 @@ e021_06_01_06  # USING CHARACTERS or OCTETS: not PostgreSQL syntax
 e021_10_01_01
 e021_11_01_02  # USING CHARACTERS or OCTETS: not PostgreSQL syntax
 e021_11_01_03  # USING CHARACTERS or OCTETS: not PostgreSQL syntax
-e051_07_01_01
-e051_07_01_03
-e051_07_01_05
-e051_07_01_07
-e051_07_01_09
-e051_07_01_11
-e051_08_01_01
-e051_08_01_03
-e051_08_01_05
-e051_08_01_07
-e051_08_01_09
-e051_08_01_11
-e051_09_01_01
-e051_09_01_02
-e051_09_01_03
+e051_07_01_01  # not PostgreSQL: `* AS (c, d)` renames the star's columns (SQL standard only)
+e051_07_01_03  # not PostgreSQL: `* AS (c, d)` renames the star's columns (SQL standard only)
+e051_07_01_05  # not PostgreSQL: `* AS (c, d)` renames the star's columns (SQL standard only)
+e051_07_01_07  # not PostgreSQL: `* AS (c, d)` renames the star's columns (SQL standard only)
+e051_07_01_09  # not PostgreSQL: `* AS (c, d)` renames the star's columns (SQL standard only)
+e051_07_01_11  # not PostgreSQL: `* AS (c, d)` renames the star's columns (SQL standard only)
+e051_08_01_01  # not PostgreSQL: `* AS (c, d)` renames the star's columns (SQL standard only)
+e051_08_01_03  # not PostgreSQL: `* AS (c, d)` renames the star's columns (SQL standard only)
+e051_08_01_05  # not PostgreSQL: `* AS (c, d)` renames the star's columns (SQL standard only)
+e051_08_01_07  # not PostgreSQL: `* AS (c, d)` renames the star's columns (SQL standard only)
+e051_08_01_09  # not PostgreSQL: `* AS (c, d)` renames the star's columns (SQL standard only)
+e051_08_01_11  # not PostgreSQL: `* AS (c, d)` renames the star's columns (SQL standard only)
 e061_13_01_01
 e061_13_01_02
 e081_01_01_01
