@@ -1841,12 +1841,152 @@ public:
       case K::Cast: not_yet("a cast of other than a constant", e.pos);
       case K::Case:
       case K::Coalesce:
-      case K::NullIf: not_yet("CASE, COALESCE and NULLIF of other than constants", e.pos);
+      case K::NullIf: return conditional_value(e, resolve);
       case K::Func: not_yet("|| and the string functions of other than constants", e.pos);
       case K::Const:
       case K::Literal: break;  // constants, above
     }
     throw SqlError{"expression not supported", e.pos};
+  }
+
+  // The type CASE, COALESCE or NULLIF gives branches of these types, as
+  // PostgreSQL's union rules resolve it (the constants' fold is common_type):
+  // one class (42804), integers widen, a numeric is at the finest scale of
+  // its branches (one scale for every row, where PostgreSQL's keeps each
+  // value's own), a float the wider float. Floats mixed with other numbers
+  // and different date and time types are refused.
+  static auto union_type(const std::vector<SqlType>& known, const std::string& what, std::int32_t pos) -> SqlType {
+    if (known.empty()) return SqlType{SqlKind::Text};
+    auto type = known.front();
+    if (type.kind == SqlKind::Varchar) type = SqlType{SqlKind::Text};
+    for (const auto& t : std::span{known}.subspan(1)) {
+      if (type_class(type.kind) != type_class(t.kind)) {
+        throw SqlError{what + " types " + pg_type_name(type) + " and " + pg_type_name(t) + " cannot be matched", pos, kDatatypeMismatch};
+      }
+      if (type_class(type.kind) == TypeClass::String) {
+        type = SqlType{SqlKind::Text};
+      } else if (type_class(type.kind) == TypeClass::Number) {
+        if (!(is_number(type) || is_float(type)) || !(is_number(t) || is_float(t))) not_yet(what + " of a numeric of no scale", pos);
+        if (is_float(type) != is_float(t)) not_yet(what + " of a floating-point value and another number", pos);
+        if (is_float(t)) {
+          if (t.kind == SqlKind::Double) type = t;
+        } else if (type.kind == SqlKind::Decimal || t.kind == SqlKind::Decimal) {
+          type = numeric_type(std::max(decimal_scale(type), decimal_scale(t)));
+        } else {
+          type = wider_integer(type, t);
+        }
+      } else if (type.kind != t.kind) {
+        not_yet(what + " of " + pg_type_name(type) + " and " + pg_type_name(t), pos);
+      }
+    }
+    return type;
+  }
+
+  // CASE, COALESCE and NULLIF over columns, parameters and subqueries
+  // (docs/frontend_design.md, *Expressions over columns*). A simple CASE is a
+  // searched one over `x = v`, NULLIF(a, b) is CASE WHEN a = b THEN NULL ELSE
+  // a END. The branches are typed together (union_type) and then each is
+  // bound to that type, an unknown literal read as it (22P02); a branch
+  // is evaluated, in the plan, only when it is taken. A `$n` takes its type
+  // from a column among the branches.
+  auto conditional_value(const ast::Expr& e, const Resolve& resolve) -> logical::Expr {
+    using K = ast::Expr::Kind;
+    auto what = std::string{e.kind == K::Case ? "CASE" : e.kind == K::Coalesce ? "COALESCE" : "NULLIF"};
+    auto equals = [](const ast::Expr& a, const ast::Expr& b, std::int32_t pos) {
+      ast::Expr c{K::Compare, {}, 0, nullptr, nullptr, pos};
+      c.cmp = ast::ValueCompare::Eq;
+      c.lhs = std::make_unique<ast::Expr>(ast::clone(a));
+      c.rhs = std::make_unique<ast::Expr>(ast::clone(b));
+      return c;
+    };
+    std::deque<ast::Expr> made;  // the conditions and the NULL this builds: stable addresses
+    std::vector<const ast::Expr*> conds, results;
+    if (e.kind == K::Case) {
+      for (std::size_t i = 0; i + 1 < e.args.size(); i += 2) {
+        conds.push_back(e.lhs ? &made.emplace_back(equals(*e.lhs, e.args[i], e.args[i].pos)) : &e.args[i]);
+        results.push_back(&e.args[i + 1]);
+      }
+      if (e.rhs) results.push_back(e.rhs.get());
+    } else if (e.kind == K::Coalesce) {
+      for (const auto& a : e.args) results.push_back(&a);
+    } else {
+      conds.push_back(&made.emplace_back(equals(*e.lhs, *e.rhs, e.pos)));
+      auto& null = made.emplace_back(K::Literal, std::string{}, 0, nullptr, nullptr, e.pos);
+      results = {&null, e.lhs.get()};
+    }
+
+    std::vector<logical::Expr> args;
+    // Each condition is a BOOLEAN (42804); NULL is not true.
+    std::vector<logical::Expr> bound_conds;
+    for (const auto* c : conds) {
+      auto v = value(*c, resolve, Peer{SqlType{SqlKind::Boolean}, nullptr, nullptr, Use::Compared});
+      if (v.type.kind != SqlKind::Boolean) {
+        throw SqlError{"argument of CASE/WHEN must be type boolean, not type " + pg_type_name(v.type), c->pos, kDatatypeMismatch};
+      }
+      bound_conds.push_back(std::move(v));
+    }
+
+    // The results: constants folded (an error they raise is PostgreSQL's too,
+    // which folds them as it plans), parameters waiting for a type, the rest bound.
+    struct Part {
+      std::optional<Constant> constant;
+      std::optional<logical::Expr> bound;
+    };
+    std::vector<Part> parts(results.size());
+    std::optional<Peer> peer;
+    std::vector<SqlType> known;
+    for (std::size_t i = 0; i < results.size(); ++i) {
+      const auto& r = *results[i];
+      if (is_constant(r)) {
+        parts[i].constant = fold(r);
+        if (!parts[i].constant->unknown) known.push_back(parts[i].constant->type);
+      } else if (r.kind != K::Param) {
+        parts[i].bound = value(r, resolve);
+        known.push_back(parts[i].bound->type);
+        if (r.kind == K::Column && !peer) {
+          auto [t, c] = resolve(r);
+          peer = Peer{c->sql, t, c, Use::Operand};
+        }
+      }
+    }
+    if (std::ranges::any_of(results, [](const ast::Expr* r) { return r->kind == K::Param; })) {
+      if (!peer) not_yet("a parameter in " + what + " with no column among its results to give it a type", e.pos);
+      known.push_back(peer->type);
+    }
+    auto type = union_type(known, what, e.pos);
+    if (type.kind == SqlKind::Decimal) {  // an unknown literal may be written at a finer scale
+      auto scale = decimal_scale(type);
+      for (const auto& p : parts) {
+        if (p.constant && p.constant->unknown) scale = std::max(scale, decimal_scale(resolved(*p.constant, type).type));
+      }
+      if (scale > kMaxDecimalPrecision) not_yet("a numeric of more than 18 digits", e.pos);
+      type = numeric_type(scale);
+    }
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+      auto& p = parts[i];
+      if (!p.bound && !p.constant) {
+        p.bound = value(*results[i], resolve, peer);
+      } else if (p.constant) {
+        auto c = p.constant->unknown ? resolved(*p.constant, type) : *p.constant;
+        p.bound = fixed(std::move(c.value), c.type);
+      }
+      if (type.kind == SqlKind::Decimal) rescalable(*p.bound, *p.bound, decimal_scale(type), results[i]->pos);
+    }
+
+    if (e.kind == K::Coalesce) {
+      if (parts.size() == 1) return std::move(*parts[0].bound);
+      for (auto& p : parts) args.push_back(std::move(*p.bound));
+      auto out = logical::expr(logical::Expr::Kind::Coalesce, type);
+      out.args = std::move(args);
+      return out;
+    }
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+      if (i < bound_conds.size()) args.push_back(std::move(bound_conds[i]));
+      args.push_back(std::move(*parts[i].bound));
+    }
+    auto out = logical::expr(logical::Expr::Kind::Case, type);
+    out.args = std::move(args);
+    return out;
   }
 
   // The two operands of an operator. One a $n or an unknown literal takes
@@ -2683,7 +2823,11 @@ public:
       }
       if (e.kind != ast::Expr::Kind::Column) {
         if (aggregated) not_yet("an expression in the select list of an aggregated query", e.pos);
-        targets.push_back({value(e, resolve), "?column?"});
+        auto name = e.kind == ast::Expr::Kind::Case       ? "case"
+                    : e.kind == ast::Expr::Kind::Coalesce ? "coalesce"
+                    : e.kind == ast::Expr::Kind::NullIf   ? "nullif"
+                                                          : "?column?";
+        targets.push_back({value(e, resolve), name});
         continue;
       }
       auto [t, c] = resolve(e);
