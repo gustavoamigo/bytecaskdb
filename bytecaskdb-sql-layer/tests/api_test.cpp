@@ -25,6 +25,7 @@
 #include "include/bytecask.hpp"
 
 import bytecask.sql.api;
+import bytecask.sql.text;
 import bytecask.sql.tests.util;
 
 using namespace bytecask::sql;
@@ -2501,8 +2502,13 @@ TEST_CASE("embedded API: the time is read once per statement, and once per trans
   now = -3'600'000'000;  // 1969-12-31 23:00:00
   CHECK(first("SELECT CURRENT_DATE, LOCALTIME", *db) == std::vector<Value>{i(-1), i(kDay - 3'600'000'000)});
 
-  // The WITH TIME ZONE forms are refused, not read as the zoneless ones.
-  for (auto sql : {"SELECT CURRENT_TIMESTAMP", "SELECT CURRENT_TIME(0)"}) {
+  // CURRENT_TIMESTAMP is a timestamptz: the same instant, UTC. CURRENT_TIME,
+  // a TIME WITH TIME ZONE, is refused, not read as the zoneless one.
+  now = 1'793'095'123'456'789;  // 2026-10-27 09:12:03.456789 UTC
+  CHECK(first("SELECT CURRENT_TIMESTAMP, now(), CURRENT_TIMESTAMP(0), LOCALTIMESTAMP", *db) ==
+        std::vector<Value>{i(now), i(now), i(now - 456'789), i(now)});
+  CHECK(db->execute("SELECT now()").types.at(0).kind == SqlKind::TimestampTz);
+  for (auto sql : {"SELECT CURRENT_TIME(0)"}) {
     try {
       (void)db->execute(sql);
       FAIL(sql << " must be refused");
@@ -2510,6 +2516,52 @@ TEST_CASE("embedded API: the time is read once per statement, and once per trans
       CHECK(sqlstate(e) == "42601");  // a form not supported yet
     }
   }
+}
+
+TEST_CASE("embedded API: a TIMESTAMP WITH TIME ZONE column keeps the instant, in UTC, across a reopen", "[sql][api][timestamptz]") {
+  sql_test::TempDir dir{"api_timestamptz"};
+  auto text = [](Database& d, std::string_view sql, const std::vector<Value>& params = {}) {
+    std::vector<std::string> out;
+    auto r = d.execute(std::string{sql}, params);
+    for (const auto& row : r.rows) out.push_back(to_text(row.at(0), r.types.at(0)));
+    return out;
+  };
+  {
+    auto db = Database::open(dir.path());
+    (void)db->execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, at TIMESTAMPTZ, plain TIMESTAMP)");
+    (void)db->execute("CREATE INDEX ev_at ON ev (at)");
+    // An offset is taken off; text without one is UTC.
+    (void)db->execute("INSERT INTO ev VALUES (1, '2026-10-27 10:00:00+02', '2026-10-27 08:00:00')");
+    (void)db->execute("INSERT INTO ev VALUES (2, '2026-10-27 10:00:00Z', NULL)");
+    (void)db->execute("INSERT INTO ev VALUES (3, '2026-10-27 10:00:00', NULL)");
+    (void)db->execute("INSERT INTO ev VALUES (4, '2026-10-27 05:30:00-04:30', NULL)");
+    (void)db->execute("INSERT INTO ev VALUES (5, NULL, NULL)");
+    CHECK(text(*db, "SELECT at FROM ev WHERE id = 1") == std::vector<std::string>{"2026-10-27 08:00:00+00"});
+    CHECK(text(*db, "SELECT at FROM ev ORDER BY at, id") == std::vector<std::string>{"2026-10-27 08:00:00+00", "2026-10-27 10:00:00+00",
+                                                                                      "2026-10-27 10:00:00+00", "2026-10-27 10:00:00+00", ""});
+    CHECK(text(*db, "SELECT id FROM ev WHERE at = '2026-10-27 12:00:00+02' ORDER BY id") == std::vector<std::string>{"2", "3", "4"});
+    CHECK(text(*db, "SELECT min(at) FROM ev") == std::vector<std::string>{"2026-10-27 08:00:00+00"});
+    CHECK(text(*db, "SELECT max(at) FROM ev") == std::vector<std::string>{"2026-10-27 10:00:00+00"});
+    // Against a timestamp and a date constant, the timestamp read as UTC.
+    CHECK(text(*db, "SELECT id FROM ev WHERE at = TIMESTAMP '2026-10-27 08:00:00'") == std::vector<std::string>{"1"});
+    CHECK(text(*db, "SELECT id FROM ev WHERE at >= DATE '2026-10-27' AND at < DATE '2026-10-28' AND id < 3 ORDER BY id") ==
+          std::vector<std::string>{"1", "2"});
+    // Casts of constants.
+    CHECK(text(*db, "SELECT CAST(TIMESTAMPTZ '2026-10-27 23:30:00-02' AS DATE)") == std::vector<std::string>{"2026-10-28"});
+    CHECK(text(*db, "SELECT CAST(TIMESTAMPTZ '2026-10-27 10:00:00+02' AS TIMESTAMP)") == std::vector<std::string>{"2026-10-27 08:00:00"});
+    CHECK(text(*db, "SELECT CAST(TIMESTAMP '2026-10-27 08:00:00' AS TIMESTAMPTZ)") == std::vector<std::string>{"2026-10-27 08:00:00+00"});
+    CHECK(text(*db, "SELECT CAST(DATE '2026-10-27' AS TIMESTAMPTZ)") == std::vector<std::string>{"2026-10-27 00:00:00+00"});
+    CHECK(text(*db, "SELECT CAST(TIMESTAMPTZ '2026-10-27 10:00:00+02' AS VARCHAR)") == std::vector<std::string>{"2026-10-27 08:00:00+00"});
+    // A string assigned to a timestamptz column is read with its offset.
+    (void)db->execute("UPDATE ev SET at = '2000-01-01 00:00:00 BC' WHERE id = 5");
+    CHECK(text(*db, "SELECT at FROM ev WHERE id = 5") == std::vector<std::string>{"2000-01-01 00:00:00+00 BC"});
+    // A time zone offset past 15 hours, or no digits, is refused.
+    CHECK_THROWS(db->execute("INSERT INTO ev VALUES (9, '2026-10-27 10:00:00+16', NULL)"));
+    CHECK_THROWS(db->execute("INSERT INTO ev VALUES (9, '2026-10-27 10:00:00+', NULL)"));
+  }
+  auto db = Database::open(dir.path());
+  CHECK(text(*db, "SELECT at FROM ev WHERE id = 4") == std::vector<std::string>{"2026-10-27 10:00:00+00"});
+  CHECK(text(*db, "SELECT id FROM ev WHERE at > '2026-10-27 09:00:00Z' ORDER BY id") == std::vector<std::string>{"2", "3", "4"});
 }
 
 TEST_CASE("embedded API: a CHECK is tested on every INSERT and UPDATE, on the row as written", "[sql][api]") {
