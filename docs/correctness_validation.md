@@ -2889,7 +2889,11 @@ nothing. The kill mode and the chaos rig run it too. Three mutations of the
 range check, applied by hand, are each caught by a guarded history: skipping
 the deleted-keys pass, skipping the changed-keys pass, and treating a write
 above the snapshot's sequence as unchanged (what validating against the
-published state amounts to).
+published state amounts to). Its `presence` configuration (#676) adds plans
+without a snapshot that rest on `ensure_present` or `ensure_absent`, and
+`del`. Every outcome, a `nullopt` included, is held to the commit order and
+to real time, under frequent `fdatasync` failures. It catches #672's
+mutation in the first round.
 
 ---
 

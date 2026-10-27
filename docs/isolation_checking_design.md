@@ -174,6 +174,95 @@ the head; replacing the head with the published state in `execute_group`
 hangs the run instead, since the head then disagrees with the file it writes
 to.
 
+### Presence plans
+
+`--workload range --config presence` (#676) checks snapshot-free plans. The
+contract checks such a plan on `ensure_present` and `ensure_absent` alone,
+and holds it to the same order as a guarded one. No other configuration
+builds one. #672 was in that gap. A `del` found only an unpublished
+tombstone whose flush then failed. It returned `nullopt` while the key stayed
+readable.
+
+**Why not Elle.** A `del` that commits has no counterpart in `list-append` or
+`rw-register`. A guard's outcome also names no version: a `nullopt` from
+`ensure_present` says the key was absent, but not which tombstone made it so.
+Elle needs every read to name the version it saw. The history checker
+already models dels, and it knows the commit order, so these plans are
+checked there.
+
+**The transactions.** Half are the `guarded` configuration's. The other half
+use the first 8 keys, with `{.sync = false}` so that a plan with nothing to
+write does not drive its own flush. Each is one of:
+
+| Transaction | A commit says the key was | A `nullopt` says |
+|---|---|---|
+| `db.del(k)`, or `ensure_present` + `del` | present | absent |
+| `ensure_absent` + `put` (an insert) | absent | present |
+| `ensure_present` + `put` | present | absent |
+| `ensure_present` or `ensure_absent` alone | present / absent | the opposite |
+| `db.get(k)` through the head | the version read, or absent | |
+
+There is one guard per plan, so a `nullopt` says which key it read. The
+history records the outcome as `["guard", k, want, observed]`. A `nullopt`
+keeps its observation, and is `:fail` because its write did not happen. An
+exception is `:info`, with the observation cleared, as in every other
+workload. The plan runs after its invoke is recorded, so its real-time window
+contains the read.
+
+**The check.** `presence_check` holds each observation to the order that
+`history_check` replays:
+
+- A plan that committed with a sequence (one that also wrote) read the key
+  just before its own write.
+- One with no sequence (a `nullopt`, a guard-only commit, a head read) is
+  placed by real time. Its window runs from the state after the last
+  transaction that committed before it was invoked, to the state before the
+  first transaction invoked after it returned. Some state in that window has
+  to agree with what it saw.
+
+An `:info` write may or may not take effect, and may take effect after it
+returns, since `resume()` replays a write whose flush failed. So an
+observation of a key with an `:info` write is not judged when that write
+could explain it. That lasts from the `:info`'s invoke until a committed write
+of the key that began after it returned. One rule narrows this. A read made
+after the observation returned may still name a version written before the
+`:info` began. Then the `:info` had not taken effect by the observation's
+point, because a version is never written twice. Only reads made after their
+invoke count here: head reads and the final read. A range transaction scans
+before its invoke.
+
+That is the shape #672 leaves. The del whose flush failed is `:info`. The del
+behind it answered "absent" from that del's unpublished tombstone, and only
+the failed del could explain that answer. A head read after it still sees the
+old version, so the failed del can't explain the answer, and no state in its
+window agrees.
+
+**Nemesis and reach.** The configuration always runs the degrade nemesis, with
+1–20 ms between degrades instead of 20–200 ms. It sets
+`test_before_degrade_publish_` to sleep 2 ms on the failing flush's thread,
+between the flush error and the published degrade, as a descheduled thread
+would. Writers that pass admission during that window append behind the
+failed write, and a plan that appends nothing can answer from their entries.
+A run must show it reached this case. At least one judged observation must
+overlap an `:info` write that a later read showed could not explain it
+(`presence_near_failure`). The run fails if that count stays at zero across
+every round.
+
+**Mutation.** `tests/soak_mutations/unappended_plan_answers_from_head.patch`
+drops the `settle_unappended` call, which restores #672. With it applied, the
+first round of 50,000 transactions failed on each of 5 seeds, with 20 or more
+violations each. A typical one is a `nullopt` that said a key was absent
+across a window where the order holds the key present. `presence_near_failure`
+rose from 29–86 per clean round to 387–728. Without the 2 ms stall, the first
+round still failed on both of the 2 seeds tried, but one of them with a single
+violation. The stall is what makes detection reliable.
+
+**Result.** 6 clean rounds of 50,000 transactions. Each `presence` history
+judged about 15,000–17,000 observations by real time and 5,000–6,000 at their
+commit, and reached a failed flush 29–86 times.
+
+Kill and chaos lives of this configuration are a follow-up (#703).
+
 ## Configurations
 
 Each run records three histories from one seed. They differ only in how the
@@ -520,6 +609,9 @@ timestamp, which also replaces the `state_time_` advance in `commit_wait`
 - The commit-sequence cross-check passes in all three configurations.
 - `guarded` range histories pass `history_check` on every nightly run, and
   `unguarded` ones show at least one stale read per run.
+- `presence` range histories pass `history_check`, with every presence
+  observation agreeing with the order, and at least one per run is judged
+  across a failed flush.
 - The seed is printed, and a failure uploads the history.
 - The README's isolation paragraph and `transaction_design.md` cite this
   check.
