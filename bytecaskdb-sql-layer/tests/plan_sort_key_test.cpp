@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <compare>
 #include <cstdint>
 #include <limits>
@@ -591,4 +592,119 @@ TEST_CASE("sort key: a builder ended twice, a part after its end and bad argumen
     CHECK(run(f, plan, {}) == BC_FAILED);
     CHECK(bc_error(f.cx) == BC_E_HANDLE);
   }
+}
+
+namespace {
+
+constexpr std::array<PhysType, 1> kF64Row{PhysType::F64};
+constexpr std::array<PhysType, 5> kDecoded{PhysType::I64, PhysType::Bytes, PhysType::F64, PhysType::Bool, PhysType::I64};
+
+// A sort key of the four parameters (NULL kept), through a sorter's payload,
+// and read back by bc_sort_key_part_*; part 0 once more at the end.
+void sort_key_round_trip(bc_ctx* cx) {
+  bc_sort_key k = bc_sort_key_begin(cx);
+  if (bc_param_null(cx, 0)) {
+    bc_sort_key_null(cx, k, BC_SORT_ASC, BC_SORT_NULLS_LAST);
+  } else {
+    bc_sort_key_i64(cx, k, bc_param_i64(cx, 0), BC_SORT_ASC, BC_SORT_NULLS_LAST);
+  }
+  if (bc_param_null(cx, 1)) {
+    bc_sort_key_null(cx, k, BC_SORT_ASC, BC_SORT_NULLS_FIRST);
+  } else {
+    bc_sort_key_bytes(cx, k, bc_param_bytes(cx, 1), BC_SORT_ASC, BC_SORT_NULLS_FIRST);
+  }
+  if (bc_param_null(cx, 2)) {
+    bc_sort_key_null(cx, k, BC_SORT_ASC, BC_SORT_NULLS_LAST);
+  } else {
+    bc_sort_key_f64(cx, k, bc_param_f64(cx, 2), BC_SORT_ASC, BC_SORT_NULLS_LAST);
+  }
+  if (bc_param_null(cx, 3)) {
+    bc_sort_key_null(cx, k, BC_SORT_ASC, BC_SORT_NULLS_LAST);
+  } else {
+    bc_sort_key_bool(cx, k, bc_param_bool(cx, 3), BC_SORT_ASC, BC_SORT_NULLS_LAST);
+  }
+  bc_view key = bc_sort_key_end(cx, k);
+  bc_sorter s = bc_sorter_open(cx, 0);
+  bc_sorter_add(cx, s, bc_empty(cx), key);
+  bc_view p = bc_empty(cx);
+  while (bc_sorter_next(cx, s, &p)) {
+    bc_emit_begin(cx);
+    if (bc_sort_key_part_null(cx, p, 0)) bc_emit_null(cx); else bc_emit_i64(cx, bc_sort_key_part_i64(cx, p, 0));
+    if (bc_sort_key_part_null(cx, p, 1)) bc_emit_null(cx); else bc_emit_bytes(cx, bc_sort_key_part_bytes(cx, p, 1));
+    if (bc_sort_key_part_null(cx, p, 2)) bc_emit_null(cx); else bc_emit_f64(cx, bc_sort_key_part_f64(cx, p, 2));
+    if (bc_sort_key_part_null(cx, p, 3)) bc_emit_null(cx); else bc_emit_bool(cx, bc_sort_key_part_bool(cx, p, 3));
+    if (bc_sort_key_part_null(cx, p, 0)) bc_emit_null(cx); else bc_emit_i64(cx, bc_sort_key_part_i64(cx, p, 0));
+    bc_emit_end(cx);
+  }
+}
+
+// Decoders over the first parameter's bytes, however they got there.
+void decode_i64_part_1(bc_ctx* cx) { bc_emit_begin(cx); bc_emit_i64(cx, bc_sort_key_part_i64(cx, bc_param_bytes(cx, 0), 1)); bc_emit_end(cx); }
+void decode_i64_part_0(bc_ctx* cx) { bc_emit_begin(cx); bc_emit_i64(cx, bc_sort_key_part_i64(cx, bc_param_bytes(cx, 0), 0)); bc_emit_end(cx); }
+void decode_bytes_part_0(bc_ctx* cx) {
+  bc_emit_begin(cx);
+  bc_emit_bytes(cx, bc_sort_key_part_bytes(cx, bc_param_bytes(cx, 0), 0));
+  bc_emit_end(cx);
+}
+// Part 0 read as an integer, then as a double.
+void decode_retyped(bc_ctx* cx) {
+  bc_view key = bc_param_bytes(cx, 0);
+  (void)bc_sort_key_part_i64(cx, key, 0);
+  bc_emit_begin(cx);
+  bc_emit_f64(cx, bc_sort_key_part_f64(cx, key, 0));
+  bc_emit_end(cx);
+}
+
+auto round_trip(Fixture& f, std::vector<bc_value> in) -> Row {
+  REQUIRE(run(f, sort_key_round_trip, std::move(in), kDecoded) == BC_COMMITTED);
+  auto rows = f.results(kDecoded);
+  REQUIRE(rows.size() == 1);
+  return rows[0];
+}
+
+}  // namespace
+
+TEST_CASE("sort key: bc_sort_key_part_* read back every type and NULL, through a sorter's payload",
+          "[sql][algebra][sort_key]") {
+  Fixture f;
+  // A zero byte inside the text is escaped in the key and unescaped back.
+  auto row = round_trip(f, {i64(-7), raw({0x61, 0x00, 0x62}), f64(2.5), boolean(true)});
+  CHECK(row == Row{i64(-7), raw({0x61, 0x00, 0x62}), f64(2.5), boolean(true), i64(-7)});
+  row = round_trip(f, {kNull, kNull, kNull, kNull});
+  CHECK(row == Row{kNull, kNull, kNull, kNull, kNull});
+  row = round_trip(f, {i64(kI64Min), raw({}), f64(-kInf), boolean(false)});
+  CHECK(row == Row{i64(kI64Min), raw({}), f64(-kInf), boolean(false), i64(kI64Min)});
+  row = round_trip(f, {i64(kI64Max), kNull, f64(0.0), kNull});
+  CHECK(row == Row{i64(kI64Max), kNull, f64(0.0), kNull, i64(kI64Max)});
+  // The key holds a DOUBLE as it orders it: -0.0 reads back as 0.0, a NaN as the NaN.
+  row = round_trip(f, {kNull, kNull, f64(-0.0), kNull});
+  REQUIRE(std::holds_alternative<double>(row[2]));
+  CHECK(std::get<double>(row[2]) == 0.0);
+  CHECK_FALSE(std::signbit(std::get<double>(row[2])));
+  row = round_trip(f, {kNull, kNull, f64(kNaN), kNull});
+  CHECK(std::isnan(std::get<double>(row[2])));
+}
+
+TEST_CASE("sort key: bc_sort_key_part_* refuse a part out of order, of the wrong type, or a key that does not parse",
+          "[sql][algebra][sort_key]") {
+  Fixture f;
+  const auto key = [](std::initializer_list<unsigned char> b) { return std::vector<bc_value>{raw(b)}; };
+  // Part 1 before part 0 has been read: the key carries no layout to skip by.
+  CHECK(run(f, decode_i64_part_1, key({0x01, 0x80, 0, 0, 0, 0, 0, 0, 7}), kI64Row) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  // The same part read as two types.
+  CHECK(run(f, decode_retyped, key({0x01, 0x80, 0, 0, 0, 0, 0, 0, 7}), kF64Row) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  // A well-formed integer part reads.
+  REQUIRE(run(f, decode_i64_part_0, key({0x01, 0x80, 0, 0, 0, 0, 0, 0, 7}), kI64Row) == BC_COMMITTED);
+  CHECK(f.results(kI64Row) == ids({7}));
+  // No marker, an unknown marker, an integer cut short, text with no terminator.
+  CHECK(run(f, decode_i64_part_0, key({}), kI64Row) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CORRUPT);
+  CHECK(run(f, decode_i64_part_0, key({0x07, 0, 0, 0, 0, 0, 0, 0, 0}), kI64Row) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CORRUPT);
+  CHECK(run(f, decode_i64_part_0, key({0x01, 0x80, 0}), kI64Row) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CORRUPT);
+  CHECK(run(f, decode_bytes_part_0, key({0x01, 0x61, 0x62}), kBytesRow) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CORRUPT);
 }

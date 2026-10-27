@@ -259,6 +259,23 @@ void     bc_sort_key_null(bc_ctx *, bc_sort_key, uint32_t dir, uint32_t nulls);
 void     bc_sort_key_col(bc_ctx *, bc_sort_key, bc_view row, uint32_t col, uint32_t dir, uint32_t nulls);  /* NULL included */
 bc_view  bc_sort_key_end(bc_ctx *, bc_sort_key);
 
+/* Sort-key decoders: read a part back from a key built by bc_sort_key_*, the
+   key itself or a copy of its bytes (a sorter's payload). The key carries no
+   layout, so parts are read in order, 0 first: part n's type is learned when
+   it is read, and reading part n+1 before n is BC_E_HANDLE, as is reading a
+   part as a type other than the one it was read as. For each part, call
+   bc_sort_key_part_null, then the typed decoder if it is not NULL (a typed
+   decoder of a NULL part returns zero or empty). Only a part built BC_SORT_ASC
+   decodes: a DESC part is inverted, and reads as another value. A DOUBLE
+   reads back as the key holds it, so -0.0 is 0.0 and every NaN one NaN. A key
+   that does not parse is BC_E_CORRUPT. A bytes part is unescaped into the
+   arena, the step's, charged. */
+int64_t  bc_sort_key_part_i64(bc_ctx *, bc_view key, uint32_t part);
+double   bc_sort_key_part_f64(bc_ctx *, bc_view key, uint32_t part);
+bool     bc_sort_key_part_bool(bc_ctx *, bc_view key, uint32_t part);
+bc_view  bc_sort_key_part_bytes(bc_ctx *, bc_view key, uint32_t part);
+bool     bc_sort_key_part_null(bc_ctx *, bc_view key, uint32_t part);
+
 /* Reads */
 bc_view   bc_get(bc_ctx *, bc_view key, bool *found);
 bool      bc_exists(bc_ctx *, bc_view key);

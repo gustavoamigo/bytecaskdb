@@ -1,0 +1,30 @@
+# ORDER BY a select-list position, in a plain SELECT. The position names the
+# select-list item, which must be a column; a set operation's is in
+# set_operations.yaml.
+
+- name: ORDER BY takes select-list positions
+  features: [F850]
+  ordered: true
+  setup:
+    - CREATE TABLE ob (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)
+    - INSERT INTO ob VALUES (1, 30, 'x')
+    - INSERT INTO ob VALUES (2, 10, 'z')
+    - INSERT INTO ob VALUES (3, NULL, 'y')
+    - INSERT INTO ob VALUES (4, 20, 'y')
+  steps:
+    - sql: SELECT a, b FROM ob ORDER BY 1
+      expected: [[10, "z"], [20, "y"], [30, "x"], [null, "y"]]
+    - sql: SELECT a, b FROM ob ORDER BY 1 DESC
+      expected: [[null, "y"], [30, "x"], [20, "y"], [10, "z"]]
+    - sql: SELECT b, a FROM ob ORDER BY 1, 2 DESC
+      expected: [["x", 30], ["y", null], ["y", 20], ["z", 10]]
+    - sql: SELECT b AS name, a FROM ob ORDER BY 1 DESC, 2 LIMIT 2
+      expected: [["z", 10], ["y", 20]]
+    - sql: SELECT a FROM ob ORDER BY 2
+      error: "42P10"
+    - sql: SELECT a FROM ob ORDER BY 0
+      error: "42P10"
+    - sql: SELECT a FROM ob ORDER BY 'a'
+      error: "42601"
+  teardown:
+    - DROP TABLE ob

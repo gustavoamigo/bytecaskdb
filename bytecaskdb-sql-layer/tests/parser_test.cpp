@@ -182,6 +182,34 @@ TEST_CASE("parser: ORDER BY takes NULLS FIRST and NULLS LAST; an index does not"
   CHECK_THROWS_AS(parse("CREATE INDEX u ON t (name NULLS FIRST)"), SqlError);
 }
 
+TEST_CASE("parser: ORDER BY a position names the select-list column; a set operation's stays a position", "[sql][parser]") {
+  auto s = std::get<Select>(parse("SELECT qty, id AS k FROM t ORDER BY 2 DESC, 1"));
+  REQUIRE(s.order_by.size() == 2);
+  CHECK(s.order_by[0].column == "id");
+  CHECK(s.order_by[0].position == 0);
+  CHECK(s.order_by[0].desc);
+  CHECK(s.order_by[1].column == "qty");
+  auto u = std::get<Select>(parse("SELECT a FROM t UNION SELECT b FROM u ORDER BY 1 DESC"));
+  REQUIRE(u.order_by.size() == 1);
+  CHECK(u.order_by[0].position == 1);
+  CHECK(u.order_by[0].column.empty());
+  auto sqlstate_of = [](const char* sql) {
+    try {
+      (void)parse(sql);
+    } catch (const SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"parsed"};
+  };
+  CHECK(sqlstate_of("SELECT qty FROM t ORDER BY 2") == "42P10");
+  CHECK(sqlstate_of("SELECT qty FROM t ORDER BY 0") == "42P10");
+  CHECK(sqlstate_of("SELECT qty FROM t ORDER BY -1") == "42P10");
+  CHECK(sqlstate_of("SELECT qty FROM t ORDER BY 'a'") == "42601");
+  CHECK(sqlstate_of("SELECT qty FROM t ORDER BY 1.5") == "42601");
+  CHECK(sqlstate_of("SELECT qty + 1 FROM t ORDER BY 1") == "42601");  // not a column: not yet
+  CHECK(sqlstate_of("SELECT * FROM t ORDER BY 1") == "42601");        // a position after *: not yet
+}
+
 TEST_CASE("parser: COUNT, ORDER BY, LIMIT and column + parameter", "[sql][parser]") {
   auto s = std::get<Select>(parse("SELECT count(*), count(qty) FROM t WHERE name = $1 ORDER BY name DESC, id LIMIT 3"));
   REQUIRE(s.targets.size() == 2);

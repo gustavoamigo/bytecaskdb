@@ -813,22 +813,47 @@ left of `INTERSECT`); no row count decides it. Choosing the smaller side
 needs `bc_count_range` per arm, which is a choice point (*Choosing at run
 time*) the first slice does not build (#682).
 
-**`LIMIT`.** A `LIMIT` over the combined rows is a counter in the plan,
+**`ORDER BY`.** The `ORDER BY` of the combined rows names the operation's
+columns, by the first arm's names or by position (`frontend_design.md`),
+so its keys are known when the plan is printed: `logical::SetOp::order`,
+the root's alone, becomes `physical::Plan::set_order`. The plan holds the
+rows in one `bc_sorter`. Every row the arms give, as it is in hand, is
+added with two sort keys: the sorter's key, of the `ORDER BY` columns in
+their directions and NULL placements (NULLS LAST for `ASC` and FIRST for
+`DESC` unless the statement says), and the payload, a sort key of all the
+columns, each ascending. After the arms a loop over the sorter reads each
+payload back part by part with `bc_sort_key_part_*` (`plan_api_design.md`)
+and emits the row. The payload is a second key rather than the sorter's key
+because the sorter's key has the `ORDER BY`'s directions, which the
+decoders do not read. A `DOUBLE` column is two parts in the payload, the
+value and a flag for a negative zero, since the key holds `-0.0` as `0.0`;
+a NaN comes back as the one NaN, as PostgreSQL has one. The arms are all read
+whole (no arm stops at a `LIMIT`, since a later row may sort first).
+`DISTINCT` and `ALL` arms feed the sorter the same rows they would
+return: the sink above still tells duplicates apart.
+
+*Memory:* the sorter's entries are charged to the statement's budget like any
+sort's (*Sorts*, *Memory*): without a `LIMIT` it holds every row of the
+combined arms, one key and one payload each, plus what an operation that
+tells duplicates apart already holds, and past the budget the statement
+fails with 54000, never spilling. With a `LIMIT n` it is a top-n sorter
+(`bc_sorter_open(cx, n)`), which holds at most the first n rows in order and
+copies none that sorts after them, so the rows held are bounded by n, not
+by the tables.
+
+**`LIMIT`.** Without an `ORDER BY`, a `LIMIT` over the combined rows is a counter in the plan,
 `setcount`: the sink of the stream that reaches the statement returns a row
 only while `setcount < n`, and every loop of those arms also stops at it,
 so `... UNION ALL ... LIMIT 1` reads one row. The arm whose rows only fill a
-structure is read whole.
+structure is read whole. With an `ORDER BY` it is the sorter's `keep`, above.
 
 **A miss skips an arm, not the plan.** A point lookup that finds no row, or
 a NULL parameter a key needs, ends an ordinary plan; an arm's code is
 wrapped in an `if` at the place, so the rest of the arm is skipped and the
 next one runs.
 
-**Not built.** `ORDER BY` of the combined rows: it needs to hold typed rows
-(a sorter whose payload the plan can read back column by column), which the
-plan API has no object for, since a payload is bytes and only a table's row
-or an index's key can be read back (#681). A `LIMIT` on a parenthesised set
-operation inside another. An arm that groups, aggregates or is `DISTINCT` (#682);
+**Not built.** `ORDER BY` of a parenthesised set operation inside another,
+and a `LIMIT` on one. An arm that groups, aggregates or is `DISTINCT` (#682);
 `FOR UPDATE`; a literal of no type meeting another type; `DECIMAL` of two
 scales, or with an integer; an integer with `REAL`; `DATE` with `TIMESTAMP`.
 
