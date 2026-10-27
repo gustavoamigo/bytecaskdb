@@ -19,6 +19,8 @@ module;
 #include <deque>
 #include <expected>
 #include <functional>
+#include <map>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -32,6 +34,7 @@ module;
 export module bytecask.sql.binder;
 
 export import bytecask.sql.logical;
+import bytecask.sql.parser;
 import bytecask.sql.text;
 
 export namespace bytecask::sql::bound {
@@ -71,6 +74,10 @@ struct Bound {
   // Each uncorrelated subquery, run before the plan: it sets its hidden
   // parameters, among `fixed`'s, whose values there are NULL.
   std::vector<logical::Subquery> subqueries;
+  // The views the statement was expanded through, each once, nested ones
+  // included. A cached plan is good only while each still exists: ids are
+  // never reused, so a dropped and recreated view is another id.
+  std::vector<std::uint32_t> views;
 };
 
 // Throws ast::SqlError with a message and the position of the offending node.
@@ -1253,6 +1260,15 @@ void params_in(const ast::Compare& c, std::uint32_t& n) {
   for (const auto& a : c.args) params_in(a, n);
 }
 
+auto select_param_count(const ast::Select& s) -> std::uint32_t {
+  std::uint32_t n = 0;
+  for (const auto& e : s.targets) params_in(e, n);
+  for (const auto& e : s.group_by) params_in(e, n);
+  for (const auto& c : s.where) params_in(c, n);
+  for (const auto& c : s.having) params_in(c, n);
+  return n;
+}
+
 auto param_count(const ast::Statement& stmt) -> std::uint32_t {
   std::uint32_t n = 0;
   auto conjuncts = [&](const std::vector<ast::Compare>& cs) {
@@ -1264,10 +1280,7 @@ auto param_count(const ast::Statement& stmt) -> std::uint32_t {
         if constexpr (std::is_same_v<T, ast::Insert>) {
           for (const auto& e : s.values) params_in(e, n);
         } else if constexpr (std::is_same_v<T, ast::Select>) {
-          for (const auto& e : s.targets) params_in(e, n);
-          for (const auto& e : s.group_by) params_in(e, n);
-          conjuncts(s.where);
-          conjuncts(s.having);
+          n = select_param_count(s);
         } else if constexpr (std::is_same_v<T, ast::Update>) {
           for (const auto& a : s.set) params_in(a.value, n);
           conjuncts(s.where);
@@ -1630,6 +1643,9 @@ public:
 
   auto table(const std::string& name, std::int32_t pos) const -> const Table* {
     const auto* t = cat_.table(name);
+    if (t == nullptr && cat_.view(name) != nullptr) {
+      throw SqlError{"\"" + name + "\" is a view, not a table: views are not updatable", pos, kFeatureNotSupported};
+    }
     if (t == nullptr) throw SqlError{"relation \"" + name + "\" does not exist", pos, kUndefinedTable};
     return t;
   }
@@ -2625,10 +2641,521 @@ private:
   std::deque<Column> synthetic_;
 };
 
+// ------------------------------------------------------------------- views
+
+// Each subquery slot of an expression or a WHERE conjunct, `f` called with
+// the shared_ptr (const or not as `e` is).
+template <typename E, typename F>
+void subqueries_in(E& e, F& f) {
+  if (e.subquery) f(e.subquery);
+  if (e.lhs) subqueries_in(*e.lhs, f);
+  if (e.rhs) subqueries_in(*e.rhs, f);
+  for (auto& a : e.args) subqueries_in(a, f);
+}
+
+template <typename C, typename F>
+void subqueries_in_compare(C& c, F& f) {
+  subqueries_in(c.lhs, f);
+  subqueries_in(c.rhs, f);
+  if (c.subquery) f(c.subquery);
+  for (auto& a : c.args) subqueries_in_compare(a, f);
+}
+
+template <typename S, typename F>
+void each_subquery(S& s, F&& f) {
+  for (auto& e : s.targets) subqueries_in(e, f);
+  for (auto& e : s.group_by) subqueries_in(e, f);
+  for (auto& c : s.where) subqueries_in_compare(c, f);
+  for (auto& c : s.having) subqueries_in_compare(c, f);
+}
+
+// A view's column in a reference: the select-list item it names, to take its
+// place. nullopt: the reference is left as written.
+using ColumnSwap = std::function<std::optional<ast::Expr>(ast::Expr&)>;
+
+void qualify(ast::Expr& e, const std::string& table) {
+  if ((e.kind == ast::Expr::Kind::Column || (e.kind == ast::Expr::Kind::Aggregate && !e.column.empty())) && e.table.empty()) {
+    e.table = table;
+  }
+  if (e.lhs) qualify(*e.lhs, table);
+  if (e.rhs) qualify(*e.rhs, table);
+  for (auto& a : e.args) qualify(a, table);
+}
+
+void qualify(ast::Compare& c, const std::string& table) {
+  using K = ast::Compare::Kind;
+  switch (c.kind) {
+    case K::Compare:
+    case K::Like:
+      qualify(c.lhs, table);
+      qualify(c.rhs, table);
+      break;
+    case K::IsNull:
+    case K::Quantified: qualify(c.lhs, table); break;
+    case K::And:
+    case K::Or:
+    case K::Not:
+      for (auto& a : c.args) qualify(a, table);
+      break;
+    case K::Exists: break;
+  }
+}
+
+// Replaces each column of `e` that `swap` answers for, and the column an
+// aggregate reads, which must stay a column. A subquery is left: it reads
+// no column of the query around it.
+void swap_columns(ast::Expr& e, const ColumnSwap& swap) {
+  if (e.kind == ast::Expr::Kind::Column) {
+    if (auto repl = swap(e)) {
+      repl->pos = e.pos;
+      e = std::move(*repl);
+    }
+    return;
+  }
+  if (e.kind == ast::Expr::Kind::Aggregate && !e.column.empty()) {
+    ast::Expr ref{ast::Expr::Kind::Column, e.column, 0, nullptr, nullptr, e.pos};
+    ref.table = e.table;
+    if (auto repl = swap(ref)) {
+      if (repl->kind != ast::Expr::Kind::Column) {
+        not_yet("an aggregate of a view column that is an expression", e.pos);
+      }
+      ref = std::move(*repl);
+    }
+    e.column = ref.column;
+    e.table = ref.table;
+    return;
+  }
+  if (e.lhs) swap_columns(*e.lhs, swap);
+  if (e.rhs) swap_columns(*e.rhs, swap);
+  for (auto& a : e.args) swap_columns(a, swap);
+}
+
+void swap_columns(ast::Compare& c, const ColumnSwap& swap) {
+  using K = ast::Compare::Kind;
+  switch (c.kind) {
+    case K::Compare:
+    case K::Like:
+      swap_columns(c.lhs, swap);
+      swap_columns(c.rhs, swap);
+      break;
+    case K::IsNull:
+    case K::Quantified: swap_columns(c.lhs, swap); break;
+    case K::And:
+    case K::Or:
+    case K::Not:
+      for (auto& a : c.args) swap_columns(a, swap);
+      break;
+    case K::Exists: break;
+  }
+}
+
+// The same column, one reference perhaps qualified and the other not.
+auto same_column(const ast::Expr& a, const ast::Expr& b) -> bool {
+  return a.column == b.column && (a.table == b.table || a.table.empty() || b.table.empty());
+}
+
+auto is_group_column(const ast::Expr& e, const std::vector<ast::Expr>& group) -> bool {
+  return e.kind == ast::Expr::Kind::Column &&
+         std::ranges::any_of(group, [&](const ast::Expr& g) { return same_column(e, g); });
+}
+
+// Whether `e` reads only columns of `group` and calls no aggregate.
+auto over_group(const ast::Expr& e, const std::vector<ast::Expr>& group) -> bool {
+  if (e.kind == ast::Expr::Kind::Column) return is_group_column(e, group);
+  if (e.kind == ast::Expr::Kind::Aggregate) return false;
+  return (!e.lhs || over_group(*e.lhs, group)) && (!e.rhs || over_group(*e.rhs, group)) &&
+         std::ranges::all_of(e.args, [&](const ast::Expr& a) { return over_group(a, group); });
+}
+
+auto over_group(const ast::Compare& c, const std::vector<ast::Expr>& group) -> bool {
+  using K = ast::Compare::Kind;
+  switch (c.kind) {
+    case K::Compare:
+    case K::Like: return over_group(c.lhs, group) && over_group(c.rhs, group);
+    case K::IsNull:
+    case K::Quantified: return over_group(c.lhs, group);
+    case K::And:
+    case K::Or:
+    case K::Not: return std::ranges::all_of(c.args, [&](const ast::Compare& a) { return over_group(a, group); });
+    case K::Exists: return true;
+  }
+  return false;
+}
+
+// A view, expanded to base tables: its SELECT, and its column names, the
+// select list's items in order (docs/frontend_design.md, *Views*).
+struct ViewBody {
+  ast::Select select;
+  std::vector<std::string> names;
+};
+
+// Expands the views a statement reads before it is bound, so the binder,
+// planner and plans see base tables alone: a FROM that names a view takes the
+// view's FROM and WHERE, and each reference to one of its columns the
+// select-list item the column is. The view's text is parsed and bound at each
+// use, so it is checked against the tables as they are then.
+class ViewExpander {
+public:
+  explicit ViewExpander(const Catalog& cat) : cat_{cat} {}
+
+  [[nodiscard]] auto used() const -> const std::vector<std::uint32_t>& { return used_; }
+
+  // The statement with its views expanded; nullopt where it reads none.
+  [[nodiscard]] auto statement(const ast::Statement& stmt) -> std::optional<ast::Statement> {
+    if (const auto* s = std::get_if<ast::Select>(&stmt)) {
+      if (!mentions(*s)) return std::nullopt;
+      return std::optional<ast::Statement>{std::in_place, std::in_place_type<ast::Select>, expand(*s)};
+    }
+    if (const auto* u = std::get_if<ast::Update>(&stmt)) {
+      ast::Update out{u->table, {}, {}, u->pos};
+      for (const auto& a : u->set) out.set.push_back({a.column, ast::clone(a.value), a.pos});
+      for (const auto& c : u->where) out.where.push_back(ast::clone(c));
+      if (!rewrite(out.set, out.where)) return std::nullopt;
+      return std::optional<ast::Statement>{std::in_place, std::in_place_type<ast::Update>, std::move(out)};
+    }
+    if (const auto* d = std::get_if<ast::Delete>(&stmt)) {
+      ast::Delete out{d->table, {}, d->pos};
+      for (const auto& c : d->where) out.where.push_back(ast::clone(c));
+      std::vector<ast::Assignment> none;
+      if (!rewrite(none, out.where)) return std::nullopt;
+      return std::optional<ast::Statement>{std::in_place, std::in_place_type<ast::Delete>, std::move(out)};
+    }
+    return std::nullopt;
+  }
+
+  // A view's body from its defining SELECT and column list: expanded, its
+  // stars written out, its columns named and checked.
+  auto describe(const ast::Select& query, const std::vector<std::string>& columns) -> ViewBody {
+    ViewBody b{expand(query), {}};
+    Binder scratch{cat_, 0};
+    if (std::ranges::any_of(b.select.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Star; })) {
+      b.select.targets = scratch.expand_stars(b.select);
+    }
+    auto root = scratch.select(b.select);
+    for (const auto& out : Binder::outputs_of(*root)) b.names.push_back(out.name);
+    if (b.names.size() != b.select.targets.size()) throw std::logic_error{"a view's columns are not its select list"};
+    if (columns.size() > b.names.size()) {
+      throw SqlError{"CREATE VIEW specifies more column names than columns", b.select.pos};
+    }
+    std::ranges::copy(columns, b.names.begin());
+    for (std::size_t i = 0; i < b.names.size(); ++i) {
+      if (std::ranges::find(b.names, b.names[i]) != b.names.begin() + static_cast<std::ptrdiff_t>(i)) {
+        throw SqlError{"column \"" + b.names[i] + "\" specified more than once", b.select.pos, kDuplicateColumn};
+      }
+    }
+    return b;
+  }
+
+  // The tables and views a SELECT names directly, subqueries included.
+  void relations(const ast::Select& s, std::vector<std::uint32_t>& out) const {
+    for (const auto* name : {&s.table, &s.join}) {
+      if (name->empty()) continue;
+      if (const auto* t = cat_.table(*name)) out.push_back(t->id);
+      if (const auto* v = cat_.view(*name)) out.push_back(v->id);
+    }
+    each_subquery(s, [&](const std::shared_ptr<const ast::Select>& q) { relations(*q, out); });
+  }
+
+private:
+  static constexpr int kMaxDepth = 16;
+
+  [[nodiscard]] auto mentions(const ast::Select& s) const -> bool {
+    auto found = cat_.view(s.table) != nullptr || cat_.view(s.join) != nullptr;
+    each_subquery(s, [&](const std::shared_ptr<const ast::Select>& q) { found = found || mentions(*q); });
+    return found;
+  }
+
+  // Whether a view is named in the SET values or WHERE, subqueries included;
+  // if so they are rewritten in place.
+  auto rewrite(std::vector<ast::Assignment>& set, std::vector<ast::Compare>& where) -> bool {
+    auto found = false;
+    auto expand_slot = [&](std::shared_ptr<const ast::Select>& q) {
+      if (!mentions(*q)) return;
+      q = std::make_shared<const ast::Select>(expand(*q));
+      found = true;
+    };
+    for (auto& a : set) subqueries_in(a.value, expand_slot);
+    for (auto& c : where) subqueries_in_compare(c, expand_slot);
+    return found;
+  }
+
+  auto body(const View& v) -> const ViewBody& {
+    if (auto it = bodies_.find(v.id); it != bodies_.end()) return it->second;
+    if (depth_ >= kMaxDepth) throw SqlError{"views are nested too deeply", -1, kFeatureNotSupported};
+    ++depth_;
+    auto parsed = ast::parse(v.definition);
+    auto* def = std::get_if<ast::CreateView>(&parsed);
+    if (def == nullptr) throw SqlError{"the definition of view \"" + v.name + "\" is not a CREATE VIEW", -1};
+    auto described = describe(def->query, def->columns);
+    --depth_;
+    if (described.names != v.columns) {
+      throw SqlError{"view \"" + v.name + "\" no longer has the columns it was created with: the tables it reads changed; drop it and create it again",
+                     -1, kFeatureNotSupported};
+    }
+    if (std::ranges::find(used_, v.id) == used_.end()) used_.push_back(v.id);
+    return bodies_.emplace(v.id, std::move(described)).first->second;
+  }
+
+  static auto aggregated(const ast::Select& s) -> bool {
+    return !s.group_by.empty() || !s.having.empty() ||
+           std::ranges::any_of(s.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Aggregate; });
+  }
+
+  static auto column_named(const ast::Expr& star, const std::string& table, const std::string& name) -> ast::Expr {
+    ast::Expr c{ast::Expr::Kind::Column, name, 0, nullptr, nullptr, star.pos};
+    c.table = table;
+    return c;
+  }
+
+  auto expand(const ast::Select& in) -> ast::Select {
+    auto s = ast::clone(in);
+    auto expand_slot = [&](std::shared_ptr<const ast::Select>& q) {
+      if (mentions(*q)) q = std::make_shared<const ast::Select>(expand(*q));
+    };
+    each_subquery(s, expand_slot);
+    const auto* left = cat_.view(s.table);
+    const auto* right = cat_.view(s.join);
+    if (left == nullptr && right == nullptr) return s;
+    if (s.join.empty()) {
+      merge_one(s, body(*left));
+    } else {
+      merge_two(s, left, right);
+    }
+    return s;
+  }
+
+  // FROM view [WHERE …]: the view's FROM, and its WHERE and the query's
+  // together; over a grouped view the query's WHERE is a HAVING, the groups
+  // it keeps. The query may not group or aggregate again, but where a group
+  // is a row of the view (regroup, below); nor may it read through a view
+  // that cuts rows (DISTINCT, LIMIT).
+  void merge_one(ast::Select& s, const ViewBody& v) {
+    const auto& view = v.select;
+    auto grouped = aggregated(view);
+    if (view.distinct || view.limit) not_yet("a view defined with DISTINCT or LIMIT", s.table_pos);
+    if (view.for_update) not_yet("a view defined FOR UPDATE", s.table_pos);
+    auto again = aggregated(s) || s.distinct;
+    std::vector<ast::Expr> targets;
+    for (auto& e : s.targets) {
+      if (e.kind != ast::Expr::Kind::Star) {
+        targets.push_back(std::move(e));
+        continue;
+      }
+      if (!e.table.empty() && e.table != s.table) {
+        throw SqlError{"missing FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable};
+      }
+      if (!e.alias.empty()) throw SqlError{"syntax error at or near \"AS\"", e.pos};
+      for (const auto& name : v.names) targets.push_back(column_named(e, "", name));
+    }
+    s.targets = std::move(targets);
+    auto swap = [&](ast::Expr& ref) -> std::optional<ast::Expr> {
+      if (!ref.table.empty() && ref.table != s.table) {
+        throw SqlError{"missing FROM-clause entry for table \"" + ref.table + "\"", ref.pos, kUndefinedTable};
+      }
+      auto at = std::ranges::find(v.names, ref.column);
+      if (at == v.names.end()) throw SqlError{"column \"" + ref.column + "\" does not exist", ref.pos, kUndefinedColumn};
+      return ast::clone(view.targets[static_cast<std::size_t>(at - v.names.begin())]);
+    };
+    apply(s, swap);
+    if (grouped && again) {
+      if (!regroup(s, view)) not_yet("grouping, aggregating or DISTINCT over a grouped view", s.pos);
+    } else if (grouped) {
+      s.having.clear();
+      for (const auto& c : view.having) s.having.push_back(ast::clone(c));
+      for (auto& c : s.where) s.having.push_back(std::move(c));
+      s.where.clear();
+      s.group_by.clear();
+      for (const auto& g : view.group_by) s.group_by.push_back(ast::clone(g));
+    }
+    // The query takes the view's FROM, and its WHERE joins the query's.
+    s.table = view.table;
+    s.join = view.join;
+    s.table_pos = view.table_pos;
+    s.join_pos = view.join_pos;
+    s.using_columns = view.using_columns;
+    s.natural = view.natural;
+    s.using_alias = view.using_alias;
+    s.join_kind = view.join_kind;
+    std::vector<ast::Compare> where;
+    for (const auto& c : view.where) where.push_back(ast::clone(c));
+    for (auto& c : s.where) where.push_back(std::move(c));
+    s.where = std::move(where);
+    if (s.order_by.empty() && !s.distinct) s.order_by = view.order_by;
+  }
+
+  // A query that groups again over a grouped view, already substituted, is
+  // answered from the view's own query where that is the same answer: GROUP BY
+  // the view's group columns, no aggregate, only those columns read. A view
+  // row is a group, so grouping the rows by what groups them again is the
+  // view; the query's WHERE and HAVING are the view's HAVING. Any other
+  // waits for a derived table.
+  static auto regroup(ast::Select& s, const ast::Select& view) -> bool {
+    const auto& group = view.group_by;
+    auto in_group = [&](const ast::Expr& e) { return is_group_column(e, group); };
+    auto ordered_by_group = [&](const ast::OrderItem& o) {
+      return std::ranges::any_of(group, [&](const ast::Expr& g) {
+        return g.column == o.column && (o.table.empty() || g.table.empty() || g.table == o.table);
+      });
+    };
+    auto groups_alike = std::ranges::all_of(s.group_by, in_group) &&
+                        std::ranges::all_of(group, [&](const ast::Expr& g) {
+                          return std::ranges::any_of(s.group_by, [&](const ast::Expr& e) { return same_column(e, g); });
+                        });
+    if (s.distinct || s.group_by.empty() || !groups_alike || !std::ranges::all_of(s.targets, in_group) ||
+        !std::ranges::all_of(s.order_by, ordered_by_group) ||
+        !std::ranges::all_of(s.having, [&](const ast::Compare& c) { return over_group(c, group); })) {
+      return false;
+    }
+    std::vector<ast::Compare> having;
+    for (const auto& c : view.having) having.push_back(ast::clone(c));
+    for (auto& c : s.where) having.push_back(std::move(c));
+    for (auto& c : s.having) having.push_back(std::move(c));
+    s.having = std::move(having);
+    s.where.clear();
+    s.group_by.clear();
+    for (const auto& g : group) s.group_by.push_back(ast::clone(g));
+    return true;
+  }
+
+  // The query's clauses, each view column replaced by its item. A select-list
+  // column keeps its view name; a grouping or sort column must stay a column.
+  void apply(ast::Select& s, const ColumnSwap& swap) {
+    for (auto& e : s.targets) {
+      auto name = e.kind == ast::Expr::Kind::Column ? (e.alias.empty() ? e.column : e.alias) : std::string{};
+      swap_columns(e, swap);
+      if (!name.empty()) e.alias = name;
+    }
+    for (auto& c : s.where) swap_columns(c, swap);
+    for (auto& c : s.having) swap_columns(c, swap);
+    for (auto& g : s.group_by) {
+      swap_columns(g, swap);
+      if (g.kind != ast::Expr::Kind::Column) not_yet("grouping by a view column that is an expression", g.pos);
+    }
+    for (auto& o : s.order_by) {
+      auto ref = ast::Expr{ast::Expr::Kind::Column, o.column, 0, nullptr, nullptr, o.pos};
+      ref.table = o.table;
+      swap_columns(ref, swap);
+      if (ref.kind != ast::Expr::Kind::Column) not_yet("ordering by a view column that is an expression", o.pos);
+      o.column = ref.column;
+      o.table = ref.table;
+    }
+  }
+
+  // FROM view JOIN table, a table JOIN view, or two views, inner or outer:
+  // each view a single table's plain SELECT, replaced by its table, its
+  // columns by its items qualified with it, its WHERE added to the query's.
+  struct Side {
+    std::string name;
+    const ViewBody* view{nullptr};
+    const Table* table{nullptr};
+  };
+  void merge_two(ast::Select& s, const View* left, const View* right) {
+    Side sides[2]{{s.table, left != nullptr ? &body(*left) : nullptr, cat_.table(s.table)},
+                  {s.join, right != nullptr ? &body(*right) : nullptr, cat_.table(s.join)}};
+    for (auto i = 0; i < 2; ++i) {
+      if (sides[i].view == nullptr && sides[i].table == nullptr) {
+        throw SqlError{"relation \"" + sides[i].name + "\" does not exist", i == 0 ? s.table_pos : s.join_pos, kUndefinedTable};
+      }
+    }
+    auto outer = s.join_kind != ast::Select::JoinKind::Inner;
+    if (!s.using_columns.empty() || s.natural) not_yet("USING or NATURAL join of a view", s.join_pos);
+    for (const auto& side : sides) {
+      if (side.view == nullptr) continue;
+      const auto& v = side.view->select;
+      if (v.table.empty() || !v.join.empty() || aggregated(v) || v.distinct || v.limit || v.for_update) {
+        not_yet("a join of view \"" + side.name + "\", which is not a plain SELECT of one table", s.join_pos);
+      }
+      if (outer && !v.where.empty()) not_yet("an outer join of view \"" + side.name + "\", which has a WHERE", s.join_pos);
+    }
+    auto has = [](const Side& side, const std::string& column) {
+      if (side.view != nullptr) return std::ranges::find(side.view->names, column) != side.view->names.end();
+      return side.table->column(column) != nullptr;
+    };
+    // The side a column reference names or, unqualified, the only one that has it.
+    auto side_of = [&](const ast::Expr& ref) -> int {
+      if (!ref.table.empty()) return ref.table == sides[0].name ? 0 : ref.table == sides[1].name ? 1 : -1;
+      auto hit = -1;
+      for (auto i = 0; i < 2; ++i) {
+        if (!has(sides[i], ref.column)) continue;
+        if (hit >= 0) throw SqlError{"column reference \"" + ref.column + "\" is ambiguous", ref.pos, kAmbiguousColumn};
+        hit = i;
+      }
+      return hit;
+    };
+    auto swap = [&](ast::Expr& ref) -> std::optional<ast::Expr> {
+      auto i = side_of(ref);
+      if (i < 0) return std::nullopt;
+      const auto& side = sides[i];
+      if (side.view == nullptr) {
+        ref.table = side.name;
+        return std::nullopt;
+      }
+      auto at = std::ranges::find(side.view->names, ref.column);
+      if (at == side.view->names.end()) {
+        throw SqlError{"column \"" + ref.column + "\" does not exist", ref.pos, kUndefinedColumn};
+      }
+      auto item = ast::clone(side.view->select.targets[static_cast<std::size_t>(at - side.view->names.begin())]);
+      qualify(item, side.view->select.table);
+      return item;
+    };
+    std::vector<ast::Expr> targets;
+    for (auto& e : s.targets) {
+      if (e.kind != ast::Expr::Kind::Star) {
+        targets.push_back(std::move(e));
+        continue;
+      }
+      if (!e.alias.empty()) throw SqlError{"syntax error at or near \"AS\"", e.pos};
+      if (!e.table.empty() && e.table != sides[0].name && e.table != sides[1].name) {
+        throw SqlError{"missing FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable};
+      }
+      for (const auto& side : sides) {
+        if (!e.table.empty() && e.table != side.name) continue;
+        if (side.view != nullptr) {
+          for (const auto& name : side.view->names) targets.push_back(column_named(e, side.name, name));
+        } else {
+          for (const auto& c : side.table->columns) {
+            if (!c.hidden) targets.push_back(column_named(e, side.name, c.name));
+          }
+        }
+      }
+    }
+    s.targets = std::move(targets);
+    apply(s, swap);
+    for (const auto& side : sides) {
+      if (side.view == nullptr) continue;
+      for (const auto& c : side.view->select.where) {
+        s.where.push_back(ast::clone(c));
+        qualify(s.where.back(), side.view->select.table);
+      }
+    }
+    s.table = sides[0].view != nullptr ? sides[0].view->select.table : sides[0].name;
+    s.join = sides[1].view != nullptr ? sides[1].view->select.table : sides[1].name;
+  }
+
+  const Catalog& cat_;
+  std::map<std::uint32_t, ViewBody> bodies_;
+  std::vector<std::uint32_t> used_;
+  int depth_{0};
+};
+
+// CREATE VIEW: the body is bound as a use would, so its errors are the
+// statement's; its definition is the statement's text.
+auto bind_create_view(const ast::CreateView& cv, const Catalog& cat) -> Bound {
+  if (select_param_count(cv.query) != 0) throw SqlError{"there is no parameter $1", cv.pos, kUndefinedParameter};
+  ViewExpander views{cat};
+  CreateViewDdl ddl{cv.view, cv.definition, {}, views.describe(cv.query, cv.columns).names};
+  views.relations(cv.query, ddl.depends_on);
+  return Bound{Ddl{std::move(ddl)}, {}, {}, {}, {}, {}, {}, {}};
+}
+
 }  // namespace
 
 auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
-  Binder b{cat, param_count(stmt)};
+  if (const auto* cv = std::get_if<ast::CreateView>(&stmt)) return bind_create_view(*cv, cat);
+  ViewExpander views{cat};
+  auto expanded = views.statement(stmt);
+  const auto& target = expanded ? *expanded : stmt;
+  Binder b{cat, param_count(target)};
   auto bound_stmt = std::visit(
       [&](const auto& s) -> std::pair<std::variant<Ddl, logical::NodePtr>, std::int32_t> {
         using T = std::decay_t<decltype(s)>;
@@ -2656,6 +3183,10 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           return {Ddl{DropTableDdl{s.table, s.if_exists}}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::DropIndex>) {
           return {Ddl{DropIndexDdl{s.index, s.if_exists}}, s.pos};
+        } else if constexpr (std::is_same_v<T, ast::DropView>) {
+          return {Ddl{DropViewDdl{s.view, s.if_exists}}, s.pos};
+        } else if constexpr (std::is_same_v<T, ast::CreateView>) {
+          throw std::logic_error("CREATE VIEW is bound by bind_create_view");
         } else if constexpr (std::is_same_v<T, ast::AddColumn>) {
           (void)b.table(s.table, s.pos);
           if (s.column.primary_key) throw SqlError{"ADD COLUMN cannot add a primary key column", s.column.pos};
@@ -2731,11 +3262,11 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           return {logical::node(logical::Delete{Binder::rows(*t, b.where(*t, s.where)), t}), s.pos};
         }
       },
-      stmt);
+      target);
   auto types = b.param_types(bound_stmt.second);
   types.insert(types.end(), b.fixed_types().begin(), b.fixed_types().end());
   return Bound{std::move(bound_stmt.first), std::move(types), b.param_sql(), b.param_table(), b.param_info(),
-               b.fixed_values(), b.take_subqueries()};
+               b.fixed_values(), b.take_subqueries(), views.used()};
 }
 
 }  // namespace bytecask::sql::bound

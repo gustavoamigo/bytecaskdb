@@ -153,7 +153,6 @@ e152_02_01_01
 e152_02_01_02
 e152_02_01_03
 e152_02_01_04
-f031_02_01_01
 f031_03_01_01
 f031_03_01_02
 f031_03_01_03
@@ -203,7 +202,6 @@ f031_03_12_18
 f031_03_12_19
 f031_03_12_20
 f031_03_12_21
-f031_16_01_01
 f031_19_01_01
 f031_19_01_02
 f031_19_01_03
@@ -277,18 +275,12 @@ f051_07_01_01
 f051_07_01_02
 f051_08_01_01
 f051_08_01_02
-f081_01_01
-f081_01_02
-f081_01_03
-f131_01_01_01
-f131_01_01_02
-f131_01_01_03
-f131_01_01_04
-f131_01_01_05
-f131_01_01_06
-f131_02_01_01
-f131_03_01_01
-f131_03_01_02
+f081_01_01  # UNION, EXCEPT: set operations
+f081_01_02  # UNION, EXCEPT: set operations
+f081_01_03  # UNION, EXCEPT: set operations
+f131_02_01_01  # a join of a grouped view
+f131_03_01_01  # an aggregate over a grouped view: needs a derived table
+f131_03_01_02  # an aggregate over a grouped view: needs a derived table
 f131_04_01_01
 f131_04_01_02
 f131_04_01_03
@@ -301,18 +293,18 @@ f131_04_01_09
 f131_04_01_10
 f131_04_01_11
 f131_04_01_12
-f131_04_02_01
-f131_04_02_02
-f131_04_02_03
-f131_04_02_04
-f131_04_02_05
-f131_04_02_06
-f131_04_02_07
-f131_04_02_08
-f131_04_02_09
-f131_04_02_10
-f131_04_02_11
-f131_04_02_12
+f131_04_02_01  # a column compared with a subquery in a select list (not views)
+f131_04_02_02  # a column compared with a subquery in a select list (not views)
+f131_04_02_03  # a column compared with a subquery in a select list (not views)
+f131_04_02_04  # a column compared with a subquery in a select list (not views)
+f131_04_02_05  # a column compared with a subquery in a select list (not views)
+f131_04_02_06  # a column compared with a subquery in a select list (not views)
+f131_04_02_07  # a column compared with a subquery in a select list (not views)
+f131_04_02_08  # a column compared with a subquery in a select list (not views)
+f131_04_02_09  # a column compared with a subquery in a select list (not views)
+f131_04_02_10  # a column compared with a subquery in a select list (not views)
+f131_04_02_11  # a column compared with a subquery in a select list (not views)
+f131_04_02_12  # a column compared with a subquery in a select list (not views)
 f221_01_01
 f221_02_01
 f261_01_01_01  # WHEN with a list of values: not PostgreSQL syntax
@@ -323,10 +315,10 @@ f261_01_01_05  # WHEN with a list of values: not PostgreSQL syntax
 f261_01_01_06  # WHEN with a list of values: not PostgreSQL syntax
 f311_01_01_01
 f311_02_01_01
-f311_03_01_01
-f311_04_01_01
-f311_04_01_02
-f311_04_01_03
+f311_03_01_01  # CREATE SCHEMA with a view in it
+f311_04_01_01  # CREATE SCHEMA with a view in it
+f311_04_01_02  # CREATE SCHEMA with a view in it
+f311_04_01_03  # CREATE SCHEMA with a view in it
 f311_05_01_01
 f311_05_01_02
 f481_01_01

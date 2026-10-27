@@ -1615,6 +1615,172 @@ TEST_CASE("embedded API: || and the string functions of constants fold as Postgr
   CHECK(state("SELECT id FROM sf WHERE UPPER(v) = 'ABC'") == "42601");
 }
 
+TEST_CASE("embedded API: a view is read as a table, expanded at each use, and kept in the catalog", "[sql][api][view]") {
+  sql_test::TempDir dir{"api_view"};
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  auto state = [](Database& db, std::string_view sql) -> std::string {
+    try {
+      (void)db.execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    } catch (const DdlRefused& e) {
+      return std::string{e.sqlstate()};
+    } catch (const FeatureNotSupported&) {
+      return std::string{"0A000"};
+    }
+    return std::string{"ran"};
+  };
+  {
+    auto db = Database::open(dir.path());
+    auto run = [&](std::string_view sql) { return db->execute(sql).rows; };
+    (void)run("CREATE TABLE vt (id INTEGER PRIMARY KEY, a INTEGER, b VARCHAR(10))");
+    (void)run("INSERT INTO vt VALUES (1, 10, 'x')");
+    (void)run("INSERT INTO vt VALUES (2, 20, 'y')");
+    (void)run("INSERT INTO vt VALUES (3, 30, 'z')");
+    (void)run("CREATE TABLE vu (id INTEGER PRIMARY KEY, c INTEGER)");
+    (void)run("INSERT INTO vu VALUES (2, 200)");
+    (void)run("INSERT INTO vu VALUES (3, 300)");
+    (void)run("INSERT INTO vu VALUES (4, 400)");
+
+    // A view of a WHERE, with a column renamed; its columns are its select list's names.
+    (void)run("CREATE VIEW v AS SELECT id, a AS aa, b FROM vt WHERE a > 10");
+    CHECK(run("SELECT * FROM v ORDER BY id") == Grid{{i(2), i(20), text("y")}, {i(3), i(30), text("z")}});
+    CHECK(db->execute("SELECT * FROM v").columns == std::vector<std::string>{"id", "aa", "b"});
+    CHECK(run("SELECT aa FROM v WHERE id = 3") == Grid{{i(30)}});
+    CHECK(run("SELECT aa, id FROM v ORDER BY aa DESC") == Grid{{i(30), i(3)}, {i(20), i(2)}});
+    CHECK(run("SELECT v.b FROM v WHERE v.aa >= 30") == Grid{{text("z")}});
+    CHECK(run("SELECT COUNT(*) FROM v") == Grid{{i(2)}});
+    CHECK(run("SELECT id FROM v WHERE aa = 20 OR b = 'z' ORDER BY id") == Grid{{i(2)}, {i(3)}});
+    CHECK(run("SELECT x.id FROM v AS x WHERE x.aa = 20") == Grid{{i(2)}});
+    // Read at each use: a row written since shows.
+    (void)run("INSERT INTO vt VALUES (4, 40, 'w')");
+    CHECK(run("SELECT COUNT(*) FROM v") == Grid{{i(3)}});
+    // A column the view does not have is the view's to refuse, not the table's.
+    CHECK(state(*db, "SELECT a FROM v") == "42703");
+    CHECK(state(*db, "SELECT nope.id FROM v") == "42P01");
+
+    // A column list names the columns; fewer names than columns rename the first ones.
+    (void)run("CREATE VIEW w (x, y) AS SELECT id, a FROM vt");
+    CHECK(db->execute("SELECT * FROM w").columns == std::vector<std::string>{"x", "y"});
+    CHECK(run("SELECT x, y FROM w WHERE y >= 30 ORDER BY x") == Grid{{i(3), i(30)}, {i(4), i(40)}});
+    CHECK(state(*db, "CREATE VIEW w3 (x, y, z) AS SELECT id, a FROM vt") == "42601");
+    CHECK(state(*db, "CREATE VIEW w4 (x, x) AS SELECT id, a FROM vt") == "42701");
+    CHECK(state(*db, "CREATE VIEW w5 AS SELECT id, id FROM vt") == "42701");
+
+    // In a join, with a table or with another view, and in subqueries.
+    CHECK(run("SELECT v.aa, vu.c FROM v JOIN vu ON v.id = vu.id ORDER BY vu.c") == Grid{{i(20), i(200)}, {i(30), i(300)}, {i(40), i(400)}});
+    CHECK(run("SELECT * FROM vu JOIN v ON vu.id = v.id WHERE vu.c > 200 ORDER BY vu.c") ==
+          Grid{{i(3), i(300), i(3), i(30), text("z")}, {i(4), i(400), i(4), i(40), text("w")}});
+    CHECK(run("SELECT b, c FROM v JOIN vu ON v.id = vu.id WHERE c = 200") == Grid{{text("y"), i(200)}});  // each column's side is found
+    CHECK(run("SELECT w.y, vu.c FROM w, vu WHERE w.x = vu.id AND w.y = 30") == Grid{{i(30), i(300)}});
+    CHECK(state(*db, "SELECT * FROM w, v WHERE w.x = v.id") == "42601");  // two views of one table: a table joined with itself
+    CHECK(run("SELECT c FROM vu WHERE id IN (SELECT id FROM v WHERE aa > 20) ORDER BY c") == Grid{{i(300)}, {i(400)}});
+    CHECK(run("SELECT c FROM vu WHERE EXISTS (SELECT id FROM v WHERE aa = 20)").size() == 3);
+    CHECK(state(*db, "SELECT id FROM v JOIN vu ON v.id = vu.id") == "42702");  // both sides have id
+    CHECK(state(*db, "SELECT * FROM v JOIN vu USING (id)") == "42601");  // USING a view's column: not supported yet
+    CHECK(state(*db, "SELECT v.aa FROM v LEFT JOIN vu ON v.id = vu.id") == "42601");  // an outer join of a view with a WHERE
+    (void)run("CREATE VIEW plain AS SELECT id, a FROM vt");
+    CHECK(run("SELECT plain.a, vu.c FROM plain LEFT JOIN vu ON plain.id = vu.id WHERE plain.id < 3 ORDER BY plain.id") ==
+          Grid{{i(10), Value{}}, {i(20), i(200)}});
+    CHECK(run("SELECT vu.c, plain.a FROM vu RIGHT JOIN plain ON plain.id = vu.id WHERE plain.id < 3 ORDER BY plain.id") ==
+          Grid{{Value{}, i(10)}, {i(200), i(20)}});
+
+    // A view of a view.
+    (void)run("CREATE VIEW vv AS SELECT aa AS q, b FROM v WHERE id < 4");
+    CHECK(run("SELECT q FROM vv ORDER BY q") == Grid{{i(20)}, {i(30)}});
+    CHECK(run("SELECT * FROM vv WHERE b = 'z'") == Grid{{i(30), text("z")}});
+
+    // A constant in a view's select list, and a view of no table.
+    (void)run("CREATE VIEW k AS SELECT id, 7 AS seven FROM vt");
+    CHECK(run("SELECT id, seven FROM k WHERE id = 1") == Grid{{i(1), i(7)}});
+    CHECK(state(*db, "SELECT SUM(seven) FROM k") == "42601");  // an aggregate of a constant column: not supported yet
+    (void)run("CREATE VIEW one AS SELECT 1 AS n");
+    CHECK(run("SELECT n FROM one") == Grid{{i(1)}});
+
+    // A grouped view: the query reads its groups; its WHERE keeps groups (a HAVING).
+    (void)run("INSERT INTO vt VALUES (5, 10, 'x')");
+    (void)run("CREATE VIEW g AS SELECT a, COUNT(*) AS n, MIN(id) AS lo FROM vt GROUP BY a");
+    CHECK(run("SELECT a, n FROM g ORDER BY a") == Grid{{i(10), i(2)}, {i(20), i(1)}, {i(30), i(1)}, {i(40), i(1)}});
+    CHECK(run("SELECT a FROM g WHERE n = 2") == Grid{{i(10)}});
+    CHECK(run("SELECT lo FROM g WHERE a = 10 AND n >= 2") == Grid{{i(1)}});
+    CHECK(run("SELECT a FROM g WHERE a > 100").empty());
+    (void)run("CREATE VIEW ga AS SELECT a FROM vt GROUP BY a HAVING a >= 30");
+    CHECK(run("SELECT a FROM ga ORDER BY a") == Grid{{i(30)}, {i(40)}});
+    // Grouping a grouped view again by its own groups is the view; otherwise it waits for derived tables.
+    CHECK(run("SELECT a FROM ga GROUP BY a ORDER BY a") == Grid{{i(30)}, {i(40)}});
+    CHECK(run("SELECT a FROM ga WHERE a = 40 GROUP BY a HAVING a = 40") == Grid{{i(40)}});
+    CHECK(run("SELECT a FROM ga WHERE a = 40 GROUP BY a HAVING a = 30").empty());
+    CHECK(state(*db, "SELECT SUM(a) FROM ga") == "42601");
+    CHECK(state(*db, "SELECT COUNT(*) FROM ga") == "42601");
+    CHECK(state(*db, "SELECT DISTINCT a FROM ga") == "42601");
+    CHECK(state(*db, "SELECT a, n FROM g GROUP BY a") == "42601");
+    CHECK(state(*db, "SELECT a FROM g JOIN vu ON g.a = vu.id") == "42601");
+
+    // A view that cuts rows (DISTINCT, LIMIT) is created, and not read yet.
+    (void)run("CREATE VIEW d AS SELECT DISTINCT a FROM vt");
+    CHECK(state(*db, "SELECT a FROM d") == "42601");
+    CHECK(state(*db, "CREATE VIEW dp AS SELECT a FROM vt WHERE a = $1") == "42P02");
+
+    // A view is read-only here.
+    CHECK(state(*db, "INSERT INTO v VALUES (9, 9, 'q')") == "0A000");
+    CHECK(state(*db, "UPDATE v SET aa = 1") == "0A000");
+    CHECK(state(*db, "DELETE FROM v") == "0A000");
+    CHECK(state(*db, "CREATE INDEX vi ON v (id)") == "0A000");
+    CHECK(run("SELECT COUNT(*) FROM vt").front().front() == i(5));
+    // A view in a subquery of a write.
+    CHECK(db->execute("DELETE FROM vu WHERE id IN (SELECT id FROM v WHERE aa = 40)").affected == 1);
+    CHECK(run("SELECT COUNT(*) FROM vu") == Grid{{i(2)}});
+    (void)run("INSERT INTO vu VALUES (4, 400)");
+
+    // DDL: the names are one namespace, and a drop names its kind.
+    CHECK(state(*db, "CREATE VIEW v AS SELECT id FROM vt") == "42P07");
+    CHECK(state(*db, "CREATE VIEW vt AS SELECT id FROM vu") == "42P07");
+    CHECK(state(*db, "CREATE TABLE v (id INTEGER PRIMARY KEY)") == "42P07");
+    CHECK(state(*db, "CREATE VIEW bad AS SELECT id FROM nope") == "42P01");
+    CHECK(state(*db, "CREATE VIEW bad AS SELECT nope FROM vt") == "42703");
+    CHECK(state(*db, "CREATE VIEW bad AS SELECT * FROM v, vu, vt") == "42601");
+    CHECK(state(*db, "CREATE VIEW bad AS SELECT id FROM vt WITH CHECK OPTION") == "42601");
+    CHECK(state(*db, "DROP VIEW vt") == "42809");
+    CHECK(state(*db, "DROP TABLE v") == "42809");
+    CHECK(state(*db, "DROP INDEX v") == "42809");
+    CHECK(state(*db, "DROP VIEW nope") == "42P01");
+    CHECK(state(*db, "DROP VIEW IF EXISTS nope") == "ran");
+    // A view keeps what it reads from being dropped, as PostgreSQL's RESTRICT does.
+    CHECK(state(*db, "DROP TABLE vt") == "2BP01");
+    CHECK(state(*db, "DROP VIEW v") == "2BP01");  // vv reads it
+    CHECK(run("SELECT COUNT(*) FROM vv") == Grid{{i(2)}});
+    db->close();
+  }
+  // A fresh open reads the same views, and plans compiled through a view follow it when it is dropped and created again.
+  auto db = Database::open(dir.path());
+  auto run = [&](std::string_view sql) { return db->execute(sql).rows; };
+  CHECK(run("SELECT q FROM vv ORDER BY q") == Grid{{i(20)}, {i(30)}});
+  const auto& stmt = db->prepare("SELECT n FROM one");
+  CHECK(db->execute(stmt, {}).rows == Grid{{i(1)}});
+  (void)run("DROP VIEW one");
+  CHECK(state(*db, "SELECT n FROM one") == "42P01");
+  (void)run("CREATE VIEW one AS SELECT 2 AS n");
+  CHECK(db->execute(stmt, {}).rows == Grid{{i(2)}});  // the cached plan was rebuilt through the new view
+  // The view is bound against the tables as they are when it is read. PostgreSQL keeps the columns a star
+  // gave a view; here a view the tables have outgrown is refused, never given more columns.
+  (void)run("CREATE VIEW everything AS SELECT * FROM vu");
+  (void)run("CREATE VIEW over_everything AS SELECT c FROM everything");
+  CHECK(db->execute("SELECT * FROM everything").columns == std::vector<std::string>{"id", "c"});
+  (void)run("ALTER TABLE vu ADD COLUMN extra INTEGER DEFAULT 5");
+  CHECK(state(*db, "SELECT * FROM everything") == "0A000");
+  CHECK(state(*db, "SELECT c FROM over_everything") == "0A000");
+  (void)run("DROP VIEW over_everything");
+  (void)run("DROP VIEW everything");
+  (void)run("CREATE VIEW everything AS SELECT * FROM vu");
+  CHECK(db->execute("SELECT * FROM everything").columns == std::vector<std::string>{"id", "c", "extra"});
+  // Dropping what is read, once its views are gone.
+  for (auto name : {"vv", "v", "w", "plain", "k", "one", "g", "ga", "d", "everything"}) (void)run(std::string{"DROP VIEW "} + name);
+  (void)run("DROP TABLE vt");
+  (void)run("DROP TABLE vu");
+}
+
 TEST_CASE("embedded API: a choice point's plan text shows both plans, and each returns the same rows",
           "[sql][api][search][choice]") {
   sql_test::TempDir dir{"api_choice"};

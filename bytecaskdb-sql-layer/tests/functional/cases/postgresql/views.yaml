@@ -1,0 +1,232 @@
+# Views: CREATE VIEW and DROP VIEW, read like a table in FROM. A view is its
+# query, read again at each use. Updatable views, WITH CHECK OPTION, and a
+# query that groups or aggregates over a grouped view are not built.
+
+- name: a view reads its table's rows as they are when it is read
+  features: [F031-02]
+  ordered: true
+  setup:
+    - CREATE TABLE vw1 (id INTEGER PRIMARY KEY, v INTEGER, w TEXT)
+    - CREATE VIEW vw1_big AS SELECT id, v AS value, w FROM vw1 WHERE v > 10
+  steps:
+    - sql: INSERT INTO vw1 VALUES ($1, $2, $3)
+      params: [1, 10, "a"]
+      rowcount: 1
+    - sql: INSERT INTO vw1 VALUES ($1, $2, $3)
+      params: [2, 20, "b"]
+      rowcount: 1
+    - sql: SELECT * FROM vw1_big
+      expected: [[2, 20, "b"]]
+    - sql: INSERT INTO vw1 VALUES ($1, $2, $3)
+      params: [3, 30, "c"]
+      rowcount: 1
+    - sql: SELECT value, id FROM vw1_big WHERE id >= 2 ORDER BY value DESC
+      expected: [[30, 3], [20, 2]]
+    - sql: SELECT id FROM vw1_big WHERE w = 'c' OR value = 20 ORDER BY id
+      expected: [[2], [3]]
+    - sql: SELECT COUNT(*) FROM vw1_big
+      expected: [[2]]
+    - sql: SELECT x.value FROM vw1_big AS x WHERE x.id = 3
+      expected: [[30]]
+    # the view's columns are its own names: the table's v is not one of them
+    - sql: SELECT v FROM vw1_big
+      error: "42703"
+  teardown:
+    - DROP VIEW vw1_big
+    - DROP TABLE vw1
+
+- name: a view takes a column list, and a view can be read through another
+  features: [F031-02]
+  ordered: true
+  setup:
+    - CREATE TABLE vw2 (id INTEGER PRIMARY KEY, v INTEGER)
+    - CREATE VIEW vw2_a (k, n) AS SELECT id, v FROM vw2
+    - CREATE VIEW vw2_b AS SELECT n AS m FROM vw2_a WHERE k < 3
+  steps:
+    - sql: INSERT INTO vw2 VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO vw2 VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: INSERT INTO vw2 VALUES ($1, $2)
+      params: [3, 30]
+      rowcount: 1
+    - sql: SELECT k, n FROM vw2_a WHERE n >= 20 ORDER BY k
+      expected: [[2, 20], [3, 30]]
+    - sql: SELECT m FROM vw2_b ORDER BY m
+      expected: [[10], [20]]
+    - sql: SELECT id FROM vw2_a
+      error: "42703"
+    - sql: CREATE VIEW vw2_c (a, b, c) AS SELECT id, v FROM vw2
+      error: "42601"
+    - sql: CREATE VIEW vw2_c (a, a) AS SELECT id, v FROM vw2
+      error: "42701"
+  teardown:
+    - DROP VIEW vw2_b
+    - DROP VIEW vw2_a
+    - DROP TABLE vw2
+
+- name: a view in a join and in a subquery
+  features: [F031-02, F041-01]
+  ordered: true
+  setup:
+    - CREATE TABLE vw3 (id INTEGER PRIMARY KEY, v INTEGER)
+    - CREATE TABLE vw3_o (id INTEGER PRIMARY KEY, c INTEGER)
+    - CREATE VIEW vw3_v AS SELECT id, v FROM vw3 WHERE v > 10
+  steps:
+    - sql: INSERT INTO vw3 VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO vw3 VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: INSERT INTO vw3 VALUES ($1, $2)
+      params: [3, 30]
+      rowcount: 1
+    - sql: INSERT INTO vw3_o VALUES ($1, $2)
+      params: [2, 200]
+      rowcount: 1
+    - sql: INSERT INTO vw3_o VALUES ($1, $2)
+      params: [3, 300]
+      rowcount: 1
+    - sql: INSERT INTO vw3_o VALUES ($1, $2)
+      params: [4, 400]
+      rowcount: 1
+    - sql: SELECT vw3_v.v, vw3_o.c FROM vw3_v JOIN vw3_o ON vw3_v.id = vw3_o.id ORDER BY vw3_o.c
+      expected: [[20, 200], [30, 300]]
+    - sql: SELECT * FROM vw3_o JOIN vw3_v ON vw3_o.id = vw3_v.id ORDER BY vw3_o.id
+      expected: [[2, 200, 2, 20], [3, 300, 3, 30]]
+    - sql: SELECT c FROM vw3_o WHERE id IN (SELECT id FROM vw3_v) ORDER BY c
+      expected: [[200], [300]]
+    - sql: SELECT c FROM vw3_o WHERE id NOT IN (SELECT id FROM vw3_v) ORDER BY c
+      expected: [[400]]
+    - sql: SELECT vw3_o.c FROM vw3_o WHERE EXISTS (SELECT id FROM vw3_v WHERE v = 20) ORDER BY c
+      expected: [[200], [300], [400]]
+    # a column both have, unqualified
+    - sql: SELECT id FROM vw3_v JOIN vw3_o ON vw3_v.id = vw3_o.id
+      error: "42702"
+  teardown:
+    - DROP VIEW vw3_v
+    - DROP TABLE vw3_o
+    - DROP TABLE vw3
+
+- name: INSERT through a simple view reaches its table
+  features: [F031-02]
+  unimplemented: true
+  # updatable views: INSERT, UPDATE and DELETE on a view are refused (0A000)
+  setup:
+    - CREATE TABLE vw4 (id INTEGER PRIMARY KEY, v INTEGER)
+    - CREATE VIEW vw4_v AS SELECT id, v FROM vw4
+  steps:
+    - sql: INSERT INTO vw4_v VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: SELECT id, v FROM vw4
+      expected: [[1, 10]]
+  teardown:
+    - DROP VIEW vw4_v
+    - DROP TABLE vw4
+
+- name: DROP VIEW, and what keeps a table or a view from being dropped
+  features: [F031-16]
+  setup:
+    - CREATE TABLE vw5 (id INTEGER PRIMARY KEY)
+    - CREATE VIEW vw5_a AS SELECT id FROM vw5
+    - CREATE VIEW vw5_b AS SELECT id FROM vw5_a
+  steps:
+    # RESTRICT is the default: a table a view reads, a view another reads
+    - sql: DROP TABLE vw5
+      error: "2BP01"
+    - sql: DROP VIEW vw5_a
+      error: "2BP01"
+    - sql: DROP VIEW vw5_b
+    - sql: DROP VIEW vw5_a
+    - sql: DROP VIEW vw5_a
+      error: "42P01"
+    - sql: DROP VIEW IF EXISTS vw5_a
+    # the kinds of object are not interchangeable
+    - sql: DROP VIEW vw5
+      error: "42809"
+    - sql: CREATE VIEW vw5_c AS SELECT id FROM vw5
+    - sql: DROP TABLE vw5_c
+      error: "42809"
+    - sql: CREATE TABLE vw5_c (id INTEGER PRIMARY KEY)
+      error: "42P07"
+    - sql: CREATE VIEW vw5 AS SELECT id FROM vw5_c
+      error: "42P07"
+    - sql: DROP VIEW vw5_c
+  teardown:
+    - DROP TABLE vw5
+
+- name: a view of a table that is not there, a column that is not there, or a parameter
+  features: [F031-02]
+  setup:
+    - CREATE TABLE vw6 (id INTEGER PRIMARY KEY)
+  steps:
+    - sql: CREATE VIEW vw6_v AS SELECT id FROM vw6_nope
+      error: "42P01"
+    - sql: CREATE VIEW vw6_v AS SELECT nope FROM vw6
+      error: "42703"
+    - sql: CREATE VIEW vw6_v AS SELECT id FROM vw6 WHERE id = $1
+      error: "42P02"
+    - sql: SELECT id FROM vw6_v
+      error: "42P01"
+  teardown:
+    - DROP TABLE vw6
+
+- name: a grouped view is read for its groups; the query's WHERE keeps groups
+  features: [F131-01]
+  setup:
+    - CREATE TABLE vw7 (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)
+    - CREATE VIEW vw7_g AS SELECT a FROM vw7 GROUP BY a
+    - CREATE VIEW vw7_h AS SELECT a, MIN(b) AS lo, COUNT(*) AS n FROM vw7 GROUP BY a
+  steps:
+    - sql: INSERT INTO vw7 VALUES ($1, $2, $3)
+      params: [1, 1, 5]
+      rowcount: 1
+    - sql: INSERT INTO vw7 VALUES ($1, $2, $3)
+      params: [2, 1, 7]
+      rowcount: 1
+    - sql: INSERT INTO vw7 VALUES ($1, $2, $3)
+      params: [3, 2, 9]
+      rowcount: 1
+    - sql: SELECT a FROM vw7_g ORDER BY a
+      expected: [[1], [2]]
+      ordered: true
+    - sql: SELECT a FROM vw7_g WHERE a = 1
+      expected: [[1]]
+    # grouped again by its own group: the view
+    - sql: SELECT a FROM vw7_g GROUP BY a ORDER BY a
+      expected: [[1], [2]]
+      ordered: true
+    - sql: SELECT a FROM vw7_g WHERE a = 1 GROUP BY a HAVING a = 2
+      expected: []
+    - sql: SELECT a, lo FROM vw7_h WHERE n = 2
+      expected: [[1, 5]]
+    - sql: SELECT lo FROM vw7_h WHERE lo > 5
+      expected: [[9]]
+  teardown:
+    - DROP VIEW vw7_h
+    - DROP VIEW vw7_g
+    - DROP TABLE vw7
+
+- name: a query that aggregates over a grouped view
+  features: [F131-03]
+  unimplemented: true
+  # needs a derived table: refused (42601), the aggregate of the view's own aggregate
+  setup:
+    - CREATE TABLE vw8 (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)
+    - CREATE VIEW vw8_h AS SELECT a, MIN(b) AS lo FROM vw8 GROUP BY a
+  steps:
+    - sql: INSERT INTO vw8 VALUES ($1, $2, $3)
+      params: [1, 1, 5]
+      rowcount: 1
+    - sql: INSERT INTO vw8 VALUES ($1, $2, $3)
+      params: [2, 2, 7]
+      rowcount: 1
+    - sql: SELECT SUM(lo) FROM vw8_h
+      expected: [[12]]
+  teardown:
+    - DROP VIEW vw8_h
+    - DROP TABLE vw8

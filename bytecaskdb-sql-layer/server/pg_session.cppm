@@ -265,6 +265,8 @@ auto command_tag(Command c, const Rows& r) -> std::string {
     case Command::DropTable: return "DROP TABLE";
     case Command::DropIndex: return "DROP INDEX";
     case Command::AlterTable: return "ALTER TABLE";
+    case Command::CreateView: return "CREATE VIEW";
+    case Command::DropView: return "DROP VIEW";
   }
   return {};
 }

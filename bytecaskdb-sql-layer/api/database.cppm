@@ -193,6 +193,8 @@ enum class Command {
   DropTable,
   DropIndex,
   AlterTable,
+  CreateView,
+  DropView,
 };
 
 // A result column: its name and SQL type, as a client is told them before
@@ -241,6 +243,9 @@ private:
     // (bound::Bound::fixed): bound after the caller's parameters, as the
     // plan's last ones. A client never sees or sends them.
     std::vector<Value> fixed;
+    // The views the plan was expanded through (bound::Bound::views): it is
+    // rebuilt after any DDL, which may have changed what they read.
+    std::vector<std::uint32_t> views;
     std::vector<std::uint8_t> result_codes;  // the plan's result_types as bc_type codes
     RowLayout result_layout;                 // how its result rows decode
     std::vector<bc_col_ref> col_refs;
@@ -516,6 +521,10 @@ private:
   // Compiles a plan's text and sets what a run needs from it.
   void link(Compiled& c);
   auto recompile(const Statement& stmt) -> std::shared_ptr<const Compiled>;
+  // Recompiles a plan expanded through a view after any DDL: the runtime's
+  // check sees the tables the plan reads, and a view dropped, created again
+  // or outgrown by its tables leaves them as they were.
+  void recompile_view_plan(const Statement& stmt);
   // The statement's plan, checked against the live catalog and recompiled
   // if it no longer fits.
   auto fitting_plan(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params)
@@ -787,6 +796,10 @@ auto Statement::command() const -> Command {
           return Command::DropTable;
         } else if constexpr (std::is_same_v<T, ast::DropIndex>) {
           return Command::DropIndex;
+        } else if constexpr (std::is_same_v<T, ast::CreateView>) {
+          return Command::CreateView;
+        } else if constexpr (std::is_same_v<T, ast::DropView>) {
+          return Command::DropView;
         } else {
           static_assert(std::is_same_v<T, ast::AddColumn>);
           return Command::AlterTable;
@@ -964,6 +977,7 @@ auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
   c->param_table = std::move(bound.param_table);
   c->params = std::move(bound.params);
   c->fixed = std::move(bound.fixed);
+  c->views = std::move(bound.views);
   c->plan = std::make_unique<GeneratedPlan>(generate_plan(std::move(bound), *cat, s.sql_, row_counts(), budget_.max_bytes));
   link(*c);
   ++compilations_;
@@ -1128,7 +1142,14 @@ auto Database::plan_params(const Compiled& c, const std::vector<Value>& params) 
   return out;
 }
 
+void Database::recompile_view_plan(const Statement& stmt) {
+  auto c = stmt.compiled();
+  if (!c || c->views.empty() || c->plan->catalog_version == live_->current()->version()) return;
+  (void)recompile(stmt);
+}
+
 auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn) -> Rows {
+  recompile_view_plan(stmt);
   // The context reads the parameters through bp, filled once the plan that
   // runs is known: the caller's, then its constants (plan_params).
   bc_params bp;
