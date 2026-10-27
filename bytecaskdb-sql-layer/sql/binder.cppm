@@ -409,11 +409,14 @@ auto is_constant(const ast::Expr& e) -> bool {
     case K::Neg: return is_constant(*e.rhs);
     case K::Add:
     case K::Sub:
+    case K::Mul:
+    case K::Div:
     case K::Compare: return is_constant(*e.lhs) && is_constant(*e.rhs);
     case K::Cast: return is_constant(*e.rhs);
     case K::Column:
     case K::Param:
     case K::Aggregate:
+    case K::Star:
     case K::Subquery: return false;
   }
   return false;
@@ -434,48 +437,85 @@ auto rescale(std::int64_t v, std::uint8_t up) -> std::optional<std::int64_t> {
   return out;
 }
 
-// x + y or x - y, of integer or numeric constants, as PostgreSQL's
-// operators type it: INTEGER of two INTEGERs, BIGINT of two integers
-// otherwise, numeric at the finer scale with a numeric; the range checked
-// as there (22003). NULL beside a number is NULL of the number's type.
-auto add(const Constant& x, const Constant& y, bool sub, std::int32_t pos) -> Constant {
-  auto op = std::string{sub ? "-" : "+"};
+enum class Arith { Add, Sub, Mul, Div };
+
+constexpr auto arith_text(Arith op) -> std::string_view {
+  switch (op) {
+    case Arith::Add: return "+";
+    case Arith::Sub: return "-";
+    case Arith::Mul: return "*";
+    case Arith::Div: return "/";
+  }
+  return "+";
+}
+
+// x op y, of integer or numeric constants, as PostgreSQL's operators type
+// it: INTEGER of two INTEGERs, BIGINT of two integers otherwise; with a
+// numeric, + and - at the finer scale and * at the sum of the scales; the
+// range checked as there (22003). Integer / truncates toward zero; a
+// numeric quotient has PostgreSQL's own scale rule, not taken yet. A zero
+// divisor is 22012, a NULL operand NULL (a divisor of NULL first: strict
+// operators do not run). NULL beside a number is NULL of the number's type.
+auto arithmetic(const Constant& x, const Constant& y, Arith op, std::int32_t pos) -> Constant {
+  auto text = std::string{arith_text(op)};
   auto null_untyped = [](const Constant& c) { return c.unknown && std::holds_alternative<std::monostate>(c.value); };
-  if (null_untyped(x) && null_untyped(y)) not_yet("NULL " + op + " NULL", pos);
+  if (null_untyped(x) && null_untyped(y)) not_yet("NULL " + text + " NULL", pos);
   for (const auto* c : {&x, &y}) {
     if (c->unknown && !null_untyped(*c)) not_yet("a string literal in arithmetic", c->pos);
     if (!c->unknown && !is_integer(c->type) && c->type.kind != SqlKind::Decimal) {
-      throw SqlError{"operator does not exist: " + pg_type_name(x.type) + " " + op + " " + pg_type_name(y.type), pos,
+      throw SqlError{"operator does not exist: " + pg_type_name(x.type) + " " + text + " " + pg_type_name(y.type), pos,
                      kUndefinedFunction};
     }
   }
+  auto both_integer = !null_untyped(x) && !null_untyped(y) && is_integer(x.type) && is_integer(y.type);
   auto type = [&] {
     if (null_untyped(x)) return y.type;
     if (null_untyped(y)) return x.type;
-    if (is_integer(x.type) && is_integer(y.type)) {
+    if (both_integer) {
       return SqlType{x.type.kind == SqlKind::Integer && y.type.kind == SqlKind::Integer ? SqlKind::Integer : SqlKind::BigInt};
     }
+    if (op == Arith::Mul) return numeric_type(static_cast<std::uint8_t>(scaled(x).scale + scaled(y).scale));
     return numeric_type(std::max(scaled(x).scale, scaled(y).scale));
   }();
-  if (null_untyped(x) || null_untyped(y)) return {std::monostate{}, type, false, {}, pos};
-  if (std::holds_alternative<std::monostate>(x.value) || std::holds_alternative<std::monostate>(y.value)) {
+  auto is_null = [](const Constant& c) { return std::holds_alternative<std::monostate>(c.value); };
+  auto is_zero = [&](const Constant& c) { return !is_null(c) && std::get<std::int64_t>(c.value) == 0; };
+  if (op == Arith::Div && !is_null(x) && is_zero(y)) throw SqlError{"division by zero", pos, kDivisionByZero};
+  if (is_null(x) || is_null(y)) {
+    if (op == Arith::Div && !both_integer && !null_untyped(x) && !null_untyped(y)) not_yet("division of numerics", pos);
     return {std::monostate{}, type, false, {}, pos};
   }
+  auto overflow_error = [&] {
+    return SqlError{type.kind == SqlKind::Integer ? "integer out of range" : "bigint out of range", pos, kNumericValueOutOfRange};
+  };
   std::int64_t out = 0;
   if (is_integer(type)) {
     auto a = std::get<std::int64_t>(x.value);
     auto b = std::get<std::int64_t>(y.value);
-    auto overflow = sub ? __builtin_sub_overflow(a, b, &out) : __builtin_add_overflow(a, b, &out);
-    if (overflow || (type.kind == SqlKind::Integer && !std::in_range<std::int32_t>(out))) {
-      throw SqlError{type.kind == SqlKind::Integer ? "integer out of range" : "bigint out of range", pos,
-                     kNumericValueOutOfRange};
+    auto overflow = false;
+    switch (op) {
+      case Arith::Add: overflow = __builtin_add_overflow(a, b, &out); break;
+      case Arith::Sub: overflow = __builtin_sub_overflow(a, b, &out); break;
+      case Arith::Mul: overflow = __builtin_mul_overflow(a, b, &out); break;
+      case Arith::Div:
+        overflow = a == std::numeric_limits<std::int64_t>::min() && b == -1;
+        if (!overflow) out = a / b;
+        break;
+    }
+    if (overflow || (type.kind == SqlKind::Integer && !std::in_range<std::int32_t>(out))) throw overflow_error();
+    return {out, type, false, {}, pos};
+  }
+  if (op == Arith::Div) not_yet("division of numerics", pos);
+  if (op == Arith::Mul) {
+    // The product's scale is the sum of the scales: no rescaling, only the 18 digits.
+    if (__builtin_mul_overflow(scaled(x).v, scaled(y).v, &out) || out >= kDecimalLimit || out <= -kDecimalLimit) {
+      not_yet("a numeric of more than 18 digits", pos);
     }
     return {out, type, false, {}, pos};
   }
   auto a = rescale(scaled(x).v, static_cast<std::uint8_t>(type.scale - scaled(x).scale));
   auto b = rescale(scaled(y).v, static_cast<std::uint8_t>(type.scale - scaled(y).scale));
   if (!a || !b) not_yet("a numeric of more than 18 digits", pos);
-  out = sub ? *a - *b : *a + *b;  // each below 10^18: no overflow
+  out = op == Arith::Sub ? *a - *b : *a + *b;  // each below 10^18: no overflow
   if (out >= kDecimalLimit || out <= -kDecimalLimit) not_yet("a numeric of more than 18 digits", pos);
   return {out, type, false, {}, pos};
 }
@@ -667,13 +707,16 @@ auto fold(const ast::Expr& e) -> Constant {
       c.pos = e.pos;
       return c;
     }
-    case K::Add:
-    case K::Sub: return add(fold(*e.lhs), fold(*e.rhs), e.kind == K::Sub, e.pos);
+    case K::Add: return arithmetic(fold(*e.lhs), fold(*e.rhs), Arith::Add, e.pos);
+    case K::Sub: return arithmetic(fold(*e.lhs), fold(*e.rhs), Arith::Sub, e.pos);
+    case K::Mul: return arithmetic(fold(*e.lhs), fold(*e.rhs), Arith::Mul, e.pos);
+    case K::Div: return arithmetic(fold(*e.lhs), fold(*e.rhs), Arith::Div, e.pos);
     case K::Compare: return compare_constants(fold(*e.lhs), fold(*e.rhs), e.cmp, e.pos);
     case K::Cast: return cast_constant(e, fold(*e.rhs));
     case K::Column:
     case K::Param:
     case K::Aggregate:
+    case K::Star:
     case K::Subquery: break;
   }
   throw SqlError{"expression not supported", e.pos};
@@ -1449,6 +1492,9 @@ public:
                   e.kind == ast::Expr::Kind::Add ? Use::Added : Use::Subtracted);
         return logical::binary(kind, logical::column_of(t.id, *c), logical::param(e.rhs->param, c->sql), c->sql);
       }
+      case ast::Expr::Kind::Mul:
+      case ast::Expr::Kind::Div: not_yet("* and / of other than constants", e.pos);
+      case ast::Expr::Kind::Star: throw SqlError{"syntax error at or near \"*\"", e.pos};
       case ast::Expr::Kind::Aggregate: throw SqlError{"aggregate functions are not allowed here", e.pos, kGroupingError};
       case ast::Expr::Kind::Plus:
       case ast::Expr::Kind::Neg: not_yet("unary + and - of other than a constant", e.pos);
@@ -1699,13 +1745,19 @@ public:
   // USING (…) or NATURAL: its columns, each of both tables and named once
   // (NATURAL: every column name they share, in the left table's order), and
   // the equality of each, in that order.
-  auto using_conjuncts(const Table* (&sides)[2], const ast::Select& s) -> std::vector<logical::Expr> {
-    using_ = s.using_columns;
+  // The columns a USING clause or NATURAL joins on, in order (NATURAL:
+  // every column name both tables share, in the left table's order).
+  static auto shared_columns(const Table* const (&sides)[2], const ast::Select& s) -> std::vector<std::string> {
+    auto names = s.using_columns;
     if (s.natural) {
       for (const auto& c : sides[0]->columns) {
-        if (!c.hidden && sides[1]->column(c.name) != nullptr) using_.push_back(c.name);
+        if (!c.hidden && sides[1]->column(c.name) != nullptr) names.push_back(c.name);
       }
     }
+    return names;
+  }
+  auto using_conjuncts(const Table* (&sides)[2], const ast::Select& s) -> std::vector<logical::Expr> {
+    using_ = shared_columns(sides, s);
     using_alias_ = s.using_alias;
     std::vector<logical::Expr> out;
     for (const auto& name : using_) {
@@ -1738,6 +1790,10 @@ public:
   // one (Aggregate::dependent), and the GROUP BY stays as written.
   auto select(const ast::Select& s) -> logical::NodePtr {
     if (s.table.empty()) return select_without_from(s);
+    auto starred = std::ranges::any_of(s.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Star; });
+    std::vector<ast::Expr> expanded;
+    if (starred) expanded = expand_stars(s);
+    const auto& list = starred ? expanded : s.targets;
     auto joined = !s.join.empty();
     const Table* sides[2]{table(s.table, joined ? s.table_pos : s.pos), nullptr};
     std::vector<logical::Expr> conjuncts;
@@ -1774,7 +1830,7 @@ public:
       return {sides[side], c};
     };
     auto aggregated = !s.group_by.empty() || !s.having.empty() ||
-                      std::ranges::any_of(s.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Aggregate; });
+                      std::ranges::any_of(list, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Aggregate; });
     // DISTINCT is a GROUP BY of the selected columns. Over a query already
     // aggregated it is nothing more where every grouped column is
     // selected, each group then one row; else not yet. Checked in
@@ -1784,7 +1840,7 @@ public:
       if (s.for_update) throw SqlError{"FOR UPDATE is not allowed with DISTINCT clause", s.pos, kFeatureNotSupported};
       auto selected = [&](const ast::Expr& e) {
         auto ref = resolve(e);
-        return std::ranges::any_of(s.targets, [&](const ast::Expr& t) { return t.kind == ast::Expr::Kind::Column && resolve(t) == ref; });
+        return std::ranges::any_of(list, [&](const ast::Expr& t) { return t.kind == ast::Expr::Kind::Column && resolve(t) == ref; });
       };
       for (const auto& o : s.order_by) {
         if (!selected(column_ref(o))) {
@@ -1795,14 +1851,14 @@ public:
       if (aggregated && !std::ranges::all_of(s.group_by, selected)) {
         not_yet("SELECT DISTINCT of groups it does not select every GROUP BY column of", s.pos);
       }
-      for (const auto& e : s.targets) {
+      for (const auto& e : list) {
         if (distinct_groups && e.kind != ast::Expr::Kind::Column) not_yet("SELECT DISTINCT of other than columns", e.pos);
       }
     }
     aggregated = aggregated || distinct_groups;
     auto grouping = !s.group_by.empty() || distinct_groups;
     std::vector<logical::Expr> group_by;
-    for (const auto& e : distinct_groups ? s.targets : s.group_by) {
+    for (const auto& e : distinct_groups ? list : s.group_by) {
       auto [t, c] = resolve(e);
       auto g = logical::column_of(t->id, *c);
       if (std::ranges::find(group_by, g) == group_by.end()) group_by.push_back(std::move(g));
@@ -1821,7 +1877,7 @@ public:
       return g;
     };
     std::vector<logical::Output> targets;
-    for (const auto& e : s.targets) {
+    for (const auto& e : list) {
       if (is_constant(e) || e.kind == ast::Expr::Kind::Subquery) {
         if (aggregated) {
           not_yet(std::string{e.kind == ast::Expr::Kind::Subquery ? "a subquery" : "a constant"} +
@@ -1844,7 +1900,7 @@ public:
       auto [t, c] = resolve(e);
       targets.push_back({aggregated ? grouped(*t, *c, e.pos) : logical::column_of(t->id, *c), c->name});
     }
-    named(s, targets);
+    named(list, targets);
     std::vector<logical::Expr> having;
     for (const auto& h : s.having) having.push_back(having_conjunct(h, resolve, grouped));
     // 0A000, as PostgreSQL refuses it, and in its order of checks.
@@ -1909,15 +1965,58 @@ public:
   }
 
   // A select-list item's AS name is its output column's.
-  static void named(const ast::Select& s, std::vector<logical::Output>& targets) {
+  static void named(const std::vector<ast::Expr>& list, std::vector<logical::Output>& targets) {
     for (std::size_t i = 0; i < targets.size(); ++i) {
-      if (!s.targets[i].alias.empty()) targets[i].name = s.targets[i].alias;
+      if (!list[i].alias.empty()) targets[i].name = list[i].alias;
     }
+  }
+
+  // The select list with each * and `table`.* replaced by the columns it
+  // stands for, in table order, hidden ones left out. A * over a USING or
+  // NATURAL join gives the USING columns first, each once, named alone.
+  auto expand_stars(const ast::Select& s) -> std::vector<ast::Expr> {
+    std::vector<ast::Expr> out;
+    const Table* from[2]{table(s.table, s.join.empty() ? s.pos : s.table_pos), nullptr};
+    if (!s.join.empty()) from[1] = table(s.join, s.join_pos);
+    auto column_expr = [](const Table& t, const Column& c, std::int32_t pos) {
+      ast::Expr e{ast::Expr::Kind::Column, c.name, 0, nullptr, nullptr, pos};
+      e.table = t.name;
+      return e;
+    };
+    for (const auto& e : s.targets) {
+      if (e.kind != ast::Expr::Kind::Star) {
+        out.push_back(ast::clone(e));
+        out.back().alias = e.alias;
+        continue;
+      }
+      if (!e.alias.empty()) throw SqlError{"syntax error at or near \"AS\"", e.pos};
+      std::vector<std::string> merged;
+      if (e.table.empty() && from[1] != nullptr) {
+        merged = shared_columns(from, s);
+        for (const auto& name : merged) {
+          ast::Expr c{ast::Expr::Kind::Column, name, 0, nullptr, nullptr, e.pos};
+          out.push_back(std::move(c));
+        }
+      }
+      auto any = false;
+      for (const auto* t : from) {
+        if (t == nullptr || (!e.table.empty() && e.table != t->name)) continue;
+        any = true;
+        for (const auto& c : t->columns) {
+          if (!c.hidden && std::ranges::find(merged, c.name) == merged.end()) out.push_back(column_expr(*t, c, e.pos));
+        }
+      }
+      if (!any) throw SqlError{"missing FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable};
+    }
+    return out;
   }
 
   // A SELECT without FROM: its constants, one row of them, under its LIMIT.
   // A column is a column of no table (42703), as in PostgreSQL.
   auto select_without_from(const ast::Select& s) -> logical::NodePtr {
+    for (const auto& e : s.targets) {
+      if (e.kind == ast::Expr::Kind::Star) throw SqlError{"SELECT * with no tables specified is not valid", e.pos};
+    }
     if (!s.where.empty() || !s.group_by.empty() || !s.having.empty() || !s.order_by.empty() || s.for_update) {
       not_yet("a SELECT without FROM with WHERE, GROUP BY, HAVING, ORDER BY or FOR UPDATE", s.pos);
     }
@@ -1933,7 +2032,7 @@ public:
       if (!is_constant(e)) not_yet("a SELECT without FROM of other than constants and subqueries", e.pos);
       targets.push_back(constant_output(e));
     }
-    named(s, targets);
+    named(s.targets, targets);
     auto rows = logical::node(logical::Project{logical::node(logical::OneRow{}), std::move(targets)});
     if (s.limit) rows = logical::node(logical::Limit{std::move(rows), *s.limit});
     return rows;

@@ -154,7 +154,7 @@
 
 - name: multiplication
   features: [E011-04]
-  # only + and - are supported here
+  # only columns, constants and aggregates can be selected: arithmetic of columns is not supported
   unimplemented: true
   ordered: true
   setup:
@@ -177,7 +177,7 @@
 
 - name: division of integers truncates
   features: [E011-04]
-  # only + and - are supported here
+  # only columns, constants and aggregates can be selected: arithmetic of columns is not supported
   unimplemented: true
   ordered: true
   setup:
@@ -223,7 +223,7 @@
 
 - name: division by zero
   features: [E011-04]
-  # only + and - are supported here
+  # only columns, constants and aggregates can be selected: arithmetic of columns is not supported
   unimplemented: true
   setup:
     - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
@@ -242,6 +242,20 @@
       error: "22012"
   teardown:
     - DROP TABLE n
+
+- name: multiplication and division of constants, the integer quotient truncated
+  features: [E011-04]
+  steps:
+    - sql: SELECT 6 * 7, 7 / 2, -7 / 2, 2 + 3 * 4, 8 / 2 / 2, 1.5 * 1.5
+      expected: [[42, 3, -3, 14, 2, "2.25"]]
+    - sql: SELECT 2147483647 * 2
+      error: "22003"
+    - sql: SELECT NULL * 2, NULL / 0
+      expected: [[null, null]]
+    - sql: SELECT 1 / 0
+      error: "22012"
+    - sql: SELECT 1.5 / 0
+      error: "22012"
 
 - name: unary minus and ABS
   features: [E011-04]

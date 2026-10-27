@@ -1427,6 +1427,69 @@ TEST_CASE("embedded API: table aliases qualify columns and hide the table's name
   CHECK(state("SELECT x.id FROM g AS x (a, b)") == "42601");  // renaming columns is not supported
 }
 
+TEST_CASE("embedded API: SELECT * and table.* expand to the FROM tables' columns, in order", "[sql][api]") {
+  sql_test::TempDir dir{"api_star"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE g (id INTEGER PRIMARY KEY, v INTEGER)");
+  (void)db->execute("CREATE TABLE h (id INTEGER PRIMARY KEY, w INTEGER)");
+  (void)db->execute("CREATE TABLE np (p INTEGER, q INTEGER)");
+  (void)db->execute("INSERT INTO g VALUES (1, 10)");
+  (void)db->execute("INSERT INTO g VALUES (2, 20)");
+  (void)db->execute("INSERT INTO h VALUES (1, 7)");
+  (void)db->execute("INSERT INTO np VALUES (3, 4)");
+  auto all = db->execute("SELECT * FROM g ORDER BY id");
+  CHECK(all.columns == std::vector<std::string>{"id", "v"});
+  CHECK(all.rows == Grid{{i(1), i(10)}, {i(2), i(20)}});
+  CHECK(db->execute("SELECT x.*, v FROM g AS x WHERE x.v > 10").rows == Grid{{i(2), i(20), i(20)}});
+  CHECK(db->execute("SELECT * FROM g JOIN h ON g.id = h.id").columns == std::vector<std::string>{"id", "v", "id", "w"});
+  // A USING column is named once, first.
+  auto using_star = db->execute("SELECT * FROM g JOIN h USING (id)");
+  CHECK(using_star.columns == std::vector<std::string>{"id", "v", "w"});
+  CHECK(using_star.rows == Grid{{i(1), i(10), i(7)}});
+  CHECK(db->execute("SELECT h.*, g.v FROM g JOIN h ON g.id = h.id").rows == Grid{{i(1), i(7), i(10)}});
+  CHECK(db->execute("SELECT DISTINCT * FROM np").rows == Grid{{i(3), i(4)}});
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+  CHECK(state("SELECT *") == "42601");
+  CHECK(state("SELECT nope.* FROM g") == "42P01");
+  CHECK(state("SELECT g.* FROM g x") == "42P01");
+  CHECK(state("SELECT id FROM g WHERE * = 1") == "42601");
+}
+
+TEST_CASE("embedded API: * and / of constants fold as PostgreSQL's operators type them", "[sql][api]") {
+  sql_test::TempDir dir{"api_mul_div"};
+  auto db = Database::open(dir.path());
+  CHECK(db->execute("SELECT 6 * 7, 7 / 2, -7 / 2, 2 + 3 * 4, 8 / 2 / 2").rows ==
+        Grid{{i(42), i(3), i(-3), i(14), i(2)}});
+  CHECK(db->execute("SELECT 2147483648 * 2").rows == Grid{{i(4294967296)}});  // past INTEGER: BIGINT
+  CHECK(db->execute("SELECT NULL * 2, NULL / 0, 1 / NULL").rows == Grid{{Value{}, Value{}, Value{}}});
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+  CHECK(state("SELECT 1 / 0") == "22012");
+  CHECK(state("SELECT 1.5 / 0") == "22012");
+  CHECK(state("SELECT 2147483647 * 2") == "22003");
+  CHECK(state("SELECT 9223372036854775807 * 2") == "22003");
+  CHECK(state("SELECT (-9223372036854775807 - 1) / -1") == "22003");
+  CHECK(state("SELECT 5.0 / 2") == "42601");  // a numeric quotient's scale is not taken yet
+  CHECK(state("SELECT 1 % 2") == "42601");
+}
+
 TEST_CASE("embedded API: a choice point's plan text shows both plans, and each returns the same rows",
           "[sql][api][search][choice]") {
   sql_test::TempDir dir{"api_choice"};
