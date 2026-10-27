@@ -272,8 +272,6 @@
 
 - name: SUM of a DOUBLE and of a DECIMAL
   features: [E091-05, E011-02, E011-03]
-  # SUM of a double precision column is not supported
-  unimplemented: true
   setup:
     - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
   steps:

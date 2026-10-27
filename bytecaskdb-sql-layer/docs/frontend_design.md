@@ -238,9 +238,25 @@ on any columns, and of predicates over them.
 - `COUNT(*)` counts rows, `COUNT(col)` non-NULL values, `COUNT(DISTINCT
   col)` distinct non-NULL values. All three are `bigint`, and 0 over no
   rows.
+- Every aggregate over a column takes `ALL` (the default) or `DISTINCT`.
+  `DISTINCT` folds each distinct non-NULL value of the column once: a
+  `DOUBLE PRECISION`'s `-0.0` and `0.0` are one value and NaN is one, as
+  `COUNT(DISTINCT)` already took them. `MIN(DISTINCT x)` and `MAX(DISTINCT
+  x)` are `MIN(x)` and `MAX(x)`, bound as such. The values seen are held
+  per group in the statement's memory, a key each, and a statement that
+  passes its budget fails with 54000, never spilling (`planner_design.md`,
+  *Memory*). The argument is a column: `SUM(DISTINCT a + 1)` is refused, as
+  is every aggregate of an expression (42601).
 - `SUM` over `SMALLINT` or `INTEGER` is `bigint`. Over `BIGINT` or
   `DECIMAL` it is `numeric`, kept at the input's scale. It is NULL over no
   rows.
+- `SUM`, `AVG`, `MIN` and `MAX` over a `DOUBLE PRECISION` column (`FLOAT`)
+  are `double precision`, as PostgreSQL's `float8` aggregates are. `SUM`
+  adds in order and fails with 22003 where finite values overflow; an
+  infinity or NaN carries through. `AVG` is the sum divided by the count.
+  NaN is above every number, so it is the `MAX` and the `MIN` only of NaNs.
+  Of `-0.0` and `0.0` the last read is the `MIN` and the `MAX`, as
+  PostgreSQL keeps it (*Known differences*).
 - `AVG` over an integer or `DECIMAL` column is `numeric`: PostgreSQL's
   `numeric_div` of the sum by the count, at the scale its
   `select_div_scale` chooses (at least 16 significant digits), rounded
@@ -251,8 +267,9 @@ on any columns, and of predicates over them.
   take a numeric or temporal column.
   - Of a `TEXT`, `VARCHAR` or `BYTEA` column they are refused (#534).
     Keeping the least value seen needs a buffer the plan API doesn't have.
-  - Of a `REAL` or `DOUBLE PRECISION` column they are refused too (*Known
-    differences*), as are `SUM` and `AVG` of one (42601).
+  - `SUM`, `AVG`, `MIN` and `MAX` of a `REAL` column are refused (42601):
+    PostgreSQL's `SUM` and `MIN` of one are `real`, summed in single
+    precision.
 
 **`SELECT DISTINCT`** is a `GROUP BY` of the selected columns, so it
 returns one row per distinct combination, NULL one value and a DOUBLE's
@@ -286,7 +303,9 @@ and with a constant selected or `DISTINCT ON`, it is not taken yet.
   it where both are integers of scale 0 (SMALLINT, INTEGER, BIGINT, a
   DECIMAL of scale 0), which compare exactly; any other pair is refused, as
   two uses of one `$n` are (*Known differences*). `HAVING` on `AVG` is
-  refused (42601): its quotient is no type a plan holds.
+  refused (42601): its quotient is no type a plan holds. So is `HAVING` on
+  an aggregate of a `DOUBLE PRECISION` column, which needs PostgreSQL's NaN
+  and `-0.0` rules, as a comparison of one does.
 - `AVG`'s result is PostgreSQL's numeric of no declared precision, a SQL
   type of its own (`SqlKind::Numeric`): no column has it, and a result row
   carries its value as its text.
@@ -656,10 +675,18 @@ fail on them.
   statement fails as 22003; PostgreSQL's `SUM` of a BIGINT or NUMERIC is an unbounded `numeric`. Below that the
   sums agree exactly (`test_sum_past_int64_is_an_error`). The machine sums
   no BIGINT column; no TPROC-C sum comes near.
-- **MIN and MAX of a REAL or DOUBLE PRECISION column are refused.**
-  PostgreSQL's `MIN` keeps the last of `-0.0` and `0.0` it meets, so its
-  answer depends on the order it reads the rows. The machine takes no `MIN`
-  or `MAX` of a float.
+- **MIN and MAX of a DOUBLE PRECISION column keep the last of `-0.0` and
+  `0.0` read**, as PostgreSQL's do, so which of the two shows depends on the
+  order the rows are read, which is the plan's and not the heap's. The two
+  compare equal and differ only in sign. The machine takes no `MIN` or `MAX`
+  of a float.
+- **SUM and AVG of DISTINCT DOUBLE PRECISION values add them in the order
+  they were first read**; PostgreSQL sorts the values and adds them
+  ascending. Float addition is not associative, so the two can differ in the
+  last digits (`0.1`, `0.2`, `1.5`, `2.5` and `4` sum to `8.3` ascending and
+  to `8.299999999999999` added as 1.5, 2.5, 4, 0.1, 0.2). Without `DISTINCT` both add in
+  the order the rows are read, which is the plan's and not the heap's. The
+  machine's floats are exact binary fractions.
 - **A HAVING parameter compared with the SUM of a BIGINT or DECIMAL is
   checked as a BIGINT** at the column's scale before the plan runs: a value
   past it is 22003, where PostgreSQL compares it with the numeric sum. The

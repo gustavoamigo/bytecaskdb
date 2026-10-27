@@ -2247,9 +2247,9 @@ public:
 
   // Whether the layer takes `fn` of `c`, and if not the SQLSTATE of the
   // refusal: 42883 where PostgreSQL has no such aggregate either, 42601 where
-  // it has and the layer does not yet (SUM or AVG of a REAL, DOUBLE PRECISION
-  // or TIME column, which PostgreSQL takes as an interval; MIN or MAX of a
-  // REAL, DOUBLE PRECISION or string column).
+  // it has and the layer does not yet (SUM, AVG, MIN or MAX of a REAL, SUM or
+  // AVG of a TIME column, which PostgreSQL takes as an interval; MIN or MAX
+  // of a string column).
   struct AggregateSupport {
     bool supported;
     SqlState sqlstate;
@@ -2263,8 +2263,8 @@ public:
       case SqlKind::Integer:
       case SqlKind::BigInt:
       case SqlKind::Decimal: return {true, kSyntaxError};
-      case SqlKind::Real:
-      case SqlKind::Double: return {false, kSyntaxError};
+      case SqlKind::Double: return {true, kSyntaxError};
+      case SqlKind::Real: return {false, kSyntaxError};
       case SqlKind::Text:
       case SqlKind::Varchar: return {false, sum ? kUndefinedFunction : kSyntaxError};
       case SqlKind::Boolean:
@@ -2304,7 +2304,8 @@ public:
   static auto aggregate(const Column* c, std::uint32_t table, const ast::Expr& e) -> logical::Output {
     using Fn = ast::Expr::Fn;
     auto agg = logical::expr(logical::Expr::Kind::Aggregate, SqlType{SqlKind::BigInt});
-    agg.distinct = e.distinct;
+    // MIN and MAX of the distinct values are those of all of them.
+    agg.distinct = e.distinct && e.fn != Fn::Min && e.fn != Fn::Max;
     switch (e.fn) {
       case Fn::Count: agg.fn = logical::Expr::Fn::Count; break;
       case Fn::Sum: agg.fn = logical::Expr::Fn::Sum; break;
@@ -2322,13 +2323,17 @@ public:
     switch (e.fn) {
       case Fn::Count: return {std::move(agg), "count"};
       case Fn::Sum:
-        if (c->sql.kind != SqlKind::SmallInt && c->sql.kind != SqlKind::Integer) {
+        if (c->sql.kind == SqlKind::Double) {
+          agg.type = c->sql;
+        } else if (c->sql.kind != SqlKind::SmallInt && c->sql.kind != SqlKind::Integer) {
           agg.type = SqlType{SqlKind::Decimal, 0, 0, c->sql.scale};
         }
         return {std::move(agg), "sum"};
       case Fn::Min: agg.type = c->sql; return {std::move(agg), "min"};
       case Fn::Max: agg.type = c->sql; return {std::move(agg), "max"};
-      case Fn::Avg: agg.type = SqlType{SqlKind::Numeric, 0, 0, c->sql.scale}; return {std::move(agg), "avg"};
+      case Fn::Avg:
+        agg.type = c->sql.kind == SqlKind::Double ? c->sql : SqlType{SqlKind::Numeric, 0, 0, c->sql.scale};
+        return {std::move(agg), "avg"};
     }
     return {std::move(agg), ""};
   }
@@ -3112,7 +3117,9 @@ public:
   // the aggregate's: COUNT's and SUM's of a SMALLINT or INTEGER a BIGINT,
   // SUM's of a BIGINT or DECIMAL the numeric at its scale, checked as a
   // BIGINT is (compared_type), MIN's and MAX's their column's. HAVING on AVG
-  // is not supported: its quotient is no type the plan holds.
+  // is not supported: its quotient is no type the plan holds. Nor is HAVING
+  // on an aggregate of a DOUBLE PRECISION column: it needs PostgreSQL's NaN
+  // and -0.0 rules, as a filter on one does.
   auto having_conjunct(const ast::Compare& w, const auto& resolve, const auto& grouped) -> logical::Expr {
     if (w.kind != ast::Compare::Kind::Compare) not_yet("HAVING with AND, OR, NOT, IS NULL, <>, BETWEEN or IN", w.pos);
     const auto* lhs = &w.lhs;
@@ -3146,6 +3153,9 @@ public:
       agg = aggregate(c, t->id, *lhs);
     }
     if (agg.expr.fn == logical::Expr::Fn::Avg) throw SqlError{"HAVING on AVG is not supported yet", lhs->pos};
+    if (agg.expr.fn != logical::Expr::Fn::Count && arg->sql.kind == SqlKind::Double) {
+      throw SqlError{"HAVING on an aggregate of a double precision column is not supported yet", lhs->pos};
+    }
     const Column* as = arg;
     if (agg.expr.fn == logical::Expr::Fn::Count || agg.expr.fn == logical::Expr::Fn::Sum) {
       synthetic_.push_back(Column{0, agg.name, agg.expr.type, PhysType::I64, true, {}});

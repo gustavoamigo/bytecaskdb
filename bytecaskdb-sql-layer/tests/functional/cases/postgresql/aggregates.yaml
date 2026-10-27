@@ -369,3 +369,173 @@
       expected: [[1], [2]]
   teardown:
     - DROP TABLE g
+
+- name: SUM, AVG, MIN and MAX of a DOUBLE column, ALL or DISTINCT
+  features: [E091-01, E091-03, E091-04, E091-05, E091-06, E091-07]
+  setup:
+    - CREATE TABLE d (id INTEGER PRIMARY KEY, k INTEGER, f DOUBLE PRECISION)
+  steps:
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [1, 1, 1.5]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [2, 1, 1.5]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [3, 1, 2.5]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [4, 2, null]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [5, 2, 4.0]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [6, null, 4.0]
+      rowcount: 1
+    - sql: SELECT SUM(f), AVG(f), MIN(f), MAX(f) FROM d WHERE id >= $1
+      params: [0]
+      expected: [[13.5, 2.7, 1.5, 4]]
+    - sql: SELECT SUM(ALL f), AVG(ALL f), MIN(ALL f), MAX(ALL f) FROM d WHERE id >= $1
+      params: [0]
+      expected: [[13.5, 2.7, 1.5, 4]]
+    - sql: SELECT SUM(DISTINCT f), AVG(DISTINCT f), MIN(DISTINCT f), MAX(DISTINCT f), COUNT(DISTINCT f) FROM d WHERE id >= $1
+      params: [0]
+      expected: [[8, 2.6666666666666665, 1.5, 4, 3]]
+    - sql: SELECT SUM(f), SUM(DISTINCT f), COUNT(f), COUNT(DISTINCT f) FROM d WHERE id >= $1
+      params: [0]
+      expected: [[13.5, 8, 5, 3]]
+  teardown:
+    - DROP TABLE d
+
+- name: SUM, AVG, MIN and MAX of a DOUBLE column are NULL over no rows
+  features: [E091-01, E091-03, E091-04, E091-05, E091-07]
+  setup:
+    - CREATE TABLE d (id INTEGER PRIMARY KEY, k INTEGER, f DOUBLE PRECISION)
+  steps:
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [1, 1, 1.5]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [2, 1, 1.5]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [3, 1, 2.5]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [4, 2, null]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [5, 2, 4.0]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [6, null, 4.0]
+      rowcount: 1
+    - sql: SELECT SUM(f), AVG(f), MIN(f), MAX(f), SUM(DISTINCT f), AVG(DISTINCT f) FROM d WHERE id > $1
+      params: [100]
+      expected: [[null, null, null, null, null, null]]
+    - sql: SELECT SUM(f), MIN(f) FROM d WHERE id = $1
+      params: [4]
+      expected: [[null, null]]
+  teardown:
+    - DROP TABLE d
+
+- name: SUM, AVG, MIN and MAX of a DOUBLE column per group
+  features: [E091-01, E091-03, E091-04, E091-05, E091-06]
+  setup:
+    - CREATE TABLE d (id INTEGER PRIMARY KEY, k INTEGER, f DOUBLE PRECISION)
+  steps:
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [1, 1, 1.5]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [2, 1, 1.5]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [3, 1, 2.5]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [4, 2, null]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [5, 2, 4.0]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [6, null, 4.0]
+      rowcount: 1
+    - sql: SELECT k, SUM(f), AVG(f), MIN(f), MAX(f) FROM d WHERE id >= $1 GROUP BY k ORDER BY k
+      params: [0]
+      expected: [[1, 5.5, 1.8333333333333333, 1.5, 2.5], [2, 4, 4, 4, 4], [null, 4, 4, 4, 4]]
+    - sql: SELECT k, SUM(DISTINCT f), AVG(DISTINCT f), COUNT(DISTINCT f) FROM d WHERE id >= $1 GROUP BY k ORDER BY k
+      params: [0]
+      expected: [[1, 4, 2, 2], [2, 4, 4, 1], [null, 4, 4, 1]]
+  teardown:
+    - DROP TABLE d
+
+- name: SUM and AVG of DISTINCT integers, beside COUNT(DISTINCT) of the same column
+  features: [E091-05, E091-07]
+  setup:
+    - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
+  steps:
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [1, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [2, 1, 10]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [3, 2, 20]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [4, 2, null]
+      rowcount: 1
+    - sql: INSERT INTO g VALUES ($1, $2, $3)
+      params: [5, 2, 20]
+      rowcount: 1
+    - sql: SELECT SUM(DISTINCT v), COUNT(DISTINCT v), MIN(DISTINCT v), MAX(DISTINCT v), SUM(v) FROM g WHERE id >= $1
+      params: [0]
+      expected: [[30, 2, 10, 20, 60]]
+    - sql: SELECT k, SUM(DISTINCT v), COUNT(DISTINCT v), SUM(v) FROM g WHERE id >= $1 GROUP BY k ORDER BY k
+      params: [0]
+      expected: [[1, 10, 1, 20], [2, 20, 1, 40]]
+  teardown:
+    - DROP TABLE g
+
+- name: a DOUBLE aggregate over an indexed table, streamed by the index or held
+  features: [E091-03, E091-05, E091-07]
+  setup:
+    - CREATE TABLE d (id INTEGER PRIMARY KEY, k INTEGER, f DOUBLE PRECISION)
+    - CREATE INDEX d_kf ON d (k, f)
+  steps:
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [1, 1, 1.5]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [2, 1, 1.5]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [3, 1, 2.5]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [4, 2, null]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [5, 2, 4.0]
+      rowcount: 1
+    - sql: INSERT INTO d VALUES ($1, $2, $3)
+      params: [6, null, 4.0]
+      rowcount: 1
+    - sql: SELECT k, SUM(f), MIN(f), MAX(f), AVG(f) FROM d WHERE k >= $1 GROUP BY k ORDER BY k
+      params: [0]
+      expected: [[1, 5.5, 1.5, 2.5, 1.8333333333333333], [2, 4, 4, 4, 4]]
+    - sql: SELECT SUM(f), MIN(f), MAX(f) FROM d WHERE k = $1
+      params: [1]
+      expected: [[5.5, 1.5, 2.5]]
+    - sql: SELECT SUM(DISTINCT f), MAX(f) FROM d WHERE k >= $1
+      params: [1]
+      expected: [[8, 4]]
+    - sql: SELECT k, SUM(DISTINCT f) FROM d WHERE k >= $1 GROUP BY k ORDER BY k
+      params: [1]
+      expected: [[1, 4], [2, 4]]
+  teardown:
+    - DROP TABLE d
