@@ -531,13 +531,18 @@ TEST_CASE("plan API: the arithmetic helpers define what C leaves undefined", "[s
   arith_error(f, mul_p, {kMax, std::int64_t{2}});
   arith_error(f, mul_p, {kMin, std::int64_t{-1}});
   CHECK(value(f, div_p, {std::int64_t{-7}, std::int64_t{2}}) == -3);  // truncates toward zero
+  // The runtime tells a zero divisor (SQLSTATE 22012) from an overflow
+  // (22003) by this message.
   arith_error(f, div_p, {std::int64_t{1}, std::int64_t{0}});
+  CHECK(std::string{bc_error_message(f.cx)} == "division by zero");
   arith_error(f, div_p, {kMin, std::int64_t{-1}});
+  CHECK(std::string{bc_error_message(f.cx)} != "division by zero");
   CHECK(value(f, div_p, {kMin, std::int64_t{1}}) == kMin);
   CHECK(value(f, mod_p, {std::int64_t{-7}, std::int64_t{2}}) == -1);  // the dividend's sign
   CHECK(value(f, mod_p, {std::int64_t{7}, std::int64_t{-2}}) == 1);
   CHECK(value(f, mod_p, {kMin, std::int64_t{-1}}) == 0);
   arith_error(f, mod_p, {std::int64_t{1}, std::int64_t{0}});
+  CHECK(std::string{bc_error_message(f.cx)} == "division by zero");
   CHECK(value(f, neg_p, {std::int64_t{5}}) == -5);
   arith_error(f, neg_p, {kMin});
   CHECK(value(f, trunc_p, {-2.7}) == -2);

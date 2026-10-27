@@ -1489,8 +1489,170 @@ TEST_CASE("embedded API: * and / of constants fold as PostgreSQL's operators typ
   CHECK(state("SELECT 2147483647 * 2") == "22003");
   CHECK(state("SELECT 9223372036854775807 * 2") == "22003");
   CHECK(state("SELECT (-9223372036854775807 - 1) / -1") == "22003");
-  CHECK(state("SELECT 5.0 / 2") == "42601");  // a numeric quotient's scale is not taken yet
   CHECK(state("SELECT 1 % 2") == "42601");
+}
+
+TEST_CASE("embedded API: a numeric quotient of constants has PostgreSQL's scale", "[sql][api]") {
+  sql_test::TempDir dir{"api_numeric_quotient"};
+  auto db = Database::open(dir.path());
+  // select_div_scale: 16 significant digits, more where the dividend is the
+  // smaller by a base-10000 digit, and the finer operand's scale at least.
+  auto q = db->execute("SELECT 5.0 / 2, 10.0 / 4, 7.5 / 0.5, 100.0 / 3, -5.0 / 2, 5.0 / -2, 2.25 / 1.5, 3 / 2.0");
+  CHECK(q.rows == Grid{{i(25000000000000000), i(25000000000000000), i(150000000000000000), i(333333333333333333),
+                        i(-25000000000000000), i(-25000000000000000), i(15000000000000000), i(15000000000000000)}});
+  CHECK(q.types[0] == SqlType{SqlKind::Decimal, 0, 0, 16});
+  CHECK(q.types[3] == SqlType{SqlKind::Decimal, 0, 0, 16});
+  // Rounded half away from zero at the scale.
+  CHECK(db->execute("SELECT 20.0 / 3, -20.0 / 3, 10.0 / 3").rows ==
+        Grid{{i(66666666666666667), i(-66666666666666667), i(33333333333333333)}});
+  // A larger dividend leaves fewer places: 12 here.
+  auto big = db->execute("SELECT 100000.0 / 3");
+  CHECK(big.rows == Grid{{i(33333333333333333)}});
+  CHECK(big.types[0] == SqlType{SqlKind::Decimal, 0, 0, 12});
+  CHECK(db->execute("SELECT NULL / 1.5, 1.5 / NULL").rows == Grid{{Value{}, Value{}}});
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+  CHECK(state("SELECT 1.5 / 0") == "22012");
+  // A scale or a quotient past the 18 digits a DECIMAL holds is not taken.
+  CHECK(state("SELECT 1.0 / 3") == "42601");  // 20 digits of scale
+  CHECK(state("SELECT 1 / 2.0") == "42601");
+  CHECK(state("SELECT 0.0 / 2") == "42601");
+}
+
+TEST_CASE("embedded API: expressions over columns in the select list", "[sql][api]") {
+  sql_test::TempDir dir{"api_column_expressions"};
+  auto db = Database::open(dir.path());
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  auto yes = Value{true};
+  auto no = Value{false};
+  auto null = Value{};
+  (void)db->execute(
+      "CREATE TABLE ce (id INTEGER PRIMARY KEY, i INTEGER, s SMALLINT, b BIGINT, d DECIMAL(6,2), z INTEGER, t TEXT, f DOUBLE PRECISION)");
+  (void)db->execute("INSERT INTO ce VALUES (1, 1, 100, 9000000000000000000, 2.50, NULL, 'a', 1.5)");
+  (void)db->execute("INSERT INTO ce VALUES (2, 2, 200, 5, 2.50, 0, 'b', 2.5)");
+  (void)db->execute("INSERT INTO ce VALUES (3, 3, 300, 7, 10.00, 4, 'c', 0.5)");
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+
+  // + - * / with PostgreSQL's result types; / of integers truncates.
+  auto ints = db->execute("SELECT i + i, i - 1, i * i, i / 2, 7 / i FROM ce ORDER BY id");
+  CHECK(ints.rows == Grid{{i(2), i(0), i(1), i(0), i(7)}, {i(4), i(1), i(4), i(1), i(3)}, {i(6), i(2), i(9), i(1), i(2)}});
+  CHECK(ints.columns == std::vector<std::string>{"?column?", "?column?", "?column?", "?column?", "?column?"});
+  CHECK(ints.types == std::vector<SqlType>(5, SqlType{SqlKind::Integer}));
+  CHECK(db->execute("SELECT s * s FROM ce WHERE id = 1").types[0] == SqlType{SqlKind::SmallInt});
+  CHECK(db->execute("SELECT s * i FROM ce WHERE id = 1").types[0] == SqlType{SqlKind::Integer});
+  CHECK(db->execute("SELECT i * b FROM ce WHERE id = 2").types[0] == SqlType{SqlKind::BigInt});
+  CHECK(db->execute("SELECT b + 1 FROM ce ORDER BY id").rows == Grid{{i(9000000000000000001)}, {i(6)}, {i(8)}});
+
+  // DECIMALs: + and - at the finer scale, * at the sum; an integer meets them.
+  auto dec = db->execute("SELECT d + d, d + i, d - i, d * d, d * i FROM ce ORDER BY id");
+  CHECK(dec.types == std::vector<SqlType>{{SqlKind::Decimal, 0, 0, 2}, {SqlKind::Decimal, 0, 0, 2}, {SqlKind::Decimal, 0, 0, 2},
+                                          {SqlKind::Decimal, 0, 0, 4}, {SqlKind::Decimal, 0, 0, 2}});
+  CHECK(dec.rows == Grid{{i(500), i(350), i(150), i(62500), i(250)},
+                         {i(500), i(450), i(50), i(62500), i(500)},
+                         {i(2000), i(1300), i(700), i(1000000), i(3000)}});
+
+  // NULL in, NULL out; an operand a NULL column leaves the other unevaluated.
+  CHECK(db->execute("SELECT z + 1, z * 2, 1 - z FROM ce ORDER BY id").rows ==
+        Grid{{null, null, null}, {i(1), i(0), i(1)}, {i(5), i(8), i(-3)}});
+
+  // 22012 for a zero divisor, a column or a parameter; a NULL dividend raises none.
+  CHECK(state("SELECT i / z FROM ce") == "22012");
+  CHECK(state("SELECT d / 1 FROM ce") == "42601");  // a numeric quotient: its scale follows the values
+  CHECK(db->execute("SELECT i / z FROM ce WHERE id = 1").rows == Grid{{null}});
+  CHECK(db->execute("SELECT i / z FROM ce WHERE id = 3").rows == Grid{{i(0)}});
+  {
+    const auto& st = db->prepare("SELECT id, i / $1 FROM ce WHERE id < 3 ORDER BY id");
+    CHECK(db->execute(st, {i(1)}).rows == Grid{{i(1), i(1)}, {i(2), i(2)}});
+    try {
+      (void)db->execute(st, {i(0)});
+      FAIL("a zero divisor ran");
+    } catch (const ExecError& e) {
+      CHECK(sqlstate(e) == "22012");
+    }
+  }
+  // AND and OR evaluate an operand only while the result is open, so a guard works.
+  CHECK(db->execute("SELECT z <> 0 AND i / z > 0 FROM ce ORDER BY id").rows == Grid{{null}, {no}, {no}});
+  CHECK(db->execute("SELECT z = 0 OR i / z > 0 FROM ce WHERE id > 1 ORDER BY id").rows == Grid{{yes}, {no}});
+
+  // Range: a SMALLINT or INTEGER result is checked against its type, BIGINT's against its own.
+  CHECK(state("SELECT s * s FROM ce") == "22003");
+  CHECK(state("SELECT i * 1000000000 FROM ce") == "22003");
+  CHECK(state("SELECT b * 2 FROM ce") == "22003");
+  CHECK(state("SELECT b + b FROM ce WHERE id = 1") == "22003");
+  CHECK(db->execute("SELECT s * 100 FROM ce WHERE id = 1").rows == Grid{{i(10000)}});
+
+  // Comparisons as values: three-valued; numbers meet at the finer scale.
+  CHECK(db->execute("SELECT i < 2, i <= 2, i = 2, i <> 2, i >= 2, i > 2 FROM ce ORDER BY id").rows ==
+        Grid{{yes, yes, no, yes, no, no}, {no, yes, yes, no, yes, no}, {no, no, no, yes, yes, yes}});
+  CHECK(db->execute("SELECT i < z, z = z, z <> 0 FROM ce ORDER BY id").rows ==
+        Grid{{null, null, null}, {no, yes, no}, {yes, yes, yes}});
+  CHECK(db->execute("SELECT d < i, d = 2.5, d > 2 FROM ce ORDER BY id").rows ==
+        Grid{{no, yes, yes}, {no, yes, yes}, {no, no, yes}});
+  CHECK(db->execute("SELECT t = 'b', t < 'b', t >= 'b' FROM ce ORDER BY id").rows ==
+        Grid{{no, yes, no}, {yes, no, yes}, {no, no, yes}});
+  CHECK(db->execute("SELECT i + 1 = 3 AS hit FROM ce ORDER BY id").columns == std::vector<std::string>{"hit"});
+  CHECK(db->execute("SELECT i < (SELECT MAX(id) FROM ce), i = (SELECT MIN(id) FROM ce) FROM ce ORDER BY id").rows ==
+        Grid{{yes, yes}, {yes, no}, {no, no}});
+  CHECK(db->execute("SELECT i < (SELECT MAX(id) FROM ce WHERE id > 99) FROM ce WHERE id = 1").rows == Grid{{null}});
+  CHECK(state("SELECT i < t FROM ce") == "42883");
+  CHECK(state("SELECT i + t FROM ce") == "42883");
+  CHECK(db->execute(db->prepare("SELECT i + $1 < 4 FROM ce WHERE id = 1"), {i(2)}).rows == Grid{{yes}});
+
+  // IS [NOT] NULL of an expression, and AND, OR, NOT in SQL's logic.
+  CHECK(db->execute("SELECT z IS NULL, z IS NOT NULL, z + 1 IS NULL, i + i IS NOT NULL FROM ce ORDER BY id").rows ==
+        Grid{{yes, no, yes, yes}, {no, yes, no, yes}, {no, yes, no, yes}});
+  CHECK(db->execute("SELECT NOT (i > 1), i > 1 AND z IS NULL, i > 2 OR z IS NULL FROM ce ORDER BY id").rows ==
+        Grid{{yes, no, yes}, {no, no, no}, {no, no, yes}});
+  CHECK(db->execute("SELECT (z > 0) AND (z < 5), (z > 0) OR (z < 5), NOT (z > 0) FROM ce WHERE id = 1").rows ==
+        Grid{{null, null, null}});
+  CHECK(db->execute("SELECT (z > 0) AND false, (z > 0) OR true FROM ce WHERE id = 1").rows == Grid{{no, yes}});
+  CHECK(state("SELECT i AND true FROM ce") == "42804");
+  CHECK(state("SELECT NOT i FROM ce") == "42804");
+  // Constants fold: IS NULL, NOT, AND, OR of them.
+  CHECK(db->execute("SELECT NULL IS NULL, 1 IS NOT NULL, NOT TRUE, TRUE AND NULL, FALSE AND NULL, TRUE OR NULL, NULL OR NULL").rows ==
+        Grid{{yes, yes, no, null, no, yes, null}});
+
+  // Over a join, below a sort, from a covering index, in a set operation, a view.
+  (void)db->execute("CREATE TABLE ce2 (id INTEGER PRIMARY KEY, w INTEGER)");
+  (void)db->execute("INSERT INTO ce2 VALUES (1, 10)");
+  (void)db->execute("INSERT INTO ce2 VALUES (3, 30)");
+  CHECK(db->execute("SELECT ce.i + ce2.w, ce.i * ce2.w < 50 FROM ce JOIN ce2 ON ce.id = ce2.id ORDER BY ce2.w").rows ==
+        Grid{{i(11), yes}, {i(33), no}});
+  CHECK(db->execute("SELECT i * 2 FROM ce ORDER BY i DESC").rows == Grid{{i(6)}, {i(4)}, {i(2)}});
+  CHECK(db->execute("SELECT i * 2 FROM ce ORDER BY id DESC LIMIT 2").rows == Grid{{i(6)}, {i(4)}});
+  (void)db->execute("CREATE INDEX ce_i ON ce (i)");
+  CHECK(db->execute("SELECT i + 1 FROM ce WHERE i >= 2 ORDER BY i").rows == Grid{{i(3)}, {i(4)}});
+  CHECK(db->execute("SELECT i * 2 FROM ce UNION ALL SELECT w FROM ce2").rows.size() == 5);
+  (void)db->execute("CREATE VIEW cv AS SELECT id, i * 2 AS dbl FROM ce");
+  CHECK(db->execute("SELECT dbl FROM cv WHERE id = 3").rows == Grid{{i(6)}});
+
+  // What is still refused.
+  CHECK(state("SELECT f * 2 FROM ce") == "42601");               // REAL and DOUBLE PRECISION arithmetic
+  CHECK(state("SELECT f < 1 FROM ce") == "42601");
+  CHECK(state("SELECT -i FROM ce") == "42601");
+  CHECK(state("SELECT i % 2 FROM ce") == "42601");
+  CHECK(state("SELECT SUM(i) + 1 FROM ce") == "42601");
+  CHECK(state("SELECT i + 1, COUNT(*) FROM ce GROUP BY i") == "42601");
+  CHECK(state("SELECT $1 + 1 FROM ce") == "42601");
+  CHECK(state("UPDATE ce SET i = i * 2") == "42601");
+  CHECK(state("SELECT id FROM ce WHERE i * 2 = 4") == "42601");
 }
 
 TEST_CASE("embedded API: CASE, COALESCE and NULLIF of constants fold as PostgreSQL's do", "[sql][api]") {

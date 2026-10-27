@@ -75,8 +75,8 @@ compute, not how.
 | `Insert`, `Update`, `Delete` | writes, over the rows their input gives |
 
 Each expression carries its SQL type, which the binder resolves. The
-dialect's expressions are columns, parameters, integer constants, `+` and
-`-`, comparisons, their conjunction and aggregate calls. A literal is a
+dialect's expressions are columns, parameters, integer constants, `+ - * /`,
+comparisons, their conjunction and aggregate calls. A literal is a
 parameter by then: the binder folds it and the API binds it after the
 statement's own (`frontend_design.md`, *Literals*). A predicate (`And`,
 `Or`, `Not` of comparisons, and `IsNull` of a column) is a conjunct of its
@@ -84,15 +84,15 @@ own: the search keeps a table's predicates apart from its comparisons
 (`Rel::preds`), no access path takes one, and each is a filter after the
 path's, refused (`no plan:`) where it compares a REAL or DOUBLE column, as a
 comparison is. Codegen prints one as two C conditions, true and false, SQL's
-three-valued logic with unknown neither; `*` and `/` of columns come with
-the dialect that accepts them (#534). The
+three-valued logic with unknown neither. In a select list the same kinds
+are values (*Expressions over columns*). The
 binder's own rules are the frontend's: one SQL type per `$n`, and the
 errors it raises.
 
 **What the binder builds.**
 - A `SELECT` is `Limit? → Project → Sort? → Filter? → the tables`, the
   tables a `Get`, or a `Join` of two `Get`s. A `Project`'s outputs are
-  columns and constants' parameters. A `SELECT` without `FROM` is `Limit?
+  columns, constants' parameters and expressions over columns. A `SELECT` without `FROM` is `Limit?
   → Project → OneRow`.
 - An aggregated `SELECT` is `Limit? → Sort? → Filter? → Aggregate →
   Filter? → the tables`: the `Filter` above the `Aggregate` is its
@@ -832,6 +832,40 @@ operation inside another. An arm that groups, aggregates or is `DISTINCT` (#682)
 `FOR UPDATE`; a literal of no type meeting another type; `DECIMAL` of two
 scales, or with an integer; an integer with `REAL`; `DATE` with `TIMESTAMP`.
 
+### Expressions over columns
+
+A select-list item such as `a + b`, `a * 2 > c` or `a + a IS NULL` is a
+`logical::Expr` tree in the `Project`: columns, parameters (a constant or a
+subquery's value is one, hidden), `Add`, `Sub`, `Mul`, `Div`, `Compare`,
+`IsNull`, `Not`, `And` and `Or`, each typed by the binder
+(`frontend_design.md`, *Expressions over columns*). It is **one evaluator**:
+
+- **Search.** `emit_targets` makes a `physical::ExprTarget` of any output
+  that is neither a column nor a parameter; the columns it reads are the
+  `Project`'s needs like any other, so projection pruning, the choice of a
+  covering index and the rows a sorter holds (`q.above`) include them. The
+  checks are the Emit's: each column read is of a table in hand, never a
+  DOUBLE from a key. Nothing else in the search sees the tree.
+- **Codegen.** `Gen::eval(expr)` prints the expression for the row in hand
+  and returns its NULL test and value as C. Each operator's result is a
+  local (`v<i>`, with `n<i>` its NULL), so an operand prints once however
+  deep the tree. Arithmetic is the plan API's helpers (`bc_add`, `bc_sub`,
+  `bc_mul`, `bc_div`, `bc_add_bigint`, `bc_check_int`), called only for a
+  row whose operands are not NULL, so a NULL column raises nothing. A
+  `DECIMAL` is its scaled `int64_t`; an operand at a coarser scale is
+  multiplied by a power of ten first (`bc_mul`), which the binder has kept
+  inside 18 digits. `AND` and `OR` evaluate each operand in an `if (!settled)`
+  block, so an operand an earlier one settles is not evaluated and raises
+  nothing. `Emit` evaluates every expression of a row before `bc_emit_begin`,
+  then emits each by its type; in a set operation's arm the value goes to
+  the sink as any column does.
+- **What plugs in.** `CASE`, `COALESCE`, `NULLIF` and the string functions
+  (#669, #671) are more `Kind`s of the same tree and more cases in `eval`;
+  `CASE` evaluates a branch inside an `if` as `AND` does.
+- **Cost.** A plan with no such output prints exactly what it printed
+  before. An expression adds locals and a call per operator to each row it
+  is evaluated for; no performance claim is made.
+
 ### Aggregates
 
 **One row of `COUNT` or `SUM`.** A lone `COUNT`, `COUNT(DISTINCT)` or
@@ -1156,8 +1190,9 @@ with uncompilable C:
   join`, `a join conjunct that does not compare a column of each side`,
   `a conjunct that reads no column`); a table joined with itself; more than
   32 tables;
-- a result, aggregate, `GROUP BY` or `ORDER BY` column that is not a column
-  of the statement's tables; an output or `ORDER BY` key not grouped; a
+- a result column that is not an expression of columns of the statement's
+  tables; an aggregate, `GROUP BY` or `ORDER BY` column that is not a
+  column of them; an output or `ORDER BY` key not grouped; a
   `HAVING` conjunct that does not compare a grouped column or an aggregate
   with a parameter.
 

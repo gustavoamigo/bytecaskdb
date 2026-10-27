@@ -8,9 +8,12 @@
 // physical plan that computes it.
 //
 // The expressions are those the dialect has today: columns, parameters
-// (a literal is one, folded by the binder), integer constants, + and -,
+// (a literal is one, folded by the binder), integer constants, + - * and /,
 // comparisons, a conjunction of them, and aggregate calls. A predicate is its conjuncts, in the order the statement
-// wrote them.
+// wrote them. A select list's expression over columns (Project's outputs) is
+// a tree of these, each node typed: the one value expression the search
+// plans and codegen evaluates (docs/planner_design.md, *Expressions over
+// columns*).
 
 module;
 #include <cstdint>
@@ -54,9 +57,11 @@ struct ColumnRef {
 // And, Or, Not, IsNull and Like are a predicate's, a WHERE conjunct that is
 // no comparison of its own: three-valued, as SQL's logic is, over
 // comparisons, IS NULL of a column and a text column LIKE a pattern; a
-// filter, never a key's bound.
+// filter, never a key's bound. In a select list the same kinds are values:
+// a BOOLEAN, NULL where SQL's logic says unknown, over operands of any
+// value expression.
 struct Expr {
-  enum class Kind { Column, Param, Const, Add, Sub, Compare, Aggregate, And, Or, Not, IsNull, Like, Truth, InSet };
+  enum class Kind { Column, Param, Const, Add, Sub, Mul, Div, Compare, Aggregate, And, Or, Not, IsNull, Like, Truth, InSet };
   enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind{Kind::Param};
   SqlType type{};
@@ -67,8 +72,9 @@ struct Expr {
   Op op{Op::Eq};                // Compare
   Fn fn{Fn::Count};             // Aggregate
   bool distinct{false};         // Aggregate: COUNT(DISTINCT arg)
-  std::vector<Expr> args;       // Add, Sub, Compare: two; Aggregate: none (COUNT(*)) or its argument;
-                                // And, Or: two or more; Not: one; IsNull: its column; Like: the column and the
+  std::vector<Expr> args;       // Add, Sub, Mul, Div, Compare: two; Aggregate: none (COUNT(*)) or its argument;
+                                // And, Or: two or more; Not: one; IsNull: its column, or in a select list its
+                                // operand; Like: the column and the
                                 // pattern, a parameter; Truth: its parameter; InSet: its column
 
   [[nodiscard]] auto phys() const -> PhysType { return phys_type(type); }

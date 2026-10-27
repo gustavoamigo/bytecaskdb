@@ -91,6 +91,9 @@ struct SqlType {
   auto operator==(const SqlType&) const -> bool = default;
 };
 
+// The places after the point a type holds: a DECIMAL's scale, 0 for an integer.
+[[nodiscard]] constexpr auto decimal_scale(SqlType t) -> std::uint8_t { return t.kind == SqlKind::Decimal ? t.scale : std::uint8_t{0}; }
+
 [[nodiscard]] auto phys_type(SqlType t) -> PhysType;
 // The SQL type a column of only a physical type is declared as: BIGINT,
 // DOUBLE PRECISION, BOOLEAN or BYTEA, none with a range narrower than its
