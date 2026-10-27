@@ -1,10 +1,10 @@
 # Sessions, the worker pool and the transport
 
-Status: **approved, in progress** (design approved by the owner, 2026-10-25;
-tracked in #642). The second of the post-MVP designs (#487, *Next*). Once
-built, it replaces *Threading*, *I/O* and *Shutdown* in `server_design.md`.
-The protocol the server speaks, and everything a client sees, stays as
-`server_design.md` describes it.
+Status: **slice 1 built; slices 2–3 next** (design approved by the owner,
+2026-10-25; tracked in #642). The second of the post-MVP designs (#487,
+*Next*). Slice 1 replaced *Threading*, *I/O* and *Shutdown* in
+`server_design.md`. The protocol the server speaks, and everything a client
+sees, stays as `server_design.md` describes it.
 
 ## Why
 
@@ -73,10 +73,11 @@ map.
 protocol is sequential per connection, and a client may pipeline
 `Parse`, `Bind`, `Execute` and `Sync` before reading anything. So a session
 is *idle*, *queued* or *running*:
-- the loop appends messages to the session's queue and makes an idle
+- the loop hands the bytes it reads to the session and makes an idle
   session queued;
-- a worker takes a queued session, makes it running, and runs its messages
-  through today's `pg_session` logic, synchronously and to completion;
+- a worker takes a queued session, makes it running, cuts its bytes into
+  messages, and runs them through today's `pg_session` logic, synchronously
+  and to completion;
 - when its queue is empty, the session goes back to idle. Otherwise it
   goes back to queued, behind the others.
 
@@ -93,9 +94,12 @@ is *idle*, *queued* or *running*:
   of the session's queue and the session returns to idle until the next
   message (or end of stream) arrives. A worker never blocks on the socket.
 
-The queue's lock is the only lock. Taking a session from it gives the
-worker exclusive access, and makes the previous worker's writes to the
-session visible to it. No lock exists inside a session. The embedded API
+Each session has a small lock that guards only its handoff with the loop:
+the bytes read for it, its unsent output and its state. Each worker has its
+own queue with its own lock, and an idle worker takes sessions from the
+others' queues. Taking a session gives the worker exclusive access to the
+session's protocol and SQL state, and makes the previous worker's writes
+to it visible; nothing inside that state is locked. The embedded API
 already allows this: every `Database` call may come from any thread, and a
 `Transaction` handle may move between threads as long as one thread uses
 it at a time (`transaction_design.md`, *Shape*).
@@ -107,9 +111,24 @@ worker indefinitely. A single statement's memory is bounded by its budget
 (`plan_api_design.md`, *The guarantee*), and its run time is bounded when
 the statement timeout is set.
 
-**Replies.** A worker appends reply bytes to the connection's output buffer
-at the points today's server writes (`ReadyForQuery`, `Flush`, or past
-64 KiB) and wakes the loop. A slow reader never holds a worker. While a
+**An active session stays on its worker.** A client in a transaction sends
+its next statement microseconds after reading the last reply. Handing the
+session back to the loop between them costs an `epoll` wakeup and two
+thread switches per statement. So while no other session is queued, the
+worker that ran it waits up to 10 ms on the session's socket and runs the
+next statement itself; the loop isn't reading that socket meanwhile. The
+wait also watches the worker's `eventfd`, which a session queued on that
+worker, a stop, a drop, a closed connection or shutdown writes, so the
+session yields as soon as another needs the worker. A session goes to an
+idle worker if there is one, else to a parked one, rather than behind a
+worker that may be in a commit. An idle worker looks at another worker's
+queue only when its length counter says it isn't empty.
+
+**Replies.** A worker writes reply bytes at the points today's server writes
+(`ReadyForQuery`, `Flush`, or past 64 KiB): straight to the socket with a
+non-blocking `send` while the connection has no unsent output, or else to
+the connection's output buffer, and it wakes the loop. A slow reader never
+holds a worker. While a
 connection's unsent output is past its bound (*Bounds*), the session isn't
 scheduled for its next turn: its messages wait in its queue, and the loop
 stops reading its socket, so TCP pushes back on the client.
@@ -196,8 +215,8 @@ one that takes no bytes for ten seconds is dropped. Then the server calls
 None of them waits. A bound past its limit refuses, with the SQLSTATE
 PostgreSQL uses.
 - **Sessions.** `--max-connections`, as today: `FATAL 53300` past it.
-- **Workers.** A fixed pool (`--workers`, by default twice the cores,
-  minimum 2; *Decisions*, 6).
+- **Workers.** A fixed pool (`--workers`, by default four times the cores,
+  minimum 4; *Decisions*, 6).
 - **A session's input.** At most 64 MiB of unrun messages. Past it, the loop
   stops reading the socket until the session catches up. This is TCP
   backpressure, not an error.
@@ -288,7 +307,7 @@ vacuum. The connection-to-session map then goes.
 
 ## Slices
 
-1. **The model at parity.** The libuv loop, the session structure, the
+1. **The model at parity (built).** The libuv loop, the session structure, the
    per-session queue and the worker pool. The protocol and everything
    observable are unchanged, and `test_wire.py` passes as it is. The thread
    per connection is removed in the same PR.
@@ -324,9 +343,13 @@ The owner's, in the discussions of 2026-10-24 and 2026-10-25:
    callbacks rather than coroutines.
 5. No TLS and no authentication in the server: a terminating proxy in front
    owns both, and the server listens on loopback and trusts it.
-6. The worker pool's size is twice the cores by default (minimum 2) and
-   configurable (`--workers`), measured on the 48-user gate under
-   `AT_EVERY_COMMIT` before the default is locked.
+6. The worker pool's size is four times the cores by default (minimum 4) and
+   configurable (`--workers`): a worker waits on `fdatasync` under
+   `AT_EVERY_COMMIT`, and waits for the client's next statement between the
+   statements of an active burst, so the pool is larger than the cores.
+   Measured on the 48-user gate (48 warehouses, 2 + 5 min): `AT_EVERY_COMMIT`
+   57,109 NOPM against 39,530 with 48 workers, and `AT_INTERVAL` (1,000 ms)
+   150,208 NOPM at 48 users and 146,169 at 16.
 7. A global memory cap (`--max-memory-bytes`, by default half the machine's
    RAM) bounds the bytes every session's transaction buffers and statement
    budgets hold; passing it fails with `53200` (`out_of_memory`) and never

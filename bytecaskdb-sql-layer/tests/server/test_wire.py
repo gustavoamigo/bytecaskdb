@@ -607,7 +607,8 @@ def test_a_stop_drops_a_client_that_stopped_reading():
 
 def test_a_stop_lets_a_client_still_reading_take_its_whole_reply():
     """A result that takes seconds to read, begun before the stop: the client
-    gets every row, CommandComplete and ReadyForQuery, then 57P01."""
+    gets every row, CommandComplete and ReadyForQuery, then 57P01. A second
+    SIGTERM while the stop runs changes nothing, and the server exits 0."""
     if not server_binary():
         pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
     directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
@@ -622,6 +623,8 @@ def test_a_stop_lets_a_client_still_reading_take_its_whole_reply():
         out = []
         while not out or out[-1][0] != b"Z":
             out.append(c.message())
+            if len(out) == 400:
+                s.proc.send_signal(signal.SIGTERM)  # the stop is still running
             if len(out) % 200 == 0:
                 time.sleep(0.03)  # a slow reader: the reply takes seconds
         assert time.monotonic() - started > 2
@@ -634,6 +637,57 @@ def test_a_stop_lets_a_client_still_reading_take_its_whole_reply():
         s.stop()
         shutil.rmtree(directory, ignore_errors=True)
 
+
+
+def test_a_slow_reader_holds_no_worker():
+    """With one worker, a client that stops reading a 40 MB result does not
+    hold the worker: another session's statements still run (docs/session_design.md,
+    *Tests*)."""
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory, extra_args=["--workers", "1"])
+    try:
+        slow = connect(s)
+        fast = connect(s)
+        big_table(slow)
+        slow.send(parse("SELECT k, v FROM big WHERE k >= $1"), bind(["0"]), execute(), SYNC)
+        assert slow.message()[0] == b"1"  # the worker has run the query; 40 MB sits unsent
+        for k in ("0", "42", "19999"):
+            assert data(run(fast, "SELECT k FROM big WHERE k = $1", [k])) == [[k]]
+        fast.close()
+        slow.close()
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_a_long_pipeline_does_not_starve_another_session():
+    """With one worker, a session goes behind the others after each
+    ReadyForQuery so a long pipeline cannot starve another client."""
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory, extra_args=["--workers", "1"])
+    try:
+        pipeliner = connect(s)
+        other = connect(s)
+        table(pipeliner)
+        turns = 50
+        pipeliner.send(
+            parse("INSERT INTO t VALUES ($1, $2)"),
+            *[m for k in range(turns) for m in (bind([str(k), str(k)]), execute(), SYNC)],
+        )
+        assert status(pipeliner.until_ready()) == "I"
+        assert data(run(other, "SELECT k FROM t WHERE k = $1", ["0"])) == [["0"]]
+        for _ in range(turns - 1):
+            assert status(pipeliner.until_ready()) == "I"
+        assert data(run(other, "SELECT k FROM t WHERE k = $1", [str(turns - 1)])) == [[str(turns - 1)]]
+        other.close()
+        pipeliner.close()
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
 
 # ---------------------------------------------------------------- text forms
 
@@ -784,6 +838,8 @@ def test_statement_memory_bytes_is_every_statement_s_budget():
     (["--io-backend", "buffer_pool", "--buffer-pool-size", "1"], "buffer"),
     (["--statement-memory-bytes", "lots"], "--statement-memory-bytes"),
     (["--statement-memory-bytes", "0"], "statement_memory_bytes is at least 1"),
+    (["--workers", "0"], "--workers"),
+    (["--workers", "many"], "--workers"),
 ])
 def test_sync_and_io_flags_are_validated(flags, says):
     binary = server_binary()

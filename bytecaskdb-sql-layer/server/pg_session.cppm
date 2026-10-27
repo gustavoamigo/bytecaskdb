@@ -1,30 +1,43 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// pg_session.cppm — one PostgreSQL wire-protocol connection, from startup to
-// its end, over the embedded API (docs/server_design.md). A session runs on
-// its connection's own thread and shares nothing with another but the
-// Database. It blocks only on its socket and on the API's calls, which never
-// wait for another caller.
+// pg_session.cppm — PostgreSQL wire-protocol session state machine and worker
+// pool (docs/server_design.md, docs/session_design.md).
+//
+// A Session is a plain data structure with no thread and no lock: it holds the
+// startup parameters, the block status (I, T, E), the open Transaction handle,
+// the prepared statements and portals, and the pending implicit block. A
+// worker in Pool runs one session's queued messages up to the next
+// ReadyForQuery, then puts the session behind the others.
 
 module;
+#include <pthread.h>
+#include <sched.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/eventfd.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cctype>
 #include <chrono>
-#include <cerrno>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <exception>
+#include <functional>
 #include <map>
-#include <new>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -41,13 +54,6 @@ export namespace bytecask::sql::pg {
 struct SessionConfig {
   std::string database;  // the one name a client may connect to
 };
-
-// Serves one connection until the client terminates or drops it, or until
-// `stopping` is set and the read side of `fd` has been shut down, which wakes
-// a read: the connection is then sent FATAL 57P01. A send checks `stopping`
-// at least once a second. An open transaction is rolled back either way.
-// Does not close `fd`.
-void serve(Database& db, int fd, const SessionConfig& cfg, const std::atomic<bool>& stopping);
 
 // Once a stop has begun, how long a send waits on a client that takes no
 // bytes before the connection is dropped. A client still reading gets its
@@ -78,14 +84,6 @@ private:
   const char* sqlstate_;
 };
 SessionError::~SessionError() = default;
-
-// The socket closed or failed: nothing more can be sent.
-struct ConnectionGone {};
-
-struct Message {
-  char type;
-  std::string body;
-};
 
 // SetEncoding is SET client_encoding, the one SET taken: libpq's
 // PQsetClientEncoding sends it, and pgtcl's pg_connect calls that.
@@ -211,20 +209,20 @@ auto classify(std::string_view text, const char* several_state, std::string_view
   };
   if (w == "BEGIN") {
     only(1);
-    return {Classified::Kind::Control, Control::Begin, {}};
+    return {Classified::Kind::Control, Control::Begin, {}, {}};
   }
   if (w == "START") {
     if (words.size() < 2 || words[1] != "TRANSACTION") throw SessionError("syntax error at or near \"START\"", "42601");
     if (words.size() > 2) throw SessionError("START TRANSACTION with options is not supported", "0A000");
-    return {Classified::Kind::Control, Control::Begin, {}};
+    return {Classified::Kind::Control, Control::Begin, {}, {}};
   }
   if (w == "COMMIT" || w == "END") {
     only(1);
-    return {Classified::Kind::Control, Control::Commit, {}};
+    return {Classified::Kind::Control, Control::Commit, {}, {}};
   }
   if (w == "ROLLBACK" || w == "ABORT") {
     only(1);
-    return {Classified::Kind::Control, Control::Rollback, {}};
+    return {Classified::Kind::Control, Control::Rollback, {}, {}};
   }
   if (w == "SET") {
     // SET [SESSION] client_encoding {TO | =} 'UTF8': the server speaks UTF8,
@@ -291,118 +289,154 @@ struct Portal {
   std::vector<Value> params;
 };
 
-class Session {
+}  // namespace
+
+export class Session {
 public:
-  Session(Database& db, int fd, const SessionConfig& cfg, const std::atomic<bool>& stopping)
-      : db_{db}, fd_{fd}, cfg_{cfg}, stopping_{stopping} {}
+  Session(Database& db, const SessionConfig& cfg, std::function<void(std::string_view)> on_flush = {})
+      : db_{db}, cfg_{cfg}, on_flush_{std::move(on_flush)} {}
 
-  void run() {
-    try {
-      if (!startup()) return;
-      loop();
-    } catch (const ConnectionGone&) {  // NOLINT(bugprone-empty-catch): nothing to send it to
-    }
+  Session(const Session&) = delete;
+  Session& operator=(const Session&) = delete;
+  ~Session() { close(); }
+
+  void push(Input in) {
+    if (ended_) return;
+    waiting_for_lookahead_ = false;
+    queue_.push_back(std::move(in));
   }
 
-private:
-  // ------------------------------------------------------------ I/O
-
-  // More bytes into in_; false at the end of the stream or on an error.
-  auto fill() -> bool {
-    char buf[16 << 10];
-    for (;;) {
-      auto n = ::read(fd_, buf, sizeof buf);
-      if (n > 0) {
-        in_.append(buf, static_cast<std::size_t>(n));
-        return true;
-      }
-      if (n < 0 && errno == EINTR) continue;
-      return false;
-    }
+  [[nodiscard]] auto runnable() const noexcept -> bool {
+    return !ended_ && !queue_.empty() && !waiting_for_lookahead_;
   }
 
-  auto read_exact(std::size_t n, std::string& out) -> bool {
-    while (in_.size() - pos_ < n) {
-      if (pos_ > 0) {
-        in_.erase(0, pos_);
-        pos_ = 0;
-      }
-      if (!fill()) return false;
-    }
-    out.assign(in_, pos_, n);
-    pos_ += n;
-    return true;
-  }
+  [[nodiscard]] auto ended() const noexcept -> bool { return ended_; }
 
-  auto read_length(std::uint32_t& len) -> bool {
-    std::string b;
-    if (!read_exact(4, b)) return false;
-    Body body{b};
-    len = static_cast<std::uint32_t>(body.i32());
-    if (len < 4 || len > kMaxMessage) {
-      fatal("08P01", "invalid message length");
-      return false;
-    }
-    return true;
-  }
-
-  // The next message, from the one held by peek_type() first; nullopt at the
-  // end of the stream, and from then on: after a FATAL the bytes left are
-  // never read as messages.
-  auto next() -> std::optional<Message> {
-    if (pending_) return std::exchange(pending_, std::nullopt);
-    if (ended_) return std::nullopt;
-    std::string type;
-    std::uint32_t len = 0;
-    Message m{'\0', {}};
-    if (!read_exact(1, type) || !read_length(len) || !read_exact(len - 4, m.body)) {
-      ended_ = true;
-      return std::nullopt;
-    }
-    m.type = type[0];
-    return m;
-  }
-
-  // The type of the message after this one, read and held for next(); 0 at
-  // the end of the stream.
-  auto peek_type() -> char {
-    if (!pending_) pending_ = next();
-    return pending_ ? pending_->type : '\0';
-  }
-
-  // Whether the next message's first byte is here, without waiting for it.
-  auto arrived() -> bool {
-    if (in_.size() > pos_) return true;
-    pollfd p{fd_, POLLIN, 0};
-    return ::poll(&p, 1, 0) > 0;  // readable or at its end: next() tells which
-  }
-
-  // The stream ended: a stop says 57P01, unless a FATAL was already sent.
-  void stream_ended() {
-    if (stopping_.load() && !fatal_sent_) fatal("57P01", "terminating connection due to administrator command");
-  }
-
-  // Writes the buffer. It waits for a client as long as it reads, and,
-  // once a stop has begun, kStopSendTimeout for one that takes nothing: a
-  // send blocked in the kernel would not see the stop, so it never blocks.
-  void flush() {
-    auto data = out_.data();
-    std::size_t done = 0;
-    auto progress = std::chrono::steady_clock::now();
-    while (done < data.size()) {
-      auto n = ::send(fd_, data.data() + done, data.size() - done, MSG_NOSIGNAL | MSG_DONTWAIT);
-      if (n > 0) {
-        done += static_cast<std::size_t>(n);
-        progress = std::chrono::steady_clock::now();
+  // Runs queued messages up to the next ReadyForQuery (Startup, Query or Sync),
+  // or until the queue is empty, an Execute needs lookahead, or the session ends.
+  void step() {
+    while (!ended_ && !queue_.empty()) {
+      auto in = std::move(queue_.front());
+      queue_.pop_front();
+      if (!started_) {
+        switch (in.kind) {
+          case Input::Kind::BadStartupLength:
+            fatal("08P01", "invalid length of startup packet");
+            return;
+          case Input::Kind::EndOfStream:
+            close();
+            return;
+          case Input::Kind::Startup:
+            if (startup_packet(in.body)) {
+              started_ = true;
+              return;
+            }
+            if (ended_) return;
+            break;
+          case Input::Kind::Message:
+          case Input::Kind::BadMessageLength:
+            fatal("08P01", "invalid length of startup packet");
+            return;
+        }
         continue;
       }
-      if (n < 0 && errno == EINTR) continue;
-      if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) throw ConnectionGone{};
-      if (stopping_.load() && std::chrono::steady_clock::now() - progress > kStopSendTimeout) throw ConnectionGone{};
-      pollfd p{fd_, POLLOUT, 0};
-      (void)::poll(&p, 1, 1'000);
+
+      switch (in.kind) {
+        case Input::Kind::BadMessageLength:
+        case Input::Kind::BadStartupLength:
+          fatal("08P01", "invalid message length");
+          return;
+        case Input::Kind::EndOfStream:
+          close();
+          return;
+        case Input::Kind::Startup:
+          fatal("08P01", "invalid frontend message type 0");
+          return;
+        case Input::Kind::Message:
+          break;
+      }
+
+      if (in.type == 'X') {
+        close();
+        return;
+      }
+      if (skip_to_sync_ && in.type != 'S') continue;
+      Body body{in.body};
+      switch (in.type) {
+        case 'Q':
+          simple(body);
+          return;
+        case 'P':
+        case 'B':
+        case 'D':
+        case 'C':
+          try {
+            extended(in.type, body);
+          } catch (...) {
+            report(last_text_);
+            fail_block();
+            skip_to_sync_ = true;
+          }
+          break;
+        case 'E':
+          try {
+            if (!execute(body)) {
+              queue_.push_front(std::move(in));
+              waiting_for_lookahead_ = true;
+              return;
+            }
+          } catch (...) {
+            if (ended_) return;
+            report(last_text_);
+            fail_block();
+            skip_to_sync_ = true;
+          }
+          break;
+        case 'S':
+          sync();
+          return;
+        case 'H':
+          flush();
+          break;
+        case 'F':
+          error("0A000", "the function call protocol is not supported");
+          skip_to_sync_ = true;
+          break;
+        default:
+          fatal("08P01", std::string{"invalid frontend message type "} + std::to_string(in.type));
+          return;
+      }
     }
-    out_.clear();
+  }
+
+  // Ends the session on server shutdown: sends FATAL 57P01 unless a FATAL was
+  // already sent, and rolls back any open transaction.
+  void stop() {
+    if (!fatal_sent_) fatal("57P01", "terminating connection due to administrator command");
+    close();
+  }
+
+  void close() noexcept {
+    if (txn_) txn_->rollback();
+    txn_.reset();
+    if (implicit_) implicit_->rollback();
+    implicit_.reset();
+    portals_.clear();
+    queue_.clear();
+    waiting_for_lookahead_ = false;
+    ended_ = true;
+  }
+
+  [[nodiscard]] auto output() const noexcept -> std::string_view { return out_.data(); }
+  void clear_output() noexcept { out_.clear(); }
+  [[nodiscard]] auto take_output() noexcept -> std::string { return out_.take(); }
+
+private:
+  void flush() {
+    if (on_flush_ && out_.size() > 0) {
+      on_flush_(out_.data());
+      out_.clear();
+    }
   }
 
   // ------------------------------------------------------------ replies
@@ -431,13 +465,14 @@ private:
   }
   void warning(std::string_view state, std::string_view message) { send_fields('N', "WARNING", state, message, 0); }
 
-  // The session ends after it: nothing more is read or run.
+  // The session ends after it: nothing more is read or run, and any open
+  // transaction is rolled back.
   void fatal(std::string_view state, std::string_view message) {
     fatal_sent_ = true;
-    ended_ = true;
     send_fields('E', "FATAL", state, message, 0);
-    flush();
+    close();
   }
+
 
   // The exception in flight as an ErrorResponse. `text` is the statement an
   // ast::SqlError's position is into.
@@ -461,8 +496,8 @@ private:
     out_.begin('Z');
     out_.raw(status());
     out_.end();
-    flush();
   }
+
 
   void row_description(const std::vector<ResultColumn>& cols) {
     out_.begin('T');
@@ -516,32 +551,29 @@ private:
 
   // ------------------------------------------------------------ startup
 
-  // Startup and authentication, to the first ReadyForQuery; false if the
-  // connection ends here.
-  auto startup() -> bool {
-    for (;;) {
-      std::uint32_t len = 0;
-      if (!read_length(len)) return false;
-      if (len < 8 || len > 10'000) {
-        fatal("08P01", "invalid length of startup packet");
-        return false;
-      }
-      std::string b;
-      if (!read_exact(len - 4, b)) return false;
-      Body body{b};
+  // Handles one startup packet; true when startup reached ReadyForQuery.
+  auto startup_packet(std::string_view raw) -> bool {
+    try {
+      Body body{raw};
       auto code = body.i32();
       if (code == kSslRequest || code == kGssEncRequest) {
         out_.raw('N');  // no encryption: the client goes on in plaintext on this connection
         flush();
-        continue;
+        return false;
       }
-      if (code == kCancelRequest) return false;  // there is no cancel: nothing to do
+      if (code == kCancelRequest) {
+        close();  // there is no cancel yet (slice 2): nothing to do
+        return false;
+      }
       if ((code >> 16) != 3) {
         fatal("0A000", "unsupported frontend protocol " + std::to_string(code >> 16) + "." +
                            std::to_string(code & 0xFFFF) + ": server supports 3.0");
         return false;
       }
       return parameters(body, code & 0xFFFF);
+    } catch (const ProtocolError& e) {
+      fatal("08P01", e.what());
+      return false;
     }
   }
 
@@ -720,52 +752,12 @@ private:
 
   // ------------------------------------------------------------ messages
 
-  void loop() {
-    for (;;) {
-      auto m = next();
-      if (!m) {
-        stream_ended();
-        return;
-      }
-      if (m->type == 'X') return;
-      if (skip_to_sync_ && m->type != 'S') continue;
-      Body body{m->body};
-      switch (m->type) {
-        case 'Q': simple(body); break;
-        case 'P':
-        case 'B':
-        case 'D':
-        case 'E':
-        case 'C':
-          try {
-            extended(m->type, body);
-          } catch (const ConnectionGone&) {
-            throw;
-          } catch (...) {
-            report(last_text_);
-            fail_block();
-            skip_to_sync_ = true;
-          }
-          break;
-        case 'S': sync(); break;
-        case 'H': flush(); break;
-        case 'F':
-          error("0A000", "the function call protocol is not supported");
-          skip_to_sync_ = true;
-          break;
-        default:
-          fatal("08P01", std::string{"invalid frontend message type "} + std::to_string(m->type));
-          return;
-      }
-    }
-  }
-
   // A Query inside an extended block, before its Sync, joins the block's
   // implicit transaction, which commits when the Query ends, as in
   // PostgreSQL.
   void simple(Body& body) {
-    auto text = std::string{body.cstr()};
     try {
+      auto text = std::string{body.cstr()};
       auto c = classify(text, "0A000", "several statements in one query are not supported");
       switch (c.kind) {
         case Classified::Kind::Empty: simple_reply('I'); break;
@@ -794,8 +786,6 @@ private:
         implicit_.reset();
         (void)t.commit();
       }
-    } catch (const ConnectionGone&) {
-      throw;
     } catch (...) {
       report(last_text_);
       fail_block();
@@ -826,8 +816,7 @@ private:
       case 'P': parse(body); break;
       case 'B': bind(body); break;
       case 'D': describe(body); break;
-      case 'E': execute(body); break;
-      case 'C': close(body); break;
+      case 'C': close_msg(body); break;
       default: break;
     }
   }
@@ -929,19 +918,56 @@ private:
     }
   }
 
-  void execute(Body& body) {
+  enum class Lookahead { Wait, Sync, Other, Ended };
+
+  // Inspects the queued items after this Execute (docs/session_design.md,
+  // *Running a session*). A Flush is consumed; if nothing is queued behind it
+  // yet, the client may be waiting for this Execute's reply before sending
+  // Sync, so the statement runs in the implicit transaction and flushes.
+  auto lookahead(bool& flush_after) -> Lookahead {
+    if (queue_.empty()) return Lookahead::Wait;
+    while (!queue_.empty()) {
+      const auto& next = queue_.front();
+      if (next.kind == Input::Kind::BadMessageLength || next.kind == Input::Kind::BadStartupLength) {
+        queue_.pop_front();
+        fatal("08P01", "invalid message length");
+        return Lookahead::Ended;
+      }
+      if (next.kind == Input::Kind::EndOfStream) {
+        queue_.pop_front();
+        close();
+        return Lookahead::Ended;
+      }
+      if (next.kind != Input::Kind::Message) {
+        queue_.pop_front();
+        fatal("08P01", "invalid frontend message type 0");
+        return Lookahead::Ended;
+      }
+      if (next.type != 'H') {
+        return next.type == 'S' ? Lookahead::Sync : Lookahead::Other;
+      }
+      queue_.pop_front();
+      flush_after = true;
+      if (queue_.empty()) return Lookahead::Other;
+    }
+    return Lookahead::Other;
+  }
+
+  // Runs Execute; returns false only when no message after it has arrived yet
+  // and lookahead is needed before choosing autocommit vs implicit transaction.
+  auto execute(Body& body) -> bool {
     auto name = std::string{body.cstr()};
     if (body.i32() > 0) throw SessionError("Execute with a row limit is not supported", "0A000");
     const auto& portal = find_portal(name);
     const auto& p = portal.prepared;
     if (p.kind == Classified::Kind::Empty) {
       simple_reply('I');
-      return;
+      return true;
     }
     if (p.kind == Classified::Kind::Control) {
       auto [control, encoding] = std::pair{p.control, p.encoding};  // run_control may drop the portal
       complete(run_control(control, encoding));
-      return;
+      return true;
     }
     last_text_ = p.stmt->sql();
     refuse_if_failed();
@@ -950,20 +976,30 @@ private:
       rows = txn_->execute(*p.stmt, portal.params);
     } else if (implicit_) {
       rows = implicit_->execute(*p.stmt, portal.params);
-    } else if (auto flush_after = false; next_is_sync(flush_after)) {
-      // The block's one statement, as PQexecParams sends it: autocommit,
-      // with its conflict retry, as a simple Query runs it.
-      rows = db_.execute(*p.stmt, portal.params);
     } else {
-      // Two or more: PostgreSQL's implicit transaction, committed at Sync.
-      if (p.stmt->is_ddl()) refuse_ddl_beside_others();
-      implicit_.emplace(db_.begin());
-      rows = implicit_->execute(*p.stmt, portal.params);
-      reply(*p.stmt, rows);
-      if (flush_after) flush();
-      return;
+      auto flush_after = false;
+      switch (lookahead(flush_after)) {
+        case Lookahead::Wait:
+          return false;
+        case Lookahead::Ended:
+          return true;
+        case Lookahead::Sync:
+          // The block's one statement, as PQexecParams sends it: autocommit,
+          // with its conflict retry, as a simple Query runs it.
+          rows = db_.execute(*p.stmt, portal.params);
+          break;
+        case Lookahead::Other:
+          // Two or more: PostgreSQL's implicit transaction, committed at Sync.
+          if (p.stmt->is_ddl()) refuse_ddl_beside_others();
+          implicit_.emplace(db_.begin());
+          rows = implicit_->execute(*p.stmt, portal.params);
+          reply(*p.stmt, rows);
+          if (flush_after) flush();
+          return true;
+      }
     }
     reply(*p.stmt, rows);
+    return true;
   }
 
   void reply(const Statement& stmt, const Rows& rows) {
@@ -975,29 +1011,7 @@ private:
     throw SessionError("DDL in a block of several statements is not supported: send it alone", "0A000");
   }
 
-  // Whether the message after this Execute, past any Flush, is Sync. A Flush
-  // is looked past only when the message after it is already here: a client
-  // that sent Flush may be waiting for this Execute's reply, which is then
-  // sent at once (`flush_after`), and the statement runs in the implicit
-  // transaction. The stream's end runs nothing: no Sync would commit it.
-  auto next_is_sync(bool& flush_after) -> bool {
-    for (;;) {
-      auto t = peek_type();
-      if (t == '\0') {
-        stream_ended();
-        throw ConnectionGone{};
-      }
-      if (t != 'H') return t == 'S';
-      if (!arrived()) {
-        flush_after = true;
-        return false;
-      }
-      pending_.reset();  // this Flush: Sync, or the flush after the reply, covers it
-      flush_after = true;
-    }
-  }
-
-  void close(Body& body) {
+  void close_msg(Body& body) {
     auto what = body.byte();
     auto name = std::string{body.cstr()};
     if (what == 'S') {
@@ -1011,16 +1025,13 @@ private:
   }
 
   Database& db_;
-  int fd_;
   const SessionConfig& cfg_;
-  const std::atomic<bool>& stopping_;
-  std::string in_;
-  std::size_t pos_{0};
-  std::optional<Message> pending_;
+  std::function<void(std::string_view)> on_flush_;
+  std::deque<Input> queue_;
   Out out_;
   std::string application_name_;
   std::string encoding_{"UTF8"};  // client_encoding, as ParameterStatus reports it
-  std::string last_text_;  // the statement an error's position is into
+  std::string last_text_;         // the statement an error's position is into
   std::map<std::string, Prepared> statements_;
   std::map<std::string, Portal> portals_;
   std::optional<Transaction> txn_;       // the explicit block's, from BEGIN
@@ -1028,17 +1039,552 @@ private:
   bool in_block_{false};                 // inside BEGIN
   bool failed_{false};                   // the explicit block failed: E until COMMIT or ROLLBACK
   bool skip_to_sync_{false};
-  bool ended_{false};       // the stream ended, or a FATAL was sent: nothing more is read
+  bool started_{false};
+  bool waiting_for_lookahead_{false};
+  bool ended_{false};  // the stream ended, or a FATAL was sent: nothing more is read
   bool fatal_sent_{false};
 };
 
-}  // namespace
+// Fixed worker pool scheduling sessions one turn at a time
+// (docs/session_design.md, *Running a session*). Each Slot has its own mutex
+// for inbox/outbox handoff with the I/O loop, and each worker has its own
+// queue so workers do not contend on a single global mutex. When a connection
+// has no unsent backlog on the loop, the worker sends reply bytes directly
+// with non-blocking MSG_DONTWAIT and only hands over to the loop on EAGAIN.
+export class Pool {
+public:
+  static constexpr std::size_t kNoPreference = static_cast<std::size_t>(-1);
 
-void serve(Database& db, int fd, const SessionConfig& cfg, const std::atomic<bool>& stopping) {
-  Session s{db, fd, cfg, stopping};
-  s.run();
-}
+  struct Slot {
+    enum class State { Idle, Queued, Running };
 
+    Slot(Database& db, const SessionConfig& cfg, Pool& pool, int sock_fd, void* user_tag, std::size_t pref,
+         std::function<void(void*)> wake_cb)
+        : session{db, cfg, [this, &pool](std::string_view bytes) { pool.write_or_queue(*this, bytes); }},
+          fd{sock_fd},
+          tag{user_tag},
+          preferred_worker{pref},
+          on_wake{std::move(wake_cb)} {}
+
+    Session session;  // owned by the running worker (State::Running), or idle
+    Framer framer{};  // owned by the running worker (State::Running), or idle
+    std::mutex mu;
+    State state{State::Idle};
+    std::string raw_in;
+    std::deque<Input> inbox;
+    std::string outbox;
+    int fd{-1};
+    void* tag{nullptr};
+    std::size_t preferred_worker{kNoPreference};
+    std::function<void(void*)> on_wake;
+    bool loop_writing{false};
+    bool in_woken{false};
+    bool stopping{false};
+    bool dropped{false};
+    bool session_ended{false};
+    std::size_t turns{0};
+    std::size_t worker_migrations{0};
+    std::thread::id last_worker{};
+    std::size_t running_on{kNoPreference};  // the worker running it (State::Running)
+  };
+
+  struct Status {
+    bool ended{false};
+    bool idle{false};
+    std::size_t turns{0};
+    std::size_t worker_migrations{0};
+  };
+
+  Pool(Database& db, const SessionConfig& cfg, std::size_t workers, std::function<void()> on_wake = {},
+       std::span<const int> cpus = {})
+      : db_{db}, cfg_{cfg}, on_wake_{std::move(on_wake)} {
+    auto n = workers == 0 ? 1 : workers;
+    wq_.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      wq_.push_back(std::make_unique<WorkerQueue>());
+      wq_.back()->wake_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+      if (wq_.back()->wake_fd < 0) throw std::system_error{errno, std::generic_category(), "eventfd"};
+    }
+    workers_.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      int cpu = cpus.empty() ? -1 : cpus[i % cpus.size()];
+      workers_.emplace_back([this, i, cpu] {
+        if (cpu >= 0) {
+          cpu_set_t set;
+          CPU_ZERO(&set);
+          CPU_SET(static_cast<std::size_t>(cpu), &set);
+          (void)pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+        }
+        worker_loop(i);
+      });
+    }
+  }
+
+  Pool(const Pool&) = delete;
+  Pool& operator=(const Pool&) = delete;
+  ~Pool() { shutdown(); }
+
+  [[nodiscard]] auto open(int fd = -1, void* tag = nullptr, std::size_t preferred_worker = kNoPreference,
+                          std::function<void(void*)> wake_cb = {}) -> std::shared_ptr<Slot> {
+    return std::make_shared<Slot>(db_, cfg_, *this, fd, tag, preferred_worker, std::move(wake_cb));
+  }
+
+  void detach(const std::shared_ptr<Slot>& slot) {
+    auto running_on = kNoPreference;
+    {
+      std::lock_guard<std::mutex> lock{slot->mu};
+      slot->fd = -1;
+      slot->tag = nullptr;
+      slot->in_woken = false;
+      if (slot->state == Slot::State::Running) running_on = slot->running_on;
+    }
+    wake_parked(running_on);
+  }
+  void submit(const std::shared_ptr<Slot>& slot, std::span<Input> inputs) {
+    if (inputs.empty()) return;
+    auto need_schedule = false;
+    {
+      std::lock_guard<std::mutex> lock{slot->mu};
+      if (slot->dropped || slot->session_ended) return;
+      for (auto& in : inputs) slot->inbox.push_back(std::move(in));
+      if (slot->state == Slot::State::Idle) {
+        slot->state = Slot::State::Queued;
+        need_schedule = true;
+      }
+    }
+    if (need_schedule) enqueue_slot(slot);
+  }
+
+  void submit(const std::shared_ptr<Slot>& slot, Input in) {
+    submit(slot, std::span<Input>{&in, 1});
+  }
+
+  void submit_bytes(const std::shared_ptr<Slot>& slot, std::string_view bytes) {
+    if (bytes.empty()) return;
+    auto need_schedule = false;
+    {
+      std::lock_guard<std::mutex> lock{slot->mu};
+      if (slot->dropped || slot->session_ended) return;
+      slot->raw_in.append(bytes);
+      if (slot->state == Slot::State::Idle) {
+        slot->state = Slot::State::Queued;
+        need_schedule = true;
+      }
+    }
+    if (need_schedule) enqueue_slot(slot);
+  }
+
+  void stop(const std::shared_ptr<Slot>& slot) {
+    auto need_schedule = false;
+    auto running_on = kNoPreference;
+    {
+      std::lock_guard<std::mutex> lock{slot->mu};
+      if (slot->dropped || slot->session_ended) return;
+      slot->stopping = true;
+      if (slot->state == Slot::State::Idle) {
+        slot->state = Slot::State::Queued;
+        need_schedule = true;
+      } else if (slot->state == Slot::State::Running) {
+        running_on = slot->running_on;
+      }
+    }
+    if (need_schedule) enqueue_slot(slot);
+    wake_parked(running_on);
+  }
+
+  void drop(const std::shared_ptr<Slot>& slot) {
+    auto need_schedule = false;
+    auto running_on = kNoPreference;
+    {
+      std::lock_guard<std::mutex> lock{slot->mu};
+      slot->dropped = true;
+      slot->outbox.clear();
+      if (!slot->session_ended && slot->state == Slot::State::Idle) {
+        slot->state = Slot::State::Queued;
+        need_schedule = true;
+      } else if (slot->state == Slot::State::Running) {
+        running_on = slot->running_on;
+      }
+    }
+    if (need_schedule) enqueue_slot(slot);
+    wake_parked(running_on);
+  }
+
+  [[nodiscard]] auto drain(const std::shared_ptr<Slot>& slot, std::string& out, bool write_in_flight = false) -> Status {
+    std::lock_guard<std::mutex> lock{slot->mu};
+    slot->in_woken = false;
+    if (!slot->outbox.empty()) {
+      if (out.empty()) {
+        out = std::move(slot->outbox);
+      } else {
+        out.append(slot->outbox);
+      }
+      slot->outbox.clear();
+      slot->loop_writing = true;
+    } else if (out.empty() && !write_in_flight) {
+      slot->loop_writing = false;
+    }
+    return {slot->session_ended, slot->state == Slot::State::Idle, slot->turns, slot->worker_migrations};
+  }
+
+  void shutdown() noexcept {
+    if (shutdown_.exchange(true)) return;
+    for (auto& w : wq_) {
+      {
+        std::lock_guard<std::mutex> lock{w->mu};
+        w->shutdown = true;
+      }
+      w->cv.notify_all();
+      poke(*w);
+    }
+    for (auto& t : workers_) {
+      if (t.joinable()) t.join();
+    }
+    for (auto& w : wq_) {
+      if (w->wake_fd >= 0) ::close(w->wake_fd);
+      w->wake_fd = -1;
+    }
+  }
+
+private:
+  // How long a worker waits on its session's socket for the client's next
+  // statement before handing the session back to the loop.
+  static constexpr int kBurstWaitMs = 10;
+
+  struct alignas(64) WorkerQueue {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::shared_ptr<Slot>> queue;
+    std::atomic<std::size_t> len{0};    // queue.size(), read without the lock
+    std::atomic<bool> busy{false};
+    std::atomic<bool> parked{false};    // waiting on its session's socket and wake_fd
+    int wake_fd{-1};                    // eventfd: ends a parked wait
+    bool shutdown{false};
+  };
+
+  static void poke(WorkerQueue& w) noexcept {
+    std::uint64_t one = 1;
+    (void)!::write(w.wake_fd, &one, sizeof one);
+  }
+
+  void wake_parked(std::size_t idx) noexcept {
+    if (idx < wq_.size() && wq_[idx]->parked.load()) poke(*wq_[idx]);
+  }
+
+  void enqueue_slot(const std::shared_ptr<Slot>& slot) {
+    queued_slots_.fetch_add(1);
+    auto n = wq_.size();
+    auto start = slot->preferred_worker < n
+                     ? slot->preferred_worker
+                     : next_worker_.fetch_add(1, std::memory_order_relaxed) % n;
+    // An idle worker first; else one parked on its session's socket, which
+    // yields at once when poked; else the start, which may be in a commit.
+    auto chosen = n;
+    auto parked = n;
+    for (std::size_t i = 0; i < n; ++i) {
+      auto idx = (start + i) % n;
+      if (!wq_[idx]->busy.load(std::memory_order_relaxed)) {
+        chosen = idx;
+        break;
+      }
+      if (parked == n && wq_[idx]->parked.load(std::memory_order_relaxed)) parked = idx;
+    }
+    if (chosen == n) chosen = parked < n ? parked : start;
+    auto& w = *wq_[chosen];
+    {
+      std::lock_guard<std::mutex> lock{w.mu};
+      w.queue.push_back(slot);
+      w.len.fetch_add(1, std::memory_order_relaxed);
+      w.busy.store(true, std::memory_order_relaxed);
+    }
+    w.cv.notify_one();
+    // Its worker may be parked on another session's socket: end the wait so
+    // the session queued behind it runs.
+    if (w.parked.load()) poke(w);
+  }
+
+  auto pop_slot(std::size_t my_idx) -> std::shared_ptr<Slot> {
+    auto n = wq_.size();
+    auto& mine = *wq_[my_idx];
+    for (;;) {
+      {
+        std::lock_guard<std::mutex> lock{mine.mu};
+        if (!mine.queue.empty()) {
+          auto s = std::move(mine.queue.front());
+          mine.queue.pop_front();
+          mine.len.fetch_sub(1, std::memory_order_relaxed);
+          mine.busy.store(true, std::memory_order_relaxed);
+          queued_slots_.fetch_sub(1, std::memory_order_relaxed);
+          return s;
+        }
+      }
+      for (std::size_t i = 1; i < n; ++i) {
+        auto& other = *wq_[(my_idx + i) % n];
+        if (other.len.load(std::memory_order_relaxed) == 0) continue;
+        std::lock_guard<std::mutex> lock{other.mu};
+        if (!other.queue.empty()) {
+          auto s = std::move(other.queue.front());
+          other.queue.pop_front();
+          other.len.fetch_sub(1, std::memory_order_relaxed);
+          mine.busy.store(true, std::memory_order_relaxed);
+          queued_slots_.fetch_sub(1, std::memory_order_relaxed);
+          return s;
+        }
+      }
+      std::unique_lock<std::mutex> lock{mine.mu};
+      while (!mine.shutdown && mine.queue.empty()) {
+        mine.busy.store(false, std::memory_order_relaxed);
+        mine.cv.wait(lock);
+      }
+      if (mine.shutdown && mine.queue.empty()) return nullptr;
+    }
+  }
+
+  void notify_loop(Slot& slot) {
+    std::function<void(void*)> cb;
+    void* t = nullptr;
+    {
+      std::lock_guard<std::mutex> lock{slot.mu};
+      if (!slot.in_woken) {
+        slot.in_woken = true;
+        cb = slot.on_wake;
+        t = slot.tag;
+      }
+    }
+    if (cb && t != nullptr) {
+      cb(t);
+    } else if (on_wake_) {
+      on_wake_();
+    }
+  }
+
+  void write_or_queue(Slot& slot, std::string_view bytes) {
+    if (bytes.empty()) return;
+    int fd = -1;
+    {
+      std::lock_guard<std::mutex> lock{slot.mu};
+      if (slot.dropped) return;
+      if (slot.fd < 0 || slot.loop_writing || !slot.outbox.empty()) {
+        slot.outbox.append(bytes);
+        slot.loop_writing = true;
+      } else {
+        fd = slot.fd;
+      }
+    }
+    if (fd < 0) {
+      notify_loop(slot);
+      return;
+    }
+
+    std::size_t done = 0;
+    auto send_failed = false;
+    while (done < bytes.size()) {
+      auto n = ::send(fd, bytes.data() + done, bytes.size() - done, MSG_NOSIGNAL | MSG_DONTWAIT);
+      if (n > 0) {
+        done += static_cast<std::size_t>(n);
+        continue;
+      }
+      if (n < 0 && errno == EINTR) continue;
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+      send_failed = true;
+      break;
+    }
+    if (done == bytes.size() && !send_failed) return;
+
+    {
+      std::lock_guard<std::mutex> lock{slot.mu};
+      if (send_failed) {
+        slot.dropped = true;
+        slot.outbox.clear();
+      } else if (!slot.dropped) {
+        slot.outbox.append(bytes.substr(done));
+        slot.loop_writing = true;
+      }
+    }
+    notify_loop(slot);
+  }
+
+  void feed_raw(Slot& slot, std::string_view raw, std::vector<Input>& scratch) {
+    if (raw.empty()) return;
+    scratch.clear();
+    slot.framer.push(raw, scratch);
+    for (auto& in : scratch) slot.session.push(std::move(in));
+    scratch.clear();
+  }
+
+  void flush_session_output(Slot& slot) {
+    auto rem = slot.session.output();
+    if (!rem.empty()) {
+      write_or_queue(slot, rem);
+      slot.session.clear_output();
+    }
+  }
+
+  void worker_loop(std::size_t my_idx) {
+    auto tid = std::this_thread::get_id();
+    std::string local_raw;
+    std::vector<Input> scratch;
+    char recv_buf[16 << 10];
+
+    for (;;) {
+      auto slot = pop_slot(my_idx);
+      if (!slot) return;
+      auto dropped = false;
+      auto stopping = false;
+      {
+        std::lock_guard<std::mutex> lock{slot->mu};
+        slot->state = Slot::State::Running;
+        slot->running_on = my_idx;
+        if (slot->turns > 0 && slot->last_worker != tid) ++slot->worker_migrations;
+        slot->last_worker = tid;
+        ++slot->turns;
+        local_raw.swap(slot->raw_in);
+        slot->raw_in.clear();
+        while (!slot->inbox.empty()) {
+          slot->session.push(std::move(slot->inbox.front()));
+          slot->inbox.pop_front();
+        }
+        dropped = slot->dropped;
+        stopping = slot->stopping;
+      }
+      feed_raw(*slot, local_raw, scratch);
+      local_raw.clear();
+
+      if (dropped) {
+        slot->session.close();
+      } else if (stopping) {
+        slot->session.stop();
+        flush_session_output(*slot);
+      } else {
+        for (;;) {
+          slot->session.step();
+          flush_session_output(*slot);
+          if (slot->session.ended() || wq_.size() == 1 || queued_slots_.load(std::memory_order_relaxed) > 0 ||
+              shutdown_.load(std::memory_order_relaxed)) {
+            break;
+          }
+          int fd = -1;
+          {
+            std::lock_guard<std::mutex> lock{slot->mu};
+            if (slot->dropped || slot->stopping || slot->loop_writing) break;
+            fd = slot->fd;
+          }
+          if (slot->session.runnable()) {
+            std::lock_guard<std::mutex> lock{slot->mu};
+            ++slot->turns;
+            continue;
+          }
+          if (fd < 0) break;
+
+          // Active-session fast path: while no other session is queued, wait
+          // here for the client's next statement and run it without bouncing
+          // through the libuv loop. The wait ends on the socket, on wake_fd
+          // (a session queued behind this worker, stop, drop, detach or
+          // shutdown), or after kBurstWaitMs.
+          auto& me = *wq_[my_idx];
+          auto got_bytes = false;
+          auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{kBurstWaitMs};
+          for (;;) {
+            auto n = ::recv(fd, recv_buf, sizeof recv_buf, MSG_DONTWAIT);
+            if (n > 0) {
+              feed_raw(*slot, std::string_view{recv_buf, static_cast<std::size_t>(n)}, scratch);
+              got_bytes = true;
+              if (slot->session.runnable()) break;
+              continue;
+            }
+            if (n == 0) {
+              slot->session.push({Input::Kind::EndOfStream, '\0', {}});
+              slot->session.step();
+              got_bytes = false;
+              break;
+            }
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+              std::lock_guard<std::mutex> lock{slot->mu};
+              slot->dropped = true;
+              got_bytes = false;
+              break;
+            }
+            auto left = std::chrono::ceil<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+            if (left.count() <= 0) break;
+            // parked before the checks, so an enqueue, stop, drop or detach
+            // after them sees it and pokes wake_fd.
+            me.parked.store(true);
+            if (queued_slots_.load() > 0 || shutdown_.load()) {
+              me.parked.store(false);
+              break;
+            }
+            {
+              std::lock_guard<std::mutex> lock{slot->mu};
+              if (slot->stopping || slot->dropped || slot->fd < 0) {
+                me.parked.store(false);
+                break;
+              }
+            }
+            pollfd pfds[2]{{fd, POLLIN, 0}, {me.wake_fd, POLLIN, 0}};
+            auto ready = ::poll(pfds, 2, static_cast<int>(left.count()));
+            me.parked.store(false);
+            if (ready > 0 && (pfds[1].revents & POLLIN) != 0) {
+              std::uint64_t count = 0;
+              (void)!::read(me.wake_fd, &count, sizeof count);
+              break;
+            }
+          }
+          if (!got_bytes || !slot->session.runnable()) break;
+          {
+            std::lock_guard<std::mutex> lock{slot->mu};
+            if (slot->dropped || slot->stopping) break;
+            ++slot->turns;
+          }
+        }
+      }
+
+      auto requeue = false;
+      auto need_loop_wake = false;
+      {
+        std::unique_lock<std::mutex> lock{slot->mu};
+        if (!slot->raw_in.empty()) {
+          local_raw.swap(slot->raw_in);
+          slot->raw_in.clear();
+          lock.unlock();
+          feed_raw(*slot, local_raw, scratch);
+          local_raw.clear();
+          lock.lock();
+        }
+        while (!slot->inbox.empty()) {
+          slot->session.push(std::move(slot->inbox.front()));
+          slot->inbox.pop_front();
+        }
+        if (slot->dropped && !slot->session.ended()) {
+          lock.unlock();
+          slot->session.close();
+          lock.lock();
+          slot->outbox.clear();
+        } else if (slot->stopping && !slot->session.ended()) {
+          lock.unlock();
+          slot->session.stop();
+          flush_session_output(*slot);
+          lock.lock();
+        }
+        slot->session_ended = slot->session.ended();
+        requeue = (!slot->dropped && !slot->session_ended && slot->session.runnable());
+        slot->state = requeue ? Slot::State::Queued : Slot::State::Idle;
+        need_loop_wake = !requeue || !slot->outbox.empty() || slot->session_ended || slot->dropped || slot->stopping;
+      }
+      if (requeue) enqueue_slot(slot);
+      if (need_loop_wake) notify_loop(*slot);
+    }
+  }
+
+  Database& db_;
+  const SessionConfig& cfg_;
+  std::function<void()> on_wake_;
+  std::vector<std::unique_ptr<WorkerQueue>> wq_;
+  std::vector<std::thread> workers_;
+  std::atomic<std::size_t> next_worker_{0};
+  std::atomic<std::size_t> queued_slots_{0};
+  std::atomic<bool> shutdown_{false};
+};
 auto too_many_connections() -> std::string {
   Out out;
   out.begin('E');

@@ -74,8 +74,9 @@ bindings (#494) and a header bridge for the plugin, the counterpart of
 `include/bytecask.hpp` (#488).
 
 Its third-party dependencies are fetched at build time, not vendored:
-libpg_query (PostgreSQL licence, with its bundled protobuf-c, MIT/BSD) and
-TinyCC (LGPL-2.1). The layer is part of the build only when configured with
+libpg_query (PostgreSQL licence, with its bundled protobuf-c, MIT/BSD),
+TinyCC (LGPL-2.1) and, for `sql_layer_server`, libuv (MIT). The layer is part
+of the build only when configured with
 `xmake f --sql_layer=y`, so configuring the engine fetches neither. Its own
 workflow, `.github/workflows/sql-layer.yml`, configures it on and builds and
 runs `sql_layer_tests`, under the sanitizers too; the engine's workflows
