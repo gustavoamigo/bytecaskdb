@@ -391,7 +391,27 @@ TEST_CASE("binder: comparisons of constants fold to a BOOLEAN; a string literal 
   CHECK(state("SELECT CAST('12345.678' AS NUMERIC(6,2))") == "22003");
   CHECK(state("SELECT CAST('x' AS INTEGER)") == "22P02");
   CHECK(state("SELECT DATE '2016-02-30'") == "22008");
-  CHECK(rejected(cat, "SELECT CAST(1 AS TEXT)").first == "a cast of other than a string literal or NULL is not supported yet");
+  CHECK(rejected(cat, "SELECT CAST(1 AS TEXT)").first ==
+        "a cast of other than a string literal, NULL, date, time or timestamp is not supported yet");
+  // A date, time or timestamp cast to another type.
+  auto text = [&](std::string_view sql) { return std::get<Bytes>(std::get<2>(out(sql))); };
+  CHECK(text("SELECT CAST(CAST('2016-03-26' AS DATE) AS VARCHAR)") == sql_test::bytes("2016-03-26"));
+  CHECK(text("SELECT CAST(CAST('01:02:03' AS TIME) AS VARCHAR)") == sql_test::bytes("01:02:03"));
+  CHECK(text("SELECT CAST(CAST('2016-03-26 01:02:03' AS TIMESTAMP) AS VARCHAR)") == sql_test::bytes("2016-03-26 01:02:03"));
+  CHECK(out("SELECT CAST(CAST('2016-03-26 01:02:03' AS TIMESTAMP) AS DATE)") ==
+        std::tuple{std::string{"date"}, SqlType{SqlKind::Date}, Datum{std::int64_t{16886}}});
+  CHECK(out("SELECT CAST(CAST('2016-03-26 01:02:03' AS TIMESTAMP) AS TIME)") ==
+        std::tuple{std::string{"time"}, SqlType{SqlKind::Time}, Datum{std::int64_t{3'723'000'000}}});
+  CHECK(out("SELECT CAST(TIMESTAMP '1969-12-31 23:00:00' AS DATE)") ==  // floor, not truncation
+        std::tuple{std::string{"date"}, SqlType{SqlKind::Date}, Datum{std::int64_t{-1}}});
+  CHECK(out("SELECT CAST(DATE '1970-01-02' AS TIMESTAMP)") ==
+        std::tuple{std::string{"timestamp"}, SqlType{SqlKind::Timestamp}, Datum{std::int64_t{86'400'000'000}}});
+  CHECK(out("SELECT CAST(CAST('01:02:03' AS TIME) AS TIME)") == out("SELECT TIME '01:02:03'") );
+  CHECK(out("SELECT CAST(CAST(NULL AS DATE) AS TEXT)") == std::tuple{std::string{"text"}, SqlType{SqlKind::Text}, Datum{}});
+  CHECK(state("SELECT CAST(CAST('01:02:03' AS TIME) AS TIMESTAMP)") == "42846");  // PostgreSQL has no such cast
+  CHECK(state("SELECT CAST(CAST('01:02:03' AS TIME) AS DATE)") == "42846");
+  CHECK(state("SELECT CAST(DATE '2016-03-26' AS TIME)") == "42846");
+  CHECK(state("SELECT CAST(DATE '5000000-01-01' AS TIMESTAMP)") == "22008");
   CHECK(rejected(cat, "SELECT CAST('abc' AS VARCHAR(2))").first == "a cast to VARCHAR(n) is not supported yet");
   // Where a typed constant meets a column.
   CHECK(bind_sql(cat, "INSERT INTO ct VALUES ($1, DATE '1970-01-03', DATE '1970-01-03')").fixed ==

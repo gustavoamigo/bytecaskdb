@@ -483,6 +483,12 @@ recompile after a DDL folds them again, to the types they meet then.
   a `DECIMAL(p, s)` rounded to its scale and range-checked (22003), and are
   of that type. A cast of anything else, and to `VARCHAR(n)`, which
   PostgreSQL's cast truncates, are not taken yet.
+- A cast of a date, time or timestamp constant: to text its text; to its
+  own type itself; a timestamp to a date (the floor, so 1969-12-31 23:00 is
+  1969-12-31) or a time; a date to a timestamp (22008 if the instant passes
+  64 bits). A time to a date or a timestamp, and a date to a time, are
+  42846, as in PostgreSQL. Other typed constants cast to text are not taken
+  yet.
 - A select-list constant is named `?column?`, a cast by its type's name
   (`date`, `int4`, `numeric`), as PostgreSQL names them.
 
@@ -502,6 +508,33 @@ recompile after a DDL folds them again, to the types they meet then.
   A string literal is read as the column's type: `int_col = '7'` is `= 7`,
   `int_col = '1.5'` is 22P02. An integer compared with a string column is
   42883, as in PostgreSQL.
+
+### The time
+
+`CURRENT_DATE`, `LOCALTIME[(p)]` and `LOCALTIMESTAMP[(p)]` are the one
+constant a plan cannot fold: a plan is cached by its text, so a value
+folded at bind would be the time of the first run. The binder gives each
+use a slot among the statement's constants (`bound::ClockSlot`), marked as
+the time, and the API fills it on every run (`Database::plan_params`),
+from one reading of the clock per statement, so two uses in a statement
+are one instant.
+
+- **Which time.** A statement in a transaction reads the time the
+  transaction began, as PostgreSQL's `CURRENT_*` and `LOCALTIME*` do
+  (`transaction_timestamp()`); an autocommit statement, the time it began.
+- **The clock.** `Database` reads the system clock, microseconds since the
+  Unix epoch, through one function a test replaces
+  (`clock_for_testing`), so the tests fix the time.
+- **The zone.** The layer has no time zone: the time is UTC, the date the
+  UTC date. A PostgreSQL session set to another `TimeZone` differs.
+- **Precision.** `(p)` rounds to p fractional digits, half up, as
+  PostgreSQL does; above 6 it is 6 (PostgreSQL warns). A time can round to
+  24:00:00, as there.
+- **Refused.** `CURRENT_TIME` and `CURRENT_TIMESTAMP` (and `now()`) are
+  `time with time zone` and `timestamp with time zone`, types the layer
+  lacks (#491): refused with 42601, not read as their zoneless kin. Also
+  refused: the time as an assigned value, in a `WHERE`, or inside an
+  aggregated select list; `USER` and the other SQL value functions.
 
 ### Expressions over columns
 

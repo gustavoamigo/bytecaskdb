@@ -222,3 +222,33 @@
       expected: []
   teardown:
     - DROP TABLE dt
+
+- name: a timestamp cast to a date, a time and text
+  features: [F051-05]
+  steps:
+    - sql: SELECT CAST(CAST('2016-03-26 01:02:03' AS TIMESTAMP) AS DATE)
+      expected: [["2016-03-26"]]
+    - sql: SELECT CAST(CAST('2016-03-26 01:02:03.5' AS TIMESTAMP) AS TIME)
+      expected: [["01:02:03.5"]]
+    - sql: SELECT CAST(CAST('2016-03-26 01:02:03' AS TIMESTAMP) AS VARCHAR)
+      expected: [["2016-03-26 01:02:03"]]
+    - sql: SELECT CAST(CAST('1969-12-31 23:00:00' AS TIMESTAMP) AS DATE)
+      expected: [["1969-12-31"]]
+
+- name: a date cast to a timestamp and to text
+  features: [F051-05]
+  steps:
+    - sql: SELECT CAST(DATE '2016-03-26' AS TIMESTAMP)
+      expected: [["2016-03-26 00:00:00"]]
+    - sql: SELECT CAST(DATE '2016-03-26' AS VARCHAR)
+      expected: [["2016-03-26"]]
+
+- name: casts PostgreSQL has no function for
+  features: [F051-05]
+  steps:
+    - sql: SELECT CAST(CAST('01:02:03' AS TIME) AS TIMESTAMP)
+      error: "42846"
+    - sql: SELECT CAST(CAST('01:02:03' AS TIME) AS DATE)
+      error: "42846"
+    - sql: SELECT CAST(DATE '2016-03-26' AS TIME)
+      error: "42846"
