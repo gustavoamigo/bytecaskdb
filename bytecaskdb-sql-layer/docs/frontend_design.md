@@ -296,6 +296,37 @@ and with a constant selected or `DISTINCT ON`, it is not taken yet.
   aggregate functions"), as PostgreSQL refuses it;
 - on a join, not yet (#534).
 
+**Set operations**, `UNION`, `INTERSECT` and `EXCEPT` of two queries, each
+`ALL` or `DISTINCT` (the default), as PostgreSQL's (`planner_design.md`,
+*Set operations*):
+- **Precedence:** `INTERSECT` binds tighter than `UNION` and `EXCEPT`,
+  which group to the left; parentheses group. The parser builds the tree
+  (`ast::SetOperation`, a `Select`'s `set`), so a set operation is a
+  `SELECT` wherever one is taken: a statement, a subquery in `EXISTS`, `IN`,
+  `ANY`, `ALL` or a comparison, and a view's query.
+- **Arms** are plain `SELECT`s of columns, constants and parameters, a
+  `WHERE`, a join, and in parentheses their own `ORDER BY` and `LIMIT`.
+  Refused (42601): an arm that groups, aggregates or is `DISTINCT`. Refused
+  (0A000, as PostgreSQL's): `FOR UPDATE` on or inside one. `CORRESPONDING` is
+  not PostgreSQL's, and a syntax error.
+- **Columns.** The arms give as many columns as each other (42601). A
+  result column is named as the first arm names it. Its type resolves pair
+  by pair, as PostgreSQL's `UNION` does: the same type; integers to the
+  wider; an integer or `REAL` meeting `DOUBLE PRECISION` to it; `TEXT`
+  meeting `VARCHAR` to `TEXT`; `DECIMAL` of one scale; classes that differ
+  (a number and a string) are 42804, `UNION types integer and text cannot
+  be matched`.
+  Refused (42601) where the layer does not convert yet: `DECIMAL` of two
+  scales or with an integer or a float, an integer with `REAL` (PostgreSQL
+  rounds it to a float), `DATE` with `TIMESTAMP`, and a literal of no type
+  (`NULL`, `'a'`) meeting a column of another type.
+- **`LIMIT`** after the last arm limits the combined rows. `ORDER BY` of the
+  combined rows is refused (42601): it needs the plan to hold typed rows
+  (#681).
+- **A view defined with a set operation** is created, with its columns and
+  the tables it reads, and not read yet (42601), as one defined with
+  `DISTINCT` or `LIMIT`: reading it needs a derived table.
+
 **Views**, `CREATE VIEW name [(column, …)] AS SELECT …` and `DROP VIEW [IF
 EXISTS] name`:
 - **Expanded by the binder.** The catalog keeps the statement's text
@@ -319,8 +350,8 @@ EXISTS] name`:
   view's group columns, selecting those alone: a view row is a group, so
   that is the view. An aggregate, `DISTINCT` or a join over a grouped
   view, or a `GROUP BY` of anything else, is refused (42601); it needs a
-  derived table. A view defined with `DISTINCT` or `LIMIT` is created and
-  not read yet.
+  derived table. A view defined with `DISTINCT`, `LIMIT` or a set operation
+  is created and not read yet.
 - **Columns** are named as the select list names them, or by the column
   list, which may name fewer than there are columns. Two with one name are
   42701, more names than columns 42601.
@@ -341,8 +372,7 @@ EXISTS] name`:
 That includes:
 - `ILIKE`, `IS DISTINCT FROM`, a predicate over both tables of a join or
   in `HAVING`;
-- correlated and nested subqueries and the others above, derived tables,
-  set operations;
+- correlated and nested subqueries and the others above, derived tables;
 - `DISTINCT ON`, `DISTINCT` of a constant or over groups it does not select
   every key of, `GROUP BY` of an expression, and `HAVING` of anything but
   the comparisons above;
@@ -536,9 +566,10 @@ fail on them.
   PRECISION column no key takes. PostgreSQL runs it. Everything else in
   the dialect is planned: full scans, sorts and joins no key reaches
   included.
-- **A sort, or a structure of groups, past the statement's memory budget
-  fails** with 54000, where PostgreSQL spills it to disk
-  (`planner_design.md`, *Memory*).
+- **A sort, a structure of groups, or the keys a set operation tells
+  duplicates apart by, past the statement's memory budget fails** with
+  54000, where PostgreSQL spills it to disk (`planner_design.md`, *Memory*
+  and *Set operations*).
 - **A filter on a grouped DOUBLE or REAL column in HAVING is refused**
   (`no plan:`), as a `WHERE`'s is.
 - **A constant a column's type does not hold exactly is refused in a
@@ -591,6 +622,12 @@ implemented (`functional_testing_design.md`).
 
 - **A table needs columns.** The layer refuses `CREATE TABLE t ()` (0A000);
   PostgreSQL accepts a table of no columns.
+- **A set operation cannot be ordered, and its arms are plain.** PostgreSQL
+  sorts the combined rows with `ORDER BY` and combines queries that group,
+  aggregate or select `DISTINCT`. Here a set operation streams its arms
+  into a structure of keys and holds no typed row, so the first waits for
+  an object in the plan API that does (#681), and the second for the same
+  streaming at a grouped query's emit (#682).
 - **Views are read-only, and a query over a grouped view is limited.**
   PostgreSQL writes through a simple view, checks the rows written with
   `WITH CHECK OPTION`, replaces a view with `CREATE OR REPLACE VIEW`, and

@@ -415,6 +415,14 @@ auto prune(Node& n, std::vector<ColumnRef> needed) -> bool {
 }  // namespace
 
 void rewrite(Node& root) {
+  // A set operation's arms are queries of their own, rewritten alone.
+  auto* top = &root;
+  if (auto* l = std::get_if<Limit>(&top->op)) top = l->input.get();
+  if (auto* set = std::get_if<SetOp>(&top->op)) {
+    rewrite(*set->left);
+    rewrite(*set->right);
+    return;
+  }
   while (fold_constants(root)) {
   }
   while (push_down(root)) {
