@@ -862,7 +862,7 @@ scales, or with an integer; an integer with `REAL`; `DATE` with `TIMESTAMP`.
 A select-list item such as `a + b`, `a * 2 > c` or `a + a IS NULL` is a
 `logical::Expr` tree in the `Project`: columns, parameters (a constant or a
 subquery's value is one, hidden), `Add`, `Sub`, `Mul`, `Div`, `Compare`,
-`IsNull`, `Not`, `And` and `Or`, each typed by the binder
+`IsNull`, `Not`, `And`, `Or`, `Case` and `Coalesce`, each typed by the binder
 (`frontend_design.md`, *Expressions over columns*). It is **one evaluator**:
 
 - **Search.** `emit_targets` makes a `physical::ExprTarget` of any output
@@ -884,9 +884,20 @@ subquery's value is one, hidden), `Add`, `Sub`, `Mul`, `Div`, `Compare`,
   nothing. `Emit` evaluates every expression of a row before `bc_emit_begin`,
   then emits each by its type; in a set operation's arm the value goes to
   the sink as any column does.
-- **What plugs in.** `CASE`, `COALESCE`, `NULLIF` and the string functions
-  (#669, #671) are more `Kind`s of the same tree and more cases in `eval`;
-  `CASE` evaluates a branch inside an `if` as `AND` does.
+- **`CASE` and `COALESCE`.** `Case` holds WHEN, THEN, … and an ELSE if
+  there is one; `Coalesce` its arguments. A simple `CASE` and `NULLIF` are
+  built by the binder from `Compare` and `Case`, so `eval` has two cases.
+  Each is a result local (`v<i>`, `n<i>`, NULL until a branch gives a value) and each
+  branch is evaluated inside an `if`, as `AND` is: a WHEN only while no
+  earlier one was true, its THEN only when its WHEN is (a NULL condition is
+  not true), a COALESCE argument only while the result is NULL. So an
+  untaken branch raises nothing. A numeric branch is multiplied up to the
+  result's scale when it is finer-bound (the binder keeps it within 18
+  digits); the Emit check refuses a branch of another type than its
+  result, a coarser numeric one, or a WHEN that is not BOOLEAN. Text and
+  floats go through the same locals (`bc_view`, `double`).
+- **What plugs in.** The string functions (#671) are more `Kind`s of the
+  same tree and more cases in `eval`.
 - **Cost.** A plan with no such output prints exactly what it printed
   before. An expression adds locals and a call per operator to each row it
   is evaluated for; no performance claim is made.
