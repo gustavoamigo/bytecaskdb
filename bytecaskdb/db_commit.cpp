@@ -49,7 +49,7 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
   auto entries = t.prepare_write(slot.plan);
   if (entries.empty()) {
     // Guards that held may have held on any entry the head holds.
-    slot.rests_on = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
+    slot.rests_on = t.next_seq() - 1;  // next_seq starts at 1
     slot.result = CommitResult{};
     return true;
   }

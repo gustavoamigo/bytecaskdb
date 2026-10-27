@@ -1,7 +1,10 @@
 Drops the wait a plan that appends nothing makes for the head entry its
-outcome rests on (#672). Expected: caught. The soak sees a del that finds
-nothing on a key whose last write threw, then a read that still holds the
-key's last confirmed value.
+outcome rests on (#672). Expected: NOT caught, reliably: the soak needs a
+writer to retry a key in the microseconds between a failed flush's error
+and its degrade; the nightly hit it at epoch 15 of one leg and 279 of
+the other.
+A 1,500 s run of this mutation (seed 40445801076, 349 epochs) passed. The
+unit test below catches it every time.
 Guarded-by: "pipeline: a del after a failed flush does not answer from the failed write before the degrade is published"
 
 diff --git a/bytecaskdb/db.cpp b/bytecaskdb/db.cpp
