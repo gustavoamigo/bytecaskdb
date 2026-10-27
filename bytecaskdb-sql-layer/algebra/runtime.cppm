@@ -9,6 +9,7 @@
 
 module;
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -40,9 +41,21 @@ export using bc_value = bytecask::sql::Datum;
 // the standard library's module exports its header-declared names.
 extern "C++" {
 
-// The open engine a context reads through and commits to. Not owned.
+// The memory every statement and transaction of one database holds
+// together, against one cap (DatabaseOptions::max_memory_bytes). Each
+// statement reserves from `used` in steps, at least what it holds, and
+// returns its reservation when it ends; a transaction takes over what its
+// statements' write sets reserved and returns it when it ends. Not owned.
+struct bc_memory_cap {
+  std::atomic<std::uint64_t> used{0};
+  std::uint64_t cap;
+};
+
+// The open engine a context reads through and commits to, and the memory
+// cap its statements and transactions reserve from (null: none). Not owned.
 struct bc_db {
   bytecask::DB* db;
+  bc_memory_cap* memory{nullptr};
 };
 
 // The live catalog. Not owned; must outlive every context built on it. A
@@ -70,6 +83,7 @@ std::size_t bc_ctx_write_set_slots_for_testing(const bc_ctx* cx);
 }  // extern "C++"
 
 export using ::bc_db;
+export using ::bc_memory_cap;
 export using ::bc_catalog;
 export using ::bc_params;
 export using ::bc_ctx_affected;

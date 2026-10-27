@@ -424,6 +424,13 @@ struct DatabaseOptions {
   // ends). Past it the statement fails with BC_E_LIMIT (SQLSTATE
   // 54000), never a spill; open refuses 0.
   std::uint64_t statement_memory_bytes{64u << 20};
+  // The most memory every statement and transaction in progress may hold
+  // together: what each statement's budget counts, and the writes each
+  // transaction holds until it ends. A statement that would pass it fails
+  // at once with BC_E_MEMORY (SQLSTATE 53200), and in a transaction aborts
+  // it; nothing waits. Reserved in steps of 1 MiB per statement, so it can
+  // refuse up to 1 MiB per statement in progress early. 0: no cap.
+  std::uint64_t max_memory_bytes{0};
 };
 
 // Every call may be made from any thread, concurrently with any other but
@@ -569,6 +576,7 @@ private:
   std::thread flusher_;         // AtInterval only; joined before the engine closes
   std::unique_ptr<DB> db_;
   std::unique_ptr<LiveCatalog> live_;
+  bc_memory_cap memory_{};  // set by open(); read through bdb_ only when max_memory_bytes is set
   bc_db bdb_{};
   bc_catalog bcat_{};
   std::shared_ptr<DatabaseLife> life_;
@@ -834,7 +842,8 @@ auto Database::open(const std::filesystem::path& dir, DatabaseOptions opts) -> s
   engine.buffer_pool = opts.buffer_pool;
   d->db_.reset(new DB(DB::open(dir, engine)));
   d->live_ = std::make_unique<LiveCatalog>(*d->db_);
-  d->bdb_ = {d->db_.get()};
+  d->memory_.cap = opts.max_memory_bytes;
+  d->bdb_ = {d->db_.get(), opts.max_memory_bytes == 0 ? nullptr : &d->memory_};
   d->bcat_ = {d->live_.get()};
   d->release_context(d->acquire_context());  // the first, made now: open fails, not the first call
   if (d->idle_.empty()) throw std::bad_alloc();

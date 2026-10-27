@@ -18,6 +18,7 @@ import struct
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 
 import pytest
@@ -844,6 +845,8 @@ def test_statement_memory_bytes_is_every_statement_s_budget():
     (["--idle-in-transaction-timeout-ms", "-1"], "--idle-in-transaction-timeout-ms"),
     (["--transaction-timeout-ms", "1.5"], "--transaction-timeout-ms"),
     (["--idle-session-timeout-ms", ""], "--idle-session-timeout-ms"),
+    (["--max-memory-bytes", "0"], "--max-memory-bytes"),
+    (["--max-memory-bytes", "half"], "--max-memory-bytes"),
 ])
 def test_sync_and_io_flags_are_validated(flags, says):
     binary = server_binary()
@@ -1074,6 +1077,95 @@ def test_the_idle_session_timeout_closes_an_idle_session_but_not_one_in_a_transa
         assert f["M"] == "terminating connection due to idle-session timeout"
         assert idle.closed()
         assert status(run(in_block, "SELECT k FROM t WHERE k = $1", ["1"])) == "T"
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+# ------------------------------------------------------------------ bounds
+# docs/session_design.md, *Bounds*.
+
+def rss_bytes(pid: int) -> int:
+    with open(f"/proc/{pid}/status") as f:
+        for line in f:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) * 1024
+    raise AssertionError("no VmRSS")
+
+
+def test_a_client_that_takes_no_replies_holds_its_pipeline_back():
+    """3,000 pipelined statements of 20 KB, each replying 100 KB (60 MB in,
+    300 MB out), from a client that reads nothing for three seconds: past
+    64 MiB unsent the session runs nothing more, so the server reads nothing
+    more, the client's send stops part-way, and the server's memory stays far
+    under the 300 MB. Then the client reads, and every reply arrives."""
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory)
+    try:
+        c = connect(s)
+        c.send(query("CREATE TABLE p (k INTEGER PRIMARY KEY, v VARCHAR(1000))"))
+        assert states(c.until_ready()) == []
+        c.send(query("BEGIN"), parse("INSERT INTO p VALUES ($1, $2)"),
+               *[m for k in range(100) for m in (bind([str(k), "x" * 1000]), execute())], SYNC, query("COMMIT"))
+        for _ in range(3):
+            assert states(c.until_ready()) == []
+        before = rss_bytes(s.proc.pid)
+
+        statements = 3_000
+        one = query("SELECT k, v FROM p" + " " * 20_000)
+        sender = threading.Thread(target=c.send, args=(one * statements,), daemon=True)
+        sender.start()
+        time.sleep(3)
+        assert sender.is_alive()  # the server stopped reading
+        grown = rss_bytes(s.proc.pid) - before
+        assert grown < 160 << 20, grown
+
+        replies = completes = 0
+        while replies < statements:
+            kind, body = c.message()
+            if kind == b"C":
+                assert body == b"SELECT 100\0"
+                completes += 1
+            elif kind == b"Z":
+                replies += 1
+            else:
+                assert kind in (b"T", b"D"), (kind, body)
+        assert completes == statements
+        sender.join(timeout=30)
+        assert not sender.is_alive()
+        assert data(run(c, "SELECT k FROM p WHERE k = $1", ["7"])) == [["7"]]
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_max_memory_bytes_bounds_every_statement_and_transaction_together():
+    """--max-memory-bytes is DatabaseOptions::max_memory_bytes: a statement
+    that would pass it fails with 53200 and fails its block; one within it
+    runs."""
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_mem_")
+    s = Server(directory, extra_args=["--max-memory-bytes", "4096"])
+    try:
+        c = connect(s)
+        table(c)
+        for k in range(1, 201):
+            assert states(run(c, "INSERT INTO t VALUES ($1, $2)", [str(k), "1"])) == []
+        out = run(c, "SELECT k, v FROM t WHERE k >= $1", ["1"])
+        assert states(out) == ["53200"]
+        error = fields(next(b for k, b in out if k == b"E"))
+        assert error["M"] == ("out of memory: the statements and transactions in progress "
+                              "would hold more than the memory cap of 4096 bytes")
+        assert len(data(run(c, "SELECT k, v FROM t WHERE k >= $1", ["191"]))) == 10
+        c.send(query("BEGIN"))
+        assert status(c.until_ready()) == "T"
+        out = run(c, "SELECT k, v FROM t WHERE k >= $1", ["1"])
+        assert states(out) == ["53200"] and status(out) == "E"
+        c.send(query("ROLLBACK"))
+        assert status(c.until_ready()) == "I"
     finally:
         s.stop()
         shutil.rmtree(directory, ignore_errors=True)

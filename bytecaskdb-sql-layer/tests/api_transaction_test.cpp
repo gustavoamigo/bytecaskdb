@@ -1466,3 +1466,73 @@ TEST_CASE("embedded API: an allocation failure in a grouped plan is BC_E_MEMORY 
                          "bc_agg_open");
   sweep_plan_allocations(*db, "SELECT id, max(bal), count(DISTINCT bal) FROM acct WHERE id >= $1 GROUP BY id", "bool st0");
 }
+
+TEST_CASE("embedded API: a statement that would take what every statement and transaction holds past max_memory_bytes "
+          "is 53200 and aborts its transaction; what each holds is returned when it ends",
+          "[sql][api][txn][memory]") {
+  sql_test::TempDir dir{"api_cap"};
+  {
+    auto db = Database::open(dir.path());
+    seed_wide(*db, 40'000);
+    // No cap by default: a transaction holding about 9.6 MB runs.
+    auto t = db->begin();
+    (void)t.execute("UPDATE wide SET n = n + 1 WHERE id < $1", {std::int64_t{10'000}});
+    t.rollback();
+  }
+  // Measured on this table: a SELECT holds about 108 bytes a row, an UPDATE
+  // about 962 while it runs, and its transaction about 709 after. Every
+  // case below is at least 0.5 MB from the cap.
+  constexpr std::uint64_t kCap = 6u << 20;
+  auto db = Database::open(dir.path(), {.max_memory_bytes = kCap});
+  auto failure = [](auto&& run) -> std::pair<std::string, std::string> {
+    try {
+      run();
+    } catch (const ExecError& e) {
+      return {std::string{sqlstate(e)}, e.what()};
+    }
+    return {"00000", ""};
+  };
+  constexpr auto kSelect = "SELECT id, n, pad FROM wide WHERE id < $1";
+  auto select = [&](std::int64_t rows) { (void)db->execute(kSelect, {rows}); };
+  auto n_of = [&](std::int64_t id) {
+    return std::get<std::int64_t>(db->execute("SELECT n FROM wide WHERE id = $1", {id}).rows.at(0).at(0));
+  };
+
+  // Alone, 40,000 rows (4.3 MB) fit, again and again: each statement
+  // returns what it held when it ends.
+  for (int run = 0; run < 20; ++run) CHECK(failure([&] { select(40'000); }).first == "00000");
+
+  // A transaction past the cap on its own fails on the statement that
+  // passes it, is aborted, and commits nothing.
+  {
+    auto t = db->begin();
+    const auto [state, message] = failure([&] { (void)t.execute("UPDATE wide SET n = n + 1 WHERE id < $1", {std::int64_t{10'000}}); });
+    CHECK(state == "53200");
+    CHECK(message ==
+          "out of memory: the statements and transactions in progress would hold more than the memory cap of 6291456 bytes");
+    CHECK(t.is_aborted());
+    CHECK(t.commit() == CommitOutcome::RolledBack);
+    CHECK(n_of(0) == 0);
+  }
+
+  // The cap is shared: an open transaction's writes (about 3.5 MB) leave
+  // room for a 20,000-row SELECT but not a 40,000-row one, which fails
+  // without touching the transaction.
+  auto t = db->begin();
+  (void)t.execute("UPDATE wide SET n = n + 1 WHERE id < $1", {std::int64_t{5'000}});
+  CHECK(failure([&] { select(20'000); }).first == "00000");
+  CHECK(failure([&] { select(40'000); }).first == "53200");
+  CHECK_FALSE(t.is_aborted());
+  CHECK(t.commit() == CommitOutcome::Committed);
+  CHECK(n_of(0) == 1);
+  CHECK(n_of(5'000) == 5'000);
+  // Committed, the transaction returned what it held.
+  CHECK(failure([&] { select(40'000); }).first == "00000");
+
+  // So does a rolled-back one.
+  auto r = db->begin();
+  (void)r.execute("UPDATE wide SET n = n + 1 WHERE id < $1", {std::int64_t{5'000}});
+  CHECK(failure([&] { select(40'000); }).first == "53200");
+  r.rollback();
+  CHECK(failure([&] { select(40'000); }).first == "00000");
+}

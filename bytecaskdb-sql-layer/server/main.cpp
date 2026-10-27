@@ -8,7 +8,7 @@
 //                     [--workers N] [--thread-affinity on|off]
 //                     [--sync AT_EVERY_COMMIT|AT_INTERVAL|AT_FILE_ROTATION] [--sync-interval-ms 1000]
 //                     [--io-backend pread|mmap|buffer_pool] [--buffer-pool-size BYTES] [--buffer-pool-direct-io on|off]
-//                     [--statement-memory-bytes 67108864]
+//                     [--statement-memory-bytes 67108864] [--max-memory-bytes BYTES]
 //                     [--idle-in-transaction-timeout-ms 60000] [--statement-timeout-ms 0]
 //                     [--transaction-timeout-ms 0] [--idle-session-timeout-ms 0]
 //
@@ -80,7 +80,7 @@ auto flags(int argc, char** argv) -> std::map<std::string, std::string> {
   for (const auto& [k, v] : out) {
     if (k != "dir" && k != "listen" && k != "database" && k != "max-connections" && k != "workers" &&
         k != "thread-affinity" && k != "sync" && k != "sync-interval-ms" && k != "io-backend" &&
-        k != "buffer-pool-size" && k != "buffer-pool-direct-io" && k != "statement-memory-bytes" &&
+        k != "buffer-pool-size" && k != "buffer-pool-direct-io" && k != "statement-memory-bytes" && k != "max-memory-bytes" &&
         k != "idle-in-transaction-timeout-ms" && k != "statement-timeout-ms" && k != "transaction-timeout-ms" &&
         k != "idle-session-timeout-ms") {
       throw std::invalid_argument("unknown flag --" + k);
@@ -322,7 +322,7 @@ void pump(Connection* c) {
   auto* sh = c->shard;
   auto* s = sh->server;
   if (c->slot) {
-    auto st = s->pool.drain(c->slot, c->write_queue, c->write_in_flight);
+    auto st = s->pool.drain(c->slot, c->write_queue, c->write_active.size());
     c->session_ended = st.ended;
     c->worker_idle = st.idle;
     c->idle_at = st.idle_at;
@@ -364,7 +364,7 @@ void pump(Connection* c) {
     break;
   }
   if (!c->write_in_flight && c->write_queue.empty() && c->slot && !c->write_failed) {
-    auto st = s->pool.drain(c->slot, c->write_queue, false);
+    auto st = s->pool.drain(c->slot, c->write_queue, 0);
     c->session_ended = st.ended;
     c->worker_idle = st.idle;
     c->idle_at = st.idle_at;
@@ -662,6 +662,14 @@ int main(int argc, char** argv) {
     if (f.contains("statement-memory-bytes")) {
       number("statement-memory-bytes", f["statement-memory-bytes"], "a number of bytes",
              db_opts.statement_memory_bytes);
+    }
+    // Every statement and transaction together (docs/session_design.md,
+    // *Bounds*): half the machine's RAM unless given; 0 is refused, not "no cap".
+    db_opts.max_memory_bytes =
+        static_cast<std::uint64_t>(::sysconf(_SC_PHYS_PAGES)) * static_cast<std::uint64_t>(::sysconf(_SC_PAGE_SIZE)) / 2;
+    if (f.contains("max-memory-bytes")) {
+      number("max-memory-bytes", f["max-memory-bytes"], "a positive number of bytes", db_opts.max_memory_bytes);
+      if (db_opts.max_memory_bytes == 0) throw std::invalid_argument("--max-memory-bytes takes a positive number of bytes");
     }
 
     sigset_t stop_signals;

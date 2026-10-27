@@ -9,9 +9,13 @@
 //   session runs after one turn rather than behind the whole pipeline.
 // - An Execute outside BEGIN with no queued message after it parks without
 //   blocking a worker until the next message arrives.
+// - A session whose client has not taken max_unsent_bytes of its replies
+//   runs no further statement until the client takes some, and a drop
+//   still ends it.
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -353,6 +357,95 @@ TEST_CASE("pg_session: Execute without following message parks until Sync arrive
   wait_turns(a, 5);
   wait_turns(b, 2);
   CHECK(db->execute("SELECT seq FROM log ORDER BY seq").rows.size() == 5);
+
+  pool.shutdown();
+  db->close();
+}
+
+TEST_CASE("pg_session: past max_unsent_bytes a session runs no further statement until its client takes replies",
+          "[sql][server]") {
+  sql_test::TempDir dir{"pg_session_unsent"};
+  auto db = bytecask::sql::Database::open(dir.path());
+  db->execute("CREATE TABLE big (id BIGINT PRIMARY KEY, pad VARCHAR(1000) NOT NULL)");
+  for (std::int64_t id = 0; id < 10; ++id) {
+    db->execute("INSERT INTO big VALUES ($1, $2)", {id, sql_test::bytes(std::string(1000, 'p'))});
+  }
+  constexpr std::size_t kLimit = 64u << 10;
+  constexpr std::size_t kStatements = 40;  // each reply about 10 KB: 400 KB in all
+  pg::SessionConfig cfg{"testdb"};
+  cfg.max_unsent_bytes = kLimit;
+
+  std::mutex mu;
+  std::condition_variable cv;
+  std::uint64_t wakes = 0;
+  pg::Pool pool{*db, cfg, 2, [&] {
+                  {
+                    std::lock_guard<std::mutex> lock{mu};
+                    ++wakes;
+                  }
+                  cv.notify_all();
+                }};
+  auto slot = pool.open();  // no socket: every reply waits for the test, as the loop's unsent bytes
+  pg::Framer framer;
+  auto send = [&](const std::string& bytes) {
+    std::vector<pg::Input> in;
+    framer.push(bytes, in);
+    pool.submit(slot, in);
+  };
+  // Drains replies into `unsent`, as the loop does, without taking them:
+  // returns once nothing new has come for 300 ms.
+  std::string unsent;
+  auto settle = [&] {
+    pg::Pool::Status st;
+    for (;;) {
+      std::unique_lock<std::mutex> lock{mu};
+      auto seen = wakes;
+      lock.unlock();
+      st = pool.drain(slot, unsent);
+      lock.lock();
+      if (!cv.wait_for(lock, std::chrono::milliseconds{300}, [&] { return wakes != seen; })) return st;
+    }
+  };
+  std::size_t ready = 0;
+  auto take = [&] {
+    ready += count_ready(parse_replies(unsent));
+    unsent.clear();
+  };
+
+  send(startup_bytes("testdb"));
+  (void)settle();
+  take();
+  REQUIRE(ready == 1);
+
+  std::string pipeline;
+  for (std::size_t k = 0; k < kStatements; ++k) pipeline += query_msg("SELECT id, pad FROM big");
+  send(pipeline);
+  auto st = settle();
+  // Held back: past the bound by at most one statement's reply, with
+  // statements left, and not idle, so the loop would read nothing more.
+  CHECK(unsent.size() > kLimit);
+  CHECK(unsent.size() < kLimit + (16u << 10));
+  CHECK_FALSE(st.idle);
+  auto copy = unsent;
+  auto first = count_ready(parse_replies(copy));
+  CHECK(first < kStatements);
+
+  // Each time the client takes its replies, the session runs on, until
+  // every statement has run and it is idle.
+  for (int round = 0; round < 100 && ready < 1 + kStatements; ++round) {
+    take();
+    st = settle();
+  }
+  take();
+  CHECK(ready == 1 + kStatements);
+  CHECK(pool.drain(slot, unsent).idle);
+
+  // Held back again, a drop still ends it.
+  send(pipeline);
+  (void)settle();
+  CHECK(unsent.size() > kLimit);
+  pool.drop(slot);
+  CHECK(settle().ended);
 
   pool.shutdown();
   db->close();
