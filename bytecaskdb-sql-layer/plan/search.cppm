@@ -153,7 +153,7 @@ using Conjuncts = std::vector<Expr>;
 // An operator's name, for a refusal of a shape the search does not plan.
 auto op_name(const logical::Node& n) -> std::string {
   constexpr const char* kNames[] = {"Get",  "Empty", "OneRow", "Filter", "Project", "Join",  "Aggregate",
-                                    "Sort", "Limit", "Insert", "Update", "Delete"};
+                                    "Sort", "Limit", "SetOp", "Insert", "Update", "Delete"};
   static_assert(std::size(kNames) == std::variant_size_v<decltype(n.op)>);
   return kNames[n.op.index()];
 }

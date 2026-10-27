@@ -346,8 +346,6 @@
 
 - name: UNION of two selects
   features: [E071-01]
-  # set operations are refused
-  unimplemented: true
   setup:
     - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
   steps:

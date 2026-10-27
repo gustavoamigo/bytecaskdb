@@ -237,6 +237,8 @@ struct OrderItem {
   std::optional<bool> nulls_first;
 };
 
+struct SetOperation;
+
 struct Select {
   std::vector<Expr> targets;
   std::string table;  // "" for none: a SELECT without FROM
@@ -260,6 +262,19 @@ struct Select {
   // `join`, each joined to NULLs where no row of the other matches.
   enum class JoinKind { Inner, Left, Right };
   JoinKind join_kind{JoinKind::Inner};
+  // A set operation: this query is `set->left` combined with `set->right`,
+  // and has no select list or FROM of its own; its order_by and limit apply
+  // to the combined rows. A parenthesised arm keeps its own.
+  std::shared_ptr<const SetOperation> set;
+};
+
+// UNION, INTERSECT or EXCEPT of two queries, each of them a set operation
+// too. `all` keeps duplicates (UNION ALL), as PostgreSQL's ALL does.
+struct SetOperation {
+  enum class Kind { Union, Intersect, Except };
+  Kind kind{Kind::Union};
+  bool all{false};
+  Select left, right;
 };
 
 // A copy of c and of s, which own their operands. A subquery is shared:
@@ -298,6 +313,7 @@ struct Select {
   out.natural = s.natural;
   out.using_alias = s.using_alias;
   out.join_kind = s.join_kind;
+  out.set = s.set;  // never changed once parsed: shared
   return out;
 }
 

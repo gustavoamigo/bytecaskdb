@@ -765,6 +765,73 @@ Not planned yet: a correlated subquery, one inside another, one in `FROM`
 (a derived table), and `IN (SELECT …)` as a semi-join that probes the outer
 table's key per value, which #659 tracks.
 
+### Set operations
+
+`UNION`, `INTERSECT` and `EXCEPT`, each with `ALL` or `DISTINCT`, are a
+`logical::SetOp` of two queries, each a `SELECT` or another set operation,
+under the statement's `LIMIT`. PostgreSQL's precedence is the parser's:
+`INTERSECT` is the inner node of `a UNION b INTERSECT c`. The binder binds
+each arm alone, as a `SELECT` of its own, and resolves the columns the arms
+give pair by pair (`frontend_design.md`, *Set operations*); the rewrites
+treat each arm as a statement. The search plans each arm alone and keeps its
+cheapest plan, as it does a subquery's (`physical::SetPlan`: a tree whose
+leaves are arm plans whose root is an `Emit`); an arm that is not a plain
+`SELECT` (a group, an aggregate, `DISTINCT`) is refused by the binder.
+
+Codegen prints one function. Each arm is a block of it, its pipeline as
+alone with every result row going to a sink instead of `bc_emit_*`, and
+what the sink does is the operation's part. Nothing is collected: a row is
+returned while it is in hand, so the plan holds only what telling duplicates
+apart needs. A row's key is a sort key of its columns, each ascending, NULL
+last (`bc_sort_key_*`), so two rows are alike where each column is equal and
+NULL equals NULL, and the key goes to a `bc_agg` as its group key:
+
+| Operation | Streams | Holds |
+|---|---|---|
+| `UNION ALL` | both arms, left first, to the parent | nothing |
+| `UNION [DISTINCT]` | both arms through one aggregate: a row is returned the first time its group is seen | the keys of the rows returned |
+| `EXCEPT [DISTINCT]` | the right arm into the aggregate, then the left: returned if its group holds no right row, once | the keys of the right rows, then of the left |
+| `EXCEPT ALL` | the same: slot 0 counts the right rows, slot 1 the left rows they cancelled; a left row cancels one while slot 1 < slot 0, else it is returned | as above |
+| `INTERSECT [DISTINCT]` | the left arm into the aggregate, then the right: returned if its group holds a left row, once | the keys of the left rows, then of the right |
+| `INTERSECT ALL` | the same: a right row is returned while the left rows of its key are not used up | as above |
+
+So `ALL` returns `max(l − r, 0)` copies for `EXCEPT` and `min(l, r)` for
+`INTERSECT`, as PostgreSQL does, and a set operation of several arms nests
+these: the rows of an inner node are the stream its parent's sink reads,
+converted to the parent's column types (an integer meeting a `DOUBLE
+PRECISION` is read as one: `bc_i64_to_f64`). The sort key makes `-0.0`
+equal to `0.0` and NaN equal to NaN, as PostgreSQL's set operations compare.
+
+**Memory.** The structures are charged to the statement's budget like any
+group (*Memory*). What bounds them is the arm held: for `UNION` the distinct
+rows returned, for `EXCEPT` and `INTERSECT` the held side's distinct rows
+and then the other's, since a probe adds its row's group too. It is
+unbounded in the tables' size, like `GROUP BY` of a high-cardinality
+column, and past the budget the statement fails with 54000, never spilling.
+Which side is held is the plan's fixed choice (the right of `EXCEPT`, the
+left of `INTERSECT`); no row count decides it. Choosing the smaller side
+needs `bc_count_range` per arm, which is a choice point (*Choosing at run
+time*) the first slice does not build (#682).
+
+**`LIMIT`.** A `LIMIT` over the combined rows is a counter in the plan,
+`setcount`: the sink of the stream that reaches the statement returns a row
+only while `setcount < n`, and every loop of those arms also stops at it,
+so `... UNION ALL ... LIMIT 1` reads one row. The arm whose rows only fill a
+structure is read whole.
+
+**A miss skips an arm, not the plan.** A point lookup that finds no row, or
+a NULL parameter a key needs, ends an ordinary plan; an arm's code is
+wrapped in an `if` at the place, so the rest of the arm is skipped and the
+next one runs.
+
+**Not built.** `ORDER BY` of the combined rows: it needs to hold typed rows
+(a sorter whose payload the plan can read back column by column), which the
+plan API has no object for, since a payload is bytes and only a table's row
+or an index's key can be read back (#681). A `LIMIT` on a parenthesised set
+operation inside another. An arm that groups, aggregates or is `DISTINCT` (#682);
+`FOR UPDATE`; a literal of no type meeting another type; `DECIMAL` of two
+scales, or with an integer; an integer with `REAL`; `DATE` with `TIMESTAMP`.
+
 ### Aggregates
 
 **One row of `COUNT` or `SUM`.** A lone `COUNT`, `COUNT(DISTINCT)` or
@@ -1119,7 +1186,10 @@ join no key reaches and an `ORDER BY` over a plan of two loops are planned.
   (`group_by_hash`, `group_by_stream`, `group_by_stream_limit`,
   `group_by_held_row`, `group_by_having`, `group_by_sorted`,
   `group_by_distinct`, `group_by_join`, `group_by_double`,
-  `group_by_dependent`, `group_by_dependent_held`, `aggregates_ungrouped`).
+  `group_by_dependent`, `group_by_dependent_held`, `aggregates_ungrouped`)
+  and set operations (`set_union_distinct`, `set_union_all_limit`,
+  `set_union_all_scan_limit`, `set_except_all`, `set_intersect_double`,
+  `set_precedence`, `set_subquery`).
 - **Alternatives agree.** `search_all` returns every plan the search
   costed, none pruned, cheapest first. `generate_alternatives` prints each
   once per combination of its choice points' branches, 2^k for k choice

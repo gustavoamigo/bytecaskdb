@@ -418,6 +418,18 @@ struct ResultColumn {
 
 struct Plan;
 
+// A set operation's plan (docs/planner_design.md, *Set operations*): a tree
+// whose leaves are SELECTs searched alone, each a plan whose root is an Emit.
+// `types` are the columns of the rows the node gives, which a leaf's rows are
+// converted to.
+struct SetPlan {
+  logical::SetOp::Kind kind{logical::SetOp::Kind::Union};
+  bool all{false};
+  std::shared_ptr<const SetPlan> left, right;  // both, or neither for a leaf
+  std::shared_ptr<const Plan> select;          // a leaf's
+  std::vector<SqlType> types;
+};
+
 // An uncorrelated subquery's plan, run before the statement's own: its rows
 // folded as `kind` says into the parameters from `param` on, and for a Set
 // into the set InSet tests by its index here (logical::Subquery).
@@ -429,7 +441,12 @@ struct Sub {
 };
 
 struct Plan {
-  NodePtr root;
+  NodePtr root;  // null for a set operation
+  // A set operation's rows, its arms' plans streamed into it, under the
+  // statement's LIMIT. The arms hold no subqueries of their own: this plan's
+  // `subs` are the statement's.
+  std::shared_ptr<const SetPlan> set;
+  std::optional<std::int64_t> set_limit;
   std::vector<Sub> subs;  // run in order, before anything else
   std::vector<Catalog::PlanConstant> constants;  // its tables', in the catalog's order
   std::uint64_t catalog_version{0};
@@ -486,16 +503,17 @@ public:
   explicit Checker(const Plan& p) : p_{p} {}
 
   void plan() {
+    if (p_.set) {
+      if (p_.root || !p_.null_checks.empty() || !p_.computed.empty()) broken("a set operation with a pipeline of its own");
+      if (p_.set_limit && *p_.set_limit < 0) broken("a negative LIMIT");
+      subqueries();
+      arms(*p_.set);
+      return;
+    }
     if (p_.constants.empty() && !of_no_table(*p_.root)) broken("a plan with no constants");
     if (!p_.root) broken("a plan with no operator");
     for (auto n : p_.null_checks) param(n);
-    for (const auto& s : p_.subs) {
-      if (!s.plan || !s.plan->subs.empty()) broken("a subquery with no plan, or one of its own");
-      using K = logical::Subquery::Kind;
-      auto n = s.kind == K::Bounds ? 4u : s.kind == K::Set ? 2u : 1u;
-      if (std::uint64_t{s.param} + n > p_.param_types.size()) broken("a subquery's parameters past the statement's");
-      check(*s.plan);
-    }
+    subqueries();
     // Each combination of the choice points' branches is checked as the plan
     // it runs: what one branch's covering scan reads from a key says nothing
     // of the other's.
@@ -515,6 +533,37 @@ public:
 private:
   void param(std::uint32_t n) const {
     if (n >= p_.param_types.size()) broken("a parameter past the statement's");
+  }
+
+  void subqueries() const {
+    for (const auto& s : p_.subs) {
+      if (!s.plan || !s.plan->subs.empty()) broken("a subquery with no plan, or one of its own");
+      using K = logical::Subquery::Kind;
+      auto n = s.kind == K::Bounds ? 4u : s.kind == K::Set ? 2u : 1u;
+      if (std::uint64_t{s.param} + n > p_.param_types.size()) broken("a subquery's parameters past the statement's");
+      check(*s.plan);
+    }
+  }
+
+  // Each leaf is a SELECT whose rows are the node's columns, as many as its
+  // Emit has; the operation's two sides give as many as it does.
+  void arms(const SetPlan& n) const {
+    if (n.types.empty()) broken("a set operation of no columns");
+    if (!n.select) {
+      if (!n.left || !n.right || n.left->types.size() != n.types.size() || n.right->types.size() != n.types.size()) {
+        broken("a set operation whose sides differ in their columns");
+      }
+      arms(*n.left);
+      arms(*n.right);
+      return;
+    }
+    if (n.left || n.right) broken("a set operation leaf with sides");
+    const auto& leaf = *n.select;
+    if (!leaf.root || !std::holds_alternative<Emit>(leaf.root->op) || !leaf.subs.empty() || leaf.set) {
+      broken("a set operation arm that is not a SELECT of rows with no subquery of its own");
+    }
+    if (std::get<Emit>(leaf.root->op).targets.size() != n.types.size()) broken("a set operation arm of other columns");
+    check(leaf);
   }
 
   void params(const Expr& e) const {
@@ -1220,6 +1269,7 @@ void each_choice(Node& n, const F& f) {
 }  // namespace
 
 auto choices(const Plan& p) -> std::size_t {
+  if (!p.root) return 0;
   std::size_t n = 0;
   each_choice(*p.root, [&](const Choice&) { ++n; });
   return n;

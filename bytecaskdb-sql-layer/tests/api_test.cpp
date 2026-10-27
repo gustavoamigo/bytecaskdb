@@ -11,6 +11,9 @@
 #include <cmath>
 #include <limits>
 #include <cstdint>
+#include <optional>
+#include <tuple>
+#include <utility>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -1823,4 +1826,114 @@ TEST_CASE("embedded API: a choice point's plan text shows both plans, and each r
       CHECK(sorted(all[n].rows) == sorted(want));
     }
   }
+}
+
+TEST_CASE("embedded API: a set operation streams its arms, names its columns from the first and resolves their types", "[sql][api][setop]") {
+  sql_test::TempDir dir{"api_setop"};
+  auto db = Database::open(dir.path());
+  auto run = [&](std::string_view sql, const std::vector<Value>& params = {}) { return db->execute(sql, params).rows; };
+  auto sorted = [](Grid g) {
+    std::ranges::sort(g);
+    return g;
+  };
+  (void)run("CREATE TABLE sa (id INTEGER PRIMARY KEY, x INTEGER)");
+  (void)run("CREATE TABLE sb (id BIGINT PRIMARY KEY, y BIGINT, f DOUBLE PRECISION)");
+  for (auto [id, x] : std::vector<std::pair<int, std::optional<int>>>{{1, 1}, {2, 2}, {3, 2}, {4, {}}, {5, {}}}) {
+    (void)db->execute("INSERT INTO sa VALUES ($1, $2)", {i(id), x ? i(*x) : kNull});
+  }
+  for (auto [id, y] : std::vector<std::pair<int, std::optional<int>>>{{1, 2}, {2, 3}, {3, {}}, {4, 3}, {5, 2}}) {
+    (void)db->execute("INSERT INTO sb VALUES ($1, $2, $3)", {i(id), y ? i(*y) : kNull, y ? Value{*y + 0.5} : kNull});
+  }
+
+  // Column names are the first arm's; a column both arms give is of the type they resolve to.
+  auto r = db->execute("SELECT x AS first, id FROM sa UNION ALL SELECT y AS second, id FROM sb");
+  CHECK(r.columns == std::vector<std::string>{"first", "id"});
+  CHECK(r.types[0].kind == SqlKind::BigInt);  // INTEGER meets BIGINT
+  CHECK(r.rows.size() == 10);
+  CHECK(db->execute("SELECT x FROM sa UNION SELECT f FROM sb").types[0].kind == SqlKind::Double);
+  CHECK(db->execute("SELECT x FROM sa UNION SELECT y FROM sb").columns == std::vector<std::string>{"x"});
+
+  // An integer meeting a double compares as a double and comes back as one.
+  CHECK(sorted(run("SELECT x FROM sa UNION SELECT f FROM sb")) ==
+        sorted(Grid{{Value{1.0}}, {Value{2.0}}, {Value{2.5}}, {Value{3.5}}, {kNull}}));
+  CHECK(sorted(run("SELECT f FROM sb INTERSECT SELECT x FROM sa")) == Grid{{kNull}});
+  CHECK(sorted(run("SELECT x FROM sa EXCEPT ALL SELECT y FROM sb")) == sorted(Grid{{kNull}, {i(1)}}));
+
+  // The counts of ALL.
+  CHECK(sorted(run("SELECT x FROM sa INTERSECT ALL SELECT y FROM sb")) == sorted(Grid{{kNull}, {i(2)}, {i(2)}}));
+  CHECK(sorted(run("SELECT y FROM sb EXCEPT ALL SELECT x FROM sa")) == Grid{{i(3)}, {i(3)}});
+  CHECK(sorted(run("SELECT x FROM sa UNION ALL SELECT y FROM sb")).size() == 10);
+  CHECK(sorted(run("SELECT x FROM sa UNION SELECT y FROM sb")) == sorted(Grid{{kNull}, {i(1)}, {i(2)}, {i(3)}}));
+
+  // A prepared statement runs again with other parameters, its structures made anew.
+  const auto& stmt = db->prepare("SELECT x FROM sa WHERE id = $1 UNION SELECT y FROM sb WHERE id = $2");
+  CHECK(db->execute(stmt, {i(1), i(2)}).rows == Grid{{i(1)}, {i(3)}});
+  CHECK(db->execute(stmt, {i(1), i(1)}).rows == Grid{{i(1)}, {i(2)}});
+  CHECK(db->execute(stmt, {i(1), i(99)}).rows == Grid{{i(1)}});
+  CHECK(db->execute(stmt, {kNull, kNull}).rows.empty());
+  for (const auto& all : db->alternatives_for_testing("SELECT x FROM sa UNION SELECT y FROM sb", {})) {
+    CHECK(sorted(all.rows) == sorted(Grid{{kNull}, {i(1)}, {i(2)}, {i(3)}}));
+  }
+
+  // An arm that is a join, and one that reads an index's keys alone.
+  (void)run("CREATE TABLE sc (id INTEGER PRIMARY KEY, z INTEGER)");
+  for (int k = 1; k <= 3; ++k) (void)db->execute("INSERT INTO sc VALUES ($1, $2)", {i(k), i(k * 10)});
+  CHECK(sorted(run("SELECT sa.x FROM sa, sc WHERE sa.id = sc.id UNION SELECT y FROM sb WHERE id = 2")) ==
+        sorted(Grid{{i(1)}, {i(2)}, {i(3)}}));
+  CHECK(sorted(run("SELECT sa.x FROM sa, sc WHERE sa.id = sc.id EXCEPT ALL SELECT y FROM sb WHERE id < 3")) ==
+        sorted(Grid{{i(1)}, {i(2)}}));
+  (void)run("CREATE TABLE sj (id BIGINT PRIMARY KEY, g BIGINT, name BYTEA)");
+  (void)run("CREATE INDEX sj_by_name ON sj (name)");
+  for (auto [id, g, name] : std::vector<std::tuple<int, int, const char*>>{{1, 1, "apple"}, {2, 1, "banana"}, {3, 2, "cherry"}, {4, 2, "apple"}}) {
+    (void)db->execute("INSERT INTO sj VALUES ($1, $2, $3)", {i(id), i(g), bytes(name)});
+  }
+  const std::string covered =
+      "SELECT name FROM sj WHERE name >= $1 AND name < $2 UNION ALL SELECT name FROM sj WHERE id = $3 INTERSECT SELECT name FROM sj WHERE g = $4";
+  INFO(db->prepare(covered).plan_source());
+  CHECK(db->prepare(covered).plan_source().find("bc_key_part_bytes") != std::string::npos);  // the index covers the first arm
+  CHECK(sorted(run(covered, {bytes("a"), bytes("b"), i(2), i(1)})) ==
+        sorted(Grid{{bytes("apple")}, {bytes("apple")}, {bytes("banana")}}));
+  CHECK(sorted(run("SELECT name FROM sj WHERE g = $1 EXCEPT SELECT name FROM sj WHERE g = $2", {i(2), i(1)})) ==
+        sorted(Grid{{bytes("cherry")}}));
+
+  // Inside a transaction a set operation reads what the transaction wrote.
+  auto txn = db->begin();
+  (void)txn.execute("INSERT INTO sa VALUES (6, 3)");
+  CHECK(sorted(txn.execute("SELECT x FROM sa EXCEPT SELECT y FROM sb WHERE id = 1").rows) ==
+        sorted(Grid{{kNull}, {i(1)}, {i(3)}}));
+  txn.rollback();
+
+  // Refusals.
+  CHECK(sql_refusal(*db, "SELECT x FROM sa UNION ALL SELECT y FROM sb ORDER BY x", {}).find("ORDER BY on a set operation") !=
+        std::string::npos);
+  CHECK(sql_refusal(*db, "SELECT DISTINCT x FROM sa UNION SELECT y FROM sb", {}).find("aggregated, grouped or DISTINCT") !=
+        std::string::npos);
+  CHECK(sql_refusal(*db, "SELECT x FROM sa UNION SELECT 'a'", {}).find("literal of no type") != std::string::npos);
+  CHECK(sql_refusal(*db, "SELECT x FROM sa UNION SELECT 1", {}).empty());
+  CHECK(sql_refusal(*db, "SELECT x FROM sa UNION SELECT NULL", {}).find("literal of no type") != std::string::npos);
+  CHECK(sql_refusal(*db, "SELECT 1 UNION SELECT NULL", {}).find("literal of no type") != std::string::npos);
+  CHECK(sql_refusal(*db, "SELECT 'a' UNION SELECT 'b'", {}).empty());
+}
+
+TEST_CASE("embedded API: a set operation holds the keys of one side and fails past the statement's memory budget", "[sql][api][setop]") {
+  sql_test::TempDir dir{"api_setop_mem"};
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  (void)db->execute("CREATE TABLE big (id INTEGER PRIMARY KEY, x INTEGER)");
+  auto txn = db->begin();
+  for (int k = 0; k < 2000; ++k) (void)txn.execute("INSERT INTO big VALUES ($1, $1)", {i(k)});
+  (void)txn.commit();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  // Nothing is collected but the side that is held: the other streams past it.
+  CHECK(state("SELECT x FROM big UNION ALL SELECT x FROM big LIMIT 5") == "ran");
+  CHECK(state("SELECT x FROM big INTERSECT SELECT x FROM big WHERE id < 0") == "54000");
+  CHECK(state("SELECT x FROM big WHERE id < 0 EXCEPT SELECT x FROM big") == "54000");
+  CHECK(state("SELECT x FROM big WHERE id < 100 EXCEPT SELECT x FROM big WHERE id < 100") == "ran");
+  CHECK(state("SELECT x FROM big UNION SELECT x FROM big WHERE id < 0") == "54000");
 }
