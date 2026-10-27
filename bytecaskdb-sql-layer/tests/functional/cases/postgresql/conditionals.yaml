@@ -1,0 +1,76 @@
+# CASE, COALESCE and NULLIF of constants. Of columns they are not supported
+# yet (#667), so each case here selects constants only.
+
+- name: searched CASE takes the first true WHEN, else ELSE, else NULL
+  features: [F261-02]
+  steps:
+    - sql: SELECT CASE WHEN 1 = 2 THEN 10 WHEN 2 = 2 THEN 20 ELSE 30 END
+      expected: [[20]]
+    - sql: SELECT CASE WHEN 1 = 2 THEN 10 ELSE 30 END, CASE WHEN 1 = 2 THEN 10 END
+      expected: [[30, null]]
+    - sql: SELECT CASE WHEN NULL THEN 1 ELSE 2 END
+      expected: [[2]]
+    - sql: SELECT CASE WHEN 1 = 1 THEN 1 WHEN 1 / 0 = 1 THEN 2 END
+      expected: [[1]]
+    - sql: SELECT CASE WHEN 1 THEN 1 END
+      error: "42804"
+
+- name: simple CASE tests the operand for equality with each WHEN
+  features: [F261-01]
+  steps:
+    - sql: SELECT CASE 3 WHEN 1 THEN 'a' WHEN 3 THEN 'c' ELSE 'z' END
+      expected: [["c"]]
+    - sql: SELECT CASE 0 WHEN 2 THEN 1 END, CASE 1 WHEN 1.0 THEN 'eq' END
+      expected: [[null, "eq"]]
+    - sql: SELECT CASE NULL WHEN NULL THEN 'eq' ELSE 'ne' END
+      expected: [["ne"]]
+    - sql: SELECT CASE 1 WHEN true THEN 1 END
+      error: "42883"
+
+- name: CASE result type is resolved across its branches
+  features: [F261-01, F261-02]
+  steps:
+    - sql: SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2.50 END, CASE WHEN 1 = 2 THEN 1.5 ELSE 2 END
+      expected: [["1", "2"]]
+    - sql: SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2147483648 END + 1
+      expected: [[2]]
+    - sql: SELECT CASE WHEN 1 = 1 THEN NULL END, CASE WHEN 1 = 1 THEN 'a' END
+      expected: [[null, "a"]]
+    - sql: SELECT CASE WHEN 1 = 1 THEN 1 ELSE true END
+      error: "42804"
+    - sql: SELECT CASE WHEN 1 = 1 THEN 1 ELSE 'a' END
+      error: "22P02"
+
+- name: a CASE branch that raises does so only when taken
+  features: [F261-02]
+  steps:
+    - sql: SELECT CASE WHEN 1 = 2 THEN 1 ELSE 1 / 0 END
+      error: "22012"
+
+- name: COALESCE returns its first argument that is not NULL
+  features: [F261-04]
+  steps:
+    - sql: SELECT COALESCE(NULL, NULL, 3, 4), COALESCE(1, 2), COALESCE(NULL, 'x')
+      expected: [[3, 1, "x"]]
+    - sql: SELECT COALESCE(NULL, NULL)
+      expected: [[null]]
+    - sql: SELECT COALESCE(1, 2.50), COALESCE(NULL, 2147483648)
+      expected: [["1", 2147483648]]
+    - sql: SELECT COALESCE(1, true)
+      error: "42804"
+    - sql: SELECT COALESCE(1, 'a')
+      error: "22P02"
+    - sql: SELECT COALESCE(NULL, 1 / 0)
+      error: "22012"
+
+- name: NULLIF is NULL when its arguments are equal, else the first
+  features: [F261-03]
+  steps:
+    - sql: SELECT NULLIF(1, 1), NULLIF(1, 2), NULLIF(NULL, 1), NULLIF(1, NULL)
+      expected: [[null, 1, null, 1]]
+    - sql: SELECT NULLIF('a', 'a'), NULLIF('a', 'b'), NULLIF('1', 1), NULLIF(1, 1.0), NULLIF(1.5, 1)
+      expected: [[null, "a", null, null, "1.5"]]
+    - sql: SELECT NULLIF(1, true)
+      error: "42883"
+    - sql: SELECT NULLIF(1, 'a')
+      error: "22P02"

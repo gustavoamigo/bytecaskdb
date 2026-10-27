@@ -115,8 +115,8 @@ the row says 2016.
   tables without a primary key, literals, `SELECT` without `FROM` and
   comparisons of constants, UNIQUE constraints, SELECT DISTINCT, JOIN
   USING, WHERE predicates, LIKE, outer joins, FOREIGN KEY accepted (not
-  enforced), uncorrelated subqueries, table aliases and `SELECT *` built,
-  378 pass, and the
+  enforced), uncorrelated subqueries, table aliases, `SELECT *` and `CASE`/`COALESCE`/`NULLIF` of constants built,
+  392 pass, and the
   rest stop at forms the dialect leaves out. The list is
   `tests/functional/not_implemented/sqltest.txt`.
 
