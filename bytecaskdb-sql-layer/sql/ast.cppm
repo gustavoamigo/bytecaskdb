@@ -275,6 +275,8 @@ struct FromItem {
   // qualifier that names an alias to its table, so the alias stays only for a
   // query that names one table twice, where it tells the two apart.
   std::string alias;
+  // t AS x (a, b): the names of the table's first columns in this query.
+  std::vector<std::string> column_aliases;
   std::int32_t pos{-1};
   JoinKind kind{JoinKind::Inner};
   std::vector<std::string> using_columns;

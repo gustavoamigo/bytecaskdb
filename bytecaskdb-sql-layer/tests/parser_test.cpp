@@ -453,6 +453,13 @@ TEST_CASE("parser: a chain of joins, each with its own ON, kind and USING", "[sq
   CHECK_THROWS_AS(parse("SELECT 1 FROM (a JOIN b ON a.k = b.k) AS j"), SqlError);
 }
 
+TEST_CASE("parser: a column list on a table alias is kept with the alias", "[sql][parser][join]") {
+  auto s = std::get<Select>(parse("SELECT m.x, y FROM t AS m (x, y)"));
+  CHECK(s.from[0].name() == "m");
+  CHECK(s.from[0].column_aliases == std::vector<std::string>{"x", "y"});
+  CHECK(s.targets[0].table == "m");
+}
+
 TEST_CASE("parser: an alias is rewritten to its table, and kept where a table is named twice", "[sql][parser][join]") {
   // Once: the qualifier names the table, and the item has no alias.
   auto once = std::get<Select>(parse("SELECT x.id FROM t AS x JOIN u y ON x.k = y.k"));
