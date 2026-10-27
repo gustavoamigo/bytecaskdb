@@ -15,6 +15,8 @@ module;
 #include <sched.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <cerrno>
@@ -34,6 +36,7 @@ module;
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <variant>
@@ -1082,6 +1085,7 @@ public:
     std::size_t turns{0};
     std::size_t worker_migrations{0};
     std::thread::id last_worker{};
+    std::size_t running_on{kNoPreference};  // the worker running it (State::Running)
   };
 
   struct Status {
@@ -1096,7 +1100,11 @@ public:
       : db_{db}, cfg_{cfg}, on_wake_{std::move(on_wake)} {
     auto n = workers == 0 ? 1 : workers;
     wq_.reserve(n);
-    for (std::size_t i = 0; i < n; ++i) wq_.push_back(std::make_unique<WorkerQueue>());
+    for (std::size_t i = 0; i < n; ++i) {
+      wq_.push_back(std::make_unique<WorkerQueue>());
+      wq_.back()->wake_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+      if (wq_.back()->wake_fd < 0) throw std::system_error{errno, std::generic_category(), "eventfd"};
+    }
     workers_.reserve(n);
     for (std::size_t i = 0; i < n; ++i) {
       int cpu = cpus.empty() ? -1 : cpus[i % cpus.size()];
@@ -1122,10 +1130,15 @@ public:
   }
 
   void detach(const std::shared_ptr<Slot>& slot) {
-    std::lock_guard<std::mutex> lock{slot->mu};
-    slot->fd = -1;
-    slot->tag = nullptr;
-    slot->in_woken = false;
+    auto running_on = kNoPreference;
+    {
+      std::lock_guard<std::mutex> lock{slot->mu};
+      slot->fd = -1;
+      slot->tag = nullptr;
+      slot->in_woken = false;
+      if (slot->state == Slot::State::Running) running_on = slot->running_on;
+    }
+    wake_parked(running_on);
   }
   void submit(const std::shared_ptr<Slot>& slot, std::span<Input> inputs) {
     if (inputs.empty()) return;
@@ -1163,6 +1176,7 @@ public:
 
   void stop(const std::shared_ptr<Slot>& slot) {
     auto need_schedule = false;
+    auto running_on = kNoPreference;
     {
       std::lock_guard<std::mutex> lock{slot->mu};
       if (slot->dropped || slot->session_ended) return;
@@ -1170,13 +1184,17 @@ public:
       if (slot->state == Slot::State::Idle) {
         slot->state = Slot::State::Queued;
         need_schedule = true;
+      } else if (slot->state == Slot::State::Running) {
+        running_on = slot->running_on;
       }
     }
     if (need_schedule) enqueue_slot(slot);
+    wake_parked(running_on);
   }
 
   void drop(const std::shared_ptr<Slot>& slot) {
     auto need_schedule = false;
+    auto running_on = kNoPreference;
     {
       std::lock_guard<std::mutex> lock{slot->mu};
       slot->dropped = true;
@@ -1184,9 +1202,12 @@ public:
       if (!slot->session_ended && slot->state == Slot::State::Idle) {
         slot->state = Slot::State::Queued;
         need_schedule = true;
+      } else if (slot->state == Slot::State::Running) {
+        running_on = slot->running_on;
       }
     }
     if (need_schedule) enqueue_slot(slot);
+    wake_parked(running_on);
   }
 
   [[nodiscard]] auto drain(const std::shared_ptr<Slot>& slot, std::string& out, bool write_in_flight = false) -> Status {
@@ -1214,42 +1235,72 @@ public:
         w->shutdown = true;
       }
       w->cv.notify_all();
+      poke(*w);
     }
     for (auto& t : workers_) {
       if (t.joinable()) t.join();
     }
+    for (auto& w : wq_) {
+      if (w->wake_fd >= 0) ::close(w->wake_fd);
+      w->wake_fd = -1;
+    }
   }
 
 private:
+  // How long a worker waits on its session's socket for the client's next
+  // statement before handing the session back to the loop.
+  static constexpr int kBurstWaitMs = 10;
+
   struct alignas(64) WorkerQueue {
     std::mutex mu;
     std::condition_variable cv;
     std::deque<std::shared_ptr<Slot>> queue;
+    std::atomic<std::size_t> len{0};    // queue.size(), read without the lock
     std::atomic<bool> busy{false};
+    std::atomic<bool> parked{false};    // waiting on its session's socket and wake_fd
+    int wake_fd{-1};                    // eventfd: ends a parked wait
     bool shutdown{false};
   };
 
+  static void poke(WorkerQueue& w) noexcept {
+    std::uint64_t one = 1;
+    (void)!::write(w.wake_fd, &one, sizeof one);
+  }
+
+  void wake_parked(std::size_t idx) noexcept {
+    if (idx < wq_.size() && wq_[idx]->parked.load()) poke(*wq_[idx]);
+  }
+
   void enqueue_slot(const std::shared_ptr<Slot>& slot) {
-    queued_slots_.fetch_add(1, std::memory_order_relaxed);
+    queued_slots_.fetch_add(1);
     auto n = wq_.size();
     auto start = slot->preferred_worker < n
                      ? slot->preferred_worker
                      : next_worker_.fetch_add(1, std::memory_order_relaxed) % n;
-    auto chosen = start;
+    // An idle worker first; else one parked on its session's socket, which
+    // yields at once when poked; else the start, which may be in a commit.
+    auto chosen = n;
+    auto parked = n;
     for (std::size_t i = 0; i < n; ++i) {
       auto idx = (start + i) % n;
       if (!wq_[idx]->busy.load(std::memory_order_relaxed)) {
         chosen = idx;
         break;
       }
+      if (parked == n && wq_[idx]->parked.load(std::memory_order_relaxed)) parked = idx;
     }
+    if (chosen == n) chosen = parked < n ? parked : start;
     auto& w = *wq_[chosen];
     {
       std::lock_guard<std::mutex> lock{w.mu};
       w.queue.push_back(slot);
+      w.len.fetch_add(1, std::memory_order_relaxed);
       w.busy.store(true, std::memory_order_relaxed);
     }
     w.cv.notify_one();
+    // Its worker may be parked on another session's socket: end the wait so
+    // the session queued behind it runs.
+    if (w.parked.load()) poke(w);
   }
 
   auto pop_slot(std::size_t my_idx) -> std::shared_ptr<Slot> {
@@ -1261,6 +1312,7 @@ private:
         if (!mine.queue.empty()) {
           auto s = std::move(mine.queue.front());
           mine.queue.pop_front();
+          mine.len.fetch_sub(1, std::memory_order_relaxed);
           mine.busy.store(true, std::memory_order_relaxed);
           queued_slots_.fetch_sub(1, std::memory_order_relaxed);
           return s;
@@ -1268,10 +1320,12 @@ private:
       }
       for (std::size_t i = 1; i < n; ++i) {
         auto& other = *wq_[(my_idx + i) % n];
+        if (other.len.load(std::memory_order_relaxed) == 0) continue;
         std::lock_guard<std::mutex> lock{other.mu};
         if (!other.queue.empty()) {
           auto s = std::move(other.queue.front());
           other.queue.pop_front();
+          other.len.fetch_sub(1, std::memory_order_relaxed);
           mine.busy.store(true, std::memory_order_relaxed);
           queued_slots_.fetch_sub(1, std::memory_order_relaxed);
           return s;
@@ -1380,6 +1434,7 @@ private:
       {
         std::lock_guard<std::mutex> lock{slot->mu};
         slot->state = Slot::State::Running;
+        slot->running_on = my_idx;
         if (slot->turns > 0 && slot->last_worker != tid) ++slot->worker_migrations;
         slot->last_worker = tid;
         ++slot->turns;
@@ -1421,11 +1476,15 @@ private:
           }
           if (fd < 0) break;
 
-          // Active-session fast path: if the client sends its next statement
-          // promptly and no other session is queued, read and run it here
-          // without bouncing through the libuv loop.
+          // Active-session fast path: while no other session is queued, wait
+          // here for the client's next statement and run it without bouncing
+          // through the libuv loop. The wait ends on the socket, on wake_fd
+          // (a session queued behind this worker, stop, drop, detach or
+          // shutdown), or after kBurstWaitMs.
+          auto& me = *wq_[my_idx];
           auto got_bytes = false;
-          for (int attempt = 0; attempt < 10; ++attempt) {
+          auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{kBurstWaitMs};
+          for (;;) {
             auto n = ::recv(fd, recv_buf, sizeof recv_buf, MSG_DONTWAIT);
             if (n > 0) {
               feed_raw(*slot, std::string_view{recv_buf, static_cast<std::size_t>(n)}, scratch);
@@ -1446,13 +1505,30 @@ private:
               got_bytes = false;
               break;
             }
-            if (queued_slots_.load(std::memory_order_relaxed) > 0 || shutdown_.load(std::memory_order_relaxed)) break;
+            auto left = std::chrono::ceil<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+            if (left.count() <= 0) break;
+            // parked before the checks, so an enqueue, stop, drop or detach
+            // after them sees it and pokes wake_fd.
+            me.parked.store(true);
+            if (queued_slots_.load() > 0 || shutdown_.load()) {
+              me.parked.store(false);
+              break;
+            }
             {
               std::lock_guard<std::mutex> lock{slot->mu};
-              if (slot->stopping || slot->dropped) break;
+              if (slot->stopping || slot->dropped || slot->fd < 0) {
+                me.parked.store(false);
+                break;
+              }
             }
-            pollfd pfd{fd, POLLIN, 0};
-            (void)::poll(&pfd, 1, 1);
+            pollfd pfds[2]{{fd, POLLIN, 0}, {me.wake_fd, POLLIN, 0}};
+            auto ready = ::poll(pfds, 2, static_cast<int>(left.count()));
+            me.parked.store(false);
+            if (ready > 0 && (pfds[1].revents & POLLIN) != 0) {
+              std::uint64_t count = 0;
+              (void)!::read(me.wake_fd, &count, sizeof count);
+              break;
+            }
           }
           if (!got_bytes || !slot->session.runnable()) break;
           {

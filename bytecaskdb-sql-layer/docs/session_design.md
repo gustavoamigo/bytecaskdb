@@ -107,9 +107,24 @@ worker indefinitely. A single statement's memory is bounded by its budget
 (`plan_api_design.md`, *The guarantee*), and its run time is bounded when
 the statement timeout is set.
 
-**Replies.** A worker appends reply bytes to the connection's output buffer
-at the points today's server writes (`ReadyForQuery`, `Flush`, or past
-64 KiB) and wakes the loop. A slow reader never holds a worker. While a
+**An active session stays on its worker.** A client in a transaction sends
+its next statement microseconds after reading the last reply. Handing the
+session back to the loop between them costs an `epoll` wakeup and two
+thread switches per statement. So while no other session is queued, the
+worker that ran it waits up to 10 ms on the session's socket and runs the
+next statement itself; the loop isn't reading that socket meanwhile. The
+wait also watches the worker's `eventfd`, which a session queued on that
+worker, a stop, a drop, a closed connection or shutdown writes, so the
+session yields as soon as another needs the worker. A session goes to an
+idle worker if there is one, else to a parked one, rather than behind a
+worker that may be in a commit. An idle worker looks at another worker's
+queue only when its length counter says it isn't empty.
+
+**Replies.** A worker writes reply bytes at the points today's server writes
+(`ReadyForQuery`, `Flush`, or past 64 KiB): straight to the socket with a
+non-blocking `send` while the connection has no unsent output, or else to
+the connection's output buffer, and it wakes the loop. A slow reader never
+holds a worker. While a
 connection's unsent output is past its bound (*Bounds*), the session isn't
 scheduled for its next turn: its messages wait in its queue, and the loop
 stops reading its socket, so TCP pushes back on the client.
