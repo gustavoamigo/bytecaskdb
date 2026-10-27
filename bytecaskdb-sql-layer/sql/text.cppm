@@ -164,11 +164,12 @@ auto date_text(std::int64_t days) -> std::string {
   return date_part(c) + (c.year <= 0 ? " BC" : "");
 }
 
-auto timestamp_text(std::int64_t micros) -> std::string {
+// With `utc`, the offset PostgreSQL writes a timestamptz at, before the era.
+auto timestamp_text(std::int64_t micros, bool utc = false) -> std::string {
   auto per_day = kSecondsPerDay * kMicrosPerSecond;
   auto days = floor_div(micros, per_day);
   auto c = civil_from_days(days);
-  return date_part(c) + " " + time_part(micros - days * per_day) + (c.year <= 0 ? " BC" : "");
+  return date_part(c) + " " + time_part(micros - days * per_day) + (utc ? "+00" : "") + (c.year <= 0 ? " BC" : "");
 }
 
 // A cursor over a datetime's text. Fields are digits; anything unexpected
@@ -258,21 +259,58 @@ auto read_time(Cursor& c, bool allow_24) -> std::int64_t {
   return total;
 }
 
-auto timestamp_from(std::string_view text) -> std::int64_t {
-  Cursor c{trim(text), text, "timestamp"};
+// A UTC offset after a time: Z, or + or - with HH, HH:MM, HHMM or HH:MM:SS,
+// as microseconds east of UTC. None where the text has none. PostgreSQL's
+// bound is under 16 hours.
+auto read_offset(Cursor& c) -> std::optional<std::int64_t> {
+  while (c.peek() == ' ' && !(c.s.size() >= 3 && iequals(c.s.substr(1, 2), "BC"))) c.s.remove_prefix(1);
+  if (c.peek() == 'Z' || c.peek() == 'z') {
+    c.s.remove_prefix(1);
+    return 0;
+  }
+  if (c.peek() != '+' && c.peek() != '-') return std::nullopt;
+  auto sign = c.peek() == '-' ? -1 : 1;
+  c.s.remove_prefix(1);
+  auto h = c.digits(1, 2);
+  std::int64_t m = 0;
+  std::int64_t sec = 0;
+  if (c.peek() == ':' || std::isdigit(static_cast<unsigned char>(c.peek())) != 0) {
+    if (c.peek() == ':') c.s.remove_prefix(1);
+    m = c.digits(2, 2);
+    if (c.peek() == ':') {
+      c.s.remove_prefix(1);
+      sec = c.digits(2, 2);
+    }
+  }
+  if (h > 15 || m > 59 || sec > 59) {
+    throw TextError("time zone displacement out of range: \"" + std::string{c.whole} + "\"", "22009");
+  }
+  return sign * ((h * 60 + m) * 60 + sec) * kMicrosPerSecond;
+}
+
+// A timestamp's text; with `tz`, one that may end in a UTC offset, which is
+// taken off (a text without one is UTC, the session's time zone).
+auto timestamp_read(std::string_view text, bool tz) -> std::int64_t {
+  Cursor c{trim(text), text, tz ? "timestamp with time zone" : "timestamp"};
   auto [y, md] = read_date(c);
   std::int64_t micros = 0;
+  std::int64_t offset = 0;
   if (c.peek() == ' ' || c.peek() == 'T') {
     if (c.peek() == ' ' && c.s.size() >= 3 && iequals(c.s.substr(1, 2), "BC")) {
       // the date's era, no time
     } else {
       c.s.remove_prefix(1);
       micros = read_time(c, false);
+      if (tz) offset = read_offset(c).value_or(0);
     }
   }
   auto days = finish_date(c, y, md);
-  return days * kSecondsPerDay * kMicrosPerSecond + micros;
+  return days * kSecondsPerDay * kMicrosPerSecond + micros - offset;
 }
+
+auto timestamp_from(std::string_view text) -> std::int64_t { return timestamp_read(text, false); }
+
+auto timestamptz_from(std::string_view text) -> std::int64_t { return timestamp_read(text, true); }
 
 auto date_from(std::string_view text) -> std::int64_t {
   Cursor c{trim(text), text, "date"};
@@ -619,6 +657,7 @@ auto to_text(const Datum& v, SqlType t) -> std::string {
           switch (t.kind) {
             case SqlKind::Decimal: return decimal_text(x, t.scale);
             case SqlKind::Timestamp: return timestamp_text(x);
+            case SqlKind::TimestampTz: return timestamp_text(x, true);
             case SqlKind::Date: return date_text(x);
             case SqlKind::Time: return time_part(x);
             case SqlKind::SmallInt:
@@ -651,6 +690,7 @@ auto from_text(std::string_view text, SqlType t, bool assigned_only) -> Datum {
     case SqlKind::Varchar: return text_bytes(text);
     case SqlKind::Decimal: return decimal_from(text, t.scale, assigned_only);
     case SqlKind::Timestamp: return timestamp_from(text);
+    case SqlKind::TimestampTz: return timestamptz_from(text);
     case SqlKind::Date: return date_from(text);
     case SqlKind::Time: return time_from(text);
     case SqlKind::Numeric: break;  // no parameter has it: HAVING on AVG is refused

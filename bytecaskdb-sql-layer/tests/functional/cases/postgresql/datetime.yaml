@@ -252,3 +252,88 @@
       error: "42846"
     - sql: SELECT CAST(DATE '2016-03-26' AS TIME)
       error: "42846"
+
+- name: TIMESTAMP WITH TIME ZONE column keeps the instant, shown in UTC
+  features: [pg:timestamptz]
+  setup:
+    - CREATE TABLE tz (id INTEGER PRIMARY KEY, at TIMESTAMP WITH TIME ZONE, ts TIMESTAMP)
+    - CREATE INDEX tz_at ON tz (at)
+  steps:
+    - sql: INSERT INTO tz VALUES ($1, $2, $3)
+      params: [1, "2026-10-27 10:00:00+02", "2026-10-27 08:00:00"]
+      rowcount: 1
+    - sql: INSERT INTO tz VALUES ($1, $2, $3)
+      params: [2, "2026-10-27 10:00:00Z", null]
+      rowcount: 1
+    - sql: INSERT INTO tz VALUES ($1, $2, $3)
+      params: [3, "2026-10-27 10:00:00", null]
+      rowcount: 1
+    - sql: INSERT INTO tz VALUES ($1, $2, $3)
+      params: [4, "2026-10-27 05:30:00-04:30", null]
+      rowcount: 1
+    - sql: INSERT INTO tz VALUES ($1, $2, $3)
+      params: [5, "2026-10-27 10:00:00.5+05:30", null]
+      rowcount: 1
+    - sql: SELECT at FROM tz WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected:
+        - ["2026-10-27 04:30:00.5+00"]
+        - ["2026-10-27 08:00:00+00"]
+        - ["2026-10-27 10:00:00+00"]
+        - ["2026-10-27 10:00:00+00"]
+        - ["2026-10-27 10:00:00+00"]
+    - sql: SELECT id FROM tz WHERE at = $1 AND id >= $2 ORDER BY id
+      params: ["2026-10-27 12:00:00+02", 0]
+      expected: [[2], [3], [4]]
+    - sql: SELECT id FROM tz WHERE at > $1 AND id >= $2 ORDER BY at, id
+      params: ["2026-10-27 09:00:00+00", 0]
+      expected: [[2], [3], [4]]
+    - sql: SELECT id FROM tz WHERE at = TIMESTAMP '2026-10-27 08:00:00'
+      expected: [[1]]
+    - sql: SELECT id FROM tz WHERE at >= DATE '2026-10-27' AND at < DATE '2026-10-28' ORDER BY id
+      expected: [[1], [2], [3], [4], [5]]
+    - sql: SELECT min(at), max(at) FROM tz
+      expected: [["2026-10-27 04:30:00.5+00", "2026-10-27 10:00:00+00"]]
+    - sql: SELECT at, count(*) FROM tz GROUP BY at ORDER BY at
+      expected:
+        - ["2026-10-27 04:30:00.5+00", 1]
+        - ["2026-10-27 08:00:00+00", 1]
+        - ["2026-10-27 10:00:00+00", 3]
+    - sql: INSERT INTO tz VALUES ($1, $2, $3)
+      params: [6, "2026-10-27 10:00:00+16", null]
+      error: "22009"
+    - sql: INSERT INTO tz VALUES ($1, $2, $3)
+      params: [6, "not a time", null]
+      error: "22007"
+  teardown:
+    - DROP TABLE tz
+
+- name: casts between timestamptz, timestamp, date and text
+  features: [pg:timestamptz]
+  steps:
+    - sql: SELECT TIMESTAMPTZ '2026-10-27 10:00:00+02'
+      expected: [["2026-10-27 08:00:00+00"]]
+    - sql: SELECT CAST('2026-10-27 10:00:00-03' AS TIMESTAMP WITH TIME ZONE)
+      expected: [["2026-10-27 13:00:00+00"]]
+    - sql: SELECT CAST(TIMESTAMPTZ '2026-10-27 10:00:00+02' AS TIMESTAMP)
+      expected: [["2026-10-27 08:00:00"]]
+    - sql: SELECT CAST(TIMESTAMPTZ '2026-10-27 23:30:00-02' AS DATE)
+      expected: [["2026-10-28"]]
+    - sql: SELECT CAST(TIMESTAMPTZ '2026-10-27 23:30:00-02' AS TIME)
+      expected: [["01:30:00"]]
+    - sql: SELECT CAST(TIMESTAMP '2026-10-27 08:00:00' AS TIMESTAMPTZ)
+      expected: [["2026-10-27 08:00:00+00"]]
+    - sql: SELECT CAST(DATE '2026-10-27' AS TIMESTAMPTZ)
+      expected: [["2026-10-27 00:00:00+00"]]
+    - sql: SELECT CAST(TIMESTAMPTZ '2026-10-27 10:00:00+02' AS VARCHAR)
+      expected: [["2026-10-27 08:00:00+00"]]
+    - sql: SELECT CAST(TIME '10:00:00' AS TIMESTAMPTZ)
+      error: "42846"
+    - sql: SELECT TIMESTAMPTZ '2026-10-27 10:00:00' = TIMESTAMPTZ '2026-10-27 12:00:00+02'
+      expected: [[t]]
+    - sql: SELECT TIMESTAMPTZ '2026-10-27 10:00:00' < TIMESTAMP '2026-10-27 10:00:01'
+      expected: [[t]]
+    - sql: SELECT TIMESTAMPTZ '2026-10-27 00:00:00' = DATE '2026-10-27'
+      expected: [[t]]
+    - sql: SELECT TIMESTAMPTZ '0001-01-01 00:00:00+00 BC'
+      expected: [["0001-01-01 00:00:00+00 BC"]]

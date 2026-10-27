@@ -78,6 +78,7 @@ auto exact_scale(const SqlType& t) -> std::optional<std::uint8_t> {
     case SqlKind::Text:
     case SqlKind::Varchar:
     case SqlKind::Timestamp:
+    case SqlKind::TimestampTz:
     case SqlKind::Date:
     case SqlKind::Time:
     case SqlKind::Numeric: return std::nullopt;
@@ -108,7 +109,7 @@ auto comparable(const Expr& a, const Expr& b) -> std::optional<std::pair<std::in
     return std::pair{*va, *vb};
   }
   auto ordinal = [](SqlKind k) {
-    return k == SqlKind::Boolean || k == SqlKind::Date || k == SqlKind::Timestamp || k == SqlKind::Time;
+    return k == SqlKind::Boolean || k == SqlKind::Date || k == SqlKind::Timestamp || k == SqlKind::TimestampTz || k == SqlKind::Time;
   };
   if (a.type.kind == b.type.kind && ordinal(a.type.kind)) return std::pair{a.constant, b.constant};
   return std::nullopt;

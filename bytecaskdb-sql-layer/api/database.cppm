@@ -1159,7 +1159,7 @@ static auto clock_value(const bound::ClockSlot& k, std::int64_t now_us) -> Value
   constexpr std::int64_t kDay = 86'400'000'000;
   auto day = now_us >= 0 ? now_us / kDay : -((-now_us + kDay - 1) / kDay);
   if (k.kind == bound::ClockSlot::Kind::Date) return Value{day};
-  auto us = k.kind == bound::ClockSlot::Kind::Time ? now_us - day * kDay : now_us;
+  auto us = k.kind == bound::ClockSlot::Kind::Time ? now_us - day * kDay : now_us;  // Timestamp and TimestampTz: the instant
   std::int64_t unit = 1;
   for (auto i = k.precision; i < 6; ++i) unit *= 10;
   auto rounded = us - (us >= 0 ? us % unit : (unit + us % unit) % unit);

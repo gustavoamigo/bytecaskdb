@@ -47,7 +47,7 @@ u16 npk     { u32 col_id }
 u16 nidx    { u32 len, u32 id, str name, u8 unique, u16 nparts { u32 col_id, u8 desc } }
 u16 nlayout { u32 len, u32 layout_id, u16 generation, u16 bitmap_bytes, u16 var_table, u16 nvar,
               u16 nslots { u32 col_id, u32 pos } }
-u16 nchecks { u32 len, str name, blob expression }   ; format 5 only, and never empty
+u16 nchecks { u32 len, str name, blob expression }   ; formats 5 and 6; never empty in 5
 ```
 
 A layout records where its fixed region ends (`var_table`) and its slot
@@ -71,8 +71,14 @@ primary key. Format 5 added the `CHECK` list at the end of the record. A table
 without a `CHECK` is still written as format 4, so a database is closed to
 an earlier build only once it holds one: that build refuses the record
 ("written by a later SQL-layer build") and so refuses to open. Nothing
-else about a database changes. The record format also names the row format
-its positions are for; formats 2, 3, 4 and 5 share the 12-byte-header row
+else about a database changes. Format 6 is format 5 whose CHECK list may be
+empty: it is the record of a table with a `TIMESTAMP WITH TIME ZONE` column
+(type tag 15, which an earlier build would call corrupt), written only for
+such a table, so a database is closed to an earlier build ("written by a
+later SQL-layer build") only once it holds one. No existing encoding changes:
+the column stores a `TIMESTAMP`'s microseconds and keys as one. The record
+format also names the row format its positions are for; formats 2, 3, 4, 5
+and 6 share the 12-byte-header row
 format.
 
 **A record that does not parse is refused at load**, with the table's id:
