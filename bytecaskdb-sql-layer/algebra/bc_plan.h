@@ -42,7 +42,7 @@ enum bc_error_code {
   BC_E_IO,          /* std::system_error from the engine */
   BC_E_CORRUPT,     /* CRC mismatch or unparseable record */
   BC_E_MEMORY,      /* an allocation failed (std::bad_alloc) */
-  BC_E_BUDGET,      /* work budget or deadline exhausted */
+  BC_E_BUDGET,      /* work budget or deadline exhausted, or the statement cancelled */
   BC_E_LIMIT,       /* key, value or write plan over the engine's limits, or the statement over its memory budget */
   BC_E_HANDLE,      /* stale, foreign or out-of-range handle, or a table, index or column the plan's
                        bc_schema_ref does not declare, or not of the type used: a plan bug */
@@ -89,6 +89,8 @@ typedef struct {
   uint64_t max_reads;       /* record reads and cursor steps, together; 0 = none */
   uint64_t max_bytes;       /* memory the statement holds, as bytes requested; 0 = none */
   uint64_t deadline_ns;     /* monotonic; 0 = none */
+  const uint8_t *cancel;    /* nonzero once another thread cancels the statement, read with an
+                               atomic load where deadline_ns is checked; null = none */
 } bc_budget;
 
 /* The runtime's objects, opaque to a plan: the open engine, the live

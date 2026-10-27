@@ -33,7 +33,7 @@ In:
 
 Out, each refused with a stated error rather than half-supported: SSL and
 GSSAPI encryption, every authentication method but trust, binary format,
-`COPY`, the function-call protocol, `CancelRequest`, `SET` (but `SET
+`COPY`, the function-call protocol, `SET` (but `SET
 client_encoding` to UTF8) and `SHOW`, SQL
 `PREPARE`/`EXECUTE`/`DEALLOCATE`, `Execute` with a row limit, several
 statements in one `Query`, and the system catalogs (`pg_catalog`,
@@ -94,7 +94,9 @@ costs one lookup in `Database::prepare`'s cache, keyed by the exact text.
 127.0.0.1:5432] [--database NAME] [--max-connections 100] [--workers N]
 [--sync AT_EVERY_COMMIT|AT_INTERVAL|AT_FILE_ROTATION] [--sync-interval-ms 1000]
 [--io-backend pread|mmap|buffer_pool] [--buffer-pool-size BYTES]
-[--buffer-pool-direct-io on|off] [--statement-memory-bytes 67108864]` serves one
+[--buffer-pool-direct-io on|off] [--statement-memory-bytes 67108864]
+[--idle-in-transaction-timeout-ms 60000] [--statement-timeout-ms 0]
+[--transaction-timeout-ms 0] [--idle-session-timeout-ms 0]` serves one
 database directory under one database name, by default the directory's
 last component. It opens the directory with `Database::open`, so it holds
 the engine's directory lock. The code is in `bytecaskdb-sql-layer/server/`:
@@ -200,6 +202,24 @@ statement committed. Another `SIGINT` or `SIGTERM` during the stop is
 ignored. When every connection and session has ended, the server shuts down
 the worker pool and calls `Database::close()`.
 
+**Cancellation and timeouts** (`session_design.md`, *Lifetime,
+cancellation and shutdown*). A `CancelRequest` naming a session's
+`BackendKeyData` key fails its running statement with `57014`
+(`canceling statement due to user request`); one naming a session that runs
+nothing, or a wrong key, does nothing. A cancel is checked where the runtime
+charges a statement's reads, every 64. The timeouts, in milliseconds, `0`
+turning one off:
+- `--statement-timeout-ms` (off): a statement past it fails with `57014`
+  (`canceling statement due to statement timeout`), and the session goes on;
+- `--idle-in-transaction-timeout-ms` (60000): a session idle that long in a
+  transaction, explicit, failed or an extended block's implicit one, gets
+  `FATAL 25P03`, and its transaction rolls back;
+- `--transaction-timeout-ms` (off): a transaction open that long in total,
+  busy or idle, gets `FATAL 25P04` and rolls back. A statement outside a
+  block is its own transaction;
+- `--idle-session-timeout-ms` (off): a session idle that long outside a
+  transaction gets `FATAL 57P05`.
+
 **After a `FATAL`** the session ends: it reads no more messages and runs
 nothing more. After startup, an invalid message length or type is `FATAL`.
 
@@ -208,8 +228,9 @@ nothing more. After startup, an invalid message length or type is `FATAL`.
 1. **The request.**
    - An `SSLRequest` or `GSSENCRequest` is answered `N`, and the next
      message is read on the same connection.
-   - A `CancelRequest` closes the connection with nothing done. There is no
-     cancel, so no `BackendKeyData` is sent.
+   - A `CancelRequest` cancels the running statement of the session its key
+     names (*Cancellation and timeouts*), and its connection is closed with
+     no reply.
    - A `StartupMessage` of protocol 3.0 is read.
    - Protocol 3.x, x > 0, gets `NegotiateProtocolVersion` (3.0, naming any
      `_pq_.` options), as PostgreSQL answers it, and startup goes on at 3.0.
@@ -241,7 +262,9 @@ nothing more. After startup, an invalid message length or type is `FATAL`.
    - `integer_datetimes` `on`, `standard_conforming_strings` `on`;
    - `is_superuser` `off`, `session_authorization` the user;
    - `application_name`.
-5. **`ReadyForQuery`**, status `I`.
+5. **`BackendKeyData`**: the session's process id, unique among the
+   server's sessions, and a random secret, which a `CancelRequest` names.
+6. **`ReadyForQuery`**, status `I`.
 
 ## A session
 
@@ -832,7 +855,12 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 - The integer and datetime input forms listed above only.
 - A form the layer does not support is `42601`, not PostgreSQL's code for running it.
 - `Execute` with a row limit, several statements in one `Query`, SQL
-  `PREPARE`, `SET`, `SHOW`, `COPY` and cancel are refused.
+  `PREPARE`, `SET`, `SHOW` and `COPY` are refused.
+- The idle-in-transaction timeout is on by default (60 s); PostgreSQL's
+  `idle_in_transaction_session_timeout` is off by default. An open
+  transaction holds a snapshot (`session_design.md`, *Bounds*).
+- A cancel or statement timeout is seen where a statement charges its reads,
+  every 64: a statement that reads fewer runs to its end.
 - A result is built whole by the embedded API before its first `DataRow`
   is sent. Streaming rows waits on the API streaming them, part of the
   transport design (#487, *Next*).

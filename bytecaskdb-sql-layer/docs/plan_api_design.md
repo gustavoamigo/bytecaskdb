@@ -338,9 +338,10 @@ There is no spill. The embedded API passes `DatabaseOptions::
 statement_memory_bytes`, 64 MiB by default.
 
 **The API meters the work.** `bc_ctx_begin` sets a budget in record reads
-and cursor steps and a deadline. Every read and every step charges the
-budget, and the API checks the deadline periodically. Exhausting either sets
-`BC_E_BUDGET` and the plan unwinds. Compute between API calls is
+and cursor steps, a deadline and a cancel flag. Every read and every step
+charges the budget, and every 64 the API checks the flag, which another
+thread may set, and the deadline. Exhausting the budget, a set flag or a
+passed deadline sets `BC_E_BUDGET` and the plan unwinds. Compute between API calls is
 straight-line and finite, so the budget bounds the whole execution without
 help from the compiler. An interpreter, if a target ever needs one, would
 add a fuel counter on backward branches, which compiled plans do not need.
@@ -419,7 +420,7 @@ enum bc_error_code {
   BC_E_IO,          /* std::system_error from the engine */
   BC_E_CORRUPT,     /* CRC mismatch or unparseable record */
   BC_E_MEMORY,      /* an allocation failed (std::bad_alloc) */
-  BC_E_BUDGET,      /* work budget or deadline exhausted */
+  BC_E_BUDGET,      /* work budget or deadline exhausted, or the statement cancelled */
   BC_E_LIMIT,       /* key or value over the engine's limits, or the statement over its memory budget */
   BC_E_HANDLE,      /* stale, foreign or out-of-range handle, or a table, index or column the plan's
                        bc_schema_ref does not declare, or not of the type used: a plan bug */
@@ -466,6 +467,8 @@ typedef struct {
   uint64_t max_reads;       /* record reads and cursor steps, together; 0 = none */
   uint64_t max_bytes;       /* memory the statement holds, as bytes requested; 0 = none */
   uint64_t deadline_ns;     /* monotonic; 0 = none */
+  const uint8_t *cancel;    /* nonzero once another thread cancels the statement, read with an
+                               atomic load where deadline_ns is checked; null = none */
 } bc_budget;
 
 /* The runtime's objects, opaque to a plan: the open engine, the live

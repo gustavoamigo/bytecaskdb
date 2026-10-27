@@ -1029,13 +1029,19 @@ struct bc_ctx {
       return false;
     }
     // Every 64 units, whatever the step: a charge of several units must not
-    // jump over the check.
-    if (budget.deadline_ns != 0 && before / 64 != reads / 64) {
-      auto now = std::chrono::steady_clock::now().time_since_epoch();
-      if (static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count()) >
-          budget.deadline_ns) {
-        fail(BC_E_BUDGET, "deadline passed");
+    // jump over the check. The messages are PostgreSQL's for 57014.
+    if ((budget.deadline_ns != 0 || budget.cancel != nullptr) && before / 64 != reads / 64) {
+      if (budget.cancel != nullptr && __atomic_load_n(budget.cancel, __ATOMIC_RELAXED) != 0) {
+        fail(BC_E_BUDGET, "canceling statement due to user request");
         return false;
+      }
+      if (budget.deadline_ns != 0) {
+        auto now = std::chrono::steady_clock::now().time_since_epoch();
+        if (static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count()) >
+            budget.deadline_ns) {
+          fail(BC_E_BUDGET, "canceling statement due to statement timeout");
+          return false;
+        }
       }
     }
     return true;
