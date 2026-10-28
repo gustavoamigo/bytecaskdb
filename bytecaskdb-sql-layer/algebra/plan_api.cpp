@@ -1015,6 +1015,14 @@ struct bc_ctx {
   // preceded by its u32 length.
   Bytes results;
   std::size_t result_pos{0};
+  // bc_ctx_window: the result rows a run drops from its front and keeps
+  // after them. `emitted` counts the rows a top-level bc_emit_end ended,
+  // dropped ones included; `kept` those encoded into `results`.
+  bool windowed{false};
+  bool unwinding{false};  // the plan is running out after its last kept row
+  bool stopped{false};    // bc_ctx_run ended that way
+  std::uint64_t window_skip{0}, window_limit{0};
+  std::uint64_t emitted{0}, kept{0};
   std::optional<RowWriter> emit;
   std::uint32_t emit_col{0};
   std::int64_t affected{-1};
@@ -1040,7 +1048,9 @@ struct bc_ctx {
 
   bc_ctx(bytecask::DB* d, LiveCatalog* l) : db{d}, live{l} {}
 
-  auto ok() const -> bool { return error == BC_OK; }
+  // A run that reached its window's end is unwound as a failed one is: every
+  // call after the stop returns a neutral value. It is not an error.
+  auto ok() const -> bool { return error == BC_OK && !unwinding; }
 
   [[nodiscard]] auto sink() -> ErrorSink { return {error, detail, message}; }
 
@@ -1461,6 +1471,10 @@ struct bc_ctx {
     sort_parts.type.clear();
     results.clear();
     result_pos = 0;
+    windowed = false;
+    unwinding = false;
+    stopped = false;
+    window_skip = window_limit = emitted = kept = 0;
     emit.reset();
     emit_col = 0;
     affected = -1;
@@ -2719,7 +2733,11 @@ void bc_ctx_run(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* checked_agains
   BC_GUARD_BEGIN
   cx->affected = -1;  // the count is the run's: a failed run reports none
   if (!bc_ctx_check(cx, checked_against)) return;
+  // limit 0 wants no row: the plan, verified, reads nothing.
+  cx->unwinding = cx->windowed && cx->window_limit == 0;
   plan(cx);
+  cx->stopped = cx->unwinding;
+  cx->unwinding = false;
   if (cx->ok() && cx->emit) cx->fail(BC_L_PLAN, "result row begun and not ended");
   BC_GUARD_END(cx)
 }
@@ -2789,6 +2807,22 @@ bool bc_ctx_next_result(bc_ctx* cx, const uint8_t** row, uint32_t* len) {
 }
 
 void bc_ctx_reset(bc_ctx* cx) { cx->drop_execution_state(); }
+
+void bc_ctx_window(bc_ctx* cx, uint64_t skip, uint64_t limit) {
+  BC_GUARD_BEGIN
+  if (cx->base == nullptr || cx->emitted != 0 || cx->windowed) {
+    cx->fail(BC_E_HANDLE, "bc_ctx_window needs a begun context that has run nothing, once");
+    return;
+  }
+  cx->windowed = true;
+  cx->window_skip = skip;
+  cx->window_limit = limit;
+  BC_GUARD_END(cx)
+}
+
+uint64_t bc_ctx_emitted(const bc_ctx* cx) { return cx->emitted; }
+
+bool bc_ctx_stopped(const bc_ctx* cx) { return cx->stopped; }
 
 enum bc_error_code bc_error(const bc_ctx* cx) { return cx->error; }
 
@@ -3399,6 +3433,11 @@ void bc_emit_end(bc_ctx* cx) {
     cx->fail(BC_L_PLAN, "result row ended with the wrong number of columns");
     return;
   }
+  ++cx->emitted;
+  if (cx->windowed && cx->emitted <= cx->window_skip) {
+    cx->emit.reset();  // before the window: dropped unencoded and uncharged
+    return;
+  }
   // The row is encoded straight into the result buffer, after its length,
   // and charged with it.
   auto at = cx->results.size();
@@ -3415,6 +3454,7 @@ void bc_emit_end(bc_ctx* cx) {
   auto n = static_cast<std::uint32_t>(cx->results.size() - at - 4);
   std::memcpy(cx->results.data() + at, &n, 4);
   cx->emit.reset();
+  if (cx->windowed && ++cx->kept >= cx->window_limit) cx->unwinding = true;
   BC_GUARD_END(cx)
 }
 
