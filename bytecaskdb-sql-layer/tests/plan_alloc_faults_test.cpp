@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -424,4 +425,75 @@ TEST_CASE("plan API: a commit whose allocations fail is never BC_COMMITTED with 
     ++failed;
   }
   CHECK(failed > 0);
+}
+
+TEST_CASE("plan API: an allocation failure in a pin, or in the clone the next write forces, is an error and nothing else",
+          "[sql][algebra][alloc][txn][cursor]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("operator new is the sanitizer's in this build");
+  Fixture f;
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+  auto ref = sr.get();
+  // One statement of the transaction: INSERT INTO t VALUES (id, 'n', 1).
+  auto statement = [&](bc_txn* txn, std::int64_t id) {
+    auto ps = params({id, bytes("n"), std::int64_t{1}});
+    bc_ctx_begin_txn(f.cx, txn, &ps, {});
+    bc_ctx_run(f.cx, insert_row, &ref);
+    REQUIRE(bc_error(f.cx) == BC_OK);
+  };
+  for (auto phase : {"the pin", "the clone"}) {
+    INFO(phase);
+    auto failed = 0;
+    for (long nth = 1;; ++nth) {
+      REQUIRE(nth < 100000);
+      auto* txn = bc_txn_new(&f.bdb, &f.bcat, std::uint64_t{1} << 20);
+      REQUIRE(txn != nullptr);
+      statement(txn, 1);
+      REQUIRE(bc_txn_add(f.cx));
+      bc_ctx_reset(f.cx);
+      auto threw = false;
+      bytecask::testing::AllocFaultReport report;
+      bc_overlay* pin = nullptr;
+      auto added = true;
+      if (std::string_view{phase} == "the pin") {
+        bytecask::testing::ScopedAllocFaults faults{nth, false};
+        try {
+          pin = bc_txn_overlay_pin(txn);
+        } catch (...) {
+          threw = true;
+        }
+        report = faults.report();
+        INFO("allocation " << nth);
+        CHECK_FALSE(threw);
+        // A pin that failed aborted the transaction and says why; one that did not holds it.
+        CHECK((pin == nullptr) == (bc_txn_error(txn) != BC_OK));
+        if (pin == nullptr) CHECK(bc_txn_error(txn) == BC_E_MEMORY);
+      } else {
+        pin = bc_txn_overlay_pin(txn);
+        REQUIRE(pin != nullptr);
+        statement(txn, 2);
+        {
+          bytecask::testing::ScopedAllocFaults faults{nth, false};
+          try {
+            added = bc_txn_add(f.cx);
+          } catch (...) {
+            threw = true;
+          }
+          report = faults.report();
+        }
+        INFO("allocation " << nth);
+        CHECK_FALSE(threw);
+        CHECK((added == (bc_error(f.cx) == BC_OK)));
+        if (!added) CHECK(bc_error(f.cx) == BC_E_MEMORY);
+        bc_ctx_reset(f.cx);
+      }
+      bc_txn_overlay_release(pin);
+      bc_txn_free(txn);
+      if (!report.fired) {
+        CHECK(added);
+        break;
+      }
+      ++failed;
+    }
+    CHECK(failed > 0);
+  }
 }

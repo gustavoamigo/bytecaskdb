@@ -248,6 +248,7 @@ public:
 private:
   friend class Database;
   friend class Transaction;
+  friend struct CursorState;
   // One compile of a DML statement, never changed once built but for
   // `checked`. A run holds it by shared_ptr, so a recompile, which swaps in a
   // new one, never changes a plan a run on another thread is using.
@@ -310,6 +311,7 @@ struct TransactionOptions {
 };
 
 class Database;
+class Cursor;
 
 // What commit() did, as PostgreSQL's COMMIT reports it in its command tag.
 enum class CommitOutcome {
@@ -319,6 +321,40 @@ enum class CommitOutcome {
 
 enum class TxnState : std::uint8_t { Open, Aborted, Ended };
 
+struct TxnHandle;
+struct DatabaseLife;
+
+// What a Cursor pins and where it stands (docs/cursor_design.md, *The replay
+// cursor*), shared by the Cursor handle and the transaction's list. The
+// snapshot and the pinned catalog are the transaction's. Closed when the
+// cursor is closed or its transaction ends, aborts or is closed with its
+// database.
+struct CursorState {
+  std::shared_ptr<DatabaseLife> life;
+  Database* db{nullptr};  // valid while !life->closed, read under life->mu
+  TxnHandle* h{nullptr};  // null once closed
+  std::atomic<bool> live{true};
+  bool aborted{false};  // closed by its transaction's abort
+  // The compiled plan the cursor was opened on, held so that a recompile
+  // cannot change the plan or its order.
+  std::shared_ptr<const Statement::Compiled> compiled;
+  // The plan's parameters as bound at open: the caller's, the statement's
+  // constants and the clocks at the transaction's time.
+  std::vector<Value> values;
+  bc_overlay* overlay{nullptr};  // the transaction's writes as of open, released at close
+  std::uint64_t position{0};     // rows returned
+  bool end{false};               // the plan ran out of rows
+
+  // Releases the overlay: before the transaction is freed.
+  void close() noexcept {
+    if (overlay != nullptr) bc_txn_overlay_release(overlay);
+    overlay = nullptr;
+    h = nullptr;
+    compiled.reset();
+    live.store(false);
+  }
+};
+
 // A transaction's resources, on the heap so that a moved Transaction keeps
 // them where the Database's list of open transactions finds them.
 struct TxnHandle {
@@ -326,8 +362,11 @@ struct TxnHandle {
   bc_txn* txn{nullptr};
   std::atomic<TxnState> state{TxnState::Ended};  // close() ends it from another thread
   std::int64_t started_us{0};  // the transaction's time: what CURRENT_DATE, LOCALTIME and LOCALTIMESTAMP read in it
+  std::vector<std::shared_ptr<CursorState>> cursors;  // open; closed before the snapshot is released
 
   void release() noexcept {
+    for (const auto& c : cursors) c->close();
+    cursors.clear();
     bc_ctx_free(cx);
     bc_txn_free(txn);  // a transaction not committed writes nothing
     cx = nullptr;
@@ -336,6 +375,7 @@ struct TxnHandle {
   // Aborted: what it held is freed now, the snapshot that holds vacuum back
   // first. Only the state is left, for rollback() or commit() to end.
   void abort() noexcept {
+    for (const auto& c : cursors) c->aborted = true;
     release();
     state.store(TxnState::Aborted);
   }
@@ -353,6 +393,39 @@ struct DatabaseLife {
   bool closed{false};                // under mu
   std::mutex open_mu;                // guards open; taken briefly, never across I/O
   std::set<TxnHandle*> open;
+};
+
+// A cursor opened by Transaction::open_cursor: fetch() returns the statement's
+// rows in order, a page at a time, as a full run would. It is a handle on a
+// cursor the transaction owns; dropping it leaves the cursor open until
+// close() or the end of the transaction. Move-only; one thread at a time.
+// A fetch re-runs the plan to its position (the replay cursor), so it costs
+// work proportional to the position.
+class Cursor {
+public:
+  Cursor(Cursor&&) noexcept = default;
+  Cursor& operator=(Cursor&&) noexcept = default;
+  Cursor(const Cursor&) = delete;
+  Cursor& operator=(const Cursor&) = delete;
+  ~Cursor() = default;
+
+  // The next `k` rows, fewer at the end; none once the end was reached or for
+  // k 0, without running. Throws std::logic_error on a closed cursor,
+  // TransactionAborted once its transaction aborted, DbClosed after the
+  // database closed. A run that fails (an ExecError, a budget) aborts the
+  // transaction, and so closes its cursors.
+  auto fetch(std::uint64_t k) -> Rows;
+  [[nodiscard]] auto position() const noexcept -> std::uint64_t { return s_ ? s_->position : 0; }
+  // The plan ran out of rows: fetch returns none.
+  [[nodiscard]] auto at_end() const noexcept -> bool { return s_ && s_->end; }
+  [[nodiscard]] auto is_open() const noexcept -> bool { return s_ && s_->live.load(); }
+  // Releases what it pins; the transaction goes on. Once closed, does nothing.
+  void close() noexcept;
+
+private:
+  friend class Transaction;
+  explicit Cursor(std::shared_ptr<CursorState> s) : s_{std::move(s)} {}
+  std::shared_ptr<CursorState> s_;
 };
 
 // A transaction from Database::begin(): its statements read the snapshot
@@ -387,6 +460,17 @@ public:
   // statement that returns no rows throws std::invalid_argument, the
   // transaction unchanged. Otherwise as execute.
   auto execute_window(const Statement& stmt, const std::vector<Value>& params, RowWindow window) -> WindowRows;
+  // Opens a forward-only cursor over a SELECT (docs/cursor_design.md). It
+  // pins what the statement reads or is given: the snapshot, the
+  // transaction's writes so far, the parameters, the time and the plan. It
+  // runs nothing; fetch() does. The cursor sees nothing the transaction
+  // writes after this call, and is closed with the transaction, by commit,
+  // rollback, an abort or the database's close. It reserves the pinned
+  // writes' bound against TransactionOptions::max_bytes until closed: a
+  // transaction that cannot is aborted with ExecError BC_E_LIMIT (54000).
+  // Throws std::invalid_argument, the transaction unchanged, for a statement
+  // that is not a SELECT; otherwise as execute.
+  auto open_cursor(const Statement& stmt, const std::vector<Value>& params) -> Cursor;
   // Writes every statement's writes as one batch: Committed. After a failed
   // statement it writes nothing and returns RolledBack. Throws
   // SerializationFailure on a conflict and ExecError on an engine error,
@@ -538,6 +622,7 @@ public:
 
 private:
   friend class Transaction;
+  friend class Cursor;
   using Compiled = Statement::Compiled;
   Database() = default;
   // The AtInterval flusher: an empty synced write returns once every earlier
@@ -573,8 +658,14 @@ private:
   // `now_us` is the statement's time (a transaction's start), read once.
   // `window`, only with a transaction, runs the statement windowed and
   // records where it stopped in the position and end of `*window`.
+  // `open`, only with a transaction, runs nothing: it verifies the plan
+  // against the transaction's pin, as a run would, and records the plan and
+  // its parameters in `*open` (a cursor's).
   auto run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn, std::int64_t now_us,
-           WindowRows* window = nullptr, RowWindow range = {}) -> Rows;
+           WindowRows* window = nullptr, RowWindow range = {}, CursorState* open = nullptr) -> Rows;
+  // A window of a cursor's rows, run on its pinned plan, parameters and
+  // overlay over the transaction's snapshot.
+  auto run_pinned(bc_ctx* cx, bc_txn* txn, const CursorState& cursor, RowWindow range, WindowRows& out) -> Rows;
   [[nodiscard]] auto clock_now() const -> std::int64_t { return clock_(); }
   // Throws ParamError for parameters the plan does not take, and ExecError
   // BC_C_RANGE for a value outside its parameter's SQL type.
@@ -1221,7 +1312,7 @@ void Database::recompile_view_plan(const Statement& stmt) {
 }
 
 auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn, std::int64_t now_us,
-                   WindowRows* window, RowWindow range) -> Rows {
+                   WindowRows* window, RowWindow range, CursorState* open) -> Rows {
   recompile_view_plan(stmt);
   // The context reads the parameters through bp, filled once the plan that
   // runs is known: the caller's, then its constants (plan_params).
@@ -1269,6 +1360,19 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
         bc_ctx_reset(cx);
         throw;
       }
+      if (open != nullptr) {
+        if (!bc_ctx_check(cx, &c->ref)) {
+          if (incompatible()) {
+            stale();
+            continue;
+          }
+          throw_context_error(cx);
+        }
+        bc_ctx_reset(cx);
+        open->compiled = c;
+        open->values = std::move(bp.values);
+        return Rows{};
+      }
       bc_ctx_run(cx, c->code->fn(), &c->ref);
       if (incompatible()) {
         stale();
@@ -1305,6 +1409,22 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
   }
   if (r == BC_FAILED) throw_context_error(cx);
   return results(cx, *c, Rows{});
+}
+
+auto Database::run_pinned(bc_ctx* cx, bc_txn* txn, const CursorState& cursor, RowWindow range, WindowRows& out) -> Rows {
+  const auto& c = *cursor.compiled;
+  bc_params bp;
+  bc_ctx_begin_txn(cx, txn, &bp, budget_);
+  bc_ctx_use_overlay(cx, cursor.overlay);
+  bc_ctx_window(cx, range.skip, range.limit);
+  bp.values = cursor.values;
+  // The transaction's pin is the one the plan was verified against at open
+  // (a pin blocks a re-pin), and bc_ctx_run verifies it again.
+  bc_ctx_run(cx, c.code->fn(), &c.ref);
+  if (!bc_txn_add(cx)) throw_context_error(cx);
+  out.position = bc_ctx_emitted(cx);
+  out.end = !bc_ctx_stopped(cx);
+  return results(cx, c, Rows{});
 }
 
 // The rows and count the statement the context ran left, decoded; the
@@ -1482,6 +1602,75 @@ auto Transaction::execute_window(const Statement& stmt, const std::vector<Value>
   WindowRows out;
   out.rows = run_locked(stmt, params, &out, window);
   return out;
+}
+
+auto Transaction::open_cursor(const Statement& stmt, const std::vector<Value>& params) -> Cursor {
+  if (!h_) throw std::logic_error("the transaction has ended");
+  std::shared_lock<std::shared_mutex> lock{life_->mu};
+  check_usable();
+  if (stmt.owner_ != db_) throw std::logic_error("the statement was prepared on another database");
+  if (stmt.is_ddl() || stmt.command() != Command::Select) throw std::invalid_argument("a cursor needs a SELECT");
+  try {
+    // In the transaction's list before it pins anything: whatever fails
+    // after, its abort closes the cursor before the transaction is freed.
+    auto state = std::make_shared<CursorState>();
+    state->life = life_;
+    state->db = db_;
+    state->h = h_.get();
+    h_->cursors.push_back(state);
+    (void)db_->run(h_->cx, stmt, params, h_->txn, h_->started_us, nullptr, {}, state.get());
+    state->overlay = bc_txn_overlay_pin(h_->txn);
+    if (state->overlay == nullptr) {
+      std::string message;
+      try {
+        message = bc_txn_error_message(h_->txn);
+      } catch (const std::bad_alloc&) {  // NOLINT(bugprone-empty-catch): the message is dropped, not the outcome
+      }
+      throw_error(bc_txn_error(h_->txn), bc_txn_error_detail(h_->txn), message);
+    }
+    return Cursor{std::move(state)};
+  } catch (const SerializationFailure&) {
+    end_locked();
+    throw;
+  } catch (...) {
+    h_->abort();
+    throw;
+  }
+}
+
+auto Cursor::fetch(std::uint64_t k) -> Rows {
+  if (!s_) throw std::logic_error("the cursor was moved from");
+  std::shared_lock<std::shared_mutex> lock{s_->life->mu};
+  if (s_->life->closed || s_->life->closing.load()) throw DbClosed();
+  if (!s_->live.load()) {
+    if (s_->aborted) throw TransactionAborted();
+    throw std::logic_error("the cursor is closed");
+  }
+  auto* h = s_->h;
+  if (k == 0 || s_->end) {
+    Rows none;
+    none.columns = s_->compiled->columns;
+    none.types = s_->compiled->column_types;
+    return none;
+  }
+  try {
+    WindowRows out;
+    out.rows = s_->db->run_pinned(h->cx, h->txn, *s_, RowWindow{s_->position, k}, out);
+    s_->position += std::ssize(out.rows.rows);
+    s_->end = out.end;
+    return std::move(out.rows);
+  } catch (...) {
+    h->abort();  // closes this cursor, with the transaction's others
+    throw;
+  }
+}
+
+void Cursor::close() noexcept {
+  if (!s_) return;
+  std::shared_lock<std::shared_mutex> lock{s_->life->mu};
+  if (!s_->live.load()) return;  // closed already, with its transaction or the database
+  std::erase(s_->h->cursors, s_);
+  s_->close();
 }
 
 auto Transaction::execute(std::string_view sql, const std::vector<Value>& params) -> Rows {

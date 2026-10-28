@@ -1,8 +1,8 @@
 # Cursors in the SQL layer
 
 Status: **design, not approved** (written 2026-10-28 for #663, sqltest
-E121; revised the same day for the owner's replay proposal). Phase 1
-(the replay runner, #717) is built; nothing else is. The owner's direction: a cursor is evaluated lazily; holding the whole
+E121; revised the same day for the owner's replay proposal). Phases 1
+(the replay runner, #717) and 2 (pinned state, #718) are built; nothing else is. The owner's direction: a cursor is evaluated lazily; holding the whole
 result in memory is not the design. The first phases build a **replay
 cursor** (the snapshot and a position; each `FETCH` re-runs the plan to its
 position), and a resumable run replaces it later where replay is too slow.
@@ -418,6 +418,26 @@ version at each run, as `bc_ctx_run` does.
 A concurrent transaction's commit is invisible to the cursor, as to the
 transaction.
 
+**As built (phase 2).** `Transaction::open_cursor(stmt, params)` returns a
+`Cursor` (`api/database.cppm`) over a SELECT; the transaction owns it, and the
+handle is a view of it. It runs nothing at open but verifies the plan against
+the transaction's pin, as a run does, pinning the snapshot and catalog if no
+statement has. It keeps: the `Compiled` plan, the plan's parameter vector
+(the caller's, the constants, the clock slots filled once from
+`started_us`), and a `bc_overlay` pin of the transaction's overlay
+(`transaction_design.md`, *The transaction's view*, *Limits*). `fetch(k)` runs
+`execute_window`'s machinery with `skip = position`, `limit = k` on the pinned
+plan, parameters and overlay, then `position += rows returned`; `at_end()`
+once the plan ran out; `close()`. A cursor is closed by commit, rollback, an
+abort (including its own failed `fetch`: the transaction aborts and so do all
+its cursors, `25P02` after) and the database's close; a closed cursor's
+`fetch` throws `std::logic_error`, `TransactionAborted` after an abort,
+`DbClosed` after the database closed. No cursor timer, cap or setting exists:
+the pin's reservation against `max_bytes` is the only limit, and a held
+cursor is a held transaction. The memory reservation is the transaction's
+bound (`BC_E_LIMIT` at open), not the statement budget or the server's global
+cap, which a session adds in phase 7.
+
 ## `WITH HOLD`
 
 A holdable cursor outlives its transaction, so it cannot read the
@@ -629,7 +649,7 @@ interface, so phases 3 to 7 do not change when it lands.
 | Phase | Issue | What | Unlocks | Decision |
 |---|---|---|---|---|
 | 1 | #717 | **Done.** Replay runner in the runtime: skip count, row limit, stop; resumable-plan flag; determinism and differential tests. The start-key checkpoint is not built (owner direction, 2026-10-28): #731 | none | |
-| 2 | #718 | Copy-on-write overlay; pinned parameters, clocks and plan; forward-only `Cursor` in `Transaction` | none | |
+| 2 | #718 | **Done.** Copy-on-write overlay; pinned parameters, clocks and plan; forward-only `Cursor` in `Transaction` | none | |
 | 3 | #719 | `DECLARE`, `FETCH` forward, `MOVE`, `CLOSE`, `FOR UPDATE` in the dialect and session | none alone | **1** |
 | 4 | #720 | `WITH HOLD` (result store); `DECLARE` outside a block | 8 ids, or 1 | **1, 3** |
 | 5 | #721 | Every `FETCH` direction, `SCROLL`, `55000` | none | |
