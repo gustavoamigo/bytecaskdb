@@ -41,6 +41,11 @@ export namespace bytecask::sql::ast {
 // PostgreSQL's message and position) or a form the prototype does not take.
 [[nodiscard]] auto parse(std::string_view sql) -> Statement;
 
+// Parses a DECLARE, FETCH, MOVE or CLOSE; nullopt for any other statement,
+// which is parse()'s to take. Throws SqlError as parse() does. A DECLARE's
+// query is returned as text, for parse() to read as the SELECT it must be.
+[[nodiscard]] auto parse_cursor(std::string_view sql) -> std::optional<CursorStatement>;
+
 }  // namespace bytecask::sql::ast
 
 namespace bytecask::sql::ast {
@@ -1073,7 +1078,17 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
     if (lc->wait_policy != PG_QUERY__LOCK_WAIT_POLICY__LockWaitBlock) {
       reject("NOWAIT and SKIP LOCKED are not supported", pos);
     }
-    if (lc->n_locked_rels != 0) reject("FOR UPDATE OF is not supported", pos);
+    // OF t, u: each must be a FROM item. The lock covers every table the query
+    // reads, which includes the named ones (docs/cursor_design.md).
+    for (std::size_t k = 0; k < lc->n_locked_rels; ++k) {
+      const auto* rv = lc->locked_rels[k]->range_var;
+      if (!empty(rv->schemaname)) reject("schema-qualified names are not supported", rv->location);
+      auto named = std::ranges::any_of(sel.from, [&](const FromItem& f) { return f.name() == rv->relname; });
+      if (!named) {
+        reject(std::string{"relation \""} + rv->relname + "\" in FOR UPDATE clause not found in FROM clause",
+               rv->location, kUndefinedTable);
+      }
+    }
     sel.for_update = true;
   }
   sel.order_by = order_items(s, pos);
@@ -1132,7 +1147,92 @@ struct ParseResources {
   }
 };
 
+// PostgreSQL's CURSOR_OPT_* bits in DeclareCursorStmt::options.
+constexpr std::int32_t kCursorBinary = 0x1;
+constexpr std::int32_t kCursorScroll = 0x2;
+constexpr std::int32_t kCursorNoScroll = 0x4;
+constexpr std::int32_t kCursorHold = 0x20;
+
+// The offset where a DECLARE's query begins: past the FOR that follows
+// CURSOR [WITH | WITHOUT HOLD]. The parse tree has no location for it, so the
+// scanner's tokens are read. The statement parsed, so the tokens are there.
+auto declare_query_start(const std::string& text) -> std::size_t {
+  struct Scan {
+    PgQueryScanResult raw{};
+    PgQuery__ScanResult* tree{nullptr};
+    Scan() = default;
+    Scan(const Scan&) = delete;
+    Scan& operator=(const Scan&) = delete;
+    ~Scan() {
+      if (tree != nullptr) pg_query__scan_result__free_unpacked(tree, nullptr);
+      pg_query_free_scan_result(raw);
+    }
+  } scan;
+  scan.raw = pg_query_scan(text.c_str());
+  if (scan.raw.error == nullptr) {
+    scan.tree = pg_query__scan_result__unpack(nullptr, scan.raw.pbuf.len,
+                                              reinterpret_cast<const std::uint8_t*>(scan.raw.pbuf.data));
+  }
+  if (scan.tree == nullptr) reject("unreadable DECLARE", -1);
+  // Tokens 0 and 1 are DECLARE and the name, which may itself be spelled cursor.
+  auto n = scan.tree->n_tokens;
+  for (std::size_t i = 2; i < n; ++i) {
+    if (scan.tree->tokens[i]->token != PG_QUERY__TOKEN__CURSOR) continue;
+    auto j = i + 1;
+    if (j < n && (scan.tree->tokens[j]->token == PG_QUERY__TOKEN__WITH || scan.tree->tokens[j]->token == PG_QUERY__TOKEN__WITHOUT)) j += 2;
+    if (j >= n || scan.tree->tokens[j]->token != PG_QUERY__TOKEN__FOR) break;
+    return static_cast<std::size_t>(scan.tree->tokens[j]->end);
+  }
+  reject("unreadable DECLARE", -1);
+}
+
 }  // namespace
+
+auto parse_cursor(std::string_view sql) -> std::optional<CursorStatement> {
+  std::string text{sql};
+  ParseResources res;
+  res.raw = pg_query_parse_protobuf(text.c_str());
+  if (res.raw.error != nullptr) {
+    reject(res.raw.error->message, res.raw.error->cursorpos > 0 ? res.raw.error->cursorpos - 1 : -1);
+  }
+  res.tree = pg_query__parse_result__unpack(nullptr, res.raw.parse_tree.len,
+                                            reinterpret_cast<const std::uint8_t*>(res.raw.parse_tree.data));
+  if (res.tree == nullptr) reject("unreadable parse tree", -1);
+  if (res.tree->n_stmts != 1) reject("expected exactly one statement", -1);
+  const auto* n = res.tree->stmts[0]->stmt;
+  if (n->node_case == PG_QUERY__NODE__NODE_DECLARE_CURSOR_STMT) {
+    const auto* d = n->declare_cursor_stmt;
+    DeclareCursor out;
+    out.name = d->portalname;
+    out.binary = (d->options & kCursorBinary) != 0;
+    out.hold = (d->options & kCursorHold) != 0;
+    if ((d->options & kCursorScroll) != 0) out.scroll = DeclareCursor::Scroll::Scroll;
+    if ((d->options & kCursorNoScroll) != 0) out.scroll = DeclareCursor::Scroll::NoScroll;
+    const auto* q = d->query;
+    out.for_update = q != nullptr && q->node_case == PG_QUERY__NODE__NODE_SELECT_STMT && q->select_stmt->n_locking_clause != 0;
+    auto start = declare_query_start(text);
+    out.query = std::string(start, ' ') + text.substr(start);
+    return out;
+  }
+  if (n->node_case == PG_QUERY__NODE__NODE_FETCH_STMT) {
+    const auto* f = n->fetch_stmt;
+    FetchCursor out;
+    out.name = f->portalname;
+    out.move = f->ismove != 0;
+    out.count = f->how_many;
+    if (f->direction == PG_QUERY__FETCH_DIRECTION__FETCH_BACKWARD) out.direction = FetchCursor::Direction::Backward;
+    if (f->direction == PG_QUERY__FETCH_DIRECTION__FETCH_ABSOLUTE) out.direction = FetchCursor::Direction::Absolute;
+    if (f->direction == PG_QUERY__FETCH_DIRECTION__FETCH_RELATIVE) out.direction = FetchCursor::Direction::Relative;
+    return out;
+  }
+  if (n->node_case == PG_QUERY__NODE__NODE_CLOSE_PORTAL_STMT) {
+    CloseCursor out;
+    out.name = n->close_portal_stmt->portalname;
+    out.all = out.name.empty();
+    return out;
+  }
+  return std::nullopt;
+}
 
 auto parse(std::string_view sql) -> Statement {
   std::string text{sql};  // libpg_query takes a NUL-terminated string

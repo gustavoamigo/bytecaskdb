@@ -371,7 +371,8 @@ TEST_CASE("parser: SELECT … FOR UPDATE, and no other locking clause", "[sql][p
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 FOR NO KEY UPDATE"), SqlError);
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 FOR UPDATE NOWAIT"), SqlError);
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 FOR UPDATE SKIP LOCKED"), SqlError);
-  CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 FOR UPDATE OF t"), SqlError);
+  CHECK(std::get<Select>(parse("SELECT id FROM t WHERE id = $1 FOR UPDATE OF t")).for_update);
+  CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 FOR UPDATE OF u"), SqlError);  // not a FROM item
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 FOR UPDATE FOR UPDATE"), SqlError);
 }
 
@@ -481,4 +482,75 @@ TEST_CASE("parser: an alias is rewritten to its table, and kept where a table is
   CHECK_THROWS_AS(parse("SELECT 1 FROM t, t"), SqlError);
   CHECK_THROWS_AS(parse("SELECT 1 FROM t x, u x"), SqlError);
   CHECK_THROWS_AS(parse("SELECT t.id FROM t x JOIN t y ON x.k = y.k"), SqlError);
+}
+
+TEST_CASE("parser: DECLARE, FETCH, MOVE and CLOSE", "[sql][parser][cursor]") {
+  auto declare = [](std::string_view sql) { return std::get<DeclareCursor>(*parse_cursor(sql)); };
+  auto fetch = [](std::string_view sql) { return std::get<FetchCursor>(*parse_cursor(sql)); };
+
+  SECTION("DECLARE: the options and the query") {
+    auto d = declare("DECLARE c CURSOR FOR SELECT 1");
+    CHECK(d.name == "c");
+    CHECK(d.scroll == DeclareCursor::Scroll::Default);
+    CHECK_FALSE(d.hold);
+    CHECK_FALSE(d.binary);
+    CHECK_FALSE(d.for_update);
+    // The statement's own length, so a position into the query is one into the statement.
+    CHECK(d.query == std::string(21, ' ') + "SELECT 1");
+    d = declare("DECLARE \"C d\" BINARY INSENSITIVE NO SCROLL CURSOR WITH HOLD FOR SELECT a FROM t FOR UPDATE OF t");
+    CHECK(d.name == "C d");
+    CHECK(d.scroll == DeclareCursor::Scroll::NoScroll);
+    CHECK(d.binary);
+    CHECK(d.hold);
+    CHECK(d.for_update);
+    CHECK(declare("DECLARE c SCROLL CURSOR WITHOUT HOLD FOR SELECT 1").scroll == DeclareCursor::Scroll::Scroll);
+    CHECK_FALSE(declare("DECLARE c SCROLL CURSOR WITHOUT HOLD FOR SELECT 1").hold);
+    // CURSOR is also a name.
+    CHECK(declare("DECLARE cursor CURSOR FOR SELECT 1").name == "cursor");
+    CHECK(declare("DECLARE c CURSOR FOR SELECT a FROM t FOR READ ONLY").query.ends_with("FOR READ ONLY"));
+  }
+
+  SECTION("FETCH and MOVE: direction and count as PostgreSQL's tree has them") {
+    using D = FetchCursor::Direction;
+    auto f = fetch("FETCH c");
+    CHECK(f.name == "c");
+    CHECK(f.direction == D::Forward);
+    CHECK(f.count == 1);
+    CHECK_FALSE(f.move);
+    CHECK(fetch("FETCH NEXT FROM c").count == 1);
+    CHECK(fetch("FETCH 4 IN c").count == 4);
+    CHECK(fetch("FETCH FORWARD 3 c").count == 3);
+    CHECK(fetch("FETCH FORWARD c").count == 1);
+    CHECK(fetch("FETCH ALL c").count == FetchCursor::kAll);
+    CHECK(fetch("FETCH FORWARD ALL FROM c").count == FetchCursor::kAll);
+    CHECK(fetch("FETCH 0 c").count == 0);
+    CHECK(fetch("FETCH -2 c").count == -2);  // a negative count, Forward: PostgreSQL reads it as backward
+    CHECK(fetch("FETCH PRIOR c").direction == D::Backward);
+    CHECK(fetch("FETCH BACKWARD 2 c").count == 2);
+    CHECK(fetch("FETCH ABSOLUTE 3 c").direction == D::Absolute);
+    CHECK(fetch("FETCH LAST c").count == -1);  // LAST is ABSOLUTE -1
+    CHECK(fetch("FETCH RELATIVE 2 c").direction == D::Relative);
+    auto m = fetch("MOVE FORWARD 2 IN c");
+    CHECK(m.move);
+    CHECK(m.count == 2);
+  }
+
+  SECTION("CLOSE") {
+    auto c = std::get<CloseCursor>(*parse_cursor("CLOSE c"));
+    CHECK(c.name == "c");
+    CHECK_FALSE(c.all);
+    CHECK(std::get<CloseCursor>(*parse_cursor("CLOSE ALL")).all);
+  }
+
+  SECTION("anything else is parse()'s, and a syntax error is an error") {
+    CHECK_FALSE(parse_cursor("SELECT 1").has_value());
+    CHECK_FALSE(parse_cursor("BEGIN").has_value());
+    CHECK_THROWS_AS(parse_cursor("FETCH"), SqlError);
+    CHECK_THROWS_AS(parse_cursor("OPEN c"), SqlError);  // not PostgreSQL's
+    CHECK_THROWS_AS(parse_cursor("FETCH c INTO t"), SqlError);
+  }
+
+  SECTION("DELETE FROM ONLY ( t ) is the tree of DELETE FROM t") {
+    CHECK(std::get<Delete>(parse("DELETE FROM ONLY ( t )")).table == "t");
+  }
 }

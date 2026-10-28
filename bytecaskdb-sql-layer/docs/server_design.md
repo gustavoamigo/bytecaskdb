@@ -260,7 +260,8 @@ A session holds:
 - the named statements, each a `const Statement&` from `Database::prepare`,
   which is valid until close;
 - the named portals;
-- the unnamed statement and the unnamed portal.
+- the unnamed statement and the unnamed portal;
+- the block's named cursors (*Cursor statements*).
 
 A portal lasts until its transaction ends, as in PostgreSQL: at `COMMIT` or
 `ROLLBACK` inside `BEGIN`, and at `Sync` or the end of a `Query` outside it.
@@ -366,9 +367,34 @@ and the transaction commits when the `Query` ends. An error in the `Query`
 rolls the whole block back. A DDL `Query` there is `0A000`, as a DDL beside
 other statements is.
 
+## Cursor statements
+
+`DECLARE`, `FETCH`, `MOVE` and `CLOSE` are classified by the session, as
+`BEGIN` is, and parsed by the dialect's `ast::parse_cursor`
+(`frontend_design.md`, *Cursor statements*). The session keeps the block's
+cursors in a map of `Cursor`s from `Transaction::open_cursor`; the design is
+`cursor_design.md` and what phase 3 built is its *As built (phase 3)*. What
+the server adds:
+- Cursors exist only in an explicit block (`BEGIN`): `DECLARE` anywhere else
+  is `25P01`, as PostgreSQL's, and `WITH HOLD` is `0A000` until phase 4. A
+  cursor shares the portals' namespace (a used name is `42P03`) and ends with
+  the block, at `COMMIT`, `ROLLBACK`, an error or a disconnect.
+- A failed block refuses them all with `25P02`; an error in one fails the
+  block.
+- Tags: `DECLARE CURSOR`, `FETCH n`, `MOVE n`, `CLOSE CURSOR`,
+  `CLOSE CURSOR ALL`. A `FETCH` sends a `RowDescription` in a simple `Query`
+  even when no row is left.
+- Through the extended protocol: `Parse` of a `DECLARE` prepares its query,
+  which may take `$n` parameters bound by `Bind`; `Describe` of a `FETCH`
+  gives the cursor's columns when the cursor exists and `NoData` before;
+  `Execute` of a `FETCH` sends `DataRow`s and the tag, never a
+  `RowDescription`. `Execute` with a row limit is still `0A000`.
+- Only forward fetches (`NEXT`, a count, `FORWARD n`, `ALL`) run; the other
+  directions are `0A000`, naming phase 5.
+
 ## Extended query
 
-- **`Parse`** (name, text, parameter OIDs).
+- **`Parse`** (name, text, parameter OIDs). (name, text, parameter OIDs).
   - The name must be free: a used name is `42P05`, and the unnamed
     statement is replaced.
   - The text goes to `Database::prepare`.
@@ -853,6 +879,9 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 - A form the layer does not support is `42601`, not PostgreSQL's code for running it.
 - `Execute` with a row limit, several statements in one `Query`, SQL
   `PREPARE`, `SET`, `SHOW`, `COPY` and cancel are refused.
+- Cursors: `DECLARE` outside `BEGIN` is `25P01`; `WITH HOLD`, `BINARY` and
+  every `FETCH` direction but forward are `0A000` (`cursor_design.md`,
+  *Known differences from PostgreSQL*).
 - A result is built whole by the embedded API before its first `DataRow`
   is sent. Streaming rows waits on the API streaming them, part of the
   transport design (#487, *Next*).
