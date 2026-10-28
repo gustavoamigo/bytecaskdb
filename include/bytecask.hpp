@@ -26,7 +26,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <expected>
 #include <filesystem>
 #include <limits>
 #include <map>
@@ -132,6 +131,27 @@ enum class PlanRefusal {
   // (a reopen, resume(), ingest, or more deletes since than
   // Options::max_delete_log_bytes holds). Take a fresh snapshot.
   TooOld,
+};
+
+// What DB::apply_batch returns: the CommitResult, or why the plan was
+// refused. Shaped like std::expected<CommitResult, PlanRefusal>, which this
+// header cannot use: it stays C++20 for callers such as the MariaDB plugin.
+class ApplyResult {
+public:
+  ApplyResult(CommitResult result) noexcept : result_{result} {}  // NOLINT(google-explicit-constructor)
+  ApplyResult(PlanRefusal refusal) noexcept : refusal_{refusal} {}  // NOLINT(google-explicit-constructor)
+
+  [[nodiscard]] auto has_value() const noexcept -> bool { return !refusal_; }
+  explicit operator bool() const noexcept { return has_value(); }
+  // On a refusal: {sequence = 0, durable = false}, nothing written.
+  auto operator*() const noexcept -> const CommitResult& { return result_; }
+  auto operator->() const noexcept -> const CommitResult* { return &result_; }
+  // Throws std::bad_optional_access if the plan committed.
+  [[nodiscard]] auto error() const -> PlanRefusal { return refusal_.value(); }
+
+private:
+  CommitResult result_{};
+  std::optional<PlanRefusal> refusal_;
 };
 
 struct ReadOptions {
@@ -571,7 +591,7 @@ public:
   [[nodiscard]] auto snapshot() const -> Snapshot;
   // A read sequence past the latest throws std::invalid_argument.
   [[nodiscard]] auto apply_batch(WriteOptions opts, WritePlan plan)
-      -> std::expected<CommitResult, PlanRefusal>;
+      -> ApplyResult;
 
   [[nodiscard]] auto iter_from(const ReadOptions& opts,
                                BytesView from = {}) const
@@ -638,6 +658,7 @@ using EntryType            = internal::EntryType;
 using WriteOptions         = internal::WriteOptions;
 using CommitResult         = internal::CommitResult;
 using PlanRefusal          = internal::PlanRefusal;
+using ApplyResult          = internal::ApplyResult;
 using ReadOptions          = internal::ReadOptions;
 using VacuumOptions        = internal::VacuumOptions;
 using internal::kNoRetention;

@@ -151,8 +151,8 @@ static_assert(static_cast<int>(bytecask::PlanRefusal::TooOld) ==
               static_cast<int>(bytecask::internal::PlanRefusal::TooOld));
 
 auto from_module(std::expected<bytecask::CommitResult, bytecask::PlanRefusal> r) noexcept
-    -> std::expected<bytecask::internal::CommitResult, bytecask::internal::PlanRefusal> {
-  if (!r) return std::unexpected{static_cast<bytecask::internal::PlanRefusal>(r.error())};
+    -> bytecask::internal::ApplyResult {
+  if (!r) return static_cast<bytecask::internal::PlanRefusal>(r.error());
   return from_module(*r);
 }
 
@@ -652,8 +652,7 @@ auto DB::snapshot() const -> Snapshot {
   });
 }
 
-auto DB::apply_batch(WriteOptions opts, WritePlan plan)
-    -> std::expected<CommitResult, PlanRefusal> {
+auto DB::apply_batch(WriteOptions opts, WritePlan plan) -> ApplyResult {
   return translate_exceptions([&] {
     return from_module(impl_->db.apply_batch(to_module(opts), std::move(*plan.impl_->plan)));
   });

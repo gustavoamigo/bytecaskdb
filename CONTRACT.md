@@ -103,8 +103,8 @@ byte in a data file and does not degrade the engine.
 
 Every write that commits returns one; `del` returns
 `std::optional<CommitResult>` and reports `nullopt` for an absent key, and
-`apply_batch` returns `std::expected<CommitResult, PlanRefusal>` and reports
-the refusal. [`docs/commit_result_api_design.md`](docs/commit_result_api_design.md)
+`apply_batch` returns an `ApplyResult`, the `CommitResult` or the
+`PlanRefusal`. [`docs/commit_result_api_design.md`](docs/commit_result_api_design.md)
 has the API across the bindings.
 
 | Guarantee | Proved by |

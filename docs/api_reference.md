@@ -221,8 +221,7 @@ public:
     // A plan over 1 GiB on disk, batch markers included, throws
     // std::invalid_argument before anything is written.
     // Throws std::system_error on I/O failure or DbDegraded if the engine is degraded.
-    [[nodiscard]] auto apply_batch(WriteOptions opts, WritePlan plan)
-        -> std::expected<CommitResult, PlanRefusal>;
+    [[nodiscard]] auto apply_batch(WriteOptions opts, WritePlan plan) -> ApplyResult;
 
     // Returns a frozen, move-only, read-only view of the DB at this instant.
     // Holds open referenced data files until destroyed — vacuum deferred automatically.
@@ -384,6 +383,11 @@ enum class PlanRefusal {
     Conflict,  // a guard failed, or a written key changed since the read sequence
     TooOld,    // the read sequence is older than the engine still tracks deletes for
 };
+
+// apply_batch's outcome, shaped like std::expected<CommitResult, PlanRefusal>
+// (the header stays C++20): has_value() / operator bool, *r and r->,
+// and error() for the refusal.
+class ApplyResult;
 
 // Write plan for apply_batch. Groups multiple operations into a single atomic write.
 // Construct with a read sequence — WritePlan(snap.sequence()), or WritePlan(snap),
