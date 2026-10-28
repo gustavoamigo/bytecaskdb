@@ -205,6 +205,11 @@ kind the transformer doesn't take is refused with its position.
 - **Where expressions may appear:** `SET col = expr`, a comparison's
   operand (`ol_o_id >= $3 - 20`), and `VALUES`. A constant expression may
   also be a select-list target and a `HAVING` operand.
+- **`DEFAULT`** as a `VALUES` item of an `INSERT` or the value of a `SET`
+  assignment is the column's default constant, NULL where it has none (a
+  NOT NULL column without one is 23502). The binder replaces it with that
+  constant, so it is no new plan shape. It is no expression: PostgreSQL's
+  grammar allows it nowhere else.
 
 **`WHERE`** is a conjunction (`AND`) of comparisons (`=`, `<`, `<=`, `>`,
 `>=`) of a column with a parameter, a constant or `$n ± k`, in any order,
