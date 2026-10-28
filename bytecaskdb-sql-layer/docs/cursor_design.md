@@ -485,6 +485,50 @@ shutdown. `DECLARE` outside a block is accepted in phase 4 as a hold cursor
 (*Owner decisions*, 1): it declares in a transaction of its own that
 commits at once, and the cursor holds the snapshot of that moment.
 
+### Who owns a hold cursor's snapshot (phase 4 finding, open)
+
+Found by reading the code before building; **no code is written yet**, because
+one case needs an engine change (the stop rule of #720).
+
+- `Snapshot` (`include/bytecask.hpp`) is move-only. The transaction keeps it
+  as `std::optional<Snapshot>` in `bc_txn`, pinned at the first statement.
+- `bc_txn_commit` ends it in one of two ways. A transaction with an empty
+  overlay and no counting guard drops the snapshot (`txn->snap.reset()`).
+  Any other moves it into the `WritePlan` (`WritePlan{std::move(*txn->snap)}`),
+  which needs it by value for `ensure_unchanged` and the range guards.
+- **Layer only, no engine change:** make the transaction's handle a
+  `std::shared_ptr<Snapshot>` that a hold cursor shares. This is enough for
+  every transaction whose commit drops the snapshot, and so for `DECLARE`
+  outside a block (an implicit transaction that writes nothing) and for
+  `DECLARE ... WITH HOLD` in a read-only block. It moves all 8 sqltest ids.
+  It is not enough when the commit moves the snapshot into a `WritePlan`:
+  a hold cursor declared in a transaction that writes, or that writes after the
+  `DECLARE`, would lose its snapshot at `COMMIT`. A second `db.snapshot()`
+  taken at `DECLARE` is the wrong view whenever another session committed
+  since the transaction's first statement, and the engine exposes no version
+  to compare.
+- **Needs the engine:** `Snapshot::clone() const`, a copy of the
+  `shared_ptr<const EngineState>` that `Snapshot` already holds, in
+  `bytecask.cppm`, the `bytecask_hpp.cpp` wrapper and `bytecask.hpp`. About 10
+  lines, additive. The cost is an engine API and a test and design-doc line.
+  It retains nothing a hold cursor does not already retain: both handles
+  reach the same state, so the parked tree nodes and the unlinked data files
+  held are those of the one snapshot, until the last handle goes.
+- **Retention either way:** a hold cursor pins its snapshot until `CLOSE`,
+  disconnect or shutdown. Parked nodes and the disk blocks of files vacuum
+  unlinked stay held for that time (1.1 GB retained for 20 M keys under a
+  full-key-space write load, measured on the MariaDB plugin). This phase adds
+  no timer or cap; the bound is the session design's (#642).
+- **Fallback if the engine change is declined:** refuse the writing case.
+  `DECLARE ... WITH HOLD` in a transaction that already wrote is `0A000`, and
+  so is a write or `FOR UPDATE` after a hold cursor in the same transaction.
+  The 8 ids and read-only hold cursors work; the psycopg "write, declare,
+  commit" and "declare, write, commit" patterns do not.
+
+Recommendation: add `Snapshot::clone()`. It is the smallest change that makes
+the owner's rule ("COMMIT of the declaring transaction keeps it") hold for a
+transaction that writes. If it is declined, build the fallback.
+
 ## Limits, lifetime and failure
 
 | Event | What happens to open cursors |
@@ -732,7 +776,7 @@ interface, so phases 3 to 7 do not change when it lands.
 | 1 | #717 | **Done.** Replay runner in the runtime: skip count, row limit, stop; resumable-plan flag; determinism and differential tests. The start-key checkpoint is not built (owner direction, 2026-10-28): #731 | none | |
 | 2 | #718 | **Done.** Copy-on-write overlay; pinned parameters, clocks and plan; forward-only `Cursor` in `Transaction` | none | |
 | 3 | #719 | **Done.** `DECLARE`, `FETCH` forward, `MOVE`, `CLOSE`, `FOR READ ONLY`, `FOR UPDATE [OF t]` in the dialect and session, inside a block | none alone | decided |
-| 4 | #720 | `WITH HOLD` by holding the snapshot (lazy); `DECLARE` outside a block, accepted as a hold cursor | 8 ids | decided (1, 3) |
+| 4 | #720 | **Blocked on one engine question** (*Who owns a hold cursor's snapshot*). `WITH HOLD` by holding the snapshot (lazy); `DECLARE` outside a block, accepted as a hold cursor | 8 ids | decided (1, 3); `Snapshot::clone` open |
 | 5 | #721 | Every `FETCH` direction, `SCROLL`, `55000` | none | |
 | 6 | #722 | `WHERE CURRENT OF` | none as written | **5** |
 | 7 | #724 | Replay cap, flags, accounting; no cursor-own timers or caps | none | **7** |
