@@ -415,6 +415,9 @@ void DB::ingest(const ChangeHeader &header,
       }
 
       t.apply_ingest(chunk, offsets);
+      // Ingest removes keys without recording them; a plan read before it
+      // is too old once this node is promoted.
+      deletes_.reset(t.next_seq() - 1);
 
       // Phase 2: writev chunk to active file.
       std::vector<std::uint64_t> io_offsets(chunk.size());

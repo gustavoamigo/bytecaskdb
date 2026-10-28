@@ -117,7 +117,13 @@ def test_guards_and_snapshots(tmp_path):
 
         snap = db.snapshot()
         db.put(b"new", b"1")
-        db.del_(b"new")  # created and erased since: not a change
+        db.del_(b"new")  # created and erased since: a change, though both lack it
+        plan = ref.WritePlan(snap)
+        plan.ensure_range_unchanged(b"n", b"o")
+        assert db.apply_batch(plan) is None
+
+        snap = db.snapshot()
+        db.put(b"other", b"1")  # outside the range
         plan = ref.WritePlan(snap)
         plan.ensure_range_unchanged(b"n", b"o")
         assert db.apply_batch(plan) is not None

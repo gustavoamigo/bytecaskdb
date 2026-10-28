@@ -235,7 +235,10 @@ inline auto execute(bytecask::DB &db, const Op &op)
         break;
       }
     }
-    return db.apply_batch(wo, std::move(plan));
+    // No read sequence, so the only refusal is a failed guard.
+    auto r = db.apply_batch(wo, std::move(plan));
+    if (!r) return std::nullopt;
+    return *r;
   }
   }
   return std::nullopt;

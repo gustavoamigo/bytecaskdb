@@ -17,6 +17,7 @@ out-of-tree users: `include/bytecask.hpp`, implemented by `bytecask_hpp.cpp`.
 | Commit path: writer executors, pipeline, durability waits | `db_commit.cpp` |
 | Group commit batching, background worker, solo writer | `concurrency.cppm` |
 | Mutable state the write path builds and freezes | `engine_state.cpp` |
+| Checking a plan by its read sequence: guards, the W-W check | `engine_state.cpp` (`validate_preconditions`), `delete_log.cppm` (keys recent writes removed); tests `[validate_preconditions]`, `[read_sequence]`, `tests/range_conflict_test.cpp` |
 | Publishing the immutable state, the read cache | `db_state.cpp` |
 | Point reads, snapshots, iterators | `db_read.cpp`, `batch_iterator.cppm` |
 | Recovery at `open` (hint replay, hint rebuild, torn tail) | `db_recovery.cpp` |

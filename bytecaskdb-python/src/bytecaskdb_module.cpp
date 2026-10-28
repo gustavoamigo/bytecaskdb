@@ -162,7 +162,7 @@ struct PyWritePlan {
 
   [[nodiscard]] auto has_snapshot() const -> bool {
     check();
-    return plan->has_snapshot();
+    return plan->read_sequence().has_value();
   }
 
   auto take() -> bytecask::WritePlan {
@@ -889,10 +889,14 @@ NB_MODULE(_bytecaskdb, m) {
             auto p = plan.take();
             auto wopts = opts.value_or(bytecask::WriteOptions{});
             BC_GIL_RELEASE;
-            return self.db.apply_batch(wopts, std::move(p));
+            // Both refusals are None: a retry from a fresh snapshot answers
+            // either one.
+            auto r = self.db.apply_batch(wopts, std::move(p));
+            if (!r) return std::nullopt;
+            return *r;
           },
           "Apply plan atomically. Returns the CommitResult if committed, or "
-          "None on conflict.",
+          "None on conflict or when the plan's snapshot is too old to check.",
           "plan"_a, "opts"_a = nb::none())
       .def(
           "snapshot",

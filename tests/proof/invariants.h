@@ -13,6 +13,7 @@
 #include "mapping_probe.h"
 #include <algorithm>
 #include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -393,9 +394,10 @@ inline auto make_durable(DB &db) -> std::uint64_t {
 // durable_sequence(), which must already cover a CommitResult that reported
 // durable — the two are checked against each other, as the crash harness does
 // with what the child reported.
-inline auto durable_watermark(const DB &db,
-                              const std::optional<CommitResult> &cr = {})
-    -> std::uint64_t {
+inline auto durable_watermark(
+    const DB &db,
+    const std::expected<CommitResult, PlanRefusal> &cr =
+        std::unexpected{PlanRefusal::Conflict}) -> std::uint64_t {
   auto watermark = db.durable_sequence();
   if (cr && cr->durable) {
     INFO("a CommitResult reported durable must be covered by durable_sequence()");

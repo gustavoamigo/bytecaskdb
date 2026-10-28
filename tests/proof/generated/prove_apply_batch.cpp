@@ -78,7 +78,7 @@ TEST_CASE("prove__empty_db__single_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -122,7 +122,7 @@ TEST_CASE("prove__empty_db__single_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -354,7 +354,7 @@ TEST_CASE("prove__empty_db__single_delete__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -398,7 +398,7 @@ TEST_CASE("prove__empty_db__single_delete__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -630,7 +630,7 @@ TEST_CASE("prove__empty_db__multi_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -675,7 +675,7 @@ TEST_CASE("prove__empty_db__multi_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -1298,7 +1298,7 @@ TEST_CASE("prove__empty_db__mixed_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -1343,7 +1343,7 @@ TEST_CASE("prove__empty_db__mixed_batch__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -1627,7 +1627,7 @@ TEST_CASE("prove__empty_db__large_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -1673,7 +1673,7 @@ TEST_CASE("prove__empty_db__large_batch__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -1963,7 +1963,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -2009,7 +2009,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards__success_nosync", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -2251,7 +2251,7 @@ TEST_CASE("prove__empty_db__conflicting_plan__before_any_io", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -2299,7 +2299,7 @@ TEST_CASE("prove__empty_db__causality_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -2344,7 +2344,7 @@ TEST_CASE("prove__empty_db__causality_overwrite__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -2628,7 +2628,7 @@ TEST_CASE("prove__empty_db__causality_put_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -2673,7 +2673,7 @@ TEST_CASE("prove__empty_db__causality_put_del__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -2957,7 +2957,7 @@ TEST_CASE("prove__empty_db__causality_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -3002,7 +3002,7 @@ TEST_CASE("prove__empty_db__causality_del_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -3353,7 +3353,7 @@ TEST_CASE("prove__empty_db__causality_put_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -3399,7 +3399,7 @@ TEST_CASE("prove__empty_db__causality_put_del_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -3689,7 +3689,7 @@ TEST_CASE("prove__empty_db__solo_causality_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -3734,7 +3734,7 @@ TEST_CASE("prove__empty_db__solo_causality_overwrite__success_nosync", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -4018,7 +4018,7 @@ TEST_CASE("prove__empty_db__solo_causality_put_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -4063,7 +4063,7 @@ TEST_CASE("prove__empty_db__solo_causality_put_del__success_nosync", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -4347,7 +4347,7 @@ TEST_CASE("prove__empty_db__solo_causality_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -4392,7 +4392,7 @@ TEST_CASE("prove__empty_db__solo_causality_del_put__success_nosync", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -4676,7 +4676,7 @@ TEST_CASE("prove__empty_db__solo_causality_put_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -4722,7 +4722,7 @@ TEST_CASE("prove__empty_db__solo_causality_put_del_put__success_nosync", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -5012,7 +5012,7 @@ TEST_CASE("prove__empty_db__sequential_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -5056,7 +5056,7 @@ TEST_CASE("prove__empty_db__sequential_overwrite__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -5556,7 +5556,7 @@ TEST_CASE("prove__empty_db__solo_sequential_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -5600,7 +5600,7 @@ TEST_CASE("prove__empty_db__solo_sequential_overwrite__success_nosync", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -5832,7 +5832,7 @@ TEST_CASE("prove__empty_db__range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -5876,7 +5876,7 @@ TEST_CASE("prove__empty_db__range_del__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -6108,7 +6108,7 @@ TEST_CASE("prove__empty_db__range_del_then_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -6153,7 +6153,7 @@ TEST_CASE("prove__empty_db__range_del_then_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -6437,7 +6437,7 @@ TEST_CASE("prove__empty_db__put_then_range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -6482,7 +6482,7 @@ TEST_CASE("prove__empty_db__put_then_range_del__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -6766,7 +6766,7 @@ TEST_CASE("prove__single_key__single_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -6811,7 +6811,7 @@ TEST_CASE("prove__single_key__single_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -7048,7 +7048,7 @@ TEST_CASE("prove__single_key__single_delete__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -7093,7 +7093,7 @@ TEST_CASE("prove__single_key__single_delete__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -7330,7 +7330,7 @@ TEST_CASE("prove__single_key__multi_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -7376,7 +7376,7 @@ TEST_CASE("prove__single_key__multi_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -9281,7 +9281,7 @@ TEST_CASE("prove__single_key__mixed_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -9327,7 +9327,7 @@ TEST_CASE("prove__single_key__mixed_batch__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -9617,7 +9617,7 @@ TEST_CASE("prove__single_key__large_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -9664,7 +9664,7 @@ TEST_CASE("prove__single_key__large_batch__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -9960,7 +9960,7 @@ TEST_CASE("prove__single_key__single_put_with_guards__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -10008,7 +10008,7 @@ TEST_CASE("prove__single_key__single_put_with_guards__success_nosync", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -10260,7 +10260,7 @@ TEST_CASE("prove__single_key__conflicting_plan__before_any_io", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -10309,7 +10309,7 @@ TEST_CASE("prove__single_key__causality_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -10355,7 +10355,7 @@ TEST_CASE("prove__single_key__causality_overwrite__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -10645,7 +10645,7 @@ TEST_CASE("prove__single_key__causality_put_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -10691,7 +10691,7 @@ TEST_CASE("prove__single_key__causality_put_del__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -10981,7 +10981,7 @@ TEST_CASE("prove__single_key__causality_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -11027,7 +11027,7 @@ TEST_CASE("prove__single_key__causality_del_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -11636,7 +11636,7 @@ TEST_CASE("prove__single_key__causality_put_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -11683,7 +11683,7 @@ TEST_CASE("prove__single_key__causality_put_del_put__success_nosync", "[prove]")
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -11979,7 +11979,7 @@ TEST_CASE("prove__single_key__solo_causality_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -12025,7 +12025,7 @@ TEST_CASE("prove__single_key__solo_causality_overwrite__success_nosync", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -12315,7 +12315,7 @@ TEST_CASE("prove__single_key__solo_causality_put_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -12361,7 +12361,7 @@ TEST_CASE("prove__single_key__solo_causality_put_del__success_nosync", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -12651,7 +12651,7 @@ TEST_CASE("prove__single_key__solo_causality_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -12697,7 +12697,7 @@ TEST_CASE("prove__single_key__solo_causality_del_put__success_nosync", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -12987,7 +12987,7 @@ TEST_CASE("prove__single_key__solo_causality_put_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -13034,7 +13034,7 @@ TEST_CASE("prove__single_key__solo_causality_put_del_put__success_nosync", "[pro
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -13330,7 +13330,7 @@ TEST_CASE("prove__single_key__sequential_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -13375,7 +13375,7 @@ TEST_CASE("prove__single_key__sequential_overwrite__success_nosync", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -14888,7 +14888,7 @@ TEST_CASE("prove__single_key__solo_sequential_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -14933,7 +14933,7 @@ TEST_CASE("prove__single_key__solo_sequential_overwrite__success_nosync", "[prov
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -15170,7 +15170,7 @@ TEST_CASE("prove__single_key__range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -15215,7 +15215,7 @@ TEST_CASE("prove__single_key__range_del__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -15452,7 +15452,7 @@ TEST_CASE("prove__single_key__range_del_then_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -15498,7 +15498,7 @@ TEST_CASE("prove__single_key__range_del_then_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -15788,7 +15788,7 @@ TEST_CASE("prove__single_key__put_then_range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -15834,7 +15834,7 @@ TEST_CASE("prove__single_key__put_then_range_del__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -16124,7 +16124,7 @@ TEST_CASE("prove__populated_db__single_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -16178,7 +16178,7 @@ TEST_CASE("prove__populated_db__single_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -16460,7 +16460,7 @@ TEST_CASE("prove__populated_db__single_delete__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -16514,7 +16514,7 @@ TEST_CASE("prove__populated_db__single_delete__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -16796,7 +16796,7 @@ TEST_CASE("prove__populated_db__multi_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -16851,7 +16851,7 @@ TEST_CASE("prove__populated_db__multi_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -19035,7 +19035,7 @@ TEST_CASE("prove__populated_db__mixed_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -19090,7 +19090,7 @@ TEST_CASE("prove__populated_db__mixed_batch__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -19434,7 +19434,7 @@ TEST_CASE("prove__populated_db__large_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -19490,7 +19490,7 @@ TEST_CASE("prove__populated_db__large_batch__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -19840,7 +19840,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -19897,7 +19897,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards__success_nosync", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -20194,7 +20194,7 @@ TEST_CASE("prove__populated_db__conflicting_plan__before_any_io", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -20252,7 +20252,7 @@ TEST_CASE("prove__populated_db__causality_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -20307,7 +20307,7 @@ TEST_CASE("prove__populated_db__causality_overwrite__success_nosync", "[prove]")
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -20651,7 +20651,7 @@ TEST_CASE("prove__populated_db__causality_put_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -20706,7 +20706,7 @@ TEST_CASE("prove__populated_db__causality_put_del__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -21050,7 +21050,7 @@ TEST_CASE("prove__populated_db__causality_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -21105,7 +21105,7 @@ TEST_CASE("prove__populated_db__causality_del_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -21813,7 +21813,7 @@ TEST_CASE("prove__populated_db__causality_put_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -21869,7 +21869,7 @@ TEST_CASE("prove__populated_db__causality_put_del_put__success_nosync", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -22219,7 +22219,7 @@ TEST_CASE("prove__populated_db__solo_causality_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -22274,7 +22274,7 @@ TEST_CASE("prove__populated_db__solo_causality_overwrite__success_nosync", "[pro
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -22618,7 +22618,7 @@ TEST_CASE("prove__populated_db__solo_causality_put_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -22673,7 +22673,7 @@ TEST_CASE("prove__populated_db__solo_causality_put_del__success_nosync", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -23017,7 +23017,7 @@ TEST_CASE("prove__populated_db__solo_causality_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -23072,7 +23072,7 @@ TEST_CASE("prove__populated_db__solo_causality_del_put__success_nosync", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -23416,7 +23416,7 @@ TEST_CASE("prove__populated_db__solo_causality_put_del_put__success", "[prove]")
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -23472,7 +23472,7 @@ TEST_CASE("prove__populated_db__solo_causality_put_del_put__success_nosync", "[p
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -23822,7 +23822,7 @@ TEST_CASE("prove__populated_db__sequential_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -23876,7 +23876,7 @@ TEST_CASE("prove__populated_db__sequential_overwrite__success_nosync", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -25614,7 +25614,7 @@ TEST_CASE("prove__populated_db__solo_sequential_overwrite__success", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -25668,7 +25668,7 @@ TEST_CASE("prove__populated_db__solo_sequential_overwrite__success_nosync", "[pr
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -25950,7 +25950,7 @@ TEST_CASE("prove__populated_db__range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -26004,7 +26004,7 @@ TEST_CASE("prove__populated_db__range_del__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -26286,7 +26286,7 @@ TEST_CASE("prove__populated_db__range_del_then_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -26341,7 +26341,7 @@ TEST_CASE("prove__populated_db__range_del_then_put__success_nosync", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -26685,7 +26685,7 @@ TEST_CASE("prove__populated_db__put_then_range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -26740,7 +26740,7 @@ TEST_CASE("prove__populated_db__put_then_range_del__success_nosync", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -27084,7 +27084,7 @@ TEST_CASE("prove__rotation_threshold__single_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -27129,7 +27129,7 @@ TEST_CASE("prove__rotation_threshold__single_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -27462,7 +27462,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -27507,7 +27507,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__success_nosync", "[prove]")
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -27840,7 +27840,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -27886,7 +27886,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -30537,7 +30537,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -30583,7 +30583,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -30971,7 +30971,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -31018,7 +31018,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -31414,7 +31414,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__success", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -31462,7 +31462,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__success_nosync", "
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -31816,7 +31816,7 @@ TEST_CASE("prove__rotation_threshold__conflicting_plan__before_any_io", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -31865,7 +31865,7 @@ TEST_CASE("prove__rotation_threshold__causality_overwrite__success", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -31911,7 +31911,7 @@ TEST_CASE("prove__rotation_threshold__causality_overwrite__success_nosync", "[pr
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -32299,7 +32299,7 @@ TEST_CASE("prove__rotation_threshold__causality_put_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -32345,7 +32345,7 @@ TEST_CASE("prove__rotation_threshold__causality_put_del__success_nosync", "[prov
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -32733,7 +32733,7 @@ TEST_CASE("prove__rotation_threshold__causality_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -32779,7 +32779,7 @@ TEST_CASE("prove__rotation_threshold__causality_del_put__success_nosync", "[prov
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -33486,7 +33486,7 @@ TEST_CASE("prove__rotation_threshold__causality_put_del_put__success", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -33533,7 +33533,7 @@ TEST_CASE("prove__rotation_threshold__causality_put_del_put__success_nosync", "[
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -33929,7 +33929,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_overwrite__success", "[prov
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -33975,7 +33975,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_overwrite__success_nosync",
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -34363,7 +34363,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_put_del__success", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -34409,7 +34409,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_put_del__success_nosync", "
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -34797,7 +34797,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_del_put__success", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -34843,7 +34843,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_del_put__success_nosync", "
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -35231,7 +35231,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_put_del_put__success", "[pr
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -35278,7 +35278,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_put_del_put__success_nosync
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -35674,7 +35674,7 @@ TEST_CASE("prove__rotation_threshold__sequential_overwrite__success", "[prove]")
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -35719,7 +35719,7 @@ TEST_CASE("prove__rotation_threshold__sequential_overwrite__success_nosync", "[p
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -37966,7 +37966,7 @@ TEST_CASE("prove__rotation_threshold__solo_sequential_overwrite__success", "[pro
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -38011,7 +38011,7 @@ TEST_CASE("prove__rotation_threshold__solo_sequential_overwrite__success_nosync"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -38344,7 +38344,7 @@ TEST_CASE("prove__rotation_threshold__range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -38389,7 +38389,7 @@ TEST_CASE("prove__rotation_threshold__range_del__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -38722,7 +38722,7 @@ TEST_CASE("prove__rotation_threshold__range_del_then_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -38768,7 +38768,7 @@ TEST_CASE("prove__rotation_threshold__range_del_then_put__success_nosync", "[pro
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -39156,7 +39156,7 @@ TEST_CASE("prove__rotation_threshold__put_then_range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -39202,7 +39202,7 @@ TEST_CASE("prove__rotation_threshold__put_then_range_del__success_nosync", "[pro
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -39590,7 +39590,7 @@ TEST_CASE("prove__deleted_key__single_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -39636,7 +39636,7 @@ TEST_CASE("prove__deleted_key__single_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -39878,7 +39878,7 @@ TEST_CASE("prove__deleted_key__single_delete__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -39924,7 +39924,7 @@ TEST_CASE("prove__deleted_key__single_delete__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -40166,7 +40166,7 @@ TEST_CASE("prove__deleted_key__multi_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -40213,7 +40213,7 @@ TEST_CASE("prove__deleted_key__multi_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -40858,7 +40858,7 @@ TEST_CASE("prove__deleted_key__mixed_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -40905,7 +40905,7 @@ TEST_CASE("prove__deleted_key__mixed_batch__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -41201,7 +41201,7 @@ TEST_CASE("prove__deleted_key__large_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -41249,7 +41249,7 @@ TEST_CASE("prove__deleted_key__large_batch__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -41551,7 +41551,7 @@ TEST_CASE("prove__deleted_key__single_put_with_guards__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -41600,7 +41600,7 @@ TEST_CASE("prove__deleted_key__single_put_with_guards__success_nosync", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -41857,7 +41857,7 @@ TEST_CASE("prove__deleted_key__conflicting_plan__before_any_io", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -41907,7 +41907,7 @@ TEST_CASE("prove__deleted_key__causality_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -41954,7 +41954,7 @@ TEST_CASE("prove__deleted_key__causality_overwrite__success_nosync", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -42250,7 +42250,7 @@ TEST_CASE("prove__deleted_key__causality_put_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -42297,7 +42297,7 @@ TEST_CASE("prove__deleted_key__causality_put_del__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -42593,7 +42593,7 @@ TEST_CASE("prove__deleted_key__causality_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -42640,7 +42640,7 @@ TEST_CASE("prove__deleted_key__causality_del_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -43005,7 +43005,7 @@ TEST_CASE("prove__deleted_key__causality_put_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -43053,7 +43053,7 @@ TEST_CASE("prove__deleted_key__causality_put_del_put__success_nosync", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -43355,7 +43355,7 @@ TEST_CASE("prove__deleted_key__solo_causality_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -43402,7 +43402,7 @@ TEST_CASE("prove__deleted_key__solo_causality_overwrite__success_nosync", "[prov
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -43698,7 +43698,7 @@ TEST_CASE("prove__deleted_key__solo_causality_put_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -43745,7 +43745,7 @@ TEST_CASE("prove__deleted_key__solo_causality_put_del__success_nosync", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -44041,7 +44041,7 @@ TEST_CASE("prove__deleted_key__solo_causality_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -44088,7 +44088,7 @@ TEST_CASE("prove__deleted_key__solo_causality_del_put__success_nosync", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -44384,7 +44384,7 @@ TEST_CASE("prove__deleted_key__solo_causality_put_del_put__success", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -44432,7 +44432,7 @@ TEST_CASE("prove__deleted_key__solo_causality_put_del_put__success_nosync", "[pr
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -44734,7 +44734,7 @@ TEST_CASE("prove__deleted_key__sequential_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -44780,7 +44780,7 @@ TEST_CASE("prove__deleted_key__sequential_overwrite__success_nosync", "[prove]")
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -45298,7 +45298,7 @@ TEST_CASE("prove__deleted_key__solo_sequential_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -45344,7 +45344,7 @@ TEST_CASE("prove__deleted_key__solo_sequential_overwrite__success_nosync", "[pro
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -45586,7 +45586,7 @@ TEST_CASE("prove__deleted_key__range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -45632,7 +45632,7 @@ TEST_CASE("prove__deleted_key__range_del__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -45874,7 +45874,7 @@ TEST_CASE("prove__deleted_key__range_del_then_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -45921,7 +45921,7 @@ TEST_CASE("prove__deleted_key__range_del_then_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -46217,7 +46217,7 @@ TEST_CASE("prove__deleted_key__put_then_range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -46264,7 +46264,7 @@ TEST_CASE("prove__deleted_key__put_then_range_del__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir);
@@ -46561,7 +46561,7 @@ TEST_CASE("prove__single_key_mmap__single_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -46608,7 +46608,7 @@ TEST_CASE("prove__single_key_mmap__single_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -46855,7 +46855,7 @@ TEST_CASE("prove__single_key_mmap__single_delete__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -46902,7 +46902,7 @@ TEST_CASE("prove__single_key_mmap__single_delete__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -47149,7 +47149,7 @@ TEST_CASE("prove__single_key_mmap__multi_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -47197,7 +47197,7 @@ TEST_CASE("prove__single_key_mmap__multi_put__success__held_value", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -47253,7 +47253,7 @@ TEST_CASE("prove__single_key_mmap__multi_put__success__held_iter_span", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -47312,7 +47312,7 @@ TEST_CASE("prove__single_key_mmap__multi_put__success__held_riter_span", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -47371,7 +47371,7 @@ TEST_CASE("prove__single_key_mmap__multi_put__success__held_snapshot", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -47430,7 +47430,7 @@ TEST_CASE("prove__single_key_mmap__multi_put__success__second_instance", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -47492,7 +47492,7 @@ TEST_CASE("prove__single_key_mmap__multi_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -49459,7 +49459,7 @@ TEST_CASE("prove__single_key_mmap__mixed_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -49507,7 +49507,7 @@ TEST_CASE("prove__single_key_mmap__mixed_batch__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -49809,7 +49809,7 @@ TEST_CASE("prove__single_key_mmap__large_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -49858,7 +49858,7 @@ TEST_CASE("prove__single_key_mmap__large_batch__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -50166,7 +50166,7 @@ TEST_CASE("prove__single_key_mmap__single_put_with_guards__success", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -50216,7 +50216,7 @@ TEST_CASE("prove__single_key_mmap__single_put_with_guards__success_nosync", "[pr
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -50478,7 +50478,7 @@ TEST_CASE("prove__single_key_mmap__conflicting_plan__before_any_io", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -50529,7 +50529,7 @@ TEST_CASE("prove__single_key_mmap__causality_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -50577,7 +50577,7 @@ TEST_CASE("prove__single_key_mmap__causality_overwrite__success_nosync", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -50879,7 +50879,7 @@ TEST_CASE("prove__single_key_mmap__causality_put_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -50927,7 +50927,7 @@ TEST_CASE("prove__single_key_mmap__causality_put_del__success_nosync", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -51229,7 +51229,7 @@ TEST_CASE("prove__single_key_mmap__causality_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -51277,7 +51277,7 @@ TEST_CASE("prove__single_key_mmap__causality_del_put__success_nosync", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -51908,7 +51908,7 @@ TEST_CASE("prove__single_key_mmap__causality_put_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -51957,7 +51957,7 @@ TEST_CASE("prove__single_key_mmap__causality_put_del_put__success_nosync", "[pro
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -52265,7 +52265,7 @@ TEST_CASE("prove__single_key_mmap__solo_causality_overwrite__success", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -52313,7 +52313,7 @@ TEST_CASE("prove__single_key_mmap__solo_causality_overwrite__success_nosync", "[
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -52615,7 +52615,7 @@ TEST_CASE("prove__single_key_mmap__solo_causality_put_del__success", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -52663,7 +52663,7 @@ TEST_CASE("prove__single_key_mmap__solo_causality_put_del__success_nosync", "[pr
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -52965,7 +52965,7 @@ TEST_CASE("prove__single_key_mmap__solo_causality_del_put__success", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -53013,7 +53013,7 @@ TEST_CASE("prove__single_key_mmap__solo_causality_del_put__success_nosync", "[pr
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -53315,7 +53315,7 @@ TEST_CASE("prove__single_key_mmap__solo_causality_put_del_put__success", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -53364,7 +53364,7 @@ TEST_CASE("prove__single_key_mmap__solo_causality_put_del_put__success_nosync", 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -53672,7 +53672,7 @@ TEST_CASE("prove__single_key_mmap__sequential_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -53719,7 +53719,7 @@ TEST_CASE("prove__single_key_mmap__sequential_overwrite__success__held_value", "
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -53774,7 +53774,7 @@ TEST_CASE("prove__single_key_mmap__sequential_overwrite__success__held_iter_span
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -53832,7 +53832,7 @@ TEST_CASE("prove__single_key_mmap__sequential_overwrite__success__held_riter_spa
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -53890,7 +53890,7 @@ TEST_CASE("prove__single_key_mmap__sequential_overwrite__success__held_snapshot"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -53948,7 +53948,7 @@ TEST_CASE("prove__single_key_mmap__sequential_overwrite__success__second_instanc
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -54009,7 +54009,7 @@ TEST_CASE("prove__single_key_mmap__sequential_overwrite__success_nosync", "[prov
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -55572,7 +55572,7 @@ TEST_CASE("prove__single_key_mmap__solo_sequential_overwrite__success", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -55619,7 +55619,7 @@ TEST_CASE("prove__single_key_mmap__solo_sequential_overwrite__success_nosync", "
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -55866,7 +55866,7 @@ TEST_CASE("prove__single_key_mmap__range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -55913,7 +55913,7 @@ TEST_CASE("prove__single_key_mmap__range_del__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -56160,7 +56160,7 @@ TEST_CASE("prove__single_key_mmap__range_del_then_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -56208,7 +56208,7 @@ TEST_CASE("prove__single_key_mmap__range_del_then_put__success_nosync", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -56510,7 +56510,7 @@ TEST_CASE("prove__single_key_mmap__put_then_range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -56558,7 +56558,7 @@ TEST_CASE("prove__single_key_mmap__put_then_range_del__success_nosync", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -56860,7 +56860,7 @@ TEST_CASE("prove__populated_db_mmap__single_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -56916,7 +56916,7 @@ TEST_CASE("prove__populated_db_mmap__single_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -57208,7 +57208,7 @@ TEST_CASE("prove__populated_db_mmap__single_delete__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -57264,7 +57264,7 @@ TEST_CASE("prove__populated_db_mmap__single_delete__success_nosync", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -57556,7 +57556,7 @@ TEST_CASE("prove__populated_db_mmap__multi_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -57613,7 +57613,7 @@ TEST_CASE("prove__populated_db_mmap__multi_put__success__held_value", "[prove]")
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -57678,7 +57678,7 @@ TEST_CASE("prove__populated_db_mmap__multi_put__success__held_iter_span", "[prov
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -57746,7 +57746,7 @@ TEST_CASE("prove__populated_db_mmap__multi_put__success__held_riter_span", "[pro
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -57814,7 +57814,7 @@ TEST_CASE("prove__populated_db_mmap__multi_put__success__held_snapshot", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -57882,7 +57882,7 @@ TEST_CASE("prove__populated_db_mmap__multi_put__success__second_instance", "[pro
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -57953,7 +57953,7 @@ TEST_CASE("prove__populated_db_mmap__multi_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -60199,7 +60199,7 @@ TEST_CASE("prove__populated_db_mmap__mixed_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -60256,7 +60256,7 @@ TEST_CASE("prove__populated_db_mmap__mixed_batch__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -60612,7 +60612,7 @@ TEST_CASE("prove__populated_db_mmap__large_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -60670,7 +60670,7 @@ TEST_CASE("prove__populated_db_mmap__large_batch__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -61032,7 +61032,7 @@ TEST_CASE("prove__populated_db_mmap__single_put_with_guards__success", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -61091,7 +61091,7 @@ TEST_CASE("prove__populated_db_mmap__single_put_with_guards__success_nosync", "[
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -61398,7 +61398,7 @@ TEST_CASE("prove__populated_db_mmap__conflicting_plan__before_any_io", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -61458,7 +61458,7 @@ TEST_CASE("prove__populated_db_mmap__causality_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -61515,7 +61515,7 @@ TEST_CASE("prove__populated_db_mmap__causality_overwrite__success_nosync", "[pro
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -61871,7 +61871,7 @@ TEST_CASE("prove__populated_db_mmap__causality_put_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -61928,7 +61928,7 @@ TEST_CASE("prove__populated_db_mmap__causality_put_del__success_nosync", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -62284,7 +62284,7 @@ TEST_CASE("prove__populated_db_mmap__causality_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -62341,7 +62341,7 @@ TEST_CASE("prove__populated_db_mmap__causality_del_put__success_nosync", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -63071,7 +63071,7 @@ TEST_CASE("prove__populated_db_mmap__causality_put_del_put__success", "[prove]")
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -63129,7 +63129,7 @@ TEST_CASE("prove__populated_db_mmap__causality_put_del_put__success_nosync", "[p
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -63491,7 +63491,7 @@ TEST_CASE("prove__populated_db_mmap__solo_causality_overwrite__success", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -63548,7 +63548,7 @@ TEST_CASE("prove__populated_db_mmap__solo_causality_overwrite__success_nosync", 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -63904,7 +63904,7 @@ TEST_CASE("prove__populated_db_mmap__solo_causality_put_del__success", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -63961,7 +63961,7 @@ TEST_CASE("prove__populated_db_mmap__solo_causality_put_del__success_nosync", "[
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -64317,7 +64317,7 @@ TEST_CASE("prove__populated_db_mmap__solo_causality_del_put__success", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -64374,7 +64374,7 @@ TEST_CASE("prove__populated_db_mmap__solo_causality_del_put__success_nosync", "[
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -64730,7 +64730,7 @@ TEST_CASE("prove__populated_db_mmap__solo_causality_put_del_put__success", "[pro
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -64788,7 +64788,7 @@ TEST_CASE("prove__populated_db_mmap__solo_causality_put_del_put__success_nosync"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -65150,7 +65150,7 @@ TEST_CASE("prove__populated_db_mmap__sequential_overwrite__success", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -65206,7 +65206,7 @@ TEST_CASE("prove__populated_db_mmap__sequential_overwrite__success__held_value",
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -65270,7 +65270,7 @@ TEST_CASE("prove__populated_db_mmap__sequential_overwrite__success__held_iter_sp
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -65337,7 +65337,7 @@ TEST_CASE("prove__populated_db_mmap__sequential_overwrite__success__held_riter_s
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -65404,7 +65404,7 @@ TEST_CASE("prove__populated_db_mmap__sequential_overwrite__success__held_snapsho
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -65471,7 +65471,7 @@ TEST_CASE("prove__populated_db_mmap__sequential_overwrite__success__second_insta
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -65541,7 +65541,7 @@ TEST_CASE("prove__populated_db_mmap__sequential_overwrite__success_nosync", "[pr
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -67329,7 +67329,7 @@ TEST_CASE("prove__populated_db_mmap__solo_sequential_overwrite__success", "[prov
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -67385,7 +67385,7 @@ TEST_CASE("prove__populated_db_mmap__solo_sequential_overwrite__success_nosync",
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -67677,7 +67677,7 @@ TEST_CASE("prove__populated_db_mmap__range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -67733,7 +67733,7 @@ TEST_CASE("prove__populated_db_mmap__range_del__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -68025,7 +68025,7 @@ TEST_CASE("prove__populated_db_mmap__range_del_then_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -68082,7 +68082,7 @@ TEST_CASE("prove__populated_db_mmap__range_del_then_put__success_nosync", "[prov
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -68438,7 +68438,7 @@ TEST_CASE("prove__populated_db_mmap__put_then_range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -68495,7 +68495,7 @@ TEST_CASE("prove__populated_db_mmap__put_then_range_del__success_nosync", "[prov
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
@@ -68851,7 +68851,7 @@ TEST_CASE("prove__rotation_threshold_mmap__single_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -68898,7 +68898,7 @@ TEST_CASE("prove__rotation_threshold_mmap__single_put__success_nosync", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -69245,7 +69245,7 @@ TEST_CASE("prove__rotation_threshold_mmap__single_delete__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -69292,7 +69292,7 @@ TEST_CASE("prove__rotation_threshold_mmap__single_delete__success_nosync", "[pro
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -69639,7 +69639,7 @@ TEST_CASE("prove__rotation_threshold_mmap__multi_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -69687,7 +69687,7 @@ TEST_CASE("prove__rotation_threshold_mmap__multi_put__success__held_value", "[pr
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -69743,7 +69743,7 @@ TEST_CASE("prove__rotation_threshold_mmap__multi_put__success__held_iter_span", 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -69802,7 +69802,7 @@ TEST_CASE("prove__rotation_threshold_mmap__multi_put__success__held_riter_span",
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -69861,7 +69861,7 @@ TEST_CASE("prove__rotation_threshold_mmap__multi_put__success__held_snapshot", "
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -69920,7 +69920,7 @@ TEST_CASE("prove__rotation_threshold_mmap__multi_put__success__second_instance",
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -69982,7 +69982,7 @@ TEST_CASE("prove__rotation_threshold_mmap__multi_put__success_nosync", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -72719,7 +72719,7 @@ TEST_CASE("prove__rotation_threshold_mmap__mixed_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -72767,7 +72767,7 @@ TEST_CASE("prove__rotation_threshold_mmap__mixed_batch__success_nosync", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -73171,7 +73171,7 @@ TEST_CASE("prove__rotation_threshold_mmap__large_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -73220,7 +73220,7 @@ TEST_CASE("prove__rotation_threshold_mmap__large_batch__success_nosync", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -73632,7 +73632,7 @@ TEST_CASE("prove__rotation_threshold_mmap__single_put_with_guards__success", "[p
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -73682,7 +73682,7 @@ TEST_CASE("prove__rotation_threshold_mmap__single_put_with_guards__success_nosyn
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -74050,7 +74050,7 @@ TEST_CASE("prove__rotation_threshold_mmap__conflicting_plan__before_any_io", "[p
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -74101,7 +74101,7 @@ TEST_CASE("prove__rotation_threshold_mmap__causality_overwrite__success", "[prov
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -74149,7 +74149,7 @@ TEST_CASE("prove__rotation_threshold_mmap__causality_overwrite__success_nosync",
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -74553,7 +74553,7 @@ TEST_CASE("prove__rotation_threshold_mmap__causality_put_del__success", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -74601,7 +74601,7 @@ TEST_CASE("prove__rotation_threshold_mmap__causality_put_del__success_nosync", "
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -75005,7 +75005,7 @@ TEST_CASE("prove__rotation_threshold_mmap__causality_del_put__success", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -75053,7 +75053,7 @@ TEST_CASE("prove__rotation_threshold_mmap__causality_del_put__success_nosync", "
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -75786,7 +75786,7 @@ TEST_CASE("prove__rotation_threshold_mmap__causality_put_del_put__success", "[pr
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -75835,7 +75835,7 @@ TEST_CASE("prove__rotation_threshold_mmap__causality_put_del_put__success_nosync
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -76247,7 +76247,7 @@ TEST_CASE("prove__rotation_threshold_mmap__solo_causality_overwrite__success", "
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -76295,7 +76295,7 @@ TEST_CASE("prove__rotation_threshold_mmap__solo_causality_overwrite__success_nos
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -76699,7 +76699,7 @@ TEST_CASE("prove__rotation_threshold_mmap__solo_causality_put_del__success", "[p
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -76747,7 +76747,7 @@ TEST_CASE("prove__rotation_threshold_mmap__solo_causality_put_del__success_nosyn
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -77151,7 +77151,7 @@ TEST_CASE("prove__rotation_threshold_mmap__solo_causality_del_put__success", "[p
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -77199,7 +77199,7 @@ TEST_CASE("prove__rotation_threshold_mmap__solo_causality_del_put__success_nosyn
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -77603,7 +77603,7 @@ TEST_CASE("prove__rotation_threshold_mmap__solo_causality_put_del_put__success",
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -77652,7 +77652,7 @@ TEST_CASE("prove__rotation_threshold_mmap__solo_causality_put_del_put__success_n
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -78064,7 +78064,7 @@ TEST_CASE("prove__rotation_threshold_mmap__sequential_overwrite__success", "[pro
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -78111,7 +78111,7 @@ TEST_CASE("prove__rotation_threshold_mmap__sequential_overwrite__success__held_v
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -78166,7 +78166,7 @@ TEST_CASE("prove__rotation_threshold_mmap__sequential_overwrite__success__held_i
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -78224,7 +78224,7 @@ TEST_CASE("prove__rotation_threshold_mmap__sequential_overwrite__success__held_r
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -78282,7 +78282,7 @@ TEST_CASE("prove__rotation_threshold_mmap__sequential_overwrite__success__held_s
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -78340,7 +78340,7 @@ TEST_CASE("prove__rotation_threshold_mmap__sequential_overwrite__success__second
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -78401,7 +78401,7 @@ TEST_CASE("prove__rotation_threshold_mmap__sequential_overwrite__success_nosync"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -80722,7 +80722,7 @@ TEST_CASE("prove__rotation_threshold_mmap__solo_sequential_overwrite__success", 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -80769,7 +80769,7 @@ TEST_CASE("prove__rotation_threshold_mmap__solo_sequential_overwrite__success_no
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -81116,7 +81116,7 @@ TEST_CASE("prove__rotation_threshold_mmap__range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -81163,7 +81163,7 @@ TEST_CASE("prove__rotation_threshold_mmap__range_del__success_nosync", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -81510,7 +81510,7 @@ TEST_CASE("prove__rotation_threshold_mmap__range_del_then_put__success", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -81558,7 +81558,7 @@ TEST_CASE("prove__rotation_threshold_mmap__range_del_then_put__success_nosync", 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -81962,7 +81962,7 @@ TEST_CASE("prove__rotation_threshold_mmap__put_then_range_del__success", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -82010,7 +82010,7 @@ TEST_CASE("prove__rotation_threshold_mmap__put_then_range_del__success_nosync", 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
@@ -82414,7 +82414,7 @@ TEST_CASE("prove__single_key_pool__single_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -82461,7 +82461,7 @@ TEST_CASE("prove__single_key_pool__single_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -82708,7 +82708,7 @@ TEST_CASE("prove__single_key_pool__single_delete__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -82755,7 +82755,7 @@ TEST_CASE("prove__single_key_pool__single_delete__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -83002,7 +83002,7 @@ TEST_CASE("prove__single_key_pool__multi_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -83050,7 +83050,7 @@ TEST_CASE("prove__single_key_pool__multi_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -85017,7 +85017,7 @@ TEST_CASE("prove__single_key_pool__mixed_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -85065,7 +85065,7 @@ TEST_CASE("prove__single_key_pool__mixed_batch__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -85367,7 +85367,7 @@ TEST_CASE("prove__single_key_pool__large_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -85416,7 +85416,7 @@ TEST_CASE("prove__single_key_pool__large_batch__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -85724,7 +85724,7 @@ TEST_CASE("prove__single_key_pool__single_put_with_guards__success", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -85774,7 +85774,7 @@ TEST_CASE("prove__single_key_pool__single_put_with_guards__success_nosync", "[pr
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -86036,7 +86036,7 @@ TEST_CASE("prove__single_key_pool__conflicting_plan__before_any_io", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -86087,7 +86087,7 @@ TEST_CASE("prove__single_key_pool__causality_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -86135,7 +86135,7 @@ TEST_CASE("prove__single_key_pool__causality_overwrite__success_nosync", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -86437,7 +86437,7 @@ TEST_CASE("prove__single_key_pool__causality_put_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -86485,7 +86485,7 @@ TEST_CASE("prove__single_key_pool__causality_put_del__success_nosync", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -86787,7 +86787,7 @@ TEST_CASE("prove__single_key_pool__causality_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -86835,7 +86835,7 @@ TEST_CASE("prove__single_key_pool__causality_del_put__success_nosync", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -87466,7 +87466,7 @@ TEST_CASE("prove__single_key_pool__causality_put_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -87515,7 +87515,7 @@ TEST_CASE("prove__single_key_pool__causality_put_del_put__success_nosync", "[pro
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -87823,7 +87823,7 @@ TEST_CASE("prove__single_key_pool__solo_causality_overwrite__success", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -87871,7 +87871,7 @@ TEST_CASE("prove__single_key_pool__solo_causality_overwrite__success_nosync", "[
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -88173,7 +88173,7 @@ TEST_CASE("prove__single_key_pool__solo_causality_put_del__success", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -88221,7 +88221,7 @@ TEST_CASE("prove__single_key_pool__solo_causality_put_del__success_nosync", "[pr
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -88523,7 +88523,7 @@ TEST_CASE("prove__single_key_pool__solo_causality_del_put__success", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -88571,7 +88571,7 @@ TEST_CASE("prove__single_key_pool__solo_causality_del_put__success_nosync", "[pr
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -88873,7 +88873,7 @@ TEST_CASE("prove__single_key_pool__solo_causality_put_del_put__success", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -88922,7 +88922,7 @@ TEST_CASE("prove__single_key_pool__solo_causality_put_del_put__success_nosync", 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -89230,7 +89230,7 @@ TEST_CASE("prove__single_key_pool__sequential_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -89277,7 +89277,7 @@ TEST_CASE("prove__single_key_pool__sequential_overwrite__success_nosync", "[prov
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -90840,7 +90840,7 @@ TEST_CASE("prove__single_key_pool__solo_sequential_overwrite__success", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -90887,7 +90887,7 @@ TEST_CASE("prove__single_key_pool__solo_sequential_overwrite__success_nosync", "
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -91134,7 +91134,7 @@ TEST_CASE("prove__single_key_pool__range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -91181,7 +91181,7 @@ TEST_CASE("prove__single_key_pool__range_del__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -91428,7 +91428,7 @@ TEST_CASE("prove__single_key_pool__range_del_then_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -91476,7 +91476,7 @@ TEST_CASE("prove__single_key_pool__range_del_then_put__success_nosync", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -91778,7 +91778,7 @@ TEST_CASE("prove__single_key_pool__put_then_range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -91826,7 +91826,7 @@ TEST_CASE("prove__single_key_pool__put_then_range_del__success_nosync", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -92128,7 +92128,7 @@ TEST_CASE("prove__populated_db_pool__single_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -92184,7 +92184,7 @@ TEST_CASE("prove__populated_db_pool__single_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -92476,7 +92476,7 @@ TEST_CASE("prove__populated_db_pool__single_delete__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -92532,7 +92532,7 @@ TEST_CASE("prove__populated_db_pool__single_delete__success_nosync", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -92824,7 +92824,7 @@ TEST_CASE("prove__populated_db_pool__multi_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -92881,7 +92881,7 @@ TEST_CASE("prove__populated_db_pool__multi_put__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -95127,7 +95127,7 @@ TEST_CASE("prove__populated_db_pool__mixed_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -95184,7 +95184,7 @@ TEST_CASE("prove__populated_db_pool__mixed_batch__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -95540,7 +95540,7 @@ TEST_CASE("prove__populated_db_pool__large_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -95598,7 +95598,7 @@ TEST_CASE("prove__populated_db_pool__large_batch__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -95960,7 +95960,7 @@ TEST_CASE("prove__populated_db_pool__single_put_with_guards__success", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -96019,7 +96019,7 @@ TEST_CASE("prove__populated_db_pool__single_put_with_guards__success_nosync", "[
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -96326,7 +96326,7 @@ TEST_CASE("prove__populated_db_pool__conflicting_plan__before_any_io", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -96386,7 +96386,7 @@ TEST_CASE("prove__populated_db_pool__causality_overwrite__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -96443,7 +96443,7 @@ TEST_CASE("prove__populated_db_pool__causality_overwrite__success_nosync", "[pro
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -96799,7 +96799,7 @@ TEST_CASE("prove__populated_db_pool__causality_put_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -96856,7 +96856,7 @@ TEST_CASE("prove__populated_db_pool__causality_put_del__success_nosync", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -97212,7 +97212,7 @@ TEST_CASE("prove__populated_db_pool__causality_del_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -97269,7 +97269,7 @@ TEST_CASE("prove__populated_db_pool__causality_del_put__success_nosync", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -97999,7 +97999,7 @@ TEST_CASE("prove__populated_db_pool__causality_put_del_put__success", "[prove]")
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -98057,7 +98057,7 @@ TEST_CASE("prove__populated_db_pool__causality_put_del_put__success_nosync", "[p
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -98419,7 +98419,7 @@ TEST_CASE("prove__populated_db_pool__solo_causality_overwrite__success", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -98476,7 +98476,7 @@ TEST_CASE("prove__populated_db_pool__solo_causality_overwrite__success_nosync", 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -98832,7 +98832,7 @@ TEST_CASE("prove__populated_db_pool__solo_causality_put_del__success", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -98889,7 +98889,7 @@ TEST_CASE("prove__populated_db_pool__solo_causality_put_del__success_nosync", "[
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -99245,7 +99245,7 @@ TEST_CASE("prove__populated_db_pool__solo_causality_del_put__success", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -99302,7 +99302,7 @@ TEST_CASE("prove__populated_db_pool__solo_causality_del_put__success_nosync", "[
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -99658,7 +99658,7 @@ TEST_CASE("prove__populated_db_pool__solo_causality_put_del_put__success", "[pro
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -99716,7 +99716,7 @@ TEST_CASE("prove__populated_db_pool__solo_causality_put_del_put__success_nosync"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -100078,7 +100078,7 @@ TEST_CASE("prove__populated_db_pool__sequential_overwrite__success", "[prove]") 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -100134,7 +100134,7 @@ TEST_CASE("prove__populated_db_pool__sequential_overwrite__success_nosync", "[pr
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -101922,7 +101922,7 @@ TEST_CASE("prove__populated_db_pool__solo_sequential_overwrite__success", "[prov
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -101978,7 +101978,7 @@ TEST_CASE("prove__populated_db_pool__solo_sequential_overwrite__success_nosync",
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -102270,7 +102270,7 @@ TEST_CASE("prove__populated_db_pool__range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -102326,7 +102326,7 @@ TEST_CASE("prove__populated_db_pool__range_del__success_nosync", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -102618,7 +102618,7 @@ TEST_CASE("prove__populated_db_pool__range_del_then_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -102675,7 +102675,7 @@ TEST_CASE("prove__populated_db_pool__range_del_then_put__success_nosync", "[prov
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -103031,7 +103031,7 @@ TEST_CASE("prove__populated_db_pool__put_then_range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -103088,7 +103088,7 @@ TEST_CASE("prove__populated_db_pool__put_then_range_del__success_nosync", "[prov
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -103444,7 +103444,7 @@ TEST_CASE("prove__rotation_threshold_pool__single_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -103491,7 +103491,7 @@ TEST_CASE("prove__rotation_threshold_pool__single_put__success_nosync", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -103838,7 +103838,7 @@ TEST_CASE("prove__rotation_threshold_pool__single_delete__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -103885,7 +103885,7 @@ TEST_CASE("prove__rotation_threshold_pool__single_delete__success_nosync", "[pro
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -104232,7 +104232,7 @@ TEST_CASE("prove__rotation_threshold_pool__multi_put__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -104280,7 +104280,7 @@ TEST_CASE("prove__rotation_threshold_pool__multi_put__success_nosync", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -107017,7 +107017,7 @@ TEST_CASE("prove__rotation_threshold_pool__mixed_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -107065,7 +107065,7 @@ TEST_CASE("prove__rotation_threshold_pool__mixed_batch__success_nosync", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -107469,7 +107469,7 @@ TEST_CASE("prove__rotation_threshold_pool__large_batch__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -107518,7 +107518,7 @@ TEST_CASE("prove__rotation_threshold_pool__large_batch__success_nosync", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -107930,7 +107930,7 @@ TEST_CASE("prove__rotation_threshold_pool__single_put_with_guards__success", "[p
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -107980,7 +107980,7 @@ TEST_CASE("prove__rotation_threshold_pool__single_put_with_guards__success_nosyn
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -108348,7 +108348,7 @@ TEST_CASE("prove__rotation_threshold_pool__conflicting_plan__before_any_io", "[p
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -108399,7 +108399,7 @@ TEST_CASE("prove__rotation_threshold_pool__causality_overwrite__success", "[prov
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -108447,7 +108447,7 @@ TEST_CASE("prove__rotation_threshold_pool__causality_overwrite__success_nosync",
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -108851,7 +108851,7 @@ TEST_CASE("prove__rotation_threshold_pool__causality_put_del__success", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -108899,7 +108899,7 @@ TEST_CASE("prove__rotation_threshold_pool__causality_put_del__success_nosync", "
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -109303,7 +109303,7 @@ TEST_CASE("prove__rotation_threshold_pool__causality_del_put__success", "[prove]
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -109351,7 +109351,7 @@ TEST_CASE("prove__rotation_threshold_pool__causality_del_put__success_nosync", "
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -110084,7 +110084,7 @@ TEST_CASE("prove__rotation_threshold_pool__causality_put_del_put__success", "[pr
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -110133,7 +110133,7 @@ TEST_CASE("prove__rotation_threshold_pool__causality_put_del_put__success_nosync
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -110545,7 +110545,7 @@ TEST_CASE("prove__rotation_threshold_pool__solo_causality_overwrite__success", "
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -110593,7 +110593,7 @@ TEST_CASE("prove__rotation_threshold_pool__solo_causality_overwrite__success_nos
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -110997,7 +110997,7 @@ TEST_CASE("prove__rotation_threshold_pool__solo_causality_put_del__success", "[p
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -111045,7 +111045,7 @@ TEST_CASE("prove__rotation_threshold_pool__solo_causality_put_del__success_nosyn
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -111449,7 +111449,7 @@ TEST_CASE("prove__rotation_threshold_pool__solo_causality_del_put__success", "[p
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -111497,7 +111497,7 @@ TEST_CASE("prove__rotation_threshold_pool__solo_causality_del_put__success_nosyn
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -111901,7 +111901,7 @@ TEST_CASE("prove__rotation_threshold_pool__solo_causality_put_del_put__success",
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -111950,7 +111950,7 @@ TEST_CASE("prove__rotation_threshold_pool__solo_causality_put_del_put__success_n
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -112362,7 +112362,7 @@ TEST_CASE("prove__rotation_threshold_pool__sequential_overwrite__success", "[pro
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -112409,7 +112409,7 @@ TEST_CASE("prove__rotation_threshold_pool__sequential_overwrite__success_nosync"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -114730,7 +114730,7 @@ TEST_CASE("prove__rotation_threshold_pool__solo_sequential_overwrite__success", 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -114777,7 +114777,7 @@ TEST_CASE("prove__rotation_threshold_pool__solo_sequential_overwrite__success_no
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -115124,7 +115124,7 @@ TEST_CASE("prove__rotation_threshold_pool__range_del__success", "[prove]") {
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -115171,7 +115171,7 @@ TEST_CASE("prove__rotation_threshold_pool__range_del__success_nosync", "[prove]"
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -115518,7 +115518,7 @@ TEST_CASE("prove__rotation_threshold_pool__range_del_then_put__success", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -115566,7 +115566,7 @@ TEST_CASE("prove__rotation_threshold_pool__range_del_then_put__success_nosync", 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -115970,7 +115970,7 @@ TEST_CASE("prove__rotation_threshold_pool__put_then_range_del__success", "[prove
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -116018,7 +116018,7 @@ TEST_CASE("prove__rotation_threshold_pool__put_then_range_del__success_nosync", 
         .degraded = false,
     };
   Baseline before;
-  std::optional<bytecask::CommitResult> cr;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
   std::uint64_t watermark = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});

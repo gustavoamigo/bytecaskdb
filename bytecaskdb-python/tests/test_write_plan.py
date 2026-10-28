@@ -89,7 +89,7 @@ def test_ensure_range_unchanged(db):
 
 def test_ensure_unchanged_without_snapshot_raises(db):
     plan = bc.WritePlan()
-    with pytest.raises(ValueError, match="requires a snapshot"):
+    with pytest.raises(ValueError, match="requires a read sequence"):
         plan.ensure_unchanged(b"key")
 
 

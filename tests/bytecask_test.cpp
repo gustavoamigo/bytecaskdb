@@ -4,6 +4,7 @@
 // ByteCaskDB — integration and model-based correctness tests
 
 #include <algorithm>
+#include <expected>
 #include <atomic>
 #include <cstdlib>
 #include <concepts>
@@ -6384,8 +6385,8 @@ TEST_CASE("apply_batch group commit: second slot conflicts on existing key",
     db.test_write_group().wait_for_queue_size(2);
   };
 
-  std::optional<bytecask::CommitResult> resultA;
-  std::optional<bytecask::CommitResult> resultB;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> resultA;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> resultB;
 
   // Thread A becomes leader, blocks in hook until thread B enqueues.
   std::thread tA([&] {
@@ -6442,8 +6443,8 @@ TEST_CASE("apply_batch group commit: second slot conflicts on new key",
     db.test_write_group().wait_for_queue_size(2);
   };
 
-  std::optional<bytecask::CommitResult> resultA;
-  std::optional<bytecask::CommitResult> resultB;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> resultA;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> resultB;
 
   std::thread tA([&] {
     resultA = db.apply_batch({.sync = false}, std::move(planA));
@@ -7846,7 +7847,10 @@ TEST_CASE("resume() with live snapshot on degraded DB",
 // ---------------------------------------------------------------------------
 // These test TransientEngineState::validate_preconditions in isolation —
 // no DB, no disk I/O. We construct EngineState directly, call .transient(),
-// and verify each guard path.
+// and verify each guard path against the read sequence a plan carries
+// (docs/bytecask_design.md, "Snapshots and conditional writes"). A head
+// entry above the snapshot's sequence is a change; a key absent from the
+// head changed only if the delete log holds its removal.
 
 namespace {
 
@@ -7869,10 +7873,26 @@ auto make_state(
   return s;
 }
 
+// A snapshot at sequence 15: every entry these tests give a snapshot is at
+// or below it, and every change a head makes since is above it.
+constexpr std::uint64_t kSnapSeq = 15;
+
 auto make_snapshot(
     std::initializer_list<std::pair<std::string, bytecask::KeyDirEntry>> entries)
     -> bytecask::Snapshot {
-  return bytecask::Snapshot::from_state(make_state(entries));
+  auto s = make_state(entries);
+  s->next_seq = kSnapSeq + 1;
+  return bytecask::Snapshot::from_state(std::move(s));
+}
+
+using Verdict = bytecask::TransientEngineState::Verdict;
+
+// A removal the head made at seq.
+void removed(bytecask::DeleteLog &log, const std::string &key,
+             std::uint64_t seq) {
+  const auto k = to_bytes(key);
+  const bytecask::KeyRemoval r{{k.begin(), k.end()}, seq};
+  log.record_all(std::span{&r, 1});
 }
 
 } // namespace
@@ -7883,49 +7903,54 @@ TEST_CASE("validate_preconditions: MustExist passes when key present",
           "[validate_preconditions]") {
   auto state = make_state({{"k", kde(10, 0, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan;
   plan.ensure_present(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: MustExist fails when key absent",
           "[validate_preconditions]") {
   auto state = make_state({});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan;
   plan.ensure_present(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: MustBeAbsent passes when key absent",
           "[validate_preconditions]") {
   auto state = make_state({});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan;
   plan.ensure_absent(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: MustBeAbsent fails when key present",
           "[validate_preconditions]") {
   auto state = make_state({{"k", kde(10, 0, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan;
   plan.ensure_absent(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: None precondition always passes",
           "[validate_preconditions]") {
   auto state = make_state({{"k", kde(10, 0, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan;
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
 }
 
 // --- MustBeUnchanged (requires snapshot) ---
@@ -7935,10 +7960,11 @@ TEST_CASE("validate_preconditions: MustBeUnchanged passes when key unchanged",
   auto snap = make_snapshot({{"k", kde(10, 0, 1, 5)}});
   auto state = make_state({{"k", kde(10, 0, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_unchanged(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: MustBeUnchanged fails when key modified",
@@ -7946,10 +7972,11 @@ TEST_CASE("validate_preconditions: MustBeUnchanged fails when key modified",
   auto snap = make_snapshot({{"k", kde(10, 0, 1, 5)}});
   auto state = make_state({{"k", kde(20, 100, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_unchanged(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: MustBeUnchanged fails when key deleted",
@@ -7957,10 +7984,12 @@ TEST_CASE("validate_preconditions: MustBeUnchanged fails when key deleted",
   auto snap = make_snapshot({{"k", kde(10, 0, 1, 5)}});
   auto state = make_state({});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  removed(deletes, "k", 20);
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_unchanged(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: MustBeUnchanged passes when key absent in both",
@@ -7968,21 +7997,23 @@ TEST_CASE("validate_preconditions: MustBeUnchanged passes when key absent in bot
   auto snap = make_snapshot({});
   auto state = make_state({});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_unchanged(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: MustBeUnchanged fails when key appeared",
           "[validate_preconditions]") {
   auto snap = make_snapshot({});
-  auto state = make_state({{"k", kde(15, 0, 1, 5)}});
+  auto state = make_state({{"k", kde(20, 0, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_unchanged(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
 }
 
 // --- Range guards ---
@@ -7992,10 +8023,11 @@ TEST_CASE("validate_preconditions: range guard passes when range unchanged",
   auto snap = make_snapshot({{"a", kde(5, 0, 1, 3)}, {"b", kde(10, 0, 1, 5)}, {"d", kde(15, 0, 1, 4)}});
   auto state = make_state({{"a", kde(5, 0, 1, 3)}, {"b", kde(10, 0, 1, 5)}, {"d", kde(15, 0, 1, 4)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
   plan.put(to_bytes("x"), to_bytes("new"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: range guard fails when key modified in range",
@@ -8003,10 +8035,11 @@ TEST_CASE("validate_preconditions: range guard fails when key modified in range"
   auto snap = make_snapshot({{"b", kde(10, 0, 1, 5)}});
   auto state = make_state({{"b", kde(20, 100, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
   plan.put(to_bytes("x"), to_bytes("new"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: range guard fails when key inserted in range",
@@ -8014,10 +8047,11 @@ TEST_CASE("validate_preconditions: range guard fails when key inserted in range"
   auto snap = make_snapshot({});
   auto state = make_state({{"c", kde(20, 0, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
   plan.put(to_bytes("x"), to_bytes("new"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: range guard fails when key deleted in range",
@@ -8025,10 +8059,12 @@ TEST_CASE("validate_preconditions: range guard fails when key deleted in range",
   auto snap = make_snapshot({{"c", kde(10, 0, 1, 5)}});
   auto state = make_state({});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  removed(deletes, "c", 20);
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
   plan.put(to_bytes("x"), to_bytes("new"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: range guard ignores keys outside range",
@@ -8036,10 +8072,11 @@ TEST_CASE("validate_preconditions: range guard ignores keys outside range",
   auto snap = make_snapshot({{"a", kde(5, 0, 1, 3)}, {"b", kde(10, 0, 1, 5)}});
   auto state = make_state({{"a", kde(50, 0, 1, 3)}, {"b", kde(10, 0, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
   plan.put(to_bytes("x"), to_bytes("new"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
 }
 
 // --- Implicit W-W conflict detection (snapshot present) ---
@@ -8049,9 +8086,10 @@ TEST_CASE("validate_preconditions: W-W passes when write key unchanged",
   auto snap = make_snapshot({{"k", kde(10, 0, 1, 5)}});
   auto state = make_state({{"k", kde(10, 0, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan{std::move(snap)};
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: W-W fails when write key modified",
@@ -8059,19 +8097,21 @@ TEST_CASE("validate_preconditions: W-W fails when write key modified",
   auto snap = make_snapshot({{"k", kde(10, 0, 1, 5)}});
   auto state = make_state({{"k", kde(20, 100, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan{std::move(snap)};
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: W-W fails when write key appeared",
           "[validate_preconditions]") {
   auto snap = make_snapshot({});
-  auto state = make_state({{"k", kde(15, 0, 1, 5)}});
+  auto state = make_state({{"k", kde(20, 0, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan{std::move(snap)};
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: W-W fails when write key deleted",
@@ -8079,9 +8119,11 @@ TEST_CASE("validate_preconditions: W-W fails when write key deleted",
   auto snap = make_snapshot({{"k", kde(10, 0, 1, 5)}});
   auto state = make_state({});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  removed(deletes, "k", 20);
   bytecask::WritePlan plan{std::move(snap)};
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: W-W passes for new key absent in both",
@@ -8089,9 +8131,10 @@ TEST_CASE("validate_preconditions: W-W passes for new key absent in both",
   auto snap = make_snapshot({});
   auto state = make_state({});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan{std::move(snap)};
   plan.put(to_bytes("new_key"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: W-W skips guard-only keys",
@@ -8101,10 +8144,11 @@ TEST_CASE("validate_preconditions: W-W skips guard-only keys",
   auto snap = make_snapshot({{"g", kde(10, 0, 1, 5)}, {"k", kde(10, 0, 1, 5)}});
   auto state = make_state({{"g", kde(20, 100, 1, 3)}, {"k", kde(10, 0, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_present(to_bytes("g"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
 }
 
 // --- Combined scenarios ---
@@ -8114,11 +8158,12 @@ TEST_CASE("validate_preconditions: multiple guards all pass",
   auto snap = make_snapshot({{"a", kde(5, 0, 1, 3)}, {"b", kde(10, 0, 1, 5)}});
   auto state = make_state({{"a", kde(5, 0, 1, 3)}, {"b", kde(10, 0, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_present(to_bytes("a"));
   plan.ensure_unchanged(to_bytes("b"));
   plan.put(to_bytes("a"), to_bytes("new_a"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: one failing guard rejects plan",
@@ -8126,11 +8171,12 @@ TEST_CASE("validate_preconditions: one failing guard rejects plan",
   auto snap = make_snapshot({{"a", kde(5, 0, 1, 3)}, {"b", kde(10, 0, 1, 5)}});
   auto state = make_state({{"a", kde(5, 0, 1, 3)}, {"b", kde(20, 100, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan{std::move(snap)};
   plan.ensure_present(to_bytes("a"));
   plan.ensure_unchanged(to_bytes("b"));
   plan.put(to_bytes("a"), to_bytes("new_a"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: del with snapshot triggers W-W check",
@@ -8138,18 +8184,81 @@ TEST_CASE("validate_preconditions: del with snapshot triggers W-W check",
   auto snap = make_snapshot({{"k", kde(10, 0, 1, 5)}});
   auto state = make_state({{"k", kde(20, 100, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan{std::move(snap)};
   plan.del(to_bytes("k"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: no snapshot skips W-W checks",
           "[validate_preconditions]") {
   auto state = make_state({{"k", kde(20, 0, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan;
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
+}
+
+TEST_CASE("validate_preconditions: a removal at or below the read sequence "
+          "is not a change",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({});
+  auto state = make_state({});
+  auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  removed(deletes, "k", kSnapSeq);
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_unchanged(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
+}
+
+TEST_CASE("validate_preconditions: a key written and removed again since the "
+          "read sequence conflicts",
+          "[validate_preconditions]") {
+  // Absent from both states, but a write since touched it: refused, though
+  // the snapshot and the head agree (CONTRACT.md, "Isolation is what the
+  // plan guards").
+  auto snap = make_snapshot({});
+  auto state = make_state({});
+  auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  removed(deletes, "k", 20);
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
+}
+
+TEST_CASE("validate_preconditions: a read sequence below the delete log's "
+          "horizon is too old",
+          "[validate_preconditions]") {
+  auto state = make_state({{"k", kde(10, 0, 1, 5)}});
+  auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  deletes.reset(kSnapSeq + 1);
+  bytecask::WritePlan plan{kSnapSeq};
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::TooOld);
+  bytecask::WritePlan at_horizon{kSnapSeq + 1};
+  at_horizon.put(to_bytes("k"), to_bytes("v1"));
+  CHECK(t.validate_preconditions(at_horizon, deletes) == Verdict::Holds);
+}
+
+TEST_CASE("validate_preconditions: a removal after the state checked is not "
+          "part of it",
+          "[validate_preconditions]") {
+  // The published state is checked with the head's log: a removal at or
+  // above its next sequence is a later state's.
+  auto snap = make_snapshot({});
+  auto state = make_state({});  // next_seq 100
+  auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  removed(deletes, "k", 100);
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_unchanged(to_bytes("k"));
+  plan.ensure_range_unchanged(to_bytes("a"), to_bytes("z"));
+  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
 }
 
 // ---------------------------------------------------------------------------
@@ -9359,6 +9468,146 @@ TEST_CASE("CommitResult apply_batch conflict returns nullopt",
 }
 
 // ---------------------------------------------------------------------------
+// Plans checked by read sequence (CONTRACT.md, "A plan is checked by its
+// read sequence" and "A plan read too long ago is refused as TooOld").
+// ---------------------------------------------------------------------------
+TEST_CASE("read sequence: a snapshot's sequence is the last write it sees",
+          "[apply_batch][read_sequence]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  const auto r = db.put({}, to_bytes("k"), to_bytes("v"));
+  CHECK(db.snapshot().sequence() == r.sequence);
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("a"), to_bytes("1"));
+  plan.put(to_bytes("b"), to_bytes("2"));
+  const auto rb = db.apply_batch({}, std::move(plan));
+  REQUIRE(rb.has_value());
+  CHECK(db.snapshot().sequence() == rb->sequence);
+}
+
+TEST_CASE("read sequence: a plan built from a bare sequence is checked "
+          "without the snapshot",
+          "[apply_batch][read_sequence]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+  db.put({}, to_bytes("gone"), to_bytes("v0"));
+  std::uint64_t read_seq = 0;
+  {
+    auto snap = db.snapshot();
+    read_seq = snap.sequence();
+  }  // the snapshot is gone; the plan carries a number
+
+  SECTION("nothing it touches changed: commits") {
+    db.put({}, to_bytes("other"), to_bytes("x"));
+    bytecask::WritePlan plan{read_seq};
+    plan.ensure_unchanged(to_bytes("gone"));
+    plan.ensure_range_unchanged(to_bytes("j"), to_bytes("l"));
+    plan.put(to_bytes("k"), to_bytes("v1"));
+    REQUIRE(db.apply_batch({}, std::move(plan)).has_value());
+    CHECK(to_string(*get_val(db, to_bytes("k"))) == "v1");
+  }
+  SECTION("a written key changed: conflict") {
+    db.put({}, to_bytes("k"), to_bytes("v1"));
+    bytecask::WritePlan plan{read_seq};
+    plan.put(to_bytes("k"), to_bytes("v2"));
+    const auto r = db.apply_batch({}, std::move(plan));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == bytecask::PlanRefusal::Conflict);
+  }
+  SECTION("a guarded key was deleted: conflict") {
+    (void)db.del({}, to_bytes("gone"));
+    bytecask::WritePlan plan{read_seq};
+    plan.ensure_unchanged(to_bytes("gone"));
+    plan.put(to_bytes("k"), to_bytes("v1"));
+    const auto r = db.apply_batch({}, std::move(plan));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == bytecask::PlanRefusal::Conflict);
+  }
+  SECTION("a key in a guarded range was deleted by a range delete: conflict") {
+    db.del_range({}, to_bytes("g"), to_bytes("h"));
+    bytecask::WritePlan plan{read_seq};
+    plan.ensure_range_unchanged(to_bytes("a"), to_bytes("z"));
+    plan.put(to_bytes("other"), to_bytes("y"));
+    const auto r = db.apply_batch({}, std::move(plan));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == bytecask::PlanRefusal::Conflict);
+  }
+}
+
+TEST_CASE("read sequence: a sequence past the latest throws",
+          "[apply_batch][read_sequence]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+  bytecask::WritePlan plan{db.snapshot().sequence() + 1};
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK_THROWS_AS(db.apply_batch({}, std::move(plan)), std::invalid_argument);
+  CHECK(to_string(*get_val(db, to_bytes("k"))) == "v0");
+}
+
+TEST_CASE("read sequence: a plan read too long ago is refused as TooOld",
+          "[apply_batch][read_sequence]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+
+  SECTION("read before a reopen") {
+    std::uint64_t read_seq = 0;
+    {
+      auto db = bytecask::DB::open(dir);
+      db.put({}, to_bytes("k"), to_bytes("v0"));
+      read_seq = db.snapshot().sequence();
+      db.put({}, to_bytes("k"), to_bytes("v1"));
+      db.close();
+    }
+    auto db = bytecask::DB::open(dir);
+    bytecask::WritePlan plan{read_seq};
+    plan.put(to_bytes("k"), to_bytes("v2"));
+    const auto r = db.apply_batch({}, std::move(plan));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == bytecask::PlanRefusal::TooOld);
+    // One read at the recovered state is not too old.
+    bytecask::WritePlan fresh{db.snapshot().sequence()};
+    fresh.put(to_bytes("k"), to_bytes("v2"));
+    CHECK(db.apply_batch({}, std::move(fresh)).has_value());
+  }
+  SECTION("more deletes since than the log holds") {
+    auto db = bytecask::DB::open(dir, {.max_delete_log_bytes = 512});
+    db.put({}, to_bytes("k"), to_bytes("v0"));
+    const auto read_seq = db.snapshot().sequence();
+    for (int i = 0; i < 64; ++i) {
+      const auto key = std::format("d{:03}", i);
+      db.put({}, to_bytes(key), to_bytes("x"));
+      (void)db.del({}, to_bytes(key));
+    }
+    bytecask::WritePlan plan{read_seq};
+    plan.put(to_bytes("k"), to_bytes("v1"));
+    const auto r = db.apply_batch({}, std::move(plan));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == bytecask::PlanRefusal::TooOld);
+    CHECK(to_string(*get_val(db, to_bytes("k"))) == "v0");
+  }
+  SECTION("no log at all: any delete since makes it too old") {
+    auto db = bytecask::DB::open(dir, {.max_delete_log_bytes = 0});
+    db.put({}, to_bytes("k"), to_bytes("v0"));
+    db.put({}, to_bytes("d"), to_bytes("x"));
+    const auto before = db.snapshot().sequence();
+    {
+      bytecask::WritePlan plan{before};
+      plan.put(to_bytes("k"), to_bytes("v1"));
+      CHECK(db.apply_batch({}, std::move(plan)).has_value());
+    }
+    const auto read_seq = db.snapshot().sequence();
+    (void)db.del({}, to_bytes("d"));
+    bytecask::WritePlan plan{read_seq};
+    plan.put(to_bytes("k"), to_bytes("v2"));
+    const auto r = db.apply_batch({}, std::move(plan));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == bytecask::PlanRefusal::TooOld);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // CommitResult: empty plan commits as a no-op — {sequence = 0, durable = true}
 // ---------------------------------------------------------------------------
 TEST_CASE("CommitResult empty plan returns durable zero sequence",
@@ -9435,8 +9684,8 @@ TEST_CASE("CommitResult nosync writer coalesced with sync writer is durable",
     db.test_write_group().wait_for_queue_size(2);
   };
 
-  std::optional<bytecask::CommitResult> nosync_result;
-  std::optional<bytecask::CommitResult> sync_result;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> nosync_result;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> sync_result;
 
   // Thread A becomes leader with a nosync write, blocks until B enqueues.
   std::thread tA([&] {
@@ -13166,7 +13415,7 @@ TEST_CASE("pipeline: a sync-only write joins group commit behind an "
   db.test_before_flush_sync_ = gate.hook();
 
   std::optional<bytecask::CommitResult> ra;
-  std::optional<bytecask::CommitResult> rs;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> rs;
   std::thread ta([&] { ra = db.put({.sync = true}, to_bytes("k1"), to_bytes("v1")); });
   gate.wait_in_flush();
 
@@ -13244,7 +13493,7 @@ TEST_CASE("pipeline: a sync-only write in the same batch as a rotation is "
   };
 
   std::optional<bytecask::CommitResult> rbig;
-  std::optional<bytecask::CommitResult> rsync;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> rsync;
   std::thread tbig([&] {
     rbig = db.put({.sync = true}, to_bytes("big"), to_bytes(std::string(kRotatingValueBytes, 'x')));
   });
@@ -13296,7 +13545,7 @@ TEST_CASE("pipeline: concurrent sync-only writes share one fdatasync",
   wait_until([&] { return blocked_count(db) >= 1; });
 
   constexpr int kSyncOnly = 3;
-  std::vector<std::optional<bytecask::CommitResult>> rs(kSyncOnly);
+  std::vector<std::expected<bytecask::CommitResult, bytecask::PlanRefusal>> rs(kSyncOnly);
   std::vector<std::thread> ts;
   for (int i = 0; i < kSyncOnly; ++i) {
     ts.emplace_back([&, i] {
@@ -13579,7 +13828,7 @@ TEST_CASE("pipeline: snapshot conflict is detected against a write that is "
   // published: until then no snapshot can see what the plan lost to, and a
   // retry would lose the same way for the length of the flush.
   std::atomic<bool> b_returned{false};
-  std::optional<bytecask::CommitResult> rb;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> rb;
   std::thread tb([&] {
     bytecask::WritePlan plan{std::move(snap)};
     plan.put(to_bytes("a"), to_bytes("fromB"));
@@ -13869,7 +14118,7 @@ TEST_CASE("location tokens: plans checked and applied by location commit and "
         } else if (kind < 9) {
           pa->del(to_bytes(k));
           pb->del(to_bytes(k));
-        } else if (pa->has_snapshot()) {
+        } else if (pa->read_sequence()) {
           pa->ensure_unchanged(to_bytes(k));
           pb->ensure_unchanged(to_bytes(k));
         }
@@ -14104,7 +14353,7 @@ TEST_CASE("pipeline: a plan that loses to a write not yet published reports "
   // B: snapshot (sees "0"), guarded write on k — loses to A's in-flight
   // write, and must block until A publishes.
   std::atomic<bool> b_returned{false};
-  std::optional<bytecask::CommitResult> rb;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> rb;
   std::thread tb([&] {
     auto snap = db.snapshot();
     bytecask::Bytes out;

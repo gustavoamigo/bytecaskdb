@@ -763,7 +763,7 @@ static void jswp_ensure_range_unchanged(JsWritePlan &self,
 
 static auto jswp_has_snapshot(JsWritePlan &self) -> bool {
   self.check();
-  return self.plan->has_snapshot();
+  return self.plan->read_sequence().has_value();
 }
 
 static auto js_file_manifest_get_snapshot(JsFileManifest &self) -> JsSnapshot * {

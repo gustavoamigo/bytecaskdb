@@ -768,7 +768,11 @@ auto CommitOutcomeUnknown::what() const noexcept -> const char* {
 auto apply_batch_or_unknown(DB& db, WriteOptions opts, WritePlan plan) -> std::optional<CommitResult> {
   auto was_degraded = db.is_degraded();
   try {
-    return db.apply_batch(opts, std::move(plan));
+    // TooOld is reported as a conflict: either way nothing was written and
+    // the transaction has to start again from a fresh snapshot.
+    auto r = db.apply_batch(opts, std::move(plan));
+    if (!r) return std::nullopt;
+    return *r;
   } catch (...) {
     if (was_degraded || !db.is_degraded()) throw;
     throw CommitOutcomeUnknown{};

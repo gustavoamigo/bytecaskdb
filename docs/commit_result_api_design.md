@@ -101,13 +101,14 @@ public:
   auto del_range(const WriteOptions &opts, BytesView from, BytesView to)
       -> CommitResult;
 
-  // Engaged iff the plan committed. nullopt: a guard failed or the implicit
-  // W-W check detected a conflict — nothing was written.
+  // A value iff the plan committed. PlanRefusal::Conflict: a guard failed or
+  // the implicit W-W check detected a conflict; PlanRefusal::TooOld: the read
+  // sequence is too old to check — nothing was written either way.
   // An empty plan returns {sequence = 0, durable = true}.
   // A guard-only plan that passes returns {sequence = 0, durable = true}.
   // With sync, both first wait until every earlier write is durable.
   [[nodiscard]] auto apply_batch(WriteOptions opts, WritePlan plan)
-      -> std::optional<CommitResult>;
+      -> std::expected<CommitResult, PlanRefusal>;
 
   // The single sequence primitive — replaces current_sequence(timeout).
   // Blocks until the durable sequence (highest sequence confirmed by
@@ -239,11 +240,11 @@ from `bool` to the final result type:
 export struct EngineSlot : Slot {
   WritePlan plan;
   WriteOptions opts;
-  std::optional<CommitResult> result;  // was: bool result
+  std::expected<CommitResult, PlanRefusal> result;  // was: bool result
 };
 ```
 
-- `execute_slot`: on validation failure, `result = nullopt`. On success,
+- `execute_slot`: on validation failure, `result` holds the refusal. On success,
   `result = CommitResult{.sequence = entries.back().sequence}` (or
   `{.sequence = 0}` for empty/guard-only plans). `durable` is left false.
 - `execute_slots` phase 1 collects entries from every slot in the batch, but
@@ -476,7 +477,7 @@ arguments instead of advance-based ones.
 - **Unit**: sequence monotonicity across `put`/`del`/`del_range`/batches;
   batch result equals the `BulkEnd` sequence (verifiable via
   `changes_since`); `del` absent → `nullopt`; empty and guard-only plans →
-  `sequence == 0`; conflict → `nullopt` and no sequence consumed beyond the
+  `sequence == 0`; conflict → `PlanRefusal::Conflict` and no sequence consumed beyond the
   failed slot.
 - **Durability flag**: `sync=true` → `durable`; solo `sync=false` →
   `!durable`; concurrent group with one sync writer → coalesced `sync=false`
