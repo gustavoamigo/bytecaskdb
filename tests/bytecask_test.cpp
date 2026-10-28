@@ -8200,8 +8200,7 @@ TEST_CASE("validate_preconditions: no snapshot skips W-W checks",
   CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
 }
 
-TEST_CASE("validate_preconditions: a removal at or below the read sequence "
-          "is not a change",
+TEST_CASE("validate_preconditions: a removal at or below the read sequence is not a change",
           "[validate_preconditions]") {
   auto snap = make_snapshot({});
   auto state = make_state({});
@@ -8214,8 +8213,7 @@ TEST_CASE("validate_preconditions: a removal at or below the read sequence "
   CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
 }
 
-TEST_CASE("validate_preconditions: a key written and removed again since the "
-          "read sequence conflicts",
+TEST_CASE("validate_preconditions: a key written and removed again since the read sequence conflicts",
           "[validate_preconditions]") {
   // Absent from both states, but a write since touched it: refused, though
   // the snapshot and the head agree (CONTRACT.md, "Isolation is what the
@@ -8230,8 +8228,7 @@ TEST_CASE("validate_preconditions: a key written and removed again since the "
   CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
 }
 
-TEST_CASE("validate_preconditions: a read sequence below the delete log's "
-          "horizon is too old",
+TEST_CASE("validate_preconditions: a read sequence below the delete log's horizon is too old",
           "[validate_preconditions]") {
   auto state = make_state({{"k", kde(10, 0, 1, 5)}});
   auto t = state->transient();
@@ -8245,8 +8242,7 @@ TEST_CASE("validate_preconditions: a read sequence below the delete log's "
   CHECK(t.validate_preconditions(at_horizon, deletes) == Verdict::Holds);
 }
 
-TEST_CASE("validate_preconditions: a removal after the state checked is not "
-          "part of it",
+TEST_CASE("validate_preconditions: a removal after the state checked is not part of it",
           "[validate_preconditions]") {
   // The published state is checked with the head's log: a removal at or
   // above its next sequence is a later state's.
