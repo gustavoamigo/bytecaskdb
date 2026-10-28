@@ -1685,6 +1685,10 @@ The `shared_ptr` keeps all data files referenced at snapshot time alive — thei
 
 `Snapshot` exposes the same read API as `DB`: `get`, `contains_key`, `iter_from`, `keys_from`, `riter_from`, `rkeys_from`.
 
+#### `Snapshot::clone()`
+
+`clone()` copies the `shared_ptr<const EngineState>` and the size limits: a second handle on the same frozen state, a reference-count increment. Both handles read the same key directory version and share the open files; each keeps them alive, so the last one to go releases the parked nodes and lets the disk blocks of unlinked files free. A clone outlives the original, the `DB` and `close()` exactly as the original does, and moving or destroying either handle changes nothing for the other. It touches no commit-path code: a `WritePlan` built from either handle validates against the same state. Its use is a reader that must outlive the owner of the snapshot, such as a SQL cursor held past its transaction's commit (`bytecaskdb-sql-layer/docs/cursor_design.md`, *`WITH HOLD`*), while the commit moves the original into a `WritePlan`. A clone adds no retention of its own; what a held snapshot costs (parked nodes, unlinked files) is the same for one handle or two.
+
 ### `DB::apply_batch(opts, plan) -> std::optional<CommitResult>`
 
 Applies `plan` atomically only if all guards pass and no key in the write set was modified since the plan's snapshot was taken (when the plan carries a snapshot). Both the conflict check and the apply run under `write_mu_`, serialised with all other writers.

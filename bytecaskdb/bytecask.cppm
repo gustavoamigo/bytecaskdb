@@ -1834,6 +1834,13 @@ public:
   Snapshot(Snapshot &&) noexcept = default;
   Snapshot &operator=(Snapshot &&) noexcept = default;
 
+  // A second handle on the same frozen state: it reads what this one reads,
+  // and each keeps the state, its files and its parked nodes alive until
+  // both are gone. A refcount increment; allocates nothing and cannot throw.
+  [[nodiscard]] auto clone() const noexcept -> Snapshot {
+    return Snapshot{state_, limits_};
+  }
+
   // Returns true if key exists in this snapshot. No disk I/O.
   [[nodiscard]] auto contains_key(const ReadOptions& opts,
                                   BytesView key) const -> bool;

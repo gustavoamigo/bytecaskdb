@@ -420,6 +420,11 @@ public:
   Snapshot(Snapshot&&) noexcept;
   Snapshot& operator=(Snapshot&&) noexcept;
 
+  // A second, independent handle on the same frozen state. It reads what
+  // this one reads and outlives it, and the DB, as this one does. Cheap: a
+  // reference count. Throws std::bad_alloc only for the handle itself.
+  [[nodiscard]] auto clone() const -> Snapshot;
+
   [[nodiscard]] auto get(const ReadOptions& opts,
                          BytesView key,
                          Bytes& out) const -> bool;
