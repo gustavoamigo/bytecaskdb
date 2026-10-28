@@ -369,10 +369,13 @@ struct Prepared {
   std::optional<ast::CursorStatement> cursor;  // Cursor
 };
 
-// A session's cursor: the transaction's, and whether DECLARE said NO SCROLL.
+// A session's cursor, and whether DECLARE said NO SCROLL. A hold cursor
+// (WITH HOLD, or any DECLARE outside a block) outlives the transaction it was
+// declared in; the others are the transaction's.
 struct SessionCursor {
   Cursor cursor;
   bool no_scroll{false};
+  bool hold{false};
 };
 
 // What a cursor statement answers: rows (FETCH) and the command tag.
@@ -391,6 +394,9 @@ class Session {
 public:
   Session(Database& db, int fd, const SessionConfig& cfg, const std::atomic<bool>& stopping)
       : db_{db}, fd_{fd}, cfg_{cfg}, stopping_{stopping} {}
+  Session(const Session&) = delete;
+  Session& operator=(const Session&) = delete;
+  ~Session() { close_cursors(); }
 
   void run() {
     try {
@@ -746,9 +752,26 @@ private:
     refuse_if_failed();
   }
 
-  // A transaction ended: its portals go with it, as in PostgreSQL.
+  // A transaction ended: its portals go with it, as in PostgreSQL, and so do
+  // its cursors but the hold cursors that its commit kept. A hold cursor its
+  // rollback dropped is closed already: it is forgotten here or when next named.
   void end_transaction() noexcept {
     portals_.clear();
+    std::erase_if(cursors_, [](auto& entry) {
+      auto& c = entry.second;
+      if (!c.hold) c.cursor.close();
+      return !c.hold || !c.cursor.is_open();
+    });
+  }
+
+  // Forgets the cursors a rollback or abort closed.
+  void forget_closed_cursors() noexcept {
+    std::erase_if(cursors_, [](const auto& entry) { return !entry.second.cursor.is_open(); });
+  }
+
+  // The session's end, by a disconnect, Terminate or the server's shutdown:
+  // a hold cursor releases its snapshot with it.
+  void close_cursors() noexcept {
     for (auto& [name, c] : cursors_) c.cursor.close();
     cursors_.clear();
   }
@@ -842,10 +865,10 @@ private:
   // failed block, then a statement outside a block.
   void check_declare(const ast::DeclareCursor& d) const {
     refuse_if_failed();
-    if (d.hold) {
-      throw SessionError("DECLARE ... WITH HOLD is not supported yet (phase 4 of docs/cursor_design.md)", "0A000");
+    // Outside a block it is a hold cursor (a known difference: PostgreSQL says 25P01).
+    if (d.hold && d.for_update) {
+      throw SessionError("DECLARE CURSOR WITH HOLD ... FOR UPDATE is not supported", "0A000");
     }
-    if (!in_block_) throw SessionError("DECLARE CURSOR can only be used in transaction blocks", "25P01");
     if (d.scroll == ast::DeclareCursor::Scroll::Scroll && d.for_update) {
       throw SessionError("DECLARE SCROLL CURSOR ... FOR UPDATE is not supported", "0A000");
     }
@@ -863,9 +886,23 @@ private:
   }
 
   auto find_cursor(const std::string& name) -> SessionCursor& {
+    forget_closed_cursors();
     auto it = cursors_.find(name);
     if (it == cursors_.end()) throw SessionError("cursor \"" + name + "\" does not exist", "34000");
     return it->second;
+  }
+
+  // The cursor a DECLARE opens: in the block's transaction, or, outside one,
+  // in a transaction of its own that commits at once. Outside a block it is
+  // always a hold cursor, taken on the snapshot of that moment.
+  auto declare_cursor(const ast::DeclareCursor& d, const Statement& stmt, const std::vector<Value>& params) -> Cursor {
+    auto kind = d.hold || !in_block_ ? Holdability::Hold : Holdability::Plain;
+    if (in_block_) return txn_->open_cursor(stmt, params, kind);
+    if (implicit_) return implicit_->open_cursor(stmt, params, kind);
+    auto t = db_.begin();
+    auto cursor = t.open_cursor(stmt, params, kind);
+    (void)t.commit();
+    return cursor;
   }
 
   // The rows a FETCH of `f` takes from `c`: how many, for a forward fetch.
@@ -891,12 +928,14 @@ private:
     CursorReply out;
     if (const auto* d = std::get_if<ast::DeclareCursor>(&c)) {
       check_declare(*d);
+      forget_closed_cursors();
       if (cursors_.contains(d->name) || portals_.contains(d->name)) {
         throw SessionError("cursor \"" + d->name + "\" already exists", "42P03");
       }
       enter_statement(*stmt);
-      cursors_.emplace(d->name, SessionCursor{txn_->open_cursor(*stmt, params),
-                                              d->scroll == ast::DeclareCursor::Scroll::NoScroll});
+      cursors_.emplace(d->name, SessionCursor{declare_cursor(*d, *stmt, params),
+                                              d->scroll == ast::DeclareCursor::Scroll::NoScroll,
+                                              d->hold || !in_block_});
       out.tag = "DECLARE CURSOR";
     } else if (const auto* f = std::get_if<ast::FetchCursor>(&c)) {
       auto& cursor = find_cursor(f->name);
@@ -1129,6 +1168,7 @@ private:
     for (std::int16_t i = 0; i < results; ++i) {
       if (body.i16() != 0) throw SessionError("binary format is not supported", "0A000");
     }
+    forget_closed_cursors();
     if (!portal.empty() && (portals_.contains(portal) || cursors_.contains(portal))) {
       throw SessionError("portal \"" + portal + "\" already exists", "42P03");
     }

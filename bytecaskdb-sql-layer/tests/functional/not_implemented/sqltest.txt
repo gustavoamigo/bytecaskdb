@@ -74,27 +74,20 @@ e081_10_01_01
 e081_10_01_02
 e111_01_01  # SELECT … INTO table is CREATE TABLE AS in PostgreSQL: not built (#714)
 e111_01_02  # SELECT … INTO table is CREATE TABLE AS in PostgreSQL: not built (#714)
-e121_01_01_01
-e121_01_01_02
-e121_01_01_03
-e121_01_01_04
-e121_02_01_01
-e121_03_01_01
-e121_04_01_01
-e121_06_01_01
-e121_07_01_01
-e121_07_01_02
-e121_08_01_01
-e121_10_01_01
-e121_10_01_02
-e121_10_01_03
-e121_10_01_04
-e121_10_01_05
-e121_10_01_06
-e121_10_01_07
-e121_10_01_08
-e121_17_01_01
-e121_17_01_02
+e121_03_01_01  # ORDER BY takes columns: an expression (A + 5) is refused, in a cursor or not (a dialect gap, not a cursor one)
+e121_04_01_01  # OPEN c: not PostgreSQL syntax (owner decision 2026-10-28)
+e121_06_01_01  # WHERE CURRENT OF on a cursor never fetched is 24000 in PostgreSQL (owner decision 2026-10-28, #722)
+e121_07_01_01  # WHERE CURRENT OF on a cursor never fetched is 24000 in PostgreSQL (owner decision 2026-10-28, #722)
+e121_07_01_02  # WHERE CURRENT OF on a cursor never fetched is 24000 in PostgreSQL (owner decision 2026-10-28, #722)
+e121_08_01_01  # OPEN c: not PostgreSQL syntax (owner decision 2026-10-28)
+e121_10_01_01  # FETCH ... INTO: not PostgreSQL syntax (owner decision 2026-10-28)
+e121_10_01_02  # FETCH ... INTO: not PostgreSQL syntax (owner decision 2026-10-28)
+e121_10_01_03  # FETCH ... INTO: not PostgreSQL syntax (owner decision 2026-10-28)
+e121_10_01_04  # FETCH ... INTO: not PostgreSQL syntax (owner decision 2026-10-28)
+e121_10_01_05  # FETCH ... INTO: not PostgreSQL syntax (owner decision 2026-10-28)
+e121_10_01_06  # FETCH ... INTO: not PostgreSQL syntax (owner decision 2026-10-28)
+e121_10_01_07  # FETCH ... INTO: not PostgreSQL syntax (owner decision 2026-10-28)
+e121_10_01_08  # FETCH ... INTO: not PostgreSQL syntax (owner decision 2026-10-28)
 e141_07_01_01  # type NAME with DEFAULT CURRENT_CATALOG: no NAME type, and no DEFAULT but a constant
 e141_07_02_01  # DEFAULT CURRENT_DATE: the layer keeps constant defaults only; a default the clock fills is #701
 e141_07_03_01  # CURRENT_PATH is not PostgreSQL syntax

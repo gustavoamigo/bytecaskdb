@@ -375,10 +375,14 @@ other statements is.
 cursors in a map of `Cursor`s from `Transaction::open_cursor`; the design is
 `cursor_design.md` and what phase 3 built is its *As built (phase 3)*. What
 the server adds:
-- Cursors exist only in an explicit block (`BEGIN`): `DECLARE` anywhere else
-  is `25P01`, as PostgreSQL's, and `WITH HOLD` is `0A000` until phase 4. A
-  cursor shares the portals' namespace (a used name is `42P03`) and ends with
-  the block, at `COMMIT`, `ROLLBACK`, an error or a disconnect.
+- A cursor ends with the block, at `COMMIT`, `ROLLBACK` or an error, unless it
+  is a hold cursor: `WITH HOLD`, or any `DECLARE` outside `BEGIN` (PostgreSQL
+  says `25P01`: a known difference). A hold cursor survives the `COMMIT` of
+  the block that declared it, is dropped by its `ROLLBACK`, and ends at
+  `CLOSE`, a disconnect or the server's shutdown. It pins an engine snapshot
+  meanwhile and has no timer or cap here (`cursor_design.md`, *As built
+  (phase 4)*). A cursor shares the portals' namespace (a used name is
+  `42P03`).
 - A failed block refuses them all with `25P02`; an error in one fails the
   block.
 - Tags: `DECLARE CURSOR`, `FETCH n`, `MOVE n`, `CLOSE CURSOR`,
@@ -879,9 +883,9 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 - A form the layer does not support is `42601`, not PostgreSQL's code for running it.
 - `Execute` with a row limit, several statements in one `Query`, SQL
   `PREPARE`, `SET`, `SHOW`, `COPY` and cancel are refused.
-- Cursors: `DECLARE` outside `BEGIN` is `25P01`; `WITH HOLD`, `BINARY` and
-  every `FETCH` direction but forward are `0A000` (`cursor_design.md`,
-  *Known differences from PostgreSQL*).
+- Cursors: `DECLARE` outside `BEGIN` is a hold cursor, where PostgreSQL says
+  `25P01`; `WITH HOLD ... FOR UPDATE`, `BINARY` and every `FETCH` direction but
+  forward are `0A000` (`cursor_design.md`, *Known differences from PostgreSQL*).
 - A result is built whole by the embedded API before its first `DataRow`
   is sent. Streaming rows waits on the API streaming them, part of the
   transport design (#487, *Next*).
