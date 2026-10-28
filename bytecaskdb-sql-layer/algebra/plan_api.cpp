@@ -1503,8 +1503,16 @@ struct bc_txn {
   std::shared_ptr<const Catalog> pinned;
   std::optional<bytecask::Snapshot> snap;  // engaged from the first statement to the commit
   // The writes: the commit is built from the overlay, its ranges first,
-  // since every point in it is newer than any range over it.
-  Overlay overlay;
+  // since every point in it is newer than any range over it. Shared with the
+  // cursors that pinned it (bc_txn_overlay_pin) and copy-on-write: a
+  // statement's writes go through own_overlay(), which clones it first if a
+  // cursor holds it, so a pinned overlay never changes.
+  std::shared_ptr<Overlay> overlay{std::make_shared<Overlay>()};
+  // What the pins (bc_overlay) hold back: each reserves the overlay's bound
+  // as of its pin, counted by txn_holds so the write that follows a clone
+  // cannot pass max_bytes for the copy a cursor keeps.
+  std::uint64_t pinned_bytes{0};
+  std::uint64_t pins{0};  // bc_overlay handles live
   std::vector<Effect> guards;          // the statements' guards, in their order
   std::vector<Claim> claims;           // the statements' insert claims, in their order
   std::vector<Lock> locks;             // the statements' rows locked or written, in their order
@@ -1533,6 +1541,22 @@ struct bc_txn {
   bc_ctx* attached{nullptr};
 
   bc_txn(bytecask::DB* d, LiveCatalog* l, std::uint64_t max) : db{d}, live{l}, max_bytes{max} {}
+
+  // The overlay to write to: cloned first when a pin shares it. A throw
+  // leaves the transaction's overlay and the pin's as they were.
+  auto own_overlay() -> Overlay& {
+    if (overlay.use_count() > 1) overlay = std::make_shared<Overlay>(*overlay);
+    return *overlay;
+  }
+};
+
+// A transaction's overlay as it stood when pinned: what a cursor reads
+// through (docs/cursor_design.md, *What a cursor sees*). Released before its
+// transaction is freed.
+struct bc_overlay {
+  std::shared_ptr<const Overlay> view;
+  bc_txn* owner;
+  std::uint64_t reserved;
 };
 
 namespace {
@@ -1549,7 +1573,7 @@ namespace {
 // merging an effect into the overlay adds at most one node, and one that
 // replaces or erases others only frees. So the commit needs nothing its
 // statements were not held to.
-auto txn_holds(const bc_txn& t) -> std::uint64_t { return t.overlay.bytes + t.held; }
+auto txn_holds(const bc_txn& t) -> std::uint64_t { return t.overlay->bytes + t.held + t.pinned_bytes; }
 
 }  // namespace
 
@@ -1583,7 +1607,7 @@ void txn_abort(bc_txn* txn) noexcept {
   txn_drop_context(txn);
   txn->snap.reset();
   txn->pinned.reset();
-  txn->overlay = {};
+  txn->overlay = std::make_shared<Overlay>();  // a pin keeps the one it holds
   txn->guards = {};
   txn->claims = {};
   txn->locks = {};
@@ -2712,7 +2736,7 @@ void bc_ctx_begin_txn(bc_ctx* cx, bc_txn* txn, const bc_params* params, bc_budge
   cx->pinned = txn->pinned;
   cx->cat = cx->pinned.get();
   cx->base = &*txn->snap;
-  cx->overlay = &txn->overlay;
+  cx->overlay = txn->overlay.get();
   BC_GUARD_END(cx)
 }
 
@@ -2863,10 +2887,62 @@ void bc_txn_free(bc_txn* txn) {
 uint64_t bc_txn_catalog_version(const bc_txn* txn) { return txn->pinned ? txn->pinned->version() : 0; }
 
 bool bc_txn_repin(bc_txn* txn) {
-  if (txn->statements != 0 || txn->aborted || txn->done || txn->attached != nullptr) return false;
+  // A pin reads the snapshot: moving it would change what the cursor sees.
+  if (txn->statements != 0 || txn->pins != 0 || txn->aborted || txn->done || txn->attached != nullptr) return false;
   txn->snap.reset();
   txn->pinned.reset();
   return true;
+}
+
+bc_overlay* bc_txn_overlay_pin(bc_txn* txn) {
+  BC_GUARD_BEGIN
+  txn->sink().clear();
+  if (txn->aborted || txn->done) {
+    txn->sink().fail(BC_E_HANDLE, txn->done ? "the transaction has ended" : "the transaction is aborted");
+    return nullptr;
+  }
+  if (txn->attached != nullptr) {
+    txn->sink().fail(BC_E_HANDLE, "a statement of this transaction is still open on a context: reset it first");
+    return nullptr;
+  }
+  // The snapshot and catalog are the transaction's from here, as a first
+  // statement would pin them.
+  if (!txn->snap) {
+    auto p = txn->live->pin();
+    txn->pinned = std::move(p.cat);
+    txn->snap.emplace(std::move(p.snap));
+  }
+  const auto reserve = txn->overlay->bytes;
+  if (txn_holds(*txn) + reserve > txn->max_bytes) {
+    txn->sink().fail(BC_E_LIMIT, "a cursor's copy of the transaction's writes would pass its bound of " +
+                                     std::to_string(txn->max_bytes) + " bytes");
+    txn_abort(txn);
+    return nullptr;
+  }
+  auto pin = std::make_unique<bc_overlay>(bc_overlay{txn->overlay, txn, reserve});
+  txn->pinned_bytes += reserve;
+  ++txn->pins;
+  return pin.release();
+  BC_GUARD_END(txn)
+  if (txn != nullptr) txn_abort(txn);
+  return nullptr;
+}
+
+void bc_txn_overlay_release(bc_overlay* pin) {
+  if (pin == nullptr) return;
+  pin->owner->pinned_bytes -= pin->reserved;
+  --pin->owner->pins;
+  delete pin;
+}
+
+void bc_ctx_use_overlay(bc_ctx* cx, const bc_overlay* pin) {
+  BC_GUARD_BEGIN
+  if (cx->txn == nullptr || pin->owner != cx->txn || !cx->ok()) {
+    cx->fail(BC_E_HANDLE, "bc_ctx_use_overlay needs a context begun on the transaction the overlay was pinned from");
+    return;
+  }
+  cx->overlay = pin->view.get();
+  BC_GUARD_END(cx)
 }
 
 namespace {
@@ -2906,11 +2982,15 @@ bool bc_txn_add(bc_ctx* cx) {
       txn->held += table_bytes(id);
     }
   }
+  auto writes = std::ranges::any_of(cx->effects, [](const Effect& e) {
+    return e.kind == EffectKind::Put || e.kind == EffectKind::Del || e.kind == EffectKind::DelRange;
+  });
+  if (writes) (void)txn->own_overlay();  // before the first write: a clone that fails changes nothing
   for (auto& e : cx->effects) {
     switch (e.kind) {
-      case EffectKind::Put: txn->overlay.put(std::move(e.a), std::move(e.b)); break;
-      case EffectKind::Del: txn->overlay.del(std::move(e.a)); break;
-      case EffectKind::DelRange: txn->overlay.del_range(std::move(e.a), std::move(e.b)); break;
+      case EffectKind::Put: txn->overlay->put(std::move(e.a), std::move(e.b)); break;
+      case EffectKind::Del: txn->overlay->del(std::move(e.a)); break;
+      case EffectKind::DelRange: txn->overlay->del_range(std::move(e.a), std::move(e.b)); break;
       case EffectKind::GuardUnchanged:
       case EffectKind::GuardRange:
       case EffectKind::GuardUniqueRange:
@@ -2968,7 +3048,7 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
     return BC_FAILED;
   }
   txn->done = true;
-  const auto& ov = txn->overlay;
+  const auto& ov = *txn->overlay;
   // A transaction that neither writes nor guards commits nothing. One that
   // only guarded (SELECT … FOR UPDATE) is still checked: a guarded row a
   // concurrent commit changed is its conflict. The engine checks a
@@ -3014,7 +3094,7 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
   // since its snapshot, makes the commit a conflict.
   for (auto id : txn->written) plan.ensure_unchanged(bytecask::sql::table_record_key(id));
   auto r = submit(out, *txn->db, std::move(plan), sync);
-  return r == BC_CONFLICT ? conflict_or_duplicate(out, *txn->db, txn->claims, txn->locks, &txn->overlay) : r;
+  return r == BC_CONFLICT ? conflict_or_duplicate(out, *txn->db, txn->claims, txn->locks, txn->overlay.get()) : r;
   BC_GUARD_END(txn)
   return BC_FAILED;  // the guard caught a throw: never BC_COMMITTED
 }
