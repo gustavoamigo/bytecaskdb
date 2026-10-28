@@ -1,8 +1,8 @@
 # Cursors in the SQL layer
 
 Status: **design, not approved** (written 2026-10-28 for #663, sqltest
-E121; revised the same day for the owner's replay proposal). Nothing is
-built. The owner's direction: a cursor is evaluated lazily; holding the whole
+E121; revised the same day for the owner's replay proposal). Phase 1
+(the replay runner, #717) is built; nothing else is. The owner's direction: a cursor is evaluated lazily; holding the whole
 result in memory is not the design. The first phases build a **replay
 cursor** (the snapshot and a position; each `FETCH` re-runs the plan to its
 position), and a resumable run replaces it later where replay is too slow.
@@ -310,6 +310,20 @@ guarded twice, and a guard is never lost.
 **Directions.** Replay makes every direction a position computation, with no
 extra structure (*`FETCH`, `MOVE` and `SCROLL`*).
 
+**As built (phase 1).** `bc_ctx_window(cx, skip, limit)` sets the window
+after `bc_ctx_begin*` and before `bc_ctx_run`; `bc_emit_end` of the top-level
+plan drops the first `skip` rows unencoded and uncharged and keeps `limit`,
+and the last kept row unwinds the plan as a failed context does, except that
+it is not an error. `bc_ctx_emitted` and `bc_ctx_stopped` report where it
+stopped. `Transaction::execute_window(stmt, params, RowWindow)` runs a read
+over the transaction's view and returns `WindowRows`: the rows, the
+`position` (rows the plan ended, skipped ones included) and `end` (the plan
+ran out before the window was full; a window that ends exactly at the last
+row has not seen that yet). `Statement::is_resumable()` is the checkpoint
+whitelist above, computed at code generation (`GeneratedPlan::resumable`);
+nothing reads it yet. The run is always from the first row: the checkpoint is
+#731, and the interface leaves room for it.
+
 ## Resumable execution (later)
 
 When replay is too slow, a run that can pause replaces it behind the same
@@ -614,7 +628,7 @@ interface, so phases 3 to 7 do not change when it lands.
 
 | Phase | Issue | What | Unlocks | Decision |
 |---|---|---|---|---|
-| 1 | #717 | Replay runner in the runtime: skip count, row limit, stop, start key for the outermost scan; resumable-plan flag; determinism and differential tests | none | |
+| 1 | #717 | **Done.** Replay runner in the runtime: skip count, row limit, stop; resumable-plan flag; determinism and differential tests. The start-key checkpoint is not built (owner direction, 2026-10-28): #731 | none | |
 | 2 | #718 | Copy-on-write overlay; pinned parameters, clocks and plan; forward-only `Cursor` in `Transaction` | none | |
 | 3 | #719 | `DECLARE`, `FETCH` forward, `MOVE`, `CLOSE`, `FOR UPDATE` in the dialect and session | none alone | **1** |
 | 4 | #720 | `WITH HOLD` (result store); `DECLARE` outside a block | 8 ids, or 1 | **1, 3** |

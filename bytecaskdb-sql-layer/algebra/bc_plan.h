@@ -142,6 +142,17 @@ bool    bc_ctx_check(bc_ctx *, const bc_schema_ref *checked_against);      /* bc
 enum bc_commit_result bc_ctx_commit(bc_ctx *, bool sync);
 bool    bc_ctx_next_result(bc_ctx *, const uint8_t **row, uint32_t *len);     /* result rows, in emit order */
 void    bc_ctx_reset(bc_ctx *);                                               /* drops snapshot, plan, arena */
+/* A window on the next run's result rows (docs/cursor_design.md, *The replay
+   cursor*), set after bc_ctx_begin* and before bc_ctx_run, once: the first
+   `skip` rows the plan ends are dropped, unencoded and uncharged; the next
+   `limit` are kept; after the last the run stops, a normal end, not an error.
+   limit 0 stops it, once verified, before it reads anything. A stopped run leaves the
+   statement's writes as the rows it reached made them: use it for reads.
+   bc_ctx_emitted is the rows the plan ended, dropped ones included; when the
+   run was not stopped it is the result's whole size. */
+void    bc_ctx_window(bc_ctx *, uint64_t skip, uint64_t limit);
+uint64_t bc_ctx_emitted(const bc_ctx *);
+bool    bc_ctx_stopped(const bc_ctx *);
 enum bc_error_code bc_error(const bc_ctx *);
 const char *bc_error_message(const bc_ctx *);
 uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits; BC_E_LAYOUT: a bc_layout_detail */

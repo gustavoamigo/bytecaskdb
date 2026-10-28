@@ -66,6 +66,10 @@ struct GeneratedPlan {
   std::vector<std::uint32_t> objects_read, tables_written;
   std::vector<ColumnDep> columns;
   double cost{0};  // what the search predicted the plan charges the work budget
+  // A cursor over the plan can resume from a checkpoint of its outermost
+  // scan instead of replaying from the first row (docs/cursor_design.md,
+  // *The replay cursor*). A whitelist: false until a shape is proven.
+  bool resumable{false};
 };
 
 // Plans a bound DML statement, its logical plan rewritten, then searched,
@@ -2701,6 +2705,36 @@ void print_body(Writer& w, const physical::Plan& p) {
   }
 }
 
+// The inner side of a nested loop: a scan or point lookup under filters, a
+// pure function of the outer row.
+auto resumable_inner(const physical::Node& n) -> bool {
+  if (const auto* f = std::get_if<physical::Filter>(&n.op)) return resumable_inner(*f->input);
+  return std::holds_alternative<physical::Scan>(n.op) || std::holds_alternative<physical::PointGet>(n.op);
+}
+
+// Emit over filters, joins and at most one Limit, the outermost loop a Scan;
+// the joins' inner sides are scans or lookups. No Sort, hash join, aggregate,
+// set operation, choice point or NullSplitScan.
+auto resumable_plan(const physical::Plan& p) -> bool {
+  if (p.set || !p.root) return false;
+  const auto* emit = std::get_if<physical::Emit>(&p.root->op);
+  if (emit == nullptr) return false;
+  const auto* n = emit->input.get();
+  if (const auto* l = std::get_if<physical::Limit>(&n->op)) n = l->input.get();
+  for (;;) {
+    if (const auto* f = std::get_if<physical::Filter>(&n->op)) {
+      n = f->input.get();
+    } else if (const auto* j = std::get_if<physical::IndexJoin>(&n->op)) {
+      n = j->outer.get();
+    } else if (const auto* nl = std::get_if<physical::NestedLoop>(&n->op)) {
+      if (!resumable_inner(*nl->inner)) return false;
+      n = nl->outer.get();
+    } else {
+      return std::holds_alternative<physical::Scan>(n->op);
+    }
+  }
+}
+
 // Prints a searched plan, checked first.
 auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std::string_view sql) -> GeneratedPlan {
   p.param_types = param_types;
@@ -2747,6 +2781,7 @@ auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std
   out.objects_read = w.objects_read();
   out.columns = w.columns_used();
   out.cost = p.cost;
+  out.resumable = resumable_plan(p);
   return out;
 }
 
