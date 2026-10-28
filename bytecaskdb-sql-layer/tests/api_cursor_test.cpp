@@ -17,6 +17,8 @@
 #include <variant>
 #include <vector>
 
+#include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+
 import bytecask.sql.api;
 import bytecask.sql.tests.util;
 
