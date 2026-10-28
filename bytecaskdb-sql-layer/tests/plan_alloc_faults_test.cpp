@@ -440,7 +440,7 @@ TEST_CASE("plan API: an allocation failure in a pin, or in the clone the next wr
     bc_ctx_run(f.cx, insert_row, &ref);
     REQUIRE(bc_error(f.cx) == BC_OK);
   };
-  for (auto phase : {"the pin", "the clone"}) {
+  for (auto phase : {"the pin", "the clone", "the hold"}) {
     INFO(phase);
     auto failed = 0;
     for (long nth = 1;; ++nth) {
@@ -453,8 +453,26 @@ TEST_CASE("plan API: an allocation failure in a pin, or in the clone the next wr
       auto threw = false;
       bytecask::testing::AllocFaultReport report;
       bc_overlay* pin = nullptr;
+      bc_hold* hold = nullptr;
       auto added = true;
-      if (std::string_view{phase} == "the pin") {
+      if (std::string_view{phase} == "the hold") {
+        pin = bc_txn_overlay_pin(txn);
+        REQUIRE(pin != nullptr);
+        {
+          bytecask::testing::ScopedAllocFaults faults{nth, false};
+          try {
+            hold = bc_txn_hold(txn, pin);
+          } catch (...) {
+            threw = true;
+          }
+          report = faults.report();
+        }
+        INFO("allocation " << nth);
+        CHECK_FALSE(threw);
+        // A hold that failed aborted the transaction and says why; one that did not is the caller's to free.
+        CHECK((hold == nullptr) == (bc_txn_error(txn) != BC_OK));
+        if (hold == nullptr) CHECK(bc_txn_error(txn) == BC_E_MEMORY);
+      } else if (std::string_view{phase} == "the pin") {
         bytecask::testing::ScopedAllocFaults faults{nth, false};
         try {
           pin = bc_txn_overlay_pin(txn);
@@ -486,6 +504,7 @@ TEST_CASE("plan API: an allocation failure in a pin, or in the clone the next wr
         if (!added) CHECK(bc_error(f.cx) == BC_E_MEMORY);
         bc_ctx_reset(f.cx);
       }
+      bc_txn_hold_free(hold);  // a hold outlives the pin it was made from, so either order is allowed
       bc_txn_overlay_release(pin);
       bc_txn_free(txn);
       if (!report.fired) {

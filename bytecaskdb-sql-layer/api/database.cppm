@@ -313,6 +313,12 @@ struct TransactionOptions {
 class Database;
 class Cursor;
 
+// Whether a cursor outlives the transaction that opened it.
+enum class Holdability : std::uint8_t {
+  Plain,  // closed with the transaction
+  Hold,   // survives its commit (WITH HOLD); dropped by its rollback
+};
+
 // What commit() did, as PostgreSQL's COMMIT reports it in its command tag.
 enum class CommitOutcome {
   Committed,
@@ -332,7 +338,12 @@ struct DatabaseLife;
 struct CursorState {
   std::shared_ptr<DatabaseLife> life;
   Database* db{nullptr};  // valid while !life->closed, read under life->mu
-  TxnHandle* h{nullptr};  // null once closed
+  TxnHandle* h{nullptr};  // null once closed, and once a hold cursor's transaction committed
+  // A hold cursor (Holdability::Hold) reads its own clone of the snapshot,
+  // its catalog and its overlay, not the transaction's, so it outlives the
+  // transaction's commit; it is dropped by the transaction's rollback or
+  // abort, by close() and by the database's close.
+  bc_hold* hold{nullptr};
   std::atomic<bool> live{true};
   bool aborted{false};  // closed by its transaction's abort
   // The compiled plan the cursor was opened on, held so that a recompile
@@ -345,14 +356,20 @@ struct CursorState {
   std::uint64_t position{0};     // rows returned
   bool end{false};               // the plan ran out of rows
 
-  // Releases the overlay: before the transaction is freed.
-  void close() noexcept {
+  [[nodiscard]] auto holdable() const noexcept -> bool { return hold != nullptr; }
+
+  // The transaction committed: a hold cursor lets go of the pin it was
+  // charged to the transaction by, and keeps the view in its hold. Before
+  // the transaction is freed.
+  void detach() noexcept {
     if (overlay != nullptr) bc_txn_overlay_release(overlay);
     overlay = nullptr;
     h = nullptr;
-    compiled.reset();
-    live.store(false);
   }
+
+  // Releases the overlay pin, before the transaction is freed, and the hold,
+  // which releases the engine's snapshot.
+  void close() noexcept;
 };
 
 // A transaction's resources, on the heap so that a moved Transaction keeps
@@ -363,6 +380,18 @@ struct TxnHandle {
   std::atomic<TxnState> state{TxnState::Ended};  // close() ends it from another thread
   std::int64_t started_us{0};  // the transaction's time: what CURRENT_DATE, LOCALTIME and LOCALTIMESTAMP read in it
   std::vector<std::shared_ptr<CursorState>> cursors;  // open; closed before the snapshot is released
+
+  // The transaction committed: its hold cursors outlive it, the others close.
+  void commit_cursors() noexcept {
+    for (const auto& c : cursors) {
+      if (c->holdable()) {
+        c->detach();
+      } else {
+        c->close();
+      }
+    }
+    cursors.clear();
+  }
 
   void release() noexcept {
     for (const auto& c : cursors) c->close();
@@ -391,9 +420,28 @@ struct DatabaseLife {
   std::shared_mutex mu;
   std::atomic<bool> closing{false};  // set before close() waits: calls arriving meanwhile refuse at once
   bool closed{false};                // under mu
-  std::mutex open_mu;                // guards open; taken briefly, never across I/O
+  std::mutex open_mu;                // guards open and holds; taken briefly, never across I/O
   std::set<TxnHandle*> open;
+  // The hold cursors still open, so that close() releases their snapshots. A
+  // cycle with CursorState::life that close() of either end breaks.
+  std::set<std::shared_ptr<CursorState>> holds;
 };
+
+inline void CursorState::close() noexcept {
+  if (overlay != nullptr) bc_txn_overlay_release(overlay);
+  overlay = nullptr;
+  const auto was_hold = std::exchange(hold, nullptr);
+  if (was_hold != nullptr) bc_txn_hold_free(was_hold);
+  h = nullptr;
+  compiled.reset();
+  live.store(false);
+  if (was_hold == nullptr) return;
+  // Last: this may be the registry's reference to the state, so the
+  // database's life is kept by a copy and nothing of this is read after.
+  const auto keep = life;
+  std::lock_guard<std::mutex> lock{keep->open_mu};
+  std::erase_if(keep->holds, [this](const auto& c) { return c.get() == this; });
+}
 
 // A cursor opened by Transaction::open_cursor: fetch() returns the statement's
 // rows in order, a page at a time, as a full run would. It is a handle on a
@@ -470,7 +518,21 @@ public:
   // transaction that cannot is aborted with ExecError BC_E_LIMIT (54000).
   // Throws std::invalid_argument, the transaction unchanged, for a statement
   // that is not a SELECT; otherwise as execute.
-  auto open_cursor(const Statement& stmt, const std::vector<Value>& params) -> Cursor;
+  //
+  // Holdability::Hold (docs/cursor_design.md, *`WITH HOLD`*) gives the cursor
+  // a snapshot handle of its own, so it survives commit() of this
+  // transaction and keeps showing the view it was opened on: the snapshot
+  // (the engine's Snapshot::clone), the pinned catalog and the transaction's
+  // writes so far. It does not materialise the result; each fetch replays
+  // from that view. It pins the snapshot, and with it every tree node and
+  // data file the snapshot reaches, until close(), the database's close or a
+  // rollback or abort of this transaction (which drop it, as PostgreSQL drops
+  // a cursor declared in a transaction that rolls back). No timer or cap
+  // limits how long that is. The overlay copy is charged to this
+  // transaction's bound while it lasts. A hold cursor takes no FOR UPDATE
+  // guard: a statement with one is the caller's to refuse.
+  auto open_cursor(const Statement& stmt, const std::vector<Value>& params, Holdability hold = Holdability::Plain)
+      -> Cursor;
   // Writes every statement's writes as one batch: Committed. After a failed
   // statement it writes nothing and returns RolledBack. Throws
   // SerializationFailure on a conflict and ExecError on an engine error,
@@ -666,6 +728,8 @@ private:
   // A window of a cursor's rows, run on its pinned plan, parameters and
   // overlay over the transaction's snapshot.
   auto run_pinned(bc_ctx* cx, bc_txn* txn, const CursorState& cursor, RowWindow range, WindowRows& out) -> Rows;
+  // The same on a hold cursor's own view, in a context of the pool.
+  auto run_held(const CursorState& cursor, RowWindow range, WindowRows& out) -> Rows;
   [[nodiscard]] auto clock_now() const -> std::int64_t { return clock_(); }
   // Throws ParamError for parameters the plan does not take, and ExecError
   // BC_C_RANGE for a value outside its parameter's SQL type.
@@ -1031,14 +1095,24 @@ void Database::close() {
   // A transaction still open holds the engine's snapshot: ended first, with
   // nothing written, and every later call on it throws. No call is in
   // flight: each holds the lock shared.
+  // Released outside open_mu: closing a hold cursor takes it.
+  std::set<TxnHandle*> open;
+  {
+    std::lock_guard<std::mutex> guard{life_->open_mu};
+    open.swap(life_->open);
+  }
+  for (auto* h : open) {
+    h->release();
+    h->state.store(TxnState::Ended);
+  }
+  // The hold cursors outlive their transactions, so they are closed too: the
+  // snapshots they pin go now, not when a caller drops the handle.
+  std::set<std::shared_ptr<CursorState>> holds;
   {
     std::lock_guard<std::mutex> open{life_->open_mu};
-    for (auto* h : life_->open) {
-      h->release();
-      h->state.store(TxnState::Ended);
-    }
-    life_->open.clear();
+    holds.swap(life_->holds);
   }
+  for (const auto& c : holds) c->close();
   {
     std::unique_lock<std::shared_mutex> cache{cache_mu_};  // cached_plans() reads it without entering
     cache_.clear();
@@ -1427,6 +1501,28 @@ auto Database::run_pinned(bc_ctx* cx, bc_txn* txn, const CursorState& cursor, Ro
   return results(cx, c, Rows{});
 }
 
+auto Database::run_held(const CursorState& cursor, RowWindow range, WindowRows& out) -> Rows {
+  const auto& c = *cursor.compiled;
+  auto* cx = acquire_context();
+  try {
+    bc_params bp;
+    bc_ctx_begin_hold(cx, cursor.hold, &bp, budget_);
+    bc_ctx_window(cx, range.skip, range.limit);
+    bp.values = cursor.values;
+    bc_ctx_run(cx, c.code->fn(), &c.ref);
+    if (bc_error(cx) != BC_OK) throw_context_error(cx);
+    out.position = bc_ctx_emitted(cx);
+    out.end = !bc_ctx_stopped(cx);
+    auto rows = results(cx, c, Rows{});
+    release_context(cx);
+    return rows;
+  } catch (...) {
+    bc_ctx_reset(cx);
+    release_context(cx);
+    throw;
+  }
+}
+
 // The rows and count the statement the context ran left, decoded; the
 // context is reset either way.
 auto Database::results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows {
@@ -1604,7 +1700,7 @@ auto Transaction::execute_window(const Statement& stmt, const std::vector<Value>
   return out;
 }
 
-auto Transaction::open_cursor(const Statement& stmt, const std::vector<Value>& params) -> Cursor {
+auto Transaction::open_cursor(const Statement& stmt, const std::vector<Value>& params, Holdability hold) -> Cursor {
   if (!h_) throw std::logic_error("the transaction has ended");
   std::shared_lock<std::shared_mutex> lock{life_->mu};
   check_usable();
@@ -1619,14 +1715,22 @@ auto Transaction::open_cursor(const Statement& stmt, const std::vector<Value>& p
     state->h = h_.get();
     h_->cursors.push_back(state);
     (void)db_->run(h_->cx, stmt, params, h_->txn, h_->started_us, nullptr, {}, state.get());
-    state->overlay = bc_txn_overlay_pin(h_->txn);
-    if (state->overlay == nullptr) {
+    auto fail_from_txn = [&] {
       std::string message;
       try {
         message = bc_txn_error_message(h_->txn);
       } catch (const std::bad_alloc&) {  // NOLINT(bugprone-empty-catch): the message is dropped, not the outcome
       }
       throw_error(bc_txn_error(h_->txn), bc_txn_error_detail(h_->txn), message);
+    };
+    state->overlay = bc_txn_overlay_pin(h_->txn);
+    if (state->overlay == nullptr) fail_from_txn();
+    if (hold == Holdability::Hold) {
+      state->hold = bc_txn_hold(h_->txn, state->overlay);
+      if (state->hold == nullptr) fail_from_txn();
+      // Registered last, so that a failure above leaves nothing in the registry.
+      std::lock_guard<std::mutex> lock{life_->open_mu};
+      life_->holds.insert(state);
     }
     return Cursor{std::move(state)};
   } catch (const SerializationFailure&) {
@@ -1653,6 +1757,22 @@ auto Cursor::fetch(std::uint64_t k) -> Rows {
     none.types = s_->compiled->column_types;
     return none;
   }
+  if (s_->holdable()) {
+    // Its own view, in a context of the pool: nothing of the transaction is
+    // read, so it works before and after the transaction ends. A failed fetch
+    // closes this cursor and no other.
+    try {
+      WindowRows out;
+      out.rows = s_->db->run_held(*s_, RowWindow{s_->position, k}, out);
+      s_->position += std::ssize(out.rows.rows);
+      s_->end = out.end;
+      return std::move(out.rows);
+    } catch (...) {
+      if (h != nullptr) std::erase(h->cursors, s_);
+      s_->close();
+      throw;
+    }
+  }
   try {
     WindowRows out;
     out.rows = s_->db->run_pinned(h->cx, h->txn, *s_, RowWindow{s_->position, k}, out);
@@ -1669,7 +1789,7 @@ void Cursor::close() noexcept {
   if (!s_) return;
   std::shared_lock<std::shared_mutex> lock{s_->life->mu};
   if (!s_->live.load()) return;  // closed already, with its transaction or the database
-  std::erase(s_->h->cursors, s_);
+  if (s_->h != nullptr) std::erase(s_->h->cursors, s_);
   s_->close();
 }
 
@@ -1716,6 +1836,7 @@ auto Transaction::commit() -> CommitOutcome {
     } catch (const std::bad_alloc&) {  // NOLINT(bugprone-empty-catch): the message is dropped, not the outcome
     }
   }
+  if (r == BC_COMMITTED) h_->commit_cursors();  // the hold cursors leave before the transaction is freed
   end_locked();
   lock.unlock();
   if (r == BC_CONFLICT) throw_serialization_failure(kConflict);

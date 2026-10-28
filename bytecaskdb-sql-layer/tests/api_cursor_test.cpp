@@ -9,10 +9,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -363,4 +365,202 @@ TEST_CASE("cursor: its copy of the transaction's writes counts against the trans
     CHECK(txn.is_aborted());
     CHECK_FALSE(c.is_open());
   }
+}
+
+// ---------------------------------------------------------------------------
+// WITH HOLD (docs/cursor_design.md, *`WITH HOLD`*): a hold cursor owns a clone
+// of the snapshot, so it outlives the transaction that declared it.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+auto ids(const Rows& r) -> std::vector<std::int64_t> {
+  std::vector<std::int64_t> out;
+  for (const auto& row : r.rows) out.push_back(std::get<std::int64_t>(row[0]));
+  return out;
+}
+
+auto first_n(std::int64_t n) -> std::vector<std::int64_t> {
+  std::vector<std::int64_t> out;
+  for (std::int64_t i = 1; i <= n; ++i) out.push_back(i);
+  return out;
+}
+
+// The key directory versions alive: 1 is the published state alone. A
+// thread's idle read cache is scraped by stats(), so this waits for it.
+auto versions_live(Database& db) -> std::int64_t {
+  auto n = std::int64_t{0};
+  for (int i = 0; i < 40; ++i) {
+    n = db.engine_for_testing().stats().at("bytecask.keydir_versions_live");
+    if (n <= 1) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  return n;
+}
+
+}  // namespace
+
+TEST_CASE("hold cursor: survives the commit of its transaction and shows the DECLARE-time view",
+          "[sql][api][txn][cursor][hold]") {
+  sql_test::TempDir dir{"api_hold_commit"};
+  auto db = populated(dir);
+  const auto& scan = db->prepare("SELECT id FROM t ORDER BY id");
+  const auto all = first_n(kRows);
+
+  SECTION("a read-only transaction") {
+    auto txn = db->begin();
+    auto c = txn.open_cursor(scan, {}, Holdability::Hold);
+    CHECK(ids(c.fetch(3)) == first_n(3));
+    CHECK(txn.commit() == CommitOutcome::Committed);
+    REQUIRE(c.is_open());
+    // Other sessions write and commit; the cursor shows none of it.
+    db->execute("INSERT INTO t VALUES (100, 'x', 1)");
+    db->execute("DELETE FROM t WHERE id = 4");
+    db->execute("UPDATE t SET qty = 99 WHERE id = 5");
+    auto rest = ids(c.fetch(1000));
+    CHECK(rest == std::vector<std::int64_t>(all.begin() + 3, all.end()));
+    CHECK(c.at_end());
+  }
+  SECTION("a transaction that wrote before and after the DECLARE: the overlay is the DECLARE-time one") {
+    auto txn = db->begin();
+    insert(txn, 200);  // before: in the view
+    auto c = txn.open_cursor(scan, {}, Holdability::Hold);
+    insert(txn, 300);  // after: not
+    txn.execute("DELETE FROM t WHERE id = 1");
+    CHECK(txn.commit() == CommitOutcome::Committed);  // moves the transaction's own snapshot into the commit
+    auto expected = all;
+    expected.push_back(200);
+    CHECK(ids(c.fetch(1000)) == expected);
+    // The committed writes are in the database, not in the cursor's view.
+    CHECK(db->execute("SELECT COUNT(*) FROM t WHERE id IN (200, 300)").rows.size() == 1);
+    CHECK(std::get<std::int64_t>(db->execute("SELECT COUNT(*) FROM t WHERE id IN (200, 300)").rows[0][0]) == 2);
+  }
+  SECTION("fetch in a later transaction and in autocommit") {
+    auto txn = db->begin();
+    auto c = txn.open_cursor(scan, {}, Holdability::Hold);
+    CHECK(txn.commit() == CommitOutcome::Committed);
+    CHECK(ids(c.fetch(2)) == first_n(2));  // no transaction at all
+    auto later = db->begin();
+    db->execute("INSERT INTO t VALUES (101, 'x', 1)");
+    CHECK(ids(c.fetch(2)) == std::vector<std::int64_t>({3, 4}));
+    later.rollback();
+    CHECK(c.position() == 4);
+  }
+  SECTION("a plain cursor is still closed by the commit") {
+    auto txn = db->begin();
+    auto plain = txn.open_cursor(scan, {});
+    auto held = txn.open_cursor(scan, {}, Holdability::Hold);
+    CHECK(txn.commit() == CommitOutcome::Committed);
+    CHECK_FALSE(plain.is_open());
+    CHECK(held.is_open());
+  }
+}
+
+TEST_CASE("hold cursor: parameters and clocks are the ones at DECLARE", "[sql][api][txn][cursor][hold]") {
+  sql_test::TempDir dir{"api_hold_params"};
+  auto db = populated(dir);
+  const auto& stmt = db->prepare("SELECT id FROM t WHERE qty = $1 ORDER BY id");
+  auto txn = db->begin();
+  auto c = txn.open_cursor(stmt, {std::int64_t{2}}, Holdability::Hold);
+  auto other = txn.open_cursor(stmt, {std::int64_t{3}}, Holdability::Hold);
+  CHECK(txn.commit() == CommitOutcome::Committed);
+  CHECK(ids(c.fetch(100)) == std::vector<std::int64_t>({2, 7, 12, 17, 22}));
+  CHECK(ids(other.fetch(100)) == std::vector<std::int64_t>({3, 8, 13, 18, 23}));
+}
+
+TEST_CASE("hold cursor: a rollback or abort drops the ones declared in the transaction, not earlier ones",
+          "[sql][api][txn][cursor][hold]") {
+  sql_test::TempDir dir{"api_hold_rollback"};
+  auto db = populated(dir);
+  const auto& scan = db->prepare("SELECT id FROM t ORDER BY id");
+
+  auto first = db->begin();
+  auto earlier = first.open_cursor(scan, {}, Holdability::Hold);
+  CHECK(first.commit() == CommitOutcome::Committed);
+
+  SECTION("rollback") {
+    auto txn = db->begin();
+    auto declared = txn.open_cursor(scan, {}, Holdability::Hold);
+    CHECK(ids(declared.fetch(2)) == first_n(2));
+    txn.rollback();
+    CHECK_FALSE(declared.is_open());
+    CHECK_THROWS_AS(declared.fetch(1), std::logic_error);
+    CHECK(earlier.is_open());
+    CHECK(ids(earlier.fetch(2)) == first_n(2));
+  }
+  SECTION("an abort, and a destroyed transaction") {
+    auto txn = db->begin();
+    auto declared = txn.open_cursor(scan, {}, Holdability::Hold);
+    CHECK_THROWS(txn.execute("SELECT nope FROM t"));
+    CHECK(txn.is_aborted());
+    CHECK_FALSE(declared.is_open());
+    CHECK_THROWS_AS(declared.fetch(1), TransactionAborted);
+    CHECK(txn.commit() == CommitOutcome::RolledBack);
+    CHECK(ids(earlier.fetch(1)) == first_n(1));
+    auto gone = std::make_unique<Transaction>(db->begin());
+    auto d2 = gone->open_cursor(scan, {}, Holdability::Hold);
+    gone.reset();
+    CHECK_FALSE(d2.is_open());
+  }
+  SECTION("an earlier hold cursor fetches while a later transaction is aborted") {
+    auto txn = db->begin();
+    CHECK_THROWS(txn.execute("SELECT nope FROM t"));
+    CHECK(ids(earlier.fetch(1)) == first_n(1));
+  }
+}
+
+TEST_CASE("hold cursor: close, the database's close and a failed fetch release it", "[sql][api][txn][cursor][hold]") {
+  sql_test::TempDir dir{"api_hold_close"};
+  auto db = populated(dir);
+  const auto& scan = db->prepare("SELECT id FROM t ORDER BY id");
+
+  SECTION("close() releases the snapshot it pins") {
+    REQUIRE(versions_live(*db) == 1);
+    auto txn = db->begin();
+    auto c = txn.open_cursor(scan, {}, Holdability::Hold);
+    CHECK(txn.commit() == CommitOutcome::Committed);
+    db->execute("INSERT INTO t VALUES (100, 'x', 1)");  // the published state moves on; the cursor's version stays
+    CHECK(db->engine_for_testing().stats().at("bytecask.keydir_versions_live") >= 2);
+    CHECK(versions_live(*db) >= 2);
+    c.close();
+    CHECK_FALSE(c.is_open());
+    CHECK_THROWS_AS(c.fetch(1), std::logic_error);
+    CHECK(versions_live(*db) == 1);
+  }
+  SECTION("the database's close releases it, and a fetch after is DbClosed") {
+    auto txn = db->begin();
+    auto c = txn.open_cursor(scan, {}, Holdability::Hold);
+    CHECK(txn.commit() == CommitOutcome::Committed);
+    db->close();
+    CHECK_FALSE(c.is_open());
+    CHECK_THROWS_AS(c.fetch(1), DbClosed);
+    c.close();
+  }
+  SECTION("a dropped handle leaves the cursor open until the database closes") {
+    {
+      auto txn = db->begin();
+      (void)txn.open_cursor(scan, {}, Holdability::Hold);
+      CHECK(txn.commit() == CommitOutcome::Committed);
+    }
+    db->execute("INSERT INTO t VALUES (100, 'x', 1)");
+    CHECK(versions_live(*db) >= 2);
+    db->close();
+  }
+}
+
+TEST_CASE("hold cursor: its overlay copy is charged to the transaction until it commits", "[sql][api][txn][cursor][hold]") {
+  sql_test::TempDir dir{"api_hold_bound"};
+  auto db = populated(dir);
+  const auto& scan = db->prepare("SELECT id FROM t");
+  const auto cap = capacity(*db);
+  REQUIRE(cap >= 30);
+  auto txn = db->begin({.max_bytes = kBound});
+  for (std::int64_t i = 0; i < cap; ++i) insert_wide(txn, i);  // the bound nearly spent
+  try {
+    (void)txn.open_cursor(scan, {}, Holdability::Hold);
+    FAIL("expected a limit error");
+  } catch (const ExecError& e) {
+    CHECK(e.code() == BC_E_LIMIT);
+  }
+  CHECK(txn.is_aborted());
 }

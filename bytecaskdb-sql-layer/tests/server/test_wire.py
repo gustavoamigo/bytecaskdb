@@ -886,16 +886,19 @@ def test_simple_query_cursor_statements_and_their_tags(server):
 def test_cursor_errors_and_the_failed_block(server):
     c = connect(server)
     cursor_table(c)
+    # Outside a block a DECLARE is a hold cursor (PostgreSQL says 25P01: a known difference).
     c.send(query("DECLARE c CURSOR FOR SELECT k FROM t"))
     out = c.until_ready()
-    assert states(out) == ["25P01"] and status(out) == "I"
+    assert states(out) == [] and tags(out) == ["DECLARE CURSOR"] and status(out) == "I"
+    c.send(query("CLOSE c"))
+    assert tags(c.until_ready()) == ["CLOSE CURSOR"]
     c.send(query("FETCH c"))
     assert states(c.until_ready()) == ["34000"]
     c.send(query("BEGIN"))
     c.until_ready()
-    c.send(query("DECLARE c CURSOR WITH HOLD FOR SELECT k FROM t"))
+    c.send(query("DECLARE c CURSOR WITH HOLD FOR SELECT k FROM t FOR UPDATE"))
     out = c.until_ready()
-    assert states(out) == ["0A000"] and status(out) == "E"  # WITH HOLD is phase 4
+    assert states(out) == ["0A000"] and status(out) == "E"  # as PostgreSQL's
     for sql, state in [("FETCH c", "25P02"), ("DECLARE d CURSOR FOR SELECT k FROM t", "25P02"), ("CLOSE ALL", "25P02")]:
         c.send(query(sql))
         assert states(c.until_ready()) == [state], sql
@@ -989,11 +992,49 @@ def test_extended_cursor_statements_across_syncs(server):
     assert states(c.until_ready()) == ["42P03"]
     c.send(query("ROLLBACK"))
     c.until_ready()
-    # Outside a block the one statement is autocommit: a DECLARE is 25P01.
-    out = run(c, "DECLARE c CURSOR FOR SELECT k FROM t")
-    assert states(out) == ["25P01"] and status(out) == "I"
+    # Outside a block the one statement is autocommit: a DECLARE is a hold cursor.
+    out = run(c, "DECLARE c CURSOR FOR SELECT k FROM t ORDER BY k")
+    assert states(out) == [] and status(out) == "I"
+    out = run(c, "FETCH 2 FROM c")
+    assert states(out) == [] and data(out) == [["1"], ["2"]]
+    assert states(run(c, "CLOSE c")) == []
     out = run(c, "FETCH c")
     assert states(out) == ["34000"]
+
+
+def test_hold_cursor_outlives_commit_and_dies_with_rollback(server):
+    c = connect(server)
+    cursor_table(c)
+
+    def send(sql):
+        c.send(query(sql))
+        return c.until_ready()
+
+    # WITH HOLD in a block survives its COMMIT and shows the view at DECLARE.
+    send("BEGIN")
+    send("DECLARE h CURSOR WITH HOLD FOR SELECT k FROM t ORDER BY k")
+    send("INSERT INTO t VALUES (6, 60)")
+    out = send("COMMIT")
+    assert tags(out) == ["COMMIT"] and status(out) == "I"
+    assert data(send("FETCH 2 FROM h")) == [["1"], ["2"]]
+    assert states(send("INSERT INTO t VALUES (7, 70)")) == []
+    assert data(send("FETCH ALL FROM h")) == [["3"], ["4"], ["5"]]
+    # A cursor declared in a transaction that rolls back goes with it; the earlier hold cursor stays.
+    send("BEGIN")
+    send("DECLARE g CURSOR WITH HOLD FOR SELECT k FROM t ORDER BY k")
+    send("ROLLBACK")
+    assert states(send("FETCH g")) == ["34000"]
+    send("BEGIN")
+    assert states(send("FETCH h")) == [] and send("COMMIT")
+    # It is a name in the session's namespace until closed.
+    assert states(send("DECLARE h CURSOR FOR SELECT k FROM t")) == ["42P03"]
+    assert tags(send("CLOSE h")) == ["CLOSE CURSOR"]
+    assert states(send("FETCH h")) == ["34000"]
+    # Another connection does not see it.
+    other = connect(server)
+    send("DECLARE mine CURSOR FOR SELECT k FROM t")
+    other.send(query("FETCH mine"))
+    assert states(other.until_ready()) == ["34000"]
 
 
 def test_extended_cursor_in_a_failed_block(server):
