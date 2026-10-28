@@ -83,6 +83,9 @@ SQL_WORDS = {
     # Transaction control and the session statements the PostgreSQL server
     # names (docs/server_design.md).
     "BEGIN", "COMMIT", "ROLLBACK", "SHOW", "PREPARE",
+    # Cursors.
+    "DECLARE", "FETCH", "MOVE", "CLOSE", "CURSOR", "INSENSITIVE", "SCROLL", "BINARY", "HOLD", "WITH", "READ",
+    "ONLY", "NEXT", "FORWARD", "ALL", "FROM", "IN",
 }
 
 # name -> (contract, interface files, extra allowed words)

@@ -10,6 +10,7 @@
 
 module;
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -385,6 +386,40 @@ struct DropView {
 
 using Statement =
     std::variant<CreateTable, CreateIndex, DropTable, DropIndex, AddColumn, CreateView, DropView, Insert, Select, Update, Delete>;
+
+// Cursor statements (docs/cursor_design.md). They are not a Statement: they
+// name a session's cursor and carry no plan, so the session runs them, as it
+// does BEGIN. A DECLARE's query is parsed again as the SELECT it is.
+struct DeclareCursor {
+  enum class Scroll { Default, Scroll, NoScroll };
+  std::string name;
+  Scroll scroll{Scroll::Default};
+  bool binary{false};
+  bool hold{false};
+  bool for_update{false};  // the query has a FOR UPDATE
+  // The query's text: the DECLARE's own with everything before the query
+  // blanked, so an error position into it is a position into the statement.
+  std::string query;
+};
+
+// FETCH and MOVE. `count` is PostgreSQL's howMany: kAll for ALL, negative for
+// "FETCH -2", the target row for Absolute and the offset for Relative.
+struct FetchCursor {
+  enum class Direction { Forward, Backward, Absolute, Relative };
+  static constexpr std::int64_t kAll = std::numeric_limits<std::int64_t>::max();
+  std::string name;
+  Direction direction{Direction::Forward};
+  std::int64_t count{1};
+  bool move{false};
+};
+
+// CLOSE name, or CLOSE ALL when `all`.
+struct CloseCursor {
+  std::string name;
+  bool all{false};
+};
+
+using CursorStatement = std::variant<DeclareCursor, FetchCursor, CloseCursor>;
 
 }  // namespace bytecask::sql::ast
 
