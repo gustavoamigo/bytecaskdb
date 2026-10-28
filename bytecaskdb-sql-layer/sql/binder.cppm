@@ -1913,6 +1913,7 @@ public:
         case ast::Expr::Kind::Or:
         case ast::Expr::Kind::Aggregate:
         case ast::Expr::Kind::Clock:
+        case ast::Expr::Kind::Default:
         case ast::Expr::Kind::Subquery: break;
       }
       return "?column?";
@@ -2650,6 +2651,7 @@ public:
       case ast::Expr::Kind::Cast: not_yet("a cast of other than a constant", e.pos);
       case ast::Expr::Kind::Clock: not_yet("CURRENT_DATE, LOCALTIME and LOCALTIMESTAMP assigned to a column", e.pos);
       case ast::Expr::Kind::Subquery: not_yet("a subquery assigned to a column", e.pos);
+      case ast::Expr::Kind::Default: return fixed(target.default_value, target.sql);
       case ast::Expr::Kind::Case:
       case ast::Expr::Kind::Coalesce:
       case ast::Expr::Kind::NullIf: not_yet("CASE, COALESCE and NULLIF of other than constants", e.pos);
