@@ -8,14 +8,14 @@ unit test below catches it every time.
 Guarded-by: "pipeline: a del after a failed flush does not answer from the failed write before the degrade is published"
 
 diff --git a/bytecaskdb/db.cpp b/bytecaskdb/db.cpp
-index 5ac9e01..66e3637 100644
+index 184c7f5..1107f3b 100644
 --- a/bytecaskdb/db.cpp
 +++ b/bytecaskdb/db.cpp
-@@ -391,7 +391,6 @@ auto DB::apply_batch(WriteOptions opts,
+@@ -410,7 +410,6 @@ auto DB::apply_batch(WriteOptions opts, WritePlan plan)
    if (opts.sync)
      last_synced_return = {instance_id_, std::chrono::steady_clock::now()};
  
 -  settle_unappended(slot);
-   return slot.result;
+   return std::move(slot.result);
  }
  
