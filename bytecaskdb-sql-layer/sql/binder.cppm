@@ -1261,6 +1261,7 @@ void params_in(const ast::Compare& c, std::uint32_t& n) {
 }
 
 auto select_param_count(const ast::Select& s) -> std::uint32_t {
+  if (s.set) return std::max(select_param_count(s.set->left), select_param_count(s.set->right));
   std::uint32_t n = 0;
   for (const auto& e : s.targets) params_in(e, n);
   for (const auto& e : s.group_by) params_in(e, n);
@@ -1487,6 +1488,7 @@ public:
   static auto outputs_of(const logical::Node& n) -> const std::vector<logical::Output>& {
     if (const auto* p = std::get_if<logical::Project>(&n.op)) return p->exprs;
     if (const auto* a = std::get_if<logical::Aggregate>(&n.op)) return a->aggs;
+    if (const auto* o = std::get_if<logical::SetOp>(&n.op)) return o->outputs;
     const auto* in = logical::input_of(n);
     if (in == nullptr || !*in) throw std::logic_error{"a bound SELECT with no select list"};
     return outputs_of(**in);
@@ -1496,6 +1498,7 @@ public:
   // by one of its tables, or unqualified, of none of the subquery's own
   // tables but of one of the outer's.
   auto correlated(const ast::Select& q) const -> bool {
+    if (q.set) return correlated(q.set->left) || correlated(q.set->right);
     std::vector<const Table*> own;
     for (const auto& name : {q.table, q.join}) {
       if (const auto* t = name.empty() ? nullptr : cat_.table(name)) own.push_back(t);
@@ -2226,6 +2229,7 @@ public:
   // dependency, so it is the same in every row of a group, read from any
   // one (Aggregate::dependent), and the GROUP BY stays as written.
   auto select(const ast::Select& s) -> logical::NodePtr {
+    if (s.set) return set_operation(s);
     if (s.table.empty()) return select_without_from(s);
     auto starred = std::ranges::any_of(s.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Star; });
     std::vector<ast::Expr> expanded;
@@ -2368,6 +2372,117 @@ public:
     if (s.limit) rows = logical::node(logical::Limit{std::move(rows), *s.limit});
     if (outer) nullable_above_join(*rows, sides[1]->id);
     return rows;
+  }
+
+  // An arm of a set operation: its rows, and for each column whether it is
+  // an untyped literal, which PostgreSQL types by the other arm.
+  struct Arm {
+    logical::NodePtr node;
+    std::vector<bool> untyped;
+  };
+
+  // UNION, INTERSECT or EXCEPT. Each arm is bound as a SELECT of its own
+  // and must be a plain one: a Project, not an Aggregate (GROUP BY, an
+  // aggregate call or DISTINCT), because the plan streams an arm's rows into
+  // the operation and has no group to stream. The columns' types resolve
+  // pair by pair, as PostgreSQL resolves UNION's (set_type); the names are
+  // the left arm's. ORDER BY of the combined rows would need the plan to
+  // hold typed rows, which the plan API has no object for.
+  auto set_operation(const ast::Select& s) -> logical::NodePtr {
+    auto arm = set_arm(s, true);
+    return std::move(arm.node);
+  }
+
+  static auto set_name(ast::SetOperation::Kind k) -> std::string {
+    switch (k) {
+      case ast::SetOperation::Kind::Union: return "UNION";
+      case ast::SetOperation::Kind::Intersect: return "INTERSECT";
+      case ast::SetOperation::Kind::Except: return "EXCEPT";
+    }
+    return "UNION";
+  }
+
+  auto set_arm(const ast::Select& q, bool root) -> Arm {
+    if (q.set) {
+      if (!q.order_by.empty()) not_yet("ORDER BY on a set operation", q.pos);
+      if (!root && q.limit) not_yet("LIMIT on a parenthesised set operation inside another", q.pos);
+      const auto& op = *q.set;
+      auto l = set_arm(op.left, false);
+      auto r = set_arm(op.right, false);
+      const auto& lo = outputs_of(*l.node);
+      const auto& ro = outputs_of(*r.node);
+      auto what = set_name(op.kind);
+      if (lo.size() != ro.size()) throw SqlError{"each " + what + " query must have the same number of columns", q.pos};
+      logical::SetOp out;
+      out.kind = op.kind;
+      out.all = op.all;
+      Arm arm;
+      for (std::size_t i = 0; i < lo.size(); ++i) {
+        auto type = set_type(lo[i].expr.type, ro[i].expr.type, l.untyped[i], r.untyped[i], what, q.pos);
+        out.outputs.push_back({logical::param(0, type), lo[i].name});
+        arm.untyped.push_back(l.untyped[i] && r.untyped[i]);
+      }
+      out.left = std::move(l.node);
+      out.right = std::move(r.node);
+      arm.node = logical::node(std::move(out));
+      if (q.limit) arm.node = logical::node(logical::Limit{std::move(arm.node), *q.limit});
+      return arm;
+    }
+    if (q.for_update) throw SqlError{"FOR UPDATE is not allowed with UNION/INTERSECT/EXCEPT", q.pos, kFeatureNotSupported};
+    Arm arm;
+    arm.node = select(q);
+    const logical::Node* n = arm.node.get();
+    while (!std::holds_alternative<logical::Project>(n->op)) {
+      const auto* in = logical::input_of(*n);
+      if (in == nullptr || !std::holds_alternative<logical::Limit>(n->op)) {
+        not_yet("a set operation over an aggregated, grouped or DISTINCT query", q.pos);
+      }
+      n = in->get();
+    }
+    const auto& outs = outputs_of(*arm.node);
+    auto stars = std::ranges::any_of(q.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Star; });
+    for (std::size_t i = 0; i < outs.size(); ++i) {
+      const auto* e = stars || i >= q.targets.size() ? nullptr : &q.targets[i];
+      arm.untyped.push_back(e != nullptr && e->kind == ast::Expr::Kind::Literal &&
+                            (e->literal.kind == ast::Literal::Kind::Null || e->literal.kind == ast::Literal::Kind::String));
+    }
+    return arm;
+  }
+
+  // The type of a column both arms give, as PostgreSQL's UNION resolves it:
+  // the same type; integers widen to the wider; an integer or REAL meeting
+  // DOUBLE PRECISION is that; DECIMALs of one scale a DECIMAL; TEXT meeting
+  // VARCHAR is TEXT, and VARCHARs of two lengths VARCHAR; types of one class
+  // that are not these, or a literal of no type of its own, are refused; else
+  // 42804.
+  static auto set_type(SqlType a, SqlType b, bool a_untyped, bool b_untyped, const std::string& what, std::int32_t pos)
+      -> SqlType {
+    if (a == b) return a;
+    auto refuse = [&] [[noreturn]] (const std::string& why) { not_yet(what + " of " + why, pos); };
+    if (a_untyped || b_untyped) refuse("a literal of no type and a column of another type");
+    if (type_class(a.kind) != type_class(b.kind)) {
+      throw SqlError{what + " types " + pg_type_name(a) + " and " + pg_type_name(b) + " cannot be matched", pos,
+                     kDatatypeMismatch};
+    }
+    auto approximate = [](SqlType t) { return t.kind == SqlKind::Real || t.kind == SqlKind::Double; };
+    if (is_integer(a) && is_integer(b)) {
+      auto rank = [](SqlType t) { return t.kind == SqlKind::SmallInt ? 0 : t.kind == SqlKind::Integer ? 1 : 2; };
+      return rank(a) >= rank(b) ? a : b;
+    }
+    if ((is_integer(a) || approximate(a)) && (is_integer(b) || approximate(b))) {
+      // An integer is read as a double exactly as far as a double holds it, as PostgreSQL's cast
+      // does; a REAL would round it to a float, which the layer does not.
+      if ((is_integer(a) && b.kind == SqlKind::Real) || (a.kind == SqlKind::Real && is_integer(b))) {
+        refuse("an integer and REAL");
+      }
+      return SqlType{SqlKind::Double};
+    }
+    if (a.kind == SqlKind::Decimal && b.kind == SqlKind::Decimal && a.scale == b.scale) return numeric_type(a.scale);
+    if (is_string(a) && is_string(b)) {
+      if (a.kind == SqlKind::Varchar && b.kind == SqlKind::Varchar) return SqlType{SqlKind::Varchar};
+      return SqlType{SqlKind::Text};
+    }
+    refuse(pg_type_name(a) + " and " + pg_type_name(b));
   }
 
   // Above a left outer join every column of its right table may be NULL, in
@@ -2828,12 +2943,15 @@ public:
   auto describe(const ast::Select& query, const std::vector<std::string>& columns) -> ViewBody {
     ViewBody b{expand(query), {}};
     Binder scratch{cat_, 0};
-    if (std::ranges::any_of(b.select.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Star; })) {
+    if (!b.select.set &&
+        std::ranges::any_of(b.select.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Star; })) {
       b.select.targets = scratch.expand_stars(b.select);
     }
     auto root = scratch.select(b.select);
     for (const auto& out : Binder::outputs_of(*root)) b.names.push_back(out.name);
-    if (b.names.size() != b.select.targets.size()) throw std::logic_error{"a view's columns are not its select list"};
+    if (!b.select.set && b.names.size() != b.select.targets.size()) {
+      throw std::logic_error{"a view's columns are not its select list"};
+    }
     if (columns.size() > b.names.size()) {
       throw SqlError{"CREATE VIEW specifies more column names than columns", b.select.pos};
     }
@@ -2848,6 +2966,11 @@ public:
 
   // The tables and views a SELECT names directly, subqueries included.
   void relations(const ast::Select& s, std::vector<std::uint32_t>& out) const {
+    if (s.set) {
+      relations(s.set->left, out);
+      relations(s.set->right, out);
+      return;
+    }
     for (const auto* name : {&s.table, &s.join}) {
       if (name->empty()) continue;
       if (const auto* t = cat_.table(*name)) out.push_back(t->id);
@@ -2860,6 +2983,7 @@ private:
   static constexpr int kMaxDepth = 16;
 
   [[nodiscard]] auto mentions(const ast::Select& s) const -> bool {
+    if (s.set) return mentions(s.set->left) || mentions(s.set->right);
     auto found = cat_.view(s.table) != nullptr || cat_.view(s.join) != nullptr;
     each_subquery(s, [&](const std::shared_ptr<const ast::Select>& q) { found = found || mentions(*q); });
     return found;
@@ -2909,6 +3033,13 @@ private:
 
   auto expand(const ast::Select& in) -> ast::Select {
     auto s = ast::clone(in);
+    if (s.set) {
+      if (mentions(in)) {
+        s.set = std::make_shared<const ast::SetOperation>(
+            ast::SetOperation{s.set->kind, s.set->all, expand(s.set->left), expand(s.set->right)});
+      }
+      return s;
+    }
     auto expand_slot = [&](std::shared_ptr<const ast::Select>& q) {
       if (mentions(*q)) q = std::make_shared<const ast::Select>(expand(*q));
     };
@@ -2931,6 +3062,7 @@ private:
   // that cuts rows (DISTINCT, LIMIT).
   void merge_one(ast::Select& s, const ViewBody& v) {
     const auto& view = v.select;
+    if (view.set) not_yet("reading a view defined with a set operation", s.table_pos);
     auto grouped = aggregated(view);
     if (view.distinct || view.limit) not_yet("a view defined with DISTINCT or LIMIT", s.table_pos);
     if (view.for_update) not_yet("a view defined FOR UPDATE", s.table_pos);

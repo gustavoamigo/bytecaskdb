@@ -1,0 +1,349 @@
+# UNION, INTERSECT and EXCEPT, each with ALL or DISTINCT, between SELECTs of
+# plain columns, constants and parameters. INTERSECT binds tighter than UNION
+# and EXCEPT; parentheses group. A LIMIT applies to the combined rows. Not
+# built: ORDER BY on the combined rows, and an arm that groups, aggregates or
+# is DISTINCT (refused, 42601). Reading a view defined with a set operation
+# is refused (42601).
+#
+# sa.x: 1, 2, 2, NULL, NULL     sb.y: 2, 3, NULL, 3, 2
+
+- name: UNION and UNION ALL, NULL equal to NULL
+  features: [E071-01, E071-02]
+  setup:
+    - CREATE TABLE so1a (id INTEGER PRIMARY KEY, x INTEGER)
+    - CREATE TABLE so1b (id INTEGER PRIMARY KEY, y INTEGER)
+    - INSERT INTO so1a VALUES (1, 1)
+    - INSERT INTO so1a VALUES (2, 2)
+    - INSERT INTO so1a VALUES (3, 2)
+    - INSERT INTO so1a VALUES (4, NULL)
+    - INSERT INTO so1a VALUES (5, NULL)
+    - INSERT INTO so1b VALUES (1, 2)
+    - INSERT INTO so1b VALUES (2, 3)
+    - INSERT INTO so1b VALUES (3, NULL)
+    - INSERT INTO so1b VALUES (4, 3)
+    - INSERT INTO so1b VALUES (5, 2)
+  steps:
+    - sql: SELECT x FROM so1a UNION ALL SELECT y FROM so1b
+      expected: [[1], [2], [2], [null], [null], [2], [3], [null], [3], [2]]
+    - sql: SELECT x FROM so1a UNION SELECT y FROM so1b
+      expected: [[1], [2], [3], [null]]
+    - sql: SELECT x FROM so1a UNION DISTINCT SELECT y FROM so1b
+      expected: [[1], [2], [3], [null]]
+    - sql: SELECT x FROM so1a UNION ALL SELECT y FROM so1b UNION ALL SELECT x FROM so1a WHERE id = 1
+      expected: [[1], [2], [2], [null], [null], [2], [3], [null], [3], [2], [1]]
+    - sql: SELECT id, x FROM so1a WHERE id < 3 UNION SELECT id, y FROM so1b WHERE id < 3
+      expected: [[1, 1], [2, 2], [1, 2], [2, 3]]
+  teardown:
+    - DROP TABLE so1b
+    - DROP TABLE so1a
+
+- name: EXCEPT and INTERSECT, with ALL keeping the counts
+  features: [E071-03, F302-01, F302-02, F304]
+  setup:
+    - CREATE TABLE so2a (id INTEGER PRIMARY KEY, x INTEGER)
+    - CREATE TABLE so2b (id INTEGER PRIMARY KEY, y INTEGER)
+    - INSERT INTO so2a VALUES (1, 1)
+    - INSERT INTO so2a VALUES (2, 2)
+    - INSERT INTO so2a VALUES (3, 2)
+    - INSERT INTO so2a VALUES (4, NULL)
+    - INSERT INTO so2a VALUES (5, NULL)
+    - INSERT INTO so2b VALUES (1, 2)
+    - INSERT INTO so2b VALUES (2, 3)
+    - INSERT INTO so2b VALUES (3, NULL)
+    - INSERT INTO so2b VALUES (4, 3)
+    - INSERT INTO so2b VALUES (5, 2)
+  steps:
+    - sql: SELECT x FROM so2a EXCEPT SELECT y FROM so2b
+      expected: [[1]]
+    - sql: SELECT x FROM so2a EXCEPT DISTINCT SELECT y FROM so2b
+      expected: [[1]]
+    - sql: SELECT x FROM so2a EXCEPT ALL SELECT y FROM so2b
+      expected: [[1], [null]]
+    - sql: SELECT y FROM so2b EXCEPT ALL SELECT x FROM so2a
+      expected: [[3], [3]]
+    - sql: SELECT x FROM so2a INTERSECT SELECT y FROM so2b
+      expected: [[2], [null]]
+    - sql: SELECT x FROM so2a INTERSECT ALL SELECT y FROM so2b
+      expected: [[2], [2], [null]]
+    - sql: SELECT y FROM so2b INTERSECT ALL SELECT x FROM so2a
+      expected: [[2], [2], [null]]
+    - sql: SELECT x FROM so2a EXCEPT SELECT x FROM so2a
+      expected: []
+  teardown:
+    - DROP TABLE so2b
+    - DROP TABLE so2a
+
+- name: INTERSECT binds tighter than UNION and EXCEPT, and parentheses group
+  features: [E071-01, E071-03, F302-01]
+  setup:
+    - CREATE TABLE so3a (id INTEGER PRIMARY KEY, x INTEGER)
+    - CREATE TABLE so3b (id INTEGER PRIMARY KEY, y INTEGER)
+    - INSERT INTO so3a VALUES (1, 1)
+    - INSERT INTO so3a VALUES (2, 2)
+    - INSERT INTO so3a VALUES (3, 2)
+    - INSERT INTO so3a VALUES (4, NULL)
+    - INSERT INTO so3a VALUES (5, NULL)
+    - INSERT INTO so3b VALUES (1, 2)
+    - INSERT INTO so3b VALUES (2, 3)
+    - INSERT INTO so3b VALUES (3, NULL)
+    - INSERT INTO so3b VALUES (4, 3)
+    - INSERT INTO so3b VALUES (5, 2)
+  steps:
+    - sql: SELECT 1 UNION SELECT x FROM so3a INTERSECT SELECT y FROM so3b
+      expected: [[1], [2], [null]]
+    - sql: (SELECT 1 UNION SELECT x FROM so3a) INTERSECT SELECT y FROM so3b
+      expected: [[2], [null]]
+    # UNION and EXCEPT are one level, left to right
+    - sql: SELECT x FROM so3a EXCEPT SELECT y FROM so3b UNION SELECT 7
+      expected: [[1], [7]]
+    - sql: SELECT x FROM so3a EXCEPT (SELECT y FROM so3b UNION SELECT 1)
+      expected: []
+    - sql: SELECT y FROM so3b EXCEPT (SELECT x FROM so3a EXCEPT SELECT 2)
+      expected: [[2], [3]]
+  teardown:
+    - DROP TABLE so3b
+    - DROP TABLE so3a
+
+- name: columns of different types combine as UNION resolves them
+  features: [E071-05]
+  setup:
+    - CREATE TABLE so4i (id INTEGER PRIMARY KEY, x INTEGER)
+    - CREATE TABLE so4b (id INTEGER PRIMARY KEY, y BIGINT)
+    - CREATE TABLE so4f (id INTEGER PRIMARY KEY, f DOUBLE PRECISION)
+    - CREATE TABLE so4t (id INTEGER PRIMARY KEY, s TEXT)
+    - INSERT INTO so4i VALUES (1, 1)
+    - INSERT INTO so4i VALUES (2, 2)
+    - INSERT INTO so4i VALUES (3, NULL)
+    - INSERT INTO so4b VALUES (1, 2)
+    - INSERT INTO so4b VALUES (2, 9000000000)
+    - INSERT INTO so4f VALUES (1, 2.5)
+    - INSERT INTO so4f VALUES (2, 2)
+    - INSERT INTO so4t VALUES (1, 'a')
+  steps:
+    - sql: SELECT x FROM so4i UNION SELECT y FROM so4b
+      expected: [[1], [2], [null], [9000000000]]
+    - sql: SELECT x FROM so4i UNION ALL SELECT f FROM so4f
+      expected: [[1], [2], [null], [2.5], [2]]
+    - sql: SELECT x FROM so4i UNION SELECT f FROM so4f
+      expected: [[1], [2], [null], [2.5]]
+    - sql: SELECT x FROM so4i INTERSECT SELECT f FROM so4f
+      expected: [[2]]
+    - sql: SELECT f FROM so4f EXCEPT SELECT x FROM so4i
+      expected: [[2.5]]
+    - sql: SELECT x FROM so4i UNION SELECT s FROM so4t
+      error: "42804"
+    - sql: SELECT s FROM so4t EXCEPT SELECT f FROM so4f
+      error: "42804"
+    - sql: SELECT x, id FROM so4i UNION SELECT y FROM so4b
+      error: "42601"
+    - sql: SELECT x FROM so4i INTERSECT SELECT y, id FROM so4b
+      error: "42601"
+  teardown:
+    - DROP TABLE so4t
+    - DROP TABLE so4f
+    - DROP TABLE so4b
+    - DROP TABLE so4i
+
+- name: LIMIT applies to the combined rows, parenthesised arms keep their own
+  features: [E071-02]
+  ordered: true
+  setup:
+    - CREATE TABLE so5a (id INTEGER PRIMARY KEY, x INTEGER)
+    - CREATE TABLE so5b (id INTEGER PRIMARY KEY, y INTEGER)
+    - INSERT INTO so5a VALUES (1, 10)
+    - INSERT INTO so5a VALUES (2, 20)
+    - INSERT INTO so5a VALUES (3, 30)
+    - INSERT INTO so5b VALUES (1, 40)
+    - INSERT INTO so5b VALUES (2, 50)
+  steps:
+    - sql: SELECT x FROM so5a WHERE id = 1 UNION ALL SELECT y FROM so5b WHERE id = 2 LIMIT 1
+      expected: [[10]]
+    - sql: SELECT x FROM so5a WHERE id = 1 UNION ALL SELECT y FROM so5b WHERE id = 2 LIMIT 5
+      expected: [[10], [50]]
+    - sql: SELECT x FROM so5a UNION ALL SELECT y FROM so5b LIMIT 0
+      expected: []
+    - sql: SELECT x FROM so5a UNION SELECT y FROM so5b LIMIT 2
+      rowcount: 2
+    - sql: (SELECT x FROM so5a ORDER BY id LIMIT 2) UNION ALL (SELECT y FROM so5b ORDER BY id DESC LIMIT 1)
+      expected: [[10], [20], [50]]
+    - sql: SELECT x FROM so5a ORDER BY x DESC LIMIT 1 UNION ALL SELECT y FROM so5b
+      error: "42601"
+    # ORDER BY of the combined rows is not built
+    - sql: SELECT x FROM so5a UNION ALL SELECT y FROM so5b ORDER BY x
+      error: "42601"
+  teardown:
+    - DROP TABLE so5b
+    - DROP TABLE so5a
+
+- name: arms of constants and of parameters, a missing row skips only its arm
+  features: [E071-01, E071-02]
+  setup:
+    - CREATE TABLE so6a (id INTEGER PRIMARY KEY, x INTEGER)
+    - CREATE TABLE so6b (id INTEGER PRIMARY KEY, y INTEGER)
+    - INSERT INTO so6a VALUES (1, 10)
+    - INSERT INTO so6a VALUES (2, 20)
+    - INSERT INTO so6b VALUES (1, 30)
+    - INSERT INTO so6b VALUES (2, 40)
+  steps:
+    - sql: SELECT 1 UNION SELECT 2 UNION SELECT 1
+      expected: [[1], [2]]
+    - sql: SELECT 1 UNION ALL SELECT 1
+      expected: [[1], [1]]
+    - sql: SELECT x FROM so6a WHERE id = $1 UNION ALL SELECT y FROM so6b WHERE id = $2
+      params: [1, 2]
+      expected: [[10], [40]]
+    - sql: SELECT x FROM so6a WHERE id = $1 UNION ALL SELECT y FROM so6b WHERE id = $2
+      params: [99, 2]
+      expected: [[40]]
+    - sql: SELECT x FROM so6a WHERE id = $1 UNION ALL SELECT y FROM so6b WHERE id = $2
+      params: [1, 99]
+      expected: [[10]]
+    - sql: SELECT x FROM so6a WHERE id = $1 UNION SELECT y FROM so6b WHERE id = $2
+      params: [99, 99]
+      expected: []
+    - sql: SELECT x FROM so6a WHERE id = $1 INTERSECT SELECT x FROM so6a WHERE id = $2
+      params: [1, 1]
+      expected: [[10]]
+    - sql: SELECT x FROM so6a WHERE x > $1 EXCEPT SELECT y FROM so6b WHERE y < $2
+      params: [5, 35]
+      expected: [[10], [20]]
+  teardown:
+    - DROP TABLE so6b
+    - DROP TABLE so6a
+
+- name: a set operation in a subquery
+  features: [E071-06, F041-01]
+  setup:
+    - CREATE TABLE so7a (id INTEGER PRIMARY KEY, x INTEGER)
+    - CREATE TABLE so7b (id INTEGER PRIMARY KEY, y INTEGER)
+    - INSERT INTO so7a VALUES (1, 1)
+    - INSERT INTO so7a VALUES (2, 2)
+    - INSERT INTO so7a VALUES (3, 3)
+    - INSERT INTO so7b VALUES (1, 3)
+    - INSERT INTO so7b VALUES (2, 4)
+  steps:
+    - sql: SELECT id FROM so7a WHERE EXISTS (SELECT x FROM so7a UNION ALL SELECT y FROM so7b)
+      expected: [[1], [2], [3]]
+    - sql: SELECT id FROM so7a WHERE EXISTS (SELECT x FROM so7a EXCEPT SELECT x FROM so7a)
+      expected: []
+    - sql: SELECT id FROM so7a WHERE NOT EXISTS (SELECT x FROM so7a EXCEPT SELECT x FROM so7a)
+      expected: [[1], [2], [3]]
+    - sql: SELECT id FROM so7a WHERE x IN (SELECT y FROM so7b UNION SELECT 1)
+      expected: [[1], [3]]
+    - sql: SELECT id FROM so7a WHERE x NOT IN (SELECT y FROM so7b INTERSECT SELECT x FROM so7a)
+      expected: [[1], [2]]
+    - sql: SELECT id FROM so7a WHERE x > ANY (SELECT y FROM so7b EXCEPT SELECT 4)
+      expected: []
+    - sql: SELECT id FROM so7a WHERE x < (SELECT 3 UNION SELECT 3)
+      expected: [[1], [2]]
+    - sql: SELECT id FROM so7a WHERE x = (SELECT y FROM so7b UNION ALL SELECT x FROM so7a)
+      error: "21000"
+    - sql: SELECT id FROM so7a WHERE x IN (SELECT y, id FROM so7b UNION SELECT x, id FROM so7a)
+      error: "42601"
+  teardown:
+    - DROP TABLE so7b
+    - DROP TABLE so7a
+
+- name: a view can be defined by a set operation
+  features: [F081]
+  setup:
+    - CREATE TABLE so8a (id INTEGER PRIMARY KEY, x INTEGER)
+    - CREATE TABLE so8b (id INTEGER PRIMARY KEY, y INTEGER)
+  steps:
+    - sql: CREATE VIEW so8_v AS SELECT x FROM so8a EXCEPT SELECT y FROM so8b
+    - sql: CREATE VIEW so8_w (a) AS SELECT x FROM so8a UNION ALL SELECT y FROM so8b
+    - sql: CREATE VIEW so8_bad AS SELECT x, id FROM so8a UNION SELECT y FROM so8b
+      error: "42601"
+    # the tables a view reads cannot be dropped under it
+    - sql: DROP TABLE so8b
+      error: "2BP01"
+    # reading one is not built
+    - sql: SELECT * FROM so8_v
+      error: "42601"
+    - sql: DROP VIEW so8_w
+    - sql: DROP VIEW so8_v
+  teardown:
+    - DROP TABLE so8b
+    - DROP TABLE so8a
+
+- name: what a set operation refuses
+  features: [E071-01, F301]
+  setup:
+    - CREATE TABLE so9a (id INTEGER PRIMARY KEY, x INTEGER)
+    - CREATE TABLE so9b (id INTEGER PRIMARY KEY, y INTEGER)
+  steps:
+    - sql: SELECT x FROM so9a UNION CORRESPONDING SELECT y FROM so9b
+      error: "42601"
+    - sql: SELECT x FROM so9a UNION SELECT y FROM so9b FOR UPDATE
+      error: "0A000"
+    - sql: (SELECT x FROM so9a FOR UPDATE) UNION SELECT y FROM so9b
+      error: "0A000"
+    - sql: SELECT DISTINCT x FROM so9a UNION SELECT y FROM so9b
+      error: "42601"
+    - sql: SELECT COUNT(*) FROM so9a UNION SELECT y FROM so9b
+      error: "42601"
+    - sql: SELECT x FROM so9a GROUP BY x UNION SELECT y FROM so9b
+      error: "42601"
+    - sql: SELECT x FROM so9a UNION SELECT z FROM so9b
+      error: "42703"
+    - sql: SELECT x FROM nope UNION SELECT y FROM so9b
+      error: "42P01"
+  teardown:
+    - DROP TABLE so9b
+    - DROP TABLE so9a
+
+- name: a set operation under UPDATE and DELETE, and arms that join
+  features: [E071-06, E071-01]
+  setup:
+    - CREATE TABLE so10a (id INTEGER PRIMARY KEY, x INTEGER)
+    - CREATE TABLE so10b (id INTEGER PRIMARY KEY, y INTEGER)
+    - CREATE TABLE so10c (id INTEGER PRIMARY KEY, z INTEGER)
+    - INSERT INTO so10a VALUES (1, 1)
+    - INSERT INTO so10a VALUES (2, 2)
+    - INSERT INTO so10a VALUES (3, 3)
+    - INSERT INTO so10b VALUES (1, 3)
+    - INSERT INTO so10b VALUES (2, 4)
+    - INSERT INTO so10c VALUES (1, 100)
+    - INSERT INTO so10c VALUES (2, 200)
+  steps:
+    - sql: SELECT so10a.x FROM so10a, so10c WHERE so10a.id = so10c.id UNION SELECT y FROM so10b
+      expected: [[1], [2], [3], [4]]
+    - sql: SELECT so10a.x FROM so10a JOIN so10c ON so10a.id = so10c.id EXCEPT SELECT y FROM so10b WHERE id = 1
+      expected: [[1], [2]]
+    - sql: SELECT z FROM so10c LEFT JOIN so10a ON so10a.id = so10c.id INTERSECT SELECT 100
+      expected: [[100]]
+    - sql: UPDATE so10a SET x = 0 WHERE x IN (SELECT y FROM so10b UNION SELECT 2)
+      rowcount: 2
+    - sql: SELECT x FROM so10a
+      expected: [[1], [0], [0]]
+    - sql: DELETE FROM so10a WHERE EXISTS (SELECT 1 EXCEPT SELECT 1)
+      rowcount: 0
+    - sql: DELETE FROM so10a WHERE id IN (SELECT id FROM so10c INTERSECT SELECT id FROM so10b)
+      rowcount: 2
+    - sql: SELECT x FROM so10a
+      expected: [[0]]
+  teardown:
+    - DROP TABLE so10c
+    - DROP TABLE so10b
+    - DROP TABLE so10a
+
+- name: an arm can read a view
+  features: [E071-01, F081]
+  setup:
+    - CREATE TABLE so11a (id INTEGER PRIMARY KEY, x INTEGER)
+    - INSERT INTO so11a VALUES (1, 1)
+    - INSERT INTO so11a VALUES (2, 2)
+    - INSERT INTO so11a VALUES (3, 3)
+    - CREATE VIEW so11_v AS SELECT id, x FROM so11a WHERE x > 1
+  steps:
+    - sql: SELECT x FROM so11_v UNION ALL SELECT x FROM so11a WHERE id = 1
+      expected: [[2], [3], [1]]
+    - sql: SELECT x FROM so11a EXCEPT SELECT x FROM so11_v
+      expected: [[1]]
+    - sql: SELECT id FROM so11a WHERE x IN (SELECT x FROM so11_v INTERSECT SELECT x FROM so11a WHERE id = 3)
+      expected: [[3]]
+    - sql: DROP TABLE so11a
+      error: "2BP01"
+  teardown:
+    - DROP VIEW so11_v
+    - DROP TABLE so11a

@@ -211,6 +211,19 @@ public:
   [[nodiscard]] auto body() const -> const std::string& { return body_; }
   [[nodiscard]] auto p() const -> const physical::Plan& { return p_; }
 
+  // The lines another writer printed, indented to this one's depth; what that
+  // writer used joins this one's.
+  void splice(const Writer& inner) {
+    absorb(inner);
+    std::string_view text = inner.body_;
+    while (!text.empty()) {
+      auto end = text.find('\n');
+      body_ += std::string(2 * (depth_ - 1), ' ');
+      body_ += text.substr(0, end + 1);
+      text.remove_prefix(end + 1);
+    }
+  }
+
   // What a subquery's writer used, which the statement's plan declares.
   void absorb(const Writer& w) {
     used_.insert(w.used_.begin(), w.used_.end());
@@ -374,9 +387,9 @@ public:
 
   explicit Gen(Writer& w) : w_{w} {}
 
-  void plan(const physical::Node& root) {
-    // Each subquery first, once, on the statement's snapshot: it sets the
-    // parameters the rest reads (bc_sub_kind).
+  // Each subquery first, once, on the statement's snapshot: it sets the
+  // parameters the rest reads (bc_sub_kind).
+  void subqueries() {
     const auto& subs = w_.p().subs;
     for (std::size_t i = 0; i < subs.size(); ++i) {
       auto n = std::to_string(i);
@@ -385,12 +398,48 @@ public:
       w_.line("sub" + n + "(cx);");
       w_.line("bc_sub_end(cx);");
     }
+  }
+
+  void plan(const physical::Node& root) {
+    subqueries();
     print_computed(w_);
     // LIMIT 0 returns nothing, so nothing is read.
     if (limit_zero(root)) return;
     no_rows_ = no_rows(root);
     if (!w_.p().null_checks.empty()) return_if_null(w_, w_.p().null_checks, no_rows_);
     produce(root, [] {});
+  }
+
+  // A value in hand, as C: whether it is NULL, and its value (garbage where it is).
+  struct Val {
+    std::string null, value;
+    PhysType type{PhysType::I64};
+  };
+  using Row = std::vector<Val>;
+  // What a set operation does with each row an arm gives, printed where the
+  // row is in hand.
+  using Sink = std::function<void(Writer&, const Row&)>;
+
+  // An arm of a set operation, a SELECT's plan whose result rows go to
+  // `sink` instead. `limit` is a loop condition that stops the arm once the
+  // statement's LIMIT is reached, or empty. The arm's misses skip the rest
+  // of it instead of ending the plan: where a row is missing, the code after
+  // is in an `if`, which the arm closes.
+  void arm(const physical::Plan& arm_plan, const std::string& limit, const Sink& sink) {
+    sink_ = &sink;
+    base_limit_ = limit;
+    limit_ = limit;
+    const auto& root = *arm_plan.root;
+    print_computed(w_);
+    if (limit_zero(root)) return;
+    if (!arm_plan.null_checks.empty()) {
+      std::string cond;
+      for (auto n : arm_plan.null_checks) cond += (cond.empty() ? "" : " || ") + param_null(n);
+      w_.open("if (!(" + cond + "))");
+      ++open_;
+    }
+    produce(root, [] {});
+    for (; open_ > 0; --open_) w_.close();
   }
 
   static auto sub_kind(logical::Subquery::Kind k) -> std::string {
@@ -531,6 +580,11 @@ private:
   void miss(const std::string& cond) {
     if (loop_) {
       w_.line("if (" + cond + ") continue;");
+      return;
+    }
+    if (sink_ != nullptr) {
+      w_.open("if (!(" + cond + "))");
+      ++open_;
       return;
     }
     w_.open("if (" + cond + ")");
@@ -1203,7 +1257,7 @@ private:
       return;
     }
     w_.line("int64_t n = 0;");
-    limit_ = "n < " + std::to_string(l.n);
+    limit_ = (base_limit_.empty() ? "" : base_limit_ + " && ") + "n < " + std::to_string(l.n);
     produce(*l.input, [&] {
       k();
       w_.line("++n;");
@@ -1215,6 +1269,19 @@ private:
   // *Isolation*).
   void produce(const physical::Emit& e, const Consume&) {
     produce(*e.input, [&] {
+      if (sink_ != nullptr) {
+        Row row;
+        for (const auto& t : e.targets) {
+          if (const auto* p = std::get_if<physical::ParamTarget>(&t)) {
+            row.push_back({param_null(p->param), param(p->type, p->param), p->type});
+            continue;
+          }
+          const auto& c = std::get<ColumnRef>(t);
+          row.push_back({col_null(c), read_col(c), c.type});
+        }
+        (*sink_)(w_, row);
+        return;
+      }
       if (rows_.size() == 1 && rows_[0].covering) {
         // Every result column from the entry's key: no row read.
         const auto& b = rows_[0];
@@ -1985,6 +2052,9 @@ private:
   const Binding* keyed_{nullptr};  // the covering scan whose entry the row has bound as `key`, or null
   bool loop_{false};             // inside a loop: a miss is `continue`
   std::string limit_;            // a LIMIT's condition, n < its count, or empty
+  const Sink* sink_{nullptr};    // an arm of a set operation: where its result rows go
+  std::string base_limit_;       // an arm's: the statement's LIMIT, which every loop of the arm also stops at
+  int open_{0};                  // an arm's: the `if` blocks its misses opened
   std::string* hit_{nullptr};    // a one-row aggregate: a miss joins this condition instead
   int choices_{0};               // the choice points printed: each counts into count<i>, over lo<i> and hi<i>
   int sorts_{0};                 // the sorts printed: each into sorter s<i>, its row p<i>
@@ -2001,6 +2071,230 @@ private:
   std::map<const physical::Scan*, Counted> counted_;
 };
 
+// Prints a set operation (docs/planner_design.md, *Set operations*). Each
+// arm is printed as its own SELECT, in a block of the plan's one function,
+// and the rows it gives go to a sink that does the operation's part: they
+// are not collected, so the plan holds only what telling duplicates apart
+// needs, a bc_agg of the rows' keys (a sort key of every column, NULL equal
+// to NULL) with a count or two per key. UNION ALL holds nothing. UNION
+// streams both arms through a set of the keys seen. INTERSECT and EXCEPT
+// stream the arm whose rows can be returned, after the other's keys are in
+// the aggregate with how many rows had each; a row is returned while the
+// count of the rows it matched is not used up (ALL), or once (DISTINCT).
+class SetGen {
+public:
+  SetGen(Writer& w, const physical::Plan& p) : w_{w}, p_{p} {}
+
+  void plan() {
+    Gen{w_}.subqueries();
+    const auto& limit = p_.set_limit;
+    if (limit && *limit == 0) return;  // LIMIT 0 returns nothing, so nothing is read
+    if (limit) {
+      stop_ = "setcount < " + std::to_string(*limit);
+      w_.line("int64_t setcount = 0;");
+    }
+    stream(*p_.set, [&](Writer& w, const Row& row) {
+      if (limit) w.open("if (" + stop_ + ")");
+      emit(w, row);
+      if (limit) {
+        w.line("setcount = bc_add(cx, setcount, INT64_C(1));");
+        w.close();
+      }
+    }, true);
+  }
+
+private:
+  using Row = Gen::Row;
+  using Sink = Gen::Sink;
+  using Val = Gen::Val;
+
+  auto fresh(const std::string& what) -> std::string { return "set" + what + std::to_string(ids_++); }
+
+  static auto zero(PhysType t) -> std::string {
+    switch (t) {
+      case PhysType::I64: return "INT64_C(0)";
+      case PhysType::F64: return "0.0";
+      case PhysType::Bool: return "false";
+      case PhysType::Bytes: return "bc_empty(cx)";
+    }
+    return "INT64_C(0)";
+  }
+
+  static auto c_type(PhysType t) -> std::string {
+    switch (t) {
+      case PhysType::I64: return "int64_t";
+      case PhysType::F64: return "double";
+      case PhysType::Bool: return "bool";
+      case PhysType::Bytes: return "bc_view";
+    }
+    return "int64_t";
+  }
+
+  static void emit(Writer& w, const Row& row) {
+    w.line("bc_emit_begin(cx);");
+    for (const auto& v : row) {
+      w.open("if (" + v.null + ")");
+      w.line("bc_emit_null(cx);");
+      w.otherwise();
+      w.line("bc_emit_" + suffix(v.type) + "(cx, " + v.value + ");");
+      w.close();
+    }
+    w.line("bc_emit_end(cx);");
+  }
+
+  // The arm's values in locals, a NULL one's value the type's zero: what
+  // the rest reads more than once, and where it is not NULL.
+  Sink held(Sink next) {
+    return [this, into = std::move(next)](Writer& w, const Row& row) {
+      Row out;
+      for (const auto& v : row) {
+        auto n = fresh("n");
+        auto x = fresh("x");
+        w.line("bool " + n + " = " + v.null + ";");
+        w.line(c_type(v.type) + " " + x + " = " + zero(v.type) + ";");
+        w.line("if (!" + n + ") " + x + " = " + v.value + ";");
+        out.push_back({n, x, v.type});
+      }
+      into(w, out);
+    };
+  }
+
+  // The arm's rows as the operation's columns: an integer type meeting a
+  // floating one is converted to it.
+  Sink converted(const std::vector<SqlType>& from_types, const std::vector<SqlType>& to_types, Sink next) {
+    auto same = true;
+    for (std::size_t i = 0; i < to_types.size(); ++i) same = same && phys_type(from_types[i]) == phys_type(to_types[i]);
+    if (same) return next;
+    return [this, from = from_types, to = to_types, into = std::move(next)](Writer& w, const Row& row) {
+      Row out = row;
+      for (std::size_t i = 0; i < to.size(); ++i) {
+        if (phys_type(from[i]) == phys_type(to[i])) continue;
+        if (phys_type(from[i]) != PhysType::I64 || phys_type(to[i]) != PhysType::F64) {
+          throw std::logic_error{"physical plan: a set operation column converted other than from integer to double"};
+        }
+        auto x = fresh("x");
+        w.line("double " + x + " = bc_i64_to_f64(" + row[i].value + ");");
+        out[i] = {row[i].null, x, PhysType::F64};
+      }
+      into(w, out);
+    };
+  }
+
+  // The group of the aggregate the row's key names.
+  auto group(Writer& w, const std::string& agg, const Row& row) -> std::string {
+    auto k = fresh("k");
+    w.line("bc_sort_key " + k + " = bc_sort_key_begin(cx);");
+    for (const auto& v : row) {
+      w.open("if (" + v.null + ")");
+      w.line("bc_sort_key_null(cx, " + k + ", BC_SORT_ASC, BC_SORT_NULLS_LAST);");
+      w.otherwise();
+      w.line("bc_sort_key_" + suffix(v.type) + "(cx, " + k + ", " + v.value + ", BC_SORT_ASC, BC_SORT_NULLS_LAST);");
+      w.close();
+    }
+    auto g = fresh("g");
+    w.line("bc_group " + g + " = bc_agg_group(cx, " + agg + ", bc_sort_key_end(cx, " + k + "));");
+    return g;
+  }
+
+  static auto add_one(const std::string& g, int slot) -> std::string {
+    return "bc_agg_add_i64(cx, " + g + ", " + std::to_string(slot) + ", INT64_C(1));";
+  }
+
+  static auto slot_i64(const std::string& g, int slot) -> std::string {
+    return "bc_agg_i64(cx, " + g + ", " + std::to_string(slot) + ")";
+  }
+
+  // Slot 0 counts the rows of the side held, slot 1 the rows returned.
+  Sink hold_rows(const std::string& agg) {
+    return [this, agg](Writer& w, const Row& row) { w.line(add_one(group(w, agg, row), 0)); };
+  }
+
+  // The rows of `side` are the node's, streamed after the held side's.
+  void stream(const physical::SetPlan& n, const Sink& sink, bool direct) {
+    if (n.select) {
+      leaf(n, sink, direct);
+      return;
+    }
+    auto side = [&](const physical::SetPlan& s, const Sink& into, bool d) {
+      stream(s, converted(s.types, n.types, into), d);
+    };
+    using Kind = logical::SetOp::Kind;
+    if (n.kind == Kind::Union && n.all) {
+      side(*n.left, sink, direct);
+      side(*n.right, sink, direct);
+      return;
+    }
+    auto agg = fresh("u");
+    w_.line("bc_agg " + agg + " = bc_agg_open(cx, 2);");
+    if (n.kind == Kind::Union) {
+      Sink once = [this, agg, sink](Writer& w, const Row& row) {
+        auto g = group(w, agg, row);
+        w.open("if (bc_agg_null(cx, " + g + ", 0))");
+        w.line(add_one(g, 0));
+        sink(w, row);
+        w.close();
+      };
+      side(*n.left, once, direct);
+      side(*n.right, once, direct);
+      return;
+    }
+    // EXCEPT returns the left arm's rows the right's did not use up;
+    // INTERSECT the right arm's that the left's did not.
+    auto except = n.kind == Kind::Except;
+    Sink match = [this, agg, sink, except, all = n.all](Writer& w, const Row& row) {
+      auto g = group(w, agg, row);
+      if (all) {
+        w.open("if (" + slot_i64(g, 1) + " < " + slot_i64(g, 0) + ")");
+        w.line(add_one(g, 1));
+        if (!except) sink(w, row);
+        if (except) {
+          w.otherwise();
+          sink(w, row);
+        }
+        w.close();
+        return;
+      }
+      // DISTINCT: once, if a row of the held side had the key (INTERSECT) or
+      // none did (EXCEPT).
+      w.open("if (" + std::string{except ? "" : "!"} + "bc_agg_null(cx, " + g + ", 0))");
+      w.open("if (bc_agg_null(cx, " + g + ", 1))");
+      w.line(add_one(g, 1));
+      sink(w, row);
+      w.close();
+      w.close();
+    };
+    const auto& held_side = except ? *n.right : *n.left;
+    const auto& probed = except ? *n.left : *n.right;
+    side(held_side, hold_rows(agg), false);
+    side(probed, match, direct);
+  }
+
+  // The arm as a block of its own, its rows held in locals and converted by
+  // the node above before the sink sees them.
+  void leaf(const physical::SetPlan& n, const Sink& sink, bool direct) {
+    Writer lw{*n.select};
+    Gen g{lw};
+    g.arm(*n.select, direct && !stop_.empty() ? stop_ : std::string{}, held(sink));
+    w_.open("");
+    w_.splice(lw);
+    w_.close();
+  }
+
+  Writer& w_;
+  const physical::Plan& p_;
+  std::string stop_;  // the statement's LIMIT as a loop condition, or empty
+  int ids_{0};
+};
+
+// A plan's code: a SELECT's pipeline, or a set operation's arms.
+void print_body(Writer& w, const physical::Plan& p) {
+  if (p.set) {
+    SetGen{w, p}.plan();
+  } else {
+    Gen{w}.plan(*p.root);
+  }
+}
+
 // Prints a searched plan, checked first.
 auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std::string_view sql) -> GeneratedPlan {
   p.param_types = param_types;
@@ -2013,23 +2307,27 @@ auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std
   std::string subs;
   for (std::size_t i = 0; i < p.subs.size(); ++i) {
     Writer sw{*p.subs[i].plan};
-    Gen{sw}.plan(*p.subs[i].plan->root);
+    print_body(sw, *p.subs[i].plan);
     w.absorb(sw);
     subs += "\nstatic void sub" + std::to_string(i) + "(bc_ctx *cx) {\n" + sw.body() + "}\n";
   }
-  Gen{w}.plan(*p.root);
-  std::visit(
-      [&](const auto& op) {
-        using T = std::decay_t<decltype(op)>;
-        if constexpr (std::is_same_v<T, physical::Insert> || std::is_same_v<T, physical::Update> ||
-                      std::is_same_v<T, physical::Delete>) {
-          // The runtime maintains the table's indexes: a write plan names none.
-          out.tables_written = {op.table};
-        } else {
-          out.returns_rows = true;
-        }
-      },
-      p.root->op);
+  print_body(w, p);
+  if (p.set) {
+    out.returns_rows = true;
+  } else {
+    std::visit(
+        [&](const auto& op) {
+          using T = std::decay_t<decltype(op)>;
+          if constexpr (std::is_same_v<T, physical::Insert> || std::is_same_v<T, physical::Update> ||
+                        std::is_same_v<T, physical::Delete>) {
+            // The runtime maintains the table's indexes: a write plan names none.
+            out.tables_written = {op.table};
+          } else {
+            out.returns_rows = true;
+          }
+        },
+        p.root->op);
+  }
   for (const auto& r : p.result) {
     const auto columns = physical::plan_columns(r.sql);
     out.result_types.insert(out.result_types.end(), columns.begin(), columns.end());
@@ -2053,6 +2351,62 @@ auto rewritten(bound::Bound& b) -> logical::Node& {
   return **stmt;
 }
 
+// A statement or subquery that is a set operation, with the LIMIT over it.
+struct SetRoot {
+  const logical::Node* node;  // the set operation, under the LIMIT
+  const logical::SetOp* op;
+  std::optional<std::int64_t> limit;
+};
+
+auto set_root(const logical::Node& n) -> std::optional<SetRoot> {
+  const auto* top = &n;
+  std::optional<std::int64_t> limit;
+  if (const auto* l = std::get_if<logical::Limit>(&n.op)) {
+    limit = l->n;
+    top = l->input.get();
+  }
+  if (const auto* s = std::get_if<logical::SetOp>(&top->op)) return SetRoot{top, s, limit};
+  return std::nullopt;
+}
+
+// The plans of a set operation's arms, each searched alone, as a tree. Their
+// constants and costs are added to `into`.
+auto set_tree(const logical::Node& n, const Catalog& cat, const RowCounts& counts, std::uint64_t memory_bytes,
+              const std::vector<PhysType>& param_types, physical::Plan& into) -> std::shared_ptr<const physical::SetPlan> {
+  auto out = std::make_shared<physical::SetPlan>();
+  if (const auto* s = std::get_if<logical::SetOp>(&n.op)) {
+    out->kind = s->kind;
+    out->all = s->all;
+    out->left = set_tree(*s->left, cat, counts, memory_bytes, param_types, into);
+    out->right = set_tree(*s->right, cat, counts, memory_bytes, param_types, into);
+    for (const auto& o : s->outputs) out->types.push_back(o.expr.type);
+    return out;
+  }
+  auto arm = search(n, cat, counts, memory_bytes);
+  arm.param_types = param_types;
+  for (const auto& c : arm.constants) {
+    if (std::ranges::none_of(into.constants, [&](const auto& d) { return d.name == c.name; })) into.constants.push_back(c);
+  }
+  into.cost += arm.cost;
+  for (const auto& r : arm.result) out->types.push_back(r.sql);
+  out->select = std::make_shared<const physical::Plan>(std::move(arm));
+  return out;
+}
+
+// The cheapest plan of a rewritten statement or subquery: a SELECT's, or a
+// set operation's, whose arms are each searched alone.
+auto plan_for(const logical::Node& n, const Catalog& cat, const RowCounts& counts, std::uint64_t memory_bytes,
+              const std::vector<PhysType>& param_types) -> physical::Plan {
+  const auto set = set_root(n);
+  if (!set) return search(n, cat, counts, memory_bytes);
+  physical::Plan p;
+  p.catalog_version = cat.version();
+  p.set = set_tree(*set->node, cat, counts, memory_bytes, param_types, p);
+  p.set_limit = set->limit;
+  for (const auto& o : set->op->outputs) p.result.push_back({o.name, o.expr.type});
+  return p;
+}
+
 // Each subquery's cheapest plan, its parameters the statement's, given to
 // `p`; the constants of its tables join the statement's, so the one source
 // declares them all.
@@ -2060,7 +2414,7 @@ void attach_subqueries(physical::Plan& p, bound::Bound& b, const Catalog& cat, c
                        std::uint64_t memory_bytes) {
   for (auto& s : b.subqueries) {
     logical::rewrite(*s.plan);
-    auto sp = search(*s.plan, cat, counts, memory_bytes);
+    auto sp = plan_for(*s.plan, cat, counts, memory_bytes, b.param_types);
     sp.param_types = b.param_types;
     for (const auto& c : sp.constants) {
       if (std::ranges::none_of(p.constants, [&](const auto& d) { return d.name == c.name; })) p.constants.push_back(c);
@@ -2075,13 +2429,19 @@ auto no_rows_lines(const physical::Node& root) -> std::vector<std::string> { ret
 
 auto generate_plan(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts,
                    std::uint64_t memory_bytes) -> GeneratedPlan {
-  auto p = search(rewritten(b), cat, counts, memory_bytes);
+  auto p = plan_for(rewritten(b), cat, counts, memory_bytes, b.param_types);
   attach_subqueries(p, b, cat, counts, memory_bytes);
   return print_plan(p, b.param_types, sql);
 }
 
 auto generate_alternatives(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts,
                            std::uint64_t memory_bytes) -> std::vector<GeneratedPlan> {
+  // A set operation's arms are each searched alone, and only the cheapest of each is kept.
+  if (const auto* stmt = std::get_if<logical::NodePtr>(&b.stmt); stmt != nullptr && set_root(**stmt)) {
+    std::vector<GeneratedPlan> only;
+    only.push_back(generate_plan(std::move(b), cat, sql, counts, memory_bytes));
+    return only;
+  }
   std::vector<GeneratedPlan> out;
   physical::Plan with_subs;  // the subqueries' plans, the same for every alternative
   attach_subqueries(with_subs, b, cat, counts, memory_bytes);

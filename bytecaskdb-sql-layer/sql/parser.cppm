@@ -774,8 +774,49 @@ void resolve_aliases(Select& sel, const std::vector<std::string>& aliases) {
   }
 }
 
+// ORDER BY's columns, in order.
+auto order_items(const PgQuery__SelectStmt* s, std::int32_t pos) -> std::vector<OrderItem> {
+  std::vector<OrderItem> out;
+  for (std::size_t i = 0; i < s->n_sort_clause; ++i) {
+    const auto* sb = s->sort_clause[i]->sort_by;
+    // libpg_query records no position for a SortBy: report its column's.
+    if (sb->node == nullptr || sb->node->node_case != PG_QUERY__NODE__NODE_COLUMN_REF) {
+      reject("ORDER BY takes columns", pos);
+    }
+    auto col = expr(sb->node);
+    if (sb->sortby_dir == PG_QUERY__SORT_BY_DIR__SORTBY_USING) reject("ORDER BY ... USING is not supported", col.pos);
+    std::optional<bool> nulls_first;
+    if (sb->sortby_nulls == PG_QUERY__SORT_BY_NULLS__SORTBY_NULLS_FIRST) nulls_first = true;
+    if (sb->sortby_nulls == PG_QUERY__SORT_BY_NULLS__SORTBY_NULLS_LAST) nulls_first = false;
+    out.push_back({col.column, sb->sortby_dir == PG_QUERY__SORT_BY_DIR__SORTBY_DESC, col.pos, col.table,
+                            nulls_first});
+  }
+  return out;
+}
+
+// UNION, INTERSECT or EXCEPT of the statement's two queries, whose own
+// ORDER BY and LIMIT are the combined rows'. Each arm is parsed as any
+// SELECT is; a parenthesised one keeps its ORDER BY and LIMIT.
+auto set_operation(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
+  if (s->larg == nullptr || s->rarg == nullptr) reject("a set operation needs two queries", pos);
+  if (s->limit_offset != nullptr || s->with_clause != nullptr) reject("SELECT clause not supported", pos);
+  if (s->n_locking_clause != 0) {
+    reject("FOR UPDATE is not allowed with UNION/INTERSECT/EXCEPT", pos, kFeatureNotSupported);
+  }
+  using Kind = SetOperation::Kind;
+  auto kind = s->op == PG_QUERY__SET_OPERATION__SETOP_UNION       ? Kind::Union
+              : s->op == PG_QUERY__SET_OPERATION__SETOP_INTERSECT ? Kind::Intersect
+                                                                  : Kind::Except;
+  Select sel;
+  sel.pos = pos;
+  sel.limit = limit(s);
+  sel.order_by = order_items(s, pos);
+  sel.set = std::make_shared<const SetOperation>(SetOperation{kind, s->all != 0, select(s->larg, pos), select(s->rarg, pos)});
+  return sel;
+}
+
 auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
-  if (s->op != PG_QUERY__SET_OPERATION__SETOP_NONE) reject("set operations are not supported", pos);
+  if (s->op != PG_QUERY__SET_OPERATION__SETOP_NONE) return set_operation(s, pos);
   // No table, one, or two: FROM a, b, or a [INNER] JOIN b ON …, whose ON
   // conjuncts join the WHERE's.
   if (s->n_values_lists != 0) reject("VALUES is supported only in INSERT", pos);
@@ -847,20 +888,7 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
     if (lc->n_locked_rels != 0) reject("FOR UPDATE OF is not supported", pos);
     sel.for_update = true;
   }
-  for (std::size_t i = 0; i < s->n_sort_clause; ++i) {
-    const auto* sb = s->sort_clause[i]->sort_by;
-    // libpg_query records no position for a SortBy: report its column's.
-    if (sb->node == nullptr || sb->node->node_case != PG_QUERY__NODE__NODE_COLUMN_REF) {
-      reject("ORDER BY takes columns", pos);
-    }
-    auto col = expr(sb->node);
-    if (sb->sortby_dir == PG_QUERY__SORT_BY_DIR__SORTBY_USING) reject("ORDER BY ... USING is not supported", col.pos);
-    std::optional<bool> nulls_first;
-    if (sb->sortby_nulls == PG_QUERY__SORT_BY_NULLS__SORTBY_NULLS_FIRST) nulls_first = true;
-    if (sb->sortby_nulls == PG_QUERY__SORT_BY_NULLS__SORTBY_NULLS_LAST) nulls_first = false;
-    sel.order_by.push_back({col.column, sb->sortby_dir == PG_QUERY__SORT_BY_DIR__SORTBY_DESC, col.pos, col.table,
-                            nulls_first});
-  }
+  sel.order_by = order_items(s, pos);
   for (std::size_t i = 0; i < s->n_target_list; ++i) {
     const auto* rt = s->target_list[i]->res_target;
     sel.targets.push_back(expr(rt->val));
