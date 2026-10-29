@@ -34,7 +34,9 @@ kind the transformer doesn't take is refused with its position.
   `ALTER TABLE … ADD COLUMN` (`catalog_design.md`, *DDL*). A table
   declared without a primary key keeps every row, duplicates included,
   under a hidden row id no statement sees (`catalog_design.md`, *Tables
-  without a primary key*).
+  without a primary key*). `UNIQUE` on a column or on the table, named or
+  not, is a unique index created with the table (`catalog_design.md`,
+  *UNIQUE constraints*).
 - `INSERT … VALUES` of one row, with or without a column list, of
   parameters and constants.
 - `SELECT` targets: columns, constants (*Literals*), `COUNT(*)`,
@@ -341,6 +343,11 @@ fail on them.
   its own key encoding, so it would have to rewrite the comparison
   (`= 40000` is never true, `< 40000` is `IS NOT NULL`); it refuses rather
   than guess. The machine expects the refusal (`oracle.exact_literal`).
+- **A UNIQUE constraint's index can be dropped.** The layer keeps no
+  constraint object, so `DROP INDEX` of a `UNIQUE` constraint's index drops
+  it, and the constraint with it. PostgreSQL refuses (2BP01: the constraint
+  requires the index) and drops it only with its table or `ALTER TABLE …
+  DROP CONSTRAINT`.
 - **Strings compare bytewise, as `COLLATE "C"`**, constants as columns
   do: `'B' < 'a'` is true. PostgreSQL orders them by the database's
   collation, under which `'a' < 'B'` may be true instead. The layer has one

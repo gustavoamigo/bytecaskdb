@@ -1541,11 +1541,12 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
       [&](const auto& s) -> std::pair<std::variant<Ddl, logical::NodePtr>, std::int32_t> {
         using T = std::decay_t<decltype(s)>;
         if constexpr (std::is_same_v<T, ast::CreateTable>) {
-          CreateTableDdl out{s.table, {}, s.pk};
+          CreateTableDdl out{s.table, {}, s.pk, {}};
           for (const auto& c : s.columns) {
             out.columns.push_back(column_spec(c));
             if (c.primary_key) out.pk.push_back(c.name);
           }
+          for (const auto& u : s.unique) out.unique.push_back({u.name, u.columns});
           return {Ddl{std::move(out)}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::CreateIndex>) {
           const auto* t = b.table(s.table, s.pos);
@@ -1562,6 +1563,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
         } else if constexpr (std::is_same_v<T, ast::AddColumn>) {
           (void)b.table(s.table, s.pos);
           if (s.column.primary_key) throw SqlError{"ADD COLUMN cannot add a primary key column", s.column.pos};
+          if (!s.column.unique.empty()) not_yet("ADD COLUMN … UNIQUE", s.column.pos);
           auto spec = column_spec(s.column);
           if (!spec.nullable && std::holds_alternative<std::monostate>(spec.default_value)) {
             throw SqlError{"column \"" + s.column.name + "\" is NOT NULL and needs a DEFAULT for the existing rows",
