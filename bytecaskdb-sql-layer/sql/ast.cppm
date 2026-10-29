@@ -71,31 +71,33 @@ enum class ValueCompare { Eq, Ne, Lt, Le, Gt, Ge };
 
 // A select-list, SET or comparison operand: a column, a parameter, a
 // literal (an integer within BIGINT after + or - is a Const), a sum,
-// difference, product or quotient of two, unary + or - of one, a comparison of two, a cast of
+// difference, product or quotient of two, unary + or - of one, a comparison of two, IS [NOT]
+// NULL of one, AND, OR or NOT of boolean expressions, a cast of
 // one (DATE '…' and '…'::date alike), an aggregate: COUNT(*),
 // COUNT([DISTINCT] column), SUM, MIN, MAX or AVG of a column; or a scalar
 // subquery, (SELECT …), the value of its one row; CASE (searched, or simple
 // on `lhs`), COALESCE and NULLIF; a string function or ||; or, in a select list only,
 // * or `table`.*, which the binder expands to columns.
 struct Expr {
-  enum class Kind { Column, Param, Const, Literal, Add, Sub, Mul, Div, Star, Plus, Neg, Compare, Cast, Aggregate, Subquery, Case, Coalesce, NullIf, Func };
+  enum class Kind { Column, Param, Const, Literal, Add, Sub, Mul, Div, Star, Plus, Neg, Compare, IsNull, Not, And, Or, Cast, Aggregate, Subquery, Case, Coalesce, NullIf, Func };
   enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind;
   std::string column;       // Column; Aggregate's argument, "" for COUNT(*)
   std::uint32_t param{0};   // Param: zero-based ($1 is 0)
-  std::unique_ptr<Expr> lhs, rhs;  // Add, Sub, Mul, Div, Compare; Plus, Neg and Cast: rhs
+  std::unique_ptr<Expr> lhs, rhs;  // Add, Sub, Mul, Div, Compare; Plus, Neg, IsNull, Not and Cast: rhs
   std::int32_t pos{-1};
   std::string table;          // Column, Aggregate, Star: the table it is qualified by, "" for none
   std::int64_t constant{0};   // Const: an integer literal (Add and Sub's right operand only)
   Fn fn{Fn::Count};           // Aggregate
   bool distinct{false};       // Aggregate: COUNT(DISTINCT column)
+  bool negated{false};        // IsNull: IS NOT NULL
   Literal literal{};          // Literal
   ValueCompare cmp{ValueCompare::Eq};  // Compare
   std::string cast_type;               // Cast: libpg_query's last type name, as a column's
   std::vector<std::int32_t> cast_typmods;
   std::shared_ptr<const Select> subquery;  // Subquery
   std::string alias;  // a select-list item's AS name, "" for none
-  // Case: WHEN, THEN, WHEN, THEN … in order, `lhs` the simple form's operand
+  // And, Or: two or more operands. Case: WHEN, THEN, WHEN, THEN … in order, `lhs` the simple form's operand
   // and `rhs` its ELSE, each none where absent. Coalesce: its arguments.
   // NullIf: `lhs` and `rhs`.
   std::vector<Expr> args;
@@ -136,6 +138,7 @@ struct Compare {
   out.constant = e.constant;
   out.fn = e.fn;
   out.distinct = e.distinct;
+  out.negated = e.negated;
   out.literal = e.literal;
   out.cmp = e.cmp;
   out.cast_type = e.cast_type;

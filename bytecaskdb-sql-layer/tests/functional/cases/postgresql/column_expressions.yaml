@@ -1,0 +1,249 @@
+# Expressions over columns in the select list: + - * / with PostgreSQL's result
+# types, comparisons and IS NULL, AND, OR, NOT as values. Expected results
+# are PostgreSQL's (record.py).
+
+- name: arithmetic of integer columns, the integer quotient truncated
+  features: [E011-04]
+  ordered: true
+  setup:
+    - CREATE TABLE ce (id INTEGER PRIMARY KEY, i INTEGER, s SMALLINT, b BIGINT, d DECIMAL(6,2), z INTEGER, t TEXT)
+  steps:
+    - sql: INSERT INTO ce VALUES (1, 1, 100, 9000000000000000000, 2.50, NULL, 'a')
+      rowcount: 1
+    - sql: INSERT INTO ce VALUES (2, 2, 200, 5, 2.50, 0, 'b')
+      rowcount: 1
+    - sql: INSERT INTO ce VALUES (3, 3, 300, 7, 10.00, 4, 'c')
+      rowcount: 1
+    - sql: SELECT i + i, i - 1, i * i, i / 2, 7 / i FROM ce ORDER BY id
+      expected: [[2, 0, 1, 0, 7], [4, 1, 4, 1, 3], [6, 2, 9, 1, 2]]
+    - sql: SELECT b + 1 FROM ce ORDER BY id
+      expected: [["9000000000000000001"], [6], [8]]
+    - sql: SELECT s * 100, s * i, i * b FROM ce WHERE id > 1 ORDER BY id
+      expected: [[20000, 400, 10], [30000, 900, 21]]
+  teardown:
+    - DROP TABLE ce
+
+- name: arithmetic of DECIMAL columns, + and - at the finer scale, * at the sum of the scales
+  features: [E011-04]
+  ordered: true
+  setup:
+    - CREATE TABLE ce (id INTEGER PRIMARY KEY, i INTEGER, d DECIMAL(6,2), e DECIMAL(5,1))
+  steps:
+    - sql: INSERT INTO ce VALUES (1, 1, 2.50, 0.5)
+      rowcount: 1
+    - sql: INSERT INTO ce VALUES (2, 3, 10.00, 12.5)
+      rowcount: 1
+    - sql: SELECT d + d, d + i, d - i, d * d, d * i, d + e, d * e, e - d FROM ce ORDER BY id
+      expected:
+        - ["5.00", "3.50", "1.50", "6.2500", "2.50", "3.00", "1.250", "-2.00"]
+        - ["20.00", "13.00", "7.00", "100.0000", "30.00", "22.50", "125.000", "2.50"]
+  teardown:
+    - DROP TABLE ce
+
+- name: a NULL operand makes the result NULL, and a NULL dividend raises no error
+  features: [E011-04, F481]
+  ordered: true
+  setup:
+    - CREATE TABLE ce (id INTEGER PRIMARY KEY, i INTEGER, z INTEGER)
+  steps:
+    - sql: INSERT INTO ce VALUES (1, 1, NULL)
+      rowcount: 1
+    - sql: INSERT INTO ce VALUES (2, 2, 4)
+      rowcount: 1
+    - sql: SELECT z + 1, z * 2, 1 - z, i / z, z / i FROM ce ORDER BY id
+      expected: [[null, null, null, null, null], [5, 8, -3, 0, 2]]
+  teardown:
+    - DROP TABLE ce
+
+- name: a zero divisor is 22012 and an out-of-range result 22003
+  features: [E011-04]
+  setup:
+    - CREATE TABLE ce (id INTEGER PRIMARY KEY, i INTEGER, s SMALLINT, b BIGINT, z INTEGER)
+  steps:
+    - sql: INSERT INTO ce VALUES (1, 1, 300, 9000000000000000000, NULL)
+      rowcount: 1
+    - sql: INSERT INTO ce VALUES (2, 2, 200, 5, 0)
+      rowcount: 1
+    - sql: SELECT i / z FROM ce
+      error: "22012"
+    - sql: SELECT i / z FROM ce WHERE id = 1
+      expected: [[null]]
+    - sql: SELECT id, i / $1 FROM ce
+      params: [0]
+      error: "22012"
+    - sql: SELECT id, i / $1 FROM ce WHERE id < 0
+      params: [0]
+      expected: []
+    - sql: SELECT s * s FROM ce
+      error: "22003"
+    - sql: SELECT i * 2000000000 FROM ce
+      error: "22003"
+    - sql: SELECT b * 2 FROM ce
+      error: "22003"
+    - sql: SELECT i + 'x' FROM ce
+      error: "22P02"
+  teardown:
+    - DROP TABLE ce
+
+- name: AND and OR evaluate an operand only while the result is open
+  features: [E011-04, F481]
+  ordered: true
+  setup:
+    - CREATE TABLE ce (id INTEGER PRIMARY KEY, i INTEGER, z INTEGER)
+  steps:
+    - sql: INSERT INTO ce VALUES (1, 1, NULL)
+      rowcount: 1
+    - sql: INSERT INTO ce VALUES (2, 2, 0)
+      rowcount: 1
+    - sql: INSERT INTO ce VALUES (3, 3, 4)
+      rowcount: 1
+    - sql: SELECT z <> 0 AND i / z > 0 FROM ce ORDER BY id
+      expected: [[null], [f], [f]]
+    - sql: SELECT z = 0 OR i / z > 0 FROM ce WHERE id > 1 ORDER BY id
+      expected: [[t], [f]]
+  teardown:
+    - DROP TABLE ce
+
+- name: comparisons of columns as values
+  features: [E011-05, E011-06, F131-04]
+  ordered: true
+  setup:
+    - CREATE TABLE ce (id INTEGER PRIMARY KEY, i INTEGER, d DECIMAL(6,2), z INTEGER, t TEXT, p BOOLEAN)
+  steps:
+    - sql: INSERT INTO ce VALUES (1, 1, 2.50, NULL, 'a', TRUE)
+      rowcount: 1
+    - sql: INSERT INTO ce VALUES (2, 2, 2.50, 0, 'b', FALSE)
+      rowcount: 1
+    - sql: INSERT INTO ce VALUES (3, 3, 10.00, 4, 'c', NULL)
+      rowcount: 1
+    - sql: SELECT i < 2, i <= 2, i = 2, i <> 2, i >= 2, i > 2 FROM ce ORDER BY id
+      expected: [[t, t, f, t, f, f], [f, t, t, f, t, f], [f, f, f, t, t, t]]
+    - sql: SELECT i < z, z = z, z <> 0 FROM ce ORDER BY id
+      expected: [[null, null, null], [f, t, f], [t, t, t]]
+    - sql: SELECT d < i, d = 2.5, d > 2 FROM ce ORDER BY id
+      expected: [[f, t, t], [f, t, t], [f, f, t]]
+    - sql: SELECT t = 'b', t < 'b', t >= 'b' FROM ce ORDER BY id
+      expected: [[f, t, f], [t, f, t], [f, f, t]]
+    - sql: SELECT p = TRUE, p < TRUE FROM ce ORDER BY id
+      expected: [[t, f], [f, t], [null, null]]
+    - sql: SELECT i + 1 = 3 FROM ce ORDER BY id
+      expected: [[f], [t], [f]]
+    - sql: SELECT id, i < $1 FROM ce ORDER BY id
+      params: [2]
+      expected: [[1, t], [2, f], [3, f]]
+    - sql: SELECT i < t FROM ce
+      error: "42883"
+    - sql: SELECT i + t FROM ce
+      error: "42883"
+  teardown:
+    - DROP TABLE ce
+
+- name: a comparison with a scalar subquery
+  features: [F131-04]
+  ordered: true
+  setup:
+    - CREATE TABLE ce (id INTEGER PRIMARY KEY, i INTEGER)
+    - CREATE TABLE ce2 (id INTEGER PRIMARY KEY, a INTEGER)
+  steps:
+    - sql: INSERT INTO ce VALUES (1, 1)
+      rowcount: 1
+    - sql: INSERT INTO ce VALUES (2, 2)
+      rowcount: 1
+    - sql: INSERT INTO ce VALUES (3, 3)
+      rowcount: 1
+    - sql: INSERT INTO ce2 VALUES (1, 2)
+      rowcount: 1
+    - sql: INSERT INTO ce2 VALUES (2, 2)
+      rowcount: 1
+    - sql: SELECT i < (SELECT MAX(a) FROM ce2), i = (SELECT MIN(a) FROM ce2) FROM ce ORDER BY id
+      expected: [[t, f], [f, t], [f, f]]
+    - sql: SELECT i < (SELECT MAX(a) FROM ce2 WHERE a > 99) FROM ce ORDER BY id
+      expected: [[null], [null], [null]]
+    - sql: SELECT i <> (SELECT MAX(a) FROM ce2 GROUP BY a) FROM ce ORDER BY id
+      expected: [[t], [f], [t]]
+    - sql: SELECT i <> (SELECT a FROM ce2) FROM ce
+      error: "21000"
+  teardown:
+    - DROP TABLE ce2
+    - DROP TABLE ce
+
+- name: IS NULL, IS NOT NULL, AND, OR and NOT as values
+  features: [F481, E011-04]
+  ordered: true
+  setup:
+    - CREATE TABLE ce (id INTEGER PRIMARY KEY, i INTEGER, z INTEGER)
+  steps:
+    - sql: INSERT INTO ce VALUES (1, 1, NULL)
+      rowcount: 1
+    - sql: INSERT INTO ce VALUES (2, 2, 0)
+      rowcount: 1
+    - sql: INSERT INTO ce VALUES (3, 3, 4)
+      rowcount: 1
+    - sql: SELECT z IS NULL, z IS NOT NULL, z + 1 IS NULL, i + i IS NOT NULL FROM ce ORDER BY id
+      expected: [[t, f, t, t], [f, t, f, t], [f, t, f, t]]
+    - sql: SELECT NOT (i > 1), i > 1 AND z IS NULL, i > 2 OR z IS NULL FROM ce ORDER BY id
+      expected: [[t, f, t], [f, f, f], [f, f, t]]
+    - sql: SELECT (z > 0) AND (z < 5), (z > 0) OR (z < 5), NOT (z > 0), (z > 0) AND false, (z > 0) OR true FROM ce WHERE id = 1
+      expected: [[null, null, null, f, t]]
+    - sql: SELECT i AND TRUE FROM ce
+      error: "42804"
+    - sql: SELECT NOT i FROM ce
+      error: "42804"
+  teardown:
+    - DROP TABLE ce
+
+- name: IS NULL, NOT, AND and OR of constants
+  features: [F481]
+  steps:
+    - sql: SELECT NULL IS NULL, 1 IS NOT NULL, NOT TRUE, TRUE AND NULL, FALSE AND NULL, TRUE OR NULL, NULL OR NULL
+      expected: [[t, t, f, null, f, t, null]]
+    - sql: SELECT 1 IS NULL AND TRUE, NOT NULL
+      expected: [[f, null]]
+    - sql: SELECT 1 AND TRUE
+      error: "42804"
+
+- name: expressions over a join, under a sort, from a covering index and in a view
+  features: [E011-04, E091-05]
+  ordered: true
+  setup:
+    - CREATE TABLE ce (id INTEGER PRIMARY KEY, i INTEGER)
+    - CREATE TABLE ce2 (id INTEGER PRIMARY KEY, w INTEGER)
+    - CREATE INDEX ce_i ON ce (i)
+    - CREATE VIEW cv AS SELECT id, i * 2 AS dbl FROM ce
+  steps:
+    - sql: INSERT INTO ce VALUES (1, 1)
+      rowcount: 1
+    - sql: INSERT INTO ce VALUES (2, 2)
+      rowcount: 1
+    - sql: INSERT INTO ce VALUES (3, 3)
+      rowcount: 1
+    - sql: INSERT INTO ce2 VALUES (1, 10)
+      rowcount: 1
+    - sql: INSERT INTO ce2 VALUES (3, 30)
+      rowcount: 1
+    - sql: SELECT ce.i + ce2.w, ce.i * ce2.w < 50 FROM ce JOIN ce2 ON ce.id = ce2.id ORDER BY ce2.w
+      expected: [[11, t], [33, f]]
+    - sql: SELECT i * 2 FROM ce ORDER BY i DESC
+      expected: [[6], [4], [2]]
+    - sql: SELECT i * 2 FROM ce ORDER BY id DESC LIMIT 2
+      expected: [[6], [4]]
+    - sql: SELECT i + 1 FROM ce WHERE i >= 2 ORDER BY i
+      expected: [[3], [4]]
+    - sql: SELECT dbl FROM cv WHERE id = 3
+      expected: [[6]]
+  teardown:
+    - DROP VIEW cv
+    - DROP TABLE ce2
+    - DROP TABLE ce
+
+- name: the quotient of numeric constants has PostgreSQL's scale
+  features: [E011-04]
+  steps:
+    - sql: SELECT 5.0 / 2, 10.0 / 4, 7.5 / 0.5, 100.0 / 3, -5.0 / 2, 5.0 / -2, 2.25 / 1.5, 3 / 2.0
+      expected:
+        - ["2.5000000000000000", "2.5000000000000000", "15.0000000000000000", "33.3333333333333333", "-2.5000000000000000", "-2.5000000000000000", "1.5000000000000000", "1.5000000000000000"]
+    - sql: SELECT 20.0 / 3, -20.0 / 3, 10.0 / 3, 100000.0 / 3
+      expected:
+        - ["6.6666666666666667", "-6.6666666666666667", "3.3333333333333333", "33333.333333333333"]
+    - sql: SELECT NULL / 1.5, 1.5 / NULL
+      expected: [[null, null]]

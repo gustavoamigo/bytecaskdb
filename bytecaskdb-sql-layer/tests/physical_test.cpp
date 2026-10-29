@@ -411,6 +411,36 @@ TEST_CASE("physical: a hash join holds the row of its build side's one loop, key
   refused(plan(choice(scan({p(0)}, {}), node(scan({p(0)}, {})))), "whose other plan reads other tables");
 }
 
+TEST_CASE("physical: check refuses an expression result column codegen can't print", "[sql][physical]") {
+  using Kind = logical::Expr::Kind;
+  using Op = ast::Compare::Op;
+  const auto big = SqlType{SqlKind::BigInt};
+  auto id = logical::column(kId, big);
+  auto emitting = [&](logical::Expr e) {
+    std::vector<physical::EmitTarget> targets;
+    targets.emplace_back(physical::ExprTarget{std::move(e)});
+    return plan(node(physical::Emit{get({p(0)}), std::move(targets)}));
+  };
+  // An operator over a column and a parameter; a comparison; a negated NULL test.
+  CHECK(refusal(emitting(logical::binary(Kind::Add, id, p(1), big))).empty());
+  CHECK(refusal(emitting(logical::compare(Op::Lt, logical::binary(Kind::Mul, id, p(1), big), p(0)))).empty());
+  auto is_null = logical::expr(Kind::IsNull, SqlType{SqlKind::Boolean});
+  is_null.args.push_back(id);
+  CHECK(refusal(emitting(logical::predicate_of(Kind::Not, {is_null}))).empty());
+  // What eval does not print, an operator of the wrong operands, a parameter past the statement's.
+  refused(emitting(logical::expr(Kind::Aggregate, big)), "does not print");
+  auto lone = logical::expr(Kind::Add, big);
+  lone.args.push_back(id);
+  refused(emitting(lone), "wrong number of operands");
+  refused(emitting(logical::predicate_of(Kind::And, {is_null})), "wrong number of operands");
+  refused(emitting(logical::binary(Kind::Div, id, p(2), big)), "past the statement's");
+  // A DOUBLE column an expression reads from a covering scan's key.
+  std::vector<physical::EmitTarget> from_key;
+  from_key.emplace_back(physical::ExprTarget{logical::binary(Kind::Add, logical::column(kD, SqlType{SqlKind::Double}), p(1),
+                                                              SqlType{SqlKind::Double})});
+  refused(plan(node(physical::Emit{node(scan({p(0)}, {}, true)), std::move(from_key)})), "DOUBLE column read from a key");
+}
+
 TEST_CASE("physical: check refuses a grouped aggregate codegen can't print", "[sql][physical][group]") {
   const logical::ColumnRef name{1, 2, PhysType::Bytes, true};
   auto count = logical::expr(logical::Expr::Kind::Aggregate, SqlType{SqlKind::BigInt});

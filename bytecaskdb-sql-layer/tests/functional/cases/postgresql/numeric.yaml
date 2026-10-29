@@ -108,8 +108,6 @@
 
 - name: DECIMAL plus DECIMAL of the same scale
   features: [E011-04, E011-03]
-  # only columns, constants and aggregates can be selected
-  unimplemented: true
   ordered: true
   setup:
     - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
@@ -131,8 +129,6 @@
 
 - name: DECIMAL plus an integer column
   features: [E011-04, E011-06]
-  # only columns, constants and aggregates can be selected
-  unimplemented: true
   ordered: true
   setup:
     - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
@@ -154,8 +150,6 @@
 
 - name: multiplication
   features: [E011-04]
-  # only columns, constants and aggregates can be selected: arithmetic of columns is not supported
-  unimplemented: true
   ordered: true
   setup:
     - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
@@ -177,8 +171,6 @@
 
 - name: division of integers truncates
   features: [E011-04]
-  # only columns, constants and aggregates can be selected: arithmetic of columns is not supported
-  unimplemented: true
   ordered: true
   setup:
     - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
@@ -200,7 +192,7 @@
 
 - name: modulo
   features: [E011-04]
-  # only + and - are supported here
+  # % is not supported yet
   unimplemented: true
   ordered: true
   setup:
@@ -223,8 +215,6 @@
 
 - name: division by zero
   features: [E011-04]
-  # only columns, constants and aggregates can be selected: arithmetic of columns is not supported
-  unimplemented: true
   setup:
     - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
   steps:
@@ -259,7 +249,7 @@
 
 - name: unary minus and ABS
   features: [E011-04]
-  # only + and - are supported here
+  # unary minus and ABS are not supported yet
   unimplemented: true
   ordered: true
   setup:

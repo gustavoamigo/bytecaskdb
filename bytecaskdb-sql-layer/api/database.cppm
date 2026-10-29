@@ -720,7 +720,8 @@ auto exec_sqlstate(const ExecError& e) noexcept -> std::string_view {
   switch (e.code()) {
     case BC_E_CONSTRAINT: return constraint_sqlstate(e);
     case BC_E_LIMIT: return "54000";      // program_limit_exceeded
-    case BC_E_ARITH: return "22003";      // numeric_value_out_of_range: the subset has no division
+    case BC_E_ARITH:                      // bc_div and bc_mod name their zero divisor; every other failure is a range
+      return std::string_view{e.what()} == "division by zero" ? "22012" : "22003";  // division_by_zero, numeric_value_out_of_range
     case BC_E_BUDGET: return "57014";     // query_canceled
     case BC_E_MEMORY: return "53200";     // out_of_memory
     case BC_E_CLOSED: return "57P01";     // admin_shutdown
