@@ -27,6 +27,7 @@ private:
 inline constexpr SqlState kSyntaxError{"42601"};  // also a form the layer does not support yet
 inline constexpr SqlState kFeatureNotSupported{"0A000"};
 inline constexpr SqlState kNumericValueOutOfRange{"22003"};
+inline constexpr SqlState kDivisionByZero{"22012"};
 inline constexpr SqlState kNotNullViolation{"23502"};
 inline constexpr SqlState kGroupingError{"42803"};
 inline constexpr SqlState kDatatypeMismatch{"42804"};
@@ -54,7 +55,7 @@ inline constexpr SqlState kInvalidEscapeSequence{"22025"};
 
 // The constant above whose code is `code`, or nullopt.
 [[nodiscard]] constexpr auto known_sqlstate(std::string_view code) noexcept -> std::optional<SqlState> {
-  for (auto s : {kSyntaxError, kFeatureNotSupported, kNumericValueOutOfRange, kNotNullViolation, kGroupingError,
+  for (auto s : {kSyntaxError, kFeatureNotSupported, kNumericValueOutOfRange, kDivisionByZero, kNotNullViolation, kGroupingError,
                  kDatatypeMismatch, kUndefinedFunction, kUndefinedColumn, kUndefinedTable, kUndefinedObject,
                  kDuplicateColumn, kDuplicateTable, kAmbiguousColumn, kDuplicateAlias, kIndeterminateDatatype, kWrongObjectType, kInvalidColumnReference, kInvalidForeignKey,
                  kInvalidTextRepresentation, kStringDataRightTruncation, kInvalidDatetimeFormat,

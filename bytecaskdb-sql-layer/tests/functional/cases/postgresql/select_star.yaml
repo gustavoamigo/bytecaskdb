@@ -1,0 +1,57 @@
+# SELECT * and table.*: the columns of the FROM tables, in order.
+
+- name: "* and table.* give a table's columns in order, under an alias too"
+  features: [E051-07, E051-08]
+  ordered: true
+  setup:
+    - CREATE TABLE st (id INTEGER PRIMARY KEY, v INTEGER, w TEXT)
+  steps:
+    - sql: INSERT INTO st VALUES ($1, $2, $3)
+      params: [1, 10, "a"]
+      rowcount: 1
+    - sql: INSERT INTO st VALUES ($1, $2, $3)
+      params: [2, 20, "b"]
+      rowcount: 1
+    - sql: SELECT * FROM st ORDER BY id
+      expected: [[1, 10, "a"], [2, 20, "b"]]
+    - sql: SELECT st.* FROM st WHERE v > 10
+      expected: [[2, 20, "b"]]
+    - sql: SELECT x.* FROM st AS x ORDER BY x.id DESC
+      expected: [[2, 20, "b"], [1, 10, "a"]]
+    - sql: SELECT *, v FROM st ORDER BY id
+      expected: [[1, 10, "a", 10], [2, 20, "b", 20]]
+    - sql: SELECT DISTINCT * FROM st ORDER BY id
+      expected: [[1, 10, "a"], [2, 20, "b"]]
+    - sql: SELECT st.* FROM st AS x
+      error: "42P01"
+    - sql: SELECT nope.* FROM st
+      error: "42P01"
+    - sql: SELECT *
+      error: "42601"
+  teardown:
+    - DROP TABLE st
+
+- name: "* of a join gives each table's columns, a USING column once and first"
+  features: [E051-07, F041-01]
+  ordered: true
+  setup:
+    - CREATE TABLE sa (id INTEGER PRIMARY KEY, v INTEGER)
+    - CREATE TABLE sb (id INTEGER PRIMARY KEY, x INTEGER)
+  steps:
+    - sql: INSERT INTO sa VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO sb VALUES ($1, $2)
+      params: [1, 5]
+      rowcount: 1
+    - sql: SELECT * FROM sa JOIN sb ON sa.id = sb.id
+      expected: [[1, 10, 1, 5]]
+    - sql: SELECT * FROM sa JOIN sb USING (id)
+      expected: [[1, 10, 5]]
+    - sql: SELECT * FROM sa NATURAL JOIN sb
+      expected: [[1, 10, 5]]
+    - sql: SELECT sb.*, sa.v FROM sa JOIN sb ON sa.id = sb.id
+      expected: [[1, 5, 10]]
+  teardown:
+    - DROP TABLE sa
+    - DROP TABLE sb
