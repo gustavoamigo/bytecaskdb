@@ -365,6 +365,7 @@ struct GroupEmit {
 struct Insert {
   std::uint32_t table{0};
   std::vector<std::pair<ColumnRef, Expr>> values;
+  std::vector<Expr> checks;  // logical::Insert's, evaluated over the row as written
 };
 
 // UPDATE and DELETE write each row their input gives, read from the
@@ -373,6 +374,7 @@ struct Update {
   NodePtr input;
   std::uint32_t table{0};
   std::vector<std::pair<ColumnRef, Expr>> set;
+  std::vector<Expr> checks;  // logical::Update's
 };
 
 struct Delete {
@@ -1311,8 +1313,10 @@ private:
           } else if constexpr (std::is_same_v<T, Insert>) {
             if (op.values.empty()) broken("an insert that sets no column");
             for (const auto& [col, e] : op.values) params(e);
+            for (const auto& c : op.checks) params(c);
           } else if constexpr (std::is_same_v<T, Update>) {
             if (op.set.empty()) broken("an update that sets no column");
+            for (const auto& c : op.checks) params(c);
             for (const auto& [col, e] : op.set) {
               params(e);
               if (e.kind == Expr::Kind::Column && e.col.type != col.type) broken("a column set from a column of another type");

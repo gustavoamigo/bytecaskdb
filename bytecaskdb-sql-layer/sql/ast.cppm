@@ -163,6 +163,17 @@ struct ForeignKeyAst {
   std::int32_t pos{-1};
 };
 
+// A CHECK constraint of CREATE TABLE, on a column or on the table: its name,
+// "" for none, and the text of its expression, as written between the
+// parentheses. `column` is the column a column CHECK is written on, "" for
+// a table's.
+struct CheckAst {
+  std::string name;
+  std::string text;
+  std::int32_t pos{-1};
+  std::string column;
+};
+
 struct ColumnDefAst {
   std::string name;
   std::string type;                    // libpg_query's last type name: int8, varchar, numeric, …
@@ -174,6 +185,7 @@ struct ColumnDefAst {
   // Each UNIQUE constraint on the column: its name, "" for none.
   std::vector<std::string> unique;
   std::vector<ForeignKeyAst> references;  // each REFERENCES on the column
+  std::vector<CheckAst> checks;    // each CHECK on the column
 };
 
 // A UNIQUE constraint of CREATE TABLE, on a column or on the table, in the
@@ -191,6 +203,7 @@ struct CreateTable {
   std::int32_t pos{-1};
   std::vector<UniqueAst> unique;  // every UNIQUE constraint, columns' and the table's, in order
   std::vector<ForeignKeyAst> foreign_keys;  // every FOREIGN KEY, columns' and the table's, in order
+  std::vector<CheckAst> checks;  // every CHECK, columns' and the table's, in order
 };
 
 struct IndexColumnAst {
