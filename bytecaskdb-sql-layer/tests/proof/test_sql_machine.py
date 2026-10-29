@@ -1717,8 +1717,13 @@ class KeylessMachine(Sides, RuleBasedStateMachine):
         if drawn is None:
             return
         where, pg_where, params, types = drawn
-        self.bag(f"SELECT {', '.join(cols)} FROM {t.name}{where}", params,
-                 f"SELECT {', '.join(cols)} FROM {t.name}{pg_where}", types)
+        # DISTINCT now and then: one row per distinct combination, NULL one
+        # value. Not of a float column, whose group shows -0.0 or 0.0, as
+        # each side happens to meet them.
+        floats = any(t.column(c).type.kind in ("float", "real") for c in cols)
+        distinct = "DISTINCT " if not floats and data.draw(st.integers(0, 2), label="distinct?") == 0 else ""
+        self.bag(f"SELECT {distinct}{', '.join(cols)} FROM {t.name}{where}", params,
+                 f"SELECT {distinct}{', '.join(cols)} FROM {t.name}{pg_where}", types)
 
     @precondition(lambda self: any(KeylessMachine.filterable(t) for t in self.tables.values()))
     @rule(data=st.data())

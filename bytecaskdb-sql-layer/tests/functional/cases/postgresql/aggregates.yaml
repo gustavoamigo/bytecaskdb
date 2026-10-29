@@ -214,8 +214,6 @@
 
 - name: SELECT DISTINCT
   features: [E051-01]
-  # DISTINCT on the select list is refused
-  unimplemented: true
   setup:
     - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
   steps:
