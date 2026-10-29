@@ -221,21 +221,11 @@ f031_19_10_18
 f031_19_10_19
 f031_19_10_20
 f031_19_10_21
-f051_05_04_01
-f051_05_05_01
-f051_05_06_01
-f051_05_07_01
-f051_05_07_02
-f051_05_07_03
-f051_05_08_01
-f051_05_08_02
-f051_05_08_03
-f051_05_08_04
-f051_06_01_01
-f051_07_01_01
-f051_07_01_02
-f051_08_01_01
-f051_08_01_02
+f051_05_07_02  # not PostgreSQL: there is no cast from time to timestamp (42846, which the layer gives)
+f051_07_01_01  # CURRENT_TIME is time with time zone: the layer has no WITH TIME ZONE types (#491)
+f051_07_01_02  # CURRENT_TIME is time with time zone: the layer has no WITH TIME ZONE types (#491)
+f051_08_01_01  # CURRENT_TIMESTAMP is timestamp with time zone: the layer has no WITH TIME ZONE types (#491)
+f051_08_01_02  # CURRENT_TIMESTAMP is timestamp with time zone: the layer has no WITH TIME ZONE types (#491)
 f131_02_01_01  # a join of a grouped view
 f131_03_01_01  # an aggregate over a grouped view: needs a derived table
 f131_03_01_02  # an aggregate over a grouped view: needs a derived table

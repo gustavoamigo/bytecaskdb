@@ -2471,3 +2471,43 @@ TEST_CASE("embedded API: ORDER BY of a set operation's rows is charged to the st
   CHECK(db->execute("SELECT x FROM big UNION ALL SELECT x FROM big ORDER BY x DESC LIMIT 3").rows ==
         Grid{{i(1999)}, {i(1999)}, {i(1998)}});
 }
+
+TEST_CASE("embedded API: the time is read once per statement, and once per transaction", "[sql][api][time]") {
+  sql_test::TempDir dir{"api_clock"};
+  auto db = Database::open(dir.path());
+  constexpr std::int64_t kDay = 86'400'000'000;
+  std::int64_t now = 20'000 * kDay + 3'723'456'789;  // 1 02:03:03.456789 into day 20000
+  db->clock_for_testing([&] { return now; });
+  auto first = [&](std::string_view sql, Database& d) { return d.execute(sql).rows.at(0); };
+
+  CHECK(first("SELECT CURRENT_DATE", *db) == std::vector<Value>{i(20'000)});
+  CHECK(first("SELECT LOCALTIME", *db) == std::vector<Value>{i(3'723'456'789 % kDay)});
+  CHECK(first("SELECT LOCALTIME(0), LOCALTIME(2), LOCALTIMESTAMP(1)", *db) ==
+        std::vector<Value>{i(3'723'000'000 + 1'000'000 * 0), i(3'723'460'000), i(20'000 * kDay + 3'723'500'000)});
+  // Two readings in a statement are one instant; the cached plan reads the clock again.
+  CHECK(first("SELECT LOCALTIMESTAMP, LOCALTIMESTAMP", *db) == std::vector<Value>{i(now), i(now)});
+  now += 5 * kDay;
+  CHECK(first("SELECT CURRENT_DATE", *db) == std::vector<Value>{i(20'005)});
+
+  // A transaction's statements read the time it began, however late they run.
+  auto t = db->begin();
+  CHECK(t.execute("SELECT CURRENT_DATE").rows.at(0) == std::vector<Value>{i(20'005)});
+  now += 3 * kDay;
+  CHECK(t.execute("SELECT CURRENT_DATE").rows.at(0) == std::vector<Value>{i(20'005)});
+  t.rollback();
+  CHECK(first("SELECT CURRENT_DATE", *db) == std::vector<Value>{i(20'008)});
+
+  // Before 1970 the day is the floor and the time of day stays positive.
+  now = -3'600'000'000;  // 1969-12-31 23:00:00
+  CHECK(first("SELECT CURRENT_DATE, LOCALTIME", *db) == std::vector<Value>{i(-1), i(kDay - 3'600'000'000)});
+
+  // The WITH TIME ZONE forms are refused, not read as the zoneless ones.
+  for (auto sql : {"SELECT CURRENT_TIMESTAMP", "SELECT CURRENT_TIME(0)"}) {
+    try {
+      (void)db->execute(sql);
+      FAIL(sql << " must be refused");
+    } catch (const std::exception& e) {
+      CHECK(sqlstate(e) == "42601");  // a form not supported yet
+    }
+  }
+}

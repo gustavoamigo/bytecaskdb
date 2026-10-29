@@ -284,6 +284,35 @@ auto expr(const PgQuery__Node* n) -> Expr {
     e.subquery = subquery(l);
     return e;
   }
+  if (n->node_case == PG_QUERY__NODE__NODE_SQLVALUE_FUNCTION) {
+    const auto* f = n->sqlvalue_function;
+    auto name = [&]() -> const char* {
+      switch (f->op) {
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_CURRENT_DATE: return "current_date";
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_CURRENT_TIME:
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_CURRENT_TIME_N: return "current_time";
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_CURRENT_TIMESTAMP:
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_CURRENT_TIMESTAMP_N: return "current_timestamp";
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_LOCALTIME:
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_LOCALTIME_N: return "localtime";
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_LOCALTIMESTAMP:
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_LOCALTIMESTAMP_N: return "localtimestamp";
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SQLVALUE_FUNCTION_OP_UNDEFINED:
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_CURRENT_ROLE:
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_CURRENT_USER:
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_USER:
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_SESSION_USER:
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_CURRENT_CATALOG:
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_CURRENT_SCHEMA:
+        case _PG_QUERY__SQLVALUE_FUNCTION_OP_IS_INT_SIZE: break;
+      }
+      reject("this SQL value function is not supported", f->location);
+    }();
+    Expr e{Expr::Kind::Clock, {}, 0, nullptr, nullptr, f->location};
+    e.func = name;
+    e.constant = f->typmod;
+    return e;
+  }
   if (n->node_case == PG_QUERY__NODE__NODE_TYPE_CAST) {
     const auto* c = n->type_cast;
     const auto* tn = c->type_name;

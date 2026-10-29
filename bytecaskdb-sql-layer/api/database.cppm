@@ -243,6 +243,9 @@ private:
     // (bound::Bound::fixed): bound after the caller's parameters, as the
     // plan's last ones. A client never sees or sends them.
     std::vector<Value> fixed;
+    // Which of `fixed` are the time (bound::Bound::clocks): filled on every
+    // run from the statement's time, never from the compile.
+    std::vector<bound::ClockSlot> clocks;
     // The views the plan was expanded through (bound::Bound::views): it is
     // rebuilt after any DDL, which may have changed what they read.
     std::vector<std::uint32_t> views;
@@ -299,6 +302,7 @@ struct TxnHandle {
   bc_ctx* cx{nullptr};    // null once ended or aborted: an aborted transaction keeps no snapshot
   bc_txn* txn{nullptr};
   std::atomic<TxnState> state{TxnState::Ended};  // close() ends it from another thread
+  std::int64_t started_us{0};  // the transaction's time: what CURRENT_DATE, LOCALTIME and LOCALTIMESTAMP read in it
 
   void release() noexcept {
     bc_ctx_free(cx);
@@ -479,6 +483,10 @@ public:
   // transaction's catalog is pinned, before the plan is checked against it.
   // Set it while no transaction runs.
   void after_txn_pin_for_testing(std::function<void()> hook) { after_txn_pin_ = std::move(hook); }
+  // Test only: the time CURRENT_DATE, LOCALTIME and LOCALTIMESTAMP read, as
+  // microseconds since 1970-01-01 00:00:00 UTC; the system clock by default.
+  // Set it while no statement runs.
+  void clock_for_testing(std::function<std::int64_t()> clock) { clock_ = std::move(clock); }
   // Test only: the live catalog, for a test that holds a DDL mid-commit.
   [[nodiscard]] auto live_catalog_for_testing() -> LiveCatalog& {
     if (life_->closing.load()) throw DbClosed();
@@ -531,13 +539,15 @@ private:
       -> std::shared_ptr<const Compiled>;
   // Runs a DML statement on `cx`: autocommit, retried on a conflict, when
   // `txn` is null; else as a statement of `txn`, its writes added to it.
-  auto run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn) -> Rows;
+  // `now_us` is the statement's time (a transaction's start), read once.
+  auto run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn, std::int64_t now_us) -> Rows;
+  [[nodiscard]] auto clock_now() const -> std::int64_t { return clock_(); }
   // Throws ParamError for parameters the plan does not take, and ExecError
   // BC_C_RANGE for a value outside its parameter's SQL type.
   static void check_params(const Compiled& c, const std::vector<Value>& params);
   // What the plan's parameters are bound to: the caller's, then the
-  // statement's constants.
-  static auto plan_params(const Compiled& c, const std::vector<Value>& params) -> std::vector<Value>;
+  // statement's constants, with the time's slots filled from `now_us`.
+  static auto plan_params(const Compiled& c, const std::vector<Value>& params, std::int64_t now_us) -> std::vector<Value>;
   static auto results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows;
   static auto quotients(const GeneratedPlan& p, std::vector<Value> values) -> std::vector<Value>;
   // An autocommit context: one per call in flight, kept for the next.
@@ -564,6 +574,10 @@ private:
   std::mutex contexts_mu_;  // guards idle_; taken only to take or return one
   std::vector<bc_ctx*> idle_;
   std::atomic<std::uint64_t> compilations_{0};
+  // The time of CURRENT_DATE and its kin, microseconds since the Unix epoch: the system clock unless a test sets it.
+  std::function<std::int64_t()> clock_{[] {
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  }};
 #ifdef BYTECASK_SQL_TESTING
   std::atomic<std::uint64_t> plan_checks_{0};
   std::atomic<bool> conflict_every_commit_{false};
@@ -978,6 +992,7 @@ auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
   c->param_table = std::move(bound.param_table);
   c->params = std::move(bound.params);
   c->fixed = std::move(bound.fixed);
+  c->clocks = std::move(bound.clocks);
   c->views = std::move(bound.views);
   c->plan = std::make_unique<GeneratedPlan>(generate_plan(std::move(bound), *cat, s.sql_, row_counts(), budget_.max_bytes));
   link(*c);
@@ -1070,7 +1085,7 @@ auto Database::execute(const Statement& stmt, const std::vector<Value>& params) 
   }
   auto* cx = acquire_context();
   try {
-    auto out = run(cx, stmt, params, nullptr);
+    auto out = run(cx, stmt, params, nullptr, clock_now());
     release_context(cx);
     return out;
   } catch (...) {
@@ -1137,9 +1152,25 @@ void Database::check_params(const Compiled& c, const std::vector<Value>& params)
   }
 }
 
-auto Database::plan_params(const Compiled& c, const std::vector<Value>& params) -> std::vector<Value> {
+// The time as a value of each clock slot's type: the day, the time of day, or
+// the instant, in UTC, rounded to the slot's fractional digits as PostgreSQL
+// rounds a time or timestamp typmod.
+static auto clock_value(const bound::ClockSlot& k, std::int64_t now_us) -> Value {
+  constexpr std::int64_t kDay = 86'400'000'000;
+  auto day = now_us >= 0 ? now_us / kDay : -((-now_us + kDay - 1) / kDay);
+  if (k.kind == bound::ClockSlot::Kind::Date) return Value{day};
+  auto us = k.kind == bound::ClockSlot::Kind::Time ? now_us - day * kDay : now_us;
+  std::int64_t unit = 1;
+  for (auto i = k.precision; i < 6; ++i) unit *= 10;
+  auto rounded = us - (us >= 0 ? us % unit : (unit + us % unit) % unit);
+  if (us - rounded >= (unit + 1) / 2) rounded += unit;
+  return Value{rounded};
+}
+
+auto Database::plan_params(const Compiled& c, const std::vector<Value>& params, std::int64_t now_us) -> std::vector<Value> {
   auto out = params;
   out.insert(out.end(), c.fixed.begin(), c.fixed.end());
+  for (const auto& k : c.clocks) out[params.size() + k.slot] = clock_value(k, now_us);
   return out;
 }
 
@@ -1149,7 +1180,7 @@ void Database::recompile_view_plan(const Statement& stmt) {
   (void)recompile(stmt);
 }
 
-auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn) -> Rows {
+auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn, std::int64_t now_us) -> Rows {
   recompile_view_plan(stmt);
   // The context reads the parameters through bp, filled once the plan that
   // runs is known: the caller's, then its constants (plan_params).
@@ -1168,7 +1199,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
       if (after_txn_pin_) after_txn_pin_();
 #endif
       auto c = stmt.compiled();  // taken after the pin: the plan of a DDL that raced it, if one did
-      bp.values = plan_params(*c, params);
+      bp.values = plan_params(*c, params, now_us);
       // A plan that does not fit the pin has run nothing: bc_ctx_run
       // verifies it before the plan's body. Recompiled, pinned again, or
       // 40001.
@@ -1208,7 +1239,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
   }
   auto c = fitting_plan(cx, stmt, params);
   check_params(*c, params);
-  bp.values = plan_params(*c, params);
+  bp.values = plan_params(*c, params, now_us);
   auto r = bc_execute(cx, c->code->fn(), &c->ref, &bp, budget_, sync_commits_, kMaxRetries);
   // bc_ctx_run checks the plan against the catalog it pinned. A plan a DDL
   // made incompatible (BC_E_LAYOUT with BC_L_INCOMPATIBLE) is recompiled
@@ -1218,7 +1249,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
     bc_ctx_reset(cx);
     c = recompile(stmt);
     check_params(*c, params);
-    bp.values = plan_params(*c, params);
+    bp.values = plan_params(*c, params, now_us);
     r = bc_execute(cx, c->code->fn(), &c->ref, &bp, budget_, sync_commits_, kMaxRetries);
   }
   if (r == BC_CONFLICT) {
@@ -1316,6 +1347,7 @@ Transaction::Transaction(Database& db, TransactionOptions opts)
     h_->release();
     throw;
   }
+  h_->started_us = db.clock_now();
   h_->state.store(TxnState::Open);
 }
 
@@ -1359,7 +1391,7 @@ auto Transaction::run_locked(const Statement& stmt, const std::vector<Value>& pa
   try {
     // DDL is its own atomic operation, never part of a transaction.
     if (stmt.is_ddl()) throw FeatureNotSupported("DDL inside a transaction is not supported: run it outside one");
-    return db_->run(h_->cx, stmt, params, h_->txn);
+    return db_->run(h_->cx, stmt, params, h_->txn, h_->started_us);
   } catch (const SerializationFailure&) {
     end_locked();
     throw;
@@ -1445,6 +1477,7 @@ auto Database::alternatives_for_testing(std::string_view sql, const std::vector<
   auto param_table = bound.param_table;
   auto param_info = bound.params;
   auto fixed = bound.fixed;
+  auto clocks = bound.clocks;
   std::vector<Rows> out;
   for (auto& plan : generate_alternatives(std::move(bound), *cat, sql, row_counts(), budget_.max_bytes)) {
     if (!plan.returns_rows) throw std::logic_error("alternatives of a statement that writes");
@@ -1453,12 +1486,13 @@ auto Database::alternatives_for_testing(std::string_view sql, const std::vector<
     c.param_table = param_table;
     c.params = param_info;
     c.fixed = fixed;
+    c.clocks = clocks;
     c.plan = std::make_unique<GeneratedPlan>(std::move(plan));
     check_params(c, params);
     link(c);
     auto* cx = acquire_context();
     try {
-      bc_params bp{plan_params(c, params)};
+      bc_params bp{plan_params(c, params, clock_now())};
       auto r = bc_execute(cx, c.code->fn(), &c.ref, &bp, budget_, sync_commits_, kMaxRetries);
       if (r == BC_CONFLICT) throw ExecError::conflicted("conflict: a guard failed on every attempt");
       if (r == BC_FAILED) throw_context_error(cx);
