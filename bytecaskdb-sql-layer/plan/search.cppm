@@ -152,8 +152,8 @@ using Conjuncts = std::vector<Expr>;
 
 // An operator's name, for a refusal of a shape the search does not plan.
 auto op_name(const logical::Node& n) -> std::string {
-  constexpr const char* kNames[] = {"Get",  "Empty", "Filter", "Project", "Join",  "Aggregate",
-                                    "Sort", "Limit", "Insert", "Update",  "Delete"};
+  constexpr const char* kNames[] = {"Get",  "Empty", "OneRow", "Filter", "Project", "Join",  "Aggregate",
+                                    "Sort", "Limit", "Insert", "Update", "Delete"};
   static_assert(std::size(kNames) == std::variant_size_v<decltype(n.op)>);
   return kNames[n.op.index()];
 }
@@ -1945,7 +1945,9 @@ private:
     auto column = [&](const Expr& e) { return reads(tables, e); };
     if (s.project != nullptr) {
       for (const auto& o : s.project->exprs) {
-        if (!column(o.expr)) no_plan("a result column that is not a column of its tables");
+        if (!column(o.expr) && o.expr.kind != Expr::Kind::Param) {
+          no_plan("a result column that is not a column of its tables or a constant");
+        }
       }
     } else {
       if (s.aggregate->aggs.size() != 1) no_plan("an Aggregate of other than one aggregate call");
@@ -1972,14 +1974,35 @@ private:
       out.push_back({physical::node(physical::Aggregate{std::move(leaf), s.aggregate->aggs[0].expr, emits}), {}, {}, 0});
       return out;
     }
-    std::vector<ColumnRef> targets;
-    for (const auto& o : s.project->exprs) targets.push_back(o.expr.col);
-    out.push_back({emit(s, std::move(leaf), std::move(targets)), {}, {}, 0});
+    out.push_back({emit(s, std::move(leaf), emit_targets(s)), {}, {}, 0});
+    return out;
+  }
+
+  // A SELECT without FROM: its one row of constants, nothing read.
+  static auto one_row(const SelectParts& s) -> std::vector<Finished> {
+    if (s.project == nullptr) no_plan("an Aggregate of no table");
+    std::vector<Finished> out;
+    out.push_back({emit(s, physical::node(physical::OneRow{}), emit_targets(s)), {}, {}, 0});
+    return out;
+  }
+
+  // The SELECT's result columns: its columns, and its constants, which the
+  // binder made parameters.
+  static auto emit_targets(const SelectParts& s) -> std::vector<physical::EmitTarget> {
+    std::vector<physical::EmitTarget> out;
+    for (const auto& o : s.project->exprs) {
+      if (o.expr.kind == Expr::Kind::Param) {
+        out.emplace_back(physical::ParamTarget{o.expr.param, o.expr.phys()});
+      } else {
+        out.emplace_back(o.expr.col);
+      }
+    }
     return out;
   }
 
   // Emit, under LIMIT.
-  static auto emit(const SelectParts& s, physical::NodePtr rows, std::vector<ColumnRef> targets) -> physical::NodePtr {
+  static auto emit(const SelectParts& s, physical::NodePtr rows, std::vector<physical::EmitTarget> targets)
+      -> physical::NodePtr {
     if (s.limit) rows = physical::node(physical::Limit{std::move(rows), *s.limit});
     return physical::node(physical::Emit{std::move(rows), std::move(targets)});
   }
@@ -2002,6 +2025,7 @@ private:
     auto s = select_parts(root);
     result(s);
     if (const auto* e = std::get_if<logical::Empty>(&s.source->op)) return nothing(s, *e);
+    if (std::holds_alternative<logical::OneRow>(s.source->op)) return one_row(s);
     Query q;
     flatten(*s.source, q);
     for (const auto& rel : q.rels) constants(rel.table());
@@ -2029,7 +2053,9 @@ private:
         q.sort_by.push_back(o.col);
         if (std::ranges::find(used, o.col) == used.end()) used.push_back(o.col);
       }
-      for (const auto& o : s.project->exprs) q.above.push_back(o.expr.col);
+      for (const auto& o : s.project->exprs) {
+        if (o.expr.kind == Expr::Kind::Column) q.above.push_back(o.expr.col);
+      }
     }
     auto searched = candidates(q, ordered, used, !for_update && !distinct, sorting);
     auto emits = !s.limit || *s.limit > 0;
@@ -2040,11 +2066,9 @@ private:
     std::vector<Finished> out;
     for (const auto& c : searched.plans) {
       if (agg == nullptr) {
-        std::vector<ColumnRef> targets;
-        for (const auto& o : s.project->exprs) targets.push_back(o.expr.col);
         // A plan not in the ORDER BY's order sorts its rows.
         auto f = finish(q, c, sink, searched, order, avoiding,
-                        [&](physical::NodePtr rows) { return emit(s, std::move(rows), std::move(targets)); });
+                        [&](physical::NodePtr rows) { return emit(s, std::move(rows), emit_targets(s)); });
         if (f) out.push_back(std::move(*f));
         continue;
       }

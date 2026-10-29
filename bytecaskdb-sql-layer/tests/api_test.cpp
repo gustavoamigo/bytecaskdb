@@ -718,6 +718,57 @@ TEST_CASE("embedded API: a table without a primary key keeps every row, duplicat
                              {i(2), bytes("t2")}, {i(3), bytes("after")}});
 }
 
+TEST_CASE("embedded API: literals are bound after the caller's parameters, and a recompile folds them again",
+          "[sql][api]") {
+  sql_test::TempDir dir{"api_literals"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE l (k INTEGER PRIMARY KEY, d NUMERIC(6,2), t TEXT)");
+  const auto& ins = db->prepare("INSERT INTO l VALUES ($1, 1.25, 'one')");
+  // The constants are no parameter a caller binds or is told of.
+  CHECK(ins.param_types() == std::vector<PhysType>{PhysType::I64});
+  CHECK(ins.params().size() == 1);
+  CHECK(db->execute(ins, {i(1)}).affected == 1);
+  CHECK(db->execute(ins, {i(2)}).affected == 1);
+  try {
+    (void)db->execute(ins, {i(3), i(4)});
+    FAIL("an extra parameter was taken");
+  } catch (const ParamError& e) {
+    CHECK(std::string{e.what()} == "statement takes 1 parameters, got 2");
+  }
+  CHECK(db->execute("SELECT k, d, t FROM l WHERE t = 'one' AND k >= 2").rows == Grid{{i(2), i(125), bytes("one")}});
+  CHECK(db->execute("SELECT k, 'x', 2.5 FROM l WHERE k = 1").rows == Grid{{i(1), bytes("x"), i(25)}});
+
+  // Recompiled after a DDL, a literal is folded to the type it meets now.
+  const auto& by_d = db->prepare("SELECT k FROM l WHERE d = 1.25");
+  CHECK(db->execute(by_d, {}).rows.size() == 2);
+  (void)db->execute("DROP TABLE l");
+  (void)db->execute("CREATE TABLE l (k INTEGER PRIMARY KEY, d NUMERIC(6,3), t TEXT)");
+  CHECK(db->execute(ins, {i(1)}).affected == 1);
+  CHECK(db->table_rows("l").rows == Grid{{i(1), i(1250), bytes("one")}});
+  CHECK(db->execute(by_d, {}).rows == Grid{{i(1)}});
+  (void)db->execute("DROP TABLE l");
+  (void)db->execute("CREATE TABLE l (k INTEGER PRIMARY KEY, d NUMERIC(6,1), t TEXT)");
+  // At scale 1, 1.25 is no value d holds: refused, as on a first compile.
+  CHECK(sql_refusal(*db, by_d, {}) == "comparing d (numeric(6,1)) with a constant its type does not hold exactly is "
+                                      "not supported yet");
+
+  // A SELECT without FROM: one row of its constants, or none under LIMIT 0.
+  auto one = db->execute("SELECT 5, -7.80, 'a', NULL, TRUE, 1 + 1.5");
+  CHECK(one.columns == std::vector<std::string>(6, "?column?"));
+  CHECK(one.rows == Grid{{i(5), i(-780), bytes("a"), kNull, Value{true}, i(25)}});
+  CHECK(one.types == std::vector<SqlType>{{SqlKind::Integer}, {SqlKind::Decimal, 0, 0, 2}, {SqlKind::Text},
+                                          {SqlKind::Text}, {SqlKind::Boolean}, {SqlKind::Decimal, 0, 0, 1}});
+  CHECK(db->execute("SELECT 1 LIMIT 0").rows.empty());
+  CHECK(db->execute("SELECT 1 LIMIT 1").rows == Grid{{i(1)}});
+  // And in a transaction, beside its writes.
+  auto t = db->begin();
+  CHECK(t.execute("INSERT INTO l VALUES (9, 0.5, 'nine')").affected == 1);
+  CHECK(t.execute("SELECT k FROM l WHERE t = 'nine'").rows == Grid{{i(9)}});
+  CHECK(t.execute("SELECT 'in a transaction'").rows == Grid{{bytes("in a transaction")}});
+  CHECK(t.commit() == CommitOutcome::Committed);
+  CHECK(db->execute("SELECT d FROM l WHERE k = 9").rows == Grid{{i(5)}});
+}
+
 TEST_CASE("embedded API: a stored column that does not decode is BC_E_CORRUPT, never 0, empty or NULL",
           "[sql][api]") {
   sql_test::TempDir dir{"api_strict_rows"};

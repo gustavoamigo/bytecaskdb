@@ -173,7 +173,132 @@ TEST_CASE("binder: anything outside the scope is rejected with a message and pos
         std::pair<std::string, std::int32_t>{"CHAR(n) is not supported; use VARCHAR(n)", 16});
   // No primary key: the catalog gives the table a row id.
   CHECK(std::get<CreateTableDdl>(std::get<Ddl>(bind_sql(cat, "CREATE TABLE u (k BIGINT)").stmt)).pk.empty());
-  CHECK(rejected(cat, "SELECT id FROM t WHERE id = qty").first == "WHERE must compare a column with a parameter");
+  CHECK(rejected(cat, "SELECT id FROM t WHERE id = qty").first == "WHERE must compare a column with a parameter or a constant");
+}
+
+TEST_CASE("binder: constants are folded to the type they meet, as PostgreSQL types them", "[sql][binder]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE lt (k INTEGER PRIMARY KEY, s SMALLINT, d NUMERIC(6,2), "
+                                         "t TEXT, b BOOLEAN, r REAL, dt DATE, g BIGINT)")
+                          .stmt));
+  const auto& cat = f.cat();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return "bound";
+  };
+  // The constants, after the statement's own parameters: $1 is the caller's,
+  // the literal $2, which no client sees.
+  auto b = bind_sql(cat, "SELECT k FROM lt WHERE s = $1 AND k = 5");
+  CHECK(b.param_types == std::vector<PhysType>{PhysType::I64, PhysType::I64});
+  CHECK(b.params.size() == 1);
+  CHECK(b.param_sql.size() == 1);
+  CHECK(b.fixed == std::vector<Datum>{std::int64_t{5}});
+
+  // Alone in a select list: PostgreSQL's types, named ?column?.
+  auto out = [&](std::string_view sql) {
+    auto bound = bind_sql(cat, sql);
+    const auto* p = find<logical::Project>(root(bound));
+    REQUIRE(p != nullptr);
+    REQUIRE(p->exprs.size() == 1);
+    CHECK(p->exprs[0].name == "?column?");
+    REQUIRE(bound.fixed.size() == 1);
+    return std::pair{p->exprs[0].expr.type, bound.fixed[0]};
+  };
+  CHECK(out("SELECT 5") == std::pair{SqlType{SqlKind::Integer}, Datum{std::int64_t{5}}});
+  CHECK(out("SELECT 2147483648") == std::pair{SqlType{SqlKind::BigInt}, Datum{std::int64_t{2147483648}}});
+  CHECK(out("SELECT -7.80") == std::pair{SqlType{SqlKind::Decimal, 0, 0, 2}, Datum{std::int64_t{-780}}});
+  CHECK(out("SELECT .2E+2") == std::pair{SqlType{SqlKind::Decimal, 0, 0, 0}, Datum{std::int64_t{20}}});
+  CHECK(out("SELECT 2.2E-2") == std::pair{SqlType{SqlKind::Decimal, 0, 0, 3}, Datum{std::int64_t{22}}});
+  CHECK(out("SELECT 'a'") == std::pair{SqlType{SqlKind::Text}, Datum{sql_test::bytes("a")}});
+  CHECK(out("SELECT NULL") == std::pair{SqlType{SqlKind::Text}, Datum{}});
+  CHECK(out("SELECT TRUE") == std::pair{SqlType{SqlKind::Boolean}, Datum{true}});
+  // Folded: + and - as PostgreSQL's operators type and check them.
+  CHECK(out("SELECT 1 - 2 - 3") == std::pair{SqlType{SqlKind::Integer}, Datum{std::int64_t{-4}}});
+  CHECK(out("SELECT -(1 + 2)") == std::pair{SqlType{SqlKind::Integer}, Datum{std::int64_t{-3}}});
+  CHECK(out("SELECT 2147483647 + 2147483648") == std::pair{SqlType{SqlKind::BigInt}, Datum{std::int64_t{4294967295}}});
+  CHECK(out("SELECT 1 + 1.5") == std::pair{SqlType{SqlKind::Decimal, 0, 0, 1}, Datum{std::int64_t{25}}});
+  CHECK(out("SELECT 1 + NULL") == std::pair{SqlType{SqlKind::Integer}, Datum{}});
+  CHECK(state("SELECT 2147483647 + 1") == "22003");
+  CHECK(state("SELECT -2147483648 - 1") == "22003");
+  CHECK(state("SELECT 9223372036854775807 + 1") == "22003");
+  CHECK(state("SELECT TRUE + 1") == "42883");
+  // Not yet: PostgreSQL runs each.
+  CHECK(rejected(cat, "SELECT 1e100").first == "a numeric literal of more than 18 digits is not supported yet");
+  CHECK(rejected(cat, "SELECT 99999999999999999999").first == "a numeric literal of more than 18 digits is not supported yet");
+  CHECK(rejected(cat, "SELECT 'a' + 1").first == "a string literal in arithmetic is not supported yet");
+  CHECK(rejected(cat, "SELECT COUNT(*), 5 FROM lt").first ==
+        "a constant in the select list of an aggregated query is not supported yet");
+  CHECK(rejected(cat, "SELECT 1 WHERE 1 = 1").first ==
+        "a SELECT without FROM with WHERE, GROUP BY, HAVING, ORDER BY or FOR UPDATE is not supported yet");
+  CHECK(state("SELECT k") == "42703");  // a column of no table
+
+  // Assigned: PostgreSQL's assignment casts.
+  auto assigned = [&](std::string_view col, std::string_view lit) {
+    auto bound = bind_sql(cat, "INSERT INTO lt (k, " + std::string{col} + ") VALUES ($1, " + std::string{lit} + ")");
+    REQUIRE(bound.fixed.size() == 1);
+    return bound.fixed[0];
+  };
+  CHECK(assigned("s", "2.5") == Datum{std::int64_t{3}});  // half away from zero
+  CHECK(assigned("s", "-2.5") == Datum{std::int64_t{-3}});
+  CHECK(assigned("s", "40000") == Datum{std::int64_t{40000}});  // its range is checked when the row is built
+  CHECK(assigned("d", "1.005") == Datum{std::int64_t{101}});
+  CHECK(assigned("d", "7") == Datum{std::int64_t{700}});
+  CHECK(assigned("t", "2.2E-2") == Datum{sql_test::bytes("0.022")});
+  CHECK(assigned("t", "5") == Datum{sql_test::bytes("5")});
+  CHECK(assigned("t", "TRUE") == Datum{sql_test::bytes("true")});
+  CHECK(assigned("r", "0.1") == Datum{static_cast<double>(0.1F)});  // rounded once, to a float
+  CHECK(assigned("dt", "'1970-01-02'") == Datum{std::int64_t{1}});  // read as the column's type
+  CHECK(assigned("b", "'yes'") == Datum{true});
+  CHECK(assigned("t", "NULL") == Datum{});
+  CHECK(state("INSERT INTO lt (k, b) VALUES ($1, 1)") == "42804");
+  CHECK(state("INSERT INTO lt (k, s) VALUES ($1, '1.5')") == "22P02");
+  CHECK(state("INSERT INTO lt (k, dt) VALUES ($1, 'not a date')") == "22007");
+  CHECK(state("INSERT INTO lt (k, d) VALUES ($1, 99999999999999999.5)") == "22003");  // past 18 digits at the scale
+  CHECK(state("INSERT INTO lt (k, d) VALUES ($1, 9999999999999999999.5)") == "42601");  // a literal past 18: not yet
+  // An UPDATE's constant is checked against the column now, as PostgreSQL
+  // folds its cast when it plans the statement, whether or not a row matches.
+  CHECK(state("UPDATE lt SET s = 40000 WHERE k = $1") == "22003");
+  CHECK(state("UPDATE lt SET s = 32767 WHERE k = $1") == "bound");
+
+  // Compared: only a constant the column's type holds exactly.
+  auto compared = [&](std::string_view where) {
+    auto bound = bind_sql(cat, "SELECT k FROM lt WHERE " + std::string{where});
+    REQUIRE(bound.fixed.size() == 1);
+    return bound.fixed[0];
+  };
+  CHECK(compared("s = 7") == Datum{std::int64_t{7}});
+  CHECK(compared("7 < s") == Datum{std::int64_t{7}});
+  CHECK(compared("s = 7.0") == Datum{std::int64_t{7}});
+  CHECK(compared("d = 1.5") == Datum{std::int64_t{150}});
+  CHECK(compared("s = '7'") == Datum{std::int64_t{7}});
+  CHECK(compared("t = 'x'") == Datum{sql_test::bytes("x")});
+  CHECK(compared("s = NULL") == Datum{});
+  CHECK(compared("r = 16777216") == Datum{16777216.0});
+  CHECK(rejected(cat, "SELECT k FROM lt WHERE s = 40000").first ==
+        "comparing s (smallint) with a constant its type does not hold exactly is not supported yet");
+  CHECK(rejected(cat, "SELECT k FROM lt WHERE s = 1.5").first ==
+        "comparing s (smallint) with a constant its type does not hold exactly is not supported yet");
+  CHECK(rejected(cat, "SELECT k FROM lt WHERE d = 1.005").first ==
+        "comparing d (numeric(6,2)) with a constant its type does not hold exactly is not supported yet");
+  CHECK(rejected(cat, "SELECT k FROM lt WHERE r = 0.1").first ==
+        "comparing r (real) with a constant its type does not hold exactly is not supported yet");
+  CHECK(rejected(cat, "SELECT k FROM lt WHERE d = '1.005'").first ==
+        "comparing d (numeric(6,2)) with a constant its type does not hold exactly is not supported yet");
+  CHECK(state("SELECT k FROM lt WHERE d = 'x'") == "22P02");
+  CHECK(state("SELECT k FROM lt WHERE t = 5") == "42883");
+  // In a join, and in its select list.
+  auto joined = bind_sql(cat, "SELECT lt.k, 1 FROM lt, t WHERE lt.g = t.id AND t.name = 'n' AND lt.s = 3");
+  CHECK(joined.fixed == std::vector<Datum>{sql_test::bytes("n"), std::int64_t{3}, std::int64_t{1}});  // in binding order
+  CHECK(state("SELECT k FROM lt WHERE s = '1.5'") == "22P02");
+  CHECK(state("SELECT k FROM lt WHERE s = '40000'") == "22003");
+  // HAVING: a grouped column or an aggregate with a constant.
+  CHECK(bind_sql(cat, "SELECT s, COUNT(*) FROM lt GROUP BY s HAVING COUNT(*) > 1").fixed ==
+        std::vector<Datum>{std::int64_t{1}});
+  CHECK(bind_sql(cat, "SELECT s FROM lt GROUP BY s HAVING 2 <= s").fixed == std::vector<Datum>{std::int64_t{2}});
 }
 
 TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][binder][catalog]") {
@@ -487,7 +612,7 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
   CHECK(rejected(cat, "SELECT u.qty, count(*) FROM t, u WHERE id = k").first ==
         "column \"u.qty\" must appear in the GROUP BY clause or be used in an aggregate function");
   CHECK(rejected(cat, "SELECT id FROM t JOIN u ON id = $1 + k WHERE k = $2").first ==
-        "ON must compare a column with a parameter");
+        "ON must compare a column with a parameter or a constant");
   {
     // A range refusal names the table of the column the parameter is compared with.
     auto b = bind_sql(cat, "SELECT name FROM t, u WHERE id = $1 AND k = $2");

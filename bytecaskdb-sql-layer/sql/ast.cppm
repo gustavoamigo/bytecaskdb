@@ -53,21 +53,33 @@ public:
   ~FeatureNotSupported() override;  // out of line: anchors the vtable (-Wweak-vtables)
 };
 
-// A select-list, SET or comparison operand: a column, a parameter, an
-// integer literal, a sum or difference of two, or an aggregate: COUNT(*),
+// A constant, as written: a literal, or DEFAULT's operand. Numbers keep
+// their text, so the binder folds them exactly to the type they meet.
+struct Literal {
+  enum class Kind { Null, Integer, Number, String, Bool };
+  Kind kind{Kind::Null};
+  std::string text;  // Integer and Number: the digits as written; String: the bytes
+  bool b{false};     // Bool
+  std::int32_t pos{-1};
+};
+
+// A select-list, SET or comparison operand: a column, a parameter, a
+// literal (an integer within BIGINT after + or - is a Const), a sum or
+// difference of two, unary + or - of one, or an aggregate: COUNT(*),
 // COUNT([DISTINCT] column), SUM, MIN, MAX or AVG of a column.
 struct Expr {
-  enum class Kind { Column, Param, Const, Add, Sub, Aggregate };
+  enum class Kind { Column, Param, Const, Literal, Add, Sub, Plus, Neg, Aggregate };
   enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind;
   std::string column;       // Column; Aggregate's argument, "" for COUNT(*)
   std::uint32_t param{0};   // Param: zero-based ($1 is 0)
-  std::unique_ptr<Expr> lhs, rhs;  // Add, Sub
+  std::unique_ptr<Expr> lhs, rhs;  // Add, Sub; Plus and Neg: rhs
   std::int32_t pos{-1};
   std::string table;          // Column, Aggregate: the table it is qualified by, "" for none
   std::int64_t constant{0};   // Const: an integer literal (Add and Sub's right operand only)
   Fn fn{Fn::Count};           // Aggregate
   bool distinct{false};       // Aggregate: COUNT(DISTINCT column)
+  Literal literal{};          // Literal
 };
 
 // One conjunct of a WHERE clause: two expressions compared.
@@ -77,16 +89,6 @@ struct Compare {
   Expr lhs, rhs;
   std::int32_t pos{-1};
   bool on{false};  // a JOIN's ON conjunct, not the WHERE's
-};
-
-// A constant, as written: DEFAULT's operand. Numbers keep their text, so
-// the binder folds them exactly to the column's type.
-struct Literal {
-  enum class Kind { Null, Integer, Number, String, Bool };
-  Kind kind;
-  std::string text;  // Integer and Number: the digits as written; String: the bytes
-  bool b{false};     // Bool
-  std::int32_t pos{-1};
 };
 
 struct ColumnDefAst {
@@ -157,7 +159,7 @@ struct OrderItem {
 
 struct Select {
   std::vector<Expr> targets;
-  std::string table;
+  std::string table;  // "" for none: a SELECT without FROM
   std::string join;  // a second table, "" for none: FROM a, b or a [INNER] JOIN b ON …
   std::vector<Compare> where;
   std::vector<OrderItem> order_by;

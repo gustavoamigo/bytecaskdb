@@ -65,6 +65,7 @@ compute, not how.
 | Operator | Meaning |
 |---|---|
 | `Get(table)` | every row of a table |
+| `OneRow` | one row of no columns: a `SELECT` without `FROM` |
 | `Filter(input, predicate)` | the rows for which the predicate is true |
 | `Project(input, exprs)` | one output row per input row, of these expressions |
 | `Join(left, right, predicate)` | inner; outer joins with #534 |
@@ -75,14 +76,18 @@ compute, not how.
 
 Each expression carries its SQL type, which the binder resolves. The
 dialect's expressions are columns, parameters, integer constants, `+` and
-`-`, comparisons, their conjunction and aggregate calls; `*`, `/`, `OR`,
+`-`, comparisons, their conjunction and aggregate calls. A literal is a
+parameter by then: the binder folds it and the API binds it after the
+statement's own (`frontend_design.md`, *Literals*); `*`, `/`, `OR`,
 `NOT` and `IS NULL` come with the dialect that accepts them (#534). The
 binder's own rules are the frontend's: one SQL type per `$n`, and the
 errors it raises.
 
 **What the binder builds.**
 - A `SELECT` is `Limit? → Project → Sort? → Filter? → the tables`, the
-  tables a `Get`, or a `Join` of two `Get`s.
+  tables a `Get`, or a `Join` of two `Get`s. A `Project`'s outputs are
+  columns and constants' parameters. A `SELECT` without `FROM` is `Limit?
+  → Project → OneRow`.
 - An aggregated `SELECT` is `Limit? → Sort? → Filter? → Aggregate →
   Filter? → the tables`: the `Filter` above the `Aggregate` is its
   `HAVING`, and the `Sort` orders the groups. The `Aggregate`'s outputs are
@@ -407,6 +412,9 @@ point lookup, and in an `UPDATE`; `no_choice_under_limit` the `LIMIT` case.
 
 The physical plan's operators:
 - `Empty`, no rows and no read: the sink reports what it gives for none;
+- `OneRow`, one row of no columns and no read: its consumer runs once. A
+  plan of `Emit` over it is the one that names no table, so it has no
+  constants;
 - the access paths `PointGet`, `Scan` and `NullSplitScan`;
 - `CountRange` and `KeyAggregates`, access paths that also produce the
   aggregate;
@@ -414,7 +422,9 @@ The physical plan's operators:
 - `Filter`, `Sort`, `Limit` and `Choice`;
 - `Aggregate` (one row of `COUNT`, `COUNT(DISTINCT)` or `SUM`) and
   `GroupAggregate`;
-- the sinks: `Emit`, `GroupEmit`, `Insert`, `Update` and `Delete`.
+- the sinks: `Emit`, `GroupEmit`, `Insert`, `Update` and `Delete`. An
+  `Emit` target is a column or a parameter, a constant's, the same in
+  every row.
 
 The plan also lists the parameters a NULL of which ends it before it reads
 (`null_checks`), the `$n ± k` values computed before anything is read, and
@@ -535,7 +545,7 @@ output.
 | A join read once, or once per outer row | `NestedLoop` | the inner scan nested in the outer loop, opened once when the outer side is at most one row |
 | A hash join | `HashJoin` | `bc_hash_*` (*Hash joins*) |
 | `FOR UPDATE` | the access path's `for_update`, from the `Get`'s | `bc_guard_row` on each returned row: `bc_guard_unchanged` on its primary key |
-| Targets | `Emit`, `GroupEmit`, or the aggregate's row | `bc_emit_col`, `bc_emit_key_part`; for an aggregate, `bc_emit_i64` (every aggregate is held as an `int64_t`), and `bc_emit_null` for NULL |
+| Targets | `Emit`, `GroupEmit`, or the aggregate's row | `bc_emit_col`, `bc_emit_key_part`; a constant's parameter, `bc_emit_<type>` of `bc_param_<type>` or `bc_emit_null`; for an aggregate, `bc_emit_i64` (every aggregate is held as an `int64_t`), and `bc_emit_null` for NULL |
 
 A NULL that a key needs means no row can match, since `=` and the range
 operators reject NULL: a parameter ends the plan before any read

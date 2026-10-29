@@ -1297,7 +1297,7 @@ void dump_sql(Database& db, std::ostream& out) {
         if (std::holds_alternative<std::monostate>(row[i])) {
           line += "\\N";
         } else {
-          field(pg::to_text(row[i], rows.types.at(i)), line);
+          field(to_text(row[i], rows.types.at(i)), line);
         }
       }
       out << line << "\n";

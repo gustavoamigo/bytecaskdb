@@ -339,8 +339,6 @@
 
 - name: an INSERT of a literal
   features: [E101-01]
-  # literals other than in the supported forms are refused: use parameters
-  unimplemented: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
   steps:

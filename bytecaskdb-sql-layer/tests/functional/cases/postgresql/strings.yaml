@@ -402,8 +402,6 @@
 
 - name: a string literal in WHERE
   features: [E021-03]
-  # literals are not supported; use parameters
-  unimplemented: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR(20))
   steps:
@@ -433,8 +431,6 @@
 
 - name: a string literal in VALUES
   features: [E021-03]
-  # literals are not supported; use parameters
-  unimplemented: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR(20))
   steps:

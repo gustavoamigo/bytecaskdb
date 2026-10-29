@@ -35,21 +35,26 @@ kind the transformer doesn't take is refused with its position.
   declared without a primary key keeps every row, duplicates included,
   under a hidden row id no statement sees (`catalog_design.md`, *Tables
   without a primary key*).
-- `INSERT … VALUES` of one row, with or without a column list.
-- `SELECT` targets: columns, `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT
-  col)`, `SUM(col)`, `MIN(col)`, `MAX(col)` and `AVG(col)`, several of
-  them in any order.
+- `INSERT … VALUES` of one row, with or without a column list, of
+  parameters and constants.
+- `SELECT` targets: columns, constants (*Literals*), `COUNT(*)`,
+  `COUNT(col)`, `COUNT(DISTINCT col)`, `SUM(col)`, `MIN(col)`, `MAX(col)` and
+  `AVG(col)`, several of them in any order; a constant not beside an
+  aggregate or a `GROUP BY`.
 - `GROUP BY` of columns, and `HAVING`, below. A query with a `GROUP BY`, a
   `HAVING` or an aggregate is aggregated; without `GROUP BY` it returns
   exactly one row, or none where its `HAVING` is false.
 - `FROM`: one table, or two joined by a comma or `[INNER] JOIN … ON`.
-  Columns may be qualified by the table's name.
+  Columns may be qualified by the table's name. Without `FROM`, a
+  `SELECT` of constants returns one row of them, or none under `LIMIT 0`;
+  it takes no `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` or `FOR UPDATE`
+  yet.
 - `UPDATE` and `DELETE` of any number of rows.
 - `ORDER BY`, `LIMIT` and `FOR UPDATE`, below.
 
 **Literals and expressions.**
-- **Integer literals**, typed as PostgreSQL types them: `integer` if they
-  fit, else `bigint`, else refused. Other values travel as parameters.
+- **Literals** of every kind, typed and read as PostgreSQL types them
+  (*Literals*, below).
 - **`+` and `-`** on integers and on `DECIMAL`, with PostgreSQL's result
   type: `smallint + smallint` is `smallint`, `integer + bigint` is
   `bigint`, and so on.
@@ -59,10 +64,12 @@ kind the transformer doesn't take is refused with its position.
     of range`, `numeric field overflow`, all SQLSTATE 22003.
   - An expression involving NULL is NULL.
 - **Where expressions may appear:** `SET col = expr`, a comparison's
-  operand (`ol_o_id >= $3 - 20`), and `VALUES`.
+  operand (`ol_o_id >= $3 - 20`), and `VALUES`. A constant expression may
+  also be a select-list target and a `HAVING` operand.
 
 **`WHERE`** is a conjunction (`AND`) of comparisons (`=`, `<`, `<=`, `>`,
-`>=`) between expressions, in any order, on any columns.
+`>=`) of a column with a parameter, a constant or `$n ± k`, in any order,
+on any columns.
 - A comparison with NULL is not true, so it rejects the row, as in SQL's
   three-valued logic.
 - Comparing two columns of different SQL types is refused (*Known
@@ -143,9 +150,49 @@ That includes:
 - outer joins, three or more tables, table aliases;
 - `OFFSET`, `RETURNING`, multi-row `VALUES`;
 - `*`, `/`, string concatenation and functions;
-- literals other than integers.
+- a cast (`CAST`, `::`) and typed literals (`DATE '…'`), a numeric literal
+  of more than 18 digits, a string literal in arithmetic, unary `-` of
+  anything but a constant, and a constant beside an aggregate.
 
 The list and its order of work are #534.
+
+### Literals
+
+A literal is a constant of the statement, folded when it is bound, so a
+plan never holds one: each becomes a parameter the API binds after the
+statement's own (`bound::Bound::fixed`), which no client is told of or
+sends. A plan is compiled for its text, so the values are the text's; a
+recompile after a DDL folds them again, to the types they meet then.
+
+**Typed as PostgreSQL types them.**
+- An integer literal is `integer`, or `bigint` past it. A number with a
+  point or an exponent is `numeric` at the scale it is written with (`1.50`
+  at 2, `.2E+2` at 0, `2.2E-2` at 3), held as a `DECIMAL` of no declared
+  precision within 18 digits. `TRUE` and `FALSE` are `boolean`.
+- A string literal and `NULL` have no type yet. PostgreSQL types one by
+  where it is used and reads a string with that type's input function: the
+  same reading a parameter's text gets on the wire, from one module
+  (`sql/text.cppm`). Alone in a select list each is `text`.
+- Unary `+` and `-`, and `+` and `-` of constants, fold with PostgreSQL's
+  result types and range checks: `2147483647 + 1` is "integer out of
+  range" (22003), `1 + 1.5` the numeric 2.5, `1 + NULL` an integer NULL.
+- A select-list constant is named `?column?`.
+
+**Where it meets a column.**
+- **Assigned** (`VALUES`, `SET`): PostgreSQL's assignment casts. A numeric
+  is rounded half away from zero to an integer column or a `DECIMAL`'s
+  scale (`2.5` stores 3), a number or a boolean assigned to a string column
+  is its text (`2.2E-2` stores `0.022`), a REAL is read once as a float.
+  A type PostgreSQL does not assign is 42804. The value's range is checked
+  where the row is written, in column order, as an assigned parameter's
+  is; an `UPDATE`'s constant is checked when the statement is compiled, as
+  PostgreSQL checks it when it plans it, whether or not a row matches.
+- **Compared** (`WHERE`, `HAVING`): only a constant the column's type holds
+  exactly. `smallint_col = 7.0` is `= 7`; `smallint_col = 40000`,
+  `dec2_col = 1.005` and `real_col = 0.1` are refused (*Known differences*).
+  A string literal is read as the column's type: `int_col = '7'` is `= 7`,
+  `int_col = '1.5'` is 22P02. An integer compared with a string column is
+  42883, as in PostgreSQL.
 
 ## Binding
 
@@ -272,6 +319,19 @@ fail on them.
   (`planner_design.md`, *Memory*).
 - **A filter on a grouped DOUBLE or REAL column in HAVING is refused**
   (`no plan:`), as a `WHERE`'s is.
+- **A constant a column's type does not hold exactly is refused in a
+  comparison** (42601): `smallint_col = 40000`, `int_col = 1.5`,
+  `dec2_col = 1.005`, a REAL compared with a number that is no float, a
+  `DECIMAL` compared with one past 18 digits at its scale. PostgreSQL
+  compares in a wider type and answers. The layer compares each column in
+  its own key encoding, so it would have to rewrite the comparison
+  (`= 40000` is never true, `< 40000` is `IS NOT NULL`); it refuses rather
+  than guess. The machine expects the refusal (`oracle.exact_literal`).
+- **A constant's error is raised when the statement is compiled**: `SELECT
+  2147483647 + 1` and `UPDATE … SET smallint_col = 40000` fail at prepare
+  (the wire's Parse), with PostgreSQL's SQLSTATE. PostgreSQL folds the same
+  constants when it plans the statement, at Bind for a statement Parse left
+  unplanned.
 
 Each is a refusal or an error, not a different answer. Everything else in
 the dialect matches PostgreSQL, and the proof machine checks that it does.

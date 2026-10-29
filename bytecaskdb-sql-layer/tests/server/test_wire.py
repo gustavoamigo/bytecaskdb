@@ -385,6 +385,35 @@ def test_describe_statement_gives_parameter_types_and_columns(server):
     assert kinds(out) == b"1tnZ"
 
 
+def row_description(body: bytes) -> list[tuple[str, int]]:
+    """Each RowDescription field's name and type OID."""
+    (n,) = struct.unpack("!h", body[:2])
+    body, out = body[2:], []
+    for _ in range(n):
+        name, body = body.split(b"\0", 1)
+        _, _, oid, _, _, _ = struct.unpack("!ihihih", body[:18])
+        out.append((name.decode(), oid))
+        body = body[18:]
+    return out
+
+
+def test_literals_are_no_parameters_and_their_columns_have_postgresqls_types(server):
+    c = connect(server)
+    c.send(query("CREATE TABLE d (k SMALLINT PRIMARY KEY, s TEXT)"))
+    c.until_ready()
+    sql = "SELECT k, 'x', 2.50, 5, NULL FROM d WHERE k = $1 AND s = 'y'"
+    c.send(parse(sql, "q"), describe("S", "q"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"1tTZ"
+    assert struct.unpack("!hi", out[1][1]) == (1, 21)  # $1 alone, a SMALLINT: the literals are no parameters
+    assert row_description(out[2][1]) == [("k", 21), ("?column?", 25), ("?column?", 1700), ("?column?", 23),
+                                          ("?column?", 25)]
+    assert states(run(c, "INSERT INTO d VALUES (7, 'y')")) == []
+    assert data(run(c, sql, ["7"])) == [["7", "x", "2.50", "5", None]]
+    assert data(run(c, "SELECT -2.E-2, 1 + 1.5, TRUE")) == [["-0.02", "2.5", "t"]]
+    assert states(run(c, "SELECT 2147483647 + 1")) == ["22003"]
+
+
 def test_a_parameter_its_type_does_not_take_is_22p02(server):
     c = connect(server)
     table(c)
@@ -476,7 +505,8 @@ def test_a_query_inside_an_extended_block_joins_its_transaction_and_commits_it(s
     assert status(c.until_ready()) == "I"
     assert keys(c) == ["1"]
     # The Query fails: the Execute before it is rolled back with it.
-    for failing, state in (("SELECT k FROM t WHERE k = 1", "42601"), ("CREATE TABLE w (k BIGINT PRIMARY KEY)", "0A000")):
+    for failing, state in (("SELECT k FROM t WHERE k = 1 OR k = 2", "42601"),
+                           ("CREATE TABLE w (k BIGINT PRIMARY KEY)", "0A000")):
         c.send(parse(insert), bind(["2", "2"]), execute(), query(failing))
         out = c.until_ready()
         assert states(out) == [state] and status(out) == "I", failing
