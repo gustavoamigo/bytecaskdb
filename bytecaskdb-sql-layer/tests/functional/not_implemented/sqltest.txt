@@ -212,21 +212,9 @@ f031_19_10_21
 f051_05_07_02  # not PostgreSQL: there is no cast from time to timestamp (42846, which the layer gives)
 f051_07_01_01  # CURRENT_TIME is time with time zone: the layer has no WITH TIME ZONE types (#491)
 f051_07_01_02  # CURRENT_TIME is time with time zone: the layer has no WITH TIME ZONE types (#491)
-f131_02_01_01  # a join of a grouped view
+f131_02_01_01  # a join of a grouped view: needs a derived table (the view is not a plain table), and USING on a view
 f131_03_01_01  # an aggregate over a grouped view: needs a derived table
 f131_03_01_02  # an aggregate over a grouped view: needs a derived table
-f131_04_02_01  # a column compared with a subquery in a select list (not views)
-f131_04_02_02  # a column compared with a subquery in a select list (not views)
-f131_04_02_03  # a column compared with a subquery in a select list (not views)
-f131_04_02_04  # a column compared with a subquery in a select list (not views)
-f131_04_02_05  # a column compared with a subquery in a select list (not views)
-f131_04_02_06  # a column compared with a subquery in a select list (not views)
-f131_04_02_07  # a column compared with a subquery in a select list (not views)
-f131_04_02_08  # a column compared with a subquery in a select list (not views)
-f131_04_02_09  # a column compared with a subquery in a select list (not views)
-f131_04_02_10  # a column compared with a subquery in a select list (not views)
-f131_04_02_11  # a column compared with a subquery in a select list (not views)
-f131_04_02_12  # a column compared with a subquery in a select list (not views)
 f221_01_01
 f221_02_01
 f261_01_01_01  # WHEN with a list of values: not PostgreSQL syntax

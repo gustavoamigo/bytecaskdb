@@ -417,7 +417,14 @@ EXISTS] name`:
   view's group columns, selecting those alone: a view row is a group, so
   that is the view. An aggregate, `DISTINCT` or a join over a grouped
   view, or a `GROUP BY` of anything else, is refused (42601); it needs a
-  derived table. A view defined with `DISTINCT`, `LIMIT` or a set operation
+  derived table. One case is not refused: a grouped view with no aggregate,
+  whose `HAVING` tests group columns alone, has the base rows' values, one row
+  per group. `MIN`, `MAX` and `COUNT(DISTINCT)` cannot tell a value once from
+  many, so a query whose aggregates are those reads the base rows (the view's
+  `HAVING` joining its `WHERE`), grouped by its own `GROUP BY` if any. `SUM`,
+  `COUNT`, `AVG`, an aggregate of a view's own aggregate and a `HAVING` of the
+  query stay refused. A derived table needs an `Aggregate` over another's
+  rows, which the plan API doesn't express: it reads tables. A view defined with `DISTINCT`, `LIMIT` or a set operation
   is created and not read yet.
 - **Columns** are named as the select list names them, or by the column
   list, which may name fewer than there are columns. Two with one name are

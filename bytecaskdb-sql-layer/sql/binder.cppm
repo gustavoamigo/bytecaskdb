@@ -3953,7 +3953,11 @@ private:
       return ast::clone(view.targets[static_cast<std::size_t>(at - v.names.begin())]);
     };
     apply(s, swap);
-    if (grouped && again) {
+    if (grouped && again && rows_of_base(view) && duplicate_blind(s)) {
+      // The view's rows are base-row values: the query reads the base rows,
+      // those its HAVING (over group columns, so a WHERE) keeps.
+      for (const auto& c : view.having) s.where.push_back(ast::clone(c));
+    } else if (grouped && again) {
       if (!regroup(s, view)) not_yet("grouping, aggregating or DISTINCT over a grouped view", s.pos);
     } else if (grouped) {
       s.having.clear();
@@ -3970,6 +3974,31 @@ private:
     for (auto& c : s.where) where.push_back(std::move(c));
     s.where = std::move(where);
     if (s.order_by.empty() && !s.distinct) s.order_by = view.order_by;
+  }
+
+  // A grouped view without aggregates, whose HAVING tests group columns alone,
+  // selects columns of base rows, one row per distinct group: the same values
+  // as the base rows it keeps, fewer times.
+  static auto rows_of_base(const ast::Select& view) -> bool {
+    return !view.group_by.empty() &&
+           std::ranges::all_of(view.having, [&](const ast::Compare& c) { return over_group(c, view.group_by); }) &&
+           std::ranges::all_of(view.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Column; });
+  }
+
+  // A query, already substituted, whose aggregates cannot tell a value once
+  // from a value many times (MIN, MAX, COUNT(DISTINCT)), and has at least one.
+  static auto duplicate_blind(const ast::Select& s) -> bool {
+    using Fn = ast::Expr::Fn;
+    auto blind = [](const ast::Expr& e) {
+      return e.fn == Fn::Min || e.fn == Fn::Max || (e.fn == Fn::Count && e.distinct);
+    };
+    auto aggregates = 0;
+    for (const auto& e : s.targets) {
+      if (e.kind != ast::Expr::Kind::Aggregate) continue;
+      if (!blind(e)) return false;
+      ++aggregates;
+    }
+    return !s.distinct && s.having.empty() && aggregates > 0;
   }
 
   // A query that groups again over a grouped view, already substituted, is
