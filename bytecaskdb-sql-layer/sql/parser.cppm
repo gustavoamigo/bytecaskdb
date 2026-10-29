@@ -14,6 +14,7 @@ module;
 #include <charconv>
 #include <cstddef>
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -162,6 +163,13 @@ auto expr(const PgQuery__Node* n) -> Expr {
       e.rhs = std::make_unique<Expr>(operand(a->rexpr));
       return e;
     }
+    if (op == "||" && a->lexpr != nullptr) {
+      Expr e{Expr::Kind::Func, {}, 0, nullptr, nullptr, a->location};
+      e.func = op;
+      e.args.push_back(operand(a->lexpr));
+      e.args.push_back(operand(a->rexpr));
+      return e;
+    }
     if (op != "+" && op != "-" && op != "*" && op != "/") reject("only +, -, * and / are supported here", a->location);
     // Unary: PostgreSQL's grammar folds - of a number into the literal, so
     // what is left is + of anything and - of an expression.
@@ -183,6 +191,21 @@ auto expr(const PgQuery__Node* n) -> Expr {
   if (n->node_case == PG_QUERY__NODE__NODE_FUNC_CALL) {
     const auto* f = n->func_call;
     auto name = str(f->funcname[f->n_funcname - 1]);
+    // PostgreSQL's grammar spells TRIM, POSITION, SUBSTRING and OVERLAY as
+    // calls of these, their operands in the function's order.
+    static constexpr std::array kStringFunctions{"upper",        "lower",         "substring", "btrim",  "ltrim",  "rtrim",
+                                                 "position",     "char_length",   "character_length", "octet_length", "overlay"};
+    if (std::ranges::find(kStringFunctions, name) != kStringFunctions.end() &&
+        (f->n_funcname == 1 || (f->n_funcname == 2 && str(f->funcname[0]) == "pg_catalog"))) {
+      if (f->agg_star || f->agg_distinct || f->n_agg_order != 0 || f->agg_filter != nullptr || f->over != nullptr ||
+          f->agg_within_group || f->func_variadic) {
+        reject("function " + name + " takes plain arguments", f->location);
+      }
+      Expr e{Expr::Kind::Func, {}, 0, nullptr, nullptr, f->location};
+      e.func = name;
+      for (std::size_t k = 0; k < f->n_args; ++k) e.args.push_back(operand(f->args[k]));
+      return e;
+    }
     auto known = name == "count" || name == "sum" || name == "min" || name == "max" || name == "avg";
     if (!known || (f->n_funcname == 2 && str(f->funcname[0]) != "pg_catalog") || f->n_funcname > 2) {
       reject("function " + name + " is not supported", f->location);

@@ -1,0 +1,123 @@
+# || and the string functions of constants. Of columns they are not supported
+# yet (#667), so each case here selects constants only; the cases of columns
+# are in strings.yaml, marked unimplemented.
+
+- name: "|| concatenates strings, and any other type through its text"
+  features: [E021-07]
+  steps:
+    - sql: SELECT 'foo' || 'bar', 'a' || 'b' || 'c', '' || 'x'
+      expected: [["foobar", "abc", "x"]]
+    - sql: SELECT 'a' || 1, 1 || 'a', 'a' || 1.50, 'a' || true, 'a' || false
+      expected: [["a1", "1a", "a1.50", "atrue", "afalse"]]
+    - sql: SELECT 'a' || NULL, NULL || 'a', NULL || NULL, 'a' || NULL || 'b'
+      expected: [[null, null, null, null]]
+    - sql: SELECT 'é' || '日本'
+      expected: [["é日本"]]
+    - sql: SELECT 1 || 2
+      error: "42883"
+    - sql: SELECT true || false
+      error: "42883"
+
+- name: UPPER and LOWER fold ASCII letters, NULL gives NULL
+  features: [E021-08]
+  steps:
+    - sql: SELECT UPPER('foo'), LOWER('FoO'), UPPER('a_b 1'), LOWER('É')
+      expected: [["FOO", "foo", "A_B 1", "É"]]
+    - sql: SELECT UPPER(NULL), LOWER(NULL)
+      expected: [[null, null]]
+    - sql: SELECT UPPER(1)
+      error: "42883"
+    - sql: SELECT LOWER(NULL::integer)
+      error: "42883"
+    - sql: SELECT UPPER('a', 'b')
+      error: "42883"
+
+- name: CHARACTER_LENGTH, CHAR_LENGTH and OCTET_LENGTH count characters and bytes
+  features: [E021-04, E021-05]
+  steps:
+    - sql: SELECT CHARACTER_LENGTH('foo'), CHAR_LENGTH('foo'), OCTET_LENGTH('foo')
+      expected: [[3, 3, 3]]
+    - sql: SELECT CHAR_LENGTH('é'), OCTET_LENGTH('é'), CHAR_LENGTH('日本語'), OCTET_LENGTH('日本語'), CHAR_LENGTH('')
+      expected: [[1, 2, 3, 9, 0]]
+    - sql: SELECT CHAR_LENGTH(NULL), OCTET_LENGTH(NULL)
+      expected: [[null, null]]
+    - sql: SELECT CHAR_LENGTH(1)
+      error: "42883"
+
+- name: SUBSTRING takes characters from a position, for a length
+  features: [E021-06]
+  steps:
+    - sql: SELECT SUBSTRING('foobar' FROM 3), SUBSTRING('foobar' FROM 2 FOR 3), SUBSTRING('foobar', 4, 2)
+      expected: [["obar", "oob", "ba"]]
+    - sql: SELECT SUBSTRING('foobar' FROM 0), SUBSTRING('foobar' FROM -2), SUBSTRING('foobar' FROM 7), SUBSTRING('foobar' FROM 99)
+      expected: [["foobar", "foobar", "", ""]]
+    - sql: SELECT SUBSTRING('foobar' FROM -1 FOR 3), SUBSTRING('foobar' FROM 0 FOR 2), SUBSTRING('foobar' FROM 2 FOR 0), SUBSTRING('foobar' FROM -5 FOR 2)
+      expected: [["f", "f", "", ""]]
+    - sql: SELECT SUBSTRING('foobar' FROM 5 FOR 2147483647), SUBSTRING('日本語' FROM 2 FOR 1)
+      expected: [["ar", "本"]]
+    - sql: SELECT SUBSTRING('foobar' FROM '2' FOR 2)
+      expected: [["oo"]]
+    - sql: SELECT SUBSTRING(NULL FROM 1), SUBSTRING('abc' FROM NULL::integer), SUBSTRING('abc' FROM 1 FOR NULL::integer)
+      expected: [[null, null, null]]
+    - sql: SELECT SUBSTRING('foobar' FROM 1 FOR -1)
+      error: "22011"
+    - sql: SELECT SUBSTRING('foobar' FROM 3000000000)
+      error: "42883"
+    - sql: SELECT SUBSTRING('foobar' FROM 'x')
+      error: "42601"
+    - sql: SELECT SUBSTRING(12 FROM 1)
+      error: "42883"
+
+- name: TRIM removes spaces, or the characters it is given, from either end
+  features: [E021-09]
+  steps:
+    - sql: SELECT TRIM('  foo  '), TRIM(BOTH FROM '  foo  '), TRIM(LEADING FROM '  foo  '), TRIM(TRAILING FROM '  foo  ')
+      expected: [["foo", "foo", "foo  ", "  foo"]]
+    - sql: SELECT TRIM('x' FROM 'xxfooxx'), TRIM(BOTH 'xy' FROM 'xyfooyx'), TRIM(LEADING 'x' FROM 'xxfooxx'), TRIM(TRAILING 'x' FROM 'xxfooxx')
+      expected: [["foo", "foo", "fooxx", "xxfoo"]]
+    - sql: SELECT TRIM('foo' FROM 'foo'), TRIM('' FROM ' a '), TRIM('é' FROM 'éaé'), TRIM(' ' FROM '   ')
+      expected: [["", " a ", "a", ""]]
+    - sql: SELECT BTRIM('xaxx', 'x'), LTRIM('  a'), RTRIM('a  ', ' '), LTRIM('xxa', 'x')
+      expected: [["a", "a", "a", "a"]]
+    - sql: SELECT TRIM(NULL), TRIM('x' FROM NULL), TRIM(NULL FROM 'x')
+      expected: [[null, null, null]]
+    - sql: SELECT TRIM(1)
+      error: "42883"
+
+- name: POSITION finds a substring's first character position, 0 for none
+  features: [E021-11]
+  steps:
+    - sql: SELECT POSITION('an' IN 'banana'), POSITION('na' IN 'banana'), POSITION('x' IN 'banana'), POSITION('b' IN 'banana')
+      expected: [[2, 3, 0, 1]]
+    - sql: SELECT POSITION('' IN 'abc'), POSITION('' IN ''), POSITION('a' IN ''), POSITION('本' IN '日本語')
+      expected: [[1, 1, 0, 2]]
+    - sql: SELECT POSITION(NULL IN 'abc'), POSITION('a' IN NULL)
+      expected: [[null, null]]
+    - sql: SELECT POSITION(1 IN 'abc')
+      error: "42883"
+    - sql: SELECT 'x' IN 'abc'
+      error: "42601"
+
+- name: OVERLAY replaces characters from a position
+  features: [T312]
+  steps:
+    - sql: SELECT OVERLAY('abcdef' PLACING 'XY' FROM 2), OVERLAY('abcdef' PLACING 'XY' FROM 2 FOR 3), OVERLAY('abcdef' PLACING 'XY' FROM 2 FOR 0)
+      expected: [["aXYdef", "aXYef", "aXYbcdef"]]
+    - sql: SELECT OVERLAY('abc' PLACING 'XY' FROM 5), OVERLAY('abc' PLACING '' FROM 2 FOR 5), OVERLAY('日本語' PLACING 'x' FROM 2)
+      expected: [["abcXY", "a", "日x語"]]
+    - sql: SELECT OVERLAY(NULL PLACING 'x' FROM 1), OVERLAY('a' PLACING NULL FROM 1)
+      expected: [[null, null]]
+    - sql: SELECT OVERLAY('abc' PLACING 'x' FROM 0)
+      error: "22011"
+    - sql: SELECT OVERLAY('abc' PLACING 'x' FROM 2147483647 FOR 1)
+      error: "22003"
+
+- name: string functions nest, and take the constants of a conditional
+  features: [E021-07, E021-08, E021-09]
+  steps:
+    - sql: SELECT UPPER(SUBSTRING('foobar' FROM 4)) || '!', CHAR_LENGTH(TRIM('  ab ')) + 1
+      expected: [["BAR!", 3]]
+    - sql: SELECT COALESCE(NULL, 'a') || 'b', CASE WHEN 1 = 1 THEN LOWER('X') END
+      expected: [["ab", "x"]]
+    - sql: SELECT 'ab' || 'c' = 'abc', UPPER('a') = 'A'
+      expected: [[true, true]]
