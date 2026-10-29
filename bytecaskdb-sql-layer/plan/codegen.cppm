@@ -643,6 +643,8 @@ private:
       case Expr::Kind::Sub:
       case Expr::Kind::Mul:
       case Expr::Kind::Div:
+      case Expr::Kind::Case:
+      case Expr::Kind::Coalesce:
       case Expr::Kind::Aggregate: break;
     }
     throw std::logic_error{"physical plan: a predicate codegen does not print"};
@@ -679,7 +681,9 @@ private:
       case Expr::Kind::IsNull:
       case Expr::Kind::Like:
       case Expr::Kind::Truth:
-      case Expr::Kind::InSet: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
+      case Expr::Kind::InSet:
+      case Expr::Kind::Case:
+      case Expr::Kind::Coalesce: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
     }
     auto col = read_col(lhs);
     // Text and bytes compare as bytes: COLLATE "C".
@@ -1368,6 +1372,8 @@ private:
       }
       case Expr::Kind::And:
       case Expr::Kind::Or: return eval_connective(e);
+      case Expr::Kind::Case: return eval_case(e);
+      case Expr::Kind::Coalesce: return eval_coalesce(e);
       case Expr::Kind::Aggregate:
       case Expr::Kind::Like:
       case Expr::Kind::Truth:
@@ -1423,7 +1429,9 @@ private:
       case Expr::Kind::IsNull:
       case Expr::Kind::Like:
       case Expr::Kind::Truth:
-      case Expr::Kind::InSet: throw std::logic_error{"physical plan: not an arithmetic expression"};
+      case Expr::Kind::InSet:
+      case Expr::Kind::Case:
+      case Expr::Kind::Coalesce: throw std::logic_error{"physical plan: not an arithmetic expression"};
     }
     if (e.type.kind == SqlKind::SmallInt || e.type.kind == SqlKind::Integer) {
       call = "bc_check_int(cx, " + call + ", " + (e.type.kind == SqlKind::SmallInt ? "BC_SMALLINT" : "BC_INTEGER") + ", 0)";
@@ -1483,6 +1491,71 @@ private:
     }
     w_.line("n" + id + " = n" + id + " && !d" + id + ";");
     return {"n" + id, is_and ? "!d" + id : "d" + id, PhysType::Bool};
+  }
+
+  // The result of a CASE or COALESCE: a local, NULL until a branch gives a
+  // value (so a CASE no WHEN takes and has no ELSE is NULL).
+  auto open_result(const Expr& e) -> std::string {
+    auto id = std::to_string(exprs_++);
+    switch (e.phys()) {
+      case PhysType::I64: w_.line("int64_t v" + id + " = 0;"); break;
+      case PhysType::F64: w_.line("double v" + id + " = 0;"); break;
+      case PhysType::Bool: w_.line("bool v" + id + " = 0;"); break;
+      case PhysType::Bytes: w_.line("bc_view v" + id + "; v" + id + ".i = 0; v" + id + ".g = 0;"); break;
+    }
+    w_.line("bool n" + id + " = 1;");
+    return id;
+  }
+
+  // A branch's value as the result: at the result's scale if both are
+  // numerics, and NULL as NULL. Printed only inside the branch's own block,
+  // so an error the branch raises is raised only when it is taken.
+  void take(const std::string& id, const Expr& result, const Expr& branch) {
+    auto v = eval(branch);
+    auto value = result.type.kind == SqlKind::Decimal ? at_scale(v, branch.type, decimal_scale(result.type)) : v.value;
+    if (v.null.empty()) {
+      w_.line("n" + id + " = 0;");
+      w_.line("v" + id + " = " + value + ";");
+      return;
+    }
+    w_.line("n" + id + " = " + v.null + ";");
+    w_.open("if (!n" + id + ")");
+    w_.line("v" + id + " = " + value + ";");
+    w_.close();
+  }
+
+  // CASE: each WHEN is evaluated only while no earlier one was true, its
+  // THEN only when its WHEN is. A NULL condition is not true.
+  auto eval_case(const Expr& e) -> Val {
+    auto id = open_result(e);
+    w_.line("bool d" + id + " = 0;");
+    for (std::size_t i = 0; i + 1 < e.args.size(); i += 2) {
+      w_.open("if (!d" + id + ")");
+      auto c = eval(e.args[i]);
+      w_.open("if (" + (c.null.empty() ? c.value : "!(" + c.null + ") && " + c.value) + ")");
+      w_.line("d" + id + " = 1;");
+      take(id, e, e.args[i + 1]);
+      w_.close();
+      w_.close();
+    }
+    if (e.args.size() % 2 == 1) {
+      w_.open("if (!d" + id + ")");
+      take(id, e, e.args.back());
+      w_.close();
+    }
+    return {"n" + id, "v" + id, e.phys()};
+  }
+
+  // COALESCE: each argument is evaluated only while the ones before it are
+  // NULL.
+  auto eval_coalesce(const Expr& e) -> Val {
+    auto id = open_result(e);
+    for (const auto& arg : e.args) {
+      w_.open("if (n" + id + ")");
+      take(id, e, arg);
+      w_.close();
+    }
+    return {"n" + id, "v" + id, e.phys()};
   }
 
   // A computed value as a result column, NULL as NULL.

@@ -439,6 +439,29 @@ TEST_CASE("physical: check refuses an expression result column codegen can't pri
   from_key.emplace_back(physical::ExprTarget{logical::binary(Kind::Add, logical::column(kD, SqlType{SqlKind::Double}), p(1),
                                                               SqlType{SqlKind::Double})});
   refused(plan(node(physical::Emit{node(scan({p(0)}, {}, true)), std::move(from_key)})), "DOUBLE column read from a key");
+
+  // CASE and COALESCE: a branch of the result's type, a numeric branch no finer than it, a BOOLEAN WHEN.
+  const auto text = SqlType{SqlKind::Text};
+  const auto d2 = SqlType{SqlKind::Decimal, 0, 0, 2};
+  auto when = logical::compare(Op::Lt, id, p(1));
+  auto searched = logical::expr(Kind::Case, big);
+  searched.args = {when, id, p(1)};
+  CHECK(refusal(emitting(searched)).empty());
+  auto coalesced = logical::expr(Kind::Coalesce, big);
+  coalesced.args = {id, p(1)};
+  CHECK(refusal(emitting(coalesced)).empty());
+  auto not_boolean = searched;
+  not_boolean.args[0] = id;
+  refused(emitting(not_boolean), "not a BOOLEAN");
+  auto other_type = logical::expr(Kind::Case, text);
+  other_type.args = {when, id};
+  refused(emitting(other_type), "another type than its result");
+  auto finer = logical::expr(Kind::Case, big);
+  finer.args = {when, logical::param(1, d2)};
+  refused(emitting(finer), "another type than its result");
+  auto lone_branch = logical::expr(Kind::Coalesce, big);
+  lone_branch.args = {id};
+  refused(emitting(lone_branch), "wrong number of operands");
 }
 
 TEST_CASE("physical: check refuses a grouped aggregate codegen can't print", "[sql][physical][group]") {

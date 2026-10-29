@@ -1655,6 +1655,94 @@ TEST_CASE("embedded API: expressions over columns in the select list", "[sql][ap
   CHECK(state("SELECT id FROM ce WHERE i * 2 = 4") == "42601");
 }
 
+
+TEST_CASE("embedded API: CASE, COALESCE and NULLIF over columns, parameters and subqueries", "[sql][api]") {
+  sql_test::TempDir dir{"api_case_columns"};
+  auto db = Database::open(dir.path());
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  auto null = Value{};
+  (void)db->execute(
+      "CREATE TABLE cc (id INTEGER PRIMARY KEY, i INTEGER, s SMALLINT, d DECIMAL(6,2), z INTEGER, t TEXT, f DOUBLE PRECISION)");
+  (void)db->execute("INSERT INTO cc VALUES (1, 1, 100, 2.50, NULL, 'a', 1.5)");
+  (void)db->execute("INSERT INTO cc VALUES (2, 2, 200, 2.50, 0, 'b', 2.5)");
+  (void)db->execute("INSERT INTO cc VALUES (3, 3, 300, 10.00, 4, 'c', 0.5)");
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+  auto rows = [&](std::string_view sql) { return db->execute(sql).rows; };
+
+  // Searched: the first true WHEN, else ELSE, else NULL; a NULL condition is not true.
+  auto bands = db->execute("SELECT CASE WHEN i < 2 THEN 'low' WHEN i < 3 THEN 'mid' ELSE 'high' END FROM cc ORDER BY id");
+  CHECK(bands.rows == Grid{{text("low")}, {text("mid")}, {text("high")}});
+  CHECK(bands.columns == std::vector<std::string>{"case"});
+  CHECK(bands.types == std::vector<SqlType>{SqlType{SqlKind::Text}});
+  CHECK(rows("SELECT CASE WHEN z > 0 THEN 1 END FROM cc ORDER BY id") == Grid{{null}, {null}, {i(1)}});
+  CHECK(rows("SELECT CASE WHEN i > 1 THEN NULL END FROM cc ORDER BY id") == Grid{{null}, {null}, {null}});
+  // Simple: CASE x WHEN v tests x = v.
+  CHECK(rows("SELECT CASE i WHEN 1 THEN 10 WHEN 3 THEN 30 ELSE 0 END FROM cc ORDER BY id") == Grid{{i(10)}, {i(0)}, {i(30)}});
+  CHECK(rows("SELECT CASE z WHEN 0 THEN 'zero' WHEN 4 THEN 'four' END FROM cc ORDER BY id") ==
+        Grid{{null}, {text("zero")}, {text("four")}});
+  // A WHEN that is AND, OR, NOT, IS NULL, or a subquery's boolean.
+  CHECK(rows("SELECT CASE WHEN z IS NULL THEN 'n' WHEN z = 0 OR i > 5 THEN 'z' ELSE 'p' END FROM cc ORDER BY id") ==
+        Grid{{text("n")}, {text("z")}, {text("p")}});
+  CHECK(rows("SELECT CASE WHEN NOT (i > 1) AND z IS NULL THEN 1 ELSE 0 END FROM cc ORDER BY id") == Grid{{i(1)}, {i(0)}, {i(0)}});
+  CHECK(rows("SELECT CASE WHEN i > (SELECT MIN(id) FROM cc) THEN 'x' ELSE 'y' END FROM cc ORDER BY id") ==
+        Grid{{text("y")}, {text("x")}, {text("x")}});
+
+  // COALESCE and NULLIF.
+  CHECK(rows("SELECT COALESCE(z, 99), COALESCE(z, i), COALESCE(t, 'q') FROM cc ORDER BY id") ==
+        Grid{{i(99), i(1), text("a")}, {i(0), i(0), text("b")}, {i(4), i(4), text("c")}});
+  CHECK(db->execute("SELECT COALESCE(z, i) FROM cc").columns == std::vector<std::string>{"coalesce"});
+  CHECK(rows("SELECT NULLIF(z, 0), NULLIF(i, 2) FROM cc ORDER BY id") == Grid{{null, i(1)}, {null, null}, {i(4), i(3)}});
+  CHECK(db->execute("SELECT NULLIF(i, 2) FROM cc").columns == std::vector<std::string>{"nullif"});
+  CHECK(rows("SELECT COALESCE(NULLIF(z, 0), i) FROM cc ORDER BY id") == Grid{{i(1)}, {i(2)}, {i(4)}});
+  CHECK(rows("SELECT COALESCE(z, (SELECT MAX(id) FROM cc)) FROM cc ORDER BY id") == Grid{{i(3)}, {i(0)}, {i(4)}});
+  {
+    const auto& st = db->prepare("SELECT COALESCE(z, $1) FROM cc ORDER BY id");
+    CHECK(db->execute(st, {i(7)}).rows == Grid{{i(7)}, {i(0)}, {i(4)}});
+  }
+
+  // Result types: integers widen; a numeric is at the finest scale of its branches.
+  CHECK(db->execute("SELECT CASE WHEN i = 1 THEN s ELSE i END FROM cc").types[0] == SqlType{SqlKind::Integer});
+  CHECK(rows("SELECT CASE WHEN i = 1 THEN s ELSE i END FROM cc ORDER BY id") == Grid{{i(100)}, {i(2)}, {i(3)}});
+  auto dec = db->execute("SELECT COALESCE(z, d), CASE WHEN i = 1 THEN d ELSE 0.125 END FROM cc ORDER BY id");
+  CHECK(dec.types == std::vector<SqlType>{{SqlKind::Decimal, 0, 0, 2}, {SqlKind::Decimal, 0, 0, 3}});
+  CHECK(dec.rows == Grid{{i(250), i(2500)}, {i(0), i(125)}, {i(400), i(125)}});
+  CHECK(rows("SELECT CASE WHEN i < 3 THEN f END FROM cc ORDER BY id") == Grid{{Value{1.5}}, {Value{2.5}}, {null}});
+  CHECK(state("SELECT CASE WHEN i = 1 THEN f ELSE 0 END FROM cc") == "42601");  // a float beside another number
+
+  // A branch is evaluated only when taken: an untaken one raises nothing.
+  CHECK(rows("SELECT CASE WHEN z <> 0 THEN i * 100 / z ELSE 0 END FROM cc ORDER BY id") == Grid{{i(0)}, {i(0)}, {i(75)}});
+  CHECK(rows("SELECT COALESCE(z, i / z) FROM cc WHERE id = 3") == Grid{{i(4)}});
+  CHECK(rows("SELECT COALESCE(i, i / z) FROM cc ORDER BY id") == Grid{{i(1)}, {i(2)}, {i(3)}});
+  CHECK(state("SELECT CASE WHEN id > 1 THEN i / z END FROM cc") == "22012");  // the taken one raises
+  CHECK(state("SELECT CASE WHEN i > 5 THEN i ELSE 1 / 0 END FROM cc") == "22012");  // a constant, folded when planned, as PostgreSQL
+
+  // Errors.
+  CHECK(state("SELECT CASE WHEN i THEN 1 END FROM cc") == "42804");
+  CHECK(state("SELECT CASE WHEN i > 0 THEN i ELSE t END FROM cc") == "42804");
+  CHECK(state("SELECT COALESCE(i, t) FROM cc") == "42804");
+  CHECK(state("SELECT CASE WHEN i > 0 THEN i ELSE 'x' END FROM cc") == "22P02");
+  CHECK(state("SELECT NULLIF(i, t) FROM cc") == "42883");
+
+  // Over a join, in a set operation, in a view.
+  (void)db->execute("CREATE TABLE cc2 (id INTEGER PRIMARY KEY, w INTEGER)");
+  (void)db->execute("INSERT INTO cc2 VALUES (1, 10)");
+  (void)db->execute("INSERT INTO cc2 VALUES (3, 30)");
+  CHECK(rows("SELECT CASE WHEN cc.i + cc2.w > 20 THEN 1 ELSE 0 END FROM cc JOIN cc2 ON cc.id = cc2.id ORDER BY cc2.w") ==
+        Grid{{i(0)}, {i(1)}});
+  CHECK(rows("SELECT COALESCE(z, 9) FROM cc WHERE id = 1 UNION ALL SELECT 5 ORDER BY 1") == Grid{{i(5)}, {i(9)}});
+  (void)db->execute("CREATE VIEW ccv AS SELECT id, COALESCE(z, 0) AS zz FROM cc");
+  CHECK(rows("SELECT zz FROM ccv ORDER BY id") == Grid{{i(0)}, {i(0)}, {i(4)}});
+}
+
 TEST_CASE("embedded API: CASE, COALESCE and NULLIF of constants fold as PostgreSQL's do", "[sql][api]") {
   sql_test::TempDir dir{"api_case"};
   auto db = Database::open(dir.path());
@@ -1703,9 +1791,10 @@ TEST_CASE("embedded API: CASE, COALESCE and NULLIF of constants fold as PostgreS
   CHECK(state("SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 / 0 END") == "42601");
   CHECK(state("SELECT CASE 0 WHEN 2, 2 THEN 1 END") == "42601");  // PostgreSQL has no list of WHEN values
   (void)db->execute("CREATE TABLE cc (id INTEGER PRIMARY KEY, v INTEGER)");
-  CHECK(state("SELECT CASE WHEN v = 1 THEN 1 END FROM cc") == "42601");  // of columns: not supported yet
-  CHECK(state("SELECT COALESCE(v, 0) FROM cc") == "42601");
-  CHECK(state("SELECT NULLIF(v, 0) FROM cc") == "42601");
+  // Of columns they are the next test's.
+  CHECK(state("SELECT CASE WHEN v = 1 THEN 1 END FROM cc") == "ran");
+  CHECK(state("SELECT COALESCE(v, 0) FROM cc") == "ran");
+  CHECK(state("SELECT NULLIF(v, 0) FROM cc") == "ran");
 }
 
 TEST_CASE("embedded API: || and the string functions of constants fold as PostgreSQL's do", "[sql][api]") {
