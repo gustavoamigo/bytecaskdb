@@ -1,6 +1,8 @@
 # Cursors inside a transaction block (docs/cursor_design.md): DECLARE, FETCH,
-# MOVE and CLOSE, forward only, and WITH HOLD. The directions and WHERE
-# CURRENT OF are later phases: their cases are marked unimplemented.
+# MOVE and CLOSE, every FETCH direction, SCROLL and NO SCROLL, and WITH HOLD.
+# WHERE CURRENT OF is a later phase: its cases are marked unimplemented. The
+# direction cases were recorded from PostgreSQL 16 (the only server at hand);
+# the arithmetic they pin is the same in 17.
 
 - name: DECLARE, FETCH forward and CLOSE
   features: [E121-01, E121-08, pg:fetch-move]
@@ -240,6 +242,7 @@
 # says 25P01 to a DECLARE outside a transaction block. The layer accepts it as
 # a WITH HOLD cursor, taken on the snapshot of that moment, so this case's
 # expected values are the layer's and were not recorded from PostgreSQL.
+
 - name: DECLARE outside a transaction block is a hold cursor (known difference, PostgreSQL says 25P01)
   features: [E121-01, E121-17, pg:cursor-lifetime]
   setup:
@@ -358,8 +361,6 @@
 
 - name: FETCH in every other direction
   features: [pg:fetch-move]
-  # phase 5 of docs/cursor_design.md: backward, absolute and relative fetches
-  unimplemented: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
     - INSERT INTO t VALUES (1, 10)
@@ -394,6 +395,847 @@
       expected: []
       ordered: true
     - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a fetch past either end returns no row and leaves the cursor before the start or after the end
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH NEXT FROM c
+      expected: [[1]]
+      ordered: true
+    - sql: FETCH PRIOR FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH PRIOR FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH NEXT FROM c
+      expected: [[1]]
+      ordered: true
+    - sql: FETCH 0 FROM c
+      expected: [[1]]
+      ordered: true
+    - sql: FETCH FORWARD 9 FROM c
+      expected: [[2], [3], [4]]
+      ordered: true
+    - sql: FETCH NEXT FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH 0 FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH PRIOR FROM c
+      expected: [[4]]
+      ordered: true
+    - sql: FETCH FORWARD ALL FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH PRIOR FROM c
+      expected: [[4]]
+      ordered: true
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: BACKWARD n returns the rows in reverse and stops on the last one it returned
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: MOVE LAST IN c
+      rowcount: 1
+    - sql: FETCH BACKWARD 2 FROM c
+      expected: [[3], [2]]
+      ordered: true
+    - sql: FETCH NEXT FROM c
+      expected: [[3]]
+      ordered: true
+    - sql: FETCH BACKWARD 9 FROM c
+      expected: [[2], [1]]
+      ordered: true
+    - sql: FETCH BACKWARD ALL FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH FORWARD 3 FROM c
+      expected: [[1], [2], [3]]
+      ordered: true
+    - sql: FETCH BACKWARD 3 FROM c
+      expected: [[2], [1]]
+      ordered: true
+    - sql: FETCH BACKWARD 1 FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH NEXT FROM c
+      expected: [[1]]
+      ordered: true
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: ABSOLUTE and RELATIVE inside and outside the result
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH ABSOLUTE 3 FROM c
+      expected: [[3]]
+      ordered: true
+    - sql: FETCH ABSOLUTE 3 FROM c
+      expected: [[3]]
+      ordered: true
+    - sql: FETCH ABSOLUTE 1 FROM c
+      expected: [[1]]
+      ordered: true
+    - sql: FETCH ABSOLUTE -1 FROM c
+      expected: [[4]]
+      ordered: true
+    - sql: FETCH ABSOLUTE -4 FROM c
+      expected: [[1]]
+      ordered: true
+    - sql: FETCH ABSOLUTE -5 FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH NEXT FROM c
+      expected: [[1]]
+      ordered: true
+    - sql: FETCH ABSOLUTE 5 FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH PRIOR FROM c
+      expected: [[4]]
+      ordered: true
+    - sql: FETCH ABSOLUTE 0 FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH NEXT FROM c
+      expected: [[1]]
+      ordered: true
+    - sql: FETCH RELATIVE 2 FROM c
+      expected: [[3]]
+      ordered: true
+    - sql: FETCH RELATIVE 0 FROM c
+      expected: [[3]]
+      ordered: true
+    - sql: FETCH RELATIVE -1 FROM c
+      expected: [[2]]
+      ordered: true
+    - sql: FETCH RELATIVE -9 FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH NEXT FROM c
+      expected: [[1]]
+      ordered: true
+    - sql: FETCH RELATIVE 9 FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH PRIOR FROM c
+      expected: [[4]]
+      ordered: true
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: negative counts reverse the direction and FETCH 0 repeats the current row
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 3 FROM c
+      expected: [[1], [2], [3]]
+      ordered: true
+    - sql: FETCH FORWARD -1 FROM c
+      expected: [[2]]
+      ordered: true
+    - sql: FETCH BACKWARD -2 FROM c
+      expected: [[3], [4]]
+      ordered: true
+    - sql: FETCH -1 FROM c
+      expected: [[3]]
+      ordered: true
+    - sql: FETCH 0 FROM c
+      expected: [[3]]
+      ordered: true
+    - sql: FETCH FORWARD 0 FROM c
+      expected: [[3]]
+      ordered: true
+    - sql: FETCH BACKWARD 0 FROM c
+      expected: [[3]]
+      ordered: true
+    - sql: FETCH FIRST FROM c
+      expected: [[1]]
+      ordered: true
+    - sql: FETCH 0 FROM c
+      expected: [[1]]
+      ordered: true
+    - sql: FETCH BACKWARD 0 FROM c
+      expected: [[1]]
+      ordered: true
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: MOVE reports the rows it passed in every direction
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: MOVE FORWARD ALL IN c
+      rowcount: 4
+    - sql: MOVE BACKWARD ALL IN c
+      rowcount: 4
+    - sql: MOVE FORWARD 3 IN c
+      rowcount: 3
+    - sql: MOVE BACKWARD 2 IN c
+      rowcount: 2
+    - sql: MOVE ABSOLUTE 9 IN c
+      rowcount: 0
+    - sql: MOVE RELATIVE -1 IN c
+      rowcount: 1
+    - sql: MOVE LAST IN c
+      rowcount: 1
+    - sql: MOVE 0 IN c
+      rowcount: 1
+    - sql: MOVE ABSOLUTE 0 IN c
+      rowcount: 0
+    - sql: MOVE RELATIVE 0 IN c
+      rowcount: 0
+    - sql: MOVE PRIOR IN c
+      rowcount: 0
+    - sql: MOVE FIRST IN c
+      rowcount: 1
+    - sql: FETCH NEXT FROM c
+      expected: [[2]]
+      ordered: true
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: every direction on an empty cursor
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c SCROLL CURSOR FOR SELECT id FROM t WHERE id > 9
+    - sql: FETCH NEXT FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH PRIOR FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH FIRST FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH LAST FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH ABSOLUTE 1 FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH ABSOLUTE -1 FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH RELATIVE 0 FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH 0 FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH BACKWARD ALL FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH FORWARD ALL FROM c
+      expected: []
+      ordered: true
+    - sql: MOVE ALL IN c
+      rowcount: 0
+    - sql: MOVE LAST IN c
+      rowcount: 0
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: with one row FIRST, LAST, NEXT and PRIOR meet
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c SCROLL CURSOR FOR SELECT id FROM t WHERE id = 2
+    - sql: FETCH NEXT FROM c
+      expected: [[2]]
+      ordered: true
+    - sql: FETCH NEXT FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH PRIOR FROM c
+      expected: [[2]]
+      ordered: true
+    - sql: FETCH PRIOR FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH PRIOR FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH LAST FROM c
+      expected: [[2]]
+      ordered: true
+    - sql: FETCH FIRST FROM c
+      expected: [[2]]
+      ordered: true
+    - sql: FETCH ABSOLUTE -2 FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH NEXT FROM c
+      expected: [[2]]
+      ordered: true
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a cursor without SCROLL or NO SCROLL fetches backward
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 3 FROM c
+      expected: [[1], [2], [3]]
+      ordered: true
+    - sql: FETCH PRIOR FROM c
+      expected: [[2]]
+      ordered: true
+    - sql: FETCH LAST FROM c
+      expected: [[4]]
+      ordered: true
+    - sql: FETCH ABSOLUTE 1 FROM c
+      expected: [[1]]
+      ordered: true
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a cursor over a sort and a join scrolls
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c SCROLL CURSOR FOR SELECT a.id, b.id FROM t a JOIN t b ON a.id = b.id ORDER BY b.v DESC, a.id
+    - sql: FETCH LAST FROM c
+      expected: [[1, 1]]
+      ordered: true
+    - sql: FETCH PRIOR FROM c
+      expected: [[2, 2]]
+      ordered: true
+    - sql: FETCH ABSOLUTE 2 FROM c
+      expected: [[3, 3]]
+      ordered: true
+    - sql: FETCH BACKWARD ALL FROM c
+      expected: [[4, 4]]
+      ordered: true
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a cursor does not see later writes in any direction
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 3 FROM c
+      expected: [[1], [2], [3]]
+      ordered: true
+    - sql: INSERT INTO t VALUES (0, 0)
+      rowcount: 1
+    - sql: DELETE FROM t WHERE id = 2
+      rowcount: 1
+    - sql: UPDATE t SET v = 99
+      rowcount: 4
+    - sql: FETCH BACKWARD 3 FROM c
+      expected: [[2], [1]]
+      ordered: true
+    - sql: FETCH LAST FROM c
+      expected: [[4]]
+      ordered: true
+    - sql: FETCH ABSOLUTE 2 FROM c
+      expected: [[2]]
+      ordered: true
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a NO SCROLL cursor moves forward and refuses to go back or re-read (PRIOR)
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c NO SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 2 FROM c
+      expected: [[1], [2]]
+      ordered: true
+    - sql: FETCH PRIOR FROM c
+      error: "55000"
+      ordered: true
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a NO SCROLL cursor refuses BACKWARD n
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c NO SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 2 FROM c
+      expected: [[1], [2]]
+      ordered: true
+    - sql: FETCH BACKWARD 1 FROM c
+      error: "55000"
+      ordered: true
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a NO SCROLL cursor refuses FETCH 0 on a row
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c NO SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 2 FROM c
+      expected: [[1], [2]]
+      ordered: true
+    - sql: FETCH 0 FROM c
+      error: "55000"
+      ordered: true
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a NO SCROLL cursor refuses RELATIVE 0 on a row
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c NO SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 2 FROM c
+      expected: [[1], [2]]
+      ordered: true
+    - sql: FETCH RELATIVE 0 FROM c
+      error: "55000"
+      ordered: true
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a NO SCROLL cursor refuses RELATIVE -1
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c NO SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 2 FROM c
+      expected: [[1], [2]]
+      ordered: true
+    - sql: FETCH RELATIVE -1 FROM c
+      error: "55000"
+      ordered: true
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a NO SCROLL cursor refuses ABSOLUTE to the current row
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c NO SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 2 FROM c
+      expected: [[1], [2]]
+      ordered: true
+    - sql: FETCH ABSOLUTE 2 FROM c
+      error: "55000"
+      ordered: true
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a NO SCROLL cursor refuses ABSOLUTE before the current row
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c NO SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 3 FROM c
+      expected: [[1], [2], [3]]
+      ordered: true
+    - sql: FETCH ABSOLUTE 1 FROM c
+      error: "55000"
+      ordered: true
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a NO SCROLL cursor refuses ABSOLUTE 0 after a row
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c NO SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 2 FROM c
+      expected: [[1], [2]]
+      ordered: true
+    - sql: FETCH ABSOLUTE 0 FROM c
+      error: "55000"
+      ordered: true
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a NO SCROLL cursor refuses LAST
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c NO SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 1 FROM c
+      expected: [[1]]
+      ordered: true
+    - sql: FETCH LAST FROM c
+      error: "55000"
+      ordered: true
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a NO SCROLL cursor refuses ABSOLUTE -n
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c NO SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 1 FROM c
+      expected: [[1]]
+      ordered: true
+    - sql: FETCH ABSOLUTE -2 FROM c
+      error: "55000"
+      ordered: true
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a NO SCROLL cursor refuses FIRST after the end
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c NO SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH ALL FROM c
+      expected: [[1], [2], [3], [4]]
+      ordered: true
+    - sql: FETCH FIRST FROM c
+      error: "55000"
+      ordered: true
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a NO SCROLL cursor refuses a negative FORWARD count
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c NO SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 2 FROM c
+      expected: [[1], [2]]
+      ordered: true
+    - sql: FETCH FORWARD -1 FROM c
+      error: "55000"
+      ordered: true
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a NO SCROLL cursor refuses BACKWARD 0
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c NO SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 2 FROM c
+      expected: [[1], [2]]
+      ordered: true
+    - sql: FETCH BACKWARD 0 FROM c
+      error: "55000"
+      ordered: true
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a NO SCROLL cursor refuses BACKWARD ALL
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c NO SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 2 FROM c
+      expected: [[1], [2]]
+      ordered: true
+    - sql: FETCH BACKWARD ALL FROM c
+      error: "55000"
+      ordered: true
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a NO SCROLL cursor refuses MOVE BACKWARD
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c NO SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 2 FROM c
+      expected: [[1], [2]]
+      ordered: true
+    - sql: MOVE BACKWARD 1 IN c
+      error: "55000"
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a NO SCROLL cursor allows what only goes forward
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c NO SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 0 FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH ABSOLUTE 0 FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH RELATIVE 0 FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH ABSOLUTE 2 FROM c
+      expected: [[2]]
+      ordered: true
+    - sql: FETCH RELATIVE 1 FROM c
+      expected: [[3]]
+      ordered: true
+    - sql: FETCH ABSOLUTE 9 FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH 0 FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH ABSOLUTE 9 FROM c
+      expected: []
+      ordered: true
+    - sql: FETCH FORWARD ALL FROM c
+      expected: []
+      ordered: true
+    - sql: MOVE FORWARD 2 IN c
+      rowcount: 0
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a WITH HOLD cursor scrolls after its transaction committed
+  features: [E121-17, pg:cursor-lifetime]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c SCROLL CURSOR WITH HOLD FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 3 FROM c
+      expected: [[1], [2], [3]]
+      ordered: true
+    - sql: COMMIT
+    - sql: FETCH PRIOR FROM c
+      expected: [[2]]
+      ordered: true
+    - sql: FETCH LAST FROM c
+      expected: [[4]]
+      ordered: true
+    - sql: FETCH BACKWARD 2 FROM c
+      expected: [[3], [2]]
+      ordered: true
+    - sql: MOVE ABSOLUTE 1 IN c
+      rowcount: 1
+    - sql: FETCH NEXT FROM c
+      expected: [[2]]
+      ordered: true
+    - sql: CLOSE c
   teardown:
     - ROLLBACK
     - DROP TABLE t
