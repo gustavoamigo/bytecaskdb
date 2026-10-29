@@ -672,6 +672,9 @@ TEST_CASE("alloc sweep: the counter sees the engine's allocations",
 // is checked at a head past every sequence the failed batch would have used.
 TEST_CASE("alloc sweep: a write that fails leaves no removal behind",
           "[alloc_sweep][apply_batch]") {
+  // A node a failed write had not yet placed is leaked (#390), and this
+  // sweep runs in the test process, not a child.
+  const ExpectedLeaks leaks;
   TempDir td;
   auto db = open_db(td.path / "db", {});
   db->put({.sync = true}, to_bytes("y"), to_bytes("v"));
