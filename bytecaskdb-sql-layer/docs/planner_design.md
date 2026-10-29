@@ -68,7 +68,7 @@ compute, not how.
 | `OneRow` | one row of no columns: a `SELECT` without `FROM` |
 | `Filter(input, predicate)` | the rows for which the predicate is true |
 | `Project(input, exprs)` | one output row per input row, of these expressions |
-| `Join(left, right, predicate)` | inner; outer joins with #534 |
+| `Join(left, right, predicate, left_outer)` | inner, or left outer: each left row, with a right row of NULLs where the predicate matches none |
 | `Aggregate(input, group_by, aggs)` | `COUNT`, `COUNT(DISTINCT)`, `SUM`, `MIN`, `MAX`, `AVG`; no `group_by` means one row |
 | `Sort(input, keys)` | each key with its direction and its NULL placement |
 | `Limit(input, n)` | the first n rows |
@@ -123,12 +123,18 @@ A fixed list, applied in order, each to a fixpoint. None needs a cost.
    else not at all; two add only when both are in the result's
    representation. A conjunct always false replaces its `Filter`, and what
    it reads, with an `Empty` naming the tables it replaced; a `Join` with an
-   `Empty` side is `Empty`. The search plans it as no rows, read from
+   `Empty` side is `Empty`, but for a left outer join's right side, which
+   leaves the left rows NULL-extended. The search plans it as no rows, read from
    nothing. Today's dialect rarely gives it anything to fold: a `WHERE`
    compares a column with a parameter.
 2. **Predicate pushdown.** A conjunct moves to the lowest operator whose
    columns it reads: onto the table it reads, or onto the `Join` when it
-   compares the two sides. Two `Filter`s in a row become one, the lower
+   compares the two sides. Over a left outer join, only a conjunct on the
+   left side alone moves below it: one on the right side filters the joined
+   rows, NULL-extended ones too, so it stays above. Of the join's own
+   predicate, a conjunct on the right side alone moves onto that side's
+   table; one on the left side alone stays, deciding which left rows find a
+   pair. Two `Filter`s in a row become one, the lower
    one's conjuncts first, so a `Get` has at most one.
 3. **Projection pruning.** Each operator keeps only the columns something
    above it reads. A read is covering when every column the operators above
@@ -691,6 +697,30 @@ loop is made to read rows: the probe side's sorter holds its row, so its
 loop reads rows, and nothing else does for it. Any plan can instead be
 sorted above the join (*Sorts*).
 
+### Outer joins
+
+A left outer join (`RIGHT JOIN` is one of its sides swapped, by the binder)
+is planned in one order: its left table first, by any access path, and its
+right table under it, by a lookup on its key or a scan, read once per left
+row. It is never hashed, as a build of the right side would lose the left
+rows it matches nothing of. Under each left row the plan sets a matched
+flag; after the right side's loop, a row nothing matched is joined to
+`bc_null_row`'s row of NULLs, every column of the right table NULL, and the
+plan goes on with it as with any other.
+
+The join's predicate is the right side's key and filters; a conjunct on
+the left side alone is a filter of the right side's rows too, which reads
+the left row. The `WHERE` conjuncts on the right side's columns filter the
+joined rows, before any sort, so `LIMIT` counts the rows they keep. Above
+the join every column of the right table is nullable, its declaration
+aside: the binder marks it, and the plan tests the NULL.
+
+A NULL parameter of the right side's key matches no row: it is that side's
+guard, which skips its loop and leaves the left row NULL-extended, where an
+inner join's plan would end with no rows. Probed by key, the right side is
+looked up only when no part is NULL and the key fits: a NULL, or a left
+value too long for any key, is a miss, and the left row goes on.
+
 ### Aggregates
 
 **One row of `COUNT` or `SUM`.** A lone `COUNT`, `COUNT(DISTINCT)` or
@@ -1135,8 +1165,8 @@ Each slice was one PR, or a few, with its tests.
    aggregates in one select list.
 
 The rest of the dialect stays in #534: three or more tables, aliases,
-expressions, `OFFSET`, `RETURNING` and multi-row `VALUES`, subqueries and
-outer joins, `FOR UPDATE` on joins, and `EXPLAIN`. The serializable guards,
+expressions, `OFFSET`, `RETURNING` and multi-row `VALUES`, subqueries,
+`FULL JOIN`, `FOR UPDATE` on joins, and `EXPLAIN`. The serializable guards,
 the plan cache and procedures (#495) keep their own designs.
 
 ## Decisions

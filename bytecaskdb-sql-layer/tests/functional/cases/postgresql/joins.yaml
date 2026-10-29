@@ -289,8 +289,6 @@
 
 - name: a LEFT JOIN keeps the rows with no match
   features: [F041-03]
-  # outer joins are refused: only an inner join of two tables, by ON
-  unimplemented: true
   setup:
     - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, v VARCHAR(10))
     - CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, w INTEGER)

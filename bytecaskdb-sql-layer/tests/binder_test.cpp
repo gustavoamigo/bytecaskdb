@@ -177,6 +177,30 @@ TEST_CASE("binder: anything outside the scope is rejected with a message and pos
   CHECK(rejected(cat, "SELECT id FROM t WHERE id = qty").first == "WHERE must compare a column with a parameter or a constant");
 }
 
+TEST_CASE("binder: an assigned constant out of its column's type is refused, the first in column order", "[sql][binder]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(
+      bind_sql(f.cat(), "CREATE TABLE v (k INTEGER PRIMARY KEY, s SMALLINT, c VARCHAR(4), d NUMERIC(6,2))").stmt));
+  const auto& cat = f.cat();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what();
+    }
+    return "bound";
+  };
+  CHECK(state("INSERT INTO v VALUES (1, 2, 'abcd', 1.5)") == "bound");
+  CHECK(state("INSERT INTO v VALUES (1, 40000, 'abcd', 1.5)") == "22003 smallint out of range");
+  CHECK(state("INSERT INTO v VALUES (1, 2, 'abcde', 1.5)") == "22001 value too long for type character varying(4)");
+  CHECK(state("INSERT INTO v VALUES (1, 2, 'abcd', 12345.5)") == "22003 numeric field overflow");
+  // As PostgreSQL: the string's column comes first, so its error is the one.
+  CHECK(state("INSERT INTO v VALUES (1, 2, 'abcde', -1000000000000000000)") ==
+        "22001 value too long for type character varying(4)");
+  CHECK(state("INSERT INTO v (d, c) VALUES (12345.5, 'abcde')") == "22003 numeric field overflow");
+  CHECK(state("UPDATE v SET c = 'abcde' WHERE k = 1") == "22001 value too long for type character varying(4)");
+}
+
 TEST_CASE("binder: constants are folded to the type they meet, as PostgreSQL types them", "[sql][binder]") {
   sql_test::Fixture f;
   f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE lt (k INTEGER PRIMARY KEY, s SMALLINT, d NUMERIC(6,2), "
@@ -245,7 +269,6 @@ TEST_CASE("binder: constants are folded to the type they meet, as PostgreSQL typ
   };
   CHECK(assigned("s", "2.5") == Datum{std::int64_t{3}});  // half away from zero
   CHECK(assigned("s", "-2.5") == Datum{std::int64_t{-3}});
-  CHECK(assigned("s", "40000") == Datum{std::int64_t{40000}});  // its range is checked when the row is built
   CHECK(assigned("d", "1.005") == Datum{std::int64_t{101}});
   CHECK(assigned("d", "7") == Datum{std::int64_t{700}});
   CHECK(assigned("t", "2.2E-2") == Datum{sql_test::bytes("0.022")});
@@ -450,8 +473,37 @@ TEST_CASE("binder: JOIN USING and NATURAL JOIN compare their columns by =, each 
   CHECK(rejected(cat, "SELECT k FROM l JOIN r USING (k)").first ==
         "column \"k\" specified in USING clause does not exist in right table");
   CHECK(state("SELECT k FROM l JOIN r USING (a, a)") == "42701");
-  CHECK(rejected(cat, "SELECT k FROM l LEFT JOIN r USING (a)").first ==
-        "only an inner join of two tables, by ON, USING or NATURAL, is supported");
+  CHECK(rejected(cat, "SELECT k FROM l FULL JOIN r USING (a)").first == "FULL JOIN is not supported");
+}
+
+TEST_CASE("binder: LEFT and RIGHT JOIN are a left outer join, ON its predicate, WHERE above it", "[sql][binder]") {
+  sql_test::Fixture f;
+  for (auto ddl : {"CREATE TABLE l (k INTEGER PRIMARY KEY, a INTEGER NOT NULL)",
+                   "CREATE TABLE r (j INTEGER PRIMARY KEY, a INTEGER NOT NULL)"}) {
+    f.ddl(std::get<Ddl>(bind_sql(f.cat(), ddl).stmt));
+  }
+  const auto& cat = f.cat();
+  const auto* l = cat.table("l");
+  const auto* r = cat.table("r");
+  auto table_of = [](const logical::Node& n) { return std::get<logical::Get>(n.op).table->id; };
+  for (auto sql : {"SELECT l.k, r.j FROM l LEFT JOIN r ON l.a = r.a AND r.j > 1 WHERE l.k < 5",
+                   "SELECT l.k, r.j FROM r RIGHT JOIN l ON l.a = r.a AND r.j > 1 WHERE l.k < 5"}) {
+    INFO(sql);
+    auto b = bind_sql(cat, sql);
+    const auto& j = get<logical::Join>(b);
+    CHECK(j.left_outer);
+    CHECK(table_of(*j.left) == l->id);  // RIGHT JOIN's preserved side becomes the left
+    CHECK(table_of(*j.right) == r->id);
+    CHECK(j.predicate.size() == 2);
+    CHECK(get<logical::Filter>(b).conjuncts.size() == 1);
+    // Above the join r's columns may be NULL, declared NOT NULL or not.
+    const auto& out = get<logical::Project>(b).exprs;
+    CHECK_FALSE(out[0].expr.col.nullable);
+    CHECK(out[1].expr.col.nullable);
+  }
+  CHECK_FALSE(get<logical::Join>(bind_sql(cat, "SELECT l.k FROM l JOIN r ON l.a = r.a")).left_outer);
+  CHECK(get<logical::Join>(bind_sql(cat, "SELECT l.k FROM l LEFT JOIN r USING (a)")).left_outer);
+  CHECK(rejected(cat, "SELECT l.k FROM l FULL JOIN r ON l.a = r.a").first == "FULL JOIN is not supported");
 }
 
 TEST_CASE("binder: OR, NOT, IS NULL, <>, BETWEEN and IN are predicates over comparisons", "[sql][binder]") {
