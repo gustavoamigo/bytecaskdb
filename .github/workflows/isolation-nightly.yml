@@ -159,6 +159,9 @@ jobs:
       # dels and one-key range deletes over overlapping ranges, checked
       # against the commit order instead of Elle, whose models have no
       # counterpart for them. Unguarded must show stale reads every run.
+      # Presence (#676) adds snapshot-free ensure_present / ensure_absent
+      # plans and dels under frequent fdatasync failures; it must reach a
+      # failed flush every run.
       - name: Run range workload
         env:
           ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
