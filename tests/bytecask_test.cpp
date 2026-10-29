@@ -6810,8 +6810,25 @@ TEST_CASE("directory sync: open syncs each directory it creates",
   }
   std::filesystem::remove_all(td.path / "a");
   { auto db = bytecask::DB::open(db_path); }
-  // An existing directory creates nothing, so there is nothing to sync.
-  bytecask::testing::ScopedFaultInjector fi{"io_dir_sync_create_dir"};
+}
+
+TEST_CASE("directory sync: open syncs the entry of a directory that exists",
+          "[dir_sync]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  // An open that created the directory and failed its parent's sync (or was
+  // killed before it) leaves an entry no later open would otherwise make
+  // durable: a power cut then loses the directory and everything synced in it
+  // (#740).
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_dir_sync_create_dir"};
+    REQUIRE_THROWS_AS(bytecask::DB::open(db_path), std::system_error);
+  }
+  REQUIRE(std::filesystem::exists(db_path));
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_dir_sync_create_dir"};
+    REQUIRE_THROWS_AS(bytecask::DB::open(db_path), std::system_error);
+  }
   REQUIRE_NOTHROW(bytecask::DB::open(db_path));
 }
 
