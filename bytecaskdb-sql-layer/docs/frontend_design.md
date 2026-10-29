@@ -495,8 +495,8 @@ recompile after a DDL folds them again, to the types they meet then.
 - A cast of a string literal or `NULL`: `DATE '…'`, `'…'::date` and
   `CAST('…' AS date)` alike read the string with the type's input function,
   a `DECIMAL(p, s)` rounded to its scale and range-checked (22003), and are
-  of that type. A cast of anything else, and to `VARCHAR(n)`, which
-  PostgreSQL's cast truncates, are not taken yet.
+  of that type. A cast of anything else, and to `VARCHAR(n)` or `CHAR(n)`,
+  which PostgreSQL's cast truncates, are not taken yet.
 - A cast of a date, time, timestamp or timestamptz constant: to text its
   text; to its own type itself; a timestamp or timestamptz to a date (the
   floor in UTC, so 1969-12-31 23:00 is 1969-12-31) or a time; a date to a
@@ -686,7 +686,8 @@ search refuses*).
 The proof machine expects each one, or doesn't generate it, so it doesn't
 fail on them.
 
-- **A VARCHAR(n) value whose excess is only spaces is refused.**
+- **A VARCHAR(n) value whose excess is only spaces is refused.** (A
+  `CHAR(n)` cuts it, as PostgreSQL does: `types_design.md`, *CHAR(n)*.)
   PostgreSQL truncates it to n characters and stores it; the layer refuses
   it as too long (22001). The machine doesn't generate one.
 - **A DEFAULT outside its column's type is refused by the DDL.** The layer

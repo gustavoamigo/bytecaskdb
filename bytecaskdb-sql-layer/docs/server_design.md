@@ -446,6 +446,7 @@ Each `SqlType` has an OID, a length and a modifier, as `pg_type` and
 | `BYTEA` | 17 | -1 | -1 |
 | `TEXT` | 25 | -1 | -1 |
 | `VARCHAR(n)` | 1043 | -1 | n + 4 |
+| `CHAR(n)` | 1042 | -1 | n + 4 |
 | `DECIMAL(p, s)` | 1700 | -1 | ((p << 16) \| s) + 4 |
 | `numeric`, unconstrained (a `SUM`) | 1700 | -1 | -1 |
 | `TIMESTAMP` | 1114 | 8 | -1 |

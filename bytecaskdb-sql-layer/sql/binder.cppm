@@ -164,7 +164,14 @@ auto sql_type(const ast::ColumnDefAst& c) -> SqlType {
     }
     return t;
   }
-  if (c.type == "bpchar") throw SqlError{"CHAR(n) is not supported; use VARCHAR(n)", c.pos};
+  if (c.type == "bpchar") {
+    // CHAR and CHARACTER arrive with the length 1; a bare bpchar, which
+    // PostgreSQL leaves unbounded, has none.
+    if (c.typmods.size() != 1) throw SqlError{"CHAR takes one positive length", c.pos};
+    SqlType t{SqlKind::Char, std::in_range<std::uint32_t>(c.typmods[0]) ? static_cast<std::uint32_t>(c.typmods[0]) : 0};
+    if (!sql_type_valid(t)) throw SqlError{"length for type char must be at least 1", c.pos};
+    return t;
+  }
   throw SqlError{"type " + c.type + " is not supported", c.pos};
 }
 
@@ -244,6 +251,7 @@ auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
       if (l.kind != K::Bool) bad();
       return l.b;
     case SqlKind::Varchar:
+    case SqlKind::Char:
     case SqlKind::Text:
     case SqlKind::Bytea: {
       if (l.kind != K::String) bad();
@@ -283,7 +291,8 @@ constexpr auto type_class(SqlKind k) -> TypeClass {
     case SqlKind::Time: return TypeClass::Temporal;
     case SqlKind::Boolean: return TypeClass::Boolean;
     case SqlKind::Text:
-    case SqlKind::Varchar: return TypeClass::String;
+    case SqlKind::Varchar:
+    case SqlKind::Char: return TypeClass::String;
     case SqlKind::Bytea: return TypeClass::Bytea;
   }
   std::unreachable();
@@ -313,6 +322,7 @@ auto exact_number(const Column& c) -> bool {
     case SqlKind::Bytea:
     case SqlKind::Text:
     case SqlKind::Varchar:
+    case SqlKind::Char:
     case SqlKind::Timestamp:
     case SqlKind::TimestampTz:
     case SqlKind::Date:
@@ -354,6 +364,7 @@ auto is_integer(SqlType t) -> bool {
 auto pg_type_name(SqlType t) -> std::string {
   switch (t.kind) {
     case SqlKind::Varchar: return "character varying";
+    case SqlKind::Char: return "character";
     case SqlKind::Decimal:
     case SqlKind::Numeric: return "numeric";
     case SqlKind::Timestamp: return "timestamp without time zone";
@@ -657,6 +668,9 @@ auto arithmetic(const Constant& x, const Constant& y, Arith op, std::int32_t pos
 auto is_number(SqlType t) -> bool { return is_integer(t) || t.kind == SqlKind::Decimal; }
 auto is_float(SqlType t) -> bool { return t.kind == SqlKind::Real || t.kind == SqlKind::Double; }
 auto is_string(SqlType t) -> bool { return t.kind == SqlKind::Text || t.kind == SqlKind::Varchar; }
+// A string a column of this type takes: CHAR(n) is not is_string, whose LIKE,
+// UNION and parameter rules are TEXT's and VARCHAR's.
+auto holds_string(SqlType t) -> bool { return is_string(t) || t.kind == SqlKind::Char; }
 
 auto bytes_of(std::string_view t) -> Bytes {
   auto b = std::as_bytes(std::span{t.data(), t.size()});
@@ -867,6 +881,7 @@ auto cast_temporal(const Constant& arg, SqlType t, std::int32_t pos) -> Constant
 auto cast_constant(const ast::Expr& e, const Constant& arg) -> Constant {
   auto t = sql_type(ast::ColumnDefAst{"", e.cast_type, e.cast_typmods, false, false, std::nullopt, e.pos, {}});
   if (t.kind == SqlKind::Varchar) not_yet("a cast to VARCHAR(n)", e.pos);
+  if (t.kind == SqlKind::Char) not_yet("a cast to CHAR(n)", e.pos);
   auto temporal = !arg.unknown && type_class(arg.type.kind) == TypeClass::Temporal;
   if (temporal) return cast_temporal(arg, t, e.pos);
   if (!arg.unknown) not_yet("a cast of other than a string literal, NULL, date, time or timestamp", e.pos);
@@ -1356,7 +1371,7 @@ auto fold(const ast::Expr& e) -> Constant {
 // (docs/frontend_design.md, *Known differences*). A string literal or NULL
 // is read as c's type, as PostgreSQL reads an unknown literal. The range of
 // an assigned value is its caller's to check.
-auto coerce(const Constant& k, const Column& c, bool assigned, std::string_view op) -> Datum {
+auto coerce_value(const Constant& k, const Column& c, bool assigned, std::string_view op) -> Datum {
   auto inexact = [&] [[noreturn]] {
     not_yet("comparing " + c.name + " (" + sql_type_name(c.sql) + ") with a constant its type does not hold exactly", k.pos);
   };
@@ -1400,12 +1415,12 @@ auto coerce(const Constant& k, const Column& c, bool assigned, std::string_view 
   }
   // A cast's: a string, bytes, a date or time, or a float.
   if (!is_number(k.type)) {
-    if (is_string(k.type) && is_string(c.sql)) return k.value;
+    if (is_string(k.type) && holds_string(c.sql)) return k.value;
     if (k.type.kind == c.sql.kind && k.type.kind != SqlKind::Real) return k.value;
     if (type_class(k.type.kind) == TypeClass::Temporal && type_class(c.sql.kind) == TypeClass::Temporal) {
       if (auto v = exact_temporal(k, c.sql.kind)) return *v;
     }
-    if (assigned && is_string(c.sql) && !is_float(k.type)) return bytes_of(to_text(k.value, k.type));
+    if (assigned && holds_string(c.sql) && !is_float(k.type)) return bytes_of(to_text(k.value, k.type));
     not_yet("a " + pg_type_name(k.type) + " constant " + (assigned ? "assigned to " : "compared with ") + "a " +
                 pg_type_name(c.sql) + " column",
             k.pos);
@@ -1457,6 +1472,7 @@ auto coerce(const Constant& k, const Column& c, bool assigned, std::string_view 
       return static_cast<double>(f);
     }
     case SqlKind::Text:
+    case SqlKind::Char:
     case SqlKind::Varchar: {
       auto t = to_text(Datum{v}, numeric_type(scale));
       auto bytes = std::as_bytes(std::span{t.data(), t.size()});
@@ -1471,6 +1487,16 @@ auto coerce(const Constant& k, const Column& c, bool assigned, std::string_view 
     case SqlKind::Numeric: break;  // refused by type_refusal
   }
   throw SqlError{"expression not supported", k.pos};
+}
+
+// coerce_value, then a CHAR(n)'s value without its trailing spaces, which are
+// insignificant: the form the column stores, so a compared constant matches it.
+auto coerce(const Constant& k, const Column& c, bool assigned, std::string_view op) -> Datum {
+  auto d = coerce_value(k, c, assigned, op);
+  if (auto* b = std::get_if<Bytes>(&d); b != nullptr && c.sql.kind == SqlKind::Char) {
+    while (!b->empty() && b->back() == std::byte{' '}) b->pop_back();
+  }
+  return d;
 }
 
 // The largest $n the statement names: its own parameters, which come
@@ -2155,6 +2181,7 @@ public:
       case SqlKind::Boolean:
       case SqlKind::Text:
       case SqlKind::Varchar:
+      case SqlKind::Char:
       case SqlKind::Bytea:
       case SqlKind::Timestamp:
       case SqlKind::TimestampTz:
@@ -2387,6 +2414,9 @@ public:
   // DECIMAL operand against 18 digits at its scale, so a sum stays inside
   // int64; one only assigned is checked by the row builder.
   void use_param(std::uint32_t n, PhysType t, std::int32_t pos, const Column& col, std::uint32_t table, Use use) {
+    // A CHAR(n) compares without its trailing spaces: a parameter would need
+    // them cut at run time, as a constant is cut here.
+    if (col.sql.kind == SqlKind::Char && use != Use::Assigned) not_yet("a parameter compared with a CHAR(n) column", pos);
     if (params_.size() <= n) params_.resize(n + 1);
     auto& p = params_[n];
     // PostgreSQL's code only for two comparisons. It types a $n by its first
@@ -2457,7 +2487,8 @@ public:
       case SqlKind::Double: return {true, kSyntaxError};
       case SqlKind::Real: return {false, kSyntaxError};
       case SqlKind::Text:
-      case SqlKind::Varchar: return {false, sum ? kUndefinedFunction : kSyntaxError};
+      case SqlKind::Varchar:
+      case SqlKind::Char: return {false, sum ? kUndefinedFunction : kSyntaxError};
       case SqlKind::Boolean:
       case SqlKind::Bytea: return {false, kUndefinedFunction};
       case SqlKind::Timestamp:

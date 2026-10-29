@@ -169,7 +169,7 @@ TEST_CASE("catalog: a table's CHECK constraints are a format-5 tail; a table wit
   CHECK_THROWS_AS(parse_table(serialize_table(t)), std::runtime_error);
 }
 
-TEST_CASE("catalog: a table with a TIMESTAMPTZ column is a format-6 record; any other keeps format 4 or 5", "[sql][catalog]") {
+TEST_CASE("catalog: a table with a TIMESTAMPTZ or CHAR(n) column is a format-6 record; any other keeps format 4 or 5", "[sql][catalog]") {
   auto t = rich_table();
   t.columns.back().sql = SqlType{SqlKind::TimestampTz};  // an earlier build would call the tag corrupt
   auto rec = serialize_table(t);
@@ -178,6 +178,11 @@ TEST_CASE("catalog: a table with a TIMESTAMPTZ column is a format-6 record; any 
   CHECK(u.columns.back().sql.kind == SqlKind::TimestampTz);
   CHECK(u.checks.empty());
   CHECK(serialize_table(u) == rec);
+  // A CHAR(n) column is a format-6 record too, its length kept.
+  t.columns[2].sql = SqlType{SqlKind::Char, 7};
+  auto char_rec = serialize_table(t);
+  CHECK(char_rec[0] == std::byte{6});
+  CHECK(parse_table(char_rec).columns[2].sql == SqlType{SqlKind::Char, 7});
   t.checks = {{"c1", "f > 0"}};
   auto with_check = serialize_table(t);
   CHECK(with_check[0] == std::byte{6});
