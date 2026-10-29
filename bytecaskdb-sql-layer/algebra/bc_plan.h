@@ -207,6 +207,22 @@ typedef struct bc_overlay bc_overlay;
 bc_overlay *bc_txn_overlay_pin(bc_txn *);
 void    bc_txn_overlay_release(bc_overlay *);
 void    bc_ctx_use_overlay(bc_ctx *, const bc_overlay *);
+/* A hold (docs/cursor_design.md, WITH HOLD): what a cursor that outlives its
+   transaction reads, owned by the cursor. bc_txn_hold takes, from a
+   transaction with a live overlay pin, a clone of its snapshot, its pinned
+   catalog and the pin's overlay, so the transaction's commit may consume its
+   own snapshot and the transaction may end: a hold needs nothing of the
+   transaction after the call. A hold keeps the engine's snapshot, and so every
+   tree node and data file it reaches, until bc_txn_hold_free. Failure is as
+   bc_txn_overlay_pin's: null, bc_txn_error says why, the transaction aborted.
+   bc_ctx_begin_hold begins a context, which belongs to no transaction, on a
+   hold: it reads the hold's snapshot through its overlay and writes nothing,
+   so the statement must be a read. Free every context begun on a hold before
+   bc_txn_hold_free; a hold may outlive its bc_txn and its pin. */
+typedef struct bc_hold bc_hold;
+bc_hold *bc_txn_hold(bc_txn *, const bc_overlay *);
+void    bc_txn_hold_free(bc_hold *);
+void    bc_ctx_begin_hold(bc_ctx *, const bc_hold *, const bc_params *, bc_budget);
 enum bc_commit_result bc_txn_commit(bc_txn *, bool sync);
 enum bc_error_code bc_txn_error(const bc_txn *);  /* of the last bc_txn_commit */
 const char *bc_txn_error_message(const bc_txn *);

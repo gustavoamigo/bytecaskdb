@@ -2,8 +2,9 @@
 
 Status: **design, revised to the owner's decisions of 2026-10-28** (written
 for #663, sqltest E121). Phases 1 (the replay runner, #717), 2 (pinned state,
-#718) and 3 (`DECLARE`, `FETCH` forward, `MOVE`, `CLOSE` in a transaction
-block, #719) are built; nothing else is. The owner's direction: a cursor is
+#718), 3 (`DECLARE`, `FETCH` forward, `MOVE`, `CLOSE` in a transaction
+block, #719) and 4 (`WITH HOLD` by holding the snapshot, `DECLARE` outside a
+block, #720) are built; nothing else is. The owner's direction: a cursor is
 evaluated lazily; holding the whole result in memory is not the design. The
 first phases build a **replay cursor** (the snapshot and a position; each
 `FETCH` re-runs the plan to its position, with no checkpoint or other
@@ -474,8 +475,7 @@ snapshots may be pinned, for how long, and what happens at the limit are
 one policy for the session design (#642), covering a long transaction, a
 streaming read and a hold cursor alike. A hold cursor adds no timer and no
 cap of its own; it is a pinned snapshot like any other and falls under that
-policy. Until phase 4, `DECLARE ... WITH HOLD` is `0A000` with a message
-that names phase 4.
+policy. `DECLARE ... WITH HOLD` is phase 4 (*As built (phase 4)*).
 
 A hold cursor declared in a block fetches before and after `COMMIT`. One
 declared in a transaction that rolls back is dropped with it, as PostgreSQL
@@ -484,6 +484,59 @@ one declared earlier. It closes at `CLOSE`, disconnect, or the server's
 shutdown. `DECLARE` outside a block is accepted in phase 4 as a hold cursor
 (*Owner decisions*, 1): it declares in a transaction of its own that
 commits at once, and the cursor holds the snapshot of that moment.
+
+### As built (phase 4)
+
+**Who owns the snapshot.** `Snapshot` is move-only, and a transaction's
+commit moves its own into the `WritePlan` that validates the writes. A hold
+cursor therefore has a handle of its own: `Snapshot::clone()` (engine, a
+reference-count increment on the `EngineState` the snapshot already holds;
+decided by the owner, 2026-10-28, over a sequence-based validation that would
+need no handle and is a possible future change, not part of this work). Both
+handles reach one state, so a clone retains nothing a hold cursor would not
+retain with the original.
+
+`bc_txn_hold` (plan API) takes, from a transaction with a live overlay pin, the
+clone, the pinned catalog and the pin's overlay (`shared_ptr`) into a `bc_hold`
+that the cursor owns. A hold cursor runs on it, in a context of the database's
+pool begun with `bc_ctx_begin_hold`, whether its transaction is open or not: one
+code path, `Database::run_held`, reads nothing of the transaction. It takes no
+`FOR UPDATE` guard: the session refuses `WITH HOLD ... FOR UPDATE` (`0A000`, as
+PostgreSQL).
+
+**Lifetime.** `Transaction::open_cursor(stmt, params, Holdability::Hold)`.
+`commit()` that commits detaches the hold cursors (releases the overlay pin's
+charge to the transaction; the view stays in the hold) and closes the others.
+A rollback, an abort, a commit that does not commit (a conflict, an engine
+error) and a destroyed transaction close every cursor declared in it, hold
+included. A hold cursor declared in an earlier transaction is untouched. A hold
+cursor ends at `close()` / `CLOSE`, at `Database::close()` (the database keeps
+a registry of its open hold cursors for this) and at the session's end
+(disconnect, `Terminate`, shutdown). A dropped `Cursor` handle leaves it open.
+A failed `FETCH` of a hold cursor closes that cursor; the session fails the
+block as for any error.
+
+**What it pins, and for how long.** The engine's snapshot: every tree node a
+later write retires that it reaches is parked, and every data file vacuum
+unlinks keeps its disk blocks (`keydir_versions_live`, `keydir_nodes_parked`;
+1.1 GB retained for 20 M keys under a write load that touched the whole key
+space, measured on the MariaDB plugin). **This phase adds no timer, cap, TTL or
+setting.** A hold cursor lives until `CLOSE`, disconnect or server shutdown;
+the limit on pinned snapshots is the session design's (#642). The overlay copy
+is charged to the declaring transaction's bound while that transaction lasts
+(`BC_E_LIMIT`, `54000`, at `DECLARE`); after its commit the copy is held
+uncharged, until the session design's accounting (phase 7) charges what a
+session holds.
+
+**`DECLARE` outside a block** (owner decision 1) opens a transaction of its
+own, declares a hold cursor in it and commits; `WITH HOLD` or not, and
+`FOR UPDATE` too, which takes no guard there: there is no transaction left to
+hold it. In an extended-protocol implicit block it is declared in that block
+and kept by its commit.
+
+**Session.** `SessionCursor::hold`. `end_transaction` drops the block's plain
+cursors and keeps the hold ones that are still open; a name whose cursor a
+rollback closed is forgotten when next named.
 
 ## Limits, lifetime and failure
 
@@ -661,8 +714,8 @@ rules, in PostgreSQL's order:
 | Statement | Result |
 |---|---|
 | `DECLARE` in a failed block | `25P02` |
-| `DECLARE … WITH HOLD` | `0A000`, names phase 4 |
-| `DECLARE` outside a block | `25P01` |
+| `DECLARE … WITH HOLD … FOR UPDATE` | `0A000`, as PostgreSQL |
+| `DECLARE` outside a block | a hold cursor (phase 4; PostgreSQL says `25P01`) |
 | `DECLARE BINARY` | `0A000` |
 | `DECLARE SCROLL … FOR UPDATE` | `0A000`, as PostgreSQL |
 | a name in use | `42P03`, the transaction aborts |
@@ -732,7 +785,7 @@ interface, so phases 3 to 7 do not change when it lands.
 | 1 | #717 | **Done.** Replay runner in the runtime: skip count, row limit, stop; resumable-plan flag; determinism and differential tests. The start-key checkpoint is not built (owner direction, 2026-10-28): #731 | none | |
 | 2 | #718 | **Done.** Copy-on-write overlay; pinned parameters, clocks and plan; forward-only `Cursor` in `Transaction` | none | |
 | 3 | #719 | **Done.** `DECLARE`, `FETCH` forward, `MOVE`, `CLOSE`, `FOR READ ONLY`, `FOR UPDATE [OF t]` in the dialect and session, inside a block | none alone | decided |
-| 4 | #720 | `WITH HOLD` by holding the snapshot (lazy); `DECLARE` outside a block, accepted as a hold cursor | 8 ids | decided (1, 3) |
+| 4 | #720 | **Done.** `WITH HOLD` by holding the snapshot (lazy, on `Snapshot::clone`); `DECLARE` outside a block, accepted as a hold cursor | 7 of 8 ids; e121_03_01_01 needs `ORDER BY` of an expression | decided (1, 3) |
 | 5 | #721 | Every `FETCH` direction, `SCROLL`, `55000` | none | |
 | 6 | #722 | `WHERE CURRENT OF` | none as written | **5** |
 | 7 | #724 | Replay cap, flags, accounting; no cursor-own timers or caps | none | **7** |
@@ -743,7 +796,9 @@ interface, so phases 3 to 7 do not change when it lands.
 
 Phase 4's eight ids are e121_01_01_01 to _04, e121_02_01_01, e121_03_01_01,
 e121_17_01_01 and _02; they need phase 3's syntax and phase 4's hold and
-`DECLARE` outside a block. Phase 3 moves no sqltest id: the harness runs
+`DECLARE` outside a block. Seven pass. e121_03_01_01 declares
+`ORDER BY A + 5`, which the dialect refuses with or without a cursor (a gap
+in `ORDER BY`, not in cursors), so it stays marked. Phase 3 moves no sqltest id: the harness runs
 outside a block. Phases 3 to 7 need phase 2; 5 also needs phase 1's replay;
 11 needs 10.
 
@@ -754,7 +809,7 @@ transaction's `Overlay` becomes shared, so every place that mutates it goes
 through the clone, and the allocation-fault sweep covers it; **3**
 `libpg_query`'s parse tree for the cursor statements was assumed; phase 3
 read it (*As built (phase 3)*); **4** the snapshot a hold cursor retains,
-against the session's policy for pinned snapshots; **6** the planner's result description
+against the session's policy for pinned snapshots (read, in *As built (phase 4)*); **6** the planner's result description
 gains hidden columns, which `check()` and the schema reference must carry;
 **9** the spike can fail, in which case (c) takes (c′)'s place.
 
@@ -794,7 +849,6 @@ Still open:
 ## Deferred
 
 - `FETCH LAST` and `BACKWARD` by a reverse run, without replay: #725.
-- Lazy `WITH HOLD` by holding a snapshot: #726.
 - Cursors under user `SAVEPOINT` / `ROLLBACK TO`: #727.
 - Spilling a cursor's sort or hash to disk: part of the layer-wide spill
   design (`planner_design.md`, *Memory*), not cursor-specific.
@@ -812,9 +866,9 @@ Still open:
 - A sort or hash a cursor needs is built within the statement budget at
   every run that reaches it, never spilled.
 - A `WITH HOLD` cursor holds its snapshot, where PostgreSQL copies the rows
-  at `COMMIT` (phase 4; `0A000` until then).
+  at `COMMIT`: it pins tree nodes and files until closed (no timer or cap).
 - `DECLARE` outside a block opens a hold cursor, where PostgreSQL says
-  `25P01` (phase 4; `25P01` until then, decision 1).
+  `25P01` (decision 1), and takes no `FOR UPDATE` guard.
 - `FOR UPDATE OF t` locks the one table the query reads, which is all
   `FOR UPDATE` of a single-table `SELECT` can name.
 - `SCROLL` with `FOR UPDATE` is `0A000`, as PostgreSQL's.

@@ -1,6 +1,6 @@
 # Cursors inside a transaction block (docs/cursor_design.md): DECLARE, FETCH,
-# MOVE and CLOSE, forward only. The directions, WITH HOLD and WHERE CURRENT OF
-# are later phases: their cases are recorded and marked unimplemented.
+# MOVE and CLOSE, forward only, and WITH HOLD. The directions and WHERE
+# CURRENT OF are later phases: their cases are marked unimplemented.
 
 - name: DECLARE, FETCH forward and CLOSE
   features: [E121-01, E121-08, pg:fetch-move]
@@ -235,17 +235,35 @@
     - ROLLBACK
     - DROP TABLE t
 
-- name: DECLARE outside a transaction block is 25P01
-  features: [pg:cursor-lifetime]
+# Known difference from PostgreSQL (owner decision 2026-10-28, #720;
+# docs/cursor_design.md, *Known differences from PostgreSQL*): PostgreSQL
+# says 25P01 to a DECLARE outside a transaction block. The layer accepts it as
+# a WITH HOLD cursor, taken on the snapshot of that moment, so this case's
+# expected values are the layer's and were not recorded from PostgreSQL.
+- name: DECLARE outside a transaction block is a hold cursor (known difference, PostgreSQL says 25P01)
+  features: [E121-01, E121-17, pg:cursor-lifetime]
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
   steps:
-    - sql: DECLARE c CURSOR FOR SELECT id FROM t
-      error: "25P01"
+    - sql: DECLARE c CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH c
+      expected: [[1]]
+      ordered: true
+    - sql: INSERT INTO t VALUES (3, 30)
+      rowcount: 1
+    - sql: FETCH ALL c
+      expected: [[2]]
+      ordered: true
+    - sql: CLOSE c
     - sql: FETCH c
       error: "34000"
-    - sql: CLOSE c
-      error: "34000"
+    - sql: DECLARE d CURSOR WITHOUT HOLD FOR SELECT id FROM t ORDER BY id FOR UPDATE
+    - sql: FETCH d
+      expected: [[1]]
+      ordered: true
+    - sql: CLOSE d
   teardown:
     - ROLLBACK
     - DROP TABLE t
@@ -382,8 +400,6 @@
 
 - name: a WITH HOLD cursor outlives its transaction
   features: [E121-17, pg:cursor-lifetime]
-  # phase 4 of docs/cursor_design.md
-  unimplemented: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
     - INSERT INTO t VALUES (1, 10)
@@ -399,6 +415,85 @@
       expected: [[2]]
       ordered: true
     - sql: CLOSE c
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a WITH HOLD cursor shows the view at DECLARE after the COMMIT
+  features: [E121-17, pg:cursor-lifetime]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO t VALUES (0, 5)
+      rowcount: 1
+    - sql: DECLARE c CURSOR WITH HOLD FOR SELECT id FROM t ORDER BY id
+    - sql: INSERT INTO t VALUES (4, 40)
+      rowcount: 1
+    - sql: DELETE FROM t WHERE id = 2
+      rowcount: 1
+    - sql: COMMIT
+    - sql: FETCH 2 FROM c
+      expected: [[0], [1]]
+      ordered: true
+    - sql: INSERT INTO t VALUES (9, 90)
+      rowcount: 1
+    - sql: FETCH ALL FROM c
+      expected: [[2], [3]]
+      ordered: true
+    - sql: SELECT id FROM t ORDER BY id
+      expected: [[0], [1], [3], [4], [9]]
+      ordered: true
+    - sql: CLOSE c
+    - sql: FETCH c
+      error: "34000"
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: ROLLBACK drops a WITH HOLD cursor declared in the transaction, not an earlier one
+  features: [E121-17, pg:cursor-lifetime]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE kept CURSOR WITH HOLD FOR SELECT id FROM t ORDER BY id
+    - sql: COMMIT
+    - sql: BEGIN
+    - sql: DECLARE dropped CURSOR WITH HOLD FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH dropped
+      expected: [[1]]
+      ordered: true
+    - sql: ROLLBACK
+    - sql: FETCH dropped
+      error: "34000"
+    - sql: FETCH kept
+      expected: [[1]]
+      ordered: true
+    - sql: BEGIN
+    - sql: FETCH kept
+      expected: [[2]]
+      ordered: true
+    - sql: ROLLBACK
+    - sql: CLOSE kept
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a WITH HOLD cursor cannot be FOR UPDATE
+  features: [E121-17, pg:cursor-lifetime]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR WITH HOLD FOR SELECT id FROM t FOR UPDATE
+      error: "0A000"
+    - sql: ROLLBACK
   teardown:
     - ROLLBACK
     - DROP TABLE t
