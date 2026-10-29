@@ -9,9 +9,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -20,6 +23,7 @@
 #include <vector>
 
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+#include "tests/alloc_faults.h"
 
 import bytecask.sql.api;
 import bytecask.sql.tests.util;
@@ -77,7 +81,7 @@ TEST_CASE("cursor: fetch returns the rows of a full run, in order, for every pag
       CHECK(c.position() == 0);
       CHECK_FALSE(c.at_end());
       CHECK(drain(c, k) == full);
-      CHECK(c.position() == full.size());
+      CHECK(c.position() == full.size() + 1);  // after the last row
       CHECK(c.at_end());
       CHECK(c.fetch(k).rows.empty());
       c.close();
@@ -558,6 +562,379 @@ TEST_CASE("hold cursor: its overlay copy is charged to the transaction until it 
   for (std::int64_t i = 0; i < cap; ++i) insert_wide(txn, i);  // the bound nearly spent
   try {
     (void)txn.open_cursor(scan, {}, Holdability::Hold);
+    FAIL("expected a limit error");
+  } catch (const ExecError& e) {
+    CHECK(e.code() == BC_E_LIMIT);
+  }
+  CHECK(txn.is_aborted());
+}
+
+// ---------------------------------------------------------------- FETCH directions
+//
+// The model is PostgreSQL's FETCH written the way PostgreSQL runs it: one
+// row at a time, from a position in 0 .. n + 1 (DoPortalRunFetch), with
+// nothing of the layer's window arithmetic.
+
+namespace {
+
+using Move = CursorMove;
+using Kind = CursorMove::Kind;
+
+struct Model {
+  std::int64_t n;  // rows in the result
+  std::int64_t p{0};
+  bool forward_only{false};
+  bool refused{false};
+
+  // Steps toward the end up to `count` rows; the rows passed, as numbers.
+  auto forward(std::int64_t count) -> std::vector<std::int64_t> {
+    std::vector<std::int64_t> out;
+    for (std::int64_t i = 0; i < count && p <= n; ++i) {
+      ++p;
+      if (p > n) break;
+      out.push_back(p);
+    }
+    return out;
+  }
+  auto backward(std::int64_t count) -> std::vector<std::int64_t> {
+    std::vector<std::int64_t> out;
+    for (std::int64_t i = 0; i < count && p > 0; ++i) {
+      --p;
+      if (p < 1) break;
+      out.push_back(p);
+    }
+    return out;
+  }
+  auto current() const -> std::vector<std::int64_t> {
+    if (p >= 1 && p <= n) return {p};
+    return {};
+  }
+
+  auto fetch(Move m) -> std::vector<std::int64_t> {
+    refused = false;
+    auto c = m.count;
+    auto rewind_refused = [&] { return forward_only && p > 0; };
+    switch (m.kind) {
+      case Kind::Forward:
+      case Kind::Backward: {
+        auto back = (m.kind == Kind::Backward) == (c >= 0);
+        auto size = c < 0 ? -c : c;  // kAll is positive
+        if (size == 0) {
+          if (forward_only && (back || !current().empty())) refused = true;
+          return refused ? std::vector<std::int64_t>{} : current();
+        }
+        if (back && forward_only) {
+          refused = true;
+          return {};
+        }
+        return back ? backward(size) : forward(size);
+      }
+      case Kind::Absolute:
+        if (c == 0) {
+          if (rewind_refused()) {
+            refused = true;
+          } else {
+            p = 0;
+          }
+          return {};
+        }
+        if (c > 0) {
+          if (forward_only && c <= std::min(p, n)) {
+            refused = true;
+            return {};
+          }
+          p = 0;
+          (void)forward(c - 1);
+          return forward(1);
+        }
+        if (forward_only) {
+          refused = true;
+          return {};
+        }
+        (void)forward(Move::kAll);
+        (void)backward(-c - 1);
+        return backward(1);
+      case Kind::Relative:
+        if (c == 0) return fetch(Move{Kind::Forward, 0});
+        if (c > 0) {
+          (void)forward(c - 1);
+          return forward(1);
+        }
+        if (forward_only) {
+          refused = true;
+          return {};
+        }
+        (void)backward(-c - 1);
+        return backward(1);
+    }
+    return {};
+  }
+};
+
+auto all_moves() -> std::vector<Move> {
+  std::vector<Move> out;
+  for (auto kind : {Kind::Forward, Kind::Backward, Kind::Absolute, Kind::Relative}) {
+    for (std::int64_t c = -7; c <= 7; ++c) out.push_back({kind, c});
+    out.push_back({kind, Move::kAll});
+  }
+  return out;
+}
+
+auto describe(Move m) -> std::string {
+  static constexpr const char* kNames[] = {"FORWARD", "BACKWARD", "ABSOLUTE", "RELATIVE"};
+  return std::string{kNames[static_cast<int>(m.kind)]} + " " +
+         (m.count == Move::kAll ? std::string{"ALL"} : std::to_string(m.count));
+}
+
+// The rows a move returned as their numbers in `full`, which are distinct.
+auto numbers(const Rows& r, const RowVec& full) -> std::vector<std::int64_t> {
+  std::vector<std::int64_t> out;
+  for (const auto& row : r.rows) {
+    auto at = std::ranges::find(full, row);
+    REQUIRE(at != full.end());
+    out.push_back(at - full.begin() + 1);
+  }
+  return out;
+}
+
+// Applies `m` to the cursor and to the model and compares what they return and
+// where they stand.
+void step_both(Cursor& c, Model& model, const RowVec& full, Move m) {
+  INFO(describe(m) << " from position " << model.p);
+  auto want = model.fetch(m);
+  if (model.refused) {
+    CHECK_THROWS_AS(c.fetch(m), CursorForwardOnly);
+    CHECK(c.position() == static_cast<std::uint64_t>(model.p));
+    return;
+  }
+  auto got = c.fetch(m);
+  CHECK(numbers(got, full) == want);
+  CHECK(c.position() == static_cast<std::uint64_t>(model.p));
+  CHECK(c.at_end() == (model.p == model.n + 1));
+}
+
+// The rows of `SELECT id FROM t WHERE id <= $1 ORDER BY id`, n of them.
+constexpr std::string_view kUpTo = "SELECT id FROM t WHERE id <= $1 ORDER BY id";
+
+}  // namespace
+
+TEST_CASE("cursor: every direction from every position, at every boundary, is PostgreSQL's FETCH",
+          "[sql][api][txn][cursor][fetch]") {
+  sql_test::TempDir dir{"api_cursor_fetch"};
+  auto db = populated(dir);
+  const auto& stmt = db->prepare(kUpTo);
+  for (auto hold : {Holdability::Plain, Holdability::Hold}) {
+    for (auto scrolling : {Scrolling::Any, Scrolling::ForwardOnly}) {
+      for (std::int64_t n : {0, 1, 2, 3, 6}) {
+        auto txn = db->begin();
+        auto full = txn.execute(stmt, {n}).rows;
+        REQUIRE(std::ssize(full) == n);
+        for (std::int64_t start = 0; start <= n + 1; ++start) {
+          for (auto m : all_moves()) {
+            INFO("n " << n << " start " << start << (hold == Holdability::Hold ? " hold" : "")
+                      << (scrolling == Scrolling::ForwardOnly ? " no scroll" : ""));
+            auto c = txn.open_cursor(stmt, {n}, hold, scrolling);
+            Model model{n};
+            model.forward_only = scrolling == Scrolling::ForwardOnly;
+            // Get to `start` by moves a NO SCROLL cursor allows too.
+            if (start == n + 1) {
+              step_both(c, model, full, {Kind::Forward, Move::kAll});
+            } else if (start > 0) {
+              step_both(c, model, full, {Kind::Forward, start});
+            }
+            REQUIRE(c.position() == static_cast<std::uint64_t>(start));
+            step_both(c, model, full, m);
+            // A second move from wherever the first left it.
+            step_both(c, model, full, {Kind::Relative, 1});
+            c.close();
+          }
+        }
+        txn.rollback();
+      }
+    }
+  }
+}
+
+TEST_CASE("cursor: fetching by random sequences of directions equals slicing the full result",
+          "[sql][api][txn][cursor][fetch]") {
+  sql_test::TempDir dir{"api_cursor_fetch_seq"};
+  auto db = populated(dir);
+  auto txn = db->begin();
+  const auto moves = all_moves();
+  std::mt19937_64 rng{721};
+  for (std::string_view sql : {"SELECT id, qty FROM t", "SELECT id FROM t WHERE qty > 1 ORDER BY qty, id",
+                               "SELECT name, COUNT(*) FROM t GROUP BY name ORDER BY name",
+                               "SELECT id FROM t ORDER BY name DESC, id",
+                               "SELECT a.id, b.id FROM t a JOIN t b ON a.qty = b.id WHERE a.id < 12"}) {
+    INFO(sql);
+    const auto& stmt = db->prepare(sql);
+    auto full = txn.execute(stmt, {}).rows;
+    REQUIRE_FALSE(full.empty());
+    for (auto hold : {Holdability::Plain, Holdability::Hold}) {
+      for (int sequence = 0; sequence < 40; ++sequence) {
+        auto c = txn.open_cursor(stmt, {}, hold);
+        Model model{std::ssize(full)};
+        for (int i = 0; i < 12; ++i) step_both(c, model, full, moves[rng() % moves.size()]);
+        c.close();
+      }
+    }
+  }
+  txn.rollback();
+}
+
+TEST_CASE("cursor: NO SCROLL refuses what PostgreSQL refuses and nothing it allows", "[sql][api][txn][cursor][fetch]") {
+  sql_test::TempDir dir{"api_cursor_noscroll"};
+  auto db = populated(dir);
+  const auto& stmt = db->prepare(kUpTo);
+  auto txn = db->begin();
+  auto at = [&](std::int64_t position) {
+    auto c = txn.open_cursor(stmt, {std::int64_t{3}}, Holdability::Plain, Scrolling::ForwardOnly);
+    if (position == 4) (void)c.fetch(Move{Kind::Forward, Move::kAll});
+    else if (position > 0) (void)c.fetch(static_cast<std::uint64_t>(position));
+    REQUIRE(c.position() == static_cast<std::uint64_t>(position));
+    return c;
+  };
+  // Recorded from PostgreSQL 16: a refusal leaves the cursor where it was.
+  struct Case {
+    std::int64_t position;
+    Move move;
+    bool refused;
+  };
+  for (auto [position, move, refused] : std::vector<Case>{
+           {1, {Kind::Forward, 0}, true},          {1, {Kind::Relative, 0}, true},
+           {0, {Kind::Forward, 0}, false},         {0, {Kind::Relative, 0}, false},
+           {4, {Kind::Forward, 0}, false},         {0, {Kind::Backward, 0}, true},
+           {1, {Kind::Relative, 1}, false},        {1, {Kind::Relative, -1}, true},
+           {1, {Kind::Absolute, 3}, false},        {1, {Kind::Absolute, 1}, true},
+           {2, {Kind::Absolute, 2}, true},         {2, {Kind::Absolute, 3}, false},
+           {2, {Kind::Absolute, 9}, false},        {0, {Kind::Absolute, 1}, false},
+           {0, {Kind::Absolute, 0}, false},        {1, {Kind::Absolute, 0}, true},
+           {4, {Kind::Absolute, 9}, false},        {4, {Kind::Absolute, 1}, true},
+           {0, {Kind::Absolute, -1}, true},        {0, {Kind::Backward, 1}, true},
+           {0, {Kind::Forward, -1}, true},         {1, {Kind::Backward, Move::kAll}, true},
+           {4, {Kind::Forward, Move::kAll}, false}}) {
+    INFO(describe(move) << " from " << position);
+    auto c = at(position);
+    if (refused) {
+      CHECK_THROWS_AS(c.fetch(move), CursorForwardOnly);
+      CHECK(c.is_open());  // the layer's refusal is not a failed run: the transaction goes on
+      CHECK(c.position() == static_cast<std::uint64_t>(position));
+    } else {
+      CHECK_NOTHROW(c.fetch(move));
+    }
+  }
+  txn.rollback();
+}
+
+TEST_CASE("cursor: FETCH LAST and a negative ABSOLUTE learn the size once", "[sql][api][txn][cursor][fetch]") {
+  sql_test::TempDir dir{"api_cursor_last"};
+  auto db = populated(dir);
+  auto txn = db->begin();
+  const auto& stmt = db->prepare("SELECT id FROM t ORDER BY id");
+  auto c = txn.open_cursor(stmt, {});
+  CHECK(ids(c.fetch(Move{Kind::Absolute, -1})) == std::vector<std::int64_t>({kRows}));
+  CHECK(c.position() == static_cast<std::uint64_t>(kRows));
+  CHECK(ids(c.fetch(Move{Kind::Backward, 2})) == std::vector<std::int64_t>({kRows - 1, kRows - 2}));
+  CHECK(ids(c.fetch(Move{Kind::Absolute, -kRows})) == std::vector<std::int64_t>({1}));
+  CHECK(c.fetch(Move{Kind::Absolute, -kRows - 1}).rows.empty());
+  CHECK(c.position() == 0);
+  CHECK(ids(c.fetch(Move{Kind::Forward, 1})) == std::vector<std::int64_t>({1}));
+  // The result of an empty cursor: LAST finds nothing and stands before the start.
+  const auto& none = db->prepare("SELECT id FROM t WHERE id < 0");
+  auto e = txn.open_cursor(none, {});
+  CHECK(e.fetch(Move{Kind::Absolute, -1}).rows.empty());
+  CHECK(e.position() == 0);
+  CHECK(e.fetch(Move{Kind::Backward, Move::kAll}).columns == std::vector<std::string>{"id"});
+  txn.rollback();
+}
+
+TEST_CASE("cursor: a backward fetch of a hold cursor works after its transaction committed, and stays insensitive",
+          "[sql][api][txn][cursor][fetch][hold]") {
+  sql_test::TempDir dir{"api_cursor_fetch_hold"};
+  auto db = populated(dir);
+  const auto& scan = db->prepare("SELECT id FROM t ORDER BY id");
+  auto txn = db->begin();
+  auto c = txn.open_cursor(scan, {}, Holdability::Hold);
+  CHECK(ids(c.fetch(Move{Kind::Forward, 5})) == first_n(5));
+  CHECK(txn.commit() == CommitOutcome::Committed);
+  db->execute("DELETE FROM t WHERE id IN (3, 4)");
+  db->execute("INSERT INTO t VALUES (100, 'x', 1)");
+  CHECK(ids(c.fetch(Move{Kind::Backward, 3})) == std::vector<std::int64_t>({4, 3, 2}));
+  CHECK(ids(c.fetch(Move{Kind::Absolute, -1})) == std::vector<std::int64_t>({kRows}));
+  CHECK(ids(c.fetch(Move{Kind::Relative, -kRows + 1})) == std::vector<std::int64_t>({1}));
+  c.close();
+}
+
+TEST_CASE("cursor: a plain cursor ignores the transaction's later writes in every direction",
+          "[sql][api][txn][cursor][fetch]") {
+  sql_test::TempDir dir{"api_cursor_fetch_insensitive"};
+  auto db = populated(dir);
+  auto txn = db->begin();
+  const auto& scan = db->prepare("SELECT id FROM t ORDER BY id");
+  auto c = txn.open_cursor(scan, {});
+  CHECK(ids(c.fetch(Move{Kind::Forward, 10})) == first_n(10));
+  insert(txn, 0);
+  txn.execute("DELETE FROM t WHERE id <= 5");
+  txn.execute("UPDATE t SET qty = 9");
+  CHECK(ids(c.fetch(Move{Kind::Backward, 4})) == std::vector<std::int64_t>({9, 8, 7, 6}));
+  CHECK(ids(c.fetch(Move{Kind::Absolute, 1})) == std::vector<std::int64_t>({1}));
+  CHECK(ids(c.fetch(Move{Kind::Absolute, -1})) == std::vector<std::int64_t>({kRows}));
+  txn.rollback();
+}
+
+TEST_CASE("cursor: a backward fetch buffers its rows within the statement budget, and an allocation failure is an error",
+          "[sql][api][alloc][cursor][fetch]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
+  sql_test::TempDir dir{"api_cursor_fetch_alloc"};
+  auto db = populated(dir);
+  const auto& scan = db->prepare("SELECT id, name FROM t ORDER BY id");
+  for (auto hold : {Holdability::Plain, Holdability::Hold}) {
+    auto failed = 0;
+    for (long nth = 1;; ++nth) {
+      REQUIRE(nth < 100000);
+      auto txn = db->begin();
+      auto c = txn.open_cursor(scan, {}, hold);
+      (void)c.fetch(Move{Kind::Forward, 20});
+      auto fired = false;
+      auto ok = false;
+      {
+        bytecask::testing::ScopedAllocFaults faults{nth, false};
+        try {
+          auto rows = c.fetch(Move{Kind::Backward, 8});
+          ok = rows.rows.size() == 8;
+        } catch (const std::exception&) {
+        }
+        fired = faults.report().fired;
+      }
+      INFO("allocation " << nth);
+      if (ok) {
+        CHECK(c.position() == 12);
+      } else {
+        // A failed fetch closes the cursor, and a plain cursor's transaction with it.
+        CHECK_FALSE(c.is_open());
+        if (hold == Holdability::Plain) CHECK(txn.is_aborted());
+        ++failed;
+      }
+      c.close();
+      txn.rollback();
+      if (!fired) break;
+    }
+    CHECK(failed > 0);
+  }
+}
+
+TEST_CASE("cursor: a backward fetch whose rows do not fit the statement budget is a limit error",
+          "[sql][api][txn][cursor][fetch]") {
+  sql_test::TempDir dir{"api_cursor_fetch_budget"};
+  auto db = Database::open(dir.path(), DatabaseOptions{.statement_memory_bytes = 6000});
+  db->execute("CREATE TABLE w (id BIGINT PRIMARY KEY, v BYTEA)");
+  for (std::int64_t i = 1; i <= 40; ++i) db->execute("INSERT INTO w VALUES ($1, $2)", {i, sql_test::bytes(std::string(200, 'x'))});
+  auto txn = db->begin();
+  auto c = txn.open_cursor(db->prepare("SELECT id, v FROM w ORDER BY id"), {});
+  CHECK(c.fetch(Move{Kind::Absolute, 30}).rows.size() == 1);  // the rows before it are not buffered
+  CHECK(ids(c.fetch(Move{Kind::Backward, 2})).size() == 2);
+  try {
+    (void)c.fetch(Move{Kind::Backward, Move::kAll});  // 28 rows of 200 bytes and more
     FAIL("expected a limit error");
   } catch (const ExecError& e) {
     CHECK(e.code() == BC_E_LIMIT);
