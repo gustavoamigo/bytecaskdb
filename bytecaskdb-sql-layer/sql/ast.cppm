@@ -91,18 +91,20 @@ struct Expr {
 };
 
 // One conjunct of a WHERE clause: two expressions compared; or, as a
-// predicate, AND, OR or NOT of conjuncts (`args`), or `lhs` IS NULL. The
+// predicate, AND, OR or NOT of conjuncts (`args`), `lhs` IS NULL, or `lhs`
+// LIKE the pattern `rhs`, with its ESCAPE as written. The
 // parser writes <>, BETWEEN and IN with them: NOT (a = b); a >= lo AND a <=
 // hi; a = x OR a = y.
 struct Compare {
   enum class Op { Eq, Lt, Le, Gt, Ge };
-  enum class Kind { Compare, And, Or, Not, IsNull };
+  enum class Kind { Compare, And, Or, Not, IsNull, Like };
   Op op;
   Expr lhs, rhs;
   std::int32_t pos{-1};
   bool on{false};  // a JOIN's ON conjunct, not the WHERE's
   Kind kind{Kind::Compare};
   std::vector<Compare> args;  // And, Or: two or more; Not: one
+  std::optional<std::string> escape;  // Like: ESCAPE's string; none for the default, a backslash
 };
 
 // A copy of e, which owns its operands: what BETWEEN and IN repeat.

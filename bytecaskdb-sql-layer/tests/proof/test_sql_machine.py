@@ -1636,6 +1636,25 @@ class KeylessMachine(Sides, RuleBasedStateMachine):
             return where, where, [], []
         return f" WHERE {c} = ${first}", f" WHERE {c} = {typed(t, c, first)}", [v], [ty]
 
+    @staticmethod
+    def draw_pattern(data, held: list[str]) -> str:
+        """A LIKE pattern, mostly made from a value a row holds: the whole of
+        it, a prefix, a suffix or a middle with % around, now and then a
+        character as _; its own %, _ and backslash escaped. Sometimes any
+        text, % and _ among it."""
+        if not held or data.draw(st.integers(0, 4), label="free pattern?") == 0:
+            return data.draw(st.text(alphabet="ab%_\\é", max_size=5), label="pattern")
+        v = data.draw(st.sampled_from(held), label="pattern source")
+        i = data.draw(st.integers(0, len(v)), label="cut from")
+        j = data.draw(st.integers(i, len(v)), label="cut to")
+        piece = "".join("\\" + ch if ch in "%_\\" else ch for ch in v[i:j])
+        if piece and data.draw(st.booleans(), label="one as _?"):
+            k = data.draw(st.integers(0, len(v[i:j]) - 1), label="which _")
+            chars = ["\\" + ch if ch in "%_\\" else ch for ch in v[i:j]]
+            chars[k] = "_"
+            piece = "".join(chars)
+        return ("%" if i > 0 else "") + piece + ("%" if j < len(v) else "")
+
     def draw_predicate(self, data, t: Table, depth: int) -> str:
         """A predicate on filterable columns, as SQL both sides read alike:
         AND, OR and NOT over =, <>, IS [NOT] NULL, [NOT] BETWEEN and [NOT]
@@ -1651,8 +1670,12 @@ class KeylessMachine(Sides, RuleBasedStateMachine):
         held = [r[[x.name for x in t.columns].index(c)] for r in self.rows(t)]
         value = st.sampled_from(held + [None]) if held else st.just(None)
         lit = lambda label: o.sql_literal(ty, data.draw(value, label=label))  # noqa: E731
-        form = data.draw(st.sampled_from(["=", "<>", "IS NULL", "IS NOT NULL", "BETWEEN", "NOT BETWEEN", "IN", "NOT IN"]),
-                         label="predicate form")
+        forms = ["=", "<>", "IS NULL", "IS NOT NULL", "BETWEEN", "NOT BETWEEN", "IN", "NOT IN"]
+        if ty.kind == "text":
+            forms += ["LIKE", "NOT LIKE"]
+        form = data.draw(st.sampled_from(forms), label="predicate form")
+        if form in ("LIKE", "NOT LIKE"):
+            return f"{c} {form} {o.sql_literal(ty, self.draw_pattern(data, [h for h in held if h is not None]))}"
         if form in ("IS NULL", "IS NOT NULL"):
             return f"{c} {form}"
         if form in ("BETWEEN", "NOT BETWEEN"):
@@ -1797,6 +1820,30 @@ def test_a_unique_column_refuses_a_duplicate_and_takes_nulls(dsn):
         assert m.both("UPDATE k0 SET c0 = 1 WHERE c0 = 3").error == "23505"
         m.reopen()
         assert m.both("INSERT INTO k0 VALUES (3, 4.0)").error == "23505"
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_like_agrees_with_postgresql_on_utf8_and_escapes(dsn):
+    """LIKE and NOT LIKE as PostgreSQL matches them: _ one character, not one
+    byte; % any run, backtracking; the escape, default and given; NULL
+    unknown."""
+    m = keyless_machine(dsn)()
+    try:
+        t = Table("k0", [Column("c0", o.TEXT), Column("c1", o.varchar(8))], [])
+        assert m.both(t.ddl(pg=False), pg_sql=t.ddl(pg=True)).error is None
+        m.tables[t.name] = t
+        for row in (["h\u00e9llo", "\u00e9t\u00e9"], ["hello", "ete"], ["a_b", "100%"], ["a\\b", "x"],
+                    ["mississippi", "\u00fc\u00fc"], [None, None], ["", ""]):
+            assert m.both("INSERT INTO k0 VALUES ($1, $2)", row, types=[o.TEXT, o.varchar(8)]).error is None
+        for where in ("c0 LIKE 'h_llo'", "c0 LIKE 'h__llo'", "c0 LIKE '%\u00e9%'", "c1 LIKE '_t_'",
+                      "c1 LIKE '\u00e9%'", "c1 LIKE '__'", "c0 LIKE 'm%iss%ppi'", "c0 LIKE '%s%s%s%s%'",
+                      "c0 LIKE 'a\\_b'", "c1 LIKE '100\\%'", "c1 LIKE '100!%' ESCAPE '!'",
+                      "c0 LIKE 'a\\b' ESCAPE ''", "c0 LIKE ''", "c0 NOT LIKE '%l%'", "c0 LIKE 'x\\'",
+                      "c0 LIKE '%' OR c1 IS NULL"):
+            sql = f"SELECT c0, c1 FROM k0 WHERE {where}"
+            m.bag(sql, [], sql, [])
         m.check()
     finally:
         m.teardown()

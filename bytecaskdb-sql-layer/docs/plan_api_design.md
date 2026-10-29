@@ -1,6 +1,7 @@
 # Plan API: a physical algebra for generated plans
 
-Status: **built**, revision 9 (revision 8 with the sort-key builder,
+Status: **built**, revision 10 (revision 9 with `bc_like` and
+`BC_E_PATTERN`, for `LIKE`; revision 8 with the sort-key builder,
 `bc_sort_key_*` (#579); revision 8 built the sorters, the hash tables and
 the aggregates' slots, `bc_sorter_open`'s `keep`, and `bc_agg_null`, and
 charged the write set to the statement budget as it grows; revision 7 added the lifetime rule of a loop's storage,
@@ -431,6 +432,7 @@ enum bc_error_code {
   BC_E_CLOSED,
   BC_E_UNKNOWN,     /* a commit failed and degraded the engine: its batch may have reached the data
                        file, so its outcome is unknown, never "nothing written" (SQLSTATE 08007) */
+  BC_E_PATTERN,     /* bc_like reached a pattern's escape character at its end (SQLSTATE 22025) */
 };
 
 enum bc_scan_flags {
@@ -620,6 +622,10 @@ double  bc_i64_to_f64(int64_t);                 /* always defined */
 bool    bc_bytes_eq(bc_ctx *, bc_view, bc_view);
 int     bc_bytes_cmp(bc_ctx *, bc_view, bc_view);       /* memcmp order */
 bool    bc_bytes_prefix(bc_ctx *, bc_view prefix, bc_view);
+bool    bc_like(bc_ctx *, bc_view text, bc_view pattern, int32_t escape);  /* PostgreSQL's LIKE of UTF-8 text:
+                                                   _ one character, % any run, the escape (a code point, -1 for
+                                                   none) quoting the next; an escape it reaches at the pattern's
+                                                   end is BC_E_PATTERN */
 ```
 
 The header implements the integer helpers on the compiler's overflow
@@ -629,6 +635,15 @@ defined for every input, and NaN and infinities propagate as SQL expects the
 compiler to handle. Byte comparisons are for encoded or binary columns; the
 compiler emits comparisons on sort keys it built, never on raw text, and on
 TEXT and VARCHAR columns compared under `COLLATE "C"`, byte order.
+
+`bc_like` is PostgreSQL's `LIKE` of UTF-8 text, case-sensitive, under
+`COLLATE "C"`: `%` matches any run of characters, `_` one character (not
+one byte), the escape (a code point; -1 for none, `ESCAPE ''`) the character
+after it as written, any other character itself, byte for byte. It matches
+greedily with one backtrack point, the last `%`, and allocates nothing. An
+escape the match reaches with nothing after it sets `BC_E_PATTERN`
+("LIKE pattern must not end with escape character", SQLSTATE 22025) and
+returns false; as in PostgreSQL, one the match never reaches is no error.
 
 `bc_add_bigint` and `bc_sub_bigint` are `bc_add` and `bc_sub` for a value
 that is stored in a BIGINT column (`SET col = col ± $n`): the only integer
