@@ -86,7 +86,9 @@ DB::DB(std::filesystem::path dir, Options opts)
     pool_ = std::make_shared<BufferPool>(opts.buffer_pool, scratch_bytes_);
   }
   // The directories open creates, each named by an entry in its parent that
-  // has to be durable before the database's files can be.
+  // has to be durable before the database's files can be. A directory that
+  // already exists may have been created by an open that failed or was killed
+  // before its sync, so the database directory's entry is synced every open.
   std::vector<std::filesystem::path> created;
   for (auto p = std::filesystem::absolute(dir_); !std::filesystem::exists(p);
        p = p.parent_path()) {
@@ -95,6 +97,10 @@ DB::DB(std::filesystem::path dir, Options opts)
   std::filesystem::create_directories(dir_);
   for (const auto &p : created)
     sync_directory(p.parent_path(), "io_dir_sync_create_dir");
+  if (created.empty()) {
+    sync_directory(std::filesystem::absolute(dir_).parent_path(),
+                   "io_dir_sync_create_dir");
+  }
 
   // Acquire exclusive advisory lock on the database directory.
   const auto lock_path = dir_ / ".lock";
