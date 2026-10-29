@@ -108,6 +108,19 @@ auto expr(const PgQuery__Node* n) -> Expr {
   if (n->node_case == PG_QUERY__NODE__NODE_A_EXPR) {
     const auto* a = n->a_expr;
     auto op = a->kind == PG_QUERY__A__EXPR__KIND__AEXPR_OP && a->n_name == 1 ? str(a->name[0]) : "";
+    // A comparison as a value; PostgreSQL's grammar spells != as <>.
+    if (a->lexpr != nullptr && (op == "=" || op == "<>" || op == "<" || op == "<=" || op == ">" || op == ">=")) {
+      Expr e{Expr::Kind::Compare, {}, 0, nullptr, nullptr, a->location};
+      e.cmp = op == "=" ? ValueCompare::Eq
+              : op == "<>" ? ValueCompare::Ne
+              : op == "<"  ? ValueCompare::Lt
+              : op == "<=" ? ValueCompare::Le
+              : op == ">"  ? ValueCompare::Gt
+                           : ValueCompare::Ge;
+      e.lhs = std::make_unique<Expr>(operand(a->lexpr));
+      e.rhs = std::make_unique<Expr>(operand(a->rexpr));
+      return e;
+    }
     if (op != "+" && op != "-") reject("only + and - are supported here", a->location);
     // Unary: PostgreSQL's grammar folds - of a number into the literal, so
     // what is left is + of anything and - of an expression.
@@ -150,6 +163,24 @@ auto expr(const PgQuery__Node* n) -> Expr {
     return e;
   }
   if (n->node_case == PG_QUERY__NODE__NODE_A_CONST) return literal_expr(literal(n));
+  if (n->node_case == PG_QUERY__NODE__NODE_TYPE_CAST) {
+    const auto* c = n->type_cast;
+    const auto* tn = c->type_name;
+    if (tn == nullptr || tn->n_names == 0 || tn->n_array_bounds != 0 || tn->setof || tn->pct_type) {
+      reject("type not supported", c->location);
+    }
+    Expr e{Expr::Kind::Cast, {}, 0, nullptr, nullptr, c->location};
+    e.cast_type = str(tn->names[tn->n_names - 1]);
+    for (std::size_t k = 0; k < tn->n_typmods; ++k) {
+      const auto* m = tn->typmods[k];
+      if (m->node_case != PG_QUERY__NODE__NODE_A_CONST || m->a_const->val_case != PG_QUERY__A__CONST__VAL_IVAL) {
+        reject("type modifier must be an integer", tn->location);
+      }
+      e.cast_typmods.push_back(m->a_const->ival->ival);
+    }
+    e.rhs = std::make_unique<Expr>(operand(c->arg));
+    return e;
+  }
   reject("expression not supported", -1);
 }
 

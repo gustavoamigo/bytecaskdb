@@ -63,23 +63,31 @@ struct Literal {
   std::int32_t pos{-1};
 };
 
+// A comparison as a value (SELECT 3 < 5): its operator, <> among them. A
+// WHERE's comparisons are Compare's, below.
+enum class ValueCompare { Eq, Ne, Lt, Le, Gt, Ge };
+
 // A select-list, SET or comparison operand: a column, a parameter, a
 // literal (an integer within BIGINT after + or - is a Const), a sum or
-// difference of two, unary + or - of one, or an aggregate: COUNT(*),
+// difference of two, unary + or - of one, a comparison of two, a cast of
+// one (DATE '…' and '…'::date alike), or an aggregate: COUNT(*),
 // COUNT([DISTINCT] column), SUM, MIN, MAX or AVG of a column.
 struct Expr {
-  enum class Kind { Column, Param, Const, Literal, Add, Sub, Plus, Neg, Aggregate };
+  enum class Kind { Column, Param, Const, Literal, Add, Sub, Plus, Neg, Compare, Cast, Aggregate };
   enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind;
   std::string column;       // Column; Aggregate's argument, "" for COUNT(*)
   std::uint32_t param{0};   // Param: zero-based ($1 is 0)
-  std::unique_ptr<Expr> lhs, rhs;  // Add, Sub; Plus and Neg: rhs
+  std::unique_ptr<Expr> lhs, rhs;  // Add, Sub, Compare; Plus, Neg and Cast: rhs
   std::int32_t pos{-1};
   std::string table;          // Column, Aggregate: the table it is qualified by, "" for none
   std::int64_t constant{0};   // Const: an integer literal (Add and Sub's right operand only)
   Fn fn{Fn::Count};           // Aggregate
   bool distinct{false};       // Aggregate: COUNT(DISTINCT column)
   Literal literal{};          // Literal
+  ValueCompare cmp{ValueCompare::Eq};  // Compare
+  std::string cast_type;               // Cast: libpg_query's last type name, as a column's
+  std::vector<std::int32_t> cast_typmods;
 };
 
 // One conjunct of a WHERE clause: two expressions compared.
