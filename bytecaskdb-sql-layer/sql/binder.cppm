@@ -1844,6 +1844,7 @@ public:
       auto [t, c] = resolve(e);
       targets.push_back({aggregated ? grouped(*t, *c, e.pos) : logical::column_of(t->id, *c), c->name});
     }
+    named(s, targets);
     std::vector<logical::Expr> having;
     for (const auto& h : s.having) having.push_back(having_conjunct(h, resolve, grouped));
     // 0A000, as PostgreSQL refuses it, and in its order of checks.
@@ -1907,6 +1908,13 @@ public:
         n.op);
   }
 
+  // A select-list item's AS name is its output column's.
+  static void named(const ast::Select& s, std::vector<logical::Output>& targets) {
+    for (std::size_t i = 0; i < targets.size(); ++i) {
+      if (!s.targets[i].alias.empty()) targets[i].name = s.targets[i].alias;
+    }
+  }
+
   // A SELECT without FROM: its constants, one row of them, under its LIMIT.
   // A column is a column of no table (42703), as in PostgreSQL.
   auto select_without_from(const ast::Select& s) -> logical::NodePtr {
@@ -1925,6 +1933,7 @@ public:
       if (!is_constant(e)) not_yet("a SELECT without FROM of other than constants and subqueries", e.pos);
       targets.push_back(constant_output(e));
     }
+    named(s, targets);
     auto rows = logical::node(logical::Project{logical::node(logical::OneRow{}), std::move(targets)});
     if (s.limit) rows = logical::node(logical::Limit{std::move(rows), *s.limit});
     return rows;

@@ -403,7 +403,7 @@
 
 - name: a table joined to itself
   features: [F041-01]
-  # table aliases are refused
+  # a table joined with itself is refused
   unimplemented: true
   setup:
     - CREATE TABLE s (id INTEGER PRIMARY KEY, parent INTEGER)
@@ -421,3 +421,28 @@
       expected: [[1, 2], [1, 3]]
   teardown:
     - DROP TABLE s
+
+- name: table aliases qualify the columns of a join, and hide the table's own name
+  features: [E051-08]
+  setup:
+    - CREATE TABLE al (id INTEGER PRIMARY KEY, v INTEGER)
+    - CREATE TABLE bl (id INTEGER PRIMARY KEY, w INTEGER)
+  steps:
+    - sql: INSERT INTO al VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: INSERT INTO al VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: INSERT INTO bl VALUES ($1, $2)
+      params: [1, 5]
+      rowcount: 1
+    - sql: SELECT x.id, y.w FROM al AS x JOIN bl y ON x.id = y.id
+      expected: [[1, 5]]
+    - sql: SELECT v AS total, id n FROM al AS x WHERE x.v > 10 ORDER BY total
+      expected: [[20, 2]]
+    - sql: SELECT al.id FROM al AS x
+      error: "42P01"
+  teardown:
+    - DROP TABLE al
+    - DROP TABLE bl

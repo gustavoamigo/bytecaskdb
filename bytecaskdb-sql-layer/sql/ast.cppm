@@ -92,6 +92,7 @@ struct Expr {
   std::string cast_type;               // Cast: libpg_query's last type name, as a column's
   std::vector<std::int32_t> cast_typmods;
   std::shared_ptr<const Select> subquery;  // Subquery
+  std::string alias;  // a select-list item's AS name, "" for none
 };
 
 // One conjunct of a WHERE clause: two expressions compared; or, as a
