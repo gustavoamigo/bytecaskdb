@@ -1177,7 +1177,10 @@ TEST_CASE("binder: a set operation binds its arms alone and resolves their colum
   CHECK(state("SELECT d FROM u UNION SELECT k FROM u") == "42601");
   CHECK(state("SELECT qty FROM t UNION SELECT 'a'") == "42601");  // a literal of no type
   CHECK(state("SELECT qty FROM t UNION SELECT NULL") == "42601");
-  CHECK(state("SELECT qty FROM t UNION SELECT big FROM u ORDER BY qty") == "42601");
+  CHECK(state("SELECT qty FROM t UNION SELECT big FROM u ORDER BY qty") == "bound");
+  CHECK(state("(SELECT qty FROM t UNION SELECT big FROM u ORDER BY qty) UNION SELECT k FROM u") == "42601");
+  CHECK(state("SELECT qty FROM t UNION SELECT big FROM u ORDER BY 3") == "42P10");
+  CHECK(state("SELECT qty FROM t UNION SELECT big FROM u ORDER BY big") == "42703");
   CHECK(state("SELECT qty FROM t UNION SELECT big FROM nope") == "42P01");
   CHECK(state("SELECT qty FROM t UNION SELECT nope FROM u") == "42703");
   CHECK(state("SELECT qty FROM t UNION SELECT big FROM u FOR UPDATE") == "0A000");

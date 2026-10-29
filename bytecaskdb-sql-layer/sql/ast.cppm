@@ -232,6 +232,9 @@ struct Insert {
 
 struct OrderItem {
   std::string column;
+  // ORDER BY 2: the select-list position, 1-based, and no column. The parser
+  // resolves it in a plain SELECT; a set operation's the binder does.
+  std::int64_t position{0};
   bool desc{false};
   std::int32_t pos{-1};
   std::string table;  // the table it is qualified by, "" for none

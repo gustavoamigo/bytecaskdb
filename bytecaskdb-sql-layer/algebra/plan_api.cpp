@@ -996,6 +996,15 @@ struct bc_ctx {
     std::uint32_t object{0};
     std::vector<std::size_t> at;
   } key_parts;
+  // The same for a sort key's parts (bc_sort_key_part_*): the key carries no
+  // layout, so each part's type is learned as it is read, in order. `type[i]`
+  // is part i's, nullopt for a NULL; `at[i]` is where it starts, and `at`
+  // holds one more, where the next unread part does.
+  struct {
+    bc_view view{};
+    std::vector<std::size_t> at;
+    std::vector<std::optional<PhysType>> type;
+  } sort_parts;
   std::map<Bytes, Bytes, BytesLess> deleted_ranges;  // lo -> hi of each bc_del_range, likewise; disjoint
 
   Verified verified;                 // this context's reference, rebuilt by every run
@@ -1174,6 +1183,7 @@ struct bc_ctx {
   auto remake_view(bc_view& v, BytesView b, std::uint32_t table, RowKind kind) -> bc_view {
     if (find_view(v) == nullptr) return v = make_view(b.data(), b.size(), kNoCursor, 0, table, kind);
     if (key_parts.view.i == v.i && key_parts.view.g == v.g) key_parts.view = {};
+    if (sort_parts.view.i == v.i && sort_parts.view.g == v.g) sort_parts.view = {};
     auto gen = next_gen();
     views[v.i] = ViewEntry{b.data(), 0, gen, static_cast<std::uint32_t>(b.size()), kNoCursor, table, kind};
     v.g = gen;
@@ -1374,6 +1384,7 @@ struct bc_ctx {
   void roll_back(const Mark& m) noexcept {
     auto released = arena.roll_back(m.arena) + (views.size() - m.views) * kViewEntryBytes;
     if ((key_parts.view.i & kPinnedView) == 0 && key_parts.view.i >= m.views) key_parts.view = {};
+    if ((sort_parts.view.i & kPinnedView) == 0 && sort_parts.view.i >= m.views) sort_parts.view = {};
     views.erase(views.begin() + static_cast<std::ptrdiff_t>(m.views), views.end());
     for (auto i = m.keys; i < keys.size(); ++i) released += keys[i].held + kKeyEntryBytes;
     keys.erase(keys.begin() + static_cast<std::ptrdiff_t>(m.keys), keys.end());
@@ -1445,6 +1456,9 @@ struct bc_ctx {
     key_slots.clear();
     key_parts.view = {};  // its view's slot is released
     key_parts.at.clear();
+    sort_parts.view = {};
+    sort_parts.at.clear();
+    sort_parts.type.clear();
     results.clear();
     result_pos = 0;
     emit.reset();
@@ -1991,6 +2005,87 @@ auto decoded(bc_ctx* cx, const KeyReader& r, std::optional<T> v, T neutral) -> T
   if (v) return *v;
   if (!r.ok()) cx->fail(BC_E_CORRUPT, "unparseable key");
   return neutral;
+}
+
+// What bc_sort_key_part_* found at a part: nullopt if the key is unusable (a
+// failure is set), else whether the part is a NULL, and the reader positioned
+// on its value when it is not. `want` is the type the caller reads, nullopt
+// for bc_sort_key_part_null, which can tell a NULL from a value but not read
+// one, and so leaves a value's end unknown until a typed read of it.
+struct SortPartAt {
+  bool null;
+  bool known;  // the part's end is known: a NULL, or a value already read
+  std::optional<KeyReader> reader;
+};
+
+constexpr std::byte kSortMarkerPresent{0x01};
+
+auto sort_part_at(bc_ctx* cx, bc_view key, std::uint32_t part, std::optional<PhysType> want)
+    -> std::optional<SortPartAt> {
+  auto k = cx->resolve(key);
+  if (!k) return std::nullopt;
+  auto& sp = cx->sort_parts;
+  if (sp.view.i != key.i || sp.view.g != key.g) {
+    sp.view = key;
+    sp.at.assign(1, 0);
+    sp.type.clear();
+  }
+  if (part > sp.type.size()) {
+    cx->fail(BC_E_HANDLE, "sort key parts are read in order: part " + std::to_string(sp.type.size()) + " first");
+    return std::nullopt;
+  }
+  if (part < sp.type.size()) {
+    if (!sp.type[part]) return SortPartAt{true, true, std::nullopt};
+    if (want && *want != *sp.type[part]) {
+      cx->fail(BC_E_HANDLE, "sort key part of the wrong type");
+      return std::nullopt;
+    }
+    return SortPartAt{false, true, want ? std::optional{KeyReader{*k, sp.at[part] + 1}} : std::nullopt};
+  }
+  auto at = sp.at[part];
+  if (at >= k->size()) {
+    cx->fail(BC_E_CORRUPT, "unparseable sort key");
+    return std::nullopt;
+  }
+  if ((*k)[at] != kSortMarkerPresent) {
+    // 0x00 and 0x02 are a NULL first and last; anything else is no marker.
+    if ((*k)[at] != std::byte{0x00} && (*k)[at] != std::byte{0x02}) {
+      cx->fail(BC_E_CORRUPT, "unparseable sort key");
+      return std::nullopt;
+    }
+    sp.type.push_back(std::nullopt);
+    sp.at.push_back(at + 1);
+    return SortPartAt{true, true, std::nullopt};
+  }
+  if (!want) return SortPartAt{false, false, std::nullopt};
+  return SortPartAt{false, false, KeyReader{*k, at + 1}};
+}
+
+// Records the type and end of part `part`, which a typed read of it just
+// found; false, with BC_E_CORRUPT set, if the key did not parse there.
+auto sort_part_read(bc_ctx* cx, const SortPartAt& at, PhysType type, bool ok) -> bool {
+  if (!ok) {
+    cx->fail(BC_E_CORRUPT, "unparseable sort key");
+    return false;
+  }
+  auto& sp = cx->sort_parts;
+  if (!at.known) {
+    sp.type.push_back(type);
+    sp.at.push_back(at.reader->pos());
+  }
+  return true;
+}
+
+// A typed read of sort key part `part`: the value, or the neutral one for a
+// NULL part. `read` takes the reader and returns the optional value.
+template <typename T, typename Read>
+T sort_part_value(bc_ctx* cx, bc_view key, std::uint32_t part, PhysType type, T neutral, Read read) {
+  auto at = sort_part_at(cx, key, part, type);
+  if (!at) return neutral;
+  if (at->null) return neutral;
+  auto v = read(*at->reader);
+  if (!sort_part_read(cx, *at, type, v.has_value())) return neutral;
+  return std::move(*v);
 }
 
 auto add_effect(bc_ctx* cx, EffectKind kind, bc_view a, bc_view b) -> void {
@@ -3931,6 +4026,50 @@ bool bc_key_part_null(bc_ctx* cx, uint32_t table_or_index, bc_view key, uint32_t
     return true;
   }
   return at->reader.last_was_null();
+  BC_GUARD_END(cx)
+  return true;
+}
+
+// ------------------------------------------------------- sort key decoders
+
+int64_t bc_sort_key_part_i64(bc_ctx* cx, bc_view key, uint32_t part) {
+  BC_GUARD_BEGIN
+  return sort_part_value<std::int64_t>(cx, key, part, PhysType::I64, 0,
+                                       [](KeyReader& r) { return r.read_i64(KeyPart{PhysType::I64, false, false, false}); });
+  BC_GUARD_END(cx)
+  return {};
+}
+
+double bc_sort_key_part_f64(bc_ctx* cx, bc_view key, uint32_t part) {
+  BC_GUARD_BEGIN
+  return sort_part_value<double>(cx, key, part, PhysType::F64, 0.0,
+                                 [](KeyReader& r) { return r.read_f64(KeyPart{PhysType::F64, false, false, false}); });
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bool bc_sort_key_part_bool(bc_ctx* cx, bc_view key, uint32_t part) {
+  BC_GUARD_BEGIN
+  return sort_part_value<bool>(cx, key, part, PhysType::Bool, false,
+                               [](KeyReader& r) { return r.read_bool(KeyPart{PhysType::Bool, false, false, false}); });
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_view bc_sort_key_part_bytes(bc_ctx* cx, bc_view key, uint32_t part) {
+  BC_GUARD_BEGIN
+  auto v = sort_part_value<Bytes>(cx, key, part, PhysType::Bytes, Bytes{},
+                                  [](KeyReader& r) { return r.read_bytes(KeyPart{PhysType::Bytes, false, false, false}); });
+  if (!cx->ok()) return {};
+  return cx->arena_view(v);
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bool bc_sort_key_part_null(bc_ctx* cx, bc_view key, uint32_t part) {
+  BC_GUARD_BEGIN
+  auto at = sort_part_at(cx, key, part, std::nullopt);
+  return !at || at->null;
   BC_GUARD_END(cx)
   return true;
 }

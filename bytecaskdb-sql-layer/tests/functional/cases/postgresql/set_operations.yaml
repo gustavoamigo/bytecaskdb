@@ -1,9 +1,9 @@
 # UNION, INTERSECT and EXCEPT, each with ALL or DISTINCT, between SELECTs of
 # plain columns, constants and parameters. INTERSECT binds tighter than UNION
-# and EXCEPT; parentheses group. A LIMIT applies to the combined rows. Not
-# built: ORDER BY on the combined rows, and an arm that groups, aggregates or
-# is DISTINCT (refused, 42601). Reading a view defined with a set operation
-# is refused (42601).
+# and EXCEPT; parentheses group. A LIMIT applies to the combined rows, and so
+# does an ORDER BY, by output column names or positions. Not built: an arm
+# that groups, aggregates or is DISTINCT (refused, 42601). Reading a view
+# defined with a set operation is refused (42601).
 #
 # sa.x: 1, 2, 2, NULL, NULL     sb.y: 2, 3, NULL, 3, 2
 
@@ -168,9 +168,8 @@
       expected: [[10], [20], [50]]
     - sql: SELECT x FROM so5a ORDER BY x DESC LIMIT 1 UNION ALL SELECT y FROM so5b
       error: "42601"
-    # ORDER BY of the combined rows is not built
-    - sql: SELECT x FROM so5a UNION ALL SELECT y FROM so5b ORDER BY x
-      error: "42601"
+    - sql: SELECT x FROM so5a UNION ALL SELECT y FROM so5b ORDER BY x DESC LIMIT 2
+      expected: [[50], [40]]
   teardown:
     - DROP TABLE so5b
     - DROP TABLE so5a
@@ -347,3 +346,104 @@
   teardown:
     - DROP VIEW so11_v
     - DROP TABLE so11a
+
+- name: ORDER BY of the combined rows, NULLs placed as PostgreSQL places them
+  features: [E071-01, E071-02, F850]
+  ordered: true
+  setup:
+    - CREATE TABLE so9a (id INTEGER PRIMARY KEY, x INTEGER, s TEXT)
+    - CREATE TABLE so9b (id INTEGER PRIMARY KEY, y INTEGER, t TEXT)
+    - INSERT INTO so9a VALUES (1, 3, 'c')
+    - INSERT INTO so9a VALUES (2, 1, 'a')
+    - INSERT INTO so9a VALUES (3, NULL, 'z')
+    - INSERT INTO so9a VALUES (4, 2, 'b')
+    - INSERT INTO so9a VALUES (5, 2, 'b')
+    - INSERT INTO so9b VALUES (1, 2, 'b')
+    - INSERT INTO so9b VALUES (2, 5, 'e')
+    - INSERT INTO so9b VALUES (3, NULL, 'n')
+    - INSERT INTO so9b VALUES (4, 1, 'a')
+  steps:
+    # NULLS LAST ascending, NULLS FIRST descending
+    - sql: SELECT x FROM so9a UNION ALL SELECT y FROM so9b ORDER BY x
+      expected: [[1], [1], [2], [2], [2], [3], [5], [null], [null]]
+    - sql: SELECT x FROM so9a UNION ALL SELECT y FROM so9b ORDER BY x DESC
+      expected: [[null], [null], [5], [3], [2], [2], [2], [1], [1]]
+    - sql: SELECT x FROM so9a UNION ALL SELECT y FROM so9b ORDER BY x DESC NULLS LAST
+      expected: [[5], [3], [2], [2], [2], [1], [1], [null], [null]]
+    - sql: SELECT x FROM so9a UNION ALL SELECT y FROM so9b ORDER BY x ASC NULLS FIRST
+      expected: [[null], [null], [1], [1], [2], [2], [2], [3], [5]]
+    # DISTINCT arms and ALL arms
+    - sql: SELECT x FROM so9a UNION SELECT y FROM so9b ORDER BY 1 DESC
+      expected: [[null], [5], [3], [2], [1]]
+    - sql: SELECT x FROM so9a INTERSECT SELECT y FROM so9b ORDER BY x
+      expected: [[1], [2], [null]]
+    - sql: SELECT x FROM so9a EXCEPT SELECT y FROM so9b ORDER BY x
+      expected: [[3]]
+    - sql: SELECT x FROM so9a EXCEPT ALL SELECT y FROM so9b ORDER BY x DESC
+      expected: [[3], [2]]
+    - sql: SELECT x FROM so9a INTERSECT ALL SELECT y FROM so9b ORDER BY x
+      expected: [[1], [2], [null]]
+    # several keys, by name and by position; the names are the first arm's
+    - sql: SELECT x, s FROM so9a UNION ALL SELECT y, t FROM so9b ORDER BY s DESC, x
+      expected: [[null, "z"], [null, "n"], [5, "e"], [3, "c"], [2, "b"], [2, "b"], [2, "b"], [1, "a"], [1, "a"]]
+    - sql: SELECT x, s FROM so9a UNION ALL SELECT y, t FROM so9b ORDER BY 2, 1 DESC
+      expected: [[1, "a"], [1, "a"], [2, "b"], [2, "b"], [2, "b"], [3, "c"], [5, "e"], [null, "n"], [null, "z"]]
+    - sql: SELECT x AS v FROM so9a UNION ALL SELECT y FROM so9b ORDER BY v
+      expected: [[1], [1], [2], [2], [2], [3], [5], [null], [null]]
+    # a LIMIT applies to the sorted rows
+    - sql: SELECT x FROM so9a UNION ALL SELECT y FROM so9b ORDER BY x LIMIT 3
+      expected: [[1], [1], [2]]
+    - sql: SELECT x FROM so9a UNION ALL SELECT y FROM so9b ORDER BY x DESC LIMIT 3
+      expected: [[null], [null], [5]]
+    - sql: SELECT x FROM so9a UNION SELECT y FROM so9b ORDER BY x LIMIT 0
+      expected: []
+    # arms with a point lookup, a missing row skips only its arm
+    - sql: SELECT x FROM so9a WHERE id = $1 UNION ALL SELECT y FROM so9b WHERE id = $2 ORDER BY x
+      params: [1, 4]
+      expected: [[1], [3]]
+    - sql: SELECT x FROM so9a WHERE id = $1 UNION ALL SELECT y FROM so9b WHERE id = $2 ORDER BY x
+      params: [99, 2]
+      expected: [[5]]
+    # three arms
+    - sql: SELECT x FROM so9a UNION SELECT y FROM so9b UNION ALL SELECT 7 ORDER BY x DESC
+      expected: [[null], [7], [5], [3], [2], [1]]
+    # refusals
+    - sql: SELECT x FROM so9a UNION ALL SELECT y FROM so9b ORDER BY 3
+      error: "42P10"
+    - sql: SELECT x FROM so9a UNION ALL SELECT y FROM so9b ORDER BY 0
+      error: "42P10"
+    - sql: SELECT x FROM so9a UNION ALL SELECT y FROM so9b ORDER BY nope
+      error: "42703"
+    - sql: SELECT x AS v FROM so9a UNION ALL SELECT y FROM so9b ORDER BY x
+      error: "42703"
+    - sql: SELECT x FROM so9a UNION ALL SELECT y FROM so9b ORDER BY so9a.x
+      error: "42P01"
+    - sql: SELECT x FROM so9a UNION ALL SELECT y FROM so9b ORDER BY 'a'
+      error: "42601"
+  teardown:
+    - DROP TABLE so9b
+    - DROP TABLE so9a
+
+- name: ORDER BY of the combined rows of every column type
+  features: [E071-01, F850]
+  ordered: true
+  setup:
+    - CREATE TABLE so10a (id INTEGER PRIMARY KEY, b BOOLEAN, n DECIMAL(8,2), d DOUBLE PRECISION, t TEXT)
+    - CREATE TABLE so10b (id INTEGER PRIMARY KEY, b BOOLEAN, n DECIMAL(8,2), d DOUBLE PRECISION, t TEXT)
+    - INSERT INTO so10a VALUES (1, true, 1.50, 2.5, 'x')
+    - INSERT INTO so10a VALUES (2, false, -3.25, -1.5, 'a')
+    - INSERT INTO so10a VALUES (3, NULL, NULL, NULL, NULL)
+    - INSERT INTO so10b VALUES (1, false, 10.00, 0.5, 'm')
+    - INSERT INTO so10b VALUES (2, true, 1.50, -1.5, 'a')
+  steps:
+    - sql: SELECT n, d, t, b FROM so10a UNION ALL SELECT n, d, t, b FROM so10b ORDER BY n, t
+      expected: [["-3.25", -1.5, "a", false], ["1.50", -1.5, "a", true], ["1.50", 2.5, "x", true], ["10.00", 0.5, "m", false], [null, null, null, null]]
+    - sql: SELECT n, d, t, b FROM so10a UNION ALL SELECT n, d, t, b FROM so10b ORDER BY d DESC, n
+      expected: [[null, null, null, null], ["1.50", 2.5, "x", true], ["10.00", 0.5, "m", false], ["-3.25", -1.5, "a", false], ["1.50", -1.5, "a", true]]
+    - sql: SELECT b, t FROM so10a UNION SELECT b, t FROM so10b ORDER BY b, t
+      expected: [[false, "a"], [false, "m"], [true, "a"], [true, "x"], [null, null]]
+    - sql: SELECT t FROM so10a UNION ALL SELECT t FROM so10b ORDER BY t DESC
+      expected: [[null], ["x"], ["m"], ["a"], ["a"]]
+  teardown:
+    - DROP TABLE so10b
+    - DROP TABLE so10a
