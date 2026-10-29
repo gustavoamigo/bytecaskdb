@@ -58,6 +58,7 @@ auto type_info(SqlType t) -> TypeInfo {
       if (t.precision == 0) return {1700, -1, -1};
       return {1700, -1, ((static_cast<std::int32_t>(t.precision) << 16) | t.scale) + 4};
     case SqlKind::Timestamp: return {1114, 8, -1};
+    case SqlKind::TimestampTz: return {1184, 8, -1};
     case SqlKind::Date: return {1082, 4, -1};
     case SqlKind::Time: return {1083, 8, -1};
     case SqlKind::Numeric: return {1700, -1, -1};

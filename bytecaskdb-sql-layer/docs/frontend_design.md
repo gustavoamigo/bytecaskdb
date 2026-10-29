@@ -484,17 +484,21 @@ recompile after a DDL folds them again, to the types they meet then.
   (*Known differences*), `FALSE` before `TRUE`, dates and times of one
   type by value. A string literal beside a typed constant is read as that
   constant's type (`1 < '2'`); two compare as text. Types PostgreSQL has no
-  operator for are 42883; a date beside a timestamp is not taken yet.
+  operator for are 42883. A timestamptz beside a timestamp or a date
+  compares as timestamptz (the timestamp read as UTC, the date as midnight
+  UTC); a date beside a timestamp is not taken yet.
 - A cast of a string literal or `NULL`: `DATE '…'`, `'…'::date` and
   `CAST('…' AS date)` alike read the string with the type's input function,
   a `DECIMAL(p, s)` rounded to its scale and range-checked (22003), and are
   of that type. A cast of anything else, and to `VARCHAR(n)`, which
   PostgreSQL's cast truncates, are not taken yet.
-- A cast of a date, time or timestamp constant: to text its text; to its
-  own type itself; a timestamp to a date (the floor, so 1969-12-31 23:00 is
-  1969-12-31) or a time; a date to a timestamp (22008 if the instant passes
-  64 bits). A time to a date or a timestamp, and a date to a time, are
-  42846, as in PostgreSQL. Other typed constants cast to text are not taken
+- A cast of a date, time, timestamp or timestamptz constant: to text its
+  text; to its own type itself; a timestamp or timestamptz to a date (the
+  floor in UTC, so 1969-12-31 23:00 is 1969-12-31) or a time; a date to a
+  timestamp or timestamptz (22008 if the instant passes 64 bits); a
+  timestamp to a timestamptz and back (the same microseconds, the session
+  being UTC). A time to a date, timestamp or timestamptz, and a date to a
+  time, are 42846, as in PostgreSQL. Other typed constants cast to text are not taken
   yet.
 - A select-list constant is named `?column?`, a cast by its type's name
   (`date`, `int4`, `numeric`), as PostgreSQL names them.
@@ -518,7 +522,7 @@ recompile after a DDL folds them again, to the types they meet then.
 
 ### The time
 
-`CURRENT_DATE`, `LOCALTIME[(p)]` and `LOCALTIMESTAMP[(p)]` are the one
+`CURRENT_DATE`, `LOCALTIME[(p)]`, `LOCALTIMESTAMP[(p)]`, `CURRENT_TIMESTAMP[(p)]` and `now()` are the one
 constant a plan cannot fold: a plan is cached by its text, so a value
 folded at bind would be the time of the first run. The binder gives each
 use a slot among the statement's constants (`bound::ClockSlot`), marked as
@@ -537,9 +541,11 @@ are one instant.
 - **Precision.** `(p)` rounds to p fractional digits, half up, as
   PostgreSQL does; above 6 it is 6 (PostgreSQL warns). A time can round to
   24:00:00, as there.
-- **Refused.** `CURRENT_TIME` and `CURRENT_TIMESTAMP` (and `now()`) are
-  `time with time zone` and `timestamp with time zone`, types the layer
-  lacks (#491): refused with 42601, not read as their zoneless kin. Also
+- **With a time zone.** `CURRENT_TIMESTAMP[(p)]` and `now()` are `timestamp
+  with time zone`, as in PostgreSQL: the same instant as `LOCALTIMESTAMP`,
+  written with `+00`.
+- **Refused.** `CURRENT_TIME` is `time with time zone`, a type the layer
+  lacks: refused with 42601, not read as `LOCALTIME`. Also
   refused: the time as an assigned value, in a `WHERE`, or inside an
   aggregated select list; `USER` and the other SQL value functions.
 

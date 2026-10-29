@@ -113,9 +113,9 @@ e141_07_07_01  # type NAME with DEFAULT SESSION_USER: no NAME type, and no DEFAU
 e141_07_08_01  # SYSTEM_USER is text in PostgreSQL, which refuses it as the DEFAULT of an INT column
 e141_07_09_01  # type NAME with DEFAULT USER: no NAME type, and no DEFAULT but a constant
 e141_07_10_01  # TIME WITH TIME ZONE: the layer has no WITH TIME ZONE types
-e141_07_11_01  # TIMESTAMP WITH TIME ZONE: the layer has no WITH TIME ZONE types
+e141_07_11_01  # TIMESTAMP WITH TIME ZONE is supported; a DEFAULT of a clock is not (#701)
 e141_07_12_01  # TIME WITH TIME ZONE: the layer has no WITH TIME ZONE types
-e141_07_13_01  # TIMESTAMP WITH TIME ZONE: the layer has no WITH TIME ZONE types
+e141_07_13_01  # TIMESTAMP WITH TIME ZONE is supported; a DEFAULT of a clock is not (#701)
 e152_01_01_01
 e152_01_01_02
 e152_02_01_01
@@ -220,8 +220,6 @@ f031_19_10_21
 f051_05_07_02  # not PostgreSQL: there is no cast from time to timestamp (42846, which the layer gives)
 f051_07_01_01  # CURRENT_TIME is time with time zone: the layer has no WITH TIME ZONE types (#491)
 f051_07_01_02  # CURRENT_TIME is time with time zone: the layer has no WITH TIME ZONE types (#491)
-f051_08_01_01  # CURRENT_TIMESTAMP is timestamp with time zone: the layer has no WITH TIME ZONE types (#491)
-f051_08_01_02  # CURRENT_TIMESTAMP is timestamp with time zone: the layer has no WITH TIME ZONE types (#491)
 f131_02_01_01  # a join of a grouped view
 f131_03_01_01  # an aggregate over a grouped view: needs a derived table
 f131_03_01_02  # an aggregate over a grouped view: needs a derived table

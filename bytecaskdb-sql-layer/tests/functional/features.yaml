@@ -2055,3 +2055,5 @@ pg:text-type:
   description: the TEXT type
 pg:bytea:
   description: the BYTEA type
+pg:timestamptz:
+  description: the TIMESTAMP WITH TIME ZONE type (timestamptz), in UTC

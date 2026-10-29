@@ -26,6 +26,7 @@ bind error with the position of the type name.
 | `TEXT`, `VARCHAR(n)` | `bytes` | UTF-8. Compared as bytes (binary collation). `n` counts code points and is a catalog property, checked on assignment. |
 | `DECIMAL(p, s)`, `NUMERIC(p, s)`, p ≤ 18 | `i64` | The value times 10^s, exactly. `p` and `s` are catalog properties of the column. `s` defaults to 0; `p` is required. |
 | `TIMESTAMP` | `i64` | Microseconds since 1970-01-01 00:00:00, no time zone; from 4714-11-24 BC, PostgreSQL's first. |
+| `TIMESTAMP WITH TIME ZONE`, `TIMESTAMPTZ` | `i64` | The same microseconds, as an instant in UTC; told apart from `TIMESTAMP` by its catalog type tag (`SqlKind::TimestampTz`, 15), not by its bytes. Keys and rows encode it as a `TIMESTAMP`. |
 | `DATE` | `i64` | Days since 1970-01-01, in PostgreSQL's range: 4714-11-24 BC to 5874897-12-31. |
 | `TIME` | `i64` | Microseconds since midnight, in [0, 86 400 000 000]: 24:00:00 included, as in PostgreSQL. |
 
@@ -38,7 +39,7 @@ Rejected, each for a reason that is not "later": `NUMERIC` with
 no precision or with p > 18 (does not fit `i64`); `CHAR(n)` (its
 blank-padded comparison is a collation rule, and there are no collations
 yet);
-`TIMESTAMP WITH TIME ZONE` (a request carries no time zone yet, #491);
+`TIMESTAMP(p) WITH TIME ZONE` for p other than 6, which would round on store; `TIME WITH TIME ZONE`;
 `INTERVAL`, `UUID`, `JSON`, arrays, enums, composite types, `BIT`, `MONEY`,
 `SERIAL` (sequences are a runtime service, deferred in the plan API).
 
@@ -107,6 +108,14 @@ further. `TIMESTAMP` and `DATE` values are instants and days with no time
 zone; conversions between them are integer arithmetic on the day length
 (`DATE` from `TIMESTAMP` is the floor division, which the compiler emits
 with the adjustment for negative values that `bc_div` truncation needs).
+
+**Time zone.** The session time zone is always UTC and the layer has no time
+zone database. A `TIMESTAMP WITH TIME ZONE` literal's numeric offset (`Z`,
+`+02`, `-04:30`, `+0530`, `+hh:mm:ss`, under 16 hours) is subtracted at input,
+and a literal with none is UTC, as it is in a PostgreSQL session set to UTC.
+Output is UTC with the `+00` suffix. A `timestamp` read as a `timestamptz`
+(and the reverse) is therefore the same microseconds, and a `date` becomes
+midnight UTC. `AT TIME ZONE` is not built.
 
 ## Null
 
@@ -236,7 +245,7 @@ document fixes the set, not the signatures.
 | `OCTET_LENGTH` on bytes and text | a helper |
 | `LENGTH` (code points), `SUBSTRING` (by code point), `||`, `CONCAT` on text | helpers that walk UTF-8 in the API, not in the plan: the subset has no counted loop |
 | `SUBSTRING` by byte, `||` on `BYTEA` | the same helpers on bytes |
-| `CURRENT_TIMESTAMP`, `NOW()`, `CURRENT_DATE` | a hidden parameter the runtime binds at `bc_ctx_begin`: a plan cannot see the clock, so every call in one statement sees one instant. Built for `CURRENT_DATE`, `LOCALTIME` and `LOCALTIMESTAMP`, as a hidden parameter bound by the API at each run, not by the plan API (`frontend_design.md`, *The time*); the WITH TIME ZONE forms wait for those types (#491) |
+| `CURRENT_TIMESTAMP`, `NOW()`, `CURRENT_DATE` | a hidden parameter the runtime binds at `bc_ctx_begin`: a plan cannot see the clock, so every call in one statement sees one instant. Built for `CURRENT_DATE`, `LOCALTIME` and `LOCALTIMESTAMP`, as a hidden parameter bound by the API at each run, not by the plan API (`frontend_design.md`, *The time*); `CURRENT_TIMESTAMP[(p)]` and `NOW()` are `TIMESTAMP WITH TIME ZONE`; `CURRENT_TIME` waits for `TIME WITH TIME ZONE` |
 | `EXTRACT(field FROM ts)` for `YEAR`…`SECOND`, `DATE_TRUNC` to a day or coarser | integer arithmetic on the microsecond value and a civil-date helper |
 | `CAST` | *Casts*, above |
 

@@ -871,7 +871,11 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
         "a DEFAULT for type timestamp is not supported yet");
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v NUMERIC)").first.starts_with("NUMERIC needs a precision"));
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v NUMERIC(19, 2))").first.starts_with("NUMERIC(19, 2)"));
-  CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v TIMESTAMPTZ)").first == "type timestamptz is not supported");
+  CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v TIMESTAMPTZ DEFAULT 0)").first ==
+        "a DEFAULT for type timestamptz is not supported yet");
+  CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v TIMESTAMP(3) WITH TIME ZONE)").first ==
+        "a precision other than 6 on TIMESTAMP WITH TIME ZONE is not supported yet");
+  CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v TIME WITH TIME ZONE)").first == "type timetz is not supported");
   CHECK(rejected(cat, "ALTER TABLE t ADD COLUMN z BIGINT NOT NULL").first.find("needs a DEFAULT") != std::string::npos);
   CHECK(rejected(cat, "ALTER TABLE nope ADD COLUMN z BIGINT").first == "relation \"nope\" does not exist");
   CHECK(rejected(cat, "CREATE INDEX i ON t (nope)").first == "column \"nope\" does not exist");
@@ -1145,7 +1149,8 @@ TEST_CASE("binder: each refusal carries PostgreSQL's SQLSTATE", "[sql][binder][s
   CHECK(state("SELECT sum(tm) FROM u WHERE k = $1") == "42601");  // an interval sum there
   CHECK(state("SELEC 1") == "42601");
   CHECK(state("SELECT id FROM t WHERE id = qty") == "42601");
-  CHECK(state("CREATE TABLE u2 (k BIGINT PRIMARY KEY, v TIMESTAMPTZ)") == "42601");
+  CHECK(state("CREATE TABLE u2 (k BIGINT PRIMARY KEY, v TIMESTAMPTZ)") == "bound");
+  CHECK(state("CREATE TABLE u3 (k BIGINT PRIMARY KEY, v TIME WITH TIME ZONE)") == "42601");
 }
 
 TEST_CASE("binder: a set operation binds its arms alone and resolves their columns", "[sql][binder][setop]") {

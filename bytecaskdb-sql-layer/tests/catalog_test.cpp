@@ -169,6 +169,29 @@ TEST_CASE("catalog: a table's CHECK constraints are a format-5 tail; a table wit
   CHECK_THROWS_AS(parse_table(serialize_table(t)), std::runtime_error);
 }
 
+TEST_CASE("catalog: a table with a TIMESTAMPTZ column is a format-6 record; any other keeps format 4 or 5", "[sql][catalog]") {
+  auto t = rich_table();
+  t.columns.back().sql = SqlType{SqlKind::TimestampTz};  // an earlier build would call the tag corrupt
+  auto rec = serialize_table(t);
+  CHECK(rec[0] == std::byte{6});
+  auto u = parse_table(rec);
+  CHECK(u.columns.back().sql.kind == SqlKind::TimestampTz);
+  CHECK(u.checks.empty());
+  CHECK(serialize_table(u) == rec);
+  t.checks = {{"c1", "f > 0"}};
+  auto with_check = serialize_table(t);
+  CHECK(with_check[0] == std::byte{6});
+  CHECK(parse_table(with_check).checks.size() == 1);
+  // A format-5 record still may not hold an empty CHECK list.
+  auto five = rec;
+  five[0] = std::byte{5};
+  CHECK_THROWS_AS(parse_table(five), std::runtime_error);
+  for (std::size_t n = 0; n < rec.size(); ++n) {
+    INFO(n);
+    CHECK_THROWS_AS(parse_table(BytesView{rec}.first(n)), std::runtime_error);
+  }
+}
+
 TEST_CASE("catalog: CHECK constraints are named as PostgreSQL names them and survive a reopen", "[sql][catalog]") {
   sql_test::TempDir dir{"catalog_check"};
   auto db = DB::open(dir.path());
@@ -223,7 +246,7 @@ TEST_CASE("catalog: a damaged or foreign-format record is refused", "[sql][catal
   };
   CHECK(format(1).find("earlier SQL-layer build") != std::string::npos);
   CHECK(format(2).find("earlier SQL-layer build") != std::string::npos);
-  CHECK(format(6).find("later SQL-layer build") != std::string::npos);
+  CHECK(format(7).find("later SQL-layer build") != std::string::npos);
 
   // Records that parse but break an invariant.
   auto broken = [](auto&& mutate) {

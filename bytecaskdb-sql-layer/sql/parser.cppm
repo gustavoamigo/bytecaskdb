@@ -207,6 +207,15 @@ auto expr(const PgQuery__Node* n) -> Expr {
       for (std::size_t k = 0; k < f->n_args; ++k) e.args.push_back(operand(f->args[k]));
       return e;
     }
+    // now() is CURRENT_TIMESTAMP spelled as a call.
+    if (name == "now" && f->n_args == 0 && (f->n_funcname == 1 || (f->n_funcname == 2 && str(f->funcname[0]) == "pg_catalog")) &&
+        !f->agg_star && !f->agg_distinct && f->n_agg_order == 0 && f->agg_filter == nullptr && f->over == nullptr &&
+        !f->agg_within_group && !f->func_variadic) {
+      Expr e{Expr::Kind::Clock, {}, 0, nullptr, nullptr, f->location};
+      e.func = "current_timestamp";
+      e.constant = -1;
+      return e;
+    }
     auto known = name == "count" || name == "sum" || name == "min" || name == "max" || name == "avg";
     if (!known || (f->n_funcname == 2 && str(f->funcname[0]) != "pg_catalog") || f->n_funcname > 2) {
       reject("function " + name + " is not supported", f->location);
