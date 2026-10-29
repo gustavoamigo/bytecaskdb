@@ -21,7 +21,7 @@ How much of each suite the layer passes, from the functional suite's conformance
 
 | Suite | Coverage | Tests | Checks |
 |---|---|---|---|
-| SQL:2016 Core (sqltest) | 33% | 242/743 tests | statement accepted |
+| SQL:2016 Core (sqltest) | 33% | 246/743 tests | statement accepted |
 | PostgreSQL features | 65% | 112/172 cases | results |
 | ByteCaskDB features | 100% | 12/12 cases | results |
 | TPROC-C | 100% | 1/1 case: five transactions, then consistency conditions 1–9 | consistency conditions 1–9 |
@@ -33,7 +33,7 @@ The suite is young: its cases are the first of the plan in `docs/functional_test
 Built and tested:
 
 - **Statements:** `CREATE TABLE`, with or without a primary key (a table without one keeps duplicate rows) and with `UNIQUE` constraints, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `ALTER TABLE … ADD COLUMN`; `INSERT` of one row; `SELECT`; `UPDATE` and `DELETE` of any number of rows; `BEGIN`/`COMMIT`/`ROLLBACK`.
-- **Queries:** one table, or two joined (index nested loop or hash), or none (`SELECT` of constants); `WHERE` as a conjunction of comparisons; `ORDER BY` with `NULLS FIRST`/`LAST`; `LIMIT`; `SELECT DISTINCT`; `GROUP BY` and `HAVING`; `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`; `FOR UPDATE` on one table. Full scans and sorts are served.
+- **Queries:** one table, or two joined by `ON`, `USING` or `NATURAL` (index nested loop or hash), or none (`SELECT` of constants); `WHERE` as a conjunction of comparisons; `ORDER BY` with `NULLS FIRST`/`LAST`; `LIMIT`; `SELECT DISTINCT`; `GROUP BY` and `HAVING`; `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`; `FOR UPDATE` on one table. Full scans and sorts are served.
 - **Literals:** integers, numerics of up to 18 digits, strings, `TRUE`/`FALSE`, `NULL` and casts of strings (`DATE '…'`, `CAST('5' AS INTEGER)`), typed as PostgreSQL types them, in `VALUES`, `SET`, `WHERE`, `HAVING` and the select list; `+`, `-` and comparisons of them folded.
 - **Types:** `SMALLINT`, `INTEGER`, `BIGINT`, `REAL`, `DOUBLE PRECISION`, `BOOLEAN`, `TEXT`, `VARCHAR(n)`, `BYTEA`, `DECIMAL(p, s)` with p ≤ 18, `DATE`, `TIME`, `TIMESTAMP`.
 - **Transactions:** statements read their own writes; DDL is its own statement, not transactional.

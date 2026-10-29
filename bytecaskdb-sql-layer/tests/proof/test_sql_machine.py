@@ -1881,6 +1881,31 @@ def test_every_statement_after_a_failed_one_is_25P02(dsn):
         m.teardown()
 
 
+def test_join_using_and_natural_join(dsn):
+    """USING and NATURAL: the pairs equal on the named columns, NULL never
+    equal, each named alone the left side's."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT), Column("c1", o.INTEGER), Column("c2", o.TEXT)], ["c0"]))
+        m.create(Table("t1", [Column("c3", o.BIGINT), Column("c1", o.INTEGER), Column("c2", o.TEXT)], ["c3"]))
+        for row in ({"c0": 1, "c1": 1, "c2": "x"}, {"c0": 2, "c1": 2, "c2": "y"}, {"c0": 3, "c1": None, "c2": "z"}):
+            assert m.insert("t0", row, all_columns=True).error is None
+        for row in ({"c3": 10, "c1": 1, "c2": "x"}, {"c3": 11, "c1": 2, "c2": "n"}, {"c3": 12, "c1": None, "c2": "z"},
+                    {"c3": 13, "c1": 1, "c2": "x"}):
+            assert m.insert("t1", row, all_columns=True).error is None
+        for sql in ("SELECT c1, t0.c0, t1.c3 FROM t0 JOIN t1 USING (c1) ORDER BY t0.c0, t1.c3",
+                    "SELECT c1, c2, t1.c3 FROM t0 INNER JOIN t1 USING (c2, c1) ORDER BY t1.c3",
+                    "SELECT t0.c0, t1.c3 FROM t0 NATURAL JOIN t1 ORDER BY t0.c0, t1.c3",
+                    "SELECT j.c1 FROM t0 JOIN t1 USING (c1) AS j WHERE c1 = 2",
+                    "SELECT c1, COUNT(*) FROM t0 JOIN t1 USING (c1) GROUP BY c1 ORDER BY c1"):
+            assert m.both(sql).error is None
+        assert m.both("SELECT c2 FROM t0 JOIN t1 USING (c1)").error == "42702"
+        assert m.both("SELECT c0 FROM t0 JOIN t1 USING (c3)").error == "42703"
+        m.check()
+    finally:
+        m.teardown()
+
+
 def test_create_and_drop_refusals(dsn):
     m = fixed(dsn)
     try:
