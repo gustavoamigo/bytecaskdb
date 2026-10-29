@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -451,6 +452,67 @@ TEST_CASE("binder: JOIN USING and NATURAL JOIN compare their columns by =, each 
   CHECK(state("SELECT k FROM l JOIN r USING (a, a)") == "42701");
   CHECK(rejected(cat, "SELECT k FROM l LEFT JOIN r USING (a)").first ==
         "only an inner join of two tables, by ON, USING or NATURAL, is supported");
+}
+
+TEST_CASE("binder: OR, NOT, IS NULL, <>, BETWEEN and IN are predicates over comparisons", "[sql][binder]") {
+  sql_test::Fixture f;
+  const auto& cat = f.cat();
+  using K = logical::Expr::Kind;
+  // The shape of each conjunct, as a string: its kind, then its arguments'.
+  auto shape = [](const logical::Expr& e) {
+    auto name = [](K k) -> std::string {
+      switch (k) {
+        case K::And: return "AND";
+        case K::Or: return "OR";
+        case K::Not: return "NOT";
+        case K::IsNull: return "ISNULL";
+        case K::Compare: return "CMP";
+        case K::Column:
+        case K::Param:
+        case K::Const:
+        case K::Add:
+        case K::Sub:
+        case K::Aggregate: break;
+      }
+      return "?";
+    };
+    std::function<std::string(const logical::Expr&)> walk = [&](const logical::Expr& x) {
+      if (x.kind == K::Compare || x.kind == K::IsNull) return name(x.kind);
+      std::string out = name(x.kind) + "(";
+      for (std::size_t i = 0; i < x.args.size(); ++i) out += (i ? "," : "") + walk(x.args[i]);
+      return out + ")";
+    };
+    return walk(e);
+  };
+  auto conjuncts = [&](std::string_view where) {
+    auto b = bind_sql(cat, "SELECT id FROM t WHERE " + std::string{where});
+    std::vector<std::string> out;
+    for (const auto& c : get<logical::Filter>(b).conjuncts) out.push_back(shape(c));
+    return out;
+  };
+  using V = std::vector<std::string>;
+  CHECK(conjuncts("qty <> $1") == V{"NOT(CMP)"});
+  CHECK(conjuncts("qty IS NULL") == V{"ISNULL"});
+  CHECK(conjuncts("qty IS NOT NULL") == V{"NOT(ISNULL)"});
+  CHECK(conjuncts("qty = $1 OR name = $2") == V{"OR(CMP,CMP)"});
+  // BETWEEN's two bounds, at the top, are two conjuncts a key can take.
+  CHECK(conjuncts("qty BETWEEN $1 AND $2") == V{"CMP", "CMP"});
+  CHECK(conjuncts("qty NOT BETWEEN 1 AND 5") == V{"NOT(AND(CMP,CMP))"});
+  CHECK(conjuncts("qty BETWEEN SYMMETRIC 5 AND 1") == V{"OR(AND(CMP,CMP),AND(CMP,CMP))"});
+  CHECK(conjuncts("qty IN (1, 2, 3)") == V{"OR(CMP,CMP,CMP)"});
+  CHECK(conjuncts("qty IN (1)") == V{"CMP"});
+  CHECK(conjuncts("qty NOT IN (1, 2)") == V{"NOT(OR(CMP,CMP))"});
+  CHECK(conjuncts("id = $1 AND NOT (qty = 1 OR name IS NULL)") == V{"CMP", "NOT(OR(CMP,ISNULL))"});
+  // Each comparison in a tree is a WHERE's: typed, folded, refused alike.
+  CHECK(rejected(cat, "SELECT id FROM t WHERE qty = 1 OR qty = id").first ==
+        "WHERE must compare a column with a parameter or a constant");
+  CHECK(rejected(cat, "SELECT id FROM t WHERE qty = $1 + 1 OR id = 2").first ==
+        "$n + k and $n - k inside AND, OR or NOT is not supported yet");
+  CHECK(rejected(cat, "SELECT id FROM t WHERE 1 IS NULL").first == "IS NULL of other than a column is not supported yet");
+  CHECK(rejected(cat, "SELECT qty FROM t GROUP BY qty HAVING qty <> 1").first ==
+        "HAVING with AND, OR, NOT, IS NULL, <>, BETWEEN or IN is not supported yet");
+  CHECK(bind_sql(cat, "SELECT id FROM t WHERE qty = $1 OR qty <> $2").param_types ==
+        std::vector<PhysType>{PhysType::I64, PhysType::I64});
 }
 
 TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][binder][catalog]") {

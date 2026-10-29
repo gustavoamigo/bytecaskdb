@@ -193,23 +193,134 @@ auto compare_op(const std::string& op, std::int32_t pos) -> Compare::Op {
   reject("operator " + op + " is not supported in WHERE", pos);
 }
 
-// A WHERE clause as a list of conjuncts, each a comparison.
-void where(const PgQuery__Node* n, std::vector<Compare>& out, const std::string& clause = "WHERE",
-           std::int32_t pos = -1) {
-  if (n == nullptr) return;
+auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t pos) -> Compare;
+
+auto compare_of(Compare::Op op, Expr lhs, Expr rhs, std::int32_t pos, bool on) -> Compare {
+  return Compare{op, std::move(lhs), std::move(rhs), pos, on};
+}
+
+auto of_kind(Compare::Kind kind, std::vector<Compare> args, std::int32_t pos, bool on) -> Compare {
+  Compare c{Compare::Op::Eq, {}, {}, pos, on};
+  c.kind = kind;
+  c.args = std::move(args);
+  return c;
+}
+
+auto negated(Compare c) -> Compare {
+  auto pos = c.pos;
+  auto on = c.on;
+  std::vector<Compare> one;
+  one.push_back(std::move(c));
+  return of_kind(Compare::Kind::Not, std::move(one), pos, on);
+}
+
+// A WHERE clause's conjunct, as a comparison or a predicate over them:
+// AND, OR, NOT, IS [NOT] NULL, <> (NOT =), BETWEEN [SYMMETRIC] (>= and <=;
+// SYMMETRIC either way round) and [NOT] IN of a list (= of each, OR'd).
+auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t pos) -> Compare {
+  auto on = clause == "ON";
+  if (n == nullptr) reject(clause + " must compare a column", pos);
   if (n->node_case == PG_QUERY__NODE__NODE_BOOL_EXPR) {
     const auto* b = n->bool_expr;
-    if (b->boolop != PG_QUERY__BOOL_EXPR_TYPE__AND_EXPR) reject("only AND is supported in " + clause, b->location);
-    for (std::size_t i = 0; i < b->n_args; ++i) where(b->args[i], out, clause, pos);
-    return;
+    std::vector<Compare> args;
+    for (std::size_t i = 0; i < b->n_args; ++i) args.push_back(predicate(b->args[i], clause, pos));
+    switch (b->boolop) {
+      case PG_QUERY__BOOL_EXPR_TYPE__AND_EXPR: return of_kind(Compare::Kind::And, std::move(args), b->location, on);
+      case PG_QUERY__BOOL_EXPR_TYPE__OR_EXPR: return of_kind(Compare::Kind::Or, std::move(args), b->location, on);
+      case PG_QUERY__BOOL_EXPR_TYPE__NOT_EXPR: return of_kind(Compare::Kind::Not, std::move(args), b->location, on);
+      case PG_QUERY__BOOL_EXPR_TYPE__BOOL_EXPR_TYPE_UNDEFINED:
+      case _PG_QUERY__BOOL_EXPR_TYPE_IS_INT_SIZE: break;
+    }
+    reject("boolean operator not supported in " + clause, b->location);
+  }
+  if (n->node_case == PG_QUERY__NODE__NODE_NULL_TEST) {
+    const auto* t = n->null_test;
+    if (t->argisrow) reject("IS NULL of a row is not supported", t->location);
+    Compare c{Compare::Op::Eq, expr(t->arg), {}, t->location, on};
+    c.kind = Compare::Kind::IsNull;
+    if (t->nulltesttype == PG_QUERY__NULL_TEST_TYPE__IS_NOT_NULL) return negated(std::move(c));
+    return c;
   }
   if (n->node_case != PG_QUERY__NODE__NODE_A_EXPR) reject(clause + " must compare a column", pos);
   const auto* a = n->a_expr;
-  if (a->kind != PG_QUERY__A__EXPR__KIND__AEXPR_OP || a->n_name != 1) {
-    reject(clause + " must compare a column", a->location);
+  auto list = [&](const PgQuery__Node* l) {
+    if (l == nullptr || l->node_case != PG_QUERY__NODE__NODE_LIST) reject(clause + " must compare a column", a->location);
+    return l->list;
+  };
+  switch (a->kind) {
+    case PG_QUERY__A__EXPR__KIND__AEXPR_OP: {
+      if (a->n_name != 1 || a->lexpr == nullptr) break;
+      auto op = str(a->name[0]);
+      if (op == "<>") return negated(compare_of(Compare::Op::Eq, expr(a->lexpr), expr(a->rexpr), a->location, on));
+      return compare_of(compare_op(op, a->location), expr(a->lexpr), expr(a->rexpr), a->location, on);
+    }
+    case PG_QUERY__A__EXPR__KIND__AEXPR_BETWEEN:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_NOT_BETWEEN:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_BETWEEN_SYM:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_NOT_BETWEEN_SYM: {
+      const auto* bounds = list(a->rexpr);
+      if (bounds->n_items != 2) reject("BETWEEN takes two bounds", a->location);
+      auto x = expr(a->lexpr);
+      auto lo = expr(bounds->items[0]);
+      auto hi = expr(bounds->items[1]);
+      auto within = [&](const Expr& from, const Expr& to) {
+        std::vector<Compare> both;
+        both.push_back(compare_of(Compare::Op::Ge, clone(x), clone(from), a->location, on));
+        both.push_back(compare_of(Compare::Op::Le, clone(x), clone(to), a->location, on));
+        return of_kind(Compare::Kind::And, std::move(both), a->location, on);
+      };
+      auto sym = a->kind == PG_QUERY__A__EXPR__KIND__AEXPR_BETWEEN_SYM || a->kind == PG_QUERY__A__EXPR__KIND__AEXPR_NOT_BETWEEN_SYM;
+      auto c = within(lo, hi);
+      if (sym) {
+        std::vector<Compare> either;
+        either.push_back(std::move(c));
+        either.push_back(within(hi, lo));
+        c = of_kind(Compare::Kind::Or, std::move(either), a->location, on);
+      }
+      auto negate = a->kind == PG_QUERY__A__EXPR__KIND__AEXPR_NOT_BETWEEN || a->kind == PG_QUERY__A__EXPR__KIND__AEXPR_NOT_BETWEEN_SYM;
+      if (negate) return negated(std::move(c));
+      return c;
+    }
+    case PG_QUERY__A__EXPR__KIND__AEXPR_IN: {
+      if (a->rexpr == nullptr || a->rexpr->node_case != PG_QUERY__NODE__NODE_LIST) {
+        reject("IN of a subquery is not supported", a->location);
+      }
+      const auto* items = a->rexpr->list;
+      auto x = expr(a->lexpr);
+      std::vector<Compare> any;
+      for (std::size_t i = 0; i < items->n_items; ++i) {
+        any.push_back(compare_of(Compare::Op::Eq, clone(x), expr(items->items[i]), a->location, on));
+      }
+      // IN of one is its equality alone.
+      auto c = any.size() == 1 ? std::move(any[0]) : of_kind(Compare::Kind::Or, std::move(any), a->location, on);
+      if (a->n_name == 1 && str(a->name[0]) == "<>") return negated(std::move(c));  // NOT IN
+      return c;
+    }
+    case PG_QUERY__A__EXPR__KIND__A_EXPR_KIND_UNDEFINED:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_OP_ANY:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_OP_ALL:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_DISTINCT:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_NOT_DISTINCT:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_NULLIF:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_LIKE:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_ILIKE:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_SIMILAR:
+    case _PG_QUERY__A__EXPR__KIND_IS_INT_SIZE: break;
   }
-  out.push_back(Compare{compare_op(str(a->name[0]), a->location), expr(a->lexpr), expr(a->rexpr), a->location,
-                        clause == "ON"});
+  reject(clause + " must compare a column", a->location);
+}
+
+// A WHERE clause as a list of conjuncts: its top-level AND's, each a
+// comparison or a predicate.
+void where(const PgQuery__Node* n, std::vector<Compare>& out, const std::string& clause = "WHERE",
+           std::int32_t pos = -1) {
+  if (n == nullptr) return;
+  if (n->node_case == PG_QUERY__NODE__NODE_BOOL_EXPR && n->bool_expr->boolop == PG_QUERY__BOOL_EXPR_TYPE__AND_EXPR) {
+    const auto* b = n->bool_expr;
+    for (std::size_t i = 0; i < b->n_args; ++i) where(b->args[i], out, clause, pos);
+    return;
+  }
+  out.push_back(predicate(n, clause, pos));
 }
 
 auto literal(const PgQuery__Node* n) -> Literal {

@@ -90,14 +90,36 @@ struct Expr {
   std::vector<std::int32_t> cast_typmods;
 };
 
-// One conjunct of a WHERE clause: two expressions compared.
+// One conjunct of a WHERE clause: two expressions compared; or, as a
+// predicate, AND, OR or NOT of conjuncts (`args`), or `lhs` IS NULL. The
+// parser writes <>, BETWEEN and IN with them: NOT (a = b); a >= lo AND a <=
+// hi; a = x OR a = y.
 struct Compare {
   enum class Op { Eq, Lt, Le, Gt, Ge };
+  enum class Kind { Compare, And, Or, Not, IsNull };
   Op op;
   Expr lhs, rhs;
   std::int32_t pos{-1};
   bool on{false};  // a JOIN's ON conjunct, not the WHERE's
+  Kind kind{Kind::Compare};
+  std::vector<Compare> args;  // And, Or: two or more; Not: one
 };
+
+// A copy of e, which owns its operands: what BETWEEN and IN repeat.
+[[nodiscard]] auto clone(const Expr& e) -> Expr {
+  Expr out{e.kind, e.column, e.param, nullptr, nullptr, e.pos};
+  if (e.lhs) out.lhs = std::make_unique<Expr>(clone(*e.lhs));
+  if (e.rhs) out.rhs = std::make_unique<Expr>(clone(*e.rhs));
+  out.table = e.table;
+  out.constant = e.constant;
+  out.fn = e.fn;
+  out.distinct = e.distinct;
+  out.literal = e.literal;
+  out.cmp = e.cmp;
+  out.cast_type = e.cast_type;
+  out.cast_typmods = e.cast_typmods;
+  return out;
+}
 
 struct ColumnDefAst {
   std::string name;
