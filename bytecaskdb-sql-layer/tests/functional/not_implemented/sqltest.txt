@@ -333,26 +333,12 @@ f131_04_02_11
 f131_04_02_12
 f221_01_01
 f221_02_01
-f261_01_01_01
-f261_01_01_02
-f261_01_01_03
-f261_01_01_04
-f261_01_01_05
-f261_01_01_06
-f261_01_01_07
-f261_01_01_08
-f261_01_01_09
-f261_01_01_10
-f261_01_01_11
-f261_01_01_12
-f261_02_01_01
-f261_02_01_02
-f261_02_01_03
-f261_02_01_04
-f261_02_01_05
-f261_02_01_06
-f261_03_01_01
-f261_04_01_01
+f261_01_01_01  # WHEN with a list of values: not PostgreSQL syntax
+f261_01_01_02  # WHEN with a list of values: not PostgreSQL syntax
+f261_01_01_03  # WHEN with a list of values: not PostgreSQL syntax
+f261_01_01_04  # WHEN with a list of values: not PostgreSQL syntax
+f261_01_01_05  # WHEN with a list of values: not PostgreSQL syntax
+f261_01_01_06  # WHEN with a list of values: not PostgreSQL syntax
 f311_01_01_01
 f311_02_01_01
 f311_03_01_01
