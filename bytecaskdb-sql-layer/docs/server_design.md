@@ -300,8 +300,23 @@ exposes as calls, not as statements.
 - **`BEGIN`** calls `Database::begin()`; the tag is `BEGIN`. Inside an open
   transaction it is `WARNING 25001` ("there is already a transaction in
   progress") and changes nothing. Inside an aborted one it is `25P02`.
-  `BEGIN` with a mode (`ISOLATION LEVEL …`, `READ ONLY`, `DEFERRABLE`) is
-  `0A000`. The isolation is the layer's (`transaction_design.md`).
+  `BEGIN` and `START TRANSACTION` take modes, and `SET TRANSACTION` sets
+  them for the open block (*Transaction modes*). The isolation is the
+  layer's (`transaction_design.md`).
+- **Transaction modes** are `ISOLATION LEVEL READ UNCOMMITTED | READ
+  COMMITTED | REPEATABLE READ`, `READ ONLY`, `READ WRITE` and `[NOT]
+  DEFERRABLE`, in any order, with or without commas. The session keeps them,
+  not the API: a block that is `READ ONLY` refuses any statement but a
+  `SELECT` with `25006`, which aborts the block, as in PostgreSQL (a
+  `SELECT … FOR UPDATE` is not told apart and is taken). The isolation levels
+  change nothing: every transaction reads one snapshot, which is what
+  `REPEATABLE READ` asks and more than the other two do. `SERIALIZABLE` is
+  `0A000`, because snapshot isolation allows write skew and the guards that
+  would prevent it are not built. `SET TRANSACTION` outside a block is
+  `WARNING 25P01`; an isolation level, or `READ WRITE` after `READ ONLY`,
+  once the block has run a statement is `25001`. `SET LOCAL TRANSACTION`
+  (the standard's spelling, not PostgreSQL's) and `SET SESSION
+  CHARACTERISTICS` are `0A000`.
 - **`COMMIT`** calls `commit()`. `Committed` gives the tag `COMMIT`. A
   transaction that was aborted is rolled back instead (`RolledBack`), with
   the tag `ROLLBACK`, as PostgreSQL's `COMMIT` does. Errors:

@@ -272,6 +272,9 @@ auto expr(const PgQuery__Node* n) -> Expr {
     for (std::size_t k = 0; k < b->n_args; ++k) e.args.push_back(operand(b->args[k]));
     return e;
   }
+  if (n->node_case == PG_QUERY__NODE__NODE_SET_TO_DEFAULT) {
+    return Expr{Expr::Kind::Default, {}, 0, nullptr, nullptr, n->set_to_default->location};
+  }
   if (n->node_case == PG_QUERY__NODE__NODE_COALESCE_EXPR) {
     const auto* c = n->coalesce_expr;
     Expr e{Expr::Kind::Coalesce, {}, 0, nullptr, nullptr, c->location};

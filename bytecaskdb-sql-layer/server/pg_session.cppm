@@ -23,6 +23,7 @@ module;
 #include <new>
 #include <optional>
 #include <stdexcept>
+#include <tuple>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -89,7 +90,14 @@ struct Message {
 
 // SetEncoding is SET client_encoding, the one SET taken: libpq's
 // PQsetClientEncoding sends it, and pgtcl's pg_connect calls that.
-enum class Control { Begin, Commit, Rollback, SetEncoding };
+enum class Control { Begin, Commit, Rollback, SetEncoding, SetTransaction };
+
+// SET TRANSACTION's modes. SERIALIZABLE is refused when the statement is read,
+// so an isolation level that gets here is one the snapshot already gives.
+struct TransactionModes {
+  bool isolation{false};           // an ISOLATION LEVEL was given
+  std::optional<bool> read_only;   // READ ONLY (true) or READ WRITE (false)
+};
 
 // A statement's text as the session takes it: nothing, a transaction
 // control word, or a statement for the layer.
@@ -98,6 +106,7 @@ struct Classified {
   Control control{Control::Begin};
   std::string sql;       // Sql: the one statement, without its trailing ';'
   std::string encoding;  // SetEncoding: PostgreSQL's name for it
+  TransactionModes modes;  // SetTransaction
 };
 
 auto upper_words(std::string_view s) -> std::vector<std::string> {
@@ -193,6 +202,48 @@ auto client_encoding(std::string_view value) -> std::optional<std::string_view> 
                      "22023");
 }
 
+// The mode list of SET TRANSACTION, BEGIN and START TRANSACTION: ISOLATION LEVEL …, READ ONLY, READ WRITE,
+// [NOT] DEFERRABLE, with or without commas. The snapshot every transaction
+// reads is stronger than READ UNCOMMITTED, READ COMMITTED and REPEATABLE READ,
+// so those are taken and change nothing; SERIALIZABLE is not provided (the
+// guards it needs are not built: docs/transaction_design.md, *Isolation*).
+auto transaction_modes(std::string_view sql, std::size_t first) -> TransactionModes {
+  std::string spaced;
+  for (auto ch : sql) {
+    if (ch == ',') {
+      spaced += " ";
+    } else {
+      spaced.push_back(ch);
+    }
+  }
+  auto words = upper_words(spaced);
+  TransactionModes modes;
+  for (auto i = first; i < words.size();) {
+    auto at = [&](std::size_t k) -> std::string_view { return i + k < words.size() ? words[i + k] : std::string_view{}; };
+    if (at(0) == "ISOLATION" && at(1) == "LEVEL") {
+      if (at(2) == "SERIALIZABLE") {
+        throw SessionError("ISOLATION LEVEL SERIALIZABLE is not supported: transactions run at snapshot isolation", "0A000");
+      }
+      auto level = (at(2) == "REPEATABLE" && at(3) == "READ") ||
+                   (at(2) == "READ" && (at(3) == "COMMITTED" || at(3) == "UNCOMMITTED"));
+      if (!level) throw SessionError("syntax error at or near \"" + std::string{at(2)} + "\"", "42601");
+      modes.isolation = true;
+      i += 4;
+    } else if (at(0) == "READ" && (at(1) == "ONLY" || at(1) == "WRITE")) {
+      modes.read_only = at(1) == "ONLY";
+      i += 2;
+    } else if (at(0) == "DEFERRABLE") {
+      i += 1;
+    } else if (at(0) == "NOT" && at(1) == "DEFERRABLE") {
+      i += 2;
+    } else {
+      throw SessionError("syntax error at or near \"" + words[i] + "\"", "42601");
+    }
+  }
+  if (words.size() <= first) throw SessionError("syntax error at end of input", "42601");
+  return modes;
+}
+
 auto classify(std::string_view text, const char* several_state, std::string_view several_message) -> Classified {
   auto rest_blank = true;
   auto end = first_statement(text, rest_blank);
@@ -210,13 +261,14 @@ auto classify(std::string_view text, const char* several_state, std::string_view
     if (words.size() > extra) throw SessionError(w + " with options is not supported", "0A000");
   };
   if (w == "BEGIN") {
-    only(1);
-    return {Classified::Kind::Control, Control::Begin, {}};
+    auto first = words.size() > 1 && (words[1] == "WORK" || words[1] == "TRANSACTION") ? std::size_t{2} : std::size_t{1};
+    auto modes = words.size() > first ? transaction_modes(sql, first) : TransactionModes{};
+    return {Classified::Kind::Control, Control::Begin, {}, {}, modes};
   }
   if (w == "START") {
     if (words.size() < 2 || words[1] != "TRANSACTION") throw SessionError("syntax error at or near \"START\"", "42601");
-    if (words.size() > 2) throw SessionError("START TRANSACTION with options is not supported", "0A000");
-    return {Classified::Kind::Control, Control::Begin, {}};
+    auto modes = words.size() > 2 ? transaction_modes(sql, 2) : TransactionModes{};
+    return {Classified::Kind::Control, Control::Begin, {}, {}, modes};
   }
   if (w == "COMMIT" || w == "END") {
     only(1);
@@ -225,6 +277,10 @@ auto classify(std::string_view text, const char* several_state, std::string_view
   if (w == "ROLLBACK" || w == "ABORT") {
     only(1);
     return {Classified::Kind::Control, Control::Rollback, {}};
+  }
+  if (w == "SET" && words.size() > 1 && words[1] == "TRANSACTION") {
+    auto modes = transaction_modes(sql, 2);
+    return {Classified::Kind::Control, Control::SetTransaction, {}, {}, modes};
   }
   if (w == "SET") {
     // SET [SESSION] client_encoding {TO | =} 'UTF8': the server speaks UTF8,
@@ -252,6 +308,23 @@ auto classify(std::string_view text, const char* several_state, std::string_view
   out.kind = Classified::Kind::Sql;
   out.sql = std::string{sql};
   return out;
+}
+
+auto command_name(Command c) -> std::string_view {
+  switch (c) {
+    case Command::Select: return "SELECT";
+    case Command::Insert: return "INSERT";
+    case Command::Update: return "UPDATE";
+    case Command::Delete: return "DELETE";
+    case Command::CreateTable: return "CREATE TABLE";
+    case Command::CreateIndex: return "CREATE INDEX";
+    case Command::DropTable: return "DROP TABLE";
+    case Command::DropIndex: return "DROP INDEX";
+    case Command::AlterTable: return "ALTER TABLE";
+    case Command::CreateView: return "CREATE VIEW";
+    case Command::DropView: return "DROP VIEW";
+  }
+  return {};
 }
 
 auto command_tag(Command c, const Rows& r) -> std::string {
@@ -285,6 +358,7 @@ struct Prepared {
   Classified::Kind kind{Classified::Kind::Empty};
   Control control{Control::Begin};
   std::string encoding;            // SetEncoding
+  TransactionModes modes;          // SetTransaction
   const Statement* stmt{nullptr};  // Sql: from Database::prepare, valid until close
 };
 
@@ -655,9 +729,9 @@ private:
   // A transaction ended: its portals go with it, as in PostgreSQL.
   void end_transaction() noexcept { portals_.clear(); }
 
-  // BEGIN, COMMIT, ROLLBACK or SET client_encoding; returns the command tag.
+  // BEGIN, COMMIT, ROLLBACK, SET TRANSACTION or SET client_encoding; returns the command tag.
   // Ending a block drops every portal: a caller holds none across it.
-  auto run_control(Control c, const std::string& encoding) -> std::string {
+  auto run_control(Control c, const std::string& encoding, TransactionModes modes) -> std::string {
     switch (c) {
       case Control::Begin:
         if (in_block_) {
@@ -670,9 +744,11 @@ private:
           implicit_.reset();
         } else {
           txn_.emplace(db_.begin());
+          start_modes();
         }
         in_block_ = true;
         failed_ = false;
+        if (modes.read_only) read_only_ = *modes.read_only;
         return "BEGIN";
       case Control::Commit: {
         end_transaction();
@@ -694,6 +770,22 @@ private:
         }
         return t->commit() == CommitOutcome::Committed ? "COMMIT" : "ROLLBACK";
       }
+      case Control::SetTransaction:
+        refuse_if_failed();
+        if (!in_block_ && !implicit_) {
+          warning("25P01", "SET TRANSACTION can only be used in transaction blocks");
+          return "SET";
+        }
+        if (modes.isolation && block_used_) {
+          throw SessionError("SET TRANSACTION ISOLATION LEVEL must be called before any query", "25001");
+        }
+        if (modes.read_only) {
+          if (!*modes.read_only && read_only_ && block_used_) {
+            throw SessionError("transaction read-write mode must be set before any query", "25001");
+          }
+          read_only_ = *modes.read_only;
+        }
+        return "SET";
       case Control::SetEncoding:
         refuse_if_failed();
         encoding_ = encoding;
@@ -771,13 +863,14 @@ private:
       auto c = classify(text, "0A000", "several statements in one query are not supported");
       switch (c.kind) {
         case Classified::Kind::Empty: simple_reply('I'); break;
-        case Classified::Kind::Control: complete(run_control(c.control, c.encoding)); break;
+        case Classified::Kind::Control: complete(run_control(c.control, c.encoding, c.modes)); break;
         case Classified::Kind::Sql: {
           last_text_ = c.sql;
           refuse_sql_if_failed(c.sql);
           const auto& stmt = db_.prepare(c.sql);
           if (!stmt.params().empty()) throw SessionError("there is no parameter $1", "42P02");
           if (implicit_ && stmt.is_ddl()) refuse_ddl_beside_others();
+          enter_statement(stmt);
           auto rows = in_block_   ? txn_->execute(stmt, {})
                       : implicit_ ? implicit_->execute(stmt, {})
                                   : db_.execute(stmt, {});
@@ -844,7 +937,7 @@ private:
     }
     last_text_ = text;
     auto c = classify(text, "42601", "cannot insert multiple commands into a prepared statement");
-    Prepared p{c.kind, c.control, c.encoding, nullptr};
+    Prepared p{c.kind, c.control, c.encoding, c.modes, nullptr};
     if (c.kind == Classified::Kind::Sql) {
       last_text_ = c.sql;
       refuse_sql_if_failed(c.sql);
@@ -941,13 +1034,14 @@ private:
       return;
     }
     if (p.kind == Classified::Kind::Control) {
-      auto [control, encoding] = std::pair{p.control, p.encoding};  // run_control may drop the portal
-      complete(run_control(control, encoding));
+      auto [control, encoding, modes] = std::tuple{p.control, p.encoding, p.modes};  // run_control may drop the portal
+      complete(run_control(control, encoding, modes));
       return;
     }
     last_text_ = p.stmt->sql();
     refuse_if_failed();
     Rows rows;
+    enter_statement(*p.stmt);
     if (in_block_) {
       rows = txn_->execute(*p.stmt, portal.params);
     } else if (implicit_) {
@@ -960,6 +1054,8 @@ private:
       // Two or more: PostgreSQL's implicit transaction, committed at Sync.
       if (p.stmt->is_ddl()) refuse_ddl_beside_others();
       implicit_.emplace(db_.begin());
+      start_modes();
+      block_used_ = true;
       rows = implicit_->execute(*p.stmt, portal.params);
       reply(*p.stmt, rows);
       if (flush_after) flush();
@@ -971,6 +1067,23 @@ private:
   void reply(const Statement& stmt, const Rows& rows) {
     data_rows(rows);
     complete(command_tag(stmt.command(), rows));
+  }
+
+  // A new transaction starts with PostgreSQL's defaults: read write, no query yet.
+  void start_modes() {
+    read_only_ = false;
+    block_used_ = false;
+  }
+
+  // A statement about to run in a block: a read-only one takes only a SELECT
+  // (25006), as PostgreSQL does; SELECT … FOR UPDATE is not told apart from it.
+  void enter_statement(const Statement& stmt) {
+    if (!in_block_ && !implicit_) return;
+    if (read_only_ && stmt.command() != Command::Select) {
+      throw SessionError("cannot execute " + std::string{command_name(stmt.command())} + " in a read-only transaction",
+                         "25006");
+    }
+    block_used_ = true;
   }
 
   [[noreturn]] static void refuse_ddl_beside_others() {
@@ -1025,6 +1138,8 @@ private:
   std::string last_text_;  // the statement an error's position is into
   std::map<std::string, Prepared> statements_;
   std::map<std::string, Portal> portals_;
+  bool read_only_{false};   // SET TRANSACTION READ ONLY, for the block that is open
+  bool block_used_{false};  // the open block has run a statement
   std::optional<Transaction> txn_;       // the explicit block's, from BEGIN
   std::optional<Transaction> implicit_;  // an extended block of several statements, outside BEGIN
   bool in_block_{false};                 // inside BEGIN

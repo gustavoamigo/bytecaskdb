@@ -110,7 +110,7 @@
 
 - name: SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
   features: [E152-01]
-  # SET is not supported
+  # snapshot isolation only: the serializable guards are not built (0A000)
   unimplemented: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
@@ -133,8 +133,6 @@
 
 - name: a READ ONLY transaction refuses a write
   features: [E152-02]
-  # BEGIN with options is not supported
-  unimplemented: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
   steps:
@@ -233,3 +231,58 @@
   teardown:
     - ROLLBACK
     - DROP TABLE t
+
+- name: SET TRANSACTION READ ONLY refuses a write and READ WRITE allows it
+  features: [E152-02]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: START TRANSACTION
+    - sql: SET TRANSACTION READ ONLY
+    - sql: SELECT id FROM t
+      expected: []
+    - sql: INSERT INTO t VALUES (1, 10)
+      error: "25006"
+    - sql: ROLLBACK
+    - sql: START TRANSACTION
+    - sql: SET TRANSACTION READ ONLY
+    - sql: SET TRANSACTION READ WRITE
+    - sql: INSERT INTO t VALUES (1, 10)
+      rowcount: 1
+    - sql: COMMIT
+    - sql: SELECT id, v FROM t
+      expected: [[1, 10]]
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: SET TRANSACTION takes an isolation level the snapshot already gives, with modes
+  features: [E152-01, E152-02]
+  steps:
+    - sql: START TRANSACTION
+    - sql: SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY
+    - sql: COMMIT
+    - sql: BEGIN READ ONLY, ISOLATION LEVEL READ COMMITTED
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+
+- name: SET TRANSACTION must come before the transaction's first query
+  features: [E152-01]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY)
+  steps:
+    - sql: BEGIN
+    - sql: SELECT id FROM t
+      expected: []
+    - sql: SET TRANSACTION ISOLATION LEVEL READ COMMITTED
+      error: "25001"
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: SET TRANSACTION outside a transaction block only warns
+  features: [E152-02]
+  steps:
+    - sql: SET TRANSACTION READ ONLY
