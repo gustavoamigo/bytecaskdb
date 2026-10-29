@@ -4,8 +4,9 @@ Status: **design, revised to the owner's decisions of 2026-10-28** (written
 for #663, sqltest E121). Phases 1 (the replay runner, #717), 2 (pinned state,
 #718), 3 (`DECLARE`, `FETCH` forward, `MOVE`, `CLOSE` in a transaction
 block, #719), 4 (`WITH HOLD` by holding the snapshot, `DECLARE` outside a
-block, #720) and 5 (every `FETCH` direction, `SCROLL` and `NO SCROLL`, #721)
-are built; nothing else is. The owner's direction: a cursor is
+block, #720), 5 (every `FETCH` direction, `SCROLL` and `NO SCROLL`, #721) and
+6 (`UPDATE` and `DELETE … WHERE CURRENT OF`, #722) are built; nothing else
+is. The owner's direction: a cursor is
 evaluated lazily; holding the whole result in memory is not the design. The
 first phases build a **replay cursor** (the snapshot and a position; each
 `FETCH` re-runs the plan to its position, with no checkpoint or other
@@ -642,8 +643,11 @@ Errors, as PostgreSQL's: an unknown cursor `34000`; not positioned on a row
 that table `24000`. The update sees the cursor's row as the transaction
 sees it, writes to the overlay as any statement, and the cursor does not see
 the write (it is insensitive); the phase 2 copy-on-write is what makes this
-safe. Phase 6 records the cases from PostgreSQL 17. It changes the
-planner's result description, so it is decision 6. The cursor keeps the key of its last returned row with its position; a replay recomputes nothing for it.
+safe. Phase 6 records the cases from PostgreSQL. The cursor keeps the key of
+its last returned row with its position; a replay recomputes nothing for it.
+The owner allowed the planner's result description and the plan API to change
+for this, additively (decision 6, 2026-10-29); the build needed neither
+(*As built (phase 6)*).
 
 ## Protocol fit
 
@@ -734,9 +738,9 @@ and, as for any portal, a row limit is still `0A000`.
 **`FOR UPDATE [OF t]`** is accepted in the dialect for any `SELECT`:
 `OF t` must name a `FROM` item (`42P01` otherwise) and is `FOR UPDATE`. A
 cursor's guards are taken as its rows are fetched (*The replay cursor*,
-`FOR UPDATE`). **`WHERE CURRENT OF`** is phase 6: today the dialect's `WHERE` rejects
-it (`42601`, "WHERE must compare a column"), so a `FOR UPDATE` cursor can be declared and fetched but
-no positioned `UPDATE` or `DELETE` can name it.
+`FOR UPDATE`). **`WHERE CURRENT OF`** is phase 6 (*As built (phase 6)*). In phases 3 to 5 the
+dialect's `WHERE` rejected it (`42601`), so a `FOR UPDATE` cursor could be
+declared and fetched but no positioned `UPDATE` or `DELETE` could name it.
 
 **Embedded API.** The embedded API has no SQL `DECLARE`: `Transaction::execute`
 takes the dialect's `Statement`s, and a cursor statement is the session's. Its
@@ -829,6 +833,101 @@ the allocation-fault sweep over a `BACKWARD` fetch; the statement budget.
 PostgreSQL 16. `tests/server/test_wire.py`: tags, row framing, `Describe` and
 `55000` over the wire.
 
+## As built (phase 6)
+
+**The hidden key.** A cursor's query that is a plain scan of one table (no
+join, `GROUP BY`, aggregate, `DISTINCT`, set operation, view or `FROM`-less
+`SELECT`) is bound with the table's primary key columns appended to its
+select list, in key order; for a table declared without a primary key the key
+is the hidden row id, a column of the stored row like the others. They are
+ordinary `Project` outputs (`ast::Select::row_key` asks for them,
+`bound::Bound::key_columns` and `key_table` report them), so neither the
+planner, the code generator nor `bc_plan.h` changed: the sort payload of an
+`ORDER BY` carries them as it carries any column. The API's compiled plan
+knows that the last `key_columns` values of a result row are the key:
+`Statement::columns()`, `Rows::columns` and the `RowDescription` leave them
+out, and `Cursor::fetch` removes them from each row before returning it. Any
+other query compiles as before and has no key; `WHERE CURRENT OF` on it is
+`24000`.
+
+Because the extra columns change the plan, `Transaction::open_cursor` opens
+the *twin* of the statement it is given: the same text compiled with the key
+(one more cached statement per cursor query, compiled at the first `DECLARE`
+of it). If the twin cannot be planned the cursor keeps the plain plan and has
+no key.
+
+**The cursor's key.** `CursorState::key` holds the key of the row the cursor
+stands on, and is empty before the first row and after the last. A `FETCH` or
+`MOVE` of any direction sets it from the last row of the window it returned
+(after a `BACKWARD` window is reversed, which is the row the cursor stops
+on), clears it when the move leaves the cursor off the rows, and `FETCH 0`
+reads the current row again. A replay (every move is one) returns the same
+rows, so the key it takes is the one it took. The key is a copy of the row's
+key values, which are already the parameters a `PointGet` takes: the
+types of a result and of a parameter are the same.
+
+**The statement.** The dialect takes `UPDATE … SET … WHERE CURRENT OF name`
+and `DELETE FROM [ONLY] t WHERE CURRENT OF name` (`ast::Update::current_of`,
+`ast::Delete::current_of`), as the whole `WHERE`: PostgreSQL's grammar has no
+other form. The binder writes it as `WHERE pk1 = $n+1 AND pk2 = $n+2 …`, the
+key columns' parameters after the statement's own `n`: the `PointGet` the
+layer already plans for `WHERE pk = $1`, with every check and constraint of
+that statement. The key parameters are not the caller's: `Statement::params()`
+and `param_types()` leave them out, so a `Parse` and `Describe` see the
+statement's own. `Statement::current_of()` names the cursor.
+`Transaction::execute_current_of(stmt, params, cursor)` appends the cursor's
+key to `params` and runs the statement as any statement of the transaction:
+its write goes to the overlay, which the cursor (pinned at `DECLARE`, phase 2)
+does not see. Running such a statement with `execute` is a `ParamError`:
+nothing names its cursor.
+
+| Case | Result |
+|---|---|
+| an unknown cursor (session) | `34000` |
+| the cursor stands before the first row or after the last, or was never fetched | `24000`, "is not positioned on a row" |
+| the cursor's query is no plain scan of one table, or it scans another table than the statement's | `24000`, "is not a simply updatable scan of table" |
+| a hold cursor whose declaring transaction has ended | `24000`, "is held from a previous transaction" (PostgreSQL's, which holds the rows and not their places) |
+| the row was deleted since | `UPDATE 0` / `DELETE 0`, as PostgreSQL's |
+| any of the `24000` | `CurrentOfRefused`; the transaction aborts, as for any failed statement |
+| a cursor of another transaction, a closed one | `std::logic_error`, the transaction unchanged |
+
+In the order PostgreSQL checks them: the kind of scan first, the position
+second. Outside a block a positioned statement is a statement of its own, in
+its own transaction, and the only cursors there are hold cursors, which that
+transaction cannot name: it is `24000`.
+
+**FOR UPDATE.** A `FOR UPDATE` cursor guards the rows it returns
+(*The replay cursor*); `WHERE CURRENT OF` through it writes the row it
+guarded, nothing else differs. A plain cursor can be updated too, as
+PostgreSQL's can when its plan is a simple scan.
+
+**Conformance.** No sqltest id moves. e121_06_01_01, e121_07_01_01 and
+e121_07_01_02 write `WHERE CURRENT OF` on a cursor never fetched, which is
+`24000` in PostgreSQL as it is here (decision 4); they stay marked, their
+error now `24000` and no longer `42601`. The PostgreSQL features suite goes
+from 270 of 311 cases to 279 of 320: the nine cases of
+`tests/functional/cases/postgresql/cursors.yaml` added in this phase, recorded
+from PostgreSQL 16.15 (the one server at hand; the cases pin the same rules in
+17), all pass.
+
+**Cost.** One more compile per distinct cursor query, once; one copy of the
+key per `FETCH`; the extra columns are read from the row in hand, with no
+extra read. No performance claim is made.
+
+**Tests.** `tests/api_cursor_test.cpp` (`[current_of]`): a model of the
+cursor's position steps random sequences of every direction, plain and hold,
+and after each move changes the row the cursor stands on and checks that
+exactly that row changed and that the rows the cursor returns are still the
+ones at `DECLARE`; `DELETE` and a second statement on a deleted row; every
+refusal in the table; the key of a composite, `VARCHAR`, `TEXT`, `DECIMAL`,
+`DATE`, `TIMESTAMP`, `BOOLEAN`, `REAL`, `DOUBLE PRECISION` and `BYTEA` primary
+key and of a table without one; a `FOR UPDATE` cursor with a parameter and a
+`SET` with parameters of its own; an allocation-failure sweep over the
+statement. The existing sweep over a `BACKWARD` fetch covers the key's
+capture. `tests/parser_test.cpp`: the syntax. `tests/server/test_wire.py`:
+tags, `24000`/`34000`, `Parse`/`Describe` with no key parameter, a hold cursor
+outside a block. `cursors.yaml`: nine cases recorded from PostgreSQL.
+
 ## Tests
 
 - Each phase adds cases to `tests/functional/cases/` with expected rows
@@ -871,7 +970,7 @@ interface, so phases 3 to 7 do not change when it lands.
 | 3 | #719 | **Done.** `DECLARE`, `FETCH` forward, `MOVE`, `CLOSE`, `FOR READ ONLY`, `FOR UPDATE [OF t]` in the dialect and session, inside a block | none alone | decided |
 | 4 | #720 | **Done.** `WITH HOLD` by holding the snapshot (lazy, on `Snapshot::clone`); `DECLARE` outside a block, accepted as a hold cursor | 7 of 8 ids; e121_03_01_01 needs `ORDER BY` of an expression | decided (1, 3) |
 | 5 | #721 | **Done.** Every `FETCH` direction, `SCROLL` and `NO SCROLL`, `55000` | none (all eight E121-10 ids write `FETCH … INTO`, which stays refused) | |
-| 6 | #722 | `WHERE CURRENT OF` | none as written | **5** |
+| 6 | #722 | **Done.** `WHERE CURRENT OF`: the key of a plain one-table cursor kept as hidden trailing columns | none (the three ids write it on a cursor never fetched, `24000`) | decided (6) |
 | 7 | #724 | Replay cap, flags, accounting; no cursor-own timers or caps | none | **7** |
 | 8 | #729 | **Parked** (owner, 2026-10-28). Result cache for small blocking cursors | none | |
 | 9 | #716 | Spike: the plan on its own stack | none | **2** |
@@ -894,7 +993,8 @@ through the clone, and the allocation-fault sweep covers it; **3**
 `libpg_query`'s parse tree for the cursor statements was assumed; phase 3
 read it (*As built (phase 3)*); **4** the snapshot a hold cursor retains,
 against the session's policy for pinned snapshots (read, in *As built (phase 4)*); **6** the planner's result description
-gains hidden columns, which `check()` and the schema reference must carry;
+gains hidden columns, which `check()` and the schema reference must carry
+(it did not: the columns are the binder's, and the API trims them);
 **9** the spike can fail, in which case (c) takes (c′)'s place.
 
 ## Owner decisions
@@ -917,11 +1017,16 @@ Decided on 2026-10-28 (recorded on PR #728):
    `24000` (3 ids).
 5. **Phase 8, the result cache, is parked.**
 
+Decided on 2026-10-29:
+
+6. **Hidden key columns in a cursor's plan** for `WHERE CURRENT OF`: the
+   planner's result description and the plan API may change for it,
+   additively. Phase 6 needed neither: the key columns are select-list
+   items the binder adds, and only the API's compiled plan knows they are
+   hidden.
+
 Still open:
 
-6. **Hidden key columns in a cursor's plan** for `WHERE CURRENT OF`: a
-   change to the planner's result description and the schema reference.
-   (Phase 6.)
 7. **How long a streaming read may pin a snapshot.** (Phase 11.) It belongs
    to the same pinned-snapshot policy as decision 3.
 8. **The numbers:** the replay cap on reads per `FETCH` (set after phase 1
@@ -958,3 +1063,10 @@ Still open:
 - `FOR UPDATE OF t` locks the one table the query reads, which is all
   `FOR UPDATE` of a single-table `SELECT` can name.
 - `SCROLL` with `FOR UPDATE` is `0A000`, as PostgreSQL's.
+- `WHERE CURRENT OF` works through any plain scan of one table, a sort
+  included; PostgreSQL refuses a cursor whose plan sorts (`24000`).
+- `WHERE CURRENT OF` on a hold cursor is `24000` once its transaction has
+  ended, as PostgreSQL's; a `DECLARE` outside a block is a hold cursor here,
+  so no positioned statement outside a block can name a cursor.
+- Outside a block, a positioned statement over the extended protocol is a
+  transaction of its own even when more statements follow before `Sync`.

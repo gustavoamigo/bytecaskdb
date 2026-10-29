@@ -905,6 +905,28 @@ private:
     return cursor;
   }
 
+  // UPDATE or DELETE ... WHERE CURRENT OF c, on the row c stands on (docs/cursor_design.md,
+  // *WHERE CURRENT OF*). Outside a block it is a statement of its own, as
+  // every statement is; the cursor there is a hold cursor.
+  auto run_positioned(const Statement& stmt, const std::vector<Value>& params) -> Rows {
+    const auto name = std::string{stmt.current_of()};
+    auto& cursor = find_cursor(name);
+    try {
+      if (in_block_) return txn_->execute_current_of(stmt, params, cursor.cursor);
+      if (implicit_) return implicit_->execute_current_of(stmt, params, cursor.cursor);
+      auto t = db_.begin();
+      auto rows = t.execute_current_of(stmt, params, cursor.cursor);
+      (void)t.commit();
+      return rows;
+    } catch (const CurrentOfRefused& e) {
+      using Why = CurrentOfRefused::Why;
+      auto what = e.why() == Why::NotOnRow  ? "is not positioned on a row"
+                  : e.why() == Why::Held    ? "is held from a previous transaction"
+                                            : "is not a simply updatable scan of table \"" + std::string{stmt.current_of_table()} + "\"";
+      throw SessionError("cursor \"" + name + "\" " + what, "24000");
+    }
+  }
+
   static auto move_of(const ast::FetchCursor& f) -> CursorMove {
     using Direction = ast::FetchCursor::Direction;
     switch (f.direction) {
@@ -1041,9 +1063,10 @@ private:
           if (!stmt.params().empty()) throw SessionError("there is no parameter $1", "42P02");
           if (implicit_ && stmt.is_ddl()) refuse_ddl_beside_others();
           enter_statement(stmt);
-          auto rows = in_block_   ? txn_->execute(stmt, {})
-                      : implicit_ ? implicit_->execute(stmt, {})
-                                  : db_.execute(stmt, {});
+          auto rows = !stmt.current_of().empty() ? run_positioned(stmt, {})
+                      : in_block_                ? txn_->execute(stmt, {})
+                      : implicit_                ? implicit_->execute(stmt, {})
+                                                 : db_.execute(stmt, {});
           if (stmt.command() == Command::Select) {
             std::vector<ResultColumn> cols;
             for (std::size_t i = 0; i < rows.columns.size(); ++i) cols.push_back({rows.columns[i], rows.types.at(i)});
@@ -1236,7 +1259,9 @@ private:
     refuse_if_failed();
     Rows rows;
     enter_statement(*p.stmt);
-    if (in_block_) {
+    if (!p.stmt->current_of().empty()) {
+      rows = run_positioned(*p.stmt, portal.params);
+    } else if (in_block_) {
       rows = txn_->execute(*p.stmt, portal.params);
     } else if (implicit_) {
       rows = implicit_->execute(*p.stmt, portal.params);
