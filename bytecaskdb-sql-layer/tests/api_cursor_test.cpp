@@ -941,3 +941,245 @@ TEST_CASE("cursor: a backward fetch whose rows do not fit the statement budget i
   }
   CHECK(txn.is_aborted());
 }
+
+// ---------------------------------------------------------------- WHERE CURRENT OF
+//
+// docs/cursor_design.md, *WHERE CURRENT OF*: a cursor over one table keeps
+// the primary key of the row it stands on, and UPDATE or DELETE ... WHERE
+// CURRENT OF changes that row.
+
+namespace {
+
+constexpr std::string_view kSetQty = "UPDATE t SET qty = $1 WHERE CURRENT OF c";
+
+auto qty_of(Transaction& txn, std::int64_t id) -> Value {
+  auto r = txn.execute("SELECT qty FROM t WHERE id = $1", {id});
+  REQUIRE(r.rows.size() == 1);
+  return r.rows[0][0];
+}
+
+}  // namespace
+
+TEST_CASE("where current of: the key follows the cursor through every move, a replay and a hold cursor",
+          "[sql][api][txn][cursor][current_of]") {
+  sql_test::TempDir dir{"api_cursor_current_of_moves"};
+  auto db = populated(dir);
+  const auto& scan = db->prepare("SELECT id, qty FROM t ORDER BY id");
+  const auto& set = db->prepare(kSetQty);
+  REQUIRE(set.params().size() == 1);  // the key is not the caller's to bind
+  const auto moves = all_moves();
+  std::mt19937_64 rng{722};
+  for (auto hold : {Holdability::Plain, Holdability::Hold}) {
+    for (int sequence = 0; sequence < 60; ++sequence) {
+      auto txn = db->begin();
+      auto full = txn.execute(scan, {}).rows;
+      auto c = txn.open_cursor(scan, {}, hold);
+      Model model{std::ssize(full)};
+      std::int64_t marker = 1000;
+      for (int i = 0; i < 12; ++i) {
+        auto m = moves[rng() % moves.size()];
+        step_both(c, model, full, m);  // the rows are the ones at open, whatever was written meanwhile
+        if (model.current().empty()) {
+          // Before the first row or after the last: no row to change, and the statement fails the transaction.
+          CHECK_THROWS_AS(txn.execute_current_of(set, {++marker}, c), CurrentOfRefused);
+          CHECK(txn.is_aborted());
+          break;
+        }
+        auto id = std::get<std::int64_t>(full[static_cast<std::size_t>(model.p - 1)][0]);
+        INFO("row " << model.p << " id " << id);
+        auto r = txn.execute_current_of(set, {++marker}, c);
+        CHECK(r.affected == 1);
+        CHECK(qty_of(txn, id) == Value{marker});
+      }
+      txn.rollback();
+    }
+  }
+}
+
+TEST_CASE("where current of: DELETE, a replay, a second statement on one row and the table after", "[sql][api][txn][cursor][current_of]") {
+  sql_test::TempDir dir{"api_cursor_current_of_delete"};
+  auto db = populated(dir);
+  const auto& scan = db->prepare("SELECT id FROM t ORDER BY id");
+  const auto& del = db->prepare("DELETE FROM t WHERE CURRENT OF c");
+  const auto& set = db->prepare(kSetQty);
+  auto txn = db->begin();
+  auto c = txn.open_cursor(scan, {});
+  (void)c.fetch(Move{Kind::Forward, 5});
+  CHECK(txn.execute_current_of(del, {}, c).affected == 1);  // row 5
+  CHECK(txn.execute_current_of(del, {}, c).affected == 0);  // already gone: the same key, a point lookup that finds nothing
+  (void)c.fetch(Move{Kind::Absolute, 2});                   // a replay from the first row
+  CHECK(txn.execute_current_of(set, {std::int64_t{77}}, c).affected == 1);
+  CHECK(qty_of(txn, 2) == Value{std::int64_t{77}});
+  // The cursor is insensitive: row 5 is still there for it.
+  CHECK(std::get<std::int64_t>(c.fetch(Move{Kind::Absolute, 5}).rows.at(0).at(0)) == 5);
+  CHECK(txn.execute("SELECT id FROM t WHERE id = 5").rows.empty());
+  CHECK(txn.execute("SELECT id FROM t").rows.size() == static_cast<std::size_t>(kRows - 1));
+  txn.rollback();
+}
+
+TEST_CASE("where current of: what it refuses, with 24000, and that the transaction then aborts", "[sql][api][txn][cursor][current_of]") {
+  sql_test::TempDir dir{"api_cursor_current_of_refused"};
+  auto db = populated(dir);
+  db->execute("CREATE TABLE u (id BIGINT PRIMARY KEY, qty BIGINT)");
+  const auto& set = db->prepare(kSetQty);
+  const auto& set_u = db->prepare("UPDATE u SET qty = $1 WHERE CURRENT OF c");
+  auto refused = [&](std::string_view query, const Statement& stmt, CurrentOfRefused::Why why, Holdability hold = Holdability::Plain,
+                     std::int64_t fetch = 1) {
+    INFO(query);
+    auto txn = db->begin();
+    auto c = txn.open_cursor(db->prepare(query), {}, hold);
+    if (fetch > 0) (void)c.fetch(Move{Kind::Forward, fetch});
+    try {
+      (void)txn.execute_current_of(stmt, {std::int64_t{1}}, c);
+      FAIL("expected a refusal");
+    } catch (const CurrentOfRefused& e) {
+      CHECK(e.why() == why);
+      CHECK(sqlstate(e) == "24000");
+    }
+    CHECK(txn.is_aborted());
+  };
+  using Why = CurrentOfRefused::Why;
+  refused("SELECT id, qty FROM t", set, Why::NotOnRow, Holdability::Plain, 0);  // never fetched
+  refused("SELECT id, qty FROM t", set, Why::NotOnRow, Holdability::Plain, kRows + 1);  // after the last row
+  refused("SELECT id, qty FROM t", set_u, Why::NotSimple);                    // another table
+  refused("SELECT a.id FROM t a JOIN t b ON a.qty = b.id", set, Why::NotSimple);
+  refused("SELECT qty, COUNT(*) FROM t GROUP BY qty", set, Why::NotSimple);
+  refused("SELECT COUNT(*) FROM t", set, Why::NotSimple);
+  refused("SELECT DISTINCT qty FROM t", set, Why::NotSimple);
+  refused("SELECT id FROM t UNION ALL SELECT id FROM t", set, Why::NotSimple);
+  refused("SELECT 1", set, Why::NotSimple);
+  {  // a view's rows are no table's
+    db->execute("CREATE VIEW v AS SELECT id, qty FROM t");
+    refused("SELECT id, qty FROM v", set, Why::NotSimple);
+  }
+  {  // a hold cursor after its transaction committed
+    auto txn = db->begin();
+    auto c = txn.open_cursor(db->prepare("SELECT id, qty FROM t"), {}, Holdability::Hold);
+    (void)c.fetch(1);
+    CHECK(txn.execute_current_of(set, {std::int64_t{5}}, c).affected == 1);  // while its own transaction lives
+    (void)txn.commit();
+    auto later = db->begin();
+    CHECK_THROWS_AS(later.execute_current_of(set, {std::int64_t{6}}, c), CurrentOfRefused);
+    c.close();
+  }
+  {  // misuse of the handle leaves the transaction alone
+    auto txn = db->begin();
+    auto c = txn.open_cursor(db->prepare("SELECT id, qty FROM t"), {});
+    (void)c.fetch(1);
+    CHECK_THROWS_AS(txn.execute_current_of(db->prepare("UPDATE t SET qty = 1 WHERE id = 1"), {}, c), std::invalid_argument);
+    CHECK_THROWS_AS(txn.execute(set, {std::int64_t{1}}), ParamError);  // a cursor is what it needs
+    CHECK(txn.is_aborted());
+    CHECK_THROWS_AS(db->execute(set, {std::int64_t{1}}), ParamError);
+    auto other = db->begin();
+    auto d = other.open_cursor(db->prepare("SELECT id, qty FROM t"), {});
+    (void)d.fetch(1);
+    auto third = db->begin();
+    CHECK_THROWS_AS(third.execute_current_of(set, {std::int64_t{1}}, d), std::logic_error);  // another transaction's cursor
+    CHECK_FALSE(third.is_aborted());
+    d.close();
+    CHECK_THROWS_AS(other.execute_current_of(set, {std::int64_t{1}}, d), std::logic_error);  // closed
+  }
+}
+
+TEST_CASE("where current of: keys of every shape, and a table with no primary key", "[sql][api][txn][cursor][current_of]") {
+  sql_test::TempDir dir{"api_cursor_current_of_keys"};
+  auto db = Database::open(dir.path());
+  struct Shape {
+    std::string table, columns, order;
+    std::vector<std::string> rows;
+  };
+  const std::vector<Shape> shapes{
+      {"k_composite", "a BIGINT, b TEXT, v BIGINT, PRIMARY KEY (a, b)", "a, b", {"(1, 'x', 0)", "(1, 'y', 0)", "(2, 'x', 0)"}},
+      {"k_varchar", "c VARCHAR(4) PRIMARY KEY, v BIGINT", "c", {"('ab', 0)", "('abc', 0)", "('b', 0)"}},
+      {"k_text", "t TEXT PRIMARY KEY, v BIGINT", "t", {"('a', 0)", "('ab', 0)", "('b', 0)"}},
+      {"k_decimal", "d DECIMAL(10,2) PRIMARY KEY, v BIGINT", "d", {"(1.50, 0)", "(2.25, 0)", "(10.00, 0)"}},
+      {"k_date", "d DATE PRIMARY KEY, v BIGINT", "d", {"('2020-01-01', 0)", "('2020-01-02', 0)", "('2021-05-06', 0)"}},
+      {"k_timestamp", "ts TIMESTAMP PRIMARY KEY, v BIGINT", "ts", {"('2020-01-01 10:00:00', 0)", "('2020-01-01 10:00:01', 0)", "('2020-02-01 00:00:00', 0)"}},
+      {"k_bool", "b BOOLEAN PRIMARY KEY, v BIGINT", "b", {"(false, 0)", "(true, 0)"}},
+      {"k_real", "r REAL PRIMARY KEY, v BIGINT", "r", {"(1.5, 0)", "(2.5, 0)", "(3.5, 0)"}},
+      {"k_double", "x DOUBLE PRECISION PRIMARY KEY, v BIGINT", "x", {"(-1.5, 0)", "(0.25, 0)", "(7.125, 0)"}},
+      {"k_bytea", "b BYTEA PRIMARY KEY, v BIGINT", "b", {"('\\x01', 0)", "('\\x0102', 0)", "('\\x02', 0)"}},
+      {"k_none", "w TEXT, v BIGINT", "w", {"('a', 0)", "('a', 0)", "('a', 0)"}},  // the hidden row id is the key
+  };
+  for (const auto& shape : shapes) {
+    INFO(shape.table);
+    db->execute("CREATE TABLE " + shape.table + " (" + shape.columns + ")");
+    for (const auto& row : shape.rows) db->execute("INSERT INTO " + shape.table + " VALUES " + row);
+    const auto& set = db->prepare("UPDATE " + shape.table + " SET v = 99 WHERE CURRENT OF c");
+    const auto& del = db->prepare("DELETE FROM " + shape.table + " WHERE CURRENT OF c");
+    // k_none has no order the rows are distinguished by: its scan order is its row id's.
+    auto query = "SELECT * FROM " + shape.table + (shape.table == "k_none" ? "" : " ORDER BY " + shape.order);
+    for (std::int64_t row = 1; row <= std::ssize(shape.rows); ++row) {
+      INFO("row " << row);
+      auto txn = db->begin();
+      auto before = txn.execute(query).rows;
+      auto c = txn.open_cursor(db->prepare(query), {});
+      (void)c.fetch(Move{Kind::Absolute, row});
+      REQUIRE(txn.execute_current_of(set, {}, c).affected == 1);
+      auto after = txn.execute(query).rows;
+      REQUIRE(after.size() == before.size());
+      for (std::size_t i = 0; i < after.size(); ++i) {
+        auto changed = std::get<std::int64_t>(after[i].back());
+        CHECK(changed == (static_cast<std::int64_t>(i) + 1 == row ? 99 : 0));
+      }
+      REQUIRE(txn.execute_current_of(del, {}, c).affected == 1);
+      CHECK(txn.execute(query).rows.size() == before.size() - 1);
+      txn.rollback();
+    }
+  }
+}
+
+TEST_CASE("where current of: a FOR UPDATE cursor, parameters and the SET list's own parameters", "[sql][api][txn][cursor][current_of]") {
+  sql_test::TempDir dir{"api_cursor_current_of_locking"};
+  auto db = populated(dir);
+  const auto& scan = db->prepare("SELECT id, qty FROM t WHERE qty >= $1 ORDER BY id FOR UPDATE");
+  const auto& set = db->prepare("UPDATE t SET qty = $1, name = $2 WHERE CURRENT OF c");
+  REQUIRE(set.params().size() == 2);
+  REQUIRE(set.param_types().size() == 2);
+  auto txn = db->begin();
+  auto c = txn.open_cursor(scan, {std::int64_t{3}});
+  auto rows = c.fetch(Move{Kind::Forward, 2}).rows;
+  auto id = std::get<std::int64_t>(rows.at(1).at(0));
+  CHECK(txn.execute_current_of(set, {std::int64_t{-5}, sql_test::bytes("z")}, c).affected == 1);
+  auto after = txn.execute("SELECT qty, name FROM t WHERE id = $1", {id});
+  CHECK(after.rows.at(0).at(0) == Value{std::int64_t{-5}});
+  CHECK(after.rows.at(0).at(1) == Value{sql_test::bytes("z")});
+  CHECK(txn.commit() == CommitOutcome::Committed);
+}
+
+TEST_CASE("where current of: an allocation failure is an error and nothing else", "[sql][api][alloc][cursor][current_of]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
+  sql_test::TempDir dir{"api_cursor_current_of_alloc"};
+  auto db = populated(dir);
+  const auto& scan = db->prepare("SELECT id, name FROM t ORDER BY id");
+  const auto& set = db->prepare(kSetQty);
+  auto failed = 0;
+  for (long nth = 1;; ++nth) {
+    REQUIRE(nth < 100000);
+    auto txn = db->begin();
+    auto c = txn.open_cursor(scan, {});
+    (void)c.fetch(Move{Kind::Forward, 3});
+    auto fired = false;
+    auto ok = false;
+    const std::vector<Value> args{std::int64_t{42}};
+    {
+      bytecask::testing::ScopedAllocFaults faults{nth, false};
+      try {
+        ok = txn.execute_current_of(set, args, c).affected == 1;
+      } catch (const std::exception&) {
+      }
+      fired = faults.report().fired;
+    }
+    INFO("allocation " << nth);
+    if (ok) {
+      CHECK(txn.execute("SELECT qty FROM t WHERE id = 3").rows.at(0).at(0) == Value{std::int64_t{42}});
+    } else {
+      CHECK(txn.is_aborted());
+      ++failed;
+    }
+    c.close();
+    txn.rollback();
+    if (!fired) break;
+  }
+  CHECK(failed > 0);
+}

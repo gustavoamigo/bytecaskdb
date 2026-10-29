@@ -244,6 +244,11 @@ public:
   // checkpoint rather than replay from the first row. False for DDL and for
   // a statement that returns no rows.
   [[nodiscard]] auto is_resumable() const -> bool;
+  // The cursor an UPDATE or DELETE ... WHERE CURRENT OF names; "" for any
+  // other statement. Run it with Transaction::execute_current_of.
+  [[nodiscard]] auto current_of() const -> std::string_view;
+  // The table such a statement writes; "" for any other.
+  [[nodiscard]] auto current_of_table() const -> std::string_view;
 
 private:
   friend class Database;
@@ -270,6 +275,17 @@ private:
     // Which of `fixed` are the time (bound::Bound::clocks): filled on every
     // run from the statement's time, never from the compile.
     std::vector<bound::ClockSlot> clocks;
+    // A cursor's query (Database::prepare_cursor_query): the trailing
+    // `key_columns` values of each result row are the primary key of the
+    // table it scans, `key_table`, kept by the cursor and shown to no one
+    // (`columns` and `column_types` leave them out). 0 for a query that is no
+    // simple scan of one table. An UPDATE or DELETE ... WHERE CURRENT OF: the
+    // trailing `key_params` parameters are that table's key, filled by the
+    // cursor's current row, and `key_table` the table; `params` lists them
+    // but Statement::params() does not.
+    std::uint32_t key_columns{0};
+    std::uint32_t key_table{0};
+    std::uint32_t key_params{0};
     // The views the plan was expanded through (bound::Bound::views): it is
     // rebuilt after any DDL, which may have changed what they read.
     std::vector<std::uint32_t> views;
@@ -344,6 +360,26 @@ public:
   ~CursorForwardOnly() override;  // out of line: anchors the vtable (-Wweak-vtables)
 };
 
+// UPDATE or DELETE ... WHERE CURRENT OF a cursor that names no row to change
+// (SQLSTATE 24000): its query is no simple scan of the statement's table, it
+// stands before the first row or after the last, or it is a hold cursor whose
+// transaction has ended (as PostgreSQL's, which holds its rows, not their
+// places in the table).
+class CurrentOfRefused : public std::runtime_error {
+public:
+  enum class Why : std::uint8_t { NotSimple, NotOnRow, Held };
+  explicit CurrentOfRefused(Why why)
+      : std::runtime_error{why == Why::NotSimple  ? "cursor is not a simply updatable scan of the table"
+                           : why == Why::NotOnRow ? "cursor is not positioned on a row"
+                                                  : "cursor is held from a previous transaction"},
+        why_{why} {}
+  ~CurrentOfRefused() override;  // out of line: anchors the vtable (-Wweak-vtables)
+  [[nodiscard]] auto why() const noexcept -> Why { return why_; }
+
+private:
+  Why why_;
+};
+
 // What commit() did, as PostgreSQL's COMMIT reports it in its command tag.
 enum class CommitOutcome {
   Committed,
@@ -370,6 +406,10 @@ struct CursorState {
   // abort, by close() and by the database's close.
   bc_hold* hold{nullptr};
   std::atomic<bool> live{true};
+  // The primary key of the row the cursor stands on, when its query keeps
+  // one (Compiled::key_columns); none before the first row, after the last,
+  // or for a query that is no simple scan.
+  std::optional<std::vector<Value>> key;
   bool aborted{false};  // closed by its transaction's abort
   // The compiled plan the cursor was opened on, held so that a recompile
   // cannot change the plan or its order.
@@ -544,6 +584,16 @@ public:
   // throws SerializationFailure, and the transaction has ended.
   auto execute(const Statement& stmt, const std::vector<Value>& params) -> Rows;
   auto execute(std::string_view sql, const std::vector<Value>& params = {}) -> Rows;
+  // Runs an UPDATE or DELETE ... WHERE CURRENT OF (Statement::current_of) on
+  // the row `cursor` stands on: `params` are the statement's own, and the
+  // cursor's key follows them. The write goes to the transaction's overlay,
+  // which the cursor does not see (it is insensitive). Throws
+  // CurrentOfRefused (24000) when the cursor's query is no simple scan of the
+  // statement's table, it stands on no row, or it is a hold cursor of an
+  // earlier transaction; std::invalid_argument for a statement that is not a
+  // WHERE CURRENT OF. The transaction then aborts, as for any failed
+  // statement. Otherwise as execute.
+  auto execute_current_of(const Statement& stmt, const std::vector<Value>& params, const Cursor& cursor) -> Rows;
   // Runs a statement that returns rows over the transaction's snapshot and
   // overlay, keeping the window's rows: the replay runner a cursor is built
   // on. The same statement, parameters and view give the same rows on every
@@ -595,7 +645,7 @@ private:
   // ended or aborted transaction.
   void check_usable() const;
   auto run_locked(const Statement& stmt, const std::vector<Value>& params, WindowRows* window = nullptr,
-                  RowWindow range = {}) -> Rows;
+                  RowWindow range = {}, const CursorState* positioned = nullptr) -> Rows;
   void end_locked() noexcept;  // under life_->mu, shared: forgets and frees it
 
   std::shared_ptr<DatabaseLife> life_;
@@ -739,7 +789,7 @@ private:
   // Takes life_->mu shared for a call, or throws DbClosed.
   [[nodiscard]] auto enter() const -> std::shared_lock<std::shared_mutex>;
   // The same calls, under the lock enter() took.
-  auto prepare_locked(std::string_view sql) -> const Statement&;
+  auto prepare_locked(std::string_view sql, bool cursor_query = false) -> const Statement&;
   [[nodiscard]] auto cached(std::string_view sql) const -> bool;
   // A DML statement's plan for the live catalog; null for DDL. Throws what
   // binding, planning and compiling throw.
@@ -832,6 +882,7 @@ ExecError::~ExecError() = default;
 SerializationFailure::~SerializationFailure() = default;
 TransactionAborted::~TransactionAborted() = default;
 CursorForwardOnly::~CursorForwardOnly() = default;
+CurrentOfRefused::~CurrentOfRefused() = default;
 TransactionResolutionUnknown::~TransactionResolutionUnknown() = default;
 auto TransactionResolutionUnknown::what() const noexcept -> const char* {
   return "the transaction's outcome is unknown: its commit failed after its batch may have reached the data file "
@@ -991,6 +1042,7 @@ auto sqlstate(const std::exception& e) noexcept -> std::string_view {
   if (dynamic_cast<const TransactionResolutionUnknown*>(&e) != nullptr) return "08007";
   if (dynamic_cast<const TransactionAborted*>(&e) != nullptr) return "25P02";
   if (dynamic_cast<const FeatureNotSupported*>(&e) != nullptr) return "0A000";
+  if (dynamic_cast<const CurrentOfRefused*>(&e) != nullptr) return "24000";
   if (dynamic_cast<const ParamError*>(&e) != nullptr) return "08P01";
   if (const auto* x = dynamic_cast<const DdlRefused*>(&e)) return x->sqlstate();
   if (const auto* x = dynamic_cast<const ast::SqlError*>(&e)) return x->sqlstate();
@@ -1004,7 +1056,7 @@ auto Statement::param_types() const -> std::vector<PhysType> {
   auto c = compiled();
   if (!c) return {};
   const auto& all = c->plan->param_types;  // the constants' last: not the caller's to bind
-  return {all.begin(), all.end() - std::ssize(c->fixed)};
+  return {all.begin(), all.end() - std::ssize(c->fixed) - static_cast<std::ptrdiff_t>(c->key_params)};
 }
 
 auto Statement::plan_source() const -> std::string {
@@ -1019,7 +1071,22 @@ auto Statement::is_resumable() const -> bool {
 
 auto Statement::params() const -> std::vector<ParamInfo> {
   auto c = compiled();
-  return c ? c->params : std::vector<ParamInfo>{};
+  if (!c) return {};
+  auto out = c->params;
+  out.resize(out.size() - c->key_params);  // the cursor's key is not the caller's to bind
+  return out;
+}
+
+auto Statement::current_of_table() const -> std::string_view {
+  if (current_of().empty()) return {};
+  if (const auto* u = std::get_if<ast::Update>(&ast_)) return u->table;
+  return std::get<ast::Delete>(ast_).table;
+}
+
+auto Statement::current_of() const -> std::string_view {
+  if (const auto* u = std::get_if<ast::Update>(&ast_)) return u->current_of;
+  if (const auto* d = std::get_if<ast::Delete>(&ast_)) return d->current_of;
+  return {};
 }
 
 auto Statement::columns() const -> std::vector<ResultColumn> {
@@ -1243,6 +1310,9 @@ auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
   c->fixed = std::move(bound.fixed);
   c->clocks = std::move(bound.clocks);
   c->views = std::move(bound.views);
+  c->key_columns = bound.key_columns;
+  c->key_table = bound.key_table;
+  c->key_params = bound.key_params;
   c->plan = std::make_unique<GeneratedPlan>(generate_plan(std::move(bound), *cat, s.sql_, row_counts(), budget_.max_bytes));
   link(*c);
   ++compilations_;
@@ -1253,6 +1323,8 @@ void Database::link(Compiled& compiled) {
   auto* c = &compiled;
   c->columns = c->plan->result_names;
   c->column_types = c->plan->result_sql;
+  c->columns.resize(c->columns.size() - c->key_columns);
+  c->column_types.resize(c->column_types.size() - c->key_columns);
   c->result_codes = result_type_codes(c->plan->result_types);
   c->result_layout = make_result_layout(c->plan->result_types);
   {
@@ -1292,21 +1364,27 @@ auto Database::cached(std::string_view sql) const -> bool {
   return cache_.contains(sql);
 }
 
-auto Database::prepare_locked(std::string_view sql) -> const Statement& {
+auto Database::prepare_locked(std::string_view sql, bool cursor_query) -> const Statement& {
+  // A cursor's query is another statement from the same text: its plan reads
+  // the key too. Its cache key starts with a byte no SQL text does.
+  auto key = cursor_query ? "\x01" + std::string{sql} : std::string{sql};
   {
     std::shared_lock<std::shared_mutex> lock{cache_mu_};
-    if (auto it = cache_.find(sql); it != cache_.end()) return *it->second;
+    if (auto it = cache_.find(key); it != cache_.end()) return *it->second;
   }
   // Parsed and compiled outside the cache's lock: a statement another
   // thread added meanwhile is kept, and this one dropped.
   auto s = std::make_unique<Statement>();
   s->sql_ = std::string{sql};
   s->ast_ = ast::parse(sql);
+  if (cursor_query) {
+    if (auto* select = std::get_if<ast::Select>(&s->ast_)) select->row_key = true;
+  }
   s->compiled_ = build(*s);
   s->ddl_ = s->compiled_ == nullptr;
   s->owner_ = this;
   std::unique_lock<std::shared_mutex> lock{cache_mu_};
-  return *cache_.try_emplace(s->sql_, std::move(s)).first->second;
+  return *cache_.try_emplace(std::move(key), std::move(s)).first->second;
 }
 
 auto Database::execute(std::string_view sql, const std::vector<Value>& params) -> Rows {
@@ -1316,6 +1394,7 @@ auto Database::execute(std::string_view sql, const std::vector<Value>& params) -
 auto Database::execute(const Statement& stmt, const std::vector<Value>& params) -> Rows {
   auto lock = enter();
   if (stmt.owner_ != this) throw std::logic_error("the statement was prepared on another database");
+  if (!stmt.current_of().empty()) throw ParamError("WHERE CURRENT OF needs a cursor of a transaction");
   if (stmt.is_ddl()) {
     if (!params.empty()) throw ParamError("DDL takes no parameters");
     auto bound = bound::bind(stmt.ast_, *live_->current());
@@ -1705,11 +1784,35 @@ void Transaction::check_usable() const {
   if (state == TxnState::Aborted) throw TransactionAborted();
 }
 
-auto Transaction::run_locked(const Statement& stmt, const std::vector<Value>& params, WindowRows* window, RowWindow range)
-    -> Rows {
+namespace {
+// Under the database's shared lock.
+void require_live(const CursorState& s);
+
+// The statement's parameters and the key of the row the cursor stands on.
+// (a template: Statement::Compiled is private to its friends).
+template <typename Compiled>
+auto with_cursor_key(const Compiled& stmt, const CursorState& cursor, const std::vector<Value>& params) -> std::vector<Value> {
+  require_live(cursor);
+  const auto& c = *cursor.compiled;
+  if (cursor.h == nullptr) throw CurrentOfRefused(CurrentOfRefused::Why::Held);
+  if (c.key_columns == 0 || c.key_table != stmt.key_table) throw CurrentOfRefused(CurrentOfRefused::Why::NotSimple);
+  if (!cursor.key) throw CurrentOfRefused(CurrentOfRefused::Why::NotOnRow);
+  auto out = params;
+  out.insert(out.end(), cursor.key->begin(), cursor.key->end());
+  return out;
+}
+}  // namespace
+
+auto Transaction::run_locked(const Statement& stmt, const std::vector<Value>& params, WindowRows* window, RowWindow range,
+                             const CursorState* positioned) -> Rows {
   try {
     // DDL is its own atomic operation, never part of a transaction.
     if (stmt.is_ddl()) throw FeatureNotSupported("DDL inside a transaction is not supported: run it outside one");
+    if (positioned != nullptr) {
+      return db_->run(h_->cx, stmt, with_cursor_key(*stmt.compiled(), *positioned, params), h_->txn, h_->started_us, window,
+                      range);
+    }
+    if (!stmt.current_of().empty()) throw ParamError("WHERE CURRENT OF needs a cursor: use execute_current_of");
     return db_->run(h_->cx, stmt, params, h_->txn, h_->started_us, window, range);
   } catch (const SerializationFailure&) {
     end_locked();
@@ -1729,6 +1832,18 @@ auto Transaction::execute(const Statement& stmt, const std::vector<Value>& param
   // A misuse of the handle, not a failed statement: the transaction stays as it was.
   if (stmt.owner_ != db_) throw std::logic_error("the statement was prepared on another database");
   return run_locked(stmt, params);
+}
+
+auto Transaction::execute_current_of(const Statement& stmt, const std::vector<Value>& params, const Cursor& cursor) -> Rows {
+  if (!h_) throw std::logic_error("the transaction has ended");
+  std::shared_lock<std::shared_mutex> lock{life_->mu};
+  check_usable();
+  if (stmt.owner_ != db_) throw std::logic_error("the statement was prepared on another database");
+  if (stmt.current_of().empty()) throw std::invalid_argument("not an UPDATE or DELETE ... WHERE CURRENT OF");
+  if (!cursor.s_) throw std::logic_error("the cursor was moved from");
+  // Another transaction's cursor cannot name a row of this one.
+  if (cursor.s_->h != nullptr && cursor.s_->h != h_.get()) throw std::logic_error("the cursor belongs to another transaction");
+  return run_locked(stmt, params, nullptr, {}, cursor.s_.get());
 }
 
 auto Transaction::execute_window(const Statement& stmt, const std::vector<Value>& params, RowWindow window)
@@ -1760,7 +1875,16 @@ auto Transaction::open_cursor(const Statement& stmt, const std::vector<Value>& p
     state->h = h_.get();
     state->scrolling = scrolling;
     h_->cursors.push_back(state);
-    (void)db_->run(h_->cx, stmt, params, h_->txn, h_->started_us, nullptr, {}, state.get());
+    // The cursor reads the query's twin that also reads the table's key,
+    // when it is a simple scan of one table (docs/cursor_design.md, *WHERE
+    // CURRENT OF*). A query the planner cannot plan with the key keeps its
+    // own plan, and then no WHERE CURRENT OF can name the cursor.
+    const Statement* keyed = &stmt;
+    try {
+      keyed = &db_->prepare_locked(stmt.sql_, true);
+    } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch): the plain plan serves
+    }
+    (void)db_->run(h_->cx, *keyed, params, h_->txn, h_->started_us, nullptr, {}, state.get());
     auto fail_from_txn = [&] {
       std::string message;
       try {
@@ -1914,6 +2038,21 @@ auto plan_fetch(CursorMove m, std::uint64_t p, std::optional<std::uint64_t> tota
 
 }  // namespace
 
+namespace {
+// Removes the key a cursor's query appended to each row (Compiled::key_columns,
+// the trailing values) and returns the last row's: the row the cursor stands on.
+auto take_keys(Rows& rows, std::size_t key_columns) -> std::optional<std::vector<Value>> {
+  if (key_columns == 0 || rows.rows.empty()) return std::nullopt;
+  std::vector<Value> last;
+  for (auto& row : rows.rows) {
+    auto tail = row.end() - static_cast<std::ptrdiff_t>(key_columns);
+    last.assign(std::make_move_iterator(tail), std::make_move_iterator(row.end()));
+    row.erase(tail, row.end());
+  }
+  return last;
+}
+}  // namespace
+
 auto Cursor::fetch(std::uint64_t k) -> Rows {
   if (k == 0) return describe();
   return fetch(CursorMove{CursorMove::Kind::Forward, static_cast<std::int64_t>(std::min<std::uint64_t>(k, CursorMove::kAll))});
@@ -1954,6 +2093,7 @@ auto Cursor::fetch(CursorMove move) -> Rows {
     out.rows = st.holdable() ? st.db->run_held(st, w, out) : st.db->run_pinned(h->cx, h->txn, st, w, out);
     return out;
   };
+  std::optional<std::vector<Value>> new_key;
   try {
     // A run to the end that keeps one row learns the size, once.
     if (needs_total(move) && !st.total) st.total = run(RowWindow{kNoLimit, 1}).position;
@@ -1964,11 +2104,20 @@ auto Cursor::fetch(CursorMove move) -> Rows {
       if (out.end) st.total = out.position;
       rows = std::move(out.rows);
       if (plan.reverse) std::ranges::reverse(rows.rows);
+      new_key = take_keys(rows, st.compiled->key_columns);
     } else {
       rows.columns = st.compiled->columns;
       rows.types = st.compiled->column_types;
     }
-    st.position = st.total ? std::min(plan.target, *st.total + 1) : plan.target;
+    auto before = std::exchange(st.position, st.total ? std::min(plan.target, *st.total + 1) : plan.target);
+    // The cursor stands on the last row it returned, when it stands on a row.
+    if (st.position == 0 || st.after_end()) {
+      st.key.reset();
+    } else if (new_key) {
+      st.key = std::move(new_key);
+    } else if (st.position != before) {
+      st.key.reset();
+    }
     return rows;
   } catch (...) {
     if (st.holdable()) {
