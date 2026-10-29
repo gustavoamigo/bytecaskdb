@@ -2059,3 +2059,7 @@ pg:timestamptz:
   description: the TIMESTAMP WITH TIME ZONE type (timestamptz), in UTC
 pg:char:
   description: the CHAR(n) type, blank-padded
+pg:fetch-move:
+  description: FETCH and MOVE of a cursor, in the directions PostgreSQL has
+pg:cursor-lifetime:
+  description: a cursor's scope, name and error behaviour in a transaction block

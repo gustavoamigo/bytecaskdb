@@ -1,13 +1,15 @@
 # Cursors in the SQL layer
 
-Status: **design, not approved** (written 2026-10-28 for #663, sqltest
-E121; revised the same day for the owner's replay proposal). Phases 1
-(the replay runner, #717) and 2 (pinned state, #718) are built; nothing else is. The owner's direction: a cursor is evaluated lazily; holding the whole
-result in memory is not the design. The first phases build a **replay
-cursor** (the snapshot and a position; each `FETCH` re-runs the plan to its
-position), and a resumable run replaces it later where replay is too slow.
-The decisions that need the owner are listed under *Owner decisions*; the
-phases, with their issues, under *Phases*.
+Status: **design, revised to the owner's decisions of 2026-10-28** (written
+for #663, sqltest E121). Phases 1 (the replay runner, #717), 2 (pinned state,
+#718) and 3 (`DECLARE`, `FETCH` forward, `MOVE`, `CLOSE` in a transaction
+block, #719) are built; nothing else is. The owner's direction: a cursor is
+evaluated lazily; holding the whole result in memory is not the design. The
+first phases build a **replay cursor** (the snapshot and a position; each
+`FETCH` re-runs the plan to its position, with no checkpoint or other
+optimisation until a measurement asks, #731), and a resumable run replaces it
+later where replay is too slow. The decisions still open are listed under
+*Owner decisions*; the phases, with their issues, under *Phases*.
 
 ## What a cursor is here
 
@@ -44,11 +46,11 @@ That decides most of them. Against PostgreSQL 17's rules:
 | e121_17_01_01 | `DECLARE … WITH HOLD` | Passes in PostgreSQL. |
 | e121_04_01_01, e121_08_01_01 | `OPEN c` | Not PostgreSQL. It has no `OPEN` (a `DECLARE` opens), so it is a syntax error there. |
 | e121_10_01_01 to _08 | `FETCH … INTO <table>` | Not PostgreSQL. SQL-level `FETCH` has no `INTO`; the standard's takes host variables, and sqltest names a table. |
-| e121_06_01_01, e121_07_01_01, e121_07_01_02 | `UPDATE`/`DELETE … WHERE CURRENT OF c` | The cursor was never fetched, so it is not positioned on a row: `24000` in PostgreSQL. `DELETE FROM ONLY ( t )` is in PostgreSQL's grammar (`relation_expr`), so far as I know; it is not the obstacle, and phase 2 confirms it with a parse test. |
+| e121_06_01_01, e121_07_01_01, e121_07_01_02 | `UPDATE`/`DELETE … WHERE CURRENT OF c` | The cursor was never fetched, so it is not positioned on a row: `24000` in PostgreSQL. `DELETE FROM ONLY ( t )` is in PostgreSQL's grammar (`relation_expr`), and parses to the tree of `DELETE FROM t` (phase 3's parse test); it is not the obstacle. |
 
-(I did not run the sequences against PostgreSQL, as #663 says; this is from
-its documented rules and grammar. The phase that adds the syntax records each
-case from PostgreSQL 17 before relying on it.)
+(This table is from PostgreSQL's documented rules and grammar. Phase 3's
+cases in `tests/functional/cases/postgresql/cursors.yaml` are recorded from a
+real PostgreSQL, and the ones it makes true are listed in *As built (phase 3)*.)
 
 So with PostgreSQL's semantics kept, **one of the 21 ids can pass**. The
 rest need the layer to accept something PostgreSQL does not. The cheapest
@@ -283,21 +285,21 @@ principle 3), so the bound is per FETCH, not per position:
   a per-server value, and a `FETCH` that needs more is `54000`, "cursor
   position too far to replay", failing the statement as any budget does.
   Every record read and cursor step is charged already, skipped rows
-  included, so no new accounting is needed. The number is decision 7, set
+  included, so no new accounting is needed. The number is decision 8, set
   after phase 1 measures reads per second;
 - the statement timeout and cancel (#684) apply to each run;
 - no cap on the position itself: a cursor over a million-row table is legal
   if its shape is resumable.
 
 **Blocking operators under replay.** Every non-resumable FETCH pays `B`
-again. A bounded **result cache** removes that where the result is small
-(phase 8): the encoded result rows from the front of the result are kept in
+again. A bounded **result cache** would remove that where the result is small
+(phase 8, **parked** by the owner, 2026-10-28; nothing else depends on it,
+and `WITH HOLD` no longer shares its store): the encoded result rows from the front of the result are kept in
 the cursor, up to a byte budget inside the statement memory (proposed 4
-MiB; decision 7). A `FETCH` inside the cached prefix runs nothing. One that
+MiB). A `FETCH` inside the cached prefix runs nothing. One that
 passes it runs, skipping the cached rows, and appends rows while room is
 left. A cursor whose whole result fits is complete after one run: it never
-runs again, which is also exactly what `WITH HOLD` needs (below), so the two
-share one store. It does not help a large result over a sort: the cache is
+runs again. It does not help a large result over a sort: the cache is
 the output, not the sorter, and the sorter is rebuilt for every FETCH past
 the prefix. That case is what the resumable run is for.
 
@@ -440,41 +442,48 @@ cap, which a session adds in phase 7.
 
 ## `WITH HOLD`
 
-A holdable cursor outlives its transaction, so it cannot read the
-transaction's snapshot or overlay. Options:
+Phase 4. A holdable cursor outlives its transaction, so it cannot read the
+transaction's snapshot and overlay as they are at `COMMIT`. Decided
+(2026-10-28): it is **lazy**. It holds the snapshot, never a materialised
+result.
 
-- **Materialise (recommended), at `DECLARE`.** Run the plan to the end into
-  the cursor's result store (the result cache of phase 8, with no byte
-  limit but the statement budget), charged to the statement budget (`54000` past it,
-  never a spill), release the snapshot, and serve every `FETCH` from the
-  store. PostgreSQL does the same at `COMMIT` (it fills a tuplestore from the
-  cursor). Doing it at `DECLARE` keeps a failure where the user can see it: at
-  `COMMIT` a `54000` would end the transaction, and the commit would be a
-  new place to fail. The cost is that `DECLARE … WITH HOLD` reads the whole
-  result and is not lazy. This is the one cursor that is not lazy; it is
-  bounded, and a snapshot is released at once.
-- **Hold the snapshot**, with a cap on held snapshots, a time-to-live and a
-  close at disconnect. The engine's snapshot is a handle on the published
-  tree and the open files. While it lives, every node a write retires that it
-  reaches is parked, and every unlinked data file keeps its disk blocks
-  (engine design, *Read path*, `keydir_nodes_parked`; measured on the MariaDB
-  plugin at 1.1 GB retained for 20 M keys under a write load that touched the
-  whole key space). A hold cursor can live for days. The cap and the TTL are
-  policy the layer would own, and `Snapshot` is move-only, so a hold cursor
-  would need its own or a clone. Deferred, #726, for when a workload needs
-  more than the budget.
-  Under replay it is worse: a held snapshot would be replayed from at
-  whatever position the cursor reaches, days later, over a database that
-  has moved on. The recommendation stands.
-- **Refuse** `WITH HOLD`: loses a feature psycopg and JDBC use for
-  `commit()` in a loop. Rejected.
+- **Hold the snapshot (decided).** The cursor keeps what `DECLARE` pinned: the
+  snapshot, the overlay copy of the transaction's writes at `DECLARE`
+  (phase 2's shared copy-on-write overlay, which survives the commit), the
+  parameters, the clocks and the plan. A `FETCH` after `COMMIT` replays
+  against that view, as any `FETCH` does, so it returns the rows a run at
+  `DECLARE` would have returned, whatever has been committed since. The
+  engine's snapshot is a handle on the published tree and the open files.
+  While it lives, every node a write retires that it reaches is parked, and
+  every unlinked data file keeps its disk blocks (engine design, *Read path*,
+  `keydir_nodes_parked`; measured on the MariaDB plugin at 1.1 GB retained
+  for 20 M keys under a write load that touched the whole key space). A hold
+  cursor can live for days, so this is the cost, and it is real. `Snapshot`
+  is move-only, so the hold cursor needs a snapshot of its own or a clone
+  that outlives the transaction's; phase 4 settles which.
+- **Materialising is rejected.** Reading the whole result into a store at
+  `DECLARE` (or at `COMMIT`, as PostgreSQL does) is not lazy: it costs the
+  whole result's memory and time up front, and a result over the statement
+  budget could not be declared at all. The owner's direction is that holding
+  the result in memory is not the design.
+- **Refuse `WITH HOLD`: rejected.** It loses a feature psycopg and JDBC use
+  for `commit()` in a loop.
 
-A hold cursor declared in a block is materialised at `DECLARE` and its
-`FETCH`es work before and after `COMMIT`. A hold cursor declared in a transaction that rolls back is
-dropped with it, as PostgreSQL drops it; one declared in a transaction that
-commits survives, and so does one declared earlier. It counts against the
-session's cursor limit and the memory cap, and it closes at `CLOSE`,
-disconnect, or the server's shutdown.
+Who bounds the snapshots held is not this document's to set. How many
+snapshots may be pinned, for how long, and what happens at the limit are
+one policy for the session design (#642), covering a long transaction, a
+streaming read and a hold cursor alike. A hold cursor adds no timer and no
+cap of its own; it is a pinned snapshot like any other and falls under that
+policy. Until phase 4, `DECLARE ... WITH HOLD` is `0A000` with a message
+that names phase 4.
+
+A hold cursor declared in a block fetches before and after `COMMIT`. One
+declared in a transaction that rolls back is dropped with it, as PostgreSQL
+drops it; one declared in a transaction that commits survives, and so does
+one declared earlier. It closes at `CLOSE`, disconnect, or the server's
+shutdown. `DECLARE` outside a block is accepted in phase 4 as a hold cursor
+(*Owner decisions*, 1): it declares in a transaction of its own that
+commits at once, and the cursor holds the snapshot of that moment.
 
 ## Limits, lifetime and failure
 
@@ -482,21 +491,24 @@ disconnect, or the server's shutdown.
 |---|---|
 | `COMMIT`, `ROLLBACK` | Non-hold cursors are dropped first (they are data under replay; a resumable run is freed), then the snapshot is released. |
 | A statement or `FETCH` fails | The transaction aborts (`25P02` to follow); its cursors close at the abort, so the snapshot is released at once (`bc_txn_add`'s abort already does). |
-| Idle-in-transaction timeout (`25P03`, #642) | The transaction ends and its cursors with it. This bounds how long a lazy cursor pins a snapshot, with no new timer. |
+| Idle-in-transaction timeout (`25P03`) | Not part of this stack: it is in the separate session stack (#675, #644, #684, #688), and cursors neither build nor depend on it. When it ends a transaction, that is an end like any other and its cursors close with it. |
 | Disconnect, `Terminate`, shutdown | Rolled back with the transaction; hold cursors closed by the session. A suspended run, in phase 10, is freed, not resumed. |
 | Statement timeout, `CancelRequest` | Apply to the `FETCH` running; the cursor is closed with the failed statement. A cancel between FETCHes is a no-op, as for any idle session. |
-| DDL on a table a cursor reads | In a block: DDL is `0A000` (`server_design.md`). In autocommit, DDL commits and a lazy cursor cannot exist outside a block. A hold cursor holds rows, not a table. So no case arises, and the pinned catalog already keeps the layout stable. |
+| DDL on a table a cursor reads | In a block: DDL is `0A000` (`server_design.md`). In autocommit, DDL commits and a lazy cursor cannot exist outside a block. A hold cursor holds its snapshot and the catalog pinned at `DECLARE`, so a later DDL changes nothing for it. So no case arises, and the pinned catalog already keeps the layout stable. |
 | `DROP TABLE` by another session | The cursor's snapshot still reads the table's rows; the cursor is unaffected. |
 
-Limits (numbers are decision 7, #724):
-- open cursors per session; PostgreSQL has no limit, the layer needs one
-  because each cursor pins an overlay copy and a result cache;
-- the replay cap on reads per run (*Bounding it*), and, in phase 10, the
-  suspended runs in the server, bounding stacks as `--max-connections` bounds
-  sessions;
-- every held byte (overlay copies, result caches, hold stores) counts against the server's `--max-memory-bytes` (`53200`, #688),
-  and the session's cursors against one per-session bound, charged when
-  reserved and released at close.
+Limits (numbers are decision 8, #724):
+- **Cursors add no timers or caps of their own.** How many snapshots may be
+  pinned, and for how long, is one policy for the session design (#642), the
+  same for a long transaction, a cursor and a streaming read (decision 7). A
+  cursor is held to it, not given a limit beside it;
+- the replay cap on reads per run (*Bounding it*), a work budget like any
+  statement's, and, in phase 10, the suspended runs in the server, bounding
+  stacks as `--max-connections` bounds sessions;
+- the memory a cursor holds (its overlay copy) is charged to the owning
+  transaction's bound when the cursor is opened and released when it closes
+  (phase 2), and counts against the server's `--max-memory-bytes` (`53200`,
+  #688) as everything else the session holds does.
 
 ## `FETCH`, `MOVE` and `SCROLL`
 
@@ -577,7 +589,7 @@ that table `24000`. The update sees the cursor's row as the transaction
 sees it, writes to the overlay as any statement, and the cursor does not see
 the write (it is insensitive); the phase 2 copy-on-write is what makes this
 safe. Phase 6 records the cases from PostgreSQL 17. It changes the
-planner's result description, so it is decision 5. The cursor keeps the key of its last returned row with its position; a replay recomputes nothing for it.
+planner's result description, so it is decision 6. The cursor keeps the key of its last returned row with its position; a replay recomputes nothing for it.
 
 ## Protocol fit
 
@@ -609,7 +621,76 @@ Streaming has a cost cursors do not: an autocommit `SELECT` keeps its
 snapshot for as long as the client takes to read, pinning what a long
 transaction pins. The statement timeout bounds the read time only if it
 counts the whole statement; how long a slow reader may pin a snapshot is
-decision 6. Neither is built here.
+decision 7. Neither is built here.
+
+## As built (phase 3)
+
+**The parse test.** What `libpg_query` (PostgreSQL 17's parser) gives, read
+from the tree and not assumed:
+
+| Text | Tree |
+|---|---|
+| `DECLARE c … CURSOR [WITH \| WITHOUT HOLD] FOR select` | `DeclareCursorStmt{portalname, options, query: SelectStmt}`. `options` is PostgreSQL's `CURSOR_OPT_*` bits: `BINARY` 0x1, `SCROLL` 0x2, `NO_SCROLL` 0x4, `INSENSITIVE` 0x8, `ASENSITIVE` 0x10, `HOLD` 0x20; 0x100 (fast plan) is always set. The tree has no location for the query, so the text of it is found from the scanner's tokens: after `CURSOR`, an optional `WITH`/`WITHOUT HOLD`, then `FOR`. |
+| `… FOR UPDATE [OF t]` | The `SelectStmt` has a `lockingClause` (`LCS_FORUPDATE`, `lockedRels` for `OF`). |
+| `… FOR READ ONLY` | **Nothing**: the clause is dropped by the grammar and the `SelectStmt` is the one without it. The layer cannot see it and does not need to. |
+| `FETCH [NEXT] [FROM\|IN] c`, `FETCH 4 c`, `FETCH FORWARD [n] c` | `FetchStmt{direction: FORWARD, howMany, portalname, ismove}`. `NEXT`, a bare `FORWARD` and no direction are all `howMany` 1. |
+| `FETCH ALL c`, `FETCH FORWARD ALL c` | FORWARD with `howMany` = `INT64_MAX`. |
+| `FETCH PRIOR c`, `BACKWARD n`, `BACKWARD ALL` | BACKWARD, 1 for `PRIOR`, `INT64_MAX` for `ALL`. |
+| `FETCH FIRST c`, `LAST c`, `ABSOLUTE n c`, `RELATIVE n c` | ABSOLUTE/RELATIVE; `FIRST` is ABSOLUTE 1 and `LAST` ABSOLUTE −1. |
+| `FETCH -2 c` | FORWARD with `howMany` −2: PostgreSQL itself turns that into a backward fetch. |
+| `FETCH 0 c` | FORWARD, `howMany` 0: the current row again. |
+| `MOVE …` | The same `FetchStmt` with `ismove`. |
+| `CLOSE c`, `CLOSE ALL` | `ClosePortalStmt{portalname}`; empty for `ALL`. |
+| `DELETE FROM ONLY ( t )` | The tree of `DELETE FROM ONLY t`: `inh` false on the relation, which the layer already ignores. |
+
+**Statement kind.** A cursor statement names the session's cursor and carries
+no plan, so it is not an `ast::Statement`: the dialect has `ast::parse_cursor`,
+which returns a `DeclareCursor`, `FetchCursor` or `CloseCursor` or nothing,
+and the session runs it, as it runs `BEGIN`. A `DECLARE`'s query is returned
+as text with everything before it blanked (same length, so an error's
+position into the query is a position into the statement) and is prepared as
+the `SELECT` it is, with its parameters. No binder, planner or `Statement`
+change was needed.
+
+**The session** keeps `cursors_`, a map of the block's `Cursor`s
+(`Transaction::open_cursor`). A cursor shares the portals' namespace: a
+`DECLARE` or a `Bind` of a used name is `42P03`. They close at `COMMIT`,
+`ROLLBACK` and an abort (the transaction closes them), and at disconnect. The
+rules, in PostgreSQL's order:
+
+| Statement | Result |
+|---|---|
+| `DECLARE` in a failed block | `25P02` |
+| `DECLARE … WITH HOLD` | `0A000`, names phase 4 |
+| `DECLARE` outside a block | `25P01` |
+| `DECLARE BINARY` | `0A000` |
+| `DECLARE SCROLL … FOR UPDATE` | `0A000`, as PostgreSQL |
+| a name in use | `42P03`, the transaction aborts |
+| `FETCH`/`MOVE` of an unknown name, `CLOSE` of one | `34000` |
+| `FETCH`/`MOVE` forward, a count or `ALL` | the next rows; `FETCH n` and `MOVE n` count the rows |
+| `FETCH 0`, `ABSOLUTE`, `RELATIVE`, `FIRST`, `LAST`, `BACKWARD`, a negative count | `0A000`, names phase 5; a backward one on `NO SCROLL` is `55000` as PostgreSQL |
+| `CLOSE name`, `CLOSE ALL` | `CLOSE CURSOR`, `CLOSE CURSOR ALL` |
+
+A `FETCH` returns its `RowDescription` even with no row, as PostgreSQL does.
+In the extended protocol a `Describe` of a `FETCH` gives the cursor's columns
+if the cursor exists then, and `NoData` otherwise; a `DECLARE` may carry
+parameters through `Bind`. `Execute` of a `FETCH` sends the rows and the tag
+and, as for any portal, a row limit is still `0A000`.
+
+**`FOR UPDATE [OF t]`** is accepted in the dialect for any `SELECT`:
+`OF t` must name a `FROM` item (`42P01` otherwise) and is `FOR UPDATE`. A
+cursor's guards are taken as its rows are fetched (*The replay cursor*,
+`FOR UPDATE`). **`WHERE CURRENT OF`** is phase 6: today the dialect's `WHERE` rejects
+it (`42601`, "WHERE must compare a column"), so a `FOR UPDATE` cursor can be declared and fetched but
+no positioned `UPDATE` or `DELETE` can name it.
+
+**Embedded API.** The embedded API has no SQL `DECLARE`: `Transaction::execute`
+takes the dialect's `Statement`s, and a cursor statement is the session's. Its
+surface is `Transaction::open_cursor` and `Cursor::fetch`, which the session
+calls. The statement kinds are the server's.
+
+**Conformance.** No sqltest id moves: the harness runs outside a block, so
+`DECLARE` is `25P01` there (*What the sqltest ids need*).
 
 ## Tests
 
@@ -650,57 +731,65 @@ interface, so phases 3 to 7 do not change when it lands.
 |---|---|---|---|---|
 | 1 | #717 | **Done.** Replay runner in the runtime: skip count, row limit, stop; resumable-plan flag; determinism and differential tests. The start-key checkpoint is not built (owner direction, 2026-10-28): #731 | none | |
 | 2 | #718 | **Done.** Copy-on-write overlay; pinned parameters, clocks and plan; forward-only `Cursor` in `Transaction` | none | |
-| 3 | #719 | `DECLARE`, `FETCH` forward, `MOVE`, `CLOSE`, `FOR UPDATE` in the dialect and session | none alone | **1** |
-| 4 | #720 | `WITH HOLD` (result store); `DECLARE` outside a block | 8 ids, or 1 | **1, 3** |
+| 3 | #719 | **Done.** `DECLARE`, `FETCH` forward, `MOVE`, `CLOSE`, `FOR READ ONLY`, `FOR UPDATE [OF t]` in the dialect and session, inside a block | none alone | decided |
+| 4 | #720 | `WITH HOLD` by holding the snapshot (lazy); `DECLARE` outside a block, accepted as a hold cursor | 8 ids | decided (1, 3) |
 | 5 | #721 | Every `FETCH` direction, `SCROLL`, `55000` | none | |
 | 6 | #722 | `WHERE CURRENT OF` | none as written | **5** |
-| 7 | #724 | Limits, replay cap, flags, accounting | none | **7** |
-| 8 | #729 | Result cache for small blocking cursors | none | **7** |
+| 7 | #724 | Replay cap, flags, accounting; no cursor-own timers or caps | none | **7** |
+| 8 | #729 | **Parked** (owner, 2026-10-28). Result cache for small blocking cursors | none | |
 | 9 | #716 | Spike: the plan on its own stack | none | **2** |
 | 10 | #730 | Resumable run replaces replay | none | after 9 |
 | 11 | #723 | `Execute` row limit at checkpoint cost, `PortalSuspended`, streamed results | none | **6** |
 
 Phase 4's eight ids are e121_01_01_01 to _04, e121_02_01_01, e121_03_01_01,
-e121_17_01_01 and _02; they need phase 3's syntax and phase 4's hold.
-Phases 3 to 8 need phase 2; 5 and 8 also need phase 1's replay; 11 needs 10.
+e121_17_01_01 and _02; they need phase 3's syntax and phase 4's hold and
+`DECLARE` outside a block. Phase 3 moves no sqltest id: the harness runs
+outside a block. Phases 3 to 7 need phase 2; 5 also needs phase 1's replay;
+11 needs 10.
 
 Risks, by phase: **1** determinism is a property of today's operators, so
 the test is the phase's gate; the start-key substitution must handle prefix
 and reverse scans (a key inside `[lo, hi)`, not past it); **2** the
 transaction's `Overlay` becomes shared, so every place that mutates it goes
 through the clone, and the allocation-fault sweep covers it; **3**
-`libpg_query`'s parse tree for `FOR READ ONLY` and `ONLY ( t )` is assumed,
-not read, and the first thing the phase does is a parse test; **4** the hold
-store's size against the budget; **6** the planner's result description
+`libpg_query`'s parse tree for the cursor statements was assumed; phase 3
+read it (*As built (phase 3)*); **4** the snapshot a hold cursor retains,
+against the session's policy for pinned snapshots; **6** the planner's result description
 gains hidden columns, which `check()` and the schema reference must carry;
 **9** the spike can fail, in which case (c) takes (c′)'s place.
 
 ## Owner decisions
 
-1. **`DECLARE` outside a transaction block.** PostgreSQL: `25P01` unless
-   `WITH HOLD`. Recommended: accept it and make the cursor `WITH HOLD`, a
-   documented known difference. 8 sqltest ids instead of 1. The alternative
-   keeps PostgreSQL exactly and leaves 20 ids marked. (Phases 3, 4.)
-2. **When to build resumable execution.** The owner's order is replay first.
-   Recommended: build phases 1 to 8, measure real cursors, and take phase 9
-   when a measurement, a streaming need (#487) or a large sorted cursor asks.
-   Not codegen re-entrancy. (Phase 9.)
-3. **`WITH HOLD` policy.** Recommended: materialise at `DECLARE`, bounded by
-   the statement budget. Alternatives: hold the snapshot with caps (#726),
-   or refuse. (Phase 4.)
-4. **Syntax PostgreSQL does not have.** `OPEN c` (2 ids: e121_04_01_01,
-   e121_08_01_01) and `FETCH … INTO` (8 ids, e121_10) would be accepted only
-   as extensions. Recommended: neither; leave the 10 ids marked. `WHERE
-   CURRENT OF` on a cursor never fetched stays `24000` (3 ids).
-5. **Hidden key columns in a cursor's plan** for `WHERE CURRENT OF`: a
+Decided on 2026-10-28 (recorded on PR #728):
+
+1. **`DECLARE` outside a transaction block** will be accepted, as a `WITH
+   HOLD` cursor, a documented known difference; that is phase 4. Until then
+   it stays PostgreSQL's `25P01`. 8 sqltest ids instead of 1.
+2. **Replay first, no optimisation.** No checkpoint and no key-directory
+   replay until a measurement asks (#731); resumable execution (phase 9) is
+   taken when a measurement, a streaming need (#487) or a large sorted cursor
+   asks, and not as codegen re-entrancy.
+3. **`WITH HOLD` is lazy.** It holds the snapshot and is never materialised
+   (*`WITH HOLD`*). Phase 4. The bound on pinned snapshots is the session
+   design's one policy (#642), not a cursor limit.
+4. **No syntax PostgreSQL does not have.** `OPEN c` (2 ids: e121_04_01_01,
+   e121_08_01_01) and `FETCH … INTO` (8 ids, e121_10) stay syntax errors; the
+   10 ids stay marked. `WHERE CURRENT OF` on a cursor never fetched stays
+   `24000` (3 ids).
+5. **Phase 8, the result cache, is parked.**
+
+Still open:
+
+6. **Hidden key columns in a cursor's plan** for `WHERE CURRENT OF`: a
    change to the planner's result description and the schema reference.
    (Phase 6.)
-6. **How long a streaming read may pin a snapshot.** (Phase 11.)
-7. **The numbers:** open cursors per session (proposed 16); the replay cap on
-   reads per `FETCH` (set after phase 1 measures reads per second); the
-   result cache size per cursor (proposed 4 MiB); and, for phase 10, the
-   suspended runs per server and the stack reservation (proposed 256 KiB).
-   (Phases 7, 8.)
+7. **How long a streaming read may pin a snapshot.** (Phase 11.) It belongs
+   to the same pinned-snapshot policy as decision 3.
+8. **The numbers:** the replay cap on reads per `FETCH` (set after phase 1
+   measures reads per second); and, for phase 10, the suspended runs per
+   server and the stack reservation (proposed 256 KiB). The open-cursors
+   bound and the result cache size of earlier drafts are gone: cursors take
+   no cap of their own, and the cache is parked. (Phase 7.)
 
 ## Deferred
 
@@ -722,7 +811,10 @@ gains hidden columns, which `check()` and the schema reference must carry;
   statement budget.
 - A sort or hash a cursor needs is built within the statement budget at
   every run that reaches it, never spilled.
-- `WITH HOLD` reads the whole result at `DECLARE`, not at `COMMIT`.
-- `DECLARE` outside a block opens a hold cursor, if decision 1 goes as
-  recommended.
-- A bound on cursors per session.
+- A `WITH HOLD` cursor holds its snapshot, where PostgreSQL copies the rows
+  at `COMMIT` (phase 4; `0A000` until then).
+- `DECLARE` outside a block opens a hold cursor, where PostgreSQL says
+  `25P01` (phase 4; `25P01` until then, decision 1).
+- `FOR UPDATE OF t` locks the one table the query reads, which is all
+  `FOR UPDATE` of a single-table `SELECT` can name.
+- `SCROLL` with `FOR UPDATE` is `0A000`, as PostgreSQL's.

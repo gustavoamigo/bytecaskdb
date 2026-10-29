@@ -1,0 +1,404 @@
+# Cursors inside a transaction block (docs/cursor_design.md): DECLARE, FETCH,
+# MOVE and CLOSE, forward only. The directions, WITH HOLD and WHERE CURRENT OF
+# are later phases: their cases are recorded and marked unimplemented.
+
+- name: DECLARE, FETCH forward and CLOSE
+  features: [E121-01, E121-08, pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+    - INSERT INTO t VALUES (5, 50)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT id, v FROM t ORDER BY id
+    - sql: FETCH c
+      expected: [[1, 10]]
+      ordered: true
+    - sql: FETCH NEXT FROM c
+      expected: [[2, 20]]
+      ordered: true
+    - sql: FETCH 2 IN c
+      expected: [[3, 30], [4, 40]]
+      ordered: true
+    - sql: FETCH FORWARD 1 c
+      expected: [[5, 50]]
+      ordered: true
+    - sql: FETCH c
+      expected: []
+      ordered: true
+    - sql: FETCH ALL FROM c
+      expected: []
+      ordered: true
+    - sql: CLOSE c
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: FETCH ALL, and a FETCH past the end returns no row
+  features: [E121-01, pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 2 FROM c
+      expected: [[1], [2]]
+      ordered: true
+    - sql: FETCH FORWARD ALL FROM c
+      expected: [[3]]
+      ordered: true
+    - sql: FETCH 5 FROM c
+      expected: []
+    - sql: FETCH c
+      expected: []
+    - sql: FETCH ALL c
+      expected: []
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: MOVE skips rows and reports how many
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: MOVE 2 IN c
+      rowcount: 2
+    - sql: FETCH c
+      expected: [[3]]
+      ordered: true
+    - sql: MOVE FORWARD ALL IN c
+      rowcount: 1
+    - sql: MOVE c
+      rowcount: 0
+    - sql: FETCH c
+      expected: []
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: two cursors are read in turn
+  features: [E121-01, pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE a CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: DECLARE b CURSOR FOR SELECT v FROM t ORDER BY id DESC
+    - sql: FETCH a
+      expected: [[1]]
+      ordered: true
+    - sql: FETCH b
+      expected: [[30]]
+      ordered: true
+    - sql: FETCH 2 a
+      expected: [[2], [3]]
+      ordered: true
+    - sql: FETCH a
+      expected: []
+    - sql: FETCH ALL b
+      expected: [[20], [10]]
+      ordered: true
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a cursor does not see writes made after DECLARE
+  features: [E121-01, pg:cursor-lifetime]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO t VALUES (0, 5)
+      rowcount: 1
+    - sql: DECLARE c CURSOR FOR SELECT id, v FROM t ORDER BY id
+    - sql: UPDATE t SET v = 99 WHERE id = 1
+      rowcount: 1
+    - sql: DELETE FROM t WHERE id = 2
+      rowcount: 1
+    - sql: INSERT INTO t VALUES (4, 40)
+      rowcount: 1
+    - sql: FETCH 2 FROM c
+      expected: [[0, 5], [1, 10]]
+      ordered: true
+    - sql: DELETE FROM t
+      rowcount: 4
+    - sql: FETCH ALL FROM c
+      expected: [[2, 20], [3, 30]]
+      ordered: true
+    - sql: SELECT id FROM t
+      expected: []
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a cursor is closed by COMMIT
+  features: [pg:cursor-lifetime]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT id FROM t
+    - sql: COMMIT
+    - sql: FETCH c
+      error: "34000"
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT id FROM t
+    - sql: FETCH c
+      expected: [[1]]
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a cursor is closed by ROLLBACK
+  features: [pg:cursor-lifetime]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT id FROM t
+    - sql: ROLLBACK
+    - sql: BEGIN
+    - sql: FETCH c
+      error: "34000"
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: CLOSE a cursor, CLOSE ALL, and an unknown name
+  features: [E121-08, pg:cursor-lifetime]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE a CURSOR FOR SELECT id FROM t
+    - sql: DECLARE b CURSOR FOR SELECT id FROM t
+    - sql: CLOSE a
+    - sql: DECLARE a CURSOR FOR SELECT v FROM t
+    - sql: FETCH a
+      expected: [[10]]
+    - sql: CLOSE ALL
+    - sql: CLOSE ALL
+    - sql: CLOSE b
+      error: "34000"
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a name in use is 42P03, and the transaction is then aborted
+  features: [pg:cursor-lifetime]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT id FROM t
+    - sql: DECLARE c CURSOR FOR SELECT v FROM t
+      error: "42P03"
+    - sql: FETCH c
+      error: "25P02"
+    - sql: DECLARE d CURSOR FOR SELECT id FROM t
+      error: "25P02"
+    - sql: CLOSE c
+      error: "25P02"
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: DECLARE outside a transaction block is 25P01
+  features: [pg:cursor-lifetime]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: DECLARE c CURSOR FOR SELECT id FROM t
+      error: "25P01"
+    - sql: FETCH c
+      error: "34000"
+    - sql: CLOSE c
+      error: "34000"
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a failed FETCH or DECLARE aborts the block
+  features: [pg:cursor-lifetime]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: BEGIN
+    - sql: FETCH nothing
+      error: "34000"
+    - sql: SELECT id FROM t
+      error: "25P02"
+    - sql: ROLLBACK
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT id FROM nope
+      error: "42P01"
+    - sql: FETCH c
+      error: "25P02"
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: FOR READ ONLY, FOR UPDATE and SCROLL options
+  features: [E121-01, pg:cursor-lifetime]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE a INSENSITIVE CURSOR FOR SELECT id FROM t ORDER BY id FOR READ ONLY
+    - sql: DECLARE b NO SCROLL CURSOR FOR SELECT id FROM t ORDER BY id FOR UPDATE
+    - sql: DECLARE c CURSOR FOR SELECT id FROM t ORDER BY id FOR UPDATE OF t
+    - sql: FETCH a
+      expected: [[1]]
+    - sql: FETCH b
+      expected: [[1]]
+    - sql: FETCH c
+      expected: [[1]]
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a SCROLL cursor FOR UPDATE is refused
+  features: [pg:cursor-lifetime]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c SCROLL CURSOR FOR SELECT id FROM t FOR UPDATE
+      error: "0A000"
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: FOR UPDATE OF a table the query does not read
+  features: [pg:cursor-lifetime]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT id FROM t FOR UPDATE OF u
+      error: "42P01"
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a NO SCROLL cursor refuses a backward fetch
+  features: [pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c NO SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 2 FROM c
+      expected: [[1], [2]]
+      ordered: true
+    - sql: FETCH PRIOR FROM c
+      error: "55000"
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: FETCH in every other direction
+  features: [pg:fetch-move]
+  # phase 5 of docs/cursor_design.md: backward, absolute and relative fetches
+  unimplemented: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+    - INSERT INTO t VALUES (4, 40)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH LAST FROM c
+      expected: [[4]]
+      ordered: true
+    - sql: FETCH PRIOR FROM c
+      expected: [[3]]
+      ordered: true
+    - sql: FETCH ABSOLUTE 2 FROM c
+      expected: [[2]]
+      ordered: true
+    - sql: FETCH RELATIVE 1 FROM c
+      expected: [[3]]
+      ordered: true
+    - sql: FETCH BACKWARD 2 FROM c
+      expected: [[2], [1]]
+      ordered: true
+    - sql: FETCH FIRST FROM c
+      expected: [[1]]
+      ordered: true
+    - sql: FETCH 0 FROM c
+      expected: [[1]]
+      ordered: true
+    - sql: FETCH BACKWARD ALL FROM c
+      expected: []
+      ordered: true
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a WITH HOLD cursor outlives its transaction
+  features: [E121-17, pg:cursor-lifetime]
+  # phase 4 of docs/cursor_design.md
+  unimplemented: true
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR WITH HOLD FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH c
+      expected: [[1]]
+      ordered: true
+    - sql: COMMIT
+    - sql: FETCH c
+      expected: [[2]]
+      ordered: true
+    - sql: CLOSE c
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
