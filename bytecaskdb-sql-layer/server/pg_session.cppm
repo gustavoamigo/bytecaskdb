@@ -369,12 +369,11 @@ struct Prepared {
   std::optional<ast::CursorStatement> cursor;  // Cursor
 };
 
-// A session's cursor, and whether DECLARE said NO SCROLL. A hold cursor
+// A session's cursor. A hold cursor
 // (WITH HOLD, or any DECLARE outside a block) outlives the transaction it was
 // declared in; the others are the transaction's.
 struct SessionCursor {
   Cursor cursor;
-  bool no_scroll{false};
   bool hold{false};
 };
 
@@ -897,27 +896,24 @@ private:
   // always a hold cursor, taken on the snapshot of that moment.
   auto declare_cursor(const ast::DeclareCursor& d, const Statement& stmt, const std::vector<Value>& params) -> Cursor {
     auto kind = d.hold || !in_block_ ? Holdability::Hold : Holdability::Plain;
-    if (in_block_) return txn_->open_cursor(stmt, params, kind);
-    if (implicit_) return implicit_->open_cursor(stmt, params, kind);
+    auto scrolling = d.scroll == ast::DeclareCursor::Scroll::NoScroll ? Scrolling::ForwardOnly : Scrolling::Any;
+    if (in_block_) return txn_->open_cursor(stmt, params, kind, scrolling);
+    if (implicit_) return implicit_->open_cursor(stmt, params, kind, scrolling);
     auto t = db_.begin();
-    auto cursor = t.open_cursor(stmt, params, kind);
+    auto cursor = t.open_cursor(stmt, params, kind, scrolling);
     (void)t.commit();
     return cursor;
   }
 
-  // The rows a FETCH of `f` takes from `c`: how many, for a forward fetch.
-  // Backward and absolute fetches are phase 5 (docs/cursor_design.md).
-  static auto forward_count(const ast::FetchCursor& f, const SessionCursor& c) -> std::uint64_t {
+  static auto move_of(const ast::FetchCursor& f) -> CursorMove {
     using Direction = ast::FetchCursor::Direction;
-    auto verb = std::string{f.move ? "MOVE" : "FETCH"};
-    auto backward = f.direction == Direction::Backward || (f.direction == Direction::Forward && f.count < 0);
-    if (backward && c.no_scroll) throw SessionError("cursor can only scan forward", "55000");
-    if (f.direction == Direction::Absolute || f.direction == Direction::Relative || backward ||
-        (f.direction == Direction::Forward && f.count == 0)) {
-      throw SessionError(verb + " in this direction is not supported yet (phase 5 of docs/cursor_design.md); only NEXT, a count, FORWARD n and ALL are",
-                         "0A000");
+    switch (f.direction) {
+      case Direction::Forward: return {CursorMove::Kind::Forward, f.count};
+      case Direction::Backward: return {CursorMove::Kind::Backward, f.count};
+      case Direction::Absolute: return {CursorMove::Kind::Absolute, f.count};
+      case Direction::Relative: return {CursorMove::Kind::Relative, f.count};
     }
-    return static_cast<std::uint64_t>(f.count);
+    return {};
   }
 
   // DECLARE, FETCH, MOVE or CLOSE inside the block. A failure here fails the
@@ -933,14 +929,15 @@ private:
         throw SessionError("cursor \"" + d->name + "\" already exists", "42P03");
       }
       enter_statement(*stmt);
-      cursors_.emplace(d->name, SessionCursor{declare_cursor(*d, *stmt, params),
-                                              d->scroll == ast::DeclareCursor::Scroll::NoScroll,
-                                              d->hold || !in_block_});
+      cursors_.emplace(d->name, SessionCursor{declare_cursor(*d, *stmt, params), d->hold || !in_block_});
       out.tag = "DECLARE CURSOR";
     } else if (const auto* f = std::get_if<ast::FetchCursor>(&c)) {
       auto& cursor = find_cursor(f->name);
-      auto k = forward_count(*f, cursor);
-      out.rows = cursor.cursor.fetch(k);
+      try {
+        out.rows = cursor.cursor.fetch(move_of(*f));
+      } catch (const CursorForwardOnly& e) {
+        throw SessionError(e.what(), "55000");
+      }
       out.returns_rows = !f->move;
       out.tag = (f->move ? "MOVE " : "FETCH ") + std::to_string(out.rows.rows.size());
       if (f->move) out.rows.rows.clear();
@@ -964,7 +961,7 @@ private:
   auto cursor_columns(const std::string& name) -> std::optional<std::vector<ResultColumn>> {
     auto it = cursors_.find(name);
     if (it == cursors_.end() || !it->second.cursor.is_open()) return std::nullopt;
-    return result_columns(it->second.cursor.fetch(0));
+    return result_columns(it->second.cursor.describe());
   }
 
   static auto result_columns(const Rows& rows) -> std::vector<ResultColumn> {
