@@ -1467,3 +1467,122 @@ TEST_CASE("search: COUNT(*), MIN and MAX of one group are answered from the rang
     CHECK(has(plan(sql), "while ("));
   }
 }
+
+namespace {
+
+// How many times `needle` is in `text`.
+auto occurrences(const std::string& text, std::string_view needle) -> std::size_t {
+  std::size_t n = 0;
+  for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + needle.size())) ++n;
+  return n;
+}
+
+}  // namespace
+
+TEST_CASE("search: a join of three tables is planned in any order the costs choose, each table by its own access",
+          "[sql][search][cost][join]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"u", {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateTableDdl{"w", {Fixture::col("j", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"j"}});
+  const auto& cat = f.cat();
+  const std::string sql = "SELECT t.id, u.k, w.j FROM t, u, w WHERE t.name = $1 AND u.k = t.qty AND w.j = u.v";
+  // t by its index on name, then u and w each by the whole key from the row before it: three loops' worth of
+  // lookups, one loop.
+  auto keyed = plan_sql(cat, sql, {{"t", 100}, {"u", 100}, {"w", 100}});
+  CHECK(keyed.source.find("bc_hash") == std::string::npos);
+  CHECK(occurrences(keyed.source, "bc_scan_open(") == 1);
+  CHECK(has(keyed, "TBL_4"));
+  CHECK(has(keyed, "TBL_6"));
+  // Every plan the search costed reads the three tables, and none holds two hash tables.
+  const std::string by_columns = "SELECT t.id, u.k, w.j FROM t, u, w WHERE t.qty = u.v AND u.v = w.v";
+  auto b = bound::bind(ast::parse(by_columns), cat);
+  auto all = generate_alternatives(std::move(b), cat, by_columns, [](const Table&) -> std::optional<std::uint64_t> { return 1000; });
+  REQUIRE(all.size() > 3);
+  for (const auto& g : all) {
+    INFO(g.source);
+    CHECK(occurrences(g.source, "bc_hash_open(") <= 1);
+    CHECK(has(g, "TBL_1"));
+    CHECK(has(g, "TBL_4"));
+    CHECK(has(g, "TBL_6"));
+  }
+  // One of them hashes a table and reads the third once per row of the pairs.
+  CHECK(std::ranges::any_of(all, [](const GeneratedPlan& g) { return occurrences(g.source, "bc_hash_open(") == 1; }));
+}
+
+TEST_CASE("search: a chain of left joins is planned in FROM order, each right table under the rows before it",
+          "[sql][search][join][outer]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"u", {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateTableDdl{"w", {Fixture::col("j", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"j"}});
+  const auto& cat = f.cat();
+  const std::string sql = "SELECT t.id, u.k, w.j FROM t LEFT JOIN u ON u.k = t.qty LEFT JOIN w ON w.j = u.v";
+  // Every plan the search costed has the same order, and a row of NULLs for each right table.
+  auto b = bound::bind(ast::parse(sql), cat);
+  auto all = generate_alternatives(std::move(b), cat, sql, [](const Table&) -> std::optional<std::uint64_t> { return 1000; });
+  REQUIRE_FALSE(all.empty());
+  for (const auto& g : all) {
+    INFO(g.source);
+    CHECK(occurrences(g.source, "bc_null_row(") == 2);
+    CHECK(g.source.find("bc_hash") == std::string::npos);  // a left join's right side is never hashed
+    CHECK(g.source.find("COL_1_0") < g.source.find("COL_4_0"));
+    CHECK(g.source.find("COL_4_0") < g.source.find("COL_6_0"));
+  }
+  // u is a primary key looked up from t, and w from u: a key from a row the first join may have NULL-extended
+  // is a miss, tested before it is read.
+  const auto& plan = all[0].source;
+  CHECK(has(all[0], "bc_col_null(cx, row1, COL_4_1)"));
+  // An inner join after an outer one is not outer: no row of NULLs for it.
+  const std::string inner = "SELECT t.id, u.k, w.j FROM t LEFT JOIN u ON u.k = t.qty JOIN w ON w.j = u.v";
+  auto mixed = plan_sql(cat, inner, {{"t", 1000}, {"u", 1000}, {"w", 1000}});
+  CHECK(occurrences(mixed.source, "bc_null_row(") == 1);
+  (void)plan;
+}
+
+TEST_CASE("search: a predicate over the columns of two tables filters the pairs where the last of them is read",
+          "[sql][search][join]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"u", {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  const auto& cat = f.cat();
+  // NOT (a = b) over t and u: not a key of either, so u is read once per row of t, the pair tested.
+  auto g = plan_sql(cat, "SELECT t.id, u.k FROM t JOIN u ON NOT (t.qty = u.v) WHERE t.name = $1");
+  CHECK(has(g, "bc_col_i64(cx, row, COL_1_2)"));
+  CHECK(has(g, "bc_col_i64(cx, row1, COL_4_1)"));
+  CHECK(has(g, "bc_emit_col(cx, row1, COL_4_0);"));
+  // In an outer join's ON, the pair is a match: no pair, a row of NULLs.
+  auto outer = plan_sql(cat, "SELECT t.id, u.k FROM t LEFT JOIN u ON u.k = t.qty AND (t.id < u.v OR u.v IS NULL)");
+  CHECK(has(outer, "bc_null_row("));
+  // A predicate over a DOUBLE column is refused, as any filter on one is.
+  f.ddl(CreateTableDdl{"d", {Fixture::col("k", PhysType::I64, false), Fixture::col("x", PhysType::F64, true)}, {"k"}});
+  f.ddl(CreateTableDdl{"e", {Fixture::col("k", PhysType::I64, false), Fixture::col("y", PhysType::F64, true)}, {"k"}});
+  auto refused = [&](std::string_view sql) {
+    try {
+      (void)plan_sql(f.cat(), sql);
+    } catch (const ast::FeatureNotSupported& e) {
+      return std::string{e.what()};
+    }
+    return std::string{"accepted"};
+  };
+  CHECK(refused("SELECT d.k FROM d JOIN e ON NOT (d.x = e.y)").starts_with("no plan: a filter on column"));
+}
+
+TEST_CASE("search: a table read twice has an instance for each use, and the plan names the table's ids once",
+          "[sql][search][join]") {
+  sql_test::Fixture f;
+  const auto& cat = f.cat();
+  auto g = plan_sql(cat, "SELECT x.id, y.id FROM t x JOIN t y ON x.qty < y.id WHERE x.name = $1");
+  INFO(g.source);
+  // x is read by the table's index on name, y by a scan of the table's rows; the constants of each are named by
+  // its own id and stand for the one table's.
+  CHECK(has(g, "COL_1073741824_0 = 0"));
+  CHECK(has(g, "COL_1073741824_2 = 2"));
+  CHECK(has(g, "TBL_1073741825 = 1"));
+  CHECK(has(g, "COL_1073741825_0 = 0"));
+  // The index is the table's, whichever use reads it.
+  CHECK(occurrences(g.source, "IDX_3 = 3") == 1);
+  // The header says whose rows they are: the instance is named as the query names it.
+  CHECK(has(g, "TBL_1073741825 y"));
+  CHECK(has(g, "COL_1073741824_0 x.id"));
+}

@@ -1015,7 +1015,7 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
         std::pair<std::string, std::int32_t>{"column reference \"qty\" is ambiguous", 7});
   CHECK(rejected(cat, "SELECT v.qty FROM t, u WHERE id = $1").first == "missing FROM-clause entry for table \"v\"");
   CHECK(rejected(cat, "SELECT v.qty FROM t WHERE id = $1").first == "missing FROM-clause entry for table \"v\"");
-  CHECK(rejected(cat, "SELECT id FROM t, t WHERE id = $1").first == "a table joined with itself is not supported");
+  CHECK(rejected(cat, "SELECT id FROM t, t WHERE id = $1").first == "table name \"t\" specified more than once");
   CHECK(rejected(cat, "SELECT id FROM t, u WHERE id = $1 AND k = $2 FOR UPDATE").first ==
         "FOR UPDATE on a join is not supported yet");
   {
@@ -1036,7 +1036,16 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
         "column reference \"qty\" is ambiguous");
   CHECK(rejected(cat, "SELECT id FROM t, u WHERE t.id = t.qty").first ==
         "comparing two columns of one table is not supported yet");
-  CHECK(rejected(cat, "SELECT id FROM t, u WHERE id < k").first == "a join compares two columns with = only yet");
+  {
+    // Any comparison of a column of each table joins them, as = does.
+    auto b = bind_sql(cat, "SELECT id FROM t, u WHERE id < k");
+    logical::rewrite(root(b));
+    const auto& on = get<logical::Join>(b).predicate;
+    REQUIRE(on.size() == 1);
+    CHECK(on[0].op == ast::Compare::Op::Lt);
+    CHECK(on[0].args[0].col.table == cat.table("t")->id);
+    CHECK(on[0].args[1].col.table == cat.table("u")->id);
+  }
   CHECK(rejected(cat, "SELECT id FROM t, u WHERE name = k").first ==
         "comparing name (bytea) with k (bigint) is not supported: a join compares columns of one type");
   CHECK(rejected(cat, "SELECT u.qty, count(*) FROM t, u WHERE id = k").first ==
@@ -1296,4 +1305,128 @@ TEST_CASE("binder: GROUP BY, HAVING and the aggregates, as PostgreSQL binds them
         "HAVING on an aggregate of a double precision column is not supported yet");
   CHECK(rejected(cat, "SELECT a FROM g GROUP BY a HAVING avg(a) > $1").first == "HAVING on AVG is not supported yet");
   CHECK(rejected(cat, "SELECT a FROM g GROUP BY a + 1").first == "GROUP BY takes columns");
+}
+
+TEST_CASE("binder: a chain of joins is a left-deep tree, each ON bound against the tables before it", "[sql][binder][join]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE u (k BIGINT PRIMARY KEY, qty BIGINT)").stmt));
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE w (j BIGINT PRIMARY KEY, qty BIGINT)").stmt));
+  const auto& cat = f.cat();
+  auto tables_of = [](const logical::Node& n) {
+    std::vector<std::string> out;
+    std::function<void(const logical::Node&)> walk = [&](const logical::Node& x) {
+      if (const auto* g = std::get_if<logical::Get>(&x.op)) out.push_back(g->table->name);
+      if (const auto* j = std::get_if<logical::Join>(&x.op)) {
+        walk(*j->left);
+        walk(*j->right);
+      }
+      if (const auto* in = logical::input_of(x); in != nullptr && *in) walk(**in);
+    };
+    walk(n);
+    return out;
+  };
+  {
+    // ((t, u), w): the second Join's left side is the first.
+    auto b = bind_sql(cat, "SELECT t.id FROM t JOIN u ON t.qty = u.qty JOIN w ON u.qty = w.qty");
+    const auto& top = get<logical::Join>(b);
+    REQUIRE(std::holds_alternative<logical::Join>(top.left->op));
+    CHECK(std::get<logical::Get>(top.right->op).table->name == "w");
+    CHECK(tables_of(root(b)) == std::vector<std::string>{"t", "u", "w"});
+    // Both ONs are inner: they sit with the WHERE's conjuncts, in order, above the tables.
+    CHECK(get<logical::Filter>(b).conjuncts.size() == 2);
+    CHECK_FALSE(top.left_outer);
+    // Pushdown puts each on the join that has both its tables.
+    logical::rewrite(root(b));
+    const auto& pushed = get<logical::Join>(b);
+    CHECK(pushed.predicate.size() == 1);
+    CHECK(std::get<logical::Join>(pushed.left->op).predicate.size() == 1);
+  }
+  {
+    // A comma list is the same tree, its conditions the WHERE's.
+    auto b = bind_sql(cat, "SELECT t.id FROM t, u, w WHERE t.qty = u.qty AND u.qty < w.qty");
+    CHECK(tables_of(root(b)) == std::vector<std::string>{"t", "u", "w"});
+    logical::rewrite(root(b));
+    const auto& top = get<logical::Join>(b);
+    REQUIRE(top.predicate.size() == 1);
+    CHECK(top.predicate[0].op == ast::Compare::Op::Lt);
+  }
+  {
+    // An outer join keeps its ON; the NULL-extended table's columns are NULL-able above it, and in the ON
+    // of every later join, whatever the catalog declares: u.k is a primary key.
+    auto b = bind_sql(cat, "SELECT u.k, w.j FROM t LEFT JOIN u ON u.k = t.qty LEFT JOIN w ON u.k = w.j WHERE u.k > $1");
+    const auto& top = get<logical::Join>(b);
+    CHECK(top.left_outer);
+    REQUIRE(top.predicate.size() == 1);
+    CHECK(top.predicate[0].args[0].col.table == cat.table("u")->id);
+    CHECK(top.predicate[0].args[0].col.nullable);  // read from a row the first join may have NULL-extended
+    CHECK_FALSE(top.predicate[0].args[1].col.nullable);  // w's own row
+    const auto& first = std::get<logical::Join>(top.left->op);
+    CHECK(first.left_outer);
+    CHECK_FALSE(first.predicate[0].args[0].col.nullable);  // u in its own ON reads real rows
+    const auto& selected = get<logical::Project>(b).exprs;
+    CHECK(selected[0].expr.col.nullable);
+    CHECK(selected[1].expr.col.nullable);
+    CHECK(get<logical::Filter>(b).conjuncts[0].args[0].col.nullable);
+  }
+  {
+    // An inner join after an outer one is inner; the ON's columns of the outer join's right table are NULL-able.
+    auto b = bind_sql(cat, "SELECT t.id FROM t LEFT JOIN u ON t.qty = u.qty JOIN w ON u.k = w.j");
+    const auto& top = get<logical::Join>(b);
+    CHECK_FALSE(top.left_outer);
+    CHECK(std::get<logical::Join>(top.left->op).left_outer);
+    CHECK(get<logical::Filter>(b).conjuncts[0].args[0].col.nullable);
+  }
+  // The names an ON may use, and what is not taken yet.
+  CHECK(rejected(cat, "SELECT t.id FROM t JOIN u ON t.qty = w.qty JOIN w ON u.qty = w.qty").first ==
+        "missing FROM-clause entry for table \"w\"");
+  CHECK(rejected(cat, "SELECT t.id FROM t RIGHT JOIN u ON t.qty = u.qty JOIN w ON u.qty = w.qty").first ==
+        "a RIGHT JOIN of more than two tables is not supported yet");
+  CHECK(rejected(cat, "SELECT t.id FROM t JOIN u ON t.qty = u.qty NATURAL JOIN w").first ==
+        "USING or NATURAL after the first join is not supported yet");
+  CHECK(rejected(cat, "SELECT t.id FROM t JOIN u USING (qty) JOIN w USING (qty)").first ==
+        "USING or NATURAL after the first join is not supported yet");
+  CHECK(rejected(cat, "SELECT qty FROM t JOIN u ON t.qty = u.qty JOIN w ON u.qty = w.qty").first ==
+        "column reference \"qty\" is ambiguous");
+  // The first join's USING column is the left table's, unless a third table has the name.
+  CHECK(rejected(cat, "SELECT qty FROM t JOIN u USING (qty) JOIN w ON w.j = t.id").first ==
+        "column reference \"qty\" is ambiguous");
+  CHECK_NOTHROW(bind_sql(cat, "SELECT * FROM t JOIN u USING (qty) JOIN w ON w.j = t.id"));
+}
+
+TEST_CASE("binder: a table read twice is two instances of it, named as the query names them", "[sql][binder][join]") {
+  sql_test::Fixture f;
+  const auto& cat = f.cat();
+  const auto id = cat.table("t")->id;
+  auto b = bind_sql(cat, "SELECT x.id, y.qty FROM t x JOIN t y ON x.id = y.qty");
+  const auto& join = get<logical::Join>(b);
+  const auto& left = *std::get<logical::Get>(join.left->op).table;
+  const auto& right = *std::get<logical::Get>(join.right->op).table;
+  // Each use named by an alias is an instance with an id of its own, above every object's, that reads the
+  // table's rows (Table::source).
+  CHECK(left.name == "x");
+  CHECK(right.name == "y");
+  CHECK(left.id != right.id);
+  CHECK(left.id >= Table::kInstanceBase);
+  CHECK(right.id >= Table::kInstanceBase);
+  CHECK(left.storage_id() == id);
+  CHECK(right.source == id);
+  // The columns of each use are its own, so a plan can tell them apart.
+  const auto& targets = get<logical::Project>(b).exprs;
+  CHECK(targets[0].expr.col.table == left.id);
+  CHECK(targets[1].expr.col.table == right.id);
+  // The bound statement owns the instances the plan names.
+  CHECK(b.instances.size() == 2);
+  // A table named by its own name is the catalog's table, when it is the first use.
+  auto c = bind_sql(cat, "SELECT t.id FROM t JOIN t y ON t.id = y.id");
+  CHECK(std::get<logical::Get>(get<logical::Join>(c).left->op).table->id == id);
+  CHECK(std::get<logical::Get>(get<logical::Join>(c).right->op).table->id >= Table::kInstanceBase);
+  // A parameter compared with a column of an instance is checked against the table the rows are in.
+  auto d = bind_sql(cat, "SELECT x.id FROM t x JOIN t y ON x.id = y.id WHERE y.qty = $1");
+  REQUIRE(d.param_table.size() == 1);
+  CHECK(d.param_table[0] == id);
+  // Three uses are three instances.
+  auto e = bind_sql(cat, "SELECT 1 FROM t a, t b, t c WHERE a.id = b.id AND b.id = c.id");
+  CHECK(e.instances.size() == 3);
+  auto g = bind_sql(cat, "SELECT t.id FROM t JOIN t y ON t.id = y.id");
+  CHECK(g.instances.size() == 1);
 }

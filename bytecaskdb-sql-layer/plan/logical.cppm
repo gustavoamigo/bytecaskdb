@@ -34,9 +34,11 @@ export namespace bytecask::sql::logical {
 
 using Op = ast::Compare::Op;
 
-// A column of one of the statement's tables. A self-join is refused, so the
-// table names the operand. Its physical type and nullability are the
-// catalog's, so codegen never reads the catalog.
+// A column of one of the statement's tables, named by the table's id. A table
+// read twice is two tables, an instance (Table::source) for each use, so the
+// id names the use. Its physical type and nullability are the catalog's, but
+// for a column of a table an outer join may NULL-extend, which the binder
+// marks nullable, so codegen never reads the catalog.
 struct ColumnRef {
   std::uint32_t table{0};
   std::uint32_t col{0};
@@ -193,7 +195,8 @@ struct Project {
 // The inner join: the pairs for which every conjunct of the predicate is
 // true. Left outer: those, and each row of `left` none pairs with, once,
 // with `right`'s columns NULL; the predicate is its ON, which decides the
-// pairs, never which rows of `left` there are.
+// pairs, never which rows of `left` there are. A join of several tables is
+// left-deep: `left` is the join of the tables before, `right` one table.
 struct Join {
   NodePtr left, right;
   std::vector<Expr> predicate;

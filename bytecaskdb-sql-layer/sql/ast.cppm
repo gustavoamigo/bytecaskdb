@@ -120,7 +120,7 @@ struct Compare {
   Op op;
   Expr lhs, rhs;
   std::int32_t pos{-1};
-  bool on{false};  // a JOIN's ON conjunct, not the WHERE's
+  std::uint32_t on{0};  // 0: the WHERE's; k: the ON conjunct of Select::from[k]
   Kind kind{Kind::Compare};
   std::vector<Compare> args;  // And, Or: two or more; Not: one
   std::optional<std::string> escape;  // Like: ESCAPE's string; none for the default, a backslash
@@ -245,29 +245,44 @@ struct OrderItem {
 
 struct SetOperation;
 
+// How a FROM item joins the ones before it: LEFT keeps every row of the
+// items before it, RIGHT every row of the item (two items only), each joined
+// to NULLs where no row of the other matches.
+enum class JoinKind { Inner, Left, Right };
+
+// A FROM item: a table or view, and how it joins the items before it. A
+// comma is an inner join with no ON. USING (…) or NATURAL compare the
+// columns the two sides share by =, each named alone as one column;
+// `using_alias` names them too: USING (…) AS alias.
+struct FromItem {
+  std::string table;
+  // The name the query gives the item. The parser has rewritten every
+  // qualifier that names an alias to its table, so the alias stays only for a
+  // query that names one table twice, where it tells the two apart.
+  std::string alias;
+  std::int32_t pos{-1};
+  JoinKind kind{JoinKind::Inner};
+  std::vector<std::string> using_columns;
+  bool natural{false};
+  std::string using_alias;
+
+  // What a column of the item is qualified by.
+  [[nodiscard]] auto name() const -> const std::string&;
+};
+
+auto FromItem::name() const -> const std::string& { return alias.empty() ? table : alias; }
+
 struct Select {
   std::vector<Expr> targets;
-  std::string table;  // "" for none: a SELECT without FROM
-  std::string join;  // a second table, "" for none: FROM a, b or a [INNER] JOIN b ON …
+  std::vector<FromItem> from;  // empty: a SELECT without FROM
   std::vector<Compare> where;
   std::vector<OrderItem> order_by;
   std::optional<std::int64_t> limit;  // nullopt: none, LIMIT ALL or LIMIT NULL
   std::int32_t pos{-1};
   bool for_update{false};  // FOR UPDATE: a guard on each row returned, never a lock
-  std::int32_t table_pos{-1}, join_pos{-1};  // where table and join are named
   std::vector<Expr> group_by;  // GROUP BY's columns, as written
   std::vector<Compare> having;  // HAVING's conjuncts
   bool distinct{false};         // SELECT DISTINCT, not DISTINCT ON
-  // An inner join's USING (…), or NATURAL: the columns both tables have,
-  // compared by =, each named alone as one column. using_alias names them
-  // too: USING (…) AS alias.
-  std::vector<std::string> using_columns;
-  bool natural{false};
-  std::string using_alias;
-  // The join's kind: LEFT keeps every row of `table`, RIGHT every row of
-  // `join`, each joined to NULLs where no row of the other matches.
-  enum class JoinKind { Inner, Left, Right };
-  JoinKind join_kind{JoinKind::Inner};
   // A set operation: this query is `set->left` combined with `set->right`,
   // and has no select list or FROM of its own; its order_by and limit apply
   // to the combined rows. A parenthesised arm keeps its own.
@@ -303,22 +318,15 @@ struct SetOperation {
     out.targets.push_back(clone(e));
     out.targets.back().alias = e.alias;
   }
-  out.table = s.table;
-  out.join = s.join;
+  out.from = s.from;
   for (const auto& c : s.where) out.where.push_back(clone(c));
   out.order_by = s.order_by;
   out.limit = s.limit;
   out.pos = s.pos;
   out.for_update = s.for_update;
-  out.table_pos = s.table_pos;
-  out.join_pos = s.join_pos;
   for (const auto& e : s.group_by) out.group_by.push_back(clone(e));
   for (const auto& c : s.having) out.having.push_back(clone(c));
   out.distinct = s.distinct;
-  out.using_columns = s.using_columns;
-  out.natural = s.natural;
-  out.using_alias = s.using_alias;
-  out.join_kind = s.join_kind;
   out.set = s.set;  // never changed once parsed: shared
   return out;
 }
