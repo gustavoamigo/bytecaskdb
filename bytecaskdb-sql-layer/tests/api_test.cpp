@@ -209,6 +209,15 @@ TEST_CASE("embedded API: parameters are checked against the plan that will run",
   (void)db->execute("CREATE TABLE t (k BIGINT PRIMARY KEY, v BIGINT)");
   (void)db->execute("INSERT INTO t VALUES ($1, $2)", {i(3'000'000'000), i(7)});
   CHECK(db->execute(by_k, {i(3'000'000'000)}).rows == Grid{{i(7)}});
+  // Of an UPDATE's parameters out of range, a SET value's is reported
+  // first, as PostgreSQL folds the target list before the WHERE.
+  (void)db->execute("CREATE TABLE u (s VARCHAR(4) NOT NULL, n SMALLINT PRIMARY KEY)");
+  try {
+    (void)db->execute("UPDATE u SET s = $2 WHERE n = $1", {i(32768), Value{sql_test::bytes("00000")}});
+    FAIL("ran");
+  } catch (const ExecError& e) {
+    CHECK(sqlstate(e) == "22001");
+  }
 }
 
 TEST_CASE("embedded API: a cached plan is checked once per catalog version", "[sql][api][catalog]") {
@@ -1315,6 +1324,71 @@ TEST_CASE("embedded API: a left outer join NULL-extends each left row no right r
   const std::string keyed = "SELECT ls.k, rc.a FROM ls LEFT JOIN rc ON rc.s = ls.s AND rc.a = $1 ORDER BY ls.k";
   CHECK(db->execute(keyed, {i(1)}).rows == Grid{{i(1), i(1)}, {i(2), Value{}}});
   CHECK(db->execute(keyed, {Value{}}).rows == Grid{{i(1), Value{}}, {i(2), Value{}}});
+}
+
+TEST_CASE("embedded API: an uncorrelated subquery runs once, on the statement's snapshot, before its plan",
+          "[sql][api]") {
+  sql_test::TempDir dir{"api_subquery"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE g (id INTEGER PRIMARY KEY, v INTEGER)");
+  (void)db->execute("CREATE TABLE h (k INTEGER PRIMARY KEY, w INTEGER)");
+  for (auto [id, v] : {std::pair<std::int64_t, Value>{1, i(10)}, {2, i(20)}, {3, Value{}}, {4, i(20)}, {5, i(30)}}) {
+    (void)db->execute("INSERT INTO g VALUES ($1, $2)", {i(id), v});
+  }
+  for (auto [k, w] : {std::pair<std::int64_t, Value>{1, i(20)}, {2, Value{}}, {3, i(5)}}) {
+    (void)db->execute("INSERT INTO h VALUES ($1, $2)", {i(k), w});
+  }
+  auto ids = [&](std::string_view sql) {
+    std::vector<std::int64_t> out;
+    for (const auto& r : db->execute(sql).rows) out.push_back(std::get<std::int64_t>(r[0]));
+    std::ranges::sort(out);
+    return out;
+  };
+  using V = std::vector<std::int64_t>;
+  CHECK(ids("SELECT id FROM g WHERE v = (SELECT MAX(v) FROM g)") == V{5});
+  CHECK(ids("SELECT id FROM g WHERE id = (SELECT MAX(k) FROM h)") == V{3});
+  CHECK(ids("SELECT id FROM g WHERE v = (SELECT w FROM h WHERE k = 2)").empty());  // NULL matches nothing
+  CHECK(ids("SELECT id FROM g WHERE v IN (SELECT w FROM h)") == V{2, 4});
+  // h holds a NULL, so NOT IN is never true: NULL where no value equals v.
+  CHECK(ids("SELECT id FROM g WHERE v NOT IN (SELECT w FROM h)").empty());
+  CHECK(ids("SELECT id FROM g WHERE v NOT IN (SELECT w FROM h WHERE w IS NOT NULL)") == V{1, 5});
+  CHECK(ids("SELECT id FROM g WHERE v > ALL (SELECT w FROM h WHERE w IS NOT NULL)") == V{5});
+  CHECK(ids("SELECT id FROM g WHERE v > ALL (SELECT w FROM h WHERE k > 9)") == V{1, 2, 3, 4, 5});  // over none: true
+  CHECK(ids("SELECT id FROM g WHERE v < ANY (SELECT w FROM h)") == V{1});
+  CHECK(ids("SELECT id FROM g WHERE EXISTS (SELECT 1 FROM h WHERE w = 5)") == V{1, 2, 3, 4, 5});
+  CHECK(ids("SELECT id FROM g WHERE NOT EXISTS (SELECT k, w FROM h)").empty());
+  // EXISTS reads no column: over a join it filters the left side, and in an
+  // outer join's ON the right one, the left rows staying.
+  CHECK(ids("SELECT g.id FROM g JOIN h ON g.v = h.w WHERE EXISTS (SELECT 1 FROM h WHERE k = 3)") == V{2, 4});
+  CHECK(ids("SELECT g.id FROM g JOIN h ON g.v = h.w WHERE NOT EXISTS (SELECT 1 FROM h)").empty());
+  CHECK(db->execute("SELECT g.id, h.k FROM g LEFT JOIN h ON g.v = h.w AND NOT EXISTS (SELECT 1 FROM h) WHERE g.id = 2")
+            .rows == Grid{{i(2), Value{}}});
+  CHECK(db->execute("SELECT (SELECT w FROM h WHERE k = 3), (SELECT w FROM h WHERE k = 9)").rows == Grid{{i(5), Value{}}});
+  try {
+    (void)db->execute("SELECT id FROM g WHERE v = (SELECT w FROM h)");
+    FAIL("a scalar subquery of three rows ran");
+  } catch (const ExecError& e) {
+    CHECK(sqlstate(e) == "21000");
+  }
+  // A write's subquery reads the rows as they were before the statement.
+  CHECK(db->execute("UPDATE g SET v = v + 100 WHERE v = (SELECT MAX(v) FROM g)").affected == 1);
+  CHECK(ids("SELECT id FROM g WHERE v > 100") == V{5});
+  // In a transaction, its earlier writes are the subquery's too.
+  auto t = db->begin();
+  (void)t.execute("INSERT INTO h VALUES ($1, $2)", {i(9), i(10)});
+  auto rows = t.execute("SELECT id FROM g WHERE v IN (SELECT w FROM h)").rows;
+  CHECK(rows.size() == 3);  // 10, 20, 20
+  CHECK(t.commit() == CommitOutcome::Committed);
+  // Every plan the search costs for the outer query agrees.
+  for (auto sql : {"SELECT id FROM g WHERE id IN (SELECT k FROM h)", "SELECT id FROM g WHERE v >= (SELECT MIN(w) FROM h)"}) {
+    INFO(sql);
+    auto want = db->execute(sql).rows;
+    std::ranges::sort(want);
+    for (auto& alt : db->alternatives_for_testing(sql, {})) {
+      std::ranges::sort(alt.rows);
+      CHECK(alt.rows == want);
+    }
+  }
 }
 
 TEST_CASE("embedded API: a choice point's plan text shows both plans, and each returns the same rows",

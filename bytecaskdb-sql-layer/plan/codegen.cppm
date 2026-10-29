@@ -21,6 +21,7 @@ module;
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -210,6 +211,13 @@ public:
   [[nodiscard]] auto body() const -> const std::string& { return body_; }
   [[nodiscard]] auto p() const -> const physical::Plan& { return p_; }
 
+  // What a subquery's writer used, which the statement's plan declares.
+  void absorb(const Writer& w) {
+    used_.insert(w.used_.begin(), w.used_.end());
+    cols_.insert(w.cols_.begin(), w.cols_.end());
+    reads_.insert(w.reads_.begin(), w.reads_.end());
+  }
+
 private:
   // A name the plan's constants lack would fail at TinyCC: a compiler bug,
   // refused here instead.
@@ -367,12 +375,44 @@ public:
   explicit Gen(Writer& w) : w_{w} {}
 
   void plan(const physical::Node& root) {
+    // Each subquery first, once, on the statement's snapshot: it sets the
+    // parameters the rest reads (bc_sub_kind).
+    const auto& subs = w_.p().subs;
+    for (std::size_t i = 0; i < subs.size(); ++i) {
+      auto n = std::to_string(i);
+      w_.line("bc_sub_begin(cx, " + n + ", " + sub_kind(subs[i].kind) + ", " + type_code(subs[i]) + ", " +
+              std::to_string(subs[i].param) + ");");
+      w_.line("sub" + n + "(cx);");
+      w_.line("bc_sub_end(cx);");
+    }
     print_computed(w_);
     // LIMIT 0 returns nothing, so nothing is read.
     if (limit_zero(root)) return;
     no_rows_ = no_rows(root);
     if (!w_.p().null_checks.empty()) return_if_null(w_, w_.p().null_checks, no_rows_);
     produce(root, [] {});
+  }
+
+  static auto sub_kind(logical::Subquery::Kind k) -> std::string {
+    switch (k) {
+      case logical::Subquery::Kind::Value: return "BC_SUB_VALUE";
+      case logical::Subquery::Kind::Exists: return "BC_SUB_EXISTS";
+      case logical::Subquery::Kind::Bounds: return "BC_SUB_BOUNDS";
+      case logical::Subquery::Kind::Set: return "BC_SUB_SET";
+    }
+    return "BC_SUB_VALUE";
+  }
+
+  // The bc_type of a subquery's column; EXISTS keeps none, so any.
+  static auto type_code(const physical::Sub& s) -> std::string {
+    if (s.kind == logical::Subquery::Kind::Exists) return "BC_T_BOOL";
+    switch (phys_type(s.type)) {
+      case PhysType::I64: return "BC_T_I64";
+      case PhysType::F64: return "BC_T_F64";
+      case PhysType::Bool: return "BC_T_BOOL";
+      case PhysType::Bytes: return "BC_T_BYTES";
+    }
+    return "BC_T_I64";
   }
 
   // What the root reports when no row can match: nothing for result rows,
@@ -534,6 +574,15 @@ private:
         auto [null, cmp] = comparison(e);
         return "!(" + null + ") && " + (want ? "(" : "!(") + cmp + ")";
       }
+      case Expr::Kind::Truth: {  // a subquery's BOOLEAN parameter
+        auto p = e.args[0].param;
+        return "!" + param_null(p) + " && " + (want ? "" : "!") + param(PhysType::Bool, p);
+      }
+      case Expr::Kind::InSet: {  // the column's value among a subquery's
+        const auto& col = e.args[0].col;
+        auto has = "bc_sub_has_" + suffix(col.type) + "(cx, " + std::to_string(e.constant) + ", " + read_col(col) + ")";
+        return "!(" + col_null(col) + ") && " + (want ? "" : "!") + has;
+      }
       case Expr::Kind::Column:
       case Expr::Kind::Param:
       case Expr::Kind::Add:
@@ -570,7 +619,9 @@ private:
       case Expr::Kind::Or:
       case Expr::Kind::Not:
       case Expr::Kind::IsNull:
-      case Expr::Kind::Like: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
+      case Expr::Kind::Like:
+      case Expr::Kind::Truth:
+      case Expr::Kind::InSet: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
     }
     auto col = read_col(lhs);
     // Text and bytes compare as bytes: COLLATE "C".
@@ -1958,6 +2009,14 @@ auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std
   out.param_types = p.param_types;
   out.catalog_version = p.catalog_version;
   Writer w{p};
+  // Each subquery as a function of its own: a miss in it returns from it.
+  std::string subs;
+  for (std::size_t i = 0; i < p.subs.size(); ++i) {
+    Writer sw{*p.subs[i].plan};
+    Gen{sw}.plan(*p.subs[i].plan->root);
+    w.absorb(sw);
+    subs += "\nstatic void sub" + std::to_string(i) + "(bc_ctx *cx) {\n" + sw.body() + "}\n";
+  }
   Gen{w}.plan(*p.root);
   std::visit(
       [&](const auto& op) {
@@ -1979,8 +2038,8 @@ auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std
   }
   out.source = comment_line(sql) +
                comment_line("isolation: snapshot   schema: catalog v" + std::to_string(p.catalog_version)) +
-               comment_line("objects: " + w.legend()) + "#include \"bc_plan.h\"\n" + w.constants() +
-               "\n\nvoid plan(bc_ctx *cx) {\n" + w.body() + "}\n";
+               comment_line("objects: " + w.legend()) + "#include \"bc_plan.h\"\n" + w.constants() + "\n" + subs +
+               "\nvoid plan(bc_ctx *cx) {\n" + w.body() + "}\n";
   out.objects_read = w.objects_read();
   out.columns = w.columns_used();
   out.cost = p.cost;
@@ -1994,6 +2053,22 @@ auto rewritten(bound::Bound& b) -> logical::Node& {
   return **stmt;
 }
 
+// Each subquery's cheapest plan, its parameters the statement's, given to
+// `p`; the constants of its tables join the statement's, so the one source
+// declares them all.
+void attach_subqueries(physical::Plan& p, bound::Bound& b, const Catalog& cat, const RowCounts& counts,
+                       std::uint64_t memory_bytes) {
+  for (auto& s : b.subqueries) {
+    logical::rewrite(*s.plan);
+    auto sp = search(*s.plan, cat, counts, memory_bytes);
+    sp.param_types = b.param_types;
+    for (const auto& c : sp.constants) {
+      if (std::ranges::none_of(p.constants, [&](const auto& d) { return d.name == c.name; })) p.constants.push_back(c);
+    }
+    p.subs.push_back({std::make_shared<const physical::Plan>(std::move(sp)), s.kind, s.type, s.param});
+  }
+}
+
 }  // namespace
 
 auto no_rows_lines(const physical::Node& root) -> std::vector<std::string> { return Gen::no_rows(root); }
@@ -2001,13 +2076,20 @@ auto no_rows_lines(const physical::Node& root) -> std::vector<std::string> { ret
 auto generate_plan(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts,
                    std::uint64_t memory_bytes) -> GeneratedPlan {
   auto p = search(rewritten(b), cat, counts, memory_bytes);
+  attach_subqueries(p, b, cat, counts, memory_bytes);
   return print_plan(p, b.param_types, sql);
 }
 
 auto generate_alternatives(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts,
                            std::uint64_t memory_bytes) -> std::vector<GeneratedPlan> {
   std::vector<GeneratedPlan> out;
+  physical::Plan with_subs;  // the subqueries' plans, the same for every alternative
+  attach_subqueries(with_subs, b, cat, counts, memory_bytes);
   for (auto& p : search_all(rewritten(b), cat, counts, memory_bytes)) {
+    p.subs = with_subs.subs;
+    for (const auto& c : with_subs.constants) {
+      if (std::ranges::none_of(p.constants, [&](const auto& d) { return d.name == c.name; })) p.constants.push_back(c);
+    }
     const auto n = physical::choices(p);
     // Bit i of a combination takes choice point i's second plan.
     for (std::uint32_t combination = 0; combination < (1u << n); ++combination) {

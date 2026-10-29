@@ -416,8 +416,21 @@ struct ResultColumn {
   return {phys_type(t)};
 }
 
+struct Plan;
+
+// An uncorrelated subquery's plan, run before the statement's own: its rows
+// folded as `kind` says into the parameters from `param` on, and for a Set
+// into the set InSet tests by its index here (logical::Subquery).
+struct Sub {
+  std::shared_ptr<const Plan> plan;
+  logical::Subquery::Kind kind{logical::Subquery::Kind::Value};
+  SqlType type{};
+  std::uint32_t param{0};
+};
+
 struct Plan {
   NodePtr root;
+  std::vector<Sub> subs;  // run in order, before anything else
   std::vector<Catalog::PlanConstant> constants;  // its tables', in the catalog's order
   std::uint64_t catalog_version{0};
   std::vector<PhysType> param_types;
@@ -476,6 +489,13 @@ public:
     if (p_.constants.empty() && !of_no_table(*p_.root)) broken("a plan with no constants");
     if (!p_.root) broken("a plan with no operator");
     for (auto n : p_.null_checks) param(n);
+    for (const auto& s : p_.subs) {
+      if (!s.plan || !s.plan->subs.empty()) broken("a subquery with no plan, or one of its own");
+      using K = logical::Subquery::Kind;
+      auto n = s.kind == K::Bounds ? 4u : s.kind == K::Set ? 2u : 1u;
+      if (std::uint64_t{s.param} + n > p_.param_types.size()) broken("a subquery's parameters past the statement's");
+      check(*s.plan);
+    }
     // Each combination of the choice points' branches is checked as the plan
     // it runs: what one branch's covering scan reads from a key says nothing
     // of the other's.
@@ -567,6 +587,22 @@ private:
         reads(e);
         return;
       case Expr::Kind::Const: return;  // a comparison folded
+      case Expr::Kind::Truth:
+        if (e.args.size() != 1 || e.args[0].kind != Expr::Kind::Param || e.args[0].phys() != PhysType::Bool) {
+          broken("a truth of other than a BOOLEAN parameter");
+        }
+        params(e);
+        return;
+      case Expr::Kind::InSet: {
+        // Of a column of its subquery's set's type.
+        auto i = static_cast<std::size_t>(e.constant);
+        if (e.args.size() != 1 || e.args[0].kind != Expr::Kind::Column || e.constant < 0 || i >= p_.subs.size() ||
+            p_.subs[i].kind != logical::Subquery::Kind::Set || phys_type(p_.subs[i].type) != e.args[0].col.type) {
+          broken("IN of a subquery of other than a column of its set's type");
+        }
+        reads(e);
+        return;
+      }
       case Expr::Kind::Column:
       case Expr::Kind::Param:
       case Expr::Kind::Add:

@@ -65,6 +65,25 @@ auto relation(const PgQuery__RangeVar* rv) -> std::string {
 
 auto expr(const PgQuery__Node* n) -> Expr;
 auto literal(const PgQuery__Node* n) -> Literal;
+auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select;
+
+// A subquery's SELECT, parsed as any SELECT is.
+auto subquery(const PgQuery__SubLink* l) -> std::shared_ptr<const Select> {
+  if (l->subselect == nullptr || l->subselect->node_case != PG_QUERY__NODE__NODE_SELECT_STMT) {
+    reject("a subquery must be a SELECT", l->location);
+  }
+  return std::make_shared<const Select>(select(l->subselect->select_stmt, l->location));
+}
+
+auto value_compare(const std::string& op, std::int32_t pos) -> ValueCompare {
+  if (op == "=") return ValueCompare::Eq;
+  if (op == "<>") return ValueCompare::Ne;
+  if (op == "<") return ValueCompare::Lt;
+  if (op == "<=") return ValueCompare::Le;
+  if (op == ">") return ValueCompare::Gt;
+  if (op == ">=") return ValueCompare::Ge;
+  reject("operator " + op + " is not supported", pos);
+}
 
 auto literal_expr(Literal l) -> Expr {
   Expr e{Expr::Kind::Literal, {}, 0, nullptr, nullptr, l.pos};
@@ -111,12 +130,7 @@ auto expr(const PgQuery__Node* n) -> Expr {
     // A comparison as a value; PostgreSQL's grammar spells != as <>.
     if (a->lexpr != nullptr && (op == "=" || op == "<>" || op == "<" || op == "<=" || op == ">" || op == ">=")) {
       Expr e{Expr::Kind::Compare, {}, 0, nullptr, nullptr, a->location};
-      e.cmp = op == "=" ? ValueCompare::Eq
-              : op == "<>" ? ValueCompare::Ne
-              : op == "<"  ? ValueCompare::Lt
-              : op == "<=" ? ValueCompare::Le
-              : op == ">"  ? ValueCompare::Gt
-                           : ValueCompare::Ge;
+      e.cmp = value_compare(op, a->location);
       e.lhs = std::make_unique<Expr>(operand(a->lexpr));
       e.rhs = std::make_unique<Expr>(operand(a->rexpr));
       return e;
@@ -163,6 +177,15 @@ auto expr(const PgQuery__Node* n) -> Expr {
     return e;
   }
   if (n->node_case == PG_QUERY__NODE__NODE_A_CONST) return literal_expr(literal(n));
+  if (n->node_case == PG_QUERY__NODE__NODE_SUB_LINK) {
+    const auto* l = n->sub_link;
+    if (l->sub_link_type != PG_QUERY__SUB_LINK_TYPE__EXPR_SUBLINK) {
+      reject("only a subquery of one value, (SELECT …), is supported here", l->location);
+    }
+    Expr e{Expr::Kind::Subquery, {}, 0, nullptr, nullptr, l->location};
+    e.subquery = subquery(l);
+    return e;
+  }
   if (n->node_case == PG_QUERY__NODE__NODE_TYPE_CAST) {
     const auto* c = n->type_cast;
     const auto* tn = c->type_name;
@@ -239,6 +262,27 @@ auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t p
     Compare c{Compare::Op::Eq, expr(t->arg), {}, t->location, on};
     c.kind = Compare::Kind::IsNull;
     if (t->nulltesttype == PG_QUERY__NULL_TEST_TYPE__IS_NOT_NULL) return negated(std::move(c));
+    return c;
+  }
+  if (n->node_case == PG_QUERY__NODE__NODE_SUB_LINK) {
+    const auto* l = n->sub_link;
+    Compare c{Compare::Op::Eq, {}, {}, l->location, on};
+    if (l->sub_link_type == PG_QUERY__SUB_LINK_TYPE__EXISTS_SUBLINK) {
+      c.kind = Compare::Kind::Exists;
+    } else if (l->sub_link_type == PG_QUERY__SUB_LINK_TYPE__ANY_SUBLINK ||
+               l->sub_link_type == PG_QUERY__SUB_LINK_TYPE__ALL_SUBLINK) {
+      c.kind = Compare::Kind::Quantified;
+      c.lhs = expr(l->testexpr);
+      // IN (SELECT …) names no operator: it is = ANY.
+      c.quantified = l->n_oper_name == 0 ? ValueCompare::Eq
+                                         : value_compare(str(l->oper_name[l->n_oper_name - 1]), l->location);
+      c.all = l->sub_link_type == PG_QUERY__SUB_LINK_TYPE__ALL_SUBLINK;
+    } else if (l->sub_link_type == PG_QUERY__SUB_LINK_TYPE__EXPR_SUBLINK) {
+      reject("a subquery of one value is not a predicate; compare it", l->location);
+    } else {
+      reject("this subquery form is not supported", l->location);
+    }
+    c.subquery = subquery(l);
     return c;
   }
   if (n->node_case != PG_QUERY__NODE__NODE_A_EXPR) reject(clause + " must compare a column", pos);

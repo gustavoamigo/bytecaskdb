@@ -47,25 +47,29 @@ struct ColumnRef {
 
 // A typed expression. Its SQL type is the binder's, by types_design.md's
 // rules: a comparison's is BOOLEAN, an aggregate's PostgreSQL's result type.
+// Truth and InSet are an uncorrelated subquery's (Subquery, below): a
+// BOOLEAN parameter it set, true, false or NULL as it holds; and whether a
+// column's value is among a BC_SUB_SET subquery's values, `constant` its
+// index in the statement's subqueries (NULL for a NULL column).
 // And, Or, Not, IsNull and Like are a predicate's, a WHERE conjunct that is
 // no comparison of its own: three-valued, as SQL's logic is, over
 // comparisons, IS NULL of a column and a text column LIKE a pattern; a
 // filter, never a key's bound.
 struct Expr {
-  enum class Kind { Column, Param, Const, Add, Sub, Compare, Aggregate, And, Or, Not, IsNull, Like };
+  enum class Kind { Column, Param, Const, Add, Sub, Compare, Aggregate, And, Or, Not, IsNull, Like, Truth, InSet };
   enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind{Kind::Param};
   SqlType type{};
   ColumnRef col{};              // Column
   std::uint32_t param{0};       // Param: zero-based ($1 is 0)
   std::int64_t constant{0};     // Const: in its type's representation, a DECIMAL's scaled; a BOOLEAN's 0 or 1;
-                                // Like: the escape's code point, -1 for none
+                                // Like: the escape's code point, -1 for none; InSet: its subquery
   Op op{Op::Eq};                // Compare
   Fn fn{Fn::Count};             // Aggregate
   bool distinct{false};         // Aggregate: COUNT(DISTINCT arg)
   std::vector<Expr> args;       // Add, Sub, Compare: two; Aggregate: none (COUNT(*)) or its argument;
                                 // And, Or: two or more; Not: one; IsNull: its column; Like: the column and the
-                                // pattern, a parameter
+                                // pattern, a parameter; Truth: its parameter; InSet: its column
 
   [[nodiscard]] auto phys() const -> PhysType { return phys_type(type); }
 
@@ -116,10 +120,18 @@ struct Expr {
   return e;
 }
 
-// Whether e is a predicate: And, Or, Not or IsNull.
+// Whether e is a predicate: And, Or, Not, IsNull, Like, Truth or InSet.
 [[nodiscard]] auto is_predicate(const Expr& e) -> bool {
   return e.kind == Expr::Kind::And || e.kind == Expr::Kind::Or || e.kind == Expr::Kind::Not ||
-         e.kind == Expr::Kind::IsNull || e.kind == Expr::Kind::Like;
+         e.kind == Expr::Kind::IsNull || e.kind == Expr::Kind::Like || e.kind == Expr::Kind::Truth ||
+         e.kind == Expr::Kind::InSet;
+}
+
+// A predicate of two or more conjuncts or disjuncts, or one alone.
+[[nodiscard]] auto predicate_of(Expr::Kind kind, std::vector<Expr> args) -> Expr {
+  auto e = expr(kind, SqlType{SqlKind::Boolean});
+  e.args = std::move(args);
+  return e;
 }
 
 // Every column the expression reads, in the order it reads them.
@@ -245,6 +257,21 @@ template <typename T>
 [[nodiscard]] auto node(T op) -> NodePtr {
   return std::make_unique<Node>(Node{std::move(op), {}});
 }
+
+// An uncorrelated subquery: a SELECT the statement runs once, before its
+// own plan, on its snapshot, its rows of one column folded as `kind` says
+// into the hidden parameters from `param` on (bc_sub_kind in bc_plan.h).
+// Value: its one row's value, NULL for none, a second row 21000. Exists:
+// a BOOLEAN. Bounds: its largest and smallest non-NULL values, then two
+// BOOLEANs, NULL if a row was NULL else FALSE, and whether it gave a row.
+// Set: its non-NULL values, which InSet tests, then those two BOOLEANs.
+struct Subquery {
+  enum class Kind { Value, Exists, Bounds, Set };
+  NodePtr plan;
+  Kind kind{Kind::Value};
+  SqlType type{};  // its column's; Exists: none it reads
+  std::uint32_t param{0};
+};
 
 // The operator below n, or null for a leaf (Get, Empty, OneRow, Insert); a
 // Join has two.

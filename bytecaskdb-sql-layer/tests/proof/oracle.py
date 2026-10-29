@@ -24,6 +24,7 @@ import bytecask_sql
 SQLSTATE = {
     "unique": "23505",
     "not_null": "23502",
+    "cardinality": "21000",  # a scalar subquery of more than one row
 }
 
 # A value outside its declared type is one kind, "range", in the layer; its
@@ -333,9 +334,14 @@ def run_layer(db, sql: str, params=()) -> Outcome:
     except bytecask_sql.TransactionAborted as e:
         return Outcome(error=ABORTED, detail=str(e), sqlstate=e.sqlstate)
     except bytecask_sql.ExecError as e:
-        # A constraint violation is an outcome to compare. Any other failure
-        # of a plan that ran (corrupt, I/O, a handle, a layout, a limit,
-        # memory, a conflict) is the layer failing: the test fails on it.
+        # A constraint violation is an outcome to compare, and so is a SQL
+        # error a plan raises as PostgreSQL's executor does: a scalar
+        # subquery of more than one row, a LIKE pattern ending in its escape.
+        # Any other failure of a plan that ran (corrupt, I/O, a handle, a
+        # layout, a limit, memory, a conflict) is the layer failing: the test
+        # fails on it.
+        if e.constraint is None and e.sqlstate in (SQLSTATE["cardinality"], "22025"):
+            return Outcome(error=e.sqlstate, detail=str(e), sqlstate=e.sqlstate)
         if e.constraint is None:
             raise
         return Outcome(error=layer_sqlstate(e), detail=str(e), sqlstate=e.sqlstate)

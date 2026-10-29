@@ -249,7 +249,9 @@ auto use_of(const Expr& c, const Tables& here, const Tables& other) -> Use {
     case Expr::Kind::Or:
     case Expr::Kind::Not:
     case Expr::Kind::IsNull:
-    case Expr::Kind::Like: return Use::Operand;
+    case Expr::Kind::Like:
+    case Expr::Kind::Truth:
+    case Expr::Kind::InSet: return Use::Operand;
   }
   return Use::Operand;
 }
