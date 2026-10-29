@@ -554,3 +554,18 @@ TEST_CASE("parser: DECLARE, FETCH, MOVE and CLOSE", "[sql][parser][cursor]") {
     CHECK(std::get<Delete>(parse("DELETE FROM ONLY ( t )")).table == "t");
   }
 }
+
+TEST_CASE("parser: UPDATE and DELETE ... WHERE CURRENT OF name the cursor and have no other WHERE", "[sql][parser][cursor]") {
+  auto u = std::get<Update>(parse("UPDATE t SET v = $1 WHERE CURRENT OF \"My C\""));
+  CHECK(u.current_of == "My C");
+  CHECK(u.where.empty());
+  CHECK(u.set.size() == 1);
+  auto d = std::get<Delete>(parse("DELETE FROM ONLY t WHERE CURRENT OF c"));
+  CHECK(d.current_of == "c");
+  CHECK(d.where.empty());
+  CHECK(std::get<Update>(parse("UPDATE t SET v = 1 WHERE id = 1")).current_of.empty());
+  // PostgreSQL's grammar takes it as the whole clause; so does the dialect's.
+  CHECK_THROWS_AS(parse("UPDATE t SET v = 1 WHERE id = 1 AND CURRENT OF c"), SqlError);
+  CHECK_THROWS_AS(parse("DELETE FROM t WHERE CURRENT OF $1"), SqlError);
+  CHECK_THROWS_AS(parse("SELECT 1 FROM t WHERE CURRENT OF c"), SqlError);
+}

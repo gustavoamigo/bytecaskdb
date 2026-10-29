@@ -1095,6 +1095,59 @@ def test_extended_cursor_statements_across_syncs(server):
     assert states(out) == ["34000"]
 
 
+def test_where_current_of_over_simple_and_extended_protocol(server):
+    c = connect(server)
+    cursor_table(c)
+    c.send(query("BEGIN"))
+    c.until_ready()
+    c.send(query("DECLARE c CURSOR FOR SELECT k FROM t ORDER BY k"))
+    c.until_ready()
+    # Never fetched: no row to change.
+    c.send(query("UPDATE t SET v = 0 WHERE CURRENT OF c"))
+    assert states(c.until_ready()) == ["24000"]
+    c.send(query("ROLLBACK"))
+    c.until_ready()
+    c.send(query("BEGIN"))
+    c.until_ready()
+    c.send(query("DECLARE c SCROLL CURSOR FOR SELECT k FROM t ORDER BY k"))
+    c.until_ready()
+    c.send(query("FETCH 2 c"))
+    c.until_ready()
+    c.send(query("UPDATE t SET v = 99 WHERE CURRENT OF c"))
+    out = c.until_ready()
+    assert tags(out) == ["UPDATE 1"] and states(out) == []
+    # Extended protocol: the cursor's key is no parameter of the statement.
+    c.send(parse("DELETE FROM t WHERE CURRENT OF c", "d"), describe("S", "d"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"1tnZ"  # ParameterDescription with none, NoData
+    c.send(bind([], "d", "pd"), execute("pd"), SYNC)
+    out = c.until_ready()
+    assert tags(out) == ["DELETE 1"]
+    c.send(parse("UPDATE t SET v = $1 WHERE CURRENT OF c", "u"), describe("S", "u"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"1tnZ"
+    c.send(bind(["7"], "u", "pu"), execute("pu"), SYNC)
+    assert tags(c.until_ready()) == ["UPDATE 0"]  # the row is gone: its key finds nothing
+    c.send(query("FETCH PRIOR c"))
+    c.until_ready()
+    c.send(query("UPDATE t SET v = 7 WHERE CURRENT OF c"))
+    assert tags(c.until_ready()) == ["UPDATE 1"]
+    c.send(query("SELECT k, v FROM t ORDER BY k"))
+    assert data(c.until_ready()) == [["1", "7"], ["3", "30"], ["4", "40"], ["5", "50"]]
+    # An unknown cursor is 34000, and the error fails the block.
+    c.send(query("DELETE FROM t WHERE CURRENT OF nope"))
+    assert states(c.until_ready()) == ["34000"]
+    c.send(query("SELECT 1"))
+    assert states(c.until_ready()) == ["25P02"]
+    c.send(query("ROLLBACK"))
+    c.until_ready()
+    # Outside a block the cursor is a hold cursor, held from a previous transaction.
+    assert states(run(c, "DECLARE h CURSOR FOR SELECT k FROM t ORDER BY k")) == []
+    assert states(run(c, "FETCH h")) == []
+    out = run(c, "DELETE FROM t WHERE CURRENT OF h")
+    assert states(out) == ["24000"]
+
+
 def test_hold_cursor_outlives_commit_and_dies_with_rollback(server):
     c = connect(server)
     cursor_table(c)

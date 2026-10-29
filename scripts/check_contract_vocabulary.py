@@ -85,7 +85,7 @@ SQL_WORDS = {
     "BEGIN", "COMMIT", "ROLLBACK", "SHOW", "PREPARE",
     # Cursors.
     "DECLARE", "FETCH", "MOVE", "CLOSE", "CURSOR", "INSENSITIVE", "SCROLL", "BINARY", "HOLD", "WITH", "READ",
-    "ONLY", "NEXT", "FORWARD", "ALL", "FROM", "IN",
+    "ONLY", "NEXT", "FORWARD", "ALL", "FROM", "IN", "CURRENT",
 }
 
 # name -> (contract, interface files, extra allowed words)

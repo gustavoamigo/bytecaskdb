@@ -301,6 +301,10 @@ struct Select {
   std::vector<Expr> group_by;  // GROUP BY's columns, as written
   std::vector<Compare> having;  // HAVING's conjuncts
   bool distinct{false};         // SELECT DISTINCT, not DISTINCT ON
+  // A cursor's query (docs/cursor_design.md, *WHERE CURRENT OF*): the binder
+  // appends the table's primary key to the result as hidden trailing columns
+  // when the query is a simple scan of one table, and adds nothing otherwise.
+  bool row_key{false};
   // A set operation: this query is `set->left` combined with `set->right`,
   // and has no select list or FROM of its own; its order_by and limit apply
   // to the combined rows. A parenthesised arm keeps its own.
@@ -345,6 +349,7 @@ struct SetOperation {
   for (const auto& e : s.group_by) out.group_by.push_back(clone(e));
   for (const auto& c : s.having) out.having.push_back(clone(c));
   out.distinct = s.distinct;
+  out.row_key = s.row_key;
   out.set = s.set;  // never changed once parsed: shared
   return out;
 }
@@ -360,12 +365,14 @@ struct Update {
   std::vector<Assignment> set;
   std::vector<Compare> where;
   std::int32_t pos{-1};
+  std::string current_of;  // WHERE CURRENT OF name: the cursor, and `where` is empty
 };
 
 struct Delete {
   std::string table;
   std::vector<Compare> where;
   std::int32_t pos{-1};
+  std::string current_of;  // WHERE CURRENT OF name: the cursor, and `where` is empty
 };
 
 // CREATE VIEW name [(columns)] AS query. `query` is the SELECT as written;

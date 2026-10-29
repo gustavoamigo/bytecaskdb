@@ -1,8 +1,9 @@
 # Cursors inside a transaction block (docs/cursor_design.md): DECLARE, FETCH,
-# MOVE and CLOSE, every FETCH direction, SCROLL and NO SCROLL, and WITH HOLD.
-# WHERE CURRENT OF is a later phase: its cases are marked unimplemented. The
-# direction cases were recorded from PostgreSQL 16 (the only server at hand);
-# the arithmetic they pin is the same in 17.
+# MOVE and CLOSE, every FETCH direction, SCROLL and NO SCROLL, WITH HOLD, and
+# UPDATE and DELETE ... WHERE CURRENT OF. Recorded from PostgreSQL 16 (the only
+# server at hand); the arithmetic and the errors they pin are the same in 17.
+# The WHERE CURRENT OF cursors order by the primary key: PostgreSQL updates a
+# cursor through an index scan, and refuses one that sorts (the layer allows it).
 
 - name: DECLARE, FETCH forward and CLOSE
   features: [E121-01, E121-08, pg:fetch-move]
@@ -1336,6 +1337,347 @@
     - sql: DECLARE c CURSOR WITH HOLD FOR SELECT id FROM t FOR UPDATE
       error: "0A000"
     - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: UPDATE WHERE CURRENT OF changes the row the cursor stands on, and the cursor does not see it
+  features: [E121-06, pg:where-current-of]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT id, v FROM t ORDER BY id
+    - sql: FETCH 2 FROM c
+      expected: [[1, 10], [2, 20]]
+      ordered: true
+    - sql: UPDATE t SET v = 99 WHERE CURRENT OF c
+      rowcount: 1
+    - sql: SELECT id, v FROM t ORDER BY id
+      expected: [[1, 10], [2, 99], [3, 30]]
+      ordered: true
+    - sql: FETCH c
+      expected: [[3, 30]]
+      ordered: true
+    - sql: UPDATE t SET v = 98 WHERE CURRENT OF c
+      rowcount: 1
+    - sql: SELECT id, v FROM t ORDER BY id
+      expected: [[1, 10], [2, 99], [3, 98]]
+      ordered: true
+    - sql: COMMIT
+    - sql: SELECT id, v FROM t ORDER BY id
+      expected: [[1, 10], [2, 99], [3, 98]]
+      ordered: true
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: DELETE WHERE CURRENT OF deletes the row the cursor stands on
+  features: [E121-07, pg:where-current-of]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT id, v FROM t ORDER BY id
+    - sql: FETCH 2 FROM c
+      expected: [[1, 10], [2, 20]]
+      ordered: true
+    - sql: DELETE FROM t WHERE CURRENT OF c
+      rowcount: 1
+    - sql: SELECT id, v FROM t ORDER BY id
+      expected: [[1, 10], [3, 30]]
+      ordered: true
+    - sql: DELETE FROM t WHERE CURRENT OF c
+      rowcount: 0
+    - sql: FETCH c
+      expected: [[3, 30]]
+      ordered: true
+    - sql: DELETE FROM t WHERE CURRENT OF c
+      rowcount: 1
+    - sql: COMMIT
+    - sql: SELECT id, v FROM t ORDER BY id
+      expected: [[1, 10]]
+      ordered: true
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: WHERE CURRENT OF follows a SCROLL cursor in every direction
+  features: [E121-06, pg:where-current-of, pg:fetch-move]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 0)
+    - INSERT INTO t VALUES (2, 0)
+    - INSERT INTO t VALUES (3, 0)
+    - INSERT INTO t VALUES (4, 0)
+    - INSERT INTO t VALUES (5, 0)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c SCROLL CURSOR FOR SELECT id FROM t ORDER BY id
+    - sql: FETCH 3 FROM c
+      expected: [[1], [2], [3]]
+      ordered: true
+    - sql: UPDATE t SET v = 1 WHERE CURRENT OF c
+      rowcount: 1
+    - sql: FETCH PRIOR FROM c
+      expected: [[2]]
+      ordered: true
+    - sql: UPDATE t SET v = 2 WHERE CURRENT OF c
+      rowcount: 1
+    - sql: FETCH LAST FROM c
+      expected: [[5]]
+      ordered: true
+    - sql: UPDATE t SET v = 3 WHERE CURRENT OF c
+      rowcount: 1
+    - sql: FETCH ABSOLUTE 1 FROM c
+      expected: [[1]]
+      ordered: true
+    - sql: UPDATE t SET v = 4 WHERE CURRENT OF c
+      rowcount: 1
+    - sql: FETCH RELATIVE 3 FROM c
+      expected: [[4]]
+      ordered: true
+    - sql: UPDATE t SET v = 5 WHERE CURRENT OF c
+      rowcount: 1
+    - sql: FETCH BACKWARD 2 FROM c
+      expected: [[3], [2]]
+      ordered: true
+    - sql: UPDATE t SET v = 6 WHERE CURRENT OF c
+      rowcount: 1
+    - sql: MOVE FORWARD 2 IN c
+      rowcount: 2
+    - sql: UPDATE t SET v = 7 WHERE CURRENT OF c
+      rowcount: 1
+    - sql: FETCH 0 FROM c
+      expected: [[4]]
+      ordered: true
+    - sql: UPDATE t SET v = v WHERE CURRENT OF c
+      rowcount: 1
+    - sql: SELECT id, v FROM t ORDER BY id
+      expected: [[1, 4], [2, 6], [3, 1], [4, 7], [5, 3]]
+      ordered: true
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: WHERE CURRENT OF on a cursor that stands on no row is 24000
+  features: [E121-06, E121-07, pg:where-current-of]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c SCROLL CURSOR FOR SELECT id, v FROM t ORDER BY id
+    - sql: UPDATE t SET v = 0 WHERE CURRENT OF c
+      error: "24000"
+    - sql: ROLLBACK
+    - sql: BEGIN
+    - sql: DECLARE c SCROLL CURSOR FOR SELECT id, v FROM t ORDER BY id
+    - sql: FETCH ALL FROM c
+      expected: [[1, 10], [2, 20]]
+      ordered: true
+    - sql: DELETE FROM t WHERE CURRENT OF c
+      error: "24000"
+    - sql: ROLLBACK
+    - sql: BEGIN
+    - sql: DECLARE c SCROLL CURSOR FOR SELECT id, v FROM t ORDER BY id
+    - sql: FETCH 1 FROM c
+      expected: [[1, 10]]
+      ordered: true
+    - sql: FETCH PRIOR FROM c
+      expected: []
+      ordered: true
+    - sql: UPDATE t SET v = 0 WHERE CURRENT OF c
+      error: "24000"
+    - sql: ROLLBACK
+    - sql: SELECT id, v FROM t ORDER BY id
+      expected: [[1, 10], [2, 20]]
+      ordered: true
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: WHERE CURRENT OF on an unknown or closed cursor is 34000
+  features: [E121-06, pg:where-current-of]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+  steps:
+    - sql: BEGIN
+    - sql: UPDATE t SET v = 0 WHERE CURRENT OF nope
+      error: "34000"
+    - sql: ROLLBACK
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT id, v FROM t ORDER BY id
+    - sql: FETCH c
+      expected: [[1, 10]]
+      ordered: true
+    - sql: CLOSE c
+    - sql: DELETE FROM t WHERE CURRENT OF c
+      error: "34000"
+    - sql: ROLLBACK
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: WHERE CURRENT OF names the cursor's own table, and a simple scan of it
+  features: [E121-06, E121-07, pg:where-current-of]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - CREATE TABLE u (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 10)
+    - INSERT INTO u VALUES (1, 5)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT id, v FROM t ORDER BY id
+    - sql: FETCH c
+      expected: [[1, 10]]
+      ordered: true
+    - sql: UPDATE u SET v = 0 WHERE CURRENT OF c
+      error: "24000"
+    - sql: ROLLBACK
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT t.id, u.v FROM t JOIN u ON t.id = u.id
+    - sql: FETCH c
+      expected: [[1, 5]]
+      ordered: true
+    - sql: UPDATE t SET v = 0 WHERE CURRENT OF c
+      error: "24000"
+    - sql: ROLLBACK
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT v, COUNT(*) FROM t GROUP BY v
+    - sql: FETCH c
+      expected: [[10, 2]]
+      ordered: true
+    - sql: DELETE FROM t WHERE CURRENT OF c
+      error: "24000"
+    - sql: ROLLBACK
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT DISTINCT v FROM t
+    - sql: FETCH c
+      expected: [[10]]
+      ordered: true
+    - sql: DELETE FROM t WHERE CURRENT OF c
+      error: "24000"
+    - sql: ROLLBACK
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT id FROM t UNION ALL SELECT id FROM u
+    - sql: FETCH c
+      expected: [[1]]
+    - sql: DELETE FROM t WHERE CURRENT OF c
+      error: "24000"
+    - sql: ROLLBACK
+    - sql: SELECT id, v FROM t ORDER BY id
+      expected: [[1, 10], [2, 10]]
+      ordered: true
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+    - DROP TABLE u
+
+- name: WHERE CURRENT OF on a composite key and on a table with no primary key
+  features: [E121-06, E121-07, pg:where-current-of]
+  setup:
+    - CREATE TABLE k (a INTEGER, b VARCHAR(5), v INTEGER, PRIMARY KEY (a, b))
+    - INSERT INTO k VALUES (1, 'x', 0)
+    - INSERT INTO k VALUES (1, 'y', 0)
+    - INSERT INTO k VALUES (2, 'x', 0)
+    - CREATE TABLE n (a INTEGER, v INTEGER)
+    - INSERT INTO n VALUES (1, 0)
+    - INSERT INTO n VALUES (1, 0)
+    - INSERT INTO n VALUES (1, 0)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT a, b FROM k ORDER BY a, b
+    - sql: FETCH 2 FROM c
+      expected: [[1, x], [1, y]]
+      ordered: true
+    - sql: UPDATE k SET v = 1 WHERE CURRENT OF c
+      rowcount: 1
+    - sql: DECLARE d CURSOR FOR SELECT a, v FROM n
+    - sql: FETCH 2 FROM d
+      expected: [[1, 0], [1, 0]]
+      ordered: true
+    - sql: UPDATE n SET v = 1 WHERE CURRENT OF d
+      rowcount: 1
+    - sql: SELECT a, b, v FROM k ORDER BY a, b
+      expected: [[1, x, 0], [1, y, 1], [2, x, 0]]
+      ordered: true
+    - sql: SELECT COUNT(*), SUM(v) FROM n
+      expected: [[3, 1]]
+    - sql: DELETE FROM n WHERE CURRENT OF d
+      rowcount: 1
+    - sql: SELECT COUNT(*), SUM(v) FROM n
+      expected: [[2, 0]]
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE k
+    - DROP TABLE n
+
+- name: WHERE CURRENT OF through a FOR UPDATE cursor
+  features: [E121-06, E121-07, pg:where-current-of]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+    - INSERT INTO t VALUES (3, 30)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c CURSOR FOR SELECT id, v FROM t WHERE v > 10 ORDER BY id FOR UPDATE
+    - sql: FETCH c
+      expected: [[2, 20]]
+      ordered: true
+    - sql: UPDATE t SET v = 0 WHERE CURRENT OF c
+      rowcount: 1
+    - sql: FETCH c
+      expected: [[3, 30]]
+      ordered: true
+    - sql: DELETE FROM t WHERE CURRENT OF c
+      rowcount: 1
+    - sql: COMMIT
+    - sql: SELECT id, v FROM t ORDER BY id
+      expected: [[1, 10], [2, 0]]
+      ordered: true
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: WHERE CURRENT OF through a WITH HOLD cursor, in its own transaction and after it
+  features: [E121-06, E121-17, pg:where-current-of]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+    - INSERT INTO t VALUES (2, 20)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE h CURSOR WITH HOLD FOR SELECT id, v FROM t ORDER BY id
+    - sql: FETCH h
+      expected: [[1, 10]]
+      ordered: true
+    - sql: UPDATE t SET v = 11 WHERE CURRENT OF h
+      rowcount: 1
+    - sql: COMMIT
+    - sql: FETCH h
+      expected: [[2, 20]]
+      ordered: true
+    - sql: BEGIN
+    - sql: UPDATE t SET v = 22 WHERE CURRENT OF h
+      error: "24000"
+    - sql: ROLLBACK
+    - sql: CLOSE h
+    - sql: SELECT id, v FROM t ORDER BY id
+      expected: [[1, 11], [2, 20]]
+      ordered: true
   teardown:
     - ROLLBACK
     - DROP TABLE t

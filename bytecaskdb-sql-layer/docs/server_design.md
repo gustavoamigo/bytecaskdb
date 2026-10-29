@@ -383,6 +383,11 @@ the server adds:
   meanwhile and has no timer or cap here (`cursor_design.md`, *As built
   (phase 4)*). A cursor shares the portals' namespace (a used name is
   `42P03`).
+- `UPDATE` and `DELETE … WHERE CURRENT OF name` are ordinary statements to
+  the classifier; the session finds the cursor by name (`34000`) and runs the
+  statement with the cursor's key (`Transaction::execute_current_of`;
+  `cursor_design.md`, *As built (phase 6)*). A refusal is `24000`. The key is
+  not a parameter: `Describe` of the statement lists only its own.
 - A failed block refuses them all with `25P02`; an error in one fails the
   block.
 - Tags: `DECLARE CURSOR`, `FETCH n`, `MOVE n`, `CLOSE CURSOR`,
