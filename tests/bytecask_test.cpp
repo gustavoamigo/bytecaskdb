@@ -9531,6 +9531,68 @@ TEST_CASE("read sequence: a plan built from a bare sequence is checked "
   }
 }
 
+TEST_CASE("read sequence: a delete earlier in the same group commit is a change",
+          "[apply_batch][read_sequence][concurrency]") {
+  // The group's removals reach the delete log only once it is appended, so
+  // a later slot in the same group must see the earlier slot's removal
+  // another way (docs/bytecask_design.md, "Checking a plan by its read
+  // sequence"). Missing it would let B overwrite a key A just deleted,
+  // from a read that saw the key present.
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+  db.put({}, to_bytes("r"), to_bytes("v0"));
+  const auto read_seq = db.snapshot().sequence();
+
+  bytecask::WritePlan planA{read_seq};
+  planA.del(to_bytes("k"));
+  planA.del(to_bytes("r"));
+  bytecask::WritePlan planB{read_seq};
+  planB.put(to_bytes("k"), to_bytes("fromB"));
+  bytecask::WritePlan planC{read_seq};
+  planC.ensure_range_unchanged(to_bytes("q"), to_bytes("s"));
+  planC.put(to_bytes("other"), to_bytes("fromC"));
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool leader_ready = false;
+  db.test_write_group().on_batch_start_ = [&] {
+    {
+      std::unique_lock<std::mutex> lk{mu};
+      leader_ready = true;
+      cv.notify_all();
+    }
+    db.test_write_group().wait_for_queue_size(3);
+  };
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> ra;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> rb;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> rc;
+  const auto behind_leader = [&](auto &plan, auto &result) {
+    return std::thread{[&] {
+      {
+        std::unique_lock<std::mutex> lk{mu};
+        cv.wait(lk, [&] { return leader_ready; });
+      }
+      result = db.apply_batch({.sync = false}, std::move(plan));
+    }};
+  };
+  std::thread ta{[&] { ra = db.apply_batch({.sync = false}, std::move(planA)); }};
+  auto tb = behind_leader(planB, rb);
+  auto tc = behind_leader(planC, rc);
+  ta.join();
+  tb.join();
+  tc.join();
+  db.test_write_group().on_batch_start_ = nullptr;
+
+  REQUIRE(ra.has_value());
+  REQUIRE_FALSE(rb.has_value());
+  CHECK(rb.error() == bytecask::PlanRefusal::Conflict);
+  REQUIRE_FALSE(rc.has_value());
+  CHECK(rc.error() == bytecask::PlanRefusal::Conflict);
+  CHECK_FALSE(get_val(db, to_bytes("k")).has_value());
+  CHECK_FALSE(get_val(db, to_bytes("other")).has_value());
+}
+
 TEST_CASE("read sequence: a sequence past the latest throws",
           "[apply_batch][read_sequence]") {
   TempDir td;
