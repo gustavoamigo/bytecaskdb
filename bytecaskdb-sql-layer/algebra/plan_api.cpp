@@ -687,11 +687,11 @@ struct HashIter {
 };
 
 // What an aggregate's slot accumulates, fixed by its first fold.
-enum class SlotKind : std::uint8_t { None, SumI64, SumF64, MinI64, MaxI64, Count };
+enum class SlotKind : std::uint8_t { None, SumI64, SumF64, MinI64, MaxI64, MinF64, MaxF64, Count };
 
 struct Slot {
   std::int64_t i{0};  // a sum, a minimum or maximum, or a count
-  double f{0};        // a double sum
+  double f{0};        // a double sum, minimum or maximum
   bool set{false};    // a value was folded in
 };
 
@@ -4705,6 +4705,8 @@ auto slot_kind_name(SlotKind k) -> const char* {
     case SlotKind::SumF64: return "a double sum";
     case SlotKind::MinI64: return "a minimum";
     case SlotKind::MaxI64: return "a maximum";
+    case SlotKind::MinF64: return "a double minimum";
+    case SlotKind::MaxF64: return "a double maximum";
     case SlotKind::Count: return "a count";
   }
   return "a slot";
@@ -4738,7 +4740,8 @@ auto read_slot(bc_ctx* cx, bc_group g, std::uint32_t slot, std::optional<bool> f
     return nullptr;
   }
   auto k = agg->kinds[slot];
-  if (f64 && k != SlotKind::None && (k == SlotKind::SumF64) != *f64) {
+  auto is_f64 = k == SlotKind::SumF64 || k == SlotKind::MinF64 || k == SlotKind::MaxF64;
+  if (f64 && k != SlotKind::None && is_f64 != *f64) {
     cx->fail(BC_E_HANDLE, std::string{"slot "} + std::to_string(slot) + " is " + slot_kind_name(k) + ", read as " +
                               (*f64 ? "a double" : "an integer"));
     return nullptr;
@@ -4764,16 +4767,46 @@ void bc_agg_add_i64(bc_ctx* cx, bc_group g, uint32_t slot, int64_t v) {
 }
 // PostgreSQL's float8 sum: a finite sum that overflows is an error, and an
 // infinite or NaN input carries through.
+static auto sum_f64(bc_ctx* cx, double a, double b) -> double {
+  auto r = a + b;
+  if (std::isinf(r) && !std::isinf(a) && !std::isinf(b)) cx->fail(BC_E_ARITH, "value out of range: overflow");
+  return r;
+}
+// PostgreSQL's float8 order: NaN above every number, -0.0 equal to 0.0.
+static auto less_f64(double a, double b) -> bool { return !std::isnan(a) && (std::isnan(b) || a < b); }
+
+double bc_add_f64(bc_ctx* cx, double a, double b) {
+  BC_GUARD_BEGIN
+  return sum_f64(cx, a, b);
+  BC_GUARD_END(cx)
+  return {};
+}
+// As float8smaller and float8larger: of equal values (-0.0 and 0.0) the second.
+double bc_min_f64(double a, double b) { return less_f64(a, b) ? a : b; }
+double bc_max_f64(double a, double b) { return less_f64(b, a) ? a : b; }
 void bc_agg_add_f64(bc_ctx* cx, bc_group g, uint32_t slot, double v) {
   BC_GUARD_BEGIN
   auto* s = fold_slot(cx, g, slot, SlotKind::SumF64);
   if (s == nullptr) return;
-  auto r = s->f + v;
-  if (std::isinf(r) && !std::isinf(s->f) && !std::isinf(v)) {
-    cx->fail(BC_E_ARITH, "value out of range: overflow");
-    return;
-  }
+  auto r = sum_f64(cx, s->f, v);
+  if (!cx->ok()) return;
   s->f = r;
+  s->set = true;
+  BC_GUARD_END(cx)
+}
+void bc_agg_min_f64(bc_ctx* cx, bc_group g, uint32_t slot, double v) {
+  BC_GUARD_BEGIN
+  auto* s = fold_slot(cx, g, slot, SlotKind::MinF64);
+  if (s == nullptr) return;
+  s->f = s->set ? bc_min_f64(s->f, v) : v;
+  s->set = true;
+  BC_GUARD_END(cx)
+}
+void bc_agg_max_f64(bc_ctx* cx, bc_group g, uint32_t slot, double v) {
+  BC_GUARD_BEGIN
+  auto* s = fold_slot(cx, g, slot, SlotKind::MaxF64);
+  if (s == nullptr) return;
+  s->f = s->set ? bc_max_f64(s->f, v) : v;
   s->set = true;
   BC_GUARD_END(cx)
 }

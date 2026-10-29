@@ -5,7 +5,7 @@
 enum { TBL_4 = 4, COL_4_0 = 0, COL_4_2 = 2 };
 
 void plan(bc_ctx *cx) {
-  bc_agg d0_0 = bc_agg_open(cx, 1);  // COUNT(DISTINCT) values seen per group
+  bc_agg d0_0 = bc_agg_open(cx, 1);  // DISTINCT values seen per group
   bool st0 = false;
   int64_t kv0_0 = 0;
   int64_t x0_0 = 0;

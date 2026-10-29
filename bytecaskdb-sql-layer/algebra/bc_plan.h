@@ -219,6 +219,9 @@ enum bc_int_type { BC_SMALLINT = 2, BC_INTEGER = 4 };
 int64_t bc_check_int(bc_ctx *, int64_t v, uint32_t int_type, uint32_t object_id);  /* v outside the type:
                                                    BC_E_CONSTRAINT, BC_C_RANGE on object_id; else v */
 double  bc_i64_to_f64(int64_t);                 /* always defined */
+double  bc_add_f64(bc_ctx *, double, double);   /* PostgreSQL's float8 sum: finite operands that overflow → error */
+double  bc_min_f64(double, double);             /* PostgreSQL's order: NaN above +inf; of equal values (-0.0, 0.0) the second, as float8smaller */
+double  bc_max_f64(double, double);
 bool    bc_bytes_eq(bc_ctx *, bc_view, bc_view);
 int     bc_bytes_cmp(bc_ctx *, bc_view, bc_view);       /* memcmp order */
 bool    bc_bytes_prefix(bc_ctx *, bc_view prefix, bc_view);
@@ -356,6 +359,8 @@ void      bc_agg_add_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);   /* overf
 void      bc_agg_add_f64(bc_ctx *, bc_group, uint32_t slot, double);
 void      bc_agg_min_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);
 void      bc_agg_max_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);
+void      bc_agg_min_f64(bc_ctx *, bc_group, uint32_t slot, double);
+void      bc_agg_max_f64(bc_ctx *, bc_group, uint32_t slot, double);
 void      bc_agg_count(bc_ctx *, bc_group, uint32_t slot);
 bool      bc_agg_next(bc_ctx *, bc_agg, bc_view *group_key, bc_group *g);
 int64_t   bc_agg_i64(bc_ctx *, bc_group, uint32_t slot);

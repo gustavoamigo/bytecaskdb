@@ -626,6 +626,9 @@ int64_t bc_f64_to_i64(bc_ctx *, double);        /* NaN or out of range → error
 enum bc_int_type { BC_SMALLINT = 2, BC_INTEGER = 4 };
 int64_t bc_check_int(bc_ctx *, int64_t v, uint32_t int_type, uint32_t object_id);  /* outside the type: BC_C_RANGE */
 double  bc_i64_to_f64(int64_t);                 /* always defined */
+double  bc_add_f64(bc_ctx *, double, double);   /* PostgreSQL's float8 sum: finite operands that overflow → error */
+double  bc_min_f64(double, double);             /* PostgreSQL's order: NaN above +inf; of equal values the second */
+double  bc_max_f64(double, double);
 bool    bc_bytes_eq(bc_ctx *, bc_view, bc_view);
 int     bc_bytes_cmp(bc_ctx *, bc_view, bc_view);       /* memcmp order */
 bool    bc_bytes_prefix(bc_ctx *, bc_view prefix, bc_view);
@@ -658,6 +661,16 @@ type whose sum can leave `int64`. An overflow is the same range error
 `bc_check_int` raises, on `object_id`, with PostgreSQL's words ("bigint out of
 range", SQLSTATE 22003, #540), where `bc_add` stays `BC_E_ARITH` for
 aggregates and intermediates.
+
+`bc_add_f64`, `bc_min_f64` and `bc_max_f64` are the double aggregates'
+accumulators for a plan that keeps one in a local (a stream), and what
+`bc_agg_add_f64`, `bc_agg_min_f64` and `bc_agg_max_f64` fold by. `bc_add_f64`
+is PostgreSQL's `float8pl` as the aggregate takes it: finite operands whose
+sum is infinite are `BC_E_ARITH` ("value out of range: overflow"), an
+infinity or NaN carries through. `bc_min_f64` and `bc_max_f64` order as
+PostgreSQL's `float8` does, NaN above every number and `-0.0` equal to
+`0.0`; of equal values they return the second, as `float8smaller` and
+`float8larger` do. They allocate nothing and cannot fail.
 
 `bc_check_int` is the range check of a computed integer: it returns `v` when it is inside the SQL type the
 compiler resolved, `BC_SMALLINT` or `BC_INTEGER`, and otherwise sets
@@ -871,6 +884,8 @@ void      bc_agg_add_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);   /* overf
 void      bc_agg_add_f64(bc_ctx *, bc_group, uint32_t slot, double);
 void      bc_agg_min_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);
 void      bc_agg_max_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);
+void      bc_agg_min_f64(bc_ctx *, bc_group, uint32_t slot, double);
+void      bc_agg_max_f64(bc_ctx *, bc_group, uint32_t slot, double);
 void      bc_agg_count(bc_ctx *, bc_group, uint32_t slot);
 bool      bc_agg_next(bc_ctx *, bc_agg, bc_view *group_key, bc_group *g);
 int64_t   bc_agg_i64(bc_ctx *, bc_group, uint32_t slot);
@@ -892,7 +907,7 @@ bool      bc_agg_null(bc_ctx *, bc_group, uint32_t slot);
 | `bc_agg_add_*`, `bc_agg_min_*`, `bc_agg_max_*`, `bc_agg_count` | Folds a value into a slot: `SUM`, `MIN`, `MAX`, `COUNT`; `AVG` is a sum slot and a count slot divided at emit. A slot's first fold fixes its kind, the same for every group; a fold of another kind, or a slot past `slots`, is `BC_E_HANDLE`. An integer sum, or a count, that overflows is `BC_E_ARITH` ("bigint out of range"); a double sum that overflows from finite values is `BC_E_ARITH` ("value out of range: overflow"), as PostgreSQL's `float8` sum, and an infinite or NaN input carries through. |
 | `bc_agg_next` | Iterates groups in first-appearance order, one unit each. |
 | `bc_agg_clear` | Drops every group and releases what each was charged, its key, `kGroupEntryBytes` and its slots; the slots keep their kinds. The groups' indices start again at 0, under a new generation of the aggregate's groups, so a handle of a dropped group is stale (`BC_E_HANDLE`), never another group's, and the limit of 2^32 groups (`BC_E_LIMIT`) counts the groups held, not every group ever made. A streamed `COUNT(DISTINCT)` clears its values' aggregate as each group ends, so it holds only the current group's (`planner_design.md`, *Aggregates*). Once `bc_agg_next` has started on it, `BC_E_HANDLE`. |
-| `bc_agg_i64`, `bc_agg_f64` | Reads a slot: `bc_agg_f64` a double sum, `bc_agg_i64` any other. A slot read as the other type is `BC_E_HANDLE`; one never folded reads zero either way. |
+| `bc_agg_i64`, `bc_agg_f64` | Reads a slot: `bc_agg_f64` a double sum, minimum or maximum, `bc_agg_i64` any other. A slot read as the other type is `BC_E_HANDLE`; one never folded reads zero either way. |
 | `bc_agg_null` | True when no value was folded into the slot in this group, of any kind; a slot past `slots` is `BC_E_HANDLE`. |
 
 **PostgreSQL's NULLs are the plan's.** The slots hold numbers, never

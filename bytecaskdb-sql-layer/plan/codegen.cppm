@@ -1774,7 +1774,8 @@ private:
     auto count = e.fn == Expr::Fn::Count;
     if (g.op->streamed) return {count ? "" : "!" + local("xs", g, j), local("x", g, j)};
     auto slot = std::to_string(g.layout.agg_slot[j]);
-    return {count ? "" : "bc_agg_null(cx, " + g.handle + ", " + slot + ")", "bc_agg_i64(cx, " + g.handle + ", " + slot + ")"};
+    return {count ? "" : "bc_agg_null(cx, " + g.handle + ", " + slot + ")",
+            std::string{folds_f64(e) ? "bc_agg_f64" : "bc_agg_i64"} + "(cx, " + g.handle + ", " + slot + ")"};
   }
 
   // Whether the group fails a HAVING conjunct, as C: NULL on either side, or
@@ -1811,20 +1812,25 @@ private:
       } else {
         auto slot = g.layout.agg_slot[j];
         is_null = "bc_agg_null(cx, " + g.handle + ", " + std::to_string(slot) + ")";
-        sum = "bc_agg_i64(cx, " + g.handle + ", " + std::to_string(slot) + ")";
+        sum = std::string{folds_f64(e) ? "bc_agg_f64" : "bc_agg_i64"} + "(cx, " + g.handle + ", " + std::to_string(slot) + ")";
         count = "bc_agg_i64(cx, " + g.handle + ", " + std::to_string(slot + 1) + ")";
       }
       w_.open("if (" + is_null + ")");
       w_.line("bc_emit_null(cx);");
-      w_.line("bc_emit_null(cx);");
+      if (!folds_f64(e)) w_.line("bc_emit_null(cx);");
       w_.otherwise();
-      w_.line("bc_emit_i64(cx, " + sum + ");");
-      w_.line("bc_emit_i64(cx, " + count + ");");
+      if (folds_f64(e)) {
+        // PostgreSQL's float8 average: the sum over the count.
+        w_.line("bc_emit_f64(cx, " + sum + " / bc_i64_to_f64(" + count + "));");
+      } else {
+        w_.line("bc_emit_i64(cx, " + sum + ");");
+        w_.line("bc_emit_i64(cx, " + count + ");");
+      }
       w_.close();
       return;
     }
     auto [is_null, value] = group_value(e);
-    auto type = e.kind == Expr::Kind::Column ? e.col.type : PhysType::I64;
+    auto type = e.kind == Expr::Kind::Column ? e.col.type : folds_f64(e) ? PhysType::F64 : PhysType::I64;
     auto emit = "bc_emit_" + suffix(type) + "(cx, " + value + ");";
     if (is_null.empty()) {
       w_.line(emit);
@@ -1929,33 +1935,59 @@ private:
     w_.line("bc_agg_count(cx, " + gg + ", 0);");
     for (std::size_t j = 0; j < op.aggs.size(); ++j) {
       const auto& a = op.aggs[j];
-      if (a.args.empty()) continue;  // COUNT(*): slot 0
+      if (a.args.empty() || a.distinct) continue;  // COUNT(*): slot 0
       const auto& arg = a.args[0].col;
-      const auto slot = std::to_string(g.layout.agg_slot[j]);
       if (arg.nullable) w_.open("if (!" + col_null(arg) + ")");
-      if (a.distinct) {
-        distinct_value(g, arg, gr, "bc_agg_count(cx, " + gg + ", " + slot + ");");
-      } else {
-        switch (a.fn) {
-          case Expr::Fn::Count: w_.line("bc_agg_count(cx, " + gg + ", " + slot + ");"); break;
-          case Expr::Fn::Sum: w_.line("bc_agg_add_i64(cx, " + gg + ", " + slot + ", " + read_col(arg) + ");"); break;
-          case Expr::Fn::Min: w_.line("bc_agg_min_i64(cx, " + gg + ", " + slot + ", " + read_col(arg) + ");"); break;
-          case Expr::Fn::Max: w_.line("bc_agg_max_i64(cx, " + gg + ", " + slot + ", " + read_col(arg) + ");"); break;
-          case Expr::Fn::Avg:
-            w_.line("bc_agg_add_i64(cx, " + gg + ", " + slot + ", " + read_col(arg) + ");");
-            w_.line("bc_agg_count(cx, " + gg + ", " + std::to_string(g.layout.agg_slot[j] + 1) + ");");
-            break;
-        }
+      for (const auto& line : structure_fold(g, j, gg)) w_.line(line);
+      if (arg.nullable) w_.close();
+    }
+    for (std::size_t m = 0; m < g.layout.distinct.size(); ++m) {
+      const auto& arg = g.layout.distinct[m];
+      std::vector<std::string> folds;
+      for (std::size_t j = 0; j < op.aggs.size(); ++j) {
+        if (!op.aggs[j].distinct || op.aggs[j].args[0].col != arg) continue;
+        for (auto& line : structure_fold(g, j, gg)) folds.push_back(std::move(line));
       }
+      if (arg.nullable) w_.open("if (!" + col_null(arg) + ")");
+      distinct_value(g, arg, gr, folds);
       if (arg.nullable) w_.close();
     }
   }
 
-  // A COUNT(DISTINCT) of `arg` in the group in hand: its value, keyed in the
-  // argument's structure d<i>_<m>; in a structure after the group's key
-  // `group_key`, streamed alone, since the stream clears d<i>_<m> as each
-  // group ends. `counted` runs when the value is new to the group.
-  void distinct_value(const Group& g, const ColumnRef& arg, const std::string& group_key, const std::string& counted) {
+  // Whether the aggregate folds doubles: a SUM, AVG, MIN or MAX of a DOUBLE.
+  static auto folds_f64(const Expr& a) -> bool {
+    return a.fn != Expr::Fn::Count && !a.args.empty() && a.args[0].col.type == PhysType::F64;
+  }
+
+  // The statements folding the row in hand's argument of aggregate j into
+  // its slots of group `gg`.
+  auto structure_fold(const Group& g, std::size_t j, const std::string& gg) -> std::vector<std::string> {
+    const auto& a = g.op->aggs[j];
+    const auto& arg = a.args[0].col;
+    const auto slot = std::to_string(g.layout.agg_slot[j]);
+    const auto at = "(cx, " + gg + ", " + slot + ", " + read_col(arg) + ");";
+    const auto f64 = folds_f64(a);
+    switch (a.fn) {
+      case Expr::Fn::Count: return {"bc_agg_count(cx, " + gg + ", " + slot + ");"};
+      case Expr::Fn::Sum: return {std::string{f64 ? "bc_agg_add_f64" : "bc_agg_add_i64"} + at};
+      case Expr::Fn::Min: return {std::string{f64 ? "bc_agg_min_f64" : "bc_agg_min_i64"} + at};
+      case Expr::Fn::Max: return {std::string{f64 ? "bc_agg_max_f64" : "bc_agg_max_i64"} + at};
+      case Expr::Fn::Avg:
+        return {std::string{f64 ? "bc_agg_add_f64" : "bc_agg_add_i64"} + at,
+                "bc_agg_count(cx, " + gg + ", " + std::to_string(g.layout.agg_slot[j] + 1) + ");"};
+    }
+    std::unreachable();
+  }
+
+  // The aggregates of DISTINCT values over `arg` in the group in hand: its
+  // value, keyed in the argument's structure d<i>_<m>; in a structure after
+  // the group's key `group_key`, streamed alone, since the stream clears
+  // d<i>_<m> as each group ends. `folds` run when the value is new to the
+  // group, all the aggregates over `arg` at once. The structure grows by a
+  // key per distinct value per group and is charged to the statement's
+  // memory budget like a group: past it the statement fails with 54000.
+  void distinct_value(const Group& g, const ColumnRef& arg, const std::string& group_key,
+                      const std::vector<std::string>& folds) {
     auto m = static_cast<std::size_t>(std::ranges::find(g.layout.distinct, arg) - g.layout.distinct.begin());
     const auto dk = local("dk", g, m);
     const auto dg = local("dg", g, m);
@@ -1965,7 +1997,7 @@ private:
     w_.line("bc_group " + dg + " = bc_agg_group(cx, " + local("d", g, m) + ", bc_sort_key_end(cx, " + dk + "));");
     w_.open("if (bc_agg_null(cx, " + dg + ", 0))");
     w_.line("bc_agg_count(cx, " + dg + ", 0);");
-    w_.line(counted);
+    for (const auto& f : folds) w_.line(f);
     w_.close();
   }
 
@@ -1980,7 +2012,7 @@ private:
       }
     }
     for (std::size_t m = 0; m < g.layout.distinct.size(); ++m) {
-      w_.line("bc_agg " + local("d", g, m) + " = bc_agg_open(cx, 1);  // COUNT(DISTINCT) values seen per group");
+      w_.line("bc_agg " + local("d", g, m) + " = bc_agg_open(cx, 1);  // DISTINCT values seen per group");
     }
   }
 
@@ -2016,7 +2048,7 @@ private:
   // so the group is kept in locals, given (k) inside the input's loop when a
   // row of another group starts the next, and after it for the last. Each
   // dependent column is read from every row and kept as a key is: every row
-  // of a group holds the same value. A COUNT(DISTINCT)'s values are cleared as
+  // of a group holds the same value. An aggregate's distinct values are cleared as
   // each group ends: the stream holds only the group in hand's. With no key,
   // one group, given after the input, over no rows too. A LIMIT's counter is
   // the input loop's, and the last group's.
@@ -2032,7 +2064,7 @@ private:
     auto reset = [&](bool declare) {
       for (std::size_t j = 0; j < op.aggs.size(); ++j) {
         const auto& a = op.aggs[j];
-        w_.line((declare ? "int64_t " : "") + local("x", g, j) + " = 0;");
+        w_.line((declare ? (folds_f64(a) ? "double " : "int64_t ") : "") + local("x", g, j) + " = 0;");
         if (a.fn != Expr::Fn::Count) w_.line((declare ? "bool " : "") + local("xs", g, j) + " = false;");
         if (a.fn == Expr::Fn::Avg) w_.line((declare ? "int64_t " : "") + local("xc", g, j) + " = 0;");
       }
@@ -2096,6 +2128,37 @@ private:
     w_.close();
   }
 
+  // The statements folding the row in hand's argument of aggregate j into
+  // the streamed group's locals: x<j> the count, sum, minimum or maximum,
+  // xs<j> whether a value was folded, xc<j> an AVG's count.
+  auto local_fold(const Group& g, std::size_t j) -> std::vector<std::string> {
+    const auto& a = g.op->aggs[j];
+    const auto& arg = a.args[0].col;
+    const auto x = local("x", g, j);
+    const auto xs = local("xs", g, j);
+    const auto v = read_col(arg);
+    const auto f64 = folds_f64(a);
+    auto sum = x + " = " + (f64 ? "bc_add_f64" : "bc_add") + "(cx, " + x + ", " + v + ");";
+    switch (a.fn) {
+      case Expr::Fn::Count: return {"++" + x + ";"};
+      case Expr::Fn::Sum: return {sum, xs + " = true;"};
+      case Expr::Fn::Min:
+      case Expr::Fn::Max: {
+        const auto lv = local("v", g, j);
+        if (f64) {
+          auto pick = std::string{a.fn == Expr::Fn::Min ? "bc_min_f64" : "bc_max_f64"};
+          return {"double " + lv + " = " + v + ";", x + " = " + xs + " ? " + pick + "(" + x + ", " + lv + ") : " + lv + ";",
+                  xs + " = true;"};
+        }
+        return {"int64_t " + lv + " = " + v + ";",
+                "if (!" + xs + " || " + lv + (a.fn == Expr::Fn::Min ? " < " : " > ") + x + ") " + x + " = " + lv + ";",
+                xs + " = true;"};
+      }
+      case Expr::Fn::Avg: return {sum, xs + " = true;", "++" + local("xc", g, j) + ";"};
+    }
+    std::unreachable();
+  }
+
   // The row in hand folded into the streamed group's locals. NULLs are
   // skipped.
   void fold_into_locals(const Group& g) {
@@ -2112,38 +2175,25 @@ private:
     }
     for (std::size_t j = 0; j < op.aggs.size(); ++j) {
       const auto& a = op.aggs[j];
-      const auto x = local("x", g, j);
-      const auto xs = local("xs", g, j);
       if (a.args.empty()) {
-        w_.line("++" + x + ";");  // COUNT(*)
+        w_.line("++" + local("x", g, j) + ";");  // COUNT(*)
         continue;
       }
+      if (a.distinct) continue;
       const auto& arg = a.args[0].col;
       if (arg.nullable) w_.open("if (!" + col_null(arg) + ")");
-      if (a.distinct) {
-        distinct_value(g, arg, "", "++" + x + ";");
-      } else {
-        switch (a.fn) {
-          case Expr::Fn::Count: w_.line("++" + x + ";"); break;
-          case Expr::Fn::Sum:
-            w_.line(x + " = bc_add(cx, " + x + ", " + read_col(arg) + ");");
-            w_.line(xs + " = true;");
-            break;
-          case Expr::Fn::Min:
-          case Expr::Fn::Max: {
-            const auto v = local("v", g, j);
-            w_.line("int64_t " + v + " = " + read_col(arg) + ";");
-            w_.line("if (!" + xs + " || " + v + (a.fn == Expr::Fn::Min ? " < " : " > ") + x + ") " + x + " = " + v + ";");
-            w_.line(xs + " = true;");
-            break;
-          }
-          case Expr::Fn::Avg:
-            w_.line(x + " = bc_add(cx, " + x + ", " + read_col(arg) + ");");
-            w_.line(xs + " = true;");
-            w_.line("++" + local("xc", g, j) + ";");
-            break;
-        }
+      for (const auto& line : local_fold(g, j)) w_.line(line);
+      if (arg.nullable) w_.close();
+    }
+    for (std::size_t m = 0; m < g.layout.distinct.size(); ++m) {
+      const auto& arg = g.layout.distinct[m];
+      std::vector<std::string> folds;
+      for (std::size_t j = 0; j < op.aggs.size(); ++j) {
+        if (!op.aggs[j].distinct || op.aggs[j].args[0].col != arg) continue;
+        for (auto& line : local_fold(g, j)) folds.push_back(std::move(line));
       }
+      if (arg.nullable) w_.open("if (!" + col_null(arg) + ")");
+      distinct_value(g, arg, "", folds);
       if (arg.nullable) w_.close();
     }
     keyed_ = nullptr;

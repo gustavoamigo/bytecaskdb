@@ -2243,7 +2243,7 @@ private:
   };
 
   // Whether a SELECT is aggregated other than as slice 1's one aggregate row
-  // (a COUNT or a SUM, no GROUP BY, no HAVING): grouped, or of other
+  // (a COUNT or an integer SUM, no GROUP BY, no HAVING): grouped, or of other
   // aggregates, or several. A lone MIN takes the grouped route, as a lone
   // MAX does, and from_keys answers either there.
   static auto grouped(const logical::Node& root) -> bool {
@@ -2259,8 +2259,10 @@ private:
     if (a == nullptr) return false;
     if (a->grouped || !a->group_by.empty() || a->aggs.size() != 1) return true;
     const auto& e = a->aggs[0].expr;
-    return e.kind != Expr::Kind::Aggregate ||
-           (e.fn != Expr::Fn::Count && e.fn != Expr::Fn::Sum);
+    // The one aggregate row sums integers whole; a SUM of DISTINCT values or
+    // of a DOUBLE takes the grouped route.
+    return e.kind != Expr::Kind::Aggregate || (e.fn != Expr::Fn::Count && e.fn != Expr::Fn::Sum) ||
+           (e.fn == Expr::Fn::Sum && (e.distinct || e.args[0].col.type == PhysType::F64));
   }
 
   static auto group_parts(const logical::Node& root) -> GroupParts {
