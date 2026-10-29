@@ -82,6 +82,25 @@ struct Rows {
   std::int64_t affected{-1};  // INSERT, UPDATE, DELETE: rows changed
 };
 
+// Which of a read statement's rows a run returns: the first `skip` are
+// dropped and the next `limit` kept (docs/cursor_design.md, *The replay
+// cursor*).
+struct RowWindow {
+  std::uint64_t skip{0};
+  std::uint64_t limit{std::numeric_limits<std::uint64_t>::max()};
+};
+
+// A windowed run's rows and where it stopped. `position` is the rows the
+// plan ended, dropped ones included; `end` is true when the plan ran out of
+// rows before the window was full, and `position` is then the whole result's
+// size. A run that kept exactly `limit` rows has not found out whether more
+// follow: `end` is false.
+struct WindowRows {
+  Rows rows;
+  std::uint64_t position{0};
+  bool end{false};
+};
+
 // A plan that ran and failed: the plan API's error code, its detail and
 // message (a duplicate key is BC_E_CONSTRAINT with BC_C_UNIQUE in the
 // detail's high byte, raised by the plan); or a conflict on every retry.
@@ -221,6 +240,10 @@ public:
   [[nodiscard]] auto columns() const -> std::vector<ResultColumn>;
   // The plan file, as EXPLAIN would print it; empty for DDL.
   [[nodiscard]] auto plan_source() const -> std::string;
+  // Of the plan the statement runs now: a cursor over it may resume from a
+  // checkpoint rather than replay from the first row. False for DDL and for
+  // a statement that returns no rows.
+  [[nodiscard]] auto is_resumable() const -> bool;
 
 private:
   friend class Database;
@@ -357,6 +380,13 @@ public:
   // throws SerializationFailure, and the transaction has ended.
   auto execute(const Statement& stmt, const std::vector<Value>& params) -> Rows;
   auto execute(std::string_view sql, const std::vector<Value>& params = {}) -> Rows;
+  // Runs a statement that returns rows over the transaction's snapshot and
+  // overlay, keeping the window's rows: the replay runner a cursor is built
+  // on. The same statement, parameters and view give the same rows on every
+  // run, so a window of the rows is the same slice of the whole result. A
+  // statement that returns no rows throws std::invalid_argument, the
+  // transaction unchanged. Otherwise as execute.
+  auto execute_window(const Statement& stmt, const std::vector<Value>& params, RowWindow window) -> WindowRows;
   // Writes every statement's writes as one batch: Committed. After a failed
   // statement it writes nothing and returns RolledBack. Throws
   // SerializationFailure on a conflict and ExecError on an engine error,
@@ -375,7 +405,8 @@ private:
   // Under life_->mu, shared: refuses a call on a closed database or an
   // ended or aborted transaction.
   void check_usable() const;
-  auto run_locked(const Statement& stmt, const std::vector<Value>& params) -> Rows;
+  auto run_locked(const Statement& stmt, const std::vector<Value>& params, WindowRows* window = nullptr,
+                  RowWindow range = {}) -> Rows;
   void end_locked() noexcept;  // under life_->mu, shared: forgets and frees it
 
   std::shared_ptr<DatabaseLife> life_;
@@ -540,7 +571,10 @@ private:
   // Runs a DML statement on `cx`: autocommit, retried on a conflict, when
   // `txn` is null; else as a statement of `txn`, its writes added to it.
   // `now_us` is the statement's time (a transaction's start), read once.
-  auto run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn, std::int64_t now_us) -> Rows;
+  // `window`, only with a transaction, runs the statement windowed and
+  // records where it stopped in the position and end of `*window`.
+  auto run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn, std::int64_t now_us,
+           WindowRows* window = nullptr, RowWindow range = {}) -> Rows;
   [[nodiscard]] auto clock_now() const -> std::int64_t { return clock_(); }
   // Throws ParamError for parameters the plan does not take, and ExecError
   // BC_C_RANGE for a value outside its parameter's SQL type.
@@ -777,6 +811,11 @@ auto Statement::param_types() const -> std::vector<PhysType> {
 auto Statement::plan_source() const -> std::string {
   auto c = compiled();
   return c ? c->plan->source : std::string{};
+}
+
+auto Statement::is_resumable() const -> bool {
+  auto c = compiled();
+  return c && c->plan->returns_rows && c->plan->resumable;
 }
 
 auto Statement::params() const -> std::vector<ParamInfo> {
@@ -1181,7 +1220,8 @@ void Database::recompile_view_plan(const Statement& stmt) {
   (void)recompile(stmt);
 }
 
-auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn, std::int64_t now_us) -> Rows {
+auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn, std::int64_t now_us,
+                   WindowRows* window, RowWindow range) -> Rows {
   recompile_view_plan(stmt);
   // The context reads the parameters through bp, filled once the plan that
   // runs is known: the caller's, then its constants (plan_params).
@@ -1195,6 +1235,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
     // since the transaction began: 40001, as a commit after it would be.
     for (auto attempt = 0;; ++attempt) {
       bc_ctx_begin_txn(cx, txn, &bp, budget_);
+      if (window != nullptr) bc_ctx_window(cx, range.skip, range.limit);
       auto pinned = bc_txn_catalog_version(txn);
 #ifdef BYTECASK_SQL_TESTING
       if (after_txn_pin_) after_txn_pin_();
@@ -1235,6 +1276,10 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
       }
       // The statement's writes join the transaction, or it aborts.
       if (!bc_txn_add(cx)) throw_context_error(cx);
+      if (window != nullptr) {
+        window->position = bc_ctx_emitted(cx);
+        window->end = !bc_ctx_stopped(cx);
+      }
       return results(cx, *c, Rows{});
     }
   }
@@ -1400,11 +1445,12 @@ void Transaction::check_usable() const {
   if (state == TxnState::Aborted) throw TransactionAborted();
 }
 
-auto Transaction::run_locked(const Statement& stmt, const std::vector<Value>& params) -> Rows {
+auto Transaction::run_locked(const Statement& stmt, const std::vector<Value>& params, WindowRows* window, RowWindow range)
+    -> Rows {
   try {
     // DDL is its own atomic operation, never part of a transaction.
     if (stmt.is_ddl()) throw FeatureNotSupported("DDL inside a transaction is not supported: run it outside one");
-    return db_->run(h_->cx, stmt, params, h_->txn, h_->started_us);
+    return db_->run(h_->cx, stmt, params, h_->txn, h_->started_us, window, range);
   } catch (const SerializationFailure&) {
     end_locked();
     throw;
@@ -1423,6 +1469,19 @@ auto Transaction::execute(const Statement& stmt, const std::vector<Value>& param
   // A misuse of the handle, not a failed statement: the transaction stays as it was.
   if (stmt.owner_ != db_) throw std::logic_error("the statement was prepared on another database");
   return run_locked(stmt, params);
+}
+
+auto Transaction::execute_window(const Statement& stmt, const std::vector<Value>& params, RowWindow window)
+    -> WindowRows {
+  if (!h_) throw std::logic_error("the transaction has ended");
+  std::shared_lock<std::shared_mutex> lock{life_->mu};
+  check_usable();
+  if (stmt.owner_ != db_) throw std::logic_error("the statement was prepared on another database");
+  auto c = stmt.compiled();
+  if (!c || !c->plan->returns_rows) throw std::invalid_argument("execute_window needs a statement that returns rows");
+  WindowRows out;
+  out.rows = run_locked(stmt, params, &out, window);
+  return out;
 }
 
 auto Transaction::execute(std::string_view sql, const std::vector<Value>& params) -> Rows {
