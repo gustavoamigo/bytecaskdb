@@ -222,12 +222,36 @@
   teardown:
     - DROP TABLE t
 
-- name: a table with no primary key
+- name: a table with no primary key keeps duplicate rows
   features: [F031-01]
-  # a table needs a PRIMARY KEY (frontend_design.md, What the layer doesn't do yet)
-  unimplemented: true
   steps:
-    - sql: CREATE TABLE n (a INTEGER)
+    - sql: CREATE TABLE n (a INTEGER, b TEXT)
+    - sql: INSERT INTO n VALUES ($1, $2)
+      params: [1, "x"]
+      rowcount: 1
+    - sql: INSERT INTO n VALUES ($1, $2)
+      params: [1, "x"]
+      rowcount: 1
+    - sql: INSERT INTO n (b) VALUES ($1)
+      params: ["y"]
+      rowcount: 1
+    - sql: SELECT a, b, COUNT(*) FROM n GROUP BY a, b ORDER BY a
+      expected: [[1, "x", 2], [null, "y", 1]]
+      ordered: true
+    - sql: UPDATE n SET b = $1 WHERE a = $2
+      params: ["z", 1]
+      rowcount: 2
+    - sql: DELETE FROM n WHERE b = $1
+      params: ["y"]
+      rowcount: 1
+    - sql: SELECT a, b FROM n
+      expected: [[1, "z"], [1, "z"]]
+    - restart: true
+    - sql: INSERT INTO n VALUES ($1, $2)
+      params: [1, "z"]
+      rowcount: 1
+    - sql: SELECT a, b FROM n
+      expected: [[1, "z"], [1, "z"], [1, "z"]]
   teardown:
     - DROP TABLE n
 

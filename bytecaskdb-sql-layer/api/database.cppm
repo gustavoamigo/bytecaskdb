@@ -1425,10 +1425,12 @@ auto Database::table_rows(std::string_view table) const -> Rows {
   if (t == nullptr) throw ast::SqlError("relation \"" + std::string{table} + "\" does not exist", -1, kUndefinedTable);
   Rows out;
   // The table's layout with its slots in column order, the order the rows
-  // are read in. A column a row's bitmap has no bit for reads as NULL.
+  // are read in, without the hidden row id: the columns a statement sees. A
+  // column a row's bitmap has no bit for reads as NULL.
   auto layout = t->layout;
   layout.columns.clear();
   for (const auto& c : t->columns) {
+    if (c.hidden) continue;
     const auto* slot = t->layout.find(c.id);
     if (slot == nullptr) throw std::runtime_error("column " + c.name + " is not in the layout of table " + t->name);
     layout.columns.push_back(*slot);

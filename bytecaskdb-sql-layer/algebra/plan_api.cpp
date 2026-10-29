@@ -3788,6 +3788,12 @@ bc_row bc_row_begin(bc_ctx* cx, uint32_t table) {
       return {};
     }
   }
+  // A table without a primary key: its hidden row id, drawn now, so a retry
+  // of the plan draws another.
+  if (const auto* rid = t->row_id(); rid != nullptr && !b.writer().set_i64(rid->id, cx->live->next_row_id(*t))) {
+    cx->fail(BC_E_CORRUPT, "the row id of table " + t->name + " does not fit its layout");
+    return {};
+  }
   return b.keep();
   BC_GUARD_END(cx)
   return {};
