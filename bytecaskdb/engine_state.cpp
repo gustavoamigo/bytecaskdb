@@ -67,18 +67,31 @@ void TransientEngineState::apply_change_marker(std::uint64_t sequence,
 }
 
 auto TransientEngineState::validate_preconditions(
-    const WritePlan &plan, std::uint64_t &rests_on) const -> bool {
-  const auto *snap_state =
-      plan.snap_ ? plan.snap_->state_.get() : nullptr;
+    const WritePlan &plan, const DeleteLog &deletes,
+    std::uint64_t &rests_on) const -> Verdict {
+  const auto read_seq = plan.read_seq_;
+  if (read_seq && !deletes.covers(*read_seq)) return Verdict::TooOld;
   // The head's latest sequence: what an outcome rests on when the entry it
   // read has no sequence of its own (deleted, or absent).
   const auto head_latest = next_seq_ - 1;
-  const auto read_seq = [&](const std::optional<KeyDirEntry> &cur) {
+  const auto read_seq_of = [&](const std::optional<KeyDirEntry> &cur) {
     return cur ? cur->sequence() : head_latest;
   };
   const auto lost = [&](const std::optional<KeyDirEntry> &cur) {
-    rests_on = read_seq(cur);
-    return false;
+    rests_on = read_seq_of(cur);
+    return Verdict::Conflict;
+  };
+  // Whether key changed since the read sequence. A present key changed if
+  // its entry is newer: nothing but a write gives an entry a sequence, and
+  // vacuum keeps it. An absent one changed if a write since removed it;
+  // one written and removed again since counts too.
+  const auto changed = [&](std::span<const std::byte> key,
+                           const std::optional<KeyDirEntry> &cur) {
+    if (cur) return cur->sequence() > *read_seq;
+    return deletes.removed(key, *read_seq, next_seq_) ||
+           std::ranges::any_of(removed_, [&](const KeyRemoval &r) {
+             return std::ranges::equal(r.key, key);
+           });
   };
   std::uint64_t held_on = 0;
 
@@ -90,51 +103,44 @@ auto TransientEngineState::validate_preconditions(
     switch (guard.precondition) {
     case WritePlan::Precondition::MustExist:
       if (!cur_entry) return lost(std::nullopt);
-      held_on = std::max(held_on, read_seq(cur_entry));
+      held_on = std::max(held_on, read_seq_of(cur_entry));
       break;
     case WritePlan::Precondition::MustBeAbsent:
       if (cur_entry) return lost(cur_entry);
-      held_on = std::max(held_on, read_seq(cur_entry));
+      held_on = std::max(held_on, read_seq_of(cur_entry));
       break;
-    case WritePlan::Precondition::MustBeUnchanged: {
-      // ensure_unchanged already enforced snap_ is present at build time.
-      const auto snap_entry = kd_get(snap_state->key_dir, key_span, snap_state->kd_ctx());
-      const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence() : 0;
-      const std::uint64_t cur_seq = cur_entry ? cur_entry->sequence() : 0;
-      if (cur_seq != snap_seq) return lost(cur_entry);
-      held_on = std::max(held_on, read_seq(cur_entry));
+    case WritePlan::Precondition::MustBeUnchanged:
+      // ensure_unchanged already enforced a read sequence at build time.
+      if (changed(key_span, cur_entry)) return lost(cur_entry);
+      held_on = std::max(held_on, read_seq_of(cur_entry));
       break;
-    }
     case WritePlan::Precondition::None:
       break;
     }
   }
 
-  // 2. Range guards (only present when snap_ is set — enforced at build time).
-  // One that holds read keys absent from both states too, which have no
-  // sequence: it rests on the head's latest.
+  // 2. Range guards (only present with a read sequence — enforced at build
+  // time). One that holds read keys absent from both states too, which have
+  // no sequence: it rests on the head's latest.
   for (const auto &rg : plan.range_guards_) {
-    if (range_changed(*snap_state, rg.from, rg.to, rests_on)) return false;
+    if (range_changed(*read_seq, deletes, rg.from, rg.to, rests_on))
+      return Verdict::Conflict;
     held_on = head_latest;
   }
 
-  // 3. Implicit W-W check on all write keys (only when snapshot present).
-  if (snap_state) {
-    // The key changed since the snapshot unless the head maps it to the
-    // snapshot's record, or it is absent from both. The head is asked by
-    // location first, which reads nothing; only a key that moved is read,
-    // to tell a changed key from one vacuum relocated.
+  // 3. Implicit W-W check on all write keys (only with a read sequence).
+  if (read_seq) {
+    // A key the head still maps to the snapshot's record is unchanged: the
+    // record is at or below the read sequence, and a location names one
+    // record. Asking by location reads nothing; only a key that moved, or a
+    // plan with no locations, is looked up by key.
     const auto point_conflict = [&](std::size_t i, const Bytes &key) {
       const std::span<const std::byte> key_span{key};
-      const auto snap_entry = plan.snapshot_entry(i, key_span);
-      if (snap_entry && kd_holds(key_dir_, key_span, *snap_entry)) return false;
+      const auto &at = plan.resolved_entry(i);
+      if (at && kd_holds(key_dir_, key_span, *at)) return false;
       const auto cur_entry = kd_get(key_dir_, key_span, kd_ctx());
-      const bool appeared = !snap_entry && cur_entry;
-      const bool deleted = snap_entry && !cur_entry;
-      const bool modified = snap_entry && cur_entry &&
-                            cur_entry->sequence() != snap_entry->sequence();
-      if (!(appeared || deleted || modified)) return false;
-      rests_on = read_seq(cur_entry);
+      if (!changed(key_span, cur_entry)) return false;
+      rests_on = read_seq_of(cur_entry);
       return true;
     };
     for (std::size_t i = 0; i < plan.writes_.size(); ++i) {
@@ -146,47 +152,45 @@ auto TransientEngineState::validate_preconditions(
                           std::is_same_v<T, WritePlan::PointDel>) {
               has_conflict = point_conflict(i, op.key);
             } else if constexpr (std::is_same_v<T, WritePlan::RangeDel>) {
-              has_conflict = range_changed(*snap_state, op.from, op.to, rests_on);
+              has_conflict =
+                  range_changed(*read_seq, deletes, op.from, op.to, rests_on);
             }
           },
           plan.writes_[i]);
-      if (has_conflict) return false;
+      if (has_conflict) return Verdict::Conflict;
     }
   }
 
   rests_on = held_on;
-  return true;
+  return Verdict::Holds;
 }
 
-auto TransientEngineState::range_changed(const EngineState &snap,
+auto TransientEngineState::range_changed(std::uint64_t read_seq,
+                                         const DeleteLog &deletes,
                                          std::span<const std::byte> from,
                                          std::span<const std::byte> to,
                                          std::uint64_t &rests_on) const -> bool {
-  // Keys changed or inserted since the snapshot: present in the head with a
-  // sequence the snapshot does not hold for them. A key vacuum relocated
-  // keeps its sequence, so it is not a change.
+  // Keys changed or inserted since read_seq: present with a newer entry. A
+  // key vacuum relocated keeps its sequence, so it is not a change.
   for (auto it = kd_lower_bound(key_dir_, from, kd_ctx());
        it != std::default_sentinel; ++it) {
     auto [key_span, entry] = *it;
     if (Key{key_span} >= Key{to}) break;
-    const auto snap_entry = kd_get(snap.key_dir, key_span, snap.kd_ctx());
-    const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence() : 0;
-    if (entry.sequence() != snap_seq) {
+    if (entry.sequence() > read_seq) {
       rests_on = entry.sequence();
       return true;
     }
   }
-  // Keys deleted since the snapshot, by del or by a range tombstone: present
-  // in the snapshot, absent from the head. They leave no entry to carry a
-  // sequence, so a retry has to see the head's latest.
-  for (auto it = kd_lower_bound(snap.key_dir, from, snap.kd_ctx());
-       it != std::default_sentinel; ++it) {
-    auto [key_span, entry] = *it;
-    if (Key{key_span} >= Key{to}) break;
-    if (!kd_get(key_dir_, key_span, kd_ctx())) {
-      rests_on = next_seq_ - 1;
-      return true;
-    }
+  // Keys removed since read_seq, by del or by a range delete. They leave no
+  // entry to carry a sequence, so a retry has to see the head's latest.
+  const auto in_range = [&](const KeyRemoval &r) {
+    return !std::ranges::lexicographical_compare(r.key, from) &&
+           std::ranges::lexicographical_compare(r.key, to);
+  };
+  if (deletes.removed_in(from, to, read_seq, next_seq_) ||
+      std::ranges::any_of(removed_, in_range)) {
+    rests_on = next_seq_ - 1;
+    return true;
   }
   return false;
 }
@@ -209,13 +213,7 @@ void WritePlan::resolve_snapshot_entries() {
         },
         w);
   }
-}
-
-auto WritePlan::snapshot_entry(std::size_t i, BytesView key) const
-    -> std::optional<KeyDirEntry> {
-  if (i < snap_entries_.size()) return snap_entries_[i];
-  const auto &s = *snap_->state_;
-  return kd_get(s.key_dir, key, s.kd_ctx());
+  snap_.reset();
 }
 
 auto TransientEngineState::prepare_write(const WritePlan &plan) const
@@ -317,6 +315,7 @@ void TransientEngineState::apply_writes(
               const auto dec =
                   entry_size(key_span.size(), existing->value_size());
               file_stats_.patch(existing->file_id(), {.live_removed = dec});
+              removed_.push_back({{key_span.begin(), key_span.end()}, next_seq_});
             }
             const auto del_sz = entry_size(key_span.size(), 0);
             file_stats_.patch(active_file_id_, {.total_added = del_sz, .tombstone_added = del_sz});
@@ -342,7 +341,9 @@ void TransientEngineState::apply_writes(
               to_erase.emplace_back(key_span);
             }
             for (const auto &k : to_erase) {
-              (void)kd_erase(key_dir_, std::span<const std::byte>{k}, kd_ctx());
+              const std::span<const std::byte> k_span{k};
+              (void)kd_erase(key_dir_, k_span, kd_ctx());
+              removed_.push_back({{k_span.begin(), k_span.end()}, next_seq_});
             }
 
             const auto rd_sz = entry_size(op.from.size(), op.to.size());

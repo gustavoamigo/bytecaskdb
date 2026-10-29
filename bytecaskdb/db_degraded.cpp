@@ -194,6 +194,10 @@ void DB::resume() {
   // Build and publish new state. Replay scanned entries into key_dir so that
   // entries on disk but not yet in EngineState become visible.
   t.apply_resume(old_file_id, committed, valid_offset);
+  // The replay can give keys entries at or below a sequence a snapshot of
+  // the degraded state already named, so no plan read before it can be
+  // checked by sequence.
+  deletes_.reset(t.next_seq() - 1);
   t.apply_rotate_file(std::move(read_only_old), std::move(new_file),
                       new_file_id);
   if (pool_) pool_->set_active_file(new_file_id);

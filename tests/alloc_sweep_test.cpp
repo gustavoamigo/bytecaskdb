@@ -663,6 +663,50 @@ TEST_CASE("alloc sweep: the counter sees the engine's allocations",
   }
 }
 
+// A write that fails for want of memory removes nothing, so it leaves no
+// removal for a later plan to conflict with (docs/bytecask_design.md,
+// "Checking a plan by its read sequence"). Each allocation of a batch that
+// writes and removes x and removes y is failed in turn; after each, a plan
+// read from a fresh snapshot that writes both and guards their range commits.
+// Three writes elsewhere come between the snapshot and the plan, so the plan
+// is checked at a head past every sequence the failed batch would have used.
+TEST_CASE("alloc sweep: a write that fails leaves no removal behind",
+          "[alloc_sweep][apply_batch]") {
+  // A node a failed write had not yet placed is leaked (#390), and this
+  // sweep runs in the test process, not a child.
+  const ExpectedLeaks leaks;
+  TempDir td;
+  auto db = open_db(td.path / "db", {});
+  db->put({.sync = true}, to_bytes("y"), to_bytes("v"));
+  for (long nth = 1;; ++nth) {
+    REQUIRE(nth < kMaxAllocations);
+    INFO("allocation " << nth);
+    bytecask::WritePlan p;
+    p.put(to_bytes("x"), to_bytes("v"));
+    p.del(to_bytes("x"));
+    p.del(to_bytes("y"));
+    bool fired = false;
+    {
+      ScopedAllocFaults faults{nth, false};
+      try {
+        (void)db->apply_batch({.sync = true}, std::move(p));
+      } catch (...) {  // NOLINT(bugprone-empty-catch): the failure is the test's own
+      }
+      fired = faults.report().fired;
+    }
+    if (db->is_degraded()) db->resume();
+    const auto read_seq = db->snapshot().sequence();
+    for (int i = 0; i < 3; ++i)
+      db->put({.sync = false}, to_bytes("a"), to_bytes("v"));
+    bytecask::WritePlan q{read_seq};
+    q.ensure_range_unchanged(to_bytes("x"), to_bytes("z"));
+    q.put(to_bytes("x"), to_bytes("w"));
+    q.put(to_bytes("y"), to_bytes("v"));
+    REQUIRE(db->apply_batch({.sync = true}, std::move(q)).has_value());
+    if (!fired) break;
+  }
+}
+
 TEST_CASE("alloc sweep: put", "[alloc_sweep]") { alloc_sweep(put_operation()); }
 
 TEST_CASE("alloc sweep: del", "[alloc_sweep]") { alloc_sweep(del_operation()); }

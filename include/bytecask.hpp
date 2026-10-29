@@ -122,6 +122,38 @@ struct CommitResult {
   bool durable{false};
 };
 
+// Why DB::apply_batch refused a plan. Nothing was written either way.
+enum class PlanRefusal {
+  // A guard failed, or a key the plan writes changed since its read
+  // sequence. Retry from a fresh snapshot.
+  Conflict,
+  // The read sequence is older than the engine still tracks deletes for
+  // (a reopen, resume(), ingest, or more deletes since than
+  // Options::max_delete_log_bytes holds). Take a fresh snapshot.
+  TooOld,
+};
+
+// What DB::apply_batch returns: the CommitResult, or why the plan was
+// refused. Shaped like std::expected<CommitResult, PlanRefusal>, which this
+// header cannot use: it stays C++20 for callers such as the MariaDB plugin.
+class ApplyResult {
+public:
+  ApplyResult(CommitResult result) noexcept : result_{result} {}  // NOLINT(google-explicit-constructor)
+  ApplyResult(PlanRefusal refusal) noexcept : refusal_{refusal} {}  // NOLINT(google-explicit-constructor)
+
+  [[nodiscard]] auto has_value() const noexcept -> bool { return !refusal_; }
+  explicit operator bool() const noexcept { return has_value(); }
+  // On a refusal: {sequence = 0, durable = false}, nothing written.
+  auto operator*() const noexcept -> const CommitResult& { return result_; }
+  auto operator->() const noexcept -> const CommitResult* { return &result_; }
+  // Throws std::bad_optional_access if the plan committed.
+  [[nodiscard]] auto error() const -> PlanRefusal { return refusal_.value(); }
+
+private:
+  CommitResult result_{};
+  std::optional<PlanRefusal> refusal_;
+};
+
 struct ReadOptions {
   bool verify_checksums{true};
 };
@@ -154,6 +186,10 @@ struct Options {
   // Most bytes a thread's record buffers keep after a call on this DB
   // (default 1 MiB, at least 256 KiB).
   std::size_t thread_scratch_bytes{std::size_t{1} << 20};
+  // Most bytes the log of recent deletes holds (default 4 MiB). A plan read
+  // before the oldest delete it still holds is refused as TooOld. 0 keeps
+  // none: a plan read before the latest delete is too old.
+  std::size_t max_delete_log_bytes{std::size_t{4} << 20};
 };
 
 struct SizeLimits {
@@ -414,6 +450,9 @@ class Snapshot {
 public:
   struct Impl;
 
+  // The last write this snapshot sees: all at or below it, none above.
+  [[nodiscard]] auto sequence() const noexcept -> std::uint64_t;
+
   ~Snapshot();
   Snapshot(const Snapshot&) = delete;
   Snapshot& operator=(const Snapshot&) = delete;
@@ -473,6 +512,13 @@ public:
 
   WritePlan();
   explicit WritePlan(SizeLimits limits);
+  // A plan checked against the state at read_sequence (Snapshot::sequence()
+  // of the snapshot its reads came from). Plain data: no snapshot is held,
+  // so it can be built away from the reads, in another process.
+  explicit WritePlan(std::uint64_t read_sequence, SizeLimits limits = {});
+  // WritePlan(snap.sequence(), its limits). Keeps snap only until
+  // apply_batch, which uses it to find the written keys without reading
+  // their records again.
   explicit WritePlan(Snapshot snap);
   ~WritePlan();
   WritePlan(const WritePlan&) = delete;
@@ -486,11 +532,12 @@ public:
 
   void ensure_present(BytesView key);
   void ensure_absent(BytesView key);
-  // Requires snapshot; throws std::logic_error if called without one.
+  // Require a read sequence; throw std::logic_error without one.
   void ensure_unchanged(BytesView key);
   void ensure_range_unchanged(BytesView from, BytesView to);  // from >= to throws
 
-  [[nodiscard]] auto has_snapshot() const noexcept -> bool;
+  [[nodiscard]] auto read_sequence() const noexcept
+      -> std::optional<std::uint64_t>;
 
 private:
   std::unique_ptr<Impl> impl_;
@@ -542,8 +589,9 @@ public:
   void resume();
 
   [[nodiscard]] auto snapshot() const -> Snapshot;
-  [[nodiscard]] auto apply_batch(WriteOptions opts,
-                                 WritePlan plan) -> std::optional<CommitResult>;
+  // A read sequence past the latest throws std::invalid_argument.
+  [[nodiscard]] auto apply_batch(WriteOptions opts, WritePlan plan)
+      -> ApplyResult;
 
   [[nodiscard]] auto iter_from(const ReadOptions& opts,
                                BytesView from = {}) const
@@ -609,6 +657,8 @@ using BufferPoolOptions    = internal::BufferPoolOptions;
 using EntryType            = internal::EntryType;
 using WriteOptions         = internal::WriteOptions;
 using CommitResult         = internal::CommitResult;
+using PlanRefusal          = internal::PlanRefusal;
+using ApplyResult          = internal::ApplyResult;
 using ReadOptions          = internal::ReadOptions;
 using VacuumOptions        = internal::VacuumOptions;
 using internal::kNoRetention;

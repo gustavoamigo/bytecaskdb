@@ -22,8 +22,9 @@ auto del_result = db.del({}, to_bytes("user:1"));    // nullopt if key was absen
 db.del_range({}, to_bytes("session:"), to_bytes("session:~"));
 
 // Atomic batch — all operations land atomically. Every write returns a
-// CommitResult (or nullopt on conflict) carrying the assigned sequence and
-// whether fdatasync confirmed it durable before return.
+// CommitResult carrying the assigned sequence and whether fdatasync
+// confirmed it durable before return; apply_batch returns a PlanRefusal
+// instead when it refuses the plan.
 WritePlan plan;
 plan.put(to_bytes("user:2"), to_bytes("bob"));
 plan.put(to_bytes("user:3"), to_bytes("carol"));
@@ -52,6 +53,24 @@ order.ensure_unchanged(to_bytes("price:widget"));  // reject if price changed
 order.put(to_bytes("order:99"), order_total);
 if (!db.apply_batch({}, std::move(order))) {
     // price changed since snapshot — re-read price and recompute
+}
+
+// A plan is plain data: it needs the sequence its reads came from, not the
+// snapshot. Build it anywhere — another thread, another process — and send it.
+auto snap3 = db.snapshot();
+const std::uint64_t read_seq = snap3.sequence();
+Bytes qty_out;
+snap3.get({}, to_bytes("stock:widget"), qty_out);
+// ... the snapshot can go; the plan carries read_seq ...
+WritePlan remote{read_seq};
+remote.put(to_bytes("stock:widget"), new_stock);
+if (auto r = db.apply_batch({}, std::move(remote)); !r) {
+    if (r.error() == PlanRefusal::TooOld) {
+        // read before a reopen, a resume(), or more deletes since than
+        // Options::max_delete_log_bytes holds — take a fresh snapshot
+    } else {
+        // PlanRefusal::Conflict — stock:widget changed since read_seq
+    }
 }
 
 // Prefix scan — keys and values fetched lazily from disk as it advances.
@@ -110,6 +129,8 @@ struct Options {
     // crash — stays bounded. 0 turns the bound off.
     uint32_t max_hint_backlog{4};
     size_t thread_scratch_bytes{1024 * 1024};   // most a thread's record buffers keep after a call (at least 256 KiB)
+    size_t max_delete_log_bytes{4 << 20};       // most the log of recent deletes holds; a plan read before
+                                                // the oldest delete it holds is refused TooOld (0 = none)
 };
 
 // Selects how sealed data files are read. The active file is written the same
@@ -189,16 +210,18 @@ public:
     [[nodiscard]] auto contains_key(const ReadOptions& opts,
                                     BytesView key) const -> bool;
 
-    // Atomically applies all operations in plan. nullopt on conflict (guard
-    // failure or implicit W-W check) — nothing was written. An empty or
+    // Atomically applies all operations in plan. PlanRefusal::Conflict on a
+    // guard failure or the implicit W-W check, PlanRefusal::TooOld when the
+    // plan's read sequence is older than the log of recent deletes covers —
+    // nothing was written either way. A read sequence past the latest throws
+    // std::invalid_argument. An empty or
     // guard-only plan that passes writes nothing and returns {sequence = 0,
     // durable = true}. With sync it first makes every earlier write durable, so
     // apply_batch({.sync = true}, WritePlan{}) flushes earlier sync=false writes.
     // A plan over 1 GiB on disk, batch markers included, throws
     // std::invalid_argument before anything is written.
     // Throws std::system_error on I/O failure or DbDegraded if the engine is degraded.
-    [[nodiscard]] auto apply_batch(WriteOptions opts,
-                                   WritePlan plan) -> std::optional<CommitResult>;
+    [[nodiscard]] auto apply_batch(WriteOptions opts, WritePlan plan) -> ApplyResult;
 
     // Returns a frozen, move-only, read-only view of the DB at this instant.
     // Holds open referenced data files until destroyed — vacuum deferred automatically.
@@ -314,6 +337,9 @@ public:
 // Holds open any referenced data files until destroyed.
 class Snapshot {
 public:
+    // The last write this snapshot sees: every write at or below it, none
+    // above. A WritePlan built from it is checked against this state.
+    [[nodiscard]] auto sequence() const noexcept -> std::uint64_t;
     [[nodiscard]] auto get(const ReadOptions& opts,
                            BytesView key, Bytes& out) const -> bool;
     [[nodiscard]] auto contains_key(const ReadOptions& opts,
@@ -352,18 +378,35 @@ struct FileManifest {
     std::uint64_t through_sequence{0};   // last sequence covered
 };
 
+// Why apply_batch refused a plan. Nothing was written either way.
+enum class PlanRefusal {
+    Conflict,  // a guard failed, or a written key changed since the read sequence
+    TooOld,    // the read sequence is older than the engine still tracks deletes for
+};
+
+// apply_batch's outcome, shaped like std::expected<CommitResult, PlanRefusal>
+// (the header stays C++20): has_value() / operator bool, *r and r->,
+// and error() for the refusal.
+class ApplyResult;
+
 // Write plan for apply_batch. Groups multiple operations into a single atomic write.
-// Construct with WritePlan(snap) to enable ensure_unchanged / ensure_range_unchanged guards;
-// those methods throw std::logic_error if called on a snapshot-less WritePlan().
-// When a snapshot is present, apply_batch automatically rejects the plan if any
-// write key (put or del) changed since the snapshot — no explicit guard needed on
+// Construct with a read sequence — WritePlan(snap.sequence()), or WritePlan(snap),
+// which takes it — to enable ensure_unchanged / ensure_range_unchanged guards;
+// those methods throw std::logic_error on a plan without one.
+// With a read sequence, apply_batch automatically rejects the plan if any
+// write key (put or del) changed since it — no explicit guard needed on
 // keys in the write set. Use ensure_unchanged for read-only dependencies: keys whose
-// value influenced the plan but that the plan does not modify.
-// A guardless, snapshot-less WritePlan always commits successfully (no conflict possible).
+// value influenced the plan but that the plan does not modify. A key written and
+// deleted again since the read sequence counts as changed.
+// A guardless plan without a read sequence always commits (no conflict possible).
 class WritePlan {
 public:
-    WritePlan();                         // snapshot-less: only ensure_present/ensure_absent available
-    explicit WritePlan(Snapshot snap);   // snapshot embedded; all guards available
+    WritePlan();                         // no read sequence: only ensure_present/ensure_absent available
+    // Checked against the state at read_sequence; holds no snapshot.
+    explicit WritePlan(std::uint64_t read_sequence, SizeLimits limits = {});
+    // WritePlan(snap.sequence()) with snap's limits; keeps snap until apply_batch,
+    // which uses it to find the written keys without reading their records again.
+    explicit WritePlan(Snapshot snap);
 
     void put(BytesView key, BytesView value);
     void del(BytesView key);
@@ -371,10 +414,10 @@ public:
 
     void ensure_present(BytesView key);                         // guard: key must exist
     void ensure_absent(BytesView key);                          // guard: key must be absent
-    void ensure_unchanged(BytesView key);                       // guard: key unchanged since snapshot
+    void ensure_unchanged(BytesView key);                       // guard: key unchanged since read sequence
     void ensure_range_unchanged(BytesView from, BytesView to);  // guard: no key change in [from, to)
 
-    [[nodiscard]] auto has_snapshot() const noexcept -> bool;
+    [[nodiscard]] auto read_sequence() const noexcept -> std::optional<std::uint64_t>;
 };
 
 // The identity of a history from a promotion on: the marker entry's own
@@ -422,4 +465,4 @@ class DbClosed : public std::logic_error { /* ... */ };
 } // namespace bytecask
 ```
 
-Error handling follows the throw-on-failure convention used by the C++ standard library: a key, value or plan over its limit, or an option over its hard ceiling at `open`, throws `std::invalid_argument` before anything is written; I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; an internal invariant violation that cannot be continued through safely — currently only a reused data file name, which would silently drop writes at recovery — prints to stderr and aborts the process rather than throwing, since the write path would otherwise catch it and retry into the same corrupt state; write operations on a degraded engine throw `DbDegraded` (a `std::runtime_error` subclass, catchable separately); normal writes in follower mode throw `DbFollowerMode`; an `ingest` from a history that diverged at a promotion throws `DbChangeMarkerMismatch`; any call on a closed `DB` throws `DbClosed` (a `std::logic_error`). Key-not-found is signalled by `get` returning `false`; `apply_batch` (and `del`) return `nullopt` on precondition or W-W conflict — conflicts are expected outcomes, not exceptional errors. Every committed write returns a `CommitResult{sequence, durable}` — a wait-friendly token for read-your-own-writes across replication (see `durable_sequence` above).
+Error handling follows the throw-on-failure convention used by the C++ standard library: a key, value or plan over its limit, or an option over its hard ceiling at `open`, throws `std::invalid_argument` before anything is written; I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; an internal invariant violation that cannot be continued through safely — currently only a reused data file name, which would silently drop writes at recovery — prints to stderr and aborts the process rather than throwing, since the write path would otherwise catch it and retry into the same corrupt state; write operations on a degraded engine throw `DbDegraded` (a `std::runtime_error` subclass, catchable separately); normal writes in follower mode throw `DbFollowerMode`; an `ingest` from a history that diverged at a promotion throws `DbChangeMarkerMismatch`; any call on a closed `DB` throws `DbClosed` (a `std::logic_error`). Key-not-found is signalled by `get` returning `false`; `apply_batch` returns a `PlanRefusal` (`Conflict` or `TooOld`) and `del` returns `nullopt` when they write nothing — refusals are expected outcomes, not exceptional errors. Every committed write returns a `CommitResult{sequence, durable}` — a wait-friendly token for read-your-own-writes across replication (see `durable_sequence` above).

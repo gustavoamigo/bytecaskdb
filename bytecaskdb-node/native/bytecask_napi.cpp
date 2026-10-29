@@ -1030,7 +1030,7 @@ auto NapiWritePlan::EnsureRangeUnchanged(const Napi::CallbackInfo& info) -> void
 
 auto NapiWritePlan::HasSnapshot(const Napi::CallbackInfo& info) -> Napi::Value {
   Check();
-  return Napi::Boolean::New(info.Env(), plan->has_snapshot());
+  return Napi::Boolean::New(info.Env(), plan->read_sequence().has_value());
 }
 
 auto NapiWritePlan::Close(const Napi::CallbackInfo&) -> void { plan.reset(); }

@@ -35,6 +35,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <expected>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -101,6 +102,7 @@ auto to_module(bytecask::internal::Options o) noexcept -> bytecask::Options {
     to_module(o.buffer_pool),
     o.max_hint_backlog,
     o.thread_scratch_bytes,
+    o.max_delete_log_bytes,
   };
 }
 
@@ -140,6 +142,17 @@ auto from_module(const bytecask::ChangeHeader& h) noexcept
 auto from_module(std::optional<bytecask::CommitResult> r) noexcept
     -> std::optional<bytecask::internal::CommitResult> {
   if (!r) return std::nullopt;
+  return from_module(*r);
+}
+
+static_assert(static_cast<int>(bytecask::PlanRefusal::Conflict) ==
+              static_cast<int>(bytecask::internal::PlanRefusal::Conflict));
+static_assert(static_cast<int>(bytecask::PlanRefusal::TooOld) ==
+              static_cast<int>(bytecask::internal::PlanRefusal::TooOld));
+
+auto from_module(std::expected<bytecask::CommitResult, bytecask::PlanRefusal> r) noexcept
+    -> bytecask::internal::ApplyResult {
+  if (!r) return static_cast<bytecask::internal::PlanRefusal>(r.error());
   return from_module(*r);
 }
 
@@ -436,6 +449,10 @@ Snapshot& Snapshot::operator=(Snapshot&&) noexcept = default;
 Snapshot::Snapshot(std::unique_ptr<Impl> impl) noexcept
     : impl_{std::move(impl)} {}
 
+auto Snapshot::sequence() const noexcept -> std::uint64_t {
+  return impl_->snap.sequence();
+}
+
 auto Snapshot::get(const ReadOptions& opts,
                    BytesView key,
                    Bytes& out) const -> bool {
@@ -504,6 +521,11 @@ WritePlan::WritePlan(SizeLimits limits)
     : impl_{std::make_unique<Impl>(bytecask::WritePlan{
           bytecask::SizeLimits{limits.max_key_bytes, limits.max_value_bytes}})} {}
 
+WritePlan::WritePlan(std::uint64_t read_sequence, SizeLimits limits)
+    : impl_{std::make_unique<Impl>(bytecask::WritePlan{
+          read_sequence,
+          bytecask::SizeLimits{limits.max_key_bytes, limits.max_value_bytes}})} {}
+
 WritePlan::WritePlan(Snapshot snap)
     : impl_{std::make_unique<Impl>(
           bytecask::WritePlan{std::move(snap.impl_->snap)})} {}
@@ -541,8 +563,9 @@ void WritePlan::ensure_range_unchanged(BytesView from,
   impl_->plan->ensure_range_unchanged(from, to);
 }
 
-auto WritePlan::has_snapshot() const noexcept -> bool {
-  return impl_->plan && impl_->plan->has_snapshot();
+auto WritePlan::read_sequence() const noexcept -> std::optional<std::uint64_t> {
+  if (!impl_->plan) return std::nullopt;
+  return impl_->plan->read_sequence();
 }
 
 // ---------------------------------------------------------------------------
@@ -629,7 +652,7 @@ auto DB::snapshot() const -> Snapshot {
   });
 }
 
-auto DB::apply_batch(WriteOptions opts, WritePlan plan) -> std::optional<CommitResult> {
+auto DB::apply_batch(WriteOptions opts, WritePlan plan) -> ApplyResult {
   return translate_exceptions([&] {
     return from_module(impl_->db.apply_batch(to_module(opts), std::move(*plan.impl_->plan)));
   });
