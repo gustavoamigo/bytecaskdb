@@ -293,9 +293,7 @@
     - DROP TABLE r
 
 - name: a view
-  features: [F031-02]
-  # statement not supported
-  unimplemented: true
+  features: [F031-02, F031-16]
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
   steps:
