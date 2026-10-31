@@ -2809,7 +2809,8 @@ auto run(const RunOptions &o) -> int {
   // pass admission meanwhile append behind the failed write, and a plan that
   // appends nothing can answer from their entries (#672). Set before any
   // thread starts and cleared once they stop.
-  if (o.mode == Mode::Presence && cfg.degrade)
+  const auto hold_degrade_publish = o.mode == Mode::Presence && cfg.degrade;
+  if (hold_degrade_publish)
     node(0).holder->db.test_before_degrade_publish_ = [] {
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     };
@@ -3053,7 +3054,10 @@ auto run(const RunOptions &o) -> int {
   if (orchestrator.joinable()) orchestrator.join();
   if (nemesis_thread.joinable()) nemesis_thread.join();
   if (vacuum_thread.joinable()) vacuum_thread.join();
-  node(0).holder->db.test_before_degrade_publish_ = nullptr;
+  // Only the run that set the hook clears it: in a cluster run node 0 may be
+  // a follower mid-restart here, its holder briefly null.
+  if (hold_degrade_publish)
+    node(0).holder->db.test_before_degrade_publish_ = nullptr;
   const auto final_leader = view.get().leader;
   auto &leader_db = node(final_leader).holder->db;
   if (leader_db.is_degraded()) leader_db.resume();
