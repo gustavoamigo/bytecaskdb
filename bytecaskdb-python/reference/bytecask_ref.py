@@ -276,39 +276,22 @@ def apply_entry(keydir: KeyDir, file_id: int, placed: Placed) -> KeyDir:
             return keydir
 
 
-def _erased_by(keydir: KeyDir, entry: Entry) -> list[bytes]:
-    """The keys entry erases from keydir: those it deletes that are present."""
-    match entry.type:
-        case EntryType.DELETE:
-            return [entry.key] if entry.key in keydir else []
-        case EntryType.RANGE_DELETE:
-            return [k for k, _ in keydir.ascending(entry.key, entry.value)]
-        case _:
-            return []
+def _sequence(location: Location | None) -> int:
+    return 0 if location is None else location.sequence
 
 
-# A key a write erased from the key directory, and that write's sequence.
-Removal = tuple[int, bytes]
+def _key_changed(head: KeyDir, snapshot: KeyDir, key: bytes) -> bool:
+    """Whether key was written, or erased, since the snapshot.
 
-
-def _key_changed(head: KeyDir, removals: list[Removal], read_seq: int, key: bytes) -> bool:
-    """Whether key was written, or erased, since read_seq.
-
-    A present key was written since if its record is newer. An absent one
-    changed if a write since erased it: one created and erased again since
-    counts too, though the snapshot and the head agree.
+    A key created and erased since is absent from both, and does not count.
     """
-    location = head.get(key)
-    if location is not None:
-        return location.sequence > read_seq
-    return any(seq > read_seq and k == key for seq, k in removals)
+    return _sequence(head.get(key)) != _sequence(snapshot.get(key))
 
 
-def _range_changed(head: KeyDir, removals: list[Removal], read_seq: int,
-                   start: bytes, stop: bytes) -> bool:
-    """Whether any key in [start, stop) was written, or erased, since read_seq."""
-    return (any(loc.sequence > read_seq for _, loc in head.ascending(start, stop))
-            or any(seq > read_seq and start <= k < stop for seq, k in removals))
+def _range_changed(head: KeyDir, snapshot: KeyDir, start: bytes, stop: bytes) -> bool:
+    """Whether any key in [start, stop) was written, or erased, since the snapshot."""
+    keys = {k for k, _ in head.ascending(start, stop)} | {k for k, _ in snapshot.ascending(start, stop)}
+    return any(_key_changed(head, snapshot, k) for k in keys)
 
 
 # ── Public interface: the engine's ───────────────────────────────────────────
@@ -460,11 +443,10 @@ class Snapshot:
     WritePlan(snapshot) consumes it, as in the engine; it cannot be read after.
     """
 
-    def __init__(self, db: DB, keydir: KeyDir, sequence: int, durable_sequence: int = 0,
+    def __init__(self, db: DB, keydir: KeyDir, durable_sequence: int = 0,
                  markers: tuple[ChangeMarker, ...] = ()) -> None:
         self._db = db
         self._keydir: KeyDir | None = keydir
-        self.sequence = sequence  # the last write it sees
         self._durable_sequence = durable_sequence  # changes_since ships up to it
         self._markers = markers
 
@@ -521,15 +503,11 @@ class _Guard(enum.Enum):
 class WritePlan:
     """Writes that DB.apply_batch applies atomically, if every guard holds.
 
-    With a snapshot, every key the plan writes must also be unchanged since
-    it. The plan keeps only the snapshot's sequence, its read sequence.
+    With a snapshot, every key the plan writes must also be unchanged since it.
     """
 
     def __init__(self, snapshot: Snapshot | None = None) -> None:
-        self._read_seq: int | None = None
-        if snapshot is not None:
-            snapshot._consume()
-            self._read_seq = snapshot.sequence
+        self._snapshot = snapshot._consume() if snapshot is not None else None
         self._writes: list[Entry] = []  # sequences assigned at commit
         self._guards: dict[bytes, _Guard] = {}
         self._range_guards: list[tuple[bytes, bytes]] = []
@@ -537,7 +515,7 @@ class WritePlan:
 
     @property
     def has_snapshot(self) -> bool:
-        return self._read_seq is not None
+        return self._snapshot is not None
 
     def put(self, key: bytes, value: bytes) -> None:
         self._add(Entry(0, EntryType.PUT, bytes(key), bytes(value)))
@@ -556,14 +534,14 @@ class WritePlan:
         self._guard(key, _Guard.ABSENT)
 
     def ensure_unchanged(self, key: bytes) -> None:
-        if self._read_seq is None:
-            raise ValueError("WritePlan::ensure_unchanged requires a read sequence")
+        if self._snapshot is None:
+            raise ValueError("WritePlan::ensure_unchanged requires a snapshot")
         self._guard(key, _Guard.UNCHANGED)
 
     def ensure_range_unchanged(self, from_key: bytes, to_key: bytes) -> None:
         _check_range(from_key, to_key)
-        if self._read_seq is None:
-            raise ValueError("WritePlan::ensure_range_unchanged requires a read sequence")
+        if self._snapshot is None:
+            raise ValueError("WritePlan::ensure_range_unchanged requires a snapshot")
         self._check_not_applied()
         self._range_guards.append((bytes(from_key), bytes(to_key)))
 
@@ -580,14 +558,13 @@ class WritePlan:
         if self._applied:
             raise RuntimeError("WritePlan already applied")
 
-    def _holds(self, head: KeyDir, removals: list[Removal]) -> bool:
+    def _holds(self, head: KeyDir) -> bool:
         guards = self._guards.items()
         if any(key not in head for key, g in guards if g is _Guard.PRESENT):
             return False
         if any(key in head for key, g in guards if g is _Guard.ABSENT):
             return False
-        read_seq = self._read_seq
-        if read_seq is None:
+        if self._snapshot is None:
             return True  # nothing to compare with: no other guard is possible
         unchanged_keys = [key for key, g in guards if g is _Guard.UNCHANGED]
         unchanged_ranges = list(self._range_guards)
@@ -596,9 +573,8 @@ class WritePlan:
                 unchanged_ranges.append((write.key, write.value))
             else:
                 unchanged_keys.append(write.key)
-        return (not any(_key_changed(head, removals, read_seq, k) for k in unchanged_keys)
-                and not any(_range_changed(head, removals, read_seq, a, b)
-                            for a, b in unchanged_ranges))
+        return (not any(_key_changed(head, self._snapshot, k) for k in unchanged_keys)
+                and not any(_range_changed(head, self._snapshot, a, b) for a, b in unchanged_ranges))
 
 
 class DB:
@@ -614,13 +590,6 @@ class DB:
         self._markers: tuple[ChangeMarker, ...] = ()  # by sequence; replaced, never changed
         self._next_sequence = 1
         self._durable_sequence = 0  # the highest sequence fdatasync confirmed
-        # Every key a write erased since the horizon. A plan read below the
-        # horizon cannot be checked: it is refused, as the engine refuses it
-        # TooOld. The engine bounds its log by Options::max_delete_log_bytes;
-        # this one is unbounded, and the workloads that compare the two stay
-        # far below the engine's default.
-        self._removals: list[Removal] = []
-        self._horizon = 0
         self._mode = opts.initial_mode
         self._active_id = 0
         self._active_size = 0
@@ -649,8 +618,7 @@ class DB:
 
     def snapshot(self) -> Snapshot:
         self._check_open()
-        return Snapshot(self, self._head, self._next_sequence - 1, self._durable_sequence,
-                        self._markers)
+        return Snapshot(self, self._head, self._durable_sequence, self._markers)
 
     def get(self, key: bytes, opts: ReadOptions | None = None) -> bytes | None:
         return self.snapshot().get(key, opts)
@@ -711,8 +679,7 @@ class DB:
         return result
 
     def apply_batch(self, plan: WritePlan, opts: WriteOptions | None = None) -> CommitResult | None:
-        """Applies every write in plan atomically, or none: None if a guard
-        failed, or if the plan was read below the horizon (too old to check).
+        """Applies every write in plan atomically, or none: None if a guard failed.
 
         Check, frame, append, sync, publish.
         """
@@ -725,15 +692,9 @@ class DB:
             self._check_writable()
             if self._mode is not Mode.Leader:
                 raise DbFollowerMode("a follower takes writes through ingest only")
-            read_seq = plan._read_seq
-            if read_seq is not None and read_seq >= self._next_sequence:
-                raise ValueError(f"plan read sequence {read_seq} is past the latest "
-                                 f"sequence {self._next_sequence - 1}")
 
             # 1. Check the guards against the head.
-            if read_seq is not None and read_seq < self._horizon:
-                return None
-            if not plan._holds(self._head, self._removals):
+            if not plan._holds(self._head):
                 return None
             if not plan._writes:
                 if sync:
@@ -758,7 +719,6 @@ class DB:
             self._sync_active()
         head, markers = self._head, self._markers
         for p in placed:
-            self._removals += [(p.entry.sequence, k) for k in _erased_by(head, p.entry)]
             head = apply_entry(head, self._active_id, p)
             if p.entry.type is EntryType.CHANGE_MARKER:
                 markers += (_marker_of(p.entry),)
@@ -1002,9 +962,6 @@ class DB:
             new = [entry for entry in entries if entry.sequence > durable]
             if new:
                 self._publish(self._append(new))
-                # Ingest erases keys the engine does not log: a plan read before
-                # it is too old.
-                self._removals, self._horizon = [], self._next_sequence - 1
 
     def _check_slice(self, header: ChangeHeader, entries: list[Entry]) -> None:
         previous = header.from_sequence
@@ -1091,8 +1048,6 @@ class DB:
         # Every recovered entry is on disk: synced before its file was sealed,
         # or rewritten durably just now.
         self._durable_sequence = self._next_sequence - 1
-        # No plan read before this open can be checked.
-        self._horizon = self._next_sequence - 1
 
 
 @dataclass

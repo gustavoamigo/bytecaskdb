@@ -723,6 +723,14 @@ TEST_CASE("alloc sweep: apply_batch", "[alloc_sweep]") {
   alloc_sweep(apply_batch_operation());
 }
 
+TEST_CASE("alloc sweep: apply_batch on a snapshot", "[alloc_sweep]") {
+  alloc_sweep(based_batch_operation(true));
+}
+
+TEST_CASE("alloc sweep: apply_batch on a read sequence", "[alloc_sweep]") {
+  alloc_sweep(based_batch_operation(false));
+}
+
 TEST_CASE("alloc sweep: apply_batch that splits what it changed",
           "[alloc_sweep]") {
   alloc_sweep(splitting_batch_operation());

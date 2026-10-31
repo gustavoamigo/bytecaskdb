@@ -5,14 +5,16 @@
 // and the implicit W-W check of a planned del_range, against a std::map.
 //
 // Each round takes a snapshot, makes random intervening writes, then applies a
-// plan that guards or range-deletes a random [from, to). The oracle: the plan
-// conflicts exactly when the model, restricted to [from, to), differs between
-// the snapshot and the head — a key changed, inserted or deleted — or when an
-// intervening write removed a key in it, even one written since (CONTRACT.md,
-// "Isolation is what the plan guards": a plan is checked by its read
-// sequence, and a removal is a change). Both missed conflicts and false ones
-// fail. The key alphabet puts keys on range bounds and between prefix
-// neighbours ("b" < "b\0" < "b0" < "bb").
+// plan that guards or range-deletes a random [from, to). The plan is built
+// from the snapshot, or from the snapshot's sequence alone, and each base has
+// its own oracle (CONTRACT.md, "Isolation is what the plan guards"):
+//   snapshot  the plan conflicts exactly when the model, restricted to
+//             [from, to), differs between the snapshot and the head: a key
+//             changed, inserted or deleted.
+//   sequence  the same, or when an intervening write removed a key in
+//             [from, to), even one written since: a removal is a change.
+// Both missed conflicts and false ones fail. The key alphabet puts keys on
+// range bounds and between prefix neighbours ("b" < "b\0" < "b0" < "bb").
 //
 // The intervening writes land four ways:
 //   published   plain writes, published before the plan is validated
@@ -20,7 +22,8 @@
 //               the pipeline head but not yet published
 //   vacuum      published, then vacuum relocates keys: no change by itself
 //   resume      the last write's fdatasync fails, resume() replays it; a
-//               plan read before resume() is refused as TooOld
+//               plan built from a sequence read before resume() is refused
+//               as TooOld, one built from a snapshot is checked as usual
 
 #include <algorithm>
 #include <expected>
@@ -215,6 +218,13 @@ auto placement_name(Placement p) -> std::string_view {
   return "?";
 }
 
+// What a plan is built from.
+enum class PlanBase : std::uint8_t { Snapshot, Sequence };
+
+auto base_name(PlanBase b) -> std::string_view {
+  return b == PlanBase::Snapshot ? "snapshot" : "sequence";
+}
+
 // Plan shapes: a guard alone, a del_range alone, or both over the same range.
 enum class PlanShape : std::uint8_t { Guard, DelRange, Both };
 
@@ -258,10 +268,13 @@ struct Counts {
   int commits{0};
   int vacuumed{0};
   int too_old{0};
+  // Rounds where only a removal tells the bases apart: the states agree on
+  // [from, to), but an intervening write removed a key in it.
+  int removal_only{0};
 };
 
-void run_rounds(Placement placement, std::uint64_t seed, int rounds,
-                Counts &counts) {
+void run_rounds(Placement placement, PlanBase base, std::uint64_t seed,
+                int rounds, Counts &counts) {
   TempDir td;
   // Small files so vacuum has sealed files to relocate keys out of.
   auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 512});
@@ -270,8 +283,8 @@ void run_rounds(Placement placement, std::uint64_t seed, int rounds,
   std::uint64_t version = 0;
 
   for (int round = 0; round < rounds; ++round) {
-    INFO(std::format("placement {} seed {} round {}", placement_name(placement),
-                     seed, round));
+    INFO(std::format("placement {} base {} seed {} round {}",
+                     placement_name(placement), base_name(base), seed, round));
 
     // Background history the snapshot sees.
     for (int i = std::uniform_int_distribution<int>{0, 3}(rng); i > 0; --i) {
@@ -286,7 +299,9 @@ void run_rounds(Placement placement, std::uint64_t seed, int rounds,
     const auto [from, to] = random_range(rng);
     const auto shape = static_cast<PlanShape>(
         std::uniform_int_distribution<int>{0, 2}(rng));
-    bytecask::WritePlan plan{std::move(snap)};
+    auto plan = base == PlanBase::Snapshot
+                    ? bytecask::WritePlan{std::move(snap)}
+                    : bytecask::WritePlan{snap.sequence()};
     if (shape != PlanShape::DelRange)
       plan.ensure_range_unchanged(to_bytes(from), to_bytes(to));
     if (shape != PlanShape::Guard)
@@ -350,16 +365,17 @@ void run_rounds(Placement placement, std::uint64_t seed, int rounds,
 
     INFO(std::format("plan shape {} over [{}, {}), {} intervening writes",
                      static_cast<int>(shape), from, to, n));
-    if (placement == Placement::Resume) {
+    if (placement == Placement::Resume && base == PlanBase::Sequence) {
       REQUIRE_FALSE(result.has_value());
       REQUIRE(result.error() == bytecask::PlanRefusal::TooOld);
       ++counts.too_old;
       REQUIRE(db_contents(db) == model_contents(model));
       continue;
     }
+    const bool states_differ = slice(snap_model, from, to) != slice(model, from, to);
+    if (removed_in_range && !states_differ) ++counts.removal_only;
     const bool expect_conflict =
-        slice(snap_model, from, to) != slice(model, from, to) ||
-        removed_in_range;
+        states_differ || (base == PlanBase::Sequence && removed_in_range);
     REQUIRE(result.has_value() == !expect_conflict);
     if (!result) REQUIRE(result.error() == bytecask::PlanRefusal::Conflict);
 
@@ -387,21 +403,24 @@ TEST_CASE("range conflicts match a model of the key range",
   const auto placement = GENERATE(Placement::Published, Placement::SameGroup,
                                   Placement::Vacuum, Placement::Resume);
 #endif
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
   Counts counts;
   const int rounds = placement == Placement::Published ? 400 : 150;
   for (std::uint64_t seed = 1; seed <= 4; ++seed)
-    run_rounds(placement, seed, rounds, counts);
+    run_rounds(placement, base, seed, rounds, counts);
 
   // A run where the oracle never said "conflict", or never said "commit",
   // proved nothing in that direction.
-  INFO(std::format("{}: {} conflicts, {} commits, {} vacuums, {} too old",
-                   placement_name(placement), counts.conflicts, counts.commits,
-                   counts.vacuumed, counts.too_old));
-  if (placement == Placement::Resume) {
+  INFO(std::format("{} {}: {} conflicts, {} commits, {} vacuums, {} too old",
+                   placement_name(placement), base_name(base), counts.conflicts,
+                   counts.commits, counts.vacuumed, counts.too_old));
+  if (placement == Placement::Resume && base == PlanBase::Sequence) {
     CHECK(counts.too_old > 0);
     return;
   }
   CHECK(counts.conflicts > 0);
   CHECK(counts.commits > 0);
+  // The rule the bases differ on was reached.
+  CHECK(counts.removal_only > 0);
   if (placement == Placement::Vacuum) CHECK(counts.vacuumed > 0);
 }

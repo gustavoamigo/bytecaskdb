@@ -382,9 +382,7 @@ auto DB::apply_batch(WriteOptions opts, WritePlan plan)
   slot.opts = opts;
   slot.sync = opts.sync;
 #ifdef BYTECASK_TESTING
-  if (test_resolve_by_key_)
-    slot.plan.snap_.reset();
-  else
+  if (!test_resolve_by_key_)
 #endif
     slot.plan.resolve_snapshot_entries();
 

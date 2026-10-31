@@ -2286,6 +2286,342 @@ TEST_CASE("prove__empty_db__conflicting_plan__before_any_io", "[prove]") {
        .watermark = watermark});
 }
 
+TEST_CASE("prove__empty_db__single_put_with_guards_on_sequence__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark});
+}
+
+TEST_CASE("prove__empty_db__single_put_with_guards_on_sequence__success_nosync", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = false},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark});
+}
+
+TEST_CASE("prove__empty_db__single_put_with_guards_on_sequence__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
+}
+
+TEST_CASE("prove__empty_db__single_put_with_guards_on_sequence__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
+}
+
+TEST_CASE("prove__empty_db__single_put_with_guards_on_sequence__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
+}
+
+TEST_CASE("prove__empty_db__single_put_with_guards_on_sequence__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
+}
+
+TEST_CASE("prove__empty_db__conflicting_plan_on_sequence__before_any_io", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir);
+
+    auto snap = db.snapshot();
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("conflict"));
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE_FALSE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark});
+}
+
 TEST_CASE("prove__empty_db__causality_overwrite__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -10273,6 +10609,355 @@ TEST_CASE("prove__single_key__conflicting_plan__before_any_io", "[prove]") {
     before = capture_baseline(db);
 
     bytecask::WritePlan plan{std::move(snap)};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE_FALSE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark});
+}
+
+TEST_CASE("prove__single_key__single_put_with_guards_on_sequence__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark});
+}
+
+TEST_CASE("prove__single_key__single_put_with_guards_on_sequence__success_nosync", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = false},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark});
+}
+
+TEST_CASE("prove__single_key__single_put_with_guards_on_sequence__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
+}
+
+TEST_CASE("prove__single_key__single_put_with_guards_on_sequence__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
+}
+
+TEST_CASE("prove__single_key__single_put_with_guards_on_sequence__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
+}
+
+TEST_CASE("prove__single_key__single_put_with_guards_on_sequence__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
+}
+
+TEST_CASE("prove__single_key__conflicting_plan_on_sequence__before_any_io", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("conflict"));
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
@@ -20216,6 +20901,418 @@ TEST_CASE("prove__populated_db__conflicting_plan__before_any_io", "[prove]") {
     before = capture_baseline(db);
 
     bytecask::WritePlan plan{std::move(snap)};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE_FALSE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark});
+}
+
+TEST_CASE("prove__populated_db__single_put_with_guards_on_sequence__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark});
+}
+
+TEST_CASE("prove__populated_db__single_put_with_guards_on_sequence__success_nosync", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = false},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark});
+}
+
+TEST_CASE("prove__populated_db__single_put_with_guards_on_sequence__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
+}
+
+TEST_CASE("prove__populated_db__single_put_with_guards_on_sequence__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
+}
+
+TEST_CASE("prove__populated_db__single_put_with_guards_on_sequence__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
+}
+
+TEST_CASE("prove__populated_db__single_put_with_guards_on_sequence__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
+}
+
+TEST_CASE("prove__populated_db__conflicting_plan_on_sequence__before_any_io", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("conflict"));
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
@@ -31852,6 +32949,457 @@ TEST_CASE("prove__rotation_threshold__conflicting_plan__before_any_io", "[prove]
        .watermark = watermark}, {.max_file_bytes = 1});
 }
 
+TEST_CASE("prove__rotation_threshold__single_put_with_guards_on_sequence__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__single_put_with_guards_on_sequence__success_nosync", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = false},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__single_put_with_guards_on_sequence__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.max_file_bytes = 1});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__single_put_with_guards_on_sequence__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.max_file_bytes = 1});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__single_put_with_guards_on_sequence__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.max_file_bytes = 1});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__single_put_with_guards_on_sequence__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{4};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.max_file_bytes = 1});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__single_put_with_guards_on_sequence__rotation_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.max_file_bytes = 1});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__single_put_with_guards_on_sequence__rotation_file_creation_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.max_file_bytes = 1});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1});
+}
+
+TEST_CASE("prove__rotation_threshold__conflicting_plan_on_sequence__before_any_io", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("conflict"));
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE_FALSE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.max_file_bytes = 1});
+}
+
 TEST_CASE("prove__rotation_threshold__causality_overwrite__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -41894,6 +43442,362 @@ TEST_CASE("prove__deleted_key__conflicting_plan__before_any_io", "[prove]") {
        .watermark = watermark});
 }
 
+TEST_CASE("prove__deleted_key__single_put_with_guards_on_sequence__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark});
+}
+
+TEST_CASE("prove__deleted_key__single_put_with_guards_on_sequence__success_nosync", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = false},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark});
+}
+
+TEST_CASE("prove__deleted_key__single_put_with_guards_on_sequence__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
+}
+
+TEST_CASE("prove__deleted_key__single_put_with_guards_on_sequence__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
+}
+
+TEST_CASE("prove__deleted_key__single_put_with_guards_on_sequence__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
+}
+
+TEST_CASE("prove__deleted_key__single_put_with_guards_on_sequence__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
+}
+
+TEST_CASE("prove__deleted_key__conflicting_plan_on_sequence__before_any_io", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    (void)db.del({.sync = false}, to_bytes("k0"));
+
+    auto snap = db.snapshot();
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("conflict"));
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE_FALSE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected);
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark});
+}
+
 TEST_CASE("prove__deleted_key__causality_overwrite__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -50491,6 +52395,369 @@ TEST_CASE("prove__single_key_mmap__conflicting_plan__before_any_io", "[prove]") 
     before = capture_baseline(db);
 
     bytecask::WritePlan plan{std::move(snap)};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE_FALSE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__single_put_with_guards_on_sequence__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__single_put_with_guards_on_sequence__success_nosync", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = false},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__single_put_with_guards_on_sequence__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__single_put_with_guards_on_sequence__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__single_put_with_guards_on_sequence__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__single_put_with_guards_on_sequence__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_mmap__conflicting_plan_on_sequence__before_any_io", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("conflict"));
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
@@ -61420,6 +63687,432 @@ TEST_CASE("prove__populated_db_mmap__conflicting_plan__before_any_io", "[prove]"
     before = capture_baseline(db);
 
     bytecask::WritePlan plan{std::move(snap)};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE_FALSE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__single_put_with_guards_on_sequence__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__single_put_with_guards_on_sequence__success_nosync", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = false},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__single_put_with_guards_on_sequence__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__single_put_with_guards_on_sequence__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__single_put_with_guards_on_sequence__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::Mmap});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__single_put_with_guards_on_sequence__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_mmap__conflicting_plan_on_sequence__before_any_io", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("conflict"));
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
@@ -74088,6 +76781,475 @@ TEST_CASE("prove__rotation_threshold_mmap__conflicting_plan__before_any_io", "[p
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__single_put_with_guards_on_sequence__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__single_put_with_guards_on_sequence__success_nosync", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = false},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__single_put_with_guards_on_sequence__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__single_put_with_guards_on_sequence__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__single_put_with_guards_on_sequence__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__single_put_with_guards_on_sequence__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{4};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__single_put_with_guards_on_sequence__rotation_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__single_put_with_guards_on_sequence__rotation_file_creation_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_mmap__conflicting_plan_on_sequence__before_any_io", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("conflict"));
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE_FALSE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__rotation_threshold_mmap__causality_overwrite__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -86074,6 +89236,369 @@ TEST_CASE("prove__single_key_pool__conflicting_plan__before_any_io", "[prove]") 
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__single_put_with_guards_on_sequence__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__single_put_with_guards_on_sequence__success_nosync", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = false},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__single_put_with_guards_on_sequence__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__single_put_with_guards_on_sequence__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__single_put_with_guards_on_sequence__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__single_put_with_guards_on_sequence__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__single_key_pool__conflicting_plan_on_sequence__before_any_io", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("conflict"));
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE_FALSE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove__single_key_pool__causality_overwrite__success", "[prove]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -96348,6 +99873,432 @@ TEST_CASE("prove__populated_db_pool__conflicting_plan__before_any_io", "[prove]"
     before = capture_baseline(db);
 
     bytecask::WritePlan plan{std::move(snap)};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE_FALSE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__single_put_with_guards_on_sequence__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__single_put_with_guards_on_sequence__success_nosync", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = false},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__single_put_with_guards_on_sequence__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__single_put_with_guards_on_sequence__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__single_put_with_guards_on_sequence__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__single_put_with_guards_on_sequence__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__populated_db_pool__conflicting_plan_on_sequence__before_any_io", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+    db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+    db.put({.sync = false}, to_bytes("k3"), to_bytes("v3"));
+    db.put({.sync = false}, to_bytes("k4"), to_bytes("v4"));
+    db.put({.sync = false}, to_bytes("k5"), to_bytes("v5"));
+    db.put({.sync = false}, to_bytes("k6"), to_bytes("v6"));
+    db.put({.sync = false}, to_bytes("k7"), to_bytes("v7"));
+    db.put({.sync = false}, to_bytes("k8"), to_bytes("v8"));
+    db.put({.sync = false}, to_bytes("k9"), to_bytes("v9"));
+
+    auto snap = db.snapshot();
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("conflict"));
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
@@ -108361,6 +112312,475 @@ TEST_CASE("prove__rotation_threshold_pool__conflicting_plan__before_any_io", "[p
     before = capture_baseline(db);
 
     bytecask::WritePlan plan{std::move(snap)};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("k0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE_FALSE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__single_put_with_guards_on_sequence__success", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = true},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__single_put_with_guards_on_sequence__success_nosync", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      cr = db.apply_batch({.sync = false},
+                          std::move(plan));
+      REQUIRE(cr);
+    }
+
+    assert_delta(before, db, expected);
+    watermark = durable_watermark(db, cr);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = before.key_values,
+       .after = apply_delta(before.key_values, expected),
+       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},
+       .watermark = watermark}, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__single_put_with_guards_on_sequence__append_fails_nothing_written", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__single_put_with_guards_on_sequence__append_fails_partial_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__single_put_with_guards_on_sequence__append_fails_after_full_write", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__single_put_with_guards_on_sequence__commit_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{4};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__single_put_with_guards_on_sequence__rotation_sync_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = false},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  // Recovery skipped: sync failed — page-cache bytes may survive
+  // to resume() and be committed then. assert_resumable covers
+  // the in-process recovery path.
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__single_put_with_guards_on_sequence__rotation_file_creation_fails", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {"p0"},
+        .keys_removed = {},
+        .expected_values = {{"p0", "new0"}},
+        .seq_advance = 1,
+        .degraded = true,
+    };
+  Baseline before;
+  bytecask::testing::EngineFingerprint fp;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
+    plan.ensure_unchanged(to_bytes("k0"));
+    plan.put(to_bytes("p0"), to_bytes("new0"));
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true},
+                            std::move(plan)),
+          std::system_error);
+    }
+
+    assert_delta(before, db, expected);
+    assert_resumable(db);
+    fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_recoverable(dir, before, expected, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // resume() and a cold open read the same bytes and must
+  // reconstruct the same engine.
+  assert_matches_recovery(dir, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut:
+  // resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("prove__rotation_threshold_pool__conflicting_plan_on_sequence__before_any_io", "[prove]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  auto expected = ExpectedDelta{
+        .keys_added = {},
+        .keys_removed = {},
+        .expected_values = {},
+        .seq_advance = 0,
+        .degraded = false,
+    };
+  Baseline before;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;
+  std::uint64_t watermark = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+
+    auto snap = db.snapshot();
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("conflict"));
+
+    make_durable(db);
+    before = capture_baseline(db);
+
+    bytecask::WritePlan plan{snap.sequence()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("k0"), to_bytes("new0"));
 

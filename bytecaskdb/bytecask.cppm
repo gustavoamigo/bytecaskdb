@@ -626,12 +626,16 @@ public:
   enum class Verdict { Holds, Conflict, TooOld };
 
   // Precondition validation — pure reads, no mutations.
-  // A plan with a read sequence R: every point and range guard, and every
-  // key it writes, must be unchanged since R. A present key changed if its
-  // entry's sequence is above R; an absent one if `deletes` holds a removal
-  // of it above R, or this transient staged one (always above R: staged
-  // removals are newer than any published state). TooOld when `deletes` no
-  // longer covers R. Without a read
+  // ensure_present / ensure_absent hold against this state. A plan with a
+  // base also needs every unchanged guard, range guard and written key
+  // unchanged since that base, by the base's rules:
+  //   a snapshot  its entry for the key equals this state's (absent in both
+  //               counts as equal);
+  //   a sequence R  a present key's entry is at or below R; an absent key
+  //               has no removal above R in `deletes`, or staged by this
+  //               transient (always above R: staged removals are newer than
+  //               any published state). TooOld when `deletes` no longer
+  //               covers R. Without a read
   // sequence, only ensure_present / ensure_absent are checked.
   //
   // rests_on is the head entry the outcome rests on. On failure, the entry
@@ -765,15 +769,17 @@ public:
   [[nodiscard]] auto persistent() && -> std::shared_ptr<EngineState>;
 
 private:
-  // Returns true if [from, to) changed since read_seq: a key in it holds an
-  // entry above read_seq, or `deletes` holds a removal in it above read_seq.
-  // Sets rests_on as validate_preconditions documents. Shared by range
-  // guards and the implicit W-W check of a planned del_range.
-  [[nodiscard]] auto range_changed(std::uint64_t read_seq,
-                                   const DeleteLog &deletes,
-                                   std::span<const std::byte> from,
-                                   std::span<const std::byte> to,
-                                   std::uint64_t &rests_on) const -> bool;
+  // What changed since a plan's base, one class per base (engine_state.cpp).
+  // Each answers admit(), changed(key, entry, write index) and
+  // range_changed(from, to, rests_on); check_plan asks them.
+  class NoBaseCheck;
+  class SnapshotCheck;
+  class SequenceCheck;
+  // Every guard and the implicit W-W check, asking `check` what changed.
+  // Sets rests_on as validate_preconditions documents.
+  template <typename Check>
+  [[nodiscard]] auto check_plan(const WritePlan &plan, const Check &check,
+                                std::uint64_t &rests_on) const -> Verdict;
   // Where key_dir_ reads the keys it does not store: this transient's files
   // and the records it has not written yet.
   [[nodiscard]] auto kd_ctx() const -> KeyDirCtx {
@@ -2061,18 +2067,21 @@ export struct FileManifest {
 // ---------------------------------------------------------------------------
 // WritePlan — conditional write + guard vocabulary for apply_batch.
 //
-// Optionally carries a read sequence: the sequence of the state its reads
-// came from (Snapshot::sequence()). ensure_unchanged and
-// ensure_range_unchanged are checked against it; a plan without one throws
-// std::logic_error on either (programming error). Built from a Snapshot,
-// the plan takes its sequence and holds the snapshot only until apply_batch
-// has looked up its written keys there (resolve_snapshot_entries).
+// A plan has a base: what its reads came from, fixed at construction.
+//   none        WritePlan(), WritePlan(SizeLimits): only ensure_present and
+//               ensure_absent, checked against the current state.
+//   a snapshot  WritePlan(Snapshot): checked by comparing the snapshot with
+//               the current state.
+//   a sequence  WritePlan(read_sequence): plain data, checked by sequences
+//               and the delete log (docs/bytecask_design.md, "Checking a plan
+//               by its read sequence"); may be refused as TooOld.
+// ensure_unchanged and ensure_range_unchanged need a base; a plan without
+// one throws std::logic_error on either (programming error).
 //
-// Implicit W-W check: when a read sequence is present, apply_batch
-// automatically rejects the plan if any key in the write set (put or del)
-// changed since it. This means ensure_unchanged is only needed for read-only
-// dependencies — keys whose value influenced the plan but that the plan does
-// not modify.
+// Implicit W-W check: when a plan has a base, apply_batch automatically
+// rejects it if any key in the write set (put or del) changed since. This
+// means ensure_unchanged is only needed for read-only dependencies — keys
+// whose value influenced the plan but that the plan does not modify.
 //
 // Guards and writes on the same key are merged. Contradictory guards
 // throw std::logic_error at build time.
@@ -2107,13 +2116,22 @@ public:
 
   using WriteOp = std::variant<PointPut, PointDel, RangeDel>;
 
+  // The plan's base (see above).
+  struct NoBase {};
+  struct SnapshotBase {
+    Snapshot snap;
+  };
+  struct SequenceBase {
+    std::uint64_t read_seq;
+  };
+  using Base = std::variant<NoBase, SnapshotBase, SequenceBase>;
+
   WritePlan() = default;
   explicit WritePlan(SizeLimits limits) : limits_{limits} {}
   explicit WritePlan(std::uint64_t read_sequence, SizeLimits limits = {})
-      : read_seq_{read_sequence}, limits_{limits} {}
+      : limits_{limits}, base_{SequenceBase{read_sequence}} {}
   explicit WritePlan(Snapshot snap)
-      : read_seq_{snap.sequence()}, snap_{std::move(snap)},
-        limits_{snap_->limits_} {}
+      : limits_{snap.limits_}, base_{SnapshotBase{std::move(snap)}} {}
   WritePlan(const WritePlan &) = delete;
   WritePlan &operator=(const WritePlan &) = delete;
   WritePlan(WritePlan &&) noexcept = default;
@@ -2158,12 +2176,12 @@ public:
     set_precondition(key, Precondition::MustBeAbsent);
   }
 
-  // Requires a read sequence — throws std::logic_error without one.
+  // Requires a base — throws std::logic_error without one.
   void ensure_unchanged(BytesView key) {
     check_key_size(key.size(), limits_.max_key_bytes);
-    if (!read_seq_) {
+    if (!has_base()) {
       throw std::logic_error{
-          "WritePlan::ensure_unchanged requires a read sequence"};
+          "WritePlan::ensure_unchanged requires a snapshot or a read sequence"};
     }
     set_precondition(key, Precondition::MustBeUnchanged);
   }
@@ -2171,28 +2189,38 @@ public:
   // --- Range guards ---
 
   // Conflict if any key in [from, to) was inserted, modified,
-  // or deleted since the read sequence. The range is half-open:
+  // or deleted since the plan's base. The range is half-open:
   // from is inclusive, to is exclusive; from >= to throws
   // std::invalid_argument.
-  // Requires a read sequence — throws std::logic_error without one.
+  // Requires a base — throws std::logic_error without one.
   void ensure_range_unchanged(BytesView from, BytesView to) {
     check_key_size(from.size(), limits_.max_key_bytes);
     check_key_size(to.size(), limits_.max_key_bytes);
     check_range(from, to);
-    if (!read_seq_) {
+    if (!has_base()) {
       throw std::logic_error{
-          "WritePlan::ensure_range_unchanged requires a read sequence"};
+          "WritePlan::ensure_range_unchanged requires a snapshot or a read "
+          "sequence"};
     }
     range_guards_.push_back(
         {Bytes{from.begin(), from.end()}, Bytes{to.begin(), to.end()}});
   }
 
+  // The sequence of the state the plan's reads came from: its snapshot's,
+  // or the one it was given. nullopt without a base.
   [[nodiscard]] auto read_sequence() const noexcept
       -> std::optional<std::uint64_t> {
-    return read_seq_;
+    if (const auto *b = std::get_if<SnapshotBase>(&base_))
+      return b->snap.sequence();
+    if (const auto *b = std::get_if<SequenceBase>(&base_)) return b->read_seq;
+    return std::nullopt;
   }
 
 private:
+  [[nodiscard]] auto has_base() const noexcept -> bool {
+    return !std::holds_alternative<NoBase>(base_);
+  }
+
   [[nodiscard]] auto empty() const noexcept -> bool {
     return writes_.empty() && guards_.empty() && range_guards_.empty();
   }
@@ -2239,10 +2267,13 @@ private:
   // Looks up each point write's key in the snapshot, on the caller's
   // thread, before the plan joins a batch: under the write lock the check
   // and the update then find the key by the location found here, without
-  // reading its record (docs/unsynced_commit_design.md, D3). Then releases
-  // the snapshot: validation needs only the read sequence. A plan built
-  // from a bare read sequence has nothing to resolve and goes by key.
+  // reading its record (docs/unsynced_commit_design.md, D3). A plan without
+  // a snapshot has nothing to resolve and goes by key.
   void resolve_snapshot_entries();
+  // The snapshot's entry for write i: resolved earlier, or looked up now.
+  // Only for a plan built from a snapshot.
+  [[nodiscard]] auto snapshot_entry(std::size_t i, BytesView key) const
+      -> std::optional<KeyDirEntry>;
   // The resolved snapshot entry for write i, if resolution ran and the key
   // was present: the location the check, an update or an erase can go by.
   [[nodiscard]] auto resolved_entry(std::size_t i) const
@@ -2251,10 +2282,8 @@ private:
     return i < snap_entries_.size() ? snap_entries_[i] : kNone;
   }
 
-  std::optional<std::uint64_t> read_seq_;
-  // Only until resolve_snapshot_entries; see there.
-  std::optional<Snapshot> snap_;
   SizeLimits limits_;
+  Base base_;
   std::vector<WriteOp> writes_;
   std::map<Bytes, KeyGuard> guards_;
   std::vector<RangeGuard> range_guards_;

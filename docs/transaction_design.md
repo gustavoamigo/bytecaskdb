@@ -85,7 +85,11 @@ for (auto& [k, v] : snap.iter_from({})) { ... }
 
 `WritePlan` is the type `apply_batch` consumes. It carries **writes** (`put`, `del`, `del_range`) and **guards** (`ensure_present`, `ensure_absent`, `ensure_unchanged`, `ensure_range_unchanged`). Guards are preconditions checked atomically with the apply; if any fails, nothing in the plan is written.
 
-A plan built with `WritePlan()` has no read sequence. It is an unconditional batch that may also carry `ensure_present` and `ensure_absent`, which test the current state. A plan built with a read sequence adds `ensure_unchanged`, `ensure_range_unchanged` and the implicit write-write check on every key it writes. The read sequence is `Snapshot::sequence()` of the snapshot the plan's reads came from: `WritePlan(read_sequence)` takes the number, so the plan is plain data that can be built away from the reads, even in another process; `WritePlan(Snapshot)` takes it from the snapshot and keeps the snapshot only until `apply_batch` has used it (see *Conflict check*).
+A plan built with `WritePlan()` has no base. It is an unconditional batch that may also carry `ensure_present` and `ensure_absent`, which test the current state. A plan with a base adds `ensure_unchanged`, `ensure_range_unchanged` and the implicit write-write check on every key it writes. The base is what the plan's reads came from:
+- **a `Snapshot`** (`WritePlan(Snapshot)`): checked by comparing the snapshot with the current state;
+- **its sequence alone** (`WritePlan(snap.sequence())`): plain data that can be built away from the reads, even in another process, checked by sequences and the engine's log of recent deletes, and refused as `TooOld` when read too long ago.
+
+Both give the same isolation; *Conflict check* gives the one case where they differ.
 
 ```cpp
 export class WritePlan {
@@ -168,18 +172,26 @@ Writes and point guards are stored separately: writes in a vector, in the order 
 
 ### Conflict check
 
-Before the plan joins a batch, `apply_batch` looks up each written key in the plan's snapshot, if it was built from one, on the caller's thread (`WritePlan::resolve_snapshot_entries`), and releases the snapshot. The check itself needs only the read sequence R. It runs in the write path's serial section under `write_mu_`, against the prepared head: every write already accepted, including those whose `fdatasync` is still in flight. Plans in one batch are checked one after another, so each sees the writes of the plans before it.
+Before the plan joins a batch, `apply_batch` looks up each written key in the plan's snapshot, if it was built from one, on the caller's thread (`WritePlan::resolve_snapshot_entries`). The check runs in the write path's serial section under `write_mu_`, against the prepared head: every write already accepted, including those whose `fdatasync` is still in flight. Plans in one batch are checked one after another, so each sees the writes of the plans before it.
 
 ```
-// Under write_mu_. "head" is the prepared state; R the plan's read sequence;
-// "removed" the log of keys writes removed, with the sequence of each.
+// Under write_mu_. "head" is the prepared state. What changed(K) and
+// range_changed(from, to) mean depends on the plan's base:
 
+// On a snapshot "snap":
+changed(K):                seq(snap.find(K)) != seq(head.find(K))   // absent = 0
+range_changed(from, to):   a K in head over [from, to) with seq differing from snap's,
+                           or a K in snap over [from, to) absent from head
+
+// On a read sequence R, with "removed" the log of keys writes removed:
 // 0. if R < removed.horizon → TooOld
-
 changed(K):
     cur = head.find(K)
     if cur: seq(cur) > R                         // written since
     else:   removed holds K above R              // deleted since
+range_changed(from, to):
+    any K in head over [from, to) with seq(K) > R      // inserted or modified
+    or removed holds a key in [from, to) above R       // deleted, by del or a range tombstone
 
 // 1. Point guards
 for each (key, precondition) in plan.guards_:
@@ -192,7 +204,7 @@ for each (key, precondition) in plan.guards_:
 for each [from, to) in plan.range_guards_:
     range_changed(from, to)
 
-// 3. Implicit W-W check (only when the plan has a read sequence)
+// 3. Implicit W-W check (only when the plan has a base)
 for each write in plan.writes_:
     put / del key K:
         s = snap entry for K (resolved earlier, if the plan had a snapshot)
@@ -201,15 +213,11 @@ for each write in plan.writes_:
     del_range [from, to):
         range_changed(from, to)
 
-range_changed(from, to):
-    any K in head over [from, to) with seq(K) > R      // inserted or modified
-    or removed holds a key in [from, to) above R       // deleted, by del or a range tombstone
-
 on conflict: result = Conflict, nothing appended
 otherwise:   append entries, apply them to the head
 ```
 
-Comparisons are by `KeyDirEntry::sequence`: a sequence names a state, so a key changed since R exactly when its entry is above R, or it is gone and the log holds its removal above R. Vacuum moves a record but keeps its sequence, so a relocated key is not a conflict. A key written and deleted again since R is a conflict, though it is absent at both: the log holds its removal. `docs/bytecask_design.md` (*Checking a plan by its read sequence*) has the log, what moves its horizon, and why a plan read before a reopen or a `resume()` is too old. A record location names one immutable record for the life of the process, so a written key whose head entry still points at the snapshot's record is unchanged and needs no further lookup. On the blind-leaf key directory that check reads no record; `docs/bytecask_design.md` (*Implicit W-W check on write keys*) has the detail.
+Comparisons are by `KeyDirEntry::sequence`. Vacuum moves a record but keeps its sequence, so a relocated key is not a conflict, for either base. The bases differ on one case: a key written and deleted again since the base is absent at both. A snapshot plan sees no change; a sequence plan conflicts, since the log holds the removal. `docs/bytecask_design.md` (*Checking a plan by its read sequence*) has the log, what moves its horizon, and why a plan read before a reopen or a `resume()` is too old. A record location names one immutable record for the life of the process, so a written key whose head entry still points at the snapshot's record is unchanged and needs no further lookup. On the blind-leaf key directory that check reads no record; `docs/bytecask_design.md` (*Implicit W-W check on write keys*) has the detail.
 
 A plan that conflicts with a write the head holds but that is not yet published returns once that write is published. Until then a retry from a fresh snapshot would see the same state and lose again. If that write's flush fails, the plan throws `DbDegraded`: the write is unseen, and a conflict with it is no answer. A plan the published state refutes as well returns at once. The same holds for a plan whose guards hold with nothing to write: it returns once what they held on is published.
 
@@ -304,7 +312,7 @@ Not a separate level. Writes are visible only after `state_.store()` publishes t
 
 ### Edge cases
 
-11. `ensure_unchanged(k)` on a key absent at snapshot and still absent: no conflict, unless a write since created and deleted it.
+11. `ensure_unchanged(k)` on a key absent at snapshot and still absent: no conflict on a snapshot plan; on a sequence plan, a conflict if a write since created and deleted it.
 12. Absent at snapshot, present now: conflict.
 13. Present at snapshot, deleted now: conflict.
 14. `ensure_present(k)` and `ensure_unchanged(k)` on the same key: different preconditions, `std::logic_error` at build time. `ensure_unchanged` alone already fails if the key was deleted; if it must also exist, that is known from the snapshot read.
@@ -343,7 +351,7 @@ while (true) {
 
 `Snapshot` holds `shared_ptr<const EngineState>`. Through `EngineState → FileRegistry → DataFile`, that keeps every data file the snapshot references open. Vacuum unlinks a file it has compacted, but a held descriptor keeps `pread` working and the blocks allocated until the last reference goes. The same mechanism protects in-flight readers; snapshots need nothing extra.
 
-A `WritePlan` built from a `Snapshot` holds it until `apply_batch`, which releases it before the plan joins a batch; one built from a read sequence holds none. A long-lived snapshot, or a plan built from one, therefore delays the reclamation of disk space. It is not a correctness risk. `stats()` reports `bytecask.keydir_versions_live` and `bytecask.keydir_nodes_parked`, which grow while old states are held.
+A `WritePlan` built from a `Snapshot` holds it until `apply_batch` returns; one built from a read sequence holds none. A long-lived snapshot, or a plan built from one, therefore delays the reclamation of disk space. It is not a correctness risk. `stats()` reports `bytecask.keydir_versions_live` and `bytecask.keydir_nodes_parked`, which grow while old states are held.
 
 ---
 

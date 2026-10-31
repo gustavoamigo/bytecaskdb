@@ -28,6 +28,12 @@
 //              appends: it shows the checker sees anomalies at all. Append
 //              workload only.
 //
+// --plan-base sequence builds guarded and unguarded plans on the snapshot's
+// sequence, WritePlan(snap.sequence()), instead of on the snapshot: the same
+// expectations, checked by sequences and the engine's delete log. A plan the
+// engine refuses as TooOld (a resume() since its read) is a failed
+// transaction, as a conflict is.
+//
 // Nemeses, drawn from the seed: a vacuum thread over small files, and a
 // client that fails its own fdatasync through the fault injector, degrading
 // the engine, then calls resume(). Every exception is recorded as :info: a
@@ -39,7 +45,7 @@
 //                     [--seed S] [--threads N] [--txns N] [--dir PATH]
 //                     [--no-vacuum] [--force-vacuum] [--no-degrade]
 //                     [--followers N] [--follower-readers N] [--lag]
-//                     [--kill-epochs N]
+//                     [--kill-epochs N] [--plan-base snapshot|sequence]
 //   isolation_history --chaos-child --config C --seed S --threads N --dir D
 //                     --fd N --process-base P --key-base K
 //   isolation_history --absorb MANIFEST --config C --seed S --threads N
@@ -127,6 +133,18 @@ auto workload_name(Workload w) -> std::string_view {
   return "?";
 }
 
+// What a transaction's plan is built from (--plan-base): its snapshot (the
+// default), or the snapshot's sequence alone, which the engine checks by
+// sequences and its delete log. Set once in main, before any thread starts.
+bool g_plan_on_sequence = false;
+
+// The plan for a transaction that read from `snap`, or a snapshot-less one.
+auto plan_from(std::optional<bytecask::Snapshot> &snap) -> bytecask::WritePlan {
+  if (!snap) return bytecask::WritePlan{};
+  if (g_plan_on_sequence) return bytecask::WritePlan{snap->sequence()};
+  return bytecask::WritePlan{std::move(*snap)};
+}
+
 struct RunOptions {
   Mode mode{Mode::Guarded};
   Workload workload{Workload::Append};
@@ -138,6 +156,7 @@ struct RunOptions {
   bool no_vacuum{false};
   bool no_retention{false}; // vacuum ignores where followers are (#168)
   bool no_degrade{false};
+  bool plan_on_sequence{false};  // --plan-base sequence
   int followers{0};        // 0: leader only (#94); N: a cluster (#178)
   int follower_readers{4}; // reader threads per follower
   bool lag{false};         // pause replication threads at random
@@ -733,8 +752,7 @@ auto apply_range_txn(bytecask::DB &db, Mode mode, const std::vector<Mop> &mops,
       writes[m.key] = &m;
   if (writes.empty()) return {};
 
-  auto plan = snap ? bytecask::WritePlan{std::move(*snap)}
-                   : bytecask::WritePlan{};
+  auto plan = plan_from(snap);
   for (const auto &[k, m] : writes) {
     const auto kb = range_key_bytes(k);
     switch (m->kind) {
@@ -827,8 +845,7 @@ auto execute_txn(bytecask::DB &db, Mode mode, Workload workload,
   }
   if (written.empty()) return {};
 
-  auto plan = snap ? bytecask::WritePlan{std::move(*snap)}
-                   : bytecask::WritePlan{};
+  auto plan = plan_from(snap);
   for (const auto &[k, l] : lists) {
     const auto kb = key_bytes(k);
     if (written.contains(k)) {
@@ -1799,7 +1816,8 @@ auto spawn_kill_child(const RunOptions &o, int epoch, int write_fd) -> pid_t {
       "--dir", o.dir.string(),
       "--fd", std::to_string(write_fd),
       "--process-base", std::to_string(o.process_base),
-      "--key-base", std::to_string(o.key_base)};
+      "--key-base", std::to_string(o.key_base),
+      "--plan-base", o.plan_on_sequence ? "sequence" : "snapshot"};
   std::vector<char *> argv;
   for (auto &a : args) argv.push_back(a.data());
   argv.push_back(nullptr);
@@ -2511,6 +2529,13 @@ auto parse_args(int argc, char **argv) -> RunOptions {
       o.no_retention = true;
     } else if (a == "--no-degrade") {
       o.no_degrade = true;
+    } else if (a == "--plan-base") {
+      const auto b = next();
+      if (b == "sequence") {
+        o.plan_on_sequence = true;
+      } else if (b != "snapshot") {
+        throw std::runtime_error{std::format("unknown --plan-base {}", b)};
+      }
     } else if (a == "--followers") {
       o.followers = std::stoi(std::string{next()});
     } else if (a == "--follower-readers") {
@@ -3026,6 +3051,7 @@ auto run(const RunOptions &o) -> int {
 auto main(int argc, char **argv) -> int {
   try {
     const auto o = parse_args(argc, argv);
+    g_plan_on_sequence = o.plan_on_sequence;
     if (o.kill_child) return run_kill_child(o);
     if (o.chaos_child) return run_chaos_child(o);
     if (!o.absorb.empty()) return run_absorb(o);

@@ -62,6 +62,9 @@ class PlanShape:
     # are k0..kN, so ["k", "l") spans every one of them.
     range_from: Optional[str] = None
     range_to: Optional[str] = None
+    # A plan with guards built on the snapshot's sequence alone, not on the
+    # snapshot: the checks that need a base go by sequence and the delete log.
+    on_sequence: bool = False
 
     @property
     def has_range_del(self) -> bool:
@@ -114,6 +117,10 @@ PLAN_SHAPES = [
     PlanShape("large_batch", (OpType.PUT, OpType.PUT, OpType.PUT)),
     PlanShape("single_put_with_guards", (OpType.PUT,), has_guards=True),
     PlanShape("conflicting_plan", (OpType.PUT,), is_conflicting=True),
+    PlanShape("single_put_with_guards_on_sequence", (OpType.PUT,), has_guards=True,
+              on_sequence=True),
+    PlanShape("conflicting_plan_on_sequence", (OpType.PUT,), is_conflicting=True,
+              on_sequence=True),
     PlanShape("causality_overwrite", (OpType.PUT, OpType.PUT), causality_key="c0"),
     PlanShape("causality_put_del", (OpType.PUT, OpType.DELETE), causality_key="c0"),
     PlanShape("causality_del_put", (OpType.DELETE, OpType.PUT), causality_key="k0"),

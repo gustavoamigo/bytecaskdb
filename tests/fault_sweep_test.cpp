@@ -419,6 +419,14 @@ TEST_CASE("fault sweep: apply_batch", "[fault_sweep]") {
   sweep(apply_batch_operation());
 }
 
+TEST_CASE("fault sweep: apply_batch on a snapshot", "[fault_sweep]") {
+  sweep(based_batch_operation(true));
+}
+
+TEST_CASE("fault sweep: apply_batch on a read sequence", "[fault_sweep]") {
+  sweep(based_batch_operation(false));
+}
+
 TEST_CASE("fault sweep: write across a rotation", "[fault_sweep]") {
   sweep(rotation_operation());
 }

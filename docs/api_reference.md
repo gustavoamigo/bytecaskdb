@@ -211,8 +211,8 @@ public:
                                     BytesView key) const -> bool;
 
     // Atomically applies all operations in plan. PlanRefusal::Conflict on a
-    // guard failure or the implicit W-W check, PlanRefusal::TooOld when the
-    // plan's read sequence is older than the log of recent deletes covers —
+    // guard failure or the implicit W-W check, PlanRefusal::TooOld when a
+    // plan on a read sequence is older than the log of recent deletes covers —
     // nothing was written either way. A read sequence past the latest throws
     // std::invalid_argument. An empty or
     // guard-only plan that passes writes nothing and returns {sequence = 0,
@@ -380,8 +380,8 @@ struct FileManifest {
 
 // Why apply_batch refused a plan. Nothing was written either way.
 enum class PlanRefusal {
-    Conflict,  // a guard failed, or a written key changed since the read sequence
-    TooOld,    // the read sequence is older than the engine still tracks deletes for
+    Conflict,  // a guard failed, or a written key changed since the plan's base
+    TooOld,    // sequence plans only: older than the engine still tracks deletes for
 };
 
 // apply_batch's outcome, shaped like std::expected<CommitResult, PlanRefusal>
@@ -390,22 +390,25 @@ enum class PlanRefusal {
 class ApplyResult;
 
 // Write plan for apply_batch. Groups multiple operations into a single atomic write.
-// Construct with a read sequence — WritePlan(snap.sequence()), or WritePlan(snap),
-// which takes it — to enable ensure_unchanged / ensure_range_unchanged guards;
-// those methods throw std::logic_error on a plan without one.
-// With a read sequence, apply_batch automatically rejects the plan if any
+// A plan's base is what "changed since" is measured against:
+//   WritePlan(snap)            the snapshot itself, held until apply_batch returns.
+//                              A key absent in snap and absent now is unchanged.
+//   WritePlan(snap.sequence()) a plain sequence, no snapshot held. A key written
+//                              and deleted again since counts as changed, and a
+//                              sequence older than the delete log covers is TooOld.
+// A base enables ensure_unchanged / ensure_range_unchanged guards; those
+// methods throw std::logic_error on a plan without one.
+// With a base, apply_batch automatically rejects the plan if any
 // write key (put or del) changed since it — no explicit guard needed on
 // keys in the write set. Use ensure_unchanged for read-only dependencies: keys whose
-// value influenced the plan but that the plan does not modify. A key written and
-// deleted again since the read sequence counts as changed.
-// A guardless plan without a read sequence always commits (no conflict possible).
+// value influenced the plan but that the plan does not modify.
+// A guardless plan without a base always commits (no conflict possible).
 class WritePlan {
 public:
-    WritePlan();                         // no read sequence: only ensure_present/ensure_absent available
+    WritePlan();                         // no base: only ensure_present/ensure_absent available
     // Checked against the state at read_sequence; holds no snapshot.
     explicit WritePlan(std::uint64_t read_sequence, SizeLimits limits = {});
-    // WritePlan(snap.sequence()) with snap's limits; keeps snap until apply_batch,
-    // which uses it to find the written keys without reading their records again.
+    // Checked against snap; holds it until apply_batch returns.
     explicit WritePlan(Snapshot snap);
 
     void put(BytesView key, BytesView value);
@@ -414,7 +417,7 @@ public:
 
     void ensure_present(BytesView key);                         // guard: key must exist
     void ensure_absent(BytesView key);                          // guard: key must be absent
-    void ensure_unchanged(BytesView key);                       // guard: key unchanged since read sequence
+    void ensure_unchanged(BytesView key);                       // guard: key unchanged since the base
     void ensure_range_unchanged(BytesView from, BytesView to);  // guard: no key change in [from, to)
 
     [[nodiscard]] auto read_sequence() const noexcept -> std::optional<std::uint64_t>;

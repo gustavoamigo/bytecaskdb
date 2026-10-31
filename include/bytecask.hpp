@@ -124,12 +124,12 @@ struct CommitResult {
 
 // Why DB::apply_batch refused a plan. Nothing was written either way.
 enum class PlanRefusal {
-  // A guard failed, or a key the plan writes changed since its read
-  // sequence. Retry from a fresh snapshot.
+  // A guard failed, or a key the plan writes changed since its snapshot
+  // or read sequence. Retry from a fresh snapshot.
   Conflict,
-  // The read sequence is older than the engine still tracks deletes for
-  // (a reopen, resume(), ingest, or more deletes since than
-  // Options::max_delete_log_bytes holds). Take a fresh snapshot.
+  // Plans on a read sequence only: it is older than the engine still
+  // tracks deletes for (a reopen, resume(), ingest, or more deletes since
+  // than Options::max_delete_log_bytes holds). Take a fresh snapshot.
   TooOld,
 };
 
@@ -516,9 +516,9 @@ public:
   // of the snapshot its reads came from). Plain data: no snapshot is held,
   // so it can be built away from the reads, in another process.
   explicit WritePlan(std::uint64_t read_sequence, SizeLimits limits = {});
-  // WritePlan(snap.sequence(), its limits). Keeps snap only until
-  // apply_batch, which uses it to find the written keys without reading
-  // their records again.
+  // A plan checked against snap itself, which it holds until apply_batch
+  // returns. A key absent in snap and absent now is unchanged, even if
+  // written and deleted again between; never refused as TooOld.
   explicit WritePlan(Snapshot snap);
   ~WritePlan();
   WritePlan(const WritePlan&) = delete;
@@ -532,7 +532,7 @@ public:
 
   void ensure_present(BytesView key);
   void ensure_absent(BytesView key);
-  // Require a read sequence; throw std::logic_error without one.
+  // Require a snapshot or a read sequence; throw std::logic_error without one.
   void ensure_unchanged(BytesView key);
   void ensure_range_unchanged(BytesView from, BytesView to);  // from >= to throws
 
