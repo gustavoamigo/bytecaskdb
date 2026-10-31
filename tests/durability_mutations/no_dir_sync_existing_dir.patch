@@ -1,0 +1,21 @@
+open syncs the parent of a database directory it did not create only when it
+created nothing; without it, an entry left unsynced by an open that failed or
+was killed stays volatile and a power cut loses the directory and every file
+synced in it. Reverts the #740 fix.
+Guarded-by: "directory sync: open syncs the entry of a directory that exists"
+
+diff --git a/bytecaskdb/db.cpp b/bytecaskdb/db.cpp
+index 845f0af..614f96f 100644
+--- a/bytecaskdb/db.cpp
++++ b/bytecaskdb/db.cpp
+@@ -97,10 +97,6 @@ DB::DB(std::filesystem::path dir, Options opts)
+   std::filesystem::create_directories(dir_);
+   for (const auto &p : created)
+     sync_directory(p.parent_path(), "io_dir_sync_create_dir");
+-  if (created.empty()) {
+-    sync_directory(std::filesystem::absolute(dir_).parent_path(),
+-                   "io_dir_sync_create_dir");
+-  }
+ 
+   // Acquire exclusive advisory lock on the database directory.
+   const auto lock_path = dir_ / ".lock";

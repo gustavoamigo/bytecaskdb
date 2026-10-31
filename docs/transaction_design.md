@@ -201,7 +201,7 @@ otherwise:   append entries, apply them to the head
 
 Comparisons are by `KeyDirEntry::sequence`. Vacuum moves a record but keeps its sequence, so a relocated key is not a conflict. A record location names one immutable record for the life of the process, so a written key whose head entry still points at the snapshot's record is unchanged and needs no further lookup. On the blind-leaf key directory that check reads no record; `docs/bytecask_design.md` (*Implicit W-W check on write keys*) has the detail.
 
-A plan that conflicts with a write the head holds but that is not yet published returns once that write is published. Until then a retry from a fresh snapshot would see the same state and lose again. A plan whose snapshot is already behind the published state returns at once.
+A plan that conflicts with a write the head holds but that is not yet published returns once that write is published. Until then a retry from a fresh snapshot would see the same state and lose again. If that write's flush fails, the plan throws `DbDegraded`: the write is unseen, and a conflict with it is no answer. A plan the published state refutes as well returns at once. The same holds for a plan whose guards hold with nothing to write: it returns once what they held on is published.
 
 ### Single-entry plans
 
@@ -237,7 +237,7 @@ The isolation check ([`isolation_checking_design.md`](isolation_checking_design.
 - The same plan without read guards is **snapshot-isolated**. Its only serializability anomaly is write skew (G2-item).
 - Plans without a snapshot lose updates, as expected.
 
-Range guards and range deletes are checked by the same harness's range workload: concurrent scans, reads, `put`s, `del`s and `del_range`s over overlapping ranges, replayed against the commit order. A guarded plan must see exactly the state its transaction should have seen; without the guards, reads behind that state show up. See `isolation_checking_design.md`, *Range workload*.
+Range guards and range deletes are checked by the same harness's range workload: concurrent scans, reads, `put`s, `del`s and `del_range`s over overlapping ranges, replayed against the commit order. A guarded plan must see exactly the state its transaction should have seen; without the guards, reads behind that state show up. Plans without a snapshot that rest on `ensure_present` or `ensure_absent`, and `del`, are checked there too: every outcome, a `nullopt` included, has to agree with the commit order and real time (#676). See `isolation_checking_design.md`, *Range workload*.
 
 The check covers point reads and writes. `ensure_range_unchanged`, `del_range` and phantoms are not part of it yet.
 

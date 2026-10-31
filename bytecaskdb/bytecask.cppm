@@ -611,11 +611,12 @@ public:
     std::uint64_t ignored = 0;
     return validate_preconditions(plan, ignored);
   }
-  // On failure, lost_to is the highest sequence among the entries the plan
-  // lost to — what a retry has to be able to see — or, for a key the plan
-  // found deleted or absent, the head's latest sequence.
+  // rests_on is the head entry the outcome rests on. On failure, the entry
+  // the plan lost to — what a retry has to be able to see. On success, the
+  // latest entry its guards read; 0 for a plan without guards. For a key
+  // found deleted or absent, which has no entry, the head's latest sequence.
   [[nodiscard]] auto validate_preconditions(const WritePlan &plan,
-                                            std::uint64_t &lost_to) const
+                                            std::uint64_t &rests_on) const
       -> bool;
 
   // Prepare IO plan — pure read, no mutations.
@@ -728,13 +729,13 @@ public:
 
 private:
   // Returns true if [from, to) differs between snap and the head: a key
-  // changed, inserted or deleted since snap. Sets lost_to as
+  // changed, inserted or deleted since snap. Sets rests_on as
   // validate_preconditions documents. Shared by range guards and the
   // implicit W-W check of a planned del_range.
   [[nodiscard]] auto range_changed(const EngineState &snap,
                                    std::span<const std::byte> from,
                                    std::span<const std::byte> to,
-                                   std::uint64_t &lost_to) const -> bool;
+                                   std::uint64_t &rests_on) const -> bool;
   // Where key_dir_ reads the keys it does not store: this transient's files
   // and the records it has not written yet.
   [[nodiscard]] auto kd_ctx() const -> KeyDirCtx {
@@ -1328,10 +1329,13 @@ public:
 private:
   explicit DB(std::filesystem::path dir, Options opts);
 
-  // Blocks until the published state covers sequence — a fresh snapshot
-  // can see the write a plan lost to — or the engine degrades or closes.
-  // See apply_batch.
+  // Blocks until the published state covers sequence, or the engine
+  // degrades or closes.
   void wait_published(std::uint64_t sequence) const;
+  // Returns once the outcome of a slot that appended nothing rests only on
+  // published writes. Throws DbDegraded when a write it rests on will never
+  // be published.
+  void settle_unappended(const EngineSlot &slot) const;
 
   // Drains background hint tasks then writes all sealed hint files.
   void flush_hints();
@@ -1546,9 +1550,57 @@ private:
   // so, or write_fault_ is set.
   [[nodiscard]] auto refused(const EngineState &s) const noexcept -> bool;
   // Refuses writes from now on, then publishes the degraded state if memory
-  // allows, and wakes every waiter. Allocates nothing to refuse. For a
-  // failure after an append that no I/O handler degraded for.
+  // allows, and wakes every waiter. Allocates nothing to refuse. Publishes
+  // by compare-and-swap, so it never replaces a state newer than the one it
+  // degraded, and needs no flush role. For a failure after an append that no
+  // I/O handler degraded for, and the last step of every degrade.
   void refuse_writes() noexcept;
+  // For a failure after bytes may have reached the file. Runs publish,
+  // which builds and stores the handler's degraded state, then refuses
+  // writes by the flag (refuse_writes) whether or not it could: building the
+  // state allocates. Never throws: the handler throws its own error after
+  // it, never the allocation's. The flag goes up after the publish, so no
+  // reader sees the generic reason before the handler's, and a quiesce()
+  // inside publish still lands the flush in flight. publish runs under the
+  // caller's flush role, or takes it.
+  template <typename Publish>
+  void degrade(Publish &&publish) noexcept {
+    try {
+#ifdef BYTECASK_TESTING
+      if (test_before_degrade_publish_) test_before_degrade_publish_();
+#endif
+      publish();
+    } catch (...) {
+      // No memory to say why: the flag refuses, and refuse_writes publishes
+      // the generic reason if it can.
+    }
+    refuse_writes();
+  }
+  // The two shapes of degrade: the published state degraded, or the
+  // transient with what it applied. reason is a string literal, or a
+  // callable that builds it, so that its allocation is inside degrade too.
+  template <typename Reason>
+  void degrade_from(const std::shared_ptr<const EngineState> &current,
+                    const Reason &reason) noexcept {
+    degrade([&] { store_state(current->degraded_copy(make_reason(reason))); });
+  }
+  template <typename Reason>
+  void degrade_transient(TransientEngineState &t,
+                         const std::shared_ptr<const EngineState> &current,
+                         const Reason &reason) noexcept {
+    degrade([&] {
+      t.apply_degrade(make_reason(reason));
+      store_state(current, std::move(t).persistent());
+    });
+  }
+  template <typename Reason>
+  static auto make_reason(const Reason &reason) -> std::string {
+    if constexpr (std::is_invocable_v<const Reason &>) {
+      return std::string{reason()};
+    } else {
+      return std::string{reason};
+    }
+  }
   // Releases the flush role and wakes commit_wait / quiesce / durable_sequence
   // waiters. The empty durable_mu_ critical section orders the release
   // before the notify for waiters that checked the predicate and are about
@@ -1599,6 +1651,10 @@ private:
   [[nodiscard]] auto ingest_chunk(std::span<const DataEntryView> entries,
                                   std::uint64_t file_size) const
       -> IngestChunk;
+  // Syncs and seals ingest's active file and opens the next, between
+  // chunks and after the last. A failure degrades from current and throws.
+  void ingest_rotate(TransientEngineState &t,
+                     const std::shared_ptr<const EngineState> &current);
 
   // Recovery
   // Runs recovery, undoing an interrupted vacuum it finds on the way.
@@ -1660,6 +1716,31 @@ private:
     // state_ is never null: it starts as an empty state (see open).
     if (degraded && !old->degraded) {
       counters_.degraded_transitions.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  // refuse_writes' publication, which runs without the flush role: the
+  // current state degraded, swapped in only if no publication landed since
+  // it was loaded, and otherwise retried on the newer one, so no state is
+  // replaced by an older one. A state degraded already keeps its own reason.
+  // Throws std::bad_alloc.
+  void publish_degraded_if_healthy(std::string_view reason) {
+    auto current = std::atomic_load(&state_);
+    while (!current->degraded) {
+      auto s = current->degraded_copy(std::string{reason});
+#ifdef BYTECASK_TESTING
+      if (test_before_refusal_swap_) test_before_refusal_swap_();
+#endif
+      publishing_.fetch_add(1, std::memory_order_acq_rel);
+      const bool swapped =
+          std::atomic_compare_exchange_strong(&state_, &current, s);
+      if (swapped)
+        state_gen_.store(next_state_gen(), std::memory_order_release);
+      publishing_.fetch_sub(1, std::memory_order_release);
+      if (swapped) {
+        counters_.degraded_transitions.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+      // current now holds the state that landed in between.
     }
   }
   auto load_head() const -> std::shared_ptr<EngineState> {
@@ -1798,6 +1879,16 @@ public:
   // Called by refuse_writes before it publishes the degraded state. A test
   // throws from it to leave the flag as the only refusal.
   std::function<void()> test_before_refusal_publish_;
+  // Called by degrade before it builds the handler's degraded state. A test
+  // throws from it to leave the I/O handler with the flag alone.
+  std::function<void()> test_before_degrade_publish_;
+  // Called by refuse_writes once it has built its degraded state, before it
+  // swaps it in. A test publishes there (test_publish_unchecked) as a flush
+  // would, which the swap must not replace.
+  std::function<void()> test_before_refusal_swap_;
+  void test_publish_unchecked(std::shared_ptr<EngineState> s) {
+    store_state(std::move(s));
+  }
   // Called by finish_rotation before it installs the new files in the
   // transient. A test throws from it to fail the rotation's in-memory step.
   std::function<void()> test_in_finish_rotation_;
@@ -2128,12 +2219,10 @@ export struct EngineSlot : Slot {
   WritePlan plan;
   WriteOptions opts;
   std::optional<CommitResult> result;
-  // On a conflict: the sequence of the entry the plan lost to, and the
-  // plan's snapshot's next_seq. A snapshot that already covers every
-  // published write lost to something still in flight — see apply_batch,
-  // which then reports the conflict only once that write is published.
-  std::uint64_t conflict_lost_to{0};
-  std::uint64_t conflict_snap_next{0};
+  // A slot that appended nothing: the head entry its outcome rests on (see
+  // validate_preconditions). 0 when it rests on nothing. apply_batch
+  // returns only once it is published (settle_unappended).
+  std::uint64_t rests_on{0};
   // A sync slot that appended nothing: the sequence every earlier write
   // reaches, which commit_wait makes durable before the slot returns. Its
   // result keeps sequence 0 — the write itself wrote nothing.

@@ -58,6 +58,9 @@ public:
   auto operator=(ScopedAllocFaults &&) -> ScopedAllocFaults & = delete;
 
   auto report() -> AllocFaultReport;
+
+  // Allocations counted so far, without disarming.
+  [[nodiscard]] auto allocations() const -> long;
 };
 
 // Allocations this thread makes while one is alive are not reported as
