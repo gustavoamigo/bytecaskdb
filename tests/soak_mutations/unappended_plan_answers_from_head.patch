@@ -4,7 +4,8 @@ writer to retry a key in the microseconds between a failed flush's error
 and its degrade; the nightly hit it at epoch 15 of one leg and 279 of
 the other.
 A 1,500 s run of this mutation (seed 40445801076, 349 epochs) passed. The
-unit test below catches it every time.
+unit test below catches it every time, and so does the isolation nightly's
+presence configuration of the range workload, in its first round (#676).
 Guarded-by: "pipeline: a del after a failed flush does not answer from the failed write before the degrade is published"
 
 diff --git a/bytecaskdb/db.cpp b/bytecaskdb/db.cpp

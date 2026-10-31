@@ -2889,7 +2889,11 @@ nothing. The kill mode and the chaos rig run it too. Three mutations of the
 range check, applied by hand, are each caught by a guarded history: skipping
 the deleted-keys pass, skipping the changed-keys pass, and treating a write
 above the snapshot's sequence as unchanged (what validating against the
-published state amounts to).
+published state amounts to). Its `presence` configuration (#676) adds plans
+without a snapshot that rest on `ensure_present` or `ensure_absent`, and
+`del`. Every outcome, a `nullopt` included, is held to the commit order and
+to real time, under frequent `fdatasync` failures. It catches #672's
+mutation in the first round.
 
 ---
 
@@ -3003,6 +3007,7 @@ A site whose break nothing has to catch says why instead.
 | Site | Guarded by | Mutation | Origin |
 |---|---|---|---|
 | `DB::DB`: each directory open creates is synced in its parent | `directory sync: open syncs each directory it creates` | `no_dir_sync_created_dir` | #199 |
+| `DB::DB`: the database directory's entry is synced in its parent when the directory already exists | `directory sync: open syncs the entry of a directory that exists` | `no_dir_sync_existing_dir` | #740 |
 | `recovery_prepare_files`: a hint-less file is rewritten and synced before it is read | `open makes a hint-less file durable before it indexes it: a process killed before its sync` | `open_trusts_page_cache` (chaos) | #240 (#231) |
 | `recovery_check_tail`: a tail is cut only in the newest file | `DB recovery: a hint-less file's tail is truncated only in the newest file` | `tail_cut_in_any_file` | #206 (#138) |
 | `recovery_check_tail`: a first header with an unknown type and only zeros after its sequence field has no sequence, so a first write that landed only part of its sequence is cut, while an unknown type before intact records is still refused | `DB recovery: a hint-less file's tail is truncated only in the newest file` | `torn_first_sequence_trusted` (chaos) | #471 |

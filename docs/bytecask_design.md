@@ -1337,6 +1337,7 @@ Because hint file writes are deferred (see above), this protocol is exercised at
 | Entry | Synced | Before |
 |---|---|---|
 | directories `DB::open` creates | each parent, deepest first | anything is written in them |
+| the database directory, when `DB::open` finds it already there | its parent | anything is written in it; an earlier open may have created it and failed or been killed before its sync (#740) |
 | a new active file (`DB::open`, `prepare_rotation`, `resume()`, all through `create_active_file`) | `dir_` | any write into it is acknowledged |
 | vacuum's compacted file, renamed from `.data.tmp` | `dir_` | the commit, and so the unlink of the source |
 | a hint file, renamed from `.hint.tmp` | `dir_` | nothing; a lost rename only costs a rebuild |
