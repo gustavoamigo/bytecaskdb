@@ -11,6 +11,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <string_view>
 
@@ -22,7 +23,8 @@ auto b(std::string_view s) -> std::span<const std::byte> {
   return std::as_bytes(std::span{s.data(), s.size()});
 }
 
-constexpr std::size_t kBig = std::size_t{1} << 40;
+// No budget limit, on 32-bit targets (the wasm build) too.
+constexpr std::size_t kBig = std::numeric_limits<std::size_t>::max();
 
 void del(bytecask::DeleteLog &log, std::string_view key, std::uint64_t seq) {
   bytecask::StagedRemovals staged;
