@@ -2124,6 +2124,9 @@ TEST_CASE("embedded API: a view is read as a table, expanded at each use, and ke
     CHECK(run("SELECT a FROM ga GROUP BY a ORDER BY a") == Grid{{i(30)}, {i(40)}});
     CHECK(run("SELECT a FROM ga WHERE a = 40 GROUP BY a HAVING a = 40") == Grid{{i(40)}});
     CHECK(run("SELECT a FROM ga WHERE a = 40 GROUP BY a HAVING a = 30").empty());
+    // MIN, MAX and COUNT(DISTINCT) cannot tell a value once from many: they read the base rows the view keeps.
+    CHECK(run("SELECT MAX(a), MIN(a) FROM ga") == Grid{{i(40), i(30)}});
+    CHECK(run("SELECT COUNT(DISTINCT a) FROM ga WHERE a < 40") == Grid{{i(1)}});
     CHECK(state(*db, "SELECT SUM(a) FROM ga") == "42601");
     CHECK(state(*db, "SELECT COUNT(*) FROM ga") == "42601");
     CHECK(state(*db, "SELECT DISTINCT a FROM ga") == "42601");
