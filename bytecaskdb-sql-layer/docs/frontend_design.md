@@ -108,7 +108,13 @@ kind the transformer doesn't take is refused with its position.
   a name orders by that item (PostgreSQL looks at output names first there,
   at input columns first in `GROUP BY`, which takes no output name here). A
   subquery resolves its own aliases; it cannot name the outer query's
-  (correlation is refused). `t AS x (c1, c2)`, an alias of a join, a join in
+  (correlation is refused). `t AS x (c1, c2)` renames the table's first
+  columns (the binder renames them in the alias's table instance, which is
+  already a copy; the parser keeps the alias so qualifiers are resolved
+  there). The old names are gone (42703), the unnamed columns keep theirs,
+  more names than columns is 42P10, a repeated name 42701. `SELECT * AS (c,
+  d)` is SQL standard only, not PostgreSQL, and is a syntax error (42601).
+  An alias of a join, a join in
   parentheses or inside a comma list, and a view in a query that names a
   table twice are refused. Without `FROM`, a `SELECT` of constants returns
   one row of them, or none under `LIMIT 0`; it takes no `WHERE`, `GROUP BY`,
@@ -439,8 +445,7 @@ That includes:
 - `FULL JOIN`, an outer join's `ON` comparing an expression of columns,
   more than eight tables, a `RIGHT JOIN` of more than two, `USING` or
   `NATURAL` after the first join, a join in parentheses or among commas,
-  `FOR UPDATE` of a join (#697), renaming a table's columns (`t AS x (a,
-  b)`), an alias of a join, an output name in `GROUP BY` or in `ORDER BY` of
+  `FOR UPDATE` of a join (#697), an alias of a join, an output name in `GROUP BY` or in `ORDER BY` of
   other than a column;
 - `OFFSET`, `RETURNING`, multi-row `VALUES`;
 - `CASE` or `COALESCE` of a float beside another number, a `BETWEEN` or

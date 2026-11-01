@@ -2913,12 +2913,38 @@ public:
     for (const auto& item : s.from) {
       const auto pos = s.from.size() == 1 ? s.pos : item.pos;
       rels.push_back(instance(*table(item.table, pos), item.name(), rels));
+      if (!item.column_aliases.empty()) rename_columns(*rels.back(), item, pos);
       // Two views of one table are merged into the query under one name.
       if (std::ranges::count_if(rels, [&](const Table* r) { return r->name == rels.back()->name; }) > 1) {
         not_yet("a table joined with itself through views", pos);
       }
     }
     return rels;
+  }
+
+  // t AS x (a, b): the instance's first columns carry the names the alias
+  // gives; the rest keep theirs. More names than columns is 42P10. The
+  // instance is the alias's own (FromItem::name differs from the table's).
+  void rename_columns(const Table& read, const ast::FromItem& item, std::int32_t pos) {
+    auto visible = static_cast<std::size_t>(std::ranges::count_if(read.columns, [](const Column& c) { return !c.hidden; }));
+    if (item.column_aliases.size() > visible) {
+      throw SqlError{"table \"" + item.name() + "\" has " + std::to_string(visible) + " columns available but " +
+                         std::to_string(item.column_aliases.size()) + " columns specified",
+                     pos, kInvalidColumnReference};
+    }
+    auto owned = std::ranges::find_if(instances_, [&](const auto& i) { return i.get() == &read; });
+    if (owned == instances_.end()) not_yet("renaming the columns of a table under its own name", pos);
+    auto& copy = **owned;
+    auto next = item.column_aliases.begin();
+    for (auto& c : copy.columns) {
+      if (c.hidden || next == item.column_aliases.end()) continue;
+      c.name = *next++;
+    }
+    if (std::ranges::any_of(copy.columns, [&](const Column& c) {
+          return !c.hidden && std::ranges::count_if(copy.columns, [&](const Column& d) { return !d.hidden && d.name == c.name; }) > 1;
+        })) {
+      throw SqlError{"column name specified more than once in the alias of \"" + item.name() + "\"", pos, kDuplicateColumn};
+    }
   }
 
   // The table to read for a use of `t` named `name`: the table itself, or,

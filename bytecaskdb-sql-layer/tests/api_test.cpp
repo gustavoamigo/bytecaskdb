@@ -1578,7 +1578,14 @@ TEST_CASE("embedded API: table aliases qualify columns and hide the table's name
   CHECK(state("SELECT g.id FROM g x") == "42P01");  // the alias hides the table's name
   CHECK(state("SELECT id FROM g x JOIN h x ON x.id = x.k") == "42712");
   CHECK(state("SELECT x.id FROM g x") == "ran");
-  CHECK(state("SELECT x.id FROM g AS x (a, b)") == "42601");  // renaming columns is not supported
+  // A column list renames the first columns: the old name is gone.
+  auto renamed = db->execute("SELECT x.a, b FROM g AS x (a, b) ORDER BY a");
+  CHECK(renamed.columns == std::vector<std::string>{"a", "b"});
+  CHECK(renamed.rows == Grid{{i(1), i(30)}, {i(2), i(10)}, {i(3), i(20)}});
+  CHECK(db->execute("SELECT * FROM g AS x (a)").columns == std::vector<std::string>{"a", "v"});
+  CHECK(state("SELECT x.id FROM g AS x (a, b)") == "42703");
+  CHECK(state("SELECT * FROM g AS x (a, b, c)") == "42P10");
+  CHECK(state("SELECT * FROM g AS x (a, a)") == "42701");
 }
 
 TEST_CASE("embedded API: SELECT * and table.* expand to the FROM tables' columns, in order", "[sql][api]") {
