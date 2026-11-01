@@ -105,6 +105,14 @@ on any columns.
   - Of a `REAL` or `DOUBLE PRECISION` column they are refused too (*Known
     differences*), as are `SUM` and `AVG` of one (42601).
 
+**`SELECT DISTINCT`** is a `GROUP BY` of the selected columns, so it
+returns one row per distinct combination, NULL one value and a DOUBLE's
+`-0.0` and `0.0` one, as the grouping below makes them. Its `ORDER BY` must
+name selected columns (42P10) and it takes no `FOR UPDATE` (0A000), as in
+PostgreSQL. Over a query already aggregated it is nothing more where every
+`GROUP BY` column is selected, or where there is no `GROUP BY`; otherwise,
+and with a constant selected or `DISTINCT ON`, it is not taken yet.
+
 **`GROUP BY` and `HAVING`** (`planner_design.md`, *Aggregates*):
 - `GROUP BY` takes a list of columns of the statement's tables, of any type.
   NULLs form one group, and a DOUBLE's `-0.0` and `0.0` one (its row shows
@@ -147,8 +155,9 @@ on any columns.
 That includes:
 - `OR`, `NOT`, `IN`, `BETWEEN`, `IS NULL`;
 - subqueries, derived tables, set operations;
-- `DISTINCT` on the select list, `GROUP BY` of an expression, and `HAVING`
-  of anything but the comparisons above;
+- `DISTINCT ON`, `DISTINCT` of a constant or over groups it does not select
+  every key of, `GROUP BY` of an expression, and `HAVING` of anything but
+  the comparisons above;
 - outer joins, three or more tables, table aliases;
 - `OFFSET`, `RETURNING`, multi-row `VALUES`;
 - `*`, `/`, string concatenation and functions;

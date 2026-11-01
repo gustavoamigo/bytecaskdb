@@ -436,12 +436,17 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
     if (from->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) reject("SELECT reads one or two tables", pos);
     tables.push_back(from->range_var);
   }
-  if (s->n_distinct_clause != 0 || s->group_distinct || s->limit_offset != nullptr || s->n_locking_clause > 1 || s->with_clause != nullptr ||
+  // DISTINCT is a list of one empty node; DISTINCT ON a list of its expressions.
+  auto distinct = s->n_distinct_clause == 1 &&
+                  (s->distinct_clause[0] == nullptr || s->distinct_clause[0]->node_case == PG_QUERY__NODE__NODE__NOT_SET);
+  if (s->n_distinct_clause != 0 && !distinct) reject("DISTINCT ON is not supported", pos);
+  if (s->group_distinct || s->limit_offset != nullptr || s->n_locking_clause > 1 || s->with_clause != nullptr ||
       s->n_window_clause != 0 || s->into_clause != nullptr) {
     reject("SELECT clause not supported", pos);
   }
   Select sel{{}, tables.empty() ? "" : relation(tables[0]), tables.size() == 2 ? relation(tables[1]) : "", {}, {}, limit(s),
              pos, false};
+  sel.distinct = distinct;
   if (!tables.empty()) sel.table_pos = tables[0]->location;
   if (tables.size() == 2) sel.join_pos = tables[1]->location;
   if (s->n_locking_clause == 1) {
