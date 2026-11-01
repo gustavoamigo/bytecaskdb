@@ -241,9 +241,14 @@ struct Limit {
 
 // One row of VALUES: per table column, in column order, its value, or
 // nullopt for the default bc_row_begin writes.
+//
+// `checks` are the table's CHECK constraints over the row as written, each
+// a BOOLEAN over the table's columns and constants: the row is refused
+// (23514) where one is false, and accepted where it is true or NULL.
 struct Insert {
   const Table* table{nullptr};
   std::vector<std::optional<Expr>> values;
+  std::vector<Expr> checks;
 };
 
 // Each row the input gives, written: its set columns from expressions of
@@ -252,6 +257,7 @@ struct Update {
   NodePtr input;
   const Table* table{nullptr};
   std::vector<std::pair<ColumnRef, Expr>> set;
+  std::vector<Expr> checks;  // as Insert's, over the row as it will be written
 };
 
 struct Delete {

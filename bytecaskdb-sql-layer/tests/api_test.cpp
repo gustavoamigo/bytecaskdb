@@ -2511,3 +2511,36 @@ TEST_CASE("embedded API: the time is read once per statement, and once per trans
     }
   }
 }
+
+TEST_CASE("embedded API: a CHECK is tested on every INSERT and UPDATE, on the row as written", "[sql][api]") {
+  sql_test::TempDir dir{"api_check"};
+  auto state = [](Database& db, std::string_view sql, const std::vector<Value>& params = {}) -> std::string {
+    try {
+      (void)db.execute(std::string{sql}, params);
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ok";
+  };
+  {
+    auto db = Database::open(dir.path());
+    CHECK(state(*db, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER CHECK (a > 0), b INTEGER DEFAULT 5, "
+                     "CONSTRAINT lt CHECK (a IS NULL OR a < b))") == "ok");
+    CHECK(state(*db, "INSERT INTO t VALUES ($1, $2, $3)", {i(1), i(1), i(2)}) == "ok");
+    CHECK(state(*db, "INSERT INTO t VALUES ($1, $2, $3)", {i(2), i(0), i(2)}) == "23514");     // a > 0 false
+    CHECK(state(*db, "INSERT INTO t VALUES ($1, $2, $3)", {i(2), i(3), i(2)}) == "23514");     // lt false
+    CHECK(state(*db, "INSERT INTO t VALUES ($1, $2, $3)", {i(2), kNull, i(2)}) == "ok");       // NULL passes
+    CHECK(state(*db, "INSERT INTO t (id, a) VALUES ($1, $2)", {i(3), i(4)}) == "ok");          // b is its default, 5
+    CHECK(state(*db, "INSERT INTO t (id, a) VALUES ($1, $2)", {i(4), i(5)}) == "23514");       // 5 < 5 false
+    CHECK(state(*db, "UPDATE t SET a = 0 WHERE id = 1") == "23514");
+    CHECK(state(*db, "UPDATE t SET b = 1 WHERE id = 1") == "23514");  // a column the CHECK reads, not a column it names in SET
+    CHECK(state(*db, "UPDATE t SET b = $1 WHERE id = $2", {i(9), i(1)}) == "ok");
+    // A refused row is not written.
+    CHECK(db->execute("SELECT id FROM t ORDER BY id").rows == Grid{{i(1)}, {i(2)}, {i(3)}});
+    CHECK(db->execute("SELECT a, b FROM t WHERE id = 1").rows == Grid{{i(1), i(9)}});
+    CHECK(state(*db, "ALTER TABLE t ADD COLUMN c INTEGER CHECK (c > 0)") == "42601");
+  }
+  auto db = Database::open(dir.path());  // the constraints are in the catalog
+  CHECK(state(*db, "INSERT INTO t VALUES ($1, $2, $3)", {i(7), i(0), i(2)}) == "23514");
+  CHECK(state(*db, "INSERT INTO t VALUES ($1, $2, $3)", {i(7), i(1), i(2)}) == "ok");
+}

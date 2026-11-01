@@ -261,6 +261,14 @@ struct Index {
   std::vector<IndexPart> parts;
 };
 
+// A CHECK constraint: its name and the text of its expression, bound again
+// at each INSERT and UPDATE of the table (the text is the definition, as a
+// view's is).
+struct CheckConstraint {
+  std::string name;
+  std::string expr;
+};
+
 struct Table {
   std::uint32_t id{0};
   std::string name;
@@ -269,6 +277,7 @@ struct Table {
   std::vector<Column> columns;
   std::vector<std::uint32_t> pk_col_ids;
   std::vector<Index> indexes;
+  std::vector<CheckConstraint> checks;
   std::uint32_t layout_id{0};  // the current generation's object id
   RowLayout layout;            // the current generation
   // Earlier generations, oldest first: empty until REBUILD (#503).
@@ -337,11 +346,20 @@ struct UniqueSpec {
 // The stage-1 DDL statements, as values: what LiveCatalog prepares.
 // A CREATE TABLE with no primary key gets a hidden row id as its key; its
 // UNIQUE constraints are unique indexes created with it, in its batch.
+// A CHECK of CREATE TABLE: its name, "" for one the catalog chooses as
+// PostgreSQL does, its expression's text, and the column it is written on,
+// "" for a table's. The binder has checked the expression.
+struct CheckSpec {
+  std::string name;
+  std::string expr;
+  std::string column;
+};
 struct CreateTableDdl {
   std::string name;
   std::vector<ColumnSpec> columns;
   std::vector<std::string> pk;
   std::vector<UniqueSpec> unique;
+  std::vector<CheckSpec> checks;
 };
 struct CreateIndexDdl {
   std::string name;
@@ -409,7 +427,10 @@ public:
   // without a primary key). 3, #489's record (SQL types, defaults, unique
   // and DESC parts, layout entries), is read with no hidden column. 2 was
   // #490's, 1 the prototype's; both are refused.
-  static constexpr std::uint16_t kRecordFormat = 4;
+  // 5: the record ends with the table's CHECK constraints. A table with none
+  // is still written as 4, so only a database that holds a CHECK is closed
+  // to an earlier build.
+  static constexpr std::uint16_t kRecordFormat = 5;
   static constexpr std::uint16_t kOldestRecordFormat = 3;
 
   // The constants a plan on this table needs, named from ids alone so that
@@ -1239,7 +1260,7 @@ auto read_layout(RecordReader& r, const Table& t) -> std::pair<std::uint32_t, Ro
 
 auto serialize_table(const Table& t) -> Bytes {
   RecordWriter w;
-  w.u16(Catalog::kRecordFormat);
+  w.u16(t.checks.empty() ? std::uint16_t{4} : Catalog::kRecordFormat);
   w.u32(t.id);
   w.str(t.name);
   w.u32(t.version);
@@ -1276,6 +1297,15 @@ auto serialize_table(const Table& t) -> Bytes {
   w.u16(t.retired_layouts.size() + 1);
   for (const auto& [id, l] : t.retired_layouts) write_layout(w, id, l);
   write_layout(w, t.layout_id, t.layout);
+  if (!t.checks.empty()) {
+    w.u16(t.checks.size());
+    for (const auto& c : t.checks) {
+      w.entry([&](RecordWriter& e) {
+        e.str(c.name);
+        e.blob(std::as_bytes(std::span{c.expr}));
+      });
+    }
+  }
   return w.bytes();
 }
 
@@ -1391,6 +1421,22 @@ auto parse_table(BytesView in) -> Table {
   for (std::uint32_t i = 0; i < nlayout; ++i) t.retired_layouts.push_back(read_layout(r, t));
   std::tie(t.layout_id, t.layout) = std::move(t.retired_layouts.back());
   t.retired_layouts.pop_back();
+  if (format >= 5) {
+    auto nchecks = r.u16();
+    if (nchecks == 0) corrupt("table " + t.name + " has a format-5 record and no CHECK");
+    for (std::uint32_t i = 0; i < nchecks; ++i) {
+      RecordReader e{r.blob()};
+      CheckConstraint c;
+      c.name = e.str();
+      auto text = e.blob();
+      c.expr.assign(reinterpret_cast<const char*>(text.data()), text.size());
+      e.expect_end("CHECK entry of table " + t.name);
+      if (c.name.empty() || c.expr.empty() || std::ranges::contains(t.checks, c.name, &CheckConstraint::name)) {
+        corrupt("table " + t.name + " has a malformed CHECK");
+      }
+      t.checks.push_back(std::move(c));
+    }
+  }
   r.expect_end("record of table " + t.name);
 
   // Every key column is a column of the table, and the current layout holds
@@ -1742,6 +1788,23 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       put_op(ops, DdlOp::Kind::EnsureAbsent, name_entry_key(ix.name));
       put_op(ops, DdlOp::Kind::Put, name_entry_key(ix.name), name_value(kKindIndex, ix.id));
       t.indexes.push_back(std::move(ix));
+    }
+    // The CHECKs, named as written or as PostgreSQL's ChooseConstraintName
+    // does: table_column_check for one on a column, table_check for the
+    // table's, then 1, 2… where a CHECK of the table has the name.
+    for (const auto& c : ct->checks) {
+      if (c.name.empty()) continue;
+      if (std::ranges::contains(t.checks, c.name, &CheckConstraint::name)) {
+        throw DdlRefused("constraint \"" + c.name + "\" for relation \"" + t.name + "\" already exists", kDuplicateObject);
+      }
+      t.checks.push_back({c.name, c.expr});
+    }
+    for (const auto& c : ct->checks) {
+      if (!c.name.empty()) continue;
+      auto base = t.name + (c.column.empty() ? "" : "_" + c.column) + "_check";
+      auto chosen = base;
+      for (auto n = 1; std::ranges::contains(t.checks, chosen, &CheckConstraint::name); ++n) chosen = base + std::to_string(n);
+      t.checks.push_back({chosen, c.expr});
     }
     put_op(ops, DdlOp::Kind::Put, table_record_key(t.id), serialize_table(t));
     next->put_table(std::move(t));
