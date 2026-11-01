@@ -127,6 +127,42 @@ kind the transformer doesn't take is refused with its position.
   A result not taken that raises is refused (42601): its type is not
   known without evaluating it. Float branches are refused. The output
   column is named `case`, `coalesce` or `nullif`.
+- **`||` and the string functions** fold constants only (of a column, a
+  parameter or a subquery they are refused, 42601, with the other
+  column-valued expressions, #667). The parser reads PostgreSQL's
+  spellings as the calls the grammar makes of them: `TRIM([LEADING |
+  TRAILING | BOTH] [chars FROM] s)` is `ltrim`, `rtrim` or `btrim` (spaces
+  by default), `POSITION(sub IN s)` is `position(s, sub)`, `SUBSTRING(s
+  FROM a [FOR n])` is `substring(s, a, n)`, `OVERLAY(s PLACING r FROM a
+  [FOR n])` is `overlay`; `CHAR_LENGTH`, `CHARACTER_LENGTH`, `OCTET_LENGTH`,
+  `UPPER`, `LOWER` and the function-call forms of the others are taken
+  as written. Text is UTF-8 and positions and lengths count characters.
+  - Arguments resolve as PostgreSQL's overloads do: an unknown literal
+    is of the parameter's type (`SUBSTRING('abc' FROM '2')` reads `'2'`
+    as an integer, 22P02 if it is not one), `smallint` and `integer` fit
+    an `integer` parameter, and any other type matches no function
+    (42883, `function upper(integer) does not exist`; so does a wrong
+    number of arguments). A NULL argument gives NULL after the types are
+    checked, as the functions are strict.
+  - `a || b`: strings, or a string with any other type through its text
+    (`'a' || 1` is `a1`, `'a' || true` is `atrue`); two values neither of
+    which is a string match no operator (42883).
+  - `UPPER` and `LOWER` fold ASCII letters only, the layer's one
+    collation being `COLLATE "C"`.
+  - `SUBSTRING(s FROM a FOR n)` is PostgreSQL's: a start before the first
+    character takes from it, the characters before it counting toward
+    `n`; `n < 0` is 22011; a start or length past `integer` is 42883
+    (`bigint`) and `a + n` past 2^31 − 1 reads to the end. `OVERLAY` with
+    a start below 1 is 22011, and a resume position past `integer` is
+    22003.
+  - `POSITION` of an empty substring is 1, of one not found 0.
+  - The output column is named as PostgreSQL names it: `?column?` for
+    `||`, otherwise the function (`btrim` for `TRIM`).
+  - Refused (42601): `SUBSTRING(s FROM 'pattern' [FOR 'escape'])`, the
+    regular-expression form PostgreSQL picks when no operand is an
+    integer; `bytea` operands but for `bytea || bytea`; a float operand
+    of `||`; a schema other than `pg_catalog`. `USING CHARACTERS` and
+    `USING OCTETS` are not PostgreSQL syntax (42601).
 - **`+` and `-`** on integers and on `DECIMAL`, with PostgreSQL's result
   type: `smallint + smallint` is `smallint`, `integer + bigint` is
   `bigint`, and so on.
@@ -277,8 +313,9 @@ That includes:
 - `CASE`, `COALESCE` and `NULLIF` of columns, parameters and subqueries, a
   `CASE` result that is a float, a `WHEN` that is not a comparison
   (`AND`, `OR`, `IS NULL`, `BETWEEN` as a value), `GREATEST` and `LEAST`;
-- `*` and `/` of columns, a numeric quotient, `%`, string concatenation
-  and functions;
+- `*` and `/` of columns, a numeric quotient, `%`, `||` and the string
+  functions of columns and parameters, `LENGTH`, `CONCAT`, `REPLACE`, the
+  regular-expression `SUBSTRING`, `bytea` string functions (#667, #671);
 - a cast of anything but a string literal or `NULL`, a numeric literal of
   more than 18 digits, a string literal in arithmetic, unary `-` of
   anything but a constant, a comparison of a column as a value, and a

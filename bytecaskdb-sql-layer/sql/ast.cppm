@@ -75,10 +75,10 @@ enum class ValueCompare { Eq, Ne, Lt, Le, Gt, Ge };
 // one (DATE '…' and '…'::date alike), an aggregate: COUNT(*),
 // COUNT([DISTINCT] column), SUM, MIN, MAX or AVG of a column; or a scalar
 // subquery, (SELECT …), the value of its one row; CASE (searched, or simple
-// on `lhs`), COALESCE and NULLIF; or, in a select list only,
+// on `lhs`), COALESCE and NULLIF; a string function or ||; or, in a select list only,
 // * or `table`.*, which the binder expands to columns.
 struct Expr {
-  enum class Kind { Column, Param, Const, Literal, Add, Sub, Mul, Div, Star, Plus, Neg, Compare, Cast, Aggregate, Subquery, Case, Coalesce, NullIf };
+  enum class Kind { Column, Param, Const, Literal, Add, Sub, Mul, Div, Star, Plus, Neg, Compare, Cast, Aggregate, Subquery, Case, Coalesce, NullIf, Func };
   enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind;
   std::string column;       // Column; Aggregate's argument, "" for COUNT(*)
@@ -99,6 +99,10 @@ struct Expr {
   // and `rhs` its ELSE, each none where absent. Coalesce: its arguments.
   // NullIf: `lhs` and `rhs`.
   std::vector<Expr> args;
+  // Func: a string function or ||, `func` its name as PostgreSQL resolves it
+  // (btrim for TRIM(BOTH …), position(string, substring) for POSITION(sub IN
+  // string)), its operands in `args`.
+  std::string func;
 };
 
 // One conjunct of a WHERE clause: two expressions compared; or, as a
@@ -138,6 +142,7 @@ struct Compare {
   out.cast_typmods = e.cast_typmods;
   out.subquery = e.subquery;  // never changed once parsed: shared
   for (const auto& a : e.args) out.args.push_back(clone(a));
+  out.func = e.func;
   return out;
 }
 

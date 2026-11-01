@@ -152,7 +152,7 @@
 
 - name: concatenation with ||
   features: [E021-07]
-  # only + and - are supported here
+  # || of a column (#667)
   unimplemented: true
   ordered: true
   setup:
@@ -190,7 +190,7 @@
 
 - name: UPPER and LOWER
   features: [E021-08]
-  # function upper is not supported
+  # UPPER and LOWER of a column (#667)
   unimplemented: true
   ordered: true
   setup:
@@ -228,7 +228,7 @@
 
 - name: CHARACTER_LENGTH and OCTET_LENGTH
   features: [E021-04, E021-05]
-  # function character_length is not supported
+  # CHARACTER_LENGTH and OCTET_LENGTH of a column (#667)
   unimplemented: true
   ordered: true
   setup:
@@ -251,7 +251,7 @@
 
 - name: SUBSTRING from a position, with a length
   features: [E021-06]
-  # function substring is not supported
+  # SUBSTRING of a column (#667)
   unimplemented: true
   ordered: true
   setup:
@@ -277,13 +277,13 @@
       rowcount: 1
     - sql: SELECT id, SUBSTRING(v FROM $1 FOR $2) FROM t WHERE id >= $3 ORDER BY id
       params: [2, 3, 0]
-      expected: [[1, null], [2, null], [3, null], [4, null], [5, null], [6, null]]
+      expected: [[1, ppl], [2, ppl], [3, ana], [4, _b], [5, null], [6, " pa"]]
   teardown:
     - DROP TABLE t
 
 - name: TRIM of spaces
   features: [E021-09]
-  # function btrim is not supported
+  # TRIM of a column (#667)
   unimplemented: true
   ordered: true
   setup:
@@ -315,7 +315,7 @@
 
 - name: POSITION of a substring
   features: [E021-11]
-  # function position is not supported
+  # POSITION of a column (#667)
   unimplemented: true
   ordered: true
   setup:
