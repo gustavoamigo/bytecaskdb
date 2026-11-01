@@ -28,17 +28,19 @@ The interface is the engine's (README, API Reference; CONTRACT.md)::
         plan.put(b"c", b"3")
         db.apply_batch(plan)
 
-leaves one data file holding, as ``dump("my_db")`` prints it::
+leaves one data file holding, as ``dump("my_db")`` prints it, the change
+marker the open appended (its id is random) and then the writes::
 
     data_..._V01.data
-           0  seq 1  PUT         b'a' b'1'
-          21  seq 2  BULK_BEGIN
-          40  seq 3  PUT         b'b' b'2'
-          61  seq 4  PUT         b'c' b'3'
-          82  seq 5  BULK_END
+           0  seq 1  CHANGE_MARKER id 9f2c...
+          27  seq 2  PUT           b'a' b'1'
+          48  seq 3  BULK_BEGIN
+          67  seq 4  PUT           b'b' b'2'
+          88  seq 5  PUT           b'c' b'3'
+         109  seq 6  BULK_END
 
-and a key directory mapping a, b and c to (file 1, offset 0, seq 1),
-(file 1, 40, 3) and (file 1, 61, 4). The Pythonic interface (``db[k]``,
+and a key directory mapping a, b and c to (file 1, offset 27, seq 2),
+(file 1, 67, 4) and (file 1, 88, 5). The Pythonic interface (``db[k]``,
 ``with db.transaction()``) is bytecaskdb/ext.py, which runs on this module as
 on the engine: ``bytecaskdb.DB.open(path, backend=bytecask_ref)``.
 
@@ -239,7 +241,7 @@ def dump(path: str | os.PathLike[str]) -> None:
                     fields = ""
                 case EntryType.CHANGE_MARKER:
                     fields = f"id {e.value.hex()}"
-            print(f"{offset:8}  seq {e.sequence}  {e.type.name:<12}{fields}".rstrip())
+            print(f"{offset:8}  seq {e.sequence}  {e.type.name:<14}{fields}".rstrip())
 
 
 # ── The key directory ────────────────────────────────────────────────────────

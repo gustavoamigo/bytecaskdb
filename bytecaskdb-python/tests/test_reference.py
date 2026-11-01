@@ -20,6 +20,7 @@ import bytecask_ref as ref  # noqa: E402
 from bytecask_ref import EntryType as T  # noqa: E402
 
 NO_SYNC = ref.WriteOptions(sync=False)
+FOLLOWER = ref.Options(initial_mode=ref.Mode.Follower)  # an open that appends no change marker
 
 
 def data_files(path):
@@ -47,22 +48,25 @@ def batch(*writes, snapshot=None):
 
 def test_sequences_framing_and_dump(tmp_path, capsys):
     with ref.DB.open(tmp_path) as db:
-        assert db.put(b"a", b"1").sequence == 1
-        assert db.apply_batch(batch((b"b", b"2"), (b"c", b"3"))).sequence == 5
+        (opened,) = db.changes_since(db.snapshot(), 0).entries
+        assert (opened.sequence, opened.type) == (1, T.CHANGE_MARKER)  # the leader's open
+        assert db.put(b"a", b"1").sequence == 2
+        assert db.apply_batch(batch((b"b", b"2"), (b"c", b"3"))).sequence == 6
         assert db.del_(b"zz") is None
-        assert db.del_(b"a").sequence == 6
+        assert db.del_(b"a").sequence == 7
         with pytest.raises(ValueError):
             db.del_range(b"x", b"a")
     ref.dump(tmp_path)
     lines = [line for line in capsys.readouterr().out.splitlines() if not line.endswith(".data")]
     # The trace in the module docstring, plus the delete.
     assert lines == [
-        "       0  seq 1  PUT         b'a' b'1'",
-        "      21  seq 2  BULK_BEGIN",
-        "      40  seq 3  PUT         b'b' b'2'",
-        "      61  seq 4  PUT         b'c' b'3'",
-        "      82  seq 5  BULK_END",
-        "     101  seq 6  DELETE      b'a'",
+        f"       0  seq 1  CHANGE_MARKER id {opened.value.hex()}",
+        "      27  seq 2  PUT           b'a' b'1'",
+        "      48  seq 3  BULK_BEGIN",
+        "      67  seq 4  PUT           b'b' b'2'",
+        "      88  seq 5  PUT           b'c' b'3'",
+        "     109  seq 6  BULK_END",
+        "     128  seq 7  DELETE        b'a'",
     ]
 
 
@@ -91,7 +95,8 @@ def test_reopen_replays_every_write(tmp_path):
         expected = [f"k{i:02}".encode() for i in range(50) if not 10 <= i < 20 and i != 30]
         assert list(db.keys_from()) == expected
         assert db.get(b"k05") == b"v5"
-        assert db.put(b"n", b"v").sequence == 53
+        # The first open's marker at 1, 50 puts, the two deletes, this open's marker at 54.
+        assert db.put(b"n", b"v").sequence == 55
 
 
 def test_guards_and_snapshots(tmp_path):
@@ -148,23 +153,25 @@ def test_torn_batch_in_newest_file_is_cut(tmp_path):
     with ref.DB.open(tmp_path) as db:
         db.put(b"a", b"1")
         db.apply_batch(batch((b"b", b"2"), (b"c", b"3")))
-    path = file_starting_at(tmp_path, 1)
+    path = file_starting_at(tmp_path, 1)  # the open's marker at 1, a at 2, the batch at 3..6
     with open(path, "r+b") as f:
         f.truncate(path.stat().st_size - 5)  # BULK_END torn
-    with ref.DB.open(tmp_path) as db:
+    with ref.DB.open(tmp_path, FOLLOWER) as db:  # a follower's open appends nothing
         assert list(db.keys_from()) == [b"a"]
-    assert path.stat().st_size == len(ref.Entry(1, T.PUT, b"a", b"1").encode())
+    marker = ref.Entry(1, T.CHANGE_MARKER, b"", bytes(8))
+    assert path.stat().st_size == len(marker.encode()) + len(ref.Entry(2, T.PUT, b"a", b"1").encode())
 
 
 @pytest.mark.parametrize("torn_to", [10, 20])
 def test_a_torn_first_write_of_a_file_is_cut(tmp_path, torn_to):
     """A file torn inside its first header has no first sequence. Nothing in
-    it survives, so it goes whole, as in the engine."""
+    it survives, so it goes whole, as in the engine. A leader's open starts a
+    file with its change marker, so that is the record torn here."""
     with ref.DB.open(tmp_path) as db:
-        db.put(b"a", b"1")
+        db.put(b"a", b"1")  # the open's marker at 1, a at 2
     with ref.DB.open(tmp_path) as db:
-        db.put(b"b", b"2")
-    second = file_starting_at(tmp_path, 2)
+        db.put(b"b", b"2")  # the open's marker at 3, b at 4
+    second = file_starting_at(tmp_path, 3)
     with open(second, "r+b") as f:
         f.truncate(torn_to)
     with ref.DB.open(tmp_path) as db:
@@ -177,14 +184,14 @@ def test_a_first_write_that_landed_one_byte_is_cut(tmp_path):
     byte of a two-byte sequence reads as a smaller one, below an older file's
     (#471). The type byte is unknown, so the file has no first sequence."""
     with ref.DB.open(tmp_path) as db:
-        db.put(b"a", b"1")
+        db.put(b"a", b"1")  # the open's marker at 1, a at 2
     with ref.DB.open(tmp_path) as db:
         for i in range(3):
-            db.put(f"k{i}".encode(), b"v")
+            db.put(f"k{i}".encode(), b"v")  # the open's marker at 3, k0..k2 at 4..6
     with ref.DB.open(tmp_path) as db:
-        db.put(b"z", b"2")
-    third = file_starting_at(tmp_path, 5)
-    third.write_bytes(b"\x01" + bytes(4095))  # reads as 1, below the second's 2
+        db.put(b"z", b"2")  # the open's marker at 7, z at 8
+    third = file_starting_at(tmp_path, 7)
+    third.write_bytes(b"\x01" + bytes(4095))  # reads as 1, below the second's 3
     with ref.DB.open(tmp_path) as db:
         assert list(db.keys_from()) == [b"a", b"k0", b"k1", b"k2"]
     assert third.stat().st_size == 0
@@ -212,11 +219,11 @@ def test_a_file_whose_first_page_was_lost_is_cut(tmp_path):
     """A power cut can lose the first page of a file that was never synced
     and keep a later one. The file has no first sequence, and goes whole."""
     with ref.DB.open(tmp_path) as db:
-        db.put(b"a", b"1")
+        db.put(b"a", b"1")  # the open's marker at 1, a at 2
     with ref.DB.open(tmp_path) as db:
         for i in range(5):
-            db.put(f"k{i}".encode(), b"v", NO_SYNC)
-    second = file_starting_at(tmp_path, 2)
+            db.put(f"k{i}".encode(), b"v", NO_SYNC)  # the open's marker at 3, k0..k4 at 4..8
+    second = file_starting_at(tmp_path, 3)
     raw = bytearray(second.read_bytes())
     raw[:8] = bytes(8)
     second.write_bytes(bytes(raw))
@@ -230,11 +237,11 @@ def test_two_files_with_data_past_their_end_are_refused(tmp_path):
     sequence beside a torn newest one is damage, and neither is cut."""
     with ref.DB.open(tmp_path) as db:
         for i in range(5):
-            db.put(f"k{i}".encode(), b"v", NO_SYNC)
+            db.put(f"k{i}".encode(), b"v", NO_SYNC)  # the open's marker at 1, k0..k4 at 2..6
     with ref.DB.open(tmp_path) as db:
-        db.put(b"y", b"1")
+        db.put(b"y", b"1")  # the open's marker at 7, y at 8
         db.put(b"z", b"2")
-    older, newest = file_starting_at(tmp_path, 1), file_starting_at(tmp_path, 6)
+    older, newest = file_starting_at(tmp_path, 1), file_starting_at(tmp_path, 7)
     raw = bytearray(older.read_bytes())
     raw[:8] = bytes(8)
     older.write_bytes(bytes(raw))
@@ -311,10 +318,10 @@ def test_a_torn_write_is_cut_at_reopen(tmp_path, monkeypatch):
 
 def test_open_makes_the_newest_file_durable(tmp_path, monkeypatch):
     opts = ref.Options(max_file_bytes=1)  # a file per write
-    with ref.DB.open(tmp_path, opts) as db:
+    with ref.DB.open(tmp_path, opts) as db:  # the open's marker at 1, in a file of its own
         db.put(b"a", b"1")
         db.put(b"b", b"2")
-    newest = file_starting_at(tmp_path, 2)
+    newest = file_starting_at(tmp_path, 3)
     synced = []
     real = ref._fullsync
 

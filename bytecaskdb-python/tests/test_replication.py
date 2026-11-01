@@ -98,8 +98,14 @@ def test_set_mode_back_to_leader(db, nosync):
     assert db.get(b"k") == b"v"
 
 
-def test_durable_sequence_empty(db):
-    assert db.durable_sequence() == 0
+def test_durable_sequence_empty(tmp_path):
+    """An empty database opened as a leader holds its open's change marker,
+    synced; opened as a follower it holds nothing."""
+    leader = bc.DB.open(str(tmp_path / "leader"))
+    (opened,) = markers(leader)
+    assert opened.since_sequence == 1 and leader.durable_sequence() == 1
+    follower = open_follower(tmp_path / "follower")
+    assert follower.durable_sequence() == 0 and history(follower) == []
 
 
 def test_durable_sequence_increments(db):
@@ -162,11 +168,12 @@ def test_changes_since_from_sequence(db):
     db.put(b"a", b"1", opts)
     seq_after_a = db.durable_sequence()
     db.put(b"b", b"2", opts)
+    (opened,) = markers(db)  # the leader's open, at 1
 
     snap = db.snapshot()
     batch = db.changes_since(snap, seq_after_a)
     assert batch.header.from_sequence == seq_after_a
-    assert batch.header.marker == ORIGIN
+    assert batch.header.marker == opened
     entries = list(batch.entries)
     put_entries = [e for e in entries if e.entry_type == T.Put]
     keys = {bytes(e.key) for e in put_entries}
@@ -207,7 +214,8 @@ def test_ingest_idempotency(tmp_path):
     # Re-ingest same entries — should be idempotent.
     follower.ingest(header, entries)
     assert follower.get(b"k1") == b"v1"
-    assert follower.durable_sequence() == 1
+    # The leader's open marker at 1 and k1 at 2, each applied once.
+    assert follower.durable_sequence() == 2 and len(history(follower)) == 2
 
 
 def test_ingest_from_reconstructed_data_entries(tmp_path):
@@ -313,46 +321,58 @@ def test_change_marker_mismatch_is_a_bytecask_runtime_error():
     assert bytecaskdb.DbChangeMarkerMismatch is bc.DbChangeMarkerMismatch
 
 
-def test_promotion_writes_a_marker_visible_in_changes_since(tmp_path):
+def test_a_promotion_or_a_leaders_open_writes_a_marker_and_nothing_else_does(tmp_path):
     leader = bc.DB.open(str(tmp_path / "leader"))
+    (opened,) = markers(leader)  # the leader's open writes one, at the first sequence
+    assert opened.since_sequence == 1 and opened.id != 0
+    assert leader.durable_sequence() == 1, "the open's marker is synced"
+    assert marker_at(leader, 0) == ORIGIN and marker_at(leader, 1) == opened
     leader.put(b"a", b"1")
     leader.set_mode(bc.Mode.Leader)  # leader to leader: nothing written
-    assert leader.durable_sequence() == 1 and markers(leader) == []
+    assert leader.durable_sequence() == 2 and markers(leader) == [opened]
 
     follower = open_follower(tmp_path / "follower")
+    assert markers(follower) == [], "a follower's open writes none"
     replicate(leader, follower)
-    assert marker_at(follower, 0) == ORIGIN and marker_at(follower, 1) == ORIGIN
+    assert markers(follower) == [opened]
+    assert marker_at(follower, 0) == ORIGIN and marker_at(follower, 2) == opened
 
     leader.set_mode(bc.Mode.Follower)
     follower.set_mode(bc.Mode.Leader)
     assert follower.mode == bc.Mode.Leader
-    assert follower.durable_sequence() == 2, "the marker is synced before the mode changes"
-    entries = history(follower)
-    seq, kind, key, value = entries[-1]
-    assert (seq, kind, key) == (2, T.ChangeMarker, b"")
+    assert follower.durable_sequence() == 3, "the marker is synced before the mode changes"
+    seq, kind, key, value = history(follower)[-1]
+    assert (seq, kind, key) == (3, T.ChangeMarker, b"")
     assert len(value) == 8
-    (marker,) = markers(follower)
-    assert marker == bc.ChangeMarker(2, MARKER_ID.unpack(value)[0]) and marker.id != 0
+    (_, marker) = markers(follower)
+    assert marker == bc.ChangeMarker(3, MARKER_ID.unpack(value)[0]) and marker.id != 0
 
-    # The header's marker: the origin before the promotion, the marker from it on.
-    assert marker_at(follower, 0) == ORIGIN and marker_at(follower, 1) == ORIGIN
-    assert marker_at(follower, 2) == marker and marker_at(follower, 99) == marker
-    assert follower.changes_since(follower.snapshot(), 2).header == bc.ChangeHeader(marker, 2)
+    # The header's marker: the open's before the promotion, the promotion's from it on.
+    assert marker_at(follower, 0) == ORIGIN and marker_at(follower, 2) == opened
+    assert marker_at(follower, 3) == marker and marker_at(follower, 99) == marker
+    assert follower.changes_since(follower.snapshot(), 3).header == bc.ChangeHeader(marker, 3)
 
     # The first write takes the sequence after the marker's.
-    assert follower.put(b"b", b"2").sequence == 3
+    assert follower.put(b"b", b"2").sequence == 4
 
     # The old leader follows the new one and receives the marker as an entry.
     catch_up(follower, leader)
-    assert markers(leader) == [marker] and history(leader) == history(follower)
+    assert markers(leader) == [opened, marker] and history(leader) == history(follower)
     assert marker_at(leader, 99) == marker
 
-    # Reopening in Leader mode is not a promotion.
+    # Reopening in Leader mode writes a marker of its own, at the next sequence.
     follower.close()
     reopened = bc.DB.open(str(tmp_path / "follower"))
-    assert markers(reopened) == [marker] and reopened.durable_sequence() == 3
-    assert reopened.put(b"c", b"3").sequence == 4
-    assert markers(reopened) == [marker]
+    *before, reopen = markers(reopened)
+    assert before == [opened, marker]
+    assert reopen.since_sequence == 5 and reopen.id not in (opened.id, marker.id)
+    assert reopened.durable_sequence() == 5
+    assert reopened.put(b"c", b"3").sequence == 6
+    assert markers(reopened) == [opened, marker, reopen]
+    reopened.close()
+    # Reopening in Follower mode writes none.
+    reopened = open_follower(tmp_path / "follower")
+    assert markers(reopened) == [opened, marker, reopen] and reopened.durable_sequence() == 6
     reopened.close()
     leader.close()
 
@@ -363,7 +383,7 @@ def test_a_gap_is_refused_before_anything_is_written(tmp_path):
     nosync.sync = False
     for i in range(5):
         leader.put(bytes([97 + i]), b"v", nosync)
-    leader.put(b"z", b"v")  # 6 entries, all durable
+    leader.put(b"z", b"v")  # 7 entries with the open's marker, all durable
     follower = open_follower(tmp_path / "follower")
     replicate(leader, follower, max_bytes=1)  # one unit per slice
     replicate(leader, follower, max_bytes=1)
@@ -383,8 +403,10 @@ def test_a_gap_is_refused_before_anything_is_written(tmp_path):
 
 
 def test_promoting_the_less_advanced_follower_forks_the_one_ahead(tmp_path):
-    """The unplanned failover of the design: L dies at 20; N is at 10, F at 20."""
+    """The unplanned failover of the design: L dies at 21; N is at 11, F at 21
+    (L's open took sequence 1)."""
     L = bc.DB.open(str(tmp_path / "L"))
+    (opened,) = markers(L)
     for i in range(10):
         L.put(f"k{i:02}".encode(), b"L")
     N = bootstrap(L, tmp_path / "N")
@@ -392,31 +414,31 @@ def test_promoting_the_less_advanced_follower_forks_the_one_ahead(tmp_path):
     for i in range(10, 20):
         L.put(f"k{i:02}".encode(), b"L")
     F = bootstrap(L, tmp_path / "F")
-    assert (N.durable_sequence(), G.durable_sequence(), F.durable_sequence()) == (10, 10, 20)
+    assert (N.durable_sequence(), G.durable_sequence(), F.durable_sequence()) == (11, 11, 21)
     L.close()  # L dies
 
     N.set_mode(bc.Mode.Leader)  # the wrong choice: F is ahead of N
     N.put(b"n", b"1")
-    (marker,) = markers(N)
-    assert marker.since_sequence == 11
-    assert marker_at(N, 20) == marker and marker_at(F, 20) == ORIGIN
+    (inherited, marker) = markers(N)
+    assert inherited == opened and marker.since_sequence == 12
+    assert marker_at(N, 21) == marker and marker_at(F, 21) == opened
 
-    # F holds L's 11..20, which N never had: refused, and nothing is written.
+    # F holds L's 12..21, which N never had: refused, and nothing is written.
     before = history(F)
     with pytest.raises(bc.DbChangeMarkerMismatch):
         replicate(N, F)
     # Re-delivered from an earlier point, the marker is in the slice: refused too.
     with pytest.raises(bc.DbChangeMarkerMismatch):
         replicate(N, F, from_sequence=5)
-    assert history(F) == before and F.durable_sequence() == 20
+    assert history(F) == before and F.durable_sequence() == 21
 
     # G, at N's position, catches up and receives the marker.
     catch_up(N, G)
-    assert markers(G) == [marker] and history(G) == history(N)
+    assert markers(G) == [opened, marker] and history(G) == history(N)
 
     # L comes back with writes nobody replicated: refused the same way.
     L = open_follower(tmp_path / "L")
-    assert L.durable_sequence() == 20
+    assert L.durable_sequence() == 21
     with pytest.raises(bc.DbChangeMarkerMismatch):
         replicate(N, L)
 
@@ -435,26 +457,26 @@ def test_promoting_the_less_advanced_follower_forks_the_one_ahead(tmp_path):
 
 
 def test_re_delivery_of_the_same_history_is_accepted(tmp_path):
-    leader = bc.DB.open(str(tmp_path / "leader"))
+    leader = bc.DB.open(str(tmp_path / "leader"))  # its open's marker at 1
     for i in range(6):
-        leader.put(bytes([97 + i]), b"1")
+        leader.put(bytes([97 + i]), b"1")  # 2..7
     follower = open_follower(tmp_path / "follower")
     catch_up(leader, follower)
-    assert replicate(leader, follower, from_sequence=3)  # 4..6 again: all duplicates
-    assert follower.durable_sequence() == 6 and len(history(follower)) == 6
+    assert replicate(leader, follower, from_sequence=3)  # 4..7 again: all duplicates
+    assert follower.durable_sequence() == 7 and len(history(follower)) == 7
     leader.put(b"g", b"1")
     leader.put(b"h", b"1")
-    replicate(leader, follower, from_sequence=3)  # 4..8: duplicates skipped, 7 and 8 applied
+    replicate(leader, follower, from_sequence=3)  # 4..9: duplicates skipped, 8 and 9 applied
     assert history(follower) == history(leader)
 
     # With a promotion in the re-delivered range.
     leader.set_mode(bc.Mode.Follower)
-    follower.set_mode(bc.Mode.Leader)  # marker at 9
-    follower.put(b"i", b"1")  # 10
+    follower.set_mode(bc.Mode.Leader)  # marker at 10
+    follower.put(b"i", b"1")  # 11
     catch_up(follower, leader)
     assert markers(leader) == markers(follower)
-    replicate(follower, leader, from_sequence=4)  # 5..10 again, marker included
-    replicate(follower, leader, from_sequence=9)  # from the marker itself
+    replicate(follower, leader, from_sequence=4)  # 5..11 again, marker included
+    replicate(follower, leader, from_sequence=10)  # from the marker itself
     assert history(leader) == history(follower)
     leader.close()
     follower.close()
