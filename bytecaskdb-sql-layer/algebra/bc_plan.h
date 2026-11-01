@@ -192,6 +192,21 @@ uint64_t bc_txn_catalog_version(const bc_txn *);  /* the catalog version pinned 
 bool    bc_txn_repin(bc_txn *);                   /* before any statement was added, with no context attached:
                                                      drops the pin, so the next statement pins the live catalog
                                                      and a new snapshot; false, changing nothing, otherwise */
+/* Cursors (docs/cursor_design.md, *What a cursor sees*). A pin is the
+   transaction's overlay as of the call, shared copy-on-write: the statements
+   added later write to a copy and the pin never changes. The call also pins
+   the snapshot and catalog if no statement did. A pin reserves the overlay's
+   bound against max_bytes until it is released; one that would pass it is
+   BC_E_LIMIT and aborts the transaction, any other failure also, and the
+   call returns null (bc_txn_error says why). A pin is a read: a context
+   begun on the transaction reads through it after bc_ctx_use_overlay, which
+   is called after bc_ctx_begin_txn and before bc_ctx_run, and the statement
+   must not write. bc_txn_repin is refused while a pin is live. Release every
+   pin before bc_txn_free. */
+typedef struct bc_overlay bc_overlay;
+bc_overlay *bc_txn_overlay_pin(bc_txn *);
+void    bc_txn_overlay_release(bc_overlay *);
+void    bc_ctx_use_overlay(bc_ctx *, const bc_overlay *);
 enum bc_commit_result bc_txn_commit(bc_txn *, bool sync);
 enum bc_error_code bc_txn_error(const bc_txn *);  /* of the last bc_txn_commit */
 const char *bc_txn_error_message(const bc_txn *);

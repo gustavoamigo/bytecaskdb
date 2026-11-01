@@ -37,7 +37,7 @@ Built and tested:
 - **Literals:** integers, numerics of up to 18 digits, strings, `TRUE`/`FALSE`, `NULL` and casts of strings (`DATE '…'`, `CAST('5' AS INTEGER)`), typed as PostgreSQL types them, in `VALUES`, `SET`, `WHERE`, `HAVING` and the select list; `+`, `-`, `*`, `/` and comparisons of them folded (integer `/` truncates; a numeric quotient has PostgreSQL's scale; `/` by zero is 22012).
 - **Types:** `SMALLINT`, `INTEGER`, `BIGINT`, `REAL`, `DOUBLE PRECISION`, `BOOLEAN`, `TEXT`, `VARCHAR(n)`, `CHAR(n)` (stored without its trailing spaces, returned padded; a database holding one cannot be opened by an earlier build), `BYTEA`, `DECIMAL(p, s)` with p ≤ 18, `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMP WITH TIME ZONE` / `TIMESTAMPTZ` (always UTC: an offset in a literal is taken off, `CURRENT_TIMESTAMP` and `now()` return it; a database holding one cannot be opened by an earlier build).
 - **Transactions:** statements read their own writes; DDL is its own statement, not transactional.
-- **Interfaces:** the embedded C++ API (`api/database.cppm`), with a row window on reads in a transaction (`Transaction::execute_window`: skip, limit, stop; the replay runner cursors will use, not reachable from SQL yet), and `sql_layer_server`, a PostgreSQL wire-protocol server that psql, psycopg and HammerDB connect to. Trust authentication only: it listens on loopback unless told otherwise.
+- **Interfaces:** the embedded C++ API (`api/database.cppm`), with a row window on reads in a transaction (`Transaction::execute_window`: skip, limit, stop) and a forward-only cursor (`Transaction::open_cursor`, `Cursor::fetch`: it sees the transaction as of the call; embedded API only, no `DECLARE` yet), and `sql_layer_server`, a PostgreSQL wire-protocol server that psql, psycopg and HammerDB connect to. Trust authentication only: it listens on loopback unless told otherwise.
 - **HammerDB gate:** TPROC-C over the wire, driven by HammerDB (`hammerdb/run-gate.sh`; its defaults are 48 warehouses at 1, 16 and 48 virtual users). Nightly CI runs its smoke: 2 warehouses, 2 users, one minute, then the consistency conditions.
 
 Not built yet (each is refused, with a message):
@@ -94,5 +94,5 @@ CI is `.github/workflows/sql-layer.yml`, with the sanitizers (ASan, TSan, UBSan)
 | `harness/` | `sql_layer_tprocc`, the in-process TPROC-C harness |
 | `python/` | the `bytecask_sql` module the tests use |
 | `tests/` | C++ tests, golden plans, proof, server and functional suites |
-| `docs/` | design documents, one per area: `frontend_design.md`, `planner_design.md`, `plan_api_design.md`, `catalog_design.md`, `types_design.md`, `transaction_design.md`, `server_design.md`, `cursor_design.md` (design, not built), `testing_design.md` |
+| `docs/` | design documents, one per area: `frontend_design.md`, `planner_design.md`, `plan_api_design.md`, `catalog_design.md`, `types_design.md`, `transaction_design.md`, `server_design.md`, `cursor_design.md` (design; phases 1 and 2 built), `testing_design.md` |
 | `CONTRACT.md` | what the layer guarantees, and the test proving each row |
