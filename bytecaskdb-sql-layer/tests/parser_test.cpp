@@ -110,7 +110,7 @@ TEST_CASE("parser: subqueries as values, EXISTS, IN and ANY, SOME or ALL", "[sql
                                     "EXISTS (SELECT 1 FROM u) AND id IN (SELECT a FROM u) AND id NOT IN (SELECT a FROM u) "
                                     "AND id < ALL (SELECT a FROM u) AND id <> SOME (SELECT a FROM u)"));
   REQUIRE(sel.targets[0].kind == Expr::Kind::Subquery);
-  CHECK(sel.targets[0].subquery->table == "u");
+  CHECK(sel.targets[0].subquery->from[0].table == "u");
   REQUIRE(sel.where.size() == 6);
   CHECK(sel.where[0].rhs.kind == Expr::Kind::Subquery);
   CHECK(sel.where[1].kind == Compare::Kind::Exists);
@@ -146,7 +146,7 @@ TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql]
   //                    0         1         2         3
   //                    0123456789012345678901234567890123456789
   CHECK(rejected_at("SELECT id FROM t FULL JOIN u ON t.id = u.id") == 27);
-  CHECK(rejected_at("SELECT id FROM t, u, v WHERE id = $1") >= 0);
+  CHECK(rejected_at("SELECT id FROM a, b, c, d, e, f, g, h, i WHERE id = $1") >= 0);  // nine tables
   CHECK(rejected_at("SELECT id FROM t WHERE id = B'1'") == 28);  // a bit-string literal
   CHECK(rejected_at("VALUES (1)") == 0);
   CHECK(rejected_at("SELECT id FROM t WHERE id ILIKE $1") >= 0);
@@ -279,7 +279,7 @@ TEST_CASE("parser: CREATE VIEW and DROP VIEW", "[sql][parser][view]") {
   auto v = std::get<CreateView>(parse(text));
   CHECK(v.view == "v");
   CHECK(v.columns == std::vector<std::string>{"x", "y"});
-  CHECK(v.query.table == "t");
+  CHECK(v.query.from[0].table == "t");
   CHECK(v.query.targets.size() == 2);
   CHECK(v.definition == text);  // what the catalog stores and parses again
   CHECK(std::get<CreateView>(parse("CREATE VIEW v AS SELECT 1")).columns.empty());
@@ -305,8 +305,8 @@ TEST_CASE("parser: UNION, INTERSECT and EXCEPT, their ALL and precedence", "[sql
   REQUIRE(s.set != nullptr);
   CHECK(s.set->kind == Kind::Union);
   CHECK_FALSE(s.set->all);
-  CHECK(s.set->left.table == "t");
-  CHECK(s.set->right.table == "u");
+  CHECK(s.set->left.from[0].table == "t");
+  CHECK(s.set->right.from[0].table == "u");
   CHECK(s.targets.empty());
   CHECK(top("SELECT a FROM t UNION ALL SELECT b FROM u").set->all);
   CHECK_FALSE(top("SELECT a FROM t UNION DISTINCT SELECT b FROM u").set->all);
@@ -363,17 +363,20 @@ TEST_CASE("parser: SELECT … FOR UPDATE, and no other locking clause", "[sql][p
 
 TEST_CASE("parser: two tables, qualified columns and integer literals", "[sql][parser]") {
   auto j = std::get<Select>(parse("SELECT t.id, qty FROM t, u WHERE t.id = $1 AND k = $2"));
-  CHECK(j.table == "t");
-  CHECK(j.join == "u");
+  REQUIRE(j.from.size() == 2);
+  CHECK(j.from[0].table == "t");
+  CHECK(j.from[1].table == "u");
   CHECK(j.targets[0].table == "t");
   CHECK(j.targets[1].table.empty());
   REQUIRE(j.where.size() == 2);
   CHECK(j.where[0].lhs.table == "t");
   // JOIN … ON: the ON conjuncts come first, then the WHERE's.
   auto on = std::get<Select>(parse("SELECT id FROM t JOIN u ON k = $1 WHERE id = $2"));
-  CHECK(on.join == "u");
+  CHECK(on.from[1].table == "u");
   REQUIRE(on.where.size() == 2);
   CHECK(on.where[0].lhs.column == "k");
+  CHECK(on.where[0].on == 1);
+  CHECK(on.where[1].on == 0);
   auto u = std::get<Update>(parse("UPDATE t SET qty = qty + 1 WHERE id = $1"));
   CHECK(u.set[0].value.rhs->kind == Expr::Kind::Const);
   CHECK(u.set[0].value.rhs->constant == 1);
@@ -395,7 +398,7 @@ TEST_CASE("parser: two tables, qualified columns and integer literals", "[sql][p
   // A SELECT without FROM; PostgreSQL's grammar folds - of a number into the
   // literal, and leaves unary + an operator.
   auto bare = std::get<Select>(parse("SELECT -5, +7.8, -(1 + 2)"));
-  CHECK(bare.table.empty());
+  CHECK(bare.from.empty());
   REQUIRE(bare.targets.size() == 3);
   CHECK(literal_of(bare.targets[0]).text == "-5");
   CHECK(bare.targets[1].kind == Expr::Kind::Plus);
@@ -404,7 +407,57 @@ TEST_CASE("parser: two tables, qualified columns and integer literals", "[sql][p
   auto ors = std::get<Select>(parse("SELECT id FROM t JOIN u ON id = $1 OR k = $2"));
   REQUIRE(ors.where.size() == 1);
   CHECK(ors.where[0].kind == Compare::Kind::Or);
-  CHECK(ors.where[0].on);
+  CHECK(ors.where[0].on == 1);
   CHECK(ors.where[0].args.size() == 2);
 }
 
+TEST_CASE("parser: a chain of joins, each with its own ON, kind and USING", "[sql][parser][join]") {
+  auto q = std::get<Select>(
+      parse("SELECT t.id FROM t JOIN u ON t.k = u.k LEFT JOIN v ON u.k < v.k AND v.k <> $1 JOIN w USING (k) WHERE t.id = $2"));
+  REQUIRE(q.from.size() == 4);
+  CHECK(q.from[1].kind == JoinKind::Inner);
+  CHECK(q.from[2].kind == JoinKind::Left);
+  CHECK(q.from[3].using_columns == std::vector<std::string>{"k"});
+  // The ON conjuncts of each join come first, in order, marked with the join; the WHERE's last, marked 0.
+  REQUIRE(q.where.size() == 4);
+  CHECK(q.where[0].on == 1);
+  CHECK(q.where[1].on == 2);
+  CHECK(q.where[2].on == 2);
+  CHECK(q.where[3].on == 0);
+  // A comma list is joins with no ON.
+  auto list = std::get<Select>(parse("SELECT 1 FROM a, b, c"));
+  CHECK(list.from.size() == 3);
+  CHECK(list.where.empty());
+  // CROSS JOIN is an inner join with no condition.
+  CHECK(std::get<Select>(parse("SELECT 1 FROM a CROSS JOIN b")).from.size() == 2);
+  // At most 8 tables; a join on the right of a join, a join among commas, FULL and an alias of a join are refused.
+  CHECK(std::get<Select>(parse("SELECT 1 FROM a, b, c, d, e, f, g, h")).from.size() == 8);
+  CHECK_THROWS_AS(parse("SELECT 1 FROM a, b, c, d, e, f, g, h, i"), SqlError);
+  CHECK_THROWS_AS(parse("SELECT 1 FROM a JOIN (b JOIN c ON b.k = c.k) ON a.k = b.k"), SqlError);
+  CHECK_THROWS_AS(parse("SELECT 1 FROM a, b JOIN c ON b.k = c.k"), SqlError);
+  CHECK_THROWS_AS(parse("SELECT 1 FROM a FULL JOIN b ON a.k = b.k"), SqlError);
+  CHECK_THROWS_AS(parse("SELECT 1 FROM (a JOIN b ON a.k = b.k) AS j"), SqlError);
+}
+
+TEST_CASE("parser: an alias is rewritten to its table, and kept where a table is named twice", "[sql][parser][join]") {
+  // Once: the qualifier names the table, and the item has no alias.
+  auto once = std::get<Select>(parse("SELECT x.id FROM t AS x JOIN u y ON x.k = y.k"));
+  CHECK(once.targets[0].table == "t");
+  CHECK(once.from[0].alias.empty());
+  CHECK(once.where[0].rhs.table == "u");
+  // Twice: the aliases are what tell the two apart.
+  auto twice = std::get<Select>(parse("SELECT x.id, y.id FROM t x JOIN t y ON x.k = y.k"));
+  CHECK(twice.targets[0].table == "x");
+  CHECK(twice.targets[1].table == "y");
+  CHECK(twice.from[0].name() == "x");
+  CHECK(twice.from[1].name() == "y");
+  CHECK(twice.where[0].rhs.table == "y");
+  // The table's own name is visible where an item is not aliased.
+  auto mixed = std::get<Select>(parse("SELECT t.id, y.id FROM t JOIN t y ON t.k = y.k"));
+  CHECK(mixed.targets[0].table == "t");
+  CHECK(mixed.from[1].name() == "y");
+  // Two items of one name, or a name an alias hides, are errors (42712, 42P01).
+  CHECK_THROWS_AS(parse("SELECT 1 FROM t, t"), SqlError);
+  CHECK_THROWS_AS(parse("SELECT 1 FROM t x, u x"), SqlError);
+  CHECK_THROWS_AS(parse("SELECT t.id FROM t x JOIN t y ON x.k = y.k"), SqlError);
+}

@@ -962,7 +962,7 @@ auto Database::row_counts() const -> RowCounts {
   // bc_count_range's: at most two record reads, whatever the table holds.
   auto snap = std::make_shared<Snapshot>(db_->snapshot());
   return [snap](const Table& t) -> std::optional<std::uint64_t> {
-    auto lo = row_prefix(t.id);
+    auto lo = row_prefix(t.storage_id());
     auto hi = key_successor(lo);
     return snap->count_keys(lo, hi, std::numeric_limits<std::size_t>::max());
   };

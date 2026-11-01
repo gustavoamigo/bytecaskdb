@@ -273,6 +273,16 @@ struct Table {
   RowLayout layout;            // the current generation
   // Earlier generations, oldest first: empty until REBUILD (#503).
   std::vector<std::pair<std::uint32_t, RowLayout>> retired_layouts;
+  // A table a query reads more than once is read as one instance of it per
+  // use: a copy under the name the query gives the use, with an id of its own
+  // at or above kInstanceBase, and `source` the id of the table whose rows it
+  // reads. 0 for a table of the catalog (docs/planner_design.md, *Joins of
+  // several tables*).
+  static constexpr std::uint32_t kInstanceBase = std::uint32_t{1} << 30;
+  std::uint32_t source{0};
+
+  // The table whose rows this one reads: its own, or its source's.
+  [[nodiscard]] auto storage_id() const -> std::uint32_t;
 
   // A column by name: never the hidden row id, which has none.
   [[nodiscard]] auto column(std::string_view name) const -> const Column*;
@@ -1413,6 +1423,8 @@ auto parse_table(BytesView in) -> Table {
 
 // ------------------------------------------------------------------ lookups
 
+auto Table::storage_id() const -> std::uint32_t { return source != 0 ? source : id; }
+
 auto Table::column(std::string_view n) const -> const Column* {
   auto it = std::ranges::find_if(columns, [&](const Column& c) { return !c.hidden && c.name == n; });
   return it == columns.end() ? nullptr : &*it;
@@ -1597,7 +1609,7 @@ auto Catalog::constants(const Table& t) -> std::vector<PlanConstant> {
   std::vector<PlanConstant> out;
   auto id = [](std::uint32_t v) { return std::to_string(v); };
   auto named = [](const Column& c) { return c.hidden ? std::string{"(row id)"} : c.name; };
-  out.push_back({"TBL_" + id(t.id), t.id, t.name});
+  out.push_back({"TBL_" + id(t.id), t.storage_id(), t.name});
   for (const auto& ix : t.indexes) out.push_back({"IDX_" + id(ix.id), ix.id, ix.name});
   for (const auto& c : t.columns) out.push_back({"COL_" + id(t.id) + "_" + id(c.id), c.id, t.name + "." + named(c)});
   // Key parts by position: a table's primary key, then each index's parts

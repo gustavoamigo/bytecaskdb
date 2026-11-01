@@ -314,13 +314,13 @@ auto compare_op(const std::string& op, std::int32_t pos) -> Compare::Op {
   reject("operator " + op + " is not supported in WHERE", pos);
 }
 
-auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t pos) -> Compare;
+auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t pos, std::uint32_t on = 0) -> Compare;
 
-auto compare_of(Compare::Op op, Expr lhs, Expr rhs, std::int32_t pos, bool on) -> Compare {
+auto compare_of(Compare::Op op, Expr lhs, Expr rhs, std::int32_t pos, std::uint32_t on) -> Compare {
   return Compare{op, std::move(lhs), std::move(rhs), pos, on};
 }
 
-auto of_kind(Compare::Kind kind, std::vector<Compare> args, std::int32_t pos, bool on) -> Compare {
+auto of_kind(Compare::Kind kind, std::vector<Compare> args, std::int32_t pos, std::uint32_t on) -> Compare {
   Compare c{Compare::Op::Eq, {}, {}, pos, on};
   c.kind = kind;
   c.args = std::move(args);
@@ -338,13 +338,12 @@ auto negated(Compare c) -> Compare {
 // A WHERE clause's conjunct, as a comparison or a predicate over them:
 // AND, OR, NOT, IS [NOT] NULL, <> (NOT =), BETWEEN [SYMMETRIC] (>= and <=;
 // SYMMETRIC either way round) and [NOT] IN of a list (= of each, OR'd).
-auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t pos) -> Compare {
-  auto on = clause == "ON";
+auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t pos, std::uint32_t on) -> Compare {
   if (n == nullptr) reject(clause + " must compare a column", pos);
   if (n->node_case == PG_QUERY__NODE__NODE_BOOL_EXPR) {
     const auto* b = n->bool_expr;
     std::vector<Compare> args;
-    for (std::size_t i = 0; i < b->n_args; ++i) args.push_back(predicate(b->args[i], clause, pos));
+    for (std::size_t i = 0; i < b->n_args; ++i) args.push_back(predicate(b->args[i], clause, pos, on));
     switch (b->boolop) {
       case PG_QUERY__BOOL_EXPR_TYPE__AND_EXPR: return of_kind(Compare::Kind::And, std::move(args), b->location, on);
       case PG_QUERY__BOOL_EXPR_TYPE__OR_EXPR: return of_kind(Compare::Kind::Or, std::move(args), b->location, on);
@@ -473,14 +472,14 @@ auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t p
 // A WHERE clause as a list of conjuncts: its top-level AND's, each a
 // comparison or a predicate.
 void where(const PgQuery__Node* n, std::vector<Compare>& out, const std::string& clause = "WHERE",
-           std::int32_t pos = -1) {
+           std::int32_t pos = -1, std::uint32_t on = 0) {
   if (n == nullptr) return;
   if (n->node_case == PG_QUERY__NODE__NODE_BOOL_EXPR && n->bool_expr->boolop == PG_QUERY__BOOL_EXPR_TYPE__AND_EXPR) {
     const auto* b = n->bool_expr;
-    for (std::size_t i = 0; i < b->n_args; ++i) where(b->args[i], out, clause, pos);
+    for (std::size_t i = 0; i < b->n_args; ++i) where(b->args[i], out, clause, pos, on);
     return;
   }
-  out.push_back(predicate(n, clause, pos));
+  out.push_back(predicate(n, clause, pos, on));
 }
 
 auto literal(const PgQuery__Node* n) -> Literal {
@@ -736,29 +735,44 @@ auto limit(const PgQuery__SelectStmt* s) -> std::optional<std::int64_t> {
 
 // Table aliases: a qualifier naming an alias is rewritten to its table, and
 // one naming an aliased table by its own name is refused, as the alias hides
-// it (42P01). An ORDER BY name that is a select-list item's AS name, and no
-// qualified one, orders by that item's column, as PostgreSQL resolves it
+// it (42P01). A query that names one table twice keeps its aliases (`keep`),
+// which are then what tells its items apart: the qualifiers are checked and
+// left as written. An ORDER BY name that is a select-list item's AS name, and
+// no qualified one, orders by that item's column, as PostgreSQL resolves it
 // before the tables' columns. A subquery resolves its own.
-void requalify(Expr& e, const std::vector<std::string>& tables, const std::vector<std::string>& aliases) {
+struct Names {
+  std::vector<std::string> tables;
+  std::vector<std::string> aliases;
+  bool keep{false};
+
+  [[nodiscard]] auto visible(std::size_t i) const -> const std::string& {
+    return aliases[i].empty() ? tables[i] : aliases[i];
+  }
+};
+
+void requalify(Expr& e, const Names& n) {
   if (!e.table.empty()) {
-    for (std::size_t i = 0; i < aliases.size(); ++i) {
-      if (!aliases[i].empty() && e.table == aliases[i]) {
-        e.table = tables[i];
-        break;
-      }
-      if (!aliases[i].empty() && e.table == tables[i] && !std::ranges::contains(aliases, e.table)) {
-        reject("invalid reference to FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable);
+    auto named = [&](std::size_t i) { return n.visible(i) == e.table; };
+    std::size_t visible = 0;
+    while (visible < n.tables.size() && !named(visible)) ++visible;
+    if (visible < n.tables.size()) {
+      if (!n.keep && !n.aliases[visible].empty()) e.table = n.tables[visible];
+    } else {
+      for (std::size_t i = 0; i < n.tables.size(); ++i) {
+        if (!n.aliases[i].empty() && e.table == n.tables[i]) {
+          reject("invalid reference to FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable);
+        }
       }
     }
   }
-  if (e.lhs) requalify(*e.lhs, tables, aliases);
-  if (e.rhs) requalify(*e.rhs, tables, aliases);
+  if (e.lhs) requalify(*e.lhs, n);
+  if (e.rhs) requalify(*e.rhs, n);
 }
 
-void requalify(Compare& c, const std::vector<std::string>& tables, const std::vector<std::string>& aliases) {
-  requalify(c.lhs, tables, aliases);
-  requalify(c.rhs, tables, aliases);
-  for (auto& a : c.args) requalify(a, tables, aliases);
+void requalify(Compare& c, const Names& n) {
+  requalify(c.lhs, n);
+  requalify(c.rhs, n);
+  for (auto& a : c.args) requalify(a, n);
 }
 
 // ORDER BY 2 of a plain SELECT orders by the second select-list item, which
@@ -781,16 +795,18 @@ void resolve_positions(Select& sel) {
   }
 }
 
-void resolve_aliases(Select& sel, const std::vector<std::string>& aliases) {
-  std::vector<std::string> tables{sel.table};
-  if (!sel.join.empty()) tables.push_back(sel.join);
-  for (std::size_t i = 0; i < aliases.size(); ++i) {
+void resolve_aliases(Select& sel) {
+  Names names;
+  for (const auto& item : sel.from) {
+    names.tables.push_back(item.table);
+    names.aliases.push_back(item.alias);
+  }
+  for (std::size_t i = 0; i < names.tables.size(); ++i) {
     for (std::size_t j = 0; j < i; ++j) {
-      auto name = [&](std::size_t k) { return aliases[k].empty() ? tables[k] : aliases[k]; };
-      if (name(i) == name(j) && !(aliases[i].empty() && aliases[j].empty())) {
-        reject("table name \"" + name(i) + "\" specified more than once", i == 0 ? sel.table_pos : sel.join_pos,
-             kDuplicateAlias);
+      if (names.visible(i) == names.visible(j)) {
+        reject("table name \"" + names.visible(i) + "\" specified more than once", sel.from[i].pos, kDuplicateAlias);
       }
+      names.keep = names.keep || names.tables[i] == names.tables[j];
     }
   }
   for (auto& o : sel.order_by) {
@@ -806,17 +822,19 @@ void resolve_aliases(Select& sel, const std::vector<std::string>& aliases) {
       o.table = hit->table;
     }
   }
-  if (std::ranges::all_of(aliases, [](const std::string& a) { return a.empty(); })) return;
-  for (auto& e : sel.targets) requalify(e, tables, aliases);
-  for (auto& c : sel.where) requalify(c, tables, aliases);
-  for (auto& c : sel.having) requalify(c, tables, aliases);
-  for (auto& e : sel.group_by) requalify(e, tables, aliases);
+  if (std::ranges::all_of(names.aliases, [](const std::string& a) { return a.empty(); })) return;
+  for (auto& e : sel.targets) requalify(e, names);
+  for (auto& c : sel.where) requalify(c, names);
+  for (auto& c : sel.having) requalify(c, names);
+  for (auto& e : sel.group_by) requalify(e, names);
   for (auto& o : sel.order_by) {
     Expr e{Expr::Kind::Column, o.column, 0, nullptr, nullptr, o.pos};
     e.table = o.table;
-    requalify(e, tables, aliases);
+    requalify(e, names);
     o.table = e.table;
   }
+  if (names.keep) return;
+  for (auto& item : sel.from) item.alias.clear();
 }
 
 // ORDER BY's columns, in order.
@@ -875,49 +893,71 @@ auto set_operation(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   return sel;
 }
 
+// The most tables one SELECT reads: the search plans their join order by a
+// pass over the subsets of them (docs/planner_design.md, *Joins of several tables*).
+constexpr std::size_t kMaxFrom = 8;
+
+// A FROM item that is a table, with its alias.
+auto from_item(const PgQuery__RangeVar* rv) -> FromItem {
+  FromItem item;
+  item.table = from_relation(rv);
+  item.alias = table_alias(rv);
+  item.pos = rv->location;
+  return item;
+}
+
+// The items of a join tree and their ON conjuncts. Only a left-deep tree of
+// tables is taken: `a JOIN b … JOIN c …`, each join's right side a table.
+void join_items(const PgQuery__Node* n, std::int32_t pos, std::vector<FromItem>& items, std::vector<Compare>& on) {
+  if (n != nullptr && n->node_case == PG_QUERY__NODE__NODE_RANGE_VAR) {
+    items.push_back(from_item(n->range_var));
+    return;
+  }
+  const auto* j = n != nullptr && n->node_case == PG_QUERY__NODE__NODE_JOIN_EXPR ? n->join_expr : nullptr;
+  // The join has no position of its own; report the table it joins.
+  const auto* r = j != nullptr ? j->rarg : nullptr;
+  auto at = r != nullptr && r->node_case == PG_QUERY__NODE__NODE_RANGE_VAR ? r->range_var->location : pos;
+  if (j == nullptr) reject("SELECT reads tables", pos);
+  if (j->jointype == PG_QUERY__JOIN_TYPE__JOIN_FULL) reject("FULL JOIN is not supported", at);
+  auto kind = j->jointype == PG_QUERY__JOIN_TYPE__JOIN_LEFT    ? JoinKind::Left
+              : j->jointype == PG_QUERY__JOIN_TYPE__JOIN_RIGHT ? JoinKind::Right
+                                                               : JoinKind::Inner;
+  if ((j->jointype != PG_QUERY__JOIN_TYPE__JOIN_INNER && kind == JoinKind::Inner) || j->alias != nullptr ||
+      j->larg == nullptr || r == nullptr || r->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) {
+    reject("only an inner, LEFT or RIGHT join of tables, each joined to the ones before it, is supported", at);
+  }
+  join_items(j->larg, pos, items, on);
+  auto item = from_item(r->range_var);
+  item.kind = kind;
+  item.natural = j->is_natural;
+  for (std::size_t k = 0; k < j->n_using_clause; ++k) item.using_columns.push_back(str(j->using_clause[k]));
+  if (j->join_using_alias != nullptr) {
+    if (j->join_using_alias->n_colnames != 0) reject("a USING alias takes no column list", at);
+    item.using_alias = j->join_using_alias->aliasname;
+  }
+  // The item is the next one: its ON conjuncts are its own.
+  where(j->quals, on, "ON", item.pos, static_cast<std::uint32_t>(items.size()));
+  items.push_back(std::move(item));
+}
+
 auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   if (s->op != PG_QUERY__SET_OPERATION__SETOP_NONE) return set_operation(s, pos);
-  // No table, one, or two: FROM a, b, or a [INNER] JOIN b ON …, whose ON
-  // conjuncts join the WHERE's.
+  // No table, or tables joined: FROM a, b, c, or a [INNER] JOIN b ON … JOIN
+  // c …, whose ON conjuncts join the WHERE's.
   if (s->n_values_lists != 0) reject("VALUES is supported only in INSERT", pos);
-  if (s->n_from_clause > 2) reject("SELECT reads one or two tables", pos);
-  std::vector<const PgQuery__RangeVar*> tables;
-  const PgQuery__Node* on = nullptr;
-  std::vector<std::string> using_columns;
-  std::string using_alias;
-  auto natural = false;
-  auto join_kind = Select::JoinKind::Inner;
+  std::vector<FromItem> items;
+  std::vector<Compare> on;
   for (std::size_t i = 0; i < s->n_from_clause; ++i) {
     const auto* from = s->from_clause[i];
     if (from->node_case == PG_QUERY__NODE__NODE_JOIN_EXPR) {
-      const auto* j = from->join_expr;
-      // The join has no position of its own; report the table it joins.
-      const auto* r = j->rarg;
-      auto at = r != nullptr && r->node_case == PG_QUERY__NODE__NODE_RANGE_VAR ? r->range_var->location : pos;
-      auto kind = j->jointype == PG_QUERY__JOIN_TYPE__JOIN_LEFT    ? Select::JoinKind::Left
-                  : j->jointype == PG_QUERY__JOIN_TYPE__JOIN_RIGHT ? Select::JoinKind::Right
-                                                                   : Select::JoinKind::Inner;
-      if (j->jointype == PG_QUERY__JOIN_TYPE__JOIN_FULL) reject("FULL JOIN is not supported", at);
-      if (s->n_from_clause != 1 ||
-          (j->jointype != PG_QUERY__JOIN_TYPE__JOIN_INNER && kind == Select::JoinKind::Inner) || j->alias != nullptr ||
-          j->larg == nullptr || r == nullptr || j->larg->node_case != PG_QUERY__NODE__NODE_RANGE_VAR ||
-          r->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) {
-        reject("only an inner, LEFT or RIGHT join of two tables, by ON, USING or NATURAL, is supported", at);
-      }
-      join_kind = kind;
-      tables = {j->larg->range_var, r->range_var};
-      on = j->quals;
-      natural = j->is_natural;
-      for (std::size_t k = 0; k < j->n_using_clause; ++k) using_columns.push_back(str(j->using_clause[k]));
-      if (j->join_using_alias != nullptr) {
-        if (j->join_using_alias->n_colnames != 0) reject("a USING alias takes no column list", at);
-        using_alias = j->join_using_alias->aliasname;
-      }
+      if (s->n_from_clause != 1) reject("a join inside a list of tables is not supported", pos);
+      join_items(from, pos, items, on);
       continue;
     }
-    if (from->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) reject("SELECT reads one or two tables", pos);
-    tables.push_back(from->range_var);
+    if (from->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) reject("SELECT reads tables", pos);
+    items.push_back(from_item(from->range_var));
   }
+  if (items.size() > kMaxFrom) reject("SELECT reads at most " + std::to_string(kMaxFrom) + " tables", pos);
   // DISTINCT is a list of one empty node; DISTINCT ON a list of its expressions.
   auto distinct = s->n_distinct_clause == 1 &&
                   (s->distinct_clause[0] == nullptr || s->distinct_clause[0]->node_case == PG_QUERY__NODE__NODE__NOT_SET);
@@ -926,17 +966,11 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
       s->n_window_clause != 0 || s->into_clause != nullptr) {
     reject("SELECT clause not supported", pos);
   }
-  Select sel{{}, tables.empty() ? "" : from_relation(tables[0]), tables.size() == 2 ? from_relation(tables[1]) : "", {}, {},
-             limit(s), pos, false};
-  std::vector<std::string> aliases;  // each table's alias, "" for none
-  for (const auto* t : tables) aliases.push_back(table_alias(t));
+  Select sel;
+  sel.from = std::move(items);
+  sel.limit = limit(s);
+  sel.pos = pos;
   sel.distinct = distinct;
-  sel.using_columns = std::move(using_columns);
-  sel.natural = natural;
-  sel.using_alias = std::move(using_alias);
-  sel.join_kind = join_kind;
-  if (!tables.empty()) sel.table_pos = tables[0]->location;
-  if (tables.size() == 2) sel.join_pos = tables[1]->location;
   if (s->n_locking_clause == 1) {
     // FOR UPDATE alone: never NOWAIT or SKIP LOCKED, which only mean
     // something to a locker, nor a weaker lock or OF a table list.
@@ -954,7 +988,7 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
     sel.targets.push_back(expr(rt->val));
     if (!empty(rt->name)) sel.targets.back().alias = rt->name;
   }
-  where(on, sel.where, "ON", sel.join_pos);
+  sel.where = std::move(on);
   where(s->where_clause, sel.where);
   // GROUP BY of columns: no expressions, grouping sets, ROLLUP or CUBE.
   for (std::size_t i = 0; i < s->n_group_clause; ++i) {
@@ -964,7 +998,7 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   }
   where(s->having_clause, sel.having, "HAVING", pos);
   resolve_positions(sel);
-  resolve_aliases(sel, aliases);
+  resolve_aliases(sel);
   return sel;
 }
 

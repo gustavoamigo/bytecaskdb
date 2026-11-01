@@ -231,6 +231,18 @@ The rules, by what they test.
   of either table, with the same aggregates, `HAVING`, `ORDER BY` and
   `LIMIT` (`group_by_join`).
 
+**Joins of several tables** (a fixed case, not generated):
+`test_joins_of_several_tables_with_themselves_and_on_any_comparison` runs
+about forty statements on three small tables with NULLs: three tables and
+more by `JOIN` and by a comma list, a table joined with itself under
+aliases (on its key, a column, a comparison, `USING`), `ON` by every
+comparison and by predicates over both tables, chains of left joins, an inner
+join before and after a left join, and the errors PostgreSQL gives for a
+name used wrongly. Each runs on the layer, the server and PostgreSQL, which
+must agree, and each plan the search costed returns PostgreSQL's rows.
+Beside it, `tests/functional/cases/postgresql/joins.yaml` holds the same
+forms with PostgreSQL's recorded results, and the sqltest ids of F041.
+
 `test_tprocc.py` runs TPROC-C's five transactions through SQL against
 PostgreSQL: a small fixture (one warehouse, two
 districts, thirty customers each, some with a NULL `c_first`, fifty items
