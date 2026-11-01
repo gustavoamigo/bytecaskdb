@@ -4,22 +4,18 @@
 e011_03_01_03
 e011_03_01_06
 e011_03_01_09
-e021_01_01_01
-e021_01_01_02
-e021_01_01_03
-e021_01_01_04
-e021_01_01_05
-e021_01_01_06
-e021_01_01_07
-e021_01_01_08
-e021_02_01_01
-e021_02_01_02
-e021_02_01_03
-e021_02_01_04
-e021_02_01_06
-e021_02_01_07
-e021_02_01_10
-e021_02_01_11
+e021_01_01_02  # CHARACTERS or OCTETS after the length: not PostgreSQL syntax
+e021_01_01_03  # CHARACTERS or OCTETS after the length: not PostgreSQL syntax
+e021_01_01_06  # CHARACTERS or OCTETS after the length: not PostgreSQL syntax
+e021_01_01_07  # CHARACTERS or OCTETS after the length: not PostgreSQL syntax
+e021_02_01_01  # sqltest spells VARYING as VARING: not valid SQL
+e021_02_01_02  # sqltest spells VARYING as VARING: not valid SQL
+e021_02_01_03  # sqltest spells VARYING as VARING: not valid SQL
+e021_02_01_04  # sqltest spells VARYING as VARING: not valid SQL
+e021_02_01_06  # CHARACTERS or OCTETS after the length: not PostgreSQL syntax
+e021_02_01_07  # CHARACTERS or OCTETS after the length: not PostgreSQL syntax
+e021_02_01_10  # CHARACTERS or OCTETS after the length: not PostgreSQL syntax
+e021_02_01_11  # CHARACTERS or OCTETS after the length: not PostgreSQL syntax
 e021_04_01_02  # USING CHARACTERS or OCTETS: not PostgreSQL syntax
 e021_04_01_03  # USING CHARACTERS or OCTETS: not PostgreSQL syntax
 e021_04_01_05  # USING CHARACTERS or OCTETS: not PostgreSQL syntax
@@ -28,7 +24,6 @@ e021_06_01_03  # USING CHARACTERS or OCTETS: not PostgreSQL syntax
 e021_06_01_04  # USING CHARACTERS or OCTETS: not PostgreSQL syntax
 e021_06_01_05  # USING CHARACTERS or OCTETS: not PostgreSQL syntax
 e021_06_01_06  # USING CHARACTERS or OCTETS: not PostgreSQL syntax
-e021_10_01_01
 e021_11_01_02  # USING CHARACTERS or OCTETS: not PostgreSQL syntax
 e021_11_01_03  # USING CHARACTERS or OCTETS: not PostgreSQL syntax
 e051_07_01_01  # not PostgreSQL: `* AS (c, d)` renames the star's columns (SQL standard only)

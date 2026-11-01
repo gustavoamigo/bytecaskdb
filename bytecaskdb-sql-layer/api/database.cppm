@@ -550,6 +550,7 @@ private:
   static auto plan_params(const Compiled& c, const std::vector<Value>& params, std::int64_t now_us) -> std::vector<Value>;
   static auto results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows;
   static auto quotients(const GeneratedPlan& p, std::vector<Value> values) -> std::vector<Value>;
+  static auto padded(const std::vector<SqlType>& types, std::vector<Value> values) -> std::vector<Value>;
   // An autocommit context: one per call in flight, kept for the next.
   [[nodiscard]] auto acquire_context() -> bc_ctx*;
   void release_context(bc_ctx* cx) noexcept;
@@ -1280,11 +1281,23 @@ auto Database::results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows {
         bc_ctx_reset(cx);
         throw ExecError("malformed result row: column " + std::to_string(values.error()), BC_E_CORRUPT);
       }
-      out.rows.push_back(quotients(p, std::move(*values)));
+      out.rows.push_back(padded(out.types, quotients(p, std::move(*values))));
     }
   }
   bc_ctx_reset(cx);
   return out;
+}
+
+// A CHAR(n) is stored without its trailing spaces and returned padded with
+// spaces to n code points, as PostgreSQL returns it.
+auto Database::padded(const std::vector<SqlType>& types, std::vector<Value> values) -> std::vector<Value> {
+  for (std::size_t i = 0; i < values.size() && i < types.size(); ++i) {
+    auto* b = std::get_if<Bytes>(&values[i]);
+    if (types[i].kind != SqlKind::Char || b == nullptr) continue;
+    auto have = utf8_code_points(*b).value_or(b->size());
+    if (have < types[i].length) b->insert(b->end(), types[i].length - have, std::byte{' '});
+  }
+  return values;
 }
 
 // A result row's NUMERICs, each its plan's columns (physical::plan_columns),

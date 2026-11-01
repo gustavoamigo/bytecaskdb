@@ -2571,6 +2571,81 @@ TEST_CASE("embedded API: a TIMESTAMP WITH TIME ZONE column keeps the instant, in
   CHECK(text(*db, "SELECT id FROM ev WHERE at > '2026-10-27 09:00:00Z' ORDER BY id") == std::vector<std::string>{"2", "3", "4"});
 }
 
+TEST_CASE("embedded API: a CHAR(n) column ignores trailing spaces and is returned padded to n", "[sql][api][char]") {
+  sql_test::TempDir dir{"api_char"};
+  auto state = [](Database& d, std::string_view sql, const std::vector<Value>& params = {}) -> std::string {
+    try {
+      (void)d.execute(std::string{sql}, params);
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ok";
+  };
+  auto text = [](Database& d, std::string_view sql, const std::vector<Value>& params = {}) {
+    std::vector<std::string> out;
+    auto r = d.execute(std::string{sql}, params);
+    for (const auto& row : r.rows) out.push_back(to_text(row.at(0), r.types.at(0)));
+    return out;
+  };
+  using V = std::vector<std::string>;
+  {
+    auto db = Database::open(dir.path());
+    CHECK(state(*db, "CREATE TABLE t (id INTEGER PRIMARY KEY, a CHAR(5), b CHARACTER(3), c CHAR, v VARCHAR(8))") == "ok");
+    CHECK(db->execute("SELECT a, b, c FROM t").types ==
+          std::vector<SqlType>{{SqlKind::Char, 5}, {SqlKind::Char, 3}, {SqlKind::Char, 1}});
+    CHECK(state(*db, "INSERT INTO t VALUES (1, 'ab', 'xyz', 'q', 'ab ')") == "ok");
+    CHECK(state(*db, "INSERT INTO t VALUES ($1, $2, 'x', 'q', 'a')", {i(2), bytes("abcde   ")}) == "ok");  // spaces past n are cut
+    CHECK(state(*db, "INSERT INTO t VALUES ($1, $2, 'x', 'q', 'a')", {i(3), bytes("ab ")}) == "ok");
+    CHECK(state(*db, "INSERT INTO t VALUES (4, 'é', 'x', 'q', 'a')") == "ok");
+    // Too long once spaces are cut: 22001, as PostgreSQL's.
+    CHECK(state(*db, "INSERT INTO t VALUES (9, 'abcdef', 'x', 'q', 'a')") == "22001");
+    CHECK(state(*db, "INSERT INTO t VALUES ($1, 'ab', 'x', 'q', 'a')", {i(9)}) == "ok");
+    CHECK(state(*db, "INSERT INTO t VALUES (10, 'ab', 'x', 'qq', 'a')") == "22001");
+    CHECK(state(*db, "INSERT INTO t VALUES ($1, $2, 'x', 'q', 'a')", {i(11), bytes("abcdef")}) == "22001");
+    CHECK(text(*db, "SELECT a FROM t ORDER BY id") == V{"ab   ", "abcde", "ab   ", "é    ", "ab   "});
+    CHECK(text(*db, "SELECT b FROM t WHERE id = 2") == V{"x  "});
+    // A constant is compared without its trailing spaces, as a CHAR's are.
+    CHECK(text(*db, "SELECT id FROM t WHERE a = 'ab' ORDER BY id") == V{"1", "3", "9"});
+    CHECK(text(*db, "SELECT id FROM t WHERE a = 'ab        ' ORDER BY id") == V{"1", "3", "9"});
+    CHECK(text(*db, "SELECT id FROM t WHERE a = 'é'") == V{"4"});
+    CHECK(text(*db, "SELECT id FROM t WHERE a > 'ab' ORDER BY id") == V{"2", "4"});
+    // Two CHARs compare without their spaces; a CHAR with a VARCHAR as text,
+    // the CHAR's spaces cut and the VARCHAR's kept.
+    CHECK(text(*db, "SELECT a = b FROM t WHERE id = 4") == V{"f"});
+    CHECK(text(*db, "SELECT a = v FROM t WHERE id = 1") == V{"f"});
+    CHECK(text(*db, "SELECT a = v FROM t WHERE id = 3") == V{"f"});
+    CHECK(text(*db, "SELECT a = v FROM t WHERE id = 9") == V{"f"});
+    (void)db->execute("UPDATE t SET v = 'ab' WHERE id = 1");
+    CHECK(text(*db, "SELECT a = v FROM t WHERE id = 1") == V{"t"});
+    CHECK(text(*db, "SELECT DISTINCT a FROM t ORDER BY a") == V{"ab   ", "abcde", "é    "});
+    CHECK(state(*db, "UPDATE t SET a = $1 WHERE id = 1", {bytes("z  ")}) == "ok");
+    CHECK(text(*db, "SELECT a FROM t WHERE id = 1") == V{"z    "});
+    CHECK(text(*db, "SELECT id FROM t WHERE a = 'z'") == V{"1"});
+    // NULL is not padded.
+    CHECK(state(*db, "INSERT INTO t VALUES (12, NULL, NULL, NULL, NULL)") == "ok");
+    CHECK(db->execute("SELECT a FROM t WHERE id = 12").rows == Grid{{kNull}});
+    // A DEFAULT is stored as any value is.
+    CHECK(state(*db, "CREATE TABLE d (x CHAR(4) DEFAULT 'a ', y INTEGER)") == "ok");
+    CHECK(state(*db, "INSERT INTO d (y) VALUES (1)") == "ok");
+    CHECK(text(*db, "SELECT x FROM d") == V{"a   "});
+    CHECK(state(*db, "CREATE TABLE d2 (x CHAR(2) DEFAULT 'abc')") == "42601");
+    // Not yet: a key, an index, a parameter compared, a cast, LIKE.
+    CHECK(state(*db, "CREATE TABLE k (a CHAR(3) PRIMARY KEY)") == "0A000");
+    CHECK(state(*db, "CREATE TABLE k (a CHAR(3) UNIQUE)") == "0A000");
+    CHECK(state(*db, "CREATE INDEX t_a ON t (a)") == "0A000");
+    CHECK(state(*db, "SELECT id FROM t WHERE a = $1", {bytes("ab")}) == "42601");
+    CHECK(state(*db, "SELECT CAST('ab' AS CHAR(5))") == "42601");
+    CHECK(state(*db, "SELECT id FROM t WHERE a LIKE 'a%'") != "ok");
+    CHECK(state(*db, "CREATE TABLE z (a CHAR(0))") == "42601");
+    CHECK(state(*db, "CREATE TABLE z (a CHAR(8 CHARACTERS))") == "42601");
+  }
+  // The type survives a reopen, and what was stored stays stripped.
+  auto db = Database::open(dir.path());
+  CHECK(text(*db, "SELECT a FROM t WHERE id = 2") == V{"abcde"});
+  CHECK(text(*db, "SELECT id FROM t WHERE a = 'ab' ORDER BY id") == V{"3", "9"});
+  CHECK(db->execute("SELECT a FROM t").types.at(0) == SqlType{SqlKind::Char, 5});
+}
+
 TEST_CASE("embedded API: a CHECK is tested on every INSERT and UPDATE, on the row as written", "[sql][api]") {
   sql_test::TempDir dir{"api_check"};
   auto state = [](Database& db, std::string_view sql, const std::vector<Value>& params = {}) -> std::string {

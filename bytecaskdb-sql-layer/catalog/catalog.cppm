@@ -431,9 +431,9 @@ public:
   // is still written as 4, so only a database that holds a CHECK is closed
   // to an earlier build.
   // 6: as 5, but the CHECK count may be 0. It is the record of a table with a
-  // TIMESTAMP WITH TIME ZONE column, whose type tag an earlier build would
-  // call corrupt: written only for such a table, so only a database that
-  // holds one is closed to an earlier build.
+  // TIMESTAMP WITH TIME ZONE or CHAR(n) column, whose type tag an earlier
+  // build would call corrupt: written only for such a table, so only a
+  // database that holds one is closed to an earlier build.
   static constexpr std::uint16_t kRecordFormat = 6;
   static constexpr std::uint16_t kOldestRecordFormat = 3;
 
@@ -985,7 +985,8 @@ auto set_datum(RowWriter& w, std::uint32_t col_id, const Datum& d) -> bool {
 
 auto sql_type_valid(SqlType t) -> bool {
   switch (t.kind) {
-    case SqlKind::Varchar: return t.length > 0 && t.precision == 0 && t.scale == 0;
+    case SqlKind::Varchar:
+    case SqlKind::Char: return t.length > 0 && t.precision == 0 && t.scale == 0;
     case SqlKind::Decimal:
       return t.length == 0 && t.precision >= 1 && t.precision <= kMaxDecimalPrecision && t.scale <= t.precision;
     case SqlKind::SmallInt:
@@ -1017,6 +1018,7 @@ auto sql_type_name(SqlType t) -> std::string {
     case SqlKind::Bytea: return "bytea";
     case SqlKind::Text: return "text";
     case SqlKind::Varchar: return "varchar(" + std::to_string(t.length) + ")";
+    case SqlKind::Char: return "char(" + std::to_string(t.length) + ")";
     case SqlKind::Decimal:
       if (t.precision == 0) return "numeric";  // no declared precision: a SUM's result
       return "numeric(" + std::to_string(t.precision) + "," + std::to_string(t.scale) + ")";
@@ -1067,7 +1069,8 @@ auto utf8_code_points(BytesView s) -> std::optional<std::size_t> {
 auto compared_type(SqlType t) -> ComparedType {
   auto same = [](SqlType u) { return ComparedType{u, u}; };
   switch (t.kind) {
-    case SqlKind::Varchar: return same({SqlKind::Text});
+    case SqlKind::Varchar:
+    case SqlKind::Char: return same({SqlKind::Text});
     case SqlKind::Decimal:
       if (t.scale == 0) return same({SqlKind::BigInt});
       return {{SqlKind::Decimal, 0, 0, t.scale}, {SqlKind::BigInt}};
@@ -1119,6 +1122,7 @@ auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string> {
     case SqlKind::Bytea:
     case SqlKind::Text:
     case SqlKind::Varchar:
+    case SqlKind::Char:
     case SqlKind::Numeric: break;
   }
   return std::nullopt;
@@ -1136,11 +1140,16 @@ auto out_of_range(SqlType t, double v) -> std::optional<std::string> {
 }
 
 auto out_of_range(SqlType t, BytesView v) -> std::optional<std::string> {
-  if (t.kind != SqlKind::Text && t.kind != SqlKind::Varchar) return std::nullopt;
+  if (t.kind != SqlKind::Text && t.kind != SqlKind::Varchar && t.kind != SqlKind::Char) return std::nullopt;
   auto n = utf8_code_points(v);
   if (!n) return "invalid byte sequence for encoding \"UTF8\"";
   if (t.kind == SqlKind::Varchar && *n > t.length) {
     return "value too long for type character varying(" + std::to_string(t.length) + ")";
+  }
+  if (t.kind == SqlKind::Char && *n > t.length) {
+    // Spaces past n are cut, not refused: only the other characters count.
+    while (!v.empty() && v.back() == std::byte{' '}) v = v.first(v.size() - 1);
+    if (utf8_code_points(v) > t.length) return "value too long for type character(" + std::to_string(t.length) + ")";
   }
   return std::nullopt;
 }
@@ -1155,6 +1164,7 @@ constexpr RangeMessage kRangeMessages[] = {
     {"value out of range: underflow", "22003"},  // REAL
     {"numeric field overflow", "22003"},         // DECIMAL(p, s)
     {"value too long for type character varying", "22001"},
+    {"value too long for type character(", "22001"},
     {"invalid byte sequence for encoding", "22021"},  // TEXT, VARCHAR
     {"date out of range", "22008"},
     {"timestamp out of range", "22008"},
@@ -1222,6 +1232,15 @@ auto name_entry_key(std::string_view name) -> Bytes {
 
 namespace {
 
+// A CHAR(n) is stored without its trailing spaces, which a key built from a
+// parameter would keep: it is not a key or index column yet.
+void refuse_char_key(const Column& c) {
+  if (c.sql.kind == SqlKind::Char) {
+    throw DdlRefused("CHAR(n) column \"" + c.name + "\" as a primary key, unique or index column is not supported yet; use VARCHAR(n)",
+                     kFeatureNotSupported);
+  }
+}
+
 void write_layout(RecordWriter& w, std::uint32_t layout_id, const RowLayout& l) {
   w.entry([&](RecordWriter& e) {
     e.u32(layout_id);
@@ -1268,8 +1287,8 @@ auto read_layout(RecordReader& r, const Table& t) -> std::pair<std::uint32_t, Ro
 
 auto serialize_table(const Table& t) -> Bytes {
   RecordWriter w;
-  auto has_tz = std::ranges::any_of(t.columns, [](const Column& c) { return c.sql.kind == SqlKind::TimestampTz; });
-  w.u16(has_tz ? Catalog::kRecordFormat : t.checks.empty() ? std::uint16_t{4} : std::uint16_t{5});
+  auto has_new_type = std::ranges::any_of(t.columns, [](const Column& c) { return c.sql.kind == SqlKind::TimestampTz || c.sql.kind == SqlKind::Char; });
+  w.u16(has_new_type ? Catalog::kRecordFormat : t.checks.empty() ? std::uint16_t{4} : std::uint16_t{5});
   w.u32(t.id);
   w.str(t.name);
   w.u32(t.version);
@@ -1306,7 +1325,7 @@ auto serialize_table(const Table& t) -> Bytes {
   w.u16(t.retired_layouts.size() + 1);
   for (const auto& [id, l] : t.retired_layouts) write_layout(w, id, l);
   write_layout(w, t.layout_id, t.layout);
-  if (!t.checks.empty() || has_tz) {
+  if (!t.checks.empty() || has_new_type) {
     w.u16(t.checks.size());
     for (const auto& c : t.checks) {
       w.entry([&](RecordWriter& e) {
@@ -1769,7 +1788,10 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       defs.emplace_back(c.id, c.sql, c.nullable);
       t.columns.push_back(std::move(c));
     }
-    for (const auto& p : ct->pk) t.pk_col_ids.push_back(t.column(p)->id);
+    for (const auto& p : ct->pk) {
+      refuse_char_key(*t.column(p));
+      t.pk_col_ids.push_back(t.column(p)->id);
+    }
     if (ct->pk.empty()) {
       // No primary key: a hidden row id is the key, after the columns.
       Column c{t.next_col_id++, "", {SqlKind::BigInt}, PhysType::I64, false, {}, true};
@@ -1792,7 +1814,10 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       ix.name = u.name.empty() ? unique_index_name(t.name, u.columns, taken) : u.name;
       if (taken(ix.name)) throw DdlRefused("relation \"" + ix.name + "\" already exists", kDuplicateTable);
       ix.unique = true;
-      for (const auto& c : u.columns) ix.parts.push_back({t.column(c)->id, false});
+      for (const auto& c : u.columns) {
+        refuse_char_key(*t.column(c));
+        ix.parts.push_back({t.column(c)->id, false});
+      }
       ix.id = reserve_ids(next->next_id_, 1);
       put_op(ops, DdlOp::Kind::EnsureAbsent, name_entry_key(ix.name));
       put_op(ops, DdlOp::Kind::Put, name_entry_key(ix.name), name_value(kKindIndex, ix.id));
@@ -1834,6 +1859,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       if (std::ranges::find(ix.parts, col->id, &IndexPart::col_id) != ix.parts.end()) {
         throw DdlRefused("column \"" + col->name + "\" appears twice in the index", kDuplicateColumn);
       }
+      refuse_char_key(*col);
       ix.parts.push_back({col->id, c.desc});
     }
     ix.id = reserve_ids(next->next_id_, 1);

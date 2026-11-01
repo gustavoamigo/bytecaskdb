@@ -82,6 +82,11 @@ enum class SqlKind : std::uint8_t {
   // since 1970-01-01 00:00:00 UTC), told apart by this tag. Appended, so no
   // earlier value moves; a catalog that holds it is closed to an earlier build.
   TimestampTz,
+  // CHAR(n): text of at most n code points, stored without its trailing
+  // spaces (they are insignificant, as PostgreSQL's bpchar compares them)
+  // and padded to n when a result is returned. Appended; a catalog that
+  // holds it is closed to an earlier build.
+  Char,
 };
 
 // DECIMAL(p, s) is a scaled i64: p of at most 18 digits fits.
@@ -89,7 +94,7 @@ inline constexpr std::uint8_t kMaxDecimalPrecision = 18;
 
 struct SqlType {
   SqlKind kind;
-  std::uint32_t length{0};    // VARCHAR(n): n, in code points
+  std::uint32_t length{0};    // VARCHAR(n), CHAR(n): n, in code points
   std::uint8_t precision{0};  // DECIMAL(p, s): p, 1..18
   std::uint8_t scale{0};      // DECIMAL(p, s): s, 0..p
   auto operator==(const SqlType&) const -> bool = default;
@@ -352,6 +357,7 @@ auto phys_type(SqlType t) -> PhysType {
     case SqlKind::Bytea:
     case SqlKind::Text:
     case SqlKind::Varchar:
+    case SqlKind::Char:
     case SqlKind::Numeric: return PhysType::Bytes;
   }
   return PhysType::Bytes;
@@ -445,6 +451,10 @@ auto RowWriter::set_bytes(std::uint32_t col_id, BytesView v) -> bool {
   auto i = index_of(col_id, PhysType::Bytes);
   if (!i) return false;
   present_[*i] = true;
+  // A CHAR(n) keeps no trailing spaces: every value stored passes here.
+  if (layout_->columns[*i].sql.kind == SqlKind::Char) {
+    while (!v.empty() && v.back() == std::byte{' '}) v = v.first(v.size() - 1);
+  }
   var_[*i].assign(v.begin(), v.end());
   return true;
 }
