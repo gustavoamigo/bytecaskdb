@@ -95,6 +95,16 @@ struct Bound {
   // The instances of tables the plan reads (Table::source): the logical plan
   // names them, so they live as long as it does.
   std::vector<std::unique_ptr<Table>> instances;
+  // A cursor's query (ast::Select::row_key): how many trailing result columns
+  // are the scanned table's primary key, hidden from the client, and that
+  // table's storage id. 0 and 0 for a query that is no simple scan of one
+  // table.
+  std::uint32_t key_columns{0};
+  std::uint32_t key_table{0};
+  // An UPDATE or DELETE ... WHERE CURRENT OF: the primary key of its table
+  // as that many parameters after the statement's own, bound by the
+  // cursor's current row; key_table is the table.
+  std::uint32_t key_params{0};
 };
 
 // Throws ast::SqlError with a message and the position of the offending node.
@@ -2670,6 +2680,22 @@ public:
     return out;
   }
 
+  // WHERE CURRENT OF: `pk = $n` for each primary key column of `t`, the
+  // parameters from `first` (zero-based) on. The hidden row id of a table
+  // without a primary key has no name a statement can write, so the column
+  // is resolved by the lambda, not by its name.
+  auto current_of(const Table& t, std::uint32_t first, std::int32_t pos) -> std::vector<logical::Expr> {
+    std::vector<logical::Expr> out;
+    for (auto id : t.pk_col_ids) {
+      const auto* col = t.column(id);
+      ast::Compare w{ast::Compare::Op::Eq, ast::Expr{ast::Expr::Kind::Column, col->name, 0, nullptr, nullptr, pos},
+                     ast::Expr{ast::Expr::Kind::Param, {}, first + bytecask::sql::narrow<std::uint32_t>(out.size()), nullptr, nullptr, pos},
+                     pos};
+      out.push_back(predicate(w, [&](const ast::Expr&) { return std::pair{t.id, col}; }));
+    }
+    return out;
+  }
+
   // The conjuncts, each AND among them (a BETWEEN's) taken apart, so a key
   // may take each comparison.
   static auto top_level(const std::vector<ast::Compare>& in) -> std::vector<const ast::Compare*> {
@@ -3154,6 +3180,12 @@ public:
       targets.push_back({aggregated ? grouped(*t, *c, e.pos) : logical::column_of(t->id, *c), c->name});
     }
     named(list, targets);
+    if (s.row_key && row_key_allowed_ && !joined && !aggregated) {
+      const auto& t = *rels[0];
+      for (auto id : t.pk_col_ids) targets.push_back({logical::column_of(t.id, *t.column(id)), "?key?"});
+      key_columns_ = bytecask::sql::narrow<std::uint32_t>(t.pk_col_ids.size());
+      key_table_ = t.storage_id();
+    }
     std::vector<logical::Expr> having;
     for (const auto& h : s.having) having.push_back(having_conjunct(h, resolve, grouped));
     // 0A000, as PostgreSQL refuses it, and in its order of checks.
@@ -3567,6 +3599,14 @@ public:
     return out;
   }
 
+  // A cursor's query is a simple scan of one table (ast::Select::row_key):
+  // select() appended the table's primary key to the result, key_columns()
+  // of it, as hidden trailing columns.
+  [[nodiscard]] auto key_columns() const -> std::uint32_t { return key_columns_; }
+  [[nodiscard]] auto key_table() const -> std::uint32_t { return key_table_; }
+  // The query reads a view, whose rows are no table's: no key is added.
+  void forbid_row_key() { row_key_allowed_ = false; }
+
 private:
   // A parameter's type from its uses, which all agree.
   struct ParamUse {
@@ -3603,6 +3643,9 @@ private:
 
   const Catalog& cat_;
   std::uint32_t own_params_;
+  bool row_key_allowed_{true};
+  std::uint32_t key_columns_{0};
+  std::uint32_t key_table_{0};
   std::vector<std::string> using_;  // a join's USING or NATURAL columns: one column each
   std::string using_alias_;         // USING (…) AS alias
   std::vector<std::unique_ptr<Table>> instances_;  // see instance()
@@ -3784,14 +3827,14 @@ public:
       return std::optional<ast::Statement>{std::in_place, std::in_place_type<ast::Select>, expand(*s)};
     }
     if (const auto* u = std::get_if<ast::Update>(&stmt)) {
-      ast::Update out{u->table, {}, {}, u->pos};
+      ast::Update out{u->table, {}, {}, u->pos, u->current_of};
       for (const auto& a : u->set) out.set.push_back({a.column, ast::clone(a.value), a.pos});
       for (const auto& c : u->where) out.where.push_back(ast::clone(c));
       if (!rewrite(out.set, out.where)) return std::nullopt;
       return std::optional<ast::Statement>{std::in_place, std::in_place_type<ast::Update>, std::move(out)};
     }
     if (const auto* d = std::get_if<ast::Delete>(&stmt)) {
-      ast::Delete out{d->table, {}, d->pos};
+      ast::Delete out{d->table, {}, d->pos, d->current_of};
       for (const auto& c : d->where) out.where.push_back(ast::clone(c));
       std::vector<ast::Assignment> none;
       if (!rewrite(none, out.where)) return std::nullopt;
@@ -4176,7 +4219,26 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
   ViewExpander views{cat};
   auto expanded = views.statement(stmt);
   const auto& target = expanded ? *expanded : stmt;
-  Binder b{cat, param_count(target)};
+  // WHERE CURRENT OF takes the table's key as parameters after the statement's own.
+  auto own = param_count(target);
+  std::uint32_t key_params = 0;
+  std::uint32_t positioned_table = 0;
+  auto positioned = [&](const std::string& table, const std::string& cursor, std::int32_t pos) {
+    if (cursor.empty()) return;
+    const auto* t = cat.table(table);
+    if (t == nullptr) {
+      if (cat.view(table) != nullptr) {
+        throw SqlError{"\"" + table + "\" is a view, not a table: views are not updatable", pos, kFeatureNotSupported};
+      }
+      throw SqlError{"relation \"" + table + "\" does not exist", pos, kUndefinedTable};
+    }
+    key_params = bytecask::sql::narrow<std::uint32_t>(t->pk_col_ids.size());
+    positioned_table = t->storage_id();
+  };
+  if (const auto* u = std::get_if<ast::Update>(&target)) positioned(u->table, u->current_of, u->pos);
+  if (const auto* d = std::get_if<ast::Delete>(&target)) positioned(d->table, d->current_of, d->pos);
+  Binder b{cat, own + key_params};
+  if (!views.used().empty()) b.forbid_row_key();
   auto bound_stmt = std::visit(
       [&](const auto& s) -> std::pair<std::variant<Ddl, logical::NodePtr>, std::int32_t> {
         using T = std::decay_t<decltype(s)>;
@@ -4291,19 +4353,24 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
             set.emplace_back(logical::column_of(t->id, *c).col, std::move(v));
           }
           b.set_scope({t});
-          auto rows = Binder::rows(*t, b.where(*t, s.where));
+          auto rows = Binder::rows(*t, s.current_of.empty() ? b.where(*t, s.where) : b.current_of(*t, own, s.pos));
           return {logical::node(logical::Update{std::move(rows), t, std::move(set), b.checks(*t)}), s.pos};
         } else {
           const auto* t = b.table(s.table, s.pos);
           b.set_scope({t});
-          return {logical::node(logical::Delete{Binder::rows(*t, b.where(*t, s.where)), t}), s.pos};
+          auto rows = Binder::rows(*t, s.current_of.empty() ? b.where(*t, s.where) : b.current_of(*t, own, s.pos));
+          return {logical::node(logical::Delete{std::move(rows), t}), s.pos};
         }
       },
       target);
   auto types = b.param_types(bound_stmt.second);
   types.insert(types.end(), b.fixed_types().begin(), b.fixed_types().end());
-  return Bound{std::move(bound_stmt.first), std::move(types), b.param_sql(), b.param_table(), b.param_info(),
-               b.fixed_values(), b.take_clocks(), b.take_subqueries(), views.used(), b.take_instances()};
+  Bound out{std::move(bound_stmt.first), std::move(types), b.param_sql(), b.param_table(), b.param_info(),
+            b.fixed_values(), b.take_clocks(), b.take_subqueries(), views.used(), b.take_instances()};
+  out.key_columns = b.key_columns();
+  out.key_table = key_params != 0 ? positioned_table : b.key_table();
+  out.key_params = key_params;
+  return out;
 }
 
 }  // namespace bytecask::sql::bound

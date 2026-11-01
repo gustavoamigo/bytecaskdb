@@ -362,8 +362,10 @@ query has `FOR UPDATE`, and the query's text, which `parse` then reads as a
 `SELECT` (`FOR READ ONLY` is dropped by libpg_query's grammar and needs
 nothing). A `FETCH` or `MOVE` gives PostgreSQL's direction and count. Which
 forms run is the session's and `cursor_design.md`'s; `OPEN` and `FETCH … INTO`
-are syntax errors as in PostgreSQL, and `WHERE CURRENT OF` is refused in
-`WHERE` until phase 6.
+are syntax errors as in PostgreSQL, and `WHERE CURRENT OF name` is the whole
+`WHERE` of an `UPDATE` or `DELETE` (`ast::Update::current_of`, `ast::Delete::current_of`;
+`cursor_design.md`, *As built (phase 6)*); in a `SELECT` or beside another
+condition it is a syntax error, as in PostgreSQL.
 
 **Select-list positions in `ORDER BY`.** `ORDER BY 2` orders a plain `SELECT`
 by its second select-list item. The parser resolves it to that item's

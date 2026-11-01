@@ -1111,17 +1111,31 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   return sel;
 }
 
+// The cursor of a WHERE that is CURRENT OF name alone; PostgreSQL's grammar
+// takes it as the whole clause or not at all (WHERE x AND CURRENT OF c is a
+// syntax error there, and here too: predicate() has no such node).
+auto current_of(const PgQuery__Node* where_clause) -> std::optional<std::string> {
+  if (where_clause == nullptr || where_clause->node_case != PG_QUERY__NODE__NODE_CURRENT_OF_EXPR) return std::nullopt;
+  const auto* c = where_clause->current_of_expr;
+  if (empty(c->cursor_name)) reject("WHERE CURRENT OF takes a cursor name, not a parameter", -1);
+  return std::string{c->cursor_name};
+}
+
 auto update(const PgQuery__UpdateStmt* s, std::int32_t pos) -> Update {
   if (s->n_from_clause != 0 || s->n_returning_list != 0 || s->with_clause != nullptr) {
     reject("UPDATE option not supported", s->relation->location);
   }
-  Update u{relation(s->relation), {}, {}, pos};
+  Update u{relation(s->relation), {}, {}, pos, {}};
   for (std::size_t i = 0; i < s->n_target_list; ++i) {
     const auto* rt = s->target_list[i]->res_target;
     if (rt->n_indirection != 0) reject("subscripted assignment is not supported", rt->location);
     u.set.push_back(Assignment{rt->name, expr(rt->val), rt->location});
   }
-  where(s->where_clause, u.where);
+  if (auto cursor = current_of(s->where_clause)) {
+    u.current_of = std::move(*cursor);
+  } else {
+    where(s->where_clause, u.where);
+  }
   return u;
 }
 
@@ -1129,8 +1143,12 @@ auto del(const PgQuery__DeleteStmt* s, std::int32_t pos) -> Delete {
   if (s->n_using_clause != 0 || s->n_returning_list != 0 || s->with_clause != nullptr) {
     reject("DELETE option not supported", s->relation->location);
   }
-  Delete d{relation(s->relation), {}, pos};
-  where(s->where_clause, d.where);
+  Delete d{relation(s->relation), {}, pos, {}};
+  if (auto cursor = current_of(s->where_clause)) {
+    d.current_of = std::move(*cursor);
+  } else {
+    where(s->where_clause, d.where);
+  }
   return d;
 }
 
