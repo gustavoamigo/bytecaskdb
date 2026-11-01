@@ -21,6 +21,13 @@
 # header is sequence(u64) entry_type(u8) key_size(u16) value_size(u32). With
 # 2-byte keys and 2-byte values every entry is 23 bytes, so entry i begins at
 # 23*i and each field sits at a fixed offset inside it.
+#
+# Every open as a leader appends a ChangeMarker before it returns (CONTRACT.md,
+# "Every open as a leader starts a new history"): 15 bytes of header, an empty
+# key, an 8-byte id and a 4-byte CRC. The DB under test is opened on an empty
+# directory, so its data file begins with that marker and entry i begins at
+# OPEN_MARKER_BYTES + 23*i. The marker stays outside the damage: a cold open
+# keeps it, along with every entry committed before the damaged one.
 
 from __future__ import annotations
 
@@ -31,6 +38,8 @@ from typing import Generator, List, Tuple
 # 15 header + 2 key + 2 value + 4 crc
 ENTRY_BYTES = 23
 MARKER_BYTES = 19  # header + crc, no key or value
+# The open's ChangeMarker: header + 8-byte id + crc.
+OPEN_MARKER_BYTES = 15 + 8 + 4
 
 
 class CorruptField(Enum):
@@ -48,7 +57,7 @@ class CorruptField(Enum):
 
 
 class Position(Enum):
-    FIRST = "first"      # entry 0 — the scan parses nothing at all
+    FIRST = "first"      # entry 0 — the scan parses only the open's marker
     MIDDLE = "middle"    # entry 2
     LAST = "last"        # entry 5, the final entry
     IN_BATCH = "in_batch"  # an entry between BulkBegin and BulkEnd
@@ -83,8 +92,8 @@ class CorruptionShape:
         """Byte offset of the corrupted entry's start."""
         if self.position == Position.IN_BATCH:
             # k0, k1, then BulkBegin, then the first batch entry.
-            return 2 * ENTRY_BYTES + MARKER_BYTES
-        return self.corrupt_entry_index * ENTRY_BYTES
+            return OPEN_MARKER_BYTES + 2 * ENTRY_BYTES + MARKER_BYTES
+        return OPEN_MARKER_BYTES + self.corrupt_entry_index * ENTRY_BYTES
 
     @property
     def committed_before(self) -> int:
@@ -92,7 +101,7 @@ class CorruptionShape:
         open truncates the file to. Inside the batch that is where the batch
         begins: an incomplete batch is dropped whole."""
         if self.position == Position.IN_BATCH:
-            return 2 * ENTRY_BYTES
+            return OPEN_MARKER_BYTES + 2 * ENTRY_BYTES
         return self.corrupt_offset
 
     @property
@@ -107,8 +116,8 @@ class CorruptionShape:
         """Bytes published before the damage — what resume() must not cut."""
         if self.position == Position.IN_BATCH:
             # k0, k1, then BulkBegin, b0, b1, BulkEnd.
-            return 4 * ENTRY_BYTES + 2 * MARKER_BYTES
-        return 6 * ENTRY_BYTES
+            return OPEN_MARKER_BYTES + 4 * ENTRY_BYTES + 2 * MARKER_BYTES
+        return OPEN_MARKER_BYTES + 6 * ENTRY_BYTES
 
 
 CORRUPTION_SHAPES = [

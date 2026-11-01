@@ -749,7 +749,8 @@ from #240.
 Twelve degrade shapes establish a degraded DB before resume is called:
 
 - **degrade_H** — `io_rotate_file_creation` fires on a put at the
-  rotation threshold. The write committed (both keys are in key_dir),
+  rotation threshold (`max_file_bytes = 60`: the open's 27-byte marker
+  and k0 stay under it, p0 crosses it). The write committed (both keys are in key_dir),
   rotation failed. No orphaned bytes — `valid_offset == file.size()`.
 - **degrade_C** — `ScopedFaultInjector{fail_at=3}` on a 2-op batch.
   BulkEnd at checkpoint 3 fails; subsequent isolation sync and rotation
@@ -902,7 +903,9 @@ contain none, so the check is vacuous there and costs nothing.
 
 Files with live entries always use the compact path (sealed→sealed).
 `mostly_dead` uses `max_file_bytes=150` to pack all 6 keys into one
-sealed file.
+sealed file. Every shape first seals the open's `ChangeMarker` in a file
+of its own (`create_manifest`), so file_0 holds exactly the writes these
+sizes count.
 
 Failure classes: SUCCESS, VC1 (`io_vacuum_compact_tmp_create`),
 VC2 (`io_data_file_append`), VC3 (`io_data_file_sync`),
@@ -997,8 +1000,9 @@ wrong.
 The entry layout makes a position addressable without parsing. A data
 entry is 15 bytes of header — `sequence` u64, `entry_type` u8, `key_size`
 u16, `value_size` u32 — then key, then value, then a 4-byte CRC. With
-2-byte keys and values every entry is 23 bytes, so entry *i* starts at
-`23 * i` and each field sits at a fixed offset inside it.
+2-byte keys and values every entry is 23 bytes. The file opens with the
+27-byte `ChangeMarker` the leader open appends, so entry *i* starts at
+`27 + 23 * i` and each field sits at a fixed offset inside it.
 
 | Field | Damage |
 |-------|--------|
@@ -1166,7 +1170,7 @@ where a scan begins, the lenient open fails there.
 |-------|--------|---------------|
 | `crash_hintless` | newest hint removed | The file that was active when the process died: a crash leaves it hint-less, and `recovery_prepare_files` regenerates it. A clean close writes that hint, so the cell removes it |
 | `multi_file_hintless` | every hint removed | Several sealed files, none with a hint; all must be rebuilt |
-| `damaged_hint` | newest hint's CRC broken | `open_hint_or_rebuild` must discard it and rebuild from the data file rather than drop the keys behind it |
+| `damaged_hint` | newest hint's CRC broken | `open_hint_or_rebuild` must discard it and rebuild from the data file rather than drop the keys behind it. `max_file_bytes = 150` keeps every write, the open's marker included, in one file, so the rebuild runs on the opening thread, where the injector can reach it (#599) |
 | `hintless_batched` | newest hint removed | `BulkBegin`/`BulkEnd` have to survive regeneration — a hint carries them so recovery can compute `durable_seq` across a batch |
 | `hintless_range_del` | newest hint removed | A range tombstone has to survive it too; recovery reads it back out of the regenerated hint to suppress the range |
 

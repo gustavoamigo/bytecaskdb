@@ -79,9 +79,14 @@ RECOVERY_STATE_SHAPES = [
         "multi_file_hintless", Damage.DROP_ALL_HINTS, max_file_bytes=120
     ),
     # A hint that fails its CRC. open_hint_or_rebuild must discard it and
-    # rebuild from the data file rather than drop the keys behind it.
+    # rebuild from the data file rather than drop the keys behind it. The
+    # rebuild runs in recovery's per-file scan, on its workers when there is
+    # more than one data file, where the thread-local injector cannot reach
+    # it (#599). So every write lands in one file, sealed by the last: the
+    # open's 27-byte ChangeMarker and five 23-byte entries are 142 bytes,
+    # under the threshold, and the sixth takes the file to 165, across it.
     RecoveryStateShape(
-        "damaged_hint", Damage.CORRUPT_NEWEST_HINT, max_file_bytes=120
+        "damaged_hint", Damage.CORRUPT_NEWEST_HINT, max_file_bytes=150
     ),
     # Batch markers have to survive regeneration: hint files carry BulkBegin
     # and BulkEnd so recovery can compute durable_seq over a batch.

@@ -58,7 +58,9 @@ TEST_CASE("prove_resume__degrade_H__success", "[prove_resume]") {
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30});
+    // The open's marker (27 bytes) and k0 (23) stay under 60; p0
+    // takes the file across it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 60});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
       bytecask::testing::ScopedFaultInjector fi_degrade{"io_rotate_file_creation"};
@@ -106,7 +108,9 @@ TEST_CASE("prove_resume__degrade_H__file_creation_fails", "[prove_resume]") {
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30});
+    // The open's marker (27 bytes) and k0 (23) stay under 60; p0
+    // takes the file across it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 60});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
       bytecask::testing::ScopedFaultInjector fi_degrade{"io_rotate_file_creation"};
@@ -161,7 +165,9 @@ TEST_CASE("prove_resume__degrade_H__double_resume", "[prove_resume]") {
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30});
+    // The open's marker (27 bytes) and k0 (23) stay under 60; p0
+    // takes the file across it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 60});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
       bytecask::testing::ScopedFaultInjector fi_degrade{"io_rotate_file_creation"};
@@ -1213,7 +1219,9 @@ TEST_CASE("prove_resume__degrade_H_mmap__success", "[prove_resume]") {
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .io_backend = bytecask::IoBackend::Mmap});
+    // The open's marker (27 bytes) and k0 (23) stay under 60; p0
+    // takes the file across it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 60, .io_backend = bytecask::IoBackend::Mmap});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
       bytecask::testing::ScopedFaultInjector fi_degrade{"io_rotate_file_creation"};
@@ -1263,7 +1271,9 @@ TEST_CASE("prove_resume__degrade_H_mmap__file_creation_fails", "[prove_resume]")
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .io_backend = bytecask::IoBackend::Mmap});
+    // The open's marker (27 bytes) and k0 (23) stay under 60; p0
+    // takes the file across it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 60, .io_backend = bytecask::IoBackend::Mmap});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
       bytecask::testing::ScopedFaultInjector fi_degrade{"io_rotate_file_creation"};
@@ -1320,7 +1330,9 @@ TEST_CASE("prove_resume__degrade_H_mmap__double_resume", "[prove_resume]") {
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .io_backend = bytecask::IoBackend::Mmap});
+    // The open's marker (27 bytes) and k0 (23) stay under 60; p0
+    // takes the file across it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 60, .io_backend = bytecask::IoBackend::Mmap});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
       bytecask::testing::ScopedFaultInjector fi_degrade{"io_rotate_file_creation"};
@@ -1807,7 +1819,9 @@ TEST_CASE("prove_resume__degrade_H_pool__success", "[prove_resume]") {
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // The open's marker (27 bytes) and k0 (23) stay under 60; p0
+    // takes the file across it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 60, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
       bytecask::testing::ScopedFaultInjector fi_degrade{"io_rotate_file_creation"};
@@ -1857,7 +1871,9 @@ TEST_CASE("prove_resume__degrade_H_pool__file_creation_fails", "[prove_resume]")
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // The open's marker (27 bytes) and k0 (23) stay under 60; p0
+    // takes the file across it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 60, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
       bytecask::testing::ScopedFaultInjector fi_degrade{"io_rotate_file_creation"};
@@ -1914,7 +1930,9 @@ TEST_CASE("prove_resume__degrade_H_pool__double_resume", "[prove_resume]") {
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 30, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // The open's marker (27 bytes) and k0 (23) stay under 60; p0
+    // takes the file across it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 60, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
     {
       bytecask::testing::ScopedFaultInjector fi_degrade{"io_rotate_file_creation"};
@@ -3446,10 +3464,13 @@ TEST_CASE("prove_resume__degrade_F_batch__success", "[prove_resume]") {
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_batch: a 2-op batch commits (sync=false), so
-    // the active file holds BulkBegin(1) p0(2) p1(3) BulkEnd(4) below the
-    // failure point; then k0's commit sync fails at sequence 5. The
+    // the active file holds BulkBegin(2) p0(3) p1(4) BulkEnd(5) below the
+    // failure point; then k0's commit sync fails at sequence 6. The
     // markers consume sequences the file's bounds have to account for.
+    // The open's ChangeMarker(1) is sealed in a file of its own first,
+    // so the resumed file's first entry is a batch marker.
     auto db = bytecask::DB::open(dir);
+    (void)db.create_manifest();  // seals the open's marker alone
     {
       bytecask::WritePlan plan;
       plan.put(to_bytes("p0"), to_bytes("new0"));
@@ -3508,10 +3529,13 @@ TEST_CASE("prove_resume__degrade_F_batch__sync_fails", "[prove_resume]") {
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_batch: a 2-op batch commits (sync=false), so
-    // the active file holds BulkBegin(1) p0(2) p1(3) BulkEnd(4) below the
-    // failure point; then k0's commit sync fails at sequence 5. The
+    // the active file holds BulkBegin(2) p0(3) p1(4) BulkEnd(5) below the
+    // failure point; then k0's commit sync fails at sequence 6. The
     // markers consume sequences the file's bounds have to account for.
+    // The open's ChangeMarker(1) is sealed in a file of its own first,
+    // so the resumed file's first entry is a batch marker.
     auto db = bytecask::DB::open(dir);
+    (void)db.create_manifest();  // seals the open's marker alone
     {
       bytecask::WritePlan plan;
       plan.put(to_bytes("p0"), to_bytes("new0"));
@@ -3577,10 +3601,13 @@ TEST_CASE("prove_resume__degrade_F_batch__file_creation_fails", "[prove_resume]"
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_batch: a 2-op batch commits (sync=false), so
-    // the active file holds BulkBegin(1) p0(2) p1(3) BulkEnd(4) below the
-    // failure point; then k0's commit sync fails at sequence 5. The
+    // the active file holds BulkBegin(2) p0(3) p1(4) BulkEnd(5) below the
+    // failure point; then k0's commit sync fails at sequence 6. The
     // markers consume sequences the file's bounds have to account for.
+    // The open's ChangeMarker(1) is sealed in a file of its own first,
+    // so the resumed file's first entry is a batch marker.
     auto db = bytecask::DB::open(dir);
+    (void)db.create_manifest();  // seals the open's marker alone
     {
       bytecask::WritePlan plan;
       plan.put(to_bytes("p0"), to_bytes("new0"));
@@ -3646,10 +3673,13 @@ TEST_CASE("prove_resume__degrade_F_batch__double_resume", "[prove_resume]") {
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_batch: a 2-op batch commits (sync=false), so
-    // the active file holds BulkBegin(1) p0(2) p1(3) BulkEnd(4) below the
-    // failure point; then k0's commit sync fails at sequence 5. The
+    // the active file holds BulkBegin(2) p0(3) p1(4) BulkEnd(5) below the
+    // failure point; then k0's commit sync fails at sequence 6. The
     // markers consume sequences the file's bounds have to account for.
+    // The open's ChangeMarker(1) is sealed in a file of its own first,
+    // so the resumed file's first entry is a batch marker.
     auto db = bytecask::DB::open(dir);
+    (void)db.create_manifest();  // seals the open's marker alone
     {
       bytecask::WritePlan plan;
       plan.put(to_bytes("p0"), to_bytes("new0"));
@@ -3731,10 +3761,13 @@ TEST_CASE("prove_resume__degrade_F_batch__cascade_r2_r3", "[prove_resume]") {
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_batch: a 2-op batch commits (sync=false), so
-    // the active file holds BulkBegin(1) p0(2) p1(3) BulkEnd(4) below the
-    // failure point; then k0's commit sync fails at sequence 5. The
+    // the active file holds BulkBegin(2) p0(3) p1(4) BulkEnd(5) below the
+    // failure point; then k0's commit sync fails at sequence 6. The
     // markers consume sequences the file's bounds have to account for.
+    // The open's ChangeMarker(1) is sealed in a file of its own first,
+    // so the resumed file's first entry is a batch marker.
     auto db = bytecask::DB::open(dir);
+    (void)db.create_manifest();  // seals the open's marker alone
     {
       bytecask::WritePlan plan;
       plan.put(to_bytes("p0"), to_bytes("new0"));

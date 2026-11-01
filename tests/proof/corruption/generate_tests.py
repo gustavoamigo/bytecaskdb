@@ -51,7 +51,8 @@ def gen_setup(shape: CorruptionShape) -> List[str]:
         lines.append("      REQUIRE(db.apply_batch({.sync = true}, std::move(plan)));")
         lines.append("    }")
     else:
-        lines.append("    // Six 23-byte entries: entry i begins at 23*i.")
+        lines.append("    // The open's 27-byte ChangeMarker, then six 23-byte entries:")
+        lines.append("    // entry i begins at 27 + 23*i.")
         for i in range(6):
             lines.append(
                 f'    db.put({{.sync = true}}, to_bytes("k{i}"), to_bytes("v{i}"));'

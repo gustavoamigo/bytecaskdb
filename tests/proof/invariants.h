@@ -648,7 +648,7 @@ inline void poke_huge_value_size(const std::filesystem::path &dir,
   poke_active_file(dir, off, huge);
 }
 
-// A byte that is not a valid EntryType (valid are 0x01..0x05).
+// A byte that is not a valid EntryType (valid are 0x01..0x06).
 inline void poke_invalid_entry_type(const std::filesystem::path &dir,
                                     std::uint64_t off) {
   const std::array<unsigned char, 1> bad{0x7F};

@@ -75,7 +75,8 @@ TEST_CASE("prove_corruption__first_entry__crc", "[prove_corruption]") {
   std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
-    // Six 23-byte entries: entry i begins at 23*i.
+    // The open's 27-byte ChangeMarker, then six 23-byte entries:
+    // entry i begins at 27 + 23*i.
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -95,9 +96,9 @@ TEST_CASE("prove_corruption__first_entry__crc", "[prove_corruption]") {
     }
     REQUIRE(db.is_degraded());
 
-    // Damage the crc field of the entry at byte 0.
-    flip_byte_at(dir, 15);
-    damaged = data_file_prefix(dir, 161);
+    // Damage the crc field of the entry at byte 27.
+    flip_byte_at(dir, 42);
+    damaged = data_file_prefix(dir, 188);
 
     // No consistent state to resume into: refuse, twice, and leave
     // every byte where it was — the published extent and the
@@ -106,7 +107,7 @@ TEST_CASE("prove_corruption__first_entry__crc", "[prove_corruption]") {
       INFO("resume attempt " << attempt);
       CHECK(resume_refuses_over_damage(db));
       CHECK(db.is_degraded());
-      CHECK(data_file_prefix(dir, 161) == damaged);
+      CHECK(data_file_prefix(dir, 188) == damaged);
     }
   }
   // A cold open cannot refuse the same way: the damaged file is the
@@ -124,7 +125,7 @@ TEST_CASE("prove_corruption__first_entry__crc", "[prove_corruption]") {
     CHECK(!db.contains_key({}, to_bytes("k5")));
     CHECK(!db.contains_key({}, to_bytes("zz")));
   }
-  CHECK(std::filesystem::file_size(data) == 0u);
+  CHECK(std::filesystem::file_size(data) == 27u);
 }
 
 TEST_CASE("prove_corruption__first_entry__value_size", "[prove_corruption]") {
@@ -133,7 +134,8 @@ TEST_CASE("prove_corruption__first_entry__value_size", "[prove_corruption]") {
   std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
-    // Six 23-byte entries: entry i begins at 23*i.
+    // The open's 27-byte ChangeMarker, then six 23-byte entries:
+    // entry i begins at 27 + 23*i.
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -153,9 +155,9 @@ TEST_CASE("prove_corruption__first_entry__value_size", "[prove_corruption]") {
     }
     REQUIRE(db.is_degraded());
 
-    // Damage the value_size field of the entry at byte 0.
-    poke_huge_value_size(dir, 11);
-    damaged = data_file_prefix(dir, 161);
+    // Damage the value_size field of the entry at byte 27.
+    poke_huge_value_size(dir, 38);
+    damaged = data_file_prefix(dir, 188);
 
     // No consistent state to resume into: refuse, twice, and leave
     // every byte where it was — the published extent and the
@@ -164,7 +166,7 @@ TEST_CASE("prove_corruption__first_entry__value_size", "[prove_corruption]") {
       INFO("resume attempt " << attempt);
       CHECK(resume_refuses_over_damage(db));
       CHECK(db.is_degraded());
-      CHECK(data_file_prefix(dir, 161) == damaged);
+      CHECK(data_file_prefix(dir, 188) == damaged);
     }
   }
   // A cold open cannot refuse the same way: the damaged file is the
@@ -182,7 +184,7 @@ TEST_CASE("prove_corruption__first_entry__value_size", "[prove_corruption]") {
     CHECK(!db.contains_key({}, to_bytes("k5")));
     CHECK(!db.contains_key({}, to_bytes("zz")));
   }
-  CHECK(std::filesystem::file_size(data) == 0u);
+  CHECK(std::filesystem::file_size(data) == 27u);
 }
 
 TEST_CASE("prove_corruption__first_entry__entry_type", "[prove_corruption]") {
@@ -191,7 +193,8 @@ TEST_CASE("prove_corruption__first_entry__entry_type", "[prove_corruption]") {
   std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
-    // Six 23-byte entries: entry i begins at 23*i.
+    // The open's 27-byte ChangeMarker, then six 23-byte entries:
+    // entry i begins at 27 + 23*i.
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -211,9 +214,9 @@ TEST_CASE("prove_corruption__first_entry__entry_type", "[prove_corruption]") {
     }
     REQUIRE(db.is_degraded());
 
-    // Damage the entry_type field of the entry at byte 0.
-    poke_invalid_entry_type(dir, 8);
-    damaged = data_file_prefix(dir, 161);
+    // Damage the entry_type field of the entry at byte 27.
+    poke_invalid_entry_type(dir, 35);
+    damaged = data_file_prefix(dir, 188);
 
     // No consistent state to resume into: refuse, twice, and leave
     // every byte where it was — the published extent and the
@@ -222,7 +225,7 @@ TEST_CASE("prove_corruption__first_entry__entry_type", "[prove_corruption]") {
       INFO("resume attempt " << attempt);
       CHECK(resume_refuses_over_damage(db));
       CHECK(db.is_degraded());
-      CHECK(data_file_prefix(dir, 161) == damaged);
+      CHECK(data_file_prefix(dir, 188) == damaged);
     }
   }
   // A cold open cannot refuse the same way: the damaged file is the
@@ -240,7 +243,7 @@ TEST_CASE("prove_corruption__first_entry__entry_type", "[prove_corruption]") {
     CHECK(!db.contains_key({}, to_bytes("k5")));
     CHECK(!db.contains_key({}, to_bytes("zz")));
   }
-  CHECK(std::filesystem::file_size(data) == 0u);
+  CHECK(std::filesystem::file_size(data) == 27u);
 }
 
 TEST_CASE("prove_corruption__first_entry__sequence", "[prove_corruption]") {
@@ -249,7 +252,8 @@ TEST_CASE("prove_corruption__first_entry__sequence", "[prove_corruption]") {
   std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
-    // Six 23-byte entries: entry i begins at 23*i.
+    // The open's 27-byte ChangeMarker, then six 23-byte entries:
+    // entry i begins at 27 + 23*i.
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -269,9 +273,9 @@ TEST_CASE("prove_corruption__first_entry__sequence", "[prove_corruption]") {
     }
     REQUIRE(db.is_degraded());
 
-    // Damage the sequence field of the entry at byte 0.
-    poke_zero_sequence(dir, 0);
-    damaged = data_file_prefix(dir, 161);
+    // Damage the sequence field of the entry at byte 27.
+    poke_zero_sequence(dir, 27);
+    damaged = data_file_prefix(dir, 188);
 
     // No consistent state to resume into: refuse, twice, and leave
     // every byte where it was — the published extent and the
@@ -280,7 +284,7 @@ TEST_CASE("prove_corruption__first_entry__sequence", "[prove_corruption]") {
       INFO("resume attempt " << attempt);
       CHECK(resume_refuses_over_damage(db));
       CHECK(db.is_degraded());
-      CHECK(data_file_prefix(dir, 161) == damaged);
+      CHECK(data_file_prefix(dir, 188) == damaged);
     }
   }
   // A cold open cannot refuse the same way: the damaged file is the
@@ -298,7 +302,7 @@ TEST_CASE("prove_corruption__first_entry__sequence", "[prove_corruption]") {
     CHECK(!db.contains_key({}, to_bytes("k5")));
     CHECK(!db.contains_key({}, to_bytes("zz")));
   }
-  CHECK(std::filesystem::file_size(data) == 0u);
+  CHECK(std::filesystem::file_size(data) == 27u);
 }
 
 TEST_CASE("prove_corruption__mid_file__crc", "[prove_corruption]") {
@@ -307,7 +311,8 @@ TEST_CASE("prove_corruption__mid_file__crc", "[prove_corruption]") {
   std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
-    // Six 23-byte entries: entry i begins at 23*i.
+    // The open's 27-byte ChangeMarker, then six 23-byte entries:
+    // entry i begins at 27 + 23*i.
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -327,9 +332,9 @@ TEST_CASE("prove_corruption__mid_file__crc", "[prove_corruption]") {
     }
     REQUIRE(db.is_degraded());
 
-    // Damage the crc field of the entry at byte 46.
-    flip_byte_at(dir, 61);
-    damaged = data_file_prefix(dir, 161);
+    // Damage the crc field of the entry at byte 73.
+    flip_byte_at(dir, 88);
+    damaged = data_file_prefix(dir, 188);
 
     // No consistent state to resume into: refuse, twice, and leave
     // every byte where it was — the published extent and the
@@ -338,7 +343,7 @@ TEST_CASE("prove_corruption__mid_file__crc", "[prove_corruption]") {
       INFO("resume attempt " << attempt);
       CHECK(resume_refuses_over_damage(db));
       CHECK(db.is_degraded());
-      CHECK(data_file_prefix(dir, 161) == damaged);
+      CHECK(data_file_prefix(dir, 188) == damaged);
     }
   }
   // A cold open cannot refuse the same way: the damaged file is the
@@ -356,7 +361,7 @@ TEST_CASE("prove_corruption__mid_file__crc", "[prove_corruption]") {
     CHECK(!db.contains_key({}, to_bytes("k5")));
     CHECK(!db.contains_key({}, to_bytes("zz")));
   }
-  CHECK(std::filesystem::file_size(data) == 46u);
+  CHECK(std::filesystem::file_size(data) == 73u);
 }
 
 TEST_CASE("prove_corruption__mid_file__value_size", "[prove_corruption]") {
@@ -365,7 +370,8 @@ TEST_CASE("prove_corruption__mid_file__value_size", "[prove_corruption]") {
   std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
-    // Six 23-byte entries: entry i begins at 23*i.
+    // The open's 27-byte ChangeMarker, then six 23-byte entries:
+    // entry i begins at 27 + 23*i.
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -385,9 +391,9 @@ TEST_CASE("prove_corruption__mid_file__value_size", "[prove_corruption]") {
     }
     REQUIRE(db.is_degraded());
 
-    // Damage the value_size field of the entry at byte 46.
-    poke_huge_value_size(dir, 57);
-    damaged = data_file_prefix(dir, 161);
+    // Damage the value_size field of the entry at byte 73.
+    poke_huge_value_size(dir, 84);
+    damaged = data_file_prefix(dir, 188);
 
     // No consistent state to resume into: refuse, twice, and leave
     // every byte where it was — the published extent and the
@@ -396,7 +402,7 @@ TEST_CASE("prove_corruption__mid_file__value_size", "[prove_corruption]") {
       INFO("resume attempt " << attempt);
       CHECK(resume_refuses_over_damage(db));
       CHECK(db.is_degraded());
-      CHECK(data_file_prefix(dir, 161) == damaged);
+      CHECK(data_file_prefix(dir, 188) == damaged);
     }
   }
   // A cold open cannot refuse the same way: the damaged file is the
@@ -414,7 +420,7 @@ TEST_CASE("prove_corruption__mid_file__value_size", "[prove_corruption]") {
     CHECK(!db.contains_key({}, to_bytes("k5")));
     CHECK(!db.contains_key({}, to_bytes("zz")));
   }
-  CHECK(std::filesystem::file_size(data) == 46u);
+  CHECK(std::filesystem::file_size(data) == 73u);
 }
 
 TEST_CASE("prove_corruption__mid_file__entry_type", "[prove_corruption]") {
@@ -423,7 +429,8 @@ TEST_CASE("prove_corruption__mid_file__entry_type", "[prove_corruption]") {
   std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
-    // Six 23-byte entries: entry i begins at 23*i.
+    // The open's 27-byte ChangeMarker, then six 23-byte entries:
+    // entry i begins at 27 + 23*i.
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -443,9 +450,9 @@ TEST_CASE("prove_corruption__mid_file__entry_type", "[prove_corruption]") {
     }
     REQUIRE(db.is_degraded());
 
-    // Damage the entry_type field of the entry at byte 46.
-    poke_invalid_entry_type(dir, 54);
-    damaged = data_file_prefix(dir, 161);
+    // Damage the entry_type field of the entry at byte 73.
+    poke_invalid_entry_type(dir, 81);
+    damaged = data_file_prefix(dir, 188);
 
     // No consistent state to resume into: refuse, twice, and leave
     // every byte where it was — the published extent and the
@@ -454,7 +461,7 @@ TEST_CASE("prove_corruption__mid_file__entry_type", "[prove_corruption]") {
       INFO("resume attempt " << attempt);
       CHECK(resume_refuses_over_damage(db));
       CHECK(db.is_degraded());
-      CHECK(data_file_prefix(dir, 161) == damaged);
+      CHECK(data_file_prefix(dir, 188) == damaged);
     }
   }
   // A cold open cannot refuse the same way: the damaged file is the
@@ -472,7 +479,7 @@ TEST_CASE("prove_corruption__mid_file__entry_type", "[prove_corruption]") {
     CHECK(!db.contains_key({}, to_bytes("k5")));
     CHECK(!db.contains_key({}, to_bytes("zz")));
   }
-  CHECK(std::filesystem::file_size(data) == 46u);
+  CHECK(std::filesystem::file_size(data) == 73u);
 }
 
 TEST_CASE("prove_corruption__mid_file__sequence", "[prove_corruption]") {
@@ -481,7 +488,8 @@ TEST_CASE("prove_corruption__mid_file__sequence", "[prove_corruption]") {
   std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
-    // Six 23-byte entries: entry i begins at 23*i.
+    // The open's 27-byte ChangeMarker, then six 23-byte entries:
+    // entry i begins at 27 + 23*i.
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -501,9 +509,9 @@ TEST_CASE("prove_corruption__mid_file__sequence", "[prove_corruption]") {
     }
     REQUIRE(db.is_degraded());
 
-    // Damage the sequence field of the entry at byte 46.
-    poke_zero_sequence(dir, 46);
-    damaged = data_file_prefix(dir, 161);
+    // Damage the sequence field of the entry at byte 73.
+    poke_zero_sequence(dir, 73);
+    damaged = data_file_prefix(dir, 188);
 
     // No consistent state to resume into: refuse, twice, and leave
     // every byte where it was — the published extent and the
@@ -512,7 +520,7 @@ TEST_CASE("prove_corruption__mid_file__sequence", "[prove_corruption]") {
       INFO("resume attempt " << attempt);
       CHECK(resume_refuses_over_damage(db));
       CHECK(db.is_degraded());
-      CHECK(data_file_prefix(dir, 161) == damaged);
+      CHECK(data_file_prefix(dir, 188) == damaged);
     }
   }
   // A cold open cannot refuse the same way: the damaged file is the
@@ -530,7 +538,7 @@ TEST_CASE("prove_corruption__mid_file__sequence", "[prove_corruption]") {
     CHECK(!db.contains_key({}, to_bytes("k5")));
     CHECK(!db.contains_key({}, to_bytes("zz")));
   }
-  CHECK(std::filesystem::file_size(data) == 46u);
+  CHECK(std::filesystem::file_size(data) == 73u);
 }
 
 TEST_CASE("prove_corruption__last_entry__crc", "[prove_corruption]") {
@@ -539,7 +547,8 @@ TEST_CASE("prove_corruption__last_entry__crc", "[prove_corruption]") {
   std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
-    // Six 23-byte entries: entry i begins at 23*i.
+    // The open's 27-byte ChangeMarker, then six 23-byte entries:
+    // entry i begins at 27 + 23*i.
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -559,9 +568,9 @@ TEST_CASE("prove_corruption__last_entry__crc", "[prove_corruption]") {
     }
     REQUIRE(db.is_degraded());
 
-    // Damage the crc field of the entry at byte 115.
-    flip_byte_at(dir, 130);
-    damaged = data_file_prefix(dir, 161);
+    // Damage the crc field of the entry at byte 142.
+    flip_byte_at(dir, 157);
+    damaged = data_file_prefix(dir, 188);
 
     // No consistent state to resume into: refuse, twice, and leave
     // every byte where it was — the published extent and the
@@ -570,7 +579,7 @@ TEST_CASE("prove_corruption__last_entry__crc", "[prove_corruption]") {
       INFO("resume attempt " << attempt);
       CHECK(resume_refuses_over_damage(db));
       CHECK(db.is_degraded());
-      CHECK(data_file_prefix(dir, 161) == damaged);
+      CHECK(data_file_prefix(dir, 188) == damaged);
     }
   }
   // A cold open cannot refuse the same way: the damaged file is the
@@ -588,7 +597,7 @@ TEST_CASE("prove_corruption__last_entry__crc", "[prove_corruption]") {
     CHECK(!db.contains_key({}, to_bytes("k5")));
     CHECK(!db.contains_key({}, to_bytes("zz")));
   }
-  CHECK(std::filesystem::file_size(data) == 115u);
+  CHECK(std::filesystem::file_size(data) == 142u);
 }
 
 TEST_CASE("prove_corruption__last_entry__value_size", "[prove_corruption]") {
@@ -597,7 +606,8 @@ TEST_CASE("prove_corruption__last_entry__value_size", "[prove_corruption]") {
   std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
-    // Six 23-byte entries: entry i begins at 23*i.
+    // The open's 27-byte ChangeMarker, then six 23-byte entries:
+    // entry i begins at 27 + 23*i.
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -617,9 +627,9 @@ TEST_CASE("prove_corruption__last_entry__value_size", "[prove_corruption]") {
     }
     REQUIRE(db.is_degraded());
 
-    // Damage the value_size field of the entry at byte 115.
-    poke_huge_value_size(dir, 126);
-    damaged = data_file_prefix(dir, 161);
+    // Damage the value_size field of the entry at byte 142.
+    poke_huge_value_size(dir, 153);
+    damaged = data_file_prefix(dir, 188);
 
     // No consistent state to resume into: refuse, twice, and leave
     // every byte where it was — the published extent and the
@@ -628,7 +638,7 @@ TEST_CASE("prove_corruption__last_entry__value_size", "[prove_corruption]") {
       INFO("resume attempt " << attempt);
       CHECK(resume_refuses_over_damage(db));
       CHECK(db.is_degraded());
-      CHECK(data_file_prefix(dir, 161) == damaged);
+      CHECK(data_file_prefix(dir, 188) == damaged);
     }
   }
   // A cold open cannot refuse the same way: the damaged file is the
@@ -646,7 +656,7 @@ TEST_CASE("prove_corruption__last_entry__value_size", "[prove_corruption]") {
     CHECK(!db.contains_key({}, to_bytes("k5")));
     CHECK(!db.contains_key({}, to_bytes("zz")));
   }
-  CHECK(std::filesystem::file_size(data) == 115u);
+  CHECK(std::filesystem::file_size(data) == 142u);
 }
 
 TEST_CASE("prove_corruption__last_entry__entry_type", "[prove_corruption]") {
@@ -655,7 +665,8 @@ TEST_CASE("prove_corruption__last_entry__entry_type", "[prove_corruption]") {
   std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
-    // Six 23-byte entries: entry i begins at 23*i.
+    // The open's 27-byte ChangeMarker, then six 23-byte entries:
+    // entry i begins at 27 + 23*i.
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -675,9 +686,9 @@ TEST_CASE("prove_corruption__last_entry__entry_type", "[prove_corruption]") {
     }
     REQUIRE(db.is_degraded());
 
-    // Damage the entry_type field of the entry at byte 115.
-    poke_invalid_entry_type(dir, 123);
-    damaged = data_file_prefix(dir, 161);
+    // Damage the entry_type field of the entry at byte 142.
+    poke_invalid_entry_type(dir, 150);
+    damaged = data_file_prefix(dir, 188);
 
     // No consistent state to resume into: refuse, twice, and leave
     // every byte where it was — the published extent and the
@@ -686,7 +697,7 @@ TEST_CASE("prove_corruption__last_entry__entry_type", "[prove_corruption]") {
       INFO("resume attempt " << attempt);
       CHECK(resume_refuses_over_damage(db));
       CHECK(db.is_degraded());
-      CHECK(data_file_prefix(dir, 161) == damaged);
+      CHECK(data_file_prefix(dir, 188) == damaged);
     }
   }
   // A cold open cannot refuse the same way: the damaged file is the
@@ -704,7 +715,7 @@ TEST_CASE("prove_corruption__last_entry__entry_type", "[prove_corruption]") {
     CHECK(!db.contains_key({}, to_bytes("k5")));
     CHECK(!db.contains_key({}, to_bytes("zz")));
   }
-  CHECK(std::filesystem::file_size(data) == 115u);
+  CHECK(std::filesystem::file_size(data) == 142u);
 }
 
 TEST_CASE("prove_corruption__last_entry__sequence", "[prove_corruption]") {
@@ -713,7 +724,8 @@ TEST_CASE("prove_corruption__last_entry__sequence", "[prove_corruption]") {
   std::vector<char> damaged;
   {
     auto db = bytecask::DB::open(dir);
-    // Six 23-byte entries: entry i begins at 23*i.
+    // The open's 27-byte ChangeMarker, then six 23-byte entries:
+    // entry i begins at 27 + 23*i.
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -733,9 +745,9 @@ TEST_CASE("prove_corruption__last_entry__sequence", "[prove_corruption]") {
     }
     REQUIRE(db.is_degraded());
 
-    // Damage the sequence field of the entry at byte 115.
-    poke_zero_sequence(dir, 115);
-    damaged = data_file_prefix(dir, 161);
+    // Damage the sequence field of the entry at byte 142.
+    poke_zero_sequence(dir, 142);
+    damaged = data_file_prefix(dir, 188);
 
     // No consistent state to resume into: refuse, twice, and leave
     // every byte where it was — the published extent and the
@@ -744,7 +756,7 @@ TEST_CASE("prove_corruption__last_entry__sequence", "[prove_corruption]") {
       INFO("resume attempt " << attempt);
       CHECK(resume_refuses_over_damage(db));
       CHECK(db.is_degraded());
-      CHECK(data_file_prefix(dir, 161) == damaged);
+      CHECK(data_file_prefix(dir, 188) == damaged);
     }
   }
   // A cold open cannot refuse the same way: the damaged file is the
@@ -762,7 +774,7 @@ TEST_CASE("prove_corruption__last_entry__sequence", "[prove_corruption]") {
     CHECK(!db.contains_key({}, to_bytes("k5")));
     CHECK(!db.contains_key({}, to_bytes("zz")));
   }
-  CHECK(std::filesystem::file_size(data) == 115u);
+  CHECK(std::filesystem::file_size(data) == 142u);
 }
 
 TEST_CASE("prove_corruption__inside_batch__crc", "[prove_corruption]") {
@@ -794,9 +806,9 @@ TEST_CASE("prove_corruption__inside_batch__crc", "[prove_corruption]") {
     }
     REQUIRE(db.is_degraded());
 
-    // Damage the crc field of the entry at byte 65.
-    flip_byte_at(dir, 80);
-    damaged = data_file_prefix(dir, 153);
+    // Damage the crc field of the entry at byte 92.
+    flip_byte_at(dir, 107);
+    damaged = data_file_prefix(dir, 180);
 
     // No consistent state to resume into: refuse, twice, and leave
     // every byte where it was — the published extent and the
@@ -805,7 +817,7 @@ TEST_CASE("prove_corruption__inside_batch__crc", "[prove_corruption]") {
       INFO("resume attempt " << attempt);
       CHECK(resume_refuses_over_damage(db));
       CHECK(db.is_degraded());
-      CHECK(data_file_prefix(dir, 153) == damaged);
+      CHECK(data_file_prefix(dir, 180) == damaged);
     }
   }
   // A cold open cannot refuse the same way: the damaged file is the
@@ -821,7 +833,7 @@ TEST_CASE("prove_corruption__inside_batch__crc", "[prove_corruption]") {
     CHECK(!db.contains_key({}, to_bytes("b1")));
     CHECK(!db.contains_key({}, to_bytes("zz")));
   }
-  CHECK(std::filesystem::file_size(data) == 46u);
+  CHECK(std::filesystem::file_size(data) == 73u);
 }
 
 TEST_CASE("prove_corruption__inside_batch__value_size", "[prove_corruption]") {
@@ -853,9 +865,9 @@ TEST_CASE("prove_corruption__inside_batch__value_size", "[prove_corruption]") {
     }
     REQUIRE(db.is_degraded());
 
-    // Damage the value_size field of the entry at byte 65.
-    poke_huge_value_size(dir, 76);
-    damaged = data_file_prefix(dir, 153);
+    // Damage the value_size field of the entry at byte 92.
+    poke_huge_value_size(dir, 103);
+    damaged = data_file_prefix(dir, 180);
 
     // No consistent state to resume into: refuse, twice, and leave
     // every byte where it was — the published extent and the
@@ -864,7 +876,7 @@ TEST_CASE("prove_corruption__inside_batch__value_size", "[prove_corruption]") {
       INFO("resume attempt " << attempt);
       CHECK(resume_refuses_over_damage(db));
       CHECK(db.is_degraded());
-      CHECK(data_file_prefix(dir, 153) == damaged);
+      CHECK(data_file_prefix(dir, 180) == damaged);
     }
   }
   // A cold open cannot refuse the same way: the damaged file is the
@@ -880,7 +892,7 @@ TEST_CASE("prove_corruption__inside_batch__value_size", "[prove_corruption]") {
     CHECK(!db.contains_key({}, to_bytes("b1")));
     CHECK(!db.contains_key({}, to_bytes("zz")));
   }
-  CHECK(std::filesystem::file_size(data) == 46u);
+  CHECK(std::filesystem::file_size(data) == 73u);
 }
 
 TEST_CASE("prove_corruption__inside_batch__entry_type", "[prove_corruption]") {
@@ -912,9 +924,9 @@ TEST_CASE("prove_corruption__inside_batch__entry_type", "[prove_corruption]") {
     }
     REQUIRE(db.is_degraded());
 
-    // Damage the entry_type field of the entry at byte 65.
-    poke_invalid_entry_type(dir, 73);
-    damaged = data_file_prefix(dir, 153);
+    // Damage the entry_type field of the entry at byte 92.
+    poke_invalid_entry_type(dir, 100);
+    damaged = data_file_prefix(dir, 180);
 
     // No consistent state to resume into: refuse, twice, and leave
     // every byte where it was — the published extent and the
@@ -923,7 +935,7 @@ TEST_CASE("prove_corruption__inside_batch__entry_type", "[prove_corruption]") {
       INFO("resume attempt " << attempt);
       CHECK(resume_refuses_over_damage(db));
       CHECK(db.is_degraded());
-      CHECK(data_file_prefix(dir, 153) == damaged);
+      CHECK(data_file_prefix(dir, 180) == damaged);
     }
   }
   // A cold open cannot refuse the same way: the damaged file is the
@@ -939,7 +951,7 @@ TEST_CASE("prove_corruption__inside_batch__entry_type", "[prove_corruption]") {
     CHECK(!db.contains_key({}, to_bytes("b1")));
     CHECK(!db.contains_key({}, to_bytes("zz")));
   }
-  CHECK(std::filesystem::file_size(data) == 46u);
+  CHECK(std::filesystem::file_size(data) == 73u);
 }
 
 TEST_CASE("prove_corruption__inside_batch__sequence", "[prove_corruption]") {
@@ -971,9 +983,9 @@ TEST_CASE("prove_corruption__inside_batch__sequence", "[prove_corruption]") {
     }
     REQUIRE(db.is_degraded());
 
-    // Damage the sequence field of the entry at byte 65.
-    poke_zero_sequence(dir, 65);
-    damaged = data_file_prefix(dir, 153);
+    // Damage the sequence field of the entry at byte 92.
+    poke_zero_sequence(dir, 92);
+    damaged = data_file_prefix(dir, 180);
 
     // No consistent state to resume into: refuse, twice, and leave
     // every byte where it was — the published extent and the
@@ -982,7 +994,7 @@ TEST_CASE("prove_corruption__inside_batch__sequence", "[prove_corruption]") {
       INFO("resume attempt " << attempt);
       CHECK(resume_refuses_over_damage(db));
       CHECK(db.is_degraded());
-      CHECK(data_file_prefix(dir, 153) == damaged);
+      CHECK(data_file_prefix(dir, 180) == damaged);
     }
   }
   // A cold open cannot refuse the same way: the damaged file is the
@@ -998,5 +1010,5 @@ TEST_CASE("prove_corruption__inside_batch__sequence", "[prove_corruption]") {
     CHECK(!db.contains_key({}, to_bytes("b1")));
     CHECK(!db.contains_key({}, to_bytes("zz")));
   }
-  CHECK(std::filesystem::file_size(data) == 46u);
+  CHECK(std::filesystem::file_size(data) == 73u);
 }

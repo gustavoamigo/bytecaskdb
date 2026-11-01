@@ -1758,7 +1758,7 @@ TEST_CASE("prove_recovery__damaged_hint__success__t1", "[prove_recovery]") {
   TempDir td;
   auto dir = td.path / "db";
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -1771,7 +1771,7 @@ TEST_CASE("prove_recovery__damaged_hint__success__t1", "[prove_recovery]") {
   REQUIRE(corrupt_newest_hint(dir));
 
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .recovery_threads = 1});
     CHECK_FALSE(db.is_degraded());
     {
       bytecask::Bytes out;
@@ -1817,7 +1817,7 @@ TEST_CASE("prove_recovery__damaged_hint__success__t4", "[prove_recovery]") {
   TempDir td;
   auto dir = td.path / "db";
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -1830,7 +1830,7 @@ TEST_CASE("prove_recovery__damaged_hint__success__t4", "[prove_recovery]") {
   REQUIRE(corrupt_newest_hint(dir));
 
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .recovery_threads = 4});
     CHECK_FALSE(db.is_degraded());
     {
       bytecask::Bytes out;
@@ -1876,7 +1876,7 @@ TEST_CASE("prove_recovery__damaged_hint__hint_write_fails__t1", "[prove_recovery
   TempDir td;
   auto dir = td.path / "db";
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -1892,14 +1892,14 @@ TEST_CASE("prove_recovery__damaged_hint__hint_write_fails__t1", "[prove_recovery
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
-    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}),
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 150, .recovery_threads = 1}),
                       std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
   // failure cost recovery time and must have cost no keys.
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .recovery_threads = 1});
     CHECK_FALSE(db.is_degraded());
     {
       bytecask::Bytes out;
@@ -1945,7 +1945,7 @@ TEST_CASE("prove_recovery__damaged_hint__hint_write_fails__t4", "[prove_recovery
   TempDir td;
   auto dir = td.path / "db";
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -1961,14 +1961,14 @@ TEST_CASE("prove_recovery__damaged_hint__hint_write_fails__t4", "[prove_recovery
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
-    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}),
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 150, .recovery_threads = 4}),
                       std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
   // failure cost recovery time and must have cost no keys.
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .recovery_threads = 4});
     CHECK_FALSE(db.is_degraded());
     {
       bytecask::Bytes out;
@@ -2014,7 +2014,7 @@ TEST_CASE("prove_recovery__damaged_hint__hint_sync_fails__t1", "[prove_recovery]
   TempDir td;
   auto dir = td.path / "db";
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -2030,14 +2030,14 @@ TEST_CASE("prove_recovery__damaged_hint__hint_sync_fails__t1", "[prove_recovery]
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
-    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}),
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 150, .recovery_threads = 1}),
                       std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
   // failure cost recovery time and must have cost no keys.
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .recovery_threads = 1});
     CHECK_FALSE(db.is_degraded());
     {
       bytecask::Bytes out;
@@ -2083,7 +2083,7 @@ TEST_CASE("prove_recovery__damaged_hint__hint_sync_fails__t4", "[prove_recovery]
   TempDir td;
   auto dir = td.path / "db";
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -2099,14 +2099,14 @@ TEST_CASE("prove_recovery__damaged_hint__hint_sync_fails__t4", "[prove_recovery]
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
-    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}),
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 150, .recovery_threads = 4}),
                       std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
   // failure cost recovery time and must have cost no keys.
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .recovery_threads = 4});
     CHECK_FALSE(db.is_degraded());
     {
       bytecask::Bytes out;
@@ -2152,7 +2152,7 @@ TEST_CASE("prove_recovery__damaged_hint__hint_rename_fails__t1", "[prove_recover
   TempDir td;
   auto dir = td.path / "db";
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -2168,14 +2168,14 @@ TEST_CASE("prove_recovery__damaged_hint__hint_rename_fails__t1", "[prove_recover
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
-    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}),
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 150, .recovery_threads = 1}),
                       std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
   // failure cost recovery time and must have cost no keys.
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .recovery_threads = 1});
     CHECK_FALSE(db.is_degraded());
     {
       bytecask::Bytes out;
@@ -2221,7 +2221,7 @@ TEST_CASE("prove_recovery__damaged_hint__hint_rename_fails__t4", "[prove_recover
   TempDir td;
   auto dir = td.path / "db";
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -2237,14 +2237,14 @@ TEST_CASE("prove_recovery__damaged_hint__hint_rename_fails__t4", "[prove_recover
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
-    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}),
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 150, .recovery_threads = 4}),
                       std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
   // failure cost recovery time and must have cost no keys.
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .recovery_threads = 4});
     CHECK_FALSE(db.is_degraded());
     {
       bytecask::Bytes out;
@@ -2290,7 +2290,7 @@ TEST_CASE("prove_recovery__damaged_hint__hint_read_fails_while_verified__t1", "[
   TempDir td;
   auto dir = td.path / "db";
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -2313,7 +2313,7 @@ TEST_CASE("prove_recovery__damaged_hint__hint_read_fails_while_verified__t1", "[
     fi.inj.fail_on_nth_match = fail_on;
     const auto hint = first_hint_of(dir);
     const auto replaced = hint_identity(hint);
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .recovery_threads = 1});
     REQUIRE(fi.inj.name_matches >= fail_on);
     // Where a hint stood before the open the rebuild replaced it —
     // a hint that cannot be read is removed and its data file
@@ -2364,7 +2364,7 @@ TEST_CASE("prove_recovery__damaged_hint__hint_read_fails_while_verified__t1", "[
   // The fault clears. A hint is an index, not the record: the
   // failure cost recovery time and must have cost no keys.
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .recovery_threads = 1});
     CHECK_FALSE(db.is_degraded());
     {
       bytecask::Bytes out;
@@ -2410,7 +2410,7 @@ TEST_CASE("prove_recovery__damaged_hint__hint_read_fails_during_scan__t1", "[pro
   TempDir td;
   auto dir = td.path / "db";
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -2429,10 +2429,10 @@ TEST_CASE("prove_recovery__damaged_hint__hint_read_fails_during_scan__t1", "[pro
   // those that open the first hint with anything to scan is a read
   // of its scan.
   {
-    const int fail_on = first_hint_scan_read(dir, {.max_file_bytes = 120, .recovery_threads = 1});
+    const int fail_on = first_hint_scan_read(dir, {.max_file_bytes = 150, .recovery_threads = 1});
     bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
     fi.inj.fail_on_nth_match = fail_on;
-    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}),
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 150, .recovery_threads = 1}),
                       std::system_error);
     REQUIRE(fi.inj.name_matches >= fail_on);
   }
@@ -2444,10 +2444,10 @@ TEST_CASE("prove_recovery__damaged_hint__hint_read_fails_during_scan__t1", "[pro
   // open in every mode. So an open that throws here says the
   // fault went where this cell says it did.
   {
-    const int fail_on = first_hint_scan_read(dir, {.max_file_bytes = 120, .recovery_threads = 1, .fail_recovery_on_crc_errors = false});
+    const int fail_on = first_hint_scan_read(dir, {.max_file_bytes = 150, .recovery_threads = 1, .fail_recovery_on_crc_errors = false});
     bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
     fi.inj.fail_on_nth_match = fail_on;
-    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1, .fail_recovery_on_crc_errors = false}),
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 150, .recovery_threads = 1, .fail_recovery_on_crc_errors = false}),
                       std::system_error);
     REQUIRE(fi.inj.name_matches >= fail_on);
   }
@@ -2455,7 +2455,7 @@ TEST_CASE("prove_recovery__damaged_hint__hint_read_fails_during_scan__t1", "[pro
   // The fault clears. A hint is an index, not the record: the
   // failure cost recovery time and must have cost no keys.
   {
-    auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1});
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .recovery_threads = 1});
     CHECK_FALSE(db.is_degraded());
     {
       bytecask::Bytes out;
