@@ -3218,6 +3218,102 @@ bool bc_bytes_prefix(bc_ctx* cx, bc_view prefix, bc_view b) {
   return {};
 }
 
+namespace {
+
+// The bytes of the UTF-8 character at s[i]: 1 for a byte that starts none,
+// which a TEXT, checked as UTF-8 when written or bound, does not hold.
+auto char_len(BytesView s, std::size_t i) -> std::size_t {
+  auto b = std::to_integer<unsigned>(s[i]);
+  std::size_t n = b < 0x80 ? 1 : b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1;
+  return std::min(n, s.size() - i);
+}
+
+// The code point of the n-byte UTF-8 character at s[i].
+auto code_point(BytesView s, std::size_t i, std::size_t n) -> std::int32_t {
+  auto b = std::to_integer<std::int32_t>(s[i]);
+  if (n == 1) return b;
+  std::int32_t cp = b & (0x7F >> n);
+  for (std::size_t k = 1; k < n; ++k) cp = (cp << 6) | (std::to_integer<std::int32_t>(s[i + k]) & 0x3F);
+  return cp;
+}
+
+enum class Like { Match, NoMatch, BadPattern };
+
+// PostgreSQL's LIKE (MatchText) of UTF-8 text, case-sensitive: % matches
+// any run of characters, _ one, the escape the character after it as
+// written, and any other character itself, byte for byte. Greedy, with one
+// backtrack point: the last %, which absorbs one more character of the
+// text at each retry. No allocation. An escape the match reaches with
+// nothing after it is a bad pattern, as PostgreSQL raises it only when its
+// match gets there.
+auto like(BytesView s, BytesView p, std::int32_t escape) -> Like {
+  struct Token {
+    enum class Kind { Any, One, Literal } kind;
+    std::size_t at, len;   // the token in p: its bytes
+    std::size_t lit, n;    // a literal's bytes in p
+  };
+  auto token = [&](std::size_t i) -> std::optional<Token> {
+    auto n = char_len(p, i);
+    auto cp = code_point(p, i, n);
+    if (escape >= 0 && cp == escape) {
+      if (i + n >= p.size()) return std::nullopt;
+      auto m = char_len(p, i + n);
+      return Token{Token::Kind::Literal, i, n + m, i + n, m};
+    }
+    if (cp == '%') return Token{Token::Kind::Any, i, n, 0, 0};
+    if (cp == '_') return Token{Token::Kind::One, i, n, 0, 0};
+    return Token{Token::Kind::Literal, i, n, i, n};
+  };
+  std::size_t si = 0, pi = 0;
+  std::optional<std::size_t> star_p, star_s;
+  while (si < s.size()) {
+    if (pi < p.size()) {
+      auto t = token(pi);
+      if (!t) return Like::BadPattern;
+      if (t->kind == Token::Kind::Any) {
+        pi += t->len;
+        star_p = pi;
+        star_s = si;
+        continue;
+      }
+      if (t->kind == Token::Kind::One) {
+        si += char_len(s, si);
+        pi += t->len;
+        continue;
+      }
+      if (si + t->n <= s.size() && std::ranges::equal(s.subspan(si, t->n), p.subspan(t->lit, t->n))) {
+        si += t->n;
+        pi += t->len;
+        continue;
+      }
+    }
+    if (!star_p) return Like::NoMatch;
+    *star_s += char_len(s, *star_s);
+    si = *star_s;
+    pi = *star_p;
+  }
+  // The text is done: what is left of the pattern must be %s alone.
+  while (pi < p.size() && std::to_integer<char>(p[pi]) == '%') ++pi;
+  return pi == p.size() ? Like::Match : Like::NoMatch;
+}
+
+}  // namespace
+
+bool bc_like(bc_ctx* cx, bc_view text, bc_view pattern, int32_t escape) {
+  BC_GUARD_BEGIN
+  auto v = cx->resolve2(text, pattern);
+  if (!v) return false;
+  switch (like(v->first, v->second, escape)) {
+    case Like::Match: return true;
+    case Like::NoMatch: return false;
+    case Like::BadPattern:
+      cx->fail(BC_E_PATTERN, "LIKE pattern must not end with escape character");
+      return false;
+  }
+  BC_GUARD_END(cx)
+  return {};
+}
+
 // ---------------------------------------------------------------------- keys
 
 bc_key bc_key_begin(bc_ctx* cx, uint32_t table_or_index) {

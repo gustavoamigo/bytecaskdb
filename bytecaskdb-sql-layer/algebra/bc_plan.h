@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
    Copyright (c) 2026 Gustavo Amigo
 
-   bc_plan.h — the plan API of docs/plan_api_design.md (revision 7). A plan is
+   bc_plan.h — the plan API of docs/plan_api_design.md (revision 10). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
    and bc_params are opaque here and built by the runtime
@@ -54,6 +54,7 @@ enum bc_error_code {
   BC_E_CLOSED,
   BC_E_UNKNOWN,     /* a commit failed and degraded the engine: its batch may have reached the data
                        file, so its outcome is unknown, never "nothing written" (SQLSTATE 08007) */
+  BC_E_PATTERN,     /* bc_like reached a pattern's escape character at its end (SQLSTATE 22025) */
 };
 
 enum bc_scan_flags {
@@ -208,6 +209,10 @@ double  bc_i64_to_f64(int64_t);                 /* always defined */
 bool    bc_bytes_eq(bc_ctx *, bc_view, bc_view);
 int     bc_bytes_cmp(bc_ctx *, bc_view, bc_view);       /* memcmp order */
 bool    bc_bytes_prefix(bc_ctx *, bc_view prefix, bc_view);
+bool    bc_like(bc_ctx *, bc_view text, bc_view pattern, int32_t escape);  /* PostgreSQL's LIKE of UTF-8 text:
+                                                   _ one character, % any run, the escape (a code point, -1 for
+                                                   none) quoting the next; an escape it reaches at the pattern's
+                                                   end is BC_E_PATTERN */
 
 /* Keys */
 bc_key   bc_key_begin(bc_ctx *, uint32_t table_or_index);

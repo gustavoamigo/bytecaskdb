@@ -520,6 +520,12 @@ private:
         return out;
       }
       case Expr::Kind::IsNull: return (want ? "" : "!") + col_null(e.args[0].col);  // never unknown
+      case Expr::Kind::Like: {
+        const auto& col = e.args[0].col;
+        auto p = e.args[1].param;
+        auto match = "bc_like(cx, " + read_col(col) + ", " + param(PhysType::Bytes, p) + ", " + std::to_string(e.constant) + ")";
+        return "!(" + col_null(col) + " || " + param_null(p) + ") && " + (want ? "" : "!") + match;
+      }
       case Expr::Kind::Const: return (e.constant != 0) == want ? "1" : "0";
       case Expr::Kind::Compare: {
         auto [null, cmp] = comparison(e);
@@ -560,7 +566,8 @@ private:
       case Expr::Kind::And:
       case Expr::Kind::Or:
       case Expr::Kind::Not:
-      case Expr::Kind::IsNull: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
+      case Expr::Kind::IsNull:
+      case Expr::Kind::Like: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
     }
     auto col = read_col(lhs);
     // Text and bytes compare as bytes: COLLATE "C".
