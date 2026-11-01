@@ -209,8 +209,10 @@ def test_markers_accumulate_across_promotions_and_survive_reopen(tmp_path):
     a.put(b"k", b"3")
     catch_up(a, b)
     expected = markers(a)
-    assert [m.since_sequence for m in expected] == [2, 4] and markers(b) == expected
-    assert marker_at(a, 1) == ORIGIN and marker_at(a, 3) == expected[0] and marker_at(a, 4) == expected[1]
+    # a's open at 1, b's promotion at 3, a's promotion at 5.
+    assert [m.since_sequence for m in expected] == [1, 3, 5] and markers(b) == expected
+    assert marker_at(a, 0) == ORIGIN and marker_at(a, 2) == expected[0]
+    assert marker_at(a, 4) == expected[1] and marker_at(a, 5) == expected[2]
     durable = a.durable_sequence()
     assert b.durable_sequence() == durable
     for db, name in ((a, "a"), (b, "b")):
@@ -243,7 +245,7 @@ def test_a_follower_whose_writes_stopped_cannot_be_promoted(tmp_path, monkeypatc
     with pytest.raises(ref.DbDegraded):
         follower.close()
     with open_follower(tmp_path / "follower") as follower:  # the slice is there whole or not at all
-        assert markers(follower) == [] and follower.durable_sequence() in (0, 1)
+        assert (markers(follower), follower.durable_sequence()) in (([], 0), (markers(leader), 2))
     leader.close()
 
 
@@ -261,12 +263,16 @@ def test_a_promotion_whose_sync_fails_leaves_the_mode(tmp_path, monkeypatch):
     assert follower.mode is Mode.Follower and follower.is_degraded
     with pytest.raises(ref.DbDegraded):
         follower.close()
-    # The marker may or may not have reached the disk; a reopen in Leader mode adds none.
-    with ref.DB.open(tmp_path / "f") as reopened:
+    # The marker may or may not have reached the disk; a reopen in Follower mode adds none.
+    with open_follower(tmp_path / "f") as reopened:
         found = markers(reopened)
         assert len(found) <= 1
-        reopened.put(b"a", b"1")
-        assert markers(reopened) == found
+    # A reopen in Leader mode adds its own, and writes go on after it.
+    with ref.DB.open(tmp_path / "f") as reopened:
+        *kept, opened = markers(reopened)
+        assert kept == found and opened not in found
+        assert reopened.put(b"a", b"1").sequence == opened.since_sequence + 1
+        assert markers(reopened) == found + [opened]
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +284,7 @@ def test_a_gap_is_refused_before_anything_is_written(tmp_path):
     leader = ref.DB.open(tmp_path / "leader")
     for i in range(5):
         leader.put(bytes([97 + i]), b"v", NO_SYNC)
-    leader.put(b"z", b"v")  # 6 entries, all durable
+    leader.put(b"z", b"v")  # 7 entries with the open's marker, all durable
     follower = open_follower(tmp_path / "follower")
     replicate(leader, follower, max_bytes=1)  # one unit per slice
     replicate(leader, follower, max_bytes=1)
