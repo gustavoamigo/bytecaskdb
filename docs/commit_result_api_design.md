@@ -103,7 +103,8 @@ public:
 
   // A value iff the plan committed. PlanRefusal::Conflict: a guard failed or
   // the implicit W-W check detected a conflict; PlanRefusal::TooOld: the read
-  // sequence is too old to check — nothing was written either way.
+  // point cannot be checked here (another history, past the latest, or
+  // deletes the log no longer holds) — nothing was written either way.
   // An empty plan returns {sequence = 0, durable = true}.
   // A guard-only plan that passes returns {sequence = 0, durable = true}.
   // With sync, both first wait until every earlier write is durable.

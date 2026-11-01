@@ -282,7 +282,7 @@ inline auto based_batch_operation(bool on_snapshot) -> Operation {
                   const SuspendSyscallFaults inputs;
                   auto snap = db.snapshot();
                   auto p = on_snapshot ? WritePlan{std::move(snap)}
-                                       : WritePlan{snap.sequence()};
+                                       : WritePlan{snap.sequence(), snap.marker()};
                   p.ensure_unchanged(to_bytes("k1"));
                   add_mixed_writes(p);
                   return p;

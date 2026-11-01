@@ -2309,7 +2309,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards_on_sequence__success", "[prov
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
     {
@@ -2355,7 +2355,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards_on_sequence__success_nosync",
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
     {
@@ -2400,7 +2400,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards_on_sequence__append_fails_not
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
     {
@@ -2448,7 +2448,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards_on_sequence__append_fails_par
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
     {
@@ -2497,7 +2497,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards_on_sequence__append_fails_aft
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
     {
@@ -2546,7 +2546,7 @@ TEST_CASE("prove__empty_db__single_put_with_guards_on_sequence__commit_sync_fail
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
     {
@@ -2598,7 +2598,7 @@ TEST_CASE("prove__empty_db__conflicting_plan_on_sequence__before_any_io", "[prov
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
@@ -10656,7 +10656,7 @@ TEST_CASE("prove__single_key__single_put_with_guards_on_sequence__success", "[pr
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -10704,7 +10704,7 @@ TEST_CASE("prove__single_key__single_put_with_guards_on_sequence__success_nosync
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -10751,7 +10751,7 @@ TEST_CASE("prove__single_key__single_put_with_guards_on_sequence__append_fails_n
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -10801,7 +10801,7 @@ TEST_CASE("prove__single_key__single_put_with_guards_on_sequence__append_fails_p
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -10852,7 +10852,7 @@ TEST_CASE("prove__single_key__single_put_with_guards_on_sequence__append_fails_a
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -10903,7 +10903,7 @@ TEST_CASE("prove__single_key__single_put_with_guards_on_sequence__commit_sync_fa
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -10957,7 +10957,7 @@ TEST_CASE("prove__single_key__conflicting_plan_on_sequence__before_any_io", "[pr
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
@@ -20957,7 +20957,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards_on_sequence__success", "[
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -21014,7 +21014,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards_on_sequence__success_nosy
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -21070,7 +21070,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards_on_sequence__append_fails
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -21129,7 +21129,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards_on_sequence__append_fails
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -21189,7 +21189,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards_on_sequence__append_fails
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -21249,7 +21249,7 @@ TEST_CASE("prove__populated_db__single_put_with_guards_on_sequence__commit_sync_
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -21312,7 +21312,7 @@ TEST_CASE("prove__populated_db__conflicting_plan_on_sequence__before_any_io", "[
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
@@ -32973,7 +32973,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards_on_sequence__succes
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -33021,7 +33021,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards_on_sequence__succes
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -33068,7 +33068,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards_on_sequence__append
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -33118,7 +33118,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards_on_sequence__append
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -33169,7 +33169,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards_on_sequence__append
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -33220,7 +33220,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards_on_sequence__commit
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -33272,7 +33272,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards_on_sequence__rotati
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -33324,7 +33324,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards_on_sequence__rotati
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -33376,7 +33376,7 @@ TEST_CASE("prove__rotation_threshold__conflicting_plan_on_sequence__before_any_i
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
@@ -43467,7 +43467,7 @@ TEST_CASE("prove__deleted_key__single_put_with_guards_on_sequence__success", "[p
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -43516,7 +43516,7 @@ TEST_CASE("prove__deleted_key__single_put_with_guards_on_sequence__success_nosyn
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -43564,7 +43564,7 @@ TEST_CASE("prove__deleted_key__single_put_with_guards_on_sequence__append_fails_
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -43615,7 +43615,7 @@ TEST_CASE("prove__deleted_key__single_put_with_guards_on_sequence__append_fails_
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -43667,7 +43667,7 @@ TEST_CASE("prove__deleted_key__single_put_with_guards_on_sequence__append_fails_
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -43719,7 +43719,7 @@ TEST_CASE("prove__deleted_key__single_put_with_guards_on_sequence__commit_sync_f
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -43774,7 +43774,7 @@ TEST_CASE("prove__deleted_key__conflicting_plan_on_sequence__before_any_io", "[p
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
@@ -52444,7 +52444,7 @@ TEST_CASE("prove__single_key_mmap__single_put_with_guards_on_sequence__success",
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -52494,7 +52494,7 @@ TEST_CASE("prove__single_key_mmap__single_put_with_guards_on_sequence__success_n
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -52543,7 +52543,7 @@ TEST_CASE("prove__single_key_mmap__single_put_with_guards_on_sequence__append_fa
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -52595,7 +52595,7 @@ TEST_CASE("prove__single_key_mmap__single_put_with_guards_on_sequence__append_fa
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -52648,7 +52648,7 @@ TEST_CASE("prove__single_key_mmap__single_put_with_guards_on_sequence__append_fa
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -52701,7 +52701,7 @@ TEST_CASE("prove__single_key_mmap__single_put_with_guards_on_sequence__commit_sy
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -52757,7 +52757,7 @@ TEST_CASE("prove__single_key_mmap__conflicting_plan_on_sequence__before_any_io",
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
@@ -63745,7 +63745,7 @@ TEST_CASE("prove__populated_db_mmap__single_put_with_guards_on_sequence__success
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -63804,7 +63804,7 @@ TEST_CASE("prove__populated_db_mmap__single_put_with_guards_on_sequence__success
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -63862,7 +63862,7 @@ TEST_CASE("prove__populated_db_mmap__single_put_with_guards_on_sequence__append_
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -63923,7 +63923,7 @@ TEST_CASE("prove__populated_db_mmap__single_put_with_guards_on_sequence__append_
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -63985,7 +63985,7 @@ TEST_CASE("prove__populated_db_mmap__single_put_with_guards_on_sequence__append_
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -64047,7 +64047,7 @@ TEST_CASE("prove__populated_db_mmap__single_put_with_guards_on_sequence__commit_
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -64112,7 +64112,7 @@ TEST_CASE("prove__populated_db_mmap__conflicting_plan_on_sequence__before_any_io
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
@@ -76805,7 +76805,7 @@ TEST_CASE("prove__rotation_threshold_mmap__single_put_with_guards_on_sequence__s
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -76855,7 +76855,7 @@ TEST_CASE("prove__rotation_threshold_mmap__single_put_with_guards_on_sequence__s
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -76904,7 +76904,7 @@ TEST_CASE("prove__rotation_threshold_mmap__single_put_with_guards_on_sequence__a
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -76956,7 +76956,7 @@ TEST_CASE("prove__rotation_threshold_mmap__single_put_with_guards_on_sequence__a
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -77009,7 +77009,7 @@ TEST_CASE("prove__rotation_threshold_mmap__single_put_with_guards_on_sequence__a
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -77062,7 +77062,7 @@ TEST_CASE("prove__rotation_threshold_mmap__single_put_with_guards_on_sequence__c
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -77116,7 +77116,7 @@ TEST_CASE("prove__rotation_threshold_mmap__single_put_with_guards_on_sequence__r
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -77170,7 +77170,7 @@ TEST_CASE("prove__rotation_threshold_mmap__single_put_with_guards_on_sequence__r
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -77224,7 +77224,7 @@ TEST_CASE("prove__rotation_threshold_mmap__conflicting_plan_on_sequence__before_
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
@@ -89260,7 +89260,7 @@ TEST_CASE("prove__single_key_pool__single_put_with_guards_on_sequence__success",
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -89310,7 +89310,7 @@ TEST_CASE("prove__single_key_pool__single_put_with_guards_on_sequence__success_n
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -89359,7 +89359,7 @@ TEST_CASE("prove__single_key_pool__single_put_with_guards_on_sequence__append_fa
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -89411,7 +89411,7 @@ TEST_CASE("prove__single_key_pool__single_put_with_guards_on_sequence__append_fa
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -89464,7 +89464,7 @@ TEST_CASE("prove__single_key_pool__single_put_with_guards_on_sequence__append_fa
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -89517,7 +89517,7 @@ TEST_CASE("prove__single_key_pool__single_put_with_guards_on_sequence__commit_sy
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -89573,7 +89573,7 @@ TEST_CASE("prove__single_key_pool__conflicting_plan_on_sequence__before_any_io",
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
@@ -99931,7 +99931,7 @@ TEST_CASE("prove__populated_db_pool__single_put_with_guards_on_sequence__success
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -99990,7 +99990,7 @@ TEST_CASE("prove__populated_db_pool__single_put_with_guards_on_sequence__success
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -100048,7 +100048,7 @@ TEST_CASE("prove__populated_db_pool__single_put_with_guards_on_sequence__append_
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -100109,7 +100109,7 @@ TEST_CASE("prove__populated_db_pool__single_put_with_guards_on_sequence__append_
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -100171,7 +100171,7 @@ TEST_CASE("prove__populated_db_pool__single_put_with_guards_on_sequence__append_
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -100233,7 +100233,7 @@ TEST_CASE("prove__populated_db_pool__single_put_with_guards_on_sequence__commit_
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -100298,7 +100298,7 @@ TEST_CASE("prove__populated_db_pool__conflicting_plan_on_sequence__before_any_io
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
@@ -112361,7 +112361,7 @@ TEST_CASE("prove__rotation_threshold_pool__single_put_with_guards_on_sequence__s
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -112411,7 +112411,7 @@ TEST_CASE("prove__rotation_threshold_pool__single_put_with_guards_on_sequence__s
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -112460,7 +112460,7 @@ TEST_CASE("prove__rotation_threshold_pool__single_put_with_guards_on_sequence__a
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -112512,7 +112512,7 @@ TEST_CASE("prove__rotation_threshold_pool__single_put_with_guards_on_sequence__a
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -112565,7 +112565,7 @@ TEST_CASE("prove__rotation_threshold_pool__single_put_with_guards_on_sequence__a
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -112618,7 +112618,7 @@ TEST_CASE("prove__rotation_threshold_pool__single_put_with_guards_on_sequence__c
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -112672,7 +112672,7 @@ TEST_CASE("prove__rotation_threshold_pool__single_put_with_guards_on_sequence__r
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -112726,7 +112726,7 @@ TEST_CASE("prove__rotation_threshold_pool__single_put_with_guards_on_sequence__r
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
@@ -112780,7 +112780,7 @@ TEST_CASE("prove__rotation_threshold_pool__conflicting_plan_on_sequence__before_
     make_durable(db);
     before = capture_baseline(db);
 
-    bytecask::WritePlan plan{snap.sequence()};
+    bytecask::WritePlan plan{snap.sequence(), snap.marker()};
     plan.ensure_unchanged(to_bytes("k0"));
     plan.put(to_bytes("k0"), to_bytes("new0"));
 

@@ -127,9 +127,11 @@ enum class PlanRefusal {
   // A guard failed, or a key the plan writes changed since its snapshot
   // or read sequence. Retry from a fresh snapshot.
   Conflict,
-  // Plans on a read sequence only: it is older than the engine still
-  // tracks deletes for (a reopen, resume(), ingest, or more deletes since
-  // than Options::max_delete_log_bytes holds). Take a fresh snapshot.
+  // Plans on a read point only: it cannot be checked here. Read on another
+  // history (before a crash, across a failover), past the latest sequence,
+  // or needing deletes the engine no longer tracks (from before a reopen,
+  // resume() or ingest, or more than Options::max_delete_log_bytes holds).
+  // Take a fresh snapshot.
   TooOld,
 };
 
@@ -454,6 +456,10 @@ public:
   // The last write this snapshot sees: all at or below it, none above.
   // A moved-from snapshot throws std::logic_error.
   [[nodiscard]] auto sequence() const -> std::uint64_t;
+  // The database's marker at sequence(): with it, the read point of
+  // WritePlan(sequence, marker). A moved-from snapshot throws
+  // std::logic_error.
+  [[nodiscard]] auto marker() const -> ChangeMarker;
 
   ~Snapshot();
   Snapshot(const Snapshot&) = delete;
@@ -514,10 +520,13 @@ public:
 
   WritePlan();
   explicit WritePlan(SizeLimits limits);
-  // A plan checked against the state at read_sequence (Snapshot::sequence()
-  // of the snapshot its reads came from). Plain data: no snapshot is held,
-  // so it can be built away from the reads, in another process.
-  explicit WritePlan(std::uint64_t read_sequence, SizeLimits limits = {});
+  // A plan checked against a read point: Snapshot::sequence() and
+  // Snapshot::marker() of the snapshot its reads came from. Plain data: no
+  // snapshot is held, so it can be built away from the reads, in another
+  // process. One read on another history (before a crash, across a
+  // failover) is refused as TooOld.
+  WritePlan(std::uint64_t read_sequence, ChangeMarker marker,
+            SizeLimits limits = {});
   // A plan checked against snap itself, which it holds until apply_batch
   // returns. A key absent in snap and absent now is unchanged, even if
   // written and deleted again between; never refused as TooOld. A

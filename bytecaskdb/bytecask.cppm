@@ -246,10 +246,11 @@ export enum class PlanRefusal {
   // A guard failed, or a key the plan writes changed since its snapshot or
   // read sequence. Retry from a fresh snapshot.
   Conflict,
-  // Plans on a read sequence only: it is older than what the engine still
-  // tracks (a restart, resume(), ingest, or deletes beyond
-  // max_delete_log_bytes since). Whether it conflicts cannot be told: take a
-  // fresh snapshot.
+  // Plans on a read point only: it cannot be checked here. Read on another
+  // history (before a crash, across a failover), past the latest sequence,
+  // or needing deletes the engine no longer tracks (from before a restart,
+  // resume() or ingest, or beyond max_delete_log_bytes since). Take a fresh
+  // snapshot.
   TooOld,
 };
 
@@ -1209,8 +1210,9 @@ public:
   // sequence and fdatasyncs it before the mode changes, so the first write
   // after it takes the sequence after the marker's. A failed append or sync
   // degrades, throws and leaves the mode; so does a promotion on a degraded
-  // engine, with DbDegraded. Leader -> Leader writes nothing; opening in
-  // Leader mode is not a promotion (#397).
+  // engine, with DbDegraded. Leader -> Leader writes nothing. An open in
+  // Leader mode appends a marker too (with_open_marker); one in Follower
+  // mode writes none (#397).
   void set_mode(Mode mode);
 
   // Returns true if the engine has entered a degraded state. A degraded DB
@@ -1667,6 +1669,17 @@ private:
                     const std::filesystem::path &active_path);
   // Publish initial state during construction (no previous state to compare).
   void store_initial_state(std::shared_ptr<EngineState> s);
+  // Appends a ChangeMarker with a fresh random id at t's next sequence to
+  // its active file, and returns it; the caller applies it to t once the
+  // append has landed. Throws what the append throws.
+  [[nodiscard]] static auto append_change_marker(TransientEngineState &t)
+      -> ChangeMarker;
+  // The state an open in Leader mode publishes: s with a ChangeMarker
+  // appended and synced, so writes from this open on sit under a marker no
+  // earlier reader holds (docs/bytecask_design.md, "Replication mode"). An
+  // I/O error makes the open throw.
+  [[nodiscard]] auto with_open_marker(const EngineState &s)
+      -> std::shared_ptr<EngineState>;
   // Validates structural consistency of published state. Throws on violation.
   // Called on cold paths only (open, resume).
   void validate_state_consistency(const EngineState &s) const;
@@ -1990,6 +2003,12 @@ public:
   [[nodiscard]] auto sequence() const -> std::uint64_t {
     return named_state().next_seq - 1;
   }
+  // This database's marker at sequence(): with it, the read point a plan
+  // built away from the snapshot carries (WritePlan(sequence, marker)).
+  [[nodiscard]] auto marker() const -> ChangeMarker {
+    const auto &s = named_state();
+    return s.marker_at(s.next_seq - 1);
+  }
 
   // Returns true if key exists in this snapshot. No disk I/O.
   [[nodiscard]] auto contains_key(const ReadOptions& opts,
@@ -2080,9 +2099,10 @@ export struct FileManifest {
 //               ensure_absent, checked against the current state.
 //   a snapshot  WritePlan(Snapshot): checked by comparing the snapshot with
 //               the current state.
-//   a sequence  WritePlan(read_sequence): plain data, checked by sequences
-//               and the delete log (docs/bytecask_design.md, "Checking a plan
-//               by its read sequence"); may be refused as TooOld.
+//   a read point  WritePlan(read_sequence, marker): plain data, checked
+//               for the same history by the marker, then by sequences and
+//               the delete log (docs/bytecask_design.md, "Checking a plan by
+//               its read sequence"); may be refused as TooOld.
 // ensure_unchanged and ensure_range_unchanged need a base; a plan without
 // one throws std::logic_error on either (programming error).
 //
@@ -2131,13 +2151,18 @@ public:
   };
   struct SequenceBase {
     std::uint64_t read_seq;
+    ChangeMarker marker;  // the reader's marker at read_seq
   };
   using Base = std::variant<NoBase, SnapshotBase, SequenceBase>;
 
   WritePlan() = default;
   explicit WritePlan(SizeLimits limits) : limits_{limits} {}
-  explicit WritePlan(std::uint64_t read_sequence, SizeLimits limits = {})
-      : limits_{limits}, base_{SequenceBase{read_sequence}} {}
+  // A read point: Snapshot::sequence() and Snapshot::marker() of the
+  // snapshot the reads came from. A bare sequence names no state once two
+  // histories have used it, so there is no constructor from one.
+  WritePlan(std::uint64_t read_sequence, ChangeMarker marker,
+            SizeLimits limits = {})
+      : limits_{limits}, base_{SequenceBase{read_sequence, marker}} {}
   // A moved-from snapshot names no state: refused with
   // std::invalid_argument rather than read when the plan is checked.
   explicit WritePlan(Snapshot snap)

@@ -159,7 +159,9 @@ TEST_CASE("plans on a snapshot and on its sequence match their models for point 
       intervene(db_snap, db_seq, model, version, rng, before);
 
     auto snap = db_snap.snapshot();
-    const auto read_seq = db_seq.snapshot().sequence();
+    const auto seq_snap = db_seq.snapshot();
+    const auto read_seq = seq_snap.sequence();
+    const auto read_marker = seq_snap.marker();
     REQUIRE(read_seq == snap.sequence());  // same history, same sequences
     const auto snap_model = model;
 
@@ -185,7 +187,7 @@ TEST_CASE("plans on a snapshot and on its sequence match their models for point 
       return plan;
     };
     auto on_snap = build(bytecask::WritePlan{std::move(snap)}, true);
-    auto on_seq = build(bytecask::WritePlan{read_seq}, true);
+    auto on_seq = build(bytecask::WritePlan{read_seq, read_marker}, true);
 
     Named since;
     for (int i = std::uniform_int_distribution<int>{0, 3}(rng); i > 0; --i)

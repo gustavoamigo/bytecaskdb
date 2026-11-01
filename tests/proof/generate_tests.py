@@ -119,7 +119,7 @@ def gen_plan(plan: PlanShape, state: StateShape, labels: List[str]) -> str:
 
     if plan.is_conflicting or plan.has_guards:
         if plan.on_sequence:
-            lines.append("    bytecask::WritePlan plan{snap.sequence()};")
+            lines.append("    bytecask::WritePlan plan{snap.sequence(), snap.marker()};")
         else:
             lines.append("    bytecask::WritePlan plan{std::move(snap)};")
         if plan.has_guards and state.num_keys > 0:

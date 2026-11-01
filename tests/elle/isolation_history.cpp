@@ -143,14 +143,15 @@ auto workload_name(Workload w) -> std::string_view {
 }
 
 // What a transaction's plan is built from (--plan-base): its snapshot (the
-// default), or the snapshot's sequence alone, which the engine checks by
-// sequences and its delete log. Set once in main, before any thread starts.
+// default), or the snapshot's read point alone (its sequence and marker),
+// which the engine checks by sequences and its delete log. Set once in main, before any thread starts.
 bool g_plan_on_sequence = false;
 
 // The plan for a transaction that read from `snap`, or a snapshot-less one.
 auto plan_from(std::optional<bytecask::Snapshot> &snap) -> bytecask::WritePlan {
   if (!snap) return bytecask::WritePlan{};
-  if (g_plan_on_sequence) return bytecask::WritePlan{snap->sequence()};
+  if (g_plan_on_sequence)
+    return bytecask::WritePlan{snap->sequence(), snap->marker()};
   return bytecask::WritePlan{std::move(*snap)};
 }
 

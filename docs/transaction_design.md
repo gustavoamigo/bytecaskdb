@@ -22,7 +22,7 @@ There is no transaction object, no wrapper around `DB`, and no lock beyond the w
 | Unconditional single-key write | `put` / `del` / `del_range` |
 | Unconditional multi-key atomic write | `apply_batch(opts, WritePlan{})` |
 | Consistent read-only view | `db.snapshot()` |
-| Conflict-safe read-modify-write | `db.snapshot()`, then `apply_batch(opts, WritePlan{std::move(snap)})`, or `WritePlan{snap.sequence()}` to build the plan without the snapshot |
+| Conflict-safe read-modify-write | `db.snapshot()`, then `apply_batch(opts, WritePlan{std::move(snap)})`, or `WritePlan{snap.sequence(), snap.marker()}` to build the plan without the snapshot |
 
 `put`, `del` and `del_range` build a `WritePlan` and call `apply_batch`. `del` adds an `ensure_present` guard, which is why it returns `nullopt` when the key is absent.
 
@@ -87,17 +87,17 @@ for (auto& [k, v] : snap.iter_from({})) { ... }
 
 A plan built with `WritePlan()` has no base. It is an unconditional batch that may also carry `ensure_present` and `ensure_absent`, which test the current state. A plan with a base adds `ensure_unchanged`, `ensure_range_unchanged` and the implicit write-write check on every key it writes. The base is what the plan's reads came from:
 - **a `Snapshot`** (`WritePlan(Snapshot)`): checked by comparing the snapshot with the current state;
-- **its sequence alone** (`WritePlan(snap.sequence())`): plain data that can be built away from the reads, even in another process, checked by sequences and the engine's log of recent deletes, and refused as `TooOld` when read too long ago.
+- **its read point alone** (`WritePlan(snap.sequence(), snap.marker())`): plain data that can be built away from the reads, even in another process. It is checked by the marker for the same history, then by sequences and the engine's log of recent deletes, and refused as `TooOld` when it was read on another history (before a crash, across a failover) or a check needs deletes the log no longer holds.
 
 Both give the same isolation; *Conflict check* gives the one case where they differ.
 
 ```cpp
 export class WritePlan {
 public:
-  WritePlan();                         // no read sequence: only ensure_present / ensure_absent
-  // All guards and the implicit W-W check, against the state at read_sequence.
-  explicit WritePlan(std::uint64_t read_sequence, SizeLimits limits = {});
-  explicit WritePlan(Snapshot snap);   // WritePlan(snap.sequence()), snap's limits
+  WritePlan();                         // no base: only ensure_present / ensure_absent
+  // All guards and the implicit W-W check, against the state at a read point.
+  WritePlan(std::uint64_t read_sequence, ChangeMarker marker, SizeLimits limits = {});
+  explicit WritePlan(Snapshot snap);   // against snap itself, snap's limits
 
   WritePlan(const WritePlan&) = delete;
   WritePlan& operator=(const WritePlan&) = delete;
@@ -156,14 +156,14 @@ Writes and point guards are stored separately: writes in a vector, in the order 
 
 ```cpp
 // On DB:
-// Applies plan atomically iff every guard passes and, when the plan carries
-// a read sequence, no key it writes changed since. PlanRefusal::Conflict on
-// conflict, PlanRefusal::TooOld when the read sequence is older than the
-// engine tracks deletes for — nothing was written either way. An empty or
-// guard-only plan that passes writes nothing and returns {sequence = 0,
-// durable = true}. Throws std::invalid_argument for a read sequence past the
-// latest, std::system_error on I/O failure, DbDegraded if degraded,
-// DbFollowerMode in follower mode.
+// Applies plan atomically iff every guard passes and, when the plan has a
+// base, no key it writes changed since. PlanRefusal::Conflict on conflict,
+// PlanRefusal::TooOld when a read point cannot be checked here (another
+// history, past the latest, or deletes the log no longer holds) — nothing
+// was written either way. An empty or guard-only plan that passes writes
+// nothing and returns {sequence = 0, durable = true}. Throws
+// std::system_error on I/O failure, DbDegraded if degraded, DbFollowerMode
+// in follower mode.
 [[nodiscard]] auto apply_batch(WriteOptions opts, WritePlan plan)
     -> std::expected<CommitResult, PlanRefusal>;
 ```
@@ -183,15 +183,17 @@ changed(K):                seq(snap.find(K)) != seq(head.find(K))   // absent = 
 range_changed(from, to):   a K in head over [from, to) with seq differing from snap's,
                            or a K in snap over [from, to) absent from head
 
-// On a read sequence R, with "removed" the log of keys writes removed:
-// 0. if R < removed.horizon → TooOld
+// On a read point (R, M), with "deletes" the log of recent deletes:
+// 0. if R >= head.next_seq or head.marker_at(R) != M → TooOld   // another history
 changed(K):
     cur = head.find(K)
     if cur: seq(cur) > R                         // written since
-    else:   removed holds K above R              // deleted since
+    else if R < deletes.horizon: TooOld          // the deletes since R are gone
+    else:   deletes name K above R               // deleted since
 range_changed(from, to):
     any K in head over [from, to) with seq(K) > R      // inserted or modified
-    or removed holds a key in [from, to) above R       // deleted, by del or a range tombstone
+    or else, if R < deletes.horizon: TooOld
+    or deletes name a key in [from, to) above R        // deleted, by del or a range delete
 
 // 1. Point guards
 for each (key, precondition) in plan.guards_:

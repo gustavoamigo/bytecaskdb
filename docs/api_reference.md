@@ -55,19 +55,22 @@ if (!db.apply_batch({}, std::move(order))) {
     // price changed since snapshot — re-read price and recompute
 }
 
-// A plan is plain data: it needs the sequence its reads came from, not the
-// snapshot. Build it anywhere — another thread, another process — and send it.
+// A plan is plain data: it needs the read point its reads came from (the
+// snapshot's sequence and marker), not the snapshot. Build it anywhere —
+// another thread, another process — and send it.
 auto snap3 = db.snapshot();
 const std::uint64_t read_seq = snap3.sequence();
+const ChangeMarker read_marker = snap3.marker();
 Bytes qty_out;
 snap3.get({}, to_bytes("stock:widget"), qty_out);
-// ... the snapshot can go; the plan carries read_seq ...
-WritePlan remote{read_seq};
+// ... the snapshot can go; the plan carries read_seq and read_marker ...
+WritePlan remote{read_seq, read_marker};
 remote.put(to_bytes("stock:widget"), new_stock);
 if (auto r = db.apply_batch({}, std::move(remote)); !r) {
     if (r.error() == PlanRefusal::TooOld) {
-        // read before a reopen, a resume(), or more deletes since than
-        // Options::max_delete_log_bytes holds — take a fresh snapshot
+        // read on another history (before a crash, across a failover), or a
+        // check needed deletes the engine no longer tracks — take a fresh
+        // snapshot
     } else {
         // PlanRefusal::Conflict — stock:widget changed since read_seq
     }
@@ -212,9 +215,9 @@ public:
 
     // Atomically applies all operations in plan. PlanRefusal::Conflict on a
     // guard failure or the implicit W-W check, PlanRefusal::TooOld when a
-    // plan on a read sequence is older than the log of recent deletes covers —
-    // nothing was written either way. A read sequence past the latest throws
-    // std::invalid_argument. An empty or
+    // plan on a read point cannot be checked here (read on another history,
+    // past the latest, or needing deletes the log no longer holds) —
+    // nothing was written either way. An empty or
     // guard-only plan that passes writes nothing and returns {sequence = 0,
     // durable = true}. With sync it first makes every earlier write durable, so
     // apply_batch({.sync = true}, WritePlan{}) flushes earlier sync=false writes.
@@ -273,7 +276,8 @@ public:
     // promoted appends a change marker at the next sequence and fdatasyncs it
     // before the mode changes; the first write takes the sequence after it.
     // A failed append or sync degrades and leaves the mode. Leader -> Leader
-    // writes nothing; opening in Leader mode is not a promotion.
+    // writes nothing. An open in Leader mode appends a change marker too; one
+    // in Follower mode writes none.
     void set_mode(Mode mode);
 
     // One slice of this node's history for ingest: a header naming this
@@ -339,7 +343,11 @@ class Snapshot {
 public:
     // The last write this snapshot sees: every write at or below it, none
     // above. A WritePlan built from it is checked against this state.
-    [[nodiscard]] auto sequence() const noexcept -> std::uint64_t;
+    [[nodiscard]] auto sequence() const -> std::uint64_t;
+    // The database's change marker at sequence(): with it, the read point of
+    // WritePlan(sequence, marker). Both throw std::logic_error on a
+    // moved-from snapshot.
+    [[nodiscard]] auto marker() const -> ChangeMarker;
     [[nodiscard]] auto get(const ReadOptions& opts,
                            BytesView key, Bytes& out) const -> bool;
     [[nodiscard]] auto contains_key(const ReadOptions& opts,
@@ -381,7 +389,8 @@ struct FileManifest {
 // Why apply_batch refused a plan. Nothing was written either way.
 enum class PlanRefusal {
     Conflict,  // a guard failed, or a written key changed since the plan's base
-    TooOld,    // sequence plans only: older than the engine still tracks deletes for
+    TooOld,    // read-point plans only: read on another history, past the latest,
+               // or needing deletes the engine no longer tracks
 };
 
 // apply_batch's outcome, shaped like std::expected<CommitResult, PlanRefusal>
@@ -393,10 +402,12 @@ class ApplyResult;
 // A plan's base is what "changed since" is measured against:
 //   WritePlan(snap)            the snapshot itself, held until apply_batch returns.
 //                              A key absent in snap and absent now is unchanged.
-//   WritePlan(snap.sequence()) a plain sequence, no snapshot held. A key a delete
+//   WritePlan(snap.sequence(), snap.marker())
+//                              a read point, no snapshot held. A key a delete
 //                              since named counts as changed, present or not (a
-//                              del_range names every key it covers), and a
-//                              sequence older than the delete log covers is TooOld.
+//                              del_range names every key it covers). TooOld when
+//                              read on another history, past the latest, or when
+//                              a check needs deletes the log no longer holds.
 // A base enables ensure_unchanged / ensure_range_unchanged guards; those
 // methods throw std::logic_error on a plan without one.
 // With a base, apply_batch automatically rejects the plan if any
@@ -407,8 +418,8 @@ class ApplyResult;
 class WritePlan {
 public:
     WritePlan();                         // no base: only ensure_present/ensure_absent available
-    // Checked against the state at read_sequence; holds no snapshot.
-    explicit WritePlan(std::uint64_t read_sequence, SizeLimits limits = {});
+    // Checked against the state at the read point; holds no snapshot.
+    WritePlan(std::uint64_t read_sequence, ChangeMarker marker, SizeLimits limits = {});
     // Checked against snap; holds it until apply_batch returns.
     explicit WritePlan(Snapshot snap);
 

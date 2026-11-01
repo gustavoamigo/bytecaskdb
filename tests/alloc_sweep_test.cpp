@@ -695,10 +695,12 @@ TEST_CASE("alloc sweep: a write that fails leaves no removal behind",
       fired = faults.report().fired;
     }
     if (db->is_degraded()) db->resume();
-    const auto read_seq = db->snapshot().sequence();
+    const auto read = db->snapshot();
+    const auto read_seq = read.sequence();
+    const auto read_marker = read.marker();
     for (int i = 0; i < 3; ++i)
       db->put({.sync = false}, to_bytes("a"), to_bytes("v"));
-    bytecask::WritePlan q{read_seq};
+    bytecask::WritePlan q{read_seq, read_marker};
     q.ensure_range_unchanged(to_bytes("x"), to_bytes("z"));
     q.put(to_bytes("x"), to_bytes("w"));
     q.put(to_bytes("y"), to_bytes("v"));

@@ -126,58 +126,73 @@ def test_round_trip_in_slices_keeps_batches_whole(tmp_path):
 
 def test_changes_since_ships_what_was_durable_and_stepping_down_syncs(tmp_path):
     with ref.DB.open(tmp_path / "leader") as leader:
+        (opened,) = markers(leader)  # the leader's open: one marker, synced
+        base = opened.since_sequence
+        assert leader.durable_sequence() == base
         leader.put(b"a", b"1")
-        assert leader.durable_sequence() == 1
+        assert leader.durable_sequence() == base + 1
         leader.put(b"b", b"2", NO_SYNC)
-        assert leader.durable_sequence() == 1
+        assert leader.durable_sequence() == base + 1
         snap = leader.snapshot()
         assert snap.get(b"b") == b"2"  # visible
-        assert [e.key for e in leader.changes_since(snap, 0).entries] == [b"a"]  # not shipped
+        assert [e.key for e in leader.changes_since(snap, base).entries] == [b"a"]  # not shipped
         leader.put(b"c", b"3")  # its sync covers b
-        assert leader.durable_sequence() == 3
-        assert [e.key for e in history(leader)] == [b"a", b"b", b"c"]
+        assert leader.durable_sequence() == base + 3
+        assert [e.key for e in history(leader) if e.type is not T.CHANGE_MARKER] == [b"a", b"b", b"c"]
         assert leader.changes_since(leader.snapshot(), 0).header == ChangeHeader(ORIGIN, 0)
 
         leader.put(b"d", b"4", NO_SYNC)
         leader.set_mode(Mode.Follower)  # stepping down makes d durable, so it can be shipped
-        assert leader.durable_sequence() == 4 and leader.mode is Mode.Follower
+        assert leader.durable_sequence() == base + 4 and leader.mode is Mode.Follower
         for write in (lambda: leader.put(b"e", b"5"), lambda: leader.del_(b"a"),
                       lambda: leader.del_range(b"a", b"b"), lambda: leader.apply_batch(ref.WritePlan())):
             with pytest.raises(ref.DbFollowerMode):
                 write()
-        assert markers(leader) == []  # stepping down writes nothing
+        assert markers(leader) == [opened]  # stepping down writes nothing
 
 
-def test_promotion_writes_a_marker_and_only_a_promotion_does(tmp_path):
+def test_a_promotion_or_a_leaders_open_writes_a_marker_and_nothing_else_does(tmp_path):
     leader = ref.DB.open(tmp_path / "leader")
+    (opened,) = markers(leader)  # the leader's open writes one, at the first sequence
+    assert opened.since_sequence == 1 and opened.id != 0
+    assert leader.durable_sequence() == 1, "the open's marker is synced"
+    assert marker_at(leader, 0) == ORIGIN and marker_at(leader, 1) == opened
     leader.put(b"a", b"1")
     leader.set_mode(Mode.Leader)  # leader to leader: nothing written
-    assert leader.durable_sequence() == 1 and markers(leader) == []
+    assert leader.durable_sequence() == 2 and markers(leader) == [opened]
 
     follower = open_follower(tmp_path / "follower")
+    assert markers(follower) == [], "a follower's open writes none"
     replicate(leader, follower)
+    assert markers(follower) == [opened]
     leader.set_mode(Mode.Follower)
     follower.set_mode(Mode.Leader)
     assert follower.mode is Mode.Leader
-    (marker,) = markers(follower)
-    assert marker.since_sequence == 2 and marker.id != 0
-    assert follower.durable_sequence() == 2, "the marker is synced before the mode changes"
-    assert follower.put(b"b", b"2").sequence == 3, "the first write takes the sequence after the marker's"
-    # The marker names the history from its sequence on; before it, the origin.
-    assert marker_at(follower, 1) == ORIGIN
-    assert marker_at(follower, 2) == marker and marker_at(follower, 99) == marker
+    (_, marker) = markers(follower)
+    assert marker.since_sequence == 3 and marker.id != 0
+    assert follower.durable_sequence() == 3, "the marker is synced before the mode changes"
+    assert follower.put(b"b", b"2").sequence == 4, "the first write takes the sequence after the marker's"
+    # The marker names the history from its sequence on; before it, the open's.
+    assert marker_at(follower, 2) == opened
+    assert marker_at(follower, 3) == marker and marker_at(follower, 99) == marker
 
     # The old leader follows the new one and receives the marker as an entry.
     catch_up(follower, leader)
-    assert markers(leader) == [marker] and history(leader) == history(follower)
+    assert markers(leader) == [opened, marker] and history(leader) == history(follower)
     assert marker_at(leader, 99) == marker
 
-    # Reopening in Leader mode is not a promotion: nothing written, sequences go on.
+    # Reopening in Leader mode writes a marker of its own, at the next sequence.
     follower.close()
     with ref.DB.open(tmp_path / "follower") as reopened:
-        assert markers(reopened) == [marker] and reopened.durable_sequence() == 3
-        assert reopened.put(b"c", b"3").sequence == 4
-        assert markers(reopened) == [marker]
+        *before, reopen = markers(reopened)
+        assert before == [opened, marker]
+        assert reopen.since_sequence == 5 and reopen.id not in (opened.id, marker.id)
+        assert reopened.durable_sequence() == 5
+        assert reopened.put(b"c", b"3").sequence == 6
+        assert markers(reopened) == [opened, marker, reopen]
+    # Reopening in Follower mode writes none.
+    with open_follower(tmp_path / "follower") as reopened:
+        assert markers(reopened) == [opened, marker, reopen] and reopened.durable_sequence() == 6
     leader.close()
 
 

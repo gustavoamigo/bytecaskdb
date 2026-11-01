@@ -71,6 +71,14 @@ namespace {
 // The write index SnapshotCheck::changed takes for a guard's key, which no
 // write of the plan names.
 constexpr std::size_t kGuard = std::numeric_limits<std::size_t>::max();
+
+// What a check class answers for a key or a range. Unknown: the answer
+// needs deletes the log no longer holds, and the plan is TooOld.
+enum class Change : std::uint8_t { Unchanged, Changed, Unknown };
+
+auto change_if(bool changed) noexcept -> Change {
+  return changed ? Change::Changed : Change::Unchanged;
+}
 } // namespace
 
 // A plan without a base: only ensure_present and ensure_absent, which
@@ -96,16 +104,16 @@ public:
   // write_index is the key's write in the plan, or kGuard for a guard's key.
   [[nodiscard]] auto changed(std::span<const std::byte> key,
                              const std::optional<KeyDirEntry> &cur,
-                             std::size_t write_index) const -> bool {
+                             std::size_t write_index) const -> Change {
     const auto then = write_index == kGuard
                           ? kd_get(snap_.key_dir, key, snap_.kd_ctx())
                           : plan_.snapshot_entry(write_index, key);
-    return sequence_or_zero(then) != sequence_or_zero(cur);
+    return change_if(sequence_or_zero(then) != sequence_or_zero(cur));
   }
 
   [[nodiscard]] auto range_changed(std::span<const std::byte> from,
                                    std::span<const std::byte> to,
-                                   std::uint64_t &rests_on) const -> bool {
+                                   std::uint64_t &rests_on) const -> Change {
     // Keys changed or inserted since the snapshot: present in the head with
     // a sequence the snapshot does not hold for them. A key vacuum
     // relocated keeps its sequence, so it is not a change.
@@ -116,7 +124,7 @@ public:
       const auto then = kd_get(snap_.key_dir, key_span, snap_.kd_ctx());
       if (entry.sequence() != sequence_or_zero(then)) {
         rests_on = entry.sequence();
-        return true;
+        return Change::Changed;
       }
     }
     // Keys deleted since the snapshot, by del or by a range tombstone:
@@ -128,10 +136,10 @@ public:
       if (Key{key_span} >= Key{to}) break;
       if (!kd_get(head_.key_dir_, key_span, head_.kd_ctx())) {
         rests_on = head_.next_seq_ - 1;
-        return true;
+        return Change::Changed;
       }
     }
-    return false;
+    return Change::Unchanged;
   }
 
 private:
@@ -144,18 +152,26 @@ private:
   const EngineState &snap_;
 };
 
-// A plan built from a read sequence R: a present key changed if its entry
-// is above R; an absent one if a delete since R named it, staged by this
-// transient's earlier slots or logged in `deletes`.
+// A plan built from a read point (R, M). It must have been read on this
+// history: M is the head's marker at R, and R below the head's next
+// sequence. Then a present key changed if its entry is above R; an absent
+// one if a delete since R named it, staged by this transient's earlier
+// slots or logged in `deletes`. Only that last question needs the log to
+// cover R.
 class TransientEngineState::SequenceCheck {
 public:
   static constexpr bool kHasBase = true;
   SequenceCheck(const TransientEngineState &head, std::uint64_t read_seq,
-                const DeleteLog &deletes) noexcept
-      : head_{head}, read_seq_{read_seq}, deletes_{deletes} {}
+                ChangeMarker marker, const DeleteLog &deletes) noexcept
+      : head_{head}, read_seq_{read_seq}, marker_{marker}, deletes_{deletes} {}
 
+  // A sequence names a state only within one history: a crash or a
+  // failover gives the same sequences to other writes.
   [[nodiscard]] auto admit() const -> Verdict {
-    return deletes_.covers(read_seq_) ? Verdict::Holds : Verdict::TooOld;
+    if (read_seq_ >= head_.next_seq_) return Verdict::TooOld;
+    if (marker_at(head_.change_markers_.get(), read_seq_) != marker_)
+      return Verdict::TooOld;
+    return Verdict::Holds;
   }
 
   // A present key changed if its entry is newer: nothing but a write gives
@@ -164,15 +180,16 @@ public:
   // not it was present then.
   [[nodiscard]] auto changed(std::span<const std::byte> key,
                              const std::optional<KeyDirEntry> &cur,
-                             std::size_t /*write_index*/) const -> bool {
-    if (cur) return cur->sequence() > read_seq_;
-    if (head_.removed_.removes(key)) return true;
-    return deletes_.removed(key, read_seq_, head_.next_seq_);
+                             std::size_t /*write_index*/) const -> Change {
+    if (cur) return change_if(cur->sequence() > read_seq_);
+    if (head_.removed_.removes(key)) return Change::Changed;
+    if (!deletes_.covers(read_seq_)) return Change::Unknown;
+    return change_if(deletes_.removed(key, read_seq_, head_.next_seq_));
   }
 
   [[nodiscard]] auto range_changed(std::span<const std::byte> from,
                                    std::span<const std::byte> to,
-                                   std::uint64_t &rests_on) const -> bool {
+                                   std::uint64_t &rests_on) const -> Change {
     // Keys changed or inserted since R: present with a newer entry.
     for (auto it = kd_lower_bound(head_.key_dir_, from, head_.kd_ctx());
          it != std::default_sentinel; ++it) {
@@ -180,22 +197,22 @@ public:
       if (Key{key_span} >= Key{to}) break;
       if (entry.sequence() > read_seq_) {
         rests_on = entry.sequence();
-        return true;
+        return Change::Changed;
       }
     }
     // Keys a delete since R named, by del or by a range delete. They leave
     // no entry to carry a sequence, so a retry has to see the head's latest.
-    if (head_.removed_.removes_any_in(from, to) ||
-        deletes_.removed_in(from, to, read_seq_, head_.next_seq_)) {
-      rests_on = head_.next_seq_ - 1;
-      return true;
-    }
-    return false;
+    rests_on = head_.next_seq_ - 1;
+    if (head_.removed_.removes_any_in(from, to)) return Change::Changed;
+    if (!deletes_.covers(read_seq_)) return Change::Unknown;
+    return change_if(
+        deletes_.removed_in(from, to, read_seq_, head_.next_seq_));
   }
 
 private:
   const TransientEngineState &head_;
   std::uint64_t read_seq_;
+  ChangeMarker marker_;
   const DeleteLog &deletes_;
 };
 
@@ -211,12 +228,28 @@ auto TransientEngineState::validate_preconditions(
           return check_plan(plan, SnapshotCheck{*this, plan, *base.snap.state_},
                             rests_on);
         } else {
-          return check_plan(plan, SequenceCheck{*this, base.read_seq, deletes},
+          return check_plan(plan,
+                            SequenceCheck{*this, base.read_seq, base.marker,
+                                          deletes},
                             rests_on);
         }
       },
       plan.base_);
 }
+
+namespace {
+auto verdict_of(Change c) noexcept -> TransientEngineState::Verdict {
+  switch (c) {
+  case Change::Unchanged:
+    return TransientEngineState::Verdict::Holds;
+  case Change::Changed:
+    return TransientEngineState::Verdict::Conflict;
+  case Change::Unknown:
+    return TransientEngineState::Verdict::TooOld;
+  }
+  return TransientEngineState::Verdict::TooOld;
+}
+} // namespace
 
 template <typename Check>
 auto TransientEngineState::check_plan(const WritePlan &plan,
@@ -253,7 +286,14 @@ auto TransientEngineState::check_plan(const WritePlan &plan,
     case WritePlan::Precondition::MustBeUnchanged:
       // ensure_unchanged refuses a plan without a base at build time.
       if constexpr (Check::kHasBase) {
-        if (check.changed(key_span, cur_entry, kGuard)) return lost(cur_entry);
+        switch (check.changed(key_span, cur_entry, kGuard)) {
+        case Change::Unchanged:
+          break;
+        case Change::Changed:
+          return lost(cur_entry);
+        case Change::Unknown:
+          return Verdict::TooOld;
+        }
         held_on = std::max(held_on, read_seq_of(cur_entry));
       }
       break;
@@ -266,8 +306,9 @@ auto TransientEngineState::check_plan(const WritePlan &plan,
     // 2. Range guards. One that holds read keys absent from both states too,
     // which have no sequence: it rests on the head's latest.
     for (const auto &rg : plan.range_guards_) {
-      if (check.range_changed(rg.from, rg.to, rests_on))
-        return Verdict::Conflict;
+      if (const auto v = verdict_of(check.range_changed(rg.from, rg.to, rests_on));
+          v != Verdict::Holds)
+        return v;
       held_on = head_latest;
     }
 
@@ -275,29 +316,27 @@ auto TransientEngineState::check_plan(const WritePlan &plan,
     // the snapshot's record is unchanged: a location names one record, at or
     // below the base. Asking by location reads nothing; only a key that
     // moved, or a plan with no locations, is looked up by key.
-    const auto point_conflict = [&](std::size_t i, const Bytes &key) {
+    const auto point_change = [&](std::size_t i, const Bytes &key) {
       const std::span<const std::byte> key_span{key};
       const auto &at = plan.resolved_entry(i);
-      if (at && kd_holds(key_dir_, key_span, *at)) return false;
+      if (at && kd_holds(key_dir_, key_span, *at)) return Change::Unchanged;
       const auto cur_entry = kd_get(key_dir_, key_span, kd_ctx());
-      if (!check.changed(key_span, cur_entry, i)) return false;
-      rests_on = read_seq_of(cur_entry);
-      return true;
+      const auto c = check.changed(key_span, cur_entry, i);
+      if (c == Change::Changed) rests_on = read_seq_of(cur_entry);
+      return c;
     };
     for (std::size_t i = 0; i < plan.writes_.size(); ++i) {
-      bool has_conflict = false;
-      std::visit(
-          [&](const auto &op) -> void {
+      const auto c = std::visit(
+          [&](const auto &op) -> Change {
             using T = std::decay_t<decltype(op)>;
-            if constexpr (std::is_same_v<T, WritePlan::PointPut> ||
-                          std::is_same_v<T, WritePlan::PointDel>) {
-              has_conflict = point_conflict(i, op.key);
-            } else if constexpr (std::is_same_v<T, WritePlan::RangeDel>) {
-              has_conflict = check.range_changed(op.from, op.to, rests_on);
+            if constexpr (std::is_same_v<T, WritePlan::RangeDel>) {
+              return check.range_changed(op.from, op.to, rests_on);
+            } else {
+              return point_change(i, op.key);
             }
           },
           plan.writes_[i]);
-      if (has_conflict) return Verdict::Conflict;
+      if (const auto v = verdict_of(c); v != Verdict::Holds) return v;
     }
   }
 

@@ -7913,7 +7913,7 @@ enum class PlanBase : std::uint8_t { Snapshot, Sequence };
 // A plan on `snap`, or on its sequence alone.
 auto plan_on(PlanBase base, bytecask::Snapshot snap) -> bytecask::WritePlan {
   if (base == PlanBase::Snapshot) return bytecask::WritePlan{std::move(snap)};
-  return bytecask::WritePlan{snap.sequence()};
+  return bytecask::WritePlan{snap.sequence(), snap.marker()};
 }
 
 // A del of key the head made at seq.
@@ -8329,16 +8329,39 @@ TEST_CASE("validate_preconditions: a read sequence below the delete log's horizo
   auto t = state->transient();
   bytecask::DeleteLog deletes{std::size_t{1} << 20};
   deletes.reset(kSnapSeq + 1);
-  bytecask::WritePlan plan{kSnapSeq};
-  plan.put(to_bytes("k"), to_bytes("v1"));
+  // Only a check that needs the log is too old for it: an absent key here.
+  bytecask::WritePlan plan{kSnapSeq, bytecask::kOriginMarker};
+  plan.put(to_bytes("absent"), to_bytes("v1"));
   CHECK(t.validate_preconditions(plan, deletes) == Verdict::TooOld);
-  bytecask::WritePlan at_horizon{kSnapSeq + 1};
-  at_horizon.put(to_bytes("k"), to_bytes("v1"));
+  bytecask::WritePlan present{kSnapSeq, bytecask::kOriginMarker};
+  present.put(to_bytes("k"), to_bytes("v1"));
+  CHECK(t.validate_preconditions(present, deletes) == Verdict::Holds);
+  bytecask::WritePlan at_horizon{kSnapSeq + 1, bytecask::kOriginMarker};
+  at_horizon.put(to_bytes("absent"), to_bytes("v1"));
   CHECK(t.validate_preconditions(at_horizon, deletes) == Verdict::Holds);
   // A plan on the snapshot itself is never too old: it does not use the log.
   bytecask::WritePlan on_snapshot{make_snapshot({{"k", kde(10, 0, 1, 5)}})};
   on_snapshot.put(to_bytes("k"), to_bytes("v1"));
   CHECK(t.validate_preconditions(on_snapshot, deletes) == Verdict::Holds);
+}
+
+TEST_CASE("validate_preconditions: a read point on another history or past the head is too old",
+          "[validate_preconditions]") {
+  // A sequence names a state only within one history (docs/bytecask_design.md,
+  // "Checking a plan by its read sequence"). make_state holds no marker, so
+  // its marker at every sequence is the origin.
+  auto state = make_state({{"k", kde(10, 0, 1, 5)}});  // next_seq 100
+  auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  const auto verdict = [&](std::uint64_t read_seq, bytecask::ChangeMarker m) {
+    bytecask::WritePlan plan{read_seq, m};
+    plan.put(to_bytes("k"), to_bytes("v1"));
+    return t.validate_preconditions(plan, deletes);
+  };
+  CHECK(verdict(kSnapSeq, bytecask::kOriginMarker) == Verdict::Holds);
+  CHECK(verdict(kSnapSeq, bytecask::ChangeMarker{5, 42}) == Verdict::TooOld);
+  CHECK(verdict(99, bytecask::kOriginMarker) == Verdict::Holds);
+  CHECK(verdict(100, bytecask::kOriginMarker) == Verdict::TooOld);
 }
 
 TEST_CASE("validate_preconditions: a removal after the state checked is not part of it",
@@ -9567,6 +9590,22 @@ TEST_CASE("CommitResult apply_batch conflict returns nullopt",
 // Plans checked by read sequence (CONTRACT.md, "A plan is checked by its
 // read sequence" and "A plan read too long ago is refused as TooOld").
 // ---------------------------------------------------------------------------
+namespace {
+// A read point taken from db now: what a plan built away from its reads
+// carries (WritePlan(sequence, marker)).
+struct ReadPoint {
+  std::uint64_t seq{0};
+  bytecask::ChangeMarker marker{};
+};
+auto read_point(const bytecask::DB &db) -> ReadPoint {
+  const auto snap = db.snapshot();
+  return {snap.sequence(), snap.marker()};
+}
+auto plan_at(const ReadPoint &r) -> bytecask::WritePlan {
+  return bytecask::WritePlan{r.seq, r.marker};
+}
+} // namespace
+
 TEST_CASE("read sequence: a snapshot's sequence is the last write it sees",
           "[apply_batch][read_sequence]") {
   TempDir td;
@@ -9588,15 +9627,11 @@ TEST_CASE("read sequence: a plan built from a bare sequence is checked "
   auto db = bytecask::DB::open(td.path / "db");
   db.put({}, to_bytes("k"), to_bytes("v0"));
   db.put({}, to_bytes("gone"), to_bytes("v0"));
-  std::uint64_t read_seq = 0;
-  {
-    auto snap = db.snapshot();
-    read_seq = snap.sequence();
-  }  // the snapshot is gone; the plan carries a number
+  const auto read_seq = read_point(db);  // the plan carries two numbers
 
   SECTION("nothing it touches changed: commits") {
     db.put({}, to_bytes("other"), to_bytes("x"));
-    bytecask::WritePlan plan{read_seq};
+    auto plan = plan_at(read_seq);
     plan.ensure_unchanged(to_bytes("gone"));
     plan.ensure_range_unchanged(to_bytes("j"), to_bytes("l"));
     plan.put(to_bytes("k"), to_bytes("v1"));
@@ -9605,7 +9640,7 @@ TEST_CASE("read sequence: a plan built from a bare sequence is checked "
   }
   SECTION("a written key changed: conflict") {
     db.put({}, to_bytes("k"), to_bytes("v1"));
-    bytecask::WritePlan plan{read_seq};
+    auto plan = plan_at(read_seq);
     plan.put(to_bytes("k"), to_bytes("v2"));
     const auto r = db.apply_batch({}, std::move(plan));
     REQUIRE_FALSE(r.has_value());
@@ -9613,7 +9648,7 @@ TEST_CASE("read sequence: a plan built from a bare sequence is checked "
   }
   SECTION("a guarded key was deleted: conflict") {
     (void)db.del({}, to_bytes("gone"));
-    bytecask::WritePlan plan{read_seq};
+    auto plan = plan_at(read_seq);
     plan.ensure_unchanged(to_bytes("gone"));
     plan.put(to_bytes("k"), to_bytes("v1"));
     const auto r = db.apply_batch({}, std::move(plan));
@@ -9622,7 +9657,7 @@ TEST_CASE("read sequence: a plan built from a bare sequence is checked "
   }
   SECTION("a key in a guarded range was deleted by a range delete: conflict") {
     db.del_range({}, to_bytes("g"), to_bytes("h"));
-    bytecask::WritePlan plan{read_seq};
+    auto plan = plan_at(read_seq);
     plan.ensure_range_unchanged(to_bytes("a"), to_bytes("z"));
     plan.put(to_bytes("other"), to_bytes("y"));
     const auto r = db.apply_batch({}, std::move(plan));
@@ -9644,15 +9679,15 @@ TEST_CASE("read sequence: a delete earlier in the same group commit is a change"
   auto db = bytecask::DB::open(td.path / "db");
   db.put({}, to_bytes("k"), to_bytes("v0"));
   db.put({}, to_bytes("r"), to_bytes("v0"));
-  const auto read_seq = db.snapshot().sequence();
+  const auto read_seq = read_point(db);
   const bool on_snapshot = GENERATE(false, true);
   INFO((on_snapshot ? "plans on a snapshot" : "plans on a read sequence"));
   const auto plan = [&] {
     return on_snapshot ? bytecask::WritePlan{db.snapshot()}
-                       : bytecask::WritePlan{read_seq};
+                       : plan_at(read_seq);
   };
 
-  bytecask::WritePlan planA{read_seq};
+  auto planA = plan_at(read_seq);
   planA.del(to_bytes("k"));
   planA.del(to_bytes("r"));
   auto planB = plan();
@@ -9754,15 +9789,15 @@ TEST_CASE("read sequence: a range delete is one entry in the delete log, whateve
   for (int i = 0; i < 2000; ++i)
     db.put({.sync = false}, to_bytes(std::format("r{:04}", i)), to_bytes("x"));
   db.put({}, to_bytes("k"), to_bytes("v0"));
-  const auto read_seq = db.snapshot().sequence();
+  const auto read_seq = read_point(db);
   db.del_range({}, to_bytes("r"), to_bytes("s"));
 
-  bytecask::WritePlan outside{read_seq};
+  auto outside = plan_at(read_seq);
   outside.put(to_bytes("k"), to_bytes("v1"));
   CHECK(db.apply_batch({}, std::move(outside)).has_value());
   for (const auto *key : {"r0005", "r9999"}) {
     INFO(key);
-    bytecask::WritePlan inside{read_seq};
+    auto inside = plan_at(read_seq);
     inside.put(to_bytes(key), to_bytes("v1"));
     const auto r = db.apply_batch({}, std::move(inside));
     REQUIRE_FALSE(r.has_value());
@@ -9783,75 +9818,163 @@ TEST_CASE("WritePlan: a moved-from snapshot is refused",
   CHECK(db.apply_batch({}, std::move(plan)).has_value());
 }
 
-TEST_CASE("read sequence: a sequence past the latest throws",
+TEST_CASE("read point: one read on another history is refused as TooOld",
           "[apply_batch][read_sequence]") {
+  // A sequence names a state only within one history. Two copies of one
+  // database stand in for a crash or a failover: each starts its own
+  // history at open, and writes other things under the same sequences
+  // (CONTRACT.md, "A plan on a read point that cannot be checked").
   TempDir td;
-  auto db = bytecask::DB::open(td.path / "db");
-  db.put({}, to_bytes("k"), to_bytes("v0"));
-  bytecask::WritePlan plan{db.snapshot().sequence() + 1};
-  plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK_THROWS_AS(db.apply_batch({}, std::move(plan)), std::invalid_argument);
-  CHECK(to_string(*get_val(db, to_bytes("k"))) == "v0");
+  const auto dir_a = td.path / "a";
+  const auto dir_b = td.path / "b";
+  ReadPoint shared;
+  {
+    auto db = bytecask::DB::open(dir_a);
+    db.put({}, to_bytes("k"), to_bytes("v0"));
+    shared = read_point(db);
+    db.close();
+  }
+  std::filesystem::copy(dir_a, dir_b);
+  auto a = bytecask::DB::open(dir_a);
+  auto b = bytecask::DB::open(dir_b);
+
+  SECTION("read on the other copy, under sequences both reached") {
+    a.put({}, to_bytes("k"), to_bytes("a1"));
+    const auto read = read_point(a);
+    b.put({}, to_bytes("k"), to_bytes("b1"));
+    b.put({}, to_bytes("x"), to_bytes("b2"));
+    REQUIRE(b.snapshot().sequence() >= read.seq);
+    // By sequences alone k is unchanged: b's entry is at or below the read.
+    auto plan = plan_at(read);
+    plan.put(to_bytes("k"), to_bytes("lost update"));
+    const auto r = b.apply_batch({}, std::move(plan));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == bytecask::PlanRefusal::TooOld);
+    CHECK(to_string(*get_val(b, to_bytes("k"))) == "b1");
+  }
+  SECTION("read past the latest sequence") {
+    a.put({}, to_bytes("k"), to_bytes("a1"));
+    a.put({}, to_bytes("k"), to_bytes("a2"));
+    const auto read = read_point(a);
+    REQUIRE(b.snapshot().sequence() < read.seq);
+    auto plan = plan_at(read);
+    plan.put(to_bytes("k"), to_bytes("v"));
+    const auto r = b.apply_batch({}, std::move(plan));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == bytecask::PlanRefusal::TooOld);
+    // Its own history, past its own latest, too.
+    auto ahead = bytecask::WritePlan{read.seq + 1, read.marker};
+    ahead.put(to_bytes("k"), to_bytes("v"));
+    const auto r2 = a.apply_batch({}, std::move(ahead));
+    REQUIRE_FALSE(r2.has_value());
+    CHECK(r2.error() == bytecask::PlanRefusal::TooOld);
+  }
+  SECTION("read below both opens: the shared history checks as usual") {
+    auto plan = plan_at(shared);
+    plan.put(to_bytes("k"), to_bytes("v1"));
+    CHECK(b.apply_batch({}, std::move(plan)).has_value());
+  }
 }
 
-TEST_CASE("read sequence: a plan read too long ago is refused as TooOld",
-          "[apply_batch][read_sequence]") {
+TEST_CASE("read point: every open as a leader starts a new history",
+          "[apply_batch][read_sequence][replication]") {
+  // CONTRACT.md, "Every open as a leader starts a new history".
   TempDir td;
   const auto dir = td.path / "db";
-
-  SECTION("read before a reopen") {
-    std::uint64_t read_seq = 0;
-    {
-      auto db = bytecask::DB::open(dir);
-      db.put({}, to_bytes("k"), to_bytes("v0"));
-      read_seq = db.snapshot().sequence();
-      db.put({}, to_bytes("k"), to_bytes("v1"));
-      db.close();
-    }
+  bytecask::ChangeMarker first;
+  {
+    auto db = bytecask::DB::open(dir);  // empty: it gets a marker too
+    first = db.snapshot().marker();
+    CHECK(first != bytecask::kOriginMarker);
+    CHECK(first.since_sequence == db.snapshot().sequence());
+    db.put({}, to_bytes("k"), to_bytes("v0"));
+    db.close();
+  }
+  bytecask::ChangeMarker second;
+  {
     auto db = bytecask::DB::open(dir);
-    bytecask::WritePlan plan{read_seq};
-    plan.put(to_bytes("k"), to_bytes("v2"));
+    second = db.snapshot().marker();
+    CHECK(second != first);
+    CHECK(second.since_sequence > first.since_sequence);
+    db.close();
+  }
+  {
+    auto db = bytecask::DB::open(dir, {.initial_mode = bytecask::Mode::Follower});
+    CHECK(db.snapshot().marker() == second);  // a follower's open writes none
+    db.close();
+  }
+}
+
+TEST_CASE("read point: only a check that needs the delete log is too old for it",
+          "[apply_batch][read_sequence]") {
+  // A present key is decided by its entry's sequence; an absent one, and
+  // the delete half of a range, need the deletes since the read point
+  // (docs/bytecask_design.md, "Checking a plan by its read sequence").
+  TempDir td;
+  const auto dir = td.path / "db";
+  const auto expect_too_old = [](bytecask::DB &db, bytecask::WritePlan plan) {
     const auto r = db.apply_batch({}, std::move(plan));
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error() == bytecask::PlanRefusal::TooOld);
-    // One read at the recovered state is not too old.
-    bytecask::WritePlan fresh{db.snapshot().sequence()};
-    fresh.put(to_bytes("k"), to_bytes("v2"));
-    CHECK(db.apply_batch({}, std::move(fresh)).has_value());
+  };
+  const auto check_read = [&](bytecask::DB &db, const ReadPoint &read) {
+    {
+      auto plan = plan_at(read);
+      plan.ensure_unchanged(to_bytes("k"));
+      plan.put(to_bytes("k"), to_bytes("v1"));
+      CHECK(db.apply_batch({}, std::move(plan)).has_value());
+    }
+    {
+      auto plan = plan_at(read);
+      plan.put(to_bytes("absent"), to_bytes("v1"));
+      expect_too_old(db, std::move(plan));
+    }
+    {
+      auto plan = plan_at(read);
+      plan.ensure_range_unchanged(to_bytes("a"), to_bytes("b"));
+      plan.put(to_bytes("k"), to_bytes("v2"));
+      expect_too_old(db, std::move(plan));
+    }
+    {
+      // A present key that changed is a conflict, whatever the log holds.
+      db.put({}, to_bytes("k"), to_bytes("v3"));
+      auto plan = plan_at(read);
+      plan.put(to_bytes("k"), to_bytes("v4"));
+      const auto r = db.apply_batch({}, std::move(plan));
+      REQUIRE_FALSE(r.has_value());
+      CHECK(r.error() == bytecask::PlanRefusal::Conflict);
+    }
+  };
+
+  SECTION("read before a reopen") {
+    ReadPoint read;
+    {
+      auto db = bytecask::DB::open(dir);
+      db.put({}, to_bytes("k"), to_bytes("v0"));
+      read = read_point(db);
+      db.close();
+    }
+    auto db = bytecask::DB::open(dir);
+    check_read(db, read);
   }
   SECTION("more deletes since than the log holds") {
     auto db = bytecask::DB::open(dir, {.max_delete_log_bytes = 512});
     db.put({}, to_bytes("k"), to_bytes("v0"));
-    const auto read_seq = db.snapshot().sequence();
+    const auto read = read_point(db);
     for (int i = 0; i < 64; ++i) {
       const auto key = std::format("d{:03}", i);
       db.put({}, to_bytes(key), to_bytes("x"));
       (void)db.del({}, to_bytes(key));
     }
-    bytecask::WritePlan plan{read_seq};
-    plan.put(to_bytes("k"), to_bytes("v1"));
-    const auto r = db.apply_batch({}, std::move(plan));
-    REQUIRE_FALSE(r.has_value());
-    CHECK(r.error() == bytecask::PlanRefusal::TooOld);
-    CHECK(to_string(*get_val(db, to_bytes("k"))) == "v0");
+    check_read(db, read);
   }
-  SECTION("no log at all: any delete since makes it too old") {
+  SECTION("no log at all: any delete since") {
     auto db = bytecask::DB::open(dir, {.max_delete_log_bytes = 0});
     db.put({}, to_bytes("k"), to_bytes("v0"));
     db.put({}, to_bytes("d"), to_bytes("x"));
-    const auto before = db.snapshot().sequence();
-    {
-      bytecask::WritePlan plan{before};
-      plan.put(to_bytes("k"), to_bytes("v1"));
-      CHECK(db.apply_batch({}, std::move(plan)).has_value());
-    }
-    const auto read_seq = db.snapshot().sequence();
+    const auto read = read_point(db);
     (void)db.del({}, to_bytes("d"));
-    bytecask::WritePlan plan{read_seq};
-    plan.put(to_bytes("k"), to_bytes("v2"));
-    const auto r = db.apply_batch({}, std::move(plan));
-    REQUIRE_FALSE(r.has_value());
-    CHECK(r.error() == bytecask::PlanRefusal::TooOld);
+    check_read(db, read);
   }
 }
 

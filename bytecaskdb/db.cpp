@@ -161,8 +161,9 @@ DB::DB(std::filesystem::path dir, Options opts)
     if (test_before_validate_) test_before_validate_(*initial);
 #endif
     validate_state_consistency(*initial);
-    // Plans read before this open are too old: their removals were never
-    // recorded here. One read at the recovered state itself is not.
+    if (initial->mode == Mode::Leader) initial = with_open_marker(*initial);
+    // The deletes before this open were never recorded here: a plan that
+    // needs them is too old.
     deletes_.reset(initial->next_seq - 1);
     store_initial_state(std::move(initial));
   } catch (...) {
@@ -359,14 +360,6 @@ auto DB::apply_batch(WriteOptions opts, WritePlan plan)
   const auto published = load_state();
   if (auto refusal = write_refusal(*published)) {
     std::rethrow_exception(refusal);
-  }
-  // A read sequence names a state this DB published. One past the latest
-  // names none: no snapshot gave it, and checking it against the head would
-  // pass a plan whose reads came from nowhere.
-  if (const auto r = plan.read_sequence(); r && *r >= published->next_seq) {
-    throw std::invalid_argument{std::format(
-        "plan read sequence {} is past the latest sequence {}", *r,
-        published->next_seq - 1)};
   }
   if (plan.write_bytes() > max_batch_bytes()) {
     throw std::invalid_argument{std::format(

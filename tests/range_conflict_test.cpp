@@ -24,8 +24,10 @@
 //               the pipeline head but not yet published
 //   vacuum      published, then vacuum relocates keys: no change by itself
 //   resume      the last write's fdatasync fails, resume() replays it; a
-//               plan built from a sequence read before resume() is refused
-//               as TooOld, one built from a snapshot is checked as usual
+//               plan built from a read point before resume() conflicts on a
+//               present key that changed and is otherwise refused as TooOld
+//               (resume() reset the delete log its range check needs); one
+//               built from a snapshot is checked as usual
 
 #include <algorithm>
 #include <expected>
@@ -301,7 +303,7 @@ void run_rounds(Placement placement, PlanBase base, std::uint64_t seed,
         std::uniform_int_distribution<int>{0, 2}(rng));
     auto plan = base == PlanBase::Snapshot
                     ? bytecask::WritePlan{std::move(snap)}
-                    : bytecask::WritePlan{snap.sequence()};
+                    : bytecask::WritePlan{snap.sequence(), snap.marker()};
     if (shape != PlanShape::DelRange)
       plan.ensure_range_unchanged(to_bytes(from), to_bytes(to));
     if (shape != PlanShape::Guard)
@@ -366,8 +368,18 @@ void run_rounds(Placement placement, PlanBase base, std::uint64_t seed,
     INFO(std::format("plan shape {} over [{}, {}), {} intervening writes",
                      static_cast<int>(shape), from, to, n));
     if (placement == Placement::Resume && base == PlanBase::Sequence) {
+      // resume() reset the delete log: a key present in the range with a
+      // newer entry is a conflict; otherwise the range's delete half needs
+      // the log, and the plan is too old.
+      const auto now = slice(model, from, to);
+      const auto then = slice(snap_model, from, to);
+      const bool present_changed = std::ranges::any_of(now, [&](const auto &kv) {
+        const auto it = then.find(kv.first);
+        return it == then.end() || it->second != kv.second;
+      });
       REQUIRE_FALSE(result.has_value());
-      REQUIRE(result.error() == bytecask::PlanRefusal::TooOld);
+      REQUIRE(result.error() == (present_changed ? bytecask::PlanRefusal::Conflict
+                                                 : bytecask::PlanRefusal::TooOld));
       ++counts.too_old;
       REQUIRE(db_contents(db) == model_contents(model));
       continue;

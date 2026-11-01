@@ -454,6 +454,12 @@ auto Snapshot::sequence() const -> std::uint64_t {
   return impl_->snap.sequence();
 }
 
+auto Snapshot::marker() const -> ChangeMarker {
+  if (!impl_) throw std::logic_error{"Snapshot: moved from"};
+  const auto m = impl_->snap.marker();
+  return {m.since_sequence, m.id};
+}
+
 auto Snapshot::get(const ReadOptions& opts,
                    BytesView key,
                    Bytes& out) const -> bool {
@@ -522,9 +528,11 @@ WritePlan::WritePlan(SizeLimits limits)
     : impl_{std::make_unique<Impl>(bytecask::WritePlan{
           bytecask::SizeLimits{limits.max_key_bytes, limits.max_value_bytes}})} {}
 
-WritePlan::WritePlan(std::uint64_t read_sequence, SizeLimits limits)
+WritePlan::WritePlan(std::uint64_t read_sequence, ChangeMarker marker,
+                     SizeLimits limits)
     : impl_{std::make_unique<Impl>(bytecask::WritePlan{
           read_sequence,
+          bytecask::ChangeMarker{marker.since_sequence, marker.id},
           bytecask::SizeLimits{limits.max_key_bytes, limits.max_value_bytes}})} {}
 
 // A moved-from Snapshot has no Impl; the engine's WritePlan(Snapshot)
