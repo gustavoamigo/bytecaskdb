@@ -48,21 +48,6 @@ e051_09_01_02
 e051_09_01_03
 e061_13_01_01
 e061_13_01_02
-e071_01_01_01
-e071_01_01_02
-e071_02_01_01
-e071_03_01_01
-e071_03_01_02
-e071_05_01_01
-e071_05_01_02
-e071_05_01_03
-e071_05_02_01
-e071_05_02_02
-e071_06_01_01
-e071_06_01_02
-e071_06_01_03
-e071_06_02_01
-e071_06_02_02
 e081_01_01_01
 e081_01_01_02
 e081_02_01_01
@@ -275,9 +260,6 @@ f051_07_01_01
 f051_07_01_02
 f051_08_01_01
 f051_08_01_02
-f081_01_01  # UNION, EXCEPT: set operations
-f081_01_02  # UNION, EXCEPT: set operations
-f081_01_03  # UNION, EXCEPT: set operations
 f131_02_01_01  # a join of a grouped view
 f131_03_01_01  # an aggregate over a grouped view: needs a derived table
 f131_03_01_02  # an aggregate over a grouped view: needs a derived table

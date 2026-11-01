@@ -1117,6 +1117,94 @@ TEST_CASE("binder: each refusal carries PostgreSQL's SQLSTATE", "[sql][binder][s
   CHECK(state("CREATE TABLE u2 (k BIGINT PRIMARY KEY, v TIMESTAMPTZ)") == "42601");
 }
 
+TEST_CASE("binder: a set operation binds its arms alone and resolves their columns", "[sql][binder][setop]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(),
+                               "CREATE TABLE u (k INTEGER PRIMARY KEY, n SMALLINT, big BIGINT, dbl DOUBLE PRECISION, "
+                               "r REAL, s TEXT, v VARCHAR(5), d NUMERIC(10, 2), e NUMERIC(8, 3), ts TIMESTAMP, dt DATE)")
+                        .stmt));
+  const auto& cat = f.cat();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return "bound";
+  };
+  auto type_of = [&](std::string_view sql) {
+    auto b = bind_sql(cat, sql);
+    const auto* set = std::get_if<logical::SetOp>(&root(b).op);
+    REQUIRE(set != nullptr);
+    return set->outputs.at(0).expr.type.kind;
+  };
+  auto b = bind_sql(cat, "SELECT qty AS a, id FROM t UNION ALL SELECT big, k FROM u");
+  const auto& set = std::get<logical::SetOp>(root(b).op);
+  CHECK(set.kind == logical::SetOp::Kind::Union);
+  CHECK(set.all);
+  CHECK(set.outputs.size() == 2);
+  CHECK(set.outputs[0].name == "a");  // the left arm's
+  CHECK(std::holds_alternative<logical::Project>(set.left->op));
+  CHECK(std::holds_alternative<logical::Project>(set.right->op));
+
+  // A LIMIT over all of it is the root's.
+  auto limited = bind_sql(cat, "SELECT qty FROM t UNION SELECT big FROM u LIMIT 4");
+  REQUIRE(std::holds_alternative<logical::Limit>(root(limited).op));
+  CHECK(std::get<logical::Limit>(root(limited).op).n == 4);
+  CHECK(std::holds_alternative<logical::SetOp>(std::get<logical::Limit>(root(limited).op).input->op));
+
+  // The type of a column both arms give.
+  CHECK(type_of("SELECT n FROM u UNION SELECT k FROM u") == SqlKind::Integer);
+  CHECK(type_of("SELECT k FROM u UNION SELECT n FROM u") == SqlKind::Integer);
+  CHECK(type_of("SELECT k FROM u UNION SELECT big FROM u") == SqlKind::BigInt);
+  CHECK(type_of("SELECT k FROM u UNION SELECT dbl FROM u") == SqlKind::Double);
+  CHECK(type_of("SELECT dbl FROM u UNION SELECT r FROM u") == SqlKind::Double);
+  CHECK(type_of("SELECT big FROM u UNION SELECT dbl FROM u") == SqlKind::Double);
+  CHECK(type_of("SELECT s FROM u UNION SELECT v FROM u") == SqlKind::Text);
+  CHECK(type_of("SELECT v FROM u UNION SELECT v FROM u") == SqlKind::Varchar);
+  CHECK(type_of("SELECT d FROM u UNION SELECT d FROM u") == SqlKind::Decimal);
+  CHECK(type_of("SELECT dt FROM u INTERSECT SELECT dt FROM u") == SqlKind::Date);
+  CHECK(type_of("SELECT 1 UNION SELECT 2147483648") == SqlKind::BigInt);
+
+  CHECK(state("SELECT qty FROM t UNION SELECT big, k FROM u") == "42601");  // a different number of columns
+  CHECK(state("SELECT qty FROM t INTERSECT SELECT s FROM u") == "42804");
+  CHECK(state("SELECT s FROM u EXCEPT SELECT dbl FROM u") == "42804");
+  CHECK(state("SELECT ts FROM u UNION SELECT k FROM u") == "42804");
+  CHECK(state("SELECT ts FROM u UNION SELECT dt FROM u") == "42601");  // one class, not resolved yet
+  CHECK(state("SELECT k FROM u UNION SELECT r FROM u") == "42601");  // an integer rounded to a REAL: not yet
+  CHECK(state("SELECT d FROM u UNION SELECT e FROM u") == "42601");
+  CHECK(state("SELECT d FROM u UNION SELECT k FROM u") == "42601");
+  CHECK(state("SELECT qty FROM t UNION SELECT 'a'") == "42601");  // a literal of no type
+  CHECK(state("SELECT qty FROM t UNION SELECT NULL") == "42601");
+  CHECK(state("SELECT qty FROM t UNION SELECT big FROM u ORDER BY qty") == "42601");
+  CHECK(state("SELECT qty FROM t UNION SELECT big FROM nope") == "42P01");
+  CHECK(state("SELECT qty FROM t UNION SELECT nope FROM u") == "42703");
+  CHECK(state("SELECT qty FROM t UNION SELECT big FROM u FOR UPDATE") == "0A000");
+  CHECK(state("(SELECT qty FROM t FOR UPDATE) UNION SELECT big FROM u") == "0A000");
+  CHECK(state("SELECT DISTINCT qty FROM t UNION SELECT big FROM u") == "42601");
+  CHECK(state("SELECT COUNT(*) FROM t UNION SELECT big FROM u") == "42601");
+  CHECK(state("SELECT qty FROM t GROUP BY qty UNION SELECT big FROM u") == "42601");
+  CHECK(state("(SELECT qty FROM t UNION SELECT big FROM u LIMIT 1) UNION SELECT k FROM u") == "42601");
+  CHECK(state("(SELECT qty FROM t UNION SELECT big FROM u) UNION SELECT k FROM u LIMIT 1") == "bound");
+
+  // In a subquery: of one column, uncorrelated, not inside another.
+  CHECK(state("SELECT id FROM t WHERE qty IN (SELECT big FROM u UNION SELECT k FROM u)") == "bound");
+  CHECK(state("SELECT id FROM t WHERE qty IN (SELECT big, k FROM u UNION SELECT k, k FROM u)") == "42601");
+  CHECK(state("SELECT id FROM t WHERE EXISTS (SELECT big, k FROM u UNION SELECT k, k FROM u)") == "bound");
+  CHECK(state("SELECT id FROM t WHERE qty IN (SELECT big FROM u WHERE k = id UNION SELECT k FROM u)") == "42601");  // correlated
+  CHECK(state("SELECT id FROM t WHERE qty IN (SELECT k FROM u WHERE big IN (SELECT k FROM u UNION SELECT k FROM u) UNION SELECT k FROM u)") ==
+        "42601");  // a subquery inside one
+  CHECK(state("SELECT qty FROM t UNION SELECT big FROM u WHERE big IN (SELECT k FROM u UNION SELECT n FROM u)") == "bound");
+
+  // Each arm is rewritten alone: the Filter of a WHERE reaches its Get.
+  auto filtered = bind_sql(cat, "SELECT qty FROM t WHERE id = $1 UNION SELECT big FROM u WHERE k = $2 LIMIT 2");
+  logical::rewrite(root(filtered));
+  const auto& top = std::get<logical::SetOp>(std::get<logical::Limit>(root(filtered).op).input->op);
+  CHECK(find<logical::Filter>(*top.left) != nullptr);
+  CHECK(find<logical::Filter>(*top.right) != nullptr);
+  CHECK(find<logical::Get>(*top.right)->table->name == "u");
+}
+
 TEST_CASE("binder: GROUP BY, HAVING and the aggregates, as PostgreSQL binds them", "[sql][binder][group]") {
   sql_test::Fixture f;
   f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE g (k BIGINT PRIMARY KEY, a INTEGER, d NUMERIC(6,2), "

@@ -265,9 +265,60 @@ TEST_CASE("parser: CREATE VIEW and DROP VIEW", "[sql][parser][view]") {
   CHECK_THROWS_AS(parse("CREATE TEMPORARY VIEW v AS SELECT a FROM t"), SqlError);
   CHECK_THROWS_AS(parse("CREATE VIEW v WITH (security_barrier) AS SELECT a FROM t"), SqlError);
   CHECK_THROWS_AS(parse("CREATE VIEW s.v AS SELECT a FROM t"), SqlError);
-  CHECK_THROWS_AS(parse("CREATE VIEW v AS SELECT a FROM t UNION SELECT a FROM u"), SqlError);
+  CHECK(std::get<CreateView>(parse("CREATE VIEW v AS SELECT a FROM t UNION SELECT a FROM u")).query.set != nullptr);
   CHECK_THROWS_AS(parse("DROP VIEW a, b"), SqlError);
   CHECK_THROWS_AS(parse("DROP VIEW v CASCADE"), SqlError);
+}
+
+TEST_CASE("parser: UNION, INTERSECT and EXCEPT, their ALL and precedence", "[sql][parser][setop]") {
+  using Kind = SetOperation::Kind;
+  auto top = [](std::string_view sql) { return std::get<Select>(parse(sql)); };
+  auto s = top("SELECT a FROM t UNION SELECT b FROM u");
+  REQUIRE(s.set != nullptr);
+  CHECK(s.set->kind == Kind::Union);
+  CHECK_FALSE(s.set->all);
+  CHECK(s.set->left.table == "t");
+  CHECK(s.set->right.table == "u");
+  CHECK(s.targets.empty());
+  CHECK(top("SELECT a FROM t UNION ALL SELECT b FROM u").set->all);
+  CHECK_FALSE(top("SELECT a FROM t UNION DISTINCT SELECT b FROM u").set->all);
+  CHECK(top("SELECT a FROM t EXCEPT ALL SELECT b FROM u").set->kind == Kind::Except);
+  CHECK(top("SELECT a FROM t INTERSECT SELECT b FROM u").set->kind == Kind::Intersect);
+
+  // INTERSECT binds tighter; UNION and EXCEPT group to the left; parentheses group.
+  auto p = top("SELECT 1 UNION SELECT 2 INTERSECT SELECT 3");
+  CHECK(p.set->kind == Kind::Union);
+  CHECK(p.set->left.set == nullptr);
+  REQUIRE(p.set->right.set != nullptr);
+  CHECK(p.set->right.set->kind == Kind::Intersect);
+  auto l = top("SELECT 1 EXCEPT SELECT 2 UNION SELECT 3");
+  CHECK(l.set->kind == Kind::Union);
+  REQUIRE(l.set->left.set != nullptr);
+  CHECK(l.set->left.set->kind == Kind::Except);
+  auto g = top("SELECT 1 UNION (SELECT 2 UNION SELECT 3)");
+  CHECK(g.set->left.set == nullptr);
+  CHECK(g.set->right.set != nullptr);
+
+  // ORDER BY and LIMIT after the last arm are the combined rows'; a parenthesised arm keeps its own.
+  auto o = top("SELECT a FROM t UNION SELECT b FROM u ORDER BY a LIMIT 3");
+  CHECK(o.limit == 3);
+  CHECK(o.order_by.size() == 1);
+  CHECK_FALSE(o.set->right.limit.has_value());
+  auto a = top("(SELECT a FROM t ORDER BY a LIMIT 1) UNION (SELECT b FROM u LIMIT 2)");
+  CHECK_FALSE(a.limit.has_value());
+  CHECK(a.set->left.limit == 1);
+  CHECK(a.set->left.order_by.size() == 1);
+  CHECK(a.set->right.limit == 2);
+
+  // As a subquery.
+  auto q = top("SELECT id FROM t WHERE EXISTS (SELECT a FROM t UNION ALL SELECT b FROM u)");
+  REQUIRE(q.where.size() == 1);
+  CHECK(q.where[0].subquery->set != nullptr);
+
+  CHECK_THROWS_AS(parse("SELECT a FROM t UNION CORRESPONDING SELECT b FROM u"), SqlError);
+  CHECK_THROWS_AS(parse("SELECT a FROM t UNION SELECT b FROM u FOR UPDATE"), SqlError);
+  CHECK_THROWS_AS(parse("SELECT a FROM t UNION SELECT b FROM u OFFSET 1"), SqlError);
+  CHECK_THROWS_AS(parse("WITH c AS (SELECT 1) SELECT a FROM t UNION SELECT b FROM u"), SqlError);
 }
 
 TEST_CASE("parser: SELECT … FOR UPDATE, and no other locking clause", "[sql][parser][txn]") {

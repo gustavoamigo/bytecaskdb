@@ -246,8 +246,24 @@ struct Delete {
   const Table* table{nullptr};
 };
 
+// UNION, INTERSECT or EXCEPT of two queries' rows, each a Project (under a
+// Sort or Limit of its own) or another SetOp: the rows of both, or those in
+// both, or those in `left` and not in `right`, each row once unless `all`
+// keeps them (docs/planner_design.md, *Set operations*). Two rows are alike
+// where each column is equal, NULL equal to NULL. `outputs` are its columns:
+// the names of the left arm's, the types the arms' resolve to, each expr a
+// Param of that type that stands for the column and is read by no one. Only
+// the root may sit under a Limit, and none has a Sort.
+struct SetOp {
+  using Kind = ast::SetOperation::Kind;
+  NodePtr left, right;
+  Kind kind{Kind::Union};
+  bool all{false};
+  std::vector<Output> outputs;
+};
+
 struct Node {
-  std::variant<Get, Empty, OneRow, Filter, Project, Join, Aggregate, Sort, Limit, Insert, Update, Delete> op;
+  std::variant<Get, Empty, OneRow, Filter, Project, Join, Aggregate, Sort, Limit, SetOp, Insert, Update, Delete> op;
   // The columns something above reads from this operator's rows: set by
   // projection pruning, empty before it.
   std::vector<ColumnRef> output;
