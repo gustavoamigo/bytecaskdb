@@ -112,8 +112,9 @@ kind the transformer doesn't take is refused with its position.
 - **`+`, `-`, `*`, `/`, comparisons, `IS [NOT] NULL`, `AND`, `OR` and
   `NOT` of columns** are values in a select list (*Expressions over
   columns*, below).
-- **`CASE`, `COALESCE` and `NULLIF`** fold constants only (of a column,
-  a parameter or a subquery they are refused, 42601, until #669). The result type is PostgreSQL's union rule: unknown
+- **`CASE`, `COALESCE` and `NULLIF`** of constants fold. Of a column, a
+  parameter or a subquery they are values in a select list (*Expressions
+  over columns*, below). The result type is PostgreSQL's union rule: unknown
   literals give way to the typed branches, which must be of one class
   (42804, `CASE types … cannot be matched`); integers widen to the
   widest; a numeric branch is `numeric` and keeps its own scale
@@ -128,8 +129,9 @@ kind the transformer doesn't take is refused with its position.
   answer needs: a `WHEN` after the first true one is never evaluated,
   and a condition or the taken result that raises (22012, 22003) raises.
   A result not taken that raises is refused (42601): its type is not
-  known without evaluating it. Float branches are refused. The output
-  column is named `case`, `coalesce` or `nullif`.
+  known without evaluating it (with a column among the branches this
+  goes away: *Expressions over columns*). Float branches of constants are
+  refused. The output column is named `case`, `coalesce` or `nullif`.
 - **`||` and the string functions** fold constants only (of a column, a
   parameter or a subquery they are refused, 42601, until #671). The parser reads PostgreSQL's
   spellings as the calls the grammar makes of them: `TRIM([LEADING |
@@ -400,9 +402,9 @@ That includes:
   alias of a join, an output name in `GROUP BY` or in `ORDER BY` of other
   than a column;
 - `OFFSET`, `RETURNING`, multi-row `VALUES`;
-- `CASE`, `COALESCE` and `NULLIF` of columns, parameters and subqueries, a
-  `CASE` result that is a float, a `WHEN` that is not a comparison
-  (`AND`, `OR`, `IS NULL`, `BETWEEN` as a value), `GREATEST` and `LEAST`;
+- `CASE` or `COALESCE` of a float beside another number, a `BETWEEN` or
+  `IN` as a value, `GREATEST` and `LEAST`, `CASE` outside the plain select
+  list (#685);
 - the quotient of a numeric other than constants, `%`, arithmetic and
   comparison of `REAL` and `DOUBLE PRECISION` as values, an expression in
   `ORDER BY`, `GROUP BY`, `SET` or an aggregated select list (#685, #686);
@@ -472,11 +474,12 @@ recompile after a DDL folds them again, to the types they meet then.
 A select-list item that is not a column, a constant, an aggregate or a
 subquery by itself is a *value expression*: a tree of columns, constants,
 scalar subqueries, `$n`, `+ - * /`, the six comparisons, `IS [NOT] NULL`,
-`AND`, `OR` and `NOT`. The binder types it (`Binder::value`) and gives the
-plan one `Project` output; the search plans it as a result column and
-codegen evaluates it for each row (*planner_design.md*, *Expressions over
-columns*). `CASE`, `COALESCE`, `NULLIF`, `||` and the string functions plug
-into the same tree (#669, #671); they are refused over columns until then.
+`AND`, `OR`, `NOT`, `CASE`, `COALESCE` and `NULLIF`. The binder types it
+(`Binder::value`) and gives the plan one `Project` output; the search plans
+it as a result column and codegen evaluates it for each row
+(*planner_design.md*, *Expressions over columns*). `||` and the string
+functions plug into the same tree (#671); they are refused over columns
+until then.
 
 - **Result types are PostgreSQL's, from one function (`arith_type`), for a
   constant and a column alike.** Two integers give the wider of the two
@@ -508,6 +511,32 @@ into the same tree (#669, #671); they are refused over columns until then.
   its type, or by its value for a constant; a `bigint` beside a `DECIMAL`
   that needs rescaling is refused. A product past int64 is 22003, where
   PostgreSQL's numeric is exact.
+- **`CASE`, `COALESCE` and `NULLIF`** over columns, parameters and
+  subqueries. A simple `CASE x WHEN v` is a searched one over `x = v`
+  and `NULLIF(a, b)` is `CASE WHEN a = b THEN NULL ELSE a END`.
+  - *Conditions.* A `WHEN` is any boolean expression the tree holds
+    (`AND`, `OR`, `NOT`, `IS NULL`, a comparison, a subquery's value); one
+    that is not `boolean` is 42804; NULL is not true.
+  - *Result type.* The union rule of the constants' fold, over the branches'
+    types: unknown literals and `NULL` give way; the typed branches must be of one
+    class (42804 otherwise); integers widen; `text` and `varchar` are `text`;
+    two floats are the wider float; all unknown is `text`. A `$n` among
+    the results takes the type of the first plain column among them (none:
+    refused, 42601). An unknown literal that is not a value of the type is
+    22P02.
+  - *Evaluation.* In order, and a branch only when it is taken: `CASE WHEN
+    b <> 0 THEN a / b ELSE 0 END` raises nothing, as PostgreSQL's. So the
+    refusal of a result that would raise and is not taken (constants
+    only, above) does not apply once a column, parameter or subquery is
+    among the branches. A branch of constants still folds when the
+    statement is compiled, so `CASE WHEN a > 0 THEN a ELSE 1 / 0 END` is
+    22012, as PostgreSQL's (it folds constants in untaken branches too).
+  - *Known difference.* A numeric result has one scale, the finest of its
+    branches (an integer is scale 0): `COALESCE(price, 0)` over a
+    `DECIMAL(10,2)` is `0.00` where PostgreSQL's `numeric` keeps each
+    value's own scale and gives `0`. The value is the same.
+  - *Refused (42601).* A float beside another number, different date and
+    time types, and a numeric result past 18 digits.
 - **Refused (42601).** A numeric quotient with a column or an expression in
   it: PostgreSQL's scale follows the operands' values (`select_div_scale`
   reads their leading digits), so one column's quotient has several scales
@@ -682,11 +711,15 @@ fail on them.
   (the wire's Parse), with PostgreSQL's SQLSTATE. PostgreSQL folds the same
   constants when it plans the statement, at Bind for a statement Parse left
   unplanned.
-- **A `CASE` or `COALESCE` result that would raise, and is not taken, is
-  refused.** `SELECT CASE WHEN true THEN 1 ELSE 1 / 0 END` is 1 in
+- **A `CASE` or `COALESCE` of constants whose untaken result would raise
+  is refused.** `SELECT CASE WHEN true THEN 1 ELSE 1 / 0 END` is 1 in
   PostgreSQL; here the folder evaluates a result to learn its type, so
   the statement is refused with 42601. A `WHEN` after the first true one
-  is skipped, as there.
+  is skipped, as there. With a column, parameter or subquery among the
+  branches the result is typed without evaluating it and the branch is
+  evaluated only when taken (*Expressions over columns*).
+- **A numeric `CASE` or `COALESCE` over columns has one scale,** the
+  finest of its branches; PostgreSQL's keeps each value's own.
 
 - **A view is bound again at each use,** so one its tables have outgrown
   is refused (0A000) until it is dropped and created again: a `SELECT *`

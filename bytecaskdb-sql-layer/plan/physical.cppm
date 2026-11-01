@@ -633,10 +633,28 @@ private:
       case Expr::Kind::Not: operands(1, 1); break;
       case Expr::Kind::And:
       case Expr::Kind::Or: operands(2, e.args.size()); break;
+      case Expr::Kind::Coalesce: operands(2, e.args.size()); break;
+      case Expr::Kind::Case: {
+        operands(2, e.args.size());
+        for (std::size_t i = 0; i + 1 < e.args.size(); i += 2) {
+          if (e.args[i].phys() != PhysType::Bool) broken("a CASE condition that is not a BOOLEAN");
+        }
+        break;
+      }
       case Expr::Kind::Aggregate:
       case Expr::Kind::Like:
       case Expr::Kind::Truth:
       case Expr::Kind::InSet: broken("a result column of an expression codegen does not print");
+    }
+    // A branch is of the expression's type; a numeric may be of a finer scale
+    // below it, which eval brings up, never a coarser one, which would lose digits.
+    if (e.kind == Expr::Kind::Coalesce || e.kind == Expr::Kind::Case) {
+      for (std::size_t i = 0; i < e.args.size(); ++i) {
+        if (e.kind == Expr::Kind::Case && i % 2 == 0 && i + 1 < e.args.size()) continue;  // a WHEN
+        const auto& b = e.args[i];
+        auto finer = decimal_scale(b.type) > decimal_scale(e.type) || (b.type.kind == SqlKind::Decimal && e.type.kind != SqlKind::Decimal);
+        if (b.phys() != e.phys() || finer) broken("a CASE or COALESCE branch of another type than its result");
+      }
     }
     for (const auto& a : e.args) value(a);
   }
@@ -697,7 +715,9 @@ private:
       case Expr::Kind::Sub:
       case Expr::Kind::Mul:
       case Expr::Kind::Div:
-      case Expr::Kind::Aggregate: break;
+      case Expr::Kind::Aggregate:
+      case Expr::Kind::Case:
+      case Expr::Kind::Coalesce: break;
     }
     broken("a predicate of an expression codegen does not print");
   }

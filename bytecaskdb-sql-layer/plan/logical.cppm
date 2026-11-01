@@ -59,9 +59,11 @@ struct ColumnRef {
 // comparisons, IS NULL of a column and a text column LIKE a pattern; a
 // filter, never a key's bound. In a select list the same kinds are values:
 // a BOOLEAN, NULL where SQL's logic says unknown, over operands of any
-// value expression.
+// value expression. Case and Coalesce are values of a select list only:
+// every branch is of the expression's type, or a numeric of a finer scale
+// below it, which the evaluator brings up.
 struct Expr {
-  enum class Kind { Column, Param, Const, Add, Sub, Mul, Div, Compare, Aggregate, And, Or, Not, IsNull, Like, Truth, InSet };
+  enum class Kind { Column, Param, Const, Add, Sub, Mul, Div, Compare, Aggregate, And, Or, Not, IsNull, Like, Truth, InSet, Case, Coalesce };
   enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind{Kind::Param};
   SqlType type{};
@@ -75,7 +77,9 @@ struct Expr {
   std::vector<Expr> args;       // Add, Sub, Mul, Div, Compare: two; Aggregate: none (COUNT(*)) or its argument;
                                 // And, Or: two or more; Not: one; IsNull: its column, or in a select list its
                                 // operand; Like: the column and the
-                                // pattern, a parameter; Truth: its parameter; InSet: its column
+                                // pattern, a parameter; Truth: its parameter; InSet: its column;
+                                // Case: WHEN, THEN, WHEN, THEN … and an ELSE last if there is one (an odd count);
+                                // Coalesce: two or more
 
   [[nodiscard]] auto phys() const -> PhysType { return phys_type(type); }
 
