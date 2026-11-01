@@ -1241,6 +1241,20 @@ TEST_CASE("embedded API: every plan the search costed returns the same rows", "[
       {"SELECT o.k, p.v FROM p, o WHERE p.k = $1 AND a = $2", {i(3), i(2)}, false, 4},
       {"SELECT count(*) FROM p, o WHERE p.k = $1 AND a = $2", {i(1), i(2)}, false, 4},
       {"SELECT o.k FROM p, o WHERE p.k = $1 AND a = $2 ORDER BY o.k LIMIT 3", {i(5), i(1)}, true, 1},
+      // Outer joins: o.c 3 and 4..6 find no row of p, or none whose v passes.
+      {"SELECT o.k, p.v FROM o LEFT JOIN p ON p.k = o.c WHERE a = $1", {i(1)}, false, 1},
+      {"SELECT o.k, p.v FROM o LEFT JOIN p ON p.k = o.c AND p.v > $2 WHERE a = $1", {i(1), i(1)}, false, 1},
+      {"SELECT o.k, p.v FROM o LEFT JOIN p ON p.v = o.b WHERE a = $1", {i(2)}, false, 1},
+      {"SELECT o.k, p.v FROM p RIGHT JOIN o ON p.k = o.c WHERE a = $1 AND p.v IS NULL", {i(3)}, false, 1},
+      {"SELECT count(p.v) FROM o LEFT JOIN p ON p.k = o.c WHERE a = $1", {i(0)}, false, 1},
+      {"SELECT o.k, p.v FROM o LEFT JOIN p ON p.k = o.c WHERE a = $1 ORDER BY p.v, o.k", {i(1)}, true, 1},
+      // o the right side, by its index on a, which holds o.k too: it reads
+      // rows, where the join matches nothing a row of NULLs.
+      {"SELECT p.k, o.k FROM p LEFT JOIN o ON o.a = p.v", {}, false, 1},
+      {"SELECT p.k FROM p LEFT JOIN o ON o.a = p.v AND o.k > $1 WHERE o.k IS NULL", {i(30)}, false, 1},
+      {"SELECT p.k, o.k FROM p LEFT JOIN o ON o.a = p.v ORDER BY o.k, p.k", {}, true, 1},
+      // o.c only in the WHERE above the join: o's index on a does not hold it.
+      {"SELECT o.k FROM o LEFT JOIN p ON p.k = o.k WHERE a = $1 AND (p.v = $2 OR o.c = $3)", {i(1), i(1), i(2)}, false, 1},
   };
   const std::string cross = "SELECT o.k, p.v FROM p, o WHERE p.k = $1 AND a = $2";
   CHECK(db->execute(cross, {i(1), i(2)}).rows.size() == 10);
@@ -1263,6 +1277,44 @@ TEST_CASE("embedded API: every plan the search costed returns the same rows", "[
       }
     }
   }
+}
+
+TEST_CASE("embedded API: a left outer join NULL-extends each left row no right row matches", "[sql][api]") {
+  sql_test::TempDir dir{"api_outer_join"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE l (k INTEGER PRIMARY KEY, a INTEGER NOT NULL)");
+  (void)db->execute("CREATE TABLE r (j INTEGER PRIMARY KEY, a INTEGER NOT NULL)");
+  for (std::int64_t k = 1; k <= 3; ++k) (void)db->execute("INSERT INTO l VALUES ($1, $2)", {i(k), i(k)});
+  for (auto [j, a] : {std::pair{10, 1}, {11, 1}, {12, 2}}) (void)db->execute("INSERT INTO r VALUES ($1, $2)", {i(j), i(a)});
+  auto rows = [&](std::string_view sql) { return db->execute(sql).rows; };
+  const Grid by_a{{i(1), i(10)}, {i(1), i(11)}, {i(2), i(12)}, {i(3), Value{}}};
+  CHECK(rows("SELECT l.k, r.j FROM l LEFT JOIN r ON l.a = r.a ORDER BY l.k, r.j") == by_a);
+  CHECK(rows("SELECT l.k, r.j FROM r RIGHT JOIN l ON l.a = r.a ORDER BY l.k, r.j") == by_a);
+  // ON decides the pairs, WHERE the joined rows: a NULL-extended row is in
+  // the first, out of the second.
+  CHECK(rows("SELECT l.k, r.j FROM l LEFT JOIN r ON l.a = r.a AND r.j > 10 ORDER BY l.k") ==
+        Grid{{i(1), i(11)}, {i(2), i(12)}, {i(3), Value{}}});
+  CHECK(rows("SELECT l.k, r.j FROM l LEFT JOIN r ON l.a = r.a WHERE r.j > 10 ORDER BY l.k") ==
+        Grid{{i(1), i(11)}, {i(2), i(12)}});
+  CHECK(rows("SELECT l.k, r.j FROM l LEFT JOIN r ON l.a = r.a AND l.k = 2 ORDER BY l.k") ==
+        Grid{{i(1), Value{}}, {i(2), i(12)}, {i(3), Value{}}});
+  CHECK(rows("SELECT l.k FROM l LEFT JOIN r ON l.a = r.a WHERE r.j IS NULL") == Grid{{i(3)}});
+  // A NOT NULL column of the right side is NULL in an extended row, so not counted.
+  CHECK(rows("SELECT count(r.a), count(*) FROM l LEFT JOIN r ON l.a = r.a WHERE l.k = 3") == Grid{{i(0), i(1)}});
+  CHECK(rows("SELECT l.k, r.j FROM l LEFT JOIN r ON r.j = 99 ORDER BY l.k") ==
+        Grid{{i(1), Value{}}, {i(2), Value{}}, {i(3), Value{}}});
+  CHECK_THROWS_AS(db->execute("SELECT l.k FROM l FULL JOIN r ON l.a = r.a"), ast::SqlError);
+  // The right side keyed by a parameter and a left column: a NULL parameter,
+  // or a left value too long for any key, matches nothing, and the left row
+  // stays, NULL-extended.
+  (void)db->execute("CREATE TABLE rc (a INTEGER NOT NULL, s TEXT NOT NULL, PRIMARY KEY (a, s))");
+  (void)db->execute("CREATE TABLE ls (k INTEGER PRIMARY KEY, s TEXT NOT NULL)");
+  (void)db->execute("INSERT INTO rc VALUES (1, 'x')");
+  (void)db->execute("INSERT INTO ls VALUES (1, 'x')");
+  (void)db->execute("INSERT INTO ls VALUES (2, $1)", {Value{Bytes(70000, std::byte{'y'})}});
+  const std::string keyed = "SELECT ls.k, rc.a FROM ls LEFT JOIN rc ON rc.s = ls.s AND rc.a = $1 ORDER BY ls.k";
+  CHECK(db->execute(keyed, {i(1)}).rows == Grid{{i(1), i(1)}, {i(2), Value{}}});
+  CHECK(db->execute(keyed, {Value{}}).rows == Grid{{i(1), Value{}}, {i(2), Value{}}});
 }
 
 TEST_CASE("embedded API: a choice point's plan text shows both plans, and each returns the same rows",

@@ -114,7 +114,8 @@ the row says 2016.
   the 743, 374 stopping at the layer's refusal of such a table; with
   tables without a primary key, literals, `SELECT` without `FROM` and
   comparisons of constants, UNIQUE constraints, SELECT DISTINCT, JOIN
-  USING, WHERE predicates and LIKE built, 266 pass, and the rest stop at forms the dialect leaves out. The list is
+  USING, WHERE predicates, LIKE and outer joins built, 278 pass, and the
+  rest stop at forms the dialect leaves out. The list is
   `tests/functional/not_implemented/sqltest.txt`.
 
 ### PostgreSQL features and ByteCaskDB features: our cases

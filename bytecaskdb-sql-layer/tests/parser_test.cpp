@@ -103,7 +103,7 @@ TEST_CASE("parser: UNIQUE on a column or the table, in the order written", "[sql
 TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql][parser]") {
   //                    0         1         2         3
   //                    0123456789012345678901234567890123456789
-  CHECK(rejected_at("SELECT id FROM t LEFT JOIN u ON t.id = u.id") == 27);
+  CHECK(rejected_at("SELECT id FROM t FULL JOIN u ON t.id = u.id") == 27);
   CHECK(rejected_at("SELECT id FROM t, u, v WHERE id = $1") >= 0);
   CHECK(rejected_at("SELECT id FROM t WHERE id = B'1'") == 28);  // a bit-string literal
   CHECK(rejected_at("VALUES (1)") == 0);

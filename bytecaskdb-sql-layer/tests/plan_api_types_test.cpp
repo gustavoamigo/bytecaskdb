@@ -1091,3 +1091,21 @@ TEST_CASE("plan API: a commit refused because the engine is a follower is BC_E_D
   f.db->set_mode(bytecask::Mode::Leader);
   CHECK(run(f, insert_t, {std::int64_t{1}, bytes("a"), std::int64_t{5}}) == BC_COMMITTED);
 }
+
+namespace {
+// How many columns of t's and m's NULL rows are null, as a count.
+void null_rows(bc_ctx* cx) {
+  bc_view t = bc_null_row(cx, kTbl);
+  bc_view m = bc_null_row(cx, kM);
+  int64_t n = 0;
+  for (uint32_t c : {kIdCol, kNameCol, kQtyCol}) n += bc_col_null(cx, t, c) ? 1 : 0;
+  for (uint32_t c : {kKCol, kXCol, kBCol}) n += bc_col_null(cx, m, c) ? 1 : 0;
+  bc_emit_count(cx, n);
+}
+}  // namespace
+
+TEST_CASE("plan API: bc_null_row is a row of its table with every column NULL, a key column too", "[sql][algebra]") {
+  Fixture f;
+  create_m(f);
+  CHECK(value(f, null_rows, {}) == 6);
+}

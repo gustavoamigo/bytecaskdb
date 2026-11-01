@@ -549,6 +549,7 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   std::vector<std::string> using_columns;
   std::string using_alias;
   auto natural = false;
+  auto join_kind = Select::JoinKind::Inner;
   for (std::size_t i = 0; i < s->n_from_clause; ++i) {
     const auto* from = s->from_clause[i];
     if (from->node_case == PG_QUERY__NODE__NODE_JOIN_EXPR) {
@@ -556,11 +557,17 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
       // The join has no position of its own; report the table it joins.
       const auto* r = j->rarg;
       auto at = r != nullptr && r->node_case == PG_QUERY__NODE__NODE_RANGE_VAR ? r->range_var->location : pos;
-      if (s->n_from_clause != 1 || j->jointype != PG_QUERY__JOIN_TYPE__JOIN_INNER || j->alias != nullptr ||
+      auto kind = j->jointype == PG_QUERY__JOIN_TYPE__JOIN_LEFT    ? Select::JoinKind::Left
+                  : j->jointype == PG_QUERY__JOIN_TYPE__JOIN_RIGHT ? Select::JoinKind::Right
+                                                                   : Select::JoinKind::Inner;
+      if (j->jointype == PG_QUERY__JOIN_TYPE__JOIN_FULL) reject("FULL JOIN is not supported", at);
+      if (s->n_from_clause != 1 ||
+          (j->jointype != PG_QUERY__JOIN_TYPE__JOIN_INNER && kind == Select::JoinKind::Inner) || j->alias != nullptr ||
           j->larg == nullptr || r == nullptr || j->larg->node_case != PG_QUERY__NODE__NODE_RANGE_VAR ||
           r->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) {
-        reject("only an inner join of two tables, by ON, USING or NATURAL, is supported", at);
+        reject("only an inner, LEFT or RIGHT join of two tables, by ON, USING or NATURAL, is supported", at);
       }
+      join_kind = kind;
       tables = {j->larg->range_var, r->range_var};
       on = j->quals;
       natural = j->is_natural;
@@ -588,6 +595,7 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   sel.using_columns = std::move(using_columns);
   sel.natural = natural;
   sel.using_alias = std::move(using_alias);
+  sel.join_kind = join_kind;
   if (!tables.empty()) sel.table_pos = tables[0]->location;
   if (tables.size() == 2) sel.join_pos = tables[1]->location;
   if (s->n_locking_clause == 1) {
