@@ -273,7 +273,7 @@
 
 - name: a FOREIGN KEY constraint
   features: [E141-04]
-  # column constraint not supported
+  # a FOREIGN KEY is accepted, not enforced
   unimplemented: true
   setup:
     - CREATE TABLE r (id INTEGER PRIMARY KEY)

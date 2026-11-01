@@ -380,6 +380,30 @@ void plain_unique(const PgQuery__Constraint* c) {
   }
 }
 
+// A FOREIGN KEY as it is accepted: MATCH SIMPLE, NO ACTION or RESTRICT on
+// DELETE and UPDATE, not deferred. Not enforced, so an action it would take
+// is refused rather than ignored.
+auto foreign_key(const PgQuery__Constraint* c) -> ForeignKeyAst {
+  auto action = [&](const char* a, std::string_view on) {
+    auto v = std::string_view{a == nullptr ? "" : a};
+    if (v.empty() || v == "a" || v == "r") return;
+    auto what = v == "c" ? "CASCADE" : v == "n" ? "SET NULL" : v == "d" ? "SET DEFAULT" : "this action";
+    reject("ON " + std::string{on} + " " + what + " is not supported", c->location);
+  };
+  action(c->fk_del_action, "DELETE");
+  action(c->fk_upd_action, "UPDATE");
+  if (!empty(c->fk_matchtype) && std::string_view{c->fk_matchtype} != "s") {
+    reject("MATCH FULL and MATCH PARTIAL are not supported", c->location);
+  }
+  if (c->deferrable || c->initdeferred || c->skip_validation || c->n_fk_del_set_cols != 0) {
+    reject("a FOREIGN KEY that is DEFERRABLE, NOT VALID or sets columns is not supported", c->location);
+  }
+  ForeignKeyAst f{c->conname, {}, relation(c->pktable), {}, c->location};
+  for (std::size_t k = 0; k < c->n_fk_attrs; ++k) f.columns.push_back(str(c->fk_attrs[k]));
+  for (std::size_t k = 0; k < c->n_pk_attrs; ++k) f.ref_columns.push_back(str(c->pk_attrs[k]));
+  return f;
+}
+
 // Adds each PRIMARY KEY constraint on the column to `primary_keys`, so a
 // repeated one counts twice.
 auto column_def(const PgQuery__ColumnDef* cd, int& primary_keys) -> ColumnDefAst {
@@ -409,6 +433,10 @@ auto column_def(const PgQuery__ColumnDef* cd, int& primary_keys) -> ColumnDefAst
     } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_UNIQUE) {
       plain_unique(c);
       col.unique.emplace_back(c->conname);
+    } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_FOREIGN) {
+      auto f = foreign_key(c);
+      f.columns = {col.name};
+      col.references.push_back(std::move(f));
     } else if (c->contype != PG_QUERY__CONSTR_TYPE__CONSTR_NULL) {
       reject("column constraint not supported", c->location);
     }
@@ -438,6 +466,10 @@ auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos) -> CreateTable
         t.unique.push_back(std::move(u));
         continue;
       }
+      if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_FOREIGN) {
+        t.foreign_keys.push_back(foreign_key(c));
+        continue;
+      }
       if (c->contype != PG_QUERY__CONSTR_TYPE__CONSTR_PRIMARY) reject("table constraint not supported", c->location);
       ++primary_keys;
       at_most_one(c->location);
@@ -448,6 +480,8 @@ auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos) -> CreateTable
     t.columns.push_back(column_def(el->column_def, primary_keys));
     at_most_one(t.columns.back().pos);
     for (const auto& name : t.columns.back().unique) t.unique.push_back({name, {t.columns.back().name}, t.columns.back().pos});
+    for (auto& f : t.columns.back().references) t.foreign_keys.push_back(std::move(f));
+    t.columns.back().references.clear();
   }
   return t;
 }
