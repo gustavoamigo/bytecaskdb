@@ -301,6 +301,79 @@ TEST_CASE("binder: constants are folded to the type they meet, as PostgreSQL typ
   CHECK(bind_sql(cat, "SELECT s FROM lt GROUP BY s HAVING 2 <= s").fixed == std::vector<Datum>{std::int64_t{2}});
 }
 
+TEST_CASE("binder: comparisons of constants fold to a BOOLEAN; a string literal casts to a type", "[sql][binder]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE ct (k INTEGER PRIMARY KEY, dt DATE, t TEXT)").stmt));
+  const auto& cat = f.cat();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return "bound";
+  };
+  auto out = [&](std::string_view sql) {
+    auto bound = bind_sql(cat, sql);
+    const auto* p = find<logical::Project>(root(bound));
+    REQUIRE(p != nullptr);
+    REQUIRE(p->exprs.size() == 1);
+    REQUIRE(bound.fixed.size() == 1);
+    return std::tuple{p->exprs[0].name, p->exprs[0].expr.type, bound.fixed[0]};
+  };
+  auto truth = [&](std::string_view sql) {
+    auto [name, type, v] = out(sql);
+    CHECK(name == "?column?");
+    CHECK(type == SqlType{SqlKind::Boolean});
+    return v;
+  };
+  const Datum yes{true}, no{false}, null{};
+  CHECK(truth("SELECT 3 < 5") == yes);
+  CHECK(truth("SELECT 3 <> 5") == yes);
+  CHECK(truth("SELECT 3 != 3") == no);
+  CHECK(truth("SELECT 3 = 3.00") == yes);  // numbers compare exactly, whatever their scales
+  CHECK(truth("SELECT 3.7 >= 5.2") == no);
+  CHECK(truth("SELECT 9223372036854775807 > 99999999999999999.5") == yes);
+  CHECK(truth("SELECT 'foo' < 'bar'") == no);
+  CHECK(truth("SELECT 'B' < 'a'") == yes);  // bytewise: COLLATE "C"
+  CHECK(truth("SELECT 'ab' < 'abc'") == yes);
+  CHECK(truth("SELECT 1 < '2'") == yes);  // the string read as the other side's type
+  CHECK(truth("SELECT 1.5 < '1.55'") == yes);
+  CHECK(truth("SELECT TRUE > FALSE") == yes);
+  CHECK(truth("SELECT NULL = NULL") == null);
+  CHECK(truth("SELECT 1 = NULL") == null);
+  CHECK(truth("SELECT DATE '2016-03-26' < DATE '2016-03-27'") == yes);
+  CHECK(truth("SELECT DATE '2016-03-26' = '2016-03-26'") == yes);
+  CHECK(truth("SELECT TIME '01:02:03' >= TIME '01:02:03'") == yes);
+  CHECK(truth("SELECT CAST('NaN' AS DOUBLE PRECISION) > 1") == yes);  // NaN above every number
+  CHECK(state("SELECT 1 < 'x'") == "22P02");
+  CHECK(state("SELECT TRUE = 1") == "42883");
+  CHECK(state("SELECT 'a'::text = 1") == "42883");
+  CHECK(rejected(cat, "SELECT DATE '2016-03-26' < TIMESTAMP '2016-03-26 00:00:00'").first ==
+        "comparing a date with a timestamp without time zone is not supported yet");
+  CHECK(rejected(cat, "SELECT k < 5 FROM ct").first == "only columns, constants and aggregates can be selected");
+
+  // A cast of a string literal: read as the type, named by it.
+  CHECK(out("SELECT DATE '1970-01-02'") == std::tuple{std::string{"date"}, SqlType{SqlKind::Date}, Datum{std::int64_t{1}}});
+  CHECK(out("SELECT '1970-01-02'::date") == out("SELECT DATE '1970-01-02'"));
+  CHECK(out("SELECT CAST('5' AS INTEGER)") == std::tuple{std::string{"int4"}, SqlType{SqlKind::Integer}, Datum{std::int64_t{5}}});
+  CHECK(out("SELECT CAST('1.005' AS NUMERIC(6,2))") ==
+        std::tuple{std::string{"numeric"}, SqlType{SqlKind::Decimal, 0, 6, 2}, Datum{std::int64_t{101}}});
+  CHECK(out("SELECT CAST(NULL AS DATE)") == std::tuple{std::string{"date"}, SqlType{SqlKind::Date}, Datum{}});
+  CHECK(state("SELECT CAST('40000' AS SMALLINT)") == "22003");
+  CHECK(state("SELECT CAST('12345.678' AS NUMERIC(6,2))") == "22003");
+  CHECK(state("SELECT CAST('x' AS INTEGER)") == "22P02");
+  CHECK(state("SELECT DATE '2016-02-30'") == "22008");
+  CHECK(rejected(cat, "SELECT CAST(1 AS TEXT)").first == "a cast of other than a string literal or NULL is not supported yet");
+  CHECK(rejected(cat, "SELECT CAST('abc' AS VARCHAR(2))").first == "a cast to VARCHAR(n) is not supported yet");
+  // Where a typed constant meets a column.
+  CHECK(bind_sql(cat, "INSERT INTO ct VALUES ($1, DATE '1970-01-03', DATE '1970-01-03')").fixed ==
+        std::vector<Datum>{std::int64_t{2}, sql_test::bytes("1970-01-03")});
+  CHECK(bind_sql(cat, "SELECT k FROM ct WHERE dt >= '1970-01-03'::date").fixed == std::vector<Datum>{std::int64_t{2}});
+  CHECK(rejected(cat, "INSERT INTO ct (k, dt) VALUES ($1, TIMESTAMP '2020-01-01 00:00:00')").first ==
+        "a timestamp without time zone constant assigned to a date column is not supported yet");
+}
+
 TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][binder][catalog]") {
   sql_test::Fixture f;
   const auto& cat = f.cat();
