@@ -302,8 +302,10 @@ def test_a_gap_is_refused_before_anything_is_written(tmp_path):
 
 
 def test_promoting_the_less_advanced_follower_forks_the_one_ahead(tmp_path):
-    """The unplanned failover of the design: L dies at 20; N is at 10, F at 20."""
+    """The unplanned failover of the design: L dies at 21; N is at 11, F at 21
+    (L's open took sequence 1)."""
     L = ref.DB.open(tmp_path / "L")
+    (opened,) = markers(L)
     for i in range(10):
         L.put(f"k{i:02}".encode(), b"L")
     N = bootstrap(L, tmp_path / "N")
@@ -311,31 +313,31 @@ def test_promoting_the_less_advanced_follower_forks_the_one_ahead(tmp_path):
     for i in range(10, 20):
         L.put(f"k{i:02}".encode(), b"L")
     F = bootstrap(L, tmp_path / "F")
-    assert (N.durable_sequence(), G.durable_sequence(), F.durable_sequence()) == (10, 10, 20)
+    assert (N.durable_sequence(), G.durable_sequence(), F.durable_sequence()) == (11, 11, 21)
     L.close()  # L dies
 
     N.set_mode(Mode.Leader)  # the wrong choice: F is ahead of N
     N.put(b"n", b"1")
-    (marker,) = markers(N)
-    assert marker.since_sequence == 11
-    assert marker_at(N, 20) == marker and marker_at(F, 20) == ORIGIN
+    (inherited, marker) = markers(N)
+    assert inherited == opened and marker.since_sequence == 12
+    assert marker_at(N, 21) == marker and marker_at(F, 21) == opened
 
-    # F holds L's 11..20, which N never had: refused, and nothing is written.
+    # F holds L's 12..21, which N never had: refused, and nothing is written.
     before = history(F)
     with pytest.raises(ref.DbChangeMarkerMismatch):
         replicate(N, F)
     # Re-delivered from an earlier point, the marker is in the slice: refused too.
     with pytest.raises(ref.DbChangeMarkerMismatch):
         replicate(N, F, from_sequence=5)
-    assert history(F) == before and F.durable_sequence() == 20
+    assert history(F) == before and F.durable_sequence() == 21
 
     # G, at N's position, catches up and receives the marker.
     catch_up(N, G)
-    assert markers(G) == [marker] and history(G) == history(N)
+    assert markers(G) == [opened, marker] and history(G) == history(N)
 
     # L comes back with writes nobody replicated: refused the same way.
     L = open_follower(tmp_path / "L")
-    assert L.durable_sequence() == 20
+    assert L.durable_sequence() == 21
     with pytest.raises(ref.DbChangeMarkerMismatch):
         replicate(N, L)
     # Re-bootstrapped from N, everything converges.
@@ -353,48 +355,51 @@ def test_promoting_the_less_advanced_follower_forks_the_one_ahead(tmp_path):
 
 
 def test_a_zombie_leaders_writes_are_refused(tmp_path):
-    """An old leader reopened in Leader mode in place keeps writing, without a
-    marker. Once it steps down and follows the promoted node, the promoted
-    node's marker gives it away."""
+    """An old leader reopened in Leader mode in place keeps writing, under the
+    marker its open appended. Once it steps down and follows the promoted
+    node, the two markers at the same sequence give it away."""
     L = ref.DB.open(tmp_path / "L")
-    L.put(b"a", b"1")
+    (opened,) = markers(L)  # 1
+    L.put(b"a", b"1")  # 2
     N = bootstrap(L, tmp_path / "N")
     L.close()
-    N.set_mode(Mode.Leader)  # marker at 2
-    L = ref.DB.open(tmp_path / "L")  # the forbidden reopen in place
-    L.put(b"zombie", b"1")  # 2, no marker
-    L.put(b"zombie", b"2")  # 3
+    N.set_mode(Mode.Leader)  # marker at 3
+    L = ref.DB.open(tmp_path / "L")  # the forbidden reopen in place: its open's marker at 3
+    L.put(b"zombie", b"1")  # 4
+    L.put(b"zombie", b"2")  # 5
     L.set_mode(Mode.Follower)
-    assert markers(L) == [] and marker_at(L, 3) == ORIGIN
+    (_, reopened) = markers(L)
+    assert reopened.since_sequence == 3 and marker_at(L, 5) == reopened
+    assert marker_at(N, 3) != reopened
     with pytest.raises(ref.DbChangeMarkerMismatch):
         replicate(N, L)
-    # Nothing was applied either way: N has nothing above 2, L stays as it was.
-    assert L.durable_sequence() == 3 and L.get(b"zombie") == b"2"
+    # Nothing was applied either way: N has nothing above 3, L stays as it was.
+    assert L.durable_sequence() == 5 and L.get(b"zombie") == b"2"
     L.close()
     N.close()
 
 
 def test_re_delivery_of_the_same_history_is_accepted(tmp_path):
-    leader = ref.DB.open(tmp_path / "leader")
+    leader = ref.DB.open(tmp_path / "leader")  # its open's marker at 1
     for i in range(6):
-        leader.put(bytes([97 + i]), b"1")
+        leader.put(bytes([97 + i]), b"1")  # 2..7
     follower = open_follower(tmp_path / "follower")
     catch_up(leader, follower)
-    assert replicate(leader, follower, from_sequence=3)  # 4..6 again: all duplicates
-    assert follower.durable_sequence() == 6 and len(history(follower)) == 6
+    assert replicate(leader, follower, from_sequence=3)  # 4..7 again: all duplicates
+    assert follower.durable_sequence() == 7 and len(history(follower)) == 7
     leader.put(b"g", b"1")
     leader.put(b"h", b"1")
-    replicate(leader, follower, from_sequence=3)  # 4..8: the duplicates are skipped, 7 and 8 applied
+    replicate(leader, follower, from_sequence=3)  # 4..9: the duplicates are skipped, 8 and 9 applied
     assert history(follower) == history(leader)
 
     # With a promotion in the re-delivered range.
     leader.set_mode(Mode.Follower)
-    follower.set_mode(Mode.Leader)  # marker at 9
-    follower.put(b"i", b"1")  # 10
+    follower.set_mode(Mode.Leader)  # marker at 10
+    follower.put(b"i", b"1")  # 11
     catch_up(follower, leader)
     assert markers(leader) == markers(follower)
-    replicate(follower, leader, from_sequence=4)  # 5..10 again, marker included: same history
-    replicate(follower, leader, from_sequence=9)  # from the marker itself
+    replicate(follower, leader, from_sequence=4)  # 5..11 again, marker included: same history
+    replicate(follower, leader, from_sequence=10)  # from the marker itself
     assert history(leader) == history(follower)
     leader.close()
     follower.close()
@@ -402,44 +407,45 @@ def test_re_delivery_of_the_same_history_is_accepted(tmp_path):
 
 def test_a_slice_cut_before_the_followers_marker_is_accepted(tmp_path):
     """The comparison point stops at the slice's last entry. B holds the marker
-    at 6; a re-delivered slice from 2 cut at 4 says nothing about 6 and must
+    at 7; a re-delivered slice from 2 cut at 4 says nothing about 7 and must
     pass; compared over (from, P] it would be refused."""
-    A = ref.DB.open(tmp_path / "A")
+    A = ref.DB.open(tmp_path / "A")  # its open's marker at 1
+    (opened,) = markers(A)
     for i in range(5):
-        A.put(bytes([97 + i]), b"1")
+        A.put(bytes([97 + i]), b"1")  # 2..6
     G = bootstrap(A, tmp_path / "G")
     B = bootstrap(A, tmp_path / "B")
     A.set_mode(Mode.Follower)
-    G.set_mode(Mode.Leader)  # marker at 6
-    G.put(b"g", b"1")  # 7
-    G.put(b"h", b"1")  # 8
+    G.set_mode(Mode.Leader)  # marker at 7
+    G.put(b"g", b"1")  # 8
+    G.put(b"h", b"1")  # 9
     catch_up(G, B, max_bytes=1)  # unit by unit: the marker alone in a slice
-    (marker,) = markers(B)
-    assert marker.since_sequence == 6 and B.durable_sequence() == 8
+    (_, marker) = markers(B)
+    assert marker.since_sequence == 7 and B.durable_sequence() == 9
 
     header, entries = slice_from(G, 2, max_bytes=1)
     assert [e.sequence for e in entries] == [3]  # cut well before the marker
-    assert header == ChangeHeader(ORIGIN, 2)
-    B.ingest(header, entries)  # X = 3: origin on both sides
+    assert header == ChangeHeader(opened, 2)
+    B.ingest(header, entries)  # X = 3: A's open marker on both sides
     header, entries = slice_from(G, 2, max_bytes=40)
-    assert entries[-1].sequence < 6
+    assert entries[-1].sequence < 7
     B.ingest(header, entries)
     header, entries = slice_from(G, 2)  # uncut: the marker is in the slice and matches
     assert any(e.type is T.CHANGE_MARKER for e in entries)
     B.ingest(header, entries)
-    assert B.durable_sequence() == 8 and history(B) == history(G)
+    assert B.durable_sequence() == 9 and history(B) == history(G)
 
     # Cut or not, a slice from a forked source is refused once the comparison
-    # point reaches the divergence. A at 5 is promoted too (split brain).
-    A.set_mode(Mode.Leader)  # A's own marker at 6
-    A.put(b"split", b"1")  # 7
+    # point reaches the divergence. A at 6 is promoted too (split brain).
+    A.set_mode(Mode.Leader)  # A's own marker at 7
+    A.put(b"split", b"1")  # 8
     header, entries = slice_from(A, 2, max_bytes=1)  # [3]: nothing to see yet
     B.ingest(header, entries)
     with pytest.raises(ref.DbChangeMarkerMismatch):
-        replicate(A, B, from_sequence=2)  # X = min(8, 7) = 7: A's marker at 6 is not B's
+        replicate(A, B, from_sequence=2)  # X = min(9, 8) = 8: A's marker at 7 is not B's
     with pytest.raises(ref.DbChangeMarkerMismatch):
-        replicate(A, B)  # from 8: an empty slice, compared at 8
-    assert B.durable_sequence() == 8 and history(B) == history(G)
+        replicate(A, B)  # from 9: an empty slice, compared at 9
+    assert B.durable_sequence() == 9 and history(B) == history(G)
     for db in (A, B, G):
         db.close()
 
