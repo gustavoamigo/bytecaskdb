@@ -120,7 +120,9 @@ struct Options {
     // tail in the newest file is truncated, and damage in any other file
     // without a hint is refused, in both modes.
     bool fail_recovery_on_crc_errors{true};
-    Mode initial_mode{Mode::Leader};             // leader allows normal writes; follower allows ingest
+    // Leader allows normal writes, follower allows ingest. An open as a leader
+    // starts a history of its own, so a follower is opened as a follower.
+    Mode initial_mode{Mode::Leader};
     // A setting above its hard ceiling makes open throw std::invalid_argument.
     uint32_t max_key_bytes{4096};                // max key size (hard ceiling: 65,535 — u16 wire format)
     uint32_t max_value_bytes{4 * 1024 * 1024};   // max value size (hard ceiling: 2^28 - 1, 256 MiB less one byte)
@@ -435,7 +437,7 @@ public:
     [[nodiscard]] auto read_sequence() const noexcept -> std::optional<std::uint64_t>;
 };
 
-// The identity of a history from a promotion on: the marker entry's own
+// The identity of a history from a leader's open or a promotion on: the marker entry's own
 // sequence and a random id. A node's marker at a sequence is its last marker
 // at or below it, kOriginMarker ({0, 0}) if it holds none.
 struct ChangeMarker {

@@ -227,6 +227,29 @@ TEST_CASE("a promotion or a leader's open writes a change marker, and nothing el
   CHECK(change_marker_bytes(reopened) == 3 * kMarkerBytes);
 }
 
+// CONTRACT.md, "Every open as a leader starts a new history": a node opened
+// as a leader holds a history of its own from its first sequence, so it
+// cannot follow another leader, even if it never wrote and stepped down at
+// once. A follower is opened as a follower.
+TEST_CASE("a node opened as a leader cannot follow another leader's history",
+          "[replication][change_marker]") {
+  TempDir td;
+  auto leader = bytecask::DB::open(td.path / "leader");
+  leader.put({}, to_bytes("k"), to_bytes("v"));
+
+  auto stepped_down = bytecask::DB::open(td.path / "stepped_down");
+  stepped_down.set_mode(Mode::Follower);
+  const auto s = slice(leader, 0);
+  CHECK_THROWS_AS(stepped_down.ingest(s.header, s.views()),
+                  bytecask::DbChangeMarkerMismatch);
+  CHECK_FALSE(stepped_down.contains_key({}, to_bytes("k")));
+
+  auto follower = bytecask::DB::open(td.path / "follower", follower_opts());
+  follower.ingest(s.header, s.views());
+  CHECK(follower.contains_key({}, to_bytes("k")));
+  CHECK(follower.durable_sequence() == leader.durable_sequence());
+}
+
 TEST_CASE("ingest refuses a slice that starts past the follower, before "
           "anything is written",
           "[replication][change_marker]") {

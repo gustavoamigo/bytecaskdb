@@ -642,7 +642,7 @@ def replication_script(x):
     yield "G keys", list(G.iter_from())
     for node in (N, G, E, F, L):
         node.close()
-    N = x.open("N")  # reopening in Leader mode is not a promotion
+    N = x.open("N")  # reopening in Leader mode appends a marker of its own
     yield "N reopened", (N.durable_sequence(), N.put(b"z", b"1").sequence, x.history(N)[-3:])
     N.close()
 

@@ -605,8 +605,8 @@ NB_MODULE(_bytecaskdb, m) {
            })
       .def("__repr__", &marker_repr);
 
-  // The history before any promotion: the marker at every position of a
-  // database that was never promoted.
+  // The history before any marker: the marker at every position of a
+  // database that holds none.
   m.attr("ORIGIN_MARKER") = nb::cast(bytecask::kOriginMarker);
 
   nb::class_<bytecask::ChangeHeader>(m, "ChangeHeader",

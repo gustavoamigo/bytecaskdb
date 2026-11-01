@@ -90,8 +90,9 @@ struct ChangeMarker {
       -> bool = default;
 };
 
-// The history before any promotion: the marker at every position of a
-// database that was never promoted.
+// The history before any marker: the marker at every position of a
+// database that holds none, such as a follower that has not yet ingested its
+// leader's first marker.
 inline constexpr ChangeMarker kOriginMarker{};
 
 // Where a slice of a history starts: the source's marker at from_sequence,

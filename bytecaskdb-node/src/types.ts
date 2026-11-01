@@ -7,8 +7,8 @@ export interface Disposable {
   [Symbol.dispose](): void;
 }
 
-// 'changeMarker' is a promotion: the entry a follower appends when it becomes
-// leader. Its key is empty and its value the marker's 8-byte little-endian id.
+// 'changeMarker' starts a history: the entry a leader's open appends, and a
+// follower when it becomes leader. Its key is empty and its value the marker's 8-byte little-endian id.
 export type EntryType = 'put' | 'delete' | 'bulkBegin' | 'bulkEnd' | 'rangeDel' | 'changeMarker';
 
 // The `code` on every error either backend throws.
@@ -106,7 +106,7 @@ export interface DataEntry {
   value: Uint8Array;
 }
 
-// The identity of a history from a promotion on: the changeMarker entry's own
+// The identity of a history from a leader's open or a promotion on: the changeMarker entry's own
 // sequence and its random id. A node's marker at a sequence is its last marker
 // at or below it, ORIGIN_MARKER if it holds none. Two nodes with the same
 // marker at a sequence hold the same history up to it.
@@ -115,8 +115,8 @@ export interface ChangeMarker {
   id: bigint;
 }
 
-// The history before any promotion: the marker at every position of a
-// database that was never promoted.
+// The history before any marker: the marker at every position of a
+// database that holds none.
 export const ORIGIN_MARKER: Readonly<ChangeMarker> = Object.freeze({ sinceSequence: 0n, id: 0n });
 
 // Where a slice of a history starts: the source's marker at fromSequence, and

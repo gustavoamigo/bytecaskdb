@@ -12256,8 +12256,8 @@ TEST_CASE("Limits: ingest takes the last packable sequence and refuses the "
     CHECK_FALSE(db.is_degraded());
     CHECK(get_str(db, k) == "v");
   }
-  // Reopened as a leader, which is not a promotion, a write needs the next
-  // sequence and is refused before it appends, leaving the engine healthy.
+  // Reopened as a leader, whose open writes no marker past the last
+  // sequence, a write needs the next sequence and is refused before it appends, leaving the engine healthy.
   auto db = bytecask::DB::open(dir);
   CHECK(get_str(db, to_bytes("k")) == "v");
   CHECK(db.durable_sequence() == E::kMaxSequence);
