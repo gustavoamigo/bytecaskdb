@@ -516,7 +516,10 @@ auto decode_record(Reader &r) -> OpRecord {
 }
 
 auto load_base(const fs::path &p) -> Base {
-  if (!fs::exists(p)) return {};
+  // No check ran yet: the first life opens an empty directory, and an open
+  // in Leader mode writes one entry, its ChangeMarker, and syncs it
+  // (docs/bytecask_design.md, "Replication mode").
+  if (!fs::exists(p)) return {.durable = 1};
   const auto bytes = read_file(p);
   Reader r{bytes};
   Base b;

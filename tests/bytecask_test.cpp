@@ -10679,11 +10679,11 @@ TEST_CASE("changes_since iterator yields entries in sequence order", "[replicati
     INFO("Entry " << i << " seq=" << collected_sequences[i] << " key='" << collected_keys[i] << "' value='" << collected_values[i] << "'");
   }
 
-  // Should have 2 entries (sequences 5 and 6) in sequence order
+  // Should have the 2 entries after from_seq, in sequence order
   REQUIRE(collected_sequences.size() == 2);
   REQUIRE(collected_sequences[0] < collected_sequences[1]);
-  REQUIRE(collected_sequences[0] == 5);
-  REQUIRE(collected_sequences[1] == 6);
+  REQUIRE(collected_sequences[0] == from_seq + 1);
+  REQUIRE(collected_sequences[1] == from_seq + 2);
 
   // Check that we got the expected keys and values
   REQUIRE(collected_keys[0] == "key4");
@@ -10698,6 +10698,9 @@ TEST_CASE("iterators advance by post-increment as by pre-increment",
   // calls them.
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
+  // The open's own marker is the history's first entry; the walk below
+  // starts after it.
+  const auto opened = db.durable_sequence();
   for (const auto *k : {"a", "b", "c"}) db.put({}, to_bytes(k), to_bytes(k));
 
   auto keys = db.keys_from({});
@@ -10720,7 +10723,7 @@ TEST_CASE("iterators advance by post-increment as by pre-increment",
   CHECK(to_string((*r).key) == "b");
 
   auto snap = db.snapshot();
-  auto changes = db.changes_since(snap, 0);
+  auto changes = db.changes_since(snap, opened);
   auto c = changes.entries.begin();
   c++;
   CHECK(to_string((*c).key) == "b");
@@ -10733,12 +10736,13 @@ TEST_CASE("changes_since stops at the snapshot's durable sequence",
           "[replication]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
+  const auto opened = db.durable_sequence();  // the open's own marker
   const auto synced = db.put({.sync = true}, to_bytes("a"), to_bytes("1"));
   const auto unsynced = db.put({.sync = false}, to_bytes("b"), to_bytes("2"));
   REQUIRE_FALSE(unsynced.durable);
   auto snap = db.snapshot();
   std::vector<std::uint64_t> seqs;
-  for (const auto &e : db.changes_since(snap, 0).entries) seqs.push_back(e.sequence);
+  for (const auto &e : db.changes_since(snap, opened).entries) seqs.push_back(e.sequence);
   CHECK(seqs == std::vector<std::uint64_t>{synced.sequence});
 }
 
@@ -11002,8 +11006,10 @@ TEST_CASE("ingest with batches: BulkBegin/BulkEnd preserved", "[replication]") {
                      bytecask::Bytes{e.key.begin(), e.key.end()},
                      bytecask::Bytes{e.value.begin(), e.value.end()}});
   }
-  // Verify BulkBegin and BulkEnd are present.
-  REQUIRE(owned.front().entry_type == bytecask::EntryType::BulkBegin);
+  // Verify BulkBegin and BulkEnd are present, after the open's own marker.
+  REQUIRE(owned.size() == 6);
+  REQUIRE(owned.front().entry_type == bytecask::EntryType::ChangeMarker);
+  REQUIRE(owned[1].entry_type == bytecask::EntryType::BulkBegin);
   REQUIRE(owned.back().entry_type == bytecask::EntryType::BulkEnd);
 
   std::vector<bytecask::DataEntryView> views;
@@ -12070,8 +12076,10 @@ TEST_CASE("ingest refuses a slice that ends inside an atomic batch",
   std::vector<bytecask::DataEntryView> views;
   for (const auto &o : owned)
     views.push_back({o.sequence, o.entry_type, o.key, o.value});
-  REQUIRE(views.size() == 8);  // BulkBegin, 6 puts, BulkEnd
-  const auto head = std::span{views}.first(4);
+  // The open's own marker, BulkBegin, 6 puts, BulkEnd.
+  REQUIRE(views.size() == 9);
+  REQUIRE(views.front().entry_type == bytecask::EntryType::ChangeMarker);
+  const auto head = std::span{views}.first(5);
 
   bytecask::Bytes out;
   {

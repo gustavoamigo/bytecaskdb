@@ -713,8 +713,12 @@ TEST_CASE("Recovery model-based: change markers survive serial and parallel "
       }
     }
     REQUIRE(promotions >= 20);
-    CHECK(markers(db).size() == promotions);
+    CHECK(markers(db).size() == promotions + 1);  // and the open's
   }
+  // Every marker the writer made: its open's and one per promotion. The
+  // copies below open as followers, which recover the same state and write
+  // no marker of their own.
+  const auto made = promotions + 1;
 
   using Stats = std::vector<std::tuple<std::uint64_t, std::uint64_t,
                                        std::uint64_t, std::uint64_t,
@@ -741,12 +745,13 @@ TEST_CASE("Recovery model-based: change markers survive serial and parallel "
   {
     const auto p = td.path / "serial";
     copy_to(p);
-    auto db = bytecask::DB::open(p, {.recovery_threads = 1});
+    auto db = bytecask::DB::open(
+        p, {.recovery_threads = 1, .initial_mode = Mode::Follower});
     REQUIRE(kv(db) == oracle);
     serial_markers = markers(db);
-    REQUIRE(serial_markers.size() == promotions);
+    REQUIRE(serial_markers.size() == made);
     serial_stats = collect_stats(db);
-    CHECK(change_marker_bytes(db) == promotions * kMarkerBytes);
+    CHECK(change_marker_bytes(db) == made * kMarkerBytes);
     CHECK(marker_at(db, db.durable_sequence()) == serial_markers.back());
   }
 
@@ -754,7 +759,8 @@ TEST_CASE("Recovery model-based: change markers survive serial and parallel "
     DYNAMIC_SECTION("recovery_threads = " << threads) {
       const auto p = td.path / std::format("t{}", threads);
       copy_to(p);
-      auto db = bytecask::DB::open(p, {.recovery_threads = threads});
+      auto db = bytecask::DB::open(
+          p, {.recovery_threads = threads, .initial_mode = Mode::Follower});
       CHECK(kv(db) == oracle);
       CHECK(markers(db) == serial_markers);
       CHECK(collect_stats(db) == serial_stats);
@@ -764,15 +770,17 @@ TEST_CASE("Recovery model-based: change markers survive serial and parallel "
   SECTION("vacuum to convergence keeps every marker") {
     const auto p = td.path / "vacuum";
     copy_to(p);
-    auto db = bytecask::DB::open(p, {.max_file_bytes = 2048});
+    auto db = bytecask::DB::open(
+        p, {.max_file_bytes = 2048, .initial_mode = Mode::Follower});
     while (db.vacuum({.fragmentation_threshold = 0.0})) {
     }
     CHECK(kv(db) == oracle);
     CHECK(markers(db) == serial_markers);
-    CHECK(change_marker_bytes(db) == promotions * kMarkerBytes);
+    CHECK(change_marker_bytes(db) == made * kMarkerBytes);
     const auto vacuumed = collect_stats(db);
     db.close();
-    auto reopened = bytecask::DB::open(p, {.max_file_bytes = 2048});
+    auto reopened = bytecask::DB::open(
+        p, {.max_file_bytes = 2048, .initial_mode = Mode::Follower});
     CHECK(kv(reopened) == oracle);
     CHECK(markers(reopened) == serial_markers);
     CHECK(collect_stats(reopened) == vacuumed);
@@ -781,8 +789,8 @@ TEST_CASE("Recovery model-based: change markers survive serial and parallel "
   SECTION("resume replays the active file's markers, without duplicates") {
     const auto p = td.path / "resume";
     copy_to(p);
-    auto db = bytecask::DB::open(p, {.max_file_bytes = 1 << 20});
-    db.set_mode(Mode::Follower);
+    auto db = bytecask::DB::open(
+        p, {.max_file_bytes = 1 << 20, .initial_mode = Mode::Follower});
     db.set_mode(Mode::Leader);  // a published marker in the active file
     auto expected = serial_markers;
     expected.push_back(markers(db).back());
@@ -796,7 +804,7 @@ TEST_CASE("Recovery model-based: change markers survive serial and parallel "
     CHECK(markers(db) == expected);
     CHECK(change_marker_bytes(db) == expected.size() * kMarkerBytes);
     db.close();
-    auto reopened = bytecask::DB::open(p);
+    auto reopened = bytecask::DB::open(p, follower_opts());
     CHECK(markers(reopened) == expected);
   }
 }
