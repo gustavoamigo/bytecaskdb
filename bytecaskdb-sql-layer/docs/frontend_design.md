@@ -108,6 +108,25 @@ kind the transformer doesn't take is refused with its position.
   `NULL` (the operator is strict and never runs). A numeric quotient is
   refused: its scale is PostgreSQL's division rule (`select_div_scale`),
   not built yet. `%` is refused.
+- **`CASE`, `COALESCE` and `NULLIF`** fold constants only (of a column,
+  a parameter or a subquery they are refused, 42601, with `*` and `/`
+  of columns, #667). The result type is PostgreSQL's union rule: unknown
+  literals give way to the typed branches, which must be of one class
+  (42804, `CASE types … cannot be matched`); integers widen to the
+  widest; a numeric branch is `numeric` and keeps its own scale
+  (`CASE WHEN true THEN 1 ELSE 2.50 END` is `1`); all unknown is `text`.
+  An unknown literal that is not a value of the type is 22P02, in a
+  branch not taken too, as PostgreSQL checks types before it runs. A
+  `WHEN` of a searched `CASE` must be `boolean` (42804); `NULL` is not
+  true. A simple `CASE x WHEN v` tests `x = v` as a comparison of
+  constants does (42883 where PostgreSQL has no such operator). `NULLIF(a, b)`
+  is `a`, of `a`'s type (an unknown `a` takes `b`'s), unless `a = b`.
+  Conditions and results are evaluated in order and only as far as the
+  answer needs: a `WHEN` after the first true one is never evaluated,
+  and a condition or the taken result that raises (22012, 22003) raises.
+  A result not taken that raises is refused (42601): its type is not
+  known without evaluating it. Float branches are refused. The output
+  column is named `case`, `coalesce` or `nullif`.
 - **`+` and `-`** on integers and on `DECIMAL`, with PostgreSQL's result
   type: `smallint + smallint` is `smallint`, `integer + bigint` is
   `bigint`, and so on.
@@ -255,6 +274,9 @@ That includes:
   alias of a join, an output name in `GROUP BY` or in `ORDER BY` of other
   than a column;
 - `OFFSET`, `RETURNING`, multi-row `VALUES`;
+- `CASE`, `COALESCE` and `NULLIF` of columns, parameters and subqueries, a
+  `CASE` result that is a float, a `WHEN` that is not a comparison
+  (`AND`, `OR`, `IS NULL`, `BETWEEN` as a value), `GREATEST` and `LEAST`;
 - `*` and `/` of columns, a numeric quotient, `%`, string concatenation
   and functions;
 - a cast of anything but a string literal or `NULL`, a numeric literal of
@@ -469,6 +491,11 @@ fail on them.
   (the wire's Parse), with PostgreSQL's SQLSTATE. PostgreSQL folds the same
   constants when it plans the statement, at Bind for a statement Parse left
   unplanned.
+- **A `CASE` or `COALESCE` result that would raise, and is not taken, is
+  refused.** `SELECT CASE WHEN true THEN 1 ELSE 1 / 0 END` is 1 in
+  PostgreSQL; here the folder evaluates a result to learn its type, so
+  the statement is refused with 42601. A `WHEN` after the first true one
+  is skipped, as there.
 
 Each is a refusal or an error, not a different answer. Everything else in
 the dialect matches PostgreSQL, and the proof machine checks that it does.

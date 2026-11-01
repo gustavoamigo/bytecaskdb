@@ -156,6 +156,12 @@ auto expr(const PgQuery__Node* n) -> Expr {
       e.rhs = std::make_unique<Expr>(operand(a->rexpr));
       return e;
     }
+    if (a->kind == PG_QUERY__A__EXPR__KIND__AEXPR_NULLIF) {
+      Expr e{Expr::Kind::NullIf, {}, 0, nullptr, nullptr, a->location};
+      e.lhs = std::make_unique<Expr>(operand(a->lexpr));
+      e.rhs = std::make_unique<Expr>(operand(a->rexpr));
+      return e;
+    }
     if (op != "+" && op != "-" && op != "*" && op != "/") reject("only +, -, * and / are supported here", a->location);
     // Unary: PostgreSQL's grammar folds - of a number into the literal, so
     // what is left is + of anything and - of an expression.
@@ -203,6 +209,24 @@ auto expr(const PgQuery__Node* n) -> Expr {
     return e;
   }
   if (n->node_case == PG_QUERY__NODE__NODE_A_CONST) return literal_expr(literal(n));
+  if (n->node_case == PG_QUERY__NODE__NODE_COALESCE_EXPR) {
+    const auto* c = n->coalesce_expr;
+    Expr e{Expr::Kind::Coalesce, {}, 0, nullptr, nullptr, c->location};
+    for (std::size_t k = 0; k < c->n_args; ++k) e.args.push_back(operand(c->args[k]));
+    return e;
+  }
+  if (n->node_case == PG_QUERY__NODE__NODE_CASE_EXPR) {
+    const auto* c = n->case_expr;
+    Expr e{Expr::Kind::Case, {}, 0, nullptr, nullptr, c->location};
+    if (c->arg != nullptr) e.lhs = std::make_unique<Expr>(operand(c->arg));
+    for (std::size_t k = 0; k < c->n_args; ++k) {
+      const auto* w = c->args[k]->case_when;
+      e.args.push_back(operand(w->expr));
+      e.args.push_back(operand(w->result));
+    }
+    if (c->defresult != nullptr) e.rhs = std::make_unique<Expr>(operand(c->defresult));
+    return e;
+  }
   if (n->node_case == PG_QUERY__NODE__NODE_SUB_LINK) {
     const auto* l = n->sub_link;
     if (l->sub_link_type != PG_QUERY__SUB_LINK_TYPE__EXPR_SUBLINK) {

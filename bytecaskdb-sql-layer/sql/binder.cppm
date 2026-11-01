@@ -413,6 +413,10 @@ auto is_constant(const ast::Expr& e) -> bool {
     case K::Div:
     case K::Compare: return is_constant(*e.lhs) && is_constant(*e.rhs);
     case K::Cast: return is_constant(*e.rhs);
+    case K::NullIf: return is_constant(*e.lhs) && is_constant(*e.rhs);
+    case K::Coalesce: return std::ranges::all_of(e.args, is_constant);
+    case K::Case:
+      return (!e.lhs || is_constant(*e.lhs)) && (!e.rhs || is_constant(*e.rhs)) && std::ranges::all_of(e.args, is_constant);
     case K::Column:
     case K::Param:
     case K::Aggregate:
@@ -683,6 +687,153 @@ auto cast_constant(const ast::Expr& e, const Constant& arg) -> Constant {
   return {read_as(arg, t, true), t, false, {}, e.pos};
 }
 
+auto fold(const ast::Expr& e) -> Constant;
+
+// A conditional's branch, folded. A runtime error (SQLSTATE class 22) is
+// kept, not thrown: PostgreSQL raises it only if the branch is evaluated,
+// and a branch the conditional does not reach is not.
+struct Branch {
+  std::optional<Constant> value;
+  std::optional<SqlError> error;
+};
+
+auto fold_branch(const ast::Expr& e) -> Branch {
+  try {
+    return {fold(e), std::nullopt};
+  } catch (const SqlError& err) {
+    if (!err.sqlstate().starts_with("22")) throw;
+    return {std::nullopt, err};
+  }
+}
+
+// The type of CASE, COALESCE or the branches of one, as PostgreSQL's union
+// rules resolve it: the unknown literals give way to the others, which
+// must be of one class (42804); integers widen to the widest, a numeric
+// to a numeric; all unknown is TEXT. `what` names the construct.
+auto common_type(const std::vector<const Constant*>& parts, const std::string& what, std::int32_t pos) -> SqlType {
+  const Constant* first = nullptr;
+  auto type = SqlType{SqlKind::Text};
+  for (const auto* c : parts) {
+    if (c->unknown) continue;
+    if (first == nullptr) {
+      first = c;
+      type = c->type;
+      if (type.kind == SqlKind::Varchar) type = SqlType{SqlKind::Text};
+      continue;
+    }
+    if (type_class(type.kind) != type_class(c->type.kind)) {
+      throw SqlError{what + " types " + pg_type_name(type) + " and " + pg_type_name(c->type) + " cannot be matched", c->pos,
+                     kDatatypeMismatch};
+    }
+    if (is_float(type) || is_float(c->type)) not_yet(what + " of floating-point values", pos);
+    if (is_number(type)) {
+      if (type.kind == SqlKind::Decimal || c->type.kind == SqlKind::Decimal) {
+        type = numeric_type(0);  // NUMERIC of no scale: each value keeps its own, as PostgreSQL's
+      } else {
+        auto rank = [](SqlType t) { return t.kind == SqlKind::SmallInt ? 0 : t.kind == SqlKind::Integer ? 1 : 2; };
+        if (rank(c->type) > rank(type)) type = c->type;
+      }
+    } else if (type.kind != c->type.kind && !(is_string(type) && is_string(c->type))) {
+      not_yet(what + " of " + pg_type_name(type) + " and " + pg_type_name(c->type), pos);
+    }
+  }
+  return type;
+}
+
+// c as a value of the common type t: an unknown literal read as t, an
+// integer widened to a numeric, which keeps its value and so its scale.
+auto as_common(const Constant& c, SqlType t) -> Constant {
+  auto out = c.unknown ? resolved(c, t) : c;
+  out.unknown = false;
+  out.pos = c.pos;
+  if (std::holds_alternative<std::monostate>(out.value)) {
+    out.type = t;
+    return out;
+  }
+  out.type = t.kind == SqlKind::Decimal ? numeric_type(scaled(out).scale) : t;
+  return out;
+}
+
+// The result of a conditional: the selected branch (nullptr for NULL),
+// typed with the common type of `parts`, every branch counted. A branch
+// that raises and is not selected leaves the type unknown to us: refused.
+auto conditional_result(const std::vector<Branch>& parts, const Branch* selected, const std::string& what, std::int32_t pos)
+    -> Constant {
+  std::vector<const Constant*> known;
+  for (const auto& b : parts) {
+    if (b.error && &b != selected) not_yet("a branch of " + what + " that raises an error and is not taken", pos);
+    if (b.value) known.push_back(&*b.value);
+  }
+  if (selected != nullptr && selected->error) throw *selected->error;
+  auto type = common_type(known, what, pos);
+  for (const auto* c : known) (void)as_common(*c, type);  // an unknown literal that is not a value of the type: 22P02
+  if (selected == nullptr) return {std::monostate{}, type, false, {}, pos};
+  return as_common(*selected->value, type);
+}
+
+auto is_null(const Constant& c) -> bool { return std::holds_alternative<std::monostate>(c.value); }
+
+// CASE WHEN c THEN r … [ELSE r] END, or CASE x WHEN v THEN r … END, which
+// tests x = v. Only the branch taken is evaluated; a NULL condition is not
+// true.
+auto fold_case(const ast::Expr& e) -> Constant {
+  std::optional<Constant> operand;
+  if (e.lhs) operand = fold(*e.lhs);
+  std::vector<Branch> conds;
+  std::vector<Branch> parts;  // each THEN, then the ELSE
+  for (std::size_t i = 0; i + 1 < e.args.size(); i += 2) {
+    conds.push_back(fold_branch(e.args[i]));
+    parts.push_back(fold_branch(e.args[i + 1]));
+  }
+  if (e.rhs) parts.push_back(fold_branch(*e.rhs));
+  const Branch* selected = e.rhs ? &parts.back() : nullptr;
+  for (std::size_t i = 0; i < conds.size(); ++i) {
+    if (conds[i].error) throw *conds[i].error;
+    auto truth = operand ? compare_constants(*operand, *conds[i].value, ast::ValueCompare::Eq, e.args[2 * i].pos) : *conds[i].value;
+    if (!operand) {
+      if (truth.unknown && !is_null(truth)) not_yet("a string literal as a CASE condition", truth.pos);
+      if (!truth.unknown && truth.type.kind != SqlKind::Boolean) {
+        throw SqlError{"argument of CASE/WHEN must be type boolean, not type " + pg_type_name(truth.type), truth.pos,
+                       kDatatypeMismatch};
+      }
+    }
+    if (!is_null(truth) && std::get<bool>(truth.value)) {
+      selected = &parts[i];
+      break;
+    }
+  }
+  return conditional_result(parts, selected, "CASE", e.pos);
+}
+
+// COALESCE(a, b, …): the first argument that is not NULL, each evaluated
+// only if the ones before it are NULL.
+auto fold_coalesce(const ast::Expr& e) -> Constant {
+  std::vector<Branch> parts;
+  for (const auto& a : e.args) parts.push_back(fold_branch(a));
+  const Branch* selected = nullptr;
+  for (const auto& b : parts) {
+    if (b.error) throw *b.error;
+    if (!is_null(*b.value)) {
+      selected = &b;
+      break;
+    }
+  }
+  return conditional_result(parts, selected, "COALESCE", e.pos);
+}
+
+// NULLIF(a, b): NULL if a = b, else a, of a's type (an unknown literal
+// takes b's).
+auto fold_nullif(const ast::Expr& e) -> Constant {
+  auto a = fold(*e.lhs);
+  auto b = fold(*e.rhs);
+  auto equal = compare_constants(a, b, ast::ValueCompare::Eq, e.pos);
+  if (a.unknown) a = resolved(a, b.unknown ? SqlType{SqlKind::Text} : b.type);
+  a.unknown = false;
+  a.pos = e.pos;
+  if (!is_null(equal) && std::get<bool>(equal.value)) return {std::monostate{}, a.type, false, {}, e.pos};
+  return a;
+}
+
 // The constant expression e, folded.
 auto fold(const ast::Expr& e) -> Constant {
   using K = ast::Expr::Kind;
@@ -713,6 +864,9 @@ auto fold(const ast::Expr& e) -> Constant {
     case K::Div: return arithmetic(fold(*e.lhs), fold(*e.rhs), Arith::Div, e.pos);
     case K::Compare: return compare_constants(fold(*e.lhs), fold(*e.rhs), e.cmp, e.pos);
     case K::Cast: return cast_constant(e, fold(*e.rhs));
+    case K::Case: return fold_case(e);
+    case K::Coalesce: return fold_coalesce(e);
+    case K::NullIf: return fold_nullif(e);
     case K::Column:
     case K::Param:
     case K::Aggregate:
@@ -1201,7 +1355,30 @@ public:
   // by its type's name (int4, date), anything else ?column?.
   auto constant_output(const ast::Expr& e) -> logical::Output {
     auto c = fold(e);
-    return {fixed(std::move(c.value), c.type), e.kind == ast::Expr::Kind::Cast ? e.cast_type : "?column?"};
+    auto name = [&]() -> std::string {
+      switch (e.kind) {
+        case ast::Expr::Kind::Cast: return e.cast_type;
+        case ast::Expr::Kind::Case: return "case";
+        case ast::Expr::Kind::Coalesce: return "coalesce";
+        case ast::Expr::Kind::NullIf: return "nullif";
+        case ast::Expr::Kind::Column:
+        case ast::Expr::Kind::Param:
+        case ast::Expr::Kind::Const:
+        case ast::Expr::Kind::Literal:
+        case ast::Expr::Kind::Add:
+        case ast::Expr::Kind::Sub:
+        case ast::Expr::Kind::Mul:
+        case ast::Expr::Kind::Div:
+        case ast::Expr::Kind::Star:
+        case ast::Expr::Kind::Plus:
+        case ast::Expr::Kind::Neg:
+        case ast::Expr::Kind::Compare:
+        case ast::Expr::Kind::Aggregate:
+        case ast::Expr::Kind::Subquery: break;
+      }
+      return "?column?";
+    }();
+    return {fixed(std::move(c.value), c.type), name};
   }
 
   // A scalar subquery in a select list: its value, named as PostgreSQL
@@ -1501,6 +1678,9 @@ public:
       case ast::Expr::Kind::Compare: not_yet("a comparison of other than constants as a value", e.pos);
       case ast::Expr::Kind::Cast: not_yet("a cast of other than a constant", e.pos);
       case ast::Expr::Kind::Subquery: not_yet("a subquery assigned to a column", e.pos);
+      case ast::Expr::Kind::Case:
+      case ast::Expr::Kind::Coalesce:
+      case ast::Expr::Kind::NullIf: not_yet("CASE, COALESCE and NULLIF of other than constants", e.pos);
       case ast::Expr::Kind::Const:
       case ast::Expr::Kind::Literal: break;  // constants, above
     }

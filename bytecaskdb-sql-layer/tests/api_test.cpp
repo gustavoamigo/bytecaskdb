@@ -1490,6 +1490,59 @@ TEST_CASE("embedded API: * and / of constants fold as PostgreSQL's operators typ
   CHECK(state("SELECT 1 % 2") == "42601");
 }
 
+TEST_CASE("embedded API: CASE, COALESCE and NULLIF of constants fold as PostgreSQL's do", "[sql][api]") {
+  sql_test::TempDir dir{"api_case"};
+  auto db = Database::open(dir.path());
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  auto one = [&](std::string_view sql) { return db->execute(sql).rows; };
+  // Searched and simple CASE: the first true WHEN, else ELSE, else NULL.
+  CHECK(one("SELECT CASE WHEN 1 = 2 THEN 10 WHEN 2 = 2 THEN 20 ELSE 30 END, CASE 3 WHEN 1 THEN 'a' WHEN 3 THEN 'c' END") ==
+        Grid{{i(20), text("c")}});
+  CHECK(one("SELECT CASE WHEN 0 = 1 THEN 1 END, CASE 0 WHEN 2 THEN 1 END, CASE NULL WHEN NULL THEN 1 ELSE 2 END") ==
+        Grid{{Value{}, Value{}, i(2)}});
+  CHECK(one("SELECT CASE WHEN NULL THEN 1 ELSE 2 END").front().front() == i(2));  // a NULL condition is not true
+  CHECK(db->execute("SELECT CASE WHEN 0 = 1 THEN 1 END, COALESCE(NULL, 2), NULLIF(1, 1)").columns ==
+        std::vector<std::string>{"case", "coalesce", "nullif"});
+  // A WHEN after the one that matched is not evaluated.
+  CHECK(one("SELECT CASE WHEN 1 = 1 THEN 1 WHEN 1 / 0 = 1 THEN 2 END").front().front() == i(1));
+  // COALESCE and NULLIF.
+  CHECK(one("SELECT COALESCE(NULL, NULL, 3, 4), COALESCE(NULL, NULL), NULLIF(1, 2), NULLIF(2, 2), NULLIF(NULL, 1), NULLIF(1, NULL)") ==
+        Grid{{i(3), Value{}, i(1), Value{}, Value{}, i(1)}});
+  CHECK(one("SELECT NULLIF('a', 'a'), NULLIF('a', 'b'), COALESCE(NULL, 'x'), NULLIF('1', 1), NULLIF(1, 1.0)") ==
+        Grid{{Value{}, text("a"), text("x"), Value{}, Value{}}});
+  // An unknown literal takes the other branches' type; integers widen.
+  CHECK(one("SELECT COALESCE(NULL, '7'), CASE WHEN 1 = 2 THEN 1 ELSE 2 END") == Grid{{text("7"), i(2)}});
+  CHECK(one("SELECT COALESCE(1, 2147483648) + 1").front().front() == i(2));
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+  CHECK(state("SELECT CASE WHEN 1 THEN 1 END") == "42804");        // a condition must be boolean
+  CHECK(state("SELECT CASE WHEN 1 = 1 THEN 1 ELSE true END") == "42804");
+  CHECK(state("SELECT COALESCE(1, true)") == "42804");
+  CHECK(state("SELECT COALESCE(1, 'a')") == "22P02");
+  CHECK(state("SELECT CASE WHEN 1 = 1 THEN 1 ELSE 'a' END") == "22P02");  // type-checked though not taken
+  CHECK(state("SELECT NULLIF(1, 'a')") == "22P02");
+  CHECK(state("SELECT NULLIF(1, true)") == "42883");
+  CHECK(state("SELECT CASE 1 WHEN true THEN 1 END") == "42883");
+  CHECK(state("SELECT CASE WHEN 1 = 2 THEN 1 ELSE 1 / 0 END") == "22012");  // the branch taken raises
+  CHECK(state("SELECT COALESCE(NULL, 1 / 0)") == "22012");
+  // PostgreSQL skips a result that is not taken; here its type is unknown, so it is refused.
+  CHECK(state("SELECT COALESCE(1, 1 / 0, 2)") == "42601");
+  CHECK(state("SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 / 0 END") == "42601");
+  CHECK(state("SELECT CASE 0 WHEN 2, 2 THEN 1 END") == "42601");  // PostgreSQL has no list of WHEN values
+  (void)db->execute("CREATE TABLE cc (id INTEGER PRIMARY KEY, v INTEGER)");
+  CHECK(state("SELECT CASE WHEN v = 1 THEN 1 END FROM cc") == "42601");  // of columns: not supported yet
+  CHECK(state("SELECT COALESCE(v, 0) FROM cc") == "42601");
+  CHECK(state("SELECT NULLIF(v, 0) FROM cc") == "42601");
+}
+
 TEST_CASE("embedded API: a choice point's plan text shows both plans, and each returns the same rows",
           "[sql][api][search][choice]") {
   sql_test::TempDir dir{"api_choice"};
