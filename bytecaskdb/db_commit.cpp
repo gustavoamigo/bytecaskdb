@@ -237,7 +237,7 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
   // The group's removals are in the file: from here it is published, or the
   // engine refuses writes until resume(), which resets the log. Before the
   // append, a failure drops the transient and the removals with it.
-  deletes_.record_all(t.take_removed());
+  deletes_.record(t.staged_removals());
 
   try {
 #ifdef BYTECASK_TESTING
@@ -606,6 +606,10 @@ void DB::settle_unappended(const EngineSlot &slot) const {
   if (slot.rests_on == 0) return;
   const auto published = load_state();
   if (published->next_seq > slot.rests_on) return;
+  // TooOld here means the published state can no longer tell (more deletes
+  // since dropped the ones the head read): that is no confirmation, so the
+  // slot waits like on any disagreement. Returning instead would answer from
+  // a write whose flush may still fail.
   const auto verdict =
       published->transient().validate_preconditions(slot.plan, deletes_);
   const auto same =
@@ -613,7 +617,9 @@ void DB::settle_unappended(const EngineSlot &slot) const {
                   : verdict == TransientEngineState::Verdict::Conflict;
   if (same) return;
   wait_published(slot.rests_on);
-  if (load_state()->next_seq > slot.rests_on) return;
+  const auto after = load_state();
+  if (after->next_seq > slot.rests_on) return;
+  if (after->closed) throw DbClosed{};
   throw DbDegraded{degraded_reason()};
 }
 

@@ -38,7 +38,8 @@ MCDC_REQUIRED=(bytecaskdb/data_file.cppm bytecaskdb/hint_file.cppm
                bytecaskdb/bytecask.cppm bytecaskdb/change_iterator.cppm
                bytecaskdb/blind_btree.cppm bytecaskdb/btree.cppm
                bytecaskdb/version_chain.cppm bytecaskdb/internals.cppm
-               bytecaskdb/u32_map.cppm bytecaskdb/concurrency.cppm)
+               bytecaskdb/u32_map.cppm bytecaskdb/concurrency.cppm
+               bytecaskdb/delete_log.cppm)
 mapfile -t -O "${#MCDC_REQUIRED[@]}" MCDC_REQUIRED \
     < <(cd "$PROJECT_DIR" &&
         grep -lE '&&|\|\|' bytecaskdb/*.cpp | grep -vx bytecaskdb/bytecask_hpp.cpp)

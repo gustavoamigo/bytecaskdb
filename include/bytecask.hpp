@@ -186,9 +186,10 @@ struct Options {
   // Most bytes a thread's record buffers keep after a call on this DB
   // (default 1 MiB, at least 256 KiB).
   std::size_t thread_scratch_bytes{std::size_t{1} << 20};
-  // Most bytes the log of recent deletes holds (default 4 MiB). A plan read
-  // before the oldest delete it still holds is refused as TooOld. 0 keeps
-  // none: a plan read before the latest delete is too old.
+  // Most bytes the log of recent deletes holds (default 4 MiB); a del_range
+  // is one entry, whatever it covers. A plan read before the oldest delete
+  // it still holds is refused as TooOld. 0 keeps none: a plan read before
+  // the latest delete is too old.
   std::size_t max_delete_log_bytes{std::size_t{4} << 20};
 };
 
@@ -518,7 +519,8 @@ public:
   explicit WritePlan(std::uint64_t read_sequence, SizeLimits limits = {});
   // A plan checked against snap itself, which it holds until apply_batch
   // returns. A key absent in snap and absent now is unchanged, even if
-  // written and deleted again between; never refused as TooOld.
+  // written and deleted again between; never refused as TooOld. A
+  // moved-from snap throws std::invalid_argument.
   explicit WritePlan(Snapshot snap);
   ~WritePlan();
   WritePlan(const WritePlan&) = delete;

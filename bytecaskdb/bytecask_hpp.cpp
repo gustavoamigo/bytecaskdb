@@ -526,9 +526,14 @@ WritePlan::WritePlan(std::uint64_t read_sequence, SizeLimits limits)
           read_sequence,
           bytecask::SizeLimits{limits.max_key_bytes, limits.max_value_bytes}})} {}
 
+// A moved-from Snapshot has no Impl; the engine's WritePlan(Snapshot)
+// refuses the same case for module callers.
 WritePlan::WritePlan(Snapshot snap)
-    : impl_{std::make_unique<Impl>(
-          bytecask::WritePlan{std::move(snap.impl_->snap)})} {}
+    : impl_{std::make_unique<Impl>(bytecask::WritePlan{[&] {
+        if (!snap.impl_)
+          throw std::invalid_argument{"WritePlan: the Snapshot was moved from"};
+        return std::move(snap.impl_->snap);
+      }()})} {}
 
 WritePlan::~WritePlan() = default;
 WritePlan::WritePlan(WritePlan&&) noexcept = default;

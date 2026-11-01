@@ -13,8 +13,8 @@
 // version per write is the oracle:
 //   snapshot  conflict exactly when a key the plan guards or writes differs
 //             between the snapshot and the head (absent in both is equal).
-//   sequence  the same, or when an intervening write removed such a key,
-//             even one written since.
+//   sequence  the same, or when an intervening delete named such a key: a
+//             del that removed it, or a del_range over it, present or not.
 // So a snapshot conflict is always a sequence conflict, never the reverse.
 // When only db_snap commits, its writes are replayed on db_seq unguarded so
 // the two histories stay the same.
@@ -33,6 +33,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 import bytecask;
@@ -79,12 +80,23 @@ struct Write {
   std::string key;
 };
 
-// Applies an intervening write to the model and both databases. Returns the
-// key it removed from the model, if any.
-auto intervene(bytecask::DB &a, bytecask::DB &b, Model &m,
-               std::uint64_t &version, std::mt19937_64 &rng)
-    -> std::vector<std::string> {
-  std::vector<std::string> removed;
+// What intervening deletes named: keys a del removed (DB::del of an absent
+// key writes nothing), and every del_range's bounds.
+struct Named {
+  std::set<std::string> keys;
+  std::vector<std::pair<std::string, std::string>> ranges;
+  [[nodiscard]] auto names(const std::string &k) const -> bool {
+    return keys.contains(k) ||
+           std::ranges::any_of(ranges, [&](const auto &r) {
+             return k >= r.first && k < r.second;
+           });
+  }
+};
+
+// Applies an intervening write to the model and both databases, adding what
+// a delete named to `named`.
+void intervene(bytecask::DB &a, bytecask::DB &b, Model &m,
+               std::uint64_t &version, std::mt19937_64 &rng, Named &named) {
   const auto kind = std::uniform_int_distribution<int>{0, 9}(rng);
   const auto k = key_of(std::uniform_int_distribution<int>{0, kKeys - 1}(rng));
   if (kind < 5) {
@@ -95,19 +107,16 @@ auto intervene(bytecask::DB &a, bytecask::DB &b, Model &m,
   } else if (kind < 8) {
     (void)a.del({.sync = false}, to_bytes(k));
     (void)b.del({.sync = false}, to_bytes(k));
-    if (m.erase(k) != 0) removed.push_back(k);
+    if (m.erase(k) != 0) named.keys.insert(k);
   } else {
     const auto j = key_of(std::uniform_int_distribution<int>{0, kKeys}(rng));
     const auto from = std::min(k, j);
     const auto to = std::max(k, j) + "~";
     a.del_range({.sync = false}, to_bytes(from), to_bytes(to));
     b.del_range({.sync = false}, to_bytes(from), to_bytes(to));
-    for (auto it = m.lower_bound(from); it != m.end() && it->first < to;) {
-      removed.push_back(it->first);
-      it = m.erase(it);
-    }
+    m.erase(m.lower_bound(from), m.lower_bound(to));
+    named.ranges.emplace_back(from, to);
   }
-  return removed;
 }
 
 auto contents(const bytecask::DB &db) -> std::map<std::string, std::string> {
@@ -145,8 +154,9 @@ TEST_CASE("plans on a snapshot and on its sequence match their models for point 
 
   for (int round = 0; round < 3000; ++round) {
     INFO(std::format("round {}", round));
+    Named before;
     for (int i = std::uniform_int_distribution<int>{0, 2}(rng); i > 0; --i)
-      (void)intervene(db_snap, db_seq, model, version, rng);
+      intervene(db_snap, db_seq, model, version, rng, before);
 
     auto snap = db_snap.snapshot();
     const auto read_seq = db_seq.snapshot().sequence();
@@ -177,10 +187,9 @@ TEST_CASE("plans on a snapshot and on its sequence match their models for point 
     auto on_snap = build(bytecask::WritePlan{std::move(snap)}, true);
     auto on_seq = build(bytecask::WritePlan{read_seq}, true);
 
-    std::set<std::string> removed;
+    Named since;
     for (int i = std::uniform_int_distribution<int>{0, 3}(rng); i > 0; --i)
-      for (auto &k : intervene(db_snap, db_seq, model, version, rng))
-        removed.insert(std::move(k));
+      intervene(db_snap, db_seq, model, version, rng, since);
 
     std::set<std::string> touched = guarded;
     for (const auto &w : writes) touched.insert(w.key);
@@ -188,7 +197,7 @@ TEST_CASE("plans on a snapshot and on its sequence match their models for point 
     bool any_removed = false;
     for (const auto &k : touched) {
       states_differ |= at(snap_model, k) != at(model, k);
-      any_removed |= removed.contains(k);
+      any_removed |= since.names(k);
     }
     const bool expect_snap_conflict = states_differ;
     const bool expect_seq_conflict = states_differ || any_removed;

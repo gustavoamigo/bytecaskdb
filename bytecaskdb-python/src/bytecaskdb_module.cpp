@@ -889,14 +889,14 @@ NB_MODULE(_bytecaskdb, m) {
             auto p = plan.take();
             auto wopts = opts.value_or(bytecask::WriteOptions{});
             BC_GIL_RELEASE;
-            // Both refusals are None: a retry from a fresh snapshot answers
-            // either one.
+            // Python plans are built on a snapshot, which is never TooOld,
+            // so a refusal is a conflict (#737 tracks a read-sequence plan).
             auto r = self.db.apply_batch(wopts, std::move(p));
             if (!r) return std::nullopt;
             return *r;
           },
           "Apply plan atomically. Returns the CommitResult if committed, or "
-          "None on conflict or when the plan's snapshot is too old to check.",
+          "None on conflict.",
           "plan"_a, "opts"_a = nb::none())
       .def(
           "snapshot",

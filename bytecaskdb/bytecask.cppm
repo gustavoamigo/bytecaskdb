@@ -241,21 +241,22 @@ export struct WriteOptions {
   bool solo{false};
 };
 
+// Why apply_batch refused a plan. Nothing was written either way.
+export enum class PlanRefusal {
+  // A guard failed, or a key the plan writes changed since its snapshot or
+  // read sequence. Retry from a fresh snapshot.
+  Conflict,
+  // Plans on a read sequence only: it is older than what the engine still
+  // tracks (a restart, resume(), ingest, or deletes beyond
+  // max_delete_log_bytes since). Whether it conflicts cannot be told: take a
+  // fresh snapshot.
+  TooOld,
+};
+
 // Outcome of a committed write. sequence is the highest sequence assigned to
 // the write (for a multi-op batch this is the BulkEnd marker's sequence). A
 // reader — local or follower — whose durable_sequence() >= sequence is
 // guaranteed to see every entry of this write.
-// Why apply_batch refused a plan. Nothing was written either way.
-export enum class PlanRefusal {
-  // A guard failed, or a key the plan writes changed since its read
-  // sequence. Retry from a fresh snapshot.
-  Conflict,
-  // The plan's read sequence is older than what the engine still tracks
-  // (a restart, resume(), ingest, or deletes beyond max_delete_log_bytes
-  // since). Whether it conflicts cannot be told: take a fresh snapshot.
-  TooOld,
-};
-
 export struct CommitResult {
   // Highest sequence assigned to this write. 0 means nothing was written
   // (empty plan, guard-only plan, or empty-range del_range) — there is
@@ -335,8 +336,9 @@ export struct Options {
   // Most bytes the log of recent deletes may hold. A plan carries the
   // sequence it read at, and a key it finds absent is checked against this
   // log; once the log drops the deletes after a plan's read sequence, the
-  // plan is refused as PlanRefusal::TooOld. 0 keeps no log: every plan
-  // read before the latest delete is too old.
+  // plan is refused as PlanRefusal::TooOld. A del_range is one entry,
+  // whatever it covers. 0 keeps no log: every plan read before the latest
+  // delete is too old.
   std::size_t max_delete_log_bytes{kDefaultMaxDeleteLogBytes};
 };
 
@@ -661,15 +663,15 @@ public:
       -> std::vector<DataEntryView>;
 
   // State transition: apply all writes from a plan using pre-computed offsets.
-  // Pure in-memory mutations. Every key a write removes from the key
-  // directory is staged with the sequence that removed it (take_removed).
+  // Pure in-memory mutations. Every delete is staged with its sequence, a
+  // del by its key and a del_range by its bounds (staged_removals).
   void apply_writes(const WritePlan &plan,
                     std::span<const std::uint64_t> offsets);
 
-  // The removals apply_writes staged, for DeleteLog::record_all once the
-  // whole group has applied. Leaves none staged.
-  [[nodiscard]] auto take_removed() noexcept -> std::vector<KeyRemoval> {
-    return std::exchange(removed_, {});
+  // The deletes apply_writes staged, for DeleteLog::record once the whole
+  // group is appended; record takes them out.
+  [[nodiscard]] auto staged_removals() noexcept -> StagedRemovals & {
+    return removed_;
   }
 
   // State transition: register a sealed read-only file in place of the old
@@ -832,10 +834,11 @@ private:
   std::string degraded_reason_;
   std::shared_ptr<const std::vector<ChangeMarker>> change_markers_;
   std::size_t scratch_bytes_;
-  // Keys this transient's writes removed, in sequence order: staged here so
-  // a group that fails before it is appended leaves no removal in the
-  // DeleteLog. The writer hands them over with take_removed().
-  std::vector<KeyRemoval> removed_;
+  // The deletes this transient's writes made: staged here so a group that
+  // fails before it is appended leaves none in the DeleteLog, and so the
+  // group's later slots see them. The writer hands them over with
+  // staged_removals().
+  StagedRemovals removed_;
 };
 
 // ---------------------------------------------------------------------------
@@ -2130,8 +2133,10 @@ public:
   explicit WritePlan(SizeLimits limits) : limits_{limits} {}
   explicit WritePlan(std::uint64_t read_sequence, SizeLimits limits = {})
       : limits_{limits}, base_{SequenceBase{read_sequence}} {}
+  // A moved-from snapshot names no state: refused with
+  // std::invalid_argument rather than read when the plan is checked.
   explicit WritePlan(Snapshot snap)
-      : limits_{snap.limits_}, base_{SnapshotBase{std::move(snap)}} {}
+      : limits_{snap.limits_}, base_{SnapshotBase{checked(std::move(snap))}} {}
   WritePlan(const WritePlan &) = delete;
   WritePlan &operator=(const WritePlan &) = delete;
   WritePlan(WritePlan &&) noexcept = default;
@@ -2280,6 +2285,12 @@ private:
       -> const std::optional<KeyDirEntry> & {
     static const std::optional<KeyDirEntry> kNone;
     return i < snap_entries_.size() ? snap_entries_[i] : kNone;
+  }
+
+  static auto checked(Snapshot snap) -> Snapshot {
+    if (!snap.state_)
+      throw std::invalid_argument{"WritePlan: the Snapshot was moved from"};
+    return snap;
   }
 
   SizeLimits limits_;

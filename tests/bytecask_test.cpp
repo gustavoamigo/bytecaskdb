@@ -7916,12 +7916,20 @@ auto plan_on(PlanBase base, bytecask::Snapshot snap) -> bytecask::WritePlan {
   return bytecask::WritePlan{snap.sequence()};
 }
 
-// A removal the head made at seq.
+// A del of key the head made at seq.
 void removed(bytecask::DeleteLog &log, const std::string &key,
              std::uint64_t seq) {
-  const auto k = to_bytes(key);
-  const bytecask::KeyRemoval r{{k.begin(), k.end()}, seq};
-  log.record_all(std::span{&r, 1});
+  bytecask::StagedRemovals staged;
+  staged.add_key(to_bytes(key), seq);
+  log.record(staged);
+}
+
+// A del_range of [from, to) the head made at seq.
+void range_removed(bytecask::DeleteLog &log, const std::string &from,
+                   const std::string &to, std::uint64_t seq) {
+  bytecask::StagedRemovals staged;
+  staged.add_range(to_bytes(from), to_bytes(to), seq);
+  log.record(staged);
 }
 
 } // namespace
@@ -8277,6 +8285,42 @@ TEST_CASE("validate_preconditions: a key written and removed again since the bas
   plan.put(to_bytes("k"), to_bytes("v1"));
   CHECK(t.validate_preconditions(plan, deletes) ==
         (base == PlanBase::Snapshot ? Verdict::Holds : Verdict::Conflict));
+}
+
+TEST_CASE("validate_preconditions: a range delete since the base over an absent key conflicts for a sequence plan only",
+          "[validate_preconditions]") {
+  // A del_range is logged by its bounds, so it names every key it covers,
+  // present or not (CONTRACT.md, "Isolation is what the plan guards").
+  auto snap = make_snapshot({});
+  auto state = make_state({});
+  auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  range_removed(deletes, "a", "m", 20);
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  const auto expect = [&](bool inside) {
+    return base == PlanBase::Sequence && inside ? Verdict::Conflict
+                                                : Verdict::Holds;
+  };
+  SECTION("a written key inside the range") {
+    auto plan = plan_on(base, std::move(snap));
+    plan.put(to_bytes("k"), to_bytes("v1"));
+    CHECK(t.validate_preconditions(plan, deletes) == expect(true));
+  }
+  SECTION("a written key past the range") {
+    auto plan = plan_on(base, std::move(snap));
+    plan.put(to_bytes("m"), to_bytes("v1"));
+    CHECK(t.validate_preconditions(plan, deletes) == expect(false));
+  }
+  SECTION("a range guard overlapping it") {
+    auto plan = plan_on(base, std::move(snap));
+    plan.ensure_range_unchanged(to_bytes("l"), to_bytes("z"));
+    CHECK(t.validate_preconditions(plan, deletes) == expect(true));
+  }
+  SECTION("a range guard next to it") {
+    auto plan = plan_on(base, std::move(snap));
+    plan.ensure_range_unchanged(to_bytes("m"), to_bytes("z"));
+    CHECK(t.validate_preconditions(plan, deletes) == expect(false));
+  }
 }
 
 TEST_CASE("validate_preconditions: a read sequence below the delete log's horizon is too old",
@@ -9697,6 +9741,45 @@ TEST_CASE("snapshot plan: never too old, whatever the delete log holds",
   plan.put(to_bytes("k"), to_bytes("v1"));
   REQUIRE(db.apply_batch({}, std::move(plan)).has_value());
   CHECK(to_string(*get_val(db, to_bytes("k"))) == "v1");
+}
+
+TEST_CASE("read sequence: a range delete is one entry in the delete log, whatever it covers",
+          "[apply_batch][read_sequence]") {
+  // 2000 keys logged one by one would overflow a 1 KiB log and refuse the
+  // plan as TooOld. Logged by its bounds, the range delete fits, and it
+  // names every key in the range, present at the read or not (CONTRACT.md,
+  // "Isolation is what the plan guards").
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_delete_log_bytes = 1024});
+  for (int i = 0; i < 2000; ++i)
+    db.put({.sync = false}, to_bytes(std::format("r{:04}", i)), to_bytes("x"));
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+  const auto read_seq = db.snapshot().sequence();
+  db.del_range({}, to_bytes("r"), to_bytes("s"));
+
+  bytecask::WritePlan outside{read_seq};
+  outside.put(to_bytes("k"), to_bytes("v1"));
+  CHECK(db.apply_batch({}, std::move(outside)).has_value());
+  for (const auto *key : {"r0005", "r9999"}) {
+    INFO(key);
+    bytecask::WritePlan inside{read_seq};
+    inside.put(to_bytes(key), to_bytes("v1"));
+    const auto r = db.apply_batch({}, std::move(inside));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == bytecask::PlanRefusal::Conflict);
+  }
+}
+
+TEST_CASE("WritePlan: a moved-from snapshot is refused",
+          "[apply_batch][snapshot]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  auto snap = db.snapshot();
+  auto kept = std::move(snap);
+  CHECK_THROWS_AS(bytecask::WritePlan{std::move(snap)}, std::invalid_argument);
+  bytecask::WritePlan plan{std::move(kept)};
+  plan.put(to_bytes("k"), to_bytes("v"));
+  CHECK(db.apply_batch({}, std::move(plan)).has_value());
 }
 
 TEST_CASE("read sequence: a sequence past the latest throws",

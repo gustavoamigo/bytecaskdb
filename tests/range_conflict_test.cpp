@@ -11,8 +11,10 @@
 //   snapshot  the plan conflicts exactly when the model, restricted to
 //             [from, to), differs between the snapshot and the head: a key
 //             changed, inserted or deleted.
-//   sequence  the same, or when an intervening write removed a key in
-//             [from, to), even one written since: a removal is a change.
+//   sequence  the same, or when an intervening delete named a key in
+//             [from, to): a del of a present key (or any planned del, which
+//             writes a tombstone either way), or a del_range overlapping
+//             it, whatever keys it found.
 // Both missed conflicts and false ones fail. The key alphabet puts keys on
 // range bounds and between prefix neighbours ("b" < "b\0" < "b0" < "bb").
 //
@@ -113,21 +115,19 @@ void apply(Model &m, const Op &op, std::uint64_t &version) {
   }
 }
 
-// The keys op removes from m: those it deletes that are present.
-auto removed_by(const Model &m, const Op &op) -> std::vector<std::string> {
-  std::vector<std::string> out;
+// Whether op is a delete that names a key in [from, to). DB::del of an
+// absent key writes nothing; a planned del writes a tombstone either way.
+auto names_in(const Model &m, const Op &op, bool planned,
+              const std::string &from, const std::string &to) -> bool {
   switch (op.kind) {
   case OpKind::Put:
-    break;
+    return false;
   case OpKind::Del:
-    if (m.contains(op.a)) out.push_back(op.a);
-    break;
+    return (planned || m.contains(op.a)) && op.a >= from && op.a < to;
   case OpKind::DelRange:
-    for (auto it = m.lower_bound(op.a); it != m.lower_bound(op.b); ++it)
-      out.push_back(it->first);
-    break;
+    return op.a < to && from < op.b;
   }
-  return out;
+  return false;
 }
 
 auto random_range(std::mt19937_64 &rng) -> std::pair<std::string, std::string> {
@@ -319,8 +319,8 @@ void run_rounds(Placement placement, PlanBase base, std::uint64_t seed,
       // fail: the resume placement's last write is never a del.
       if (placement == Placement::Resume && i == n - 1 && op.kind == OpKind::Del)
         op.kind = OpKind::Put;
-      for (const auto &k : removed_by(model, op))
-        removed_in_range |= k >= from && k < to;
+      removed_in_range |= names_in(model, op, placement == Placement::SameGroup,
+                                   from, to);
       apply(model, op, version);
       ops.emplace_back(op, version);
     }

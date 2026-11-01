@@ -393,8 +393,9 @@ class ApplyResult;
 // A plan's base is what "changed since" is measured against:
 //   WritePlan(snap)            the snapshot itself, held until apply_batch returns.
 //                              A key absent in snap and absent now is unchanged.
-//   WritePlan(snap.sequence()) a plain sequence, no snapshot held. A key written
-//                              and deleted again since counts as changed, and a
+//   WritePlan(snap.sequence()) a plain sequence, no snapshot held. A key a delete
+//                              since named counts as changed, present or not (a
+//                              del_range names every key it covers), and a
 //                              sequence older than the delete log covers is TooOld.
 // A base enables ensure_unchanged / ensure_range_unchanged guards; those
 // methods throw std::logic_error on a plan without one.

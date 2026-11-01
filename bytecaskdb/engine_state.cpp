@@ -145,8 +145,8 @@ private:
 };
 
 // A plan built from a read sequence R: a present key changed if its entry
-// is above R; an absent one if a write since R removed it, logged in
-// `deletes` or staged by this transient's earlier slots.
+// is above R; an absent one if a delete since R named it, staged by this
+// transient's earlier slots or logged in `deletes`.
 class TransientEngineState::SequenceCheck {
 public:
   static constexpr bool kHasBase = true;
@@ -160,15 +160,14 @@ public:
 
   // A present key changed if its entry is newer: nothing but a write gives
   // an entry a sequence, and vacuum keeps it. An absent one changed if a
-  // write since removed it; one written and removed again since counts too.
+  // delete since named it: a del of it or a del_range over it, whether or
+  // not it was present then.
   [[nodiscard]] auto changed(std::span<const std::byte> key,
                              const std::optional<KeyDirEntry> &cur,
                              std::size_t /*write_index*/) const -> bool {
     if (cur) return cur->sequence() > read_seq_;
-    return deletes_.removed(key, read_seq_, head_.next_seq_) ||
-           std::ranges::any_of(head_.removed_, [&](const KeyRemoval &r) {
-             return std::ranges::equal(r.key, key);
-           });
+    if (head_.removed_.removes(key)) return true;
+    return deletes_.removed(key, read_seq_, head_.next_seq_);
   }
 
   [[nodiscard]] auto range_changed(std::span<const std::byte> from,
@@ -184,14 +183,10 @@ public:
         return true;
       }
     }
-    // Keys removed since R, by del or by a range delete. They leave no entry
-    // to carry a sequence, so a retry has to see the head's latest.
-    const auto in_range = [&](const KeyRemoval &r) {
-      return !std::ranges::lexicographical_compare(r.key, from) &&
-             std::ranges::lexicographical_compare(r.key, to);
-    };
-    if (deletes_.removed_in(from, to, read_seq_, head_.next_seq_) ||
-        std::ranges::any_of(head_.removed_, in_range)) {
+    // Keys a delete since R named, by del or by a range delete. They leave
+    // no entry to carry a sequence, so a retry has to see the head's latest.
+    if (head_.removed_.removes_any_in(from, to) ||
+        deletes_.removed_in(from, to, read_seq_, head_.next_seq_)) {
       rests_on = head_.next_seq_ - 1;
       return true;
     }
@@ -437,8 +432,8 @@ void TransientEngineState::apply_writes(
               const auto dec =
                   entry_size(key_span.size(), existing->value_size());
               file_stats_.patch(existing->file_id(), {.live_removed = dec});
-              removed_.push_back({{key_span.begin(), key_span.end()}, next_seq_});
             }
+            removed_.add_key(key_span, next_seq_);
             const auto del_sz = entry_size(key_span.size(), 0);
             file_stats_.patch(active_file_id_, {.total_added = del_sz, .tombstone_added = del_sz});
             ++next_seq_;
@@ -465,8 +460,8 @@ void TransientEngineState::apply_writes(
             for (const auto &k : to_erase) {
               const std::span<const std::byte> k_span{k};
               (void)kd_erase(key_dir_, k_span, kd_ctx());
-              removed_.push_back({{k_span.begin(), k_span.end()}, next_seq_});
             }
+            removed_.add_range(from_span, to_span, next_seq_);
 
             const auto rd_sz = entry_size(op.from.size(), op.to.size());
             file_stats_.patch(active_file_id_, {.total_added = rd_sz, .tombstone_added = rd_sz});
