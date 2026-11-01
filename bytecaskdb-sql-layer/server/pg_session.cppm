@@ -102,11 +102,12 @@ struct TransactionModes {
 // A statement's text as the session takes it: nothing, a transaction
 // control word, or a statement for the layer.
 struct Classified {
-  enum class Kind { Empty, Control, Sql } kind{Kind::Empty};
+  enum class Kind { Empty, Control, Sql, Cursor } kind{Kind::Empty};
   Control control{Control::Begin};
   std::string sql;       // Sql: the one statement, without its trailing ';'
   std::string encoding;  // SetEncoding: PostgreSQL's name for it
   TransactionModes modes;  // SetTransaction
+  std::optional<ast::CursorStatement> cursor;  // Cursor: DECLARE, FETCH, MOVE or CLOSE
 };
 
 auto upper_words(std::string_view s) -> std::vector<std::string> {
@@ -301,6 +302,11 @@ auto classify(std::string_view text, const char* several_state, std::string_view
       return {Classified::Kind::Control, Control::SetEncoding, {}, std::string{*encoding}};
     }
   }
+  if (w == "DECLARE" || w == "FETCH" || w == "MOVE" || w == "CLOSE") {
+    out.kind = Classified::Kind::Cursor;
+    out.cursor = ast::parse_cursor(sql);
+    return out;
+  }
   for (const auto* word : {"SET", "SHOW", "RESET", "PREPARE", "EXECUTE", "DEALLOCATE", "SAVEPOINT", "RELEASE", "COPY",
                            "DISCARD", "LISTEN", "UNLISTEN", "NOTIFY", "LOCK"}) {
     if (w == word) throw SessionError(w + " is not supported", "0A000");
@@ -359,7 +365,21 @@ struct Prepared {
   Control control{Control::Begin};
   std::string encoding;            // SetEncoding
   TransactionModes modes;          // SetTransaction
-  const Statement* stmt{nullptr};  // Sql: from Database::prepare, valid until close
+  const Statement* stmt{nullptr};  // Sql, and a DECLARE's query: from Database::prepare, valid until close
+  std::optional<ast::CursorStatement> cursor;  // Cursor
+};
+
+// A session's cursor: the transaction's, and whether DECLARE said NO SCROLL.
+struct SessionCursor {
+  Cursor cursor;
+  bool no_scroll{false};
+};
+
+// What a cursor statement answers: rows (FETCH) and the command tag.
+struct CursorReply {
+  Rows rows;
+  bool returns_rows{false};
+  std::string tag;
 };
 
 struct Portal {
@@ -727,7 +747,11 @@ private:
   }
 
   // A transaction ended: its portals go with it, as in PostgreSQL.
-  void end_transaction() noexcept { portals_.clear(); }
+  void end_transaction() noexcept {
+    portals_.clear();
+    for (auto& [name, c] : cursors_) c.cursor.close();
+    cursors_.clear();
+  }
 
   // BEGIN, COMMIT, ROLLBACK, SET TRANSACTION or SET client_encoding; returns the command tag.
   // Ending a block drops every portal: a caller holds none across it.
@@ -812,6 +836,104 @@ private:
     return {};
   }
 
+  // ------------------------------------------------------------ cursors
+
+  // What a DECLARE refuses before its query is read, in PostgreSQL's order: a
+  // failed block, then a statement outside a block.
+  void check_declare(const ast::DeclareCursor& d) const {
+    refuse_if_failed();
+    if (d.hold) {
+      throw SessionError("DECLARE ... WITH HOLD is not supported yet (phase 4 of docs/cursor_design.md)", "0A000");
+    }
+    if (!in_block_) throw SessionError("DECLARE CURSOR can only be used in transaction blocks", "25P01");
+    if (d.scroll == ast::DeclareCursor::Scroll::Scroll && d.for_update) {
+      throw SessionError("DECLARE SCROLL CURSOR ... FOR UPDATE is not supported", "0A000");
+    }
+    if (d.binary) throw SessionError("DECLARE BINARY CURSOR is not supported: binary results are not", "0A000");
+  }
+
+  // The statement a cursor statement prepares: a DECLARE's query, else none.
+  auto prepare_cursor(const ast::CursorStatement& c) -> const Statement* {
+    const auto* d = std::get_if<ast::DeclareCursor>(&c);
+    if (d == nullptr) return nullptr;
+    check_declare(*d);
+    const auto& stmt = db_.prepare(d->query);
+    if (stmt.command() != Command::Select) throw SessionError("a cursor needs a SELECT", "42601");
+    return &stmt;
+  }
+
+  auto find_cursor(const std::string& name) -> SessionCursor& {
+    auto it = cursors_.find(name);
+    if (it == cursors_.end()) throw SessionError("cursor \"" + name + "\" does not exist", "34000");
+    return it->second;
+  }
+
+  // The rows a FETCH of `f` takes from `c`: how many, for a forward fetch.
+  // Backward and absolute fetches are phase 5 (docs/cursor_design.md).
+  static auto forward_count(const ast::FetchCursor& f, const SessionCursor& c) -> std::uint64_t {
+    using Direction = ast::FetchCursor::Direction;
+    auto verb = std::string{f.move ? "MOVE" : "FETCH"};
+    auto backward = f.direction == Direction::Backward || (f.direction == Direction::Forward && f.count < 0);
+    if (backward && c.no_scroll) throw SessionError("cursor can only scan forward", "55000");
+    if (f.direction == Direction::Absolute || f.direction == Direction::Relative || backward ||
+        (f.direction == Direction::Forward && f.count == 0)) {
+      throw SessionError(verb + " in this direction is not supported yet (phase 5 of docs/cursor_design.md); only NEXT, a count, FORWARD n and ALL are",
+                         "0A000");
+    }
+    return static_cast<std::uint64_t>(f.count);
+  }
+
+  // DECLARE, FETCH, MOVE or CLOSE inside the block. A failure here fails the
+  // block through the caller, which closes the cursors with the transaction.
+  auto run_cursor(const ast::CursorStatement& c, const Statement* stmt, const std::vector<Value>& params)
+      -> CursorReply {
+    refuse_if_failed();
+    CursorReply out;
+    if (const auto* d = std::get_if<ast::DeclareCursor>(&c)) {
+      check_declare(*d);
+      if (cursors_.contains(d->name) || portals_.contains(d->name)) {
+        throw SessionError("cursor \"" + d->name + "\" already exists", "42P03");
+      }
+      enter_statement(*stmt);
+      cursors_.emplace(d->name, SessionCursor{txn_->open_cursor(*stmt, params),
+                                              d->scroll == ast::DeclareCursor::Scroll::NoScroll});
+      out.tag = "DECLARE CURSOR";
+    } else if (const auto* f = std::get_if<ast::FetchCursor>(&c)) {
+      auto& cursor = find_cursor(f->name);
+      auto k = forward_count(*f, cursor);
+      out.rows = cursor.cursor.fetch(k);
+      out.returns_rows = !f->move;
+      out.tag = (f->move ? "MOVE " : "FETCH ") + std::to_string(out.rows.rows.size());
+      if (f->move) out.rows.rows.clear();
+    } else {
+      const auto& x = std::get<ast::CloseCursor>(c);
+      if (x.all) {
+        for (auto& [name, sc] : cursors_) sc.cursor.close();
+        cursors_.clear();
+        out.tag = "CLOSE CURSOR ALL";
+      } else {
+        auto& cursor = find_cursor(x.name);
+        cursor.cursor.close();
+        cursors_.erase(x.name);
+        out.tag = "CLOSE CURSOR";
+      }
+    }
+    return out;
+  }
+
+  // The columns a FETCH of `name` would describe; none if there is no such cursor yet.
+  auto cursor_columns(const std::string& name) -> std::optional<std::vector<ResultColumn>> {
+    auto it = cursors_.find(name);
+    if (it == cursors_.end() || !it->second.cursor.is_open()) return std::nullopt;
+    return result_columns(it->second.cursor.fetch(0));
+  }
+
+  static auto result_columns(const Rows& rows) -> std::vector<ResultColumn> {
+    std::vector<ResultColumn> cols;
+    for (std::size_t i = 0; i < rows.columns.size(); ++i) cols.push_back({rows.columns[i], rows.types.at(i)});
+    return cols;
+  }
+
   // ------------------------------------------------------------ messages
 
   void loop() {
@@ -860,9 +982,21 @@ private:
   void simple(Body& body) {
     auto text = std::string{body.cstr()};
     try {
+      last_text_ = text;  // a cursor statement's parse error is a position into it
       auto c = classify(text, "0A000", "several statements in one query are not supported");
       switch (c.kind) {
         case Classified::Kind::Empty: simple_reply('I'); break;
+        case Classified::Kind::Cursor: {
+          const auto* stmt = prepare_cursor(*c.cursor);
+          if (stmt != nullptr && !stmt->params().empty()) throw SessionError("there is no parameter $1", "42P02");
+          auto reply = run_cursor(*c.cursor, stmt, {});
+          if (reply.returns_rows) {
+            row_description(result_columns(reply.rows));
+            data_rows(reply.rows);
+          }
+          complete(reply.tag);
+          break;
+        }
         case Classified::Kind::Control: complete(run_control(c.control, c.encoding, c.modes)); break;
         case Classified::Kind::Sql: {
           last_text_ = c.sql;
@@ -937,7 +1071,12 @@ private:
     }
     last_text_ = text;
     auto c = classify(text, "42601", "cannot insert multiple commands into a prepared statement");
-    Prepared p{c.kind, c.control, c.encoding, c.modes, nullptr};
+    Prepared p{c.kind, c.control, c.encoding, c.modes, nullptr, std::move(c.cursor)};
+    if (c.kind == Classified::Kind::Cursor) {
+      refuse_if_failed();
+      p.stmt = prepare_cursor(*p.cursor);
+      if (p.stmt != nullptr) db_.refit(*p.stmt);
+    }
     if (c.kind == Classified::Kind::Sql) {
       last_text_ = c.sql;
       refuse_sql_if_failed(c.sql);
@@ -976,7 +1115,7 @@ private:
                              statement + "\" requires " + std::to_string(infos.size()),
                          "08P01");
     }
-    if (p.kind == Classified::Kind::Sql) refuse_if_failed();
+    if (p.kind == Classified::Kind::Sql || p.kind == Classified::Kind::Cursor) refuse_if_failed();
     Portal out{p, {}};
     for (std::int16_t i = 0; i < n; ++i) {
       auto len = body.i32();
@@ -990,7 +1129,7 @@ private:
     for (std::int16_t i = 0; i < results; ++i) {
       if (body.i16() != 0) throw SessionError("binary format is not supported", "0A000");
     }
-    if (!portal.empty() && portals_.contains(portal)) {
+    if (!portal.empty() && (portals_.contains(portal) || cursors_.contains(portal))) {
       throw SessionError("portal \"" + portal + "\" already exists", "42P03");
     }
     portals_[portal] = std::move(out);
@@ -998,6 +1137,17 @@ private:
   }
 
   void describe_result(const Prepared& p) {
+    if (p.kind == Classified::Kind::Cursor) {
+      // A FETCH describes its cursor's columns once the cursor exists; a MOVE, DECLARE and CLOSE return no rows.
+      const auto* f = std::get_if<ast::FetchCursor>(&*p.cursor);
+      auto cols = f != nullptr && !f->move ? cursor_columns(f->name) : std::nullopt;
+      if (cols) {
+        row_description(*cols);
+      } else {
+        no_data();
+      }
+      return;
+    }
     if (p.stmt != nullptr && p.stmt->command() == Command::Select) {
       row_description(p.stmt->columns());
     } else {
@@ -1036,6 +1186,13 @@ private:
     if (p.kind == Classified::Kind::Control) {
       auto [control, encoding, modes] = std::tuple{p.control, p.encoding, p.modes};  // run_control may drop the portal
       complete(run_control(control, encoding, modes));
+      return;
+    }
+    if (p.kind == Classified::Kind::Cursor) {
+      last_text_ = p.stmt != nullptr ? p.stmt->sql() : std::string{};
+      auto reply = run_cursor(*p.cursor, p.stmt, portal.params);
+      if (reply.returns_rows) data_rows(reply.rows);
+      complete(reply.tag);
       return;
     }
     last_text_ = p.stmt->sql();
@@ -1138,6 +1295,7 @@ private:
   std::string last_text_;  // the statement an error's position is into
   std::map<std::string, Prepared> statements_;
   std::map<std::string, Portal> portals_;
+  std::map<std::string, SessionCursor> cursors_;  // the block's cursors; they share the portals' namespace
   bool read_only_{false};   // SET TRANSACTION READ ONLY, for the block that is open
   bool block_used_{false};  // the open block has run a statement
   std::optional<Transaction> txn_;       // the explicit block's, from BEGIN

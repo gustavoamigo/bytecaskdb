@@ -349,7 +349,21 @@ and with a constant selected or `DISTINCT ON`, it is not taken yet.
   fails with 40001 if another transaction committed a change to one first;
 - with an aggregate it is refused (0A000, "FOR UPDATE is not allowed with
   aggregate functions"), as PostgreSQL refuses it;
+- `FOR UPDATE OF t` is taken when `t` is a table the query reads (`42P01`
+  otherwise), and is `FOR UPDATE`;
 - on a join, not yet (#534).
+
+**Cursor statements.** `ast::parse_cursor` reads `DECLARE`, `FETCH`, `MOVE` and
+`CLOSE`, and returns nothing for any other statement. They are not an
+`ast::Statement`: they name a session's cursor and carry no plan, so the
+server session runs them (`server_design.md`, *Cursor statements*). A
+`DECLARE` gives its name, `[NO] SCROLL`, `BINARY`, `WITH HOLD`, whether the
+query has `FOR UPDATE`, and the query's text, which `parse` then reads as a
+`SELECT` (`FOR READ ONLY` is dropped by libpg_query's grammar and needs
+nothing). A `FETCH` or `MOVE` gives PostgreSQL's direction and count. Which
+forms run is the session's and `cursor_design.md`'s; `OPEN` and `FETCH … INTO`
+are syntax errors as in PostgreSQL, and `WHERE CURRENT OF` is refused in
+`WHERE` until phase 6.
 
 **Select-list positions in `ORDER BY`.** `ORDER BY 2` orders a plain `SELECT`
 by its second select-list item. The parser resolves it to that item's
