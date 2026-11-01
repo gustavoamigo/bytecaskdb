@@ -50,7 +50,7 @@ auto scan(std::vector<logical::Expr> prefix, std::variant<std::monostate, physic
 }
 
 auto emit(physical::NodePtr in, std::vector<logical::ColumnRef> targets = {kId}) -> physical::NodePtr {
-  return node(physical::Emit{std::move(in), std::move(targets)});
+  return node(physical::Emit{std::move(in), {targets.begin(), targets.end()}});
 }
 
 auto value(logical::Expr e) -> physical::KeyBound { return {physical::KeyBound::Kind::Value, std::move(e), false}; }

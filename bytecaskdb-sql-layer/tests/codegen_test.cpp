@@ -187,6 +187,48 @@ TEST_CASE("codegen: MIN from the first entry past the NULLs, or a loop; SUM by a
   CHECK(generate(f.cat(), "SELECT min(x) FROM m WHERE g = $1").result_names == std::vector<std::string>{"min"});
 }
 
+TEST_CASE("codegen: a constant is emitted from its parameter; a SELECT without FROM reads nothing", "[sql][codegen]") {
+  sql_test::Fixture f;
+  // The constant is $2, after the statement's own $1, read in every row.
+  auto beside = generate(f.cat(), "SELECT id, 7 FROM t WHERE id = $1").source;
+  CHECK(beside.find("bc_emit_col(cx, row, COL_1_0);") != std::string::npos);
+  CHECK(beside.find("if (bc_param_null(cx, 1)) {") != std::string::npos);
+  CHECK(beside.find("bc_emit_i64(cx, bc_param_i64(cx, 1));") != std::string::npos);
+  // No table: one row, emitted once; no constants block, no read.
+  auto bare = generate(f.cat(), "SELECT 'a', 2.5");
+  CHECK(bare.result_names == std::vector<std::string>{"?column?", "?column?"});
+  CHECK(bare.source.find("bc_emit_bytes(cx, bc_param_bytes(cx, 0));") != std::string::npos);
+  CHECK(bare.source.find("bc_emit_i64(cx, bc_param_i64(cx, 1));") != std::string::npos);
+  CHECK(bare.source.find("enum") == std::string::npos);
+  CHECK(bare.source.find("bc_scan") == std::string::npos);
+  CHECK(bare.source.find("while") == std::string::npos);
+  CHECK(bare.objects_read.empty());
+}
+
+TEST_CASE("codegen: a predicate filter is true or false in SQL's three-valued logic, each node printed once",
+          "[sql][codegen]") {
+  sql_test::Fixture f;
+  auto ne = generate(f.cat(), "SELECT id FROM t WHERE qty <> $1").source;
+  INFO(ne);
+  // NOT (qty = $1) is true where the comparison is false: neither NULL,
+  // and not equal.
+  CHECK(ne.find("if (!(!(bc_col_null(cx, row, COL_1_2) || bc_param_null(cx, 0)) && !(bc_col_i64(cx, row, COL_1_2) == "
+                "bc_param_i64(cx, 0)))) continue;") != std::string::npos);
+  auto either = generate(f.cat(), "SELECT id FROM t WHERE qty IS NULL OR name = $1").source;
+  INFO(either);
+  CHECK(either.find("(bc_col_null(cx, row, COL_1_2)) || (!(bc_col_null(cx, row, COL_1_1) || bc_param_null(cx, 0)) && "
+                    "(bc_bytes_cmp(cx, bc_col_bytes(cx, row, COL_1_1), bc_param_bytes(cx, 0)) == 0))") != std::string::npos);
+  // A BETWEEN of the key at the top is its range; a predicate never is.
+  auto between = generate(f.cat(), "SELECT id FROM t WHERE id BETWEEN $1 AND $2").source;
+  CHECK(between.find("bc_scan_open(cx, TBL_1") != std::string::npos);
+  CHECK(between.find("continue;") == std::string::npos);
+  // IN is an OR: no key takes it, so the rows are scanned and filtered.
+  auto in = generate(f.cat(), "SELECT id FROM t WHERE id IN ($1, $2)").source;
+  CHECK(in.find("bc_get(") == std::string::npos);
+  CHECK(in.find("bc_param_i64(cx, 0))) || (") != std::string::npos);
+  CHECK(in.find("continue;") != std::string::npos);
+}
+
 TEST_CASE("codegen: over no rows, only a COUNT call is 0; anything else is NULL", "[sql][codegen][group]") {
   // Expr::fn defaults to Count: a column output is NULL whatever its fn.
   // Hand-built, since check refuses a column of one group of every row.

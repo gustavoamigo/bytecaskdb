@@ -66,15 +66,22 @@ auto relation(const PgQuery__RangeVar* rv) -> std::string {
 auto expr(const PgQuery__Node* n) -> Expr;
 auto literal(const PgQuery__Node* n) -> Literal;
 
-// An operand of + or -: an expression, or an integer literal, which must
-// fit BIGINT (PostgreSQL types a larger one as numeric).
+auto literal_expr(Literal l) -> Expr {
+  Expr e{Expr::Kind::Literal, {}, 0, nullptr, nullptr, l.pos};
+  e.literal = std::move(l);
+  return e;
+}
+
+// An operand of + or -: an expression, an integer literal within BIGINT,
+// as a Const, or any other literal (PostgreSQL types a larger integer as
+// numeric), for the binder to fold or refuse.
 auto operand(const PgQuery__Node* n) -> Expr {
   if (n == nullptr || n->node_case != PG_QUERY__NODE__NODE_A_CONST) return expr(n);
   auto l = literal(n);
   std::int64_t v = 0;
   auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
   if (l.kind != Literal::Kind::Integer || ec != std::errc{} || end != l.text.data() + l.text.size()) {
-    reject("only integer literals within BIGINT are supported", l.pos);
+    return literal_expr(std::move(l));
   }
   Expr e{Expr::Kind::Const, {}, 0, nullptr, nullptr, l.pos};
   e.constant = v;
@@ -101,7 +108,27 @@ auto expr(const PgQuery__Node* n) -> Expr {
   if (n->node_case == PG_QUERY__NODE__NODE_A_EXPR) {
     const auto* a = n->a_expr;
     auto op = a->kind == PG_QUERY__A__EXPR__KIND__AEXPR_OP && a->n_name == 1 ? str(a->name[0]) : "";
-    if ((op != "+" && op != "-") || a->lexpr == nullptr) reject("only + and - are supported here", a->location);
+    // A comparison as a value; PostgreSQL's grammar spells != as <>.
+    if (a->lexpr != nullptr && (op == "=" || op == "<>" || op == "<" || op == "<=" || op == ">" || op == ">=")) {
+      Expr e{Expr::Kind::Compare, {}, 0, nullptr, nullptr, a->location};
+      e.cmp = op == "=" ? ValueCompare::Eq
+              : op == "<>" ? ValueCompare::Ne
+              : op == "<"  ? ValueCompare::Lt
+              : op == "<=" ? ValueCompare::Le
+              : op == ">"  ? ValueCompare::Gt
+                           : ValueCompare::Ge;
+      e.lhs = std::make_unique<Expr>(operand(a->lexpr));
+      e.rhs = std::make_unique<Expr>(operand(a->rexpr));
+      return e;
+    }
+    if (op != "+" && op != "-") reject("only + and - are supported here", a->location);
+    // Unary: PostgreSQL's grammar folds - of a number into the literal, so
+    // what is left is + of anything and - of an expression.
+    if (a->lexpr == nullptr) {
+      Expr e{op == "+" ? Expr::Kind::Plus : Expr::Kind::Neg, {}, 0, nullptr, nullptr, a->location};
+      e.rhs = std::make_unique<Expr>(operand(a->rexpr));
+      return e;
+    }
     Expr e{op == "+" ? Expr::Kind::Add : Expr::Kind::Sub, {}, 0, nullptr, nullptr, a->location};
     e.lhs = std::make_unique<Expr>(operand(a->lexpr));
     e.rhs = std::make_unique<Expr>(operand(a->rexpr));
@@ -135,8 +162,24 @@ auto expr(const PgQuery__Node* n) -> Expr {
     e.table = arg.table;
     return e;
   }
-  if (n->node_case == PG_QUERY__NODE__NODE_A_CONST) {
-    reject("literals are not supported; use parameters", n->a_const->location);
+  if (n->node_case == PG_QUERY__NODE__NODE_A_CONST) return literal_expr(literal(n));
+  if (n->node_case == PG_QUERY__NODE__NODE_TYPE_CAST) {
+    const auto* c = n->type_cast;
+    const auto* tn = c->type_name;
+    if (tn == nullptr || tn->n_names == 0 || tn->n_array_bounds != 0 || tn->setof || tn->pct_type) {
+      reject("type not supported", c->location);
+    }
+    Expr e{Expr::Kind::Cast, {}, 0, nullptr, nullptr, c->location};
+    e.cast_type = str(tn->names[tn->n_names - 1]);
+    for (std::size_t k = 0; k < tn->n_typmods; ++k) {
+      const auto* m = tn->typmods[k];
+      if (m->node_case != PG_QUERY__NODE__NODE_A_CONST || m->a_const->val_case != PG_QUERY__A__CONST__VAL_IVAL) {
+        reject("type modifier must be an integer", tn->location);
+      }
+      e.cast_typmods.push_back(m->a_const->ival->ival);
+    }
+    e.rhs = std::make_unique<Expr>(operand(c->arg));
+    return e;
   }
   reject("expression not supported", -1);
 }
@@ -150,23 +193,134 @@ auto compare_op(const std::string& op, std::int32_t pos) -> Compare::Op {
   reject("operator " + op + " is not supported in WHERE", pos);
 }
 
-// A WHERE clause as a list of conjuncts, each a comparison.
-void where(const PgQuery__Node* n, std::vector<Compare>& out, const std::string& clause = "WHERE",
-           std::int32_t pos = -1) {
-  if (n == nullptr) return;
+auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t pos) -> Compare;
+
+auto compare_of(Compare::Op op, Expr lhs, Expr rhs, std::int32_t pos, bool on) -> Compare {
+  return Compare{op, std::move(lhs), std::move(rhs), pos, on};
+}
+
+auto of_kind(Compare::Kind kind, std::vector<Compare> args, std::int32_t pos, bool on) -> Compare {
+  Compare c{Compare::Op::Eq, {}, {}, pos, on};
+  c.kind = kind;
+  c.args = std::move(args);
+  return c;
+}
+
+auto negated(Compare c) -> Compare {
+  auto pos = c.pos;
+  auto on = c.on;
+  std::vector<Compare> one;
+  one.push_back(std::move(c));
+  return of_kind(Compare::Kind::Not, std::move(one), pos, on);
+}
+
+// A WHERE clause's conjunct, as a comparison or a predicate over them:
+// AND, OR, NOT, IS [NOT] NULL, <> (NOT =), BETWEEN [SYMMETRIC] (>= and <=;
+// SYMMETRIC either way round) and [NOT] IN of a list (= of each, OR'd).
+auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t pos) -> Compare {
+  auto on = clause == "ON";
+  if (n == nullptr) reject(clause + " must compare a column", pos);
   if (n->node_case == PG_QUERY__NODE__NODE_BOOL_EXPR) {
     const auto* b = n->bool_expr;
-    if (b->boolop != PG_QUERY__BOOL_EXPR_TYPE__AND_EXPR) reject("only AND is supported in " + clause, b->location);
-    for (std::size_t i = 0; i < b->n_args; ++i) where(b->args[i], out, clause, pos);
-    return;
+    std::vector<Compare> args;
+    for (std::size_t i = 0; i < b->n_args; ++i) args.push_back(predicate(b->args[i], clause, pos));
+    switch (b->boolop) {
+      case PG_QUERY__BOOL_EXPR_TYPE__AND_EXPR: return of_kind(Compare::Kind::And, std::move(args), b->location, on);
+      case PG_QUERY__BOOL_EXPR_TYPE__OR_EXPR: return of_kind(Compare::Kind::Or, std::move(args), b->location, on);
+      case PG_QUERY__BOOL_EXPR_TYPE__NOT_EXPR: return of_kind(Compare::Kind::Not, std::move(args), b->location, on);
+      case PG_QUERY__BOOL_EXPR_TYPE__BOOL_EXPR_TYPE_UNDEFINED:
+      case _PG_QUERY__BOOL_EXPR_TYPE_IS_INT_SIZE: break;
+    }
+    reject("boolean operator not supported in " + clause, b->location);
+  }
+  if (n->node_case == PG_QUERY__NODE__NODE_NULL_TEST) {
+    const auto* t = n->null_test;
+    if (t->argisrow) reject("IS NULL of a row is not supported", t->location);
+    Compare c{Compare::Op::Eq, expr(t->arg), {}, t->location, on};
+    c.kind = Compare::Kind::IsNull;
+    if (t->nulltesttype == PG_QUERY__NULL_TEST_TYPE__IS_NOT_NULL) return negated(std::move(c));
+    return c;
   }
   if (n->node_case != PG_QUERY__NODE__NODE_A_EXPR) reject(clause + " must compare a column", pos);
   const auto* a = n->a_expr;
-  if (a->kind != PG_QUERY__A__EXPR__KIND__AEXPR_OP || a->n_name != 1) {
-    reject(clause + " must compare a column", a->location);
+  auto list = [&](const PgQuery__Node* l) {
+    if (l == nullptr || l->node_case != PG_QUERY__NODE__NODE_LIST) reject(clause + " must compare a column", a->location);
+    return l->list;
+  };
+  switch (a->kind) {
+    case PG_QUERY__A__EXPR__KIND__AEXPR_OP: {
+      if (a->n_name != 1 || a->lexpr == nullptr) break;
+      auto op = str(a->name[0]);
+      if (op == "<>") return negated(compare_of(Compare::Op::Eq, expr(a->lexpr), expr(a->rexpr), a->location, on));
+      return compare_of(compare_op(op, a->location), expr(a->lexpr), expr(a->rexpr), a->location, on);
+    }
+    case PG_QUERY__A__EXPR__KIND__AEXPR_BETWEEN:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_NOT_BETWEEN:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_BETWEEN_SYM:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_NOT_BETWEEN_SYM: {
+      const auto* bounds = list(a->rexpr);
+      if (bounds->n_items != 2) reject("BETWEEN takes two bounds", a->location);
+      auto x = expr(a->lexpr);
+      auto lo = expr(bounds->items[0]);
+      auto hi = expr(bounds->items[1]);
+      auto within = [&](const Expr& from, const Expr& to) {
+        std::vector<Compare> both;
+        both.push_back(compare_of(Compare::Op::Ge, clone(x), clone(from), a->location, on));
+        both.push_back(compare_of(Compare::Op::Le, clone(x), clone(to), a->location, on));
+        return of_kind(Compare::Kind::And, std::move(both), a->location, on);
+      };
+      auto sym = a->kind == PG_QUERY__A__EXPR__KIND__AEXPR_BETWEEN_SYM || a->kind == PG_QUERY__A__EXPR__KIND__AEXPR_NOT_BETWEEN_SYM;
+      auto c = within(lo, hi);
+      if (sym) {
+        std::vector<Compare> either;
+        either.push_back(std::move(c));
+        either.push_back(within(hi, lo));
+        c = of_kind(Compare::Kind::Or, std::move(either), a->location, on);
+      }
+      auto negate = a->kind == PG_QUERY__A__EXPR__KIND__AEXPR_NOT_BETWEEN || a->kind == PG_QUERY__A__EXPR__KIND__AEXPR_NOT_BETWEEN_SYM;
+      if (negate) return negated(std::move(c));
+      return c;
+    }
+    case PG_QUERY__A__EXPR__KIND__AEXPR_IN: {
+      if (a->rexpr == nullptr || a->rexpr->node_case != PG_QUERY__NODE__NODE_LIST) {
+        reject("IN of a subquery is not supported", a->location);
+      }
+      const auto* items = a->rexpr->list;
+      auto x = expr(a->lexpr);
+      std::vector<Compare> any;
+      for (std::size_t i = 0; i < items->n_items; ++i) {
+        any.push_back(compare_of(Compare::Op::Eq, clone(x), expr(items->items[i]), a->location, on));
+      }
+      // IN of one is its equality alone.
+      auto c = any.size() == 1 ? std::move(any[0]) : of_kind(Compare::Kind::Or, std::move(any), a->location, on);
+      if (a->n_name == 1 && str(a->name[0]) == "<>") return negated(std::move(c));  // NOT IN
+      return c;
+    }
+    case PG_QUERY__A__EXPR__KIND__A_EXPR_KIND_UNDEFINED:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_OP_ANY:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_OP_ALL:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_DISTINCT:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_NOT_DISTINCT:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_NULLIF:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_LIKE:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_ILIKE:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_SIMILAR:
+    case _PG_QUERY__A__EXPR__KIND_IS_INT_SIZE: break;
   }
-  out.push_back(Compare{compare_op(str(a->name[0]), a->location), expr(a->lexpr), expr(a->rexpr), a->location,
-                        clause == "ON"});
+  reject(clause + " must compare a column", a->location);
+}
+
+// A WHERE clause as a list of conjuncts: its top-level AND's, each a
+// comparison or a predicate.
+void where(const PgQuery__Node* n, std::vector<Compare>& out, const std::string& clause = "WHERE",
+           std::int32_t pos = -1) {
+  if (n == nullptr) return;
+  if (n->node_case == PG_QUERY__NODE__NODE_BOOL_EXPR && n->bool_expr->boolop == PG_QUERY__BOOL_EXPR_TYPE__AND_EXPR) {
+    const auto* b = n->bool_expr;
+    for (std::size_t i = 0; i < b->n_args; ++i) where(b->args[i], out, clause, pos);
+    return;
+  }
+  out.push_back(predicate(n, clause, pos));
 }
 
 auto literal(const PgQuery__Node* n) -> Literal {
@@ -199,6 +353,15 @@ auto literal(const PgQuery__Node* n) -> Literal {
   reject("constant not supported", c->location);
 }
 
+// A UNIQUE constraint as a unique index takes it: none of NULLS NOT
+// DISTINCT, INCLUDE, DEFERRABLE, USING INDEX or index options yet.
+void plain_unique(const PgQuery__Constraint* c) {
+  if (c->nulls_not_distinct || c->n_including != 0 || c->deferrable || c->initdeferred || !empty(c->indexname) ||
+      !empty(c->indexspace) || c->n_options != 0) {
+    reject("UNIQUE with NULLS NOT DISTINCT, INCLUDE, DEFERRABLE, USING INDEX or options is not supported", c->location);
+  }
+}
+
 // Adds each PRIMARY KEY constraint on the column to `primary_keys`, so a
 // repeated one counts twice.
 auto column_def(const PgQuery__ColumnDef* cd, int& primary_keys) -> ColumnDefAst {
@@ -225,6 +388,9 @@ auto column_def(const PgQuery__ColumnDef* cd, int& primary_keys) -> ColumnDefAst
       col.not_null = true;
     } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_DEFAULT) {
       col.default_value = literal(c->raw_expr);
+    } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_UNIQUE) {
+      plain_unique(c);
+      col.unique.emplace_back(c->conname);
     } else if (c->contype != PG_QUERY__CONSTR_TYPE__CONSTR_NULL) {
       reject("column constraint not supported", c->location);
     }
@@ -247,6 +413,13 @@ auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos) -> CreateTable
     const auto* el = s->table_elts[i];
     if (el->node_case == PG_QUERY__NODE__NODE_CONSTRAINT) {
       const auto* c = el->constraint;
+      if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_UNIQUE) {
+        plain_unique(c);
+        UniqueAst u{c->conname, {}, c->location};
+        for (std::size_t k = 0; k < c->n_keys; ++k) u.columns.push_back(str(c->keys[k]));
+        t.unique.push_back(std::move(u));
+        continue;
+      }
       if (c->contype != PG_QUERY__CONSTR_TYPE__CONSTR_PRIMARY) reject("table constraint not supported", c->location);
       ++primary_keys;
       at_most_one(c->location);
@@ -256,6 +429,7 @@ auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos) -> CreateTable
     if (el->node_case != PG_QUERY__NODE__NODE_COLUMN_DEF) reject("table element not supported", -1);
     t.columns.push_back(column_def(el->column_def, primary_keys));
     at_most_one(t.columns.back().pos);
+    for (const auto& name : t.columns.back().unique) t.unique.push_back({name, {t.columns.back().name}, t.columns.back().pos});
   }
   return t;
 }
@@ -348,11 +522,15 @@ auto limit(const PgQuery__SelectStmt* s) -> std::optional<std::int64_t> {
 
 auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   if (s->op != PG_QUERY__SET_OPERATION__SETOP_NONE) reject("set operations are not supported", pos);
-  // One table, or two: FROM a, b, or a [INNER] JOIN b ON …, whose ON
+  // No table, one, or two: FROM a, b, or a [INNER] JOIN b ON …, whose ON
   // conjuncts join the WHERE's.
-  if (s->n_from_clause != 1 && s->n_from_clause != 2) reject("SELECT reads one or two tables", pos);
+  if (s->n_values_lists != 0) reject("VALUES is supported only in INSERT", pos);
+  if (s->n_from_clause > 2) reject("SELECT reads one or two tables", pos);
   std::vector<const PgQuery__RangeVar*> tables;
   const PgQuery__Node* on = nullptr;
+  std::vector<std::string> using_columns;
+  std::string using_alias;
+  auto natural = false;
   for (std::size_t i = 0; i < s->n_from_clause; ++i) {
     const auto* from = s->from_clause[i];
     if (from->node_case == PG_QUERY__NODE__NODE_JOIN_EXPR) {
@@ -360,24 +538,39 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
       // The join has no position of its own; report the table it joins.
       const auto* r = j->rarg;
       auto at = r != nullptr && r->node_case == PG_QUERY__NODE__NODE_RANGE_VAR ? r->range_var->location : pos;
-      if (s->n_from_clause != 1 || j->jointype != PG_QUERY__JOIN_TYPE__JOIN_INNER || j->is_natural ||
-          j->n_using_clause != 0 || j->alias != nullptr || j->larg == nullptr || r == nullptr ||
-          j->larg->node_case != PG_QUERY__NODE__NODE_RANGE_VAR || r->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) {
-        reject("only an inner join of two tables, by ON, is supported", at);
+      if (s->n_from_clause != 1 || j->jointype != PG_QUERY__JOIN_TYPE__JOIN_INNER || j->alias != nullptr ||
+          j->larg == nullptr || r == nullptr || j->larg->node_case != PG_QUERY__NODE__NODE_RANGE_VAR ||
+          r->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) {
+        reject("only an inner join of two tables, by ON, USING or NATURAL, is supported", at);
       }
       tables = {j->larg->range_var, r->range_var};
       on = j->quals;
+      natural = j->is_natural;
+      for (std::size_t k = 0; k < j->n_using_clause; ++k) using_columns.push_back(str(j->using_clause[k]));
+      if (j->join_using_alias != nullptr) {
+        if (j->join_using_alias->n_colnames != 0) reject("a USING alias takes no column list", at);
+        using_alias = j->join_using_alias->aliasname;
+      }
       continue;
     }
     if (from->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) reject("SELECT reads one or two tables", pos);
     tables.push_back(from->range_var);
   }
-  if (s->n_distinct_clause != 0 || s->group_distinct || s->limit_offset != nullptr || s->n_locking_clause > 1 || s->with_clause != nullptr ||
+  // DISTINCT is a list of one empty node; DISTINCT ON a list of its expressions.
+  auto distinct = s->n_distinct_clause == 1 &&
+                  (s->distinct_clause[0] == nullptr || s->distinct_clause[0]->node_case == PG_QUERY__NODE__NODE__NOT_SET);
+  if (s->n_distinct_clause != 0 && !distinct) reject("DISTINCT ON is not supported", pos);
+  if (s->group_distinct || s->limit_offset != nullptr || s->n_locking_clause > 1 || s->with_clause != nullptr ||
       s->n_window_clause != 0 || s->into_clause != nullptr) {
     reject("SELECT clause not supported", pos);
   }
-  Select sel{{}, relation(tables[0]), tables.size() == 2 ? relation(tables[1]) : "", {}, {}, limit(s), pos, false};
-  sel.table_pos = tables[0]->location;
+  Select sel{{}, tables.empty() ? "" : relation(tables[0]), tables.size() == 2 ? relation(tables[1]) : "", {}, {}, limit(s),
+             pos, false};
+  sel.distinct = distinct;
+  sel.using_columns = std::move(using_columns);
+  sel.natural = natural;
+  sel.using_alias = std::move(using_alias);
+  if (!tables.empty()) sel.table_pos = tables[0]->location;
   if (tables.size() == 2) sel.join_pos = tables[1]->location;
   if (s->n_locking_clause == 1) {
     // FOR UPDATE alone: never NOWAIT or SKIP LOCKED, which only mean

@@ -74,6 +74,9 @@ using ScanRest = std::variant<std::monostate, Range>;
 // No rows, and nothing read: the input a conjunct always false leaves.
 struct Empty {};
 
+// One row of no columns, and nothing read: a SELECT without FROM's.
+struct OneRow {};
+
 // The whole primary key by equality, each part a parameter: at most one row.
 struct PointGet {
   std::uint32_t table{0};
@@ -235,11 +238,21 @@ struct Limit {
   std::int64_t n{0};
 };
 
+// A result column that is a parameter, the same in every row: a constant
+// the binder made one.
+struct ParamTarget {
+  std::uint32_t param{0};
+  PhysType type{PhysType::I64};
+};
+// A result column: a column, from the row or from the entry's key when the
+// scan covers, or a parameter.
+using EmitTarget = std::variant<ColumnRef, ParamTarget>;
+
 // Result rows: the targets of each row. No target is a row of no columns, as
 // PostgreSQL's `SELECT FROM`.
 struct Emit {
   NodePtr input;
-  std::vector<ColumnRef> targets;  // from the row, or from the entry's key when the scan covers
+  std::vector<EmitTarget> targets;
 };
 
 // One aggregate row, of COUNT(*), or COUNT, COUNT(DISTINCT) or SUM of its
@@ -348,7 +361,7 @@ struct Delete {
 };
 
 struct Node {
-  std::variant<Empty, PointGet, Scan, NullSplitScan, CountRange, KeyAggregates, IndexJoin, NestedLoop, HashJoin, Choice,
+  std::variant<Empty, OneRow, PointGet, Scan, NullSplitScan, CountRange, KeyAggregates, IndexJoin, NestedLoop, HashJoin, Choice,
                Filter, Sort, Limit, Emit, Aggregate, GroupAggregate, GroupEmit, Insert, Update, Delete>
       op;
 };
@@ -434,12 +447,22 @@ namespace {
 
 [[noreturn]] void broken(const std::string& rule) { throw std::logic_error{"physical plan: " + rule}; }
 
+// A SELECT without FROM's plan, Emit over OneRow under its LIMIT: the one
+// plan that names no table, and so has no constants.
+auto of_no_table(const Node& root) -> bool {
+  const auto* e = std::get_if<Emit>(&root.op);
+  if (e == nullptr) return false;
+  const auto* n = e->input.get();
+  if (const auto* l = std::get_if<Limit>(&n->op)) n = l->input.get();
+  return std::holds_alternative<OneRow>(n->op);
+}
+
 class Checker {
 public:
   explicit Checker(const Plan& p) : p_{p} {}
 
   void plan() {
-    if (p_.constants.empty()) broken("a plan with no constants");
+    if (p_.constants.empty() && !of_no_table(*p_.root)) broken("a plan with no constants");
     if (!p_.root) broken("a plan with no operator");
     for (auto n : p_.null_checks) param(n);
     // Each combination of the choice points' branches is checked as the plan
@@ -496,6 +519,41 @@ private:
   void reads(const Expr& e) const {
     if (e.kind == Expr::Kind::Column) read(e.col);
     for (const auto& a : e.args) reads(a);
+  }
+
+  // A predicate filter: AND, OR and NOT of comparisons of a column with a
+  // parameter or a constant, none of a DOUBLE, and IS NULL of a column.
+  void predicate(const Expr& e) const {
+    switch (e.kind) {
+      case Expr::Kind::And:
+      case Expr::Kind::Or:
+        if (e.args.size() < 2) broken("an AND or OR of fewer than two");
+        for (const auto& a : e.args) predicate(a);
+        return;
+      case Expr::Kind::Not:
+        if (e.args.size() != 1) broken("a NOT of other than one");
+        predicate(e.args[0]);
+        return;
+      case Expr::Kind::IsNull:
+        if (e.args.size() != 1 || e.args[0].kind != Expr::Kind::Column) broken("IS NULL of other than a column");
+        reads(e);
+        return;
+      case Expr::Kind::Compare:
+        if (e.args[0].kind != Expr::Kind::Column || e.args[0].col.type == PhysType::F64 ||
+            (e.args[1].kind != Expr::Kind::Param && e.args[1].kind != Expr::Kind::Const)) {
+          broken("a predicate's comparison other than of a column, not a DOUBLE, with a parameter");
+        }
+        params(e.args[1]);
+        reads(e);
+        return;
+      case Expr::Kind::Const: return;  // a comparison folded
+      case Expr::Kind::Column:
+      case Expr::Kind::Param:
+      case Expr::Kind::Add:
+      case Expr::Kind::Sub:
+      case Expr::Kind::Aggregate: break;
+    }
+    broken("a predicate of an expression codegen does not print");
   }
 
   void scan(const Scan& s) const {
@@ -892,6 +950,10 @@ private:
               return;
             }
             for (const auto& c : op.conjuncts) {
+              if (logical::is_predicate(c)) {
+                predicate(c);
+                continue;
+              }
               if (c.kind != Expr::Kind::Compare) continue;
               if (c.args[0].kind == Expr::Kind::Column && c.args[0].col.type == PhysType::F64) {
                 broken("a filter on a DOUBLE column");
@@ -942,8 +1004,10 @@ private:
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Emit>) {
             for (const auto& t : op.targets) {
-              read(t);
-              held_above(*op.input, t);
+              if (const auto* c = std::get_if<ColumnRef>(&t)) {
+                read(*c);
+                held_above(*op.input, *c);
+              }
             }
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Aggregate>) {

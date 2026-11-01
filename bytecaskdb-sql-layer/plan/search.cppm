@@ -152,8 +152,8 @@ using Conjuncts = std::vector<Expr>;
 
 // An operator's name, for a refusal of a shape the search does not plan.
 auto op_name(const logical::Node& n) -> std::string {
-  constexpr const char* kNames[] = {"Get",  "Empty", "Filter", "Project", "Join",  "Aggregate",
-                                    "Sort", "Limit", "Insert", "Update",  "Delete"};
+  constexpr const char* kNames[] = {"Get",  "Empty", "OneRow", "Filter", "Project", "Join",  "Aggregate",
+                                    "Sort", "Limit", "Insert", "Update", "Delete"};
   static_assert(std::size(kNames) == std::variant_size_v<decltype(n.op)>);
   return kNames[n.op.index()];
 }
@@ -194,8 +194,11 @@ auto mirrored(Op op) -> Op {
   return op;
 }
 
-// The fraction of rows a conjunct keeps, as the cost model assumes it.
-auto selectivity(const Expr& c) -> double { return c.op == Op::Eq ? kEqSelectivity : kRangeSelectivity; }
+// The fraction of rows a conjunct keeps, as the cost model assumes it: a
+// predicate's as a range's.
+auto selectivity(const Expr& c) -> double {
+  return is_compare(c) && c.op == Op::Eq ? kEqSelectivity : kRangeSelectivity;
+}
 auto selectivity(const Conjuncts& cs) -> double {
   auto s = 1.0;
   for (const auto& c : cs) s *= selectivity(c);
@@ -241,7 +244,11 @@ auto use_of(const Expr& c, const Tables& here, const Tables& other) -> Use {
     case Expr::Kind::Column: return reads(other, o) ? Use::Ok : Use::Columns;
     case Expr::Kind::Const:
     case Expr::Kind::Compare:
-    case Expr::Kind::Aggregate: return Use::Operand;
+    case Expr::Kind::Aggregate:
+    case Expr::Kind::And:
+    case Expr::Kind::Or:
+    case Expr::Kind::Not:
+    case Expr::Kind::IsNull: return Use::Operand;
   }
   return Use::Operand;
 }
@@ -404,18 +411,15 @@ auto double_filter(const std::string& column) -> Refusal {
   return {Stage::Filter, "a filter on column \"" + column + "\", a REAL or DOUBLE PRECISION, is not supported yet"};
 }
 
-// The conjuncts of `where` not in `used`, as filters; refused when one is on
-// a DOUBLE or REAL column: its comparisons need PostgreSQL's NaN and -0.0
-// rules, which only its key encoding has.
-auto residual(const Table& t, const Conjuncts& where, const std::vector<const Expr*>& used)
-    -> std::expected<Conjuncts, Refusal> {
-  Conjuncts out;
-  for (const auto& c : where) {
-    if (std::ranges::find(used, &c) != used.end()) continue;
-    if (col_of(c).type == PhysType::F64) return std::unexpected(double_filter(t.column(col_of(c).col)->name));
-    out.push_back(c);
+// The DOUBLE or REAL column a predicate compares, or null: IS NULL of one
+// needs no comparison.
+auto float_compared(const Expr& p) -> const ColumnRef* {
+  if (p.kind == Expr::Kind::Compare) return col_of(p).type == PhysType::F64 ? &col_of(p) : nullptr;
+  if (p.kind == Expr::Kind::IsNull) return nullptr;
+  for (const auto& a : p.args) {
+    if (const auto* c = float_compared(a)) return c;
   }
-  return out;
+  return nullptr;
 }
 
 // One table's rows by one access path. Its cost and rows follow from the
@@ -502,10 +506,30 @@ struct Tried {
 // A table of the statement and the conjuncts on it.
 struct Rel {
   const logical::Get* get{nullptr};
-  Conjuncts where;
+  Conjuncts where;  // its comparisons, which its access paths may take
+  Conjuncts preds;  // its predicates (logical::is_predicate): filters only
 
   [[nodiscard]] auto table() const -> const Table& { return *get->table; }
 };
+
+// The conjuncts of rel's WHERE not in `used`, then its predicates, as
+// filters; refused when one compares a DOUBLE or REAL column: its
+// comparisons need PostgreSQL's NaN and -0.0 rules, which only its key
+// encoding has.
+auto residual(const Rel& rel, const std::vector<const Expr*>& used) -> std::expected<Conjuncts, Refusal> {
+  const auto& t = rel.table();
+  Conjuncts out;
+  for (const auto& c : rel.where) {
+    if (std::ranges::find(used, &c) != used.end()) continue;
+    if (col_of(c).type == PhysType::F64) return std::unexpected(double_filter(t.column(col_of(c).col)->name));
+    out.push_back(c);
+  }
+  for (const auto& p : rel.preds) {
+    if (const auto* c = float_compared(p)) return std::unexpected(double_filter(t.column(c->col)->name));
+    out.push_back(p);
+  }
+  return out;
+}
 
 // The inner side of an index nested loop: a table read by its whole primary
 // key, each part a parameter or a column of a table read before it.
@@ -811,7 +835,13 @@ private:
         no_plan("a Filter over " + with_article(op_name(*f->input)) + " where the search plans a table");
       }
       const auto& t = *g->table;
+      Rel rel{g, {}, {}};
       for (const auto& c : f->conjuncts) {
+        if (logical::is_predicate(c)) {
+          rel.preds.push_back(c);
+          continue;
+        }
+        rel.where.push_back(c);
         switch (use_of(c, {t.id}, {})) {
           case Use::Ok: break;
           case Use::NoColumn: no_plan("a conjunct on " + t.name + " that does not compare one of its columns");
@@ -821,7 +851,7 @@ private:
                     " with an expression the search does not plan yet");
         }
       }
-      add_rel(q, {g, f->conjuncts});
+      add_rel(q, std::move(rel));
       return;
     }
     if (const auto* g = std::get_if<logical::Get>(&n.op)) {
@@ -838,6 +868,16 @@ private:
     for (auto i = split; i < right_from; ++i) left.push_back(q.rels[i].table().id);
     auto right = tables_of(q, right_from);
     for (const auto& c : j->predicate) {
+      if (logical::is_predicate(c)) {
+        // A filter of the one table whose columns it reads.
+        std::vector<ColumnRef> cols;
+        logical::columns_of(c, cols);
+        if (cols.empty() || std::ranges::any_of(cols, [&](const ColumnRef& r) { return r.table != cols[0].table; })) {
+          no_plan("a predicate (AND, OR, NOT, IS NULL) of other than one table's columns");
+        }
+        q.rels[q.index_of(cols[0].table)].preds.push_back(c);
+        continue;
+      }
       auto on_right = is_compare(c) && reads(right, c.args[0]);
       const auto& here = on_right ? right : left;
       const auto& other = on_right ? left : right;
@@ -942,7 +982,7 @@ private:
     };
     // A point lookup returns at most one row: it gives any ORDER BY.
     if (auto k = point_get(t, where)) {
-      auto f = residual(t, where, k->used);
+      auto f = residual(rel, k->used);
       Access a;
       a.null_checks = key_params(k->key);
       a.keyed = positions(k->used);
@@ -976,7 +1016,7 @@ private:
       for (const auto* e : {b.lo, b.hi}) {
         if (e != nullptr) keyed.push_back(e);
       }
-      auto f = residual(t, where, keyed);
+      auto f = residual(rel, keyed);
       if (!f) {
         refused(std::move(f.error()));
         continue;
@@ -1107,7 +1147,7 @@ private:
       keyed_on.push_back(static_cast<std::size_t>(jt - on.begin()));
     }
     if (!missing.empty()) return std::unexpected(Refusal{Stage::Reach, missing_key(t, missing)});
-    auto f = residual(t, rel.where, used);
+    auto f = residual(rel, used);
     if (!f) return std::unexpected(std::move(f.error()));
     // Every join conjunct the key does not take is a filter.
     pr.filters = std::move(*f);
@@ -1389,7 +1429,9 @@ private:
   // The $n ± k an access path compares with a column of `table`: in its
   // filters and its scan's range.
   static void access_computed(std::vector<physical::Computed>& comp, const Access& a, std::uint32_t table) {
-    for (const auto& f : a.filters) add_computed(comp, operand_of(f), table);
+    for (const auto& f : a.filters) {
+      if (is_compare(f)) add_computed(comp, operand_of(f), table);
+    }
     const auto* scan = scan_of(a);
     if (scan == nullptr) return;
     if (const auto* r = std::get_if<physical::Range>(&scan->rest)) {
@@ -1481,7 +1523,9 @@ private:
     auto nested = false;
     for (std::size_t i = 0; i < c.steps.size(); ++i) {
       if (const auto* pr = std::get_if<Probe>(&c.steps[i])) {
-        for (const auto& f : pr->filters) add_computed(out.computed, operand_of(f), q.rels[pr->rel].table().id);
+        for (const auto& f : pr->filters) {
+          if (is_compare(f)) add_computed(out.computed, operand_of(f), q.rels[pr->rel].table().id);
+        }
         by_column = by_column || pr->by_column;
       } else {
         access_computed(out.computed, c.access_at(i + 1), q.rels[rel_of(c.steps[i])].table().id);
@@ -1945,7 +1989,9 @@ private:
     auto column = [&](const Expr& e) { return reads(tables, e); };
     if (s.project != nullptr) {
       for (const auto& o : s.project->exprs) {
-        if (!column(o.expr)) no_plan("a result column that is not a column of its tables");
+        if (!column(o.expr) && o.expr.kind != Expr::Kind::Param) {
+          no_plan("a result column that is not a column of its tables or a constant");
+        }
       }
     } else {
       if (s.aggregate->aggs.size() != 1) no_plan("an Aggregate of other than one aggregate call");
@@ -1972,14 +2018,35 @@ private:
       out.push_back({physical::node(physical::Aggregate{std::move(leaf), s.aggregate->aggs[0].expr, emits}), {}, {}, 0});
       return out;
     }
-    std::vector<ColumnRef> targets;
-    for (const auto& o : s.project->exprs) targets.push_back(o.expr.col);
-    out.push_back({emit(s, std::move(leaf), std::move(targets)), {}, {}, 0});
+    out.push_back({emit(s, std::move(leaf), emit_targets(s)), {}, {}, 0});
+    return out;
+  }
+
+  // A SELECT without FROM: its one row of constants, nothing read.
+  static auto one_row(const SelectParts& s) -> std::vector<Finished> {
+    if (s.project == nullptr) no_plan("an Aggregate of no table");
+    std::vector<Finished> out;
+    out.push_back({emit(s, physical::node(physical::OneRow{}), emit_targets(s)), {}, {}, 0});
+    return out;
+  }
+
+  // The SELECT's result columns: its columns, and its constants, which the
+  // binder made parameters.
+  static auto emit_targets(const SelectParts& s) -> std::vector<physical::EmitTarget> {
+    std::vector<physical::EmitTarget> out;
+    for (const auto& o : s.project->exprs) {
+      if (o.expr.kind == Expr::Kind::Param) {
+        out.emplace_back(physical::ParamTarget{o.expr.param, o.expr.phys()});
+      } else {
+        out.emplace_back(o.expr.col);
+      }
+    }
     return out;
   }
 
   // Emit, under LIMIT.
-  static auto emit(const SelectParts& s, physical::NodePtr rows, std::vector<ColumnRef> targets) -> physical::NodePtr {
+  static auto emit(const SelectParts& s, physical::NodePtr rows, std::vector<physical::EmitTarget> targets)
+      -> physical::NodePtr {
     if (s.limit) rows = physical::node(physical::Limit{std::move(rows), *s.limit});
     return physical::node(physical::Emit{std::move(rows), std::move(targets)});
   }
@@ -2002,6 +2069,7 @@ private:
     auto s = select_parts(root);
     result(s);
     if (const auto* e = std::get_if<logical::Empty>(&s.source->op)) return nothing(s, *e);
+    if (std::holds_alternative<logical::OneRow>(s.source->op)) return one_row(s);
     Query q;
     flatten(*s.source, q);
     for (const auto& rel : q.rels) constants(rel.table());
@@ -2029,7 +2097,9 @@ private:
         q.sort_by.push_back(o.col);
         if (std::ranges::find(used, o.col) == used.end()) used.push_back(o.col);
       }
-      for (const auto& o : s.project->exprs) q.above.push_back(o.expr.col);
+      for (const auto& o : s.project->exprs) {
+        if (o.expr.kind == Expr::Kind::Column) q.above.push_back(o.expr.col);
+      }
     }
     auto searched = candidates(q, ordered, used, !for_update && !distinct, sorting);
     auto emits = !s.limit || *s.limit > 0;
@@ -2040,11 +2110,9 @@ private:
     std::vector<Finished> out;
     for (const auto& c : searched.plans) {
       if (agg == nullptr) {
-        std::vector<ColumnRef> targets;
-        for (const auto& o : s.project->exprs) targets.push_back(o.expr.col);
         // A plan not in the ORDER BY's order sorts its rows.
         auto f = finish(q, c, sink, searched, order, avoiding,
-                        [&](physical::NodePtr rows) { return emit(s, std::move(rows), std::move(targets)); });
+                        [&](physical::NodePtr rows) { return emit(s, std::move(rows), emit_targets(s)); });
         if (f) out.push_back(std::move(*f));
         continue;
       }

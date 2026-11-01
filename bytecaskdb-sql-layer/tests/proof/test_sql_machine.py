@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Gustavo Amigo
-"""The SQL layer against PostgreSQL: one Hypothesis state machine (#515).
+"""The SQL layer against PostgreSQL: Hypothesis state machines (#515).
 
 Each rule runs one statement on both sides and checks that they agree:
 both accept it, changing as many rows and returning the same rows, values
@@ -57,6 +57,11 @@ to statements the layer plans; the rest must be refused with "no plan".
 What is left of it is the dialect's own limit, a filter on a DOUBLE or REAL
 column no key takes.
 
+Tables without a primary key: a second machine, KeylessMachine, as this
+one reaches a table by its key. Inserts weighted towards copies of rows
+the table holds, UPDATE, DELETE and SELECT by full scans, COUNT(*) per
+group, and a reopen, each table and result compared as a bag of rows.
+
 The fixed cases at the end call the same steps in a set order.
 """
 
@@ -106,6 +111,7 @@ class Column:
     type: o.Type
     nullable: bool = True
     default: object = None  # None: no DEFAULT clause
+    unique: bool = False  # a UNIQUE column constraint
 
     def ddl(self, pg: bool, primary_key: bool = False) -> str:
         out = f"{self.name} {self.type.pg if pg else self.type.sql}"
@@ -113,6 +119,8 @@ class Column:
             out += " PRIMARY KEY"
         if not self.nullable:
             out += " NOT NULL"
+        if self.unique:
+            out += " UNIQUE"
         if self.default is not None:
             out += " DEFAULT " + o.literal(self.type, self.default)
         return out
@@ -376,11 +384,14 @@ def draw_order(data, columns: list[str], label: str) -> list[tuple]:
              data.draw(st.sampled_from([None, True, False]), label=f"{label} {c} nulls")) for c in cols]
 
 
-class SqlMachine(RuleBasedStateMachine):
+class Sides:
+    """The two sides a machine runs each statement on, the layer (and the
+    server, when the wire target runs) and PostgreSQL, and the checks that
+    they agree. A state machine mixes it in and calls open_sides() first."""
+
     dsn: str = ""  # set by the test that runs the machine
 
-    def __init__(self):
-        super().__init__()
+    def open_sides(self):
         # PostgreSQL first: if it cannot connect, nothing else is open yet.
         self.pg = Oracle(self.dsn)
         try:
@@ -391,7 +402,6 @@ class SqlMachine(RuleBasedStateMachine):
             if hasattr(self, "dir"):
                 shutil.rmtree(self.dir, ignore_errors=True)
             raise
-        self.tables: dict[str, Table] = {}
         self.txn = None  # the layer's open transaction, if any
         self.wire = None  # the server's connection, when the wire target runs
         if server_binary():
@@ -512,6 +522,20 @@ class SqlMachine(RuleBasedStateMachine):
 
         return self.pg.conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR
 
+    def reopen(self) -> None:
+        self.db.close()
+        self.db = bytecask_sql.open(self.dir)
+        if self.wire is not None:  # the server stopped by SIGTERM and started again, on its data
+            self.stop_wire()
+            self.connect_wire(Server(self.wire_dir))
+
+
+class SqlMachine(Sides, RuleBasedStateMachine):
+    def __init__(self):
+        super().__init__()
+        self.tables: dict[str, Table] = {}
+        self.open_sides()
+
     def existing_keys(self, t: Table) -> list[tuple]:
         if self.txn is not None and self.txn.is_aborted:
             return []  # PostgreSQL answers nothing until the rollback
@@ -539,29 +563,48 @@ class SqlMachine(RuleBasedStateMachine):
             self.tables[t.name] = t
         return out
 
-    def create_without_pk(self, t: Table) -> None:
-        # Known difference: the layer needs a primary key; PostgreSQL does not.
-        out = self.layer(t.ddl(pg=False))
-        assert out.error == "refused", f"{t.ddl(pg=False)}: a table without a primary key was accepted"
-
     def drop(self, name: str, if_exists: bool) -> o.Outcome:
         out = self.both(f"DROP TABLE {'IF EXISTS ' if if_exists else ''}{name}")
         if out.error is None:
             self.tables.pop(name, None)
         return out
 
-    def insert(self, name: str, row: dict[str, object], all_columns: bool) -> o.Outcome:
+    def insert(self, name: str, row: dict[str, object], all_columns: bool, literal: bool = False) -> o.Outcome:
+        """`literal`: the values written into the text as literals
+        (o.sql_literal), not sent as parameters."""
         cols = list(row)
         params = [row[c] for c in cols]
-        marks = ", ".join(f"${i + 1}" for i in range(len(cols)))
         target = "" if all_columns else f" ({', '.join(cols)})"
-        sql = f"INSERT INTO {name}{target} VALUES ({marks})"
         t = self.tables.get(name)
         types = [t.column(c).type for c in cols] if t is not None else None
-        return self.both(sql, params, types=types)
+        if literal and t is not None:
+            values = ", ".join(o.sql_literal(t.column(c).type, row[c]) for c in cols)
+            return self.both(f"INSERT INTO {name}{target} VALUES ({values})")
+        marks = ", ".join(f"${i + 1}" for i in range(len(cols)))
+        return self.both(f"INSERT INTO {name}{target} VALUES ({marks})", params, types=types)
 
-    def lookup(self, name: str, key: tuple, for_update: bool = False) -> o.Outcome:
+    def lookup(self, name: str, key: tuple, for_update: bool = False, literal: bool = False) -> o.Outcome | None:
+        """`literal`: the key written into the text as literals; one its
+        column's type does not hold exactly is the layer's refusal
+        (o.exact_literal), which PostgreSQL does not have."""
         t = self.tables[name]
+        if literal:
+            lock = " FOR UPDATE" if for_update else ""
+            types = [t.column(c).type for c in t.pk]
+            sql = f"{t.select_all} WHERE " + " AND ".join(
+                f"{c} = {o.sql_literal(ty, v)}" for c, ty, v in zip(t.pk, types, key)) + lock
+            if not all(o.exact_literal(ty, v) for ty, v in zip(types, key)):
+                out = self.layer(sql)
+                if out.error == o.ABORTED:
+                    return None  # the transaction was aborted before
+                assert out.error == "refused", f"{sql}: a literal its column does not hold was {out.error or 'accepted'}"
+                if self.txn is not None and not self.pg_aborted():
+                    # A refused statement aborts the transaction on both sides,
+                    # as any statement PostgreSQL refuses does.
+                    assert self.txn.is_aborted
+                    assert o.run_pg(self.pg.conn, "SELECT no_such_column FROM " + name).error == "42703"
+                return None
+            return self.both(sql)
         where = " AND ".join(f"{c} = ${i + 1}" for i, c in enumerate(t.pk))
         pg_where = " AND ".join(f"{c} = {typed(t, c, i + 1)}" for i, c in enumerate(t.pk))
         # FOR UPDATE returns what the plain SELECT does: on one connection
@@ -1032,13 +1075,6 @@ class SqlMachine(RuleBasedStateMachine):
         if self.wire is not None:
             assert o.run_wire(self.wire, "ROLLBACK").error is None
 
-    def reopen(self) -> None:
-        self.db.close()
-        self.db = bytecask_sql.open(self.dir)
-        if self.wire is not None:  # the server stopped by SIGTERM and started again, on its data
-            self.stop_wire()
-            self.connect_wire(Server(self.wire_dir))
-
     def check(self) -> None:
         names = sorted(t["name"] for t in self.db.catalog())
         assert names == sorted(self.tables), f"the layer's tables are {names}, expected {sorted(self.tables)}"
@@ -1090,8 +1126,11 @@ class SqlMachine(RuleBasedStateMachine):
         elif variant == "unknown pk column":
             t.pk = ["zz"]
         elif variant == "no pk":
+            # Both take it; this machine's steps reach a table by its key, so
+            # it is dropped again. KeylessMachine runs the tables without one.
             t.pk = []
-            self.create_without_pk(t)
+            if self.both(t.ddl(pg=False), pg_sql=t.ddl(pg=True)).error is None:
+                assert self.both(f"DROP TABLE {t.name}").error is None
             return
         self.create(t)
 
@@ -1125,7 +1164,7 @@ class SqlMachine(RuleBasedStateMachine):
                 row[c.name] = None
             else:
                 row[c.name] = data.draw(values(c.type), label=c.name)
-        self.insert(name, row, all_columns)
+        self.insert(name, row, all_columns, literal=data.draw(st.integers(0, 3), label="literals?") == 0)
 
     # Inserts are three times as likely as any other step: three rules run
     # them, so the reads find rows.
@@ -1142,7 +1181,8 @@ class SqlMachine(RuleBasedStateMachine):
             key = data.draw(st.sampled_from(keys), label="key")
         else:
             key = tuple(data.draw(st.none() | values(t.column(c).type), label=c) for c in t.pk)
-        self.lookup(t.name, key, for_update=data.draw(st.booleans(), label="FOR UPDATE"))
+        self.lookup(t.name, key, for_update=data.draw(st.booleans(), label="FOR UPDATE"),
+                    literal=data.draw(st.integers(0, 3), label="literal key?") == 0)
 
     @precondition(lambda self: self.tables and self.txn is None)
     @rule(data=st.data())
@@ -1513,6 +1553,274 @@ def test_sql_machine(dsn):
     run_state_machine_as_test(machine(dsn))
 
 
+# Tables without a primary key ------------------------------------------------
+
+KEYLESS_NAMES = ["k0", "k1"]
+
+
+class KeylessMachine(Sides, RuleBasedStateMachine):
+    """Tables declared without a primary key, which PostgreSQL and the layer
+    both take: every row inserted is kept, duplicates included, but where a
+    UNIQUE column refuses them (23505), and UPDATE,
+    DELETE, SELECT and GROUP BY reach them by full scans. Rows have no key
+    to order them by, so a table, and each result, is compared as a bag of
+    rows. Reopening the layer keeps the rows, and the inserts after it add
+    rows rather than overwrite one."""
+
+    def __init__(self):
+        super().__init__()
+        self.tables: dict[str, Table] = {}
+        self.open_sides()
+
+    def rows(self, t: Table) -> list[tuple]:
+        """PostgreSQL's rows, in an order fixed by their values, so a draw
+        from them is reproducible from its seed."""
+        out = o.run_pg(self.pg.conn, f"{t.select_all} ORDER BY {', '.join(c.name for c in t.columns)}")
+        assert out.error is None, out.detail
+        return list(out.rows)
+
+    def bag(self, sql: str, params, pg_sql: str, types) -> None:
+        """A SELECT on both sides: the same rows, in any order."""
+        layer = self.served(sql, params, self.layer(sql, params, types))
+        pg = o.run_pg(self.pg.conn, pg_sql, params)
+        assert layer.error == pg.error, f"{sql} {params!r}: the layer {layer.error} ({layer.detail}), PostgreSQL {pg.error}"
+        assert collections.Counter(o.strict(layer.rows)) == collections.Counter(o.strict(pg.rows)), (
+            f"{sql} {params!r}: the layer returned {layer.rows}, PostgreSQL {pg.rows}")
+
+    @invariant()
+    def check(self) -> None:
+        catalog = {t["name"]: t for t in self.db.catalog()}
+        assert sorted(catalog) == sorted(self.tables), f"the layer's tables are {sorted(catalog)}, expected {sorted(self.tables)}"
+        for t in self.tables.values():
+            # Its columns, and no primary key: the row id is no column.
+            assert [c["name"] for c in catalog[t.name]["columns"]] == [c.name for c in t.columns]
+            assert catalog[t.name]["primary_key"] == []
+            layer = self.db.table_rows(t.name)["rows"]
+            pg = o.run_pg(self.pg.conn, t.select_all)
+            assert collections.Counter(o.strict(layer)) == collections.Counter(o.strict(pg.rows)), (
+                f"table {t.name}: the layer holds {layer}, PostgreSQL {list(pg.rows)}")
+
+    def draw_table(self, data) -> Table:
+        return self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="table")]
+
+    @staticmethod
+    def filterable(t: Table) -> list[str]:
+        """The columns a filter may compare: not a DOUBLE or REAL, which the
+        planner does not filter on (docs/frontend_design.md, *Known
+        differences*)."""
+        return [c.name for c in t.columns if c.type.kind not in ("float", "real")]
+
+    def draw_where(self, data, t: Table, first: int) -> tuple[str, str, list, list] | None:
+        """No WHERE, or col = $first, or col = a literal, on a filterable
+        column, its value often one a row holds: the layer's text,
+        PostgreSQL's, the parameters and their types. None for a literal
+        the column's type does not hold exactly, which the layer refuses
+        (o.exact_literal), having checked it does."""
+        cols = self.filterable(t)
+        if not cols or data.draw(st.integers(0, 3), label="no where?") == 0:
+            return "", "", [], []
+        c = data.draw(st.sampled_from(cols), label="where column")
+        held = [r[[x.name for x in t.columns].index(c)] for r in self.rows(t)]
+        v = data.draw(st.sampled_from(held) if held and data.draw(st.booleans(), label="held?") else values(t.column(c).type),
+                      label="where value")
+        ty = t.column(c).type
+        if data.draw(st.integers(0, 2), label="predicate?") == 0:
+            pred = self.draw_predicate(data, t, depth=2)
+            return f" WHERE {pred}", f" WHERE {pred}", [], []
+        if data.draw(st.booleans(), label="literal?"):
+            where = f" WHERE {c} = {o.sql_literal(ty, v)}"
+            if not o.exact_literal(ty, v):
+                out = self.layer(f"SELECT {c} FROM {t.name}{where}")
+                assert out.error == "refused", f"{where}: a literal its column does not hold was {out.error or 'accepted'}"
+                return None
+            return where, where, [], []
+        return f" WHERE {c} = ${first}", f" WHERE {c} = {typed(t, c, first)}", [v], [ty]
+
+    def draw_predicate(self, data, t: Table, depth: int) -> str:
+        """A predicate on filterable columns, as SQL both sides read alike:
+        AND, OR and NOT over =, <>, IS [NOT] NULL, [NOT] BETWEEN and [NOT]
+        IN, of literals the table holds or NULL, so each is one its column
+        holds exactly."""
+        if depth > 0 and data.draw(st.integers(0, 2), label="combine?") == 0:
+            op = data.draw(st.sampled_from(["AND", "OR", "NOT"]), label="combinator")
+            if op == "NOT":
+                return f"NOT ({self.draw_predicate(data, t, depth - 1)})"
+            return f"({self.draw_predicate(data, t, depth - 1)}) {op} ({self.draw_predicate(data, t, depth - 1)})"
+        c = data.draw(st.sampled_from(self.filterable(t)), label="predicate column")
+        ty = t.column(c).type
+        held = [r[[x.name for x in t.columns].index(c)] for r in self.rows(t)]
+        value = st.sampled_from(held + [None]) if held else st.just(None)
+        lit = lambda label: o.sql_literal(ty, data.draw(value, label=label))  # noqa: E731
+        form = data.draw(st.sampled_from(["=", "<>", "IS NULL", "IS NOT NULL", "BETWEEN", "NOT BETWEEN", "IN", "NOT IN"]),
+                         label="predicate form")
+        if form in ("IS NULL", "IS NOT NULL"):
+            return f"{c} {form}"
+        if form in ("BETWEEN", "NOT BETWEEN"):
+            sym = " SYMMETRIC" if data.draw(st.booleans(), label="symmetric?") else ""
+            return f"{c} {form}{sym} {lit('lo')} AND {lit('hi')}"
+        if form in ("IN", "NOT IN"):
+            n = data.draw(st.integers(1, 3), label="in size")
+            return f"{c} {form} ({', '.join(lit(f'in {i}') for i in range(n))})"
+        return f"{c} {form} {lit('operand')}"
+
+    @precondition(lambda self: len(self.tables) < len(KEYLESS_NAMES))
+    @rule(data=st.data())
+    def create_table(self, data):
+        free = [n for n in KEYLESS_NAMES if n not in self.tables]
+        n = data.draw(st.integers(1, 3), label="columns")
+        # Now and then UNIQUE: inserts copying a row, and UPDATEs giving rows
+        # one value, are then 23505 on both, NULLs never.
+        cols = [Column(f"c{i}", data.draw(st.sampled_from(TYPES), label=f"c{i} type"),
+                       nullable=data.draw(st.booleans(), label=f"c{i} nullable"),
+                       unique=data.draw(st.integers(0, 3), label=f"c{i} unique") == 0) for i in range(n)]
+        t = Table(data.draw(st.sampled_from(free), label="name"), cols, [])
+        if self.both(t.ddl(pg=False), pg_sql=t.ddl(pg=True)).error is None:
+            self.tables[t.name] = t
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
+    def drop_table(self, data):
+        t = self.draw_table(data)
+        assert self.both(f"DROP TABLE {t.name}").error is None
+        del self.tables[t.name]
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
+    def insert(self, data):
+        """A row, often a copy of one the table holds; all its columns, or
+        some, the rest NULL."""
+        t = self.draw_table(data)
+        held = self.rows(t)
+        if held and data.draw(st.integers(0, 2), label="duplicate?") == 0:
+            row = dict(zip((c.name for c in t.columns), data.draw(st.sampled_from(held), label="copied row")))
+        else:
+            row = {c.name: data.draw(st.none() | values(c.type), label=c.name) for c in t.columns}
+        all_columns = data.draw(st.booleans(), label="all columns?")
+        if not all_columns:
+            keep = data.draw(st.lists(st.sampled_from(list(row)), min_size=1, unique=True), label="given")
+            row = {c: v for c, v in row.items() if c in keep}
+        cols = list(row)
+        target = "" if all_columns else f" ({', '.join(cols)})"
+        if data.draw(st.booleans(), label="literals?"):
+            values_text = ", ".join(o.sql_literal(t.column(c).type, row[c]) for c in cols)
+            self.both(f"INSERT INTO {t.name}{target} VALUES ({values_text})")
+            return
+        marks = ", ".join(f"${i + 1}" for i in range(len(cols)))
+        self.both(f"INSERT INTO {t.name}{target} VALUES ({marks})", [row[c] for c in cols],
+                  types=[t.column(c).type for c in cols])
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
+    def update(self, data):
+        t = self.draw_table(data)
+        c = data.draw(st.sampled_from([x.name for x in t.columns]), label="set column")
+        v = data.draw(st.none() | values(t.column(c).type), label="set value")
+        drawn = self.draw_where(data, t, 2)
+        if drawn is None:
+            return
+        where, pg_where, params, types = drawn
+        if data.draw(st.booleans(), label="literal set?"):
+            # The WHERE's parameter, if any, is $2: renumbered as $1.
+            lit = o.sql_literal(t.column(c).type, v)
+            self.both(f"UPDATE {t.name} SET {c} = {lit}{where.replace('$2', '$1')}", params,
+                      pg_sql=f"UPDATE {t.name} SET {c} = {lit}{pg_where.replace('$2', '$1')}", types=types)
+            return
+        self.both(f"UPDATE {t.name} SET {c} = $1{where}", [v, *params], pg_sql=f"UPDATE {t.name} SET {c} = $1{pg_where}",
+                  types=[t.column(c).type, *types])
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
+    def delete(self, data):
+        t = self.draw_table(data)
+        drawn = self.draw_where(data, t, 1)
+        if drawn is None:
+            return
+        where, pg_where, params, types = drawn
+        self.both(f"DELETE FROM {t.name}{where}", params, pg_sql=f"DELETE FROM {t.name}{pg_where}", types=types)
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
+    def select(self, data):
+        t = self.draw_table(data)
+        cols = data.draw(st.lists(st.sampled_from([c.name for c in t.columns]), min_size=1, unique=True), label="selected")
+        drawn = self.draw_where(data, t, 1)
+        if drawn is None:
+            return
+        where, pg_where, params, types = drawn
+        # DISTINCT now and then: one row per distinct combination, NULL one
+        # value. Not of a float column, whose group shows -0.0 or 0.0, as
+        # each side happens to meet them.
+        floats = any(t.column(c).type.kind in ("float", "real") for c in cols)
+        distinct = "DISTINCT " if not floats and data.draw(st.integers(0, 2), label="distinct?") == 0 else ""
+        self.bag(f"SELECT {distinct}{', '.join(cols)} FROM {t.name}{where}", params,
+                 f"SELECT {distinct}{', '.join(cols)} FROM {t.name}{pg_where}", types)
+
+    @precondition(lambda self: any(KeylessMachine.filterable(t) for t in self.tables.values()))
+    @rule(data=st.data())
+    def count_groups(self, data):
+        """COUNT(*) per value of a column: duplicates are counted, never merged."""
+        t = self.tables[data.draw(st.sampled_from(sorted(n for n, t in self.tables.items() if self.filterable(t))),
+                                  label="table")]
+        c = data.draw(st.sampled_from(self.filterable(t)), label="group column")
+        sql = f"SELECT {c}, COUNT(*) FROM {t.name} GROUP BY {c}"
+        self.bag(sql, [], sql, [])
+
+    @rule()
+    def reopen_layer(self):
+        self.reopen()
+
+
+def keyless_machine(dsn: str) -> type[KeylessMachine]:
+    return type("KeylessMachineWithOracle", (KeylessMachine,), {"dsn": dsn})
+
+
+def test_keyless_machine(dsn):
+    run_state_machine_as_test(keyless_machine(dsn))
+
+
+def test_a_unique_column_refuses_a_duplicate_and_takes_nulls(dsn):
+    """A UNIQUE constraint is a unique index: 23505 on both for a value a
+    row holds, by INSERT or UPDATE; any number of NULLs; -0.0 is 0.0."""
+    m = keyless_machine(dsn)()
+    try:
+        t = Table("k0", [Column("c0", o.INTEGER, unique=True), Column("c1", o.DOUBLE, unique=True)], [])
+        assert m.both(t.ddl(pg=False), pg_sql=t.ddl(pg=True)).error is None
+        m.tables[t.name] = t
+        ins = "INSERT INTO k0 VALUES ($1, $2)"
+        types = [o.INTEGER, o.DOUBLE]
+        assert m.both(ins, [1, 0.0], types=types).error is None
+        assert m.both(ins, [1, 1.0], types=types).error == "23505"
+        assert m.both(ins, [2, -0.0], types=types).error == "23505"
+        assert m.both(ins, [None, None], types=types).error is None
+        assert m.both(ins, [None, None], types=types).error is None
+        assert m.both(ins, [3, 3.0], types=types).error is None
+        assert m.both("UPDATE k0 SET c0 = 1 WHERE c0 = 3").error == "23505"
+        m.reopen()
+        assert m.both("INSERT INTO k0 VALUES (3, 4.0)").error == "23505"
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_a_table_without_a_primary_key_keeps_duplicates_across_a_reopen(dsn):
+    """Row ids after a reopen start past the rows the data holds: an insert
+    then adds a row, never collides with one (23505) or replaces it."""
+    m = keyless_machine(dsn)()
+    try:
+        t = Table("k0", [Column("c0", o.INTEGER), Column("c1", o.TEXT)], [])
+        assert m.both(t.ddl(pg=False), pg_sql=t.ddl(pg=True)).error is None
+        m.tables[t.name] = t
+        for row in ([1, "a"], [1, "a"], [None, "b"]):
+            assert m.both("INSERT INTO k0 VALUES ($1, $2)", row, types=[o.INTEGER, o.TEXT]).error is None
+        m.reopen()
+        for row in ([1, "a"], [2, None]):
+            assert m.both("INSERT INTO k0 VALUES ($1, $2)", row, types=[o.INTEGER, o.TEXT]).error is None
+        assert m.both("DELETE FROM k0 WHERE c0 = $1", [1], types=[o.INTEGER]).affected == 3
+        m.check()
+    finally:
+        m.teardown()
+
+
 # Fixed cases: the machine's steps in a set order. ---------------------------
 
 
@@ -1603,6 +1911,31 @@ def test_every_statement_after_a_failed_one_is_25P02(dsn):
         m.teardown()
 
 
+def test_join_using_and_natural_join(dsn):
+    """USING and NATURAL: the pairs equal on the named columns, NULL never
+    equal, each named alone the left side's."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT), Column("c1", o.INTEGER), Column("c2", o.TEXT)], ["c0"]))
+        m.create(Table("t1", [Column("c3", o.BIGINT), Column("c1", o.INTEGER), Column("c2", o.TEXT)], ["c3"]))
+        for row in ({"c0": 1, "c1": 1, "c2": "x"}, {"c0": 2, "c1": 2, "c2": "y"}, {"c0": 3, "c1": None, "c2": "z"}):
+            assert m.insert("t0", row, all_columns=True).error is None
+        for row in ({"c3": 10, "c1": 1, "c2": "x"}, {"c3": 11, "c1": 2, "c2": "n"}, {"c3": 12, "c1": None, "c2": "z"},
+                    {"c3": 13, "c1": 1, "c2": "x"}):
+            assert m.insert("t1", row, all_columns=True).error is None
+        for sql in ("SELECT c1, t0.c0, t1.c3 FROM t0 JOIN t1 USING (c1) ORDER BY t0.c0, t1.c3",
+                    "SELECT c1, c2, t1.c3 FROM t0 INNER JOIN t1 USING (c2, c1) ORDER BY t1.c3",
+                    "SELECT t0.c0, t1.c3 FROM t0 NATURAL JOIN t1 ORDER BY t0.c0, t1.c3",
+                    "SELECT j.c1 FROM t0 JOIN t1 USING (c1) AS j WHERE c1 = 2",
+                    "SELECT c1, COUNT(*) FROM t0 JOIN t1 USING (c1) GROUP BY c1 ORDER BY c1"):
+            assert m.both(sql).error is None
+        assert m.both("SELECT c2 FROM t0 JOIN t1 USING (c1)").error == "42702"
+        assert m.both("SELECT c0 FROM t0 JOIN t1 USING (c3)").error == "42703"
+        m.check()
+    finally:
+        m.teardown()
+
+
 def test_create_and_drop_refusals(dsn):
     m = fixed(dsn)
     try:
@@ -1611,7 +1944,8 @@ def test_create_and_drop_refusals(dsn):
         assert m.create(t).error == "42P07"  # already exists
         assert m.create(Table("t1", [Column("c0", o.BIGINT), Column("c0", o.TEXT)], ["c0"])).error == "42701"
         assert m.create(Table("t1", [Column("c0", o.BIGINT)], ["zz"])).error == "42703"
-        m.create_without_pk(Table("t1", [Column("c0", o.BIGINT)], []))
+        assert m.both(Table("t1", [Column("c0", o.BIGINT)], []).ddl(pg=False)).error is None  # no key: a row id
+        assert m.both("DROP TABLE t1").error is None
         assert m.drop("t2", if_exists=False).error == "42P01"
         assert m.drop("t2", if_exists=True).error is None
         assert m.drop("t0", if_exists=False).error is None

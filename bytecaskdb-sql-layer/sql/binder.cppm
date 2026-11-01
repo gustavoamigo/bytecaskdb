@@ -12,10 +12,13 @@
 module;
 #include <algorithm>
 #include <charconv>
+#include <cmath>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <expected>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -29,6 +32,7 @@ module;
 export module bytecask.sql.binder;
 
 export import bytecask.sql.logical;
+import bytecask.sql.text;
 
 export namespace bytecask::sql::bound {
 
@@ -59,6 +63,11 @@ struct Bound {
   // checked as: the object a BC_C_RANGE refusal names.
   std::vector<std::uint32_t> param_table;
   std::vector<ParamInfo> params;  // $1 is [0]
+  // The values of the statement's constants, folded (docs/frontend_design.md,
+  // *Literals*): the parameters after its own, in order. param_types holds
+  // their types after the statement's own parameters'; param_sql,
+  // param_table and params hold the statement's own only.
+  std::vector<Datum> fixed;
 };
 
 // Throws ast::SqlError with a message and the position of the offending node.
@@ -275,6 +284,561 @@ auto exact_number(const Column& c) -> bool {
   return false;
 }
 
+// ------------------------------------------------------------- constants
+
+// A constant expression, folded when the statement is bound
+// (docs/frontend_design.md, *Literals*): a literal, or unary + or -, + or -
+// of constants. Its value is in its type's representation, a numeric's
+// scaled by 10^scale, and its type PostgreSQL's: an integer literal is an
+// INTEGER, or a BIGINT past it; a number with a point or an exponent a
+// numeric of no declared precision at the scale it is written with
+// (SqlType{Decimal, 0, 0, scale}), within 18 digits; TRUE and FALSE
+// BOOLEAN. A string literal and NULL are of no type yet (`unknown`):
+// PostgreSQL types one by its use and reads a string with that type's input
+// function, and alone in a select list it is TEXT.
+struct Constant {
+  Datum value;
+  SqlType type;
+  bool unknown{false};
+  std::string text;  // an unknown string's bytes
+  std::int32_t pos{-1};
+};
+
+constexpr std::int64_t kDecimalLimit = kPowersOfTen[kMaxDecimalPrecision];  // 10^18: past every DECIMAL
+
+auto numeric_type(std::uint8_t scale) -> SqlType { return SqlType{SqlKind::Decimal, 0, 0, scale}; }
+
+auto is_integer(SqlType t) -> bool {
+  return t.kind == SqlKind::SmallInt || t.kind == SqlKind::Integer || t.kind == SqlKind::BigInt;
+}
+
+// A type as PostgreSQL's messages name it.
+auto pg_type_name(SqlType t) -> std::string {
+  switch (t.kind) {
+    case SqlKind::Varchar: return "character varying";
+    case SqlKind::Decimal:
+    case SqlKind::Numeric: return "numeric";
+    case SqlKind::Timestamp: return "timestamp without time zone";
+    case SqlKind::Time: return "time without time zone";
+    case SqlKind::SmallInt:
+    case SqlKind::Integer:
+    case SqlKind::BigInt:
+    case SqlKind::Real:
+    case SqlKind::Double:
+    case SqlKind::Boolean:
+    case SqlKind::Text:
+    case SqlKind::Bytea:
+    case SqlKind::Date: return sql_type_name(t);
+  }
+  return sql_type_name(t);
+}
+
+// A form the layer does not take yet: 42601, where PostgreSQL runs it.
+[[noreturn]] void not_yet(const std::string& what, std::int32_t pos) { throw SqlError{what + " is not supported yet", pos}; }
+
+auto integer_constant(std::int64_t v, std::int32_t pos) -> Constant {
+  return {v, SqlType{std::in_range<std::int32_t>(v) ? SqlKind::Integer : SqlKind::BigInt}, false, {}, pos};
+}
+
+// A number as PostgreSQL's numeric input reads it, [digits][.digits][e[+-]n],
+// at the scale it is written with: the digits after the point, less the
+// exponent, and none below 0 (".2E+2" is 20, "2.2E-2" 0.022 at scale 3).
+auto numeric_constant(std::string_view written, std::int32_t pos) -> Constant {
+  auto text = written;
+  auto negative = !text.empty() && text.front() == '-';  // PostgreSQL's grammar folds a minus into the literal
+  if (negative) text.remove_prefix(1);
+  auto e_at = text.find_first_of("eE");
+  auto mantissa = text.substr(0, e_at);
+  std::int64_t exp = 0;
+  if (e_at != std::string_view::npos) {
+    auto x = text.substr(e_at + 1);
+    if (!x.empty() && x.front() == '+') x.remove_prefix(1);
+    auto [end, ec] = std::from_chars(x.data(), x.data() + x.size(), exp);
+    if (x.empty() || ec != std::errc{} || end != x.data() + x.size()) not_yet("the numeric literal " + std::string{written}, pos);
+  }
+  auto dot = mantissa.find('.');
+  auto frac = dot == std::string_view::npos ? std::int64_t{0} : std::ssize(mantissa) - std::ssize(mantissa.substr(0, dot)) - 1;
+  std::string digits;
+  for (auto ch : mantissa) {
+    if (ch != '.') digits.push_back(ch);
+  }
+  // Too far from 0 either way to be 18 digits at its scale.
+  if (exp > 18 || exp < -18) not_yet("a numeric literal of more than 18 digits", pos);
+  auto scale = std::max<std::int64_t>(0, frac - exp);
+  auto shift = exp - frac + scale;  // the zeros after the digits: >= 0
+  auto first = digits.find_first_not_of('0');
+  auto significant = first == std::string::npos ? 0 : std::ssize(digits) - static_cast<std::ptrdiff_t>(first);
+  if (significant + shift > kMaxDecimalPrecision || scale > kMaxDecimalPrecision) {
+    not_yet("a numeric literal of more than 18 digits", pos);
+  }
+  std::int64_t v = 0;
+  for (auto ch : digits) v = v * 10 + (ch - '0');
+  v *= kPowersOfTen[static_cast<std::size_t>(shift)];
+  return {negative ? -v : v, numeric_type(static_cast<std::uint8_t>(scale)), false, {}, pos};
+}
+
+auto literal_constant(const ast::Literal& l) -> Constant {
+  using K = ast::Literal::Kind;
+  switch (l.kind) {
+    case K::Null: return {std::monostate{}, SqlType{SqlKind::Text}, true, {}, l.pos};
+    case K::Bool: return {l.b, SqlType{SqlKind::Boolean}, false, {}, l.pos};
+    case K::String: {
+      auto b = std::as_bytes(std::span{l.text.data(), l.text.size()});
+      return {Bytes(b.begin(), b.end()), SqlType{SqlKind::Text}, true, l.text, l.pos};
+    }
+    case K::Integer: {
+      std::int64_t v = 0;
+      auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
+      if (ec == std::errc{} && end == l.text.data() + l.text.size()) return integer_constant(v, l.pos);
+      return numeric_constant(l.text, l.pos);  // PostgreSQL types an integer past BIGINT as numeric
+    }
+    case K::Number: return numeric_constant(l.text, l.pos);
+  }
+  std::unreachable();
+}
+
+auto is_constant(const ast::Expr& e) -> bool {
+  using K = ast::Expr::Kind;
+  switch (e.kind) {
+    case K::Const:
+    case K::Literal: return true;
+    case K::Plus:
+    case K::Neg: return is_constant(*e.rhs);
+    case K::Add:
+    case K::Sub:
+    case K::Compare: return is_constant(*e.lhs) && is_constant(*e.rhs);
+    case K::Cast: return is_constant(*e.rhs);
+    case K::Column:
+    case K::Param:
+    case K::Aggregate: return false;
+  }
+  return false;
+}
+
+// An integer or numeric constant as a numeric: its scaled value and scale.
+struct Scaled {
+  std::int64_t v;
+  std::uint8_t scale;
+};
+
+auto scaled(const Constant& c) -> Scaled { return {std::get<std::int64_t>(c.value), c.type.kind == SqlKind::Decimal ? c.type.scale : std::uint8_t{0}}; }
+
+// v at a scale `up` places finer, or nullopt past 18 digits.
+auto rescale(std::int64_t v, std::uint8_t up) -> std::optional<std::int64_t> {
+  std::int64_t out = 0;
+  if (__builtin_mul_overflow(v, kPowersOfTen[up], &out) || out >= kDecimalLimit || out <= -kDecimalLimit) return std::nullopt;
+  return out;
+}
+
+// x + y or x - y, of integer or numeric constants, as PostgreSQL's
+// operators type it: INTEGER of two INTEGERs, BIGINT of two integers
+// otherwise, numeric at the finer scale with a numeric; the range checked
+// as there (22003). NULL beside a number is NULL of the number's type.
+auto add(const Constant& x, const Constant& y, bool sub, std::int32_t pos) -> Constant {
+  auto op = std::string{sub ? "-" : "+"};
+  auto null_untyped = [](const Constant& c) { return c.unknown && std::holds_alternative<std::monostate>(c.value); };
+  if (null_untyped(x) && null_untyped(y)) not_yet("NULL " + op + " NULL", pos);
+  for (const auto* c : {&x, &y}) {
+    if (c->unknown && !null_untyped(*c)) not_yet("a string literal in arithmetic", c->pos);
+    if (!c->unknown && !is_integer(c->type) && c->type.kind != SqlKind::Decimal) {
+      throw SqlError{"operator does not exist: " + pg_type_name(x.type) + " " + op + " " + pg_type_name(y.type), pos,
+                     kUndefinedFunction};
+    }
+  }
+  auto type = [&] {
+    if (null_untyped(x)) return y.type;
+    if (null_untyped(y)) return x.type;
+    if (is_integer(x.type) && is_integer(y.type)) {
+      return SqlType{x.type.kind == SqlKind::Integer && y.type.kind == SqlKind::Integer ? SqlKind::Integer : SqlKind::BigInt};
+    }
+    return numeric_type(std::max(scaled(x).scale, scaled(y).scale));
+  }();
+  if (null_untyped(x) || null_untyped(y)) return {std::monostate{}, type, false, {}, pos};
+  if (std::holds_alternative<std::monostate>(x.value) || std::holds_alternative<std::monostate>(y.value)) {
+    return {std::monostate{}, type, false, {}, pos};
+  }
+  std::int64_t out = 0;
+  if (is_integer(type)) {
+    auto a = std::get<std::int64_t>(x.value);
+    auto b = std::get<std::int64_t>(y.value);
+    auto overflow = sub ? __builtin_sub_overflow(a, b, &out) : __builtin_add_overflow(a, b, &out);
+    if (overflow || (type.kind == SqlKind::Integer && !std::in_range<std::int32_t>(out))) {
+      throw SqlError{type.kind == SqlKind::Integer ? "integer out of range" : "bigint out of range", pos,
+                     kNumericValueOutOfRange};
+    }
+    return {out, type, false, {}, pos};
+  }
+  auto a = rescale(scaled(x).v, static_cast<std::uint8_t>(type.scale - scaled(x).scale));
+  auto b = rescale(scaled(y).v, static_cast<std::uint8_t>(type.scale - scaled(y).scale));
+  if (!a || !b) not_yet("a numeric of more than 18 digits", pos);
+  out = sub ? *a - *b : *a + *b;  // each below 10^18: no overflow
+  if (out >= kDecimalLimit || out <= -kDecimalLimit) not_yet("a numeric of more than 18 digits", pos);
+  return {out, type, false, {}, pos};
+}
+
+// A range check's message as a SqlError, with its SQLSTATE.
+[[noreturn]] void out_of_type(const std::string& why, std::int32_t pos) {
+  throw SqlError{why, pos, known_sqlstate(range_sqlstate(why)).value_or(kNumericValueOutOfRange)};
+}
+
+auto is_number(SqlType t) -> bool { return is_integer(t) || t.kind == SqlKind::Decimal; }
+auto is_float(SqlType t) -> bool { return t.kind == SqlKind::Real || t.kind == SqlKind::Double; }
+auto is_string(SqlType t) -> bool { return t.kind == SqlKind::Text || t.kind == SqlKind::Varchar; }
+
+auto bytes_of(std::string_view t) -> Bytes {
+  auto b = std::as_bytes(std::span{t.data(), t.size()});
+  return {b.begin(), b.end()};
+}
+
+// Text read as a value of type t, as t's input function reads it, the
+// range checked: what an unknown literal is where it meets t. `assigned`
+// rounds a DECIMAL finer than its scale, as a cast or an assignment does.
+auto read_as(const Constant& k, SqlType t, bool assigned) -> Datum {
+  Datum d;
+  try {
+    d = from_text(k.text, t, assigned);
+  } catch (const TextError& e) {
+    throw SqlError{e.what(), k.pos, known_sqlstate(e.sqlstate()).value_or(kInvalidTextRepresentation)};
+  }
+  if (auto why = out_of_range(t, d)) out_of_type(*why, k.pos);
+  return d;
+}
+
+// An unknown literal beside a constant of type t, as PostgreSQL resolves
+// it: of t's type; a numeric at the scale its text is written with.
+auto resolved(const Constant& k, SqlType t) -> Constant {
+  if (std::holds_alternative<std::monostate>(k.value)) return {std::monostate{}, t, false, {}, k.pos};
+  if (t.kind == SqlKind::Decimal) {
+    auto text = std::string_view{k.text};
+    while (!text.empty() && text.front() == ' ') text.remove_prefix(1);
+    while (!text.empty() && text.back() == ' ') text.remove_suffix(1);
+    if (!text.empty() && text.front() == '+') text.remove_prefix(1);
+    auto body = text.substr(!text.empty() && text.front() == '-' ? 1 : 0);
+    auto e_at = body.find_first_of("eE");
+    auto mantissa = body.substr(0, e_at);
+    auto digit = [](char ch) { return ch >= '0' && ch <= '9'; };
+    auto points = std::ranges::count(mantissa, '.');
+    auto exponent_ok = e_at == std::string_view::npos ||
+                       (e_at + 1 < body.size() && std::ranges::all_of(body.substr(e_at + 1 + (body[e_at + 1] == '+' || body[e_at + 1] == '-')), digit) &&
+                        e_at + 1 + (body[e_at + 1] == '+' || body[e_at + 1] == '-') < body.size());
+    if (points > 1 || mantissa == "." || mantissa.empty() || !exponent_ok ||
+        !std::ranges::all_of(mantissa, [&](char ch) { return digit(ch) || ch == '.'; })) {
+      throw SqlError{"invalid input syntax for type numeric: \"" + k.text + "\"", k.pos, kInvalidTextRepresentation};
+    }
+    auto c = numeric_constant(text, k.pos);
+    return c;
+  }
+  return {read_as(k, t, false), t, false, {}, k.pos};
+}
+
+constexpr auto value_op_text(ast::ValueCompare op) -> std::string_view {
+  switch (op) {
+    case ast::ValueCompare::Eq: return "=";
+    case ast::ValueCompare::Ne: return "<>";
+    case ast::ValueCompare::Lt: return "<";
+    case ast::ValueCompare::Le: return "<=";
+    case ast::ValueCompare::Gt: return ">";
+    case ast::ValueCompare::Ge: return ">=";
+  }
+  return "=";
+}
+
+// The order of two values: below 0, 0 or above 0, as PostgreSQL's operator
+// of their types orders them: numbers exactly, a float as a double with
+// NaN above every value and equal to itself, strings and bytes bytewise
+// (the layer's one collation, COLLATE "C"), FALSE before TRUE, a date or
+// time by its value.
+auto order(const Constant& x, const Constant& y, ast::ValueCompare op, std::int32_t pos) -> int {
+  auto refuse = [&] [[noreturn]] {
+    throw SqlError{"operator does not exist: " + pg_type_name(x.type) + " " + std::string{value_op_text(op)} + " " +
+                       pg_type_name(y.type),
+                   pos, kUndefinedFunction};
+  };
+  auto sign = [](auto a, auto b) { return a < b ? -1 : a > b ? 1 : 0; };
+  if (is_number(x.type) && is_number(y.type)) {
+    auto [a, sa] = scaled(x);
+    auto [b, sb] = scaled(y);
+    auto wa = static_cast<__int128>(a);
+    auto wb = static_cast<__int128>(b);
+    // Each below 10^19 at a scale of at most 18: aligned, within 10^37.
+    for (auto i = sa; i < sb; ++i) wa *= 10;
+    for (auto i = sb; i < sa; ++i) wb *= 10;
+    return sign(wa, wb);
+  }
+  if ((is_float(x.type) || is_number(x.type)) && (is_float(y.type) || is_number(y.type))) {
+    auto as_double = [](const Constant& c) {
+      if (is_float(c.type)) return std::get<double>(c.value);
+      auto text = to_text(c.value, c.type);
+      double d = 0;
+      (void)std::from_chars(text.data(), text.data() + text.size(), d);
+      return d;
+    };
+    auto a = as_double(x);
+    auto b = as_double(y);
+    if (std::isnan(a) || std::isnan(b)) return std::isnan(a) && std::isnan(b) ? 0 : std::isnan(a) ? 1 : -1;
+    return sign(a, b);
+  }
+  if ((is_string(x.type) && is_string(y.type)) || (x.type.kind == SqlKind::Bytea && y.type.kind == SqlKind::Bytea)) {
+    const auto& a = std::get<Bytes>(x.value);
+    const auto& b = std::get<Bytes>(y.value);
+    auto c = std::lexicographical_compare_three_way(a.begin(), a.end(), b.begin(), b.end());
+    return std::is_lt(c) ? -1 : std::is_gt(c) ? 1 : 0;
+  }
+  if (x.type.kind == SqlKind::Boolean && y.type.kind == SqlKind::Boolean) {
+    return sign(std::get<bool>(x.value) ? 1 : 0, std::get<bool>(y.value) ? 1 : 0);
+  }
+  if (type_class(x.type.kind) == TypeClass::Temporal && type_class(y.type.kind) == TypeClass::Temporal) {
+    if (x.type.kind != y.type.kind) not_yet("comparing a " + pg_type_name(x.type) + " with a " + pg_type_name(y.type), pos);
+    return sign(std::get<std::int64_t>(x.value), std::get<std::int64_t>(y.value));
+  }
+  refuse();
+}
+
+// x op y, of constants: a BOOLEAN, NULL if either is. An unknown literal
+// takes the other side's type; two compare as text.
+auto compare_constants(Constant x, Constant y, ast::ValueCompare op, std::int32_t pos) -> Constant {
+  if (!x.unknown && !y.unknown && type_class(x.type.kind) != type_class(y.type.kind)) {
+    throw SqlError{"operator does not exist: " + pg_type_name(x.type) + " " + std::string{value_op_text(op)} + " " +
+                       pg_type_name(y.type),
+                   pos, kUndefinedFunction};
+  }
+  if (x.unknown && y.unknown) {
+    x.unknown = y.unknown = false;  // text: their bytes, or NULL
+  } else if (x.unknown) {
+    x = resolved(x, y.type);
+  } else if (y.unknown) {
+    y = resolved(y, x.type);
+  }
+  if (std::holds_alternative<std::monostate>(x.value) || std::holds_alternative<std::monostate>(y.value)) {
+    return {std::monostate{}, SqlType{SqlKind::Boolean}, false, {}, pos};
+  }
+  auto o = order(x, y, op, pos);
+  auto truth = [&] {
+    switch (op) {
+      case ast::ValueCompare::Eq: return o == 0;
+      case ast::ValueCompare::Ne: return o != 0;
+      case ast::ValueCompare::Lt: return o < 0;
+      case ast::ValueCompare::Le: return o <= 0;
+      case ast::ValueCompare::Gt: return o > 0;
+      case ast::ValueCompare::Ge: return o >= 0;
+    }
+    return false;
+  }();
+  return {truth, SqlType{SqlKind::Boolean}, false, {}, pos};
+}
+
+// type 'text', '…'::type and CAST('…' AS type): a string literal read as
+// the type, as its input function reads it, a DECIMAL rounded to its scale;
+// NULL of the type. A cast of anything else, and to VARCHAR(n), which
+// PostgreSQL's cast truncates, are not taken yet.
+auto cast_constant(const ast::Expr& e, const Constant& arg) -> Constant {
+  auto t = sql_type(ast::ColumnDefAst{"", e.cast_type, e.cast_typmods, false, false, std::nullopt, e.pos, {}});
+  if (t.kind == SqlKind::Varchar) not_yet("a cast to VARCHAR(n)", e.pos);
+  if (!arg.unknown) not_yet("a cast of other than a string literal or NULL", e.pos);
+  if (std::holds_alternative<std::monostate>(arg.value)) return {std::monostate{}, t, false, {}, e.pos};
+  return {read_as(arg, t, true), t, false, {}, e.pos};
+}
+
+// The constant expression e, folded.
+auto fold(const ast::Expr& e) -> Constant {
+  using K = ast::Expr::Kind;
+  switch (e.kind) {
+    case K::Const: return integer_constant(e.constant, e.pos);
+    case K::Literal: return literal_constant(e.literal);
+    case K::Plus:
+    case K::Neg: {
+      auto c = fold(*e.rhs);
+      if (c.unknown) not_yet(std::string{"unary "} + (e.kind == K::Plus ? "+" : "-") + " of a string literal or NULL", e.pos);
+      if (!is_integer(c.type) && c.type.kind != SqlKind::Decimal) {
+        throw SqlError{std::string{"operator does not exist: "} + (e.kind == K::Plus ? "+ " : "- ") + pg_type_name(c.type), e.pos,
+                       kUndefinedFunction};
+      }
+      if (e.kind == K::Plus || std::holds_alternative<std::monostate>(c.value)) return c;
+      auto v = std::get<std::int64_t>(c.value);
+      if (v == std::numeric_limits<std::int64_t>::min() || (c.type.kind == SqlKind::Integer && !std::in_range<std::int32_t>(-v))) {
+        throw SqlError{c.type.kind == SqlKind::Integer ? "integer out of range" : "bigint out of range", e.pos,
+                       kNumericValueOutOfRange};
+      }
+      c.value = -v;
+      c.pos = e.pos;
+      return c;
+    }
+    case K::Add:
+    case K::Sub: return add(fold(*e.lhs), fold(*e.rhs), e.kind == K::Sub, e.pos);
+    case K::Compare: return compare_constants(fold(*e.lhs), fold(*e.rhs), e.cmp, e.pos);
+    case K::Cast: return cast_constant(e, fold(*e.rhs));
+    case K::Column:
+    case K::Param:
+    case K::Aggregate: break;
+  }
+  throw SqlError{"expression not supported", e.pos};
+}
+
+// The constant as a value of column c's type: assigned to it (INSERT's
+// VALUES, SET), with PostgreSQL's assignment casts, which round a numeric
+// half away from zero and write a number or a boolean as its text; or
+// compared with it by `op`. A compared constant is taken only where c's
+// type holds it exactly, and refused otherwise (42601): PostgreSQL then
+// compares in a wider type, which the layer's keys don't
+// (docs/frontend_design.md, *Known differences*). A string literal or NULL
+// is read as c's type, as PostgreSQL reads an unknown literal. The range of
+// an assigned value is checked where the value is written, as an assigned
+// parameter's is.
+auto coerce(const Constant& k, const Column& c, bool assigned, std::string_view op) -> Datum {
+  auto inexact = [&] [[noreturn]] {
+    not_yet("comparing " + c.name + " (" + sql_type_name(c.sql) + ") with a constant its type does not hold exactly", k.pos);
+  };
+  if (k.unknown) {
+    if (std::holds_alternative<std::monostate>(k.value)) return std::monostate{};
+    Datum d;
+    try {
+      d = from_text(k.text, c.sql, assigned);
+    } catch (const TextError& e) {
+      // A number finer than a DECIMAL's scale reads only as assigned: in a
+      // comparison it is a constant the type does not hold exactly.
+      if (!assigned && c.sql.kind == SqlKind::Decimal) {
+        try {
+          (void)from_text(k.text, c.sql, true);
+        } catch (const TextError&) {
+          throw SqlError{e.what(), k.pos, known_sqlstate(e.sqlstate()).value_or(kInvalidTextRepresentation)};
+        }
+        inexact();
+      }
+      throw SqlError{e.what(), k.pos, known_sqlstate(e.sqlstate()).value_or(kInvalidTextRepresentation)};
+    }
+    if (!assigned) {
+      if (auto why = out_of_range(compared_type(c.sql).range, d)) out_of_type(*why, k.pos);
+    }
+    return d;
+  }
+  if (auto refusal = type_refusal(k.type.kind, c.sql.kind, assigned)) {
+    if (assigned) {
+      throw SqlError{"column \"" + c.name + "\" is of type " + pg_type_name(c.sql) + " but expression is of type " +
+                         pg_type_name(k.type),
+                     k.pos, *refusal};
+    }
+    throw SqlError{"operator does not exist: " + pg_type_name(c.sql) + " " + std::string{op} + " " + pg_type_name(k.type),
+                   k.pos, *refusal};
+  }
+  if (std::holds_alternative<std::monostate>(k.value)) return std::monostate{};
+  if (k.type.kind == SqlKind::Boolean) {
+    auto b = std::get<bool>(k.value);
+    if (c.sql.kind == SqlKind::Boolean) return b;
+    return bytes_of(b ? "true" : "false");  // assigned to a string: its text
+  }
+  // A cast's: a string, bytes, a date or time, or a float.
+  if (!is_number(k.type)) {
+    if (is_string(k.type) && is_string(c.sql)) return k.value;
+    if (k.type.kind == c.sql.kind && k.type.kind != SqlKind::Real) return k.value;
+    if (assigned && is_string(c.sql) && !is_float(k.type)) return bytes_of(to_text(k.value, k.type));
+    not_yet("a " + pg_type_name(k.type) + " constant " + (assigned ? "assigned to " : "compared with ") + "a " +
+                pg_type_name(c.sql) + " column",
+            k.pos);
+  }
+  auto [v, scale] = scaled(k);
+  auto unit = kPowersOfTen[scale];
+  switch (c.sql.kind) {
+    case SqlKind::SmallInt:
+    case SqlKind::Integer:
+    case SqlKind::BigInt: {
+      auto n = v / unit;
+      if (auto r = v % unit; r != 0) {
+        if (!assigned) inexact();
+        if (2 * (r < 0 ? -r : r) >= unit) n += v < 0 ? -1 : 1;
+      }
+      if (!assigned && out_of_range(compared_type(c.sql).range, n)) inexact();
+      return n;
+    }
+    case SqlKind::Decimal: {
+      if (scale <= c.sql.scale) {
+        auto n = rescale(v, static_cast<std::uint8_t>(c.sql.scale - scale));
+        if (!n && assigned) throw SqlError{"numeric field overflow", k.pos, kNumericValueOutOfRange};
+        if (!n) inexact();
+        return *n;
+      }
+      auto d = kPowersOfTen[scale - c.sql.scale];
+      auto n = v / d;
+      if (auto r = v % d; r != 0) {
+        if (!assigned) inexact();
+        if (2 * (r < 0 ? -r : r) >= d) n += v < 0 ? -1 : 1;
+      }
+      return n;
+    }
+    case SqlKind::Real:
+    case SqlKind::Double: {
+      // As the type's input reads the number's text: once rounded, a REAL
+      // to a float.
+      auto text = to_text(Datum{v}, numeric_type(scale));
+      if (c.sql.kind == SqlKind::Double) {
+        double d = 0;
+        (void)std::from_chars(text.data(), text.data() + text.size(), d);
+        return d;
+      }
+      float f = 0;
+      (void)std::from_chars(text.data(), text.data() + text.size(), f);
+      // PostgreSQL compares a REAL with a number as a double: only one the
+      // float holds exactly compares the same.
+      if (!assigned && (v % unit != 0 || v / unit > (1 << 24) || v / unit < -(1 << 24))) inexact();
+      return static_cast<double>(f);
+    }
+    case SqlKind::Text:
+    case SqlKind::Varchar: {
+      auto t = to_text(Datum{v}, numeric_type(scale));
+      auto bytes = std::as_bytes(std::span{t.data(), t.size()});
+      return Bytes(bytes.begin(), bytes.end());
+    }
+    case SqlKind::Boolean:
+    case SqlKind::Bytea:
+    case SqlKind::Timestamp:
+    case SqlKind::Date:
+    case SqlKind::Time:
+    case SqlKind::Numeric: break;  // refused by type_refusal
+  }
+  throw SqlError{"expression not supported", k.pos};
+}
+
+// The largest $n the statement names: its own parameters, which come
+// before the constants' (Binder::fixed).
+void params_in(const ast::Expr& e, std::uint32_t& n) {
+  if (e.kind == ast::Expr::Kind::Param) n = std::max(n, e.param + 1);
+  if (e.lhs) params_in(*e.lhs, n);
+  if (e.rhs) params_in(*e.rhs, n);
+}
+
+void params_in(const ast::Compare& c, std::uint32_t& n) {
+  if (c.kind == ast::Compare::Kind::Compare || c.kind == ast::Compare::Kind::IsNull) {
+    params_in(c.lhs, n);
+    if (c.kind == ast::Compare::Kind::Compare) params_in(c.rhs, n);
+  }
+  for (const auto& a : c.args) params_in(a, n);
+}
+
+auto param_count(const ast::Statement& stmt) -> std::uint32_t {
+  std::uint32_t n = 0;
+  auto conjuncts = [&](const std::vector<ast::Compare>& cs) {
+    for (const auto& c : cs) params_in(c, n);
+  };
+  std::visit(
+      [&](const auto& s) {
+        using T = std::decay_t<decltype(s)>;
+        if constexpr (std::is_same_v<T, ast::Insert>) {
+          for (const auto& e : s.values) params_in(e, n);
+        } else if constexpr (std::is_same_v<T, ast::Select>) {
+          for (const auto& e : s.targets) params_in(e, n);
+          for (const auto& e : s.group_by) params_in(e, n);
+          conjuncts(s.where);
+          conjuncts(s.having);
+        } else if constexpr (std::is_same_v<T, ast::Update>) {
+          for (const auto& a : s.set) params_in(a.value, n);
+          conjuncts(s.where);
+        } else if constexpr (std::is_same_v<T, ast::Delete>) {
+          conjuncts(s.where);
+        }
+      },
+      stmt);
+  return n;
+}
+
 auto column_spec(const ast::ColumnDefAst& c) -> ColumnSpec {
   auto t = sql_type(c);
   return ColumnSpec{c.name, t, !c.not_null && !c.primary_key,
@@ -283,7 +847,31 @@ auto column_spec(const ast::ColumnDefAst& c) -> ColumnSpec {
 
 class Binder {
 public:
-  explicit Binder(const Catalog& cat) : cat_{cat} {}
+  // `own_params`: how many parameters the statement's text names, $1 to
+  // its largest $n, each of which must get a type.
+  Binder(const Catalog& cat, std::uint32_t own_params) : cat_{cat}, own_params_{own_params} { params_.resize(own_params); }
+
+  // A constant's value as a parameter the API binds after the statement's
+  // own. Its value is checked here or where it is written, so it has no
+  // range check before the plan runs.
+  auto fixed(Datum v, SqlType t) -> logical::Expr {
+    auto n = own_params_ + bytecask::sql::narrow<std::uint32_t>(fixed_.size());
+    fixed_.push_back(std::move(v));
+    fixed_types_.push_back(phys_type(t));
+    return logical::param(n, t);
+  }
+  [[nodiscard]] auto is_fixed(std::uint32_t n) const -> bool { return n >= own_params_; }
+  [[nodiscard]] auto fixed_value(std::uint32_t n) const -> const Datum& { return fixed_.at(n - own_params_); }
+  [[nodiscard]] auto fixed_values() const -> const std::vector<Datum>& { return fixed_; }
+  [[nodiscard]] auto fixed_types() const -> const std::vector<PhysType>& { return fixed_types_; }
+
+  // A constant in a select list, of its own type: an unknown one is TEXT,
+  // as PostgreSQL resolves it there. Named as PostgreSQL names it: a cast
+  // by its type's name (int4, date), anything else ?column?.
+  auto constant_output(const ast::Expr& e) -> logical::Output {
+    auto c = fold(e);
+    return {fixed(std::move(c.value), c.type), e.kind == ast::Expr::Kind::Cast ? e.cast_type : "?column?"};
+  }
 
   auto table(const std::string& name, std::int32_t pos) const -> const Table* {
     const auto* t = cat_.table(name);
@@ -314,8 +902,16 @@ public:
   }
 
   // A column reference of a join: the side whose table it names, or the one
-  // that has the column; one both have is ambiguous (42702).
-  static auto column(const Table* (&sides)[2], const ast::Expr& e) -> std::pair<std::uint32_t, const Column*> {
+  // that has the column; one both have is ambiguous (42702), but for a
+  // column of its USING, which is one column: the left side's, equal to the
+  // right's in every pair. The USING's alias names those columns alone.
+  auto column(const Table* (&sides)[2], const ast::Expr& e) const -> std::pair<std::uint32_t, const Column*> {
+    auto in_using = std::ranges::contains(using_, e.column);
+    if (!using_alias_.empty() && e.table == using_alias_) {
+      if (!in_using) throw SqlError{"column " + e.table + "." + e.column + " does not exist", e.pos, kUndefinedColumn};
+      return {0, sides[0]->column(e.column)};
+    }
+    if (e.table.empty() && in_using) return {0, sides[0]->column(e.column)};
     std::optional<std::pair<std::uint32_t, const Column*>> found;
     for (std::uint32_t side = 0; side < 2; ++side) {
       if (!e.table.empty() && e.table != sides[side]->name) continue;
@@ -511,6 +1107,7 @@ public:
   // An expression whose type is fixed by its target (an assigned column).
   auto value(const Table& t, const ast::Expr& e, const Column& target) -> logical::Expr {
     auto want = target.type;
+    if (is_constant(e)) return fixed(coerce(fold(e), target, true, "="), target.sql);
     switch (e.kind) {
       case ast::Expr::Kind::Param:
         use_param(e.param, want, e.pos, target, t.id, Use::Assigned);
@@ -550,15 +1147,69 @@ public:
         return logical::binary(kind, logical::column_of(t.id, *c), logical::param(e.rhs->param, c->sql), c->sql);
       }
       case ast::Expr::Kind::Aggregate: throw SqlError{"aggregate functions are not allowed here", e.pos, kGroupingError};
-      case ast::Expr::Kind::Const: throw SqlError{"an integer literal is supported only after + or - yet", e.pos};
+      case ast::Expr::Kind::Plus:
+      case ast::Expr::Kind::Neg: not_yet("unary + and - of other than a constant", e.pos);
+      case ast::Expr::Kind::Compare: not_yet("a comparison of other than constants as a value", e.pos);
+      case ast::Expr::Kind::Cast: not_yet("a cast of other than a constant", e.pos);
+      case ast::Expr::Kind::Const:
+      case ast::Expr::Kind::Literal: break;  // constants, above
     }
     throw SqlError{"expression not supported", e.pos};
   }
 
   auto where(const Table& t, const std::vector<ast::Compare>& in) -> std::vector<logical::Expr> {
     std::vector<logical::Expr> out;
-    for (const auto& w : in) out.push_back(compare(w, [&](const ast::Expr& e) { return std::pair{t.id, column(t, e)}; }));
+    for (const auto* w : top_level(in)) {
+      out.push_back(predicate(*w, [&](const ast::Expr& e) { return std::pair{t.id, column(t, e)}; }));
+    }
     return out;
+  }
+
+  // The conjuncts, each AND among them (a BETWEEN's) taken apart, so a key
+  // may take each comparison.
+  static auto top_level(const std::vector<ast::Compare>& in) -> std::vector<const ast::Compare*> {
+    std::vector<const ast::Compare*> out;
+    std::function<void(const ast::Compare&)> add = [&](const ast::Compare& c) {
+      if (c.kind != ast::Compare::Kind::And) {
+        out.push_back(&c);
+        return;
+      }
+      for (const auto& a : c.args) add(a);
+    };
+    for (const auto& c : in) add(c);
+    return out;
+  }
+
+  // A conjunct: a comparison, or a predicate's tree, each comparison in it
+  // bound as a WHERE's is and IS NULL of a column (docs/frontend_design.md,
+  // *WHERE*). In a tree, $n ± k is not taken yet.
+  auto predicate(const ast::Compare& w, const auto& resolve) -> logical::Expr {
+    using K = ast::Compare::Kind;
+    auto tree = [&](logical::Expr::Kind kind) {
+      auto e = logical::expr(kind, SqlType{SqlKind::Boolean});
+      for (const auto& a : w.args) {
+        auto computed = [](const ast::Expr& x) { return x.kind == ast::Expr::Kind::Add || x.kind == ast::Expr::Kind::Sub; };
+        if (a.kind == K::Compare && ((computed(a.lhs) && !is_constant(a.lhs)) || (computed(a.rhs) && !is_constant(a.rhs)))) {
+          not_yet("$n + k and $n - k inside AND, OR or NOT", a.pos);
+        }
+        e.args.push_back(predicate(a, resolve));
+      }
+      return e;
+    };
+    switch (w.kind) {
+      case K::Compare: return compare(w, resolve);
+      case K::IsNull: {
+        if (w.lhs.kind != ast::Expr::Kind::Column) not_yet("IS NULL of other than a column", w.pos);
+        auto [table, c] = resolve(w.lhs);
+        auto e = logical::expr(logical::Expr::Kind::IsNull, SqlType{SqlKind::Boolean});
+        e.args.push_back(logical::column_of(table, *c));
+        return e;
+      }
+      case K::And: return tree(logical::Expr::Kind::And);
+      case K::Or: return tree(logical::Expr::Kind::Or);
+      case K::Not: return tree(logical::Expr::Kind::Not);
+    }
+    std::unreachable();
   }
 
   // A comparison's operand other than a column: a parameter, or $n ± an
@@ -577,12 +1228,18 @@ public:
     const auto* col = &w.lhs;
     const auto* rhs = &w.rhs;
     auto op = w.op;
-    if (operand(*col) && rhs->kind == ast::Expr::Kind::Column) {
+    if ((operand(*col) || is_constant(*col)) && rhs->kind == ast::Expr::Kind::Column) {
       std::swap(col, rhs);
       op = mirrored(op);
     }
+    // A constant: folded to the column's type, where it holds it exactly.
+    if (col->kind == ast::Expr::Kind::Column && is_constant(*rhs)) {
+      auto [table, c] = resolve(*col);
+      auto v = coerce(fold(*rhs), *c, false, op_text(op));
+      return logical::compare(op, logical::column_of(table, *c), fixed(std::move(v), c->sql));
+    }
     if (col->kind != ast::Expr::Kind::Column || !operand(*rhs)) {
-      throw SqlError{std::string{w.on ? "ON" : "WHERE"} + " must compare a column with a parameter", w.pos};
+      throw SqlError{std::string{w.on ? "ON" : "WHERE"} + " must compare a column with a parameter or a constant", w.pos};
     }
     auto [table, c] = resolve(*col);
     if (rhs->kind == ast::Expr::Kind::Param) {
@@ -602,6 +1259,17 @@ public:
     return logical::compare(op, logical::column_of(table, *c), std::move(operand));
   }
 
+  static constexpr auto op_text(ast::Compare::Op op) -> std::string_view {
+    switch (op) {
+      case ast::Compare::Op::Eq: return "=";
+      case ast::Compare::Op::Lt: return "<";
+      case ast::Compare::Op::Le: return "<=";
+      case ast::Compare::Op::Gt: return ">";
+      case ast::Compare::Op::Ge: return ">=";
+    }
+    return "=";
+  }
+
   // $1 < x is x > $1.
   static auto mirrored(ast::Compare::Op op) -> ast::Compare::Op {
     switch (op) {
@@ -618,12 +1286,14 @@ public:
   // a parameter, or a column of each, in WHERE order.
   auto where(const Table* (&sides)[2], const std::vector<ast::Compare>& in) -> std::vector<logical::Expr> {
     std::vector<logical::Expr> out;
-    for (const auto& w : in) {
-      if (w.lhs.kind == ast::Expr::Kind::Column && w.rhs.kind == ast::Expr::Kind::Column) {
+    for (const auto* c : top_level(in)) {
+      const auto& w = *c;
+      if (w.kind == ast::Compare::Kind::Compare && w.lhs.kind == ast::Expr::Kind::Column &&
+          w.rhs.kind == ast::Expr::Kind::Column) {
         out.push_back(join_on(sides, w));
         continue;
       }
-      out.push_back(compare(w, [&](const ast::Expr& e) {
+      out.push_back(predicate(w, [&](const ast::Expr& e) {
         auto [side, col] = column(sides, e);
         return std::pair{sides[side]->id, col};
       }));
@@ -632,18 +1302,52 @@ public:
   }
 
   // A column of one table equal to a column of the other, of one SQL type.
-  static auto join_on(const Table* (&sides)[2], const ast::Compare& w) -> logical::Expr {
+  auto join_on(const Table* (&sides)[2], const ast::Compare& w) const -> logical::Expr {
     auto [ls, lc] = column(sides, w.lhs);
     auto [rs, rc] = column(sides, w.rhs);
     if (ls == rs) throw SqlError{"comparing two columns of one table is not supported yet", w.pos};
     if (w.op != ast::Compare::Op::Eq) throw SqlError{"a join compares two columns with = only yet", w.pos};
-    if (compared_type(lc->sql).identity != compared_type(rc->sql).identity) {
-      throw SqlError{"comparing " + lc->name + " (" + sql_type_name(lc->sql) + ") with " + rc->name + " (" +
-                         sql_type_name(rc->sql) + ") is not supported: a join compares columns of one type",
-                     w.pos};
+    return joined_equal(*sides[ls], *lc, *sides[rs], *rc, w.pos);
+  }
+
+  // l.lc = r.rc, columns of one SQL type: two of different ones are
+  // refused (docs/frontend_design.md, *Known differences*).
+  static auto joined_equal(const Table& l, const Column& lc, const Table& r, const Column& rc, std::int32_t pos)
+      -> logical::Expr {
+    if (compared_type(lc.sql).identity != compared_type(rc.sql).identity) {
+      throw SqlError{"comparing " + lc.name + " (" + sql_type_name(lc.sql) + ") with " + rc.name + " (" +
+                         sql_type_name(rc.sql) + ") is not supported: a join compares columns of one type",
+                     pos};
     }
-    return logical::compare(ast::Compare::Op::Eq, logical::column_of(sides[ls]->id, *lc),
-                            logical::column_of(sides[rs]->id, *rc));
+    return logical::compare(ast::Compare::Op::Eq, logical::column_of(l.id, lc), logical::column_of(r.id, rc));
+  }
+
+  // USING (…) or NATURAL: its columns, each of both tables and named once
+  // (NATURAL: every column name they share, in the left table's order), and
+  // the equality of each, in that order.
+  auto using_conjuncts(const Table* (&sides)[2], const ast::Select& s) -> std::vector<logical::Expr> {
+    using_ = s.using_columns;
+    if (s.natural) {
+      for (const auto& c : sides[0]->columns) {
+        if (!c.hidden && sides[1]->column(c.name) != nullptr) using_.push_back(c.name);
+      }
+    }
+    using_alias_ = s.using_alias;
+    std::vector<logical::Expr> out;
+    for (const auto& name : using_) {
+      if (std::ranges::count(using_, name) > 1) {
+        throw SqlError{"column name \"" + name + "\" appears more than once in USING clause", s.join_pos, kDuplicateColumn};
+      }
+      for (std::uint32_t side = 0; side < 2; ++side) {
+        if (sides[side]->column(name) == nullptr) {
+          throw SqlError{"column \"" + name + "\" specified in USING clause does not exist in " +
+                             (side == 0 ? "left" : "right") + " table",
+                         s.join_pos, kUndefinedColumn};
+        }
+      }
+      out.push_back(joined_equal(*sides[0], *sides[0]->column(name), *sides[1], *sides[1]->column(name), s.join_pos));
+    }
+    return out;
   }
 
   // A SELECT of one table, or of two joined: Limit? -> Project -> Sort? ->
@@ -659,6 +1363,7 @@ public:
   // dependency, so it is the same in every row of a group, read from any
   // one (Aggregate::dependent), and the GROUP BY stays as written.
   auto select(const ast::Select& s) -> logical::NodePtr {
+    if (s.table.empty()) return select_without_from(s);
     auto joined = !s.join.empty();
     const Table* sides[2]{table(s.table, joined ? s.table_pos : s.pos), nullptr};
     std::vector<logical::Expr> conjuncts;
@@ -666,7 +1371,9 @@ public:
       sides[1] = table(s.join, s.join_pos);
       if (sides[0] == sides[1]) throw SqlError{"a table joined with itself is not supported", s.pos};
       if (s.for_update) throw SqlError{"FOR UPDATE on a join is not supported yet", s.pos};
-      conjuncts = where(sides, s.where);
+      conjuncts = using_conjuncts(sides, s);
+      auto rest = where(sides, s.where);
+      conjuncts.insert(conjuncts.end(), std::make_move_iterator(rest.begin()), std::make_move_iterator(rest.end()));
     } else {
       conjuncts = where(*sides[0], s.where);
     }
@@ -678,8 +1385,34 @@ public:
     };
     auto aggregated = !s.group_by.empty() || !s.having.empty() ||
                       std::ranges::any_of(s.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Aggregate; });
+    // DISTINCT is a GROUP BY of the selected columns. Over a query already
+    // aggregated it is nothing more where every grouped column is
+    // selected, each group then one row; else not yet. Checked in
+    // PostgreSQL's order.
+    auto distinct_groups = s.distinct && !aggregated;
+    if (s.distinct) {
+      if (s.for_update) throw SqlError{"FOR UPDATE is not allowed with DISTINCT clause", s.pos, kFeatureNotSupported};
+      auto selected = [&](const ast::Expr& e) {
+        auto ref = resolve(e);
+        return std::ranges::any_of(s.targets, [&](const ast::Expr& t) { return t.kind == ast::Expr::Kind::Column && resolve(t) == ref; });
+      };
+      for (const auto& o : s.order_by) {
+        if (!selected(column_ref(o))) {
+          throw SqlError{"for SELECT DISTINCT, ORDER BY expressions must appear in select list", o.pos,
+                         kInvalidColumnReference};
+        }
+      }
+      if (aggregated && !std::ranges::all_of(s.group_by, selected)) {
+        not_yet("SELECT DISTINCT of groups it does not select every GROUP BY column of", s.pos);
+      }
+      for (const auto& e : s.targets) {
+        if (distinct_groups && e.kind != ast::Expr::Kind::Column) not_yet("SELECT DISTINCT of other than columns", e.pos);
+      }
+    }
+    aggregated = aggregated || distinct_groups;
+    auto grouping = !s.group_by.empty() || distinct_groups;
     std::vector<logical::Expr> group_by;
-    for (const auto& e : s.group_by) {
+    for (const auto& e : distinct_groups ? s.targets : s.group_by) {
       auto [t, c] = resolve(e);
       auto g = logical::column_of(t->id, *c);
       if (std::ranges::find(group_by, g) == group_by.end()) group_by.push_back(std::move(g));
@@ -690,7 +1423,7 @@ public:
     auto grouped = [&](const Table& t, const Column& c, std::int32_t pos) -> logical::Expr {
       auto g = logical::column_of(t.id, c);
       if (std::ranges::find(group_by, g) != group_by.end()) return g;
-      auto by_key = !s.group_by.empty() && std::ranges::all_of(t.pk_col_ids, [&](std::uint32_t id) {
+      auto by_key = grouping && std::ranges::all_of(t.pk_col_ids, [&](std::uint32_t id) {
         return std::ranges::find(group_by, logical::column_of(t.id, *t.column(id))) != group_by.end();
       });
       if (!by_key) ungrouped(t, c.name, pos);
@@ -699,6 +1432,11 @@ public:
     };
     std::vector<logical::Output> targets;
     for (const auto& e : s.targets) {
+      if (is_constant(e)) {
+        if (aggregated) not_yet("a constant in the select list of an aggregated query", e.pos);
+        targets.push_back(constant_output(e));
+        continue;
+      }
       if (e.kind == ast::Expr::Kind::Aggregate) {
         if (e.column.empty()) {
           targets.push_back(aggregate(nullptr, 0, e));
@@ -708,7 +1446,7 @@ public:
         }
         continue;
       }
-      if (e.kind != ast::Expr::Kind::Column) throw SqlError{"only columns and aggregates can be selected", e.pos};
+      if (e.kind != ast::Expr::Kind::Column) throw SqlError{"only columns, constants and aggregates can be selected", e.pos};
       auto [t, c] = resolve(e);
       targets.push_back({aggregated ? grouped(*t, *c, e.pos) : logical::column_of(t->id, *c), c->name});
     }
@@ -731,7 +1469,7 @@ public:
                        : logical::node(logical::Get{sides[0], s.for_update});
     if (!conjuncts.empty()) rows = logical::node(logical::Filter{std::move(rows), std::move(conjuncts)});
     if (aggregated) {
-      rows = logical::node(logical::Aggregate{std::move(rows), std::move(targets), std::move(group_by), !s.group_by.empty(),
+      rows = logical::node(logical::Aggregate{std::move(rows), std::move(targets), std::move(group_by), grouping,
                                               std::move(dependent)});
       if (!having.empty()) rows = logical::node(logical::Filter{std::move(rows), std::move(having)});
       if (!keys.empty()) rows = logical::node(logical::Sort{std::move(rows), std::move(keys)});
@@ -743,6 +1481,25 @@ public:
     return rows;
   }
 
+  // A SELECT without FROM: its constants, one row of them, under its LIMIT.
+  // A column is a column of no table (42703), as in PostgreSQL.
+  auto select_without_from(const ast::Select& s) -> logical::NodePtr {
+    if (!s.where.empty() || !s.group_by.empty() || !s.having.empty() || !s.order_by.empty() || s.for_update) {
+      not_yet("a SELECT without FROM with WHERE, GROUP BY, HAVING, ORDER BY or FOR UPDATE", s.pos);
+    }
+    std::vector<logical::Output> targets;
+    for (const auto& e : s.targets) {
+      if (e.kind == ast::Expr::Kind::Column) {
+        throw SqlError{"column \"" + e.column + "\" does not exist", e.pos, kUndefinedColumn};
+      }
+      if (!is_constant(e)) not_yet("a SELECT without FROM of other than constants", e.pos);
+      targets.push_back(constant_output(e));
+    }
+    auto rows = logical::node(logical::Project{logical::node(logical::OneRow{}), std::move(targets)});
+    if (s.limit) rows = logical::node(logical::Limit{std::move(rows), *s.limit});
+    return rows;
+  }
+
   // One HAVING conjunct: a grouped column or an aggregate call compared with
   // a parameter, in either order. The parameter takes the column's type, or
   // the aggregate's: COUNT's and SUM's of a SMALLINT or INTEGER a BIGINT,
@@ -750,20 +1507,23 @@ public:
   // BIGINT is (compared_type), MIN's and MAX's their column's. HAVING on AVG
   // is not supported: its quotient is no type the plan holds.
   auto having_conjunct(const ast::Compare& w, const auto& resolve, const auto& grouped) -> logical::Expr {
+    if (w.kind != ast::Compare::Kind::Compare) not_yet("HAVING with AND, OR, NOT, IS NULL, <>, BETWEEN or IN", w.pos);
     const auto* lhs = &w.lhs;
     const auto* rhs = &w.rhs;
     auto op = w.op;
-    if (lhs->kind == ast::Expr::Kind::Param) {
+    if (lhs->kind == ast::Expr::Kind::Param || is_constant(*lhs)) {
       std::swap(lhs, rhs);
       op = mirrored(op);
     }
+    auto constant = is_constant(*rhs);
     if ((lhs->kind != ast::Expr::Kind::Column && lhs->kind != ast::Expr::Kind::Aggregate) ||
-        rhs->kind != ast::Expr::Kind::Param) {
-      throw SqlError{"HAVING must compare a grouped column or an aggregate with a parameter", w.pos};
+        (rhs->kind != ast::Expr::Kind::Param && !constant)) {
+      throw SqlError{"HAVING must compare a grouped column or an aggregate with a parameter or a constant", w.pos};
     }
     if (lhs->kind == ast::Expr::Kind::Column) {
       auto [t, c] = resolve(*lhs);
       auto g = grouped(*t, *c, lhs->pos);
+      if (constant) return logical::compare(op, std::move(g), fixed(coerce(fold(*rhs), *c, false, op_text(op)), c->sql));
       auto sql = having_param(rhs->param, c->type, rhs->pos, *c, t->id);
       return logical::compare(op, std::move(g), logical::param(rhs->param, sql));
     }
@@ -783,6 +1543,9 @@ public:
     if (agg.expr.fn == logical::Expr::Fn::Count || agg.expr.fn == logical::Expr::Fn::Sum) {
       synthetic_.push_back(Column{0, agg.name, agg.expr.type, PhysType::I64, true, {}});
       as = &synthetic_.back();
+    }
+    if (constant) {
+      return logical::compare(op, std::move(agg.expr), fixed(coerce(fold(*rhs), *as, false, op_text(op)), as->sql));
     }
     auto sql = having_param(rhs->param, PhysType::I64, rhs->pos, *as, table_id);
     return logical::compare(op, std::move(agg.expr), logical::param(rhs->param, sql));
@@ -889,7 +1652,12 @@ private:
   }
 
   const Catalog& cat_;
+  std::uint32_t own_params_;
+  std::vector<std::string> using_;  // a join's USING or NATURAL columns: one column each
+  std::string using_alias_;         // USING (…) AS alias
   std::vector<ParamUse> params_;
+  std::vector<Datum> fixed_;  // the constants' values, $own_params_ + 1 onwards
+  std::vector<PhysType> fixed_types_;
   // What a HAVING parameter compared with COUNT or SUM is typed by: no
   // column of a table, kept where a parameter's first use points.
   std::deque<Column> synthetic_;
@@ -898,17 +1666,17 @@ private:
 }  // namespace
 
 auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
-  Binder b{cat};
+  Binder b{cat, param_count(stmt)};
   auto bound_stmt = std::visit(
       [&](const auto& s) -> std::pair<std::variant<Ddl, logical::NodePtr>, std::int32_t> {
         using T = std::decay_t<decltype(s)>;
         if constexpr (std::is_same_v<T, ast::CreateTable>) {
-          CreateTableDdl out{s.table, {}, s.pk};
+          CreateTableDdl out{s.table, {}, s.pk, {}};
           for (const auto& c : s.columns) {
             out.columns.push_back(column_spec(c));
             if (c.primary_key) out.pk.push_back(c.name);
           }
-          if (out.pk.empty()) throw SqlError{"a table needs a PRIMARY KEY", s.pos};
+          for (const auto& u : s.unique) out.unique.push_back({u.name, u.columns});
           return {Ddl{std::move(out)}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::CreateIndex>) {
           const auto* t = b.table(s.table, s.pos);
@@ -925,6 +1693,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
         } else if constexpr (std::is_same_v<T, ast::AddColumn>) {
           (void)b.table(s.table, s.pos);
           if (s.column.primary_key) throw SqlError{"ADD COLUMN cannot add a primary key column", s.column.pos};
+          if (!s.column.unique.empty()) not_yet("ADD COLUMN … UNIQUE", s.column.pos);
           auto spec = column_spec(s.column);
           if (!spec.nullable && std::holds_alternative<std::monostate>(spec.default_value)) {
             throw SqlError{"column \"" + s.column.name + "\" is NOT NULL and needs a DEFAULT for the existing rows",
@@ -938,10 +1707,12 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           if (s.columns.empty()) {
             // As PostgreSQL: the values fill the leading columns and the rest
             // take their defaults, so a column added later changes nothing.
-            for (std::size_t i = 0; i < std::min(s.values.size(), t->columns.size()); ++i) {
-              targets.push_back(&t->columns[i]);
+            // The hidden row id is no column a statement fills.
+            for (const auto& c : t->columns) {
+              if (targets.size() == s.values.size()) break;
+              if (!c.hidden) targets.push_back(&c);
             }
-            if (s.values.size() > t->columns.size()) {
+            if (s.values.size() > targets.size()) {
               throw SqlError{"INSERT has more expressions than target columns", s.pos};
             }
           } else {
@@ -957,7 +1728,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
             if (out.values[at]) throw SqlError{"column \"" + targets[i]->name + "\" specified more than once", s.pos, kDuplicateColumn};
             out.values[at] = b.value(*t, s.values[i], *targets[i]);
             if (out.values[at]->kind != logical::Expr::Kind::Param) {
-              throw SqlError{"INSERT values must be parameters", s.values[i].pos};
+              throw SqlError{"INSERT values must be parameters or constants", s.values[i].pos};
             }
           }
           // A column left out takes its default. One that is NOT NULL with no
@@ -975,7 +1746,13 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
               throw SqlError{"updating a primary key column is not supported", a.pos};
             }
             auto v = b.value(*t, a.value, *c);
-            if (v.kind == logical::Expr::Kind::Param) b.check_assigned(v.param, *c, t->id);
+            // A constant is checked against the column's type now, as
+            // PostgreSQL folds its cast when it plans the statement.
+            if (v.kind == logical::Expr::Kind::Param && b.is_fixed(v.param)) {
+              if (auto why = out_of_range(c->sql, b.fixed_value(v.param))) out_of_type(*why, a.value.pos);
+            } else if (v.kind == logical::Expr::Kind::Param) {
+              b.check_assigned(v.param, *c, t->id);
+            }
             set.emplace_back(logical::column_of(t->id, *c).col, std::move(v));
           }
           auto rows = Binder::rows(*t, b.where(*t, s.where));
@@ -987,7 +1764,8 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
       },
       stmt);
   auto types = b.param_types(bound_stmt.second);
-  return Bound{std::move(bound_stmt.first), std::move(types), b.param_sql(), b.param_table(), b.param_info()};
+  types.insert(types.end(), b.fixed_types().begin(), b.fixed_types().end());
+  return Bound{std::move(bound_stmt.first), std::move(types), b.param_sql(), b.param_table(), b.param_info(), b.fixed_values()};
 }
 
 }  // namespace bytecask::sql::bound

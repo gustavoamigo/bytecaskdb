@@ -53,41 +53,73 @@ public:
   ~FeatureNotSupported() override;  // out of line: anchors the vtable (-Wweak-vtables)
 };
 
-// A select-list, SET or comparison operand: a column, a parameter, an
-// integer literal, a sum or difference of two, or an aggregate: COUNT(*),
+// A constant, as written: a literal, or DEFAULT's operand. Numbers keep
+// their text, so the binder folds them exactly to the type they meet.
+struct Literal {
+  enum class Kind { Null, Integer, Number, String, Bool };
+  Kind kind{Kind::Null};
+  std::string text;  // Integer and Number: the digits as written; String: the bytes
+  bool b{false};     // Bool
+  std::int32_t pos{-1};
+};
+
+// A comparison as a value (SELECT 3 < 5): its operator, <> among them. A
+// WHERE's comparisons are Compare's, below.
+enum class ValueCompare { Eq, Ne, Lt, Le, Gt, Ge };
+
+// A select-list, SET or comparison operand: a column, a parameter, a
+// literal (an integer within BIGINT after + or - is a Const), a sum or
+// difference of two, unary + or - of one, a comparison of two, a cast of
+// one (DATE '…' and '…'::date alike), or an aggregate: COUNT(*),
 // COUNT([DISTINCT] column), SUM, MIN, MAX or AVG of a column.
 struct Expr {
-  enum class Kind { Column, Param, Const, Add, Sub, Aggregate };
+  enum class Kind { Column, Param, Const, Literal, Add, Sub, Plus, Neg, Compare, Cast, Aggregate };
   enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind;
   std::string column;       // Column; Aggregate's argument, "" for COUNT(*)
   std::uint32_t param{0};   // Param: zero-based ($1 is 0)
-  std::unique_ptr<Expr> lhs, rhs;  // Add, Sub
+  std::unique_ptr<Expr> lhs, rhs;  // Add, Sub, Compare; Plus, Neg and Cast: rhs
   std::int32_t pos{-1};
   std::string table;          // Column, Aggregate: the table it is qualified by, "" for none
   std::int64_t constant{0};   // Const: an integer literal (Add and Sub's right operand only)
   Fn fn{Fn::Count};           // Aggregate
   bool distinct{false};       // Aggregate: COUNT(DISTINCT column)
+  Literal literal{};          // Literal
+  ValueCompare cmp{ValueCompare::Eq};  // Compare
+  std::string cast_type;               // Cast: libpg_query's last type name, as a column's
+  std::vector<std::int32_t> cast_typmods;
 };
 
-// One conjunct of a WHERE clause: two expressions compared.
+// One conjunct of a WHERE clause: two expressions compared; or, as a
+// predicate, AND, OR or NOT of conjuncts (`args`), or `lhs` IS NULL. The
+// parser writes <>, BETWEEN and IN with them: NOT (a = b); a >= lo AND a <=
+// hi; a = x OR a = y.
 struct Compare {
   enum class Op { Eq, Lt, Le, Gt, Ge };
+  enum class Kind { Compare, And, Or, Not, IsNull };
   Op op;
   Expr lhs, rhs;
   std::int32_t pos{-1};
   bool on{false};  // a JOIN's ON conjunct, not the WHERE's
+  Kind kind{Kind::Compare};
+  std::vector<Compare> args;  // And, Or: two or more; Not: one
 };
 
-// A constant, as written: DEFAULT's operand. Numbers keep their text, so
-// the binder folds them exactly to the column's type.
-struct Literal {
-  enum class Kind { Null, Integer, Number, String, Bool };
-  Kind kind;
-  std::string text;  // Integer and Number: the digits as written; String: the bytes
-  bool b{false};     // Bool
-  std::int32_t pos{-1};
-};
+// A copy of e, which owns its operands: what BETWEEN and IN repeat.
+[[nodiscard]] auto clone(const Expr& e) -> Expr {
+  Expr out{e.kind, e.column, e.param, nullptr, nullptr, e.pos};
+  if (e.lhs) out.lhs = std::make_unique<Expr>(clone(*e.lhs));
+  if (e.rhs) out.rhs = std::make_unique<Expr>(clone(*e.rhs));
+  out.table = e.table;
+  out.constant = e.constant;
+  out.fn = e.fn;
+  out.distinct = e.distinct;
+  out.literal = e.literal;
+  out.cmp = e.cmp;
+  out.cast_type = e.cast_type;
+  out.cast_typmods = e.cast_typmods;
+  return out;
+}
 
 struct ColumnDefAst {
   std::string name;
@@ -97,6 +129,16 @@ struct ColumnDefAst {
   bool primary_key{false};
   std::optional<Literal> default_value;
   std::int32_t pos{-1};
+  // Each UNIQUE constraint on the column: its name, "" for none.
+  std::vector<std::string> unique;
+};
+
+// A UNIQUE constraint of CREATE TABLE, on a column or on the table, in the
+// order written: its name ("" for one the catalog chooses) and columns.
+struct UniqueAst {
+  std::string name;
+  std::vector<std::string> columns;
+  std::int32_t pos{-1};
 };
 
 struct CreateTable {
@@ -104,6 +146,7 @@ struct CreateTable {
   std::vector<ColumnDefAst> columns;
   std::vector<std::string> pk;  // a table-level PRIMARY KEY (…)
   std::int32_t pos{-1};
+  std::vector<UniqueAst> unique;  // every UNIQUE constraint, columns' and the table's, in order
 };
 
 struct IndexColumnAst {
@@ -157,7 +200,7 @@ struct OrderItem {
 
 struct Select {
   std::vector<Expr> targets;
-  std::string table;
+  std::string table;  // "" for none: a SELECT without FROM
   std::string join;  // a second table, "" for none: FROM a, b or a [INNER] JOIN b ON …
   std::vector<Compare> where;
   std::vector<OrderItem> order_by;
@@ -167,6 +210,13 @@ struct Select {
   std::int32_t table_pos{-1}, join_pos{-1};  // where table and join are named
   std::vector<Expr> group_by;  // GROUP BY's columns, as written
   std::vector<Compare> having;  // HAVING's conjuncts
+  bool distinct{false};         // SELECT DISTINCT, not DISTINCT ON
+  // An inner join's USING (…), or NATURAL: the columns both tables have,
+  // compared by =, each named alone as one column. using_alias names them
+  // too: USING (…) AS alias.
+  std::vector<std::string> using_columns;
+  bool natural{false};
+  std::string using_alias;
 };
 
 struct Assignment {

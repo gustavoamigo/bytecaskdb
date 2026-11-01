@@ -7,9 +7,9 @@
 // turn it into an equivalent one, and the search (search.cppm) picks the
 // physical plan that computes it.
 //
-// The expressions are those the dialect has today: columns, parameters,
-// integer constants, + and -, comparisons, a conjunction of them, and
-// aggregate calls. A predicate is its conjuncts, in the order the statement
+// The expressions are those the dialect has today: columns, parameters
+// (a literal is one, folded by the binder), integer constants, + and -,
+// comparisons, a conjunction of them, and aggregate calls. A predicate is its conjuncts, in the order the statement
 // wrote them.
 
 module;
@@ -47,8 +47,11 @@ struct ColumnRef {
 
 // A typed expression. Its SQL type is the binder's, by types_design.md's
 // rules: a comparison's is BOOLEAN, an aggregate's PostgreSQL's result type.
+// And, Or, Not and IsNull are a predicate's, a WHERE conjunct that is no
+// comparison of its own: three-valued, as SQL's logic is, over comparisons
+// and IS NULL of a column; a filter, never a key's bound.
 struct Expr {
-  enum class Kind { Column, Param, Const, Add, Sub, Compare, Aggregate };
+  enum class Kind { Column, Param, Const, Add, Sub, Compare, Aggregate, And, Or, Not, IsNull };
   enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind{Kind::Param};
   SqlType type{};
@@ -58,7 +61,8 @@ struct Expr {
   Op op{Op::Eq};                // Compare
   Fn fn{Fn::Count};             // Aggregate
   bool distinct{false};         // Aggregate: COUNT(DISTINCT arg)
-  std::vector<Expr> args;       // Add, Sub, Compare: two; Aggregate: none (COUNT(*)) or its argument
+  std::vector<Expr> args;       // Add, Sub, Compare: two; Aggregate: none (COUNT(*)) or its argument;
+                                // And, Or: two or more; Not: one; IsNull: its column
 
   [[nodiscard]] auto phys() const -> PhysType { return phys_type(type); }
 
@@ -109,6 +113,11 @@ struct Expr {
   return e;
 }
 
+// Whether e is a predicate: And, Or, Not or IsNull.
+[[nodiscard]] auto is_predicate(const Expr& e) -> bool {
+  return e.kind == Expr::Kind::And || e.kind == Expr::Kind::Or || e.kind == Expr::Kind::Not || e.kind == Expr::Kind::IsNull;
+}
+
 // Every column the expression reads, in the order it reads them.
 void columns_of(const Expr& e, std::vector<ColumnRef>& out) {
   if (e.kind == Expr::Kind::Column) {
@@ -133,6 +142,9 @@ struct Get {
 struct Empty {
   std::vector<const Table*> tables;
 };
+
+// One row of no columns: what a SELECT without FROM reads.
+struct OneRow {};
 
 // The rows for which every conjunct is true.
 struct Filter {
@@ -216,7 +228,7 @@ struct Delete {
 };
 
 struct Node {
-  std::variant<Get, Empty, Filter, Project, Join, Aggregate, Sort, Limit, Insert, Update, Delete> op;
+  std::variant<Get, Empty, OneRow, Filter, Project, Join, Aggregate, Sort, Limit, Insert, Update, Delete> op;
   // The columns something above reads from this operator's rows: set by
   // projection pruning, empty before it.
   std::vector<ColumnRef> output;
@@ -227,8 +239,8 @@ template <typename T>
   return std::make_unique<Node>(Node{std::move(op), {}});
 }
 
-// The operator below n, or null for a leaf (Get, Empty, Insert); a Join has
-// two.
+// The operator below n, or null for a leaf (Get, Empty, OneRow, Insert); a
+// Join has two.
 template <typename N>
   requires std::is_same_v<std::remove_const_t<N>, Node>
 [[nodiscard]] auto input_of(N& n) {

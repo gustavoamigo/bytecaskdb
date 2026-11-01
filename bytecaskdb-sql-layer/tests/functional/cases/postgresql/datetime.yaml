@@ -84,7 +84,7 @@
 
 - name: the difference of two DATEs
   features: [F051-01]
-  # only columns and aggregates can be selected
+  # only columns, constants and aggregates can be selected
   unimplemented: true
   ordered: true
   setup:
@@ -129,8 +129,6 @@
 
 - name: a DATE literal
   features: [F051-01]
-  # expression not supported
-  unimplemented: true
   setup:
     - CREATE TABLE dt (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)
   steps:

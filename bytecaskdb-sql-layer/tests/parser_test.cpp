@@ -84,13 +84,30 @@ TEST_CASE("parser: the seven statements of the prototype", "[sql][parser]") {
   }
 }
 
+TEST_CASE("parser: UNIQUE on a column or the table, in the order written", "[sql][parser]") {
+  auto t = std::get<CreateTable>(parse("CREATE TABLE u (a INT UNIQUE, b INT CONSTRAINT bu UNIQUE, "
+                                       "CONSTRAINT ab UNIQUE (a, b), UNIQUE (b))"));
+  REQUIRE(t.unique.size() == 4);
+  CHECK((t.unique[0].name.empty() && t.unique[0].columns == std::vector<std::string>{"a"}));
+  CHECK((t.unique[1].name == "bu" && t.unique[1].columns == std::vector<std::string>{"b"}));
+  CHECK((t.unique[2].name == "ab" && t.unique[2].columns == std::vector<std::string>{"a", "b"}));
+  CHECK((t.unique[3].name.empty() && t.unique[3].columns == std::vector<std::string>{"b"}));
+  CHECK(t.columns[0].unique == std::vector<std::string>{""});
+  for (auto sql : {"CREATE TABLE u (a INT UNIQUE NULLS NOT DISTINCT)", "CREATE TABLE u (a INT, b INT, UNIQUE (a) INCLUDE (b))",
+                   "CREATE TABLE u (a INT UNIQUE DEFERRABLE)", "CREATE TABLE u (a INT, CHECK (a > 0))"}) {
+    INFO(sql);
+    CHECK_THROWS_AS(parse(sql), SqlError);
+  }
+}
+
 TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql][parser]") {
   //                    0         1         2         3
   //                    0123456789012345678901234567890123456789
   CHECK(rejected_at("SELECT id FROM t LEFT JOIN u ON t.id = u.id") == 27);
   CHECK(rejected_at("SELECT id FROM t, u, v WHERE id = $1") >= 0);
-  CHECK(rejected_at("SELECT id FROM t WHERE id = 1") == 28);   // a literal
-  CHECK(rejected_at("SELECT id FROM t WHERE id = $1 OR id = $2") >= 0);
+  CHECK(rejected_at("SELECT id FROM t WHERE id = B'1'") == 28);  // a bit-string literal
+  CHECK(rejected_at("VALUES (1)") == 0);
+  CHECK(rejected_at("SELECT id FROM t WHERE id LIKE $1") >= 0);
   CHECK(rejected_at("SELEC id FROM t") == 0);                   // PostgreSQL's own syntax error
   CHECK(rejected_at("SELECT id FROM t; SELECT id FROM t") == -1);
   CHECK(rejected_at("DROP VIEW v") == 0);
@@ -217,14 +234,32 @@ TEST_CASE("parser: two tables, qualified columns and integer literals", "[sql][p
   CHECK(u.set[0].value.rhs->constant == 1);
   CHECK(std::get<Update>(parse("UPDATE t SET qty = qty - 10000000000 WHERE id = $1")).set[0].value.rhs->constant ==
         10000000000);
-  CHECK_THROWS_AS(parse("UPDATE t SET qty = qty + 1.5 WHERE id = $1"), SqlError);
-  CHECK_THROWS_AS(parse("UPDATE t SET qty = qty + 99999999999999999999 WHERE id = $1"), SqlError);
-  CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = 1"), SqlError);
-  try {
-    (void)parse("SELECT id FROM t JOIN u ON id = $1 OR k = $2");
-    FAIL("accepted");
-  } catch (const SqlError& e) {
-    CHECK(std::string{e.what()} == "only AND is supported in ON");
-  }
+  // Any other literal is a Literal, as written, for the binder to fold or
+  // refuse.
+  auto literal_of = [](const Expr& e) {
+    REQUIRE(e.kind == Expr::Kind::Literal);
+    return e.literal;
+  };
+  auto number = literal_of(*std::get<Update>(parse("UPDATE t SET qty = qty + 1.5 WHERE id = $1")).set[0].value.rhs);
+  CHECK((number.kind == Literal::Kind::Number && number.text == "1.5"));
+  auto wide = literal_of(*std::get<Update>(parse("UPDATE t SET qty = qty + 99999999999999999999 WHERE id = $1")).set[0].value.rhs);
+  CHECK((wide.kind == Literal::Kind::Integer && wide.text == "99999999999999999999"));
+  CHECK(literal_of(std::get<Select>(parse("SELECT id FROM t WHERE id = 1")).where[0].rhs).text == "1");
+  auto string = literal_of(std::get<Insert>(parse("INSERT INTO t VALUES ('it''s', NULL, TRUE)")).values[0]);
+  CHECK((string.kind == Literal::Kind::String && string.text == "it's"));
+  // A SELECT without FROM; PostgreSQL's grammar folds - of a number into the
+  // literal, and leaves unary + an operator.
+  auto bare = std::get<Select>(parse("SELECT -5, +7.8, -(1 + 2)"));
+  CHECK(bare.table.empty());
+  REQUIRE(bare.targets.size() == 3);
+  CHECK(literal_of(bare.targets[0]).text == "-5");
+  CHECK(bare.targets[1].kind == Expr::Kind::Plus);
+  CHECK(bare.targets[2].kind == Expr::Kind::Neg);
+  // OR, in ON as in WHERE, is a predicate conjunct; ON's are marked so.
+  auto ors = std::get<Select>(parse("SELECT id FROM t JOIN u ON id = $1 OR k = $2"));
+  REQUIRE(ors.where.size() == 1);
+  CHECK(ors.where[0].kind == Compare::Kind::Or);
+  CHECK(ors.where[0].on);
+  CHECK(ors.where[0].args.size() == 2);
 }
 

@@ -65,7 +65,7 @@ BINDER_STATES = frozenset(
 )
 
 # 0A000 is also one of the layer's own rules, which PostgreSQL does not
-# have: a table needs a PRIMARY KEY. The state alone cannot tell it from FOR
+# have: a table needs columns. The state alone cannot tell it from FOR
 # UPDATE with an aggregate, so the statement does: a CREATE TABLE refused
 # with 0A000 is the layer's rule, kind "refused", never compared. The
 # planner's refusal, also 0A000, is told by its class (run_layer: NO_PLAN).
@@ -237,6 +237,51 @@ def literal(t: Type, v) -> str:
     if t.kind == "bytes":
         v = v.decode("ascii")  # printable ASCII only: no escapes to agree on
     return "'" + v.replace("'", "''") + "'"
+
+
+def sql_literal(t: Type, v) -> str:
+    """A value as a literal in a statement's text, read the same way on both
+    sides: a number as written, which the column's type takes by its
+    assignment cast; a float, a REAL and bytes as a string, which each side
+    reads with the column type's input function. A REAL is written as the
+    float it rounds to, so both read that float; one past float's range is
+    written as given, and both refuse it."""
+    if v is None:
+        return "NULL"
+    if t.kind == "bool":
+        return "TRUE" if v else "FALSE"
+    if t.kind in ("int", "decimal"):
+        return str(v)
+    if t.kind in ("float", "real"):
+        if math.isnan(v):
+            text = "NaN"
+        elif math.isinf(v):
+            text = "Infinity" if v > 0 else "-Infinity"
+        else:
+            if t.kind == "real":
+                try:
+                    v = struct.unpack("f", struct.pack("f", v))[0]
+                except OverflowError:
+                    pass
+            text = repr(v)
+        return f"'{text}'"
+    if t.kind == "bytes":
+        return "'\\x" + v.hex() + "'"
+    return "'" + v.replace("'", "''") + "'"
+
+
+def exact_literal(t: Type, v) -> bool:
+    """Whether the layer compares a column of type t with v as a literal: a
+    value its type holds exactly. The rest it refuses, where PostgreSQL
+    compares in a wider type (docs/frontend_design.md, *Known
+    differences*)."""
+    if v is None:
+        return True
+    if t.kind == "int":
+        return t.low <= v <= t.high
+    if t.kind == "decimal":
+        return abs(v.scaleb(t.scale)) < 10**18  # within a DECIMAL's 18 digits at the column's scale
+    return True
 
 
 # Outside a literal: a quoted string ('' escapes a quote), a $n

@@ -15,6 +15,7 @@
 #include <string>
 #include <type_traits>
 #include <variant>
+#include <thread>
 #include <vector>
 
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
@@ -644,6 +645,128 @@ TEST_CASE("embedded API: table_rows reads a table in key order; errors carry the
     CHECK(e.code() == BC_E_CORRUPT);
   }
   fourth->close();
+}
+
+TEST_CASE("embedded API: a table without a primary key keeps every row, duplicates included, under hidden row ids",
+          "[sql][api]") {
+  sql_test::TempDir dir{"api_row_id"};
+  auto rows_of = [](Database& d) {
+    auto r = d.table_rows("k");
+    CHECK(r.columns == std::vector<std::string>{"a", "b"});  // never the row id
+    return r.rows;
+  };
+  {
+    auto db = Database::open(dir.path());
+    (void)db->execute("CREATE TABLE k (a INTEGER, b TEXT)");
+    const auto& ins = db->prepare("INSERT INTO k VALUES ($1, $2)");
+    CHECK(ins.param_types() == std::vector<PhysType>{PhysType::I64, PhysType::Bytes});  // the row id is no parameter
+    CHECK(db->execute(ins, {i(1), bytes("x")}).affected == 1);
+    CHECK(db->execute(ins, {i(1), bytes("x")}).affected == 1);  // a duplicate is another row
+    CHECK(db->execute("INSERT INTO k (b) VALUES ($1)", {bytes("b only")}).affected == 1);
+    CHECK(sql_refusal(*db, "INSERT INTO k VALUES ($1, $2, $3)", {i(1), bytes("x"), i(3)}) ==
+          "INSERT has more expressions than target columns");
+    // Rows come back in the order they were inserted: the row id's.
+    CHECK(rows_of(*db) == Grid{{i(1), bytes("x")}, {i(1), bytes("x")}, {kNull, bytes("b only")}});
+
+    // A rolled-back insert leaves a gap, never a row.
+    {
+      auto t = db->begin();
+      (void)t.execute(ins, {i(9), bytes("gone")});
+      t.rollback();
+    }
+    // Two transactions inserting into the table both commit: their row ids
+    // differ, so no write conflicts.
+    auto t1 = db->begin();
+    auto t2 = db->begin();
+    (void)t1.execute(ins, {i(2), bytes("t1")});
+    (void)t2.execute(ins, {i(2), bytes("t2")});
+    CHECK(t1.commit() == CommitOutcome::Committed);
+    CHECK(t2.commit() == CommitOutcome::Committed);
+
+    // Concurrent autocommit inserts all land.
+    {
+      std::vector<std::jthread> threads;
+      for (int w = 0; w < 4; ++w) {
+        threads.emplace_back([&, w] {
+          for (int n = 0; n < 50; ++n) (void)db->execute(ins, {i(100 + w), bytes("c")});
+        });
+      }
+    }
+    CHECK(db->execute("SELECT COUNT(*) FROM k WHERE b = $1", {bytes("c")}).rows == Grid{{i(200)}});
+
+    CHECK(db->execute("UPDATE k SET b = $1 WHERE a = $2", {bytes("y"), i(1)}).affected == 2);
+    CHECK(db->execute("DELETE FROM k WHERE a >= $1", {i(100)}).affected == 200);
+    // No primary key is grouped, so no column depends on the group.
+    try {
+      (void)db->execute("SELECT a, b FROM k GROUP BY a");
+      FAIL("an ungrouped column was accepted");
+    } catch (const ast::SqlError& e) {
+      CHECK(e.sqlstate() == "42803");
+    }
+    CHECK(db->execute("SELECT a, COUNT(*) FROM k GROUP BY a ORDER BY a").rows ==
+          Grid{{i(1), i(2)}, {i(2), i(2)}, {kNull, i(1)}});
+    // A unique index on a column holds as on any table.
+    (void)db->execute("CREATE TABLE u (v INTEGER)");
+    (void)db->execute("CREATE UNIQUE INDEX u_v ON u (v)");
+    CHECK(db->execute("INSERT INTO u VALUES ($1)", {i(1)}).affected == 1);
+    CHECK_THROWS_AS(db->execute("INSERT INTO u VALUES ($1)", {i(1)}), ExecError);
+  }
+  // Reopened: the rows are all there, and the next row id is past them.
+  auto db = Database::open(dir.path());
+  CHECK(db->execute("INSERT INTO k VALUES ($1, $2)", {i(3), bytes("after")}).affected == 1);
+  CHECK(rows_of(*db) == Grid{{i(1), bytes("y")}, {i(1), bytes("y")}, {kNull, bytes("b only")}, {i(2), bytes("t1")},
+                             {i(2), bytes("t2")}, {i(3), bytes("after")}});
+}
+
+TEST_CASE("embedded API: literals are bound after the caller's parameters, and a recompile folds them again",
+          "[sql][api]") {
+  sql_test::TempDir dir{"api_literals"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE l (k INTEGER PRIMARY KEY, d NUMERIC(6,2), t TEXT)");
+  const auto& ins = db->prepare("INSERT INTO l VALUES ($1, 1.25, 'one')");
+  // The constants are no parameter a caller binds or is told of.
+  CHECK(ins.param_types() == std::vector<PhysType>{PhysType::I64});
+  CHECK(ins.params().size() == 1);
+  CHECK(db->execute(ins, {i(1)}).affected == 1);
+  CHECK(db->execute(ins, {i(2)}).affected == 1);
+  try {
+    (void)db->execute(ins, {i(3), i(4)});
+    FAIL("an extra parameter was taken");
+  } catch (const ParamError& e) {
+    CHECK(std::string{e.what()} == "statement takes 1 parameters, got 2");
+  }
+  CHECK(db->execute("SELECT k, d, t FROM l WHERE t = 'one' AND k >= 2").rows == Grid{{i(2), i(125), bytes("one")}});
+  CHECK(db->execute("SELECT k, 'x', 2.5 FROM l WHERE k = 1").rows == Grid{{i(1), bytes("x"), i(25)}});
+
+  // Recompiled after a DDL, a literal is folded to the type it meets now.
+  const auto& by_d = db->prepare("SELECT k FROM l WHERE d = 1.25");
+  CHECK(db->execute(by_d, {}).rows.size() == 2);
+  (void)db->execute("DROP TABLE l");
+  (void)db->execute("CREATE TABLE l (k INTEGER PRIMARY KEY, d NUMERIC(6,3), t TEXT)");
+  CHECK(db->execute(ins, {i(1)}).affected == 1);
+  CHECK(db->table_rows("l").rows == Grid{{i(1), i(1250), bytes("one")}});
+  CHECK(db->execute(by_d, {}).rows == Grid{{i(1)}});
+  (void)db->execute("DROP TABLE l");
+  (void)db->execute("CREATE TABLE l (k INTEGER PRIMARY KEY, d NUMERIC(6,1), t TEXT)");
+  // At scale 1, 1.25 is no value d holds: refused, as on a first compile.
+  CHECK(sql_refusal(*db, by_d, {}) == "comparing d (numeric(6,1)) with a constant its type does not hold exactly is "
+                                      "not supported yet");
+
+  // A SELECT without FROM: one row of its constants, or none under LIMIT 0.
+  auto one = db->execute("SELECT 5, -7.80, 'a', NULL, TRUE, 1 + 1.5");
+  CHECK(one.columns == std::vector<std::string>(6, "?column?"));
+  CHECK(one.rows == Grid{{i(5), i(-780), bytes("a"), kNull, Value{true}, i(25)}});
+  CHECK(one.types == std::vector<SqlType>{{SqlKind::Integer}, {SqlKind::Decimal, 0, 0, 2}, {SqlKind::Text},
+                                          {SqlKind::Text}, {SqlKind::Boolean}, {SqlKind::Decimal, 0, 0, 1}});
+  CHECK(db->execute("SELECT 1 LIMIT 0").rows.empty());
+  CHECK(db->execute("SELECT 1 LIMIT 1").rows == Grid{{i(1)}});
+  // And in a transaction, beside its writes.
+  auto t = db->begin();
+  CHECK(t.execute("INSERT INTO l VALUES (9, 0.5, 'nine')").affected == 1);
+  CHECK(t.execute("SELECT k FROM l WHERE t = 'nine'").rows == Grid{{i(9)}});
+  CHECK(t.execute("SELECT 'in a transaction'").rows == Grid{{bytes("in a transaction")}});
+  CHECK(t.commit() == CommitOutcome::Committed);
+  CHECK(db->execute("SELECT d FROM l WHERE k = 9").rows == Grid{{i(5)}});
 }
 
 TEST_CASE("embedded API: a stored column that does not decode is BC_E_CORRUPT, never 0, empty or NULL",

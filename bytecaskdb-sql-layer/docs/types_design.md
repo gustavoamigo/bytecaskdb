@@ -216,8 +216,9 @@ decimal (scaling, checked; decimal to integer truncates toward zero);
 decimal and double; boolean and integer (0 and 1; any non-zero integer is
 true); timestamp and date (floor and multiplication); text and binary
 (identity, with the UTF-8 check on the way to text, done by the runtime).
-Casts to and from text (`'42'::INTEGER`, `now()::TEXT`) are not supported,
-except for literals, which the binder folds at compile time.
+Casts to and from text (`'42'::INTEGER`, `now()::TEXT`) are not supported.
+A string literal is read as the type it meets, with that type's input
+function, when the statement is bound (`frontend_design.md`, *Literals*).
 
 ## The function library
 

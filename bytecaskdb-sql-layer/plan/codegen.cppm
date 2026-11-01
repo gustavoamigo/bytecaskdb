@@ -497,9 +497,45 @@ private:
   }
 
   // Whether the row fails the conjunct, as a C expression: NULL on either
-  // side, or the comparison false.
+  // side, or the comparison false; a predicate, unless it is true.
   auto fails(const Expr& c) -> std::string {
     if (c.kind == Expr::Kind::Const) return c.constant != 0 ? "0" : "1";  // folded: never, or always
+    if (logical::is_predicate(c)) return "!(" + truth(c, true) + ")";
+    auto [null, cmp] = comparison(c);
+    return null + " || !(" + cmp + ")";
+  }
+
+  // Whether predicate e is true (`want`) or false, as C: SQL's three-valued
+  // logic as two conditions, unknown being neither. NOT swaps them; AND is
+  // true when all are and false when one is, OR the mirror. Each node is
+  // printed once, in one of the two, and short-circuits.
+  auto truth(const Expr& e, bool want) -> std::string {
+    switch (e.kind) {
+      case Expr::Kind::Not: return truth(e.args[0], !want);
+      case Expr::Kind::And:
+      case Expr::Kind::Or: {
+        auto all = (e.kind == Expr::Kind::And) == want;
+        std::string out;
+        for (const auto& a : e.args) out += (out.empty() ? "(" : all ? " && (" : " || (") + truth(a, want) + ")";
+        return out;
+      }
+      case Expr::Kind::IsNull: return (want ? "" : "!") + col_null(e.args[0].col);  // never unknown
+      case Expr::Kind::Const: return (e.constant != 0) == want ? "1" : "0";
+      case Expr::Kind::Compare: {
+        auto [null, cmp] = comparison(e);
+        return "!(" + null + ") && " + (want ? "(" : "!(") + cmp + ")";
+      }
+      case Expr::Kind::Column:
+      case Expr::Kind::Param:
+      case Expr::Kind::Add:
+      case Expr::Kind::Sub:
+      case Expr::Kind::Aggregate: break;
+    }
+    throw std::logic_error{"physical plan: a predicate codegen does not print"};
+  }
+
+  // A comparison's NULL test (either side NULL) and the comparison, as C.
+  auto comparison(const Expr& c) -> std::pair<std::string, std::string> {
     const auto& lhs = c.args[0].col;
     const auto& rhs = c.args[1];
     auto out = col_null(lhs);
@@ -520,13 +556,17 @@ private:
         break;
       case Expr::Kind::Const:
       case Expr::Kind::Compare:
-      case Expr::Kind::Aggregate: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
+      case Expr::Kind::Aggregate:
+      case Expr::Kind::And:
+      case Expr::Kind::Or:
+      case Expr::Kind::Not:
+      case Expr::Kind::IsNull: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
     }
     auto col = read_col(lhs);
     // Text and bytes compare as bytes: COLLATE "C".
     auto cmp = lhs.type == PhysType::Bytes ? "bc_bytes_cmp(cx, " + col + ", " + value + ") " + op_text(c.op) + " 0"
                                            : col + " " + op_text(c.op) + " " + value;
-    return out + " || !(" + cmp + ")";
+    return {out, cmp};
   }
 
   void produce(const physical::Node& n, const Consume& k) {
@@ -537,6 +577,9 @@ private:
   void produce(const physical::Empty&, const Consume&) {
     for (const auto& line : no_rows_) w_.line(line);
   }
+
+  // One row of no columns: the consumer, once.
+  void produce(const physical::OneRow&, const Consume& k) { k(); }
 
   // The single row a point lookup names. In a one-row aggregate a missing
   // row is a condition, `hit_`, not an end.
@@ -1017,10 +1060,16 @@ private:
       if (rows_.size() == 1 && rows_[0].covering) {
         // Every result column from the entry's key: no row read.
         const auto& b = rows_[0];
-        if (!e.targets.empty()) w_.line("bc_view key = bc_scan_key(cx, " + b.cursor + ");");
+        if (std::ranges::any_of(e.targets, [](const auto& t) { return std::holds_alternative<ColumnRef>(t); })) {
+          w_.line("bc_view key = bc_scan_key(cx, " + b.cursor + ");");
+        }
         w_.line("bc_emit_begin(cx);");
         for (const auto& t : e.targets) {
-          w_.line("bc_emit_key_part(cx, " + w_.obj(b.object) + ", key, " + w_.part(b.object, t) + ");");
+          if (const auto* p = std::get_if<physical::ParamTarget>(&t)) {
+            emit_param(*p);
+            continue;
+          }
+          w_.line("bc_emit_key_part(cx, " + w_.obj(b.object) + ", key, " + w_.part(b.object, std::get<ColumnRef>(t)) + ");");
         }
         w_.line("bc_emit_end(cx);");
         return;
@@ -1029,7 +1078,12 @@ private:
         if (b.for_update) w_.line("bc_guard_row(cx, " + w_.tbl(b.table) + ", " + b.row + ");");
       }
       w_.line("bc_emit_begin(cx);");
-      for (const auto& t : e.targets) {
+      for (const auto& target : e.targets) {
+        if (const auto* p = std::get_if<physical::ParamTarget>(&target)) {
+          emit_param(*p);
+          continue;
+        }
+        const auto& t = std::get<ColumnRef>(target);
         if (const auto& b = binding(t.table); b.covering) {
           w_.line("bc_emit_key_part(cx, " + key_part(b, t) + ";");
         } else {
@@ -1038,6 +1092,15 @@ private:
       }
       w_.line("bc_emit_end(cx);");
     });
+  }
+
+  // A parameter as a result column, NULL as NULL.
+  void emit_param(const physical::ParamTarget& p) {
+    w_.open("if (" + param_null(p.param) + ")");
+    w_.line("bc_emit_null(cx);");
+    w_.otherwise();
+    w_.line("bc_emit_" + suffix(p.type) + "(cx, " + param(p.type, p.param) + ");");
+    w_.close();
   }
 
   void emit_count(const std::string& n) {

@@ -40,7 +40,7 @@ every rule, the invariants are checked.
   42703, 42804, 42P18, 42883, 42702, 42701, 42803, 0A000, 22003, and the
   catalog's 42P07, 42704, 42809) must agree with PostgreSQL's. The one state
   both sides use for different things is 0A000: on a `CREATE TABLE` it is the
-  layer's own rule that a table needs a primary key, which PostgreSQL does not
+  layer's own rule that a table needs columns, which PostgreSQL does not
   have, and on a message starting "no plan:" the planner's refusal; `layer_only`
   in `oracle.py` classes both as a refusal, not compared. Any other statement
   PostgreSQL runs that the layer refuses is 42601
@@ -92,7 +92,15 @@ The rules, by what they test.
   columns, NOT NULL and nullable columns, and DEFAULT literals. Refused
   variants: an existing name, a duplicate column, a primary key naming no
   column, and two primary keys (on two columns, or on a column and the
-  table).
+  table). A table without a primary key, which both take, is dropped
+  again: this machine reaches a table by its key.
+- **Tables without a primary key** have a machine of their own
+  (`KeylessMachine`): CREATE and DROP TABLE, INSERT weighted towards copies
+  of rows the table holds, UPDATE, DELETE and SELECT with no `WHERE` or `col
+  = $n` on a column no filter refuses, COUNT(*) per group, and a reopen.
+  With no key to order rows by, each table and each result compares as a
+  bag of rows. A fixed case inserts across a reopen, which the bounded
+  profile may not reach (`test_a_table_without_a_primary_key_keeps_duplicates_across_a_reopen`).
 - **DROP TABLE**, with and without `IF EXISTS`.
 - **INSERT**, weighted towards duplicate keys, NULLs, left-out NOT NULL
   columns (a primary key column among them) and values outside their
