@@ -24,7 +24,7 @@ These instructions apply to every repository work request in this workspace.
 ## Required workflow for every implementation request
 
 1. Update `docs/bytecask_design.md` to reflect any behavior, architecture, constraints, or invariants changed by the work. If a guarantee changes, update the row in `CONTRACT.md` with the test that proves it, and name the change in the PR description: added, widened, narrowed or removed. Work on the SQL layer updates its own documents instead: `bytecaskdb-sql-layer/docs/` and `bytecaskdb-sql-layer/CONTRACT.md`, not the engine's design doc and contract.
-2. Track any follow-up work as a GitHub issue. Don't open an issue for the PR's own task — the PR is its own record; use an issue when work is being deferred, discovered mid-implementation, or otherwise won't be covered by a PR opened now.
+2. Finish the work in the PR that finds it. Work discovered mid-implementation, a review finding, or a gap a test exposes belongs to the current PR, not to an issue. If it seems too large or out of place there, say so and ask; the owner decides.
 3. Update the root `README.md` only when the project's pitch changes: a headline feature, a headline number, or the quick-start path. (`bytecaskdb-sql-layer/README.md` is the exception: it is that layer's status page, updated with every feature, per `bytecaskdb-sql-layer/CLAUDE.md`.) A feature added or changed goes in the Features section of `docs/bytecask_design.md`; API changes go in `docs/api_reference.md`; performance figures go in `docs/performance.md`. The README is an entry point and stays short (`scripts/check_readme_size.py` fails CI past its limit). It targets an external audience — avoid internal implementation details; focus on user-visible characteristics and behavior.
 4. Always validate design before moving to implementation
 5. After design approval, move to the implementation
@@ -34,10 +34,10 @@ These instructions apply to every repository work request in this workspace.
 
 ## Issue tracking rules
 
-GitHub Issues are the repository's task tracker, for work not already captured by an open PR.
+GitHub Issues are the repository's task tracker, and the owner decides what goes in it.
 
-- Track follow-up work as GitHub issues rather than in a repo file. Don't open one just to mirror a PR that's already tracking its own task.
-- Add follow-up work discovered during implementation as a new issue.
+- Open an issue only when the owner asks for one. "Out of scope", "a follow-up" or "deferred" is not a reason to open one on your own: an issue filed instead of doing the work postpones it.
+- Never track work in a repo file instead.
 
 ## Benchmarking rules
 
@@ -45,13 +45,13 @@ GitHub Issues are the repository's task tracker, for work not already captured b
 - A performance claim in `bytecaskdb-sql-layer` **must** include before/after numbers from `sql_layer_bench`, which prints them rather than writing a CSV (`xmake f -m releasedbg --sql_layer=y && xmake build sql_layer_bench && xmake run sql_layer_bench`); `engine_bench` does not apply to a change that leaves the engine untouched (owner decision, 2026-10-19).
 - Run `python3 scripts/run_map_bench.py` (records to `benchmarks/map_bench_results.csv`, also gitignored) only when making changes to a key directory tree: `blind_btree` or `btree`.
 - Show the before/after CSV rows to the user as evidence of improvement.
-- If benchmarks cannot be run, state why clearly and record the blocker in the PR description or a GitHub issue.
+- If benchmarks cannot be run, state why clearly and record the blocker in the PR description.
 
 ## Testing rules
 
 - Prefer the narrowest test coverage that proves the change.
 - If the repository does not yet have the necessary test seam, create the smallest practical test harness first.
-- If tests cannot be run, state why clearly and record the blocker in the PR description or a GitHub issue.
+- If tests cannot be run, state why clearly and record the blocker in the PR description.
 
 ### Engine tests (`tests/`)
 
