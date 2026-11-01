@@ -350,14 +350,17 @@ auto alloc_limited(const RunLimits &l) -> bool {
   return l.as_headroom > 0 || r.rlim_cur < r.rlim_max;
 }
 
+// The file limit goes first: counting the open files allocates, and under
+// the address-space limit that count could fail with ENOMEM before the life
+// starts, a failure of the rig rather than of the engine.
 void apply_run_limits(const RunLimits &l) {
-  if (l.as_headroom > 0)
-    set_soft_limit(RLIMIT_AS, current_vm_bytes() + l.as_headroom);
   if (l.nofile_headroom > 0) {
     const auto open_fds = static_cast<std::uint64_t>(std::distance(
         fs::directory_iterator{"/proc/self/fd"}, fs::directory_iterator{}));
     set_soft_limit(RLIMIT_NOFILE, open_fds + l.nofile_headroom);
   }
+  if (l.as_headroom > 0)
+    set_soft_limit(RLIMIT_AS, current_vm_bytes() + l.as_headroom);
 }
 
 auto run_open(bytecask::DB &db_ref, Channel &ch, const Config &cfg,

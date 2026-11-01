@@ -4184,33 +4184,30 @@ TEST_CASE("recovery keeps the full file over a copy of its prefix",
 // writes, not a copy. Recovery refuses them and deletes nothing.
 TEST_CASE("recovery refuses two different writes under one sequence",
           "[vacuum][recovery]") {
-  using Write = std::function<void(bytecask::DB &)>;
-  const auto put = [](std::string k, std::string v) -> Write {
-    return [k, v](bytecask::DB &db) { db.put({}, to_bytes(k), to_bytes(v)); };
-  };
-  const auto del = [](std::string k) -> Write {
-    return [k](bytecask::DB &db) { (void)db.del({}, to_bytes(k)); };
-  };
-  // Sequence 1 is the same write in both; sequence 2 differs.
-  const auto [what, second_a, second_b] =
-      GENERATE_COPY(table<std::string, Write, Write>({
-          {"value", put("key", "aaaa"), put("key", "bbbb")},
-          {"key", put("key", "aaaa"), put("kez", "aaaa")},
-          {"type", put("key", "aaaa"), del("key")},
-      }));
+  using bytecask::EntryType;
+  using V = bytecask::DataEntryView;
+  const auto key = to_bytes("key");
+  const auto kez = to_bytes("kez");
+  const auto aaaa = to_bytes("aaaa");
+  const auto bbbb = to_bytes("bbbb");
+  // Sequence 1 is the same write in both; sequence 2 differs. Each copy is a
+  // follower fed one slice, so neither holds a change marker of its own: a
+  // leader's open would write one with a random id, and the copies would
+  // already differ there.
+  const std::string what = GENERATE("value", "key", "type");
+  const V second_a{2, EntryType::Put, key, aaaa};
+  const V second_b = what == "value" ? V{2, EntryType::Put, key, bbbb}
+                     : what == "key" ? V{2, EntryType::Put, kez, aaaa}
+                                     : V{2, EntryType::Delete, key, {}};
   INFO("the second writes differ in " << what);
   TempDir td;
   const auto a = td.path / "a";
   const auto b = td.path / "b";
-  {
-    auto db = bytecask::DB::open(a);
-    db.put({}, to_bytes("key"), to_bytes("0000"));
-    second_a(db);
-  }
-  {
-    auto db = bytecask::DB::open(b);
-    db.put({}, to_bytes("key"), to_bytes("0000"));
-    second_b(db);
+  const auto zeros = to_bytes("0000");
+  for (const auto &[dir, second] : {std::pair{a, second_a}, std::pair{b, second_b}}) {
+    auto db = bytecask::DB::open(dir, {.initial_mode = bytecask::Mode::Follower});
+    const std::vector<V> slice{{1, EntryType::Put, key, zeros}, second};
+    db.ingest(bytecask::ChangeHeader{}, slice);
   }
   for (const auto &e : std::filesystem::directory_iterator{b}) {
     const auto ext = e.path().extension();
