@@ -541,7 +541,7 @@ PostgreSQL also checks the server's mapping. The mapping:
 | `BC_C_NOT_NULL` | `23502` |
 | `BC_C_RANGE`, by the check that failed | `22003` (`smallint`/`integer`/`numeric field overflow`/`REAL`), `22001` (`VARCHAR` too long), `22021` (encoding), `22008` (datetime) |
 | `BC_E_LIMIT` | `54000` |
-| `BC_E_ARITH` | `22003`. The subset has no division; adding one adds `22012` for division by zero |
+| `BC_E_ARITH` | `22003`. The subset has no division in a plan; the front end folds `/` of constants, and a zero divisor there is `22012` |
 | `SerializationFailure`, a conflict on every retry, `DdlInProgress` | `40001` |
 | `TransactionResolutionUnknown` | `08007` |
 | `TransactionAborted` | `25P02` |

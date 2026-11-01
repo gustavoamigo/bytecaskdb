@@ -70,20 +70,21 @@ struct Select;
 enum class ValueCompare { Eq, Ne, Lt, Le, Gt, Ge };
 
 // A select-list, SET or comparison operand: a column, a parameter, a
-// literal (an integer within BIGINT after + or - is a Const), a sum or
-// difference of two, unary + or - of one, a comparison of two, a cast of
+// literal (an integer within BIGINT after + or - is a Const), a sum,
+// difference, product or quotient of two, unary + or - of one, a comparison of two, a cast of
 // one (DATE '…' and '…'::date alike), an aggregate: COUNT(*),
 // COUNT([DISTINCT] column), SUM, MIN, MAX or AVG of a column; or a scalar
-// subquery, (SELECT …), the value of its one row.
+// subquery, (SELECT …), the value of its one row; or, in a select list only,
+// * or `table`.*, which the binder expands to columns.
 struct Expr {
-  enum class Kind { Column, Param, Const, Literal, Add, Sub, Plus, Neg, Compare, Cast, Aggregate, Subquery };
+  enum class Kind { Column, Param, Const, Literal, Add, Sub, Mul, Div, Star, Plus, Neg, Compare, Cast, Aggregate, Subquery };
   enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind;
   std::string column;       // Column; Aggregate's argument, "" for COUNT(*)
   std::uint32_t param{0};   // Param: zero-based ($1 is 0)
-  std::unique_ptr<Expr> lhs, rhs;  // Add, Sub, Compare; Plus, Neg and Cast: rhs
+  std::unique_ptr<Expr> lhs, rhs;  // Add, Sub, Mul, Div, Compare; Plus, Neg and Cast: rhs
   std::int32_t pos{-1};
-  std::string table;          // Column, Aggregate: the table it is qualified by, "" for none
+  std::string table;          // Column, Aggregate, Star: the table it is qualified by, "" for none
   std::int64_t constant{0};   // Const: an integer literal (Add and Sub's right operand only)
   Fn fn{Fn::Count};           // Aggregate
   bool distinct{false};       // Aggregate: COUNT(DISTINCT column)
