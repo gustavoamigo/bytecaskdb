@@ -79,6 +79,13 @@ enum class Change : std::uint8_t { Unchanged, Changed, Unknown };
 auto change_if(bool changed) noexcept -> Change {
   return changed ? Change::Changed : Change::Unchanged;
 }
+
+// The delete log's answer: no answer when the read point is below its
+// horizon.
+auto change_of(std::optional<bool> removed) noexcept -> Change {
+  if (!removed) return Change::Unknown;
+  return change_if(*removed);
+}
 } // namespace
 
 // A plan without a base: only ensure_present and ensure_absent, which
@@ -183,8 +190,7 @@ public:
                              std::size_t /*write_index*/) const -> Change {
     if (cur) return change_if(cur->sequence() > read_seq_);
     if (head_.removed_.removes(key)) return Change::Changed;
-    if (!deletes_.covers(read_seq_)) return Change::Unknown;
-    return change_if(deletes_.removed(key, read_seq_, head_.next_seq_));
+    return change_of(deletes_.removed(key, read_seq_, head_.next_seq_));
   }
 
   [[nodiscard]] auto range_changed(std::span<const std::byte> from,
@@ -204,8 +210,7 @@ public:
     // no entry to carry a sequence, so a retry has to see the head's latest.
     rests_on = head_.next_seq_ - 1;
     if (head_.removed_.removes_any_in(from, to)) return Change::Changed;
-    if (!deletes_.covers(read_seq_)) return Change::Unknown;
-    return change_if(
+    return change_of(
         deletes_.removed_in(from, to, read_seq_, head_.next_seq_));
   }
 

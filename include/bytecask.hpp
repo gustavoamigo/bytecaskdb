@@ -602,7 +602,7 @@ public:
   void resume();
 
   [[nodiscard]] auto snapshot() const -> Snapshot;
-  // A read sequence past the latest throws std::invalid_argument.
+  // A refused plan (PlanRefusal) is returned, not thrown; nothing is written.
   [[nodiscard]] auto apply_batch(WriteOptions opts, WritePlan plan)
       -> ApplyResult;
 

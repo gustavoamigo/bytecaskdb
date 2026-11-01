@@ -40,6 +40,7 @@ module;
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -275,19 +276,15 @@ public:
     staged.last_seq_ = 0;
   }
 
-  // Whether a plan read at read_seq can be checked: every delete above it is
-  // still here.
-  [[nodiscard]] auto covers(std::uint64_t read_seq) const -> bool {
-    std::lock_guard<std::mutex> lk{mu_};
-    return read_seq >= horizon_;
-  }
-
   // Whether a delete above read_seq and below `below` named key. `below` is
   // the next sequence of the state being checked: deletes a later state made
-  // are not part of it.
+  // are not part of it. nullopt when read_seq is below the horizon: a delete
+  // above it may have been dropped. The horizon is read under the same lock
+  // as the deletes, so a record() that drops some cannot fall between them.
   [[nodiscard]] auto removed(ByteView key, std::uint64_t read_seq,
-                             std::uint64_t below) const -> bool {
+                             std::uint64_t below) const -> std::optional<bool> {
     std::lock_guard<std::mutex> lk{mu_};
+    if (read_seq < horizon_) return std::nullopt;
     if (key_removed_locked(key, read_seq, below)) return true;
     // The key's latest range delete answers alone unless it is at or above
     // `below`; then an earlier one may still fall in the window.
@@ -299,12 +296,14 @@ public:
   }
 
   // Whether a delete above read_seq and below `below` named a key in
-  // [from, to). The cost is the deletes logged inside the range, not every
-  // delete since read_seq.
+  // [from, to); nullopt below the horizon, as for removed(). The cost is the
+  // deletes logged inside the range, not every delete since read_seq.
   [[nodiscard]] auto removed_in(ByteView from, ByteView to,
                                 std::uint64_t read_seq,
-                                std::uint64_t below) const -> bool {
+                                std::uint64_t below) const
+      -> std::optional<bool> {
     std::lock_guard<std::mutex> lk{mu_};
+    if (read_seq < horizon_) return std::nullopt;
     auto past_below = false;
     for (auto it = latest_.lower_bound(from); it != latest_.end(); ++it) {
       if (!byte_less(it->first, to)) break;

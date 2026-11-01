@@ -634,12 +634,14 @@ public:
   // unchanged since that base, by the base's rules:
   //   a snapshot  its entry for the key equals this state's (absent in both
   //               counts as equal);
-  //   a sequence R  a present key's entry is at or below R; an absent key
-  //               has no removal above R in `deletes`, or staged by this
-  //               transient (always above R: staged removals are newer than
-  //               any published state). TooOld when `deletes` no longer
-  //               covers R. Without a read
-  // sequence, only ensure_present / ensure_absent are checked.
+  //   a read point (R, M)  TooOld unless R is below this state's next
+  //               sequence and its marker at R is M. Then a present key's
+  //               entry is at or below R, exactly, at any age; an absent
+  //               key has no removal above R staged by this transient
+  //               (always above R: staged removals are newer than any
+  //               published state) or in `deletes`. TooOld only when that
+  //               last answer is needed and R is below the log's horizon.
+  // Without a base, only ensure_present / ensure_absent are checked.
   //
   // rests_on is the head entry the outcome rests on. On failure, the entry
   // the plan lost to — what a retry has to be able to see. On success, the
@@ -1269,13 +1271,12 @@ public:
   [[nodiscard]] auto snapshot() const -> Snapshot;
 
   // Applies plan atomically iff all guards pass and no written key changed
-  // since the plan's read sequence. Returns PlanRefusal::Conflict when a
-  // guard failed or the implicit W-W check found a change, and
-  // PlanRefusal::TooOld when the read sequence is older than the log of
-  // recent deletes covers — nothing was written either way. A guardless
-  // plan without a read sequence always commits. An empty plan commits as
-  // a no-op, returning {sequence = 0, durable = true}. A read sequence at or
-  // above the next sequence throws std::invalid_argument.
+  // since the plan's base. Returns PlanRefusal::Conflict when a guard failed
+  // or the implicit W-W check found a change, and PlanRefusal::TooOld when
+  // a read point cannot be checked: read on another history, at or past the
+  // next sequence, or needing deletes the log no longer holds. Nothing is
+  // written either way. A guardless plan without a base always commits. An
+  // empty plan commits as a no-op, returning {sequence = 0, durable = true}.
   // Throws std::system_error on I/O failure or lock contention (try_lock).
   [[nodiscard]] auto apply_batch(WriteOptions opts, WritePlan plan)
       -> std::expected<CommitResult, PlanRefusal>;
@@ -1832,8 +1833,10 @@ private:
   SizeLimits size_limits_;
   std::size_t scratch_bytes_;
   // Keys recent writes removed, for checking plans by read sequence.
-  // Written under write_mu_ (apply_writes); reset at open, resume() and
-  // ingest, which change keys without recording their removals.
+  // Recorded by execute_group under write_mu_ once a group is appended, and
+  // reset at open, resume() and ingest, which change keys without recording
+  // their removals. settle_unappended reads it without write_mu_: its own
+  // mutex is what makes that safe.
   DeleteLog deletes_;
   mutable Counters counters_;
   // Bookmarks for changes_since to enter a file near from_sequence (#443).
@@ -1997,8 +2000,9 @@ public:
   Snapshot &operator=(Snapshot &&) noexcept = default;
 
   // The sequence of the last write this snapshot sees: every write at or
-  // below it, and none above. A plan built from it (WritePlan(sequence))
-  // is checked against it without holding the snapshot. A moved-from
+  // below it, and none above. With marker(), the read point of a plan
+  // built from it (WritePlan(sequence(), marker())), which is checked
+  // against it without holding the snapshot. A moved-from
   // snapshot names no state: std::logic_error.
   [[nodiscard]] auto sequence() const -> std::uint64_t {
     return named_state().next_seq - 1;

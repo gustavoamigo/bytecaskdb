@@ -61,10 +61,10 @@ TEST_CASE("delete log: a del names its key inside the window only",
           "[delete_log]") {
   bytecask::DeleteLog log{kBig};
   del(log, "k", 20);
-  CHECK(log.removed(b("k"), 10, 100));
-  CHECK_FALSE(log.removed(b("k"), 20, 100));  // at or below the read
-  CHECK_FALSE(log.removed(b("j"), 10, 100));  // another key
-  CHECK_FALSE(log.removed(b("k"), 10, 20));   // a later state's delete
+  CHECK(log.removed(b("k"), 10, 100) == true);
+  CHECK(log.removed(b("k"), 20, 100) == false);  // at or below the read
+  CHECK(log.removed(b("j"), 10, 100) == false);  // another key
+  CHECK(log.removed(b("k"), 10, 20) == false);   // a later state's delete
 }
 
 TEST_CASE("delete log: a key deleted again past the state checked still answers from its earlier delete",
@@ -74,22 +74,22 @@ TEST_CASE("delete log: a key deleted again past the state checked still answers 
   del(log, "other", 30);
   del(log, "k", 40);
   // The latest delete of k is past `below`; the earlier one is in the window.
-  CHECK(log.removed(b("k"), 10, 35));
-  CHECK_FALSE(log.removed(b("k"), 25, 35));
-  CHECK(log.removed_in(b("j"), b("l"), 10, 35));
-  CHECK_FALSE(log.removed_in(b("j"), b("l"), 25, 35));
+  CHECK(log.removed(b("k"), 10, 35) == true);
+  CHECK(log.removed(b("k"), 25, 35) == false);
+  CHECK(log.removed_in(b("j"), b("l"), 10, 35) == true);
+  CHECK(log.removed_in(b("j"), b("l"), 25, 35) == false);
 }
 
 TEST_CASE("delete log: a del_range names every key it covers",
           "[delete_log]") {
   bytecask::DeleteLog log{kBig};
   del_range(log, "c", "f", 20);
-  CHECK(log.removed(b("c"), 10, 100));
-  CHECK(log.removed(b("e9"), 10, 100));
-  CHECK_FALSE(log.removed(b("b"), 10, 100));  // before from
-  CHECK_FALSE(log.removed(b("f"), 10, 100));  // to is exclusive
-  CHECK_FALSE(log.removed(b("d"), 20, 100));  // at or below the read
-  CHECK_FALSE(log.removed(b("d"), 10, 20));   // a later state's delete
+  CHECK(log.removed(b("c"), 10, 100) == true);
+  CHECK(log.removed(b("e9"), 10, 100) == true);
+  CHECK(log.removed(b("b"), 10, 100) == false);  // before from
+  CHECK(log.removed(b("f"), 10, 100) == false);  // to is exclusive
+  CHECK(log.removed(b("d"), 20, 100) == false);  // at or below the read
+  CHECK(log.removed(b("d"), 10, 20) == false);   // a later state's delete
 }
 
 TEST_CASE("delete log: a range query finds the deletes that overlap it",
@@ -97,15 +97,15 @@ TEST_CASE("delete log: a range query finds the deletes that overlap it",
   bytecask::DeleteLog log{kBig};
   del(log, "k", 20);
   del_range(log, "c", "f", 30);
-  CHECK(log.removed_in(b("j"), b("l"), 10, 100));   // the del
-  CHECK_FALSE(log.removed_in(b("l"), b("z"), 10, 100));
-  CHECK_FALSE(log.removed_in(b("j"), b("l"), 20, 100));
-  CHECK(log.removed_in(b("a"), b("d"), 25, 100));   // the range, from below
-  CHECK(log.removed_in(b("e"), b("g"), 25, 100));   // the range, from above
-  CHECK_FALSE(log.removed_in(b("a"), b("c"), 25, 100));  // ends at its from
-  CHECK_FALSE(log.removed_in(b("f"), b("g"), 25, 100));  // starts at its to
-  CHECK_FALSE(log.removed_in(b("a"), b("z"), 30, 100));  // all at or below
-  CHECK_FALSE(log.removed_in(b("a"), b("z"), 10, 20));   // all later
+  CHECK(log.removed_in(b("j"), b("l"), 10, 100) == true);   // the del
+  CHECK(log.removed_in(b("l"), b("z"), 10, 100) == false);
+  CHECK(log.removed_in(b("j"), b("l"), 20, 100) == false);
+  CHECK(log.removed_in(b("a"), b("d"), 25, 100) == true);   // the range, from below
+  CHECK(log.removed_in(b("e"), b("g"), 25, 100) == true);   // the range, from above
+  CHECK(log.removed_in(b("a"), b("c"), 25, 100) == false);  // ends at its from
+  CHECK(log.removed_in(b("f"), b("g"), 25, 100) == false);  // starts at its to
+  CHECK(log.removed_in(b("a"), b("z"), 30, 100) == false);  // all at or below
+  CHECK(log.removed_in(b("a"), b("z"), 10, 20) == false);   // all later
 }
 
 TEST_CASE("delete log: past its budget the oldest delete goes first, point or range",
@@ -118,7 +118,8 @@ TEST_CASE("delete log: past its budget the oldest delete goes first, point or ra
     del_range(log, "b", "c", 20);
     del(log, "d", 30);
     CHECK(log.horizon() >= 10);
-    CHECK_FALSE(log.covers(9));
+    CHECK_FALSE(log.removed(b("a"), 9, 100).has_value());
+    CHECK_FALSE(log.removed_in(b("a"), b("z"), 9, 100).has_value());
     CHECK(log.bytes() <= 2 * one);
   }
   SECTION("an older del_range before a newer del") {
@@ -135,8 +136,8 @@ TEST_CASE("delete log: past its budget the oldest delete goes first, point or ra
     del(log, "a", 20);
     del(log, "b", 30);
     CHECK(log.horizon() >= 20);
-    CHECK(log.covers(log.horizon()));
-    CHECK_FALSE(log.removed(b("a"), log.horizon(), 100));
+    CHECK(log.removed(b("a"), log.horizon(), 100).has_value());
+    CHECK(log.removed(b("a"), log.horizon(), 100) == false);
   }
   SECTION("del_ranges only") {
     bytecask::DeleteLog log{one};
@@ -156,8 +157,10 @@ TEST_CASE("delete log: with no budget nothing is kept and every delete raises th
   del_range(log, "a", "z", 30);
   CHECK(log.bytes() == 0);
   CHECK(log.horizon() == 30);
-  CHECK_FALSE(log.covers(29));
-  CHECK(log.covers(30));
+  CHECK_FALSE(log.removed(b("k"), 29, 100).has_value());
+  CHECK(log.removed(b("k"), 30, 100) == false);
+  CHECK_FALSE(log.removed_in(b("a"), b("z"), 29, 100).has_value());
+  CHECK(log.removed_in(b("a"), b("z"), 30, 100) == false);
 }
 
 TEST_CASE("delete log: reset forgets every delete and raises the horizon",
@@ -168,7 +171,8 @@ TEST_CASE("delete log: reset forgets every delete and raises the horizon",
   log.reset(40);
   CHECK(log.bytes() == 0);
   CHECK(log.horizon() == 40);
-  CHECK_FALSE(log.removed(b("k"), 10, 100));
+  CHECK_FALSE(log.removed(b("k"), 10, 100).has_value());  // forgotten
+  CHECK(log.removed(b("k"), 40, 100) == false);
   log.reset(5);  // never lowers it
   CHECK(log.horizon() == 40);
 }
@@ -196,8 +200,8 @@ TEST_CASE("staged removals: a group's later slots see its earlier deletes",
   log.record(staged);
   CHECK(staged.empty());
   CHECK_FALSE(staged.removes(b("k")));
-  CHECK(log.removed(b("k"), 10, 100));
-  CHECK(log.removed(b("d"), 10, 100));
+  CHECK(log.removed(b("k"), 10, 100) == true);
+  CHECK(log.removed(b("d"), 10, 100) == true);
 }
 
 TEST_CASE("staged removals: a key deleted twice in a group is logged by its later delete",
@@ -208,8 +212,8 @@ TEST_CASE("staged removals: a key deleted twice in a group is logged by its late
   staged.add_key(b("k"), 22);
   bytecask::DeleteLog log{kBig};
   log.record(staged);
-  CHECK(log.removed(b("k"), 21, 100));
-  CHECK_FALSE(log.removed(b("j"), 21, 100));
+  CHECK(log.removed(b("k"), 21, 100) == true);
+  CHECK(log.removed(b("j"), 21, 100) == false);
 }
 
 TEST_CASE("staged removals: a group is logged in sequence order, not key order",
@@ -223,7 +227,7 @@ TEST_CASE("staged removals: a group is logged in sequence order, not key order",
   log.record(staged);
   del(log, "m", 30);
   CHECK(log.horizon() == 20);
-  CHECK(log.removed(b("a"), 20, 100));
+  CHECK(log.removed(b("a"), 20, 100) == true);
 }
 
 TEST_CASE("range segments: a stamp covers its keys and replaces older stamps where it lies",
@@ -327,7 +331,13 @@ TEST_CASE("delete log: answers like a list of every delete, whatever the budget"
     boundaries.push_back(seq + 1);
     for (int q = 0; q < 8; ++q) {
       const auto read_seq = std::uniform_int_distribution<std::uint64_t>{0, seq}(rng);
-      if (!log.covers(read_seq)) continue;
+      if (read_seq < log.horizon()) {
+        // Below the horizon a delete in the window may have been dropped:
+        // no answer, rather than a wrong one.
+        CHECK_FALSE(log.removed(b(pick()), read_seq, seq + 1).has_value());
+        CHECK_FALSE(log.removed_in(b("a"), b("~"), read_seq, seq + 1).has_value());
+        continue;
+      }
       const auto later = std::ranges::upper_bound(boundaries, read_seq);
       const auto below = *std::next(
           later, std::uniform_int_distribution<std::ptrdiff_t>{
