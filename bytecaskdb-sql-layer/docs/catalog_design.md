@@ -194,6 +194,32 @@ which is the whole primary key.
   would conflict, and it would be state outside the rows that has to
   agree with them.
 
+## UNIQUE constraints
+
+A `UNIQUE` constraint, on a column or on the table, is a unique index on
+its columns, created with the table in the `CREATE TABLE`'s batch, so the
+table never exists without it. There is no constraint object: the index is
+the constraint. The catalog takes the constraints as PostgreSQL's
+`transformIndexConstraints` does:
+
+- each column must be the table's and named once (42703 "column … named in
+  key does not exist", 42701 "… appears twice in unique constraint"),
+  checked before the table's own name is (42P07);
+- one on the primary key's columns, in order, is the key, and makes no
+  index; one on an earlier one's columns, in order, is that index, which
+  takes its name if it had none;
+- a named one's index has its name, refused (42P07) where a relation, the
+  table itself or an earlier constraint has it;
+- an unnamed one's is named as PostgreSQL's `ChooseIndexName` names it:
+  `table_col1_col2_key`, within 63 bytes, the longer of the table and the
+  column part shortened first and each clipped to a UTF-8 character, then
+  `key1`, `key2`… where a relation, or an index named earlier in the
+  statement, has the name.
+
+`NULLS NOT DISTINCT`, `INCLUDE`, `DEFERRABLE` and `ADD COLUMN … UNIQUE` are
+refused, not yet built. A constraint's index is an index like any other:
+`DROP INDEX` drops it (*Known differences* in `frontend_design.md`).
+
 ## The in-memory form
 
 `Catalog` is immutable: the tables by id and by name, each index's table,
@@ -286,7 +312,7 @@ disk and in memory, as it was.
 
 | Statement | Batch |
 |---|---|
-| `CREATE TABLE` | Record, name entry (`ensure_absent`), counters. Two ids: the table and its first layout. The bitmap is sized as the row format says. Without a primary key, the record holds the hidden row id (*Tables without a primary key*). A table of no columns is refused (0A000); PostgreSQL takes one. |
+| `CREATE TABLE` | Record, name entry (`ensure_absent`), counters. Two ids: the table and its first layout. The bitmap is sized as the row format says. Without a primary key, the record holds the hidden row id (*Tables without a primary key*). Each `UNIQUE` constraint is a unique index in the same record and batch, with its own name entry (*UNIQUE constraints*). A table of no columns is refused (0A000); PostgreSQL takes one. |
 | `CREATE [UNIQUE] INDEX … (col [DESC], …)` | Record with the index, name entry (`ensure_absent`), counters, an entry per existing row, `ensure_range_unchanged` over the table's rows. A unique index whose rows already hold a duplicate is refused. |
 | `DROP TABLE` | Record and name entries deleted; `del_range` over `02 <table_id>` and over `03 <index_id>` per index. |
 | `DROP INDEX` | Record without the index, name entry deleted, `del_range` over `03 <index_id>`. |

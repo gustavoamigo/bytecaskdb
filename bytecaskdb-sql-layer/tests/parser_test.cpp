@@ -84,6 +84,22 @@ TEST_CASE("parser: the seven statements of the prototype", "[sql][parser]") {
   }
 }
 
+TEST_CASE("parser: UNIQUE on a column or the table, in the order written", "[sql][parser]") {
+  auto t = std::get<CreateTable>(parse("CREATE TABLE u (a INT UNIQUE, b INT CONSTRAINT bu UNIQUE, "
+                                       "CONSTRAINT ab UNIQUE (a, b), UNIQUE (b))"));
+  REQUIRE(t.unique.size() == 4);
+  CHECK((t.unique[0].name.empty() && t.unique[0].columns == std::vector<std::string>{"a"}));
+  CHECK((t.unique[1].name == "bu" && t.unique[1].columns == std::vector<std::string>{"b"}));
+  CHECK((t.unique[2].name == "ab" && t.unique[2].columns == std::vector<std::string>{"a", "b"}));
+  CHECK((t.unique[3].name.empty() && t.unique[3].columns == std::vector<std::string>{"b"}));
+  CHECK(t.columns[0].unique == std::vector<std::string>{""});
+  for (auto sql : {"CREATE TABLE u (a INT UNIQUE NULLS NOT DISTINCT)", "CREATE TABLE u (a INT, b INT, UNIQUE (a) INCLUDE (b))",
+                   "CREATE TABLE u (a INT UNIQUE DEFERRABLE)", "CREATE TABLE u (a INT, CHECK (a > 0))"}) {
+    INFO(sql);
+    CHECK_THROWS_AS(parse(sql), SqlError);
+  }
+}
+
 TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql][parser]") {
   //                    0         1         2         3
   //                    0123456789012345678901234567890123456789

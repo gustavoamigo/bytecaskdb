@@ -242,6 +242,15 @@ auto literal(const PgQuery__Node* n) -> Literal {
   reject("constant not supported", c->location);
 }
 
+// A UNIQUE constraint as a unique index takes it: none of NULLS NOT
+// DISTINCT, INCLUDE, DEFERRABLE, USING INDEX or index options yet.
+void plain_unique(const PgQuery__Constraint* c) {
+  if (c->nulls_not_distinct || c->n_including != 0 || c->deferrable || c->initdeferred || !empty(c->indexname) ||
+      !empty(c->indexspace) || c->n_options != 0) {
+    reject("UNIQUE with NULLS NOT DISTINCT, INCLUDE, DEFERRABLE, USING INDEX or options is not supported", c->location);
+  }
+}
+
 // Adds each PRIMARY KEY constraint on the column to `primary_keys`, so a
 // repeated one counts twice.
 auto column_def(const PgQuery__ColumnDef* cd, int& primary_keys) -> ColumnDefAst {
@@ -268,6 +277,9 @@ auto column_def(const PgQuery__ColumnDef* cd, int& primary_keys) -> ColumnDefAst
       col.not_null = true;
     } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_DEFAULT) {
       col.default_value = literal(c->raw_expr);
+    } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_UNIQUE) {
+      plain_unique(c);
+      col.unique.emplace_back(c->conname);
     } else if (c->contype != PG_QUERY__CONSTR_TYPE__CONSTR_NULL) {
       reject("column constraint not supported", c->location);
     }
@@ -290,6 +302,13 @@ auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos) -> CreateTable
     const auto* el = s->table_elts[i];
     if (el->node_case == PG_QUERY__NODE__NODE_CONSTRAINT) {
       const auto* c = el->constraint;
+      if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_UNIQUE) {
+        plain_unique(c);
+        UniqueAst u{c->conname, {}, c->location};
+        for (std::size_t k = 0; k < c->n_keys; ++k) u.columns.push_back(str(c->keys[k]));
+        t.unique.push_back(std::move(u));
+        continue;
+      }
       if (c->contype != PG_QUERY__CONSTR_TYPE__CONSTR_PRIMARY) reject("table constraint not supported", c->location);
       ++primary_keys;
       at_most_one(c->location);
@@ -299,6 +318,7 @@ auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos) -> CreateTable
     if (el->node_case != PG_QUERY__NODE__NODE_COLUMN_DEF) reject("table element not supported", -1);
     t.columns.push_back(column_def(el->column_def, primary_keys));
     at_most_one(t.columns.back().pos);
+    for (const auto& name : t.columns.back().unique) t.unique.push_back({name, {t.columns.back().name}, t.columns.back().pos});
   }
   return t;
 }

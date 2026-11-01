@@ -304,12 +304,21 @@ struct KeyLayout {
   std::size_t index_parts;     // how many of them precede the primary key
 };
 
+// A UNIQUE constraint of CREATE TABLE: its name, "" for one the catalog
+// chooses as PostgreSQL does, and its columns. It is a unique index.
+struct UniqueSpec {
+  std::string name;
+  std::vector<std::string> columns;
+};
+
 // The stage-1 DDL statements, as values: what LiveCatalog prepares.
-// A CREATE TABLE with no primary key gets a hidden row id as its key.
+// A CREATE TABLE with no primary key gets a hidden row id as its key; its
+// UNIQUE constraints are unique indexes created with it, in its batch.
 struct CreateTableDdl {
   std::string name;
   std::vector<ColumnSpec> columns;
   std::vector<std::string> pk;
+  std::vector<UniqueSpec> unique;
 };
 struct CreateIndexDdl {
   std::string name;
@@ -768,6 +777,50 @@ private:
 auto snapshot_version(const Snapshot& snap) -> std::uint64_t {
   Bytes v;
   return snap.get({}, counter_key(kCounterVersion), v) ? be_value(v) : 0;
+}
+
+// The bytes of the first `limit` of s that end on a UTF-8 character
+// (PostgreSQL's pg_mbcliplen).
+auto clip_utf8(std::string_view s, std::size_t limit) -> std::size_t {
+  while (limit > 0 && limit < s.size() && (static_cast<unsigned char>(s[limit]) & 0xC0) == 0x80) --limit;
+  return limit;
+}
+
+// PostgreSQL's name for an object it names (makeObjectName): name1_name2_label
+// within 63 bytes, the longer of name1 and name2 shortened first, each then
+// clipped to a character.
+auto object_name(std::string_view name1, std::string_view name2, std::string_view label) -> std::string {
+  constexpr std::size_t kMaxName = 63;  // PostgreSQL's NAMEDATALEN - 1
+  auto overhead = 1 + label.size() + 1;
+  auto avail = kMaxName - overhead;
+  auto n1 = name1.size();
+  auto n2 = name2.size();
+  while (n1 + n2 > avail) {
+    if (n1 > n2) {
+      --n1;
+    } else {
+      --n2;
+    }
+  }
+  return std::string{name1.substr(0, clip_utf8(name1, n1))} + "_" + std::string{name2.substr(0, clip_utf8(name2, n2))} +
+         "_" + std::string{label};
+}
+
+// The name PostgreSQL gives a UNIQUE constraint's index it names
+// (ChooseIndexName): table_columns_key, the columns joined by _, and key1,
+// key2… where the name is taken.
+template <typename Taken>
+auto unique_index_name(std::string_view table, const std::vector<std::string>& columns, const Taken& taken) -> std::string {
+  std::string name2;
+  for (const auto& c : columns) {
+    if (!name2.empty()) name2 += '_';
+    name2 += c;
+    if (name2.size() >= 64) break;
+  }
+  for (std::uint32_t pass = 0;; ++pass) {
+    auto name = object_name(table, name2, pass == 0 ? std::string{"key"} : "key" + std::to_string(pass));
+    if (!taken(name)) return name;
+  }
 }
 
 auto reserve_ids(std::uint64_t& next_id, std::uint32_t n) -> std::uint32_t {
@@ -1499,6 +1552,27 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
         throw DdlRefused("column \"" + p + "\" appears twice in the primary key", kDuplicateColumn);
       }
     }
+    // The UNIQUE constraints, as PostgreSQL takes them: each column present
+    // and named once. One on the primary key's columns, in order, is the
+    // key; one on an earlier one's is that index, which takes its name if it
+    // had none.
+    std::vector<UniqueSpec> unique;
+    for (const auto& u : ct->unique) {
+      for (const auto& c : u.columns) {
+        if (std::ranges::find(names, c) == names.end()) {
+          throw DdlRefused("column \"" + c + "\" named in key does not exist", kUndefinedColumn);
+        }
+        if (std::ranges::count(u.columns, c) > 1) {
+          throw DdlRefused("column \"" + c + "\" appears twice in unique constraint", kDuplicateColumn);
+        }
+      }
+      if (u.columns == ct->pk) continue;
+      if (auto prior = std::ranges::find(unique, u.columns, &UniqueSpec::columns); prior != unique.end()) {
+        if (prior->name.empty()) prior->name = u.name;
+        continue;
+      }
+      unique.push_back(u);
+    }
     name_free(name);
     if (ct->columns.empty()) throw DdlRefused("a table needs columns", kFeatureNotSupported);
     Table t;
@@ -1525,6 +1599,22 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     t.layout_id = t.id + 1;
     put_op(ops, DdlOp::Kind::EnsureAbsent, name_entry_key(name));
     put_op(ops, DdlOp::Kind::Put, name_entry_key(name), name_value(kKindTable, t.id));
+    // Each a unique index, named in order: as written, or as PostgreSQL
+    // chooses, past every relation name and the ones before it.
+    auto taken = [&](const std::string& n) {
+      return names_.contains(n) || n == t.name || std::ranges::contains(t.indexes, n, &Index::name);
+    };
+    for (const auto& u : unique) {
+      Index ix;
+      ix.name = u.name.empty() ? unique_index_name(t.name, u.columns, taken) : u.name;
+      if (taken(ix.name)) throw DdlRefused("relation \"" + ix.name + "\" already exists", kDuplicateTable);
+      ix.unique = true;
+      for (const auto& c : u.columns) ix.parts.push_back({t.column(c)->id, false});
+      ix.id = reserve_ids(next->next_id_, 1);
+      put_op(ops, DdlOp::Kind::EnsureAbsent, name_entry_key(ix.name));
+      put_op(ops, DdlOp::Kind::Put, name_entry_key(ix.name), name_value(kKindIndex, ix.id));
+      t.indexes.push_back(std::move(ix));
+    }
     put_op(ops, DdlOp::Kind::Put, table_record_key(t.id), serialize_table(t));
     next->put_table(std::move(t));
     return finish();

@@ -111,6 +111,7 @@ class Column:
     type: o.Type
     nullable: bool = True
     default: object = None  # None: no DEFAULT clause
+    unique: bool = False  # a UNIQUE column constraint
 
     def ddl(self, pg: bool, primary_key: bool = False) -> str:
         out = f"{self.name} {self.type.pg if pg else self.type.sql}"
@@ -118,6 +119,8 @@ class Column:
             out += " PRIMARY KEY"
         if not self.nullable:
             out += " NOT NULL"
+        if self.unique:
+            out += " UNIQUE"
         if self.default is not None:
             out += " DEFAULT " + o.literal(self.type, self.default)
         return out
@@ -1557,7 +1560,8 @@ KEYLESS_NAMES = ["k0", "k1"]
 
 class KeylessMachine(Sides, RuleBasedStateMachine):
     """Tables declared without a primary key, which PostgreSQL and the layer
-    both take: every row inserted is kept, duplicates included, and UPDATE,
+    both take: every row inserted is kept, duplicates included, but where a
+    UNIQUE column refuses them (23505), and UPDATE,
     DELETE, SELECT and GROUP BY reach them by full scans. Rows have no key
     to order them by, so a table, and each result, is compared as a bag of
     rows. Reopening the layer keeps the rows, and the inserts after it add
@@ -1634,8 +1638,11 @@ class KeylessMachine(Sides, RuleBasedStateMachine):
     def create_table(self, data):
         free = [n for n in KEYLESS_NAMES if n not in self.tables]
         n = data.draw(st.integers(1, 3), label="columns")
+        # Now and then UNIQUE: inserts copying a row, and UPDATEs giving rows
+        # one value, are then 23505 on both, NULLs never.
         cols = [Column(f"c{i}", data.draw(st.sampled_from(TYPES), label=f"c{i} type"),
-                       nullable=data.draw(st.booleans(), label=f"c{i} nullable")) for i in range(n)]
+                       nullable=data.draw(st.booleans(), label=f"c{i} nullable"),
+                       unique=data.draw(st.integers(0, 3), label=f"c{i} unique") == 0) for i in range(n)]
         t = Table(data.draw(st.sampled_from(free), label="name"), cols, [])
         if self.both(t.ddl(pg=False), pg_sql=t.ddl(pg=True)).error is None:
             self.tables[t.name] = t
@@ -1734,6 +1741,30 @@ def keyless_machine(dsn: str) -> type[KeylessMachine]:
 
 def test_keyless_machine(dsn):
     run_state_machine_as_test(keyless_machine(dsn))
+
+
+def test_a_unique_column_refuses_a_duplicate_and_takes_nulls(dsn):
+    """A UNIQUE constraint is a unique index: 23505 on both for a value a
+    row holds, by INSERT or UPDATE; any number of NULLs; -0.0 is 0.0."""
+    m = keyless_machine(dsn)()
+    try:
+        t = Table("k0", [Column("c0", o.INTEGER, unique=True), Column("c1", o.DOUBLE, unique=True)], [])
+        assert m.both(t.ddl(pg=False), pg_sql=t.ddl(pg=True)).error is None
+        m.tables[t.name] = t
+        ins = "INSERT INTO k0 VALUES ($1, $2)"
+        types = [o.INTEGER, o.DOUBLE]
+        assert m.both(ins, [1, 0.0], types=types).error is None
+        assert m.both(ins, [1, 1.0], types=types).error == "23505"
+        assert m.both(ins, [2, -0.0], types=types).error == "23505"
+        assert m.both(ins, [None, None], types=types).error is None
+        assert m.both(ins, [None, None], types=types).error is None
+        assert m.both(ins, [3, 3.0], types=types).error is None
+        assert m.both("UPDATE k0 SET c0 = 1 WHERE c0 = 3").error == "23505"
+        m.reopen()
+        assert m.both("INSERT INTO k0 VALUES (3, 4.0)").error == "23505"
+        m.check()
+    finally:
+        m.teardown()
 
 
 def test_a_table_without_a_primary_key_keeps_duplicates_across_a_reopen(dsn):

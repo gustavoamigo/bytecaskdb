@@ -684,6 +684,82 @@ TEST_CASE("catalog: CREATE TABLE refuses in PostgreSQL's order", "[sql][catalog]
   CHECK(state({"u", {col("c", SqlKind::BigInt)}, {}}) == "created");
 }
 
+TEST_CASE("catalog: UNIQUE constraints are unique indexes of the CREATE TABLE's batch, named as PostgreSQL names them",
+          "[sql][catalog]") {
+  sql_test::TempDir dir{"catalog_unique"};
+  auto db = DB::open(dir.path());
+  LiveCatalog live{db};
+  auto ints = [](std::vector<std::string> names) {
+    std::vector<ColumnSpec> out;
+    for (auto& n : names) out.push_back(col(std::move(n), SqlKind::Integer));
+    return out;
+  };
+  auto indexes = [&](std::string_view table) {
+    auto cat = live.current();
+    std::vector<std::pair<std::string, std::vector<std::uint32_t>>> out;
+    for (const auto& ix : cat->table(table)->indexes) {
+      CHECK(ix.unique);
+      std::vector<std::uint32_t> cols;
+      for (const auto& part : ix.parts) cols.push_back(part.col_id);
+      out.emplace_back(ix.name, cols);
+    }
+    return out;
+  };
+  using Named = std::vector<std::pair<std::string, std::vector<std::uint32_t>>>;
+  // a's, then (a, b)'s; a repeated one is the first, and one on the
+  // primary key's columns is the key.
+  (void)live.apply(CreateTableDdl{"u1", ints({"k", "a", "b"}), {"k"}, {{"", {"a"}}, {"", {"a", "b"}}, {"", {"a"}}, {"", {"k"}}}});
+  CHECK(indexes("u1") == Named{{"u1_a_key", {1}}, {"u1_a_b_key", {1, 2}}});
+  // A first unnamed one takes a repeat's name; column order matters.
+  (void)live.apply(CreateTableDdl{"u2", ints({"a", "b"}), {}, {{"", {"a"}}, {"named", {"a"}}, {"", {"b", "a"}}}});
+  CHECK(indexes("u2") == Named{{"named", {0}}, {"u2_b_a_key", {1, 0}}});
+  // A chosen name past every name taken, this statement's too.
+  (void)live.apply(CreateIndexDdl{"u3_a_key", "u1", {{"b"}}});
+  (void)live.apply(CreateTableDdl{"u3", ints({"a", "b"}), {}, {{"u3_a_key1", {"b"}}, {"", {"a"}}}});
+  CHECK(indexes("u3") == Named{{"u3_a_key1", {1}}, {"u3_a_key2", {0}}});
+  // Within 63 bytes: the longer part shortened first, clipped to a
+  // character.
+  auto long_table = std::string(60, 'x');
+  (void)live.apply(CreateTableDdl{long_table, ints({"aaaaaaaaaa"}), {}, {{"", {"aaaaaaaaaa"}}}});
+  CHECK(indexes(long_table)[0].first == std::string(48, 'x') + "_aaaaaaaaaa_key");
+  auto e = std::string{"\xc3\xa9"};  // é, two bytes
+  std::string wide_table, wide_col = "b";
+  for (int i = 0; i < 31; ++i) wide_table += e;
+  for (int i = 0; i < 20; ++i) wide_col += "\xc3\xbc";  // ü
+  (void)live.apply(CreateTableDdl{wide_table, ints({wide_col}), {}, {{"", {wide_col}}}});
+  auto wide = indexes(wide_table)[0].first;
+  CHECK(wide.size() <= 63);
+  CHECK(wide.substr(0, 28) == wide_table.substr(0, 28));  // 14 é, cut at a character
+  CHECK(wide.ends_with("_key"));
+
+  // Refusals, in PostgreSQL's order: the constraint's columns before a
+  // name in use, which a named constraint's name may also be.
+  auto state = [&](const CreateTableDdl& ddl) -> std::string {
+    try {
+      (void)live.apply(ddl);
+    } catch (const DdlRefused& err) {
+      return std::string{err.sqlstate()};
+    }
+    return "created";
+  };
+  CHECK(state({"u1", ints({"a"}), {}, {{"", {"z"}}}}) == "42703");
+  CHECK(state({"u9", ints({"a"}), {}, {{"", {"a", "a"}}}}) == "42701");
+  CHECK(state({"u9", ints({"a"}), {}, {{"u1", {"a"}}}}) == "42P07");
+  CHECK(state({"u9", ints({"a"}), {}, {{"u9", {"a"}}}}) == "42P07");  // its own table's name
+  CHECK(state({"u9", ints({"a", "b"}), {}, {{"", {"a"}}, {"u9_a_key", {"b"}}}}) == "42P07");
+  // A refused one writes nothing, its table included.
+  CHECK(live.current()->table("u9") == nullptr);
+  CHECK(live.current()->index("u9_a_key").first == nullptr);
+
+  // A duplicate is refused, NULLs are not duplicates, and all of it
+  // survives a reopen.
+  auto cat = live.current();
+  CHECK(cat->index("u1_a_b_key").first == cat->table("u1"));
+  LiveCatalog again{db};
+  CHECK(again.current()->table("u1")->indexes.size() == 3);  // its two constraints and u3_a_key
+  CHECK(again.current()->index("u3_a_key2").first != nullptr);
+}
+
 TEST_CASE("catalog: a DDL the engine refuses leaves nothing on disk or in memory", "[sql][catalog]") {
   sql_test::TempDir dir{"catalog_inject"};
   {
