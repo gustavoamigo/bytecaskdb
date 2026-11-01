@@ -642,7 +642,8 @@ auto drop(const PgQuery__DropStmt* s, std::int32_t pos) -> Statement {
   auto name = str(obj->list->items[0]);
   if (s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_TABLE) return DropTable{name, s->missing_ok != 0, pos};
   if (s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_INDEX) return DropIndex{name, s->missing_ok != 0, pos};
-  reject("only DROP TABLE and DROP INDEX are supported", pos);
+  if (s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_VIEW) return DropView{name, s->missing_ok != 0, pos};
+  reject("only DROP TABLE, DROP INDEX and DROP VIEW are supported", pos);
 }
 
 auto alter_table(const PgQuery__AlterTableStmt* s, std::int32_t pos) -> AddColumn {
@@ -669,6 +670,25 @@ auto insert(const PgQuery__InsertStmt* s, std::int32_t pos) -> Insert {
   const auto* row = sel->values_lists[0]->list;
   for (std::size_t i = 0; i < row->n_items; ++i) ins.values.push_back(expr(row->items[i]));
   return ins;
+}
+
+// CREATE VIEW name [(columns)] AS SELECT …: not OR REPLACE, TEMPORARY, view
+// options or a CHECK OPTION, which need updatable views.
+auto create_view(const PgQuery__ViewStmt* s, std::int32_t pos) -> CreateView {
+  auto name = from_relation(s->view);
+  if (s->replace || s->n_options != 0 || (!empty(s->view->relpersistence) && s->view->relpersistence[0] != 'p')) {
+    reject("CREATE VIEW takes no OR REPLACE, TEMPORARY or options", s->view->location);
+  }
+  if (s->with_check_option == PG_QUERY__VIEW_CHECK_OPTION__LOCAL_CHECK_OPTION ||
+      s->with_check_option == PG_QUERY__VIEW_CHECK_OPTION__CASCADED_CHECK_OPTION) {
+    reject("WITH CHECK OPTION is not supported: views are not updatable", s->view->location);
+  }
+  if (s->query == nullptr || s->query->node_case != PG_QUERY__NODE__NODE_SELECT_STMT) {
+    reject("a view is defined by a SELECT", pos);
+  }
+  std::vector<std::string> columns;
+  for (std::size_t i = 0; i < s->n_aliases; ++i) columns.push_back(str(s->aliases[i]));
+  return CreateView{std::move(name), std::move(columns), select(s->query->select_stmt, pos), pos};
 }
 
 // LIMIT: an integer constant, or ALL or NULL (no limit). A negative one is
@@ -915,6 +935,11 @@ auto parse(std::string_view sql) -> Statement {
   if (n->node_case == PG_QUERY__NODE__NODE_INDEX_STMT) return create_index(n->index_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_DROP_STMT) return drop(n->drop_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_ALTER_TABLE_STMT) return alter_table(n->alter_table_stmt, pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_VIEW_STMT) {
+    auto view = create_view(n->view_stmt, pos);
+    view.definition = std::string{sql};
+    return view;
+  }
   if (n->node_case == PG_QUERY__NODE__NODE_INSERT_STMT) return insert(n->insert_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_SELECT_STMT) return select(n->select_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_UPDATE_STMT) return update(n->update_stmt, pos);

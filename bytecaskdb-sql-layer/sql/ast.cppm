@@ -262,6 +262,45 @@ struct Select {
   JoinKind join_kind{JoinKind::Inner};
 };
 
+// A copy of c and of s, which own their operands. A subquery is shared:
+// it is never changed once parsed.
+[[nodiscard]] auto clone(const Compare& c) -> Compare {
+  Compare out{c.op, clone(c.lhs), clone(c.rhs), c.pos};
+  out.on = c.on;
+  out.kind = c.kind;
+  for (const auto& a : c.args) out.args.push_back(clone(a));
+  out.escape = c.escape;
+  out.subquery = c.subquery;
+  out.quantified = c.quantified;
+  out.all = c.all;
+  return out;
+}
+
+[[nodiscard]] auto clone(const Select& s) -> Select {
+  Select out{};
+  for (const auto& e : s.targets) {
+    out.targets.push_back(clone(e));
+    out.targets.back().alias = e.alias;
+  }
+  out.table = s.table;
+  out.join = s.join;
+  for (const auto& c : s.where) out.where.push_back(clone(c));
+  out.order_by = s.order_by;
+  out.limit = s.limit;
+  out.pos = s.pos;
+  out.for_update = s.for_update;
+  out.table_pos = s.table_pos;
+  out.join_pos = s.join_pos;
+  for (const auto& e : s.group_by) out.group_by.push_back(clone(e));
+  for (const auto& c : s.having) out.having.push_back(clone(c));
+  out.distinct = s.distinct;
+  out.using_columns = s.using_columns;
+  out.natural = s.natural;
+  out.using_alias = s.using_alias;
+  out.join_kind = s.join_kind;
+  return out;
+}
+
 struct Assignment {
   std::string column;
   Expr value;
@@ -281,8 +320,24 @@ struct Delete {
   std::int32_t pos{-1};
 };
 
+// CREATE VIEW name [(columns)] AS query. `query` is the SELECT as written;
+// the catalog stores the statement's text and parses it again at each use.
+struct CreateView {
+  std::string view;
+  std::vector<std::string> columns;  // the view's column names, empty: the query's own
+  Select query;
+  std::int32_t pos{-1};
+  std::string definition;  // the statement's text, set by parse()
+};
+
+struct DropView {
+  std::string view;
+  bool if_exists{false};
+  std::int32_t pos{-1};
+};
+
 using Statement =
-    std::variant<CreateTable, CreateIndex, DropTable, DropIndex, AddColumn, Insert, Select, Update, Delete>;
+    std::variant<CreateTable, CreateIndex, DropTable, DropIndex, AddColumn, CreateView, DropView, Insert, Select, Update, Delete>;
 
 }  // namespace bytecask::sql::ast
 

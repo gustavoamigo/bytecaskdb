@@ -296,6 +296,47 @@ and with a constant selected or `DISTINCT ON`, it is not taken yet.
   aggregate functions"), as PostgreSQL refuses it;
 - on a join, not yet (#534).
 
+**Views**, `CREATE VIEW name [(column, …)] AS SELECT …` and `DROP VIEW [IF
+EXISTS] name`:
+- **Expanded by the binder.** The catalog keeps the statement's text
+  (`catalog_design.md`, *Views*). A statement that names a view has it
+  parsed and bound again, and `ViewExpander` (`sql/binder.cppm`) rewrites
+  the statement before the binder sees it: the view's `FROM` and `WHERE`
+  replace the name, and each reference to one of its columns becomes the
+  select-list item it is. Planner, plans and runtime see base tables
+  only. A view of views is expanded through, to a depth of 16.
+- **Where it is read:** alone, as the table of a `FROM`; inner, `LEFT` and
+  `RIGHT` joined with a table or another view; in a subquery, and in the
+  subquery of an `UPDATE`'s or `DELETE`'s `WHERE`. A joined view must be a
+  plain `SELECT` of one table. Its columns are qualified by that table, so
+  one the other side lacks never changes meaning, and one both have is
+  42702. Refused (42601): `USING` or `NATURAL` on a view, an outer join of
+  a view with a `WHERE`, and two views of one table (a table joined with
+  itself).
+- **Over a grouped view** (`GROUP BY`, `HAVING` or an aggregate) a query
+  selects its columns, orders by its group columns, and its `WHERE` keeps
+  groups: it becomes the view's `HAVING`. It may group again by exactly the
+  view's group columns, selecting those alone: a view row is a group, so
+  that is the view. An aggregate, `DISTINCT` or a join over a grouped
+  view, or a `GROUP BY` of anything else, is refused (42601); it needs a
+  derived table. A view defined with `DISTINCT` or `LIMIT` is created and
+  not read yet.
+- **Columns** are named as the select list names them, or by the column
+  list, which may name fewer than there are columns. Two with one name are
+  42701, more names than columns 42601.
+- **Created** by binding its query as a use would, so its errors are
+  PostgreSQL's (42P01, 42703, …). It takes no parameter (42P02). Refused
+  (42601): `OR REPLACE`, `TEMPORARY`, options, `WITH [CASCADED | LOCAL]
+  CHECK OPTION` and a schema-qualified name.
+- **Read-only.** `INSERT`, `UPDATE` and `DELETE` of a view are refused
+  (0A000), as is any DDL written against it as a table.
+- **Dropped with `RESTRICT`**, the default and only form: a table or view
+  another view reads cannot be dropped (2BP01). `DROP VIEW` of a table is
+  42809, as `DROP TABLE` of a view.
+- **A plan through a view is rebuilt after any DDL**, since the runtime
+  checks the tables a plan reads and not the views it came through
+  (`Statement`'s plan records them, `bound::Bound::views`).
+
 **Refused**, with a message and the node's position: everything not above.
 That includes:
 - `ILIKE`, `IS DISTINCT FROM`, a predicate over both tables of a join or
@@ -534,6 +575,11 @@ fail on them.
   the statement is refused with 42601. A `WHEN` after the first true one
   is skipped, as there.
 
+- **A view is bound again at each use,** so one its tables have outgrown
+  is refused (0A000) until it is dropped and created again: a `SELECT *`
+  view after `ALTER TABLE … ADD COLUMN`. PostgreSQL keeps the columns the
+  star gave it.
+
 Each is a refusal or an error, not a different answer. Everything else in
 the dialect matches PostgreSQL, and the proof machine checks that it does.
 
@@ -545,6 +591,12 @@ implemented (`functional_testing_design.md`).
 
 - **A table needs columns.** The layer refuses `CREATE TABLE t ()` (0A000);
   PostgreSQL accepts a table of no columns.
+- **Views are read-only, and a query over a grouped view is limited.**
+  PostgreSQL writes through a simple view, checks the rows written with
+  `WITH CHECK OPTION`, replaces a view with `CREATE OR REPLACE VIEW`, and
+  aggregates, joins and selects `DISTINCT` over any view, which it runs as
+  a subquery in `FROM`. Here a view's query is merged into the
+  statement, so these wait for updatable views and derived tables.
 
 ## Decisions
 

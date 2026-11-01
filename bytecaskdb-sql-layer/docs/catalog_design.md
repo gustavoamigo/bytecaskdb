@@ -5,7 +5,8 @@ Status: **built** (#489): `bytecaskdb-sql-layer/catalog/`, with its tests in
 This covers what the catalog records, how it is stored under namespace
 `0x01`, the in-memory form plans resolve against and how readers share it,
 what makes a compiled plan compatible with the live catalog, and how each
-DDL statement writes. Nothing in the engine changes for it.
+DDL statement writes. Views are in *Views*. Nothing in the engine changes
+for it.
 
 The catalog is written from scratch. The plugin's catalog is positional,
 keyed by name and GPL-2.0, and nothing of it is copied. The plugin would
@@ -84,7 +85,8 @@ Namespace `0x01`, as the plugin's catalog is:
 | `01 01 01` | Next object id, `u64` big-endian. |
 | `01 01 02` | Catalog version, `u64` big-endian; bumped by every DDL. |
 | `01 02 <id:4>` | The table record above, indexes and layouts included. |
-| `01 03 <name>` | Name entry: kind (1 table, 2 index) and id (4, big-endian). |
+| `01 03 <name>` | Name entry: kind (1 table, 2 index, 3 view) and id (4, big-endian). |
+| `01 04 <id:4>` | The view record (*Views*). |
 
 **The counters are 8 bytes**, and the next id at most one past
 `kMaxObjectId`; any other value is refused at load. **One id counter** gives every table, index and layout its id, so an id
@@ -94,8 +96,8 @@ names one object for ever, and `bc_key_begin(table_or_index)` and
 pass it is refused.
 
 **The name entry** makes a name a key, so a `CREATE` guards its name with
-`ensure_absent` and a rename is one key changed. Tables and indexes share
-one namespace, as relations do in PostgreSQL. At load every name entry must
+`ensure_absent` and a rename is one key changed. Tables, indexes and views
+share one namespace, as relations do in PostgreSQL. At load every name entry must
 name an object of that name and every object must have its entry; a
 mismatch is refused as corruption.
 
@@ -270,6 +272,46 @@ second `LiveCatalog` on the same open database (only tests open one)
 catches up at its next pin, so its DDL never builds on a stale version and
 never hands out an id twice.
 
+## Views
+
+A view is a stored query. The record is under `01 04 <id>`, its name entry
+has kind 3, and the id comes from the one counter, so a view dropped and
+created again is another object and nothing that named the first can mistake
+it for the second.
+
+```
+u16 format                   ; kViewRecordFormat, 1
+u32 id, str name
+blob definition              ; the CREATE VIEW statement, as the client sent it
+u16 ndeps { u32 id }         ; the tables and views the query names, each once
+u16 ncols { str name }       ; the view's columns, as created
+```
+
+- **The text is the definition.** Nothing parsed or bound is stored: a
+  parsed form would be a second format to version, and the binder already
+  turns text into a statement. A view is read by parsing the text and
+  binding it again (`frontend_design.md`, *The dialect*, *Views*), so a use
+  sees the tables as they are then. `columns` is what the view returned
+  when it was created, and a use whose columns differ is refused, so the
+  catalog never gives a view columns it did not have.
+- **`ndeps` makes `DROP` RESTRICT.** `DROP TABLE` and `DROP VIEW` look for a
+  view whose list holds the object, and refuse it (2BP01). A view reads
+  through the views it names, so the list holds what the query names
+  directly, subqueries included, not what those read in turn.
+- **Format 1 is the first.** A build reads views of format 1 and refuses a
+  later one, as it refuses a later table record. A build from before views
+  refuses a database holding one: the view's name entry names no table or
+  index, which that build refuses at open as corruption. Table records
+  keep format 4: no table record changed.
+- **A record that does not parse is refused at load**, with the same
+  checks as a table's: a truncated field, trailing bytes, a record under
+  another id's key, an id used twice, a dependency that is neither a table
+  nor a view, a name entry that disagrees.
+- **Compatibility.** A plan names tables, never views, so the runtime's
+  check (*Compatibility*) does not see one. The embedded API records the
+  views each plan was expanded through and rebuilds it after any DDL
+  (`frontend_design.md`, *Views*).
+
 ## Compatibility
 
 `bc_schema_ref` lists what a plan depends on, and `bc_ctx_run` checks it
@@ -314,8 +356,10 @@ disk and in memory, as it was.
 |---|---|
 | `CREATE TABLE` | Record, name entry (`ensure_absent`), counters. Two ids: the table and its first layout. The bitmap is sized as the row format says. Without a primary key, the record holds the hidden row id (*Tables without a primary key*). Each `UNIQUE` constraint is a unique index in the same record and batch, with its own name entry (*UNIQUE constraints*). A table of no columns is refused (0A000); PostgreSQL takes one. |
 | `CREATE [UNIQUE] INDEX … (col [DESC], …)` | Record with the index, name entry (`ensure_absent`), counters, an entry per existing row, `ensure_range_unchanged` over the table's rows. A unique index whose rows already hold a duplicate is refused. |
-| `DROP TABLE` | Record and name entries deleted; `del_range` over `02 <table_id>` and over `03 <index_id>` per index. |
+| `DROP TABLE` | Record and name entries deleted; `del_range` over `02 <table_id>` and over `03 <index_id>` per index. Refused (2BP01) while a view reads the table. |
 | `DROP INDEX` | Record without the index, name entry deleted, `del_range` over `03 <index_id>`. |
+| `CREATE VIEW` | View record, name entry (`ensure_absent`), counters. One id. |
+| `DROP VIEW` | View record and name entry deleted. |
 | `ALTER TABLE … ADD COLUMN` | Record with the column appended at the next id and the next position of its region; the current generation's offsets do not move. With a default, every existing row rewritten with it, and `ensure_range_unchanged` over the rows. |
 
 `IF EXISTS` on the drops; nothing else. A drop deletes in O(1) appends
@@ -388,4 +432,6 @@ recompile; unique indexes and ranges on `DESC` parts, nullable and not.
 `tests/tcc_test.cpp`: a unique insert raced by another commit conflicts,
 and its retry raises the duplicate. `tests/tprocc_test.cpp`: the
 nine TPROC-C tables and their indexes, created by SQL DDL, reopened and
-checked.
+checked. Views: `tests/catalog_test.cpp` has the record cut at every byte, a later
+format, trailing bytes, a missing or mistyped name entry, the drops that
+2BP01 refuses, and a reopen; `tests/api_test.cpp` reads views through SQL.
