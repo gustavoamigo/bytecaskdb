@@ -147,7 +147,9 @@ auto fold(Expr& e) -> bool {
     case Kind::Or:
     case Kind::Not:
     case Kind::IsNull:
-    case Kind::Like: return changed;
+    case Kind::Like:
+    case Kind::Truth:
+    case Kind::InSet: return changed;
   }
   return changed;
 }
@@ -246,6 +248,14 @@ void tables_of(const Node& n, std::vector<const Table*>& out) {
   if (const auto* in = input_of(n); in != nullptr && *in) tables_of(**in, out);
 }
 
+// Whether e is a predicate that reads no column: a subquery's EXISTS or
+// its flags, the same for every row.
+auto reads_none(const Expr& e) -> bool {
+  std::vector<ColumnRef> cols;
+  columns_of(e, cols);
+  return cols.empty() && logical::is_predicate(e);
+}
+
 auto reads_only(const Expr& e, const std::vector<const Table*>& tables) -> bool {
   std::vector<ColumnRef> cols;
   columns_of(e, cols);
@@ -285,7 +295,9 @@ auto push_down(Node& n) -> bool {
     both.insert(both.end(), right.begin(), right.end());
     std::vector<Expr> kept, to_left, to_right;
     for (auto& c : f->conjuncts) {
-      if (reads_only(c, left)) {
+      // One that reads no column holds of every row or of none: it filters
+      // the left side, whose rows an outer join keeps.
+      if (reads_only(c, left) || reads_none(c)) {
         to_left.push_back(std::move(c));
       } else if (j.left_outer) {
         // Above a left outer join, a conjunct reading its right side filters
@@ -296,7 +308,7 @@ auto push_down(Node& n) -> bool {
       } else if (reads_only(c, both)) {
         j.predicate.push_back(std::move(c));
       } else {
-        kept.push_back(std::move(c));  // reads no column
+        kept.push_back(std::move(c));
       }
     }
     changed = changed || kept.size() != f->conjuncts.size();
@@ -316,7 +328,8 @@ auto push_down(Node& n) -> bool {
       std::vector<const Table*> right;
       tables_of(*j->right, right);
       std::vector<Expr> stays, to_right;
-      for (auto& c : j->predicate) (reads_only(c, right) ? to_right : stays).push_back(std::move(c));
+      // One of no column decides every pair alike: a filter of the right side.
+      for (auto& c : j->predicate) (reads_only(c, right) || reads_none(c) ? to_right : stays).push_back(std::move(c));
       changed = changed || !to_right.empty();
       j->predicate = std::move(stays);
       push_onto(j->right, std::move(to_right));

@@ -68,6 +68,9 @@ struct Bound {
   // their types after the statement's own parameters'; param_sql,
   // param_table and params hold the statement's own only.
   std::vector<Datum> fixed;
+  // Each uncorrelated subquery, run before the plan: it sets its hidden
+  // parameters, among `fixed`'s, whose values there are NULL.
+  std::vector<logical::Subquery> subqueries;
 };
 
 // Throws ast::SqlError with a message and the position of the offending node.
@@ -410,7 +413,8 @@ auto is_constant(const ast::Expr& e) -> bool {
     case K::Cast: return is_constant(*e.rhs);
     case K::Column:
     case K::Param:
-    case K::Aggregate: return false;
+    case K::Aggregate:
+    case K::Subquery: return false;
   }
   return false;
 }
@@ -669,7 +673,8 @@ auto fold(const ast::Expr& e) -> Constant {
     case K::Cast: return cast_constant(e, fold(*e.rhs));
     case K::Column:
     case K::Param:
-    case K::Aggregate: break;
+    case K::Aggregate:
+    case K::Subquery: break;
   }
   throw SqlError{"expression not supported", e.pos};
 }
@@ -965,6 +970,188 @@ public:
   [[nodiscard]] auto fixed_value(std::uint32_t n) const -> const Datum& { return fixed_.at(n - own_params_); }
   [[nodiscard]] auto fixed_values() const -> const std::vector<Datum>& { return fixed_; }
   [[nodiscard]] auto fixed_types() const -> const std::vector<PhysType>& { return fixed_types_; }
+  [[nodiscard]] auto take_subqueries() -> std::vector<logical::Subquery> { return std::move(subqueries_); }
+  void set_scope(std::vector<const Table*> tables) { scope_ = std::move(tables); }
+
+  // A subquery's SELECT, bound as any is, then listed to run before the
+  // statement's plan (logical::Subquery), its values in hidden parameters
+  // after the constants': its index and first parameter. Uncorrelated, one
+  // level deep, not FOR UPDATE; of one column, but for EXISTS, whose rows
+  // are counted and taken one at most.
+  struct BoundSubquery {
+    std::uint32_t index;
+    std::uint32_t param;
+    SqlType type;
+    std::string name;
+  };
+  auto subquery(const ast::Select& q, logical::Subquery::Kind kind, std::int32_t pos) -> BoundSubquery {
+    if (depth_ > 0) not_yet("a subquery inside a subquery", pos);
+    if (q.for_update) not_yet("FOR UPDATE in a subquery", pos);
+    if (correlated(q)) not_yet("a correlated subquery, one that reads a column of the query around it", pos);
+    auto using_columns = std::move(using_);
+    auto using_alias = std::move(using_alias_);
+    auto scope = std::move(scope_);
+    ++depth_;
+    auto root = select(q);
+    --depth_;
+    using_ = std::move(using_columns);
+    using_alias_ = std::move(using_alias);
+    scope_ = std::move(scope);
+    using K = logical::Subquery::Kind;
+    SqlType type{SqlKind::Boolean};
+    std::string name = "?column?";
+    if (kind == K::Exists) {
+      const auto* l = std::get_if<logical::Limit>(&root->op);
+      if (l == nullptr || l->n > 1) root = logical::node(logical::Limit{std::move(root), 1});
+    } else {
+      const auto& outs = outputs_of(*root);
+      if (outs.size() != 1) throw SqlError{"subquery must return only one column", pos};
+      type = outs[0].expr.type;
+      if (type.kind == SqlKind::Numeric) not_yet("a subquery of AVG", pos);
+      name = outs[0].name;
+    }
+    // Its parameters, NULL until it runs: its value or values, then its flags.
+    auto value = [&] { return fixed(Datum{}, type).param; };
+    auto flag = [&] { return fixed(Datum{}, SqlType{SqlKind::Boolean}).param; };
+    std::uint32_t first = 0;
+    switch (kind) {
+      case K::Value: first = value(); break;
+      case K::Exists: first = flag(); break;
+      case K::Bounds:
+        first = value();
+        (void)value();
+        (void)flag();
+        (void)flag();
+        break;
+      case K::Set:
+        first = flag();
+        (void)flag();
+        break;
+    }
+    auto index = bytecask::sql::narrow<std::uint32_t>(subqueries_.size());
+    subqueries_.push_back({std::move(root), kind, type, first});
+    return {index, first, type, name};
+  }
+
+  // The select list of a bound SELECT: its Project's or its Aggregate's,
+  // under any Sort, Limit or HAVING Filter.
+  static auto outputs_of(const logical::Node& n) -> const std::vector<logical::Output>& {
+    if (const auto* p = std::get_if<logical::Project>(&n.op)) return p->exprs;
+    if (const auto* a = std::get_if<logical::Aggregate>(&n.op)) return a->aggs;
+    const auto* in = logical::input_of(n);
+    if (in == nullptr || !*in) throw std::logic_error{"a bound SELECT with no select list"};
+    return outputs_of(**in);
+  }
+
+  // Whether the subquery names a column of the query around it: qualified
+  // by one of its tables, or unqualified, of none of the subquery's own
+  // tables but of one of the outer's.
+  auto correlated(const ast::Select& q) const -> bool {
+    std::vector<const Table*> own;
+    for (const auto& name : {q.table, q.join}) {
+      if (const auto* t = name.empty() ? nullptr : cat_.table(name)) own.push_back(t);
+    }
+    auto outer_names = [&](const ast::Expr& e) {
+      if (!e.table.empty()) {
+        if (e.table == q.table || e.table == q.join) return false;
+        return std::ranges::any_of(scope_, [&](const Table* t) { return t->name == e.table; });
+      }
+      if (std::ranges::any_of(own, [&](const Table* t) { return t->column(e.column) != nullptr; })) return false;
+      return std::ranges::any_of(scope_, [&](const Table* t) { return t->column(e.column) != nullptr; });
+    };
+    std::function<bool(const ast::Expr&)> in_expr = [&](const ast::Expr& e) {
+      if ((e.kind == ast::Expr::Kind::Column || (e.kind == ast::Expr::Kind::Aggregate && !e.column.empty())) &&
+          outer_names(e)) {
+        return true;
+      }
+      return (e.lhs && in_expr(*e.lhs)) || (e.rhs && in_expr(*e.rhs));
+    };
+    std::function<bool(const ast::Compare&)> in_compare = [&](const ast::Compare& c) {
+      return in_expr(c.lhs) || in_expr(c.rhs) || std::ranges::any_of(c.args, in_compare);
+    };
+    return std::ranges::any_of(q.targets, in_expr) || std::ranges::any_of(q.where, in_compare) ||
+           std::ranges::any_of(q.having, in_compare) || std::ranges::any_of(q.group_by, in_expr) ||
+           std::ranges::any_of(q.order_by, [&](const ast::OrderItem& o) { return in_expr(column_ref(o)); });
+  }
+
+  // Whether a column of type `col` is compared with a subquery's value of
+  // type `sub` as it holds it: integers with integers, a key encoding each
+  // as 64 bits whatever its declared width, so one past the column's type
+  // matches nothing and bounds a range where it falls; a DECIMAL of its
+  // scale; strings with strings; any other type its own.
+  static void comparable(SqlType sub, const Column& c, std::int32_t pos) {
+    auto ok = (is_integer(sub) && is_integer(c.sql)) ||
+              (sub.kind == SqlKind::Decimal && c.sql.kind == SqlKind::Decimal && sub.scale == c.sql.scale) ||
+              (is_string(sub) && is_string(c.sql)) || (!is_integer(sub) && sub.kind != SqlKind::Decimal && sub.kind == c.sql.kind);
+    if (!ok) {
+      not_yet("comparing " + c.name + " (" + sql_type_name(c.sql) + ") with a subquery of " + sql_type_name(sub), pos);
+    }
+  }
+
+  // x op ANY (subquery), x a column, three-valued as PostgreSQL's: true
+  // where a row's value makes x op it true; else NULL where a row is NULL,
+  // or x is and a row exists; else false, over no rows too. = ANY tests the
+  // subquery's set; every other operator its bounds.
+  auto any_of(const logical::Expr& x, const Column& c, ast::ValueCompare op, const ast::Select& q, std::int32_t pos)
+      -> logical::Expr {
+    using K = logical::Expr::Kind;
+    auto truth = [](std::uint32_t p) {
+      auto e = logical::expr(K::Truth, SqlType{SqlKind::Boolean});
+      e.args.push_back(logical::param(p, SqlType{SqlKind::Boolean}));
+      return e;
+    };
+    logical::Expr core;
+    std::uint32_t flags = 0;
+    if (op == ast::ValueCompare::Eq) {
+      auto s = subquery(q, logical::Subquery::Kind::Set, pos);
+      comparable(s.type, c, pos);
+      core = logical::expr(K::InSet, SqlType{SqlKind::Boolean});
+      core.args.push_back(x);
+      core.constant = s.index;
+      flags = s.param;
+    } else {
+      auto s = subquery(q, logical::Subquery::Kind::Bounds, pos);
+      comparable(s.type, c, pos);
+      auto hi = logical::param(s.param, c.sql);
+      auto lo = logical::param(s.param + 1, c.sql);
+      flags = s.param + 2;
+      switch (op) {
+        case ast::ValueCompare::Lt: core = logical::compare(ast::Compare::Op::Lt, x, std::move(hi)); break;
+        case ast::ValueCompare::Le: core = logical::compare(ast::Compare::Op::Le, x, std::move(hi)); break;
+        case ast::ValueCompare::Gt: core = logical::compare(ast::Compare::Op::Gt, x, std::move(lo)); break;
+        case ast::ValueCompare::Ge: core = logical::compare(ast::Compare::Op::Ge, x, std::move(lo)); break;
+        case ast::ValueCompare::Ne: {  // a value other than x: one above it or one below
+          std::vector<logical::Expr> either;
+          either.push_back(logical::compare(ast::Compare::Op::Lt, x, std::move(hi)));
+          either.push_back(logical::compare(ast::Compare::Op::Gt, x, std::move(lo)));
+          core = logical::predicate_of(K::Or, std::move(either));
+          break;
+        }
+        case ast::ValueCompare::Eq: break;
+      }
+    }
+    std::vector<logical::Expr> or_null;
+    or_null.push_back(std::move(core));
+    or_null.push_back(truth(flags));
+    std::vector<logical::Expr> both;
+    both.push_back(logical::predicate_of(K::Or, std::move(or_null)));
+    both.push_back(truth(flags + 1));
+    return logical::predicate_of(K::And, std::move(both));
+  }
+
+  // x op ALL (subquery) is NOT (x op' ANY), op' its negation: true over no
+  // rows, false where a row makes x op it false.
+  static auto negation(ast::ValueCompare op) -> ast::ValueCompare {
+    switch (op) {
+      case ast::ValueCompare::Eq: return ast::ValueCompare::Ne;
+      case ast::ValueCompare::Ne: return ast::ValueCompare::Eq;
+      case ast::ValueCompare::Lt: return ast::ValueCompare::Ge;
+      case ast::ValueCompare::Le: return ast::ValueCompare::Gt;
+      case ast::ValueCompare::Gt: return ast::ValueCompare::Le;
+      case ast::ValueCompare::Ge: return ast::ValueCompare::Lt;
+    }
+    return op;
+  }
 
   // A constant in a select list, of its own type: an unknown one is TEXT,
   // as PostgreSQL resolves it there. Named as PostgreSQL names it: a cast
@@ -972,6 +1159,13 @@ public:
   auto constant_output(const ast::Expr& e) -> logical::Output {
     auto c = fold(e);
     return {fixed(std::move(c.value), c.type), e.kind == ast::Expr::Kind::Cast ? e.cast_type : "?column?"};
+  }
+
+  // A scalar subquery in a select list: its value, named as PostgreSQL
+  // names it, by its own column's name.
+  auto subquery_output(const ast::Expr& e) -> logical::Output {
+    auto s = subquery(*e.subquery, logical::Subquery::Kind::Value, e.pos);
+    return {logical::param(s.param, s.type), s.name};
   }
 
   auto table(const std::string& name, std::int32_t pos) const -> const Table* {
@@ -1260,6 +1454,7 @@ public:
       case ast::Expr::Kind::Neg: not_yet("unary + and - of other than a constant", e.pos);
       case ast::Expr::Kind::Compare: not_yet("a comparison of other than constants as a value", e.pos);
       case ast::Expr::Kind::Cast: not_yet("a cast of other than a constant", e.pos);
+      case ast::Expr::Kind::Subquery: not_yet("a subquery assigned to a column", e.pos);
       case ast::Expr::Kind::Const:
       case ast::Expr::Kind::Literal: break;  // constants, above
     }
@@ -1357,6 +1552,21 @@ public:
         return e;
       }
       case K::Like: return like(w, resolve);
+      case K::Exists: {
+        auto s = subquery(*w.subquery, logical::Subquery::Kind::Exists, w.pos);
+        auto e = logical::expr(logical::Expr::Kind::Truth, SqlType{SqlKind::Boolean});
+        e.args.push_back(logical::param(s.param, SqlType{SqlKind::Boolean}));
+        return e;
+      }
+      case K::Quantified: {
+        if (w.lhs.kind != ast::Expr::Kind::Column) not_yet("IN, ANY or ALL of a subquery of other than a column", w.pos);
+        auto [table, c] = resolve(w.lhs);
+        auto x = logical::column_of(table, *c);
+        if (!w.all) return any_of(x, *c, w.quantified, *w.subquery, w.pos);
+        std::vector<logical::Expr> one;
+        one.push_back(any_of(x, *c, negation(w.quantified), *w.subquery, w.pos));
+        return logical::predicate_of(logical::Expr::Kind::Not, std::move(one));
+      }
       case K::And: return tree(logical::Expr::Kind::And);
       case K::Or: return tree(logical::Expr::Kind::Or);
       case K::Not: return tree(logical::Expr::Kind::Not);
@@ -1380,9 +1590,17 @@ public:
     const auto* col = &w.lhs;
     const auto* rhs = &w.rhs;
     auto op = w.op;
-    if ((operand(*col) || is_constant(*col)) && rhs->kind == ast::Expr::Kind::Column) {
+    if ((operand(*col) || is_constant(*col) || col->kind == ast::Expr::Kind::Subquery) &&
+        rhs->kind == ast::Expr::Kind::Column) {
       std::swap(col, rhs);
       op = mirrored(op);
+    }
+    // A scalar subquery: its value, a parameter it sets before the plan runs.
+    if (col->kind == ast::Expr::Kind::Column && rhs->kind == ast::Expr::Kind::Subquery) {
+      auto [table, c] = resolve(*col);
+      auto s = subquery(*rhs->subquery, logical::Subquery::Kind::Value, rhs->pos);
+      comparable(s.type, *c, rhs->pos);
+      return logical::compare(op, logical::column_of(table, *c), logical::param(s.param, c->sql));
     }
     // A constant: folded to the column's type, where it holds it exactly.
     if (col->kind == ast::Expr::Kind::Column && is_constant(*rhs)) {
@@ -1527,6 +1745,7 @@ public:
     std::vector<logical::Expr> on;  // an outer join's ON: its Join's predicate
     if (joined) {
       sides[1] = table(s.join, s.join_pos);
+      set_scope({sides[0], sides[1]});
       if (sides[0] == sides[1]) throw SqlError{"a table joined with itself is not supported", s.pos};
       if (s.for_update) throw SqlError{"FOR UPDATE on a join is not supported yet", s.pos};
       conjuncts = using_conjuncts(sides, s);
@@ -1545,6 +1764,7 @@ public:
         conjuncts.insert(conjuncts.end(), std::make_move_iterator(rest.begin()), std::make_move_iterator(rest.end()));
       }
     } else {
+      set_scope({sides[0]});
       conjuncts = where(*sides[0], s.where);
     }
     // A column reference: of the one table, or of the side that has it.
@@ -1602,9 +1822,13 @@ public:
     };
     std::vector<logical::Output> targets;
     for (const auto& e : s.targets) {
-      if (is_constant(e)) {
-        if (aggregated) not_yet("a constant in the select list of an aggregated query", e.pos);
-        targets.push_back(constant_output(e));
+      if (is_constant(e) || e.kind == ast::Expr::Kind::Subquery) {
+        if (aggregated) {
+          not_yet(std::string{e.kind == ast::Expr::Kind::Subquery ? "a subquery" : "a constant"} +
+                      " in the select list of an aggregated query",
+                  e.pos);
+        }
+        targets.push_back(e.kind == ast::Expr::Kind::Subquery ? subquery_output(e) : constant_output(e));
         continue;
       }
       if (e.kind == ast::Expr::Kind::Aggregate) {
@@ -1694,7 +1918,11 @@ public:
       if (e.kind == ast::Expr::Kind::Column) {
         throw SqlError{"column \"" + e.column + "\" does not exist", e.pos, kUndefinedColumn};
       }
-      if (!is_constant(e)) not_yet("a SELECT without FROM of other than constants", e.pos);
+      if (e.kind == ast::Expr::Kind::Subquery) {
+        targets.push_back(subquery_output(e));
+        continue;
+      }
+      if (!is_constant(e)) not_yet("a SELECT without FROM of other than constants and subqueries", e.pos);
       targets.push_back(constant_output(e));
     }
     auto rows = logical::node(logical::Project{logical::node(logical::OneRow{}), std::move(targets)});
@@ -1860,6 +2088,9 @@ private:
   std::vector<ParamUse> params_;
   std::vector<Datum> fixed_;  // the constants' values, $own_params_ + 1 onwards
   std::vector<PhysType> fixed_types_;
+  std::vector<logical::Subquery> subqueries_;  // in the order bound; InSet names one by its index
+  int depth_{0};                               // inside a subquery: one more is refused
+  std::vector<const Table*> scope_;            // the tables of the query being bound
   // What a HAVING parameter compared with COUNT or SUM is typed by: no
   // column of a table, kept where a parameter's first use points.
   std::deque<Column> synthetic_;
@@ -1962,17 +2193,20 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
             }
             set.emplace_back(logical::column_of(t->id, *c).col, std::move(v));
           }
+          b.set_scope({t});
           auto rows = Binder::rows(*t, b.where(*t, s.where));
           return {logical::node(logical::Update{std::move(rows), t, std::move(set)}), s.pos};
         } else {
           const auto* t = b.table(s.table, s.pos);
+          b.set_scope({t});
           return {logical::node(logical::Delete{Binder::rows(*t, b.where(*t, s.where)), t}), s.pos};
         }
       },
       stmt);
   auto types = b.param_types(bound_stmt.second);
   types.insert(types.end(), b.fixed_types().begin(), b.fixed_types().end());
-  return Bound{std::move(bound_stmt.first), std::move(types), b.param_sql(), b.param_table(), b.param_info(), b.fixed_values()};
+  return Bound{std::move(bound_stmt.first), std::move(types), b.param_sql(), b.param_table(), b.param_info(),
+               b.fixed_values(), b.take_subqueries()};
 }
 
 }  // namespace bytecask::sql::bound

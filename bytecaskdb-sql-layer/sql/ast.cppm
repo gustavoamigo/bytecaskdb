@@ -63,6 +63,8 @@ struct Literal {
   std::int32_t pos{-1};
 };
 
+struct Select;
+
 // A comparison as a value (SELECT 3 < 5): its operator, <> among them. A
 // WHERE's comparisons are Compare's, below.
 enum class ValueCompare { Eq, Ne, Lt, Le, Gt, Ge };
@@ -70,10 +72,11 @@ enum class ValueCompare { Eq, Ne, Lt, Le, Gt, Ge };
 // A select-list, SET or comparison operand: a column, a parameter, a
 // literal (an integer within BIGINT after + or - is a Const), a sum or
 // difference of two, unary + or - of one, a comparison of two, a cast of
-// one (DATE '…' and '…'::date alike), or an aggregate: COUNT(*),
-// COUNT([DISTINCT] column), SUM, MIN, MAX or AVG of a column.
+// one (DATE '…' and '…'::date alike), an aggregate: COUNT(*),
+// COUNT([DISTINCT] column), SUM, MIN, MAX or AVG of a column; or a scalar
+// subquery, (SELECT …), the value of its one row.
 struct Expr {
-  enum class Kind { Column, Param, Const, Literal, Add, Sub, Plus, Neg, Compare, Cast, Aggregate };
+  enum class Kind { Column, Param, Const, Literal, Add, Sub, Plus, Neg, Compare, Cast, Aggregate, Subquery };
   enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind;
   std::string column;       // Column; Aggregate's argument, "" for COUNT(*)
@@ -88,16 +91,19 @@ struct Expr {
   ValueCompare cmp{ValueCompare::Eq};  // Compare
   std::string cast_type;               // Cast: libpg_query's last type name, as a column's
   std::vector<std::int32_t> cast_typmods;
+  std::shared_ptr<const Select> subquery;  // Subquery
 };
 
 // One conjunct of a WHERE clause: two expressions compared; or, as a
-// predicate, AND, OR or NOT of conjuncts (`args`), `lhs` IS NULL, or `lhs`
-// LIKE the pattern `rhs`, with its ESCAPE as written. The
+// predicate, AND, OR or NOT of conjuncts (`args`), `lhs` IS NULL, `lhs`
+// LIKE the pattern `rhs`, with its ESCAPE as written, EXISTS (`subquery`),
+// or `lhs` compared by `quantified` with ANY or ALL (`all`) of the
+// subquery's rows: IN is = ANY, NOT IN its NOT. The
 // parser writes <>, BETWEEN and IN with them: NOT (a = b); a >= lo AND a <=
 // hi; a = x OR a = y.
 struct Compare {
   enum class Op { Eq, Lt, Le, Gt, Ge };
-  enum class Kind { Compare, And, Or, Not, IsNull, Like };
+  enum class Kind { Compare, And, Or, Not, IsNull, Like, Exists, Quantified };
   Op op;
   Expr lhs, rhs;
   std::int32_t pos{-1};
@@ -105,6 +111,9 @@ struct Compare {
   Kind kind{Kind::Compare};
   std::vector<Compare> args;  // And, Or: two or more; Not: one
   std::optional<std::string> escape;  // Like: ESCAPE's string; none for the default, a backslash
+  std::shared_ptr<const Select> subquery;  // Exists, Quantified
+  ValueCompare quantified{ValueCompare::Eq};
+  bool all{false};
 };
 
 // A copy of e, which owns its operands: what BETWEEN and IN repeat.
@@ -120,6 +129,7 @@ struct Compare {
   out.cmp = e.cmp;
   out.cast_type = e.cast_type;
   out.cast_typmods = e.cast_typmods;
+  out.subquery = e.subquery;  // never changed once parsed: shared
   return out;
 }
 

@@ -320,8 +320,6 @@
 
 - name: a scalar subquery
   features: [F471]
-  # subqueries are refused
-  unimplemented: true
   setup:
     - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
   steps:
