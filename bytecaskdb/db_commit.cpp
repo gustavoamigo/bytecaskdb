@@ -235,9 +235,10 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
     return batch.size();
   }
   // The group's removals are in the file: from here it is published, or the
-  // engine refuses writes until resume(), which resets the log. Before the
-  // append, a failure drops the transient and the removals with it.
-  deletes_.record(t.staged_removals());
+  // engine refuses writes until resume(). Before the append, a failure drops
+  // the transient and the removals with it; its sequences, if resume()
+  // replays them, are a gap the log never recorded.
+  deletes_.record(t.staged_removals(), current->next_seq, batch_max_seq);
 
   try {
 #ifdef BYTECASK_TESTING

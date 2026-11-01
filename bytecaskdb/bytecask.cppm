@@ -249,7 +249,8 @@ export enum class PlanRefusal {
   // Plans on a read point only: it cannot be checked here. Read on another
   // history (before a crash, across a failover), past the latest sequence,
   // or needing deletes the engine no longer tracks (from before a restart,
-  // resume() or ingest, or beyond max_delete_log_bytes since). Take a fresh
+  // a promotion, an ingest or a resume() that replayed writes, or beyond
+  // max_delete_log_bytes since). Take a fresh
   // snapshot.
   TooOld,
 };
@@ -830,6 +831,9 @@ private:
   std::uint32_t active_file_id_;
   std::uint32_t next_file_id_;
   std::uint64_t next_seq_;
+  // next_seq_ when this transient was made: what it assigned since is in
+  // removed_, what came before is the DeleteLog's to answer for.
+  std::uint64_t base_seq_;
   std::uint64_t durable_seq_;
   std::uint64_t sync_requested_seq_;
   Mode mode_;
@@ -1833,10 +1837,10 @@ private:
   SizeLimits size_limits_;
   std::size_t scratch_bytes_;
   // Keys recent writes removed, for checking plans by read sequence.
-  // Recorded by execute_group under write_mu_ once a group is appended, and
-  // reset at open, resume() and ingest, which change keys without recording
-  // their removals. settle_unappended reads it without write_mu_: its own
-  // mutex is what makes that safe.
+  // Recorded by execute_group under write_mu_ once a group is appended, with
+  // the group's sequence range; a sequence assigned anywhere else is a gap
+  // the log answers no plan across. settle_unappended reads it without
+  // write_mu_: its own mutex is what makes that safe.
   DeleteLog deletes_;
   mutable Counters counters_;
   // Bookmarks for changes_since to enter a file near from_sequence (#443).
@@ -2246,11 +2250,14 @@ public:
   }
 
   // The sequence of the state the plan's reads came from: its snapshot's,
-  // or the one it was given. nullopt without a base.
+  // or the one it was given. nullopt without a base, and on a moved-from
+  // plan, whose snapshot names no state.
   [[nodiscard]] auto read_sequence() const noexcept
       -> std::optional<std::uint64_t> {
-    if (const auto *b = std::get_if<SnapshotBase>(&base_))
+    if (const auto *b = std::get_if<SnapshotBase>(&base_)) {
+      if (!b->snap.state_) return std::nullopt;
       return b->snap.sequence();
+    }
     if (const auto *b = std::get_if<SequenceBase>(&base_)) return b->read_seq;
     return std::nullopt;
   }

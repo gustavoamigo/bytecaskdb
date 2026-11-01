@@ -34,17 +34,31 @@ auto b(std::string_view s) -> std::span<const std::byte> {
 // No budget limit, on 32-bit targets (the wasm build) too.
 constexpr std::size_t kBig = std::numeric_limits<std::size_t>::max();
 
+// Records `staged` as a group that ends at `last` and starts right after
+// the last sequence recorded: the sequences between were writes that
+// deleted nothing.
+void record_through(bytecask::DeleteLog &log, bytecask::StagedRemovals &staged,
+                    std::uint64_t last) {
+  log.record(staged, log.recorded_through() + 1, last);
+}
+
 void del(bytecask::DeleteLog &log, std::string_view key, std::uint64_t seq) {
   bytecask::StagedRemovals staged;
   staged.add_key(b(key), seq);
-  log.record(staged);
+  record_through(log, staged, seq);
 }
 
 void del_range(bytecask::DeleteLog &log, std::string_view from,
                std::string_view to, std::uint64_t seq) {
   bytecask::StagedRemovals staged;
   staged.add_range(b(from), b(to), seq);
-  log.record(staged);
+  record_through(log, staged, seq);
+}
+
+// Writes that delete nothing, up to the state the queries check (below 100).
+void fill(bytecask::DeleteLog &log, std::uint64_t last = 99) {
+  bytecask::StagedRemovals none;
+  record_through(log, none, last);
 }
 
 // The budget two one-byte dels fill exactly.
@@ -61,6 +75,7 @@ TEST_CASE("delete log: a del names its key inside the window only",
           "[delete_log]") {
   bytecask::DeleteLog log{kBig};
   del(log, "k", 20);
+  fill(log);
   CHECK(log.removed(b("k"), 10, 100) == true);
   CHECK(log.removed(b("k"), 20, 100) == false);  // at or below the read
   CHECK(log.removed(b("j"), 10, 100) == false);  // another key
@@ -84,6 +99,7 @@ TEST_CASE("delete log: a del_range names every key it covers",
           "[delete_log]") {
   bytecask::DeleteLog log{kBig};
   del_range(log, "c", "f", 20);
+  fill(log);
   CHECK(log.removed(b("c"), 10, 100) == true);
   CHECK(log.removed(b("e9"), 10, 100) == true);
   CHECK(log.removed(b("b"), 10, 100) == false);  // before from
@@ -97,6 +113,7 @@ TEST_CASE("delete log: a range query finds the deletes that overlap it",
   bytecask::DeleteLog log{kBig};
   del(log, "k", 20);
   del_range(log, "c", "f", 30);
+  fill(log);
   CHECK(log.removed_in(b("j"), b("l"), 10, 100) == true);   // the del
   CHECK(log.removed_in(b("l"), b("z"), 10, 100) == false);
   CHECK(log.removed_in(b("j"), b("l"), 20, 100) == false);
@@ -117,6 +134,7 @@ TEST_CASE("delete log: past its budget the oldest delete goes first, point or ra
     del(log, "a", 10);
     del_range(log, "b", "c", 20);
     del(log, "d", 30);
+    fill(log);
     CHECK(log.horizon() >= 10);
     CHECK_FALSE(log.removed(b("a"), 9, 100).has_value());
     CHECK_FALSE(log.removed_in(b("a"), b("z"), 9, 100).has_value());
@@ -135,6 +153,7 @@ TEST_CASE("delete log: past its budget the oldest delete goes first, point or ra
     del(log, "a", 10);
     del(log, "a", 20);
     del(log, "b", 30);
+    fill(log);
     CHECK(log.horizon() >= 20);
     CHECK(log.removed(b("a"), log.horizon(), 100).has_value());
     CHECK(log.removed(b("a"), log.horizon(), 100) == false);
@@ -157,24 +176,47 @@ TEST_CASE("delete log: with no budget nothing is kept and every delete raises th
   del_range(log, "a", "z", 30);
   CHECK(log.bytes() == 0);
   CHECK(log.horizon() == 30);
+  fill(log);
   CHECK_FALSE(log.removed(b("k"), 29, 100).has_value());
   CHECK(log.removed(b("k"), 30, 100) == false);
   CHECK_FALSE(log.removed_in(b("a"), b("z"), 29, 100).has_value());
   CHECK(log.removed_in(b("a"), b("z"), 30, 100) == false);
 }
 
-TEST_CASE("delete log: reset forgets every delete and raises the horizon",
+// docs/bytecask_design.md, "Checking a plan by its read sequence": the log
+// answers only for sequences it was handed.
+TEST_CASE("delete log: a group that does not follow the last recorded one forgets everything older",
           "[delete_log]") {
   bytecask::DeleteLog log{kBig};
   del(log, "k", 20);
   del_range(log, "a", "b", 30);
-  log.reset(40);
+  // Sequences 31 to 39 came from elsewhere (an ingest, a marker).
+  bytecask::StagedRemovals none;
+  log.record(none, 40, 45);
   CHECK(log.bytes() == 0);
-  CHECK(log.horizon() == 40);
-  CHECK_FALSE(log.removed(b("k"), 10, 100).has_value());  // forgotten
-  CHECK(log.removed(b("k"), 40, 100) == false);
-  log.reset(5);  // never lowers it
-  CHECK(log.horizon() == 40);
+  CHECK(log.horizon() == 39);
+  CHECK(log.recorded_through() == 45);
+  CHECK_FALSE(log.removed(b("k"), 10, 46).has_value());  // forgotten
+  CHECK(log.removed(b("k"), 39, 46) == false);
+  // A group that reuses sequences (after resume() cut a tail) is one too.
+  del(log, "k", 50);
+  log.record(none, 48, 60);
+  CHECK(log.horizon() == 47);
+  CHECK(log.removed(b("k"), 47, 61) == false);
+}
+
+TEST_CASE("delete log: a state past the last recorded sequence is a gap",
+          "[delete_log]") {
+  bytecask::DeleteLog log{kBig};
+  del(log, "k", 20);
+  CHECK(log.removed(b("k"), 10, 21) == true);
+  // The state checked holds sequences 21 to 24, which no group recorded.
+  CHECK_FALSE(log.removed(b("k"), 10, 25).has_value());
+  CHECK_FALSE(log.removed_in(b("a"), b("z"), 10, 25).has_value());
+  CHECK(log.removed(b("k"), 24, 25) == false);  // nothing above the read
+  // A group that deleted nothing still closes the gap.
+  fill(log, 24);
+  CHECK(log.removed(b("k"), 10, 25) == true);
 }
 
 TEST_CASE("staged removals: a group's later slots see its earlier deletes",
@@ -197,7 +239,7 @@ TEST_CASE("staged removals: a group's later slots see its earlier deletes",
 
   // Recording takes them out.
   bytecask::DeleteLog log{kBig};
-  log.record(staged);
+  record_through(log, staged, 99);
   CHECK(staged.empty());
   CHECK_FALSE(staged.removes(b("k")));
   CHECK(log.removed(b("k"), 10, 100) == true);
@@ -211,7 +253,7 @@ TEST_CASE("staged removals: a key deleted twice in a group is logged by its late
   staged.add_key(b("j"), 21);
   staged.add_key(b("k"), 22);
   bytecask::DeleteLog log{kBig};
-  log.record(staged);
+  record_through(log, staged, 99);
   CHECK(log.removed(b("k"), 21, 100) == true);
   CHECK(log.removed(b("j"), 21, 100) == false);
 }
@@ -224,8 +266,9 @@ TEST_CASE("staged removals: a group is logged in sequence order, not key order",
   staged.add_key(b("z"), 20);
   staged.add_key(b("a"), 21);
   bytecask::DeleteLog log{log_bytes_for_two()};
-  log.record(staged);
+  record_through(log, staged, 21);
   del(log, "m", 30);
+  fill(log);
   CHECK(log.horizon() == 20);
   CHECK(log.removed(b("a"), 20, 100) == true);
 }
@@ -311,7 +354,16 @@ TEST_CASE("delete log: answers like a list of every delete, whatever the budget"
   std::vector<Delete> all;
   std::vector<std::uint64_t> boundaries;  // each group's next sequence
   std::uint64_t seq = 0;
+  std::uint64_t last_gap = 0;  // the newest sequence no group recorded
   for (int group = 0; group < 400; ++group) {
+    if (rng() % 10 == 0) {
+      // Sequences assigned elsewhere (an ingest, a marker): the log never
+      // sees them, and cannot answer across them.
+      seq += std::uniform_int_distribution<std::uint64_t>{1, 3}(rng);
+      last_gap = seq;
+      boundaries.push_back(seq + 1);
+    }
+    const auto first = seq + 1;
     bytecask::StagedRemovals staged;
     for (int i = std::uniform_int_distribution<int>{1, 3}(rng); i > 0; --i) {
       ++seq;
@@ -327,10 +379,12 @@ TEST_CASE("delete log: answers like a list of every delete, whatever the budget"
         all.push_back({k, {}, seq});
       }
     }
-    log.record(staged);
+    log.record(staged, first, seq);
     boundaries.push_back(seq + 1);
     for (int q = 0; q < 8; ++q) {
       const auto read_seq = std::uniform_int_distribution<std::uint64_t>{0, seq}(rng);
+      // Below a gap the log must not answer, whatever it still holds.
+      if (read_seq < last_gap) CHECK(log.horizon() >= last_gap);
       if (read_seq < log.horizon()) {
         // Below the horizon a delete in the window may have been dropped:
         // no answer, rather than a wrong one.

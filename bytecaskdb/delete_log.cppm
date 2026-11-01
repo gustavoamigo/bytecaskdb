@@ -14,23 +14,29 @@
 // whatever it covers.
 //
 // Lookups cost the deletes that matter to the key or range asked about:
-// point deletes are a map by key, range deletes a map of disjoint key
-// segments each stamped with the latest range delete that covered it
-// (RangeSegments). A queue per kind keeps sequence order for dropping the
-// oldest, and for the rare query against a state older than the newest
-// delete of a key (the `below` bound).
+// point deletes are indexed by (key, sequence), range deletes by a map of
+// disjoint key segments each stamped with the latest range delete that
+// covered it (RangeSegments). A queue per kind keeps sequence order for
+// dropping the oldest, and, for ranges, for the rare query against a state
+// older than the newest range delete over a key (the `below` bound).
 //
-// In memory only: the data files are the record. An open starts the log
-// empty with the horizon at the latest recovered sequence. Bounded by
-// max_bytes: past it the oldest deletes are dropped and the horizon rises to
-// the newest dropped one. With max_bytes 0 nothing is kept: every delete
-// raises the horizon.
+// The log trusts only the sequences it was handed. Every write group calls
+// record() with its sequence range, deletes or not. A sequence the log never
+// saw (an open's or a promotion's marker, an ingest, a group resume()
+// replayed without its record) may have removed keys it does not hold, so
+// it is a gap: a plan read below one is too old. No other path has to tell
+// the log anything.
 //
-// Thread-safety: record and reset are called under the DB's write lock; the
-// queries run there and, for a plan that appended nothing, on its writer
-// thread against the published state (DB::settle_unappended). An internal
-// mutex serialises the two. StagedRemovals is not thread-safe: it belongs to
-// one TransientEngineState.
+// In memory only: the data files are the record. Bounded by max_bytes: past
+// it the oldest deletes are dropped and the horizon rises to the newest
+// dropped one. With max_bytes 0 nothing is kept: every delete raises the
+// horizon.
+//
+// Thread-safety: record is called under the DB's write lock; the queries run
+// there and, for a plan that appended nothing, on its writer thread against
+// the published state (DB::settle_unappended). An internal mutex serialises
+// the two, and each query answers under one hold of it. StagedRemovals is
+// not thread-safe: it belongs to one TransientEngineState.
 
 module;
 #include <algorithm>
@@ -41,7 +47,9 @@ module;
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
+#include <tuple>
 #include <vector>
 
 export module bytecask.delete_log;
@@ -196,8 +204,8 @@ export class DeleteLog;
 
 // The deletes one group's slots applied so far, indexed for the checks of
 // the group's later slots. Every one is above any read sequence the group
-// checks (apply_batch refuses one past the published state, and the group
-// only writes above it), so being here is the whole answer. Handed to the
+// checks (a read point at or past the head is TooOld, and the group only
+// writes above it), so being here is the whole answer. Handed to the
 // DeleteLog once the group is appended (DeleteLog::record).
 export class StagedRemovals {
 public:
@@ -244,22 +252,19 @@ public:
   DeleteLog(const DeleteLog &) = delete;
   auto operator=(const DeleteLog &) -> DeleteLog & = delete;
 
-  // Forgets every delete: a plan read below `latest` is too old from now on.
-  // Used at open, and wherever the key directory changes by a path that does
-  // not record its deletes (resume(), ingest).
-  void reset(std::uint64_t latest) noexcept {
+  // A group that assigned sequences [first, last], once it is appended,
+  // with its deletes; takes them out of `staged`. A first that does not
+  // follow the last sequence recorded means sequences in between came from
+  // elsewhere: everything older is forgotten. Storing the deletes may fail
+  // for want of memory: the log then forgets everything instead, which makes
+  // older plans too old rather than unchecked, since every delete lost is at
+  // or below `last`.
+  void record(StagedRemovals &staged, std::uint64_t first,
+              std::uint64_t last) noexcept {
     std::lock_guard<std::mutex> lk{mu_};
-    clear_locked(latest);
-  }
-
-  // A group's deletes, once the group is appended; takes them out of
-  // `staged`. Storing them may fail for want of memory: the log then forgets
-  // everything instead, which makes older plans too old rather than
-  // unchecked, since every delete lost is at or below the group's last.
-  void record(StagedRemovals &staged) noexcept {
+    if (first != recorded_through_ + 1) clear_locked(first - 1);
+    recorded_through_ = last;
     if (staged.empty()) return;
-    const auto last = staged.last_seq_;
-    std::lock_guard<std::mutex> lk{mu_};
     if (max_bytes_ == 0) {
       clear_locked(last);
     } else {
@@ -284,7 +289,7 @@ public:
   [[nodiscard]] auto removed(ByteView key, std::uint64_t read_seq,
                              std::uint64_t below) const -> std::optional<bool> {
     std::lock_guard<std::mutex> lk{mu_};
-    if (read_seq < horizon_) return std::nullopt;
+    if (!answers_locked(read_seq, below)) return std::nullopt;
     if (key_removed_locked(key, read_seq, below)) return true;
     // The key's latest range delete answers alone unless it is at or above
     // `below`; then an earlier one may still fall in the window.
@@ -303,23 +308,11 @@ public:
                                 std::uint64_t below) const
       -> std::optional<bool> {
     std::lock_guard<std::mutex> lk{mu_};
-    if (read_seq < horizon_) return std::nullopt;
-    auto past_below = false;
-    for (auto it = latest_.lower_bound(from); it != latest_.end(); ++it) {
-      if (!byte_less(it->first, to)) break;
-      if (it->second >= below) {
-        past_below = true;
-      } else if (it->second > read_seq) {
-        return true;
-      }
-    }
-    // A key whose latest delete is past `below` may have an earlier one in
-    // the window.
-    if (past_below) {
-      const auto in_range = [&](const LogBytes &k) {
-        return key_in_range(k, from, to);
-      };
-      if (any_key_locked(read_seq, below, in_range)) return true;
+    if (!answers_locked(read_seq, below)) return std::nullopt;
+    for (auto it = by_key_.lower_bound(KeyProbe{from, 0}); it != by_key_.end();
+         ++it) {
+      if (!byte_less(*it->key, to)) break;
+      if (it->seq > read_seq && it->seq < below) return true;
     }
     auto range_past_below = false;
     const auto in_window = [&](std::uint64_t seq) {
@@ -340,45 +333,87 @@ public:
     std::lock_guard<std::mutex> lk{mu_};
     return horizon_;
   }
+  // The last sequence of the unbroken run record() was handed.
+  [[nodiscard]] auto recorded_through() const -> std::uint64_t {
+    std::lock_guard<std::mutex> lk{mu_};
+    return recorded_through_;
+  }
   [[nodiscard]] auto bytes() const -> std::size_t {
     std::lock_guard<std::mutex> lk{mu_};
     return bytes_locked();
   }
 
 private:
-  using Map = std::map<LogBytes, std::uint64_t, ByteLess>;
+  // Each logged key and how many of the logged point deletes name it.
+  using Keys = std::map<LogBytes, std::uint64_t, ByteLess>;
+  // One point delete, by (key, sequence): the key's bytes live in keys_.
+  struct KeySeq {
+    const LogBytes *key;
+    std::uint64_t seq;
+  };
+  struct KeyProbe {
+    ByteView key;
+    std::uint64_t seq;
+  };
+  struct KeySeqLess {
+    using is_transparent = void;
+    static auto parts(const KeySeq &k) -> std::pair<ByteView, std::uint64_t> {
+      return {*k.key, k.seq};
+    }
+    static auto parts(const KeyProbe &k) -> std::pair<ByteView, std::uint64_t> {
+      return {k.key, k.seq};
+    }
+    template <typename A, typename B>
+    auto operator()(const A &a, const B &b) const -> bool {
+      const auto [ak, as] = parts(a);
+      const auto [bk, bs] = parts(b);
+      if (byte_less(ak, bk)) return true;
+      if (byte_less(bk, ak)) return false;
+      return as < bs;
+    }
+  };
   struct KeyRemoval {
     std::uint64_t seq;
-    Map::iterator key;  // map iterators stay valid until their node is erased
+    Keys::iterator key;  // map iterators stay valid until their node is erased
   };
 
   // Rough cost of each record beyond its key or bound bytes, for the
-  // max_bytes budget: a map node plus its queue slot, a queue slot, a range's
-  // queue slot. A range's segments are counted by RangeSegments.
+  // max_bytes budget: a key's map node; a point delete's index node and
+  // queue slot; a range's queue slot. A range's segments are counted by
+  // RangeSegments.
   static constexpr std::size_t kNodeBytes = 64;
-  static constexpr std::size_t kKeyRemovalBytes = 16;
+  static constexpr std::size_t kKeyRemovalBytes = 64;
   static constexpr std::size_t kRangeBytes = 64;
 
   [[nodiscard]] auto bytes_locked() const noexcept -> std::size_t {
     return bytes_ + segments_.bytes();
   }
 
+  // Whether every delete above read_seq that a state below `below` holds is
+  // here: none was dropped (the horizon), and every sequence up to below - 1
+  // came through record() (no gap).
+  [[nodiscard]] auto answers_locked(std::uint64_t read_seq,
+                                    std::uint64_t below) const noexcept
+      -> bool {
+    if (read_seq < horizon_) return false;
+    return below <= recorded_through_ + 1 || read_seq + 1 >= below;
+  }
+
   void record_locked(StagedRemovals &staged) {
     // The group's point deletes join order_ in sequence order; the staged map
-    // holds them in key order. Each staged node moves into latest_, so a
-    // key is copied once per delete, when it is staged.
+    // holds them in key order. Each staged node moves into keys_, so a key
+    // is copied once per delete, when it is staged.
     std::vector<KeyRemoval> group;
     group.reserve(staged.keys_.size());
     while (!staged.keys_.empty()) {
       auto node = staged.keys_.extract(staged.keys_.begin());
       const auto seq = node.mapped();
       const auto key_bytes = node.key().size();
-      const auto placed = latest_.insert(std::move(node));
-      if (placed.inserted) {
-        bytes_ += key_bytes + kNodeBytes;
-      } else {
-        placed.position->second = seq;
-      }
+      node.mapped() = 0;
+      const auto placed = keys_.insert(std::move(node));
+      if (placed.inserted) bytes_ += key_bytes + kNodeBytes;
+      ++placed.position->second;
+      by_key_.insert(KeySeq{&placed.position->first, seq});
       group.push_back({seq, placed.position});
       bytes_ += kKeyRemovalBytes;
     }
@@ -391,38 +426,25 @@ private:
     }
   }
 
-  // The key's latest delete answers alone unless it is at or above `below`;
-  // then an earlier one may still fall in the window.
+  // The key's first logged delete above read_seq answers: it is the only
+  // one that can fall in (read_seq, below).
   auto key_removed_locked(ByteView key, std::uint64_t read_seq,
                           std::uint64_t below) const -> bool {
-    const auto it = latest_.find(key);
-    if (it == latest_.end()) return false;
-    if (it->second < below) return it->second > read_seq;
-    return any_key_locked(read_seq, below, [&](const LogBytes &k) {
-      return std::ranges::equal(k, key);
-    });
+    const auto it = by_key_.upper_bound(KeyProbe{key, read_seq});
+    if (it == by_key_.end()) return false;
+    return std::ranges::equal(*it->key, key) && it->seq < below;
   }
 
-  // Walks the point deletes newer than read_seq, newest first.
-  template <typename Pred>
-  auto any_key_locked(std::uint64_t read_seq, std::uint64_t below,
-                      Pred matches) const -> bool {
-    for (auto it = order_.rbegin(); it != order_.rend(); ++it) {
-      if (it->seq <= read_seq) return false;
-      if (it->seq >= below) continue;
-      if (matches(it->key->first)) return true;
-    }
-    return false;
-  }
-
-  // Walks the range deletes newer than read_seq, newest first: only for a
-  // state older than a range's latest delete.
+  // Walks the range deletes in (read_seq, below), newest first: only for a
+  // state older than the newest range delete over what is asked, so the
+  // walk is the range deletes of that window, found by sequence.
   template <typename Pred>
   auto any_range_locked(std::uint64_t read_seq, std::uint64_t below,
                         Pred matches) const -> bool {
-    for (auto it = ranges_.rbegin(); it != ranges_.rend(); ++it) {
+    auto it = std::ranges::lower_bound(ranges_, below, {}, &RangeRemoval::seq);
+    while (it != ranges_.begin()) {
+      --it;
       if (it->seq <= read_seq) return false;
-      if (it->seq >= below) continue;
       if (matches(*it)) return true;
     }
     return false;
@@ -445,11 +467,12 @@ private:
   void drop_oldest_key_locked() noexcept {
     const auto r = order_.front();
     order_.pop_front();
+    by_key_.erase(by_key_.find(KeySeq{&r.key->first, r.seq}));
     bytes_ -= kKeyRemovalBytes;
     horizon_ = std::max(horizon_, r.seq);
-    if (r.key->second == r.seq) {
+    if (--r.key->second == 0) {
       bytes_ -= r.key->first.size() + kNodeBytes;
-      latest_.erase(r.key);
+      keys_.erase(r.key);
     }
   }
 
@@ -463,7 +486,8 @@ private:
 
   void clear_locked(std::uint64_t latest) noexcept {
     order_.clear();
-    latest_.clear();
+    by_key_.clear();
+    keys_.clear();
     ranges_.clear();
     segments_.clear();
     bytes_ = 0;
@@ -474,8 +498,13 @@ private:
   std::size_t max_bytes_;
   std::size_t bytes_{0};
   std::uint64_t horizon_{0};
-  // Each key's latest point delete, for lookups by key.
-  Map latest_;
+  // The last sequence of the unbroken run record() was handed; 0 before the
+  // first group.
+  std::uint64_t recorded_through_{0};
+  // Each logged key, owning its bytes.
+  Keys keys_;
+  // Every point delete by (key, sequence), for lookups by key or key range.
+  std::set<KeySeq, KeySeqLess> by_key_;
   // Every point delete in sequence order, for dropping the oldest; several
   // may name one key.
   std::deque<KeyRemoval> order_;

@@ -7983,20 +7983,34 @@ auto plan_on(PlanBase base, bytecask::Snapshot snap) -> bytecask::WritePlan {
   return bytecask::WritePlan{snap.sequence(), snap.marker()};
 }
 
-// A del of key the head made at seq.
+// A del of key the head made at seq, in a group that follows the last one
+// the log recorded.
 void removed(bytecask::DeleteLog &log, const std::string &key,
              std::uint64_t seq) {
   bytecask::StagedRemovals staged;
   staged.add_key(to_bytes(key), seq);
-  log.record(staged);
+  log.record(staged, log.recorded_through() + 1, seq);
 }
 
-// A del_range of [from, to) the head made at seq.
+// A del_range of [from, to) the head made at seq, the same way.
 void range_removed(bytecask::DeleteLog &log, const std::string &from,
                    const std::string &to, std::uint64_t seq) {
   bytecask::StagedRemovals staged;
   staged.add_range(to_bytes(from), to_bytes(to), seq);
-  log.record(staged);
+  log.record(staged, log.recorded_through() + 1, seq);
+}
+
+// Checks plan against t with a log that recorded every sequence below t's:
+// what a DB's log holds when every write before t went through a group that
+// deleted nothing more than the test logged.
+auto validate(const bytecask::TransientEngineState &t,
+              const bytecask::WritePlan &plan, bytecask::DeleteLog &deletes)
+    -> bytecask::TransientEngineState::Verdict {
+  if (deletes.recorded_through() + 1 < t.next_seq()) {
+    bytecask::StagedRemovals none;
+    deletes.record(none, deletes.recorded_through() + 1, t.next_seq() - 1);
+  }
+  return t.validate_preconditions(plan, deletes);
 }
 
 } // namespace
@@ -8011,7 +8025,7 @@ TEST_CASE("validate_preconditions: MustExist passes when key present",
   bytecask::WritePlan plan;
   plan.ensure_present(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: MustExist fails when key absent",
@@ -8022,7 +8036,7 @@ TEST_CASE("validate_preconditions: MustExist fails when key absent",
   bytecask::WritePlan plan;
   plan.ensure_present(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: MustBeAbsent passes when key absent",
@@ -8033,7 +8047,7 @@ TEST_CASE("validate_preconditions: MustBeAbsent passes when key absent",
   bytecask::WritePlan plan;
   plan.ensure_absent(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: MustBeAbsent fails when key present",
@@ -8044,7 +8058,7 @@ TEST_CASE("validate_preconditions: MustBeAbsent fails when key present",
   bytecask::WritePlan plan;
   plan.ensure_absent(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: None precondition always passes",
@@ -8054,7 +8068,7 @@ TEST_CASE("validate_preconditions: None precondition always passes",
   bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan;
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 // --- MustBeUnchanged (requires snapshot) ---
@@ -8069,7 +8083,7 @@ TEST_CASE("validate_preconditions: MustBeUnchanged passes when key unchanged",
   auto plan = plan_on(base, std::move(snap));
   plan.ensure_unchanged(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: MustBeUnchanged fails when key modified",
@@ -8082,7 +8096,7 @@ TEST_CASE("validate_preconditions: MustBeUnchanged fails when key modified",
   auto plan = plan_on(base, std::move(snap));
   plan.ensure_unchanged(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: MustBeUnchanged fails when key deleted",
@@ -8096,7 +8110,7 @@ TEST_CASE("validate_preconditions: MustBeUnchanged fails when key deleted",
   auto plan = plan_on(base, std::move(snap));
   plan.ensure_unchanged(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: MustBeUnchanged passes when key absent in both",
@@ -8109,7 +8123,7 @@ TEST_CASE("validate_preconditions: MustBeUnchanged passes when key absent in bot
   auto plan = plan_on(base, std::move(snap));
   plan.ensure_unchanged(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: MustBeUnchanged fails when key appeared",
@@ -8122,7 +8136,7 @@ TEST_CASE("validate_preconditions: MustBeUnchanged fails when key appeared",
   auto plan = plan_on(base, std::move(snap));
   plan.ensure_unchanged(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 // --- Range guards ---
@@ -8137,7 +8151,7 @@ TEST_CASE("validate_preconditions: range guard passes when range unchanged",
   auto plan = plan_on(base, std::move(snap));
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
   plan.put(to_bytes("x"), to_bytes("new"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: range guard fails when key modified in range",
@@ -8150,7 +8164,7 @@ TEST_CASE("validate_preconditions: range guard fails when key modified in range"
   auto plan = plan_on(base, std::move(snap));
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
   plan.put(to_bytes("x"), to_bytes("new"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: range guard fails when key inserted in range",
@@ -8163,7 +8177,7 @@ TEST_CASE("validate_preconditions: range guard fails when key inserted in range"
   auto plan = plan_on(base, std::move(snap));
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
   plan.put(to_bytes("x"), to_bytes("new"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: range guard fails when key deleted in range",
@@ -8177,7 +8191,7 @@ TEST_CASE("validate_preconditions: range guard fails when key deleted in range",
   auto plan = plan_on(base, std::move(snap));
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
   plan.put(to_bytes("x"), to_bytes("new"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: range guard ignores keys outside range",
@@ -8190,7 +8204,7 @@ TEST_CASE("validate_preconditions: range guard ignores keys outside range",
   auto plan = plan_on(base, std::move(snap));
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
   plan.put(to_bytes("x"), to_bytes("new"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 // --- Implicit W-W conflict detection (snapshot present) ---
@@ -8204,7 +8218,7 @@ TEST_CASE("validate_preconditions: W-W passes when write key unchanged",
   const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
   auto plan = plan_on(base, std::move(snap));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: W-W fails when write key modified",
@@ -8216,7 +8230,7 @@ TEST_CASE("validate_preconditions: W-W fails when write key modified",
   const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
   auto plan = plan_on(base, std::move(snap));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: W-W fails when write key appeared",
@@ -8228,7 +8242,7 @@ TEST_CASE("validate_preconditions: W-W fails when write key appeared",
   const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
   auto plan = plan_on(base, std::move(snap));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: W-W fails when write key deleted",
@@ -8241,7 +8255,7 @@ TEST_CASE("validate_preconditions: W-W fails when write key deleted",
   const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
   auto plan = plan_on(base, std::move(snap));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: W-W passes for new key absent in both",
@@ -8253,7 +8267,7 @@ TEST_CASE("validate_preconditions: W-W passes for new key absent in both",
   const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
   auto plan = plan_on(base, std::move(snap));
   plan.put(to_bytes("new_key"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: W-W skips guard-only keys",
@@ -8268,7 +8282,7 @@ TEST_CASE("validate_preconditions: W-W skips guard-only keys",
   auto plan = plan_on(base, std::move(snap));
   plan.ensure_present(to_bytes("g"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 // --- Combined scenarios ---
@@ -8284,7 +8298,7 @@ TEST_CASE("validate_preconditions: multiple guards all pass",
   plan.ensure_present(to_bytes("a"));
   plan.ensure_unchanged(to_bytes("b"));
   plan.put(to_bytes("a"), to_bytes("new_a"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: one failing guard rejects plan",
@@ -8298,7 +8312,7 @@ TEST_CASE("validate_preconditions: one failing guard rejects plan",
   plan.ensure_present(to_bytes("a"));
   plan.ensure_unchanged(to_bytes("b"));
   plan.put(to_bytes("a"), to_bytes("new_a"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: del with snapshot triggers W-W check",
@@ -8310,7 +8324,7 @@ TEST_CASE("validate_preconditions: del with snapshot triggers W-W check",
   const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
   auto plan = plan_on(base, std::move(snap));
   plan.del(to_bytes("k"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Conflict);
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: no snapshot skips W-W checks",
@@ -8320,7 +8334,7 @@ TEST_CASE("validate_preconditions: no snapshot skips W-W checks",
   bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan;
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: a removal at or below the read sequence is not a change",
@@ -8334,7 +8348,7 @@ TEST_CASE("validate_preconditions: a removal at or below the read sequence is no
   auto plan = plan_on(base, std::move(snap));
   plan.ensure_unchanged(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: a key written and removed again since the base conflicts for a sequence plan only",
@@ -8350,7 +8364,7 @@ TEST_CASE("validate_preconditions: a key written and removed again since the bas
   const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
   auto plan = plan_on(base, std::move(snap));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) ==
+  CHECK(validate(t, plan, deletes) ==
         (base == PlanBase::Snapshot ? Verdict::Holds : Verdict::Conflict));
 }
 
@@ -8371,22 +8385,22 @@ TEST_CASE("validate_preconditions: a range delete since the base over an absent 
   SECTION("a written key inside the range") {
     auto plan = plan_on(base, std::move(snap));
     plan.put(to_bytes("k"), to_bytes("v1"));
-    CHECK(t.validate_preconditions(plan, deletes) == expect(true));
+    CHECK(validate(t, plan, deletes) == expect(true));
   }
   SECTION("a written key past the range") {
     auto plan = plan_on(base, std::move(snap));
     plan.put(to_bytes("m"), to_bytes("v1"));
-    CHECK(t.validate_preconditions(plan, deletes) == expect(false));
+    CHECK(validate(t, plan, deletes) == expect(false));
   }
   SECTION("a range guard overlapping it") {
     auto plan = plan_on(base, std::move(snap));
     plan.ensure_range_unchanged(to_bytes("l"), to_bytes("z"));
-    CHECK(t.validate_preconditions(plan, deletes) == expect(true));
+    CHECK(validate(t, plan, deletes) == expect(true));
   }
   SECTION("a range guard next to it") {
     auto plan = plan_on(base, std::move(snap));
     plan.ensure_range_unchanged(to_bytes("m"), to_bytes("z"));
-    CHECK(t.validate_preconditions(plan, deletes) == expect(false));
+    CHECK(validate(t, plan, deletes) == expect(false));
   }
 }
 
@@ -8395,21 +8409,23 @@ TEST_CASE("validate_preconditions: a read sequence below the delete log's horizo
   auto state = make_state({{"k", kde(10, 0, 1, 5)}});
   auto t = state->transient();
   bytecask::DeleteLog deletes{std::size_t{1} << 20};
-  deletes.reset(kSnapSeq + 1);
+  // Sequences up to kSnapSeq + 1 came from a path the log never saw.
+  bytecask::StagedRemovals none;
+  deletes.record(none, kSnapSeq + 2, kSnapSeq + 2);
   // Only a check that needs the log is too old for it: an absent key here.
   bytecask::WritePlan plan{kSnapSeq, bytecask::kOriginMarker};
   plan.put(to_bytes("absent"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::TooOld);
+  CHECK(validate(t, plan, deletes) == Verdict::TooOld);
   bytecask::WritePlan present{kSnapSeq, bytecask::kOriginMarker};
   present.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(present, deletes) == Verdict::Holds);
+  CHECK(validate(t, present, deletes) == Verdict::Holds);
   bytecask::WritePlan at_horizon{kSnapSeq + 1, bytecask::kOriginMarker};
   at_horizon.put(to_bytes("absent"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(at_horizon, deletes) == Verdict::Holds);
+  CHECK(validate(t, at_horizon, deletes) == Verdict::Holds);
   // A plan on the snapshot itself is never too old: it does not use the log.
   bytecask::WritePlan on_snapshot{make_snapshot({{"k", kde(10, 0, 1, 5)}})};
   on_snapshot.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(on_snapshot, deletes) == Verdict::Holds);
+  CHECK(validate(t, on_snapshot, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: a read point on another history or past the head is too old",
@@ -8423,7 +8439,7 @@ TEST_CASE("validate_preconditions: a read point on another history or past the h
   const auto verdict = [&](std::uint64_t read_seq, bytecask::ChangeMarker m) {
     bytecask::WritePlan plan{read_seq, m};
     plan.put(to_bytes("k"), to_bytes("v1"));
-    return t.validate_preconditions(plan, deletes);
+    return validate(t, plan, deletes);
   };
   CHECK(verdict(kSnapSeq, bytecask::kOriginMarker) == Verdict::Holds);
   CHECK(verdict(kSnapSeq, bytecask::ChangeMarker{5, 42}) == Verdict::TooOld);
@@ -8444,7 +8460,7 @@ TEST_CASE("validate_preconditions: a removal after the state checked is not part
   auto plan = plan_on(base, std::move(snap));
   plan.ensure_unchanged(to_bytes("k"));
   plan.ensure_range_unchanged(to_bytes("a"), to_bytes("z"));
-  CHECK(t.validate_preconditions(plan, deletes) == Verdict::Holds);
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 // ---------------------------------------------------------------------------
@@ -9890,7 +9906,11 @@ TEST_CASE("WritePlan: a moved-from snapshot is refused",
   CHECK_THROWS_AS((void)snap.sequence(), std::logic_error);
   bytecask::WritePlan plan{std::move(kept)};
   plan.put(to_bytes("k"), to_bytes("v"));
-  CHECK(db.apply_batch({}, std::move(plan)).has_value());
+  // A moved-from plan has no read sequence, rather than a snapshot to read.
+  auto moved_to = std::move(plan);
+  CHECK_FALSE(plan.read_sequence().has_value());  // NOLINT(bugprone-use-after-move)
+  CHECK(moved_to.read_sequence().has_value());
+  CHECK(db.apply_batch({}, std::move(moved_to)).has_value());
 }
 
 TEST_CASE("read point: one read on another history is refused as TooOld",
@@ -10030,6 +10050,26 @@ TEST_CASE("read point: only a check that needs the delete log is too old for it"
       db.close();
     }
     auto db = bytecask::DB::open(dir);
+    check_read(db, read);
+  }
+  SECTION("read before a promotion") {
+    // The promotion's marker takes a sequence no write group assigned: the
+    // log cannot tell what changed across it.
+    auto db = bytecask::DB::open(dir, {.initial_mode = bytecask::Mode::Follower});
+    const auto k = to_bytes("k");
+    const auto v0 = to_bytes("v0");
+    const std::vector<bytecask::DataEntryView> slice{
+        {1, bytecask::EntryType::Put, k, v0}};
+    db.ingest(bytecask::ChangeHeader{}, slice);
+    const auto read = read_point(db);
+    db.set_mode(bytecask::Mode::Leader);
+    // Before any write group: the state checked reaches past every
+    // sequence the log recorded.
+    {
+      auto plan = plan_at(read);
+      plan.put(to_bytes("absent"), to_bytes("v1"));
+      expect_too_old(db, std::move(plan));
+    }
     check_read(db, read);
   }
   SECTION("more deletes since than the log holds") {

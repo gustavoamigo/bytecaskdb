@@ -35,7 +35,7 @@ TransientEngineState::TransientEngineState(
     std::size_t scratch_bytes)
     : key_dir_{std::move(key_dir)}, files_{std::move(files)},
       file_stats_{std::move(file_stats)}, active_file_id_{active_file_id},
-      next_file_id_{next_file_id}, next_seq_{next_seq},
+      next_file_id_{next_file_id}, next_seq_{next_seq}, base_seq_{next_seq},
       durable_seq_{durable_seq}, sync_requested_seq_{sync_requested_seq},
       mode_{mode}, degraded_{degraded},
       degraded_reason_{std::move(degraded_reason)},
@@ -190,7 +190,7 @@ public:
                              std::size_t /*write_index*/) const -> Change {
     if (cur) return change_if(cur->sequence() > read_seq_);
     if (head_.removed_.removes(key)) return Change::Changed;
-    return change_of(deletes_.removed(key, read_seq_, head_.next_seq_));
+    return change_of(deletes_.removed(key, read_seq_, head_.base_seq_));
   }
 
   [[nodiscard]] auto range_changed(std::span<const std::byte> from,
@@ -208,10 +208,14 @@ public:
     }
     // Keys a delete since R named, by del or by a range delete. They leave
     // no entry to carry a sequence, so a retry has to see the head's latest.
-    rests_on = head_.next_seq_ - 1;
-    if (head_.removed_.removes_any_in(from, to)) return Change::Changed;
-    return change_of(
-        deletes_.removed_in(from, to, read_seq_, head_.next_seq_));
+    // rests_on is set only on Changed, as SnapshotCheck sets it.
+    const auto change =
+        head_.removed_.removes_any_in(from, to)
+            ? Change::Changed
+            : change_of(deletes_.removed_in(from, to, read_seq_,
+                                            head_.base_seq_));
+    if (change == Change::Changed) rests_on = head_.next_seq_ - 1;
+    return change;
   }
 
 private:

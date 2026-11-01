@@ -130,8 +130,9 @@ enum class PlanRefusal {
   Conflict,
   // Plans on a read point only: it cannot be checked here. Read on another
   // history (before a crash, across a failover), past the latest sequence,
-  // or needing deletes the engine no longer tracks (from before a reopen,
-  // resume() or ingest, or more than Options::max_delete_log_bytes holds).
+  // or needing deletes the engine no longer tracks (from before a reopen, a
+  // promotion, an ingest or a resume() that replayed writes, or more than
+  // Options::max_delete_log_bytes holds).
   // Take a fresh snapshot.
   TooOld,
 };

@@ -161,10 +161,12 @@ DB::DB(std::filesystem::path dir, Options opts)
     if (test_before_validate_) test_before_validate_(*initial);
 #endif
     validate_state_consistency(*initial);
-    if (initial->mode == Mode::Leader) initial = with_open_marker(*initial);
-    // The deletes before this open were never recorded here: a plan that
-    // needs them is too old.
-    deletes_.reset(initial->next_seq - 1);
+    // The marker is appended to a state that passed, and the state it
+    // makes is checked before it is published.
+    if (initial->mode == Mode::Leader) {
+      initial = with_open_marker(*initial);
+      validate_state_consistency(*initial);
+    }
     store_initial_state(std::move(initial));
   } catch (...) {
     ::close(lock_fd_);

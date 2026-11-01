@@ -578,7 +578,8 @@ void WritePlan::ensure_range_unchanged(BytesView from,
 }
 
 auto WritePlan::read_sequence() const noexcept -> std::optional<std::uint64_t> {
-  if (!impl_->plan) return std::nullopt;
+  // A moved-from plan has no Impl.
+  if (!impl_ || !impl_->plan) return std::nullopt;
   return impl_->plan->read_sequence();
 }
 
