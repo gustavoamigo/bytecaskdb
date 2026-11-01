@@ -79,7 +79,7 @@ enum class ValueCompare { Eq, Ne, Lt, Le, Gt, Ge };
 // on `lhs`), COALESCE and NULLIF; a string function or ||; or, in a select list only,
 // * or `table`.*, which the binder expands to columns.
 struct Expr {
-  enum class Kind { Column, Param, Const, Literal, Add, Sub, Mul, Div, Star, Plus, Neg, Compare, IsNull, Not, And, Or, Cast, Aggregate, Subquery, Case, Coalesce, NullIf, Func, Clock };
+  enum class Kind { Column, Param, Const, Literal, Add, Sub, Mul, Div, Star, Plus, Neg, Compare, IsNull, Not, And, Or, Cast, Aggregate, Subquery, Case, Coalesce, NullIf, Func, Clock, Default };
   enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind;
   std::string column;       // Column; Aggregate's argument, "" for COUNT(*)

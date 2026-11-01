@@ -349,3 +349,33 @@
       expected: [[1, 10]]
   teardown:
     - DROP TABLE t
+
+- name: DEFAULT in an INSERT and an UPDATE takes the column's default, NULL without one
+  features: [F221]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER DEFAULT 123, b INTEGER)
+  steps:
+    - sql: INSERT INTO t (id, a, b) VALUES (1, DEFAULT, DEFAULT)
+      rowcount: 1
+    - sql: INSERT INTO t VALUES (2, 5, 6)
+      rowcount: 1
+    - sql: SELECT id, a, b FROM t ORDER BY id
+      expected: [[1, 123, null], [2, 5, 6]]
+      ordered: true
+    - sql: UPDATE t SET a = DEFAULT, b = DEFAULT WHERE id = 2
+      rowcount: 1
+    - sql: SELECT id, a, b FROM t ORDER BY id
+      expected: [[1, 123, null], [2, 123, null]]
+      ordered: true
+  teardown:
+    - DROP TABLE t
+
+- name: DEFAULT for a NOT NULL column without a default is a not-null violation
+  features: [F221]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL)
+  steps:
+    - sql: INSERT INTO t VALUES (1, DEFAULT)
+      error: "23502"
+  teardown:
+    - DROP TABLE t
