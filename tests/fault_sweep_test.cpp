@@ -139,13 +139,15 @@ auto same_stats(const bytecask::FileStats &a, const bytecask::FileStats &b)
 // Opens two copies of what a clean close left in `dir`, one with serial
 // recovery and one with parallel, and holds both to `expected` and to each
 // other, file stats included. Each open adds an active file of its own, so
-// only the files both saw are compared.
+// only the files both saw are compared. Both open as followers, which recover
+// the same state as a leader's open but append no ChangeMarker of their own.
 void assert_reopens(const std::filesystem::path &dir, const KeyValues &expected,
                     std::uint64_t expected_next_seq, Options opts) {
   const auto twin = dir.parent_path() / (dir.filename().string() + "_parallel");
   std::filesystem::remove_all(twin);
   std::filesystem::copy(dir, twin);
 
+  opts.initial_mode = bytecask::Mode::Follower;
   auto recover = [&](const std::filesystem::path &d, unsigned threads) {
     opts.recovery_threads = threads;
     auto db = DB::open(d, opts);

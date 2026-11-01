@@ -2046,15 +2046,17 @@ enum class DegradeMemory { available, exhausted };
 constexpr Options kPostLoopFollower{.max_file_bytes = 100,
                                     .initial_mode = bytecask::Mode::Follower};
 
-// Five puts that cross a 100-byte file only with the last, so ingest
-// rotates after its loop, not inside it: checked on a copy, where the slice
-// fills one file and leaves the next empty (inside the loop, the last put
-// would have gone to the next file).
+// The leader's open marker (27 bytes) and four 21-byte puts, which cross a
+// 100-byte file only with the last, so ingest rotates after its loop, not
+// inside it: checked on a copy, where the slice fills one file and leaves
+// the next empty (inside the loop, the last put would have gone to the next
+// file).
+constexpr char kPostLoopLast = 'd';
 auto post_loop_rotation_slice() -> bytecask::testing::OwnedEntries {
   TempDir td;
   auto slice = [&] {
     auto leader = DB::open(td.path / "leader");
-    for (char c = 'a'; c <= 'e'; ++c)
+    for (char c = 'a'; c <= kPostLoopLast; ++c)
       leader.put({.sync = true}, to_bytes(std::string(1, c)), to_bytes("x"));
     const auto snap = leader.snapshot();
     return bytecask::testing::collect_changes(leader.changes_since(snap, 0));
@@ -2104,12 +2106,12 @@ void ingest_post_loop_rotation_fails(const char *checkpoint,
     CHECK(fi.inj.fired);
   }
   expect_io_failure_refused(*db, memory, reason);
-  for (char c = 'a'; c <= 'e'; ++c)
+  for (char c = 'a'; c <= kPostLoopLast; ++c)
     CHECK(value_of(*db, std::string(1, c)) == "<absent>");
   CHECK_THROWS_AS(db->ingest(slice.header, slice.views()), DbDegraded);
   REQUIRE_NOTHROW(db->resume());
   db->ingest(slice.header, slice.views());
-  for (char c = 'a'; c <= 'e'; ++c)
+  for (char c = 'a'; c <= kPostLoopLast; ++c)
     CHECK(value_of(*db, std::string(1, c)) == "x");
   bytecask::testing::assert_consistent(*db);
 }

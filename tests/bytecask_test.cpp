@@ -1281,12 +1281,24 @@ namespace {
 
 constexpr std::uint64_t kEntry = 23;  // 15 header + 2 key + 2 value + 4 CRC
 
-// Data files ordered by the sequence of their first record.
+// An open in Leader mode appends a ChangeMarker to its fresh active file.
+// The tests below lay out files entry by entry: after the open they call
+// seal_open_marker, which seals that marker in a file of its own, and they
+// leave marker-only files out of data_files_by_sequence.
+void seal_open_marker(bytecask::DB &db) {
+  (void)db.create_manifest();  // seals the active file, the marker alone
+}
+constexpr std::uint64_t kMarkerFileBytes =
+    bytecask::change_marker_size(bytecask::EntryType::ChangeMarker);
+
+// Data files ordered by the sequence of their first record, but for files
+// holding only an open's ChangeMarker.
 auto data_files_by_sequence(const std::filesystem::path &dir)
     -> std::vector<std::filesystem::path> {
   std::vector<std::pair<std::uint64_t, std::filesystem::path>> files;
   for (const auto &e : std::filesystem::directory_iterator{dir}) {
     if (e.path().extension() != ".data") continue;
+    if (e.file_size() == kMarkerFileBytes) continue;
     std::ifstream f{e.path(), std::ios::binary};
     std::array<unsigned char, 8> b{};
     f.read(reinterpret_cast<char *>(b.data()), 8);
@@ -1500,6 +1512,7 @@ TEST_CASE("DB recovery: a hint-less file's tail is truncated only in the "
                                      .fail_recovery_on_crc_errors = strict};
         {
           auto db = bytecask::DB::open(dir, opts);
+          seal_open_marker(db);
           for (int i = 0; i < 14; ++i)
             db.put({.sync = true}, to_bytes(std::format("k{:x}", i)),
                    to_bytes(std::format("v{:x}", i)));
@@ -1551,6 +1564,7 @@ TEST_CASE("DB recovery: a crash while open writes a hint leaves no hint behind "
   const bytecask::Options opts{.max_file_bytes = 100};
   {
     auto db = bytecask::DB::open(dir, opts);
+    seal_open_marker(db);
     for (int i = 0; i < 14; ++i)
       db.put({.sync = true}, to_bytes(std::format("k{:x}", i)),
              to_bytes(std::format("v{:x}", i)));
@@ -1603,6 +1617,7 @@ TEST_CASE("DB recovery: open fails when the cut of a torn tail cannot be "
     opts.buffer_pool.capacity_bytes = 1024 * 1024;
   {
     auto db = bytecask::DB::open(dir, opts);
+    seal_open_marker(db);
     for (int i = 0; i < 14; ++i)
       db.put({.sync = true}, to_bytes(std::format("k{:x}", i)),
              to_bytes(std::format("v{:x}", i)));
@@ -1648,6 +1663,7 @@ TEST_CASE("DB read: a record past the end of its file names the file, the "
   const bytecask::Options opts{.max_file_bytes = 100};
   {
     auto db = bytecask::DB::open(dir, opts);
+    seal_open_marker(db);
     for (int i = 0; i < 14; ++i)
       db.put({.sync = true}, to_bytes(std::format("k{:x}", i)),
              to_bytes(std::format("v{:x}", i)));
@@ -1684,13 +1700,16 @@ TEST_CASE("DB vacuum: a damaged sealed file is not compacted away",
   std::filesystem::path victim;
   {
     auto db = bytecask::DB::open(db_path, opts);
+    seal_open_marker(db);
     for (int i = 0; i < 8; ++i) {
       db.put({.sync = true}, to_bytes(std::format("a{}", i)),
              to_bytes(std::format("v{}", i)));
-      // Only one data file exists until the first rotation.
+      // Only one data file but the marker's exists until the first rotation.
       if (i == 0)
         for (const auto &e : std::filesystem::directory_iterator{db_path})
-          if (e.path().extension() == ".data") victim = e.path();
+          if (e.path().extension() == ".data" &&
+              e.file_size() != kMarkerFileBytes)
+            victim = e.path();
     }
     // Overwrite half of them so the first file qualifies for compaction.
     for (int i = 0; i < 4; ++i)
@@ -3365,6 +3384,10 @@ static auto tombstone_size(std::string_view key) -> std::uint64_t {
   return bytecask::kHeaderSize + key.size() + bytecask::kCrcSize;
 }
 
+// The ChangeMarker an open in Leader mode appends to its fresh active file.
+static constexpr auto kOpenMarkerBytes =
+    bytecask::change_marker_size(bytecask::EntryType::ChangeMarker);
+
 // ---------------------------------------------------------------------------
 // put accounts for live_bytes and total_bytes on the active file
 // ---------------------------------------------------------------------------
@@ -3383,7 +3406,7 @@ TEST_CASE("FileStats: put tracks live_bytes and total_bytes",
 
   const auto expected = esize("k1", "v1") + esize("k2", "val2");
   CHECK(fs.live_bytes == expected);
-  CHECK(fs.total_bytes == expected);
+  CHECK(fs.total_bytes == kOpenMarkerBytes + expected);  // and the open's marker
 }
 
 // ---------------------------------------------------------------------------
@@ -3403,7 +3426,8 @@ TEST_CASE("FileStats: overwrite decrements old live_bytes",
 
   // Only the new entry is live; both entries exist on disk.
   CHECK(fs.live_bytes == esize("k", "new_value"));
-  CHECK(fs.total_bytes == esize("k", "old_value") + esize("k", "new_value"));
+  CHECK(fs.total_bytes == kOpenMarkerBytes + esize("k", "old_value") +
+                              esize("k", "new_value"));
 }
 
 // ---------------------------------------------------------------------------
@@ -3422,7 +3446,8 @@ TEST_CASE("FileStats: del decrements live_bytes, tombstone in total_bytes",
   const auto &fs = stats.begin()->second;
 
   CHECK(fs.live_bytes == 0);
-  CHECK(fs.total_bytes == esize("k", "value") + tombstone_size("k"));
+  CHECK(fs.total_bytes ==
+        kOpenMarkerBytes + esize("k", "value") + tombstone_size("k"));
 }
 
 // ---------------------------------------------------------------------------
@@ -3443,7 +3468,8 @@ TEST_CASE("FileStats: apply_batch tracks stats with bulk markers",
   const auto &fs = stats.begin()->second;
 
   const auto bulk_marker_size = bytecask::kHeaderSize + bytecask::kCrcSize;
-  const auto expected_total = bulk_marker_size * 2 + // BulkBegin + BulkEnd
+  const auto expected_total = kOpenMarkerBytes +      // the open's marker
+                              bulk_marker_size * 2 + // BulkBegin + BulkEnd
                               esize("a", "va") + esize("b", "vb");
   CHECK(fs.live_bytes == esize("a", "va") + esize("b", "vb"));
   CHECK(fs.total_bytes == expected_total);
@@ -3511,14 +3537,16 @@ TEST_CASE("FileStats: fragmentation computation", "[bytecask][filestats]") {
   REQUIRE(stats.size() == 1);
   const auto &fs = stats.begin()->second;
 
-  // 3 entries on disk, 2 live.
+  // 3 entries on disk, 2 live, after the open's marker (kept, not live).
   const auto one_entry = esize("k1", "value");
   CHECK(fs.live_bytes == 2 * one_entry);
-  CHECK(fs.total_bytes == 3 * one_entry);
+  CHECK(fs.change_marker_bytes == kOpenMarkerBytes);
+  CHECK(fs.total_bytes == kOpenMarkerBytes + 3 * one_entry);
 
-  // fragmentation = 1 - live/total = 1/3 ≈ 0.333
+  // fragmentation of the entries = 1 - live/(total - marker) = 1/3 ≈ 0.333
   auto frag = 1.0 - static_cast<double>(fs.live_bytes) /
-                         static_cast<double>(fs.total_bytes);
+                         static_cast<double>(fs.total_bytes -
+                                             fs.change_marker_bytes);
   CHECK(frag > 0.33);
   CHECK(frag < 0.34);
 }
@@ -3540,8 +3568,10 @@ TEST_CASE("FileStats: recovery reconstructs stats", "[bytecask][filestats]") {
     pre_stats = db.file_stats();
   }
 
-  // Reopen — recovery from hint files.
-  auto db2 = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+  // Reopen — recovery from hint files. As a follower, whose open writes no
+  // ChangeMarker of its own.
+  auto db2 = bytecask::DB::open(
+      db_path, {.max_file_bytes = 1, .initial_mode = bytecask::Mode::Follower});
   auto post_stats = db2.file_stats();
 
   // Verify live_bytes and total_bytes per sealed file match.
@@ -3649,7 +3679,10 @@ TEST_CASE("Preallocated tail: sealed files shrink to their logical size",
         std::filesystem::copy_file(e.path(), crash_path / e.path().filename());
     }
     {
-      auto crashed = bytecask::DB::open(crash_path, opts);
+      // Recovery checks open as followers, which write no ChangeMarker.
+      auto check_opts = opts;
+      check_opts.initial_mode = bytecask::Mode::Follower;
+      auto crashed = bytecask::DB::open(crash_path, check_opts);
       const auto cr = size_report(crashed);
       for (const auto &[physical, total] : cr.sealed) CHECK(physical == total);
       std::uint64_t post_total = 0;
@@ -3669,7 +3702,9 @@ TEST_CASE("Preallocated tail: sealed files shrink to their logical size",
   }
   CHECK(on_disk == pre_total);
 
-  auto db2 = bytecask::DB::open(db_path, opts);
+  auto check_opts = opts;  // a follower's open writes no ChangeMarker
+  check_opts.initial_mode = bytecask::Mode::Follower;
+  auto db2 = bytecask::DB::open(db_path, check_opts);
   const auto r2 = size_report(db2);
   for (const auto &[physical, total] : r2.sealed) CHECK(physical == total);
   std::uint64_t post_total = 0;
@@ -3793,6 +3828,7 @@ struct OwnedHint {
   std::string key;
   std::uint32_t value_size;
   std::string end_key;
+  std::uint64_t marker_id{0};  // a ChangeMarker's id
 };
 
 auto only_hint(const std::filesystem::path &dir) -> std::filesystem::path {
@@ -3810,7 +3846,7 @@ auto read_hint(const std::filesystem::path &p) -> std::vector<OwnedHint> {
   while (const auto he = scanner.next()) {
     out.push_back({he->sequence, he->entry_type, he->file_offset,
                    to_string(he->key), he->value_size,
-                   to_string(he->end_key)});
+                   to_string(he->end_key), he->marker_id});
   }
   return out;
 }
@@ -3822,6 +3858,8 @@ void write_hint(const std::filesystem::path &p,
   for (const auto &e : entries) {
     if (e.type == bytecask::EntryType::RangeDel) {
       hf.append_range_del(e.seq, e.offset, to_bytes(e.key), to_bytes(e.end_key));
+    } else if (e.type == bytecask::EntryType::ChangeMarker) {
+      hf.append_change_marker(e.seq, e.offset, e.marker_id);
     } else {
       hf.append(e.seq, e.type, e.offset, to_bytes(e.key), e.value_size);
     }
@@ -3847,13 +3885,14 @@ TEST_CASE("recovery checks the layout of a hint file's sorted run",
   }
   const auto hint = only_hint(dir);
   const auto written = read_hint(hint);
-  // The head (both batch markers, then the range tombstone) and the run: a,
-  // then b's Delete before its older Put.
+  // The head (the open's ChangeMarker, both batch markers, then the range
+  // tombstone) and the run: a, then b's Delete before its older Put.
   using bytecask::EntryType;
-  REQUIRE(written.size() == 6);
-  const auto &[begin, end, range, a, b_del, b_put] =
+  REQUIRE(written.size() == 7);
+  const auto &[marker, begin, end, range, a, b_del, b_put] =
       std::tie(written[0], written[1], written[2], written[3], written[4],
-               written[5]);
+               written[5], written[6]);
+  REQUIRE(marker.type == EntryType::ChangeMarker);
   REQUIRE(begin.type == EntryType::BulkBegin);
   REQUIRE(end.type == EntryType::BulkEnd);
   REQUIRE(range.type == EntryType::RangeDel);
@@ -3862,20 +3901,20 @@ TEST_CASE("recovery checks the layout of a hint file's sorted run",
   REQUIRE(b_put.type == EntryType::Put);
 
   SECTION("batch markers inside the run are passed over") {
-    write_hint(hint, {range, a, begin, b_del, end, b_put});
+    write_hint(hint, {marker, range, a, begin, b_del, end, b_put});
     auto db = bytecask::DB::open(dir);
     CHECK(get_val(db, to_bytes("a")).has_value());
     CHECK_FALSE(get_val(db, to_bytes("b")).has_value());
   }
   SECTION("keys descending are refused") {
-    write_hint(hint, {begin, end, range, b_del, b_put, a});
+    write_hint(hint, {marker, begin, end, range, b_del, b_put, a});
     // Each recovery words it its own way.
     CHECK_THROWS_WITH(bytecask::DB::open(dir),
                       Catch::Matchers::ContainsSubstring("not sorted") ||
                           Catch::Matchers::ContainsSubstring("not ascending"));
   }
   SECTION("a range tombstone after the head is refused") {
-    write_hint(hint, {begin, end, a, range, b_del, b_put});
+    write_hint(hint, {marker, begin, end, a, range, b_del, b_put});
     CHECK_THROWS_WITH(
         bytecask::DB::open(dir),
         Catch::Matchers::ContainsSubstring("range tombstone inside"));
@@ -4377,8 +4416,10 @@ TEST_CASE("vacuum does not select a file holding only tombstones",
   for (const unsigned threads : {1U, 4U}) {
     const auto copy = td.path / std::format("copy{}", threads);
     std::filesystem::copy(path, copy, std::filesystem::copy_options::recursive);
+    // As a follower, whose open writes no ChangeMarker of its own.
     auto db = bytecask::DB::open(copy, {.max_file_bytes = 1,
-                                        .recovery_threads = threads});
+                                        .recovery_threads = threads,
+                                        .initial_mode = bytecask::Mode::Follower});
     std::vector<std::uint64_t> want;
     std::vector<std::uint64_t> got;
     // Every open starts a fresh, empty active file; only files with bytes
@@ -4518,6 +4559,7 @@ TEST_CASE("vacuum drops a tombstone after the Put it hid is gone",
   const auto dir = td.path / "db";
   {
     auto db = bytecask::DB::open(dir);
+    seal(db);  // the open's ChangeMarker, kept for ever, in a file of its own
     db.put({}, to_bytes("a"), to_bytes("old"));
     seal(db);  // A: only a
     db.put({}, to_bytes("x"), to_bytes("1"));
@@ -4867,7 +4909,9 @@ TEST_CASE("FileStats: tombstone and marker bytes survive reopen",
     }
     before = collect_file_stats(db);
   }
-  auto db = bytecask::DB::open(dir, {.recovery_threads = threads});
+  // As a follower, whose open writes no ChangeMarker of its own.
+  auto db = bytecask::DB::open(dir, {.recovery_threads = threads,
+                                     .initial_mode = bytecask::Mode::Follower});
   auto after = collect_file_stats(db);
   // Each open starts an empty active file.
   const auto empty = [](const FileStatsTuple &t) { return std::get<1>(t) == 0; };
@@ -4908,11 +4952,13 @@ TEST_CASE("vacuum keeps dead entries above retain_after", "[vacuum][retain]") {
   TempDir td;
   const auto dir = td.path / "db";
   std::uint64_t retain = 0;
+  std::uint64_t first_put = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 128});
     for (int i = 0; i < 10; ++i) {
       const auto seq =
           db.put({}, to_bytes(std::format("k{}", i)), to_bytes("old")).sequence;
+      if (i == 0) first_put = seq;
       if (i == 4) retain = seq;
     }
     for (int i = 0; i < 10; ++i)
@@ -4921,8 +4967,10 @@ TEST_CASE("vacuum keeps dead entries above retain_after", "[vacuum][retain]") {
     while (db.vacuum({.fragmentation_threshold = 0.0, .retain_after = retain})) {
     }
     CHECK(db.stats().at("bytecask.vacuum_bytes_reclaimed") > 0);
-    // Dropped at or below retain_after, kept above it.
-    CHECK(stream_sequences(db, 0).front() > 1);
+    // Dropped at or below retain_after, kept above it. (The open's marker,
+    // sequence 1, is kept for ever.)
+    const auto kept = stream_sequences(db, 0);
+    CHECK(std::ranges::find(kept, first_put) == kept.end());
     check_complete_from(db, retain);
     CHECK(collect_kv(db).at("k7") == "new");
   }
@@ -4972,7 +5020,9 @@ TEST_CASE("vacuum is not stalled by a file whose dead entries are all above "
   auto db = bytecask::DB::open(td.path / "db");
   // File 1: six keys, one of them later overwritten — a little to reclaim,
   // all of it at or below the retention point.
-  for (int i = 0; i < 6; ++i)
+  const auto a0_first =
+      db.put({}, to_bytes("a0"), to_bytes("xxxxxxxx")).sequence;
+  for (int i = 1; i < 6; ++i)
     db.put({}, to_bytes(std::format("a{}", i)), to_bytes("xxxxxxxx"));
   seal(db);
   // File 2: two keys that stay live, then four that die, above the point.
@@ -4989,7 +5039,10 @@ TEST_CASE("vacuum is not stalled by a file whose dead entries are all above "
   // File 2 is the more fragmented but has nothing vacuum may drop; file 1
   // is compacted instead.
   CHECK(db.vacuum({.fragmentation_threshold = 0.0, .retain_after = retain}));
-  CHECK(stream_sequences(db, 0).front() == 2);  // a0's first write went
+  // a0's first write went; the open's marker before it is kept for ever.
+  const auto after = stream_sequences(db, 0);
+  CHECK(std::ranges::find(after, a0_first) == after.end());
+  CHECK(after.front() == 1);
   check_complete_from(db, retain);
   CHECK_FALSE(db.vacuum({.fragmentation_threshold = 0.0, .retain_after = retain}));
 }
@@ -5255,7 +5308,9 @@ TEST_CASE("vacuum keeps total_bytes equal to the compacted file's size",
     before = stats_shape(db);
   }
 
-  auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+  // As a follower, whose open writes no ChangeMarker of its own.
+  auto db = bytecask::DB::open(
+      db_path, {.max_file_bytes = 1, .initial_mode = bytecask::Mode::Follower});
   // Recovery computes total_bytes from the file's actual size. If vacuum
   // undercounted, these disagree by kHeaderSize + kCrcSize per marker.
   CHECK(stats_shape(db) == before);
@@ -5277,6 +5332,9 @@ TEST_CASE("vacuum unlinks stale file immediately, snapshot reads via open fd",
   auto db_path = td.path / "db";
   auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
 
+  // The open's marker shares the first file with this put, so v1 below
+  // gets a file of its own, which vacuum can remove whole.
+  db.put({}, to_bytes("other"), to_bytes("x"));
   db.put({}, to_bytes("k"), to_bytes("v1"));
   db.put({}, to_bytes("k"), to_bytes("v2")); // kills v1 → file qualifies
 
@@ -6681,10 +6739,11 @@ TEST_CASE("class G: key not visible after rotation sync failure", "[g_visibility
 TEST_CASE("resume() recovers from degraded state", "[degraded][resume]") {
   TempDir td;
 
-  // max_file_bytes=30 triggers rotation once the file exceeds ~30 bytes.
-  // Each entry is ~23 bytes (15 hdr + 4 crc + 2 key + 2 value).
-  // k1 fits (23 bytes); k2 pushes the file to ~46 bytes, triggering rotation.
-  bytecask::DB db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 30});
+  // max_file_bytes=60 triggers rotation once the file reaches 60 bytes.
+  // The open's marker is 27 bytes, each entry here 23 (15 hdr + 4 crc +
+  // 2 key + 2 value). With k1 the file holds 50; k2 pushes it to 73,
+  // triggering rotation.
+  bytecask::DB db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 60});
   db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
 
   {
@@ -6722,9 +6781,9 @@ TEST_CASE("directory sync: a failed sync at rotation degrades before the new "
   TempDir td;
   const auto db_path = td.path / "db";
   {
-    // As in "resume() recovers from degraded state": k2 crosses the 30-byte
+    // As in "resume() recovers from degraded state": k2 crosses the 60-byte
     // threshold, and the rotation after its commit creates the next file.
-    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 30});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 60});
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     const auto files_before = data_files_in(db_path);
     {
@@ -6746,15 +6805,17 @@ TEST_CASE("directory sync: a failed sync at rotation degrades before the new "
   }
   // The file left behind by the failed rotation is recovered like the active
   // file of a crash.
-  auto db = bytecask::DB::open(db_path, {.max_file_bytes = 30});
+  auto db = bytecask::DB::open(db_path, {.max_file_bytes = 60});
   CHECK(collect_kv(db) == std::map<std::string, std::string>{
                               {"k1", "v1"}, {"k2", "v2"}, {"k3", "v3"}});
 }
 
 TEST_CASE("directory sync: a failed sync in resume() stays degraded",
           "[dir_sync][degraded][resume]") {
+  // As in "resume() recovers from degraded state": k2 crosses the 60-byte
+  // threshold.
   TempDir td;
-  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 30});
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 60});
   db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
   {
     bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
@@ -7048,7 +7109,12 @@ auto degrade_with_unsynced_batch(bytecask::DB &db,
                       std::system_error);
   }
   REQUIRE(db.is_degraded());
-  return raw_entry_offsets(active_data_file(dir));
+  // The file's first record is the open's ChangeMarker; the callers index
+  // the writes after it.
+  auto offsets = raw_entry_offsets(active_data_file(dir));
+  REQUIRE_FALSE(offsets.empty());
+  offsets.erase(offsets.begin());
+  return offsets;
 }
 
 }  // namespace
@@ -7408,10 +7474,10 @@ TEST_CASE("create_manifest whose fdatasync fails degrades, and a power cut "
     durable = db.durable_sequence();
     cache.model.copy_device(dir, after_cut);  // power cut
   }
-  // k{i} was written at sequence i + 1.
+  // k{i} was written at sequence i + 2, after the open's marker.
   auto db = bytecask::DB::open(after_cut);
   for (int i = 0; i <= kUnsyncedPuts; ++i) {
-    if (static_cast<std::uint64_t>(i) + 1 > durable) break;
+    if (static_cast<std::uint64_t>(i) + 2 > durable) break;
     INFO("key " << i << ", durable_sequence " << durable);
     CHECK(get_str(db, to_bytes(fsyncgate_key(i))) == fsyncgate_value(i));
   }
@@ -7433,7 +7499,8 @@ TEST_CASE("create_manifest after resume() from its failed fdatasync makes "
     }
     REQUIRE_NOTHROW(db.resume());
     const auto manifest = db.create_manifest();
-    CHECK(manifest.through_sequence == static_cast<std::uint64_t>(kUnsyncedPuts + 1));
+    // The open's marker, then kUnsyncedPuts + 1 puts.
+    CHECK(manifest.through_sequence == static_cast<std::uint64_t>(kUnsyncedPuts + 2));
     cache.model.copy_device(dir, after_cut);  // power cut
   }
   auto db = bytecask::DB::open(after_cut);
@@ -7455,11 +7522,13 @@ TEST_CASE("vacuum does not drop a durable record that only an unsynced write "
       TempDir td;
       const auto dir = td.path / "db";
       const auto after_cut = td.path / "after_cut";
-      // Two 25-byte entries fill the first file and seal it. The 23-byte
-      // overwrites stay below the limit, so no rotation syncs them.
+      // The open's marker is sealed in a file of its own. Two 25-byte
+      // entries fill the next file and seal it. The 23-byte overwrites stay
+      // below the limit, so no rotation syncs them.
       const bytecask::Options opts{.max_file_bytes = 50};
       {
         auto db = bytecask::DB::open(dir, opts);
+        seal(db);
         db.put({.sync = true}, to_bytes("k0"), to_bytes("v_k0"));
         db.put({.sync = true}, to_bytes("k1"), to_bytes("v_k1"));
         if (whole_file)
@@ -7488,6 +7557,7 @@ TEST_CASE("vacuum whose fdatasync fails degrades, keeps the source file, and "
   const bytecask::Options opts{.max_file_bytes = 50};  // as above
   {
     auto db = bytecask::DB::open(dir, opts);
+    seal(db);  // the open's marker in a file of its own, as above
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k0"), to_bytes("n0"));
@@ -9262,19 +9332,20 @@ TEST_CASE("durable_sequence reflects sync writes", "[durable_seq]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
 
-  // Fresh DB with no writes: durable_seq == 0 (next_seq starts at 1,
-  // no keys recovered, so durable_seq = next_seq - 1 = 0).
-  CHECK(db.durable_sequence() == 0);
+  // Fresh DB with no writes: durable_seq is the open's own marker, synced
+  // before open returns (sequence 1; next_seq starts at 1).
+  const auto opened = db.durable_sequence();
+  CHECK(opened == 1);
 
   // NoSync write — must NOT advance durable_seq.
   db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
-  CHECK(db.durable_sequence() == 0);
+  CHECK(db.durable_sequence() == opened);
 
   // Sync write — must advance durable_seq to cover both keys
   // (group commit: the sync also confirms the earlier nosync entry).
   db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
   auto seq_after_sync = db.durable_sequence();
-  CHECK(seq_after_sync >= 2);
+  CHECK(seq_after_sync >= opened + 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -9282,14 +9353,16 @@ TEST_CASE("durable_sequence reflects sync writes", "[durable_seq]") {
 // ---------------------------------------------------------------------------
 TEST_CASE("durable_sequence stays at zero for nosync-only writes",
           "[durable_seq]") {
+  // "Zero" past the open's own marker, which the open synced.
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
+  const auto opened = db.durable_sequence();
 
   for (int i = 0; i < 10; ++i) {
     db.put({.sync = false}, to_bytes(std::format("k{}", i)),
            to_bytes(std::format("v{}", i)));
   }
-  CHECK(db.durable_sequence() == 0);
+  CHECK(db.durable_sequence() == opened);
 }
 
 // ---------------------------------------------------------------------------
@@ -9302,7 +9375,7 @@ TEST_CASE("durable_sequence returns immediately for reached targets",
 
   db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
   auto baseline = db.durable_sequence();
-  REQUIRE(baseline >= 1);
+  REQUIRE(baseline >= 2);  // the open's marker, then k1
 
   auto start = std::chrono::steady_clock::now();
   // min_sequence = 0: always trivially reached.
@@ -9319,22 +9392,23 @@ TEST_CASE("durable_sequence returns immediately for reached targets",
 TEST_CASE("durable_sequence long-poll wakes on sync write", "[durable_seq][concurrency]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
+  const auto target = db.durable_sequence() + 1;  // past the open's marker
 
   std::atomic<std::uint64_t> polled_seq{0};
   std::thread poller{[&] {
     polled_seq.store(
-        db.durable_sequence(1, std::chrono::milliseconds{5000}),
+        db.durable_sequence(target, std::chrono::milliseconds{5000}),
         std::memory_order_release);
   }};
 
   // Give poller time to block on the condvar.
   std::this_thread::sleep_for(std::chrono::milliseconds{50});
 
-  // Sync write wakes the poller by reaching target sequence 1.
+  // Sync write wakes the poller by reaching the target sequence.
   db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
 
   poller.join();
-  CHECK(polled_seq.load(std::memory_order_acquire) >= 1);
+  CHECK(polled_seq.load(std::memory_order_acquire) >= target);
 }
 
 // ---------------------------------------------------------------------------
@@ -9344,12 +9418,14 @@ TEST_CASE("durable_sequence long-poll times out on idle DB", "[durable_seq]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
 
+  // The target past the open's marker is never reached — nothing is
+  // written.
+  const auto target = db.durable_sequence() + 1;
   auto start = std::chrono::steady_clock::now();
-  // Target 1 is never reached — nothing is written.
-  auto seq = db.durable_sequence(1, std::chrono::milliseconds{50});
+  auto seq = db.durable_sequence(target, std::chrono::milliseconds{50});
   auto elapsed = std::chrono::steady_clock::now() - start;
 
-  CHECK(seq < 1);
+  CHECK(seq < target);
   CHECK(elapsed >= std::chrono::milliseconds{40});
 }
 
@@ -9357,8 +9433,9 @@ TEST_CASE("durable_sequence with no timeout returns an unreached target at once"
           "[durable_seq]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
+  const auto opened = db.durable_sequence();  // the open's own marker
   const auto start = std::chrono::steady_clock::now();
-  CHECK(db.durable_sequence(1, std::chrono::milliseconds{0}) == 0);
+  CHECK(db.durable_sequence(opened + 1, std::chrono::milliseconds{0}) == opened);
   CHECK(std::chrono::steady_clock::now() - start <
         std::chrono::milliseconds{2000});
 }
@@ -9367,6 +9444,7 @@ TEST_CASE("durable_sequence wakes a waiter when the DB closes",
           "[durable_seq][concurrency]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
+  const auto target = db.durable_sequence() + 1;  // past the open's marker
   std::latch parked{1};
   std::atomic<bool> signalled{false};
   db.test_in_sequence_wait_ = [&] {
@@ -9375,7 +9453,7 @@ TEST_CASE("durable_sequence wakes a waiter when the DB closes",
   std::exception_ptr err;
   std::thread waiter{[&] {
     try {
-      (void)db.durable_sequence(1, std::chrono::seconds{30});
+      (void)db.durable_sequence(target, std::chrono::seconds{30});
     } catch (...) {
       err = std::current_exception();
     }
@@ -10153,6 +10231,9 @@ TEST_CASE("vacuum drops batch when all entries are stale",
   TempDir td;
   auto db_path = td.path / "db";
   auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+  // The open's ChangeMarker, kept for ever, in a file of its own, so the
+  // batch's file can go whole.
+  seal(db);
 
   // Write a batch.
   {
@@ -10200,19 +10281,19 @@ TEST_CASE("vacuum drops batch when all entries are stale",
 TEST_CASE("single write sets min_sequence and max_sequence",
           "[file_stats_seq]") {
   TempDir td;
-  auto db = bytecask::DB::open(td.path);
-  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  auto db = bytecask::DB::open(td.path);  // the open's marker: 1
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));  // 2
 
   auto stats = db.file_stats();
   REQUIRE(stats.size() == 1);
   const auto &[fid, fs] = *stats.begin();
   CHECK(fs.min_sequence == 1);
-  CHECK(fs.max_sequence == 1);
+  CHECK(fs.max_sequence == 2);
 }
 
 TEST_CASE("multiple writes update sequence range", "[file_stats_seq]") {
   TempDir td;
-  auto db = bytecask::DB::open(td.path);
+  auto db = bytecask::DB::open(td.path);  // the open's marker: 1
   db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
   db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
   db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
@@ -10221,13 +10302,13 @@ TEST_CASE("multiple writes update sequence range", "[file_stats_seq]") {
   REQUIRE(stats.size() == 1);
   const auto &[fid, fs] = *stats.begin();
   CHECK(fs.min_sequence == 1);
-  CHECK(fs.max_sequence == 3);
+  CHECK(fs.max_sequence == 4);
 }
 
 TEST_CASE("batch write covers marker sequences", "[file_stats_seq]") {
   TempDir td;
-  auto db = bytecask::DB::open(td.path);
-  // 3-op batch: BulkBegin(1), Put(2), Put(3), Put(4), BulkEnd(5)
+  auto db = bytecask::DB::open(td.path);  // the open's marker: 1
+  // 3-op batch: BulkBegin(2), Put(3), Put(4), Put(5), BulkEnd(6)
   bytecask::WritePlan plan;
   plan.put(to_bytes("k1"), to_bytes("v1"));
   plan.put(to_bytes("k2"), to_bytes("v2"));
@@ -10238,7 +10319,7 @@ TEST_CASE("batch write covers marker sequences", "[file_stats_seq]") {
   REQUIRE(stats.size() == 1);
   const auto &[fid, fs] = *stats.begin();
   CHECK(fs.min_sequence == 1);
-  CHECK(fs.max_sequence == 5);
+  CHECK(fs.max_sequence == 6);
 }
 
 // A batch's end marker carries the highest sequence of the batch. A restart
@@ -10258,16 +10339,19 @@ TEST_CASE("a write after a restart does not reuse a batch marker's sequence",
     batch_end = r->sequence;  // the BulkEnd's
   }
   auto db = bytecask::DB::open(td.path);
-  CHECK(db.durable_sequence() == batch_end);
+  // The reopen's own marker takes the sequence after the BulkEnd's.
+  CHECK(db.durable_sequence() == batch_end + 1);
+  CHECK(db.snapshot().marker().since_sequence == batch_end + 1);
   CHECK(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")).sequence >
-        batch_end);
+        batch_end + 1);
 }
 
 TEST_CASE("rotation preserves sealed file bounds and resets new",
           "[file_stats_seq]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path, {.max_file_bytes = 1});
-  // First write goes to file 1; rotation triggered.
+  // The open's marker (1) and the first write (2) go to file 1; rotation
+  // triggered.
   db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
   // Second write goes to a new active file.
   db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -10278,10 +10362,10 @@ TEST_CASE("rotation preserves sealed file bounds and resets new",
   bool found_sealed = false;
   bool found_new = false;
   for (const auto &[fid, fs] : stats) {
-    if (fs.min_sequence == 1 && fs.max_sequence == 1) {
+    if (fs.min_sequence == 1 && fs.max_sequence == 2) {
       found_sealed = true;
     }
-    if (fs.min_sequence == 2 && fs.max_sequence == 2) {
+    if (fs.min_sequence == 3 && fs.max_sequence == 3) {
       found_new = true;
     }
   }
@@ -10323,8 +10407,10 @@ TEST_CASE("recovery reconstructs min_max sequences", "[file_stats_seq]") {
     pre_close_stats = db.file_stats();
   }
 
-  // Reopen — recovery rebuilds stats from hint files.
-  auto db = bytecask::DB::open(td.path);
+  // Reopen — recovery rebuilds stats from hint files. As a follower, whose
+  // open writes no ChangeMarker of its own.
+  auto db = bytecask::DB::open(td.path,
+                               {.initial_mode = bytecask::Mode::Follower});
   auto post_open_stats = db.file_stats();
 
   // Verify each sealed file from pre-close appears in post-open with
@@ -10350,7 +10436,7 @@ TEST_CASE("recovery reconstructs min_max sequences", "[file_stats_seq]") {
 
 TEST_CASE("nosync writes track sequences", "[file_stats_seq]") {
   TempDir td;
-  auto db = bytecask::DB::open(td.path);
+  auto db = bytecask::DB::open(td.path);  // the open's marker: 1
   db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
   db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
 
@@ -10358,7 +10444,7 @@ TEST_CASE("nosync writes track sequences", "[file_stats_seq]") {
   REQUIRE(stats.size() == 1);
   const auto &[fid, fs] = *stats.begin();
   CHECK(fs.min_sequence == 1);
-  CHECK(fs.max_sequence == 2);
+  CHECK(fs.max_sequence == 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -10396,8 +10482,9 @@ TEST_CASE("empty db manifest", "[manifest]") {
 
   auto manifest = db.create_manifest();
 
-  // No writes — through_sequence is 0.
-  CHECK(manifest.through_sequence == 0);
+  // No writes — through_sequence is the open's own marker.
+  CHECK(manifest.through_sequence == db.snapshot().marker().since_sequence);
+  CHECK(manifest.through_sequence == 1);
 
   // Snapshot has no keys.
   bytecask::Bytes out;
@@ -12416,11 +12503,13 @@ TEST_CASE("stats: fresh DB has zero counters and one open file",
   TempDir td;
   auto db = bytecask::DB::open(td.path);
   auto s = db.stats();
-  CHECK(s.at("bytecask.bytes_written") == 0);
+  // All but the open's own ChangeMarker: one record, one fdatasync.
+  CHECK(s.at("bytecask.bytes_written") ==
+        static_cast<std::int64_t>(kOpenMarkerBytes));
   CHECK(s.at("bytecask.group_writer_batches") == 0);
   CHECK(s.at("bytecask.group_writer_coalesced") == 0);
   CHECK(s.at("bytecask.group_writer_busy_us") == 0);
-  CHECK(s.at("bytecask.fsyncs") == 0);
+  CHECK(s.at("bytecask.fsyncs") == 1);
   CHECK(s.at("bytecask.disk_reads") == 0);
   CHECK(s.at("bytecask.disk_read_bytes") == 0);
   CHECK(s.at("bytecask.crc_failures") == 0);

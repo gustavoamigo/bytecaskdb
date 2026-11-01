@@ -347,11 +347,16 @@ inline auto rotation_operation() -> Operation {
           }};
 }
 
+// The open's ChangeMarker shares the first file with the first write: sealed
+// on its own first, the setups below lay out their files as without it.
+inline void seal_open_marker(DB &db) { (void)db.create_manifest(); }
+
 inline auto vacuum_operation() -> Operation {
   return {.name = "vacuum",
           .opts = {.max_file_bytes = 50},
           .setup =
               [](DB &db) {
+                seal_open_marker(db);
                 db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
                 db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
                 (void)db.del({.sync = false}, to_bytes("k1"));
@@ -594,6 +599,7 @@ inline auto vacuum_failed_sync_operation() -> Operation {
           .opts = {.max_file_bytes = 50},
           .setup =
               [](DB &db) {
+                seal_open_marker(db);
                 db.put({.sync = true}, to_bytes("k0"), to_bytes("v_k0"));
                 db.put({.sync = true}, to_bytes("k1"), to_bytes("v_k1"));
                 db.put({.sync = false}, to_bytes("k0"), to_bytes("n0"));
