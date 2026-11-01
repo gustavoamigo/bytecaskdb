@@ -47,8 +47,11 @@ struct ColumnRef {
 
 // A typed expression. Its SQL type is the binder's, by types_design.md's
 // rules: a comparison's is BOOLEAN, an aggregate's PostgreSQL's result type.
+// And, Or, Not and IsNull are a predicate's, a WHERE conjunct that is no
+// comparison of its own: three-valued, as SQL's logic is, over comparisons
+// and IS NULL of a column; a filter, never a key's bound.
 struct Expr {
-  enum class Kind { Column, Param, Const, Add, Sub, Compare, Aggregate };
+  enum class Kind { Column, Param, Const, Add, Sub, Compare, Aggregate, And, Or, Not, IsNull };
   enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind{Kind::Param};
   SqlType type{};
@@ -58,7 +61,8 @@ struct Expr {
   Op op{Op::Eq};                // Compare
   Fn fn{Fn::Count};             // Aggregate
   bool distinct{false};         // Aggregate: COUNT(DISTINCT arg)
-  std::vector<Expr> args;       // Add, Sub, Compare: two; Aggregate: none (COUNT(*)) or its argument
+  std::vector<Expr> args;       // Add, Sub, Compare: two; Aggregate: none (COUNT(*)) or its argument;
+                                // And, Or: two or more; Not: one; IsNull: its column
 
   [[nodiscard]] auto phys() const -> PhysType { return phys_type(type); }
 
@@ -107,6 +111,11 @@ struct Expr {
   auto e = binary(Expr::Kind::Compare, std::move(lhs), std::move(rhs), SqlType{SqlKind::Boolean});
   e.op = op;
   return e;
+}
+
+// Whether e is a predicate: And, Or, Not or IsNull.
+[[nodiscard]] auto is_predicate(const Expr& e) -> bool {
+  return e.kind == Expr::Kind::And || e.kind == Expr::Kind::Or || e.kind == Expr::Kind::Not || e.kind == Expr::Kind::IsNull;
 }
 
 // Every column the expression reads, in the order it reads them.
