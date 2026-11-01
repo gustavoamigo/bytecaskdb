@@ -189,6 +189,12 @@ struct Select {
   std::vector<Expr> group_by;  // GROUP BY's columns, as written
   std::vector<Compare> having;  // HAVING's conjuncts
   bool distinct{false};         // SELECT DISTINCT, not DISTINCT ON
+  // An inner join's USING (…), or NATURAL: the columns both tables have,
+  // compared by =, each named alone as one column. using_alias names them
+  // too: USING (…) AS alias.
+  std::vector<std::string> using_columns;
+  bool natural{false};
+  std::string using_alias;
 };
 
 struct Assignment {

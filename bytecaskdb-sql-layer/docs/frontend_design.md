@@ -46,8 +46,13 @@ kind the transformer doesn't take is refused with its position.
 - `GROUP BY` of columns, and `HAVING`, below. A query with a `GROUP BY`, a
   `HAVING` or an aggregate is aggregated; without `GROUP BY` it returns
   exactly one row, or none where its `HAVING` is false.
-- `FROM`: one table, or two joined by a comma or `[INNER] JOIN … ON`.
-  Columns may be qualified by the table's name. Without `FROM`, a
+- `FROM`: one table, or two joined by a comma, `[INNER] JOIN … ON`, `JOIN
+  … USING (cols) [AS alias]` or `NATURAL JOIN`. Columns may be qualified by
+  the table's name. `USING` and `NATURAL` (every column name both tables
+  share) compare their columns by `=`, as `ON` would, and name each alone
+  as one column, the left table's, equal to the right's in every pair; the
+  `USING` alias qualifies those columns only. A name missing from a side is
+  42703, one named twice 42701, as in PostgreSQL. Without `FROM`, a
   `SELECT` of constants returns one row of them, or none under `LIMIT 0`;
   it takes no `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` or `FOR UPDATE`
   yet.
