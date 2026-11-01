@@ -298,6 +298,14 @@ and with a constant selected or `DISTINCT ON`, it is not taken yet.
   aggregate functions"), as PostgreSQL refuses it;
 - on a join, not yet (#534).
 
+**Select-list positions in `ORDER BY`.** `ORDER BY 2` orders a plain `SELECT`
+by its second select-list item. The parser resolves it to that item's
+column, so every later stage sees the column's name; the item must be a
+column (an expression is refused as `ORDER BY` of one is, 42601), a position
+outside the list is 42P10 and any other constant 42601, as in PostgreSQL. A
+position after `*` is refused (42601): the binder expands stars, the parser
+does not.
+
 **Set operations**, `UNION`, `INTERSECT` and `EXCEPT` of two queries, each
 `ALL` or `DISTINCT` (the default), as PostgreSQL's (`planner_design.md`,
 *Set operations*):
@@ -322,9 +330,18 @@ and with a constant selected or `DISTINCT ON`, it is not taken yet.
   scales or with an integer or a float, an integer with `REAL` (PostgreSQL
   rounds it to a float), `DATE` with `TIMESTAMP`, and a literal of no type
   (`NULL`, `'a'`) meeting a column of another type.
-- **`LIMIT`** after the last arm limits the combined rows. `ORDER BY` of the
-  combined rows is refused (42601): it needs the plan to hold typed rows
-  (#681).
+- **`LIMIT`** after the last arm limits the combined rows.
+- **`ORDER BY`** after the last arm orders the combined rows, by the result
+  columns' names (the first arm's) or by position, `ASC` or `DESC`, with
+  `NULLS FIRST` or `LAST` (last under `ASC`, first under `DESC` by default),
+  and a `LIMIT` after it applies to the sorted rows. The names are the
+  output's alone, as in PostgreSQL: a name that is only an arm's column is
+  42703, a name two columns share 42702, a qualified name 42P01 ("missing
+  FROM-clause entry"), a position outside the columns 42P10, and an expression 42601 (PostgreSQL's 0A000).
+  The parser keeps a position (`ast::OrderItem::position`) for the binder
+  to resolve against the outputs (`logical::SetOp::order`). `ORDER BY` inside
+  a parenthesised set operation within another is refused (42601, "not
+  supported yet"). *Select-list positions* below.
 - **A view defined with a set operation** is created, with its columns and
   the tables it reads, and not read yet (42601), as one defined with
   `DISTINCT` or `LIMIT`: reading it needs a derived table.

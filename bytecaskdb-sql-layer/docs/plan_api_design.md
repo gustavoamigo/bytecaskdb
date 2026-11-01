@@ -1,6 +1,7 @@
 # Plan API: a physical algebra for generated plans
 
-Status: **built**, revision 12 (revision 11 with `bc_sub_*` and
+Status: **built**, revision 13 (revision 13 with the sort-key decoders,
+`bc_sort_key_part_*`, for a set operation's `ORDER BY`; revision 11 with `bc_sub_*` and
 `BC_E_CARDINALITY`, for subqueries; revision 10 with `bc_null_row`, for outer
 joins; revision 9 with `bc_like` and
 `BC_E_PATTERN`, for `LIKE`; revision 8 with the sort-key builder,
@@ -717,6 +718,12 @@ void     bc_sort_key_bytes(bc_ctx *, bc_sort_key, bc_view, uint32_t dir, uint32_
 void     bc_sort_key_null(bc_ctx *, bc_sort_key, uint32_t dir, uint32_t nulls);
 void     bc_sort_key_col(bc_ctx *, bc_sort_key, bc_view row, uint32_t col, uint32_t dir, uint32_t nulls);  /* NULL included */
 bc_view  bc_sort_key_end(bc_ctx *, bc_sort_key);
+
+int64_t  bc_sort_key_part_i64(bc_ctx *, bc_view key, uint32_t part);
+double   bc_sort_key_part_f64(bc_ctx *, bc_view key, uint32_t part);
+bool     bc_sort_key_part_bool(bc_ctx *, bc_view key, uint32_t part);
+bc_view  bc_sort_key_part_bytes(bc_ctx *, bc_view key, uint32_t part);
+bool     bc_sort_key_part_null(bc_ctx *, bc_view key, uint32_t part);
 ```
 
 | Function | What it does |
@@ -725,6 +732,8 @@ bc_view  bc_sort_key_end(bc_ctx *, bc_sort_key);
 | `bc_sort_key_i64`, `bc_sort_key_f64`, `bc_sort_key_bool`, `bc_sort_key_bytes`, `bc_sort_key_null` | Appends one part: a value, or NULL, with its direction and NULL placement. Every call of one part takes the same `dir` and `nulls`, a NULL's too, so the plan writes a part's placement once. A `DOUBLE` orders as PostgreSQL's `float8`: `-0.0` and `0.0` make one key, every NaN one key above `+∞`. Before a part is built it is charged the most it can take (a `BYTES` value with every byte escaped: its marker, twice its length and the terminator), and a part that could take the key past `UINT32_MAX` bytes, a view's length, is `BC_E_LIMIT`; once built, the key is charged the bytes it holds. A `dir` or `nulls` outside its enum is `BC_E_HANDLE`. |
 | `bc_sort_key_col` | Appends a row's column as the next part, NULL included: what a plan uses for `ORDER BY col`. A column the plan's `bc_schema_ref` does not declare is `BC_E_HANDLE`, as for every column decoder. |
 | `bc_sort_key_end` | Finalizes the key and returns its view, the step's. The engine's key ceiling does not apply: a sort key never reaches the engine, and its bytes are bounded by the memory budget and the 4 GiB limit on its parts. |
+
+| `bc_sort_key_part_*` | Reads part `part` back from a key built by `bc_sort_key_*`, or from a copy of its bytes: a sorter's payload, which is how a plan holds rows it can read back column by column when they are neither a table's rows nor an index's keys (a set operation's, `planner_design.md`, *Set operations*). `bc_sort_key_part_null` reports a NULL; a typed decoder of a NULL part returns zero or empty. The key holds no layout, so the parts are read in order, part 0 first, each part's type being learned when it is read (a `NULL` is known by its marker, a value by the decoder that read it): a plan calls `_null` and then the typed decoder of a part it does not know to be present, and reads each part again, if it needs to, as the type it read. A part read before its predecessor, or as another type than it was read as, is `BC_E_HANDLE`; a key that does not parse is `BC_E_CORRUPT`. Only `BC_SORT_ASC` parts decode (a `DESC` part is inverted, and reads as another value), and a `DOUBLE` reads back as the key holds it: `-0.0` is `0.0`, every NaN one NaN, so a plan that must keep a zero's sign carries it in a part of its own. A bytes part is unescaped into the arena, the step's, charged. Revision 13. |
 
 A sort key and a table's or index's key do not mix: `bc_sort_key` and
 `bc_key` are distinct handle types, so a plan that passes one to the

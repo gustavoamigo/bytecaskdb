@@ -2270,6 +2270,10 @@ public:
     Gen{w_}.subqueries();
     const auto& limit = p_.set_limit;
     if (limit && *limit == 0) return;  // LIMIT 0 returns nothing, so nothing is read
+    if (!p_.set_order.empty()) {
+      ordered(limit.value_or(0));
+      return;
+    }
     if (limit) {
       stop_ = "setcount < " + std::to_string(*limit);
       w_.line("int64_t setcount = 0;");
@@ -2288,6 +2292,73 @@ private:
   using Row = Gen::Row;
   using Sink = Gen::Sink;
   using Val = Gen::Val;
+
+  // ORDER BY of the combined rows. Every row the arms give is added to one
+  // sorter, as it is in hand: keyed by the ORDER BY columns, each with its
+  // direction and NULL placement, its payload a sort key of all the columns,
+  // each ascending, which the loop after the arms reads back part by part
+  // (bc_sort_key_part_*). A LIMIT is the sorter's `keep`: it holds the first n
+  // in order and no more, and every arm is read whole. Without one the sorter
+  // holds every row, charged to the statement's budget.
+  void ordered(std::int64_t keep) {
+    const auto sorter = fresh("s");
+    w_.line("bc_sorter " + sorter + " = bc_sorter_open(cx, " + std::to_string(keep) + ");");
+    stream(*p_.set, [this, sorter](Writer& w, const Row& row) { add_to_sorter(w, sorter, row); }, false);
+    const auto held = fresh("p");
+    w_.line("bc_view " + held + " = bc_empty(cx);");
+    w_.open("while (bc_sorter_next(cx, " + sorter + ", &" + held + "))");
+    Row row;
+    int part = 0;
+    for (const auto& t : p_.set->types) {
+      const auto type = phys_type(t);
+      const auto n = fresh("n");
+      const auto x = fresh("x");
+      const auto at = std::to_string(part++);
+      w_.line("bool " + n + " = bc_sort_key_part_null(cx, " + held + ", " + at + ");");
+      w_.line(c_type(type) + " " + x + " = " + zero(type) + ";");
+      w_.line("if (!" + n + ") " + x + " = bc_sort_key_part_" + suffix(type) + "(cx, " + held + ", " + at + ");");
+      if (type == PhysType::F64) {
+        const auto neg = std::to_string(part++);
+        w_.line("if (bc_sort_key_part_bool(cx, " + held + ", " + neg + ")) " + x + " *= -1.0;");
+      }
+      row.push_back({n, x, type});
+    }
+    emit(w_, row);
+    w_.close();
+  }
+
+  void add_to_sorter(Writer& w, const std::string& sorter, const Row& row) {
+    if (row.size() != p_.set->types.size()) {
+      throw std::logic_error{"physical plan: a set operation row of other columns than its types"};
+    }
+    auto part = [&](const std::string& key, const Val& v, const std::string& placed) {
+      w.open("if (" + v.null + ")");
+      w.line("bc_sort_key_null(cx, " + key + ", " + placed + ");");
+      w.otherwise();
+      w.line("bc_sort_key_" + suffix(v.type) + "(cx, " + key + ", " + v.value + ", " + placed + ");");
+      w.close();
+    };
+    const auto k = fresh("k");
+    w.line("bc_sort_key " + k + " = bc_sort_key_begin(cx);");
+    for (const auto& o : p_.set_order) {
+      part(k, row[o.column],
+           std::string{o.desc ? "BC_SORT_DESC" : "BC_SORT_ASC"} + ", " +
+               (o.nulls_first ? "BC_SORT_NULLS_FIRST" : "BC_SORT_NULLS_LAST"));
+    }
+    const auto key = fresh("v");
+    w.line("bc_view " + key + " = bc_sort_key_end(cx, " + k + ");");
+    const auto d = fresh("k");
+    w.line("bc_sort_key " + d + " = bc_sort_key_begin(cx);");
+    for (const auto& v : row) {
+      part(d, v, "BC_SORT_ASC, BC_SORT_NULLS_LAST");
+      // The key holds -0.0 as 0.0; the sign of a zero rides in a part of its own.
+      if (v.type == PhysType::F64) {
+        w.line("bc_sort_key_bool(cx, " + d + ", !" + v.null + " && " + v.value + " == 0.0 && 1.0 / " + v.value +
+               " < 0.0, BC_SORT_ASC, BC_SORT_NULLS_LAST);");
+      }
+    }
+    w.line("bc_sorter_add(cx, " + sorter + ", " + key + ", bc_sort_key_end(cx, " + d + "));");
+  }
 
   auto fresh(const std::string& what) -> std::string { return "set" + what + std::to_string(ids_++); }
 
@@ -2584,6 +2655,7 @@ auto plan_for(const logical::Node& n, const Catalog& cat, const RowCounts& count
   p.catalog_version = cat.version();
   p.set = set_tree(*set->node, cat, counts, memory_bytes, param_types, p);
   p.set_limit = set->limit;
+  p.set_order = set->op->order;
   for (const auto& o : set->op->outputs) p.result.push_back({o.name, o.expr.type});
   return p;
 }

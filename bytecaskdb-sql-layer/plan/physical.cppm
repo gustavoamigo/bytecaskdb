@@ -454,6 +454,8 @@ struct Plan {
   // `subs` are the statement's.
   std::shared_ptr<const SetPlan> set;
   std::optional<std::int64_t> set_limit;
+  // ORDER BY of the combined rows, by the columns of the root's `types`.
+  std::vector<logical::SetOp::Order> set_order;
   std::vector<Sub> subs;  // run in order, before anything else
   std::vector<Catalog::PlanConstant> constants;  // its tables', in the catalog's order
   std::uint64_t catalog_version{0};
@@ -513,6 +515,9 @@ public:
     if (p_.set) {
       if (p_.root || !p_.null_checks.empty() || !p_.computed.empty()) broken("a set operation with a pipeline of its own");
       if (p_.set_limit && *p_.set_limit < 0) broken("a negative LIMIT");
+      for (const auto& o : p_.set_order) {
+        if (o.column >= p_.set->types.size()) broken("a set operation ordered by a column it does not have");
+      }
       subqueries();
       arms(*p_.set);
       return;
