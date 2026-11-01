@@ -232,6 +232,30 @@ auto expr(const PgQuery__Node* n) -> Expr {
     return e;
   }
   if (n->node_case == PG_QUERY__NODE__NODE_A_CONST) return literal_expr(literal(n));
+  if (n->node_case == PG_QUERY__NODE__NODE_NULL_TEST) {
+    const auto* t = n->null_test;
+    if (t->argisrow) reject("IS NULL of a row is not supported", t->location);
+    Expr e{Expr::Kind::IsNull, {}, 0, nullptr, nullptr, t->location};
+    e.negated = t->nulltesttype == PG_QUERY__NULL_TEST_TYPE__IS_NOT_NULL;
+    e.rhs = std::make_unique<Expr>(operand(t->arg));
+    return e;
+  }
+  if (n->node_case == PG_QUERY__NODE__NODE_BOOL_EXPR) {
+    const auto* b = n->bool_expr;
+    auto kind = [&] {
+      switch (b->boolop) {
+        case PG_QUERY__BOOL_EXPR_TYPE__AND_EXPR: return Expr::Kind::And;
+        case PG_QUERY__BOOL_EXPR_TYPE__OR_EXPR: return Expr::Kind::Or;
+        case PG_QUERY__BOOL_EXPR_TYPE__NOT_EXPR: return Expr::Kind::Not;
+        case PG_QUERY__BOOL_EXPR_TYPE__BOOL_EXPR_TYPE_UNDEFINED:
+        case _PG_QUERY__BOOL_EXPR_TYPE_IS_INT_SIZE: break;
+      }
+      reject("boolean operator not supported", b->location);
+    }();
+    Expr e{kind, {}, 0, nullptr, nullptr, b->location};
+    for (std::size_t k = 0; k < b->n_args; ++k) e.args.push_back(operand(b->args[k]));
+    return e;
+  }
   if (n->node_case == PG_QUERY__NODE__NODE_COALESCE_EXPR) {
     const auto* c = n->coalesce_expr;
     Expr e{Expr::Kind::Coalesce, {}, 0, nullptr, nullptr, c->location};

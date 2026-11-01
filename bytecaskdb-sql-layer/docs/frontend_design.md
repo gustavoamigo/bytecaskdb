@@ -98,19 +98,22 @@ kind the transformer doesn't take is refused with its position.
 **Literals and expressions.**
 - **Literals** of every kind, typed and read as PostgreSQL types them
   (*Literals*, below).
-- **`*` and `/`** fold constants only, as `+` and `-` do, and are refused
-  on a column (42601, not supported yet): the select list holds no
-  arithmetic of columns. Integers take PostgreSQL's types (`integer *
-  integer` is `integer`, any wider operand makes `bigint`), the product
-  of numerics is at the sum of the scales within 18 digits, and the
-  result is range-checked (22003, `INT_MIN / -1` included). Integer `/`
-  truncates toward zero. A zero divisor is 22012, unless the dividend is
-  `NULL` (the operator is strict and never runs). A numeric quotient is
-  refused: its scale is PostgreSQL's division rule (`select_div_scale`),
-  not built yet. `%` is refused.
+- **`*` and `/`** of constants fold as `+` and `-` do. Integers take
+  PostgreSQL's types (`integer * integer` is `integer`, any wider operand
+  makes `bigint`), the product of numerics is at the sum of the scales
+  within 18 digits, and the result is range-checked (22003, `INT_MIN / -1`
+  included). Integer `/` truncates toward zero. A zero divisor is 22012,
+  unless the dividend is `NULL` (the operator is strict and never runs).
+  A numeric quotient has PostgreSQL's scale (`select_div_scale`: at least
+  16 significant digits, so `5.0 / 2` is `2.5000000000000000`), rounded half
+  away from zero; one whose scale or value passes 18 digits (`1.0 / 3` is
+  twenty places) is refused (42601). `%` is refused. Of columns, they are
+  *Expressions over columns*, below.
+- **`+`, `-`, `*`, `/`, comparisons, `IS [NOT] NULL`, `AND`, `OR` and
+  `NOT` of columns** are values in a select list (*Expressions over
+  columns*, below).
 - **`CASE`, `COALESCE` and `NULLIF`** fold constants only (of a column,
-  a parameter or a subquery they are refused, 42601, with `*` and `/`
-  of columns, #667). The result type is PostgreSQL's union rule: unknown
+  a parameter or a subquery they are refused, 42601, until #669). The result type is PostgreSQL's union rule: unknown
   literals give way to the typed branches, which must be of one class
   (42804, `CASE types … cannot be matched`); integers widen to the
   widest; a numeric branch is `numeric` and keeps its own scale
@@ -128,8 +131,7 @@ kind the transformer doesn't take is refused with its position.
   known without evaluating it. Float branches are refused. The output
   column is named `case`, `coalesce` or `nullif`.
 - **`||` and the string functions** fold constants only (of a column, a
-  parameter or a subquery they are refused, 42601, with the other
-  column-valued expressions, #667). The parser reads PostgreSQL's
+  parameter or a subquery they are refused, 42601, until #671). The parser reads PostgreSQL's
   spellings as the calls the grammar makes of them: `TRIM([LEADING |
   TRAILING | BOTH] [chars FROM] s)` is `ltrim`, `rtrim` or `btrim` (spaces
   by default), `POSITION(sub IN s)` is `position(s, sub)`, `SUBSTRING(s
@@ -384,13 +386,15 @@ That includes:
 - `CASE`, `COALESCE` and `NULLIF` of columns, parameters and subqueries, a
   `CASE` result that is a float, a `WHEN` that is not a comparison
   (`AND`, `OR`, `IS NULL`, `BETWEEN` as a value), `GREATEST` and `LEAST`;
-- `*` and `/` of columns, a numeric quotient, `%`, `||` and the string
-  functions of columns and parameters, `LENGTH`, `CONCAT`, `REPLACE`, the
-  regular-expression `SUBSTRING`, `bytea` string functions (#667, #671);
+- the quotient of a numeric other than constants, `%`, arithmetic and
+  comparison of `REAL` and `DOUBLE PRECISION` as values, an expression in
+  `ORDER BY`, `GROUP BY`, `SET` or an aggregated select list (#685, #686);
+- `||` and the string functions of columns and parameters, `LENGTH`,
+  `CONCAT`, `REPLACE`, the regular-expression `SUBSTRING`, `bytea` string
+  functions (#671);
 - a cast of anything but a string literal or `NULL`, a numeric literal of
   more than 18 digits, a string literal in arithmetic, unary `-` of
-  anything but a constant, a comparison of a column as a value, and a
-  constant beside an aggregate.
+  anything but a constant, and a constant beside an aggregate.
 
 The list and its order of work are #534.
 
@@ -445,6 +449,56 @@ recompile after a DDL folds them again, to the types they meet then.
   A string literal is read as the column's type: `int_col = '7'` is `= 7`,
   `int_col = '1.5'` is 22P02. An integer compared with a string column is
   42883, as in PostgreSQL.
+
+### Expressions over columns
+
+A select-list item that is not a column, a constant, an aggregate or a
+subquery by itself is a *value expression*: a tree of columns, constants,
+scalar subqueries, `$n`, `+ - * /`, the six comparisons, `IS [NOT] NULL`,
+`AND`, `OR` and `NOT`. The binder types it (`Binder::value`) and gives the
+plan one `Project` output; the search plans it as a result column and
+codegen evaluates it for each row (*planner_design.md*, *Expressions over
+columns*). `CASE`, `COALESCE`, `NULLIF`, `||` and the string functions plug
+into the same tree (#669, #671); they are refused over columns until then.
+
+- **Result types are PostgreSQL's, from one function (`arith_type`), for a
+  constant and a column alike.** Two integers give the wider of the two
+  (`smallint * smallint` is `smallint`, `smallint * integer` `integer`); with
+  a `DECIMAL`, `+` and `-` are at the finer scale and `*` at the sum of the
+  scales. A comparison, `IS NULL`, `AND`, `OR` and `NOT` are `boolean`. The
+  output is named `?column?`, or its `AS` name.
+- **NULL is SQL's.** An arithmetic operator or a comparison with a NULL
+  operand is NULL and never runs; `IS [NOT] NULL` is never NULL; `AND` is
+  false where an operand is false, else NULL where one is NULL; `OR` the
+  mirror; `NOT` of NULL is NULL.
+- **Errors.** A `smallint` or `integer` result outside its type, and a
+  `bigint` one outside int64, is 22003 (a `bigint` product says "integer out
+  of range" where PostgreSQL says "bigint"); a zero divisor is 22012 and is
+  raised only for a row that evaluates it. `AND` and `OR` evaluate an
+  operand only while no earlier one settles the result, as PostgreSQL does
+  left to right, so `b <> 0 AND a / b > 1` raises nothing.
+- **Comparisons** need operands of one class (42883 otherwise: `integer <
+  text`): numbers meet at the finer scale, text and `bytea` compare bytewise
+  (`COLLATE "C"`), booleans `FALSE` before `TRUE`, dates and times of one
+  type by value. A subquery's value compares as a constant does; no row is
+  NULL.
+- **A `$n` takes its type from the column beside it** (`i / $1`, `i < $1`),
+  as in a `WHERE`; one beside another parameter, a constant or an
+  expression is refused (42601). An unknown literal or `NULL` takes the
+  other operand's type (`i + '1'`, `z = NULL`).
+- **Held within 18 digits.** A numeric operand brought to a finer scale
+  (`d + i`, `d < i`) must stay inside the 18 digits a `DECIMAL` holds, by
+  its type, or by its value for a constant; a `bigint` beside a `DECIMAL`
+  that needs rescaling is refused. A product past int64 is 22003, where
+  PostgreSQL's numeric is exact.
+- **Refused (42601).** A numeric quotient with a column or an expression in
+  it: PostgreSQL's scale follows the operands' values (`select_div_scale`
+  reads their leading digits), so one column's quotient has several scales
+  and the layer's result type has one. `REAL` and `DOUBLE PRECISION`
+  arithmetic and comparison as a value. `%`, unary `-`, a cast, an
+  aggregate inside an expression, an expression in the select list of an
+  aggregated query or under `DISTINCT`, an expression in `ORDER BY`, `GROUP
+  BY`, `SET` or a `WHERE`.
 
 ## Binding
 
@@ -540,6 +594,17 @@ fail on them.
   refused at bind** ("numeric field overflow"), whatever the column holds.
   PostgreSQL computes the sum and fails only when it doesn't fit the
   column. The machine's literals stay inside 18 digits.
+- **A numeric quotient of columns is refused; one of constants is exact
+  to 18 digits.** PostgreSQL's scale follows the operands' values, so
+  `d / 2` has a scale per row; a result column has one type
+  (*Expressions over columns*). A quotient of constants whose scale is
+  past 18 (`1.0 / 3`, twenty places) is refused (42601). The machine
+  divides integers only.
+- **An expression over columns that leaves int64 is 22003.** A product of
+  two large `DECIMAL`s, or a `bigint` beside a `DECIMAL` that needs
+  rescaling, is where PostgreSQL's `numeric` stays exact. A `bigint`
+  product or quotient out of range is "integer out of range", where
+  PostgreSQL's message says "bigint"; the SQLSTATE is the same.
 - **A SUM or an AVG whose running total leaves `int64_t` fails** (`BC_E_ARITH`). The
   layer adds in 64 bits, a BIGINT's or a DECIMAL's scaled integer, and the
   statement fails as 22003; PostgreSQL's `SUM` of a BIGINT or NUMERIC is an unbounded `numeric`. Below that the

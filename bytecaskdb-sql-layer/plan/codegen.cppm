@@ -641,6 +641,8 @@ private:
       case Expr::Kind::Param:
       case Expr::Kind::Add:
       case Expr::Kind::Sub:
+      case Expr::Kind::Mul:
+      case Expr::Kind::Div:
       case Expr::Kind::Aggregate: break;
     }
     throw std::logic_error{"physical plan: a predicate codegen does not print"};
@@ -667,6 +669,8 @@ private:
         value = computed_name(rhs, lhs.table);
         break;
       case Expr::Kind::Const:
+      case Expr::Kind::Mul:
+      case Expr::Kind::Div:
       case Expr::Kind::Compare:
       case Expr::Kind::Aggregate:
       case Expr::Kind::And:
@@ -1269,15 +1273,23 @@ private:
   // *Isolation*).
   void produce(const physical::Emit& e, const Consume&) {
     produce(*e.input, [&] {
+      // Each expression first, in the row in hand: an error it raises is
+      // sticky, so the row is never half written.
+      std::vector<Val> computed(e.targets.size());
+      for (std::size_t i = 0; i < e.targets.size(); ++i) {
+        if (const auto* x = std::get_if<physical::ExprTarget>(&e.targets[i])) computed[i] = eval(x->expr);
+      }
       if (sink_ != nullptr) {
         Row row;
-        for (const auto& t : e.targets) {
-          if (const auto* p = std::get_if<physical::ParamTarget>(&t)) {
+        for (std::size_t i = 0; i < e.targets.size(); ++i) {
+          if (const auto* p = std::get_if<physical::ParamTarget>(&e.targets[i])) {
             row.push_back({param_null(p->param), param(p->type, p->param), p->type});
-            continue;
+          } else if (std::holds_alternative<physical::ExprTarget>(e.targets[i])) {
+            row.push_back({computed[i].null.empty() ? "0" : computed[i].null, computed[i].value, computed[i].type});
+          } else {
+            const auto& c = std::get<ColumnRef>(e.targets[i]);
+            row.push_back({col_null(c), read_col(c), c.type});
           }
-          const auto& c = std::get<ColumnRef>(t);
-          row.push_back({col_null(c), read_col(c), c.type});
         }
         (*sink_)(w_, row);
         return;
@@ -1289,12 +1301,14 @@ private:
           w_.line("bc_view key = bc_scan_key(cx, " + b.cursor + ");");
         }
         w_.line("bc_emit_begin(cx);");
-        for (const auto& t : e.targets) {
-          if (const auto* p = std::get_if<physical::ParamTarget>(&t)) {
+        for (std::size_t i = 0; i < e.targets.size(); ++i) {
+          if (const auto* p = std::get_if<physical::ParamTarget>(&e.targets[i])) {
             emit_param(*p);
-            continue;
+          } else if (std::holds_alternative<physical::ExprTarget>(e.targets[i])) {
+            emit_val(computed[i]);
+          } else {
+            w_.line("bc_emit_key_part(cx, " + w_.obj(b.object) + ", key, " + w_.part(b.object, std::get<ColumnRef>(e.targets[i])) + ");");
           }
-          w_.line("bc_emit_key_part(cx, " + w_.obj(b.object) + ", key, " + w_.part(b.object, std::get<ColumnRef>(t)) + ");");
         }
         w_.line("bc_emit_end(cx);");
         return;
@@ -1303,12 +1317,16 @@ private:
         if (b.for_update) w_.line("bc_guard_row(cx, " + w_.tbl(b.table) + ", " + b.row + ");");
       }
       w_.line("bc_emit_begin(cx);");
-      for (const auto& target : e.targets) {
-        if (const auto* p = std::get_if<physical::ParamTarget>(&target)) {
+      for (std::size_t i = 0; i < e.targets.size(); ++i) {
+        if (const auto* p = std::get_if<physical::ParamTarget>(&e.targets[i])) {
           emit_param(*p);
           continue;
         }
-        const auto& t = std::get<ColumnRef>(target);
+        if (std::holds_alternative<physical::ExprTarget>(e.targets[i])) {
+          emit_val(computed[i]);
+          continue;
+        }
+        const auto& t = std::get<ColumnRef>(e.targets[i]);
         if (const auto& b = binding(t.table); b.covering) {
           w_.line("bc_emit_key_part(cx, " + key_part(b, t) + ";");
         } else {
@@ -1317,6 +1335,168 @@ private:
       }
       w_.line("bc_emit_end(cx);");
     });
+  }
+
+  // ---------------------------------------------------- expressions over columns
+
+  // The value of e for the rows in hand, in C: NULL (empty: never) and the
+  // value (garbage where it is NULL). Printed as it goes: an operator's
+  // result is a local, so each operand is evaluated once however deep the
+  // tree; AND and OR evaluate an operand only while the result is open, as
+  // PostgreSQL does left to right, so a guard such as `b <> 0 AND a / b > 1`
+  // raises no error. Integer and DECIMAL arithmetic is the plan API's
+  // checked helpers: an overflow is 22003, a zero divisor 22012. A DECIMAL is
+  // an int64_t at the scale of its type, operands brought to a common scale
+  // by a power of ten the binder has kept within 18 digits.
+  auto eval(const Expr& e) -> Val {
+    switch (e.kind) {
+      case Expr::Kind::Column: return {e.col.nullable ? col_null(e.col) : "", read_col(e.col), e.col.type};
+      case Expr::Kind::Param: return {param_null(e.param), param(e.phys(), e.param), e.phys()};
+      case Expr::Kind::Const: return {"", e.phys() == PhysType::Bool ? (e.constant != 0 ? "1" : "0") : constant(e.constant), e.phys()};
+      case Expr::Kind::Add:
+      case Expr::Kind::Sub:
+      case Expr::Kind::Mul:
+      case Expr::Kind::Div: return eval_arithmetic(e);
+      case Expr::Kind::Compare: return eval_compare(e);
+      case Expr::Kind::IsNull: {
+        auto v = eval(e.args[0]);
+        return {"", v.null.empty() ? "0" : "(" + v.null + ")", PhysType::Bool};
+      }
+      case Expr::Kind::Not: {
+        auto v = eval(e.args[0]);
+        return {v.null, "!(" + v.value + ")", PhysType::Bool};
+      }
+      case Expr::Kind::And:
+      case Expr::Kind::Or: return eval_connective(e);
+      case Expr::Kind::Aggregate:
+      case Expr::Kind::Like:
+      case Expr::Kind::Truth:
+      case Expr::Kind::InSet: break;
+    }
+    throw std::logic_error{"physical plan: an expression over columns codegen does not print"};
+  }
+
+  [[nodiscard]] static auto either(const std::string& a, const std::string& b) -> std::string {
+    return a.empty() ? b : b.empty() ? a : a + " || " + b;
+  }
+
+  // `v` of type `from` at `scale`, a finer one: times a power of ten.
+  static auto at_scale(const Val& v, SqlType from, int scale) -> std::string {
+    auto up = scale - decimal_scale(from);
+    if (up == 0) return v.value;
+    std::int64_t factor = 1;
+    for (auto i = 0; i < up; ++i) factor *= 10;
+    return "bc_mul(cx, " + v.value + ", " + constant(factor) + ")";
+  }
+
+  auto eval_arithmetic(const Expr& e) -> Val {
+    auto a = eval(e.args[0]);
+    auto b = eval(e.args[1]);
+    auto additive = e.kind == Expr::Kind::Add || e.kind == Expr::Kind::Sub;
+    // A sum is taken at the result's scale; a product or quotient of the
+    // operands' own.
+    auto scale = decimal_scale(e.type);
+    auto x = additive ? at_scale(a, e.args[0].type, scale) : a.value;
+    auto y = additive ? at_scale(b, e.args[1].type, scale) : b.value;
+    // A BIGINT sum fails with that type's range error; a SMALLINT or INTEGER
+    // result is checked against its own range, as PostgreSQL's operators of
+    // those types are (the operands are held in 64 bits, so these cannot
+    // overflow first). The object a range error names is none.
+    std::string call;
+    switch (e.kind) {
+      case Expr::Kind::Add:
+      case Expr::Kind::Sub: {
+        auto fn = std::string{e.kind == Expr::Kind::Add ? "bc_add" : "bc_sub"};
+        call = e.type.kind == SqlKind::BigInt ? fn + "_bigint(cx, " + x + ", " + y + ", 0)" : fn + "(cx, " + x + ", " + y + ")";
+        break;
+      }
+      case Expr::Kind::Mul: call = "bc_mul(cx, " + x + ", " + y + ")"; break;
+      case Expr::Kind::Div: call = "bc_div(cx, " + x + ", " + y + ")"; break;
+      case Expr::Kind::Column:
+      case Expr::Kind::Param:
+      case Expr::Kind::Const:
+      case Expr::Kind::Compare:
+      case Expr::Kind::Aggregate:
+      case Expr::Kind::And:
+      case Expr::Kind::Or:
+      case Expr::Kind::Not:
+      case Expr::Kind::IsNull:
+      case Expr::Kind::Like:
+      case Expr::Kind::Truth:
+      case Expr::Kind::InSet: throw std::logic_error{"physical plan: not an arithmetic expression"};
+    }
+    if (e.type.kind == SqlKind::SmallInt || e.type.kind == SqlKind::Integer) {
+      call = "bc_check_int(cx, " + call + ", " + (e.type.kind == SqlKind::SmallInt ? "BC_SMALLINT" : "BC_INTEGER") + ", 0)";
+    }
+    return guarded("int64_t", "0", either(a.null, b.null), call, PhysType::I64);
+  }
+
+  // A local `type v = fallback`, set to `value` unless `null`; the Val of
+  // the local and the NULL test, evaluated once.
+  auto guarded(const std::string& ctype, const std::string& fallback, const std::string& null, const std::string& value,
+               PhysType type) -> Val {
+    auto id = std::to_string(exprs_++);
+    w_.line(ctype + " v" + id + " = " + fallback + ";");
+    if (null.empty()) {
+      w_.line("v" + id + " = " + value + ";");
+      return {"", "v" + id, type};
+    }
+    w_.line("bool n" + id + " = " + null + ";");
+    w_.open("if (!n" + id + ")");
+    w_.line("v" + id + " = " + value + ";");
+    w_.close();
+    return {"n" + id, "v" + id, type};
+  }
+
+  // A comparison as a value: NULL if an operand is. Numbers meet at the
+  // finer scale, text and bytes compare as bytes (COLLATE "C").
+  auto eval_compare(const Expr& e) -> Val {
+    auto a = eval(e.args[0]);
+    auto b = eval(e.args[1]);
+    const auto& lt = e.args[0].type;
+    const auto& rt = e.args[1].type;
+    auto scale = std::max(decimal_scale(lt), decimal_scale(rt));
+    auto x = at_scale(a, lt, scale);
+    auto y = at_scale(b, rt, scale);
+    auto cmp = a.type == PhysType::Bytes ? "bc_bytes_cmp(cx, " + x + ", " + y + ") " + op_text(e.op) + " 0"
+                                         : x + " " + op_text(e.op) + " " + y;
+    return guarded("bool", "0", either(a.null, b.null), cmp, PhysType::Bool);
+  }
+
+  // AND and OR in SQL's three-valued logic, an operand evaluated only while
+  // no earlier one has settled the result (false for AND, true for OR).
+  auto eval_connective(const Expr& e) -> Val {
+    auto id = std::to_string(exprs_++);
+    auto is_and = e.kind == Expr::Kind::And;
+    w_.line("bool d" + id + " = 0;");
+    w_.line("bool n" + id + " = 0;");
+    for (const auto& arg : e.args) {
+      w_.open("if (!d" + id + ")");
+      auto v = eval(arg);
+      auto settles = is_and ? "!(" + v.value + ")" : v.value;
+      if (v.null.empty()) {
+        w_.line("if (" + settles + ") d" + id + " = 1;");
+      } else {
+        w_.line("if (" + v.null + ") n" + id + " = 1; else if (" + settles + ") d" + id + " = 1;");
+      }
+      w_.close();
+    }
+    w_.line("n" + id + " = n" + id + " && !d" + id + ";");
+    return {"n" + id, is_and ? "!d" + id : "d" + id, PhysType::Bool};
+  }
+
+  // A computed value as a result column, NULL as NULL.
+  void emit_val(const Val& v) {
+    auto emit = "bc_emit_" + suffix(v.type) + "(cx, " + v.value + ");";
+    if (v.null.empty()) {
+      w_.line(emit);
+      return;
+    }
+    w_.open("if (" + v.null + ")");
+    w_.line("bc_emit_null(cx);");
+    w_.otherwise();
+    w_.line(emit);
+    w_.close();
   }
 
   // A parameter as a result column, NULL as NULL.
@@ -2055,6 +2235,7 @@ private:
   const Sink* sink_{nullptr};    // an arm of a set operation: where its result rows go
   std::string base_limit_;       // an arm's: the statement's LIMIT, which every loop of the arm also stops at
   int open_{0};                  // an arm's: the `if` blocks its misses opened
+  int exprs_{0};                 // the locals the expressions over columns printed: v<i>, n<i>, d<i>
   std::string* hit_{nullptr};    // a one-row aggregate: a miss joins this condition instead
   int choices_{0};               // the choice points printed: each counts into count<i>, over lo<i> and hi<i>
   int sorts_{0};                 // the sorts printed: each into sorter s<i>, its row p<i>

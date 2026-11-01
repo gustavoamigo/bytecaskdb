@@ -263,18 +263,6 @@ f051_08_01_02
 f131_02_01_01  # a join of a grouped view
 f131_03_01_01  # an aggregate over a grouped view: needs a derived table
 f131_03_01_02  # an aggregate over a grouped view: needs a derived table
-f131_04_01_01
-f131_04_01_02
-f131_04_01_03
-f131_04_01_04
-f131_04_01_05
-f131_04_01_06
-f131_04_01_07
-f131_04_01_08
-f131_04_01_09
-f131_04_01_10
-f131_04_01_11
-f131_04_01_12
 f131_04_02_01  # a column compared with a subquery in a select list (not views)
 f131_04_02_02  # a column compared with a subquery in a select list (not views)
 f131_04_02_03  # a column compared with a subquery in a select list (not views)
@@ -303,8 +291,6 @@ f311_04_01_02  # CREATE SCHEMA with a view in it
 f311_04_01_03  # CREATE SCHEMA with a view in it
 f311_05_01_01
 f311_05_01_02
-f481_01_01
-f481_01_02
 s011_01_01
 s011_01_02
 s011_02_01

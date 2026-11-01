@@ -243,6 +243,8 @@ auto use_of(const Expr& c, const Tables& here, const Tables& other) -> Use {
       return o.args[0].kind == Expr::Kind::Param && o.args[1].kind == Expr::Kind::Const ? Use::Ok : Use::Operand;
     case Expr::Kind::Column: return reads(other, o) ? Use::Ok : Use::Columns;
     case Expr::Kind::Const:
+    case Expr::Kind::Mul:
+    case Expr::Kind::Div:
     case Expr::Kind::Compare:
     case Expr::Kind::Aggregate:
     case Expr::Kind::And:
@@ -2059,8 +2061,10 @@ private:
     auto column = [&](const Expr& e) { return reads(tables, e); };
     if (s.project != nullptr) {
       for (const auto& o : s.project->exprs) {
-        if (!column(o.expr) && o.expr.kind != Expr::Kind::Param) {
-          no_plan("a result column that is not a column of its tables or a constant");
+        std::vector<ColumnRef> cols;
+        logical::columns_of(o.expr, cols);
+        if (!std::ranges::all_of(cols, [&](const ColumnRef& c) { return std::ranges::find(tables, c.table) != tables.end(); })) {
+          no_plan("a result column that is not an expression of columns of its tables");
         }
       }
     } else {
@@ -2105,10 +2109,23 @@ private:
   static auto emit_targets(const SelectParts& s) -> std::vector<physical::EmitTarget> {
     std::vector<physical::EmitTarget> out;
     for (const auto& o : s.project->exprs) {
-      if (o.expr.kind == Expr::Kind::Param) {
-        out.emplace_back(physical::ParamTarget{o.expr.param, o.expr.phys()});
-      } else {
-        out.emplace_back(o.expr.col);
+      switch (o.expr.kind) {
+        case Expr::Kind::Param: out.emplace_back(physical::ParamTarget{o.expr.param, o.expr.phys()}); break;
+        case Expr::Kind::Column: out.emplace_back(o.expr.col); break;
+        case Expr::Kind::Const:
+        case Expr::Kind::Add:
+        case Expr::Kind::Sub:
+        case Expr::Kind::Mul:
+        case Expr::Kind::Div:
+        case Expr::Kind::Compare:
+        case Expr::Kind::Aggregate:
+        case Expr::Kind::And:
+        case Expr::Kind::Or:
+        case Expr::Kind::Not:
+        case Expr::Kind::IsNull:
+        case Expr::Kind::Like:
+        case Expr::Kind::Truth:
+        case Expr::Kind::InSet: out.emplace_back(physical::ExprTarget{o.expr}); break;
       }
     }
     return out;
@@ -2167,9 +2184,9 @@ private:
         q.sort_by.push_back(o.col);
         if (std::ranges::find(used, o.col) == used.end()) used.push_back(o.col);
       }
-      for (const auto& o : s.project->exprs) {
-        if (o.expr.kind == Expr::Kind::Column) q.above.push_back(o.expr.col);
-      }
+      std::vector<ColumnRef> read_above;
+      for (const auto& o : s.project->exprs) logical::columns_of(o.expr, read_above);
+      q.above.insert(q.above.end(), read_above.begin(), read_above.end());
     }
     auto searched = candidates(q, ordered, used, !for_update && !distinct, sorting);
     auto emits = !s.limit || *s.limit > 0;
