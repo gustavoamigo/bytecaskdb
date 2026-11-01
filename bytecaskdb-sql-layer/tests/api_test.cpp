@@ -2189,6 +2189,59 @@ TEST_CASE("embedded API: a set operation holds the keys of one side and fails pa
   CHECK(state("SELECT x FROM big UNION SELECT x FROM big WHERE id < 0") == "54000");
 }
 
+TEST_CASE("embedded API: SUM, AVG, MIN and MAX of a DOUBLE, and DISTINCT values, as PostgreSQL's float8", "[sql][api][aggregate]") {
+  sql_test::TempDir dir{"api_double_aggregates"};
+  auto db = Database::open(dir.path());
+  auto run = [&](std::string_view sql, const std::vector<Value>& params = {}) { return db->execute(sql, params).rows; };
+  (void)run("CREATE TABLE fa (id INTEGER PRIMARY KEY, f DOUBLE PRECISION)");
+  const auto nan = std::numeric_limits<double>::quiet_NaN();
+  for (auto [id, f] : std::vector<std::pair<int, double>>{{1, nan}, {2, nan}, {3, -0.0}, {4, 0.0}, {5, 1.5}}) {
+    (void)db->execute("INSERT INTO fa VALUES ($1, $2)", {i(id), Value{f}});
+  }
+  // NaN is one value and above every number; -0.0 and 0.0 are one.
+  CHECK(run("SELECT COUNT(DISTINCT f), COUNT(f) FROM fa") == Grid{{i(3), i(5)}});
+  auto row = run("SELECT MAX(f), MIN(f), SUM(f), AVG(f), MAX(DISTINCT f) FROM fa").at(0);
+  CHECK(std::isnan(std::get<double>(row[0])));
+  CHECK(std::get<double>(row[1]) == 0.0);
+  CHECK(std::isnan(std::get<double>(row[2])));
+  CHECK(std::isnan(std::get<double>(row[3])));
+  CHECK(std::isnan(std::get<double>(row[4])));
+  CHECK(run("SELECT SUM(DISTINCT f), AVG(DISTINCT f), MIN(f) FROM fa WHERE id >= 3") == Grid{{Value{1.5}, Value{0.75}, Value{-0.0}}});
+  // A sum that overflows from finite values is 22003, as PostgreSQL's.
+  (void)run("CREATE TABLE fb (id INTEGER PRIMARY KEY, f DOUBLE PRECISION)");
+  (void)db->execute("INSERT INTO fb VALUES (1, $1)", {Value{1e308}});
+  (void)db->execute("INSERT INTO fb VALUES (2, $1)", {Value{1e308}});
+  CHECK(run("SELECT SUM(DISTINCT f) FROM fb") == Grid{{Value{1e308}}});
+  try {
+    (void)run("SELECT SUM(f) FROM fb");
+    FAIL("expected an overflow");
+  } catch (const ExecError& e) {
+    CHECK(std::string{sqlstate(e)} == "22003");
+  }
+}
+
+TEST_CASE("embedded API: the distinct values of an aggregate are held in the statement's memory and fail past it", "[sql][api][aggregate]") {
+  sql_test::TempDir dir{"api_distinct_agg_mem"};
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  (void)db->execute("CREATE TABLE big (id INTEGER PRIMARY KEY, x INTEGER)");
+  auto txn = db->begin();
+  for (int k = 0; k < 2000; ++k) (void)txn.execute("INSERT INTO big VALUES ($1, $1)", {i(k)});
+  (void)txn.commit();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  CHECK(state("SELECT SUM(DISTINCT x) FROM big") == "54000");
+  CHECK(state("SELECT AVG(DISTINCT x) FROM big") == "54000");
+  CHECK(state("SELECT SUM(DISTINCT x) FROM big WHERE id < 10") == "ran");
+  // MIN and MAX of the distinct values are those of all of them: nothing is held.
+  CHECK(state("SELECT MIN(DISTINCT x), MAX(DISTINCT x) FROM big") == "ran");
+}
+
 TEST_CASE("embedded API: ORDER BY of a set operation's rows sorts them as a SELECT's, and a LIMIT keeps the first", "[sql][api][setop]") {
   sql_test::TempDir dir{"api_setop_order"};
   auto db = Database::open(dir.path());

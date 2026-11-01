@@ -1735,6 +1735,51 @@ void sum_two(bc_ctx* cx) {
   bc_emit_end(cx);
 }
 
+// $1 to $4 folded into a double minimum and maximum, and into the helpers
+// of the same order: PostgreSQL's, NaN above every number.
+void minmax_f64(bc_ctx* cx) {
+  bc_agg a = bc_agg_open(cx, 2);
+  bc_group g = bc_agg_group(cx, a, bc_empty(cx));
+  const auto null_first = bc_agg_null(cx, g, 0);
+  double m = 0;
+  for (uint32_t i = 0; i < 4; ++i) {
+    auto v = bc_param_f64(cx, i);
+    bc_agg_min_f64(cx, g, 0, v);
+    bc_agg_max_f64(cx, g, 1, v);
+    m = i == 0 ? v : bc_min_f64(m, v);
+  }
+  bc_emit_begin(cx);
+  bc_emit_bool(cx, null_first);
+  bc_emit_bool(cx, bc_agg_null(cx, g, 0));
+  // A NaN is not equal to itself: its bool is the value's, not a double's.
+  auto lo = bc_agg_f64(cx, g, 0);
+  auto hi = bc_agg_f64(cx, g, 1);
+  bc_emit_bool(cx, lo != lo);
+  bc_emit_bool(cx, hi != hi);
+  bc_emit_f64(cx, lo != lo ? 0.0 : lo);
+  bc_emit_f64(cx, hi != hi ? 0.0 : hi);
+  bc_emit_f64(cx, std::signbit(bc_max_f64(0.0, -0.0)) ? -1.0 : 1.0);  // of equal values the second
+  bc_emit_f64(cx, m != m ? 0.0 : m);
+  bc_emit_end(cx);
+}
+void add_f64_helper(bc_ctx* cx) {
+  bc_emit_begin(cx);
+  bc_emit_f64(cx, bc_add_f64(cx, bc_param_f64(cx, 0), bc_param_f64(cx, 1)));
+  bc_emit_end(cx);
+}
+void min_slot_read_as_integer(bc_ctx* cx) {
+  bc_agg a = bc_agg_open(cx, 1);
+  bc_group g = bc_agg_group(cx, a, bc_empty(cx));
+  bc_agg_min_f64(cx, g, 0, 1.0);
+  (void)bc_agg_i64(cx, g, 0);
+}
+void min_f64_then_max(bc_ctx* cx) {
+  bc_agg a = bc_agg_open(cx, 1);
+  bc_group g = bc_agg_group(cx, a, bc_empty(cx));
+  bc_agg_min_f64(cx, g, 0, 1.0);
+  bc_agg_max_f64(cx, g, 0, 1.0);
+}
+
 // Wrong plans: a slot folded two ways, read as the other type, past the
 // aggregate's slots, and a group of another aggregate.
 void slot_two_ways(bc_ctx* cx) {
@@ -1811,6 +1856,30 @@ TEST_CASE("plan API: an aggregate's slots fold SUM, MIN, MAX and COUNT, and an i
   CHECK(bc_error(f.cx) == BC_E_ARITH);
   CHECK(run_rows(f, sum_two, {std::int64_t{0}, std::int64_t{0}, HUGE_VAL, 1.0}, two) == BC_COMMITTED);
   CHECK(f.results(two) == std::vector<R>{R{std::int64_t{0}, HUGE_VAL}});
+
+  // A double minimum and maximum: NaN above every number, so it is the
+  // maximum and the minimum only when it is alone; of -0.0 and 0.0 the second
+  // is kept, as PostgreSQL's float8smaller and float8larger keep it.
+  const std::vector<PhysType> minmax{PhysType::Bool, PhysType::Bool, PhysType::Bool, PhysType::Bool,
+                                     PhysType::F64,  PhysType::F64,  PhysType::F64,  PhysType::F64};
+  CHECK(run_rows(f, minmax_f64, {2.5, -1.0, 7.0, 3.0}, minmax) == BC_COMMITTED);
+  CHECK(f.results(minmax) == std::vector<R>{R{true, false, false, false, -1.0, 7.0, -1.0, -1.0}});
+  CHECK(run_rows(f, minmax_f64, {2.5, std::nan(""), 7.0, 3.0}, minmax) == BC_COMMITTED);
+  CHECK(f.results(minmax) == std::vector<R>{R{true, false, false, true, 2.5, 0.0, -1.0, 2.5}});
+  CHECK(run_rows(f, minmax_f64, {std::nan(""), std::nan(""), std::nan(""), std::nan("")}, minmax) == BC_COMMITTED);
+  CHECK(f.results(minmax) == std::vector<R>{R{true, false, true, true, 0.0, 0.0, -1.0, 0.0}});
+  // bc_add_f64 is the float8 sum: an overflow of finite operands is an error.
+  const std::vector<PhysType> one{PhysType::F64};
+  CHECK(run_rows(f, add_f64_helper, {1.5, 2.0}, one) == BC_COMMITTED);
+  CHECK(f.results(one) == std::vector<R>{R{3.5}});
+  CHECK(run_rows(f, add_f64_helper, {1e308, 1e308}, one) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_ARITH);
+  CHECK(run_rows(f, add_f64_helper, {HUGE_VAL, 1.0}, one) == BC_COMMITTED);
+  CHECK(f.results(one) == std::vector<R>{R{HUGE_VAL}});
+  for (auto plan : {min_slot_read_as_integer, min_f64_then_max}) {
+    CHECK(run(f, plan, {}) == BC_FAILED);
+    CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  }
 
   // bc_agg_null of each kind of slot: true until a value is folded in, of
   // either type, and true for a slot never folded.

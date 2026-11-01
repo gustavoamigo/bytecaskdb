@@ -212,9 +212,9 @@ auto expr(const PgQuery__Node* n) -> Expr {
       reject("function " + name + " is not supported", f->location);
     }
     auto refuse = [&] [[noreturn]] {
-      reject("only COUNT(*), COUNT([DISTINCT] column), and SUM, MIN, MAX and AVG of a column are supported", f->location);
+      reject("only COUNT(*), and COUNT, SUM, MIN, MAX and AVG of a column, ALL or DISTINCT, are supported", f->location);
     };
-    if ((f->agg_distinct && name != "count") || f->n_agg_order != 0 || f->agg_filter != nullptr ||
+    if (f->n_agg_order != 0 || f->agg_filter != nullptr ||
         f->over != nullptr || f->agg_within_group || f->func_variadic) {
       refuse();
     }

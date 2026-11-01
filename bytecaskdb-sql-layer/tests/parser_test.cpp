@@ -166,7 +166,7 @@ TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql]
   CHECK(rejected_at("SELECT stddev(qty) FROM t WHERE id = $1") == 7);
   CHECK(rejected_at("SELECT sum(*) FROM t WHERE id = $1") == 7);
   CHECK(rejected_at("SELECT min(qty + $2) FROM t WHERE id = $1") == 7);
-  CHECK(rejected_at("SELECT sum(DISTINCT qty) FROM t WHERE id = $1") == 7);
+  CHECK(rejected_at("SELECT sum(DISTINCT qty + 1) FROM t WHERE id = $1") == 7);
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 LIMIT $2"), SqlError);
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 OFFSET 1"), SqlError);
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 ORDER BY qty + $2"), SqlError);

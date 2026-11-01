@@ -435,7 +435,7 @@ The physical plan's operators:
   aggregate;
 - the joins `IndexJoin`, `NestedLoop` and `HashJoin`;
 - `Filter`, `Sort`, `Limit` and `Choice`;
-- `Aggregate` (one row of `COUNT`, `COUNT(DISTINCT)` or `SUM`) and
+- `Aggregate` (one row of `COUNT`, `COUNT(DISTINCT)` or an integer `SUM`) and
   `GroupAggregate`;
 - the sinks: `Emit`, `GroupEmit`, `Insert`, `Update` and `Delete`. An
   `Emit` target is a column or a parameter, a constant's, the same in
@@ -905,9 +905,10 @@ subquery's value is one, hidden), `Add`, `Sub`, `Mul`, `Div`, `Compare`,
 ### Aggregates
 
 **One row of `COUNT` or `SUM`.** A lone `COUNT`, `COUNT(DISTINCT)` or
-`SUM`, with no `GROUP BY` or `HAVING`, is an `Aggregate` over its input: a
-`CountRange` where the keys answer it, else the loop with an accumulator.
-Everything else aggregated, a lone `MIN` or `MAX` among it, is a
+`SUM` of an integer or `DECIMAL`, with no `GROUP BY` or `HAVING`, is an
+`Aggregate` over its input: a `CountRange` where the keys answer it, else
+the loop with an accumulator. Everything else aggregated, a lone `MIN` or
+`MAX`, a `SUM` of `DISTINCT` values or of a `DOUBLE` among it, is a
 `GroupAggregate`, one route, and where its aggregates allow it also
 answered from the keys.
 
@@ -978,9 +979,16 @@ the order they first appeared. Where it keeps what it gives for a group
 - each aggregate a slot: `COUNT` by `bc_agg_count`, `SUM` by
   `bc_agg_add_i64`, `MIN` and `MAX` by `bc_agg_min_i64` and
   `bc_agg_max_i64`, `AVG` two, its sum and its count; NULL inputs skipped,
-  and `SUM`, `MIN`, `MAX` and `AVG` NULL where `bc_agg_null`;
-- a `COUNT(DISTINCT col)` keeps an aggregate of its own, one slot, keyed by
-  the group's key and the value: a pair new to it counts in the group.
+  and `SUM`, `MIN`, `MAX` and `AVG` NULL where `bc_agg_null`. Of a DOUBLE
+  they are `bc_agg_add_f64`, `bc_agg_min_f64` and `bc_agg_max_f64`, and the
+  slot is read by `bc_agg_f64`;
+- the aggregates of `DISTINCT` values over one column (`COUNT`, `SUM`,
+  `AVG`) share an aggregate of their own, one slot, keyed by the group's
+  key and the value: a pair new to it is folded into each of them, once, so
+  `SUM(DISTINCT v)` beside `COUNT(DISTINCT v)` sees each value once.
+  `MIN(DISTINCT v)` and `MAX(DISTINCT v)` are
+  bound without the quantifier: the extremes of the distinct values are
+  those of all.
 
 A group's handle is found again by its key (`bc_agg_group` finds an
 existing group and charges nothing), since a plan's locals are initialized
@@ -1017,7 +1025,7 @@ the next, then after the loop for the last. A dependent column is read from
 each row and kept beside the keys. Its columns are I64 and BOOLEAN, the
 types a local holds, read from a row or from a covering scan's entry: a
 stream holds no row, so it may cover where a structure may not. Nothing is
-held but the group in hand's `COUNT(DISTINCT)` values: each argument's
+held but the group in hand's distinct values: each argument's
 aggregate is keyed by the value alone and cleared (`bc_agg_clear`) as each
 group ends, so a stream's memory does not grow with its groups. With no key
 it is one group, given after the input, over no rows too, and its no-rows
@@ -1028,7 +1036,7 @@ each `COUNT` 0 and every other aggregate NULL, under its `HAVING`.
 bool st0 = false;
 int64_t kv0_0 = 0;
 int64_t x0_0 = 0;
-bc_agg d0_0 = bc_agg_open(cx, 1);  // COUNT(DISTINCT) values seen per group
+bc_agg d0_0 = bc_agg_open(cx, 1);  // DISTINCT values seen per group
 /* the input's loop, in a's order */
     int64_t rk0_0 = bc_col_i64(cx, row, COL_4_0);
     if (st0 && (rk0_0 != kv0_0)) {
@@ -1059,7 +1067,19 @@ reads. `SELECT a, count(*) FROM g GROUP BY a`, 1,000 rows, an index on a:
 streamed in its order, covering, 1,000; the structure over any scan costs
 more by 1,000 × 1.3 + 100.
 
-**AVG** is PostgreSQL's `numeric`: `numeric_div` of the sum by the count
+**DOUBLE aggregates.** `SUM`, `AVG`, `MIN` and `MAX` of a DOUBLE column
+are `double precision`. A stream keeps them in `double` locals and folds
+them with `bc_add_f64` (the float8 sum: finite operands that overflow
+are `BC_E_ARITH`, an infinity or NaN carries) and `bc_min_f64` and
+`bc_max_f64` (PostgreSQL's order, NaN above every number; of equal values,
+`-0.0` and `0.0`, the second, as `float8smaller` keeps it); a structure's
+slot is the same through `bc_agg_*_f64`. `AVG` is the float8 quotient,
+emitted by the plan as one `F64` column: the sum over the count converted
+by `bc_i64_to_f64`. A DOUBLE is never read from a key (`bc_key_part_f64`
+is `BC_E_HANDLE`), so these read the row, and are never answered from the
+keys.
+
+**AVG** of an integer or DECIMAL is PostgreSQL's `numeric`: `numeric_div` of the sum by the count
 at the scale `select_div_scale` chooses, 16 significant digits or more,
 rounded half away from zero, which can pass 64 bits. So the plan emits the
 sum and the count, two `I64` columns for one result column
@@ -1153,12 +1173,12 @@ never at more.
   probe side, or a sort above the join, is not a choice by the budget.
 - **A structure of groups** over one table's range, where a streamed plan
   avoids it: fixed `kAggBytes` and a byte per slot, `kHashBytes` per table
-  whose rows its groups hold, `kAggBytes` + 1 per `COUNT(DISTINCT)`, and
+  whose rows its groups hold, `kAggBytes` + 1 per column with `DISTINCT` aggregates, and
   `kSorterBytes` where it sorts its groups; per row, as if each started a
-  group and gave each `COUNT(DISTINCT)` a new value, what `bc_agg_group`,
+  group and gave each `DISTINCT` column a new value, what `bc_agg_group`,
   `bc_hash_put` and `bc_sorter_add` charge: the group's key,
   `kGroupEntryBytes` and `kAggSlotBytes` per slot; per held table its row,
-  `kHashEntryBytes` and the group's key; per `COUNT(DISTINCT)` a key of the
+  `kHashEntryBytes` and the group's key; per `DISTINCT` column a key of the
   group's key, as a byte-string part, and the value's part,
   `kGroupEntryBytes` and one slot; in a sort the sort key, the group's key
   as payload and `kSortEntryBytes`. The other plan is the cheapest streamed

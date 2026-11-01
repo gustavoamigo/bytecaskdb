@@ -2730,6 +2730,34 @@ def test_a_computed_bound_past_integer_is_22003_before_the_plan_runs(dsn):
         m.teardown()
 
 
+def test_double_aggregates_and_distinct_values_agree_with_postgresql(dsn):
+    """SUM, AVG, MIN and MAX of a DOUBLE PRECISION column, and the DISTINCT
+    form of every aggregate, alone, per group and over no rows: the layer's
+    rows and the server's text are PostgreSQL's."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.BIGINT), Column("c2", o.DOUBLE),
+                              Column("c3", o.BIGINT)], ["c0"]))
+        for c0, c1, c2, c3 in ((1, 1, 1.5, 10), (2, 1, 1.5, 10), (3, 1, 2.5, 20), (4, 2, None, None), (5, 2, 4.0, 20),
+                               (6, None, 4.0, None), (7, 2, 0.25, 30), (8, 2, 0.5, 30)):
+            m.insert("t0", {"c0": c0, "c1": c1, "c2": c2, "c3": c3}, all_columns=True)
+        for sql in (
+            "SELECT sum(c2), avg(c2), min(c2), max(c2) FROM t0 WHERE c0 >= $1",
+            "SELECT sum(ALL c2), avg(ALL c2), min(ALL c2), max(ALL c2) FROM t0 WHERE c0 >= $1",
+            "SELECT sum(DISTINCT c2), avg(DISTINCT c2), min(DISTINCT c2), max(DISTINCT c2), count(DISTINCT c2) FROM t0 WHERE c0 >= $1",
+            "SELECT sum(c2), sum(DISTINCT c2), count(c2), count(DISTINCT c2) FROM t0 WHERE c0 >= $1",
+            "SELECT sum(DISTINCT c3), count(DISTINCT c3), min(DISTINCT c3), max(DISTINCT c3), sum(c3) FROM t0 WHERE c0 >= $1",
+            "SELECT avg(DISTINCT c3) FROM t0 WHERE c0 >= $1",
+            "SELECT c1, sum(c2), avg(c2), min(c2), max(c2) FROM t0 WHERE c0 >= $1 GROUP BY c1 ORDER BY c1",
+            "SELECT c1, sum(DISTINCT c2), avg(DISTINCT c2), count(DISTINCT c2), sum(DISTINCT c3) FROM t0 WHERE c0 >= $1 GROUP BY c1 ORDER BY c1",
+        ):
+            m.both(sql, (0,))
+            m.both(sql, (100,))  # no row matches
+        m.check()
+    finally:
+        m.teardown()
+
+
 def test_forms_the_layer_does_not_support_are_refused_without_a_sqlstate(dsn):
     """A statement PostgreSQL runs, which the layer refuses as a form it does not
     support, is 42601: the layer claims PostgreSQL's code only where
@@ -2746,8 +2774,6 @@ def test_forms_the_layer_does_not_support_are_refused_without_a_sqlstate(dsn):
             ("SELECT c0 FROM t0 WHERE c2 = $1 AND c6 = $1", (1.5,)),
             ("UPDATE t0 SET c1 = $1 WHERE c6 = $1 AND c0 = $2", (1, 99)),  # PostgreSQL types the WHERE's $1 first
             ("UPDATE t0 SET c6 = c6 + $1 WHERE c0 = $2 AND c2 = $1", (1, 99)),
-            ("SELECT sum(c2) FROM t0 WHERE c0 = $1", (1,)),
-            ("SELECT min(c2) FROM t0 WHERE c0 = $1", (1,)),
             ("SELECT min(c1) FROM t0 WHERE c0 = $1", (1,)),
         ):
             layer = o.run_layer(m.db, sql, params)
