@@ -314,6 +314,9 @@ public:
 // Holds open any referenced data files until destroyed.
 class Snapshot {
 public:
+    // A second independent handle on the same frozen state (a refcount
+    // increment). Reads what this one reads; outlives it and the DB.
+    [[nodiscard]] auto clone() const -> Snapshot;
     [[nodiscard]] auto get(const ReadOptions& opts,
                            BytesView key, Bytes& out) const -> bool;
     [[nodiscard]] auto contains_key(const ReadOptions& opts,

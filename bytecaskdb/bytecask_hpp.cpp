@@ -436,6 +436,12 @@ Snapshot& Snapshot::operator=(Snapshot&&) noexcept = default;
 Snapshot::Snapshot(std::unique_ptr<Impl> impl) noexcept
     : impl_{std::move(impl)} {}
 
+auto Snapshot::clone() const -> Snapshot {
+  return translate_exceptions([&] {
+    return Snapshot{std::make_unique<Impl>(impl_->snap.clone())};
+  });
+}
+
 auto Snapshot::get(const ReadOptions& opts,
                    BytesView key,
                    Bytes& out) const -> bool {

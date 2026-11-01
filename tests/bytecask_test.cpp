@@ -5337,6 +5337,131 @@ TEST_CASE("Snapshot get is frozen at snapshot time", "[snapshot]") {
   CHECK(to_string(out) == "v2");
 }
 
+// Snapshot::clone (docs/bytecask_design.md, "Snapshot::clone"): a second
+// handle on the same frozen state.
+namespace {
+auto snapshot_text(const bytecask::Snapshot &snap) -> std::string {
+  std::string out;
+  for (const auto &e : snap.iter_from({})) {
+    out += to_string(e.key) + "=" + to_string(e.value) + ";";
+  }
+  return out;
+}
+} // namespace
+
+TEST_CASE("Snapshot clone reads what the original reads, and outlives it",
+          "[snapshot][clone]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  db.put({}, to_bytes("b"), to_bytes("2"));
+
+  auto snap = db.snapshot();
+  auto copy = snap.clone();
+  db.put({}, to_bytes("a"), to_bytes("changed"));
+  (void)db.del({}, to_bytes("b"));
+  db.put({}, to_bytes("c"), to_bytes("3"));
+
+  CHECK(snapshot_text(copy) == snapshot_text(snap));
+  CHECK(snapshot_text(copy) == "a=1;b=2;");
+  bytecask::Bytes out;
+  CHECK(copy.contains_key({}, to_bytes("b")));
+  CHECK_FALSE(copy.contains_key({}, to_bytes("c")));
+  CHECK(copy.count_keys(to_bytes("a"), to_bytes("z"), 10) == 2);
+
+  { auto gone = std::move(snap); }  // the original is destroyed
+  CHECK(snapshot_text(copy) == "a=1;b=2;");
+
+  // And the other way round: a clone destroyed leaves the original intact.
+  auto again = copy.clone();
+  { auto gone = std::move(copy); }
+  CHECK(snapshot_text(again) == "a=1;b=2;");
+}
+
+TEST_CASE("Snapshot clone survives close, rotation, vacuum and reopen",
+          "[snapshot][clone][vacuum][close]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
+  db.put({}, to_bytes("k"), to_bytes("v1"));
+  db.put({}, to_bytes("k"), to_bytes("v2"));  // v1's file qualifies
+
+  auto snap = db.snapshot();
+  auto copy = snap.clone();
+  { auto gone = std::move(snap); }  // only the clone holds the old files
+
+  db.put({}, to_bytes("k"), to_bytes("v3"));  // rotates: max_file_bytes = 1
+  REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+  bytecask::Bytes out;
+  REQUIRE(copy.get({}, to_bytes("k"), out));
+  CHECK(to_string(out) == "v2");
+
+  db.close();
+  REQUIRE(copy.get({}, to_bytes("k"), out));
+  CHECK(to_string(out) == "v2");
+
+  auto reopened = bytecask::DB::open(dir);
+  CHECK(get_str(reopened, to_bytes("k")) == "v3");
+  REQUIRE(copy.get({}, to_bytes("k"), out));
+  CHECK(to_string(out) == "v2");
+}
+
+TEST_CASE("Snapshot clone leaves a WritePlan built from the original as it was",
+          "[snapshot][clone][apply_batch]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+
+  auto snap = db.snapshot();
+  auto copy = snap.clone();
+  db.put({}, to_bytes("k"), to_bytes("concurrent"));
+
+  bytecask::WritePlan stale{std::move(snap)};
+  stale.put(to_bytes("k"), to_bytes("mine"));
+  CHECK_FALSE(db.apply_batch({}, std::move(stale)));  // W-W conflict, as before
+
+  auto fresh = db.snapshot();
+  auto fresh_copy = fresh.clone();
+  bytecask::WritePlan ok{std::move(fresh)};
+  ok.ensure_unchanged(to_bytes("k"));
+  ok.put(to_bytes("k"), to_bytes("mine"));
+  CHECK(db.apply_batch({}, std::move(ok)));
+  CHECK(get_str(db, to_bytes("k")) == "mine");
+
+  // The clones still show their own moment.
+  CHECK(snapshot_text(copy) == "k=v0;");
+  CHECK(snapshot_text(fresh_copy) == "k=concurrent;");
+}
+
+TEST_CASE("Snapshot clone: concurrent reads through both handles",
+          "[snapshot][clone][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  for (int i = 0; i < 200; ++i) {
+    db.put({}, to_bytes("k" + std::to_string(1000 + i)), to_bytes("v"));
+  }
+  auto snap = db.snapshot();
+  auto copy = snap.clone();
+  const auto expected = snapshot_text(snap);
+
+  std::atomic<bool> stop{false};
+  std::thread writer([&] {
+    for (int i = 0; !stop.load(); ++i) {
+      db.put({}, to_bytes("k" + std::to_string(1000 + i % 200)),
+             to_bytes("w" + std::to_string(i)));
+    }
+  });
+  std::vector<std::string> seen(2);
+  std::thread a([&] { for (int i = 0; i < 20; ++i) seen[0] = snapshot_text(snap); });
+  std::thread b([&] { for (int i = 0; i < 20; ++i) seen[1] = snapshot_text(copy); });
+  a.join();
+  b.join();
+  stop.store(true);
+  writer.join();
+  CHECK(seen[0] == expected);
+  CHECK(seen[1] == expected);
+}
+
 // Snapshot::contains_key reflects state at snapshot time, not after a del.
 TEST_CASE("Snapshot contains_key is frozen at snapshot time", "[snapshot]") {
   TempDir td;

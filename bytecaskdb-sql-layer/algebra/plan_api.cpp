@@ -1559,6 +1559,15 @@ struct bc_overlay {
   std::uint64_t reserved;
 };
 
+// What a cursor that outlives its transaction reads: its own handle on the
+// snapshot (a clone, so the transaction's commit may move the original into
+// its WritePlan), the catalog version and the overlay as they were pinned.
+struct bc_hold {
+  bytecask::Snapshot snap;
+  std::shared_ptr<const Catalog> pinned;
+  std::shared_ptr<const Overlay> view;
+};
+
 namespace {
 void txn_abort(bc_txn* txn) noexcept;
 }  // namespace
@@ -2926,6 +2935,35 @@ bc_overlay* bc_txn_overlay_pin(bc_txn* txn) {
   BC_GUARD_END(txn)
   if (txn != nullptr) txn_abort(txn);
   return nullptr;
+}
+
+bc_hold* bc_txn_hold(bc_txn* txn, const bc_overlay* pin) {
+  BC_GUARD_BEGIN
+  txn->sink().clear();
+  // The pin made the snapshot and catalog the transaction's.
+  if (txn->aborted || txn->done || !txn->snap || !txn->pinned || pin == nullptr || pin->owner != txn) {
+    txn->sink().fail(BC_E_HANDLE, "bc_txn_hold needs a live transaction and an overlay pinned from it");
+    return nullptr;
+  }
+  return new bc_hold{txn->snap->clone(), txn->pinned, pin->view};
+  BC_GUARD_END(txn)
+  if (txn != nullptr) txn_abort(txn);
+  return nullptr;
+}
+
+void bc_txn_hold_free(bc_hold* hold) { delete hold; }
+
+void bc_ctx_begin_hold(bc_ctx* cx, const bc_hold* hold, const bc_params* params, bc_budget budget) {
+  BC_GUARD_BEGIN
+  cx->drop_execution_state();
+  cx->sink().clear();
+  cx->params = params;
+  cx->budget = budget;
+  cx->pinned = hold->pinned;
+  cx->cat = cx->pinned.get();
+  cx->base = &hold->snap;
+  cx->overlay = hold->view.get();
+  BC_GUARD_END(cx)
 }
 
 void bc_txn_overlay_release(bc_overlay* pin) {
