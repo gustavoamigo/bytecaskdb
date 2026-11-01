@@ -101,8 +101,10 @@ the engine's directory lock. The code is in `bytecaskdb-sql-layer/server/`:
 - `pg_wire.cppm` (`bytecask.sql.pg_wire`): message framing. It reads a
   message from a buffer and writes one into a buffer; it does no I/O and has
   no policy.
-- `pg_text.cppm` (`bytecask.sql.pg_text`): each SQL type's OID, its text
-  input and its text output.
+- `pg_text.cppm` (`bytecask.sql.pg_text`): each SQL type's OID, and its
+  text input and output, which are the layer's own (`sql/text.cppm`,
+  `bytecask.sql.text`): the binder reads a string literal with the same
+  input functions (`frontend_design.md`, *Literals*).
 - `pg_session.cppm` (`bytecask.sql.pg_session`): one connection's protocol
   state machine, over a file descriptor.
 - `main.cpp`: arguments, the listener, signals.

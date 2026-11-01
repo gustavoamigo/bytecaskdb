@@ -66,15 +66,22 @@ auto relation(const PgQuery__RangeVar* rv) -> std::string {
 auto expr(const PgQuery__Node* n) -> Expr;
 auto literal(const PgQuery__Node* n) -> Literal;
 
-// An operand of + or -: an expression, or an integer literal, which must
-// fit BIGINT (PostgreSQL types a larger one as numeric).
+auto literal_expr(Literal l) -> Expr {
+  Expr e{Expr::Kind::Literal, {}, 0, nullptr, nullptr, l.pos};
+  e.literal = std::move(l);
+  return e;
+}
+
+// An operand of + or -: an expression, an integer literal within BIGINT,
+// as a Const, or any other literal (PostgreSQL types a larger integer as
+// numeric), for the binder to fold or refuse.
 auto operand(const PgQuery__Node* n) -> Expr {
   if (n == nullptr || n->node_case != PG_QUERY__NODE__NODE_A_CONST) return expr(n);
   auto l = literal(n);
   std::int64_t v = 0;
   auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
   if (l.kind != Literal::Kind::Integer || ec != std::errc{} || end != l.text.data() + l.text.size()) {
-    reject("only integer literals within BIGINT are supported", l.pos);
+    return literal_expr(std::move(l));
   }
   Expr e{Expr::Kind::Const, {}, 0, nullptr, nullptr, l.pos};
   e.constant = v;
@@ -101,7 +108,14 @@ auto expr(const PgQuery__Node* n) -> Expr {
   if (n->node_case == PG_QUERY__NODE__NODE_A_EXPR) {
     const auto* a = n->a_expr;
     auto op = a->kind == PG_QUERY__A__EXPR__KIND__AEXPR_OP && a->n_name == 1 ? str(a->name[0]) : "";
-    if ((op != "+" && op != "-") || a->lexpr == nullptr) reject("only + and - are supported here", a->location);
+    if (op != "+" && op != "-") reject("only + and - are supported here", a->location);
+    // Unary: PostgreSQL's grammar folds - of a number into the literal, so
+    // what is left is + of anything and - of an expression.
+    if (a->lexpr == nullptr) {
+      Expr e{op == "+" ? Expr::Kind::Plus : Expr::Kind::Neg, {}, 0, nullptr, nullptr, a->location};
+      e.rhs = std::make_unique<Expr>(operand(a->rexpr));
+      return e;
+    }
     Expr e{op == "+" ? Expr::Kind::Add : Expr::Kind::Sub, {}, 0, nullptr, nullptr, a->location};
     e.lhs = std::make_unique<Expr>(operand(a->lexpr));
     e.rhs = std::make_unique<Expr>(operand(a->rexpr));
@@ -135,9 +149,7 @@ auto expr(const PgQuery__Node* n) -> Expr {
     e.table = arg.table;
     return e;
   }
-  if (n->node_case == PG_QUERY__NODE__NODE_A_CONST) {
-    reject("literals are not supported; use parameters", n->a_const->location);
-  }
+  if (n->node_case == PG_QUERY__NODE__NODE_A_CONST) return literal_expr(literal(n));
   reject("expression not supported", -1);
 }
 
@@ -348,9 +360,10 @@ auto limit(const PgQuery__SelectStmt* s) -> std::optional<std::int64_t> {
 
 auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   if (s->op != PG_QUERY__SET_OPERATION__SETOP_NONE) reject("set operations are not supported", pos);
-  // One table, or two: FROM a, b, or a [INNER] JOIN b ON …, whose ON
+  // No table, one, or two: FROM a, b, or a [INNER] JOIN b ON …, whose ON
   // conjuncts join the WHERE's.
-  if (s->n_from_clause != 1 && s->n_from_clause != 2) reject("SELECT reads one or two tables", pos);
+  if (s->n_values_lists != 0) reject("VALUES is supported only in INSERT", pos);
+  if (s->n_from_clause > 2) reject("SELECT reads one or two tables", pos);
   std::vector<const PgQuery__RangeVar*> tables;
   const PgQuery__Node* on = nullptr;
   for (std::size_t i = 0; i < s->n_from_clause; ++i) {
@@ -376,8 +389,9 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
       s->n_window_clause != 0 || s->into_clause != nullptr) {
     reject("SELECT clause not supported", pos);
   }
-  Select sel{{}, relation(tables[0]), tables.size() == 2 ? relation(tables[1]) : "", {}, {}, limit(s), pos, false};
-  sel.table_pos = tables[0]->location;
+  Select sel{{}, tables.empty() ? "" : relation(tables[0]), tables.size() == 2 ? relation(tables[1]) : "", {}, {}, limit(s),
+             pos, false};
+  if (!tables.empty()) sel.table_pos = tables[0]->location;
   if (tables.size() == 2) sel.join_pos = tables[1]->location;
   if (s->n_locking_clause == 1) {
     // FOR UPDATE alone: never NOWAIT or SKIP LOCKED, which only mean

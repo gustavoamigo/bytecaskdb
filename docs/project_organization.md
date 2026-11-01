@@ -57,7 +57,8 @@ translation unit.
 | `bytecask.sql.runtime` | `algebra/runtime.cppm` | The C++ side of the plan API: the types `bc_plan.h` leaves opaque, and the symbol table a run-time loader links plans against |
 | `bytecask.sql.ast` | `sql/ast.cppm` | The AST the parser hands the binder |
 | `bytecask.sql.parser` | `sql/parser.cppm` | libpg_query behind `parse()`; no importer sees its headers |
-| `bytecask.sql.binder` | `sql/binder.cppm` | Names to ids, parameter types from use |
+| `bytecask.sql.text` | `sql/text.cppm` | Each type's text, as PostgreSQL's input and output functions read and write it: a wire parameter's and a string literal's |
+| `bytecask.sql.binder` | `sql/binder.cppm` | Names to ids, parameter types from use, literals folded to the types they meet |
 | `bytecask.sql.codegen` | `plan/codegen.cppm` | Planner and code generator |
 | `bytecask.sql.tcc_loader` | `plan/tcc_loader.cppm` | TinyCC in process; no importer sees `libtcc.h` |
 | `bytecask.sql.api` | `api/database.cppm` | The embedded API |

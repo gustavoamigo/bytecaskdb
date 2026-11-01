@@ -566,18 +566,42 @@ class SqlMachine(Sides, RuleBasedStateMachine):
             self.tables.pop(name, None)
         return out
 
-    def insert(self, name: str, row: dict[str, object], all_columns: bool) -> o.Outcome:
+    def insert(self, name: str, row: dict[str, object], all_columns: bool, literal: bool = False) -> o.Outcome:
+        """`literal`: the values written into the text as literals
+        (o.sql_literal), not sent as parameters."""
         cols = list(row)
         params = [row[c] for c in cols]
-        marks = ", ".join(f"${i + 1}" for i in range(len(cols)))
         target = "" if all_columns else f" ({', '.join(cols)})"
-        sql = f"INSERT INTO {name}{target} VALUES ({marks})"
         t = self.tables.get(name)
         types = [t.column(c).type for c in cols] if t is not None else None
-        return self.both(sql, params, types=types)
+        if literal and t is not None:
+            values = ", ".join(o.sql_literal(t.column(c).type, row[c]) for c in cols)
+            return self.both(f"INSERT INTO {name}{target} VALUES ({values})")
+        marks = ", ".join(f"${i + 1}" for i in range(len(cols)))
+        return self.both(f"INSERT INTO {name}{target} VALUES ({marks})", params, types=types)
 
-    def lookup(self, name: str, key: tuple, for_update: bool = False) -> o.Outcome:
+    def lookup(self, name: str, key: tuple, for_update: bool = False, literal: bool = False) -> o.Outcome | None:
+        """`literal`: the key written into the text as literals; one its
+        column's type does not hold exactly is the layer's refusal
+        (o.exact_literal), which PostgreSQL does not have."""
         t = self.tables[name]
+        if literal:
+            lock = " FOR UPDATE" if for_update else ""
+            types = [t.column(c).type for c in t.pk]
+            sql = f"{t.select_all} WHERE " + " AND ".join(
+                f"{c} = {o.sql_literal(ty, v)}" for c, ty, v in zip(t.pk, types, key)) + lock
+            if not all(o.exact_literal(ty, v) for ty, v in zip(types, key)):
+                out = self.layer(sql)
+                if out.error == o.ABORTED:
+                    return None  # the transaction was aborted before
+                assert out.error == "refused", f"{sql}: a literal its column does not hold was {out.error or 'accepted'}"
+                if self.txn is not None and not self.pg_aborted():
+                    # A refused statement aborts the transaction on both sides,
+                    # as any statement PostgreSQL refuses does.
+                    assert self.txn.is_aborted
+                    assert o.run_pg(self.pg.conn, "SELECT no_such_column FROM " + name).error == "42703"
+                return None
+            return self.both(sql)
         where = " AND ".join(f"{c} = ${i + 1}" for i, c in enumerate(t.pk))
         pg_where = " AND ".join(f"{c} = {typed(t, c, i + 1)}" for i, c in enumerate(t.pk))
         # FOR UPDATE returns what the plain SELECT does: on one connection
@@ -1137,7 +1161,7 @@ class SqlMachine(Sides, RuleBasedStateMachine):
                 row[c.name] = None
             else:
                 row[c.name] = data.draw(values(c.type), label=c.name)
-        self.insert(name, row, all_columns)
+        self.insert(name, row, all_columns, literal=data.draw(st.integers(0, 3), label="literals?") == 0)
 
     # Inserts are three times as likely as any other step: three rules run
     # them, so the reads find rows.
@@ -1154,7 +1178,8 @@ class SqlMachine(Sides, RuleBasedStateMachine):
             key = data.draw(st.sampled_from(keys), label="key")
         else:
             key = tuple(data.draw(st.none() | values(t.column(c).type), label=c) for c in t.pk)
-        self.lookup(t.name, key, for_update=data.draw(st.booleans(), label="FOR UPDATE"))
+        self.lookup(t.name, key, for_update=data.draw(st.booleans(), label="FOR UPDATE"),
+                    literal=data.draw(st.integers(0, 3), label="literal key?") == 0)
 
     @precondition(lambda self: self.tables and self.txn is None)
     @rule(data=st.data())
@@ -1581,10 +1606,12 @@ class KeylessMachine(Sides, RuleBasedStateMachine):
         differences*)."""
         return [c.name for c in t.columns if c.type.kind not in ("float", "real")]
 
-    def draw_where(self, data, t: Table, first: int) -> tuple[str, str, list, list]:
-        """No WHERE, or col = $first on a filterable column, its value often
-        one a row holds: the layer's text, PostgreSQL's, the parameters and
-        their types."""
+    def draw_where(self, data, t: Table, first: int) -> tuple[str, str, list, list] | None:
+        """No WHERE, or col = $first, or col = a literal, on a filterable
+        column, its value often one a row holds: the layer's text,
+        PostgreSQL's, the parameters and their types. None for a literal
+        the column's type does not hold exactly, which the layer refuses
+        (o.exact_literal), having checked it does."""
         cols = self.filterable(t)
         if not cols or data.draw(st.integers(0, 3), label="no where?") == 0:
             return "", "", [], []
@@ -1592,7 +1619,15 @@ class KeylessMachine(Sides, RuleBasedStateMachine):
         held = [r[[x.name for x in t.columns].index(c)] for r in self.rows(t)]
         v = data.draw(st.sampled_from(held) if held and data.draw(st.booleans(), label="held?") else values(t.column(c).type),
                       label="where value")
-        return f" WHERE {c} = ${first}", f" WHERE {c} = {typed(t, c, first)}", [v], [t.column(c).type]
+        ty = t.column(c).type
+        if data.draw(st.booleans(), label="literal?"):
+            where = f" WHERE {c} = {o.sql_literal(ty, v)}"
+            if not o.exact_literal(ty, v):
+                out = self.layer(f"SELECT {c} FROM {t.name}{where}")
+                assert out.error == "refused", f"{where}: a literal its column does not hold was {out.error or 'accepted'}"
+                return None
+            return where, where, [], []
+        return f" WHERE {c} = ${first}", f" WHERE {c} = {typed(t, c, first)}", [v], [ty]
 
     @precondition(lambda self: len(self.tables) < len(KEYLESS_NAMES))
     @rule(data=st.data())
@@ -1629,6 +1664,10 @@ class KeylessMachine(Sides, RuleBasedStateMachine):
             row = {c: v for c, v in row.items() if c in keep}
         cols = list(row)
         target = "" if all_columns else f" ({', '.join(cols)})"
+        if data.draw(st.booleans(), label="literals?"):
+            values_text = ", ".join(o.sql_literal(t.column(c).type, row[c]) for c in cols)
+            self.both(f"INSERT INTO {t.name}{target} VALUES ({values_text})")
+            return
         marks = ", ".join(f"${i + 1}" for i in range(len(cols)))
         self.both(f"INSERT INTO {t.name}{target} VALUES ({marks})", [row[c] for c in cols],
                   types=[t.column(c).type for c in cols])
@@ -1639,7 +1678,16 @@ class KeylessMachine(Sides, RuleBasedStateMachine):
         t = self.draw_table(data)
         c = data.draw(st.sampled_from([x.name for x in t.columns]), label="set column")
         v = data.draw(st.none() | values(t.column(c).type), label="set value")
-        where, pg_where, params, types = self.draw_where(data, t, 2)
+        drawn = self.draw_where(data, t, 2)
+        if drawn is None:
+            return
+        where, pg_where, params, types = drawn
+        if data.draw(st.booleans(), label="literal set?"):
+            # The WHERE's parameter, if any, is $2: renumbered as $1.
+            lit = o.sql_literal(t.column(c).type, v)
+            self.both(f"UPDATE {t.name} SET {c} = {lit}{where.replace('$2', '$1')}", params,
+                      pg_sql=f"UPDATE {t.name} SET {c} = {lit}{pg_where.replace('$2', '$1')}", types=types)
+            return
         self.both(f"UPDATE {t.name} SET {c} = $1{where}", [v, *params], pg_sql=f"UPDATE {t.name} SET {c} = $1{pg_where}",
                   types=[t.column(c).type, *types])
 
@@ -1647,7 +1695,10 @@ class KeylessMachine(Sides, RuleBasedStateMachine):
     @rule(data=st.data())
     def delete(self, data):
         t = self.draw_table(data)
-        where, pg_where, params, types = self.draw_where(data, t, 1)
+        drawn = self.draw_where(data, t, 1)
+        if drawn is None:
+            return
+        where, pg_where, params, types = drawn
         self.both(f"DELETE FROM {t.name}{where}", params, pg_sql=f"DELETE FROM {t.name}{pg_where}", types=types)
 
     @precondition(lambda self: self.tables)
@@ -1655,7 +1706,10 @@ class KeylessMachine(Sides, RuleBasedStateMachine):
     def select(self, data):
         t = self.draw_table(data)
         cols = data.draw(st.lists(st.sampled_from([c.name for c in t.columns]), min_size=1, unique=True), label="selected")
-        where, pg_where, params, types = self.draw_where(data, t, 1)
+        drawn = self.draw_where(data, t, 1)
+        if drawn is None:
+            return
+        where, pg_where, params, types = drawn
         self.bag(f"SELECT {', '.join(cols)} FROM {t.name}{where}", params,
                  f"SELECT {', '.join(cols)} FROM {t.name}{pg_where}", types)
 

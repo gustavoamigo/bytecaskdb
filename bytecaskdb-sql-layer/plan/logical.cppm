@@ -7,9 +7,9 @@
 // turn it into an equivalent one, and the search (search.cppm) picks the
 // physical plan that computes it.
 //
-// The expressions are those the dialect has today: columns, parameters,
-// integer constants, + and -, comparisons, a conjunction of them, and
-// aggregate calls. A predicate is its conjuncts, in the order the statement
+// The expressions are those the dialect has today: columns, parameters
+// (a literal is one, folded by the binder), integer constants, + and -,
+// comparisons, a conjunction of them, and aggregate calls. A predicate is its conjuncts, in the order the statement
 // wrote them.
 
 module;
@@ -134,6 +134,9 @@ struct Empty {
   std::vector<const Table*> tables;
 };
 
+// One row of no columns: what a SELECT without FROM reads.
+struct OneRow {};
+
 // The rows for which every conjunct is true.
 struct Filter {
   NodePtr input;
@@ -216,7 +219,7 @@ struct Delete {
 };
 
 struct Node {
-  std::variant<Get, Empty, Filter, Project, Join, Aggregate, Sort, Limit, Insert, Update, Delete> op;
+  std::variant<Get, Empty, OneRow, Filter, Project, Join, Aggregate, Sort, Limit, Insert, Update, Delete> op;
   // The columns something above reads from this operator's rows: set by
   // projection pruning, empty before it.
   std::vector<ColumnRef> output;
@@ -227,8 +230,8 @@ template <typename T>
   return std::make_unique<Node>(Node{std::move(op), {}});
 }
 
-// The operator below n, or null for a leaf (Get, Empty, Insert); a Join has
-// two.
+// The operator below n, or null for a leaf (Get, Empty, OneRow, Insert); a
+// Join has two.
 template <typename N>
   requires std::is_same_v<std::remove_const_t<N>, Node>
 [[nodiscard]] auto input_of(N& n) {
