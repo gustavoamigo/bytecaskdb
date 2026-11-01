@@ -49,6 +49,16 @@ struct ParamInfo {
   bool assigned_only{true};
 };
 
+// A constant of the statement that is the time, not a literal: its slot among
+// `Bound::fixed` is filled with the statement's time each time it runs, not
+// when it was compiled (docs/frontend_design.md, *The time*).
+struct ClockSlot {
+  enum class Kind { Date, Time, Timestamp };
+  std::uint32_t slot;  // index into Bound::fixed
+  Kind kind;
+  std::uint8_t precision;  // fractional digits of a time or timestamp, 0 to 6
+};
+
 // A bound statement: DDL as the catalog's statement values, names checked,
 // types and defaults folded; anything else as its logical plan.
 struct Bound {
@@ -72,6 +82,9 @@ struct Bound {
   // their types after the statement's own parameters'; param_sql,
   // param_table and params hold the statement's own only.
   std::vector<Datum> fixed;
+  // The entries of `fixed` that are the time (CURRENT_DATE, LOCALTIME,
+  // LOCALTIMESTAMP): their values here are placeholders.
+  std::vector<ClockSlot> clocks;
   // Each uncorrelated subquery, run before the plan: it sets its hidden
   // parameters, among `fixed`'s, whose values there are NULL.
   std::vector<logical::Subquery> subqueries;
@@ -437,6 +450,7 @@ auto is_constant(const ast::Expr& e) -> bool {
     case K::Param:
     case K::Aggregate:
     case K::Star:
+    case K::Clock:
     case K::Subquery: return false;
   }
   return false;
@@ -774,14 +788,48 @@ auto compare_constants(Constant x, Constant y, ast::ValueCompare op, std::int32_
   return {truth, SqlType{SqlKind::Boolean}, false, {}, pos};
 }
 
+auto text_of(const Constant& c) -> std::string;
+
+constexpr std::int64_t kMicrosPerDay = 86'400'000'000;
+
+// A date, time or timestamp cast to another type, as PostgreSQL casts it:
+// to text; to its own type; a timestamp to a date or a time; a date to a
+// timestamp. A time to a date or a timestamp, and a date to a time, have no
+// cast (42846).
+auto cast_temporal(const Constant& arg, SqlType t, std::int32_t pos) -> Constant {
+  auto from = arg.type.kind;
+  auto null = std::holds_alternative<std::monostate>(arg.value);
+  auto result = [&](Datum v) -> Constant { return {std::move(v), t, false, {}, pos}; };
+  if (t.kind == SqlKind::Text) return null ? result(std::monostate{}) : result(bytes_of(text_of(arg)));
+  if (from == t.kind) return {arg.value, t, false, {}, pos};
+  using K = SqlKind;
+  if (from == K::Timestamp && (t.kind == K::Date || t.kind == K::Time)) {
+    if (null) return result(std::monostate{});
+    auto us = std::get<std::int64_t>(arg.value);
+    auto days = us >= 0 ? us / kMicrosPerDay : -((-us + kMicrosPerDay - 1) / kMicrosPerDay);
+    return result(t.kind == K::Date ? days : us - days * kMicrosPerDay);
+  }
+  if (from == K::Date && t.kind == K::Timestamp) {
+    if (null) return result(std::monostate{});
+    auto days = std::get<std::int64_t>(arg.value);
+    constexpr auto kLimit = std::numeric_limits<std::int64_t>::max() / kMicrosPerDay;
+    if (days > kLimit || days < -kLimit) throw SqlError{"timestamp out of range", pos, kDatetimeFieldOverflow};
+    return result(days * kMicrosPerDay);
+  }
+  throw SqlError{"cannot cast type " + pg_type_name(arg.type) + " to " + pg_type_name(t), pos, kCannotCoerce};
+}
+
 // type 'text', '…'::type and CAST('…' AS type): a string literal read as
 // the type, as its input function reads it, a DECIMAL rounded to its scale;
-// NULL of the type. A cast of anything else, and to VARCHAR(n), which
-// PostgreSQL's cast truncates, are not taken yet.
+// NULL of the type. A date, time or timestamp is cast by cast_temporal. A
+// cast of anything else, and to VARCHAR(n), which PostgreSQL's cast
+// truncates, are not taken yet.
 auto cast_constant(const ast::Expr& e, const Constant& arg) -> Constant {
   auto t = sql_type(ast::ColumnDefAst{"", e.cast_type, e.cast_typmods, false, false, std::nullopt, e.pos, {}});
   if (t.kind == SqlKind::Varchar) not_yet("a cast to VARCHAR(n)", e.pos);
-  if (!arg.unknown) not_yet("a cast of other than a string literal or NULL", e.pos);
+  auto temporal = !arg.unknown && (arg.type.kind == SqlKind::Date || arg.type.kind == SqlKind::Time || arg.type.kind == SqlKind::Timestamp);
+  if (temporal) return cast_temporal(arg, t, e.pos);
+  if (!arg.unknown) not_yet("a cast of other than a string literal, NULL, date, time or timestamp", e.pos);
   if (std::holds_alternative<std::monostate>(arg.value)) return {std::monostate{}, t, false, {}, e.pos};
   return {read_as(arg, t, true), t, false, {}, e.pos};
 }
@@ -1249,6 +1297,7 @@ auto fold(const ast::Expr& e) -> Constant {
     case K::Coalesce: return fold_coalesce(e);
     case K::NullIf: return fold_nullif(e);
     case K::Func: return fold_function(e);
+    case K::Clock: not_yet("CURRENT_DATE, LOCALTIME and LOCALTIMESTAMP other than as a select-list value", e.pos);
     case K::Column:
     case K::Param:
     case K::Aggregate:
@@ -1552,6 +1601,24 @@ public:
     fixed_types_.push_back(phys_type(t));
     return logical::param(n, t);
   }
+  // CURRENT_DATE, LOCALTIME or LOCALTIMESTAMP: a constant slot the runtime
+  // fills with the statement's time on every run.
+  auto clock(const ast::Expr& e) -> logical::Output {
+    using Kind = ClockSlot::Kind;
+    if (e.func == "current_time" || e.func == "current_timestamp") {
+      not_yet(std::string{e.func == "current_time" ? "CURRENT_TIME" : "CURRENT_TIMESTAMP"} +
+                  ": a WITH TIME ZONE type, which the layer lacks; LOCALTIME and LOCALTIMESTAMP are supported",
+              e.pos);
+    }
+    // PostgreSQL warns and uses 6 for a larger precision.
+    auto precision = static_cast<std::uint8_t>(e.constant < 0 || e.constant > 6 ? 6 : e.constant);
+    auto kind = e.func == "current_date" ? Kind::Date : e.func == "localtime" ? Kind::Time : Kind::Timestamp;
+    auto type = SqlType{kind == Kind::Date ? SqlKind::Date : kind == Kind::Time ? SqlKind::Time : SqlKind::Timestamp};
+    auto expr = fixed(std::int64_t{0}, type);
+    clocks_.push_back({expr.param - own_params_, kind, precision});
+    return {std::move(expr), e.func};
+  }
+  [[nodiscard]] auto take_clocks() -> std::vector<ClockSlot> { return std::move(clocks_); }
   [[nodiscard]] auto is_fixed(std::uint32_t n) const -> bool { return n >= own_params_; }
   [[nodiscard]] auto fixed_value(std::uint32_t n) const -> const Datum& { return fixed_.at(n - own_params_); }
   [[nodiscard]] auto fixed_values() const -> const std::vector<Datum>& { return fixed_; }
@@ -1771,6 +1838,7 @@ public:
         case ast::Expr::Kind::And:
         case ast::Expr::Kind::Or:
         case ast::Expr::Kind::Aggregate:
+        case ast::Expr::Kind::Clock:
         case ast::Expr::Kind::Subquery: break;
       }
       return "?column?";
@@ -1825,6 +1893,7 @@ public:
         use_param(e.param, phys_type(peer->column->sql), e.pos, *peer->column, peer->table->id, peer->use);
         return logical::param(e.param, peer->column->sql);
       case K::Subquery: return subquery_output(e).expr;
+      case K::Clock: return clock(e).expr;
       case K::Add:
       case K::Sub:
       case K::Mul:
@@ -2439,6 +2508,7 @@ public:
       case ast::Expr::Kind::And:
       case ast::Expr::Kind::Or: not_yet("IS NULL, AND, OR and NOT of other than constants as a value", e.pos);
       case ast::Expr::Kind::Cast: not_yet("a cast of other than a constant", e.pos);
+      case ast::Expr::Kind::Clock: not_yet("CURRENT_DATE, LOCALTIME and LOCALTIMESTAMP assigned to a column", e.pos);
       case ast::Expr::Kind::Subquery: not_yet("a subquery assigned to a column", e.pos);
       case ast::Expr::Kind::Case:
       case ast::Expr::Kind::Coalesce:
@@ -2880,6 +2950,11 @@ public:
     };
     std::vector<logical::Output> targets;
     for (const auto& e : list) {
+      if (e.kind == ast::Expr::Kind::Clock) {
+        if (aggregated) not_yet("the time in the select list of an aggregated query", e.pos);
+        targets.push_back(clock(e));
+        continue;
+      }
       if (is_constant(e) || e.kind == ast::Expr::Kind::Subquery) {
         if (aggregated) {
           not_yet(std::string{e.kind == ast::Expr::Kind::Subquery ? "a subquery" : "a constant"} +
@@ -3186,6 +3261,10 @@ public:
         targets.push_back(subquery_output(e));
         continue;
       }
+      if (e.kind == ast::Expr::Kind::Clock) {
+        targets.push_back(clock(e));
+        continue;
+      }
       if (!is_constant(e)) not_yet("a SELECT without FROM of other than constants and subqueries", e.pos);
       targets.push_back(constant_output(e));
     }
@@ -3362,6 +3441,7 @@ private:
   std::vector<ParamUse> params_;
   std::vector<Datum> fixed_;  // the constants' values, $own_params_ + 1 onwards
   std::vector<PhysType> fixed_types_;
+  std::vector<ClockSlot> clocks_;
   std::vector<logical::Subquery> subqueries_;  // in the order bound; InSet names one by its index
   int depth_{0};                               // inside a subquery: one more is refused
   std::vector<const Table*> scope_;            // the tables of the query being bound
@@ -4010,7 +4090,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
   auto types = b.param_types(bound_stmt.second);
   types.insert(types.end(), b.fixed_types().begin(), b.fixed_types().end());
   return Bound{std::move(bound_stmt.first), std::move(types), b.param_sql(), b.param_table(), b.param_info(),
-               b.fixed_values(), b.take_subqueries(), views.used(), b.take_instances()};
+               b.fixed_values(), b.take_clocks(), b.take_subqueries(), views.used(), b.take_instances()};
 }
 
 }  // namespace bytecask::sql::bound
