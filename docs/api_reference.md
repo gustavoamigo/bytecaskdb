@@ -350,6 +350,9 @@ public:
     // WritePlan(sequence, marker). Both throw std::logic_error on a
     // moved-from snapshot.
     [[nodiscard]] auto marker() const -> ChangeMarker;
+    // A second independent handle on the same frozen state (a refcount
+    // increment). Reads what this one reads; outlives it and the DB.
+    [[nodiscard]] auto clone() const -> Snapshot;
     [[nodiscard]] auto get(const ReadOptions& opts,
                            BytesView key, Bytes& out) const -> bool;
     [[nodiscard]] auto contains_key(const ReadOptions& opts,

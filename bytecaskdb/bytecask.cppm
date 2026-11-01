@@ -249,7 +249,7 @@ export enum class PlanRefusal {
   // Plans on a read point only: it cannot be checked here. Read on another
   // history (before a crash, across a failover), past the latest sequence,
   // or needing deletes the engine no longer tracks (from before a restart,
-  // a promotion, an ingest or a resume() that replayed writes, or beyond
+  // a promotion, an ingest or a failed append resume() replayed, or beyond
   // max_delete_log_bytes since). Take a fresh
   // snapshot.
   TooOld,
@@ -2016,6 +2016,12 @@ public:
   [[nodiscard]] auto marker() const -> ChangeMarker {
     const auto &s = named_state();
     return s.marker_at(s.next_seq - 1);
+  }
+  // A second handle on the same frozen state: it reads what this one reads,
+  // and each keeps the state, its files and its parked nodes alive until
+  // both are gone. A refcount increment; allocates nothing and cannot throw.
+  [[nodiscard]] auto clone() const noexcept -> Snapshot {
+    return Snapshot{state_, limits_};
   }
 
   // Returns true if key exists in this snapshot. No disk I/O.

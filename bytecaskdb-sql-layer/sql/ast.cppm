@@ -10,6 +10,7 @@
 
 module;
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -63,46 +64,72 @@ struct Literal {
   std::int32_t pos{-1};
 };
 
+struct Select;
+
 // A comparison as a value (SELECT 3 < 5): its operator, <> among them. A
 // WHERE's comparisons are Compare's, below.
 enum class ValueCompare { Eq, Ne, Lt, Le, Gt, Ge };
 
 // A select-list, SET or comparison operand: a column, a parameter, a
-// literal (an integer within BIGINT after + or - is a Const), a sum or
-// difference of two, unary + or - of one, a comparison of two, a cast of
-// one (DATE '…' and '…'::date alike), or an aggregate: COUNT(*),
-// COUNT([DISTINCT] column), SUM, MIN, MAX or AVG of a column.
+// literal (an integer within BIGINT after + or - is a Const), a sum,
+// difference, product or quotient of two, unary + or - of one, a comparison of two, IS [NOT]
+// NULL of one, AND, OR or NOT of boolean expressions, a cast of
+// one (DATE '…' and '…'::date alike), an aggregate: COUNT(*),
+// COUNT([DISTINCT] column), SUM, MIN, MAX or AVG of a column; or a scalar
+// subquery, (SELECT …), the value of its one row; CASE (searched, or simple
+// on `lhs`), COALESCE and NULLIF; a string function or ||; or, in a select list only,
+// * or `table`.*, which the binder expands to columns.
 struct Expr {
-  enum class Kind { Column, Param, Const, Literal, Add, Sub, Plus, Neg, Compare, Cast, Aggregate };
+  enum class Kind { Column, Param, Const, Literal, Add, Sub, Mul, Div, Star, Plus, Neg, Compare, IsNull, Not, And, Or, Cast, Aggregate, Subquery, Case, Coalesce, NullIf, Func, Clock, Default };
   enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind;
   std::string column;       // Column; Aggregate's argument, "" for COUNT(*)
   std::uint32_t param{0};   // Param: zero-based ($1 is 0)
-  std::unique_ptr<Expr> lhs, rhs;  // Add, Sub, Compare; Plus, Neg and Cast: rhs
+  std::unique_ptr<Expr> lhs, rhs;  // Add, Sub, Mul, Div, Compare; Plus, Neg, IsNull, Not and Cast: rhs
   std::int32_t pos{-1};
-  std::string table;          // Column, Aggregate: the table it is qualified by, "" for none
+  std::string table;          // Column, Aggregate, Star: the table it is qualified by, "" for none
   std::int64_t constant{0};   // Const: an integer literal (Add and Sub's right operand only)
   Fn fn{Fn::Count};           // Aggregate
   bool distinct{false};       // Aggregate: COUNT(DISTINCT column)
+  bool negated{false};        // IsNull: IS NOT NULL
   Literal literal{};          // Literal
   ValueCompare cmp{ValueCompare::Eq};  // Compare
   std::string cast_type;               // Cast: libpg_query's last type name, as a column's
   std::vector<std::int32_t> cast_typmods;
+  std::shared_ptr<const Select> subquery;  // Subquery
+  std::string alias;  // a select-list item's AS name, "" for none
+  // And, Or: two or more operands. Case: WHEN, THEN, WHEN, THEN … in order, `lhs` the simple form's operand
+  // and `rhs` its ELSE, each none where absent. Coalesce: its arguments.
+  // NullIf: `lhs` and `rhs`.
+  std::vector<Expr> args;
+  // Func: a string function or ||, `func` its name as PostgreSQL resolves it
+  // (btrim for TRIM(BOTH …), position(string, substring) for POSITION(sub IN
+  // string)), its operands in `args`.
+  std::string func;
+  // Clock: `func` is the SQL name (current_date, localtime, …) and `constant`
+  // the precision written after it, -1 for none.
 };
 
 // One conjunct of a WHERE clause: two expressions compared; or, as a
-// predicate, AND, OR or NOT of conjuncts (`args`), or `lhs` IS NULL. The
+// predicate, AND, OR or NOT of conjuncts (`args`), `lhs` IS NULL, `lhs`
+// LIKE the pattern `rhs`, with its ESCAPE as written, EXISTS (`subquery`),
+// or `lhs` compared by `quantified` with ANY or ALL (`all`) of the
+// subquery's rows: IN is = ANY, NOT IN its NOT. The
 // parser writes <>, BETWEEN and IN with them: NOT (a = b); a >= lo AND a <=
 // hi; a = x OR a = y.
 struct Compare {
   enum class Op { Eq, Lt, Le, Gt, Ge };
-  enum class Kind { Compare, And, Or, Not, IsNull };
+  enum class Kind { Compare, And, Or, Not, IsNull, Like, Exists, Quantified };
   Op op;
   Expr lhs, rhs;
   std::int32_t pos{-1};
-  bool on{false};  // a JOIN's ON conjunct, not the WHERE's
+  std::uint32_t on{0};  // 0: the WHERE's; k: the ON conjunct of Select::from[k]
   Kind kind{Kind::Compare};
   std::vector<Compare> args;  // And, Or: two or more; Not: one
+  std::optional<std::string> escape;  // Like: ESCAPE's string; none for the default, a backslash
+  std::shared_ptr<const Select> subquery;  // Exists, Quantified
+  ValueCompare quantified{ValueCompare::Eq};
+  bool all{false};
 };
 
 // A copy of e, which owns its operands: what BETWEEN and IN repeat.
@@ -114,12 +141,39 @@ struct Compare {
   out.constant = e.constant;
   out.fn = e.fn;
   out.distinct = e.distinct;
+  out.negated = e.negated;
   out.literal = e.literal;
   out.cmp = e.cmp;
   out.cast_type = e.cast_type;
   out.cast_typmods = e.cast_typmods;
+  out.subquery = e.subquery;  // never changed once parsed: shared
+  for (const auto& a : e.args) out.args.push_back(clone(a));
+  out.func = e.func;
   return out;
 }
+
+// A FOREIGN KEY constraint of CREATE TABLE, on a column (REFERENCES) or
+// on the table: its name, "" for none, its columns, and the table and
+// columns it references, none for that table's primary key. Checked
+// against the referenced table's keys, then not enforced.
+struct ForeignKeyAst {
+  std::string name;
+  std::vector<std::string> columns;
+  std::string table;
+  std::vector<std::string> ref_columns;
+  std::int32_t pos{-1};
+};
+
+// A CHECK constraint of CREATE TABLE, on a column or on the table: its name,
+// "" for none, and the text of its expression, as written between the
+// parentheses. `column` is the column a column CHECK is written on, "" for
+// a table's.
+struct CheckAst {
+  std::string name;
+  std::string text;
+  std::int32_t pos{-1};
+  std::string column;
+};
 
 struct ColumnDefAst {
   std::string name;
@@ -131,6 +185,8 @@ struct ColumnDefAst {
   std::int32_t pos{-1};
   // Each UNIQUE constraint on the column: its name, "" for none.
   std::vector<std::string> unique;
+  std::vector<ForeignKeyAst> references;  // each REFERENCES on the column
+  std::vector<CheckAst> checks;    // each CHECK on the column
 };
 
 // A UNIQUE constraint of CREATE TABLE, on a column or on the table, in the
@@ -147,6 +203,8 @@ struct CreateTable {
   std::vector<std::string> pk;  // a table-level PRIMARY KEY (…)
   std::int32_t pos{-1};
   std::vector<UniqueAst> unique;  // every UNIQUE constraint, columns' and the table's, in order
+  std::vector<ForeignKeyAst> foreign_keys;  // every FOREIGN KEY, columns' and the table's, in order
+  std::vector<CheckAst> checks;  // every CHECK, columns' and the table's, in order
 };
 
 struct IndexColumnAst {
@@ -190,6 +248,9 @@ struct Insert {
 
 struct OrderItem {
   std::string column;
+  // ORDER BY 2: the select-list position, 1-based, and no column. The parser
+  // resolves it in a plain SELECT; a set operation's the binder does.
+  std::int64_t position{0};
   bool desc{false};
   std::int32_t pos{-1};
   std::string table;  // the table it is qualified by, "" for none
@@ -198,26 +259,100 @@ struct OrderItem {
   std::optional<bool> nulls_first;
 };
 
+struct SetOperation;
+
+// How a FROM item joins the ones before it: LEFT keeps every row of the
+// items before it, RIGHT every row of the item (two items only), each joined
+// to NULLs where no row of the other matches.
+enum class JoinKind { Inner, Left, Right };
+
+// A FROM item: a table or view, and how it joins the items before it. A
+// comma is an inner join with no ON. USING (…) or NATURAL compare the
+// columns the two sides share by =, each named alone as one column;
+// `using_alias` names them too: USING (…) AS alias.
+struct FromItem {
+  std::string table;
+  // The name the query gives the item. The parser has rewritten every
+  // qualifier that names an alias to its table, so the alias stays only for a
+  // query that names one table twice, where it tells the two apart.
+  std::string alias;
+  // t AS x (a, b): the names of the table's first columns in this query.
+  std::vector<std::string> column_aliases;
+  std::int32_t pos{-1};
+  JoinKind kind{JoinKind::Inner};
+  std::vector<std::string> using_columns;
+  bool natural{false};
+  std::string using_alias;
+
+  // What a column of the item is qualified by.
+  [[nodiscard]] auto name() const -> const std::string&;
+};
+
+auto FromItem::name() const -> const std::string& { return alias.empty() ? table : alias; }
+
 struct Select {
   std::vector<Expr> targets;
-  std::string table;  // "" for none: a SELECT without FROM
-  std::string join;  // a second table, "" for none: FROM a, b or a [INNER] JOIN b ON …
+  std::vector<FromItem> from;  // empty: a SELECT without FROM
   std::vector<Compare> where;
   std::vector<OrderItem> order_by;
   std::optional<std::int64_t> limit;  // nullopt: none, LIMIT ALL or LIMIT NULL
   std::int32_t pos{-1};
   bool for_update{false};  // FOR UPDATE: a guard on each row returned, never a lock
-  std::int32_t table_pos{-1}, join_pos{-1};  // where table and join are named
   std::vector<Expr> group_by;  // GROUP BY's columns, as written
   std::vector<Compare> having;  // HAVING's conjuncts
   bool distinct{false};         // SELECT DISTINCT, not DISTINCT ON
-  // An inner join's USING (…), or NATURAL: the columns both tables have,
-  // compared by =, each named alone as one column. using_alias names them
-  // too: USING (…) AS alias.
-  std::vector<std::string> using_columns;
-  bool natural{false};
-  std::string using_alias;
+  // A cursor's query (docs/cursor_design.md, *WHERE CURRENT OF*): the binder
+  // appends the table's primary key to the result as hidden trailing columns
+  // when the query is a simple scan of one table, and adds nothing otherwise.
+  bool row_key{false};
+  // A set operation: this query is `set->left` combined with `set->right`,
+  // and has no select list or FROM of its own; its order_by and limit apply
+  // to the combined rows. A parenthesised arm keeps its own.
+  std::shared_ptr<const SetOperation> set;
 };
+
+// UNION, INTERSECT or EXCEPT of two queries, each of them a set operation
+// too. `all` keeps duplicates (UNION ALL), as PostgreSQL's ALL does.
+struct SetOperation {
+  enum class Kind { Union, Intersect, Except };
+  Kind kind{Kind::Union};
+  bool all{false};
+  Select left, right;
+};
+
+// A copy of c and of s, which own their operands. A subquery is shared:
+// it is never changed once parsed.
+[[nodiscard]] auto clone(const Compare& c) -> Compare {
+  Compare out{c.op, clone(c.lhs), clone(c.rhs), c.pos};
+  out.on = c.on;
+  out.kind = c.kind;
+  for (const auto& a : c.args) out.args.push_back(clone(a));
+  out.escape = c.escape;
+  out.subquery = c.subquery;
+  out.quantified = c.quantified;
+  out.all = c.all;
+  return out;
+}
+
+[[nodiscard]] auto clone(const Select& s) -> Select {
+  Select out{};
+  for (const auto& e : s.targets) {
+    out.targets.push_back(clone(e));
+    out.targets.back().alias = e.alias;
+  }
+  out.from = s.from;
+  for (const auto& c : s.where) out.where.push_back(clone(c));
+  out.order_by = s.order_by;
+  out.limit = s.limit;
+  out.pos = s.pos;
+  out.for_update = s.for_update;
+  for (const auto& e : s.group_by) out.group_by.push_back(clone(e));
+  for (const auto& c : s.having) out.having.push_back(clone(c));
+  out.distinct = s.distinct;
+  out.row_key = s.row_key;
+  out.set = s.set;  // never changed once parsed: shared
+  return out;
+}
 
 struct Assignment {
   std::string column;
@@ -230,16 +365,68 @@ struct Update {
   std::vector<Assignment> set;
   std::vector<Compare> where;
   std::int32_t pos{-1};
+  std::string current_of;  // WHERE CURRENT OF name: the cursor, and `where` is empty
 };
 
 struct Delete {
   std::string table;
   std::vector<Compare> where;
   std::int32_t pos{-1};
+  std::string current_of;  // WHERE CURRENT OF name: the cursor, and `where` is empty
+};
+
+// CREATE VIEW name [(columns)] AS query. `query` is the SELECT as written;
+// the catalog stores the statement's text and parses it again at each use.
+struct CreateView {
+  std::string view;
+  std::vector<std::string> columns;  // the view's column names, empty: the query's own
+  Select query;
+  std::int32_t pos{-1};
+  std::string definition;  // the statement's text, set by parse()
+};
+
+struct DropView {
+  std::string view;
+  bool if_exists{false};
+  std::int32_t pos{-1};
 };
 
 using Statement =
-    std::variant<CreateTable, CreateIndex, DropTable, DropIndex, AddColumn, Insert, Select, Update, Delete>;
+    std::variant<CreateTable, CreateIndex, DropTable, DropIndex, AddColumn, CreateView, DropView, Insert, Select, Update, Delete>;
+
+// Cursor statements (docs/cursor_design.md). They are not a Statement: they
+// name a session's cursor and carry no plan, so the session runs them, as it
+// does BEGIN. A DECLARE's query is parsed again as the SELECT it is.
+struct DeclareCursor {
+  enum class Scroll { Default, Scroll, NoScroll };
+  std::string name;
+  Scroll scroll{Scroll::Default};
+  bool binary{false};
+  bool hold{false};
+  bool for_update{false};  // the query has a FOR UPDATE
+  // The query's text: the DECLARE's own with everything before the query
+  // blanked, so an error position into it is a position into the statement.
+  std::string query;
+};
+
+// FETCH and MOVE. `count` is PostgreSQL's howMany: kAll for ALL, negative for
+// "FETCH -2", the target row for Absolute and the offset for Relative.
+struct FetchCursor {
+  enum class Direction { Forward, Backward, Absolute, Relative };
+  static constexpr std::int64_t kAll = std::numeric_limits<std::int64_t>::max();
+  std::string name;
+  Direction direction{Direction::Forward};
+  std::int64_t count{1};
+  bool move{false};
+};
+
+// CLOSE name, or CLOSE ALL when `all`.
+struct CloseCursor {
+  std::string name;
+  bool all{false};
+};
+
+using CursorStatement = std::variant<DeclareCursor, FetchCursor, CloseCursor>;
 
 }  // namespace bytecask::sql::ast
 

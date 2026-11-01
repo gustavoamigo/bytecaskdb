@@ -36,32 +36,164 @@ kind the transformer doesn't take is refused with its position.
   under a hidden row id no statement sees (`catalog_design.md`, *Tables
   without a primary key*). `UNIQUE` on a column or on the table, named or
   not, is a unique index created with the table (`catalog_design.md`,
-  *UNIQUE constraints*).
+  *UNIQUE constraints*). `REFERENCES` on a column and `FOREIGN KEY … REFERENCES`
+  on the table, named or not, `ON DELETE` and `ON UPDATE` `NO ACTION` or
+  `RESTRICT`, are checked as PostgreSQL checks them when it creates them:
+  the referenced table and columns exist, and are its primary key (the
+  default) or a unique index's columns in any order, of types it compares
+  (an INTEGER references a DECIMAL or a REAL key, not the reverse), with
+  its SQLSTATE where they are not. Then nothing is kept: the constraint is
+  not enforced (*Known differences*). `CASCADE`, `SET NULL`, `SET DEFAULT`,
+  `MATCH FULL` and `PARTIAL`, `DEFERRABLE` and `NOT VALID` are refused.
+  `CHECK (…)` on a column or on the table, named or not, is tested on every
+  `INSERT` and `UPDATE` of the table, over the row as written, and refuses
+  a row it makes false with 23514 (`catalog_design.md`, *CHECK
+  constraints*). Its expression is any BOOLEAN value the select list
+  evaluates over the table's columns and constants (*Expressions over
+  columns*); `NO INHERIT`, `NOT VALID`, `DEFERRABLE` and `ADD COLUMN …
+  CHECK` are refused.
 - `INSERT … VALUES` of one row, with or without a column list, of
   parameters and constants.
-- `SELECT` targets: columns, constants (*Literals*), `COUNT(*)`,
+- `SELECT` targets: columns, `*` and `table.*` (below), constants (*Literals*), `COUNT(*)`,
   `COUNT(col)`, `COUNT(DISTINCT col)`, `SUM(col)`, `MIN(col)`, `MAX(col)` and
   `AVG(col)`, several of them in any order; a constant not beside an
   aggregate or a `GROUP BY`.
+- `SELECT *` and `table.*` are expanded by the binder, before it binds
+  anything else, into the columns they stand for: each FROM table's in
+  table order, hidden row ids left out, each named by its column's name.
+  Over a `USING` or `NATURAL` join `*` gives the `USING` columns first,
+  each once and named alone (so the preserved side's, as a column named
+  alone is), then the left table's other columns, then the right's; a
+  `table.*` is that table's columns, `USING` ones included. The
+  expansion is a select list of ordinary columns, so everything after it
+  (aggregation, `DISTINCT`, `ORDER BY`) treats it as the columns written
+  out. `*` without `FROM` is 42601, `x.*` for a name not in `FROM` 42P01,
+  `x.*` of a table an alias hides 42P01; `*` anywhere but the select list
+  is 42601, `* AS (c, d)` is not PostgreSQL and is a syntax error.
 - `GROUP BY` of columns, and `HAVING`, below. A query with a `GROUP BY`, a
   `HAVING` or an aggregate is aggregated; without `GROUP BY` it returns
   exactly one row, or none where its `HAVING` is false.
-- `FROM`: one table, or two joined by a comma, `[INNER] JOIN … ON`, `JOIN
-  … USING (cols) [AS alias]` or `NATURAL JOIN`. Columns may be qualified by
-  the table's name. `USING` and `NATURAL` (every column name both tables
-  share) compare their columns by `=`, as `ON` would, and name each alone
-  as one column, the left table's, equal to the right's in every pair; the
-  `USING` alias qualifies those columns only. A name missing from a side is
-  42703, one named twice 42701, as in PostgreSQL. Without `FROM`, a
-  `SELECT` of constants returns one row of them, or none under `LIMIT 0`;
-  it takes no `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` or `FOR UPDATE`
-  yet.
+- `FROM`: one table, or up to eight joined by a comma list, `[INNER] JOIN …
+  ON`, `CROSS JOIN` or `LEFT [OUTER] JOIN … ON`, one after the other
+  (`a JOIN b ON … LEFT JOIN c ON …`, each join's right side a table and its
+  left side the tables before it), and for the first join `JOIN … USING
+  (cols) [AS alias]`, `NATURAL JOIN` and `RIGHT [OUTER] JOIN`. Columns may be
+  qualified by the table's name. Each `ON` sees the tables up to its own
+  (a later one is 42P01). It compares columns of two tables by any of `=`,
+  `<`, `<=`, `>`, `>=` and `<>`, or is a predicate (`AND`, `OR`, `NOT`, `IS
+  NULL`) over columns of both; NULL is true of none. `USING` and `NATURAL`
+  (every column name both tables share) compare their columns by `=`, as
+  `ON` would, and name each alone as one column, the left table's, equal to
+  the right's in every pair, unless a third table has the name too (42702);
+  the `USING` alias qualifies those columns only. A name missing from a side
+  is 42703, one named twice 42701, as in PostgreSQL. `LEFT` and `RIGHT` give
+  every row of the preserved table, joined to each row of the other that
+  `ON` matches, or to a row of NULLs where it matches none. `ON` decides the
+  pairs and `WHERE` filters the joined rows, so `WHERE r.k IS NULL` keeps
+  the rows nothing matched; a `USING` column named alone is the preserved
+  table's. In a chain, a left join NULL-extends its right table in the rows
+  before it: a later `ON` reading that table sees NULLs, so an inner join
+  after it drops those rows where it reads them, and a left join keeps
+  them. `RIGHT JOIN` is taken of two tables only, `USING` and `NATURAL` of
+  the first join only, and `FULL JOIN` not. A table takes an alias, `t [AS]
+  x`. A table named twice, `t JOIN t AS x`, is read twice, once under each
+  name; the planner reads it as two tables (`planner_design.md`, *Joins of
+  several tables*). The front end rewrites the qualifier `x` to the table
+  in every clause of that `SELECT` where no table is named twice, so the
+  binder never sees an alias, and keeps the aliases where one is, which are
+  then what tell the two apart. The table's own name qualifies nothing while
+  it is aliased (42P01, as PostgreSQL), nor may two `FROM` items share a name
+  (42712, `FROM t, t` among them). A select-list item takes `[AS] name`,
+  which names its output column; an unqualified `ORDER BY name` that is such
+  a name orders by that item (PostgreSQL looks at output names first there,
+  at input columns first in `GROUP BY`, which takes no output name here). A
+  subquery resolves its own aliases; it cannot name the outer query's
+  (correlation is refused). `t AS x (c1, c2)` renames the table's first
+  columns (the binder renames them in the alias's table instance, which is
+  already a copy; the parser keeps the alias so qualifiers are resolved
+  there). The old names are gone (42703), the unnamed columns keep theirs,
+  more names than columns is 42P10, a repeated name 42701. `SELECT * AS (c,
+  d)` is SQL standard only, not PostgreSQL, and is a syntax error (42601).
+  An alias of a join, a join in
+  parentheses or inside a comma list, and a view in a query that names a
+  table twice are refused. Without `FROM`, a `SELECT` of constants returns
+  one row of them, or none under `LIMIT 0`; it takes no `WHERE`, `GROUP BY`,
+  `HAVING`, `ORDER BY` or `FOR UPDATE` yet.
 - `UPDATE` and `DELETE` of any number of rows.
 - `ORDER BY`, `LIMIT` and `FOR UPDATE`, below.
 
 **Literals and expressions.**
 - **Literals** of every kind, typed and read as PostgreSQL types them
   (*Literals*, below).
+- **`*` and `/`** of constants fold as `+` and `-` do. Integers take
+  PostgreSQL's types (`integer * integer` is `integer`, any wider operand
+  makes `bigint`), the product of numerics is at the sum of the scales
+  within 18 digits, and the result is range-checked (22003, `INT_MIN / -1`
+  included). Integer `/` truncates toward zero. A zero divisor is 22012,
+  unless the dividend is `NULL` (the operator is strict and never runs).
+  A numeric quotient has PostgreSQL's scale (`select_div_scale`: at least
+  16 significant digits, so `5.0 / 2` is `2.5000000000000000`), rounded half
+  away from zero; one whose scale or value passes 18 digits (`1.0 / 3` is
+  twenty places) is refused (42601). `%` is refused. Of columns, they are
+  *Expressions over columns*, below.
+- **`+`, `-`, `*`, `/`, comparisons, `IS [NOT] NULL`, `AND`, `OR` and
+  `NOT` of columns** are values in a select list (*Expressions over
+  columns*, below).
+- **`CASE`, `COALESCE` and `NULLIF`** of constants fold. Of a column, a
+  parameter or a subquery they are values in a select list (*Expressions
+  over columns*, below). The result type is PostgreSQL's union rule: unknown
+  literals give way to the typed branches, which must be of one class
+  (42804, `CASE types … cannot be matched`); integers widen to the
+  widest; a numeric branch is `numeric` and keeps its own scale
+  (`CASE WHEN true THEN 1 ELSE 2.50 END` is `1`); all unknown is `text`.
+  An unknown literal that is not a value of the type is 22P02, in a
+  branch not taken too, as PostgreSQL checks types before it runs. A
+  `WHEN` of a searched `CASE` must be `boolean` (42804); `NULL` is not
+  true. A simple `CASE x WHEN v` tests `x = v` as a comparison of
+  constants does (42883 where PostgreSQL has no such operator). `NULLIF(a, b)`
+  is `a`, of `a`'s type (an unknown `a` takes `b`'s), unless `a = b`.
+  Conditions and results are evaluated in order and only as far as the
+  answer needs: a `WHEN` after the first true one is never evaluated,
+  and a condition or the taken result that raises (22012, 22003) raises.
+  A result not taken that raises is refused (42601): its type is not
+  known without evaluating it (with a column among the branches this
+  goes away: *Expressions over columns*). Float branches of constants are
+  refused. The output column is named `case`, `coalesce` or `nullif`.
+- **`||` and the string functions** fold constants only (of a column, a
+  parameter or a subquery they are refused, 42601, until #671). The parser reads PostgreSQL's
+  spellings as the calls the grammar makes of them: `TRIM([LEADING |
+  TRAILING | BOTH] [chars FROM] s)` is `ltrim`, `rtrim` or `btrim` (spaces
+  by default), `POSITION(sub IN s)` is `position(s, sub)`, `SUBSTRING(s
+  FROM a [FOR n])` is `substring(s, a, n)`, `OVERLAY(s PLACING r FROM a
+  [FOR n])` is `overlay`; `CHAR_LENGTH`, `CHARACTER_LENGTH`, `OCTET_LENGTH`,
+  `UPPER`, `LOWER` and the function-call forms of the others are taken
+  as written. Text is UTF-8 and positions and lengths count characters.
+  - Arguments resolve as PostgreSQL's overloads do: an unknown literal
+    is of the parameter's type (`SUBSTRING('abc' FROM '2')` reads `'2'`
+    as an integer, 22P02 if it is not one), `smallint` and `integer` fit
+    an `integer` parameter, and any other type matches no function
+    (42883, `function upper(integer) does not exist`; so does a wrong
+    number of arguments). A NULL argument gives NULL after the types are
+    checked, as the functions are strict.
+  - `a || b`: strings, or a string with any other type through its text
+    (`'a' || 1` is `a1`, `'a' || true` is `atrue`); two values neither of
+    which is a string match no operator (42883).
+  - `UPPER` and `LOWER` fold ASCII letters only, the layer's one
+    collation being `COLLATE "C"`.
+  - `SUBSTRING(s FROM a FOR n)` is PostgreSQL's: a start before the first
+    character takes from it, the characters before it counting toward
+    `n`; `n < 0` is 22011; a start or length past `integer` is 42883
+    (`bigint`) and `a + n` past 2^31 − 1 reads to the end. `OVERLAY` with
+    a start below 1 is 22011, and a resume position past `integer` is
+    22003.
+  - `POSITION` of an empty substring is 1, of one not found 0.
+  - The output column is named as PostgreSQL names it: `?column?` for
+    `||`, otherwise the function (`btrim` for `TRIM`).
+  - Refused (42601): `SUBSTRING(s FROM 'pattern' [FOR 'escape'])`, the
+    regular-expression form PostgreSQL picks when no operand is an
+    integer; `bytea` operands but for `bytea || bytea`; a float operand
+    of `||`; a schema other than `pg_catalog`. `USING CHARACTERS` and
+    `USING OCTETS` are not PostgreSQL syntax (42601).
 - **`+` and `-`** on integers and on `DECIMAL`, with PostgreSQL's result
   type: `smallint + smallint` is `smallint`, `integer + bigint` is
   `bigint`, and so on.
@@ -73,6 +205,11 @@ kind the transformer doesn't take is refused with its position.
 - **Where expressions may appear:** `SET col = expr`, a comparison's
   operand (`ol_o_id >= $3 - 20`), and `VALUES`. A constant expression may
   also be a select-list target and a `HAVING` operand.
+- **`DEFAULT`** as a `VALUES` item of an `INSERT` or the value of a `SET`
+  assignment is the column's default constant, NULL where it has none (a
+  NOT NULL column without one is 23502). The binder replaces it with that
+  constant, so it is no new plan shape. It is no expression: PostgreSQL's
+  grammar allows it nowhere else.
 
 **`WHERE`** is a conjunction (`AND`) of comparisons (`=`, `<`, `<=`, `>`,
 `>=`) of a column with a parameter, a constant or `$n ± k`, in any order,
@@ -90,9 +227,34 @@ on any columns, and of predicates over them.
   a key takes each comparison it can. A predicate (`OR`, `NOT`, `IS NULL`)
   is a filter, checked on each row a plan reads, never a key's bound
   (`planner_design.md`, *The search*).
+- **`LIKE`**: `col [NOT] LIKE pattern [ESCAPE 'c']`, of a TEXT or VARCHAR
+  column and a parameter or constant pattern, typed TEXT as PostgreSQL
+  types it; a predicate leaf, matched by `bc_like` (`plan_api_design.md`):
+  `%` any run, `_` one character, case-sensitive and bytewise (`COLLATE
+  "C"`). The escape is a backslash, `ESCAPE`'s one character, or none for
+  `ESCAPE ''`; a longer one is 22025, as is a pattern the match finds ending
+  in its escape. A number column is 42883.
+- **Subqueries**, uncorrelated, in a `SELECT`'s and in an `UPDATE`'s or
+  `DELETE`'s `WHERE`: `col op (SELECT …)` of one value, `[NOT] EXISTS (SELECT
+  …)`, `col [NOT] IN (SELECT …)` and `col op ANY | SOME | ALL (SELECT …)`; and
+  `(SELECT …)` in a select list. Each runs once, before the statement's own
+  plan, on its snapshot (`planner_design.md`, *Subqueries*). Its semantics
+  are PostgreSQL's: a scalar subquery of no row is NULL, of two or more
+  21000; `IN` is `= ANY` and `NOT IN` its `NOT`; `ANY` is true where a row
+  makes the comparison true, else NULL where a row is NULL (or the column
+  is, over some rows), else false, over no rows too; `ALL` is `NOT ANY` of
+  the negated operator, so true over no rows. A subquery selects one column,
+  but for `EXISTS` (42601 otherwise), of a type the column compares with:
+  integers with integers, a DECIMAL of its scale, strings with strings, any
+  other type its own. A scalar one is a parameter to the plan, so
+  `id = (SELECT MAX(k) FROM u)` is a key lookup.
 - Not yet: a predicate comparing a REAL or DOUBLE column (`no plan:`, as
   any filter on one), `$n ± k` inside one, one of both tables' columns in a
-  join, in `HAVING`, `IN` of a subquery, `LIKE`, `IS DISTINCT FROM`.
+  join, in `HAVING`, `ILIKE` (its case folding is a locale's), `LIKE` of a
+  BYTEA column, `IS DISTINCT FROM`; a subquery that reads a column of the
+  query around it (correlated), one inside another, in `FROM`, `FOR UPDATE`
+  in one, one of `AVG`, assigned by `SET` or `VALUES`, beside an aggregate,
+  or compared with other than a column.
 - Comparing two columns of different SQL types is refused (*Known
   differences*).
 
@@ -108,9 +270,25 @@ on any columns, and of predicates over them.
 - `COUNT(*)` counts rows, `COUNT(col)` non-NULL values, `COUNT(DISTINCT
   col)` distinct non-NULL values. All three are `bigint`, and 0 over no
   rows.
+- Every aggregate over a column takes `ALL` (the default) or `DISTINCT`.
+  `DISTINCT` folds each distinct non-NULL value of the column once: a
+  `DOUBLE PRECISION`'s `-0.0` and `0.0` are one value and NaN is one, as
+  `COUNT(DISTINCT)` already took them. `MIN(DISTINCT x)` and `MAX(DISTINCT
+  x)` are `MIN(x)` and `MAX(x)`, bound as such. The values seen are held
+  per group in the statement's memory, a key each, and a statement that
+  passes its budget fails with 54000, never spilling (`planner_design.md`,
+  *Memory*). The argument is a column: `SUM(DISTINCT a + 1)` is refused, as
+  is every aggregate of an expression (42601).
 - `SUM` over `SMALLINT` or `INTEGER` is `bigint`. Over `BIGINT` or
   `DECIMAL` it is `numeric`, kept at the input's scale. It is NULL over no
   rows.
+- `SUM`, `AVG`, `MIN` and `MAX` over a `DOUBLE PRECISION` column (`FLOAT`)
+  are `double precision`, as PostgreSQL's `float8` aggregates are. `SUM`
+  adds in order and fails with 22003 where finite values overflow; an
+  infinity or NaN carries through. `AVG` is the sum divided by the count.
+  NaN is above every number, so it is the `MAX` and the `MIN` only of NaNs.
+  Of `-0.0` and `0.0` the last read is the `MIN` and the `MAX`, as
+  PostgreSQL keeps it (*Known differences*).
 - `AVG` over an integer or `DECIMAL` column is `numeric`: PostgreSQL's
   `numeric_div` of the sum by the count, at the scale its
   `select_div_scale` chooses (at least 16 significant digits), rounded
@@ -121,8 +299,9 @@ on any columns, and of predicates over them.
   take a numeric or temporal column.
   - Of a `TEXT`, `VARCHAR` or `BYTEA` column they are refused (#534).
     Keeping the least value seen needs a buffer the plan API doesn't have.
-  - Of a `REAL` or `DOUBLE PRECISION` column they are refused too (*Known
-    differences*), as are `SUM` and `AVG` of one (42601).
+  - `SUM`, `AVG`, `MIN` and `MAX` of a `REAL` column are refused (42601):
+    PostgreSQL's `SUM` and `MIN` of one are `real`, summed in single
+    precision.
 
 **`SELECT DISTINCT`** is a `GROUP BY` of the selected columns, so it
 returns one row per distinct combination, NULL one value and a DOUBLE's
@@ -156,7 +335,9 @@ and with a constant selected or `DISTINCT ON`, it is not taken yet.
   it where both are integers of scale 0 (SMALLINT, INTEGER, BIGINT, a
   DECIMAL of scale 0), which compare exactly; any other pair is refused, as
   two uses of one `$n` are (*Known differences*). `HAVING` on `AVG` is
-  refused (42601): its quotient is no type a plan holds.
+  refused (42601): its quotient is no type a plan holds. So is `HAVING` on
+  an aggregate of a `DOUBLE PRECISION` column, which needs PostgreSQL's NaN
+  and `-0.0` rules, as a comparison of one does.
 - `AVG`'s result is PostgreSQL's numeric of no declared precision, a SQL
   type of its own (`SqlKind::Numeric`): no column has it, and a result row
   carries its value as its text.
@@ -168,23 +349,145 @@ and with a constant selected or `DISTINCT ON`, it is not taken yet.
   fails with 40001 if another transaction committed a change to one first;
 - with an aggregate it is refused (0A000, "FOR UPDATE is not allowed with
   aggregate functions"), as PostgreSQL refuses it;
+- `FOR UPDATE OF t` is taken when `t` is a table the query reads (`42P01`
+  otherwise), and is `FOR UPDATE`;
 - on a join, not yet (#534).
+
+**Cursor statements.** `ast::parse_cursor` reads `DECLARE`, `FETCH`, `MOVE` and
+`CLOSE`, and returns nothing for any other statement. They are not an
+`ast::Statement`: they name a session's cursor and carry no plan, so the
+server session runs them (`server_design.md`, *Cursor statements*). A
+`DECLARE` gives its name, `[NO] SCROLL`, `BINARY`, `WITH HOLD`, whether the
+query has `FOR UPDATE`, and the query's text, which `parse` then reads as a
+`SELECT` (`FOR READ ONLY` is dropped by libpg_query's grammar and needs
+nothing). A `FETCH` or `MOVE` gives PostgreSQL's direction and count. Which
+forms run is the session's and `cursor_design.md`'s; `OPEN` and `FETCH … INTO`
+are syntax errors as in PostgreSQL, and `WHERE CURRENT OF name` is the whole
+`WHERE` of an `UPDATE` or `DELETE` (`ast::Update::current_of`, `ast::Delete::current_of`;
+`cursor_design.md`, *As built (phase 6)*); in a `SELECT` or beside another
+condition it is a syntax error, as in PostgreSQL.
+
+**Select-list positions in `ORDER BY`.** `ORDER BY 2` orders a plain `SELECT`
+by its second select-list item. The parser resolves it to that item's
+column, so every later stage sees the column's name; the item must be a
+column (an expression is refused as `ORDER BY` of one is, 42601), a position
+outside the list is 42P10 and any other constant 42601, as in PostgreSQL. A
+position after `*` is refused (42601): the binder expands stars, the parser
+does not.
+
+**Set operations**, `UNION`, `INTERSECT` and `EXCEPT` of two queries, each
+`ALL` or `DISTINCT` (the default), as PostgreSQL's (`planner_design.md`,
+*Set operations*):
+- **Precedence:** `INTERSECT` binds tighter than `UNION` and `EXCEPT`,
+  which group to the left; parentheses group. The parser builds the tree
+  (`ast::SetOperation`, a `Select`'s `set`), so a set operation is a
+  `SELECT` wherever one is taken: a statement, a subquery in `EXISTS`, `IN`,
+  `ANY`, `ALL` or a comparison, and a view's query.
+- **Arms** are plain `SELECT`s of columns, constants and parameters, a
+  `WHERE`, a join, and in parentheses their own `ORDER BY` and `LIMIT`.
+  Refused (42601): an arm that groups, aggregates or is `DISTINCT`. Refused
+  (0A000, as PostgreSQL's): `FOR UPDATE` on or inside one. `CORRESPONDING` is
+  not PostgreSQL's, and a syntax error.
+- **Columns.** The arms give as many columns as each other (42601). A
+  result column is named as the first arm names it. Its type resolves pair
+  by pair, as PostgreSQL's `UNION` does: the same type; integers to the
+  wider; an integer or `REAL` meeting `DOUBLE PRECISION` to it; `TEXT`
+  meeting `VARCHAR` to `TEXT`; `DECIMAL` of one scale; classes that differ
+  (a number and a string) are 42804, `UNION types integer and text cannot
+  be matched`.
+  Refused (42601) where the layer does not convert yet: `DECIMAL` of two
+  scales or with an integer or a float, an integer with `REAL` (PostgreSQL
+  rounds it to a float), `DATE` with `TIMESTAMP`, and a literal of no type
+  (`NULL`, `'a'`) meeting a column of another type.
+- **`LIMIT`** after the last arm limits the combined rows.
+- **`ORDER BY`** after the last arm orders the combined rows, by the result
+  columns' names (the first arm's) or by position, `ASC` or `DESC`, with
+  `NULLS FIRST` or `LAST` (last under `ASC`, first under `DESC` by default),
+  and a `LIMIT` after it applies to the sorted rows. The names are the
+  output's alone, as in PostgreSQL: a name that is only an arm's column is
+  42703, a name two columns share 42702, a qualified name 42P01 ("missing
+  FROM-clause entry"), a position outside the columns 42P10, and an expression 42601 (PostgreSQL's 0A000).
+  The parser keeps a position (`ast::OrderItem::position`) for the binder
+  to resolve against the outputs (`logical::SetOp::order`). `ORDER BY` inside
+  a parenthesised set operation within another is refused (42601, "not
+  supported yet"). *Select-list positions* below.
+- **A view defined with a set operation** is created, with its columns and
+  the tables it reads, and not read yet (42601), as one defined with
+  `DISTINCT` or `LIMIT`: reading it needs a derived table.
+
+**Views**, `CREATE VIEW name [(column, …)] AS SELECT …` and `DROP VIEW [IF
+EXISTS] name`:
+- **Expanded by the binder.** The catalog keeps the statement's text
+  (`catalog_design.md`, *Views*). A statement that names a view has it
+  parsed and bound again, and `ViewExpander` (`sql/binder.cppm`) rewrites
+  the statement before the binder sees it: the view's `FROM` and `WHERE`
+  replace the name, and each reference to one of its columns becomes the
+  select-list item it is. Planner, plans and runtime see base tables
+  only. A view of views is expanded through, to a depth of 16.
+- **Where it is read:** alone, as the table of a `FROM`; inner, `LEFT` and
+  `RIGHT` joined with a table or another view; in a subquery, and in the
+  subquery of an `UPDATE`'s or `DELETE`'s `WHERE`. A joined view must be a
+  plain `SELECT` of one table. Its columns are qualified by that table, so
+  one the other side lacks never changes meaning, and one both have is
+  42702. Refused (42601): `USING` or `NATURAL` on a view, an outer join of
+  a view with a `WHERE`, and two views of one table (a table joined with
+  itself).
+- **Over a grouped view** (`GROUP BY`, `HAVING` or an aggregate) a query
+  selects its columns, orders by its group columns, and its `WHERE` keeps
+  groups: it becomes the view's `HAVING`. It may group again by exactly the
+  view's group columns, selecting those alone: a view row is a group, so
+  that is the view. An aggregate, `DISTINCT` or a join over a grouped
+  view, or a `GROUP BY` of anything else, is refused (42601); it needs a
+  derived table. One case is not refused: a grouped view with no aggregate,
+  whose `HAVING` tests group columns alone, has the base rows' values, one row
+  per group. `MIN`, `MAX` and `COUNT(DISTINCT)` cannot tell a value once from
+  many, so a query whose aggregates are those reads the base rows (the view's
+  `HAVING` joining its `WHERE`), grouped by its own `GROUP BY` if any. `SUM`,
+  `COUNT`, `AVG`, an aggregate of a view's own aggregate and a `HAVING` of the
+  query stay refused. A derived table needs an `Aggregate` over another's
+  rows, which the plan API doesn't express: it reads tables. A view defined with `DISTINCT`, `LIMIT` or a set operation
+  is created and not read yet.
+- **Columns** are named as the select list names them, or by the column
+  list, which may name fewer than there are columns. Two with one name are
+  42701, more names than columns 42601.
+- **Created** by binding its query as a use would, so its errors are
+  PostgreSQL's (42P01, 42703, …). It takes no parameter (42P02). Refused
+  (42601): `OR REPLACE`, `TEMPORARY`, options, `WITH [CASCADED | LOCAL]
+  CHECK OPTION` and a schema-qualified name.
+- **Read-only.** `INSERT`, `UPDATE` and `DELETE` of a view are refused
+  (0A000), as is any DDL written against it as a table.
+- **Dropped with `RESTRICT`**, the default and only form: a table or view
+  another view reads cannot be dropped (2BP01). `DROP VIEW` of a table is
+  42809, as `DROP TABLE` of a view.
+- **A plan through a view is rebuilt after any DDL**, since the runtime
+  checks the tables a plan reads and not the views it came through
+  (`Statement`'s plan records them, `bound::Bound::views`).
 
 **Refused**, with a message and the node's position: everything not above.
 That includes:
-- `LIKE`, `IN` of a subquery, `IS DISTINCT FROM`, a predicate over both
-  tables of a join or in `HAVING`;
-- subqueries, derived tables, set operations;
+- `ILIKE`, `IS DISTINCT FROM`, and a predicate in `HAVING`;
+- correlated and nested subqueries and the others above, derived tables;
 - `DISTINCT ON`, `DISTINCT` of a constant or over groups it does not select
   every key of, `GROUP BY` of an expression, and `HAVING` of anything but
   the comparisons above;
-- outer joins, three or more tables, table aliases;
+- `FULL JOIN`, an outer join's `ON` comparing an expression of columns,
+  more than eight tables, a `RIGHT JOIN` of more than two, `USING` or
+  `NATURAL` after the first join, a join in parentheses or among commas,
+  `FOR UPDATE` of a join (#697), an alias of a join, an output name in `GROUP BY` or in `ORDER BY` of
+  other than a column;
 - `OFFSET`, `RETURNING`, multi-row `VALUES`;
-- `*`, `/`, string concatenation and functions;
+- `CASE` or `COALESCE` of a float beside another number, a `BETWEEN` or
+  `IN` as a value, `GREATEST` and `LEAST`, `CASE` outside the plain select
+  list (#685);
+- the quotient of a numeric other than constants, `%`, arithmetic and
+  comparison of `REAL` and `DOUBLE PRECISION` as values, an expression in
+  `ORDER BY`, `GROUP BY`, `SET` or an aggregated select list (#685, #686);
+- `||` and the string functions of columns and parameters, `LENGTH`,
+  `CONCAT`, `REPLACE`, the regular-expression `SUBSTRING`, `bytea` string
+  functions (#671);
 - a cast of anything but a string literal or `NULL`, a numeric literal of
   more than 18 digits, a string literal in arithmetic, unary `-` of
-  anything but a constant, a comparison of a column as a value, and a
-  constant beside an aggregate.
+  anything but a constant, and a constant beside an aggregate.
 
 The list and its order of work are #534.
 
@@ -205,8 +508,8 @@ recompile after a DDL folds them again, to the types they meet then.
   where it is used and reads a string with that type's input function: the
   same reading a parameter's text gets on the wire, from one module
   (`sql/text.cppm`). Alone in a select list each is `text`.
-- Unary `+` and `-`, and `+` and `-` of constants, fold with PostgreSQL's
-  result types and range checks: `2147483647 + 1` is "integer out of
+- Unary `+` and `-`, and `+`, `-`, `*` and `/` of constants, fold with
+  PostgreSQL's result types and range checks: `2147483647 + 1` is "integer out of
   range" (22003), `1 + 1.5` the numeric 2.5, `1 + NULL` an integer NULL.
 - A comparison of constants (`=`, `<>`, `<`, `<=`, `>`, `>=`) folds to a
   `boolean`, NULL if either side is: numbers exactly whatever their
@@ -214,12 +517,22 @@ recompile after a DDL folds them again, to the types they meet then.
   (*Known differences*), `FALSE` before `TRUE`, dates and times of one
   type by value. A string literal beside a typed constant is read as that
   constant's type (`1 < '2'`); two compare as text. Types PostgreSQL has no
-  operator for are 42883; a date beside a timestamp is not taken yet.
+  operator for are 42883. A timestamptz beside a timestamp or a date
+  compares as timestamptz (the timestamp read as UTC, the date as midnight
+  UTC); a date beside a timestamp is not taken yet.
 - A cast of a string literal or `NULL`: `DATE '…'`, `'…'::date` and
   `CAST('…' AS date)` alike read the string with the type's input function,
   a `DECIMAL(p, s)` rounded to its scale and range-checked (22003), and are
-  of that type. A cast of anything else, and to `VARCHAR(n)`, which
-  PostgreSQL's cast truncates, are not taken yet.
+  of that type. A cast of anything else, and to `VARCHAR(n)` or `CHAR(n)`,
+  which PostgreSQL's cast truncates, are not taken yet.
+- A cast of a date, time, timestamp or timestamptz constant: to text its
+  text; to its own type itself; a timestamp or timestamptz to a date (the
+  floor in UTC, so 1969-12-31 23:00 is 1969-12-31) or a time; a date to a
+  timestamp or timestamptz (22008 if the instant passes 64 bits); a
+  timestamp to a timestamptz and back (the same microseconds, the session
+  being UTC). A time to a date, timestamp or timestamptz, and a date to a
+  time, are 42846, as in PostgreSQL. Other typed constants cast to text are not taken
+  yet.
 - A select-list constant is named `?column?`, a cast by its type's name
   (`date`, `int4`, `numeric`), as PostgreSQL names them.
 
@@ -229,15 +542,122 @@ recompile after a DDL folds them again, to the types they meet then.
   scale (`2.5` stores 3), a number or a boolean assigned to a string column
   is its text (`2.2E-2` stores `0.022`), a REAL is read once as a float.
   A type PostgreSQL does not assign is 42804. The value's range is checked
-  where the row is written, in column order, as an assigned parameter's
-  is; an `UPDATE`'s constant is checked when the statement is compiled, as
-  PostgreSQL checks it when it plans it, whether or not a row matches.
+  when the statement is compiled, as PostgreSQL checks it when it plans
+  it, whether or not a row is written; of several out of range, the first
+  in the statement's order is the error, as there (a too-long string
+  before a later column's numeric overflow).
 - **Compared** (`WHERE`, `HAVING`): only a constant the column's type holds
   exactly. `smallint_col = 7.0` is `= 7`; `smallint_col = 40000`,
   `dec2_col = 1.005` and `real_col = 0.1` are refused (*Known differences*).
   A string literal is read as the column's type: `int_col = '7'` is `= 7`,
   `int_col = '1.5'` is 22P02. An integer compared with a string column is
   42883, as in PostgreSQL.
+
+### The time
+
+`CURRENT_DATE`, `LOCALTIME[(p)]`, `LOCALTIMESTAMP[(p)]`, `CURRENT_TIMESTAMP[(p)]` and `now()` are the one
+constant a plan cannot fold: a plan is cached by its text, so a value
+folded at bind would be the time of the first run. The binder gives each
+use a slot among the statement's constants (`bound::ClockSlot`), marked as
+the time, and the API fills it on every run (`Database::plan_params`),
+from one reading of the clock per statement, so two uses in a statement
+are one instant.
+
+- **Which time.** A statement in a transaction reads the time the
+  transaction began, as PostgreSQL's `CURRENT_*` and `LOCALTIME*` do
+  (`transaction_timestamp()`); an autocommit statement, the time it began.
+- **The clock.** `Database` reads the system clock, microseconds since the
+  Unix epoch, through one function a test replaces
+  (`clock_for_testing`), so the tests fix the time.
+- **The zone.** The layer has no time zone: the time is UTC, the date the
+  UTC date. A PostgreSQL session set to another `TimeZone` differs.
+- **Precision.** `(p)` rounds to p fractional digits, half up, as
+  PostgreSQL does; above 6 it is 6 (PostgreSQL warns). A time can round to
+  24:00:00, as there.
+- **With a time zone.** `CURRENT_TIMESTAMP[(p)]` and `now()` are `timestamp
+  with time zone`, as in PostgreSQL: the same instant as `LOCALTIMESTAMP`,
+  written with `+00`.
+- **Refused.** `CURRENT_TIME` is `time with time zone`, a type the layer
+  lacks: refused with 42601, not read as `LOCALTIME`. Also
+  refused: the time as an assigned value, in a `WHERE`, or inside an
+  aggregated select list; `USER` and the other SQL value functions.
+
+### Expressions over columns
+
+A select-list item that is not a column, a constant, an aggregate or a
+subquery by itself is a *value expression*: a tree of columns, constants,
+scalar subqueries, `$n`, `+ - * /`, the six comparisons, `IS [NOT] NULL`,
+`AND`, `OR`, `NOT`, `CASE`, `COALESCE` and `NULLIF`. The binder types it
+(`Binder::value`) and gives the plan one `Project` output; the search plans
+it as a result column and codegen evaluates it for each row
+(*planner_design.md*, *Expressions over columns*). `||` and the string
+functions plug into the same tree (#671); they are refused over columns
+until then.
+
+- **Result types are PostgreSQL's, from one function (`arith_type`), for a
+  constant and a column alike.** Two integers give the wider of the two
+  (`smallint * smallint` is `smallint`, `smallint * integer` `integer`); with
+  a `DECIMAL`, `+` and `-` are at the finer scale and `*` at the sum of the
+  scales. A comparison, `IS NULL`, `AND`, `OR` and `NOT` are `boolean`. The
+  output is named `?column?`, or its `AS` name.
+- **NULL is SQL's.** An arithmetic operator or a comparison with a NULL
+  operand is NULL and never runs; `IS [NOT] NULL` is never NULL; `AND` is
+  false where an operand is false, else NULL where one is NULL; `OR` the
+  mirror; `NOT` of NULL is NULL.
+- **Errors.** A `smallint` or `integer` result outside its type, and a
+  `bigint` one outside int64, is 22003 (a `bigint` product says "integer out
+  of range" where PostgreSQL says "bigint"); a zero divisor is 22012 and is
+  raised only for a row that evaluates it. `AND` and `OR` evaluate an
+  operand only while no earlier one settles the result, as PostgreSQL does
+  left to right, so `b <> 0 AND a / b > 1` raises nothing.
+- **Comparisons** need operands of one class (42883 otherwise: `integer <
+  text`): numbers meet at the finer scale, text and `bytea` compare bytewise
+  (`COLLATE "C"`), booleans `FALSE` before `TRUE`, dates and times of one
+  type by value. A subquery's value compares as a constant does; no row is
+  NULL.
+- **A `$n` takes its type from the column beside it** (`i / $1`, `i < $1`),
+  as in a `WHERE`; one beside another parameter, a constant or an
+  expression is refused (42601). An unknown literal or `NULL` takes the
+  other operand's type (`i + '1'`, `z = NULL`).
+- **Held within 18 digits.** A numeric operand brought to a finer scale
+  (`d + i`, `d < i`) must stay inside the 18 digits a `DECIMAL` holds, by
+  its type, or by its value for a constant; a `bigint` beside a `DECIMAL`
+  that needs rescaling is refused. A product past int64 is 22003, where
+  PostgreSQL's numeric is exact.
+- **`CASE`, `COALESCE` and `NULLIF`** over columns, parameters and
+  subqueries. A simple `CASE x WHEN v` is a searched one over `x = v`
+  and `NULLIF(a, b)` is `CASE WHEN a = b THEN NULL ELSE a END`.
+  - *Conditions.* A `WHEN` is any boolean expression the tree holds
+    (`AND`, `OR`, `NOT`, `IS NULL`, a comparison, a subquery's value); one
+    that is not `boolean` is 42804; NULL is not true.
+  - *Result type.* The union rule of the constants' fold, over the branches'
+    types: unknown literals and `NULL` give way; the typed branches must be of one
+    class (42804 otherwise); integers widen; `text` and `varchar` are `text`;
+    two floats are the wider float; all unknown is `text`. A `$n` among
+    the results takes the type of the first plain column among them (none:
+    refused, 42601). An unknown literal that is not a value of the type is
+    22P02.
+  - *Evaluation.* In order, and a branch only when it is taken: `CASE WHEN
+    b <> 0 THEN a / b ELSE 0 END` raises nothing, as PostgreSQL's. So the
+    refusal of a result that would raise and is not taken (constants
+    only, above) does not apply once a column, parameter or subquery is
+    among the branches. A branch of constants still folds when the
+    statement is compiled, so `CASE WHEN a > 0 THEN a ELSE 1 / 0 END` is
+    22012, as PostgreSQL's (it folds constants in untaken branches too).
+  - *Known difference.* A numeric result has one scale, the finest of its
+    branches (an integer is scale 0): `COALESCE(price, 0)` over a
+    `DECIMAL(10,2)` is `0.00` where PostgreSQL's `numeric` keeps each
+    value's own scale and gives `0`. The value is the same.
+  - *Refused (42601).* A float beside another number, different date and
+    time types, and a numeric result past 18 digits.
+- **Refused (42601).** A numeric quotient with a column or an expression in
+  it: PostgreSQL's scale follows the operands' values (`select_div_scale`
+  reads their leading digits), so one column's quotient has several scales
+  and the layer's result type has one. `REAL` and `DOUBLE PRECISION`
+  arithmetic and comparison as a value. `%`, unary `-`, a cast, an
+  aggregate inside an expression, an expression in the select list of an
+  aggregated query or under `DISTINCT`, an expression in `ORDER BY`, `GROUP
+  BY`, `SET` or a `WHERE`.
 
 ## Binding
 
@@ -294,7 +714,8 @@ search refuses*).
 The proof machine expects each one, or doesn't generate it, so it doesn't
 fail on them.
 
-- **A VARCHAR(n) value whose excess is only spaces is refused.**
+- **A VARCHAR(n) value whose excess is only spaces is refused.** (A
+  `CHAR(n)` cuts it, as PostgreSQL does: `types_design.md`, *CHAR(n)*.)
   PostgreSQL truncates it to n characters and stores it; the layer refuses
   it as too long (22001). The machine doesn't generate one.
 - **A DEFAULT outside its column's type is refused by the DDL.** The layer
@@ -333,15 +754,34 @@ fail on them.
   refused at bind** ("numeric field overflow"), whatever the column holds.
   PostgreSQL computes the sum and fails only when it doesn't fit the
   column. The machine's literals stay inside 18 digits.
+- **A numeric quotient of columns is refused; one of constants is exact
+  to 18 digits.** PostgreSQL's scale follows the operands' values, so
+  `d / 2` has a scale per row; a result column has one type
+  (*Expressions over columns*). A quotient of constants whose scale is
+  past 18 (`1.0 / 3`, twenty places) is refused (42601). The machine
+  divides integers only.
+- **An expression over columns that leaves int64 is 22003.** A product of
+  two large `DECIMAL`s, or a `bigint` beside a `DECIMAL` that needs
+  rescaling, is where PostgreSQL's `numeric` stays exact. A `bigint`
+  product or quotient out of range is "integer out of range", where
+  PostgreSQL's message says "bigint"; the SQLSTATE is the same.
 - **A SUM or an AVG whose running total leaves `int64_t` fails** (`BC_E_ARITH`). The
   layer adds in 64 bits, a BIGINT's or a DECIMAL's scaled integer, and the
   statement fails as 22003; PostgreSQL's `SUM` of a BIGINT or NUMERIC is an unbounded `numeric`. Below that the
   sums agree exactly (`test_sum_past_int64_is_an_error`). The machine sums
   no BIGINT column; no TPROC-C sum comes near.
-- **MIN and MAX of a REAL or DOUBLE PRECISION column are refused.**
-  PostgreSQL's `MIN` keeps the last of `-0.0` and `0.0` it meets, so its
-  answer depends on the order it reads the rows. The machine takes no `MIN`
-  or `MAX` of a float.
+- **MIN and MAX of a DOUBLE PRECISION column keep the last of `-0.0` and
+  `0.0` read**, as PostgreSQL's do, so which of the two shows depends on the
+  order the rows are read, which is the plan's and not the heap's. The two
+  compare equal and differ only in sign. The machine takes no `MIN` or `MAX`
+  of a float.
+- **SUM and AVG of DISTINCT DOUBLE PRECISION values add them in the order
+  they were first read**; PostgreSQL sorts the values and adds them
+  ascending. Float addition is not associative, so the two can differ in the
+  last digits (`0.1`, `0.2`, `1.5`, `2.5` and `4` sum to `8.3` ascending and
+  to `8.299999999999999` added as 1.5, 2.5, 4, 0.1, 0.2). Without `DISTINCT` both add in
+  the order the rows are read, which is the plan's and not the heap's. The
+  machine's floats are exact binary fractions.
 - **A HAVING parameter compared with the SUM of a BIGINT or DECIMAL is
   checked as a BIGINT** at the column's scale before the plan runs: a value
   past it is 22003, where PostgreSQL compares it with the numeric sum. The
@@ -359,9 +799,10 @@ fail on them.
   PRECISION column no key takes. PostgreSQL runs it. Everything else in
   the dialect is planned: full scans, sorts and joins no key reaches
   included.
-- **A sort, or a structure of groups, past the statement's memory budget
-  fails** with 54000, where PostgreSQL spills it to disk
-  (`planner_design.md`, *Memory*).
+- **A sort, a structure of groups, or the keys a set operation tells
+  duplicates apart by, past the statement's memory budget fails** with
+  54000, where PostgreSQL spills it to disk (`planner_design.md`, *Memory*
+  and *Set operations*).
 - **A filter on a grouped DOUBLE or REAL column in HAVING is refused**
   (`no plan:`), as a `WHERE`'s is.
 - **A constant a column's type does not hold exactly is refused in a
@@ -377,6 +818,12 @@ fail on them.
   it, and the constraint with it. PostgreSQL refuses (2BP01: the constraint
   requires the index) and drops it only with its table or `ALTER TABLE …
   DROP CONSTRAINT`.
+- **A FOREIGN KEY is not enforced.** It is checked when its table is
+  created, then dropped: a row whose key no parent row holds is written,
+  a parent row with children can be deleted or have its key changed, and
+  the parent table or the index it references can be dropped. PostgreSQL
+  refuses each (23503, 2BP01). The owner postponed enforcement, as several
+  databases have shipped without it; its design is in #657.
 - **Strings compare bytewise, as `COLLATE "C"`**, constants as columns
   do: `'B' < 'a'` is true. PostgreSQL orders them by the database's
   collation, under which `'a' < 'B'` may be true instead. The layer has one
@@ -386,6 +833,20 @@ fail on them.
   (the wire's Parse), with PostgreSQL's SQLSTATE. PostgreSQL folds the same
   constants when it plans the statement, at Bind for a statement Parse left
   unplanned.
+- **A `CASE` or `COALESCE` of constants whose untaken result would raise
+  is refused.** `SELECT CASE WHEN true THEN 1 ELSE 1 / 0 END` is 1 in
+  PostgreSQL; here the folder evaluates a result to learn its type, so
+  the statement is refused with 42601. A `WHEN` after the first true one
+  is skipped, as there. With a column, parameter or subquery among the
+  branches the result is typed without evaluating it and the branch is
+  evaluated only when taken (*Expressions over columns*).
+- **A numeric `CASE` or `COALESCE` over columns has one scale,** the
+  finest of its branches; PostgreSQL's keeps each value's own.
+
+- **A view is bound again at each use,** so one its tables have outgrown
+  is refused (0A000) until it is dropped and created again: a `SELECT *`
+  view after `ALTER TABLE … ADD COLUMN`. PostgreSQL keeps the columns the
+  star gave it.
 
 Each is a refusal or an error, not a different answer. Everything else in
 the dialect matches PostgreSQL, and the proof machine checks that it does.
@@ -398,6 +859,18 @@ implemented (`functional_testing_design.md`).
 
 - **A table needs columns.** The layer refuses `CREATE TABLE t ()` (0A000);
   PostgreSQL accepts a table of no columns.
+- **A set operation cannot be ordered, and its arms are plain.** PostgreSQL
+  sorts the combined rows with `ORDER BY` and combines queries that group,
+  aggregate or select `DISTINCT`. Here a set operation streams its arms
+  into a structure of keys and holds no typed row, so the first waits for
+  an object in the plan API that does (#681), and the second for the same
+  streaming at a grouped query's emit (#682).
+- **Views are read-only, and a query over a grouped view is limited.**
+  PostgreSQL writes through a simple view, checks the rows written with
+  `WITH CHECK OPTION`, replaces a view with `CREATE OR REPLACE VIEW`, and
+  aggregates, joins and selects `DISTINCT` over any view, which it runs as
+  a subquery in `FROM`. Here a view's query is merged into the
+  statement, so these wait for updatable views and derived tables.
 
 ## Decisions
 

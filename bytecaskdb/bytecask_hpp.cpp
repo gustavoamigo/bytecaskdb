@@ -460,6 +460,12 @@ auto Snapshot::marker() const -> ChangeMarker {
   return {m.since_sequence, m.id};
 }
 
+auto Snapshot::clone() const -> Snapshot {
+  return translate_exceptions([&] {
+    return Snapshot{std::make_unique<Impl>(impl_->snap.clone())};
+  });
+}
+
 auto Snapshot::get(const ReadOptions& opts,
                    BytesView key,
                    Bytes& out) const -> bool {

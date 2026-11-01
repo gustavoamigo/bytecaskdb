@@ -269,7 +269,6 @@ struct Counts {
   int conflicts{0};
   int commits{0};
   int vacuumed{0};
-  int too_old{0};
   // Rounds where only a removal tells the bases apart: the states agree on
   // [from, to), but an intervening write removed a key in it.
   int removal_only{0};
@@ -367,23 +366,10 @@ void run_rounds(Placement placement, PlanBase base, std::uint64_t seed,
 
     INFO(std::format("plan shape {} over [{}, {}), {} intervening writes",
                      static_cast<int>(shape), from, to, n));
-    if (placement == Placement::Resume && base == PlanBase::Sequence) {
-      // resume() reset the delete log: a key present in the range with a
-      // newer entry is a conflict; otherwise the range's delete half needs
-      // the log, and the plan is too old.
-      const auto now = slice(model, from, to);
-      const auto then = slice(snap_model, from, to);
-      const bool present_changed = std::ranges::any_of(now, [&](const auto &kv) {
-        const auto it = then.find(kv.first);
-        return it == then.end() || it->second != kv.second;
-      });
-      REQUIRE_FALSE(result.has_value());
-      REQUIRE(result.error() == (present_changed ? bytecask::PlanRefusal::Conflict
-                                                 : bytecask::PlanRefusal::TooOld));
-      ++counts.too_old;
-      REQUIRE(db_contents(db) == model_contents(model));
-      continue;
-    }
+    // Resume: the last write was appended, so its group was logged before
+    // its fdatasync failed, and resume() replays exactly what the log holds.
+    // No sequence escaped the log: the plan gets the same answer as on a
+    // published write.
     const bool states_differ = slice(snap_model, from, to) != slice(model, from, to);
     if (removed_in_range && !states_differ) ++counts.removal_only;
     const bool expect_conflict =
@@ -423,13 +409,9 @@ TEST_CASE("range conflicts match a model of the key range",
 
   // A run where the oracle never said "conflict", or never said "commit",
   // proved nothing in that direction.
-  INFO(std::format("{} {}: {} conflicts, {} commits, {} vacuums, {} too old",
+  INFO(std::format("{} {}: {} conflicts, {} commits, {} vacuums",
                    placement_name(placement), base_name(base), counts.conflicts,
-                   counts.commits, counts.vacuumed, counts.too_old));
-  if (placement == Placement::Resume && base == PlanBase::Sequence) {
-    CHECK(counts.too_old > 0);
-    return;
-  }
+                   counts.commits, counts.vacuumed));
   CHECK(counts.conflicts > 0);
   CHECK(counts.commits > 0);
   // The rule the bases differ on was reached.

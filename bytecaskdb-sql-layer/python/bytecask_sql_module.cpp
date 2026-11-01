@@ -147,7 +147,7 @@ auto to_python(const sql::Value& v, sql::SqlType t) -> nb::object {
   if (const auto* b = std::get_if<sql::Bytes>(&v)) {
     // A NUMERIC: its text (sql::Rows).
     if (t.kind == sql::SqlKind::Numeric) return nb::borrow(decimal_type)(nb::str(bytes_view(*b).data(), b->size()));
-    if (t.kind == sql::SqlKind::Text || t.kind == sql::SqlKind::Varchar) {
+    if (t.kind == sql::SqlKind::Text || t.kind == sql::SqlKind::Varchar || t.kind == sql::SqlKind::Char) {
       auto s = bytes_view(*b);
       auto* o = PyUnicode_DecodeUTF8(s.data(), std::ssize(s), "strict");
       if (o == nullptr) throw nb::python_error();  // stored bytes that are not UTF-8: UnicodeDecodeError

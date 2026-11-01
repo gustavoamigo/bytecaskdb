@@ -131,7 +131,7 @@ enum class PlanRefusal {
   // Plans on a read point only: it cannot be checked here. Read on another
   // history (before a crash, across a failover), past the latest sequence,
   // or needing deletes the engine no longer tracks (from before a reopen, a
-  // promotion, an ingest or a resume() that replayed writes, or more than
+  // promotion, an ingest or a failed append resume() replayed, or more than
   // Options::max_delete_log_bytes holds).
   // Take a fresh snapshot.
   TooOld,
@@ -468,6 +468,11 @@ public:
   Snapshot& operator=(const Snapshot&) = delete;
   Snapshot(Snapshot&&) noexcept;
   Snapshot& operator=(Snapshot&&) noexcept;
+
+  // A second, independent handle on the same frozen state. It reads what
+  // this one reads and outlives it, and the DB, as this one does. Cheap: a
+  // reference count. Throws std::bad_alloc only for the handle itself.
+  [[nodiscard]] auto clone() const -> Snapshot;
 
   [[nodiscard]] auto get(const ReadOptions& opts,
                          BytesView key,

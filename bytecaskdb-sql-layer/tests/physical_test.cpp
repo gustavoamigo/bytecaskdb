@@ -389,6 +389,12 @@ TEST_CASE("physical: a hash join holds the row of its build side's one loop, key
   refused(plan(hash(node(scan({p(0)}, {})), u_scan(), {{t_v, t_v}})), "outside the probe side");
   refused(plan(hash(node(scan({p(0)}, {})), u_scan(), {{t_v, u_b}})), "of two types");
   refused(plan(hash(node(scan({p(0)}, {})), u_scan(), {{kD, u_d}})), "on a DOUBLE column");
+  // A left outer loop's inner side reads rows: its row of NULLs is not an entry.
+  auto outer_loop = [&](bool covering) {
+    return emit(node(physical::NestedLoop{node(scan({p(0)}, {})), u_scan(covering), true, {}}), {kId, u_v});
+  };
+  CHECK(refusal(plan(outer_loop(false))).empty());
+  refused(plan(outer_loop(true)), "a left outer nested loop whose inner scan covers");
   // One table read once per row of the other, as a build side: two loops.
   auto twice = node(physical::NestedLoop{node(scan({p(0)}, {})), u_scan()});
   refused(plan(hash(std::move(twice), u_scan(), {{t_v, u_v}})), "not one loop");
@@ -403,6 +409,105 @@ TEST_CASE("physical: a hash join holds the row of its build side's one loop, key
   refused(plan(choice(physical::Scan{2, 4, {p(1)}, {}, false, false, false}, loop())),
           "counts another range than its build side's");
   refused(plan(choice(scan({p(0)}, {}), node(scan({p(0)}, {})))), "whose other plan reads other tables");
+}
+
+TEST_CASE("physical: a plan holds one hash join, and a predicate over two tables reads rows in hand",
+          "[sql][physical][hash][join]") {
+  const logical::ColumnRef t_v{1, 2, PhysType::I64, true};
+  const logical::ColumnRef u_v{2, 1, PhysType::I64, true};
+  const logical::ColumnRef w_v{3, 1, PhysType::I64, true};
+  const logical::ColumnRef u_b{2, 2, PhysType::Bytes, true};
+  auto scan_of = [](std::uint32_t table) { return node(physical::Scan{table, 4, {p(1)}, {}, false, false, false}); };
+  auto hash = [&](physical::NodePtr build, physical::NodePtr probe, logical::ColumnRef b, logical::ColumnRef pr,
+                  std::uint32_t held) {
+    return node(physical::HashJoin{std::move(build), std::move(probe), {{b, pr}}, held});
+  };
+  auto with = [&](physical::NodePtr rows) {
+    auto plan_of = plan(emit(std::move(rows), {kId, u_v}));
+    return plan_of;
+  };
+  // Two hash joins, one the other's probe side: the choice by the budget counts one build side.
+  refused(with(hash(scan_of(3), hash(node(scan({p(0)}, {})), scan_of(2), t_v, u_v, 1), w_v, u_v, 3)),
+          "a plan with more than one hash join");
+  // One hash join under a nested loop and an index join is a plan.
+  auto under = [&] {
+    return node(physical::NestedLoop{hash(node(scan({p(0)}, {})), scan_of(2), t_v, u_v, 1), scan_of(3)});
+  };
+  CHECK(refusal(with(under())).empty());
+  // A predicate over columns of two tables: both rows must be in hand where it is evaluated.
+  auto both_columns = [&](logical::ColumnRef a, logical::ColumnRef b) {
+    auto eq = logical::compare(ast::Compare::Op::Eq, logical::column(a, SqlType{SqlKind::BigInt}),
+                               logical::column(b, SqlType{SqlKind::BigInt}));
+    return logical::predicate_of(logical::Expr::Kind::Not, {std::move(eq)});
+  };
+  auto over = [&](logical::ColumnRef a, logical::ColumnRef b) {
+    return node(physical::Filter{hash(node(scan({p(0)}, {})), scan_of(2), t_v, u_v, 1), {both_columns(a, b)}});
+  };
+  CHECK(refusal(with(over(t_v, u_v))).empty());
+  refused(with(over(t_v, w_v)), "a predicate that reads a column of a table not in hand");
+  // Two columns of one type only, and never a DOUBLE.
+  refused(with(over(t_v, u_b)), "a column of its type");
+  refused(with(over(kD, u_v)), "a column of its type");
+  // The inner side of a nested loop reads the outer side's rows too: as a left outer join's match does.
+  auto inner = [&](logical::ColumnRef a, logical::ColumnRef b) {
+    auto filtered = node(physical::Filter{scan_of(2), {both_columns(a, b)}});
+    return node(physical::NestedLoop{node(scan({p(0)}, {})), std::move(filtered), true, {}});
+  };
+  CHECK(refusal(with(inner(t_v, u_v))).empty());
+  refused(with(inner(t_v, w_v)), "a predicate that reads a column of a table not in hand");
+}
+
+TEST_CASE("physical: check refuses an expression result column codegen can't print", "[sql][physical]") {
+  using Kind = logical::Expr::Kind;
+  using Op = ast::Compare::Op;
+  const auto big = SqlType{SqlKind::BigInt};
+  auto id = logical::column(kId, big);
+  auto emitting = [&](logical::Expr e) {
+    std::vector<physical::EmitTarget> targets;
+    targets.emplace_back(physical::ExprTarget{std::move(e)});
+    return plan(node(physical::Emit{get({p(0)}), std::move(targets)}));
+  };
+  // An operator over a column and a parameter; a comparison; a negated NULL test.
+  CHECK(refusal(emitting(logical::binary(Kind::Add, id, p(1), big))).empty());
+  CHECK(refusal(emitting(logical::compare(Op::Lt, logical::binary(Kind::Mul, id, p(1), big), p(0)))).empty());
+  auto is_null = logical::expr(Kind::IsNull, SqlType{SqlKind::Boolean});
+  is_null.args.push_back(id);
+  CHECK(refusal(emitting(logical::predicate_of(Kind::Not, {is_null}))).empty());
+  // What eval does not print, an operator of the wrong operands, a parameter past the statement's.
+  refused(emitting(logical::expr(Kind::Aggregate, big)), "does not print");
+  auto lone = logical::expr(Kind::Add, big);
+  lone.args.push_back(id);
+  refused(emitting(lone), "wrong number of operands");
+  refused(emitting(logical::predicate_of(Kind::And, {is_null})), "wrong number of operands");
+  refused(emitting(logical::binary(Kind::Div, id, p(2), big)), "past the statement's");
+  // A DOUBLE column an expression reads from a covering scan's key.
+  std::vector<physical::EmitTarget> from_key;
+  from_key.emplace_back(physical::ExprTarget{logical::binary(Kind::Add, logical::column(kD, SqlType{SqlKind::Double}), p(1),
+                                                              SqlType{SqlKind::Double})});
+  refused(plan(node(physical::Emit{node(scan({p(0)}, {}, true)), std::move(from_key)})), "DOUBLE column read from a key");
+
+  // CASE and COALESCE: a branch of the result's type, a numeric branch no finer than it, a BOOLEAN WHEN.
+  const auto text = SqlType{SqlKind::Text};
+  const auto d2 = SqlType{SqlKind::Decimal, 0, 0, 2};
+  auto when = logical::compare(Op::Lt, id, p(1));
+  auto searched = logical::expr(Kind::Case, big);
+  searched.args = {when, id, p(1)};
+  CHECK(refusal(emitting(searched)).empty());
+  auto coalesced = logical::expr(Kind::Coalesce, big);
+  coalesced.args = {id, p(1)};
+  CHECK(refusal(emitting(coalesced)).empty());
+  auto not_boolean = searched;
+  not_boolean.args[0] = id;
+  refused(emitting(not_boolean), "not a BOOLEAN");
+  auto other_type = logical::expr(Kind::Case, text);
+  other_type.args = {when, id};
+  refused(emitting(other_type), "another type than its result");
+  auto finer = logical::expr(Kind::Case, big);
+  finer.args = {when, logical::param(1, d2)};
+  refused(emitting(finer), "another type than its result");
+  auto lone_branch = logical::expr(Kind::Coalesce, big);
+  lone_branch.args = {id};
+  refused(emitting(lone_branch), "wrong number of operands");
 }
 
 TEST_CASE("physical: check refuses a grouped aggregate codegen can't print", "[sql][physical][group]") {

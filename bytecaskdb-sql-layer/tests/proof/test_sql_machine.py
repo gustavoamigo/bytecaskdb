@@ -79,6 +79,7 @@ import tempfile
 
 import bytecask_sql
 import hypothesis.strategies as st
+import psycopg
 import pytest
 from hypothesis import note
 from hypothesis.control import currently_in_test_context
@@ -166,16 +167,19 @@ class Table:
         return f"SELECT {', '.join(c.name for c in self.columns)} FROM {self.name}"
 
 
-def join_served(a: Table, conj_a: list[tuple], b: Table, conj_b: list[tuple], on: list[tuple[str, str]]) -> bool:
+def join_served(a: Table, conj_a: list[tuple], b: Table, conj_b: list[tuple], on: list[tuple[str, str]],
+                outer: bool = False) -> bool:
     """Whether the planner plans a join of a and b on `on` (a's column, b's)
     with these conjuncts: when some order reads the outer table by any
     access path and the inner one by its whole primary key from parameters
     and outer columns, or by its own scan: under an outer table named by its
     key, read once; under any other, read once per outer row or hash joined.
     Every other conjunct a filter, none on a DOUBLE or REAL. Any ORDER BY is
-    served: a sort holds a row of each loop in a sorter of its own."""
+    served: a sort holds a row of each loop in a sorter of its own. `outer`:
+    a LEFT JOIN of b, which keeps a the outer table and never hashes, the
+    same conditions in its one order."""
     sides = [(a, conj_a, [x for x, _ in on]), (b, conj_b, [y for _, y in on])]
-    for o in (0, 1):
+    for o in ((0,) if outer else (0, 1)):
         (ot, oconj, ocols), (it, iconj, icols) = sides[o], sides[1 - o]
         if not served(ot, oconj):
             continue
@@ -753,14 +757,18 @@ class SqlMachine(Sides, RuleBasedStateMachine):
     def join_on(self, a_name: str, b_name: str, where_a: list[tuple[str, str, object]],
                 keys_b: list[tuple[str, tuple[str, object]]], filters_b: list[tuple[str, str, object]],
                 targets: list[tuple[str, str]], limit: int | None = None, distinct: tuple[str, str] | None = None,
-                links: list[tuple[str, str]] = (), order: list[tuple] = ()) -> None:
+                links: list[tuple[str, str]] = (), order: list[tuple] = (), outer: str | None = None,
+                anti: bool = False) -> None:
         """SELECT targets (or COUNT(DISTINCT table.col)) FROM a, b WHERE a's
         conjuncts, each of b's key parts equal to a column of a ("col", name)
         or to a parameter ("param", value), b's filters, and each link (b's
         column, a's) an equality of a column b's key does not hold with a
         column of a, ORDER BY each (table, column, DESC, NULLS FIRST): on both
         sides when the planner serves it, else the layer must refuse it with
-        no plan."""
+        no plan. `outer` "LEFT" or "RIGHT": a outer joined to b, b's
+        conditions and the links its ON, a's its WHERE; `anti`: the WHERE
+        also takes the rows b matched none of, by b's first key column IS
+        NULL."""
         a, b = self.tables[a_name], self.tables[b_name]
         conds, pg_conds, params, types = [], [], [], []
         def add(t, c, op, v):
@@ -771,6 +779,7 @@ class SqlMachine(Sides, RuleBasedStateMachine):
             types.append(t.column(c).type)
         for c, op, v in where_a:
             add(a, c, op, v)
+        n_a = len(conds)
         on = []
         for c, (kind, v) in keys_b:
             if kind == "col":
@@ -788,10 +797,18 @@ class SqlMachine(Sides, RuleBasedStateMachine):
         select = f"count(DISTINCT {distinct[0]}.{distinct[1]})" if distinct else ", ".join(f"{t}.{c}" for t, c in targets)
         ordered = " ORDER BY " + order_text([(f"{t}.{c}", *rest) for t, c, *rest in order]) if order else ""
         tail = f" LIMIT {limit}" if limit is not None else ""
-        sql = f"SELECT {select} FROM {a_name}, {b_name}{self.where_text(conds)}{ordered}{tail}"
-        pg_sql = f"SELECT {select} FROM {a_name}, {b_name}{self.where_text(pg_conds)}{ordered}"
+        if outer and len(conds) > n_a:
+            def text(cs):
+                where = cs[:n_a] + ([f"{b_name}.{b.pk[0]} IS NULL"] if anti else [])
+                joined = (f"{a_name} LEFT JOIN {b_name}" if outer == "LEFT" else f"{b_name} RIGHT JOIN {a_name}")
+                return f"SELECT {select} FROM {joined} ON {' AND '.join(cs[n_a:])}{self.where_text(where)}"
+            sql, pg_sql = text(conds) + ordered + tail, text(pg_conds) + ordered
+        else:
+            outer = None
+            sql = f"SELECT {select} FROM {a_name}, {b_name}{self.where_text(conds)}{ordered}{tail}"
+            pg_sql = f"SELECT {select} FROM {a_name}, {b_name}{self.where_text(pg_conds)}{ordered}"
         conj_b = [(c, "=", False) for c, (kind, _) in keys_b if kind == "param"] + conjuncts(filters_b)
-        if not join_served(a, conjuncts(where_a), b, conj_b, on):
+        if not join_served(a, conjuncts(where_a), b, conj_b, on, outer=outer is not None):
             self.no_plan(a_name, sql, params, types)
             return
         out = None
@@ -1401,13 +1418,23 @@ class SqlMachine(Sides, RuleBasedStateMachine):
         if data.draw(st.integers(0, 3), label="COUNT(DISTINCT)?") == 0:
             t = data.draw(st.sampled_from([a, b]), label="distinct of")
             self.join_on(a_name, b_name, where_a, keys_b, filters_b, [],
-                         distinct=(t.name, data.draw(st.sampled_from([x.name for x in t.columns]), label="column")))
+                         distinct=(t.name, data.draw(st.sampled_from([x.name for x in t.columns]), label="column")),
+                         **self.draw_outer(data, b))
             return
         columns = [(t.name, x.name) for t in (a, b) for x in t.columns]
         targets = data.draw(st.lists(st.sampled_from(columns), min_size=1, max_size=3, unique=True), label="targets")
         order = self.join_order(data, columns, targets)
         self.join_on(a_name, b_name, where_a, keys_b, filters_b, targets,
-                     limit=data.draw(st.none() | st.sampled_from([0, 1, 3]), label="limit"), order=order)
+                     limit=data.draw(st.none() | st.sampled_from([0, 1, 3]), label="limit"), order=order,
+                     **self.draw_outer(data, b))
+
+    @staticmethod
+    def draw_outer(data, b: Table) -> dict:
+        """Now and then the join outer: LEFT, or RIGHT with its sides
+        written the other way round, the rows b matches none of alone now
+        and then."""
+        outer = data.draw(st.sampled_from([None, None, "LEFT", "RIGHT"]), label="outer join")
+        return {"outer": outer, "anti": outer is not None and data.draw(st.integers(0, 3), label="anti join?") == 0}
 
     @staticmethod
     def join_order(data, columns: list[tuple[str, str]], targets: list[tuple[str, str]]) -> list[tuple]:
@@ -1465,12 +1492,14 @@ class SqlMachine(Sides, RuleBasedStateMachine):
         if data.draw(st.integers(0, 3), label="COUNT(DISTINCT)?") == 0:
             t = data.draw(st.sampled_from([a, b]), label="distinct of")
             self.join_on(a_name, b_name, where_a, keys_b, [], [], links=links,
-                         distinct=(t.name, data.draw(st.sampled_from([x.name for x in t.columns]), label="column")))
+                         distinct=(t.name, data.draw(st.sampled_from([x.name for x in t.columns]), label="column")),
+                         **self.draw_outer(data, b))
             return
         targets = data.draw(st.lists(st.sampled_from(columns), min_size=1, max_size=3, unique=True), label="targets")
         order = self.join_order(data, columns, targets)
         self.join_on(a_name, b_name, where_a, keys_b, [], targets, links=links,
-                     limit=data.draw(st.none() | st.sampled_from([0, 1, 3]), label="limit"), order=order)
+                     limit=data.draw(st.none() | st.sampled_from([0, 1, 3]), label="limit"), order=order,
+                     **self.draw_outer(data, b))
 
     @precondition(lambda self: len(self.tables) >= 2)
     @rule(data=st.data())
@@ -1490,12 +1519,74 @@ class SqlMachine(Sides, RuleBasedStateMachine):
         if data.draw(st.integers(0, 3), label="COUNT(DISTINCT)?") == 0:
             t = data.draw(st.sampled_from([a, b]), label="distinct of")
             self.join_on(a_name, b_name, where_a, [], where_b, [], links=links,
-                         distinct=(t.name, data.draw(st.sampled_from([x.name for x in t.columns]), label="column")))
+                         distinct=(t.name, data.draw(st.sampled_from([x.name for x in t.columns]), label="column")),
+                         **self.draw_outer(data, b))
             return
         targets = data.draw(st.lists(st.sampled_from(columns), min_size=1, max_size=3, unique=True), label="targets")
         order = self.join_order(data, columns, targets)
         self.join_on(a_name, b_name, where_a, [], where_b, targets, links=links,
-                     limit=data.draw(st.none() | st.sampled_from([0, 1, 3]), label="limit"), order=order)
+                     limit=data.draw(st.none() | st.sampled_from([0, 1, 3]), label="limit"), order=order,
+                     **self.draw_outer(data, b))
+
+    @precondition(lambda self: len(self.tables) >= 1)
+    @rule(data=st.data())
+    def subquery(self, data):
+        # A's rows by an uncorrelated subquery over b, a itself or another
+        # table: IN, NOT IN, op ANY or ALL, = or < of a scalar MIN, EXISTS or
+        # NOT EXISTS, its rows narrowed now and then by a parameter or IS
+        # [NOT] NULL. Of columns the layer compares, never a float, which
+        # no filter takes.
+        a = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="outer")]
+        b = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="inner")]
+        def comparable(x: o.Type, y: o.Type) -> bool:
+            if x.kind in ("float", "real") or y.kind in ("float", "real"):
+                return False
+            if x.kind == "decimal" or y.kind == "decimal":
+                return x.kind == y.kind and x.scale == y.scale
+            return x.kind == y.kind
+        pairs = [(x.name, y.name) for x in a.columns for y in b.columns if comparable(x.type, y.type)]
+        if not pairs:
+            return
+        ca, cb = data.draw(st.sampled_from(pairs), label="columns")
+        ty = b.column(cb).type
+        params, types, pg_params = [], [], []
+        where = data.draw(st.sampled_from(["", "not null", "null", "param"]), label="inner where")
+        inner_where, pg_inner_where = "", ""
+        if where == "not null":
+            inner_where = pg_inner_where = f" WHERE {cb} IS NOT NULL"
+        elif where == "null":
+            inner_where = pg_inner_where = f" WHERE {cb} IS NULL"
+        elif where == "param":
+            op = data.draw(st.sampled_from(["=", "<", ">="]), label="inner op")
+            v = data.draw(st.none() | values(ty), label="inner value")
+            inner_where = " WHERE " + compared(b, cb, op, v, 1, False)
+            pg_inner_where = " WHERE " + compared(b, cb, op, v, 1, True)
+            params.append(param_value(v))
+            types.append(ty)
+        form = data.draw(st.sampled_from(["in", "not in", "any", "all", "scalar", "exists", "not exists"]), label="form")
+        def text(w):
+            inner = f"SELECT {cb} FROM {b.name}{w}"
+            if form == "in":
+                return f"{ca} IN ({inner})"
+            if form == "not in":
+                return f"{ca} NOT IN ({inner})"
+            if form in ("any", "all"):
+                op = data.draw(st.sampled_from(["=", "<>", "<", "<=", ">", ">="]), label="quantified op")
+                quantifier = form.upper() if form == "all" else data.draw(st.sampled_from(["ANY", "SOME"]), label="any")
+                return f"{ca} {op} {quantifier} ({inner})"
+            if form == "scalar":
+                op = data.draw(st.sampled_from(["=", "<", ">="]), label="scalar op")
+                return f"{ca} {op} (SELECT MIN({cb}) FROM {b.name}{w})"
+            return f"{'NOT ' if form == 'not exists' else ''}EXISTS ({inner})"
+        if form == "scalar" and ty.kind not in ("int", "decimal"):
+            return  # the layer's MIN takes integers and DECIMALs
+        cond_layer = text(inner_where)
+        select = ", ".join(a.pk)
+        sql = f"SELECT {select} FROM {a.name} WHERE {cond_layer} ORDER BY {select}"
+        pg_sql = sql.replace(inner_where, pg_inner_where) if inner_where else sql
+        out = self.both(sql, params, pg_sql=pg_sql, types=types)
+        if out.error is None:
+            self.alternatives_agree(sql, params, types, out.rows, None, None)
 
     @precondition(lambda self: len(self.tables) >= 2 and self.txn is None)
     @rule(data=st.data())
@@ -1636,6 +1727,25 @@ class KeylessMachine(Sides, RuleBasedStateMachine):
             return where, where, [], []
         return f" WHERE {c} = ${first}", f" WHERE {c} = {typed(t, c, first)}", [v], [ty]
 
+    @staticmethod
+    def draw_pattern(data, held: list[str]) -> str:
+        """A LIKE pattern, mostly made from a value a row holds: the whole of
+        it, a prefix, a suffix or a middle with % around, now and then a
+        character as _; its own %, _ and backslash escaped. Sometimes any
+        text, % and _ among it."""
+        if not held or data.draw(st.integers(0, 4), label="free pattern?") == 0:
+            return data.draw(st.text(alphabet="ab%_\\é", max_size=5), label="pattern")
+        v = data.draw(st.sampled_from(held), label="pattern source")
+        i = data.draw(st.integers(0, len(v)), label="cut from")
+        j = data.draw(st.integers(i, len(v)), label="cut to")
+        piece = "".join("\\" + ch if ch in "%_\\" else ch for ch in v[i:j])
+        if piece and data.draw(st.booleans(), label="one as _?"):
+            k = data.draw(st.integers(0, len(v[i:j]) - 1), label="which _")
+            chars = ["\\" + ch if ch in "%_\\" else ch for ch in v[i:j]]
+            chars[k] = "_"
+            piece = "".join(chars)
+        return ("%" if i > 0 else "") + piece + ("%" if j < len(v) else "")
+
     def draw_predicate(self, data, t: Table, depth: int) -> str:
         """A predicate on filterable columns, as SQL both sides read alike:
         AND, OR and NOT over =, <>, IS [NOT] NULL, [NOT] BETWEEN and [NOT]
@@ -1651,8 +1761,12 @@ class KeylessMachine(Sides, RuleBasedStateMachine):
         held = [r[[x.name for x in t.columns].index(c)] for r in self.rows(t)]
         value = st.sampled_from(held + [None]) if held else st.just(None)
         lit = lambda label: o.sql_literal(ty, data.draw(value, label=label))  # noqa: E731
-        form = data.draw(st.sampled_from(["=", "<>", "IS NULL", "IS NOT NULL", "BETWEEN", "NOT BETWEEN", "IN", "NOT IN"]),
-                         label="predicate form")
+        forms = ["=", "<>", "IS NULL", "IS NOT NULL", "BETWEEN", "NOT BETWEEN", "IN", "NOT IN"]
+        if ty.kind == "text":
+            forms += ["LIKE", "NOT LIKE"]
+        form = data.draw(st.sampled_from(forms), label="predicate form")
+        if form in ("LIKE", "NOT LIKE"):
+            return f"{c} {form} {o.sql_literal(ty, self.draw_pattern(data, [h for h in held if h is not None]))}"
         if form in ("IS NULL", "IS NOT NULL"):
             return f"{c} {form}"
         if form in ("BETWEEN", "NOT BETWEEN"):
@@ -1802,6 +1916,30 @@ def test_a_unique_column_refuses_a_duplicate_and_takes_nulls(dsn):
         m.teardown()
 
 
+def test_like_agrees_with_postgresql_on_utf8_and_escapes(dsn):
+    """LIKE and NOT LIKE as PostgreSQL matches them: _ one character, not one
+    byte; % any run, backtracking; the escape, default and given; NULL
+    unknown."""
+    m = keyless_machine(dsn)()
+    try:
+        t = Table("k0", [Column("c0", o.TEXT), Column("c1", o.varchar(8))], [])
+        assert m.both(t.ddl(pg=False), pg_sql=t.ddl(pg=True)).error is None
+        m.tables[t.name] = t
+        for row in (["h\u00e9llo", "\u00e9t\u00e9"], ["hello", "ete"], ["a_b", "100%"], ["a\\b", "x"],
+                    ["mississippi", "\u00fc\u00fc"], [None, None], ["", ""]):
+            assert m.both("INSERT INTO k0 VALUES ($1, $2)", row, types=[o.TEXT, o.varchar(8)]).error is None
+        for where in ("c0 LIKE 'h_llo'", "c0 LIKE 'h__llo'", "c0 LIKE '%\u00e9%'", "c1 LIKE '_t_'",
+                      "c1 LIKE '\u00e9%'", "c1 LIKE '__'", "c0 LIKE 'm%iss%ppi'", "c0 LIKE '%s%s%s%s%'",
+                      "c0 LIKE 'a\\_b'", "c1 LIKE '100\\%'", "c1 LIKE '100!%' ESCAPE '!'",
+                      "c0 LIKE 'a\\b' ESCAPE ''", "c0 LIKE ''", "c0 NOT LIKE '%l%'", "c0 LIKE 'x\\'",
+                      "c0 LIKE '%' OR c1 IS NULL"):
+            sql = f"SELECT c0, c1 FROM k0 WHERE {where}"
+            m.bag(sql, [], sql, [])
+        m.check()
+    finally:
+        m.teardown()
+
+
 def test_a_table_without_a_primary_key_keeps_duplicates_across_a_reopen(dsn):
     """Row ids after a reopen start past the rows the data holds: an insert
     then adds a row, never collides with one (23505) or replaces it."""
@@ -1932,6 +2070,195 @@ def test_join_using_and_natural_join(dsn):
         assert m.both("SELECT c2 FROM t0 JOIN t1 USING (c1)").error == "42702"
         assert m.both("SELECT c0 FROM t0 JOIN t1 USING (c3)").error == "42703"
         m.check()
+    finally:
+        m.teardown()
+
+
+def test_left_and_right_join_null_extend_the_rows_nothing_matches(dsn):
+    """LEFT and RIGHT JOIN: each row of the preserved side, NULL-extended
+    where ON matches nothing; WHERE filters the joined rows; a USING
+    column alone is the preserved side's."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT), Column("c1", o.INTEGER), Column("c2", o.TEXT)], ["c0"]))
+        m.create(Table("t1", [Column("c3", o.BIGINT), Column("c1", o.INTEGER, nullable=False), Column("c2", o.TEXT)],
+                       ["c3"]))
+        for row in ({"c0": 1, "c1": 1, "c2": "x"}, {"c0": 2, "c1": 2, "c2": "y"}, {"c0": 3, "c1": None, "c2": "z"},
+                    {"c0": 4, "c1": 4, "c2": None}):
+            assert m.insert("t0", row, all_columns=True).error is None
+        for row in ({"c3": 10, "c1": 1, "c2": "x"}, {"c3": 11, "c1": 2, "c2": "n"}, {"c3": 12, "c1": 5, "c2": "z"},
+                    {"c3": 13, "c1": 1, "c2": "x"}):
+            assert m.insert("t1", row, all_columns=True).error is None
+        for sql in ("SELECT t0.c0, t1.c3 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 ORDER BY t0.c0, t1.c3",
+                    "SELECT t0.c0, t1.c3 FROM t1 RIGHT JOIN t0 ON t0.c1 = t1.c1 AND t1.c2 = 'x' ORDER BY t0.c0, t1.c3",
+                    "SELECT t0.c0, t1.c3 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 AND t0.c2 = 'x' ORDER BY t0.c0, t1.c3",
+                    "SELECT t0.c0 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 WHERE t1.c3 IS NULL ORDER BY t0.c0",
+                    "SELECT t0.c0, t1.c3 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 WHERE t1.c2 = 'x' OR t0.c0 > 2 ORDER BY t0.c0, t1.c3",
+                    "SELECT c1, t0.c0, t1.c3 FROM t0 LEFT JOIN t1 USING (c1) ORDER BY t0.c0, t1.c3",
+                    "SELECT c1, t0.c0, t1.c3 FROM t0 RIGHT JOIN t1 USING (c1) ORDER BY t1.c3",
+                    "SELECT t0.c0, t1.c3 FROM t0 NATURAL LEFT JOIN t1 ORDER BY t0.c0",
+                    "SELECT t0.c0, COUNT(t1.c1), COUNT(*) FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 GROUP BY t0.c0 ORDER BY t0.c0",
+                    "SELECT t1.c1, COUNT(*) FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 GROUP BY t1.c1 ORDER BY t1.c1"):
+            assert m.both(sql).error is None
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_joins_of_several_tables_with_themselves_and_on_any_comparison(dsn):
+    """Three or more tables, a table joined with itself under two aliases,
+    and ON by any comparison or by a predicate over both sides, inner and
+    left, in a chain: each pair NULL-extended or dropped as PostgreSQL does,
+    through the layer, the server and every plan the search costed."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER), Column("c1", o.INTEGER), Column("c2", o.INTEGER)], ["c0"]))
+        m.create(Table("t1", [Column("c3", o.INTEGER), Column("c1", o.INTEGER), Column("c4", o.INTEGER)], ["c3"]))
+        m.create_index("t1", Index("t1_c1", [("c1", False)]))
+        m.create(Table("t2", [Column("c5", o.INTEGER), Column("c1", o.INTEGER)], ["c5"]))
+        # Each table has a row of key 0: what a row of NULLs would read as, if a join read a key from one.
+        for row in ({"c0": 0, "c1": 3, "c2": 5}, {"c0": 1, "c1": 1, "c2": 10}, {"c0": 2, "c1": 2, "c2": 20},
+                    {"c0": 3, "c1": 2, "c2": None}, {"c0": 4, "c1": None, "c2": 40}, {"c0": 5, "c1": 5, "c2": 50}):
+            assert m.insert("t0", row, all_columns=True).error is None
+        for row in ({"c3": 0, "c1": 4, "c4": 50}, {"c3": 1, "c1": 1, "c4": 100}, {"c3": 2, "c1": 2, "c4": 200},
+                    {"c3": 3, "c1": 2, "c4": None}, {"c3": 4, "c1": None, "c4": 400}, {"c3": 6, "c1": 6, "c4": 600}):
+            assert m.insert("t1", row, all_columns=True).error is None
+        for row in ({"c5": 0, "c1": 4}, {"c5": 1, "c1": 1}, {"c5": 2, "c1": 2}, {"c5": 3, "c1": None}, {"c5": 7, "c1": 7}):
+            assert m.insert("t2", row, all_columns=True).error is None
+        statements = (
+            # Three tables and more, by JOIN or by a comma list, in any order the WHERE leaves.
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 JOIN t1 ON t0.c1 = t1.c1 JOIN t2 ON t1.c1 = t2.c1 ORDER BY 1, 2, 3",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0, t1, t2 WHERE t0.c1 = t1.c1 AND t1.c1 = t2.c1 ORDER BY 1, 2, 3",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 JOIN t1 ON t0.c0 = t1.c3 JOIN t2 ON t2.c5 = t0.c0 ORDER BY 1",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0, t1, t2 WHERE t0.c1 < t1.c1 AND t1.c1 <> t2.c1 ORDER BY 1, 2, 3",
+            "SELECT COUNT(*), MIN(t2.c5) FROM t0 JOIN t1 ON t0.c1 = t1.c1 JOIN t2 ON t1.c1 = t2.c1",
+            "SELECT t0.c1, COUNT(*) FROM t0 JOIN t1 ON t0.c1 = t1.c1 JOIN t2 ON t1.c1 = t2.c1 GROUP BY t0.c1 ORDER BY 1",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 JOIN t1 ON t0.c1 = t1.c1 JOIN t2 ON t1.c1 = t2.c1 ORDER BY 1, 2, 3 LIMIT 2",
+            # ON by any comparison, and by a predicate over both sides.
+            "SELECT t0.c0, t1.c3 FROM t0 JOIN t1 ON t0.c1 < t1.c1 ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0 JOIN t1 ON t0.c1 <= t1.c1 ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0 JOIN t1 ON t0.c1 > t1.c1 ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0 JOIN t1 ON t0.c1 >= t1.c1 ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0 JOIN t1 ON t0.c1 <> t1.c1 ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0 JOIN t1 ON t0.c1 = t1.c1 AND t0.c2 < t1.c4 ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0 JOIN t1 ON NOT (t0.c1 = t1.c1) ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0 JOIN t1 ON t0.c1 = t1.c1 OR t0.c2 = t1.c4 ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0 JOIN t1 ON t0.c1 < t1.c1 OR t1.c4 IS NULL ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0, t1 WHERE t0.c1 <> t1.c1 AND t0.c0 > 1 ORDER BY 1, 2",
+            # Left joins: a pair of the ON, or the row NULL-extended, again through a second join.
+            "SELECT t0.c0, t1.c3 FROM t0 LEFT JOIN t1 ON t0.c1 < t1.c1 ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 AND NOT (t0.c2 < t1.c4) ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 LEFT JOIN t2 ON t1.c1 = t2.c1 ORDER BY 1, 2, 3",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 LEFT JOIN t2 ON t1.c3 = t2.c5 ORDER BY 1, 2, 3",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 LEFT JOIN t1 ON t0.c1 < t1.c1 LEFT JOIN t2 ON t1.c1 <> t2.c1 ORDER BY 1, 2, 3",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 LEFT JOIN t2 ON t0.c1 = t2.c1 AND t1.c4 > 100 ORDER BY 1, 2, 3",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 LEFT JOIN t2 ON t1.c1 = t2.c1 WHERE t2.c5 IS NULL ORDER BY 1, 2",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 LEFT JOIN t2 ON t1.c1 = t2.c1 WHERE t1.c3 IS NULL ORDER BY 1",
+            # An inner join after a left join drops the rows it NULL-extended; before it, it does not.
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 JOIN t2 ON t1.c1 = t2.c1 ORDER BY 1, 2, 3",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 JOIN t1 ON t0.c1 = t1.c1 LEFT JOIN t2 ON t1.c1 = t2.c1 ORDER BY 1, 2, 3",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 LEFT JOIN t1 ON t0.c0 = t1.c3 JOIN t2 ON t2.c5 = t1.c3 ORDER BY 1",
+            "SELECT t0.c1, COUNT(t1.c3), COUNT(t2.c5), COUNT(*) FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 LEFT JOIN t2 ON t1.c1 = t2.c1 GROUP BY t0.c1 ORDER BY 1",
+            # A table with itself, under two aliases, on its key, a column, a comparison or USING.
+            "SELECT x.c0, y.c0 FROM t0 x JOIN t0 y ON x.c0 = y.c0 ORDER BY 1",
+            "SELECT x.c0, y.c0 FROM t0 x JOIN t0 y ON x.c1 = y.c1 ORDER BY 1, 2",
+            "SELECT x.c0, y.c0 FROM t0 x JOIN t0 y ON x.c0 < y.c0 ORDER BY 1, 2",
+            "SELECT x.c0, y.c0 FROM t0 x, t0 y WHERE x.c1 <> y.c1 ORDER BY 1, 2",
+            "SELECT x.c0, y.c0 FROM t0 x LEFT JOIN t0 y ON x.c1 = y.c1 AND x.c0 <> y.c0 ORDER BY 1, 2",
+            "SELECT x.c0, y.c0 FROM t0 x RIGHT JOIN t0 y ON x.c2 < y.c2 ORDER BY 1, 2",
+            "SELECT t0.c0, y.c0 FROM t0 JOIN t0 AS y ON t0.c0 = y.c0 ORDER BY 1",
+            "SELECT x.c0, y.c0, z.c0 FROM t0 x JOIN t0 y ON x.c0 < y.c0 JOIN t0 z ON y.c0 < z.c0 ORDER BY 1, 2, 3",
+            "SELECT x.c0, y.c0, z.c0 FROM t0 x LEFT JOIN t0 y ON x.c0 = y.c1 LEFT JOIN t0 z ON y.c0 = z.c1 ORDER BY 1, 2, 3",
+            "SELECT x.c0, z.c3 FROM t0 x JOIN t1 z ON x.c1 = z.c1 JOIN t0 y ON z.c1 = y.c1 ORDER BY 1, 2",
+            "SELECT * FROM t0 JOIN t0 AS y USING (c1) ORDER BY t0.c0, y.c0",
+            "SELECT * FROM t0 JOIN t0 AS y USING (c1) AS u ORDER BY t0.c0, y.c0",
+            "SELECT u.c1, t0.c0 FROM t0 JOIN t0 AS y USING (c1) AS u ORDER BY 1, 2",
+            "SELECT * FROM t0 JOIN t1 USING (c1) JOIN t2 ON t2.c1 = t0.c1 ORDER BY t0.c0, t1.c3, t2.c5",
+            # A subquery that joins, and one in a self-join's WHERE.
+            "SELECT x.c0 FROM t0 x WHERE x.c1 IN (SELECT p.c1 FROM t1 p JOIN t1 q ON p.c3 < q.c3) ORDER BY 1",
+            "SELECT x.c0, y.c0 FROM t0 x JOIN t0 y ON x.c0 < y.c0 WHERE x.c1 IN (SELECT c1 FROM t2) ORDER BY 1, 2",
+        )
+        for sql in statements:
+            layer = m.both(sql)
+            assert layer.error is None, sql
+            if not sql.startswith("SELECT * "):
+                pg = o.run_pg(m.pg.conn, sql)
+                m.alternatives_agree(sql, (), [], pg.rows, None, None)
+        # The errors PostgreSQL gives for a name used wrongly (42712 is one the oracle
+        # calls "refused", as it does any state it does not compare).
+        for sql, state in (("SELECT c0 FROM t0 x JOIN t0 y ON x.c0 = y.c0", "42702"),
+                           ("SELECT t0.c0 FROM t0 x JOIN t0 y ON x.c0 = y.c0", "42P01"),
+                           ("SELECT x.c0 FROM t0 x JOIN t0 x ON x.c0 = x.c0", "refused"),
+                           ("SELECT 1 FROM t0 JOIN t1 ON t0.c1 = t2.c1 JOIN t2 ON t1.c1 = t2.c1", "42P01")):
+            assert m.both(sql).error == state, sql
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_uncorrelated_subqueries_agree_with_postgresql(dsn):
+    """Each form, over a subquery with NULLs, one without, one of no rows
+    and one of one row: the three-valued IN, NOT IN, ANY and ALL, EXISTS, a
+    scalar subquery as a key and in a select list, and 21000 for one of
+    many rows."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER), Column("c1", o.INTEGER), Column("c2", o.TEXT)], ["c0"]))
+        m.create(Table("t1", [Column("c3", o.BIGINT), Column("c4", o.BIGINT), Column("c5", o.TEXT)], ["c3"]))
+        for row in ({"c0": 1, "c1": 10, "c2": "a"}, {"c0": 2, "c1": 20, "c2": "b"}, {"c0": 3, "c1": None, "c2": None},
+                    {"c0": 4, "c1": 20, "c2": "d"}, {"c0": 5, "c1": 30, "c2": "e"}):
+            assert m.insert("t0", row, all_columns=True).error is None
+        for row in ({"c3": 1, "c4": 20, "c5": "b"}, {"c3": 2, "c4": None, "c5": None}, {"c3": 3, "c4": 5, "c5": "zz"}):
+            assert m.insert("t1", row, all_columns=True).error is None
+        subs = ("SELECT c4 FROM t1", "SELECT c4 FROM t1 WHERE c4 IS NOT NULL", "SELECT c4 FROM t1 WHERE c3 > 9",
+                "SELECT c4 FROM t1 WHERE c3 = 1")
+        for sq in subs:
+            for form in ("IN", "NOT IN", "= ANY", "<> ALL", "< ALL", ">= ANY", "<> ANY", "= ALL", "> SOME"):
+                assert m.both(f"SELECT c0 FROM t0 WHERE c1 {form} ({sq}) ORDER BY c0").error is None
+            assert m.both(f"SELECT c0 FROM t0 WHERE EXISTS ({sq}) ORDER BY c0").error is None
+            assert m.both(f"SELECT c0 FROM t0 WHERE NOT EXISTS ({sq}) OR c0 = 3 ORDER BY c0").error is None
+        for sql in ("SELECT c0 FROM t0 WHERE c0 = (SELECT MAX(c3) FROM t1)",
+                    "SELECT c0 FROM t0 WHERE c1 >= (SELECT MIN(c4) FROM t1) ORDER BY c0",
+                    "SELECT c0 FROM t0 WHERE c1 = (SELECT c4 FROM t1 WHERE c3 = 2)",
+                    "SELECT c0 FROM t0 WHERE c2 IN (SELECT c5 FROM t1) ORDER BY c0",
+                    "SELECT c0, (SELECT c5 FROM t1 WHERE c3 = 3) FROM t0 ORDER BY c0",
+                    "SELECT (SELECT COUNT(*) FROM t1), (SELECT c4 FROM t1 WHERE c3 = 9)"):
+            assert m.both(sql).error is None, sql
+        assert m.both("SELECT c0 FROM t0 WHERE c1 = (SELECT c4 FROM t1)").error == "21000"
+        assert m.both("UPDATE t0 SET c1 = 0 WHERE c0 IN (SELECT c3 FROM t1)").error is None
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_a_foreign_key_is_checked_when_created_and_not_enforced(dsn):
+    """REFERENCES and FOREIGN KEY: created where PostgreSQL creates them,
+    refused with its SQLSTATE where it refuses them; then not enforced, a
+    row the parent does not hold written (frontend_design.md, *Known
+    differences*)."""
+    m = fixed(dsn)
+    try:
+        assert m.both("CREATE TABLE p (k INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL, UNIQUE (a, b))").error is None
+        assert m.both("CREATE TABLE n (a INTEGER)").error is None
+        for sql in ("CREATE TABLE c (x BIGINT REFERENCES p (k))",
+                    "CREATE TABLE c (x SMALLINT CONSTRAINT cx REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT)",
+                    "CREATE TABLE c (x INT, y INT, FOREIGN KEY (x, y) REFERENCES p (b, a) ON UPDATE NO ACTION)",
+                    "CREATE TABLE c (id INT PRIMARY KEY, up INT REFERENCES c)"):
+            assert m.both(sql).error is None
+            assert m.both("DROP TABLE c").error is None
+        for sql, state in (("CREATE TABLE c (x INT REFERENCES p (a))", "42830"),
+                           ("CREATE TABLE c (x INT REFERENCES n)", "42704"),
+                           ("CREATE TABLE c (x INT REFERENCES nope)", "42P01"),
+                           ("CREATE TABLE c (x INT REFERENCES p (z))", "42703"),
+                           ("CREATE TABLE c (x INT, FOREIGN KEY (x) REFERENCES p (a, b))", "42830"),
+                           ("CREATE TABLE c (x TEXT REFERENCES p)", "42804")):
+            assert m.both(sql).error == state, sql
+        assert m.both("CREATE TABLE c (x INT REFERENCES p)").error is None
+        assert m.layer("INSERT INTO c VALUES (9)").error is None  # no p row 9: not enforced
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):  # 23503
+            m.pg.conn.execute("INSERT INTO c VALUES (9)")
+        for t in ("c", "n", "p"):
+            assert m.both(f"DROP TABLE {t}").error is None
     finally:
         m.teardown()
 
@@ -2144,8 +2471,8 @@ def test_every_range_message_maps_to_its_sqlstate(tmp_path):
     db = bytecask_sql.open(str(tmp_path))
     try:
         db.execute("CREATE TABLE r (k BIGINT PRIMARY KEY, s SMALLINT, i INTEGER, f REAL, d NUMERIC(4, 2), "
-                   "v VARCHAR(2), x TEXT, dt DATE, ts TIMESTAMP, tm TIME)")
-        cols = ["s", "i", "f", "d", "v", "x", "dt", "ts", "tm"]
+                   "v VARCHAR(2), x TEXT, dt DATE, ts TIMESTAMP, tm TIME, c CHAR(2))")
+        cols = ["s", "i", "f", "d", "v", "x", "dt", "ts", "tm", "c"]
         cases = [
             ("s", 2**15, "22003"),
             ("i", 2**31, "22003"),
@@ -2153,6 +2480,7 @@ def test_every_range_message_maps_to_its_sqlstate(tmp_path):
             ("f", 1e-50, "22003"),
             ("d", 10_000, "22003"),
             ("v", "abc", "22001"),
+            ("c", "abc", "22001"),
             ("v", b"\xc3", "22021"),
             ("x", b"\x00", "22021"),
             ("dt", -2_440_589, "22008"),
@@ -2494,6 +2822,34 @@ def test_a_computed_bound_past_integer_is_22003_before_the_plan_runs(dsn):
         m.teardown()
 
 
+def test_double_aggregates_and_distinct_values_agree_with_postgresql(dsn):
+    """SUM, AVG, MIN and MAX of a DOUBLE PRECISION column, and the DISTINCT
+    form of every aggregate, alone, per group and over no rows: the layer's
+    rows and the server's text are PostgreSQL's."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.BIGINT), Column("c2", o.DOUBLE),
+                              Column("c3", o.BIGINT)], ["c0"]))
+        for c0, c1, c2, c3 in ((1, 1, 1.5, 10), (2, 1, 1.5, 10), (3, 1, 2.5, 20), (4, 2, None, None), (5, 2, 4.0, 20),
+                               (6, None, 4.0, None), (7, 2, 0.25, 30), (8, 2, 0.5, 30)):
+            m.insert("t0", {"c0": c0, "c1": c1, "c2": c2, "c3": c3}, all_columns=True)
+        for sql in (
+            "SELECT sum(c2), avg(c2), min(c2), max(c2) FROM t0 WHERE c0 >= $1",
+            "SELECT sum(ALL c2), avg(ALL c2), min(ALL c2), max(ALL c2) FROM t0 WHERE c0 >= $1",
+            "SELECT sum(DISTINCT c2), avg(DISTINCT c2), min(DISTINCT c2), max(DISTINCT c2), count(DISTINCT c2) FROM t0 WHERE c0 >= $1",
+            "SELECT sum(c2), sum(DISTINCT c2), count(c2), count(DISTINCT c2) FROM t0 WHERE c0 >= $1",
+            "SELECT sum(DISTINCT c3), count(DISTINCT c3), min(DISTINCT c3), max(DISTINCT c3), sum(c3) FROM t0 WHERE c0 >= $1",
+            "SELECT avg(DISTINCT c3) FROM t0 WHERE c0 >= $1",
+            "SELECT c1, sum(c2), avg(c2), min(c2), max(c2) FROM t0 WHERE c0 >= $1 GROUP BY c1 ORDER BY c1",
+            "SELECT c1, sum(DISTINCT c2), avg(DISTINCT c2), count(DISTINCT c2), sum(DISTINCT c3) FROM t0 WHERE c0 >= $1 GROUP BY c1 ORDER BY c1",
+        ):
+            m.both(sql, (0,))
+            m.both(sql, (100,))  # no row matches
+        m.check()
+    finally:
+        m.teardown()
+
+
 def test_forms_the_layer_does_not_support_are_refused_without_a_sqlstate(dsn):
     """A statement PostgreSQL runs, which the layer refuses as a form it does not
     support, is 42601: the layer claims PostgreSQL's code only where
@@ -2510,8 +2866,6 @@ def test_forms_the_layer_does_not_support_are_refused_without_a_sqlstate(dsn):
             ("SELECT c0 FROM t0 WHERE c2 = $1 AND c6 = $1", (1.5,)),
             ("UPDATE t0 SET c1 = $1 WHERE c6 = $1 AND c0 = $2", (1, 99)),  # PostgreSQL types the WHERE's $1 first
             ("UPDATE t0 SET c6 = c6 + $1 WHERE c0 = $2 AND c2 = $1", (1, 99)),
-            ("SELECT sum(c2) FROM t0 WHERE c0 = $1", (1,)),
-            ("SELECT min(c2) FROM t0 WHERE c0 = $1", (1,)),
             ("SELECT min(c1) FROM t0 WHERE c0 = $1", (1,)),
         ):
             layer = o.run_layer(m.db, sql, params)

@@ -21,6 +21,7 @@ module;
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -65,6 +66,10 @@ struct GeneratedPlan {
   std::vector<std::uint32_t> objects_read, tables_written;
   std::vector<ColumnDep> columns;
   double cost{0};  // what the search predicted the plan charges the work budget
+  // A cursor over the plan can resume from a checkpoint of its outermost
+  // scan instead of replaying from the first row (docs/cursor_design.md,
+  // *The replay cursor*). A whitelist: false until a shape is proven.
+  bool resumable{false};
 };
 
 // Plans a bound DML statement, its logical plan rewritten, then searched,
@@ -165,7 +170,7 @@ public:
     return table ? tbl(id) : idx(id);
   }
   auto col(const ColumnRef& c) -> std::string {
-    cols_.emplace(c.table, c.col, c.type);
+    cols_.emplace(storage(c.table), c.col, c.type);
     return use("COL_" + std::to_string(c.table) + "_" + std::to_string(c.col));
   }
   // The position of a column in an index's key, for the key-part decoders.
@@ -173,7 +178,7 @@ public:
     return use("PART_" + std::to_string(index) + "_" + std::to_string(c.col));
   }
   // A table or index the plan reads.
-  void reads(std::uint32_t id) { reads_.insert(id); }
+  void reads(std::uint32_t id) { reads_.insert(storage(id)); }
   [[nodiscard]] auto objects_read() const -> std::vector<std::uint32_t> { return {reads_.begin(), reads_.end()}; }
   // Every column the plan reads or sets, with its type.
   [[nodiscard]] auto columns_used() const -> std::vector<ColumnDep> {
@@ -210,7 +215,35 @@ public:
   [[nodiscard]] auto body() const -> const std::string& { return body_; }
   [[nodiscard]] auto p() const -> const physical::Plan& { return p_; }
 
+  // The lines another writer printed, indented to this one's depth; what that
+  // writer used joins this one's.
+  void splice(const Writer& inner) {
+    absorb(inner);
+    std::string_view text = inner.body_;
+    while (!text.empty()) {
+      auto end = text.find('\n');
+      body_ += std::string(2 * (depth_ - 1), ' ');
+      body_ += text.substr(0, end + 1);
+      text.remove_prefix(end + 1);
+    }
+  }
+
+  // What a subquery's writer used, which the statement's plan declares.
+  void absorb(const Writer& w) {
+    used_.insert(w.used_.begin(), w.used_.end());
+    cols_.insert(w.cols_.begin(), w.cols_.end());
+    reads_.insert(w.reads_.begin(), w.reads_.end());
+  }
+
 private:
+  // The table whose rows a table of the plan reads: its own, or, for an
+  // instance of it (Table::source), the table it is an instance of. Any other
+  // object is itself.
+  auto storage(std::uint32_t id) const -> std::uint32_t {
+    auto it = std::ranges::find(p_.constants, "TBL_" + std::to_string(id), &Catalog::PlanConstant::name);
+    return it == p_.constants.end() ? id : it->value;
+  }
+
   // A name the plan's constants lack would fail at TinyCC: a compiler bug,
   // refused here instead.
   auto use(std::string name) -> std::string {
@@ -262,9 +295,11 @@ auto param_parts(const std::vector<Expr>& params) -> std::vector<KeySrc> {
 // A key of `object` from its leading parts, as an expression. One
 // bc_key_params when they are consecutive parameters, a builder otherwise.
 // In a loop, `miss_if_long` skips to the next iteration when a byte string
-// read from a row makes the key too long for any row to have.
-auto key(Writer& w, std::uint32_t object, const std::vector<KeySrc>& parts, bool miss_if_long = false)
-    -> std::string {
+// read from a row makes the key too long for any row to have; `fits`, when
+// given, is set to that test instead, for a caller where such a key is a
+// miss but the row goes on.
+auto key(Writer& w, std::uint32_t object, const std::vector<KeySrc>& parts, bool miss_if_long = false,
+         std::string* fits = nullptr) -> std::string {
   auto consecutive = !parts.empty() && parts[0].param.has_value();
   for (std::size_t i = 1; consecutive && i < parts.size(); ++i) {
     consecutive = parts[i].param.has_value() && *parts[i].param == *parts[0].param + i;
@@ -287,6 +322,7 @@ auto key(Writer& w, std::uint32_t object, const std::vector<KeySrc>& parts, bool
   auto long_value =
       std::ranges::any_of(parts, [](const KeySrc& p) { return !p.value.empty() && p.type == PhysType::Bytes; });
   if (miss_if_long && long_value) w.line("if (!bc_key_fits(cx, " + k + ")) continue;");
+  if (fits != nullptr && long_value) *fits = "bc_key_fits(cx, " + k + ")";
   return "bc_key_end(cx, " + k + ")";
 }
 
@@ -363,13 +399,81 @@ public:
 
   explicit Gen(Writer& w) : w_{w} {}
 
+  // Each subquery first, once, on the statement's snapshot: it sets the
+  // parameters the rest reads (bc_sub_kind).
+  void subqueries() {
+    const auto& subs = w_.p().subs;
+    for (std::size_t i = 0; i < subs.size(); ++i) {
+      auto n = std::to_string(i);
+      w_.line("bc_sub_begin(cx, " + n + ", " + sub_kind(subs[i].kind) + ", " + type_code(subs[i]) + ", " +
+              std::to_string(subs[i].param) + ");");
+      w_.line("sub" + n + "(cx);");
+      w_.line("bc_sub_end(cx);");
+    }
+  }
+
   void plan(const physical::Node& root) {
+    subqueries();
     print_computed(w_);
     // LIMIT 0 returns nothing, so nothing is read.
     if (limit_zero(root)) return;
     no_rows_ = no_rows(root);
     if (!w_.p().null_checks.empty()) return_if_null(w_, w_.p().null_checks, no_rows_);
     produce(root, [] {});
+  }
+
+  // A value in hand, as C: whether it is NULL, and its value (garbage where it is).
+  struct Val {
+    std::string null, value;
+    PhysType type{PhysType::I64};
+  };
+  using Row = std::vector<Val>;
+  // What a set operation does with each row an arm gives, printed where the
+  // row is in hand.
+  using Sink = std::function<void(Writer&, const Row&)>;
+
+  // An arm of a set operation, a SELECT's plan whose result rows go to
+  // `sink` instead. `limit` is a loop condition that stops the arm once the
+  // statement's LIMIT is reached, or empty. The arm's misses skip the rest
+  // of it instead of ending the plan: where a row is missing, the code after
+  // is in an `if`, which the arm closes.
+  void arm(const physical::Plan& arm_plan, const std::string& limit, const Sink& sink) {
+    sink_ = &sink;
+    base_limit_ = limit;
+    limit_ = limit;
+    const auto& root = *arm_plan.root;
+    print_computed(w_);
+    if (limit_zero(root)) return;
+    if (!arm_plan.null_checks.empty()) {
+      std::string cond;
+      for (auto n : arm_plan.null_checks) cond += (cond.empty() ? "" : " || ") + param_null(n);
+      w_.open("if (!(" + cond + "))");
+      ++open_;
+    }
+    produce(root, [] {});
+    for (; open_ > 0; --open_) w_.close();
+  }
+
+  static auto sub_kind(logical::Subquery::Kind k) -> std::string {
+    switch (k) {
+      case logical::Subquery::Kind::Value: return "BC_SUB_VALUE";
+      case logical::Subquery::Kind::Exists: return "BC_SUB_EXISTS";
+      case logical::Subquery::Kind::Bounds: return "BC_SUB_BOUNDS";
+      case logical::Subquery::Kind::Set: return "BC_SUB_SET";
+    }
+    return "BC_SUB_VALUE";
+  }
+
+  // The bc_type of a subquery's column; EXISTS keeps none, so any.
+  static auto type_code(const physical::Sub& s) -> std::string {
+    if (s.kind == logical::Subquery::Kind::Exists) return "BC_T_BOOL";
+    switch (phys_type(s.type)) {
+      case PhysType::I64: return "BC_T_I64";
+      case PhysType::F64: return "BC_T_F64";
+      case PhysType::Bool: return "BC_T_BOOL";
+      case PhysType::Bytes: return "BC_T_BYTES";
+    }
+    return "BC_T_I64";
   }
 
   // What the root reports when no row can match: nothing for result rows,
@@ -490,6 +594,11 @@ private:
       w_.line("if (" + cond + ") continue;");
       return;
     }
+    if (sink_ != nullptr) {
+      w_.open("if (!(" + cond + "))");
+      ++open_;
+      return;
+    }
     w_.open("if (" + cond + ")");
     for (const auto& line : no_rows_) w_.line(line);
     w_.line("return;");
@@ -520,15 +629,34 @@ private:
         return out;
       }
       case Expr::Kind::IsNull: return (want ? "" : "!") + col_null(e.args[0].col);  // never unknown
+      case Expr::Kind::Like: {
+        const auto& col = e.args[0].col;
+        auto p = e.args[1].param;
+        auto match = "bc_like(cx, " + read_col(col) + ", " + param(PhysType::Bytes, p) + ", " + std::to_string(e.constant) + ")";
+        return "!(" + col_null(col) + " || " + param_null(p) + ") && " + (want ? "" : "!") + match;
+      }
       case Expr::Kind::Const: return (e.constant != 0) == want ? "1" : "0";
       case Expr::Kind::Compare: {
         auto [null, cmp] = comparison(e);
         return "!(" + null + ") && " + (want ? "(" : "!(") + cmp + ")";
       }
+      case Expr::Kind::Truth: {  // a subquery's BOOLEAN parameter
+        auto p = e.args[0].param;
+        return "!" + param_null(p) + " && " + (want ? "" : "!") + param(PhysType::Bool, p);
+      }
+      case Expr::Kind::InSet: {  // the column's value among a subquery's
+        const auto& col = e.args[0].col;
+        auto has = "bc_sub_has_" + suffix(col.type) + "(cx, " + std::to_string(e.constant) + ", " + read_col(col) + ")";
+        return "!(" + col_null(col) + ") && " + (want ? "" : "!") + has;
+      }
       case Expr::Kind::Column:
       case Expr::Kind::Param:
       case Expr::Kind::Add:
       case Expr::Kind::Sub:
+      case Expr::Kind::Mul:
+      case Expr::Kind::Div:
+      case Expr::Kind::Case:
+      case Expr::Kind::Coalesce:
       case Expr::Kind::Aggregate: break;
     }
     throw std::logic_error{"physical plan: a predicate codegen does not print"};
@@ -555,12 +683,19 @@ private:
         value = computed_name(rhs, lhs.table);
         break;
       case Expr::Kind::Const:
+      case Expr::Kind::Mul:
+      case Expr::Kind::Div:
       case Expr::Kind::Compare:
       case Expr::Kind::Aggregate:
       case Expr::Kind::And:
       case Expr::Kind::Or:
       case Expr::Kind::Not:
-      case Expr::Kind::IsNull: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
+      case Expr::Kind::IsNull:
+      case Expr::Kind::Like:
+      case Expr::Kind::Truth:
+      case Expr::Kind::InSet:
+      case Expr::Kind::Case:
+      case Expr::Kind::Coalesce: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
     }
     auto col = read_col(lhs);
     // Text and bytes compare as bytes: COLLATE "C".
@@ -723,14 +858,17 @@ private:
     if (cr.emits) emit_count("n");
   }
 
-  // The scan a plan's rows come from, under its filters and sort, or a hash
-  // join's build side; null for a NULL split.
-  static auto plain_scan(const physical::Node& n) -> const physical::Scan* {
-    if (const auto* sc = std::get_if<physical::Scan>(&n.op)) return sc;
-    if (const auto* f = std::get_if<physical::Filter>(&n.op)) return plain_scan(*f->input);
-    if (const auto* o = std::get_if<physical::Sort>(&n.op)) return plain_scan(*o->input);
-    if (const auto* h = std::get_if<physical::HashJoin>(&n.op)) return plain_scan(*h->build);
-    if (const auto* g = std::get_if<physical::GroupAggregate>(&n.op)) return plain_scan(*g->input);
+  // The scan of the table a choice point counts that a plan's rows come from,
+  // under its filters and sort, or a hash join's build side, or a join whose
+  // outer side a hash join is; null for a NULL split.
+  static auto counted_scan(const physical::Node& n, const physical::Scan& counted) -> const physical::Scan* {
+    if (const auto* sc = std::get_if<physical::Scan>(&n.op)) return sc->table == counted.table ? sc : nullptr;
+    if (const auto* f = std::get_if<physical::Filter>(&n.op)) return counted_scan(*f->input, counted);
+    if (const auto* o = std::get_if<physical::Sort>(&n.op)) return counted_scan(*o->input, counted);
+    if (const auto* g = std::get_if<physical::GroupAggregate>(&n.op)) return counted_scan(*g->input, counted);
+    if (const auto* j = std::get_if<physical::IndexJoin>(&n.op)) return counted_scan(*j->outer, counted);
+    if (const auto* j = std::get_if<physical::NestedLoop>(&n.op)) return counted_scan(*j->outer, counted);
+    if (const auto* h = std::get_if<physical::HashJoin>(&n.op)) return counted_scan(*h->build, counted);
     return nullptr;
   }
 
@@ -747,7 +885,7 @@ private:
             ");");
     w_.open("if (" + n + " < " + t + ")");
     // A NULL split's ranges are its own, not the count of its prefix.
-    if (const auto* first = plain_scan(*ch.below)) counted_.emplace(first, Counted{"lo" + i, "hi" + i});
+    if (const auto* first = counted_scan(*ch.below, ch.counted)) counted_.emplace(first, Counted{"lo" + i, "hi" + i});
     produce(*ch.below, k);
     w_.otherwise();
     produce(*ch.at_or_above, k);
@@ -809,7 +947,79 @@ private:
   // For each outer row, the inner row its key names. Of an outer column, a
   // NULL names no row, nor does a byte string too long for any key. The
   // inner row of the d-th join from the first table is row<d>, found<d>.
+  // A left outer join's row of the inner table's NULLs, nr<i>, made once
+  // before its outer side's loop.
+  auto null_row(std::uint32_t table) -> std::string {
+    auto n = "nr" + std::to_string(nulls_++);
+    w_.reads(table);
+    w_.line("bc_view " + n + " = bc_null_row(cx, " + w_.tbl(table) + ");");
+    return n;
+  }
+
+  // The table a nested loop's inner side reads.
+  static auto inner_table(const physical::Node& n) -> std::uint32_t {
+    return std::visit(
+        [](const auto& op) -> std::uint32_t {
+          using T = std::decay_t<decltype(op)>;
+          if constexpr (std::is_same_v<T, physical::Scan> || std::is_same_v<T, physical::PointGet>) {
+            return op.table;
+          } else if constexpr (std::is_same_v<T, physical::NullSplitScan>) {
+            return op.present.table;
+          } else if constexpr (std::is_same_v<T, physical::Choice>) {
+            return inner_table(*op.below);
+          } else if constexpr (requires { op.input; }) {
+            return inner_table(*op.input);
+          } else {
+            throw std::logic_error{"physical plan: a nested loop's inner side reads no one table"};
+          }
+        },
+        n.op);
+  }
+
+  // Left outer: the inner row where its key has no NULL part, the table
+  // holds it and every match conjunct holds of the pair; else the null row.
+  // The outer row is never dropped.
+  void outer_index_join(const physical::IndexJoin& j, const Consume& k) {
+    const auto nr = null_row(j.inner);
+    produce(*j.outer, [&] {
+      const auto d = std::to_string(rows_.size());
+      const auto row = "row" + d;
+      const auto found = "found" + d;
+      std::vector<KeySrc> parts;
+      std::string nulls;
+      for (const auto& e : j.inner_key) {
+        if (e.kind == Expr::Kind::Param) {
+          parts.push_back({e.param, {}, PhysType::I64});
+          nulls += (nulls.empty() ? "" : " || ") + param_null(e.param);
+          continue;
+        }
+        if (e.col.nullable) nulls += (nulls.empty() ? "" : " || ") + col_null(e.col);
+        parts.push_back({std::nullopt, read_col(e.col), e.col.type});
+      }
+      w_.reads(j.inner);
+      w_.line("bool " + found + " = false;");
+      w_.line("bc_view " + row + " = bc_empty(cx);");
+      // A NULL part, or a value too long for any key, names no row: the key
+      // is built only without one, and the outer row goes on either way.
+      if (!nulls.empty()) w_.open("if (!(" + nulls + "))");
+      std::string fits;
+      auto inner_key = key(w_, j.inner, parts, false, &fits);
+      w_.line((fits.empty() ? "" : "if (" + fits + ") ") + row + " = bc_get(cx, " + inner_key + ", &" + found + ");");
+      if (!nulls.empty()) w_.close();
+      rows_.push_back({j.inner, row});
+      auto matched = found;
+      for (const auto& c : j.match) matched += " && !(" + fails(c) + ")";
+      w_.line("if (!(" + matched + ")) " + row + " = " + nr + ";");
+      k();
+      rows_.pop_back();
+    });
+  }
+
   void produce(const physical::IndexJoin& j, const Consume& k) {
+    if (j.left_outer) {
+      outer_index_join(j, k);
+      return;
+    }
     produce(*j.outer, [&] {
       const auto d = std::to_string(rows_.size());
       const auto row = "row" + d;
@@ -846,15 +1056,40 @@ private:
   // The outer side's row, then, if it has one, the inner scan's loop: its
   // row is row<d>, as an index join's. Inside an outer loop, its cursor is
   // c<d>, so the outer one's stays in reach.
+  // Left outer: m<d> says whether the inner side gave a row for the outer
+  // one, its filters the join's ON; where it gave none, or its guard's
+  // parameters hold a NULL, the outer row once more, joined to the null row.
   void produce(const physical::NestedLoop& j, const Consume& k) {
     const auto outer_loops = loops(*j.outer);
+    const auto table = j.left_outer ? inner_table(*j.inner) : 0;
+    const auto nr = j.left_outer ? null_row(table) : std::string{};
     produce(*j.outer, [&] {
       const auto d = std::to_string(rows_.size());
       auto outer_row = std::exchange(row_name_, "row" + d);
       auto outer_cursor = outer_loops ? std::exchange(cursor_, "c" + d) : cursor_;
-      produce(*j.inner, k);
+      if (!j.left_outer) {
+        produce(*j.inner, k);
+        row_name_ = outer_row;
+        cursor_ = outer_cursor;
+        return;
+      }
+      const auto m = "m" + d;
+      w_.line("bool " + m + " = false;");
+      std::string guard;
+      for (auto p : j.guard) guard += (guard.empty() ? "" : " || ") + param_null(p);
+      if (!guard.empty()) w_.open("if (!(" + guard + "))");
+      produce(*j.inner, [&] {
+        w_.line(m + " = true;");
+        k();
+      });
+      if (!guard.empty()) w_.close();
       row_name_ = outer_row;
       cursor_ = outer_cursor;
+      w_.open("if (!" + m + ")");
+      rows_.push_back({table, nr});
+      k();
+      rows_.pop_back();
+      w_.close();
     });
   }
 
@@ -1045,7 +1280,7 @@ private:
       return;
     }
     w_.line("int64_t n = 0;");
-    limit_ = "n < " + std::to_string(l.n);
+    limit_ = (base_limit_.empty() ? "" : base_limit_ + " && ") + "n < " + std::to_string(l.n);
     produce(*l.input, [&] {
       k();
       w_.line("++n;");
@@ -1057,6 +1292,27 @@ private:
   // *Isolation*).
   void produce(const physical::Emit& e, const Consume&) {
     produce(*e.input, [&] {
+      // Each expression first, in the row in hand: an error it raises is
+      // sticky, so the row is never half written.
+      std::vector<Val> computed(e.targets.size());
+      for (std::size_t i = 0; i < e.targets.size(); ++i) {
+        if (const auto* x = std::get_if<physical::ExprTarget>(&e.targets[i])) computed[i] = eval(x->expr);
+      }
+      if (sink_ != nullptr) {
+        Row row;
+        for (std::size_t i = 0; i < e.targets.size(); ++i) {
+          if (const auto* p = std::get_if<physical::ParamTarget>(&e.targets[i])) {
+            row.push_back({param_null(p->param), param(p->type, p->param), p->type});
+          } else if (std::holds_alternative<physical::ExprTarget>(e.targets[i])) {
+            row.push_back({computed[i].null.empty() ? "0" : computed[i].null, computed[i].value, computed[i].type});
+          } else {
+            const auto& c = std::get<ColumnRef>(e.targets[i]);
+            row.push_back({col_null(c), read_col(c), c.type});
+          }
+        }
+        (*sink_)(w_, row);
+        return;
+      }
       if (rows_.size() == 1 && rows_[0].covering) {
         // Every result column from the entry's key: no row read.
         const auto& b = rows_[0];
@@ -1064,12 +1320,14 @@ private:
           w_.line("bc_view key = bc_scan_key(cx, " + b.cursor + ");");
         }
         w_.line("bc_emit_begin(cx);");
-        for (const auto& t : e.targets) {
-          if (const auto* p = std::get_if<physical::ParamTarget>(&t)) {
+        for (std::size_t i = 0; i < e.targets.size(); ++i) {
+          if (const auto* p = std::get_if<physical::ParamTarget>(&e.targets[i])) {
             emit_param(*p);
-            continue;
+          } else if (std::holds_alternative<physical::ExprTarget>(e.targets[i])) {
+            emit_val(computed[i]);
+          } else {
+            w_.line("bc_emit_key_part(cx, " + w_.obj(b.object) + ", key, " + w_.part(b.object, std::get<ColumnRef>(e.targets[i])) + ");");
           }
-          w_.line("bc_emit_key_part(cx, " + w_.obj(b.object) + ", key, " + w_.part(b.object, std::get<ColumnRef>(t)) + ");");
         }
         w_.line("bc_emit_end(cx);");
         return;
@@ -1078,12 +1336,16 @@ private:
         if (b.for_update) w_.line("bc_guard_row(cx, " + w_.tbl(b.table) + ", " + b.row + ");");
       }
       w_.line("bc_emit_begin(cx);");
-      for (const auto& target : e.targets) {
-        if (const auto* p = std::get_if<physical::ParamTarget>(&target)) {
+      for (std::size_t i = 0; i < e.targets.size(); ++i) {
+        if (const auto* p = std::get_if<physical::ParamTarget>(&e.targets[i])) {
           emit_param(*p);
           continue;
         }
-        const auto& t = std::get<ColumnRef>(target);
+        if (std::holds_alternative<physical::ExprTarget>(e.targets[i])) {
+          emit_val(computed[i]);
+          continue;
+        }
+        const auto& t = std::get<ColumnRef>(e.targets[i]);
         if (const auto& b = binding(t.table); b.covering) {
           w_.line("bc_emit_key_part(cx, " + key_part(b, t) + ";");
         } else {
@@ -1092,6 +1354,237 @@ private:
       }
       w_.line("bc_emit_end(cx);");
     });
+  }
+
+  // ---------------------------------------------------- expressions over columns
+
+  // The value of e for the rows in hand, in C: NULL (empty: never) and the
+  // value (garbage where it is NULL). Printed as it goes: an operator's
+  // result is a local, so each operand is evaluated once however deep the
+  // tree; AND and OR evaluate an operand only while the result is open, as
+  // PostgreSQL does left to right, so a guard such as `b <> 0 AND a / b > 1`
+  // raises no error. Integer and DECIMAL arithmetic is the plan API's
+  // checked helpers: an overflow is 22003, a zero divisor 22012. A DECIMAL is
+  // an int64_t at the scale of its type, operands brought to a common scale
+  // by a power of ten the binder has kept within 18 digits.
+  auto eval(const Expr& e) -> Val {
+    switch (e.kind) {
+      case Expr::Kind::Column: return {e.col.nullable ? col_null(e.col) : "", read_col(e.col), e.col.type};
+      case Expr::Kind::Param: return {param_null(e.param), param(e.phys(), e.param), e.phys()};
+      case Expr::Kind::Const: return {"", e.phys() == PhysType::Bool ? (e.constant != 0 ? "1" : "0") : constant(e.constant), e.phys()};
+      case Expr::Kind::Add:
+      case Expr::Kind::Sub:
+      case Expr::Kind::Mul:
+      case Expr::Kind::Div: return eval_arithmetic(e);
+      case Expr::Kind::Compare: return eval_compare(e);
+      case Expr::Kind::IsNull: {
+        auto v = eval(e.args[0]);
+        return {"", v.null.empty() ? "0" : "(" + v.null + ")", PhysType::Bool};
+      }
+      case Expr::Kind::Not: {
+        auto v = eval(e.args[0]);
+        return {v.null, "!(" + v.value + ")", PhysType::Bool};
+      }
+      case Expr::Kind::And:
+      case Expr::Kind::Or: return eval_connective(e);
+      case Expr::Kind::Case: return eval_case(e);
+      case Expr::Kind::Coalesce: return eval_coalesce(e);
+      case Expr::Kind::Aggregate:
+      case Expr::Kind::Like:
+      case Expr::Kind::Truth:
+      case Expr::Kind::InSet: break;
+    }
+    throw std::logic_error{"physical plan: an expression over columns codegen does not print"};
+  }
+
+  [[nodiscard]] static auto either(const std::string& a, const std::string& b) -> std::string {
+    return a.empty() ? b : b.empty() ? a : a + " || " + b;
+  }
+
+  // `v` of type `from` at `scale`, a finer one: times a power of ten.
+  static auto at_scale(const Val& v, SqlType from, int scale) -> std::string {
+    auto up = scale - decimal_scale(from);
+    if (up == 0) return v.value;
+    std::int64_t factor = 1;
+    for (auto i = 0; i < up; ++i) factor *= 10;
+    return "bc_mul(cx, " + v.value + ", " + constant(factor) + ")";
+  }
+
+  auto eval_arithmetic(const Expr& e) -> Val {
+    auto a = eval(e.args[0]);
+    auto b = eval(e.args[1]);
+    auto additive = e.kind == Expr::Kind::Add || e.kind == Expr::Kind::Sub;
+    // A sum is taken at the result's scale; a product or quotient of the
+    // operands' own.
+    auto scale = decimal_scale(e.type);
+    auto x = additive ? at_scale(a, e.args[0].type, scale) : a.value;
+    auto y = additive ? at_scale(b, e.args[1].type, scale) : b.value;
+    // A BIGINT sum fails with that type's range error; a SMALLINT or INTEGER
+    // result is checked against its own range, as PostgreSQL's operators of
+    // those types are (the operands are held in 64 bits, so these cannot
+    // overflow first). The object a range error names is none.
+    std::string call;
+    switch (e.kind) {
+      case Expr::Kind::Add:
+      case Expr::Kind::Sub: {
+        auto fn = std::string{e.kind == Expr::Kind::Add ? "bc_add" : "bc_sub"};
+        call = e.type.kind == SqlKind::BigInt ? fn + "_bigint(cx, " + x + ", " + y + ", 0)" : fn + "(cx, " + x + ", " + y + ")";
+        break;
+      }
+      case Expr::Kind::Mul: call = "bc_mul(cx, " + x + ", " + y + ")"; break;
+      case Expr::Kind::Div: call = "bc_div(cx, " + x + ", " + y + ")"; break;
+      case Expr::Kind::Column:
+      case Expr::Kind::Param:
+      case Expr::Kind::Const:
+      case Expr::Kind::Compare:
+      case Expr::Kind::Aggregate:
+      case Expr::Kind::And:
+      case Expr::Kind::Or:
+      case Expr::Kind::Not:
+      case Expr::Kind::IsNull:
+      case Expr::Kind::Like:
+      case Expr::Kind::Truth:
+      case Expr::Kind::InSet:
+      case Expr::Kind::Case:
+      case Expr::Kind::Coalesce: throw std::logic_error{"physical plan: not an arithmetic expression"};
+    }
+    if (e.type.kind == SqlKind::SmallInt || e.type.kind == SqlKind::Integer) {
+      call = "bc_check_int(cx, " + call + ", " + (e.type.kind == SqlKind::SmallInt ? "BC_SMALLINT" : "BC_INTEGER") + ", 0)";
+    }
+    return guarded("int64_t", "0", either(a.null, b.null), call, PhysType::I64);
+  }
+
+  // A local `type v = fallback`, set to `value` unless `null`; the Val of
+  // the local and the NULL test, evaluated once.
+  auto guarded(const std::string& ctype, const std::string& fallback, const std::string& null, const std::string& value,
+               PhysType type) -> Val {
+    auto id = std::to_string(exprs_++);
+    w_.line(ctype + " v" + id + " = " + fallback + ";");
+    if (null.empty()) {
+      w_.line("v" + id + " = " + value + ";");
+      return {"", "v" + id, type};
+    }
+    w_.line("bool n" + id + " = " + null + ";");
+    w_.open("if (!n" + id + ")");
+    w_.line("v" + id + " = " + value + ";");
+    w_.close();
+    return {"n" + id, "v" + id, type};
+  }
+
+  // A comparison as a value: NULL if an operand is. Numbers meet at the
+  // finer scale, text and bytes compare as bytes (COLLATE "C").
+  auto eval_compare(const Expr& e) -> Val {
+    auto a = eval(e.args[0]);
+    auto b = eval(e.args[1]);
+    const auto& lt = e.args[0].type;
+    const auto& rt = e.args[1].type;
+    auto scale = std::max(decimal_scale(lt), decimal_scale(rt));
+    auto x = at_scale(a, lt, scale);
+    auto y = at_scale(b, rt, scale);
+    auto cmp = a.type == PhysType::Bytes ? "bc_bytes_cmp(cx, " + x + ", " + y + ") " + op_text(e.op) + " 0"
+                                         : x + " " + op_text(e.op) + " " + y;
+    return guarded("bool", "0", either(a.null, b.null), cmp, PhysType::Bool);
+  }
+
+  // AND and OR in SQL's three-valued logic, an operand evaluated only while
+  // no earlier one has settled the result (false for AND, true for OR).
+  auto eval_connective(const Expr& e) -> Val {
+    auto id = std::to_string(exprs_++);
+    auto is_and = e.kind == Expr::Kind::And;
+    w_.line("bool d" + id + " = 0;");
+    w_.line("bool n" + id + " = 0;");
+    for (const auto& arg : e.args) {
+      w_.open("if (!d" + id + ")");
+      auto v = eval(arg);
+      auto settles = is_and ? "!(" + v.value + ")" : v.value;
+      if (v.null.empty()) {
+        w_.line("if (" + settles + ") d" + id + " = 1;");
+      } else {
+        w_.line("if (" + v.null + ") n" + id + " = 1; else if (" + settles + ") d" + id + " = 1;");
+      }
+      w_.close();
+    }
+    w_.line("n" + id + " = n" + id + " && !d" + id + ";");
+    return {"n" + id, is_and ? "!d" + id : "d" + id, PhysType::Bool};
+  }
+
+  // The result of a CASE or COALESCE: a local, NULL until a branch gives a
+  // value (so a CASE no WHEN takes and has no ELSE is NULL).
+  auto open_result(const Expr& e) -> std::string {
+    auto id = std::to_string(exprs_++);
+    switch (e.phys()) {
+      case PhysType::I64: w_.line("int64_t v" + id + " = 0;"); break;
+      case PhysType::F64: w_.line("double v" + id + " = 0;"); break;
+      case PhysType::Bool: w_.line("bool v" + id + " = 0;"); break;
+      case PhysType::Bytes: w_.line("bc_view v" + id + "; v" + id + ".i = 0; v" + id + ".g = 0;"); break;
+    }
+    w_.line("bool n" + id + " = 1;");
+    return id;
+  }
+
+  // A branch's value as the result: at the result's scale if both are
+  // numerics, and NULL as NULL. Printed only inside the branch's own block,
+  // so an error the branch raises is raised only when it is taken.
+  void take(const std::string& id, const Expr& result, const Expr& branch) {
+    auto v = eval(branch);
+    auto value = result.type.kind == SqlKind::Decimal ? at_scale(v, branch.type, decimal_scale(result.type)) : v.value;
+    if (v.null.empty()) {
+      w_.line("n" + id + " = 0;");
+      w_.line("v" + id + " = " + value + ";");
+      return;
+    }
+    w_.line("n" + id + " = " + v.null + ";");
+    w_.open("if (!n" + id + ")");
+    w_.line("v" + id + " = " + value + ";");
+    w_.close();
+  }
+
+  // CASE: each WHEN is evaluated only while no earlier one was true, its
+  // THEN only when its WHEN is. A NULL condition is not true.
+  auto eval_case(const Expr& e) -> Val {
+    auto id = open_result(e);
+    w_.line("bool d" + id + " = 0;");
+    for (std::size_t i = 0; i + 1 < e.args.size(); i += 2) {
+      w_.open("if (!d" + id + ")");
+      auto c = eval(e.args[i]);
+      w_.open("if (" + (c.null.empty() ? c.value : "!(" + c.null + ") && " + c.value) + ")");
+      w_.line("d" + id + " = 1;");
+      take(id, e, e.args[i + 1]);
+      w_.close();
+      w_.close();
+    }
+    if (e.args.size() % 2 == 1) {
+      w_.open("if (!d" + id + ")");
+      take(id, e, e.args.back());
+      w_.close();
+    }
+    return {"n" + id, "v" + id, e.phys()};
+  }
+
+  // COALESCE: each argument is evaluated only while the ones before it are
+  // NULL.
+  auto eval_coalesce(const Expr& e) -> Val {
+    auto id = open_result(e);
+    for (const auto& arg : e.args) {
+      w_.open("if (n" + id + ")");
+      take(id, e, arg);
+      w_.close();
+    }
+    return {"n" + id, "v" + id, e.phys()};
+  }
+
+  // A computed value as a result column, NULL as NULL.
+  void emit_val(const Val& v) {
+    auto emit = "bc_emit_" + suffix(v.type) + "(cx, " + v.value + ");";
+    if (v.null.empty()) {
+      w_.line(emit);
+      return;
+    }
+    w_.open("if (" + v.null + ")");
+    w_.line("bc_emit_null(cx);");
+    w_.otherwise();
+    w_.line(emit);
+    w_.close();
   }
 
   // A parameter as a result column, NULL as NULL.
@@ -1296,7 +1789,8 @@ private:
     auto count = e.fn == Expr::Fn::Count;
     if (g.op->streamed) return {count ? "" : "!" + local("xs", g, j), local("x", g, j)};
     auto slot = std::to_string(g.layout.agg_slot[j]);
-    return {count ? "" : "bc_agg_null(cx, " + g.handle + ", " + slot + ")", "bc_agg_i64(cx, " + g.handle + ", " + slot + ")"};
+    return {count ? "" : "bc_agg_null(cx, " + g.handle + ", " + slot + ")",
+            std::string{folds_f64(e) ? "bc_agg_f64" : "bc_agg_i64"} + "(cx, " + g.handle + ", " + slot + ")"};
   }
 
   // Whether the group fails a HAVING conjunct, as C: NULL on either side, or
@@ -1333,20 +1827,25 @@ private:
       } else {
         auto slot = g.layout.agg_slot[j];
         is_null = "bc_agg_null(cx, " + g.handle + ", " + std::to_string(slot) + ")";
-        sum = "bc_agg_i64(cx, " + g.handle + ", " + std::to_string(slot) + ")";
+        sum = std::string{folds_f64(e) ? "bc_agg_f64" : "bc_agg_i64"} + "(cx, " + g.handle + ", " + std::to_string(slot) + ")";
         count = "bc_agg_i64(cx, " + g.handle + ", " + std::to_string(slot + 1) + ")";
       }
       w_.open("if (" + is_null + ")");
       w_.line("bc_emit_null(cx);");
-      w_.line("bc_emit_null(cx);");
+      if (!folds_f64(e)) w_.line("bc_emit_null(cx);");
       w_.otherwise();
-      w_.line("bc_emit_i64(cx, " + sum + ");");
-      w_.line("bc_emit_i64(cx, " + count + ");");
+      if (folds_f64(e)) {
+        // PostgreSQL's float8 average: the sum over the count.
+        w_.line("bc_emit_f64(cx, " + sum + " / bc_i64_to_f64(" + count + "));");
+      } else {
+        w_.line("bc_emit_i64(cx, " + sum + ");");
+        w_.line("bc_emit_i64(cx, " + count + ");");
+      }
       w_.close();
       return;
     }
     auto [is_null, value] = group_value(e);
-    auto type = e.kind == Expr::Kind::Column ? e.col.type : PhysType::I64;
+    auto type = e.kind == Expr::Kind::Column ? e.col.type : folds_f64(e) ? PhysType::F64 : PhysType::I64;
     auto emit = "bc_emit_" + suffix(type) + "(cx, " + value + ");";
     if (is_null.empty()) {
       w_.line(emit);
@@ -1451,33 +1950,59 @@ private:
     w_.line("bc_agg_count(cx, " + gg + ", 0);");
     for (std::size_t j = 0; j < op.aggs.size(); ++j) {
       const auto& a = op.aggs[j];
-      if (a.args.empty()) continue;  // COUNT(*): slot 0
+      if (a.args.empty() || a.distinct) continue;  // COUNT(*): slot 0
       const auto& arg = a.args[0].col;
-      const auto slot = std::to_string(g.layout.agg_slot[j]);
       if (arg.nullable) w_.open("if (!" + col_null(arg) + ")");
-      if (a.distinct) {
-        distinct_value(g, arg, gr, "bc_agg_count(cx, " + gg + ", " + slot + ");");
-      } else {
-        switch (a.fn) {
-          case Expr::Fn::Count: w_.line("bc_agg_count(cx, " + gg + ", " + slot + ");"); break;
-          case Expr::Fn::Sum: w_.line("bc_agg_add_i64(cx, " + gg + ", " + slot + ", " + read_col(arg) + ");"); break;
-          case Expr::Fn::Min: w_.line("bc_agg_min_i64(cx, " + gg + ", " + slot + ", " + read_col(arg) + ");"); break;
-          case Expr::Fn::Max: w_.line("bc_agg_max_i64(cx, " + gg + ", " + slot + ", " + read_col(arg) + ");"); break;
-          case Expr::Fn::Avg:
-            w_.line("bc_agg_add_i64(cx, " + gg + ", " + slot + ", " + read_col(arg) + ");");
-            w_.line("bc_agg_count(cx, " + gg + ", " + std::to_string(g.layout.agg_slot[j] + 1) + ");");
-            break;
-        }
+      for (const auto& line : structure_fold(g, j, gg)) w_.line(line);
+      if (arg.nullable) w_.close();
+    }
+    for (std::size_t m = 0; m < g.layout.distinct.size(); ++m) {
+      const auto& arg = g.layout.distinct[m];
+      std::vector<std::string> folds;
+      for (std::size_t j = 0; j < op.aggs.size(); ++j) {
+        if (!op.aggs[j].distinct || op.aggs[j].args[0].col != arg) continue;
+        for (auto& line : structure_fold(g, j, gg)) folds.push_back(std::move(line));
       }
+      if (arg.nullable) w_.open("if (!" + col_null(arg) + ")");
+      distinct_value(g, arg, gr, folds);
       if (arg.nullable) w_.close();
     }
   }
 
-  // A COUNT(DISTINCT) of `arg` in the group in hand: its value, keyed in the
-  // argument's structure d<i>_<m>; in a structure after the group's key
-  // `group_key`, streamed alone, since the stream clears d<i>_<m> as each
-  // group ends. `counted` runs when the value is new to the group.
-  void distinct_value(const Group& g, const ColumnRef& arg, const std::string& group_key, const std::string& counted) {
+  // Whether the aggregate folds doubles: a SUM, AVG, MIN or MAX of a DOUBLE.
+  static auto folds_f64(const Expr& a) -> bool {
+    return a.fn != Expr::Fn::Count && !a.args.empty() && a.args[0].col.type == PhysType::F64;
+  }
+
+  // The statements folding the row in hand's argument of aggregate j into
+  // its slots of group `gg`.
+  auto structure_fold(const Group& g, std::size_t j, const std::string& gg) -> std::vector<std::string> {
+    const auto& a = g.op->aggs[j];
+    const auto& arg = a.args[0].col;
+    const auto slot = std::to_string(g.layout.agg_slot[j]);
+    const auto at = "(cx, " + gg + ", " + slot + ", " + read_col(arg) + ");";
+    const auto f64 = folds_f64(a);
+    switch (a.fn) {
+      case Expr::Fn::Count: return {"bc_agg_count(cx, " + gg + ", " + slot + ");"};
+      case Expr::Fn::Sum: return {std::string{f64 ? "bc_agg_add_f64" : "bc_agg_add_i64"} + at};
+      case Expr::Fn::Min: return {std::string{f64 ? "bc_agg_min_f64" : "bc_agg_min_i64"} + at};
+      case Expr::Fn::Max: return {std::string{f64 ? "bc_agg_max_f64" : "bc_agg_max_i64"} + at};
+      case Expr::Fn::Avg:
+        return {std::string{f64 ? "bc_agg_add_f64" : "bc_agg_add_i64"} + at,
+                "bc_agg_count(cx, " + gg + ", " + std::to_string(g.layout.agg_slot[j] + 1) + ");"};
+    }
+    std::unreachable();
+  }
+
+  // The aggregates of DISTINCT values over `arg` in the group in hand: its
+  // value, keyed in the argument's structure d<i>_<m>; in a structure after
+  // the group's key `group_key`, streamed alone, since the stream clears
+  // d<i>_<m> as each group ends. `folds` run when the value is new to the
+  // group, all the aggregates over `arg` at once. The structure grows by a
+  // key per distinct value per group and is charged to the statement's
+  // memory budget like a group: past it the statement fails with 54000.
+  void distinct_value(const Group& g, const ColumnRef& arg, const std::string& group_key,
+                      const std::vector<std::string>& folds) {
     auto m = static_cast<std::size_t>(std::ranges::find(g.layout.distinct, arg) - g.layout.distinct.begin());
     const auto dk = local("dk", g, m);
     const auto dg = local("dg", g, m);
@@ -1487,7 +2012,7 @@ private:
     w_.line("bc_group " + dg + " = bc_agg_group(cx, " + local("d", g, m) + ", bc_sort_key_end(cx, " + dk + "));");
     w_.open("if (bc_agg_null(cx, " + dg + ", 0))");
     w_.line("bc_agg_count(cx, " + dg + ", 0);");
-    w_.line(counted);
+    for (const auto& f : folds) w_.line(f);
     w_.close();
   }
 
@@ -1502,7 +2027,7 @@ private:
       }
     }
     for (std::size_t m = 0; m < g.layout.distinct.size(); ++m) {
-      w_.line("bc_agg " + local("d", g, m) + " = bc_agg_open(cx, 1);  // COUNT(DISTINCT) values seen per group");
+      w_.line("bc_agg " + local("d", g, m) + " = bc_agg_open(cx, 1);  // DISTINCT values seen per group");
     }
   }
 
@@ -1538,7 +2063,7 @@ private:
   // so the group is kept in locals, given (k) inside the input's loop when a
   // row of another group starts the next, and after it for the last. Each
   // dependent column is read from every row and kept as a key is: every row
-  // of a group holds the same value. A COUNT(DISTINCT)'s values are cleared as
+  // of a group holds the same value. An aggregate's distinct values are cleared as
   // each group ends: the stream holds only the group in hand's. With no key,
   // one group, given after the input, over no rows too. A LIMIT's counter is
   // the input loop's, and the last group's.
@@ -1554,7 +2079,7 @@ private:
     auto reset = [&](bool declare) {
       for (std::size_t j = 0; j < op.aggs.size(); ++j) {
         const auto& a = op.aggs[j];
-        w_.line((declare ? "int64_t " : "") + local("x", g, j) + " = 0;");
+        w_.line((declare ? (folds_f64(a) ? "double " : "int64_t ") : "") + local("x", g, j) + " = 0;");
         if (a.fn != Expr::Fn::Count) w_.line((declare ? "bool " : "") + local("xs", g, j) + " = false;");
         if (a.fn == Expr::Fn::Avg) w_.line((declare ? "int64_t " : "") + local("xc", g, j) + " = 0;");
       }
@@ -1618,6 +2143,37 @@ private:
     w_.close();
   }
 
+  // The statements folding the row in hand's argument of aggregate j into
+  // the streamed group's locals: x<j> the count, sum, minimum or maximum,
+  // xs<j> whether a value was folded, xc<j> an AVG's count.
+  auto local_fold(const Group& g, std::size_t j) -> std::vector<std::string> {
+    const auto& a = g.op->aggs[j];
+    const auto& arg = a.args[0].col;
+    const auto x = local("x", g, j);
+    const auto xs = local("xs", g, j);
+    const auto v = read_col(arg);
+    const auto f64 = folds_f64(a);
+    auto sum = x + " = " + (f64 ? "bc_add_f64" : "bc_add") + "(cx, " + x + ", " + v + ");";
+    switch (a.fn) {
+      case Expr::Fn::Count: return {"++" + x + ";"};
+      case Expr::Fn::Sum: return {sum, xs + " = true;"};
+      case Expr::Fn::Min:
+      case Expr::Fn::Max: {
+        const auto lv = local("v", g, j);
+        if (f64) {
+          auto pick = std::string{a.fn == Expr::Fn::Min ? "bc_min_f64" : "bc_max_f64"};
+          return {"double " + lv + " = " + v + ";", x + " = " + xs + " ? " + pick + "(" + x + ", " + lv + ") : " + lv + ";",
+                  xs + " = true;"};
+        }
+        return {"int64_t " + lv + " = " + v + ";",
+                "if (!" + xs + " || " + lv + (a.fn == Expr::Fn::Min ? " < " : " > ") + x + ") " + x + " = " + lv + ";",
+                xs + " = true;"};
+      }
+      case Expr::Fn::Avg: return {sum, xs + " = true;", "++" + local("xc", g, j) + ";"};
+    }
+    std::unreachable();
+  }
+
   // The row in hand folded into the streamed group's locals. NULLs are
   // skipped.
   void fold_into_locals(const Group& g) {
@@ -1634,38 +2190,25 @@ private:
     }
     for (std::size_t j = 0; j < op.aggs.size(); ++j) {
       const auto& a = op.aggs[j];
-      const auto x = local("x", g, j);
-      const auto xs = local("xs", g, j);
       if (a.args.empty()) {
-        w_.line("++" + x + ";");  // COUNT(*)
+        w_.line("++" + local("x", g, j) + ";");  // COUNT(*)
         continue;
       }
+      if (a.distinct) continue;
       const auto& arg = a.args[0].col;
       if (arg.nullable) w_.open("if (!" + col_null(arg) + ")");
-      if (a.distinct) {
-        distinct_value(g, arg, "", "++" + x + ";");
-      } else {
-        switch (a.fn) {
-          case Expr::Fn::Count: w_.line("++" + x + ";"); break;
-          case Expr::Fn::Sum:
-            w_.line(x + " = bc_add(cx, " + x + ", " + read_col(arg) + ");");
-            w_.line(xs + " = true;");
-            break;
-          case Expr::Fn::Min:
-          case Expr::Fn::Max: {
-            const auto v = local("v", g, j);
-            w_.line("int64_t " + v + " = " + read_col(arg) + ";");
-            w_.line("if (!" + xs + " || " + v + (a.fn == Expr::Fn::Min ? " < " : " > ") + x + ") " + x + " = " + v + ";");
-            w_.line(xs + " = true;");
-            break;
-          }
-          case Expr::Fn::Avg:
-            w_.line(x + " = bc_add(cx, " + x + ", " + read_col(arg) + ");");
-            w_.line(xs + " = true;");
-            w_.line("++" + local("xc", g, j) + ";");
-            break;
-        }
+      for (const auto& line : local_fold(g, j)) w_.line(line);
+      if (arg.nullable) w_.close();
+    }
+    for (std::size_t m = 0; m < g.layout.distinct.size(); ++m) {
+      const auto& arg = g.layout.distinct[m];
+      std::vector<std::string> folds;
+      for (std::size_t j = 0; j < op.aggs.size(); ++j) {
+        if (!op.aggs[j].distinct || op.aggs[j].args[0].col != arg) continue;
+        for (auto& line : local_fold(g, j)) folds.push_back(std::move(line));
       }
+      if (arg.nullable) w_.open("if (!" + col_null(arg) + ")");
+      distinct_value(g, arg, "", folds);
       if (arg.nullable) w_.close();
     }
     keyed_ = nullptr;
@@ -1733,6 +2276,26 @@ private:
     return out;
   }
 
+  // Ends the row `r` and writes it with `call` + the row + ");". With
+  // CHECK constraints the row is first tested: each is evaluated over the
+  // row as written, and one that is false (not NULL) raises 23514 before
+  // anything is written, so a refused row leaves no index entry.
+  void write_checked(std::uint32_t table, const std::vector<Expr>& checks, const std::string& call) {
+    if (checks.empty()) {
+      w_.line(call + "bc_row_end(cx, r));");
+      return;
+    }
+    w_.line("bc_view nr = bc_row_end(cx, r);");
+    auto outer = std::exchange(rows_, std::vector<Binding>{{table, "nr"}});
+    for (const auto& c : checks) {
+      auto v = eval(c);
+      auto unknown = v.null.empty() ? std::string{} : "!(" + v.null + ") && ";
+      w_.line("if (" + unknown + "!(" + v.value + ")) bc_raise(cx, BC_C_CHECK, " + std::to_string(table) + ");");
+    }
+    rows_ = std::move(outer);
+    w_.line(call + "nr);");
+  }
+
   void produce(const physical::Insert& s, const Consume&) {
     // bc_row_begin sets every column to its default; a column not given keeps
     // it. The runtime checks the keys and writes the index entries.
@@ -1740,7 +2303,7 @@ private:
     for (const auto& [col, e] : s.values) {
       w_.line("bc_row_set_param(cx, r, " + w_.col(col) + ", " + std::to_string(e.param) + ");");
     }
-    w_.line("bc_insert(cx, " + w_.tbl(s.table) + ", bc_row_end(cx, r));");
+    write_checked(s.table, s.checks, "bc_insert(cx, " + w_.tbl(s.table) + ", ");
     w_.line("bc_emit_count(cx, 1);");
   }
 
@@ -1770,7 +2333,7 @@ private:
       w_.line("bc_row r = bc_row_from(cx, " + w_.tbl(s.table) + ", old);");
       for (const auto& [col, e] : s.set) set(col, e);
       // The runtime moves the index entries whose keys changed.
-      w_.line("bc_update(cx, " + w_.tbl(s.table) + ", old, bc_row_end(cx, r));");
+      write_checked(s.table, s.checks, "bc_update(cx, " + w_.tbl(s.table) + ", old, ");
     });
   }
 
@@ -1827,10 +2390,15 @@ private:
   const Binding* keyed_{nullptr};  // the covering scan whose entry the row has bound as `key`, or null
   bool loop_{false};             // inside a loop: a miss is `continue`
   std::string limit_;            // a LIMIT's condition, n < its count, or empty
+  const Sink* sink_{nullptr};    // an arm of a set operation: where its result rows go
+  std::string base_limit_;       // an arm's: the statement's LIMIT, which every loop of the arm also stops at
+  int open_{0};                  // an arm's: the `if` blocks its misses opened
+  int exprs_{0};                 // the locals the expressions over columns printed: v<i>, n<i>, d<i>
   std::string* hit_{nullptr};    // a one-row aggregate: a miss joins this condition instead
   int choices_{0};               // the choice points printed: each counts into count<i>, over lo<i> and hi<i>
   int sorts_{0};                 // the sorts printed: each into sorter s<i>, its row p<i>
   int hashes_{0};                // the hash joins printed: each into table h<i>, its row b<i>
+  int nulls_{0};                 // the outer joins printed: each's null row nr<i>
   int groups_{0};                // the grouped aggregates printed: each into a<i>, its group g<i>
   const Group* group_{nullptr};  // the group in hand, for a grouped aggregate's consumer
   std::string cursor_{"c"};      // the cursor a scan opens
@@ -1842,6 +2410,331 @@ private:
   std::map<const physical::Scan*, Counted> counted_;
 };
 
+// Prints a set operation (docs/planner_design.md, *Set operations*). Each
+// arm is printed as its own SELECT, in a block of the plan's one function,
+// and the rows it gives go to a sink that does the operation's part: they
+// are not collected, so the plan holds only what telling duplicates apart
+// needs, a bc_agg of the rows' keys (a sort key of every column, NULL equal
+// to NULL) with a count or two per key. UNION ALL holds nothing. UNION
+// streams both arms through a set of the keys seen. INTERSECT and EXCEPT
+// stream the arm whose rows can be returned, after the other's keys are in
+// the aggregate with how many rows had each; a row is returned while the
+// count of the rows it matched is not used up (ALL), or once (DISTINCT).
+class SetGen {
+public:
+  SetGen(Writer& w, const physical::Plan& p) : w_{w}, p_{p} {}
+
+  void plan() {
+    Gen{w_}.subqueries();
+    const auto& limit = p_.set_limit;
+    if (limit && *limit == 0) return;  // LIMIT 0 returns nothing, so nothing is read
+    if (!p_.set_order.empty()) {
+      ordered(limit.value_or(0));
+      return;
+    }
+    if (limit) {
+      stop_ = "setcount < " + std::to_string(*limit);
+      w_.line("int64_t setcount = 0;");
+    }
+    stream(*p_.set, [&](Writer& w, const Row& row) {
+      if (limit) w.open("if (" + stop_ + ")");
+      emit(w, row);
+      if (limit) {
+        w.line("setcount = bc_add(cx, setcount, INT64_C(1));");
+        w.close();
+      }
+    }, true);
+  }
+
+private:
+  using Row = Gen::Row;
+  using Sink = Gen::Sink;
+  using Val = Gen::Val;
+
+  // ORDER BY of the combined rows. Every row the arms give is added to one
+  // sorter, as it is in hand: keyed by the ORDER BY columns, each with its
+  // direction and NULL placement, its payload a sort key of all the columns,
+  // each ascending, which the loop after the arms reads back part by part
+  // (bc_sort_key_part_*). A LIMIT is the sorter's `keep`: it holds the first n
+  // in order and no more, and every arm is read whole. Without one the sorter
+  // holds every row, charged to the statement's budget.
+  void ordered(std::int64_t keep) {
+    const auto sorter = fresh("s");
+    w_.line("bc_sorter " + sorter + " = bc_sorter_open(cx, " + std::to_string(keep) + ");");
+    stream(*p_.set, [this, sorter](Writer& w, const Row& row) { add_to_sorter(w, sorter, row); }, false);
+    const auto held = fresh("p");
+    w_.line("bc_view " + held + " = bc_empty(cx);");
+    w_.open("while (bc_sorter_next(cx, " + sorter + ", &" + held + "))");
+    Row row;
+    int part = 0;
+    for (const auto& t : p_.set->types) {
+      const auto type = phys_type(t);
+      const auto n = fresh("n");
+      const auto x = fresh("x");
+      const auto at = std::to_string(part++);
+      w_.line("bool " + n + " = bc_sort_key_part_null(cx, " + held + ", " + at + ");");
+      w_.line(c_type(type) + " " + x + " = " + zero(type) + ";");
+      w_.line("if (!" + n + ") " + x + " = bc_sort_key_part_" + suffix(type) + "(cx, " + held + ", " + at + ");");
+      if (type == PhysType::F64) {
+        const auto neg = std::to_string(part++);
+        w_.line("if (bc_sort_key_part_bool(cx, " + held + ", " + neg + ")) " + x + " *= -1.0;");
+      }
+      row.push_back({n, x, type});
+    }
+    emit(w_, row);
+    w_.close();
+  }
+
+  void add_to_sorter(Writer& w, const std::string& sorter, const Row& row) {
+    if (row.size() != p_.set->types.size()) {
+      throw std::logic_error{"physical plan: a set operation row of other columns than its types"};
+    }
+    auto part = [&](const std::string& key, const Val& v, const std::string& placed) {
+      w.open("if (" + v.null + ")");
+      w.line("bc_sort_key_null(cx, " + key + ", " + placed + ");");
+      w.otherwise();
+      w.line("bc_sort_key_" + suffix(v.type) + "(cx, " + key + ", " + v.value + ", " + placed + ");");
+      w.close();
+    };
+    const auto k = fresh("k");
+    w.line("bc_sort_key " + k + " = bc_sort_key_begin(cx);");
+    for (const auto& o : p_.set_order) {
+      part(k, row[o.column],
+           std::string{o.desc ? "BC_SORT_DESC" : "BC_SORT_ASC"} + ", " +
+               (o.nulls_first ? "BC_SORT_NULLS_FIRST" : "BC_SORT_NULLS_LAST"));
+    }
+    const auto key = fresh("v");
+    w.line("bc_view " + key + " = bc_sort_key_end(cx, " + k + ");");
+    const auto d = fresh("k");
+    w.line("bc_sort_key " + d + " = bc_sort_key_begin(cx);");
+    for (const auto& v : row) {
+      part(d, v, "BC_SORT_ASC, BC_SORT_NULLS_LAST");
+      // The key holds -0.0 as 0.0; the sign of a zero rides in a part of its own.
+      if (v.type == PhysType::F64) {
+        w.line("bc_sort_key_bool(cx, " + d + ", !" + v.null + " && " + v.value + " == 0.0 && 1.0 / " + v.value +
+               " < 0.0, BC_SORT_ASC, BC_SORT_NULLS_LAST);");
+      }
+    }
+    w.line("bc_sorter_add(cx, " + sorter + ", " + key + ", bc_sort_key_end(cx, " + d + "));");
+  }
+
+  auto fresh(const std::string& what) -> std::string { return "set" + what + std::to_string(ids_++); }
+
+  static auto zero(PhysType t) -> std::string {
+    switch (t) {
+      case PhysType::I64: return "INT64_C(0)";
+      case PhysType::F64: return "0.0";
+      case PhysType::Bool: return "false";
+      case PhysType::Bytes: return "bc_empty(cx)";
+    }
+    return "INT64_C(0)";
+  }
+
+  static auto c_type(PhysType t) -> std::string {
+    switch (t) {
+      case PhysType::I64: return "int64_t";
+      case PhysType::F64: return "double";
+      case PhysType::Bool: return "bool";
+      case PhysType::Bytes: return "bc_view";
+    }
+    return "int64_t";
+  }
+
+  static void emit(Writer& w, const Row& row) {
+    w.line("bc_emit_begin(cx);");
+    for (const auto& v : row) {
+      w.open("if (" + v.null + ")");
+      w.line("bc_emit_null(cx);");
+      w.otherwise();
+      w.line("bc_emit_" + suffix(v.type) + "(cx, " + v.value + ");");
+      w.close();
+    }
+    w.line("bc_emit_end(cx);");
+  }
+
+  // The arm's values in locals, a NULL one's value the type's zero: what
+  // the rest reads more than once, and where it is not NULL.
+  Sink held(Sink next) {
+    return [this, into = std::move(next)](Writer& w, const Row& row) {
+      Row out;
+      for (const auto& v : row) {
+        auto n = fresh("n");
+        auto x = fresh("x");
+        w.line("bool " + n + " = " + v.null + ";");
+        w.line(c_type(v.type) + " " + x + " = " + zero(v.type) + ";");
+        w.line("if (!" + n + ") " + x + " = " + v.value + ";");
+        out.push_back({n, x, v.type});
+      }
+      into(w, out);
+    };
+  }
+
+  // The arm's rows as the operation's columns: an integer type meeting a
+  // floating one is converted to it.
+  Sink converted(const std::vector<SqlType>& from_types, const std::vector<SqlType>& to_types, Sink next) {
+    auto same = true;
+    for (std::size_t i = 0; i < to_types.size(); ++i) same = same && phys_type(from_types[i]) == phys_type(to_types[i]);
+    if (same) return next;
+    return [this, from = from_types, to = to_types, into = std::move(next)](Writer& w, const Row& row) {
+      Row out = row;
+      for (std::size_t i = 0; i < to.size(); ++i) {
+        if (phys_type(from[i]) == phys_type(to[i])) continue;
+        if (phys_type(from[i]) != PhysType::I64 || phys_type(to[i]) != PhysType::F64) {
+          throw std::logic_error{"physical plan: a set operation column converted other than from integer to double"};
+        }
+        auto x = fresh("x");
+        w.line("double " + x + " = bc_i64_to_f64(" + row[i].value + ");");
+        out[i] = {row[i].null, x, PhysType::F64};
+      }
+      into(w, out);
+    };
+  }
+
+  // The group of the aggregate the row's key names.
+  auto group(Writer& w, const std::string& agg, const Row& row) -> std::string {
+    auto k = fresh("k");
+    w.line("bc_sort_key " + k + " = bc_sort_key_begin(cx);");
+    for (const auto& v : row) {
+      w.open("if (" + v.null + ")");
+      w.line("bc_sort_key_null(cx, " + k + ", BC_SORT_ASC, BC_SORT_NULLS_LAST);");
+      w.otherwise();
+      w.line("bc_sort_key_" + suffix(v.type) + "(cx, " + k + ", " + v.value + ", BC_SORT_ASC, BC_SORT_NULLS_LAST);");
+      w.close();
+    }
+    auto g = fresh("g");
+    w.line("bc_group " + g + " = bc_agg_group(cx, " + agg + ", bc_sort_key_end(cx, " + k + "));");
+    return g;
+  }
+
+  static auto add_one(const std::string& g, int slot) -> std::string {
+    return "bc_agg_add_i64(cx, " + g + ", " + std::to_string(slot) + ", INT64_C(1));";
+  }
+
+  static auto slot_i64(const std::string& g, int slot) -> std::string {
+    return "bc_agg_i64(cx, " + g + ", " + std::to_string(slot) + ")";
+  }
+
+  // Slot 0 counts the rows of the side held, slot 1 the rows returned.
+  Sink hold_rows(const std::string& agg) {
+    return [this, agg](Writer& w, const Row& row) { w.line(add_one(group(w, agg, row), 0)); };
+  }
+
+  // The rows of `side` are the node's, streamed after the held side's.
+  void stream(const physical::SetPlan& n, const Sink& sink, bool direct) {
+    if (n.select) {
+      leaf(n, sink, direct);
+      return;
+    }
+    auto side = [&](const physical::SetPlan& s, const Sink& into, bool d) {
+      stream(s, converted(s.types, n.types, into), d);
+    };
+    using Kind = logical::SetOp::Kind;
+    if (n.kind == Kind::Union && n.all) {
+      side(*n.left, sink, direct);
+      side(*n.right, sink, direct);
+      return;
+    }
+    auto agg = fresh("u");
+    w_.line("bc_agg " + agg + " = bc_agg_open(cx, 2);");
+    if (n.kind == Kind::Union) {
+      Sink once = [this, agg, sink](Writer& w, const Row& row) {
+        auto g = group(w, agg, row);
+        w.open("if (bc_agg_null(cx, " + g + ", 0))");
+        w.line(add_one(g, 0));
+        sink(w, row);
+        w.close();
+      };
+      side(*n.left, once, direct);
+      side(*n.right, once, direct);
+      return;
+    }
+    // EXCEPT returns the left arm's rows the right's did not use up;
+    // INTERSECT the right arm's that the left's did not.
+    auto except = n.kind == Kind::Except;
+    Sink match = [this, agg, sink, except, all = n.all](Writer& w, const Row& row) {
+      auto g = group(w, agg, row);
+      if (all) {
+        w.open("if (" + slot_i64(g, 1) + " < " + slot_i64(g, 0) + ")");
+        w.line(add_one(g, 1));
+        if (!except) sink(w, row);
+        if (except) {
+          w.otherwise();
+          sink(w, row);
+        }
+        w.close();
+        return;
+      }
+      // DISTINCT: once, if a row of the held side had the key (INTERSECT) or
+      // none did (EXCEPT).
+      w.open("if (" + std::string{except ? "" : "!"} + "bc_agg_null(cx, " + g + ", 0))");
+      w.open("if (bc_agg_null(cx, " + g + ", 1))");
+      w.line(add_one(g, 1));
+      sink(w, row);
+      w.close();
+      w.close();
+    };
+    const auto& held_side = except ? *n.right : *n.left;
+    const auto& probed = except ? *n.left : *n.right;
+    side(held_side, hold_rows(agg), false);
+    side(probed, match, direct);
+  }
+
+  // The arm as a block of its own, its rows held in locals and converted by
+  // the node above before the sink sees them.
+  void leaf(const physical::SetPlan& n, const Sink& sink, bool direct) {
+    Writer lw{*n.select};
+    Gen g{lw};
+    g.arm(*n.select, direct && !stop_.empty() ? stop_ : std::string{}, held(sink));
+    w_.open("");
+    w_.splice(lw);
+    w_.close();
+  }
+
+  Writer& w_;
+  const physical::Plan& p_;
+  std::string stop_;  // the statement's LIMIT as a loop condition, or empty
+  int ids_{0};
+};
+
+// A plan's code: a SELECT's pipeline, or a set operation's arms.
+void print_body(Writer& w, const physical::Plan& p) {
+  if (p.set) {
+    SetGen{w, p}.plan();
+  } else {
+    Gen{w}.plan(*p.root);
+  }
+}
+
+// The inner side of a nested loop: a scan or point lookup under filters, a
+// pure function of the outer row.
+auto resumable_inner(const physical::Node& n) -> bool {
+  if (const auto* f = std::get_if<physical::Filter>(&n.op)) return resumable_inner(*f->input);
+  return std::holds_alternative<physical::Scan>(n.op) || std::holds_alternative<physical::PointGet>(n.op);
+}
+
+// Emit over filters, joins and at most one Limit, the outermost loop a Scan;
+// the joins' inner sides are scans or lookups. No Sort, hash join, aggregate,
+// set operation, choice point or NullSplitScan.
+auto resumable_plan(const physical::Plan& p) -> bool {
+  if (p.set || !p.root) return false;
+  const auto* emit = std::get_if<physical::Emit>(&p.root->op);
+  if (emit == nullptr) return false;
+  const auto* n = emit->input.get();
+  if (const auto* l = std::get_if<physical::Limit>(&n->op)) n = l->input.get();
+  for (;;) {
+    if (const auto* f = std::get_if<physical::Filter>(&n->op)) {
+      n = f->input.get();
+    } else if (const auto* j = std::get_if<physical::IndexJoin>(&n->op)) {
+      n = j->outer.get();
+    } else if (const auto* nl = std::get_if<physical::NestedLoop>(&n->op)) {
+      if (!resumable_inner(*nl->inner)) return false;
+      n = nl->outer.get();
+    } else {
+      return std::holds_alternative<physical::Scan>(n->op);
+    }
+  }
+}
+
 // Prints a searched plan, checked first.
 auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std::string_view sql) -> GeneratedPlan {
   p.param_types = param_types;
@@ -1850,19 +2743,31 @@ auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std
   out.param_types = p.param_types;
   out.catalog_version = p.catalog_version;
   Writer w{p};
-  Gen{w}.plan(*p.root);
-  std::visit(
-      [&](const auto& op) {
-        using T = std::decay_t<decltype(op)>;
-        if constexpr (std::is_same_v<T, physical::Insert> || std::is_same_v<T, physical::Update> ||
-                      std::is_same_v<T, physical::Delete>) {
-          // The runtime maintains the table's indexes: a write plan names none.
-          out.tables_written = {op.table};
-        } else {
-          out.returns_rows = true;
-        }
-      },
-      p.root->op);
+  // Each subquery as a function of its own: a miss in it returns from it.
+  std::string subs;
+  for (std::size_t i = 0; i < p.subs.size(); ++i) {
+    Writer sw{*p.subs[i].plan};
+    print_body(sw, *p.subs[i].plan);
+    w.absorb(sw);
+    subs += "\nstatic void sub" + std::to_string(i) + "(bc_ctx *cx) {\n" + sw.body() + "}\n";
+  }
+  print_body(w, p);
+  if (p.set) {
+    out.returns_rows = true;
+  } else {
+    std::visit(
+        [&](const auto& op) {
+          using T = std::decay_t<decltype(op)>;
+          if constexpr (std::is_same_v<T, physical::Insert> || std::is_same_v<T, physical::Update> ||
+                        std::is_same_v<T, physical::Delete>) {
+            // The runtime maintains the table's indexes: a write plan names none.
+            out.tables_written = {op.table};
+          } else {
+            out.returns_rows = true;
+          }
+        },
+        p.root->op);
+  }
   for (const auto& r : p.result) {
     const auto columns = physical::plan_columns(r.sql);
     out.result_types.insert(out.result_types.end(), columns.begin(), columns.end());
@@ -1871,11 +2776,12 @@ auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std
   }
   out.source = comment_line(sql) +
                comment_line("isolation: snapshot   schema: catalog v" + std::to_string(p.catalog_version)) +
-               comment_line("objects: " + w.legend()) + "#include \"bc_plan.h\"\n" + w.constants() +
-               "\n\nvoid plan(bc_ctx *cx) {\n" + w.body() + "}\n";
+               comment_line("objects: " + w.legend()) + "#include \"bc_plan.h\"\n" + w.constants() + "\n" + subs +
+               "\nvoid plan(bc_ctx *cx) {\n" + w.body() + "}\n";
   out.objects_read = w.objects_read();
   out.columns = w.columns_used();
   out.cost = p.cost;
+  out.resumable = resumable_plan(p);
   return out;
 }
 
@@ -1886,20 +2792,106 @@ auto rewritten(bound::Bound& b) -> logical::Node& {
   return **stmt;
 }
 
+// A statement or subquery that is a set operation, with the LIMIT over it.
+struct SetRoot {
+  const logical::Node* node;  // the set operation, under the LIMIT
+  const logical::SetOp* op;
+  std::optional<std::int64_t> limit;
+};
+
+auto set_root(const logical::Node& n) -> std::optional<SetRoot> {
+  const auto* top = &n;
+  std::optional<std::int64_t> limit;
+  if (const auto* l = std::get_if<logical::Limit>(&n.op)) {
+    limit = l->n;
+    top = l->input.get();
+  }
+  if (const auto* s = std::get_if<logical::SetOp>(&top->op)) return SetRoot{top, s, limit};
+  return std::nullopt;
+}
+
+// The plans of a set operation's arms, each searched alone, as a tree. Their
+// constants and costs are added to `into`.
+auto set_tree(const logical::Node& n, const Catalog& cat, const RowCounts& counts, std::uint64_t memory_bytes,
+              const std::vector<PhysType>& param_types, physical::Plan& into) -> std::shared_ptr<const physical::SetPlan> {
+  auto out = std::make_shared<physical::SetPlan>();
+  if (const auto* s = std::get_if<logical::SetOp>(&n.op)) {
+    out->kind = s->kind;
+    out->all = s->all;
+    out->left = set_tree(*s->left, cat, counts, memory_bytes, param_types, into);
+    out->right = set_tree(*s->right, cat, counts, memory_bytes, param_types, into);
+    for (const auto& o : s->outputs) out->types.push_back(o.expr.type);
+    return out;
+  }
+  auto arm = search(n, cat, counts, memory_bytes);
+  arm.param_types = param_types;
+  for (const auto& c : arm.constants) {
+    if (std::ranges::none_of(into.constants, [&](const auto& d) { return d.name == c.name; })) into.constants.push_back(c);
+  }
+  into.cost += arm.cost;
+  for (const auto& r : arm.result) out->types.push_back(r.sql);
+  out->select = std::make_shared<const physical::Plan>(std::move(arm));
+  return out;
+}
+
+// The cheapest plan of a rewritten statement or subquery: a SELECT's, or a
+// set operation's, whose arms are each searched alone.
+auto plan_for(const logical::Node& n, const Catalog& cat, const RowCounts& counts, std::uint64_t memory_bytes,
+              const std::vector<PhysType>& param_types) -> physical::Plan {
+  const auto set = set_root(n);
+  if (!set) return search(n, cat, counts, memory_bytes);
+  physical::Plan p;
+  p.catalog_version = cat.version();
+  p.set = set_tree(*set->node, cat, counts, memory_bytes, param_types, p);
+  p.set_limit = set->limit;
+  p.set_order = set->op->order;
+  for (const auto& o : set->op->outputs) p.result.push_back({o.name, o.expr.type});
+  return p;
+}
+
+// Each subquery's cheapest plan, its parameters the statement's, given to
+// `p`; the constants of its tables join the statement's, so the one source
+// declares them all.
+void attach_subqueries(physical::Plan& p, bound::Bound& b, const Catalog& cat, const RowCounts& counts,
+                       std::uint64_t memory_bytes) {
+  for (auto& s : b.subqueries) {
+    logical::rewrite(*s.plan);
+    auto sp = plan_for(*s.plan, cat, counts, memory_bytes, b.param_types);
+    sp.param_types = b.param_types;
+    for (const auto& c : sp.constants) {
+      if (std::ranges::none_of(p.constants, [&](const auto& d) { return d.name == c.name; })) p.constants.push_back(c);
+    }
+    p.subs.push_back({std::make_shared<const physical::Plan>(std::move(sp)), s.kind, s.type, s.param});
+  }
+}
+
 }  // namespace
 
 auto no_rows_lines(const physical::Node& root) -> std::vector<std::string> { return Gen::no_rows(root); }
 
 auto generate_plan(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts,
                    std::uint64_t memory_bytes) -> GeneratedPlan {
-  auto p = search(rewritten(b), cat, counts, memory_bytes);
+  auto p = plan_for(rewritten(b), cat, counts, memory_bytes, b.param_types);
+  attach_subqueries(p, b, cat, counts, memory_bytes);
   return print_plan(p, b.param_types, sql);
 }
 
 auto generate_alternatives(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts,
                            std::uint64_t memory_bytes) -> std::vector<GeneratedPlan> {
+  // A set operation's arms are each searched alone, and only the cheapest of each is kept.
+  if (const auto* stmt = std::get_if<logical::NodePtr>(&b.stmt); stmt != nullptr && set_root(**stmt)) {
+    std::vector<GeneratedPlan> only;
+    only.push_back(generate_plan(std::move(b), cat, sql, counts, memory_bytes));
+    return only;
+  }
   std::vector<GeneratedPlan> out;
+  physical::Plan with_subs;  // the subqueries' plans, the same for every alternative
+  attach_subqueries(with_subs, b, cat, counts, memory_bytes);
   for (auto& p : search_all(rewritten(b), cat, counts, memory_bytes)) {
+    p.subs = with_subs.subs;
+    for (const auto& c : with_subs.constants) {
+      if (std::ranges::none_of(p.constants, [&](const auto& d) { return d.name == c.name; })) p.constants.push_back(c);
+    }
     const auto n = physical::choices(p);
     // Bit i of a combination takes choice point i's second plan.
     for (std::uint32_t combination = 0; combination < (1u << n); ++combination) {

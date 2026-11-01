@@ -142,6 +142,91 @@ TEST_CASE("catalog: a table record round-trips every field", "[sql][catalog]") {
   CHECK(serialize_table(u) == rec);
 }
 
+TEST_CASE("catalog: a table's CHECK constraints are a format-5 tail; a table without any is still format 4", "[sql][catalog]") {
+  auto plain = rich_table();
+  auto rec4 = serialize_table(plain);
+  CHECK(rec4[0] == std::byte{4});  // an earlier build still opens a database without a CHECK
+  auto t = rich_table();
+  t.checks = {{"c1", "a > 0"}, {"c2", "a < b AND b <> 'x(y'"}};
+  auto rec = serialize_table(t);
+  CHECK(rec[0] == std::byte{5});
+  auto u = parse_table(rec);
+  REQUIRE(u.checks.size() == 2);
+  CHECK(u.checks[1].name == "c2");
+  CHECK(u.checks[1].expr == "a < b AND b <> 'x(y'");
+  CHECK(serialize_table(u) == rec);
+  // Every cut is refused, and so is a format-5 record that holds none and one that names a CHECK twice.
+  for (std::size_t n = 0; n < rec.size(); ++n) {
+    INFO(n);
+    CHECK_THROWS_AS(parse_table(BytesView{rec}.first(n)), std::runtime_error);
+  }
+  auto none = rec4;
+  none[0] = std::byte{5};
+  none.push_back(std::byte{0});
+  none.push_back(std::byte{0});
+  CHECK_THROWS_AS(parse_table(none), std::runtime_error);
+  t.checks = {{"c1", "a > 0"}, {"c1", "a < 9"}};
+  CHECK_THROWS_AS(parse_table(serialize_table(t)), std::runtime_error);
+}
+
+TEST_CASE("catalog: a table with a TIMESTAMPTZ or CHAR(n) column is a format-6 record; any other keeps format 4 or 5", "[sql][catalog]") {
+  auto t = rich_table();
+  t.columns.back().sql = SqlType{SqlKind::TimestampTz};  // an earlier build would call the tag corrupt
+  auto rec = serialize_table(t);
+  CHECK(rec[0] == std::byte{6});
+  auto u = parse_table(rec);
+  CHECK(u.columns.back().sql.kind == SqlKind::TimestampTz);
+  CHECK(u.checks.empty());
+  CHECK(serialize_table(u) == rec);
+  // A CHAR(n) column is a format-6 record too, its length kept.
+  t.columns[2].sql = SqlType{SqlKind::Char, 7};
+  auto char_rec = serialize_table(t);
+  CHECK(char_rec[0] == std::byte{6});
+  CHECK(parse_table(char_rec).columns[2].sql == SqlType{SqlKind::Char, 7});
+  t.checks = {{"c1", "f > 0"}};
+  auto with_check = serialize_table(t);
+  CHECK(with_check[0] == std::byte{6});
+  CHECK(parse_table(with_check).checks.size() == 1);
+  // A format-5 record still may not hold an empty CHECK list.
+  auto five = rec;
+  five[0] = std::byte{5};
+  CHECK_THROWS_AS(parse_table(five), std::runtime_error);
+  for (std::size_t n = 0; n < rec.size(); ++n) {
+    INFO(n);
+    CHECK_THROWS_AS(parse_table(BytesView{rec}.first(n)), std::runtime_error);
+  }
+}
+
+TEST_CASE("catalog: CHECK constraints are named as PostgreSQL names them and survive a reopen", "[sql][catalog]") {
+  sql_test::TempDir dir{"catalog_check"};
+  auto db = DB::open(dir.path());
+  {
+    LiveCatalog live{db};
+    auto cols = std::vector<ColumnSpec>{col("a", SqlKind::Integer), col("b", SqlKind::Integer)};
+    // Named ones first; an unnamed one is table_column_check, or table_check for the table's,
+    // then 1, 2… where the name is taken.
+    CreateTableDdl ddl{"c1", cols, {}, {}, {}};
+    ddl.checks = {{"", "a > 0", "a"}, {"", "a < b", ""}, {"named", "b > 0", "b"}, {"", "b < 9", "b"}, {"", "b < 10", "b"}};
+    (void)live.apply(ddl);
+    std::vector<std::string> names;
+    for (const auto& c : live.current()->table("c1")->checks) names.push_back(c.name);
+    CHECK(names == std::vector<std::string>{"named", "c1_a_check", "c1_check", "c1_b_check", "c1_b_check1"});
+    ddl.name = "c2";
+    ddl.checks = {{"x", "a > 0", ""}, {"x", "a > 1", ""}};
+    try {
+      (void)live.apply(ddl);
+      FAIL("a constraint name used twice");
+    } catch (const DdlRefused& e) {
+      CHECK(e.sqlstate() == "42710");
+    }
+    CHECK(live.current()->table("c2") == nullptr);
+  }
+  LiveCatalog again{db};
+  REQUIRE(again.current()->table("c1")->checks.size() == 5);
+  CHECK(again.current()->table("c1")->checks[1].expr == "a > 0");
+  db.close();
+}
+
 TEST_CASE("catalog: a damaged or foreign-format record is refused", "[sql][catalog]") {
   auto rec = serialize_table(rich_table());
   // Cut at every byte: always refused, never over-read.
@@ -166,7 +251,7 @@ TEST_CASE("catalog: a damaged or foreign-format record is refused", "[sql][catal
   };
   CHECK(format(1).find("earlier SQL-layer build") != std::string::npos);
   CHECK(format(2).find("earlier SQL-layer build") != std::string::npos);
-  CHECK(format(5).find("later SQL-layer build") != std::string::npos);
+  CHECK(format(7).find("later SQL-layer build") != std::string::npos);
 
   // Records that parse but break an invariant.
   auto broken = [](auto&& mutate) {
@@ -924,4 +1009,141 @@ TEST_CASE("catalog: the constants block a plan needs", "[sql][catalog]") {
   CHECK(constant(cs, "PART_1_0") == 0);
   CHECK(constant(cs, "PART_3_1") == 0);
   CHECK(constant(cs, "PART_3_0") == 1);
+}
+
+TEST_CASE("catalog: a view is a record and a name entry, survives a reopen, and guards what it reads", "[sql][catalog][view]") {
+  sql_test::TempDir dir{"catalog_view"};
+  auto refused = [](LiveCatalog& live, const Ddl& ddl) -> std::string {
+    try {
+      (void)live.apply(ddl);
+    } catch (const DdlRefused& e) {
+      return std::string{e.sqlstate()};
+    }
+    return {};
+  };
+  std::uint32_t t_id = 0, v_id = 0;
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    (void)live.apply(create_t());
+    t_id = live.current()->table("t")->id;
+    (void)live.apply(CreateViewDdl{"v", "CREATE VIEW v AS SELECT id FROM t", {t_id, t_id}, {"id"}});
+    auto cat = live.current();
+    REQUIRE(cat->view("v") != nullptr);
+    v_id = cat->view("v")->id;
+    CHECK(v_id > t_id);  // one id counter, never reused
+    CHECK(cat->view("v")->definition == "CREATE VIEW v AS SELECT id FROM t");
+    CHECK(cat->view("v")->depends_on == std::vector<std::uint32_t>{t_id});  // each once
+    CHECK(cat->view("v")->columns == std::vector<std::string>{"id"});
+    CHECK(cat->table("v") == nullptr);
+    CHECK(cat->view("t") == nullptr);
+    // A name is one namespace for tables, indexes and views.
+    CHECK(refused(live, CreateViewDdl{"v", "x", {t_id}, {"id"}}) == "42P07");
+    CHECK(refused(live, CreateViewDdl{"t", "x", {t_id}, {"id"}}) == "42P07");
+    CHECK(refused(live, CreateTableDdl{"v", {col("id", SqlKind::BigInt)}, {"id"}}) == "42P07");
+    CHECK(refused(live, CreateViewDdl{"w", "x", {9999}, {"id"}}) == "42P01");  // reads what is not there
+    // The wrong statement for the object.
+    CHECK(refused(live, DropTableDdl{"v"}) == "42809");
+    CHECK(refused(live, DropViewDdl{"t"}) == "42809");
+    CHECK(refused(live, DropIndexDdl{"v"}) == "42809");
+    CHECK(refused(live, CreateIndexDdl{"i", "v", {{"id"}}}) == "42809");
+    CHECK(refused(live, AddColumnDdl{"v", col("c", SqlKind::BigInt)}) == "42809");
+    // A table a view reads cannot be dropped; nor a view another reads.
+    CHECK(refused(live, DropTableDdl{"t"}) == "2BP01");
+    (void)live.apply(CreateViewDdl{"w", "CREATE VIEW w AS SELECT id FROM v", {v_id}, {"id"}});
+    CHECK(refused(live, DropViewDdl{"v"}) == "2BP01");
+    CHECK(live.current()->view("v") != nullptr);
+    db.close();
+  }
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    auto cat = live.current();
+    REQUIRE(cat->view("v") != nullptr);
+    CHECK(cat->view("v")->id == v_id);
+    CHECK(cat->view("w")->depends_on == std::vector<std::uint32_t>{v_id});
+    CHECK(count_prefix(db, view_record_key(v_id)) == 1);
+    (void)live.apply(DropViewDdl{"w"});
+    (void)live.apply(DropViewDdl{"v"});
+    CHECK(count_prefix(db, view_record_key(v_id)) == 0);
+    CHECK(live.apply(DropViewDdl{"v", true}) == live.current());  // IF EXISTS of nothing: no new version
+    CHECK(refused(live, DropViewDdl{"v"}) == "42P01");
+    (void)live.apply(DropTableDdl{"t"});  // nothing reads it now
+    db.close();
+  }
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    CHECK(live.current()->views().empty());
+    CHECK(live.current()->tables().empty());
+    db.close();
+  }
+}
+
+TEST_CASE("catalog: a view's record and name entry must agree at load, and a damaged record is refused",
+          "[sql][catalog][view]") {
+  sql_test::TempDir dir{"catalog_view_damage"};
+  std::uint32_t v_id = 0;
+  Bytes record;
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    (void)live.apply(create_t());
+    (void)live.apply(CreateViewDdl{"v", "CREATE VIEW v AS SELECT id FROM t", {live.current()->table("t")->id}, {"id"}});
+    v_id = live.current()->view("v")->id;
+    Bytes v;
+    REQUIRE(db.snapshot().get({}, view_record_key(v_id), v));
+    record = v;
+    db.close();
+  }
+  auto with = [&](auto&& damage) {
+    auto db = DB::open(dir.path());
+    damage(db);
+    CHECK_THROWS_AS(LiveCatalog{db}, std::runtime_error);
+    db.close();
+  };
+  // Cut at every byte; a later format; trailing bytes.
+  for (std::size_t n = 0; n < record.size(); ++n) {
+    with([&](DB& db) { db.put({}, view_record_key(v_id), Bytes(record.begin(), record.begin() + static_cast<std::ptrdiff_t>(n))); });
+    {
+      auto db = DB::open(dir.path());
+      db.put({}, view_record_key(v_id), record);
+      db.close();
+    }
+  }
+  with([&](DB& db) {
+    auto later = record;
+    later[0] = std::byte{2};
+    db.put({}, view_record_key(v_id), later);
+  });
+  {
+    auto db = DB::open(dir.path());
+    db.put({}, view_record_key(v_id), record);
+    db.close();
+  }
+  with([&](DB& db) {
+    auto longer = record;
+    longer.push_back(std::byte{0});
+    db.put({}, view_record_key(v_id), longer);
+  });
+  {
+    auto db = DB::open(dir.path());
+    db.put({}, view_record_key(v_id), record);
+    db.close();
+  }
+  // A view with no name entry, a name entry that says table.
+  with([&](DB& db) { (void)db.del({}, name_entry_key("v")); });
+  {
+    auto db = DB::open(dir.path());
+    db.put({}, name_entry_key("v"), Bytes{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte{static_cast<unsigned char>(v_id)}});
+    db.close();
+  }
+  with([&](DB&) {});
+  {
+    auto db = DB::open(dir.path());
+    db.put({}, name_entry_key("v"), Bytes{std::byte{3}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte{static_cast<unsigned char>(v_id)}});
+    LiveCatalog ok{db};  // consistent again
+    CHECK(ok.current()->view("v") != nullptr);
+    db.close();
+  }
 }
