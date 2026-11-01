@@ -78,6 +78,10 @@ enum class SqlKind : std::uint8_t {
   // carries its value as its text (Rows), and its scale is the scale of
   // the integer sum it divides.
   Numeric,
+  // TIMESTAMP WITH TIME ZONE: the same instant as Timestamp (microseconds
+  // since 1970-01-01 00:00:00 UTC), told apart by this tag. Appended, so no
+  // earlier value moves; a catalog that holds it is closed to an earlier build.
+  TimestampTz,
 };
 
 // DECIMAL(p, s) is a scaled i64: p of at most 18 digits fits.
@@ -339,6 +343,7 @@ auto phys_type(SqlType t) -> PhysType {
     case SqlKind::BigInt:
     case SqlKind::Decimal:
     case SqlKind::Timestamp:
+    case SqlKind::TimestampTz:
     case SqlKind::Date:
     case SqlKind::Time: return PhysType::I64;
     case SqlKind::Real:

@@ -430,7 +430,11 @@ public:
   // 5: the record ends with the table's CHECK constraints. A table with none
   // is still written as 4, so only a database that holds a CHECK is closed
   // to an earlier build.
-  static constexpr std::uint16_t kRecordFormat = 5;
+  // 6: as 5, but the CHECK count may be 0. It is the record of a table with a
+  // TIMESTAMP WITH TIME ZONE column, whose type tag an earlier build would
+  // call corrupt: written only for such a table, so only a database that
+  // holds one is closed to an earlier build.
+  static constexpr std::uint16_t kRecordFormat = 6;
   static constexpr std::uint16_t kOldestRecordFormat = 3;
 
   // The constants a plan on this table needs, named from ids alone so that
@@ -993,6 +997,7 @@ auto sql_type_valid(SqlType t) -> bool {
     case SqlKind::Bytea:
     case SqlKind::Text:
     case SqlKind::Timestamp:
+    case SqlKind::TimestampTz:
     case SqlKind::Date:
     case SqlKind::Time: return t.length == 0 && t.precision == 0 && t.scale == 0;
     case SqlKind::Numeric: return false;  // AVG's result: no column is declared one
@@ -1016,6 +1021,7 @@ auto sql_type_name(SqlType t) -> std::string {
       if (t.precision == 0) return "numeric";  // no declared precision: a SUM's result
       return "numeric(" + std::to_string(t.precision) + "," + std::to_string(t.scale) + ")";
     case SqlKind::Timestamp: return "timestamp";
+    case SqlKind::TimestampTz: return "timestamptz";
     case SqlKind::Date: return "date";
     case SqlKind::Time: return "time";
     case SqlKind::Numeric: return "numeric";
@@ -1074,6 +1080,7 @@ auto compared_type(SqlType t) -> ComparedType {
     case SqlKind::Bytea:
     case SqlKind::Text:
     case SqlKind::Timestamp:
+    case SqlKind::TimestampTz:
     case SqlKind::Date:
     case SqlKind::Time:
     case SqlKind::Numeric: return same(t);
@@ -1102,6 +1109,7 @@ auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string> {
       if (v < kMinDate || v >= kEndDate) return "date out of range";
       break;
     case SqlKind::Timestamp:
+    case SqlKind::TimestampTz:
       if (v < kMinTimestamp) return "timestamp out of range";
       break;
     case SqlKind::BigInt:
@@ -1260,7 +1268,8 @@ auto read_layout(RecordReader& r, const Table& t) -> std::pair<std::uint32_t, Ro
 
 auto serialize_table(const Table& t) -> Bytes {
   RecordWriter w;
-  w.u16(t.checks.empty() ? std::uint16_t{4} : Catalog::kRecordFormat);
+  auto has_tz = std::ranges::any_of(t.columns, [](const Column& c) { return c.sql.kind == SqlKind::TimestampTz; });
+  w.u16(has_tz ? Catalog::kRecordFormat : t.checks.empty() ? std::uint16_t{4} : std::uint16_t{5});
   w.u32(t.id);
   w.str(t.name);
   w.u32(t.version);
@@ -1297,7 +1306,7 @@ auto serialize_table(const Table& t) -> Bytes {
   w.u16(t.retired_layouts.size() + 1);
   for (const auto& [id, l] : t.retired_layouts) write_layout(w, id, l);
   write_layout(w, t.layout_id, t.layout);
-  if (!t.checks.empty()) {
+  if (!t.checks.empty() || has_tz) {
     w.u16(t.checks.size());
     for (const auto& c : t.checks) {
       w.entry([&](RecordWriter& e) {
@@ -1423,7 +1432,7 @@ auto parse_table(BytesView in) -> Table {
   t.retired_layouts.pop_back();
   if (format >= 5) {
     auto nchecks = r.u16();
-    if (nchecks == 0) corrupt("table " + t.name + " has a format-5 record and no CHECK");
+    if (nchecks == 0 && format == 5) corrupt("table " + t.name + " has a format-5 record and no CHECK");
     for (std::uint32_t i = 0; i < nchecks; ++i) {
       RecordReader e{r.blob()};
       CheckConstraint c;
