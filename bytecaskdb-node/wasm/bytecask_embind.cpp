@@ -190,10 +190,13 @@ struct JsSnapshot {
 
 struct JsWritePlan {
   std::optional<bytecask::WritePlan> plan;
+  // Built from a snapshot: hasSnapshot() reports this, not whether the plan
+  // has some base.
+  bool on_snapshot{false};
 
   JsWritePlan() : plan{bytecask::WritePlan{}} {}
 
-  explicit JsWritePlan(JsSnapshot &snap) {
+  explicit JsWritePlan(JsSnapshot &snap) : on_snapshot{true} {
     snap.check();
     plan.emplace(std::move(*snap.snap));
     snap.snap.reset();
@@ -763,7 +766,7 @@ static void jswp_ensure_range_unchanged(JsWritePlan &self,
 
 static auto jswp_has_snapshot(JsWritePlan &self) -> bool {
   self.check();
-  return self.plan->read_sequence().has_value();
+  return self.on_snapshot;
 }
 
 static auto js_file_manifest_get_snapshot(JsFileManifest &self) -> JsSnapshot * {

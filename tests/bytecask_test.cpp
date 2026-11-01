@@ -9777,6 +9777,7 @@ TEST_CASE("WritePlan: a moved-from snapshot is refused",
   auto snap = db.snapshot();
   auto kept = std::move(snap);
   CHECK_THROWS_AS(bytecask::WritePlan{std::move(snap)}, std::invalid_argument);
+  CHECK_THROWS_AS((void)snap.sequence(), std::logic_error);
   bytecask::WritePlan plan{std::move(kept)};
   plan.put(to_bytes("k"), to_bytes("v"));
   CHECK(db.apply_batch({}, std::move(plan)).has_value());

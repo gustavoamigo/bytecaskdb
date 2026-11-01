@@ -119,11 +119,14 @@ struct PySnapshot {
 struct PyWritePlan {
   std::optional<bytecask::WritePlan> plan;
   std::unique_ptr<nb::ft_mutex> mu{std::make_unique<nb::ft_mutex>()};
+  // Built from a snapshot: has_snapshot reports this, not whether the plan
+  // has some base.
+  bool on_snapshot{false};
 
   PyWritePlan() : plan{bytecask::WritePlan{}} {}
 
   explicit PyWritePlan(bytecask::Snapshot snap)
-      : plan{bytecask::WritePlan{std::move(snap)}} {}
+      : plan{bytecask::WritePlan{std::move(snap)}}, on_snapshot{true} {}
 
   void put(nb::bytes key, nb::bytes value) {
     check();
@@ -162,7 +165,7 @@ struct PyWritePlan {
 
   [[nodiscard]] auto has_snapshot() const -> bool {
     check();
-    return plan->read_sequence().has_value();
+    return on_snapshot;
   }
 
   auto take() -> bytecask::WritePlan {

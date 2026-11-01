@@ -1985,9 +1985,10 @@ public:
 
   // The sequence of the last write this snapshot sees: every write at or
   // below it, and none above. A plan built from it (WritePlan(sequence))
-  // is checked against it without holding the snapshot.
-  [[nodiscard]] auto sequence() const noexcept -> std::uint64_t {
-    return state_->next_seq - 1;
+  // is checked against it without holding the snapshot. A moved-from
+  // snapshot names no state: std::logic_error.
+  [[nodiscard]] auto sequence() const -> std::uint64_t {
+    return named_state().next_seq - 1;
   }
 
   // Returns true if key exists in this snapshot. No disk I/O.
@@ -2035,6 +2036,10 @@ private:
   explicit Snapshot(std::shared_ptr<const EngineState> state,
                     SizeLimits limits = {})
       : state_{std::move(state)}, limits_{limits} {}
+  [[nodiscard]] auto named_state() const -> const EngineState & {
+    if (!state_) throw std::logic_error{"Snapshot: moved from"};
+    return *state_;
+  }
   std::shared_ptr<const EngineState> state_;
   SizeLimits limits_;
   friend class DB;

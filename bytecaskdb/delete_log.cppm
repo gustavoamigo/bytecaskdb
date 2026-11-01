@@ -13,11 +13,18 @@
 // for every key it names, present or not: a `del_range` costs one entry
 // whatever it covers.
 //
+// Lookups cost the deletes that matter to the key or range asked about:
+// point deletes are a map by key, range deletes a map of disjoint key
+// segments each stamped with the latest range delete that covered it
+// (RangeSegments). A queue per kind keeps sequence order for dropping the
+// oldest, and for the rare query against a state older than the newest
+// delete of a key (the `below` bound).
+//
 // In memory only: the data files are the record. An open starts the log
-// empty with the horizon at the latest recovered sequence, so a plan read
-// before a restart is too old. Bounded by max_bytes: past it the oldest
-// deletes are dropped and the horizon rises to the newest dropped one. With
-// max_bytes 0 nothing is kept: every delete raises the horizon.
+// empty with the horizon at the latest recovered sequence. Bounded by
+// max_bytes: past it the oldest deletes are dropped and the horizon rises to
+// the newest dropped one. With max_bytes 0 nothing is kept: every delete
+// raises the horizon.
 //
 // Thread-safety: record and reset are called under the DB's write lock; the
 // queries run there and, for a plan that appended nothing, on its writer
@@ -30,6 +37,7 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <span>
@@ -74,6 +82,115 @@ export struct RangeRemoval {
   std::uint64_t seq;
 };
 
+// Disjoint key segments, each stamped with the latest range delete that
+// covered it. Stamps arrive in ascending sequence, so a new one is the latest
+// for everything it covers: stamping [from, to) splits the segments at its
+// two bounds and replaces whatever lies between with one segment. Removing a
+// stamp, oldest first, removes the segments that still carry it.
+export class RangeSegments {
+public:
+  void stamp(ByteView from, ByteView to, std::uint64_t seq) {
+    split_at(from);
+    split_at(to);
+    // Allocated before anything is erased, so a failure leaves every
+    // segment as it was (the splits above change no stamp).
+    Map one;
+    one.try_emplace(LogBytes{from.begin(), from.end()},
+                    Segment{LogBytes{to.begin(), to.end()}, seq});
+    const auto first = segs_.lower_bound(from);
+    const auto last = segs_.lower_bound(to);
+    for (auto it = first; it != last; ++it) bytes_ -= cost(*it);
+    segs_.erase(first, last);
+    bytes_ += cost(*one.begin());
+    segs_.insert(one.extract(one.begin()));
+  }
+
+  // The latest stamp covering key; 0 if none does.
+  [[nodiscard]] auto latest_at(ByteView key) const -> std::uint64_t {
+    auto it = segs_.upper_bound(key);
+    if (it == segs_.begin()) return 0;
+    --it;
+    return byte_less(key, it->second.end) ? it->second.seq : 0;
+  }
+
+  // Whether `matches` holds for the stamp of a segment overlapping
+  // [from, to).
+  template <typename Pred>
+  [[nodiscard]] auto any_overlapping(ByteView from, ByteView to,
+                                     Pred matches) const -> bool {
+    for (auto it = first_overlapping(from); it != segs_.end(); ++it) {
+      if (!byte_less(it->first, to)) break;
+      if (matches(it->second.seq)) return true;
+    }
+    return false;
+  }
+
+  // Removes the segments of [from, to) still stamped seq. Every older stamp
+  // must be gone already: segments it alone covered would stay.
+  void unstamp(ByteView from, ByteView to, std::uint64_t seq) noexcept {
+    for (Map::const_iterator it = first_overlapping(from); it != segs_.end();) {
+      if (!byte_less(it->first, to)) break;
+      if (it->second.seq == seq) {
+        bytes_ -= cost(*it);
+        it = segs_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  void clear() noexcept {
+    segs_.clear();
+    bytes_ = 0;
+  }
+  [[nodiscard]] auto bytes() const noexcept -> std::size_t { return bytes_; }
+
+private:
+  struct Segment {
+    LogBytes end;
+    std::uint64_t seq;
+  };
+  using Map = std::map<LogBytes, Segment, ByteLess>;  // by start
+
+  // Rough cost of a segment beyond its bounds' bytes: a map node.
+  static constexpr std::size_t kSegmentBytes = 64;
+  static auto cost(const Map::value_type &s) noexcept -> std::size_t {
+    return s.first.size() + s.second.end.size() + kSegmentBytes;
+  }
+
+  // The segment holding `from`, or else the first starting after it.
+  [[nodiscard]] auto first_overlapping(ByteView from) const
+      -> Map::const_iterator {
+    auto it = segs_.upper_bound(from);
+    if (it == segs_.begin()) return it;
+    const auto prev = std::prev(it);
+    return byte_less(from, prev->second.end) ? prev : it;
+  }
+
+  // Makes k a segment boundary: the segment strictly containing it becomes
+  // two with its stamp. Allocates before it changes anything.
+  void split_at(ByteView k) {
+    auto it = segs_.upper_bound(k);
+    if (it == segs_.begin()) return;
+    --it;
+    if (!byte_less(it->first, k)) return;      // k starts this segment
+    if (!byte_less(k, it->second.end)) return; // k is past it
+    Map piece;
+    auto &tail = piece.try_emplace(LogBytes{k.begin(), k.end()},
+                                   Segment{{}, it->second.seq})
+                     .first->second;
+    LogBytes head_end{k.begin(), k.end()};
+    bytes_ -= cost(*it);
+    tail.end = std::move(it->second.end);
+    it->second.end = std::move(head_end);
+    bytes_ += cost(*it) + cost(*piece.begin());
+    segs_.insert(piece.extract(piece.begin()));
+  }
+
+  Map segs_;
+  std::size_t bytes_{0};
+};
+
 export class DeleteLog;
 
 // The deletes one group's slots applied so far, indexed for the checks of
@@ -89,6 +206,7 @@ public:
   }
   void add_range(ByteView from, ByteView to, std::uint64_t seq) {
     ranges_.push_back({{from.begin(), from.end()}, {to.begin(), to.end()}, seq});
+    segments_.stamp(from, to, seq);
     last_seq_ = seq;
   }
 
@@ -97,18 +215,15 @@ public:
   // Whether a staged delete names key.
   [[nodiscard]] auto removes(ByteView key) const -> bool {
     if (keys_.contains(key)) return true;
-    return std::ranges::any_of(ranges_, [&](const RangeRemoval &r) {
-      return key_in_range(key, r.from, r.to);
-    });
+    return segments_.latest_at(key) != 0;
   }
 
   // Whether a staged delete names a key in [from, to).
   [[nodiscard]] auto removes_any_in(ByteView from, ByteView to) const -> bool {
     const auto it = keys_.lower_bound(from);
     if (it != keys_.end() && byte_less(it->first, to)) return true;
-    return std::ranges::any_of(ranges_, [&](const RangeRemoval &r) {
-      return ranges_overlap(r.from, r.to, from, to);
-    });
+    return segments_.any_overlapping(from, to,
+                                     [](std::uint64_t) { return true; });
   }
 
 private:
@@ -117,7 +232,8 @@ private:
   // nothing, since a state the log is checked against holds the whole group
   // or none of it.
   std::map<LogBytes, std::uint64_t, ByteLess> keys_;
-  std::vector<RangeRemoval> ranges_;  // ascending sequence
+  std::vector<RangeRemoval> ranges_;  // ascending sequence, for the log
+  RangeSegments segments_;            // ranges_, for lookups
   std::uint64_t last_seq_{0};         // 0: nothing staged
 };
 
@@ -151,10 +267,11 @@ public:
       } catch (...) {
         clear_locked(last);
       }
-      while (bytes_ > max_bytes_) drop_oldest_locked();
+      while (bytes_locked() > max_bytes_) drop_oldest_locked();
     }
     staged.keys_.clear();
     staged.ranges_.clear();
+    staged.segments_.clear();
     staged.last_seq_ = 0;
   }
 
@@ -172,14 +289,18 @@ public:
                              std::uint64_t below) const -> bool {
     std::lock_guard<std::mutex> lk{mu_};
     if (key_removed_locked(key, read_seq, below)) return true;
+    // The key's latest range delete answers alone unless it is at or above
+    // `below`; then an earlier one may still fall in the window.
+    const auto latest = segments_.latest_at(key);
+    if (latest < below) return latest > read_seq;
     return any_range_locked(read_seq, below, [&](const RangeRemoval &r) {
       return key_in_range(key, r.from, r.to);
     });
   }
 
   // Whether a delete above read_seq and below `below` named a key in
-  // [from, to). Point deletes are looked up by key, so the cost is the
-  // deletes logged inside the range, not every delete since read_seq.
+  // [from, to). The cost is the deletes logged inside the range, not every
+  // delete since read_seq.
   [[nodiscard]] auto removed_in(ByteView from, ByteView to,
                                 std::uint64_t read_seq,
                                 std::uint64_t below) const -> bool {
@@ -201,6 +322,16 @@ public:
       };
       if (any_key_locked(read_seq, below, in_range)) return true;
     }
+    auto range_past_below = false;
+    const auto in_window = [&](std::uint64_t seq) {
+      if (seq >= below) {
+        range_past_below = true;
+        return false;
+      }
+      return seq > read_seq;
+    };
+    if (segments_.any_overlapping(from, to, in_window)) return true;
+    if (!range_past_below) return false;
     return any_range_locked(read_seq, below, [&](const RangeRemoval &r) {
       return ranges_overlap(r.from, r.to, from, to);
     });
@@ -212,7 +343,7 @@ public:
   }
   [[nodiscard]] auto bytes() const -> std::size_t {
     std::lock_guard<std::mutex> lk{mu_};
-    return bytes_;
+    return bytes_locked();
   }
 
 private:
@@ -223,29 +354,39 @@ private:
   };
 
   // Rough cost of each record beyond its key or bound bytes, for the
-  // max_bytes budget: a map node plus its queue slot, a queue slot, a range.
+  // max_bytes budget: a map node plus its queue slot, a queue slot, a range's
+  // queue slot. A range's segments are counted by RangeSegments.
   static constexpr std::size_t kNodeBytes = 64;
   static constexpr std::size_t kKeyRemovalBytes = 16;
   static constexpr std::size_t kRangeBytes = 64;
 
+  [[nodiscard]] auto bytes_locked() const noexcept -> std::size_t {
+    return bytes_ + segments_.bytes();
+  }
+
   void record_locked(StagedRemovals &staged) {
     // The group's point deletes join order_ in sequence order; the staged map
-    // holds them in key order.
+    // holds them in key order. Each staged node moves into latest_, so a
+    // key is copied once per delete, when it is staged.
     std::vector<KeyRemoval> group;
     group.reserve(staged.keys_.size());
-    for (auto &[key, seq] : staged.keys_) {
-      auto [it, inserted] = latest_.try_emplace(key, seq);
-      if (inserted) {
-        bytes_ += it->first.size() + kNodeBytes;
+    while (!staged.keys_.empty()) {
+      auto node = staged.keys_.extract(staged.keys_.begin());
+      const auto seq = node.mapped();
+      const auto key_bytes = node.key().size();
+      const auto placed = latest_.insert(std::move(node));
+      if (placed.inserted) {
+        bytes_ += key_bytes + kNodeBytes;
       } else {
-        it->second = seq;
+        placed.position->second = seq;
       }
-      group.push_back({seq, it});
+      group.push_back({seq, placed.position});
       bytes_ += kKeyRemovalBytes;
     }
     std::ranges::sort(group, {}, &KeyRemoval::seq);
     order_.insert(order_.end(), group.begin(), group.end());
     for (auto &r : staged.ranges_) {
+      segments_.stamp(r.from, r.to, r.seq);
       bytes_ += r.from.size() + r.to.size() + kRangeBytes;
       ranges_.push_back(std::move(r));
     }
@@ -275,7 +416,8 @@ private:
     return false;
   }
 
-  // Walks the range deletes newer than read_seq, newest first.
+  // Walks the range deletes newer than read_seq, newest first: only for a
+  // state older than a range's latest delete.
   template <typename Pred>
   auto any_range_locked(std::uint64_t read_seq, std::uint64_t below,
                         Pred matches) const -> bool {
@@ -287,8 +429,8 @@ private:
     return false;
   }
 
-  // Drops the oldest delete, point or range. Called only while bytes_ > 0,
-  // so one of the two queues holds something.
+  // Drops the oldest delete, point or range. Called only while the log
+  // holds bytes, so one of the two queues holds something.
   void drop_oldest_locked() noexcept {
     if (ranges_.empty()) {
       drop_oldest_key_locked();
@@ -314,6 +456,7 @@ private:
 
   void drop_oldest_range_locked() noexcept {
     const auto &r = ranges_.front();
+    segments_.unstamp(r.from, r.to, r.seq);
     bytes_ -= r.from.size() + r.to.size() + kRangeBytes;
     horizon_ = std::max(horizon_, r.seq);
     ranges_.pop_front();
@@ -323,6 +466,7 @@ private:
     order_.clear();
     latest_.clear();
     ranges_.clear();
+    segments_.clear();
     bytes_ = 0;
     horizon_ = std::max(horizon_, latest);
   }
@@ -336,8 +480,10 @@ private:
   // Every point delete in sequence order, for dropping the oldest; several
   // may name one key.
   std::deque<KeyRemoval> order_;
-  // Every range delete in sequence order.
+  // Every range delete in sequence order, for dropping the oldest.
   std::deque<RangeRemoval> ranges_;
+  // ranges_ as segments, for lookups.
+  RangeSegments segments_;
 };
 
 } // namespace bytecask

@@ -449,7 +449,8 @@ Snapshot& Snapshot::operator=(Snapshot&&) noexcept = default;
 Snapshot::Snapshot(std::unique_ptr<Impl> impl) noexcept
     : impl_{std::move(impl)} {}
 
-auto Snapshot::sequence() const noexcept -> std::uint64_t {
+auto Snapshot::sequence() const -> std::uint64_t {
+  if (!impl_) throw std::logic_error{"Snapshot: moved from"};
   return impl_->snap.sequence();
 }
 

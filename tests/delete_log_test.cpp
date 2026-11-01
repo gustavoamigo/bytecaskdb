@@ -8,12 +8,20 @@
 // next sequence of the state checked. The cases drive each condition of the
 // file's decisions both ways, for the MC/DC gate (scripts/run_coverage.sh).
 
+#include <algorithm>
+#include <array>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <limits>
+#include <random>
 #include <span>
+#include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 import bytecask;
 
@@ -216,4 +224,133 @@ TEST_CASE("staged removals: a group is logged in sequence order, not key order",
   del(log, "m", 30);
   CHECK(log.horizon() == 20);
   CHECK(log.removed(b("a"), 20, 100));
+}
+
+TEST_CASE("range segments: a stamp covers its keys and replaces older stamps where it lies",
+          "[delete_log]") {
+  bytecask::RangeSegments segs;
+  CHECK(segs.latest_at(b("k")) == 0);
+  segs.stamp(b("a"), b("m"), 10);
+  segs.stamp(b("f"), b("z"), 20);
+  CHECK(segs.latest_at(b("a")) == 10);
+  CHECK(segs.latest_at(b("e")) == 10);
+  CHECK(segs.latest_at(b("f")) == 20);
+  CHECK(segs.latest_at(b("y")) == 20);
+  CHECK(segs.latest_at(b("z")) == 0);  // to is exclusive
+  CHECK(segs.latest_at(b("0")) == 0);  // before every segment
+  segs.stamp(b("c"), b("d"), 30);      // inside [a, f): splits it in three
+  CHECK(segs.latest_at(b("b")) == 10);
+  CHECK(segs.latest_at(b("c")) == 30);
+  CHECK(segs.latest_at(b("d")) == 10);
+
+  // Oldest first: removing 10 leaves what 30 and 20 cover.
+  segs.unstamp(b("a"), b("m"), 10);
+  CHECK(segs.latest_at(b("b")) == 0);
+  CHECK(segs.latest_at(b("c")) == 30);
+  CHECK(segs.latest_at(b("d")) == 0);
+  CHECK(segs.latest_at(b("g")) == 20);
+  segs.unstamp(b("f"), b("z"), 20);
+  segs.unstamp(b("c"), b("d"), 30);
+  CHECK(segs.bytes() == 0);
+}
+
+TEST_CASE("range segments: a range query sees exactly the segments it overlaps",
+          "[delete_log]") {
+  bytecask::RangeSegments segs;
+  segs.stamp(b("c"), b("f"), 10);
+  segs.stamp(b("m"), b("p"), 20);
+  const auto stamps = [&](std::string_view from, std::string_view to) {
+    std::vector<std::uint64_t> out;
+    (void)segs.any_overlapping(b(from), b(to), [&](std::uint64_t s) {
+      out.push_back(s);
+      return false;
+    });
+    return out;
+  };
+  CHECK(stamps("a", "c").empty());   // ends at its from
+  CHECK(stamps("f", "m").empty());   // between the two
+  CHECK(stamps("p", "z").empty());   // starts at the last one's to
+  CHECK(stamps("d", "e") == std::vector<std::uint64_t>{10});  // inside one
+  CHECK(stamps("a", "d") == std::vector<std::uint64_t>{10});
+  CHECK(stamps("e", "n") == std::vector<std::uint64_t>{10, 20});
+  CHECK(segs.any_overlapping(b("e"), b("n"),
+                             [](std::uint64_t s) { return s == 20; }));
+}
+
+TEST_CASE("delete log: answers like a list of every delete, whatever the budget",
+          "[delete_log][model]") {
+  // The oracle keeps every delete and scans them all; the log may drop the
+  // oldest, so it is asked only where it covers the read sequence. A state
+  // checked holds whole groups, so `below` is a group boundary: the log
+  // keeps a key's last delete in each group.
+  struct Delete {
+    std::string from;
+    std::string to;  // empty: a del of `from`
+    std::uint64_t seq;
+  };
+  const std::array<std::string_view, 8> keys{"a", "b", "b0", "c", "d", "e", "f", "g"};
+  const auto names = [](const Delete &d, const std::string &key) {
+    return d.to.empty() ? d.from == key : d.from <= key && key < d.to;
+  };
+  const auto overlaps = [](const Delete &d, const std::string &from,
+                           const std::string &to) {
+    return d.to.empty() ? from <= d.from && d.from < to
+                        : d.from < to && from < d.to;
+  };
+  const auto budget = GENERATE(std::size_t{300}, std::size_t{2000}, kBig);
+  std::mt19937_64 rng{budget};
+  const auto pick = [&] {
+    return std::string{keys[std::uniform_int_distribution<std::size_t>{
+        0, keys.size() - 1}(rng)]};
+  };
+  bytecask::DeleteLog log{budget};
+  std::vector<Delete> all;
+  std::vector<std::uint64_t> boundaries;  // each group's next sequence
+  std::uint64_t seq = 0;
+  for (int group = 0; group < 400; ++group) {
+    bytecask::StagedRemovals staged;
+    for (int i = std::uniform_int_distribution<int>{1, 3}(rng); i > 0; --i) {
+      ++seq;
+      auto k = pick();
+      if (rng() % 3 == 0) {
+        auto j = pick();
+        if (j == k) j += "~";
+        const auto [from, to] = std::minmax(k, j);
+        staged.add_range(b(from), b(to), seq);
+        all.push_back({from, to, seq});
+      } else {
+        staged.add_key(b(k), seq);
+        all.push_back({k, {}, seq});
+      }
+    }
+    log.record(staged);
+    boundaries.push_back(seq + 1);
+    for (int q = 0; q < 8; ++q) {
+      const auto read_seq = std::uniform_int_distribution<std::uint64_t>{0, seq}(rng);
+      if (!log.covers(read_seq)) continue;
+      const auto later = std::ranges::upper_bound(boundaries, read_seq);
+      const auto below = *std::next(
+          later, std::uniform_int_distribution<std::ptrdiff_t>{
+                     0, std::distance(later, boundaries.end()) - 1}(rng));
+      const auto in_window = [&](const Delete &d) {
+        return d.seq > read_seq && d.seq < below;
+      };
+      const auto key = pick();
+      INFO(std::format("group {} key {} read {} below {}", group, key, read_seq, below));
+      CHECK(log.removed(b(key), read_seq, below) ==
+            std::ranges::any_of(all, [&](const Delete &d) {
+              return in_window(d) && names(d, key);
+            }));
+      auto from = pick();
+      auto to = pick();
+      if (to == from) to += "~";
+      if (to < from) std::swap(from, to);
+      INFO(std::format("range [{}, {})", from, to));
+      CHECK(log.removed_in(b(from), b(to), read_seq, below) ==
+            std::ranges::any_of(all, [&](const Delete &d) {
+              return in_window(d) && overlaps(d, from, to);
+            }));
+    }
+    CHECK(log.bytes() <= budget);
+  }
 }

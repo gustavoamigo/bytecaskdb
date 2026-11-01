@@ -413,6 +413,9 @@ class NapiWritePlan : public Napi::ObjectWrap<NapiWritePlan> {
   explicit NapiWritePlan(const Napi::CallbackInfo& info);
 
   std::optional<bytecask::WritePlan> plan;
+  // Built by withSnapshot: hasSnapshot() reports this, not whether the plan
+  // has some base.
+  bool on_snapshot{false};
 
   auto Check() const -> void {
     if (!plan) throw HandleClosed("WritePlan is closed or has already been applied");
@@ -965,7 +968,9 @@ auto NapiWritePlan::WithSnapshot(const Napi::CallbackInfo& info) -> Napi::Value 
       new bytecask::WritePlan{bytecask::WritePlan{std::move(*snap_wrap->snap)}};
   snap_wrap->snap.reset();
   auto external = Napi::External<bytecask::WritePlan>::New(env, holder);
-  return constructor.New({external});
+  auto object = constructor.New({external});
+  NapiWritePlan::Unwrap(object)->on_snapshot = true;
+  return object;
 }
 
 auto NapiWritePlan::WithLimits(const Napi::CallbackInfo& info) -> Napi::Value {
@@ -1030,7 +1035,7 @@ auto NapiWritePlan::EnsureRangeUnchanged(const Napi::CallbackInfo& info) -> void
 
 auto NapiWritePlan::HasSnapshot(const Napi::CallbackInfo& info) -> Napi::Value {
   Check();
-  return Napi::Boolean::New(info.Env(), plan->read_sequence().has_value());
+  return Napi::Boolean::New(info.Env(), on_snapshot);
 }
 
 auto NapiWritePlan::Close(const Napi::CallbackInfo&) -> void { plan.reset(); }

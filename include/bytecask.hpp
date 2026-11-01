@@ -452,7 +452,8 @@ public:
   struct Impl;
 
   // The last write this snapshot sees: all at or below it, none above.
-  [[nodiscard]] auto sequence() const noexcept -> std::uint64_t;
+  // A moved-from snapshot throws std::logic_error.
+  [[nodiscard]] auto sequence() const -> std::uint64_t;
 
   ~Snapshot();
   Snapshot(const Snapshot&) = delete;
