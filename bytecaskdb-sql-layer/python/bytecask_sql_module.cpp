@@ -192,6 +192,7 @@ auto catalog(const sql::Database& db) -> nb::list {
   for (const auto& [id, t] : cat->tables()) {
     nb::list columns;
     for (const auto& c : t.columns) {
+      if (c.hidden) continue;  // a table without a primary key: its row id
       nb::dict col;
       col["id"] = c.id;
       col["name"] = c.name;
@@ -201,7 +202,9 @@ auto catalog(const sql::Database& db) -> nb::list {
       columns.append(col);
     }
     nb::list pk;
-    for (auto col_id : t.pk_col_ids) pk.append(t.column(col_id)->name);
+    if (t.row_id() == nullptr) {
+      for (auto col_id : t.pk_col_ids) pk.append(t.column(col_id)->name);
+    }
     nb::dict table;
     table["id"] = id;
     table["name"] = t.name;

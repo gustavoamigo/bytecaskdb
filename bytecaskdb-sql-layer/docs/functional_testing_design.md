@@ -110,10 +110,10 @@ the row says 2016.
   must succeed.
 - **Checks:** that the statements are accepted. sqltest has no expected
   results, and keeping its rule keeps the number comparable with other
-  projects'. Its tables have no primary key, which the layer doesn't
-  support yet, so most cases start not implemented. A first run passed
-  16 of the 743: 374 stop at that refusal, and the rest at other forms
-  the dialect leaves out. The list is
+  projects'. Its tables have no primary key. A first run passed 16 of
+  the 743, 374 stopping at the layer's refusal of such a table; with
+  tables without a primary key built, 62 pass, and the rest stop at
+  forms the dialect leaves out. The list is
   `tests/functional/not_implemented/sqltest.txt`.
 
 ### PostgreSQL features and ByteCaskDB features: our cases
@@ -308,7 +308,8 @@ The owner's, 2026-10-25:
 10. **Concurrency and plan shapes are other classes of tests.**
     SQLLogicTest, TPC-H and TPC-DS are left out for now.
 11. **A table without a primary key is a gap.** The layer's refusal is
-    not a recorded decision.
+    not a recorded decision. Since closed: such a table gets a hidden row
+    id (`catalog_design.md`, *Tables without a primary key*).
 12. **The suite's runner is the owner's own work and carries an MIT
     header.**
 13. **A loader changes the format, never the SQL** (2026-10-25). A sqltest

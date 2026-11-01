@@ -65,7 +65,7 @@ BINDER_STATES = frozenset(
 )
 
 # 0A000 is also one of the layer's own rules, which PostgreSQL does not
-# have: a table needs a PRIMARY KEY. The state alone cannot tell it from FOR
+# have: a table needs columns. The state alone cannot tell it from FOR
 # UPDATE with an aggregate, so the statement does: a CREATE TABLE refused
 # with 0A000 is the layer's rule, kind "refused", never compared. The
 # planner's refusal, also 0A000, is told by its class (run_layer: NO_PLAN).

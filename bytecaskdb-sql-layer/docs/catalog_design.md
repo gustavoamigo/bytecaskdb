@@ -19,8 +19,8 @@ share this one only if it adopted the layer's formats (#488).
 | `name` | As the parser hands it over: an unquoted identifier folded to lower case by PostgreSQL's rules, a quoted one exactly as written, so `"Foo"` and `foo` are two tables. Plans never paste a name into C: their constants are named from ids (`TBL_1`, `IDX_3`, `COL_1_2`, `PART_3_0`), so a name need not be an identifier and two objects' constants cannot collide. The plan's header lists what each constant stands for, in `//` lines whose user bytes outside printable ASCII, `\` and `?` are `\xNN` escapes. |
 | `version` | Per-table counter, bumped by every DDL on the table. Not checked by plans (see *Compatibility*); kept for several schema versions (*Several schema versions*). |
 | `next_col_id` | The next column id. Column ids are permanent and never reused, even after a column is dropped. |
-| columns | Each: permanent `id`, `name`, SQL type (kind, `VARCHAR` length, `DECIMAL` precision and scale), nullability, default. The physical type follows from the SQL type (`types_design.md`, *Types*). |
-| primary key | Column ids, in key order. Always ascending; a primary key column is never null. |
+| columns | Each: permanent `id`, `name`, SQL type (kind, `VARCHAR` length, `DECIMAL` precision and scale), nullability, default, and whether it is hidden: the row id of a table declared without a primary key (*Tables without a primary key*). The physical type follows from the SQL type (`types_design.md`, *Types*). |
+| primary key | Column ids, in key order. Always ascending; a primary key column is never null. For a table declared without one, its hidden row id. |
 | indexes | Each: permanent `id`, `name`, unique or not, parts as (column id, `ASC`/`DESC`). |
 | layouts | Each layout generation: its object id, its generation number, `bitmap_bytes`, and its offset table (column id → byte offset or variable slot). The last is current. Each table has one until `REBUILD` exists, which appends one (#503). |
 
@@ -37,10 +37,10 @@ Little-endian, every list counted, every string a `u16` length and its
 bytes:
 
 ```
-u16 format                   ; kRecordFormat, 3
+u16 format                   ; kRecordFormat, 4
 u32 id, str name, u32 version, u32 next_col_id
 u16 ncols   { u32 len, u32 id, str name, u8 kind, u32 length, u8 precision, u8 scale,
-              u8 nullable, u8 default_tag, default }
+              u8 nullable, u8 default_tag, default, u8 hidden }
 u16 npk     { u32 col_id }
 u16 nidx    { u32 len, u32 id, str name, u8 unique, u16 nparts { u32 col_id, u8 desc } }
 u16 nlayout { u32 len, u32 layout_id, u16 generation, u16 bitmap_bytes, u16 var_table, u16 nvar,
@@ -62,15 +62,18 @@ too. A build reads every format from 3 to its own, taking an absent field
 at its default; it refuses a newer format, whose added fields it may not be
 able to ignore safely, and an older one: format 1 holds the earliest build's row
 positions, format 2 (#490's) no SQL types. Both predate any database worth
-reading. The record format also names the row format its positions are
-for; formats 2 and 3 share the 12-byte-header row format.
+reading. Format 4 added `hidden` at the end of a column entry; a format-3
+record reads with no hidden column, as every table then had a declared
+primary key. The record format also names the row format its positions are
+for; formats 2, 3 and 4 share the 12-byte-header row format.
 
 **A record that does not parse is refused at load**, with the table's id:
 a truncated field, a type kind or tag outside its set, a physical type that
 disagrees with the SQL type, a key or index column that is not a column of
 the table or appears twice, a layout that fails the row format's invariants, trailing bytes
-after the last field. The catalog never opens a database it cannot decode
-correctly.
+after the last field, a hidden column that is not the whole primary key, a
+BIGINT, nameless and without a default, or that an index names, or a second
+one. The catalog never opens a database it cannot decode correctly.
 
 ## Storage
 
@@ -147,6 +150,49 @@ Keeping one entry shape, rather than storing a unique index as its parts
 with the primary key in the value, keeps `bc_scan_row`, the covering reads
 and `DESC` the same for every index, and needs no second shape for the
 entries whose parts are null.
+
+## Tables without a primary key
+
+PostgreSQL takes a table without a primary key, and keeps every row
+inserted into it, duplicates included. The layer's rows are keyed (`02
+<table_id> <primary key>`), so such a table gets a key of its own: a
+**hidden row id**, a `BIGINT NOT NULL` column after the declared ones,
+which is the whole primary key.
+
+- **No statement sees it.** It has no name, and `Table::column(name)` never
+  returns it, so no statement can name, set, compare, group or select it,
+  and `CREATE INDEX` cannot take it. An `INSERT` without a column list
+  fills the declared columns, as PostgreSQL does. A `GROUP BY` takes no
+  functional dependency from it, as PostgreSQL takes none from a table
+  without a key. The plan API, the plans and their constants are those of
+  any table; a plan's header names the column `(row id)`.
+- **The runtime fills it.** `bc_row_begin`, which writes a column's
+  default, also draws the table's next row id
+  (`LiveCatalog::next_row_id`), so an `INSERT` plan never names it, and a
+  retried plan draws another. `bc_row_from` copies it, so an `UPDATE`
+  keeps a row's id.
+- **Where an id comes from.** Each `LiveCatalog` holds, per table with a
+  row id, the next id to hand out, under a mutex held only to advance it.
+  A table enters at its first insert, seeded from the engine's latest
+  state: one past the greatest id its row range holds (one reverse step,
+  `rkeys_from`), or 1 for none. No id of this catalog's is out before the
+  seed, so every id in use is then committed and below it. Nothing is
+  persisted: the data file is the only record, and the row keys are the
+  count's record. So:
+  - concurrent inserts never draw the same id, and so never conflict with
+    each other on the key, in autocommit or in transactions;
+  - an insert that fails, conflicts or rolls back leaves a gap;
+  - while a catalog lives, no id is handed out twice;
+  - after a reopen, the ids of rows deleted from the end of the table, or
+    drawn and never committed, may be handed out again, as PostgreSQL
+    reuses a `ctid`. No row holds them then.
+  - A second `LiveCatalog` on the same open database (only tests make one)
+    counts on its own; an id both draw is refused by the engine's check of
+    every key a commit writes, never written twice.
+- **The rejected alternative** was a stored counter per table. Every
+  insert would write it, so any two concurrent inserts into the table
+  would conflict, and it would be state outside the rows that has to
+  agree with them.
 
 ## The in-memory form
 
@@ -240,7 +286,7 @@ disk and in memory, as it was.
 
 | Statement | Batch |
 |---|---|
-| `CREATE TABLE` | Record, name entry (`ensure_absent`), counters. Two ids: the table and its first layout. The bitmap is sized as the row format says. |
+| `CREATE TABLE` | Record, name entry (`ensure_absent`), counters. Two ids: the table and its first layout. The bitmap is sized as the row format says. Without a primary key, the record holds the hidden row id (*Tables without a primary key*). A table of no columns is refused (0A000); PostgreSQL takes one. |
 | `CREATE [UNIQUE] INDEX … (col [DESC], …)` | Record with the index, name entry (`ensure_absent`), counters, an entry per existing row, `ensure_range_unchanged` over the table's rows. A unique index whose rows already hold a duplicate is refused. |
 | `DROP TABLE` | Record and name entries deleted; `del_range` over `02 <table_id>` and over `03 <index_id>` per index. |
 | `DROP INDEX` | Record without the index, name entry deleted, `del_range` over `03 <index_id>`. |
