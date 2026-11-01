@@ -913,11 +913,10 @@ def test_cursor_errors_and_the_failed_block(server):
         assert states(c.until_ready()) == [state], sql
     c.send(query("ROLLBACK"))
     c.until_ready()
-    # Directions that are phase 5, a backward fetch on NO SCROLL, BINARY, an unknown name.
+    # A backward fetch on NO SCROLL, BINARY, an unknown name.
     for declare, sql, state in [
-        ("DECLARE c SCROLL CURSOR FOR SELECT k FROM t", "FETCH LAST FROM c", "0A000"),
-        ("DECLARE c SCROLL CURSOR FOR SELECT k FROM t", "FETCH 0 FROM c", "0A000"),
         ("DECLARE c NO SCROLL CURSOR FOR SELECT k FROM t", "FETCH PRIOR FROM c", "55000"),
+        ("DECLARE c NO SCROLL CURSOR FOR SELECT k FROM t", "FETCH LAST FROM c", "55000"),
         ("DECLARE c BINARY CURSOR FOR SELECT k FROM t", "SELECT 1", "0A000"),
         ("DECLARE c SCROLL CURSOR FOR SELECT k FROM t FOR UPDATE", "SELECT 1", "0A000"),
         ("DECLARE c CURSOR FOR SELECT k FROM t", "CLOSE nothing", "34000"),
@@ -935,6 +934,100 @@ def test_cursor_errors_and_the_failed_block(server):
             assert states(c.until_ready()) == [state], sql
         c.send(query("ROLLBACK"))
         c.until_ready()
+
+
+def test_every_fetch_direction_and_its_command_tag(server):
+    c = connect(server)
+    cursor_table(c)  # k = 1 .. 5
+    c.send(query("BEGIN"))
+    c.until_ready()
+    c.send(query("DECLARE c SCROLL CURSOR FOR SELECT k FROM t ORDER BY k"))
+    c.until_ready()
+    # (statement, rows, tag): recorded from PostgreSQL 16 and kept in step with it.
+    for sql, rows, tag in [
+        ("FETCH LAST FROM c", [["5"]], "FETCH 1"),
+        ("FETCH PRIOR c", [["4"]], "FETCH 1"),
+        ("FETCH BACKWARD 2 FROM c", [["3"], ["2"]], "FETCH 2"),
+        ("FETCH NEXT IN c", [["3"]], "FETCH 1"),
+        ("FETCH ABSOLUTE 1 FROM c", [["1"]], "FETCH 1"),
+        ("FETCH PRIOR FROM c", [], "FETCH 0"),
+        ("FETCH PRIOR FROM c", [], "FETCH 0"),
+        ("FETCH RELATIVE 3 FROM c", [["3"]], "FETCH 1"),
+        ("FETCH 0 FROM c", [["3"]], "FETCH 1"),
+        ("FETCH FORWARD 9 FROM c", [["4"], ["5"]], "FETCH 2"),
+        ("FETCH 0 FROM c", [], "FETCH 0"),
+        ("FETCH BACKWARD ALL FROM c", [["5"], ["4"], ["3"], ["2"], ["1"]], "FETCH 5"),
+        ("FETCH -2 FROM c", [], "FETCH 0"),
+        ("FETCH ABSOLUTE -2 FROM c", [["4"]], "FETCH 1"),
+        ("FETCH ABSOLUTE 9 FROM c", [], "FETCH 0"),
+        ("FETCH FIRST FROM c", [["1"]], "FETCH 1"),
+    ]:
+        c.send(query(sql))
+        out = c.until_ready()
+        assert states(out) == [] and data(out) == rows and tags(out) == [tag], sql
+        assert kinds(out) == (b"TCZ" if not rows else b"T" + b"D" * len(rows) + b"CZ"), sql
+    for sql, tag in [
+        ("MOVE LAST IN c", "MOVE 1"),
+        ("MOVE BACKWARD ALL IN c", "MOVE 4"),
+        ("MOVE FORWARD ALL IN c", "MOVE 5"),
+        ("MOVE ABSOLUTE 0 IN c", "MOVE 0"),
+        ("MOVE RELATIVE 0 IN c", "MOVE 0"),
+        ("MOVE ABSOLUTE 2 IN c", "MOVE 1"),
+        ("MOVE 0 IN c", "MOVE 1"),
+    ]:
+        c.send(query(sql))
+        out = c.until_ready()
+        assert kinds(out) == b"CZ" and tags(out) == [tag], sql
+    # Extended protocol: a FETCH in any direction describes as the cursor's columns.
+    c.send(parse("FETCH BACKWARD 2 FROM c", "b"), describe("S", "b"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"1tTZ" and row_description(out[2][1]) == [("k", 23)]
+    c.send(bind([], "b", "pb"), execute("pb"), SYNC)
+    out = c.until_ready()
+    assert data(out) == [["1"]] and tags(out) == ["FETCH 1"]  # from row 2: one row, then the start
+    c.send(parse("FETCH ABSOLUTE -1 FROM c", "l"), bind([], "l", "pl"), describe("P", "pl"), execute("pl"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"12TDCZ" and data(out) == [["5"]]
+    c.send(query("COMMIT"))
+    c.until_ready()
+
+
+def test_no_scroll_refusals_fail_the_block_with_55000(server):
+    c = connect(server)
+    cursor_table(c)
+    for first, refused in [
+        ("FETCH 2 FROM n", "FETCH PRIOR FROM n"),
+        ("FETCH 2 FROM n", "FETCH 0 FROM n"),
+        ("FETCH 2 FROM n", "FETCH ABSOLUTE 1 FROM n"),
+        ("FETCH 2 FROM n", "MOVE BACKWARD 1 IN n"),
+        ("FETCH 2 FROM n", "FETCH LAST FROM n"),
+    ]:
+        c.send(query("BEGIN"))
+        c.until_ready()
+        c.send(query("DECLARE n NO SCROLL CURSOR FOR SELECT k FROM t ORDER BY k"))
+        c.until_ready()
+        c.send(query(first))
+        assert data(c.until_ready()) == [["1"], ["2"]]
+        c.send(query(refused))
+        out = c.until_ready()
+        assert states(out) == ["55000"] and status(out) == "E", refused
+        c.send(query("FETCH NEXT FROM n"))
+        assert states(c.until_ready()) == ["25P02"]
+        c.send(query("ROLLBACK"))
+        c.until_ready()
+    # Going forward is not refused, and a hold cursor keeps its declaration.
+    c.send(query("BEGIN"))
+    c.until_ready()
+    c.send(query("DECLARE n NO SCROLL CURSOR WITH HOLD FOR SELECT k FROM t ORDER BY k"))
+    c.until_ready()
+    c.send(query("COMMIT"))
+    c.until_ready()
+    c.send(query("FETCH ABSOLUTE 4 FROM n"))
+    assert data(c.until_ready()) == [["4"]]
+    c.send(query("FETCH PRIOR FROM n"))
+    assert states(c.until_ready()) == ["55000"]
+    c.send(query("CLOSE n"))
+    c.until_ready()
 
 
 def test_a_cursor_does_not_see_later_writes_and_ends_with_its_transaction(server):

@@ -3,8 +3,9 @@
 Status: **design, revised to the owner's decisions of 2026-10-28** (written
 for #663, sqltest E121). Phases 1 (the replay runner, #717), 2 (pinned state,
 #718), 3 (`DECLARE`, `FETCH` forward, `MOVE`, `CLOSE` in a transaction
-block, #719) and 4 (`WITH HOLD` by holding the snapshot, `DECLARE` outside a
-block, #720) are built; nothing else is. The owner's direction: a cursor is
+block, #719), 4 (`WITH HOLD` by holding the snapshot, `DECLARE` outside a
+block, #720) and 5 (every `FETCH` direction, `SCROLL` and `NO SCROLL`, #721)
+are built; nothing else is. The owner's direction: a cursor is
 evaluated lazily; holding the whole result in memory is not the design. The
 first phases build a **replay cursor** (the snapshot and a position; each
 `FETCH` re-runs the plan to its position, with no checkpoint or other
@@ -721,7 +722,7 @@ rules, in PostgreSQL's order:
 | a name in use | `42P03`, the transaction aborts |
 | `FETCH`/`MOVE` of an unknown name, `CLOSE` of one | `34000` |
 | `FETCH`/`MOVE` forward, a count or `ALL` | the next rows; `FETCH n` and `MOVE n` count the rows |
-| `FETCH 0`, `ABSOLUTE`, `RELATIVE`, `FIRST`, `LAST`, `BACKWARD`, a negative count | `0A000`, names phase 5; a backward one on `NO SCROLL` is `55000` as PostgreSQL |
+| `FETCH 0`, `ABSOLUTE`, `RELATIVE`, `FIRST`, `LAST`, `BACKWARD`, a negative count | phase 5 (*As built (phase 5)*) |
 | `CLOSE name`, `CLOSE ALL` | `CLOSE CURSOR`, `CLOSE CURSOR ALL` |
 
 A `FETCH` returns its `RowDescription` even with no row, as PostgreSQL does.
@@ -744,6 +745,89 @@ calls. The statement kinds are the server's.
 
 **Conformance.** No sqltest id moves: the harness runs outside a block, so
 `DECLARE` is `25P01` there (*What the sqltest ids need*).
+
+## As built (phase 5)
+
+**Position.** `Cursor::position()` is 0 before the first row, the row's number
+on a row, and `rows + 1` after the last. The size `rows` is known once a run
+has reached the plan's end; `Cursor::at_end()` is "after the last row". A
+`FETCH` moves the cursor as PostgreSQL's does: it stops on the last row it
+returned (so `BACKWARD 2` from row 3 returns 2 and 1 and stands on 1), and
+asking for more rows than remain returns the rest and leaves it before the
+first row or after the last.
+
+**One fetch.** `CursorMove` is the direction and PostgreSQL's `howMany`. The
+cursor turns it into a window of rows `first … first + count − 1` and the new
+position, then makes one `execute_window` run with `skip = first − 1`, `limit
+= count` (none when the window is empty). A `BACKWARD` window is returned
+last row first by reversing the decoded rows in place. Once the size is
+known, a window past it is trimmed and no run is made.
+
+| Move, from position `p` | Window | New position |
+|---|---|---|
+| `FORWARD n`, `n` (`ALL`: no limit) | `p+1 … p+n` | `p+n`, or `rows+1` if fewer remained |
+| `BACKWARD n` (`ALL`) | `p−1` down to `p−n` | `p−n`, or `0` |
+| `FETCH 0`, `RELATIVE 0` | `p`, if it is a row | `p` |
+| `ABSOLUTE n` | `n` | `n`, or `rows+1` past the end |
+| `ABSOLUTE −n` | `rows−n+1` | that row, or `0` if none |
+| `RELATIVE n` | `p+n` | as `ABSOLUTE` |
+| `RELATIVE −n` | `p−n` | that row, or `0` |
+| `ABSOLUTE 0` | none | `0` |
+
+A negative `FORWARD` count is `BACKWARD` and the reverse, as PostgreSQL does.
+`FIRST` is `ABSOLUTE 1`, `LAST` is `ABSOLUTE −1`, `PRIOR` is `BACKWARD 1`.
+`MOVE` is the same run with the rows dropped and the tag `MOVE n`.
+
+**Cost.** Every move is one replay from the first row (no checkpoint, #731): a
+move whose window ends at row `r` reads `B + c·r` (*Cost of replay*), whatever
+the direction. `BACKWARD n` buffers `min(n, p−1)` rows: the run charges them to
+the statement's memory budget like any result, so a window that does not fit
+is `54000` and the transaction aborts; `BACKWARD ALL` buffers `p−1` rows.
+`LAST` and `ABSOLUTE −n` first learn the size, with a run that skips every row
+and keeps none (unencoded and uncharged, a full run's reads and no memory),
+then run the one row: two replays the first time, one after the size is known
+(`FETCH ALL` and any move that reaches the end also learn it). A reverse run
+for them is #725.
+
+**`SCROLL`.** The layer follows the design's choice: `SCROLL` and no keyword
+allow every direction; `NO SCROLL` refuses with `55000` ("cursor can only
+scan forward") what PostgreSQL's `NO SCROLL` refuses, checked before anything
+runs and leaving the cursor and the transaction usable through the embedded
+API (`CursorForwardOnly`), failing the block in the session as any error does:
+
+| On `NO SCROLL` | Refused (`55000`) | Allowed |
+|---|---|---|
+| `BACKWARD` or `PRIOR`, any count, `BACKWARD 0`, a negative `FORWARD` count | always | |
+| `FETCH 0`, `RELATIVE 0`, `FORWARD 0` | when the cursor is on a row | before the first row and after the last |
+| `RELATIVE −n` | always | `RELATIVE n`, `n > 0` |
+| `ABSOLUTE n`, `n > 0` | `n` ≤ the current row (`rows` when after the end) | a row further on, or past the end |
+| `ABSOLUTE 0` | on or after a row | before the first row |
+| `ABSOLUTE −n`, `LAST` | always | |
+
+These were checked against a PostgreSQL 16 server (the one at hand; PostgreSQL
+17 is the recording target, and the rules are the same in both).
+
+**Describe.** `Cursor::describe()` gives a cursor's columns without running or
+moving, which the extended protocol's `Describe` of any `FETCH` form uses;
+`fetch(0)` on the embedded API is the same (no rows, no movement).
+
+**Embedded API.** `Cursor::fetch(CursorMove)`; `Transaction::open_cursor(…,
+Scrolling)`, `Scrolling::ForwardOnly` for `NO SCROLL`. The earlier
+`position()` after a drain was `rows`; it is now `rows + 1`.
+
+**Tests.** `tests/api_cursor_test.cpp`: a model of PostgreSQL's `FETCH` that
+steps one row at a time (so it shares no arithmetic with the code) against
+every direction and count, from every position of results of 0, 1, 2, 3 and 6
+rows (empty cursor, one row, first, last, before the start, after the end),
+for plain, hold, `SCROLL` and `NO SCROLL` cursors and `MOVE`'s rows; random
+sequences of directions over five plans (a scan, a sort, a group, a join)
+compared with slicing the full result; a table of `NO SCROLL` refusals; later
+writes ignored in every direction; hold cursors scrolling after the commit;
+the allocation-fault sweep over a `BACKWARD` fetch; the statement budget.
+`tests/functional/cases/postgresql/cursors.yaml`: 27 cases of directions,
+`MOVE`, empty and one-row cursors, `NO SCROLL` and hold, recorded from
+PostgreSQL 16. `tests/server/test_wire.py`: tags, row framing, `Describe` and
+`55000` over the wire.
 
 ## Tests
 
@@ -786,7 +870,7 @@ interface, so phases 3 to 7 do not change when it lands.
 | 2 | #718 | **Done.** Copy-on-write overlay; pinned parameters, clocks and plan; forward-only `Cursor` in `Transaction` | none | |
 | 3 | #719 | **Done.** `DECLARE`, `FETCH` forward, `MOVE`, `CLOSE`, `FOR READ ONLY`, `FOR UPDATE [OF t]` in the dialect and session, inside a block | none alone | decided |
 | 4 | #720 | **Done.** `WITH HOLD` by holding the snapshot (lazy, on `Snapshot::clone`); `DECLARE` outside a block, accepted as a hold cursor | 7 of 8 ids; e121_03_01_01 needs `ORDER BY` of an expression | decided (1, 3) |
-| 5 | #721 | Every `FETCH` direction, `SCROLL`, `55000` | none | |
+| 5 | #721 | **Done.** Every `FETCH` direction, `SCROLL` and `NO SCROLL`, `55000` | none (all eight E121-10 ids write `FETCH … INTO`, which stays refused) | |
 | 6 | #722 | `WHERE CURRENT OF` | none as written | **5** |
 | 7 | #724 | Replay cap, flags, accounting; no cursor-own timers or caps | none | **7** |
 | 8 | #729 | **Parked** (owner, 2026-10-28). Result cache for small blocking cursors | none | |
@@ -863,6 +947,8 @@ Still open:
   every plan; PostgreSQL refuses some plans.
 - `BACKWARD n` and `BACKWARD ALL` buffer the rows they return, within the
   statement budget.
+- `FETCH LAST`, a negative `ABSOLUTE` and the first move that needs the size
+  read the whole result once more; a reverse run would not (#725).
 - A sort or hash a cursor needs is built within the statement budget at
   every run that reaches it, never spilled.
 - A `WITH HOLD` cursor holds its snapshot, where PostgreSQL copies the rows

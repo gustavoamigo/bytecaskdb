@@ -393,8 +393,9 @@ the server adds:
   gives the cursor's columns when the cursor exists and `NoData` before;
   `Execute` of a `FETCH` sends `DataRow`s and the tag, never a
   `RowDescription`. `Execute` with a row limit is still `0A000`.
-- Only forward fetches (`NEXT`, a count, `FORWARD n`, `ALL`) run; the other
-  directions are `0A000`, naming phase 5.
+- Every `FETCH` and `MOVE` direction runs (`cursor_design.md`, *As built
+  (phase 5)*); a backward or re-reading move on a `NO SCROLL` cursor is
+  `55000` and fails the block.
 
 ## Extended query
 
@@ -884,8 +885,8 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 - `Execute` with a row limit, several statements in one `Query`, SQL
   `PREPARE`, `SET`, `SHOW`, `COPY` and cancel are refused.
 - Cursors: `DECLARE` outside `BEGIN` is a hold cursor, where PostgreSQL says
-  `25P01`; `WITH HOLD ... FOR UPDATE`, `BINARY` and every `FETCH` direction but
-  forward are `0A000` (`cursor_design.md`, *Known differences from PostgreSQL*).
+  `25P01`; `WITH HOLD ... FOR UPDATE` and `BINARY` are `0A000`
+  (`cursor_design.md`, *Known differences from PostgreSQL*).
 - A result is built whole by the embedded API before its first `DataRow`
   is sent. Streaming rows waits on the API streaming them, part of the
   transport design (#487, *Next*).

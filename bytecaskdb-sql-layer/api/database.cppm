@@ -319,6 +319,31 @@ enum class Holdability : std::uint8_t {
   Hold,   // survives its commit (WITH HOLD); dropped by its rollback
 };
 
+// Whether a cursor may move backward (DECLARE NO SCROLL says it may not).
+enum class Scrolling : std::uint8_t {
+  Any,
+  ForwardOnly,
+};
+
+// A FETCH or MOVE direction, as PostgreSQL's parser gives it: `count` is the
+// row count for Forward and Backward (kAll for ALL; negative reverses the
+// direction), the target row for Absolute (negative counts from the end) and
+// the offset for Relative. FETCH 0 is Forward with count 0.
+struct CursorMove {
+  enum class Kind : std::uint8_t { Forward, Backward, Absolute, Relative };
+  static constexpr std::int64_t kAll = std::numeric_limits<std::int64_t>::max();
+  Kind kind{Kind::Forward};
+  std::int64_t count{1};
+};
+
+// A move the cursor refuses because it was declared NO SCROLL and the move
+// goes backward (SQLSTATE 55000).
+class CursorForwardOnly : public std::runtime_error {
+public:
+  CursorForwardOnly() : std::runtime_error("cursor can only scan forward") {}
+  ~CursorForwardOnly() override;  // out of line: anchors the vtable (-Wweak-vtables)
+};
+
 // What commit() did, as PostgreSQL's COMMIT reports it in its command tag.
 enum class CommitOutcome {
   Committed,
@@ -353,8 +378,14 @@ struct CursorState {
   // constants and the clocks at the transaction's time.
   std::vector<Value> values;
   bc_overlay* overlay{nullptr};  // the transaction's writes as of open, released at close
-  std::uint64_t position{0};     // rows returned
-  bool end{false};               // the plan ran out of rows
+  // Where the cursor stands: 0 before the first row, the row's number on a
+  // row, `total + 1` after the last. `total` is the result's size once a run
+  // has reached the plan's end; position is never past `total + 1`.
+  std::uint64_t position{0};
+  std::optional<std::uint64_t> total;
+  Scrolling scrolling{Scrolling::Any};
+
+  [[nodiscard]] auto after_end() const noexcept -> bool { return total && position > *total; }
 
   [[nodiscard]] auto holdable() const noexcept -> bool { return hold != nullptr; }
 
@@ -457,15 +488,27 @@ public:
   Cursor& operator=(const Cursor&) = delete;
   ~Cursor() = default;
 
-  // The next `k` rows, fewer at the end; none once the end was reached or for
-  // k 0, without running. Throws std::logic_error on a closed cursor,
-  // TransactionAborted once its transaction aborted, DbClosed after the
-  // database closed. A run that fails (an ExecError, a budget) aborts the
-  // transaction, and so closes its cursors.
+  // The rows of PostgreSQL's FETCH for `move`, in the order it returns them
+  // (BACKWARD in reverse), and the cursor moves as PostgreSQL's does: a fetch
+  // past either end returns none and leaves it before the first or after the
+  // last row. Every move is position arithmetic and one run from the first
+  // row, so it costs the plan's work to the furthest row it reads; FETCH LAST
+  // and ABSOLUTE with a negative count first run to the end to learn the
+  // size, once. BACKWARD buffers the rows it returns, within the statement
+  // budget. Throws CursorForwardOnly for a backward move on a NO SCROLL
+  // cursor, std::logic_error on a closed cursor, TransactionAborted once its
+  // transaction aborted, DbClosed after the database closed. A run that fails
+  // (an ExecError, a budget) aborts the transaction, and so closes its cursors.
+  auto fetch(CursorMove move) -> Rows;
+  // The next `k` rows, fewer at the end: fetch of a forward move. None for
+  // k 0, without moving or running.
   auto fetch(std::uint64_t k) -> Rows;
+  // The columns and types of the rows, with none; runs nothing, moves nothing.
+  [[nodiscard]] auto describe() const -> Rows;
+  // 0 before the first row, the row's number on a row, rows + 1 after the last.
   [[nodiscard]] auto position() const noexcept -> std::uint64_t { return s_ ? s_->position : 0; }
-  // The plan ran out of rows: fetch returns none.
-  [[nodiscard]] auto at_end() const noexcept -> bool { return s_ && s_->end; }
+  // After the last row: a forward fetch returns none.
+  [[nodiscard]] auto at_end() const noexcept -> bool { return s_ && s_->after_end(); }
   [[nodiscard]] auto is_open() const noexcept -> bool { return s_ && s_->live.load(); }
   // Releases what it pins; the transaction goes on. Once closed, does nothing.
   void close() noexcept;
@@ -531,8 +574,8 @@ public:
   // limits how long that is. The overlay copy is charged to this
   // transaction's bound while it lasts. A hold cursor takes no FOR UPDATE
   // guard: a statement with one is the caller's to refuse.
-  auto open_cursor(const Statement& stmt, const std::vector<Value>& params, Holdability hold = Holdability::Plain)
-      -> Cursor;
+  auto open_cursor(const Statement& stmt, const std::vector<Value>& params, Holdability hold = Holdability::Plain,
+                   Scrolling scrolling = Scrolling::Any) -> Cursor;
   // Writes every statement's writes as one batch: Committed. After a failed
   // statement it writes nothing and returns RolledBack. Throws
   // SerializationFailure on a conflict and ExecError on an engine error,
@@ -788,6 +831,7 @@ constexpr std::uint32_t kMaxRetries = 3;
 ExecError::~ExecError() = default;
 SerializationFailure::~SerializationFailure() = default;
 TransactionAborted::~TransactionAborted() = default;
+CursorForwardOnly::~CursorForwardOnly() = default;
 TransactionResolutionUnknown::~TransactionResolutionUnknown() = default;
 auto TransactionResolutionUnknown::what() const noexcept -> const char* {
   return "the transaction's outcome is unknown: its commit failed after its batch may have reached the data file "
@@ -1700,7 +1744,8 @@ auto Transaction::execute_window(const Statement& stmt, const std::vector<Value>
   return out;
 }
 
-auto Transaction::open_cursor(const Statement& stmt, const std::vector<Value>& params, Holdability hold) -> Cursor {
+auto Transaction::open_cursor(const Statement& stmt, const std::vector<Value>& params, Holdability hold,
+                              Scrolling scrolling) -> Cursor {
   if (!h_) throw std::logic_error("the transaction has ended");
   std::shared_lock<std::shared_mutex> lock{life_->mu};
   check_usable();
@@ -1713,6 +1758,7 @@ auto Transaction::open_cursor(const Statement& stmt, const std::vector<Value>& p
     state->life = life_;
     state->db = db_;
     state->h = h_.get();
+    state->scrolling = scrolling;
     h_->cursors.push_back(state);
     (void)db_->run(h_->cx, stmt, params, h_->txn, h_->started_us, nullptr, {}, state.get());
     auto fail_from_txn = [&] {
@@ -1742,45 +1788,196 @@ auto Transaction::open_cursor(const Statement& stmt, const std::vector<Value>& p
   }
 }
 
-auto Cursor::fetch(std::uint64_t k) -> Rows {
-  if (!s_) throw std::logic_error("the cursor was moved from");
-  std::shared_lock<std::shared_mutex> lock{s_->life->mu};
-  if (s_->life->closed || s_->life->closing.load()) throw DbClosed();
-  if (!s_->live.load()) {
-    if (s_->aborted) throw TransactionAborted();
-    throw std::logic_error("the cursor is closed");
+namespace {
+
+// What a move reads: rows first .. first + count - 1 (count 0: none, nothing
+// runs), returned last row first when `reverse`, and the position it leaves
+// the cursor on, before clamping to the result's size.
+struct FetchPlan {
+  std::uint64_t first{1};
+  std::uint64_t count{0};
+  bool reverse{false};
+  std::uint64_t target{0};
+};
+
+constexpr auto kNoLimit = std::numeric_limits<std::uint64_t>::max();
+
+// A count's size: the direction is the caller's.
+constexpr auto magnitude(std::int64_t c) -> std::uint64_t {
+  if (c == CursorMove::kAll) return kNoLimit;
+  return c < 0 ? 0 - static_cast<std::uint64_t>(c) : static_cast<std::uint64_t>(c);
+}
+
+constexpr auto saturating_add(std::uint64_t a, std::uint64_t b) -> std::uint64_t {
+  return a > kNoLimit - b ? kNoLimit : a + b;
+}
+
+// PostgreSQL turns a negative FORWARD count into BACKWARD and the reverse.
+struct Step {
+  bool backward{false};
+  std::uint64_t n{0};
+};
+
+constexpr auto step_of(CursorMove m) -> Step {
+  auto toward_end = m.kind == CursorMove::Kind::Forward ? m.count >= 0 : m.count < 0;
+  return {!toward_end, magnitude(m.count)};
+}
+
+// Whether a NO SCROLL cursor refuses the move, as PostgreSQL does: any move
+// that goes back, or that would re-read a row at or before the position
+// (FETCH 0 and RELATIVE 0 among them, with a row to re-read).
+auto refused_when_forward_only(CursorMove m, const CursorState& s) -> bool {
+  const auto has_row = s.position >= 1 && !s.after_end();
+  switch (m.kind) {
+    case CursorMove::Kind::Forward:
+    case CursorMove::Kind::Backward: {
+      auto st = step_of(m);
+      return st.backward || (st.n == 0 && has_row);
+    }
+    case CursorMove::Kind::Absolute: {
+      if (m.count < 0) return true;
+      if (m.count == 0) return s.position >= 1;
+      auto at = s.total ? std::min(s.position, *s.total) : s.position;
+      return static_cast<std::uint64_t>(m.count) <= at;
+    }
+    case CursorMove::Kind::Relative: return m.count < 0 || (m.count == 0 && has_row);
   }
-  auto* h = s_->h;
-  if (k == 0 || s_->end) {
-    Rows none;
-    none.columns = s_->compiled->columns;
-    none.types = s_->compiled->column_types;
-    return none;
+  return false;
+}
+
+// Absolute with a negative count counts from the end: it needs the size.
+constexpr auto needs_total(CursorMove m) -> bool { return m.kind == CursorMove::Kind::Absolute && m.count < 0; }
+
+// The window of rows a move reads from position `p` (0 before the first row,
+// total + 1 after the last), the arithmetic PostgreSQL's FETCH defines.
+// `total` is the result's size when known; it only trims windows that lie
+// past it, which a run would find empty anyway.
+auto plan_fetch(CursorMove m, std::uint64_t p, std::optional<std::uint64_t> total) -> FetchPlan {
+  FetchPlan f;
+  auto one_row = [&](std::uint64_t row) {
+    f.first = row;
+    f.count = 1;
+    f.target = row;
+  };
+  switch (m.kind) {
+    case CursorMove::Kind::Forward:
+    case CursorMove::Kind::Backward: {
+      auto st = step_of(m);
+      if (st.n == 0) {  // the current row again
+        one_row(p);
+        if (p == 0) f.count = 0;
+      } else if (!st.backward) {
+        f.first = p + 1;
+        f.count = st.n;
+        f.target = saturating_add(p, st.n);
+      } else {
+        f.count = p == 0 ? 0 : std::min(st.n, p - 1);
+        f.first = p - f.count;
+        f.reverse = true;
+        f.target = p > st.n ? p - st.n : 0;
+      }
+      break;
+    }
+    case CursorMove::Kind::Absolute:
+      if (m.count > 0) {
+        one_row(static_cast<std::uint64_t>(m.count));
+      } else if (m.count < 0) {
+        auto from_end = magnitude(m.count);
+        if (from_end <= total.value_or(0)) {
+          one_row(*total - from_end + 1);
+        } else {
+          f.target = 0;
+        }
+      }
+      break;
+    case CursorMove::Kind::Relative:
+      if (m.count > 0) {
+        one_row(saturating_add(p, static_cast<std::uint64_t>(m.count)));
+      } else if (m.count < 0) {
+        auto back = magnitude(m.count);
+        if (back < p) one_row(p - back);
+      } else {
+        one_row(p);
+        if (p == 0) f.count = 0;
+      }
+      break;
   }
-  if (s_->holdable()) {
-    // Its own view, in a context of the pool: nothing of the transaction is
-    // read, so it works before and after the transaction ends. A failed fetch
-    // closes this cursor and no other.
-    try {
-      WindowRows out;
-      out.rows = s_->db->run_held(*s_, RowWindow{s_->position, k}, out);
-      s_->position += std::ssize(out.rows.rows);
-      s_->end = out.end;
-      return std::move(out.rows);
-    } catch (...) {
-      if (h != nullptr) std::erase(h->cursors, s_);
-      s_->close();
-      throw;
+  if (f.count > 0 && total) {
+    if (f.first > *total) {
+      f.count = 0;
+    } else {
+      f.count = std::min(f.count, *total - f.first + 1);
     }
   }
-  try {
+  return f;
+}
+
+}  // namespace
+
+auto Cursor::fetch(std::uint64_t k) -> Rows {
+  if (k == 0) return describe();
+  return fetch(CursorMove{CursorMove::Kind::Forward, static_cast<std::int64_t>(std::min<std::uint64_t>(k, CursorMove::kAll))});
+}
+
+namespace {
+// Under the database's shared lock.
+void require_live(const CursorState& s) {
+  if (s.life->closed || s.life->closing.load()) throw DbClosed();
+  if (!s.live.load()) {
+    if (s.aborted) throw TransactionAborted();
+    throw std::logic_error("the cursor is closed");
+  }
+}
+}  // namespace
+
+auto Cursor::describe() const -> Rows {
+  if (!s_) throw std::logic_error("the cursor was moved from");
+  std::shared_lock<std::shared_mutex> lock{s_->life->mu};
+  require_live(*s_);
+  Rows none;
+  none.columns = s_->compiled->columns;
+  none.types = s_->compiled->column_types;
+  return none;
+}
+
+auto Cursor::fetch(CursorMove move) -> Rows {
+  if (!s_) throw std::logic_error("the cursor was moved from");
+  std::shared_lock<std::shared_mutex> lock{s_->life->mu};
+  require_live(*s_);
+  auto& st = *s_;
+  if (st.scrolling == Scrolling::ForwardOnly && refused_when_forward_only(move, st)) throw CursorForwardOnly();
+  auto* h = st.h;
+  // A hold cursor reads its own view, in a context of the pool: nothing of the
+  // transaction is read, so it works before and after the transaction ends.
+  auto run = [&](RowWindow w) {
     WindowRows out;
-    out.rows = s_->db->run_pinned(h->cx, h->txn, *s_, RowWindow{s_->position, k}, out);
-    s_->position += std::ssize(out.rows.rows);
-    s_->end = out.end;
-    return std::move(out.rows);
+    out.rows = st.holdable() ? st.db->run_held(st, w, out) : st.db->run_pinned(h->cx, h->txn, st, w, out);
+    return out;
+  };
+  try {
+    // A run to the end that keeps one row learns the size, once.
+    if (needs_total(move) && !st.total) st.total = run(RowWindow{kNoLimit, 1}).position;
+    auto plan = plan_fetch(move, st.position, st.total);
+    Rows rows;
+    if (plan.count > 0) {
+      auto out = run(RowWindow{plan.first - 1, plan.count});
+      if (out.end) st.total = out.position;
+      rows = std::move(out.rows);
+      if (plan.reverse) std::ranges::reverse(rows.rows);
+    } else {
+      rows.columns = st.compiled->columns;
+      rows.types = st.compiled->column_types;
+    }
+    st.position = st.total ? std::min(plan.target, *st.total + 1) : plan.target;
+    return rows;
   } catch (...) {
-    h->abort();  // closes this cursor, with the transaction's others
+    if (st.holdable()) {
+      // A failed fetch closes this cursor and no other.
+      if (h != nullptr) std::erase(h->cursors, s_);
+      st.close();
+    } else {
+      h->abort();  // closes this cursor, with the transaction's others
+    }
     throw;
   }
 }
