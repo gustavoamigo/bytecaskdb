@@ -9,6 +9,8 @@
 //                     [--sync AT_EVERY_COMMIT|AT_INTERVAL|AT_FILE_ROTATION] [--sync-interval-ms 1000]
 //                     [--io-backend pread|mmap|buffer_pool] [--buffer-pool-size BYTES] [--buffer-pool-direct-io on|off]
 //                     [--statement-memory-bytes 67108864]
+//                     [--idle-in-transaction-timeout-ms 60000] [--statement-timeout-ms 0]
+//                     [--transaction-timeout-ms 0] [--idle-session-timeout-ms 0]
 //
 // Serves one database directory under one name, by default the directory's
 // last component. Trust authentication only: anyone who reaches the port is
@@ -78,7 +80,9 @@ auto flags(int argc, char** argv) -> std::map<std::string, std::string> {
   for (const auto& [k, v] : out) {
     if (k != "dir" && k != "listen" && k != "database" && k != "max-connections" && k != "workers" &&
         k != "thread-affinity" && k != "sync" && k != "sync-interval-ms" && k != "io-backend" &&
-        k != "buffer-pool-size" && k != "buffer-pool-direct-io" && k != "statement-memory-bytes") {
+        k != "buffer-pool-size" && k != "buffer-pool-direct-io" && k != "statement-memory-bytes" &&
+        k != "idle-in-transaction-timeout-ms" && k != "statement-timeout-ms" && k != "transaction-timeout-ms" &&
+        k != "idle-session-timeout-ms") {
       throw std::invalid_argument("unknown flag --" + k);
     }
   }
@@ -184,16 +188,23 @@ struct Connection {
   explicit Connection(LoopShard* sh) : shard{sh} {
     tcp.data = this;
     write_req.data = this;
+    idle_timer.data = this;
   }
 
   uv_tcp_t tcp{};
   uv_write_t write_req{};
+  // Armed while the session is idle and a timeout applies to it
+  // (docs/session_design.md, *Timeouts*); fires Pool::expire.
+  uv_timer_t idle_timer{};
   LoopShard* shard{nullptr};
   std::shared_ptr<pg::Pool::Slot> slot;
   std::string write_queue;
   std::string write_active;
   std::vector<char> read_buf;
   std::chrono::steady_clock::time_point last_progress{std::chrono::steady_clock::now()};
+  std::chrono::steady_clock::time_point idle_at{};  // from the last drain
+  pg::Timeout idle_kind{pg::Timeout::None};
+  int open_handles{2};  // tcp and idle_timer: freed when both have closed
   bool counted{false};
   bool reading{false};
   bool write_in_flight{false};
@@ -256,8 +267,9 @@ void pump(Connection* c);
 
 void on_alloc(uv_handle_t* h, std::size_t suggested, uv_buf_t* buf);
 void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf);
-void on_conn_closed(uv_handle_t* h) {
+void on_handle_closed(uv_handle_t* h) {
   auto* c = static_cast<Connection*>(h->data);
+  if (--c->open_handles > 0) return;
   auto* sh = c->shard;
   auto* s = sh->server;
   if (c->slot) s->pool.detach(c->slot);
@@ -265,6 +277,30 @@ void on_conn_closed(uv_handle_t* h) {
   sh->conns.erase(c);
   delete c;
   check_shard_shutdown_complete(sh);
+}
+
+void close_connection(Connection* c) {
+  c->closing = true;
+  uv_close(reinterpret_cast<uv_handle_t*>(&c->idle_timer), on_handle_closed);
+  uv_close(reinterpret_cast<uv_handle_t*>(&c->tcp), on_handle_closed);
+}
+
+void on_idle_timer(uv_timer_t* t) {
+  auto* c = static_cast<Connection*>(t->data);
+  if (c->closing || !c->slot) return;
+  // Does nothing if the session ran meanwhile: its next idle drain re-arms.
+  (void)c->shard->server->pool.expire(c->slot, c->idle_kind);
+}
+
+// While the session is idle and one of its timeouts applies, the timer runs
+// to that timeout's deadline; otherwise it is stopped.
+void arm_idle_timer(Connection* c) {
+  if (!c->worker_idle || c->session_ended || c->idle_kind == pg::Timeout::None) {
+    (void)uv_timer_stop(&c->idle_timer);
+    return;
+  }
+  auto left = std::chrono::ceil<std::chrono::milliseconds>(c->idle_at - std::chrono::steady_clock::now()).count();
+  (void)uv_timer_start(&c->idle_timer, on_idle_timer, left > 0 ? static_cast<std::uint64_t>(left) : 0, 0);
 }
 
 void on_write(uv_write_t* req, int status) {
@@ -289,6 +325,8 @@ void pump(Connection* c) {
     auto st = s->pool.drain(c->slot, c->write_queue, c->write_in_flight);
     c->session_ended = st.ended;
     c->worker_idle = st.idle;
+    c->idle_at = st.idle_at;
+    c->idle_kind = st.idle_kind;
     if (c->session_ended && c->reading) {
       (void)uv_read_stop(reinterpret_cast<uv_stream_t*>(&c->tcp));
       c->reading = false;
@@ -329,6 +367,8 @@ void pump(Connection* c) {
     auto st = s->pool.drain(c->slot, c->write_queue, false);
     c->session_ended = st.ended;
     c->worker_idle = st.idle;
+    c->idle_at = st.idle_at;
+    c->idle_kind = st.idle_kind;
   }
 
   if (c->worker_idle && !c->session_ended && !c->write_failed && !c->reading && !sh->stopping &&
@@ -336,6 +376,7 @@ void pump(Connection* c) {
     c->reading = true;
     (void)uv_read_start(reinterpret_cast<uv_stream_t*>(&c->tcp), on_alloc, on_read);
   }
+  if (c->slot) arm_idle_timer(c);
 
   auto done_writing = c->write_failed || (c->session_ended && c->write_queue.empty() && !c->write_in_flight);
   if (done_writing && c->worker_idle) {
@@ -343,8 +384,7 @@ void pump(Connection* c) {
       (void)uv_read_stop(reinterpret_cast<uv_stream_t*>(&c->tcp));
       c->reading = false;
     }
-    c->closing = true;
-    uv_close(reinterpret_cast<uv_handle_t*>(&c->tcp), on_conn_closed);
+    close_connection(c);
   }
 }
 
@@ -392,11 +432,11 @@ void accept_on_shard(LoopShard* sh, int fd, std::size_t conn_seq) {
 
   auto* c = new Connection{sh};
   (void)uv_tcp_init(&sh->loop, &c->tcp);
+  (void)uv_timer_init(&sh->loop, &c->idle_timer);
   if (uv_tcp_open(&c->tcp, fd) != 0) {
     ::close(fd);
-    c->closing = true;
     sh->conns.insert(c);
-    uv_close(reinterpret_cast<uv_handle_t*>(&c->tcp), on_conn_closed);
+    close_connection(c);
     return;
   }
   sh->conns.insert(c);
@@ -577,7 +617,19 @@ int main(int argc, char** argv) {
     // a '.' notwithstanding.
     auto named = std::filesystem::absolute(dir).lexically_normal();
     if (!named.has_filename()) named = named.parent_path();
+    pg::CancelRegistry cancels;  // outlives every session: the pool is destroyed first
     pg::SessionConfig cfg{f.contains("database") ? f["database"] : named.filename().string()};
+    cfg.cancels = &cancels;
+    // 0 turns a timeout off (docs/session_design.md, *Timeouts*).
+    for (auto [flag, out] : {std::pair{"idle-in-transaction-timeout-ms", &cfg.idle_in_transaction_timeout},
+                             std::pair{"statement-timeout-ms", &cfg.statement_timeout},
+                             std::pair{"transaction-timeout-ms", &cfg.transaction_timeout},
+                             std::pair{"idle-session-timeout-ms", &cfg.idle_session_timeout}}) {
+      if (!f.contains(flag)) continue;
+      std::uint32_t ms = 0;
+      number(flag, f[flag], "a number of milliseconds", ms);
+      *out = std::chrono::milliseconds{ms};
+    }
     std::size_t max_connections = 100;
     if (f.contains("max-connections")) {
       number("max-connections", f["max-connections"], "a positive number", max_connections);
