@@ -396,21 +396,17 @@ auto TransientEngineState::can_apply_puts_checked(const WritePlan &plan)
 
 auto TransientEngineState::apply_puts_checked(
     const WritePlan &plan, std::span<const std::uint64_t> offsets) -> bool {
+  // One per put applied, newest last. `key` points into the plan, which
+  // outlives this call; `undo` does not outlive it.
   struct Undo {
     std::span<const std::byte> key;
     KeyDirEntry now;               // where the plan put the key
     std::optional<KeyDirHit> was;  // what it replaced; none for an insert
   };
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wexit-time-destructors"
-  // Reused across plans, so the serial section allocates nothing here once
-  // warm. Cleared on entry; they hold no DB's state between calls.
-  thread_local std::vector<Undo> undo;  // TLS: scratch
-  using Dead = std::pair<std::uint32_t, std::uint64_t>;  // file, bytes
-  thread_local std::vector<Dead> dead;  // TLS: scratch
-#pragma clang diagnostic pop
-  undo.clear();
-  dead.clear();
+  // Reserved up front, so a push never allocates after the descent it
+  // records has changed the tree.
+  std::vector<Undo> undo;
+  undo.reserve(plan.writes_.size());
 
   const bool multi = plan.write_count() > 1;
   const auto first_seq = next_seq_;
@@ -445,21 +441,16 @@ auto TransientEngineState::apply_puts_checked(
     note_pending(offsets[io_idx], next_seq_, key_span, val_size);
     const auto entry = KeyDirEntry::make(next_seq_, offsets[io_idx],
                                          active_file_id_, val_size);
-    std::optional<KeyDirHit> existing;
     if (const auto &at = plan.resolved_entry(w_idx)) {
       if (!kd_put_at(key_dir_, key_span, *at, entry)) return abandon();
-      existing = kd_hit(*at);
+      undo.push_back({key_span, entry, kd_hit(*at)});
     } else {
-      existing = kd_put(key_dir_, key_span, entry, kd_ctx());
-      if (existing) {  // the key appeared since the snapshot
-        undo.push_back({key_span, entry, existing});
-        return abandon();
-      }
+      undo.push_back(
+          {key_span, entry, kd_put(key_dir_, key_span, entry, kd_ctx())});
+      // An insert that displaced a record: the key appeared since the
+      // snapshot. The record goes back with the rest of the plan.
+      if (undo.back().was) return abandon();
     }
-    undo.push_back({key_span, entry, existing});
-    if (existing)
-      dead.emplace_back(existing->file_id(),
-                        entry_size(key_span.size(), existing->value_size()));
     put_bytes += entry_size(key_span.size(), val_size);
     ++next_seq_;
     ++io_idx;
@@ -476,8 +467,12 @@ auto TransientEngineState::apply_puts_checked(
                                       .marker_added = markers,
                                       .min_sequence = first_seq,
                                       .max_sequence = next_seq_ - 1});
-  for (const auto &[file_id, bytes] : dead)
-    file_stats_.patch(file_id, {.live_removed = bytes});
+  for (const auto &u : undo) {
+    if (u.was)
+      file_stats_.patch(u.was->file_id(),
+                        {.live_removed = entry_size(u.key.size(),
+                                                    u.was->value_size())});
+  }
   return true;
 }
 

@@ -14229,16 +14229,48 @@ TEST_CASE("checked puts: plans checked by their descents commit and conflict "
         bytecask::WritePlan pb{std::move(pair.second)};
         const auto ops = 1 + rng() % 6;
         std::string last;
+        // A key takes one guard kind: two on one key contradict.
+        std::set<std::string> guarded;
+        const auto guard = [&](const std::string &k, auto add) {
+          if (!guarded.insert(k).second) return;
+          add(pa, to_bytes(k));
+          add(pb, to_bytes(k));
+        };
         for (std::size_t o = 0; o < ops; ++o) {
           const auto k = !last.empty() && rng() % 6 == 0 ? last : key();
           last = k;
           const auto v = value();
           if (rng() % 4 == 0) {
-            pa.ensure_absent(to_bytes(k));
-            pb.ensure_absent(to_bytes(k));
+            guard(k, [](bytecask::WritePlan &p, bytecask::BytesView b) {
+              p.ensure_absent(b);
+            });
           }
           pa.put(to_bytes(k), to_bytes(v));
           pb.put(to_bytes(k), to_bytes(v));
+        }
+        // Guards the fused check leaves to validate_preconditions: on keys
+        // the plan reads but need not write, and on a range of the hot set.
+        switch (rng() % 6) {
+        case 0:
+          guard(key(), [](bytecask::WritePlan &p, bytecask::BytesView b) {
+            p.ensure_present(b);
+          });
+          break;
+        case 1:
+          guard(key(), [](bytecask::WritePlan &p, bytecask::BytesView b) {
+            p.ensure_unchanged(b);
+          });
+          break;
+        case 2: {
+          const auto lo = rng() % 15;
+          const auto from = std::format("k{:02d}", lo);
+          const auto to = std::format("k{:02d}", lo + 1 + rng() % (16 - lo - 1));
+          pa.ensure_range_unchanged(to_bytes(from), to_bytes(to));
+          pb.ensure_range_unchanged(to_bytes(from), to_bytes(to));
+          break;
+        }
+        default:
+          break;
         }
         const auto ra = a.apply_batch({.sync = false}, std::move(pa));
         const auto rb = b.apply_batch({.sync = false}, std::move(pb));
