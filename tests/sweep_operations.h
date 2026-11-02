@@ -219,6 +219,60 @@ inline auto snapshot_put_operation() -> Operation {
           }};
 }
 
+// A snapshot plan of puts alone: an update and an ensure_absent-guarded
+// insert, which the fused check confirms in the descents that apply them
+// (docs/bytecask_design.md, *Checked by the descent that applies it*).
+inline auto fused_puts_operation() -> Operation {
+  return {.name = "snapshot plan of puts",
+          .setup = seed,
+          .run =
+              [](DB &db) {
+                auto plan = [&db] {
+                  const SuspendSyscallFaults inputs;
+                  WritePlan p{db.snapshot()};
+                  p.put(to_bytes("k0"), to_bytes("over"));
+                  p.ensure_absent(to_bytes("n0"));
+                  p.put(to_bytes("n0"), to_bytes("new"));
+                  return p;
+                }();
+                const auto r = db.apply_batch({.sync = true}, std::move(plan));
+                return r && r->durable;
+              },
+          .transition = [](KeyValues kv) {
+            kv["k0"] = bytes("over");
+            kv["n0"] = bytes("new");
+            return kv;
+          }};
+}
+
+// The same shape, whose last put lost its race: the fused check applies the
+// update and the insert, finds the conflict, undoes both, and the two-pass
+// check refuses the plan. The competing write is made before the fault is
+// armed and is part of the transition; the plan must leave no trace of its
+// own whatever allocation fails.
+inline auto fused_puts_conflict_operation() -> Operation {
+  return {.name = "snapshot plan of puts that conflicts",
+          .setup = seed,
+          .run =
+              [](DB &db) {
+                auto plan = [&db] {
+                  const SuspendSyscallFaults inputs;
+                  WritePlan p{db.snapshot()};
+                  (void)db.put({.sync = true}, to_bytes("k2"), to_bytes("theirs"));
+                  p.put(to_bytes("k0"), to_bytes("over"));
+                  p.ensure_absent(to_bytes("n0"));
+                  p.put(to_bytes("n0"), to_bytes("new"));
+                  p.put(to_bytes("k2"), to_bytes("mine"));
+                  return p;
+                }();
+                return !db.apply_batch({.sync = true}, std::move(plan));
+              },
+          .transition = [](KeyValues kv) {
+            kv["k2"] = bytes("theirs");
+            return kv;
+          }};
+}
+
 inline auto del_operation() -> Operation {
   return {.name = "del",
           .setup = seed,
