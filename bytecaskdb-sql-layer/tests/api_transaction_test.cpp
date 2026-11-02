@@ -1582,11 +1582,51 @@ TEST_CASE("embedded API: a cursor's copy of its transaction's writes counts agai
     auto db = Database::open(dir.path());
     seed_wide(*db, 40'000);
   }
-  // As in the test above: a SELECT holds about 108 bytes a row, a
-  // transaction about 709 a row it updated. 3,500 rows updated: about 2.5 MB
-  // of writes, and as much again for the copy a cursor's pin may keep.
-  constexpr std::uint64_t kCap = 6u << 20;
-  auto db = Database::open(dir.path(), {.max_memory_bytes = kCap});
+  // 3,500 rows updated in statements of 100, so that no statement holds
+  // much beside what the transaction has taken in.
+  auto update = [](Transaction& t) {
+    for (std::int64_t lo = 0; lo < 3'500; lo += 100) {
+      (void)t.execute("UPDATE wide SET n = n + 1 WHERE id >= $1 AND id < $2", {lo, lo + 100});
+    }
+  };
+  constexpr auto kScan = "SELECT id FROM wide WHERE id < $1";
+  std::uint64_t writes = 0;  // what the transaction reserves for its writes
+  std::uint64_t copy = 0;    // what a cursor's pin reserves for its copy
+  {
+    // A cap far above it all, to read what each holds.
+    auto db = Database::open(dir.path(), {.max_memory_bytes = 1ull << 30});
+    const auto& scan = db->prepare(kScan);
+    auto t = db->begin();
+    update(t);
+    writes = db->memory_used_for_testing();
+    REQUIRE(writes > 0);
+    auto c = t.open_cursor(scan, {std::int64_t{10}}, Holdability::Hold);
+    copy = db->memory_used_for_testing() - writes;  // reserved at the DECLARE, with no statement after it
+    REQUIRE(copy > 0);
+    CHECK(t.commit() == CommitOutcome::Committed);
+    // The transaction returned its writes; the hold cursor kept its copy.
+    CHECK(db->memory_used_for_testing() == copy);
+    CHECK(c.fetch(100).rows.size() == 10);  // a fetch returns what it reserved
+    CHECK(db->memory_used_for_testing() == copy);
+    c.close();
+    CHECK(db->memory_used_for_testing() == 0);
+
+    // A plain cursor's copy goes with its transaction.
+    auto u = db->begin();
+    update(u);
+    auto p = u.open_cursor(scan, {std::int64_t{10}});
+    CHECK(db->memory_used_for_testing() > writes);
+    u.rollback();
+    CHECK(db->memory_used_for_testing() == 0);
+    db->close();
+  }
+  INFO("writes " << writes << " bytes, the cursor's copy " << copy << " bytes");
+  // A cap one byte short of both: the writes fit, the DECLARE does not, and
+  // the transaction aborts.
+  auto db = Database::open(dir.path(), {.max_memory_bytes = writes + copy - 1});
+  const auto& scan = db->prepare(kScan);
+  auto t = db->begin();
+  update(t);
   auto state = [](auto&& run) -> std::string {
     try {
       run();
@@ -1595,31 +1635,8 @@ TEST_CASE("embedded API: a cursor's copy of its transaction's writes counts agai
     }
     return "00000";
   };
-  constexpr auto kSelect = "SELECT id, n, pad FROM wide WHERE id < $1";
-  auto select = [&](std::int64_t rows) { return state([&] { (void)db->execute(kSelect, {rows}); }); };
-  const auto& scan = db->prepare("SELECT id FROM wide WHERE id < $1");
-
-  auto t = db->begin();
-  (void)t.execute("UPDATE wide SET n = n + 1 WHERE id < $1", {std::int64_t{3'500}});
-  CHECK(select(25'000) == "00000");  // 2.7 MB beside 2.5 MB
-  auto c = t.open_cursor(scan, {std::int64_t{10}}, Holdability::Hold);
-  // The pin is reserved at the DECLARE, with no statement after it: 5 MB held.
-  CHECK(select(25'000) == "53200");
-  CHECK(t.commit() == CommitOutcome::Committed);
-  // Committed, the transaction returned its writes, and the hold cursor kept
-  // its copy: 2.5 MB, so a 40,000-row SELECT (4.3 MB) does not fit, a
-  // 25,000-row one does.
-  CHECK(select(40'000) == "53200");
-  CHECK(select(25'000) == "00000");
-  CHECK(c.fetch(100).rows.size() == 10);
-  c.close();
-  CHECK(select(40'000) == "00000");
-
-  // A plain cursor's copy goes with its transaction.
-  auto u = db->begin();
-  (void)u.execute("UPDATE wide SET n = n + 1 WHERE id < $1", {std::int64_t{3'500}});
-  auto p = u.open_cursor(scan, {std::int64_t{10}});
-  CHECK(select(25'000) == "53200");
-  u.rollback();
-  CHECK(select(40'000) == "00000");
+  CHECK(state([&] { (void)t.open_cursor(scan, {std::int64_t{10}}, Holdability::Hold); }) == "53200");
+  CHECK(t.is_aborted());
+  CHECK(t.commit() == CommitOutcome::RolledBack);
+  CHECK(db->memory_used_for_testing() == 0);
 }

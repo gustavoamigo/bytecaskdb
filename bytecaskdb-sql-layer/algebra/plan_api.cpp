@@ -1626,8 +1626,11 @@ struct bc_overlay {
   std::shared_ptr<const Overlay> view;
   bc_txn* owner;
   std::uint64_t reserved;
-  // A hold cursor took this pin's share of the memory cap over (bc_txn_hold).
-  mutable bool held{false};
+  // A hold cursor took this pin over (bc_txn_hold), and with it `held_share`
+  // of the memory cap, which the transaction's reservation leaves out
+  // (pinned_by_holds) until the pin is released.
+  bool held{false};
+  std::uint64_t held_share{0};
 };
 
 // What a cursor that outlives its transaction reads: its own handle on the
@@ -3045,7 +3048,7 @@ bc_overlay* bc_txn_overlay_pin(bc_txn* txn) {
   return nullptr;
 }
 
-bc_hold* bc_txn_hold(bc_txn* txn, const bc_overlay* pin) {
+bc_hold* bc_txn_hold(bc_txn* txn, bc_overlay* pin) {
   BC_GUARD_BEGIN
   txn->sink().clear();
   // The pin made the snapshot and catalog the transaction's.
@@ -3057,13 +3060,15 @@ bc_hold* bc_txn_hold(bc_txn* txn, const bc_overlay* pin) {
     txn->sink().fail(BC_E_HANDLE, "bc_txn_hold: a hold cursor holds this pin already");
     return nullptr;
   }
-  // The pin's share moves from the transaction's reservation (reserved at
-  // the pin) to the hold's.
+  // The pin's share moves from the transaction's reservation (the pin
+  // reserved it, so the transaction holds at least that much) to the hold's.
+  // What moves is what the transaction stops counting: the two stay equal.
   const auto moved = txn->memory != nullptr ? std::min(pin->reserved, txn->reserved) : 0;
   auto* hold = new bc_hold{txn->snap->clone(), txn->pinned, pin->view, txn->memory, moved};
   txn->reserved -= moved;
-  txn->pinned_by_holds += pin->reserved;
+  txn->pinned_by_holds += moved;
   pin->held = true;
+  pin->held_share = moved;
   return hold;
   BC_GUARD_END(txn)
   if (txn != nullptr) txn_abort(txn);
@@ -3088,7 +3093,7 @@ void bc_ctx_begin_hold(bc_ctx* cx, const bc_hold* hold, const bc_params* params,
 void bc_txn_overlay_release(bc_overlay* pin) {
   if (pin == nullptr) return;
   pin->owner->pinned_bytes -= pin->reserved;
-  if (pin->held) pin->owner->pinned_by_holds -= pin->reserved;
+  if (pin->held) pin->owner->pinned_by_holds -= pin->held_share;
   --pin->owner->pins;
   delete pin;
 }

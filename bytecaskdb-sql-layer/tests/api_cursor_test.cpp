@@ -1231,7 +1231,9 @@ TEST_CASE("cursor: a fetch and a window take ExecutionOptions: a set flag or a p
     CHECK(state([&] { (void)txn.execute_window(scan, {}, RowWindow{0, 1000}, cancelled); }) == "57014");
     CHECK(txn.is_aborted());
   }
-  SECTION("execute_current_of takes them too: a one-row statement runs under the 64 reads a check needs") {
+  // execute_current_of takes them too, but its one-row statement never
+  // reaches the 64 reads a check is made at, so no test here can see it stop.
+  SECTION("execute_current_of with a set flag: one row runs under the 64 reads a check needs") {
     auto txn = db->begin();
     auto c = txn.open_cursor(scan, {});
     (void)c.fetch(1);

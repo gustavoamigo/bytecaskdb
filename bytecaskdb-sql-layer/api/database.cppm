@@ -657,9 +657,11 @@ public:
   // rollback or abort of this transaction (which drop it, as PostgreSQL drops
   // a cursor declared in a transaction that rolls back). No timer limits how
   // long that is. The overlay copy is charged to this transaction's bound
-  // while it lasts, and to DatabaseOptions::max_memory_bytes until close():
-  // ExecError BC_E_MEMORY (53200) past it, the transaction aborted. A hold cursor takes no FOR UPDATE
-  // guard: a statement with one is the caller's to refuse.
+  // while it lasts, and to DatabaseOptions::max_memory_bytes from this call
+  // to close(), past the commit: this call throws ExecError BC_E_MEMORY
+  // (53200) when the cap has no room for it, and the transaction aborts. A
+  // hold cursor takes no FOR UPDATE guard: a statement with one is the
+  // caller's to refuse.
   auto open_cursor(const Statement& stmt, const std::vector<Value>& params, Holdability hold = Holdability::Plain,
                    Scrolling scrolling = Scrolling::Any) -> Cursor;
   // Writes every statement's writes as one batch: Committed. After a failed
@@ -777,6 +779,9 @@ public:
   // Test only: how many times a cached plan was checked (bc_ctx_check)
   // against a catalog version it was not compiled or checked against.
   [[nodiscard]] auto plan_checks_for_testing() const -> std::uint64_t { return plan_checks_.load(); }
+  // Test only: what the statements, transactions and hold cursors in
+  // progress have reserved of max_memory_bytes (0 without a cap).
+  [[nodiscard]] auto memory_used_for_testing() const -> std::uint64_t { return memory_.used.load(); }
   // Test only (sql_layer_testing): every row of a table, in primary-key
   // order, read from the engine and decoded through the catalog: every
   // column, in the table's order. For the proof tests, which compare a table

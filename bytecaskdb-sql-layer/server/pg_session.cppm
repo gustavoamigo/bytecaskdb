@@ -1107,11 +1107,10 @@ private:
   // UPDATE or DELETE ... WHERE CURRENT OF c, on the row c stands on (docs/cursor_design.md,
   // *WHERE CURRENT OF*). Outside a block it is a statement of its own, as
   // every statement is; the cursor there is a hold cursor.
-  auto run_positioned(const Statement& stmt, const std::vector<Value>& params) -> Rows {
+  auto run_positioned(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts) -> Rows {
     const auto name = std::string{stmt.current_of()};
     auto& cursor = find_cursor(name);
     try {
-      auto opts = run_options();
       if (in_block_) return txn_->execute_current_of(stmt, params, cursor.cursor, opts);
       if (implicit_) return implicit_->execute_current_of(stmt, params, cursor.cursor, opts);
       auto t = db_.begin();
@@ -1224,7 +1223,7 @@ private:
           if (implicit_ && stmt.is_ddl()) refuse_ddl_beside_others();
           enter_statement(stmt);
           auto opts = run_options();
-          auto rows = !stmt.current_of().empty() ? run_positioned(stmt, {})
+          auto rows = !stmt.current_of().empty() ? run_positioned(stmt, {}, opts)
                       : in_block_                ? txn_->execute(stmt, {}, opts)
                       : implicit_                ? implicit_->execute(stmt, {}, opts)
                                                  : db_.execute(stmt, {}, opts);
@@ -1456,7 +1455,7 @@ private:
     Rows rows;
     enter_statement(*p.stmt);
     if (!p.stmt->current_of().empty()) {
-      rows = run_positioned(*p.stmt, portal.params);
+      rows = run_positioned(*p.stmt, portal.params, run_options());
     } else if (in_block_) {
       rows = txn_->execute(*p.stmt, portal.params, run_options());
     } else if (implicit_) {

@@ -222,7 +222,7 @@ void    bc_ctx_use_overlay(bc_ctx *, const bc_overlay *);
    so the statement must be a read. Free every context begun on a hold before
    bc_txn_hold_free; a hold may outlive its bc_txn and its pin. */
 typedef struct bc_hold bc_hold;
-bc_hold *bc_txn_hold(bc_txn *, const bc_overlay *);
+bc_hold *bc_txn_hold(bc_txn *, bc_overlay *);
 void    bc_txn_hold_free(bc_hold *);
 void    bc_ctx_begin_hold(bc_ctx *, const bc_hold *, const bc_params *, bc_budget);
 enum bc_commit_result bc_txn_commit(bc_txn *, bool sync);
