@@ -1573,3 +1573,53 @@ TEST_CASE("embedded API: a statement that would take what every statement and tr
   r.rollback();
   CHECK(failure([&] { select(40'000); }).first == "00000");
 }
+
+TEST_CASE("embedded API: a cursor's copy of its transaction's writes counts against max_memory_bytes, and a hold "
+          "cursor's after the commit, until it closes",
+          "[sql][api][txn][memory][cursor]") {
+  sql_test::TempDir dir{"api_cap_cursor"};
+  {
+    auto db = Database::open(dir.path());
+    seed_wide(*db, 40'000);
+  }
+  // As in the test above: a SELECT holds about 108 bytes a row, a
+  // transaction about 709 a row it updated. 3,500 rows updated: about 2.5 MB
+  // of writes, and as much again for the copy a cursor's pin may keep.
+  constexpr std::uint64_t kCap = 6u << 20;
+  auto db = Database::open(dir.path(), {.max_memory_bytes = kCap});
+  auto state = [](auto&& run) -> std::string {
+    try {
+      run();
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "00000";
+  };
+  constexpr auto kSelect = "SELECT id, n, pad FROM wide WHERE id < $1";
+  auto select = [&](std::int64_t rows) { return state([&] { (void)db->execute(kSelect, {rows}); }); };
+  const auto& scan = db->prepare("SELECT id FROM wide WHERE id < $1");
+
+  auto t = db->begin();
+  (void)t.execute("UPDATE wide SET n = n + 1 WHERE id < $1", {std::int64_t{3'500}});
+  CHECK(select(25'000) == "00000");  // 2.7 MB beside 2.5 MB
+  auto c = t.open_cursor(scan, {std::int64_t{10}}, Holdability::Hold);
+  // The pin is reserved at the DECLARE, with no statement after it: 5 MB held.
+  CHECK(select(25'000) == "53200");
+  CHECK(t.commit() == CommitOutcome::Committed);
+  // Committed, the transaction returned its writes, and the hold cursor kept
+  // its copy: 2.5 MB, so a 40,000-row SELECT (4.3 MB) does not fit, a
+  // 25,000-row one does.
+  CHECK(select(40'000) == "53200");
+  CHECK(select(25'000) == "00000");
+  CHECK(c.fetch(100).rows.size() == 10);
+  c.close();
+  CHECK(select(40'000) == "00000");
+
+  // A plain cursor's copy goes with its transaction.
+  auto u = db->begin();
+  (void)u.execute("UPDATE wide SET n = n + 1 WHERE id < $1", {std::int64_t{3'500}});
+  auto p = u.open_cursor(scan, {std::int64_t{10}});
+  CHECK(select(25'000) == "53200");
+  u.rollback();
+  CHECK(select(40'000) == "00000");
+}

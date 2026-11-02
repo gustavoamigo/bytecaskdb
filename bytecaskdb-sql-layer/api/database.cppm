@@ -655,9 +655,10 @@ public:
   // from that view. It pins the snapshot, and with it every tree node and
   // data file the snapshot reaches, until close(), the database's close or a
   // rollback or abort of this transaction (which drop it, as PostgreSQL drops
-  // a cursor declared in a transaction that rolls back). No timer or cap
-  // limits how long that is. The overlay copy is charged to this
-  // transaction's bound while it lasts. A hold cursor takes no FOR UPDATE
+  // a cursor declared in a transaction that rolls back). No timer limits how
+  // long that is. The overlay copy is charged to this transaction's bound
+  // while it lasts, and to DatabaseOptions::max_memory_bytes until close():
+  // ExecError BC_E_MEMORY (53200) past it, the transaction aborted. A hold cursor takes no FOR UPDATE
   // guard: a statement with one is the caller's to refuse.
   auto open_cursor(const Statement& stmt, const std::vector<Value>& params, Holdability hold = Holdability::Plain,
                    Scrolling scrolling = Scrolling::Any) -> Cursor;

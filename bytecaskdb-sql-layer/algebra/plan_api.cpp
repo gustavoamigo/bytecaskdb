@@ -884,6 +884,22 @@ void txn_detach(bc_txn* txn, bc_ctx* cx, bool abandoned) noexcept;
 // step per running statement early, never late.
 constexpr std::uint64_t kMemoryStep = 1u << 20;
 
+// Reserves at least `need` bytes of `cap`, `want` where it leaves room: the
+// bytes granted, or 0 (taking nothing) when `need` does not fit. Never waits.
+[[nodiscard]] auto cap_reserve(bc_memory_cap& cap, std::uint64_t need, std::uint64_t want) noexcept -> std::uint64_t {
+  auto used = cap.used.load(std::memory_order_relaxed);
+  for (;;) {
+    if (used > cap.cap || need > cap.cap - used) return 0;
+    const auto grant = std::min(std::max(want, need), cap.cap - used);
+    if (cap.used.compare_exchange_weak(used, used + grant, std::memory_order_relaxed)) return grant;
+  }
+}
+
+auto cap_message(const bc_memory_cap& cap) -> std::string {
+  return "out of memory: the statements and transactions in progress would hold more than the memory cap of " +
+         std::to_string(cap.cap) + " bytes";
+}
+
 struct bc_ctx {
   bytecask::DB* db;
   LiveCatalog* live;
@@ -1118,20 +1134,15 @@ struct bc_ctx {
   // multiple where the cap leaves room for one: false, and BC_E_MEMORY
   // (SQLSTATE 53200), if the cap has no room for `need`. Never waits.
   [[nodiscard]] auto reserve(std::uint64_t need) -> bool {
+    if (need == 0) return true;
     const auto want = need > UINT64_MAX - (kMemoryStep - 1) ? need : (need + kMemoryStep - 1) / kMemoryStep * kMemoryStep;
-    auto used = memory->used.load(std::memory_order_relaxed);
-    for (;;) {
-      if (used > memory->cap || need > memory->cap - used) {
-        fail(BC_E_MEMORY, "out of memory: the statements and transactions in progress would hold more than the memory cap of " +
-                              std::to_string(memory->cap) + " bytes");
-        return false;
-      }
-      const auto grant = std::min(want, memory->cap - used);
-      if (memory->used.compare_exchange_weak(used, used + grant, std::memory_order_relaxed)) {
-        reserved += grant;
-        return true;
-      }
+    const auto grant = cap_reserve(*memory, need, want);
+    if (grant == 0) {
+      fail(BC_E_MEMORY, cap_message(*memory));
+      return false;
     }
+    reserved += grant;
+    return true;
   }
 
   // Moves what one buffer is charged, `held`, to its size now: a release
@@ -1552,6 +1563,11 @@ struct bc_txn {
   // as of its pin, counted by txn_holds so the write that follows a clone
   // cannot pass max_bytes for the copy a cursor keeps.
   std::uint64_t pinned_bytes{0};
+  // What of pinned_bytes hold cursors (bc_txn_hold) took over: each reserves
+  // its pin's share of the memory cap itself, and keeps it past the
+  // transaction's end, so the transaction's reservation leaves it out
+  // (cap_holds).
+  std::uint64_t pinned_by_holds{0};
   std::uint64_t pins{0};  // bc_overlay handles live
   std::vector<Effect> guards;          // the statements' guards, in their order
   std::vector<Claim> claims;           // the statements' insert claims, in their order
@@ -1610,15 +1626,34 @@ struct bc_overlay {
   std::shared_ptr<const Overlay> view;
   bc_txn* owner;
   std::uint64_t reserved;
+  // A hold cursor took this pin's share of the memory cap over (bc_txn_hold).
+  mutable bool held{false};
 };
 
 // What a cursor that outlives its transaction reads: its own handle on the
 // snapshot (a clone, so the transaction's commit may move the original into
 // its WritePlan), the catalog version and the overlay as they were pinned.
+//
+// It outlives the transaction, and the transaction's reservation of the
+// memory cap with it, so it takes over its pin's share of the cap at
+// bc_txn_hold (the copy a pin may keep, which the transaction had reserved)
+// and returns it when freed. Not counted: the snapshot's tree nodes and data
+// files, which no transaction's reservation counts either.
 struct bc_hold {
   bytecask::Snapshot snap;
   std::shared_ptr<const Catalog> pinned;
   std::shared_ptr<const Overlay> view;
+  bc_memory_cap* memory{nullptr};
+  std::uint64_t reserved{0};
+
+  bc_hold(bytecask::Snapshot s, std::shared_ptr<const Catalog> c, std::shared_ptr<const Overlay> v, bc_memory_cap* m,
+          std::uint64_t r)
+      : snap{std::move(s)}, pinned{std::move(c)}, view{std::move(v)}, memory{m}, reserved{r} {}
+  ~bc_hold() {
+    if (reserved != 0) memory->used.fetch_sub(reserved, std::memory_order_relaxed);
+  }
+  bc_hold(const bc_hold&) = delete;
+  bc_hold& operator=(const bc_hold&) = delete;
 };
 
 namespace {
@@ -1636,6 +1671,10 @@ namespace {
 // replaces or erases others only frees. So the commit needs nothing its
 // statements were not held to.
 auto txn_holds(const bc_txn& t) -> std::uint64_t { return t.overlay->bytes + t.held + t.pinned_bytes; }
+
+// What the transaction reserves of the memory cap for itself: txn_holds but
+// the pins hold cursors reserve.
+auto cap_holds(const bc_txn& t) -> std::uint64_t { return txn_holds(t) - t.pinned_by_holds; }
 
 }  // namespace
 
@@ -2984,6 +3023,19 @@ bc_overlay* bc_txn_overlay_pin(bc_txn* txn) {
     txn_abort(txn);
     return nullptr;
   }
+  // The transaction holds the copy from here (txn_holds counts it): reserved
+  // on the memory cap now, not at the next statement's bc_txn_add, which a
+  // transaction that only fetches never runs.
+  if (txn->memory != nullptr && cap_holds(*txn) + reserve > txn->reserved) {
+    const auto need = cap_holds(*txn) + reserve - txn->reserved;
+    const auto grant = cap_reserve(*txn->memory, need, need);
+    if (grant == 0) {
+      txn->sink().fail(BC_E_MEMORY, cap_message(*txn->memory));
+      txn_abort(txn);
+      return nullptr;
+    }
+    txn->reserved += grant;
+  }
   auto pin = std::make_unique<bc_overlay>(bc_overlay{txn->overlay, txn, reserve});
   txn->pinned_bytes += reserve;
   ++txn->pins;
@@ -3001,7 +3053,18 @@ bc_hold* bc_txn_hold(bc_txn* txn, const bc_overlay* pin) {
     txn->sink().fail(BC_E_HANDLE, "bc_txn_hold needs a live transaction and an overlay pinned from it");
     return nullptr;
   }
-  return new bc_hold{txn->snap->clone(), txn->pinned, pin->view};
+  if (pin->held) {
+    txn->sink().fail(BC_E_HANDLE, "bc_txn_hold: a hold cursor holds this pin already");
+    return nullptr;
+  }
+  // The pin's share moves from the transaction's reservation (reserved at
+  // the pin) to the hold's.
+  const auto moved = txn->memory != nullptr ? std::min(pin->reserved, txn->reserved) : 0;
+  auto* hold = new bc_hold{txn->snap->clone(), txn->pinned, pin->view, txn->memory, moved};
+  txn->reserved -= moved;
+  txn->pinned_by_holds += pin->reserved;
+  pin->held = true;
+  return hold;
   BC_GUARD_END(txn)
   if (txn != nullptr) txn_abort(txn);
   return nullptr;
@@ -3025,6 +3088,7 @@ void bc_ctx_begin_hold(bc_ctx* cx, const bc_hold* hold, const bc_params* params,
 void bc_txn_overlay_release(bc_overlay* pin) {
   if (pin == nullptr) return;
   pin->owner->pinned_bytes -= pin->reserved;
+  if (pin->held) pin->owner->pinned_by_holds -= pin->reserved;
   --pin->owner->pins;
   delete pin;
 }
@@ -3112,16 +3176,15 @@ bool bc_txn_add(bc_ctx* cx) {
   cx->locks.clear();
   // The write set is the transaction's now, and off the statement's budget.
   cx->release(cx->write_held);
-  // What the transaction holds grew by at most the write set
-  // (txn_holds): the statement's reservation, at least what it held, covers
-  // it and passes to the transaction. The rest of it is returned when the
-  // statement ends. It does not cover what no statement reserved: the
-  // overlays cursors pinned since (pinned_bytes, in txn_holds). That
-  // difference is reserved as any other, and past the cap the statement
-  // fails with BC_E_MEMORY and aborts the transaction: `used` never passes
-  // the cap unchecked, failing other sessions' statements.
-  if (txn->memory != nullptr && txn_holds(*txn) > txn->reserved) {
-    const auto grow = txn_holds(*txn) - txn->reserved;
+  // What the transaction holds grew by at most the write set (cap_holds;
+  // a cursor's pin reserved its own share when taken): the statement's
+  // reservation, at least what it held, covers it and passes to the
+  // transaction. The rest of it is returned when the statement ends. Should
+  // it not cover it, the difference is reserved as any other, and past the
+  // cap the statement fails with BC_E_MEMORY and aborts the transaction:
+  // `used` never passes the cap unchecked, failing other sessions' statements.
+  if (txn->memory != nullptr && cap_holds(*txn) > txn->reserved) {
+    const auto grow = cap_holds(*txn) - txn->reserved;
     const auto spare = cx->reserved - cx->mem_used;
     if (grow > spare && !cx->reserve(grow - spare)) {
       txn_abort(txn);
