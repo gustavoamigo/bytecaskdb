@@ -1,10 +1,11 @@
 # Stored procedures in the SQL layer
 
 Status: **design, approved by the owner on 2026-11-02** (#758, part of #487
-and #757; it replaces the sketch in #495). Phase 1 is built: `CREATE [OR
-REPLACE] PROCEDURE` and `DROP PROCEDURE` are parsed, checked and kept in the
-catalog (*Catalog record*). Nothing runs a procedure yet: `CALL` is refused.
-Phases 2 to 4 (*Phases*) are not built.
+and #757; it replaces the sketch in #495). Phases 1 and 2 are built:
+`CREATE [OR REPLACE] PROCEDURE` and `DROP PROCEDURE` are kept in the catalog
+(*Catalog record*), and the embedded API runs a procedure
+(`Database::call`, `Transaction::call`) from one generated file. `CALL` as
+SQL text, and so over the wire, is refused until phase 3 (*Phases*).
 
 The goal is PL/pgSQL procedures compiled by the layer's own compiler, so that
 HammerDB 6.0's stock PostgreSQL TPROC-C driver runs against
@@ -20,38 +21,44 @@ of this gap.
 
 ## One generated file per procedure
 
-A procedure compiles to **one generated C file**, compiled by TinyCC in one
-call. It holds:
+A procedure compiles to **one generated C file** (`plan/procedure.cppm`),
+compiled by TinyCC in one call (`TccPlan::compile_procedure`). It holds:
 
 - one function `s<i>` per embedded SQL statement: the code the code
-  generator prints today for that statement as a prepared statement, reading
-  `bc_param_*` and emitting through `bc_emit_*`;
-- the `sub<i>` functions those statements use, as plan files already have
+  generator prints for that statement as a prepared statement, under that
+  name (`generate_plan`'s `fn`), reading `bc_param_*` and emitting through
+  `bc_emit_*`;
+- the subquery functions those statements use, named `s<i>_sub<k>`
   (`planner_design.md`, *Subqueries*);
-- `void proc(bc_proc *px)`: the body's control flow and its expressions over
-  variables;
-- a constant table per statement: which variable feeds which `$n`, and which
-  result column goes into which `INTO` variable.
+- one `enum` of the constants every statement uses, each name once: a name
+  comes from an id (`TBL_9`, `COL_9_3`), so two statements that use it agree
+  on its value;
+- `void proc(bc_proc *px)`: the body's control flow and its expressions.
+
+Which variable feeds each `$n` of a statement, and which variables its row
+goes into, are not in the file: the compiler keeps them beside it
+(`ProcedureStatementPlan`), with what a prepared statement's compile keeps
+(the parameters' range checks, the constants), and the runtime's hooks read
+them.
 
 ```c
-// PROCEDURE neword(...)   schema: catalog v12
+// PROCEDURE p   schema: catalog v12
 #include "bc_proc.h"
-enum { TBL_9 = 9, COL_9_3 = 3, V_CNT = 4, V_OL_I_ID = 11, V_PRICE = 14, S_ITEM = 3 };
+enum { TBL_1 = 1, COL_1_2 = 2, PART_1_0 = 0 };
 
-/* SELECT i_price, i_name FROM item WHERE i_id = $1 */
-static void s3(bc_ctx *cx) {
-  bc_view row = bc_get(cx, TBL_9, bc_key_params(cx, TBL_9, 0, 1));
-  ...
-  bc_emit_begin(cx); bc_emit_col(cx, row, COL_9_3); ... bc_emit_end(cx);
-}
+// SELECT qty FROM t WHERE id = $1
+static void s0(bc_ctx *cx) { ... }
 
 void proc(bc_proc *px) {
-  bc_range r = bc_range_open(px, 1, bc_var_i64(px, V_CNT));   /* bounds fixed on entry */
-  while (bc_range_next(px, r)) {                             /* charged to the budget */
-    bc_ctx *cx = bc_stmt_begin(px, S_ITEM);   /* $1 <- V_OL_I_ID */
-    s3(cx);
-    bc_stmt_end(px, S_ITEM);                  /* effects into the transaction; row -> V_PRICE, V_NAME; FOUND */
-    bc_var_set_f64(px, V_AMOUNT, bc_mul_f64(px, bc_var_f64(px, V_QTY), bc_var_f64(px, V_PRICE)));
+  bc_ctx *cx = bc_proc_ctx(px);  /* the frame: $n is slot n */
+  s0(bc_stmt_begin(px, 0));      /* $1 <- k; INTO q */
+  bc_stmt_end(px, 0);
+  {
+    bc_range_open(px, 0, 1, 0, (bc_param_null(cx, 3)) ? 0 : bc_param_i64(cx, 3), bc_param_null(cx, 3), 0);
+    while (bc_range_next(px, 0, 4)) {  /* i, slot 4; a pass charged */
+      s1(bc_stmt_begin(px, 1));
+      bc_stmt_end(px, 1);
+    }
   }
 }
 ```
@@ -63,72 +70,102 @@ one plan run a statement never sees its own writes, and a second write of a
 row is refused (`transaction_design.md`, *Statements inside a transaction*).
 A procedure that updates a row and then reads or updates it again needs a
 boundary in between. The pair does per statement what `Transaction` does
-today:
+for a client's statement. The runtime (`bc_proc` in
+`algebra/runtime.cppm`) calls two hooks the embedded API sets
+(`Database::run_procedure`), so the parameter checks and the result decoding
+are a client statement's own:
 
-- `bc_stmt_begin` opens the statement on the procedure's transaction
-  (`bc_ctx_begin_txn`) and sets its parameters from the variables, as the
-  statement's table says.
+- `bc_stmt_begin`:
+  - takes each `$n` from its variable's slot and checks it as a client's
+    parameter is checked (`check_params`: the range of the column it meets);
+  - begins the statement on the procedure's transaction
+    (`bc_ctx_begin_txn`) and verifies its plan against the transaction's
+    pinned catalog: a plan that does not fit is a DDL since the transaction
+    began, 40001.
 - `bc_stmt_end`:
-  - appends the statement's effects to the transaction and applies them to
-    the overlay (`bc_txn_add`);
-  - copies the result row into the `INTO` variables, as copies the variables
-    own, since the statement's views die at reset (#597);
-  - records the row count for `FOUND`, and `STRICT`'s errors;
-  - resets `written_rows`, the arena and the statement budget
-    (`bc_ctx_reset`).
-- Each statement is its own savepoint: a failed statement leaves the
-  transaction's view as it was.
+  - adds the statement's effects to the transaction (`bc_txn_add`); a failed
+    statement aborts it, and the procedure with it;
+  - decodes its rows as a client's are, and copies the first into the
+    `INTO` variables, each checked against the variable's type (22003,
+    22001), as copies the slots own;
+  - sets `FOUND`: a row returned, or a row written;
+  - with `STRICT`, no row is P0002 and a second row P0003.
 
 ## The procedure language
 
 The plan language's rules (`plan_api_design.md`, *The language*) apply, with
-these changes:
+these changes, declared in `algebra/bc_proc.h`:
 
-- **Functions:** a procedure file may define `proc`, one `s<i>` per
-  statement, and the `sub<i>` functions those use.
-- **Variables** live in a frame the runtime owns, reached by slot number
-  through `bc_var_*`, so there are still no pointers. Assigning a string
-  copies it into the slot.
+- **Functions:** a procedure file defines `proc`, one `s<i>` per statement,
+  and their subquery functions.
+- **Variables** are slots of a frame the runtime owns: a context whose
+  parameter `$n` is slot `n` (`bc_proc_ctx`). The arguments come first, in
+  order, then `FOUND`, then the declared variables and the `FOR` variables,
+  then the constants of `proc()`'s expressions. `proc()` reads a slot as a
+  parameter and sets one with `bc_var_set_*`, so there are still no
+  pointers. Setting a value checks it against the variable's declared type
+  (22003, 22001); a string is copied into the slot.
 - **Loops** stay "only on an API iteration":
-  - `FOR i IN a..b` is `bc_range_next`; its bounds are evaluated once on
-    entry, so it always ends.
-  - `WHILE` and `LOOP` are charged to the statement budget on each pass.
-  - `FOR rec IN query` and cursor `FETCH` iterate over a statement's rows.
-- **Expressions over variables** are printed by the code generator plans
-  use, with variable reads in place of parameter reads. There is one
-  evaluator, not a second one in C++. A function such as `||`, `substr` or
-  `to_char` works in a procedure once the layer has it (#671, #685).
+  - `FOR i IN a..b [REVERSE]` is `bc_range_open` and `bc_range_next`; its
+    bounds are evaluated once on entry, so it always ends. A NULL bound is
+    22004.
+  - `WHILE` and `LOOP` are `while (bc_loop(px))`. Each pass of every loop is
+    charged to the procedure's budget, its deadline and cancel flag
+    included.
+  - Once the procedure has failed, `bc_loop` and `bc_range_next` return
+    false and every other call does nothing, so `proc()` returns.
+- **Expressions** are printed by the code generator's expression printer,
+  the one a select list uses, reading slots as parameters: there is one
+  evaluator, not a second one in C++. What a select list may compute, a
+  procedure may (`frontend_design.md`, *Expressions over columns*); a
+  function such as `||`, `substr` or `to_char` works in a procedure once the
+  layer has it (#671, #685).
 
 ## Compilation pipeline
 
 ```
 CREATE [OR REPLACE] PROCEDURE text
   ├─ pg_query_parse          → name, arguments, IN/INOUT/OUT modes
-  └─ pg_query_parse_plpgsql  → body JSON: declarations, statements, embedded SQL and expressions as text
+  └─ pg_query_parse_plpgsql  → body JSON (sql/json.cppm), read into the procedure IR (sql/plpgsql.cppm)
         │
-   PL binder:
-     - variables become typed slots;
-     - each embedded statement is parsed and bound through the normal binder,
-       with a scope hook: a name that is a variable becomes a $n;
-       a name that is both a variable and a column is an error (42702)
+   at the first call after any DDL (plan/procedure.cppm):
+     - variables become typed slots of the frame, a table of no catalog;
+     - each expression is bound over the frame (bound::bind_procedure_expr);
+     - each embedded statement is parsed, its variables rewritten to $n, and
+       bound and planned as a prepared statement (bound::bind_procedure_statement)
         │
-   procedure IR: Assign, If, ForRange, ForQuery, While, Exec(stmt, into), Open/Fetch/Close, Exit, Continue, Return
+   proc IR: Assign, If, ForRange, While (LOOP: no condition), Exit (EXIT, CONTINUE), Exec, Return
         │
-   each statement through the normal pipeline (planner, physical plan, codegen) → s<i>
-   the IR → proc() and the slot tables → one .c file → TinyCC
+   each statement → s<i>; the IR → proc() → one .c file → TinyCC
 ```
 
 **A name that is both a variable and a column is refused**, as under
-PostgreSQL's default `plpgsql.variable_conflict = error`: SQLSTATE 42702,
-naming both. Qualifying the column (`t.col`) or renaming the variable
-resolves it. `#variable_conflict` directives are refused.
+PostgreSQL's default `plpgsql.variable_conflict = error`: SQLSTATE 42702.
+The columns checked are those of every table and view the statement names,
+but an `INSERT`'s target, whose columns its `VALUES` cannot name (so
+`INSERT INTO t VALUES (id, v)` with variables `id` and `v` runs, as in
+PostgreSQL). This is stricter than PostgreSQL where a subquery's table is
+not in scope of the whole statement. Qualifying the column (`t.col`)
+resolves it.
 
-**When the body is checked.** `CREATE PROCEDURE` checks the body's PL/pgSQL
-syntax (`pg_query_parse_plpgsql`), as PostgreSQL does with
-`check_function_bodies` on; from phase 2 it also builds the procedure IR,
-refusing a PL/pgSQL statement the layer does not run. It does not bind the
-embedded SQL: as in PostgreSQL, a procedure may name a table created after
-it. Binding happens at the first `CALL` (*Running a procedure*).
+**A variable is its parameter's value as it is.** No conversion is built:
+a variable used as a `$n`, assigned a value, or given a column by `INTO`
+must have the same physical type and decimal scale as the other side, and
+be an integer of any width, text of any length, or of the same kind
+(`bound::assignable`). A narrower side is checked when the value is stored.
+Anything else is refused (42601, as the binder refuses a form not built
+yet; 0A000 for an assignment or `INTO`).
+
+**When the body is checked.** `CREATE PROCEDURE` reads the body into the
+procedure IR, refusing a PL/pgSQL statement the layer does not run (0A000):
+`EXCEPTION` blocks, `COMMIT` and `ROLLBACK`, `RAISE`, `EXECUTE`, cursors,
+records, labels, `FOR … BY`, `RETURN` with a value, and a variable that
+shadows another. It does not bind anything: as in PostgreSQL, a procedure
+may name a table created after it. Binding happens at the first call after
+any DDL, which reports what binding refuses: a name that does not exist
+(42P01, 42703), 42702, a condition that is not BOOLEAN (42804), a `SELECT`
+with neither `INTO` nor `PERFORM` (42601), `EXIT` outside a loop (42601), a
+`CONSTANT` assigned (42601), a `NOT NULL` variable (0A000).
 
 ## Catalog record
 
@@ -202,15 +239,22 @@ version, refused inside a transaction block, and survives a reopen.
 
 ## Running a procedure
 
-- **`CALL` in autocommit:** `Database::call` opens one transaction, runs
-  `proc`, then commits. On 40001 the body reruns from its arguments under
-  the retry policy of autocommit statements: three attempts in all on a
-  fresh snapshot, then 40001 to the client (`transaction_design.md`,
-  *Commit and conflicts*). There is no separate cap or counter.
-- **`CALL` inside the client's `BEGIN` block:** the procedure runs in that
-  transaction, and the client handles any retry.
-- **A failed statement** aborts the procedure, as it aborts a transaction
-  today.
+- **The embedded API:** `Transaction::call(name, args)` runs the procedure
+  in the transaction; `Database::call(name, args)` in a transaction of its
+  own, then commits. `args` has a value per argument, `OUT` ones included
+  and ignored, as PostgreSQL's `CALL` takes them; each is checked against
+  its argument's type. The result is one row of the `INOUT` and `OUT`
+  arguments' final values, named and typed as the arguments, or no row.
+- **In autocommit**, on 40001 the body reruns from its arguments under the
+  retry policy of autocommit statements: three attempts in all, each on a
+  fresh snapshot, then 40001 to the client (`transaction_design.md`, *Commit
+  and conflicts*). There is no separate cap or counter.
+- **Inside the client's transaction**, the procedure's writes are the
+  transaction's, and the client handles any retry.
+- **A failed statement** aborts the procedure and its transaction, as it
+  aborts a transaction today; so does any other error of the body.
+- **Compiled code** is cached per procedure and built again at the first
+  call after any DDL, as a view's plan is; it is never stored.
 - **`EXCEPTION` blocks are refused** until full fidelity: `CREATE PROCEDURE`
   of a body with one is 0A000. Full fidelity makes each block a savepoint, a
   mark in the log plus a copy of the overlay (`transaction_design.md`,
@@ -218,6 +262,10 @@ version, refused inside a transaction block, and survives a reopen.
   handler would never fire inside the body.
 - **Transaction control inside a body** (`COMMIT`, `ROLLBACK`) is refused
   (0A000).
+- **Known limit:** every read of a text variable in `proc()` takes a view
+  in the frame, held until the call ends and charged to its budget, so a
+  long loop over text variables can reach the statement memory limit
+  (54000). Releasing a frame's views between passes is #762.
 
 ## Wire protocol for `CALL`
 
@@ -249,7 +297,7 @@ bodies under HammerDB's names and signatures (`neword`, `payment`, `ostat`,
 | Phase | Content | Status |
 |---|---|---|
 | 1 | This document; `CREATE [OR REPLACE] PROCEDURE` and `DROP PROCEDURE` parsed (signature and PL/pgSQL syntax) and kept in the catalog | built |
-| 2 | PL binder, procedure IR, codegen of the one file, `bc_proc.h` and its runtime (`bc_stmt_begin/end`, `bc_var_*`, `bc_range_*`), `Database::call` with the retry | not built |
+| 2 | PL binder, procedure IR, codegen of the one file, `bc_proc.h` and its runtime (`bc_stmt_begin/end`, `bc_var_*`, `bc_range_*`), `Database::call` with the retry | built |
 | 3 | `CALL` over the wire, the OUT row, the `pg_stat_database` stub, `TO_TIMESTAMP` and `::` in arguments | not built |
 | 4 | `hammerdb/tprocc_procs.sql`, a stock-driver mode in `run-gate.sh` (HammerDB 6.0, #556), a proof test running the same procedures on PostgreSQL 17 with the consistency conditions | not built |
 
@@ -265,9 +313,16 @@ and the schema build's `COPY FROM STDIN`, catalog lookups, `CREATE USER`,
 
 ## Tests
 
-Phase 1: `tests/parser_test.cpp` (the signature, modes, types and the
-refused forms), `tests/catalog_test.cpp` (the record round-trips, survives a
-reopen, is refused when damaged; `OR REPLACE` and `DROP`), and
-`tests/api_test.cpp` (the statements through `Database`, with their
-SQLSTATEs and commands), and `tests/server/test_wire.py` (the command tags,
-a dollar-quoted body in a simple `Query`, `CALL` refused).
+- Phase 1: `tests/parser_test.cpp` (the signature, modes, types, the refused
+  forms and bodies), `tests/catalog_test.cpp` (the record round-trips,
+  survives a reopen, is refused when damaged; `OR REPLACE` and `DROP`),
+  `tests/api_test.cpp` (the statements through `Database`, with their
+  SQLSTATEs and commands), and `tests/server/test_wire.py` (the command
+  tags, a dollar-quoted body in a simple `Query`, `CALL` refused).
+- Phase 2: `tests/codegen_test.cpp` (the file's shape: `proc()`, `s<i>`,
+  one constants block, the slots), and `tests/api_test.cpp`: a procedure's
+  statements see the earlier ones' writes in one transaction and write
+  nothing when one fails; its errors at the call (P0002, P0003, 42702,
+  22003, 22004, 42804, 42601, 42883, 08P01); recompiled after a DDL; and a
+  conflict rerun in autocommit, 40001 after the last attempt, and left to
+  the client inside a transaction.

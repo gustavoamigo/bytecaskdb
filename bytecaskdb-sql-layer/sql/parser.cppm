@@ -34,6 +34,7 @@ module;
 export module bytecask.sql.parser;
 
 export import bytecask.sql.ast;
+import bytecask.sql.plpgsql;
 
 export namespace bytecask::sql::ast {
 
@@ -834,10 +835,7 @@ auto create_procedure(const PgQuery__CreateFunctionStmt* s, std::int32_t pos, co
     reject("LANGUAGE " + language + " is not supported: procedures are LANGUAGE plpgsql", pos, kFeatureNotSupported);
   }
   if (!has_body) reject("a procedure needs a body (AS)", pos, kInvalidFunctionDefinition);
-  auto body = pg_query_parse_plpgsql(text.c_str());
-  auto error = body.error == nullptr ? std::optional<std::string>{} : std::optional<std::string>{body.error->message};
-  pg_query_free_plpgsql_parse_result(body);
-  if (error) reject(*error, pos);
+  (void)pl::read_body(text, out.args.size(), pos);
   return out;
 }
 

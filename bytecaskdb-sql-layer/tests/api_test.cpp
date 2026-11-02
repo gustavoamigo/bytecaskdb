@@ -2775,3 +2775,170 @@ TEST_CASE("embedded API: CREATE and DROP PROCEDURE are DDL, kept in the catalog 
     CHECK(db->catalog()->table("neword") != nullptr);
   }
 }
+
+TEST_CASE("embedded API: a procedure runs its statements in one transaction, each seeing the ones before",
+          "[sql][api][procedure]") {
+  sql_test::TempDir dir{"api_procedure_run"};
+  auto db = Database::open(dir.path());
+  auto run = [&](std::string_view sql) { return db->execute(sql).rows; };
+  (void)run("CREATE TABLE stock (id INTEGER PRIMARY KEY, qty INTEGER, name VARCHAR(10))");
+  (void)run("CREATE TABLE orders (id INTEGER PRIMARY KEY, item INTEGER, amount INTEGER)");
+  (void)run("INSERT INTO stock VALUES (1, 10, 'a')");
+  (void)run("INSERT INTO stock VALUES (2, 20, 'b')");
+  (void)run("INSERT INTO stock VALUES (3, 30, 'c')");
+  (void)run(R"(CREATE PROCEDURE take(o_id INTEGER, n INTEGER, INOUT total INTEGER, OUT last_name VARCHAR(10))
+LANGUAGE plpgsql AS $$
+DECLARE
+  q INTEGER;
+  k INTEGER := 0;
+BEGIN
+  total := 0;
+  FOR i IN 1..n LOOP
+    SELECT qty, name INTO q, last_name FROM stock WHERE id = i;
+    IF q > 15 THEN
+      UPDATE stock SET qty = qty - 1 WHERE id = i;
+      SELECT qty INTO q FROM stock WHERE id = i;   -- sees the update
+      UPDATE stock SET qty = qty - 1 WHERE id = i; -- a second write of the row
+    ELSE
+      k := k + 1;
+    END IF;
+    total := total + q;
+  END LOOP;
+  INSERT INTO orders VALUES (o_id, n, total);
+  IF NOT FOUND THEN
+    total := -1;
+  END IF;
+END $$)");
+  auto out = db->call("take", {i(7), i(3), Value{}, Value{}});
+  CHECK(out.columns == std::vector<std::string>{"total", "last_name"});
+  // 10 + (20 - 1) + (30 - 1); the last row read is 'c'.
+  CHECK(out.rows == Grid{{i(58), Value{sql_test::bytes("c")}}});
+  CHECK(run("SELECT qty FROM stock ORDER BY id") == Grid{{i(10)}, {i(18)}, {i(28)}});
+  CHECK(run("SELECT item, amount FROM orders WHERE id = 7") == Grid{{i(3), i(58)}});
+
+  // A failed statement aborts the procedure, and its transaction keeps nothing.
+  CHECK_THROWS_AS(db->call("take", {i(7), i(1), Value{}, Value{}}), ExecError);  // 7 is in orders: 23505
+  CHECK(run("SELECT qty FROM stock ORDER BY id") == Grid{{i(10)}, {i(18)}, {i(28)}});
+  // Inside a transaction, the procedure's writes are the transaction's.
+  {
+    auto t = db->begin();
+    auto r = t.call("take", {i(8), i(2), Value{}, Value{}});
+    CHECK(r.rows == Grid{{i(27), Value{sql_test::bytes("b")}}});  // 10 + (18 - 1)
+    CHECK(t.execute("SELECT qty FROM stock WHERE id = 2").rows == Grid{{i(16)}});
+    t.rollback();
+  }
+  CHECK(run("SELECT qty FROM stock WHERE id = 2") == Grid{{i(18)}});
+}
+
+TEST_CASE("embedded API: a procedure's errors are PostgreSQL's, found at CREATE or at the call", "[sql][api][procedure]") {
+  sql_test::TempDir dir{"api_procedure_errors"};
+  auto db = Database::open(dir.path());
+  auto state = [&](auto&& f) -> std::string {
+    try {
+      f();
+    } catch (const std::exception& e) {
+      UNSCOPED_INFO(e.what());
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  auto ddl = [&](std::string_view sql) { return state([&] { (void)db->execute(sql); }); };
+  auto call = [&](std::string_view name, std::vector<Value> args) { return state([&] { (void)db->call(name, args); }); };
+  (void)db->execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, s TEXT)");
+  (void)db->execute("INSERT INTO t VALUES (1, 10, 'x')");
+  (void)db->execute("INSERT INTO t VALUES (2, 10, 'y')");
+  auto proc = [](std::string_view name, std::string_view args, std::string_view body) {
+    return "CREATE PROCEDURE " + std::string{name} + "(" + std::string{args} + ") LANGUAGE plpgsql AS $$ " +
+           std::string{body} + " $$";
+  };
+  // STRICT: no row is P0002, a second row P0003; without STRICT the first row, or NULLs.
+  CHECK(ddl(proc("one", "k INTEGER, INOUT r INTEGER", "BEGIN SELECT v INTO STRICT r FROM t WHERE id = k; END")) == "ran");
+  CHECK(db->call("one", {i(1), Value{}}).rows == Grid{{i(10)}});
+  CHECK(call("one", {i(9), Value{}}) == "P0002");
+  CHECK(ddl(proc("many", "INOUT r INTEGER", "BEGIN SELECT v INTO STRICT r FROM t WHERE v = 10; END")) == "ran");
+  CHECK(call("many", {Value{}}) == "P0003");
+  CHECK(ddl(proc("loose", "k INTEGER, INOUT r INTEGER, INOUT f BOOLEAN",
+                 "BEGIN SELECT v INTO r FROM t WHERE id = k; f := FOUND; END")) == "ran");
+  CHECK(db->call("loose", {i(9), i(5), Value{}}).rows == Grid{{Value{}, Value{false}}});
+  CHECK(db->call("loose", {i(2), Value{}, Value{}}).rows == Grid{{i(10), Value{true}}});
+  // A name that is a variable and a column of the statement's table: 42702, at the call (bodies bind there).
+  CHECK(ddl(proc("clash", "v INTEGER", "BEGIN UPDATE t SET s = 'z' WHERE id = v; END")) == "ran");
+  CHECK(call("clash", {i(1)}) == "42702");
+  // A column of the INSERT's target is no conflict: VALUES cannot name it.
+  CHECK(ddl(proc("ins", "id INTEGER, v INTEGER", "BEGIN INSERT INTO t VALUES (id, v, 'n'); END")) == "ran");
+  CHECK(call("ins", {i(3), i(30)}) == "ran");
+  CHECK(db->execute("SELECT v FROM t WHERE id = 3").rows == Grid{{i(30)}});
+  // A variable of another type than the column it meets.
+  CHECK(ddl(proc("typed", "k TEXT", "BEGIN UPDATE t SET v = 1 WHERE id = k; END")) == "ran");
+  CHECK(call("typed", {Value{sql_test::bytes("1")}}) == "42601");  // a form not built yet, as the binder refuses it
+  // Arithmetic past the variable's type, and a NULL FOR bound.
+  CHECK(ddl(proc("big", "INOUT x SMALLINT", "BEGIN x := x * 1000; END")) == "ran");
+  CHECK(call("big", {i(100)}) == "22003");
+  CHECK(ddl(proc("nullfor", "n INTEGER", "BEGIN FOR i IN 1..n LOOP NULL; END LOOP; END")) == "ran");
+  CHECK(call("nullfor", {Value{}}) == "22004");
+  // A condition that is not BOOLEAN, a SELECT with nowhere for its rows, EXIT outside a loop.
+  CHECK(ddl(proc("cond", "n INTEGER", "BEGIN IF n THEN NULL; END IF; END")) == "ran");
+  CHECK(call("cond", {i(1)}) == "42804");
+  CHECK(ddl(proc("nowhere", "n INTEGER", "BEGIN SELECT v FROM t; END")) == "ran");
+  CHECK(call("nowhere", {i(1)}) == "42601");
+  // Arguments: a procedure that does not exist, the wrong count or type, a value outside the type.
+  CHECK(call("nope", {}) == "42883");
+  CHECK(call("one", {i(1)}) == "08P01");
+  CHECK(call("one", {Value{sql_test::bytes("1")}, Value{}}) == "08P01");
+  CHECK(call("big", {i(40000)}) == "22003");
+  // WHILE and LOOP end on their own, and on EXIT and CONTINUE.
+  CHECK(ddl(proc("loops", "INOUT n INTEGER, INOUT c INTEGER",
+                 "BEGIN c := 0; WHILE n > 0 LOOP n := n - 1; CONTINUE WHEN n = 2; c := c + 1; END LOOP; "
+                 "LOOP c := c + 10; EXIT WHEN c > 30; END LOOP; END")) == "ran");
+  CHECK(db->call("loops", {i(5), Value{}}).rows == Grid{{i(0), i(34)}});
+  // A DDL since the last call: the procedure is compiled again.
+  (void)db->execute("ALTER TABLE t ADD COLUMN w INTEGER");
+  CHECK(db->call("one", {i(1), Value{}}).rows == Grid{{i(10)}});
+  (void)db->execute("DROP TABLE t");
+  CHECK(call("one", {i(1), Value{}}) == "42P01");
+}
+
+TEST_CASE("embedded API: a CALL that conflicts is run again from its arguments, as an autocommit statement is",
+          "[sql][api][procedure]") {
+  sql_test::TempDir dir{"api_procedure_retry"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE c (id INTEGER PRIMARY KEY, n INTEGER)");
+  (void)db->execute("INSERT INTO c VALUES (1, 0)");
+  (void)db->execute(R"(CREATE PROCEDURE bump(k INTEGER, INOUT seen INTEGER) LANGUAGE plpgsql AS $$
+BEGIN
+  SELECT n INTO seen FROM c WHERE id = k;
+  UPDATE c SET n = n + 1 WHERE id = k;
+END $$)");
+  // Another writer commits the row after the procedure's snapshot, `races` times.
+  auto races = 0;
+  auto racing = 0;
+  db->after_txn_pin_for_testing([&] {
+    if (racing >= races) return;
+    ++racing;
+    (void)db->execute("UPDATE c SET n = n + 100 WHERE id = 1");
+  });
+  races = 1;
+  // The first run conflicts; the second reads the other writer's row.
+  CHECK(db->call("bump", {i(1), Value{}}).rows == Grid{{i(100)}});
+  CHECK(db->execute("SELECT n FROM c").rows == Grid{{i(101)}});
+  // Conflicting on every attempt (the hook runs at each of its two statements): 40001, with
+  // nothing of the procedure written.
+  racing = 0;
+  races = 6;
+  try {
+    (void)db->call("bump", {i(1), Value{}});
+    FAIL("no conflict");
+  } catch (const SerializationFailure& e) {
+    CHECK(sqlstate(e) == "40001");
+  }
+  CHECK(racing == 6);
+  CHECK(db->execute("SELECT n FROM c").rows == Grid{{i(701)}});
+  // Inside a transaction the conflict is the client's: no rerun.
+  racing = 0;
+  races = 1;
+  auto t = db->begin();
+  CHECK(t.call("bump", {i(1), Value{}}).rows == Grid{{i(701)}});
+  CHECK_THROWS_AS(t.commit(), SerializationFailure);
+  CHECK(racing == 1);
+  db->after_txn_pin_for_testing({});
+}

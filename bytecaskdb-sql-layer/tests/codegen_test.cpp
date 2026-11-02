@@ -16,6 +16,7 @@
 #include <vector>
 
 import bytecask.sql.codegen;
+import bytecask.sql.procedure;
 import bytecask.sql.parser;
 import bytecask.sql.tests.fixture;
 
@@ -435,4 +436,35 @@ TEST_CASE("codegen: a subquery is a function of its own, run first into its para
   // ALL and ANY of other than = read its bounds.
   auto all = generate(f.cat(), "SELECT id FROM t WHERE qty < ALL (SELECT v FROM u)");
   CHECK(has(all, "bc_sub_begin(cx, 0, BC_SUB_BOUNDS, BC_T_I64, 0);"));
+}
+
+TEST_CASE("codegen: a procedure is one file: proc(), each statement as s<i>, the constants once", "[sql][codegen][procedure]") {
+  sql_test::Fixture f;
+  Procedure p{1000, "p", R"(CREATE PROCEDURE p(k INTEGER, INOUT q INTEGER) LANGUAGE plpgsql AS $$
+DECLARE n INTEGER := 2;
+BEGIN
+  SELECT qty INTO q FROM t WHERE id = k;
+  FOR i IN 1..n LOOP
+    UPDATE t SET qty = qty - 1 WHERE id = k;
+  END LOOP;
+  WHILE q > 0 LOOP q := q - 1; EXIT WHEN q = 3; END LOOP;
+  IF q IS NULL THEN q := 0; END IF;
+END $$)",
+              {{ProcedureArg::Mode::In, "k", SqlType{SqlKind::Integer}}, {ProcedureArg::Mode::InOut, "q", SqlType{SqlKind::Integer}}}};
+  auto g = generate_procedure(p, f.cat());
+  INFO(g.source);
+  REQUIRE(g.stmts.size() == 2);
+  CHECK(g.var_names == std::vector<std::string>{"k", "q", "found", "n", "i"});
+  CHECK(g.stmts[0].param_vars == std::vector<std::uint32_t>{0});  // k
+  CHECK(g.stmts[0].targets == std::vector<std::uint32_t>{1});     // INTO q
+  CHECK(g.stmts[1].param_vars == std::vector<std::uint32_t>{0});
+  CHECK(g.source.find("#include \"bc_proc.h\"") != std::string::npos);
+  CHECK(g.source.find("static void s0(bc_ctx *cx)") != std::string::npos);
+  CHECK(g.source.find("static void s1(bc_ctx *cx)") != std::string::npos);
+  CHECK(g.source.find("void proc(bc_proc *px)") != std::string::npos);
+  CHECK(g.source.find("enum { TBL_1 = 1") != std::string::npos);
+  CHECK(g.source.find("enum {", g.source.find("enum {") + 1) == std::string::npos);  // one constants block
+  CHECK(g.source.find("while (bc_range_next(px, 0, 4))") != std::string::npos);
+  CHECK(g.source.find("while (bc_loop(px))") != std::string::npos);
+  CHECK(g.source.find("s0(bc_stmt_begin(px, 0));") != std::string::npos);
 }
