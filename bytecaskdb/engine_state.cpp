@@ -84,8 +84,9 @@ auto TransientEngineState::validate_preconditions(
   std::uint64_t held_on = 0;
 
   // 1. Point guards.
-  for (const auto &[key, guard] : plan.guards_) {
-    if (defer_puts && guard.confirmed_by_insert) continue;
+  for (const auto &[key, entry] : plan.guards_) {
+    if (defer_puts && entry.confirmed_by_insert) continue;
+    const auto &guard = entry.guard;
     const std::span<const std::byte> key_span{key};
     const auto cur_entry = kd_get(key_dir_, key_span, kd_ctx());
 
@@ -219,11 +220,10 @@ void WritePlan::resolve_snapshot_entries() {
 }
 
 void WritePlan::mark_confirmed_by_insert(BytesView key) {
-  if (guards_.empty()) return;  // most plans: no key to copy for the lookup
-  const auto it = guards_.find(Bytes{key.begin(), key.end()});
+  const auto it = guards_.find(key);
   if (it == guards_.end()) return;
   it->second.confirmed_by_insert =
-      it->second.precondition == Precondition::MustBeAbsent;
+      it->second.guard.precondition == Precondition::MustBeAbsent;
 }
 
 auto WritePlan::snapshot_entry(std::size_t i, BytesView key) const
