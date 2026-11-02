@@ -878,6 +878,12 @@ struct ErrorSink {
 // aborts. Defined with bc_txn.
 void txn_detach(bc_txn* txn, bc_ctx* cx, bool abandoned) noexcept;
 
+// The step a statement reserves the memory cap in: one atomic operation per
+// MiB a statement grows by, not per allocation. Each statement in progress
+// may hold up to one step more than it uses, so the cap can refuse up to a
+// step per running statement early, never late.
+constexpr std::uint64_t kMemoryStep = 1u << 20;
+
 struct bc_ctx {
   bytecask::DB* db;
   LiveCatalog* live;
@@ -897,6 +903,12 @@ struct bc_ctx {
   // tables written), each item as its *_bytes function counts it: what
   // bc_txn_add moves from the statement budget to the transaction's bound.
   std::uint64_t write_held{0};
+  // The database's memory cap (null: none), and what of its `used` this
+  // statement reserved: at least mem_used while the statement runs, its
+  // peak rounded up to kMemoryStep. Returned by drop_execution_state; what
+  // the write set holds passes to the transaction in bc_txn_add.
+  bc_memory_cap* memory{nullptr};
+  std::uint64_t reserved{0};
   // The tables the writes are in, in first-write order.
   std::vector<std::uint32_t> written_tables;
   // The last handle generation drawn; 0 is the empty view's, never drawn.
@@ -1097,8 +1109,29 @@ struct bc_ctx {
                            " bytes");
       return false;
     }
+    if (memory != nullptr && n > reserved - mem_used && !reserve(n - (reserved - mem_used))) return false;
     mem_used += n;
     return true;
+  }
+
+  // Reserves at least `need` more bytes of the memory cap, a kMemoryStep
+  // multiple where the cap leaves room for one: false, and BC_E_MEMORY
+  // (SQLSTATE 53200), if the cap has no room for `need`. Never waits.
+  [[nodiscard]] auto reserve(std::uint64_t need) -> bool {
+    const auto want = need > UINT64_MAX - (kMemoryStep - 1) ? need : (need + kMemoryStep - 1) / kMemoryStep * kMemoryStep;
+    auto used = memory->used.load(std::memory_order_relaxed);
+    for (;;) {
+      if (used > memory->cap || need > memory->cap - used) {
+        fail(BC_E_MEMORY, "out of memory: the statements and transactions in progress would hold more than the memory cap of " +
+                              std::to_string(memory->cap) + " bytes");
+        return false;
+      }
+      const auto grant = std::min(want, memory->cap - used);
+      if (memory->used.compare_exchange_weak(used, used + grant, std::memory_order_relaxed)) {
+        reserved += grant;
+        return true;
+      }
+    }
   }
 
   // Moves what one buffer is charged, `held`, to its size now: a release
@@ -1490,6 +1523,7 @@ struct bc_ctx {
     arena.clear(true);  // one chunk kept for the next statement
     pins.clear(false);
     mem_used = 0;
+    if (reserved != 0) memory->used.fetch_sub(std::exchange(reserved, 0), std::memory_order_relaxed);
     write_held = 0;
     clear_write_slots(written_tables);
     reads = 0;
@@ -1546,7 +1580,20 @@ struct bc_txn {
   // are a re-pin and a commit while one is. An abort and a free detach it.
   bc_ctx* attached{nullptr};
 
-  bc_txn(bytecask::DB* d, LiveCatalog* l, std::uint64_t max) : db{d}, live{l}, max_bytes{max} {}
+  // The database's memory cap (null: none), and what of its `used` the
+  // transaction holds: at least txn_holds, taken over from its statements'
+  // reservations by bc_txn_add, returned by an abort or the free.
+  bc_memory_cap* memory{nullptr};
+  std::uint64_t reserved{0};
+
+  bc_txn(bytecask::DB* d, LiveCatalog* l, std::uint64_t max, bc_memory_cap* m)
+      : db{d}, live{l}, max_bytes{max}, memory{m} {}
+  ~bc_txn() { release_memory(); }
+  bc_txn(const bc_txn&) = delete;
+  bc_txn& operator=(const bc_txn&) = delete;
+  void release_memory() noexcept {
+    if (reserved != 0) memory->used.fetch_sub(std::exchange(reserved, 0), std::memory_order_relaxed);
+  }
 
   // The overlay to write to: cloned first when a pin shares it. A throw
   // leaves the transaction's overlay and the pin's as they were.
@@ -1628,6 +1675,7 @@ void txn_abort(bc_txn* txn) noexcept {
   txn->locks = {};
   txn->written = {};
   txn->held = 0;
+  txn->release_memory();
 }
 
 }  // namespace
@@ -2695,7 +2743,9 @@ extern "C" {
 
 bc_ctx* bc_ctx_new(bc_db* db, const bc_catalog* cat) {
   try {
-    return new bc_ctx(db->db, cat->live);
+    auto* cx = new bc_ctx(db->db, cat->live);
+    cx->memory = db->memory;
+    return cx;
   } catch (...) {
     return nullptr;
   }
@@ -2887,7 +2937,7 @@ extern "C" {
 
 bc_txn* bc_txn_new(bc_db* db, const bc_catalog* cat, uint64_t max_bytes) {
   try {
-    return new bc_txn(db->db, cat->live, max_bytes);
+    return new bc_txn(db->db, cat->live, max_bytes, db->memory);
   } catch (...) {
     return nullptr;
   }
@@ -3062,6 +3112,17 @@ bool bc_txn_add(bc_ctx* cx) {
   cx->locks.clear();
   // The write set is the transaction's now, and off the statement's budget.
   cx->release(cx->write_held);
+  // What the transaction holds grew by at most the write set
+  // (txn_holds): the statement's reservation, at least what it held, covers
+  // it and passes to the transaction, so taking a statement in never fails
+  // on the memory cap. The rest of it is returned when the statement ends.
+  if (txn->memory != nullptr && txn_holds(*txn) > txn->reserved) {
+    const auto grow = txn_holds(*txn) - txn->reserved;
+    const auto moved = std::min(grow, cx->reserved - cx->mem_used);
+    cx->reserved -= moved;
+    if (moved < grow) txn->memory->used.fetch_add(grow - moved, std::memory_order_relaxed);
+    txn->reserved += grow;
+  }
   cx->write_held = 0;
   ++txn->statements;
   txn->aborted = false;
