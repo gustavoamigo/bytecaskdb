@@ -57,7 +57,9 @@ import bytecask.sql.pg_text;
 export namespace bytecask::sql::pg {
 
 // The timeouts that end an idle session (docs/session_design.md, *Timeouts*).
-enum class Timeout : std::uint8_t { None, IdleInTransaction, Transaction, IdleSession };
+// Startup ends a connection that has not finished its startup in time, as
+// PostgreSQL's authentication_timeout does.
+enum class Timeout : std::uint8_t { None, Startup, IdleInTransaction, Transaction, IdleSession };
 
 // Every session's cancel key, as BackendKeyData gave it to its client: a
 // CancelRequest naming one cancels that session's running statement. Shared
@@ -113,6 +115,7 @@ struct SessionConfig {
   std::chrono::milliseconds statement_timeout{0};                 // 57014
   std::chrono::milliseconds transaction_timeout{0};               // FATAL 25P04
   std::chrono::milliseconds idle_session_timeout{0};              // FATAL 57P05
+  std::chrono::milliseconds startup_timeout{60'000};              // closed, with no reply
   CancelRegistry* cancels{nullptr};  // null: no BackendKeyData, and a CancelRequest cancels nothing
   // docs/session_design.md, *Bounds*: past this many reply bytes the client
   // has not taken, the session runs no further statement until it takes
@@ -457,7 +460,7 @@ struct Portal {
 export class Session {
 public:
   Session(Database& db, const SessionConfig& cfg, std::function<void(std::string_view)> on_flush = {})
-      : db_{db}, cfg_{cfg}, on_flush_{std::move(on_flush)} {}
+      : db_{db}, cfg_{cfg}, on_flush_{std::move(on_flush)}, opened_{std::chrono::steady_clock::now()} {}
 
   Session(const Session&) = delete;
   Session& operator=(const Session&) = delete;
@@ -599,17 +602,25 @@ public:
         break;
       case Timeout::Transaction: fatal("25P04", "terminating connection due to transaction timeout"); break;
       case Timeout::IdleSession: fatal("57P05", "terminating connection due to idle-session timeout"); break;
+      case Timeout::Startup: close(); break;  // no reply, as PostgreSQL: the client never finished its startup
       case Timeout::None: break;
     }
   }
 
   // When the session, idle from `now` on, is to be ended, and on which
-  // timeout: inside a transaction (explicit, failed or implicit) the
-  // earlier of idle-in-transaction and the transaction's own; outside one,
+  // timeout: before startup has finished, the startup timeout; inside a
+  // transaction (explicit, failed or implicit) the earlier of
+  // idle-in-transaction and the transaction's own; outside one,
   // idle-session. Timeout::None while none applies.
   [[nodiscard]] auto idle_deadline(std::chrono::steady_clock::time_point now) const
       -> std::pair<std::chrono::steady_clock::time_point, Timeout> {
-    if (!started_ || ended_) return {{}, Timeout::None};
+    if (ended_) return {{}, Timeout::None};
+    if (!started_) {
+      // From the connection's opening, not from the last turn: one that
+      // trickles packets (an SSLRequest, then nothing) runs out too.
+      if (cfg_.startup_timeout.count() == 0) return {{}, Timeout::None};
+      return {opened_ + cfg_.startup_timeout, Timeout::Startup};
+    }
     if (!in_block_ && !implicit_) {
       if (cfg_.idle_session_timeout.count() == 0) return {{}, Timeout::None};
       return {now + cfg_.idle_session_timeout, Timeout::IdleSession};
@@ -1544,6 +1555,7 @@ private:
   bool cancel_only_{false};   // admit_cancel_only()
   CancelFlag cancel_;                                     // set by a CancelRequest naming key_pid_
   std::int32_t key_pid_{0};                               // in cfg_.cancels while nonzero
+  std::chrono::steady_clock::time_point opened_;           // the startup timeout counts from here
   std::chrono::steady_clock::time_point txn_started_{};  // of the open block, explicit or implicit
   std::chrono::steady_clock::time_point txn_deadline_{}; // the running statement's transaction's; epoch: none
 };
@@ -1647,6 +1659,9 @@ public:
       -> std::shared_ptr<Slot> {
     auto slot = std::make_shared<Slot>(db_, cfg_, *this, fd, tag, preferred_worker, std::move(wake_cb));
     if (cancel_only) slot->session.admit_cancel_only();  // no worker has seen the slot yet
+    // The startup timeout runs from here: the loop arms it from drain()
+    // before the session has run a turn.
+    std::tie(slot->idle_at, slot->idle_kind) = slot->session.idle_deadline(std::chrono::steady_clock::now());
     return slot;
   }
 

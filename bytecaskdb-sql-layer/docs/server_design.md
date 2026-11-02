@@ -96,7 +96,7 @@ costs one lookup in `Database::prepare`'s cache, keyed by the exact text.
 [--io-backend pread|mmap|buffer_pool] [--buffer-pool-size BYTES]
 [--buffer-pool-direct-io on|off] [--statement-memory-bytes 67108864] [--max-memory-bytes BYTES]
 [--idle-in-transaction-timeout-ms 60000] [--statement-timeout-ms 0]
-[--transaction-timeout-ms 0] [--idle-session-timeout-ms 0]` serves one
+[--transaction-timeout-ms 0] [--idle-session-timeout-ms 0] [--startup-timeout-ms 60000]` serves one
 database directory under one database name, by default the directory's
 last component. It opens the directory with `Database::open`, so it holds
 the engine's directory lock. The code is in `bytecaskdb-sql-layer/server/`:
@@ -251,7 +251,11 @@ turning one off:
   busy or idle, gets `FATAL 25P04` and rolls back. A statement outside a
   block is its own transaction;
 - `--idle-session-timeout-ms` (off): a session idle that long outside a
-  transaction gets `FATAL 57P05`.
+  transaction gets `FATAL 57P05`;
+- `--startup-timeout-ms` (60000): a connection that has not finished its
+  startup that long after it was accepted is closed with no reply, as
+  PostgreSQL's `authentication_timeout` does. It frees the connection's
+  place under `--max-connections`, or among the 16 kept for a cancel.
 
 **After a `FATAL`** the session ends: it reads no more messages and runs
 nothing more. After startup, an invalid message length or type is `FATAL`.

@@ -188,6 +188,7 @@ cancels nothing, and no `BackendKeyData` is sent. With sessions:
 | Statement | a statement running past it | 57014, as a cancel | off (`--statement-timeout-ms 0`) |
 | Transaction | a transaction open past it in total | `FATAL 25P04` | off (`--transaction-timeout-ms 0`) |
 | Idle session | a session idle outside a transaction | `FATAL 57P05` | off (`--idle-session-timeout-ms 0`) |
+| Startup | a connection that has not finished its startup, counted from its accept | closed, no reply (PostgreSQL's `authentication_timeout`) | 60 s (`--startup-timeout-ms 60000`, `0` = off) |
 
 - **Idle in transaction is on by default.** An open transaction holds a
   snapshot (*Bounds*, *Snapshots*), and its share of the memory cap.
@@ -229,7 +230,8 @@ PostgreSQL uses.
   the connection: a full server is when a cancel matters most. Their
   startup packet is read; a cancel is acted on, an `SSLRequest` answered
   `N`, and a startup refused with `FATAL 53300`. Past those too, a
-  connection gets `FATAL 53300` at once.
+  connection gets `FATAL 53300` at once. The startup timeout (*Timeouts*)
+  frees a place held by a connection that never sends its startup.
 - **File descriptors.** When `accept4` fails with `EMFILE` or `ENFILE`, the
   listener stops accepting for 100 ms: the connection stays in the backlog,
   and is taken once a descriptor is free.

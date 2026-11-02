@@ -901,6 +901,7 @@ def test_statement_memory_bytes_is_every_statement_s_budget():
     (["--idle-in-transaction-timeout-ms", "-1"], "--idle-in-transaction-timeout-ms"),
     (["--transaction-timeout-ms", "1.5"], "--transaction-timeout-ms"),
     (["--idle-session-timeout-ms", ""], "--idle-session-timeout-ms"),
+    (["--startup-timeout-ms", "later"], "--startup-timeout-ms"),
     (["--max-memory-bytes", "0"], "--max-memory-bytes"),
     (["--max-memory-bytes", "half"], "--max-memory-bytes"),
 ])
@@ -1256,6 +1257,35 @@ def test_the_transaction_timeout_ends_a_busy_transaction():
         assert 0.5 <= time.monotonic() - started < 5
         assert c.closed()
         assert keys(connect(s)) == []  # rolled back
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_the_startup_timeout_closes_a_connection_that_never_finishes_its_startup():
+    """As PostgreSQL's authentication_timeout: counted from the connection,
+    closed with no reply, and its place under --max-connections freed."""
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory, max_connections=1, extra_args=["--startup-timeout-ms", "400"])
+    try:
+        silent = Client(s)  # takes the one place, and sends nothing
+        started = time.monotonic()
+        assert silent.sock.recv(1) == b""  # closed, with no reply
+        assert 0.4 <= time.monotonic() - started < 10
+        # An SSLRequest answered, then nothing: the timeout still counts from the connection.
+        trickle = Client(s)
+        started = time.monotonic()
+        trickle.send(startup_packet(80877103))
+        assert trickle.byte() == b"N"
+        assert trickle.sock.recv(1) == b""
+        assert 0.4 <= time.monotonic() - started < 10
+        # The place is free again, and a session that started is not ended by it.
+        c = connect(s)
+        time.sleep(0.8)
+        c.send(query("BEGIN"))
+        assert status(c.until_ready()) == "T"
     finally:
         s.stop()
         shutil.rmtree(directory, ignore_errors=True)
