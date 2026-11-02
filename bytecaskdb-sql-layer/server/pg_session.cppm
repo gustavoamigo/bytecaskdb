@@ -36,6 +36,7 @@ module;
 #include <random>
 #include <span>
 #include <stdexcept>
+#include <tuple>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -147,15 +148,24 @@ SessionError::~SessionError() = default;
 
 // SetEncoding is SET client_encoding, the one SET taken: libpq's
 // PQsetClientEncoding sends it, and pgtcl's pg_connect calls that.
-enum class Control { Begin, Commit, Rollback, SetEncoding };
+enum class Control { Begin, Commit, Rollback, SetEncoding, SetTransaction };
+
+// SET TRANSACTION's modes. SERIALIZABLE is refused when the statement is read,
+// so an isolation level that gets here is one the snapshot already gives.
+struct TransactionModes {
+  bool isolation{false};           // an ISOLATION LEVEL was given
+  std::optional<bool> read_only;   // READ ONLY (true) or READ WRITE (false)
+};
 
 // A statement's text as the session takes it: nothing, a transaction
 // control word, or a statement for the layer.
 struct Classified {
-  enum class Kind { Empty, Control, Sql } kind{Kind::Empty};
+  enum class Kind { Empty, Control, Sql, Cursor } kind{Kind::Empty};
   Control control{Control::Begin};
   std::string sql;       // Sql: the one statement, without its trailing ';'
   std::string encoding;  // SetEncoding: PostgreSQL's name for it
+  TransactionModes modes;  // SetTransaction
+  std::optional<ast::CursorStatement> cursor;  // Cursor: DECLARE, FETCH, MOVE or CLOSE
 };
 
 auto upper_words(std::string_view s) -> std::vector<std::string> {
@@ -251,6 +261,48 @@ auto client_encoding(std::string_view value) -> std::optional<std::string_view> 
                      "22023");
 }
 
+// The mode list of SET TRANSACTION, BEGIN and START TRANSACTION: ISOLATION LEVEL …, READ ONLY, READ WRITE,
+// [NOT] DEFERRABLE, with or without commas. The snapshot every transaction
+// reads is stronger than READ UNCOMMITTED, READ COMMITTED and REPEATABLE READ,
+// so those are taken and change nothing; SERIALIZABLE is not provided (the
+// guards it needs are not built: docs/transaction_design.md, *Isolation*).
+auto transaction_modes(std::string_view sql, std::size_t first) -> TransactionModes {
+  std::string spaced;
+  for (auto ch : sql) {
+    if (ch == ',') {
+      spaced += " ";
+    } else {
+      spaced.push_back(ch);
+    }
+  }
+  auto words = upper_words(spaced);
+  TransactionModes modes;
+  for (auto i = first; i < words.size();) {
+    auto at = [&](std::size_t k) -> std::string_view { return i + k < words.size() ? words[i + k] : std::string_view{}; };
+    if (at(0) == "ISOLATION" && at(1) == "LEVEL") {
+      if (at(2) == "SERIALIZABLE") {
+        throw SessionError("ISOLATION LEVEL SERIALIZABLE is not supported: transactions run at snapshot isolation", "0A000");
+      }
+      auto level = (at(2) == "REPEATABLE" && at(3) == "READ") ||
+                   (at(2) == "READ" && (at(3) == "COMMITTED" || at(3) == "UNCOMMITTED"));
+      if (!level) throw SessionError("syntax error at or near \"" + std::string{at(2)} + "\"", "42601");
+      modes.isolation = true;
+      i += 4;
+    } else if (at(0) == "READ" && (at(1) == "ONLY" || at(1) == "WRITE")) {
+      modes.read_only = at(1) == "ONLY";
+      i += 2;
+    } else if (at(0) == "DEFERRABLE") {
+      i += 1;
+    } else if (at(0) == "NOT" && at(1) == "DEFERRABLE") {
+      i += 2;
+    } else {
+      throw SessionError("syntax error at or near \"" + words[i] + "\"", "42601");
+    }
+  }
+  if (words.size() <= first) throw SessionError("syntax error at end of input", "42601");
+  return modes;
+}
+
 auto classify(std::string_view text, const char* several_state, std::string_view several_message) -> Classified {
   auto rest_blank = true;
   auto end = first_statement(text, rest_blank);
@@ -268,13 +320,14 @@ auto classify(std::string_view text, const char* several_state, std::string_view
     if (words.size() > extra) throw SessionError(w + " with options is not supported", "0A000");
   };
   if (w == "BEGIN") {
-    only(1);
-    return {Classified::Kind::Control, Control::Begin, {}, {}};
+    auto first = words.size() > 1 && (words[1] == "WORK" || words[1] == "TRANSACTION") ? std::size_t{2} : std::size_t{1};
+    auto modes = words.size() > first ? transaction_modes(sql, first) : TransactionModes{};
+    return {Classified::Kind::Control, Control::Begin, {}, {}, modes};
   }
   if (w == "START") {
     if (words.size() < 2 || words[1] != "TRANSACTION") throw SessionError("syntax error at or near \"START\"", "42601");
-    if (words.size() > 2) throw SessionError("START TRANSACTION with options is not supported", "0A000");
-    return {Classified::Kind::Control, Control::Begin, {}, {}};
+    auto modes = words.size() > 2 ? transaction_modes(sql, 2) : TransactionModes{};
+    return {Classified::Kind::Control, Control::Begin, {}, {}, modes};
   }
   if (w == "COMMIT" || w == "END") {
     only(1);
@@ -283,6 +336,10 @@ auto classify(std::string_view text, const char* several_state, std::string_view
   if (w == "ROLLBACK" || w == "ABORT") {
     only(1);
     return {Classified::Kind::Control, Control::Rollback, {}, {}};
+  }
+  if (w == "SET" && words.size() > 1 && words[1] == "TRANSACTION") {
+    auto modes = transaction_modes(sql, 2);
+    return {Classified::Kind::Control, Control::SetTransaction, {}, {}, modes};
   }
   if (w == "SET") {
     // SET [SESSION] client_encoding {TO | =} 'UTF8': the server speaks UTF8,
@@ -303,6 +360,11 @@ auto classify(std::string_view text, const char* several_state, std::string_view
       return {Classified::Kind::Control, Control::SetEncoding, {}, std::string{*encoding}};
     }
   }
+  if (w == "DECLARE" || w == "FETCH" || w == "MOVE" || w == "CLOSE") {
+    out.kind = Classified::Kind::Cursor;
+    out.cursor = ast::parse_cursor(sql);
+    return out;
+  }
   for (const auto* word : {"SET", "SHOW", "RESET", "PREPARE", "EXECUTE", "DEALLOCATE", "SAVEPOINT", "RELEASE", "COPY",
                            "DISCARD", "LISTEN", "UNLISTEN", "NOTIFY", "LOCK"}) {
     if (w == word) throw SessionError(w + " is not supported", "0A000");
@@ -310,6 +372,23 @@ auto classify(std::string_view text, const char* several_state, std::string_view
   out.kind = Classified::Kind::Sql;
   out.sql = std::string{sql};
   return out;
+}
+
+auto command_name(Command c) -> std::string_view {
+  switch (c) {
+    case Command::Select: return "SELECT";
+    case Command::Insert: return "INSERT";
+    case Command::Update: return "UPDATE";
+    case Command::Delete: return "DELETE";
+    case Command::CreateTable: return "CREATE TABLE";
+    case Command::CreateIndex: return "CREATE INDEX";
+    case Command::DropTable: return "DROP TABLE";
+    case Command::DropIndex: return "DROP INDEX";
+    case Command::AlterTable: return "ALTER TABLE";
+    case Command::CreateView: return "CREATE VIEW";
+    case Command::DropView: return "DROP VIEW";
+  }
+  return {};
 }
 
 auto command_tag(Command c, const Rows& r) -> std::string {
@@ -323,6 +402,8 @@ auto command_tag(Command c, const Rows& r) -> std::string {
     case Command::DropTable: return "DROP TABLE";
     case Command::DropIndex: return "DROP INDEX";
     case Command::AlterTable: return "ALTER TABLE";
+    case Command::CreateView: return "CREATE VIEW";
+    case Command::DropView: return "DROP VIEW";
   }
   return {};
 }
@@ -341,7 +422,24 @@ struct Prepared {
   Classified::Kind kind{Classified::Kind::Empty};
   Control control{Control::Begin};
   std::string encoding;            // SetEncoding
-  const Statement* stmt{nullptr};  // Sql: from Database::prepare, valid until close
+  TransactionModes modes;          // SetTransaction
+  const Statement* stmt{nullptr};  // Sql, and a DECLARE's query: from Database::prepare, valid until close
+  std::optional<ast::CursorStatement> cursor;  // Cursor
+};
+
+// A session's cursor. A hold cursor
+// (WITH HOLD, or any DECLARE outside a block) outlives the transaction it was
+// declared in; the others are the transaction's.
+struct SessionCursor {
+  Cursor cursor;
+  bool hold{false};
+};
+
+// What a cursor statement answers: rows (FETCH) and the command tag.
+struct CursorReply {
+  Rows rows;
+  bool returns_rows{false};
+  std::string tag;
 };
 
 struct Portal {
@@ -510,6 +608,7 @@ public:
   }
 
   void close() noexcept {
+    close_cursors();  // a hold cursor releases its snapshot with the session
     if (txn_) txn_->rollback();
     txn_.reset();
     if (implicit_) implicit_->rollback();
@@ -819,12 +918,33 @@ private:
     refuse_if_failed();
   }
 
-  // A transaction ended: its portals go with it, as in PostgreSQL.
-  void end_transaction() noexcept { portals_.clear(); }
+  // A transaction ended: its portals go with it, as in PostgreSQL, and so do
+  // its cursors but the hold cursors that its commit kept. A hold cursor its
+  // rollback dropped is closed already: it is forgotten here or when next named.
+  void end_transaction() noexcept {
+    portals_.clear();
+    std::erase_if(cursors_, [](auto& entry) {
+      auto& c = entry.second;
+      if (!c.hold) c.cursor.close();
+      return !c.hold || !c.cursor.is_open();
+    });
+  }
 
-  // BEGIN, COMMIT, ROLLBACK or SET client_encoding; returns the command tag.
+  // Forgets the cursors a rollback or abort closed.
+  void forget_closed_cursors() noexcept {
+    std::erase_if(cursors_, [](const auto& entry) { return !entry.second.cursor.is_open(); });
+  }
+
+  // The session's end, by a disconnect, Terminate or the server's shutdown:
+  // a hold cursor releases its snapshot with it.
+  void close_cursors() noexcept {
+    for (auto& [name, c] : cursors_) c.cursor.close();
+    cursors_.clear();
+  }
+
+  // BEGIN, COMMIT, ROLLBACK, SET TRANSACTION or SET client_encoding; returns the command tag.
   // Ending a block drops every portal: a caller holds none across it.
-  auto run_control(Control c, const std::string& encoding) -> std::string {
+  auto run_control(Control c, const std::string& encoding, TransactionModes modes) -> std::string {
     switch (c) {
       case Control::Begin:
         if (in_block_) {
@@ -838,9 +958,11 @@ private:
         } else {
           txn_.emplace(db_.begin());
           txn_started_ = std::chrono::steady_clock::now();
+          start_modes();
         }
         in_block_ = true;
         failed_ = false;
+        if (modes.read_only) read_only_ = *modes.read_only;
         return "BEGIN";
       case Control::Commit: {
         end_transaction();
@@ -862,6 +984,22 @@ private:
         }
         return t->commit() == CommitOutcome::Committed ? "COMMIT" : "ROLLBACK";
       }
+      case Control::SetTransaction:
+        refuse_if_failed();
+        if (!in_block_ && !implicit_) {
+          warning("25P01", "SET TRANSACTION can only be used in transaction blocks");
+          return "SET";
+        }
+        if (modes.isolation && block_used_) {
+          throw SessionError("SET TRANSACTION ISOLATION LEVEL must be called before any query", "25001");
+        }
+        if (modes.read_only) {
+          if (!*modes.read_only && read_only_ && block_used_) {
+            throw SessionError("transaction read-write mode must be set before any query", "25001");
+          }
+          read_only_ = *modes.read_only;
+        }
+        return "SET";
       case Control::SetEncoding:
         refuse_if_failed();
         encoding_ = encoding;
@@ -888,6 +1026,140 @@ private:
     return {};
   }
 
+  // ------------------------------------------------------------ cursors
+
+  // What a DECLARE refuses before its query is read, in PostgreSQL's order: a
+  // failed block, then a statement outside a block.
+  void check_declare(const ast::DeclareCursor& d) const {
+    refuse_if_failed();
+    // Outside a block it is a hold cursor (a known difference: PostgreSQL says 25P01).
+    if (d.hold && d.for_update) {
+      throw SessionError("DECLARE CURSOR WITH HOLD ... FOR UPDATE is not supported", "0A000");
+    }
+    if (d.scroll == ast::DeclareCursor::Scroll::Scroll && d.for_update) {
+      throw SessionError("DECLARE SCROLL CURSOR ... FOR UPDATE is not supported", "0A000");
+    }
+    if (d.binary) throw SessionError("DECLARE BINARY CURSOR is not supported: binary results are not", "0A000");
+  }
+
+  // The statement a cursor statement prepares: a DECLARE's query, else none.
+  auto prepare_cursor(const ast::CursorStatement& c) -> const Statement* {
+    const auto* d = std::get_if<ast::DeclareCursor>(&c);
+    if (d == nullptr) return nullptr;
+    check_declare(*d);
+    const auto& stmt = db_.prepare(d->query);
+    if (stmt.command() != Command::Select) throw SessionError("a cursor needs a SELECT", "42601");
+    return &stmt;
+  }
+
+  auto find_cursor(const std::string& name) -> SessionCursor& {
+    forget_closed_cursors();
+    auto it = cursors_.find(name);
+    if (it == cursors_.end()) throw SessionError("cursor \"" + name + "\" does not exist", "34000");
+    return it->second;
+  }
+
+  // The cursor a DECLARE opens: in the block's transaction, or, outside one,
+  // in a transaction of its own that commits at once. Outside a block it is
+  // always a hold cursor, taken on the snapshot of that moment.
+  auto declare_cursor(const ast::DeclareCursor& d, const Statement& stmt, const std::vector<Value>& params) -> Cursor {
+    auto kind = d.hold || !in_block_ ? Holdability::Hold : Holdability::Plain;
+    auto scrolling = d.scroll == ast::DeclareCursor::Scroll::NoScroll ? Scrolling::ForwardOnly : Scrolling::Any;
+    if (in_block_) return txn_->open_cursor(stmt, params, kind, scrolling);
+    if (implicit_) return implicit_->open_cursor(stmt, params, kind, scrolling);
+    auto t = db_.begin();
+    auto cursor = t.open_cursor(stmt, params, kind, scrolling);
+    (void)t.commit();
+    return cursor;
+  }
+
+  // UPDATE or DELETE ... WHERE CURRENT OF c, on the row c stands on (docs/cursor_design.md,
+  // *WHERE CURRENT OF*). Outside a block it is a statement of its own, as
+  // every statement is; the cursor there is a hold cursor.
+  auto run_positioned(const Statement& stmt, const std::vector<Value>& params) -> Rows {
+    const auto name = std::string{stmt.current_of()};
+    auto& cursor = find_cursor(name);
+    try {
+      if (in_block_) return txn_->execute_current_of(stmt, params, cursor.cursor);
+      if (implicit_) return implicit_->execute_current_of(stmt, params, cursor.cursor);
+      auto t = db_.begin();
+      auto rows = t.execute_current_of(stmt, params, cursor.cursor);
+      (void)t.commit();
+      return rows;
+    } catch (const CurrentOfRefused& e) {
+      using Why = CurrentOfRefused::Why;
+      auto what = e.why() == Why::NotOnRow  ? "is not positioned on a row"
+                  : e.why() == Why::Held    ? "is held from a previous transaction"
+                                            : "is not a simply updatable scan of table \"" + std::string{stmt.current_of_table()} + "\"";
+      throw SessionError("cursor \"" + name + "\" " + what, "24000");
+    }
+  }
+
+  static auto move_of(const ast::FetchCursor& f) -> CursorMove {
+    using Direction = ast::FetchCursor::Direction;
+    switch (f.direction) {
+      case Direction::Forward: return {CursorMove::Kind::Forward, f.count};
+      case Direction::Backward: return {CursorMove::Kind::Backward, f.count};
+      case Direction::Absolute: return {CursorMove::Kind::Absolute, f.count};
+      case Direction::Relative: return {CursorMove::Kind::Relative, f.count};
+    }
+    return {};
+  }
+
+  // DECLARE, FETCH, MOVE or CLOSE inside the block. A failure here fails the
+  // block through the caller, which closes the cursors with the transaction.
+  auto run_cursor(const ast::CursorStatement& c, const Statement* stmt, const std::vector<Value>& params)
+      -> CursorReply {
+    refuse_if_failed();
+    CursorReply out;
+    if (const auto* d = std::get_if<ast::DeclareCursor>(&c)) {
+      check_declare(*d);
+      forget_closed_cursors();
+      if (cursors_.contains(d->name) || portals_.contains(d->name)) {
+        throw SessionError("cursor \"" + d->name + "\" already exists", "42P03");
+      }
+      enter_statement(*stmt);
+      cursors_.emplace(d->name, SessionCursor{declare_cursor(*d, *stmt, params), d->hold || !in_block_});
+      out.tag = "DECLARE CURSOR";
+    } else if (const auto* f = std::get_if<ast::FetchCursor>(&c)) {
+      auto& cursor = find_cursor(f->name);
+      try {
+        out.rows = cursor.cursor.fetch(move_of(*f));
+      } catch (const CursorForwardOnly& e) {
+        throw SessionError(e.what(), "55000");
+      }
+      out.returns_rows = !f->move;
+      out.tag = (f->move ? "MOVE " : "FETCH ") + std::to_string(out.rows.rows.size());
+      if (f->move) out.rows.rows.clear();
+    } else {
+      const auto& x = std::get<ast::CloseCursor>(c);
+      if (x.all) {
+        for (auto& [name, sc] : cursors_) sc.cursor.close();
+        cursors_.clear();
+        out.tag = "CLOSE CURSOR ALL";
+      } else {
+        auto& cursor = find_cursor(x.name);
+        cursor.cursor.close();
+        cursors_.erase(x.name);
+        out.tag = "CLOSE CURSOR";
+      }
+    }
+    return out;
+  }
+
+  // The columns a FETCH of `name` would describe; none if there is no such cursor yet.
+  auto cursor_columns(const std::string& name) -> std::optional<std::vector<ResultColumn>> {
+    auto it = cursors_.find(name);
+    if (it == cursors_.end() || !it->second.cursor.is_open()) return std::nullopt;
+    return result_columns(it->second.cursor.describe());
+  }
+
+  static auto result_columns(const Rows& rows) -> std::vector<ResultColumn> {
+    std::vector<ResultColumn> cols;
+    for (std::size_t i = 0; i < rows.columns.size(); ++i) cols.push_back({rows.columns[i], rows.types.at(i)});
+    return cols;
+  }
+
   // ------------------------------------------------------------ messages
 
   // A Query inside an extended block, before its Sync, joins the block's
@@ -896,20 +1168,34 @@ private:
   void simple(Body& body) {
     try {
       auto text = std::string{body.cstr()};
+      last_text_ = text;  // a cursor statement's parse error is a position into it
       auto c = classify(text, "0A000", "several statements in one query are not supported");
       switch (c.kind) {
         case Classified::Kind::Empty: simple_reply('I'); break;
-        case Classified::Kind::Control: complete(run_control(c.control, c.encoding)); break;
+        case Classified::Kind::Cursor: {
+          const auto* stmt = prepare_cursor(*c.cursor);
+          if (stmt != nullptr && !stmt->params().empty()) throw SessionError("there is no parameter $1", "42P02");
+          auto reply = run_cursor(*c.cursor, stmt, {});
+          if (reply.returns_rows) {
+            row_description(result_columns(reply.rows));
+            data_rows(reply.rows);
+          }
+          complete(reply.tag);
+          break;
+        }
+        case Classified::Kind::Control: complete(run_control(c.control, c.encoding, c.modes)); break;
         case Classified::Kind::Sql: {
           last_text_ = c.sql;
           refuse_sql_if_failed(c.sql);
           const auto& stmt = db_.prepare(c.sql);
           if (!stmt.params().empty()) throw SessionError("there is no parameter $1", "42P02");
           if (implicit_ && stmt.is_ddl()) refuse_ddl_beside_others();
+          enter_statement(stmt);
           auto opts = run_options();
-          auto rows = in_block_   ? txn_->execute(stmt, {}, opts)
-                      : implicit_ ? implicit_->execute(stmt, {}, opts)
-                                  : db_.execute(stmt, {}, opts);
+          auto rows = !stmt.current_of().empty() ? run_positioned(stmt, {})
+                      : in_block_                ? txn_->execute(stmt, {}, opts)
+                      : implicit_                ? implicit_->execute(stmt, {}, opts)
+                                                 : db_.execute(stmt, {}, opts);
           if (stmt.command() == Command::Select) {
             std::vector<ResultColumn> cols;
             for (std::size_t i = 0; i < rows.columns.size(); ++i) cols.push_back({rows.columns[i], rows.types.at(i)});
@@ -971,7 +1257,12 @@ private:
     }
     last_text_ = text;
     auto c = classify(text, "42601", "cannot insert multiple commands into a prepared statement");
-    Prepared p{c.kind, c.control, c.encoding, nullptr};
+    Prepared p{c.kind, c.control, c.encoding, c.modes, nullptr, std::move(c.cursor)};
+    if (c.kind == Classified::Kind::Cursor) {
+      refuse_if_failed();
+      p.stmt = prepare_cursor(*p.cursor);
+      if (p.stmt != nullptr) db_.refit(*p.stmt);
+    }
     if (c.kind == Classified::Kind::Sql) {
       last_text_ = c.sql;
       refuse_sql_if_failed(c.sql);
@@ -1010,7 +1301,7 @@ private:
                              statement + "\" requires " + std::to_string(infos.size()),
                          "08P01");
     }
-    if (p.kind == Classified::Kind::Sql) refuse_if_failed();
+    if (p.kind == Classified::Kind::Sql || p.kind == Classified::Kind::Cursor) refuse_if_failed();
     Portal out{p, {}};
     for (std::int16_t i = 0; i < n; ++i) {
       auto len = body.i32();
@@ -1024,7 +1315,8 @@ private:
     for (std::int16_t i = 0; i < results; ++i) {
       if (body.i16() != 0) throw SessionError("binary format is not supported", "0A000");
     }
-    if (!portal.empty() && portals_.contains(portal)) {
+    forget_closed_cursors();
+    if (!portal.empty() && (portals_.contains(portal) || cursors_.contains(portal))) {
       throw SessionError("portal \"" + portal + "\" already exists", "42P03");
     }
     portals_[portal] = std::move(out);
@@ -1032,6 +1324,17 @@ private:
   }
 
   void describe_result(const Prepared& p) {
+    if (p.kind == Classified::Kind::Cursor) {
+      // A FETCH describes its cursor's columns once the cursor exists; a MOVE, DECLARE and CLOSE return no rows.
+      const auto* f = std::get_if<ast::FetchCursor>(&*p.cursor);
+      auto cols = f != nullptr && !f->move ? cursor_columns(f->name) : std::nullopt;
+      if (cols) {
+        row_description(*cols);
+      } else {
+        no_data();
+      }
+      return;
+    }
     if (p.stmt != nullptr && p.stmt->command() == Command::Select) {
       row_description(p.stmt->columns());
     } else {
@@ -1105,14 +1408,24 @@ private:
       return true;
     }
     if (p.kind == Classified::Kind::Control) {
-      auto [control, encoding] = std::pair{p.control, p.encoding};  // run_control may drop the portal
-      complete(run_control(control, encoding));
+      auto [control, encoding, modes] = std::tuple{p.control, p.encoding, p.modes};  // run_control may drop the portal
+      complete(run_control(control, encoding, modes));
+      return true;
+    }
+    if (p.kind == Classified::Kind::Cursor) {
+      last_text_ = p.stmt != nullptr ? p.stmt->sql() : std::string{};
+      auto reply = run_cursor(*p.cursor, p.stmt, portal.params);
+      if (reply.returns_rows) data_rows(reply.rows);
+      complete(reply.tag);
       return true;
     }
     last_text_ = p.stmt->sql();
     refuse_if_failed();
     Rows rows;
-    if (in_block_) {
+    enter_statement(*p.stmt);
+    if (!p.stmt->current_of().empty()) {
+      rows = run_positioned(*p.stmt, portal.params);
+    } else if (in_block_) {
       rows = txn_->execute(*p.stmt, portal.params, run_options());
     } else if (implicit_) {
       rows = implicit_->execute(*p.stmt, portal.params, run_options());
@@ -1133,6 +1446,8 @@ private:
           if (p.stmt->is_ddl()) refuse_ddl_beside_others();
           implicit_.emplace(db_.begin());
           txn_started_ = std::chrono::steady_clock::now();
+          start_modes();
+          block_used_ = true;
           rows = implicit_->execute(*p.stmt, portal.params, run_options());
           reply(*p.stmt, rows);
           if (flush_after) flush();
@@ -1146,6 +1461,23 @@ private:
   void reply(const Statement& stmt, const Rows& rows) {
     data_rows(rows);
     complete(command_tag(stmt.command(), rows));
+  }
+
+  // A new transaction starts with PostgreSQL's defaults: read write, no query yet.
+  void start_modes() {
+    read_only_ = false;
+    block_used_ = false;
+  }
+
+  // A statement about to run in a block: a read-only one takes only a SELECT
+  // (25006), as PostgreSQL does; SELECT … FOR UPDATE is not told apart from it.
+  void enter_statement(const Statement& stmt) {
+    if (!in_block_ && !implicit_) return;
+    if (read_only_ && stmt.command() != Command::Select) {
+      throw SessionError("cannot execute " + std::string{command_name(stmt.command())} + " in a read-only transaction",
+                         "25006");
+    }
+    block_used_ = true;
   }
 
   [[noreturn]] static void refuse_ddl_beside_others() {
@@ -1175,6 +1507,9 @@ private:
   std::string last_text_;         // the statement an error's position is into
   std::map<std::string, Prepared> statements_;
   std::map<std::string, Portal> portals_;
+  std::map<std::string, SessionCursor> cursors_;  // the block's cursors; they share the portals' namespace
+  bool read_only_{false};   // SET TRANSACTION READ ONLY, for the block that is open
+  bool block_used_{false};  // the open block has run a statement
   std::optional<Transaction> txn_;       // the explicit block's, from BEGIN
   std::optional<Transaction> implicit_;  // an extended block of several statements, outside BEGIN
   bool in_block_{false};                 // inside BEGIN

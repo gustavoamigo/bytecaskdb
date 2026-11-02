@@ -3,15 +3,20 @@ sealed active file, and the next write appends to a file that is sealed.
 Guarded-by: "*rotation_file_creation_fails"
 
 diff --git a/bytecaskdb/db_commit.cpp b/bytecaskdb/db_commit.cpp
-index 07f87ad..40f345f 100644
+index 4093733..4939a66 100644
 --- a/bytecaskdb/db_commit.cpp
 +++ b/bytecaskdb/db_commit.cpp
-@@ -311,7 +311,7 @@ void DB::commit_appended(TransientEngineState &t,
-     rotation = prepare_rotation(t);
+@@ -317,12 +317,7 @@ void DB::commit_appended(TransientEngineState &t,
    } catch (...) {
      auto ex = std::current_exception();
--    t.apply_degrade(std::format(
-+    (void)(std::format(
-         "post-write rotation failed for '{}': active file is sealed "
-         "but new file could not be created. Call resume() to recover.",
-         file.path().string()));
+     counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
+-    degrade_transient(t, published, [&] {
+-      return std::format(
+-          "post-write rotation failed for '{}': active file is sealed "
+-          "but new file could not be created. Call resume() to recover.",
+-          file.path().string());
+-    });
++    store_state(published, std::move(t).persistent());
+     for (auto *s : batch) {
+       if (!s->err) s->err = ex;
+     }

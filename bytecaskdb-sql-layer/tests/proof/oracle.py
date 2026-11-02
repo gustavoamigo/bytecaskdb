@@ -24,6 +24,7 @@ import bytecask_sql
 SQLSTATE = {
     "unique": "23505",
     "not_null": "23502",
+    "cardinality": "21000",  # a scalar subquery of more than one row
 }
 
 # A value outside its declared type is one kind, "range", in the layer; its
@@ -61,11 +62,12 @@ BINDER_STATES = frozenset(
         "42P01", "42P07", "42703", "42704", "42804", "42P18", "42883", "42702", "42701", "42803", "42809",
         "0A000",  # FOR UPDATE with an aggregate; but see layer_only
         "22003",  # a literal operand past DECIMAL's digits, as a stored value past its column
+        "42830",  # a FOREIGN KEY no unique key of the referenced table matches
     }
 )
 
 # 0A000 is also one of the layer's own rules, which PostgreSQL does not
-# have: a table needs a PRIMARY KEY. The state alone cannot tell it from FOR
+# have: a table needs columns. The state alone cannot tell it from FOR
 # UPDATE with an aggregate, so the statement does: a CREATE TABLE refused
 # with 0A000 is the layer's rule, kind "refused", never compared. The
 # planner's refusal, also 0A000, is told by its class (run_layer: NO_PLAN).
@@ -239,6 +241,51 @@ def literal(t: Type, v) -> str:
     return "'" + v.replace("'", "''") + "'"
 
 
+def sql_literal(t: Type, v) -> str:
+    """A value as a literal in a statement's text, read the same way on both
+    sides: a number as written, which the column's type takes by its
+    assignment cast; a float, a REAL and bytes as a string, which each side
+    reads with the column type's input function. A REAL is written as the
+    float it rounds to, so both read that float; one past float's range is
+    written as given, and both refuse it."""
+    if v is None:
+        return "NULL"
+    if t.kind == "bool":
+        return "TRUE" if v else "FALSE"
+    if t.kind in ("int", "decimal"):
+        return str(v)
+    if t.kind in ("float", "real"):
+        if math.isnan(v):
+            text = "NaN"
+        elif math.isinf(v):
+            text = "Infinity" if v > 0 else "-Infinity"
+        else:
+            if t.kind == "real":
+                try:
+                    v = struct.unpack("f", struct.pack("f", v))[0]
+                except OverflowError:
+                    pass
+            text = repr(v)
+        return f"'{text}'"
+    if t.kind == "bytes":
+        return "'\\x" + v.hex() + "'"
+    return "'" + v.replace("'", "''") + "'"
+
+
+def exact_literal(t: Type, v) -> bool:
+    """Whether the layer compares a column of type t with v as a literal: a
+    value its type holds exactly. The rest it refuses, where PostgreSQL
+    compares in a wider type (docs/frontend_design.md, *Known
+    differences*)."""
+    if v is None:
+        return True
+    if t.kind == "int":
+        return t.low <= v <= t.high
+    if t.kind == "decimal":
+        return abs(v.scaleb(t.scale)) < 10**18  # within a DECIMAL's 18 digits at the column's scale
+    return True
+
+
 # Outside a literal: a quoted string ('' escapes a quote), a $n
 # placeholder, a %, or any other character.
 TOKEN = re.compile(r"'(?:[^']|'')*'|\$(\d+)|%|[^'$%]+|.", re.S)
@@ -287,9 +334,14 @@ def run_layer(db, sql: str, params=()) -> Outcome:
     except bytecask_sql.TransactionAborted as e:
         return Outcome(error=ABORTED, detail=str(e), sqlstate=e.sqlstate)
     except bytecask_sql.ExecError as e:
-        # A constraint violation is an outcome to compare. Any other failure
-        # of a plan that ran (corrupt, I/O, a handle, a layout, a limit,
-        # memory, a conflict) is the layer failing: the test fails on it.
+        # A constraint violation is an outcome to compare, and so is a SQL
+        # error a plan raises as PostgreSQL's executor does: a scalar
+        # subquery of more than one row, a LIKE pattern ending in its escape.
+        # Any other failure of a plan that ran (corrupt, I/O, a handle, a
+        # layout, a limit, memory, a conflict) is the layer failing: the test
+        # fails on it.
+        if e.constraint is None and e.sqlstate in (SQLSTATE["cardinality"], "22025"):
+            return Outcome(error=e.sqlstate, detail=str(e), sqlstate=e.sqlstate)
         if e.constraint is None:
             raise
         return Outcome(error=layer_sqlstate(e), detail=str(e), sqlstate=e.sqlstate)

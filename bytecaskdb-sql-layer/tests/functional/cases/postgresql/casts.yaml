@@ -24,7 +24,6 @@
 
 - name: text that isn't a number
   features: [pg:cast-operator, E011-01]
-  unimplemented: true
   steps:
     - sql: SELECT 'x'::integer
       error: "22P02"
