@@ -67,7 +67,8 @@ void TransientEngineState::apply_change_marker(std::uint64_t sequence,
 }
 
 auto TransientEngineState::validate_preconditions(
-    const WritePlan &plan, std::uint64_t &rests_on) const -> bool {
+    const WritePlan &plan, std::uint64_t &rests_on, bool defer_puts) const
+    -> bool {
   const auto *snap_state =
       plan.snap_ ? plan.snap_->state_.get() : nullptr;
   // The head's latest sequence: what an outcome rests on when the entry it
@@ -138,6 +139,9 @@ auto TransientEngineState::validate_preconditions(
       return true;
     };
     for (std::size_t i = 0; i < plan.writes_.size(); ++i) {
+      if (defer_puts &&
+          std::holds_alternative<WritePlan::PointPut>(plan.writes_[i]))
+        continue;
       bool has_conflict = false;
       std::visit(
           [&](const auto &op) -> void {
@@ -363,6 +367,105 @@ void TransientEngineState::apply_writes(
   }
 
   file_stats_.patch(active_file_id_, {.min_sequence = batch_start_seq, .max_sequence = next_seq_ - 1});
+}
+
+auto TransientEngineState::can_apply_puts_checked(const WritePlan &plan)
+    -> bool {
+  if constexpr (!kKeyDirReadsKeys) {
+    return false;
+  } else {
+    if (!plan.snap_ || plan.writes_.empty() ||
+        plan.snap_entries_.size() != plan.writes_.size())
+      return false;
+    return std::ranges::all_of(plan.writes_, [](const WritePlan::WriteOp &w) {
+      return std::holds_alternative<WritePlan::PointPut>(w);
+    });
+  }
+}
+
+auto TransientEngineState::apply_puts_checked(
+    const WritePlan &plan, std::span<const std::uint64_t> offsets) -> bool {
+  struct Undo {
+    std::span<const std::byte> key;
+    KeyDirEntry now;               // where the plan put the key
+    std::optional<KeyDirHit> was;  // what it replaced; none for an insert
+  };
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+  // TLS: scratch. Reused across plans, so the serial section allocates
+  // nothing here once warm; cleared on entry, holds no DB's state.
+  thread_local std::vector<Undo> undo;
+  thread_local std::vector<std::pair<std::uint32_t, std::uint64_t>> dead;
+#pragma clang diagnostic pop
+  undo.clear();
+  dead.clear();
+
+  const bool multi = plan.write_count() > 1;
+  const auto first_seq = next_seq_;
+  const std::size_t first_io = multi ? 1 : 0;
+  std::size_t io_idx = first_io;
+  if (multi) ++next_seq_;  // BulkBegin
+  std::uint64_t put_bytes = 0;
+
+  // Takes back every change the plan made, newest first, by location: no
+  // record is read. The plan's pending records go too, up to and including
+  // the put that failed, and its sequences are released.
+  const auto abandon = [&]() -> bool {
+    for (auto it = undo.rbegin(); it != undo.rend(); ++it) {
+      const bool undone =
+          it->was ? kd_restore(key_dir_, it->key, it->now, *it->was)
+                  : kd_remove(key_dir_, it->key, it->now);
+      if (!undone)
+        throw std::logic_error{"apply_puts_checked: undo found a key moved "
+                               "from where the plan put it"};
+    }
+    for (auto i = first_io; i <= io_idx && i < offsets.size(); ++i)
+      pending_.erase(pending_slot(active_file_id_, offsets[i]));
+    next_seq_ = first_seq;
+    return false;
+  };
+
+  for (std::size_t w_idx = 0; w_idx < plan.writes_.size(); ++w_idx) {
+    const auto &op = std::get<WritePlan::PointPut>(plan.writes_[w_idx]);
+    const std::span<const std::byte> key_span{op.key};
+    const auto val_size = narrow<std::uint32_t>(op.value.size());
+    note_pending(offsets[io_idx], next_seq_, key_span, val_size);
+    const auto entry = KeyDirEntry::make(next_seq_, offsets[io_idx],
+                                         active_file_id_, val_size);
+    std::optional<KeyDirHit> existing;
+    if (const auto &at = plan.resolved_entry(w_idx)) {
+      if (!kd_put_at(key_dir_, key_span, *at, entry)) return abandon();
+      existing = kd_hit(*at);
+    } else {
+      existing = kd_put(key_dir_, key_span, entry, kd_ctx());
+      if (existing) {  // the key appeared since the snapshot
+        undo.push_back({key_span, entry, existing});
+        return abandon();
+      }
+    }
+    undo.push_back({key_span, entry, existing});
+    if (existing)
+      dead.emplace_back(existing->file_id(),
+                        entry_size(key_span.size(), existing->value_size()));
+    put_bytes += entry_size(key_span.size(), val_size);
+    ++next_seq_;
+    ++io_idx;
+  }
+  if (multi) ++next_seq_;  // BulkEnd
+
+  // Confirmed. The file stats land as apply_writes would leave them. They
+  // are recorded only now: a recorded patch cannot be taken back, and
+  // abandon() must leave none behind.
+  const auto markers =
+      multi ? 2 * marker_size(EntryType::BulkBegin) : std::uint64_t{0};
+  file_stats_.patch(active_file_id_, {.live_added = put_bytes,
+                                      .total_added = put_bytes + markers,
+                                      .marker_added = markers,
+                                      .min_sequence = first_seq,
+                                      .max_sequence = next_seq_ - 1});
+  for (const auto &[file_id, bytes] : dead)
+    file_stats_.patch(file_id, {.live_removed = bytes});
+  return true;
 }
 
 void TransientEngineState::apply_ingest(

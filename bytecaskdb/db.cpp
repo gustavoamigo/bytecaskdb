@@ -444,6 +444,8 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        counters_.group_writer_batches.load(std::memory_order_relaxed)},
       {"bytecask.group_writer_coalesced",
        counters_.group_writer_coalesced.load(std::memory_order_relaxed)},
+      {"bytecask.write_check_fallbacks",
+       counters_.write_check_fallbacks.load(std::memory_order_relaxed)},
       {"bytecask.group_writer_busy_us",
        counters_.group_writer_busy_ns.load(std::memory_order_relaxed) / 1000},
       {"bytecask.file_rotations",

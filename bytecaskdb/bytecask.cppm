@@ -615,8 +615,31 @@ public:
   // the plan lost to — what a retry has to be able to see. On success, the
   // latest entry its guards read; 0 for a plan without guards. For a key
   // found deleted or absent, which has no entry, the head's latest sequence.
+  // With defer_puts, point puts are not checked here: apply_puts_checked
+  // checks each in the descent that applies it.
   [[nodiscard]] auto validate_preconditions(const WritePlan &plan,
-                                            std::uint64_t &rests_on) const
+                                            std::uint64_t &rests_on,
+                                            bool defer_puts = false) const
+      -> bool;
+
+  // True for a plan whose write-write checks apply_puts_checked can fold
+  // into its descents: a snapshot plan of point puts only, its keys resolved
+  // against the snapshot, on the blind key directory (the keyed tree reads
+  // nothing to check a key, so it has nothing to save).
+  [[nodiscard]] static auto can_apply_puts_checked(const WritePlan &plan)
+      -> bool;
+  // Applies such a plan with each put's write-write check done by the
+  // descent that applies it, instead of by a descent of its own. An update
+  // goes by the snapshot's location, and applying there is the check:
+  // replace_at changes the entry only if the key is still at that record. An
+  // insert is placed by key, and displacing nothing is the check. A put that
+  // cannot be confirmed that way (a conflict, a record vacuum moved, the
+  // plan's own earlier put of the same key) is not settled here: every change
+  // the plan made is undone, and it returns false having changed nothing, for
+  // the caller to check and apply the plan in two passes. Guards must have
+  // been checked first (validate_preconditions with defer_puts).
+  [[nodiscard]] auto apply_puts_checked(const WritePlan &plan,
+                                        std::span<const std::uint64_t> offsets)
       -> bool;
 
   // Prepare IO plan — pure read, no mutations.
@@ -1896,6 +1919,8 @@ public:
   // by key, as before record locations were used as version tokens. The
   // differential test runs one workload both ways.
   bool test_resolve_by_key_{false};
+  // Checks every plan in a pass of its own, as before apply_puts_checked.
+  bool test_two_pass_{false};
   // Called on the state open or resume() is about to validate, so a test can
   // break it and drive the cold-path consistency checks through their real
   // callers. Static: open has no DB to hang a hook on yet. A plain pointer,
