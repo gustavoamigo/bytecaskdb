@@ -11,16 +11,21 @@
 #include <cmath>
 #include <limits>
 #include <cstdint>
+#include <optional>
+#include <tuple>
+#include <utility>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <variant>
+#include <thread>
 #include <vector>
 
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
 #include "include/bytecask.hpp"
 
 import bytecask.sql.api;
+import bytecask.sql.text;
 import bytecask.sql.tests.util;
 
 using namespace bytecask::sql;
@@ -194,6 +199,36 @@ TEST_CASE("embedded API: a plan the catalog refuses is recompiled and run again"
   CHECK(db->execute(by_id, {i(6)}).rows == Grid{{i(6), i(60)}});
 }
 
+TEST_CASE("embedded API: a plan that reads a table twice is recompiled when the table's ids change", "[sql][api][catalog]") {
+  sql_test::TempDir dir{"api_instances"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE s (id BIGINT PRIMARY KEY, parent BIGINT)");
+  for (auto [id, parent] : {std::pair{1, 0}, {2, 1}, {3, 1}}) {
+    (void)db->execute("INSERT INTO s VALUES ($1, $2)", {i(id), i(parent)});
+  }
+  const auto& pairs = db->prepare("SELECT x.id, y.id FROM s x JOIN s y ON x.id = y.parent WHERE x.id >= $1 ORDER BY 2");
+  CHECK(db->execute(pairs, {i(0)}).rows == Grid{{i(1), i(2)}, {i(1), i(3)}});
+  // Both uses read the one table's rows, named in the plan by its ids and not an instance's: a plan that
+  // named the instances would never be found fit, or never refused.
+  CHECK(pairs.plan_source().find("// objects: ") != std::string::npos);
+  auto compiled = db->compilations();
+  // A DDL that leaves the plan compatible: no compile. An index: the plan keeps its table's key.
+  (void)db->execute("CREATE TABLE elsewhere (k BIGINT PRIMARY KEY)");
+  CHECK(db->execute(pairs, {i(0)}).rows == Grid{{i(1), i(2)}, {i(1), i(3)}});
+  (void)db->execute("ALTER TABLE s ADD COLUMN extra BIGINT");
+  CHECK(db->execute(pairs, {i(0)}).rows == Grid{{i(1), i(2)}, {i(1), i(3)}});
+  // The table dropped and created again, with other rows: new ids, so the plan is refused, compiled again,
+  // and reads the new table through both uses.
+  (void)db->execute("DROP TABLE s");
+  (void)db->execute("CREATE TABLE s (id BIGINT PRIMARY KEY, parent BIGINT)");
+  (void)db->execute("INSERT INTO s VALUES ($1, $2)", {i(7), i(0)});
+  (void)db->execute("INSERT INTO s VALUES ($1, $2)", {i(8), i(7)});
+  CHECK(db->execute(pairs, {i(0)}).rows == Grid{{i(7), i(8)}});
+  CHECK(db->compilations() > compiled);
+  (void)db->execute("DROP TABLE s");
+  CHECK_THROWS(db->execute(pairs, {i(0)}));
+}
+
 TEST_CASE("embedded API: parameters are checked against the plan that will run", "[sql][api][catalog]") {
   sql_test::TempDir dir{"api_stale_params"};
   auto db = Database::open(dir.path());
@@ -208,6 +243,15 @@ TEST_CASE("embedded API: parameters are checked against the plan that will run",
   (void)db->execute("CREATE TABLE t (k BIGINT PRIMARY KEY, v BIGINT)");
   (void)db->execute("INSERT INTO t VALUES ($1, $2)", {i(3'000'000'000), i(7)});
   CHECK(db->execute(by_k, {i(3'000'000'000)}).rows == Grid{{i(7)}});
+  // Of an UPDATE's parameters out of range, a SET value's is reported
+  // first, as PostgreSQL folds the target list before the WHERE.
+  (void)db->execute("CREATE TABLE u (s VARCHAR(4) NOT NULL, n SMALLINT PRIMARY KEY)");
+  try {
+    (void)db->execute("UPDATE u SET s = $2 WHERE n = $1", {i(32768), Value{sql_test::bytes("00000")}});
+    FAIL("ran");
+  } catch (const ExecError& e) {
+    CHECK(sqlstate(e) == "22001");
+  }
 }
 
 TEST_CASE("embedded API: a cached plan is checked once per catalog version", "[sql][api][catalog]") {
@@ -644,6 +688,128 @@ TEST_CASE("embedded API: table_rows reads a table in key order; errors carry the
     CHECK(e.code() == BC_E_CORRUPT);
   }
   fourth->close();
+}
+
+TEST_CASE("embedded API: a table without a primary key keeps every row, duplicates included, under hidden row ids",
+          "[sql][api]") {
+  sql_test::TempDir dir{"api_row_id"};
+  auto rows_of = [](Database& d) {
+    auto r = d.table_rows("k");
+    CHECK(r.columns == std::vector<std::string>{"a", "b"});  // never the row id
+    return r.rows;
+  };
+  {
+    auto db = Database::open(dir.path());
+    (void)db->execute("CREATE TABLE k (a INTEGER, b TEXT)");
+    const auto& ins = db->prepare("INSERT INTO k VALUES ($1, $2)");
+    CHECK(ins.param_types() == std::vector<PhysType>{PhysType::I64, PhysType::Bytes});  // the row id is no parameter
+    CHECK(db->execute(ins, {i(1), bytes("x")}).affected == 1);
+    CHECK(db->execute(ins, {i(1), bytes("x")}).affected == 1);  // a duplicate is another row
+    CHECK(db->execute("INSERT INTO k (b) VALUES ($1)", {bytes("b only")}).affected == 1);
+    CHECK(sql_refusal(*db, "INSERT INTO k VALUES ($1, $2, $3)", {i(1), bytes("x"), i(3)}) ==
+          "INSERT has more expressions than target columns");
+    // Rows come back in the order they were inserted: the row id's.
+    CHECK(rows_of(*db) == Grid{{i(1), bytes("x")}, {i(1), bytes("x")}, {kNull, bytes("b only")}});
+
+    // A rolled-back insert leaves a gap, never a row.
+    {
+      auto t = db->begin();
+      (void)t.execute(ins, {i(9), bytes("gone")});
+      t.rollback();
+    }
+    // Two transactions inserting into the table both commit: their row ids
+    // differ, so no write conflicts.
+    auto t1 = db->begin();
+    auto t2 = db->begin();
+    (void)t1.execute(ins, {i(2), bytes("t1")});
+    (void)t2.execute(ins, {i(2), bytes("t2")});
+    CHECK(t1.commit() == CommitOutcome::Committed);
+    CHECK(t2.commit() == CommitOutcome::Committed);
+
+    // Concurrent autocommit inserts all land.
+    {
+      std::vector<std::jthread> threads;
+      for (int w = 0; w < 4; ++w) {
+        threads.emplace_back([&, w] {
+          for (int n = 0; n < 50; ++n) (void)db->execute(ins, {i(100 + w), bytes("c")});
+        });
+      }
+    }
+    CHECK(db->execute("SELECT COUNT(*) FROM k WHERE b = $1", {bytes("c")}).rows == Grid{{i(200)}});
+
+    CHECK(db->execute("UPDATE k SET b = $1 WHERE a = $2", {bytes("y"), i(1)}).affected == 2);
+    CHECK(db->execute("DELETE FROM k WHERE a >= $1", {i(100)}).affected == 200);
+    // No primary key is grouped, so no column depends on the group.
+    try {
+      (void)db->execute("SELECT a, b FROM k GROUP BY a");
+      FAIL("an ungrouped column was accepted");
+    } catch (const ast::SqlError& e) {
+      CHECK(e.sqlstate() == "42803");
+    }
+    CHECK(db->execute("SELECT a, COUNT(*) FROM k GROUP BY a ORDER BY a").rows ==
+          Grid{{i(1), i(2)}, {i(2), i(2)}, {kNull, i(1)}});
+    // A unique index on a column holds as on any table.
+    (void)db->execute("CREATE TABLE u (v INTEGER)");
+    (void)db->execute("CREATE UNIQUE INDEX u_v ON u (v)");
+    CHECK(db->execute("INSERT INTO u VALUES ($1)", {i(1)}).affected == 1);
+    CHECK_THROWS_AS(db->execute("INSERT INTO u VALUES ($1)", {i(1)}), ExecError);
+  }
+  // Reopened: the rows are all there, and the next row id is past them.
+  auto db = Database::open(dir.path());
+  CHECK(db->execute("INSERT INTO k VALUES ($1, $2)", {i(3), bytes("after")}).affected == 1);
+  CHECK(rows_of(*db) == Grid{{i(1), bytes("y")}, {i(1), bytes("y")}, {kNull, bytes("b only")}, {i(2), bytes("t1")},
+                             {i(2), bytes("t2")}, {i(3), bytes("after")}});
+}
+
+TEST_CASE("embedded API: literals are bound after the caller's parameters, and a recompile folds them again",
+          "[sql][api]") {
+  sql_test::TempDir dir{"api_literals"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE l (k INTEGER PRIMARY KEY, d NUMERIC(6,2), t TEXT)");
+  const auto& ins = db->prepare("INSERT INTO l VALUES ($1, 1.25, 'one')");
+  // The constants are no parameter a caller binds or is told of.
+  CHECK(ins.param_types() == std::vector<PhysType>{PhysType::I64});
+  CHECK(ins.params().size() == 1);
+  CHECK(db->execute(ins, {i(1)}).affected == 1);
+  CHECK(db->execute(ins, {i(2)}).affected == 1);
+  try {
+    (void)db->execute(ins, {i(3), i(4)});
+    FAIL("an extra parameter was taken");
+  } catch (const ParamError& e) {
+    CHECK(std::string{e.what()} == "statement takes 1 parameters, got 2");
+  }
+  CHECK(db->execute("SELECT k, d, t FROM l WHERE t = 'one' AND k >= 2").rows == Grid{{i(2), i(125), bytes("one")}});
+  CHECK(db->execute("SELECT k, 'x', 2.5 FROM l WHERE k = 1").rows == Grid{{i(1), bytes("x"), i(25)}});
+
+  // Recompiled after a DDL, a literal is folded to the type it meets now.
+  const auto& by_d = db->prepare("SELECT k FROM l WHERE d = 1.25");
+  CHECK(db->execute(by_d, {}).rows.size() == 2);
+  (void)db->execute("DROP TABLE l");
+  (void)db->execute("CREATE TABLE l (k INTEGER PRIMARY KEY, d NUMERIC(6,3), t TEXT)");
+  CHECK(db->execute(ins, {i(1)}).affected == 1);
+  CHECK(db->table_rows("l").rows == Grid{{i(1), i(1250), bytes("one")}});
+  CHECK(db->execute(by_d, {}).rows == Grid{{i(1)}});
+  (void)db->execute("DROP TABLE l");
+  (void)db->execute("CREATE TABLE l (k INTEGER PRIMARY KEY, d NUMERIC(6,1), t TEXT)");
+  // At scale 1, 1.25 is no value d holds: refused, as on a first compile.
+  CHECK(sql_refusal(*db, by_d, {}) == "comparing d (numeric(6,1)) with a constant its type does not hold exactly is "
+                                      "not supported yet");
+
+  // A SELECT without FROM: one row of its constants, or none under LIMIT 0.
+  auto one = db->execute("SELECT 5, -7.80, 'a', NULL, TRUE, 1 + 1.5");
+  CHECK(one.columns == std::vector<std::string>(6, "?column?"));
+  CHECK(one.rows == Grid{{i(5), i(-780), bytes("a"), kNull, Value{true}, i(25)}});
+  CHECK(one.types == std::vector<SqlType>{{SqlKind::Integer}, {SqlKind::Decimal, 0, 0, 2}, {SqlKind::Text},
+                                          {SqlKind::Text}, {SqlKind::Boolean}, {SqlKind::Decimal, 0, 0, 1}});
+  CHECK(db->execute("SELECT 1 LIMIT 0").rows.empty());
+  CHECK(db->execute("SELECT 1 LIMIT 1").rows == Grid{{i(1)}});
+  // And in a transaction, beside its writes.
+  auto t = db->begin();
+  CHECK(t.execute("INSERT INTO l VALUES (9, 0.5, 'nine')").affected == 1);
+  CHECK(t.execute("SELECT k FROM l WHERE t = 'nine'").rows == Grid{{i(9)}});
+  CHECK(t.execute("SELECT 'in a transaction'").rows == Grid{{bytes("in a transaction")}});
+  CHECK(t.commit() == CommitOutcome::Committed);
+  CHECK(db->execute("SELECT d FROM l WHERE k = 9").rows == Grid{{i(5)}});
 }
 
 TEST_CASE("embedded API: a stored column that does not decode is BC_E_CORRUPT, never 0, empty or NULL",
@@ -1118,6 +1284,36 @@ TEST_CASE("embedded API: every plan the search costed returns the same rows", "[
       {"SELECT o.k, p.v FROM p, o WHERE p.k = $1 AND a = $2", {i(3), i(2)}, false, 4},
       {"SELECT count(*) FROM p, o WHERE p.k = $1 AND a = $2", {i(1), i(2)}, false, 4},
       {"SELECT o.k FROM p, o WHERE p.k = $1 AND a = $2 ORDER BY o.k LIMIT 3", {i(5), i(1)}, true, 1},
+      // Outer joins: o.c 3 and 4..6 find no row of p, or none whose v passes.
+      {"SELECT o.k, p.v FROM o LEFT JOIN p ON p.k = o.c WHERE a = $1", {i(1)}, false, 1},
+      {"SELECT o.k, p.v FROM o LEFT JOIN p ON p.k = o.c AND p.v > $2 WHERE a = $1", {i(1), i(1)}, false, 1},
+      {"SELECT o.k, p.v FROM o LEFT JOIN p ON p.v = o.b WHERE a = $1", {i(2)}, false, 1},
+      {"SELECT o.k, p.v FROM p RIGHT JOIN o ON p.k = o.c WHERE a = $1 AND p.v IS NULL", {i(3)}, false, 1},
+      {"SELECT count(p.v) FROM o LEFT JOIN p ON p.k = o.c WHERE a = $1", {i(0)}, false, 1},
+      {"SELECT o.k, p.v FROM o LEFT JOIN p ON p.k = o.c WHERE a = $1 ORDER BY p.v, o.k", {i(1)}, true, 1},
+      // o the right side, by its index on a, which holds o.k too: it reads
+      // rows, where the join matches nothing a row of NULLs.
+      {"SELECT p.k, o.k FROM p LEFT JOIN o ON o.a = p.v", {}, false, 1},
+      {"SELECT p.k FROM p LEFT JOIN o ON o.a = p.v AND o.k > $1 WHERE o.k IS NULL", {i(30)}, false, 1},
+      {"SELECT p.k, o.k FROM p LEFT JOIN o ON o.a = p.v ORDER BY o.k, p.k", {}, true, 1},
+      // o.c only in the WHERE above the join: o's index on a does not hold it.
+      {"SELECT o.k FROM o LEFT JOIN p ON p.k = o.k WHERE a = $1 AND (p.v = $2 OR o.c = $3)", {i(1), i(1), i(2)}, false, 1},
+      // A table with itself, and three tables: the join order and the access of each table vary, as does a
+      // hash join of the first two on a column no key reaches, and each agrees.
+      {"SELECT x.k, y.k FROM o x JOIN o y ON x.b = y.b WHERE x.a = $1 AND y.a = $2", {i(1), i(2)}, false, 2},
+      {"SELECT x.k, y.k FROM o x JOIN o y ON x.a = y.a AND x.k < y.k WHERE x.k < $1 AND y.k > $2", {i(12), i(30)}, false, 1},
+      {"SELECT x.k, p.v, y.k FROM o x, p, o y WHERE x.a = $1 AND p.k = x.c AND y.c = p.k", {i(1)}, false, 2},
+      {"SELECT x.k, y.k, p.k FROM o x, o y, p WHERE x.b = y.b AND y.c = p.v AND x.a = $1", {i(2)}, false, 2},
+      {"SELECT x.k, y.k, p.k FROM o x, o y, p WHERE x.b = y.b AND y.c = p.v AND x.a = $1 ORDER BY x.k, y.k, p.k", {i(2)}, true, 1},
+      {"SELECT x.k, y.k, p.k FROM o x JOIN o y ON x.k < y.k JOIN p ON p.k <> y.c WHERE x.a = $1 AND y.a = $2", {i(1), i(3)}, false, 1},
+      // A comparison, a predicate over both sides of a join, and an outer join of three.
+      {"SELECT o.k, p.k FROM o JOIN p ON o.c <> p.k WHERE a = $1", {i(1)}, false, 1},
+      {"SELECT o.k, p.k FROM o JOIN p ON NOT (o.c = p.k) OR o.b IS NULL WHERE a = $1", {i(0)}, false, 1},
+      {"SELECT o.k, p.v, q.k FROM o LEFT JOIN p ON p.k = o.c LEFT JOIN o q ON q.k = p.v WHERE o.a = $1", {i(1)}, false, 1},
+      {"SELECT o.k, p.v, q.k FROM o LEFT JOIN p ON p.k = o.c AND p.v > $2 LEFT JOIN o q ON q.b = p.v AND q.k <> o.k WHERE o.a = $1",
+       {i(1), i(0)}, false, 1},
+      {"SELECT o.k, p.v, q.k FROM o LEFT JOIN p ON p.k = o.c JOIN o q ON q.k = p.v WHERE o.a = $1 ORDER BY 1, 2, 3", {i(2)}, true, 1},
+      {"SELECT o.k, q.v FROM o JOIN o x ON x.k = o.c LEFT JOIN p q ON q.k = x.k WHERE o.a = $1", {i(1)}, false, 1},
   };
   const std::string cross = "SELECT o.k, p.v FROM p, o WHERE p.k = $1 AND a = $2";
   CHECK(db->execute(cross, {i(1), i(2)}).rows.size() == 10);
@@ -1140,6 +1336,864 @@ TEST_CASE("embedded API: every plan the search costed returns the same rows", "[
       }
     }
   }
+}
+
+TEST_CASE("embedded API: a left outer join NULL-extends each left row no right row matches", "[sql][api]") {
+  sql_test::TempDir dir{"api_outer_join"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE l (k INTEGER PRIMARY KEY, a INTEGER NOT NULL)");
+  (void)db->execute("CREATE TABLE r (j INTEGER PRIMARY KEY, a INTEGER NOT NULL)");
+  for (std::int64_t k = 1; k <= 3; ++k) (void)db->execute("INSERT INTO l VALUES ($1, $2)", {i(k), i(k)});
+  for (auto [j, a] : {std::pair{10, 1}, {11, 1}, {12, 2}}) (void)db->execute("INSERT INTO r VALUES ($1, $2)", {i(j), i(a)});
+  auto rows = [&](std::string_view sql) { return db->execute(sql).rows; };
+  const Grid by_a{{i(1), i(10)}, {i(1), i(11)}, {i(2), i(12)}, {i(3), Value{}}};
+  CHECK(rows("SELECT l.k, r.j FROM l LEFT JOIN r ON l.a = r.a ORDER BY l.k, r.j") == by_a);
+  CHECK(rows("SELECT l.k, r.j FROM r RIGHT JOIN l ON l.a = r.a ORDER BY l.k, r.j") == by_a);
+  // ON decides the pairs, WHERE the joined rows: a NULL-extended row is in
+  // the first, out of the second.
+  CHECK(rows("SELECT l.k, r.j FROM l LEFT JOIN r ON l.a = r.a AND r.j > 10 ORDER BY l.k") ==
+        Grid{{i(1), i(11)}, {i(2), i(12)}, {i(3), Value{}}});
+  CHECK(rows("SELECT l.k, r.j FROM l LEFT JOIN r ON l.a = r.a WHERE r.j > 10 ORDER BY l.k") ==
+        Grid{{i(1), i(11)}, {i(2), i(12)}});
+  CHECK(rows("SELECT l.k, r.j FROM l LEFT JOIN r ON l.a = r.a AND l.k = 2 ORDER BY l.k") ==
+        Grid{{i(1), Value{}}, {i(2), i(12)}, {i(3), Value{}}});
+  CHECK(rows("SELECT l.k FROM l LEFT JOIN r ON l.a = r.a WHERE r.j IS NULL") == Grid{{i(3)}});
+  // A NOT NULL column of the right side is NULL in an extended row, so not counted.
+  CHECK(rows("SELECT count(r.a), count(*) FROM l LEFT JOIN r ON l.a = r.a WHERE l.k = 3") == Grid{{i(0), i(1)}});
+  CHECK(rows("SELECT l.k, r.j FROM l LEFT JOIN r ON r.j = 99 ORDER BY l.k") ==
+        Grid{{i(1), Value{}}, {i(2), Value{}}, {i(3), Value{}}});
+  CHECK_THROWS_AS(db->execute("SELECT l.k FROM l FULL JOIN r ON l.a = r.a"), ast::SqlError);
+  // The right side keyed by a parameter and a left column: a NULL parameter,
+  // or a left value too long for any key, matches nothing, and the left row
+  // stays, NULL-extended.
+  (void)db->execute("CREATE TABLE rc (a INTEGER NOT NULL, s TEXT NOT NULL, PRIMARY KEY (a, s))");
+  (void)db->execute("CREATE TABLE ls (k INTEGER PRIMARY KEY, s TEXT NOT NULL)");
+  (void)db->execute("INSERT INTO rc VALUES (1, 'x')");
+  (void)db->execute("INSERT INTO ls VALUES (1, 'x')");
+  (void)db->execute("INSERT INTO ls VALUES (2, $1)", {Value{Bytes(70000, std::byte{'y'})}});
+  const std::string keyed = "SELECT ls.k, rc.a FROM ls LEFT JOIN rc ON rc.s = ls.s AND rc.a = $1 ORDER BY ls.k";
+  CHECK(db->execute(keyed, {i(1)}).rows == Grid{{i(1), i(1)}, {i(2), Value{}}});
+  CHECK(db->execute(keyed, {Value{}}).rows == Grid{{i(1), Value{}}, {i(2), Value{}}});
+}
+
+// The rows below are PostgreSQL 16's, for the same statements on the same rows.
+TEST_CASE("embedded API: joins of three or more tables, a table with itself, and ON by any comparison", "[sql][api][join]") {
+  sql_test::TempDir dir{"api_joins"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE h1 (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)");
+  (void)db->execute("CREATE TABLE h2 (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER)");
+  (void)db->execute("CREATE INDEX h2_a ON h2 (a)");
+  (void)db->execute("CREATE TABLE h3 (k INTEGER PRIMARY KEY, a INTEGER)");
+  auto insert = [&](std::string_view table, std::initializer_list<std::initializer_list<Value>> rows) {
+    for (const auto& r : rows) {
+      auto sql = "INSERT INTO " + std::string{table} + (r.size() == 3 ? " VALUES ($1, $2, $3)" : " VALUES ($1, $2)");
+      (void)db->execute(sql, std::vector<Value>{r});
+    }
+  };
+  const Value n{};
+  // Each table has a row of key 0, which a row of NULLs would read as, if a join read a key from one.
+  insert("h1", {{i(0), i(3), i(5)}, {i(1), i(1), i(10)}, {i(2), i(2), i(20)}, {i(3), i(2), n}, {i(4), n, i(40)}, {i(5), i(5), i(50)}});
+  insert("h2", {{i(0), i(4), i(50)}, {i(1), i(1), i(100)}, {i(2), i(2), i(200)}, {i(3), i(2), n}, {i(4), n, i(400)}, {i(6), i(6), i(600)}});
+  insert("h3", {{i(0), i(4)}, {i(1), i(1)}, {i(2), i(2)}, {i(3), n}, {i(7), i(7)}});
+  auto rows = [&](std::string_view sql) { return db->execute(sql).rows; };
+  // three tables, inner
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1 JOIN h2 ON h1.a = h2.a JOIN h3 ON h2.a = h3.a ORDER BY 1, 2, 3") ==
+        Grid{{i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(2), i(3), i(2)}, {i(3), i(2), i(2)}, {i(3), i(3), i(2)}});
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1, h2, h3 WHERE h1.a < h2.a AND h2.a <> h3.a ORDER BY 1, 2, 3") ==
+        Grid{{i(0), i(0), i(1)}, {i(0), i(0), i(2)}, {i(0), i(0), i(7)}, {i(0), i(6), i(0)}, {i(0), i(6), i(1)}, {i(0), i(6), i(2)}, {i(0), i(6), i(7)}, {i(1), i(0), i(1)}, {i(1), i(0), i(2)}, {i(1), i(0), i(7)}, {i(1), i(2), i(0)}, {i(1), i(2), i(1)}, {i(1), i(2), i(7)}, {i(1), i(3), i(0)}, {i(1), i(3), i(1)}, {i(1), i(3), i(7)}, {i(1), i(6), i(0)}, {i(1), i(6), i(1)}, {i(1), i(6), i(2)}, {i(1), i(6), i(7)}, {i(2), i(0), i(1)}, {i(2), i(0), i(2)}, {i(2), i(0), i(7)}, {i(2), i(6), i(0)}, {i(2), i(6), i(1)}, {i(2), i(6), i(2)}, {i(2), i(6), i(7)}, {i(3), i(0), i(1)}, {i(3), i(0), i(2)}, {i(3), i(0), i(7)}, {i(3), i(6), i(0)}, {i(3), i(6), i(1)}, {i(3), i(6), i(2)}, {i(3), i(6), i(7)}, {i(5), i(6), i(0)}, {i(5), i(6), i(1)}, {i(5), i(6), i(2)}, {i(5), i(6), i(7)}});
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h3, h2, h1 WHERE h1.id = h2.id AND h3.k = h2.id ORDER BY 1") ==
+        Grid{{i(0), i(0), i(0)}, {i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(3), i(3), i(3)}});
+  CHECK(rows("SELECT count(*) FROM h1 JOIN h2 ON h1.a = h2.a JOIN h3 ON h2.a = h3.a") ==
+        Grid{{i(5)}});
+  // a chain of left joins
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1 LEFT JOIN h2 ON h1.a = h2.a LEFT JOIN h3 ON h2.a = h3.a ORDER BY 1, 2, 3") ==
+        Grid{{i(0), Value{}, Value{}}, {i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(2), i(3), i(2)}, {i(3), i(2), i(2)}, {i(3), i(3), i(2)}, {i(4), Value{}, Value{}}, {i(5), Value{}, Value{}}});
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1 LEFT JOIN h2 ON h1.a = h2.a LEFT JOIN h3 ON h1.a = h3.a AND h2.c > 100 ORDER BY 1, 2, 3") ==
+        Grid{{i(0), Value{}, Value{}}, {i(1), i(1), Value{}}, {i(2), i(2), i(2)}, {i(2), i(3), Value{}}, {i(3), i(2), i(2)}, {i(3), i(3), Value{}}, {i(4), Value{}, Value{}}, {i(5), Value{}, Value{}}});
+  CHECK(rows("SELECT h1.id, h3.k FROM h1 LEFT JOIN h2 ON h1.a = h2.a LEFT JOIN h3 ON h2.a = h3.a WHERE h3.k IS NULL ORDER BY 1, 2") ==
+        Grid{{i(0), Value{}}, {i(4), Value{}}, {i(5), Value{}}});
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1 LEFT JOIN h2 ON h1.a = h2.a JOIN h3 ON h2.a = h3.a ORDER BY 1, 2, 3") ==
+        Grid{{i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(2), i(3), i(2)}, {i(3), i(2), i(2)}, {i(3), i(3), i(2)}});
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1 JOIN h2 ON h1.id = h2.id LEFT JOIN h3 ON h2.a = h3.a ORDER BY 1, 2, 3") ==
+        Grid{{i(0), i(0), i(0)}, {i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(3), i(3), i(2)}, {i(4), i(4), Value{}}});
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1 LEFT JOIN h2 ON h1.a = h2.a LEFT JOIN h3 ON h2.id = h3.k ORDER BY 1, 2, 3") ==
+        Grid{{i(0), Value{}, Value{}}, {i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(2), i(3), i(3)}, {i(3), i(2), i(2)}, {i(3), i(3), i(3)}, {i(4), Value{}, Value{}}, {i(5), Value{}, Value{}}});
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1 LEFT JOIN h2 ON h1.a = h2.a JOIN h3 ON h2.id = h3.k ORDER BY 1, 2, 3") ==
+        Grid{{i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(2), i(3), i(3)}, {i(3), i(2), i(2)}, {i(3), i(3), i(3)}});
+  CHECK(rows("SELECT h1.a, count(h2.id), count(h3.k), count(*) FROM h1 LEFT JOIN h2 ON h1.a = h2.a LEFT JOIN h3 ON h2.a = h3.a GROUP BY h1.a ORDER BY 1") ==
+        Grid{{i(1), i(1), i(1), i(1)}, {i(2), i(4), i(4), i(4)}, {i(3), i(0), i(0), i(1)}, {i(5), i(0), i(0), i(1)}, {Value{}, i(0), i(0), i(1)}});
+  // a table joined with itself
+  CHECK(rows("SELECT x.id, y.id FROM h1 x JOIN h1 y ON x.a = y.a ORDER BY 1, 2") ==
+        Grid{{i(0), i(0)}, {i(1), i(1)}, {i(2), i(2)}, {i(2), i(3)}, {i(3), i(2)}, {i(3), i(3)}, {i(5), i(5)}});
+  CHECK(rows("SELECT x.id, y.id FROM h1 x JOIN h1 y ON x.id < y.id WHERE x.a = y.a ORDER BY 1, 2") ==
+        Grid{{i(2), i(3)}});
+  CHECK(rows("SELECT h1.id, y.id FROM h1 JOIN h1 AS y ON h1.id = y.id ORDER BY 1") ==
+        Grid{{i(0), i(0)}, {i(1), i(1)}, {i(2), i(2)}, {i(3), i(3)}, {i(4), i(4)}, {i(5), i(5)}});
+  CHECK(rows("SELECT x.id, y.id, z.id FROM h1 x JOIN h1 y ON x.id < y.id JOIN h1 z ON y.id < z.id ORDER BY 1, 2, 3") ==
+        Grid{{i(0), i(1), i(2)}, {i(0), i(1), i(3)}, {i(0), i(1), i(4)}, {i(0), i(1), i(5)}, {i(0), i(2), i(3)}, {i(0), i(2), i(4)}, {i(0), i(2), i(5)}, {i(0), i(3), i(4)}, {i(0), i(3), i(5)}, {i(0), i(4), i(5)}, {i(1), i(2), i(3)}, {i(1), i(2), i(4)}, {i(1), i(2), i(5)}, {i(1), i(3), i(4)}, {i(1), i(3), i(5)}, {i(1), i(4), i(5)}, {i(2), i(3), i(4)}, {i(2), i(3), i(5)}, {i(2), i(4), i(5)}, {i(3), i(4), i(5)}});
+  CHECK(rows("SELECT x.id, y.id FROM h1 x LEFT JOIN h1 y ON x.a = y.a AND x.id <> y.id ORDER BY 1, 2") ==
+        Grid{{i(0), Value{}}, {i(1), Value{}}, {i(2), i(3)}, {i(3), i(2)}, {i(4), Value{}}, {i(5), Value{}}});
+  CHECK(rows("SELECT x.id, y.id FROM h1 x RIGHT JOIN h1 y ON x.a < y.a ORDER BY 1, 2") ==
+        Grid{{i(0), i(5)}, {i(1), i(0)}, {i(1), i(2)}, {i(1), i(3)}, {i(1), i(5)}, {i(2), i(0)}, {i(2), i(5)}, {i(3), i(0)}, {i(3), i(5)}, {Value{}, i(1)}, {Value{}, i(4)}});
+  CHECK(rows("SELECT x.id, y.id FROM h1 x JOIN h2 z ON x.a = z.a JOIN h1 y ON z.a = y.a ORDER BY 1, 2") ==
+        Grid{{i(1), i(1)}, {i(2), i(2)}, {i(2), i(2)}, {i(2), i(3)}, {i(2), i(3)}, {i(3), i(2)}, {i(3), i(2)}, {i(3), i(3)}, {i(3), i(3)}});
+  // any comparison
+  CHECK(rows("SELECT h1.id, h2.id FROM h1 JOIN h2 ON h1.a < h2.a ORDER BY 1, 2") ==
+        Grid{{i(0), i(0)}, {i(0), i(6)}, {i(1), i(0)}, {i(1), i(2)}, {i(1), i(3)}, {i(1), i(6)}, {i(2), i(0)}, {i(2), i(6)}, {i(3), i(0)}, {i(3), i(6)}, {i(5), i(6)}});
+  CHECK(rows("SELECT h1.id, h2.id FROM h1 JOIN h2 ON h1.a <= h2.a ORDER BY 1, 2") ==
+        Grid{{i(0), i(0)}, {i(0), i(6)}, {i(1), i(0)}, {i(1), i(1)}, {i(1), i(2)}, {i(1), i(3)}, {i(1), i(6)}, {i(2), i(0)}, {i(2), i(2)}, {i(2), i(3)}, {i(2), i(6)}, {i(3), i(0)}, {i(3), i(2)}, {i(3), i(3)}, {i(3), i(6)}, {i(5), i(6)}});
+  CHECK(rows("SELECT h1.id, h2.id FROM h1 JOIN h2 ON h1.a > h2.a ORDER BY 1, 2") ==
+        Grid{{i(0), i(1)}, {i(0), i(2)}, {i(0), i(3)}, {i(2), i(1)}, {i(3), i(1)}, {i(5), i(0)}, {i(5), i(1)}, {i(5), i(2)}, {i(5), i(3)}});
+  CHECK(rows("SELECT h1.id, h2.id FROM h1 JOIN h2 ON h1.a >= h2.a ORDER BY 1, 2") ==
+        Grid{{i(0), i(1)}, {i(0), i(2)}, {i(0), i(3)}, {i(1), i(1)}, {i(2), i(1)}, {i(2), i(2)}, {i(2), i(3)}, {i(3), i(1)}, {i(3), i(2)}, {i(3), i(3)}, {i(5), i(0)}, {i(5), i(1)}, {i(5), i(2)}, {i(5), i(3)}});
+  CHECK(rows("SELECT h1.id, h2.id FROM h1 JOIN h2 ON h1.a <> h2.a ORDER BY 1, 2") ==
+        Grid{{i(0), i(0)}, {i(0), i(1)}, {i(0), i(2)}, {i(0), i(3)}, {i(0), i(6)}, {i(1), i(0)}, {i(1), i(2)}, {i(1), i(3)}, {i(1), i(6)}, {i(2), i(0)}, {i(2), i(1)}, {i(2), i(6)}, {i(3), i(0)}, {i(3), i(1)}, {i(3), i(6)}, {i(5), i(0)}, {i(5), i(1)}, {i(5), i(2)}, {i(5), i(3)}, {i(5), i(6)}});
+  CHECK(rows("SELECT h1.id, h2.id FROM h1 JOIN h2 ON h1.a = h2.a AND h1.b < h2.c ORDER BY 1, 2") ==
+        Grid{{i(1), i(1)}, {i(2), i(2)}});
+  CHECK(rows("SELECT h1.id, h2.id FROM h1 JOIN h2 ON h1.a = h2.a OR h1.b IS NULL ORDER BY 1, 2") ==
+        Grid{{i(1), i(1)}, {i(2), i(2)}, {i(2), i(3)}, {i(3), i(0)}, {i(3), i(1)}, {i(3), i(2)}, {i(3), i(3)}, {i(3), i(4)}, {i(3), i(6)}});
+  CHECK(rows("SELECT h1.id, h2.id FROM h1 LEFT JOIN h2 ON h1.a < h2.a ORDER BY 1, 2") ==
+        Grid{{i(0), i(0)}, {i(0), i(6)}, {i(1), i(0)}, {i(1), i(2)}, {i(1), i(3)}, {i(1), i(6)}, {i(2), i(0)}, {i(2), i(6)}, {i(3), i(0)}, {i(3), i(6)}, {i(4), Value{}}, {i(5), i(6)}});
+  CHECK(rows("SELECT h1.id, h2.id FROM h1 LEFT JOIN h2 ON h1.a = h2.a AND NOT (h1.b = h2.c) ORDER BY 1, 2") ==
+        Grid{{i(0), Value{}}, {i(1), i(1)}, {i(2), i(2)}, {i(3), Value{}}, {i(4), Value{}}, {i(5), Value{}}});
+
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+  // The names PostgreSQL requires: a table named twice needs aliases, and an ON sees the tables before it.
+  CHECK(state("SELECT id FROM h1 x JOIN h1 y ON x.id = y.id") == "42702");
+  CHECK(state("SELECT h1.id FROM h1 x JOIN h1 y ON x.id = y.id") == "42P01");
+  CHECK(state("SELECT 1 FROM h1, h1") == "42712");
+  CHECK(state("SELECT 1 FROM h1 x, h2 x") == "42712");
+  CHECK(state("SELECT 1 FROM h1 JOIN h2 ON h1.a = h3.a JOIN h3 ON h2.a = h3.a") == "42P01");
+  // What the layer does not take yet is refused, never answered wrongly.
+  CHECK(state("SELECT 1 FROM h1 x RIGHT JOIN h2 y ON x.a = y.a JOIN h3 z ON y.a = z.a") == "42601");
+  CHECK(state("SELECT 1 FROM h1 NATURAL JOIN h2 NATURAL JOIN h3") == "42601");
+  CHECK(state("SELECT 1 FROM h1 x, h1 y, h1 z, h1 w, h1 v, h1 u, h1 t, h1 s, h1 r") == "42601");  // nine tables
+  CHECK(state("SELECT 1 FROM h1 x JOIN h1 y ON x.id = y.id FOR UPDATE") == "42601");
+}
+
+TEST_CASE("embedded API: an uncorrelated subquery runs once, on the statement's snapshot, before its plan",
+          "[sql][api]") {
+  sql_test::TempDir dir{"api_subquery"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE g (id INTEGER PRIMARY KEY, v INTEGER)");
+  (void)db->execute("CREATE TABLE h (k INTEGER PRIMARY KEY, w INTEGER)");
+  for (auto [id, v] : {std::pair<std::int64_t, Value>{1, i(10)}, {2, i(20)}, {3, Value{}}, {4, i(20)}, {5, i(30)}}) {
+    (void)db->execute("INSERT INTO g VALUES ($1, $2)", {i(id), v});
+  }
+  for (auto [k, w] : {std::pair<std::int64_t, Value>{1, i(20)}, {2, Value{}}, {3, i(5)}}) {
+    (void)db->execute("INSERT INTO h VALUES ($1, $2)", {i(k), w});
+  }
+  auto ids = [&](std::string_view sql) {
+    std::vector<std::int64_t> out;
+    for (const auto& r : db->execute(sql).rows) out.push_back(std::get<std::int64_t>(r[0]));
+    std::ranges::sort(out);
+    return out;
+  };
+  using V = std::vector<std::int64_t>;
+  CHECK(ids("SELECT id FROM g WHERE v = (SELECT MAX(v) FROM g)") == V{5});
+  CHECK(ids("SELECT id FROM g WHERE id = (SELECT MAX(k) FROM h)") == V{3});
+  CHECK(ids("SELECT id FROM g WHERE v = (SELECT w FROM h WHERE k = 2)").empty());  // NULL matches nothing
+  CHECK(ids("SELECT id FROM g WHERE v IN (SELECT w FROM h)") == V{2, 4});
+  // h holds a NULL, so NOT IN is never true: NULL where no value equals v.
+  CHECK(ids("SELECT id FROM g WHERE v NOT IN (SELECT w FROM h)").empty());
+  CHECK(ids("SELECT id FROM g WHERE v NOT IN (SELECT w FROM h WHERE w IS NOT NULL)") == V{1, 5});
+  CHECK(ids("SELECT id FROM g WHERE v > ALL (SELECT w FROM h WHERE w IS NOT NULL)") == V{5});
+  CHECK(ids("SELECT id FROM g WHERE v > ALL (SELECT w FROM h WHERE k > 9)") == V{1, 2, 3, 4, 5});  // over none: true
+  CHECK(ids("SELECT id FROM g WHERE v < ANY (SELECT w FROM h)") == V{1});
+  CHECK(ids("SELECT id FROM g WHERE EXISTS (SELECT 1 FROM h WHERE w = 5)") == V{1, 2, 3, 4, 5});
+  CHECK(ids("SELECT id FROM g WHERE NOT EXISTS (SELECT k, w FROM h)").empty());
+  // EXISTS reads no column: over a join it filters the left side, and in an
+  // outer join's ON the right one, the left rows staying.
+  CHECK(ids("SELECT g.id FROM g JOIN h ON g.v = h.w WHERE EXISTS (SELECT 1 FROM h WHERE k = 3)") == V{2, 4});
+  CHECK(ids("SELECT g.id FROM g JOIN h ON g.v = h.w WHERE NOT EXISTS (SELECT 1 FROM h)").empty());
+  CHECK(db->execute("SELECT g.id, h.k FROM g LEFT JOIN h ON g.v = h.w AND NOT EXISTS (SELECT 1 FROM h) WHERE g.id = 2")
+            .rows == Grid{{i(2), Value{}}});
+  CHECK(db->execute("SELECT (SELECT w FROM h WHERE k = 3), (SELECT w FROM h WHERE k = 9)").rows == Grid{{i(5), Value{}}});
+  try {
+    (void)db->execute("SELECT id FROM g WHERE v = (SELECT w FROM h)");
+    FAIL("a scalar subquery of three rows ran");
+  } catch (const ExecError& e) {
+    CHECK(sqlstate(e) == "21000");
+  }
+  // A write's subquery reads the rows as they were before the statement.
+  CHECK(db->execute("UPDATE g SET v = v + 100 WHERE v = (SELECT MAX(v) FROM g)").affected == 1);
+  CHECK(ids("SELECT id FROM g WHERE v > 100") == V{5});
+  // In a transaction, its earlier writes are the subquery's too.
+  auto t = db->begin();
+  (void)t.execute("INSERT INTO h VALUES ($1, $2)", {i(9), i(10)});
+  auto rows = t.execute("SELECT id FROM g WHERE v IN (SELECT w FROM h)").rows;
+  CHECK(rows.size() == 3);  // 10, 20, 20
+  CHECK(t.commit() == CommitOutcome::Committed);
+  // Every plan the search costs for the outer query agrees.
+  for (auto sql : {"SELECT id FROM g WHERE id IN (SELECT k FROM h)", "SELECT id FROM g WHERE v >= (SELECT MIN(w) FROM h)"}) {
+    INFO(sql);
+    auto want = db->execute(sql).rows;
+    std::ranges::sort(want);
+    for (auto& alt : db->alternatives_for_testing(sql, {})) {
+      std::ranges::sort(alt.rows);
+      CHECK(alt.rows == want);
+    }
+  }
+}
+
+TEST_CASE("embedded API: table aliases qualify columns and hide the table's name; AS names the output",
+          "[sql][api]") {
+  sql_test::TempDir dir{"api_alias"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE g (id INTEGER PRIMARY KEY, v INTEGER)");
+  (void)db->execute("CREATE TABLE h (k INTEGER PRIMARY KEY, w INTEGER)");
+  for (auto [id, v] : {std::pair<std::int64_t, std::int64_t>{1, 30}, {2, 10}, {3, 20}}) {
+    (void)db->execute("INSERT INTO g VALUES ($1, $2)", {i(id), i(v)});
+  }
+  (void)db->execute("INSERT INTO h VALUES (1, 7)");
+  auto r = db->execute("SELECT x.id AS ident, v total FROM g AS x WHERE x.v > 10 ORDER BY total");
+  CHECK(r.columns == std::vector<std::string>{"ident", "total"});
+  CHECK(r.rows == Grid{{i(3), i(20)}, {i(1), i(30)}});
+  // ORDER BY an output name, over the input column of that name.
+  CHECK(db->execute("SELECT id AS v, v AS id FROM g ORDER BY v DESC").rows ==
+        Grid{{i(3), i(20)}, {i(2), i(10)}, {i(1), i(30)}});
+  CHECK(db->execute("SELECT x.id, y.w FROM g x JOIN h AS y ON x.id = y.k").rows == Grid{{i(1), i(7)}});
+  CHECK(db->execute("SELECT COUNT(*) AS n, MAX(x.v) m FROM g x").columns == std::vector<std::string>{"n", "m"});
+  CHECK(db->execute("SELECT 1 AS one").columns == std::vector<std::string>{"one"});
+  CHECK(db->execute("SELECT x.v FROM g x GROUP BY x.v ORDER BY x.v").rows == Grid{{i(10)}, {i(20)}, {i(30)}});
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+  CHECK(state("SELECT g.id FROM g x") == "42P01");  // the alias hides the table's name
+  CHECK(state("SELECT id FROM g x JOIN h x ON x.id = x.k") == "42712");
+  CHECK(state("SELECT x.id FROM g x") == "ran");
+  // A column list renames the first columns: the old name is gone.
+  auto renamed = db->execute("SELECT x.a, b FROM g AS x (a, b) ORDER BY a");
+  CHECK(renamed.columns == std::vector<std::string>{"a", "b"});
+  CHECK(renamed.rows == Grid{{i(1), i(30)}, {i(2), i(10)}, {i(3), i(20)}});
+  CHECK(db->execute("SELECT * FROM g AS x (a)").columns == std::vector<std::string>{"a", "v"});
+  CHECK(state("SELECT x.id FROM g AS x (a, b)") == "42703");
+  CHECK(state("SELECT * FROM g AS x (a, b, c)") == "42P10");
+  CHECK(state("SELECT * FROM g AS x (a, a)") == "42701");
+}
+
+TEST_CASE("embedded API: SELECT * and table.* expand to the FROM tables' columns, in order", "[sql][api]") {
+  sql_test::TempDir dir{"api_star"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE g (id INTEGER PRIMARY KEY, v INTEGER)");
+  (void)db->execute("CREATE TABLE h (id INTEGER PRIMARY KEY, w INTEGER)");
+  (void)db->execute("CREATE TABLE np (p INTEGER, q INTEGER)");
+  (void)db->execute("INSERT INTO g VALUES (1, 10)");
+  (void)db->execute("INSERT INTO g VALUES (2, 20)");
+  (void)db->execute("INSERT INTO h VALUES (1, 7)");
+  (void)db->execute("INSERT INTO np VALUES (3, 4)");
+  auto all = db->execute("SELECT * FROM g ORDER BY id");
+  CHECK(all.columns == std::vector<std::string>{"id", "v"});
+  CHECK(all.rows == Grid{{i(1), i(10)}, {i(2), i(20)}});
+  CHECK(db->execute("SELECT x.*, v FROM g AS x WHERE x.v > 10").rows == Grid{{i(2), i(20), i(20)}});
+  CHECK(db->execute("SELECT * FROM g JOIN h ON g.id = h.id").columns == std::vector<std::string>{"id", "v", "id", "w"});
+  // A USING column is named once, first.
+  auto using_star = db->execute("SELECT * FROM g JOIN h USING (id)");
+  CHECK(using_star.columns == std::vector<std::string>{"id", "v", "w"});
+  CHECK(using_star.rows == Grid{{i(1), i(10), i(7)}});
+  CHECK(db->execute("SELECT h.*, g.v FROM g JOIN h ON g.id = h.id").rows == Grid{{i(1), i(7), i(10)}});
+  CHECK(db->execute("SELECT DISTINCT * FROM np").rows == Grid{{i(3), i(4)}});
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+  CHECK(state("SELECT *") == "42601");
+  CHECK(state("SELECT nope.* FROM g") == "42P01");
+  CHECK(state("SELECT g.* FROM g x") == "42P01");
+  CHECK(state("SELECT id FROM g WHERE * = 1") == "42601");
+}
+
+TEST_CASE("embedded API: * and / of constants fold as PostgreSQL's operators type them", "[sql][api]") {
+  sql_test::TempDir dir{"api_mul_div"};
+  auto db = Database::open(dir.path());
+  CHECK(db->execute("SELECT 6 * 7, 7 / 2, -7 / 2, 2 + 3 * 4, 8 / 2 / 2").rows ==
+        Grid{{i(42), i(3), i(-3), i(14), i(2)}});
+  CHECK(db->execute("SELECT 2147483648 * 2").rows == Grid{{i(4294967296)}});  // past INTEGER: BIGINT
+  CHECK(db->execute("SELECT NULL * 2, NULL / 0, 1 / NULL").rows == Grid{{Value{}, Value{}, Value{}}});
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+  CHECK(state("SELECT 1 / 0") == "22012");
+  CHECK(state("SELECT 1.5 / 0") == "22012");
+  CHECK(state("SELECT 2147483647 * 2") == "22003");
+  CHECK(state("SELECT 9223372036854775807 * 2") == "22003");
+  CHECK(state("SELECT (-9223372036854775807 - 1) / -1") == "22003");
+  CHECK(state("SELECT 1 % 2") == "42601");
+}
+
+TEST_CASE("embedded API: a numeric quotient of constants has PostgreSQL's scale", "[sql][api]") {
+  sql_test::TempDir dir{"api_numeric_quotient"};
+  auto db = Database::open(dir.path());
+  // select_div_scale: 16 significant digits, more where the dividend is the
+  // smaller by a base-10000 digit, and the finer operand's scale at least.
+  auto q = db->execute("SELECT 5.0 / 2, 10.0 / 4, 7.5 / 0.5, 100.0 / 3, -5.0 / 2, 5.0 / -2, 2.25 / 1.5, 3 / 2.0");
+  CHECK(q.rows == Grid{{i(25000000000000000), i(25000000000000000), i(150000000000000000), i(333333333333333333),
+                        i(-25000000000000000), i(-25000000000000000), i(15000000000000000), i(15000000000000000)}});
+  CHECK(q.types[0] == SqlType{SqlKind::Decimal, 0, 0, 16});
+  CHECK(q.types[3] == SqlType{SqlKind::Decimal, 0, 0, 16});
+  // Rounded half away from zero at the scale.
+  CHECK(db->execute("SELECT 20.0 / 3, -20.0 / 3, 10.0 / 3").rows ==
+        Grid{{i(66666666666666667), i(-66666666666666667), i(33333333333333333)}});
+  // A larger dividend leaves fewer places: 12 here.
+  auto big = db->execute("SELECT 100000.0 / 3");
+  CHECK(big.rows == Grid{{i(33333333333333333)}});
+  CHECK(big.types[0] == SqlType{SqlKind::Decimal, 0, 0, 12});
+  CHECK(db->execute("SELECT NULL / 1.5, 1.5 / NULL").rows == Grid{{Value{}, Value{}}});
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+  CHECK(state("SELECT 1.5 / 0") == "22012");
+  // A scale or a quotient past the 18 digits a DECIMAL holds is not taken.
+  CHECK(state("SELECT 1.0 / 3") == "42601");  // 20 digits of scale
+  CHECK(state("SELECT 1 / 2.0") == "42601");
+  CHECK(state("SELECT 0.0 / 2") == "42601");
+}
+
+TEST_CASE("embedded API: expressions over columns in the select list", "[sql][api]") {
+  sql_test::TempDir dir{"api_column_expressions"};
+  auto db = Database::open(dir.path());
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  auto yes = Value{true};
+  auto no = Value{false};
+  auto null = Value{};
+  (void)db->execute(
+      "CREATE TABLE ce (id INTEGER PRIMARY KEY, i INTEGER, s SMALLINT, b BIGINT, d DECIMAL(6,2), z INTEGER, t TEXT, f DOUBLE PRECISION)");
+  (void)db->execute("INSERT INTO ce VALUES (1, 1, 100, 9000000000000000000, 2.50, NULL, 'a', 1.5)");
+  (void)db->execute("INSERT INTO ce VALUES (2, 2, 200, 5, 2.50, 0, 'b', 2.5)");
+  (void)db->execute("INSERT INTO ce VALUES (3, 3, 300, 7, 10.00, 4, 'c', 0.5)");
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+
+  // + - * / with PostgreSQL's result types; / of integers truncates.
+  auto ints = db->execute("SELECT i + i, i - 1, i * i, i / 2, 7 / i FROM ce ORDER BY id");
+  CHECK(ints.rows == Grid{{i(2), i(0), i(1), i(0), i(7)}, {i(4), i(1), i(4), i(1), i(3)}, {i(6), i(2), i(9), i(1), i(2)}});
+  CHECK(ints.columns == std::vector<std::string>{"?column?", "?column?", "?column?", "?column?", "?column?"});
+  CHECK(ints.types == std::vector<SqlType>(5, SqlType{SqlKind::Integer}));
+  CHECK(db->execute("SELECT s * s FROM ce WHERE id = 1").types[0] == SqlType{SqlKind::SmallInt});
+  CHECK(db->execute("SELECT s * i FROM ce WHERE id = 1").types[0] == SqlType{SqlKind::Integer});
+  CHECK(db->execute("SELECT i * b FROM ce WHERE id = 2").types[0] == SqlType{SqlKind::BigInt});
+  CHECK(db->execute("SELECT b + 1 FROM ce ORDER BY id").rows == Grid{{i(9000000000000000001)}, {i(6)}, {i(8)}});
+
+  // DECIMALs: + and - at the finer scale, * at the sum; an integer meets them.
+  auto dec = db->execute("SELECT d + d, d + i, d - i, d * d, d * i FROM ce ORDER BY id");
+  CHECK(dec.types == std::vector<SqlType>{{SqlKind::Decimal, 0, 0, 2}, {SqlKind::Decimal, 0, 0, 2}, {SqlKind::Decimal, 0, 0, 2},
+                                          {SqlKind::Decimal, 0, 0, 4}, {SqlKind::Decimal, 0, 0, 2}});
+  CHECK(dec.rows == Grid{{i(500), i(350), i(150), i(62500), i(250)},
+                         {i(500), i(450), i(50), i(62500), i(500)},
+                         {i(2000), i(1300), i(700), i(1000000), i(3000)}});
+
+  // NULL in, NULL out; an operand a NULL column leaves the other unevaluated.
+  CHECK(db->execute("SELECT z + 1, z * 2, 1 - z FROM ce ORDER BY id").rows ==
+        Grid{{null, null, null}, {i(1), i(0), i(1)}, {i(5), i(8), i(-3)}});
+
+  // 22012 for a zero divisor, a column or a parameter; a NULL dividend raises none.
+  CHECK(state("SELECT i / z FROM ce") == "22012");
+  CHECK(state("SELECT d / 1 FROM ce") == "42601");  // a numeric quotient: its scale follows the values
+  CHECK(db->execute("SELECT i / z FROM ce WHERE id = 1").rows == Grid{{null}});
+  CHECK(db->execute("SELECT i / z FROM ce WHERE id = 3").rows == Grid{{i(0)}});
+  {
+    const auto& st = db->prepare("SELECT id, i / $1 FROM ce WHERE id < 3 ORDER BY id");
+    CHECK(db->execute(st, {i(1)}).rows == Grid{{i(1), i(1)}, {i(2), i(2)}});
+    try {
+      (void)db->execute(st, {i(0)});
+      FAIL("a zero divisor ran");
+    } catch (const ExecError& e) {
+      CHECK(sqlstate(e) == "22012");
+    }
+  }
+  // AND and OR evaluate an operand only while the result is open, so a guard works.
+  CHECK(db->execute("SELECT z <> 0 AND i / z > 0 FROM ce ORDER BY id").rows == Grid{{null}, {no}, {no}});
+  CHECK(db->execute("SELECT z = 0 OR i / z > 0 FROM ce WHERE id > 1 ORDER BY id").rows == Grid{{yes}, {no}});
+
+  // Range: a SMALLINT or INTEGER result is checked against its type, BIGINT's against its own.
+  CHECK(state("SELECT s * s FROM ce") == "22003");
+  CHECK(state("SELECT i * 1000000000 FROM ce") == "22003");
+  CHECK(state("SELECT b * 2 FROM ce") == "22003");
+  CHECK(state("SELECT b + b FROM ce WHERE id = 1") == "22003");
+  CHECK(db->execute("SELECT s * 100 FROM ce WHERE id = 1").rows == Grid{{i(10000)}});
+
+  // Comparisons as values: three-valued; numbers meet at the finer scale.
+  CHECK(db->execute("SELECT i < 2, i <= 2, i = 2, i <> 2, i >= 2, i > 2 FROM ce ORDER BY id").rows ==
+        Grid{{yes, yes, no, yes, no, no}, {no, yes, yes, no, yes, no}, {no, no, no, yes, yes, yes}});
+  CHECK(db->execute("SELECT i < z, z = z, z <> 0 FROM ce ORDER BY id").rows ==
+        Grid{{null, null, null}, {no, yes, no}, {yes, yes, yes}});
+  CHECK(db->execute("SELECT d < i, d = 2.5, d > 2 FROM ce ORDER BY id").rows ==
+        Grid{{no, yes, yes}, {no, yes, yes}, {no, no, yes}});
+  CHECK(db->execute("SELECT t = 'b', t < 'b', t >= 'b' FROM ce ORDER BY id").rows ==
+        Grid{{no, yes, no}, {yes, no, yes}, {no, no, yes}});
+  CHECK(db->execute("SELECT i + 1 = 3 AS hit FROM ce ORDER BY id").columns == std::vector<std::string>{"hit"});
+  CHECK(db->execute("SELECT i < (SELECT MAX(id) FROM ce), i = (SELECT MIN(id) FROM ce) FROM ce ORDER BY id").rows ==
+        Grid{{yes, yes}, {yes, no}, {no, no}});
+  CHECK(db->execute("SELECT i < (SELECT MAX(id) FROM ce WHERE id > 99) FROM ce WHERE id = 1").rows == Grid{{null}});
+  CHECK(state("SELECT i < t FROM ce") == "42883");
+  CHECK(state("SELECT i + t FROM ce") == "42883");
+  CHECK(db->execute(db->prepare("SELECT i + $1 < 4 FROM ce WHERE id = 1"), {i(2)}).rows == Grid{{yes}});
+
+  // IS [NOT] NULL of an expression, and AND, OR, NOT in SQL's logic.
+  CHECK(db->execute("SELECT z IS NULL, z IS NOT NULL, z + 1 IS NULL, i + i IS NOT NULL FROM ce ORDER BY id").rows ==
+        Grid{{yes, no, yes, yes}, {no, yes, no, yes}, {no, yes, no, yes}});
+  CHECK(db->execute("SELECT NOT (i > 1), i > 1 AND z IS NULL, i > 2 OR z IS NULL FROM ce ORDER BY id").rows ==
+        Grid{{yes, no, yes}, {no, no, no}, {no, no, yes}});
+  CHECK(db->execute("SELECT (z > 0) AND (z < 5), (z > 0) OR (z < 5), NOT (z > 0) FROM ce WHERE id = 1").rows ==
+        Grid{{null, null, null}});
+  CHECK(db->execute("SELECT (z > 0) AND false, (z > 0) OR true FROM ce WHERE id = 1").rows == Grid{{no, yes}});
+  CHECK(state("SELECT i AND true FROM ce") == "42804");
+  CHECK(state("SELECT NOT i FROM ce") == "42804");
+  // Constants fold: IS NULL, NOT, AND, OR of them.
+  CHECK(db->execute("SELECT NULL IS NULL, 1 IS NOT NULL, NOT TRUE, TRUE AND NULL, FALSE AND NULL, TRUE OR NULL, NULL OR NULL").rows ==
+        Grid{{yes, yes, no, null, no, yes, null}});
+
+  // Over a join, below a sort, from a covering index, in a set operation, a view.
+  (void)db->execute("CREATE TABLE ce2 (id INTEGER PRIMARY KEY, w INTEGER)");
+  (void)db->execute("INSERT INTO ce2 VALUES (1, 10)");
+  (void)db->execute("INSERT INTO ce2 VALUES (3, 30)");
+  CHECK(db->execute("SELECT ce.i + ce2.w, ce.i * ce2.w < 50 FROM ce JOIN ce2 ON ce.id = ce2.id ORDER BY ce2.w").rows ==
+        Grid{{i(11), yes}, {i(33), no}});
+  CHECK(db->execute("SELECT i * 2 FROM ce ORDER BY i DESC").rows == Grid{{i(6)}, {i(4)}, {i(2)}});
+  CHECK(db->execute("SELECT i * 2 FROM ce ORDER BY id DESC LIMIT 2").rows == Grid{{i(6)}, {i(4)}});
+  (void)db->execute("CREATE INDEX ce_i ON ce (i)");
+  CHECK(db->execute("SELECT i + 1 FROM ce WHERE i >= 2 ORDER BY i").rows == Grid{{i(3)}, {i(4)}});
+  CHECK(db->execute("SELECT i * 2 FROM ce UNION ALL SELECT w FROM ce2").rows.size() == 5);
+  (void)db->execute("CREATE VIEW cv AS SELECT id, i * 2 AS dbl FROM ce");
+  CHECK(db->execute("SELECT dbl FROM cv WHERE id = 3").rows == Grid{{i(6)}});
+
+  // What is still refused.
+  CHECK(state("SELECT f * 2 FROM ce") == "42601");               // REAL and DOUBLE PRECISION arithmetic
+  CHECK(state("SELECT f < 1 FROM ce") == "42601");
+  CHECK(state("SELECT -i FROM ce") == "42601");
+  CHECK(state("SELECT i % 2 FROM ce") == "42601");
+  CHECK(state("SELECT SUM(i) + 1 FROM ce") == "42601");
+  CHECK(state("SELECT i + 1, COUNT(*) FROM ce GROUP BY i") == "42601");
+  CHECK(state("SELECT $1 + 1 FROM ce") == "42601");
+  CHECK(state("UPDATE ce SET i = i * 2") == "42601");
+  CHECK(state("SELECT id FROM ce WHERE i * 2 = 4") == "42601");
+}
+
+
+TEST_CASE("embedded API: CASE, COALESCE and NULLIF over columns, parameters and subqueries", "[sql][api]") {
+  sql_test::TempDir dir{"api_case_columns"};
+  auto db = Database::open(dir.path());
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  auto null = Value{};
+  (void)db->execute(
+      "CREATE TABLE cc (id INTEGER PRIMARY KEY, i INTEGER, s SMALLINT, d DECIMAL(6,2), z INTEGER, t TEXT, f DOUBLE PRECISION)");
+  (void)db->execute("INSERT INTO cc VALUES (1, 1, 100, 2.50, NULL, 'a', 1.5)");
+  (void)db->execute("INSERT INTO cc VALUES (2, 2, 200, 2.50, 0, 'b', 2.5)");
+  (void)db->execute("INSERT INTO cc VALUES (3, 3, 300, 10.00, 4, 'c', 0.5)");
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+  auto rows = [&](std::string_view sql) { return db->execute(sql).rows; };
+
+  // Searched: the first true WHEN, else ELSE, else NULL; a NULL condition is not true.
+  auto bands = db->execute("SELECT CASE WHEN i < 2 THEN 'low' WHEN i < 3 THEN 'mid' ELSE 'high' END FROM cc ORDER BY id");
+  CHECK(bands.rows == Grid{{text("low")}, {text("mid")}, {text("high")}});
+  CHECK(bands.columns == std::vector<std::string>{"case"});
+  CHECK(bands.types == std::vector<SqlType>{SqlType{SqlKind::Text}});
+  CHECK(rows("SELECT CASE WHEN z > 0 THEN 1 END FROM cc ORDER BY id") == Grid{{null}, {null}, {i(1)}});
+  CHECK(rows("SELECT CASE WHEN i > 1 THEN NULL END FROM cc ORDER BY id") == Grid{{null}, {null}, {null}});
+  // Simple: CASE x WHEN v tests x = v.
+  CHECK(rows("SELECT CASE i WHEN 1 THEN 10 WHEN 3 THEN 30 ELSE 0 END FROM cc ORDER BY id") == Grid{{i(10)}, {i(0)}, {i(30)}});
+  CHECK(rows("SELECT CASE z WHEN 0 THEN 'zero' WHEN 4 THEN 'four' END FROM cc ORDER BY id") ==
+        Grid{{null}, {text("zero")}, {text("four")}});
+  // A WHEN that is AND, OR, NOT, IS NULL, or a subquery's boolean.
+  CHECK(rows("SELECT CASE WHEN z IS NULL THEN 'n' WHEN z = 0 OR i > 5 THEN 'z' ELSE 'p' END FROM cc ORDER BY id") ==
+        Grid{{text("n")}, {text("z")}, {text("p")}});
+  CHECK(rows("SELECT CASE WHEN NOT (i > 1) AND z IS NULL THEN 1 ELSE 0 END FROM cc ORDER BY id") == Grid{{i(1)}, {i(0)}, {i(0)}});
+  CHECK(rows("SELECT CASE WHEN i > (SELECT MIN(id) FROM cc) THEN 'x' ELSE 'y' END FROM cc ORDER BY id") ==
+        Grid{{text("y")}, {text("x")}, {text("x")}});
+
+  // COALESCE and NULLIF.
+  CHECK(rows("SELECT COALESCE(z, 99), COALESCE(z, i), COALESCE(t, 'q') FROM cc ORDER BY id") ==
+        Grid{{i(99), i(1), text("a")}, {i(0), i(0), text("b")}, {i(4), i(4), text("c")}});
+  CHECK(db->execute("SELECT COALESCE(z, i) FROM cc").columns == std::vector<std::string>{"coalesce"});
+  CHECK(rows("SELECT NULLIF(z, 0), NULLIF(i, 2) FROM cc ORDER BY id") == Grid{{null, i(1)}, {null, null}, {i(4), i(3)}});
+  CHECK(db->execute("SELECT NULLIF(i, 2) FROM cc").columns == std::vector<std::string>{"nullif"});
+  CHECK(rows("SELECT COALESCE(NULLIF(z, 0), i) FROM cc ORDER BY id") == Grid{{i(1)}, {i(2)}, {i(4)}});
+  CHECK(rows("SELECT COALESCE(z, (SELECT MAX(id) FROM cc)) FROM cc ORDER BY id") == Grid{{i(3)}, {i(0)}, {i(4)}});
+  {
+    const auto& st = db->prepare("SELECT COALESCE(z, $1) FROM cc ORDER BY id");
+    CHECK(db->execute(st, {i(7)}).rows == Grid{{i(7)}, {i(0)}, {i(4)}});
+  }
+
+  // Result types: integers widen; a numeric is at the finest scale of its branches.
+  CHECK(db->execute("SELECT CASE WHEN i = 1 THEN s ELSE i END FROM cc").types[0] == SqlType{SqlKind::Integer});
+  CHECK(rows("SELECT CASE WHEN i = 1 THEN s ELSE i END FROM cc ORDER BY id") == Grid{{i(100)}, {i(2)}, {i(3)}});
+  auto dec = db->execute("SELECT COALESCE(z, d), CASE WHEN i = 1 THEN d ELSE 0.125 END FROM cc ORDER BY id");
+  CHECK(dec.types == std::vector<SqlType>{{SqlKind::Decimal, 0, 0, 2}, {SqlKind::Decimal, 0, 0, 3}});
+  CHECK(dec.rows == Grid{{i(250), i(2500)}, {i(0), i(125)}, {i(400), i(125)}});
+  CHECK(rows("SELECT CASE WHEN i < 3 THEN f END FROM cc ORDER BY id") == Grid{{Value{1.5}}, {Value{2.5}}, {null}});
+  CHECK(state("SELECT CASE WHEN i = 1 THEN f ELSE 0 END FROM cc") == "42601");  // a float beside another number
+
+  // A branch is evaluated only when taken: an untaken one raises nothing.
+  CHECK(rows("SELECT CASE WHEN z <> 0 THEN i * 100 / z ELSE 0 END FROM cc ORDER BY id") == Grid{{i(0)}, {i(0)}, {i(75)}});
+  CHECK(rows("SELECT COALESCE(z, i / z) FROM cc WHERE id = 3") == Grid{{i(4)}});
+  CHECK(rows("SELECT COALESCE(i, i / z) FROM cc ORDER BY id") == Grid{{i(1)}, {i(2)}, {i(3)}});
+  CHECK(state("SELECT CASE WHEN id > 1 THEN i / z END FROM cc") == "22012");  // the taken one raises
+  CHECK(state("SELECT CASE WHEN i > 5 THEN i ELSE 1 / 0 END FROM cc") == "22012");  // a constant, folded when planned, as PostgreSQL
+
+  // Errors.
+  CHECK(state("SELECT CASE WHEN i THEN 1 END FROM cc") == "42804");
+  CHECK(state("SELECT CASE WHEN i > 0 THEN i ELSE t END FROM cc") == "42804");
+  CHECK(state("SELECT COALESCE(i, t) FROM cc") == "42804");
+  CHECK(state("SELECT CASE WHEN i > 0 THEN i ELSE 'x' END FROM cc") == "22P02");
+  CHECK(state("SELECT NULLIF(i, t) FROM cc") == "42883");
+
+  // Over a join, in a set operation, in a view.
+  (void)db->execute("CREATE TABLE cc2 (id INTEGER PRIMARY KEY, w INTEGER)");
+  (void)db->execute("INSERT INTO cc2 VALUES (1, 10)");
+  (void)db->execute("INSERT INTO cc2 VALUES (3, 30)");
+  CHECK(rows("SELECT CASE WHEN cc.i + cc2.w > 20 THEN 1 ELSE 0 END FROM cc JOIN cc2 ON cc.id = cc2.id ORDER BY cc2.w") ==
+        Grid{{i(0)}, {i(1)}});
+  CHECK(rows("SELECT COALESCE(z, 9) FROM cc WHERE id = 1 UNION ALL SELECT 5 ORDER BY 1") == Grid{{i(5)}, {i(9)}});
+  (void)db->execute("CREATE VIEW ccv AS SELECT id, COALESCE(z, 0) AS zz FROM cc");
+  CHECK(rows("SELECT zz FROM ccv ORDER BY id") == Grid{{i(0)}, {i(0)}, {i(4)}});
+}
+
+TEST_CASE("embedded API: CASE, COALESCE and NULLIF of constants fold as PostgreSQL's do", "[sql][api]") {
+  sql_test::TempDir dir{"api_case"};
+  auto db = Database::open(dir.path());
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  auto one = [&](std::string_view sql) { return db->execute(sql).rows; };
+  // Searched and simple CASE: the first true WHEN, else ELSE, else NULL.
+  CHECK(one("SELECT CASE WHEN 1 = 2 THEN 10 WHEN 2 = 2 THEN 20 ELSE 30 END, CASE 3 WHEN 1 THEN 'a' WHEN 3 THEN 'c' END") ==
+        Grid{{i(20), text("c")}});
+  CHECK(one("SELECT CASE WHEN 0 = 1 THEN 1 END, CASE 0 WHEN 2 THEN 1 END, CASE NULL WHEN NULL THEN 1 ELSE 2 END") ==
+        Grid{{Value{}, Value{}, i(2)}});
+  CHECK(one("SELECT CASE WHEN NULL THEN 1 ELSE 2 END").front().front() == i(2));  // a NULL condition is not true
+  CHECK(db->execute("SELECT CASE WHEN 0 = 1 THEN 1 END, COALESCE(NULL, 2), NULLIF(1, 1)").columns ==
+        std::vector<std::string>{"case", "coalesce", "nullif"});
+  // A WHEN after the one that matched is not evaluated.
+  CHECK(one("SELECT CASE WHEN 1 = 1 THEN 1 WHEN 1 / 0 = 1 THEN 2 END").front().front() == i(1));
+  // COALESCE and NULLIF.
+  CHECK(one("SELECT COALESCE(NULL, NULL, 3, 4), COALESCE(NULL, NULL), NULLIF(1, 2), NULLIF(2, 2), NULLIF(NULL, 1), NULLIF(1, NULL)") ==
+        Grid{{i(3), Value{}, i(1), Value{}, Value{}, i(1)}});
+  CHECK(one("SELECT NULLIF('a', 'a'), NULLIF('a', 'b'), COALESCE(NULL, 'x'), NULLIF('1', 1), NULLIF(1, 1.0)") ==
+        Grid{{Value{}, text("a"), text("x"), Value{}, Value{}}});
+  // An unknown literal takes the other branches' type; integers widen.
+  CHECK(one("SELECT COALESCE(NULL, '7'), CASE WHEN 1 = 2 THEN 1 ELSE 2 END") == Grid{{text("7"), i(2)}});
+  CHECK(one("SELECT COALESCE(1, 2147483648) + 1").front().front() == i(2));
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+  CHECK(state("SELECT CASE WHEN 1 THEN 1 END") == "42804");        // a condition must be boolean
+  CHECK(state("SELECT CASE WHEN 1 = 1 THEN 1 ELSE true END") == "42804");
+  CHECK(state("SELECT COALESCE(1, true)") == "42804");
+  CHECK(state("SELECT COALESCE(1, 'a')") == "22P02");
+  CHECK(state("SELECT CASE WHEN 1 = 1 THEN 1 ELSE 'a' END") == "22P02");  // type-checked though not taken
+  CHECK(state("SELECT NULLIF(1, 'a')") == "22P02");
+  CHECK(state("SELECT NULLIF(1, true)") == "42883");
+  CHECK(state("SELECT CASE 1 WHEN true THEN 1 END") == "42883");
+  CHECK(state("SELECT CASE WHEN 1 = 2 THEN 1 ELSE 1 / 0 END") == "22012");  // the branch taken raises
+  CHECK(state("SELECT COALESCE(NULL, 1 / 0)") == "22012");
+  // PostgreSQL skips a result that is not taken; here its type is unknown, so it is refused.
+  CHECK(state("SELECT COALESCE(1, 1 / 0, 2)") == "42601");
+  CHECK(state("SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 / 0 END") == "42601");
+  CHECK(state("SELECT CASE 0 WHEN 2, 2 THEN 1 END") == "42601");  // PostgreSQL has no list of WHEN values
+  (void)db->execute("CREATE TABLE cc (id INTEGER PRIMARY KEY, v INTEGER)");
+  // Of columns they are the next test's.
+  CHECK(state("SELECT CASE WHEN v = 1 THEN 1 END FROM cc") == "ran");
+  CHECK(state("SELECT COALESCE(v, 0) FROM cc") == "ran");
+  CHECK(state("SELECT NULLIF(v, 0) FROM cc") == "ran");
+}
+
+TEST_CASE("embedded API: || and the string functions of constants fold as PostgreSQL's do", "[sql][api]") {
+  sql_test::TempDir dir{"api_strfn"};
+  auto db = Database::open(dir.path());
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  auto one = [&](std::string_view sql) { return db->execute(sql).rows.front().front(); };
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+  // ||: strings, and any other type through its text; NULL on either side.
+  CHECK(one("SELECT 'foo' || 'bar' || 'é'") == text("foobaré"));
+  CHECK(one("SELECT 'a' || 1 || true || 2.50") == text("a1true2.50"));
+  CHECK(one("SELECT 1 || 'a'") == text("1a"));
+  CHECK(one("SELECT 'a' || NULL") == Value{});
+  CHECK(state("SELECT 1 || 2") == "42883");
+  // UPPER and LOWER fold ASCII (COLLATE "C").
+  CHECK(db->execute("SELECT UPPER('aé'), LOWER('AÉ'), UPPER(NULL)").rows == Grid{{text("Aé"), text("aÉ"), Value{}}});
+  // Lengths count characters and bytes.
+  CHECK(db->execute("SELECT CHAR_LENGTH('日本'), CHARACTER_LENGTH('ab'), OCTET_LENGTH('日本'), CHAR_LENGTH(NULL)").rows ==
+        Grid{{i(2), i(2), i(6), Value{}}});
+  // SUBSTRING: PostgreSQL's text_substring, a start before the string counting toward the length.
+  CHECK(db->execute("SELECT SUBSTRING('foobar' FROM 3), SUBSTRING('foobar' FROM 2 FOR 3), SUBSTRING('foobar' FROM -1 FOR 3), "
+                    "SUBSTRING('foobar' FROM 0), SUBSTRING('foobar' FROM 9), SUBSTRING('foobar' FROM 5 FOR 2147483647), "
+                    "SUBSTRING('日本語' FROM 2 FOR 1)")
+            .rows == Grid{{text("obar"), text("oob"), text("f"), text("foobar"), text(""), text("ar"), text("本")}});
+  CHECK(one("SELECT SUBSTRING('foobar' FROM 2 FOR NULL::integer)") == Value{});
+  CHECK(state("SELECT SUBSTRING('foobar' FROM 1 FOR -1)") == "22011");
+  CHECK(state("SELECT SUBSTRING('foobar' FROM 3000000000)") == "42883");
+  CHECK(state("SELECT SUBSTRING('foobar' FROM 1 FOR 'x')") == "22P02");
+  CHECK(state("SELECT SUBSTRING('foobar' FROM 'o+')") == "42601");  // the regular-expression form: not supported yet
+  // TRIM: spaces, or the characters given, by character.
+  CHECK(db->execute("SELECT TRIM('  a '), TRIM(LEADING FROM '  a '), TRIM(TRAILING FROM '  a '), TRIM('xy' FROM 'yxaxy'), "
+                    "TRIM('é' FROM 'éaé'), BTRIM('xa', 'x'), LTRIM('xxa', 'x'), RTRIM('axx', 'x'), TRIM('' FROM ' a ')")
+            .rows == Grid{{text("a"), text("a "), text("  a"), text("a"), text("a"), text("a"), text("a"), text("a"), text(" a ")}});
+  // POSITION: 1-based characters, 0 for none, 1 for an empty substring.
+  CHECK(db->execute("SELECT POSITION('an' IN 'banana'), POSITION('x' IN 'banana'), POSITION('' IN 'ab'), POSITION('本' IN '日本語')")
+            .rows == Grid{{i(2), i(0), i(1), i(2)}});
+  CHECK(one("SELECT POSITION(NULL IN 'a')") == Value{});
+  // OVERLAY.
+  CHECK(db->execute("SELECT OVERLAY('abcdef' PLACING 'XY' FROM 2), OVERLAY('abcdef' PLACING 'XY' FROM 2 FOR 3), "
+                    "OVERLAY('abc' PLACING 'XY' FROM 5)")
+            .rows == Grid{{text("aXYdef"), text("aXYef"), text("abcXY")}});
+  CHECK(state("SELECT OVERLAY('abc' PLACING 'x' FROM 0)") == "22011");
+  CHECK(state("SELECT OVERLAY('abc' PLACING 'x' FROM 2147483647 FOR 1)") == "22003");
+  // A type no function takes is 42883, a wrong number of arguments too.
+  CHECK(state("SELECT UPPER(1)") == "42883");
+  CHECK(state("SELECT UPPER(NULL::integer)") == "42883");
+  CHECK(state("SELECT UPPER('a', 'b')") == "42883");
+  CHECK(state("SELECT TRIM(1)") == "42883");
+  CHECK(state("SELECT POSITION(1 IN 'a')") == "42883");
+  // An error raised under CASE is raised if its branch is taken, and a branch not taken that raises is refused.
+  CHECK(state("SELECT CASE WHEN 1 = 2 THEN SUBSTRING('a' FROM 1 FOR -1) ELSE 'x' END") == "42601");
+  CHECK(state("SELECT CASE WHEN 1 = 1 THEN SUBSTRING('a' FROM 1 FOR -1) END") == "22011");
+  // The output column is named as PostgreSQL names it.
+  CHECK(db->execute("SELECT 'a' || 'b', TRIM('a'), POSITION('a' IN 'b'), SUBSTRING('a' FROM 1), CHARACTER_LENGTH('a'), OVERLAY('a' PLACING 'b' FROM 1)")
+            .columns == std::vector<std::string>{"?column?", "btrim", "position", "substring", "character_length", "overlay"});
+  (void)db->execute("CREATE TABLE sf (id INTEGER PRIMARY KEY, v VARCHAR(20))");
+  (void)db->execute("INSERT INTO sf VALUES (1, 'ab' || 'c')");
+  (void)db->execute("INSERT INTO sf VALUES (2, UPPER('x'))");
+  CHECK(db->execute("SELECT v FROM sf WHERE v = LOWER('ABC')").rows == Grid{{text("abc")}});
+  // Of a column, a parameter: not supported yet.
+  CHECK(state("SELECT v || 'x' FROM sf") == "42601");
+  CHECK(state("SELECT UPPER(v) FROM sf") == "42601");
+  CHECK(state("SELECT id FROM sf WHERE UPPER(v) = 'ABC'") == "42601");
+}
+
+TEST_CASE("embedded API: a view is read as a table, expanded at each use, and kept in the catalog", "[sql][api][view]") {
+  sql_test::TempDir dir{"api_view"};
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  auto state = [](Database& db, std::string_view sql) -> std::string {
+    try {
+      (void)db.execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    } catch (const DdlRefused& e) {
+      return std::string{e.sqlstate()};
+    } catch (const FeatureNotSupported&) {
+      return std::string{"0A000"};
+    }
+    return std::string{"ran"};
+  };
+  {
+    auto db = Database::open(dir.path());
+    auto run = [&](std::string_view sql) { return db->execute(sql).rows; };
+    (void)run("CREATE TABLE vt (id INTEGER PRIMARY KEY, a INTEGER, b VARCHAR(10))");
+    (void)run("INSERT INTO vt VALUES (1, 10, 'x')");
+    (void)run("INSERT INTO vt VALUES (2, 20, 'y')");
+    (void)run("INSERT INTO vt VALUES (3, 30, 'z')");
+    (void)run("CREATE TABLE vu (id INTEGER PRIMARY KEY, c INTEGER)");
+    (void)run("INSERT INTO vu VALUES (2, 200)");
+    (void)run("INSERT INTO vu VALUES (3, 300)");
+    (void)run("INSERT INTO vu VALUES (4, 400)");
+
+    // A view of a WHERE, with a column renamed; its columns are its select list's names.
+    (void)run("CREATE VIEW v AS SELECT id, a AS aa, b FROM vt WHERE a > 10");
+    CHECK(run("SELECT * FROM v ORDER BY id") == Grid{{i(2), i(20), text("y")}, {i(3), i(30), text("z")}});
+    CHECK(db->execute("SELECT * FROM v").columns == std::vector<std::string>{"id", "aa", "b"});
+    CHECK(run("SELECT aa FROM v WHERE id = 3") == Grid{{i(30)}});
+    CHECK(run("SELECT aa, id FROM v ORDER BY aa DESC") == Grid{{i(30), i(3)}, {i(20), i(2)}});
+    CHECK(run("SELECT v.b FROM v WHERE v.aa >= 30") == Grid{{text("z")}});
+    CHECK(run("SELECT COUNT(*) FROM v") == Grid{{i(2)}});
+    CHECK(run("SELECT id FROM v WHERE aa = 20 OR b = 'z' ORDER BY id") == Grid{{i(2)}, {i(3)}});
+    CHECK(run("SELECT x.id FROM v AS x WHERE x.aa = 20") == Grid{{i(2)}});
+    // Read at each use: a row written since shows.
+    (void)run("INSERT INTO vt VALUES (4, 40, 'w')");
+    CHECK(run("SELECT COUNT(*) FROM v") == Grid{{i(3)}});
+    // A column the view does not have is the view's to refuse, not the table's.
+    CHECK(state(*db, "SELECT a FROM v") == "42703");
+    CHECK(state(*db, "SELECT nope.id FROM v") == "42P01");
+
+    // A column list names the columns; fewer names than columns rename the first ones.
+    (void)run("CREATE VIEW w (x, y) AS SELECT id, a FROM vt");
+    CHECK(db->execute("SELECT * FROM w").columns == std::vector<std::string>{"x", "y"});
+    CHECK(run("SELECT x, y FROM w WHERE y >= 30 ORDER BY x") == Grid{{i(3), i(30)}, {i(4), i(40)}});
+    CHECK(state(*db, "CREATE VIEW w3 (x, y, z) AS SELECT id, a FROM vt") == "42601");
+    CHECK(state(*db, "CREATE VIEW w4 (x, x) AS SELECT id, a FROM vt") == "42701");
+    CHECK(state(*db, "CREATE VIEW w5 AS SELECT id, id FROM vt") == "42701");
+
+    // In a join, with a table or with another view, and in subqueries.
+    CHECK(run("SELECT v.aa, vu.c FROM v JOIN vu ON v.id = vu.id ORDER BY vu.c") == Grid{{i(20), i(200)}, {i(30), i(300)}, {i(40), i(400)}});
+    CHECK(run("SELECT * FROM vu JOIN v ON vu.id = v.id WHERE vu.c > 200 ORDER BY vu.c") ==
+          Grid{{i(3), i(300), i(3), i(30), text("z")}, {i(4), i(400), i(4), i(40), text("w")}});
+    CHECK(run("SELECT b, c FROM v JOIN vu ON v.id = vu.id WHERE c = 200") == Grid{{text("y"), i(200)}});  // each column's side is found
+    CHECK(run("SELECT w.y, vu.c FROM w, vu WHERE w.x = vu.id AND w.y = 30") == Grid{{i(30), i(300)}});
+    CHECK(state(*db, "SELECT * FROM w, v WHERE w.x = v.id") == "42601");  // two views of one table: a table joined with itself
+    CHECK(run("SELECT c FROM vu WHERE id IN (SELECT id FROM v WHERE aa > 20) ORDER BY c") == Grid{{i(300)}, {i(400)}});
+    CHECK(run("SELECT c FROM vu WHERE EXISTS (SELECT id FROM v WHERE aa = 20)").size() == 3);
+    CHECK(state(*db, "SELECT id FROM v JOIN vu ON v.id = vu.id") == "42702");  // both sides have id
+    CHECK(state(*db, "SELECT * FROM v JOIN vu USING (id)") == "42601");  // USING a view's column: not supported yet
+    CHECK(state(*db, "SELECT v.aa FROM v LEFT JOIN vu ON v.id = vu.id") == "42601");  // an outer join of a view with a WHERE
+    (void)run("CREATE VIEW plain AS SELECT id, a FROM vt");
+    CHECK(run("SELECT plain.a, vu.c FROM plain LEFT JOIN vu ON plain.id = vu.id WHERE plain.id < 3 ORDER BY plain.id") ==
+          Grid{{i(10), Value{}}, {i(20), i(200)}});
+    CHECK(run("SELECT vu.c, plain.a FROM vu RIGHT JOIN plain ON plain.id = vu.id WHERE plain.id < 3 ORDER BY plain.id") ==
+          Grid{{Value{}, i(10)}, {i(200), i(20)}});
+
+    // A view of a view.
+    (void)run("CREATE VIEW vv AS SELECT aa AS q, b FROM v WHERE id < 4");
+    CHECK(run("SELECT q FROM vv ORDER BY q") == Grid{{i(20)}, {i(30)}});
+    CHECK(run("SELECT * FROM vv WHERE b = 'z'") == Grid{{i(30), text("z")}});
+
+    // A constant in a view's select list, and a view of no table.
+    (void)run("CREATE VIEW k AS SELECT id, 7 AS seven FROM vt");
+    CHECK(run("SELECT id, seven FROM k WHERE id = 1") == Grid{{i(1), i(7)}});
+    CHECK(state(*db, "SELECT SUM(seven) FROM k") == "42601");  // an aggregate of a constant column: not supported yet
+    (void)run("CREATE VIEW one AS SELECT 1 AS n");
+    CHECK(run("SELECT n FROM one") == Grid{{i(1)}});
+
+    // A grouped view: the query reads its groups; its WHERE keeps groups (a HAVING).
+    (void)run("INSERT INTO vt VALUES (5, 10, 'x')");
+    (void)run("CREATE VIEW g AS SELECT a, COUNT(*) AS n, MIN(id) AS lo FROM vt GROUP BY a");
+    CHECK(run("SELECT a, n FROM g ORDER BY a") == Grid{{i(10), i(2)}, {i(20), i(1)}, {i(30), i(1)}, {i(40), i(1)}});
+    CHECK(run("SELECT a FROM g WHERE n = 2") == Grid{{i(10)}});
+    CHECK(run("SELECT lo FROM g WHERE a = 10 AND n >= 2") == Grid{{i(1)}});
+    CHECK(run("SELECT a FROM g WHERE a > 100").empty());
+    (void)run("CREATE VIEW ga AS SELECT a FROM vt GROUP BY a HAVING a >= 30");
+    CHECK(run("SELECT a FROM ga ORDER BY a") == Grid{{i(30)}, {i(40)}});
+    // Grouping a grouped view again by its own groups is the view; otherwise it waits for derived tables.
+    CHECK(run("SELECT a FROM ga GROUP BY a ORDER BY a") == Grid{{i(30)}, {i(40)}});
+    CHECK(run("SELECT a FROM ga WHERE a = 40 GROUP BY a HAVING a = 40") == Grid{{i(40)}});
+    CHECK(run("SELECT a FROM ga WHERE a = 40 GROUP BY a HAVING a = 30").empty());
+    // MIN, MAX and COUNT(DISTINCT) cannot tell a value once from many: they read the base rows the view keeps.
+    CHECK(run("SELECT MAX(a), MIN(a) FROM ga") == Grid{{i(40), i(30)}});
+    CHECK(run("SELECT COUNT(DISTINCT a) FROM ga WHERE a < 40") == Grid{{i(1)}});
+    CHECK(state(*db, "SELECT SUM(a) FROM ga") == "42601");
+    CHECK(state(*db, "SELECT COUNT(*) FROM ga") == "42601");
+    CHECK(state(*db, "SELECT DISTINCT a FROM ga") == "42601");
+    CHECK(state(*db, "SELECT a, n FROM g GROUP BY a") == "42601");
+    CHECK(state(*db, "SELECT a FROM g JOIN vu ON g.a = vu.id") == "42601");
+
+    // A view that cuts rows (DISTINCT, LIMIT) is created, and not read yet.
+    (void)run("CREATE VIEW d AS SELECT DISTINCT a FROM vt");
+    CHECK(state(*db, "SELECT a FROM d") == "42601");
+    CHECK(state(*db, "CREATE VIEW dp AS SELECT a FROM vt WHERE a = $1") == "42P02");
+
+    // A view is read-only here.
+    CHECK(state(*db, "INSERT INTO v VALUES (9, 9, 'q')") == "0A000");
+    CHECK(state(*db, "UPDATE v SET aa = 1") == "0A000");
+    CHECK(state(*db, "DELETE FROM v") == "0A000");
+    CHECK(state(*db, "CREATE INDEX vi ON v (id)") == "0A000");
+    CHECK(run("SELECT COUNT(*) FROM vt").front().front() == i(5));
+    // A view in a subquery of a write.
+    CHECK(db->execute("DELETE FROM vu WHERE id IN (SELECT id FROM v WHERE aa = 40)").affected == 1);
+    CHECK(run("SELECT COUNT(*) FROM vu") == Grid{{i(2)}});
+    (void)run("INSERT INTO vu VALUES (4, 400)");
+
+    // DDL: the names are one namespace, and a drop names its kind.
+    CHECK(state(*db, "CREATE VIEW v AS SELECT id FROM vt") == "42P07");
+    CHECK(state(*db, "CREATE VIEW vt AS SELECT id FROM vu") == "42P07");
+    CHECK(state(*db, "CREATE TABLE v (id INTEGER PRIMARY KEY)") == "42P07");
+    CHECK(state(*db, "CREATE VIEW bad AS SELECT id FROM nope") == "42P01");
+    CHECK(state(*db, "CREATE VIEW bad AS SELECT nope FROM vt") == "42703");
+    CHECK(state(*db, "CREATE VIEW bad AS SELECT * FROM v, vu, vt") == "42601");
+    CHECK(state(*db, "CREATE VIEW bad AS SELECT id FROM vt WITH CHECK OPTION") == "42601");
+    CHECK(state(*db, "DROP VIEW vt") == "42809");
+    CHECK(state(*db, "DROP TABLE v") == "42809");
+    CHECK(state(*db, "DROP INDEX v") == "42809");
+    CHECK(state(*db, "DROP VIEW nope") == "42P01");
+    CHECK(state(*db, "DROP VIEW IF EXISTS nope") == "ran");
+    // A view keeps what it reads from being dropped, as PostgreSQL's RESTRICT does.
+    CHECK(state(*db, "DROP TABLE vt") == "2BP01");
+    CHECK(state(*db, "DROP VIEW v") == "2BP01");  // vv reads it
+    CHECK(run("SELECT COUNT(*) FROM vv") == Grid{{i(2)}});
+    db->close();
+  }
+  // A fresh open reads the same views, and plans compiled through a view follow it when it is dropped and created again.
+  auto db = Database::open(dir.path());
+  auto run = [&](std::string_view sql) { return db->execute(sql).rows; };
+  CHECK(run("SELECT q FROM vv ORDER BY q") == Grid{{i(20)}, {i(30)}});
+  const auto& stmt = db->prepare("SELECT n FROM one");
+  CHECK(db->execute(stmt, {}).rows == Grid{{i(1)}});
+  (void)run("DROP VIEW one");
+  CHECK(state(*db, "SELECT n FROM one") == "42P01");
+  (void)run("CREATE VIEW one AS SELECT 2 AS n");
+  CHECK(db->execute(stmt, {}).rows == Grid{{i(2)}});  // the cached plan was rebuilt through the new view
+  // The view is bound against the tables as they are when it is read. PostgreSQL keeps the columns a star
+  // gave a view; here a view the tables have outgrown is refused, never given more columns.
+  (void)run("CREATE VIEW everything AS SELECT * FROM vu");
+  (void)run("CREATE VIEW over_everything AS SELECT c FROM everything");
+  CHECK(db->execute("SELECT * FROM everything").columns == std::vector<std::string>{"id", "c"});
+  (void)run("ALTER TABLE vu ADD COLUMN extra INTEGER DEFAULT 5");
+  CHECK(state(*db, "SELECT * FROM everything") == "0A000");
+  CHECK(state(*db, "SELECT c FROM over_everything") == "0A000");
+  (void)run("DROP VIEW over_everything");
+  (void)run("DROP VIEW everything");
+  (void)run("CREATE VIEW everything AS SELECT * FROM vu");
+  CHECK(db->execute("SELECT * FROM everything").columns == std::vector<std::string>{"id", "c", "extra"});
+  // Dropping what is read, once its views are gone.
+  for (auto name : {"vv", "v", "w", "plain", "k", "one", "g", "ga", "d", "everything"}) (void)run(std::string{"DROP VIEW "} + name);
+  (void)run("DROP TABLE vt");
+  (void)run("DROP TABLE vu");
 }
 
 TEST_CASE("embedded API: a choice point's plan text shows both plans, and each returns the same rows",
@@ -1184,4 +2238,446 @@ TEST_CASE("embedded API: a choice point's plan text shows both plans, and each r
       CHECK(sorted(all[n].rows) == sorted(want));
     }
   }
+}
+
+TEST_CASE("embedded API: a set operation streams its arms, names its columns from the first and resolves their types", "[sql][api][setop]") {
+  sql_test::TempDir dir{"api_setop"};
+  auto db = Database::open(dir.path());
+  auto run = [&](std::string_view sql, const std::vector<Value>& params = {}) { return db->execute(sql, params).rows; };
+  auto sorted = [](Grid g) {
+    std::ranges::sort(g);
+    return g;
+  };
+  (void)run("CREATE TABLE sa (id INTEGER PRIMARY KEY, x INTEGER)");
+  (void)run("CREATE TABLE sb (id BIGINT PRIMARY KEY, y BIGINT, f DOUBLE PRECISION)");
+  for (auto [id, x] : std::vector<std::pair<int, std::optional<int>>>{{1, 1}, {2, 2}, {3, 2}, {4, {}}, {5, {}}}) {
+    (void)db->execute("INSERT INTO sa VALUES ($1, $2)", {i(id), x ? i(*x) : kNull});
+  }
+  for (auto [id, y] : std::vector<std::pair<int, std::optional<int>>>{{1, 2}, {2, 3}, {3, {}}, {4, 3}, {5, 2}}) {
+    (void)db->execute("INSERT INTO sb VALUES ($1, $2, $3)", {i(id), y ? i(*y) : kNull, y ? Value{*y + 0.5} : kNull});
+  }
+
+  // Column names are the first arm's; a column both arms give is of the type they resolve to.
+  auto r = db->execute("SELECT x AS first, id FROM sa UNION ALL SELECT y AS second, id FROM sb");
+  CHECK(r.columns == std::vector<std::string>{"first", "id"});
+  CHECK(r.types[0].kind == SqlKind::BigInt);  // INTEGER meets BIGINT
+  CHECK(r.rows.size() == 10);
+  CHECK(db->execute("SELECT x FROM sa UNION SELECT f FROM sb").types[0].kind == SqlKind::Double);
+  CHECK(db->execute("SELECT x FROM sa UNION SELECT y FROM sb").columns == std::vector<std::string>{"x"});
+
+  // An integer meeting a double compares as a double and comes back as one.
+  CHECK(sorted(run("SELECT x FROM sa UNION SELECT f FROM sb")) ==
+        sorted(Grid{{Value{1.0}}, {Value{2.0}}, {Value{2.5}}, {Value{3.5}}, {kNull}}));
+  CHECK(sorted(run("SELECT f FROM sb INTERSECT SELECT x FROM sa")) == Grid{{kNull}});
+  CHECK(sorted(run("SELECT x FROM sa EXCEPT ALL SELECT y FROM sb")) == sorted(Grid{{kNull}, {i(1)}}));
+
+  // The counts of ALL.
+  CHECK(sorted(run("SELECT x FROM sa INTERSECT ALL SELECT y FROM sb")) == sorted(Grid{{kNull}, {i(2)}, {i(2)}}));
+  CHECK(sorted(run("SELECT y FROM sb EXCEPT ALL SELECT x FROM sa")) == Grid{{i(3)}, {i(3)}});
+  CHECK(sorted(run("SELECT x FROM sa UNION ALL SELECT y FROM sb")).size() == 10);
+  CHECK(sorted(run("SELECT x FROM sa UNION SELECT y FROM sb")) == sorted(Grid{{kNull}, {i(1)}, {i(2)}, {i(3)}}));
+
+  // A prepared statement runs again with other parameters, its structures made anew.
+  const auto& stmt = db->prepare("SELECT x FROM sa WHERE id = $1 UNION SELECT y FROM sb WHERE id = $2");
+  CHECK(db->execute(stmt, {i(1), i(2)}).rows == Grid{{i(1)}, {i(3)}});
+  CHECK(db->execute(stmt, {i(1), i(1)}).rows == Grid{{i(1)}, {i(2)}});
+  CHECK(db->execute(stmt, {i(1), i(99)}).rows == Grid{{i(1)}});
+  CHECK(db->execute(stmt, {kNull, kNull}).rows.empty());
+  for (const auto& all : db->alternatives_for_testing("SELECT x FROM sa UNION SELECT y FROM sb", {})) {
+    CHECK(sorted(all.rows) == sorted(Grid{{kNull}, {i(1)}, {i(2)}, {i(3)}}));
+  }
+
+  // An arm that is a join, and one that reads an index's keys alone.
+  (void)run("CREATE TABLE sc (id INTEGER PRIMARY KEY, z INTEGER)");
+  for (int k = 1; k <= 3; ++k) (void)db->execute("INSERT INTO sc VALUES ($1, $2)", {i(k), i(k * 10)});
+  CHECK(sorted(run("SELECT sa.x FROM sa, sc WHERE sa.id = sc.id UNION SELECT y FROM sb WHERE id = 2")) ==
+        sorted(Grid{{i(1)}, {i(2)}, {i(3)}}));
+  CHECK(sorted(run("SELECT sa.x FROM sa, sc WHERE sa.id = sc.id EXCEPT ALL SELECT y FROM sb WHERE id < 3")) ==
+        sorted(Grid{{i(1)}, {i(2)}}));
+  (void)run("CREATE TABLE sj (id BIGINT PRIMARY KEY, g BIGINT, name BYTEA)");
+  (void)run("CREATE INDEX sj_by_name ON sj (name)");
+  for (auto [id, g, name] : std::vector<std::tuple<int, int, const char*>>{{1, 1, "apple"}, {2, 1, "banana"}, {3, 2, "cherry"}, {4, 2, "apple"}}) {
+    (void)db->execute("INSERT INTO sj VALUES ($1, $2, $3)", {i(id), i(g), bytes(name)});
+  }
+  const std::string covered =
+      "SELECT name FROM sj WHERE name >= $1 AND name < $2 UNION ALL SELECT name FROM sj WHERE id = $3 INTERSECT SELECT name FROM sj WHERE g = $4";
+  INFO(db->prepare(covered).plan_source());
+  CHECK(db->prepare(covered).plan_source().find("bc_key_part_bytes") != std::string::npos);  // the index covers the first arm
+  CHECK(sorted(run(covered, {bytes("a"), bytes("b"), i(2), i(1)})) ==
+        sorted(Grid{{bytes("apple")}, {bytes("apple")}, {bytes("banana")}}));
+  CHECK(sorted(run("SELECT name FROM sj WHERE g = $1 EXCEPT SELECT name FROM sj WHERE g = $2", {i(2), i(1)})) ==
+        sorted(Grid{{bytes("cherry")}}));
+
+  // Inside a transaction a set operation reads what the transaction wrote.
+  auto txn = db->begin();
+  (void)txn.execute("INSERT INTO sa VALUES (6, 3)");
+  CHECK(sorted(txn.execute("SELECT x FROM sa EXCEPT SELECT y FROM sb WHERE id = 1").rows) ==
+        sorted(Grid{{kNull}, {i(1)}, {i(3)}}));
+  txn.rollback();
+
+  // Refusals.
+  CHECK(sql_refusal(*db, "(SELECT x FROM sa UNION SELECT y FROM sb ORDER BY x) UNION SELECT 1", {})
+            .find("ORDER BY on a parenthesised set operation") != std::string::npos);
+  CHECK(sql_refusal(*db, "SELECT DISTINCT x FROM sa UNION SELECT y FROM sb", {}).find("aggregated, grouped or DISTINCT") !=
+        std::string::npos);
+  CHECK(sql_refusal(*db, "SELECT x FROM sa UNION SELECT 'a'", {}).find("literal of no type") != std::string::npos);
+  CHECK(sql_refusal(*db, "SELECT x FROM sa UNION SELECT 1", {}).empty());
+  CHECK(sql_refusal(*db, "SELECT x FROM sa UNION SELECT NULL", {}).find("literal of no type") != std::string::npos);
+  CHECK(sql_refusal(*db, "SELECT 1 UNION SELECT NULL", {}).find("literal of no type") != std::string::npos);
+  CHECK(sql_refusal(*db, "SELECT 'a' UNION SELECT 'b'", {}).empty());
+}
+
+TEST_CASE("embedded API: a set operation holds the keys of one side and fails past the statement's memory budget", "[sql][api][setop]") {
+  sql_test::TempDir dir{"api_setop_mem"};
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  (void)db->execute("CREATE TABLE big (id INTEGER PRIMARY KEY, x INTEGER)");
+  auto txn = db->begin();
+  for (int k = 0; k < 2000; ++k) (void)txn.execute("INSERT INTO big VALUES ($1, $1)", {i(k)});
+  (void)txn.commit();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  // Nothing is collected but the side that is held: the other streams past it.
+  CHECK(state("SELECT x FROM big UNION ALL SELECT x FROM big LIMIT 5") == "ran");
+  CHECK(state("SELECT x FROM big INTERSECT SELECT x FROM big WHERE id < 0") == "54000");
+  CHECK(state("SELECT x FROM big WHERE id < 0 EXCEPT SELECT x FROM big") == "54000");
+  CHECK(state("SELECT x FROM big WHERE id < 100 EXCEPT SELECT x FROM big WHERE id < 100") == "ran");
+  CHECK(state("SELECT x FROM big UNION SELECT x FROM big WHERE id < 0") == "54000");
+}
+
+TEST_CASE("embedded API: SUM, AVG, MIN and MAX of a DOUBLE, and DISTINCT values, as PostgreSQL's float8", "[sql][api][aggregate]") {
+  sql_test::TempDir dir{"api_double_aggregates"};
+  auto db = Database::open(dir.path());
+  auto run = [&](std::string_view sql, const std::vector<Value>& params = {}) { return db->execute(sql, params).rows; };
+  (void)run("CREATE TABLE fa (id INTEGER PRIMARY KEY, f DOUBLE PRECISION)");
+  const auto nan = std::numeric_limits<double>::quiet_NaN();
+  for (auto [id, f] : std::vector<std::pair<int, double>>{{1, nan}, {2, nan}, {3, -0.0}, {4, 0.0}, {5, 1.5}}) {
+    (void)db->execute("INSERT INTO fa VALUES ($1, $2)", {i(id), Value{f}});
+  }
+  // NaN is one value and above every number; -0.0 and 0.0 are one.
+  CHECK(run("SELECT COUNT(DISTINCT f), COUNT(f) FROM fa") == Grid{{i(3), i(5)}});
+  auto row = run("SELECT MAX(f), MIN(f), SUM(f), AVG(f), MAX(DISTINCT f) FROM fa").at(0);
+  CHECK(std::isnan(std::get<double>(row[0])));
+  CHECK(std::get<double>(row[1]) == 0.0);
+  CHECK(std::isnan(std::get<double>(row[2])));
+  CHECK(std::isnan(std::get<double>(row[3])));
+  CHECK(std::isnan(std::get<double>(row[4])));
+  CHECK(run("SELECT SUM(DISTINCT f), AVG(DISTINCT f), MIN(f) FROM fa WHERE id >= 3") == Grid{{Value{1.5}, Value{0.75}, Value{-0.0}}});
+  // A sum that overflows from finite values is 22003, as PostgreSQL's.
+  (void)run("CREATE TABLE fb (id INTEGER PRIMARY KEY, f DOUBLE PRECISION)");
+  (void)db->execute("INSERT INTO fb VALUES (1, $1)", {Value{1e308}});
+  (void)db->execute("INSERT INTO fb VALUES (2, $1)", {Value{1e308}});
+  CHECK(run("SELECT SUM(DISTINCT f) FROM fb") == Grid{{Value{1e308}}});
+  try {
+    (void)run("SELECT SUM(f) FROM fb");
+    FAIL("expected an overflow");
+  } catch (const ExecError& e) {
+    CHECK(std::string{sqlstate(e)} == "22003");
+  }
+}
+
+TEST_CASE("embedded API: the distinct values of an aggregate are held in the statement's memory and fail past it", "[sql][api][aggregate]") {
+  sql_test::TempDir dir{"api_distinct_agg_mem"};
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  (void)db->execute("CREATE TABLE big (id INTEGER PRIMARY KEY, x INTEGER)");
+  auto txn = db->begin();
+  for (int k = 0; k < 2000; ++k) (void)txn.execute("INSERT INTO big VALUES ($1, $1)", {i(k)});
+  (void)txn.commit();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  CHECK(state("SELECT SUM(DISTINCT x) FROM big") == "54000");
+  CHECK(state("SELECT AVG(DISTINCT x) FROM big") == "54000");
+  CHECK(state("SELECT SUM(DISTINCT x) FROM big WHERE id < 10") == "ran");
+  // MIN and MAX of the distinct values are those of all of them: nothing is held.
+  CHECK(state("SELECT MIN(DISTINCT x), MAX(DISTINCT x) FROM big") == "ran");
+}
+
+TEST_CASE("embedded API: ORDER BY of a set operation's rows sorts them as a SELECT's, and a LIMIT keeps the first", "[sql][api][setop]") {
+  sql_test::TempDir dir{"api_setop_order"};
+  auto db = Database::open(dir.path());
+  auto run = [&](std::string_view sql, const std::vector<Value>& params = {}) { return db->execute(sql, params).rows; };
+  (void)run("CREATE TABLE oa (id INTEGER PRIMARY KEY, x INTEGER, f DOUBLE PRECISION)");
+  (void)run("CREATE TABLE ob (id BIGINT PRIMARY KEY, y BIGINT, f DOUBLE PRECISION)");
+  for (auto [id, x] : std::vector<std::pair<int, std::optional<int>>>{{1, 3}, {2, 1}, {3, {}}, {4, 2}}) {
+    (void)db->execute("INSERT INTO oa VALUES ($1, $2, $3)", {i(id), x ? i(*x) : kNull, x ? Value{*x * 0.5} : kNull});
+  }
+  for (auto [id, y] : std::vector<std::pair<int, std::optional<int>>>{{1, 2}, {2, 5}, {3, {}}}) {
+    (void)db->execute("INSERT INTO ob VALUES ($1, $2, $3)", {i(id), y ? i(*y) : kNull, y ? Value{*y * 0.5} : kNull});
+  }
+  // NULLS LAST ascending, FIRST descending; an INTEGER meeting a BIGINT is BIGINT.
+  CHECK(run("SELECT x FROM oa UNION ALL SELECT y FROM ob ORDER BY x") ==
+        Grid{{i(1)}, {i(2)}, {i(2)}, {i(3)}, {i(5)}, {kNull}, {kNull}});
+  CHECK(run("SELECT x FROM oa UNION ALL SELECT y FROM ob ORDER BY 1 DESC") ==
+        Grid{{kNull}, {kNull}, {i(5)}, {i(3)}, {i(2)}, {i(2)}, {i(1)}});
+  CHECK(run("SELECT x FROM oa UNION ALL SELECT y FROM ob ORDER BY x DESC NULLS LAST LIMIT 3") ==
+        Grid{{i(5)}, {i(3)}, {i(2)}});
+  CHECK(run("SELECT x FROM oa UNION SELECT y FROM ob ORDER BY x") == Grid{{i(1)}, {i(2)}, {i(3)}, {i(5)}, {kNull}});
+  CHECK(run("SELECT x FROM oa EXCEPT SELECT y FROM ob ORDER BY x") == Grid{{i(1)}, {i(3)}});
+  CHECK(run("SELECT x FROM oa INTERSECT SELECT y FROM ob ORDER BY x") == Grid{{i(2)}, {kNull}});
+  // Two keys, the second descending; a column the key does not name rides along.
+  CHECK(run("SELECT f, x FROM oa UNION ALL SELECT f, y FROM ob ORDER BY 1 DESC, x") ==
+        Grid{{kNull, kNull}, {kNull, kNull}, {Value{2.5}, i(5)}, {Value{1.5}, i(3)}, {Value{1.0}, i(2)}, {Value{1.0}, i(2)},
+             {Value{0.5}, i(1)}});
+  // The plan sorts once, keeping only a LIMIT's rows.
+  CHECK(db->prepare("SELECT x FROM oa UNION ALL SELECT y FROM ob ORDER BY x LIMIT 3").plan_source().find("bc_sorter_open(cx, 3)") !=
+        std::string::npos);
+  CHECK(db->prepare("SELECT x FROM oa UNION ALL SELECT y FROM ob ORDER BY x").plan_source().find("bc_sorter_open(cx, 0)") !=
+        std::string::npos);
+  // A subquery's set operation orders its rows too.
+  CHECK(run("SELECT id FROM oa WHERE x = (SELECT y FROM ob UNION ALL SELECT 7 ORDER BY 1 LIMIT 1) ORDER BY id") ==
+        Grid{{i(4)}});
+  // A DOUBLE's sign of zero survives the sort.
+  (void)run("INSERT INTO oa VALUES (9, 0, $1)", {Value{-0.0}});
+  auto z = run("SELECT f FROM oa WHERE id = 9 UNION ALL SELECT f FROM ob WHERE id = 9 ORDER BY f");
+  REQUIRE(z.size() == 1);
+  CHECK(std::signbit(std::get<double>(z[0][0])));
+  // Names and positions are checked as PostgreSQL checks them.
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  CHECK(state("SELECT x FROM oa UNION SELECT y FROM ob ORDER BY 2") == "42P10");
+  CHECK(state("SELECT x FROM oa UNION SELECT y FROM ob ORDER BY y") == "42703");
+  CHECK(state("SELECT x FROM oa UNION SELECT y FROM ob ORDER BY oa.x") == "42P01");
+  CHECK(state("SELECT x, x FROM oa UNION SELECT y, y FROM ob ORDER BY x") == "42702");
+  CHECK(state("SELECT x FROM oa UNION SELECT y FROM ob ORDER BY x + 1") == "42601");
+}
+
+TEST_CASE("embedded API: ORDER BY of a set operation's rows is charged to the statement's budget, a LIMIT bounds it", "[sql][api][setop]") {
+  sql_test::TempDir dir{"api_setop_order_mem"};
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  (void)db->execute("CREATE TABLE big (id INTEGER PRIMARY KEY, x INTEGER)");
+  auto txn = db->begin();
+  for (int k = 0; k < 2000; ++k) (void)txn.execute("INSERT INTO big VALUES ($1, $1)", {i(k)});
+  (void)txn.commit();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  // The sorter holds every row of the combined arms; past the budget the statement fails, never spilling.
+  CHECK(state("SELECT x FROM big UNION ALL SELECT x FROM big ORDER BY x") == "54000");
+  // A LIMIT holds only its rows, though every row is read.
+  CHECK(state("SELECT x FROM big UNION ALL SELECT x FROM big ORDER BY x DESC LIMIT 5") == "ran");
+  CHECK(db->execute("SELECT x FROM big UNION ALL SELECT x FROM big ORDER BY x DESC LIMIT 3").rows ==
+        Grid{{i(1999)}, {i(1999)}, {i(1998)}});
+}
+
+TEST_CASE("embedded API: the time is read once per statement, and once per transaction", "[sql][api][time]") {
+  sql_test::TempDir dir{"api_clock"};
+  auto db = Database::open(dir.path());
+  constexpr std::int64_t kDay = 86'400'000'000;
+  std::int64_t now = 20'000 * kDay + 3'723'456'789;  // 1 02:03:03.456789 into day 20000
+  db->clock_for_testing([&] { return now; });
+  auto first = [&](std::string_view sql, Database& d) { return d.execute(sql).rows.at(0); };
+
+  CHECK(first("SELECT CURRENT_DATE", *db) == std::vector<Value>{i(20'000)});
+  CHECK(first("SELECT LOCALTIME", *db) == std::vector<Value>{i(3'723'456'789 % kDay)});
+  CHECK(first("SELECT LOCALTIME(0), LOCALTIME(2), LOCALTIMESTAMP(1)", *db) ==
+        std::vector<Value>{i(3'723'000'000 + 1'000'000 * 0), i(3'723'460'000), i(20'000 * kDay + 3'723'500'000)});
+  // Two readings in a statement are one instant; the cached plan reads the clock again.
+  CHECK(first("SELECT LOCALTIMESTAMP, LOCALTIMESTAMP", *db) == std::vector<Value>{i(now), i(now)});
+  now += 5 * kDay;
+  CHECK(first("SELECT CURRENT_DATE", *db) == std::vector<Value>{i(20'005)});
+
+  // A transaction's statements read the time it began, however late they run.
+  auto t = db->begin();
+  CHECK(t.execute("SELECT CURRENT_DATE").rows.at(0) == std::vector<Value>{i(20'005)});
+  now += 3 * kDay;
+  CHECK(t.execute("SELECT CURRENT_DATE").rows.at(0) == std::vector<Value>{i(20'005)});
+  t.rollback();
+  CHECK(first("SELECT CURRENT_DATE", *db) == std::vector<Value>{i(20'008)});
+
+  // Before 1970 the day is the floor and the time of day stays positive.
+  now = -3'600'000'000;  // 1969-12-31 23:00:00
+  CHECK(first("SELECT CURRENT_DATE, LOCALTIME", *db) == std::vector<Value>{i(-1), i(kDay - 3'600'000'000)});
+
+  // CURRENT_TIMESTAMP is a timestamptz: the same instant, UTC. CURRENT_TIME,
+  // a TIME WITH TIME ZONE, is refused, not read as the zoneless one.
+  now = 1'793'095'123'456'789;  // 2026-10-27 09:12:03.456789 UTC
+  CHECK(first("SELECT CURRENT_TIMESTAMP, now(), CURRENT_TIMESTAMP(0), LOCALTIMESTAMP", *db) ==
+        std::vector<Value>{i(now), i(now), i(now - 456'789), i(now)});
+  CHECK(db->execute("SELECT now()").types.at(0).kind == SqlKind::TimestampTz);
+  for (auto sql : {"SELECT CURRENT_TIME(0)"}) {
+    try {
+      (void)db->execute(sql);
+      FAIL(sql << " must be refused");
+    } catch (const std::exception& e) {
+      CHECK(sqlstate(e) == "42601");  // a form not supported yet
+    }
+  }
+}
+
+TEST_CASE("embedded API: a TIMESTAMP WITH TIME ZONE column keeps the instant, in UTC, across a reopen", "[sql][api][timestamptz]") {
+  sql_test::TempDir dir{"api_timestamptz"};
+  auto text = [](Database& d, std::string_view sql, const std::vector<Value>& params = {}) {
+    std::vector<std::string> out;
+    auto r = d.execute(std::string{sql}, params);
+    for (const auto& row : r.rows) out.push_back(to_text(row.at(0), r.types.at(0)));
+    return out;
+  };
+  {
+    auto db = Database::open(dir.path());
+    (void)db->execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, at TIMESTAMPTZ, plain TIMESTAMP)");
+    (void)db->execute("CREATE INDEX ev_at ON ev (at)");
+    // An offset is taken off; text without one is UTC.
+    (void)db->execute("INSERT INTO ev VALUES (1, '2026-10-27 10:00:00+02', '2026-10-27 08:00:00')");
+    (void)db->execute("INSERT INTO ev VALUES (2, '2026-10-27 10:00:00Z', NULL)");
+    (void)db->execute("INSERT INTO ev VALUES (3, '2026-10-27 10:00:00', NULL)");
+    (void)db->execute("INSERT INTO ev VALUES (4, '2026-10-27 05:30:00-04:30', NULL)");
+    (void)db->execute("INSERT INTO ev VALUES (5, NULL, NULL)");
+    CHECK(text(*db, "SELECT at FROM ev WHERE id = 1") == std::vector<std::string>{"2026-10-27 08:00:00+00"});
+    CHECK(text(*db, "SELECT at FROM ev ORDER BY at, id") == std::vector<std::string>{"2026-10-27 08:00:00+00", "2026-10-27 10:00:00+00",
+                                                                                      "2026-10-27 10:00:00+00", "2026-10-27 10:00:00+00", ""});
+    CHECK(text(*db, "SELECT id FROM ev WHERE at = '2026-10-27 12:00:00+02' ORDER BY id") == std::vector<std::string>{"2", "3", "4"});
+    CHECK(text(*db, "SELECT min(at) FROM ev") == std::vector<std::string>{"2026-10-27 08:00:00+00"});
+    CHECK(text(*db, "SELECT max(at) FROM ev") == std::vector<std::string>{"2026-10-27 10:00:00+00"});
+    // Against a timestamp and a date constant, the timestamp read as UTC.
+    CHECK(text(*db, "SELECT id FROM ev WHERE at = TIMESTAMP '2026-10-27 08:00:00'") == std::vector<std::string>{"1"});
+    CHECK(text(*db, "SELECT id FROM ev WHERE at >= DATE '2026-10-27' AND at < DATE '2026-10-28' AND id < 3 ORDER BY id") ==
+          std::vector<std::string>{"1", "2"});
+    // Casts of constants.
+    CHECK(text(*db, "SELECT CAST(TIMESTAMPTZ '2026-10-27 23:30:00-02' AS DATE)") == std::vector<std::string>{"2026-10-28"});
+    CHECK(text(*db, "SELECT CAST(TIMESTAMPTZ '2026-10-27 10:00:00+02' AS TIMESTAMP)") == std::vector<std::string>{"2026-10-27 08:00:00"});
+    CHECK(text(*db, "SELECT CAST(TIMESTAMP '2026-10-27 08:00:00' AS TIMESTAMPTZ)") == std::vector<std::string>{"2026-10-27 08:00:00+00"});
+    CHECK(text(*db, "SELECT CAST(DATE '2026-10-27' AS TIMESTAMPTZ)") == std::vector<std::string>{"2026-10-27 00:00:00+00"});
+    CHECK(text(*db, "SELECT CAST(TIMESTAMPTZ '2026-10-27 10:00:00+02' AS VARCHAR)") == std::vector<std::string>{"2026-10-27 08:00:00+00"});
+    // A string assigned to a timestamptz column is read with its offset.
+    (void)db->execute("UPDATE ev SET at = '2000-01-01 00:00:00 BC' WHERE id = 5");
+    CHECK(text(*db, "SELECT at FROM ev WHERE id = 5") == std::vector<std::string>{"2000-01-01 00:00:00+00 BC"});
+    // A time zone offset past 15 hours, or no digits, is refused.
+    CHECK_THROWS(db->execute("INSERT INTO ev VALUES (9, '2026-10-27 10:00:00+16', NULL)"));
+    CHECK_THROWS(db->execute("INSERT INTO ev VALUES (9, '2026-10-27 10:00:00+', NULL)"));
+  }
+  auto db = Database::open(dir.path());
+  CHECK(text(*db, "SELECT at FROM ev WHERE id = 4") == std::vector<std::string>{"2026-10-27 10:00:00+00"});
+  CHECK(text(*db, "SELECT id FROM ev WHERE at > '2026-10-27 09:00:00Z' ORDER BY id") == std::vector<std::string>{"2", "3", "4"});
+}
+
+TEST_CASE("embedded API: a CHAR(n) column ignores trailing spaces and is returned padded to n", "[sql][api][char]") {
+  sql_test::TempDir dir{"api_char"};
+  auto state = [](Database& d, std::string_view sql, const std::vector<Value>& params = {}) -> std::string {
+    try {
+      (void)d.execute(std::string{sql}, params);
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ok";
+  };
+  auto text = [](Database& d, std::string_view sql, const std::vector<Value>& params = {}) {
+    std::vector<std::string> out;
+    auto r = d.execute(std::string{sql}, params);
+    for (const auto& row : r.rows) out.push_back(to_text(row.at(0), r.types.at(0)));
+    return out;
+  };
+  using V = std::vector<std::string>;
+  {
+    auto db = Database::open(dir.path());
+    CHECK(state(*db, "CREATE TABLE t (id INTEGER PRIMARY KEY, a CHAR(5), b CHARACTER(3), c CHAR, v VARCHAR(8))") == "ok");
+    CHECK(db->execute("SELECT a, b, c FROM t").types ==
+          std::vector<SqlType>{{SqlKind::Char, 5}, {SqlKind::Char, 3}, {SqlKind::Char, 1}});
+    CHECK(state(*db, "INSERT INTO t VALUES (1, 'ab', 'xyz', 'q', 'ab ')") == "ok");
+    CHECK(state(*db, "INSERT INTO t VALUES ($1, $2, 'x', 'q', 'a')", {i(2), bytes("abcde   ")}) == "ok");  // spaces past n are cut
+    CHECK(state(*db, "INSERT INTO t VALUES ($1, $2, 'x', 'q', 'a')", {i(3), bytes("ab ")}) == "ok");
+    CHECK(state(*db, "INSERT INTO t VALUES (4, 'é', 'x', 'q', 'a')") == "ok");
+    // Too long once spaces are cut: 22001, as PostgreSQL's.
+    CHECK(state(*db, "INSERT INTO t VALUES (9, 'abcdef', 'x', 'q', 'a')") == "22001");
+    CHECK(state(*db, "INSERT INTO t VALUES ($1, 'ab', 'x', 'q', 'a')", {i(9)}) == "ok");
+    CHECK(state(*db, "INSERT INTO t VALUES (10, 'ab', 'x', 'qq', 'a')") == "22001");
+    CHECK(state(*db, "INSERT INTO t VALUES ($1, $2, 'x', 'q', 'a')", {i(11), bytes("abcdef")}) == "22001");
+    CHECK(text(*db, "SELECT a FROM t ORDER BY id") == V{"ab   ", "abcde", "ab   ", "é    ", "ab   "});
+    CHECK(text(*db, "SELECT b FROM t WHERE id = 2") == V{"x  "});
+    // A constant is compared without its trailing spaces, as a CHAR's are.
+    CHECK(text(*db, "SELECT id FROM t WHERE a = 'ab' ORDER BY id") == V{"1", "3", "9"});
+    CHECK(text(*db, "SELECT id FROM t WHERE a = 'ab        ' ORDER BY id") == V{"1", "3", "9"});
+    CHECK(text(*db, "SELECT id FROM t WHERE a = 'é'") == V{"4"});
+    CHECK(text(*db, "SELECT id FROM t WHERE a > 'ab' ORDER BY id") == V{"2", "4"});
+    // Two CHARs compare without their spaces; a CHAR with a VARCHAR as text,
+    // the CHAR's spaces cut and the VARCHAR's kept.
+    CHECK(text(*db, "SELECT a = b FROM t WHERE id = 4") == V{"f"});
+    CHECK(text(*db, "SELECT a = v FROM t WHERE id = 1") == V{"f"});
+    CHECK(text(*db, "SELECT a = v FROM t WHERE id = 3") == V{"f"});
+    CHECK(text(*db, "SELECT a = v FROM t WHERE id = 9") == V{"f"});
+    (void)db->execute("UPDATE t SET v = 'ab' WHERE id = 1");
+    CHECK(text(*db, "SELECT a = v FROM t WHERE id = 1") == V{"t"});
+    CHECK(text(*db, "SELECT DISTINCT a FROM t ORDER BY a") == V{"ab   ", "abcde", "é    "});
+    CHECK(state(*db, "UPDATE t SET a = $1 WHERE id = 1", {bytes("z  ")}) == "ok");
+    CHECK(text(*db, "SELECT a FROM t WHERE id = 1") == V{"z    "});
+    CHECK(text(*db, "SELECT id FROM t WHERE a = 'z'") == V{"1"});
+    // NULL is not padded.
+    CHECK(state(*db, "INSERT INTO t VALUES (12, NULL, NULL, NULL, NULL)") == "ok");
+    CHECK(db->execute("SELECT a FROM t WHERE id = 12").rows == Grid{{kNull}});
+    // A DEFAULT is stored as any value is.
+    CHECK(state(*db, "CREATE TABLE d (x CHAR(4) DEFAULT 'a ', y INTEGER)") == "ok");
+    CHECK(state(*db, "INSERT INTO d (y) VALUES (1)") == "ok");
+    CHECK(text(*db, "SELECT x FROM d") == V{"a   "});
+    CHECK(state(*db, "CREATE TABLE d2 (x CHAR(2) DEFAULT 'abc')") == "42601");
+    // Not yet: a key, an index, a parameter compared, a cast, LIKE.
+    CHECK(state(*db, "CREATE TABLE k (a CHAR(3) PRIMARY KEY)") == "0A000");
+    CHECK(state(*db, "CREATE TABLE k (a CHAR(3) UNIQUE)") == "0A000");
+    CHECK(state(*db, "CREATE INDEX t_a ON t (a)") == "0A000");
+    CHECK(state(*db, "SELECT id FROM t WHERE a = $1", {bytes("ab")}) == "42601");
+    CHECK(state(*db, "SELECT CAST('ab' AS CHAR(5))") == "42601");
+    CHECK(state(*db, "SELECT id FROM t WHERE a LIKE 'a%'") != "ok");
+    CHECK(state(*db, "CREATE TABLE z (a CHAR(0))") == "42601");
+    CHECK(state(*db, "CREATE TABLE z (a CHAR(8 CHARACTERS))") == "42601");
+  }
+  // The type survives a reopen, and what was stored stays stripped.
+  auto db = Database::open(dir.path());
+  CHECK(text(*db, "SELECT a FROM t WHERE id = 2") == V{"abcde"});
+  CHECK(text(*db, "SELECT id FROM t WHERE a = 'ab' ORDER BY id") == V{"3", "9"});
+  CHECK(db->execute("SELECT a FROM t").types.at(0) == SqlType{SqlKind::Char, 5});
+}
+
+TEST_CASE("embedded API: a CHECK is tested on every INSERT and UPDATE, on the row as written", "[sql][api]") {
+  sql_test::TempDir dir{"api_check"};
+  auto state = [](Database& db, std::string_view sql, const std::vector<Value>& params = {}) -> std::string {
+    try {
+      (void)db.execute(std::string{sql}, params);
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ok";
+  };
+  {
+    auto db = Database::open(dir.path());
+    CHECK(state(*db, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER CHECK (a > 0), b INTEGER DEFAULT 5, "
+                     "CONSTRAINT lt CHECK (a IS NULL OR a < b))") == "ok");
+    CHECK(state(*db, "INSERT INTO t VALUES ($1, $2, $3)", {i(1), i(1), i(2)}) == "ok");
+    CHECK(state(*db, "INSERT INTO t VALUES ($1, $2, $3)", {i(2), i(0), i(2)}) == "23514");     // a > 0 false
+    CHECK(state(*db, "INSERT INTO t VALUES ($1, $2, $3)", {i(2), i(3), i(2)}) == "23514");     // lt false
+    CHECK(state(*db, "INSERT INTO t VALUES ($1, $2, $3)", {i(2), kNull, i(2)}) == "ok");       // NULL passes
+    CHECK(state(*db, "INSERT INTO t (id, a) VALUES ($1, $2)", {i(3), i(4)}) == "ok");          // b is its default, 5
+    CHECK(state(*db, "INSERT INTO t (id, a) VALUES ($1, $2)", {i(4), i(5)}) == "23514");       // 5 < 5 false
+    CHECK(state(*db, "UPDATE t SET a = 0 WHERE id = 1") == "23514");
+    CHECK(state(*db, "UPDATE t SET b = 1 WHERE id = 1") == "23514");  // a column the CHECK reads, not a column it names in SET
+    CHECK(state(*db, "UPDATE t SET b = $1 WHERE id = $2", {i(9), i(1)}) == "ok");
+    // A refused row is not written.
+    CHECK(db->execute("SELECT id FROM t ORDER BY id").rows == Grid{{i(1)}, {i(2)}, {i(3)}});
+    CHECK(db->execute("SELECT a, b FROM t WHERE id = 1").rows == Grid{{i(1), i(9)}});
+    CHECK(state(*db, "ALTER TABLE t ADD COLUMN c INTEGER CHECK (c > 0)") == "42601");
+  }
+  auto db = Database::open(dir.path());  // the constraints are in the catalog
+  CHECK(state(*db, "INSERT INTO t VALUES ($1, $2, $3)", {i(7), i(0), i(2)}) == "23514");
+  CHECK(state(*db, "INSERT INTO t VALUES ($1, $2, $3)", {i(7), i(1), i(2)}) == "ok");
 }

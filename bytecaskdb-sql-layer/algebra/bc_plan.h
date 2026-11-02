@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
    Copyright (c) 2026 Gustavo Amigo
 
-   bc_plan.h — the plan API of docs/plan_api_design.md (revision 7). A plan is
+   bc_plan.h — the plan API of docs/plan_api_design.md (revision 12). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
    and bc_params are opaque here and built by the runtime
@@ -54,6 +54,20 @@ enum bc_error_code {
   BC_E_CLOSED,
   BC_E_UNKNOWN,     /* a commit failed and degraded the engine: its batch may have reached the data
                        file, so its outcome is unknown, never "nothing written" (SQLSTATE 08007) */
+  BC_E_PATTERN,     /* bc_like reached a pattern's escape character at its end (SQLSTATE 22025) */
+  BC_E_CARDINALITY, /* a BC_SUB_VALUE subquery emitted a second row (SQLSTATE 21000) */
+};
+
+/* What a subquery's rows are folded into, from bc_sub_begin to bc_sub_end:
+   parameters from `param` on, which the caller passes as NULL, and for
+   BC_SUB_SET the set bc_sub_has_* tests. Each row is one column of `type`;
+   an EXISTS row of any columns, none of them kept. */
+enum bc_sub_kind {
+  BC_SUB_VALUE = 0,   /* param: its one row's value, NULL for none; a second row is BC_E_CARDINALITY */
+  BC_SUB_EXISTS = 1,  /* param: a BOOL, whether it emitted a row */
+  BC_SUB_BOUNDS = 2,  /* param: the largest non-NULL value, param+1 the smallest (NULL for none);
+                         param+2: NULL if a row was NULL, else FALSE; param+3: a BOOL, whether it emitted a row */
+  BC_SUB_SET = 3,     /* the set of its non-NULL values; param and param+1 as BC_SUB_BOUNDS's +2 and +3 */
 };
 
 enum bc_scan_flags {
@@ -128,6 +142,17 @@ bool    bc_ctx_check(bc_ctx *, const bc_schema_ref *checked_against);      /* bc
 enum bc_commit_result bc_ctx_commit(bc_ctx *, bool sync);
 bool    bc_ctx_next_result(bc_ctx *, const uint8_t **row, uint32_t *len);     /* result rows, in emit order */
 void    bc_ctx_reset(bc_ctx *);                                               /* drops snapshot, plan, arena */
+/* A window on the next run's result rows (docs/cursor_design.md, *The replay
+   cursor*), set after bc_ctx_begin* and before bc_ctx_run, once: the first
+   `skip` rows the plan ends are dropped, unencoded and uncharged; the next
+   `limit` are kept; after the last the run stops, a normal end, not an error.
+   limit 0 stops it, once verified, before it reads anything. A stopped run leaves the
+   statement's writes as the rows it reached made them: use it for reads.
+   bc_ctx_emitted is the rows the plan ended, dropped ones included; when the
+   run was not stopped it is the result's whole size. */
+void    bc_ctx_window(bc_ctx *, uint64_t skip, uint64_t limit);
+uint64_t bc_ctx_emitted(const bc_ctx *);
+bool    bc_ctx_stopped(const bc_ctx *);
 enum bc_error_code bc_error(const bc_ctx *);
 const char *bc_error_message(const bc_ctx *);
 uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits; BC_E_LAYOUT: a bc_layout_detail */
@@ -167,6 +192,37 @@ uint64_t bc_txn_catalog_version(const bc_txn *);  /* the catalog version pinned 
 bool    bc_txn_repin(bc_txn *);                   /* before any statement was added, with no context attached:
                                                      drops the pin, so the next statement pins the live catalog
                                                      and a new snapshot; false, changing nothing, otherwise */
+/* Cursors (docs/cursor_design.md, *What a cursor sees*). A pin is the
+   transaction's overlay as of the call, shared copy-on-write: the statements
+   added later write to a copy and the pin never changes. The call also pins
+   the snapshot and catalog if no statement did. A pin reserves the overlay's
+   bound against max_bytes until it is released; one that would pass it is
+   BC_E_LIMIT and aborts the transaction, any other failure also, and the
+   call returns null (bc_txn_error says why). A pin is a read: a context
+   begun on the transaction reads through it after bc_ctx_use_overlay, which
+   is called after bc_ctx_begin_txn and before bc_ctx_run, and the statement
+   must not write. bc_txn_repin is refused while a pin is live. Release every
+   pin before bc_txn_free. */
+typedef struct bc_overlay bc_overlay;
+bc_overlay *bc_txn_overlay_pin(bc_txn *);
+void    bc_txn_overlay_release(bc_overlay *);
+void    bc_ctx_use_overlay(bc_ctx *, const bc_overlay *);
+/* A hold (docs/cursor_design.md, WITH HOLD): what a cursor that outlives its
+   transaction reads, owned by the cursor. bc_txn_hold takes, from a
+   transaction with a live overlay pin, a clone of its snapshot, its pinned
+   catalog and the pin's overlay, so the transaction's commit may consume its
+   own snapshot and the transaction may end: a hold needs nothing of the
+   transaction after the call. A hold keeps the engine's snapshot, and so every
+   tree node and data file it reaches, until bc_txn_hold_free. Failure is as
+   bc_txn_overlay_pin's: null, bc_txn_error says why, the transaction aborted.
+   bc_ctx_begin_hold begins a context, which belongs to no transaction, on a
+   hold: it reads the hold's snapshot through its overlay and writes nothing,
+   so the statement must be a read. Free every context begun on a hold before
+   bc_txn_hold_free; a hold may outlive its bc_txn and its pin. */
+typedef struct bc_hold bc_hold;
+bc_hold *bc_txn_hold(bc_txn *, const bc_overlay *);
+void    bc_txn_hold_free(bc_hold *);
+void    bc_ctx_begin_hold(bc_ctx *, const bc_hold *, const bc_params *, bc_budget);
 enum bc_commit_result bc_txn_commit(bc_txn *, bool sync);
 enum bc_error_code bc_txn_error(const bc_txn *);  /* of the last bc_txn_commit */
 const char *bc_txn_error_message(const bc_txn *);
@@ -205,9 +261,16 @@ enum bc_int_type { BC_SMALLINT = 2, BC_INTEGER = 4 };
 int64_t bc_check_int(bc_ctx *, int64_t v, uint32_t int_type, uint32_t object_id);  /* v outside the type:
                                                    BC_E_CONSTRAINT, BC_C_RANGE on object_id; else v */
 double  bc_i64_to_f64(int64_t);                 /* always defined */
+double  bc_add_f64(bc_ctx *, double, double);   /* PostgreSQL's float8 sum: finite operands that overflow → error */
+double  bc_min_f64(double, double);             /* PostgreSQL's order: NaN above +inf; of equal values (-0.0, 0.0) the second, as float8smaller */
+double  bc_max_f64(double, double);
 bool    bc_bytes_eq(bc_ctx *, bc_view, bc_view);
 int     bc_bytes_cmp(bc_ctx *, bc_view, bc_view);       /* memcmp order */
 bool    bc_bytes_prefix(bc_ctx *, bc_view prefix, bc_view);
+bool    bc_like(bc_ctx *, bc_view text, bc_view pattern, int32_t escape);  /* PostgreSQL's LIKE of UTF-8 text:
+                                                   _ one character, % any run, the escape (a code point, -1 for
+                                                   none) quoting the next; an escape it reaches at the pattern's
+                                                   end is BC_E_PATTERN */
 
 /* Keys */
 bc_key   bc_key_begin(bc_ctx *, uint32_t table_or_index);
@@ -240,6 +303,23 @@ void     bc_sort_key_bytes(bc_ctx *, bc_sort_key, bc_view, uint32_t dir, uint32_
 void     bc_sort_key_null(bc_ctx *, bc_sort_key, uint32_t dir, uint32_t nulls);
 void     bc_sort_key_col(bc_ctx *, bc_sort_key, bc_view row, uint32_t col, uint32_t dir, uint32_t nulls);  /* NULL included */
 bc_view  bc_sort_key_end(bc_ctx *, bc_sort_key);
+
+/* Sort-key decoders: read a part back from a key built by bc_sort_key_*, the
+   key itself or a copy of its bytes (a sorter's payload). The key carries no
+   layout, so parts are read in order, 0 first: part n's type is learned when
+   it is read, and reading part n+1 before n is BC_E_HANDLE, as is reading a
+   part as a type other than the one it was read as. For each part, call
+   bc_sort_key_part_null, then the typed decoder if it is not NULL (a typed
+   decoder of a NULL part returns zero or empty). Only a part built BC_SORT_ASC
+   decodes: a DESC part is inverted, and reads as another value. A DOUBLE
+   reads back as the key holds it, so -0.0 is 0.0 and every NaN one NaN. A key
+   that does not parse is BC_E_CORRUPT. A bytes part is unescaped into the
+   arena, the step's, charged. */
+int64_t  bc_sort_key_part_i64(bc_ctx *, bc_view key, uint32_t part);
+double   bc_sort_key_part_f64(bc_ctx *, bc_view key, uint32_t part);
+bool     bc_sort_key_part_bool(bc_ctx *, bc_view key, uint32_t part);
+bc_view  bc_sort_key_part_bytes(bc_ctx *, bc_view key, uint32_t part);
+bool     bc_sort_key_part_null(bc_ctx *, bc_view key, uint32_t part);
 
 /* Reads */
 bc_view   bc_get(bc_ctx *, bc_view key, bool *found);
@@ -289,6 +369,18 @@ void     bc_row_set_null(bc_ctx *, bc_row, uint32_t col);
 void     bc_row_set_param(bc_ctx *, bc_row, uint32_t col, uint32_t i);   /* parameter i, NULL included */
 bc_view  bc_row_end(bc_ctx *, bc_row);
 bc_view  bc_pin(bc_ctx *, bc_view);                 /* a copy that lives until reset */
+bc_view  bc_null_row(bc_ctx *, uint32_t table);     /* a row of the table's layout, every column NULL: an outer
+                                                       join's inner side where it matches nothing; lives until reset */
+
+/* Subqueries: what the plan emits between bc_sub_begin and bc_sub_end is
+   folded as `kind` says (enum bc_sub_kind), never a result row. One at a
+   time; `sub` names its set for bc_sub_has_*, which lives until reset. */
+void bc_sub_begin(bc_ctx *, uint32_t sub, int32_t kind, int32_t type, uint32_t param);  /* type: a bc_type */
+void bc_sub_end(bc_ctx *);
+bool bc_sub_has_i64(bc_ctx *, uint32_t sub, int64_t);   /* whether the BC_SUB_SET holds the value */
+bool bc_sub_has_f64(bc_ctx *, uint32_t sub, double);    /* -0.0 is 0.0, and NaN is one value, as PostgreSQL's = */
+bool bc_sub_has_bool(bc_ctx *, uint32_t sub, bool);
+bool bc_sub_has_bytes(bc_ctx *, uint32_t sub, bc_view);
 
 /* Ephemeral structures */
 bc_sorter bc_sorter_open(bc_ctx *, int64_t keep);        /* keep the first `keep` in sort order; 0 = all */
@@ -309,6 +401,8 @@ void      bc_agg_add_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);   /* overf
 void      bc_agg_add_f64(bc_ctx *, bc_group, uint32_t slot, double);
 void      bc_agg_min_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);
 void      bc_agg_max_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);
+void      bc_agg_min_f64(bc_ctx *, bc_group, uint32_t slot, double);
+void      bc_agg_max_f64(bc_ctx *, bc_group, uint32_t slot, double);
 void      bc_agg_count(bc_ctx *, bc_group, uint32_t slot);
 bool      bc_agg_next(bc_ctx *, bc_agg, bc_view *group_key, bc_group *g);
 int64_t   bc_agg_i64(bc_ctx *, bc_group, uint32_t slot);

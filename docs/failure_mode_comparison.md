@@ -71,8 +71,8 @@ All engines in this comparison trust `fdatasync`'s return value: success
 means the data is durable. On Linux, this trust has a known gap — the
 "fsyncgate" issue (2018) showed that on some kernel/filesystem
 combinations, `fsync` can return success after an earlier async writeback
-error was consumed by another fd, because the kernel clears the error
-flag on the first `fsync` call against the inode.
+error was consumed by another fd, because before Linux 4.13 the kernel
+cleared the error flag on the first `fsync` call against the inode.
 
 Engine responses vary:
 
@@ -84,13 +84,12 @@ Engine responses vary:
 | LevelDB | No specific mitigation; permanent `bg_error_` latch on any error |
 | SQLite WAL | Relies on the VFS abstraction; platform-specific VFS can add writeback tracking |
 | LMDB | COW + meta-page flip sidesteps — a successful `msync`/`fdatasync` of the meta page is the only sync that matters |
-| ByteCaskDB | Trusts `fdatasync` return value; no writeback error tracking |
+| ByteCaskDB | Syncs through the descriptor that wrote, so `errseq_t` reports every writeback error to it; after a failed sync, rewrites the file before reading it (#231) |
 
-ByteCaskDB's position: this is a deliberate simplicity choice for an
-embedded engine targeting local storage with reliable `fdatasync`
-semantics (ext4, XFS, ZFS on Linux ≥ 4.13). The assumption is documented
-in `CONTRACT.md` so it can be revisited for deployments on storage
-configurations where it may not hold.
+ByteCaskDB's position: on Linux ≥ 4.13 neither half of fsyncgate reaches
+it. What is left is trust that a successful `fdatasync` wrote what it
+confirmed, which `CONTRACT.md` states as a condition so it can be
+revisited for storage where it may not hold.
 
 ### 3. Partial write detection varies widely
 

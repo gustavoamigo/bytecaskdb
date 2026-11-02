@@ -101,8 +101,10 @@ the engine's directory lock. The code is in `bytecaskdb-sql-layer/server/`:
 - `pg_wire.cppm` (`bytecask.sql.pg_wire`): message framing (`Framer`),
   reading a message from a buffer (`Body`) and writing one into a buffer
   (`Out`); it does no I/O and has no policy.
-- `pg_text.cppm` (`bytecask.sql.pg_text`): each SQL type's OID, its text
-  input and its text output.
+- `pg_text.cppm` (`bytecask.sql.pg_text`): each SQL type's OID, and its
+  text input and output, which are the layer's own (`sql/text.cppm`,
+  `bytecask.sql.text`): the binder reads a string literal with the same
+  input functions (`frontend_design.md`, *Literals*).
 - `pg_session.cppm` (`bytecask.sql.pg_session`): one session's protocol and
   SQL state machine (`Session`), and the worker pool (`Pool`).
 - `main.cpp`: arguments, the libuv event loop, connections and signals.
@@ -251,7 +253,8 @@ A session holds:
 - the named statements, each a `const Statement&` from `Database::prepare`,
   which is valid until close;
 - the named portals;
-- the unnamed statement and the unnamed portal.
+- the unnamed statement and the unnamed portal;
+- the block's named cursors (*Cursor statements*).
 
 A portal lasts until its transaction ends, as in PostgreSQL: at `COMMIT` or
 `ROLLBACK` inside `BEGIN`, and at `Sync` or the end of a `Query` outside it.
@@ -291,8 +294,23 @@ exposes as calls, not as statements.
 - **`BEGIN`** calls `Database::begin()`; the tag is `BEGIN`. Inside an open
   transaction it is `WARNING 25001` ("there is already a transaction in
   progress") and changes nothing. Inside an aborted one it is `25P02`.
-  `BEGIN` with a mode (`ISOLATION LEVEL …`, `READ ONLY`, `DEFERRABLE`) is
-  `0A000`. The isolation is the layer's (`transaction_design.md`).
+  `BEGIN` and `START TRANSACTION` take modes, and `SET TRANSACTION` sets
+  them for the open block (*Transaction modes*). The isolation is the
+  layer's (`transaction_design.md`).
+- **Transaction modes** are `ISOLATION LEVEL READ UNCOMMITTED | READ
+  COMMITTED | REPEATABLE READ`, `READ ONLY`, `READ WRITE` and `[NOT]
+  DEFERRABLE`, in any order, with or without commas. The session keeps them,
+  not the API: a block that is `READ ONLY` refuses any statement but a
+  `SELECT` with `25006`, which aborts the block, as in PostgreSQL (a
+  `SELECT … FOR UPDATE` is not told apart and is taken). The isolation levels
+  change nothing: every transaction reads one snapshot, which is what
+  `REPEATABLE READ` asks and more than the other two do. `SERIALIZABLE` is
+  `0A000`, because snapshot isolation allows write skew and the guards that
+  would prevent it are not built. `SET TRANSACTION` outside a block is
+  `WARNING 25P01`; an isolation level, or `READ WRITE` after `READ ONLY`,
+  once the block has run a statement is `25001`. `SET LOCAL TRANSACTION`
+  (the standard's spelling, not PostgreSQL's) and `SET SESSION
+  CHARACTERISTICS` are `0A000`.
 - **`COMMIT`** calls `commit()`. `Committed` gives the tag `COMMIT`. A
   transaction that was aborted is rolled back instead (`RolledBack`), with
   the tag `ROLLBACK`, as PostgreSQL's `COMMIT` does. Errors:
@@ -342,9 +360,44 @@ and the transaction commits when the `Query` ends. An error in the `Query`
 rolls the whole block back. A DDL `Query` there is `0A000`, as a DDL beside
 other statements is.
 
+## Cursor statements
+
+`DECLARE`, `FETCH`, `MOVE` and `CLOSE` are classified by the session, as
+`BEGIN` is, and parsed by the dialect's `ast::parse_cursor`
+(`frontend_design.md`, *Cursor statements*). The session keeps the block's
+cursors in a map of `Cursor`s from `Transaction::open_cursor`; the design is
+`cursor_design.md` and what phase 3 built is its *As built (phase 3)*. What
+the server adds:
+- A cursor ends with the block, at `COMMIT`, `ROLLBACK` or an error, unless it
+  is a hold cursor: `WITH HOLD`, or any `DECLARE` outside `BEGIN` (PostgreSQL
+  says `25P01`: a known difference). A hold cursor survives the `COMMIT` of
+  the block that declared it, is dropped by its `ROLLBACK`, and ends at
+  `CLOSE`, a disconnect or the server's shutdown. It pins an engine snapshot
+  meanwhile and has no timer or cap here (`cursor_design.md`, *As built
+  (phase 4)*). A cursor shares the portals' namespace (a used name is
+  `42P03`).
+- `UPDATE` and `DELETE … WHERE CURRENT OF name` are ordinary statements to
+  the classifier; the session finds the cursor by name (`34000`) and runs the
+  statement with the cursor's key (`Transaction::execute_current_of`;
+  `cursor_design.md`, *As built (phase 6)*). A refusal is `24000`. The key is
+  not a parameter: `Describe` of the statement lists only its own.
+- A failed block refuses them all with `25P02`; an error in one fails the
+  block.
+- Tags: `DECLARE CURSOR`, `FETCH n`, `MOVE n`, `CLOSE CURSOR`,
+  `CLOSE CURSOR ALL`. A `FETCH` sends a `RowDescription` in a simple `Query`
+  even when no row is left.
+- Through the extended protocol: `Parse` of a `DECLARE` prepares its query,
+  which may take `$n` parameters bound by `Bind`; `Describe` of a `FETCH`
+  gives the cursor's columns when the cursor exists and `NoData` before;
+  `Execute` of a `FETCH` sends `DataRow`s and the tag, never a
+  `RowDescription`. `Execute` with a row limit is still `0A000`.
+- Every `FETCH` and `MOVE` direction runs (`cursor_design.md`, *As built
+  (phase 5)*); a backward or re-reading move on a `NO SCROLL` cursor is
+  `55000` and fails the block.
+
 ## Extended query
 
-- **`Parse`** (name, text, parameter OIDs).
+- **`Parse`** (name, text, parameter OIDs). (name, text, parameter OIDs).
   - The name must be free: a used name is `42P05`, and the unnamed
     statement is replaced.
   - The text goes to `Database::prepare`.
@@ -437,6 +490,7 @@ Each `SqlType` has an OID, a length and a modifier, as `pg_type` and
 | `BYTEA` | 17 | -1 | -1 |
 | `TEXT` | 25 | -1 | -1 |
 | `VARCHAR(n)` | 1043 | -1 | n + 4 |
+| `CHAR(n)` | 1042 | -1 | n + 4 |
 | `DECIMAL(p, s)` | 1700 | -1 | ((p << 16) \| s) + 4 |
 | `numeric`, unconstrained (a `SUM`) | 1700 | -1 | -1 |
 | `TIMESTAMP` | 1114 | 8 | -1 |
@@ -532,7 +586,7 @@ PostgreSQL also checks the server's mapping. The mapping:
 | `BC_C_NOT_NULL` | `23502` |
 | `BC_C_RANGE`, by the check that failed | `22003` (`smallint`/`integer`/`numeric field overflow`/`REAL`), `22001` (`VARCHAR` too long), `22021` (encoding), `22008` (datetime) |
 | `BC_E_LIMIT` | `54000` |
-| `BC_E_ARITH` | `22003`. The subset has no division; adding one adds `22012` for division by zero |
+| `BC_E_ARITH` | `22012` for a zero divisor (`bc_div`, `bc_mod`: the message `division by zero`), `22003` for any other: an overflow, or a range the helpers check |
 | `SerializationFailure`, a conflict on every retry, `DdlInProgress` | `40001` |
 | `TransactionResolutionUnknown` | `08007` |
 | `TransactionAborted` | `25P02` |
@@ -833,6 +887,9 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 - A form the layer does not support is `42601`, not PostgreSQL's code for running it.
 - `Execute` with a row limit, several statements in one `Query`, SQL
   `PREPARE`, `SET`, `SHOW`, `COPY` and cancel are refused.
+- Cursors: `DECLARE` outside `BEGIN` is a hold cursor, where PostgreSQL says
+  `25P01`; `WITH HOLD ... FOR UPDATE` and `BINARY` are `0A000`
+  (`cursor_design.md`, *Known differences from PostgreSQL*).
 - A result is built whole by the embedded API before its first `DataRow`
   is sent. Streaming rows waits on the API streaming them, part of the
   transport design (#487, *Next*).

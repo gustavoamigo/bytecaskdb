@@ -77,7 +77,9 @@ auto exact_scale(const SqlType& t) -> std::optional<std::uint8_t> {
     case SqlKind::Bytea:
     case SqlKind::Text:
     case SqlKind::Varchar:
+    case SqlKind::Char:
     case SqlKind::Timestamp:
+    case SqlKind::TimestampTz:
     case SqlKind::Date:
     case SqlKind::Time:
     case SqlKind::Numeric: return std::nullopt;
@@ -108,7 +110,7 @@ auto comparable(const Expr& a, const Expr& b) -> std::optional<std::pair<std::in
     return std::pair{*va, *vb};
   }
   auto ordinal = [](SqlKind k) {
-    return k == SqlKind::Boolean || k == SqlKind::Date || k == SqlKind::Timestamp || k == SqlKind::Time;
+    return k == SqlKind::Boolean || k == SqlKind::Date || k == SqlKind::Timestamp || k == SqlKind::TimestampTz || k == SqlKind::Time;
   };
   if (a.type.kind == b.type.kind && ordinal(a.type.kind)) return std::pair{a.constant, b.constant};
   return std::nullopt;
@@ -142,7 +144,18 @@ auto fold(Expr& e) -> bool {
     case Kind::Column:
     case Kind::Param:
     case Kind::Const:
-    case Kind::Aggregate: return changed;
+    case Kind::Mul:
+    case Kind::Div:
+    case Kind::Aggregate:
+    case Kind::And:
+    case Kind::Or:
+    case Kind::Not:
+    case Kind::IsNull:
+    case Kind::Like:
+    case Kind::Truth:
+    case Kind::InSet:
+    case Kind::Case:
+    case Kind::Coalesce: return changed;
   }
   return changed;
 }
@@ -179,11 +192,16 @@ auto fold_constants(Node& n) -> bool {
           c = fold_conjuncts(op.conjuncts, never) || c;
           never = never || std::holds_alternative<Empty>(op.input->op);
         } else if constexpr (std::is_same_v<T, Join>) {
-          c = fold_conjuncts(op.predicate, never);
+          // An inner join with an empty side, or a predicate never true, is
+          // empty. A left outer join keeps its left side's rows whatever its
+          // right side and its ON hold.
+          auto on_never = false;
+          c = fold_conjuncts(op.predicate, on_never);
+          never = never || (!op.left_outer && on_never);
           c = fold_constants(*op.left) || c;
           c = fold_constants(*op.right) || c;
-          // An inner join with an empty side is empty.
-          never = never || std::holds_alternative<Empty>(op.left->op) || std::holds_alternative<Empty>(op.right->op);
+          never = never || std::holds_alternative<Empty>(op.left->op) ||
+                  (!op.left_outer && std::holds_alternative<Empty>(op.right->op));
         } else if constexpr (std::is_same_v<T, Project> || std::is_same_v<T, Aggregate>) {
           auto& outs = [&]() -> std::vector<Output>& {
             if constexpr (std::is_same_v<T, Project>) {
@@ -236,6 +254,14 @@ void tables_of(const Node& n, std::vector<const Table*>& out) {
   if (const auto* in = input_of(n); in != nullptr && *in) tables_of(**in, out);
 }
 
+// Whether e is a predicate that reads no column: a subquery's EXISTS or
+// its flags, the same for every row.
+auto reads_none(const Expr& e) -> bool {
+  std::vector<ColumnRef> cols;
+  columns_of(e, cols);
+  return cols.empty() && logical::is_predicate(e);
+}
+
 auto reads_only(const Expr& e, const std::vector<const Table*>& tables) -> bool {
   std::vector<ColumnRef> cols;
   columns_of(e, cols);
@@ -275,14 +301,20 @@ auto push_down(Node& n) -> bool {
     both.insert(both.end(), right.begin(), right.end());
     std::vector<Expr> kept, to_left, to_right;
     for (auto& c : f->conjuncts) {
-      if (reads_only(c, left)) {
+      // One that reads no column holds of every row or of none: it filters
+      // the left side, whose rows an outer join keeps.
+      if (reads_only(c, left) || reads_none(c)) {
         to_left.push_back(std::move(c));
+      } else if (j.left_outer) {
+        // Above a left outer join, a conjunct reading its right side filters
+        // the rows the join gives, its NULLs among them: it stays.
+        kept.push_back(std::move(c));
       } else if (reads_only(c, right)) {
         to_right.push_back(std::move(c));
       } else if (reads_only(c, both)) {
         j.predicate.push_back(std::move(c));
       } else {
-        kept.push_back(std::move(c));  // reads no column
+        kept.push_back(std::move(c));
       }
     }
     changed = changed || kept.size() != f->conjuncts.size();
@@ -295,6 +327,19 @@ auto push_down(Node& n) -> bool {
     }
   }
   if (auto* j = std::get_if<Join>(&n.op)) {
+    // A left outer join's ON conjunct reading its right side alone filters
+    // that side; one reading its left side decides which pairs there are,
+    // never which left rows: it stays.
+    if (j->left_outer) {
+      std::vector<const Table*> right;
+      tables_of(*j->right, right);
+      std::vector<Expr> stays, to_right;
+      // One of no column decides every pair alike: a filter of the right side.
+      for (auto& c : j->predicate) (reads_only(c, right) || reads_none(c) ? to_right : stays).push_back(std::move(c));
+      changed = changed || !to_right.empty();
+      j->predicate = std::move(stays);
+      push_onto(j->right, std::move(to_right));
+    }
     changed = push_down(*j->left) || changed;
     return push_down(*j->right) || changed;
   }
@@ -376,6 +421,14 @@ auto prune(Node& n, std::vector<ColumnRef> needed) -> bool {
 }  // namespace
 
 void rewrite(Node& root) {
+  // A set operation's arms are queries of their own, rewritten alone.
+  auto* top = &root;
+  if (auto* l = std::get_if<Limit>(&top->op)) top = l->input.get();
+  if (auto* set = std::get_if<SetOp>(&top->op)) {
+    rewrite(*set->left);
+    rewrite(*set->right);
+    return;
+  }
   while (fold_constants(root)) {
   }
   while (push_down(root)) {

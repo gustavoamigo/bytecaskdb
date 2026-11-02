@@ -16,6 +16,7 @@
 #include <random>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -704,6 +705,62 @@ TEST_CASE("blind bulk load: an abandoned loader frees what it sealed",
       loader.append(to_bytes(k), res.ref(k));
   }
   check_accounting(foreign, {});
+}
+
+// A blind leaf split reads the right half's first key from the data file
+// for its separator, and that read can fail (EIO). The failed write must
+// leave every node it allocated freed (#652): the design's *prepare, commit,
+// then release* order puts every call that can throw before the allocations.
+TEST_CASE("blind tree: a read that fails during a write leaks no node",
+          "[blind]") {
+  struct FailingResolver {
+    MemResolver &mem;
+    std::size_t fail_at;
+    std::size_t reads{0};
+    auto key_at(BlindRef r) -> std::span<const std::byte> {
+      if (reads++ == fail_at)
+        throw std::runtime_error{"injected read error"};
+      return mem.key_at(r);
+    }
+  };
+  auto &splits = bytecask::btree_detail::transition_counts[static_cast<
+      std::size_t>(bytecask::btree_detail::Transition::kLeafSplit)];
+  std::mt19937_64 rng{652};
+  std::uniform_int_distribution<int> byte{'a', 'z'};
+  auto random_key = [&] {
+    std::string k(8, '\0');
+    for (auto &c : k)
+      c = static_cast<char>(byte(rng));
+    return k;
+  };
+  MemResolver res;
+  const auto foreign = foreign_nodes();
+  SmallTree t;
+  std::size_t failed_splits = 0;
+  for (int i = 0; i < 600; ++i) {
+    const auto k = random_key();
+    const auto ref = res.ref(k);
+    // Fail each read of the write in turn, until one runs to the end.
+    for (std::size_t fail_at = 0;; ++fail_at) {
+      FailingResolver failing{res, fail_at};
+      auto tr = t.transient();
+      const auto splits_before = splits.load();
+      try {
+        tr.set(to_bytes(k), ref, failing);
+      } catch (const std::runtime_error &) {
+        if (splits.load() != splits_before)
+          ++failed_splits;
+        continue;
+      }
+      t = std::move(tr).persistent();
+      break;
+    }
+    check_accounting(foreign, {&t});
+  }
+  // The sweep reached the separator read: some failures ended a split.
+  REQUIRE(failed_splits > 0);
+  t.validate(res);
+  check_accounting(foreign, {&t});
 }
 
 TEST_CASE("blind tree: a refused replacement changes nothing", "[blind]") {

@@ -1,6 +1,10 @@
 # Plan API: a physical algebra for generated plans
 
-Status: **built**, revision 9 (revision 8 with the sort-key builder,
+Status: **built**, revision 13 (revision 13 with the sort-key decoders,
+`bc_sort_key_part_*`, for a set operation's `ORDER BY`; revision 11 with `bc_sub_*` and
+`BC_E_CARDINALITY`, for subqueries; revision 10 with `bc_null_row`, for outer
+joins; revision 9 with `bc_like` and
+`BC_E_PATTERN`, for `LIKE`; revision 8 with the sort-key builder,
 `bc_sort_key_*` (#579); revision 8 built the sorters, the hash tables and
 the aggregates' slots, `bc_sorter_open`'s `keep`, and `bc_agg_null`, and
 charged the write set to the statement budget as it grows; revision 7 added the lifetime rule of a loop's storage,
@@ -431,6 +435,8 @@ enum bc_error_code {
   BC_E_CLOSED,
   BC_E_UNKNOWN,     /* a commit failed and degraded the engine: its batch may have reached the data
                        file, so its outcome is unknown, never "nothing written" (SQLSTATE 08007) */
+  BC_E_PATTERN,     /* bc_like reached a pattern's escape character at its end (SQLSTATE 22025) */
+  BC_E_CARDINALITY, /* a BC_SUB_VALUE subquery emitted a second row (SQLSTATE 21000) */
 };
 
 enum bc_scan_flags {
@@ -537,6 +543,15 @@ bool    bc_ctx_check(bc_ctx *, const bc_schema_ref *checked_against);      /* bc
 enum bc_commit_result bc_ctx_commit(bc_ctx *, bool sync);
 bool    bc_ctx_next_result(bc_ctx *, const uint8_t **row, uint32_t *len);     /* result rows, in emit order */
 void    bc_ctx_reset(bc_ctx *);                                               /* drops snapshot, plan, arena */
+void    bc_ctx_window(bc_ctx *, uint64_t skip, uint64_t limit);
+bc_overlay *bc_txn_overlay_pin(bc_txn *);                    /* a cursor's frozen copy of the transaction's writes */
+void    bc_txn_overlay_release(bc_overlay *);
+void    bc_ctx_use_overlay(bc_ctx *, const bc_overlay *);        /* after bc_ctx_begin_txn: read through the pin */
+bc_hold *bc_txn_hold(bc_txn *, const bc_overlay *);       /* a hold cursor's own snapshot clone, catalog and overlay */
+void bc_txn_hold_free(bc_hold *);
+void bc_ctx_begin_hold(bc_ctx *, const bc_hold *, const bc_params *, bc_budget);
+uint64_t bc_ctx_emitted(const bc_ctx *);
+bool    bc_ctx_stopped(const bc_ctx *);
 enum bc_error_code bc_error(const bc_ctx *);
 const char *bc_error_message(const bc_ctx *);
 uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits; BC_E_LAYOUT: a bc_layout_detail */
@@ -553,6 +568,9 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
 | `bc_ctx_run` | Verifies the plan's `bc_schema_ref` against the catalog version the context pinned at `bc_ctx_begin`, then calls the plan and returns when it returns. Compatible means: every table and index it names exists; every column it reads or sets exists in its table with the type it was compiled with; every table it writes exists. Verifying also maps each declared column to its offset or slot in the current layout. A null reference is `BC_E_HANDLE`. A plan that fails sets `BC_E_LAYOUT` and does not run; the server recompiles it from the SQL it cached. Adding a column or an index never invalidates a plan, since the runtime maintains whatever indexes the table has; a drop invalidates the plans that name what it drops. There is no version-equality check. |
 | `bc_ctx_commit` | Submits the write plan with `apply_batch`, guarded by `ensure_unchanged` on the catalog record of every table whose keys it writes, so a DDL on such a table committed since the snapshot makes it a conflict: the index entries the runtime wrote follow the pinned version's indexes, and a `CREATE INDEX` committed after the snapshot would otherwise miss the row. `BC_COMMITTED` on success. `BC_CONFLICT` when the engine reports a guard or write-write conflict: nothing was written. `BC_FAILED` when `bc_error` is set, including an error raised during the plan: nothing is committed. A plan with no writes commits nothing and returns `BC_COMMITTED`, whatever it guarded: guards protect writes, and what a read-only execution read is its snapshot's either way. |
 | `bc_ctx_next_result` | Iterates the result buffer. Rows are in the row format of the layout the plan emitted. The runtime, not a plan, sees raw pointers here; valid until `bc_ctx_reset`. |
+| `bc_ctx_window` | Runtime only. Set once, after `bc_ctx_begin*` and before `bc_ctx_run`: the run drops the first `skip` rows a top-level `bc_emit_end` ends (not encoded, not charged), keeps the next `limit`, and then stops. A stop fails nothing: the context is unwound as a failed one is (every call returns a neutral value), `bc_error` stays `BC_OK`, and `bc_txn_add` and `bc_ctx_commit` proceed. `limit` 0 stops the run after its verification, before the plan reads anything. Subquery rows are not counted. For reads: a stopped write plan has written what the rows it reached wrote. The replay cursor's runner (`cursor_design.md`, *The replay cursor*). | `bc_ctx_emitted` is the rows ended, skipped ones included; `bc_ctx_stopped` whether the run stopped at its limit. Both reset by `bc_ctx_reset`. |
+| `bc_txn_overlay_pin`, `bc_txn_overlay_release`, `bc_ctx_use_overlay` | Runtime only. A pin shares the transaction's overlay (copy-on-write: `bc_txn_add` clones it before the first put or delete once a pin holds it) and reserves its bound against `max_bytes` until released; one that does not fit is `BC_E_LIMIT` and aborts the transaction. `bc_ctx_use_overlay`, after `bc_ctx_begin_txn`, makes the statement read the pin instead of the transaction's overlay: a read, writing nothing. Release every pin before `bc_txn_free`. `transaction_design.md`, *The transaction's view* and *Limits*; `cursor_design.md`, *What a cursor sees*. | `bc_txn_error` reports a failed pin. |
+| `bc_txn_hold`, `bc_txn_hold_free`, `bc_ctx_begin_hold` | Runtime only. A hold is what a cursor that outlives its transaction reads: a clone of the transaction's snapshot (`Snapshot::clone`), its pinned catalog and the pin's overlay. It needs nothing of the transaction after the call, so the transaction's commit may move its own snapshot into the `WritePlan`. `bc_ctx_begin_hold` begins a context that belongs to no transaction on it; the statement must be a read. A hold pins the engine's snapshot until `bc_txn_hold_free`. `cursor_design.md`, *As built (phase 4)*. | `bc_txn_error` reports a failed `bc_txn_hold`. |
 | `bc_ctx_reset` | Releases the snapshot, drops the write plan and result buffer, frees the statement's memory (the arena keeps one chunk) and its charge, and releases every handle, so every handle and view the plan held is invalid. |
 | `bc_error_detail`, `bc_ctx_affected` | The constraint kind and object id of a raised error, or for `BC_E_LAYOUT` its class: `bc_ctx_run` refusing the reference (`BC_L_INCOMPATIBLE`, the only one a recompile cures), a row used with a table or column it is not of (`BC_L_ROW`), a malformed plan or reference (`BC_L_PLAN`), or a row of a retired layout generation (`BC_L_RETIRED`). The runtime sets every `BC_E_LAYOUT` with its detail; one without cannot be compiled; the affected-row count the last run recorded. Both read by the runtime after the plan returns. |
 | `bc_execute` | `begin`, `run`, `commit`; on `BC_CONFLICT`, `reset` and repeat up to `max_retries`. A `BC_E_CONSTRAINT` raised by the plan is final: no retry. Returns the commit result of the last attempt, except that a last attempt's conflict on a key it inserted, taken by a concurrent commit, is the duplicate it is: `BC_FAILED` with `BC_C_UNIQUE` on the table or index, as a retry's own check would raise (`docs/transaction_design.md`, *Commit and conflicts*). This is the only place retry lives. |
@@ -602,7 +620,10 @@ void     bc_emit_count(bc_ctx *, int64_t affected);   /* write statements: the r
 
 The subset has no raw integer arithmetic (*The language*). These helpers
 define the cases C leaves undefined. On failure they set `BC_E_ARITH` and
-return zero.
+return zero. The error's message tells a zero divisor, `division by zero`
+(`bc_div`, `bc_mod`), from an overflow: SQL reports the first as SQLSTATE
+22012 and every other `BC_E_ARITH` as 22003, so that text is part of the
+helpers' contract (*Errors* in `server_design.md`).
 
 ```c
 int64_t bc_add(bc_ctx *, int64_t, int64_t);     /* overflow → error */
@@ -617,9 +638,16 @@ int64_t bc_f64_to_i64(bc_ctx *, double);        /* NaN or out of range → error
 enum bc_int_type { BC_SMALLINT = 2, BC_INTEGER = 4 };
 int64_t bc_check_int(bc_ctx *, int64_t v, uint32_t int_type, uint32_t object_id);  /* outside the type: BC_C_RANGE */
 double  bc_i64_to_f64(int64_t);                 /* always defined */
+double  bc_add_f64(bc_ctx *, double, double);   /* PostgreSQL's float8 sum: finite operands that overflow → error */
+double  bc_min_f64(double, double);             /* PostgreSQL's order: NaN above +inf; of equal values the second */
+double  bc_max_f64(double, double);
 bool    bc_bytes_eq(bc_ctx *, bc_view, bc_view);
 int     bc_bytes_cmp(bc_ctx *, bc_view, bc_view);       /* memcmp order */
 bool    bc_bytes_prefix(bc_ctx *, bc_view prefix, bc_view);
+bool    bc_like(bc_ctx *, bc_view text, bc_view pattern, int32_t escape);  /* PostgreSQL's LIKE of UTF-8 text:
+                                                   _ one character, % any run, the escape (a code point, -1 for
+                                                   none) quoting the next; an escape it reaches at the pattern's
+                                                   end is BC_E_PATTERN */
 ```
 
 The header implements the integer helpers on the compiler's overflow
@@ -630,12 +658,31 @@ compiler to handle. Byte comparisons are for encoded or binary columns; the
 compiler emits comparisons on sort keys it built, never on raw text, and on
 TEXT and VARCHAR columns compared under `COLLATE "C"`, byte order.
 
+`bc_like` is PostgreSQL's `LIKE` of UTF-8 text, case-sensitive, under
+`COLLATE "C"`: `%` matches any run of characters, `_` one character (not
+one byte), the escape (a code point; -1 for none, `ESCAPE ''`) the character
+after it as written, any other character itself, byte for byte. It matches
+greedily with one backtrack point, the last `%`, and allocates nothing. An
+escape the match reaches with nothing after it sets `BC_E_PATTERN`
+("LIKE pattern must not end with escape character", SQLSTATE 22025) and
+returns false; as in PostgreSQL, one the match never reaches is no error.
+
 `bc_add_bigint` and `bc_sub_bigint` are `bc_add` and `bc_sub` for a value
 that is stored in a BIGINT column (`SET col = col ± $n`): the only integer
 type whose sum can leave `int64`. An overflow is the same range error
 `bc_check_int` raises, on `object_id`, with PostgreSQL's words ("bigint out of
 range", SQLSTATE 22003, #540), where `bc_add` stays `BC_E_ARITH` for
 aggregates and intermediates.
+
+`bc_add_f64`, `bc_min_f64` and `bc_max_f64` are the double aggregates'
+accumulators for a plan that keeps one in a local (a stream), and what
+`bc_agg_add_f64`, `bc_agg_min_f64` and `bc_agg_max_f64` fold by. `bc_add_f64`
+is PostgreSQL's `float8pl` as the aggregate takes it: finite operands whose
+sum is infinite are `BC_E_ARITH` ("value out of range: overflow"), an
+infinity or NaN carries through. `bc_min_f64` and `bc_max_f64` order as
+PostgreSQL's `float8` does, NaN above every number and `-0.0` equal to
+`0.0`; of equal values they return the second, as `float8smaller` and
+`float8larger` do. They allocate nothing and cannot fail.
 
 `bc_check_int` is the range check of a computed integer: it returns `v` when it is inside the SQL type the
 compiler resolved, `BC_SMALLINT` or `BC_INTEGER`, and otherwise sets
@@ -696,6 +743,12 @@ void     bc_sort_key_bytes(bc_ctx *, bc_sort_key, bc_view, uint32_t dir, uint32_
 void     bc_sort_key_null(bc_ctx *, bc_sort_key, uint32_t dir, uint32_t nulls);
 void     bc_sort_key_col(bc_ctx *, bc_sort_key, bc_view row, uint32_t col, uint32_t dir, uint32_t nulls);  /* NULL included */
 bc_view  bc_sort_key_end(bc_ctx *, bc_sort_key);
+
+int64_t  bc_sort_key_part_i64(bc_ctx *, bc_view key, uint32_t part);
+double   bc_sort_key_part_f64(bc_ctx *, bc_view key, uint32_t part);
+bool     bc_sort_key_part_bool(bc_ctx *, bc_view key, uint32_t part);
+bc_view  bc_sort_key_part_bytes(bc_ctx *, bc_view key, uint32_t part);
+bool     bc_sort_key_part_null(bc_ctx *, bc_view key, uint32_t part);
 ```
 
 | Function | What it does |
@@ -704,6 +757,8 @@ bc_view  bc_sort_key_end(bc_ctx *, bc_sort_key);
 | `bc_sort_key_i64`, `bc_sort_key_f64`, `bc_sort_key_bool`, `bc_sort_key_bytes`, `bc_sort_key_null` | Appends one part: a value, or NULL, with its direction and NULL placement. Every call of one part takes the same `dir` and `nulls`, a NULL's too, so the plan writes a part's placement once. A `DOUBLE` orders as PostgreSQL's `float8`: `-0.0` and `0.0` make one key, every NaN one key above `+∞`. Before a part is built it is charged the most it can take (a `BYTES` value with every byte escaped: its marker, twice its length and the terminator), and a part that could take the key past `UINT32_MAX` bytes, a view's length, is `BC_E_LIMIT`; once built, the key is charged the bytes it holds. A `dir` or `nulls` outside its enum is `BC_E_HANDLE`. |
 | `bc_sort_key_col` | Appends a row's column as the next part, NULL included: what a plan uses for `ORDER BY col`. A column the plan's `bc_schema_ref` does not declare is `BC_E_HANDLE`, as for every column decoder. |
 | `bc_sort_key_end` | Finalizes the key and returns its view, the step's. The engine's key ceiling does not apply: a sort key never reaches the engine, and its bytes are bounded by the memory budget and the 4 GiB limit on its parts. |
+
+| `bc_sort_key_part_*` | Reads part `part` back from a key built by `bc_sort_key_*`, or from a copy of its bytes: a sorter's payload, which is how a plan holds rows it can read back column by column when they are neither a table's rows nor an index's keys (a set operation's, `planner_design.md`, *Set operations*). `bc_sort_key_part_null` reports a NULL; a typed decoder of a NULL part returns zero or empty. The key holds no layout, so the parts are read in order, part 0 first, each part's type being learned when it is read (a `NULL` is known by its marker, a value by the decoder that read it): a plan calls `_null` and then the typed decoder of a part it does not know to be present, and reads each part again, if it needs to, as the type it read. A part read before its predecessor, or as another type than it was read as, is `BC_E_HANDLE`; a key that does not parse is `BC_E_CORRUPT`. Only `BC_SORT_ASC` parts decode (a `DESC` part is inverted, and reads as another value), and a `DOUBLE` reads back as the key holds it: `-0.0` is `0.0`, every NaN one NaN, so a plan that must keep a zero's sign carries it in a part of its own. A bytes part is unescaped into the arena, the step's, charged. Revision 13. |
 
 A sort key and a table's or index's key do not mix: `bc_sort_key` and
 `bc_key` are distinct handle types, so a plan that passes one to the
@@ -791,6 +846,8 @@ void     bc_row_set_null(bc_ctx *, bc_row, uint32_t col);
 void     bc_row_set_param(bc_ctx *, bc_row, uint32_t col, uint32_t i);   /* parameter i, NULL included */
 bc_view  bc_row_end(bc_ctx *, bc_row);
 bc_view  bc_pin(bc_ctx *, bc_view);                 /* a copy that lives until reset */
+bc_view  bc_null_row(bc_ctx *, uint32_t table);     /* a row of the table's layout, every column NULL: an outer
+                                                       join's inner side where it matches nothing; lives until reset */
 ```
 
 | Function | What it does |
@@ -806,6 +863,7 @@ bc_view  bc_pin(bc_ctx *, bc_view);                 /* a copy that lives until r
 | `bc_row_set_param` | Sets column `col` to parameter `i`: its value, or null when it is NULL. One call where a nullable column took an `if` and two sets. A parameter whose type is not the column's is `BC_E_HANDLE`; one outside the column's declared type is `BC_C_RANGE`, as above. |
 | `bc_row_end` | Finalizes the row and returns its view, a built row of the builder's table. The row is held with its builder, the step's, and charged to the memory budget; a write copies it into the write set, and it is released with its step. A NOT NULL column that is null, set so or never set and with no default, is `BC_E_CONSTRAINT` with `BC_C_NOT_NULL` and the table's id: checked here, after every value set passed its range check, so a row holding both is `BC_C_RANGE`, as PostgreSQL reports it. A row over the engine's value limit is `BC_E_LIMIT`. |
 | `bc_pin` | Copies a view, charged, so it outlives its step and its cursor and lives until reset, keeping what it is: a pinned row is still a row of its table. The compiler emits it where a plan keeps a step's bytes across the next. |
+| `bc_null_row` | A row of the table, every column NULL, a key column and a NOT NULL one too: what an outer join's inner side reads where it matches no row. Charged, it lives until reset; no write takes it, as `bc_row_end` checks its NOT NULL columns. A table the schema ref does not declare is `BC_E_HANDLE`, as any read of one. |
 
 ### Ephemeral structures
 
@@ -838,6 +896,8 @@ void      bc_agg_add_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);   /* overf
 void      bc_agg_add_f64(bc_ctx *, bc_group, uint32_t slot, double);
 void      bc_agg_min_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);
 void      bc_agg_max_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);
+void      bc_agg_min_f64(bc_ctx *, bc_group, uint32_t slot, double);
+void      bc_agg_max_f64(bc_ctx *, bc_group, uint32_t slot, double);
 void      bc_agg_count(bc_ctx *, bc_group, uint32_t slot);
 bool      bc_agg_next(bc_ctx *, bc_agg, bc_view *group_key, bc_group *g);
 int64_t   bc_agg_i64(bc_ctx *, bc_group, uint32_t slot);
@@ -859,7 +919,7 @@ bool      bc_agg_null(bc_ctx *, bc_group, uint32_t slot);
 | `bc_agg_add_*`, `bc_agg_min_*`, `bc_agg_max_*`, `bc_agg_count` | Folds a value into a slot: `SUM`, `MIN`, `MAX`, `COUNT`; `AVG` is a sum slot and a count slot divided at emit. A slot's first fold fixes its kind, the same for every group; a fold of another kind, or a slot past `slots`, is `BC_E_HANDLE`. An integer sum, or a count, that overflows is `BC_E_ARITH` ("bigint out of range"); a double sum that overflows from finite values is `BC_E_ARITH` ("value out of range: overflow"), as PostgreSQL's `float8` sum, and an infinite or NaN input carries through. |
 | `bc_agg_next` | Iterates groups in first-appearance order, one unit each. |
 | `bc_agg_clear` | Drops every group and releases what each was charged, its key, `kGroupEntryBytes` and its slots; the slots keep their kinds. The groups' indices start again at 0, under a new generation of the aggregate's groups, so a handle of a dropped group is stale (`BC_E_HANDLE`), never another group's, and the limit of 2^32 groups (`BC_E_LIMIT`) counts the groups held, not every group ever made. A streamed `COUNT(DISTINCT)` clears its values' aggregate as each group ends, so it holds only the current group's (`planner_design.md`, *Aggregates*). Once `bc_agg_next` has started on it, `BC_E_HANDLE`. |
-| `bc_agg_i64`, `bc_agg_f64` | Reads a slot: `bc_agg_f64` a double sum, `bc_agg_i64` any other. A slot read as the other type is `BC_E_HANDLE`; one never folded reads zero either way. |
+| `bc_agg_i64`, `bc_agg_f64` | Reads a slot: `bc_agg_f64` a double sum, minimum or maximum, `bc_agg_i64` any other. A slot read as the other type is `BC_E_HANDLE`; one never folded reads zero either way. |
 | `bc_agg_null` | True when no value was folded into the slot in this group, of any kind; a slot past `slots` is `BC_E_HANDLE`. |
 
 **PostgreSQL's NULLs are the plan's.** The slots hold numbers, never
@@ -937,6 +997,35 @@ holds rows and index entries, and both are written only through the calls
 above; the catalog's namespace is written only by DDL. A namespace added
 later gets calls of its own, decided by the same rule.
 
+### Subqueries
+
+A plan runs each uncorrelated subquery of its statement first, as a
+function of its own, and what that function emits between `bc_sub_begin`
+and `bc_sub_end` is folded, never a result row (`planner_design.md`,
+*Subqueries*):
+
+```c
+enum bc_sub_kind { BC_SUB_VALUE = 0, BC_SUB_EXISTS = 1, BC_SUB_BOUNDS = 2, BC_SUB_SET = 3 };
+void bc_sub_begin(bc_ctx *, uint32_t sub, int32_t kind, int32_t type, uint32_t param);  /* type: a bc_type */
+void bc_sub_end(bc_ctx *);
+bool bc_sub_has_i64(bc_ctx *, uint32_t sub, int64_t);
+bool bc_sub_has_f64(bc_ctx *, uint32_t sub, double);
+bool bc_sub_has_bool(bc_ctx *, uint32_t sub, bool);
+bool bc_sub_has_bytes(bc_ctx *, uint32_t sub, bc_view);
+```
+
+| Function | What it does |
+|---|---|
+| `bc_sub_begin` | Starts subquery `sub`: until `bc_sub_end`, each row emitted is one column of `type`, folded as `kind` says, or, for `BC_SUB_EXISTS`, a row of any columns, counted. One at a time; `sub` is each id once per run. Its parameters, from `param` on, are ones the caller passes as NULL. |
+| `bc_sub_end` | Sets its parameters, which every `bc_param_*` reads from then on until reset. `BC_SUB_VALUE`: its row's value, NULL for none; a second row fails the plan with `BC_E_CARDINALITY`. `BC_SUB_EXISTS`: a BOOL, whether a row came. `BC_SUB_BOUNDS`: the largest non-NULL value, then the smallest (NULL for none), then NULL if a row was NULL else FALSE, then whether a row came. `BC_SUB_SET`: the last two. |
+| `bc_sub_has_*` | Whether a `BC_SUB_SET` subquery's non-NULL values hold the value, as PostgreSQL's `=` compares: bytes bytewise, a DOUBLE's -0.0 equal to 0.0 and NaN to NaN. The set is charged and lives until reset; a `sub` not run is `BC_E_HANDLE`. |
+
+Values order as the layer compares them: integers and BOOLs numerically,
+bytes bytewise (`COLLATE "C"`), DOUBLEs with NaN above every other value.
+A misuse, a subquery begun inside another, a row begun when one starts or
+ends, an unknown kind or type, parameters past the ones given, is
+`BC_E_HANDLE`, a plan bug.
+
 ### Guards and raised errors
 
 Each appends to the write plan; a failed guard is reported by the commit,
@@ -957,7 +1046,7 @@ void bc_raise(bc_ctx *, uint32_t constraint, uint32_t object_id);   /* a user er
 | `bc_guard_row` | `bc_guard_unchanged` on the primary key of `row`, a row of `table`, encoded into the guard without the arena: what `SELECT … FOR UPDATE` emits for each row it returns, however many. | `ensure_unchanged` |
 | `bc_guard_range` | The commit fails if any key in `[lo, hi)` changed. Serializable plans emit one per range scanned; it covers phantoms. Empty bounds are the start and end of `table_or_index`, as for `bc_scan_open`; `lo >= hi` guards nothing. | `ensure_range_unchanged` |
 | `bc_guard_present`, `bc_guard_absent` | Existence preconditions on a key the plan reads and does not write. | `ensure_present`, `ensure_absent` |
-| `bc_raise` | Sets `BC_E_CONSTRAINT` with a `bc_constraint` kind and the id of the constraint, column or index concerned, as the compiler emitted them; an unknown kind or an id of 2^24 or more is `BC_E_HANDLE`. The plan unwinds; the runtime reports it and does not retry. A `CHECK` the compiler evaluates is raised this way. | none: nothing reaches the engine |
+| `bc_raise` | Sets `BC_E_CONSTRAINT` with a `bc_constraint` kind and the id of the constraint, column or index concerned, as the compiler emitted them; an unknown kind or an id of 2^24 or more is `BC_E_HANDLE`. The plan unwinds; the runtime reports it and does not retry. A `CHECK` the compiler evaluates is raised this way, with the table's id, after `bc_row_end` and before `bc_insert` or `bc_update`. | none: nothing reaches the engine |
 
 A plan under snapshot isolation emits no guards. The two plans for the same
 SQL differ only in guard calls, which is how isolation reads in the text.

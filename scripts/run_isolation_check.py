@@ -65,6 +65,13 @@ of every key follows one more recovery. Operations in flight at a kill, and
 acknowledged writes not known durable then, are :info. At least one kill
 over the run has to land with two or more sync writers in flight.
 
+With --workload range each round runs guarded and unguarded range histories
+(#302), and without --kill a presence history as well (#676): the guarded
+transactions mixed with snapshot-free ensure_present / ensure_absent plans
+and dels under frequent fdatasync failures. Each presence observation, a
+nullopt's included, must agree with the commit order, and at least one round
+has to judge one across a failed flush. None of these runs Elle.
+
 Without --elle-jar only the cross-check runs. Exit status is non-zero on any
 failed expectation. Histories and Elle's output stay under --out.
 """
@@ -72,7 +79,9 @@ failed expectation. Histories and Elle's output stay under --out.
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
+import math
 import random
 import re
 import shutil
@@ -310,6 +319,22 @@ class Op:
         return out
 
 
+    def observations(self):
+        """[(key, present, version)]: what a presence transaction (#676) saw
+        of a key. A guard says only whether the key was present (version
+        None); a head read also names the version, or None when absent. A
+        transaction whose outcome is unknown carries none."""
+        out = []
+        for m in self.value:
+            if isinstance(m[0], list):
+                continue
+            if m[0] == "guard" and len(m) > 3:
+                out.append((m[1], m[3] == "present", None))
+            elif m[0] == "get" and len(m) > 2:
+                out.append((m[1], m[2] is not None, m[2]))
+        return out
+
+
 def ops_from_history(history: list[dict]) -> list[Op]:
     """The transactions: invoke and completion matched by process, which a
     client runs one transaction at a time, in invoke order. A kill's or a
@@ -362,6 +387,8 @@ def history_check(history: list[dict], config: str) -> tuple[list[str], dict]:
 
     guarded    every read and scan matches the order at the reading
                transaction's position.
+    presence   as guarded, and every presence observation is held to the
+               order as well: see presence_check.
     unguarded  every read and scan matches the order at its position or
                earlier, and at least one transaction read a state behind its
                own position: that is the exposure the range guards close. A
@@ -510,7 +537,7 @@ def history_check(history: list[dict], config: str) -> tuple[list[str], dict]:
             missed = sorted(held - shown)
             if not missed:
                 continue
-            if config == "guarded":
+            if config in ("guarded", "presence"):
                 problems.append(
                     f"process {c.process} (sequence {c.sequence}) scanned "
                     f"[{from_}, {to_}) and missed keys {missed[:8]} the order "
@@ -563,7 +590,207 @@ def history_check(history: list[dict], config: str) -> tuple[list[str], dict]:
         problems.append(
             "unguarded: no read or scan saw a state behind its own commit; "
             "the run is not shown to reach write skew")
+    if config == "presence":
+        presence_problems, presence_summary = presence_check(
+            ops, committed, info, info_before, seed)
+        problems += presence_problems
+        summary.update(presence_summary)
     return problems[:20], summary
+
+
+def presence_check(ops: list[Op], committed: list[Op], info: list[Op],
+                   info_before: dict[int, dict[int, str]],
+                   seed: dict[int, str]) -> tuple[list[str], dict]:
+    """Holds every presence observation (#676) to the commit order: a
+    snapshot-less plan's guard, a nullopt's included, and a head read.
+
+    The order is history_check's: committed transactions by sequence, each
+    :info write a committed read named placed just before that reader. Each
+    key's presence is a series of changes along it. An observation is judged
+    against the states its transaction could have seen:
+
+    -   One that committed with a sequence (a plan that also wrote) read the
+        key just before its own write.
+    -   One without (a nullopt, a guard-only commit, a head read) is placed
+        by real time. Its window runs from the state after the last
+        transaction that committed before it was invoked, to the state
+        before the first that was invoked after it returned. Some state in
+        that window has to agree with it.
+
+    An :info write may or may not take effect, and may do so after it
+    returned: resume() replays a write whose flush failed. A key it wrote is
+    therefore not judged while it could be what an observation saw: from its
+    invoke until a committed write of the key that began after it returned,
+    which the order puts after it. One rule narrows that. A read made after
+    an observation returned, of a version written before the :info began,
+    shows the :info had not taken effect by then: had it, that version would
+    be gone, and versions are never written twice. So that :info cannot be
+    what the observation saw. Only reads made after their invoke count: a
+    head read and the final read. A range transaction scans before its
+    invoke.
+
+    That is the shape of #672. A del whose flush failed is :info. A del
+    behind it that answered from its unpublished tombstone says the key was
+    absent, which only the failed del explains; a head read after it still
+    sees the old version, so the failed del cannot explain it, and no state
+    in its window agrees.
+    """
+    problems: list[str] = []
+    position = {id(c): i for i, c in enumerate(committed)}
+
+    # key -> [(position, present)] in order: the start is -1, a placed :info
+    # lands half a step before its reader, a committed write at its own.
+    changes: dict[int, list[tuple[float, bool]]] = {
+        k: [(-1.0, True)] for k in seed}
+    for i, c in enumerate(committed):
+        for k in info_before[id(c)]:
+            changes.setdefault(k, [(-1.0, True)]).append((i - 0.5, True))
+        for k, v in c.writes():
+            changes.setdefault(k, [(-1.0, True)]).append((i, v is not None))
+    change_at = {k: [p for p, _ in ch] for k, ch in changes.items()}
+
+    def present_at(k: int, pos: float) -> bool:
+        ch = changes.get(k, [(-1.0, True)])
+        return ch[bisect.bisect_right(change_at.get(k, [-1.0]), pos) - 1][1]
+
+    def agrees(k: int, lo: float, hi: float, want: bool) -> bool:
+        """Some state at a position in [lo, hi] has k present == want."""
+        if present_at(k, lo) == want:
+            return True
+        pts = change_at.get(k, [])
+        start = bisect.bisect_right(pts, lo)
+        end = bisect.bisect_right(pts, hi)
+        return any(changes[k][j][1] == want for j in range(start, end))
+
+    # Real-time bounds of a sequence-less observation, from the committed
+    # transactions' invoke and completion indexes.
+    by_done = sorted(committed, key=lambda c: c.index)
+    done_keys = [c.index for c in by_done]
+    done_max = []  # highest position among the first j by completion
+    best = -1
+    for c in by_done:
+        best = max(best, position[id(c)])
+        done_max.append(best)
+    by_invoke = sorted(committed, key=lambda c: c.invoke)
+    invoke_keys = [c.invoke for c in by_invoke]
+    invoke_min = [0] * len(by_invoke)  # lowest position among the j-th on
+    low = len(committed)
+    for j in range(len(by_invoke) - 1, -1, -1):
+        low = min(low, position[id(by_invoke[j])])
+        invoke_min[j] = low
+
+    def window(op: Op) -> tuple[int, int]:
+        j = bisect.bisect_left(done_keys, op.invoke)
+        lo = done_max[j - 1] if j > 0 else -1
+        j = bisect.bisect_right(invoke_keys, op.index)
+        hi = (invoke_min[j] if j < len(invoke_min) else len(committed)) - 1
+        return lo, max(lo, hi)
+
+    # Who wrote each version, and the last time a read made after its invoke
+    # named it. A seed was written before everything.
+    writer_done: dict[str, int] = {v: -1 for v in seed.values()}
+    for op in ops:
+        if op.type == "fail":
+            continue
+        for _, v in op.writes():
+            if v is not None:
+                writer_done[v] = op.index
+    seen_after: dict[int, dict[str, int]] = defaultdict(dict)
+    for op in ops:
+        if op.type != "ok":
+            continue
+        named = [(k, v) for k, _, v in op.observations() if v is not None]
+        if op.role == "final":
+            named += [kv for _, kv in op.reads()]
+        for k, v in named:
+            if isinstance(v, str):
+                prev = seen_after[k].get(v, -1)
+                seen_after[k][v] = max(prev, op.invoke)
+
+    # Per key, the :info writes that may explain an observation: (invoke,
+    # the completion of the first committed write of the key that began
+    # after it returned, the last invoke of a read made after its invoke
+    # that names a version written before the :info began).
+    writes_of: dict[int, list[Op]] = defaultdict(list)
+    for c in committed:
+        for k, _ in c.writes():
+            writes_of[k].append(c)
+    settle_keys: dict[int, list[int]] = {}
+    settle_min: dict[int, list[float]] = {}
+    for k, ws in writes_of.items():
+        ws.sort(key=lambda c: c.invoke)
+        settle_keys[k] = [c.invoke for c in ws]
+        mins: list[float] = [0] * len(ws)
+        low = math.inf
+        for j in range(len(ws) - 1, -1, -1):
+            low = min(low, ws[j].index)
+            mins[j] = low
+        settle_min[k] = mins
+    open_infos: dict[int, list[tuple[int, float, int]]] = defaultdict(list)
+    never_by_done = 0
+    for iw in info:
+        for k, v in iw.writes():
+            older = max((when for seen, when in seen_after[k].items()
+                         if seen != v
+                         and writer_done.get(seen, math.inf) < iw.invoke),
+                        default=-1)
+            if older > iw.index:
+                never_by_done += 1
+            keys = settle_keys.get(k, [])
+            j = bisect.bisect_right(keys, iw.index)
+            settled = settle_min[k][j] if j < len(keys) else math.inf
+            open_infos[k].append((iw.invoke, settled, older))
+
+    def explaining(k: int, op: Op) -> tuple[bool, bool]:
+        """(an :info may explain what op saw of k, an :info overlapping op
+        was shown not to)."""
+        may = shown = False
+        for inv, settled, older in open_infos.get(k, ()):
+            if inv >= op.index or settled < op.invoke:
+                continue
+            if older > op.index:
+                shown = True
+            else:
+                may = True
+        return may, shown
+
+    judged_committed = judged_windowed = unjudged = near_failure = 0
+    for op in ops:
+        if op.type not in ("ok", "fail") or op.role == "final":
+            continue
+        for k, present, version in op.observations():
+            may, shown = explaining(k, op)
+            if may:
+                unjudged += 1
+                continue
+            committed_at = (position.get(id(op))
+                            if op.type == "ok" and op.sequence is not None
+                            else None)
+            if committed_at is not None:
+                judged_committed += 1
+                lo = hi = committed_at - 0.25
+                ok = present_at(k, lo) == present
+            else:
+                judged_windowed += 1
+                lo, hi = window(op)
+                ok = agrees(k, lo, hi, present)
+            near_failure += shown
+            if not ok:
+                state = "present" if present_at(k, lo) else "absent"
+                problems.append(
+                    f"process {op.process} ({op.type}, index {op.index}) "
+                    f"saw key {k} {'present' if present else 'absent'}"
+                    f"{f' at {version}' if version else ''}, but the order "
+                    f"holds it {state} across positions [{lo}, {hi}]")
+
+    summary = {
+        "presence_committed": judged_committed,
+        "presence_windowed": judged_windowed,
+        "presence_unjudged": unjudged,
+        "info_unseen_by_done": never_by_done,
+        "presence_near_failure": near_failure,
+    }
+    return problems, summary
 
 
 def run_elle(jar: Path, history: Path, models: str, out_dir: Path) -> dict:
@@ -962,7 +1189,10 @@ def check_range_round(args: argparse.Namespace, seed: int,
     """The range workload (#302): guarded and unguarded histories checked
     against the commit order, by history_check. Elle's models have no
     counterpart for a scan, a del or a range delete, so it does not run."""
-    for config in KILL_CONFIGS:
+    # presence (#676) runs in-process only; its kill and chaos lives are a
+    # follow-up.
+    configs = KILL_CONFIGS if args.kill else KILL_CONFIGS + ("presence",)
+    for config in configs:
         history_path = round_dir / f"{config}.json"
         cmd = [str(args.binary), "--config", config, "--workload", "range",
                "--seed", str(seed), "--txns", str(args.txns),
@@ -990,6 +1220,8 @@ def check_range_round(args: argparse.Namespace, seed: int,
             print(f"    {p}")
         if config == "unguarded":
             args.exposed_seen |= summary.get("exposures", 0) > 0
+        if config == "presence":
+            args.presence_reach += summary.get("presence_near_failure", 0)
         if problems:
             raise CheckFailed(f"{config}: range history check failed")
 
@@ -1114,6 +1346,7 @@ def main() -> int:
     args.v168_seen = False
     args.fork_seen = False
     args.group_kills = 0
+    args.presence_reach = 0
     rng = random.Random(seed)
     try:
         for r in range(args.rounds):
@@ -1138,6 +1371,12 @@ def main() -> int:
             raise CheckFailed(
                 "kill: no kill landed with two or more sync writers in "
                 "flight; the run never reached a shared fdatasync")
+        if (args.workload == "range" and not args.kill
+                and args.presence_reach == 0):
+            raise CheckFailed(
+                "presence: no presence observation was judged across a write "
+                "whose outcome a later read settled as never taken; the run "
+                "is not shown to reach a failed flush")
         if (args.workload == "range" and not args.exposed_seen):
             raise CheckFailed(
                 "unguarded: no range transaction read a state behind its own "

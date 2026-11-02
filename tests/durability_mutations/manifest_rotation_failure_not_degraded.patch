@@ -3,15 +3,18 @@ active file and cannot create the next one. Reverts 362cc590.
 Guarded-by: "prove_manifest__*"
 
 diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
-index dcda96c..87f3001 100644
+index 8b83e51..ca53df5 100644
 --- a/bytecaskdb/db_replication.cpp
 +++ b/bytecaskdb/db_replication.cpp
-@@ -144,7 +144,7 @@ auto DB::create_manifest() -> FileManifest {
+@@ -147,10 +147,7 @@ auto DB::create_manifest() -> FileManifest {
      try {
        rotation = prepare_rotation(t);
      } catch (...) {
--      t.apply_degrade(
-+      (void)(
-           "create_manifest rotation failed: active file is sealed "
-           "but new file could not be created. Call resume() to recover.");
-       store_state(current, std::move(t).persistent());
+-      degrade_transient(t, current,
+-                        "create_manifest rotation failed: active file is "
+-                        "sealed but new file could not be created. Call "
+-                        "resume() to recover.");
++      store_state(current, std::move(t).persistent());
+       throw;
+     }
+     try {

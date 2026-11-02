@@ -53,6 +53,7 @@
 #include "alloc_faults.h"
 #include "fault_injector.h"
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #ifndef BYTECASK_NO_ALLOC_FAULTS
 #include <csignal>
@@ -123,10 +124,12 @@ struct Outcome {
   std::string kind;    // see the file comment; "error" for a failed check
   std::string detail;  // what failed, for "error"
   bool fired{false};
+  bool io_fired{false};  // the injected I/O failure was thrown
 };
 
 auto encode(const Outcome &o) -> std::string {
-  return std::format("{}\t{}\t{}\n", o.kind, o.fired ? 1 : 0, o.detail);
+  return std::format("{}\t{}\t{}\t{}\n", o.kind, o.fired ? 1 : 0,
+                     o.io_fired ? 1 : 0, o.detail);
 }
 
 auto decode(std::string_view line) -> std::optional<Outcome> {
@@ -134,11 +137,14 @@ auto decode(std::string_view line) -> std::optional<Outcome> {
   if (a == std::string_view::npos) return std::nullopt;
   const auto b = line.find('\t', a + 1);
   if (b == std::string_view::npos) return std::nullopt;
-  auto detail = line.substr(b + 1);
+  const auto c = line.find('\t', b + 1);
+  if (c == std::string_view::npos) return std::nullopt;
+  auto detail = line.substr(c + 1);
   while (!detail.empty() && detail.back() == '\n') detail.remove_suffix(1);
   return Outcome{.kind = std::string{line.substr(0, a)},
                  .detail = std::string{detail},
-                 .fired = line.substr(a + 1, b - a - 1) == "1"};
+                 .fired = line.substr(a + 1, b - a - 1) == "1",
+                 .io_fired = line.substr(b + 1, c - b - 1) == "1"};
 }
 
 // Thrown in the child by a check that fails; caught at the top of the child.
@@ -278,21 +284,60 @@ auto run_in_child(const Operation &op, const Pass &pass, long n,
         op.partial ? op.partial(baseline) : std::vector<KeyValues>{};
 
     bool threw = false;
+    bool threw_system_error = false;
     bool did_work = false;
+    // A warm pool hands out nodes without operator new, so which node
+    // allocations the sweep counts would depend on the tests that ran
+    // before (#583).
+    bytecask::btree_detail::node_pool_trim();
+    bool io_failed = false;
+    // Whether the injected failure came before the allocation failed: only
+    // then is it the error the caller must see (a handler may swallow it
+    // after the allocation failed first).
+    bool io_first = false;
     {
+      const auto io = op.io_fault ? op.io_fault() : nullptr;
+      // Set before the faults are armed: the callback's own allocation is
+      // not the engine's.
+      const ScopedAllocFaults *armed = nullptr;
+      if (io)
+        io->inj.on_fire = [&io_first, &armed, n] {
+          io_first = io_first || (armed != nullptr && armed->allocations() < n);
+        };
       ScopedAllocFaults faults{n, pass.cascade};
+      armed = &faults;
       try {
         did_work = op.run(*db);
+      } catch (const std::system_error &) {
+        threw = true;
+        threw_system_error = true;
       } catch (...) {
         threw = true;
       }
       wait_hints_idle(*db);
       out.fired = faults.report().fired;
+      io_failed = io && io->inj.fired;
     }
+    out.io_fired = io_failed;
 
     const auto live = key_values(*db);
     const bool degraded = db->is_degraded();
-    if (!out.fired) {
+    if (io_failed) {
+      expect(threw, "an I/O failure was injected, yet the operation returned");
+      if (io_first)
+        expect(threw_system_error,
+               "the operation threw something else in the I/O failure's place");
+      expect(degraded, "an I/O failure was reported, yet the engine accepts writes");
+      if (op.io_fault_after_durable) {
+        expect(one_of(live, {&baseline, &after}),
+               "an I/O failure was thrown after the write was durable, and "
+               "the state is neither the baseline nor the transition");
+      } else {
+        expect(live == baseline,
+               "an I/O failure was thrown, yet what the operation did is visible");
+      }
+    }
+    if (!out.fired && !io_failed) {
       expect(!threw, "the fault was not reached, yet the operation threw");
       expect(did_work, "the fault was not reached, yet the operation did nothing");
       expect(!degraded, "the fault was not reached, yet the engine degraded");
@@ -380,6 +425,8 @@ auto judge_terminated(const Operation &op, const Expected &x,
 
 struct Tally {
   std::map<std::string, long> counts;
+  long io_runs{0};        // runs the injected I/O failure was thrown in
+  long io_only_runs{0};   // and no allocation had failed in
   std::vector<std::string> failures;
   std::vector<std::string> terminations;
 };
@@ -493,6 +540,10 @@ auto run_forked(
                     label, status, got));
   }
   ++tally.counts[out.kind];
+  if (out.io_fired) {
+    ++tally.io_runs;
+    if (!out.fired) ++tally.io_only_runs;
+  }
   if (env_flag("BYTECASK_ALLOC_SWEEP_TRACE"))
     std::fprintf(stderr, "alloc sweep %s: %s\n", label.c_str(), out.kind.c_str());
   return out.fired;
@@ -516,11 +567,14 @@ auto run_case(const Operation &op, const Expected &x, const Pass &pass, long n,
 // the fault never reached, and reports what the runs found.
 // `strict`: a termination fails the test, as with
 // BYTECASK_ALLOC_SWEEP_STRICT, for an operation whose contract says it ends
-// nothing.
+// nothing. `needs_io`: the runs inject an I/O failure, and each pass must
+// reach it, with and without an allocation failing before it: a sweep whose
+// injection stops reaching the engine fails instead of passing as a plain
+// allocation sweep.
 void sweep_passes(
     const std::string &name,
     const std::function<bool(const Pass &, long, Tally &)> &run_n,
-    bool strict = false) {
+    bool strict = false, bool needs_io = false) {
   const auto step = stride();
   Tally tally;
   const char *pass_filter = std::getenv("BYTECASK_ALLOC_SWEEP_PASS");
@@ -543,6 +597,18 @@ void sweep_passes(
     std::fprintf(stderr, "alloc sweep %s [%s]: %ld runs: %s\n", name.c_str(),
                  pass.name, (n - 1) / step + 1, summary.c_str());
     tally.counts.clear();
+    if (needs_io) {
+      if (tally.io_runs == 0)
+        tally.failures.push_back(std::format(
+            "{} [{}]: no run reached the injected I/O failure", name, pass.name));
+      else if (tally.io_only_runs == 0)
+        tally.failures.push_back(std::format(
+            "{} [{}]: the injected I/O failure was never reached without an "
+            "allocation failing first",
+            name, pass.name));
+    }
+    tally.io_runs = 0;
+    tally.io_only_runs = 0;
   }
   for (const auto &f : tally.failures) FAIL_CHECK(f);
   if (!tally.terminations.empty()) {
@@ -559,9 +625,12 @@ void sweep_passes(
 
 void alloc_sweep(const Operation &op) {
   const auto x = expected_of(op);
-  sweep_passes(op.name, [&](const Pass &pass, long n, Tally &tally) {
-    return run_case(op, x, pass, n, tally);
-  });
+  sweep_passes(
+      op.name,
+      [&](const Pass &pass, long n, Tally &tally) {
+        return run_case(op, x, pass, n, tally);
+      },
+      false, static_cast<bool>(op.io_fault));
 }
 
 }  // namespace
@@ -619,12 +688,81 @@ TEST_CASE("alloc sweep: write across a rotation", "[alloc_sweep]") {
   alloc_sweep(rotation_operation());
 }
 
+TEST_CASE("alloc sweep: put whose fdatasync fails", "[alloc_sweep]") {
+  alloc_sweep(put_failed_sync_operation());
+}
+
+TEST_CASE("alloc sweep: rotation-crossing write whose rotation fdatasync "
+          "fails",
+          "[alloc_sweep]") {
+  alloc_sweep(rotation_failed_sync_operation());
+}
+
+TEST_CASE("alloc sweep: rotation-crossing write whose next file cannot be "
+          "created",
+          "[alloc_sweep]") {
+  alloc_sweep(rotation_failed_creation_operation());
+}
+
+TEST_CASE("alloc sweep: rotation-crossing write whose sync after the "
+          "rotation fails",
+          "[alloc_sweep]") {
+  alloc_sweep(rotation_failed_second_sync_operation());
+}
+
 TEST_CASE("alloc sweep: vacuum", "[alloc_sweep]") {
   alloc_sweep(vacuum_operation());
 }
 
+TEST_CASE("alloc sweep: vacuum whose fdatasync fails", "[alloc_sweep]") {
+  alloc_sweep(vacuum_failed_sync_operation());
+}
+
 TEST_CASE("alloc sweep: ingest", "[alloc_sweep]") {
   alloc_sweep(ingest_operation());
+}
+
+TEST_CASE("alloc sweep: ingest whose append fails", "[alloc_sweep]") {
+  alloc_sweep(ingest_failed_append_operation());
+}
+
+TEST_CASE("alloc sweep: ingest whose fdatasync fails", "[alloc_sweep]") {
+  alloc_sweep(ingest_failed_sync_operation());
+}
+
+TEST_CASE("alloc sweep: ingest whose rotation cannot create a file",
+          "[alloc_sweep]") {
+  alloc_sweep(ingest_failed_rotation_operation());
+}
+
+TEST_CASE("alloc sweep: ingest whose rotation fdatasync fails",
+          "[alloc_sweep]") {
+  alloc_sweep(ingest_failed_rotation_sync_operation());
+}
+
+TEST_CASE("alloc sweep: create_manifest whose rotation cannot create a file",
+          "[alloc_sweep]") {
+  alloc_sweep(manifest_failed_rotation_operation());
+}
+
+TEST_CASE("alloc sweep: set_mode(Leader) whose marker append fails",
+          "[alloc_sweep]") {
+  alloc_sweep(promotion_failed_append_operation());
+}
+
+TEST_CASE("alloc sweep: set_mode(Leader) whose rotation cannot create a file",
+          "[alloc_sweep]") {
+  alloc_sweep(promotion_failed_rotation_operation());
+}
+
+TEST_CASE("alloc sweep: set_mode(Follower) whose fdatasync fails",
+          "[alloc_sweep]") {
+  alloc_sweep(step_down_failed_sync_operation());
+}
+
+TEST_CASE("alloc sweep: create_manifest whose fdatasync fails",
+          "[alloc_sweep]") {
+  alloc_sweep(manifest_failed_sync_operation());
 }
 
 TEST_CASE("alloc sweep: resume after a failed sync", "[alloc_sweep]") {
@@ -1640,6 +1778,94 @@ TEST_CASE("refuse writes: the refusal holds when the degraded state cannot be "
   expect_refused_then_resumed(db, dir, {}, "k1", "over");
 }
 
+// refuse_writes runs without the flush role, so a state can be published
+// between its load and its store: it must not be replaced by an older one.
+TEST_CASE("refuse writes: the refusal keeps a state published while it was "
+          "built",
+          "[refuse_writes]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = open_db(dir, {});
+  seed(*db);
+  db->test_after_append_ = [] { throw std::bad_alloc{}; };
+  bool published = false;
+  db->test_before_refusal_swap_ = [&] {
+    if (published) return;
+    published = true;
+    db->test_publish_unchecked(
+        db->engine_state()->degraded_copy("published in between"));
+  };
+  CHECK_THROWS_AS(db->put({.sync = true}, to_bytes("k1"), to_bytes("over")),
+                  std::bad_alloc);
+  db->test_after_append_ = nullptr;
+  db->test_before_refusal_swap_ = nullptr;
+  CHECK(published);
+  CHECK(db->degraded_reason() == "published in between");
+  expect_refused_then_resumed(db, dir, {}, "k1", "over");
+}
+
+// A failed append degrades only after the flush in flight lands: the
+// writers appended before it succeeded and must be told so, not DbDegraded.
+// Writer A has appended and not yet waited; writer B's append fails.
+TEST_CASE("refuse writes: a failed append lands the writes appended before "
+          "it",
+          "[refuse_writes]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = open_db(dir, {});
+  seed(*db);
+  bool b_threw = false;
+  bool once = true;
+  db->test_before_commit_wait_ = [&] {
+    if (!once) return;
+    once = false;
+    bytecask::testing::ScopedFaultInjector fi{
+        "io_data_file_append_partial",
+        bytecask::testing::PostWriteMode::throw_after};
+    try {
+      (void)db->put({.sync = true}, to_bytes("k2"), to_bytes("b"));
+    } catch (const std::system_error &) {
+      b_threw = true;
+    }
+  };
+  const auto a = db->put({.sync = true}, to_bytes("k1"), to_bytes("a"));
+  db->test_before_commit_wait_ = nullptr;
+  CHECK(b_threw);
+  CHECK(a.durable);
+  CHECK(value_of(*db, "k1") == "a");
+  CHECK(db->is_degraded());
+  expect_refused_then_resumed(db, dir, {}, "k1", "a");
+}
+
+// The same when what lands in between is healthy, as a flush's publication
+// is: the refusal retries on it, so the state it degrades is the newer one.
+TEST_CASE("refuse writes: the refusal retries on a healthy state published "
+          "while it was built",
+          "[refuse_writes]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = open_db(dir, {});
+  seed(*db);
+  db->test_after_append_ = [] { throw std::bad_alloc{}; };
+  int builds = 0;
+  std::shared_ptr<const bytecask::EngineState> newer;
+  db->test_before_refusal_swap_ = [&] {
+    if (++builds > 1) return;
+    auto s = std::make_shared<bytecask::EngineState>(*db->engine_state());
+    newer = s;
+    db->test_publish_unchecked(std::move(s));
+  };
+  CHECK_THROWS_AS(db->put({.sync = true}, to_bytes("k1"), to_bytes("over")),
+                  std::bad_alloc);
+  db->test_after_append_ = nullptr;
+  db->test_before_refusal_swap_ = nullptr;
+  CHECK(builds == 2);
+  const auto published = db->engine_state();
+  CHECK(published != newer);
+  CHECK(published->degraded);
+  expect_refused_then_resumed(db, dir, {}, "k1", "over");
+}
+
 // A flush that throws before it publishes must give the flush role back, or
 // every later writer waits for it forever.
 TEST_CASE("refuse writes: a flush that throws releases the flush role",
@@ -1753,4 +1979,178 @@ TEST_CASE("refuse writes: ingest is refused by the flag alone",
     CHECK(value_of(*db, std::format("r{}", i)) ==
           std::string(300, static_cast<char>('a' + i)));
   bytecask::testing::assert_consistent(*db);
+}
+
+// An I/O failure whose handler cannot build the degraded state: the handler
+// still throws its own error, and the flag alone refuses writes. The sweeps
+// cover every handler in forked children; these run in-process for the
+// handlers no other in-process test reaches.
+namespace {
+
+enum class DegradeMemory { available, exhausted };
+
+constexpr Options kPostLoopFollower{.max_file_bytes = 100,
+                                    .initial_mode = bytecask::Mode::Follower};
+
+// Five puts that cross a 100-byte file only with the last, so ingest
+// rotates after its loop, not inside it: checked on a copy, where the slice
+// fills one file and leaves the next empty (inside the loop, the last put
+// would have gone to the next file).
+auto post_loop_rotation_slice() -> bytecask::testing::OwnedEntries {
+  TempDir td;
+  auto slice = [&] {
+    auto leader = DB::open(td.path / "leader");
+    for (char c = 'a'; c <= 'e'; ++c)
+      leader.put({.sync = true}, to_bytes(std::string(1, c)), to_bytes("x"));
+    const auto snap = leader.snapshot();
+    return bytecask::testing::collect_changes(leader.changes_since(snap, 0));
+  }();
+  auto probe = DB::open(td.path / "probe", kPostLoopFollower);
+  probe.ingest(slice.header, slice.views());
+  const auto stats = probe.file_stats();
+  REQUIRE(stats.size() == 2);
+  REQUIRE(stats.rbegin()->second.total_bytes == 0);
+  return slice;
+}
+
+// Exhausted: neither the handler's degraded state nor the refusal's
+// fallback state can be built.
+void arm_degrade_memory(DB &db, DegradeMemory memory) {
+  if (memory == DegradeMemory::available) return;
+  db.test_before_degrade_publish_ = [] { throw std::bad_alloc{}; };
+  db.test_before_refusal_publish_ = [] { throw std::bad_alloc{}; };
+}
+
+// The handler threw the I/O error and refused writes, through its own
+// degraded state when it could build one.
+void expect_io_failure_refused(DB &db, DegradeMemory memory,
+                               std::string_view reason) {
+  db.test_before_degrade_publish_ = nullptr;
+  db.test_before_refusal_publish_ = nullptr;
+  CHECK(db.is_degraded());
+  if (memory == DegradeMemory::available) {
+    CHECK(db.degraded_reason().find(reason) != std::string::npos);
+  } else {
+    CHECK_FALSE(db.engine_state()->degraded);
+  }
+}
+
+void ingest_post_loop_rotation_fails(const char *checkpoint,
+                                     std::string_view reason) {
+  const auto memory = GENERATE(DegradeMemory::available,
+                               DegradeMemory::exhausted);
+  TempDir td;
+  const auto slice = post_loop_rotation_slice();
+  auto db = open_db(td.path / "follower", kPostLoopFollower);
+  arm_degrade_memory(*db, memory);
+  {
+    bytecask::testing::ScopedFaultInjector fi{checkpoint};
+    CHECK_THROWS_AS(db->ingest(slice.header, slice.views()),
+                    std::system_error);
+    CHECK(fi.inj.fired);
+  }
+  expect_io_failure_refused(*db, memory, reason);
+  for (char c = 'a'; c <= 'e'; ++c)
+    CHECK(value_of(*db, std::string(1, c)) == "<absent>");
+  CHECK_THROWS_AS(db->ingest(slice.header, slice.views()), DbDegraded);
+  REQUIRE_NOTHROW(db->resume());
+  db->ingest(slice.header, slice.views());
+  for (char c = 'a'; c <= 'e'; ++c)
+    CHECK(value_of(*db, std::string(1, c)) == "x");
+  bytecask::testing::assert_consistent(*db);
+}
+
+}  // namespace
+
+TEST_CASE("refuse writes: ingest's post-loop rotation fdatasync fails",
+          "[refuse_writes]") {
+  ingest_post_loop_rotation_fails("io_data_file_sync",
+                                  "ingest rotation fdatasync failed");
+}
+
+TEST_CASE("refuse writes: ingest's post-loop rotation cannot create a file",
+          "[refuse_writes]") {
+  ingest_post_loop_rotation_fails("io_rotate_file_creation",
+                                  "ingest post-rotation file creation failed");
+}
+
+TEST_CASE("refuse writes: set_mode(Leader)'s rotation cannot create a file",
+          "[refuse_writes]") {
+  const auto memory = GENERATE(DegradeMemory::available,
+                               DegradeMemory::exhausted);
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto op = promotion_failed_rotation_operation();
+  auto db = open_db(dir, op.opts);
+  op.setup(*db);
+  arm_degrade_memory(*db, memory);
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+    CHECK_THROWS_AS(db->set_mode(bytecask::Mode::Leader), std::system_error);
+    CHECK(fi.inj.fired);
+  }
+  expect_io_failure_refused(*db, memory,
+                            "set_mode(Leader) rotation file creation failed");
+  CHECK(db->mode() == bytecask::Mode::Follower);
+  REQUIRE_NOTHROW(db->resume());
+  db->set_mode(bytecask::Mode::Leader);
+  CHECK(db->put({.sync = true}, to_bytes("late"), to_bytes("x")).durable);
+  db->close();
+  db.reset();
+  auto reopened = DB::open(dir, {});
+  CHECK(value_of(reopened, "late") == "x");
+  bytecask::testing::assert_consistent(reopened);
+}
+
+// A slice that rotates and then fails its next rotation: the degraded state
+// is the one before the slice, which does not know the file the slice
+// created. resume() replays the active file it does know, and re-delivery
+// writes the rest again into a new file, so the first copy stays on disk
+// outside the state until a reopen reads it. Nothing is lost or seen twice.
+TEST_CASE("refuse writes: a slice that fails its second rotation resumes, "
+          "takes re-delivery and reopens whole",
+          "[refuse_writes]") {
+  const auto checkpoint = GENERATE(std::string{"io_rotate_file_creation"},
+                                   std::string{"io_data_file_sync"});
+  TempDir td;
+  bytecask::testing::OwnedEntries slice;
+  {
+    auto leader = DB::open(td.path / "leader");
+    for (int i = 0; i < 12; ++i)
+      leader.put({.sync = true}, to_bytes(std::format("r{:02}", i)),
+                 to_bytes(std::string(60, static_cast<char>('a' + i))));
+    const auto snap = leader.snapshot();
+    slice = bytecask::testing::collect_changes(leader.changes_since(snap, 0));
+  }
+  const Options opts{.max_file_bytes = 200, .initial_mode = bytecask::Mode::Follower};
+  const auto dir = td.path / "follower";
+  {
+    auto db = open_db(dir, opts);
+    {
+      bytecask::testing::ScopedFaultInjector fi{checkpoint};
+      fi.inj.fail_on_nth_match = 2;
+      CHECK_THROWS(db->ingest(slice.header, slice.views()));
+      CHECK(fi.inj.fired);
+    }
+    INFO(checkpoint);
+    CHECK(value_of(*db, "r00") == "<absent>");
+    std::size_t on_disk = 0;
+    for (const auto &e : std::filesystem::directory_iterator{dir})
+      if (e.path().extension() == ".data") ++on_disk;
+    CHECK(on_disk > db->file_stats().size());  // the file the slice created
+    REQUIRE_NOTHROW(db->resume());
+    bytecask::testing::assert_consistent(*db);
+    db->ingest(slice.header, slice.views());
+    for (int i = 0; i < 12; ++i)
+      CHECK(value_of(*db, std::format("r{:02}", i)) == std::string(60, static_cast<char>('a' + i)));
+    db->close();
+  }
+  auto reopened = DB::open(dir, opts);
+  bytecask::testing::assert_consistent(reopened);
+  for (int i = 0; i < 12; ++i)
+    CHECK(value_of(reopened, std::format("r{:02}", i)) == std::string(60, static_cast<char>('a' + i)));
+  std::size_t files = 0;
+  for (const auto &e : std::filesystem::directory_iterator{dir})
+    if (e.path().extension() == ".data") ++files;
+  CHECK(files == reopened.file_stats().size());
 }

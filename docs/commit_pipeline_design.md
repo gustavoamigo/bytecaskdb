@@ -214,14 +214,26 @@ after the earlier write was published. With immediate rejection, a caller's
 retry loop spun through the whole flush of the write it lost to — the CAS
 benchmark's average attempts went from 1.0 to 7–350 with the pipeline, at
 a 1 % true collision rate. So `apply_batch` reports such a conflict once the
-head it lost to is published (`wait_published`): the first moment a retry
-can make progress, and the moment the conflict was reported before the
-pipeline. It is detectable at validation — the plan's snapshot already
-covers everything in `state_` (`conflict_snap_next >= state_->next_seq`) —
-and a plan whose snapshot is behind `state_` returns at once, since its
-retry has something new to see. Nothing is written either way, and a
-non-conflicting plan keeps the full pipelining. Backoff under genuine
+write it lost to is published (`settle_unappended`): the first moment a
+retry can make progress, and the moment the conflict was reported before
+the pipeline. A plan the published state refutes as well returns at once,
+since its retry has something new to see. Nothing is written either way,
+and a non-conflicting plan keeps the full pipelining. Backoff under genuine
 contention remains the caller's job (`CONTRACT.md`, *Conflict Safety*).
+
+**A plan that appends nothing rests on the head too.** The same wait
+covers every plan that appends nothing: a conflict, and guards that held
+with nothing to write. Its outcome may rest on a head entry that is not
+yet published, and that entry's flush may fail. A plan that appends
+something inherits the failure through `commit_wait`; one that appends
+nothing would otherwise return an answer drawn from a write that is then
+unseen. Before #672 a `del` that found only a failed `del`'s tombstone
+returned `nullopt`, and the key was still there. So the plan waits for the
+entry it rests on — the entry it lost to, or the latest entry its guards
+read — and throws `DbDegraded` if the engine refuses writes before
+that entry is published. When the published state gives the same outcome
+(a `del` of a key neither holds), the plan rests on what readers already
+see and returns at once.
 
 ### Failure: the fdatasync returns an error
 
