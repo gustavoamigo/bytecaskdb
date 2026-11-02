@@ -616,8 +616,8 @@ public:
   // latest entry its guards read; 0 for a plan without guards. For a key
   // found deleted or absent, which has no entry, the head's latest sequence.
   // With defer_puts, set only for a plan of point puts alone, the plan's
-  // writes are not checked here: apply_puts_checked checks each in the
-  // descent that applies it.
+  // writes are not checked here, nor the ensure_absent guards its inserts
+  // confirm: apply_puts_checked checks each in the descent that applies it.
   [[nodiscard]] auto validate_preconditions(const WritePlan &plan,
                                             std::uint64_t &rests_on,
                                             bool defer_puts = false) const
@@ -2060,6 +2060,10 @@ public:
 
   struct KeyGuard {
     Precondition precondition{Precondition::None};
+    // An ensure_absent on a key the plan puts and the snapshot lacks, set by
+    // resolve_snapshot_entries: the insert's own descent confirms it, so the
+    // fused check (apply_puts_checked) does not look the key up first.
+    bool confirmed_by_insert{false};
   };
 
   struct RangeGuard {
@@ -2213,6 +2217,8 @@ private:
   // and the update then find the key by the location found here, without
   // reading its record (docs/unsynced_commit_design.md, D3).
   void resolve_snapshot_entries();
+  // Marks key's guard confirmed_by_insert if it is an ensure_absent.
+  void mark_confirmed_by_insert(BytesView key);
   // The snapshot's entry for write i: resolved earlier, or looked up now.
   [[nodiscard]] auto snapshot_entry(std::size_t i, BytesView key) const
       -> std::optional<KeyDirEntry>;
