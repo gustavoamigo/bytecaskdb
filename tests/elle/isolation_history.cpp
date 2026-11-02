@@ -27,6 +27,13 @@
 //   blind      db.get reads, snapshot-less WritePlan(). Expected to lose
 //              appends: it shows the checker sees anomalies at all. Append
 //              workload only.
+//   presence   Range workload only (#676): guarded transactions mixed with
+//              snapshot-less plans that rest on one ensure_present or
+//              ensure_absent guard (db.del among them), and head reads of
+//              the same few keys. A guard's outcome is a read of the key's
+//              presence, a nullopt included. Expected strict-serializable.
+//              The degrade nemesis runs often, and stalls the failing flush
+//              between its error and the degrade, the window of #672.
 //
 // Nemeses, drawn from the seed: a vacuum thread over small files, and a
 // client that fails its own fdatasync through the fault injector, degrading
@@ -34,7 +41,7 @@
 // write whose fdatasync failed can still be replayed by resume().
 //
 // Usage:
-//   isolation_history --config guarded|unguarded|blind --out history.json
+//   isolation_history --config guarded|unguarded|blind|presence --out history.json
 //                     [--workload append|range]
 //                     [--seed S] [--threads N] [--txns N] [--dir PATH]
 //                     [--no-vacuum] [--force-vacuum] [--no-degrade]
@@ -101,7 +108,7 @@ namespace {
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
 
-enum class Mode : std::uint8_t { Guarded, Unguarded, Blind };
+enum class Mode : std::uint8_t { Guarded, Unguarded, Blind, Presence };
 
 auto mode_name(Mode m) -> std::string_view {
   switch (m) {
@@ -111,6 +118,8 @@ auto mode_name(Mode m) -> std::string_view {
     return "unguarded";
   case Mode::Blind:
     return "blind";
+  case Mode::Presence:
+    return "presence";
   }
   return "?";
 }
@@ -213,6 +222,9 @@ using List = std::vector<std::int64_t>;
 
 // The range workload's keys: fixed width, so bytewise order is numeric order.
 constexpr int kRangeKeys = 32;
+// The keys the presence configuration's snapshot-less plans and head reads
+// use: few, so a retry lands on a key whose last write is still in flight.
+constexpr int kPresenceKeys = 8;
 constexpr int kRangeWidth = 2; // digits in a range key id
 
 auto key_bytes(std::int64_t k) -> std::string { return std::format("k{}", k); }
@@ -222,6 +234,10 @@ auto range_key_bytes(std::int64_t k) -> std::string {
 
 auto as_view(std::string_view s) -> bytecask::BytesView {
   return std::as_bytes(std::span{s.data(), s.size()});
+}
+
+auto as_string(std::span<const std::byte> b) -> std::string {
+  return {reinterpret_cast<const char *>(b.data()), b.size()};
 }
 
 auto encode_list(const List &l) -> std::string {
@@ -307,6 +323,11 @@ using Pairs = std::vector<std::pair<std::int64_t, std::string>>;
 //   Put       put a fresh value at key, named write_id
 //   Del       del key
 //   RangeDel  del_range [key, to)
+//   Guard     ensure_present (want_present) or ensure_absent of key in a
+//             snapshot-less plan; observed is what its outcome says the key
+//             was: want_present on a commit, the opposite on a nullopt
+//   Get       point read of key through the head, after the invoke, into
+//             pairs (empty: absent)
 //
 // A range workload read or scan fills pairs, a point read of the append
 // workload fills read; both are set on completion, and empty when the
@@ -314,7 +335,8 @@ using Pairs = std::vector<std::pair<std::int64_t, std::string>>;
 // compare equal and the checker can place every version without seeing its
 // bytes.
 struct Mop {
-  enum class Kind : std::uint8_t { Read, Append, Put, Del, RangeDel };
+  enum class Kind : std::uint8_t { Read, Append, Put, Del, RangeDel, Guard,
+                                   Get };
   Kind kind{Kind::Read};
   std::int64_t key{0};
   std::int64_t element{0};  // Append: the appended list element
@@ -323,7 +345,10 @@ struct Mop {
   std::optional<List> read;  // Read, append workload
   Pairs pairs;               // Read, range workload
   bool is_scan{false};       // Read: a range [key, to), not one key
-  bool read_done{false};     // Read: it ran; false when the transaction did not
+  bool read_done{false};     // Read, Get: it ran; false when the transaction did not
+  bool want_present{false};  // Guard: ensure_present rather than ensure_absent
+  bool api_del{false};       // Guard: run as db.del, not as a plan
+  std::optional<bool> observed; // Guard: unset when the outcome is unknown
 };
 
 enum class EventType : std::uint8_t { Invoke, Ok, Fail, Info };
@@ -446,6 +471,17 @@ auto mop_json(const Mop &m) -> std::string {
     return std::format(R"(["del",{}])", m.key);
   case Mop::Kind::RangeDel:
     return std::format(R"(["del",{},{}])", m.key, m.to);
+  case Mop::Kind::Guard: {
+    const auto want = m.want_present ? "present" : "absent";
+    if (!m.observed) return std::format(R"(["guard",{},"{}"])", m.key, want);
+    return std::format(R"(["guard",{},"{}","{}"])", m.key, want,
+                       *m.observed ? "present" : "absent");
+  }
+  case Mop::Kind::Get:
+    if (!m.read_done) return std::format(R"(["get",{}])", m.key);
+    if (m.pairs.empty()) return std::format(R"(["get",{},null])", m.key);
+    return std::format(R"(["get",{},"{}"])", m.key,
+                       json_escape(m.pairs.front().second));
   }
   return "[]";
 }
@@ -590,6 +626,40 @@ public:
     return mops;
   }
 
+  // A presence transaction (#676), on one of the first kPresenceKeys keys: a
+  // head read, or a snapshot-less plan resting on one guard, alone or with a
+  // write of the guarded key. One guard, so a nullopt says which key it read.
+  auto presence(std::mt19937_64 &rng) -> std::vector<Mop> {
+    const auto key = static_cast<std::int64_t>(rng() % kPresenceKeys);
+    Mop first;
+    first.key = key;
+    const auto r = rng() % 20;
+    if (r >= 16) {
+      first.kind = Mop::Kind::Get;
+      return {first};
+    }
+    first.kind = Mop::Kind::Guard;
+    // 0-3 db.del, 4-5 ensure_present + del, 6-9 ensure_absent + put (an
+    // insert), 10-11 ensure_present + put, 12-15 a guard alone.
+    first.want_present = r < 6 || (r >= 10 && r < 14);
+    first.api_del = r < 4;
+    std::vector<Mop> mops{first};
+    if (r < 6) {
+      Mop del;
+      del.kind = Mop::Kind::Del;
+      del.key = key;
+      del.to = key;
+      mops.push_back(del);
+    } else if (r < 12) {
+      Mop put;
+      put.kind = Mop::Kind::Put;
+      put.key = key;
+      put.write_id = write_id(serial_, next_count_++);
+      mops.push_back(put);
+    }
+    return mops;
+  }
+
 private:
   std::uint64_t serial_;
   std::uint64_t next_count_{0}; // one thread owns a generator
@@ -649,9 +719,7 @@ auto scan_pairs(const bytecask::DB &db, const bytecask::Snapshot *snap,
     const auto k = std::string_view{
         reinterpret_cast<const char *>(e.key.data()), e.key.size()};
     if (k >= hi) return false;
-    out.emplace_back(std::stoll(std::string{k.substr(1)}),
-                     std::string{reinterpret_cast<const char *>(e.value.data()),
-                                 e.value.size()});
+    out.emplace_back(std::stoll(std::string{k.substr(1)}), as_string(e.value));
     return true;
   };
   if (snap) {
@@ -705,6 +773,8 @@ auto plan_range_txn(bytecask::DB &db, Mode mode, std::vector<Mop> &mops)
     }
     case Mop::Kind::Put:
     case Mop::Kind::Append:
+    case Mop::Kind::Guard:
+    case Mop::Kind::Get:
       break;
     }
   }
@@ -751,6 +821,8 @@ auto apply_range_txn(bytecask::DB &db, Mode mode, const std::vector<Mop> &mops,
       break;
     case Mop::Kind::Read:
     case Mop::Kind::Append:
+    case Mop::Kind::Guard:
+    case Mop::Kind::Get:
       break;
     }
   }
@@ -783,11 +855,62 @@ auto apply_range_txn(bytecask::DB &db, Mode mode, const std::vector<Mop> &mops,
 // about what the database held, and Elle would otherwise order by them.
 auto clear_reads(std::vector<Mop> &mops) -> void {
   for (auto &m : mops) {
-    if (m.kind != Mop::Kind::Read) continue;
+    if (m.kind != Mop::Kind::Read && m.kind != Mop::Kind::Get &&
+        m.kind != Mop::Kind::Guard)
+      continue;
     m.read.reset();
     m.pairs.clear();
     m.read_done = false;
+    m.observed.reset();
   }
+}
+
+auto is_presence_txn(const std::vector<Mop> &mops) -> bool {
+  return !mops.empty() && (mops.front().kind == Mop::Kind::Guard ||
+                           mops.front().kind == Mop::Kind::Get);
+}
+
+// Runs a presence transaction (#676) and records what its outcome says the
+// key was. A plan that rests on its guard alone appends nothing, so its answer
+// rests on the head entry its guard read; with sync = false it does not drive
+// the flush that publishes that entry, which is the path of #672.
+auto apply_presence_txn(bytecask::DB &db, std::vector<Mop> &mops,
+                        bytecask::WriteOptions wo) -> TxnOutcome {
+  auto &first = mops.front();
+  const auto kb = range_key_bytes(first.key);
+  if (first.kind == Mop::Kind::Get) {
+    bytecask::Bytes buf;
+    if (db.get({}, as_view(kb), buf))
+      first.pairs = {{first.key, as_string(buf)}};
+    first.read_done = true;
+    return {};
+  }
+  std::optional<bytecask::CommitResult> r;
+  if (first.api_del) {
+    r = db.del(wo, as_view(kb));
+  } else {
+    bytecask::WritePlan plan;
+    if (first.want_present) {
+      plan.ensure_present(as_view(kb));
+    } else {
+      plan.ensure_absent(as_view(kb));
+    }
+    for (const auto &m : mops) {
+      if (m.kind == Mop::Kind::Put) {
+        const auto v = write_value(m.write_id);
+        plan.put(as_view(kb), as_view(v));
+      } else if (m.kind == Mop::Kind::Del) {
+        plan.del(as_view(kb));
+      }
+    }
+    r = db.apply_batch(wo, std::move(plan));
+  }
+  first.observed = r ? first.want_present : !first.want_present;
+  if (!r) return {.type = EventType::Fail, .sequence = 0, .error = {}, .durable = false};
+  return {.type = EventType::Ok,
+          .sequence = r->sequence,
+          .error = {},
+          .durable = r->durable};
 }
 
 // Runs mops as one transaction. Fills each read mop's result. Keys the
@@ -883,9 +1006,14 @@ auto run_one(bytecask::DB &db, Mode mode, Workload workload, Placement at,
   inv.life = at.life;
   inv.role = at.role;
   inv.wait_seq = at.wait_seq;
+  // The presence configuration's guarded transactions are the guarded
+  // configuration's; its presence transactions run apart.
+  const auto presence = is_presence_txn(mops);
+  if (mode == Mode::Presence) mode = Mode::Guarded;
   // A range transaction's scan and delete decide its plan, so it is read
-  // before the invoke is recorded: what the history names is what it ran.
-  auto snap = workload == Workload::Range
+  // before the invoke is recorded: what the history names is what it ran. A
+  // presence transaction reads after the invoke, so its window holds its read.
+  auto snap = workload == Workload::Range && !presence
                   ? plan_range_txn(db, mode, mops)
                   : std::optional<bytecask::Snapshot>{};
   inv.value = mops;
@@ -894,6 +1022,7 @@ auto run_one(bytecask::DB &db, Mode mode, Workload workload, Placement at,
   TxnOutcome outcome;
   try {
     const auto run = [&] {
+      if (presence) return apply_presence_txn(db, mops, wo);
       return workload == Workload::Range
                  ? apply_range_txn(db, mode, mops, std::move(snap), wo)
                  : execute_txn(db, mode, workload, mops, wo);
@@ -923,9 +1052,12 @@ auto run_one(bytecask::DB &db, Mode mode, Workload workload, Placement at,
   // A transaction reports the plan it ran: the range workload's executor
   // settles each delete's key before appending, so mops, not inv.value, names
   // what it really tried. Only an :ok carries read results; a failed or
-  // indeterminate one reports the same plan with no read result.
+  // indeterminate one reports the same plan with no read result. A presence
+  // transaction's nullopt is an answer: its guard keeps what it observed.
   done.value = std::move(mops);
-  if (outcome.type != EventType::Ok) clear_reads(done.value);
+  if (outcome.type == EventType::Info ||
+      (outcome.type == EventType::Fail && !presence))
+    clear_reads(done.value);
   done.sequence = outcome.sequence;
   done.error = std::move(outcome.error);
   rec.stamp(done);
@@ -1681,6 +1813,10 @@ auto append_mops(std::string &line, const std::vector<Mop> &mops,
     case Mop::Kind::RangeDel:
       line += std::format(" D {} {}", m.key, m.to);
       break;
+    case Mop::Kind::Guard:
+    case Mop::Kind::Get:
+      // The presence configuration runs in-process only (parse_args).
+      throw std::logic_error{"presence mops have no kill wire format"};
     case Mop::Kind::Read:
       if (with_reads && m.read) {
         line += std::format(" R {} {} {}", m.key, m.to, m.read->size());
@@ -2479,6 +2615,7 @@ auto parse_mode(std::string_view s) -> Mode {
   if (s == "guarded") return Mode::Guarded;
   if (s == "unguarded") return Mode::Unguarded;
   if (s == "blind") return Mode::Blind;
+  if (s == "presence") return Mode::Presence;
   throw std::runtime_error{std::format("unknown --config {}", s)};
 }
 
@@ -2564,7 +2701,13 @@ auto parse_args(int argc, char **argv) -> RunOptions {
   // list-shaped.
   if (o.workload == Workload::Range && (o.mode == Mode::Blind || o.followers > 0))
     throw std::runtime_error{
-        "--workload range runs guarded or unguarded, on one node"};
+        "--workload range runs guarded, unguarded or presence, on one node"};
+  // Kill and chaos lives of the presence configuration: a follow-up (#676).
+  if (o.mode == Mode::Presence &&
+      (o.workload != Workload::Range || o.kill_epochs > 0 || o.kill_child ||
+       o.chaos_child || !o.absorb.empty()))
+    throw std::runtime_error{
+        "--config presence runs the range workload, in-process"};
   return o;
 }
 
@@ -2572,6 +2715,9 @@ auto run(const RunOptions &o) -> int {
   auto cfg = config_for(o.seed);
   if (o.no_vacuum) cfg.vacuum = false;
   if (o.force_vacuum) cfg.vacuum = true;
+  // The presence configuration is for plans whose answer rests on a write
+  // whose flush fails, so it always runs the degrade nemesis.
+  if (o.mode == Mode::Presence) cfg.degrade = true;
   if (o.no_degrade || o.topology) cfg.degrade = false;
 
   std::printf("isolation_history: config=%s workload=%s seed=%llu threads=%d "
@@ -2658,6 +2804,16 @@ auto run(const RunOptions &o) -> int {
     }};
   }
 
+  // Presence: hold the failing flush between recording its error and
+  // publishing the degrade, as a descheduled flush thread would. Writers that
+  // pass admission meanwhile append behind the failed write, and a plan that
+  // appends nothing can answer from their entries (#672). Set before any
+  // thread starts and cleared once they stop.
+  if (o.mode == Mode::Presence && cfg.degrade)
+    node(0).holder->db.test_before_degrade_publish_ = [] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    };
+
   // The degrade nemesis is its own Elle process: its transactions are real
   // appends, and the one whose fdatasync fails is :info, since resume() may
   // replay it. The leader never moves while it runs (no --topology).
@@ -2668,13 +2824,14 @@ auto run(const RunOptions &o) -> int {
       std::mt19937_64 nrng{o.seed + 2};
       auto &events = buffers[static_cast<std::size_t>(process)];
       auto &db = node(0).holder->db;
+      const auto presence = o.mode == Mode::Presence;
       // One generator for the thread's whole run: a value names its write,
       // and a fresh generator per degrade cycle would number them again.
       RangeGenerator ranges{static_cast<std::uint64_t>(process)};
       std::int64_t next_element = block_base(process);
       while (!stop.load(std::memory_order_relaxed)) {
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(20 + nrng() % 180));
+        std::this_thread::sleep_for(std::chrono::milliseconds(
+            presence ? 1 + nrng() % 20 : 20 + nrng() % 180));
         if (stop.load(std::memory_order_relaxed)) break;
         // Retry until this thread holds the flush role for its own write.
         for (int attempt = 0; attempt < 50 && !db.is_degraded(); ++attempt) {
@@ -2869,8 +3026,12 @@ auto run(const RunOptions &o) -> int {
               std::this_thread::sleep_for(std::chrono::microseconds(200));
               continue;
             }
-            const auto sync =
-                static_cast<int>(crng() % 100) < cfg.sync_percent;
+            auto sync = static_cast<int>(crng() % 100) < cfg.sync_percent;
+            // Presence: half the transactions are snapshot-less, with
+            // sync = false so a guard-only plan does not drive its own flush.
+            const auto presence =
+                o.mode == Mode::Presence && crng() % 2 == 0;
+            if (presence) sync = false;
             store_max(last_acked,
                       run_one(ln.holder->db, o.mode, o.workload,
                               {.process = p, .node = v.leader,
@@ -2878,8 +3039,9 @@ auto run(const RunOptions &o) -> int {
                                .life = ln.life.load(std::memory_order_acquire),
                                .role = Role::Leader, .wait_seq = 0},
                               rec, events,
-                              make_txns(o.workload, crng, keys, ranges,
-                                        next_element),
+                              presence ? ranges.presence(crng)
+                                       : make_txns(o.workload, crng, keys,
+                                                   ranges, next_element),
                               {.sync = sync}, false, totals));
             break;
           }
@@ -2891,6 +3053,7 @@ auto run(const RunOptions &o) -> int {
   if (orchestrator.joinable()) orchestrator.join();
   if (nemesis_thread.joinable()) nemesis_thread.join();
   if (vacuum_thread.joinable()) vacuum_thread.join();
+  node(0).holder->db.test_before_degrade_publish_ = nullptr;
   const auto final_leader = view.get().leader;
   auto &leader_db = node(final_leader).holder->db;
   if (leader_db.is_degraded()) leader_db.resume();

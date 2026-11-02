@@ -26,6 +26,8 @@
 // Standard library headers before the module imports, for the reason
 // bytecaskdb/bytecask_hpp.cpp gives (LLVM 22's abi_tag redeclaration error).
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <compare>
@@ -685,11 +687,11 @@ struct HashIter {
 };
 
 // What an aggregate's slot accumulates, fixed by its first fold.
-enum class SlotKind : std::uint8_t { None, SumI64, SumF64, MinI64, MaxI64, Count };
+enum class SlotKind : std::uint8_t { None, SumI64, SumF64, MinI64, MaxI64, MinF64, MaxF64, Count };
 
 struct Slot {
   std::int64_t i{0};  // a sum, a minimum or maximum, or a count
-  double f{0};        // a double sum
+  double f{0};        // a double sum, minimum or maximum
   bool set{false};    // a value was folded in
 };
 
@@ -1006,6 +1008,15 @@ struct bc_ctx {
     std::uint32_t object{0};
     std::vector<std::size_t> at;
   } key_parts;
+  // The same for a sort key's parts (bc_sort_key_part_*): the key carries no
+  // layout, so each part's type is learned as it is read, in order. `type[i]`
+  // is part i's, nullopt for a NULL; `at[i]` is where it starts, and `at`
+  // holds one more, where the next unread part does.
+  struct {
+    bc_view view{};
+    std::vector<std::size_t> at;
+    std::vector<std::optional<PhysType>> type;
+  } sort_parts;
   std::map<Bytes, Bytes, BytesLess> deleted_ranges;  // lo -> hi of each bc_del_range, likewise; disjoint
 
   Verified verified;                 // this context's reference, rebuilt by every run
@@ -1016,13 +1027,42 @@ struct bc_ctx {
   // preceded by its u32 length.
   Bytes results;
   std::size_t result_pos{0};
+  // bc_ctx_window: the result rows a run drops from its front and keeps
+  // after them. `emitted` counts the rows a top-level bc_emit_end ended,
+  // dropped ones included; `kept` those encoded into `results`.
+  bool windowed{false};
+  bool unwinding{false};  // the plan is running out after its last kept row
+  bool stopped{false};    // bc_ctx_run ended that way
+  std::uint64_t window_skip{0}, window_limit{0};
+  std::uint64_t emitted{0}, kept{0};
   std::optional<RowWriter> emit;
   std::uint32_t emit_col{0};
   std::int64_t affected{-1};
 
+  // A subquery's rows while it runs, bc_sub_begin to bc_sub_end: folded
+  // here, never a result row. Then what the subqueries left until reset:
+  // the parameters they set, by index, over the caller's NULLs, and each
+  // BC_SUB_SET's values, encoded by sub_key.
+  struct Sub {
+    std::uint32_t id{0};
+    std::int32_t kind{BC_SUB_VALUE};
+    PhysType type{PhysType::I64};
+    std::uint32_t param{0};
+    RowLayout layout;
+    std::int64_t rows{0};
+    bool saw_null{false};
+    Datum value;                   // BC_SUB_VALUE: its row's
+    std::optional<Datum> lo, hi;   // BC_SUB_BOUNDS: the non-NULL extremes
+  };
+  std::optional<Sub> sub;
+  std::vector<std::optional<Datum>> sub_params;  // sized once, so a parameter's address is stable
+  std::map<std::uint32_t, std::set<Bytes, BytesLess>> sub_sets;
+
   bc_ctx(bytecask::DB* d, LiveCatalog* l) : db{d}, live{l} {}
 
-  auto ok() const -> bool { return error == BC_OK; }
+  // A run that reached its window's end is unwound as a failed one is: every
+  // call after the stop returns a neutral value. It is not an error.
+  auto ok() const -> bool { return error == BC_OK && !unwinding; }
 
   [[nodiscard]] auto sink() -> ErrorSink { return {error, detail, message}; }
 
@@ -1192,6 +1232,7 @@ struct bc_ctx {
   auto remake_view(bc_view& v, BytesView b, std::uint32_t table, RowKind kind) -> bc_view {
     if (find_view(v) == nullptr) return v = make_view(b.data(), b.size(), kNoCursor, 0, table, kind);
     if (key_parts.view.i == v.i && key_parts.view.g == v.g) key_parts.view = {};
+    if (sort_parts.view.i == v.i && sort_parts.view.g == v.g) sort_parts.view = {};
     auto gen = next_gen();
     views[v.i] = ViewEntry{b.data(), 0, gen, static_cast<std::uint32_t>(b.size()), kNoCursor, table, kind};
     v.g = gen;
@@ -1268,6 +1309,7 @@ struct bc_ctx {
       fail(BC_E_HANDLE, "parameter index out of range");
       return nullptr;
     }
+    if (i < sub_params.size() && sub_params[i]) return &*sub_params[i];  // a subquery's
     return &params->values[i];
   }
 
@@ -1391,6 +1433,7 @@ struct bc_ctx {
   void roll_back(const Mark& m) noexcept {
     auto released = arena.roll_back(m.arena) + (views.size() - m.views) * kViewEntryBytes;
     if ((key_parts.view.i & kPinnedView) == 0 && key_parts.view.i >= m.views) key_parts.view = {};
+    if ((sort_parts.view.i & kPinnedView) == 0 && sort_parts.view.i >= m.views) sort_parts.view = {};
     views.erase(views.begin() + static_cast<std::ptrdiff_t>(m.views), views.end());
     for (auto i = m.keys; i < keys.size(); ++i) released += keys[i].held + kKeyEntryBytes;
     keys.erase(keys.begin() + static_cast<std::ptrdiff_t>(m.keys), keys.end());
@@ -1462,11 +1505,21 @@ struct bc_ctx {
     key_slots.clear();
     key_parts.view = {};  // its view's slot is released
     key_parts.at.clear();
+    sort_parts.view = {};
+    sort_parts.at.clear();
+    sort_parts.type.clear();
     results.clear();
     result_pos = 0;
+    windowed = false;
+    unwinding = false;
+    stopped = false;
+    window_skip = window_limit = emitted = kept = 0;
     emit.reset();
     emit_col = 0;
     affected = -1;
+    sub.reset();
+    sub_params.clear();
+    sub_sets.clear();
     arena.clear(true);  // one chunk kept for the next statement
     pins.clear(false);
     mem_used = 0;
@@ -1490,8 +1543,16 @@ struct bc_txn {
   std::shared_ptr<const Catalog> pinned;
   std::optional<bytecask::Snapshot> snap;  // engaged from the first statement to the commit
   // The writes: the commit is built from the overlay, its ranges first,
-  // since every point in it is newer than any range over it.
-  Overlay overlay;
+  // since every point in it is newer than any range over it. Shared with the
+  // cursors that pinned it (bc_txn_overlay_pin) and copy-on-write: a
+  // statement's writes go through own_overlay(), which clones it first if a
+  // cursor holds it, so a pinned overlay never changes.
+  std::shared_ptr<Overlay> overlay{std::make_shared<Overlay>()};
+  // What the pins (bc_overlay) hold back: each reserves the overlay's bound
+  // as of its pin, counted by txn_holds so the write that follows a clone
+  // cannot pass max_bytes for the copy a cursor keeps.
+  std::uint64_t pinned_bytes{0};
+  std::uint64_t pins{0};  // bc_overlay handles live
   std::vector<Effect> guards;          // the statements' guards, in their order
   std::vector<Claim> claims;           // the statements' insert claims, in their order
   std::vector<Lock> locks;             // the statements' rows locked or written, in their order
@@ -1533,6 +1594,31 @@ struct bc_txn {
   void release_memory() noexcept {
     if (reserved != 0) memory->used.fetch_sub(std::exchange(reserved, 0), std::memory_order_relaxed);
   }
+
+  // The overlay to write to: cloned first when a pin shares it. A throw
+  // leaves the transaction's overlay and the pin's as they were.
+  auto own_overlay() -> Overlay& {
+    if (overlay.use_count() > 1) overlay = std::make_shared<Overlay>(*overlay);
+    return *overlay;
+  }
+};
+
+// A transaction's overlay as it stood when pinned: what a cursor reads
+// through (docs/cursor_design.md, *What a cursor sees*). Released before its
+// transaction is freed.
+struct bc_overlay {
+  std::shared_ptr<const Overlay> view;
+  bc_txn* owner;
+  std::uint64_t reserved;
+};
+
+// What a cursor that outlives its transaction reads: its own handle on the
+// snapshot (a clone, so the transaction's commit may move the original into
+// its WritePlan), the catalog version and the overlay as they were pinned.
+struct bc_hold {
+  bytecask::Snapshot snap;
+  std::shared_ptr<const Catalog> pinned;
+  std::shared_ptr<const Overlay> view;
 };
 
 namespace {
@@ -1549,7 +1635,7 @@ namespace {
 // merging an effect into the overlay adds at most one node, and one that
 // replaces or erases others only frees. So the commit needs nothing its
 // statements were not held to.
-auto txn_holds(const bc_txn& t) -> std::uint64_t { return t.overlay.bytes + t.held; }
+auto txn_holds(const bc_txn& t) -> std::uint64_t { return t.overlay->bytes + t.held + t.pinned_bytes; }
 
 }  // namespace
 
@@ -1583,7 +1669,7 @@ void txn_abort(bc_txn* txn) noexcept {
   txn_drop_context(txn);
   txn->snap.reset();
   txn->pinned.reset();
-  txn->overlay = {};
+  txn->overlay = std::make_shared<Overlay>();  // a pin keeps the one it holds
   txn->guards = {};
   txn->claims = {};
   txn->locks = {};
@@ -2020,6 +2106,87 @@ auto decoded(bc_ctx* cx, const KeyReader& r, std::optional<T> v, T neutral) -> T
   if (v) return *v;
   if (!r.ok()) cx->fail(BC_E_CORRUPT, "unparseable key");
   return neutral;
+}
+
+// What bc_sort_key_part_* found at a part: nullopt if the key is unusable (a
+// failure is set), else whether the part is a NULL, and the reader positioned
+// on its value when it is not. `want` is the type the caller reads, nullopt
+// for bc_sort_key_part_null, which can tell a NULL from a value but not read
+// one, and so leaves a value's end unknown until a typed read of it.
+struct SortPartAt {
+  bool null;
+  bool known;  // the part's end is known: a NULL, or a value already read
+  std::optional<KeyReader> reader;
+};
+
+constexpr std::byte kSortMarkerPresent{0x01};
+
+auto sort_part_at(bc_ctx* cx, bc_view key, std::uint32_t part, std::optional<PhysType> want)
+    -> std::optional<SortPartAt> {
+  auto k = cx->resolve(key);
+  if (!k) return std::nullopt;
+  auto& sp = cx->sort_parts;
+  if (sp.view.i != key.i || sp.view.g != key.g) {
+    sp.view = key;
+    sp.at.assign(1, 0);
+    sp.type.clear();
+  }
+  if (part > sp.type.size()) {
+    cx->fail(BC_E_HANDLE, "sort key parts are read in order: part " + std::to_string(sp.type.size()) + " first");
+    return std::nullopt;
+  }
+  if (part < sp.type.size()) {
+    if (!sp.type[part]) return SortPartAt{true, true, std::nullopt};
+    if (want && *want != *sp.type[part]) {
+      cx->fail(BC_E_HANDLE, "sort key part of the wrong type");
+      return std::nullopt;
+    }
+    return SortPartAt{false, true, want ? std::optional{KeyReader{*k, sp.at[part] + 1}} : std::nullopt};
+  }
+  auto at = sp.at[part];
+  if (at >= k->size()) {
+    cx->fail(BC_E_CORRUPT, "unparseable sort key");
+    return std::nullopt;
+  }
+  if ((*k)[at] != kSortMarkerPresent) {
+    // 0x00 and 0x02 are a NULL first and last; anything else is no marker.
+    if ((*k)[at] != std::byte{0x00} && (*k)[at] != std::byte{0x02}) {
+      cx->fail(BC_E_CORRUPT, "unparseable sort key");
+      return std::nullopt;
+    }
+    sp.type.push_back(std::nullopt);
+    sp.at.push_back(at + 1);
+    return SortPartAt{true, true, std::nullopt};
+  }
+  if (!want) return SortPartAt{false, false, std::nullopt};
+  return SortPartAt{false, false, KeyReader{*k, at + 1}};
+}
+
+// Records the type and end of part `part`, which a typed read of it just
+// found; false, with BC_E_CORRUPT set, if the key did not parse there.
+auto sort_part_read(bc_ctx* cx, const SortPartAt& at, PhysType type, bool ok) -> bool {
+  if (!ok) {
+    cx->fail(BC_E_CORRUPT, "unparseable sort key");
+    return false;
+  }
+  auto& sp = cx->sort_parts;
+  if (!at.known) {
+    sp.type.push_back(type);
+    sp.at.push_back(at.reader->pos());
+  }
+  return true;
+}
+
+// A typed read of sort key part `part`: the value, or the neutral one for a
+// NULL part. `read` takes the reader and returns the optional value.
+template <typename T, typename Read>
+T sort_part_value(bc_ctx* cx, bc_view key, std::uint32_t part, PhysType type, T neutral, Read read) {
+  auto at = sort_part_at(cx, key, part, type);
+  if (!at) return neutral;
+  if (at->null) return neutral;
+  auto v = read(*at->reader);
+  if (!sort_part_read(cx, *at, type, v.has_value())) return neutral;
+  return std::move(*v);
 }
 
 auto add_effect(bc_ctx* cx, EffectKind kind, bc_view a, bc_view b) -> void {
@@ -2634,7 +2801,7 @@ void bc_ctx_begin_txn(bc_ctx* cx, bc_txn* txn, const bc_params* params, bc_budge
   cx->pinned = txn->pinned;
   cx->cat = cx->pinned.get();
   cx->base = &*txn->snap;
-  cx->overlay = &txn->overlay;
+  cx->overlay = txn->overlay.get();
   BC_GUARD_END(cx)
 }
 
@@ -2655,7 +2822,11 @@ void bc_ctx_run(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* checked_agains
   BC_GUARD_BEGIN
   cx->affected = -1;  // the count is the run's: a failed run reports none
   if (!bc_ctx_check(cx, checked_against)) return;
+  // limit 0 wants no row: the plan, verified, reads nothing.
+  cx->unwinding = cx->windowed && cx->window_limit == 0;
   plan(cx);
+  cx->stopped = cx->unwinding;
+  cx->unwinding = false;
   if (cx->ok() && cx->emit) cx->fail(BC_L_PLAN, "result row begun and not ended");
   BC_GUARD_END(cx)
 }
@@ -2726,6 +2897,22 @@ bool bc_ctx_next_result(bc_ctx* cx, const uint8_t** row, uint32_t* len) {
 
 void bc_ctx_reset(bc_ctx* cx) { cx->drop_execution_state(); }
 
+void bc_ctx_window(bc_ctx* cx, uint64_t skip, uint64_t limit) {
+  BC_GUARD_BEGIN
+  if (cx->base == nullptr || cx->emitted != 0 || cx->windowed) {
+    cx->fail(BC_E_HANDLE, "bc_ctx_window needs a begun context that has run nothing, once");
+    return;
+  }
+  cx->windowed = true;
+  cx->window_skip = skip;
+  cx->window_limit = limit;
+  BC_GUARD_END(cx)
+}
+
+uint64_t bc_ctx_emitted(const bc_ctx* cx) { return cx->emitted; }
+
+bool bc_ctx_stopped(const bc_ctx* cx) { return cx->stopped; }
+
 enum bc_error_code bc_error(const bc_ctx* cx) { return cx->error; }
 
 const char* bc_error_message(const bc_ctx* cx) { return cx->message.c_str(); }
@@ -2765,10 +2952,91 @@ void bc_txn_free(bc_txn* txn) {
 uint64_t bc_txn_catalog_version(const bc_txn* txn) { return txn->pinned ? txn->pinned->version() : 0; }
 
 bool bc_txn_repin(bc_txn* txn) {
-  if (txn->statements != 0 || txn->aborted || txn->done || txn->attached != nullptr) return false;
+  // A pin reads the snapshot: moving it would change what the cursor sees.
+  if (txn->statements != 0 || txn->pins != 0 || txn->aborted || txn->done || txn->attached != nullptr) return false;
   txn->snap.reset();
   txn->pinned.reset();
   return true;
+}
+
+bc_overlay* bc_txn_overlay_pin(bc_txn* txn) {
+  BC_GUARD_BEGIN
+  txn->sink().clear();
+  if (txn->aborted || txn->done) {
+    txn->sink().fail(BC_E_HANDLE, txn->done ? "the transaction has ended" : "the transaction is aborted");
+    return nullptr;
+  }
+  if (txn->attached != nullptr) {
+    txn->sink().fail(BC_E_HANDLE, "a statement of this transaction is still open on a context: reset it first");
+    return nullptr;
+  }
+  // The snapshot and catalog are the transaction's from here, as a first
+  // statement would pin them.
+  if (!txn->snap) {
+    auto p = txn->live->pin();
+    txn->pinned = std::move(p.cat);
+    txn->snap.emplace(std::move(p.snap));
+  }
+  const auto reserve = txn->overlay->bytes;
+  if (txn_holds(*txn) + reserve > txn->max_bytes) {
+    txn->sink().fail(BC_E_LIMIT, "a cursor's copy of the transaction's writes would pass its bound of " +
+                                     std::to_string(txn->max_bytes) + " bytes");
+    txn_abort(txn);
+    return nullptr;
+  }
+  auto pin = std::make_unique<bc_overlay>(bc_overlay{txn->overlay, txn, reserve});
+  txn->pinned_bytes += reserve;
+  ++txn->pins;
+  return pin.release();
+  BC_GUARD_END(txn)
+  if (txn != nullptr) txn_abort(txn);
+  return nullptr;
+}
+
+bc_hold* bc_txn_hold(bc_txn* txn, const bc_overlay* pin) {
+  BC_GUARD_BEGIN
+  txn->sink().clear();
+  // The pin made the snapshot and catalog the transaction's.
+  if (txn->aborted || txn->done || !txn->snap || !txn->pinned || pin == nullptr || pin->owner != txn) {
+    txn->sink().fail(BC_E_HANDLE, "bc_txn_hold needs a live transaction and an overlay pinned from it");
+    return nullptr;
+  }
+  return new bc_hold{txn->snap->clone(), txn->pinned, pin->view};
+  BC_GUARD_END(txn)
+  if (txn != nullptr) txn_abort(txn);
+  return nullptr;
+}
+
+void bc_txn_hold_free(bc_hold* hold) { delete hold; }
+
+void bc_ctx_begin_hold(bc_ctx* cx, const bc_hold* hold, const bc_params* params, bc_budget budget) {
+  BC_GUARD_BEGIN
+  cx->drop_execution_state();
+  cx->sink().clear();
+  cx->params = params;
+  cx->budget = budget;
+  cx->pinned = hold->pinned;
+  cx->cat = cx->pinned.get();
+  cx->base = &hold->snap;
+  cx->overlay = hold->view.get();
+  BC_GUARD_END(cx)
+}
+
+void bc_txn_overlay_release(bc_overlay* pin) {
+  if (pin == nullptr) return;
+  pin->owner->pinned_bytes -= pin->reserved;
+  --pin->owner->pins;
+  delete pin;
+}
+
+void bc_ctx_use_overlay(bc_ctx* cx, const bc_overlay* pin) {
+  BC_GUARD_BEGIN
+  if (cx->txn == nullptr || pin->owner != cx->txn || !cx->ok()) {
+    cx->fail(BC_E_HANDLE, "bc_ctx_use_overlay needs a context begun on the transaction the overlay was pinned from");
+    return;
+  }
+  cx->overlay = pin->view.get();
+  BC_GUARD_END(cx)
 }
 
 namespace {
@@ -2808,11 +3076,15 @@ bool bc_txn_add(bc_ctx* cx) {
       txn->held += table_bytes(id);
     }
   }
+  auto writes = std::ranges::any_of(cx->effects, [](const Effect& e) {
+    return e.kind == EffectKind::Put || e.kind == EffectKind::Del || e.kind == EffectKind::DelRange;
+  });
+  if (writes) (void)txn->own_overlay();  // before the first write: a clone that fails changes nothing
   for (auto& e : cx->effects) {
     switch (e.kind) {
-      case EffectKind::Put: txn->overlay.put(std::move(e.a), std::move(e.b)); break;
-      case EffectKind::Del: txn->overlay.del(std::move(e.a)); break;
-      case EffectKind::DelRange: txn->overlay.del_range(std::move(e.a), std::move(e.b)); break;
+      case EffectKind::Put: txn->overlay->put(std::move(e.a), std::move(e.b)); break;
+      case EffectKind::Del: txn->overlay->del(std::move(e.a)); break;
+      case EffectKind::DelRange: txn->overlay->del_range(std::move(e.a), std::move(e.b)); break;
       case EffectKind::GuardUnchanged:
       case EffectKind::GuardRange:
       case EffectKind::GuardUniqueRange:
@@ -2881,7 +3153,7 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
     return BC_FAILED;
   }
   txn->done = true;
-  const auto& ov = txn->overlay;
+  const auto& ov = *txn->overlay;
   // A transaction that neither writes nor guards commits nothing. One that
   // only guarded (SELECT … FOR UPDATE) is still checked: a guarded row a
   // concurrent commit changed is its conflict. The engine checks a
@@ -2927,7 +3199,7 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
   // since its snapshot, makes the commit a conflict.
   for (auto id : txn->written) plan.ensure_unchanged(bytecask::sql::table_record_key(id));
   auto r = submit(out, *txn->db, std::move(plan), sync);
-  return r == BC_CONFLICT ? conflict_or_duplicate(out, *txn->db, txn->claims, txn->locks, &txn->overlay) : r;
+  return r == BC_CONFLICT ? conflict_or_duplicate(out, *txn->db, txn->claims, txn->locks, txn->overlay.get()) : r;
   BC_GUARD_END(txn)
   return BC_FAILED;  // the guard caught a throw: never BC_COMMITTED
 }
@@ -3004,8 +3276,8 @@ void bc_emit_begin(bc_ctx* cx) {
     return;
   }
   // A SELECT may declare no result types (SELECT FROM t); a plan that writes
-  // tables and declares none returns no rows.
-  if (cx->verified.result_types.empty() && !cx->verified.written.empty()) {
+  // tables and declares none returns no rows, but for its subqueries'.
+  if (!cx->sub && cx->verified.result_types.empty() && !cx->verified.written.empty()) {
     cx->fail(BC_L_PLAN, "a plan that writes declares no result types, so it returns no rows");
     return;
   }
@@ -3013,7 +3285,7 @@ void bc_emit_begin(bc_ctx* cx) {
     cx->fail(BC_L_PLAN, "result row already begun");
     return;
   }
-  cx->emit.emplace(*cx->verified.result_layout);
+  cx->emit.emplace(cx->sub ? cx->sub->layout : *cx->verified.result_layout);
   cx->emit_col = 0;
   BC_GUARD_END(cx)
 }
@@ -3024,6 +3296,14 @@ namespace {
 // The next result column, which must be of `type` (any, when nullopt).
 auto emit_slot(bc_ctx* cx, std::optional<PhysType> type) -> bool {
   if (!cx->ok()) return false;
+  if (cx->sub) {  // a subquery's row: one column of its type, or EXISTS's of any, not kept
+    if (cx->emit && cx->sub->kind == BC_SUB_EXISTS) return false;
+    if (!cx->emit || cx->emit_col >= 1 || (type && cx->sub->type != *type)) {
+      cx->fail(BC_L_PLAN, "emitted column does not match the subquery's type");
+      return false;
+    }
+    return true;
+  }
   if (!cx->emit || cx->emit_col >= cx->verified.result_types.size() ||
       (type && cx->verified.result_types[cx->emit_col] != *type)) {
     cx->fail(BC_L_PLAN, "emitted column does not match the result layout");
@@ -3056,6 +3336,199 @@ void emit_decoded(bc_ctx* cx, const std::optional<T>& v, bool corrupt, bool has_
 }
 }  // namespace
 }  // extern "C++"
+
+// ---------------------------------------------------------------- subqueries
+
+extern "C++" {
+namespace {
+// A BC_SUB_SET's value as its set holds it: the value's word or bytes, a
+// DOUBLE's -0.0 as 0.0 and every NaN as one, as PostgreSQL's = compares them.
+auto sub_key(const Datum& v) -> Bytes {
+  auto word = [](std::uint64_t w) {
+    Bytes out(8);
+    std::memcpy(out.data(), &w, 8);
+    return out;
+  };
+  if (const auto* i = std::get_if<std::int64_t>(&v)) return word(std::bit_cast<std::uint64_t>(*i));
+  if (const auto* d = std::get_if<double>(&v)) {
+    auto x = std::isnan(*d) ? std::numeric_limits<double>::quiet_NaN() : (*d == 0.0 ? 0.0 : *d);
+    return word(std::bit_cast<std::uint64_t>(x));
+  }
+  if (const auto* b = std::get_if<bool>(&v)) return Bytes{std::byte{*b ? std::uint8_t{1} : std::uint8_t{0}}};
+  return std::get<Bytes>(v);
+}
+
+// a < b, both non-NULL values of one type, in PostgreSQL's order: bytes
+// bytewise, as the layer's strings compare, and NaN above every DOUBLE.
+auto sub_less(const Datum& a, const Datum& b) -> bool {
+  if (const auto* x = std::get_if<double>(&a)) {
+    auto y = std::get<double>(b);
+    return !std::isnan(*x) && (std::isnan(y) || *x < y);
+  }
+  if (const auto* x = std::get_if<Bytes>(&a)) return std::ranges::lexicographical_compare(*x, std::get<Bytes>(b));
+  return a < b;  // int64 or bool, one alternative
+}
+
+// The row a subquery emitted, folded as its kind says.
+void end_sub_row(bc_ctx* cx) {
+  auto& s = *cx->sub;
+  if (cx->emit && s.kind == BC_SUB_EXISTS) {
+    cx->emit.reset();
+    ++s.rows;
+    return;
+  }
+  if (!cx->emit || cx->emit_col != 1) {
+    cx->fail(BC_L_PLAN, "a subquery's row ended with the wrong number of columns");
+    return;
+  }
+  Bytes row;
+  if (!cx->emit->finish(row)) {
+    cx->fail(BC_E_LIMIT, "subquery row over the row format's limit");
+    return;
+  }
+  cx->emit.reset();
+  auto r = bytecask::sql::row_column(row, s.layout.columns[0]);
+  Datum v;
+  if (r.state == bytecask::sql::ColumnState::Malformed) {
+    cx->fail(BC_E_CORRUPT, "a subquery's row does not parse");
+    return;
+  }
+  if (r.state == bytecask::sql::ColumnState::Value) {
+    switch (s.type) {
+      case PhysType::I64: v = r.i64(); break;
+      case PhysType::F64: v = r.f64(); break;
+      case PhysType::Bool: v = r.boolean(); break;
+      case PhysType::Bytes: v = Bytes(r.bytes.begin(), r.bytes.end()); break;
+    }
+  }
+  ++s.rows;
+  auto null = std::holds_alternative<std::monostate>(v);
+  switch (s.kind) {
+    case BC_SUB_VALUE:
+      if (s.rows > 1) {
+        cx->fail(BC_E_CARDINALITY, "more than one row returned by a subquery used as an expression");
+        return;
+      }
+      s.value = std::move(v);
+      return;
+    case BC_SUB_EXISTS: return;
+    case BC_SUB_BOUNDS:
+      if (null) {
+        s.saw_null = true;
+        return;
+      }
+      if (!s.lo || sub_less(v, *s.lo)) s.lo = v;
+      if (!s.hi || sub_less(*s.hi, v)) s.hi = std::move(v);
+      return;
+    case BC_SUB_SET: {
+      if (null) {
+        s.saw_null = true;
+        return;
+      }
+      auto& set = cx->sub_sets[s.id];
+      auto k = sub_key(v);
+      if (set.contains(k) || !cx->take(k.size() + kHashEntryBytes)) return;
+      set.insert(std::move(k));
+      return;
+    }
+    default: cx->fail(BC_L_PLAN, "unknown subquery kind");
+  }
+}
+
+// How many parameters a kind sets.
+auto sub_params_of(std::int32_t kind) -> std::uint32_t {
+  return kind == BC_SUB_BOUNDS ? 4 : kind == BC_SUB_SET ? 2 : 1;
+}
+
+auto sub_has(bc_ctx* cx, std::uint32_t sub, const Datum& v) -> bool {
+  if (!cx->ok()) return false;
+  auto it = cx->sub_sets.find(sub);
+  if (it == cx->sub_sets.end()) {
+    // A set of no values is never put: one not run is a plan bug, as
+    // bc_sub_begin records each id it ran.
+    cx->fail(BC_E_HANDLE, "no BC_SUB_SET subquery " + std::to_string(sub) + " has run");
+    return false;
+  }
+  return it->second.contains(sub_key(v));
+}
+}  // namespace
+}  // extern "C++"
+
+void bc_sub_begin(bc_ctx* cx, uint32_t sub, int32_t kind, int32_t type, uint32_t param) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return;
+  auto t = type > 0 && type < 256 ? phys_type(static_cast<std::uint8_t>(type)) : std::nullopt;
+  if (cx->sub || cx->emit || !t || kind < BC_SUB_VALUE || kind > BC_SUB_SET || cx->params == nullptr ||
+      std::uint64_t{param} + sub_params_of(kind) > cx->params->values.size() || cx->sub_sets.contains(sub)) {
+    cx->fail(BC_E_HANDLE, "bc_sub_begin: a subquery running, a row begun, an unknown kind or type, its "
+                          "parameters past the given ones, or its id run before");
+    return;
+  }
+  std::array<PhysType, 1> types{*t};
+  cx->sub.emplace(bc_ctx::Sub{sub, kind, *t, param, bytecask::sql::make_result_layout(types)});
+  if (kind == BC_SUB_SET) cx->sub_sets[sub];  // run, so bc_sub_has_* knows it
+  BC_GUARD_END(cx)
+}
+
+void bc_sub_end(bc_ctx* cx) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return;
+  if (!cx->sub || cx->emit) {
+    cx->fail(BC_E_HANDLE, "bc_sub_end: no subquery running, or a row begun");
+    return;
+  }
+  auto s = std::move(*cx->sub);
+  cx->sub.reset();
+  if (cx->sub_params.empty()) cx->sub_params.resize(cx->params->values.size());
+  auto set = [&](std::uint32_t i, Datum d) { cx->sub_params[s.param + i] = std::move(d); };
+  auto flag = [&] { return s.saw_null ? Datum{} : Datum{false}; };
+  switch (s.kind) {
+    case BC_SUB_VALUE: set(0, std::move(s.value)); break;
+    case BC_SUB_EXISTS: set(0, s.rows > 0); break;
+    case BC_SUB_BOUNDS:
+      set(0, s.hi ? std::move(*s.hi) : Datum{});
+      set(1, s.lo ? std::move(*s.lo) : Datum{});
+      set(2, flag());
+      set(3, s.rows > 0);
+      break;
+    case BC_SUB_SET:
+      set(0, flag());
+      set(1, s.rows > 0);
+      break;
+    default: break;
+  }
+  BC_GUARD_END(cx)
+}
+
+bool bc_sub_has_i64(bc_ctx* cx, uint32_t sub, int64_t v) {
+  BC_GUARD_BEGIN
+  return sub_has(cx, sub, Datum{v});
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bool bc_sub_has_f64(bc_ctx* cx, uint32_t sub, double v) {
+  BC_GUARD_BEGIN
+  return sub_has(cx, sub, Datum{v});
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bool bc_sub_has_bool(bc_ctx* cx, uint32_t sub, bool v) {
+  BC_GUARD_BEGIN
+  return sub_has(cx, sub, Datum{v});
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bool bc_sub_has_bytes(bc_ctx* cx, uint32_t sub, bc_view v) {
+  BC_GUARD_BEGIN
+  auto b = cx->resolve(v);
+  if (!b) return false;
+  return sub_has(cx, sub, Datum{Bytes(b->begin(), b->end())});
+  BC_GUARD_END(cx)
+  return {};
+}
 
 void bc_emit_i64(bc_ctx* cx, int64_t v) {
   BC_GUARD_BEGIN
@@ -3137,8 +3610,17 @@ void bc_emit_key_part(bc_ctx* cx, uint32_t table_or_index, bc_view key, uint32_t
 void bc_emit_end(bc_ctx* cx) {
   BC_GUARD_BEGIN
   if (!cx->ok()) return;
+  if (cx->sub) {
+    end_sub_row(cx);
+    return;
+  }
   if (!cx->emit || cx->emit_col != cx->verified.result_types.size()) {
     cx->fail(BC_L_PLAN, "result row ended with the wrong number of columns");
+    return;
+  }
+  ++cx->emitted;
+  if (cx->windowed && cx->emitted <= cx->window_skip) {
+    cx->emit.reset();  // before the window: dropped unencoded and uncharged
     return;
   }
   // The row is encoded straight into the result buffer, after its length,
@@ -3157,12 +3639,17 @@ void bc_emit_end(bc_ctx* cx) {
   auto n = static_cast<std::uint32_t>(cx->results.size() - at - 4);
   std::memcpy(cx->results.data() + at, &n, 4);
   cx->emit.reset();
+  if (cx->windowed && ++cx->kept >= cx->window_limit) cx->unwinding = true;
   BC_GUARD_END(cx)
 }
 
 void bc_emit_count(bc_ctx* cx, int64_t affected) {
   BC_GUARD_BEGIN
   if (!cx->ok()) return;
+  if (cx->sub) {
+    cx->fail(BC_L_PLAN, "a subquery counts no rows written");
+    return;
+  }
   if (cx->affected >= 0) {
     cx->fail(BC_E_HANDLE, "bc_emit_count called twice");
     return;
@@ -3281,6 +3768,102 @@ bool bc_bytes_prefix(bc_ctx* cx, bc_view prefix, bc_view b) {
   BC_GUARD_BEGIN
   auto v = cx->resolve2(prefix, b);
   return v && has_prefix(v->second, v->first);
+  BC_GUARD_END(cx)
+  return {};
+}
+
+namespace {
+
+// The bytes of the UTF-8 character at s[i]: 1 for a byte that starts none,
+// which a TEXT, checked as UTF-8 when written or bound, does not hold.
+auto char_len(BytesView s, std::size_t i) -> std::size_t {
+  auto b = std::to_integer<unsigned>(s[i]);
+  std::size_t n = b < 0x80 ? 1 : b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1;
+  return std::min(n, s.size() - i);
+}
+
+// The code point of the n-byte UTF-8 character at s[i].
+auto code_point(BytesView s, std::size_t i, std::size_t n) -> std::int32_t {
+  auto b = std::to_integer<std::int32_t>(s[i]);
+  if (n == 1) return b;
+  std::int32_t cp = b & (0x7F >> n);
+  for (std::size_t k = 1; k < n; ++k) cp = (cp << 6) | (std::to_integer<std::int32_t>(s[i + k]) & 0x3F);
+  return cp;
+}
+
+enum class Like { Match, NoMatch, BadPattern };
+
+// PostgreSQL's LIKE (MatchText) of UTF-8 text, case-sensitive: % matches
+// any run of characters, _ one, the escape the character after it as
+// written, and any other character itself, byte for byte. Greedy, with one
+// backtrack point: the last %, which absorbs one more character of the
+// text at each retry. No allocation. An escape the match reaches with
+// nothing after it is a bad pattern, as PostgreSQL raises it only when its
+// match gets there.
+auto like(BytesView s, BytesView p, std::int32_t escape) -> Like {
+  struct Token {
+    enum class Kind { Any, One, Literal } kind;
+    std::size_t at, len;   // the token in p: its bytes
+    std::size_t lit, n;    // a literal's bytes in p
+  };
+  auto token = [&](std::size_t i) -> std::optional<Token> {
+    auto n = char_len(p, i);
+    auto cp = code_point(p, i, n);
+    if (escape >= 0 && cp == escape) {
+      if (i + n >= p.size()) return std::nullopt;
+      auto m = char_len(p, i + n);
+      return Token{Token::Kind::Literal, i, n + m, i + n, m};
+    }
+    if (cp == '%') return Token{Token::Kind::Any, i, n, 0, 0};
+    if (cp == '_') return Token{Token::Kind::One, i, n, 0, 0};
+    return Token{Token::Kind::Literal, i, n, i, n};
+  };
+  std::size_t si = 0, pi = 0;
+  std::optional<std::size_t> star_p, star_s;
+  while (si < s.size()) {
+    if (pi < p.size()) {
+      auto t = token(pi);
+      if (!t) return Like::BadPattern;
+      if (t->kind == Token::Kind::Any) {
+        pi += t->len;
+        star_p = pi;
+        star_s = si;
+        continue;
+      }
+      if (t->kind == Token::Kind::One) {
+        si += char_len(s, si);
+        pi += t->len;
+        continue;
+      }
+      if (si + t->n <= s.size() && std::ranges::equal(s.subspan(si, t->n), p.subspan(t->lit, t->n))) {
+        si += t->n;
+        pi += t->len;
+        continue;
+      }
+    }
+    if (!star_p) return Like::NoMatch;
+    *star_s += char_len(s, *star_s);
+    si = *star_s;
+    pi = *star_p;
+  }
+  // The text is done: what is left of the pattern must be %s alone.
+  while (pi < p.size() && std::to_integer<char>(p[pi]) == '%') ++pi;
+  return pi == p.size() ? Like::Match : Like::NoMatch;
+}
+
+}  // namespace
+
+bool bc_like(bc_ctx* cx, bc_view text, bc_view pattern, int32_t escape) {
+  BC_GUARD_BEGIN
+  auto v = cx->resolve2(text, pattern);
+  if (!v) return false;
+  switch (like(v->first, v->second, escape)) {
+    case Like::Match: return true;
+    case Like::NoMatch: return false;
+    case Like::BadPattern:
+      cx->fail(BC_E_PATTERN, "LIKE pattern must not end with escape character");
+      return false;
+  }
   BC_GUARD_END(cx)
   return {};
 }
@@ -3672,6 +4255,50 @@ bool bc_key_part_null(bc_ctx* cx, uint32_t table_or_index, bc_view key, uint32_t
   return true;
 }
 
+// ------------------------------------------------------- sort key decoders
+
+int64_t bc_sort_key_part_i64(bc_ctx* cx, bc_view key, uint32_t part) {
+  BC_GUARD_BEGIN
+  return sort_part_value<std::int64_t>(cx, key, part, PhysType::I64, 0,
+                                       [](KeyReader& r) { return r.read_i64(KeyPart{PhysType::I64, false, false, false}); });
+  BC_GUARD_END(cx)
+  return {};
+}
+
+double bc_sort_key_part_f64(bc_ctx* cx, bc_view key, uint32_t part) {
+  BC_GUARD_BEGIN
+  return sort_part_value<double>(cx, key, part, PhysType::F64, 0.0,
+                                 [](KeyReader& r) { return r.read_f64(KeyPart{PhysType::F64, false, false, false}); });
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bool bc_sort_key_part_bool(bc_ctx* cx, bc_view key, uint32_t part) {
+  BC_GUARD_BEGIN
+  return sort_part_value<bool>(cx, key, part, PhysType::Bool, false,
+                               [](KeyReader& r) { return r.read_bool(KeyPart{PhysType::Bool, false, false, false}); });
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_view bc_sort_key_part_bytes(bc_ctx* cx, bc_view key, uint32_t part) {
+  BC_GUARD_BEGIN
+  auto v = sort_part_value<Bytes>(cx, key, part, PhysType::Bytes, Bytes{},
+                                  [](KeyReader& r) { return r.read_bytes(KeyPart{PhysType::Bytes, false, false, false}); });
+  if (!cx->ok()) return {};
+  return cx->arena_view(v);
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bool bc_sort_key_part_null(bc_ctx* cx, bc_view key, uint32_t part) {
+  BC_GUARD_BEGIN
+  auto at = sort_part_at(cx, key, part, std::nullopt);
+  return !at || at->null;
+  BC_GUARD_END(cx)
+  return true;
+}
+
 int64_t bc_count_range(bc_ctx* cx, uint32_t table_or_index, bc_view lo, bc_view hi, int64_t limit) {
   BC_GUARD_BEGIN
   auto range = resolve_range(cx, table_or_index, lo, hi);
@@ -3855,6 +4482,12 @@ bc_row bc_row_begin(bc_ctx* cx, uint32_t table) {
       return {};
     }
   }
+  // A table without a primary key: its hidden row id, drawn now, so a retry
+  // of the plan draws another.
+  if (const auto* rid = t->row_id(); rid != nullptr && !b.writer().set_i64(rid->id, cx->live->next_row_id(*t))) {
+    cx->fail(BC_E_CORRUPT, "the row id of table " + t->name + " does not fit its layout");
+    return {};
+  }
   return b.keep();
   BC_GUARD_END(cx)
   return {};
@@ -3952,6 +4585,23 @@ bc_view bc_row_end(bc_ctx* cx, bc_row r) {
   }
   if (!cx->rehold(b->held, b->built.size())) return {};
   return cx->make_view(b->built.data(), b->built.size(), kNoCursor, 0, b->table, RowKind::Built);
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_view bc_null_row(bc_ctx* cx, uint32_t table) {
+  BC_GUARD_BEGIN
+  const auto* t = cx->table(table);
+  if (t == nullptr) return {};
+  // A writer given nothing: every column NULL, no default and no row id, as
+  // bc_row_begin would give. Not a row any write takes: a NOT NULL column's
+  // NULL is checked only by bc_row_end.
+  Bytes row;
+  if (!RowWriter{t->layout}.finish(row)) {
+    cx->fail(BC_E_LIMIT, "row over the engine's value limit");
+    return {};
+  }
+  return cx->arena_view(row, table, RowKind::Built);
   BC_GUARD_END(cx)
   return {};
 }
@@ -4280,6 +4930,8 @@ auto slot_kind_name(SlotKind k) -> const char* {
     case SlotKind::SumF64: return "a double sum";
     case SlotKind::MinI64: return "a minimum";
     case SlotKind::MaxI64: return "a maximum";
+    case SlotKind::MinF64: return "a double minimum";
+    case SlotKind::MaxF64: return "a double maximum";
     case SlotKind::Count: return "a count";
   }
   return "a slot";
@@ -4313,7 +4965,8 @@ auto read_slot(bc_ctx* cx, bc_group g, std::uint32_t slot, std::optional<bool> f
     return nullptr;
   }
   auto k = agg->kinds[slot];
-  if (f64 && k != SlotKind::None && (k == SlotKind::SumF64) != *f64) {
+  auto is_f64 = k == SlotKind::SumF64 || k == SlotKind::MinF64 || k == SlotKind::MaxF64;
+  if (f64 && k != SlotKind::None && is_f64 != *f64) {
     cx->fail(BC_E_HANDLE, std::string{"slot "} + std::to_string(slot) + " is " + slot_kind_name(k) + ", read as " +
                               (*f64 ? "a double" : "an integer"));
     return nullptr;
@@ -4339,16 +4992,46 @@ void bc_agg_add_i64(bc_ctx* cx, bc_group g, uint32_t slot, int64_t v) {
 }
 // PostgreSQL's float8 sum: a finite sum that overflows is an error, and an
 // infinite or NaN input carries through.
+static auto sum_f64(bc_ctx* cx, double a, double b) -> double {
+  auto r = a + b;
+  if (std::isinf(r) && !std::isinf(a) && !std::isinf(b)) cx->fail(BC_E_ARITH, "value out of range: overflow");
+  return r;
+}
+// PostgreSQL's float8 order: NaN above every number, -0.0 equal to 0.0.
+static auto less_f64(double a, double b) -> bool { return !std::isnan(a) && (std::isnan(b) || a < b); }
+
+double bc_add_f64(bc_ctx* cx, double a, double b) {
+  BC_GUARD_BEGIN
+  return sum_f64(cx, a, b);
+  BC_GUARD_END(cx)
+  return {};
+}
+// As float8smaller and float8larger: of equal values (-0.0 and 0.0) the second.
+double bc_min_f64(double a, double b) { return less_f64(a, b) ? a : b; }
+double bc_max_f64(double a, double b) { return less_f64(b, a) ? a : b; }
 void bc_agg_add_f64(bc_ctx* cx, bc_group g, uint32_t slot, double v) {
   BC_GUARD_BEGIN
   auto* s = fold_slot(cx, g, slot, SlotKind::SumF64);
   if (s == nullptr) return;
-  auto r = s->f + v;
-  if (std::isinf(r) && !std::isinf(s->f) && !std::isinf(v)) {
-    cx->fail(BC_E_ARITH, "value out of range: overflow");
-    return;
-  }
+  auto r = sum_f64(cx, s->f, v);
+  if (!cx->ok()) return;
   s->f = r;
+  s->set = true;
+  BC_GUARD_END(cx)
+}
+void bc_agg_min_f64(bc_ctx* cx, bc_group g, uint32_t slot, double v) {
+  BC_GUARD_BEGIN
+  auto* s = fold_slot(cx, g, slot, SlotKind::MinF64);
+  if (s == nullptr) return;
+  s->f = s->set ? bc_min_f64(s->f, v) : v;
+  s->set = true;
+  BC_GUARD_END(cx)
+}
+void bc_agg_max_f64(bc_ctx* cx, bc_group g, uint32_t slot, double v) {
+  BC_GUARD_BEGIN
+  auto* s = fold_slot(cx, g, slot, SlotKind::MaxF64);
+  if (s == nullptr) return;
+  s->f = s->set ? bc_max_f64(s->f, v) : v;
   s->set = true;
   BC_GUARD_END(cx)
 }

@@ -7,10 +7,13 @@
 // turn it into an equivalent one, and the search (search.cppm) picks the
 // physical plan that computes it.
 //
-// The expressions are those the dialect has today: columns, parameters,
-// integer constants, + and -, comparisons, a conjunction of them, and
-// aggregate calls. A predicate is its conjuncts, in the order the statement
-// wrote them.
+// The expressions are those the dialect has today: columns, parameters
+// (a literal is one, folded by the binder), integer constants, + - * and /,
+// comparisons, a conjunction of them, and aggregate calls. A predicate is its conjuncts, in the order the statement
+// wrote them. A select list's expression over columns (Project's outputs) is
+// a tree of these, each node typed: the one value expression the search
+// plans and codegen evaluates (docs/planner_design.md, *Expressions over
+// columns*).
 
 module;
 #include <cstdint>
@@ -31,9 +34,11 @@ export namespace bytecask::sql::logical {
 
 using Op = ast::Compare::Op;
 
-// A column of one of the statement's tables. A self-join is refused, so the
-// table names the operand. Its physical type and nullability are the
-// catalog's, so codegen never reads the catalog.
+// A column of one of the statement's tables, named by the table's id. A table
+// read twice is two tables, an instance (Table::source) for each use, so the
+// id names the use. Its physical type and nullability are the catalog's, but
+// for a column of a table an outer join may NULL-extend, which the binder
+// marks nullable, so codegen never reads the catalog.
 struct ColumnRef {
   std::uint32_t table{0};
   std::uint32_t col{0};
@@ -47,18 +52,36 @@ struct ColumnRef {
 
 // A typed expression. Its SQL type is the binder's, by types_design.md's
 // rules: a comparison's is BOOLEAN, an aggregate's PostgreSQL's result type.
+// Truth and InSet are an uncorrelated subquery's (Subquery, below): a
+// BOOLEAN parameter it set, true, false or NULL as it holds; and whether a
+// column's value is among a BC_SUB_SET subquery's values, `constant` its
+// index in the statement's subqueries (NULL for a NULL column).
+// And, Or, Not, IsNull and Like are a predicate's, a WHERE conjunct that is
+// no comparison of its own: three-valued, as SQL's logic is, over
+// comparisons, IS NULL of a column and a text column LIKE a pattern; a
+// filter, never a key's bound. In a select list the same kinds are values:
+// a BOOLEAN, NULL where SQL's logic says unknown, over operands of any
+// value expression. Case and Coalesce are values of a select list only:
+// every branch is of the expression's type, or a numeric of a finer scale
+// below it, which the evaluator brings up.
 struct Expr {
-  enum class Kind { Column, Param, Const, Add, Sub, Compare, Aggregate };
+  enum class Kind { Column, Param, Const, Add, Sub, Mul, Div, Compare, Aggregate, And, Or, Not, IsNull, Like, Truth, InSet, Case, Coalesce };
   enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind{Kind::Param};
   SqlType type{};
   ColumnRef col{};              // Column
   std::uint32_t param{0};       // Param: zero-based ($1 is 0)
-  std::int64_t constant{0};     // Const: in its type's representation, a DECIMAL's scaled; a BOOLEAN's 0 or 1
+  std::int64_t constant{0};     // Const: in its type's representation, a DECIMAL's scaled; a BOOLEAN's 0 or 1;
+                                // Like: the escape's code point, -1 for none; InSet: its subquery
   Op op{Op::Eq};                // Compare
   Fn fn{Fn::Count};             // Aggregate
   bool distinct{false};         // Aggregate: COUNT(DISTINCT arg)
-  std::vector<Expr> args;       // Add, Sub, Compare: two; Aggregate: none (COUNT(*)) or its argument
+  std::vector<Expr> args;       // Add, Sub, Mul, Div, Compare: two; Aggregate: none (COUNT(*)) or its argument;
+                                // And, Or: two or more; Not: one; IsNull: its column, or in a select list its
+                                // operand; Like: the column and the
+                                // pattern, a parameter; Truth: its parameter; InSet: its column;
+                                // Case: WHEN, THEN, WHEN, THEN … and an ELSE last if there is one (an odd count);
+                                // Coalesce: two or more
 
   [[nodiscard]] auto phys() const -> PhysType { return phys_type(type); }
 
@@ -109,6 +132,20 @@ struct Expr {
   return e;
 }
 
+// Whether e is a predicate: And, Or, Not, IsNull, Like, Truth or InSet.
+[[nodiscard]] auto is_predicate(const Expr& e) -> bool {
+  return e.kind == Expr::Kind::And || e.kind == Expr::Kind::Or || e.kind == Expr::Kind::Not ||
+         e.kind == Expr::Kind::IsNull || e.kind == Expr::Kind::Like || e.kind == Expr::Kind::Truth ||
+         e.kind == Expr::Kind::InSet;
+}
+
+// A predicate of two or more conjuncts or disjuncts, or one alone.
+[[nodiscard]] auto predicate_of(Expr::Kind kind, std::vector<Expr> args) -> Expr {
+  auto e = expr(kind, SqlType{SqlKind::Boolean});
+  e.args = std::move(args);
+  return e;
+}
+
 // Every column the expression reads, in the order it reads them.
 void columns_of(const Expr& e, std::vector<ColumnRef>& out) {
   if (e.kind == Expr::Kind::Column) {
@@ -134,6 +171,9 @@ struct Empty {
   std::vector<const Table*> tables;
 };
 
+// One row of no columns: what a SELECT without FROM reads.
+struct OneRow {};
+
 // The rows for which every conjunct is true.
 struct Filter {
   NodePtr input;
@@ -153,10 +193,14 @@ struct Project {
 };
 
 // The inner join: the pairs for which every conjunct of the predicate is
-// true.
+// true. Left outer: those, and each row of `left` none pairs with, once,
+// with `right`'s columns NULL; the predicate is its ON, which decides the
+// pairs, never which rows of `left` there are. A join of several tables is
+// left-deep: `left` is the join of the tables before, `right` one table.
 struct Join {
   NodePtr left, right;
   std::vector<Expr> predicate;
+  bool left_outer{false};
 };
 
 // One row per group of the input's rows whose `group_by` columns are equal,
@@ -197,9 +241,14 @@ struct Limit {
 
 // One row of VALUES: per table column, in column order, its value, or
 // nullopt for the default bc_row_begin writes.
+//
+// `checks` are the table's CHECK constraints over the row as written, each
+// a BOOLEAN over the table's columns and constants: the row is refused
+// (23514) where one is false, and accepted where it is true or NULL.
 struct Insert {
   const Table* table{nullptr};
   std::vector<std::optional<Expr>> values;
+  std::vector<Expr> checks;
 };
 
 // Each row the input gives, written: its set columns from expressions of
@@ -208,6 +257,7 @@ struct Update {
   NodePtr input;
   const Table* table{nullptr};
   std::vector<std::pair<ColumnRef, Expr>> set;
+  std::vector<Expr> checks;  // as Insert's, over the row as it will be written
 };
 
 struct Delete {
@@ -215,8 +265,31 @@ struct Delete {
   const Table* table{nullptr};
 };
 
+// UNION, INTERSECT or EXCEPT of two queries' rows, each a Project (under a
+// Sort or Limit of its own) or another SetOp: the rows of both, or those in
+// both, or those in `left` and not in `right`, each row once unless `all`
+// keeps them (docs/planner_design.md, *Set operations*). Two rows are alike
+// where each column is equal, NULL equal to NULL. `outputs` are its columns:
+// the names of the left arm's, the types the arms' resolve to, each expr a
+// Param of that type that stands for the column and is read by no one. Only
+// the root may sit under a Limit. The root alone has an `order`: ORDER BY of
+// the combined rows, by output columns only (a Sort has columns of a table).
+struct SetOp {
+  using Kind = ast::SetOperation::Kind;
+  struct Order {
+    std::size_t column;  // index into `outputs`
+    bool desc;
+    bool nulls_first;
+  };
+  NodePtr left, right;
+  Kind kind{Kind::Union};
+  bool all{false};
+  std::vector<Output> outputs;
+  std::vector<Order> order;
+};
+
 struct Node {
-  std::variant<Get, Empty, Filter, Project, Join, Aggregate, Sort, Limit, Insert, Update, Delete> op;
+  std::variant<Get, Empty, OneRow, Filter, Project, Join, Aggregate, Sort, Limit, SetOp, Insert, Update, Delete> op;
   // The columns something above reads from this operator's rows: set by
   // projection pruning, empty before it.
   std::vector<ColumnRef> output;
@@ -227,8 +300,23 @@ template <typename T>
   return std::make_unique<Node>(Node{std::move(op), {}});
 }
 
-// The operator below n, or null for a leaf (Get, Empty, Insert); a Join has
-// two.
+// An uncorrelated subquery: a SELECT the statement runs once, before its
+// own plan, on its snapshot, its rows of one column folded as `kind` says
+// into the hidden parameters from `param` on (bc_sub_kind in bc_plan.h).
+// Value: its one row's value, NULL for none, a second row 21000. Exists:
+// a BOOLEAN. Bounds: its largest and smallest non-NULL values, then two
+// BOOLEANs, NULL if a row was NULL else FALSE, and whether it gave a row.
+// Set: its non-NULL values, which InSet tests, then those two BOOLEANs.
+struct Subquery {
+  enum class Kind { Value, Exists, Bounds, Set };
+  NodePtr plan;
+  Kind kind{Kind::Value};
+  SqlType type{};  // its column's; Exists: none it reads
+  std::uint32_t param{0};
+};
+
+// The operator below n, or null for a leaf (Get, Empty, OneRow, Insert); a
+// Join has two.
 template <typename N>
   requires std::is_same_v<std::remove_const_t<N>, Node>
 [[nodiscard]] auto input_of(N& n) {

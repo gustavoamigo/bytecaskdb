@@ -41,15 +41,16 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
     return true;
   }
 
-  if (!t.validate_preconditions(slot.plan, slot.conflict_lost_to)) {
+  std::uint64_t rests_on = 0;
+  if (!t.validate_preconditions(slot.plan, rests_on)) {
+    slot.rests_on = rests_on;
     slot.result = std::nullopt;
-    slot.conflict_snap_next =
-        slot.plan.snap_ ? slot.plan.snap_->state_->next_seq : 0;
     return false;
   }
 
   auto entries = t.prepare_write(slot.plan);
   if (entries.empty()) {
+    slot.rests_on = rests_on;
     slot.result = CommitResult{};
     return true;
   }
@@ -208,14 +209,18 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
   } catch (...) {
     auto ex = std::current_exception();
     try { file.sync(); } catch (...) {}
+    counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
+    // An append that failed partway leaves the chunks it wrote in the file,
+    // unpublished: the next write must not be appended after them.
     // Publishing needs the flush role: an in-flight flush must land (or
     // fail) first, so its publication cannot overwrite the degraded state.
-    auto role = quiesce();
-    auto err_s = load_state()->degraded_copy(std::format(
-        "append IO error on '{}': call resume() to recover.",
-        file.path().string()));
-    counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
-    store_state(std::move(err_s));
+    // A quiesce() that throws has refused writes itself (flush_threw).
+    degrade([&] {
+      const auto role = quiesce();
+      store_state(load_state()->degraded_copy(std::format(
+          "append IO error on '{}': call resume() to recover.",
+          file.path().string())));
+    });
     for (auto *s : batch) {
       if (!s->err) s->err = ex;
     }
@@ -295,12 +300,13 @@ void DB::commit_appended(TransientEngineState &t,
     t.apply_sync(batch_max_seq);
   } catch (...) {
     auto ex = std::current_exception();
-    auto err_s = published->degraded_copy(std::format(
-        "rotation fdatasync failed on '{}': bytes in page cache but "
-        "durability not confirmed. Call resume() to recover.",
-        file.path().string()));
     counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
-    store_state(std::move(err_s));
+    degrade_from(published, [&] {
+      return std::format(
+          "rotation fdatasync failed on '{}': bytes in page cache but "
+          "durability not confirmed. Call resume() to recover.",
+          file.path().string());
+    });
     for (auto *s : batch) {
       if (!s->err) s->err = ex;
     }
@@ -311,12 +317,13 @@ void DB::commit_appended(TransientEngineState &t,
     rotation = prepare_rotation(t);
   } catch (...) {
     auto ex = std::current_exception();
-    t.apply_degrade(std::format(
-        "post-write rotation failed for '{}': active file is sealed "
-        "but new file could not be created. Call resume() to recover.",
-        file.path().string()));
     counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
-    store_state(published, std::move(t).persistent());
+    degrade_transient(t, published, [&] {
+      return std::format(
+          "post-write rotation failed for '{}': active file is sealed "
+          "but new file could not be created. Call resume() to recover.",
+          file.path().string());
+    });
     for (auto *s : batch) {
       if (!s->err) s->err = ex;
     }
@@ -333,12 +340,13 @@ void DB::commit_appended(TransientEngineState &t,
       t.apply_sync(batch_max_seq);
     } catch (...) {
       auto ex = std::current_exception();
-      auto err_s = published->degraded_copy(std::format(
-          "commit fdatasync failed on '{}': bytes in page cache but "
-          "durability not confirmed. Call resume() to recover.",
-          file.path().string()));
       counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
-      store_state(std::move(err_s));
+      degrade_from(published, [&] {
+        return std::format(
+            "commit fdatasync failed on '{}': bytes in page cache but "
+            "durability not confirmed. Call resume() to recover.",
+            file.path().string());
+      });
       for (auto *s : batch) {
         if (!s->err) s->err = ex;
       }
@@ -397,19 +405,20 @@ void DB::flush_pending() {
 void DB::flush_failed(std::exception_ptr ex,
                       const std::shared_ptr<const EngineState> &published,
                       const std::filesystem::path &active_path) {
-  auto err_s = published->degraded_copy(std::format(
-      "commit fdatasync failed on '{}': bytes in page cache but "
-      "durability not confirmed. Call resume() to recover.",
-      active_path.string()));
   counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
-  // Published and recorded under one durable_mu_ hold: commit_wait checks
-  // flush_error_ under the same mutex, so no waiter can see the degraded
-  // state without the error and report DbDegraded where the contract
-  // promises the I/O error. (Raw store: the checked store_state takes
-  // durable_mu_ itself.)
-  std::lock_guard<std::mutex> lk{durable_mu_};
-  store_state(std::move(err_s));
-  flush_error_ = std::move(ex);
+  // Recorded before writes are refused: a waiter that sees the refusal
+  // re-checks flush_error_ under durable_mu_ (commit_wait), so none reports
+  // DbDegraded where the contract promises the I/O error.
+  {
+    std::lock_guard<std::mutex> lk{durable_mu_};
+    flush_error_ = std::move(ex);
+  }
+  degrade_from(published, [&] {
+    return std::format(
+        "commit fdatasync failed on '{}': bytes in page cache but "
+        "durability not confirmed. Call resume() to recover.",
+        active_path.string());
+  });
 }
 
 void DB::finish_flush() {
@@ -481,12 +490,7 @@ void DB::refuse_writes() noexcept {
 #ifdef BYTECASK_TESTING
     if (test_before_refusal_publish_) test_before_refusal_publish_();
 #endif
-    // A state that is degraded already keeps its own reason.
-    if (const auto current = load_state(); !current->degraded) {
-      auto s = current->degraded_copy(kWriteFaultReason);
-      std::lock_guard<std::mutex> lk{durable_mu_};
-      store_state(std::move(s));
-    }
+    publish_degraded_if_healthy(kWriteFaultReason);
   } catch (...) {
     // No memory to publish it: write_fault_ alone refuses until resume().
   }
@@ -531,11 +535,15 @@ void DB::commit_wait(EngineSlot &slot) {
       // publishing_ (see the raw store_state).
       return;
     }
+    // Read before flush_error_: a failed flush records its error before it
+    // refuses writes (flush_failed, flush_threw), so a refusal seen here
+    // finds the error below, and the I/O error is reported, not DbDegraded.
+    const bool refusing = refused(*published);
     {
       std::lock_guard<std::mutex> lk{durable_mu_};
       if (flush_error_) std::rethrow_exception(flush_error_);
     }
-    if (refused(*published)) throw DbDegraded{degraded_reason()};
+    if (refusing) throw DbDegraded{degraded_reason()};
 
     if (!flush_in_flight_.exchange(true, std::memory_order_acq_rel)) {
       flush_once();
@@ -555,6 +563,42 @@ void DB::commit_wait(EngineSlot &slot) {
                           : now->next_seq > target;
     });
   }
+}
+
+// Plans are validated against the head, which is right — two in-flight
+// writes to one key must not both pass — but the head holds writes not yet
+// published, and one of them may yet fail. A slot that appended something
+// waits for its own publication in commit_wait, which covers every entry
+// before it. One that appended nothing — a conflict, or guards that held
+// with nothing to write — has no entry to wait for, so it waits here for
+// the entry its outcome rests on. If that entry will never be published,
+// its write threw and is unseen, and an answer drawn from it would contradict
+// every read (CONTRACT.md, "A thrown write is unseen until resume()"), so
+// the slot throws DbDegraded instead.
+//
+// The wait is also when a conflict becomes useful to report: until the
+// write a plan lost to is published, every retry from a fresh snapshot
+// loses again. A caller's retry loop spun through the whole fdatasync of a
+// competing write — the CAS benchmark's average attempts went from 1.0 to
+// 7-350 when the commit was pipelined. The wait is for the entry the
+// outcome read, not for the whole head, whether the guards failed or held:
+// under many writers the head always holds entries appended after the
+// flush in progress began, and waiting for those would cost a second flush
+// for nothing.
+//
+// A slot whose outcome the published state gives as well returns at once:
+// it rests on what readers already see, and a conflict there is one a
+// retry can see. This is the common case of a del that finds no key while
+// other writes are in flight.
+void DB::settle_unappended(const EngineSlot &slot) const {
+  if (slot.rests_on == 0) return;
+  const auto published = load_state();
+  if (published->next_seq > slot.rests_on) return;
+  const auto holds = published->transient().validate_preconditions(slot.plan);
+  if (holds == slot.result.has_value()) return;
+  wait_published(slot.rests_on);
+  if (load_state()->next_seq > slot.rests_on) return;
+  throw DbDegraded{degraded_reason()};
 }
 
 void DB::wait_published(std::uint64_t sequence) const {

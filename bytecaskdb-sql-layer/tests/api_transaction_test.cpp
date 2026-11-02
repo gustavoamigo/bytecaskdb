@@ -452,6 +452,43 @@ TEST_CASE("embedded API: a join over many outer rows runs in a small memory budg
   CHECK(std::get<std::int64_t>(r.rows[0][0]) == kItems);
 }
 
+TEST_CASE("embedded API: a self-join, a chain of joins and a join on a comparison run in a small memory budget",
+          "[sql][api][memory][join]") {
+  sql_test::TempDir dir{"api_join_forms"};
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  db->execute("CREATE TABLE m (id BIGINT PRIMARY KEY, g BIGINT NOT NULL, pad VARCHAR(200) NOT NULL)");
+  db->execute("CREATE INDEX m_g ON m (g)");
+  constexpr std::int64_t kRows = 3000;
+  const Value pad = sql_test::bytes(std::string(200, 'p'));
+  for (std::int64_t first = 0; first < kRows; first += 1000) {
+    auto t = db->begin();
+    for (auto id = first; id < first + 1000; ++id) t.execute("INSERT INTO m VALUES ($1, $2, $3)", {id, id % 50, pad});
+    REQUIRE(t.commit() == CommitOutcome::Committed);
+  }
+  auto count = [&](std::string_view sql, std::vector<Value> params = {}) {
+    auto r = db->execute(sql, params);
+    REQUIRE(r.rows.size() == 1);
+    return std::get<std::int64_t>(r.rows[0][0]);
+  };
+  // Each row a loop reads is 200 bytes and more; 3,000 of them, never mind their pairs, are 600 KB against a
+  // 64 KiB budget, so no side is held. A self-join on the key, on a column, and on a comparison, whose pairs
+  // are the product of the sides, only counted.
+  CHECK(count("SELECT count(*) FROM m x JOIN m y ON x.id = y.id") == kRows);
+  CHECK(count("SELECT count(*) FROM m x JOIN m y ON x.g = y.g WHERE x.id < $1", {std::int64_t{10}}) == 10 * kRows / 50);
+  CHECK(count("SELECT count(*) FROM m x JOIN m y ON x.id < y.id WHERE x.id >= $1", {kRows - 100}) == 99 * 100 / 2);
+  CHECK(count("SELECT count(*) FROM m x JOIN m y ON x.id <> y.id WHERE x.id < $1 AND y.id < $2",
+              {std::int64_t{40}, std::int64_t{60}}) == 40 * 60 - 40);
+  // A chain of three tables, inner and left, and a predicate over both sides of a pair.
+  CHECK(count("SELECT count(*) FROM m x JOIN m y ON y.id = x.id JOIN m z ON z.id = y.id") == kRows);
+  CHECK(count("SELECT count(*) FROM m x LEFT JOIN m y ON y.id = x.id LEFT JOIN m z ON z.id = y.id") == kRows);
+  CHECK(count("SELECT count(*) FROM m x LEFT JOIN m y ON y.id = x.g LEFT JOIN m z ON z.id = y.g WHERE x.id < $1",
+              {std::int64_t{100}}) == 100);
+  CHECK(count("SELECT count(*) FROM m x JOIN m y ON NOT (x.id = y.id) AND x.g = y.g WHERE x.id < $1",
+              {std::int64_t{10}}) == 10 * (kRows / 50 - 1));
+  // The pairs of a join with no key at all are a product the statement does not hold, whatever the budget.
+  CHECK(count("SELECT count(*) FROM m x, m y WHERE x.id < $1 AND y.id < $1", {std::int64_t{200}}) == 200 * 200);
+}
+
 TEST_CASE("embedded API: destroying an open transaction rolls it back; close() ends the open ones",
           "[sql][api][txn]") {
   sql_test::TempDir dir{"api_txn"};

@@ -86,7 +86,9 @@ DB::DB(std::filesystem::path dir, Options opts)
     pool_ = std::make_shared<BufferPool>(opts.buffer_pool, scratch_bytes_);
   }
   // The directories open creates, each named by an entry in its parent that
-  // has to be durable before the database's files can be.
+  // has to be durable before the database's files can be. A directory that
+  // already exists may have been created by an open that failed or was killed
+  // before its sync, so the database directory's entry is synced every open.
   std::vector<std::filesystem::path> created;
   for (auto p = std::filesystem::absolute(dir_); !std::filesystem::exists(p);
        p = p.parent_path()) {
@@ -95,6 +97,10 @@ DB::DB(std::filesystem::path dir, Options opts)
   std::filesystem::create_directories(dir_);
   for (const auto &p : created)
     sync_directory(p.parent_path(), "io_dir_sync_create_dir");
+  if (created.empty()) {
+    sync_directory(std::filesystem::absolute(dir_).parent_path(),
+                   "io_dir_sync_create_dir");
+  }
 
   // Acquire exclusive advisory lock on the database directory.
   const auto lock_path = dir_ / ".lock";
@@ -391,26 +397,7 @@ auto DB::apply_batch(WriteOptions opts,
   if (opts.sync)
     last_synced_return = {instance_id_, std::chrono::steady_clock::now()};
 
-  // A conflict against a write the head holds but no snapshot can see yet.
-  // Plans are validated against the head, which is right — two in-flight
-  // writes to one key must not both pass — but a snapshot sees only the
-  // published state, so until that write is published every retry from a
-  // fresh snapshot finds the same state and loses again: a caller's retry
-  // loop spun through the whole fdatasync of a competing write, 50 to 300
-  // attempts per collision, and the CAS benchmark's average attempts went
-  // from 1.0 to 7-350 when the commit was pipelined. So a conflict is
-  // reported once the head it lost to is published — the moment a retry
-  // can make progress — which is when it was reported before the pipeline.
-  // A plan whose snapshot is already behind the published state returns at
-  // once: its retry has something new to see. The wait is for the write the
-  // plan lost to, not for the whole head: under many writers the head
-  // always holds entries appended after the flush in progress began, and
-  // waiting for those would cost a second flush for nothing.
-  if (!slot.result && slot.conflict_snap_next != 0 &&
-      slot.conflict_snap_next >= load_state()->next_seq) {
-    wait_published(slot.conflict_lost_to);
-  }
-
+  settle_unappended(slot);
   return slot.result;
 }
 

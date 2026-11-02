@@ -7,9 +7,11 @@ and #584; `plan_api_design.md`, revision 7); the choice points (#582); the plan
 API's sorters, hash tables, aggregate slots and sort keys (#577, #581);
 full scans and sorts (#591, closing #533); hash joins (#600) and `GROUP
 BY` (#609); then the closing PR, which fixed #609's last review findings
-and wrote this document as built. The first of the post-MVP designs (#487,
-*Next*). The parser, the plan API and TinyCC are unchanged by it; the
-binder's output changed. The rest of the dialect is #534's (*Slices*).
+and wrote this document as built; then joins of up to eight tables, a table
+read twice and joins on any comparison (#663, *Joins of several tables*).
+The first of the post-MVP designs (#487, *Next*). The parser, the plan API
+and TinyCC are unchanged by it; the binder's output changed. The rest of
+the dialect is #534's (*Slices*).
 
 ## Why
 
@@ -65,24 +67,36 @@ compute, not how.
 | Operator | Meaning |
 |---|---|
 | `Get(table)` | every row of a table |
+| `OneRow` | one row of no columns: a `SELECT` without `FROM` |
 | `Filter(input, predicate)` | the rows for which the predicate is true |
 | `Project(input, exprs)` | one output row per input row, of these expressions |
-| `Join(left, right, predicate)` | inner; outer joins with #534 |
+| `Join(left, right, predicate, left_outer)` | inner, or left outer: each left row, with a right row of NULLs where the predicate matches none |
 | `Aggregate(input, group_by, aggs)` | `COUNT`, `COUNT(DISTINCT)`, `SUM`, `MIN`, `MAX`, `AVG`; no `group_by` means one row |
 | `Sort(input, keys)` | each key with its direction and its NULL placement |
 | `Limit(input, n)` | the first n rows |
 | `Insert`, `Update`, `Delete` | writes, over the rows their input gives |
 
 Each expression carries its SQL type, which the binder resolves. The
-dialect's expressions are columns, parameters, integer constants, `+` and
-`-`, comparisons, their conjunction and aggregate calls; `*`, `/`, `OR`,
-`NOT` and `IS NULL` come with the dialect that accepts them (#534). The
+dialect's expressions are columns, parameters, integer constants, `+ - * /`,
+comparisons, their conjunction and aggregate calls. A literal is a
+parameter by then: the binder folds it and the API binds it after the
+statement's own (`frontend_design.md`, *Literals*). A predicate (`And`,
+`Or`, `Not` of comparisons, and `IsNull` of a column) is a conjunct of its
+own: the search keeps a table's predicates apart from its comparisons
+(`Rel::preds`), no access path takes one, and each is a filter after the
+path's, refused (`no plan:`) where it compares a REAL or DOUBLE column, as a
+comparison is. Codegen prints one as two C conditions, true and false, SQL's
+three-valued logic with unknown neither. In a select list the same kinds
+are values (*Expressions over columns*). The
 binder's own rules are the frontend's: one SQL type per `$n`, and the
 errors it raises.
 
 **What the binder builds.**
 - A `SELECT` is `Limit? → Project → Sort? → Filter? → the tables`, the
-  tables a `Get`, or a `Join` of two `Get`s.
+  tables a `Get`, or a left-deep tree of `Join`s over `Get`s, one per `FROM`
+  item (*Joins of several tables*). A `Project`'s outputs are
+  columns, constants' parameters and expressions over columns. A `SELECT` without `FROM` is `Limit?
+  → Project → OneRow`.
 - An aggregated `SELECT` is `Limit? → Sort? → Filter? → Aggregate →
   Filter? → the tables`: the `Filter` above the `Aggregate` is its
   `HAVING`, and the `Sort` orders the groups. The `Aggregate`'s outputs are
@@ -112,18 +126,28 @@ A fixed list, applied in order, each to a fixpoint. None needs a cost.
    else not at all; two add only when both are in the result's
    representation. A conjunct always false replaces its `Filter`, and what
    it reads, with an `Empty` naming the tables it replaced; a `Join` with an
-   `Empty` side is `Empty`. The search plans it as no rows, read from
+   `Empty` side is `Empty`, but for a left outer join's right side, which
+   leaves the left rows NULL-extended. The search plans it as no rows, read from
    nothing. Today's dialect rarely gives it anything to fold: a `WHERE`
    compares a column with a parameter.
 2. **Predicate pushdown.** A conjunct moves to the lowest operator whose
-   columns it reads: onto the table it reads, or onto the `Join` when it
-   compares the two sides. Two `Filter`s in a row become one, the lower
+   columns it reads: onto the table it reads, or onto the `Join` that has
+   every table it reads, whether it compares two columns or is a predicate
+   over both sides. Over a left outer join, only a conjunct on the
+   left side alone moves below it: one on the right side filters the joined
+   rows, NULL-extended ones too, so it stays above. Of the join's own
+   predicate, a conjunct on the right side alone moves onto that side's
+   table; one on the left side alone stays, deciding which left rows find a
+   pair. A predicate that reads no column, a subquery's `EXISTS` or its
+   flags (*Subqueries*), holds of every row or of none: above a join it
+   filters the left side, in an outer join's predicate the right one. Two
+   `Filter`s in a row become one, the lower
    one's conjuncts first, so a `Get` has at most one.
 3. **Projection pruning.** Each operator keeps only the columns something
    above it reads. A read is covering when every column the operators above
    take is in the key; a column only a key bound reads need not be.
 
-Subquery decorrelation joins the list when #534 brings subqueries. The two
+Subquery decorrelation joins the list with correlated subqueries. The two
 rewrites of TPROC-C statements (`testing_design.md`, *The TPROC-C
 statements*) are made by hand in the statement text.
 
@@ -186,7 +210,8 @@ from each set of k − 1 and one more table, read one of four ways:
 The join's conjuncts between the new table and those already read filter
 its rows, or the pairs, refused on a DOUBLE or REAL column alike. Bushy
 trees and merge joins wait for a workload that needs them. Sets are bit
-masks of up to 32 tables; the binder takes two.
+masks of up to 32 tables; the front end takes eight, which bounds the
+search to 255 sets (*Joins of several tables*).
 
 The search keeps the cheapest plan per set of tables, per row count (at
 most one, or more), per order (the `ORDER BY`'s, or none) and per grouping
@@ -407,14 +432,19 @@ point lookup, and in an `UPDATE`; `no_choice_under_limit` the `LIMIT` case.
 
 The physical plan's operators:
 - `Empty`, no rows and no read: the sink reports what it gives for none;
+- `OneRow`, one row of no columns and no read: its consumer runs once. A
+  plan of `Emit` over it is the one that names no table, so it has no
+  constants;
 - the access paths `PointGet`, `Scan` and `NullSplitScan`;
 - `CountRange` and `KeyAggregates`, access paths that also produce the
   aggregate;
 - the joins `IndexJoin`, `NestedLoop` and `HashJoin`;
 - `Filter`, `Sort`, `Limit` and `Choice`;
-- `Aggregate` (one row of `COUNT`, `COUNT(DISTINCT)` or `SUM`) and
+- `Aggregate` (one row of `COUNT`, `COUNT(DISTINCT)` or an integer `SUM`) and
   `GroupAggregate`;
-- the sinks: `Emit`, `GroupEmit`, `Insert`, `Update` and `Delete`.
+- the sinks: `Emit`, `GroupEmit`, `Insert`, `Update` and `Delete`. An
+  `Emit` target is a column or a parameter, a constant's, the same in
+  every row.
 
 The plan also lists the parameters a NULL of which ends it before it reads
 (`null_checks`), the `$n ± k` values computed before anything is read, and
@@ -535,7 +565,7 @@ output.
 | A join read once, or once per outer row | `NestedLoop` | the inner scan nested in the outer loop, opened once when the outer side is at most one row |
 | A hash join | `HashJoin` | `bc_hash_*` (*Hash joins*) |
 | `FOR UPDATE` | the access path's `for_update`, from the `Get`'s | `bc_guard_row` on each returned row: `bc_guard_unchanged` on its primary key |
-| Targets | `Emit`, `GroupEmit`, or the aggregate's row | `bc_emit_col`, `bc_emit_key_part`; for an aggregate, `bc_emit_i64` (every aggregate is held as an `int64_t`), and `bc_emit_null` for NULL |
+| Targets | `Emit`, `GroupEmit`, or the aggregate's row | `bc_emit_col`, `bc_emit_key_part`; a constant's parameter, `bc_emit_<type>` of `bc_param_<type>` or `bc_emit_null`; for an aggregate, `bc_emit_i64` (every aggregate is held as an `int64_t`), and `bc_emit_null` for NULL |
 
 A NULL that a key needs means no row can match, since `=` and the range
 operators reject NULL: a parameter ends the plan before any read
@@ -675,12 +705,293 @@ loop is made to read rows: the probe side's sorter holds its row, so its
 loop reads rows, and nothing else does for it. Any plan can instead be
 sorted above the join (*Sorts*).
 
+### Joins of several tables
+
+**The tree.** A `FROM` of tables is a left-deep tree of `Join`s, one per
+item after the first: `a JOIN b … JOIN c …`, or a comma list. The binder
+checks each `ON` against the items up to its own (a later table is 42P01, as
+PostgreSQL). An inner join's `ON` goes with the `WHERE`'s conjuncts and
+pushdown moves it to the lowest `Join` that has its tables; an outer join's
+stays its own. The front end takes at most eight tables
+(`kMaxFrom`): the search is a pass over the subsets of them, 255 sets
+at eight, each extended by each table left (the bit masks allow 32, which
+would be 2^32).
+
+**A table read twice.** `ColumnRef::table` names a table by id, and the plan
+reads by it, so two uses of a table need two ids. The binder gives each use
+named by an alias, and each repeat, an *instance*: a copy of the `Table`
+under the name the query gives it, with an id at or above
+`Table::kInstanceBase` and `Table::source`, the id of the table whose rows it
+reads. The bound statement owns the instances (`bound::Bound::instances`).
+The logical and physical plans see two tables; the plan text names each
+instance's constants by its own id, whose values are the one table's
+(`TBL_1073741825 = 1`), so codegen has nothing to know. What the rest of
+the system reads by the table's id reads `storage_id()`: the constants
+(`Catalog::constants`), the table's row counts, the table a failed range
+check names, and the objects and columns a plan declares to the runtime
+(`Writer::storage`), so a plan that reads a table twice is refused and
+recompiled when the table's ids change, as one that reads it once. An index
+and the parts of its key are named by the index, so two instances share
+those constants. A parser keeps an alias only where a table is named twice;
+elsewhere it rewrites the alias to the table (*the dialect*,
+`frontend_design.md`). Two views of one table, merged into the query under
+one name, are refused.
+
+**Outer joins in a chain.** A query with an outer join is planned in `FROM`
+order, each table joined to those before it, since a join's right side
+cannot move before its left. `Rel::outer` marks the right side of a left
+outer join; each outer table is read under the rows before it by a lookup
+on its key or a scan (*Outer joins*), and each inner join after it the usual
+ways, but never hashed. A column of a table an outer join may NULL-extend is
+NULL-able in the `ON` of every later join and everywhere above (the binder
+marks it; a key a later join builds from it keeps the mark, so a row of
+NULLs is a miss and never a key of whatever the column's bytes hold). So an
+inner join after an outer one drops the rows it NULL-extended where its `ON`
+reads them, and one before it does not. `RIGHT JOIN` is a left join of its
+two tables swapped, so it is taken only of two tables; `USING` and `NATURAL`
+only for the first join.
+
+**A comparison, and a predicate over both sides.** Any comparison of a
+column of each table joins them, as `=` does: `use_of` takes it, and where
+no equality keys the inner table, the comparison filters the pairs of a
+nested loop. A predicate over two tables' columns (`NOT (a.x = b.y)`, `OR`,
+`IS NULL` among comparisons) is a `Cross`: a filter of the pairs, run by the
+step that reads the last of its tables, or an outer join's `ON`, by that
+join's own step, as a match. It is refused on a DOUBLE or REAL column like
+any filter. `physical::check` takes such a predicate only over rows in hand
+(the loops' tables and the outer side's), so a plan that evaluated it early
+would not be printed.
+
+**What bounds each form.** Memory: a nested loop, an index join and an
+outer join hold the rows of one step per loop and nothing per row of
+either side (*Memory*), so a self-join, a chain and a join on a comparison
+run in a small budget whatever the tables hold
+(`embedded API: a join over many outer rows runs in a small memory
+budget`, and `… a self-join, a chain of joins and a join on a comparison run
+in a small memory budget`). A hash join holds its build side
+in the budget as before, and a plan holds at most one (`check`: `a plan with
+more than one hash join`): the choice by the budget (*Memory*) counts one
+build side and falls back to a plan with none, so a second hash table would
+be bounded by the budget alone (#696). The other joins of such a plan are
+nested loops. Time: a join no key reaches, a comparison among them, reads the
+inner table once per outer row, so its reads are the product of the sides,
+as a cross join's always were; the work budget (`max_reads`, off by
+default) is what bounds it. The statement's result is buffered, and its
+bytes count against the memory budget, so a join that returns a product
+fails with 54000 where PostgreSQL streams it.
+
+### Outer joins
+
+A left outer join (`RIGHT JOIN` is one of its sides swapped, by the binder)
+is planned in one order: its left tables first, by any access path, and its
+right table under them, by a lookup on its key or a scan, read once per left
+row; in a chain, each right table under the rows before it (*Joins of
+several tables*). It is never hashed, as a build of the right side would
+lose the left rows it matches nothing of. Under each left row the plan sets a matched
+flag; after the right side's loop, a row nothing matched is joined to
+`bc_null_row`'s row of NULLs, every column of the right table NULL, and the
+plan goes on with it as with any other.
+
+The join's predicate is the right side's key and filters; a conjunct on
+the left side alone is a filter of the right side's rows too, which reads
+the left row. The `WHERE` conjuncts on the right side's columns filter the
+joined rows, before any sort, so `LIMIT` counts the rows they keep. Above
+the join every column of the right table is nullable, its declaration
+aside: the binder marks it, and the plan tests the NULL. A conjunct of the
+`ON` that reads both sides and is no comparison with a key is the pair's
+match, tested after the row is read.
+
+A NULL parameter of the right side's key matches no row: it is that side's
+guard, which skips its loop and leaves the left row NULL-extended, where an
+inner join's plan would end with no rows. Probed by key, the right side is
+looked up only when no part is NULL and the key fits: a NULL, or a left
+value too long for any key, is a miss, and the left row goes on.
+
+### Subqueries
+
+An uncorrelated subquery is a statement of its own, run once before the
+statement's plan, on its snapshot and in its transaction: the binder binds
+its `SELECT` as any, and lists it beside the logical plan
+(`logical::Subquery`) with what its rows are folded into, in hidden
+parameters after the constants', NULL until it runs:
+
+| Kind | From | Its parameters |
+|---|---|---|
+| Value | `col op (SELECT …)`, `(SELECT …)` in a select list | its row's value; NULL for none, 21000 for a second |
+| Exists | `EXISTS` | a BOOLEAN, whether it gave a row; it reads one at most, under a `LIMIT 1` |
+| Bounds | `op ANY` and `op ALL` of other than `=` and `<>` `ALL` | its largest and smallest non-NULL values; then NULL if a row was NULL, else FALSE; then whether it gave a row |
+| Set | `IN`, `= ANY`, `<> ALL` | the two flags; its non-NULL values are a set the runtime holds |
+
+A Value is a parameter to the plan as a caller's is: it keys a lookup or
+bounds a range, and the plan ends when it is NULL. The others are a
+predicate the binder writes over two leaves: `Truth`, a BOOLEAN parameter,
+NULL as unknown; and `InSet`, whether a column's value is in a Set's set.
+`x op ANY S` is `(core OR f1) AND f2`, `core` being `x < max` (`<`, `<=`),
+`x > min` (`>`, `>=`), `x < max OR x > min` (`<>`) or `x InSet S` (`=`), `f1`
+the NULL flag and `f2` whether S gave a row: true where a value makes `x op`
+it true, NULL where none does and a row was NULL or x is, false otherwise
+and over no rows. `x op ALL S` is `NOT (x op' ANY S)`, `op'` the negation
+of `op`. So each outer row costs one comparison or one set lookup, whatever
+the subquery's size. Its value is compared as a parameter, of a type the
+column compares with: integers of any width with integers, a key encoding
+each as 64 bits (an out-of-range value matches nothing and bounds a range
+where it falls), a DECIMAL of the column's scale, strings with strings.
+
+Each subquery is searched alone, its cheapest plan kept for every plan of
+the statement (`physical::Sub`), and printed as a function of its own,
+`sub<i>`, so a miss in it returns from it. The statement's plan calls each
+first, between `bc_sub_begin` and `bc_sub_end`, which fold what it emits
+into its parameters and set (`plan_api_design.md`, *Subqueries*); then its
+computed values, NULL checks and pipeline run as without one.
+
+Not planned yet: a correlated subquery, one inside another, one in `FROM`
+(a derived table), and `IN (SELECT …)` as a semi-join that probes the outer
+table's key per value, which #659 tracks.
+
+### Set operations
+
+`UNION`, `INTERSECT` and `EXCEPT`, each with `ALL` or `DISTINCT`, are a
+`logical::SetOp` of two queries, each a `SELECT` or another set operation,
+under the statement's `LIMIT`. PostgreSQL's precedence is the parser's:
+`INTERSECT` is the inner node of `a UNION b INTERSECT c`. The binder binds
+each arm alone, as a `SELECT` of its own, and resolves the columns the arms
+give pair by pair (`frontend_design.md`, *Set operations*); the rewrites
+treat each arm as a statement. The search plans each arm alone and keeps its
+cheapest plan, as it does a subquery's (`physical::SetPlan`: a tree whose
+leaves are arm plans whose root is an `Emit`); an arm that is not a plain
+`SELECT` (a group, an aggregate, `DISTINCT`) is refused by the binder.
+
+Codegen prints one function. Each arm is a block of it, its pipeline as
+alone with every result row going to a sink instead of `bc_emit_*`, and
+what the sink does is the operation's part. Nothing is collected: a row is
+returned while it is in hand, so the plan holds only what telling duplicates
+apart needs. A row's key is a sort key of its columns, each ascending, NULL
+last (`bc_sort_key_*`), so two rows are alike where each column is equal and
+NULL equals NULL, and the key goes to a `bc_agg` as its group key:
+
+| Operation | Streams | Holds |
+|---|---|---|
+| `UNION ALL` | both arms, left first, to the parent | nothing |
+| `UNION [DISTINCT]` | both arms through one aggregate: a row is returned the first time its group is seen | the keys of the rows returned |
+| `EXCEPT [DISTINCT]` | the right arm into the aggregate, then the left: returned if its group holds no right row, once | the keys of the right rows, then of the left |
+| `EXCEPT ALL` | the same: slot 0 counts the right rows, slot 1 the left rows they cancelled; a left row cancels one while slot 1 < slot 0, else it is returned | as above |
+| `INTERSECT [DISTINCT]` | the left arm into the aggregate, then the right: returned if its group holds a left row, once | the keys of the left rows, then of the right |
+| `INTERSECT ALL` | the same: a right row is returned while the left rows of its key are not used up | as above |
+
+So `ALL` returns `max(l − r, 0)` copies for `EXCEPT` and `min(l, r)` for
+`INTERSECT`, as PostgreSQL does, and a set operation of several arms nests
+these: the rows of an inner node are the stream its parent's sink reads,
+converted to the parent's column types (an integer meeting a `DOUBLE
+PRECISION` is read as one: `bc_i64_to_f64`). The sort key makes `-0.0`
+equal to `0.0` and NaN equal to NaN, as PostgreSQL's set operations compare.
+
+**Memory.** The structures are charged to the statement's budget like any
+group (*Memory*). What bounds them is the arm held: for `UNION` the distinct
+rows returned, for `EXCEPT` and `INTERSECT` the held side's distinct rows
+and then the other's, since a probe adds its row's group too. It is
+unbounded in the tables' size, like `GROUP BY` of a high-cardinality
+column, and past the budget the statement fails with 54000, never spilling.
+Which side is held is the plan's fixed choice (the right of `EXCEPT`, the
+left of `INTERSECT`); no row count decides it. Choosing the smaller side
+needs `bc_count_range` per arm, which is a choice point (*Choosing at run
+time*) the first slice does not build (#682).
+
+**`ORDER BY`.** The `ORDER BY` of the combined rows names the operation's
+columns, by the first arm's names or by position (`frontend_design.md`),
+so its keys are known when the plan is printed: `logical::SetOp::order`,
+the root's alone, becomes `physical::Plan::set_order`. The plan holds the
+rows in one `bc_sorter`. Every row the arms give, as it is in hand, is
+added with two sort keys: the sorter's key, of the `ORDER BY` columns in
+their directions and NULL placements (NULLS LAST for `ASC` and FIRST for
+`DESC` unless the statement says), and the payload, a sort key of all the
+columns, each ascending. After the arms a loop over the sorter reads each
+payload back part by part with `bc_sort_key_part_*` (`plan_api_design.md`)
+and emits the row. The payload is a second key rather than the sorter's key
+because the sorter's key has the `ORDER BY`'s directions, which the
+decoders do not read. A `DOUBLE` column is two parts in the payload, the
+value and a flag for a negative zero, since the key holds `-0.0` as `0.0`;
+a NaN comes back as the one NaN, as PostgreSQL has one. The arms are all read
+whole (no arm stops at a `LIMIT`, since a later row may sort first).
+`DISTINCT` and `ALL` arms feed the sorter the same rows they would
+return: the sink above still tells duplicates apart.
+
+*Memory:* the sorter's entries are charged to the statement's budget like any
+sort's (*Sorts*, *Memory*): without a `LIMIT` it holds every row of the
+combined arms, one key and one payload each, plus what an operation that
+tells duplicates apart already holds, and past the budget the statement
+fails with 54000, never spilling. With a `LIMIT n` it is a top-n sorter
+(`bc_sorter_open(cx, n)`), which holds at most the first n rows in order and
+copies none that sorts after them, so the rows held are bounded by n, not
+by the tables.
+
+**`LIMIT`.** Without an `ORDER BY`, a `LIMIT` over the combined rows is a counter in the plan,
+`setcount`: the sink of the stream that reaches the statement returns a row
+only while `setcount < n`, and every loop of those arms also stops at it,
+so `... UNION ALL ... LIMIT 1` reads one row. The arm whose rows only fill a
+structure is read whole. With an `ORDER BY` it is the sorter's `keep`, above.
+
+**A miss skips an arm, not the plan.** A point lookup that finds no row, or
+a NULL parameter a key needs, ends an ordinary plan; an arm's code is
+wrapped in an `if` at the place, so the rest of the arm is skipped and the
+next one runs.
+
+**Not built.** `ORDER BY` of a parenthesised set operation inside another,
+and a `LIMIT` on one. An arm that groups, aggregates or is `DISTINCT` (#682);
+`FOR UPDATE`; a literal of no type meeting another type; `DECIMAL` of two
+scales, or with an integer; an integer with `REAL`; `DATE` with `TIMESTAMP`.
+
+### Expressions over columns
+
+A select-list item such as `a + b`, `a * 2 > c` or `a + a IS NULL` is a
+`logical::Expr` tree in the `Project`: columns, parameters (a constant or a
+subquery's value is one, hidden), `Add`, `Sub`, `Mul`, `Div`, `Compare`,
+`IsNull`, `Not`, `And`, `Or`, `Case` and `Coalesce`, each typed by the binder
+(`frontend_design.md`, *Expressions over columns*). It is **one evaluator**:
+
+- **Search.** `emit_targets` makes a `physical::ExprTarget` of any output
+  that is neither a column nor a parameter; the columns it reads are the
+  `Project`'s needs like any other, so projection pruning, the choice of a
+  covering index and the rows a sorter holds (`q.above`) include them. The
+  checks are the Emit's: each column read is of a table in hand, never a
+  DOUBLE from a key. Nothing else in the search sees the tree.
+- **Codegen.** `Gen::eval(expr)` prints the expression for the row in hand
+  and returns its NULL test and value as C. Each operator's result is a
+  local (`v<i>`, with `n<i>` its NULL), so an operand prints once however
+  deep the tree. Arithmetic is the plan API's helpers (`bc_add`, `bc_sub`,
+  `bc_mul`, `bc_div`, `bc_add_bigint`, `bc_check_int`), called only for a
+  row whose operands are not NULL, so a NULL column raises nothing. A
+  `DECIMAL` is its scaled `int64_t`; an operand at a coarser scale is
+  multiplied by a power of ten first (`bc_mul`), which the binder has kept
+  inside 18 digits. `AND` and `OR` evaluate each operand in an `if (!settled)`
+  block, so an operand an earlier one settles is not evaluated and raises
+  nothing. `Emit` evaluates every expression of a row before `bc_emit_begin`,
+  then emits each by its type; in a set operation's arm the value goes to
+  the sink as any column does.
+- **`CASE` and `COALESCE`.** `Case` holds WHEN, THEN, … and an ELSE if
+  there is one; `Coalesce` its arguments. A simple `CASE` and `NULLIF` are
+  built by the binder from `Compare` and `Case`, so `eval` has two cases.
+  Each is a result local (`v<i>`, `n<i>`, NULL until a branch gives a value) and each
+  branch is evaluated inside an `if`, as `AND` is: a WHEN only while no
+  earlier one was true, its THEN only when its WHEN is (a NULL condition is
+  not true), a COALESCE argument only while the result is NULL. So an
+  untaken branch raises nothing. A numeric branch is multiplied up to the
+  result's scale when it is finer-bound (the binder keeps it within 18
+  digits); the Emit check refuses a branch of another type than its
+  result, a coarser numeric one, or a WHEN that is not BOOLEAN. Text and
+  floats go through the same locals (`bc_view`, `double`).
+- **What plugs in.** The string functions (#671) are more `Kind`s of the
+  same tree and more cases in `eval`.
+- **Cost.** A plan with no such output prints exactly what it printed
+  before. An expression adds locals and a call per operator to each row it
+  is evaluated for; no performance claim is made.
+
 ### Aggregates
 
 **One row of `COUNT` or `SUM`.** A lone `COUNT`, `COUNT(DISTINCT)` or
-`SUM`, with no `GROUP BY` or `HAVING`, is an `Aggregate` over its input: a
-`CountRange` where the keys answer it, else the loop with an accumulator.
-Everything else aggregated, a lone `MIN` or `MAX` among it, is a
+`SUM` of an integer or `DECIMAL`, with no `GROUP BY` or `HAVING`, is an
+`Aggregate` over its input: a `CountRange` where the keys answer it, else
+the loop with an accumulator. Everything else aggregated, a lone `MIN` or
+`MAX`, a `SUM` of `DISTINCT` values or of a `DOUBLE` among it, is a
 `GroupAggregate`, one route, and where its aggregates allow it also
 answered from the keys.
 
@@ -751,9 +1062,16 @@ the order they first appeared. Where it keeps what it gives for a group
 - each aggregate a slot: `COUNT` by `bc_agg_count`, `SUM` by
   `bc_agg_add_i64`, `MIN` and `MAX` by `bc_agg_min_i64` and
   `bc_agg_max_i64`, `AVG` two, its sum and its count; NULL inputs skipped,
-  and `SUM`, `MIN`, `MAX` and `AVG` NULL where `bc_agg_null`;
-- a `COUNT(DISTINCT col)` keeps an aggregate of its own, one slot, keyed by
-  the group's key and the value: a pair new to it counts in the group.
+  and `SUM`, `MIN`, `MAX` and `AVG` NULL where `bc_agg_null`. Of a DOUBLE
+  they are `bc_agg_add_f64`, `bc_agg_min_f64` and `bc_agg_max_f64`, and the
+  slot is read by `bc_agg_f64`;
+- the aggregates of `DISTINCT` values over one column (`COUNT`, `SUM`,
+  `AVG`) share an aggregate of their own, one slot, keyed by the group's
+  key and the value: a pair new to it is folded into each of them, once, so
+  `SUM(DISTINCT v)` beside `COUNT(DISTINCT v)` sees each value once.
+  `MIN(DISTINCT v)` and `MAX(DISTINCT v)` are
+  bound without the quantifier: the extremes of the distinct values are
+  those of all.
 
 A group's handle is found again by its key (`bc_agg_group` finds an
 existing group and charges nothing), since a plan's locals are initialized
@@ -790,7 +1108,7 @@ the next, then after the loop for the last. A dependent column is read from
 each row and kept beside the keys. Its columns are I64 and BOOLEAN, the
 types a local holds, read from a row or from a covering scan's entry: a
 stream holds no row, so it may cover where a structure may not. Nothing is
-held but the group in hand's `COUNT(DISTINCT)` values: each argument's
+held but the group in hand's distinct values: each argument's
 aggregate is keyed by the value alone and cleared (`bc_agg_clear`) as each
 group ends, so a stream's memory does not grow with its groups. With no key
 it is one group, given after the input, over no rows too, and its no-rows
@@ -801,7 +1119,7 @@ each `COUNT` 0 and every other aggregate NULL, under its `HAVING`.
 bool st0 = false;
 int64_t kv0_0 = 0;
 int64_t x0_0 = 0;
-bc_agg d0_0 = bc_agg_open(cx, 1);  // COUNT(DISTINCT) values seen per group
+bc_agg d0_0 = bc_agg_open(cx, 1);  // DISTINCT values seen per group
 /* the input's loop, in a's order */
     int64_t rk0_0 = bc_col_i64(cx, row, COL_4_0);
     if (st0 && (rk0_0 != kv0_0)) {
@@ -832,7 +1150,19 @@ reads. `SELECT a, count(*) FROM g GROUP BY a`, 1,000 rows, an index on a:
 streamed in its order, covering, 1,000; the structure over any scan costs
 more by 1,000 × 1.3 + 100.
 
-**AVG** is PostgreSQL's `numeric`: `numeric_div` of the sum by the count
+**DOUBLE aggregates.** `SUM`, `AVG`, `MIN` and `MAX` of a DOUBLE column
+are `double precision`. A stream keeps them in `double` locals and folds
+them with `bc_add_f64` (the float8 sum: finite operands that overflow
+are `BC_E_ARITH`, an infinity or NaN carries) and `bc_min_f64` and
+`bc_max_f64` (PostgreSQL's order, NaN above every number; of equal values,
+`-0.0` and `0.0`, the second, as `float8smaller` keeps it); a structure's
+slot is the same through `bc_agg_*_f64`. `AVG` is the float8 quotient,
+emitted by the plan as one `F64` column: the sum over the count converted
+by `bc_i64_to_f64`. A DOUBLE is never read from a key (`bc_key_part_f64`
+is `BC_E_HANDLE`), so these read the row, and are never answered from the
+keys.
+
+**AVG** of an integer or DECIMAL is PostgreSQL's `numeric`: `numeric_div` of the sum by the count
 at the scale `select_div_scale` chooses, 16 significant digits or more,
 rounded half away from zero, which can pass 64 bits. So the plan emits the
 sum and the count, two `I64` columns for one result column
@@ -923,15 +1253,18 @@ never at more.
   u.v = t.qty`, t at 40 rows and u at 100, under 10,000 bytes: the hash join
   built on t's range costs 8 + 4 × 1.3 + 100 + 40; a row of t holds at least
   36 bytes and a key 9, so the plan counts that range against 35. A sorted
-  probe side, or a sort above the join, is not a choice by the budget.
+  probe side, or a sort above the join, is not a choice by the budget. A
+  plan holds one hash table (*Joins of several tables*); the joins above or
+  below it in a join of three tables or more are streams, and both plans of
+  the choice read the same tables.
 - **A structure of groups** over one table's range, where a streamed plan
   avoids it: fixed `kAggBytes` and a byte per slot, `kHashBytes` per table
-  whose rows its groups hold, `kAggBytes` + 1 per `COUNT(DISTINCT)`, and
+  whose rows its groups hold, `kAggBytes` + 1 per column with `DISTINCT` aggregates, and
   `kSorterBytes` where it sorts its groups; per row, as if each started a
-  group and gave each `COUNT(DISTINCT)` a new value, what `bc_agg_group`,
+  group and gave each `DISTINCT` column a new value, what `bc_agg_group`,
   `bc_hash_put` and `bc_sorter_add` charge: the group's key,
   `kGroupEntryBytes` and `kAggSlotBytes` per slot; per held table its row,
-  `kHashEntryBytes` and the group's key; per `COUNT(DISTINCT)` a key of the
+  `kHashEntryBytes` and the group's key; per `DISTINCT` column a key of the
   group's key, as a byte-string part, and the value's part,
   `kGroupEntryBytes` and one slot; in a sort the sort key, the group's key
   as payload and `kSortEntryBytes`. The other plan is the cheapest streamed
@@ -997,10 +1330,12 @@ with uncompilable C:
 - a conjunct `use_of` refuses (`no plan: a conjunct on <table> that does
   not compare one of its columns`, `… compares two columns outside a
   join`, `a join conjunct that does not compare a column of each side`,
-  `a conjunct that reads no column`); a table joined with itself; more than
-  32 tables;
-- a result, aggregate, `GROUP BY` or `ORDER BY` column that is not a column
-  of the statement's tables; an output or `ORDER BY` key not grouped; a
+  `a conjunct that reads no column`, `a predicate (…) that reads no column`);
+  a table read twice with no instance for each use; a left outer join whose
+  right side is more than one table; more than 32 tables;
+- a result column that is not an expression of columns of the statement's
+  tables; an aggregate, `GROUP BY` or `ORDER BY` column that is not a
+  column of them; an output or `ORDER BY` key not grouped; a
   `HAVING` conjunct that does not compare a grouped column or an aggregate
   with a parameter.
 
@@ -1029,7 +1364,12 @@ join no key reaches and an `ORDER BY` over a plan of two loops are planned.
   (`group_by_hash`, `group_by_stream`, `group_by_stream_limit`,
   `group_by_held_row`, `group_by_having`, `group_by_sorted`,
   `group_by_distinct`, `group_by_join`, `group_by_double`,
-  `group_by_dependent`, `group_by_dependent_held`, `aggregates_ungrouped`).
+  `group_by_dependent`, `group_by_dependent_held`, `aggregates_ungrouped`)
+  and set operations (`set_union_distinct`, `set_union_all_limit`,
+  `set_union_all_scan_limit`, `set_except_all`, `set_intersect_double`,
+  `set_precedence`, `set_subquery`) and joins of several tables
+  (`join_three_tables`, `join_self`, `join_left_chain`, `join_less_than`,
+  `join_not_equal`).
 - **Alternatives agree.** `search_all` returns every plan the search
   costed, none pruned, cheapest first. `generate_alternatives` prints each
   once per combination of its choice points' branches, 2^k for k choice
@@ -1057,10 +1397,15 @@ join no key reaches and an `ORDER BY` over a plan of two loops are planned.
   threshold, left out where known not to fit, a grouped hash join's choice;
   `COUNT(*)`, `MIN` and `MAX` from the keys, a lone `MIN` and a lone `MAX`
   by one route, and a loop where they don't apply; under `LIMIT 0` no plan
-  reads anything. Every plan the tests cost passes `check` in every
-  combination of its branches.
+  reads anything; joins of three tables in any order, one hash table at
+  most, a chain of left joins in `FROM` order with a row of NULLs for each,
+  a predicate over two tables filtering where the last is read, and the
+  constants of a table's two instances. Every plan the tests cost passes
+  `check` in every combination of its branches.
 - **`physical::check`** (`physical_test`): each refusal of *The physical
-  plan and codegen*, with a plan that passes beside it; among them a
+  plan and codegen*, with a plan that passes beside it; among them a plan of
+  two hash joins, and a predicate over two tables read outside the loops that
+  hold their rows, and a
   `KeyAggregates` of a nullable argument whose range starts at the NULLs
   (no range, a full scan's, an upper bound alone, the NULL part itself),
   and of an argument not held as `I64`.
@@ -1094,7 +1439,9 @@ join no key reaches and an `ORDER BY` over a plan of two loops are planned.
   BY` with several aggregates; and grouped joins (`group_by`,
   `group_by_join`). Its models `served` and `join_served` say whether some
   plan serves a statement: what they don't serve is the `DOUBLE` filter.
-  Fixed cases: `test_both_plans_of_a_choice_point_agree`,
+  Fixed cases: `test_joins_of_several_tables_with_themselves_and_on_any_comparison`
+  (three or more tables, a table with itself, any comparison, a chain of
+  left joins, through the layer, the server and every costed plan), `test_both_plans_of_a_choice_point_agree`,
   `test_hash_joins`, `test_group_by`,
   `test_a_grouped_hash_join_and_its_other_plan_both_order_the_groups`,
   `test_a_having_parameter_typed_by_the_where`.
@@ -1118,9 +1465,9 @@ Each slice was one PR, or a few, with its tests.
 5. **Hash joins and `GROUP BY`**, with `HAVING`, `MAX`, `AVG` and several
    aggregates in one select list.
 
-The rest of the dialect stays in #534: three or more tables, aliases,
-expressions, `OFFSET`, `RETURNING` and multi-row `VALUES`, subqueries and
-outer joins, `FOR UPDATE` on joins, and `EXPLAIN`. The serializable guards,
+The rest of the dialect stays in #534: aliases of a join and of columns,
+expressions, `OFFSET`, `RETURNING` and multi-row `VALUES`, correlated subqueries,
+`FULL JOIN`, `FOR UPDATE` on joins, and `EXPLAIN`. The serializable guards,
 the plan cache and procedures (#495) keep their own designs.
 
 ## Decisions

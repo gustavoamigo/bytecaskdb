@@ -1,0 +1,25 @@
+A write whose sync after its rotation fails, with no memory to publish the
+degraded state, gets std::bad_alloc in the I/O error's place. Reverts #623.
+Guarded-by: "alloc sweep: rotation-crossing write whose sync after the rotation fails"
+
+diff --git a/bytecaskdb/db_commit.cpp b/bytecaskdb/db_commit.cpp
+index 4093733..b7573d8 100644
+--- a/bytecaskdb/db_commit.cpp
++++ b/bytecaskdb/db_commit.cpp
+@@ -340,12 +340,10 @@ void DB::commit_appended(TransientEngineState &t,
+     } catch (...) {
+       auto ex = std::current_exception();
+       counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
+-      degrade_from(published, [&] {
+-        return std::format(
+-            "commit fdatasync failed on '{}': bytes in page cache but "
+-            "durability not confirmed. Call resume() to recover.",
+-            file.path().string());
+-      });
++      store_state(published->degraded_copy(std::format(
++          "commit fdatasync failed on '{}': bytes in page cache but "
++          "durability not confirmed. Call resume() to recover.",
++          file.path().string())));
+       for (auto *s : batch) {
+         if (!s->err) s->err = ex;
+       }
