@@ -288,7 +288,9 @@ A promotion (`set_mode(Mode::Leader)` on a follower) appends one entry of type
 `0x06` with an empty key and an 8-byte little-endian value, a random id. The
 entry's own sequence and that id together identify the history from this
 sequence on: two databases holding the same marker at a sequence hold the
-same history up to it. A leader that was never promoted holds no marker.
+same history up to it. Every open in Leader mode and every promotion appends
+one; a database only ever opened as a follower holds only the markers it
+ingested.
 Vacuum copies every change marker and never removes a file holding one, so a
 database's marker at any sequence is the same after any vacuum.
 

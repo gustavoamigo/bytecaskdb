@@ -274,7 +274,7 @@ One slice of this node's history for `ingest`: the whole units above `fromSeq` t
 
 `ChangeHeader` is `{ marker: { sinceSequence: bigint, id: bigint }, fromSequence: bigint }`. The marker is the identity of the source's history at `fromSeq`: its last `changeMarker` entry at or below it, or `ORIGIN_MARKER` (`{ sinceSequence: 0n, id: 0n }`) if it holds none.
 
-A `changeMarker` entry is a promotion: `setMode('leader')` on a follower appends one, with an empty key and the marker's 8-byte little-endian id as its value, before the first write it accepts.
+A `changeMarker` entry starts a history: every `open` in leader mode appends one, and so does `setMode('leader')` on a follower, before the first write it accepts. Its key is empty and its value the marker's 8-byte little-endian id. A node opened as a leader therefore holds a history of its own and cannot follow another leader, even after `setMode('follower')`: open a follower with `{ initialMode: 'follower' }`.
 
 ---
 

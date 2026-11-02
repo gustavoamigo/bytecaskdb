@@ -90,7 +90,8 @@ TEST_CASE("prove_group__group_of_2__success", "[prove_group][concurrency]") {
       bytecask::WritePlan plan;
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -181,7 +182,8 @@ TEST_CASE("prove_group__group_of_2__group_append_fails", "[prove_group][concurre
       bytecask::WritePlan plan;
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -270,7 +272,8 @@ TEST_CASE("prove_group__group_of_2__group_append_partial_write", "[prove_group][
       bytecask::WritePlan plan;
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -361,7 +364,8 @@ TEST_CASE("prove_group__group_of_2__group_commit_sync_fails", "[prove_group][con
       bytecask::WritePlan plan;
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -455,7 +459,8 @@ TEST_CASE("prove_group__group_of_4__success", "[prove_group][concurrency]") {
       bytecask::WritePlan plan;
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -546,7 +551,8 @@ TEST_CASE("prove_group__group_of_4__group_append_fails", "[prove_group][concurre
       bytecask::WritePlan plan;
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -635,7 +641,8 @@ TEST_CASE("prove_group__group_of_4__group_append_partial_write", "[prove_group][
       bytecask::WritePlan plan;
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -726,7 +733,8 @@ TEST_CASE("prove_group__group_of_4__group_commit_sync_fails", "[prove_group][con
       bytecask::WritePlan plan;
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -821,7 +829,8 @@ TEST_CASE("prove_group__group_of_2_batched__success", "[prove_group][concurrency
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       plan.put(to_bytes("h" + idx), to_bytes("hv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -914,7 +923,8 @@ TEST_CASE("prove_group__group_of_2_batched__group_append_fails", "[prove_group][
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       plan.put(to_bytes("h" + idx), to_bytes("hv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -1005,7 +1015,8 @@ TEST_CASE("prove_group__group_of_2_batched__group_append_partial_write", "[prove
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       plan.put(to_bytes("h" + idx), to_bytes("hv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -1098,7 +1109,8 @@ TEST_CASE("prove_group__group_of_2_batched__group_commit_sync_fails", "[prove_gr
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       plan.put(to_bytes("h" + idx), to_bytes("hv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -1194,7 +1206,8 @@ TEST_CASE("prove_group__group_of_4_batched__success", "[prove_group][concurrency
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       plan.put(to_bytes("h" + idx), to_bytes("hv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -1287,7 +1300,8 @@ TEST_CASE("prove_group__group_of_4_batched__group_append_fails", "[prove_group][
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       plan.put(to_bytes("h" + idx), to_bytes("hv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -1378,7 +1392,8 @@ TEST_CASE("prove_group__group_of_4_batched__group_append_partial_write", "[prove
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       plan.put(to_bytes("h" + idx), to_bytes("hv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -1471,7 +1486,8 @@ TEST_CASE("prove_group__group_of_4_batched__group_commit_sync_fails", "[prove_gr
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       plan.put(to_bytes("h" + idx), to_bytes("hv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -1566,7 +1582,8 @@ TEST_CASE("prove_group__group_of_2_rotation__success", "[prove_group][concurrenc
       bytecask::WritePlan plan;
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -1657,7 +1674,8 @@ TEST_CASE("prove_group__group_of_2_rotation__group_rotation_sync_fails", "[prove
       bytecask::WritePlan plan;
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = false}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = false}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -1746,7 +1764,8 @@ TEST_CASE("prove_group__group_of_2_rotation__group_rotation_file_creation_fails"
       bytecask::WritePlan plan;
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -1835,7 +1854,8 @@ TEST_CASE("prove_group__group_of_4_rotation__success", "[prove_group][concurrenc
       bytecask::WritePlan plan;
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -1926,7 +1946,8 @@ TEST_CASE("prove_group__group_of_4_rotation__group_rotation_sync_fails", "[prove
       bytecask::WritePlan plan;
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = false}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = false}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }
@@ -2015,7 +2036,8 @@ TEST_CASE("prove_group__group_of_4_rotation__group_rotation_file_creation_fails"
       bytecask::WritePlan plan;
       plan.put(to_bytes("g" + idx), to_bytes("gv" + idx));
       try {
-        results[static_cast<std::size_t>(i)] = db.apply_batch({.sync = true}, std::move(plan));
+        if (auto r = db.apply_batch({.sync = true}, std::move(plan)))
+          results[static_cast<std::size_t>(i)] = *r;
       } catch (const std::exception &) {
         threw[static_cast<std::size_t>(i)] = true;
       }

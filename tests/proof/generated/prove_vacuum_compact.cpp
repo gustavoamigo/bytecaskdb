@@ -90,6 +90,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__success", "[prove_vacuum_com
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -133,6 +136,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__tmp_create_fails", "[prove_v
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -179,6 +185,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__append_fails", "[prove_vacuu
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -225,6 +234,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__sync_fails", "[prove_vacuum_
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -271,6 +283,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__rename_fails", "[prove_vacuu
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -320,6 +335,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__unlink_fails", "[prove_vacuu
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -370,6 +388,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__post_rename", "[prove_vacuum
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -419,6 +440,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__shrink_fails", "[prove_vacuu
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -468,6 +492,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__fallback_unlink_fails", "[pr
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -530,6 +557,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__fallback_unlink_persistent",
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -592,6 +622,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__success", "[prove_vacuum_compact]"
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -643,6 +676,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__tmp_create_fails", "[prove_vacuum_
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -697,6 +733,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__append_fails", "[prove_vacuum_comp
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -751,6 +790,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__sync_fails", "[prove_vacuum_compac
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -805,6 +847,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__rename_fails", "[prove_vacuum_comp
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -862,6 +907,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__unlink_fails", "[prove_vacuum_comp
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -920,6 +968,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__post_rename", "[prove_vacuum_compa
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -977,6 +1028,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__shrink_fails", "[prove_vacuum_comp
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -1034,6 +1088,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__fallback_unlink_fails", "[prove_va
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -1104,6 +1161,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__fallback_unlink_persistent", "[pro
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -1175,6 +1235,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__success", "[prove_vacuu
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -1220,6 +1283,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__tmp_create_fails", "[pr
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -1268,6 +1334,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__append_fails", "[prove_
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -1316,6 +1385,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__sync_fails", "[prove_va
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -1364,6 +1436,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__rename_fails", "[prove_
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -1415,6 +1490,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__unlink_fails", "[prove_
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -1467,6 +1545,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__post_rename", "[prove_v
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -1518,6 +1599,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__shrink_fails", "[prove_
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -1568,6 +1652,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__fallback_unlink_fails",
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -1630,6 +1717,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__fallback_unlink_persist
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -1693,6 +1783,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__success", "[prove_vacuum_comp
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -1746,6 +1839,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__tmp_create_fails", "[prove_va
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -1802,6 +1898,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__append_fails", "[prove_vacuum
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -1858,6 +1957,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__sync_fails", "[prove_vacuum_c
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -1914,6 +2016,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__rename_fails", "[prove_vacuum
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -1973,6 +2078,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__unlink_fails", "[prove_vacuum
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -2033,6 +2141,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__post_rename", "[prove_vacuum_
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -2092,6 +2203,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__shrink_fails", "[prove_vacuum
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -2150,6 +2264,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__fallback_unlink_fails", "[pro
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -2220,6 +2337,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__fallback_unlink_persistent", 
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -2291,6 +2411,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__success", "[prove_vacuu
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -2336,6 +2459,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__tmp_create_fails", "[pr
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -2384,6 +2510,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__append_fails", "[prove_
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -2432,6 +2561,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__sync_fails", "[prove_va
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -2480,6 +2612,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__rename_fails", "[prove_
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -2531,6 +2666,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__unlink_fails", "[prove_
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -2583,6 +2721,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__post_rename", "[prove_v
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -2634,6 +2775,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__shrink_fails", "[prove_
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -2684,6 +2828,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__fallback_unlink_fails",
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -2746,6 +2893,9 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__fallback_unlink_persist
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
@@ -2809,6 +2959,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__success", "[prove_vacuum_comp
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -2862,6 +3015,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__tmp_create_fails", "[prove_va
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -2918,6 +3074,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__append_fails", "[prove_vacuum
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -2974,6 +3133,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__sync_fails", "[prove_vacuum_c
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -3030,6 +3192,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__rename_fails", "[prove_vacuum
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -3089,6 +3254,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__unlink_fails", "[prove_vacuum
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -3149,6 +3317,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__post_rename", "[prove_vacuum_
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -3208,6 +3379,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__shrink_fails", "[prove_vacuum
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -3266,6 +3440,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__fallback_unlink_fails", "[pro
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -3336,6 +3513,9 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__fallback_unlink_persistent", 
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k2"), to_bytes("v_k2"));
@@ -3406,6 +3586,9 @@ TEST_CASE("prove_vacuum_compact__batched_file__success", "[prove_vacuum_compact]
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 88});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     {
       bytecask::WritePlan plan;
       plan.put(to_bytes("k0"), to_bytes("v_k0"));
@@ -3453,6 +3636,9 @@ TEST_CASE("prove_vacuum_compact__batched_file__tmp_create_fails", "[prove_vacuum
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 88});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     {
       bytecask::WritePlan plan;
       plan.put(to_bytes("k0"), to_bytes("v_k0"));
@@ -3503,6 +3689,9 @@ TEST_CASE("prove_vacuum_compact__batched_file__append_fails", "[prove_vacuum_com
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 88});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     {
       bytecask::WritePlan plan;
       plan.put(to_bytes("k0"), to_bytes("v_k0"));
@@ -3553,6 +3742,9 @@ TEST_CASE("prove_vacuum_compact__batched_file__sync_fails", "[prove_vacuum_compa
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 88});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     {
       bytecask::WritePlan plan;
       plan.put(to_bytes("k0"), to_bytes("v_k0"));
@@ -3603,6 +3795,9 @@ TEST_CASE("prove_vacuum_compact__batched_file__rename_fails", "[prove_vacuum_com
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 88});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     {
       bytecask::WritePlan plan;
       plan.put(to_bytes("k0"), to_bytes("v_k0"));
@@ -3656,6 +3851,9 @@ TEST_CASE("prove_vacuum_compact__batched_file__unlink_fails", "[prove_vacuum_com
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 88});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     {
       bytecask::WritePlan plan;
       plan.put(to_bytes("k0"), to_bytes("v_k0"));
@@ -3710,6 +3908,9 @@ TEST_CASE("prove_vacuum_compact__batched_file__post_rename", "[prove_vacuum_comp
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 88});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     {
       bytecask::WritePlan plan;
       plan.put(to_bytes("k0"), to_bytes("v_k0"));
@@ -3763,6 +3964,9 @@ TEST_CASE("prove_vacuum_compact__batched_file__shrink_fails", "[prove_vacuum_com
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 88});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     {
       bytecask::WritePlan plan;
       plan.put(to_bytes("k0"), to_bytes("v_k0"));
@@ -3816,6 +4020,9 @@ TEST_CASE("prove_vacuum_compact__batched_file__fallback_unlink_fails", "[prove_v
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 88});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     {
       bytecask::WritePlan plan;
       plan.put(to_bytes("k0"), to_bytes("v_k0"));
@@ -3882,6 +4089,9 @@ TEST_CASE("prove_vacuum_compact__batched_file__fallback_unlink_persistent", "[pr
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 88});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     {
       bytecask::WritePlan plan;
       plan.put(to_bytes("k0"), to_bytes("v_k0"));
@@ -3948,6 +4158,9 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__success", "[prove_vacuum_
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 73});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Range tombstone inside the file being compacted: it deletes ['k1'],
@@ -3992,6 +4205,9 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__tmp_create_fails", "[prov
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 73});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Range tombstone inside the file being compacted: it deletes ['k1'],
@@ -4039,6 +4255,9 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__append_fails", "[prove_va
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 73});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Range tombstone inside the file being compacted: it deletes ['k1'],
@@ -4086,6 +4305,9 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__sync_fails", "[prove_vacu
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 73});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Range tombstone inside the file being compacted: it deletes ['k1'],
@@ -4133,6 +4355,9 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__rename_fails", "[prove_va
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 73});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Range tombstone inside the file being compacted: it deletes ['k1'],
@@ -4183,6 +4408,9 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__unlink_fails", "[prove_va
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 73});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Range tombstone inside the file being compacted: it deletes ['k1'],
@@ -4234,6 +4462,9 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__post_rename", "[prove_vac
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 73});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Range tombstone inside the file being compacted: it deletes ['k1'],
@@ -4284,6 +4515,9 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__shrink_fails", "[prove_va
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 73});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Range tombstone inside the file being compacted: it deletes ['k1'],
@@ -4334,6 +4568,9 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__fallback_unlink_fails", "
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 73});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Range tombstone inside the file being compacted: it deletes ['k1'],
@@ -4397,6 +4634,9 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__fallback_unlink_persisten
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 73});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Range tombstone inside the file being compacted: it deletes ['k1'],
@@ -4460,6 +4700,9 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__success", "[prove_vacuum_co
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // The baseline a power cut cannot take: everything so far is
@@ -4505,6 +4748,9 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__tmp_create_fails", "[prove_
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // The baseline a power cut cannot take: everything so far is
@@ -4553,6 +4799,9 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__append_fails", "[prove_vacu
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // The baseline a power cut cannot take: everything so far is
@@ -4601,6 +4850,9 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__sync_fails", "[prove_vacuum
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // The baseline a power cut cannot take: everything so far is
@@ -4649,6 +4901,9 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__rename_fails", "[prove_vacu
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // The baseline a power cut cannot take: everything so far is
@@ -4700,6 +4955,9 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__unlink_fails", "[prove_vacu
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // The baseline a power cut cannot take: everything so far is
@@ -4752,6 +5010,9 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__post_rename", "[prove_vacuu
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // The baseline a power cut cannot take: everything so far is
@@ -4803,6 +5064,9 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__durability_sync_fails", "[p
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // The baseline a power cut cannot take: everything so far is
@@ -4855,6 +5119,9 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__shrink_fails", "[prove_vacu
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // The baseline a power cut cannot take: everything so far is
@@ -4906,6 +5173,9 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__fallback_unlink_fails", "[p
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // The baseline a power cut cannot take: everything so far is
@@ -4970,6 +5240,9 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__fallback_unlink_persistent"
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // The baseline a power cut cannot take: everything so far is
@@ -5034,6 +5307,9 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite_whole_file__success", "[prov
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // The baseline a power cut cannot take: everything so far is
@@ -5080,6 +5356,9 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite_whole_file__unlink_fails", "
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // The baseline a power cut cannot take: everything so far is
@@ -5133,6 +5412,9 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite_whole_file__durability_sync_
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    // Seal the open's ChangeMarker in a file of its own, so file_0
+    // holds only the writes below.
+    (void)db.create_manifest();
     db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // The baseline a power cut cannot take: everything so far is

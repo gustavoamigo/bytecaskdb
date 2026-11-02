@@ -10,6 +10,7 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <iterator>
@@ -31,7 +32,7 @@ namespace bytecask {
 // to place keys and check guards. Entries are appended to all_entries;
 // running_offset is advanced by
 // the total byte size of entries produced. Returns false on validation
-// failure (slot.result set to nullopt). durable is left false on success;
+// failure (slot.result set to the refusal). durable is left false on success;
 // execute_slots fills it in once the batch's durability is known.
 auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
                       std::vector<DataEntryView> &all_entries,
@@ -42,9 +43,16 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
   }
 
   std::uint64_t rests_on = 0;
-  if (!t.validate_preconditions(slot.plan, rests_on)) {
+  switch (t.validate_preconditions(slot.plan, deletes_, rests_on)) {
+  case TransientEngineState::Verdict::Holds:
+    break;
+  case TransientEngineState::Verdict::Conflict:
     slot.rests_on = rests_on;
-    slot.result = std::nullopt;
+    slot.result = std::unexpected{PlanRefusal::Conflict};
+    return false;
+  case TransientEngineState::Verdict::TooOld:
+    // Nothing the head holds decides it, so there is nothing to wait for.
+    slot.result = std::unexpected{PlanRefusal::TooOld};
     return false;
   }
 
@@ -226,6 +234,11 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
     }
     return batch.size();
   }
+  // The group's removals are in the file: from here it is published, or the
+  // engine refuses writes until resume(). Before the append, a failure drops
+  // the transient and the removals with it; its sequences, if resume()
+  // replays them, are a gap the log never recorded.
+  deletes_.record(t.staged_removals(), current->next_seq, batch_max_seq);
 
   try {
 #ifdef BYTECASK_TESTING
@@ -594,10 +607,20 @@ void DB::settle_unappended(const EngineSlot &slot) const {
   if (slot.rests_on == 0) return;
   const auto published = load_state();
   if (published->next_seq > slot.rests_on) return;
-  const auto holds = published->transient().validate_preconditions(slot.plan);
-  if (holds == slot.result.has_value()) return;
+  // TooOld here means the published state can no longer tell (more deletes
+  // since dropped the ones the head read): that is no confirmation, so the
+  // slot waits like on any disagreement. Returning instead would answer from
+  // a write whose flush may still fail.
+  const auto verdict =
+      published->transient().validate_preconditions(slot.plan, deletes_);
+  const auto same =
+      slot.result ? verdict == TransientEngineState::Verdict::Holds
+                  : verdict == TransientEngineState::Verdict::Conflict;
+  if (same) return;
   wait_published(slot.rests_on);
-  if (load_state()->next_seq > slot.rests_on) return;
+  const auto after = load_state();
+  if (after->next_seq > slot.rests_on) return;
+  if (after->closed) throw DbClosed{};
   throw DbDegraded{degraded_reason()};
 }
 

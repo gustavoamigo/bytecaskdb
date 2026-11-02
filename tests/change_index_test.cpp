@@ -139,7 +139,7 @@ TEST_CASE("a slice from inside a file enters it at a bookmark and matches a "
   fill(db, 3000, 200);  // ~700 KiB: a bookmark every 4 KiB is ~170 bookmarks
   const auto snap = db.snapshot();
   const auto history = pull(db, snap, 0);  // from 0: no lookup, lays the bookmarks
-  REQUIRE(history.entries.size() == 3000);
+  REQUIRE(history.entries.size() == 3001);  // and the open's own marker
 
   auto &idx = db.test_change_index();
   const auto ids = idx.file_ids();

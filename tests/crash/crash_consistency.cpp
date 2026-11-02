@@ -437,7 +437,10 @@ auto run_parent(const RunOptions &o) -> int {
 
   std::mt19937_64 rng{o.seed};
   State base;
-  std::uint64_t base_durable = 0;
+  // An open in Leader mode of an empty directory writes one entry, its
+  // ChangeMarker, and syncs it (docs/bytecask_design.md, "Replication mode").
+  constexpr std::uint64_t kEmptyOpenDurable = 1;
+  std::uint64_t base_durable = kEmptyOpenDurable;
   Totals totals;
   const auto started = Clock::now();
 
@@ -445,7 +448,7 @@ auto run_parent(const RunOptions &o) -> int {
     if (iter % o.reset_every == 0) {
       fs::remove_all(db_dir);
       base.clear();
-      base_durable = 0;
+      base_durable = kEmptyOpenDurable;
     }
     const auto child_seed = rng();
     auto cfg = config_for(child_seed);

@@ -57,6 +57,15 @@ def gen_setup(state: CompactStateShape) -> str:
     lines.append(
         f"    auto db = bytecask::DB::open(dir, {{{opts}}});"
     )
+    # The open appends a ChangeMarker (CONTRACT.md, "Every open as a leader
+    # starts a new history"), kept for ever by vacuum. Sealed in a file of its
+    # own, it leaves file_0 holding exactly the entries the shape sizes it
+    # for, and a file whose every entry is dead still drops whole.
+    lines.append(
+        "    // Seal the open's ChangeMarker in a file of its own, so file_0"
+    )
+    lines.append("    // holds only the writes below.")
+    lines.append("    (void)db.create_manifest();")
     if state.batched:
         lines.append("    {")
         lines.append("      bytecask::WritePlan plan;")

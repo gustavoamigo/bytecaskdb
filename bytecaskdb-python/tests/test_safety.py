@@ -283,11 +283,11 @@ class TestExtTransactionSafety:
 
     def test_result_holds_the_commit(self, tmp_path):
         db = ext.DB.open(str(tmp_path / "ext_txn_result"))
-        db[b"a"] = b"1"  # sequence 1
+        db[b"a"] = b"1"  # sequence 2: the leader's open took 1 for its change marker
 
         with db.transaction() as txn:
             txn[b"a"] = b"2"
-        assert txn.result is not None and txn.result.sequence == 2
+        assert txn.result is not None and txn.result.sequence == 3
 
     def test_conflict_raises(self, tmp_path):
         db = ext.DB.open(str(tmp_path / "ext_txn3"))

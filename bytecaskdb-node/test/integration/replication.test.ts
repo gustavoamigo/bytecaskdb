@@ -46,7 +46,7 @@ function replicate(src: ByteCaskDB, dst: ByteCaskDB, maxBytes?: number): number 
   }
 }
 
-// A slice a service hands on from a node that was never promoted.
+// A slice that starts before a leader's first marker: the origin history.
 function fromOrigin(fromSequence: bigint): ChangeHeader {
   return { marker: ORIGIN_MARKER, fromSequence }
 }
@@ -111,19 +111,23 @@ test('changesSince streams every entry type in ascending sequence order', async 
   writeHistory(wasmBackend, leader, 0)
 
   const { header, entries } = slice(leader, 0n)
-  // A leader that was never promoted is on the origin history.
+  // The leader's open started its history with a marker at sequence 1; a
+  // slice from 0 starts before it, on the origin history.
   expect(header).toEqual(fromOrigin(0n))
+  const opened = markerOf(entries[0])
+  expect(opened.sinceSequence).toBe(1n)
   const types = new Set(entries.map((e) => e.entryType))
-  expect([...types].sort()).toEqual(['bulkBegin', 'bulkEnd', 'delete', 'put', 'rangeDel'])
+  expect([...types].sort()).toEqual(['bulkBegin', 'bulkEnd', 'changeMarker', 'delete', 'put', 'rangeDel'])
   for (let i = 1; i < entries.length; i++) {
     expect(entries[i].sequence > entries[i - 1].sequence).toBe(true)
   }
   expect(entries.at(-1)!.sequence).toBe(leader.durableSequence())
 
-  // From a position, only what follows it, and the header names it.
+  // From a position, only what follows it, and the header names it and the
+  // marker there.
   const mid = entries[10].sequence
   const later = slice(leader, mid)
-  expect(later.header).toEqual(fromOrigin(mid))
+  expect(later.header).toEqual({ marker: opened, fromSequence: mid })
   expect(later.entries.map((e) => e.sequence)).toEqual(
     entries.filter((e) => e.sequence > mid).map((e) => e.sequence))
 
@@ -167,9 +171,10 @@ test('maxBytes cuts a slice after the unit that passes it, never inside a batch'
   writeHistory(wasmBackend, leader, 0)
   const all = stream(leader, 0n)
 
-  // One byte: the first unit alone, a standalone put.
+  // One byte: the first unit alone, the open's standalone marker.
   const first = slice(leader, 0n, 1)
   expect(first.entries).toEqual([all[0]])
+  const opened = markerOf(all[0])
 
   // Cut in front of the atomic batch: the whole batch, bulkBegin to bulkEnd.
   const begin = all.findIndex((e) => e.entryType === 'bulkBegin')
@@ -184,7 +189,7 @@ test('maxBytes cuts a slice after the unit that passes it, never inside a batch'
   for (;;) {
     const s = slice(leader, pos, 1)
     if (s.entries.length === 0) break
-    expect(s.header).toEqual(fromOrigin(pos))
+    expect(s.header).toEqual(pos === 0n ? fromOrigin(0n) : { marker: opened, fromSequence: pos })
     let inBatch = false
     for (const e of s.entries) {
       if (e.entryType === 'bulkBegin') inBatch = true
@@ -236,7 +241,7 @@ test('ingest skips entries the follower already holds', async ({ tmpDir, wasmBac
   const tail = slice(leader, whole.entries[whole.entries.length - 8].sequence)
   follower.ingest(tail.header, tail.entries)
   // An empty slice at the follower's position is accepted too.
-  follower.ingest(fromOrigin(seq), [])
+  follower.ingest({ marker: markerOf(whole.entries[0]), fromSequence: seq }, [])
   expect(dump(follower)).toEqual(once)
   expect(follower.durableSequence()).toBe(seq)
 
@@ -249,14 +254,14 @@ test('a slice that starts past the follower is a gap, refused before anything is
   writeHistory(wasmBackend, leader, 0)
   const all = stream(leader, 0n)
 
-  // The first five units, all standalone puts.
+  // The first five units: the open's marker and four puts, all standalone.
   follower.ingest(fromOrigin(0n), all.slice(0, 5))
   const reached = follower.durableSequence()
   expect(reached).toBe(all[4].sequence)
 
   // A service that resumes from the wrong position: the slice starts above
   // the follower, and what lies between would be lost.
-  const error = caught(() => follower.ingest(fromOrigin(all[6].sequence), all.slice(7)))
+  const error = caught(() => follower.ingest({ marker: markerOf(all[0]), fromSequence: all[6].sequence }, all.slice(7)))
   expect(error.code).toBe('BC_INVALID_ARGUMENT')
   expect(follower.durableSequence()).toBe(reached)
   expect(follower.get(decodeBytes(all[7].key))).toBeNull()
@@ -300,8 +305,9 @@ test('a promotion writes a change marker that changesSince streams and names', a
   replicate(leader, follower)
   const before = follower.durableSequence()
 
-  // Nothing promoted yet: no marker anywhere, and the header reads the origin.
-  expect(stream(follower, 0n).some((e) => e.entryType === 'changeMarker')).toBe(false)
+  // Not promoted yet: the follower holds only the leader's open's marker.
+  const opened = stream(follower, 0n).filter((e) => e.entryType === 'changeMarker').map(markerOf)
+  expect(opened).toEqual([markerOf(stream(leader, 0n)[0])])
 
   follower.setMode('leader')
   const at = follower.durableSequence()
@@ -310,20 +316,21 @@ test('a promotion writes a change marker that changesSince streams and names', a
   const whole = slice(follower, 0n)
   expect(whole.header).toEqual(fromOrigin(0n))
   const markers = whole.entries.filter((e) => e.entryType === 'changeMarker')
-  expect(markers).toHaveLength(1)
-  const marker = markerOf(markers[0])
+  expect(markers).toHaveLength(2)
+  const marker = markerOf(markers[1])
   expect(marker.sinceSequence).toBe(at)
   expect(marker.id).not.toBe(0n)
+  expect(marker.id).not.toBe(opened[0].id)
 
-  // Below the marker the history is still the origin's; from it on, the
-  // marker names the history.
-  expect(slice(follower, before).header).toEqual(fromOrigin(before))
+  // Below the promotion's marker the history is still the one the leader
+  // opened; from it on, the new marker names the history.
+  expect(slice(follower, before).header).toEqual({ marker: opened[0], fromSequence: before })
   expect(slice(follower, at).header).toEqual({ marker, fromSequence: at })
   follower.put('after', 'x')
   expect(slice(follower, at + 1n).header).toEqual({ marker, fromSequence: at + 1n })
 
-  // Opening in leader mode is not a promotion: the old leader holds none.
-  expect(stream(leader, 0n).some((e) => e.entryType === 'changeMarker')).toBe(false)
+  // The old leader holds only the marker its own open wrote.
+  expect(stream(leader, 0n).filter((e) => e.entryType === 'changeMarker').map(markerOf)).toEqual(opened)
 
   follower.close()
   leader.close()
@@ -455,7 +462,7 @@ test('createManifest bootstraps a follower that then catches up', async ({ tmpDi
   expect(follower.durableSequence()).toBe(through)
 
   const rest = slice(leader, through)
-  expect(rest.header).toEqual(fromOrigin(through))
+  expect(rest.header).toEqual({ marker: markerOf(stream(leader, 0n)[0]), fromSequence: through })
   follower.ingest(rest.header, rest.entries)
   expect(dump(follower)).toEqual(dump(leader))
   expect(follower.durableSequence()).toBe(leader.durableSequence())

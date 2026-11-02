@@ -663,6 +663,52 @@ TEST_CASE("alloc sweep: the counter sees the engine's allocations",
   }
 }
 
+// A write that fails for want of memory removes nothing, so it leaves no
+// removal for a later plan to conflict with (docs/bytecask_design.md,
+// "Checking a plan by its read sequence"). Each allocation of a batch that
+// writes and removes x and removes y is failed in turn; after each, a plan
+// read from a fresh snapshot that writes both and guards their range commits.
+// Three writes elsewhere come between the snapshot and the plan, so the plan
+// is checked at a head past every sequence the failed batch would have used.
+TEST_CASE("alloc sweep: a write that fails leaves no removal behind",
+          "[alloc_sweep][apply_batch]") {
+  // A node a failed write had not yet placed is leaked (#390), and this
+  // sweep runs in the test process, not a child.
+  const ExpectedLeaks leaks;
+  TempDir td;
+  auto db = open_db(td.path / "db", {});
+  db->put({.sync = true}, to_bytes("y"), to_bytes("v"));
+  for (long nth = 1;; ++nth) {
+    REQUIRE(nth < kMaxAllocations);
+    INFO("allocation " << nth);
+    bytecask::WritePlan p;
+    p.put(to_bytes("x"), to_bytes("v"));
+    p.del(to_bytes("x"));
+    p.del(to_bytes("y"));
+    bool fired = false;
+    {
+      ScopedAllocFaults faults{nth, false};
+      try {
+        (void)db->apply_batch({.sync = true}, std::move(p));
+      } catch (...) {  // NOLINT(bugprone-empty-catch): the failure is the test's own
+      }
+      fired = faults.report().fired;
+    }
+    if (db->is_degraded()) db->resume();
+    const auto read = db->snapshot();
+    const auto read_seq = read.sequence();
+    const auto read_marker = read.marker();
+    for (int i = 0; i < 3; ++i)
+      db->put({.sync = false}, to_bytes("a"), to_bytes("v"));
+    bytecask::WritePlan q{read_seq, read_marker};
+    q.ensure_range_unchanged(to_bytes("x"), to_bytes("z"));
+    q.put(to_bytes("x"), to_bytes("w"));
+    q.put(to_bytes("y"), to_bytes("v"));
+    REQUIRE(db->apply_batch({.sync = true}, std::move(q)).has_value());
+    if (!fired) break;
+  }
+}
+
 TEST_CASE("alloc sweep: put", "[alloc_sweep]") { alloc_sweep(put_operation()); }
 
 TEST_CASE("alloc sweep: del", "[alloc_sweep]") { alloc_sweep(del_operation()); }
@@ -677,6 +723,14 @@ TEST_CASE("alloc sweep: del_range", "[alloc_sweep]") {
 
 TEST_CASE("alloc sweep: apply_batch", "[alloc_sweep]") {
   alloc_sweep(apply_batch_operation());
+}
+
+TEST_CASE("alloc sweep: apply_batch on a snapshot", "[alloc_sweep]") {
+  alloc_sweep(based_batch_operation(true));
+}
+
+TEST_CASE("alloc sweep: apply_batch on a read sequence", "[alloc_sweep]") {
+  alloc_sweep(based_batch_operation(false));
 }
 
 TEST_CASE("alloc sweep: apply_batch that splits what it changed",
@@ -1992,15 +2046,17 @@ enum class DegradeMemory { available, exhausted };
 constexpr Options kPostLoopFollower{.max_file_bytes = 100,
                                     .initial_mode = bytecask::Mode::Follower};
 
-// Five puts that cross a 100-byte file only with the last, so ingest
-// rotates after its loop, not inside it: checked on a copy, where the slice
-// fills one file and leaves the next empty (inside the loop, the last put
-// would have gone to the next file).
+// The leader's open marker (27 bytes) and four 21-byte puts, which cross a
+// 100-byte file only with the last, so ingest rotates after its loop, not
+// inside it: checked on a copy, where the slice fills one file and leaves
+// the next empty (inside the loop, the last put would have gone to the next
+// file).
+constexpr char kPostLoopLast = 'd';
 auto post_loop_rotation_slice() -> bytecask::testing::OwnedEntries {
   TempDir td;
   auto slice = [&] {
     auto leader = DB::open(td.path / "leader");
-    for (char c = 'a'; c <= 'e'; ++c)
+    for (char c = 'a'; c <= kPostLoopLast; ++c)
       leader.put({.sync = true}, to_bytes(std::string(1, c)), to_bytes("x"));
     const auto snap = leader.snapshot();
     return bytecask::testing::collect_changes(leader.changes_since(snap, 0));
@@ -2050,12 +2106,12 @@ void ingest_post_loop_rotation_fails(const char *checkpoint,
     CHECK(fi.inj.fired);
   }
   expect_io_failure_refused(*db, memory, reason);
-  for (char c = 'a'; c <= 'e'; ++c)
+  for (char c = 'a'; c <= kPostLoopLast; ++c)
     CHECK(value_of(*db, std::string(1, c)) == "<absent>");
   CHECK_THROWS_AS(db->ingest(slice.header, slice.views()), DbDegraded);
   REQUIRE_NOTHROW(db->resume());
   db->ingest(slice.header, slice.views());
-  for (char c = 'a'; c <= 'e'; ++c)
+  for (char c = 'a'; c <= kPostLoopLast; ++c)
     CHECK(value_of(*db, std::string(1, c)) == "x");
   bytecask::testing::assert_consistent(*db);
 }

@@ -118,7 +118,10 @@ def gen_plan(plan: PlanShape, state: StateShape, labels: List[str]) -> str:
     lines: List[str] = []
 
     if plan.is_conflicting or plan.has_guards:
-        lines.append("    bytecask::WritePlan plan{std::move(snap)};")
+        if plan.on_sequence:
+            lines.append("    bytecask::WritePlan plan{snap.sequence(), snap.marker()};")
+        else:
+            lines.append("    bytecask::WritePlan plan{std::move(snap)};")
         if plan.has_guards and state.num_keys > 0:
             lines.append('    plan.ensure_unchanged(to_bytes("k0"));')
         if plan.is_conflicting:
@@ -354,7 +357,7 @@ def gen_test(
     parts.append(f"  auto expected = {gen_delta_literal(delta)};")
     parts.append("  Baseline before;")
     if not delta.threw:
-        parts.append("  std::optional<bytecask::CommitResult> cr;")
+        parts.append("  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> cr;")
     if delta.degraded:
         parts.append("  bytecask::testing::EngineFingerprint fp;")
     else:

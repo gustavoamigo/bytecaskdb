@@ -8,6 +8,7 @@ module;
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <iterator>
@@ -36,6 +37,7 @@ DB::DB(std::filesystem::path dir, Options opts)
       io_backend_{opts.io_backend},
       size_limits_{opts.max_key_bytes, opts.max_value_bytes},
       scratch_bytes_{opts.thread_scratch_bytes},
+      deletes_{opts.max_delete_log_bytes},
       state_{std::make_shared<EngineState>(opts.thread_scratch_bytes)} {
   // A setting above a hard ceiling is refused, not lowered: the engine never
   // runs with a limit other than the one asked for.
@@ -159,6 +161,12 @@ DB::DB(std::filesystem::path dir, Options opts)
     if (test_before_validate_) test_before_validate_(*initial);
 #endif
     validate_state_consistency(*initial);
+    // The marker is appended to a state that passed, and the state it
+    // makes is checked before it is published.
+    if (initial->mode == Mode::Leader) {
+      initial = with_open_marker(*initial);
+      validate_state_consistency(*initial);
+    }
     store_initial_state(std::move(initial));
   } catch (...) {
     ::close(lock_fd_);
@@ -296,7 +304,10 @@ auto DB::del(const WriteOptions &opts,
   WritePlan plan{size_limits_};
   plan.ensure_present(key);
   plan.del(key);
-  return apply_batch(opts, std::move(plan));
+  // No read sequence, so the only refusal is the guard's: the key is absent.
+  const auto r = apply_batch(opts, std::move(plan));
+  if (!r) return std::nullopt;
+  return *r;
 }
 
 auto DB::del_range(const WriteOptions &opts, BytesView from,
@@ -346,9 +357,10 @@ static thread_local LastSyncedReturn last_synced_return{};
 // The single write path. Routes to either write_group_ (default) or
 // solo_writer_ depending on plan characteristics. put/del/apply_batch are
 // thin wrappers that construct a WritePlan and delegate here.
-auto DB::apply_batch(WriteOptions opts,
-                     WritePlan plan) -> std::optional<CommitResult> {
-  if (auto refusal = write_refusal(*load_state())) {
+auto DB::apply_batch(WriteOptions opts, WritePlan plan)
+    -> std::expected<CommitResult, PlanRefusal> {
+  const auto published = load_state();
+  if (auto refusal = write_refusal(*published)) {
     std::rethrow_exception(refusal);
   }
   if (plan.write_bytes() > max_batch_bytes()) {
@@ -398,7 +410,7 @@ auto DB::apply_batch(WriteOptions opts,
     last_synced_return = {instance_id_, std::chrono::steady_clock::now()};
 
   settle_unappended(slot);
-  return slot.result;
+  return std::move(slot.result);
 }
 
 auto DB::mode() const noexcept -> Mode {

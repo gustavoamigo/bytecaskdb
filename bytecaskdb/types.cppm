@@ -54,9 +54,10 @@ export struct ChangeMarker {
       -> bool = default;
 };
 
-// The history before any promotion: sequence 0 is below every sequence the
+// The history before any marker: sequence 0 is below every sequence the
 // engine assigns, so this is the marker at every position of a database that
-// was never promoted.
+// holds none, such as a follower that has not yet ingested its leader's first
+// marker.
 export inline constexpr ChangeMarker kOriginMarker{};
 
 // Where a slice of a history starts: the source's marker at from_sequence,

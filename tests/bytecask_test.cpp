@@ -4,6 +4,7 @@
 // ByteCaskDB — integration and model-based correctness tests
 
 #include <algorithm>
+#include <expected>
 #include <atomic>
 #include <cstdlib>
 #include <concepts>
@@ -1280,12 +1281,24 @@ namespace {
 
 constexpr std::uint64_t kEntry = 23;  // 15 header + 2 key + 2 value + 4 CRC
 
-// Data files ordered by the sequence of their first record.
+// An open in Leader mode appends a ChangeMarker to its fresh active file.
+// The tests below lay out files entry by entry: after the open they call
+// seal_open_marker, which seals that marker in a file of its own, and they
+// leave marker-only files out of data_files_by_sequence.
+void seal_open_marker(bytecask::DB &db) {
+  (void)db.create_manifest();  // seals the active file, the marker alone
+}
+constexpr std::uint64_t kMarkerFileBytes =
+    bytecask::change_marker_size(bytecask::EntryType::ChangeMarker);
+
+// Data files ordered by the sequence of their first record, but for files
+// holding only an open's ChangeMarker.
 auto data_files_by_sequence(const std::filesystem::path &dir)
     -> std::vector<std::filesystem::path> {
   std::vector<std::pair<std::uint64_t, std::filesystem::path>> files;
   for (const auto &e : std::filesystem::directory_iterator{dir}) {
     if (e.path().extension() != ".data") continue;
+    if (e.file_size() == kMarkerFileBytes) continue;
     std::ifstream f{e.path(), std::ios::binary};
     std::array<unsigned char, 8> b{};
     f.read(reinterpret_cast<char *>(b.data()), 8);
@@ -1499,6 +1512,7 @@ TEST_CASE("DB recovery: a hint-less file's tail is truncated only in the "
                                      .fail_recovery_on_crc_errors = strict};
         {
           auto db = bytecask::DB::open(dir, opts);
+          seal_open_marker(db);
           for (int i = 0; i < 14; ++i)
             db.put({.sync = true}, to_bytes(std::format("k{:x}", i)),
                    to_bytes(std::format("v{:x}", i)));
@@ -1550,6 +1564,7 @@ TEST_CASE("DB recovery: a crash while open writes a hint leaves no hint behind "
   const bytecask::Options opts{.max_file_bytes = 100};
   {
     auto db = bytecask::DB::open(dir, opts);
+    seal_open_marker(db);
     for (int i = 0; i < 14; ++i)
       db.put({.sync = true}, to_bytes(std::format("k{:x}", i)),
              to_bytes(std::format("v{:x}", i)));
@@ -1602,6 +1617,7 @@ TEST_CASE("DB recovery: open fails when the cut of a torn tail cannot be "
     opts.buffer_pool.capacity_bytes = 1024 * 1024;
   {
     auto db = bytecask::DB::open(dir, opts);
+    seal_open_marker(db);
     for (int i = 0; i < 14; ++i)
       db.put({.sync = true}, to_bytes(std::format("k{:x}", i)),
              to_bytes(std::format("v{:x}", i)));
@@ -1647,6 +1663,7 @@ TEST_CASE("DB read: a record past the end of its file names the file, the "
   const bytecask::Options opts{.max_file_bytes = 100};
   {
     auto db = bytecask::DB::open(dir, opts);
+    seal_open_marker(db);
     for (int i = 0; i < 14; ++i)
       db.put({.sync = true}, to_bytes(std::format("k{:x}", i)),
              to_bytes(std::format("v{:x}", i)));
@@ -1683,13 +1700,16 @@ TEST_CASE("DB vacuum: a damaged sealed file is not compacted away",
   std::filesystem::path victim;
   {
     auto db = bytecask::DB::open(db_path, opts);
+    seal_open_marker(db);
     for (int i = 0; i < 8; ++i) {
       db.put({.sync = true}, to_bytes(std::format("a{}", i)),
              to_bytes(std::format("v{}", i)));
-      // Only one data file exists until the first rotation.
+      // Only one data file but the marker's exists until the first rotation.
       if (i == 0)
         for (const auto &e : std::filesystem::directory_iterator{db_path})
-          if (e.path().extension() == ".data") victim = e.path();
+          if (e.path().extension() == ".data" &&
+              e.file_size() != kMarkerFileBytes)
+            victim = e.path();
     }
     // Overwrite half of them so the first file qualifies for compaction.
     for (int i = 0; i < 4; ++i)
@@ -3364,6 +3384,10 @@ static auto tombstone_size(std::string_view key) -> std::uint64_t {
   return bytecask::kHeaderSize + key.size() + bytecask::kCrcSize;
 }
 
+// The ChangeMarker an open in Leader mode appends to its fresh active file.
+static constexpr auto kOpenMarkerBytes =
+    bytecask::change_marker_size(bytecask::EntryType::ChangeMarker);
+
 // ---------------------------------------------------------------------------
 // put accounts for live_bytes and total_bytes on the active file
 // ---------------------------------------------------------------------------
@@ -3382,7 +3406,7 @@ TEST_CASE("FileStats: put tracks live_bytes and total_bytes",
 
   const auto expected = esize("k1", "v1") + esize("k2", "val2");
   CHECK(fs.live_bytes == expected);
-  CHECK(fs.total_bytes == expected);
+  CHECK(fs.total_bytes == kOpenMarkerBytes + expected);  // and the open's marker
 }
 
 // ---------------------------------------------------------------------------
@@ -3402,7 +3426,8 @@ TEST_CASE("FileStats: overwrite decrements old live_bytes",
 
   // Only the new entry is live; both entries exist on disk.
   CHECK(fs.live_bytes == esize("k", "new_value"));
-  CHECK(fs.total_bytes == esize("k", "old_value") + esize("k", "new_value"));
+  CHECK(fs.total_bytes == kOpenMarkerBytes + esize("k", "old_value") +
+                              esize("k", "new_value"));
 }
 
 // ---------------------------------------------------------------------------
@@ -3421,7 +3446,8 @@ TEST_CASE("FileStats: del decrements live_bytes, tombstone in total_bytes",
   const auto &fs = stats.begin()->second;
 
   CHECK(fs.live_bytes == 0);
-  CHECK(fs.total_bytes == esize("k", "value") + tombstone_size("k"));
+  CHECK(fs.total_bytes ==
+        kOpenMarkerBytes + esize("k", "value") + tombstone_size("k"));
 }
 
 // ---------------------------------------------------------------------------
@@ -3442,7 +3468,8 @@ TEST_CASE("FileStats: apply_batch tracks stats with bulk markers",
   const auto &fs = stats.begin()->second;
 
   const auto bulk_marker_size = bytecask::kHeaderSize + bytecask::kCrcSize;
-  const auto expected_total = bulk_marker_size * 2 + // BulkBegin + BulkEnd
+  const auto expected_total = kOpenMarkerBytes +      // the open's marker
+                              bulk_marker_size * 2 + // BulkBegin + BulkEnd
                               esize("a", "va") + esize("b", "vb");
   CHECK(fs.live_bytes == esize("a", "va") + esize("b", "vb"));
   CHECK(fs.total_bytes == expected_total);
@@ -3510,14 +3537,16 @@ TEST_CASE("FileStats: fragmentation computation", "[bytecask][filestats]") {
   REQUIRE(stats.size() == 1);
   const auto &fs = stats.begin()->second;
 
-  // 3 entries on disk, 2 live.
+  // 3 entries on disk, 2 live, after the open's marker (kept, not live).
   const auto one_entry = esize("k1", "value");
   CHECK(fs.live_bytes == 2 * one_entry);
-  CHECK(fs.total_bytes == 3 * one_entry);
+  CHECK(fs.change_marker_bytes == kOpenMarkerBytes);
+  CHECK(fs.total_bytes == kOpenMarkerBytes + 3 * one_entry);
 
-  // fragmentation = 1 - live/total = 1/3 ≈ 0.333
+  // fragmentation of the entries = 1 - live/(total - marker) = 1/3 ≈ 0.333
   auto frag = 1.0 - static_cast<double>(fs.live_bytes) /
-                         static_cast<double>(fs.total_bytes);
+                         static_cast<double>(fs.total_bytes -
+                                             fs.change_marker_bytes);
   CHECK(frag > 0.33);
   CHECK(frag < 0.34);
 }
@@ -3539,8 +3568,10 @@ TEST_CASE("FileStats: recovery reconstructs stats", "[bytecask][filestats]") {
     pre_stats = db.file_stats();
   }
 
-  // Reopen — recovery from hint files.
-  auto db2 = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+  // Reopen — recovery from hint files. As a follower, whose open writes no
+  // ChangeMarker of its own.
+  auto db2 = bytecask::DB::open(
+      db_path, {.max_file_bytes = 1, .initial_mode = bytecask::Mode::Follower});
   auto post_stats = db2.file_stats();
 
   // Verify live_bytes and total_bytes per sealed file match.
@@ -3648,7 +3679,10 @@ TEST_CASE("Preallocated tail: sealed files shrink to their logical size",
         std::filesystem::copy_file(e.path(), crash_path / e.path().filename());
     }
     {
-      auto crashed = bytecask::DB::open(crash_path, opts);
+      // Recovery checks open as followers, which write no ChangeMarker.
+      auto check_opts = opts;
+      check_opts.initial_mode = bytecask::Mode::Follower;
+      auto crashed = bytecask::DB::open(crash_path, check_opts);
       const auto cr = size_report(crashed);
       for (const auto &[physical, total] : cr.sealed) CHECK(physical == total);
       std::uint64_t post_total = 0;
@@ -3668,7 +3702,9 @@ TEST_CASE("Preallocated tail: sealed files shrink to their logical size",
   }
   CHECK(on_disk == pre_total);
 
-  auto db2 = bytecask::DB::open(db_path, opts);
+  auto check_opts = opts;  // a follower's open writes no ChangeMarker
+  check_opts.initial_mode = bytecask::Mode::Follower;
+  auto db2 = bytecask::DB::open(db_path, check_opts);
   const auto r2 = size_report(db2);
   for (const auto &[physical, total] : r2.sealed) CHECK(physical == total);
   std::uint64_t post_total = 0;
@@ -3792,6 +3828,7 @@ struct OwnedHint {
   std::string key;
   std::uint32_t value_size;
   std::string end_key;
+  std::uint64_t marker_id{0};  // a ChangeMarker's id
 };
 
 auto only_hint(const std::filesystem::path &dir) -> std::filesystem::path {
@@ -3809,7 +3846,7 @@ auto read_hint(const std::filesystem::path &p) -> std::vector<OwnedHint> {
   while (const auto he = scanner.next()) {
     out.push_back({he->sequence, he->entry_type, he->file_offset,
                    to_string(he->key), he->value_size,
-                   to_string(he->end_key)});
+                   to_string(he->end_key), he->marker_id});
   }
   return out;
 }
@@ -3821,6 +3858,8 @@ void write_hint(const std::filesystem::path &p,
   for (const auto &e : entries) {
     if (e.type == bytecask::EntryType::RangeDel) {
       hf.append_range_del(e.seq, e.offset, to_bytes(e.key), to_bytes(e.end_key));
+    } else if (e.type == bytecask::EntryType::ChangeMarker) {
+      hf.append_change_marker(e.seq, e.offset, e.marker_id);
     } else {
       hf.append(e.seq, e.type, e.offset, to_bytes(e.key), e.value_size);
     }
@@ -3846,13 +3885,14 @@ TEST_CASE("recovery checks the layout of a hint file's sorted run",
   }
   const auto hint = only_hint(dir);
   const auto written = read_hint(hint);
-  // The head (both batch markers, then the range tombstone) and the run: a,
-  // then b's Delete before its older Put.
+  // The head (the open's ChangeMarker, both batch markers, then the range
+  // tombstone) and the run: a, then b's Delete before its older Put.
   using bytecask::EntryType;
-  REQUIRE(written.size() == 6);
-  const auto &[begin, end, range, a, b_del, b_put] =
+  REQUIRE(written.size() == 7);
+  const auto &[marker, begin, end, range, a, b_del, b_put] =
       std::tie(written[0], written[1], written[2], written[3], written[4],
-               written[5]);
+               written[5], written[6]);
+  REQUIRE(marker.type == EntryType::ChangeMarker);
   REQUIRE(begin.type == EntryType::BulkBegin);
   REQUIRE(end.type == EntryType::BulkEnd);
   REQUIRE(range.type == EntryType::RangeDel);
@@ -3861,20 +3901,20 @@ TEST_CASE("recovery checks the layout of a hint file's sorted run",
   REQUIRE(b_put.type == EntryType::Put);
 
   SECTION("batch markers inside the run are passed over") {
-    write_hint(hint, {range, a, begin, b_del, end, b_put});
+    write_hint(hint, {marker, range, a, begin, b_del, end, b_put});
     auto db = bytecask::DB::open(dir);
     CHECK(get_val(db, to_bytes("a")).has_value());
     CHECK_FALSE(get_val(db, to_bytes("b")).has_value());
   }
   SECTION("keys descending are refused") {
-    write_hint(hint, {begin, end, range, b_del, b_put, a});
+    write_hint(hint, {marker, begin, end, range, b_del, b_put, a});
     // Each recovery words it its own way.
     CHECK_THROWS_WITH(bytecask::DB::open(dir),
                       Catch::Matchers::ContainsSubstring("not sorted") ||
                           Catch::Matchers::ContainsSubstring("not ascending"));
   }
   SECTION("a range tombstone after the head is refused") {
-    write_hint(hint, {begin, end, a, range, b_del, b_put});
+    write_hint(hint, {marker, begin, end, a, range, b_del, b_put});
     CHECK_THROWS_WITH(
         bytecask::DB::open(dir),
         Catch::Matchers::ContainsSubstring("range tombstone inside"));
@@ -4144,33 +4184,30 @@ TEST_CASE("recovery keeps the full file over a copy of its prefix",
 // writes, not a copy. Recovery refuses them and deletes nothing.
 TEST_CASE("recovery refuses two different writes under one sequence",
           "[vacuum][recovery]") {
-  using Write = std::function<void(bytecask::DB &)>;
-  const auto put = [](std::string k, std::string v) -> Write {
-    return [k, v](bytecask::DB &db) { db.put({}, to_bytes(k), to_bytes(v)); };
-  };
-  const auto del = [](std::string k) -> Write {
-    return [k](bytecask::DB &db) { (void)db.del({}, to_bytes(k)); };
-  };
-  // Sequence 1 is the same write in both; sequence 2 differs.
-  const auto [what, second_a, second_b] =
-      GENERATE_COPY(table<std::string, Write, Write>({
-          {"value", put("key", "aaaa"), put("key", "bbbb")},
-          {"key", put("key", "aaaa"), put("kez", "aaaa")},
-          {"type", put("key", "aaaa"), del("key")},
-      }));
+  using bytecask::EntryType;
+  using V = bytecask::DataEntryView;
+  const auto key = to_bytes("key");
+  const auto kez = to_bytes("kez");
+  const auto aaaa = to_bytes("aaaa");
+  const auto bbbb = to_bytes("bbbb");
+  // Sequence 1 is the same write in both; sequence 2 differs. Each copy is a
+  // follower fed one slice, so neither holds a change marker of its own: a
+  // leader's open would write one with a random id, and the copies would
+  // already differ there.
+  const std::string what = GENERATE("value", "key", "type");
+  const V second_a{2, EntryType::Put, key, aaaa};
+  const V second_b = what == "value" ? V{2, EntryType::Put, key, bbbb}
+                     : what == "key" ? V{2, EntryType::Put, kez, aaaa}
+                                     : V{2, EntryType::Delete, key, {}};
   INFO("the second writes differ in " << what);
   TempDir td;
   const auto a = td.path / "a";
   const auto b = td.path / "b";
-  {
-    auto db = bytecask::DB::open(a);
-    db.put({}, to_bytes("key"), to_bytes("0000"));
-    second_a(db);
-  }
-  {
-    auto db = bytecask::DB::open(b);
-    db.put({}, to_bytes("key"), to_bytes("0000"));
-    second_b(db);
+  const auto zeros = to_bytes("0000");
+  for (const auto &[dir, second] : {std::pair{a, second_a}, std::pair{b, second_b}}) {
+    auto db = bytecask::DB::open(dir, {.initial_mode = bytecask::Mode::Follower});
+    const std::vector<V> slice{{1, EntryType::Put, key, zeros}, second};
+    db.ingest(bytecask::ChangeHeader{}, slice);
   }
   for (const auto &e : std::filesystem::directory_iterator{b}) {
     const auto ext = e.path().extension();
@@ -4376,8 +4413,10 @@ TEST_CASE("vacuum does not select a file holding only tombstones",
   for (const unsigned threads : {1U, 4U}) {
     const auto copy = td.path / std::format("copy{}", threads);
     std::filesystem::copy(path, copy, std::filesystem::copy_options::recursive);
+    // As a follower, whose open writes no ChangeMarker of its own.
     auto db = bytecask::DB::open(copy, {.max_file_bytes = 1,
-                                        .recovery_threads = threads});
+                                        .recovery_threads = threads,
+                                        .initial_mode = bytecask::Mode::Follower});
     std::vector<std::uint64_t> want;
     std::vector<std::uint64_t> got;
     // Every open starts a fresh, empty active file; only files with bytes
@@ -4517,6 +4556,7 @@ TEST_CASE("vacuum drops a tombstone after the Put it hid is gone",
   const auto dir = td.path / "db";
   {
     auto db = bytecask::DB::open(dir);
+    seal(db);  // the open's ChangeMarker, kept for ever, in a file of its own
     db.put({}, to_bytes("a"), to_bytes("old"));
     seal(db);  // A: only a
     db.put({}, to_bytes("x"), to_bytes("1"));
@@ -4866,7 +4906,9 @@ TEST_CASE("FileStats: tombstone and marker bytes survive reopen",
     }
     before = collect_file_stats(db);
   }
-  auto db = bytecask::DB::open(dir, {.recovery_threads = threads});
+  // As a follower, whose open writes no ChangeMarker of its own.
+  auto db = bytecask::DB::open(dir, {.recovery_threads = threads,
+                                     .initial_mode = bytecask::Mode::Follower});
   auto after = collect_file_stats(db);
   // Each open starts an empty active file.
   const auto empty = [](const FileStatsTuple &t) { return std::get<1>(t) == 0; };
@@ -4907,11 +4949,13 @@ TEST_CASE("vacuum keeps dead entries above retain_after", "[vacuum][retain]") {
   TempDir td;
   const auto dir = td.path / "db";
   std::uint64_t retain = 0;
+  std::uint64_t first_put = 0;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 128});
     for (int i = 0; i < 10; ++i) {
       const auto seq =
           db.put({}, to_bytes(std::format("k{}", i)), to_bytes("old")).sequence;
+      if (i == 0) first_put = seq;
       if (i == 4) retain = seq;
     }
     for (int i = 0; i < 10; ++i)
@@ -4920,8 +4964,10 @@ TEST_CASE("vacuum keeps dead entries above retain_after", "[vacuum][retain]") {
     while (db.vacuum({.fragmentation_threshold = 0.0, .retain_after = retain})) {
     }
     CHECK(db.stats().at("bytecask.vacuum_bytes_reclaimed") > 0);
-    // Dropped at or below retain_after, kept above it.
-    CHECK(stream_sequences(db, 0).front() > 1);
+    // Dropped at or below retain_after, kept above it. (The open's marker,
+    // sequence 1, is kept for ever.)
+    const auto kept = stream_sequences(db, 0);
+    CHECK(std::ranges::find(kept, first_put) == kept.end());
     check_complete_from(db, retain);
     CHECK(collect_kv(db).at("k7") == "new");
   }
@@ -4971,7 +5017,9 @@ TEST_CASE("vacuum is not stalled by a file whose dead entries are all above "
   auto db = bytecask::DB::open(td.path / "db");
   // File 1: six keys, one of them later overwritten — a little to reclaim,
   // all of it at or below the retention point.
-  for (int i = 0; i < 6; ++i)
+  const auto a0_first =
+      db.put({}, to_bytes("a0"), to_bytes("xxxxxxxx")).sequence;
+  for (int i = 1; i < 6; ++i)
     db.put({}, to_bytes(std::format("a{}", i)), to_bytes("xxxxxxxx"));
   seal(db);
   // File 2: two keys that stay live, then four that die, above the point.
@@ -4988,7 +5036,10 @@ TEST_CASE("vacuum is not stalled by a file whose dead entries are all above "
   // File 2 is the more fragmented but has nothing vacuum may drop; file 1
   // is compacted instead.
   CHECK(db.vacuum({.fragmentation_threshold = 0.0, .retain_after = retain}));
-  CHECK(stream_sequences(db, 0).front() == 2);  // a0's first write went
+  // a0's first write went; the open's marker before it is kept for ever.
+  const auto after = stream_sequences(db, 0);
+  CHECK(std::ranges::find(after, a0_first) == after.end());
+  CHECK(after.front() == 1);
   check_complete_from(db, retain);
   CHECK_FALSE(db.vacuum({.fragmentation_threshold = 0.0, .retain_after = retain}));
 }
@@ -5254,7 +5305,9 @@ TEST_CASE("vacuum keeps total_bytes equal to the compacted file's size",
     before = stats_shape(db);
   }
 
-  auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+  // As a follower, whose open writes no ChangeMarker of its own.
+  auto db = bytecask::DB::open(
+      db_path, {.max_file_bytes = 1, .initial_mode = bytecask::Mode::Follower});
   // Recovery computes total_bytes from the file's actual size. If vacuum
   // undercounted, these disagree by kHeaderSize + kCrcSize per marker.
   CHECK(stats_shape(db) == before);
@@ -5276,6 +5329,9 @@ TEST_CASE("vacuum unlinks stale file immediately, snapshot reads via open fd",
   auto db_path = td.path / "db";
   auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
 
+  // The open's marker shares the first file with this put, so v1 below
+  // gets a file of its own, which vacuum can remove whole.
+  db.put({}, to_bytes("other"), to_bytes("x"));
   db.put({}, to_bytes("k"), to_bytes("v1"));
   db.put({}, to_bytes("k"), to_bytes("v2")); // kills v1 → file qualifies
 
@@ -6509,8 +6565,8 @@ TEST_CASE("apply_batch group commit: second slot conflicts on existing key",
     db.test_write_group().wait_for_queue_size(2);
   };
 
-  std::optional<bytecask::CommitResult> resultA;
-  std::optional<bytecask::CommitResult> resultB;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> resultA;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> resultB;
 
   // Thread A becomes leader, blocks in hook until thread B enqueues.
   std::thread tA([&] {
@@ -6567,8 +6623,8 @@ TEST_CASE("apply_batch group commit: second slot conflicts on new key",
     db.test_write_group().wait_for_queue_size(2);
   };
 
-  std::optional<bytecask::CommitResult> resultA;
-  std::optional<bytecask::CommitResult> resultB;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> resultA;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> resultB;
 
   std::thread tA([&] {
     resultA = db.apply_batch({.sync = false}, std::move(planA));
@@ -6805,10 +6861,11 @@ TEST_CASE("class G: key not visible after rotation sync failure", "[g_visibility
 TEST_CASE("resume() recovers from degraded state", "[degraded][resume]") {
   TempDir td;
 
-  // max_file_bytes=30 triggers rotation once the file exceeds ~30 bytes.
-  // Each entry is ~23 bytes (15 hdr + 4 crc + 2 key + 2 value).
-  // k1 fits (23 bytes); k2 pushes the file to ~46 bytes, triggering rotation.
-  bytecask::DB db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 30});
+  // max_file_bytes=60 triggers rotation once the file reaches 60 bytes.
+  // The open's marker is 27 bytes, each entry here 23 (15 hdr + 4 crc +
+  // 2 key + 2 value). With k1 the file holds 50; k2 pushes it to 73,
+  // triggering rotation.
+  bytecask::DB db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 60});
   db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
 
   {
@@ -6846,9 +6903,9 @@ TEST_CASE("directory sync: a failed sync at rotation degrades before the new "
   TempDir td;
   const auto db_path = td.path / "db";
   {
-    // As in "resume() recovers from degraded state": k2 crosses the 30-byte
+    // As in "resume() recovers from degraded state": k2 crosses the 60-byte
     // threshold, and the rotation after its commit creates the next file.
-    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 30});
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 60});
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
     const auto files_before = data_files_in(db_path);
     {
@@ -6870,15 +6927,17 @@ TEST_CASE("directory sync: a failed sync at rotation degrades before the new "
   }
   // The file left behind by the failed rotation is recovered like the active
   // file of a crash.
-  auto db = bytecask::DB::open(db_path, {.max_file_bytes = 30});
+  auto db = bytecask::DB::open(db_path, {.max_file_bytes = 60});
   CHECK(collect_kv(db) == std::map<std::string, std::string>{
                               {"k1", "v1"}, {"k2", "v2"}, {"k3", "v3"}});
 }
 
 TEST_CASE("directory sync: a failed sync in resume() stays degraded",
           "[dir_sync][degraded][resume]") {
+  // As in "resume() recovers from degraded state": k2 crosses the 60-byte
+  // threshold.
   TempDir td;
-  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 30});
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 60});
   db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
   {
     bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
@@ -7172,7 +7231,12 @@ auto degrade_with_unsynced_batch(bytecask::DB &db,
                       std::system_error);
   }
   REQUIRE(db.is_degraded());
-  return raw_entry_offsets(active_data_file(dir));
+  // The file's first record is the open's ChangeMarker; the callers index
+  // the writes after it.
+  auto offsets = raw_entry_offsets(active_data_file(dir));
+  REQUIRE_FALSE(offsets.empty());
+  offsets.erase(offsets.begin());
+  return offsets;
 }
 
 }  // namespace
@@ -7532,10 +7596,10 @@ TEST_CASE("create_manifest whose fdatasync fails degrades, and a power cut "
     durable = db.durable_sequence();
     cache.model.copy_device(dir, after_cut);  // power cut
   }
-  // k{i} was written at sequence i + 1.
+  // k{i} was written at sequence i + 2, after the open's marker.
   auto db = bytecask::DB::open(after_cut);
   for (int i = 0; i <= kUnsyncedPuts; ++i) {
-    if (static_cast<std::uint64_t>(i) + 1 > durable) break;
+    if (static_cast<std::uint64_t>(i) + 2 > durable) break;
     INFO("key " << i << ", durable_sequence " << durable);
     CHECK(get_str(db, to_bytes(fsyncgate_key(i))) == fsyncgate_value(i));
   }
@@ -7557,7 +7621,8 @@ TEST_CASE("create_manifest after resume() from its failed fdatasync makes "
     }
     REQUIRE_NOTHROW(db.resume());
     const auto manifest = db.create_manifest();
-    CHECK(manifest.through_sequence == static_cast<std::uint64_t>(kUnsyncedPuts + 1));
+    // The open's marker, then kUnsyncedPuts + 1 puts.
+    CHECK(manifest.through_sequence == static_cast<std::uint64_t>(kUnsyncedPuts + 2));
     cache.model.copy_device(dir, after_cut);  // power cut
   }
   auto db = bytecask::DB::open(after_cut);
@@ -7579,11 +7644,13 @@ TEST_CASE("vacuum does not drop a durable record that only an unsynced write "
       TempDir td;
       const auto dir = td.path / "db";
       const auto after_cut = td.path / "after_cut";
-      // Two 25-byte entries fill the first file and seal it. The 23-byte
-      // overwrites stay below the limit, so no rotation syncs them.
+      // The open's marker is sealed in a file of its own. Two 25-byte
+      // entries fill the next file and seal it. The 23-byte overwrites stay
+      // below the limit, so no rotation syncs them.
       const bytecask::Options opts{.max_file_bytes = 50};
       {
         auto db = bytecask::DB::open(dir, opts);
+        seal(db);
         db.put({.sync = true}, to_bytes("k0"), to_bytes("v_k0"));
         db.put({.sync = true}, to_bytes("k1"), to_bytes("v_k1"));
         if (whole_file)
@@ -7612,6 +7679,7 @@ TEST_CASE("vacuum whose fdatasync fails degrades, keeps the source file, and "
   const bytecask::Options opts{.max_file_bytes = 50};  // as above
   {
     auto db = bytecask::DB::open(dir, opts);
+    seal(db);  // the open's marker in a file of its own, as above
     db.put({.sync = true}, to_bytes("k0"), to_bytes("v_k0"));
     db.put({.sync = true}, to_bytes("k1"), to_bytes("v_k1"));
     db.put({.sync = false}, to_bytes("k0"), to_bytes("n0"));
@@ -7988,7 +8056,13 @@ TEST_CASE("resume() with live snapshot on degraded DB",
 // ---------------------------------------------------------------------------
 // These test TransientEngineState::validate_preconditions in isolation —
 // no DB, no disk I/O. We construct EngineState directly, call .transient(),
-// and verify each guard path.
+// and verify each guard path. A test that builds its plan on a snapshot runs
+// once per base (docs/bytecask_design.md, "Snapshots and conditional
+// writes"): on the snapshot, where the head and the snapshot are compared,
+// and on the snapshot's sequence alone, where a head entry above it is a
+// change and a key absent from the head changed only if the delete log
+// holds its removal. Each scenario gives both states and the log, so both
+// rules have what they need; where the rules disagree, the test says so.
 
 namespace {
 
@@ -8011,10 +8085,57 @@ auto make_state(
   return s;
 }
 
+// A snapshot at sequence 15: every entry these tests give a snapshot is at
+// or below it, and every change a head makes since is above it.
+constexpr std::uint64_t kSnapSeq = 15;
+
 auto make_snapshot(
     std::initializer_list<std::pair<std::string, bytecask::KeyDirEntry>> entries)
     -> bytecask::Snapshot {
-  return bytecask::Snapshot::from_state(make_state(entries));
+  auto s = make_state(entries);
+  s->next_seq = kSnapSeq + 1;
+  return bytecask::Snapshot::from_state(std::move(s));
+}
+
+using Verdict = bytecask::TransientEngineState::Verdict;
+
+// What a test's plan is built from.
+enum class PlanBase : std::uint8_t { Snapshot, Sequence };
+
+// A plan on `snap`, or on its sequence alone.
+auto plan_on(PlanBase base, bytecask::Snapshot snap) -> bytecask::WritePlan {
+  if (base == PlanBase::Snapshot) return bytecask::WritePlan{std::move(snap)};
+  return bytecask::WritePlan{snap.sequence(), snap.marker()};
+}
+
+// A del of key the head made at seq, in a group that follows the last one
+// the log recorded.
+void removed(bytecask::DeleteLog &log, const std::string &key,
+             std::uint64_t seq) {
+  bytecask::StagedRemovals staged;
+  staged.add_key(to_bytes(key), seq);
+  log.record(staged, log.recorded_through() + 1, seq);
+}
+
+// A del_range of [from, to) the head made at seq, the same way.
+void range_removed(bytecask::DeleteLog &log, const std::string &from,
+                   const std::string &to, std::uint64_t seq) {
+  bytecask::StagedRemovals staged;
+  staged.add_range(to_bytes(from), to_bytes(to), seq);
+  log.record(staged, log.recorded_through() + 1, seq);
+}
+
+// Checks plan against t with a log that recorded every sequence below t's:
+// what a DB's log holds when every write before t went through a group that
+// deleted nothing more than the test logged.
+auto validate(const bytecask::TransientEngineState &t,
+              const bytecask::WritePlan &plan, bytecask::DeleteLog &deletes)
+    -> bytecask::TransientEngineState::Verdict {
+  if (deletes.recorded_through() + 1 < t.next_seq()) {
+    bytecask::StagedRemovals none;
+    deletes.record(none, deletes.recorded_through() + 1, t.next_seq() - 1);
+  }
+  return t.validate_preconditions(plan, deletes);
 }
 
 } // namespace
@@ -8025,49 +8146,54 @@ TEST_CASE("validate_preconditions: MustExist passes when key present",
           "[validate_preconditions]") {
   auto state = make_state({{"k", kde(10, 0, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan;
   plan.ensure_present(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: MustExist fails when key absent",
           "[validate_preconditions]") {
   auto state = make_state({});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan;
   plan.ensure_present(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: MustBeAbsent passes when key absent",
           "[validate_preconditions]") {
   auto state = make_state({});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan;
   plan.ensure_absent(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: MustBeAbsent fails when key present",
           "[validate_preconditions]") {
   auto state = make_state({{"k", kde(10, 0, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan;
   plan.ensure_absent(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: None precondition always passes",
           "[validate_preconditions]") {
   auto state = make_state({{"k", kde(10, 0, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan;
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 // --- MustBeUnchanged (requires snapshot) ---
@@ -8077,10 +8203,12 @@ TEST_CASE("validate_preconditions: MustBeUnchanged passes when key unchanged",
   auto snap = make_snapshot({{"k", kde(10, 0, 1, 5)}});
   auto state = make_state({{"k", kde(10, 0, 1, 5)}});
   auto t = state->transient();
-  bytecask::WritePlan plan{std::move(snap)};
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
   plan.ensure_unchanged(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: MustBeUnchanged fails when key modified",
@@ -8088,10 +8216,12 @@ TEST_CASE("validate_preconditions: MustBeUnchanged fails when key modified",
   auto snap = make_snapshot({{"k", kde(10, 0, 1, 5)}});
   auto state = make_state({{"k", kde(20, 100, 1, 5)}});
   auto t = state->transient();
-  bytecask::WritePlan plan{std::move(snap)};
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
   plan.ensure_unchanged(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: MustBeUnchanged fails when key deleted",
@@ -8099,10 +8229,13 @@ TEST_CASE("validate_preconditions: MustBeUnchanged fails when key deleted",
   auto snap = make_snapshot({{"k", kde(10, 0, 1, 5)}});
   auto state = make_state({});
   auto t = state->transient();
-  bytecask::WritePlan plan{std::move(snap)};
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  removed(deletes, "k", 20);
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
   plan.ensure_unchanged(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: MustBeUnchanged passes when key absent in both",
@@ -8110,21 +8243,25 @@ TEST_CASE("validate_preconditions: MustBeUnchanged passes when key absent in bot
   auto snap = make_snapshot({});
   auto state = make_state({});
   auto t = state->transient();
-  bytecask::WritePlan plan{std::move(snap)};
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
   plan.ensure_unchanged(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: MustBeUnchanged fails when key appeared",
           "[validate_preconditions]") {
   auto snap = make_snapshot({});
-  auto state = make_state({{"k", kde(15, 0, 1, 5)}});
+  auto state = make_state({{"k", kde(20, 0, 1, 5)}});
   auto t = state->transient();
-  bytecask::WritePlan plan{std::move(snap)};
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
   plan.ensure_unchanged(to_bytes("k"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 // --- Range guards ---
@@ -8134,10 +8271,12 @@ TEST_CASE("validate_preconditions: range guard passes when range unchanged",
   auto snap = make_snapshot({{"a", kde(5, 0, 1, 3)}, {"b", kde(10, 0, 1, 5)}, {"d", kde(15, 0, 1, 4)}});
   auto state = make_state({{"a", kde(5, 0, 1, 3)}, {"b", kde(10, 0, 1, 5)}, {"d", kde(15, 0, 1, 4)}});
   auto t = state->transient();
-  bytecask::WritePlan plan{std::move(snap)};
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
   plan.put(to_bytes("x"), to_bytes("new"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: range guard fails when key modified in range",
@@ -8145,10 +8284,12 @@ TEST_CASE("validate_preconditions: range guard fails when key modified in range"
   auto snap = make_snapshot({{"b", kde(10, 0, 1, 5)}});
   auto state = make_state({{"b", kde(20, 100, 1, 5)}});
   auto t = state->transient();
-  bytecask::WritePlan plan{std::move(snap)};
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
   plan.put(to_bytes("x"), to_bytes("new"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: range guard fails when key inserted in range",
@@ -8156,10 +8297,12 @@ TEST_CASE("validate_preconditions: range guard fails when key inserted in range"
   auto snap = make_snapshot({});
   auto state = make_state({{"c", kde(20, 0, 1, 5)}});
   auto t = state->transient();
-  bytecask::WritePlan plan{std::move(snap)};
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
   plan.put(to_bytes("x"), to_bytes("new"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: range guard fails when key deleted in range",
@@ -8167,10 +8310,13 @@ TEST_CASE("validate_preconditions: range guard fails when key deleted in range",
   auto snap = make_snapshot({{"c", kde(10, 0, 1, 5)}});
   auto state = make_state({});
   auto t = state->transient();
-  bytecask::WritePlan plan{std::move(snap)};
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  removed(deletes, "c", 20);
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
   plan.put(to_bytes("x"), to_bytes("new"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: range guard ignores keys outside range",
@@ -8178,10 +8324,12 @@ TEST_CASE("validate_preconditions: range guard ignores keys outside range",
   auto snap = make_snapshot({{"a", kde(5, 0, 1, 3)}, {"b", kde(10, 0, 1, 5)}});
   auto state = make_state({{"a", kde(50, 0, 1, 3)}, {"b", kde(10, 0, 1, 5)}});
   auto t = state->transient();
-  bytecask::WritePlan plan{std::move(snap)};
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
   plan.ensure_range_unchanged(to_bytes("b"), to_bytes("d"));
   plan.put(to_bytes("x"), to_bytes("new"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 // --- Implicit W-W conflict detection (snapshot present) ---
@@ -8191,9 +8339,11 @@ TEST_CASE("validate_preconditions: W-W passes when write key unchanged",
   auto snap = make_snapshot({{"k", kde(10, 0, 1, 5)}});
   auto state = make_state({{"k", kde(10, 0, 1, 5)}});
   auto t = state->transient();
-  bytecask::WritePlan plan{std::move(snap)};
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: W-W fails when write key modified",
@@ -8201,19 +8351,23 @@ TEST_CASE("validate_preconditions: W-W fails when write key modified",
   auto snap = make_snapshot({{"k", kde(10, 0, 1, 5)}});
   auto state = make_state({{"k", kde(20, 100, 1, 5)}});
   auto t = state->transient();
-  bytecask::WritePlan plan{std::move(snap)};
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: W-W fails when write key appeared",
           "[validate_preconditions]") {
   auto snap = make_snapshot({});
-  auto state = make_state({{"k", kde(15, 0, 1, 5)}});
+  auto state = make_state({{"k", kde(20, 0, 1, 5)}});
   auto t = state->transient();
-  bytecask::WritePlan plan{std::move(snap)};
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: W-W fails when write key deleted",
@@ -8221,9 +8375,12 @@ TEST_CASE("validate_preconditions: W-W fails when write key deleted",
   auto snap = make_snapshot({{"k", kde(10, 0, 1, 5)}});
   auto state = make_state({});
   auto t = state->transient();
-  bytecask::WritePlan plan{std::move(snap)};
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  removed(deletes, "k", 20);
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: W-W passes for new key absent in both",
@@ -8231,9 +8388,11 @@ TEST_CASE("validate_preconditions: W-W passes for new key absent in both",
   auto snap = make_snapshot({});
   auto state = make_state({});
   auto t = state->transient();
-  bytecask::WritePlan plan{std::move(snap)};
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
   plan.put(to_bytes("new_key"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: W-W skips guard-only keys",
@@ -8243,10 +8402,12 @@ TEST_CASE("validate_preconditions: W-W skips guard-only keys",
   auto snap = make_snapshot({{"g", kde(10, 0, 1, 5)}, {"k", kde(10, 0, 1, 5)}});
   auto state = make_state({{"g", kde(20, 100, 1, 3)}, {"k", kde(10, 0, 1, 5)}});
   auto t = state->transient();
-  bytecask::WritePlan plan{std::move(snap)};
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
   plan.ensure_present(to_bytes("g"));
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 // --- Combined scenarios ---
@@ -8256,11 +8417,13 @@ TEST_CASE("validate_preconditions: multiple guards all pass",
   auto snap = make_snapshot({{"a", kde(5, 0, 1, 3)}, {"b", kde(10, 0, 1, 5)}});
   auto state = make_state({{"a", kde(5, 0, 1, 3)}, {"b", kde(10, 0, 1, 5)}});
   auto t = state->transient();
-  bytecask::WritePlan plan{std::move(snap)};
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
   plan.ensure_present(to_bytes("a"));
   plan.ensure_unchanged(to_bytes("b"));
   plan.put(to_bytes("a"), to_bytes("new_a"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 TEST_CASE("validate_preconditions: one failing guard rejects plan",
@@ -8268,11 +8431,13 @@ TEST_CASE("validate_preconditions: one failing guard rejects plan",
   auto snap = make_snapshot({{"a", kde(5, 0, 1, 3)}, {"b", kde(10, 0, 1, 5)}});
   auto state = make_state({{"a", kde(5, 0, 1, 3)}, {"b", kde(20, 100, 1, 5)}});
   auto t = state->transient();
-  bytecask::WritePlan plan{std::move(snap)};
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
   plan.ensure_present(to_bytes("a"));
   plan.ensure_unchanged(to_bytes("b"));
   plan.put(to_bytes("a"), to_bytes("new_a"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: del with snapshot triggers W-W check",
@@ -8280,18 +8445,147 @@ TEST_CASE("validate_preconditions: del with snapshot triggers W-W check",
   auto snap = make_snapshot({{"k", kde(10, 0, 1, 5)}});
   auto state = make_state({{"k", kde(20, 100, 1, 5)}});
   auto t = state->transient();
-  bytecask::WritePlan plan{std::move(snap)};
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
   plan.del(to_bytes("k"));
-  CHECK_FALSE(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Conflict);
 }
 
 TEST_CASE("validate_preconditions: no snapshot skips W-W checks",
           "[validate_preconditions]") {
   auto state = make_state({{"k", kde(20, 0, 1, 5)}});
   auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
   bytecask::WritePlan plan;
   plan.put(to_bytes("k"), to_bytes("v1"));
-  CHECK(t.validate_preconditions(plan));
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
+}
+
+TEST_CASE("validate_preconditions: a removal at or below the read sequence is not a change",
+          "[validate_preconditions]") {
+  auto snap = make_snapshot({});
+  auto state = make_state({});
+  auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  removed(deletes, "k", kSnapSeq);
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
+  plan.ensure_unchanged(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
+}
+
+TEST_CASE("validate_preconditions: a key written and removed again since the base conflicts for a sequence plan only",
+          "[validate_preconditions]") {
+  // Absent from both states, but a write since touched it. A snapshot plan
+  // compares the states, which agree; a sequence plan sees the removal
+  // (CONTRACT.md, "Isolation is what the plan guards").
+  auto snap = make_snapshot({});
+  auto state = make_state({});
+  auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  removed(deletes, "k", 20);
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  CHECK(validate(t, plan, deletes) ==
+        (base == PlanBase::Snapshot ? Verdict::Holds : Verdict::Conflict));
+}
+
+TEST_CASE("validate_preconditions: a range delete since the base over an absent key conflicts for a sequence plan only",
+          "[validate_preconditions]") {
+  // A del_range is logged by its bounds, so it names every key it covers,
+  // present or not (CONTRACT.md, "Isolation is what the plan guards").
+  auto snap = make_snapshot({});
+  auto state = make_state({});
+  auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  range_removed(deletes, "a", "m", 20);
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  const auto expect = [&](bool inside) {
+    return base == PlanBase::Sequence && inside ? Verdict::Conflict
+                                                : Verdict::Holds;
+  };
+  SECTION("a written key inside the range") {
+    auto plan = plan_on(base, std::move(snap));
+    plan.put(to_bytes("k"), to_bytes("v1"));
+    CHECK(validate(t, plan, deletes) == expect(true));
+  }
+  SECTION("a written key past the range") {
+    auto plan = plan_on(base, std::move(snap));
+    plan.put(to_bytes("m"), to_bytes("v1"));
+    CHECK(validate(t, plan, deletes) == expect(false));
+  }
+  SECTION("a range guard overlapping it") {
+    auto plan = plan_on(base, std::move(snap));
+    plan.ensure_range_unchanged(to_bytes("l"), to_bytes("z"));
+    CHECK(validate(t, plan, deletes) == expect(true));
+  }
+  SECTION("a range guard next to it") {
+    auto plan = plan_on(base, std::move(snap));
+    plan.ensure_range_unchanged(to_bytes("m"), to_bytes("z"));
+    CHECK(validate(t, plan, deletes) == expect(false));
+  }
+}
+
+TEST_CASE("validate_preconditions: a read sequence below the delete log's horizon is too old",
+          "[validate_preconditions]") {
+  auto state = make_state({{"k", kde(10, 0, 1, 5)}});
+  auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  // Sequences up to kSnapSeq + 1 came from a path the log never saw.
+  bytecask::StagedRemovals none;
+  deletes.record(none, kSnapSeq + 2, kSnapSeq + 2);
+  // Only a check that needs the log is too old for it: an absent key here.
+  bytecask::WritePlan plan{kSnapSeq, bytecask::kOriginMarker};
+  plan.put(to_bytes("absent"), to_bytes("v1"));
+  CHECK(validate(t, plan, deletes) == Verdict::TooOld);
+  bytecask::WritePlan present{kSnapSeq, bytecask::kOriginMarker};
+  present.put(to_bytes("k"), to_bytes("v1"));
+  CHECK(validate(t, present, deletes) == Verdict::Holds);
+  bytecask::WritePlan at_horizon{kSnapSeq + 1, bytecask::kOriginMarker};
+  at_horizon.put(to_bytes("absent"), to_bytes("v1"));
+  CHECK(validate(t, at_horizon, deletes) == Verdict::Holds);
+  // A plan on the snapshot itself is never too old: it does not use the log.
+  bytecask::WritePlan on_snapshot{make_snapshot({{"k", kde(10, 0, 1, 5)}})};
+  on_snapshot.put(to_bytes("k"), to_bytes("v1"));
+  CHECK(validate(t, on_snapshot, deletes) == Verdict::Holds);
+}
+
+TEST_CASE("validate_preconditions: a read point on another history or past the head is too old",
+          "[validate_preconditions]") {
+  // A sequence names a state only within one history (docs/bytecask_design.md,
+  // "Checking a plan by its read sequence"). make_state holds no marker, so
+  // its marker at every sequence is the origin.
+  auto state = make_state({{"k", kde(10, 0, 1, 5)}});  // next_seq 100
+  auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  const auto verdict = [&](std::uint64_t read_seq, bytecask::ChangeMarker m) {
+    bytecask::WritePlan plan{read_seq, m};
+    plan.put(to_bytes("k"), to_bytes("v1"));
+    return validate(t, plan, deletes);
+  };
+  CHECK(verdict(kSnapSeq, bytecask::kOriginMarker) == Verdict::Holds);
+  CHECK(verdict(kSnapSeq, bytecask::ChangeMarker{5, 42}) == Verdict::TooOld);
+  CHECK(verdict(99, bytecask::kOriginMarker) == Verdict::Holds);
+  CHECK(verdict(100, bytecask::kOriginMarker) == Verdict::TooOld);
+}
+
+TEST_CASE("validate_preconditions: a removal after the state checked is not part of it",
+          "[validate_preconditions]") {
+  // The published state is checked with the head's log: a removal at or
+  // above its next sequence is a later state's.
+  auto snap = make_snapshot({});
+  auto state = make_state({});  // next_seq 100
+  auto t = state->transient();
+  bytecask::DeleteLog deletes{std::size_t{1} << 20};
+  removed(deletes, "k", 100);
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
+  auto plan = plan_on(base, std::move(snap));
+  plan.ensure_unchanged(to_bytes("k"));
+  plan.ensure_range_unchanged(to_bytes("a"), to_bytes("z"));
+  CHECK(validate(t, plan, deletes) == Verdict::Holds);
 }
 
 // ---------------------------------------------------------------------------
@@ -9176,19 +9470,20 @@ TEST_CASE("durable_sequence reflects sync writes", "[durable_seq]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
 
-  // Fresh DB with no writes: durable_seq == 0 (next_seq starts at 1,
-  // no keys recovered, so durable_seq = next_seq - 1 = 0).
-  CHECK(db.durable_sequence() == 0);
+  // Fresh DB with no writes: durable_seq is the open's own marker, synced
+  // before open returns (sequence 1; next_seq starts at 1).
+  const auto opened = db.durable_sequence();
+  CHECK(opened == 1);
 
   // NoSync write — must NOT advance durable_seq.
   db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
-  CHECK(db.durable_sequence() == 0);
+  CHECK(db.durable_sequence() == opened);
 
   // Sync write — must advance durable_seq to cover both keys
   // (group commit: the sync also confirms the earlier nosync entry).
   db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
   auto seq_after_sync = db.durable_sequence();
-  CHECK(seq_after_sync >= 2);
+  CHECK(seq_after_sync >= opened + 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -9196,14 +9491,16 @@ TEST_CASE("durable_sequence reflects sync writes", "[durable_seq]") {
 // ---------------------------------------------------------------------------
 TEST_CASE("durable_sequence stays at zero for nosync-only writes",
           "[durable_seq]") {
+  // "Zero" past the open's own marker, which the open synced.
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
+  const auto opened = db.durable_sequence();
 
   for (int i = 0; i < 10; ++i) {
     db.put({.sync = false}, to_bytes(std::format("k{}", i)),
            to_bytes(std::format("v{}", i)));
   }
-  CHECK(db.durable_sequence() == 0);
+  CHECK(db.durable_sequence() == opened);
 }
 
 // ---------------------------------------------------------------------------
@@ -9216,7 +9513,7 @@ TEST_CASE("durable_sequence returns immediately for reached targets",
 
   db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
   auto baseline = db.durable_sequence();
-  REQUIRE(baseline >= 1);
+  REQUIRE(baseline >= 2);  // the open's marker, then k1
 
   auto start = std::chrono::steady_clock::now();
   // min_sequence = 0: always trivially reached.
@@ -9233,22 +9530,23 @@ TEST_CASE("durable_sequence returns immediately for reached targets",
 TEST_CASE("durable_sequence long-poll wakes on sync write", "[durable_seq][concurrency]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
+  const auto target = db.durable_sequence() + 1;  // past the open's marker
 
   std::atomic<std::uint64_t> polled_seq{0};
   std::thread poller{[&] {
     polled_seq.store(
-        db.durable_sequence(1, std::chrono::milliseconds{5000}),
+        db.durable_sequence(target, std::chrono::milliseconds{5000}),
         std::memory_order_release);
   }};
 
   // Give poller time to block on the condvar.
   std::this_thread::sleep_for(std::chrono::milliseconds{50});
 
-  // Sync write wakes the poller by reaching target sequence 1.
+  // Sync write wakes the poller by reaching the target sequence.
   db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
 
   poller.join();
-  CHECK(polled_seq.load(std::memory_order_acquire) >= 1);
+  CHECK(polled_seq.load(std::memory_order_acquire) >= target);
 }
 
 // ---------------------------------------------------------------------------
@@ -9258,12 +9556,14 @@ TEST_CASE("durable_sequence long-poll times out on idle DB", "[durable_seq]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
 
+  // The target past the open's marker is never reached — nothing is
+  // written.
+  const auto target = db.durable_sequence() + 1;
   auto start = std::chrono::steady_clock::now();
-  // Target 1 is never reached — nothing is written.
-  auto seq = db.durable_sequence(1, std::chrono::milliseconds{50});
+  auto seq = db.durable_sequence(target, std::chrono::milliseconds{50});
   auto elapsed = std::chrono::steady_clock::now() - start;
 
-  CHECK(seq < 1);
+  CHECK(seq < target);
   CHECK(elapsed >= std::chrono::milliseconds{40});
 }
 
@@ -9271,8 +9571,9 @@ TEST_CASE("durable_sequence with no timeout returns an unreached target at once"
           "[durable_seq]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
+  const auto opened = db.durable_sequence();  // the open's own marker
   const auto start = std::chrono::steady_clock::now();
-  CHECK(db.durable_sequence(1, std::chrono::milliseconds{0}) == 0);
+  CHECK(db.durable_sequence(opened + 1, std::chrono::milliseconds{0}) == opened);
   CHECK(std::chrono::steady_clock::now() - start <
         std::chrono::milliseconds{2000});
 }
@@ -9281,6 +9582,7 @@ TEST_CASE("durable_sequence wakes a waiter when the DB closes",
           "[durable_seq][concurrency]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
+  const auto target = db.durable_sequence() + 1;  // past the open's marker
   std::latch parked{1};
   std::atomic<bool> signalled{false};
   db.test_in_sequence_wait_ = [&] {
@@ -9289,7 +9591,7 @@ TEST_CASE("durable_sequence wakes a waiter when the DB closes",
   std::exception_ptr err;
   std::thread waiter{[&] {
     try {
-      (void)db.durable_sequence(1, std::chrono::seconds{30});
+      (void)db.durable_sequence(target, std::chrono::seconds{30});
     } catch (...) {
       err = std::current_exception();
     }
@@ -9501,6 +9803,422 @@ TEST_CASE("CommitResult apply_batch conflict returns nullopt",
 }
 
 // ---------------------------------------------------------------------------
+// Plans checked by read sequence (CONTRACT.md, "A plan is checked by its
+// read sequence" and "A plan read too long ago is refused as TooOld").
+// ---------------------------------------------------------------------------
+namespace {
+// A read point taken from db now: what a plan built away from its reads
+// carries (WritePlan(sequence, marker)).
+struct ReadPoint {
+  std::uint64_t seq{0};
+  bytecask::ChangeMarker marker{};
+};
+auto read_point(const bytecask::DB &db) -> ReadPoint {
+  const auto snap = db.snapshot();
+  return {snap.sequence(), snap.marker()};
+}
+auto plan_at(const ReadPoint &r) -> bytecask::WritePlan {
+  return bytecask::WritePlan{r.seq, r.marker};
+}
+} // namespace
+
+TEST_CASE("read sequence: a snapshot's sequence is the last write it sees",
+          "[apply_batch][read_sequence]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  const auto r = db.put({}, to_bytes("k"), to_bytes("v"));
+  CHECK(db.snapshot().sequence() == r.sequence);
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("a"), to_bytes("1"));
+  plan.put(to_bytes("b"), to_bytes("2"));
+  const auto rb = db.apply_batch({}, std::move(plan));
+  REQUIRE(rb.has_value());
+  CHECK(db.snapshot().sequence() == rb->sequence);
+}
+
+TEST_CASE("read sequence: a plan built from a bare sequence is checked "
+          "without the snapshot",
+          "[apply_batch][read_sequence]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+  db.put({}, to_bytes("gone"), to_bytes("v0"));
+  const auto read_seq = read_point(db);  // the plan carries two numbers
+
+  SECTION("nothing it touches changed: commits") {
+    db.put({}, to_bytes("other"), to_bytes("x"));
+    auto plan = plan_at(read_seq);
+    plan.ensure_unchanged(to_bytes("gone"));
+    plan.ensure_range_unchanged(to_bytes("j"), to_bytes("l"));
+    plan.put(to_bytes("k"), to_bytes("v1"));
+    REQUIRE(db.apply_batch({}, std::move(plan)).has_value());
+    CHECK(to_string(*get_val(db, to_bytes("k"))) == "v1");
+  }
+  SECTION("a written key changed: conflict") {
+    db.put({}, to_bytes("k"), to_bytes("v1"));
+    auto plan = plan_at(read_seq);
+    plan.put(to_bytes("k"), to_bytes("v2"));
+    const auto r = db.apply_batch({}, std::move(plan));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == bytecask::PlanRefusal::Conflict);
+  }
+  SECTION("a guarded key was deleted: conflict") {
+    (void)db.del({}, to_bytes("gone"));
+    auto plan = plan_at(read_seq);
+    plan.ensure_unchanged(to_bytes("gone"));
+    plan.put(to_bytes("k"), to_bytes("v1"));
+    const auto r = db.apply_batch({}, std::move(plan));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == bytecask::PlanRefusal::Conflict);
+  }
+  SECTION("a key in a guarded range was deleted by a range delete: conflict") {
+    db.del_range({}, to_bytes("g"), to_bytes("h"));
+    auto plan = plan_at(read_seq);
+    plan.ensure_range_unchanged(to_bytes("a"), to_bytes("z"));
+    plan.put(to_bytes("other"), to_bytes("y"));
+    const auto r = db.apply_batch({}, std::move(plan));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == bytecask::PlanRefusal::Conflict);
+  }
+}
+
+TEST_CASE("read sequence: a delete earlier in the same group commit is a change",
+          "[apply_batch][read_sequence][concurrency]") {
+  // The group's removals reach the delete log only once it is appended, so
+  // a later slot in the same group must see the earlier slot's removal
+  // another way (docs/bytecask_design.md, "Checking a plan by its read
+  // sequence"). Missing it would let B overwrite a key A just deleted,
+  // from a read that saw the key present. A plan on a snapshot compares the
+  // snapshot with the head, which the earlier slot changed: it must
+  // conflict the same way.
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+  db.put({}, to_bytes("r"), to_bytes("v0"));
+  const auto read_seq = read_point(db);
+  const bool on_snapshot = GENERATE(false, true);
+  INFO((on_snapshot ? "plans on a snapshot" : "plans on a read sequence"));
+  const auto plan = [&] {
+    return on_snapshot ? bytecask::WritePlan{db.snapshot()}
+                       : plan_at(read_seq);
+  };
+
+  auto planA = plan_at(read_seq);
+  planA.del(to_bytes("k"));
+  planA.del(to_bytes("r"));
+  auto planB = plan();
+  planB.put(to_bytes("k"), to_bytes("fromB"));
+  auto planC = plan();
+  planC.ensure_range_unchanged(to_bytes("q"), to_bytes("s"));
+  planC.put(to_bytes("other"), to_bytes("fromC"));
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool leader_ready = false;
+  db.test_write_group().on_batch_start_ = [&] {
+    {
+      std::unique_lock<std::mutex> lk{mu};
+      leader_ready = true;
+      cv.notify_all();
+    }
+    db.test_write_group().wait_for_queue_size(3);
+  };
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> ra;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> rb;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> rc;
+  const auto behind_leader = [&](auto &plan, auto &result) {
+    return std::thread{[&] {
+      {
+        std::unique_lock<std::mutex> lk{mu};
+        cv.wait(lk, [&] { return leader_ready; });
+      }
+      result = db.apply_batch({.sync = false}, std::move(plan));
+    }};
+  };
+  std::thread ta{[&] { ra = db.apply_batch({.sync = false}, std::move(planA)); }};
+  auto tb = behind_leader(planB, rb);
+  auto tc = behind_leader(planC, rc);
+  ta.join();
+  tb.join();
+  tc.join();
+  db.test_write_group().on_batch_start_ = nullptr;
+
+  REQUIRE(ra.has_value());
+  REQUIRE_FALSE(rb.has_value());
+  CHECK(rb.error() == bytecask::PlanRefusal::Conflict);
+  REQUIRE_FALSE(rc.has_value());
+  CHECK(rc.error() == bytecask::PlanRefusal::Conflict);
+  CHECK_FALSE(get_val(db, to_bytes("k")).has_value());
+  CHECK_FALSE(get_val(db, to_bytes("other")).has_value());
+}
+
+TEST_CASE("snapshot plan: a key written and deleted again since the snapshot is no change",
+          "[apply_batch][snapshot]") {
+  // A plan on a snapshot compares the snapshot with the head; a key absent
+  // from both is unchanged, whatever happened to it in between (CONTRACT.md,
+  // "Isolation is what the plan guards"). A plan on the same sequence alone
+  // conflicts: "read sequence: a plan built from a bare sequence ...".
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+  auto snap = db.snapshot();
+  db.put({}, to_bytes("new"), to_bytes("x"));
+  REQUIRE(db.del({}, to_bytes("new")).has_value());
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_unchanged(to_bytes("new"));
+  plan.ensure_range_unchanged(to_bytes("m"), to_bytes("o"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  REQUIRE(db.apply_batch({}, std::move(plan)).has_value());
+  CHECK(to_string(*get_val(db, to_bytes("k"))) == "v1");
+}
+
+TEST_CASE("snapshot plan: never too old, whatever the delete log holds",
+          "[apply_batch][snapshot]") {
+  // The delete log serves plans on a bare sequence; a plan on a snapshot
+  // never consults it, so neither a log too small to cover the snapshot nor
+  // no log at all refuses it.
+  TempDir td;
+  const auto log_bytes = GENERATE(std::size_t{0}, std::size_t{512});
+  auto db = bytecask::DB::open(td.path / "db", {.max_delete_log_bytes = log_bytes});
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+  auto snap = db.snapshot();
+  for (int i = 0; i < 64; ++i) {
+    const auto key = std::format("d{:03}", i);
+    db.put({}, to_bytes(key), to_bytes("x"));
+    (void)db.del({}, to_bytes(key));
+  }
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.ensure_unchanged(to_bytes("k"));
+  plan.put(to_bytes("k"), to_bytes("v1"));
+  REQUIRE(db.apply_batch({}, std::move(plan)).has_value());
+  CHECK(to_string(*get_val(db, to_bytes("k"))) == "v1");
+}
+
+TEST_CASE("read sequence: a range delete is one entry in the delete log, whatever it covers",
+          "[apply_batch][read_sequence]") {
+  // 2000 keys logged one by one would overflow a 1 KiB log and refuse the
+  // plan as TooOld. Logged by its bounds, the range delete fits, and it
+  // names every key in the range, present at the read or not (CONTRACT.md,
+  // "Isolation is what the plan guards").
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_delete_log_bytes = 1024});
+  for (int i = 0; i < 2000; ++i)
+    db.put({.sync = false}, to_bytes(std::format("r{:04}", i)), to_bytes("x"));
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+  const auto read_seq = read_point(db);
+  db.del_range({}, to_bytes("r"), to_bytes("s"));
+
+  auto outside = plan_at(read_seq);
+  outside.put(to_bytes("k"), to_bytes("v1"));
+  CHECK(db.apply_batch({}, std::move(outside)).has_value());
+  for (const auto *key : {"r0005", "r9999"}) {
+    INFO(key);
+    auto inside = plan_at(read_seq);
+    inside.put(to_bytes(key), to_bytes("v1"));
+    const auto r = db.apply_batch({}, std::move(inside));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == bytecask::PlanRefusal::Conflict);
+  }
+}
+
+TEST_CASE("WritePlan: a moved-from snapshot is refused",
+          "[apply_batch][snapshot]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  auto snap = db.snapshot();
+  auto kept = std::move(snap);
+  CHECK_THROWS_AS(bytecask::WritePlan{std::move(snap)}, std::invalid_argument);
+  CHECK_THROWS_AS((void)snap.sequence(), std::logic_error);
+  bytecask::WritePlan plan{std::move(kept)};
+  plan.put(to_bytes("k"), to_bytes("v"));
+  // A moved-from plan has no read sequence, rather than a snapshot to read.
+  auto moved_to = std::move(plan);
+  CHECK_FALSE(plan.read_sequence().has_value());  // NOLINT(bugprone-use-after-move)
+  CHECK(moved_to.read_sequence().has_value());
+  CHECK(db.apply_batch({}, std::move(moved_to)).has_value());
+}
+
+TEST_CASE("read point: one read on another history is refused as TooOld",
+          "[apply_batch][read_sequence]") {
+  // A sequence names a state only within one history. Two copies of one
+  // database stand in for a crash or a failover: each starts its own
+  // history at open, and writes other things under the same sequences
+  // (CONTRACT.md, "A plan on a read point that cannot be checked").
+  TempDir td;
+  const auto dir_a = td.path / "a";
+  const auto dir_b = td.path / "b";
+  ReadPoint shared;
+  {
+    auto db = bytecask::DB::open(dir_a);
+    db.put({}, to_bytes("k"), to_bytes("v0"));
+    shared = read_point(db);
+    db.close();
+  }
+  std::filesystem::copy(dir_a, dir_b);
+  auto a = bytecask::DB::open(dir_a);
+  auto b = bytecask::DB::open(dir_b);
+
+  SECTION("read on the other copy, under sequences both reached") {
+    a.put({}, to_bytes("k"), to_bytes("a1"));
+    const auto read = read_point(a);
+    b.put({}, to_bytes("k"), to_bytes("b1"));
+    b.put({}, to_bytes("x"), to_bytes("b2"));
+    REQUIRE(b.snapshot().sequence() >= read.seq);
+    // By sequences alone k is unchanged: b's entry is at or below the read.
+    auto plan = plan_at(read);
+    plan.put(to_bytes("k"), to_bytes("lost update"));
+    const auto r = b.apply_batch({}, std::move(plan));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == bytecask::PlanRefusal::TooOld);
+    CHECK(to_string(*get_val(b, to_bytes("k"))) == "b1");
+  }
+  SECTION("read past the latest sequence") {
+    a.put({}, to_bytes("k"), to_bytes("a1"));
+    a.put({}, to_bytes("k"), to_bytes("a2"));
+    const auto read = read_point(a);
+    REQUIRE(b.snapshot().sequence() < read.seq);
+    auto plan = plan_at(read);
+    plan.put(to_bytes("k"), to_bytes("v"));
+    const auto r = b.apply_batch({}, std::move(plan));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == bytecask::PlanRefusal::TooOld);
+    // Its own history, past its own latest, too.
+    auto ahead = bytecask::WritePlan{read.seq + 1, read.marker};
+    ahead.put(to_bytes("k"), to_bytes("v"));
+    const auto r2 = a.apply_batch({}, std::move(ahead));
+    REQUIRE_FALSE(r2.has_value());
+    CHECK(r2.error() == bytecask::PlanRefusal::TooOld);
+  }
+  SECTION("read below both opens: the shared history checks as usual") {
+    auto plan = plan_at(shared);
+    plan.put(to_bytes("k"), to_bytes("v1"));
+    CHECK(b.apply_batch({}, std::move(plan)).has_value());
+  }
+}
+
+TEST_CASE("read point: every open as a leader starts a new history",
+          "[apply_batch][read_sequence][replication]") {
+  // CONTRACT.md, "Every open as a leader starts a new history".
+  TempDir td;
+  const auto dir = td.path / "db";
+  bytecask::ChangeMarker first;
+  {
+    auto db = bytecask::DB::open(dir);  // empty: it gets a marker too
+    first = db.snapshot().marker();
+    CHECK(first != bytecask::kOriginMarker);
+    CHECK(first.since_sequence == db.snapshot().sequence());
+    db.put({}, to_bytes("k"), to_bytes("v0"));
+    db.close();
+  }
+  bytecask::ChangeMarker second;
+  {
+    auto db = bytecask::DB::open(dir);
+    second = db.snapshot().marker();
+    CHECK(second != first);
+    CHECK(second.since_sequence > first.since_sequence);
+    db.close();
+  }
+  {
+    auto db = bytecask::DB::open(dir, {.initial_mode = bytecask::Mode::Follower});
+    CHECK(db.snapshot().marker() == second);  // a follower's open writes none
+    db.close();
+  }
+}
+
+TEST_CASE("read point: only a check that needs the delete log is too old for it",
+          "[apply_batch][read_sequence]") {
+  // A present key is decided by its entry's sequence; an absent one, and
+  // the delete half of a range, need the deletes since the read point
+  // (docs/bytecask_design.md, "Checking a plan by its read sequence").
+  TempDir td;
+  const auto dir = td.path / "db";
+  const auto expect_too_old = [](bytecask::DB &db, bytecask::WritePlan plan) {
+    const auto r = db.apply_batch({}, std::move(plan));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == bytecask::PlanRefusal::TooOld);
+  };
+  const auto check_read = [&](bytecask::DB &db, const ReadPoint &read) {
+    {
+      auto plan = plan_at(read);
+      plan.ensure_unchanged(to_bytes("k"));
+      plan.put(to_bytes("k"), to_bytes("v1"));
+      CHECK(db.apply_batch({}, std::move(plan)).has_value());
+    }
+    {
+      auto plan = plan_at(read);
+      plan.put(to_bytes("absent"), to_bytes("v1"));
+      expect_too_old(db, std::move(plan));
+    }
+    {
+      auto plan = plan_at(read);
+      plan.ensure_range_unchanged(to_bytes("a"), to_bytes("b"));
+      plan.put(to_bytes("k"), to_bytes("v2"));
+      expect_too_old(db, std::move(plan));
+    }
+    {
+      // A present key that changed is a conflict, whatever the log holds.
+      db.put({}, to_bytes("k"), to_bytes("v3"));
+      auto plan = plan_at(read);
+      plan.put(to_bytes("k"), to_bytes("v4"));
+      const auto r = db.apply_batch({}, std::move(plan));
+      REQUIRE_FALSE(r.has_value());
+      CHECK(r.error() == bytecask::PlanRefusal::Conflict);
+    }
+  };
+
+  SECTION("read before a reopen") {
+    ReadPoint read;
+    {
+      auto db = bytecask::DB::open(dir);
+      db.put({}, to_bytes("k"), to_bytes("v0"));
+      read = read_point(db);
+      db.close();
+    }
+    auto db = bytecask::DB::open(dir);
+    check_read(db, read);
+  }
+  SECTION("read before a promotion") {
+    // The promotion's marker takes a sequence no write group assigned: the
+    // log cannot tell what changed across it.
+    auto db = bytecask::DB::open(dir, {.initial_mode = bytecask::Mode::Follower});
+    const auto k = to_bytes("k");
+    const auto v0 = to_bytes("v0");
+    const std::vector<bytecask::DataEntryView> slice{
+        {1, bytecask::EntryType::Put, k, v0}};
+    db.ingest(bytecask::ChangeHeader{}, slice);
+    const auto read = read_point(db);
+    db.set_mode(bytecask::Mode::Leader);
+    // Before any write group: the state checked reaches past every
+    // sequence the log recorded.
+    {
+      auto plan = plan_at(read);
+      plan.put(to_bytes("absent"), to_bytes("v1"));
+      expect_too_old(db, std::move(plan));
+    }
+    check_read(db, read);
+  }
+  SECTION("more deletes since than the log holds") {
+    auto db = bytecask::DB::open(dir, {.max_delete_log_bytes = 512});
+    db.put({}, to_bytes("k"), to_bytes("v0"));
+    const auto read = read_point(db);
+    for (int i = 0; i < 64; ++i) {
+      const auto key = std::format("d{:03}", i);
+      db.put({}, to_bytes(key), to_bytes("x"));
+      (void)db.del({}, to_bytes(key));
+    }
+    check_read(db, read);
+  }
+  SECTION("no log at all: any delete since") {
+    auto db = bytecask::DB::open(dir, {.max_delete_log_bytes = 0});
+    db.put({}, to_bytes("k"), to_bytes("v0"));
+    db.put({}, to_bytes("d"), to_bytes("x"));
+    const auto read = read_point(db);
+    (void)db.del({}, to_bytes("d"));
+    check_read(db, read);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // CommitResult: empty plan commits as a no-op — {sequence = 0, durable = true}
 // ---------------------------------------------------------------------------
 TEST_CASE("CommitResult empty plan returns durable zero sequence",
@@ -9577,8 +10295,8 @@ TEST_CASE("CommitResult nosync writer coalesced with sync writer is durable",
     db.test_write_group().wait_for_queue_size(2);
   };
 
-  std::optional<bytecask::CommitResult> nosync_result;
-  std::optional<bytecask::CommitResult> sync_result;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> nosync_result;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> sync_result;
 
   // Thread A becomes leader with a nosync write, blocks until B enqueues.
   std::thread tA([&] {
@@ -9675,6 +10393,9 @@ TEST_CASE("vacuum drops batch when all entries are stale",
   TempDir td;
   auto db_path = td.path / "db";
   auto db = bytecask::DB::open(db_path, {.max_file_bytes = 1});
+  // The open's ChangeMarker, kept for ever, in a file of its own, so the
+  // batch's file can go whole.
+  seal(db);
 
   // Write a batch.
   {
@@ -9722,19 +10443,19 @@ TEST_CASE("vacuum drops batch when all entries are stale",
 TEST_CASE("single write sets min_sequence and max_sequence",
           "[file_stats_seq]") {
   TempDir td;
-  auto db = bytecask::DB::open(td.path);
-  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  auto db = bytecask::DB::open(td.path);  // the open's marker: 1
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));  // 2
 
   auto stats = db.file_stats();
   REQUIRE(stats.size() == 1);
   const auto &[fid, fs] = *stats.begin();
   CHECK(fs.min_sequence == 1);
-  CHECK(fs.max_sequence == 1);
+  CHECK(fs.max_sequence == 2);
 }
 
 TEST_CASE("multiple writes update sequence range", "[file_stats_seq]") {
   TempDir td;
-  auto db = bytecask::DB::open(td.path);
+  auto db = bytecask::DB::open(td.path);  // the open's marker: 1
   db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
   db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
   db.put({.sync = true}, to_bytes("k3"), to_bytes("v3"));
@@ -9743,13 +10464,13 @@ TEST_CASE("multiple writes update sequence range", "[file_stats_seq]") {
   REQUIRE(stats.size() == 1);
   const auto &[fid, fs] = *stats.begin();
   CHECK(fs.min_sequence == 1);
-  CHECK(fs.max_sequence == 3);
+  CHECK(fs.max_sequence == 4);
 }
 
 TEST_CASE("batch write covers marker sequences", "[file_stats_seq]") {
   TempDir td;
-  auto db = bytecask::DB::open(td.path);
-  // 3-op batch: BulkBegin(1), Put(2), Put(3), Put(4), BulkEnd(5)
+  auto db = bytecask::DB::open(td.path);  // the open's marker: 1
+  // 3-op batch: BulkBegin(2), Put(3), Put(4), Put(5), BulkEnd(6)
   bytecask::WritePlan plan;
   plan.put(to_bytes("k1"), to_bytes("v1"));
   plan.put(to_bytes("k2"), to_bytes("v2"));
@@ -9760,7 +10481,7 @@ TEST_CASE("batch write covers marker sequences", "[file_stats_seq]") {
   REQUIRE(stats.size() == 1);
   const auto &[fid, fs] = *stats.begin();
   CHECK(fs.min_sequence == 1);
-  CHECK(fs.max_sequence == 5);
+  CHECK(fs.max_sequence == 6);
 }
 
 // A batch's end marker carries the highest sequence of the batch. A restart
@@ -9780,16 +10501,19 @@ TEST_CASE("a write after a restart does not reuse a batch marker's sequence",
     batch_end = r->sequence;  // the BulkEnd's
   }
   auto db = bytecask::DB::open(td.path);
-  CHECK(db.durable_sequence() == batch_end);
+  // The reopen's own marker takes the sequence after the BulkEnd's.
+  CHECK(db.durable_sequence() == batch_end + 1);
+  CHECK(db.snapshot().marker().since_sequence == batch_end + 1);
   CHECK(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")).sequence >
-        batch_end);
+        batch_end + 1);
 }
 
 TEST_CASE("rotation preserves sealed file bounds and resets new",
           "[file_stats_seq]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path, {.max_file_bytes = 1});
-  // First write goes to file 1; rotation triggered.
+  // The open's marker (1) and the first write (2) go to file 1; rotation
+  // triggered.
   db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
   // Second write goes to a new active file.
   db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
@@ -9800,10 +10524,10 @@ TEST_CASE("rotation preserves sealed file bounds and resets new",
   bool found_sealed = false;
   bool found_new = false;
   for (const auto &[fid, fs] : stats) {
-    if (fs.min_sequence == 1 && fs.max_sequence == 1) {
+    if (fs.min_sequence == 1 && fs.max_sequence == 2) {
       found_sealed = true;
     }
-    if (fs.min_sequence == 2 && fs.max_sequence == 2) {
+    if (fs.min_sequence == 3 && fs.max_sequence == 3) {
       found_new = true;
     }
   }
@@ -9845,8 +10569,10 @@ TEST_CASE("recovery reconstructs min_max sequences", "[file_stats_seq]") {
     pre_close_stats = db.file_stats();
   }
 
-  // Reopen — recovery rebuilds stats from hint files.
-  auto db = bytecask::DB::open(td.path);
+  // Reopen — recovery rebuilds stats from hint files. As a follower, whose
+  // open writes no ChangeMarker of its own.
+  auto db = bytecask::DB::open(td.path,
+                               {.initial_mode = bytecask::Mode::Follower});
   auto post_open_stats = db.file_stats();
 
   // Verify each sealed file from pre-close appears in post-open with
@@ -9872,7 +10598,7 @@ TEST_CASE("recovery reconstructs min_max sequences", "[file_stats_seq]") {
 
 TEST_CASE("nosync writes track sequences", "[file_stats_seq]") {
   TempDir td;
-  auto db = bytecask::DB::open(td.path);
+  auto db = bytecask::DB::open(td.path);  // the open's marker: 1
   db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
   db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
 
@@ -9880,7 +10606,7 @@ TEST_CASE("nosync writes track sequences", "[file_stats_seq]") {
   REQUIRE(stats.size() == 1);
   const auto &[fid, fs] = *stats.begin();
   CHECK(fs.min_sequence == 1);
-  CHECK(fs.max_sequence == 2);
+  CHECK(fs.max_sequence == 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -9918,8 +10644,9 @@ TEST_CASE("empty db manifest", "[manifest]") {
 
   auto manifest = db.create_manifest();
 
-  // No writes — through_sequence is 0.
-  CHECK(manifest.through_sequence == 0);
+  // No writes — through_sequence is the open's own marker.
+  CHECK(manifest.through_sequence == db.snapshot().marker().since_sequence);
+  CHECK(manifest.through_sequence == 1);
 
   // Snapshot has no keys.
   bytecask::Bytes out;
@@ -10201,11 +10928,11 @@ TEST_CASE("changes_since iterator yields entries in sequence order", "[replicati
     INFO("Entry " << i << " seq=" << collected_sequences[i] << " key='" << collected_keys[i] << "' value='" << collected_values[i] << "'");
   }
 
-  // Should have 2 entries (sequences 5 and 6) in sequence order
+  // Should have the 2 entries after from_seq, in sequence order
   REQUIRE(collected_sequences.size() == 2);
   REQUIRE(collected_sequences[0] < collected_sequences[1]);
-  REQUIRE(collected_sequences[0] == 5);
-  REQUIRE(collected_sequences[1] == 6);
+  REQUIRE(collected_sequences[0] == from_seq + 1);
+  REQUIRE(collected_sequences[1] == from_seq + 2);
 
   // Check that we got the expected keys and values
   REQUIRE(collected_keys[0] == "key4");
@@ -10220,6 +10947,9 @@ TEST_CASE("iterators advance by post-increment as by pre-increment",
   // calls them.
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
+  // The open's own marker is the history's first entry; the walk below
+  // starts after it.
+  const auto opened = db.durable_sequence();
   for (const auto *k : {"a", "b", "c"}) db.put({}, to_bytes(k), to_bytes(k));
 
   auto keys = db.keys_from({});
@@ -10242,7 +10972,7 @@ TEST_CASE("iterators advance by post-increment as by pre-increment",
   CHECK(to_string((*r).key) == "b");
 
   auto snap = db.snapshot();
-  auto changes = db.changes_since(snap, 0);
+  auto changes = db.changes_since(snap, opened);
   auto c = changes.entries.begin();
   c++;
   CHECK(to_string((*c).key) == "b");
@@ -10255,12 +10985,13 @@ TEST_CASE("changes_since stops at the snapshot's durable sequence",
           "[replication]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
+  const auto opened = db.durable_sequence();  // the open's own marker
   const auto synced = db.put({.sync = true}, to_bytes("a"), to_bytes("1"));
   const auto unsynced = db.put({.sync = false}, to_bytes("b"), to_bytes("2"));
   REQUIRE_FALSE(unsynced.durable);
   auto snap = db.snapshot();
   std::vector<std::uint64_t> seqs;
-  for (const auto &e : db.changes_since(snap, 0).entries) seqs.push_back(e.sequence);
+  for (const auto &e : db.changes_since(snap, opened).entries) seqs.push_back(e.sequence);
   CHECK(seqs == std::vector<std::uint64_t>{synced.sequence});
 }
 
@@ -10524,8 +11255,10 @@ TEST_CASE("ingest with batches: BulkBegin/BulkEnd preserved", "[replication]") {
                      bytecask::Bytes{e.key.begin(), e.key.end()},
                      bytecask::Bytes{e.value.begin(), e.value.end()}});
   }
-  // Verify BulkBegin and BulkEnd are present.
-  REQUIRE(owned.front().entry_type == bytecask::EntryType::BulkBegin);
+  // Verify BulkBegin and BulkEnd are present, after the open's own marker.
+  REQUIRE(owned.size() == 6);
+  REQUIRE(owned.front().entry_type == bytecask::EntryType::ChangeMarker);
+  REQUIRE(owned[1].entry_type == bytecask::EntryType::BulkBegin);
   REQUIRE(owned.back().entry_type == bytecask::EntryType::BulkEnd);
 
   std::vector<bytecask::DataEntryView> views;
@@ -11592,8 +12325,10 @@ TEST_CASE("ingest refuses a slice that ends inside an atomic batch",
   std::vector<bytecask::DataEntryView> views;
   for (const auto &o : owned)
     views.push_back({o.sequence, o.entry_type, o.key, o.value});
-  REQUIRE(views.size() == 8);  // BulkBegin, 6 puts, BulkEnd
-  const auto head = std::span{views}.first(4);
+  // The open's own marker, BulkBegin, 6 puts, BulkEnd.
+  REQUIRE(views.size() == 9);
+  REQUIRE(views.front().entry_type == bytecask::EntryType::ChangeMarker);
+  const auto head = std::span{views}.first(5);
 
   bytecask::Bytes out;
   {
@@ -11686,8 +12421,8 @@ TEST_CASE("Limits: ingest takes the last packable sequence and refuses the "
     CHECK_FALSE(db.is_degraded());
     CHECK(get_str(db, k) == "v");
   }
-  // Reopened as a leader, which is not a promotion, a write needs the next
-  // sequence and is refused before it appends, leaving the engine healthy.
+  // Reopened as a leader, whose open writes no marker past the last
+  // sequence, a write needs the next sequence and is refused before it appends, leaving the engine healthy.
   auto db = bytecask::DB::open(dir);
   CHECK(get_str(db, to_bytes("k")) == "v");
   CHECK(db.durable_sequence() == E::kMaxSequence);
@@ -11930,11 +12665,13 @@ TEST_CASE("stats: fresh DB has zero counters and one open file",
   TempDir td;
   auto db = bytecask::DB::open(td.path);
   auto s = db.stats();
-  CHECK(s.at("bytecask.bytes_written") == 0);
+  // All but the open's own ChangeMarker: one record, one fdatasync.
+  CHECK(s.at("bytecask.bytes_written") ==
+        static_cast<std::int64_t>(kOpenMarkerBytes));
   CHECK(s.at("bytecask.group_writer_batches") == 0);
   CHECK(s.at("bytecask.group_writer_coalesced") == 0);
   CHECK(s.at("bytecask.group_writer_busy_us") == 0);
-  CHECK(s.at("bytecask.fsyncs") == 0);
+  CHECK(s.at("bytecask.fsyncs") == 1);
   CHECK(s.at("bytecask.disk_reads") == 0);
   CHECK(s.at("bytecask.disk_read_bytes") == 0);
   CHECK(s.at("bytecask.crc_failures") == 0);
@@ -13308,7 +14045,7 @@ TEST_CASE("pipeline: a sync-only write joins group commit behind an "
   db.test_before_flush_sync_ = gate.hook();
 
   std::optional<bytecask::CommitResult> ra;
-  std::optional<bytecask::CommitResult> rs;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> rs;
   std::thread ta([&] { ra = db.put({.sync = true}, to_bytes("k1"), to_bytes("v1")); });
   gate.wait_in_flush();
 
@@ -13386,7 +14123,7 @@ TEST_CASE("pipeline: a sync-only write in the same batch as a rotation is "
   };
 
   std::optional<bytecask::CommitResult> rbig;
-  std::optional<bytecask::CommitResult> rsync;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> rsync;
   std::thread tbig([&] {
     rbig = db.put({.sync = true}, to_bytes("big"), to_bytes(std::string(kRotatingValueBytes, 'x')));
   });
@@ -13438,7 +14175,7 @@ TEST_CASE("pipeline: concurrent sync-only writes share one fdatasync",
   wait_until([&] { return blocked_count(db) >= 1; });
 
   constexpr int kSyncOnly = 3;
-  std::vector<std::optional<bytecask::CommitResult>> rs(kSyncOnly);
+  std::vector<std::expected<bytecask::CommitResult, bytecask::PlanRefusal>> rs(kSyncOnly);
   std::vector<std::thread> ts;
   for (int i = 0; i < kSyncOnly; ++i) {
     ts.emplace_back([&, i] {
@@ -13721,7 +14458,7 @@ TEST_CASE("pipeline: snapshot conflict is detected against a write that is "
   // published: until then no snapshot can see what the plan lost to, and a
   // retry would lose the same way for the length of the flush.
   std::atomic<bool> b_returned{false};
-  std::optional<bytecask::CommitResult> rb;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> rb;
   std::thread tb([&] {
     bytecask::WritePlan plan{std::move(snap)};
     plan.put(to_bytes("a"), to_bytes("fromB"));
@@ -14011,7 +14748,7 @@ TEST_CASE("location tokens: plans checked and applied by location commit and "
         } else if (kind < 9) {
           pa->del(to_bytes(k));
           pb->del(to_bytes(k));
-        } else if (pa->has_snapshot()) {
+        } else if (pa->read_sequence()) {
           pa->ensure_unchanged(to_bytes(k));
           pb->ensure_unchanged(to_bytes(k));
         }
@@ -14246,7 +14983,7 @@ TEST_CASE("pipeline: a plan that loses to a write not yet published reports "
   // B: snapshot (sees "0"), guarded write on k — loses to A's in-flight
   // write, and must block until A publishes.
   std::atomic<bool> b_returned{false};
-  std::optional<bytecask::CommitResult> rb;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> rb;
   std::thread tb([&] {
     auto snap = db.snapshot();
     bytecask::Bytes out;

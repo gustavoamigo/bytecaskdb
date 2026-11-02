@@ -284,11 +284,17 @@ TEST_CASE("validate_state_consistency throws on regressed next_seq",
   db.put({}, to_bytes("a"), to_bytes("1"));
   auto state = db.engine_state();
 
-  // Construct a bad state with next_seq set to 0.
+  // next_seq moved back onto the last key's sequence. It stays above the
+  // open's change marker, so the key directory check is the one that fires.
   auto bad = *state;
-  bad.next_seq = 0;
-  REQUIRE_THROWS_AS(db.test_validate_state_consistency(bad),
-                    std::runtime_error);
+  bad.next_seq = state->next_seq - 1;
+  try {
+    db.test_validate_state_consistency(bad);
+    FAIL("a next_seq at the last key's sequence passed");
+  } catch (const std::runtime_error &e) {
+    CHECK(std::string_view{e.what()}.find("max key_dir sequence") !=
+          std::string_view::npos);
+  }
 }
 
 TEST_CASE("validate_state_consistency throws on dangling file ref",

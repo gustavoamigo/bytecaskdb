@@ -34,6 +34,8 @@ def resume_delta(degrade: DegradeShape, failure: ResumeFailureClass) -> ResumeDe
 
     degrade_H: k0 was committed before degradation; p0 was also committed
                (it triggered the rotation fault after the write succeeded).
+               The threshold leaves room for the open's ChangeMarker, so p0,
+               not k0, is the write that rotates.
                Both survive resume().
 
     degrade_C: k0 was committed; the 2-op batch (p0, p1) failed at BulkEnd
@@ -73,11 +75,13 @@ def resume_delta(degrade: DegradeShape, failure: ResumeFailureClass) -> ResumeDe
     degrade_F_batch: a 2-op batch committed (sync=false), so the active file
                holds BulkBegin, p0, p1, BulkEnd below the failure point; then
                k0's commit sync fails. All three keys survive. What this shape
-               is really for is the file's sequence bounds: the markers
-               consume sequences 1 and 4, and a resume() that did not collect
-               them reported min_sequence 2 for a file whose first entry is
-               sequence 1 — a bound a cold open, whose hint file does carry
-               markers, computes differently.
+               is really for is the file's sequence bounds: the open's
+               ChangeMarker (sequence 1) is sealed in a file of its own, so
+               the active file starts with the batch markers' 2 and ends past
+               their 5, and a resume() that did not collect them reported
+               min_sequence 3 for a file whose first entry is sequence 2 — a
+               bound a cold open, whose hint file does carry markers,
+               computes differently.
     """
     keys_published = {"k0": "v0"}
     if degrade.degrade_via in (DegradeVia.H, DegradeVia.F, DegradeVia.G):

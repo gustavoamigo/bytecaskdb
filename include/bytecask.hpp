@@ -90,8 +90,9 @@ struct ChangeMarker {
       -> bool = default;
 };
 
-// The history before any promotion: the marker at every position of a
-// database that was never promoted.
+// The history before any marker: the marker at every position of a
+// database that holds none, such as a follower that has not yet ingested its
+// leader's first marker.
 inline constexpr ChangeMarker kOriginMarker{};
 
 // Where a slice of a history starts: the source's marker at from_sequence,
@@ -120,6 +121,41 @@ struct CommitResult {
 
   // True if fdatasync confirmed durability of this write before return.
   bool durable{false};
+};
+
+// Why DB::apply_batch refused a plan. Nothing was written either way.
+enum class PlanRefusal {
+  // A guard failed, or a key the plan writes changed since its snapshot
+  // or read sequence. Retry from a fresh snapshot.
+  Conflict,
+  // Plans on a read point only: it cannot be checked here. Read on another
+  // history (before a crash, across a failover), past the latest sequence,
+  // or needing deletes the engine no longer tracks (from before a reopen, a
+  // promotion, an ingest or a failed append resume() replayed, or more than
+  // Options::max_delete_log_bytes holds).
+  // Take a fresh snapshot.
+  TooOld,
+};
+
+// What DB::apply_batch returns: the CommitResult, or why the plan was
+// refused. Shaped like std::expected<CommitResult, PlanRefusal>, which this
+// header cannot use: it stays C++20 for callers such as the MariaDB plugin.
+class ApplyResult {
+public:
+  ApplyResult(CommitResult result) noexcept : result_{result} {}  // NOLINT(google-explicit-constructor)
+  ApplyResult(PlanRefusal refusal) noexcept : refusal_{refusal} {}  // NOLINT(google-explicit-constructor)
+
+  [[nodiscard]] auto has_value() const noexcept -> bool { return !refusal_; }
+  explicit operator bool() const noexcept { return has_value(); }
+  // On a refusal: {sequence = 0, durable = false}, nothing written.
+  auto operator*() const noexcept -> const CommitResult& { return result_; }
+  auto operator->() const noexcept -> const CommitResult* { return &result_; }
+  // Throws std::bad_optional_access if the plan committed.
+  [[nodiscard]] auto error() const -> PlanRefusal { return refusal_.value(); }
+
+private:
+  CommitResult result_{};
+  std::optional<PlanRefusal> refusal_;
 };
 
 struct ReadOptions {
@@ -154,6 +190,11 @@ struct Options {
   // Most bytes a thread's record buffers keep after a call on this DB
   // (default 1 MiB, at least 256 KiB).
   std::size_t thread_scratch_bytes{std::size_t{1} << 20};
+  // Most bytes the log of recent deletes holds (default 4 MiB); a del_range
+  // is one entry, whatever it covers. A plan read before the oldest delete
+  // it still holds is refused as TooOld. 0 keeps none: a plan read before
+  // the latest delete is too old.
+  std::size_t max_delete_log_bytes{std::size_t{4} << 20};
 };
 
 struct SizeLimits {
@@ -414,6 +455,14 @@ class Snapshot {
 public:
   struct Impl;
 
+  // The last write this snapshot sees: all at or below it, none above.
+  // A moved-from snapshot throws std::logic_error.
+  [[nodiscard]] auto sequence() const -> std::uint64_t;
+  // The database's marker at sequence(): with it, the read point of
+  // WritePlan(sequence, marker). A moved-from snapshot throws
+  // std::logic_error.
+  [[nodiscard]] auto marker() const -> ChangeMarker;
+
   ~Snapshot();
   Snapshot(const Snapshot&) = delete;
   Snapshot& operator=(const Snapshot&) = delete;
@@ -478,6 +527,17 @@ public:
 
   WritePlan();
   explicit WritePlan(SizeLimits limits);
+  // A plan checked against a read point: Snapshot::sequence() and
+  // Snapshot::marker() of the snapshot its reads came from. Plain data: no
+  // snapshot is held, so it can be built away from the reads, in another
+  // process. One read on another history (before a crash, across a
+  // failover) is refused as TooOld.
+  WritePlan(std::uint64_t read_sequence, ChangeMarker marker,
+            SizeLimits limits = {});
+  // A plan checked against snap itself, which it holds until apply_batch
+  // returns. A key absent in snap and absent now is unchanged, even if
+  // written and deleted again between; never refused as TooOld. A
+  // moved-from snap throws std::invalid_argument.
   explicit WritePlan(Snapshot snap);
   ~WritePlan();
   WritePlan(const WritePlan&) = delete;
@@ -491,11 +551,12 @@ public:
 
   void ensure_present(BytesView key);
   void ensure_absent(BytesView key);
-  // Requires snapshot; throws std::logic_error if called without one.
+  // Require a snapshot or a read sequence; throw std::logic_error without one.
   void ensure_unchanged(BytesView key);
   void ensure_range_unchanged(BytesView from, BytesView to);  // from >= to throws
 
-  [[nodiscard]] auto has_snapshot() const noexcept -> bool;
+  [[nodiscard]] auto read_sequence() const noexcept
+      -> std::optional<std::uint64_t>;
 
 private:
   std::unique_ptr<Impl> impl_;
@@ -547,8 +608,9 @@ public:
   void resume();
 
   [[nodiscard]] auto snapshot() const -> Snapshot;
-  [[nodiscard]] auto apply_batch(WriteOptions opts,
-                                 WritePlan plan) -> std::optional<CommitResult>;
+  // A refused plan (PlanRefusal) is returned, not thrown; nothing is written.
+  [[nodiscard]] auto apply_batch(WriteOptions opts, WritePlan plan)
+      -> ApplyResult;
 
   [[nodiscard]] auto iter_from(const ReadOptions& opts,
                                BytesView from = {}) const
@@ -614,6 +676,8 @@ using BufferPoolOptions    = internal::BufferPoolOptions;
 using EntryType            = internal::EntryType;
 using WriteOptions         = internal::WriteOptions;
 using CommitResult         = internal::CommitResult;
+using PlanRefusal          = internal::PlanRefusal;
+using ApplyResult          = internal::ApplyResult;
 using ReadOptions          = internal::ReadOptions;
 using VacuumOptions        = internal::VacuumOptions;
 using internal::kNoRetention;

@@ -119,11 +119,14 @@ struct PySnapshot {
 struct PyWritePlan {
   std::optional<bytecask::WritePlan> plan;
   std::unique_ptr<nb::ft_mutex> mu{std::make_unique<nb::ft_mutex>()};
+  // Built from a snapshot: has_snapshot reports this, not whether the plan
+  // has some base.
+  bool on_snapshot{false};
 
   PyWritePlan() : plan{bytecask::WritePlan{}} {}
 
   explicit PyWritePlan(bytecask::Snapshot snap)
-      : plan{bytecask::WritePlan{std::move(snap)}} {}
+      : plan{bytecask::WritePlan{std::move(snap)}}, on_snapshot{true} {}
 
   void put(nb::bytes key, nb::bytes value) {
     check();
@@ -162,7 +165,7 @@ struct PyWritePlan {
 
   [[nodiscard]] auto has_snapshot() const -> bool {
     check();
-    return plan->has_snapshot();
+    return on_snapshot;
   }
 
   auto take() -> bytecask::WritePlan {
@@ -602,8 +605,8 @@ NB_MODULE(_bytecaskdb, m) {
            })
       .def("__repr__", &marker_repr);
 
-  // The history before any promotion: the marker at every position of a
-  // database that was never promoted.
+  // The history before any marker: the marker at every position of a
+  // database that holds none.
   m.attr("ORIGIN_MARKER") = nb::cast(bytecask::kOriginMarker);
 
   nb::class_<bytecask::ChangeHeader>(m, "ChangeHeader",
@@ -889,7 +892,11 @@ NB_MODULE(_bytecaskdb, m) {
             auto p = plan.take();
             auto wopts = opts.value_or(bytecask::WriteOptions{});
             BC_GIL_RELEASE;
-            return self.db.apply_batch(wopts, std::move(p));
+            // Python plans are built on a snapshot, which is never TooOld,
+            // so a refusal is a conflict (#737 tracks a read-sequence plan).
+            auto r = self.db.apply_batch(wopts, std::move(p));
+            if (!r) return std::nullopt;
+            return *r;
           },
           "Apply plan atomically. Returns the CommitResult if committed, or "
           "None on conflict.",

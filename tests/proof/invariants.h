@@ -13,6 +13,7 @@
 #include "mapping_probe.h"
 #include <algorithm>
 #include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -203,6 +204,16 @@ inline void assert_resumable(DB &db) {
   assert_consistent(db);
 }
 
+// Opens a copy to check what it recovered, without changing it: in Follower
+// mode, which recovers the same state as a leader's open but appends no
+// ChangeMarker (docs/bytecask_design.md, "Replication mode"). A check that
+// opened as a leader would add a marker to the directory it then reopens.
+inline auto open_to_check(const std::filesystem::path &dir,
+                          Options opts = {}) -> DB {
+  opts.initial_mode = Mode::Follower;
+  return DB::open(dir, opts);
+}
+
 // Opens a fresh DB from on-disk files and verifies the recovered state matches
 // the expected state. Validates the persistence invariant: committed
 // transitions survive recovery, uncommitted ones do not.
@@ -213,7 +224,7 @@ inline void assert_recoverable(const std::filesystem::path &dir,
                                const Baseline &before,
                                const ExpectedDelta &expected,
                                const Options &opts = {}) {
-  auto recovered = DB::open(dir, opts);
+  auto recovered = open_to_check(dir, opts);
 
   // Pre-existing keys that were not removed or overwritten must be present
   // with their original values.
@@ -283,7 +294,7 @@ inline void assert_keys_recoverable(
     const std::map<std::string, std::string> &keys_present,
     const std::vector<std::string> &keys_absent = {},
     const Options &opts = {}) {
-  auto recovered = DB::open(dir, opts);
+  auto recovered = open_to_check(dir, opts);
   for (const auto &[key, value] : keys_present) {
     INFO("key must recover with its value: " << key);
     Bytes out;
@@ -332,7 +343,7 @@ inline auto fingerprint(const DB &db) -> EngineFingerprint {
 inline void assert_matches_recovery(const std::filesystem::path &dir,
                                     const EngineFingerprint &before,
                                     const Options &opts = {}) {
-  auto recovered = DB::open(dir, opts);
+  auto recovered = open_to_check(dir, opts);
   const auto after = fingerprint(recovered);
 
   {
@@ -393,9 +404,10 @@ inline auto make_durable(DB &db) -> std::uint64_t {
 // durable_sequence(), which must already cover a CommitResult that reported
 // durable — the two are checked against each other, as the crash harness does
 // with what the child reported.
-inline auto durable_watermark(const DB &db,
-                              const std::optional<CommitResult> &cr = {})
-    -> std::uint64_t {
+inline auto durable_watermark(
+    const DB &db,
+    const std::expected<CommitResult, PlanRefusal> &cr =
+        std::unexpected{PlanRefusal::Conflict}) -> std::uint64_t {
   auto watermark = db.durable_sequence();
   if (cr && cr->durable) {
     INFO("a CommitResult reported durable must be covered by durable_sequence()");
@@ -450,7 +462,7 @@ inline void check_key_values(const std::map<std::string, Bytes> &got,
 inline void assert_power_loss_outcome(const std::filesystem::path &cut,
                                       const PowerLossExpectation &x,
                                       const Options &opts = {}) {
-  auto recovered = DB::open(cut, opts);
+  auto recovered = open_to_check(cut, opts);
   const auto got = key_values(recovered);
   const auto durable = recovered.durable_sequence();
   {
@@ -636,7 +648,7 @@ inline void poke_huge_value_size(const std::filesystem::path &dir,
   poke_active_file(dir, off, huge);
 }
 
-// A byte that is not a valid EntryType (valid are 0x01..0x05).
+// A byte that is not a valid EntryType (valid are 0x01..0x06).
 inline void poke_invalid_entry_type(const std::filesystem::path &dir,
                                     std::uint64_t off) {
   const std::array<unsigned char, 1> bad{0x7F};
@@ -833,7 +845,7 @@ inline auto staging_data_files(const std::filesystem::path &dir)
 inline void assert_vacuum_recoverable(const std::filesystem::path &dir,
                                       const VacuumBaseline &before,
                                       const Options &opts = {}) {
-  auto recovered = DB::open(dir, opts);
+  auto recovered = open_to_check(dir, opts);
   for (const auto &[key, value] : before.keys.key_values) {
     INFO("key must survive vacuum and recovery: " << key);
     CHECK(recovered.contains_key({}, to_bytes(key)));
@@ -1058,7 +1070,7 @@ inline void assert_replication_no_change(const Baseline &before,
 // Invariant 6 from the design doc.
 inline void assert_replication_recovery(const std::filesystem::path &dir,
                                         const ReplicationBaseline &leader) {
-  auto recovered = DB::open(dir);
+  auto recovered = open_to_check(dir);
 
   for (const auto &[key, value] : leader.key_values) {
     INFO("leader key must survive recovery: " << key);
@@ -1083,7 +1095,7 @@ inline void assert_replication_recovery(const std::filesystem::path &dir,
 inline void assert_stream_survives_power_loss(
     const std::filesystem::path &leader_cut,
     const ReplicationBaseline &streamed, const Options &opts = {}) {
-  auto recovered = DB::open(leader_cut, opts);
+  auto recovered = open_to_check(leader_cut, opts);
   {
     INFO("the leader must recover to at least what it streamed");
     CHECK(recovered.durable_sequence() >= streamed.durable_seq);

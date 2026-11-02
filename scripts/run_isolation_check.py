@@ -1106,7 +1106,8 @@ def check_cluster_round(args: argparse.Namespace, seed: int,
                "--txns", str(args.txns), "--threads", str(args.threads),
                "--followers", "2", "--lag",
                "--dir", str(round_dir / f"db-{config}"),
-               "--out", str(history_path)]
+               "--out", str(history_path),
+               "--plan-base", args.plan_base]
         cmd.append("--force-vacuum" if config.startswith("cluster-vacuum")
                    else "--no-vacuum")
         if config == "cluster-vacuum-unretained":
@@ -1198,7 +1199,8 @@ def check_range_round(args: argparse.Namespace, seed: int,
                "--seed", str(seed), "--txns", str(args.txns),
                "--threads", str(args.threads),
                "--dir", str(round_dir / f"db-{config}"),
-               "--out", str(history_path)]
+               "--out", str(history_path),
+               "--plan-base", args.plan_base]
         if args.no_vacuum:
             cmd.append("--no-vacuum")
         if args.no_degrade:
@@ -1234,7 +1236,8 @@ def check_round(args: argparse.Namespace, seed: int, round_dir: Path) -> None:
         cmd = [str(args.binary), "--config", config, "--seed", str(seed),
                "--txns", str(args.txns), "--threads", str(args.threads),
                "--dir", str(round_dir / f"db-{config}"),
-               "--out", str(history_path)]
+               "--out", str(history_path),
+               "--plan-base", args.plan_base]
         if args.no_vacuum:
             cmd.append("--no-vacuum")
         if args.no_degrade:
@@ -1314,6 +1317,11 @@ def main() -> int:
                         help="SIGKILL the writer process and reopen, "
                              "--kill-epochs times per history (#176)")
     parser.add_argument("--kill-epochs", type=int, default=10)
+    parser.add_argument("--plan-base", choices=("snapshot", "sequence"),
+                        default="snapshot",
+                        help="sequence: build each transaction's plan on its "
+                             "snapshot's sequence alone, checked by sequences "
+                             "and the delete log, instead of on the snapshot")
     parser.add_argument("--workload", choices=("append", "range"),
                         default="append",
                         help="range: point reads, scans, puts, dels and "

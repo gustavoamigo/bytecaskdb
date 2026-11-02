@@ -5,20 +5,32 @@
 // and the implicit W-W check of a planned del_range, against a std::map.
 //
 // Each round takes a snapshot, makes random intervening writes, then applies a
-// plan that guards or range-deletes a random [from, to). The oracle: the plan
-// conflicts exactly when the model, restricted to [from, to), differs between
-// the snapshot and the head — a key changed, inserted or deleted. Both missed
-// conflicts and false ones fail. The key alphabet puts keys on range bounds
-// and between prefix neighbours ("b" < "b\0" < "b0" < "bb").
+// plan that guards or range-deletes a random [from, to). The plan is built
+// from the snapshot, or from the snapshot's sequence alone, and each base has
+// its own oracle (CONTRACT.md, "Isolation is what the plan guards"):
+//   snapshot  the plan conflicts exactly when the model, restricted to
+//             [from, to), differs between the snapshot and the head: a key
+//             changed, inserted or deleted.
+//   sequence  the same, or when an intervening delete named a key in
+//             [from, to): a del of a present key (or any planned del, which
+//             writes a tombstone either way), or a del_range overlapping
+//             it, whatever keys it found.
+// Both missed conflicts and false ones fail. The key alphabet puts keys on
+// range bounds and between prefix neighbours ("b" < "b\0" < "b0" < "bb").
 //
 // The intervening writes land four ways:
 //   published   plain writes, published before the plan is validated
 //   same group  one batch in the same group commit as the plan, applied to
 //               the pipeline head but not yet published
 //   vacuum      published, then vacuum relocates keys: no change by itself
-//   resume      the last write's fdatasync fails, resume() replays it
+//   resume      the last write's fdatasync fails, resume() replays it; a
+//               plan built from a read point before resume() conflicts on a
+//               present key that changed and is otherwise refused as TooOld
+//               (resume() reset the delete log its range check needs); one
+//               built from a snapshot is checked as usual
 
 #include <algorithm>
+#include <expected>
 #include <array>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -103,6 +115,21 @@ void apply(Model &m, const Op &op, std::uint64_t &version) {
     m.erase(m.lower_bound(op.a), m.lower_bound(op.b));
     break;
   }
+}
+
+// Whether op is a delete that names a key in [from, to). DB::del of an
+// absent key writes nothing; a planned del writes a tombstone either way.
+auto names_in(const Model &m, const Op &op, bool planned,
+              const std::string &from, const std::string &to) -> bool {
+  switch (op.kind) {
+  case OpKind::Put:
+    return false;
+  case OpKind::Del:
+    return (planned || m.contains(op.a)) && op.a >= from && op.a < to;
+  case OpKind::DelRange:
+    return op.a < to && from < op.b;
+  }
+  return false;
 }
 
 auto random_range(std::mt19937_64 &rng) -> std::pair<std::string, std::string> {
@@ -193,6 +220,13 @@ auto placement_name(Placement p) -> std::string_view {
   return "?";
 }
 
+// What a plan is built from.
+enum class PlanBase : std::uint8_t { Snapshot, Sequence };
+
+auto base_name(PlanBase b) -> std::string_view {
+  return b == PlanBase::Snapshot ? "snapshot" : "sequence";
+}
+
 // Plan shapes: a guard alone, a del_range alone, or both over the same range.
 enum class PlanShape : std::uint8_t { Guard, DelRange, Both };
 
@@ -202,8 +236,8 @@ enum class PlanShape : std::uint8_t { Guard, DelRange, Both };
 // before either is published.
 auto same_group(bytecask::DB &db, bytecask::WritePlan first,
                 bytecask::WritePlan second)
-    -> std::pair<std::optional<bytecask::CommitResult>,
-                 std::optional<bytecask::CommitResult>> {
+    -> std::pair<std::expected<bytecask::CommitResult, bytecask::PlanRefusal>,
+                 std::expected<bytecask::CommitResult, bytecask::PlanRefusal>> {
   std::mutex mu;
   std::condition_variable cv;
   bool leader_ready = false;
@@ -215,8 +249,8 @@ auto same_group(bytecask::DB &db, bytecask::WritePlan first,
     }
     db.test_write_group().wait_for_queue_size(2);
   };
-  std::optional<bytecask::CommitResult> ra;
-  std::optional<bytecask::CommitResult> rb;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> ra;
+  std::expected<bytecask::CommitResult, bytecask::PlanRefusal> rb;
   std::thread ta{[&] { ra = db.apply_batch({.sync = false}, std::move(first)); }};
   std::thread tb{[&] {
     {
@@ -235,10 +269,13 @@ struct Counts {
   int conflicts{0};
   int commits{0};
   int vacuumed{0};
+  // Rounds where only a removal tells the bases apart: the states agree on
+  // [from, to), but an intervening write removed a key in it.
+  int removal_only{0};
 };
 
-void run_rounds(Placement placement, std::uint64_t seed, int rounds,
-                Counts &counts) {
+void run_rounds(Placement placement, PlanBase base, std::uint64_t seed,
+                int rounds, Counts &counts) {
   TempDir td;
   // Small files so vacuum has sealed files to relocate keys out of.
   auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 512});
@@ -247,8 +284,8 @@ void run_rounds(Placement placement, std::uint64_t seed, int rounds,
   std::uint64_t version = 0;
 
   for (int round = 0; round < rounds; ++round) {
-    INFO(std::format("placement {} seed {} round {}", placement_name(placement),
-                     seed, round));
+    INFO(std::format("placement {} base {} seed {} round {}",
+                     placement_name(placement), base_name(base), seed, round));
 
     // Background history the snapshot sees.
     for (int i = std::uniform_int_distribution<int>{0, 3}(rng); i > 0; --i) {
@@ -263,7 +300,9 @@ void run_rounds(Placement placement, std::uint64_t seed, int rounds,
     const auto [from, to] = random_range(rng);
     const auto shape = static_cast<PlanShape>(
         std::uniform_int_distribution<int>{0, 2}(rng));
-    bytecask::WritePlan plan{std::move(snap)};
+    auto plan = base == PlanBase::Snapshot
+                    ? bytecask::WritePlan{std::move(snap)}
+                    : bytecask::WritePlan{snap.sequence(), snap.marker()};
     if (shape != PlanShape::DelRange)
       plan.ensure_range_unchanged(to_bytes(from), to_bytes(to));
     if (shape != PlanShape::Guard)
@@ -274,17 +313,20 @@ void run_rounds(Placement placement, std::uint64_t seed, int rounds,
     const int min_ops = placement == Placement::Published ? 0 : 1;
     const auto n = std::uniform_int_distribution<int>{min_ops, 3}(rng);
     std::vector<std::pair<Op, std::uint64_t>> ops;
+    bool removed_in_range = false;
     for (int i = 0; i < n; ++i) {
       auto op = random_op(rng);
       // A del of an absent key writes nothing, so there is no fdatasync to
       // fail: the resume placement's last write is never a del.
       if (placement == Placement::Resume && i == n - 1 && op.kind == OpKind::Del)
         op.kind = OpKind::Put;
+      removed_in_range |= names_in(model, op, placement == Placement::SameGroup,
+                                   from, to);
       apply(model, op, version);
       ops.emplace_back(op, version);
     }
 
-    std::optional<bytecask::CommitResult> result;
+    std::expected<bytecask::CommitResult, bytecask::PlanRefusal> result;
     switch (placement) {
     case Placement::Published:
       for (const auto &[op, ver] : ops) write(db, op, ver, false);
@@ -322,11 +364,18 @@ void run_rounds(Placement placement, std::uint64_t seed, int rounds,
     }
     }
 
-    const bool expect_conflict =
-        slice(snap_model, from, to) != slice(model, from, to);
     INFO(std::format("plan shape {} over [{}, {}), {} intervening writes",
                      static_cast<int>(shape), from, to, n));
+    // Resume: the last write was appended, so its group was logged before
+    // its fdatasync failed, and resume() replays exactly what the log holds.
+    // No sequence escaped the log: the plan gets the same answer as on a
+    // published write.
+    const bool states_differ = slice(snap_model, from, to) != slice(model, from, to);
+    if (removed_in_range && !states_differ) ++counts.removal_only;
+    const bool expect_conflict =
+        states_differ || (base == PlanBase::Sequence && removed_in_range);
     REQUIRE(result.has_value() == !expect_conflict);
+    if (!result) REQUIRE(result.error() == bytecask::PlanRefusal::Conflict);
 
     if (result) {
       ++counts.commits;
@@ -352,17 +401,20 @@ TEST_CASE("range conflicts match a model of the key range",
   const auto placement = GENERATE(Placement::Published, Placement::SameGroup,
                                   Placement::Vacuum, Placement::Resume);
 #endif
+  const auto base = GENERATE(PlanBase::Snapshot, PlanBase::Sequence);
   Counts counts;
   const int rounds = placement == Placement::Published ? 400 : 150;
   for (std::uint64_t seed = 1; seed <= 4; ++seed)
-    run_rounds(placement, seed, rounds, counts);
+    run_rounds(placement, base, seed, rounds, counts);
 
   // A run where the oracle never said "conflict", or never said "commit",
   // proved nothing in that direction.
-  INFO(std::format("{}: {} conflicts, {} commits, {} vacuums",
-                   placement_name(placement), counts.conflicts, counts.commits,
-                   counts.vacuumed));
+  INFO(std::format("{} {}: {} conflicts, {} commits, {} vacuums",
+                   placement_name(placement), base_name(base), counts.conflicts,
+                   counts.commits, counts.vacuumed));
   CHECK(counts.conflicts > 0);
   CHECK(counts.commits > 0);
+  // The rule the bases differ on was reached.
+  CHECK(counts.removal_only > 0);
   if (placement == Placement::Vacuum) CHECK(counts.vacuumed > 0);
 }

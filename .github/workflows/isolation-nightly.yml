@@ -140,6 +140,21 @@ jobs:
           if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
           python3 scripts/run_isolation_check.py $ARGS
 
+      # The same histories with each plan built on its snapshot's sequence
+      # alone (WritePlan(read_sequence)): checked by sequences and the delete
+      # log, held to the same expectations.
+      - name: Run isolation check, plans on a read sequence
+        env:
+          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
+          ROUNDS: ${{ github.event.inputs.rounds || '4' }}
+          SEED: ${{ github.event.inputs.seed || '' }}
+        run: |
+          ARGS="--binary build/linux/x86_64/${{ matrix.mode }}/isolation_history"
+          ARGS="$ARGS --elle-jar elle-cli.jar --rounds $ROUNDS --plan-base sequence"
+          ARGS="$ARGS --txns ${{ matrix.txns }} --out $RUNNER_TEMP/isolation-seq"
+          if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
+          python3 scripts/run_isolation_check.py $ARGS
+
       # Guarded and unguarded with the writer process SIGKILLed and reopened
       # ten times per history (#176): recovery under concurrent group-commit
       # writers.
@@ -171,6 +186,18 @@ jobs:
           ARGS="--binary build/linux/x86_64/${{ matrix.mode }}/isolation_history"
           ARGS="$ARGS --workload range --rounds $ROUNDS"
           ARGS="$ARGS --txns ${{ matrix.txns }} --out $RUNNER_TEMP/isolation-range"
+          if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
+          python3 scripts/run_isolation_check.py $ARGS
+
+      - name: Run range workload, plans on a read sequence
+        env:
+          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
+          ROUNDS: ${{ github.event.inputs.rounds || '4' }}
+          SEED: ${{ github.event.inputs.seed || '' }}
+        run: |
+          ARGS="--binary build/linux/x86_64/${{ matrix.mode }}/isolation_history"
+          ARGS="$ARGS --workload range --rounds $ROUNDS --plan-base sequence"
+          ARGS="$ARGS --txns ${{ matrix.txns }} --out $RUNNER_TEMP/isolation-range-seq"
           if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
           python3 scripts/run_isolation_check.py $ARGS
 

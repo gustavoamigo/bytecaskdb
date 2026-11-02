@@ -129,12 +129,16 @@ inline void seed(DB &db) {
 }
 
 // A batch of every write type.
-inline auto mixed_plan() -> WritePlan {
-  WritePlan plan;
+inline void add_mixed_writes(WritePlan &plan) {
   plan.put(to_bytes("n0"), to_bytes("new"));
   plan.put(to_bytes("k0"), to_bytes("over"));
   plan.del(to_bytes("b0"));
   plan.del_range(to_bytes("k2"), to_bytes("k4"));
+}
+
+inline auto mixed_plan() -> WritePlan {
+  WritePlan plan;
+  add_mixed_writes(plan);
   return plan;
 }
 
@@ -264,6 +268,31 @@ inline auto apply_batch_operation() -> Operation {
           .transition = mixed_transition};
 }
 
+// The mixed batch on a base, with a guard: the W-W check runs for every
+// write, and the removals reach the delete log. One per base (CONTRACT.md,
+// "Isolation is what the plan guards"); nothing changes between the read and
+// the commit, so both commit.
+inline auto based_batch_operation(bool on_snapshot) -> Operation {
+  return {.name = on_snapshot ? "apply_batch on a snapshot"
+                              : "apply_batch on a read sequence",
+          .setup = seed,
+          .run =
+              [on_snapshot](DB &db) {
+                auto plan = [&] {
+                  const SuspendSyscallFaults inputs;
+                  auto snap = db.snapshot();
+                  auto p = on_snapshot ? WritePlan{std::move(snap)}
+                                       : WritePlan{snap.sequence(), snap.marker()};
+                  p.ensure_unchanged(to_bytes("k1"));
+                  add_mixed_writes(p);
+                  return p;
+                }();
+                const auto r = db.apply_batch({.sync = true}, std::move(plan));
+                return r && r->durable;
+              },
+          .transition = mixed_transition};
+}
+
 // A batch that splits nodes its own earlier writes made the transient's: the
 // first put copies the seed's single leaf, and the puts after it fill that
 // copy until it splits, so the split replaces a node the transient owns and
@@ -318,11 +347,16 @@ inline auto rotation_operation() -> Operation {
           }};
 }
 
+// The open's ChangeMarker shares the first file with the first write: sealed
+// on its own first, the setups below lay out their files as without it.
+inline void seal_open_marker(DB &db) { (void)db.create_manifest(); }
+
 inline auto vacuum_operation() -> Operation {
   return {.name = "vacuum",
           .opts = {.max_file_bytes = 50},
           .setup =
               [](DB &db) {
+                seal_open_marker(db);
                 db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
                 db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
                 (void)db.del({.sync = false}, to_bytes("k1"));
@@ -565,6 +599,7 @@ inline auto vacuum_failed_sync_operation() -> Operation {
           .opts = {.max_file_bytes = 50},
           .setup =
               [](DB &db) {
+                seal_open_marker(db);
                 db.put({.sync = true}, to_bytes("k0"), to_bytes("v_k0"));
                 db.put({.sync = true}, to_bytes("k1"), to_bytes("v_k1"));
                 db.put({.sync = false}, to_bytes("k0"), to_bytes("n0"));

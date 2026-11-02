@@ -47,9 +47,14 @@ def _build_open_opts(degrade: DegradeShape, max_file_bytes: int | None = None) -
 def gen_degrade_setup(degrade: DegradeShape) -> str:
     """Generate C++ to establish the degraded state."""
     if degrade.degrade_via == DegradeVia.H:
-        opts = _build_open_opts(degrade, max_file_bytes=30)
+        # The file holds the open's 27-byte ChangeMarker, then 23-byte
+        # entries: 50 bytes after k0 stays under the threshold, 73 after p0
+        # crosses it, so p0's write is the one that rotates.
+        opts = _build_open_opts(degrade, max_file_bytes=60)
         return (
             "    // Establish degrade_H: write k0, then fault on rotation after p0.\n"
+            "    // The open's marker (27 bytes) and k0 (23) stay under 60; p0\n"
+            "    // takes the file across it.\n"
             f"    auto db = bytecask::DB::open(dir, {{{opts}}});\n"
             '    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));\n'
             "    {\n"
@@ -151,10 +156,13 @@ def gen_degrade_setup(degrade: DegradeShape) -> str:
         )
         return (
             "    // Establish degrade_F_batch: a 2-op batch commits (sync=false), so\n"
-            "    // the active file holds BulkBegin(1) p0(2) p1(3) BulkEnd(4) below the\n"
-            "    // failure point; then k0's commit sync fails at sequence 5. The\n"
+            "    // the active file holds BulkBegin(2) p0(3) p1(4) BulkEnd(5) below the\n"
+            "    // failure point; then k0's commit sync fails at sequence 6. The\n"
             "    // markers consume sequences the file's bounds have to account for.\n"
+            "    // The open's ChangeMarker(1) is sealed in a file of its own first,\n"
+            "    // so the resumed file's first entry is a batch marker.\n"
             f"    auto db = {open_call};\n"
+            "    (void)db.create_manifest();  // seals the open's marker alone\n"
             "    {\n"
             "      bytecask::WritePlan plan;\n"
             '      plan.put(to_bytes("p0"), to_bytes("new0"));\n'

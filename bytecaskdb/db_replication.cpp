@@ -41,6 +41,31 @@ auto random_marker_id() -> std::uint64_t {
 
 } // namespace
 
+auto DB::append_change_marker(TransientEngineState &t) -> ChangeMarker {
+  const ChangeMarker marker{t.next_seq(), random_marker_id()};
+  std::ignore = t.active_file().append_entry(
+      marker.since_sequence, EntryType::ChangeMarker, {},
+      encode_marker_id(marker.id));
+  return marker;
+}
+
+auto DB::with_open_marker(const EngineState &s)
+    -> std::shared_ptr<EngineState> {
+  auto t = s.transient();
+  // Past the last packable sequence the engine can write nothing, so no
+  // later write can reuse a sequence and there is no history to start.
+  if (t.next_seq() > KeyDirEntry::kMaxSequence) return std::move(t).persistent();
+  const auto marker = append_change_marker(t);
+  t.active_file().sync();
+  counters_.fsyncs.fetch_add(1, std::memory_order_relaxed);
+  t.apply_change_marker(marker.since_sequence, marker.id);
+  t.apply_sync(marker.since_sequence);
+  counters_.bytes_written.fetch_add(
+      static_cast<std::int64_t>(change_marker_size(EntryType::ChangeMarker)),
+      std::memory_order_relaxed);
+  return std::move(t).persistent();
+}
+
 void DB::set_mode(Mode mode) {
   WriteBarrier barrier{*this};
   auto current = load_state_for_write();
@@ -72,12 +97,10 @@ void DB::set_mode(Mode mode) {
           "limit of {}",
           seq, KeyDirEntry::kMaxSequence)};
     }
-    const auto id = random_marker_id();
-    const auto id_bytes = encode_marker_id(id);
     auto &file = t.active_file();
+    ChangeMarker marker;
     try {
-      std::ignore = file.append_entry(seq, EntryType::ChangeMarker, {},
-                                      id_bytes);
+      marker = append_change_marker(t);
     } catch (...) {
       auto ex = std::current_exception();
       try { file.sync(); } catch (...) {}
@@ -92,7 +115,7 @@ void DB::set_mode(Mode mode) {
     // sequence, so writes are refused until resume() reconciles the file, as
     // after any append (#364).
     try {
-      t.apply_change_marker(seq, id);
+      t.apply_change_marker(marker.since_sequence, marker.id);
       counters_.bytes_written.fetch_add(
           static_cast<std::int64_t>(
               change_marker_size(EntryType::ChangeMarker)),

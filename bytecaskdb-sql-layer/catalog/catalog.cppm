@@ -919,7 +919,11 @@ auto CommitOutcomeUnknown::what() const noexcept -> const char* {
 auto apply_batch_or_unknown(DB& db, WriteOptions opts, WritePlan plan) -> std::optional<CommitResult> {
   auto was_degraded = db.is_degraded();
   try {
-    return db.apply_batch(opts, std::move(plan));
+    // This layer builds its plans on a snapshot, which is never TooOld, so a
+    // refusal is a conflict.
+    auto r = db.apply_batch(opts, std::move(plan));
+    if (!r) return std::nullopt;
+    return *r;
   } catch (...) {
     if (was_degraded || !db.is_degraded()) throw;
     throw CommitOutcomeUnknown{};

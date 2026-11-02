@@ -161,56 +161,93 @@ auto change_marker_bytes(bytecask::DB &db) -> std::uint64_t {
 
 }  // namespace
 
-TEST_CASE("promotion writes a change marker, and only a promotion does",
+TEST_CASE("a promotion or a leader's open writes a change marker, and nothing else does",
           "[replication][change_marker]") {
   TempDir td;
   auto leader = bytecask::DB::open(td.path / "leader");
-  leader.put({}, to_bytes("a"), to_bytes("1"));
+  // The open in Leader mode wrote the first marker, at the first sequence.
+  const auto opened = markers(leader);
+  REQUIRE(opened.size() == 1);
+  CHECK(opened[0].since_sequence == 1);
+  CHECK(opened[0].id != 0);
+  CHECK(leader.put({}, to_bytes("a"), to_bytes("1")).sequence == 2);
   leader.set_mode(Mode::Leader);  // leader to leader: nothing written
-  CHECK(leader.durable_sequence() == 1);
-  CHECK(markers(leader).empty());
-  CHECK(marker_at(leader, 1) == kOriginMarker);
+  CHECK(leader.durable_sequence() == 2);
+  CHECK(markers(leader) == opened);
+  CHECK(marker_at(leader, 0) == kOriginMarker);
+  CHECK(marker_at(leader, 2) == opened[0]);
 
   auto follower = bytecask::DB::open(td.path / "follower", follower_opts());
+  CHECK(markers(follower).empty());  // a follower's open writes none
   (void)replicate(leader, follower);
   leader.set_mode(Mode::Follower);
   follower.set_mode(Mode::Leader);
   CHECK(follower.mode() == Mode::Leader);
 
   const auto ms = markers(follower);
-  REQUIRE(ms.size() == 1);
-  CHECK(ms[0].since_sequence == 2);
-  CHECK(ms[0].id != 0);
-  CHECK(follower.durable_sequence() == 2);  // synced before the mode changed
+  REQUIRE(ms.size() == 2);
+  CHECK(ms[0] == opened[0]);  // received from the leader
+  CHECK(ms[1].since_sequence == 3);
+  CHECK(ms[1].id != 0);
+  CHECK(follower.durable_sequence() == 3);  // synced before the mode changed
   // The first write takes the sequence after the marker's.
-  CHECK(follower.put({}, to_bytes("b"), to_bytes("2")).sequence == 3);
-  // The marker names the history from its sequence on; before it, the origin.
-  CHECK(marker_at(follower, 1) == kOriginMarker);
+  CHECK(follower.put({}, to_bytes("b"), to_bytes("2")).sequence == 4);
+  // The marker names the history from its sequence on; before it, the
+  // previous one.
+  CHECK(marker_at(follower, 0) == kOriginMarker);
   CHECK(marker_at(follower, 2) == ms[0]);
-  CHECK(marker_at(follower, 99) == ms[0]);
+  CHECK(marker_at(follower, 3) == ms[1]);
+  CHECK(marker_at(follower, 99) == ms[1]);
   // On disk: an entry of its own, keyless, with the id as its value.
   const auto h = history(follower);
-  REQUIRE(h.entries.size() == 3);
-  CHECK(h.entries[1].entry_type == EntryType::ChangeMarker);
-  CHECK(h.entries[1].key.empty());
-  CHECK(h.entries[1].value.size() == bytecask::kChangeMarkerIdBytes);
-  CHECK(change_marker_bytes(follower) == kMarkerBytes);
+  REQUIRE(h.entries.size() == 4);
+  CHECK(h.entries[2].entry_type == EntryType::ChangeMarker);
+  CHECK(h.entries[2].key.empty());
+  CHECK(h.entries[2].value.size() == bytecask::kChangeMarkerIdBytes);
+  CHECK(change_marker_bytes(follower) == 2 * kMarkerBytes);
 
   // The old leader follows the new one and receives the marker as an entry.
   catch_up(follower, leader);
   CHECK(markers(leader) == ms);
-  CHECK(marker_at(leader, 99) == ms[0]);
+  CHECK(marker_at(leader, 99) == ms[1]);
   CHECK(kv(leader) == kv(follower));
-  CHECK(change_marker_bytes(leader) == kMarkerBytes);
+  CHECK(change_marker_bytes(leader) == 2 * kMarkerBytes);
 
-  // Reopening in Leader mode is not a promotion.
+  // Reopening in Leader mode writes a marker of its own: a history starts
+  // at every leader open.
   follower.close();
   auto reopened = bytecask::DB::open(td.path / "follower");
-  CHECK(markers(reopened) == ms);
-  CHECK(reopened.durable_sequence() == 3);
-  CHECK(reopened.put({}, to_bytes("c"), to_bytes("3")).sequence == 4);
-  CHECK(markers(reopened) == ms);
-  CHECK(change_marker_bytes(reopened) == kMarkerBytes);
+  const auto again = markers(reopened);
+  REQUIRE(again.size() == 3);
+  CHECK(std::vector<ChangeMarker>(again.begin(), again.begin() + 2) == ms);
+  CHECK(again[2].since_sequence == 5);
+  CHECK(reopened.durable_sequence() == 5);
+  CHECK(reopened.put({}, to_bytes("c"), to_bytes("3")).sequence == 6);
+  CHECK(markers(reopened) == again);
+  CHECK(change_marker_bytes(reopened) == 3 * kMarkerBytes);
+}
+
+// CONTRACT.md, "Every open as a leader starts a new history": a node opened
+// as a leader holds a history of its own from its first sequence, so it
+// cannot follow another leader, even if it never wrote and stepped down at
+// once. A follower is opened as a follower.
+TEST_CASE("a node opened as a leader cannot follow another leader's history",
+          "[replication][change_marker]") {
+  TempDir td;
+  auto leader = bytecask::DB::open(td.path / "leader");
+  leader.put({}, to_bytes("k"), to_bytes("v"));
+
+  auto stepped_down = bytecask::DB::open(td.path / "stepped_down");
+  stepped_down.set_mode(Mode::Follower);
+  const auto s = slice(leader, 0);
+  CHECK_THROWS_AS(stepped_down.ingest(s.header, s.views()),
+                  bytecask::DbChangeMarkerMismatch);
+  CHECK_FALSE(stepped_down.contains_key({}, to_bytes("k")));
+
+  auto follower = bytecask::DB::open(td.path / "follower", follower_opts());
+  follower.ingest(s.header, s.views());
+  CHECK(follower.contains_key({}, to_bytes("k")));
+  CHECK(follower.durable_sequence() == leader.durable_sequence());
 }
 
 TEST_CASE("ingest refuses a slice that starts past the follower, before "
@@ -240,9 +277,12 @@ TEST_CASE("ingest refuses a slice that starts past the follower, before "
 
 TEST_CASE("promoting the less advanced follower forks the one ahead",
           "[replication][change_marker]") {
-  // The design's unplanned failover: L dies at 20; N is at 10, F at 20.
+  // The design's unplanned failover: L dies at 21; N is at 11, F at 21
+  // (L's open marker is sequence 1, then twenty writes).
   TempDir td;
   auto L = bytecask::DB::open(td.path / "L");
+  const auto opened = markers(L);
+  REQUIRE(opened.size() == 1);
   for (int i = 0; i < 10; ++i)
     L.put({}, to_bytes(std::format("k{:02}", i)), to_bytes("L"));
   auto N = bootstrap(L, td.path / "N");
@@ -250,20 +290,21 @@ TEST_CASE("promoting the less advanced follower forks the one ahead",
   for (int i = 10; i < 20; ++i)
     L.put({}, to_bytes(std::format("k{:02}", i)), to_bytes("L"));
   auto F = bootstrap(L, td.path / "F");
-  REQUIRE(N.durable_sequence() == 10);
-  REQUIRE(G.durable_sequence() == 10);
-  REQUIRE(F.durable_sequence() == 20);
+  REQUIRE(N.durable_sequence() == 11);
+  REQUIRE(G.durable_sequence() == 11);
+  REQUIRE(F.durable_sequence() == 21);
   L.close();  // L dies
 
   N.set_mode(Mode::Leader);  // the wrong choice: F is ahead of N
   N.put({}, to_bytes("n"), to_bytes("1"));
   const auto ms = markers(N);
-  REQUIRE(ms.size() == 1);
-  CHECK(ms[0].since_sequence == 11);
-  CHECK(marker_at(N, 20) == ms[0]);
-  CHECK(marker_at(F, 20) == kOriginMarker);
+  REQUIRE(ms.size() == 2);
+  CHECK(ms[0] == opened[0]);
+  CHECK(ms[1].since_sequence == 12);
+  CHECK(marker_at(N, 21) == ms[1]);
+  CHECK(marker_at(F, 21) == opened[0]);
 
-  // F holds L's 11..20, which N never had: refused, nothing written.
+  // F holds L's 12..21, which N never had: refused, nothing written.
   const auto before = history(F);
   const auto bytes_before = data_file_bytes(td.path / "F");
   CHECK_THROWS_AS((void)replicate(N, F), bytecask::DbChangeMarkerMismatch);
@@ -271,7 +312,7 @@ TEST_CASE("promoting the less advanced follower forks the one ahead",
   CHECK_THROWS_AS((void)replicate(N, F, 5), bytecask::DbChangeMarkerMismatch);
   CHECK(same_history(history(F), before));
   CHECK(data_file_bytes(td.path / "F") == bytes_before);
-  CHECK(F.durable_sequence() == 20);
+  CHECK(F.durable_sequence() == 21);
   CHECK_FALSE(F.is_degraded());
 
   // G, at N's position, catches up and receives the marker.
@@ -281,7 +322,7 @@ TEST_CASE("promoting the less advanced follower forks the one ahead",
 
   // L comes back with writes nobody replicated: refused the same way.
   auto L2 = bytecask::DB::open(td.path / "L", follower_opts());
-  REQUIRE(L2.durable_sequence() == 20);
+  REQUIRE(L2.durable_sequence() == 21);
   CHECK_THROWS_AS((void)replicate(N, L2), bytecask::DbChangeMarkerMismatch);
 
   // Re-bootstrapped from N, everything converges.
@@ -305,22 +346,23 @@ TEST_CASE("re-delivery of the same history is accepted, with a promotion in "
   for (char c = 'a'; c <= 'f'; ++c)
     leader.put({}, to_bytes(std::string(1, c)), to_bytes("1"));
   auto follower = bytecask::DB::open(td.path / "follower", follower_opts());
+  // The leader's open marker is 1, a..f are 2..7.
   catch_up(leader, follower);
   CHECK_FALSE(replicate(leader, follower, 3).entries.empty());  // all duplicates
-  CHECK(follower.durable_sequence() == 6);
-  CHECK(history(follower).entries.size() == 6);
+  CHECK(follower.durable_sequence() == 7);
+  CHECK(history(follower).entries.size() == 7);
   leader.put({}, to_bytes("g"), to_bytes("1"));
   leader.put({}, to_bytes("h"), to_bytes("1"));
-  (void)replicate(leader, follower, 3);  // 4..8: duplicates skipped, 7, 8 applied
+  (void)replicate(leader, follower, 3);  // 4..9: duplicates skipped, 8, 9 applied
   CHECK(same_history(history(follower), history(leader)));
 
   leader.set_mode(Mode::Follower);
-  follower.set_mode(Mode::Leader);  // marker at 9
-  follower.put({}, to_bytes("i"), to_bytes("1"));  // 10
+  follower.set_mode(Mode::Leader);  // marker at 10
+  follower.put({}, to_bytes("i"), to_bytes("1"));  // 11
   catch_up(follower, leader);
   CHECK(markers(leader) == markers(follower));
-  (void)replicate(follower, leader, 4);  // 5..10 again, marker included
-  (void)replicate(follower, leader, 9);  // from the marker itself
+  (void)replicate(follower, leader, 4);  // 5..11 again, marker included
+  (void)replicate(follower, leader, 10);  // from the marker itself
   CHECK(same_history(history(leader), history(follower)));
 }
 
@@ -328,27 +370,30 @@ TEST_CASE("a slice cut before the follower's marker is accepted; a forked "
           "source is refused once the comparison reaches the divergence",
           "[replication][change_marker]") {
   TempDir td;
-  auto A = bytecask::DB::open(td.path / "A");
+  auto A = bytecask::DB::open(td.path / "A");  // A's open marker is 1
+  const auto opened = markers(A);
+  REQUIRE(opened.size() == 1);
   for (char c = 'a'; c <= 'e'; ++c)
-    A.put({}, to_bytes(std::string(1, c)), to_bytes("1"));
+    A.put({}, to_bytes(std::string(1, c)), to_bytes("1"));  // 2..6
   auto G = bootstrap(A, td.path / "G");
   auto B = bootstrap(A, td.path / "B");
   A.set_mode(Mode::Follower);
-  G.set_mode(Mode::Leader);  // marker at 6
-  G.put({}, to_bytes("g"), to_bytes("1"));  // 7
-  G.put({}, to_bytes("h"), to_bytes("1"));  // 8
+  G.set_mode(Mode::Leader);  // marker at 7
+  G.put({}, to_bytes("g"), to_bytes("1"));  // 8
+  G.put({}, to_bytes("h"), to_bytes("1"));  // 9
   while (B.durable_sequence() < G.durable_sequence())
     (void)replicate(G, B, std::nullopt, 1);  // unit by unit: the marker alone
   const auto ms = markers(B);
-  REQUIRE(ms.size() == 1);
-  CHECK(ms[0].since_sequence == 6);
-  REQUIRE(B.durable_sequence() == 8);
+  REQUIRE(ms.size() == 2);
+  CHECK(ms[0] == opened[0]);
+  CHECK(ms[1].since_sequence == 7);
+  REQUIRE(B.durable_sequence() == 9);
 
   // The comparison point stops at the slice's last entry: a re-delivered
-  // slice from 2 cut at 3 says nothing about 6, and passes.
+  // slice from 2 cut at 3 says nothing about 7, and passes.
   auto s = slice(G, 2, 1);
   CHECK(sequences(s) == std::vector<std::uint64_t>{3});
-  CHECK(s.header.marker == kOriginMarker);
+  CHECK(s.header.marker == opened[0]);
   CHECK(s.header.from_sequence == 2);
   B.ingest(s.header, s.views());
   s = slice(G, 2);  // uncut: the marker is in the slice and matches
@@ -356,19 +401,19 @@ TEST_CASE("a slice cut before the follower's marker is accepted; a forked "
     return e.entry_type == EntryType::ChangeMarker;
   }));
   B.ingest(s.header, s.views());
-  CHECK(B.durable_sequence() == 8);
+  CHECK(B.durable_sequence() == 9);
   CHECK(same_history(history(B), history(G)));
 
-  // A at 5 is promoted too (split brain): its own marker at 6. Cut before
+  // A at 6 is promoted too (split brain): its own marker at 7. Cut before
   // the divergence a slice passes; at or past it, refused.
   A.set_mode(Mode::Leader);
-  A.put({}, to_bytes("split"), to_bytes("1"));  // 7
+  A.put({}, to_bytes("split"), to_bytes("1"));  // 8
   s = slice(A, 2, 1);
   CHECK(sequences(s) == std::vector<std::uint64_t>{3});
   B.ingest(s.header, s.views());
   CHECK_THROWS_AS((void)replicate(A, B, 2), bytecask::DbChangeMarkerMismatch);
   CHECK_THROWS_AS((void)replicate(A, B), bytecask::DbChangeMarkerMismatch);
-  CHECK(B.durable_sequence() == 8);
+  CHECK(B.durable_sequence() == 9);
   CHECK(same_history(history(B), history(G)));
 }
 
@@ -381,17 +426,17 @@ TEST_CASE("an empty slice compares the histories at from_sequence",
   auto B = bootstrap(A, td.path / "B");
   auto Z = bootstrap(A, td.path / "Z");
   A.set_mode(Mode::Follower);
-  B.set_mode(Mode::Leader);  // marker {6, b}
-  B.put({}, to_bytes("b"), to_bytes("2"));  // 7
-  Z.set_mode(Mode::Leader);  // split brain: marker {6, z}
-  Z.put({}, to_bytes("z"), to_bytes("2"));  // 7
+  B.set_mode(Mode::Leader);  // marker {7, b}; A's open marker is 1
+  B.put({}, to_bytes("b"), to_bytes("2"));  // 8
+  Z.set_mode(Mode::Leader);  // split brain: marker {7, z}
+  Z.put({}, to_bytes("z"), to_bytes("2"));  // 8
   Z.set_mode(Mode::Follower);
   REQUIRE(Z.durable_sequence() == B.durable_sequence());
 
   // Z is not behind B, so the slice is empty, and it is still refused.
   auto s = slice(B, Z.durable_sequence());
   CHECK(s.entries.empty());
-  CHECK(s.header.marker == markers(B).front());
+  CHECK(s.header.marker == markers(B).back());
   CHECK_THROWS_AS(Z.ingest(s.header, s.views()),
                   bytecask::DbChangeMarkerMismatch);
 
@@ -455,29 +500,30 @@ TEST_CASE("ingest refuses a malformed slice with nothing written",
 TEST_CASE("changes_since hands out whole units and cuts at unit boundaries",
           "[replication][change_marker]") {
   TempDir td;
-  auto db = bytecask::DB::open(td.path / "db");
-  db.put({}, to_bytes("a"), to_bytes("1"));  // 1
+  auto db = bytecask::DB::open(td.path / "db");  // the open's marker: 1
+  db.put({}, to_bytes("a"), to_bytes("1"));  // 2
   bytecask::WritePlan plan;
   plan.put(to_bytes("b"), to_bytes("1"));
   plan.put(to_bytes("c"), to_bytes("1"));
-  REQUIRE(db.apply_batch({}, std::move(plan)));  // 2 BulkBegin, 3, 4, 5 BulkEnd
-  db.put({}, to_bytes("d"), to_bytes("1"));  // 6
-  db.put({}, to_bytes("e"), to_bytes("1"));  // 7
+  REQUIRE(db.apply_batch({}, std::move(plan)));  // 3 BulkBegin, 4, 5, 6 BulkEnd
+  db.put({}, to_bytes("d"), to_bytes("1"));  // 7
+  db.put({}, to_bytes("e"), to_bytes("1"));  // 8
   using S = std::vector<std::uint64_t>;
-  CHECK(sequences(slice(db, 0)) == S{1, 2, 3, 4, 5, 6, 7});
-  CHECK(sequences(slice(db, 1)) == S{2, 3, 4, 5, 6, 7});
+  CHECK(sequences(slice(db, 0)) == S{1, 2, 3, 4, 5, 6, 7, 8});
+  CHECK(sequences(slice(db, 1)) == S{2, 3, 4, 5, 6, 7, 8});
   // A batch straddling from is left out whole.
-  CHECK(sequences(slice(db, 3)) == S{6, 7});
-  CHECK(sequences(slice(db, 4)) == S{6, 7});
+  CHECK(sequences(slice(db, 4)) == S{7, 8});
+  CHECK(sequences(slice(db, 5)) == S{7, 8});
   // max_bytes cuts after the unit that passes it, never inside a batch.
-  CHECK(sequences(slice(db, 1, 1)) == S{2, 3, 4, 5});
-  CHECK(sequences(slice(db, 0, 1)) == S{1});
-  CHECK(sequences(slice(db, 5, 1)) == S{6});
-  CHECK(sequences(slice(db, 0, 1000)) == S{1, 2, 3, 4, 5, 6, 7});
-  CHECK(sequences(slice(db, 7)).empty());
+  CHECK(sequences(slice(db, 2, 1)) == S{3, 4, 5, 6});
+  CHECK(sequences(slice(db, 0, 1)) == S{1});  // the marker is a unit
+  CHECK(sequences(slice(db, 1, 1)) == S{2});
+  CHECK(sequences(slice(db, 6, 1)) == S{7});
+  CHECK(sequences(slice(db, 0, 1000)) == S{1, 2, 3, 4, 5, 6, 7, 8});
+  CHECK(sequences(slice(db, 8)).empty());
   // Nothing a sync=false write left unsynced.
-  (void)db.put({.sync = false}, to_bytes("f"), to_bytes("1"));  // 8
-  CHECK(sequences(slice(db, 6)) == S{7});
+  (void)db.put({.sync = false}, to_bytes("f"), to_bytes("1"));  // 9
+  CHECK(sequences(slice(db, 7)) == S{8});
 
   // A follower fed unit by unit holds the same history.
   auto follower = bytecask::DB::open(td.path / "follower", follower_opts());
@@ -501,9 +547,12 @@ TEST_CASE("a follower whose writes stopped cannot be promoted",
   CHECK(follower.mode() == Mode::Follower);
   CHECK(markers(follower).empty());
   REQUIRE_NOTHROW(follower.resume());
+  // resume() replays what the failed ingest appended, the leader's open
+  // marker among it; the promotion adds one of its own.
+  const auto held = markers(follower).size();
   follower.set_mode(Mode::Leader);
   CHECK(follower.mode() == Mode::Leader);
-  CHECK(markers(follower).size() == 1);
+  CHECK(markers(follower).size() == held + 1);
 }
 
 TEST_CASE("a promotion whose fdatasync fails degrades and keeps the mode; "
@@ -528,7 +577,8 @@ TEST_CASE("a promotion whose fdatasync fails degrades and keeps the mode; "
   CHECK(markers(db)[0] == found[0]);
   CHECK(db.put({}, to_bytes("a"), to_bytes("1")).sequence == 3);
   db.close();
-  auto reopened = bytecask::DB::open(td.path / "db");
+  // Reopened as a follower, which writes no marker of its own.
+  auto reopened = bytecask::DB::open(td.path / "db", follower_opts());
   CHECK(markers(reopened).size() == 2);
   CHECK(markers(reopened)[0] == found[0]);
   CHECK(change_marker_bytes(reopened) == 2 * kMarkerBytes);
@@ -556,12 +606,12 @@ TEST_CASE("vacuum keeps a change marker: compaction leaves it in a file of "
           "its own, and never removes that file",
           "[replication][change_marker][vacuum]") {
   TempDir td;
-  // k=v is 21 bytes, a marker 27: the marker tips the first file past 40 and
-  // rotates it, so file 1 holds a put and the marker.
-  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 40});
-  db.put({}, to_bytes("k"), to_bytes("v"));  // 1
-  db.set_mode(Mode::Follower);
-  db.set_mode(Mode::Leader);  // 2: the marker, and a rotation
+  // A marker is 27 bytes, k=v 21: the put tips the first file past 40 and
+  // rotates it, so file 1 holds the marker and a put. Opened as a follower
+  // and promoted, so the promotion's marker is the only one.
+  auto db = bytecask::DB::open(td.path / "db", follower_opts(40));
+  db.set_mode(Mode::Leader);  // 1: the marker
+  db.put({}, to_bytes("k"), to_bytes("v"));  // 2, and a rotation
   REQUIRE(db.file_stats().size() == 2);
   db.put({}, to_bytes("k"), to_bytes("w"));  // 3: k=v is dead
   const auto ms = markers(db);
@@ -585,7 +635,8 @@ TEST_CASE("vacuum keeps a change marker: compaction leaves it in a file of "
   CHECK_FALSE(db.vacuum({.fragmentation_threshold = 0.0}));
   CHECK(change_marker_bytes(db) == kMarkerBytes);
   db.close();
-  auto reopened = bytecask::DB::open(td.path / "db", {.max_file_bytes = 40});
+  // Reopened as a follower, which writes no marker of its own.
+  auto reopened = bytecask::DB::open(td.path / "db", follower_opts(40));
   CHECK(markers(reopened) == ms);
   CHECK(change_marker_bytes(reopened) == kMarkerBytes);
   bytecask::Bytes out;
@@ -685,8 +736,12 @@ TEST_CASE("Recovery model-based: change markers survive serial and parallel "
       }
     }
     REQUIRE(promotions >= 20);
-    CHECK(markers(db).size() == promotions);
+    CHECK(markers(db).size() == promotions + 1);  // and the open's
   }
+  // Every marker the writer made: its open's and one per promotion. The
+  // copies below open as followers, which recover the same state and write
+  // no marker of their own.
+  const auto made = promotions + 1;
 
   using Stats = std::vector<std::tuple<std::uint64_t, std::uint64_t,
                                        std::uint64_t, std::uint64_t,
@@ -713,12 +768,13 @@ TEST_CASE("Recovery model-based: change markers survive serial and parallel "
   {
     const auto p = td.path / "serial";
     copy_to(p);
-    auto db = bytecask::DB::open(p, {.recovery_threads = 1});
+    auto db = bytecask::DB::open(
+        p, {.recovery_threads = 1, .initial_mode = Mode::Follower});
     REQUIRE(kv(db) == oracle);
     serial_markers = markers(db);
-    REQUIRE(serial_markers.size() == promotions);
+    REQUIRE(serial_markers.size() == made);
     serial_stats = collect_stats(db);
-    CHECK(change_marker_bytes(db) == promotions * kMarkerBytes);
+    CHECK(change_marker_bytes(db) == made * kMarkerBytes);
     CHECK(marker_at(db, db.durable_sequence()) == serial_markers.back());
   }
 
@@ -726,7 +782,8 @@ TEST_CASE("Recovery model-based: change markers survive serial and parallel "
     DYNAMIC_SECTION("recovery_threads = " << threads) {
       const auto p = td.path / std::format("t{}", threads);
       copy_to(p);
-      auto db = bytecask::DB::open(p, {.recovery_threads = threads});
+      auto db = bytecask::DB::open(
+          p, {.recovery_threads = threads, .initial_mode = Mode::Follower});
       CHECK(kv(db) == oracle);
       CHECK(markers(db) == serial_markers);
       CHECK(collect_stats(db) == serial_stats);
@@ -736,15 +793,17 @@ TEST_CASE("Recovery model-based: change markers survive serial and parallel "
   SECTION("vacuum to convergence keeps every marker") {
     const auto p = td.path / "vacuum";
     copy_to(p);
-    auto db = bytecask::DB::open(p, {.max_file_bytes = 2048});
+    auto db = bytecask::DB::open(
+        p, {.max_file_bytes = 2048, .initial_mode = Mode::Follower});
     while (db.vacuum({.fragmentation_threshold = 0.0})) {
     }
     CHECK(kv(db) == oracle);
     CHECK(markers(db) == serial_markers);
-    CHECK(change_marker_bytes(db) == promotions * kMarkerBytes);
+    CHECK(change_marker_bytes(db) == made * kMarkerBytes);
     const auto vacuumed = collect_stats(db);
     db.close();
-    auto reopened = bytecask::DB::open(p, {.max_file_bytes = 2048});
+    auto reopened = bytecask::DB::open(
+        p, {.max_file_bytes = 2048, .initial_mode = Mode::Follower});
     CHECK(kv(reopened) == oracle);
     CHECK(markers(reopened) == serial_markers);
     CHECK(collect_stats(reopened) == vacuumed);
@@ -753,8 +812,8 @@ TEST_CASE("Recovery model-based: change markers survive serial and parallel "
   SECTION("resume replays the active file's markers, without duplicates") {
     const auto p = td.path / "resume";
     copy_to(p);
-    auto db = bytecask::DB::open(p, {.max_file_bytes = 1 << 20});
-    db.set_mode(Mode::Follower);
+    auto db = bytecask::DB::open(
+        p, {.max_file_bytes = 1 << 20, .initial_mode = Mode::Follower});
     db.set_mode(Mode::Leader);  // a published marker in the active file
     auto expected = serial_markers;
     expected.push_back(markers(db).back());
@@ -768,20 +827,22 @@ TEST_CASE("Recovery model-based: change markers survive serial and parallel "
     CHECK(markers(db) == expected);
     CHECK(change_marker_bytes(db) == expected.size() * kMarkerBytes);
     db.close();
-    auto reopened = bytecask::DB::open(p);
+    auto reopened = bytecask::DB::open(p, follower_opts());
     CHECK(markers(reopened) == expected);
   }
 }
 
 TEST_CASE("resume replays a marker an ingest appended but never published",
           "[replication][change_marker][resume]") {
-  // Two rounds: into a node holding no marker, then into one holding one.
+  // Two rounds: into a node holding no marker, then into one holding some.
+  // The first slice carries the leader's open marker too.
   TempDir td;
   auto leader = bytecask::DB::open(td.path / "leader");
   auto follower =
       bytecask::DB::open(td.path / "follower", follower_opts(256));
   const std::string big(300, 'x');
-  std::vector<ChangeMarker> expected;
+  auto expected = markers(leader);
+  REQUIRE(expected.size() == 1);
   for (int round = 0; round < 2; ++round) {
     leader.set_mode(Mode::Follower);
     leader.set_mode(Mode::Leader);  // a marker, then writes that rotate
@@ -790,10 +851,12 @@ TEST_CASE("resume replays a marker an ingest appended but never published",
       leader.put({}, to_bytes(std::format("r{}k{}", round, i)), to_bytes(big));
     // The first chunk, marker included, is appended; the rotation after it
     // fails in memory, so nothing is published and writes are refused.
+    const auto held = markers(follower);
+    CHECK(held.size() == (round == 0 ? 0 : expected.size() - 1));
     follower.test_in_finish_rotation_ = [] { throw std::bad_alloc{}; };
     CHECK_THROWS_AS((void)replicate(leader, follower), std::bad_alloc);
     follower.test_in_finish_rotation_ = {};
-    CHECK(markers(follower).size() == static_cast<std::size_t>(round));
+    CHECK(markers(follower) == held);  // nothing published
     REQUIRE_NOTHROW(follower.resume());
     CHECK(markers(follower) == expected);
     catch_up(leader, follower);
@@ -864,7 +927,8 @@ TEST_CASE("a promotion that fails after its append refuses writes until "
   REQUIRE(markers(db).size() == 2);
   CHECK(markers(db)[1].since_sequence > found[0].since_sequence);
   db.close();
-  auto reopened = bytecask::DB::open(td.path / "db");
+  // Reopened as a follower, which writes no marker of its own.
+  auto reopened = bytecask::DB::open(td.path / "db", follower_opts());
   CHECK(markers(reopened).size() == 2);
 }
 
@@ -893,8 +957,11 @@ TEST_CASE("a change marker inside a batch, with a key or with a short id on "
     TempDir td;
     const auto dir = td.path / "db";
     std::filesystem::path sealed;
+    std::vector<ChangeMarker> opened;  // the open's own marker
     {
       auto db = bytecask::DB::open(dir);
+      opened = markers(db);
+      REQUIRE(opened.size() == 1);
       db.put({}, to_bytes("a"), to_bytes("1"));
       sealed = db.create_manifest().files.at(0).data_path;
       db.put({}, to_bytes("b"), to_bytes("2"));
@@ -917,9 +984,11 @@ TEST_CASE("a change marker inside a batch, with a key or with a short id on "
     const auto newest_size = std::filesystem::file_size(newest);
     append(newest);
     {
-      auto db = bytecask::DB::open(dir);  // the tail is cut, the marker with it
+      // The tail is cut, the marker with it. Opened as a follower, which
+      // writes no marker of its own.
+      auto db = bytecask::DB::open(dir, follower_opts());
       CHECK(kv(db) == std::map<std::string, std::string>{{"a", "1"}, {"b", "2"}});
-      CHECK(markers(db).empty());
+      CHECK(markers(db) == opened);
     }
     CHECK(std::filesystem::file_size(newest) == newest_size);
 

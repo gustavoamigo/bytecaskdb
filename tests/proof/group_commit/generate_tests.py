@@ -107,9 +107,9 @@ def gen_test(shape: GroupShape, failure: GroupFailureClass) -> str:
     p.extend(gen_plan(shape, "idx"))
     p.append("      try {")
     p.append(
-        f"        results[static_cast<std::size_t>(i)] ="
-        f" db.apply_batch({{.sync = {sync}}}, std::move(plan));"
+        f"        if (auto r = db.apply_batch({{.sync = {sync}}}, std::move(plan)))"
     )
+    p.append("          results[static_cast<std::size_t>(i)] = *r;")
     p.append("      } catch (const std::exception &) {")
     p.append("        threw[static_cast<std::size_t>(i)] = true;")
     p.append("      }")

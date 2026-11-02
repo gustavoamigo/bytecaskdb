@@ -28,17 +28,19 @@ The interface is the engine's (README, API Reference; CONTRACT.md)::
         plan.put(b"c", b"3")
         db.apply_batch(plan)
 
-leaves one data file holding, as ``dump("my_db")`` prints it::
+leaves one data file holding, as ``dump("my_db")`` prints it, the change
+marker the open appended (its id is random) and then the writes::
 
     data_..._V01.data
-           0  seq 1  PUT         b'a' b'1'
-          21  seq 2  BULK_BEGIN
-          40  seq 3  PUT         b'b' b'2'
-          61  seq 4  PUT         b'c' b'3'
-          82  seq 5  BULK_END
+           0  seq 1  CHANGE_MARKER id 9f2c...
+          27  seq 2  PUT           b'a' b'1'
+          48  seq 3  BULK_BEGIN
+          67  seq 4  PUT           b'b' b'2'
+          88  seq 5  PUT           b'c' b'3'
+         109  seq 6  BULK_END
 
-and a key directory mapping a, b and c to (file 1, offset 0, seq 1),
-(file 1, 40, 3) and (file 1, 61, 4). The Pythonic interface (``db[k]``,
+and a key directory mapping a, b and c to (file 1, offset 27, seq 2),
+(file 1, 67, 4) and (file 1, 88, 5). The Pythonic interface (``db[k]``,
 ``with db.transaction()``) is bytecaskdb/ext.py, which runs on this module as
 on the engine: ``bytecaskdb.DB.open(path, backend=bytecask_ref)``.
 
@@ -47,7 +49,8 @@ a database written here, and this opens one the engine wrote.
 
 Replication is the engine's too: ``changes_since`` streams a leader's durable
 entries, ``ingest`` applies them on a follower under their own sequences, and
-a promotion (``set_mode(Mode.Leader)`` on a follower) appends a change marker
+a promotion (``set_mode(Mode.Leader)`` on a follower), and every open in Leader
+mode, appends a change marker
 that names the history from there on, so ``ingest`` refuses a stream from a
 history that diverged at a promotion, or one that starts past the follower
 (#397). ``create_manifest`` seals the files a new follower is copied from.
@@ -238,7 +241,7 @@ def dump(path: str | os.PathLike[str]) -> None:
                     fields = ""
                 case EntryType.CHANGE_MARKER:
                     fields = f"id {e.value.hex()}"
-            print(f"{offset:8}  seq {e.sequence}  {e.type.name:<12}{fields}".rstrip())
+            print(f"{offset:8}  seq {e.sequence}  {e.type.name:<14}{fields}".rstrip())
 
 
 # ── The key directory ────────────────────────────────────────────────────────
@@ -410,7 +413,7 @@ class Options:
     max_file_bytes: int = 64 * 1024 * 1024
     max_key_bytes: int = 4096
     max_value_bytes: int = 4 * 1024 * 1024
-    initial_mode: Mode = Mode.Leader  # opening in Leader mode is not a promotion
+    initial_mode: Mode = Mode.Leader  # an open in Leader mode appends a change marker
 
     def _check(self) -> None:
         for name, ceiling in (("max_file_bytes", MAX_FILE_BYTES),
@@ -599,13 +602,21 @@ class DB:
     @classmethod
     def open(cls, path: str | os.PathLike[str], opts: Options | None = None) -> DB:
         """Opens or creates the database at path: replays every data file in
-        sequence order, then starts a new active file."""
+        sequence order, then starts a new active file. An open in Leader mode
+        then appends a change marker, as a promotion does: a crash loses the
+        writes above the durable sequence and the reopened leader hands
+        their sequences out again, so writes from this open on must sit under
+        a marker no earlier reader holds. An open in Follower mode writes
+        none."""
         opts = opts or Options()
         opts._check()
         db = cls(Path(path), opts)
         db._dir.mkdir(parents=True, exist_ok=True)
         db._recover()
         db._start_active_file()
+        if opts.initial_mode is Mode.Leader:
+            with db._lock, db._stop_writes_on_io_error():
+                db._append_marker()
         return db
 
     def __enter__(self) -> DB:
@@ -845,10 +856,15 @@ class DB:
                     self._sync_active()
             else:
                 self._check_writable()
-                marker = Entry(self._next_sequence, EntryType.CHANGE_MARKER,
-                               value=_MARKER_ID.pack(secrets.randbits(64)))
-                self._publish(self._append([marker]))
+                self._append_marker()
             self._mode = mode
+
+    def _append_marker(self) -> None:
+        """Appends and publishes a change marker with a fresh id at the next
+        sequence. Caller holds the write lock."""
+        marker = Entry(self._next_sequence, EntryType.CHANGE_MARKER,
+                       value=_MARKER_ID.pack(secrets.randbits(64)))
+        self._publish(self._append([marker]))
 
     def create_manifest(self) -> FileManifest:
         """Seals the active file, synced whole, and lists the sealed ones."""
