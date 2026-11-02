@@ -236,7 +236,8 @@ cancellation and shutdown*). A `CancelRequest` naming a session's
 `BackendKeyData` key fails its running statement with `57014`
 (`canceling statement due to user request`); one naming a session that runs
 nothing, or a wrong key, does nothing. A cancel is checked where the runtime
-charges a statement's reads, every 64. A session is idle from
+charges a statement's reads, every 64; a `FETCH` and an `UPDATE` or `DELETE
+... WHERE CURRENT OF` are statements here like any other. A session is idle from
 `ReadyForQuery` until it takes its next message, which clears any cancel
 sent meanwhile; one sent after, while the command compiles or runs, cancels
 it. The timeouts, in milliseconds, `0`

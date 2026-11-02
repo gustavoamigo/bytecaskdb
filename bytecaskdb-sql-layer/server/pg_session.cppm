@@ -1100,10 +1100,11 @@ private:
     const auto name = std::string{stmt.current_of()};
     auto& cursor = find_cursor(name);
     try {
-      if (in_block_) return txn_->execute_current_of(stmt, params, cursor.cursor);
-      if (implicit_) return implicit_->execute_current_of(stmt, params, cursor.cursor);
+      auto opts = run_options();
+      if (in_block_) return txn_->execute_current_of(stmt, params, cursor.cursor, opts);
+      if (implicit_) return implicit_->execute_current_of(stmt, params, cursor.cursor, opts);
       auto t = db_.begin();
-      auto rows = t.execute_current_of(stmt, params, cursor.cursor);
+      auto rows = t.execute_current_of(stmt, params, cursor.cursor, opts);
       (void)t.commit();
       return rows;
     } catch (const CurrentOfRefused& e) {
@@ -1144,7 +1145,7 @@ private:
     } else if (const auto* f = std::get_if<ast::FetchCursor>(&c)) {
       auto& cursor = find_cursor(f->name);
       try {
-        out.rows = cursor.cursor.fetch(move_of(*f));
+        out.rows = cursor.cursor.fetch(move_of(*f), run_options());
       } catch (const CursorForwardOnly& e) {
         throw SessionError(e.what(), "55000");
       }
