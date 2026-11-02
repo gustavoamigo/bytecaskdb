@@ -350,8 +350,14 @@ charge the cap has no room for is `BC_E_MEMORY` (53200): an error like
 statement returns its reservation when the context is reset. `bc_txn_add`
 moves to the transaction what of it covers the write set the transaction
 takes in, which the transaction returns when it is aborted or freed. Since
-the statement reserved at least what it held, taking it in never fails on
-the cap.
+the statement reserved at least what it held, taking it in does not fail on
+the cap. The transaction's count can grow by more than that reservation:
+it includes the overlays its cursors pinned (`bc_txn_overlay_pin`), which no
+statement reserved. `bc_txn_add` reserves the difference as any charge does,
+and past the cap fails with `BC_E_MEMORY` and aborts the transaction: the
+cap's count never passes the cap unchecked. A hold cursor's overlay and
+snapshot outlive the transaction, and with it its reservation: they are not
+counted against the cap.
 
 **The API meters the work.** `bc_ctx_begin` sets a budget in record reads
 and cursor steps, a deadline and a cancel flag. Every read and every step

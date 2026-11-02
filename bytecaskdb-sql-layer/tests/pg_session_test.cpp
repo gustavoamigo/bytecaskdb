@@ -12,6 +12,11 @@
 // - A session whose client has not taken max_unsent_bytes of its replies
 //   runs no further statement until the client takes some, and a drop
 //   still ends it.
+// - A cancel taken while a session is idle is dropped; one taken after its
+//   command's first message cancels the command's statement.
+// - A cancel-only session (past --max-connections) refuses a startup with
+//   53300 and takes a CancelRequest.
+// - An idle timeout's timer that fires before its deadline ends nothing.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -23,6 +28,8 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -446,6 +453,196 @@ TEST_CASE("pg_session: past max_unsent_bytes a session runs no further statement
   CHECK(unsent.size() > kLimit);
   pool.drop(slot);
   CHECK(settle().ended);
+
+  pool.shutdown();
+  db->close();
+}
+
+namespace {
+
+// Feeds `bytes` to the session and runs it to its next stop; returns the
+// reply messages.
+auto feed(pg::Session& s, pg::Framer& framer, const std::string& bytes) -> std::vector<ParsedReply> {
+  std::vector<pg::Input> in;
+  framer.push(bytes, in);
+  for (auto& item : in) s.push(std::move(item));
+  s.step();
+  auto raw = s.take_output();
+  return parse_replies(raw);
+}
+
+auto error_codes(const std::vector<ParsedReply>& msgs) -> std::vector<std::string> {
+  std::vector<std::string> out;
+  for (const auto& m : msgs) {
+    if (m.type != 'E') continue;
+    for (std::size_t pos = 0; pos < m.body.size() && m.body[pos] != '\0';) {
+      auto end = m.body.find('\0', pos + 1);
+      if (m.body[pos] == 'C') out.push_back(m.body.substr(pos + 1, end - pos - 1));
+      pos = end + 1;
+    }
+  }
+  return out;
+}
+
+auto backend_key(const std::vector<ParsedReply>& msgs) -> std::pair<std::int32_t, std::int32_t> {
+  for (const auto& m : msgs) {
+    if (m.type != 'K') continue;
+    pg::Body b{m.body};
+    auto pid = b.i32();
+    return {pid, b.i32()};
+  }
+  FAIL("no BackendKeyData");
+  return {};
+}
+
+auto cancel_request_bytes(std::int32_t pid, std::int32_t secret) -> std::string {
+  pg::Out pkt;
+  pkt.i32(16);
+  pkt.i32(pg::kCancelRequest);
+  pkt.i32(pid);
+  pkt.i32(secret);
+  return pkt.take();
+}
+
+// A table a scan of reads past the 64 reads at which a cancel is checked.
+void counted_table(bytecask::sql::Database& db) {
+  db.execute("CREATE TABLE many (id BIGINT PRIMARY KEY)");
+  for (std::int64_t id = 0; id < 1000; ++id) db.execute("INSERT INTO many VALUES ($1)", {id});
+}
+
+}  // namespace
+
+TEST_CASE("pg_session: a cancel taken after a command's first message cancels its statement, one before it nothing",
+          "[sql][server]") {
+  sql_test::TempDir dir{"pg_session_cancel"};
+  auto db = bytecask::sql::Database::open(dir.path());
+  counted_table(*db);
+  pg::CancelRegistry cancels;
+  pg::SessionConfig cfg{"testdb"};
+  cfg.cancels = &cancels;
+  pg::Framer framer;
+  pg::Session s{*db, cfg};
+  auto [pid, secret] = backend_key(feed(s, framer, startup_bytes("testdb")));
+
+  // Idle, after ReadyForQuery: dropped when the next command's first
+  // message is taken, so the statement runs.
+  cancels.cancel(pid, secret);
+  auto out = feed(s, framer, parse_msg("SELECT id FROM many") + bind_msg({}) + execute_msg() + sync_msg());
+  CHECK(error_codes(out) == std::vector<std::string>{});
+  CHECK(count_ready(out) == 1);
+
+  // After Parse and Bind were taken (as while a statement compiles): kept
+  // for the Execute, which fails with 57014.
+  out = feed(s, framer, parse_msg("SELECT id FROM many") + bind_msg({}));
+  CHECK(error_codes(out) == std::vector<std::string>{});
+  cancels.cancel(pid, secret);
+  out = feed(s, framer, execute_msg() + sync_msg());
+  CHECK(error_codes(out) == std::vector<std::string>{"57014"});
+  CHECK(count_ready(out) == 1);
+
+  // The next command starts clean.
+  out = feed(s, framer, query_msg("SELECT id FROM many"));
+  CHECK(error_codes(out) == std::vector<std::string>{});
+  s.close();
+  db->close();
+}
+
+TEST_CASE("pg_session: a cancel-only session refuses a startup with 53300 and still takes a CancelRequest",
+          "[sql][server]") {
+  sql_test::TempDir dir{"pg_session_cancel_only"};
+  auto db = bytecask::sql::Database::open(dir.path());
+  counted_table(*db);
+  pg::CancelRegistry cancels;
+  pg::SessionConfig cfg{"testdb"};
+  cfg.cancels = &cancels;
+
+  pg::Framer framer;
+  pg::Session running{*db, cfg};
+  auto [pid, secret] = backend_key(feed(running, framer, startup_bytes("testdb")));
+  (void)feed(running, framer, parse_msg("SELECT id FROM many") + bind_msg({}));  // inside a command
+
+  {
+    pg::Framer f;
+    pg::Session refused{*db, cfg};
+    refused.admit_cancel_only();
+    auto out = feed(refused, f, startup_bytes("testdb"));
+    CHECK(error_codes(out) == std::vector<std::string>{"53300"});
+    CHECK(refused.ended());
+  }
+  {
+    pg::Framer f;
+    pg::Session canceller{*db, cfg};
+    canceller.admit_cancel_only();
+    auto out = feed(canceller, f, cancel_request_bytes(pid, secret));
+    CHECK(out.empty());  // no reply to a CancelRequest
+    CHECK(canceller.ended());
+  }
+  CHECK(error_codes(feed(running, framer, execute_msg() + sync_msg())) == std::vector<std::string>{"57014"});
+  running.close();
+  db->close();
+}
+
+TEST_CASE("pg_session: an idle timeout's timer that fires before its deadline ends nothing", "[sql][server]") {
+  sql_test::TempDir dir{"pg_session_expire"};
+  auto db = bytecask::sql::Database::open(dir.path());
+  pg::SessionConfig cfg{"testdb"};
+  cfg.idle_in_transaction_timeout = std::chrono::milliseconds{300};
+
+  std::mutex mu;
+  std::condition_variable cv;
+  std::uint64_t wakes = 0;
+  pg::Pool pool{*db, cfg, 2, [&] {
+                  {
+                    std::lock_guard<std::mutex> lock{mu};
+                    ++wakes;
+                  }
+                  cv.notify_all();
+                }};
+  db->execute("CREATE TABLE one (id BIGINT PRIMARY KEY)");
+  auto slot = pool.open();
+  pg::Framer framer;
+  std::string unsent;
+  auto send = [&](const std::string& bytes) {
+    std::vector<pg::Input> in;
+    framer.push(bytes, in);
+    pool.submit(slot, in);
+  };
+  // Waits until the session is idle again, taking its replies.
+  auto idle = [&] {
+    for (int i = 0; i < 500; ++i) {
+      auto st = pool.drain(slot, unsent);
+      if (st.idle || st.ended) return st;
+      std::unique_lock<std::mutex> lock{mu};
+      cv.wait_for(lock, std::chrono::milliseconds{10});
+    }
+    FAIL("the session did not go idle");
+    return pg::Pool::Status{};
+  };
+
+  send(startup_bytes("testdb"));
+  (void)idle();
+  send(query_msg("BEGIN"));
+  auto st = idle();
+  REQUIRE(st.idle_kind == pg::Timeout::IdleInTransaction);
+
+  // A timer for this kind, fired early (or armed for an earlier idle
+  // period): refused, and the session goes on.
+  CHECK_FALSE(pool.expire(slot, pg::Timeout::IdleInTransaction));
+  CHECK_FALSE(pool.drain(slot, unsent).ended);
+  unsent.clear();
+  send(query_msg("SELECT id FROM one"));
+  st = idle();
+  CHECK_FALSE(st.ended);
+  auto replies = parse_replies(unsent);
+  CHECK(error_codes(replies) == std::vector<std::string>{});
+  CHECK(count_ready(replies) == 1);
+
+  // Past the deadline it ends the session with 25P03.
+  std::this_thread::sleep_until(st.idle_at + std::chrono::milliseconds{5});
+  CHECK(pool.expire(slot, pg::Timeout::IdleInTransaction));
+  st = idle();
+  CHECK(st.ended);
+  CHECK(error_codes(parse_replies(unsent)) == std::vector<std::string>{"25P03"});
 
   pool.shutdown();
   db->close();

@@ -173,7 +173,12 @@ cancels nothing, and no `BackendKeyData` is sent. With sessions:
   budget's deadline (`bc_budget::cancel` beside `deadline_ns`), and fails
   with SQLSTATE 57014 (`query_canceled`), as in PostgreSQL;
 - a `CancelRequest` for a session that is not running a statement does
-  nothing, as in PostgreSQL.
+  nothing, as in PostgreSQL. The session is idle from `ReadyForQuery` until
+  it takes the next message: taking it clears the mark, so a cancel from
+  while it was idle is dropped. A cancel after that, even while `Parse` or
+  a `Query` compiles, cancels the statement the command runs;
+- a `CancelRequest` still gets through when the server is at
+  `--max-connections` (*Bounds*).
 
 **Timeouts**, with PostgreSQL's semantics and SQLSTATEs:
 
@@ -201,7 +206,11 @@ Each session has one libuv timer, restarted when its state changes (idle,
 idle in transaction, running). When it fires, the loop marks the session
 and, if the session is idle, schedules it onto a worker so its transaction
 is rolled back, the `FATAL` is sent, and the connection closes. No lock
-and no wait.
+and no wait. The timer only proposes: `Pool::expire` ends the session only
+if it is still idle on that timeout and its deadline has passed. A timer
+armed for an earlier idle period, or fired early on the loop's cached
+clock, is refused, and the loop re-arms from the session's current
+deadline.
 
 **Shutdown.** The loop stops accepting. Running messages finish, and their
 replies go out. Queued messages are answered with `FATAL 57P01`
@@ -214,7 +223,16 @@ one that takes no bytes for ten seconds is dropped. Then the server calls
 
 None of them waits. A bound past its limit refuses, with the SQLSTATE
 PostgreSQL uses.
-- **Sessions.** `--max-connections`, as today: `FATAL 53300` past it.
+- **Sessions.** `--max-connections`, as today: `FATAL 53300` past it. The
+  next 16 connections past it are still taken in, each only for a
+  `CancelRequest`, as PostgreSQL reads a startup packet before counting
+  the connection: a full server is when a cancel matters most. Their
+  startup packet is read; a cancel is acted on, an `SSLRequest` answered
+  `N`, and a startup refused with `FATAL 53300`. Past those too, a
+  connection gets `FATAL 53300` at once.
+- **File descriptors.** When `accept4` fails with `EMFILE` or `ENFILE`, the
+  listener stops accepting for 100 ms: the connection stays in the backlog,
+  and is taken once a descriptor is free.
 - **Workers.** A fixed pool (`--workers`, by default four times the cores,
   minimum 4; *Decisions*, 6).
 - **A session's input.** At most 64 MiB of unrun messages. Past it, the loop

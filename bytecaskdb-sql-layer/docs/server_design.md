@@ -192,7 +192,11 @@ its handoff with the loop, and each worker a queue with its own lock.
 A connection past `--max-connections` gets `FATAL 53300`
 (`too_many_connections`) and is closed, as PostgreSQL does. The default,
 100, is PostgreSQL's, and covers the gate's 48 virtual users and its
-monitor.
+monitor. The next 16 past the limit are taken in only for a `CancelRequest`
+(`session_design.md`, *Bounds*): their startup packet is read, and a
+startup is then refused with `53300`. Out of file descriptors (`EMFILE`,
+`ENFILE`), the listener pauses for 100 ms rather than retry the backlog in a
+loop.
 
 **I/O.** Non-blocking sockets on libuv with `TCP_NODELAY`. A worker appends
 reply bytes to the connection's output buffer at `ReadyForQuery`, at `Flush`,
@@ -232,7 +236,10 @@ cancellation and shutdown*). A `CancelRequest` naming a session's
 `BackendKeyData` key fails its running statement with `57014`
 (`canceling statement due to user request`); one naming a session that runs
 nothing, or a wrong key, does nothing. A cancel is checked where the runtime
-charges a statement's reads, every 64. The timeouts, in milliseconds, `0`
+charges a statement's reads, every 64. A session is idle from
+`ReadyForQuery` until it takes its next message, which clears any cancel
+sent meanwhile; one sent after, while the command compiles or runs, cancels
+it. The timeouts, in milliseconds, `0`
 turning one off:
 - `--statement-timeout-ms` (off): a statement past it fails with `57014`
   (`canceling statement due to statement timeout`), and the session goes on;

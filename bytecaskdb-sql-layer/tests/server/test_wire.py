@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import decimal
 import os
+import resource
 import shutil
 import socket
 import struct
@@ -281,9 +282,23 @@ def test_the_connection_past_the_limit_is_refused_53300():
     s = Server(directory, max_connections=1)
     try:
         first = connect(s)
+        # Past the limit the startup packet is still read, so that a cancel
+        # gets through, and a startup is refused.
         second = Client(s)
+        second.send(startup_packet(PROTOCOL_30, {"user": "wire", "database": "proof"}))
         kind, body = second.message()
         assert kind == b"E" and fields(body)["C"] == "53300"
+        assert second.closed()
+        # Past the 16 connections taken in for a cancel, one is refused at once.
+        waiting = [Client(s) for _ in range(16)]
+        for c in waiting:
+            c.send(startup_packet(80877103))  # SSLRequest
+            assert c.byte() == b"N"  # each is taken in: the server answered it
+        past = Client(s)
+        kind, body = past.message()
+        assert kind == b"E" and fields(body)["C"] == "53300"
+        for c in waiting:
+            c.close()
         first.close()
     finally:
         s.stop()
@@ -1002,6 +1017,60 @@ def test_a_cancel_request_fails_the_running_statement_with_57014_and_the_session
         c.send(query("ROLLBACK"))
         assert status(c.until_ready()) == "I"
     finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_a_cancel_request_is_taken_when_the_server_is_at_its_connection_limit():
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory, max_connections=1)
+    try:
+        c = Client(s)
+        key = backend_key(c.start())
+        slow_tables(c)
+        c.send(query(SLOW))
+        time.sleep(0.3)
+        cancel(s, key)
+        out = c.until_ready()
+        assert states(out) == ["57014"] and status(out) == "I"
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def cpu_seconds(pid: int) -> float:
+    """The process's user and system CPU time so far."""
+    with open(f"/proc/{pid}/stat") as f:
+        fields_ = f.read().rsplit(")", 1)[1].split()
+    return (int(fields_[11]) + int(fields_[12])) / os.sysconf("SC_CLK_TCK")
+
+
+@pytest.mark.skipif(not hasattr(resource, "prlimit"), reason="needs resource.prlimit (Linux)")
+def test_out_of_file_descriptors_the_listener_waits_instead_of_spinning():
+    """accept4 failing with EMFILE leaves the connection in the backlog: the
+    server stops accepting for a while rather than retry it in a loop, and
+    takes it once a descriptor is free."""
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory)
+    pid = s.proc.pid
+    old = resource.prlimit(pid, resource.RLIMIT_NOFILE)
+    try:
+        resource.prlimit(pid, resource.RLIMIT_NOFILE, (len(os.listdir(f"/proc/{pid}/fd")), old[1]))
+        waiting = Client(s)  # in the backlog: the server has no descriptor for it
+        waiting.sock.sendall(startup_packet(PROTOCOL_30, {"user": "wire", "database": "proof"}))
+        time.sleep(0.3)
+        before = cpu_seconds(pid)
+        time.sleep(1.0)
+        assert cpu_seconds(pid) - before < 0.3  # a spinning listener takes the whole second
+        resource.prlimit(pid, resource.RLIMIT_NOFILE, old)
+        assert status(waiting.until_ready()) == "I"
+        waiting.close()
+    finally:
+        resource.prlimit(pid, resource.RLIMIT_NOFILE, old)
         s.stop()
         shutil.rmtree(directory, ignore_errors=True)
 

@@ -334,15 +334,18 @@ public:
   CancelFlag() = default;
   CancelFlag(const CancelFlag&) = delete;
   CancelFlag& operator=(const CancelFlag&) = delete;
-  void cancel() noexcept { __atomic_store_n(&v_, std::uint8_t{1}, __ATOMIC_RELAXED); }
-  void reset() noexcept { __atomic_store_n(&v_, std::uint8_t{0}, __ATOMIC_RELAXED); }
-  [[nodiscard]] auto cancelled() const noexcept -> bool { return __atomic_load_n(&v_, __ATOMIC_RELAXED) != 0; }
+  void cancel() noexcept { byte().store(1, std::memory_order_relaxed); }
+  void reset() noexcept { byte().store(0, std::memory_order_relaxed); }
+  [[nodiscard]] auto cancelled() const noexcept -> bool { return byte().load(std::memory_order_relaxed) != 0; }
 
 private:
   friend class Database;
-  // A plain byte, so the C runtime can read it (bc_budget::cancel), always
-  // through atomic operations.
-  std::uint8_t v_{0};
+  // Every access from C++ goes through here, so none is a plain read.
+  [[nodiscard]] auto byte() const noexcept -> std::atomic_ref<std::uint8_t> { return std::atomic_ref<std::uint8_t>{v_}; }
+  // A plain byte, so the C runtime can read it (bc_budget::cancel) with an
+  // atomic load. Mutable because std::atomic_ref has no const form before
+  // C++26, and cancelled() only loads.
+  alignas(std::atomic_ref<std::uint8_t>::required_alignment) mutable std::uint8_t v_{0};
 };
 
 // What may end one statement early, per call. Either fails it with ExecError
