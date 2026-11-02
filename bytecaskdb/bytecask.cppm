@@ -615,8 +615,9 @@ public:
   // the plan lost to — what a retry has to be able to see. On success, the
   // latest entry its guards read; 0 for a plan without guards. For a key
   // found deleted or absent, which has no entry, the head's latest sequence.
-  // With defer_puts, point puts are not checked here: apply_puts_checked
-  // checks each in the descent that applies it.
+  // With defer_puts, set only for a plan of point puts alone, the plan's
+  // writes are not checked here: apply_puts_checked checks each in the
+  // descent that applies it.
   [[nodiscard]] auto validate_preconditions(const WritePlan &plan,
                                             std::uint64_t &rests_on,
                                             bool defer_puts = false) const

@@ -120,7 +120,9 @@ auto TransientEngineState::validate_preconditions(
   }
 
   // 3. Implicit W-W check on all write keys (only when snapshot present).
-  if (snap_state) {
+  // defer_puts is set only for a plan of puts alone, whose checks
+  // apply_puts_checked makes in the descents that apply them.
+  if (snap_state && !defer_puts) {
     // The key changed since the snapshot unless the head maps it to the
     // snapshot's record, or it is absent from both. The head is asked by
     // location first, which reads nothing; only a key that moved is read,
@@ -139,9 +141,6 @@ auto TransientEngineState::validate_preconditions(
       return true;
     };
     for (std::size_t i = 0; i < plan.writes_.size(); ++i) {
-      if (defer_puts &&
-          std::holds_alternative<WritePlan::PointPut>(plan.writes_[i]))
-        continue;
       bool has_conflict = false;
       std::visit(
           [&](const auto &op) -> void {
@@ -420,7 +419,8 @@ auto TransientEngineState::apply_puts_checked(
         throw std::logic_error{"apply_puts_checked: undo found a key moved "
                                "from where the plan put it"};
     }
-    for (auto i = first_io; i <= io_idx && i < offsets.size(); ++i)
+    // io_idx is the put that failed: its pending record was just noted.
+    for (auto i = first_io; i <= io_idx; ++i)
       pending_.erase(pending_slot(active_file_id_, offsets[i]));
     next_seq_ = first_seq;
     return false;
