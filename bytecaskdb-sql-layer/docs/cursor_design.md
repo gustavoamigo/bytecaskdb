@@ -546,9 +546,10 @@ rollback closed is forgotten when next named.
 |---|---|
 | `COMMIT`, `ROLLBACK` | Non-hold cursors are dropped first (they are data under replay; a resumable run is freed), then the snapshot is released. |
 | A statement or `FETCH` fails | The transaction aborts (`25P02` to follow); its cursors close at the abort, so the snapshot is released at once (`bc_txn_add`'s abort already does). |
-| Idle-in-transaction timeout (`25P03`) | Not part of this stack: it is in the separate session stack (#675, #644, #684, #688), and cursors neither build nor depend on it. When it ends a transaction, that is an end like any other and its cursors close with it. |
+| Idle-in-transaction timeout (`25P03`) | Ends the transaction like any other end, and its cursors close with it. |
 | Disconnect, `Terminate`, shutdown | Rolled back with the transaction; hold cursors closed by the session. A suspended run, in phase 10, is freed, not resumed. |
-| Statement timeout, `CancelRequest` | Apply to the `FETCH` running; the cursor is closed with the failed statement. A cancel between FETCHes is a no-op, as for any idle session. |
+| The memory cap (`max_memory_bytes`) | A cursor's copy of its transaction's writes counts from `DECLARE`, which is `53200` past the cap; a hold cursor's counts until it closes, past the commit (`plan_api_design.md`, *A cursor's copy is reserved too*). The snapshot's tree nodes and data files are not counted. |
+| Statement timeout, `CancelRequest` | Apply to the `FETCH` running, and to `UPDATE`/`DELETE ... WHERE CURRENT OF`: `Cursor::fetch`, `execute_window` and `execute_current_of` take `ExecutionOptions`, as `execute` does. The cursor is closed with the failed statement. A cancel between FETCHes is a no-op, as for any idle session. |
 | DDL on a table a cursor reads | In a block: DDL is `0A000` (`server_design.md`). In autocommit, DDL commits and a lazy cursor cannot exist outside a block. A hold cursor holds its snapshot and the catalog pinned at `DECLARE`, so a later DDL changes nothing for it. So no case arises, and the pinned catalog already keeps the layout stable. |
 | `DROP TABLE` by another session | The cursor's snapshot still reads the table's rows; the cursor is unaffected. |
 
@@ -815,7 +816,7 @@ These were checked against a PostgreSQL 16 server (the one at hand; PostgreSQL
 moving, which the extended protocol's `Describe` of any `FETCH` form uses;
 `fetch(0)` on the embedded API is the same (no rows, no movement).
 
-**Embedded API.** `Cursor::fetch(CursorMove)`; `Transaction::open_cursor(…,
+**Embedded API.** `Cursor::fetch(CursorMove, ExecutionOptions)`; `Transaction::open_cursor(…,
 Scrolling)`, `Scrolling::ForwardOnly` for `NO SCROLL`. The earlier
 `position()` after a drain was `rows`; it is now `rows + 1`.
 

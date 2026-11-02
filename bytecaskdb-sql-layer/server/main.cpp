@@ -10,7 +10,7 @@
 //                     [--io-backend pread|mmap|buffer_pool] [--buffer-pool-size BYTES] [--buffer-pool-direct-io on|off]
 //                     [--statement-memory-bytes 67108864] [--max-memory-bytes BYTES]
 //                     [--idle-in-transaction-timeout-ms 60000] [--statement-timeout-ms 0]
-//                     [--transaction-timeout-ms 0] [--idle-session-timeout-ms 0]
+//                     [--transaction-timeout-ms 0] [--idle-session-timeout-ms 0] [--startup-timeout-ms 60000]
 //
 // Serves one database directory under one name, by default the directory's
 // last component. Trust authentication only: anyone who reaches the port is
@@ -90,7 +90,7 @@ auto flags(int argc, char** argv) -> std::map<std::string, std::string> {
         k != "thread-affinity" && k != "sync" && k != "sync-interval-ms" && k != "io-backend" &&
         k != "buffer-pool-size" && k != "buffer-pool-direct-io" && k != "statement-memory-bytes" && k != "max-memory-bytes" &&
         k != "idle-in-transaction-timeout-ms" && k != "statement-timeout-ms" && k != "transaction-timeout-ms" &&
-        k != "idle-session-timeout-ms") {
+        k != "idle-session-timeout-ms" && k != "startup-timeout-ms") {
       throw std::invalid_argument("unknown flag --" + k);
     }
   }
@@ -490,6 +490,7 @@ void accept_on_shard(LoopShard* sh, int fd, std::size_t conn_seq) {
   c->worker_idle = true;
   c->reading = true;
   (void)uv_read_start(reinterpret_cast<uv_stream_t*>(&c->tcp), on_alloc, on_read);
+  pump(c);  // arms the startup timeout
 }
 
 void on_accept(uv_poll_t* handle, int status, int events);
@@ -658,7 +659,8 @@ int main(int argc, char** argv) {
     for (auto [flag, out] : {std::pair{"idle-in-transaction-timeout-ms", &cfg.idle_in_transaction_timeout},
                              std::pair{"statement-timeout-ms", &cfg.statement_timeout},
                              std::pair{"transaction-timeout-ms", &cfg.transaction_timeout},
-                             std::pair{"idle-session-timeout-ms", &cfg.idle_session_timeout}}) {
+                             std::pair{"idle-session-timeout-ms", &cfg.idle_session_timeout},
+                             std::pair{"startup-timeout-ms", &cfg.startup_timeout}}) {
       if (!f.contains(flag)) continue;
       std::uint32_t ms = 0;
       number(flag, f[flag], "a number of milliseconds", ms);

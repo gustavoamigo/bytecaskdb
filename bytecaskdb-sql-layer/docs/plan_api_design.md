@@ -351,13 +351,20 @@ statement returns its reservation when the context is reset. `bc_txn_add`
 moves to the transaction what of it covers the write set the transaction
 takes in, which the transaction returns when it is aborted or freed. Since
 the statement reserved at least what it held, taking it in does not fail on
-the cap. The transaction's count can grow by more than that reservation:
-it includes the overlays its cursors pinned (`bc_txn_overlay_pin`), which no
-statement reserved. `bc_txn_add` reserves the difference as any charge does,
-and past the cap fails with `BC_E_MEMORY` and aborts the transaction: the
-cap's count never passes the cap unchecked. A hold cursor's overlay and
-snapshot outlive the transaction, and with it its reservation: they are not
-counted against the cap.
+the cap. Should the count still grow by more than that reservation,
+`bc_txn_add` reserves the difference as any charge does, and past the cap
+fails with `BC_E_MEMORY` and aborts the transaction: the cap's count never
+passes the cap unchecked.
+
+**A cursor's copy is reserved too.** A cursor's pin (`bc_txn_overlay_pin`)
+holds back the overlay as it stood, which the transaction's next write
+copies; the transaction's bound counts it (`pinned_bytes`), and so does its
+reservation of the cap, taken at the pin with one atomic operation:
+`BC_E_MEMORY` there fails the `DECLARE` and aborts the transaction. A hold
+cursor outlives the transaction and its reservation, so `bc_txn_hold` moves
+its pin's share to the hold, which returns it when freed: the copy stays
+counted until the cursor closes, and is counted once. Not counted, here as
+for any transaction: the tree nodes and data files a snapshot keeps.
 
 **The API meters the work.** `bc_ctx_begin` sets a budget in record reads
 and cursor steps, a deadline and a cancel flag. Every read and every step

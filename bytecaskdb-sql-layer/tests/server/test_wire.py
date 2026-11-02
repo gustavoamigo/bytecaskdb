@@ -901,6 +901,7 @@ def test_statement_memory_bytes_is_every_statement_s_budget():
     (["--idle-in-transaction-timeout-ms", "-1"], "--idle-in-transaction-timeout-ms"),
     (["--transaction-timeout-ms", "1.5"], "--transaction-timeout-ms"),
     (["--idle-session-timeout-ms", ""], "--idle-session-timeout-ms"),
+    (["--startup-timeout-ms", "later"], "--startup-timeout-ms"),
     (["--max-memory-bytes", "0"], "--max-memory-bytes"),
     (["--max-memory-bytes", "half"], "--max-memory-bytes"),
 ])
@@ -1261,6 +1262,37 @@ def test_the_transaction_timeout_ends_a_busy_transaction():
         shutil.rmtree(directory, ignore_errors=True)
 
 
+def test_the_startup_timeout_closes_a_connection_that_never_finishes_its_startup():
+    """As PostgreSQL's authentication_timeout: counted from the connection,
+    closed with no reply, and its place under --max-connections freed."""
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory, max_connections=1, extra_args=["--startup-timeout-ms", "400"])
+    try:
+        # Taken before the connect: the server counts from its accept, which
+        # can come before Client() returns.
+        started = time.monotonic()
+        silent = Client(s)  # takes the one place, and sends nothing
+        assert silent.sock.recv(1) == b""  # closed, with no reply
+        assert 0.4 <= time.monotonic() - started < 10
+        # An SSLRequest answered, then nothing: the timeout still counts from the connection.
+        started = time.monotonic()
+        trickle = Client(s)
+        trickle.send(startup_packet(80877103))
+        assert trickle.byte() == b"N"
+        assert trickle.sock.recv(1) == b""
+        assert 0.4 <= time.monotonic() - started < 10
+        # The place is free again, and a session that started is not ended by it.
+        c = connect(s)
+        time.sleep(0.8)
+        c.send(query("BEGIN"))
+        assert status(c.until_ready()) == "T"
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 def test_the_idle_session_timeout_closes_an_idle_session_but_not_one_in_a_transaction():
     if not server_binary():
         pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
@@ -1377,6 +1409,44 @@ def test_cursor_errors_and_the_failed_block(server):
             assert states(c.until_ready()) == [state], sql
         c.send(query("ROLLBACK"))
         c.until_ready()
+
+
+def test_a_cancel_request_and_the_statement_timeout_stop_a_fetch():
+    """A FETCH runs the cursor's query: a cancel or the statement timeout stops
+    it with 57014, as any statement."""
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory, extra_args=["--statement-timeout-ms", "500"])
+    try:
+        c = Client(s)
+        key = backend_key(c.start())
+        slow_tables(c)
+        # Inside a block, cancelled: the block fails, as for any statement.
+        for sql in ("BEGIN", f"DECLARE c CURSOR FOR {SLOW}"):
+            c.send(query(sql))
+            assert states(c.until_ready()) == []
+        c.send(query("FETCH ALL FROM c"))
+        time.sleep(0.2)
+        cancel(s, key)
+        out = c.until_ready()
+        assert states(out) == ["57014"] and status(out) == "E"
+        assert [fields(b)["M"] for k, b in out if k == b"E"] == ["canceling statement due to user request"]
+        c.send(query("ROLLBACK"))
+        assert status(c.until_ready()) == "I"
+        # A hold cursor outside a block, timed out: the session goes on.
+        c.send(query(f"DECLARE h CURSOR WITH HOLD FOR {SLOW}"))
+        assert states(c.until_ready()) == []
+        started = time.monotonic()
+        c.send(query("FETCH ALL FROM h"))
+        out = c.until_ready()
+        assert states(out) == ["57014"] and status(out) == "I"
+        assert [fields(b)["M"] for k, b in out if k == b"E"] == ["canceling statement due to statement timeout"]
+        assert 0.5 <= time.monotonic() - started < 10
+        assert data(run(c, "SELECT k FROM a WHERE k = $1", ["7"])) == [["7"]]
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 def test_every_fetch_direction_and_its_command_tag(server):

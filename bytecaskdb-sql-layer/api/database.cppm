@@ -570,10 +570,12 @@ public:
   // cursor, std::logic_error on a closed cursor, TransactionAborted once its
   // transaction aborted, DbClosed after the database closed. A run that fails
   // (an ExecError, a budget) aborts the transaction, and so closes its cursors.
-  auto fetch(CursorMove move) -> Rows;
+  // `opts` bounds each run as execute's do (BC_E_BUDGET, 57014): a fetch so
+  // stopped fails like any other run.
+  auto fetch(CursorMove move, const ExecutionOptions& opts = {}) -> Rows;
   // The next `k` rows, fewer at the end: fetch of a forward move. None for
   // k 0, without moving or running.
-  auto fetch(std::uint64_t k) -> Rows;
+  auto fetch(std::uint64_t k, const ExecutionOptions& opts = {}) -> Rows;
   // The columns and types of the rows, with none; runs nothing, moves nothing.
   [[nodiscard]] auto describe() const -> Rows;
   // 0 before the first row, the row's number on a row, rows + 1 after the last.
@@ -624,14 +626,16 @@ public:
   // earlier transaction; std::invalid_argument for a statement that is not a
   // WHERE CURRENT OF. The transaction then aborts, as for any failed
   // statement. Otherwise as execute.
-  auto execute_current_of(const Statement& stmt, const std::vector<Value>& params, const Cursor& cursor) -> Rows;
+  auto execute_current_of(const Statement& stmt, const std::vector<Value>& params, const Cursor& cursor,
+                          const ExecutionOptions& opts = {}) -> Rows;
   // Runs a statement that returns rows over the transaction's snapshot and
   // overlay, keeping the window's rows: the replay runner a cursor is built
   // on. The same statement, parameters and view give the same rows on every
   // run, so a window of the rows is the same slice of the whole result. A
   // statement that returns no rows throws std::invalid_argument, the
   // transaction unchanged. Otherwise as execute.
-  auto execute_window(const Statement& stmt, const std::vector<Value>& params, RowWindow window) -> WindowRows;
+  auto execute_window(const Statement& stmt, const std::vector<Value>& params, RowWindow window,
+                      const ExecutionOptions& opts = {}) -> WindowRows;
   // Opens a forward-only cursor over a SELECT (docs/cursor_design.md). It
   // pins what the statement reads or is given: the snapshot, the
   // transaction's writes so far, the parameters, the time and the plan. It
@@ -651,10 +655,13 @@ public:
   // from that view. It pins the snapshot, and with it every tree node and
   // data file the snapshot reaches, until close(), the database's close or a
   // rollback or abort of this transaction (which drop it, as PostgreSQL drops
-  // a cursor declared in a transaction that rolls back). No timer or cap
-  // limits how long that is. The overlay copy is charged to this
-  // transaction's bound while it lasts. A hold cursor takes no FOR UPDATE
-  // guard: a statement with one is the caller's to refuse.
+  // a cursor declared in a transaction that rolls back). No timer limits how
+  // long that is. The overlay copy is charged to this transaction's bound
+  // while it lasts, and to DatabaseOptions::max_memory_bytes from this call
+  // to close(), past the commit: this call throws ExecError BC_E_MEMORY
+  // (53200) when the cap has no room for it, and the transaction aborts. A
+  // hold cursor takes no FOR UPDATE guard: a statement with one is the
+  // caller's to refuse.
   auto open_cursor(const Statement& stmt, const std::vector<Value>& params, Holdability hold = Holdability::Plain,
                    Scrolling scrolling = Scrolling::Any) -> Cursor;
   // Writes every statement's writes as one batch: Committed. After a failed
@@ -772,6 +779,9 @@ public:
   // Test only: how many times a cached plan was checked (bc_ctx_check)
   // against a catalog version it was not compiled or checked against.
   [[nodiscard]] auto plan_checks_for_testing() const -> std::uint64_t { return plan_checks_.load(); }
+  // Test only: what the statements, transactions and hold cursors in
+  // progress have reserved of max_memory_bytes (0 without a cap).
+  [[nodiscard]] auto memory_used_for_testing() const -> std::uint64_t { return memory_.used.load(); }
   // Test only (sql_layer_testing): every row of a table, in primary-key
   // order, read from the engine and decoded through the catalog: every
   // column, in the table's order. For the proof tests, which compare a table
@@ -863,9 +873,10 @@ private:
   [[nodiscard]] auto budget_for(const ExecutionOptions& opts) const noexcept -> bc_budget;
   // A window of a cursor's rows, run on its pinned plan, parameters and
   // overlay over the transaction's snapshot.
-  auto run_pinned(bc_ctx* cx, bc_txn* txn, const CursorState& cursor, RowWindow range, WindowRows& out) -> Rows;
+  auto run_pinned(bc_ctx* cx, bc_txn* txn, const CursorState& cursor, RowWindow range, WindowRows& out,
+                  const ExecutionOptions& opts) -> Rows;
   // The same on a hold cursor's own view, in a context of the pool.
-  auto run_held(const CursorState& cursor, RowWindow range, WindowRows& out) -> Rows;
+  auto run_held(const CursorState& cursor, RowWindow range, WindowRows& out, const ExecutionOptions& opts) -> Rows;
   [[nodiscard]] auto clock_now() const -> std::int64_t { return clock_(); }
   // Throws ParamError for parameters the plan does not take, and ExecError
   // BC_C_RANGE for a value outside its parameter's SQL type.
@@ -1663,10 +1674,11 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
   return results(cx, *c, Rows{});
 }
 
-auto Database::run_pinned(bc_ctx* cx, bc_txn* txn, const CursorState& cursor, RowWindow range, WindowRows& out) -> Rows {
+auto Database::run_pinned(bc_ctx* cx, bc_txn* txn, const CursorState& cursor, RowWindow range, WindowRows& out,
+                          const ExecutionOptions& opts) -> Rows {
   const auto& c = *cursor.compiled;
   bc_params bp;
-  bc_ctx_begin_txn(cx, txn, &bp, budget_);
+  bc_ctx_begin_txn(cx, txn, &bp, budget_for(opts));
   bc_ctx_use_overlay(cx, cursor.overlay);
   bc_ctx_window(cx, range.skip, range.limit);
   bp.values = cursor.values;
@@ -1679,12 +1691,13 @@ auto Database::run_pinned(bc_ctx* cx, bc_txn* txn, const CursorState& cursor, Ro
   return results(cx, c, Rows{});
 }
 
-auto Database::run_held(const CursorState& cursor, RowWindow range, WindowRows& out) -> Rows {
+auto Database::run_held(const CursorState& cursor, RowWindow range, WindowRows& out, const ExecutionOptions& opts)
+    -> Rows {
   const auto& c = *cursor.compiled;
   auto* cx = acquire_context();
   try {
     bc_params bp;
-    bc_ctx_begin_hold(cx, cursor.hold, &bp, budget_);
+    bc_ctx_begin_hold(cx, cursor.hold, &bp, budget_for(opts));
     bc_ctx_window(cx, range.skip, range.limit);
     bp.values = cursor.values;
     bc_ctx_run(cx, c.code->fn(), &c.ref);
@@ -1890,7 +1903,8 @@ auto Transaction::execute(const Statement& stmt, const std::vector<Value>& param
   return run_locked(stmt, params, opts);
 }
 
-auto Transaction::execute_current_of(const Statement& stmt, const std::vector<Value>& params, const Cursor& cursor) -> Rows {
+auto Transaction::execute_current_of(const Statement& stmt, const std::vector<Value>& params, const Cursor& cursor,
+                                     const ExecutionOptions& opts) -> Rows {
   if (!h_) throw std::logic_error("the transaction has ended");
   std::shared_lock<std::shared_mutex> lock{life_->mu};
   check_usable();
@@ -1899,11 +1913,11 @@ auto Transaction::execute_current_of(const Statement& stmt, const std::vector<Va
   if (!cursor.s_) throw std::logic_error("the cursor was moved from");
   // Another transaction's cursor cannot name a row of this one.
   if (cursor.s_->h != nullptr && cursor.s_->h != h_.get()) throw std::logic_error("the cursor belongs to another transaction");
-  return run_locked(stmt, params, {}, nullptr, {}, cursor.s_.get());
+  return run_locked(stmt, params, opts, nullptr, {}, cursor.s_.get());
 }
 
-auto Transaction::execute_window(const Statement& stmt, const std::vector<Value>& params, RowWindow window)
-    -> WindowRows {
+auto Transaction::execute_window(const Statement& stmt, const std::vector<Value>& params, RowWindow window,
+                                 const ExecutionOptions& opts) -> WindowRows {
   if (!h_) throw std::logic_error("the transaction has ended");
   std::shared_lock<std::shared_mutex> lock{life_->mu};
   check_usable();
@@ -1911,7 +1925,7 @@ auto Transaction::execute_window(const Statement& stmt, const std::vector<Value>
   auto c = stmt.compiled();
   if (!c || !c->plan->returns_rows) throw std::invalid_argument("execute_window needs a statement that returns rows");
   WindowRows out;
-  out.rows = run_locked(stmt, params, {}, &out, window);
+  out.rows = run_locked(stmt, params, opts, &out, window);
   return out;
 }
 
@@ -2109,9 +2123,10 @@ auto take_keys(Rows& rows, std::size_t key_columns) -> std::optional<std::vector
 }
 }  // namespace
 
-auto Cursor::fetch(std::uint64_t k) -> Rows {
+auto Cursor::fetch(std::uint64_t k, const ExecutionOptions& opts) -> Rows {
   if (k == 0) return describe();
-  return fetch(CursorMove{CursorMove::Kind::Forward, static_cast<std::int64_t>(std::min<std::uint64_t>(k, CursorMove::kAll))});
+  return fetch(CursorMove{CursorMove::Kind::Forward, static_cast<std::int64_t>(std::min<std::uint64_t>(k, CursorMove::kAll))},
+               opts);
 }
 
 namespace {
@@ -2135,7 +2150,7 @@ auto Cursor::describe() const -> Rows {
   return none;
 }
 
-auto Cursor::fetch(CursorMove move) -> Rows {
+auto Cursor::fetch(CursorMove move, const ExecutionOptions& opts) -> Rows {
   if (!s_) throw std::logic_error("the cursor was moved from");
   std::shared_lock<std::shared_mutex> lock{s_->life->mu};
   require_live(*s_);
@@ -2146,7 +2161,7 @@ auto Cursor::fetch(CursorMove move) -> Rows {
   // transaction is read, so it works before and after the transaction ends.
   auto run = [&](RowWindow w) {
     WindowRows out;
-    out.rows = st.holdable() ? st.db->run_held(st, w, out) : st.db->run_pinned(h->cx, h->txn, st, w, out);
+    out.rows = st.holdable() ? st.db->run_held(st, w, out, opts) : st.db->run_pinned(h->cx, h->txn, st, w, out, opts);
     return out;
   };
   std::optional<std::vector<Value>> new_key;

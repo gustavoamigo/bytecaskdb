@@ -1573,3 +1573,70 @@ TEST_CASE("embedded API: a statement that would take what every statement and tr
   r.rollback();
   CHECK(failure([&] { select(40'000); }).first == "00000");
 }
+
+TEST_CASE("embedded API: a cursor's copy of its transaction's writes counts against max_memory_bytes, and a hold "
+          "cursor's after the commit, until it closes",
+          "[sql][api][txn][memory][cursor]") {
+  sql_test::TempDir dir{"api_cap_cursor"};
+  {
+    auto db = Database::open(dir.path());
+    seed_wide(*db, 40'000);
+  }
+  // 3,500 rows updated in statements of 100, so that no statement holds
+  // much beside what the transaction has taken in.
+  auto update = [](Transaction& t) {
+    for (std::int64_t lo = 0; lo < 3'500; lo += 100) {
+      (void)t.execute("UPDATE wide SET n = n + 1 WHERE id >= $1 AND id < $2", {lo, lo + 100});
+    }
+  };
+  constexpr auto kScan = "SELECT id FROM wide WHERE id < $1";
+  std::uint64_t writes = 0;  // what the transaction reserves for its writes
+  std::uint64_t copy = 0;    // what a cursor's pin reserves for its copy
+  {
+    // A cap far above it all, to read what each holds.
+    auto db = Database::open(dir.path(), {.max_memory_bytes = 1ull << 30});
+    const auto& scan = db->prepare(kScan);
+    auto t = db->begin();
+    update(t);
+    writes = db->memory_used_for_testing();
+    REQUIRE(writes > 0);
+    auto c = t.open_cursor(scan, {std::int64_t{10}}, Holdability::Hold);
+    copy = db->memory_used_for_testing() - writes;  // reserved at the DECLARE, with no statement after it
+    REQUIRE(copy > 0);
+    CHECK(t.commit() == CommitOutcome::Committed);
+    // The transaction returned its writes; the hold cursor kept its copy.
+    CHECK(db->memory_used_for_testing() == copy);
+    CHECK(c.fetch(100).rows.size() == 10);  // a fetch returns what it reserved
+    CHECK(db->memory_used_for_testing() == copy);
+    c.close();
+    CHECK(db->memory_used_for_testing() == 0);
+
+    // A plain cursor's copy goes with its transaction.
+    auto u = db->begin();
+    update(u);
+    auto p = u.open_cursor(scan, {std::int64_t{10}});
+    CHECK(db->memory_used_for_testing() > writes);
+    u.rollback();
+    CHECK(db->memory_used_for_testing() == 0);
+    db->close();
+  }
+  INFO("writes " << writes << " bytes, the cursor's copy " << copy << " bytes");
+  // A cap one byte short of both: the writes fit, the DECLARE does not, and
+  // the transaction aborts.
+  auto db = Database::open(dir.path(), {.max_memory_bytes = writes + copy - 1});
+  const auto& scan = db->prepare(kScan);
+  auto t = db->begin();
+  update(t);
+  auto state = [](auto&& run) -> std::string {
+    try {
+      run();
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "00000";
+  };
+  CHECK(state([&] { (void)t.open_cursor(scan, {std::int64_t{10}}, Holdability::Hold); }) == "53200");
+  CHECK(t.is_aborted());
+  CHECK(t.commit() == CommitOutcome::RolledBack);
+  CHECK(db->memory_used_for_testing() == 0);
+}

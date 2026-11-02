@@ -1183,3 +1183,62 @@ TEST_CASE("where current of: an allocation failure is an error and nothing else"
   }
   CHECK(failed > 0);
 }
+
+TEST_CASE("cursor: a fetch and a window take ExecutionOptions: a set flag or a passed deadline is 57014",
+          "[sql][api][txn][cursor]") {
+  sql_test::TempDir dir{"api_cursor_options"};
+  auto db = populated(dir);
+  for (std::int64_t id = 1000; id < 1500; ++id) {
+    db->execute("INSERT INTO t VALUES ($1, $2, $3)", {id, sql_test::bytes("m"), std::int64_t{1}});
+  }
+  const auto& scan = db->prepare("SELECT id FROM t ORDER BY id");
+  auto state = [](auto&& run) -> std::string {
+    try {
+      run();
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ok";
+  };
+  CancelFlag flag;
+  flag.cancel();
+  const ExecutionOptions cancelled{.cancel = &flag};
+  const ExecutionOptions late{.deadline = std::chrono::steady_clock::now() - std::chrono::seconds{1}};
+
+  SECTION("a fetch on a cursor of the transaction: 57014 aborts the transaction, and the cursor with it") {
+    auto txn = db->begin();
+    auto c = txn.open_cursor(scan, {});
+    CHECK(state([&] { (void)c.fetch(1000, cancelled); }) == "57014");
+    CHECK(txn.is_aborted());
+    CHECK_FALSE(c.is_open());
+  }
+  SECTION("a fetch on a hold cursor after its commit: 57014 closes that cursor") {
+    auto txn = db->begin();
+    auto c = txn.open_cursor(scan, {}, Holdability::Hold);
+    CHECK(txn.commit() == CommitOutcome::Committed);
+    CHECK(state([&] { (void)c.fetch(1000, late); }) == "57014");
+    CHECK_FALSE(c.is_open());
+  }
+  SECTION("without options, or with the flag cleared, a fetch runs to its end") {
+    auto txn = db->begin();
+    auto c = txn.open_cursor(scan, {});
+    flag.reset();
+    CHECK(c.fetch(1000, cancelled).rows.size() == 525);
+    txn.rollback();
+  }
+  SECTION("execute_window") {
+    auto txn = db->begin();
+    CHECK(state([&] { (void)txn.execute_window(scan, {}, RowWindow{0, 1000}, cancelled); }) == "57014");
+    CHECK(txn.is_aborted());
+  }
+  // execute_current_of takes them too, but its one-row statement never
+  // reaches the 64 reads a check is made at, so no test here can see it stop.
+  SECTION("execute_current_of with a set flag: one row runs under the 64 reads a check needs") {
+    auto txn = db->begin();
+    auto c = txn.open_cursor(scan, {});
+    (void)c.fetch(1);
+    const auto& set = db->prepare("UPDATE t SET qty = $1 WHERE CURRENT OF c");
+    CHECK(txn.execute_current_of(set, {std::int64_t{7}}, c, cancelled).affected == 1);
+    txn.rollback();
+  }
+}
