@@ -65,6 +65,10 @@ package("tinycc")
 package_end()
 add_requires("tinycc 2026.09.26", {configs = {selinux = selinux_enabled()}})
 
+-- libuv: non-blocking event loop for sql_layer_server (docs/session_design.md).
+-- MIT-licensed C; linked only into the server binary.
+add_requires("libuv")
+
 -- C++23 modules, as the engine (the root sets the modules policy for every
 -- target): one interface unit per module (bytecask.sql.<name>), holding its
 -- declarations and definitions, public so sql_layer_tests imports them. The
@@ -126,7 +130,7 @@ target("sql_layer_tests")
     -- The tests, and the fixtures they share as modules (bytecask.sql.tests.*).
     add_files("tests/*.cpp", "tests/*.cppm")
     -- The TPROC-C harness's module, for its smoke test.
-    add_files("harness/tprocc.cppm", "server/pg_text.cppm")
+    add_files("harness/tprocc.cppm", "server/pg_text.cppm", "server/pg_wire.cppm", "server/pg_session.cppm")
     -- The engine's counted allocation-failure seam (tests/alloc_faults.h):
     -- it replaces the global operator new in this binary.
     add_files("../tests/alloc_faults.cpp", {defines = "BYTECASK_TESTING"})
@@ -176,6 +180,7 @@ target("sql_layer_server")
     add_deps("sql_layer")
     add_rules("bytecask.native_flags")
     add_files("server/*.cpp", "server/*.cppm")
+    add_packages("libuv")
 
 -- The Python module the proof tests drive (tests/proof/, #515): open,
 -- execute, close, the catalog, and a table's rows. Not built by default.

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// pg_wire.cppm — PostgreSQL's wire protocol, version 3.0, as bytes: reading
-// the fields of a message's body, and building a message to send. No I/O and
-// no policy: pg_session.cppm reads and writes the socket and decides what
-// each message means (docs/server_design.md).
+// pg_wire.cppm — PostgreSQL's wire protocol, version 3.0, as bytes: framing
+// complete messages from a stream, reading the fields of a message's body,
+// and building a message to send. No I/O and no policy
+// (docs/server_design.md, docs/session_design.md).
 
 module;
 #include <cstddef>
@@ -13,6 +13,8 @@ module;
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 export module bytecask.sql.pg_wire;
 
@@ -71,15 +73,57 @@ public:
   [[nodiscard]] auto data() const noexcept -> std::string_view { return buf_; }
   [[nodiscard]] auto size() const noexcept -> std::size_t { return buf_.size(); }
   void clear() noexcept { buf_.clear(); }
+  [[nodiscard]] auto take() noexcept -> std::string {
+    std::string out = std::move(buf_);
+    buf_.clear();
+    return out;
+  }
 
 private:
   std::string buf_;
   std::size_t start_{0};  // where the open message's length goes
 };
 
+// One complete unit cut from a connection's byte stream, or EndOfStream when
+// the read side closes.
+struct Input {
+  enum class Kind {
+    Startup,           // startup packet body (after its 4-byte length)
+    Message,           // regular frontend message (type + body)
+    BadStartupLength,  // startup packet length < 8 or > 10'000
+    BadMessageLength,  // message length < 4 or > kMaxMessage
+    EndOfStream,       // client EOF
+  } kind{Kind::Message};
+  char type{'\0'};
+  std::string body;
+};
+
+// Cuts complete startup packets and frontend messages from a byte stream.
+// Owned by the connection on the I/O loop: no I/O and no lock.
+class Framer {
+public:
+  void push(std::string_view bytes, std::vector<Input>& out);
+
+private:
+  std::string in_;
+  std::size_t pos_{0};
+  bool startup_{true};
+  bool ended_{false};
+};
+
 }  // namespace bytecask::sql::pg
 
 namespace bytecask::sql::pg {
+
+namespace {
+
+[[nodiscard]] auto read_u32(std::string_view s) noexcept -> std::uint32_t {
+  std::uint32_t v = 0;
+  for (std::size_t i = 0; i < 4; ++i) v = (v << 8) | static_cast<unsigned char>(s[i]);
+  return v;
+}
+
+}  // namespace
 
 ProtocolError::~ProtocolError() = default;
 
@@ -103,8 +147,7 @@ auto Body::i16() -> std::int16_t {
 
 auto Body::i32() -> std::int32_t {
   need(4);
-  std::uint32_t v = 0;
-  for (std::size_t i = 0; i < 4; ++i) v = (v << 8) | static_cast<unsigned char>(s_[i]);
+  auto v = read_u32(s_);
   s_.remove_prefix(4);
   return static_cast<std::int32_t>(v);
 }
@@ -151,6 +194,54 @@ void Out::bytes(std::string_view s) { buf_.append(s); }
 void Out::end() {
   auto len = static_cast<std::uint32_t>(buf_.size() - start_);
   for (std::size_t i = 0; i < 4; ++i) buf_[start_ + i] = static_cast<char>((len >> (24 - 8 * i)) & 0xFF);
+}
+
+void Framer::push(std::string_view bytes, std::vector<Input>& out) {
+  if (ended_ || bytes.empty()) return;
+  in_.append(bytes);
+  for (;;) {
+    auto avail = in_.size() - pos_;
+    if (startup_) {
+      if (avail < 4) break;
+      auto len = read_u32(std::string_view{in_}.substr(pos_, 4));
+      if (len < 8 || len > 10'000) {
+        out.push_back({Input::Kind::BadStartupLength, '\0', {}});
+        ended_ = true;
+        in_.clear();
+        pos_ = 0;
+        return;
+      }
+      if (avail < len) break;
+      std::string body{in_, pos_ + 4, len - 4};
+      pos_ += len;
+      auto code = static_cast<std::int32_t>(read_u32(body));
+      if (code != kSslRequest && code != kGssEncRequest) startup_ = false;
+      out.push_back({Input::Kind::Startup, '\0', std::move(body)});
+    } else {
+      if (avail < 5) break;
+      auto type = in_[pos_];
+      auto len = read_u32(std::string_view{in_}.substr(pos_ + 1, 4));
+      if (len < 4 || len > kMaxMessage) {
+        out.push_back({Input::Kind::BadMessageLength, '\0', {}});
+        ended_ = true;
+        in_.clear();
+        pos_ = 0;
+        return;
+      }
+      auto total = 1u + static_cast<std::size_t>(len);
+      if (avail < total) break;
+      std::string body{in_, pos_ + 5, static_cast<std::size_t>(len - 4)};
+      pos_ += total;
+      out.push_back({Input::Kind::Message, type, std::move(body)});
+    }
+  }
+  if (pos_ == in_.size()) {
+    in_.clear();
+    pos_ = 0;
+  } else if (pos_ > 0) {
+    in_.erase(0, pos_);
+    pos_ = 0;
+  }
 }
 
 }  // namespace bytecask::sql::pg
