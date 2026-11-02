@@ -365,6 +365,12 @@ public:
   Session& operator=(const Session&) = delete;
   ~Session() { close(); }
 
+  // A connection past --max-connections, taken in so that a CancelRequest
+  // on it still cancels: its startup packet is read, and anything but a
+  // cancel, SSLRequest or GSSENCRequest is refused with FATAL 53300.
+  // Called before the session's first step.
+  void admit_cancel_only() noexcept { cancel_only_ = true; }
+
   void push(Input in) {
     if (ended_) return;
     waiting_for_lookahead_ = false;
@@ -421,6 +427,11 @@ public:
           break;
       }
 
+      // A command starts with the first message taken after ReadyForQuery.
+      // A cancel from before it, while the session was idle, is dropped; one
+      // from after it, even while Parse or a Query compiles, cancels the
+      // statement the command runs.
+      if (std::exchange(after_ready_, false)) cancel_.reset();
       if (in.type == 'X') {
         close();
         return;
@@ -599,12 +610,11 @@ private:
     }
   }
 
-  // The options a statement runs with: the session's cancel flag, cleared
-  // first, so a CancelRequest that arrived while it was idle cancels
-  // nothing; and the earlier of the statement's and its transaction's
-  // deadlines. A statement outside a block is its own transaction.
+  // The options a statement runs with: the session's cancel flag (cleared
+  // when its command's first message was taken, step()), and the earlier of
+  // the statement's and its transaction's deadlines. A statement outside a
+  // block is its own transaction.
   auto run_options() -> ExecutionOptions {
-    cancel_.reset();
     auto now = std::chrono::steady_clock::now();
     ExecutionOptions opts{.deadline = {}, .cancel = &cancel_};
     txn_deadline_ = {};
@@ -626,6 +636,7 @@ private:
     out_.begin('Z');
     out_.raw(status());
     out_.end();
+    after_ready_ = true;
   }
 
 
@@ -702,6 +713,10 @@ private:
       if ((code >> 16) != 3) {
         fatal("0A000", "unsupported frontend protocol " + std::to_string(code >> 16) + "." +
                            std::to_string(code & 0xFFFF) + ": server supports 3.0");
+        return false;
+      }
+      if (cancel_only_) {
+        fatal("53300", "sorry, too many clients already");
         return false;
       }
       return parameters(body, code & 0xFFFF);
@@ -1189,6 +1204,8 @@ private:
   bool waiting_for_lookahead_{false};
   bool ended_{false};  // the stream ended, or a FATAL was sent: nothing more is read
   bool fatal_sent_{false};
+  bool after_ready_{false};   // ReadyForQuery sent, and no message taken since: the session is idle
+  bool cancel_only_{false};   // admit_cancel_only()
   CancelFlag cancel_;                                     // set by a CancelRequest naming key_pid_
   std::int32_t key_pid_{0};                               // in cfg_.cancels while nonzero
   std::chrono::steady_clock::time_point txn_started_{};  // of the open block, explicit or implicit
@@ -1287,9 +1304,14 @@ public:
   Pool& operator=(const Pool&) = delete;
   ~Pool() { shutdown(); }
 
+  // `cancel_only`: Session::admit_cancel_only, for a connection past
+  // --max-connections.
   [[nodiscard]] auto open(int fd = -1, void* tag = nullptr, std::size_t preferred_worker = kNoPreference,
-                          std::function<void(void*)> wake_cb = {}) -> std::shared_ptr<Slot> {
-    return std::make_shared<Slot>(db_, cfg_, *this, fd, tag, preferred_worker, std::move(wake_cb));
+                          std::function<void(void*)> wake_cb = {}, bool cancel_only = false)
+      -> std::shared_ptr<Slot> {
+    auto slot = std::make_shared<Slot>(db_, cfg_, *this, fd, tag, preferred_worker, std::move(wake_cb));
+    if (cancel_only) slot->session.admit_cancel_only();  // no worker has seen the slot yet
+    return slot;
   }
 
   void detach(const std::shared_ptr<Slot>& slot) {
@@ -1310,10 +1332,7 @@ public:
       std::lock_guard<std::mutex> lock{slot->mu};
       if (slot->dropped || slot->session_ended) return;
       for (auto& in : inputs) slot->inbox.push_back(std::move(in));
-      if (slot->state == Slot::State::Idle && !slot->output_blocked) {
-        slot->state = Slot::State::Queued;
-        need_schedule = true;
-      }
+      need_schedule = schedule_locked(*slot);
     }
     if (need_schedule) enqueue_slot(slot);
   }
@@ -1329,10 +1348,7 @@ public:
       std::lock_guard<std::mutex> lock{slot->mu};
       if (slot->dropped || slot->session_ended) return;
       slot->raw_in.append(bytes);
-      if (slot->state == Slot::State::Idle && !slot->output_blocked) {
-        slot->state = Slot::State::Queued;
-        need_schedule = true;
-      }
+      need_schedule = schedule_locked(*slot);
     }
     if (need_schedule) enqueue_slot(slot);
   }
@@ -1356,17 +1372,19 @@ public:
   }
 
   // The loop's timer for `kind` fired: ends the session on it, on a worker,
-  // if it is still idle on that same timeout. False, doing nothing, if the
-  // session ran or received bytes meanwhile; its next idle turn sets a new
-  // deadline.
+  // if it is still idle on that same timeout and its deadline has passed.
+  // False, doing nothing, if the session ran or received bytes meanwhile, or
+  // the timer fired before the deadline: one armed for an earlier idle
+  // period, or early on the loop's cached clock. The loop then re-arms from
+  // drain().
   auto expire(const std::shared_ptr<Slot>& slot, Timeout kind) -> bool {
     {
       std::lock_guard<std::mutex> lock{slot->mu};
-      if (kind == Timeout::None || slot->dropped || slot->session_ended || slot->stopping || slot->output_blocked) return false;
-      if (slot->state != Slot::State::Idle || !slot->raw_in.empty() || !slot->inbox.empty()) return false;
-      if (slot->idle_kind != kind) return false;
+      if (kind == Timeout::None || slot->dropped || slot->session_ended || slot->stopping) return false;
+      if (!slot->raw_in.empty() || !slot->inbox.empty()) return false;
+      if (slot->idle_kind != kind || std::chrono::steady_clock::now() < slot->idle_at) return false;
+      if (!schedule_locked(*slot)) return false;
       slot->expired = kind;
-      slot->state = Slot::State::Queued;
     }
     enqueue_slot(slot);
     return true;
@@ -1414,10 +1432,7 @@ public:
       slot->loop_unsent = out.size() + in_flight;
       if (slot->output_blocked && slot->loop_unsent <= cfg_.max_unsent_bytes) {
         slot->output_blocked = false;
-        if (!slot->dropped && !slot->session_ended && slot->state == Slot::State::Idle) {
-          slot->state = Slot::State::Queued;
-          resume = true;
-        }
+        resume = !slot->dropped && !slot->session_ended && schedule_locked(*slot);
       }
       st = {slot->session_ended, slot->state == Slot::State::Idle && !slot->output_blocked, slot->turns,
             slot->worker_migrations, slot->idle_at, slot->idle_kind};
@@ -1464,6 +1479,34 @@ private:
   static void poke(WorkerQueue& w) noexcept {
     std::uint64_t one = 1;
     (void)!::write(w.wake_fd, &one, sizeof one);
+  }
+
+  // The one rule for queueing a session the loop hands work: idle, and not
+  // held back on its output. Caller holds slot.mu; true when it must call
+  // enqueue_slot. stop() and drop() queue a held-back session too: ending
+  // it sends nothing more.
+  static auto schedule_locked(Slot& slot) noexcept -> bool {
+    if (slot.state != Slot::State::Idle || slot.output_blocked) return false;
+    slot.state = Slot::State::Queued;
+    return true;
+  }
+
+  // Moves what the loop handed over into the session: its bytes, framed
+  // with slot.mu released, then its Inputs, in the order the loop read
+  // them. Caller holds slot.mu through `lock`.
+  void take_input(Slot& slot, std::unique_lock<std::mutex>& lock, std::string& raw, std::vector<Input>& scratch) {
+    if (!slot.raw_in.empty()) {
+      raw.swap(slot.raw_in);
+      slot.raw_in.clear();
+      lock.unlock();
+      feed_raw(slot, raw, scratch);
+      raw.clear();
+      lock.lock();
+    }
+    while (!slot.inbox.empty()) {
+      slot.session.push(std::move(slot.inbox.front()));
+      slot.inbox.pop_front();
+    }
   }
 
   void wake_parked(std::size_t idx) noexcept {
@@ -1632,24 +1675,17 @@ private:
       auto stopping = false;
       auto expired = Timeout::None;
       {
-        std::lock_guard<std::mutex> lock{slot->mu};
+        std::unique_lock<std::mutex> lock{slot->mu};
         slot->state = Slot::State::Running;
         slot->running_on = my_idx;
         if (slot->turns > 0 && slot->last_worker != tid) ++slot->worker_migrations;
         slot->last_worker = tid;
         ++slot->turns;
-        local_raw.swap(slot->raw_in);
-        slot->raw_in.clear();
-        while (!slot->inbox.empty()) {
-          slot->session.push(std::move(slot->inbox.front()));
-          slot->inbox.pop_front();
-        }
+        take_input(*slot, lock, local_raw, scratch);
         dropped = slot->dropped;
         stopping = slot->stopping;
         expired = std::exchange(slot->expired, Timeout::None);
       }
-      feed_raw(*slot, local_raw, scratch);
-      local_raw.clear();
 
       if (dropped) {
         slot->session.close();
@@ -1747,18 +1783,7 @@ private:
       auto need_loop_wake = false;
       {
         std::unique_lock<std::mutex> lock{slot->mu};
-        if (!slot->raw_in.empty()) {
-          local_raw.swap(slot->raw_in);
-          slot->raw_in.clear();
-          lock.unlock();
-          feed_raw(*slot, local_raw, scratch);
-          local_raw.clear();
-          lock.lock();
-        }
-        while (!slot->inbox.empty()) {
-          slot->session.push(std::move(slot->inbox.front()));
-          slot->inbox.pop_front();
-        }
+        take_input(*slot, lock, local_raw, scratch);
         if (slot->dropped && !slot->session.ended()) {
           lock.unlock();
           slot->session.close();

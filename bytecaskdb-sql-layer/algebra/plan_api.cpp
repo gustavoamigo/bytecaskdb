@@ -2842,13 +2842,19 @@ bool bc_txn_add(bc_ctx* cx) {
   cx->release(cx->write_held);
   // What the transaction holds grew by at most the write set
   // (txn_holds): the statement's reservation, at least what it held, covers
-  // it and passes to the transaction, so taking a statement in never fails
-  // on the memory cap. The rest of it is returned when the statement ends.
+  // it and passes to the transaction. The rest of it is returned when the
+  // statement ends. Should a count drift so that it does not cover it, the
+  // difference is reserved as any other, and past the cap the statement
+  // fails with BC_E_MEMORY and aborts the transaction: `used` never passes
+  // the cap unchecked, failing other sessions' statements.
   if (txn->memory != nullptr && txn_holds(*txn) > txn->reserved) {
     const auto grow = txn_holds(*txn) - txn->reserved;
-    const auto moved = std::min(grow, cx->reserved - cx->mem_used);
-    cx->reserved -= moved;
-    if (moved < grow) txn->memory->used.fetch_add(grow - moved, std::memory_order_relaxed);
+    const auto spare = cx->reserved - cx->mem_used;
+    if (grow > spare && !cx->reserve(grow - spare)) {
+      txn_abort(txn);
+      return false;
+    }
+    cx->reserved -= grow;
     txn->reserved += grow;
   }
   cx->write_held = 0;

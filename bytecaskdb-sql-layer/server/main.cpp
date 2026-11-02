@@ -68,6 +68,14 @@ namespace pg = bytecask::sql::pg;
 namespace {
 
 constexpr std::size_t kWriteChunk = 64u << 10;
+// Connections past --max-connections still taken in, each only for a
+// CancelRequest (Session::admit_cancel_only): a full server is when a cancel
+// matters most. Past these too, a connection is refused at once.
+constexpr std::size_t kCancelOnlyConnections = 16;
+// Out of file descriptors, the listener stops accepting this long: the
+// pending connection stays in the backlog, and a level-triggered poll on it
+// would otherwise spin.
+constexpr std::uint64_t kAcceptRetryMs = 100;
 
 auto flags(int argc, char** argv) -> std::map<std::string, std::string> {
   std::map<std::string, std::string> out;
@@ -205,7 +213,8 @@ struct Connection {
   std::chrono::steady_clock::time_point idle_at{};  // from the last drain
   pg::Timeout idle_kind{pg::Timeout::None};
   int open_handles{2};  // tcp and idle_timer: freed when both have closed
-  bool counted{false};
+  bool counted{false};             // in Server::active_connections
+  bool counted_cancel_only{false};  // in Server::cancel_only_connections
   bool reading{false};
   bool write_in_flight{false};
   bool write_failed{false};
@@ -242,6 +251,7 @@ struct Server {
         listener_fd{listen_fd},
         pool{db, cfg, n_workers, {}, use_affinity ? cpus : std::span<const int>{}} {
     listener_poll.data = this;
+    accept_retry.data = this;
     sigint.data = this;
     sigterm.data = this;
   }
@@ -251,11 +261,13 @@ struct Server {
   bool affinity{false};
   int listener_fd{-1};
   std::atomic<std::size_t> active_connections{0};
+  std::atomic<std::size_t> cancel_only_connections{0};
   std::atomic<std::size_t> next_conn_seq{0};
   std::atomic<bool> stopping{false};
   pg::Pool pool;
   std::vector<std::unique_ptr<LoopShard>> shards;
   uv_poll_t listener_poll{};
+  uv_timer_t accept_retry{};  // restarts listener_poll after EMFILE or ENFILE
   uv_signal_t sigint{};
   uv_signal_t sigterm{};
   bool listener_closed{false};
@@ -274,6 +286,7 @@ void on_handle_closed(uv_handle_t* h) {
   auto* s = sh->server;
   if (c->slot) s->pool.detach(c->slot);
   if (c->counted) s->active_connections.fetch_sub(1, std::memory_order_acq_rel);
+  if (c->counted_cancel_only) s->cancel_only_connections.fetch_sub(1, std::memory_order_acq_rel);
   sh->conns.erase(c);
   delete c;
   check_shard_shutdown_complete(sh);
@@ -288,8 +301,9 @@ void close_connection(Connection* c) {
 void on_idle_timer(uv_timer_t* t) {
   auto* c = static_cast<Connection*>(t->data);
   if (c->closing || !c->slot) return;
-  // Does nothing if the session ran meanwhile: its next idle drain re-arms.
-  (void)c->shard->server->pool.expire(c->slot, c->idle_kind);
+  // Refused if the session ran meanwhile or the deadline is still ahead:
+  // pump() re-arms from the session's current deadline, or stops the timer.
+  if (!c->shard->server->pool.expire(c->slot, c->idle_kind)) pump(c);
 }
 
 // While the session is idle and one of its timeouts applies, the timer runs
@@ -420,7 +434,18 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* /*buf*/) {
     c->reading = false;
   }
   c->worker_idle = false;
+  (void)uv_timer_stop(&c->idle_timer);  // the session is busy: its turn's drain re-arms
   if (c->slot) s->pool.submit_bytes(c->slot, std::string_view{c->read_buf.data(), static_cast<std::size_t>(nread)});
+}
+
+// Takes one of `limit` places counted by `n`; false, taking nothing, when all
+// are taken.
+auto take_one(std::atomic<std::size_t>& n, std::size_t limit) -> bool {
+  auto cur = n.load(std::memory_order_relaxed);
+  while (cur < limit) {
+    if (n.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) return true;
+  }
+  return false;
 }
 
 void accept_on_shard(LoopShard* sh, int fd, std::size_t conn_seq) {
@@ -441,16 +466,9 @@ void accept_on_shard(LoopShard* sh, int fd, std::size_t conn_seq) {
   }
   sh->conns.insert(c);
 
-  auto cur = s->active_connections.load(std::memory_order_relaxed);
-  auto reserved = false;
-  while (cur < s->max_connections) {
-    if (s->active_connections.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel,
-                                                    std::memory_order_relaxed)) {
-      reserved = true;
-      break;
-    }
-  }
-  if (!reserved) {
+  c->counted = take_one(s->active_connections, s->max_connections);
+  if (!c->counted) c->counted_cancel_only = take_one(s->cancel_only_connections, kCancelOnlyConnections);
+  if (!c->counted && !c->counted_cancel_only) {
     c->write_queue = pg::too_many_connections();
     c->session_ended = true;
     c->worker_idle = true;
@@ -458,18 +476,28 @@ void accept_on_shard(LoopShard* sh, int fd, std::size_t conn_seq) {
     return;
   }
 
-  c->counted = true;
   auto pref = s->affinity ? (conn_seq % s->workers) : pg::Pool::kNoPreference;
-  c->slot = s->pool.open(fd, c, pref, [sh](void* tag) {
-    {
-      std::lock_guard<std::mutex> lock{sh->mu};
-      sh->woken_conns.push_back(tag);
-    }
-    (void)uv_async_send(&sh->wake);
-  });
+  c->slot = s->pool.open(
+      fd, c, pref,
+      [sh](void* tag) {
+        {
+          std::lock_guard<std::mutex> lock{sh->mu};
+          sh->woken_conns.push_back(tag);
+        }
+        (void)uv_async_send(&sh->wake);
+      },
+      c->counted_cancel_only);
   c->worker_idle = true;
   c->reading = true;
   (void)uv_read_start(reinterpret_cast<uv_stream_t*>(&c->tcp), on_alloc, on_read);
+}
+
+void on_accept(uv_poll_t* handle, int status, int events);
+
+void on_accept_retry(uv_timer_t* h) {
+  auto* s = static_cast<Server*>(h->data);
+  if (s->listener_closed) return;
+  (void)uv_poll_start(&s->listener_poll, UV_READABLE, on_accept);
 }
 
 void on_accept(uv_poll_t* handle, int status, int /*events*/) {
@@ -481,6 +509,10 @@ void on_accept(uv_poll_t* handle, int status, int /*events*/) {
     auto fd = ::accept4(s->listener_fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (fd < 0) {
       if (errno == EINTR) continue;
+      if (errno == EMFILE || errno == ENFILE) {
+        (void)uv_poll_stop(&s->listener_poll);
+        (void)uv_timer_start(&s->accept_retry, on_accept_retry, kAcceptRetryMs, 0);
+      }
       break;
     }
     int on = 1;
@@ -579,6 +611,8 @@ void on_signal(uv_signal_t* h, int /*signum*/) {
     s->listener_closed = true;
     (void)uv_poll_stop(&s->listener_poll);
     uv_close(reinterpret_cast<uv_handle_t*>(&s->listener_poll), nullptr);
+    (void)uv_timer_stop(&s->accept_retry);
+    uv_close(reinterpret_cast<uv_handle_t*>(&s->accept_retry), nullptr);
     (void)::shutdown(s->listener_fd, SHUT_RDWR);
   }
   if (!s->signals_closed) {
@@ -702,6 +736,7 @@ int main(int argc, char** argv) {
     (void)uv_signal_start(&srv.sigint, on_signal, SIGINT);
     (void)uv_signal_start(&srv.sigterm, on_signal, SIGTERM);
     (void)uv_poll_init(&sh0.loop, &srv.listener_poll, listener_fd);
+    (void)uv_timer_init(&sh0.loop, &srv.accept_retry);
     (void)uv_poll_start(&srv.listener_poll, UV_READABLE, on_accept);
 
     std::vector<std::thread> loop_threads;

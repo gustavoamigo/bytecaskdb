@@ -36,7 +36,7 @@ Built and tested:
 - **Queries:** one table, or two joined (index nested loop or hash); `WHERE` as a conjunction of comparisons; `ORDER BY` with `NULLS FIRST`/`LAST`; `LIMIT`; `GROUP BY` and `HAVING`; `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`; `FOR UPDATE` on one table. Full scans and sorts are served.
 - **Types:** `SMALLINT`, `INTEGER`, `BIGINT`, `REAL`, `DOUBLE PRECISION`, `BOOLEAN`, `TEXT`, `VARCHAR(n)`, `BYTEA`, `DECIMAL(p, s)` with p ≤ 18, `DATE`, `TIME`, `TIMESTAMP`.
 - **Transactions:** statements read their own writes; DDL is its own statement, not transactional.
-- **Interfaces:** the embedded C++ API (`api/database.cppm`), and `sql_layer_server`, a PostgreSQL wire-protocol server that psql, psycopg and HammerDB connect to. Trust authentication only: it listens on loopback unless told otherwise.
+- **Interfaces:** the embedded C++ API (`api/database.cppm`), and `sql_layer_server`, a PostgreSQL wire-protocol server that psql, psycopg and HammerDB connect to. Trust authentication only: it listens on loopback unless told otherwise. It takes `CancelRequest` (57014), even at its connection limit, and has PostgreSQL's statement, idle-in-transaction, transaction and idle-session timeouts; a cap on the memory all statements and transactions hold fails one past it with 53200.
 - **HammerDB gate:** TPROC-C over the wire, driven by HammerDB (`hammerdb/run-gate.sh`; its defaults are 48 warehouses at 1, 16 and 48 virtual users). Nightly CI runs its smoke: 2 warehouses, 2 users, one minute, then the consistency conditions.
 
 Not built yet (each is refused, with a message):
@@ -60,7 +60,7 @@ build/linux/x86_64/release/sql_layer_server --dir /tmp/db --listen 127.0.0.1:543
 psql "host=127.0.0.1 user=me dbname=db"      # the database is named after the directory
 ```
 
-Flags: `--database`, `--max-connections`, `--sync AT_EVERY_COMMIT|AT_INTERVAL|AT_FILE_ROTATION`, `--sync-interval-ms`, `--io-backend pread|mmap|buffer_pool`, `--buffer-pool-size`, `--buffer-pool-direct-io`. SIGINT or SIGTERM stops it cleanly.
+Flags: `--database`, `--max-connections`, `--workers`, `--thread-affinity on|off`, `--sync AT_EVERY_COMMIT|AT_INTERVAL|AT_FILE_ROTATION`, `--sync-interval-ms`, `--io-backend pread|mmap|buffer_pool`, `--buffer-pool-size`, `--buffer-pool-direct-io`, `--statement-memory-bytes`, `--max-memory-bytes`, `--statement-timeout-ms`, `--idle-in-transaction-timeout-ms`, `--transaction-timeout-ms`, `--idle-session-timeout-ms`. SIGINT or SIGTERM stops it cleanly.
 
 The layer is part of the build only with `--sql_layer=y`, so building the engine fetches neither libpg_query (PostgreSQL licence) nor TinyCC (LGPL-2.1).
 
