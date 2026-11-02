@@ -3053,7 +3053,11 @@ auto run(const RunOptions &o) -> int {
   if (orchestrator.joinable()) orchestrator.join();
   if (nemesis_thread.joinable()) nemesis_thread.join();
   if (vacuum_thread.joinable()) vacuum_thread.join();
-  node(0).holder->db.test_before_degrade_publish_ = nullptr;
+  // Cleared under the condition that set it. Only then is node 0 known to be
+  // the leader still, with a holder no thread replaces: under --topology it
+  // may be a follower whose replicator is reopening it right now.
+  if (o.mode == Mode::Presence && cfg.degrade)
+    node(0).holder->db.test_before_degrade_publish_ = nullptr;
   const auto final_leader = view.get().leader;
   auto &leader_db = node(final_leader).holder->db;
   if (leader_db.is_degraded()) leader_db.resume();
