@@ -214,6 +214,8 @@ enum class Command {
   AlterTable,
   CreateView,
   DropView,
+  CreateProcedure,
+  DropProcedure,
 };
 
 // A result column: its name and SQL type, as a client is told them before
@@ -1176,6 +1178,10 @@ auto Statement::command() const -> Command {
           return Command::CreateView;
         } else if constexpr (std::is_same_v<T, ast::DropView>) {
           return Command::DropView;
+        } else if constexpr (std::is_same_v<T, ast::CreateProcedure>) {
+          return Command::CreateProcedure;
+        } else if constexpr (std::is_same_v<T, ast::DropProcedure>) {
+          return Command::DropProcedure;
         } else {
           static_assert(std::is_same_v<T, ast::AddColumn>);
           return Command::AlterTable;

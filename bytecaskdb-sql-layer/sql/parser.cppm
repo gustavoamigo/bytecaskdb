@@ -92,6 +92,27 @@ auto table_column_aliases(const PgQuery__RangeVar* rv) -> std::vector<std::strin
   return out;
 }
 
+// A type as a column, a cast or an argument names it: libpg_query's last
+// name (int4, varchar, numeric, …) and integer modifiers. Arrays, SETOF and
+// %TYPE are refused.
+auto type_ast(const PgQuery__TypeName* tn, std::string name, std::int32_t pos) -> ColumnDefAst {
+  if (tn == nullptr || tn->n_names == 0 || tn->n_array_bounds != 0 || tn->setof || tn->pct_type) {
+    reject("type not supported", pos);
+  }
+  ColumnDefAst out;
+  out.name = std::move(name);
+  out.type = str(tn->names[tn->n_names - 1]);
+  out.pos = pos;
+  for (std::size_t k = 0; k < tn->n_typmods; ++k) {
+    const auto* m = tn->typmods[k];
+    if (m->node_case != PG_QUERY__NODE__NODE_A_CONST || m->a_const->val_case != PG_QUERY__A__CONST__VAL_IVAL) {
+      reject("type modifier must be an integer", tn->location);
+    }
+    out.typmods.push_back(m->a_const->ival->ival);
+  }
+  return out;
+}
+
 auto expr(const PgQuery__Node* n) -> Expr;
 auto literal(const PgQuery__Node* n) -> Literal;
 auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select;
@@ -338,19 +359,10 @@ auto expr(const PgQuery__Node* n) -> Expr {
   }
   if (n->node_case == PG_QUERY__NODE__NODE_TYPE_CAST) {
     const auto* c = n->type_cast;
-    const auto* tn = c->type_name;
-    if (tn == nullptr || tn->n_names == 0 || tn->n_array_bounds != 0 || tn->setof || tn->pct_type) {
-      reject("type not supported", c->location);
-    }
+    auto type = type_ast(c->type_name, "", c->location);
     Expr e{Expr::Kind::Cast, {}, 0, nullptr, nullptr, c->location};
-    e.cast_type = str(tn->names[tn->n_names - 1]);
-    for (std::size_t k = 0; k < tn->n_typmods; ++k) {
-      const auto* m = tn->typmods[k];
-      if (m->node_case != PG_QUERY__NODE__NODE_A_CONST || m->a_const->val_case != PG_QUERY__A__CONST__VAL_IVAL) {
-        reject("type modifier must be an integer", tn->location);
-      }
-      e.cast_typmods.push_back(m->a_const->ival->ival);
-    }
+    e.cast_type = std::move(type.type);
+    e.cast_typmods = std::move(type.typmods);
     e.rhs = std::make_unique<Expr>(operand(c->arg));
     return e;
   }
@@ -635,19 +647,8 @@ auto check_constraint(const PgQuery__Constraint* c, std::string_view sql) -> Che
 // Adds each PRIMARY KEY constraint on the column to `primary_keys`, so a
 // repeated one counts twice.
 auto column_def(const PgQuery__ColumnDef* cd, int& primary_keys, std::string_view sql) -> ColumnDefAst {
-  const auto* tn = cd->type_name;
-  if (tn == nullptr || tn->n_names == 0 || tn->n_array_bounds != 0 || tn->setof || tn->pct_type) {
-    reject("column type not supported", cd->location);
-  }
-  ColumnDefAst col{cd->colname, str(tn->names[tn->n_names - 1]), {}, cd->is_not_null != 0, false, std::nullopt,
-                   cd->location};
-  for (std::size_t k = 0; k < tn->n_typmods; ++k) {
-    const auto* m = tn->typmods[k];
-    if (m->node_case != PG_QUERY__NODE__NODE_A_CONST || m->a_const->val_case != PG_QUERY__A__CONST__VAL_IVAL) {
-      reject("type modifier must be an integer", tn->location);
-    }
-    col.typmods.push_back(m->a_const->ival->ival);
-  }
+  auto col = type_ast(cd->type_name, cd->colname, cd->location);
+  col.not_null = cd->is_not_null != 0;
   if (cd->coll_clause != nullptr) reject("COLLATE is not supported", cd->location);
   for (std::size_t k = 0; k < cd->n_constraints; ++k) {
     const auto* c = cd->constraints[k]->constraint;
@@ -750,12 +751,30 @@ auto create_index(const PgQuery__IndexStmt* s, std::int32_t pos) -> CreateIndex 
   return ix;
 }
 
-// DROP TABLE and DROP INDEX, one object each, RESTRICT (the default).
+// DROP PROCEDURE name [(argtype, …)]: the list's types, without those marked
+// OUT, as libpg_query gives them (docs/procedures_design.md).
+auto drop_procedure(const PgQuery__DropStmt* s, std::int32_t pos) -> DropProcedure {
+  const auto* obj = s->objects[0];
+  if (obj->node_case != PG_QUERY__NODE__NODE_OBJECT_WITH_ARGS) reject("expected a procedure", pos);
+  const auto* o = obj->object_with_args;
+  if (o->n_objname != 1) reject("schema-qualified names are not supported", pos);
+  DropProcedure out{str(o->objname[0]), std::nullopt, s->missing_ok != 0, pos};
+  if (o->args_unspecified) return out;
+  out.arg_types.emplace();
+  for (std::size_t i = 0; i < o->n_objargs; ++i) {
+    if (o->objargs[i]->node_case != PG_QUERY__NODE__NODE_TYPE_NAME) reject("expected a type", pos);
+    out.arg_types->push_back(type_ast(o->objargs[i]->type_name, "", pos));
+  }
+  return out;
+}
+
+// DROP TABLE, INDEX, VIEW and PROCEDURE, one object each, RESTRICT (the default).
 auto drop(const PgQuery__DropStmt* s, std::int32_t pos) -> Statement {
   if (s->n_objects != 1 || s->behavior == PG_QUERY__DROP_BEHAVIOR__DROP_CASCADE || s->concurrent) {
     reject("DROP takes one object, without CASCADE or CONCURRENTLY", pos);
   }
   const auto* obj = s->objects[0];
+  if (s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_PROCEDURE) return drop_procedure(s, pos);
   if (obj->node_case != PG_QUERY__NODE__NODE_LIST || obj->list->n_items != 1) {
     reject("schema-qualified names are not supported", pos);
   }
@@ -763,7 +782,63 @@ auto drop(const PgQuery__DropStmt* s, std::int32_t pos) -> Statement {
   if (s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_TABLE) return DropTable{name, s->missing_ok != 0, pos};
   if (s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_INDEX) return DropIndex{name, s->missing_ok != 0, pos};
   if (s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_VIEW) return DropView{name, s->missing_ok != 0, pos};
-  reject("only DROP TABLE, DROP INDEX and DROP VIEW are supported", pos);
+  reject("only DROP TABLE, DROP INDEX, DROP VIEW and DROP PROCEDURE are supported", pos);
+}
+
+// CREATE [OR REPLACE] PROCEDURE name (args) LANGUAGE plpgsql AS 'body':
+// arguments IN, INOUT or OUT, named, without a default; no other option.
+// The body's PL/pgSQL syntax is checked as PostgreSQL checks it with
+// check_function_bodies on; its SQL is not bound (docs/procedures_design.md).
+auto create_procedure(const PgQuery__CreateFunctionStmt* s, std::int32_t pos, const std::string& text)
+    -> CreateProcedure {
+  if (!s->is_procedure) reject("CREATE FUNCTION is not supported yet: only procedures are", pos, kFeatureNotSupported);
+  if (s->n_funcname != 1) reject("schema-qualified names are not supported", pos);
+  CreateProcedure out{str(s->funcname[0]), s->replace != 0, {}, pos, {}};
+  for (std::size_t i = 0; i < s->n_parameters; ++i) {
+    if (s->parameters[i]->node_case != PG_QUERY__NODE__NODE_FUNCTION_PARAMETER) reject("expected an argument", pos);
+    const auto* p = s->parameters[i]->function_parameter;
+    auto at = p->arg_type == nullptr ? pos : p->arg_type->location;
+    if (p->defexpr != nullptr) reject("a procedure argument's DEFAULT is not supported yet", at, kFeatureNotSupported);
+    if (empty(p->name)) reject("a procedure argument needs a name", at, kFeatureNotSupported);
+    auto mode = [&] {
+      switch (p->mode) {
+        case PG_QUERY__FUNCTION_PARAMETER_MODE__FUNC_PARAM_IN:
+        case PG_QUERY__FUNCTION_PARAMETER_MODE__FUNC_PARAM_DEFAULT: return ProcedureArgAst::Mode::In;
+        case PG_QUERY__FUNCTION_PARAMETER_MODE__FUNC_PARAM_INOUT: return ProcedureArgAst::Mode::InOut;
+        case PG_QUERY__FUNCTION_PARAMETER_MODE__FUNC_PARAM_OUT: return ProcedureArgAst::Mode::Out;
+        case PG_QUERY__FUNCTION_PARAMETER_MODE__FUNC_PARAM_VARIADIC:
+        case PG_QUERY__FUNCTION_PARAMETER_MODE__FUNC_PARAM_TABLE:
+        case PG_QUERY__FUNCTION_PARAMETER_MODE__FUNCTION_PARAMETER_MODE_UNDEFINED:
+        case _PG_QUERY__FUNCTION_PARAMETER_MODE_IS_INT_SIZE: break;
+      }
+      reject("VARIADIC arguments are not supported", at, kFeatureNotSupported);
+    }();
+    out.args.push_back({mode, type_ast(p->arg_type, p->name, at)});
+  }
+  if (s->sql_body != nullptr) reject("BEGIN ATOMIC bodies are not supported: use LANGUAGE plpgsql", pos, kFeatureNotSupported);
+  auto has_body = false;
+  std::string language;
+  for (std::size_t i = 0; i < s->n_options; ++i) {
+    const auto* d = s->options[i]->def_elem;
+    std::string_view name = d->defname;
+    if (name == "language" && d->arg != nullptr) {
+      language = str(d->arg);
+    } else if (name == "as") {
+      has_body = true;
+    } else {
+      reject("procedure option " + std::string{name} + " is not supported", d->location, kFeatureNotSupported);
+    }
+  }
+  if (language.empty()) reject("no language specified", pos, kInvalidFunctionDefinition);
+  if (language != "plpgsql") {
+    reject("LANGUAGE " + language + " is not supported: procedures are LANGUAGE plpgsql", pos, kFeatureNotSupported);
+  }
+  if (!has_body) reject("a procedure needs a body (AS)", pos, kInvalidFunctionDefinition);
+  auto body = pg_query_parse_plpgsql(text.c_str());
+  auto error = body.error == nullptr ? std::optional<std::string>{} : std::optional<std::string>{body.error->message};
+  pg_query_free_plpgsql_parse_result(body);
+  if (error) reject(*error, pos);
+  return out;
 }
 
 auto alter_table(const PgQuery__AlterTableStmt* s, std::int32_t pos, std::string_view sql) -> AddColumn {
@@ -1275,6 +1350,12 @@ auto parse(std::string_view sql) -> Statement {
     view.definition = std::string{sql};
     return view;
   }
+  if (n->node_case == PG_QUERY__NODE__NODE_CREATE_FUNCTION_STMT) {
+    auto proc = create_procedure(n->create_function_stmt, pos, text);
+    proc.definition = std::string{sql};
+    return proc;
+  }
+  if (n->node_case == PG_QUERY__NODE__NODE_CALL_STMT) reject("CALL is not supported yet", pos, kFeatureNotSupported);
   if (n->node_case == PG_QUERY__NODE__NODE_INSERT_STMT) return insert(n->insert_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_SELECT_STMT) return select(n->select_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_UPDATE_STMT) return update(n->update_stmt, pos);

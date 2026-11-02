@@ -4284,6 +4284,25 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           return {Ddl{DropViewDdl{s.view, s.if_exists}}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::CreateView>) {
           throw std::logic_error("CREATE VIEW is bound by bind_create_view");
+        } else if constexpr (std::is_same_v<T, ast::CreateProcedure>) {
+          CreateProcedureDdl out{s.procedure, s.definition, s.replace, {}};
+          for (const auto& a : s.args) {
+            auto mode = a.mode == ast::ProcedureArgAst::Mode::In      ? ProcedureArg::Mode::In
+                        : a.mode == ast::ProcedureArgAst::Mode::InOut ? ProcedureArg::Mode::InOut
+                                                                      : ProcedureArg::Mode::Out;
+            out.args.push_back({mode, a.def.name, sql_type(a.def)});
+          }
+          return {Ddl{std::move(out)}, s.pos};
+        } else if constexpr (std::is_same_v<T, ast::DropProcedure>) {
+          DropProcedureDdl out{s.procedure, std::nullopt, s.if_exists};
+          if (s.arg_types) {
+            out.arg_types.emplace();
+            // Only the kind is compared, so a NUMERIC needs no precision here.
+            for (const auto& t : *s.arg_types) {
+              out.arg_types->push_back(t.type == "numeric" && t.typmods.empty() ? SqlType{SqlKind::Decimal} : sql_type(t));
+            }
+          }
+          return {Ddl{std::move(out)}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::AddColumn>) {
           (void)b.table(s.table, s.pos);
           if (s.column.primary_key) throw SqlError{"ADD COLUMN cannot add a primary key column", s.column.pos};

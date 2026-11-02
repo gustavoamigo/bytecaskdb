@@ -569,3 +569,57 @@ TEST_CASE("parser: UPDATE and DELETE ... WHERE CURRENT OF name the cursor and ha
   CHECK_THROWS_AS(parse("DELETE FROM t WHERE CURRENT OF $1"), SqlError);
   CHECK_THROWS_AS(parse("SELECT 1 FROM t WHERE CURRENT OF c"), SqlError);
 }
+
+TEST_CASE("parser: CREATE PROCEDURE reads its signature and checks its body's PL/pgSQL syntax", "[sql][parser][procedure]") {
+  auto sql = std::string{
+      "CREATE OR REPLACE PROCEDURE neword(no_w_id INTEGER, INOUT no_c_last VARCHAR(16), OUT total NUMERIC(12, 2), "
+      "IN tstamp TIMESTAMP) LANGUAGE plpgsql AS $$ DECLARE x INT := 1; BEGIN SELECT 1 INTO x; END $$"};
+  auto p = std::get<CreateProcedure>(parse(sql));
+  CHECK(p.procedure == "neword");
+  CHECK(p.replace);
+  CHECK(p.definition == sql);
+  REQUIRE(p.args.size() == 4);
+  CHECK((p.args[0].mode == ProcedureArgAst::Mode::In && p.args[0].def.name == "no_w_id" && p.args[0].def.type == "int4"));
+  CHECK((p.args[1].mode == ProcedureArgAst::Mode::InOut && p.args[1].def.type == "varchar" &&
+         p.args[1].def.typmods == std::vector<std::int32_t>{16}));
+  CHECK((p.args[2].mode == ProcedureArgAst::Mode::Out && p.args[2].def.typmods == std::vector<std::int32_t>{12, 2}));
+  CHECK((p.args[3].mode == ProcedureArgAst::Mode::In && p.args[3].def.type == "timestamp"));
+  CHECK(std::get<CreateProcedure>(parse("CREATE PROCEDURE p() LANGUAGE plpgsql AS 'BEGIN END'")).args.empty());
+
+  auto state = [](std::string_view s) -> std::string {
+    try {
+      (void)parse(s);
+    } catch (const SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return "accepted";
+  };
+  CHECK(state("CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN SELEC 1; END $$") == "42601");  // the body's syntax
+  CHECK(state("CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN x := ; END $$") == "42601");
+  CHECK(state("CREATE PROCEDURE p() AS $$ BEGIN END $$") == "42P13");  // no language
+  CHECK(state("CREATE PROCEDURE p() LANGUAGE sql AS $$ SELECT 1 $$") == "0A000");
+  CHECK(state("CREATE PROCEDURE p() LANGUAGE sql BEGIN ATOMIC SELECT 1; END") == "0A000");
+  CHECK(state("CREATE PROCEDURE p() LANGUAGE plpgsql SECURITY DEFINER AS $$ BEGIN END $$") == "0A000");
+  CHECK(state("CREATE PROCEDURE p(a INT DEFAULT 1) LANGUAGE plpgsql AS $$ BEGIN END $$") == "0A000");
+  CHECK(state("CREATE PROCEDURE p(INT) LANGUAGE plpgsql AS $$ BEGIN END $$") == "0A000");  // unnamed
+  CHECK(state("CREATE PROCEDURE p(VARIADIC a INT[]) LANGUAGE plpgsql AS $$ BEGIN END $$") == "0A000");
+  CHECK(state("CREATE PROCEDURE p(a INT[]) LANGUAGE plpgsql AS $$ BEGIN END $$") == "42601");
+  CHECK(state("CREATE PROCEDURE s.p() LANGUAGE plpgsql AS $$ BEGIN END $$") == "42601");
+  CHECK(state("CREATE FUNCTION f() RETURNS INT LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$") == "0A000");
+  CHECK(state("CALL p(1)") == "0A000");
+}
+
+TEST_CASE("parser: DROP PROCEDURE with or without an argument list", "[sql][parser][procedure]") {
+  auto d = std::get<DropProcedure>(parse("DROP PROCEDURE p"));
+  CHECK((d.procedure == "p" && !d.arg_types && !d.if_exists));
+  d = std::get<DropProcedure>(parse("DROP PROCEDURE IF EXISTS p()"));
+  CHECK((d.if_exists && d.arg_types && d.arg_types->empty()));
+  // An argument marked OUT is left out, as PostgreSQL leaves it out.
+  d = std::get<DropProcedure>(parse("DROP PROCEDURE p(INTEGER, INOUT VARCHAR(5), OUT NUMERIC)"));
+  REQUIRE(d.arg_types);
+  REQUIRE(d.arg_types->size() == 2);
+  CHECK((*d.arg_types)[0].type == "int4");
+  CHECK((*d.arg_types)[1].typmods == std::vector<std::int32_t>{5});
+  CHECK_THROWS_AS(parse("DROP PROCEDURE p, q"), SqlError);
+  CHECK_THROWS_AS(parse("DROP PROCEDURE p CASCADE"), SqlError);
+}

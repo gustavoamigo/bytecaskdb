@@ -463,6 +463,19 @@ EXISTS] name`:
   checks the tables a plan reads and not the views it came through
   (`Statement`'s plan records them, `bound::Bound::views`).
 
+**Procedures**, `CREATE [OR REPLACE] PROCEDURE name (args) LANGUAGE plpgsql
+AS …` and `DROP PROCEDURE [IF EXISTS] name [(argtype, …)]`
+(`procedures_design.md`):
+- **Parsed in two passes.** `pg_query_parse` gives the name, the arguments
+  and their modes; an argument's type is read as a column's is.
+  `pg_query_parse_plpgsql` checks the body's syntax (42601). The SQL in the
+  body is not bound, so it may name a table that does not exist yet.
+- **Refused (0A000):** `CREATE FUNCTION`, a language other than `plpgsql`,
+  `BEGIN ATOMIC`, any option, `VARIADIC`, an unnamed argument, a `DEFAULT`,
+  and `CALL`, until the runtime runs procedures. No language is 42P13.
+- **`DROP PROCEDURE`'s list** is read as libpg_query gives it: the types,
+  without those marked `OUT`.
+
 **Refused**, with a message and the node's position: everything not above.
 That includes:
 - `ILIKE`, `IS DISTINCT FROM`, and a predicate in `HAVING`;
