@@ -392,10 +392,11 @@ auto TransientEngineState::apply_puts_checked(
   };
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
-  // TLS: scratch. Reused across plans, so the serial section allocates
-  // nothing here once warm; cleared on entry, holds no DB's state.
-  thread_local std::vector<Undo> undo;
-  thread_local std::vector<std::pair<std::uint32_t, std::uint64_t>> dead;
+  // Reused across plans, so the serial section allocates nothing here once
+  // warm. Cleared on entry; they hold no DB's state between calls.
+  thread_local std::vector<Undo> undo;  // TLS: scratch
+  using Dead = std::pair<std::uint32_t, std::uint64_t>;  // file, bytes
+  thread_local std::vector<Dead> dead;  // TLS: scratch
 #pragma clang diagnostic pop
   undo.clear();
   dead.clear();
