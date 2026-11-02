@@ -1,0 +1,196 @@
+# CASE, COALESCE and NULLIF: the first cases select constants only; the ones
+# from "CASE over columns" on read columns, parameters and subqueries.
+
+- name: searched CASE takes the first true WHEN, else ELSE, else NULL
+  features: [F261-02]
+  steps:
+    - sql: SELECT CASE WHEN 1 = 2 THEN 10 WHEN 2 = 2 THEN 20 ELSE 30 END
+      expected: [[20]]
+    - sql: SELECT CASE WHEN 1 = 2 THEN 10 ELSE 30 END, CASE WHEN 1 = 2 THEN 10 END
+      expected: [[30, null]]
+    - sql: SELECT CASE WHEN NULL THEN 1 ELSE 2 END
+      expected: [[2]]
+    - sql: SELECT CASE WHEN 1 = 1 THEN 1 WHEN 1 / 0 = 1 THEN 2 END
+      expected: [[1]]
+    - sql: SELECT CASE WHEN 1 THEN 1 END
+      error: "42804"
+
+- name: simple CASE tests the operand for equality with each WHEN
+  features: [F261-01]
+  steps:
+    - sql: SELECT CASE 3 WHEN 1 THEN 'a' WHEN 3 THEN 'c' ELSE 'z' END
+      expected: [["c"]]
+    - sql: SELECT CASE 0 WHEN 2 THEN 1 END, CASE 1 WHEN 1.0 THEN 'eq' END
+      expected: [[null, "eq"]]
+    - sql: SELECT CASE NULL WHEN NULL THEN 'eq' ELSE 'ne' END
+      expected: [["ne"]]
+    - sql: SELECT CASE 1 WHEN true THEN 1 END
+      error: "42883"
+
+- name: CASE result type is resolved across its branches
+  features: [F261-01, F261-02]
+  steps:
+    - sql: SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2.50 END, CASE WHEN 1 = 2 THEN 1.5 ELSE 2 END
+      expected: [["1", "2"]]
+    - sql: SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2147483648 END + 1
+      expected: [[2]]
+    - sql: SELECT CASE WHEN 1 = 1 THEN NULL END, CASE WHEN 1 = 1 THEN 'a' END
+      expected: [[null, "a"]]
+    - sql: SELECT CASE WHEN 1 = 1 THEN 1 ELSE true END
+      error: "42804"
+    - sql: SELECT CASE WHEN 1 = 1 THEN 1 ELSE 'a' END
+      error: "22P02"
+
+- name: a CASE branch that raises does so only when taken
+  features: [F261-02]
+  steps:
+    - sql: SELECT CASE WHEN 1 = 2 THEN 1 ELSE 1 / 0 END
+      error: "22012"
+
+- name: COALESCE returns its first argument that is not NULL
+  features: [F261-04]
+  steps:
+    - sql: SELECT COALESCE(NULL, NULL, 3, 4), COALESCE(1, 2), COALESCE(NULL, 'x')
+      expected: [[3, 1, "x"]]
+    - sql: SELECT COALESCE(NULL, NULL)
+      expected: [[null]]
+    - sql: SELECT COALESCE(1, 2.50), COALESCE(NULL, 2147483648)
+      expected: [["1", 2147483648]]
+    - sql: SELECT COALESCE(1, true)
+      error: "42804"
+    - sql: SELECT COALESCE(1, 'a')
+      error: "22P02"
+    - sql: SELECT COALESCE(NULL, 1 / 0)
+      error: "22012"
+
+- name: NULLIF is NULL when its arguments are equal, else the first
+  features: [F261-03]
+  steps:
+    - sql: SELECT NULLIF(1, 1), NULLIF(1, 2), NULLIF(NULL, 1), NULLIF(1, NULL)
+      expected: [[null, 1, null, 1]]
+    - sql: SELECT NULLIF('a', 'a'), NULLIF('a', 'b'), NULLIF('1', 1), NULLIF(1, 1.0), NULLIF(1.5, 1)
+      expected: [[null, "a", null, null, "1.5"]]
+    - sql: SELECT NULLIF(1, true)
+      error: "42883"
+    - sql: SELECT NULLIF(1, 'a')
+      error: "22P02"
+
+- name: CASE over columns, searched and simple
+  features: [F261-01, F261-02]
+  ordered: true
+  setup:
+    - CREATE TABLE cs (id INTEGER PRIMARY KEY, i INTEGER, z INTEGER, t TEXT)
+  steps:
+    - sql: INSERT INTO cs VALUES (1, 1, NULL, 'a')
+      rowcount: 1
+    - sql: INSERT INTO cs VALUES (2, 2, 0, 'b')
+      rowcount: 1
+    - sql: INSERT INTO cs VALUES (3, 3, 4, 'c')
+      rowcount: 1
+    - sql: SELECT CASE WHEN i < 2 THEN 'low' WHEN i < 3 THEN 'mid' ELSE 'high' END FROM cs ORDER BY id
+      expected: [[low], [mid], [high]]
+    - sql: SELECT CASE WHEN z > 0 THEN 1 END FROM cs ORDER BY id
+      expected: [[null], [null], [1]]
+    - sql: SELECT CASE i WHEN 1 THEN 10 WHEN 3 THEN 30 ELSE 0 END FROM cs ORDER BY id
+      expected: [[10], [0], [30]]
+    - sql: SELECT CASE z WHEN 0 THEN 'zero' WHEN 4 THEN 'four' END FROM cs ORDER BY id
+      expected: [[null], [zero], [four]]
+    - sql: SELECT CASE WHEN i > 1 THEN NULL END FROM cs ORDER BY id
+      expected: [[null], [null], [null]]
+    - sql: SELECT CASE WHEN i = 1 THEN t ELSE 'other' END FROM cs ORDER BY id
+      expected: [[a], [other], [other]]
+  teardown:
+    - DROP TABLE cs
+
+- name: a WHEN that is AND, OR, NOT, IS NULL or a subquery's comparison
+  features: [F261-02]
+  ordered: true
+  setup:
+    - CREATE TABLE cs (id INTEGER PRIMARY KEY, i INTEGER, z INTEGER)
+  steps:
+    - sql: INSERT INTO cs VALUES (1, 1, NULL)
+      rowcount: 1
+    - sql: INSERT INTO cs VALUES (2, 2, 0)
+      rowcount: 1
+    - sql: INSERT INTO cs VALUES (3, 3, 4)
+      rowcount: 1
+    - sql: SELECT CASE WHEN z IS NULL THEN 'n' WHEN z = 0 OR i > 5 THEN 'z' ELSE 'p' END FROM cs ORDER BY id
+      expected: [[n], [z], [p]]
+    - sql: SELECT CASE WHEN NOT (i > 1) AND z IS NULL THEN 1 ELSE 0 END FROM cs ORDER BY id
+      expected: [[1], [0], [0]]
+    - sql: SELECT CASE WHEN z IS NOT NULL AND z > 0 THEN i END FROM cs ORDER BY id
+      expected: [[null], [null], [3]]
+    - sql: SELECT CASE WHEN i > (SELECT MIN(id) FROM cs) THEN 'x' ELSE 'y' END FROM cs ORDER BY id
+      expected: [[y], [x], [x]]
+    - sql: SELECT CASE WHEN i THEN 1 END FROM cs
+      error: "42804"
+  teardown:
+    - DROP TABLE cs
+
+- name: COALESCE and NULLIF over columns, parameters and subqueries
+  features: [F261-03, F261-04]
+  ordered: true
+  setup:
+    - CREATE TABLE cs (id INTEGER PRIMARY KEY, i INTEGER, z INTEGER, t TEXT)
+  steps:
+    - sql: INSERT INTO cs VALUES (1, 1, NULL, NULL)
+      rowcount: 1
+    - sql: INSERT INTO cs VALUES (2, 2, 0, 'b')
+      rowcount: 1
+    - sql: INSERT INTO cs VALUES (3, 3, 4, 'c')
+      rowcount: 1
+    - sql: SELECT COALESCE(z, 99), COALESCE(z, i), COALESCE(t, 'q') FROM cs ORDER BY id
+      expected: [[99, 1, q], [0, 0, b], [4, 4, c]]
+    - sql: SELECT NULLIF(z, 0), NULLIF(i, 2), NULLIF(t, 'b') FROM cs ORDER BY id
+      expected: [[null, 1, null], [null, null, null], [4, 3, c]]
+    - sql: SELECT COALESCE(NULLIF(z, 0), i) FROM cs ORDER BY id
+      expected: [[1], [2], [4]]
+    - sql: SELECT COALESCE(z, (SELECT MAX(id) FROM cs)) FROM cs ORDER BY id
+      expected: [[3], [0], [4]]
+    - sql: SELECT COALESCE(z, $1) FROM cs ORDER BY id
+      params: [7]
+      expected: [[7], [0], [4]]
+    - sql: SELECT COALESCE(i, t) FROM cs
+      error: "42804"
+  teardown:
+    - DROP TABLE cs
+
+- name: CASE and COALESCE types, integers widen and a float stays a float
+  features: [F261-01, E011-04]
+  ordered: true
+  setup:
+    - CREATE TABLE cs (id INTEGER PRIMARY KEY, i INTEGER, s SMALLINT, b BIGINT, d DECIMAL(6,2), e DECIMAL(6,2), f DOUBLE PRECISION)
+  steps:
+    - sql: INSERT INTO cs VALUES (1, 1, 100, 5000000000, 2.50, 7.25, 1.5)
+      rowcount: 1
+    - sql: INSERT INTO cs VALUES (2, 2, 200, 7, 2.50, NULL, NULL)
+      rowcount: 1
+    - sql: SELECT CASE WHEN i = 1 THEN s ELSE i END, CASE WHEN i = 1 THEN i ELSE b END FROM cs ORDER BY id
+      expected: [[100, 1], [2, 7]]
+    - sql: SELECT COALESCE(e, d), CASE WHEN i = 1 THEN e ELSE d END FROM cs ORDER BY id
+      expected: [["7.25", "7.25"], ["2.50", "2.50"]]
+    - sql: SELECT COALESCE(f, f), CASE WHEN i = 1 THEN f END FROM cs ORDER BY id
+      expected: [["1.5", "1.5"], [null, null]]
+  teardown:
+    - DROP TABLE cs
+
+- name: a CASE or COALESCE branch that is not taken raises nothing
+  features: [F261-01, E011-04]
+  ordered: true
+  setup:
+    - CREATE TABLE cs (id INTEGER PRIMARY KEY, i INTEGER, z INTEGER)
+  steps:
+    - sql: INSERT INTO cs VALUES (1, 1, NULL)
+      rowcount: 1
+    - sql: INSERT INTO cs VALUES (2, 2, 0)
+      rowcount: 1
+    - sql: INSERT INTO cs VALUES (3, 3, 4)
+      rowcount: 1
+    - sql: SELECT CASE WHEN z <> 0 THEN i * 100 / z ELSE 0 END FROM cs ORDER BY id
+      expected: [[0], [0], [75]]
+    - sql: SELECT COALESCE(i, i / z) FROM cs ORDER BY id
+      expected: [[1], [2], [3]]
+    - sql: SELECT CASE WHEN id > 1 THEN i / z END FROM cs
+      error: "22012"
+  teardown:
+    - DROP TABLE cs

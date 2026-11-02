@@ -145,6 +145,17 @@ answer is:
   range too, and nothing past a read's bounds is read.
 - **Lifetime.** The overlay lives in the transaction, outside the context's
   arena, which is still reset after every statement.
+- **Sharing.** The transaction holds the overlay by `shared_ptr`.
+  `bc_txn_overlay_pin` (a cursor's `Transaction::open_cursor`) takes a
+  second reference, and `bc_txn_add` writes through `own_overlay()`, the one
+  place that mutates it: if a pin shares the overlay it is cloned first and
+  the statement writes to the copy, so a pinned overlay never changes. A
+  transaction with no pin, or a statement that adds no put or delete, never
+  clones. The clone is one copy of the overlay, made by the first writing
+  statement after a pin; later statements find it unshared. A statement that
+  reads through a pin (`bc_ctx_use_overlay`) reads the frozen copy and writes
+  nothing. A clone that fails allocating is `BC_E_MEMORY` at `bc_txn_add`,
+  which aborts the transaction, and changes neither overlay.
 - **Errors propagate. No read error is ever taken as "absent".** An I/O,
   CRC or memory error in any read through the view, overlay or snapshot,
   sets the context's sticky error (`BC_E_IO`, `BC_E_CORRUPT`,
@@ -428,6 +439,15 @@ differences*.
   and each guard, claim, lock and table's slot at twice its size, the most
   its vector grows to. So a transaction of small writes can't exhaust
   memory through overhead.
+- **Pins.** A pin reserves the overlay's bound as of the pin (`Overlay::bytes`)
+  against `max_bytes`, counted with what the transaction holds until the pin
+  is released: the copy a later write forces is then already paid for.
+  A pin that does not fit is `BC_E_LIMIT` (54000) at the pin and aborts the
+  transaction; a pin of an empty overlay reserves nothing. A write that would
+  pass the bound because a pin holds a copy fails at the write, as any other.
+  `bc_txn_repin` is refused while a pin is live: the snapshot a cursor reads
+  does not move. The pin also pins the snapshot and catalog if no statement
+  has.
 - **Memory.** The overlay allocates from the heap. A failed allocation is
   `BC_E_MEMORY` for the statement, never an abort and never an exception
   into a plan (`CONTRACT.md`, *Plan safety*). An allocation-failure sweep
@@ -507,6 +527,7 @@ for their shape.
   - rollback and the destructor write nothing.
 - **Faults:**
   - read failure injected under each call through the view;
+  - an allocation-failure sweep over a pin and over the clone the next write forces;
   - an allocation-failure sweep over a multi-statement transaction;
   - `BC_E_LIMIT` at the buffer bound.
 - **Against PostgreSQL:** the proof machine (`testing_design.md`) has

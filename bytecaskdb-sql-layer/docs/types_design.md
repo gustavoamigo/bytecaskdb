@@ -24,8 +24,10 @@ bind error with the position of the type name.
 | `BOOLEAN` | `bool` | 0 or 1. |
 | `BYTEA` | `bytes` | The bytes. |
 | `TEXT`, `VARCHAR(n)` | `bytes` | UTF-8. Compared as bytes (binary collation). `n` counts code points and is a catalog property, checked on assignment. |
+| `CHAR(n)`, `CHARACTER(n)` (`CHAR` is `CHAR(1)`) | `bytes` | UTF-8 without its trailing spaces, tag `SqlKind::Char` (16). `n` counts code points and is a catalog property. A result returns it padded with spaces to `n` code points (*CHAR(n)*). |
 | `DECIMAL(p, s)`, `NUMERIC(p, s)`, p ≤ 18 | `i64` | The value times 10^s, exactly. `p` and `s` are catalog properties of the column. `s` defaults to 0; `p` is required. |
 | `TIMESTAMP` | `i64` | Microseconds since 1970-01-01 00:00:00, no time zone; from 4714-11-24 BC, PostgreSQL's first. |
+| `TIMESTAMP WITH TIME ZONE`, `TIMESTAMPTZ` | `i64` | The same microseconds, as an instant in UTC; told apart from `TIMESTAMP` by its catalog type tag (`SqlKind::TimestampTz`, 15), not by its bytes. Keys and rows encode it as a `TIMESTAMP`. |
 | `DATE` | `i64` | Days since 1970-01-01, in PostgreSQL's range: 4714-11-24 BC to 5874897-12-31. |
 | `TIME` | `i64` | Microseconds since midnight, in [0, 86 400 000 000]: 24:00:00 included, as in PostgreSQL. |
 
@@ -35,10 +37,9 @@ text, since its digits can pass 64 bits (`planner_design.md`, *Aggregates*). A `
 precision, its scaled `i64`.
 
 Rejected, each for a reason that is not "later": `NUMERIC` with
-no precision or with p > 18 (does not fit `i64`); `CHAR(n)` (its
-blank-padded comparison is a collation rule, and there are no collations
-yet);
-`TIMESTAMP WITH TIME ZONE` (a request carries no time zone yet, #491);
+no precision or with p > 18 (does not fit `i64`); `CHAR(8 CHARACTERS)`
+and `CHAR(8 OCTETS)`, which are not PostgreSQL syntax;
+`TIMESTAMP(p) WITH TIME ZONE` for p other than 6, which would round on store; `TIME WITH TIME ZONE`;
 `INTERVAL`, `UUID`, `JSON`, arrays, enums, composite types, `BIT`, `MONEY`,
 `SERIAL` (sequences are a runtime service, deferred in the plan API).
 
@@ -83,7 +84,50 @@ it is built (`bc_key_*`). `NOT NULL` is checked when the row ends, after these, 
 holding both reports the range, as PostgreSQL does. A `VARCHAR(n)` value
 whose excess is only spaces is refused, where PostgreSQL truncates it.
 
-**Text is valid UTF-8.** The row builder refuses a `TEXT` or `VARCHAR` value
+## CHAR(n)
+
+PostgreSQL's `char(n)` pads a value with spaces to `n` and ignores the
+trailing spaces when it compares, converts to text or measures it. The
+layer keeps the part that is observable and stores no padding: **a `CHAR(n)`
+value is stored without its trailing spaces, and returned padded to `n` code
+points.** The padding is added where a result row is decoded
+(`Database::results`), so the embedded API and the wire protocol return it
+alike (OID 1042, modifier `n + 4`); a NULL is not padded. Every write passes
+`RowWriter::set_bytes`, which cuts the spaces, and the binder cuts them from
+a constant compared with or assigned to a `CHAR(n)` column. The consequences
+are PostgreSQL's:
+
+- `'ab'` and `'ab   '` are one value: they compare equal, group, sort and
+  `DISTINCT` together, and compare as the shorter run of the other's
+  characters. Two `CHAR`s of different `n` compare the same way.
+- A `CHAR(n)` beside a `VARCHAR` or `TEXT` compares as text with the
+  `CHAR`'s spaces cut and the other's kept, as PostgreSQL's implicit cast
+  does: `CHAR(10)` `'foo'` equals `VARCHAR` `'foo'` and differs from
+  `'foo '`.
+- A value of more than `n` code points is cut when the excess is only
+  spaces and refused otherwise (22001, `value too long for type
+  character(n)`). This is PostgreSQL's rule; `VARCHAR(n)` refuses both.
+- The rules `LIKE`, `UNION`, `MIN`, `MAX` and parameters have for `TEXT` and
+  `VARCHAR` are not extended to `CHAR(n)` (below).
+
+Refused with a message, each for a reason:
+
+- **A primary key, `UNIQUE` or index column** (0A000). A key built from a
+  parameter would keep the spaces the row cuts, and the two would not
+  find each other.
+- **A parameter compared with a `CHAR(n)` column** (42601), for the same
+  reason: a constant is cut when the statement is bound, a parameter would
+  have to be cut at run time. A parameter that is only assigned works.
+- **A cast to `CHAR(n)`, `LIKE` on a `CHAR(n)`** (PostgreSQL's `bpchar`
+  `LIKE` keeps the padding significant, which stored values do not),
+  **`MIN` and `MAX` of one, and a set operation** that meets one and a
+  different type.
+- **A `CHAR` of no length** (`bpchar`), which PostgreSQL leaves unbounded.
+
+A database that holds a table with a `CHAR(n)` column cannot be opened by
+an earlier build (`catalog_design.md`, *Record format*); one without can.
+
+**Text is valid UTF-8.** The row builder refuses a `TEXT`, `VARCHAR` or `CHAR` value
 that is not well-formed UTF-8, or holds a NUL, when it is written
 (`BC_C_RANGE`, 22021), as it refuses any value outside its type; the
 compiler never emits a validity check. A key value that is not UTF-8 is
@@ -107,6 +151,14 @@ further. `TIMESTAMP` and `DATE` values are instants and days with no time
 zone; conversions between them are integer arithmetic on the day length
 (`DATE` from `TIMESTAMP` is the floor division, which the compiler emits
 with the adjustment for negative values that `bc_div` truncation needs).
+
+**Time zone.** The session time zone is always UTC and the layer has no time
+zone database. A `TIMESTAMP WITH TIME ZONE` literal's numeric offset (`Z`,
+`+02`, `-04:30`, `+0530`, `+hh:mm:ss`, under 16 hours) is subtracted at input,
+and a literal with none is UTC, as it is in a PostgreSQL session set to UTC.
+Output is UTC with the `+00` suffix. A `timestamp` read as a `timestamptz`
+(and the reverse) is therefore the same microseconds, and a `date` becomes
+midnight UTC. `AT TIME ZONE` is not built.
 
 ## Null
 
@@ -216,8 +268,9 @@ decimal (scaling, checked; decimal to integer truncates toward zero);
 decimal and double; boolean and integer (0 and 1; any non-zero integer is
 true); timestamp and date (floor and multiplication); text and binary
 (identity, with the UTF-8 check on the way to text, done by the runtime).
-Casts to and from text (`'42'::INTEGER`, `now()::TEXT`) are not supported,
-except for literals, which the binder folds at compile time.
+Casts to and from text (`'42'::INTEGER`, `now()::TEXT`) are not supported.
+A string literal is read as the type it meets, with that type's input
+function, when the statement is bound (`frontend_design.md`, *Literals*).
 
 ## The function library
 
@@ -235,7 +288,7 @@ document fixes the set, not the signatures.
 | `OCTET_LENGTH` on bytes and text | a helper |
 | `LENGTH` (code points), `SUBSTRING` (by code point), `||`, `CONCAT` on text | helpers that walk UTF-8 in the API, not in the plan: the subset has no counted loop |
 | `SUBSTRING` by byte, `||` on `BYTEA` | the same helpers on bytes |
-| `CURRENT_TIMESTAMP`, `NOW()`, `CURRENT_DATE` | a hidden parameter the runtime binds at `bc_ctx_begin`: a plan cannot see the clock, so every call in one statement sees one instant |
+| `CURRENT_TIMESTAMP`, `NOW()`, `CURRENT_DATE` | a hidden parameter the runtime binds at `bc_ctx_begin`: a plan cannot see the clock, so every call in one statement sees one instant. Built for `CURRENT_DATE`, `LOCALTIME` and `LOCALTIMESTAMP`, as a hidden parameter bound by the API at each run, not by the plan API (`frontend_design.md`, *The time*); `CURRENT_TIMESTAMP[(p)]` and `NOW()` are `TIMESTAMP WITH TIME ZONE`; `CURRENT_TIME` waits for `TIME WITH TIME ZONE` |
 | `EXTRACT(field FROM ts)` for `YEAR`…`SECOND`, `DATE_TRUNC` to a day or coarser | integer arithmetic on the microsecond value and a civil-date helper |
 | `CAST` | *Casts*, above |
 

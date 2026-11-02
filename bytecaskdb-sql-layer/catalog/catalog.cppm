@@ -241,6 +241,10 @@ struct Column {
   PhysType type;  // phys_type(sql)
   bool nullable;
   Datum default_value;  // monostate: no default (NULL)
+  // The row id of a table declared without a primary key: its primary key,
+  // a BIGINT the runtime fills (LiveCatalog::next_row_id). No name resolves
+  // to it, and no statement names, sets or returns it.
+  bool hidden{false};
 };
 
 struct IndexPart {
@@ -257,6 +261,14 @@ struct Index {
   std::vector<IndexPart> parts;
 };
 
+// A CHECK constraint: its name and the text of its expression, bound again
+// at each INSERT and UPDATE of the table (the text is the definition, as a
+// view's is).
+struct CheckConstraint {
+  std::string name;
+  std::string expr;
+};
+
 struct Table {
   std::uint32_t id{0};
   std::string name;
@@ -265,14 +277,42 @@ struct Table {
   std::vector<Column> columns;
   std::vector<std::uint32_t> pk_col_ids;
   std::vector<Index> indexes;
+  std::vector<CheckConstraint> checks;
   std::uint32_t layout_id{0};  // the current generation's object id
   RowLayout layout;            // the current generation
   // Earlier generations, oldest first: empty until REBUILD (#503).
   std::vector<std::pair<std::uint32_t, RowLayout>> retired_layouts;
+  // A table a query reads more than once is read as one instance of it per
+  // use: a copy under the name the query gives the use, with an id of its own
+  // at or above kInstanceBase, and `source` the id of the table whose rows it
+  // reads. 0 for a table of the catalog (docs/planner_design.md, *Joins of
+  // several tables*).
+  static constexpr std::uint32_t kInstanceBase = std::uint32_t{1} << 30;
+  std::uint32_t source{0};
 
+  // The table whose rows this one reads: its own, or its source's.
+  [[nodiscard]] auto storage_id() const -> std::uint32_t;
+
+  // A column by name: never the hidden row id, which has none.
   [[nodiscard]] auto column(std::string_view name) const -> const Column*;
   [[nodiscard]] auto column(std::uint32_t id) const -> const Column*;
   [[nodiscard]] auto index(std::string_view name) const -> const Index*;
+  // The hidden row id, the primary key of a table declared without one, or
+  // nullptr.
+  [[nodiscard]] auto row_id() const -> const Column*;
+};
+
+// A view: the text of the CREATE VIEW statement that defined it, parsed and
+// bound again at each use, the names of its columns as they were when it
+// was created, and the tables and views it names directly. A use whose
+// columns are not these is refused: PostgreSQL keeps the columns a `SELECT *`
+// view had, so a view the tables have outgrown must not give more.
+struct View {
+  std::uint32_t id{0};
+  std::string name;
+  std::string definition;
+  std::vector<std::uint32_t> depends_on;  // table and view ids, each once
+  std::vector<std::string> columns;
 };
 
 struct ColumnSpec {
@@ -296,11 +336,30 @@ struct KeyLayout {
   std::size_t index_parts;     // how many of them precede the primary key
 };
 
+// A UNIQUE constraint of CREATE TABLE: its name, "" for one the catalog
+// chooses as PostgreSQL does, and its columns. It is a unique index.
+struct UniqueSpec {
+  std::string name;
+  std::vector<std::string> columns;
+};
+
 // The stage-1 DDL statements, as values: what LiveCatalog prepares.
+// A CREATE TABLE with no primary key gets a hidden row id as its key; its
+// UNIQUE constraints are unique indexes created with it, in its batch.
+// A CHECK of CREATE TABLE: its name, "" for one the catalog chooses as
+// PostgreSQL does, its expression's text, and the column it is written on,
+// "" for a table's. The binder has checked the expression.
+struct CheckSpec {
+  std::string name;
+  std::string expr;
+  std::string column;
+};
 struct CreateTableDdl {
   std::string name;
   std::vector<ColumnSpec> columns;
   std::vector<std::string> pk;
+  std::vector<UniqueSpec> unique;
+  std::vector<CheckSpec> checks;
 };
 struct CreateIndexDdl {
   std::string name;
@@ -320,7 +379,18 @@ struct AddColumnDdl {
   std::string table;
   ColumnSpec column;
 };
-using Ddl = std::variant<CreateTableDdl, CreateIndexDdl, DropTableDdl, DropIndexDdl, AddColumnDdl>;
+struct CreateViewDdl {
+  std::string name;
+  std::string definition;
+  std::vector<std::uint32_t> depends_on;
+  std::vector<std::string> columns;
+};
+struct DropViewDdl {
+  std::string name;
+  bool if_exists{false};
+};
+using Ddl = std::variant<CreateTableDdl, CreateIndexDdl, DropTableDdl, DropIndexDdl, AddColumnDdl, CreateViewDdl,
+                         DropViewDdl>;
 
 class Catalog {
 public:
@@ -342,6 +412,9 @@ public:
   [[nodiscard]] auto tables() const -> const std::map<std::uint32_t, Table>& { return tables_; }
   [[nodiscard]] auto table(std::string_view name) const -> const Table*;
   [[nodiscard]] auto table(std::uint32_t id) const -> const Table*;
+  [[nodiscard]] auto views() const -> const std::map<std::uint32_t, View>& { return views_; }
+  [[nodiscard]] auto view(std::string_view name) const -> const View*;
+  [[nodiscard]] auto view(std::uint32_t id) const -> const View*;
   // An index by name, with its table.
   [[nodiscard]] auto index(std::string_view name) const -> std::pair<const Table*, const Index*>;
   // A table or an index: both draw ids from one counter.
@@ -350,9 +423,19 @@ public:
   // Object ids stay at or below 2^24 - 1: bc_error_detail carries one in its
   // low 24 bits (and a plan's constants are an enum, whose values are ints).
   static constexpr std::uint32_t kMaxObjectId = ConstraintDetail::kMaxObjectId;
-  // 3: #489's record (SQL types, defaults, unique and DESC parts, layout
-  // entries). 2 was #490's, 1 the prototype's; both are refused.
-  static constexpr std::uint16_t kRecordFormat = 3;
+  // 4: a column entry ends with its hidden flag (the row id of a table
+  // without a primary key). 3, #489's record (SQL types, defaults, unique
+  // and DESC parts, layout entries), is read with no hidden column. 2 was
+  // #490's, 1 the prototype's; both are refused.
+  // 5: the record ends with the table's CHECK constraints. A table with none
+  // is still written as 4, so only a database that holds a CHECK is closed
+  // to an earlier build.
+  // 6: as 5, but the CHECK count may be 0. It is the record of a table with a
+  // TIMESTAMP WITH TIME ZONE or CHAR(n) column, whose type tag an earlier
+  // build would call corrupt: written only for such a table, so only a
+  // database that holds one is closed to an earlier build.
+  static constexpr std::uint16_t kRecordFormat = 6;
+  static constexpr std::uint16_t kOldestRecordFormat = 3;
 
   // The constants a plan on this table needs, named from ids alone so that
   // no table, index or column name has to be a C identifier and no two can
@@ -390,11 +473,13 @@ private:
   void put_table(Table t);
   void erase_table(std::uint32_t id);
   void rebuild_lookups();
+  [[nodiscard]] auto find_view_dependent(std::uint32_t id) const -> const View*;
 
   std::uint64_t next_id_{1};
   std::uint64_t version_{0};
   std::map<std::uint32_t, Table> tables_;
-  std::map<std::string, std::uint32_t, std::less<>> names_;  // table or index name -> id
+  std::map<std::uint32_t, View> views_;
+  std::map<std::string, std::uint32_t, std::less<>> names_;  // table, index or view name -> id
   std::map<std::uint32_t, KeyLayout> key_layouts_;
 };
 
@@ -450,6 +535,18 @@ public:
 
   static constexpr int kDdlAttempts = 3;
 
+  // The next row id of `t`, a table whose primary key is its hidden row id:
+  // one past every id it has handed out, which starts one past the
+  // greatest id the engine holds for the table (from 1 for none). Ids are
+  // drawn, never returned: an insert that fails or rolls back leaves a gap,
+  // and none is handed out twice while this catalog lives. The data file is
+  // the only record, so after a reopen the ids of rows deleted from the end
+  // of the table may be handed out again. A second LiveCatalog on the same
+  // open DB (only tests make one) counts on its own; the engine's check of
+  // every written key refuses an id both draw. Thread-safe. Throws
+  // std::length_error past INT64_MAX, and as the engine's reads throw.
+  [[nodiscard]] auto next_row_id(const Table& t) -> std::int64_t;
+
   // Test seam: called during every commit after the generation counter
   // turns odd and before the batch reaches the engine, under the DDL lock.
   // Lets a test hold a DDL mid-commit. Not thread-safe to set while DDL runs.
@@ -473,10 +570,15 @@ private:
   // Odd from just before a DDL's batch reaches the engine until current_
   // is swapped (or the commit fails).
   mutable std::atomic<std::uint64_t> gen_{0};
+  // Per table with a row id, the next id to hand out; a table enters at its
+  // first insert. Held only to find and advance an entry, and to seed one.
+  std::mutex row_ids_mu_;
+  std::map<std::uint32_t, std::int64_t> row_ids_;
 };
 
 // The catalog record's key and a table's row-key range: for tests and tools.
 [[nodiscard]] auto table_record_key(std::uint32_t table_id) -> Bytes;
+[[nodiscard]] auto view_record_key(std::uint32_t view_id) -> Bytes;
 [[nodiscard]] auto name_entry_key(std::string_view name) -> Bytes;
 // Every row key of a table starts with its row prefix: kNsRow, the table id.
 [[nodiscard]] auto row_prefix(std::uint32_t table_id) -> Bytes;
@@ -496,6 +598,8 @@ void for_each_row(const Snapshot& snap, std::uint32_t table_id, Visit&& visit) {
 // std::runtime_error if it does not parse or breaks an invariant.
 [[nodiscard]] auto serialize_table(const Table& t) -> Bytes;
 [[nodiscard]] auto parse_table(BytesView record) -> Table;
+[[nodiscard]] auto serialize_view(const View& v) -> Bytes;
+[[nodiscard]] auto parse_view(BytesView record) -> View;
 
 // Encodes the primary key of `t` from a row: kNsRow, the table id, the parts.
 [[nodiscard]] auto encode_pk_from_row(const Table& t, BytesView row, Bytes& out) -> bool;
@@ -514,10 +618,13 @@ namespace {
 constexpr std::byte kSubCounter{0x01};
 constexpr std::byte kSubTable{0x02};
 constexpr std::byte kSubName{0x03};
+constexpr std::byte kSubView{0x04};
 constexpr std::byte kCounterNextId{0x01};
 constexpr std::byte kCounterVersion{0x02};
 constexpr std::uint8_t kKindTable = 1;
 constexpr std::uint8_t kKindIndex = 2;
+constexpr std::uint8_t kKindView = 3;
+constexpr std::uint16_t kViewRecordFormat = 1;
 
 using DdlOp = Catalog::DdlOp;
 
@@ -742,6 +849,50 @@ auto snapshot_version(const Snapshot& snap) -> std::uint64_t {
   return snap.get({}, counter_key(kCounterVersion), v) ? be_value(v) : 0;
 }
 
+// The bytes of the first `limit` of s that end on a UTF-8 character
+// (PostgreSQL's pg_mbcliplen).
+auto clip_utf8(std::string_view s, std::size_t limit) -> std::size_t {
+  while (limit > 0 && limit < s.size() && (static_cast<unsigned char>(s[limit]) & 0xC0) == 0x80) --limit;
+  return limit;
+}
+
+// PostgreSQL's name for an object it names (makeObjectName): name1_name2_label
+// within 63 bytes, the longer of name1 and name2 shortened first, each then
+// clipped to a character.
+auto object_name(std::string_view name1, std::string_view name2, std::string_view label) -> std::string {
+  constexpr std::size_t kMaxName = 63;  // PostgreSQL's NAMEDATALEN - 1
+  auto overhead = 1 + label.size() + 1;
+  auto avail = kMaxName - overhead;
+  auto n1 = name1.size();
+  auto n2 = name2.size();
+  while (n1 + n2 > avail) {
+    if (n1 > n2) {
+      --n1;
+    } else {
+      --n2;
+    }
+  }
+  return std::string{name1.substr(0, clip_utf8(name1, n1))} + "_" + std::string{name2.substr(0, clip_utf8(name2, n2))} +
+         "_" + std::string{label};
+}
+
+// The name PostgreSQL gives a UNIQUE constraint's index it names
+// (ChooseIndexName): table_columns_key, the columns joined by _, and key1,
+// key2… where the name is taken.
+template <typename Taken>
+auto unique_index_name(std::string_view table, const std::vector<std::string>& columns, const Taken& taken) -> std::string {
+  std::string name2;
+  for (const auto& c : columns) {
+    if (!name2.empty()) name2 += '_';
+    name2 += c;
+    if (name2.size() >= 64) break;
+  }
+  for (std::uint32_t pass = 0;; ++pass) {
+    auto name = object_name(table, name2, pass == 0 ? std::string{"key"} : "key" + std::to_string(pass));
+    if (!taken(name)) return name;
+  }
+}
+
 auto reserve_ids(std::uint64_t& next_id, std::uint32_t n) -> std::uint32_t {
   auto first = next_id;
   if (first + n - 1 > Catalog::kMaxObjectId) throw std::length_error("catalog object ids exhausted");
@@ -834,7 +985,8 @@ auto set_datum(RowWriter& w, std::uint32_t col_id, const Datum& d) -> bool {
 
 auto sql_type_valid(SqlType t) -> bool {
   switch (t.kind) {
-    case SqlKind::Varchar: return t.length > 0 && t.precision == 0 && t.scale == 0;
+    case SqlKind::Varchar:
+    case SqlKind::Char: return t.length > 0 && t.precision == 0 && t.scale == 0;
     case SqlKind::Decimal:
       return t.length == 0 && t.precision >= 1 && t.precision <= kMaxDecimalPrecision && t.scale <= t.precision;
     case SqlKind::SmallInt:
@@ -846,6 +998,7 @@ auto sql_type_valid(SqlType t) -> bool {
     case SqlKind::Bytea:
     case SqlKind::Text:
     case SqlKind::Timestamp:
+    case SqlKind::TimestampTz:
     case SqlKind::Date:
     case SqlKind::Time: return t.length == 0 && t.precision == 0 && t.scale == 0;
     case SqlKind::Numeric: return false;  // AVG's result: no column is declared one
@@ -865,10 +1018,12 @@ auto sql_type_name(SqlType t) -> std::string {
     case SqlKind::Bytea: return "bytea";
     case SqlKind::Text: return "text";
     case SqlKind::Varchar: return "varchar(" + std::to_string(t.length) + ")";
+    case SqlKind::Char: return "char(" + std::to_string(t.length) + ")";
     case SqlKind::Decimal:
       if (t.precision == 0) return "numeric";  // no declared precision: a SUM's result
       return "numeric(" + std::to_string(t.precision) + "," + std::to_string(t.scale) + ")";
     case SqlKind::Timestamp: return "timestamp";
+    case SqlKind::TimestampTz: return "timestamptz";
     case SqlKind::Date: return "date";
     case SqlKind::Time: return "time";
     case SqlKind::Numeric: return "numeric";
@@ -914,7 +1069,8 @@ auto utf8_code_points(BytesView s) -> std::optional<std::size_t> {
 auto compared_type(SqlType t) -> ComparedType {
   auto same = [](SqlType u) { return ComparedType{u, u}; };
   switch (t.kind) {
-    case SqlKind::Varchar: return same({SqlKind::Text});
+    case SqlKind::Varchar:
+    case SqlKind::Char: return same({SqlKind::Text});
     case SqlKind::Decimal:
       if (t.scale == 0) return same({SqlKind::BigInt});
       return {{SqlKind::Decimal, 0, 0, t.scale}, {SqlKind::BigInt}};
@@ -927,6 +1083,7 @@ auto compared_type(SqlType t) -> ComparedType {
     case SqlKind::Bytea:
     case SqlKind::Text:
     case SqlKind::Timestamp:
+    case SqlKind::TimestampTz:
     case SqlKind::Date:
     case SqlKind::Time:
     case SqlKind::Numeric: return same(t);
@@ -955,6 +1112,7 @@ auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string> {
       if (v < kMinDate || v >= kEndDate) return "date out of range";
       break;
     case SqlKind::Timestamp:
+    case SqlKind::TimestampTz:
       if (v < kMinTimestamp) return "timestamp out of range";
       break;
     case SqlKind::BigInt:
@@ -964,6 +1122,7 @@ auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string> {
     case SqlKind::Bytea:
     case SqlKind::Text:
     case SqlKind::Varchar:
+    case SqlKind::Char:
     case SqlKind::Numeric: break;
   }
   return std::nullopt;
@@ -981,11 +1140,16 @@ auto out_of_range(SqlType t, double v) -> std::optional<std::string> {
 }
 
 auto out_of_range(SqlType t, BytesView v) -> std::optional<std::string> {
-  if (t.kind != SqlKind::Text && t.kind != SqlKind::Varchar) return std::nullopt;
+  if (t.kind != SqlKind::Text && t.kind != SqlKind::Varchar && t.kind != SqlKind::Char) return std::nullopt;
   auto n = utf8_code_points(v);
   if (!n) return "invalid byte sequence for encoding \"UTF8\"";
   if (t.kind == SqlKind::Varchar && *n > t.length) {
     return "value too long for type character varying(" + std::to_string(t.length) + ")";
+  }
+  if (t.kind == SqlKind::Char && *n > t.length) {
+    // Spaces past n are cut, not refused: only the other characters count.
+    while (!v.empty() && v.back() == std::byte{' '}) v = v.first(v.size() - 1);
+    if (utf8_code_points(v) > t.length) return "value too long for type character(" + std::to_string(t.length) + ")";
   }
   return std::nullopt;
 }
@@ -1000,6 +1164,7 @@ constexpr RangeMessage kRangeMessages[] = {
     {"value out of range: underflow", "22003"},  // REAL
     {"numeric field overflow", "22003"},         // DECIMAL(p, s)
     {"value too long for type character varying", "22001"},
+    {"value too long for type character(", "22001"},
     {"invalid byte sequence for encoding", "22021"},  // TEXT, VARCHAR
     {"date out of range", "22008"},
     {"timestamp out of range", "22008"},
@@ -1052,6 +1217,13 @@ auto table_record_key(std::uint32_t id) -> Bytes {
   return k;
 }
 
+auto view_record_key(std::uint32_t id) -> Bytes {
+  auto k = Bytes{std::byte{kNsCatalog}, kSubView};
+  auto idb = be_bytes(id, 4);
+  k.insert(k.end(), idb.begin(), idb.end());
+  return k;
+}
+
 auto name_entry_key(std::string_view name) -> Bytes {
   Bytes k{std::byte{kNsCatalog}, kSubName};
   for (auto c : name) k.push_back(static_cast<std::byte>(c));
@@ -1059,6 +1231,15 @@ auto name_entry_key(std::string_view name) -> Bytes {
 }
 
 namespace {
+
+// A CHAR(n) is stored without its trailing spaces, which a key built from a
+// parameter would keep: it is not a key or index column yet.
+void refuse_char_key(const Column& c) {
+  if (c.sql.kind == SqlKind::Char) {
+    throw DdlRefused("CHAR(n) column \"" + c.name + "\" as a primary key, unique or index column is not supported yet; use VARCHAR(n)",
+                     kFeatureNotSupported);
+  }
+}
 
 void write_layout(RecordWriter& w, std::uint32_t layout_id, const RowLayout& l) {
   w.entry([&](RecordWriter& e) {
@@ -1106,7 +1287,8 @@ auto read_layout(RecordReader& r, const Table& t) -> std::pair<std::uint32_t, Ro
 
 auto serialize_table(const Table& t) -> Bytes {
   RecordWriter w;
-  w.u16(Catalog::kRecordFormat);
+  auto has_new_type = std::ranges::any_of(t.columns, [](const Column& c) { return c.sql.kind == SqlKind::TimestampTz || c.sql.kind == SqlKind::Char; });
+  w.u16(has_new_type ? Catalog::kRecordFormat : t.checks.empty() ? std::uint16_t{4} : std::uint16_t{5});
   w.u32(t.id);
   w.str(t.name);
   w.u32(t.version);
@@ -1122,6 +1304,7 @@ auto serialize_table(const Table& t) -> Bytes {
       e.u8(c.sql.scale);
       e.u8(c.nullable ? 1 : 0);
       write_datum(e, c.default_value);
+      e.u8(c.hidden ? 1 : 0);
     });
   }
   w.u16(t.pk_col_ids.size());
@@ -1142,14 +1325,60 @@ auto serialize_table(const Table& t) -> Bytes {
   w.u16(t.retired_layouts.size() + 1);
   for (const auto& [id, l] : t.retired_layouts) write_layout(w, id, l);
   write_layout(w, t.layout_id, t.layout);
+  if (!t.checks.empty() || has_new_type) {
+    w.u16(t.checks.size());
+    for (const auto& c : t.checks) {
+      w.entry([&](RecordWriter& e) {
+        e.str(c.name);
+        e.blob(std::as_bytes(std::span{c.expr}));
+      });
+    }
+  }
   return w.bytes();
+}
+
+// A view record: u16 format, u32 id, str name, blob definition,
+// u16 ndeps { u32 id }, u16 ncols { str name }. Append-only, as a table's.
+auto serialize_view(const View& v) -> Bytes {
+  RecordWriter w;
+  w.u16(kViewRecordFormat);
+  w.u32(v.id);
+  w.str(v.name);
+  w.blob(std::as_bytes(std::span{v.definition}));
+  w.u16(v.depends_on.size());
+  for (auto id : v.depends_on) w.u32(id);
+  w.u16(v.columns.size());
+  for (const auto& c : v.columns) w.str(c);
+  return w.bytes();
+}
+
+auto parse_view(BytesView in) -> View {
+  RecordReader r{in};
+  auto format = r.u16();
+  if (format != kViewRecordFormat) {
+    throw std::runtime_error("catalog view record format " + std::to_string(format) + " is not " +
+                             std::to_string(kViewRecordFormat) + ": the database was written by a later SQL-layer build");
+  }
+  View v;
+  v.id = r.u32();
+  v.name = r.str();
+  v.definition = as_string(r.blob());
+  auto ndeps = r.u16();
+  for (std::uint32_t i = 0; i < ndeps; ++i) v.depends_on.push_back(r.u32());
+  auto ncols = r.u16();
+  for (std::uint32_t i = 0; i < ncols; ++i) v.columns.push_back(r.str());
+  r.expect_end("record of view " + v.name);
+  if (v.definition.empty() || v.columns.empty()) corrupt("view " + v.name + " has no definition or no columns");
+  return v;
 }
 
 auto parse_table(BytesView in) -> Table {
   RecordReader r{in};
-  if (auto format = r.u16(); format != Catalog::kRecordFormat) {
+  auto format = r.u16();
+  if (format < Catalog::kOldestRecordFormat || format > Catalog::kRecordFormat) {
     throw std::runtime_error(
-        "catalog record format " + std::to_string(format) + " is not " + std::to_string(Catalog::kRecordFormat) +
+        "catalog record format " + std::to_string(format) + " is not " +
+        std::to_string(Catalog::kOldestRecordFormat) + " to " + std::to_string(Catalog::kRecordFormat) +
         (format < Catalog::kRecordFormat
              ? ": the database was written by an earlier SQL-layer build whose catalog this build does not read"
              : ": the database was written by a later SQL-layer build"));
@@ -1171,13 +1400,16 @@ auto parse_table(BytesView in) -> Table {
     c.sql.scale = e.u8();
     auto nullable = e.u8();
     c.default_value = read_datum(e);
+    auto hidden = format >= 4 ? e.u8() : std::uint8_t{0};
     e.expect_end("column entry of table " + t.name);
     if (!sql_type_valid(c.sql)) corrupt("column " + c.name + " of table " + t.name + " has an invalid type");
     if (nullable > 1) corrupt("column " + c.name + " of table " + t.name + " has a bad nullable flag");
+    if (hidden > 1) corrupt("column " + c.name + " of table " + t.name + " has a bad hidden flag");
     c.type = phys_type(c.sql);
     c.nullable = nullable == 1;
+    c.hidden = hidden == 1;
     if (!datum_fits(c.default_value, c.type)) corrupt("default of column " + c.name + " is not of its type");
-    if (c.id >= t.next_col_id || t.column(c.id) != nullptr || t.column(c.name) != nullptr) {
+    if (c.id >= t.next_col_id || t.column(c.id) != nullptr || (!c.hidden && t.column(c.name) != nullptr)) {
       corrupt("table " + t.name + " has a column id or name twice, or past next_col_id");
     }
     t.columns.push_back(std::move(c));
@@ -1217,6 +1449,22 @@ auto parse_table(BytesView in) -> Table {
   for (std::uint32_t i = 0; i < nlayout; ++i) t.retired_layouts.push_back(read_layout(r, t));
   std::tie(t.layout_id, t.layout) = std::move(t.retired_layouts.back());
   t.retired_layouts.pop_back();
+  if (format >= 5) {
+    auto nchecks = r.u16();
+    if (nchecks == 0 && format == 5) corrupt("table " + t.name + " has a format-5 record and no CHECK");
+    for (std::uint32_t i = 0; i < nchecks; ++i) {
+      RecordReader e{r.blob()};
+      CheckConstraint c;
+      c.name = e.str();
+      auto text = e.blob();
+      c.expr.assign(reinterpret_cast<const char*>(text.data()), text.size());
+      e.expect_end("CHECK entry of table " + t.name);
+      if (c.name.empty() || c.expr.empty() || std::ranges::contains(t.checks, c.name, &CheckConstraint::name)) {
+        corrupt("table " + t.name + " has a malformed CHECK");
+      }
+      t.checks.push_back(std::move(c));
+    }
+  }
   r.expect_end("record of table " + t.name);
 
   // Every key column is a column of the table, and the current layout holds
@@ -1231,14 +1479,28 @@ auto parse_table(BytesView in) -> Table {
   if (std::ranges::any_of(t.pk_col_ids, [&](std::uint32_t id) { return t.column(id)->nullable; })) {
     corrupt("table " + t.name + " has a nullable primary key column");
   }
+  // A hidden column is the row id: the whole primary key, a BIGINT with no
+  // name and no default that no index names, and the table's only one.
+  auto row_id_ok = [&](const Column& c) {
+    auto indexed = std::ranges::any_of(
+        t.indexes, [&](const Index& ix) { return std::ranges::contains(ix.parts, c.id, &IndexPart::col_id); });
+    return t.pk_col_ids == std::vector{c.id} && c.sql.kind == SqlKind::BigInt && c.name.empty() &&
+           std::holds_alternative<std::monostate>(c.default_value) && !indexed;
+  };
+  auto hidden = std::ranges::count_if(t.columns, &Column::hidden);
+  if (hidden > 1 || (hidden == 1 && !row_id_ok(*std::ranges::find_if(t.columns, &Column::hidden)))) {
+    corrupt("table " + t.name + " has a malformed row id");
+  }
   if (t.layout.columns.size() != t.columns.size()) corrupt("current layout of table " + t.name + " misses a column");
   return t;
 }
 
 // ------------------------------------------------------------------ lookups
 
+auto Table::storage_id() const -> std::uint32_t { return source != 0 ? source : id; }
+
 auto Table::column(std::string_view n) const -> const Column* {
-  auto it = std::ranges::find(columns, n, &Column::name);
+  auto it = std::ranges::find_if(columns, [&](const Column& c) { return !c.hidden && c.name == n; });
   return it == columns.end() ? nullptr : &*it;
 }
 
@@ -1250,6 +1512,12 @@ auto Table::column(std::uint32_t cid) const -> const Column* {
 auto Table::index(std::string_view n) const -> const Index* {
   auto it = std::ranges::find(indexes, n, &Index::name);
   return it == indexes.end() ? nullptr : &*it;
+}
+
+auto Table::row_id() const -> const Column* {
+  if (pk_col_ids.size() != 1) return nullptr;
+  const auto* c = column(pk_col_ids[0]);
+  return c != nullptr && c->hidden ? c : nullptr;
 }
 
 auto Catalog::load(const Snapshot& snap) -> Catalog {
@@ -1274,6 +1542,15 @@ auto Catalog::load(const Snapshot& snap) -> Catalog {
     }
     cat.tables_.emplace(t.id, std::move(t));
   }
+  auto views = Bytes{std::byte{kNsCatalog}, kSubView};
+  for (const auto& e : snap.iter_from({}, views)) {
+    if (!has_prefix(e.key, views)) break;
+    auto parsed = parse_view(e.value);
+    if (e.key.size() != views.size() + 4 || be_value(e.key.subspan(views.size())) != parsed.id) {
+      corrupt("record of view " + parsed.name + " is under another id's key");
+    }
+    cat.views_.emplace(parsed.id, std::move(parsed));
+  }
   cat.rebuild_lookups();
 
   // Every id below the counter and used once; every name entry names its
@@ -1290,6 +1567,13 @@ auto Catalog::load(const Snapshot& snap) -> Catalog {
     for (const auto& ix : t.indexes) use(ix.id);
     objects += 1 + t.indexes.size();
   }
+  for (const auto& [id, def] : cat.views_) {
+    use(id);
+    for (auto dep : def.depends_on) {
+      if (!cat.tables_.contains(dep) && !cat.views_.contains(dep)) corrupt("view " + def.name + " depends on a missing object");
+    }
+  }
+  objects += cat.views_.size();
   std::size_t entries = 0;
   auto names = Bytes{std::byte{kNsCatalog}, kSubName};
   for (const auto& e : snap.iter_from({}, names)) {
@@ -1298,12 +1582,12 @@ auto Catalog::load(const Snapshot& snap) -> Catalog {
     auto it = cat.names_.find(name);
     auto kind = e.value.empty() ? 0 : std::to_integer<std::uint8_t>(e.value[0]);
     if (it == cat.names_.end() || e.value.size() != 5 || be_value(e.value.subspan(1)) != it->second ||
-        kind != (cat.tables_.contains(it->second) ? kKindTable : kKindIndex)) {
+        kind != (cat.tables_.contains(it->second) ? kKindTable : cat.views_.contains(it->second) ? kKindView : kKindIndex)) {
       corrupt("name entry " + name + " does not match the records");
     }
     ++entries;
   }
-  if (entries != objects || cat.names_.size() != objects) corrupt("a table or index has no name entry");
+  if (entries != objects || cat.names_.size() != objects) corrupt("a table, index or view has no name entry");
   return cat;
 }
 
@@ -1312,6 +1596,7 @@ auto Catalog::clone() const -> Catalog {
   c.next_id_ = next_id_;
   c.version_ = version_;
   c.tables_ = tables_;
+  c.views_ = views_;
   c.rebuild_lookups();
   return c;
 }
@@ -1326,10 +1611,14 @@ void Catalog::erase_table(std::uint32_t id) { tables_.erase(id); }
 void Catalog::rebuild_lookups() {
   names_.clear();
   key_layouts_.clear();
+  auto name_taken = [&](const std::string& n) {
+    if (names_.contains(n)) corrupt("name " + n + " is used twice");
+  };
+  for (const auto& [id, v] : views_) {
+    name_taken(v.name);
+    names_[v.name] = id;
+  }
   for (const auto& [id, t] : tables_) {
-    auto name_taken = [&](const std::string& n) {
-      if (names_.contains(n)) corrupt("name " + n + " is used twice");
-    };
     name_taken(t.name);
     names_[t.name] = id;
     std::vector<KeyPart> pk_parts;
@@ -1360,6 +1649,23 @@ auto Catalog::table(std::uint32_t id) const -> const Table* {
   return it == tables_.end() ? nullptr : &it->second;
 }
 
+auto Catalog::view(std::string_view name) const -> const View* {
+  auto it = names_.find(name);
+  return it == names_.end() ? nullptr : view(it->second);
+}
+
+auto Catalog::view(std::uint32_t id) const -> const View* {
+  auto it = views_.find(id);
+  return it == views_.end() ? nullptr : &it->second;
+}
+
+auto Catalog::find_view_dependent(std::uint32_t id) const -> const View* {
+  for (const auto& [vid, v] : views_) {
+    if (std::ranges::find(v.depends_on, id) != v.depends_on.end()) return &v;
+  }
+  return nullptr;
+}
+
 auto Catalog::index(std::string_view name) const -> std::pair<const Table*, const Index*> {
   auto it = names_.find(name);
   if (it == names_.end()) return {nullptr, nullptr};
@@ -1376,9 +1682,10 @@ auto Catalog::key_layout(std::uint32_t id) const -> const KeyLayout* {
 auto Catalog::constants(const Table& t) -> std::vector<PlanConstant> {
   std::vector<PlanConstant> out;
   auto id = [](std::uint32_t v) { return std::to_string(v); };
-  out.push_back({"TBL_" + id(t.id), t.id, t.name});
+  auto named = [](const Column& c) { return c.hidden ? std::string{"(row id)"} : c.name; };
+  out.push_back({"TBL_" + id(t.id), t.storage_id(), t.name});
   for (const auto& ix : t.indexes) out.push_back({"IDX_" + id(ix.id), ix.id, ix.name});
-  for (const auto& c : t.columns) out.push_back({"COL_" + id(t.id) + "_" + id(c.id), c.id, t.name + "." + c.name});
+  for (const auto& c : t.columns) out.push_back({"COL_" + id(t.id) + "_" + id(c.id), c.id, t.name + "." + named(c)});
   // Key parts by position: a table's primary key, then each index's parts
   // and the primary key after them. A column an index names and its primary
   // key suffix repeats keeps its first position.
@@ -1388,7 +1695,7 @@ auto Catalog::constants(const Table& t) -> std::vector<PlanConstant> {
       if (std::ranges::find(seen, cols[i]) != seen.end()) continue;
       seen.push_back(cols[i]);
       out.push_back({"PART_" + id(key_id) + "_" + id(cols[i]), static_cast<std::uint32_t>(i),
-                     key_name + "." + t.column(cols[i])->name});
+                     key_name + "." + named(*t.column(cols[i]))});
     }
   };
   parts(t.id, t.name, t.pk_col_ids);
@@ -1419,6 +1726,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   };
   auto find_table = [&](const std::string& name) -> const Table& {
     const auto* t = table(name);
+    if (t == nullptr && view(name) != nullptr) throw DdlRefused("\"" + name + "\" is not a table", kWrongObjectType);
     if (t == nullptr) throw DdlRefused("relation \"" + std::string{name} + "\" does not exist", kUndefinedTable);
     return *t;
   };
@@ -1428,7 +1736,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     auto name = std::string{ct->name};
     // PostgreSQL's order: the statement's own columns and key parts are
     // refused before a name already taken (42701, 42703 over 42P07); a table
-    // without a key and a column of an unsupported type or default, which
+    // of no columns and a column of an unsupported type or default, which
     // PostgreSQL runs, after it.
     std::vector<std::string> names;
     for (const auto& spec : ct->columns) {
@@ -1446,8 +1754,29 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
         throw DdlRefused("column \"" + p + "\" appears twice in the primary key", kDuplicateColumn);
       }
     }
+    // The UNIQUE constraints, as PostgreSQL takes them: each column present
+    // and named once. One on the primary key's columns, in order, is the
+    // key; one on an earlier one's is that index, which takes its name if it
+    // had none.
+    std::vector<UniqueSpec> unique;
+    for (const auto& u : ct->unique) {
+      for (const auto& c : u.columns) {
+        if (std::ranges::find(names, c) == names.end()) {
+          throw DdlRefused("column \"" + c + "\" named in key does not exist", kUndefinedColumn);
+        }
+        if (std::ranges::count(u.columns, c) > 1) {
+          throw DdlRefused("column \"" + c + "\" appears twice in unique constraint", kDuplicateColumn);
+        }
+      }
+      if (u.columns == ct->pk) continue;
+      if (auto prior = std::ranges::find(unique, u.columns, &UniqueSpec::columns); prior != unique.end()) {
+        if (prior->name.empty()) prior->name = u.name;
+        continue;
+      }
+      unique.push_back(u);
+    }
     name_free(name);
-    if (ct->columns.empty() || ct->pk.empty()) throw DdlRefused("a table needs columns and a primary key", kFeatureNotSupported);
+    if (ct->columns.empty()) throw DdlRefused("a table needs columns", kFeatureNotSupported);
     Table t;
     t.name = name;
     std::vector<ColumnDef> defs;
@@ -1459,12 +1788,58 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       defs.emplace_back(c.id, c.sql, c.nullable);
       t.columns.push_back(std::move(c));
     }
-    for (const auto& p : ct->pk) t.pk_col_ids.push_back(t.column(p)->id);
+    for (const auto& p : ct->pk) {
+      refuse_char_key(*t.column(p));
+      t.pk_col_ids.push_back(t.column(p)->id);
+    }
+    if (ct->pk.empty()) {
+      // No primary key: a hidden row id is the key, after the columns.
+      Column c{t.next_col_id++, "", {SqlKind::BigInt}, PhysType::I64, false, {}, true};
+      defs.emplace_back(c.id, c.sql, c.nullable);
+      t.pk_col_ids.push_back(c.id);
+      t.columns.push_back(std::move(c));
+    }
     t.layout = make_layout(defs);
     t.id = reserve_ids(next->next_id_, 2);
     t.layout_id = t.id + 1;
     put_op(ops, DdlOp::Kind::EnsureAbsent, name_entry_key(name));
     put_op(ops, DdlOp::Kind::Put, name_entry_key(name), name_value(kKindTable, t.id));
+    // Each a unique index, named in order: as written, or as PostgreSQL
+    // chooses, past every relation name and the ones before it.
+    auto taken = [&](const std::string& n) {
+      return names_.contains(n) || n == t.name || std::ranges::contains(t.indexes, n, &Index::name);
+    };
+    for (const auto& u : unique) {
+      Index ix;
+      ix.name = u.name.empty() ? unique_index_name(t.name, u.columns, taken) : u.name;
+      if (taken(ix.name)) throw DdlRefused("relation \"" + ix.name + "\" already exists", kDuplicateTable);
+      ix.unique = true;
+      for (const auto& c : u.columns) {
+        refuse_char_key(*t.column(c));
+        ix.parts.push_back({t.column(c)->id, false});
+      }
+      ix.id = reserve_ids(next->next_id_, 1);
+      put_op(ops, DdlOp::Kind::EnsureAbsent, name_entry_key(ix.name));
+      put_op(ops, DdlOp::Kind::Put, name_entry_key(ix.name), name_value(kKindIndex, ix.id));
+      t.indexes.push_back(std::move(ix));
+    }
+    // The CHECKs, named as written or as PostgreSQL's ChooseConstraintName
+    // does: table_column_check for one on a column, table_check for the
+    // table's, then 1, 2… where a CHECK of the table has the name.
+    for (const auto& c : ct->checks) {
+      if (c.name.empty()) continue;
+      if (std::ranges::contains(t.checks, c.name, &CheckConstraint::name)) {
+        throw DdlRefused("constraint \"" + c.name + "\" for relation \"" + t.name + "\" already exists", kDuplicateObject);
+      }
+      t.checks.push_back({c.name, c.expr});
+    }
+    for (const auto& c : ct->checks) {
+      if (!c.name.empty()) continue;
+      auto base = t.name + (c.column.empty() ? "" : "_" + c.column) + "_check";
+      auto chosen = base;
+      for (auto n = 1; std::ranges::contains(t.checks, chosen, &CheckConstraint::name); ++n) chosen = base + std::to_string(n);
+      t.checks.push_back({chosen, c.expr});
+    }
     put_op(ops, DdlOp::Kind::Put, table_record_key(t.id), serialize_table(t));
     next->put_table(std::move(t));
     return finish();
@@ -1484,6 +1859,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       if (std::ranges::find(ix.parts, col->id, &IndexPart::col_id) != ix.parts.end()) {
         throw DdlRefused("column \"" + col->name + "\" appears twice in the index", kDuplicateColumn);
       }
+      refuse_char_key(*col);
       ix.parts.push_back({col->id, c.desc});
     }
     ix.id = reserve_ids(next->next_id_, 1);
@@ -1520,11 +1896,17 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   if (const auto* dt = std::get_if<DropTableDdl>(&ddl)) {
     const auto* found = table(dt->name);
     if (found == nullptr) {
+      if (view(dt->name) != nullptr) throw DdlRefused("\"" + std::string{dt->name} + "\" is not a table", kWrongObjectType);
       if (index(dt->name).first != nullptr) throw DdlRefused("\"" + std::string{dt->name} + "\" is an index", kWrongObjectType);
       if (dt->if_exists) return nullptr;
       throw DdlRefused("table \"" + std::string{dt->name} + "\" does not exist", kUndefinedTable);
     }
     const auto& t = *found;
+    if (const auto* dependent = find_view_dependent(t.id)) {
+      throw DdlRefused("cannot drop table " + t.name + " because other objects depend on it: view " + dependent->name +
+                           " depends on table " + t.name,
+                       kDependentObjectsStillExist);
+    }
     put_op(ops, DdlOp::Kind::Del, table_record_key(t.id));
     put_op(ops, DdlOp::Kind::Del, name_entry_key(t.name));
     auto rows = row_prefix(t.id);
@@ -1541,7 +1923,9 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   if (const auto* di = std::get_if<DropIndexDdl>(&ddl)) {
     auto [owner, found] = index(di->name);
     if (found == nullptr) {
-      if (table(di->name) != nullptr) throw DdlRefused("\"" + std::string{di->name} + "\" is not an index", kWrongObjectType);
+      if (table(di->name) != nullptr || view(di->name) != nullptr) {
+        throw DdlRefused("\"" + std::string{di->name} + "\" is not an index", kWrongObjectType);
+      }
       if (di->if_exists) return nullptr;
       throw DdlRefused("index \"" + std::string{di->name} + "\" does not exist", kUndefinedObject);
     }
@@ -1554,6 +1938,44 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     auto p = index_prefix(id);
     put_op(ops, DdlOp::Kind::DelRange, p, key_successor(p));
     next->put_table(std::move(t));
+    return finish();
+  }
+
+  if (const auto* cv = std::get_if<CreateViewDdl>(&ddl)) {
+    name_free(cv->name);
+    View v{0, cv->name, cv->definition, cv->depends_on, cv->columns};
+    std::ranges::sort(v.depends_on);
+    v.depends_on.erase(std::unique(v.depends_on.begin(), v.depends_on.end()), v.depends_on.end());
+    for (auto dep : v.depends_on) {
+      if (table(dep) == nullptr && view(dep) == nullptr) {
+        throw DdlRefused("a relation view \"" + cv->name + "\" reads does not exist", kUndefinedTable);
+      }
+    }
+    v.id = reserve_ids(next->next_id_, 1);
+    put_op(ops, DdlOp::Kind::EnsureAbsent, name_entry_key(v.name));
+    put_op(ops, DdlOp::Kind::Put, name_entry_key(v.name), name_value(kKindView, v.id));
+    put_op(ops, DdlOp::Kind::Put, view_record_key(v.id), serialize_view(v));
+    next->views_.emplace(v.id, std::move(v));
+    return finish();
+  }
+
+  if (const auto* dv = std::get_if<DropViewDdl>(&ddl)) {
+    const auto* found = view(dv->name);
+    if (found == nullptr) {
+      if (table(dv->name) != nullptr || index(dv->name).first != nullptr) {
+        throw DdlRefused("\"" + dv->name + "\" is not a view", kWrongObjectType);
+      }
+      if (dv->if_exists) return nullptr;
+      throw DdlRefused("view \"" + dv->name + "\" does not exist", kUndefinedTable);
+    }
+    if (const auto* dependent = find_view_dependent(found->id)) {
+      throw DdlRefused("cannot drop view " + found->name + " because other objects depend on it: view " +
+                           dependent->name + " depends on view " + found->name,
+                       kDependentObjectsStillExist);
+    }
+    put_op(ops, DdlOp::Kind::Del, view_record_key(found->id));
+    put_op(ops, DdlOp::Kind::Del, name_entry_key(found->name));
+    next->views_.erase(found->id);
     return finish();
   }
 
@@ -1610,6 +2032,30 @@ LiveCatalog::LiveCatalog(DB& db) : db_{db} {
 }
 
 auto LiveCatalog::current() const -> std::shared_ptr<const Catalog> { return current_.load(); }
+
+auto LiveCatalog::next_row_id(const Table& t) -> std::int64_t {
+  constexpr auto kLast = std::numeric_limits<std::int64_t>::max();  // never handed out: next would overflow
+  auto used_up = [&] { return std::length_error("table " + t.name + " has used every row id"); };
+  std::lock_guard<std::mutex> lock{row_ids_mu_};
+  auto it = row_ids_.find(t.id);
+  if (it == row_ids_.end()) {
+    // Seeded from the engine's latest state, not a statement's snapshot: no
+    // id of this catalog's is out yet, so every id in use is committed.
+    std::int64_t next = 1;
+    auto prefix = row_prefix(t.id);
+    auto last = db_.rkeys_from({}, key_successor(prefix));
+    if (auto k = last.begin(); k != last.end() && has_prefix(*k, prefix)) {
+      KeyReader r{*k, prefix.size()};
+      auto id = r.read_i64(KeyPart{PhysType::I64});
+      if (!id || !r.at_end()) throw std::runtime_error("malformed row key in table " + t.name);
+      if (*id == kLast) throw used_up();
+      next = std::max<std::int64_t>(*id + 1, 1);
+    }
+    it = row_ids_.emplace(t.id, next).first;
+  }
+  if (it->second == kLast) throw used_up();
+  return it->second++;
+}
 
 auto LiveCatalog::pin() const -> Pinned {
   for (;;) {

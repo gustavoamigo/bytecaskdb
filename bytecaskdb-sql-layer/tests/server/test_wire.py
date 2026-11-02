@@ -401,6 +401,40 @@ def test_describe_statement_gives_parameter_types_and_columns(server):
     assert kinds(out) == b"1tnZ"
 
 
+def row_description(body: bytes) -> list[tuple[str, int]]:
+    """Each RowDescription field's name and type OID."""
+    (n,) = struct.unpack("!h", body[:2])
+    body, out = body[2:], []
+    for _ in range(n):
+        name, body = body.split(b"\0", 1)
+        _, _, oid, _, _, _ = struct.unpack("!ihihih", body[:18])
+        out.append((name.decode(), oid))
+        body = body[18:]
+    return out
+
+
+def test_literals_are_no_parameters_and_their_columns_have_postgresqls_types(server):
+    c = connect(server)
+    c.send(query("CREATE TABLE d (k SMALLINT PRIMARY KEY, s TEXT)"))
+    c.until_ready()
+    sql = "SELECT k, 'x', 2.50, 5, NULL FROM d WHERE k = $1 AND s = 'y'"
+    c.send(parse(sql, "q"), describe("S", "q"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"1tTZ"
+    assert struct.unpack("!hi", out[1][1]) == (1, 21)  # $1 alone, a SMALLINT: the literals are no parameters
+    assert row_description(out[2][1]) == [("k", 21), ("?column?", 25), ("?column?", 1700), ("?column?", 23),
+                                          ("?column?", 25)]
+    assert states(run(c, "INSERT INTO d VALUES (7, 'y')")) == []
+    assert data(run(c, sql, ["7"])) == [["7", "x", "2.50", "5", None]]
+    assert data(run(c, "SELECT -2.E-2, 1 + 1.5, TRUE")) == [["-0.02", "2.5", "t"]]
+    assert states(run(c, "SELECT 2147483647 + 1")) == ["22003"]
+    # A cast is named by its type; a comparison of constants is a boolean.
+    sql = "SELECT DATE '2016-03-26', 3 < 5, CAST('5' AS INTEGER)"
+    c.send(parse(sql, "c"), describe("S", "c"), SYNC)
+    assert row_description(c.until_ready()[2][1]) == [("date", 1082), ("?column?", 16), ("int4", 23)]
+    assert data(run(c, sql)) == [["2016-03-26", "t", "5"]]
+
+
 def test_a_parameter_its_type_does_not_take_is_22p02(server):
     c = connect(server)
     table(c)
@@ -492,7 +526,8 @@ def test_a_query_inside_an_extended_block_joins_its_transaction_and_commits_it(s
     assert status(c.until_ready()) == "I"
     assert keys(c) == ["1"]
     # The Query fails: the Execute before it is rolled back with it.
-    for failing, state in (("SELECT k FROM t WHERE k = 1", "42601"), ("CREATE TABLE w (k BIGINT PRIMARY KEY)", "0A000")):
+    for failing, state in (("SELECT k FROM t WHERE v ILIKE 'a%'", "42601"),
+                           ("CREATE TABLE w (k BIGINT PRIMARY KEY)", "0A000")):
         c.send(parse(insert), bind(["2", "2"]), execute(), query(failing))
         out = c.until_ready()
         assert states(out) == [state] and status(out) == "I", failing
@@ -725,10 +760,16 @@ TEXT_FORMS = [
     ("bytea", ["\\x", "\\xDEADbeef", "\\x0 1", "abc", "a\\\\b", "\\101\\102", "\\xf", "\\9"]),
     ("text", ["", "héllo", "line\nbreak"]),
     ("varchar(3)", ["abc", "abcd"]),
+    ("char(3)", ["abc", "ab", "", "  a", "ab  ", "abcd", "abc   ", "abcd  ", "é", "日本語", "日本語 "]),
     ("date", ["2026-10-22", "0001-01-01", "0001-12-31 BC", "4714-11-24 BC", "2024-02-29", "2023-02-29", "x"]),
     ("time", ["00:00", "12:34:56", "23:59:59.999999", "24:00:00", "10:00:00.5", "25:00", "x"]),
     ("timestamp", ["2026-10-22 10:11:12", "2026-10-22T10:11:12.5", "2026-10-22", "1999-12-31 23:59:59.000001",
                    "0044-03-15 12:00:00 BC", "2026-13-01", "x"]),
+    ("timestamptz", ["2026-10-27 10:00:00+02", "2026-10-27 10:00:00Z", "2026-10-27 10:00:00", "2026-10-27T10:00:00.5-04:30",
+                     "2026-10-27 10:00:00+0530", "2026-10-27 10:00:00 +02:00", "2026-10-27 10:00:00+05:30:15",
+                     "2026-10-27", "0044-03-15 12:00:00+01 BC", "0001-01-01 00:00:00+00 BC",
+                     "2026-10-27 10:00:00+15", "2026-10-27 10:00:00+16", "2026-10-27 10:00:00+", "2026-13-01 00:00:00+01",
+                     "294276-12-31 23:00:00-02", "4714-11-24 00:00:00+00 BC", "4714-11-23 23:00:00+00 BC", "x"]),
 ]
 
 
@@ -1099,58 +1140,6 @@ def test_the_idle_in_transaction_timeout_rolls_back_and_closes_but_spares_a_busy
         shutil.rmtree(directory, ignore_errors=True)
 
 
-def test_the_transaction_timeout_ends_a_busy_transaction():
-    if not server_binary():
-        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
-    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
-    s = Server(directory, extra_args=["--transaction-timeout-ms", "500"])
-    try:
-        c = connect(s)
-        table(c)
-        c.send(query("BEGIN"))
-        assert status(c.until_ready()) == "T"
-        started = time.monotonic()
-        assert states(run(c, "INSERT INTO t VALUES ($1, $2)", ["1", "1"])) == []
-        out = []
-        while time.monotonic() - started < 5:  # busy: a statement every 50 ms
-            time.sleep(0.05)
-            c.send(parse("SELECT k FROM t WHERE k = $1"), bind(["1"]), execute(), SYNC)
-            out = until_ready_or_fatal(c)
-            if out[-1][0] != b"Z":
-                break
-        f = fatal(out)
-        assert f["C"] == "25P04"
-        assert f["M"] == "terminating connection due to transaction timeout"
-        assert 0.5 <= time.monotonic() - started < 5
-        assert c.closed()
-        assert keys(connect(s)) == []  # rolled back
-    finally:
-        s.stop()
-        shutil.rmtree(directory, ignore_errors=True)
-
-
-def test_the_idle_session_timeout_closes_an_idle_session_but_not_one_in_a_transaction():
-    if not server_binary():
-        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
-    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
-    s = Server(directory, extra_args=["--idle-session-timeout-ms", "300"])
-    try:
-        idle = connect(s)
-        in_block = connect(s)
-        table(in_block)
-        in_block.send(query("BEGIN"))
-        assert status(in_block.until_ready()) == "T"
-        time.sleep(1)
-        f = fatal([idle.message()])
-        assert f["C"] == "57P05"
-        assert f["M"] == "terminating connection due to idle-session timeout"
-        assert idle.closed()
-        assert status(run(in_block, "SELECT k FROM t WHERE k = $1", ["1"])) == "T"
-    finally:
-        s.stop()
-        shutil.rmtree(directory, ignore_errors=True)
-
-
 # ------------------------------------------------------------------ bounds
 # docs/session_design.md, *Bounds*.
 
@@ -1240,3 +1229,416 @@ def test_max_memory_bytes_bounds_every_statement_and_transaction_together():
     finally:
         s.stop()
         shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_the_transaction_timeout_ends_a_busy_transaction():
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory, extra_args=["--transaction-timeout-ms", "500"])
+    try:
+        c = connect(s)
+        table(c)
+        c.send(query("BEGIN"))
+        assert status(c.until_ready()) == "T"
+        started = time.monotonic()
+        assert states(run(c, "INSERT INTO t VALUES ($1, $2)", ["1", "1"])) == []
+        out = []
+        while time.monotonic() - started < 5:  # busy: a statement every 50 ms
+            time.sleep(0.05)
+            c.send(parse("SELECT k FROM t WHERE k = $1"), bind(["1"]), execute(), SYNC)
+            out = until_ready_or_fatal(c)
+            if out[-1][0] != b"Z":
+                break
+        f = fatal(out)
+        assert f["C"] == "25P04"
+        assert f["M"] == "terminating connection due to transaction timeout"
+        assert 0.5 <= time.monotonic() - started < 5
+        assert c.closed()
+        assert keys(connect(s)) == []  # rolled back
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_the_idle_session_timeout_closes_an_idle_session_but_not_one_in_a_transaction():
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory, extra_args=["--idle-session-timeout-ms", "300"])
+    try:
+        idle = connect(s)
+        in_block = connect(s)
+        table(in_block)
+        in_block.send(query("BEGIN"))
+        assert status(in_block.until_ready()) == "T"
+        time.sleep(1)
+        f = fatal([idle.message()])
+        assert f["C"] == "57P05"
+        assert f["M"] == "terminating connection due to idle-session timeout"
+        assert idle.closed()
+        assert status(run(in_block, "SELECT k FROM t WHERE k = $1", ["1"])) == "T"
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- cursors (docs/cursor_design.md)
+
+
+def tags(messages) -> list[str]:
+    return [b.rstrip(b"\0").decode() for k, b in messages if k == b"C"]
+
+
+def cursor_table(c: Client) -> None:
+    table(c)
+    for k in range(1, 6):
+        assert states(run(c, "INSERT INTO t VALUES ($1, $2)", [str(k), str(k * 10)])) == []
+
+
+def test_simple_query_cursor_statements_and_their_tags(server):
+    c = connect(server)
+    cursor_table(c)
+    c.send(query("BEGIN"))
+    c.until_ready()
+    c.send(query("DECLARE c CURSOR FOR SELECT k, v FROM t ORDER BY k"))
+    out = c.until_ready()
+    assert kinds(out) == b"CZ" and tags(out) == ["DECLARE CURSOR"] and status(out) == "T"
+    c.send(query("FETCH 2 FROM c"))
+    out = c.until_ready()
+    assert kinds(out) == b"TDDCZ" and tags(out) == ["FETCH 2"]
+    assert row_description(out[0][1]) == [("k", 23), ("v", 20)]
+    assert data(out) == [["1", "10"], ["2", "20"]]
+    c.send(query("MOVE FORWARD 1 IN c"))
+    out = c.until_ready()
+    assert kinds(out) == b"CZ" and tags(out) == ["MOVE 1"]
+    c.send(query("FETCH ALL c"))
+    out = c.until_ready()
+    assert data(out) == [["4", "40"], ["5", "50"]] and tags(out) == ["FETCH 2"]
+    c.send(query("FETCH c"))
+    out = c.until_ready()  # past the end: a description, no row
+    assert kinds(out) == b"TCZ" and tags(out) == ["FETCH 0"]
+    c.send(query("CLOSE c"))
+    assert tags(c.until_ready()) == ["CLOSE CURSOR"]
+    c.send(query("CLOSE ALL"))
+    assert tags(c.until_ready()) == ["CLOSE CURSOR ALL"]
+    c.send(query("COMMIT"))
+    c.until_ready()
+
+
+def test_cursor_errors_and_the_failed_block(server):
+    c = connect(server)
+    cursor_table(c)
+    # Outside a block a DECLARE is a hold cursor (PostgreSQL says 25P01: a known difference).
+    c.send(query("DECLARE c CURSOR FOR SELECT k FROM t"))
+    out = c.until_ready()
+    assert states(out) == [] and tags(out) == ["DECLARE CURSOR"] and status(out) == "I"
+    c.send(query("CLOSE c"))
+    assert tags(c.until_ready()) == ["CLOSE CURSOR"]
+    c.send(query("FETCH c"))
+    assert states(c.until_ready()) == ["34000"]
+    c.send(query("BEGIN"))
+    c.until_ready()
+    c.send(query("DECLARE c CURSOR WITH HOLD FOR SELECT k FROM t FOR UPDATE"))
+    out = c.until_ready()
+    assert states(out) == ["0A000"] and status(out) == "E"  # as PostgreSQL's
+    for sql, state in [("FETCH c", "25P02"), ("DECLARE d CURSOR FOR SELECT k FROM t", "25P02"), ("CLOSE ALL", "25P02")]:
+        c.send(query(sql))
+        assert states(c.until_ready()) == [state], sql
+    c.send(query("ROLLBACK"))
+    assert status(c.until_ready()) == "I"
+    c.send(query("BEGIN"))
+    c.until_ready()
+    c.send(query("DECLARE c CURSOR FOR SELECT k FROM t"))
+    c.until_ready()
+    for sql, state in [("DECLARE c CURSOR FOR SELECT k FROM t", "42P03")]:
+        c.send(query(sql))
+        assert states(c.until_ready()) == [state], sql
+    c.send(query("ROLLBACK"))
+    c.until_ready()
+    # A backward fetch on NO SCROLL, BINARY, an unknown name.
+    for declare, sql, state in [
+        ("DECLARE c NO SCROLL CURSOR FOR SELECT k FROM t", "FETCH PRIOR FROM c", "55000"),
+        ("DECLARE c NO SCROLL CURSOR FOR SELECT k FROM t", "FETCH LAST FROM c", "55000"),
+        ("DECLARE c BINARY CURSOR FOR SELECT k FROM t", "SELECT 1", "0A000"),
+        ("DECLARE c SCROLL CURSOR FOR SELECT k FROM t FOR UPDATE", "SELECT 1", "0A000"),
+        ("DECLARE c CURSOR FOR SELECT k FROM t", "CLOSE nothing", "34000"),
+        ("DECLARE c CURSOR FOR SELECT k FROM t", "FETCH c INTO t", "42601"),
+        ("DECLARE c CURSOR FOR SELECT k FROM nope", "SELECT 1", "42P01"),
+    ]:
+        c.send(query("BEGIN"))
+        c.until_ready()
+        c.send(query(declare))
+        out = c.until_ready()
+        if states(out):  # the DECLARE is the statement that is refused
+            assert states(out) == [state], declare
+        else:
+            c.send(query(sql))
+            assert states(c.until_ready()) == [state], sql
+        c.send(query("ROLLBACK"))
+        c.until_ready()
+
+
+def test_every_fetch_direction_and_its_command_tag(server):
+    c = connect(server)
+    cursor_table(c)  # k = 1 .. 5
+    c.send(query("BEGIN"))
+    c.until_ready()
+    c.send(query("DECLARE c SCROLL CURSOR FOR SELECT k FROM t ORDER BY k"))
+    c.until_ready()
+    # (statement, rows, tag): recorded from PostgreSQL 16 and kept in step with it.
+    for sql, rows, tag in [
+        ("FETCH LAST FROM c", [["5"]], "FETCH 1"),
+        ("FETCH PRIOR c", [["4"]], "FETCH 1"),
+        ("FETCH BACKWARD 2 FROM c", [["3"], ["2"]], "FETCH 2"),
+        ("FETCH NEXT IN c", [["3"]], "FETCH 1"),
+        ("FETCH ABSOLUTE 1 FROM c", [["1"]], "FETCH 1"),
+        ("FETCH PRIOR FROM c", [], "FETCH 0"),
+        ("FETCH PRIOR FROM c", [], "FETCH 0"),
+        ("FETCH RELATIVE 3 FROM c", [["3"]], "FETCH 1"),
+        ("FETCH 0 FROM c", [["3"]], "FETCH 1"),
+        ("FETCH FORWARD 9 FROM c", [["4"], ["5"]], "FETCH 2"),
+        ("FETCH 0 FROM c", [], "FETCH 0"),
+        ("FETCH BACKWARD ALL FROM c", [["5"], ["4"], ["3"], ["2"], ["1"]], "FETCH 5"),
+        ("FETCH -2 FROM c", [], "FETCH 0"),
+        ("FETCH ABSOLUTE -2 FROM c", [["4"]], "FETCH 1"),
+        ("FETCH ABSOLUTE 9 FROM c", [], "FETCH 0"),
+        ("FETCH FIRST FROM c", [["1"]], "FETCH 1"),
+    ]:
+        c.send(query(sql))
+        out = c.until_ready()
+        assert states(out) == [] and data(out) == rows and tags(out) == [tag], sql
+        assert kinds(out) == (b"TCZ" if not rows else b"T" + b"D" * len(rows) + b"CZ"), sql
+    for sql, tag in [
+        ("MOVE LAST IN c", "MOVE 1"),
+        ("MOVE BACKWARD ALL IN c", "MOVE 4"),
+        ("MOVE FORWARD ALL IN c", "MOVE 5"),
+        ("MOVE ABSOLUTE 0 IN c", "MOVE 0"),
+        ("MOVE RELATIVE 0 IN c", "MOVE 0"),
+        ("MOVE ABSOLUTE 2 IN c", "MOVE 1"),
+        ("MOVE 0 IN c", "MOVE 1"),
+    ]:
+        c.send(query(sql))
+        out = c.until_ready()
+        assert kinds(out) == b"CZ" and tags(out) == [tag], sql
+    # Extended protocol: a FETCH in any direction describes as the cursor's columns.
+    c.send(parse("FETCH BACKWARD 2 FROM c", "b"), describe("S", "b"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"1tTZ" and row_description(out[2][1]) == [("k", 23)]
+    c.send(bind([], "b", "pb"), execute("pb"), SYNC)
+    out = c.until_ready()
+    assert data(out) == [["1"]] and tags(out) == ["FETCH 1"]  # from row 2: one row, then the start
+    c.send(parse("FETCH ABSOLUTE -1 FROM c", "l"), bind([], "l", "pl"), describe("P", "pl"), execute("pl"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"12TDCZ" and data(out) == [["5"]]
+    c.send(query("COMMIT"))
+    c.until_ready()
+
+
+def test_no_scroll_refusals_fail_the_block_with_55000(server):
+    c = connect(server)
+    cursor_table(c)
+    for first, refused in [
+        ("FETCH 2 FROM n", "FETCH PRIOR FROM n"),
+        ("FETCH 2 FROM n", "FETCH 0 FROM n"),
+        ("FETCH 2 FROM n", "FETCH ABSOLUTE 1 FROM n"),
+        ("FETCH 2 FROM n", "MOVE BACKWARD 1 IN n"),
+        ("FETCH 2 FROM n", "FETCH LAST FROM n"),
+    ]:
+        c.send(query("BEGIN"))
+        c.until_ready()
+        c.send(query("DECLARE n NO SCROLL CURSOR FOR SELECT k FROM t ORDER BY k"))
+        c.until_ready()
+        c.send(query(first))
+        assert data(c.until_ready()) == [["1"], ["2"]]
+        c.send(query(refused))
+        out = c.until_ready()
+        assert states(out) == ["55000"] and status(out) == "E", refused
+        c.send(query("FETCH NEXT FROM n"))
+        assert states(c.until_ready()) == ["25P02"]
+        c.send(query("ROLLBACK"))
+        c.until_ready()
+    # Going forward is not refused, and a hold cursor keeps its declaration.
+    c.send(query("BEGIN"))
+    c.until_ready()
+    c.send(query("DECLARE n NO SCROLL CURSOR WITH HOLD FOR SELECT k FROM t ORDER BY k"))
+    c.until_ready()
+    c.send(query("COMMIT"))
+    c.until_ready()
+    c.send(query("FETCH ABSOLUTE 4 FROM n"))
+    assert data(c.until_ready()) == [["4"]]
+    c.send(query("FETCH PRIOR FROM n"))
+    assert states(c.until_ready()) == ["55000"]
+    c.send(query("CLOSE n"))
+    c.until_ready()
+
+
+def test_a_cursor_does_not_see_later_writes_and_ends_with_its_transaction(server):
+    c = connect(server)
+    cursor_table(c)
+    c.send(query("BEGIN"))
+    c.until_ready()
+    c.send(query("DECLARE c CURSOR FOR SELECT k FROM t ORDER BY k"))
+    c.until_ready()
+    c.send(query("DELETE FROM t"))
+    c.until_ready()
+    c.send(query("INSERT INTO t VALUES (9, 90)"))
+    c.until_ready()
+    c.send(query("FETCH ALL c"))
+    assert data(c.until_ready()) == [["1"], ["2"], ["3"], ["4"], ["5"]]
+    c.send(query("COMMIT"))
+    c.until_ready()
+    c.send(query("FETCH c"))
+    assert states(c.until_ready()) == ["34000"]
+    # Another connection's cursor is its own: the same name is free.
+    other = connect(server)
+    other.send(query("BEGIN"))
+    other.until_ready()
+    other.send(query("DECLARE c CURSOR FOR SELECT k FROM t"))
+    assert states(other.until_ready()) == []
+    other.close()  # a disconnect with a cursor open rolls the block back
+    again = connect(server)
+    assert data(run(again, "SELECT k FROM t")) == [["9"]]
+
+
+def test_extended_cursor_statements_across_syncs(server):
+    c = connect(server)
+    cursor_table(c)
+    c.send(query("BEGIN"))
+    c.until_ready()
+    # DECLARE with a parameter, through Parse, Bind and Execute.
+    out = run(c, "DECLARE c CURSOR FOR SELECT k, v FROM t WHERE k > $1 ORDER BY k", ["1"])
+    assert kinds(out) == b"12nCZ" and tags(out) == ["DECLARE CURSOR"]
+    # Describing a FETCH before the cursor exists gives NoData; a portal on an existing one, its columns.
+    c.send(parse("FETCH 2 FROM c", "f"), describe("S", "f"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"1tTZ"  # the cursor exists by now
+    assert row_description(out[2][1]) == [("k", 23), ("v", 20)]
+    c.send(bind([], "f", "p"), describe("P", "p"), execute("p"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"2TDDCZ" and data(out) == [["2", "20"], ["3", "30"]] and tags(out) == ["FETCH 2"]
+    c.send(execute("p"), SYNC)  # the same portal again: the next two
+    out = c.until_ready()
+    assert data(out) == [["4", "40"], ["5", "50"]]
+    c.send(parse("MOVE c", "m"), bind([], "m", "pm"), describe("P", "pm"), execute("pm"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"12nCZ" and tags(out) == ["MOVE 0"]
+    # A portal may not take a cursor's name, and a cursor not a portal's.
+    c.send(parse("SELECT 1", "s"), bind([], "s", "c"), SYNC)
+    assert states(c.until_ready()) == ["42P03"]
+    c.send(query("ROLLBACK"))
+    c.until_ready()
+    # Outside a block the one statement is autocommit: a DECLARE is a hold cursor.
+    out = run(c, "DECLARE c CURSOR FOR SELECT k FROM t ORDER BY k")
+    assert states(out) == [] and status(out) == "I"
+    out = run(c, "FETCH 2 FROM c")
+    assert states(out) == [] and data(out) == [["1"], ["2"]]
+    assert states(run(c, "CLOSE c")) == []
+    out = run(c, "FETCH c")
+    assert states(out) == ["34000"]
+
+
+def test_where_current_of_over_simple_and_extended_protocol(server):
+    c = connect(server)
+    cursor_table(c)
+    c.send(query("BEGIN"))
+    c.until_ready()
+    c.send(query("DECLARE c CURSOR FOR SELECT k FROM t ORDER BY k"))
+    c.until_ready()
+    # Never fetched: no row to change.
+    c.send(query("UPDATE t SET v = 0 WHERE CURRENT OF c"))
+    assert states(c.until_ready()) == ["24000"]
+    c.send(query("ROLLBACK"))
+    c.until_ready()
+    c.send(query("BEGIN"))
+    c.until_ready()
+    c.send(query("DECLARE c SCROLL CURSOR FOR SELECT k FROM t ORDER BY k"))
+    c.until_ready()
+    c.send(query("FETCH 2 c"))
+    c.until_ready()
+    c.send(query("UPDATE t SET v = 99 WHERE CURRENT OF c"))
+    out = c.until_ready()
+    assert tags(out) == ["UPDATE 1"] and states(out) == []
+    # Extended protocol: the cursor's key is no parameter of the statement.
+    c.send(parse("DELETE FROM t WHERE CURRENT OF c", "d"), describe("S", "d"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"1tnZ"  # ParameterDescription with none, NoData
+    c.send(bind([], "d", "pd"), execute("pd"), SYNC)
+    out = c.until_ready()
+    assert tags(out) == ["DELETE 1"]
+    c.send(parse("UPDATE t SET v = $1 WHERE CURRENT OF c", "u"), describe("S", "u"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"1tnZ"
+    c.send(bind(["7"], "u", "pu"), execute("pu"), SYNC)
+    assert tags(c.until_ready()) == ["UPDATE 0"]  # the row is gone: its key finds nothing
+    c.send(query("FETCH PRIOR c"))
+    c.until_ready()
+    c.send(query("UPDATE t SET v = 7 WHERE CURRENT OF c"))
+    assert tags(c.until_ready()) == ["UPDATE 1"]
+    c.send(query("SELECT k, v FROM t ORDER BY k"))
+    assert data(c.until_ready()) == [["1", "7"], ["3", "30"], ["4", "40"], ["5", "50"]]
+    # An unknown cursor is 34000, and the error fails the block.
+    c.send(query("DELETE FROM t WHERE CURRENT OF nope"))
+    assert states(c.until_ready()) == ["34000"]
+    c.send(query("SELECT 1"))
+    assert states(c.until_ready()) == ["25P02"]
+    c.send(query("ROLLBACK"))
+    c.until_ready()
+    # Outside a block the cursor is a hold cursor, held from a previous transaction.
+    assert states(run(c, "DECLARE h CURSOR FOR SELECT k FROM t ORDER BY k")) == []
+    assert states(run(c, "FETCH h")) == []
+    out = run(c, "DELETE FROM t WHERE CURRENT OF h")
+    assert states(out) == ["24000"]
+
+
+def test_hold_cursor_outlives_commit_and_dies_with_rollback(server):
+    c = connect(server)
+    cursor_table(c)
+
+    def send(sql):
+        c.send(query(sql))
+        return c.until_ready()
+
+    # WITH HOLD in a block survives its COMMIT and shows the view at DECLARE.
+    send("BEGIN")
+    send("DECLARE h CURSOR WITH HOLD FOR SELECT k FROM t ORDER BY k")
+    send("INSERT INTO t VALUES (6, 60)")
+    out = send("COMMIT")
+    assert tags(out) == ["COMMIT"] and status(out) == "I"
+    assert data(send("FETCH 2 FROM h")) == [["1"], ["2"]]
+    assert states(send("INSERT INTO t VALUES (7, 70)")) == []
+    assert data(send("FETCH ALL FROM h")) == [["3"], ["4"], ["5"]]
+    # A cursor declared in a transaction that rolls back goes with it; the earlier hold cursor stays.
+    send("BEGIN")
+    send("DECLARE g CURSOR WITH HOLD FOR SELECT k FROM t ORDER BY k")
+    send("ROLLBACK")
+    assert states(send("FETCH g")) == ["34000"]
+    send("BEGIN")
+    assert states(send("FETCH h")) == [] and send("COMMIT")
+    # It is a name in the session's namespace until closed.
+    assert states(send("DECLARE h CURSOR FOR SELECT k FROM t")) == ["42P03"]
+    assert tags(send("CLOSE h")) == ["CLOSE CURSOR"]
+    assert states(send("FETCH h")) == ["34000"]
+    # Another connection does not see it.
+    other = connect(server)
+    send("DECLARE mine CURSOR FOR SELECT k FROM t")
+    other.send(query("FETCH mine"))
+    assert states(other.until_ready()) == ["34000"]
+
+
+def test_extended_cursor_in_a_failed_block(server):
+    c = connect(server)
+    cursor_table(c)
+    c.send(query("BEGIN"))
+    c.until_ready()
+    assert states(run(c, "DECLARE c CURSOR FOR SELECT k FROM t")) == []
+    assert states(run(c, "DECLARE c CURSOR FOR SELECT k FROM t")) == ["42P03"]
+    out = run(c, "FETCH c")
+    assert states(out) == ["25P02"] and status(out) == "E"
+    out = run(c, "CLOSE c")
+    assert states(out) == ["25P02"]
+    c.send(query("ROLLBACK"))
+    out = c.until_ready()
+    assert status(out) == "I"
+    out = run(c, "FETCH c")
+    assert states(out) == ["34000"]

@@ -1,0 +1,1 @@
+SELECT s, sum(DISTINCT d), count(DISTINCT d) FROM r GROUP BY s

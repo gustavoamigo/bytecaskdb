@@ -1,9 +1,9 @@
 # Chaos Testing — Design
 
-> Status: first version implemented (`tests/chaos/`, `chaos-nightly.yml`).
-> Tracks issue #230; the Elle workload runs on chaosfs too (#232,
-> `isolation_checking_design.md`, *Chaos*). The cgroup memory hazard (#269)
-> is still to come.
+> Status: implemented (`tests/chaos/`, `chaos-nightly.yml`). Tracks issue
+> #230; the Elle workload runs on chaosfs too (#232,
+> `isolation_checking_design.md`, *Chaos*). There is no cgroup memory
+> hazard: #269 was closed as not needed (see *Resources*).
 
 ## Why
 
@@ -89,7 +89,6 @@ over many runs. The proof matrix stays the place for aimed faults.
 | Clean close | worker returns from `main` | everything |
 | SIGKILL | orchestrator | the page cache (all written bytes) |
 | Power loss | chaosfs freezes, SIGKILL, then drops non-durable state | only what was made durable, plus a random part of the rest |
-| OOM kill | cgroup `memory.max` below the working set | the page cache |
 
 Every terminator can land during `DB::open`, `resume()`, vacuum, rotation,
 hint writing and close, not only during steady writes.
@@ -124,7 +123,6 @@ active file, not on a record; with copy-on-write it lands anywhere.
 
 | Hazard | Mechanism | Surfaces as |
 |---|---|---|
-| Memory pressure | cgroup v2 `memory.max` | OOM kill (terminator above) and page-cache reclaim |
 | Allocation failure | `RLIMIT_AS` | `std::bad_alloc` anywhere, `ENOMEM` from `mmap` |
 | Descriptor exhaustion | `RLIMIT_NOFILE` near the open-file count | `EMFILE` at rotation, vacuum, open |
 
@@ -143,7 +141,7 @@ other axes aim at: a kill during a 2 s `fsync` lands inside group commit.
 ```
 run_chaos.py (orchestrator, seed)
  ├── chaosfs.py          FUSE mount; in-memory POSIX model; faults; control socket
- ├── chaos_worker run    engine + workload, in a cgroup, under rlimits,
+ ├── chaos_worker run    engine + workload, under rlimits,
  │                       on the chaosfs mount; history frames on fd 3
  └── chaos_worker check  reopens a copy of the post-crash image; checks I1–I7
                          against the whole history of the episode
@@ -335,9 +333,12 @@ Where the first version differs from the design above, and why.
   contract allows; without the limit it is a violation. One that escapes a background thread reaches the worker's
   terminate handler, which exits with code 5, the one abort the invariants
   allow. The worker lifts its limits on SIGTERM, since the clean close runs
-  with every hazard lifted. The ASan leg disables `RLIMIT_AS`. The cgroup
-  memory limit (an OOM kill under reclaim) needs a delegated cgroup on the
-  runner and is not implemented yet.
+  with every hazard lifted. The ASan leg disables `RLIMIT_AS`. There is
+  no cgroup memory limit (#269, closed as not needed). An OOM kill is a
+  SIGKILL with the page cache intact, which the SIGKILL terminator already
+  delivers. Reclaim is injected directly by timed writeback and eviction
+  events and by `evict_failed`. Allocation failure is `RLIMIT_AS`. Not
+  covered: `memory.high` throttling, which the stall faults approximate.
 - **`fstat` of an unlinked open file** returns `ENOENT` under chaosfs: the
   kernel sends no handle for it. The engine never calls `fstat`; reads through
   the handle work.

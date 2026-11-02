@@ -5,7 +5,8 @@ Status: **built** (#489): `bytecaskdb-sql-layer/catalog/`, with its tests in
 This covers what the catalog records, how it is stored under namespace
 `0x01`, the in-memory form plans resolve against and how readers share it,
 what makes a compiled plan compatible with the live catalog, and how each
-DDL statement writes. Nothing in the engine changes for it.
+DDL statement writes. Views are in *Views*. Nothing in the engine changes
+for it.
 
 The catalog is written from scratch. The plugin's catalog is positional,
 keyed by name and GPL-2.0, and nothing of it is copied. The plugin would
@@ -19,9 +20,10 @@ share this one only if it adopted the layer's formats (#488).
 | `name` | As the parser hands it over: an unquoted identifier folded to lower case by PostgreSQL's rules, a quoted one exactly as written, so `"Foo"` and `foo` are two tables. Plans never paste a name into C: their constants are named from ids (`TBL_1`, `IDX_3`, `COL_1_2`, `PART_3_0`), so a name need not be an identifier and two objects' constants cannot collide. The plan's header lists what each constant stands for, in `//` lines whose user bytes outside printable ASCII, `\` and `?` are `\xNN` escapes. |
 | `version` | Per-table counter, bumped by every DDL on the table. Not checked by plans (see *Compatibility*); kept for several schema versions (*Several schema versions*). |
 | `next_col_id` | The next column id. Column ids are permanent and never reused, even after a column is dropped. |
-| columns | Each: permanent `id`, `name`, SQL type (kind, `VARCHAR` length, `DECIMAL` precision and scale), nullability, default. The physical type follows from the SQL type (`types_design.md`, *Types*). |
-| primary key | Column ids, in key order. Always ascending; a primary key column is never null. |
+| columns | Each: permanent `id`, `name`, SQL type (kind, `VARCHAR` length, `DECIMAL` precision and scale), nullability, default, and whether it is hidden: the row id of a table declared without a primary key (*Tables without a primary key*). The physical type follows from the SQL type (`types_design.md`, *Types*). |
+| primary key | Column ids, in key order. Always ascending; a primary key column is never null. For a table declared without one, its hidden row id. |
 | indexes | Each: permanent `id`, `name`, unique or not, parts as (column id, `ASC`/`DESC`). |
+| checks | Each `CHECK` constraint: its name and the text of its expression (*CHECK constraints*). Absent for most tables. |
 | layouts | Each layout generation: its object id, its generation number, `bitmap_bytes`, and its offset table (column id → byte offset or variable slot). The last is current. Each table has one until `REBUILD` exists, which appends one (#503). |
 
 A default is a constant of the column's physical type, or none (null).
@@ -37,14 +39,15 @@ Little-endian, every list counted, every string a `u16` length and its
 bytes:
 
 ```
-u16 format                   ; kRecordFormat, 3
+u16 format                   ; 4, or 5 where the table has a CHECK
 u32 id, str name, u32 version, u32 next_col_id
 u16 ncols   { u32 len, u32 id, str name, u8 kind, u32 length, u8 precision, u8 scale,
-              u8 nullable, u8 default_tag, default }
+              u8 nullable, u8 default_tag, default, u8 hidden }
 u16 npk     { u32 col_id }
 u16 nidx    { u32 len, u32 id, str name, u8 unique, u16 nparts { u32 col_id, u8 desc } }
 u16 nlayout { u32 len, u32 layout_id, u16 generation, u16 bitmap_bytes, u16 var_table, u16 nvar,
               u16 nslots { u32 col_id, u32 pos } }
+u16 nchecks { u32 len, str name, blob expression }   ; formats 5 and 6; never empty in 5
 ```
 
 A layout records where its fixed region ends (`var_table`) and its slot
@@ -62,15 +65,30 @@ too. A build reads every format from 3 to its own, taking an absent field
 at its default; it refuses a newer format, whose added fields it may not be
 able to ignore safely, and an older one: format 1 holds the earliest build's row
 positions, format 2 (#490's) no SQL types. Both predate any database worth
-reading. The record format also names the row format its positions are
-for; formats 2 and 3 share the 12-byte-header row format.
+reading. Format 4 added `hidden` at the end of a column entry; a format-3
+record reads with no hidden column, as every table then had a declared
+primary key. Format 5 added the `CHECK` list at the end of the record. A table
+without a `CHECK` is still written as format 4, so a database is closed to
+an earlier build only once it holds one: that build refuses the record
+("written by a later SQL-layer build") and so refuses to open. Nothing
+else about a database changes. Format 6 is format 5 whose CHECK list may be
+empty: it is the record of a table with a `TIMESTAMP WITH TIME ZONE` column
+(type tag 15) or a `CHAR(n)` column (tag 16, length `n`), which an earlier
+build would call corrupt, written only for such a table, so a database is closed to an earlier build ("written by a
+later SQL-layer build") only once it holds one. No existing encoding changes:
+the timestamptz column stores a `TIMESTAMP`'s microseconds and keys as one,
+and a `CHAR(n)` is stored as `TEXT` is, without its trailing spaces. The record
+format also names the row format its positions are for; formats 2, 3, 4, 5
+and 6 share the 12-byte-header row
+format.
 
 **A record that does not parse is refused at load**, with the table's id:
 a truncated field, a type kind or tag outside its set, a physical type that
 disagrees with the SQL type, a key or index column that is not a column of
 the table or appears twice, a layout that fails the row format's invariants, trailing bytes
-after the last field. The catalog never opens a database it cannot decode
-correctly.
+after the last field, a hidden column that is not the whole primary key, a
+BIGINT, nameless and without a default, or that an index names, or a second
+one. The catalog never opens a database it cannot decode correctly.
 
 ## Storage
 
@@ -81,7 +99,8 @@ Namespace `0x01`, as the plugin's catalog is:
 | `01 01 01` | Next object id, `u64` big-endian. |
 | `01 01 02` | Catalog version, `u64` big-endian; bumped by every DDL. |
 | `01 02 <id:4>` | The table record above, indexes and layouts included. |
-| `01 03 <name>` | Name entry: kind (1 table, 2 index) and id (4, big-endian). |
+| `01 03 <name>` | Name entry: kind (1 table, 2 index, 3 view) and id (4, big-endian). |
+| `01 04 <id:4>` | The view record (*Views*). |
 
 **The counters are 8 bytes**, and the next id at most one past
 `kMaxObjectId`; any other value is refused at load. **One id counter** gives every table, index and layout its id, so an id
@@ -91,8 +110,8 @@ names one object for ever, and `bc_key_begin(table_or_index)` and
 pass it is refused.
 
 **The name entry** makes a name a key, so a `CREATE` guards its name with
-`ensure_absent` and a rename is one key changed. Tables and indexes share
-one namespace, as relations do in PostgreSQL. At load every name entry must
+`ensure_absent` and a rename is one key changed. Tables, indexes and views
+share one namespace, as relations do in PostgreSQL. At load every name entry must
 name an object of that name and every object must have its entry; a
 mismatch is refused as corruption.
 
@@ -148,6 +167,75 @@ with the primary key in the value, keeps `bc_scan_row`, the covering reads
 and `DESC` the same for every index, and needs no second shape for the
 entries whose parts are null.
 
+## Tables without a primary key
+
+PostgreSQL takes a table without a primary key, and keeps every row
+inserted into it, duplicates included. The layer's rows are keyed (`02
+<table_id> <primary key>`), so such a table gets a key of its own: a
+**hidden row id**, a `BIGINT NOT NULL` column after the declared ones,
+which is the whole primary key.
+
+- **No statement sees it.** It has no name, and `Table::column(name)` never
+  returns it, so no statement can name, set, compare, group or select it,
+  and `CREATE INDEX` cannot take it. An `INSERT` without a column list
+  fills the declared columns, as PostgreSQL does. A `GROUP BY` takes no
+  functional dependency from it, as PostgreSQL takes none from a table
+  without a key. The plan API, the plans and their constants are those of
+  any table; a plan's header names the column `(row id)`.
+- **The runtime fills it.** `bc_row_begin`, which writes a column's
+  default, also draws the table's next row id
+  (`LiveCatalog::next_row_id`), so an `INSERT` plan never names it, and a
+  retried plan draws another. `bc_row_from` copies it, so an `UPDATE`
+  keeps a row's id.
+- **Where an id comes from.** Each `LiveCatalog` holds, per table with a
+  row id, the next id to hand out, under a mutex held only to advance it.
+  A table enters at its first insert, seeded from the engine's latest
+  state: one past the greatest id its row range holds (one reverse step,
+  `rkeys_from`), or 1 for none. No id of this catalog's is out before the
+  seed, so every id in use is then committed and below it. Nothing is
+  persisted: the data file is the only record, and the row keys are the
+  count's record. So:
+  - concurrent inserts never draw the same id, and so never conflict with
+    each other on the key, in autocommit or in transactions;
+  - an insert that fails, conflicts or rolls back leaves a gap;
+  - while a catalog lives, no id is handed out twice;
+  - after a reopen, the ids of rows deleted from the end of the table, or
+    drawn and never committed, may be handed out again, as PostgreSQL
+    reuses a `ctid`. No row holds them then.
+  - A second `LiveCatalog` on the same open database (only tests make one)
+    counts on its own; an id both draw is refused by the engine's check of
+    every key a commit writes, never written twice.
+- **The rejected alternative** was a stored counter per table. Every
+  insert would write it, so any two concurrent inserts into the table
+  would conflict, and it would be state outside the rows that has to
+  agree with them.
+
+## UNIQUE constraints
+
+A `UNIQUE` constraint, on a column or on the table, is a unique index on
+its columns, created with the table in the `CREATE TABLE`'s batch, so the
+table never exists without it. There is no constraint object: the index is
+the constraint. The catalog takes the constraints as PostgreSQL's
+`transformIndexConstraints` does:
+
+- each column must be the table's and named once (42703 "column … named in
+  key does not exist", 42701 "… appears twice in unique constraint"),
+  checked before the table's own name is (42P07);
+- one on the primary key's columns, in order, is the key, and makes no
+  index; one on an earlier one's columns, in order, is that index, which
+  takes its name if it had none;
+- a named one's index has its name, refused (42P07) where a relation, the
+  table itself or an earlier constraint has it;
+- an unnamed one's is named as PostgreSQL's `ChooseIndexName` names it:
+  `table_col1_col2_key`, within 63 bytes, the longer of the table and the
+  column part shortened first and each clipped to a UTF-8 character, then
+  `key1`, `key2`… where a relation, or an index named earlier in the
+  statement, has the name.
+
+`NULLS NOT DISTINCT`, `INCLUDE`, `DEFERRABLE` and `ADD COLUMN … UNIQUE` are
+refused, not yet built. A constraint's index is an index like any other:
+`DROP INDEX` drops it (*Known differences* in `frontend_design.md`).
+
 ## The in-memory form
 
 `Catalog` is immutable: the tables by id and by name, each index's table,
@@ -198,6 +286,83 @@ second `LiveCatalog` on the same open database (only tests open one)
 catches up at its next pin, so its DDL never builds on a stale version and
 never hands out an id twice.
 
+## CHECK constraints
+
+A `CHECK` constraint, on a column or on the table, is kept in the table's
+record, in the `CREATE TABLE`'s batch, so the table never exists with a
+constraint missing. A table has no object id for it, and no name entry:
+constraint names are the table's own (PostgreSQL's are too), so they are
+unique within a table and never collide with a relation.
+
+- **The text is the definition,** as a view's is (*Views*): the expression
+  as written between the parentheses. A write to the table binds it again,
+  so the binder and `Gen::eval` are the only evaluator and there is no
+  second form to version. A table's constraints are bound at each `INSERT`
+  and `UPDATE` of it, and the plan holds the result.
+- **Names** are as written, or as PostgreSQL's `ChooseConstraintName`:
+  `table_column_check` for a constraint written on a column,
+  `table_check` for the table's, then `1`, `2`… where the table has the
+  name. Named ones are taken first. A name used twice is 42710.
+- **Checked at creation.** The binder binds each expression over the table
+  as it will be, so a column the table lacks (42703) or a result that is
+  not `BOOLEAN` (42804) is refused with the table. What a write cannot
+  evaluate over the row it has built is refused (0A000 or its SQLSTATE): a
+  parameter, a subquery, an aggregate, `CURRENT_DATE`, `LOCALTIME` and
+  `LOCALTIMESTAMP`, and any expression the select list cannot evaluate.
+- **Evaluated on the row as written.** The generated plan builds the row,
+  evaluates each constraint over it, and raises `BC_C_CHECK` (23514) where
+  the result is false, before `bc_insert` or `bc_update`: nothing is
+  written, no index entry included. True and NULL pass. The row has its
+  defaults, so a constraint sees the value an omitted column gets, and an
+  `UPDATE` tests every constraint of the table, as PostgreSQL does.
+  Its cost is one evaluation of the expression per written row, in the plan's
+  C: column reads and comparisons, no allocation.
+- **The error** carries the table's id as `bc_raise`'s object. Its message
+  says "check constraint N violated", where PostgreSQL names the relation
+  and the constraint; the SQLSTATE is the same.
+- **Not built:** `ALTER TABLE ADD CONSTRAINT`, `ADD COLUMN … CHECK`,
+  `NO INHERIT`, `NOT VALID` and `DEFERRABLE`.
+
+## Views
+
+A view is a stored query. The record is under `01 04 <id>`, its name entry
+has kind 3, and the id comes from the one counter, so a view dropped and
+created again is another object and nothing that named the first can mistake
+it for the second.
+
+```
+u16 format                   ; kViewRecordFormat, 1
+u32 id, str name
+blob definition              ; the CREATE VIEW statement, as the client sent it
+u16 ndeps { u32 id }         ; the tables and views the query names, each once
+u16 ncols { str name }       ; the view's columns, as created
+```
+
+- **The text is the definition.** Nothing parsed or bound is stored: a
+  parsed form would be a second format to version, and the binder already
+  turns text into a statement. A view is read by parsing the text and
+  binding it again (`frontend_design.md`, *The dialect*, *Views*), so a use
+  sees the tables as they are then. `columns` is what the view returned
+  when it was created, and a use whose columns differ is refused, so the
+  catalog never gives a view columns it did not have.
+- **`ndeps` makes `DROP` RESTRICT.** `DROP TABLE` and `DROP VIEW` look for a
+  view whose list holds the object, and refuse it (2BP01). A view reads
+  through the views it names, so the list holds what the query names
+  directly, subqueries included, not what those read in turn.
+- **Format 1 is the first.** A build reads views of format 1 and refuses a
+  later one, as it refuses a later table record. A build from before views
+  refuses a database holding one: the view's name entry names no table or
+  index, which that build refuses at open as corruption. Table records
+  keep format 4: no table record changed.
+- **A record that does not parse is refused at load**, with the same
+  checks as a table's: a truncated field, trailing bytes, a record under
+  another id's key, an id used twice, a dependency that is neither a table
+  nor a view, a name entry that disagrees.
+- **Compatibility.** A plan names tables, never views, so the runtime's
+  check (*Compatibility*) does not see one. The embedded API records the
+  views each plan was expanded through and rebuilds it after any DDL
+  (`frontend_design.md`, *Views*).
+
 ## Compatibility
 
 `bc_schema_ref` lists what a plan depends on, and `bc_ctx_run` checks it
@@ -240,10 +405,12 @@ disk and in memory, as it was.
 
 | Statement | Batch |
 |---|---|
-| `CREATE TABLE` | Record, name entry (`ensure_absent`), counters. Two ids: the table and its first layout. The bitmap is sized as the row format says. |
+| `CREATE TABLE` | Record, name entry (`ensure_absent`), counters. Two ids: the table and its first layout. The bitmap is sized as the row format says. Without a primary key, the record holds the hidden row id (*Tables without a primary key*). Each `UNIQUE` constraint is a unique index in the same record and batch, with its own name entry (*UNIQUE constraints*). A table of no columns is refused (0A000); PostgreSQL takes one. |
 | `CREATE [UNIQUE] INDEX … (col [DESC], …)` | Record with the index, name entry (`ensure_absent`), counters, an entry per existing row, `ensure_range_unchanged` over the table's rows. A unique index whose rows already hold a duplicate is refused. |
-| `DROP TABLE` | Record and name entries deleted; `del_range` over `02 <table_id>` and over `03 <index_id>` per index. |
+| `DROP TABLE` | Record and name entries deleted; `del_range` over `02 <table_id>` and over `03 <index_id>` per index. Refused (2BP01) while a view reads the table. |
 | `DROP INDEX` | Record without the index, name entry deleted, `del_range` over `03 <index_id>`. |
+| `CREATE VIEW` | View record, name entry (`ensure_absent`), counters. One id. |
+| `DROP VIEW` | View record and name entry deleted. |
 | `ALTER TABLE … ADD COLUMN` | Record with the column appended at the next id and the next position of its region; the current generation's offsets do not move. With a default, every existing row rewritten with it, and `ensure_range_unchanged` over the rows. |
 
 `IF EXISTS` on the drops; nothing else. A drop deletes in O(1) appends
@@ -316,4 +483,6 @@ recompile; unique indexes and ranges on `DESC` parts, nullable and not.
 `tests/tcc_test.cpp`: a unique insert raced by another commit conflicts,
 and its retry raises the duplicate. `tests/tprocc_test.cpp`: the
 nine TPROC-C tables and their indexes, created by SQL DDL, reopened and
-checked.
+checked. Views: `tests/catalog_test.cpp` has the record cut at every byte, a later
+format, trailing bytes, a missing or mistyped name entry, the drops that
+2BP01 refuses, and a reopen; `tests/api_test.cpp` reads views through SQL.
