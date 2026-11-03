@@ -159,8 +159,15 @@ kind the transformer doesn't take is refused with its position.
   known without evaluating it (with a column among the branches this
   goes away: *Expressions over columns*). Float branches of constants are
   refused. The output column is named `case`, `coalesce` or `nullif`.
-- **`||` and the string functions** fold constants only (of a column, a
-  parameter or a subquery they are refused, 42601, until #671). The parser reads PostgreSQL's
+- **`||` and the string functions** fold constants. Of a column, a
+  parameter or a procedure's variable, `||` and `SUBSTRING` (and `substr`,
+  its call form) are select-list values built per row
+  (`Expr::Kind::Concat`, `Substr`; `bc_concat`, `bc_number_text`,
+  `bc_substr`): `||` of text with text, or with an integer or a `DECIMAL`
+  through its text as PostgreSQL prints it (`12.50`); `SUBSTRING(s FROM a
+  [FOR n])` in characters, as below. A `$n` beside `||` is `text`, as a
+  start or count `integer`. The other functions of non-constants are
+  refused (42601, #671). The parser reads PostgreSQL's
   spellings as the calls the grammar makes of them: `TRIM([LEADING |
   TRAILING | BOTH] [chars FROM] s)` is `ltrim`, `rtrim` or `btrim` (spaces
   by default), `POSITION(sub IN s)` is `position(s, sub)`, `SUBSTRING(s
@@ -499,9 +506,10 @@ That includes:
 - the quotient of a numeric other than constants, `%`, arithmetic and
   comparison of `REAL` and `DOUBLE PRECISION` as values, an expression in
   `ORDER BY`, `GROUP BY`, `SET` or an aggregated select list (#685, #686);
-- `||` and the string functions of columns and parameters, `LENGTH`,
-  `CONCAT`, `REPLACE`, the regular-expression `SUBSTRING`, `bytea` string
-  functions (#671);
+- the string functions but `||` and `SUBSTRING` of columns and
+  parameters, `||` of a boolean, float or date value, `LENGTH`, `CONCAT`,
+  `REPLACE`, the regular-expression `SUBSTRING`, `bytea` string functions
+  (#671);
 - a cast of anything but a string literal or `NULL`, a numeric literal of
   more than 18 digits, a string literal in arithmetic, unary `-` of
   anything but a constant, and a constant beside an aggregate.

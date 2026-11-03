@@ -2022,8 +2022,8 @@ TEST_CASE("embedded API: || and the string functions of constants fold as Postgr
   (void)db->execute("INSERT INTO sf VALUES (1, 'ab' || 'c')");
   (void)db->execute("INSERT INTO sf VALUES (2, UPPER('x'))");
   CHECK(db->execute("SELECT v FROM sf WHERE v = LOWER('ABC')").rows == Grid{{text("abc")}});
-  // Of a column, a parameter: not supported yet.
-  CHECK(state("SELECT v || 'x' FROM sf") == "42601");
+  // || of a column is built (below, "|| and SUBSTRING of columns"); the other functions of a column are not yet.
+  CHECK(db->execute("SELECT v || 'x' FROM sf WHERE id = 1").rows == Grid{{text("abcx")}});
   CHECK(state("SELECT UPPER(v) FROM sf") == "42601");
   CHECK(state("SELECT id FROM sf WHERE UPPER(v) = 'ABC'") == "42601");
 }
@@ -3015,4 +3015,68 @@ END $$)");
   } catch (const ast::SqlError& e) {
     CHECK(std::string{e.sqlstate()} == "42601");
   }
+}
+
+TEST_CASE("embedded API: concatenation and SUBSTRING of columns build text per row, as PostgreSQL's do", "[sql][api][procedure]") {
+  sql_test::TempDir dir{"api_string_columns"};
+  auto db = Database::open(dir.path());
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  (void)db->execute("CREATE TABLE s (id INTEGER PRIMARY KEY, name VARCHAR(10), amount DECIMAL(8,2), big BIGINT, ok BOOLEAN)");
+  (void)db->execute("INSERT INTO s VALUES (1, 'héllo', 12.5, -7, TRUE)");
+  (void)db->execute("INSERT INTO s VALUES (2, NULL, -0.05, 9000000000, FALSE)");
+  auto rows = db->execute("SELECT id || ' ' || name, name || amount, substring(name FROM 2 FOR 3), substr(name, 4), "
+                          "big || '|' || amount FROM s ORDER BY id");
+  CHECK(rows.columns == std::vector<std::string>{"?column?", "?column?", "substring", "substr", "?column?"});
+  CHECK(rows.rows == Grid{{text("1 héllo"), text("héllo12.50"), text("éll"), text("lo"), text("-7|12.50")},
+                          {Value{}, Value{}, Value{}, Value{}, text("9000000000|-0.05")}});
+  // A start before the first character counts toward the length; past the end, nothing.
+  CHECK(db->execute("SELECT substring(name FROM -1 FOR 4), substring(name FROM 9) FROM s WHERE id = 1").rows ==
+        Grid{{text("hé"), text("")}});
+  CHECK(db->execute("SELECT substring(name FROM 1 FOR 0) FROM s WHERE id = 1").rows == Grid{{text("")}});
+  CHECK(state("SELECT substring(name FROM 1 FOR -1) FROM s WHERE id = 1") == "22011");
+  CHECK(state("SELECT id || big FROM s") == "42883");          // no text operand
+  CHECK(state("SELECT name || ok FROM s") == "42601");         // a boolean's text: not built
+  CHECK(state("SELECT upper(name) FROM s") == "42601");        // the other functions of columns: #671
+  CHECK(state("SELECT substring(name FROM big) FROM s") == "42883");  // a bigint start
+}
+
+TEST_CASE("embedded API: a procedure builds text from its variables, as TPROC-C's Payment does", "[sql][api][procedure]") {
+  sql_test::TempDir dir{"api_procedure_strings"};
+  auto db = Database::open(dir.path());
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  (void)db->execute("CREATE TABLE customer (c_id INTEGER PRIMARY KEY, c_credit CHAR(2), c_data VARCHAR(500))");
+  (void)db->execute("CREATE TABLE history (h_id INTEGER PRIMARY KEY, h_data VARCHAR(24))");
+  (void)db->execute("INSERT INTO customer VALUES (1, 'BC', 'old data')");
+  (void)db->execute("INSERT INTO customer VALUES (2, 'GC', 'kept')");
+  (void)db->execute(R"(CREATE PROCEDURE pay(k INTEGER, d INTEGER, w INTEGER, amount NUMERIC(6,2), w_name VARCHAR(10),
+                         d_name VARCHAR(10), INOUT out_data VARCHAR(500))
+LANGUAGE plpgsql AS $$
+DECLARE
+  credit CHAR(2);
+  data VARCHAR(500);
+  h VARCHAR(24);
+BEGIN
+  h := w_name || '    ' || d_name;
+  INSERT INTO history VALUES (k, h);
+  SELECT c_credit, c_data INTO credit, data FROM customer WHERE c_id = k;
+  IF credit = 'BC' THEN
+    data := substr(k || ' ' || d || ' ' || w || ' ' || amount || ' | ' || data, 1, 20);
+    UPDATE customer SET c_data = data WHERE c_id = k;
+  END IF;
+  out_data := data;
+END $$)");
+  CHECK(db->call("pay", {i(1), i(3), i(7), Value{std::int64_t{1250}}, text("wh"), text("dist"), Value{}}).rows ==
+        Grid{{text("1 3 7 12.50 | old da")}});  // cut at 20 characters
+  CHECK(db->execute("SELECT c_data FROM customer WHERE c_id = 1").rows == Grid{{text("1 3 7 12.50 | old da")}});
+  CHECK(db->execute("SELECT h_data FROM history WHERE h_id = 1").rows == Grid{{text("wh    dist")}});
+  CHECK(db->call("pay", {i(2), i(3), i(7), Value{std::int64_t{100}}, text("wh"), text("dist"), Value{}}).rows ==
+        Grid{{text("kept")}});
 }

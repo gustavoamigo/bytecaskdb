@@ -639,6 +639,19 @@ private:
       case Expr::Kind::And:
       case Expr::Kind::Or: operands(2, e.args.size()); break;
       case Expr::Kind::Coalesce: operands(2, e.args.size()); break;
+      case Expr::Kind::Concat:
+        operands(2, 2);
+        for (const auto& a : e.args) {
+          if (a.phys() != PhysType::Bytes && a.phys() != PhysType::I64) broken("a || operand that is not text or an exact number");
+        }
+        break;
+      case Expr::Kind::Substr:
+        operands(2, 3);
+        if (e.args[0].phys() != PhysType::Bytes || e.args[1].phys() != PhysType::I64 ||
+            (e.args.size() == 3 && e.args[2].phys() != PhysType::I64)) {
+          broken("a substring of other than text, from and for integers");
+        }
+        break;
       case Expr::Kind::Case: {
         operands(2, e.args.size());
         for (std::size_t i = 0; i + 1 < e.args.size(); i += 2) {
@@ -736,7 +749,9 @@ private:
       case Expr::Kind::Div:
       case Expr::Kind::Aggregate:
       case Expr::Kind::Case:
-      case Expr::Kind::Coalesce: break;
+      case Expr::Kind::Coalesce:
+      case Expr::Kind::Concat:
+      case Expr::Kind::Substr: break;
     }
     broken("a predicate of an expression codegen does not print");
   }

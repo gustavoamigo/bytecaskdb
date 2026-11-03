@@ -233,7 +233,7 @@ auto expr(const PgQuery__Node* n) -> Expr {
     // calls of these, their operands in the function's order.
     static constexpr std::array kStringFunctions{"upper",        "lower",         "substring", "btrim",  "ltrim",  "rtrim",
                                                  "position",     "char_length",   "character_length", "octet_length", "overlay",
-                                                 "to_timestamp"};
+                                                 "to_timestamp", "substr"};
     if (std::ranges::find(kStringFunctions, name) != kStringFunctions.end() &&
         (f->n_funcname == 1 || (f->n_funcname == 2 && str(f->funcname[0]) == "pg_catalog"))) {
       if (f->agg_star || f->agg_distinct || f->n_agg_order != 0 || f->agg_filter != nullptr || f->over != nullptr ||

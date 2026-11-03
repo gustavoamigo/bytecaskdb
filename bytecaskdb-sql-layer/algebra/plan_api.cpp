@@ -3984,6 +3984,39 @@ bool bc_bytes_prefix(bc_ctx* cx, bc_view prefix, bc_view b) {
   return {};
 }
 
+bc_view bc_concat(bc_ctx* cx, bc_view a, bc_view b) {
+  BC_GUARD_BEGIN
+  auto v = cx->resolve2(a, b);
+  if (!v) return {};
+  Bytes out;
+  out.reserve(v->first.size() + v->second.size());
+  out.insert(out.end(), v->first.begin(), v->first.end());
+  out.insert(out.end(), v->second.begin(), v->second.end());
+  return cx->arena_view(out);
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_view bc_number_text(bc_ctx* cx, int64_t v, uint32_t scale) {
+  BC_GUARD_BEGIN
+  if (scale > 18) {
+    cx->fail(BC_E_HANDLE, "bc_number_text: a scale past 18");
+    return {};
+  }
+  // The magnitude as unsigned, so INT64_MIN has one.
+  auto mag = v < 0 ? std::uint64_t{0} - static_cast<std::uint64_t>(v) : static_cast<std::uint64_t>(v);
+  auto digits = std::to_string(mag);
+  if (scale > 0) {
+    if (digits.size() <= scale) digits.insert(0, scale + 1 - digits.size(), '0');
+    digits.insert(digits.size() - scale, 1, '.');
+  }
+  if (v < 0) digits.insert(0, 1, '-');
+  auto b = std::as_bytes(std::span{digits.data(), digits.size()});
+  return cx->arena_view(BytesView{b});
+  BC_GUARD_END(cx)
+  return {};
+}
+
 namespace {
 
 // The bytes of the UTF-8 character at s[i]: 1 for a byte that starts none,
@@ -4489,6 +4522,35 @@ bool bc_sort_key_part_bool(bc_ctx* cx, bc_view key, uint32_t part) {
   BC_GUARD_BEGIN
   return sort_part_value<bool>(cx, key, part, PhysType::Bool, false,
                                [](KeyReader& r) { return r.read_bool(KeyPart{PhysType::Bool, false, false, false}); });
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_view bc_substr(bc_ctx* cx, bc_view s, int64_t from, int64_t count) {
+  BC_GUARD_BEGIN
+  auto text = cx->resolve(s);
+  if (!text) return {};
+  if (count < 0) {
+    cx->fail(BC_E_ARITH, "negative substring length not allowed");
+    return {};
+  }
+  // Characters [from, from + count), 1-based, cut to the text.
+  constexpr auto kMax = std::numeric_limits<std::int64_t>::max();
+  auto end = count == kMax || from > kMax - count ? kMax : from + count;
+  auto first = std::max<std::int64_t>(from, 1);
+  if (end <= first) return cx->arena_view(BytesView{});
+  std::size_t at = 0;
+  std::int64_t pos = 1;
+  while (at < text->size() && pos < first) {
+    at += char_len(*text, at);
+    ++pos;
+  }
+  auto start = std::min(at, text->size());
+  while (at < text->size() && pos < end) {
+    at += char_len(*text, at);
+    ++pos;
+  }
+  return cx->arena_view(text->subspan(start, std::min(at, text->size()) - start));
   BC_GUARD_END(cx)
   return {};
 }

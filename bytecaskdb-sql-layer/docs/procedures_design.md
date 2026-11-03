@@ -3,14 +3,14 @@
 Status: **design, approved by the owner on 2026-11-02** (#758, part of #487
 and #757; it replaces the sketch in #495; revised on 2026-11-03: the gate
 drives the procedures with `bcdboltp.tcl`, HammerDB 6.0's PostgreSQL
-driver logic in the layer's call syntax). Phases 1 to 3 and 4a are built:
+driver logic in the layer's call syntax). Phases 1 to 3, 4a and 4b are built:
 `CREATE [OR REPLACE] PROCEDURE` and `DROP PROCEDURE` are kept in the catalog
 (*Catalog record*), the embedded API runs a procedure (`Database::call`,
 `Transaction::call`) from one generated file, and `sql_layer_server` takes
 `CALL` as HammerDB's driver sends it, with its monitor's queries (*Wire
-protocol for `CALL`*), and a body loops over a query's rows. Phases 4b
-and 4c, the string functions Payment needs and the TPROC-C procedures with
-their driver and gate, are not built (*Phases*).
+protocol for `CALL`*), a body loops over a query's rows and builds text
+with `||` and `substr`. Phase 4c, the TPROC-C procedures with their driver
+and gate, is not built (*Phases*).
 
 The goal is PL/pgSQL procedures compiled by the layer's own compiler, so that
 HammerDB 6.0's stock PostgreSQL TPROC-C driver runs against
@@ -342,7 +342,7 @@ bodies under HammerDB's names and signatures (`neword`, `payment`, `ostat`,
 | 2 | PL binder, procedure IR, codegen of the one file, `bc_proc.h` and its runtime (`bc_stmt_begin/end`, `bc_var_*`, `bc_range_*`), `Database::call` with the retry | built |
 | 3 | `CALL` over the wire, the OUT row, the `pg_stat_database` stub, `TO_TIMESTAMP` and `::` in arguments | built |
 | 4a | `FOR a, b IN query LOOP`: TPROC-C's customer by last name, the row at position ceil(n / 2) | built |
-| 4b | `\|\|` and `substr` over columns and variables: Payment's `c_data` (#671, in part) | not built |
+| 4b | `\|\|` and `substr` over columns and variables: Payment's `h_data` and `c_data` (#671, in part) | built |
 | 4c | `hammerdb/tprocc_procs.sql`; `hammerdb/bcdboltp.tcl`, HammerDB 6.0's PostgreSQL stored-procedure driver logic with the layer's call syntax, run as a `customscript`; `CALL` over the extended protocol; `run-gate.sh` running it (#556); a proof test running the same procedures and driver on PostgreSQL 17 with the consistency conditions | not built |
 | 5 | `bytecask_tprocc.tcl` and `check_driver_statements.py` removed, once the gate passes with `bcdboltp.tcl` | not built |
 

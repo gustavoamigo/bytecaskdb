@@ -733,6 +733,8 @@ private:
       case Expr::Kind::Div:
       case Expr::Kind::Case:
       case Expr::Kind::Coalesce:
+      case Expr::Kind::Concat:
+      case Expr::Kind::Substr:
       case Expr::Kind::Aggregate: break;
     }
     throw std::logic_error{"physical plan: a predicate codegen does not print"};
@@ -771,7 +773,9 @@ private:
       case Expr::Kind::Truth:
       case Expr::Kind::InSet:
       case Expr::Kind::Case:
-      case Expr::Kind::Coalesce: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
+      case Expr::Kind::Coalesce:
+      case Expr::Kind::Concat:
+      case Expr::Kind::Substr: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
     }
     auto col = read_col(lhs);
     // Text and bytes compare as bytes: COLLATE "C".
@@ -1465,6 +1469,8 @@ private:
       case Expr::Kind::Or: return eval_connective(e);
       case Expr::Kind::Case: return eval_case(e);
       case Expr::Kind::Coalesce: return eval_coalesce(e);
+      case Expr::Kind::Concat: return eval_concat(e);
+      case Expr::Kind::Substr: return eval_substr(e);
       case Expr::Kind::Aggregate:
       case Expr::Kind::Like:
       case Expr::Kind::Truth:
@@ -1522,12 +1528,42 @@ private:
       case Expr::Kind::Truth:
       case Expr::Kind::InSet:
       case Expr::Kind::Case:
-      case Expr::Kind::Coalesce: throw std::logic_error{"physical plan: not an arithmetic expression"};
+      case Expr::Kind::Coalesce:
+      case Expr::Kind::Concat:
+      case Expr::Kind::Substr: throw std::logic_error{"physical plan: not an arithmetic expression"};
     }
     if (e.type.kind == SqlKind::SmallInt || e.type.kind == SqlKind::Integer) {
       call = "bc_check_int(cx, " + call + ", " + (e.type.kind == SqlKind::SmallInt ? "BC_SMALLINT" : "BC_INTEGER") + ", 0)";
     }
     return guarded("int64_t", "0", either(a.null, b.null), call, PhysType::I64);
+  }
+
+  // a || b: text with text, an integer or a DECIMAL through its text. NULL if
+  // either is.
+  auto eval_concat(const Expr& e) -> Val {
+    auto text = [&](const Expr& arg) {
+      auto v = eval(arg);
+      if (v.type == PhysType::Bytes) return v;
+      v.value = "bc_number_text(cx, " + v.value + ", " + std::to_string(decimal_scale(arg.type)) + ")";
+      return v;
+    };
+    auto a = text(e.args[0]);
+    auto b = text(e.args[1]);
+    return guarded("bc_view", "bc_empty(cx)", either(a.null, b.null), "bc_concat(cx, " + a.value + ", " + b.value + ")",
+                   PhysType::Bytes);
+  }
+
+  // substring(s FROM a [FOR n]): NULL if any operand is.
+  auto eval_substr(const Expr& e) -> Val {
+    auto s = eval(e.args[0]);
+    auto from = eval(e.args[1]);
+    std::optional<Val> count;
+    if (e.args.size() == 3) count = eval(e.args[2]);
+    auto null = either(s.null, from.null);
+    if (count) null = either(null, count->null);
+    auto n = count ? count->value : constant(std::numeric_limits<std::int64_t>::max());
+    return guarded("bc_view", "bc_empty(cx)", null, "bc_substr(cx, " + s.value + ", " + from.value + ", " + n + ")",
+                   PhysType::Bytes);
   }
 
   // A local `type v = fallback`, set to `value` unless `null`; the Val of
