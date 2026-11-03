@@ -146,6 +146,14 @@ struct ProcedureStatement {
 // stored (22003, 22001), as PostgreSQL's assignment cast checks it.
 [[nodiscard]] auto assignable(SqlType from, SqlType to) -> bool;
 
+// CALL's arguments as the values of `proc`'s arguments, one per argument:
+// each a constant expression (a literal, a cast, TO_TIMESTAMP), read as its
+// argument's type as an INSERT reads a constant for a column; an OUT
+// argument's is NULL, as PostgreSQL ignores it. Throws ast::SqlError: 42883
+// for the wrong number of arguments, 42601 for one that is not constant, and
+// a value outside its type as an INSERT's would.
+[[nodiscard]] auto call_arguments(const ast::Call& call, const Procedure& proc) -> std::vector<Datum>;
+
 // A declared variable's type as PL/pgSQL gives its text (int, numeric(12,2),
 // pg_catalog."integer"), read as a column of that type is.
 [[nodiscard]] auto declared_type(const std::string& text) -> SqlType;
@@ -1357,6 +1365,26 @@ auto fold_function(const ast::Expr& e) -> Constant {
     return text_constant(overlay_of(text_of(args[0]), text_of(args[1]), int_of(args[2]),
                                     args.size() == 4 ? std::optional{int_of(args[3])} : std::nullopt, e.pos),
                          e.pos);
+  }
+  if (name == "to_timestamp") {
+    // The form HammerDB's driver sends, TO_TIMESTAMP(text, 'YYYYMMDDHH24MISS'),
+    // in UTC, the layer's one time zone (docs/types_design.md).
+    arity(2, 2);
+    auto args = bind_args(name, given, std::vector{Slot::Text, Slot::Text}, false, e.pos);
+    if (auto n = strict(args, SqlKind::TimestampTz)) return *n;
+    if (text_of(args[1]) != "YYYYMMDDHH24MISS") not_yet("TO_TIMESTAMP of another format than 'YYYYMMDDHH24MISS'", e.pos);
+    auto t = text_of(args[0]);
+    if (t.size() != 14 || !std::ranges::all_of(t, [](char ch) { return ch >= '0' && ch <= '9'; })) {
+      throw SqlError{"invalid value \"" + t + "\" for \"YYYYMMDDHH24MISS\"", e.pos, kInvalidDatetimeFormat};
+    }
+    auto iso = t.substr(0, 4) + "-" + t.substr(4, 2) + "-" + t.substr(6, 2) + " " + t.substr(8, 2) + ":" + t.substr(10, 2) +
+               ":" + t.substr(12, 2);
+    auto type = SqlType{SqlKind::TimestampTz};
+    try {
+      return {from_text(iso, type, false), type, false, {}, e.pos};
+    } catch (const TextError& x) {
+      throw SqlError{x.what(), e.pos, known_sqlstate(x.sqlstate()).value_or(kDatetimeFieldOverflow)};
+    }
   }
   no_function(name, given, e.pos);
 }
@@ -4472,6 +4500,30 @@ auto assignable(SqlType from, SqlType to) -> bool {
     return 0;
   };
   return from.kind == to.kind || (family(from.kind) != 0 && family(from.kind) == family(to.kind));
+}
+
+auto call_arguments(const ast::Call& call, const Procedure& proc) -> std::vector<Datum> {
+  if (call.args.size() != proc.args.size()) {
+    throw SqlError{"procedure " + call.procedure + " takes " + std::to_string(proc.args.size()) + " arguments, not " +
+                       std::to_string(call.args.size()),
+                   call.pos, kUndefinedFunction};
+  }
+  std::vector<Datum> out;
+  for (std::size_t i = 0; i < call.args.size(); ++i) {
+    const auto& a = proc.args[i];
+    const auto& e = call.args[i];
+    if (!is_constant(e)) not_yet("an argument of CALL that is not a constant", e.pos);
+    auto k = fold(e);
+    if (a.mode == ProcedureArg::Mode::Out) {
+      out.emplace_back(std::monostate{});
+      continue;
+    }
+    Column target{static_cast<std::uint32_t>(i), a.name, a.type, phys_type(a.type), true, std::monostate{}};
+    auto v = coerce_value(k, target, true, "=");
+    if (auto why = out_of_range(a.type, v)) out_of_type(*why, k.pos);
+    out.push_back(std::move(v));
+  }
+  return out;
 }
 
 auto declared_type(const std::string& text) -> SqlType {

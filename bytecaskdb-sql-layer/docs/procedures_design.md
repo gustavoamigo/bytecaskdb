@@ -1,11 +1,13 @@
 # Stored procedures in the SQL layer
 
 Status: **design, approved by the owner on 2026-11-02** (#758, part of #487
-and #757; it replaces the sketch in #495). Phases 1 and 2 are built:
+and #757; it replaces the sketch in #495). Phases 1 to 3 are built:
 `CREATE [OR REPLACE] PROCEDURE` and `DROP PROCEDURE` are kept in the catalog
-(*Catalog record*), and the embedded API runs a procedure
-(`Database::call`, `Transaction::call`) from one generated file. `CALL` as
-SQL text, and so over the wire, is refused until phase 3 (*Phases*).
+(*Catalog record*), the embedded API runs a procedure (`Database::call`,
+`Transaction::call`) from one generated file, and `sql_layer_server` takes
+`CALL` as HammerDB's driver sends it, with its monitor's queries (*Wire
+protocol for `CALL`*). Phase 4, the TPROC-C procedures and the stock-driver
+gate, is not built (*Phases*).
 
 The goal is PL/pgSQL procedures compiled by the layer's own compiler, so that
 HammerDB 6.0's stock PostgreSQL TPROC-C driver runs against
@@ -273,17 +275,46 @@ version, refused inside a transaction block, and survives a reopen.
   protocol, with their command tags. The simple protocol's split of a
   `Query` into statements skips dollar-quoted text (`$$…$$`, `$tag$…$tag$`),
   so a `;` inside a body ends nothing.
-- **Request:** `CALL name(args)` over the simple protocol, with literal
-  arguments, `TO_TIMESTAMP(text, fmt)` and the `::timestamp` cast, as
-  HammerDB sends them.
-- **Reply:** one row of the `INOUT` and `OUT` values, with the command tag
-  `CALL`.
-- **Monitor queries:** HammerDB's monitor sends
-  `select sum(xact_commit + xact_rollback) from pg_stat_database` outside a
-  `catch`, so a stub fed by the server's commit and rollback counters is
-  required. It also sends `select sum(d_next_o_id) from district`,
-  `select max(w_id) from warehouse` and `select max(d_id) from district`.
-  `set CLIENT_MIN_MESSAGES` and the `pg_proc` query run inside a `catch`.
+HammerDB 6.0's driver (`src/postgresql/pgoltp.tcl`, `pg_storedprocs=true`)
+sends, for instance, `call neword(1,1,3,1123,9,0.0,'','',0.0,0.0,0,
+TO_TIMESTAMP('20261103120530','YYYYMMDDHH24MISS')::timestamp without time
+zone)`. Phase 3 serves that (`server/pg_session.cppm`, `run_call`):
+
+- **Request:** `CALL name(args)` as a simple `Query`, in or out of a
+  transaction block. It is not a statement the embedded API prepares, so
+  the session reads it (`ast::parse_call`) as it reads `BEGIN`; over the
+  extended protocol it is 0A000.
+- **Arguments** are constants (`bound::call_arguments`): literals, `NULL`,
+  casts, and functions of constants, `TO_TIMESTAMP` among them. Each is
+  read as its argument's type as an `INSERT` reads a constant for a
+  column: an unknown literal as that type, a number rounded to a
+  `DECIMAL`'s scale, a value outside the type refused (22003, 22001). An
+  `OUT` argument's value is ignored. A count other than the procedure's is
+  42883; an argument that is not a constant, 42601.
+- **`TO_TIMESTAMP(text, 'YYYYMMDDHH24MISS')`** folds to a `timestamptz`, in
+  UTC, the layer's one time zone (`frontend_design.md`, *The dialect*);
+  another format is refused (42601). `::timestamp without time zone` is the
+  existing cast between timestamps.
+- **Reply:** a `RowDescription` and one `DataRow` of the `INOUT` and `OUT`
+  arguments, named and typed as the arguments, then the command tag
+  `CALL`; a procedure without them sends only the tag. Out of a block the
+  call is `Database::call`, retried on 40001; in one, `Transaction::call`,
+  and an error fails the block as a statement's does. In a `READ ONLY`
+  block `CALL` is refused (25006), where PostgreSQL would refuse only the
+  writes.
+- **Monitor queries:**
+  - `select sum(xact_commit + xact_rollback) from pg_stat_database`, which
+    the monitor sends outside a `catch`, is answered by the session, matched
+    without white space and case: one `numeric` column `sum`, the
+    transactions ended since the database opened
+    (`Database::transaction_counts`: each autocommit statement and DDL is
+    one, a failed one rolled back). The query itself is not counted. Any
+    other query of `pg_stat_database` is 42P01.
+  - `select sum(d_next_o_id) from district`, `select max(w_id) from
+    warehouse` and `select max(d_id) from district` are ordinary queries.
+  - `set CLIENT_MIN_MESSAGES TO 'ERROR'` and the `pg_proc` detection are
+    refused (0A000, 42P01); the driver ignores both (its `pg_exec` does not
+    raise, and the detection is in a `catch`).
 - **Later:** `CREATE FUNCTION` called as `SELECT f(...)`, for
   `pg_storedprocs=false`.
 
@@ -298,7 +329,7 @@ bodies under HammerDB's names and signatures (`neword`, `payment`, `ostat`,
 |---|---|---|
 | 1 | This document; `CREATE [OR REPLACE] PROCEDURE` and `DROP PROCEDURE` parsed (signature and PL/pgSQL syntax) and kept in the catalog | built |
 | 2 | PL binder, procedure IR, codegen of the one file, `bc_proc.h` and its runtime (`bc_stmt_begin/end`, `bc_var_*`, `bc_range_*`), `Database::call` with the retry | built |
-| 3 | `CALL` over the wire, the OUT row, the `pg_stat_database` stub, `TO_TIMESTAMP` and `::` in arguments | not built |
+| 3 | `CALL` over the wire, the OUT row, the `pg_stat_database` stub, `TO_TIMESTAMP` and `::` in arguments | built |
 | 4 | `hammerdb/tprocc_procs.sql`, a stock-driver mode in `run-gate.sh` (HammerDB 6.0, #556), a proof test running the same procedures on PostgreSQL 17 with the consistency conditions | not built |
 
 **Full fidelity**, later: HammerDB's own procedure bodies and schema build,
@@ -326,3 +357,8 @@ and the schema build's `COPY FROM STDIN`, catalog lookups, `CREATE USER`,
   22003, 22004, 42804, 42601, 42883, 08P01); recompiled after a DDL; and a
   conflict rerun in autocommit, 40001 after the last attempt, and left to
   the client inside a transaction.
+- Phase 3: `tests/parser_test.cpp` (`parse_call`), `tests/binder_test.cpp`
+  (`call_arguments`: types, rounding, ranges, `TO_TIMESTAMP`, the refusals),
+  `tests/api_test.cpp` (`transaction_counts`), and `tests/server/test_wire.py`
+  (HammerDB's form of `CALL`, its row and tag, in and out of a block, its
+  errors; the monitor's queries).

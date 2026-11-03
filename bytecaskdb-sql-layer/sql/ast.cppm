@@ -456,6 +456,16 @@ struct CloseCursor {
 
 using CursorStatement = std::variant<DeclareCursor, FetchCursor, CloseCursor>;
 
+// CALL name(arg, …) (docs/procedures_design.md, *Wire protocol for CALL*).
+// Not a Statement: the session runs it through the embedded API's call, as
+// it runs BEGIN. Each argument is an expression of constants, bound against
+// the procedure's argument types when it runs.
+struct Call {
+  std::string procedure;
+  std::vector<Expr> args;
+  std::int32_t pos{-1};
+};
+
 }  // namespace bytecask::sql::ast
 
 namespace bytecask::sql::ast {

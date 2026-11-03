@@ -405,7 +405,8 @@ statement the session runs at `Execute`.
 ## Simple query
 
 A `Query` holds one statement, with a trailing `;` and white space
-allowed. An empty one gets `EmptyQueryResponse`. Several statements are
+allowed. `CALL` and HammerDB's `pg_stat_database` query are read by the
+session (`procedures_design.md`, *Wire protocol for `CALL`*). An empty one gets `EmptyQueryResponse`. Several statements are
 `0A000`; no client the gate uses sends them. A `$n` in a `Query` is
 `42P02` (`undefined_parameter`), PostgreSQL's "there is no parameter
 $1". A
@@ -741,9 +742,12 @@ HammerDB's MySQL driver, `src/mysql/mysqloltp.tcl`: the `neword`,
 script uses pgtcl and runs the statements of `testing_design.md` (*The
 TPROC-C statements*), with `$n` parameters.
 
-HammerDB's PostgreSQL driver cannot be used, because it calls PL/pgSQL
-procedures (or functions) through SQL `PREPARE`. Its monitor also reads
-`pg_stat_database`.
+HammerDB's PostgreSQL driver calls PL/pgSQL procedures (or functions
+through SQL `PREPARE`). The server now takes its `CALL`s and its monitor's
+`pg_stat_database` query (`procedures_design.md`, *Wire protocol for
+`CALL`*); running it unchanged needs the TPROC-C procedures and a
+stock-driver mode of the gate, #758's phase 4. Until then the gate runs
+this script.
 
 **A virtual user** connects as above.
 - **Its run.** The run script takes one run per cell before the server
@@ -950,6 +954,10 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 - A form the layer does not support is `42601`, not PostgreSQL's code for running it.
 - `Execute` with a row limit, several statements in one `Query`, SQL
   `PREPARE`, `SET`, `SHOW` and `COPY` are refused.
+- `CALL` is taken as a simple `Query` only, its arguments constants, and is
+  refused in a `READ ONLY` block (`procedures_design.md`, *Wire protocol
+  for `CALL`*). `pg_stat_database` answers one query, the transaction
+  count HammerDB's monitor reads.
 - The idle-in-transaction timeout is on by default (60 s); PostgreSQL's
   `idle_in_transaction_session_timeout` is off by default. An open
   transaction holds a snapshot (`session_design.md`, *Bounds*).

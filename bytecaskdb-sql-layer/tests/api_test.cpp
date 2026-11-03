@@ -2942,3 +2942,29 @@ END $$)");
   CHECK(racing == 1);
   db->after_txn_pin_for_testing({});
 }
+
+TEST_CASE("embedded API: transaction_counts counts each transaction once, an autocommit statement as one",
+          "[sql][api][procedure]") {
+  sql_test::TempDir dir{"api_transaction_counts"};
+  auto db = Database::open(dir.path());
+  auto before = db->transaction_counts();
+  CHECK(before.committed == 0);
+  CHECK(before.rolled_back == 0);
+  (void)db->execute("CREATE TABLE n (id INTEGER PRIMARY KEY)");      // committed
+  (void)db->execute("INSERT INTO n VALUES (1)");                     // committed
+  CHECK_THROWS(db->execute("INSERT INTO n VALUES (1)"));             // rolled back: 23505
+  {
+    auto t = db->begin();
+    (void)t.execute("INSERT INTO n VALUES (2)");
+    (void)t.commit();                                                // committed
+  }
+  {
+    auto t = db->begin();
+    (void)t.execute("INSERT INTO n VALUES (3)");
+    t.rollback();                                                    // rolled back
+  }
+  { auto t = db->begin(); }                                          // destroyed open: rolled back
+  auto after = db->transaction_counts();
+  CHECK(after.committed == 3);
+  CHECK(after.rolled_back == 3);
+}

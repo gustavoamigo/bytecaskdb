@@ -47,6 +47,10 @@ export namespace bytecask::sql::ast {
 // query is returned as text, for parse() to read as the SELECT it must be.
 [[nodiscard]] auto parse_cursor(std::string_view sql) -> std::optional<CursorStatement>;
 
+// Parses a CALL; nullopt for any other statement. Throws SqlError as parse()
+// does, and for a named or VARIADIC argument.
+[[nodiscard]] auto parse_call(std::string_view sql) -> std::optional<Call>;
+
 }  // namespace bytecask::sql::ast
 
 namespace bytecask::sql::ast {
@@ -228,7 +232,8 @@ auto expr(const PgQuery__Node* n) -> Expr {
     // PostgreSQL's grammar spells TRIM, POSITION, SUBSTRING and OVERLAY as
     // calls of these, their operands in the function's order.
     static constexpr std::array kStringFunctions{"upper",        "lower",         "substring", "btrim",  "ltrim",  "rtrim",
-                                                 "position",     "char_length",   "character_length", "octet_length", "overlay"};
+                                                 "position",     "char_length",   "character_length", "octet_length", "overlay",
+                                                 "to_timestamp"};
     if (std::ranges::find(kStringFunctions, name) != kStringFunctions.end() &&
         (f->n_funcname == 1 || (f->n_funcname == 2 && str(f->funcname[0]) == "pg_catalog"))) {
       if (f->agg_star || f->agg_distinct || f->n_agg_order != 0 || f->agg_filter != nullptr || f->over != nullptr ||
@@ -1325,6 +1330,33 @@ auto parse_cursor(std::string_view sql) -> std::optional<CursorStatement> {
   return std::nullopt;
 }
 
+auto parse_call(std::string_view sql) -> std::optional<Call> {
+  std::string text{sql};
+  ParseResources res;
+  res.raw = pg_query_parse_protobuf(text.c_str());
+  if (res.raw.error != nullptr) {
+    reject(res.raw.error->message, res.raw.error->cursorpos > 0 ? res.raw.error->cursorpos - 1 : -1);
+  }
+  res.tree = pg_query__parse_result__unpack(nullptr, res.raw.parse_tree.len,
+                                            reinterpret_cast<const std::uint8_t*>(res.raw.parse_tree.data));
+  if (res.tree == nullptr) reject("unreadable parse tree", -1);
+  if (res.tree->n_stmts != 1) return std::nullopt;
+  const auto* n = res.tree->stmts[0]->stmt;
+  if (n->node_case != PG_QUERY__NODE__NODE_CALL_STMT) return std::nullopt;
+  const auto* f = n->call_stmt->funccall;
+  auto pos = res.tree->stmts[0]->stmt_location;
+  if (f == nullptr || f->n_funcname != 1) reject("schema-qualified names are not supported", pos);
+  if (f->func_variadic) reject("VARIADIC is not supported", f->location, kFeatureNotSupported);
+  Call out{str(f->funcname[0]), {}, pos};
+  for (std::size_t i = 0; i < f->n_args; ++i) {
+    if (f->args[i]->node_case == PG_QUERY__NODE__NODE_NAMED_ARG_EXPR) {
+      reject("named arguments are not supported", f->location, kFeatureNotSupported);
+    }
+    out.args.push_back(expr(f->args[i]));
+  }
+  return out;
+}
+
 auto parse(std::string_view sql) -> Statement {
   std::string text{sql};  // libpg_query takes a NUL-terminated string
   ParseResources res;
@@ -1353,7 +1385,9 @@ auto parse(std::string_view sql) -> Statement {
     proc.definition = std::string{sql};
     return proc;
   }
-  if (n->node_case == PG_QUERY__NODE__NODE_CALL_STMT) reject("CALL is not supported yet", pos, kFeatureNotSupported);
+  if (n->node_case == PG_QUERY__NODE__NODE_CALL_STMT) {
+    reject("CALL runs as a simple Query, not as a prepared statement", pos, kFeatureNotSupported);
+  }
   if (n->node_case == PG_QUERY__NODE__NODE_INSERT_STMT) return insert(n->insert_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_SELECT_STMT) return select(n->select_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_UPDATE_STMT) return update(n->update_stmt, pos);
