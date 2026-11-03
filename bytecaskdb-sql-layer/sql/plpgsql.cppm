@@ -86,9 +86,15 @@ struct Exec {
   bool perform{false};  // PERFORM: a SELECT whose rows are dropped
 };
 struct Return {};
+// FOR targets IN query LOOP: each row of the query, in order, into the
+// targets (`query.targets`), the body run once per row.
+struct ForQuery {
+  Exec query;
+  Body body;
+};
 
 struct Stmt {
-  std::variant<Assign, If, ForRange, While, Exit, Exec, Return> v;
+  std::variant<Assign, If, ForRange, While, Exit, Exec, Return, ForQuery> v;
   std::int32_t line{0};
 };
 
@@ -263,6 +269,12 @@ private:
       if (!target) refuse("a FOR variable it cannot find", at);
       return ForRange{*target, expr_text(st.get("lower")), expr_text(st.get("upper")), st.flag("reverse"),
                       body(st.list("body"))};
+    }
+    if (kind == "PLpgSQL_stmt_fors") {
+      loop_label(st, at);
+      Exec q{expr_text(st.get("query")), false, false, targets(st.get("var"), at), false};
+      if (q.targets.empty()) refuse("FOR over a query needs its variables", at);
+      return ForQuery{std::move(q), body(st.list("body"))};
     }
     if (kind == "PLpgSQL_stmt_while") {
       loop_label(st, at);

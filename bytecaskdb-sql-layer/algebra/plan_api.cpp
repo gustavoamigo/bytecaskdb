@@ -2897,6 +2897,25 @@ void bc_var_set_bytes(bc_proc* px, uint32_t var, bc_view v) {
 
 void bc_var_set_null(bc_proc* px, uint32_t var) { proc_set(px, var, std::monostate{}); }
 
+bool bc_rows_next(bc_proc* px, uint32_t stmt) {
+  if (proc_failed(px) || !px->frame->charge()) return false;
+  try {
+    return px->next(stmt);
+  } catch (...) {
+    proc_fail(px);
+    return false;
+  }
+}
+
+void bc_rows_done(bc_proc* px, uint32_t stmt) {
+  if (proc_failed(px)) return;
+  try {
+    px->done(stmt);
+  } catch (...) {
+    proc_fail(px);
+  }
+}
+
 bool bc_loop(bc_proc* px) {
   if (proc_failed(px)) return false;
   return px->frame->charge();

@@ -1951,24 +1951,50 @@ auto Database::run_procedure(const CompiledProcedure& p, const Procedure& def, c
   };
   // bc_stmt_end: its effects into the transaction, its first row into the
   // INTO variables, and FOUND.
+  // A row's columns into the targets, each checked against its variable's type.
+  auto into = [&](const std::vector<std::uint32_t>& targets, const std::vector<Value>* row) {
+    for (std::size_t i = 0; i < targets.size(); ++i) {
+      auto v = row == nullptr ? Value{} : row->at(i);
+      if (auto range = out_of_range(gen.slot_types.at(targets[i]), v)) {
+        throw ExecError(*range + " for variable " + gen.var_names.at(targets[i]), BC_E_CONSTRAINT,
+                        ConstraintDetail{BC_C_RANGE, 0}.encode());
+      }
+      px.slots.values.at(targets[i]) = std::move(v);
+    }
+  };
+  // A FOR loop's rows, by statement: what is left of them, and whether there were any.
+  struct LoopRows {
+    std::vector<std::vector<Value>> rows;
+    std::size_t next{0};
+  };
+  std::map<std::uint32_t, LoopRows> loops;
   px.end = [&](std::uint32_t k) {
     const auto& c = *p.stmts.at(k);
     const auto& st = gen.stmts[k];
     if (!bc_txn_add(sx)) throw_context_error(sx);
     auto rows = results(sx, c, Rows{});
+    if (st.loop) {
+      loops[k] = LoopRows{std::move(rows.rows), 0};  // FOUND is set when the loop ends
+      return;
+    }
     auto found = c.plan->returns_rows ? !rows.rows.empty() : rows.affected > 0;
     px.slots.values.at(gen.found) = found;
     if (!st.into) return;
     if (st.strict && rows.rows.empty()) throw ProcedureError("query returned no rows", kNoDataFound);
     if (st.strict && rows.rows.size() > 1) throw ProcedureError("query returned more than one row", kTooManyRows);
-    for (std::size_t i = 0; i < st.targets.size(); ++i) {
-      auto v = rows.rows.empty() ? Value{} : rows.rows[0].at(i);
-      if (auto range = out_of_range(gen.slot_types.at(st.targets[i]), v)) {
-        throw ExecError(*range + " for variable " + gen.var_names.at(st.targets[i]), BC_E_CONSTRAINT,
-                        ConstraintDetail{BC_C_RANGE, 0}.encode());
-      }
-      px.slots.values.at(st.targets[i]) = std::move(v);
-    }
+    into(st.targets, rows.rows.empty() ? nullptr : &rows.rows[0]);
+  };
+  px.next = [&](std::uint32_t k) {
+    auto& l = loops.at(k);
+    if (l.next >= l.rows.size()) return false;
+    into(gen.stmts[k].targets, &l.rows[l.next++]);
+    return true;
+  };
+  px.done = [&](std::uint32_t k) {
+    auto it = loops.find(k);
+    if (it == loops.end()) return;
+    px.slots.values.at(gen.found) = !it->second.rows.empty();
+    loops.erase(it);
   };
   p.code->proc_fn()(&px);
   if (px.error) std::rethrow_exception(px.error);

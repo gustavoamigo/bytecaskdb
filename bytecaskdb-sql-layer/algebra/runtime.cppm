@@ -82,6 +82,8 @@ struct bc_proc {
   std::vector<bytecask::sql::SqlType> types;  // each slot's declared type
   std::function<bc_ctx*(std::uint32_t)> begin;
   std::function<void(std::uint32_t)> end;
+  std::function<bool(std::uint32_t)> next;  // bc_rows_next: false once the rows are done
+  std::function<void(std::uint32_t)> done;  // bc_rows_done
   std::exception_ptr error;
   struct Range {
     std::int64_t next{0}, last{0};
@@ -306,6 +308,8 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_var_set_bytes", fn_addr(bc_var_set_bytes)},
       {"bc_var_set_null", fn_addr(bc_var_set_null)},
       {"bc_loop", fn_addr(bc_loop)},
+      {"bc_rows_next", fn_addr(bc_rows_next)},
+      {"bc_rows_done", fn_addr(bc_rows_done)},
       {"bc_range_open", fn_addr(bc_range_open)},
       {"bc_range_next", fn_addr(bc_range_next)},
       {"bc_param_i64", fn_addr(bc_param_i64)},

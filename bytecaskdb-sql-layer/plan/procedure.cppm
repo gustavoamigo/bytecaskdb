@@ -41,7 +41,8 @@ struct ProcedureStatementPlan {
   std::vector<std::uint32_t> param_vars;  // $k+1's variable slot
   bool into{false};
   bool strict{false};
-  std::vector<std::uint32_t> targets;  // INTO's variable slots, one per result column
+  std::vector<std::uint32_t> targets;  // INTO's or the FOR loop's variable slots, one per result column
+  bool loop{false};  // FOR targets IN this query: its rows are kept for bc_rows_next
 };
 
 struct GeneratedProcedure {
@@ -193,7 +194,15 @@ private:
 
   auto stmt(const pl::Return&) -> proc::Stmt { return {proc::Return{}}; }
 
-  auto stmt(const pl::Exec& x) -> proc::Stmt {
+  auto stmt(const pl::ForQuery& f) -> proc::Stmt {
+    auto k = exec(f.query, true);
+    return {proc::ForQuery{k, stmts(f.body)}};
+  }
+
+  auto stmt(const pl::Exec& x) -> proc::Stmt { return {proc::Exec{exec(x, false)}}; }
+
+  // The statement's plan, its index among the procedure's.
+  auto exec(const pl::Exec& x, bool loop) -> std::uint32_t {
     auto k = static_cast<std::uint32_t>(out_.stmts.size());
     auto st = bound::bind_procedure_statement(x.sql, frame_, cat_);
     ProcedureStatementPlan sp;
@@ -208,12 +217,16 @@ private:
     sp.into = x.into;
     sp.strict = x.strict;
     sp.targets = x.targets;
+    sp.loop = loop;
     sp.plan = generate_plan(std::move(st.bound), cat_, x.sql, counts_, memory_, "s" + std::to_string(k));
-    if (sp.plan.returns_rows && !x.into && !x.perform) {
+    if (sp.plan.returns_rows && !x.into && !x.perform && !loop) {
       throw SqlError{"query has no destination for result data: use PERFORM or INTO", -1};
     }
-    if (x.into) {
-      if (!sp.plan.returns_rows) refuse("INTO of a statement that returns no rows (RETURNING)");
+    if (x.into || loop) {
+      if (!sp.plan.returns_rows) {
+        if (loop) throw SqlError{"cannot open a FOR loop over a statement that returns no rows", -1};
+        refuse("INTO of a statement that returns no rows (RETURNING)");
+      }
       if (sp.plan.result_sql.size() != sp.plan.result_types.size()) refuse("INTO a NUMERIC average");
       if (sp.plan.result_sql.size() != x.targets.size()) {
         throw SqlError{"INTO names " + std::to_string(x.targets.size()) + " variables but the query returns " +
@@ -230,7 +243,7 @@ private:
       }
     }
     out_.stmts.push_back(std::move(sp));
-    return {proc::Exec{k}};
+    return k;
   }
 
   void print(const proc::Body& body) {
