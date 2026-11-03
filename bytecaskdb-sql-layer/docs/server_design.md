@@ -734,6 +734,40 @@ binder and compiler already keep:
 
 ## The HammerDB driver
 
+The gate's driver is `hammerdb/bcdboltp.tcl`, a HammerDB 6.0 custom script
+(`customscript`) whose logic is HammerDB 6.0's PostgreSQL stored-procedure
+driver's (`src/postgresql/pgoltp.tcl`, `pg_storedprocs=true`, the timed
+driver):
+- **Each virtual user** draws from the same deck (`RandomNumber 1 23`) with
+  the same inputs: the district, the customer by `NURand` id or, 60% of the
+  time, by `NURand` last name, the remote warehouse 15% of Payments, the
+  amount, the line count, the threshold. Each transaction is one `CALL` of
+  a procedure of `hammerdb/tprocc_procs.sql`, which runs it on the server
+  in one transaction (`procedures_design.md`, *Running a procedure*),
+  retried there on 40001 as an autocommit statement is.
+- **The procedures** draw New-Order's lines with `random(lo, hi)`, as
+  HammerDB's do with its `DBMS_RANDOM`, and pick a customer by last name
+  with `FOR … IN query`. Their SQL is the harness's statements
+  (`harness/tprocc.cppm`), which the proof suite checks against PostgreSQL
+  17; the file runs on PostgreSQL 17 unchanged.
+- **Only the call syntax is the layer's:** arguments in the procedures'
+  order, NULL for the `INOUT` ones, the time as a timestamp literal, the
+  item count, and Payment's history key, `(run << 48) | (position << 40) |
+  n`, which the driver draws as the harness does, since `history.h_id` is
+  the table's key.
+- **A failed call** is counted by its SQLSTATE and not retried, as
+  HammerDB's drivers do not retry. New-Order's 1% unused item fails its
+  call with P0002 (`SELECT … INTO STRICT`), which rolls it back, as the
+  benchmark asks: not counted as an error.
+- **The monitor** is HammerDB's: TPM from `select sum(xact_commit +
+  xact_rollback) from pg_stat_database`, NOPM from `select sum(d_next_o_id)
+  from district`, then `testresult`.
+- **Its home warehouse** is fixed by position, as below.
+
+`run-gate.sh` creates the procedures in the load (`sql_layer_tprocc procs`),
+and, with `--smoke`, on PostgreSQL with `psql`. `--driver=custom` runs the
+older script, below, until it is removed (#758).
+
 `bytecaskdb-sql-layer/hammerdb/bytecask_tprocc.tcl` is a HammerDB custom
 script (`customscript`). It is a port of the client-side TPROC-C logic in
 HammerDB's MySQL driver, `src/mysql/mysqloltp.tcl`: the `neword`,
@@ -742,12 +776,8 @@ HammerDB's MySQL driver, `src/mysql/mysqloltp.tcl`: the `neword`,
 script uses pgtcl and runs the statements of `testing_design.md` (*The
 TPROC-C statements*), with `$n` parameters.
 
-HammerDB's PostgreSQL driver calls PL/pgSQL procedures (or functions
-through SQL `PREPARE`). The server now takes its `CALL`s and its monitor's
-`pg_stat_database` query (`procedures_design.md`, *Wire protocol for
-`CALL`*); running it unchanged needs the TPROC-C procedures and a
-stock-driver mode of the gate, #758's phase 4. Until then the gate runs
-this script.
+It was written when the layer had no procedures, which HammerDB's
+PostgreSQL driver needs.
 
 **A virtual user** connects as above.
 - **Its run.** The run script takes one run per cell before the server

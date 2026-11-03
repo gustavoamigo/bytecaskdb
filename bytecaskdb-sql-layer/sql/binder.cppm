@@ -524,7 +524,8 @@ auto is_constant(const ast::Expr& e) -> bool {
     case K::Not:
     case K::And:
     case K::Or:
-    case K::Func: return std::ranges::all_of(e.args, is_constant);
+    // random(lo, hi) draws anew at each evaluation: never folded.
+    case K::Func: return e.func != "random" && std::ranges::all_of(e.args, is_constant);
     case K::Case:
       return (!e.lhs || is_constant(*e.lhs)) && (!e.rhs || is_constant(*e.rhs)) && std::ranges::all_of(e.args, is_constant);
     case K::Column:
@@ -2162,6 +2163,20 @@ public:
         out.args.push_back(std::move(n));
       }
       return out;
+    }
+    if (e.func == "random") {
+      // PostgreSQL 17's random(min, max) of integers, both bounds included.
+      if (e.args.size() != 2) not_yet("random() other than random(min, max) of integers", e.pos);
+      auto lo = arg(e.args[0], SqlType{SqlKind::Integer});
+      auto hi = arg(e.args[1], SqlType{SqlKind::Integer});
+      auto integer = [](SqlType t) { return t.kind == SqlKind::SmallInt || t.kind == SqlKind::Integer || t.kind == SqlKind::BigInt; };
+      if (!integer(lo.type) || !integer(hi.type)) {
+        throw SqlError{"function random(" + pg_type_name(lo.type) + ", " + pg_type_name(hi.type) + ") does not exist", e.pos,
+                       kUndefinedFunction};
+      }
+      auto big = lo.type.kind == SqlKind::BigInt || hi.type.kind == SqlKind::BigInt;
+      return logical::binary(logical::Expr::Kind::Random, std::move(lo), std::move(hi),
+                             SqlType{big ? SqlKind::BigInt : SqlKind::Integer});
     }
     not_yet(e.func + " of other than constants", e.pos);
   }

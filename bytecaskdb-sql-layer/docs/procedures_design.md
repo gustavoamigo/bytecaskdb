@@ -3,14 +3,16 @@
 Status: **design, approved by the owner on 2026-11-02** (#758, part of #487
 and #757; it replaces the sketch in #495; revised on 2026-11-03: the gate
 drives the procedures with `bcdboltp.tcl`, HammerDB 6.0's PostgreSQL
-driver logic in the layer's call syntax). Phases 1 to 3, 4a and 4b are built:
+driver logic in the layer's call syntax). Phases 1 to 4 are built:
 `CREATE [OR REPLACE] PROCEDURE` and `DROP PROCEDURE` are kept in the catalog
 (*Catalog record*), the embedded API runs a procedure (`Database::call`,
 `Transaction::call`) from one generated file, and `sql_layer_server` takes
 `CALL` as HammerDB's driver sends it, with its monitor's queries (*Wire
 protocol for `CALL`*), a body loops over a query's rows and builds text
-with `||` and `substr`. Phase 4c, the TPROC-C procedures with their driver
-and gate, is not built (*Phases*).
+with `||` and `substr`, and the gate runs TPROC-C through HammerDB 6.0 with
+the procedures of `hammerdb/tprocc_procs.sql` (`server_design.md`, *The
+HammerDB driver*). Phase 5, removing the older client-side driver, is not
+done (*Phases*).
 
 The goal is PL/pgSQL procedures compiled by the layer's own compiler, so that
 HammerDB 6.0's stock PostgreSQL TPROC-C driver runs against
@@ -166,6 +168,11 @@ a variable used as a `$n`, assigned a value, or given a column by `INTO`
 must have the same physical type and decimal scale as the other side, and
 be an integer of any width, text of any length, or of the same kind
 (`bound::assignable`). A narrower side is checked when the value is stored.
+One conversion is built, for an assignment (`x := expr`) only: an integer
+or a `DECIMAL` assigned to a `DECIMAL` variable of another scale is brought
+to its scale, times a power of ten or, for a coarser one, rounded half away
+from zero, as PostgreSQL's assignment cast to `NUMERIC(p, s)` does
+(New-Order's line amount).
 Anything else is refused (42601, as the binder refuses a form not built
 yet; 0A000 for an assignment or `INTO`).
 
@@ -343,7 +350,7 @@ bodies under HammerDB's names and signatures (`neword`, `payment`, `ostat`,
 | 3 | `CALL` over the wire, the OUT row, the `pg_stat_database` stub, `TO_TIMESTAMP` and `::` in arguments | built |
 | 4a | `FOR a, b IN query LOOP`: TPROC-C's customer by last name, the row at position ceil(n / 2) | built |
 | 4b | `\|\|` and `substr` over columns and variables: Payment's `h_data` and `c_data` (#671, in part) | built |
-| 4c | `hammerdb/tprocc_procs.sql`; `hammerdb/bcdboltp.tcl`, HammerDB 6.0's PostgreSQL stored-procedure driver logic with the layer's call syntax, run as a `customscript`; `CALL` over the extended protocol; `run-gate.sh` running it (#556); a proof test running the same procedures and driver on PostgreSQL 17 with the consistency conditions | not built |
+| 4c | `hammerdb/tprocc_procs.sql`; `random(lo, hi)`; a procedure's assignment rounding a number to the variable's scale; `hammerdb/bcdboltp.tcl`, HammerDB 6.0's PostgreSQL stored-procedure driver logic with the layer's call syntax, run as a `customscript` (`server_design.md`, *The HammerDB driver*); `run-gate.sh` running it, and its `--smoke` running the same procedures and driver on PostgreSQL 17 with the consistency conditions (#556). `CALL` over the extended protocol was left out: a simple-protocol `CALL` is never cached | built |
 | 5 | `bytecask_tprocc.tcl` and `check_driver_statements.py` removed, once the gate passes with `bcdboltp.tcl` | not built |
 
 **Full fidelity**, later: HammerDB's own procedure bodies and schema build,
@@ -376,6 +383,10 @@ and the schema build's `COPY FROM STDIN`, catalog lookups, `CREATE USER`,
   `tests/api_test.cpp` (`transaction_counts`), and `tests/server/test_wire.py`
   (HammerDB's form of `CALL`, its row and tag, in and out of a block, its
   errors; the monitor's queries).
+- Phase 4c: `tests/tprocc_procs_test.cpp` (the five procedures of
+  `tprocc_procs.sql` at a tiny scale, as `bcdboltp.tcl` calls them, then the
+  consistency conditions), `tests/api_test.cpp` (the assignment's rounding,
+  `random`'s bounds); the HammerDB gate and its nightly smoke.
 - Phase 4a: `tests/api_test.cpp`, "FOR targets IN query runs the body per
   row of the query as it ran": the middle customer by `c_first`, the rows
   unchanged by the body's writes, `FOUND` after the loop, `EXIT` out of it,

@@ -3,7 +3,8 @@
 # Copyright (c) 2026 Gustavo Amigo
 #
 # The MVP gate (docs/server_design.md, *Running the gate*): HammerDB's
-# TPROC-C, through bytecask_tprocc.tcl, against sql_layer_server, at each
+# TPROC-C, through bcdboltp.tcl (or, with --driver=custom, the older
+# bytecask_tprocc.tcl), against sql_layer_server, at each
 # user count, each cell on a fresh copy of one load, each ending with the
 # consistency conditions checked on what it left. It follows
 # bytecaskdb-mariadb-plugin/benchmarks/run-hammerdb.sh.
@@ -21,7 +22,11 @@
 #   --duration:   measured minutes (default 5).
 #   --mix:        the transaction types the driver runs (default all five).
 #   --hammerdb-home: where hammerdbcli is (default $HAMMERDB_HOME, ~/HammerDB-*,
-#                 or PATH). HammerDB 5.0's Linux release bundles Tcl and pgtcl.
+#                 or PATH). HammerDB 6.0's Linux release bundles Tcl and pgtcl.
+#   --driver:     bcdboltp (default): HammerDB 6.0's PostgreSQL stored-procedure
+#                 driver logic, each transaction one CALL of a procedure of
+#                 tprocc_procs.sql, which the load creates; or custom: the
+#                 client-side bytecask_tprocc.tcl, until it is removed (#758).
 #   --data-root:  where the load and each cell's copy live (default a temporary
 #                 directory, removed at exit).
 #   --server-flags: more flags for sql_layer_server in every cell (default
@@ -44,6 +49,7 @@ set -euo pipefail
 LAYER="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT="$(cd "$LAYER/.." && pwd)"
 WAREHOUSES=48
+DRIVER=bcdboltp
 VUS=1,16,48
 RAMPUP=2
 DURATION=5
@@ -61,6 +67,7 @@ for arg in "$@"; do
     --rampup=*) RAMPUP="${arg#*=}" ;;
     --duration=*) DURATION="${arg#*=}" ;;
     --mix=*) MIX="${arg#*=}" ;;
+    --driver=*) DRIVER="${arg#*=}" ;;
     --hammerdb-home=*) HAMMERDB_HOME="${arg#*=}" ;;
     --data-root=*) DATA_ROOT="${arg#*=}" ;;
     --server-flags=*) read -r -a SERVER_FLAGS <<<"${arg#*=}" ;;
@@ -69,6 +76,11 @@ for arg in "$@"; do
     *) echo "run-gate.sh: unknown argument $arg" >&2; exit 2 ;;
   esac
 done
+case "$DRIVER" in
+  bcdboltp) DRIVER_FILE="bcdboltp.tcl" ;;
+  custom) DRIVER_FILE="bytecask_tprocc.tcl" ;;
+  *) echo "run-gate.sh: --driver is bcdboltp or custom" >&2; exit 2 ;;
+esac
 if ((SMOKE)); then
   WAREHOUSES=2 VUS=2 RAMPUP=0 DURATION=1
   [[ -n "$PG" ]] || { echo "run-gate.sh: --smoke needs --pg, the PostgreSQL the driver is checked on" >&2; exit 2; }
@@ -91,7 +103,7 @@ find_hammerdb() {
   return 1
 }
 HAMMERDB_HOME="$(find_hammerdb)" || {
-  echo "run-gate.sh: hammerdbcli not found: unpack HammerDB 5.0's Linux release from" >&2
+  echo "run-gate.sh: hammerdbcli not found: unpack HammerDB 6.0's Linux release from" >&2
   echo "https://github.com/TPC-Council/HammerDB/releases and pass --hammerdb-home" >&2
   exit 2
 }
@@ -117,12 +129,14 @@ if [[ -z "$DATA_ROOT" ]]; then
   trap 'rm -rf "$DATA_ROOT"' EXIT
 fi
 mkdir -p "$DATA_ROOT"
-PRISTINE="$DATA_ROOT/pristine_w$WAREHOUSES"
+PRISTINE="$DATA_ROOT/pristine_w${WAREHOUSES}_$DRIVER"
 if [[ ! -d "$PRISTINE" ]]; then
   echo "== loading $WAREHOUSES warehouses"
   sql_out=()
   ((SMOKE)) && sql_out=(--sql-out "$DATA_ROOT/pristine_w$WAREHOUSES.sql")
   "$TPROCC" load --dir "$PRISTINE" --warehouses "$WAREHOUSES" "${sql_out[@]}"
+  # The procedures bcdboltp.tcl calls, created once, in the load every cell copies.
+  if [[ "$DRIVER" == bcdboltp ]]; then "$TPROCC" procs --dir "$PRISTINE" --file "$LAYER/hammerdb/tprocc_procs.sql"; fi
 fi
 
 free_port() { python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
@@ -140,7 +154,7 @@ driver() {  # host port user db warehouses run engine out
       -e "s|^set run [0-9]* |set run $6 |" \
       -e "s|^set mix {[^}]*}|set mix {$MIX}|" \
       -e "s|^set engine \"[^\"]*\"|set engine \"$7\"|" \
-      "$LAYER/hammerdb/bytecask_tprocc.tcl" >"$8"
+      "$LAYER/hammerdb/$DRIVER_FILE" >"$8"
 }
 
 # Runs the driver with hammerdbcli; its output to $4.
@@ -212,6 +226,7 @@ if ((SMOKE)); then
   psql "$PG" -X -q -v ON_ERROR_STOP=1 -c "CREATE DATABASE $db"
   pg_db="$PG dbname=$db"
   psql "$pg_db" -X -q -v ON_ERROR_STOP=1 -f "$DATA_ROOT/pristine_w$WAREHOUSES.sql"
+  if [[ "$DRIVER" == bcdboltp ]]; then psql "$pg_db" -X -q -v ON_ERROR_STOP=1 -f "$LAYER/hammerdb/tprocc_procs.sql"; fi
   host="$(psql "$pg_db" -X -At -c "SELECT coalesce(host(inet_server_addr()), '127.0.0.1')")"
   pg_port="$(psql "$pg_db" -X -At -c "SHOW port")"
   pg_user="$(psql "$pg_db" -X -At -c "SELECT current_user")"

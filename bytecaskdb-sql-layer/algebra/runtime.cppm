@@ -347,6 +347,7 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_concat", fn_addr(bc_concat)},
       {"bc_number_text", fn_addr(bc_number_text)},
       {"bc_substr", fn_addr(bc_substr)},
+      {"bc_random", fn_addr(bc_random)},
       {"bc_like", fn_addr(bc_like)},
       {"bc_sub_begin", fn_addr(bc_sub_begin)},
       {"bc_sub_end", fn_addr(bc_sub_end)},

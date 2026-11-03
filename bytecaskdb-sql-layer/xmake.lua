@@ -153,6 +153,8 @@ target("sql_layer_tests")
     -- plan(); each is renamed so several link into one binary.
     add_includedirs("algebra")
     add_defines("SQL_LAYER_PLANS_DIR=\"" .. path.join(os.scriptdir(), "plans") .. "\"")
+    -- The TPROC-C procedures the HammerDB gate loads (hammerdb/tprocc_procs.sql).
+    add_defines("SQL_LAYER_HAMMERDB_DIR=\"" .. path.join(os.scriptdir(), "hammerdb") .. "\"")
     add_defines("SQL_LAYER_GOLDEN_DIR=\"" .. path.join(os.scriptdir(), "tests", "golden") .. "\"")
     for _, name in ipairs({"insert", "select_by_id", "select_name_range", "update_qty", "delete_by_id"}) do
         add_files("plans/" .. name .. ".c", {defines = "plan=plan_" .. name,

@@ -194,6 +194,10 @@ kind the transformer doesn't take is refused with its position.
     a start below 1 is 22011, and a resume position past `integer` is
     22003.
   - `POSITION` of an empty substring is 1, of one not found 0.
+  - `random(lo, hi)` is PostgreSQL 17's: an integer drawn uniformly from
+    `lo` to `hi`, both included, anew at each evaluation (never folded);
+    `lo > hi` is 22023. `random()` of no arguments, a `double precision`,
+    is refused (42601).
   - `TO_TIMESTAMP(s, 'YYYYMMDDHH24MISS')` is a `timestamptz` read in UTC,
     the form HammerDB's driver sends (`procedures_design.md`, *Wire
     protocol for `CALL`*); another format is refused (42601), and a string

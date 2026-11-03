@@ -1130,6 +1130,7 @@ auto exec_sqlstate(const ExecError& e) noexcept -> std::string_view {
     case BC_E_ARITH:                      // bc_div and bc_mod name their zero divisor; every other failure is a range
       if (std::string_view{e.what()} == "division by zero") return "22012";  // division_by_zero
       if (std::string_view{e.what()} == "negative substring length not allowed") return "22011";  // substring_error
+      if (std::string_view{e.what()} == "lower bound must be less than or equal to upper bound") return "22023";
       return "22003";  // numeric_value_out_of_range
     case BC_E_BUDGET: return "57014";     // query_canceled
     case BC_E_MEMORY: return "53200";     // out_of_memory

@@ -40,6 +40,7 @@
 #include <memory>
 #include <new>
 #include <optional>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -4551,6 +4552,20 @@ bc_view bc_substr(bc_ctx* cx, bc_view s, int64_t from, int64_t count) {
     ++pos;
   }
   return cx->arena_view(text->subspan(start, std::min(at, text->size()) - start));
+  BC_GUARD_END(cx)
+  return {};
+}
+
+int64_t bc_random(bc_ctx* cx, int64_t lo, int64_t hi) {
+  BC_GUARD_BEGIN
+  if (lo > hi) {
+    cx->fail(BC_E_ARITH, "lower bound must be less than or equal to upper bound");
+    return 0;
+  }
+  // TLS: process — a generator per thread, holding no DB's state: draws are
+  // not repeatable, as PostgreSQL's random() is not unless seeded.
+  thread_local std::mt19937_64 gen{std::random_device{}()};
+  return std::uniform_int_distribution<std::int64_t>{lo, hi}(gen);
   BC_GUARD_END(cx)
   return {};
 }

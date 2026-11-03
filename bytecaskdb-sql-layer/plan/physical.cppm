@@ -645,6 +645,10 @@ private:
           if (a.phys() != PhysType::Bytes && a.phys() != PhysType::I64) broken("a || operand that is not text or an exact number");
         }
         break;
+      case Expr::Kind::Random:
+        operands(2, 2);
+        if (e.args[0].phys() != PhysType::I64 || e.args[1].phys() != PhysType::I64) broken("random of other than integers");
+        break;
       case Expr::Kind::Substr:
         operands(2, 3);
         if (e.args[0].phys() != PhysType::Bytes || e.args[1].phys() != PhysType::I64 ||
@@ -751,7 +755,8 @@ private:
       case Expr::Kind::Case:
       case Expr::Kind::Coalesce:
       case Expr::Kind::Concat:
-      case Expr::Kind::Substr: break;
+      case Expr::Kind::Substr:
+      case Expr::Kind::Random: break;
     }
     broken("a predicate of an expression codegen does not print");
   }

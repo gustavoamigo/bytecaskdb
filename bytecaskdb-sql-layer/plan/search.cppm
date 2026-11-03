@@ -257,7 +257,8 @@ auto use_of(const Expr& c, const Tables& here, const Tables& other) -> Use {
     case Expr::Kind::Case:
     case Expr::Kind::Coalesce:
     case Expr::Kind::Concat:
-    case Expr::Kind::Substr: return Use::Operand;
+    case Expr::Kind::Substr:
+    case Expr::Kind::Random: return Use::Operand;
   }
   return Use::Operand;
 }
@@ -2227,7 +2228,8 @@ private:
         case Expr::Kind::Case:
         case Expr::Kind::Coalesce:
         case Expr::Kind::Concat:
-        case Expr::Kind::Substr: out.emplace_back(physical::ExprTarget{o.expr}); break;
+        case Expr::Kind::Substr:
+        case Expr::Kind::Random: out.emplace_back(physical::ExprTarget{o.expr}); break;
       }
     }
     return out;

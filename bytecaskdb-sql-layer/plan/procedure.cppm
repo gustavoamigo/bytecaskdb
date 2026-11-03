@@ -150,10 +150,20 @@ private:
       throw SqlError{"variable \"" + col->name + "\" is declared CONSTANT", -1};
     }
     auto e = expr(text, col);
+    // An exact number of another scale is brought to the variable's, as
+    // PostgreSQL's assignment cast to NUMERIC(p, s) does; then checked
+    // against its type when stored.
+    auto exact = [](SqlType t) {
+      return t.kind == SqlKind::SmallInt || t.kind == SqlKind::Integer || t.kind == SqlKind::BigInt || t.kind == SqlKind::Decimal;
+    };
+    if (exact(e.type) && col->sql.kind == SqlKind::Decimal && decimal_scale(e.type) != decimal_scale(col->sql)) {
+      auto rescale = static_cast<int>(decimal_scale(col->sql)) - static_cast<int>(decimal_scale(e.type));
+      return {var, std::move(e), rescale};
+    }
     if (!bound::assignable(e.type, col->sql)) {
       refuse("assigning " + sql_type_name(e.type) + " to variable " + col->name + " (" + sql_type_name(col->sql) + ")");
     }
-    return {var, std::move(e)};
+    return {var, std::move(e), 0};
   }
 
   auto stmts(const pl::Body& body) -> proc::Body {
