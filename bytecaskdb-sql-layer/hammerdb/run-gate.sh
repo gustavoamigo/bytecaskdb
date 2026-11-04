@@ -35,7 +35,9 @@
 #                 the driver's libpq reads too.
 #   XMAKE_FLAGS:  more `xmake f` flags for the build (CI's toolchain).
 #
-# Each cell appends a row to bytecaskdb-sql-layer/benchmarks/hammerdb_results.csv
+# Each cell appends the engine's counters, as the server held them when the
+# driver ended, to bytecaskdb-sql-layer/benchmarks/hammerdb_counters.csv, and a
+# row to bytecaskdb-sql-layer/benchmarks/hammerdb_results.csv
 # (ignored by git). A cell whose check fails, or whose run printed no result,
 # fails the script, whatever its NOPM.
 
@@ -171,6 +173,8 @@ result() {  # log -> "NOPM TPM" or nothing
 CSV="$LAYER/benchmarks/hammerdb_results.csv"
 mkdir -p "$(dirname "$CSV")"
 [[ -f "$CSV" ]] || echo "date,commit,warehouses,users,rampup_min,duration_min,nopm,tpm,errors,check" >"$CSV"
+COUNTERS_CSV="$LAYER/benchmarks/hammerdb_counters.csv"
+[[ -f "$COUNTERS_CSV" ]] || echo "date,commit,warehouses,users,name,value" >"$COUNTERS_CSV"
 # A checkout without .git (CI's, when git was not installed first) has
 # GITHUB_SHA instead.
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo "${GITHUB_SHA:0:7}")"
@@ -189,6 +193,13 @@ for vu in "${VU_LIST[@]}"; do
   echo "== $vu users, $WAREHOUSES warehouses, ${RAMPUP}+${DURATION} min"
   driver 127.0.0.1 "$port" tprocc tprocc "$WAREHOUSES" "$run" ByteCaskDB "$DATA_ROOT/driver.tcl"
   hammerdb "$DATA_ROOT/driver.tcl" "$port" "$vu" "$DATA_ROOT/hammerdb.log"
+  # A failed read loses this cell's counters and not its result.
+  if counters="$(python3 "$LAYER/hammerdb/read_counters.py" "$port" tprocc tprocc)"; then
+    stamp="$(date -u +%FT%TZ)"
+    sed "s|^|$stamp,$COMMIT,$WAREHOUSES,$vu,|" <<<"$counters" >>"$COUNTERS_CSV"
+  else
+    echo "   the counters could not be read" >&2
+  fi
   kill -TERM "$server"
   wait "$server" || { echo "sql_layer_server exited with $?" >&2; FAILED=1; }
   read -r nopm tpm <<<"$(result "$DATA_ROOT/hammerdb.log")" || true

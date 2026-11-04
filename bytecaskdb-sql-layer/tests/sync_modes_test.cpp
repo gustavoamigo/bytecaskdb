@@ -139,3 +139,47 @@ TEST_CASE("io backend: every backend reads what another wrote, and a pool too sm
                                               .buffer_pool = {.capacity_bytes = 1}}),
                   std::invalid_argument);
 }
+
+TEST_CASE("io backend: stats gives the engine's counters, the pool's zero with no pool", "[sql][api][io]") {
+  static constexpr std::size_t kPool = 256 * 1024 * 1024;
+  sql_test::TempDir dir{"stats_backends"};
+  {
+    auto db = Database::open(dir.path());  // pread
+    db->execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)");
+    write_rows(*db, 1);
+    // More than a frame, so that the reopen's reads admit whole frames: the
+    // pool never keeps a sealed file's short last frame (#768).
+    auto fill = db->begin();
+    for (std::int64_t id = 1000; id < 11000; ++id) fill.execute("INSERT INTO t VALUES ($1, $2)", {id, id});
+    (void)fill.commit();
+    // Every engine counter, under the engine's own name.
+    auto stats = db->stats();
+    auto engine = db->engine_for_testing().stats();
+    CHECK(stats.size() == engine.size());
+    for (const auto& [name, value] : engine) CHECK(stats.contains(name));
+    CHECK(stats.at("bytecask.bytes_written") > 0);
+    for (const auto* name : {"bytecask.pool_hits", "bytecask.pool_misses", "bytecask.pool_fills",
+                             "bytecask.pool_evictions", "bytecask.pool_frames_total",
+                             "bytecask.pool_frames_resident", "bytecask.pool_frames_released",
+                             "bytecask.pool_direct_io_fallbacks"}) {
+      CHECK(stats.at(name) == 0);
+    }
+    db->close();
+    CHECK_THROWS_AS(db->stats(), bytecask::DbClosed);
+  }
+  auto db = Database::open(dir.path(), {.io_backend = bytecask::IoBackend::BufferPool,
+                                        .buffer_pool = {.capacity_bytes = kPool}});
+  auto before = db->stats();
+  CHECK(before.at("bytecask.pool_frames_total") > 0);
+  // What the reopen left is in a sealed file, read through the pool.
+  CHECK(row_count(*db) == 3);
+  auto after = db->stats();
+  auto reads = [](const auto& s) { return s.at("bytecask.pool_hits") + s.at("bytecask.pool_misses"); };
+  CHECK(reads(after) > reads(before));
+  CHECK(after.at("bytecask.pool_misses") > before.at("bytecask.pool_misses"));
+  CHECK(after.at("bytecask.pool_fills") > before.at("bytecask.pool_fills"));
+  CHECK(after.at("bytecask.pool_frames_resident") > 0);
+  // The same rows again come from the frames just admitted.
+  CHECK(row_count(*db) == 3);
+  CHECK(db->stats().at("bytecask.pool_hits") > after.at("bytecask.pool_hits"));
+}

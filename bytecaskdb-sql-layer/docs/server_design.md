@@ -37,7 +37,8 @@ GSSAPI encryption, every authentication method but trust, binary format,
 client_encoding` to UTF8) and `SHOW`, SQL
 `PREPARE`/`EXECUTE`/`DEALLOCATE`, `Execute` with a row limit, several
 statements in one `Query`, and the system catalogs (`pg_catalog`,
-`information_schema`).
+`information_schema`). `pg_stat_bytecask` is no catalog: the session answers
+one query of it (*Reading the counters*).
 
 ## What the client sends
 
@@ -405,7 +406,8 @@ statement the session runs at `Execute`.
 ## Simple query
 
 A `Query` holds one statement, with a trailing `;` and white space
-allowed. An empty one gets `EmptyQueryResponse`. Several statements are
+allowed. `pg_stat_bytecask`'s query is read by the session (*Reading the
+counters*). An empty one gets `EmptyQueryResponse`. Several statements are
 `0A000`; no client the gate uses sends them. A `$n` in a `Query` is
 `42P02` (`undefined_parameter`), PostgreSQL's "there is no parameter
 $1". A
@@ -417,6 +419,51 @@ A `Query` that arrives after `Execute`s outside `BEGIN`, before their
 and the transaction commits when the `Query` ends. An error in the `Query`
 rolls the whole block back. A DDL `Query` there is `0A000`, as a DDL beside
 other statements is.
+
+## Reading the counters
+
+A client reads the engine's operational counters with one query:
+
+```sql
+select * from pg_stat_bytecask;
+```
+
+The reply is one row per entry of `DB::stats()`, `name text, value bigint`,
+in order of name, tagged `SELECT n`. A sampler needs nothing else: the same
+query covers the buffer pool (`bytecask.pool_*`), the write path and the key
+directory, and so a new group of counters needs no new surface. The counters
+are described in the engine's `docs/bytecask_design.md`, *Operational Counters*.
+
+- **Names are the engine's, passed through.** The server does not translate
+  them, so the embedded API, the Python binding, the MariaDB plugin and the
+  wire share one vocabulary. A client looks a row up by name and tolerates new
+  ones. Adding a counter is routine; a PR that renames or removes one says so.
+- **The session answers it.** `classify` takes this text alone, in any case,
+  with any white space between its words and a trailing `;`. There is no
+  catalog behind it: no plan, no statement cache entry, no transaction. Any
+  other query of the name, a column list or a `WHERE` among them, reaches the
+  binder and is `42P01`; a user table of that name is reachable only by such a
+  query. Real system views would keep this query working.
+- **Protocols and blocks.** Simple and extended query both take it. In a
+  block it starts nothing and reads live values, which move with other
+  sessions' work: not the block's snapshot. In a failed block it is `25P02`, as
+  any statement is.
+- **No pool.** With `pread` or `mmap` the `bytecask.pool_*` rows are there and
+  all zero, so a sampler sees the same rows on every backend.
+  `bytecask.pool_frames_total = 0` says there is no pool.
+- **Values.** One `stats()` call, not one atomic snapshot: a counter read late
+  in it can include work a counter read early does not.
+- **Cost.** `Database::stats()` holds the shared lock every call holds, so no
+  statement waits on it. The engine reads its counters' atomics, walks the file
+  list, and briefly takes the change index's mutex. Measured on 16 cores, with 8
+  clients at about 93,000 statements a second on a 256 MiB pool and 7 open files:
+  a read's round trip from a Python client has a p50 of about 200 µs and a p99
+  under 300 µs at 1 Hz. Throughput at 1 Hz was 92,000 to 93,000 statements a
+  second, against 93,400 to 94,700 with no sampling, in 20-second phases. One
+  client reading as fast as it can, about 7,600 reads a second, took it to 87,000.
+
+The layer's own counters (plans compiled, retries, conflicts) are not built
+(#496). They would be more rows here, under their own prefix.
 
 ## Cursor statements
 
@@ -720,7 +767,9 @@ binder and compiler already keep:
    `test_every_range_message_maps_to_its_sqlstate` proves that every
    message maps.
 
-5. `Database::refit(stmt)`: recompiles a cached plan that the live catalog
+5. `Database::stats()`: the engine's `DB::stats()`, under the shared lock
+   every call takes (*Reading the counters*).
+6. `Database::refit(stmt)`: recompiles a cached plan that the live catalog
    no longer fits, as its next run would, and runs nothing. A statement
    prepared before a `DROP TABLE` and `CREATE TABLE` of other types still
    describes its old plan until it runs. The server refits at `Parse`,
@@ -863,6 +912,12 @@ mode but needs `/tmp` to allow executable mappings.
    layer's `.gitignore` ignores: date, commit, W, users, ramp-up,
    duration, NOPM, TPM, errors by SQLSTATE, and the check's result, all
    of our server; the report prints the same. No PostgreSQL row is written.
+   Each cell also appends `pg_stat_bytecask`, read when the driver ends and
+   before the server stops, to `benchmarks/hammerdb_counters.csv`, ignored
+   too: date, commit, W, users, name, value, one line per counter, so a new
+   counter changes no column. `hammerdb/read_counters.py` reads it with the
+   standard library, because the gate's machines need not have `psql`. A failed
+   read is reported and loses that cell's counters, not its result.
 
 The harness gains three commands for this:
 - `check`, over its existing `consistency()`;
@@ -948,6 +1003,7 @@ No microbenchmarks: the gate's numbers are HammerDB's.
   are `22P02`.
 - The integer and datetime input forms listed above only.
 - A form the layer does not support is `42601`, not PostgreSQL's code for running it.
+- `pg_stat_bytecask` is not a relation: only `select * from pg_stat_bytecask` reads it, and PostgreSQL has no such view.
 - `Execute` with a row limit, several statements in one `Query`, SQL
   `PREPARE`, `SET`, `SHOW` and `COPY` are refused.
 - The idle-in-transaction timeout is on by default (60 s); PostgreSQL's
