@@ -616,8 +616,8 @@ public:
   // latest entry its guards read; 0 for a plan without guards. For a key
   // found deleted or absent, which has no entry, the head's latest sequence.
   // With defer_puts, set only for a plan of point puts alone, the plan's
-  // writes are not checked here, nor the ensure_absent guards its inserts
-  // confirm: apply_puts_checked checks each in the descent that applies it.
+  // writes are not checked here: apply_puts_checked checks each in the
+  // descent that applies it.
   [[nodiscard]] auto validate_preconditions(const WritePlan &plan,
                                             std::uint64_t &rests_on,
                                             bool defer_puts = false) const
@@ -2196,10 +2196,8 @@ private:
   }
 
   auto guard_for(BytesView key) -> KeyGuard & {
-    auto it = guards_.find(key);
-    if (it == guards_.end())
-      it = guards_.emplace(Bytes{key.begin(), key.end()}, GuardEntry{}).first;
-    return it->second.guard;
+    auto k = Bytes{key.begin(), key.end()};
+    return guards_[std::move(k)];
   }
 
   void set_precondition(BytesView key, Precondition pre) {
@@ -2215,8 +2213,6 @@ private:
   // and the update then find the key by the location found here, without
   // reading its record (docs/unsynced_commit_design.md, D3).
   void resolve_snapshot_entries();
-  // Marks key's guard confirmed_by_insert if it is an ensure_absent.
-  void mark_confirmed_by_insert(BytesView key);
   // The snapshot's entry for write i: resolved earlier, or looked up now.
   [[nodiscard]] auto snapshot_entry(std::size_t i, BytesView key) const
       -> std::optional<KeyDirEntry>;
@@ -2231,24 +2227,7 @@ private:
   std::optional<Snapshot> snap_;
   SizeLimits limits_;
   std::vector<WriteOp> writes_;
-  // A guard as the caller set it, and what the engine learned about it while
-  // resolving the plan.
-  struct GuardEntry {
-    KeyGuard guard;
-    // An ensure_absent on a key the plan puts and the snapshot lacks, set by
-    // resolve_snapshot_entries: the insert's own descent confirms it, so the
-    // fused check (apply_puts_checked) does not look the key up first.
-    bool confirmed_by_insert{false};
-  };
-  // Orders keys as Bytes' operator< does, and finds one by a BytesView
-  // without copying it.
-  struct BytesLess {
-    using is_transparent = void;
-    auto operator()(BytesView a, BytesView b) const noexcept -> bool {
-      return std::ranges::lexicographical_compare(a, b);
-    }
-  };
-  std::map<Bytes, GuardEntry, BytesLess> guards_;
+  std::map<Bytes, KeyGuard> guards_;
   std::vector<RangeGuard> range_guards_;
   // Parallel to writes_ once resolve_snapshot_entries ran; empty otherwise.
   std::vector<std::optional<KeyDirEntry>> snap_entries_;

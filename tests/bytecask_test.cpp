@@ -14137,8 +14137,10 @@ TEST_CASE("checked puts: a failed guard refuses the plan before any put "
   CHECK(get_str(db, to_bytes("dup")) == "there");
 }
 
+// The key was absent from the snapshot, so its put is an insert, and its
+// guard is still checked before any put.
 TEST_CASE("checked puts: an ensure_absent on a key inserted since the "
-          "snapshot is refused by the insert's own descent",
+          "snapshot refuses the plan before any put is applied",
           "[bytecask][checked_puts]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
@@ -14147,11 +14149,11 @@ TEST_CASE("checked puts: an ensure_absent on a key inserted since the "
   (void)db.put({}, to_bytes("dup"), to_bytes("theirs"));  // after the snapshot
   const auto before = fallbacks(db);
   bytecask::WritePlan plan{std::move(snap)};
-  plan.put(to_bytes("a"), to_bytes("a1"));  // applied, then undone
-  plan.ensure_absent(to_bytes("dup"));      // not looked up first: the
-  plan.put(to_bytes("dup"), to_bytes("mine"));  // insert finds the key
+  plan.put(to_bytes("a"), to_bytes("a1"));
+  plan.ensure_absent(to_bytes("dup"));
+  plan.put(to_bytes("dup"), to_bytes("mine"));
   CHECK_FALSE(db.apply_batch({}, std::move(plan)).has_value());
-  CHECK(fallbacks(db) == before + kFallback);
+  CHECK(fallbacks(db) == before);
   CHECK(get_str(db, to_bytes("a")) == "a0");
   CHECK(get_str(db, to_bytes("dup")) == "theirs");
 }
