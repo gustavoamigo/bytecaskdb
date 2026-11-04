@@ -22,8 +22,8 @@
 #   --rampup:     unmeasured minutes before the window (default 2).
 #   --duration:   measured minutes (default 5).
 #   --mix:        the transaction types the driver runs (default all five).
-#   --hammerdb-home: where hammerdbcli is (default $HAMMERDB_HOME, ~/HammerDB-*,
-#                 or PATH). HammerDB 6.0's Linux release bundles Tcl and pgtcl.
+#   --hammerdb-home: where hammerdbcli is (default $HAMMERDB_HOME, the newest
+#                 ~/HammerDB-*, or PATH). HammerDB 6.0's Linux release bundles Tcl and pgtcl.
 #   --driver:     bcdboltp (default): HammerDB 6.0's PostgreSQL stored-procedure
 #                 driver logic, each transaction one CALL of a procedure of
 #                 tprocc_procs.sql, which the load creates; or custom: the
@@ -101,9 +101,11 @@ find_hammerdb() {
     [[ -x "$HAMMERDB_HOME/hammerdbcli" ]] && { echo "$HAMMERDB_HOME"; return 0; }
     return 1
   fi
-  for d in "$HOME"/HammerDB-*; do
+  # By version, newest first: glob order would put 10.0 before 9.0.
+  local d
+  while IFS= read -r d; do
     [[ -x "$d/hammerdbcli" ]] && { echo "$d"; return 0; }
-  done
+  done < <(printf '%s\n' "$HOME"/HammerDB-* | sort -rV)
   command -v hammerdbcli >/dev/null 2>&1 && { dirname "$(readlink -f "$(command -v hammerdbcli)")"; return 0; }
   return 1
 }
