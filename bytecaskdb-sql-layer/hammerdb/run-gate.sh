@@ -12,7 +12,8 @@
 # Usage:
 #   bytecaskdb-sql-layer/hammerdb/run-gate.sh [--warehouses=W] [--vus=1,16,48]
 #       [--rampup=MIN] [--duration=MIN] [--mix="neword payment ostat delivery slev"]
-#       [--hammerdb-home=PATH] [--data-root=PATH] [--server-flags="--sync AT_INTERVAL"]
+#       [--driver=bcdboltp|custom] [--hammerdb-home=PATH] [--data-root=PATH]
+#       [--server-flags="--sync AT_INTERVAL --sync-interval-ms 1000"]
 #       [--smoke --pg="libpq conninfo"]
 #
 #   --warehouses: warehouses loaded (default 48). Every user count must be at
@@ -30,7 +31,9 @@
 #   --data-root:  where the load and each cell's copy live (default a temporary
 #                 directory, removed at exit).
 #   --server-flags: more flags for sql_layer_server in every cell (default
-#                 none), e.g. "--sync AT_INTERVAL --sync-interval-ms 1000".
+#                 none, so AT_EVERY_COMMIT, which on a SATA SSD mostly measures
+#                 fdatasync). Runs compared with each other use
+#                 "--sync AT_INTERVAL --sync-interval-ms 1000".
 #   --smoke:      the nightly smoke: 2 warehouses, 2 users, no ramp-up, a
 #                 one-minute window; and the same run on PostgreSQL, through
 #                 --pg, to check the driver itself (its consistency, never its
@@ -41,8 +44,10 @@
 #   XMAKE_FLAGS:  more `xmake f` flags for the build (CI's toolchain).
 #
 # Each cell appends a row to bytecaskdb-sql-layer/benchmarks/hammerdb_results.csv
-# (ignored by git). A cell whose check fails, or whose run printed no result,
-# fails the script, whatever its NOPM.
+# (ignored by git), with the driver, the server flags and the data directory's
+# size when the server stopped. A cell whose check fails, or whose run printed
+# no result, fails the script, whatever its NOPM. The build's output is
+# build.log in the data root.
 
 set -euo pipefail
 
@@ -108,27 +113,51 @@ HAMMERDB_HOME="$(find_hammerdb)" || {
   exit 2
 }
 
-# releasedbg: a debug engine walks the key directory on every commit.
-# XMAKE_FLAGS: more `xmake f` flags, as CI configures its toolchain.
-echo "== building sql_layer_tprocc and sql_layer_server (releasedbg)"
-read -r -a xmake_flags <<<"${XMAKE_FLAGS:-}"
-build_log="$(mktemp -t bytecask_gate_build_XXXXXX)"
-if ! (cd "$ROOT" && xmake f -m releasedbg --sql_layer=y "${xmake_flags[@]}" -y &&
-      xmake build -y sql_layer_tprocc && xmake build -y sql_layer_server) >"$build_log" 2>&1; then
-  tail -80 "$build_log" >&2
-  echo "run-gate.sh: the build failed" >&2
-  exit 1
+# Here, before a build and a load that take minutes: a header this script does
+# not know would misalign every row it appended. A row from before the three
+# new columns has them empty, which is "not recorded": a row since always names
+# its driver.
+CSV="$LAYER/benchmarks/hammerdb_results.csv"
+CSV_HEADER_V1="date,commit,warehouses,users,rampup_min,duration_min,nopm,tpm,errors,check"
+CSV_HEADER="$CSV_HEADER_V1,driver,server_flags,final_data_bytes"
+mkdir -p "$(dirname "$CSV")"
+if [[ ! -s "$CSV" ]]; then
+  echo "$CSV_HEADER" >"$CSV"
+else
+  case "$(head -1 "$CSV")" in
+    "$CSV_HEADER") ;;
+    "$CSV_HEADER_V1")
+      sed -e "1c\\$CSV_HEADER" -e '1!s/$/,,,/' "$CSV" >"$CSV.tmp"
+      mv "$CSV.tmp" "$CSV"
+      ;;
+    *) echo "run-gate.sh: $CSV has a header this script does not know; move it aside" >&2; exit 2 ;;
+  esac
 fi
-rm -f "$build_log"
-BIN="$ROOT/build/linux/$(uname -m)/releasedbg"
-TPROCC="$BIN/sql_layer_tprocc"
-SERVER="$BIN/sql_layer_server"
 
 if [[ -z "$DATA_ROOT" ]]; then
   DATA_ROOT="$(mktemp -d -t bytecask_gate_XXXXXX)"
   trap 'rm -rf "$DATA_ROOT"' EXIT
 fi
 mkdir -p "$DATA_ROOT"
+
+# releasedbg: a debug engine walks the key directory on every commit.
+# XMAKE_FLAGS: more `xmake f` flags, as CI configures its toolchain.
+# -P on each call: from a worktree under .claude/worktrees, plain xmake resolves
+# to the checkout that holds it, and builds that tree. -v puts this tree's paths
+# in the log.
+echo "== building sql_layer_tprocc and sql_layer_server (releasedbg) in $ROOT"
+read -r -a xmake_flags <<<"${XMAKE_FLAGS:-}"
+build_log="$DATA_ROOT/build.log"
+if ! (xmake f -P "$ROOT" -m releasedbg --sql_layer=y "${xmake_flags[@]}" -y &&
+      xmake build -P "$ROOT" -v -y sql_layer_tprocc && xmake build -P "$ROOT" -v -y sql_layer_server) >"$build_log" 2>&1; then
+  tail -80 "$build_log" >&2
+  echo "run-gate.sh: the build failed" >&2
+  exit 1
+fi
+BIN="$ROOT/build/linux/$(uname -m)/releasedbg"
+TPROCC="$BIN/sql_layer_tprocc"
+SERVER="$BIN/sql_layer_server"
+
 PRISTINE="$DATA_ROOT/pristine_w${WAREHOUSES}_$DRIVER"
 if [[ ! -d "$PRISTINE" ]]; then
   echo "== loading $WAREHOUSES warehouses"
@@ -182,13 +211,11 @@ result() {  # log -> "NOPM TPM" or nothing
   sed -n 's/.*System achieved \([0-9]*\) NOPM from \([0-9]*\) .* TPM.*/\1 \2/p' "$1" | tail -1
 }
 
-CSV="$LAYER/benchmarks/hammerdb_results.csv"
-mkdir -p "$(dirname "$CSV")"
-[[ -f "$CSV" ]] || echo "date,commit,warehouses,users,rampup_min,duration_min,nopm,tpm,errors,check" >"$CSV"
 # A checkout without .git (CI's, when git was not installed first) has
 # GITHUB_SHA instead.
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo "${GITHUB_SHA:0:7}")"
 FAILED=0
+FLAGS_TEXT="${SERVER_FLAGS[*]:-}"
 
 for vu in "${VU_LIST[@]}"; do
   cell="$DATA_ROOT/cell"
@@ -207,14 +234,16 @@ for vu in "${VU_LIST[@]}"; do
   wait "$server" || { echo "sql_layer_server exited with $?" >&2; FAILED=1; }
   read -r nopm tpm <<<"$(result "$DATA_ROOT/hammerdb.log")" || true
   errors="$(sed -n 's/.*Errors by SQLSTATE: \(.*\)/\1/p' "$DATA_ROOT/hammerdb.log" | tail -1)"
+  # Apparent size, so a reflinked copy of the load counts in full.
+  data_bytes="$(du -sb "$cell" | cut -f1)"
   if "$TPROCC" check --dir "$cell"; then check=ok; else check=failed; FAILED=1; fi
   if [[ -z "${nopm:-}" ]]; then
     echo "no result: the driver's output follows" >&2
     tail -40 "$DATA_ROOT/hammerdb.log" >&2
     FAILED=1
   fi
-  echo "   NOPM ${nopm:-none}, TPM ${tpm:-none}, errors ${errors:-unknown}, check $check"
-  echo "$(date -u +%FT%TZ),$COMMIT,$WAREHOUSES,$vu,$RAMPUP,$DURATION,${nopm:-},${tpm:-},\"${errors:-}\",$check" >>"$CSV"
+  echo "   NOPM ${nopm:-none}, TPM ${tpm:-none}, errors ${errors:-unknown}, check $check, driver $DRIVER, server flags ${FLAGS_TEXT:-none}, final data $(numfmt --to=iec-i --suffix=B --format=%.1f "$data_bytes")"
+  echo "$(date -u +%FT%TZ),$COMMIT,$WAREHOUSES,$vu,$RAMPUP,$DURATION,${nopm:-},${tpm:-},\"${errors:-}\",$check,$DRIVER,\"${FLAGS_TEXT//\"/\"\"}\",$data_bytes" >>"$CSV"
   unset nopm tpm
 done
 
