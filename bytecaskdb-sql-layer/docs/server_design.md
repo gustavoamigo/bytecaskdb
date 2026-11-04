@@ -851,12 +851,24 @@ runs is not part of its output.
 
 `bytecaskdb-sql-layer/hammerdb/run-gate.sh [--warehouses=48] [--vus=1,16,48]
 [--rampup=2] [--duration=5] [--mix="neword payment ostat delivery slev"]
-[--hammerdb-home=PATH] [--data-root=PATH] [--server-flags="--sync AT_INTERVAL"]
+[--driver=bcdboltp|custom] [--hammerdb-home=PATH] [--data-root=PATH]
+[--server-flags="--sync AT_INTERVAL --sync-interval-ms 1000"]
 [--smoke --pg=CONNINFO]`. `--server-flags` goes to the server in every cell. It
 follows `run-hammerdb.sh` in the MariaDB plugin. `--smoke` is the short run
 of *Tests*, and `--pg` names the PostgreSQL it checks the driver on (its
 password in `PGPASSWORD`). `XMAKE_FLAGS` adds `xmake f` flags, as CI sets
 its toolchain.
+
+**What a comparison run uses.** Results compared with each other use
+`--server-flags="--sync AT_INTERVAL --sync-interval-ms 1000"`, on every tree
+compared. The gate's default is the server's, `AT_EVERY_COMMIT`, which on a
+SATA SSD mostly measures `fdatasync`: compare a default run only with another
+one, and only to measure that path. The smoke uses the default.
+
+**The data outgrows its load.** On 244ae692, a 48-warehouse load of 6 GB grew
+to 23–30 GB over a 2+5 minute cell at 16 and 48 users, so a buffer pool sized
+from the load does not keep the data in memory. Each cell reports its final
+size. Size a pool from that, at the same user count and length.
 
 TinyCC is built with `--with-selinux` whenever SELinux is enabled on the
 build machine (`xmake.lua`): in enforcing mode its default way of making
@@ -866,6 +878,9 @@ mode but needs `/tmp` to allow executable mappings.
 
 1. **Build.** It builds `sql_layer_tprocc` and `sql_layer_server` in
    `releasedbg`; a debug engine walks the key directory on every commit.
+   Each `xmake` call passes `-P` with the script's own tree, so a worktree
+   under `.claude/worktrees` builds itself and not the checkout around it.
+   The verbose output is `build.log` in the data root.
 2. **Load.** It loads W warehouses once with `sql_layer_tprocc load`, not
    HammerDB's `buildschema`, and keeps the directory as the pristine copy.
    With `--smoke`, `--sql-out` also writes the population for PostgreSQL.
@@ -883,6 +898,7 @@ mode but needs `/tmp` to allow executable mappings.
      `vudestroy`;
    - parse the result line;
    - stop the server with `SIGTERM`;
+   - measure the data directory's apparent size;
    - run `sql_layer_tprocc check --dir`, the nine conditions, on what the
      run left.
 
@@ -895,8 +911,13 @@ mode but needs `/tmp` to allow executable mappings.
 5. **Results.** One row per cell goes to
    `bytecaskdb-sql-layer/benchmarks/hammerdb_results.csv`, which the
    layer's `.gitignore` ignores: date, commit, W, users, ramp-up,
-   duration, NOPM, TPM, errors by SQLSTATE, and the check's result, all
+   duration, NOPM, TPM, errors by SQLSTATE, the check's result, the driver,
+   the server flags (empty for none) and the final data size in bytes, all
    of our server; the report prints the same. No PostgreSQL row is written.
+   A file with the header from before the last three columns is rewritten to
+   the new header once, its rows with those columns empty, which means not
+   recorded: every newer row names its driver. Any other header stops the
+   script before it builds.
 
 The harness gains three commands for this:
 - `check`, over its existing `consistency()`;
