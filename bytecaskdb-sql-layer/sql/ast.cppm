@@ -391,8 +391,36 @@ struct DropView {
   std::int32_t pos{-1};
 };
 
-using Statement =
-    std::variant<CreateTable, CreateIndex, DropTable, DropIndex, AddColumn, CreateView, DropView, Insert, Select, Update, Delete>;
+// CREATE [OR REPLACE] PROCEDURE name (args) LANGUAGE plpgsql AS $$ body $$
+// (docs/procedures_design.md). Each argument's type is read as a column's
+// is; the body's PL/pgSQL syntax was checked by parse(). The catalog stores
+// the statement's text.
+struct ProcedureArgAst {
+  enum class Mode { In, InOut, Out };
+  Mode mode{Mode::In};
+  ColumnDefAst def;  // name, type and modifiers; no constraint
+};
+
+struct CreateProcedure {
+  std::string procedure;
+  bool replace{false};
+  std::vector<ProcedureArgAst> args;
+  std::int32_t pos{-1};
+  std::string definition;  // the statement's text, set by parse()
+};
+
+// DROP PROCEDURE [IF EXISTS] name [(argtype, …)]. `arg_types` is nullopt
+// when no list was written, and holds each type's name and modifiers
+// otherwise (a ColumnDefAst with no name).
+struct DropProcedure {
+  std::string procedure;
+  std::optional<std::vector<ColumnDefAst>> arg_types;
+  bool if_exists{false};
+  std::int32_t pos{-1};
+};
+
+using Statement = std::variant<CreateTable, CreateIndex, DropTable, DropIndex, AddColumn, CreateView, DropView,
+                               CreateProcedure, DropProcedure, Insert, Select, Update, Delete>;
 
 // Cursor statements (docs/cursor_design.md). They are not a Statement: they
 // name a session's cursor and carry no plan, so the session runs them, as it

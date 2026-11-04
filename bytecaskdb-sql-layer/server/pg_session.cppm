@@ -207,6 +207,21 @@ auto first_statement(std::string_view s, bool& rest_blank) -> std::size_t {
       k = close == std::string_view::npos ? s.size() : close + 2;
       return true;
     }
+    // A dollar-quoted string, $$…$$ or $tag$…$tag$, as a procedure's body is
+    // written. A '$' inside a name (a$b) or before a digit ($1) opens none.
+    auto ident = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' || c == '$'; };
+    if (s[k] == '$' && (k == 0 || !ident(s[k - 1]))) {
+      auto t = k + 1;
+      if (t < s.size() && std::isdigit(static_cast<unsigned char>(s[t])) == 0) {
+        while (t < s.size() && s[t] != '$' && ident(s[t])) ++t;
+      }
+      if (t < s.size() && s[t] == '$') {
+        auto tag = s.substr(k, t + 1 - k);
+        auto close = s.find(tag, t + 1);
+        k = close == std::string_view::npos ? s.size() : close + tag.size();
+        return true;
+      }
+    }
     if (s[k] == '\'' || s[k] == '"') {
       auto q = s[k];
       ++k;
@@ -395,6 +410,8 @@ auto command_name(Command c) -> std::string_view {
     case Command::AlterTable: return "ALTER TABLE";
     case Command::CreateView: return "CREATE VIEW";
     case Command::DropView: return "DROP VIEW";
+    case Command::CreateProcedure: return "CREATE PROCEDURE";
+    case Command::DropProcedure: return "DROP PROCEDURE";
   }
   return {};
 }
@@ -412,6 +429,8 @@ auto command_tag(Command c, const Rows& r) -> std::string {
     case Command::AlterTable: return "ALTER TABLE";
     case Command::CreateView: return "CREATE VIEW";
     case Command::DropView: return "DROP VIEW";
+    case Command::CreateProcedure: return "CREATE PROCEDURE";
+    case Command::DropProcedure: return "DROP PROCEDURE";
   }
   return {};
 }

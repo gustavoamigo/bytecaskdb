@@ -1147,3 +1147,179 @@ TEST_CASE("catalog: a view's record and name entry must agree at load, and a dam
     db.close();
   }
 }
+
+namespace {
+
+auto neword_args() -> std::vector<ProcedureArg> {
+  return {{ProcedureArg::Mode::In, "w_id", SqlType{SqlKind::Integer}},
+          {ProcedureArg::Mode::InOut, "c_last", SqlType{SqlKind::Varchar, 16}},
+          {ProcedureArg::Mode::Out, "total", SqlType{SqlKind::Decimal, 0, 12, 2}}};
+}
+
+auto create_p(std::string name = "p", bool replace = false, std::string body = "BEGIN END") -> CreateProcedureDdl {
+  return {std::move(name), "CREATE PROCEDURE p(...) LANGUAGE plpgsql AS $$" + body + "$$", replace, neword_args()};
+}
+
+}  // namespace
+
+TEST_CASE("catalog: a procedure is a record and a name entry of its own namespace, survives a reopen, and is replaced or dropped",
+          "[sql][catalog][procedure]") {
+  sql_test::TempDir dir{"catalog_procedure"};
+  auto refused = [](LiveCatalog& live, const Ddl& ddl) -> std::string {
+    try {
+      (void)live.apply(ddl);
+    } catch (const DdlRefused& e) {
+      return std::string{e.sqlstate()};
+    }
+    return {};
+  };
+  std::uint32_t p_id = 0;
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    (void)live.apply(create_t());
+    auto t_id = live.current()->table("t")->id;
+    (void)live.apply(create_p());
+    auto cat = live.current();
+    REQUIRE(cat->procedure("p") != nullptr);
+    p_id = cat->procedure("p")->id;
+    CHECK(p_id > t_id);  // one id counter
+    CHECK(cat->procedure("p")->args == neword_args());
+    CHECK(cat->procedure("p")->definition == create_p().definition);
+    // A namespace of its own: a procedure and a table may share a name.
+    (void)live.apply(create_p("t"));
+    CHECK(live.current()->table("t") != nullptr);
+    CHECK(live.current()->procedure("t") != nullptr);
+    (void)live.apply(CreateTableDdl{"p", {col("id", SqlKind::BigInt)}, {"id"}});
+    CHECK(refused(live, DropTableDdl{"t"}).empty());  // no dependency recorded: nothing refuses the drop
+    CHECK(live.current()->procedure("t") != nullptr);
+    // One procedure per name: no overloading, and OR REPLACE keeps the arguments.
+    CHECK(refused(live, create_p()) == "42723");
+    auto other = create_p("p", true);
+    other.args.pop_back();
+    CHECK(refused(live, other) == "0A000");
+    other = create_p("p", true);
+    other.args[0].name = "warehouse";
+    CHECK(refused(live, other) == "0A000");
+    auto twice = create_p("q");
+    twice.args[1].name = "w_id";
+    CHECK(refused(live, twice) == "42P13");
+    CHECK(live.current()->procedure("q") == nullptr);
+    (void)live.apply(create_p("p", true, "BEGIN NULL; END"));
+    CHECK(live.current()->procedure("p")->id == p_id);  // replaced in place
+    CHECK(live.current()->procedure("p")->definition.find("NULL") != std::string::npos);
+    (void)live.apply(create_p("r", true));  // OR REPLACE of nothing creates it
+    CHECK(live.current()->procedure("r") != nullptr);
+    db.close();
+  }
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    auto cat = live.current();
+    REQUIRE(cat->procedure("p") != nullptr);
+    CHECK(cat->procedure("p")->id == p_id);
+    CHECK(cat->procedure("p")->args == neword_args());
+    CHECK(cat->procedure("p")->definition.find("NULL") != std::string::npos);
+    CHECK(cat->procedures().size() == 3);
+    // A DROP's argument list names the input arguments, or all of them; modifiers
+    // are not compared, and VARCHAR is TEXT.
+    using Types = std::vector<SqlType>;
+    CHECK(refused(live, DropProcedureDdl{"p", Types{SqlType{SqlKind::BigInt}, SqlType{SqlKind::Text}}}) == "42883");
+    CHECK(refused(live, DropProcedureDdl{"p", Types{SqlType{SqlKind::Integer}}}) == "42883");
+    CHECK(live.apply(DropProcedureDdl{"p", Types{SqlType{SqlKind::Integer}}, true}) == live.current());  // IF EXISTS: no-op
+    (void)live.apply(DropProcedureDdl{"p", Types{SqlType{SqlKind::Integer}, SqlType{SqlKind::Text}}});
+    CHECK(count_prefix(db, procedure_record_key(p_id)) == 0);
+    CHECK(count_prefix(db, procedure_name_key("p")) == 0);
+    (void)live.apply(DropProcedureDdl{"t", Types{SqlType{SqlKind::Integer}, SqlType{SqlKind::Varchar, 3},
+                                                 SqlType{SqlKind::Decimal, 0, 5, 0}}});
+    (void)live.apply(DropProcedureDdl{"r"});
+    CHECK(refused(live, DropProcedureDdl{"r"}) == "42883");
+    CHECK(live.apply(DropProcedureDdl{"r", std::nullopt, true}) == live.current());
+    CHECK(live.current()->table("p") != nullptr);  // the table of that name stays
+    db.close();
+  }
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    CHECK(live.current()->procedures().empty());
+    // Dropped and created again: another object.
+    (void)live.apply(create_p());
+    CHECK(live.current()->procedure("p")->id > p_id);
+    db.close();
+  }
+}
+
+TEST_CASE("catalog: a procedure's record and name entry must agree at load, and a damaged record is refused",
+          "[sql][catalog][procedure]") {
+  sql_test::TempDir dir{"catalog_procedure_damage"};
+  std::uint32_t p_id = 0;
+  Bytes record, entry;
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    (void)live.apply(create_p());
+    p_id = live.current()->procedure("p")->id;
+    REQUIRE(db.snapshot().get({}, procedure_record_key(p_id), record));
+    REQUIRE(db.snapshot().get({}, procedure_name_key("p"), entry));
+    db.close();
+  }
+  auto put = [&](const Bytes& key, const Bytes& value) {
+    auto db = DB::open(dir.path());
+    db.put({}, key, value);
+    db.close();
+  };
+  auto refused_with = [&](const Bytes& key, const Bytes& value) {
+    put(key, value);
+    {
+      auto db = DB::open(dir.path());
+      CHECK_THROWS_AS(LiveCatalog{db}, std::runtime_error);
+      (void)db.del({}, key);
+      db.close();
+    }
+    put(procedure_record_key(p_id), record);
+    put(procedure_name_key("p"), entry);
+  };
+  INFO("record size " << record.size());
+  for (std::size_t n = 0; n < record.size(); ++n) {
+    refused_with(procedure_record_key(p_id), Bytes(record.begin(), record.begin() + static_cast<std::ptrdiff_t>(n)));
+  }
+  auto changed = [&](std::size_t at, std::byte b) {
+    auto r = record;
+    r[at] = b;
+    return r;
+  };
+  refused_with(procedure_record_key(p_id), changed(1, std::byte{2}));  // a later format
+  auto longer = record;
+  longer.push_back(std::byte{0});
+  refused_with(procedure_record_key(p_id), longer);
+  refused_with(procedure_record_key(p_id + 1), record);  // under another id's key
+  // The first argument's mode, then its type's kind: past the format, the id,
+  // the name "p", the definition and the argument count; the mode, then the name "w_id".
+  auto mode_at = std::size_t{2 + 4 + 2 + 1 + 4} + create_p().definition.size() + 2;
+  auto kind_at = mode_at + 1 + 2 + 4;
+  REQUIRE(std::to_integer<int>(record[mode_at]) == 1);  // In
+  REQUIRE(std::to_integer<int>(record[kind_at]) == static_cast<int>(SqlKind::Integer));
+  refused_with(procedure_record_key(p_id), changed(mode_at, std::byte{9}));
+  refused_with(procedure_record_key(p_id), changed(kind_at, std::byte{0xEE}));
+  // No name entry; an entry of another kind or id; an entry with no record.
+  {
+    auto db = DB::open(dir.path());
+    (void)db.del({}, procedure_name_key("p"));
+    CHECK_THROWS_AS(LiveCatalog{db}, std::runtime_error);
+    db.close();
+  }
+  put(procedure_name_key("p"), entry);
+  auto other_kind = entry;
+  other_kind[0] = std::byte{3};
+  refused_with(procedure_name_key("p"), other_kind);
+  auto other_id = entry;
+  other_id[4] = std::byte{static_cast<unsigned char>(std::to_integer<int>(other_id[4]) + 1)};
+  refused_with(procedure_name_key("p"), other_id);
+  refused_with(procedure_name_key("q"), entry);
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog ok{db};  // consistent again
+    CHECK(ok.current()->procedure("p") != nullptr);
+    db.close();
+  }
+}

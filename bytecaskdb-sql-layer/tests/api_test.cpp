@@ -2726,3 +2726,52 @@ TEST_CASE("embedded API: a cancel flag or a passed deadline fails a statement wi
   CHECK_THROWS_AS(t.execute(kById, {i(1)}), TransactionAborted);
   CHECK(t.commit() == CommitOutcome::RolledBack);
 }
+
+TEST_CASE("embedded API: CREATE and DROP PROCEDURE are DDL, kept in the catalog with PostgreSQL's SQLSTATEs",
+          "[sql][api][procedure]") {
+  sql_test::TempDir dir{"api_procedure"};
+  auto state = [](Database& db, std::string_view sql) -> std::string {
+    try {
+      (void)db.execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return std::string{"ran"};
+  };
+  auto neword = std::string{
+      "CREATE PROCEDURE neword(no_w_id INTEGER, INOUT no_c_last VARCHAR(16), OUT total NUMERIC(12, 2)) "
+      "LANGUAGE plpgsql AS $$ BEGIN SELECT c_last INTO no_c_last FROM customer WHERE c_w_id = no_w_id; END $$"};
+  {
+    auto db = Database::open(dir.path());
+    CHECK(db->prepare(neword).command() == Command::CreateProcedure);
+    CHECK(db->prepare("DROP PROCEDURE neword").command() == Command::DropProcedure);
+    CHECK(state(*db, neword) == "ran");  // the table it names need not exist
+    CHECK(db->catalog()->procedure("neword")->definition == neword);
+    CHECK(state(*db, neword) == "42723");
+    CHECK(state(*db, "CREATE PROCEDURE p(a INT, a INT) LANGUAGE plpgsql AS $$ BEGIN END $$") == "42P13");
+    CHECK(state(*db, "CREATE PROCEDURE p(a NUMERIC) LANGUAGE plpgsql AS $$ BEGIN END $$") == "42601");  // no precision
+    CHECK(state(*db, "CREATE PROCEDURE p(a INT) LANGUAGE plpgsql AS $$ BEGIN IF END $$") == "42601");
+    CHECK(state(*db, "CREATE OR REPLACE PROCEDURE neword(no_w_id BIGINT, INOUT no_c_last VARCHAR(16), OUT total "
+                     "NUMERIC(12, 2)) LANGUAGE plpgsql AS $$ BEGIN END $$") == "0A000");  // an overload
+    CHECK(state(*db, "CALL neword(1, 'x', NULL)") == "0A000");
+    CHECK(state(*db, "CREATE TABLE neword (id INTEGER PRIMARY KEY)") == "ran");  // its own namespace
+    {
+      auto txn = db->begin();
+      CHECK_THROWS_AS(txn.execute("DROP PROCEDURE neword"), FeatureNotSupported);  // DDL, refused in a block
+      txn.rollback();
+    }
+  }
+  {
+    auto db = Database::open(dir.path());
+    REQUIRE(db->catalog()->procedure("neword") != nullptr);
+    CHECK(state(*db, "DROP PROCEDURE neword(TEXT)") == "42883");
+    CHECK(state(*db, "DROP PROCEDURE IF EXISTS neword(TEXT)") == "ran");
+    CHECK(state(*db, "DROP PROCEDURE neword(INTEGER, VARCHAR, NUMERIC)") == "ran");  // every argument's type
+    CHECK(db->catalog()->procedure("neword") == nullptr);
+    CHECK(state(*db, "DROP PROCEDURE neword") == "42883");
+    CHECK(state(*db, "DROP PROCEDURE IF EXISTS neword") == "ran");
+    CHECK(db->catalog()->table("neword") != nullptr);
+  }
+}

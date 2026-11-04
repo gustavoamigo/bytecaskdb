@@ -599,6 +599,23 @@ def test_ddl_runs_alone_and_is_refused_beside_another_statement(server):
     assert states(c.until_ready()) == ["42P01"]  # never created
 
 
+def test_create_and_drop_procedure_have_their_command_tags_and_call_is_0a000(server):
+    c = connect(server)
+    c.send(query("CREATE PROCEDURE p(a INTEGER, INOUT b TEXT) LANGUAGE plpgsql AS $$ BEGIN b := 'x'; END $$"))
+    assert [b for k, b in c.until_ready() if k == b"C"] == [b"CREATE PROCEDURE\0"]
+    c.send(query("CALL p(1, NULL)"))
+    assert states(c.until_ready()) == ["0A000"]
+    c.send(query("DROP PROCEDURE p(INTEGER, TEXT)"))
+    assert [b for k, b in c.until_ready() if k == b"C"] == [b"DROP PROCEDURE\0"]
+    c.send(query("DROP PROCEDURE p"))
+    assert states(c.until_ready()) == ["42883"]
+    # The ';' of a dollar-quoted body, tagged or not, ends no statement; one after it does.
+    c.send(query("CREATE PROCEDURE q() LANGUAGE plpgsql AS $body$ BEGIN NULL; NULL; END $body$; ; "))
+    assert [b for k, b in c.until_ready() if k == b"C"] == [b"CREATE PROCEDURE\0"]
+    c.send(query("CREATE PROCEDURE r() LANGUAGE plpgsql AS $$ BEGIN NULL; END $$; DROP PROCEDURE q"))
+    assert states(c.until_ready()) == ["0A000"]  # two statements: the simple protocol takes one
+
+
 def test_shutdown_sends_57p01_to_an_idle_connection():
     if not server_binary():
         pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
