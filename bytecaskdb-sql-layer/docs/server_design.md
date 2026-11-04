@@ -852,18 +852,21 @@ runs is not part of its output.
 `bytecaskdb-sql-layer/hammerdb/run-gate.sh [--warehouses=48] [--vus=1,16,48]
 [--rampup=2] [--duration=5] [--mix="neword payment ostat delivery slev"]
 [--driver=bcdboltp|custom] [--hammerdb-home=PATH] [--data-root=PATH]
-[--server-flags="--sync AT_INTERVAL --sync-interval-ms 1000"]
+[--server-flags="--io-backend buffer_pool"]
 [--smoke --pg=CONNINFO]`. `--server-flags` goes to the server in every cell. It
 follows `run-hammerdb.sh` in the MariaDB plugin. `--smoke` is the short run
 of *Tests*, and `--pg` names the PostgreSQL it checks the driver on (its
 password in `PGPASSWORD`). `XMAKE_FLAGS` adds `xmake f` flags, as CI sets
 its toolchain.
 
-**What a comparison run uses.** Results compared with each other use
-`--server-flags="--sync AT_INTERVAL --sync-interval-ms 1000"`, on every tree
-compared. The gate's default is the server's, `AT_EVERY_COMMIT`, which on a
-SATA SSD mostly measures `fdatasync`: compare a default run only with another
-one, and only to measure that path. The smoke uses the default.
+**The two sync modes.** Without `--sync` in `--server-flags`, each user count
+runs twice, on a fresh copy each: `AT_EVERY_COMMIT` and `AT_INTERVAL` at 1000 ms
+(or at the flags' `--sync-interval-ms`). They test different things:
+`AT_EVERY_COMMIT` on a SATA SSD mostly measures `fdatasync`, and `AT_INTERVAL`
+measures the layer. So a default gate takes twice as long as one mode. With
+`--sync`, only that mode runs. Compare only rows of the same sync mode.
+`--smoke` runs `AT_EVERY_COMMIT` alone: it checks the driver and the conditions,
+never the numbers.
 
 **The data outgrows its load.** On 244ae692, a 48-warehouse load of 6 GB grew
 to 23–30 GB over a 2+5 minute cell at 16 and 48 users, so a buffer pool sized
@@ -884,7 +887,7 @@ mode but needs `/tmp` to allow executable mappings.
 2. **Load.** It loads W warehouses once with `sql_layer_tprocc load`, not
    HammerDB's `buildschema`, and keeps the directory as the pristine copy.
    With `--smoke`, `--sql-out` also writes the population for PostgreSQL.
-3. **Per user count:**
+3. **Per user count and sync mode:**
    - restore the copy (a reflink where the filesystem has them);
    - take a run with `sql_layer_tprocc next-run`, written into the driver's
      header;
@@ -912,12 +915,11 @@ mode but needs `/tmp` to allow executable mappings.
    `bytecaskdb-sql-layer/benchmarks/hammerdb_results.csv`, which the
    layer's `.gitignore` ignores: date, commit, W, users, ramp-up,
    duration, NOPM, TPM, errors by SQLSTATE, the check's result, the driver,
-   the server flags (empty for none) and the final data size in bytes, all
+   the server's flags, the final data size in bytes and the sync mode, all
    of our server; the report prints the same. No PostgreSQL row is written.
-   A file with the header from before the last three columns is rewritten to
-   the new header once, its rows with those columns empty, which means not
-   recorded: every newer row names its driver. Any other header stops the
-   script before it builds.
+   A file with an earlier header of this one is rewritten to it once, its
+   rows with the columns they lack empty, which means not recorded. Any other
+   header stops the script before it builds.
 
 The harness gains three commands for this:
 - `check`, over its existing `consistency()`;
