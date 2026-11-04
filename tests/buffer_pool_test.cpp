@@ -758,7 +758,7 @@ TEST_CASE("BufferPool: release_file frees a sealed file's short last frame",
 }
 
 TEST_CASE("BufferPool: sealed short frames against pread under constant eviction",
-          "[buffer_pool]") {
+          "[buffer_pool][concurrency]") {
   // Short last frames keep being evicted and refilled into frames that held
   // the other file's bytes, with readers on every thread.
   constexpr std::size_t kFile = 3 * 1024 * 1024 + 100;
