@@ -11,6 +11,8 @@ module;
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <exception>
+#include <stdexcept>
 #include <expected>
 #include <functional>
 #include <optional>
@@ -21,6 +23,7 @@ module;
 #include <vector>
 
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+#include "bytecaskdb-sql-layer/algebra/bc_proc.h"
 #include "include/bytecask.hpp"
 
 export module bytecask.sql.runtime;
@@ -68,6 +71,29 @@ struct bc_params {
   std::vector<bc_value> values;
 };
 
+// A running procedure (docs/procedures_design.md, *The statement
+// boundary*): its frame, whose parameters are its slots, and the caller's
+// hooks that begin and end each statement on its transaction. A hook throws
+// to fail the procedure; the first exception is kept for the caller, and the
+// frame fails so every later call does nothing.
+struct bc_proc {
+  bc_ctx* frame{nullptr};
+  bc_params slots;
+  std::vector<bytecask::sql::SqlType> types;  // each slot's declared type
+  std::function<bc_ctx*(std::uint32_t)> begin;
+  std::function<void(std::uint32_t)> end;
+  std::exception_ptr error;
+  struct Range {
+    std::int64_t next{0}, last{0};
+    bool reverse{false}, done{true};
+  };
+  std::vector<Range> ranges;
+};
+
+// Begins `cx` as a procedure's frame: its parameters and budget, and no
+// snapshot, since it reads no table.
+void bc_ctx_begin_frame(bc_ctx* cx, const bc_params* params, bc_budget budget);
+
 #ifdef BYTECASK_SQL_TESTING
 // Test only (sql_layer_testing): runs `hook` in every bc_ctx_commit of the
 // context, after the plan ran and before its batch reaches the engine, so a
@@ -86,6 +112,9 @@ export using ::bc_db;
 export using ::bc_memory_cap;
 export using ::bc_catalog;
 export using ::bc_params;
+export using ::bc_proc;
+export using ::bc_proc_fn;
+export using ::bc_ctx_begin_frame;
 export using ::bc_ctx_affected;
 #ifdef BYTECASK_SQL_TESTING
 export using ::bc_ctx_before_commit_for_testing;
@@ -94,6 +123,20 @@ export using ::bc_ctx_write_set_slots_for_testing;
 #endif
 
 export namespace bytecask::sql {
+
+// A procedure's failure that is no statement's: a NULL FOR bound (22004),
+// STRICT's no row (P0002) or second row (P0003).
+class ProcedureError : public std::runtime_error {
+public:
+  ProcedureError(const std::string& what, SqlState state) : std::runtime_error{what}, state_{state} {}
+  ProcedureError(const ProcedureError&) = default;
+  ProcedureError& operator=(const ProcedureError&) = default;
+  ~ProcedureError() override;  // out of line: anchors the vtable (-Wweak-vtables)
+  [[nodiscard]] auto sqlstate() const noexcept -> std::string_view { return state_.view(); }
+
+private:
+  SqlState state_;
+};
 
 // What the plan API charges a statement's memory budget for an entry of its
 // own, beside the bytes the entry holds (docs/plan_api_design.md, *Memory*):
@@ -219,6 +262,9 @@ auto fn_addr(F* f) -> const void* {
 
 namespace bytecask::sql {
 
+ProcedureError::~ProcedureError() = default;
+
+
 auto decode_row(const RowLayout& layout, BytesView row) -> std::expected<std::vector<bc_value>, std::uint32_t> {
   std::vector<bc_value> out;
   out.reserve(layout.columns.size());
@@ -251,6 +297,17 @@ auto result_type_codes(std::span<const PhysType> types) -> std::vector<std::uint
 auto plan_api_symbols() -> std::span<const ApiSymbol> {
   // Function-local: initialised on first use, not by a global constructor.
   static const ApiSymbol kSymbols[] = {
+      {"bc_proc_ctx", fn_addr(bc_proc_ctx)},
+      {"bc_stmt_begin", fn_addr(bc_stmt_begin)},
+      {"bc_stmt_end", fn_addr(bc_stmt_end)},
+      {"bc_var_set_i64", fn_addr(bc_var_set_i64)},
+      {"bc_var_set_f64", fn_addr(bc_var_set_f64)},
+      {"bc_var_set_bool", fn_addr(bc_var_set_bool)},
+      {"bc_var_set_bytes", fn_addr(bc_var_set_bytes)},
+      {"bc_var_set_null", fn_addr(bc_var_set_null)},
+      {"bc_loop", fn_addr(bc_loop)},
+      {"bc_range_open", fn_addr(bc_range_open)},
+      {"bc_range_next", fn_addr(bc_range_next)},
       {"bc_param_i64", fn_addr(bc_param_i64)},
       {"bc_param_f64", fn_addr(bc_param_f64)},
       {"bc_param_bool", fn_addr(bc_param_bool)},

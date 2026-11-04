@@ -23,6 +23,7 @@ module;
 #include <memory>
 #include <optional>
 #include <span>
+#include <set>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -109,6 +110,45 @@ struct Bound {
 
 // Throws ast::SqlError with a message and the position of the offending node.
 [[nodiscard]] auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound;
+
+// A procedure's body (docs/procedures_design.md, *Compilation pipeline*).
+// `frame` is a table that is no catalog's: its columns are the procedure's
+// variables, each column's id its slot.
+//
+// An expression over the variables, as PL/pgSQL evaluates `x := expr`, a
+// condition or a FOR bound: each variable becomes parameter $slot, and each
+// constant parameter $n from `first_constant` on, its value and type
+// appended to `constants`. With `target`, the variable it is assigned to, a
+// constant is coerced to its type as an INSERT's is.
+struct ProcedureConstants {
+  std::vector<Datum> values;
+  std::vector<SqlType> types;
+};
+[[nodiscard]] auto bind_procedure_expr(const std::string& text, const Table& frame, const Catalog& cat,
+                                       std::uint32_t first_constant, ProcedureConstants& constants,
+                                       const Column* target = nullptr) -> logical::Expr;
+
+// An embedded statement: each variable it names becomes a parameter, $1
+// onwards in the order first named; `param_vars` gives each one's slot. A
+// name that is both a variable and a column of a table the statement reads
+// or writes is 42702, as under plpgsql.variable_conflict = error. A
+// variable used where its type is not the parameter's is refused (0A000).
+struct ProcedureStatement {
+  Bound bound;
+  std::vector<std::uint32_t> param_vars;
+};
+[[nodiscard]] auto bind_procedure_statement(const std::string& sql, const Table& frame, const Catalog& cat)
+    -> ProcedureStatement;
+
+// Whether a value of type `from` may be stored as one of `to` without a
+// conversion: the same physical type and decimal scale, and both integers,
+// both text, or of one kind. A narrower `to` is checked when the value is
+// stored (22003, 22001), as PostgreSQL's assignment cast checks it.
+[[nodiscard]] auto assignable(SqlType from, SqlType to) -> bool;
+
+// A declared variable's type as PL/pgSQL gives its text (int, numeric(12,2),
+// pg_catalog."integer"), read as a column of that type is.
+[[nodiscard]] auto declared_type(const std::string& text) -> SqlType;
 
 }  // namespace bytecask::sql::bound
 
@@ -1679,6 +1719,7 @@ public:
     auto n = own_params_ + bytecask::sql::narrow<std::uint32_t>(fixed_.size());
     fixed_.push_back(std::move(v));
     fixed_types_.push_back(phys_type(t));
+    fixed_sql_.push_back(t);
     return logical::param(n, t);
   }
   // CURRENT_DATE, LOCALTIME or LOCALTIMESTAMP: a constant slot the runtime
@@ -1707,6 +1748,7 @@ public:
   [[nodiscard]] auto fixed_value(std::uint32_t n) const -> const Datum& { return fixed_.at(n - own_params_); }
   [[nodiscard]] auto fixed_values() const -> const std::vector<Datum>& { return fixed_; }
   [[nodiscard]] auto fixed_types() const -> const std::vector<PhysType>& { return fixed_types_; }
+  [[nodiscard]] auto fixed_sql() const -> const std::vector<SqlType>& { return fixed_sql_; }
   [[nodiscard]] auto take_subqueries() -> std::vector<logical::Subquery> { return std::move(subqueries_); }
   [[nodiscard]] auto take_instances() -> std::vector<std::unique_ptr<Table>> { return std::move(instances_); }
   void set_scope(std::vector<const Table*> tables) { scope_ = std::move(tables); }
@@ -2303,6 +2345,54 @@ public:
       throw SqlError{"argument of CHECK must be type boolean, not type " + pg_type_name(e.type), pos, kDatatypeMismatch};
     }
     return e;
+  }
+
+  // An expression of a procedure's body over `frame`, the variables
+  // (bind_procedure_expr): a value, or, with `target`, one assigned to it.
+  auto frame_value(const Table& frame, const std::string& text, const Column* target) -> logical::Expr {
+    auto stmt = ast::parse("SELECT (" + text + "\n)");
+    const auto* q = std::get_if<ast::Select>(&stmt);
+    if (q == nullptr || q->targets.size() != 1 || !q->from.empty() || !q->where.empty() || q->set) {
+      throw SqlError{"syntax error in the expression " + text, -1};
+    }
+    refuse_in_procedure(q->targets[0]);
+    const Table* rels[] = {&frame};
+    if (target != nullptr && is_constant(q->targets[0])) return value(frame, q->targets[0], *target);
+    return value(q->targets[0], [&](const ast::Expr& c) { return std::pair{&frame, column(rels, c).second}; });
+  }
+
+  static void refuse_in_procedure(const ast::Expr& e) {
+    using K = ast::Expr::Kind;
+    switch (e.kind) {
+      case K::Param: throw SqlError{"there is no parameter $" + std::to_string(e.param + 1), e.pos, kUndefinedParameter};
+      case K::Subquery: not_yet("a subquery in a procedure's expression", e.pos);
+      case K::Clock: not_yet("CURRENT_DATE, LOCALTIME and LOCALTIMESTAMP in a procedure's expression", e.pos);
+      case K::Aggregate: throw SqlError{"aggregate functions are not allowed here", e.pos, kGroupingError};
+      case K::Star: throw SqlError{"syntax error at or near \"*\"", e.pos};
+      case K::Column:
+      case K::Const:
+      case K::Literal:
+      case K::Add:
+      case K::Sub:
+      case K::Mul:
+      case K::Div:
+      case K::Plus:
+      case K::Neg:
+      case K::Compare:
+      case K::IsNull:
+      case K::Not:
+      case K::And:
+      case K::Or:
+      case K::Cast:
+      case K::Case:
+      case K::Coalesce:
+      case K::NullIf:
+      case K::Func: break;
+      case K::Default: throw SqlError{"DEFAULT is not allowed in this context", e.pos};
+    }
+    if (e.lhs) refuse_in_procedure(*e.lhs);
+    if (e.rhs) refuse_in_procedure(*e.rhs);
+    for (const auto& a : e.args) refuse_in_procedure(a);
   }
 
   static void refuse_in_check(const ast::Expr& e) {
@@ -3652,6 +3742,7 @@ private:
   std::vector<ParamUse> params_;
   std::vector<Datum> fixed_;  // the constants' values, $own_params_ + 1 onwards
   std::vector<PhysType> fixed_types_;
+  std::vector<SqlType> fixed_sql_;
   std::vector<ClockSlot> clocks_;
   std::vector<logical::Subquery> subqueries_;  // in the order bound; InSet names one by its index
   int depth_{0};                               // inside a subquery: one more is refused
@@ -4213,6 +4304,209 @@ auto bind_create_view(const ast::CreateView& cv, const Catalog& cat) -> Bound {
 }
 
 }  // namespace
+
+namespace {
+
+// Each variable of a procedure's statement as a parameter
+// (bind_procedure_statement): an unqualified column reference that names a
+// variable becomes $k. `scope` is every table or view the statement names
+// but an INSERT's target, whose columns a VALUES list cannot name.
+class VariableRewriter {
+public:
+  VariableRewriter(const Table& frame, const Catalog& cat) : frame_{frame}, cat_{cat} {}
+
+  void statement(ast::Statement& stmt) {
+    std::visit(
+        [&](auto& st) {
+          using T = std::decay_t<decltype(st)>;
+          if constexpr (std::is_same_v<T, ast::Select>) {
+            names(st);
+            select(st);
+          } else if constexpr (std::is_same_v<T, ast::Insert>) {
+            for (auto& v : st.values) names(v);
+            for (auto& v : st.values) expr(v);
+          } else if constexpr (std::is_same_v<T, ast::Update>) {
+            scope_.insert(st.table);
+            for (auto& a : st.set) names(a.value);
+            for (auto& c : st.where) names(c);
+            for (auto& a : st.set) expr(a.value);
+            for (auto& c : st.where) compare(c);
+            if (!st.current_of.empty()) not_yet("WHERE CURRENT OF in a procedure", st.pos);
+          } else if constexpr (std::is_same_v<T, ast::Delete>) {
+            scope_.insert(st.table);
+            for (auto& c : st.where) names(c);
+            for (auto& c : st.where) compare(c);
+            if (!st.current_of.empty()) not_yet("WHERE CURRENT OF in a procedure", st.pos);
+          } else {
+            not_yet("this statement in a procedure: only SELECT, INSERT, UPDATE and DELETE run in one", -1);
+          }
+        },
+        stmt);
+  }
+
+  [[nodiscard]] auto params() const -> const std::vector<std::uint32_t>& { return vars_; }
+
+private:
+  // The tables and views a statement names, in every FROM, subqueries' included.
+  void names(const ast::Select& q) {
+    for (const auto& f : q.from) scope_.insert(f.table);
+    for (const auto& e : q.targets) names(e);
+    for (const auto& c : q.where) names(c);
+    for (const auto& c : q.having) names(c);
+    if (q.set) {
+      names(q.set->left);
+      names(q.set->right);
+    }
+  }
+  void names(const ast::Expr& e) {
+    if (e.subquery) names(*e.subquery);
+    if (e.lhs) names(*e.lhs);
+    if (e.rhs) names(*e.rhs);
+    for (const auto& a : e.args) names(a);
+  }
+  void names(const ast::Compare& c) {
+    names(c.lhs);
+    names(c.rhs);
+    for (const auto& a : c.args) names(a);
+    if (c.subquery) names(*c.subquery);
+  }
+
+  auto has_column(const std::string& relation, const std::string& name) const -> bool {
+    if (const auto* t = cat_.table(relation)) return t->column(name) != nullptr;
+    if (const auto* v = cat_.view(relation)) return std::ranges::find(v->columns, name) != v->columns.end();
+    return false;
+  }
+
+  void expr(ast::Expr& e) {
+    if (e.kind == ast::Expr::Kind::Column && e.table.empty()) {
+      if (const auto* var = frame_.column(e.column)) {
+        for (const auto& t : scope_) {
+          if (has_column(t, e.column)) {
+            throw SqlError{"column reference \"" + e.column + "\" is ambiguous: it could refer to either a PL/pgSQL "
+                               "variable or a table column",
+                           e.pos, kAmbiguousColumn};
+          }
+        }
+        auto it = std::ranges::find(vars_, var->id);
+        auto k = static_cast<std::uint32_t>(it - vars_.begin());
+        if (it == vars_.end()) vars_.push_back(var->id);
+        auto pos = e.pos;
+        e = ast::Expr{ast::Expr::Kind::Param, {}, k, nullptr, nullptr, pos};
+        return;
+      }
+    }
+    if (e.kind == ast::Expr::Kind::Param) {
+      throw SqlError{"there is no parameter $" + std::to_string(e.param + 1), e.pos, kUndefinedParameter};
+    }
+    if (e.subquery) e.subquery = rewritten(*e.subquery);
+    if (e.lhs) expr(*e.lhs);
+    if (e.rhs) expr(*e.rhs);
+    for (auto& a : e.args) expr(a);
+  }
+  void compare(ast::Compare& c) {
+    expr(c.lhs);
+    expr(c.rhs);
+    for (auto& a : c.args) compare(a);
+    if (c.subquery) c.subquery = rewritten(*c.subquery);
+  }
+  void select(ast::Select& q) {
+    for (auto& e : q.targets) expr(e);
+    for (auto& c : q.where) compare(c);
+    for (auto& e : q.group_by) expr(e);
+    for (auto& c : q.having) compare(c);
+    if (q.set) {
+      auto set = std::make_shared<ast::SetOperation>();
+      set->kind = q.set->kind;
+      set->all = q.set->all;
+      set->left = ast::clone(q.set->left);
+      set->right = ast::clone(q.set->right);
+      select(set->left);
+      select(set->right);
+      q.set = std::move(set);
+    }
+  }
+  // A subquery is shared once parsed: rewritten as a copy.
+  auto rewritten(const ast::Select& q) -> std::shared_ptr<const ast::Select> {
+    auto copy = std::make_shared<ast::Select>(ast::clone(q));
+    select(*copy);
+    return copy;
+  }
+
+  const Table& frame_;
+  const Catalog& cat_;
+  std::set<std::string> scope_;
+  std::vector<std::uint32_t> vars_;  // $k+1's variable
+};
+
+// Each constant of `e` from `first` on, and each variable its slot.
+void to_frame(logical::Expr& e, const Table& frame, std::uint32_t first) {
+  if (e.kind == logical::Expr::Kind::Column && e.col.table == frame.id) {
+    e = logical::param(e.col.col, e.type);
+    return;
+  }
+  if (e.kind == logical::Expr::Kind::Param) e.param += first;
+  for (auto& a : e.args) to_frame(a, frame, first);
+}
+
+}  // namespace
+
+auto bind_procedure_expr(const std::string& text, const Table& frame, const Catalog& cat, std::uint32_t first_constant,
+                         ProcedureConstants& constants, const Column* target) -> logical::Expr {
+  Binder b{cat, 0};
+  auto e = b.frame_value(frame, text, target);
+  if (!b.take_clocks().empty() || !b.take_subqueries().empty()) not_yet("this expression in a procedure", -1);
+  auto first = first_constant + bytecask::sql::narrow<std::uint32_t>(constants.values.size());
+  to_frame(e, frame, first);
+  for (std::size_t i = 0; i < b.fixed_values().size(); ++i) {
+    constants.values.push_back(b.fixed_values()[i]);
+    constants.types.push_back(b.fixed_sql().at(i));
+  }
+  return e;
+}
+
+auto assignable(SqlType from, SqlType to) -> bool {
+  if (phys_type(from) != phys_type(to) || decimal_scale(from) != decimal_scale(to)) return false;
+  auto family = [](SqlKind k) {
+    if (k == SqlKind::SmallInt || k == SqlKind::Integer || k == SqlKind::BigInt) return 1;
+    if (k == SqlKind::Text || k == SqlKind::Varchar) return 2;
+    return 0;
+  };
+  return from.kind == to.kind || (family(from.kind) != 0 && family(from.kind) == family(to.kind));
+}
+
+auto declared_type(const std::string& text) -> SqlType {
+  auto stmt = ast::parse("SELECT CAST(NULL AS " + text + ")");
+  const auto* q = std::get_if<ast::Select>(&stmt);
+  if (q == nullptr || q->targets.size() != 1 || q->targets[0].kind != ast::Expr::Kind::Cast) {
+    throw SqlError{"type " + text + " is not supported", -1};
+  }
+  ast::ColumnDefAst c;
+  c.type = q->targets[0].cast_type;
+  c.typmods = q->targets[0].cast_typmods;
+  // A quoted name keeps the SQL spelling the grammar otherwise canonicalises.
+  if (c.type == "integer") c.type = "int4";
+  if (c.type == "smallint") c.type = "int2";
+  if (c.type == "bigint") c.type = "int8";
+  if (c.type == "boolean") c.type = "bool";
+  return sql_type(c);
+}
+
+auto bind_procedure_statement(const std::string& sql, const Table& frame, const Catalog& cat) -> ProcedureStatement {
+  auto stmt = ast::parse(sql);
+  VariableRewriter vars{frame, cat};
+  vars.statement(stmt);
+  ProcedureStatement out{bound::bind(stmt, cat), vars.params()};
+  // A variable is its parameter's value as it is: of the type the statement
+  // takes it as, or refused (no conversion is built).
+  for (std::size_t k = 0; k < out.param_vars.size(); ++k) {
+    const auto* var = frame.column(out.param_vars[k]);
+    const auto& as = out.bound.params.at(k).type;
+    if (!assignable(var->sql, as)) {
+      not_yet("variable " + var->name + " (" + sql_type_name(var->sql) + ") used as " + sql_type_name(as), -1);
+    }
+  }
+  return out;
+}
 
 auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
   if (const auto* cv = std::get_if<ast::CreateView>(&stmt)) return bind_create_view(*cv, cat);

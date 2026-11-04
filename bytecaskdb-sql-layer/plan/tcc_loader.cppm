@@ -34,6 +34,8 @@ public:
   // Throws std::runtime_error with TinyCC's diagnostics if the file does not
   // compile or link.
   [[nodiscard]] static auto compile(std::string_view source) -> std::unique_ptr<TccPlan>;
+  // A procedure's file (docs/procedures_design.md), whose entry is proc().
+  [[nodiscard]] static auto compile_procedure(std::string_view source) -> std::unique_ptr<TccPlan>;
 
   ~TccPlan();
   TccPlan(const TccPlan&) = delete;
@@ -41,13 +43,16 @@ public:
 
   // Valid while this object lives: the code is in memory it owns.
   [[nodiscard]] auto fn() const noexcept -> bc_plan_fn { return fn_; }
+  [[nodiscard]] auto proc_fn() const noexcept -> bc_proc_fn { return proc_; }
   [[nodiscard]] auto compile_us() const noexcept -> double { return compile_us_; }
 
 private:
   TccPlan() = default;
   TCCState* state_{nullptr};
   bc_plan_fn fn_{nullptr};
+  bc_proc_fn proc_{nullptr};
   double compile_us_{0};
+  [[nodiscard]] static auto build(std::string_view source) -> std::unique_ptr<TccPlan>;
 };
 
 }  // namespace bytecask::sql
@@ -65,6 +70,7 @@ void collect_error(void* opaque, const char* msg) {
 // A void* from tcc_get_symbol as the plan's function type; POSIX guarantees
 // the conversion, as for dlsym.
 auto as_plan_fn(void* p) -> bc_plan_fn { return reinterpret_cast<bc_plan_fn>(p); }
+auto as_proc_fn(void* p) -> bc_proc_fn { return reinterpret_cast<bc_proc_fn>(p); }
 
 }  // namespace
 
@@ -74,6 +80,25 @@ TccPlan::~TccPlan() {
 
 auto TccPlan::compile(std::string_view source) -> std::unique_ptr<TccPlan> {
   auto start = std::chrono::steady_clock::now();
+  auto plan = build(source);
+  plan->fn_ = as_plan_fn(tcc_get_symbol(plan->state_, "plan"));
+  if (plan->fn_ == nullptr) throw std::runtime_error("plan defines no plan()");
+  plan->compile_us_ =
+      std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+  return plan;
+}
+
+auto TccPlan::compile_procedure(std::string_view source) -> std::unique_ptr<TccPlan> {
+  auto start = std::chrono::steady_clock::now();
+  auto plan = build(source);
+  plan->proc_ = as_proc_fn(tcc_get_symbol(plan->state_, "proc"));
+  if (plan->proc_ == nullptr) throw std::runtime_error("procedure file defines no proc()");
+  plan->compile_us_ =
+      std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+  return plan;
+}
+
+auto TccPlan::build(std::string_view source) -> std::unique_ptr<TccPlan> {
   std::unique_ptr<TccPlan> plan{new TccPlan};
   std::string errors;
   plan->state_ = tcc_new();
@@ -90,10 +115,6 @@ auto TccPlan::compile(std::string_view source) -> std::unique_ptr<TccPlan> {
   std::string text{source};
   if (tcc_compile_string(s, text.c_str()) != 0) throw std::runtime_error("plan does not compile:\n" + errors);
   if (tcc_relocate(s) < 0) throw std::runtime_error("plan does not link:\n" + errors);
-  plan->fn_ = as_plan_fn(tcc_get_symbol(s, "plan"));
-  if (plan->fn_ == nullptr) throw std::runtime_error("plan defines no plan()");
-  plan->compile_us_ =
-      std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
   return plan;
 }
 

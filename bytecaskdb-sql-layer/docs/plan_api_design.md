@@ -1215,6 +1215,13 @@ The plugin keeps its own key and row codecs, and would adopt the shared
 ones through its per-table format versions (`types_design.md`, *What the
 plugin adopts*; #488).
 
+## Procedures
+
+A stored procedure's file adds `algebra/bc_proc.h` to this header: `proc()`,
+its statements as `s<i>`, and the calls that begin and end a statement and
+set the procedure's variables (`procedures_design.md`, *The procedure
+language*). A plan file is unchanged by it.
+
 ## Deferred
 
 - **Several schema versions served at once.** The row format and the

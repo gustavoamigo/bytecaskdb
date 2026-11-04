@@ -54,6 +54,7 @@
 
 // The C contract, and the engine through its public header.
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+#include "bytecaskdb-sql-layer/algebra/bc_proc.h"
 #include "include/bytecask.hpp"
 
 // bc_db, bc_catalog and bc_params, which bc_plan.h leaves opaque, and the
@@ -2779,6 +2780,49 @@ void refuse_f64_part(bc_ctx* cx) {
 
 }  // namespace
 
+void bc_ctx_begin_frame(bc_ctx* cx, const bc_params* params, bc_budget budget) {
+  BC_GUARD_BEGIN
+  cx->drop_execution_state();
+  cx->sink().clear();
+  cx->params = params;
+  cx->budget = budget;
+  BC_GUARD_END(cx)
+}
+
+// ------------------------------------------------------------- procedures
+
+namespace {
+
+auto proc_failed(const bc_proc* px) -> bool { return px->error != nullptr || !px->frame->ok(); }
+
+// The hook's exception is the procedure's error; the frame fails so that
+// every later call does nothing.
+void proc_fail(bc_proc* px) noexcept {
+  if (px->error == nullptr) px->error = std::current_exception();
+  px->frame->fail(BC_E_HANDLE, "the procedure failed");
+}
+
+template <typename T>
+void proc_set(bc_proc* px, uint32_t var, T v) {
+  if (proc_failed(px)) return;
+  try {
+    if (var >= px->slots.values.size()) {
+      px->frame->fail(BC_E_HANDLE, "no variable " + std::to_string(var));
+      return;
+    }
+    bc_value d{std::move(v)};
+    if (auto why = bytecask::sql::out_of_range(px->types[var], d)) {
+      px->frame->raise(BC_C_RANGE, 0, *why);
+      return;
+    }
+    px->slots.values[var] = std::move(d);
+  } catch (...) {
+    proc_fail(px);
+  }
+}
+
+}  // namespace
+
 extern "C" {
 
 // ---------------------------------------------------------------- runtime
@@ -2811,6 +2855,80 @@ void bc_ctx_begin(bc_ctx* cx, const bc_params* params, bc_budget budget) {
   cx->snap.emplace(std::move(p.snap));
   cx->base = &*cx->snap;
   BC_GUARD_END(cx)
+}
+
+bc_ctx* bc_proc_ctx(bc_proc* px) { return px->frame; }
+
+bc_ctx* bc_stmt_begin(bc_proc* px, uint32_t stmt) {
+  if (proc_failed(px)) return px->frame;
+  try {
+    return px->begin(stmt);
+  } catch (...) {
+    proc_fail(px);
+    return px->frame;
+  }
+}
+
+void bc_stmt_end(bc_proc* px, uint32_t stmt) {
+  if (proc_failed(px)) return;
+  try {
+    px->end(stmt);
+  } catch (...) {
+    proc_fail(px);
+  }
+}
+
+void bc_var_set_i64(bc_proc* px, uint32_t var, int64_t v) { proc_set(px, var, std::int64_t{v}); }
+void bc_var_set_f64(bc_proc* px, uint32_t var, double v) { proc_set(px, var, v); }
+void bc_var_set_bool(bc_proc* px, uint32_t var, bool v) { proc_set(px, var, v); }
+
+void bc_var_set_bytes(bc_proc* px, uint32_t var, bc_view v) {
+  if (proc_failed(px)) return;
+  std::optional<BytesView> b;
+  try {
+    b = px->frame->resolve(v);
+  } catch (...) {
+    proc_fail(px);
+    return;
+  }
+  if (!b) return;  // a stale view: the frame has failed
+  proc_set(px, var, Bytes(b->begin(), b->end()));
+}
+
+void bc_var_set_null(bc_proc* px, uint32_t var) { proc_set(px, var, std::monostate{}); }
+
+bool bc_loop(bc_proc* px) {
+  if (proc_failed(px)) return false;
+  return px->frame->charge();
+}
+
+void bc_range_open(bc_proc* px, uint32_t range, int64_t lo, bool lo_null, int64_t hi, bool hi_null, bool reverse) {
+  if (proc_failed(px)) return;
+  try {
+    if (lo_null || hi_null) {
+      throw bytecask::sql::ProcedureError(std::string{lo_null ? "lower" : "upper"} + " bound of FOR loop cannot be null",
+                                          bytecask::sql::kNullValueNotAllowed);
+    }
+    if (px->ranges.size() <= range) px->ranges.resize(range + 1);
+    // REVERSE counts from the first bound down to the second, as PostgreSQL's does.
+    px->ranges[range] = {lo, hi, reverse, reverse ? lo < hi : lo > hi};
+  } catch (...) {
+    proc_fail(px);
+  }
+}
+
+bool bc_range_next(bc_proc* px, uint32_t range, uint32_t var) {
+  if (proc_failed(px) || range >= px->ranges.size()) return false;
+  auto& r = px->ranges[range];
+  if (r.done || !px->frame->charge()) return false;
+  auto v = r.next;
+  if (v == r.last) {
+    r.done = true;
+  } else {
+    r.next = r.reverse ? v - 1 : v + 1;
+  }
+  bc_var_set_i64(px, var, v);
+  return !proc_failed(px);
 }
 
 void bc_ctx_begin_txn(bc_ctx* cx, bc_txn* txn, const bc_params* params, bc_budget budget) {

@@ -623,3 +623,26 @@ TEST_CASE("parser: DROP PROCEDURE with or without an argument list", "[sql][pars
   CHECK_THROWS_AS(parse("DROP PROCEDURE p, q"), SqlError);
   CHECK_THROWS_AS(parse("DROP PROCEDURE p CASCADE"), SqlError);
 }
+
+TEST_CASE("parser: a procedure body the layer does not run is refused at CREATE", "[sql][parser][procedure]") {
+  auto state = [](std::string_view body) -> std::string {
+    try {
+      (void)parse("CREATE PROCEDURE p(a INT) LANGUAGE plpgsql AS $$ DECLARE x INT; " + std::string{body} + " $$");
+    } catch (const SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return "accepted";
+  };
+  CHECK(state("BEGIN x := a + 1; IF x > 1 THEN x := 0; ELSIF x < 0 THEN NULL; ELSE x := 2; END IF; END") == "accepted");
+  CHECK(state("BEGIN FOR i IN 1..a LOOP x := i; CONTINUE WHEN i = 2; END LOOP; END") == "accepted");
+  CHECK(state("BEGIN WHILE x > 0 LOOP x := x - 1; END LOOP; LOOP EXIT WHEN x = 0; END LOOP; END") == "accepted");
+  CHECK(state("BEGIN SELECT a INTO STRICT x FROM t; UPDATE t SET b = x; PERFORM 1; RETURN; END") == "accepted");
+  CHECK(state("BEGIN x := 1; EXCEPTION WHEN OTHERS THEN x := 2; END") == "0A000");
+  CHECK(state("BEGIN COMMIT; END") == "0A000");
+  CHECK(state("BEGIN ROLLBACK; END") == "0A000");
+  CHECK(state("BEGIN RAISE NOTICE 'x'; END") == "0A000");
+  CHECK(state("BEGIN <<l>> LOOP EXIT l; END LOOP; END") == "0A000");
+  CHECK(state("BEGIN FOR i IN 1..10 BY 2 LOOP NULL; END LOOP; END") == "0A000");
+  CHECK(state("BEGIN EXECUTE 'SELECT 1'; END") == "0A000");
+  CHECK(state("BEGIN DECLARE a INT; BEGIN NULL; END; END") == "0A000");  // shadows the argument
+}

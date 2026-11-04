@@ -54,6 +54,7 @@ export module bytecask.sql.api;
 export import bytecask.sql.runtime;
 export import bytecask.sql.codegen;
 export import bytecask.sql.tcc_loader;
+export import bytecask.sql.procedure;
 import bytecask.sql.parser;
 
 export namespace bytecask::sql {
@@ -619,6 +620,17 @@ public:
   // throws SerializationFailure, and the transaction has ended.
   auto execute(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts = {}) -> Rows;
   auto execute(std::string_view sql, const std::vector<Value>& params = {}, const ExecutionOptions& opts = {}) -> Rows;
+  // Runs the stored procedure `procedure` in the transaction
+  // (docs/procedures_design.md, *Running a procedure*). `args` holds a value
+  // for each of its arguments, OUT ones included (ignored, as PostgreSQL's
+  // CALL ignores them). Returns one row of its INOUT and OUT arguments'
+  // values, named and typed as the arguments, or no row when it has none.
+  // Each statement of its body sees the writes of those before it. Throws
+  // ast::SqlError 42883 for a procedure that does not exist, ParamError for
+  // arguments of the wrong number or type, ExecError BC_C_RANGE for one
+  // outside its type, and what its statements throw; the transaction is
+  // then aborted, as for a failed statement.
+  auto call(std::string_view procedure, const std::vector<Value>& args, const ExecutionOptions& opts = {}) -> Rows;
   // Runs an UPDATE or DELETE ... WHERE CURRENT OF (Statement::current_of) on
   // the row `cursor` stands on: `params` are the statement's own, and the
   // cursor's key follows them. The write goes to the transaction's overlay,
@@ -765,6 +777,12 @@ public:
   auto execute(std::string_view sql, const std::vector<Value>& params = {}, const ExecutionOptions& opts = {}) -> Rows;
   // Opens a transaction. Its snapshot is taken at its first statement.
   [[nodiscard]] auto begin(TransactionOptions opts = {}) -> Transaction;
+  // Runs a stored procedure in a transaction of its own, then commits it:
+  // Transaction::call, then commit(). A conflict reruns the procedure from
+  // its arguments, on a fresh snapshot, as many times as an autocommit
+  // statement is retried; past that it throws SerializationFailure (40001).
+  // Throws what Transaction::call and commit() throw.
+  auto call(std::string_view procedure, const std::vector<Value>& args, const ExecutionOptions& opts = {}) -> Rows;
   // Recompiles the statement's plan if the live catalog no longer fits it,
   // as its next run would, so params() and columns() describe what that run
   // takes and returns. Runs nothing. Throws what a recompile throws.
@@ -848,8 +866,22 @@ private:
   // What the search costs plans with: each table's row count, counted on a
   // snapshot taken now.
   [[nodiscard]] auto row_counts() const -> RowCounts;
-  // Compiles a plan's text and sets what a run needs from it.
-  void link(Compiled& c);
+  // Compiles a plan's text (unless `compile` is false: a procedure's
+  // statement, compiled in its procedure's file) and sets what a run needs.
+  void link(Compiled& c, bool compile = true);
+  // A stored procedure compiled for the live catalog: kept until a DDL
+  // moves the catalog on, then built again at the next call.
+  struct CompiledProcedure {
+    std::uint32_t id{0};
+    std::uint64_t catalog_version{0};
+    GeneratedProcedure gen;
+    std::vector<std::shared_ptr<Compiled>> stmts;
+    std::unique_ptr<TccPlan> code;
+  };
+  [[nodiscard]] auto procedure_plan(const Procedure& def) -> std::shared_ptr<const CompiledProcedure>;
+  // Runs it in the transaction `h`. Throws as Transaction::call does.
+  auto run_procedure(const CompiledProcedure& p, const Procedure& def, const std::vector<Value>& args, TxnHandle& h,
+                     const ExecutionOptions& opts) -> Rows;
   auto recompile(const Statement& stmt) -> std::shared_ptr<const Compiled>;
   // Recompiles a plan expanded through a view after any DDL: the runtime's
   // check sees the tables the plan reads, and a view dropped, created again
@@ -911,6 +943,8 @@ private:
   mutable std::shared_mutex cache_mu_;
   std::map<std::string, std::unique_ptr<Statement>, std::less<>> cache_;
   std::mutex compile_mu_;  // TinyCC compiles one plan at a time; no I/O under it
+  std::mutex procedures_mu_;  // guards procedures_
+  std::map<std::string, std::shared_ptr<const CompiledProcedure>, std::less<>> procedures_;
   std::mutex contexts_mu_;  // guards idle_; taken only to take or return one
   std::vector<bc_ctx*> idle_;
   std::atomic<std::uint64_t> compilations_{0};
@@ -1102,6 +1136,7 @@ auto sqlstate(const std::exception& e) noexcept -> std::string_view {
   if (dynamic_cast<const CurrentOfRefused*>(&e) != nullptr) return "24000";
   if (dynamic_cast<const ParamError*>(&e) != nullptr) return "08P01";
   if (const auto* x = dynamic_cast<const DdlRefused*>(&e)) return x->sqlstate();
+  if (const auto* x = dynamic_cast<const ProcedureError*>(&e)) return x->sqlstate();
   if (const auto* x = dynamic_cast<const ast::SqlError*>(&e)) return x->sqlstate();
   if (dynamic_cast<const DdlInProgress*>(&e) != nullptr) return "40001";
   if (dynamic_cast<const DbClosed*>(&e) != nullptr) return "57P01";
@@ -1381,7 +1416,7 @@ auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
   return c;
 }
 
-void Database::link(Compiled& compiled) {
+void Database::link(Compiled& compiled, bool compile) {
   auto* c = &compiled;
   c->columns = c->plan->result_names;
   c->column_types = c->plan->result_sql;
@@ -1389,7 +1424,7 @@ void Database::link(Compiled& compiled) {
   c->column_types.resize(c->column_types.size() - c->key_columns);
   c->result_codes = result_type_codes(c->plan->result_types);
   c->result_layout = make_result_layout(c->plan->result_types);
-  {
+  if (compile) {
     std::lock_guard<std::mutex> lock{compile_mu_};
     c->code = TccPlan::compile(c->plan->source);
   }
@@ -1795,6 +1830,144 @@ void Database::refit(const Statement& stmt) {
   } catch (...) {
     release_context(cx);
     throw;
+  }
+}
+
+auto Database::procedure_plan(const Procedure& def) -> std::shared_ptr<const CompiledProcedure> {
+  auto cat = live_->current();
+  {
+    std::lock_guard<std::mutex> lock{procedures_mu_};
+    auto it = procedures_.find(def.name);
+    if (it != procedures_.end() && it->second->id == def.id && it->second->catalog_version == cat->version()) {
+      return it->second;
+    }
+  }
+  auto p = std::make_shared<CompiledProcedure>();
+  p->id = def.id;
+  p->catalog_version = cat->version();
+  p->gen = generate_procedure(def, *cat, row_counts(), budget_.max_bytes);
+  for (auto& st : p->gen.stmts) {
+    auto c = std::make_shared<Compiled>();
+    c->param_sql = st.param_sql;
+    c->param_table = st.param_table;
+    c->params = st.params;
+    c->fixed = st.fixed;
+    c->views = st.views;
+    c->plan = std::make_unique<GeneratedPlan>(st.plan);
+    link(*c, false);
+    p->stmts.push_back(std::move(c));
+  }
+  {
+    std::lock_guard<std::mutex> lock{compile_mu_};
+    p->code = TccPlan::compile_procedure(p->gen.source);
+  }
+  ++compilations_;
+  std::lock_guard<std::mutex> lock{procedures_mu_};
+  procedures_.insert_or_assign(def.name, p);
+  return p;
+}
+
+auto Database::run_procedure(const CompiledProcedure& p, const Procedure& def, const std::vector<Value>& args,
+                             TxnHandle& h, const ExecutionOptions& opts) -> Rows {
+  const auto& gen = p.gen;
+  if (args.size() != def.args.size()) {
+    throw ParamError("procedure " + def.name + " takes " + std::to_string(def.args.size()) + " arguments, got " +
+                     std::to_string(args.size()));
+  }
+  bc_proc px;
+  px.types = gen.slot_types;
+  px.slots.values.resize(gen.var_names.size());
+  for (std::size_t i = 0; i < args.size(); ++i) {
+    const auto& a = def.args[i];
+    if (a.mode == ProcedureArg::Mode::Out) continue;  // starts NULL, as PostgreSQL's does
+    if (!datum_fits(args[i], phys_type(a.type))) throw ParamError("argument " + a.name + " has the wrong type");
+    if (auto range = out_of_range(a.type, args[i])) {
+      throw ExecError(*range + " for argument " + a.name, BC_E_CONSTRAINT, ConstraintDetail{BC_C_RANGE, 0}.encode());
+    }
+    px.slots.values[i] = args[i];
+  }
+  px.slots.values.insert(px.slots.values.end(), gen.constants.begin(), gen.constants.end());
+  auto budget = budget_for(opts);
+  auto* frame = acquire_context();
+  struct Release {
+    Database& db;
+    bc_ctx* cx;
+    ~Release() {
+      bc_ctx_reset(cx);
+      db.release_context(cx);
+    }
+  } release{*this, frame};
+  px.frame = frame;
+  bc_ctx_begin_frame(frame, &px.slots, budget);
+  auto* sx = h.cx;
+  bc_params bp;
+  // bc_stmt_begin: the statement's parameters from the variables, checked
+  // as a client's are, then begun on the transaction and verified against
+  // its pin. A plan the pin does not fit is a DDL since the transaction began.
+  px.begin = [&](std::uint32_t k) -> bc_ctx* {
+    const auto& c = *p.stmts.at(k);
+    std::vector<Value> params;
+    for (auto v : gen.stmts[k].param_vars) params.push_back(px.slots.values.at(v));
+    check_params(c, params);
+    bp.values = plan_params(c, params, h.started_us);
+    bc_ctx_begin_txn(sx, h.txn, &bp, budget);
+#ifdef BYTECASK_SQL_TESTING
+    if (after_txn_pin_) after_txn_pin_();
+#endif
+    if (!bc_ctx_check(sx, &c.ref) && bc_error(sx) == BC_E_LAYOUT && bc_error_detail(sx) == BC_L_INCOMPATIBLE) {
+      bc_ctx_reset(sx);
+      throw_serialization_failure(kCatalogChanged);
+    }
+    return sx;
+  };
+  // bc_stmt_end: its effects into the transaction, its first row into the
+  // INTO variables, and FOUND.
+  px.end = [&](std::uint32_t k) {
+    const auto& c = *p.stmts.at(k);
+    const auto& st = gen.stmts[k];
+    if (!bc_txn_add(sx)) throw_context_error(sx);
+    auto rows = results(sx, c, Rows{});
+    auto found = c.plan->returns_rows ? !rows.rows.empty() : rows.affected > 0;
+    px.slots.values.at(gen.found) = found;
+    if (!st.into) return;
+    if (st.strict && rows.rows.empty()) throw ProcedureError("query returned no rows", kNoDataFound);
+    if (st.strict && rows.rows.size() > 1) throw ProcedureError("query returned more than one row", kTooManyRows);
+    for (std::size_t i = 0; i < st.targets.size(); ++i) {
+      auto v = rows.rows.empty() ? Value{} : rows.rows[0].at(i);
+      if (auto range = out_of_range(gen.slot_types.at(st.targets[i]), v)) {
+        throw ExecError(*range + " for variable " + gen.var_names.at(st.targets[i]), BC_E_CONSTRAINT,
+                        ConstraintDetail{BC_C_RANGE, 0}.encode());
+      }
+      px.slots.values.at(st.targets[i]) = std::move(v);
+    }
+  };
+  p.code->proc_fn()(&px);
+  if (px.error) std::rethrow_exception(px.error);
+  if (bc_error(frame) != BC_OK) throw_context_error(frame);
+  Rows out;
+  std::vector<Value> row;
+  for (std::size_t i = 0; i < def.args.size(); ++i) {
+    if (def.args[i].mode == ProcedureArg::Mode::In) continue;
+    out.columns.push_back(def.args[i].name);
+    out.types.push_back(def.args[i].type);
+    row.push_back(px.slots.values[i]);
+  }
+  if (!out.columns.empty()) out.rows.push_back(padded(out.types, std::move(row)));
+  return out;
+}
+
+auto Database::call(std::string_view procedure, const std::vector<Value>& args, const ExecutionOptions& opts) -> Rows {
+  // Rerun from the arguments on a conflict, as an autocommit statement is
+  // retried: kMaxRetries attempts in all.
+  for (std::uint32_t attempt = 1;; ++attempt) {
+    auto t = begin();
+    try {
+      auto out = t.call(procedure, args, opts);
+      (void)t.commit();
+      return out;
+    } catch (const SerializationFailure&) {
+      if (attempt >= kMaxRetries) throw;
+    }
   }
 }
 
@@ -2214,6 +2387,28 @@ void Cursor::close() noexcept {
   if (!s_->live.load()) return;  // closed already, with its transaction or the database
   if (s_->h != nullptr) std::erase(s_->h->cursors, s_);
   s_->close();
+}
+
+auto Transaction::call(std::string_view procedure, const std::vector<Value>& args, const ExecutionOptions& opts)
+    -> Rows {
+  if (!h_) throw std::logic_error("the transaction has ended");
+  std::shared_lock<std::shared_mutex> lock{life_->mu};
+  check_usable();
+  try {
+    auto cat = db_->catalog();
+    const auto* def = cat->procedure(procedure);
+    if (def == nullptr) {
+      throw ast::SqlError{"procedure " + std::string{procedure} + " does not exist", -1, kUndefinedFunction};
+    }
+    auto p = db_->procedure_plan(*def);
+    return db_->run_procedure(*p, *def, args, *h_, opts);
+  } catch (const SerializationFailure&) {
+    end_locked();
+    throw;
+  } catch (...) {
+    h_->abort();
+    throw;
+  }
 }
 
 auto Transaction::execute(std::string_view sql, const std::vector<Value>& params, const ExecutionOptions& opts)
