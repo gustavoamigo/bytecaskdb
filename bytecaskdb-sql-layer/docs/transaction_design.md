@@ -457,9 +457,10 @@ differences*.
   memory, as each execution does. A transaction-wide budget, or a request deadline turned into one,
   is later (*Later*). Nothing here blocks it: the
   budget is passed per statement.
-- **Duration.** An open transaction holds a snapshot, which keeps the data
-  files it references from vacuum. An idle handle therefore defers vacuum.
-  The in-process handle is the caller's to close. The token form's TTL
+- **Duration.** An open transaction holds a snapshot, which keeps the disk
+  blocks of the data files it references, even once vacuum has unlinked them
+  (`session_design.md`, *Background vacuum*). An idle handle therefore defers
+  what vacuum gives back. The in-process handle is the caller's to close. The token form's TTL
   (*Later*) would bound this for remote clients.
 
 ## The plan API and the runtime

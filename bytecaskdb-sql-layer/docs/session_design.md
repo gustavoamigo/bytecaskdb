@@ -274,7 +274,9 @@ PostgreSQL uses.
     the database writes meanwhile, up to a whole copy of the key directory
     (`docs/bytecask_design.md`, *Read path*: about 1.1 GB at 20 M
     keys, measured on the MariaDB plugin);
-  - it keeps the data files it references from vacuum.
+  - it keeps the disk blocks of the data files it references. Vacuum does
+    not wait for it: it compacts and unlinks them anyway, and the snapshot
+    reads on through its open descriptors (*Background vacuum*).
 
   The global cap can't count this. The pinned nodes are the engine's,
   shared by every snapshot of the same age, and not any one session's. The
@@ -282,6 +284,82 @@ PostgreSQL uses.
   for nothing; exposing `keydir_nodes_parked`, `keydir_versions_live` and
   the oldest open snapshot's age is tracked with the server's operational
   counters (#496).
+
+## Background vacuum
+
+The engine and `Database` reclaim disk only when called, so without a caller
+an update workload grows the data directory without bound. The server calls:
+`VacuumThread` (`server/vacuum_thread.cppm`), the MariaDB plugin's
+`vacuum_loop` without its backup pause. Approved on #769.
+
+| Flag | Default | Takes |
+|---|---|---|
+| `--vacuum` | `on` | `on` or `off`; `off` starts no thread |
+| `--vacuum-fragmentation-threshold` | `0.5` | 0.0 to 1.0 |
+| `--vacuum-busy-interval-ms` | `500` | 10 to 3,600,000 |
+| `--vacuum-idle-interval-ms` | `30000` | 100 to 86,400,000 |
+
+Names, defaults and ranges are the plugin's, fixed at startup. At 0.5, sealed
+files hold about twice their live bytes at most, as long as vacuum keeps up;
+at 0.9, about ten times.
+
+**The loop.** A pass is one `Database::vacuum`, which reclaims at most one
+file. It runs at once on start, then waits the busy pause after a pass that
+reclaimed a file and the idle pause otherwise.
+
+**Who owns it.** The server, not `Database`. `AtInterval`'s flusher is in
+`Database` because a sync mode is a durability promise `Database` makes;
+vacuum promises nothing, and when to run it is the host's policy, as in the
+plugin. An embedded host calls `Database::vacuum` itself, and one that never
+does never gets its disk back.
+
+**Start and stop.** It starts before `main` pins itself to a CPU and unblocks
+the stop signals, so it inherits neither. It stops after the sessions and
+before `Database::close()`, waiting for a pass in flight, since the engine
+can't abort one: a stop can take one more compaction of a 64 MiB file.
+
+**Failures.** A failed pass leaves the engine as it was. The first of a run of
+failures is logged, and the pass is retried after the idle pause: ENOSPC,
+EMFILE, or no file id left (#774). `DbDegraded` logs and ends the thread, as
+the flusher does, since no later pass can succeed; a failed `fdatasync` in a
+pass degrades the engine, so the retry finds that. The server stays up and
+refuses writes, where the plugin aborts.
+
+**Snapshots.** Vacuum never consults them, and never waits for one. A
+compacted file's source is unlinked at once, and a snapshot that reaches it
+reads on through its open descriptor. What holding one costs:
+- **Disk.** Until it is released, the source's blocks and the copy's both
+  count: at most the bytes of the files that existed when the snapshot was
+  taken, on top of what the database needs. They belong to unlinked files, so
+  `df` counts them and `du` does not. A compacted file leaves `file_stats`, so
+  vacuum doesn't pick it again.
+- **Memory.** A remap replaces key directory nodes as a write does, so it adds
+  to `keydir_nodes_parked`, under the bound *Bounds* gives.
+
+No limit is added for this. An idle transaction is bounded by its timeout; a
+busy one and a `WITH HOLD` cursor are not, which is the policy of *Bounds* and
+`cursor_design.md`. Exposing the oldest snapshot's age is #496.
+
+A moved key keeps its sequence, so the engine's conflict check doesn't see it
+as a change: a transaction open across a vacuum reads its snapshot and commits.
+
+**Writers stall during a vacuum's commit (#337).** This breaks the design
+philosophy's predictable write latency until #337 is fixed, and is shipped
+knowingly, since the alternative is a server that fills its disk. The commit
+remaps each live key of the compacted file with writers held out. On the
+plugin at 32 warehouses that was 0.23 to 1.39 s per commit with 512 MiB files
+at 0.5; this server's files are 64 MiB, and a file at the threshold is at most
+`1 - threshold` live, so a higher threshold shortens each stall. Under
+`AT_INTERVAL` and `AT_FILE_ROTATION` a commit usually adds one `fdatasync` of
+the active file too, since what it drops must be superseded durably.
+
+**File ids (#774).** A compaction takes a file id, as a rotation does. With
+disk use bounded, a server that never restarts can reach the 2^20 per process
+before it fills its disk, and past that a write needing a new file is refused
+until a restart.
+
+`retain_after` stays at `kNoRetention` while the layer has no followers, and
+the layer has no `create_manifest` for vacuum to pause for. Both are #496's.
 
 ## Prepared statements and portals
 
@@ -368,6 +446,8 @@ vacuum. The connection-to-session map then goes.
   server's memory cap fails with 53200 (`out_of_memory`).
 - **Narrowed (slice 2):** "A `CancelRequest` closes the connection with
   nothing done" goes.
+- **Added (#769):** `Database::vacuum`, and the server's background vacuum and
+  its flags.
 - **Unchanged:** startup, the block status, transaction control, the text
   forms and shutdown, as `server_design.md` states them.
 

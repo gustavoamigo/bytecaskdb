@@ -61,10 +61,14 @@ export namespace bytecask::sql {
 using Value = bc_value;  // NULL, BIGINT, DOUBLE PRECISION, BOOLEAN, BYTEA
 
 // The errors the API throws that other modules declare: the catalog's
-// refusal of a DDL statement, and the engine's error for a call after
-// close().
+// refusal of a DDL statement, and the engine's errors for a call after
+// close() and for a vacuum on a degraded engine.
 using bytecask::sql::DdlRefused;
 using bytecask::DbClosed;
+using bytecask::DbDegraded;
+
+// Database::vacuum's options, the engine's.
+using bytecask::VacuumOptions;
 
 // PostgreSQL's AVG of an exact number, as numeric's text: its numeric_div
 // of the sum (the total at the argument's `scale`) by the count, the scale
@@ -775,6 +779,16 @@ public:
   [[nodiscard]] auto compilations() const -> std::uint64_t { return compilations_.load(); }
   // The live catalog: the version DDL last published.
   [[nodiscard]] auto catalog() const -> std::shared_ptr<const Catalog>;
+  // Reclaims one sealed data file past opts.fragmentation_threshold, if there
+  // is one, and returns whether it did. Nothing calls this on its own, so a
+  // database whose host never calls it never gets its disk back; the server
+  // has a thread for it (docs/session_design.md, *Background vacuum*). Runs
+  // concurrently with statements and commits, which wait only for its commit;
+  // a second call waits for the first. An open snapshot keeps reading what it
+  // reclaims, and keeps those disk blocks until it is released. Throws
+  // DbClosed, DbDegraded, or what the failed I/O threw, and a failure leaves
+  // the database as it was.
+  [[nodiscard]] auto vacuum(VacuumOptions opts = {}) -> bool;
 #ifdef BYTECASK_SQL_TESTING
   // Test only: how many times a cached plan was checked (bc_ctx_check)
   // against a catalog version it was not compiled or checked against.
@@ -1299,6 +1313,11 @@ void Database::stop_flusher() {
   }
   flush_cv_.notify_one();
   if (flusher_.joinable()) flusher_.join();
+}
+
+auto Database::vacuum(VacuumOptions opts) -> bool {
+  const auto alive = enter();
+  return db_->vacuum(opts);
 }
 
 auto Database::acquire_context() -> bc_ctx* {

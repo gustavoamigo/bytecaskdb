@@ -616,6 +616,95 @@ def test_shutdown_sends_57p01_to_an_idle_connection():
         shutil.rmtree(directory, ignore_errors=True)
 
 
+WIDE_ROWS = 32
+WIDE_ROW = "x" * (1 << 20)
+
+
+def overwrite_wide_rows(c: Client, rounds: int) -> None:
+    """32 MiB a round, each over the last: 64 MiB is one data file."""
+    c.send(query("CREATE TABLE wide (k INTEGER PRIMARY KEY, v TEXT)"))
+    assert states(c.until_ready()) == []
+    for k in range(WIDE_ROWS):
+        c.send(query(f"INSERT INTO wide VALUES ({k}, '{WIDE_ROW}')"))
+        assert states(c.until_ready()) == []
+    for _ in range(rounds - 1):
+        for k in range(WIDE_ROWS):
+            c.send(query(f"UPDATE wide SET v = '{WIDE_ROW}' WHERE k = {k}"))
+            assert states(c.until_ready()) == []
+
+
+def data_bytes(directory: str) -> int:
+    total = 0
+    for name in os.listdir(directory):
+        if name.endswith(".data"):
+            try:
+                total += os.path.getsize(os.path.join(directory, name))
+            except FileNotFoundError:  # vacuum unlinked it since the listing
+                pass
+    return total
+
+
+def test_background_vacuum_is_on_by_default_and_gives_the_disk_back():
+    """192 MiB written, 32 MiB of it live, and SIGTERM still stops it cleanly."""
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory, extra_args=["--sync", "AT_FILE_ROTATION", "--vacuum-busy-interval-ms", "10",
+                                      "--vacuum-idle-interval-ms", "100"])
+    try:
+        c = connect(s)
+        overwrite_wide_rows(c, rounds=6)
+        deadline = time.monotonic() + 60
+        while data_bytes(directory) > 128 << 20 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert data_bytes(directory) <= 128 << 20
+        assert s.stop() == 0
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_vacuum_off_leaves_the_disk_as_written():
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory, extra_args=["--sync", "AT_FILE_ROTATION", "--vacuum", "off"])
+    try:
+        c = connect(s)
+        overwrite_wide_rows(c, rounds=6)
+        time.sleep(1)
+        assert data_bytes(directory) >= 190 << 20
+        assert s.stop() == 0
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+@pytest.mark.parametrize("flag,value", [
+    ("--vacuum", "maybe"),
+    ("--vacuum-fragmentation-threshold", "1.5"),
+    ("--vacuum-fragmentation-threshold", "-0.1"),
+    ("--vacuum-fragmentation-threshold", "nan"),
+    ("--vacuum-fragmentation-threshold", "half"),
+    ("--vacuum-busy-interval-ms", "9"),
+    ("--vacuum-busy-interval-ms", "3600001"),
+    ("--vacuum-idle-interval-ms", "99"),
+    ("--vacuum-idle-interval-ms", "86400001"),
+])
+def test_a_bad_vacuum_flag_exits_before_the_server_listens(flag, value):
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    try:
+        done = subprocess.run([server_binary(), "--dir", directory, "--listen", "127.0.0.1:0", flag, value],
+                              capture_output=True, text=True, timeout=60)
+        assert done.returncode != 0
+        assert flag in done.stderr
+        assert "ready on" not in done.stdout
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 BIG_ROWS = 20_000
 
 

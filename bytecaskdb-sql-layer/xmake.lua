@@ -130,7 +130,7 @@ target("sql_layer_tests")
     -- The tests, and the fixtures they share as modules (bytecask.sql.tests.*).
     add_files("tests/*.cpp", "tests/*.cppm")
     -- The TPROC-C harness's module, for its smoke test.
-    add_files("harness/tprocc.cppm", "server/pg_text.cppm", "server/pg_wire.cppm", "server/pg_session.cppm")
+    add_files("harness/tprocc.cppm", "server/pg_text.cppm", "server/pg_wire.cppm", "server/pg_session.cppm", "server/vacuum_thread.cppm")
     -- The engine's counted allocation-failure seam (tests/alloc_faults.h):
     -- it replaces the global operator new in this binary.
     add_files("../tests/alloc_faults.cpp", {defines = "BYTECASK_TESTING"})
