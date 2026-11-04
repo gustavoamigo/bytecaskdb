@@ -5,8 +5,8 @@
 # The MVP gate (docs/server_design.md, *Running the gate*): HammerDB's
 # TPROC-C, through bcdboltp.tcl (or, with --driver=custom, the older
 # bytecask_tprocc.tcl), against sql_layer_server, at each
-# user count, each cell on a fresh copy of one load, each ending with the
-# consistency conditions checked on what it left. It follows
+# user count and sync mode, each cell on a fresh copy of one load, each ending
+# with the consistency conditions checked on what it left. It follows
 # bytecaskdb-mariadb-plugin/benchmarks/run-hammerdb.sh.
 #
 # Usage:
@@ -22,8 +22,8 @@
 #   --rampup:     unmeasured minutes before the window (default 2).
 #   --duration:   measured minutes (default 5).
 #   --mix:        the transaction types the driver runs (default all five).
-#   --hammerdb-home: where hammerdbcli is (default $HAMMERDB_HOME, ~/HammerDB-*,
-#                 or PATH). HammerDB 6.0's Linux release bundles Tcl and pgtcl.
+#   --hammerdb-home: where hammerdbcli is (default $HAMMERDB_HOME, the newest
+#                 ~/HammerDB-*, or PATH). HammerDB 6.0's Linux release bundles Tcl and pgtcl.
 #   --driver:     bcdboltp (default): HammerDB 6.0's PostgreSQL stored-procedure
 #                 driver logic, each transaction one CALL of a procedure of
 #                 tprocc_procs.sql, which the load creates; or custom: the
@@ -31,11 +31,13 @@
 #   --data-root:  where the load and each cell's copy live (default a temporary
 #                 directory, removed at exit).
 #   --server-flags: more flags for sql_layer_server in every cell (default
-#                 none, so AT_EVERY_COMMIT, which on a SATA SSD mostly measures
-#                 fdatasync). Runs compared with each other use
-#                 "--sync AT_INTERVAL --sync-interval-ms 1000".
+#                 none). Without --sync among them, each user count runs twice,
+#                 which doubles the run's time: AT_EVERY_COMMIT, which on a SATA
+#                 SSD mostly measures fdatasync, and AT_INTERVAL, at 1000 ms
+#                 unless --sync-interval-ms says otherwise. With --sync, only
+#                 that mode runs.
 #   --smoke:      the nightly smoke: 2 warehouses, 2 users, no ramp-up, a
-#                 one-minute window; and the same run on PostgreSQL, through
+#                 one-minute window, AT_EVERY_COMMIT alone without --sync; and the same run on PostgreSQL, through
 #                 --pg, to check the driver itself (its consistency, never its
 #                 numbers: the gate reports ByteCaskDB's alone).
 #                 --pg is a libpq conninfo to a server where the user may
@@ -44,8 +46,8 @@
 #   XMAKE_FLAGS:  more `xmake f` flags for the build (CI's toolchain).
 #
 # Each cell appends a row to bytecaskdb-sql-layer/benchmarks/hammerdb_results.csv
-# (ignored by git), with the driver, the server flags and the data directory's
-# size when the server stopped. A cell whose check fails, or whose run printed
+# (ignored by git), with the driver, the sync mode, the server's flags and the
+# data directory's size when the server stopped. A cell whose check fails, or whose run printed
 # no result, fails the script, whatever its NOPM. The build's output is
 # build.log in the data root.
 
@@ -91,6 +93,24 @@ if ((SMOKE)); then
   [[ -n "$PG" ]] || { echo "run-gate.sh: --smoke needs --pg, the PostgreSQL the driver is checked on" >&2; exit 2; }
   command -v psql >/dev/null || { echo "run-gate.sh: --smoke needs psql" >&2; exit 2; }
 fi
+# The sync modes each user count runs: --sync in --server-flags names the only
+# one. Otherwise both, each flag written out so that a cell's row says what it
+# ran, whatever the server's default becomes.
+EXPLICIT_SYNC=""
+HAS_SYNC_INTERVAL=0
+for ((i = 0; i < ${#SERVER_FLAGS[@]}; i++)); do
+  case "${SERVER_FLAGS[i]}" in
+    --sync) EXPLICIT_SYNC="${SERVER_FLAGS[i + 1]:-}" ;;
+    --sync-interval-ms) HAS_SYNC_INTERVAL=1 ;;
+  esac
+done
+if [[ -n "$EXPLICIT_SYNC" ]]; then
+  SYNC_MODES=("${EXPLICIT_SYNC^^}")
+elif ((SMOKE)); then
+  SYNC_MODES=(AT_EVERY_COMMIT)
+else
+  SYNC_MODES=(AT_EVERY_COMMIT AT_INTERVAL)
+fi
 IFS=, read -r -a VU_LIST <<<"$VUS"
 for vu in "${VU_LIST[@]}"; do
   ((vu >= 1 && vu <= WAREHOUSES)) || { echo "run-gate.sh: $vu users need at least $vu warehouses (--warehouses=$WAREHOUSES)" >&2; exit 2; }
@@ -101,9 +121,11 @@ find_hammerdb() {
     [[ -x "$HAMMERDB_HOME/hammerdbcli" ]] && { echo "$HAMMERDB_HOME"; return 0; }
     return 1
   fi
-  for d in "$HOME"/HammerDB-*; do
+  # By version, newest first: glob order would put 10.0 before 9.0.
+  local d
+  while IFS= read -r d; do
     [[ -x "$d/hammerdbcli" ]] && { echo "$d"; return 0; }
-  done
+  done < <(printf '%s\n' "$HOME"/HammerDB-* | sort -rV)
   command -v hammerdbcli >/dev/null 2>&1 && { dirname "$(readlink -f "$(command -v hammerdbcli)")"; return 0; }
   return 1
 }
@@ -114,22 +136,24 @@ HAMMERDB_HOME="$(find_hammerdb)" || {
 }
 
 # Here, before a build and a load that take minutes: a header this script does
-# not know would misalign every row it appended. A row from before the three
-# new columns has them empty, which is "not recorded": a row since always names
-# its driver.
+# not know would misalign every row it appended. A row from before a column has
+# it empty, which is "not recorded".
 CSV="$LAYER/benchmarks/hammerdb_results.csv"
 CSV_HEADER_V1="date,commit,warehouses,users,rampup_min,duration_min,nopm,tpm,errors,check"
-CSV_HEADER="$CSV_HEADER_V1,driver,server_flags,final_data_bytes"
+CSV_HEADER_V2="$CSV_HEADER_V1,driver,server_flags,final_data_bytes"
+CSV_HEADER="$CSV_HEADER_V2,sync"
+upgrade_csv() {  # the empty columns each old row gains
+  sed -e "1c\\$CSV_HEADER" -e "1!s/\$/$1/" "$CSV" >"$CSV.tmp"
+  mv "$CSV.tmp" "$CSV"
+}
 mkdir -p "$(dirname "$CSV")"
 if [[ ! -s "$CSV" ]]; then
   echo "$CSV_HEADER" >"$CSV"
 else
   case "$(head -1 "$CSV")" in
     "$CSV_HEADER") ;;
-    "$CSV_HEADER_V1")
-      sed -e "1c\\$CSV_HEADER" -e '1!s/$/,,,/' "$CSV" >"$CSV.tmp"
-      mv "$CSV.tmp" "$CSV"
-      ;;
+    "$CSV_HEADER_V1") upgrade_csv ',,,,' ;;
+    "$CSV_HEADER_V2") upgrade_csv ',' ;;
     *) echo "run-gate.sh: $CSV has a header this script does not know; move it aside" >&2; exit 2 ;;
   esac
 fi
@@ -215,36 +239,43 @@ result() {  # log -> "NOPM TPM" or nothing
 # GITHUB_SHA instead.
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo "${GITHUB_SHA:0:7}")"
 FAILED=0
-FLAGS_TEXT="${SERVER_FLAGS[*]:-}"
 
 for vu in "${VU_LIST[@]}"; do
-  cell="$DATA_ROOT/cell"
-  rm -rf "$cell"
-  cp -a --reflink=auto "$PRISTINE" "$cell"
-  run="$("$TPROCC" next-run --dir "$cell")"
-  port="$(free_port)"
-  "$SERVER" --dir "$cell" --listen "127.0.0.1:$port" --database tprocc ${SERVER_FLAGS[@]+"${SERVER_FLAGS[@]}"} >"$DATA_ROOT/server.log" 2>&1 &
-  server=$!
-  for _ in $(seq 100); do grep -q "ready on" "$DATA_ROOT/server.log" && break; sleep 0.1; done
-  grep -q "ready on" "$DATA_ROOT/server.log" || { cat "$DATA_ROOT/server.log" >&2; exit 1; }
-  echo "== $vu users, $WAREHOUSES warehouses, ${RAMPUP}+${DURATION} min"
-  driver 127.0.0.1 "$port" tprocc tprocc "$WAREHOUSES" "$run" ByteCaskDB "$DATA_ROOT/driver.tcl"
-  hammerdb "$DATA_ROOT/driver.tcl" "$port" "$vu" "$DATA_ROOT/hammerdb.log"
-  kill -TERM "$server"
-  wait "$server" || { echo "sql_layer_server exited with $?" >&2; FAILED=1; }
-  read -r nopm tpm <<<"$(result "$DATA_ROOT/hammerdb.log")" || true
-  errors="$(sed -n 's/.*Errors by SQLSTATE: \(.*\)/\1/p' "$DATA_ROOT/hammerdb.log" | tail -1)"
-  # Apparent size, so a reflinked copy of the load counts in full.
-  data_bytes="$(du -sb "$cell" | cut -f1)"
-  if "$TPROCC" check --dir "$cell"; then check=ok; else check=failed; FAILED=1; fi
-  if [[ -z "${nopm:-}" ]]; then
-    echo "no result: the driver's output follows" >&2
-    tail -40 "$DATA_ROOT/hammerdb.log" >&2
-    FAILED=1
-  fi
-  echo "   NOPM ${nopm:-none}, TPM ${tpm:-none}, errors ${errors:-unknown}, check $check, driver $DRIVER, server flags ${FLAGS_TEXT:-none}, final data $(numfmt --to=iec-i --suffix=B --format=%.1f "$data_bytes")"
-  echo "$(date -u +%FT%TZ),$COMMIT,$WAREHOUSES,$vu,$RAMPUP,$DURATION,${nopm:-},${tpm:-},\"${errors:-}\",$check,$DRIVER,\"${FLAGS_TEXT//\"/\"\"}\",$data_bytes" >>"$CSV"
-  unset nopm tpm
+  for sync in "${SYNC_MODES[@]}"; do
+    flags=(${SERVER_FLAGS[@]+"${SERVER_FLAGS[@]}"})
+    if [[ -z "$EXPLICIT_SYNC" ]]; then
+      flags+=(--sync "$sync")
+      if [[ "$sync" == AT_INTERVAL ]] && ((!HAS_SYNC_INTERVAL)); then flags+=(--sync-interval-ms 1000); fi
+    fi
+    flags_text="${flags[*]}"
+    cell="$DATA_ROOT/cell"
+    rm -rf "$cell"
+    cp -a --reflink=auto "$PRISTINE" "$cell"
+    run="$("$TPROCC" next-run --dir "$cell")"
+    port="$(free_port)"
+    "$SERVER" --dir "$cell" --listen "127.0.0.1:$port" --database tprocc "${flags[@]}" >"$DATA_ROOT/server.log" 2>&1 &
+    server=$!
+    for _ in $(seq 100); do grep -q "ready on" "$DATA_ROOT/server.log" && break; sleep 0.1; done
+    grep -q "ready on" "$DATA_ROOT/server.log" || { cat "$DATA_ROOT/server.log" >&2; exit 1; }
+    echo "== $vu users, $WAREHOUSES warehouses, ${RAMPUP}+${DURATION} min, $sync"
+    driver 127.0.0.1 "$port" tprocc tprocc "$WAREHOUSES" "$run" ByteCaskDB "$DATA_ROOT/driver.tcl"
+    hammerdb "$DATA_ROOT/driver.tcl" "$port" "$vu" "$DATA_ROOT/hammerdb.log"
+    kill -TERM "$server"
+    wait "$server" || { echo "sql_layer_server exited with $?" >&2; FAILED=1; }
+    read -r nopm tpm <<<"$(result "$DATA_ROOT/hammerdb.log")" || true
+    errors="$(sed -n 's/.*Errors by SQLSTATE: \(.*\)/\1/p' "$DATA_ROOT/hammerdb.log" | tail -1)"
+    # Apparent size, so a reflinked copy of the load counts in full.
+    data_bytes="$(du -sb "$cell" | cut -f1)"
+    if "$TPROCC" check --dir "$cell"; then check=ok; else check=failed; FAILED=1; fi
+    if [[ -z "${nopm:-}" ]]; then
+      echo "no result: the driver's output follows" >&2
+      tail -40 "$DATA_ROOT/hammerdb.log" >&2
+      FAILED=1
+    fi
+    echo "   NOPM ${nopm:-none}, TPM ${tpm:-none}, errors ${errors:-unknown}, check $check, driver $DRIVER, sync $sync, server flags $flags_text, final data $(numfmt --to=iec-i --suffix=B --format=%.1f "$data_bytes")"
+    echo "$(date -u +%FT%TZ),$COMMIT,$WAREHOUSES,$vu,$RAMPUP,$DURATION,${nopm:-},${tpm:-},\"${errors:-}\",$check,$DRIVER,\"${flags_text//\"/\"\"}\",$data_bytes,$sync" >>"$CSV"
+    unset nopm tpm
+  done
 done
 
 if ((SMOKE)); then
