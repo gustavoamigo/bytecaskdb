@@ -328,6 +328,8 @@ TEST_CASE("pg_session: Execute without following message parks until Sync arrive
     pool.submit(a, ia);
     pool.submit(b, ib);
   }
+  // A turn is counted when it starts, so `target` turns are done only once
+  // the session is idle again; reading the table earlier races the last one.
   auto wait_turns = [&](const std::shared_ptr<pg::Pool::Slot>& slot, std::size_t target) {
     std::unique_lock<std::mutex> lock{order_mu};
     for (;;) {
@@ -335,7 +337,7 @@ TEST_CASE("pg_session: Execute without following message parks until Sync arrive
       lock.unlock();
       std::string dummy;
       auto st = pool.drain(slot, dummy);
-      if (st.turns >= target) return;
+      if (st.turns >= target && st.idle) return;
       lock.lock();
       order_cv.wait(lock, [&] { return wakes != seen; });
     }
