@@ -1640,6 +1640,53 @@ TEST_CASE("DataFile::lend_record past the end names the file and offset",
   std::filesystem::remove(path);
 }
 
+// CONTRACT.md, View and span lifetimes: the other back-ends throw. Under the
+// pool the file's short last frame is resident and holds nothing past the end,
+// which a read of the record the file lost must not take for the record (#768).
+// read_value is the path with no bound of its own: on the B+ tree key directory
+// its length comes from the key directory, here from an intact hint.
+TEST_CASE("DataFile: a sealed file's short last frame does not serve a record "
+          "the file lost",
+          "[data_file][buffer_pool]") {
+  const auto verify = GENERATE(false, true);
+  CAPTURE(verify);
+  const auto path =
+      std::filesystem::temp_directory_path() / "bc_test_lost_tail_record.data";
+  std::filesystem::remove(path);
+  bytecask::Offset first = 0;
+  bytecask::Offset second = 0;
+  {
+    auto writer = bytecask::WritablePosixDataFile::create(path, 0);
+    first = writer->append_entry(1, bytecask::EntryType::Put, to_bytes("a"),
+                                 to_bytes("first"));
+    second = writer->append_entry(2, bytecask::EntryType::Put, to_bytes("b"),
+                                  to_bytes("second"));
+    writer->sync();
+  }
+  // Two bytes into the second record's value.
+  REQUIRE(::truncate(path.c_str(), static_cast<off_t>(
+                                       second + bytecask::kHeaderSize + 1 + 2)) == 0);
+
+  auto pool = std::make_shared<bytecask::BufferPool>(
+      bytecask::BufferPoolOptions{.capacity_bytes = 32 << 20}, kScratchBytes);
+  const auto file = bytecask::openDataFileForRead(
+      path, bytecask::IoBackend::BufferPool, pool, 1);
+  std::vector<std::byte> io_buf;
+  std::vector<std::byte> out;
+  for (int i = 0; i < 2; ++i) {
+    file->read_value(first, 1, 5, verify, io_buf, out);
+    CHECK(to_string(out) == "first");
+  }
+  REQUIRE(pool->counters().hits.load() == 1);
+
+  CHECK_THROWS_AS(file->read_value(second, 1, 6, verify, io_buf, out),
+                  std::system_error);
+  bytecask::FrameLease lease;
+  CHECK_THROWS_AS(file->lend_record(second, 6, verify, io_buf, lease),
+                  std::runtime_error);
+  std::filesystem::remove(path);
+}
+
 // A file that ends before a read the engine believed it held (#236): pread
 // returns 0 and sets no errno, so the error must say where the file ended
 // instead of "pread failed: Success".

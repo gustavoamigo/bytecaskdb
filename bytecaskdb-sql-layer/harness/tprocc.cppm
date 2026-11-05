@@ -147,6 +147,11 @@ void dump_sql(Database& db, std::ostream& out);
 // mix: the conditions that do not hold, each described; empty when all do.
 [[nodiscard]] auto consistency(Database& db) -> std::vector<std::string>;
 
+// The CREATE PROCEDURE statements of a file such as
+// hammerdb/tprocc_procs.sql, each to its body's closing `$$`, without the
+// comments between them: one statement per Database::execute.
+[[nodiscard]] auto procedure_statements(std::string_view text) -> std::vector<std::string>;
+
 [[nodiscard]] auto format_report(const PhaseReport& r) -> std::string;
 [[nodiscard]] auto json_report(const PhaseReport& r) -> std::string;
 
@@ -370,6 +375,18 @@ void load(Database& db, const LoadOptions& opts) {
     }
   }
   l.flush();
+}
+
+auto procedure_statements(std::string_view text) -> std::vector<std::string> {
+  std::vector<std::string> out;
+  std::size_t from = 0;
+  for (auto end = text.find("$$;", from); end != std::string_view::npos; end = text.find("$$;", from)) {
+    auto create = text.find("CREATE PROCEDURE", from);
+    if (create == std::string_view::npos || create > end) throw std::runtime_error("a $$; with no CREATE PROCEDURE before it");
+    out.emplace_back(text.substr(create, end + 2 - create));
+    from = end + 3;
+  }
+  return out;
 }
 
 auto kind_name(Kind k) -> std::string_view {

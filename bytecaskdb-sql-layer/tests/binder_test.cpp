@@ -1457,3 +1457,36 @@ TEST_CASE("binder: a table read twice is two instances of it, named as the query
   auto g = bind_sql(cat, "SELECT t.id FROM t JOIN t y ON t.id = y.id");
   CHECK(g.instances.size() == 1);
 }
+
+TEST_CASE("binder: CALL's arguments are constants read as the procedure's argument types", "[sql][binder][procedure]") {
+  Procedure p{1000, "p", "CREATE PROCEDURE p …",
+              {{ProcedureArg::Mode::In, "n", SqlType{SqlKind::Integer}},
+               {ProcedureArg::Mode::InOut, "amount", SqlType{SqlKind::Decimal, 0, 6, 2}},
+               {ProcedureArg::Mode::InOut, "name", SqlType{SqlKind::Varchar, 4}},
+               {ProcedureArg::Mode::Out, "o", SqlType{SqlKind::Integer}},
+               {ProcedureArg::Mode::In, "at", SqlType{SqlKind::Timestamp}}}};
+  auto args = [&](std::string_view sql) { return bound::call_arguments(*ast::parse_call(sql), p); };
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)args(sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return "bound";
+  };
+  auto v = args("CALL p(7, 0.0, '', 99, TO_TIMESTAMP('20261103120530','YYYYMMDDHH24MISS')::timestamp without time zone)");
+  REQUIRE(v.size() == 5);
+  CHECK(v[0] == Datum{std::int64_t{7}});
+  CHECK(v[1] == Datum{std::int64_t{0}});  // 0.00 at scale 2
+  CHECK(v[2] == Datum{Bytes{}});
+  CHECK(std::holds_alternative<std::monostate>(v[3]));  // OUT: ignored
+  // 2026-11-03 12:05:30 UTC, in microseconds since 1970.
+  CHECK(v[4] == Datum{std::int64_t{1'793'707'530} * 1'000'000});
+  CHECK(args("CALL p(1, 12.345, 'abcd', NULL, NULL)")[1] == Datum{std::int64_t{1235}});  // rounded on assignment
+  CHECK(state("CALL p(1, 0, '', 0)") == "42883");                                     // a count of no procedure
+  CHECK(state("CALL p(1, 0, 'abcde', 0, NULL)") == "22001");                          // past VARCHAR(4)
+  CHECK(state("CALL p(40000000000, 0, '', 0, NULL)") == "22003");
+  CHECK(state("CALL p(x, 0, '', 0, NULL)") == "42601");                               // not a constant
+  CHECK(state("CALL p(1, 0, '', 0, TO_TIMESTAMP('2026', 'YYYY'))") == "42601");       // another format
+  CHECK(state("CALL p(1, 0, '', 0, TO_TIMESTAMP('20261332000000', 'YYYYMMDDHH24MISS'))") != "bound");
+}

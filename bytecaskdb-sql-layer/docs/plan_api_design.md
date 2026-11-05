@@ -1,6 +1,8 @@
 # Plan API: a physical algebra for generated plans
 
-Status: **built**, revision 13 (revision 13 with the sort-key decoders,
+Status: **built**, revision 14 (revision 14 with `bc_concat`, `bc_number_text` and
+`bc_substr`, for `||` and `SUBSTRING` of columns, and `algebra/bc_proc.h` for
+procedures; revision 13 with the sort-key decoders,
 `bc_sort_key_part_*`, for a set operation's `ORDER BY`; revision 11 with `bc_sub_*` and
 `BC_E_CARDINALITY`, for subqueries; revision 10 with `bc_null_row`, for outer
 joins; revision 9 with `bc_like` and
@@ -672,6 +674,11 @@ double  bc_max_f64(double, double);
 bool    bc_bytes_eq(bc_ctx *, bc_view, bc_view);
 int     bc_bytes_cmp(bc_ctx *, bc_view, bc_view);       /* memcmp order */
 bool    bc_bytes_prefix(bc_ctx *, bc_view prefix, bc_view);
+bc_view bc_concat(bc_ctx *, bc_view a, bc_view b);             /* a then b: new bytes the statement holds */
+bc_view bc_number_text(bc_ctx *, int64_t v, uint32_t scale);    /* an integer or a DECIMAL at `scale`, as PostgreSQL prints it */
+bc_view bc_substr(bc_ctx *, bc_view s, int64_t from, int64_t count);  /* PostgreSQL's substring of UTF-8 text, in
+                                                   characters; INT64_MAX: to the end; a negative count is
+                                                   BC_E_ARITH (22011) */
 bool    bc_like(bc_ctx *, bc_view text, bc_view pattern, int32_t escape);  /* PostgreSQL's LIKE of UTF-8 text:
                                                    _ one character, % any run, the escape (a code point, -1 for
                                                    none) quoting the next; an escape it reaches at the pattern's
@@ -1214,6 +1221,13 @@ reverse, and nothing under `bytecaskdb-sql-layer/` includes a MariaDB header.
 The plugin keeps its own key and row codecs, and would adopt the shared
 ones through its per-table format versions (`types_design.md`, *What the
 plugin adopts*; #488).
+
+## Procedures
+
+A stored procedure's file adds `algebra/bc_proc.h` to this header: `proc()`,
+its statements as `s<i>`, and the calls that begin and end a statement and
+set the procedure's variables (`procedures_design.md`, *The procedure
+language*). A plan file is unchanged by it.
 
 ## Deferred
 

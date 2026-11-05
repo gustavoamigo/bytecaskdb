@@ -17,6 +17,20 @@ package("libpg_query")
     set_urls("https://github.com/pganalyze/libpg_query.git")
     add_versions("6.2.5", "17-6.2.5")
     on_install("linux", "macosx", function (package)
+        -- pg_query_parse_plpgsql leaks its parse's stderr buffer (one byte)
+        -- when a body does not parse or the input holds no function: freed
+        -- here, as its success path frees it, so LeakSanitizer stays clean.
+        local plpgsql = "src/pg_query_parse_plpgsql.c"
+        local fixes = {
+            {"\t\tif (result.error != NULL) {\n\t\t\tpg_query_exit_memory_context(ctx);",
+             "\t\tif (result.error != NULL) {\n\t\t\tfree(parse_result.stderr_buffer);\n\t\t\tpg_query_exit_memory_context(ctx);"},
+            {"\t\tresult.plpgsql_funcs = strdup(\"[]\");\n\t\tpg_query_exit_memory_context(ctx);",
+             "\t\tresult.plpgsql_funcs = strdup(\"[]\");\n\t\tfree(parse_result.stderr_buffer);\n\t\tpg_query_exit_memory_context(ctx);"},
+        }
+        for _, fix in ipairs(fixes) do
+            local _, n = io.replace(plpgsql, fix[1], fix[2], {plain = true})
+            assert(n == 1, "libpg_query: the stderr-buffer fix no longer applies to " .. plpgsql)
+        end
         local cc = package:build_getenv("cc") or "cc"
         os.vrunv("make", {"build", "-j4", "CC=" .. cc})
         os.cp("libpg_query.a", package:installdir("lib") .. "/")
@@ -139,6 +153,8 @@ target("sql_layer_tests")
     -- plan(); each is renamed so several link into one binary.
     add_includedirs("algebra")
     add_defines("SQL_LAYER_PLANS_DIR=\"" .. path.join(os.scriptdir(), "plans") .. "\"")
+    -- The TPROC-C procedures the HammerDB gate loads (hammerdb/tprocc_procs.sql).
+    add_defines("SQL_LAYER_HAMMERDB_DIR=\"" .. path.join(os.scriptdir(), "hammerdb") .. "\"")
     add_defines("SQL_LAYER_GOLDEN_DIR=\"" .. path.join(os.scriptdir(), "tests", "golden") .. "\"")
     for _, name in ipairs({"insert", "select_by_id", "select_name_range", "update_qty", "delete_by_id"}) do
         add_files("plans/" .. name .. ".c", {defines = "plan=plan_" .. name,

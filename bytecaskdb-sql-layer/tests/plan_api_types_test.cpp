@@ -145,20 +145,23 @@ void key_part_wrong_table(bc_ctx* cx) {
 
 }  // namespace
 
-TEST_CASE("plan API: the symbol table names every plan-callable function of the header", "[sql][algebra]") {
-  std::ifstream in{std::string{SQL_LAYER_ALGEBRA_DIR} + "/bc_plan.h"};
-  REQUIRE(in);
+TEST_CASE("plan API: the symbol table names every plan-callable function of the headers", "[sql][algebra]") {
   std::set<std::string> declared;
   const std::regex decl{R"(^[A-Za-z_][A-Za-z0-9_ \*]*?\b(bc_[a-z0-9_]+)\()"};
-  for (std::string line; std::getline(in, line);) {
-    std::smatch m;
-    if (!std::regex_search(line, m, decl)) continue;
-    auto name = m[1].str();
-    if (name.starts_with("bc_ctx_") || name.starts_with("bc_txn_") || name.starts_with("bc_error") ||
-        name == "bc_execute") {
-      continue;
+  // A plan's header, and a procedure file's (docs/procedures_design.md).
+  for (const auto* header : {"/bc_plan.h", "/bc_proc.h"}) {
+    std::ifstream in{std::string{SQL_LAYER_ALGEBRA_DIR} + header};
+    REQUIRE(in);
+    for (std::string line; std::getline(in, line);) {
+      std::smatch m;
+      if (!std::regex_search(line, m, decl)) continue;
+      auto name = m[1].str();
+      if (name.starts_with("bc_ctx_") || name.starts_with("bc_txn_") || name.starts_with("bc_error") ||
+          name == "bc_execute") {
+        continue;
+      }
+      declared.insert(name);
     }
-    declared.insert(name);
   }
   std::set<std::string> table;
   for (const auto& sym : plan_api_symbols()) {

@@ -5,7 +5,8 @@ Status: **built** (#489): `bytecaskdb-sql-layer/catalog/`, with its tests in
 This covers what the catalog records, how it is stored under namespace
 `0x01`, the in-memory form plans resolve against and how readers share it,
 what makes a compiled plan compatible with the live catalog, and how each
-DDL statement writes. Views are in *Views*. Nothing in the engine changes
+DDL statement writes. Views are in *Views*; procedures in
+`procedures_design.md`, *Catalog record*. Nothing in the engine changes
 for it.
 
 The catalog is written from scratch. The plugin's catalog is positional,
@@ -101,6 +102,8 @@ Namespace `0x01`, as the plugin's catalog is:
 | `01 02 <id:4>` | The table record above, indexes and layouts included. |
 | `01 03 <name>` | Name entry: kind (1 table, 2 index, 3 view) and id (4, big-endian). |
 | `01 04 <id:4>` | The view record (*Views*). |
+| `01 05 <id:4>` | The procedure record (`procedures_design.md`, *Catalog record*). |
+| `01 06 <name>` | Procedure name entry: kind 4 and id (4, big-endian). Procedures have a namespace of their own. |
 
 **The counters are 8 bytes**, and the next id at most one past
 `kMaxObjectId`; any other value is refused at load. **One id counter** gives every table, index and layout its id, so an id
@@ -411,6 +414,8 @@ disk and in memory, as it was.
 | `DROP INDEX` | Record without the index, name entry deleted, `del_range` over `03 <index_id>`. |
 | `CREATE VIEW` | View record, name entry (`ensure_absent`), counters. One id. |
 | `DROP VIEW` | View record and name entry deleted. |
+| `CREATE PROCEDURE` | Procedure record, procedure name entry (`ensure_absent`), counters. One id. `OR REPLACE` of a procedure of the same arguments puts its record again, under its id. |
+| `DROP PROCEDURE` | Procedure record and procedure name entry deleted. |
 | `ALTER TABLE … ADD COLUMN` | Record with the column appended at the next id and the next position of its region; the current generation's offsets do not move. With a default, every existing row rewritten with it, and `ensure_range_unchanged` over the rows. |
 
 `IF EXISTS` on the drops; nothing else. A drop deletes in O(1) appends

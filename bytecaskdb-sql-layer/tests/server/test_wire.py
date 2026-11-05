@@ -604,6 +604,86 @@ def test_ddl_runs_alone_and_is_refused_beside_another_statement(server):
     assert states(c.until_ready()) == ["42P01"]  # never created
 
 
+def test_create_and_drop_procedure_have_their_command_tags(server):
+    c = connect(server)
+    c.send(query("CREATE PROCEDURE p(a INTEGER, INOUT b TEXT) LANGUAGE plpgsql AS $$ BEGIN b := 'x'; END $$"))
+    assert [b for k, b in c.until_ready() if k == b"C"] == [b"CREATE PROCEDURE\0"]
+    c.send(parse("CALL p(1, NULL)"), SYNC)  # a simple Query only
+    assert states(c.until_ready()) == ["0A000"]
+    c.send(query("DROP PROCEDURE p(INTEGER, TEXT)"))
+    assert [b for k, b in c.until_ready() if k == b"C"] == [b"DROP PROCEDURE\0"]
+    c.send(query("DROP PROCEDURE p"))
+    assert states(c.until_ready()) == ["42883"]
+    # The ';' of a dollar-quoted body, tagged or not, ends no statement; one after it does.
+    c.send(query("CREATE PROCEDURE q() LANGUAGE plpgsql AS $body$ BEGIN NULL; NULL; END $body$; ; "))
+    assert [b for k, b in c.until_ready() if k == b"C"] == [b"CREATE PROCEDURE\0"]
+    c.send(query("CREATE PROCEDURE r() LANGUAGE plpgsql AS $$ BEGIN NULL; END $$; DROP PROCEDURE q"))
+    assert states(c.until_ready()) == ["0A000"]  # two statements: the simple protocol takes one
+
+
+def test_call_as_hammerdb_sends_it_returns_the_out_row_and_the_tag_call(server):
+    c = connect(server)
+    for sql in ("CREATE TABLE stock (id INTEGER PRIMARY KEY, qty INTEGER, at TIMESTAMP)",
+                "INSERT INTO stock VALUES (1, 10, NULL)",
+                """CREATE PROCEDURE take(k INTEGER, n INTEGER, INOUT left_qty INTEGER, INOUT amount NUMERIC(6,2),
+                     INOUT note VARCHAR(8), stamp TIMESTAMP) LANGUAGE plpgsql AS $$
+                   BEGIN
+                     UPDATE stock SET qty = qty - n WHERE id = k;
+                     UPDATE stock SET at = stamp WHERE id = k;
+                     SELECT qty INTO left_qty FROM stock WHERE id = k;
+                     note := 'done';
+                   END $$"""):
+        c.send(query(sql))
+        assert states(c.until_ready()) == [], sql
+    # HammerDB's form: literal arguments, '' and 0.0 for the INOUT ones, and the timestamp.
+    c.send(query("call take(1,3,0,0.0,'',TO_TIMESTAMP('20261103120530','YYYYMMDDHH24MISS')::timestamp without time zone)"))
+    out = c.until_ready()
+    assert states(out) == [], out
+    assert [(n, oid) for n, oid in row_description(next(b for k, b in out if k == b"T"))] == [
+        ("left_qty", 23), ("amount", 1700), ("note", 1043)]
+    assert data(out) == [["7", "0.00", "done"]]
+    assert [b for k, b in out if k == b"C"] == [b"CALL\0"]
+    assert data(run(c, "SELECT qty, at FROM stock WHERE id = $1", ["1"])) == [["7", "2026-11-03 12:05:30"]]
+    # Inside a block, the procedure's writes are the block's.
+    c.send(query("BEGIN"))
+    c.until_ready()
+    c.send(query("CALL take(1, 1, NULL, NULL, NULL, NULL)"))
+    assert data(c.until_ready()) == [["6", None, "done"]]
+    c.send(query("ROLLBACK"))
+    c.until_ready()
+    assert data(run(c, "SELECT qty FROM stock WHERE id = $1", ["1"])) == [["7"]]
+    # Its errors: no such procedure, the wrong count, a failed statement (the block's 25P02 after).
+    c.send(query("CALL nope(1)"))
+    assert states(c.until_ready()) == ["42883"]
+    c.send(query("CALL take(1)"))
+    assert states(c.until_ready()) == ["42883"]
+    c.send(query("CALL take(1, 1, 0, 0, 'toolongvalue', NULL)"))
+    assert states(c.until_ready()) == ["22001"]
+
+
+def test_the_monitor_s_queries_answer(server):
+    c = connect(server)
+    for sql in ("CREATE TABLE district (d_id INTEGER, d_w_id INTEGER, d_next_o_id INTEGER, PRIMARY KEY (d_w_id, d_id))",
+                "CREATE TABLE warehouse (w_id INTEGER PRIMARY KEY)",
+                "INSERT INTO district VALUES (1, 1, 3001)", "INSERT INTO district VALUES (2, 1, 3005)",
+                "INSERT INTO warehouse VALUES (1)", "INSERT INTO warehouse VALUES (2)"):
+        c.send(query(sql))
+        assert states(c.until_ready()) == [], sql
+    c.send(query("select sum(xact_commit + xact_rollback) from pg_stat_database"))
+    out = c.until_ready()
+    assert row_description(next(b for k, b in out if k == b"T")) == [("sum", 1700)]
+    before = int(data(out)[0][0])
+    assert before >= 6  # the six statements above, each its own transaction
+    c.send(query("INSERT INTO warehouse VALUES (2)"))  # 23505: rolled back, and counted
+    c.until_ready()
+    c.send(query("SELECT SUM(xact_commit+xact_rollback) FROM pg_stat_database;"))
+    assert int(data(c.until_ready())[0][0]) == before + 1
+    for sql, value in (("select sum(d_next_o_id) from district", "6006"), ("select max(w_id) from warehouse", "2"),
+                       ("select max(d_id) from district", "2")):
+        c.send(query(sql))
+        assert data(c.until_ready()) == [[value]], sql
+
+
 def test_shutdown_sends_57p01_to_an_idle_connection():
     if not server_binary():
         pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")

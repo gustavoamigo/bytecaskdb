@@ -315,6 +315,33 @@ struct View {
   std::vector<std::string> columns;
 };
 
+// A stored procedure (docs/procedures_design.md): the text of the CREATE
+// PROCEDURE statement that defined it, and its signature. Its compiled code
+// is never stored. Procedures have a namespace of their own: a procedure and
+// a table may share a name.
+struct ProcedureArg {
+  enum class Mode : std::uint8_t { In = 1, InOut = 2, Out = 3 };
+  Mode mode{Mode::In};
+  std::string name;
+  SqlType type;
+  auto operator==(const ProcedureArg&) const -> bool = default;
+  // An IN or INOUT argument: one a CALL passes a value to.
+  [[nodiscard]] auto is_input() const -> bool { return mode != Mode::Out; }
+};
+
+struct Procedure {
+  std::uint32_t id{0};
+  std::string name;
+  std::string definition;
+  std::vector<ProcedureArg> args;
+};
+
+// Whether `written`, a type a DROP PROCEDURE's argument list names, is
+// `declared`, an argument's type: the same kind, whatever the modifiers, as
+// PostgreSQL ignores an argument's modifier. VARCHAR is TEXT, since the
+// layer reads VARCHAR without a length as TEXT.
+[[nodiscard]] auto same_argument_type(SqlType written, SqlType declared) -> bool;
+
 struct ColumnSpec {
   std::string name;
   SqlType sql;
@@ -389,8 +416,20 @@ struct DropViewDdl {
   std::string name;
   bool if_exists{false};
 };
+struct CreateProcedureDdl {
+  std::string name;
+  std::string definition;
+  bool replace{false};
+  std::vector<ProcedureArg> args;
+};
+// `arg_types`: the DROP's argument list, nullopt when none was written.
+struct DropProcedureDdl {
+  std::string name;
+  std::optional<std::vector<SqlType>> arg_types;
+  bool if_exists{false};
+};
 using Ddl = std::variant<CreateTableDdl, CreateIndexDdl, DropTableDdl, DropIndexDdl, AddColumnDdl, CreateViewDdl,
-                         DropViewDdl>;
+                         DropViewDdl, CreateProcedureDdl, DropProcedureDdl>;
 
 class Catalog {
 public:
@@ -415,6 +454,8 @@ public:
   [[nodiscard]] auto views() const -> const std::map<std::uint32_t, View>& { return views_; }
   [[nodiscard]] auto view(std::string_view name) const -> const View*;
   [[nodiscard]] auto view(std::uint32_t id) const -> const View*;
+  [[nodiscard]] auto procedures() const -> const std::map<std::uint32_t, Procedure>& { return procedures_; }
+  [[nodiscard]] auto procedure(std::string_view name) const -> const Procedure*;
   // An index by name, with its table.
   [[nodiscard]] auto index(std::string_view name) const -> std::pair<const Table*, const Index*>;
   // A table or an index: both draw ids from one counter.
@@ -480,6 +521,8 @@ private:
   std::map<std::uint32_t, Table> tables_;
   std::map<std::uint32_t, View> views_;
   std::map<std::string, std::uint32_t, std::less<>> names_;  // table, index or view name -> id
+  std::map<std::uint32_t, Procedure> procedures_;
+  std::map<std::string, std::uint32_t, std::less<>> procedure_names_;  // a namespace of their own
   std::map<std::uint32_t, KeyLayout> key_layouts_;
 };
 
@@ -579,6 +622,8 @@ private:
 // The catalog record's key and a table's row-key range: for tests and tools.
 [[nodiscard]] auto table_record_key(std::uint32_t table_id) -> Bytes;
 [[nodiscard]] auto view_record_key(std::uint32_t view_id) -> Bytes;
+[[nodiscard]] auto procedure_record_key(std::uint32_t procedure_id) -> Bytes;
+[[nodiscard]] auto procedure_name_key(std::string_view name) -> Bytes;
 [[nodiscard]] auto name_entry_key(std::string_view name) -> Bytes;
 // Every row key of a table starts with its row prefix: kNsRow, the table id.
 [[nodiscard]] auto row_prefix(std::uint32_t table_id) -> Bytes;
@@ -600,6 +645,8 @@ void for_each_row(const Snapshot& snap, std::uint32_t table_id, Visit&& visit) {
 [[nodiscard]] auto parse_table(BytesView record) -> Table;
 [[nodiscard]] auto serialize_view(const View& v) -> Bytes;
 [[nodiscard]] auto parse_view(BytesView record) -> View;
+[[nodiscard]] auto serialize_procedure(const Procedure& p) -> Bytes;
+[[nodiscard]] auto parse_procedure(BytesView record) -> Procedure;
 
 // Encodes the primary key of `t` from a row: kNsRow, the table id, the parts.
 [[nodiscard]] auto encode_pk_from_row(const Table& t, BytesView row, Bytes& out) -> bool;
@@ -619,12 +666,16 @@ constexpr std::byte kSubCounter{0x01};
 constexpr std::byte kSubTable{0x02};
 constexpr std::byte kSubName{0x03};
 constexpr std::byte kSubView{0x04};
+constexpr std::byte kSubProcedure{0x05};
+constexpr std::byte kSubProcedureName{0x06};
 constexpr std::byte kCounterNextId{0x01};
 constexpr std::byte kCounterVersion{0x02};
 constexpr std::uint8_t kKindTable = 1;
 constexpr std::uint8_t kKindIndex = 2;
 constexpr std::uint8_t kKindView = 3;
 constexpr std::uint16_t kViewRecordFormat = 1;
+constexpr std::uint8_t kKindProcedure = 4;
+constexpr std::uint16_t kProcedureRecordFormat = 1;
 
 using DdlOp = Catalog::DdlOp;
 
@@ -1224,6 +1275,24 @@ auto view_record_key(std::uint32_t id) -> Bytes {
   return k;
 }
 
+auto procedure_record_key(std::uint32_t id) -> Bytes {
+  auto k = Bytes{std::byte{kNsCatalog}, kSubProcedure};
+  auto idb = be_bytes(id, 4);
+  k.insert(k.end(), idb.begin(), idb.end());
+  return k;
+}
+
+auto procedure_name_key(std::string_view name) -> Bytes {
+  Bytes k{std::byte{kNsCatalog}, kSubProcedureName};
+  for (auto c : name) k.push_back(static_cast<std::byte>(c));
+  return k;
+}
+
+auto same_argument_type(SqlType written, SqlType declared) -> bool {
+  auto text = [](SqlKind k) { return k == SqlKind::Varchar ? SqlKind::Text : k; };
+  return text(written.kind) == text(declared.kind);
+}
+
 auto name_entry_key(std::string_view name) -> Bytes {
   Bytes k{std::byte{kNsCatalog}, kSubName};
   for (auto c : name) k.push_back(static_cast<std::byte>(c));
@@ -1370,6 +1439,61 @@ auto parse_view(BytesView in) -> View {
   r.expect_end("record of view " + v.name);
   if (v.definition.empty() || v.columns.empty()) corrupt("view " + v.name + " has no definition or no columns");
   return v;
+}
+
+// A procedure record: u16 format, u32 id, str name, blob definition,
+// u16 nargs { u8 mode, str name, u8 kind, u32 length, u8 precision, u8 scale }.
+auto serialize_procedure(const Procedure& p) -> Bytes {
+  RecordWriter w;
+  w.u16(kProcedureRecordFormat);
+  w.u32(p.id);
+  w.str(p.name);
+  w.blob(std::as_bytes(std::span{p.definition}));
+  w.u16(p.args.size());
+  for (const auto& a : p.args) {
+    w.u8(static_cast<std::uint8_t>(a.mode));
+    w.str(a.name);
+    w.u8(static_cast<std::uint8_t>(a.type.kind));
+    w.u32(a.type.length);
+    w.u8(a.type.precision);
+    w.u8(a.type.scale);
+  }
+  return w.bytes();
+}
+
+auto parse_procedure(BytesView in) -> Procedure {
+  RecordReader r{in};
+  auto format = r.u16();
+  if (format != kProcedureRecordFormat) {
+    throw std::runtime_error("catalog procedure record format " + std::to_string(format) + " is not " +
+                             std::to_string(kProcedureRecordFormat) +
+                             ": the database was written by a later SQL-layer build");
+  }
+  Procedure p;
+  p.id = r.u32();
+  p.name = r.str();
+  p.definition = as_string(r.blob());
+  auto nargs = r.u16();
+  std::set<std::string, std::less<>> names;
+  for (std::uint32_t i = 0; i < nargs; ++i) {
+    ProcedureArg a;
+    auto mode = r.u8();
+    if (mode < 1 || mode > 3) corrupt("argument of procedure " + p.name + " has an unknown mode");
+    a.mode = static_cast<ProcedureArg::Mode>(mode);
+    a.name = r.str();
+    a.type.kind = static_cast<SqlKind>(r.u8());
+    a.type.length = r.u32();
+    a.type.precision = r.u8();
+    a.type.scale = r.u8();
+    if (!sql_type_valid(a.type)) corrupt("argument " + a.name + " of procedure " + p.name + " has an invalid type");
+    if (a.name.empty() || !names.insert(a.name).second) {
+      corrupt("procedure " + p.name + " has an unnamed or repeated argument");
+    }
+    p.args.push_back(std::move(a));
+  }
+  r.expect_end("record of procedure " + p.name);
+  if (p.name.empty() || p.definition.empty()) corrupt("a procedure has no name or no definition");
+  return p;
 }
 
 auto parse_table(BytesView in) -> Table {
@@ -1551,6 +1675,15 @@ auto Catalog::load(const Snapshot& snap) -> Catalog {
     }
     cat.views_.emplace(parsed.id, std::move(parsed));
   }
+  auto procedures = Bytes{std::byte{kNsCatalog}, kSubProcedure};
+  for (const auto& e : snap.iter_from({}, procedures)) {
+    if (!has_prefix(e.key, procedures)) break;
+    auto parsed = parse_procedure(e.value);
+    if (e.key.size() != procedures.size() + 4 || be_value(e.key.subspan(procedures.size())) != parsed.id) {
+      corrupt("record of procedure " + parsed.name + " is under another id's key");
+    }
+    cat.procedures_.emplace(parsed.id, std::move(parsed));
+  }
   cat.rebuild_lookups();
 
   // Every id below the counter and used once; every name entry names its
@@ -1588,6 +1721,20 @@ auto Catalog::load(const Snapshot& snap) -> Catalog {
     ++entries;
   }
   if (entries != objects || cat.names_.size() != objects) corrupt("a table, index or view has no name entry");
+  for (const auto& [id, p] : cat.procedures_) use(id);
+  std::size_t procedure_entries = 0;
+  auto procedure_names = Bytes{std::byte{kNsCatalog}, kSubProcedureName};
+  for (const auto& e : snap.iter_from({}, procedure_names)) {
+    if (!has_prefix(e.key, procedure_names)) break;
+    auto name = as_string(e.key.subspan(procedure_names.size()));
+    auto it = cat.procedure_names_.find(name);
+    if (it == cat.procedure_names_.end() || e.value.size() != 5 ||
+        std::to_integer<std::uint8_t>(e.value[0]) != kKindProcedure || be_value(e.value.subspan(1)) != it->second) {
+      corrupt("procedure name entry " + name + " does not match the records");
+    }
+    ++procedure_entries;
+  }
+  if (procedure_entries != cat.procedures_.size()) corrupt("a procedure has no name entry");
   return cat;
 }
 
@@ -1597,6 +1744,7 @@ auto Catalog::clone() const -> Catalog {
   c.version_ = version_;
   c.tables_ = tables_;
   c.views_ = views_;
+  c.procedures_ = procedures_;
   c.rebuild_lookups();
   return c;
 }
@@ -1610,6 +1758,10 @@ void Catalog::erase_table(std::uint32_t id) { tables_.erase(id); }
 
 void Catalog::rebuild_lookups() {
   names_.clear();
+  procedure_names_.clear();
+  for (const auto& [id, p] : procedures_) {
+    if (!procedure_names_.emplace(p.name, id).second) corrupt("procedure name " + p.name + " is used twice");
+  }
   key_layouts_.clear();
   auto name_taken = [&](const std::string& n) {
     if (names_.contains(n)) corrupt("name " + n + " is used twice");
@@ -1657,6 +1809,11 @@ auto Catalog::view(std::string_view name) const -> const View* {
 auto Catalog::view(std::uint32_t id) const -> const View* {
   auto it = views_.find(id);
   return it == views_.end() ? nullptr : &it->second;
+}
+
+auto Catalog::procedure(std::string_view name) const -> const Procedure* {
+  auto it = procedure_names_.find(name);
+  return it == procedure_names_.end() ? nullptr : &procedures_.at(it->second);
 }
 
 auto Catalog::find_view_dependent(std::uint32_t id) const -> const View* {
@@ -1976,6 +2133,57 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     put_op(ops, DdlOp::Kind::Del, view_record_key(found->id));
     put_op(ops, DdlOp::Kind::Del, name_entry_key(found->name));
     next->views_.erase(found->id);
+    return finish();
+  }
+
+  if (const auto* cp = std::get_if<CreateProcedureDdl>(&ddl)) {
+    std::set<std::string, std::less<>> arg_names;
+    for (const auto& a : cp->args) {
+      if (!arg_names.insert(a.name).second) {
+        throw DdlRefused("parameter name \"" + a.name + "\" used more than once", kInvalidFunctionDefinition);
+      }
+      if (!sql_type_valid(a.type)) throw DdlRefused("argument " + a.name + " has an invalid type", kFeatureNotSupported);
+    }
+    Procedure p{0, cp->name, cp->definition, cp->args};
+    if (const auto* existing = procedure(cp->name)) {
+      if (!cp->replace) throw DdlRefused("procedure \"" + cp->name + "\" already exists", kDuplicateFunction);
+      // PostgreSQL would overload, or refuse a renamed argument: one
+      // procedure per name keeps neither (docs/procedures_design.md).
+      if (existing->args != cp->args) {
+        throw DdlRefused("CREATE OR REPLACE PROCEDURE cannot change the arguments of procedure \"" + cp->name +
+                             "\": drop it first",
+                         kFeatureNotSupported);
+      }
+      p.id = existing->id;
+    } else {
+      p.id = reserve_ids(next->next_id_, 1);
+      put_op(ops, DdlOp::Kind::EnsureAbsent, procedure_name_key(p.name));
+      put_op(ops, DdlOp::Kind::Put, procedure_name_key(p.name), name_value(kKindProcedure, p.id));
+    }
+    put_op(ops, DdlOp::Kind::Put, procedure_record_key(p.id), serialize_procedure(p));
+    next->procedures_.insert_or_assign(p.id, std::move(p));
+    return finish();
+  }
+
+  if (const auto* dp = std::get_if<DropProcedureDdl>(&ddl)) {
+    const auto* found = procedure(dp->name);
+    // A written list names the input arguments, or all of them.
+    auto matches = [&](bool inputs_only) {
+      std::vector<SqlType> declared;
+      for (const auto& a : found->args) {
+        if (!inputs_only || a.is_input()) declared.push_back(a.type);
+      }
+      return std::ranges::equal(*dp->arg_types, declared, same_argument_type);
+    };
+    if (found != nullptr && dp->arg_types && !matches(true) && !matches(false)) found = nullptr;
+    if (found == nullptr) {
+      if (dp->if_exists) return nullptr;
+      throw DdlRefused("procedure " + dp->name + (dp->arg_types ? " with these argument types" : "") + " does not exist",
+                       kUndefinedFunction);
+    }
+    put_op(ops, DdlOp::Kind::Del, procedure_record_key(found->id));
+    put_op(ops, DdlOp::Kind::Del, procedure_name_key(found->name));
+    next->procedures_.erase(found->id);
     return finish();
   }
 
