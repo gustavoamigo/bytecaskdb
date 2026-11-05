@@ -734,6 +734,40 @@ binder and compiler already keep:
 
 ## The HammerDB driver
 
+The gate's driver is `hammerdb/bcdboltp.tcl`, a HammerDB 6.0 custom script
+(`customscript`) whose logic is HammerDB 6.0's PostgreSQL stored-procedure
+driver's (`src/postgresql/pgoltp.tcl`, `pg_storedprocs=true`, the timed
+driver):
+- **Each virtual user** draws from the same deck (`RandomNumber 1 23`) with
+  the same inputs: the district, the customer by `NURand` id or, 60% of the
+  time, by `NURand` last name, the remote warehouse 15% of Payments, the
+  amount, the line count, the threshold. Each transaction is one `CALL` of
+  a procedure of `hammerdb/tprocc_procs.sql`, which runs it on the server
+  in one transaction (`procedures_design.md`, *Running a procedure*),
+  retried there on 40001 as an autocommit statement is.
+- **The procedures** draw New-Order's lines with `random(lo, hi)`, as
+  HammerDB's do with its `DBMS_RANDOM`, and pick a customer by last name
+  with `FOR … IN query`. Their SQL is the harness's statements
+  (`harness/tprocc.cppm`), which the proof suite checks against PostgreSQL
+  17; the file runs on PostgreSQL 17 unchanged.
+- **Only the call syntax is the layer's:** arguments in the procedures'
+  order, NULL for the `INOUT` ones, the time as a timestamp literal, the
+  item count, and Payment's history key, `(run << 48) | (position << 40) |
+  n`, which the driver draws as the harness does, since `history.h_id` is
+  the table's key.
+- **A failed call** is counted by its SQLSTATE and not retried, as
+  HammerDB's drivers do not retry. New-Order's 1% unused item fails its
+  call with P0002 (`SELECT … INTO STRICT`), which rolls it back, as the
+  benchmark asks: not counted as an error.
+- **The monitor** is HammerDB's: TPM from `select sum(xact_commit +
+  xact_rollback) from pg_stat_database`, NOPM from `select sum(d_next_o_id)
+  from district`, then `testresult`.
+- **Its home warehouse** is fixed by position, as below.
+
+`run-gate.sh` creates the procedures in the load (`sql_layer_tprocc procs`),
+and, with `--smoke`, on PostgreSQL with `psql`. `--driver=custom` runs the
+older script, below, until it is removed (#758).
+
 `bytecaskdb-sql-layer/hammerdb/bytecask_tprocc.tcl` is a HammerDB custom
 script (`customscript`). It is a port of the client-side TPROC-C logic in
 HammerDB's MySQL driver, `src/mysql/mysqloltp.tcl`: the `neword`,
@@ -742,12 +776,8 @@ HammerDB's MySQL driver, `src/mysql/mysqloltp.tcl`: the `neword`,
 script uses pgtcl and runs the statements of `testing_design.md` (*The
 TPROC-C statements*), with `$n` parameters.
 
-HammerDB's PostgreSQL driver calls PL/pgSQL procedures (or functions
-through SQL `PREPARE`). The server now takes its `CALL`s and its monitor's
-`pg_stat_database` query (`procedures_design.md`, *Wire protocol for
-`CALL`*); running it unchanged needs the TPROC-C procedures and a
-stock-driver mode of the gate, #758's phase 4. Until then the gate runs
-this script.
+It was written when the layer had no procedures, which HammerDB's
+PostgreSQL driver needs.
 
 **A virtual user** connects as above.
 - **Its run.** The run script takes one run per cell before the server
@@ -821,12 +851,27 @@ runs is not part of its output.
 
 `bytecaskdb-sql-layer/hammerdb/run-gate.sh [--warehouses=48] [--vus=1,16,48]
 [--rampup=2] [--duration=5] [--mix="neword payment ostat delivery slev"]
-[--hammerdb-home=PATH] [--data-root=PATH] [--server-flags="--sync AT_INTERVAL"]
+[--driver=bcdboltp|custom] [--hammerdb-home=PATH] [--data-root=PATH]
+[--server-flags="--io-backend buffer_pool"]
 [--smoke --pg=CONNINFO]`. `--server-flags` goes to the server in every cell. It
 follows `run-hammerdb.sh` in the MariaDB plugin. `--smoke` is the short run
 of *Tests*, and `--pg` names the PostgreSQL it checks the driver on (its
 password in `PGPASSWORD`). `XMAKE_FLAGS` adds `xmake f` flags, as CI sets
 its toolchain.
+
+**The two sync modes.** Without `--sync` in `--server-flags`, each user count
+runs twice, on a fresh copy each: `AT_EVERY_COMMIT` and `AT_INTERVAL` at 1000 ms
+(or at the flags' `--sync-interval-ms`). They test different things:
+`AT_EVERY_COMMIT` on a SATA SSD mostly measures `fdatasync`, and `AT_INTERVAL`
+measures the layer. So a default gate takes twice as long as one mode. With
+`--sync`, only that mode runs. Compare only rows of the same sync mode.
+`--smoke` runs `AT_EVERY_COMMIT` alone: it checks the driver and the conditions,
+never the numbers.
+
+**The data outgrows its load.** On 244ae692, a 48-warehouse load of 6 GB grew
+to 23–30 GB over a 2+5 minute cell at 16 and 48 users, so a buffer pool sized
+from the load does not keep the data in memory. Each cell reports its final
+size. Size a pool from that, at the same user count and length.
 
 TinyCC is built with `--with-selinux` whenever SELinux is enabled on the
 build machine (`xmake.lua`): in enforcing mode its default way of making
@@ -836,10 +881,13 @@ mode but needs `/tmp` to allow executable mappings.
 
 1. **Build.** It builds `sql_layer_tprocc` and `sql_layer_server` in
    `releasedbg`; a debug engine walks the key directory on every commit.
+   Each `xmake` call passes `-P` with the script's own tree, so a worktree
+   under `.claude/worktrees` builds itself and not the checkout around it.
+   The verbose output is `build.log` in the data root.
 2. **Load.** It loads W warehouses once with `sql_layer_tprocc load`, not
    HammerDB's `buildschema`, and keeps the directory as the pristine copy.
    With `--smoke`, `--sql-out` also writes the population for PostgreSQL.
-3. **Per user count:**
+3. **Per user count and sync mode:**
    - restore the copy (a reflink where the filesystem has them);
    - take a run with `sql_layer_tprocc next-run`, written into the driver's
      header;
@@ -853,6 +901,7 @@ mode but needs `/tmp` to allow executable mappings.
      `vudestroy`;
    - parse the result line;
    - stop the server with `SIGTERM`;
+   - measure the data directory's apparent size;
    - run `sql_layer_tprocc check --dir`, the nine conditions, on what the
      run left.
 
@@ -865,8 +914,12 @@ mode but needs `/tmp` to allow executable mappings.
 5. **Results.** One row per cell goes to
    `bytecaskdb-sql-layer/benchmarks/hammerdb_results.csv`, which the
    layer's `.gitignore` ignores: date, commit, W, users, ramp-up,
-   duration, NOPM, TPM, errors by SQLSTATE, and the check's result, all
+   duration, NOPM, TPM, errors by SQLSTATE, the check's result, the driver,
+   the server's flags, the final data size in bytes and the sync mode, all
    of our server; the report prints the same. No PostgreSQL row is written.
+   A file with an earlier header of this one is rewritten to it once, its
+   rows with the columns they lack empty, which means not recorded. Any other
+   header stops the script before it builds.
 
 The harness gains three commands for this:
 - `check`, over its existing `consistency()`;

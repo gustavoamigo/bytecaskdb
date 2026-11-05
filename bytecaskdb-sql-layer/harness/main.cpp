@@ -9,11 +9,13 @@
 //   sql_layer_tprocc elle --dir D --config guarded|unguarded|blind [--threads N] [--txns N] [--seed N] --out FILE
 //   sql_layer_tprocc check --dir D
 //   sql_layer_tprocc next-run --dir D
+//   sql_layer_tprocc procs --dir D --file hammerdb/tprocc_procs.sql
 //
 // load --sql-out also writes what it loaded as a psql script, for the same
 // population on PostgreSQL. check runs the consistency conditions alone, on
 // what a run left (hammerdb/run-gate.sh, after the server stops). next-run
 // bumps harness_run and prints the run, for the HammerDB driver's h_ids.
+// procs creates the TPROC-C procedures of a file, for hammerdb/bcdboltp.tcl.
 //
 // run checks the benchmark specification's consistency conditions after its last phase. Any error
 // but a retried 40001, and any failed condition, exits non-zero.
@@ -24,6 +26,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <map>
 #include <optional>
 #include <stdexcept>
@@ -87,7 +90,7 @@ auto list(const std::string& s) -> std::vector<std::size_t> {
 
 auto run_main(int argc, char** argv) -> int {
   if (argc < 2) {
-    std::fputs("usage: sql_layer_tprocc load|run|elle|check|next-run --dir D [...]\n", stderr);
+    std::fputs("usage: sql_layer_tprocc load|run|elle|check|next-run|procs --dir D [...]\n", stderr);
     return 2;
   }
   const std::string_view cmd{argv[1]};
@@ -150,6 +153,19 @@ auto run_main(int argc, char** argv) -> int {
     auto run = tprocc::next_run(*db);
     db->close();
     std::printf("%llu\n", static_cast<unsigned long long>(run));
+    return 0;
+  }
+  if (cmd == "procs") {
+    const auto path = get(f, "file", "");
+    std::ifstream in{path};
+    if (!in) throw std::runtime_error("cannot read " + path);
+    std::stringstream text;
+    text << in.rdbuf();
+    auto db = bytecask::sql::Database::open(dir);
+    auto stmts = tprocc::procedure_statements(text.str());
+    for (const auto& s : stmts) (void)db->execute(s);
+    db->close();
+    std::printf("created %zu procedures\n", stmts.size());
     return 0;
   }
   if (cmd == "elle") {

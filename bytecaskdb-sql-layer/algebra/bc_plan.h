@@ -281,6 +281,11 @@ bool    bc_bytes_prefix(bc_ctx *, bc_view prefix, bc_view);
 bc_view bc_concat(bc_ctx *, bc_view a, bc_view b);
 bc_view bc_number_text(bc_ctx *, int64_t v, uint32_t scale);
 bc_view bc_substr(bc_ctx *, bc_view s, int64_t from, int64_t count);
+/* PostgreSQL 17's random(lo, hi): an integer drawn uniformly from lo to hi,
+   both included; lo > hi is BC_E_ARITH, "lower bound must be less than or
+   equal to upper bound" (22023). Not repeatable: each thread draws from its
+   own generator, seeded at random. */
+int64_t bc_random(bc_ctx *, int64_t lo, int64_t hi);
 bool    bc_like(bc_ctx *, bc_view text, bc_view pattern, int32_t escape);  /* PostgreSQL's LIKE of UTF-8 text:
                                                    _ one character, % any run, the escape (a code point, -1 for
                                                    none) quoting the next; an escape it reaches at the pattern's

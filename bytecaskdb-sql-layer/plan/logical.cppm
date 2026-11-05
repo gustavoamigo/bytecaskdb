@@ -68,7 +68,7 @@ struct ColumnRef {
 // expressions) only.
 struct Expr {
   enum class Kind { Column, Param, Const, Add, Sub, Mul, Div, Compare, Aggregate, And, Or, Not, IsNull, Like, Truth, InSet, Case, Coalesce,
-                    Concat, Substr };
+                    Concat, Substr, Random };
   enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind{Kind::Param};
   SqlType type{};
@@ -85,7 +85,8 @@ struct Expr {
                                 // pattern, a parameter; Truth: its parameter; InSet: its column;
                                 // Case: WHEN, THEN, WHEN, THEN … and an ELSE last if there is one (an odd count);
                                 // Coalesce: two or more; Concat: two, text or an integer or DECIMAL (its
-                                // text); Substr: the text, the start, and the count if given (INTEGERs)
+                                // text); Substr: the text, the start, and the count if given (INTEGERs);
+                                // Random: its two bounds, both included
 
   [[nodiscard]] auto phys() const -> PhysType { return phys_type(type); }
 

@@ -3080,3 +3080,35 @@ END $$)");
   CHECK(db->call("pay", {i(2), i(3), i(7), Value{std::int64_t{100}}, text("wh"), text("dist"), Value{}}).rows ==
         Grid{{text("kept")}});
 }
+
+TEST_CASE("embedded API: a procedure's assignment brings a number to the variable's scale, rounding half away from zero",
+          "[sql][api][procedure]") {
+  sql_test::TempDir dir{"api_procedure_rescale"};
+  auto db = Database::open(dir.path());
+  (void)db->execute(R"(CREATE PROCEDURE r(a NUMERIC(6, 3), n INTEGER, INOUT down NUMERIC(6, 2), INOUT up NUMERIC(8, 2),
+                         INOUT pick INTEGER) LANGUAGE plpgsql AS $$
+BEGIN
+  down := a * 1;
+  up := n;
+  pick := random(3, 3);
+END $$)");
+  auto call = [&](std::int64_t thousandths, std::int64_t n) {
+    return db->call("r", {Value{thousandths}, Value{n}, Value{}, Value{}, Value{}}).rows.at(0);
+  };
+  CHECK(call(1005, 7) == std::vector<Value>{Value{std::int64_t{101}}, Value{std::int64_t{700}}, Value{std::int64_t{3}}});
+  CHECK(call(-1005, -7).at(0) == Value{std::int64_t{-101}});  // -1.005 is -1.01
+  CHECK(call(1004, 0).at(0) == Value{std::int64_t{100}});
+  try {
+    (void)call(1000, 1'000'000);  // 1000000.00 is past NUMERIC(8, 2)
+    FAIL("ran");
+  } catch (const std::exception& e) {
+    CHECK(std::string{sqlstate(e)} == "22003");
+  }
+  (void)db->execute("CREATE PROCEDURE bad(INOUT x INTEGER) LANGUAGE plpgsql AS $$ BEGIN x := random(5, 1); END $$");
+  try {
+    (void)db->call("bad", {Value{}});
+    FAIL("ran");
+  } catch (const std::exception& e) {
+    CHECK(std::string{sqlstate(e)} == "22023");
+  }
+}

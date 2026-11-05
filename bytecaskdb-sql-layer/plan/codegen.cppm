@@ -104,10 +104,14 @@ struct GeneratedPlan {
 namespace proc {
 struct Stmt;
 using Body = std::vector<Stmt>;
-// var := value, of the variable's own physical type.
+// var := value, of the variable's own physical type. An exact number of
+// another scale is brought to the variable's: `rescale` digits up (times a
+// power of ten) or, when negative, down, rounded half away from zero, as
+// PostgreSQL's assignment cast to NUMERIC(p, s) rounds.
 struct Assign {
   std::uint32_t var;
   logical::Expr value;
+  int rescale{0};
 };
 struct If {
   std::vector<std::pair<logical::Expr, Body>> branches;  // each a BOOLEAN condition
@@ -735,6 +739,7 @@ private:
       case Expr::Kind::Coalesce:
       case Expr::Kind::Concat:
       case Expr::Kind::Substr:
+      case Expr::Kind::Random:
       case Expr::Kind::Aggregate: break;
     }
     throw std::logic_error{"physical plan: a predicate codegen does not print"};
@@ -775,7 +780,8 @@ private:
       case Expr::Kind::Case:
       case Expr::Kind::Coalesce:
       case Expr::Kind::Concat:
-      case Expr::Kind::Substr: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
+      case Expr::Kind::Substr:
+      case Expr::Kind::Random: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
     }
     auto col = read_col(lhs);
     // Text and bytes compare as bytes: COLLATE "C".
@@ -1471,6 +1477,12 @@ private:
       case Expr::Kind::Coalesce: return eval_coalesce(e);
       case Expr::Kind::Concat: return eval_concat(e);
       case Expr::Kind::Substr: return eval_substr(e);
+      case Expr::Kind::Random: {
+        auto lo = eval(e.args[0]);
+        auto hi = eval(e.args[1]);
+        return guarded("int64_t", "0", either(lo.null, hi.null), "bc_random(cx, " + lo.value + ", " + hi.value + ")",
+                       PhysType::I64);
+      }
       case Expr::Kind::Aggregate:
       case Expr::Kind::Like:
       case Expr::Kind::Truth:
@@ -1530,7 +1542,8 @@ private:
       case Expr::Kind::Case:
       case Expr::Kind::Coalesce:
       case Expr::Kind::Concat:
-      case Expr::Kind::Substr: throw std::logic_error{"physical plan: not an arithmetic expression"};
+      case Expr::Kind::Substr:
+      case Expr::Kind::Random: throw std::logic_error{"physical plan: not an arithmetic expression"};
     }
     if (e.type.kind == SqlKind::SmallInt || e.type.kind == SqlKind::Integer) {
       call = "bc_check_int(cx, " + call + ", " + (e.type.kind == SqlKind::SmallInt ? "BC_SMALLINT" : "BC_INTEGER") + ", 0)";
@@ -3007,8 +3020,21 @@ private:
     return v.null.empty() ? "(" + v.value + ")" : "(!(" + v.null + ") && (" + v.value + "))";
   }
 
-  void set(std::uint32_t var, const logical::Expr& e) {
+  void set(std::uint32_t var, const logical::Expr& e, int rescale = 0) {
     auto v = gen_.value_of(e);
+    if (rescale != 0) {
+      std::int64_t unit = 1;
+      for (auto k = 0; k < (rescale < 0 ? -rescale : rescale); ++k) unit *= 10;
+      auto u = constant(unit);
+      if (rescale > 0) {
+        v.value = "bc_mul(cx, " + v.value + ", " + u + ")";
+      } else {
+        // Half the unit, away from zero, then truncated by the division.
+        auto half = constant(unit / 2);
+        v.value = "bc_div(cx, bc_add_bigint(cx, " + v.value + ", (" + v.value + ") < 0 ? -" + half + " : " + half + ", 0), " +
+                  u + ")";
+      }
+    }
     auto slot = std::to_string(var);
     auto call = [&]() -> std::string {
       switch (v.type) {
@@ -3036,7 +3062,7 @@ private:
 
   void stmt(const proc::Assign& a) {
     w_.open("");
-    set(a.var, a.value);
+    set(a.var, a.value, a.rescale);
     w_.close();
   }
   void stmt(const proc::If& i) { branch(i, 0); }
