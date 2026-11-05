@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
    Copyright (c) 2026 Gustavo Amigo
 
-   bc_plan.h — the plan API of docs/plan_api_design.md (revision 12). A plan is
+   bc_plan.h — the plan API of docs/plan_api_design.md (revision 14). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
    and bc_params are opaque here and built by the runtime
@@ -269,6 +269,18 @@ double  bc_max_f64(double, double);
 bool    bc_bytes_eq(bc_ctx *, bc_view, bc_view);
 int     bc_bytes_cmp(bc_ctx *, bc_view, bc_view);       /* memcmp order */
 bool    bc_bytes_prefix(bc_ctx *, bc_view prefix, bc_view);
+/* Text built from values (docs/frontend_design.md, *Expressions over
+   columns*), each a new view of bytes the statement holds:
+   - bc_concat: a, then b;
+   - bc_number_text: v, an integer or a DECIMAL at `scale`, as PostgreSQL
+     prints one (-12.50 at scale 2);
+   - bc_substr: PostgreSQL's substring(s FROM from FOR count) of UTF-8 text,
+     in characters: a start before the first character takes from it, those
+     before counting toward `count`; INT64_MAX is to the end; a negative
+     count is BC_E_ARITH, "negative substring length not allowed" (22011). */
+bc_view bc_concat(bc_ctx *, bc_view a, bc_view b);
+bc_view bc_number_text(bc_ctx *, int64_t v, uint32_t scale);
+bc_view bc_substr(bc_ctx *, bc_view s, int64_t from, int64_t count);
 bool    bc_like(bc_ctx *, bc_view text, bc_view pattern, int32_t escape);  /* PostgreSQL's LIKE of UTF-8 text:
                                                    _ one character, % any run, the escape (a code point, -1 for
                                                    none) quoting the next; an escape it reaches at the pattern's

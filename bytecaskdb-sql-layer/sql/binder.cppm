@@ -1303,7 +1303,8 @@ auto fold_concat(const Constant& a, const Constant& b, std::int32_t pos) -> Cons
 auto fold_function(const ast::Expr& e) -> Constant {
   std::vector<Constant> given;
   for (const auto& a : e.args) given.push_back(fold(a));
-  const auto& name = e.func;
+  // substr is substring's function-call form, its arguments in the same order.
+  const std::string name = e.func == "substr" ? "substring" : e.func;
   if (name == "||") return fold_concat(given[0], given[1], e.pos);
   auto arity = [&](std::size_t lo, std::size_t hi) {
     if (given.size() < lo || given.size() > hi) no_function(name, given, e.pos);
@@ -2070,7 +2071,7 @@ public:
       case K::Case:
       case K::Coalesce:
       case K::NullIf: return conditional_value(e, resolve);
-      case K::Func: not_yet("|| and the string functions of other than constants", e.pos);
+      case K::Func: return function_value(e, resolve);
       case K::Const:
       case K::Literal: break;  // constants, above
     }
@@ -2117,6 +2118,54 @@ public:
   // bound to that type, an unknown literal read as it (22P02); a branch
   // is evaluated, in the plan, only when it is taken. A `$n` takes its type
   // from a column among the branches.
+  // || and SUBSTRING (substr) of a column, a parameter-bound value or a
+  // procedure's variable: text built at run time (bc_concat, bc_substr).
+  // `||` takes text with text, or with an integer or DECIMAL through its
+  // text, as PostgreSQL's anynonarray || text does; the other string
+  // functions of non-constants are not built yet (#671).
+  auto function_value(const ast::Expr& e, const Resolve& resolve) -> logical::Expr {
+    auto texty = [](SqlType t) { return t.kind == SqlKind::Text || t.kind == SqlKind::Varchar || t.kind == SqlKind::Char; };
+    auto exact = [](SqlType t) {
+      return t.kind == SqlKind::SmallInt || t.kind == SqlKind::Integer || t.kind == SqlKind::BigInt || t.kind == SqlKind::Decimal;
+    };
+    // A $n is of the type its place takes, as PostgreSQL infers it there:
+    // text beside ||, integer for SUBSTRING's start and count.
+    auto arg = [&](const ast::Expr& a, SqlType as) {
+      if (a.kind != ast::Expr::Kind::Param) return value(a, resolve);
+      const auto& col = typed_params_.emplace_back(Column{0, "$" + std::to_string(a.param + 1), as, phys_type(as), true, std::monostate{}});
+      use_param(a.param, phys_type(as), a.pos, col, 0, Use::Operand);
+      return logical::param(a.param, as);
+    };
+    if (e.func == "||") {
+      auto a = arg(e.args[0], SqlType{SqlKind::Text});
+      auto b = arg(e.args[1], SqlType{SqlKind::Text});
+      for (const auto* x : {&a, &b}) {
+        if (!texty(x->type) && !exact(x->type)) not_yet("|| of a " + pg_type_name(x->type) + " value", e.pos);
+      }
+      if (!texty(a.type) && !texty(b.type)) {
+        throw SqlError{"operator does not exist: " + pg_type_name(a.type) + " || " + pg_type_name(b.type), e.pos,
+                       kUndefinedFunction};
+      }
+      return logical::binary(logical::Expr::Kind::Concat, std::move(a), std::move(b), SqlType{SqlKind::Text});
+    }
+    if (e.func == "substring" || e.func == "substr") {
+      if (e.args.size() < 2 || e.args.size() > 3) throw SqlError{"function " + e.func + " takes 2 or 3 arguments", e.pos, kUndefinedFunction};
+      auto out = logical::expr(logical::Expr::Kind::Substr, SqlType{SqlKind::Text});
+      out.args.push_back(arg(e.args[0], SqlType{SqlKind::Text}));
+      if (!texty(out.args[0].type)) not_yet(e.func + " of a " + pg_type_name(out.args[0].type) + " value", e.pos);
+      for (std::size_t i = 1; i < e.args.size(); ++i) {
+        auto n = arg(e.args[i], SqlType{SqlKind::Integer});
+        if (n.type.kind != SqlKind::SmallInt && n.type.kind != SqlKind::Integer) {
+          if (texty(n.type)) not_yet("SUBSTRING(s FROM 'pattern'), the regular-expression form", e.pos);
+          throw SqlError{"function " + e.func + "(text, " + pg_type_name(n.type) + ") does not exist", e.pos, kUndefinedFunction};
+        }
+        out.args.push_back(std::move(n));
+      }
+      return out;
+    }
+    not_yet(e.func + " of other than constants", e.pos);
+  }
+
   auto conditional_value(const ast::Expr& e, const Resolve& resolve) -> logical::Expr {
     using K = ast::Expr::Kind;
     auto what = std::string{e.kind == K::Case ? "CASE" : e.kind == K::Coalesce ? "COALESCE" : "NULLIF"};
@@ -3287,10 +3336,11 @@ public:
       }
       if (e.kind != ast::Expr::Kind::Column) {
         if (aggregated) not_yet("an expression in the select list of an aggregated query", e.pos);
-        auto name = e.kind == ast::Expr::Kind::Case       ? "case"
-                    : e.kind == ast::Expr::Kind::Coalesce ? "coalesce"
-                    : e.kind == ast::Expr::Kind::NullIf   ? "nullif"
-                                                          : "?column?";
+        auto name = e.kind == ast::Expr::Kind::Case                       ? std::string{"case"}
+                    : e.kind == ast::Expr::Kind::Coalesce                 ? std::string{"coalesce"}
+                    : e.kind == ast::Expr::Kind::NullIf                   ? std::string{"nullif"}
+                    : e.kind == ast::Expr::Kind::Func && e.func != "||" ? e.func
+                                                                          : std::string{"?column?"};
         targets.push_back({value(e, resolve), name});
         continue;
       }
@@ -3768,6 +3818,7 @@ private:
   std::string using_alias_;         // USING (…) AS alias
   std::vector<std::unique_ptr<Table>> instances_;  // see instance()
   std::vector<ParamUse> params_;
+  std::deque<Column> typed_params_;  // what a $n typed by its place (function_value) is used as; never moves
   std::vector<Datum> fixed_;  // the constants' values, $own_params_ + 1 onwards
   std::vector<PhysType> fixed_types_;
   std::vector<SqlType> fixed_sql_;
