@@ -10084,12 +10084,15 @@ TEST_CASE("a vacuum during a manifest transfer fails the copy with ENOENT, "
 namespace {
 
 // Writes k and closes, leaving one sealed data file, and returns its path.
-// A reopen starts every back-end cold, so the read goes to the file.
+// The record is too large for the pool the test below gives it to admit, so
+// the read goes to the file on every back-end: a test build's key directory
+// walk at open has already read it, and a frame that holds it would serve it.
 auto sealed_file_with_key(const std::filesystem::path &dir)
     -> std::filesystem::path {
   {
-    auto db = bytecask::DB::open(dir);
-    db.put({.sync = true}, to_bytes("k"), to_bytes(std::string(8192, 'v')));
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1024 * 1024});
+    db.put({.sync = true}, to_bytes("k"),
+           to_bytes(std::string(512 * 1024, 'v')));
     db.close();
   }
   const auto files = data_files_in(dir);
@@ -10107,7 +10110,7 @@ TEST_CASE("a sealed file truncated underneath: Pread and BufferPool throw",
   TempDir td;
   const auto dir = td.path / "db";
   const auto sealed = sealed_file_with_key(dir);
-  bytecask::Options opts{.io_backend = io_backend};
+  bytecask::Options opts{.max_file_bytes = 1024 * 1024, .io_backend = io_backend};
   if (io_backend == bytecask::IoBackend::BufferPool)
     opts.buffer_pool.capacity_bytes = 2 * opts.max_file_bytes;
   auto db = bytecask::DB::open(dir, opts);
@@ -12610,6 +12613,53 @@ auto temp_dir_supports_direct_io() -> bool {
   return ok;
 }
 }  // namespace
+
+// docs/buffer_pool_design.md, §3: a hot record at the end of a sealed file.
+TEST_CASE("io_backend=BufferPool: a record in a sealed file's short last frame "
+          "is read from the device once",
+          "[bytecask][buffer_pool]") {
+  const auto verify = GENERATE(false, true);
+  CAPTURE(verify);
+  TempDir td;
+  const bytecask::Options opts{
+      .io_backend = bytecask::IoBackend::BufferPool,
+      .buffer_pool = {.capacity_bytes = 256 * 1024 * 1024}};
+  // More than a frame, so the record is in a frame of its own, and short of two.
+  const std::string filler(6000, 'f');
+  const std::string hot(49, 'h');
+  {
+    auto db = bytecask::DB::open(td.path, opts);
+    db.put({.sync = true}, to_bytes("filler"), to_bytes(filler));
+    db.put({.sync = true}, to_bytes("hot"), to_bytes(hot));
+    db.close();
+  }
+  auto db = bytecask::DB::open(td.path, opts);
+  const bytecask::ReadOptions read{.verify_checksums = verify};
+  const auto misses = [&] { return db.stats().at("bytecask.pool_misses"); };
+  const auto hits = [&] { return db.stats().at("bytecask.pool_hits"); };
+
+  bytecask::Bytes out;
+  REQUIRE(db.get(read, to_bytes("hot"), out));
+  CHECK(to_string(out) == hot);
+  const auto misses_after_first = misses();
+  CHECK(misses_after_first >= 1);
+  const auto hits_after_first = hits();
+
+  for (int i = 0; i < 3; ++i) {
+    REQUIRE(db.get(read, to_bytes("hot"), out));
+    CHECK(to_string(out) == hot);
+  }
+  const auto snap = db.snapshot();
+  REQUIRE(snap.get(read, to_bytes("hot"), out));
+  CHECK(to_string(out) == hot);
+  auto range = snap.iter_from(read, to_bytes("hot"));
+  auto it = range.begin();
+  REQUIRE(it != range.end());
+  CHECK(to_string((*it).value) == hot);
+
+  CHECK(misses() == misses_after_first);
+  CHECK(hits() > hits_after_first);
+}
 
 TEST_CASE("io_backend=BufferPool: direct I/O fills serve identical bytes",
           "[bytecask][buffer_pool]") {

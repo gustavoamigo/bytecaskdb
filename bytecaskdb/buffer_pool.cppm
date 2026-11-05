@@ -67,10 +67,15 @@ export struct BufferPoolOptions {
 // The descriptors a pool-backed file hands to the pool. `direct` is opened
 // O_DIRECT and serves frame-aligned fills only; it is -1 where the filesystem
 // refused it, and fills then go through `buffered`. `buffered` serves
-// everything else: oversize reads and the fallback.
+// everything else: oversize reads and the fallback. `sealed` says the file
+// will not grow, which is what lets a read that reaches its end admit a short
+// last frame. The active file's stays false: a reader admitting its tail could
+// race an append that found no frame to extend, and the frame would then lack
+// bytes below the next reader's bound.
 export struct PoolFile {
   int buffered{-1};
   int direct{-1};
+  bool sealed{false};
 };
 
 // Opens path read-only on a descriptor whose reads bypass the page cache, so
@@ -279,9 +284,10 @@ public:
   }
 
   // Reads exactly len bytes at offset of file_id's file into dst, serving what
-  // is resident and filling the rest. file_size bounds admission: a frame that
-  // extends past EOF is served directly and never cached, which is what lets
-  // a frame's contents be fixed-length with no per-frame valid-length field.
+  // is resident and filling the rest. file_size bounds every read: a frame
+  // may hold fewer than kPoolFrameBytes valid bytes, with no per-frame length,
+  // because nothing at or past file_size is ever served from one. A read that
+  // crosses file_size goes to the device and comes up short there.
   //
   // Throws std::system_error if the underlying read fails or comes up short.
   void read_at(std::uint32_t file_id, PoolFile file, std::uint64_t offset,
@@ -289,7 +295,8 @@ public:
 
   // read_at, except that the file ending first is not an error: returns how
   // many bytes from offset were read, short only where the file ends. Only
-  // frames read whole are admitted. Throws std::system_error if a read fails.
+  // frames read whole are admitted, and a sealed file's last frame once the
+  // read reached file_size. Throws std::system_error if a read fails.
   [[nodiscard]] auto read_upto(std::uint32_t file_id, PoolFile file,
                                std::uint64_t offset, std::size_t len,
                                std::uint64_t file_size, std::byte *dst)
@@ -763,7 +770,7 @@ auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
   const auto last = (offset + len - 1) / kPoolFrameBytes;
 
   // Reads frames [a, b] in one I/O, copies their overlap with the request
-  // into dst, and admits each whole frame. The caller's bytes come from the
+  // into dst, and admits each frame it holds. The caller's bytes come from the
   // read buffer, not from the frames: a frame admitted here can be evicted
   // before we would copy out of it.
   const auto fill_run = [&](std::uint64_t a, std::uint64_t b) {
@@ -799,14 +806,18 @@ auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
     std::lock_guard<std::mutex> lk{mu_};
     for (auto f = a; f <= b; ++f) {
       const auto frame_start = f * kPoolFrameBytes;
-      // Only whole frames are admitted; a short tail frame stays uncached.
-      if (frame_start + kPoolFrameBytes > std::min<std::uint64_t>(file_size, have))
-        break;
+      auto frame_len = kPoolFrameBytes;
+      if (frame_start + kPoolFrameBytes > std::min<std::uint64_t>(file_size, have)) {
+        // A short last frame is admitted only for a sealed file, and only if
+        // the read reached file_size: the file can end below it (#246).
+        if (!file.sealed || have < file_size || frame_start >= file_size) break;
+        frame_len = static_cast<std::size_t>(file_size - frame_start);
+      }
       // Unvisited: the miss that brought it in is its first read, and what
       // earns it a place is a second one. Admitted visited, a frame read once
       // would survive a whole pass of the hand and SIEVE would be CLOCK.
       if (admit(make_key(file_id, f), buf + (frame_start - run_start),
-                kPoolFrameBytes, false)) {
+                frame_len, false)) {
         counters_.fills.fetch_add(1, std::memory_order_relaxed);
       }
     }
@@ -838,11 +849,17 @@ auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
   // frames that are not. A value of many frames with one evicted costs one
   // small read, not the whole value again — which matters exactly when
   // values are large, since eviction takes frames, not values.
+  //
+  // A read that crosses file_size uses no frame: a short last frame's bytes
+  // past file_size are not the file's, and the key directory's length is what
+  // asks for them when a file is shorter than its hint says. The fill reports
+  // the read as short instead.
+  const auto crosses_end = offset + len > file_size;
   bool any_miss = false;
   bool in_run = false;
   std::uint64_t run_start = 0;
   for (auto f = first; f <= last; ++f) {
-    if (copy_out(make_key(file_id, f), f, offset, len, dst)) {
+    if (!crosses_end && copy_out(make_key(file_id, f), f, offset, len, dst)) {
       if (in_run) {
         fill_missing(run_start, f - 1);
         in_run = false;
