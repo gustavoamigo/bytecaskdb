@@ -136,8 +136,13 @@ struct Exec {
   std::uint32_t stmt;
 };
 struct Return {};
+// FOR targets IN query: statement `stmt` once, then the body per row of it.
+struct ForQuery {
+  std::uint32_t stmt;
+  Body body;
+};
 struct Stmt {
-  std::variant<Assign, If, ForRange, While, Exit, Exec, Return> v;
+  std::variant<Assign, If, ForRange, While, Exit, Exec, Return, ForQuery> v;
 };
 }  // namespace proc
 
@@ -3060,6 +3065,17 @@ private:
     w_.line("bc_stmt_end(px, " + k + ");");
   }
   void stmt(const proc::Return&) { w_.line("return;"); }
+  void stmt(const proc::ForQuery& f) {
+    auto k = std::to_string(f.stmt);
+    w_.line("s" + k + "(bc_stmt_begin(px, " + k + "));");
+    w_.line("bc_stmt_end(px, " + k + ");");
+    ++loops_;
+    w_.open("while (bc_rows_next(px, " + k + "))");
+    stmts(f.body);
+    w_.close();
+    --loops_;
+    w_.line("bc_rows_done(px, " + k + ");");
+  }
 
   physical::Plan empty_;
   Writer w_;

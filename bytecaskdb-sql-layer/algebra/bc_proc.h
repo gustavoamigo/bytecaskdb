@@ -44,6 +44,15 @@ void bc_var_set_bool(bc_proc *, uint32_t var, bool v);
 void bc_var_set_bytes(bc_proc *, uint32_t var, bc_view v);
 void bc_var_set_null(bc_proc *, uint32_t var);
 
+/* FOR targets IN query: after bc_stmt_end of the query's statement, each
+   call copies its next row into the targets and is a pass of the loop,
+   charged; false when the rows are done or the procedure has failed. The
+   rows are the query's as it ran: the body's writes do not change them.
+   bc_rows_done, after the loop however it ended, sets FOUND: whether the
+   query returned a row. */
+bool bc_rows_next(bc_proc *, uint32_t stmt);
+void bc_rows_done(bc_proc *, uint32_t stmt);
+
 /* A pass of WHILE or LOOP, charged to the procedure's budget: false once the
    procedure has failed or its budget is spent. */
 bool bc_loop(bc_proc *);

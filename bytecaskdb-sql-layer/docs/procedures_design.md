@@ -1,13 +1,16 @@
 # Stored procedures in the SQL layer
 
 Status: **design, approved by the owner on 2026-11-02** (#758, part of #487
-and #757; it replaces the sketch in #495). Phases 1 to 3 are built:
+and #757; it replaces the sketch in #495; revised on 2026-11-03: the gate
+drives the procedures with `bcdboltp.tcl`, HammerDB 6.0's PostgreSQL
+driver logic in the layer's call syntax). Phases 1 to 3 and 4a are built:
 `CREATE [OR REPLACE] PROCEDURE` and `DROP PROCEDURE` are kept in the catalog
 (*Catalog record*), the embedded API runs a procedure (`Database::call`,
 `Transaction::call`) from one generated file, and `sql_layer_server` takes
 `CALL` as HammerDB's driver sends it, with its monitor's queries (*Wire
-protocol for `CALL`*). Phase 4, the TPROC-C procedures and the stock-driver
-gate, is not built (*Phases*).
+protocol for `CALL`*), and a body loops over a query's rows. Phases 4b
+and 4c, the string functions Payment needs and the TPROC-C procedures with
+their driver and gate, are not built (*Phases*).
 
 The goal is PL/pgSQL procedures compiled by the layer's own compiler, so that
 HammerDB 6.0's stock PostgreSQL TPROC-C driver runs against
@@ -111,10 +114,18 @@ these changes, declared in `algebra/bc_proc.h`:
   - `FOR i IN a..b [REVERSE]` is `bc_range_open` and `bc_range_next`; its
     bounds are evaluated once on entry, so it always ends. A NULL bound is
     22004.
+  - `FOR a, b IN query LOOP` runs the query's statement once
+    (`bc_stmt_begin`, `bc_stmt_end`), whose rows the runtime keeps; then
+    each `bc_rows_next` copies the next row into the variables, a pass of
+    the loop. The rows are the query's as it ran, so the body's writes do
+    not change them, as in PostgreSQL. `bc_rows_done`, after the loop
+    however it ended, sets `FOUND`: whether the query returned a row. A
+    statement that returns no rows is 42601. A record variable (`FOR rec
+    IN`) and cursor `FETCH` are not built.
   - `WHILE` and `LOOP` are `while (bc_loop(px))`. Each pass of every loop is
     charged to the procedure's budget, its deadline and cancel flag
     included.
-  - Once the procedure has failed, `bc_loop` and `bc_range_next` return
+  - Once the procedure has failed, `bc_loop`, `bc_range_next` and `bc_rows_next` return
     false and every other call does nothing, so `proc()` returns.
 - **Expressions** are printed by the code generator's expression printer,
   the one a select list uses, reading slots as parameters: there is one
@@ -136,7 +147,7 @@ CREATE [OR REPLACE] PROCEDURE text
      - each embedded statement is parsed, its variables rewritten to $n, and
        bound and planned as a prepared statement (bound::bind_procedure_statement)
         │
-   proc IR: Assign, If, ForRange, While (LOOP: no condition), Exit (EXIT, CONTINUE), Exec, Return
+   proc IR: Assign, If, ForRange, ForQuery, While (LOOP: no condition), Exit (EXIT, CONTINUE), Exec, Return
         │
    each statement → s<i>; the IR → proc() → one .c file → TinyCC
 ```
@@ -161,7 +172,7 @@ yet; 0A000 for an assignment or `INTO`).
 **When the body is checked.** `CREATE PROCEDURE` reads the body into the
 procedure IR, refusing a PL/pgSQL statement the layer does not run (0A000):
 `EXCEPTION` blocks, `COMMIT` and `ROLLBACK`, `RAISE`, `EXECUTE`, cursors,
-records, labels, `FOR … BY`, `RETURN` with a value, and a variable that
+records (`FOR rec IN query` among them), labels, `FOR … BY`, `RETURN` with a value, and a variable that
 shadows another. It does not bind anything: as in PostgreSQL, a procedure
 may name a table created after it. Binding happens at the first call after
 any DDL, which reports what binding refuses: a name that does not exist
@@ -330,7 +341,10 @@ bodies under HammerDB's names and signatures (`neword`, `payment`, `ostat`,
 | 1 | This document; `CREATE [OR REPLACE] PROCEDURE` and `DROP PROCEDURE` parsed (signature and PL/pgSQL syntax) and kept in the catalog | built |
 | 2 | PL binder, procedure IR, codegen of the one file, `bc_proc.h` and its runtime (`bc_stmt_begin/end`, `bc_var_*`, `bc_range_*`), `Database::call` with the retry | built |
 | 3 | `CALL` over the wire, the OUT row, the `pg_stat_database` stub, `TO_TIMESTAMP` and `::` in arguments | built |
-| 4 | `hammerdb/tprocc_procs.sql`, a stock-driver mode in `run-gate.sh` (HammerDB 6.0, #556), a proof test running the same procedures on PostgreSQL 17 with the consistency conditions | not built |
+| 4a | `FOR a, b IN query LOOP`: TPROC-C's customer by last name, the row at position ceil(n / 2) | built |
+| 4b | `\|\|` and `substr` over columns and variables: Payment's `c_data` (#671, in part) | not built |
+| 4c | `hammerdb/tprocc_procs.sql`; `hammerdb/bcdboltp.tcl`, HammerDB 6.0's PostgreSQL stored-procedure driver logic with the layer's call syntax, run as a `customscript`; `CALL` over the extended protocol; `run-gate.sh` running it (#556); a proof test running the same procedures and driver on PostgreSQL 17 with the consistency conditions | not built |
+| 5 | `bytecask_tprocc.tcl` and `check_driver_statements.py` removed, once the gate passes with `bcdboltp.tcl` | not built |
 
 **Full fidelity**, later: HammerDB's own procedure bodies and schema build,
 unchanged. Almost all of it is SQL rather than PL/pgSQL: arrays,
@@ -362,3 +376,7 @@ and the schema build's `COPY FROM STDIN`, catalog lookups, `CREATE USER`,
   `tests/api_test.cpp` (`transaction_counts`), and `tests/server/test_wire.py`
   (HammerDB's form of `CALL`, its row and tag, in and out of a block, its
   errors; the monitor's queries).
+- Phase 4a: `tests/api_test.cpp`, "FOR targets IN query runs the body per
+  row of the query as it ran": the middle customer by `c_first`, the rows
+  unchanged by the body's writes, `FOUND` after the loop, `EXIT` out of it,
+  and a statement with no rows refused.

@@ -2968,3 +2968,51 @@ TEST_CASE("embedded API: transaction_counts counts each transaction once, an aut
   CHECK(after.committed == 3);
   CHECK(after.rolled_back == 3);
 }
+
+TEST_CASE("embedded API: FOR targets IN query runs the body per row of the query as it ran", "[sql][api][procedure]") {
+  sql_test::TempDir dir{"api_procedure_for_query"};
+  auto db = Database::open(dir.path());
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  (void)db->execute("CREATE TABLE customer (c_id INTEGER PRIMARY KEY, c_last VARCHAR(16), c_first VARCHAR(16), c_balance INTEGER)");
+  for (auto [id, last, first] : {std::tuple{1, "BAR", "dan"}, {2, "BAR", "ann"}, {3, "OUGHT", "zed"}, {4, "BAR", "cat"},
+                                 {5, "BAR", "bob"}, {6, "BAR", "eve"}}) {
+    (void)db->execute("INSERT INTO customer VALUES ($1, $2, $3, 0)", {i(id), text(last), text(first)});
+  }
+  // TPROC-C's customer by last name: the one at position ceil(n / 2) by c_first.
+  (void)db->execute(R"(CREATE PROCEDURE middle(name VARCHAR(16), INOUT pick INTEGER, INOUT seen INTEGER, INOUT f BOOLEAN)
+LANGUAGE plpgsql AS $$
+DECLARE
+  n INTEGER;
+  k INTEGER := 0;
+  id INTEGER;
+  first VARCHAR(16);
+BEGIN
+  SELECT count(c_id) INTO n FROM customer WHERE c_last = name;
+  seen := 0;
+  FOR id, first IN SELECT c_id, c_first FROM customer WHERE c_last = name ORDER BY c_first LOOP
+    k := k + 1;
+    UPDATE customer SET c_balance = c_balance + 1 WHERE c_id = id;  -- the loop's rows stay as they ran
+    seen := seen + 1;
+    IF k = (n + 1) / 2 THEN
+      pick := id;
+      EXIT;
+    END IF;
+  END LOOP;
+  f := FOUND;
+END $$)");
+  // BAR by c_first: ann (2), bob (5), cat (4), dan (1), eve (6); n = 5, position 3: cat.
+  CHECK(db->call("middle", {text("BAR"), Value{}, Value{}, Value{}}).rows == Grid{{i(4), i(3), Value{true}}});
+  CHECK(db->execute("SELECT c_id FROM customer WHERE c_balance = 1 ORDER BY c_id").rows == Grid{{i(2)}, {i(4)}, {i(5)}});
+  CHECK(db->call("middle", {text("OUGHT"), Value{}, Value{}, Value{}}).rows == Grid{{i(3), i(1), Value{true}}});
+  // No row: the body never runs, and FOUND is false.
+  CHECK(db->call("middle", {text("NONE"), Value{}, Value{}, Value{}}).rows == Grid{{Value{}, i(0), Value{false}}});
+  // A FOR over a statement that returns no rows is refused at the call.
+  (void)db->execute("CREATE PROCEDURE bad() LANGUAGE plpgsql AS $$ DECLARE x INTEGER; BEGIN "
+                    "FOR x IN UPDATE customer SET c_balance = 0 WHERE c_id = 1 LOOP NULL; END LOOP; END $$");
+  try {
+    (void)db->call("bad", {});
+    FAIL("ran");
+  } catch (const ast::SqlError& e) {
+    CHECK(std::string{e.sqlstate()} == "42601");
+  }
+}
