@@ -281,9 +281,10 @@ PostgreSQL uses.
   The global cap can't count this. The pinned nodes are the engine's,
   shared by every snapshot of the same age, and not any one session's. The
   idle-in-transaction timeout bounds the case where a snapshot is pinned
-  for nothing; exposing `keydir_nodes_parked`, `keydir_versions_live` and
-  the oldest open snapshot's age is tracked with the server's operational
-  counters (#496).
+  for nothing. `pg_stat_bytecask` (`server_design.md`, *Reading the counters*)
+  gives `bytecask.keydir_nodes_parked` and `bytecask.keydir_versions_live`; the
+  oldest open snapshot's age is tracked with the server's operational counters
+  (#496).
 
 ## Background vacuum
 
@@ -481,5 +482,4 @@ The owner's, in the discussions of 2026-10-24 and 2026-10-25:
 9. libuv comes from xmake's `libuv` package on `sql_layer_server`.
 10. The idle-in-transaction timeout is 60 seconds by default
     (`--idle-in-transaction-timeout-ms 60000`), and `0` turns it off.
-    Reporting the engine's parked key-directory counters is tracked with
-    #496.
+    `pg_stat_bytecask` reports the engine's parked key-directory counters.

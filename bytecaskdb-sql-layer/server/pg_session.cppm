@@ -168,13 +168,22 @@ struct TransactionModes {
 // A statement's text as the session takes it: nothing, a transaction
 // control word, or a statement for the layer.
 struct Classified {
-  enum class Kind { Empty, Control, Sql, Cursor } kind{Kind::Empty};
+  // Call: CALL of a procedure. Stat: the one pg_stat_database query HammerDB's
+  // monitor sends (docs/procedures_design.md, *Wire protocol for CALL*).
+  // Stats: the one query of pg_stat_bytecask (docs/server_design.md, *Reading
+  // the counters*).
+  enum class Kind { Empty, Control, Sql, Cursor, Call, Stat, Stats } kind{Kind::Empty};
   Control control{Control::Begin};
   std::string sql;       // Sql: the one statement, without its trailing ';'
   std::string encoding;  // SetEncoding: PostgreSQL's name for it
   TransactionModes modes;  // SetTransaction
   std::optional<ast::CursorStatement> cursor;  // Cursor: DECLARE, FETCH, MOVE or CLOSE
+  std::optional<ast::Call> call;               // Call
 };
+
+// HammerDB's monitor reads its transaction count with this query alone,
+// compared without white space and case.
+constexpr std::string_view kTransactionCountQuery = "SELECTSUM(XACT_COMMIT+XACT_ROLLBACK)FROMPG_STAT_DATABASE";
 
 auto upper_words(std::string_view s) -> std::vector<std::string> {
   std::vector<std::string> out;
@@ -206,6 +215,21 @@ auto first_statement(std::string_view s, bool& rest_blank) -> std::size_t {
       auto close = s.find("*/", k + 2);
       k = close == std::string_view::npos ? s.size() : close + 2;
       return true;
+    }
+    // A dollar-quoted string, $$…$$ or $tag$…$tag$, as a procedure's body is
+    // written. A '$' inside a name (a$b) or before a digit ($1) opens none.
+    auto ident = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' || c == '$'; };
+    if (s[k] == '$' && (k == 0 || !ident(s[k - 1]))) {
+      auto t = k + 1;
+      if (t < s.size() && std::isdigit(static_cast<unsigned char>(s[t])) == 0) {
+        while (t < s.size() && s[t] != '$' && ident(s[t])) ++t;
+      }
+      if (t < s.size() && s[t] == '$') {
+        auto tag = s.substr(k, t + 1 - k);
+        auto close = s.find(tag, t + 1);
+        k = close == std::string_view::npos ? s.size() : close + tag.size();
+        return true;
+      }
     }
     if (s[k] == '\'' || s[k] == '"') {
       auto q = s[k];
@@ -368,9 +392,27 @@ auto classify(std::string_view text, const char* several_state, std::string_view
       return {Classified::Kind::Control, Control::SetEncoding, {}, std::string{*encoding}};
     }
   }
+  if (w == "CALL" || w.starts_with("CALL(")) {
+    out.kind = Classified::Kind::Call;
+    out.call = ast::parse_call(sql);
+    out.sql = std::string{sql};
+    return out;
+  }
+  {
+    std::string squeezed;
+    for (const auto& word : words) squeezed += word;
+    if (squeezed == kTransactionCountQuery) {
+      out.kind = Classified::Kind::Stat;
+      return out;
+    }
+  }
   if (w == "DECLARE" || w == "FETCH" || w == "MOVE" || w == "CLOSE") {
     out.kind = Classified::Kind::Cursor;
     out.cursor = ast::parse_cursor(sql);
+    return out;
+  }
+  if (words == std::vector<std::string>{"SELECT", "*", "FROM", "PG_STAT_BYTECASK"}) {
+    out.kind = Classified::Kind::Stats;
     return out;
   }
   for (const auto* word : {"SET", "SHOW", "RESET", "PREPARE", "EXECUTE", "DEALLOCATE", "SAVEPOINT", "RELEASE", "COPY",
@@ -395,6 +437,8 @@ auto command_name(Command c) -> std::string_view {
     case Command::AlterTable: return "ALTER TABLE";
     case Command::CreateView: return "CREATE VIEW";
     case Command::DropView: return "DROP VIEW";
+    case Command::CreateProcedure: return "CREATE PROCEDURE";
+    case Command::DropProcedure: return "DROP PROCEDURE";
   }
   return {};
 }
@@ -412,6 +456,8 @@ auto command_tag(Command c, const Rows& r) -> std::string {
     case Command::AlterTable: return "ALTER TABLE";
     case Command::CreateView: return "CREATE VIEW";
     case Command::DropView: return "DROP VIEW";
+    case Command::CreateProcedure: return "CREATE PROCEDURE";
+    case Command::DropProcedure: return "DROP PROCEDURE";
   }
   return {};
 }
@@ -1191,6 +1237,29 @@ private:
     return cols;
   }
 
+  static auto stats_columns() -> std::vector<ResultColumn> {
+    return {{"name", SqlType{SqlKind::Text}}, {"value", SqlType{SqlKind::BigInt}}};
+  }
+
+  // pg_stat_bytecask's rows, by name. Live values: no plan, snapshot or
+  // transaction is involved, so a block's statements see them move.
+  auto stats_rows() -> Rows {
+    Rows out{.columns = {"name", "value"}, .types = {SqlType{SqlKind::Text}, SqlType{SqlKind::BigInt}}};
+    for (const auto& [name, value] : db_.stats()) {
+      auto bytes = std::as_bytes(std::span{name});
+      out.rows.push_back({Bytes(bytes.begin(), bytes.end()), value});
+    }
+    return out;
+  }
+
+  void reply_stats(bool describe_it) {
+    refuse_if_failed();
+    auto rows = stats_rows();
+    if (describe_it) row_description(stats_columns());
+    data_rows(rows);
+    complete(command_tag(Command::Select, rows));
+  }
+
   // ------------------------------------------------------------ messages
 
   // A Query inside an extended block, before its Sync, joins the block's
@@ -1215,6 +1284,22 @@ private:
           break;
         }
         case Classified::Kind::Control: complete(run_control(c.control, c.encoding, c.modes)); break;
+        case Classified::Kind::Stats: reply_stats(true); break;
+        case Classified::Kind::Call: run_call(c); break;
+        case Classified::Kind::Stat: {
+          // xact_commit + xact_rollback, a numeric as PostgreSQL's sum of bigints is.
+          auto counts = db_.transaction_counts();
+          auto text = std::to_string(counts.committed + counts.rolled_back);
+          Rows r;
+          r.columns = {"sum"};
+          r.types = {SqlType{SqlKind::Numeric}};
+          r.rows.push_back({Value{Bytes(reinterpret_cast<const std::byte*>(text.data()),
+                                        reinterpret_cast<const std::byte*>(text.data()) + text.size())}});
+          row_description(result_columns(r));
+          data_rows(r);
+          complete("SELECT 1");
+          break;
+        }
         case Classified::Kind::Sql: {
           last_text_ = c.sql;
           refuse_sql_if_failed(c.sql);
@@ -1288,7 +1373,11 @@ private:
     }
     last_text_ = text;
     auto c = classify(text, "42601", "cannot insert multiple commands into a prepared statement");
+    if (c.kind == Classified::Kind::Call || c.kind == Classified::Kind::Stat) {
+      throw SessionError("this statement runs as a simple Query, not as a prepared statement", "0A000");
+    }
     Prepared p{c.kind, c.control, c.encoding, c.modes, nullptr, std::move(c.cursor)};
+    if (c.kind == Classified::Kind::Stats) refuse_if_failed();
     if (c.kind == Classified::Kind::Cursor) {
       refuse_if_failed();
       p.stmt = prepare_cursor(*p.cursor);
@@ -1332,7 +1421,9 @@ private:
                              statement + "\" requires " + std::to_string(infos.size()),
                          "08P01");
     }
-    if (p.kind == Classified::Kind::Sql || p.kind == Classified::Kind::Cursor) refuse_if_failed();
+    if (p.kind == Classified::Kind::Sql || p.kind == Classified::Kind::Cursor || p.kind == Classified::Kind::Stats) {
+      refuse_if_failed();
+    }
     Portal out{p, {}};
     for (std::int16_t i = 0; i < n; ++i) {
       auto len = body.i32();
@@ -1355,6 +1446,10 @@ private:
   }
 
   void describe_result(const Prepared& p) {
+    if (p.kind == Classified::Kind::Stats) {
+      row_description(stats_columns());
+      return;
+    }
     if (p.kind == Classified::Kind::Cursor) {
       // A FETCH describes its cursor's columns once the cursor exists; a MOVE, DECLARE and CLOSE return no rows.
       const auto* f = std::get_if<ast::FetchCursor>(&*p.cursor);
@@ -1443,6 +1538,10 @@ private:
       complete(run_control(control, encoding, modes));
       return true;
     }
+    if (p.kind == Classified::Kind::Stats) {
+      reply_stats(false);
+      return true;
+    }
     if (p.kind == Classified::Kind::Cursor) {
       last_text_ = p.stmt != nullptr ? p.stmt->sql() : std::string{};
       auto reply = run_cursor(*p.cursor, p.stmt, portal.params);
@@ -1502,6 +1601,32 @@ private:
 
   // A statement about to run in a block: a read-only one takes only a SELECT
   // (25006), as PostgreSQL does; SELECT … FOR UPDATE is not told apart from it.
+  // CALL name(args): its arguments bound to the procedure's types, run in
+  // the block's transaction or in one of its own, and answered with the
+  // INOUT and OUT values as one row, then the tag CALL.
+  void run_call(const Classified& c) {
+    last_text_ = c.sql;
+    if (in_block_ && failed_) (void)ast::parse_call(c.sql);  // a syntax error reports that, not 25P02
+    refuse_if_failed();
+    if ((in_block_ || implicit_) && read_only_) throw SessionError("cannot execute CALL in a read-only transaction", "25006");
+    if (in_block_ || implicit_) block_used_ = true;
+    auto cat = db_.catalog();
+    const auto* def = cat->procedure(c.call->procedure);
+    if (def == nullptr) {
+      throw ast::SqlError{"procedure " + c.call->procedure + " does not exist", c.call->pos, kUndefinedFunction};
+    }
+    auto args = bound::call_arguments(*c.call, *def);
+    auto opts = run_options();
+    auto rows = in_block_  ? txn_->call(def->name, args, opts)
+                : implicit_ ? implicit_->call(def->name, args, opts)
+                            : db_.call(def->name, args, opts);
+    if (!rows.columns.empty()) {
+      row_description(result_columns(rows));
+      data_rows(rows);
+    }
+    complete("CALL");
+  }
+
   void enter_statement(const Statement& stmt) {
     if (!in_block_ && !implicit_) return;
     if (read_only_ && stmt.command() != Command::Select) {

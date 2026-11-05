@@ -152,8 +152,6 @@
 
 - name: concatenation with ||
   features: [E021-07]
-  # || of a column (#667)
-  unimplemented: true
   ordered: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR(20))
@@ -251,8 +249,6 @@
 
 - name: SUBSTRING from a position, with a length
   features: [E021-06]
-  # SUBSTRING of a column (#667)
-  unimplemented: true
   ordered: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR(20))

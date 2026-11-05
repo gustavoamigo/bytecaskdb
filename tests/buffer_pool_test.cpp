@@ -5,7 +5,9 @@
 // IoBackend::BufferPool. See docs/buffer_pool_design.md.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -30,12 +32,13 @@ namespace {
 // A scratch file of deterministic bytes, plus an fd open on it.
 class ScratchFile {
 public:
-  explicit ScratchFile(std::size_t size) : size_{size} {
+  explicit ScratchFile(std::size_t size, std::uint64_t seed = 0xC0FFEE)
+      : size_{size} {
     path_ = std::filesystem::temp_directory_path() /
             ("bc_pool_" + std::to_string(::getpid()) + "_" +
              std::to_string(next_id()) + ".bin");
     bytes_.resize(size);
-    std::mt19937_64 rng{0xC0FFEE};
+    std::mt19937_64 rng{seed};
     for (auto &b : bytes_) {
       b = static_cast<std::byte>(rng() & 0xFF);
     }
@@ -62,6 +65,9 @@ public:
 
   [[nodiscard]] auto fd() const noexcept -> bytecask::PoolFile {
     return {.buffered = fd_, .direct = direct_fd_};
+  }
+  [[nodiscard]] auto sealed() const noexcept -> bytecask::PoolFile {
+    return {.buffered = fd_, .direct = direct_fd_, .sealed = true};
   }
   [[nodiscard]] auto size() const noexcept -> std::size_t { return size_; }
   // The oracle: what a correct read of [offset, offset+len) must return.
@@ -197,9 +203,11 @@ TEST_CASE("BufferPool: reads spanning frames are served whole",
   CHECK(pool.counters().hits.load() == 1);  // every covered frame was resident
 }
 
-TEST_CASE("BufferPool: a short tail frame is correct but never admitted",
+TEST_CASE("BufferPool: an active file's short tail frame is correct but never "
+          "admitted",
           "[buffer_pool]") {
-  // Final frame is partial, so it must be served without being cached.
+  // Final frame is partial and the file may still grow, so it must be served
+  // without being cached (docs/buffer_pool_design.md, §3).
   ScratchFile file{bytecask::kPoolFrameBytes + 100};
   bytecask::BufferPool pool{
       bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}, kScratchBytes};
@@ -589,7 +597,7 @@ TEST_CASE("BufferPool: a block is clipped to the file and its short tail",
   CHECK(got == file.expected(offset, got.size()));
   CHECK(pool.counters().fills.load() == static_cast<std::int64_t>(kTailFrames));
 
-  // The partial frame is served every time and never admitted.
+  // Not sealed: the partial frame is served every time and never admitted.
   const std::size_t tail =
       bytecask::kPoolFillBlockBytes + kTailFrames * bytecask::kPoolFrameBytes + 20;
   for (int i = 0; i < 2; ++i) {
@@ -638,6 +646,155 @@ TEST_CASE("BufferPool: a file that ends below the size it was given",
                        got.data()) == 0);
   CHECK(pool.counters().fills.load() ==
         static_cast<std::int64_t>(kWholeFrames));
+}
+
+// docs/buffer_pool_design.md, §3: a sealed file's short last frame.
+TEST_CASE("BufferPool: a sealed file's short last frame is admitted, and a "
+          "second read is a hit",
+          "[buffer_pool]") {
+  ScratchFile file{bytecask::kPoolFrameBytes + 100};
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}, kScratchBytes};
+
+  const std::size_t offset = bytecask::kPoolFrameBytes + 10;
+  std::vector<std::byte> got(50);
+  pool.read_at(1, file.sealed(), offset, got.size(), file.size(), got.data());
+  CHECK(got == file.expected(offset, got.size()));
+  CHECK(pool.counters().misses.load() == 1);
+  CHECK(pool.counters().fills.load() == 2);  // the whole frame and the short one
+
+  std::fill(got.begin(), got.end(), std::byte{0});
+  pool.read_at(1, file.sealed(), offset, got.size(), file.size(), got.data());
+  CHECK(got == file.expected(offset, got.size()));
+  CHECK(pool.counters().hits.load() == 1);
+  CHECK(pool.counters().misses.load() == 1);
+
+  // A read ending exactly at the end of the file is below the bound.
+  const auto last_bytes = file.size() - offset;
+  got.assign(last_bytes, std::byte{0});
+  pool.read_at(1, file.sealed(), offset, got.size(), file.size(), got.data());
+  CHECK(got == file.expected(offset, last_bytes));
+  CHECK(pool.counters().hits.load() == 2);
+
+  // view lends what the file holds and no more.
+  bytecask::FrameLease lease;
+  const auto span = pool.view(1, offset, file.size(), lease);
+  REQUIRE(span.size() == last_bytes);
+  CHECK(std::equal(span.begin(), span.end(), got.begin()));
+  CHECK(pool.view(1, file.size(), file.size(), lease).empty());
+}
+
+// The bytes past the end of a short frame belong to its previous occupant.
+TEST_CASE("BufferPool: a read crossing a sealed file's end uses no frame",
+          "[buffer_pool]") {
+  ScratchFile previous{bytecask::kPoolFrameBytes, 0xBAD};
+  ScratchFile file{100};
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}, kScratchBytes};
+
+  // Leaves one frame on the free list, holding previous's bytes.
+  std::vector<std::byte> got(10);
+  pool.read_at(2, previous.sealed(), 0, got.size(), previous.size(), got.data());
+  pool.release_file(2, previous.size());
+  REQUIRE(pool.counters().frames_released.load() == 1);
+
+  pool.read_at(1, file.sealed(), 0, got.size(), file.size(), got.data());
+  pool.read_at(1, file.sealed(), 0, got.size(), file.size(), got.data());
+  REQUIRE(pool.counters().hits.load() == 1);  // the short frame is resident
+
+  constexpr auto kUntouched = std::byte{0xAA};
+  got.assign(50, kUntouched);
+  const std::size_t across = file.size() - 20;
+  CHECK(pool.read_upto(1, file.sealed(), across, got.size(), file.size(),
+                       got.data()) == 20);
+  CHECK(std::vector(got.begin(), got.begin() + 20) ==
+        file.expected(across, 20));
+  CHECK(std::all_of(got.begin() + 20, got.end(),
+                    [](auto b) { return b == kUntouched; }));
+  CHECK_THROWS_AS(pool.read_at(1, file.sealed(), across, got.size(),
+                               file.size(), got.data()),
+                  std::system_error);
+  CHECK(pool.read_upto(1, file.sealed(), file.size() + 10, got.size(),
+                       file.size(), got.data()) == 0);
+}
+
+// #246: the file can end below the size given. What comes back short is not
+// admitted, or the frame would lack bytes below the bound it was admitted under.
+TEST_CASE("BufferPool: a sealed file ending below its size admits no short frame",
+          "[buffer_pool]") {
+  const auto missing = GENERATE(std::size_t{10},  // ends inside the same frame
+                                3 * bytecask::kPoolFrameBytes);
+  CAPTURE(missing);
+  ScratchFile file{bytecask::kPoolFrameBytes + 100};
+  const auto stale_size = file.size() + missing;
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}, kScratchBytes};
+
+  const std::size_t offset = bytecask::kPoolFrameBytes + 10;
+  std::vector<std::byte> got(50);
+  for (int i = 0; i < 2; ++i) {
+    std::fill(got.begin(), got.end(), std::byte{0});
+    pool.read_at(1, file.sealed(), offset, got.size(), stale_size, got.data());
+    CHECK(got == file.expected(offset, got.size()));
+  }
+  CHECK(pool.counters().fills.load() == 1);  // the whole frame alone
+  CHECK(pool.counters().misses.load() == 2);
+  bytecask::FrameLease lease;
+  CHECK(pool.view(1, offset, stale_size, lease).empty());
+}
+
+TEST_CASE("BufferPool: release_file frees a sealed file's short last frame",
+          "[buffer_pool]") {
+  ScratchFile file{bytecask::kPoolFrameBytes + 100};
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}, kScratchBytes};
+  std::vector<std::byte> got(50);
+  pool.read_at(1, file.sealed(), bytecask::kPoolFrameBytes, got.size(),
+               file.size(), got.data());
+  REQUIRE(pool.counters().frames_resident.load() == 2);
+  pool.release_file(1, file.size());
+  CHECK(pool.counters().frames_released.load() == 2);
+  CHECK(pool.counters().frames_resident.load() == 0);
+}
+
+TEST_CASE("BufferPool: sealed short frames against pread under constant eviction",
+          "[buffer_pool][concurrency]") {
+  // Short last frames keep being evicted and refilled into frames that held
+  // the other file's bytes, with readers on every thread.
+  constexpr std::size_t kFile = 3 * 1024 * 1024 + 100;
+  ScratchFile a{kFile, 1};
+  ScratchFile b{kFile + 7, 2};
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes =
+                                      12 * bytecask::kPoolFillBlockBytes},
+      kScratchBytes};
+
+  std::atomic<int> mismatches{0};
+  std::vector<std::thread> readers;
+  for (std::uint64_t t = 0; t < 4; ++t) {
+    readers.emplace_back([&, t] {
+      std::mt19937_64 rng{t + 99};
+      std::vector<std::byte> got;
+      for (int i = 0; i < 3000; ++i) {
+        const auto use_a = (rng() & 1) == 0;
+        const auto &file = use_a ? a : b;
+        const auto len = static_cast<std::size_t>(1 + rng() % 90);
+        // Half the reads end in the short frame; the rest push others out.
+        const auto span = (rng() & 1) == 0 ? std::size_t{100}
+                                           : file.size();
+        const auto offset =
+            file.size() - len - static_cast<std::size_t>(rng() % (span - len));
+        got.assign(len, std::byte{0});
+        pool.read_at(use_a ? 1 : 2, file.sealed(), offset, len, file.size(),
+                     got.data());
+        if (got != file.expected(offset, len)) mismatches.fetch_add(1);
+      }
+    });
+  }
+  for (auto &r : readers) r.join();
+  CHECK(mismatches.load() == 0);
+  CHECK(pool.counters().evictions.load() > 0);
+  CHECK(pool.counters().hits.load() > 0);
 }
 
 TEST_CASE("BufferPool: a partial miss reads only the blocks it touches",

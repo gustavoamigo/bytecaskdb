@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # The SQL layer's HammerDB smoke (bytecaskdb-sql-layer/docs/server_design.md,
 # *Tests*): nightly, and on demand, never per pull request (owner,
-# 2026-10-22). hammerdb/run-gate.sh --smoke runs HammerDB's TPROC-C through
-# the layer's driver script against sql_layer_server, two warehouses, two
+# 2026-10-22). hammerdb/run-gate.sh --smoke runs HammerDB 6.0's TPROC-C through
+# hammerdb/bcdboltp.tcl, each transaction one CALL of a procedure of
+# hammerdb/tprocc_procs.sql, against sql_layer_server, two warehouses, two
 # users, one minute, and checks the consistency conditions on what it left;
-# then the same driver on PostgreSQL 17, which checks the driver itself.
+# then the same driver and procedures on PostgreSQL 17, which checks them.
 # Per pull request, sql-layer.yml runs the server's wire tests instead.
 
 name: SQL layer HammerDB nightly
@@ -22,7 +23,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  HAMMERDB_VERSION: "5.0"
+  HAMMERDB_VERSION: "6.0"
 
 jobs:
   hammerdb-smoke:
@@ -70,13 +71,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/HammerDB-${{ env.HAMMERDB_VERSION }}
-          key: hammerdb-${{ env.HAMMERDB_VERSION }}-lin-ubu22
+          key: hammerdb-${{ env.HAMMERDB_VERSION }}-lin-ubu24
 
       - name: Download HammerDB
         if: steps.hammerdb.outputs.cache-hit != 'true'
         run: |
           curl -fsSL -o /tmp/hammerdb.tgz \
-            "https://github.com/TPC-Council/HammerDB/releases/download/v${HAMMERDB_VERSION}/HammerDB-${HAMMERDB_VERSION}-Prod-Lin-UBU22.tar.gz"
+            "https://github.com/TPC-Council/HammerDB/releases/download/v${HAMMERDB_VERSION}/HammerDB-${HAMMERDB_VERSION}-Prod-Lin-UBU24.tar.gz"
           tar xzf /tmp/hammerdb.tgz -C ~
 
       - name: The HammerDB smoke

@@ -159,8 +159,15 @@ kind the transformer doesn't take is refused with its position.
   known without evaluating it (with a column among the branches this
   goes away: *Expressions over columns*). Float branches of constants are
   refused. The output column is named `case`, `coalesce` or `nullif`.
-- **`||` and the string functions** fold constants only (of a column, a
-  parameter or a subquery they are refused, 42601, until #671). The parser reads PostgreSQL's
+- **`||` and the string functions** fold constants. Of a column, a
+  parameter or a procedure's variable, `||` and `SUBSTRING` (and `substr`,
+  its call form) are select-list values built per row
+  (`Expr::Kind::Concat`, `Substr`; `bc_concat`, `bc_number_text`,
+  `bc_substr`): `||` of text with text, or with an integer or a `DECIMAL`
+  through its text as PostgreSQL prints it (`12.50`); `SUBSTRING(s FROM a
+  [FOR n])` in characters, as below. A `$n` beside `||` is `text`, as a
+  start or count `integer`. The other functions of non-constants are
+  refused (42601, #671). The parser reads PostgreSQL's
   spellings as the calls the grammar makes of them: `TRIM([LEADING |
   TRAILING | BOTH] [chars FROM] s)` is `ltrim`, `rtrim` or `btrim` (spaces
   by default), `POSITION(sub IN s)` is `position(s, sub)`, `SUBSTRING(s
@@ -187,6 +194,14 @@ kind the transformer doesn't take is refused with its position.
     a start below 1 is 22011, and a resume position past `integer` is
     22003.
   - `POSITION` of an empty substring is 1, of one not found 0.
+  - `random(lo, hi)` is PostgreSQL 17's: an integer drawn uniformly from
+    `lo` to `hi`, both included, anew at each evaluation (never folded);
+    `lo > hi` is 22023. `random()` of no arguments, a `double precision`,
+    is refused (42601).
+  - `TO_TIMESTAMP(s, 'YYYYMMDDHH24MISS')` is a `timestamptz` read in UTC,
+    the form HammerDB's driver sends (`procedures_design.md`, *Wire
+    protocol for `CALL`*); another format is refused (42601), and a string
+    that is not fourteen digits is 22007.
   - The output column is named as PostgreSQL names it: `?column?` for
     `||`, otherwise the function (`btrim` for `TRIM`).
   - Refused (42601): `SUBSTRING(s FROM 'pattern' [FOR 'escape'])`, the
@@ -463,6 +478,19 @@ EXISTS] name`:
   checks the tables a plan reads and not the views it came through
   (`Statement`'s plan records them, `bound::Bound::views`).
 
+**Procedures**, `CREATE [OR REPLACE] PROCEDURE name (args) LANGUAGE plpgsql
+AS …` and `DROP PROCEDURE [IF EXISTS] name [(argtype, …)]`
+(`procedures_design.md`):
+- **Parsed in two passes.** `pg_query_parse` gives the name, the arguments
+  and their modes; an argument's type is read as a column's is.
+  `pg_query_parse_plpgsql` checks the body's syntax (42601). The SQL in the
+  body is not bound, so it may name a table that does not exist yet.
+- **Refused (0A000):** `CREATE FUNCTION`, a language other than `plpgsql`,
+  `BEGIN ATOMIC`, any option, `VARIADIC`, an unnamed argument, a `DEFAULT`,
+  and `CALL`, until the runtime runs procedures. No language is 42P13.
+- **`DROP PROCEDURE`'s list** is read as libpg_query gives it: the types,
+  without those marked `OUT`.
+
 **Refused**, with a message and the node's position: everything not above.
 That includes:
 - `ILIKE`, `IS DISTINCT FROM`, and a predicate in `HAVING`;
@@ -482,9 +510,10 @@ That includes:
 - the quotient of a numeric other than constants, `%`, arithmetic and
   comparison of `REAL` and `DOUBLE PRECISION` as values, an expression in
   `ORDER BY`, `GROUP BY`, `SET` or an aggregated select list (#685, #686);
-- `||` and the string functions of columns and parameters, `LENGTH`,
-  `CONCAT`, `REPLACE`, the regular-expression `SUBSTRING`, `bytea` string
-  functions (#671);
+- the string functions but `||` and `SUBSTRING` of columns and
+  parameters, `||` of a boolean, float or date value, `LENGTH`, `CONCAT`,
+  `REPLACE`, the regular-expression `SUBSTRING`, `bytea` string functions
+  (#671);
 - a cast of anything but a string literal or `NULL`, a numeric literal of
   more than 18 digits, a string literal in arithmetic, unary `-` of
   anything but a constant, and a constant beside an aggregate.

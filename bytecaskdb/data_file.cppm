@@ -468,7 +468,7 @@ public:
   [[nodiscard]] auto fetch_upto(int fd, Offset offset, std::size_t len,
                                 Offset logical_end, std::byte *dst) const
       -> std::size_t {
-    return pool_->read_upto(file_id_, PoolFile{.buffered = fd, .direct = -1},
+    return pool_->read_upto(file_id_, PoolFile{.buffered = fd, .direct = -1, .sealed = false},
                             offset, len, logical_end, dst);
   }
 
@@ -1630,7 +1630,7 @@ private:
   void fetch(Offset offset, std::size_t len, std::byte *dst,
              Source source) const {
     if (source == Source::Pool) {
-      pool_->read_at(file_id_, PoolFile{.buffered = fd_, .direct = direct_fd_},
+      pool_->read_at(file_id_, PoolFile{.buffered = fd_, .direct = direct_fd_, .sealed = true},
                      offset, len, file_size_, dst);
       return;
     }

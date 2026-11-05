@@ -2022,8 +2022,8 @@ TEST_CASE("embedded API: || and the string functions of constants fold as Postgr
   (void)db->execute("INSERT INTO sf VALUES (1, 'ab' || 'c')");
   (void)db->execute("INSERT INTO sf VALUES (2, UPPER('x'))");
   CHECK(db->execute("SELECT v FROM sf WHERE v = LOWER('ABC')").rows == Grid{{text("abc")}});
-  // Of a column, a parameter: not supported yet.
-  CHECK(state("SELECT v || 'x' FROM sf") == "42601");
+  // || of a column is built (below, "|| and SUBSTRING of columns"); the other functions of a column are not yet.
+  CHECK(db->execute("SELECT v || 'x' FROM sf WHERE id = 1").rows == Grid{{text("abcx")}});
   CHECK(state("SELECT UPPER(v) FROM sf") == "42601");
   CHECK(state("SELECT id FROM sf WHERE UPPER(v) = 'ABC'") == "42601");
 }
@@ -2725,4 +2725,390 @@ TEST_CASE("embedded API: a cancel flag or a passed deadline fails a statement wi
   CHECK(t.is_aborted());
   CHECK_THROWS_AS(t.execute(kById, {i(1)}), TransactionAborted);
   CHECK(t.commit() == CommitOutcome::RolledBack);
+}
+
+TEST_CASE("embedded API: CREATE and DROP PROCEDURE are DDL, kept in the catalog with PostgreSQL's SQLSTATEs",
+          "[sql][api][procedure]") {
+  sql_test::TempDir dir{"api_procedure"};
+  auto state = [](Database& db, std::string_view sql) -> std::string {
+    try {
+      (void)db.execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return std::string{"ran"};
+  };
+  auto neword = std::string{
+      "CREATE PROCEDURE neword(no_w_id INTEGER, INOUT no_c_last VARCHAR(16), OUT total NUMERIC(12, 2)) "
+      "LANGUAGE plpgsql AS $$ BEGIN SELECT c_last INTO no_c_last FROM customer WHERE c_w_id = no_w_id; END $$"};
+  {
+    auto db = Database::open(dir.path());
+    CHECK(db->prepare(neword).command() == Command::CreateProcedure);
+    CHECK(db->prepare("DROP PROCEDURE neword").command() == Command::DropProcedure);
+    CHECK(state(*db, neword) == "ran");  // the table it names need not exist
+    CHECK(db->catalog()->procedure("neword")->definition == neword);
+    CHECK(state(*db, neword) == "42723");
+    CHECK(state(*db, "CREATE PROCEDURE p(a INT, a INT) LANGUAGE plpgsql AS $$ BEGIN END $$") == "42P13");
+    CHECK(state(*db, "CREATE PROCEDURE p(a NUMERIC) LANGUAGE plpgsql AS $$ BEGIN END $$") == "42601");  // no precision
+    CHECK(state(*db, "CREATE PROCEDURE p(a INT) LANGUAGE plpgsql AS $$ BEGIN IF END $$") == "42601");
+    CHECK(state(*db, "CREATE OR REPLACE PROCEDURE neword(no_w_id BIGINT, INOUT no_c_last VARCHAR(16), OUT total "
+                     "NUMERIC(12, 2)) LANGUAGE plpgsql AS $$ BEGIN END $$") == "0A000");  // an overload
+    CHECK(state(*db, "CALL neword(1, 'x', NULL)") == "0A000");
+    CHECK(state(*db, "CREATE TABLE neword (id INTEGER PRIMARY KEY)") == "ran");  // its own namespace
+    {
+      auto txn = db->begin();
+      CHECK_THROWS_AS(txn.execute("DROP PROCEDURE neword"), FeatureNotSupported);  // DDL, refused in a block
+      txn.rollback();
+    }
+  }
+  {
+    auto db = Database::open(dir.path());
+    REQUIRE(db->catalog()->procedure("neword") != nullptr);
+    CHECK(state(*db, "DROP PROCEDURE neword(TEXT)") == "42883");
+    CHECK(state(*db, "DROP PROCEDURE IF EXISTS neword(TEXT)") == "ran");
+    CHECK(state(*db, "DROP PROCEDURE neword(INTEGER, VARCHAR, NUMERIC)") == "ran");  // every argument's type
+    CHECK(db->catalog()->procedure("neword") == nullptr);
+    CHECK(state(*db, "DROP PROCEDURE neword") == "42883");
+    CHECK(state(*db, "DROP PROCEDURE IF EXISTS neword") == "ran");
+    CHECK(db->catalog()->table("neword") != nullptr);
+  }
+}
+
+TEST_CASE("embedded API: a procedure runs its statements in one transaction, each seeing the ones before",
+          "[sql][api][procedure]") {
+  sql_test::TempDir dir{"api_procedure_run"};
+  auto db = Database::open(dir.path());
+  auto run = [&](std::string_view sql) { return db->execute(sql).rows; };
+  (void)run("CREATE TABLE stock (id INTEGER PRIMARY KEY, qty INTEGER, name VARCHAR(10))");
+  (void)run("CREATE TABLE orders (id INTEGER PRIMARY KEY, item INTEGER, amount INTEGER)");
+  (void)run("INSERT INTO stock VALUES (1, 10, 'a')");
+  (void)run("INSERT INTO stock VALUES (2, 20, 'b')");
+  (void)run("INSERT INTO stock VALUES (3, 30, 'c')");
+  (void)run(R"(CREATE PROCEDURE take(o_id INTEGER, n INTEGER, INOUT total INTEGER, OUT last_name VARCHAR(10))
+LANGUAGE plpgsql AS $$
+DECLARE
+  q INTEGER;
+  k INTEGER := 0;
+BEGIN
+  total := 0;
+  FOR i IN 1..n LOOP
+    SELECT qty, name INTO q, last_name FROM stock WHERE id = i;
+    IF q > 15 THEN
+      UPDATE stock SET qty = qty - 1 WHERE id = i;
+      SELECT qty INTO q FROM stock WHERE id = i;   -- sees the update
+      UPDATE stock SET qty = qty - 1 WHERE id = i; -- a second write of the row
+    ELSE
+      k := k + 1;
+    END IF;
+    total := total + q;
+  END LOOP;
+  INSERT INTO orders VALUES (o_id, n, total);
+  IF NOT FOUND THEN
+    total := -1;
+  END IF;
+END $$)");
+  auto out = db->call("take", {i(7), i(3), Value{}, Value{}});
+  CHECK(out.columns == std::vector<std::string>{"total", "last_name"});
+  // 10 + (20 - 1) + (30 - 1); the last row read is 'c'.
+  CHECK(out.rows == Grid{{i(58), Value{sql_test::bytes("c")}}});
+  CHECK(run("SELECT qty FROM stock ORDER BY id") == Grid{{i(10)}, {i(18)}, {i(28)}});
+  CHECK(run("SELECT item, amount FROM orders WHERE id = 7") == Grid{{i(3), i(58)}});
+
+  // A failed statement aborts the procedure, and its transaction keeps nothing.
+  CHECK_THROWS_AS(db->call("take", {i(7), i(1), Value{}, Value{}}), ExecError);  // 7 is in orders: 23505
+  CHECK(run("SELECT qty FROM stock ORDER BY id") == Grid{{i(10)}, {i(18)}, {i(28)}});
+  // Inside a transaction, the procedure's writes are the transaction's.
+  {
+    auto t = db->begin();
+    auto r = t.call("take", {i(8), i(2), Value{}, Value{}});
+    CHECK(r.rows == Grid{{i(27), Value{sql_test::bytes("b")}}});  // 10 + (18 - 1)
+    CHECK(t.execute("SELECT qty FROM stock WHERE id = 2").rows == Grid{{i(16)}});
+    t.rollback();
+  }
+  CHECK(run("SELECT qty FROM stock WHERE id = 2") == Grid{{i(18)}});
+}
+
+TEST_CASE("embedded API: a procedure's errors are PostgreSQL's, found at CREATE or at the call", "[sql][api][procedure]") {
+  sql_test::TempDir dir{"api_procedure_errors"};
+  auto db = Database::open(dir.path());
+  auto state = [&](auto&& f) -> std::string {
+    try {
+      f();
+    } catch (const std::exception& e) {
+      UNSCOPED_INFO(e.what());
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  auto ddl = [&](std::string_view sql) { return state([&] { (void)db->execute(sql); }); };
+  auto call = [&](std::string_view name, std::vector<Value> args) { return state([&] { (void)db->call(name, args); }); };
+  (void)db->execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, s TEXT)");
+  (void)db->execute("INSERT INTO t VALUES (1, 10, 'x')");
+  (void)db->execute("INSERT INTO t VALUES (2, 10, 'y')");
+  auto proc = [](std::string_view name, std::string_view args, std::string_view body) {
+    return "CREATE PROCEDURE " + std::string{name} + "(" + std::string{args} + ") LANGUAGE plpgsql AS $$ " +
+           std::string{body} + " $$";
+  };
+  // STRICT: no row is P0002, a second row P0003; without STRICT the first row, or NULLs.
+  CHECK(ddl(proc("one", "k INTEGER, INOUT r INTEGER", "BEGIN SELECT v INTO STRICT r FROM t WHERE id = k; END")) == "ran");
+  CHECK(db->call("one", {i(1), Value{}}).rows == Grid{{i(10)}});
+  CHECK(call("one", {i(9), Value{}}) == "P0002");
+  CHECK(ddl(proc("many", "INOUT r INTEGER", "BEGIN SELECT v INTO STRICT r FROM t WHERE v = 10; END")) == "ran");
+  CHECK(call("many", {Value{}}) == "P0003");
+  CHECK(ddl(proc("loose", "k INTEGER, INOUT r INTEGER, INOUT f BOOLEAN",
+                 "BEGIN SELECT v INTO r FROM t WHERE id = k; f := FOUND; END")) == "ran");
+  CHECK(db->call("loose", {i(9), i(5), Value{}}).rows == Grid{{Value{}, Value{false}}});
+  CHECK(db->call("loose", {i(2), Value{}, Value{}}).rows == Grid{{i(10), Value{true}}});
+  // A name that is a variable and a column of the statement's table: 42702, at the call (bodies bind there).
+  CHECK(ddl(proc("clash", "v INTEGER", "BEGIN UPDATE t SET s = 'z' WHERE id = v; END")) == "ran");
+  CHECK(call("clash", {i(1)}) == "42702");
+  // A column of the INSERT's target is no conflict: VALUES cannot name it.
+  CHECK(ddl(proc("ins", "id INTEGER, v INTEGER", "BEGIN INSERT INTO t VALUES (id, v, 'n'); END")) == "ran");
+  CHECK(call("ins", {i(3), i(30)}) == "ran");
+  CHECK(db->execute("SELECT v FROM t WHERE id = 3").rows == Grid{{i(30)}});
+  // A variable of another type than the column it meets.
+  CHECK(ddl(proc("typed", "k TEXT", "BEGIN UPDATE t SET v = 1 WHERE id = k; END")) == "ran");
+  CHECK(call("typed", {Value{sql_test::bytes("1")}}) == "42601");  // a form not built yet, as the binder refuses it
+  // Arithmetic past the variable's type, and a NULL FOR bound.
+  CHECK(ddl(proc("big", "INOUT x SMALLINT", "BEGIN x := x * 1000; END")) == "ran");
+  CHECK(call("big", {i(100)}) == "22003");
+  CHECK(ddl(proc("nullfor", "n INTEGER", "BEGIN FOR i IN 1..n LOOP NULL; END LOOP; END")) == "ran");
+  CHECK(call("nullfor", {Value{}}) == "22004");
+  // A condition that is not BOOLEAN, a SELECT with nowhere for its rows, EXIT outside a loop.
+  CHECK(ddl(proc("cond", "n INTEGER", "BEGIN IF n THEN NULL; END IF; END")) == "ran");
+  CHECK(call("cond", {i(1)}) == "42804");
+  CHECK(ddl(proc("nowhere", "n INTEGER", "BEGIN SELECT v FROM t; END")) == "ran");
+  CHECK(call("nowhere", {i(1)}) == "42601");
+  // Arguments: a procedure that does not exist, the wrong count or type, a value outside the type.
+  CHECK(call("nope", {}) == "42883");
+  CHECK(call("one", {i(1)}) == "08P01");
+  CHECK(call("one", {Value{sql_test::bytes("1")}, Value{}}) == "08P01");
+  CHECK(call("big", {i(40000)}) == "22003");
+  // WHILE and LOOP end on their own, and on EXIT and CONTINUE.
+  CHECK(ddl(proc("loops", "INOUT n INTEGER, INOUT c INTEGER",
+                 "BEGIN c := 0; WHILE n > 0 LOOP n := n - 1; CONTINUE WHEN n = 2; c := c + 1; END LOOP; "
+                 "LOOP c := c + 10; EXIT WHEN c > 30; END LOOP; END")) == "ran");
+  CHECK(db->call("loops", {i(5), Value{}}).rows == Grid{{i(0), i(34)}});
+  // A DDL since the last call: the procedure is compiled again.
+  (void)db->execute("ALTER TABLE t ADD COLUMN w INTEGER");
+  CHECK(db->call("one", {i(1), Value{}}).rows == Grid{{i(10)}});
+  (void)db->execute("DROP TABLE t");
+  CHECK(call("one", {i(1), Value{}}) == "42P01");
+}
+
+TEST_CASE("embedded API: a CALL that conflicts is run again from its arguments, as an autocommit statement is",
+          "[sql][api][procedure]") {
+  sql_test::TempDir dir{"api_procedure_retry"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE c (id INTEGER PRIMARY KEY, n INTEGER)");
+  (void)db->execute("INSERT INTO c VALUES (1, 0)");
+  (void)db->execute(R"(CREATE PROCEDURE bump(k INTEGER, INOUT seen INTEGER) LANGUAGE plpgsql AS $$
+BEGIN
+  SELECT n INTO seen FROM c WHERE id = k;
+  UPDATE c SET n = n + 1 WHERE id = k;
+END $$)");
+  // Another writer commits the row after the procedure's snapshot, `races` times.
+  auto races = 0;
+  auto racing = 0;
+  db->after_txn_pin_for_testing([&] {
+    if (racing >= races) return;
+    ++racing;
+    (void)db->execute("UPDATE c SET n = n + 100 WHERE id = 1");
+  });
+  races = 1;
+  // The first run conflicts; the second reads the other writer's row.
+  CHECK(db->call("bump", {i(1), Value{}}).rows == Grid{{i(100)}});
+  CHECK(db->execute("SELECT n FROM c").rows == Grid{{i(101)}});
+  // Conflicting on every attempt (the hook runs at each of its two statements): 40001, with
+  // nothing of the procedure written.
+  racing = 0;
+  races = 6;
+  try {
+    (void)db->call("bump", {i(1), Value{}});
+    FAIL("no conflict");
+  } catch (const SerializationFailure& e) {
+    CHECK(sqlstate(e) == "40001");
+  }
+  CHECK(racing == 6);
+  CHECK(db->execute("SELECT n FROM c").rows == Grid{{i(701)}});
+  // Inside a transaction the conflict is the client's: no rerun.
+  racing = 0;
+  races = 1;
+  auto t = db->begin();
+  CHECK(t.call("bump", {i(1), Value{}}).rows == Grid{{i(701)}});
+  CHECK_THROWS_AS(t.commit(), SerializationFailure);
+  CHECK(racing == 1);
+  db->after_txn_pin_for_testing({});
+}
+
+TEST_CASE("embedded API: transaction_counts counts each transaction once, an autocommit statement as one",
+          "[sql][api][procedure]") {
+  sql_test::TempDir dir{"api_transaction_counts"};
+  auto db = Database::open(dir.path());
+  auto before = db->transaction_counts();
+  CHECK(before.committed == 0);
+  CHECK(before.rolled_back == 0);
+  (void)db->execute("CREATE TABLE n (id INTEGER PRIMARY KEY)");      // committed
+  (void)db->execute("INSERT INTO n VALUES (1)");                     // committed
+  CHECK_THROWS(db->execute("INSERT INTO n VALUES (1)"));             // rolled back: 23505
+  {
+    auto t = db->begin();
+    (void)t.execute("INSERT INTO n VALUES (2)");
+    (void)t.commit();                                                // committed
+  }
+  {
+    auto t = db->begin();
+    (void)t.execute("INSERT INTO n VALUES (3)");
+    t.rollback();                                                    // rolled back
+  }
+  { auto t = db->begin(); }                                          // destroyed open: rolled back
+  auto after = db->transaction_counts();
+  CHECK(after.committed == 3);
+  CHECK(after.rolled_back == 3);
+}
+
+TEST_CASE("embedded API: FOR targets IN query runs the body per row of the query as it ran", "[sql][api][procedure]") {
+  sql_test::TempDir dir{"api_procedure_for_query"};
+  auto db = Database::open(dir.path());
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  (void)db->execute("CREATE TABLE customer (c_id INTEGER PRIMARY KEY, c_last VARCHAR(16), c_first VARCHAR(16), c_balance INTEGER)");
+  for (auto [id, last, first] : {std::tuple{1, "BAR", "dan"}, {2, "BAR", "ann"}, {3, "OUGHT", "zed"}, {4, "BAR", "cat"},
+                                 {5, "BAR", "bob"}, {6, "BAR", "eve"}}) {
+    (void)db->execute("INSERT INTO customer VALUES ($1, $2, $3, 0)", {i(id), text(last), text(first)});
+  }
+  // TPROC-C's customer by last name: the one at position ceil(n / 2) by c_first.
+  (void)db->execute(R"(CREATE PROCEDURE middle(name VARCHAR(16), INOUT pick INTEGER, INOUT seen INTEGER, INOUT f BOOLEAN)
+LANGUAGE plpgsql AS $$
+DECLARE
+  n INTEGER;
+  k INTEGER := 0;
+  id INTEGER;
+  first VARCHAR(16);
+BEGIN
+  SELECT count(c_id) INTO n FROM customer WHERE c_last = name;
+  seen := 0;
+  FOR id, first IN SELECT c_id, c_first FROM customer WHERE c_last = name ORDER BY c_first LOOP
+    k := k + 1;
+    UPDATE customer SET c_balance = c_balance + 1 WHERE c_id = id;  -- the loop's rows stay as they ran
+    seen := seen + 1;
+    IF k = (n + 1) / 2 THEN
+      pick := id;
+      EXIT;
+    END IF;
+  END LOOP;
+  f := FOUND;
+END $$)");
+  // BAR by c_first: ann (2), bob (5), cat (4), dan (1), eve (6); n = 5, position 3: cat.
+  CHECK(db->call("middle", {text("BAR"), Value{}, Value{}, Value{}}).rows == Grid{{i(4), i(3), Value{true}}});
+  CHECK(db->execute("SELECT c_id FROM customer WHERE c_balance = 1 ORDER BY c_id").rows == Grid{{i(2)}, {i(4)}, {i(5)}});
+  CHECK(db->call("middle", {text("OUGHT"), Value{}, Value{}, Value{}}).rows == Grid{{i(3), i(1), Value{true}}});
+  // No row: the body never runs, and FOUND is false.
+  CHECK(db->call("middle", {text("NONE"), Value{}, Value{}, Value{}}).rows == Grid{{Value{}, i(0), Value{false}}});
+  // A FOR over a statement that returns no rows is refused at the call.
+  (void)db->execute("CREATE PROCEDURE bad() LANGUAGE plpgsql AS $$ DECLARE x INTEGER; BEGIN "
+                    "FOR x IN UPDATE customer SET c_balance = 0 WHERE c_id = 1 LOOP NULL; END LOOP; END $$");
+  try {
+    (void)db->call("bad", {});
+    FAIL("ran");
+  } catch (const ast::SqlError& e) {
+    CHECK(std::string{e.sqlstate()} == "42601");
+  }
+}
+
+TEST_CASE("embedded API: concatenation and SUBSTRING of columns build text per row, as PostgreSQL's do", "[sql][api][procedure]") {
+  sql_test::TempDir dir{"api_string_columns"};
+  auto db = Database::open(dir.path());
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  (void)db->execute("CREATE TABLE s (id INTEGER PRIMARY KEY, name VARCHAR(10), amount DECIMAL(8,2), big BIGINT, ok BOOLEAN)");
+  (void)db->execute("INSERT INTO s VALUES (1, 'héllo', 12.5, -7, TRUE)");
+  (void)db->execute("INSERT INTO s VALUES (2, NULL, -0.05, 9000000000, FALSE)");
+  auto rows = db->execute("SELECT id || ' ' || name, name || amount, substring(name FROM 2 FOR 3), substr(name, 4), "
+                          "big || '|' || amount FROM s ORDER BY id");
+  CHECK(rows.columns == std::vector<std::string>{"?column?", "?column?", "substring", "substr", "?column?"});
+  CHECK(rows.rows == Grid{{text("1 héllo"), text("héllo12.50"), text("éll"), text("lo"), text("-7|12.50")},
+                          {Value{}, Value{}, Value{}, Value{}, text("9000000000|-0.05")}});
+  // A start before the first character counts toward the length; past the end, nothing.
+  CHECK(db->execute("SELECT substring(name FROM -1 FOR 4), substring(name FROM 9) FROM s WHERE id = 1").rows ==
+        Grid{{text("hé"), text("")}});
+  CHECK(db->execute("SELECT substring(name FROM 1 FOR 0) FROM s WHERE id = 1").rows == Grid{{text("")}});
+  CHECK(state("SELECT substring(name FROM 1 FOR -1) FROM s WHERE id = 1") == "22011");
+  CHECK(state("SELECT id || big FROM s") == "42883");          // no text operand
+  CHECK(state("SELECT name || ok FROM s") == "42601");         // a boolean's text: not built
+  CHECK(state("SELECT upper(name) FROM s") == "42601");        // the other functions of columns: #671
+  CHECK(state("SELECT substring(name FROM big) FROM s") == "42883");  // a bigint start
+}
+
+TEST_CASE("embedded API: a procedure builds text from its variables, as TPROC-C's Payment does", "[sql][api][procedure]") {
+  sql_test::TempDir dir{"api_procedure_strings"};
+  auto db = Database::open(dir.path());
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  (void)db->execute("CREATE TABLE customer (c_id INTEGER PRIMARY KEY, c_credit CHAR(2), c_data VARCHAR(500))");
+  (void)db->execute("CREATE TABLE history (h_id INTEGER PRIMARY KEY, h_data VARCHAR(24))");
+  (void)db->execute("INSERT INTO customer VALUES (1, 'BC', 'old data')");
+  (void)db->execute("INSERT INTO customer VALUES (2, 'GC', 'kept')");
+  (void)db->execute(R"(CREATE PROCEDURE pay(k INTEGER, d INTEGER, w INTEGER, amount NUMERIC(6,2), w_name VARCHAR(10),
+                         d_name VARCHAR(10), INOUT out_data VARCHAR(500))
+LANGUAGE plpgsql AS $$
+DECLARE
+  credit CHAR(2);
+  data VARCHAR(500);
+  h VARCHAR(24);
+BEGIN
+  h := w_name || '    ' || d_name;
+  INSERT INTO history VALUES (k, h);
+  SELECT c_credit, c_data INTO credit, data FROM customer WHERE c_id = k;
+  IF credit = 'BC' THEN
+    data := substr(k || ' ' || d || ' ' || w || ' ' || amount || ' | ' || data, 1, 20);
+    UPDATE customer SET c_data = data WHERE c_id = k;
+  END IF;
+  out_data := data;
+END $$)");
+  CHECK(db->call("pay", {i(1), i(3), i(7), Value{std::int64_t{1250}}, text("wh"), text("dist"), Value{}}).rows ==
+        Grid{{text("1 3 7 12.50 | old da")}});  // cut at 20 characters
+  CHECK(db->execute("SELECT c_data FROM customer WHERE c_id = 1").rows == Grid{{text("1 3 7 12.50 | old da")}});
+  CHECK(db->execute("SELECT h_data FROM history WHERE h_id = 1").rows == Grid{{text("wh    dist")}});
+  CHECK(db->call("pay", {i(2), i(3), i(7), Value{std::int64_t{100}}, text("wh"), text("dist"), Value{}}).rows ==
+        Grid{{text("kept")}});
+}
+
+TEST_CASE("embedded API: a procedure's assignment brings a number to the variable's scale, rounding half away from zero",
+          "[sql][api][procedure]") {
+  sql_test::TempDir dir{"api_procedure_rescale"};
+  auto db = Database::open(dir.path());
+  (void)db->execute(R"(CREATE PROCEDURE r(a NUMERIC(6, 3), n INTEGER, INOUT down NUMERIC(6, 2), INOUT up NUMERIC(8, 2),
+                         INOUT pick INTEGER) LANGUAGE plpgsql AS $$
+BEGIN
+  down := a * 1;
+  up := n;
+  pick := random(3, 3);
+END $$)");
+  auto call = [&](std::int64_t thousandths, std::int64_t n) {
+    return db->call("r", {Value{thousandths}, Value{n}, Value{}, Value{}, Value{}}).rows.at(0);
+  };
+  CHECK(call(1005, 7) == std::vector<Value>{Value{std::int64_t{101}}, Value{std::int64_t{700}}, Value{std::int64_t{3}}});
+  CHECK(call(-1005, -7).at(0) == Value{std::int64_t{-101}});  // -1.005 is -1.01
+  CHECK(call(1004, 0).at(0) == Value{std::int64_t{100}});
+  try {
+    (void)call(1000, 1'000'000);  // 1000000.00 is past NUMERIC(8, 2)
+    FAIL("ran");
+  } catch (const std::exception& e) {
+    CHECK(std::string{sqlstate(e)} == "22003");
+  }
+  (void)db->execute("CREATE PROCEDURE bad(INOUT x INTEGER) LANGUAGE plpgsql AS $$ BEGIN x := random(5, 1); END $$");
+  try {
+    (void)db->call("bad", {Value{}});
+    FAIL("ran");
+  } catch (const std::exception& e) {
+    CHECK(std::string{sqlstate(e)} == "22023");
+  }
 }
