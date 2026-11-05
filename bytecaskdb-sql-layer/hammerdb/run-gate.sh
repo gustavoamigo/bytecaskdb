@@ -49,7 +49,9 @@
 # (ignored by git), with the driver, the sync mode, the server's flags and the
 # data directory's size when the server stopped. A cell whose check fails, or whose run printed
 # no result, fails the script, whatever its NOPM. The build's output is
-# build.log in the data root.
+# build.log in the data root. Each cell also appends the engine's counters, as
+# the server held them when the driver ended, to
+# bytecaskdb-sql-layer/benchmarks/hammerdb_counters.csv.
 
 set -euo pipefail
 
@@ -235,6 +237,9 @@ result() {  # log -> "NOPM TPM" or nothing
   sed -n 's/.*System achieved \([0-9]*\) NOPM from \([0-9]*\) .* TPM.*/\1 \2/p' "$1" | tail -1
 }
 
+COUNTERS_CSV="$LAYER/benchmarks/hammerdb_counters.csv"
+mkdir -p "$(dirname "$COUNTERS_CSV")"
+[[ -f "$COUNTERS_CSV" ]] || echo "date,commit,warehouses,users,sync,name,value" >"$COUNTERS_CSV"
 # A checkout without .git (CI's, when git was not installed first) has
 # GITHUB_SHA instead.
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo "${GITHUB_SHA:0:7}")"
@@ -260,6 +265,13 @@ for vu in "${VU_LIST[@]}"; do
     echo "== $vu users, $WAREHOUSES warehouses, ${RAMPUP}+${DURATION} min, $sync"
     driver 127.0.0.1 "$port" tprocc tprocc "$WAREHOUSES" "$run" ByteCaskDB "$DATA_ROOT/driver.tcl"
     hammerdb "$DATA_ROOT/driver.tcl" "$port" "$vu" "$DATA_ROOT/hammerdb.log"
+    # A failed read loses this cell's counters and not its result.
+    if counters="$(python3 "$LAYER/hammerdb/read_counters.py" "$port" tprocc tprocc)"; then
+      stamp="$(date -u +%FT%TZ)"
+      sed "s|^|$stamp,$COMMIT,$WAREHOUSES,$vu,$sync,|" <<<"$counters" >>"$COUNTERS_CSV"
+    else
+      echo "   the counters could not be read" >&2
+    fi
     kill -TERM "$server"
     wait "$server" || { echo "sql_layer_server exited with $?" >&2; FAILED=1; }
     read -r nopm tpm <<<"$(result "$DATA_ROOT/hammerdb.log")" || true

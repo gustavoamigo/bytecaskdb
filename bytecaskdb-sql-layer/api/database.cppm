@@ -761,7 +761,7 @@ public:
   Database(const Database&) = delete;
   Database& operator=(const Database&) = delete;
 
-  // prepare, execute, begin, catalog and table_rows throw bytecask::DbClosed
+  // prepare, execute, begin, catalog, table_rows and stats throw bytecask::DbClosed
   // once close() was called, as the engine's calls do.
 
   // Parses, binds and (for DML) plans and compiles; cached by the exact text.
@@ -800,6 +800,10 @@ public:
   [[nodiscard]] auto compilations() const -> std::uint64_t { return compilations_.load(); }
   // The live catalog: the version DDL last published.
   [[nodiscard]] auto catalog() const -> std::shared_ptr<const Catalog>;
+  // The engine's operational counters and gauges by name, as DB::stats()
+  // gives them; the buffer pool's are all zero on a backend with no pool. Live
+  // values, not one atomic snapshot. Takes no lock another call waits on.
+  [[nodiscard]] auto stats() const -> std::map<std::string, std::int64_t>;
   // How many transactions have ended since open, committed or rolled back,
   // each autocommit statement and DDL counted as one, a failed one as
   // rolled back: what PostgreSQL's pg_stat_database counts as xact_commit
@@ -1402,6 +1406,11 @@ void Database::release_context(bc_ctx* cx) noexcept {
 auto Database::catalog() const -> std::shared_ptr<const Catalog> {
   auto lock = enter();
   return live_->current();
+}
+
+auto Database::stats() const -> std::map<std::string, std::int64_t> {
+  auto lock = enter();
+  return db_->stats();
 }
 
 auto Database::row_counts() const -> RowCounts {

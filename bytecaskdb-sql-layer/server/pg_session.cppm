@@ -170,7 +170,9 @@ struct TransactionModes {
 struct Classified {
   // Call: CALL of a procedure. Stat: the one pg_stat_database query HammerDB's
   // monitor sends (docs/procedures_design.md, *Wire protocol for CALL*).
-  enum class Kind { Empty, Control, Sql, Cursor, Call, Stat } kind{Kind::Empty};
+  // Stats: the one query of pg_stat_bytecask (docs/server_design.md, *Reading
+  // the counters*).
+  enum class Kind { Empty, Control, Sql, Cursor, Call, Stat, Stats } kind{Kind::Empty};
   Control control{Control::Begin};
   std::string sql;       // Sql: the one statement, without its trailing ';'
   std::string encoding;  // SetEncoding: PostgreSQL's name for it
@@ -407,6 +409,10 @@ auto classify(std::string_view text, const char* several_state, std::string_view
   if (w == "DECLARE" || w == "FETCH" || w == "MOVE" || w == "CLOSE") {
     out.kind = Classified::Kind::Cursor;
     out.cursor = ast::parse_cursor(sql);
+    return out;
+  }
+  if (words == std::vector<std::string>{"SELECT", "*", "FROM", "PG_STAT_BYTECASK"}) {
+    out.kind = Classified::Kind::Stats;
     return out;
   }
   for (const auto* word : {"SET", "SHOW", "RESET", "PREPARE", "EXECUTE", "DEALLOCATE", "SAVEPOINT", "RELEASE", "COPY",
@@ -1231,6 +1237,29 @@ private:
     return cols;
   }
 
+  static auto stats_columns() -> std::vector<ResultColumn> {
+    return {{"name", SqlType{SqlKind::Text}}, {"value", SqlType{SqlKind::BigInt}}};
+  }
+
+  // pg_stat_bytecask's rows, by name. Live values: no plan, snapshot or
+  // transaction is involved, so a block's statements see them move.
+  auto stats_rows() -> Rows {
+    Rows out{.columns = {"name", "value"}, .types = {SqlType{SqlKind::Text}, SqlType{SqlKind::BigInt}}};
+    for (const auto& [name, value] : db_.stats()) {
+      auto bytes = std::as_bytes(std::span{name});
+      out.rows.push_back({Bytes(bytes.begin(), bytes.end()), value});
+    }
+    return out;
+  }
+
+  void reply_stats(bool describe_it) {
+    refuse_if_failed();
+    auto rows = stats_rows();
+    if (describe_it) row_description(stats_columns());
+    data_rows(rows);
+    complete(command_tag(Command::Select, rows));
+  }
+
   // ------------------------------------------------------------ messages
 
   // A Query inside an extended block, before its Sync, joins the block's
@@ -1255,6 +1284,7 @@ private:
           break;
         }
         case Classified::Kind::Control: complete(run_control(c.control, c.encoding, c.modes)); break;
+        case Classified::Kind::Stats: reply_stats(true); break;
         case Classified::Kind::Call: run_call(c); break;
         case Classified::Kind::Stat: {
           // xact_commit + xact_rollback, a numeric as PostgreSQL's sum of bigints is.
@@ -1347,6 +1377,7 @@ private:
       throw SessionError("this statement runs as a simple Query, not as a prepared statement", "0A000");
     }
     Prepared p{c.kind, c.control, c.encoding, c.modes, nullptr, std::move(c.cursor)};
+    if (c.kind == Classified::Kind::Stats) refuse_if_failed();
     if (c.kind == Classified::Kind::Cursor) {
       refuse_if_failed();
       p.stmt = prepare_cursor(*p.cursor);
@@ -1390,7 +1421,9 @@ private:
                              statement + "\" requires " + std::to_string(infos.size()),
                          "08P01");
     }
-    if (p.kind == Classified::Kind::Sql || p.kind == Classified::Kind::Cursor) refuse_if_failed();
+    if (p.kind == Classified::Kind::Sql || p.kind == Classified::Kind::Cursor || p.kind == Classified::Kind::Stats) {
+      refuse_if_failed();
+    }
     Portal out{p, {}};
     for (std::int16_t i = 0; i < n; ++i) {
       auto len = body.i32();
@@ -1413,6 +1446,10 @@ private:
   }
 
   void describe_result(const Prepared& p) {
+    if (p.kind == Classified::Kind::Stats) {
+      row_description(stats_columns());
+      return;
+    }
     if (p.kind == Classified::Kind::Cursor) {
       // A FETCH describes its cursor's columns once the cursor exists; a MOVE, DECLARE and CLOSE return no rows.
       const auto* f = std::get_if<ast::FetchCursor>(&*p.cursor);
@@ -1499,6 +1536,10 @@ private:
     if (p.kind == Classified::Kind::Control) {
       auto [control, encoding, modes] = std::tuple{p.control, p.encoding, p.modes};  // run_control may drop the portal
       complete(run_control(control, encoding, modes));
+      return true;
+    }
+    if (p.kind == Classified::Kind::Stats) {
+      reply_stats(false);
       return true;
     }
     if (p.kind == Classified::Kind::Cursor) {

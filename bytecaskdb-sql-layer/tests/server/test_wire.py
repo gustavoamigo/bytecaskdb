@@ -168,6 +168,11 @@ def run(c: Client, sql: str, params: list[str | None] = ()) -> list[tuple[bytes,
     return c.until_ready()
 
 
+def fields_tag(messages) -> str:
+    """CommandComplete's tag."""
+    return next(b for k, b in messages if k == b"C").rstrip(b"\0").decode()
+
+
 def data(messages) -> list[list[str | None]]:
     """DataRows' columns as text."""
     rows = []
@@ -901,6 +906,173 @@ def test_a_compared_decimal_finer_than_its_scale_and_nan_are_refused(server):
         with pytest.raises(psycopg.Error) as e:
             c.execute("INSERT INTO m VALUES (%t, %t)", ("2.00", "NaN"))
         assert e.value.sqlstate == "22P02"
+
+
+STATS = "select * from pg_stat_bytecask"
+POOL_COUNTERS = {"bytecask.pool_" + n for n in (
+    "hits", "misses", "fills", "evictions", "frames_total", "frames_resident", "frames_released", "direct_io_fallbacks")}
+
+
+def counters(c: Client) -> dict[str, int]:
+    c.send(query(STATS))
+    messages = c.until_ready()
+    assert states(messages) == []
+    rows = data(messages)
+    assert [name for name, _ in rows] == sorted(name for name, _ in rows)
+    return {name: int(value) for name, value in rows}
+
+
+def test_pg_stat_bytecask_answers_over_both_protocols(server):
+    """One row per engine counter, name and value, in order of name
+    (docs/server_design.md, *Reading the counters*)."""
+    c = connect(server)
+    table(c)
+    for sql in (STATS, "SELECT  *\n FROM PG_STAT_BYTECASK ;"):
+        c.send(query(sql))
+        messages = c.until_ready()
+        assert kinds(messages)[:2] == b"TD" and status(messages) == "I"
+        assert row_description(next(b for k, b in messages if k == b"T")) == [("name", 25), ("value", 20)]
+        rows = data(messages)
+        assert POOL_COUNTERS <= {name for name, _ in rows}
+        assert fields_tag(messages) == f"SELECT {len(rows)}"
+    messages = run(c, STATS)
+    assert states(messages) == []
+    assert row_description(next(b for k, b in messages if k == b"T")) == [("name", 25), ("value", 20)]
+    assert POOL_COUNTERS <= {name for name, _ in data(messages)}
+    # Describe of the statement, before anything runs: no parameters, the same columns.
+    c.send(parse(STATS, "s"), describe("S", "s"), SYNC)
+    messages = c.until_ready()
+    assert (b"t", struct.pack("!h", 0)) in messages
+    assert row_description(next(b for k, b in messages if k == b"T")) == [("name", 25), ("value", 20)]
+    # Any other text is a query of a relation that does not exist.
+    for sql in ("select name from pg_stat_bytecask", "select * from pg_stat_bytecask where value > 0",
+                'select * from "pg_stat_bytecask"', "select * from pg_stat_bytecask_pool"):
+        c.send(query(sql))
+        assert states(c.until_ready()) == ["42P01"], sql
+    # A table of the name: the session still answers this text, any other reaches the table.
+    c.send(query("CREATE TABLE pg_stat_bytecask (id BIGINT PRIMARY KEY)"))
+    assert states(c.until_ready()) == []
+    c.send(query("select id from pg_stat_bytecask"))
+    assert fields_tag(c.until_ready()) == "SELECT 0"
+    assert "bytecask.pool_hits" in counters(c)
+    c.close()
+
+
+def test_pg_stat_bytecask_in_a_block_starts_nothing_and_a_failed_one_refuses_it(server):
+    c = connect(server)
+    table(c)
+    assert states(run(c, "INSERT INTO t VALUES ($1, $2)", ["1", "10"])) == []
+    c.send(query("BEGIN"))
+    assert status(c.until_ready()) == "T"
+    before = counters(c)["bytecask.bytes_written"]
+    # Live, not the block's snapshot: another session's commit shows.
+    other = connect(server)
+    assert states(run(other, "INSERT INTO t VALUES ($1, $2)", ["2", "20"])) == []
+    other.close()
+    assert counters(c)["bytecask.bytes_written"] > before
+    c.send(query("SELECT nosuch FROM t"))
+    assert status(c.until_ready()) == "E"
+    c.send(query(STATS))
+    messages = c.until_ready()
+    assert states(messages) == ["25P02"] and data(messages) == []
+    c.send(parse(STATS), SYNC)
+    assert states(c.until_ready()) == ["25P02"]
+    c.send(query("ROLLBACK"))
+    c.until_ready()
+    # A statement prepared before the block failed is refused at Bind.
+    c.send(parse(STATS, "s"), SYNC)
+    c.until_ready()
+    c.send(query("BEGIN"))
+    c.until_ready()
+    c.send(query("SELECT nosuch FROM t"))
+    c.until_ready()
+    c.send(bind([], "s"), execute(), SYNC)
+    assert states(c.until_ready()) == ["25P02"]
+    c.close()
+
+
+@pytest.mark.parametrize("flags", [[], ["--io-backend", "pread"], ["--io-backend", "mmap"]])
+def test_pg_stat_bytecask_s_pool_rows_are_zero_with_no_pool(flags):
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_stats_")
+    try:
+        s = Server(directory, extra_args=flags)
+        try:
+            c = connect(s)
+            table(c)
+            assert states(run(c, "INSERT INTO t VALUES ($1, $2)", ["1", "10"])) == []
+            assert keys(c) == ["1"]
+            got = counters(c)
+            assert {n: got[n] for n in POOL_COUNTERS} == dict.fromkeys(POOL_COUNTERS, 0)
+            assert got["bytecask.bytes_written"] > 0
+            c.close()
+        finally:
+            assert s.stop() == 0
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_pg_stat_bytecask_s_pool_rows_move_with_the_pool_while_another_session_writes():
+    """A sampler reads the pool's counters during a load, without stopping it."""
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    flags = ["--io-backend", "buffer_pool", "--buffer-pool-size", str(256 << 20)]
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_stats_")
+    try:
+        s = Server(directory, extra_args=flags)
+        try:
+            c = connect(s)
+            table(c)
+            for k in ("1", "2", "3"):
+                assert states(run(c, "INSERT INTO t VALUES ($1, $2)", [k, "10"])) == []
+            c.close()
+        finally:
+            assert s.stop() == 0
+        s = Server(directory, extra_args=flags)
+        try:
+            sampler = connect(s)
+            first = counters(sampler)
+            assert first["bytecask.pool_frames_total"] > 0
+            done = threading.Event()
+            errors: list[str] = []
+
+            def load():
+                w = connect(s)
+                k = 100
+                while not done.is_set():
+                    errors.extend(states(run(w, "INSERT INTO t VALUES ($1, $2)", [str(k), "10"])))
+                    assert keys(w)
+                    k += 1
+                w.close()
+
+            writer = threading.Thread(target=load)
+            writer.start()
+            try:
+                samples = []
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    samples.append(counters(sampler))
+                    if (len(samples) >= 20 and samples[-1]["bytecask.bytes_written"] > first["bytecask.bytes_written"]
+                            and samples[-1]["bytecask.pool_hits"] + samples[-1]["bytecask.pool_misses"]
+                            > first["bytecask.pool_hits"] + first["bytecask.pool_misses"]):
+                        break
+                    time.sleep(0.01)
+            finally:
+                done.set()
+                writer.join()
+            assert errors == []
+            last = samples[-1]
+            assert last["bytecask.bytes_written"] > first["bytecask.bytes_written"]
+            assert last["bytecask.pool_hits"] + last["bytecask.pool_misses"] > first["bytecask.pool_hits"] + first["bytecask.pool_misses"]
+            for name in ("hits", "misses", "fills", "evictions"):
+                seen = [x[f"bytecask.pool_{name}"] for x in samples]
+                assert seen == sorted(seen), name
+            sampler.close()
+        finally:
+            assert s.stop() == 0
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 @pytest.mark.parametrize("flags", [
