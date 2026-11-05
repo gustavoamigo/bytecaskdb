@@ -671,6 +671,30 @@ TEST_CASE("alloc sweep: put under a snapshot", "[alloc_sweep]") {
   alloc_sweep(snapshot_put_operation());
 }
 
+// The fused check of a snapshot plan of puts, committed and refused. Before
+// sweeping, each operation is run once without a fault to show it takes the
+// path it is meant to: the commit with no fallback, the conflict through the
+// undo (bytecask.write_check_fallbacks).
+TEST_CASE("alloc sweep: snapshot plan of puts", "[alloc_sweep]") {
+  const auto fallbacks_of = [](const Operation &op) {
+    TempDir td;
+    auto db = open_db(td.path / "db", op.opts);
+    op.setup(*db);
+    const auto before = db->stats().at("bytecask.write_check_fallbacks");
+    REQUIRE(op.run(*db));
+    return db->stats().at("bytecask.write_check_fallbacks") - before;
+  };
+  const auto expected = bytecask::kKeyDirReadsKeys ? 1 : 0;
+  SECTION("committed") {
+    REQUIRE(fallbacks_of(fused_puts_operation()) == 0);
+    alloc_sweep(fused_puts_operation());
+  }
+  SECTION("refused after the undo") {
+    REQUIRE(fallbacks_of(fused_puts_conflict_operation()) == expected);
+    alloc_sweep(fused_puts_conflict_operation());
+  }
+}
+
 TEST_CASE("alloc sweep: del_range", "[alloc_sweep]") {
   alloc_sweep(del_range_operation());
 }

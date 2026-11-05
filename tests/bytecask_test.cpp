@@ -12065,6 +12065,7 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.bytes_written",
       "bytecask.group_writer_batches",
       "bytecask.group_writer_coalesced",
+      "bytecask.write_check_fallbacks",
       "bytecask.group_writer_busy_us",
       "bytecask.file_rotations",
       "bytecask.fsyncs",
@@ -14091,6 +14092,275 @@ TEST_CASE("location tokens: plans checked and applied by location commit and "
     return vals;
   };
   REQUIRE(stats(a) == stats(b));
+}
+
+// ---------------------------------------------------------------------------
+// Checked puts: a plan of snapshot puts is checked by the descents that apply
+// it (TransientEngineState::apply_puts_checked). A put they cannot confirm
+// undoes the plan, which is then checked and applied in two passes.
+// ---------------------------------------------------------------------------
+
+namespace {
+auto fallbacks(bytecask::DB &db) -> std::int64_t {
+  return db.stats().at("bytecask.write_check_fallbacks");
+}
+// Only a key directory that reads keys to place them checks plans in its
+// descents; the keyed tree checks every plan in a pass of its own, so it
+// never falls back.
+constexpr std::int64_t kFallback = bytecask::kKeyDirReadsKeys ? 1 : 0;
+}  // namespace
+
+TEST_CASE("checked puts: a plan of snapshot updates and inserts commits "
+          "without a fallback", "[bytecask][checked_puts]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  (void)db.put({}, to_bytes("u1"), to_bytes("old1"));
+  (void)db.put({}, to_bytes("u2"), to_bytes("old2"));
+  const auto before = fallbacks(db);
+  bytecask::WritePlan plan{db.snapshot()};
+  plan.put(to_bytes("u1"), to_bytes("new1"));  // updates
+  plan.put(to_bytes("u2"), to_bytes("new2"));
+  plan.ensure_absent(to_bytes("i1"));          // inserts, guarded as the
+  plan.put(to_bytes("i1"), to_bytes("ins1"));  // MariaDB plugin does
+  plan.put(to_bytes("i2"), to_bytes("ins2"));
+  REQUIRE(db.apply_batch({}, std::move(plan)).has_value());
+  CHECK(fallbacks(db) == before);
+  CHECK(get_str(db, to_bytes("u1")) == "new1");
+  CHECK(get_str(db, to_bytes("u2")) == "new2");
+  CHECK(get_str(db, to_bytes("i1")) == "ins1");
+  CHECK(get_str(db, to_bytes("i2")) == "ins2");
+}
+
+TEST_CASE("checked puts: an update that lost its race undoes the whole plan",
+          "[bytecask][checked_puts]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  (void)db.put({}, to_bytes("a"), to_bytes("a0"));
+  (void)db.put({}, to_bytes("z"), to_bytes("z0"));
+  auto snap = db.snapshot();
+  const auto won = db.put({}, to_bytes("z"), to_bytes("z1"));  // after it
+  const auto before = fallbacks(db);
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.put(to_bytes("a"), to_bytes("a1"));  // applied, then undone
+  plan.put(to_bytes("n"), to_bytes("n1"));  // inserted, then undone
+  plan.put(to_bytes("z"), to_bytes("z2"));  // the conflict
+  CHECK_FALSE(db.apply_batch({}, std::move(plan)).has_value());
+  CHECK(fallbacks(db) == before + kFallback);
+  CHECK(get_str(db, to_bytes("a")) == "a0");
+  CHECK_FALSE(get_val(db, to_bytes("n")).has_value());
+  CHECK(get_str(db, to_bytes("z")) == "z1");
+  // Nothing of the plan was written: the next write takes the next sequence.
+  CHECK(db.put({}, to_bytes("q"), to_bytes("q")).sequence == won.sequence + 1);
+}
+
+TEST_CASE("checked puts: an insert whose key appeared since the snapshot "
+          "conflicts", "[bytecask][checked_puts]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  (void)db.put({}, to_bytes("a"), to_bytes("a0"));
+  auto snap = db.snapshot();
+  (void)db.put({}, to_bytes("n"), to_bytes("theirs"));  // appears after it
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.put(to_bytes("a"), to_bytes("a1"));
+  plan.put(to_bytes("n"), to_bytes("mine"));
+  CHECK_FALSE(db.apply_batch({}, std::move(plan)).has_value());
+  CHECK(get_str(db, to_bytes("a")) == "a0");
+  CHECK(get_str(db, to_bytes("n")) == "theirs");
+}
+
+// The key was in the snapshot, so its put is an update, which confirms
+// nothing about absence: the guard is checked before any put.
+TEST_CASE("checked puts: a failed guard refuses the plan before any put "
+          "is applied", "[bytecask][checked_puts]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  (void)db.put({}, to_bytes("a"), to_bytes("a0"));
+  (void)db.put({}, to_bytes("dup"), to_bytes("there"));
+  const auto before = fallbacks(db);
+  bytecask::WritePlan plan{db.snapshot()};
+  plan.put(to_bytes("a"), to_bytes("a1"));
+  plan.ensure_absent(to_bytes("dup"));
+  plan.put(to_bytes("dup"), to_bytes("mine"));
+  CHECK_FALSE(db.apply_batch({}, std::move(plan)).has_value());
+  CHECK(fallbacks(db) == before);
+  CHECK(get_str(db, to_bytes("a")) == "a0");
+  CHECK(get_str(db, to_bytes("dup")) == "there");
+}
+
+// The key was absent from the snapshot, so its put is an insert, and its
+// guard is still checked before any put.
+TEST_CASE("checked puts: an ensure_absent on a key inserted since the "
+          "snapshot refuses the plan before any put is applied",
+          "[bytecask][checked_puts]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  (void)db.put({}, to_bytes("a"), to_bytes("a0"));
+  auto snap = db.snapshot();
+  (void)db.put({}, to_bytes("dup"), to_bytes("theirs"));  // after the snapshot
+  const auto before = fallbacks(db);
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.put(to_bytes("a"), to_bytes("a1"));
+  plan.ensure_absent(to_bytes("dup"));
+  plan.put(to_bytes("dup"), to_bytes("mine"));
+  CHECK_FALSE(db.apply_batch({}, std::move(plan)).has_value());
+  CHECK(fallbacks(db) == before);
+  CHECK(get_str(db, to_bytes("a")) == "a0");
+  CHECK(get_str(db, to_bytes("dup")) == "theirs");
+}
+
+TEST_CASE("checked puts: the same key twice in a plan falls back and commits",
+          "[bytecask][checked_puts]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  (void)db.put({}, to_bytes("k"), to_bytes("k0"));
+  const auto before = fallbacks(db);
+  bytecask::WritePlan plan{db.snapshot()};
+  plan.put(to_bytes("k"), to_bytes("first"));
+  plan.put(to_bytes("new"), to_bytes("n1"));
+  plan.put(to_bytes("new"), to_bytes("n2"));
+  plan.put(to_bytes("k"), to_bytes("second"));
+  REQUIRE(db.apply_batch({}, std::move(plan)).has_value());
+  CHECK(fallbacks(db) == before + kFallback);
+  CHECK(get_str(db, to_bytes("k")) == "second");
+  CHECK(get_str(db, to_bytes("new")) == "n2");
+}
+
+// The fused check must agree with the two-pass check on every outcome. One
+// seeded workload of put-only snapshot plans (updates, inserts of new keys
+// with and without an ensure_absent guard, the same key twice, plain writes
+// landing between snapshot and commit, and vacuum moving records under the
+// snapshots) runs on two databases, one checking puts in their descents and
+// one in a pass of their own. Every commit and conflict, the final contents
+// and the file stats must match, and both paths must actually have run.
+TEST_CASE("checked puts: plans checked by their descents commit and conflict "
+          "exactly as when checked in a pass of their own",
+          "[model][checked_puts]") {
+  const auto seed = GENERATE(1u, 2u, 3u, 4u, 5u);
+  CAPTURE(seed);
+  TempDir td;
+  const bytecask::Options opts{.max_file_bytes = 8 * 1024};
+  std::map<std::string, std::string> kv_before;
+  std::vector<FileStatsTuple> stats_before;
+  {
+    auto a = bytecask::DB::open(td.path / "a", opts);
+    auto b = bytecask::DB::open(td.path / "b", opts);
+    b.test_two_pass_ = true;
+
+    std::mt19937_64 rng{seed};
+    int next_new = 0;
+    const auto key = [&] {
+      // Mostly a small hot set, so plans collide; now and then a fresh key.
+      return rng() % 5 == 0 ? std::format("n{:05d}", next_new++)
+                            : std::format("k{:02d}", rng() % 16);
+    };
+    const auto value = [&] {
+      return std::string(1 + rng() % 150, static_cast<char>('a' + rng() % 26));
+    };
+    std::vector<std::pair<bytecask::Snapshot, bytecask::Snapshot>> snaps;
+    int commits = 0;
+    int conflicts = 0;
+    for (int step = 0; step < 5000; ++step) {
+      const auto dice = rng() % 100;
+      if (dice < 40) {
+        snaps.emplace_back(a.snapshot(), b.snapshot());
+        if (snaps.size() > 12) snaps.erase(snaps.begin());
+      } else if (dice < 42) {
+        const auto th = rng() % 2 == 0 ? 0.0 : 0.5;
+        REQUIRE(a.vacuum({.fragmentation_threshold = th}) ==
+                b.vacuum({.fragmentation_threshold = th}));
+      } else if (dice < 55) {
+        const auto k = key();
+        const auto v = value();
+        REQUIRE(a.put({.sync = false}, to_bytes(k), to_bytes(v)).sequence ==
+                b.put({.sync = false}, to_bytes(k), to_bytes(v)).sequence);
+      } else if (!snaps.empty()) {
+        const auto i = static_cast<std::ptrdiff_t>(rng() % snaps.size());
+        auto pair = std::move(snaps[static_cast<std::size_t>(i)]);
+        snaps.erase(snaps.begin() + i);
+        bytecask::WritePlan pa{std::move(pair.first)};
+        bytecask::WritePlan pb{std::move(pair.second)};
+        const auto ops = 1 + rng() % 6;
+        std::string last;
+        // A key takes one guard kind: two on one key contradict.
+        std::set<std::string> guarded;
+        const auto guard = [&](const std::string &k, auto add) {
+          if (!guarded.insert(k).second) return;
+          add(pa, to_bytes(k));
+          add(pb, to_bytes(k));
+        };
+        for (std::size_t o = 0; o < ops; ++o) {
+          const auto k = !last.empty() && rng() % 6 == 0 ? last : key();
+          last = k;
+          const auto v = value();
+          if (rng() % 4 == 0) {
+            guard(k, [](bytecask::WritePlan &p, bytecask::BytesView b) {
+              p.ensure_absent(b);
+            });
+          }
+          pa.put(to_bytes(k), to_bytes(v));
+          pb.put(to_bytes(k), to_bytes(v));
+        }
+        // Guards the fused check leaves to validate_preconditions: on keys
+        // the plan reads but need not write, and on a range of the hot set.
+        switch (rng() % 6) {
+        case 0:
+          guard(key(), [](bytecask::WritePlan &p, bytecask::BytesView b) {
+            p.ensure_present(b);
+          });
+          break;
+        case 1:
+          guard(key(), [](bytecask::WritePlan &p, bytecask::BytesView b) {
+            p.ensure_unchanged(b);
+          });
+          break;
+        case 2: {
+          const auto lo = rng() % 15;
+          const auto from = std::format("k{:02d}", lo);
+          const auto to = std::format("k{:02d}", lo + 1 + rng() % (16 - lo - 1));
+          pa.ensure_range_unchanged(to_bytes(from), to_bytes(to));
+          pb.ensure_range_unchanged(to_bytes(from), to_bytes(to));
+          break;
+        }
+        default:
+          break;
+        }
+        const auto ra = a.apply_batch({.sync = false}, std::move(pa));
+        const auto rb = b.apply_batch({.sync = false}, std::move(pb));
+        REQUIRE(ra.has_value() == rb.has_value());
+        if (ra) {
+          REQUIRE(ra->sequence == rb->sequence);
+          ++commits;
+        } else {
+          ++conflicts;
+        }
+      }
+    }
+    snaps.clear();
+    CHECK(commits > 300);
+    CHECK(conflicts > 300);
+    if constexpr (bytecask::kKeyDirReadsKeys) {
+      CHECK(fallbacks(a) > 0);                    // the undo path ran
+      CHECK(fallbacks(a) < commits + conflicts);  // and so did the fused one
+    } else {
+      CHECK(fallbacks(a) == 0);
+    }
+    CHECK(fallbacks(b) == 0);
+    REQUIRE(collect_kv(a) == collect_kv(b));
+    REQUIRE(collect_file_stats(a) == collect_file_stats(b));
+    kv_before = collect_kv(a);
+    stats_before = collect_file_stats(a);
+  }
+  // Recovery rebuilds the file stats from the data files: they must be the
+  // ones the fused path kept in memory (apart from the empty active file the
+  // reopen creates) and the ones recovery rebuilds for the two-pass database.
+  auto reopened_a = bytecask::DB::open(td.path / "a", opts);
+  auto reopened_b = bytecask::DB::open(td.path / "b", opts);
+  CHECK(collect_kv(reopened_a) == kv_before);
+  CHECK(collect_kv(reopened_b) == kv_before);
+  CHECK(collect_file_stats(reopened_a) == collect_file_stats(reopened_b));
+  auto recovered = collect_file_stats(reopened_a);
+  std::erase_if(recovered, [](const auto &v) { return std::get<1>(v) == 0; });
+  CHECK(recovered == stats_before);
 }
 
 TEST_CASE("pipeline: a writer whose write another thread published sees it "

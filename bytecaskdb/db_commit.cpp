@@ -42,11 +42,19 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
   }
 
   std::uint64_t rests_on = 0;
-  if (!t.validate_preconditions(slot.plan, rests_on)) {
+  const auto conflict = [&] {
     slot.rests_on = rests_on;
     slot.result = std::nullopt;
     return false;
-  }
+  };
+  // A plan of snapshot puts is checked by the descents that apply it; any
+  // other plan is checked in a pass of its own first.
+  auto checked = TransientEngineState::can_apply_puts_checked(slot.plan);
+#ifdef BYTECASK_TESTING
+  checked = checked && !test_two_pass_;
+#endif
+  if (!t.validate_preconditions(slot.plan, rests_on, checked))
+    return conflict();
 
   auto entries = t.prepare_write(slot.plan);
   if (entries.empty()) {
@@ -71,15 +79,26 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
   }
 
   // Pre-compute offsets from running_offset (tracks the file position
-  // across all slots in the group, without actual I/O).
+  // across all slots in the group, without actual I/O). It advances only
+  // once the plan is applied: a plan that conflicts writes nothing.
   std::vector<std::uint64_t> offsets(entries.size());
+  auto next_offset = running_offset;
   for (std::size_t i = 0; i < entries.size(); ++i) {
-    offsets[i] = running_offset;
-    running_offset += entry_size(entries[i].key.size(),
-                                 entries[i].value.size());
+    offsets[i] = next_offset;
+    next_offset += entry_size(entries[i].key.size(), entries[i].value.size());
   }
 
-  t.apply_writes(slot.plan, offsets);
+  if (!checked || !t.apply_puts_checked(slot.plan, offsets)) {
+    // A put the descents could not confirm leaves the plan unapplied: check
+    // it in a pass of its own, which settles a real conflict and its
+    // rests_on exactly as before, then apply it.
+    if (checked) {
+      counters_.write_check_fallbacks.fetch_add(1, std::memory_order_relaxed);
+      if (!t.validate_preconditions(slot.plan, rests_on)) return conflict();
+    }
+    t.apply_writes(slot.plan, offsets);
+  }
+  running_offset = next_offset;
 
   const auto committed_sequence = entries.back().sequence;
 
