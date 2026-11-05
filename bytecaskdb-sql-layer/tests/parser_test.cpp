@@ -646,3 +646,18 @@ TEST_CASE("parser: a procedure body the layer does not run is refused at CREATE"
   CHECK(state("BEGIN EXECUTE 'SELECT 1'; END") == "0A000");
   CHECK(state("BEGIN DECLARE a INT; BEGIN NULL; END; END") == "0A000");  // shadows the argument
 }
+
+TEST_CASE("parser: CALL is read apart from the statements, its arguments as expressions", "[sql][parser][procedure]") {
+  auto c = parse_call("call neword(1, 2, 0.0, '', TO_TIMESTAMP('20261103120000','YYYYMMDDHH24MISS')::timestamp without time zone)");
+  REQUIRE(c);
+  CHECK(c->procedure == "neword");
+  REQUIRE(c->args.size() == 5);
+  CHECK(c->args[4].kind == Expr::Kind::Cast);
+  CHECK(c->args[4].rhs->kind == Expr::Kind::Func);
+  CHECK(c->args[4].rhs->func == "to_timestamp");
+  CHECK_FALSE(parse_call("SELECT 1"));
+  CHECK(parse_call("CALL p()")->args.empty());
+  CHECK_THROWS_AS(parse_call("CALL p(a => 1)"), SqlError);
+  CHECK_THROWS_AS(parse_call("CALL s.p(1)"), SqlError);
+  CHECK_THROWS_AS(parse("CALL p(1)"), SqlError);  // not a prepared statement
+}

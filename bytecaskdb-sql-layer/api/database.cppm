@@ -524,6 +524,9 @@ struct DatabaseLife {
   // call ever waits on it.
   std::shared_mutex mu;
   std::atomic<bool> closing{false};  // set before close() waits: calls arriving meanwhile refuse at once
+  // Transactions ended, autocommit statements included (Database::transaction_counts).
+  std::atomic<std::uint64_t> committed{0};
+  std::atomic<std::uint64_t> rolled_back{0};
   bool closed{false};                // under mu
   std::mutex open_mu;                // guards open and holds; taken briefly, never across I/O
   std::set<TxnHandle*> open;
@@ -698,7 +701,9 @@ private:
   void check_usable() const;
   auto run_locked(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts,
                   WindowRows* window = nullptr, RowWindow range = {}, const CursorState* positioned = nullptr) -> Rows;
-  void end_locked() noexcept;  // under life_->mu, shared: forgets and frees it
+  // Under life_->mu, shared: forgets and frees it, and counts it committed or
+  // rolled back.
+  void end_locked(bool committed = false) noexcept;
 
   std::shared_ptr<DatabaseLife> life_;
   Database* db_{nullptr};         // valid while !life_->closed, read under life_->mu
@@ -795,6 +800,17 @@ public:
   [[nodiscard]] auto compilations() const -> std::uint64_t { return compilations_.load(); }
   // The live catalog: the version DDL last published.
   [[nodiscard]] auto catalog() const -> std::shared_ptr<const Catalog>;
+  // How many transactions have ended since open, committed or rolled back,
+  // each autocommit statement and DDL counted as one, a failed one as
+  // rolled back: what PostgreSQL's pg_stat_database counts as xact_commit
+  // and xact_rollback.
+  struct TransactionCounts {
+    std::uint64_t committed{0};
+    std::uint64_t rolled_back{0};
+  };
+  [[nodiscard]] auto transaction_counts() const -> TransactionCounts {
+    return {life_->committed.load(std::memory_order_relaxed), life_->rolled_back.load(std::memory_order_relaxed)};
+  }
 #ifdef BYTECASK_SQL_TESTING
   // Test only: how many times a cached plan was checked (bc_ctx_check)
   // against a catalog version it was not compiled or checked against.
@@ -859,6 +875,7 @@ private:
   [[nodiscard]] auto enter() const -> std::shared_lock<std::shared_mutex>;
   // The same calls, under the lock enter() took.
   auto prepare_locked(std::string_view sql, bool cursor_query = false) -> const Statement&;
+  auto execute_locked(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts) -> Rows;
   [[nodiscard]] auto cached(std::string_view sql) const -> bool;
   // A DML statement's plan for the live catalog; null for DDL. Throws what
   // binding, planning and compiling throw.
@@ -1490,6 +1507,18 @@ auto Database::execute(std::string_view sql, const std::vector<Value>& params, c
 
 auto Database::execute(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts) -> Rows {
   auto lock = enter();
+  try {
+    auto out = execute_locked(stmt, params, opts);
+    life_->committed.fetch_add(1, std::memory_order_relaxed);
+    return out;
+  } catch (...) {
+    life_->rolled_back.fetch_add(1, std::memory_order_relaxed);
+    throw;
+  }
+}
+
+auto Database::execute_locked(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts)
+    -> Rows {
   if (stmt.owner_ != this) throw std::logic_error("the statement was prepared on another database");
   if (!stmt.current_of().empty()) throw ParamError("WHERE CURRENT OF needs a cursor of a transaction");
   if (stmt.is_ddl()) {
@@ -2008,7 +2037,8 @@ Transaction& Transaction::operator=(Transaction&& other) noexcept {
 
 Transaction::~Transaction() { rollback(); }
 
-void Transaction::end_locked() noexcept {
+void Transaction::end_locked(bool committed) noexcept {
+  (committed ? life_->committed : life_->rolled_back).fetch_add(1, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock{life_->open_mu};
     life_->open.erase(h_.get());
@@ -2456,7 +2486,7 @@ auto Transaction::commit() -> CommitOutcome {
     }
   }
   if (r == BC_COMMITTED) h_->commit_cursors();  // the hold cursors leave before the transaction is freed
-  end_locked();
+  end_locked(r == BC_COMMITTED);
   lock.unlock();
   if (r == BC_CONFLICT) throw_serialization_failure(kConflict);
   if (r == BC_FAILED) throw_error(code, detail, message);

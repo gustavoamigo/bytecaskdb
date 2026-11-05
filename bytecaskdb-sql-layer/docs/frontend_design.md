@@ -187,6 +187,10 @@ kind the transformer doesn't take is refused with its position.
     a start below 1 is 22011, and a resume position past `integer` is
     22003.
   - `POSITION` of an empty substring is 1, of one not found 0.
+  - `TO_TIMESTAMP(s, 'YYYYMMDDHH24MISS')` is a `timestamptz` read in UTC,
+    the form HammerDB's driver sends (`procedures_design.md`, *Wire
+    protocol for `CALL`*); another format is refused (42601), and a string
+    that is not fourteen digits is 22007.
   - The output column is named as PostgreSQL names it: `?column?` for
     `||`, otherwise the function (`btrim` for `TRIM`).
   - Refused (42601): `SUBSTRING(s FROM 'pattern' [FOR 'escape'])`, the
