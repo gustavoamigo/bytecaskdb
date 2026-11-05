@@ -40,6 +40,7 @@
 #include <memory>
 #include <new>
 #include <optional>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -54,6 +55,7 @@
 
 // The C contract, and the engine through its public header.
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+#include "bytecaskdb-sql-layer/algebra/bc_proc.h"
 #include "include/bytecask.hpp"
 
 // bc_db, bc_catalog and bc_params, which bc_plan.h leaves opaque, and the
@@ -2779,6 +2781,49 @@ void refuse_f64_part(bc_ctx* cx) {
 
 }  // namespace
 
+void bc_ctx_begin_frame(bc_ctx* cx, const bc_params* params, bc_budget budget) {
+  BC_GUARD_BEGIN
+  cx->drop_execution_state();
+  cx->sink().clear();
+  cx->params = params;
+  cx->budget = budget;
+  BC_GUARD_END(cx)
+}
+
+// ------------------------------------------------------------- procedures
+
+namespace {
+
+auto proc_failed(const bc_proc* px) -> bool { return px->error != nullptr || !px->frame->ok(); }
+
+// The hook's exception is the procedure's error; the frame fails so that
+// every later call does nothing.
+void proc_fail(bc_proc* px) noexcept {
+  if (px->error == nullptr) px->error = std::current_exception();
+  px->frame->fail(BC_E_HANDLE, "the procedure failed");
+}
+
+template <typename T>
+void proc_set(bc_proc* px, uint32_t var, T v) {
+  if (proc_failed(px)) return;
+  try {
+    if (var >= px->slots.values.size()) {
+      px->frame->fail(BC_E_HANDLE, "no variable " + std::to_string(var));
+      return;
+    }
+    bc_value d{std::move(v)};
+    if (auto why = bytecask::sql::out_of_range(px->types[var], d)) {
+      px->frame->raise(BC_C_RANGE, 0, *why);
+      return;
+    }
+    px->slots.values[var] = std::move(d);
+  } catch (...) {
+    proc_fail(px);
+  }
+}
+
+}  // namespace
+
 extern "C" {
 
 // ---------------------------------------------------------------- runtime
@@ -2811,6 +2856,99 @@ void bc_ctx_begin(bc_ctx* cx, const bc_params* params, bc_budget budget) {
   cx->snap.emplace(std::move(p.snap));
   cx->base = &*cx->snap;
   BC_GUARD_END(cx)
+}
+
+bc_ctx* bc_proc_ctx(bc_proc* px) { return px->frame; }
+
+bc_ctx* bc_stmt_begin(bc_proc* px, uint32_t stmt) {
+  if (proc_failed(px)) return px->frame;
+  try {
+    return px->begin(stmt);
+  } catch (...) {
+    proc_fail(px);
+    return px->frame;
+  }
+}
+
+void bc_stmt_end(bc_proc* px, uint32_t stmt) {
+  if (proc_failed(px)) return;
+  try {
+    px->end(stmt);
+  } catch (...) {
+    proc_fail(px);
+  }
+}
+
+void bc_var_set_i64(bc_proc* px, uint32_t var, int64_t v) { proc_set(px, var, std::int64_t{v}); }
+void bc_var_set_f64(bc_proc* px, uint32_t var, double v) { proc_set(px, var, v); }
+void bc_var_set_bool(bc_proc* px, uint32_t var, bool v) { proc_set(px, var, v); }
+
+void bc_var_set_bytes(bc_proc* px, uint32_t var, bc_view v) {
+  if (proc_failed(px)) return;
+  std::optional<BytesView> b;
+  try {
+    b = px->frame->resolve(v);
+  } catch (...) {
+    proc_fail(px);
+    return;
+  }
+  if (!b) return;  // a stale view: the frame has failed
+  proc_set(px, var, Bytes(b->begin(), b->end()));
+}
+
+void bc_var_set_null(bc_proc* px, uint32_t var) { proc_set(px, var, std::monostate{}); }
+
+bool bc_rows_next(bc_proc* px, uint32_t stmt) {
+  if (proc_failed(px) || !px->frame->charge()) return false;
+  try {
+    return px->next(stmt);
+  } catch (...) {
+    proc_fail(px);
+    return false;
+  }
+}
+
+void bc_rows_done(bc_proc* px, uint32_t stmt) {
+  if (proc_failed(px)) return;
+  try {
+    px->done(stmt);
+  } catch (...) {
+    proc_fail(px);
+  }
+}
+
+bool bc_loop(bc_proc* px) {
+  if (proc_failed(px)) return false;
+  return px->frame->charge();
+}
+
+void bc_range_open(bc_proc* px, uint32_t range, int64_t lo, bool lo_null, int64_t hi, bool hi_null, bool reverse) {
+  if (proc_failed(px)) return;
+  try {
+    if (lo_null || hi_null) {
+      throw bytecask::sql::ProcedureError(std::string{lo_null ? "lower" : "upper"} + " bound of FOR loop cannot be null",
+                                          bytecask::sql::kNullValueNotAllowed);
+    }
+    if (px->ranges.size() <= range) px->ranges.resize(range + 1);
+    // REVERSE counts from the first bound down to the second, as PostgreSQL's does.
+    px->ranges[range] = {lo, hi, reverse, reverse ? lo < hi : lo > hi};
+  } catch (...) {
+    proc_fail(px);
+  }
+}
+
+bool bc_range_next(bc_proc* px, uint32_t range, uint32_t var) {
+  if (proc_failed(px) || range >= px->ranges.size()) return false;
+  auto& r = px->ranges[range];
+  if (r.done || !px->frame->charge()) return false;
+  auto v = r.next;
+  if (v == r.last) {
+    r.done = true;
+  } else {
+    r.next = r.reverse ? v - 1 : v + 1;
+  }
+  bc_var_set_i64(px, var, v);
+  return !proc_failed(px);
 }
 
 void bc_ctx_begin_txn(bc_ctx* cx, bc_txn* txn, const bc_params* params, bc_budget budget) {
@@ -3847,6 +3985,39 @@ bool bc_bytes_prefix(bc_ctx* cx, bc_view prefix, bc_view b) {
   return {};
 }
 
+bc_view bc_concat(bc_ctx* cx, bc_view a, bc_view b) {
+  BC_GUARD_BEGIN
+  auto v = cx->resolve2(a, b);
+  if (!v) return {};
+  Bytes out;
+  out.reserve(v->first.size() + v->second.size());
+  out.insert(out.end(), v->first.begin(), v->first.end());
+  out.insert(out.end(), v->second.begin(), v->second.end());
+  return cx->arena_view(out);
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_view bc_number_text(bc_ctx* cx, int64_t v, uint32_t scale) {
+  BC_GUARD_BEGIN
+  if (scale > 18) {
+    cx->fail(BC_E_HANDLE, "bc_number_text: a scale past 18");
+    return {};
+  }
+  // The magnitude as unsigned, so INT64_MIN has one.
+  auto mag = v < 0 ? std::uint64_t{0} - static_cast<std::uint64_t>(v) : static_cast<std::uint64_t>(v);
+  auto digits = std::to_string(mag);
+  if (scale > 0) {
+    if (digits.size() <= scale) digits.insert(0, scale + 1 - digits.size(), '0');
+    digits.insert(digits.size() - scale, 1, '.');
+  }
+  if (v < 0) digits.insert(0, 1, '-');
+  auto b = std::as_bytes(std::span{digits.data(), digits.size()});
+  return cx->arena_view(BytesView{b});
+  BC_GUARD_END(cx)
+  return {};
+}
+
 namespace {
 
 // The bytes of the UTF-8 character at s[i]: 1 for a byte that starts none,
@@ -4352,6 +4523,49 @@ bool bc_sort_key_part_bool(bc_ctx* cx, bc_view key, uint32_t part) {
   BC_GUARD_BEGIN
   return sort_part_value<bool>(cx, key, part, PhysType::Bool, false,
                                [](KeyReader& r) { return r.read_bool(KeyPart{PhysType::Bool, false, false, false}); });
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_view bc_substr(bc_ctx* cx, bc_view s, int64_t from, int64_t count) {
+  BC_GUARD_BEGIN
+  auto text = cx->resolve(s);
+  if (!text) return {};
+  if (count < 0) {
+    cx->fail(BC_E_ARITH, "negative substring length not allowed");
+    return {};
+  }
+  // Characters [from, from + count), 1-based, cut to the text.
+  constexpr auto kMax = std::numeric_limits<std::int64_t>::max();
+  auto end = count == kMax || from > kMax - count ? kMax : from + count;
+  auto first = std::max<std::int64_t>(from, 1);
+  if (end <= first) return cx->arena_view(BytesView{});
+  std::size_t at = 0;
+  std::int64_t pos = 1;
+  while (at < text->size() && pos < first) {
+    at += char_len(*text, at);
+    ++pos;
+  }
+  auto start = std::min(at, text->size());
+  while (at < text->size() && pos < end) {
+    at += char_len(*text, at);
+    ++pos;
+  }
+  return cx->arena_view(text->subspan(start, std::min(at, text->size()) - start));
+  BC_GUARD_END(cx)
+  return {};
+}
+
+int64_t bc_random(bc_ctx* cx, int64_t lo, int64_t hi) {
+  BC_GUARD_BEGIN
+  if (lo > hi) {
+    cx->fail(BC_E_ARITH, "lower bound must be less than or equal to upper bound");
+    return 0;
+  }
+  // TLS: process — a generator per thread, holding no DB's state: draws are
+  // not repeatable, as PostgreSQL's random() is not unless seeded.
+  thread_local std::mt19937_64 gen{std::random_device{}()};
+  return std::uniform_int_distribution<std::int64_t>{lo, hi}(gen);
   BC_GUARD_END(cx)
   return {};
 }

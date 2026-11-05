@@ -70,6 +70,11 @@ struct GeneratedPlan {
   // scan instead of replaying from the first row (docs/cursor_design.md,
   // *The replay cursor*). A whitelist: false until a shape is proven.
   bool resumable{false};
+  // The plan as a part of a procedure's file (docs/procedures_design.md):
+  // its functions, the plan's named as asked and its subqueries' after it,
+  // and the constants they use, each with its value.
+  std::string functions;
+  std::vector<std::pair<std::string, std::uint32_t>> constants;
 };
 
 // Plans a bound DML statement, its logical plan rewritten, then searched,
@@ -78,8 +83,10 @@ struct GeneratedPlan {
 // cheapest plan. Throws FeatureNotSupported ("no plan: ...") when the search
 // finds none, and std::logic_error if the physical plan fails
 // physical::check, a compiler bug.
+// `fn` names the plan's function: plan() for a plan of its own, s<i> for a
+// procedure's statement, whose subqueries are then <fn>_sub<k>.
 [[nodiscard]] auto generate_plan(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts = {},
-                                 std::uint64_t memory_bytes = 0) -> GeneratedPlan;
+                                 std::uint64_t memory_bytes = 0, std::string_view fn = "plan") -> GeneratedPlan;
 
 // Every plan the search costs for the statement, cheapest first, each
 // printed as generate_plan prints the one it picks (*Tests*, alternatives
@@ -90,6 +97,63 @@ struct GeneratedPlan {
 [[nodiscard]] auto generate_alternatives(bound::Bound b, const Catalog& cat, std::string_view sql,
                                          const RowCounts& counts = {}, std::uint64_t memory_bytes = 0)
     -> std::vector<GeneratedPlan>;
+
+// A procedure's body, bound (docs/procedures_design.md): its expressions are
+// over its variables, each a parameter of the procedure's frame, $n the
+// variable or constant in slot n.
+namespace proc {
+struct Stmt;
+using Body = std::vector<Stmt>;
+// var := value, of the variable's own physical type. An exact number of
+// another scale is brought to the variable's: `rescale` digits up (times a
+// power of ten) or, when negative, down, rounded half away from zero, as
+// PostgreSQL's assignment cast to NUMERIC(p, s) rounds.
+struct Assign {
+  std::uint32_t var;
+  logical::Expr value;
+  int rescale{0};
+};
+struct If {
+  std::vector<std::pair<logical::Expr, Body>> branches;  // each a BOOLEAN condition
+  Body otherwise;
+};
+// FOR var IN lower..upper: `range` numbers the loop's state in the frame.
+struct ForRange {
+  std::uint32_t var;
+  std::uint32_t range;
+  logical::Expr lower, upper;  // BIGINT, evaluated once, on entry
+  bool reverse{false};
+  Body body;
+};
+// WHILE cond LOOP, or LOOP without one.
+struct While {
+  std::optional<logical::Expr> cond;
+  Body body;
+};
+// EXIT (`exit`) or CONTINUE of the innermost loop, when `cond` holds.
+struct Exit {
+  bool exit{true};
+  std::optional<logical::Expr> cond;
+};
+// The procedure's statement `stmt`: s<stmt>, between bc_stmt_begin and bc_stmt_end.
+struct Exec {
+  std::uint32_t stmt;
+};
+struct Return {};
+// FOR targets IN query: statement `stmt` once, then the body per row of it.
+struct ForQuery {
+  std::uint32_t stmt;
+  Body body;
+};
+struct Stmt {
+  std::variant<Assign, If, ForRange, While, Exit, Exec, Return, ForQuery> v;
+};
+}  // namespace proc
+
+// proc()'s body: control flow, and expressions printed as plans print them,
+// reading the frame's slots as parameters. Every loop ends once the
+// procedure has failed: each pass is bc_loop or bc_range_next.
+[[nodiscard]] auto print_procedure_body(const proc::Body& body) -> std::string;
 
 // The lines a plan rooted at `root` prints for when no row can match: a
 // write's count of 0, an aggregate's row over no rows, or none. A test seam:
@@ -142,7 +206,10 @@ auto comment_line(std::string_view s) -> std::string {
 // which objects and columns it read or set.
 class Writer {
 public:
-  explicit Writer(const physical::Plan& p) : p_{p} {}
+  explicit Writer(const physical::Plan& p, std::string sub_prefix = "sub") : p_{p}, sub_prefix_{std::move(sub_prefix)} {}
+
+  // The name of the plan's subquery function `i`.
+  [[nodiscard]] auto sub(std::size_t i) const -> std::string { return sub_prefix_ + std::to_string(i); }
 
   void line(const std::string& s) { body_ += std::string(2 * depth_, ' ') + s + "\n"; }
   void open(const std::string& s) {
@@ -202,6 +269,15 @@ public:
     return out + " };";
   }
 
+  // The constants the plan uses, with their values, in the catalog's order.
+  [[nodiscard]] auto constant_values() const -> std::vector<std::pair<std::string, std::uint32_t>> {
+    std::vector<std::pair<std::string, std::uint32_t>> out;
+    for (const auto& c : p_.constants) {
+      if (used_.contains(c.name)) out.emplace_back(c.name, c.value);
+    }
+    return out;
+  }
+
   // What each constant the plan uses stands for, for the header comment:
   // "TBL_1 t, IDX_3 t_by_name, COL_1_1 t.name".
   auto legend() const -> std::string {
@@ -255,6 +331,7 @@ private:
   }
 
   const physical::Plan& p_;
+  std::string sub_prefix_;
   std::string body_;
   std::size_t depth_{1};
   int keys_{0};
@@ -407,7 +484,7 @@ public:
       auto n = std::to_string(i);
       w_.line("bc_sub_begin(cx, " + n + ", " + sub_kind(subs[i].kind) + ", " + type_code(subs[i]) + ", " +
               std::to_string(subs[i].param) + ");");
-      w_.line("sub" + n + "(cx);");
+      w_.line(w_.sub(i) + "(cx);");
       w_.line("bc_sub_end(cx);");
     }
   }
@@ -498,6 +575,9 @@ public:
         },
         root.op);
   }
+
+  // An expression over parameters alone, as a procedure's body evaluates it.
+  auto value_of(const Expr& e) -> Val { return eval(e); }
 
 private:
   // A row in hand: its variable, or, for a covering scan, the entry its
@@ -657,6 +737,9 @@ private:
       case Expr::Kind::Div:
       case Expr::Kind::Case:
       case Expr::Kind::Coalesce:
+      case Expr::Kind::Concat:
+      case Expr::Kind::Substr:
+      case Expr::Kind::Random:
       case Expr::Kind::Aggregate: break;
     }
     throw std::logic_error{"physical plan: a predicate codegen does not print"};
@@ -695,7 +778,10 @@ private:
       case Expr::Kind::Truth:
       case Expr::Kind::InSet:
       case Expr::Kind::Case:
-      case Expr::Kind::Coalesce: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
+      case Expr::Kind::Coalesce:
+      case Expr::Kind::Concat:
+      case Expr::Kind::Substr:
+      case Expr::Kind::Random: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
     }
     auto col = read_col(lhs);
     // Text and bytes compare as bytes: COLLATE "C".
@@ -1389,6 +1475,14 @@ private:
       case Expr::Kind::Or: return eval_connective(e);
       case Expr::Kind::Case: return eval_case(e);
       case Expr::Kind::Coalesce: return eval_coalesce(e);
+      case Expr::Kind::Concat: return eval_concat(e);
+      case Expr::Kind::Substr: return eval_substr(e);
+      case Expr::Kind::Random: {
+        auto lo = eval(e.args[0]);
+        auto hi = eval(e.args[1]);
+        return guarded("int64_t", "0", either(lo.null, hi.null), "bc_random(cx, " + lo.value + ", " + hi.value + ")",
+                       PhysType::I64);
+      }
       case Expr::Kind::Aggregate:
       case Expr::Kind::Like:
       case Expr::Kind::Truth:
@@ -1446,12 +1540,43 @@ private:
       case Expr::Kind::Truth:
       case Expr::Kind::InSet:
       case Expr::Kind::Case:
-      case Expr::Kind::Coalesce: throw std::logic_error{"physical plan: not an arithmetic expression"};
+      case Expr::Kind::Coalesce:
+      case Expr::Kind::Concat:
+      case Expr::Kind::Substr:
+      case Expr::Kind::Random: throw std::logic_error{"physical plan: not an arithmetic expression"};
     }
     if (e.type.kind == SqlKind::SmallInt || e.type.kind == SqlKind::Integer) {
       call = "bc_check_int(cx, " + call + ", " + (e.type.kind == SqlKind::SmallInt ? "BC_SMALLINT" : "BC_INTEGER") + ", 0)";
     }
     return guarded("int64_t", "0", either(a.null, b.null), call, PhysType::I64);
+  }
+
+  // a || b: text with text, an integer or a DECIMAL through its text. NULL if
+  // either is.
+  auto eval_concat(const Expr& e) -> Val {
+    auto text = [&](const Expr& arg) {
+      auto v = eval(arg);
+      if (v.type == PhysType::Bytes) return v;
+      v.value = "bc_number_text(cx, " + v.value + ", " + std::to_string(decimal_scale(arg.type)) + ")";
+      return v;
+    };
+    auto a = text(e.args[0]);
+    auto b = text(e.args[1]);
+    return guarded("bc_view", "bc_empty(cx)", either(a.null, b.null), "bc_concat(cx, " + a.value + ", " + b.value + ")",
+                   PhysType::Bytes);
+  }
+
+  // substring(s FROM a [FOR n]): NULL if any operand is.
+  auto eval_substr(const Expr& e) -> Val {
+    auto s = eval(e.args[0]);
+    auto from = eval(e.args[1]);
+    std::optional<Val> count;
+    if (e.args.size() == 3) count = eval(e.args[2]);
+    auto null = either(s.null, from.null);
+    if (count) null = either(null, count->null);
+    auto n = count ? count->value : constant(std::numeric_limits<std::int64_t>::max());
+    return guarded("bc_view", "bc_empty(cx)", null, "bc_substr(cx, " + s.value + ", " + from.value + ", " + n + ")",
+                   PhysType::Bytes);
   }
 
   // A local `type v = fallback`, set to `value` unless `null`; the Val of
@@ -2736,20 +2861,22 @@ auto resumable_plan(const physical::Plan& p) -> bool {
 }
 
 // Prints a searched plan, checked first.
-auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std::string_view sql) -> GeneratedPlan {
+auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std::string_view sql,
+                std::string_view fn = "plan") -> GeneratedPlan {
   p.param_types = param_types;
   physical::check(p);
   GeneratedPlan out;
   out.param_types = p.param_types;
   out.catalog_version = p.catalog_version;
-  Writer w{p};
+  auto own = fn == "plan";
+  Writer w{p, own ? std::string{"sub"} : std::string{fn} + "_sub"};
   // Each subquery as a function of its own: a miss in it returns from it.
   std::string subs;
   for (std::size_t i = 0; i < p.subs.size(); ++i) {
     Writer sw{*p.subs[i].plan};
     print_body(sw, *p.subs[i].plan);
     w.absorb(sw);
-    subs += "\nstatic void sub" + std::to_string(i) + "(bc_ctx *cx) {\n" + sw.body() + "}\n";
+    subs += "\nstatic void " + w.sub(i) + "(bc_ctx *cx) {\n" + sw.body() + "}\n";
   }
   print_body(w, p);
   if (p.set) {
@@ -2774,10 +2901,15 @@ auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std
     out.result_names.push_back(r.name);
     out.result_sql.push_back(r.sql);
   }
-  out.source = comment_line(sql) +
-               comment_line("isolation: snapshot   schema: catalog v" + std::to_string(p.catalog_version)) +
-               comment_line("objects: " + w.legend()) + "#include \"bc_plan.h\"\n" + w.constants() + "\n" + subs +
-               "\nvoid plan(bc_ctx *cx) {\n" + w.body() + "}\n";
+  out.functions = subs + "\n" + comment_line(sql) + std::string{own ? "" : "static "} + "void " + std::string{fn} +
+                  "(bc_ctx *cx) {\n" + w.body() + "}\n";
+  out.constants = w.constant_values();
+  if (own) {
+    out.source = comment_line(sql) +
+                 comment_line("isolation: snapshot   schema: catalog v" + std::to_string(p.catalog_version)) +
+                 comment_line("objects: " + w.legend()) + "#include \"bc_plan.h\"\n" + w.constants() + "\n" + subs +
+                 "\nvoid plan(bc_ctx *cx) {\n" + w.body() + "}\n";
+  }
   out.objects_read = w.objects_read();
   out.columns = w.columns_used();
   out.cost = p.cost;
@@ -2869,11 +3001,159 @@ void attach_subqueries(physical::Plan& p, bound::Bound& b, const Catalog& cat, c
 
 auto no_rows_lines(const physical::Node& root) -> std::vector<std::string> { return Gen::no_rows(root); }
 
+namespace {
+
+class ProcPrinter {
+public:
+  ProcPrinter() : w_{empty_}, gen_{w_} {}
+
+  auto print(const proc::Body& body) -> std::string {
+    w_.line("bc_ctx *cx = bc_proc_ctx(px);  /* the frame: $n is slot n */");
+    stmts(body);
+    return w_.body();
+  }
+
+private:
+  // A condition's C test: true only when the value is TRUE, as PL/pgSQL takes NULL as false.
+  auto truth(const logical::Expr& e) -> std::string {
+    auto v = gen_.value_of(e);
+    return v.null.empty() ? "(" + v.value + ")" : "(!(" + v.null + ") && (" + v.value + "))";
+  }
+
+  void set(std::uint32_t var, const logical::Expr& e, int rescale = 0) {
+    auto v = gen_.value_of(e);
+    if (rescale != 0) {
+      std::int64_t unit = 1;
+      for (auto k = 0; k < (rescale < 0 ? -rescale : rescale); ++k) unit *= 10;
+      auto u = constant(unit);
+      if (rescale > 0) {
+        v.value = "bc_mul(cx, " + v.value + ", " + u + ")";
+      } else {
+        // Half the unit, away from zero, then truncated by the division.
+        auto half = constant(unit / 2);
+        v.value = "bc_div(cx, bc_add_bigint(cx, " + v.value + ", (" + v.value + ") < 0 ? -" + half + " : " + half + ", 0), " +
+                  u + ")";
+      }
+    }
+    auto slot = std::to_string(var);
+    auto call = [&]() -> std::string {
+      switch (v.type) {
+        case PhysType::I64: return "bc_var_set_i64(px, " + slot + ", " + v.value + ");";
+        case PhysType::F64: return "bc_var_set_f64(px, " + slot + ", " + v.value + ");";
+        case PhysType::Bool: return "bc_var_set_bool(px, " + slot + ", " + v.value + ");";
+        case PhysType::Bytes: return "bc_var_set_bytes(px, " + slot + ", " + v.value + ");";
+      }
+      return {};
+    }();
+    if (v.null.empty()) {
+      w_.line(call);
+      return;
+    }
+    w_.open("if (" + v.null + ")");
+    w_.line("bc_var_set_null(px, " + slot + ");");
+    w_.otherwise();
+    w_.line(call);
+    w_.close();
+  }
+
+  void stmts(const proc::Body& body) {
+    for (const auto& s : body) std::visit([&](const auto& x) { stmt(x); }, s.v);
+  }
+
+  void stmt(const proc::Assign& a) {
+    w_.open("");
+    set(a.var, a.value, a.rescale);
+    w_.close();
+  }
+  void stmt(const proc::If& i) { branch(i, 0); }
+  void branch(const proc::If& i, std::size_t k) {
+    if (k == i.branches.size()) {
+      stmts(i.otherwise);
+      return;
+    }
+    w_.open("");
+    w_.open("if " + truth(i.branches[k].first));
+    stmts(i.branches[k].second);
+    if (k + 1 < i.branches.size() || !i.otherwise.empty()) {
+      w_.otherwise();
+      branch(i, k + 1);
+    }
+    w_.close();
+    w_.close();
+  }
+  void stmt(const proc::ForRange& f) {
+    auto r = std::to_string(f.range);
+    w_.open("");
+    auto lo = gen_.value_of(f.lower);
+    auto hi = gen_.value_of(f.upper);
+    // A NULL bound's value is not read: a NULL parameter has none.
+    auto bound = [](const Gen::Val& v) {
+      return v.null.empty() ? v.value + ", 0" : "(" + v.null + ") ? 0 : " + v.value + ", " + v.null;
+    };
+    w_.line("bc_range_open(px, " + r + ", " + bound(lo) + ", " + bound(hi) + ", " + (f.reverse ? "1" : "0") + ");");
+    ++loops_;
+    w_.open("while (bc_range_next(px, " + r + ", " + std::to_string(f.var) + "))");
+    stmts(f.body);
+    w_.close();
+    --loops_;
+    w_.close();
+  }
+  void stmt(const proc::While& l) {
+    ++loops_;
+    w_.open("while (bc_loop(px))");
+    if (l.cond) {
+      w_.open("");
+      w_.line("if (!" + truth(*l.cond) + ") break;");
+      w_.close();
+    }
+    stmts(l.body);
+    w_.close();
+    --loops_;
+  }
+  void stmt(const proc::Exit& e) {
+    if (loops_ == 0) throw ast::SqlError{std::string{e.exit ? "EXIT" : "CONTINUE"} + " cannot be used outside a loop", -1};
+    auto jump = std::string{e.exit ? "break;" : "continue;"};
+    if (!e.cond) {
+      w_.line(jump);
+      return;
+    }
+    w_.open("");
+    w_.line("if " + truth(*e.cond) + " " + jump);
+    w_.close();
+  }
+  void stmt(const proc::Exec& x) {
+    auto k = std::to_string(x.stmt);
+    w_.line("s" + k + "(bc_stmt_begin(px, " + k + "));");
+    w_.line("bc_stmt_end(px, " + k + ");");
+  }
+  void stmt(const proc::Return&) { w_.line("return;"); }
+  void stmt(const proc::ForQuery& f) {
+    auto k = std::to_string(f.stmt);
+    w_.line("s" + k + "(bc_stmt_begin(px, " + k + "));");
+    w_.line("bc_stmt_end(px, " + k + ");");
+    ++loops_;
+    w_.open("while (bc_rows_next(px, " + k + "))");
+    stmts(f.body);
+    w_.close();
+    --loops_;
+    w_.line("bc_rows_done(px, " + k + ");");
+  }
+
+  physical::Plan empty_;
+  Writer w_;
+  Gen gen_;
+  int loops_{0};
+};
+
+}  // namespace
+
+auto print_procedure_body(const proc::Body& body) -> std::string { return ProcPrinter{}.print(body); }
+
 auto generate_plan(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts,
-                   std::uint64_t memory_bytes) -> GeneratedPlan {
+                   std::uint64_t memory_bytes, std::string_view fn) -> GeneratedPlan {
   auto p = plan_for(rewritten(b), cat, counts, memory_bytes, b.param_types);
   attach_subqueries(p, b, cat, counts, memory_bytes);
-  return print_plan(p, b.param_types, sql);
+  return print_plan(p, b.param_types, sql, fn);
 }
 
 auto generate_alternatives(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts,

@@ -63,9 +63,12 @@ struct ColumnRef {
 // a BOOLEAN, NULL where SQL's logic says unknown, over operands of any
 // value expression. Case and Coalesce are values of a select list only:
 // every branch is of the expression's type, or a numeric of a finer scale
-// below it, which the evaluator brings up.
+// below it, which the evaluator brings up. Concat and Substr, text built
+// at run time, are values of a select list (and of a procedure's
+// expressions) only.
 struct Expr {
-  enum class Kind { Column, Param, Const, Add, Sub, Mul, Div, Compare, Aggregate, And, Or, Not, IsNull, Like, Truth, InSet, Case, Coalesce };
+  enum class Kind { Column, Param, Const, Add, Sub, Mul, Div, Compare, Aggregate, And, Or, Not, IsNull, Like, Truth, InSet, Case, Coalesce,
+                    Concat, Substr, Random };
   enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind{Kind::Param};
   SqlType type{};
@@ -81,7 +84,9 @@ struct Expr {
                                 // operand; Like: the column and the
                                 // pattern, a parameter; Truth: its parameter; InSet: its column;
                                 // Case: WHEN, THEN, WHEN, THEN … and an ELSE last if there is one (an odd count);
-                                // Coalesce: two or more
+                                // Coalesce: two or more; Concat: two, text or an integer or DECIMAL (its
+                                // text); Substr: the text, the start, and the count if given (INTEGERs);
+                                // Random: its two bounds, both included
 
   [[nodiscard]] auto phys() const -> PhysType { return phys_type(type); }
 

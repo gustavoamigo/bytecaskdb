@@ -46,6 +46,11 @@ inline constexpr SqlState kInvalidColumnReference{"42P10"};
 inline constexpr SqlState kInvalidForeignKey{"42830"};
 inline constexpr SqlState kDependentObjectsStillExist{"2BP01"};
 inline constexpr SqlState kUndefinedParameter{"42P02"};
+inline constexpr SqlState kDuplicateFunction{"42723"};  // also a procedure
+inline constexpr SqlState kInvalidFunctionDefinition{"42P13"};
+inline constexpr SqlState kNullValueNotAllowed{"22004"};
+inline constexpr SqlState kNoDataFound{"P0002"};   // STRICT: no row
+inline constexpr SqlState kTooManyRows{"P0003"};   // STRICT: a second row
 // What an input function or a range check reports (sql/text.cppm,
 // range_sqlstate): text its type does not read, or a value outside it.
 inline constexpr SqlState kInvalidTextRepresentation{"22P02"};
@@ -62,7 +67,7 @@ inline constexpr SqlState kCannotCoerce{"42846"};
 [[nodiscard]] constexpr auto known_sqlstate(std::string_view code) noexcept -> std::optional<SqlState> {
   for (auto s : {kSyntaxError, kFeatureNotSupported, kNumericValueOutOfRange, kDivisionByZero, kNotNullViolation, kGroupingError,
                  kDatatypeMismatch, kUndefinedFunction, kUndefinedColumn, kUndefinedTable, kUndefinedObject,
-                 kDuplicateColumn, kDuplicateTable, kDuplicateObject, kAmbiguousColumn, kDuplicateAlias, kIndeterminateDatatype, kWrongObjectType, kInvalidColumnReference, kInvalidForeignKey, kDependentObjectsStillExist, kUndefinedParameter,
+                 kDuplicateColumn, kDuplicateTable, kDuplicateObject, kAmbiguousColumn, kDuplicateAlias, kIndeterminateDatatype, kWrongObjectType, kInvalidColumnReference, kInvalidForeignKey, kDependentObjectsStillExist, kUndefinedParameter, kDuplicateFunction, kInvalidFunctionDefinition, kNullValueNotAllowed, kNoDataFound, kTooManyRows,
                  kInvalidTextRepresentation, kStringDataRightTruncation, kInvalidDatetimeFormat,
                  kDatetimeFieldOverflow, kCharacterNotInRepertoire, kInvalidParameterValue, kInvalidEscapeSequence, kSubstringError, kCannotCoerce}) {
     if (s.view() == code) return s;
