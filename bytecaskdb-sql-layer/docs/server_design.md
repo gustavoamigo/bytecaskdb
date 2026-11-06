@@ -1035,6 +1035,8 @@ The run script requires W ≥ the user count; the monitor is not a user.
     64 MiB unsent, the server reads no more and holds far less than the
     300 MB of replies, and every reply arrives once the client reads;
   - `--max-memory-bytes`: a statement past it is `53200` and fails its block;
+  - each thread the server starts, failed in turn by an `LD_PRELOAD` shim
+    (`tests/server/fail_thread.c`): an error and exit 1, never an abort;
   - `--vacuum` and its pauses and threshold: on by default the data directory
     shrinks under an overwrite load and SIGTERM still exits 0, off it keeps
     what was written, and a bad value exits before the server listens.
