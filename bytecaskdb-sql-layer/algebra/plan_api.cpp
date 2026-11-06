@@ -1710,7 +1710,7 @@ void txn_drop_context(bc_txn* txn) noexcept {
 }
 
 // Aborts the transaction: a failed statement leaves only bc_txn_free, so
-// what it holds goes now, the snapshot that holds vacuum back first. The
+// what it holds goes now, the snapshot that keeps disk blocks first. The
 // contexts begun on it are detached; each keeps its error.
 void txn_abort(bc_txn* txn) noexcept {
   txn->aborted = true;

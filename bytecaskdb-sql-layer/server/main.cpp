@@ -11,6 +11,8 @@
 //                     [--statement-memory-bytes 67108864] [--max-memory-bytes BYTES]
 //                     [--idle-in-transaction-timeout-ms 60000] [--statement-timeout-ms 0]
 //                     [--transaction-timeout-ms 0] [--idle-session-timeout-ms 0] [--startup-timeout-ms 60000]
+//                     [--vacuum on|off] [--vacuum-fragmentation-threshold 0.5]
+//                     [--vacuum-busy-interval-ms 500] [--vacuum-idle-interval-ms 30000]
 //
 // Serves one database directory under one name, by default the directory's
 // last component. Trust authentication only: anyone who reaches the port is
@@ -47,6 +49,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -62,6 +65,7 @@
 import bytecask.sql.api;
 import bytecask.sql.pg_session;
 import bytecask.sql.pg_wire;
+import bytecask.sql.vacuum_thread;
 
 namespace pg = bytecask::sql::pg;
 
@@ -90,7 +94,8 @@ auto flags(int argc, char** argv) -> std::map<std::string, std::string> {
         k != "thread-affinity" && k != "sync" && k != "sync-interval-ms" && k != "io-backend" &&
         k != "buffer-pool-size" && k != "buffer-pool-direct-io" && k != "statement-memory-bytes" && k != "max-memory-bytes" &&
         k != "idle-in-transaction-timeout-ms" && k != "statement-timeout-ms" && k != "transaction-timeout-ms" &&
-        k != "idle-session-timeout-ms" && k != "startup-timeout-ms") {
+        k != "idle-session-timeout-ms" && k != "startup-timeout-ms" && k != "vacuum" &&
+        k != "vacuum-fragmentation-threshold" && k != "vacuum-busy-interval-ms" && k != "vacuum-idle-interval-ms") {
       throw std::invalid_argument("unknown flag --" + k);
     }
   }
@@ -136,6 +141,18 @@ void number(const std::string& flag, const std::string& value, const char* takes
   if (ec != std::errc{} || end != value.data() + value.size()) {
     throw std::invalid_argument("--" + flag + " takes " + takes);
   }
+}
+
+// A pause flag's value, in the MariaDB plugin's range for its sysvar.
+void pause_ms(const std::map<std::string, std::string>& f, const std::string& flag, std::int64_t min, std::int64_t max,
+              std::chrono::milliseconds& out) {
+  const auto it = f.find(flag);
+  if (it == f.end()) return;
+  const auto takes = std::to_string(min) + " to " + std::to_string(max);
+  std::int64_t ms = 0;
+  number(flag, it->second, takes.c_str(), ms);
+  if (ms < min || ms > max) throw std::invalid_argument("--" + flag + " takes " + takes);
+  out = std::chrono::milliseconds{ms};
 }
 
 auto system_error(const char* what) -> std::system_error { return {errno, std::generic_category(), what}; }
@@ -708,6 +725,21 @@ int main(int argc, char** argv) {
       if (db_opts.max_memory_bytes == 0) throw std::invalid_argument("--max-memory-bytes takes a positive number of bytes");
     }
 
+    auto vacuum_on = true;
+    if (f.contains("vacuum")) vacuum_on = on_off("vacuum", f["vacuum"]);
+    bytecask::sql::VacuumOptions vacuum_opts;
+    if (f.contains("vacuum-fragmentation-threshold")) {
+      constexpr auto takes = "a number from 0.0 to 1.0";
+      number("vacuum-fragmentation-threshold", f["vacuum-fragmentation-threshold"], takes,
+             vacuum_opts.fragmentation_threshold);
+      if (!(vacuum_opts.fragmentation_threshold >= 0.0 && vacuum_opts.fragmentation_threshold <= 1.0)) {
+        throw std::invalid_argument(std::string{"--vacuum-fragmentation-threshold takes "} + takes);
+      }
+    }
+    bytecask::sql::VacuumPacing vacuum_pacing;
+    pause_ms(f, "vacuum-busy-interval-ms", 10, 3'600'000, vacuum_pacing.busy);
+    pause_ms(f, "vacuum-idle-interval-ms", 100, 86'400'000, vacuum_pacing.idle);
+
     sigset_t stop_signals;
     sigemptyset(&stop_signals);
     sigaddset(&stop_signals, SIGINT);
@@ -740,6 +772,16 @@ int main(int argc, char** argv) {
     (void)uv_poll_init(&sh0.loop, &srv.listener_poll, listener_fd);
     (void)uv_timer_init(&sh0.loop, &srv.accept_retry);
     (void)uv_poll_start(&srv.listener_poll, UV_READABLE, on_accept);
+
+    // Before the loop threads: a failed start then exits 1, where unwinding past
+    // them would terminate. Before the pin and the unblock too: it takes neither
+    // loop 0's CPU nor the stop signals. Declared after db, so it is gone before
+    // db on every way out.
+    std::optional<bytecask::sql::VacuumThread> vacuum;
+    if (vacuum_on) {
+      vacuum.emplace([&db, vacuum_opts] { return db->vacuum(vacuum_opts); }, [&db] { return db->is_degraded(); },
+                     vacuum_pacing);
+    }
 
     std::vector<std::thread> loop_threads;
     loop_threads.reserve(n_loops - 1);
@@ -774,6 +816,7 @@ int main(int argc, char** argv) {
     }
     if (srv.listener_fd >= 0) ::close(srv.listener_fd);
     srv.pool.shutdown();
+    vacuum.reset();  // waits for a pass in flight: the engine can't abort one
     db->close();
     return 0;
   } catch (const std::exception& e) {

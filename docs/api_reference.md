@@ -201,7 +201,9 @@ public:
                                    WritePlan plan) -> std::optional<CommitResult>;
 
     // Returns a frozen, move-only, read-only view of the DB at this instant.
-    // Holds open referenced data files until destroyed — vacuum deferred automatically.
+    // Holds open referenced data files until destroyed. Vacuum does not wait for it:
+    // it unlinks them anyway, and the snapshot keeps reading them and keeps their
+    // disk blocks.
     [[nodiscard]] auto snapshot() const -> Snapshot;
 
     [[nodiscard]] auto iter_from(const ReadOptions& opts, BytesView from = {}) const

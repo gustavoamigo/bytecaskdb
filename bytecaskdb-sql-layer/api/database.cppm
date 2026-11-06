@@ -62,10 +62,14 @@ export namespace bytecask::sql {
 using Value = bc_value;  // NULL, BIGINT, DOUBLE PRECISION, BOOLEAN, BYTEA
 
 // The errors the API throws that other modules declare: the catalog's
-// refusal of a DDL statement, and the engine's error for a call after
-// close().
+// refusal of a DDL statement, and the engine's errors for a call after
+// close() and for a vacuum on a degraded engine.
 using bytecask::sql::DdlRefused;
 using bytecask::DbClosed;
+using bytecask::DbDegraded;
+
+// Database::vacuum's options, the engine's.
+using bytecask::VacuumOptions;
 
 // PostgreSQL's AVG of an exact number, as numeric's text: its numeric_div
 // of the sum (the total at the argument's `scale`) by the count, the scale
@@ -506,7 +510,7 @@ struct TxnHandle {
     cx = nullptr;
     txn = nullptr;
   }
-  // Aborted: what it held is freed now, the snapshot that holds vacuum back
+  // Aborted: what it held is freed now, the snapshot that keeps disk blocks
   // first. Only the state is left, for rollback() or commit() to end.
   void abort() noexcept {
     for (const auto& c : cursors) c->aborted = true;
@@ -800,6 +804,22 @@ public:
   [[nodiscard]] auto compilations() const -> std::uint64_t { return compilations_.load(); }
   // The live catalog: the version DDL last published.
   [[nodiscard]] auto catalog() const -> std::shared_ptr<const Catalog>;
+  // Reclaims one sealed data file past opts.fragmentation_threshold, if there
+  // is one, and returns whether it did. Nothing calls this on its own, so a
+  // database whose host never calls it never gets its disk back; the server
+  // has a thread for it (docs/session_design.md, *Background vacuum*). Runs
+  // concurrently with statements and commits, which wait only for its commit;
+  // a second call waits for the first. An open snapshot keeps reading what it
+  // reclaims, and keeps those disk blocks until it is released. close() waits
+  // for a call in flight, up to a whole file's compaction, so a host stops
+  // calling first. Throws DbClosed, DbDegraded, or what the failed I/O threw. A
+  // failure changes nothing readable, but a failed fdatasync degrades the engine
+  // as a commit's does, and a failed unlink of the old file throws after the
+  // file was reclaimed, leaving it for the next open.
+  [[nodiscard]] auto vacuum(VacuumOptions opts = {}) -> bool;
+  // Whether a failure has left the engine refusing writes: a failed fdatasync
+  // in a vacuum throws the I/O error, not DbDegraded. False after close().
+  [[nodiscard]] auto is_degraded() const -> bool;
   // The engine's operational counters and gauges by name, as DB::stats()
   // gives them; the buffer pool's are all zero on a backend with no pool. Live
   // values, not one atomic snapshot. Takes no lock another call waits on.
@@ -1364,6 +1384,16 @@ void Database::stop_flusher() {
   }
   flush_cv_.notify_one();
   if (flusher_.joinable()) flusher_.join();
+}
+
+auto Database::is_degraded() const -> bool {
+  const std::shared_lock<std::shared_mutex> lock{life_->mu};
+  return !life_->closed && db_->is_degraded();
+}
+
+auto Database::vacuum(VacuumOptions opts) -> bool {
+  const auto alive = enter();
+  return db_->vacuum(opts);
 }
 
 auto Database::acquire_context() -> bc_ctx* {
