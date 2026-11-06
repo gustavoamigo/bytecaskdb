@@ -77,7 +77,7 @@ auto to_module(const bytecask::internal::ReadOptions& o) noexcept -> bytecask::R
 }
 
 auto to_module(bytecask::internal::VacuumOptions o) noexcept -> bytecask::VacuumOptions {
-  return {o.fragmentation_threshold, o.retain_after};
+  return {o.fragmentation_threshold, o.retain_after, o.cancel};
 }
 
 auto to_module(bytecask::internal::IoBackend b) noexcept -> bytecask::IoBackend {

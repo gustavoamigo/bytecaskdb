@@ -222,6 +222,9 @@ public:
     // its bytes that are overwritten or deleted values; tombstones and batch
     // markers count towards neither side. False when no file qualified or
     // none could be made smaller.
+    // Reclaims one sealed file past opts.fragmentation_threshold, and returns whether it
+    // did. Set the flag at opts.cancel, if any, to stop it early: it then returns false,
+    // with nothing published. Its hint write and commit still run if it is past them.
     [[nodiscard]] auto vacuum(VacuumOptions opts = {}) -> bool;
 
     // The single sequence primitive — returns the highest sequence confirmed

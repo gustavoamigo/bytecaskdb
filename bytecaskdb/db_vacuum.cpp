@@ -24,6 +24,14 @@ module bytecask;
 
 namespace bytecask {
 
+namespace {
+
+[[nodiscard]] auto vacuum_cancelled(const VacuumOptions &opts) -> bool {
+  return opts.cancel != nullptr && opts.cancel->load(std::memory_order_relaxed);
+}
+
+}  // namespace
+
 // Thread-safe: vacuum_mu_ serialises concurrent vacuum() calls independently
 // from write_mu_, so normal put/del/apply_batch calls are not blocked while
 // vacuum scans and rewrites data — only the brief commit step acquires
@@ -71,6 +79,7 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
   std::ranges::sort(candidates, std::greater<>{});
 
   for (const auto &[frag, fid] : candidates) {
+    if (vacuum_cancelled(opts)) return false;
     const auto target = *stats_snap.get(fid);
     // Fast path: nothing in the file needs keeping — skip the scan and drop
     // it. A tombstone may need keeping even with no live key left: dropping
@@ -87,7 +96,7 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
     // Compaction returns false when it cannot make the file smaller: every
     // dead entry in it may be above retain_after. The next candidate may
     // still have something to reclaim.
-    if (vacuum_compact_file(fid, opts.retain_after)) return true;
+    if (vacuum_compact_file(fid, opts)) return true;
   }
   return false;
 }
@@ -101,8 +110,9 @@ auto DB::vacuum_scan_and_copy(
     const std::shared_ptr<const EngineState> &snap,
     const DataFile &source_file, WritableDataFile &dest_file,
     std::uint32_t source_file_id, const NeededTombstones &needed,
-    std::uint64_t retain_after) -> VacuumScanResult {
+    const VacuumOptions &opts) -> VacuumScanResult {
   VacuumScanResult result;
+  const auto retain_after = opts.retain_after;
 
   // The source is scanned in file order, where sequences ascend.
   auto track_seq = [&](std::uint64_t seq) {
@@ -181,6 +191,13 @@ auto DB::vacuum_scan_and_copy(
   };
 
   for (const auto &[entry, entry_off] : scan_committed(source_file)) {
+#ifdef BYTECASK_TESTING
+    if (test_vacuum_scan_entry_) test_vacuum_scan_entry_();
+#endif
+    if (vacuum_cancelled(opts)) {
+      result.cancelled = true;
+      break;
+    }
     emit_entry(entry, entry_off);
   }
 
@@ -240,7 +257,7 @@ void DB::vacuum_unlink_old_file(
 // not write_mu_.
 // The new data file is written to .data.tmp, then renamed atomically.
 // The old file is deferred for cleanup when no readers reference it.
-auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
+auto DB::vacuum_compact_file(std::uint32_t file_id, const VacuumOptions &opts)
     -> bool {
   auto snap = load_state_for_write();
   // Checked again where the id is reserved; here so a vacuum that cannot
@@ -281,7 +298,8 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
         dir_, stem, ".data.tmp", rotation_threshold_,
         stagingBackend(io_backend_));
     scan = vacuum_scan_and_copy(snap, old_file, *tmp_file, file_id,
-                                needed_tombstones_, retain_after);
+                                needed_tombstones_, opts);
+    if (scan.cancelled) return false;
     tmp_file->sync();
 #ifdef BYTECASK_TESTING
     FAULT_INJECTION(io_vacuum_compact_shrink);
@@ -332,6 +350,8 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
   FAULT_INJECTION(io_vacuum_compact_post_rename);
   if (test_before_vacuum_commit_) test_before_vacuum_commit_();
 #endif
+  // The last check: past it are the hint scan of the copy and the commit.
+  if (vacuum_cancelled(opts)) return false;
 
   // Reserve the destination id before opening the file, so the file carries
   // its engine file_id from construction — the buffer pool keys frames by it.

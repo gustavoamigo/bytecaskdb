@@ -837,6 +837,12 @@ The snapshot a file is judged by is the published state, and it includes `sync =
 
 So both primitives, in `vacuum_commit` and before the source can be unlinked, make every write up to the snapshot's last sequence durable: an `fdatasync` of the active file under the write barrier, advancing `durable_seq` as a commit would. It is skipped when `durable_seq` already covers the snapshot, which is the case whenever the writes are synced. A failed sync degrades the engine, like any failed `fdatasync` on the write path, and vacuum throws before committing, leaving the source in place. A degraded engine cannot trust a later sync (#231), so vacuum refuses there too. The alternative, dropping a record only when its superseder is at or below `durable_seq`, adds no sync but leaves the rest for a later vacuum that has to find them again.
 
+#### Cancelling a vacuum
+
+`VacuumOptions::cancel` lets a caller stop a vacuum in flight rather than wait for a file's rewrite: `Database::close()` in the SQL layer uses it, so that closing does not wait for a compaction. The engine's own `close()` still waits, on `vacuum_mu_`, for whatever the call has left.
+
+The flag is read before each candidate, before each entry the scan copies, and once the copy is in place. A cancelled call returns `false`, as one that could not shrink its file does, and needs nothing new to undo: it is an exit before the commit, so *Crash safety*'s cleanup removes the copy. The hint scan and the commit are past the last check. The commit can't stop partway, and a hint write is bounded by the copy's size. The scan's check is one relaxed atomic load per entry.
+
 #### Vacuum caller (`vacuum()`)
 
 The public `vacuum()` method orchestrates file selection and dispatches to exactly one primitive:
