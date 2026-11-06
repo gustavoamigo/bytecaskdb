@@ -312,14 +312,13 @@ reclaimed a file and the idle pause otherwise.
 `Database` because a sync mode is a durability promise `Database` makes;
 vacuum promises nothing, and when to run it is the host's policy, as in the
 plugin. An embedded host calls `Database::vacuum` itself, and one that never
-does never gets its disk back. `Database::close()` waits for a call in flight,
-up to a whole file's compaction, so a host stops calling first.
+does never gets its disk back. `Database::close()` cancels a call in flight.
 
 **Start and stop.** It starts before the loop threads, so a failed start exits
 1, and before `main` pins itself to a CPU and unblocks the stop signals, so it
-inherits neither. It stops after the sessions and
-before `Database::close()`, waiting for a pass in flight, since the engine
-can't abort one: a stop can take one more compaction of a 64 MiB file.
+inherits neither. At a stop, `Database::close()` comes first: it cancels a pass
+in flight and waits at most for its hint write and commit, and a later pass finds
+the database closed and ends the thread.
 
 **Failures.** A failed pass changes nothing readable. It is logged, and retried
 after the idle pause: ENOSPC, EMFILE, or no file id left (#774). A lasting

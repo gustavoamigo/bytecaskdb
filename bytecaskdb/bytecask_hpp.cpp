@@ -28,6 +28,7 @@
 //
 // BYTECASK_HPP_NO_STD_INCLUDES tells bytecask.hpp to skip its own copies of
 // these includes since they are already in scope.
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -77,7 +78,7 @@ auto to_module(const bytecask::internal::ReadOptions& o) noexcept -> bytecask::R
 }
 
 auto to_module(bytecask::internal::VacuumOptions o) noexcept -> bytecask::VacuumOptions {
-  return {o.fragmentation_threshold, o.retain_after};
+  return {o.fragmentation_threshold, o.retain_after, o.cancel};
 }
 
 auto to_module(bytecask::internal::IoBackend b) noexcept -> bytecask::IoBackend {

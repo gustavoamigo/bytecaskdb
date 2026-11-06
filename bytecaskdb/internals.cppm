@@ -1080,6 +1080,7 @@ export struct ResumeEntry {
 };
 
 export struct VacuumScanResult {
+  bool cancelled{false};  // VacuumOptions::cancel stopped the scan: the copy is incomplete
   std::vector<VacuumMapping> mappings;
   std::uint64_t live_bytes{0};
   std::uint64_t total_bytes{0};

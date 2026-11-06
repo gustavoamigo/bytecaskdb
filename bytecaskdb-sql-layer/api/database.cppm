@@ -810,9 +810,9 @@ public:
   // has a thread for it (docs/session_design.md, *Background vacuum*). Runs
   // concurrently with statements and commits, which wait only for its commit;
   // a second call waits for the first. An open snapshot keeps reading what it
-  // reclaims, and keeps those disk blocks until it is released. close() waits
-  // for a call in flight, up to a whole file's compaction, so a host stops
-  // calling first. Throws DbClosed, DbDegraded, or what the failed I/O threw. A
+  // reclaims, and keeps those disk blocks until it is released. close() cancels
+  // a call in flight, which then returns false, and waits for it to stop: at
+  // most its hint write and its commit. So opts.cancel is not read. Throws DbClosed, DbDegraded, or what the failed I/O threw. A
   // failure changes nothing readable, but a failed fdatasync degrades the engine
   // as a commit's does, and a failed unlink of the old file throws after the
   // file was reclaimed, leaving it for the next open.
@@ -862,6 +862,9 @@ public:
   // transaction's catalog is pinned, before the plan is checked against it.
   // Set it while no transaction runs.
   void after_txn_pin_for_testing(std::function<void()> hook) { after_txn_pin_ = std::move(hook); }
+  // Test only: called in vacuum with the options it gives the engine, before
+  // it does. Set it while no vacuum runs.
+  void before_vacuum_for_testing(std::function<void(const VacuumOptions&)> hook) { before_vacuum_ = std::move(hook); }
   // Test only: the time CURRENT_DATE, LOCALTIME and LOCALTIMESTAMP read, as
   // microseconds since 1970-01-01 00:00:00 UTC; the system clock by default.
   // Set it while no statement runs.
@@ -997,6 +1000,7 @@ private:
   std::atomic<std::uint64_t> plan_checks_{0};
   std::atomic<bool> conflict_every_commit_{false};
   std::function<void()> after_txn_pin_;
+  std::function<void(const VacuumOptions&)> before_vacuum_;
 #endif
 };
 
@@ -1393,6 +1397,10 @@ auto Database::is_degraded() const -> bool {
 
 auto Database::vacuum(VacuumOptions opts) -> bool {
   const auto alive = enter();
+  opts.cancel = &life_->closing;
+#ifdef BYTECASK_SQL_TESTING
+  if (before_vacuum_) before_vacuum_(opts);
+#endif
   return db_->vacuum(opts);
 }
 

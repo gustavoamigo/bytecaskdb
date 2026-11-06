@@ -831,8 +831,8 @@ int main(int argc, char** argv) {
     }
     if (srv.listener_fd >= 0) ::close(srv.listener_fd);
     srv.pool.shutdown();
-    vacuum.reset();  // waits for a pass in flight: the engine can't abort one
-    db->close();
+    db->close();  // cancels a vacuum pass in flight, and ends the passes
+    vacuum.reset();
     return 0;
   } catch (const std::exception& e) {
     std::fprintf(stderr, "sql_layer_server: %s\n", e.what());

@@ -4007,6 +4007,91 @@ TEST_CASE("vacuum remaps only the keys no write changed during its copy",
   CHECK(collect_kv(reopened) == expected);
 }
 
+namespace {
+
+// One sealed file with dead bytes to reclaim, and every name in the directory.
+void seed_vacuum_cancel(bytecask::DB &db) {
+  for (int i = 0; i < 8; ++i) {
+    db.put({}, to_bytes("k" + std::to_string(i)), to_bytes("old"));
+  }
+  for (int i = 0; i < 4; ++i) {
+    db.put({}, to_bytes("k" + std::to_string(i)), to_bytes("new"));
+  }
+  (void)db.create_manifest();
+}
+
+auto directory_names(const std::filesystem::path &dir) -> std::set<std::string> {
+  std::set<std::string> names;
+  for (const auto &entry : std::filesystem::directory_iterator{dir}) {
+    names.insert(entry.path().filename().string());
+  }
+  return names;
+}
+
+} // namespace
+
+TEST_CASE("vacuum cancelled at any entry of its scan publishes nothing and leaves no copy",
+          "[vacuum]") {
+  auto cancelled_runs = 0;
+  for (auto nth = 1;; ++nth) {
+    TempDir td;
+    auto db = bytecask::DB::open(td.path / "db");
+    seed_vacuum_cancel(db);
+    const auto before = collect_kv(db);
+    const auto names = directory_names(td.path / "db");
+
+    std::atomic<bool> cancel{false};
+    auto seen = 0;
+    db.test_vacuum_scan_entry_ = [&] {
+      if (++seen == nth) cancel.store(true);
+    };
+    const auto reclaimed =
+        db.vacuum({.fragmentation_threshold = 0.0, .cancel = &cancel});
+    db.test_vacuum_scan_entry_ = nullptr;
+    if (seen < nth) {  // past the last entry: nothing cancelled it
+      CHECK(reclaimed);
+      break;
+    }
+    INFO("cancelled at entry " << nth);
+    ++cancelled_runs;
+    CHECK_FALSE(reclaimed);
+    CHECK(seen == nth);  // it stopped there, not at a later check
+    CHECK(collect_kv(db) == before);
+    CHECK(directory_names(td.path / "db") == names);
+    // Cancelled, not refused: the next call does the work.
+    CHECK(db.vacuum({.fragmentation_threshold = 0.0}));
+    CHECK(collect_kv(db) == before);
+    db.close();
+    auto reopened = bytecask::DB::open(td.path / "db");
+    CHECK(collect_kv(reopened) == before);
+  }
+  CHECK(cancelled_runs >= 12);
+}
+
+TEST_CASE("vacuum cancelled before its call or after its copy is placed publishes nothing and leaves no copy",
+          "[vacuum]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  seed_vacuum_cancel(db);
+  const auto before = collect_kv(db);
+  const auto names = directory_names(td.path / "db");
+  std::atomic<bool> cancel{false};
+
+  SECTION("before the call") {
+    cancel.store(true);
+  }
+  SECTION("once the copy is placed under its final name") {
+    db.test_before_vacuum_commit_ = [&] { cancel.store(true); };
+  }
+  CHECK_FALSE(db.vacuum({.fragmentation_threshold = 0.0, .cancel = &cancel}));
+  db.test_before_vacuum_commit_ = nullptr;
+  CHECK(collect_kv(db) == before);
+  CHECK(directory_names(td.path / "db") == names);
+  db.close();
+  auto reopened = bytecask::DB::open(td.path / "db");
+  CHECK(collect_kv(reopened) == before);
+}
+
 TEST_CASE("recovery undoes a vacuum killed before the source was unlinked",
           "[vacuum][recovery]") {
   TempDir td;

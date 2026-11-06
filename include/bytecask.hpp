@@ -23,6 +23,7 @@
 // an LLVM 22+ hard error (see that file for the full explanation), then defines
 // this macro so we don't re-include headers that are already in scope.
 #ifndef BYTECASK_HPP_NO_STD_INCLUDES
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -137,6 +138,11 @@ struct VacuumOptions {
   // replication service; kNoRetention (-1), the default, means no
   // restriction.
   std::uint64_t retain_after{kNoRetention};
+  // Once this reads true, the call stops at its next check and returns false,
+  // with nothing published and its copy removed. Past its last check it runs
+  // to the end: that covers the hint write of the compacted file and the
+  // commit. Null, the default: never. Must outlive the call.
+  const std::atomic<bool>* cancel{nullptr};
 };
 
 struct Options {

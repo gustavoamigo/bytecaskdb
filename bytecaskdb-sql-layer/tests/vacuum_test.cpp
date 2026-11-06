@@ -366,6 +366,39 @@ TEST_CASE("Database::vacuum: throws DbDegraded on a degraded engine, which ends 
   db->engine_for_testing().resume();
 }
 
+TEST_CASE("Database::vacuum: close() cancels a call in flight, which reclaims nothing and loses nothing",
+          "[sql][api]") {
+  sql_test::TempDir dir{"vacuum_cancel"};
+  auto db = open_wide(dir);
+  insert_rows(*db, kKept, 0, kKeptRows);
+  const auto first_file = only_data_file(dir);
+  insert_rows(*db, 0, 0);
+  for (auto round = 1; round < 6; ++round) update_rows(*db, 0, round);
+
+  // close() has marked the database closing, and waits for this call, when
+  // the engine is given the options.
+  std::thread closer;
+  db->before_vacuum_for_testing([&](const VacuumOptions& opts) {
+    REQUIRE(opts.cancel != nullptr);
+    CHECK_FALSE(opts.cancel->load());
+    closer = std::thread{[&] { db->close(); }};
+    REQUIRE(eventually([&] { return opts.cancel->load(); }));
+  });
+  // There was a file to reclaim: only the cancel makes this false.
+  CHECK_FALSE(db->vacuum());
+  closer.join();
+  CHECK_THROWS_AS(db->vacuum(), DbClosed);
+
+  CHECK(std::filesystem::exists(first_file));
+  for (const auto& entry : std::filesystem::directory_iterator{dir.path()}) {
+    CHECK(entry.path().extension() != ".tmp");
+  }
+  db = Database::open(dir.path());
+  CHECK(holds(scan(*db), 0, 5));
+  CHECK(holds(scan_kept(*db), kKept, 0, kKeptRows));
+  CHECK(db->vacuum());
+}
+
 TEST_CASE("Database::vacuum: a transaction open across it reads its snapshot and commits with no conflict",
           "[sql][api]") {
   sql_test::TempDir dir{"vacuum_txn"};

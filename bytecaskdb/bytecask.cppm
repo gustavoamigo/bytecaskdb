@@ -103,6 +103,11 @@ export struct VacuumOptions {
   // on every node, since a follower can become leader. kNoRetention (-1),
   // the default, means no restriction.
   std::uint64_t retain_after{kNoRetention};
+  // Once this reads true, the call stops at its next check and returns false,
+  // with nothing published and its copy removed. Past its last check it runs
+  // to the end: that covers the hint write of the compacted file and the
+  // commit. Null, the default: never. Must outlive the call.
+  const std::atomic<bool>* cancel{nullptr};
 };
 
 
@@ -1445,11 +1450,11 @@ private:
   // Vacuum helpers
   // Batch-aware scan: copies live Puts, markers and the tombstones `needed`
   // does not allow dropping from source_file into dest_file.
-  static auto vacuum_scan_and_copy(
+  auto vacuum_scan_and_copy(
       const std::shared_ptr<const EngineState> &snap,
       const DataFile &source_file, WritableDataFile &dest_file,
       std::uint32_t source_file_id, const NeededTombstones &needed,
-      std::uint64_t retain_after) -> VacuumScanResult;
+      const VacuumOptions &opts) -> VacuumScanResult;
   // Remaps key_dir entries, updates file registry, publishes new state.
   // First makes every write through decided_at durable: the state vacuum
   // judged the file's records dead by. Caller must hold write_mu_.
@@ -1467,7 +1472,7 @@ private:
                               std::uint32_t file_id);
   // Rewrites a sealed file into a new sealed file containing only live entries.
   [[nodiscard]] auto vacuum_compact_file(std::uint32_t file_id,
-                                         std::uint64_t retain_after) -> bool;
+                                         const VacuumOptions &opts) -> bool;
   // Removes a sealed file with no live key and nothing compaction would keep:
   // the state change and the unlink, no scan.
   void vacuum_remove_file(std::uint32_t file_id);
@@ -1891,6 +1896,8 @@ public:
   // Called by vacuum once its copy is in place, before it takes the write
   // barrier to commit. Lets a test write to the keys the copy holds.
   std::function<void()> test_before_vacuum_commit_;
+  // Called for each entry vacuum's scan reads, before it is copied.
+  std::function<void()> test_vacuum_scan_entry_;
   // Called under durable_mu_ each time a thread blocked in wait_published or
   // durable_sequence checks its condition, the first time before it blocks.
   // Lets a test act once a waiter is parked. Must not take durable_mu_.
