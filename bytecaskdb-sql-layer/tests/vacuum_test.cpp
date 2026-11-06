@@ -236,7 +236,7 @@ TEST_CASE("Database::vacuum: a threshold of 1.0 reclaims nothing, not even a ful
   CHECK(db->vacuum());
 }
 
-TEST_CASE("Database::vacuum: throws DbDegraded on a degraded engine, which ends the thread", "[sql][api]") {
+TEST_CASE("Database::vacuum: throws DbDegraded on a degraded engine, which ends the thread", "[sql][api][alloc]") {
   if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation fault seam in this build");
   sql_test::TempDir dir{"vacuum_degraded"};
   auto db = open_wide(dir);
