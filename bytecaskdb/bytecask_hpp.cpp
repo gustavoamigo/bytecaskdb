@@ -28,6 +28,7 @@
 //
 // BYTECASK_HPP_NO_STD_INCLUDES tells bytecask.hpp to skip its own copies of
 // these includes since they are already in scope.
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
