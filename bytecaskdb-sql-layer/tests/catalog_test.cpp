@@ -142,59 +142,31 @@ TEST_CASE("catalog: a table record round-trips every field", "[sql][catalog]") {
   CHECK(serialize_table(u) == rec);
 }
 
-TEST_CASE("catalog: a table's CHECK constraints are a format-5 tail; a table without any is still format 4", "[sql][catalog]") {
+TEST_CASE("catalog: every table record is format 7, its CHECK constraints its tail", "[sql][catalog]") {
   auto plain = rich_table();
-  auto rec4 = serialize_table(plain);
-  CHECK(rec4[0] == std::byte{4});  // an earlier build still opens a database without a CHECK
+  auto rec_plain = serialize_table(plain);
+  CHECK(rec_plain[0] == std::byte{7});
   auto t = rich_table();
+  t.columns.back().sql = SqlType{SqlKind::TimestampTz};
+  t.columns[2].sql = SqlType{SqlKind::Char, 7};
   t.checks = {{"c1", "a > 0"}, {"c2", "a < b AND b <> 'x(y'"}};
   auto rec = serialize_table(t);
-  CHECK(rec[0] == std::byte{5});
+  CHECK(rec[0] == std::byte{7});
   auto u = parse_table(rec);
+  CHECK(u.columns.back().sql.kind == SqlKind::TimestampTz);
+  CHECK(u.columns[2].sql == SqlType{SqlKind::Char, 7});
   REQUIRE(u.checks.size() == 2);
   CHECK(u.checks[1].name == "c2");
   CHECK(u.checks[1].expr == "a < b AND b <> 'x(y'");
   CHECK(serialize_table(u) == rec);
-  // Every cut is refused, and so is a format-5 record that holds none and one that names a CHECK twice.
+  CHECK(parse_table(rec_plain).checks.empty());
+  // Every cut is refused, and so is a record that names a CHECK twice.
   for (std::size_t n = 0; n < rec.size(); ++n) {
     INFO(n);
     CHECK_THROWS_AS(parse_table(BytesView{rec}.first(n)), std::runtime_error);
   }
-  auto none = rec4;
-  none[0] = std::byte{5};
-  none.push_back(std::byte{0});
-  none.push_back(std::byte{0});
-  CHECK_THROWS_AS(parse_table(none), std::runtime_error);
   t.checks = {{"c1", "a > 0"}, {"c1", "a < 9"}};
   CHECK_THROWS_AS(parse_table(serialize_table(t)), std::runtime_error);
-}
-
-TEST_CASE("catalog: a table with a TIMESTAMPTZ or CHAR(n) column is a format-6 record; any other keeps format 4 or 5", "[sql][catalog]") {
-  auto t = rich_table();
-  t.columns.back().sql = SqlType{SqlKind::TimestampTz};  // an earlier build would call the tag corrupt
-  auto rec = serialize_table(t);
-  CHECK(rec[0] == std::byte{6});
-  auto u = parse_table(rec);
-  CHECK(u.columns.back().sql.kind == SqlKind::TimestampTz);
-  CHECK(u.checks.empty());
-  CHECK(serialize_table(u) == rec);
-  // A CHAR(n) column is a format-6 record too, its length kept.
-  t.columns[2].sql = SqlType{SqlKind::Char, 7};
-  auto char_rec = serialize_table(t);
-  CHECK(char_rec[0] == std::byte{6});
-  CHECK(parse_table(char_rec).columns[2].sql == SqlType{SqlKind::Char, 7});
-  t.checks = {{"c1", "f > 0"}};
-  auto with_check = serialize_table(t);
-  CHECK(with_check[0] == std::byte{6});
-  CHECK(parse_table(with_check).checks.size() == 1);
-  // A format-5 record still may not hold an empty CHECK list.
-  auto five = rec;
-  five[0] = std::byte{5};
-  CHECK_THROWS_AS(parse_table(five), std::runtime_error);
-  for (std::size_t n = 0; n < rec.size(); ++n) {
-    INFO(n);
-    CHECK_THROWS_AS(parse_table(BytesView{rec}.first(n)), std::runtime_error);
-  }
 }
 
 TEST_CASE("catalog: CHECK constraints are named as PostgreSQL names them and survive a reopen", "[sql][catalog]") {
@@ -249,9 +221,13 @@ TEST_CASE("catalog: a damaged or foreign-format record is refused", "[sql][catal
     }
     return std::string{};
   };
-  CHECK(format(1).find("earlier SQL-layer build") != std::string::npos);
-  CHECK(format(2).find("earlier SQL-layer build") != std::string::npos);
-  CHECK(format(7).find("later SQL-layer build") != std::string::npos);
+  // Formats 1 to 6 laid rows and keys out in 8-byte words: refused, so no
+  // row or key of theirs is read as this build's (#780).
+  for (std::uint8_t f = 1; f <= 6; ++f) {
+    INFO(int{f});
+    CHECK(format(f).find("earlier SQL-layer build") != std::string::npos);
+  }
+  CHECK(format(8).find("later SQL-layer build") != std::string::npos);
 
   // Records that parse but break an invariant.
   auto broken = [](auto&& mutate) {
@@ -276,40 +252,6 @@ TEST_CASE("catalog: a damaged or foreign-format record is refused", "[sql][catal
                   std::runtime_error);
 }
 
-namespace {
-
-// `rec`, a format-4 record, as format 3 wrote it: no hidden flag at the end
-// of each column entry.
-auto as_format_3(const Bytes& rec) -> Bytes {
-  auto u16 = [&](std::size_t at) {
-    return std::to_integer<std::size_t>(rec[at]) | std::to_integer<std::size_t>(rec[at + 1]) << 8;
-  };
-  auto u32 = [&](std::size_t at) { return u16(at) | u16(at + 2) << 16; };
-  Bytes out{std::byte{3}, std::byte{0}};
-  auto at = std::size_t{2};
-  auto copy = [&](std::size_t n) {
-    auto from = rec.begin() + static_cast<std::ptrdiff_t>(at);
-    out.insert(out.end(), from, from + static_cast<std::ptrdiff_t>(n));
-    at += n;
-  };
-  copy(4);              // id
-  copy(2 + u16(at));    // name
-  copy(8);              // version, next_col_id
-  auto ncols = u16(at);
-  copy(2);
-  for (std::size_t i = 0; i < ncols; ++i) {
-    auto len = u32(at) - 1;  // the entry without its last byte, the hidden flag
-    for (std::size_t b = 0; b < 4; ++b) out.push_back(static_cast<std::byte>(len >> (8 * b)));
-    at += 4;
-    copy(len);
-    ++at;
-  }
-  copy(rec.size() - at);
-  return out;
-}
-
-}  // namespace
-
 TEST_CASE("catalog: a table without a primary key has a hidden row id as its key", "[sql][catalog]") {
   sql_test::TempDir dir{"catalog_row_id"};
   auto db = DB::open(dir.path());
@@ -330,20 +272,12 @@ TEST_CASE("catalog: a table without a primary key has a hidden row id as its key
   (void)live.apply(create_t());
   CHECK(live.current()->table("t")->row_id() == nullptr);
 
-  // The record round-trips the flag, and a format-3 record, which has none,
-  // reads with no hidden column; a format-3 entry read as format 4 runs one
-  // byte short.
+  // The record round-trips the flag.
   auto rec = serialize_table(t);
   auto u = parse_table(rec);
   REQUIRE(u.row_id() != nullptr);
   CHECK(u.row_id()->id == rid->id);
   CHECK(serialize_table(u) == rec);
-  auto old = parse_table(as_format_3(serialize_table(rich_table())));
-  CHECK(std::ranges::none_of(old.columns, &Column::hidden));
-  CHECK(old.columns.size() == rich_table().columns.size());
-  auto short_entries = as_format_3(rec);
-  short_entries[0] = std::byte{4};
-  CHECK_THROWS_AS(parse_table(short_entries), std::runtime_error);
 
   // A hidden column is only ever the whole key: a BIGINT with no name, no
   // default and no index part, the table's only one.
@@ -641,7 +575,7 @@ TEST_CASE("catalog: every DDL survives a reopen", "[sql][catalog]") {
     Bytes key;
     key_put_prefix(key, kNsIndex, 3);
     key_put_bytes(key, bytes("bob"), kl->parts[0]);
-    key_put_i64(key, 1, kl->parts[1]);
+    REQUIRE(key_put_i64(key, 1, kl->parts[1]));
     Bytes out;
     CHECK(db.get({}, key, out));
     // ADD COLUMN with a default rewrites the rows; positions do not move.
@@ -663,7 +597,7 @@ TEST_CASE("catalog: every DDL survives a reopen", "[sql][catalog]") {
     CHECK(t.column("tag")->default_value == Datum{std::int64_t{7}});
     Bytes pk, row;
     key_put_prefix(pk, kNsRow, 1);
-    key_put_i64(pk, 2, {PhysType::I64});
+    REQUIRE(key_put_i64(pk, 2, {PhysType::I64}));
     REQUIRE(db.get({}, pk, row));
     CHECK(row_column(row, *t.layout.find(3)).i64() == 7);
     CHECK(row_column(row, *t.layout.find(2)).i64() == 20);

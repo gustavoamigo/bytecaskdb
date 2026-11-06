@@ -24,7 +24,7 @@ share this one only if it adopted the layer's formats (#488).
 | columns | Each: permanent `id`, `name`, SQL type (kind, `VARCHAR` length, `DECIMAL` precision and scale), nullability, default, and whether it is hidden: the row id of a table declared without a primary key (*Tables without a primary key*). The physical type follows from the SQL type (`types_design.md`, *Types*). |
 | primary key | Column ids, in key order. Always ascending; a primary key column is never null. For a table declared without one, its hidden row id. |
 | indexes | Each: permanent `id`, `name`, unique or not, parts as (column id, `ASC`/`DESC`). |
-| checks | Each `CHECK` constraint: its name and the text of its expression (*CHECK constraints*). Absent for most tables. |
+| checks | Each `CHECK` constraint: its name and the text of its expression (*CHECK constraints*). Empty for most tables. |
 | layouts | Each layout generation: its object id, its generation number, `bitmap_bytes`, and its offset table (column id → byte offset or variable slot). The last is current. Each table has one until `REBUILD` exists, which appends one (#503). |
 
 A default is a constant of the column's physical type, or none (null).
@@ -40,7 +40,7 @@ Little-endian, every list counted, every string a `u16` length and its
 bytes:
 
 ```
-u16 format                   ; 4, or 5 where the table has a CHECK
+u16 format                   ; 7
 u32 id, str name, u32 version, u32 next_col_id
 u16 ncols   { u32 len, u32 id, str name, u8 kind, u32 length, u8 precision, u8 scale,
               u8 nullable, u8 default_tag, default, u8 hidden }
@@ -48,7 +48,7 @@ u16 npk     { u32 col_id }
 u16 nidx    { u32 len, u32 id, str name, u8 unique, u16 nparts { u32 col_id, u8 desc } }
 u16 nlayout { u32 len, u32 layout_id, u16 generation, u16 bitmap_bytes, u16 var_table, u16 nvar,
               u16 nslots { u32 col_id, u32 pos } }
-u16 nchecks { u32 len, str name, blob expression }   ; formats 5 and 6; never empty in 5
+u16 nchecks { u32 len, str name, blob expression }
 ```
 
 A layout records where its fixed region ends (`var_table`) and its slot
@@ -62,26 +62,20 @@ the bytes for `bytes`.
 **The append-only rule.** A later format adds fields only at the end of the
 record or of an entry, never reorders or reinterprets one. Columns, indexes
 and layouts are length-prefixed entries, so a later format can extend them
-too. A build reads every format from 3 to its own, taking an absent field
-at its default; it refuses a newer format, whose added fields it may not be
-able to ignore safely, and an older one: format 1 holds the earliest build's row
-positions, format 2 (#490's) no SQL types. Both predate any database worth
-reading. Format 4 added `hidden` at the end of a column entry; a format-3
-record reads with no hidden column, as every table then had a declared
-primary key. Format 5 added the `CHECK` list at the end of the record. A table
-without a `CHECK` is still written as format 4, so a database is closed to
-an earlier build only once it holds one: that build refuses the record
-("written by a later SQL-layer build") and so refuses to open. Nothing
-else about a database changes. Format 6 is format 5 whose CHECK list may be
-empty: it is the record of a table with a `TIMESTAMP WITH TIME ZONE` column
-(type tag 15) or a `CHAR(n)` column (tag 16, length `n`), which an earlier
-build would call corrupt, written only for such a table, so a database is closed to an earlier build ("written by a
-later SQL-layer build") only once it holds one. No existing encoding changes:
-the timestamptz column stores a `TIMESTAMP`'s microseconds and keys as one,
-and a `CHAR(n)` is stored as `TEXT` is, without its trailing spaces. The record
-format also names the row format its positions are for; formats 2, 3, 4, 5
-and 6 share the 12-byte-header row
-format.
+too. A build refuses a newer format, whose added fields it may not be able
+to ignore safely ("written by a later SQL-layer build").
+
+**The record format names the row and key formats.** A layout's positions
+are for one row format, and its table's keys are in one key format, so a
+change to either is a new record format. Format 7 is the one of
+`types_design.md`, *Row format* and *Key encoding*: fixed columns and
+`SMALLINT`, `INTEGER` and `DATE` key parts at their declared widths, the
+8-byte row header (#780). Every table record is written as 7. Formats 1 to
+6 laid every fixed column and integer key part out as 8 bytes under a
+12-byte row header; a build refuses them ("written by an earlier SQL-layer
+build, whose row and key formats this build does not read"), so a database
+from before #780 does not open and none of its rows or keys is decoded as
+format 7's. There is no migration: such a database is reloaded.
 
 **A record that does not parse is refused at load**, with the table's id:
 a truncated field, a type kind or tag outside its set, a physical type that
@@ -355,8 +349,7 @@ u16 ncols { str name }       ; the view's columns, as created
 - **Format 1 is the first.** A build reads views of format 1 and refuses a
   later one, as it refuses a later table record. A build from before views
   refuses a database holding one: the view's name entry names no table or
-  index, which that build refuses at open as corruption. Table records
-  keep format 4: no table record changed.
+  index, which that build refuses at open as corruption.
 - **A record that does not parse is refused at load**, with the same
   checks as a table's: a truncated field, trailing bytes, a record under
   another id's key, an id used twice, a dependency that is neither a table

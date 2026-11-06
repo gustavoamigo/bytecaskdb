@@ -111,7 +111,7 @@ TEST_CASE("plan API: an error is sticky and nothing is committed", "[sql][algebr
   Bytes out;
   Bytes key;
   bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kTbl);
-  bytecask::sql::key_put_i64(key, 1, {bytecask::sql::PhysType::I64});
+  REQUIRE(bytecask::sql::key_put_i64(key, 1, {bytecask::sql::PhysType::I64}));
   CHECK_FALSE(f.db->get({}, key, out));  // the row put before the error was not committed
 
   CHECK(run(f, insert_plan_ok, {std::int64_t{1}, bytes("a"), std::int64_t{5}}) == BC_COMMITTED);
@@ -293,7 +293,7 @@ TEST_CASE("plan API: bc_ctx_run checks what a plan depends on, not a catalog ver
   CHECK(run_with(ok) == BC_COMMITTED);
   Bytes key, row;
   bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kTbl);
-  bytecask::sql::key_put_i64(key, 2, {PhysType::I64});
+  REQUIRE(bytecask::sql::key_put_i64(key, 2, {PhysType::I64}));
   REQUIRE(f.db->get({}, key, row));
   const auto& t2 = *f.cat().table("t");
   CHECK(bytecask::sql::row_column(row, *t2.layout.find(t2.column("tag")->id)).i64() == 7);
@@ -451,7 +451,7 @@ TEST_CASE("plan API: a write committed across a DDL on its table is a conflict",
   bc_ctx_reset(f.cx);
   Bytes key, out;
   bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kTbl);
-  bytecask::sql::key_put_i64(key, 1, {PhysType::I64});
+  REQUIRE(bytecask::sql::key_put_i64(key, 1, {PhysType::I64}));
   CHECK_FALSE(f.db->get({}, key, out));
 
   // A DDL on another table does not conflict.
@@ -592,7 +592,7 @@ TEST_CASE("plan API: a statement is charged the bytes it holds, exactly, and pas
   auto row_key = [&](std::int64_t id) {
     Bytes k;
     bytecask::sql::key_put_prefix(k, bytecask::sql::kNsRow, kTbl);
-    bytecask::sql::key_put_i64(k, id, f.cat().key_layout(kTbl)->parts[0]);
+    REQUIRE(bytecask::sql::key_put_i64(k, id, f.cat().key_layout(kTbl)->parts[0]));
     return k;
   };
   REQUIRE(run(f, insert_plan_ok, {std::int64_t{2}, bytes("bobby"), std::int64_t{6}}) == BC_COMMITTED);
@@ -883,7 +883,7 @@ void bump_all(bc_ctx* cx) {
 auto qty_of(Fixture& f, std::int64_t id) -> std::int64_t {
   Bytes k, row;
   bytecask::sql::key_put_prefix(k, bytecask::sql::kNsRow, kTbl);
-  bytecask::sql::key_put_i64(k, id, {PhysType::I64});
+  REQUIRE(bytecask::sql::key_put_i64(k, id, {PhysType::I64}));
   REQUIRE(f.db->get({}, k, row));
   auto cols = bytecask::sql::decode_row(f.cat().table(kTbl)->layout, row);
   REQUIRE(cols);
@@ -974,7 +974,7 @@ void probed_set_qty(bc_ctx* cx) {
 auto pk_of(std::int64_t id) -> Bytes {
   Bytes k;
   bytecask::sql::key_put_prefix(k, bytecask::sql::kNsRow, kTbl);
-  bytecask::sql::key_put_i64(k, id, {PhysType::I64});
+  REQUIRE(bytecask::sql::key_put_i64(k, id, {PhysType::I64}));
   return k;
 }
 
@@ -2045,7 +2045,7 @@ TEST_CASE("plan API: a sorter, hash table or aggregate past the memory budget is
   auto key = [&](std::int64_t id) {
     Bytes k;
     bytecask::sql::key_put_prefix(k, bytecask::sql::kNsRow, kTbl);
-    bytecask::sql::key_put_i64(k, id, f.cat().key_layout(kTbl)->parts[0]);
+    REQUIRE(bytecask::sql::key_put_i64(k, id, f.cat().key_layout(kTbl)->parts[0]));
     return k;
   };
   for (std::int64_t which = 0; which <= 2; ++which) {

@@ -261,6 +261,9 @@ TEST_CASE("search: only an equality conjunct of a join keys the inner side", "[s
   sql_test::Fixture f;
   f.ddl(CreateTableDdl{"u", {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},
                        {"k"}});
+  // w's key is an INTEGER, its part 4 bytes (below).
+  f.ddl(CreateTableDdl{"w", {ColumnSpec{"k", {SqlKind::Integer}, false, {}}, sql_test::Fixture::col("v", PhysType::I64, true)},
+                       {"k"}});
   const auto& t = *f.cat().table("t");
   const auto& u = *f.cat().table("u");
   auto join = [&](std::vector<Expr> on) {
@@ -282,6 +285,19 @@ TEST_CASE("search: only an equality conjunct of a join keys the inner side", "[s
                     1);
   CHECK(has(g, "bc_key_i64(cx, k0, bc_col_i64(cx, row, COL_1_2));"));
   CHECK(has(g, "!(bc_col_i64(cx, row1, COL_4_1) > bc_col_i64(cx, row, COL_1_2))"));
+
+  // An INTEGER key's 4-byte part cannot hold every BIGINT: w.k = t.qty is
+  // no key of w (keyable) but a filter of its rows, so a t.qty past INTEGER
+  // matches nothing rather than fail the statement.
+  const auto& w = *f.cat().table("w");
+  auto outer = filter(get(t), {logical::compare(Op::Eq, col(t, "id"), p(0))});
+  auto wide = generate(f.cat(),
+                       project(logical::node(logical::Join{std::move(outer), get(w),
+                                                           {logical::compare(Op::Eq, col(w, "k"), col(t, "qty"))}}),
+                               {col(w, "v")}),
+                       1);
+  CHECK_FALSE(has(wide, "bc_key_i64(cx, k0, bc_col_i64(cx, row, COL_1_2));"));
+  CHECK(has(wide, "bc_scan_open"));
 }
 
 TEST_CASE("rewrite: an input folded to Empty empties the Filter above it; Filters over a Join merge", "[sql][search]") {
@@ -983,20 +999,20 @@ TEST_CASE("search: a hash build that may pass the memory budget is a choice poin
   auto plan = [&](std::uint64_t budget) {
     return generate_plan(bound::bind(ast::parse(sql), cat), cat, sql, counts, budget);
   };
-  // A hash table of n rows holds at least 192 + n x (240 + 36 + 9) bytes: a
-  // row of t holds at least its 12-byte header, an 8-byte bitmap and two
-  // fixed columns, and its key a marker and a BIGINT. Past 10,000 from 35
-  // rows. The rows t's range holds when the plan runs decide: below 35 the
+  // A hash table of n rows holds at least 192 + n x (240 + 27 + 9) bytes: a
+  // row of t holds at least its 8-byte header, a 3-byte bitmap and two
+  // BIGINT columns, and its key a marker and a BIGINT. Past 10,000 from 36
+  // rows. The rows t's range holds when the plan runs decide: below 36 the
   // hash join, from it u read once per row of t, which holds nothing.
   auto choice = plan(10'000);
-  CHECK(has(choice, "int64_t count0 = bc_count_range(cx, IDX_3, lo0, hi0, 35);"));
+  CHECK(has(choice, "int64_t count0 = bc_count_range(cx, IDX_3, lo0, hi0, 36);"));
   CHECK(has(choice, "bc_cursor c = bc_scan_open(cx, IDX_3, lo0, lo0, BC_SCAN_PREFIX);"));
   const auto other = choice.source.find("} else {");
   REQUIRE(other != std::string::npos);
   CHECK(choice.source.find("bc_hash_open") < other);
   CHECK(choice.source.find("bc_cursor c1 = bc_scan_open(cx, TBL_4, lo, hi, BC_SCAN_FORWARD);", other) != std::string::npos);
   CHECK(choice.cost == Catch::Approx(8 + 4 * (1 + kHashWeight) + 100 + 40 + 2));
-  CHECK(threshold(choice) == 35);
+  CHECK(threshold(choice) == 36);
   // Under 192 bytes no hash table fits: the plan avoids it.
   auto avoided = plan(100);
   CHECK_FALSE(has(avoided, "bc_hash"));

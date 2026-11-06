@@ -274,7 +274,7 @@ TEST_CASE("plan API: a raised constraint error is final: no retry, nothing commi
   CHECK(std::string{bc_error_message(f.cx)} == "null value violates a not-null constraint of table 7");
   Bytes key, out;
   bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kTbl);
-  bytecask::sql::key_put_i64(key, 99, {PhysType::I64});
+  REQUIRE(bytecask::sql::key_put_i64(key, 99, {PhysType::I64}));
   CHECK_FALSE(f.db->get({}, key, out));
   // The detail is cleared by the next execution.
   CHECK(run(f, scan_all_forward, {}, kI64Row) == BC_COMMITTED);
@@ -604,7 +604,7 @@ void guard_whole_table(bc_ctx* cx) {
 auto pk_of(std::int64_t id) -> Bytes {
   Bytes key;
   bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kTbl);
-  bytecask::sql::key_put_i64(key, id, {PhysType::I64});
+  REQUIRE(bytecask::sql::key_put_i64(key, id, {PhysType::I64}));
   return key;
 }
 
@@ -866,12 +866,12 @@ TEST_CASE("plan API: a stored row that does not parse is BC_E_CORRUPT, never NUL
   seed_t(f);
   Bytes key;
   bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kTbl);
-  bytecask::sql::key_put_i64(key, 1, {PhysType::I64});
+  REQUIRE(bytecask::sql::key_put_i64(key, 1, {PhysType::I64}));
   Bytes good;
   REQUIRE(f.db->get({}, key, good));
 
   CHECK(value(f, read_qty, {std::int64_t{1}}) == 1);
-  // row_bytes no longer matches the record's length.
+  // A byte past the row's variable data: its last var_end is not its end.
   auto bad = good;
   bad.push_back(std::byte{0});
   f.db->put({}, key, bad);
@@ -924,11 +924,11 @@ TEST_CASE("plan API: bc_row_key and bc_row_from report a damaged row as BC_E_COR
   seed_t(f);
   Bytes key;
   bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kTbl);
-  bytecask::sql::key_put_i64(key, 1, {PhysType::I64});
+  REQUIRE(bytecask::sql::key_put_i64(key, 1, {PhysType::I64}));
   Bytes good;
   REQUIRE(f.db->get({}, key, good));
   auto bad = good;
-  bad.push_back(std::byte{0});  // row_bytes no longer matches the length
+  bad.push_back(std::byte{0});  // its last var_end is no longer its end
   f.db->put({}, key, bad);
   expect_corrupt(f, row_key_of_get);
   expect_corrupt(f, row_from_get);
@@ -984,7 +984,7 @@ TEST_CASE("plan API: a present column the row does not hold is BC_E_CORRUPT, nev
 
   Bytes key;
   bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kTbl);
-  bytecask::sql::key_put_i64(key, 1, {PhysType::I64});
+  REQUIRE(bytecask::sql::key_put_i64(key, 1, {PhysType::I64}));
   Bytes good;
   REQUIRE(f.db->get({}, key, good));
   // x's present bit set: the row predates x, so it lies past the fixed region.
@@ -1023,7 +1023,7 @@ void two_b_null(bc_ctx* cx) { bc_emit_count(cx, bc_col_null(cx, get_two(cx), g_t
 void two_b_bytes(bc_ctx* cx) { bc_col_bytes(cx, get_two(cx), g_two_b); }
 }  // namespace
 
-TEST_CASE("plan API: a variable column whose var_end words are out of order is BC_E_CORRUPT", "[sql][algebra]") {
+TEST_CASE("plan API: a variable column whose var_end entries are out of order is BC_E_CORRUPT", "[sql][algebra]") {
   Fixture f;
   f.ddl(bytecask::sql::CreateTableDdl{
       "two", {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::Bytes, true),
@@ -1043,14 +1043,69 @@ TEST_CASE("plan API: a variable column whose var_end words are out of order is B
   f.db->put({}, key, row);
   CHECK(value(f, two_b_null, {std::int64_t{1}}) == 0);
 
-  // b's end below a's: both words inside the row, out of order.
+  // a's end (2-byte entries: 6 bytes of variable data) above b's, which
+  // still ends the row: b's begin is past its end.
   REQUIRE(two.layout.find(g_two_b)->pos == 1);
   auto var_table = var_table_of(row);
-  row[var_table + 4] = std::byte{1};
-  for (std::size_t i = 1; i < 4; ++i) row[var_table + 4 + i] = std::byte{0};
+  REQUIRE(std::to_integer<int>(row[var_table + 2]) == 6);
+  row[var_table] = std::byte{7};
+  row[var_table + 1] = std::byte{0};
   f.db->put({}, key, row);
   expect_corrupt(f, two_b_null);
   expect_corrupt(f, two_b_bytes);
+}
+
+namespace {
+// An INTEGER-keyed table, its 4-byte key part: its id, set by the test that
+// creates it.
+std::uint32_t g_narrow = 0;
+void narrow_fits(bc_ctx* cx) {
+  bc_key k = bc_key_begin(cx, g_narrow);
+  bc_key_i64(cx, k, bc_param_i64(cx, 0));
+  bc_emit_count(cx, bc_key_fits(cx, k) ? 1 : 0);
+}
+void narrow_end(bc_ctx* cx) {
+  bc_key k = bc_key_begin(cx, g_narrow);
+  bc_key_i64(cx, k, bc_param_i64(cx, 0));
+  bool found = false;
+  bc_get(cx, bc_key_end(cx, k), &found);
+  bc_emit_count(cx, found ? 1 : 0);
+}
+void narrow_params(bc_ctx* cx) {
+  bool found = false;
+  bc_get(cx, bc_key_params(cx, g_narrow, 0, 1), &found);
+  bc_emit_count(cx, found ? 1 : 0);
+}
+}  // namespace
+
+TEST_CASE("plan API: an integer past its key part's width is no key: bc_key_fits is false, the key is refused, never truncated",
+          "[sql][algebra]") {
+  Fixture f;
+  f.ddl(bytecask::sql::CreateTableDdl{
+      "narrow", {bytecask::sql::ColumnSpec{"k", {bytecask::sql::SqlKind::Integer}, false, {}}}, {"k"}});
+  auto cat = f.live->current();
+  g_narrow = cat->table("narrow")->id;
+  // 2^32 + 5 would be 5 cut to 4 bytes: a row keyed 5 must not be found.
+  bytecask::sql::RowWriter w{cat->table("narrow")->layout};
+  REQUIRE(w.set_i64(cat->table("narrow")->column("k")->id, 5));
+  Bytes row, key;
+  REQUIRE(w.finish(row));
+  REQUIRE(bytecask::sql::encode_pk_from_row(*cat->table("narrow"), row, key));
+  CHECK(key.size() == bytecask::sql::kKeyPrefixBytes + 4);
+  f.db->put({}, key, row);
+  const auto past = (std::int64_t{1} << 32) + 5;
+
+  CHECK(value(f, narrow_fits, {std::int64_t{5}}) == 1);
+  CHECK(value(f, narrow_fits, {past}) == 0);
+  CHECK(value(f, narrow_fits, {std::int64_t{INT32_MIN} - 1}) == 0);
+  CHECK(value(f, narrow_end, {std::int64_t{5}}) == 1);
+  // Built anyway, the key is refused at its end.
+  CHECK(run(f, narrow_end, {past}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LIMIT);
+  // A parameter past the part is no key either, the same BC_E_LIMIT.
+  CHECK(value(f, narrow_params, {std::int64_t{5}}) == 1);
+  CHECK(run(f, narrow_params, {past}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LIMIT);
 }
 
 TEST_CASE("plan API: a charge of several units does not step over the deadline check", "[sql][algebra]") {

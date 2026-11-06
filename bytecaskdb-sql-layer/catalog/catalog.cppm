@@ -464,19 +464,12 @@ public:
   // Object ids stay at or below 2^24 - 1: bc_error_detail carries one in its
   // low 24 bits (and a plan's constants are an enum, whose values are ints).
   static constexpr std::uint32_t kMaxObjectId = ConstraintDetail::kMaxObjectId;
-  // 4: a column entry ends with its hidden flag (the row id of a table
-  // without a primary key). 3, #489's record (SQL types, defaults, unique
-  // and DESC parts, layout entries), is read with no hidden column. 2 was
-  // #490's, 1 the prototype's; both are refused.
-  // 5: the record ends with the table's CHECK constraints. A table with none
-  // is still written as 4, so only a database that holds a CHECK is closed
-  // to an earlier build.
-  // 6: as 5, but the CHECK count may be 0. It is the record of a table with a
-  // TIMESTAMP WITH TIME ZONE or CHAR(n) column, whose type tag an earlier
-  // build would call corrupt: written only for such a table, so only a
-  // database that holds one is closed to an earlier build.
-  static constexpr std::uint16_t kRecordFormat = 6;
-  static constexpr std::uint16_t kOldestRecordFormat = 3;
+  // 7: the record of docs/catalog_design.md, whose layouts are for the row
+  // format and keys of docs/types_design.md: fixed columns and integer key
+  // parts at their declared widths, the 8-byte row header (#780). Formats
+  // 1 to 6 laid rows and keys out in 8-byte words under a 12-byte header;
+  // they are refused, so no row or key of theirs is decoded as this one.
+  static constexpr std::uint16_t kRecordFormat = 7;
 
   // The constants a plan on this table needs, named from ids alone so that
   // no table, index or column name has to be a C identifier and no two can
@@ -820,10 +813,10 @@ auto index_prefix(std::uint32_t index_id) -> Bytes {
   return p;
 }
 
-// Column c's key part: its physical type, nullable and direction as given,
-// and whether it is a REAL, whose doubles are keyed as their float rounding.
+// Column c's key part (key_part_of): its type's width, nullable and
+// direction as given.
 auto key_part(const Column& c, bool nullable = false, bool desc = false) -> KeyPart {
-  return {c.type, nullable, desc, c.sql.kind == SqlKind::Real};
+  return key_part_of(c.sql, nullable, desc);
 }
 
 // Appends one column of `row` as a key part. False if the row is malformed
@@ -843,7 +836,9 @@ auto put_part_from_row(const Table& t, std::uint32_t col_id, KeyPart part, Bytes
     case ColumnState::Value: break;
   }
   switch (slot->type) {
-    case PhysType::I64: key_put_i64(out, v.i64(), part); return true;
+    // A row's column holds only what its width does, which is its key part's
+    // or less: false here is a row that does not parse.
+    case PhysType::I64: return key_put_i64(out, v.i64(), part);
     case PhysType::F64: key_put_f64(out, v.f64(), part); return true;
     case PhysType::Bool: key_put_bool(out, v.boolean(), part); return true;
     case PhysType::Bytes: key_put_bytes(out, v.bytes, part); return true;
@@ -1356,8 +1351,7 @@ auto read_layout(RecordReader& r, const Table& t) -> std::pair<std::uint32_t, Ro
 
 auto serialize_table(const Table& t) -> Bytes {
   RecordWriter w;
-  auto has_new_type = std::ranges::any_of(t.columns, [](const Column& c) { return c.sql.kind == SqlKind::TimestampTz || c.sql.kind == SqlKind::Char; });
-  w.u16(has_new_type ? Catalog::kRecordFormat : t.checks.empty() ? std::uint16_t{4} : std::uint16_t{5});
+  w.u16(Catalog::kRecordFormat);
   w.u32(t.id);
   w.str(t.name);
   w.u32(t.version);
@@ -1394,14 +1388,12 @@ auto serialize_table(const Table& t) -> Bytes {
   w.u16(t.retired_layouts.size() + 1);
   for (const auto& [id, l] : t.retired_layouts) write_layout(w, id, l);
   write_layout(w, t.layout_id, t.layout);
-  if (!t.checks.empty() || has_new_type) {
-    w.u16(t.checks.size());
-    for (const auto& c : t.checks) {
-      w.entry([&](RecordWriter& e) {
-        e.str(c.name);
-        e.blob(std::as_bytes(std::span{c.expr}));
-      });
-    }
+  w.u16(t.checks.size());
+  for (const auto& c : t.checks) {
+    w.entry([&](RecordWriter& e) {
+      e.str(c.name);
+      e.blob(std::as_bytes(std::span{c.expr}));
+    });
   }
   return w.bytes();
 }
@@ -1499,12 +1491,12 @@ auto parse_procedure(BytesView in) -> Procedure {
 auto parse_table(BytesView in) -> Table {
   RecordReader r{in};
   auto format = r.u16();
-  if (format < Catalog::kOldestRecordFormat || format > Catalog::kRecordFormat) {
+  if (format != Catalog::kRecordFormat) {
     throw std::runtime_error(
-        "catalog record format " + std::to_string(format) + " is not " +
-        std::to_string(Catalog::kOldestRecordFormat) + " to " + std::to_string(Catalog::kRecordFormat) +
+        "catalog record format " + std::to_string(format) + " is not " + std::to_string(Catalog::kRecordFormat) +
         (format < Catalog::kRecordFormat
-             ? ": the database was written by an earlier SQL-layer build whose catalog this build does not read"
+             ? ": the database was written by an earlier SQL-layer build, whose row and key formats this build "
+               "does not read"
              : ": the database was written by a later SQL-layer build"));
   }
   Table t;
@@ -1524,7 +1516,7 @@ auto parse_table(BytesView in) -> Table {
     c.sql.scale = e.u8();
     auto nullable = e.u8();
     c.default_value = read_datum(e);
-    auto hidden = format >= 4 ? e.u8() : std::uint8_t{0};
+    auto hidden = e.u8();
     e.expect_end("column entry of table " + t.name);
     if (!sql_type_valid(c.sql)) corrupt("column " + c.name + " of table " + t.name + " has an invalid type");
     if (nullable > 1) corrupt("column " + c.name + " of table " + t.name + " has a bad nullable flag");
@@ -1573,21 +1565,18 @@ auto parse_table(BytesView in) -> Table {
   for (std::uint32_t i = 0; i < nlayout; ++i) t.retired_layouts.push_back(read_layout(r, t));
   std::tie(t.layout_id, t.layout) = std::move(t.retired_layouts.back());
   t.retired_layouts.pop_back();
-  if (format >= 5) {
-    auto nchecks = r.u16();
-    if (nchecks == 0 && format == 5) corrupt("table " + t.name + " has a format-5 record and no CHECK");
-    for (std::uint32_t i = 0; i < nchecks; ++i) {
-      RecordReader e{r.blob()};
-      CheckConstraint c;
-      c.name = e.str();
-      auto text = e.blob();
-      c.expr.assign(reinterpret_cast<const char*>(text.data()), text.size());
-      e.expect_end("CHECK entry of table " + t.name);
-      if (c.name.empty() || c.expr.empty() || std::ranges::contains(t.checks, c.name, &CheckConstraint::name)) {
-        corrupt("table " + t.name + " has a malformed CHECK");
-      }
-      t.checks.push_back(std::move(c));
+  auto nchecks = r.u16();
+  for (std::uint32_t i = 0; i < nchecks; ++i) {
+    RecordReader e{r.blob()};
+    CheckConstraint c;
+    c.name = e.str();
+    auto text = e.blob();
+    c.expr.assign(reinterpret_cast<const char*>(text.data()), text.size());
+    e.expect_end("CHECK entry of table " + t.name);
+    if (c.name.empty() || c.expr.empty() || std::ranges::contains(t.checks, c.name, &CheckConstraint::name)) {
+      corrupt("table " + t.name + " has a malformed CHECK");
     }
+    t.checks.push_back(std::move(c));
   }
   r.expect_end("record of table " + t.name);
 
