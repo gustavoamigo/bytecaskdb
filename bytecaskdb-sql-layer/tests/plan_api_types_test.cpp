@@ -1055,6 +1055,59 @@ TEST_CASE("plan API: a variable column whose var_end entries are out of order is
   expect_corrupt(f, two_b_bytes);
 }
 
+namespace {
+// An INTEGER-keyed table, its 4-byte key part: its id, set by the test that
+// creates it.
+std::uint32_t g_narrow = 0;
+void narrow_fits(bc_ctx* cx) {
+  bc_key k = bc_key_begin(cx, g_narrow);
+  bc_key_i64(cx, k, bc_param_i64(cx, 0));
+  bc_emit_count(cx, bc_key_fits(cx, k) ? 1 : 0);
+}
+void narrow_end(bc_ctx* cx) {
+  bc_key k = bc_key_begin(cx, g_narrow);
+  bc_key_i64(cx, k, bc_param_i64(cx, 0));
+  bool found = false;
+  bc_get(cx, bc_key_end(cx, k), &found);
+  bc_emit_count(cx, found ? 1 : 0);
+}
+void narrow_params(bc_ctx* cx) {
+  bool found = false;
+  bc_get(cx, bc_key_params(cx, g_narrow, 0, 1), &found);
+  bc_emit_count(cx, found ? 1 : 0);
+}
+}  // namespace
+
+TEST_CASE("plan API: an integer past its key part's width is no key: bc_key_fits is false, the key is refused, never truncated",
+          "[sql][algebra]") {
+  Fixture f;
+  f.ddl(bytecask::sql::CreateTableDdl{
+      "narrow", {bytecask::sql::ColumnSpec{"k", {bytecask::sql::SqlKind::Integer}, false, {}}}, {"k"}});
+  auto cat = f.live->current();
+  g_narrow = cat->table("narrow")->id;
+  // 2^32 + 5 would be 5 cut to 4 bytes: a row keyed 5 must not be found.
+  bytecask::sql::RowWriter w{cat->table("narrow")->layout};
+  REQUIRE(w.set_i64(cat->table("narrow")->column("k")->id, 5));
+  Bytes row, key;
+  REQUIRE(w.finish(row));
+  REQUIRE(bytecask::sql::encode_pk_from_row(*cat->table("narrow"), row, key));
+  CHECK(key.size() == bytecask::sql::kKeyPrefixBytes + 4);
+  f.db->put({}, key, row);
+  const auto past = (std::int64_t{1} << 32) + 5;
+
+  CHECK(value(f, narrow_fits, {std::int64_t{5}}) == 1);
+  CHECK(value(f, narrow_fits, {past}) == 0);
+  CHECK(value(f, narrow_fits, {std::int64_t{INT32_MIN} - 1}) == 0);
+  CHECK(value(f, narrow_end, {std::int64_t{5}}) == 1);
+  // Built anyway, the key is refused at its end.
+  CHECK(run(f, narrow_end, {past}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LIMIT);
+  // A parameter past the part is a plan bug: the compiler checks it first.
+  CHECK(value(f, narrow_params, {std::int64_t{5}}) == 1);
+  CHECK(run(f, narrow_params, {past}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+}
+
 TEST_CASE("plan API: a charge of several units does not step over the deadline check", "[sql][algebra]") {
   Fixture f;
   for (std::int64_t i = 1; i <= 30; ++i) REQUIRE(run(f, insert_t, {i, bytes("n"), i}) == BC_COMMITTED);

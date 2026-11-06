@@ -2102,11 +2102,19 @@ void add_sort_key_part(bc_ctx* cx, bc_sort_key k, std::uint32_t dir, std::uint32
   key_held(cx, *b);
 }
 
-// Appends a column's value, read present, as `part`: a sort or group key's,
-// whose integer parts are 8 bytes wide and hold every i64.
+// Appends v as a sort or group key's integer part, which is 8 bytes wide
+// and holds every i64. A narrower part is a bug in its caller: it throws
+// (the guard reports it) rather than leave the part out of the key.
+void key_put_wide_i64(Bytes& out, std::int64_t v, KeyPart part) {
+  if (!bytecask::sql::key_put_i64(out, v, part)) {
+    throw std::logic_error("a sort or group key's integer part is narrower than 8 bytes");
+  }
+}
+
+// Appends a column's value, read present, as `part`: a sort or group key's.
 void key_put_column(Bytes& out, const bytecask::sql::ColumnRead& v, KeyPart part) {
   switch (part.type) {
-    case PhysType::I64: (void)bytecask::sql::key_put_i64(out, v.i64(), part); break;
+    case PhysType::I64: key_put_wide_i64(out, v.i64(), part); break;
     case PhysType::F64: bytecask::sql::key_put_f64(out, v.f64(), part); break;
     case PhysType::Bool: bytecask::sql::key_put_bool(out, v.boolean(), part); break;
     case PhysType::Bytes: bytecask::sql::key_put_bytes(out, v.bytes, part); break;
@@ -4266,7 +4274,7 @@ bc_sort_key bc_sort_key_begin(bc_ctx* cx) {
 void bc_sort_key_i64(bc_ctx* cx, bc_sort_key k, int64_t v, uint32_t dir, uint32_t nulls) {
   BC_GUARD_BEGIN
   add_sort_key_part(cx, k, dir, nulls, PhysType::I64, 0,
-                    [v](Bytes& out, KeyPart part) { (void)bytecask::sql::key_put_i64(out, v, part); });  // 8 bytes wide
+                    [v](Bytes& out, KeyPart part) { key_put_wide_i64(out, v, part); });
   BC_GUARD_END(cx)
 }
 
@@ -4523,7 +4531,7 @@ bool bc_key_part_null(bc_ctx* cx, uint32_t table_or_index, bc_view key, uint32_t
 int64_t bc_sort_key_part_i64(bc_ctx* cx, bc_view key, uint32_t part) {
   BC_GUARD_BEGIN
   return sort_part_value<std::int64_t>(cx, key, part, PhysType::I64, 0,
-                                       [](KeyReader& r) { return r.read_i64(KeyPart{PhysType::I64, false, false, false}); });
+                                       [](KeyReader& r) { return r.read_i64(KeyPart{PhysType::I64, false, false}); });
   BC_GUARD_END(cx)
   return {};
 }
@@ -4531,7 +4539,7 @@ int64_t bc_sort_key_part_i64(bc_ctx* cx, bc_view key, uint32_t part) {
 double bc_sort_key_part_f64(bc_ctx* cx, bc_view key, uint32_t part) {
   BC_GUARD_BEGIN
   return sort_part_value<double>(cx, key, part, PhysType::F64, 0.0,
-                                 [](KeyReader& r) { return r.read_f64(KeyPart{PhysType::F64, false, false, false}); });
+                                 [](KeyReader& r) { return r.read_f64(KeyPart{PhysType::F64, false, false}); });
   BC_GUARD_END(cx)
   return {};
 }
@@ -4539,7 +4547,7 @@ double bc_sort_key_part_f64(bc_ctx* cx, bc_view key, uint32_t part) {
 bool bc_sort_key_part_bool(bc_ctx* cx, bc_view key, uint32_t part) {
   BC_GUARD_BEGIN
   return sort_part_value<bool>(cx, key, part, PhysType::Bool, false,
-                               [](KeyReader& r) { return r.read_bool(KeyPart{PhysType::Bool, false, false, false}); });
+                               [](KeyReader& r) { return r.read_bool(KeyPart{PhysType::Bool, false, false}); });
   BC_GUARD_END(cx)
   return {};
 }
@@ -4590,7 +4598,7 @@ int64_t bc_random(bc_ctx* cx, int64_t lo, int64_t hi) {
 bc_view bc_sort_key_part_bytes(bc_ctx* cx, bc_view key, uint32_t part) {
   BC_GUARD_BEGIN
   auto v = sort_part_value<Bytes>(cx, key, part, PhysType::Bytes, Bytes{},
-                                  [](KeyReader& r) { return r.read_bytes(KeyPart{PhysType::Bytes, false, false, false}); });
+                                  [](KeyReader& r) { return r.read_bytes(KeyPart{PhysType::Bytes, false, false}); });
   if (!cx->ok()) return {};
   return cx->arena_view(v);
   BC_GUARD_END(cx)
@@ -4683,7 +4691,7 @@ bc_view bc_col_key(bc_ctx* cx, bc_view row, uint32_t col) {
   // Nullable and ascending: NULL is the marker alone. A DOUBLE's -0.0 and
   // 0.0 encode alike, and every NaN as one, so equal values group as
   // PostgreSQL groups them.
-  bytecask::sql::KeyPart part{rc->slot->type, true, false, false};
+  bytecask::sql::KeyPart part{rc->slot->type, true, false};
   Bytes key;
   if (v->state == bytecask::sql::ColumnState::Absent) {
     bytecask::sql::key_put_null(key, part);

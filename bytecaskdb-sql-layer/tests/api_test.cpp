@@ -1815,6 +1815,39 @@ TEST_CASE("embedded API: expressions over columns in the select list", "[sql][ap
 }
 
 
+TEST_CASE("embedded API: a database written before #780's row and key format is refused when it opens", "[sql][api]") {
+  sql_test::TempDir dir{"api_old_format"};
+  {
+    auto db = Database::open(dir.path());
+    (void)db->execute("CREATE TABLE o (k INTEGER PRIMARY KEY, v TEXT)");
+    (void)db->execute("INSERT INTO o VALUES (1, 'a')");
+    db->close();
+  }
+  // The table's record, `01 02 <id>`, as format 6 wrote it: its format field
+  // is all an earlier build's record need differ in for this build to refuse it.
+  {
+    auto engine = bytecask::DB::open(dir.path());
+    const Bytes tables{std::byte{0x01}, std::byte{0x02}};
+    std::vector<std::pair<Bytes, Bytes>> records;
+    for (const auto& e : engine.iter_from({}, tables)) {
+      if (e.key.size() < tables.size() || !std::ranges::equal(e.key.first(tables.size()), tables)) break;
+      records.emplace_back(Bytes(e.key.begin(), e.key.end()), Bytes(e.value.begin(), e.value.end()));
+    }
+    REQUIRE(records.size() == 1);
+    auto& [key, record] = records[0];
+    REQUIRE(record[0] == std::byte{7});
+    record[0] = std::byte{6};
+    engine.put({}, key, record);
+    engine.close();
+  }
+  try {
+    (void)Database::open(dir.path());
+    FAIL("a format-6 database opened");
+  } catch (const std::runtime_error& e) {
+    CHECK(std::string{e.what()}.find("earlier SQL-layer build") != std::string::npos);
+  }
+}
+
 TEST_CASE("embedded API: a narrow integer key compared with a wider subquery's value past its range is a filter, never a truncated key",
           "[sql][api][subquery]") {
   sql_test::TempDir dir{"api_sub_narrow"};

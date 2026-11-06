@@ -46,13 +46,25 @@ struct KeyPart {
   PhysType type;
   bool nullable{false};
   bool desc{false};
-  // A REAL column: a double is keyed as its float rounding, as the row
-  // stores it, in 4 bytes.
-  bool real{false};
-  // An I64 part's bytes: 2 for SMALLINT, 4 for INTEGER and DATE, 8 for
-  // every other integer type and for sort and group keys.
+  // The bytes an I64 or F64 value takes: an I64 2 for SMALLINT, 4 for
+  // INTEGER and DATE, 8 otherwise; an F64 4 for a REAL, keyed as its float
+  // rounding as the row stores it, 8 otherwise. Sort and group keys are 8.
+  // Not read for bool and bytes parts.
   std::uint8_t width{8};
 };
+
+// Whether a fixed-width value of type t is ever stored in `width` bytes, in
+// a row or a key: an I64 2, 4 or 8, an F64 4 or 8, a bool 1. False for
+// bytes, which have no fixed width.
+[[nodiscard]] constexpr auto fixed_width_valid(PhysType t, std::size_t width) noexcept -> bool {
+  switch (t) {
+    case PhysType::I64: return width == 2 || width == 4 || width == 8;
+    case PhysType::F64: return width == 4 || width == 8;
+    case PhysType::Bool: return width == 1;
+    case PhysType::Bytes: return false;
+  }
+  return false;
+}
 
 // Whether v is a two's-complement integer of `width` bytes (2, 4 or 8):
 // what a narrow key part or row column holds. False for any other width.
@@ -222,7 +234,7 @@ auto float_rounding(double v) -> double {
 void key_put_f64(Bytes& out, double v, KeyPart part) {
   auto start = out.size();
   put_marker(out, part);
-  if (part.real) {
+  if (part.width == 4) {
     // float_rounding is a float exactly, or infinite: the cast is exact.
     put_be(out, f32_to_ordered(static_cast<float>(float_rounding(v))), 4);
   } else {
@@ -296,7 +308,7 @@ auto KeyReader::read_marker(KeyPart part) -> bool {
 
 auto KeyReader::read_i64(KeyPart part) -> std::optional<std::int64_t> {
   if (!read_marker(part)) return std::nullopt;
-  if (!fits_width(0, part.width)) {  // a width no layout has
+  if (!fixed_width_valid(PhysType::I64, part.width)) {  // a width no layout has
     ok_ = false;
     return std::nullopt;
   }
@@ -309,7 +321,11 @@ auto KeyReader::read_i64(KeyPart part) -> std::optional<std::int64_t> {
 
 auto KeyReader::read_f64(KeyPart part) -> std::optional<double> {
   if (!read_marker(part)) return std::nullopt;
-  if (part.real) {
+  if (!fixed_width_valid(PhysType::F64, part.width)) {  // a width no layout has
+    ok_ = false;
+    return std::nullopt;
+  }
+  if (part.width == 4) {
     auto u = read_be(part.desc, 4);
     if (!u) return std::nullopt;
     return static_cast<double>(ordered_to_f32(static_cast<std::uint32_t>(*u)));

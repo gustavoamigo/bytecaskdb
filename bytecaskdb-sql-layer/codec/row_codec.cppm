@@ -177,7 +177,8 @@ struct ColumnDef {
 [[nodiscard]] auto append_columns(RowLayout& layout, std::span<const ColumnDef> cols) -> bool;
 // Whether a layout keeps the format's invariants: a bitmap of 1 to 255
 // bytes, every column id below its ceiling, fixed columns inside the fixed
-// region and none overlapping another, slots below nvar and none used twice,
+// region in position order and none overlapping another, slots below nvar
+// and none used twice,
 // the header's 16-bit fields, a known type. What a layout read from the
 // catalog is checked against.
 [[nodiscard]] auto layout_valid(const RowLayout& layout) -> bool;
@@ -351,17 +352,6 @@ auto header(BytesView row) -> std::optional<Header> {
 
 auto bitmap_bytes_for(std::uint32_t id_ceiling) -> std::uint32_t { return (id_ceiling + kBitmapSpareBits + 7) / 8; }
 
-// Whether a fixed column's width is one its physical type is stored in.
-auto width_valid(PhysType type, std::uint32_t width) -> bool {
-  switch (type) {
-    case PhysType::I64: return width == 2 || width == 4 || width == 8;
-    case PhysType::F64: return width == 4 || width == 8;
-    case PhysType::Bool: return width == 1;
-    case PhysType::Bytes: return width == 0;
-  }
-  return false;
-}
-
 // A fixed column's stored bytes as ColumnRead::word holds them.
 auto widen(PhysType type, std::uint64_t raw, std::uint32_t width) -> std::uint64_t {
   switch (type) {
@@ -486,8 +476,9 @@ auto fixed_width(SqlType t) -> std::uint32_t {
 }
 
 auto key_part_of(SqlType t, bool nullable, bool desc) -> KeyPart {
-  auto part = KeyPart{phys_type(t), nullable, desc, t.kind == SqlKind::Real};
-  if (t.kind == SqlKind::SmallInt || t.kind == SqlKind::Integer || t.kind == SqlKind::Date) {
+  auto part = KeyPart{phys_type(t), nullable, desc};
+  if (t.kind == SqlKind::SmallInt || t.kind == SqlKind::Integer || t.kind == SqlKind::Date ||
+      t.kind == SqlKind::Real) {
     part.width = static_cast<std::uint8_t>(fixed_width(t));
   }
   return part;
@@ -609,13 +600,31 @@ auto RowWriter::missing_required() const -> std::optional<std::uint32_t> {
   return std::nullopt;
 }
 
+namespace {
+// Whether the layout's fixed columns, in layout order, each lie inside the
+// fixed region at a width their type is stored in, each starting at or
+// after the previous one's end: no two share a byte. Layouts keep their
+// columns in position order (append_columns adds at the region's end, and
+// the catalog record keeps the order), so one pass decides it.
+auto fixed_columns_valid(const RowLayout& l) -> bool {
+  auto end = std::size_t{l.fixed_start};
+  for (const auto& c : l.columns) {
+    if (!is_fixed(c.type)) continue;
+    if (!fixed_width_valid(c.type, c.width) || c.pos < end || std::size_t{c.pos} + c.width > l.fixed_end) return false;
+    end = std::size_t{c.pos} + c.width;
+  }
+  return true;
+}
+}  // namespace
+
 auto RowWriter::finish(Bytes& out, std::size_t max_bytes) const -> bool {
   const auto& l = *layout_;
   // The header's fields, and every column inside the region it is written
-  // to: a layout that breaks them is refused, never encoded past them. The
-  // catalog checks the rest of layout_valid when it loads a layout.
+  // to and over no other: a layout that breaks them is refused, never
+  // encoded past them or over itself. The catalog checks the rest of
+  // layout_valid when it loads a layout.
   if (l.bitmap_bytes == 0 || l.bitmap_bytes > kMaxBitmapBytes || l.fixed_start != kRowHeaderBytes + l.bitmap_bytes ||
-      l.fixed_end < l.fixed_start || l.fixed_end > kMaxVarTable || l.nvar > kMaxVarTable) {
+      l.fixed_end < l.fixed_start || l.fixed_end > kMaxVarTable || l.nvar > kMaxVarTable || !fixed_columns_valid(l)) {
     return false;
   }
   // Only present columns are written: a column the writer holds a value for
@@ -625,15 +634,9 @@ auto RowWriter::finish(Bytes& out, std::size_t max_bytes) const -> bool {
   for (std::size_t i = 0; i < l.columns.size(); ++i) {
     const auto& c = l.columns[i];
     if (c.col_id >= l.id_ceiling()) return false;
-    if (is_fixed(c.type)) {
-      if (c.pos < l.fixed_start || std::size_t{c.pos} + c.width > l.fixed_end || !width_valid(c.type, c.width)) {
-        return false;
-      }
-    } else if (c.pos >= l.nvar) {
-      return false;
-    } else if (present_[i]) {
-      var_bytes += var_[i].size();
-    }
+    if (is_fixed(c.type)) continue;
+    if (c.pos >= l.nvar) return false;
+    if (present_[i]) var_bytes += var_[i].size();
   }
   // Two-byte var_end entries while every offset fits them, four past that.
   auto end_bytes = var_bytes <= 0xFFFF ? std::size_t{2} : std::size_t{4};
@@ -677,30 +680,17 @@ auto layout_valid(const RowLayout& l) -> bool {
   if (l.bitmap_bytes == 0 || l.bitmap_bytes > kMaxBitmapBytes) return false;
   if (l.fixed_start != kRowHeaderBytes + l.bitmap_bytes || l.fixed_end < l.fixed_start) return false;
   if (l.fixed_end > kMaxVarTable || l.nvar > kMaxVarTable) return false;
-  // Each byte of the fixed region, and each slot, belongs to one column at most.
-  std::vector<bool> fixed_used(l.fixed_end - l.fixed_start, false);
+  if (!fixed_columns_valid(l)) return false;
+  // Each slot belongs to one column at most.
   std::vector<bool> slot_used(l.nvar, false);
   for (const auto& c : l.columns) {
     if (c.col_id >= l.id_ceiling()) return false;
     // A type code no build knows (a damaged record) is out of the enum's range.
     auto code = static_cast<int>(c.type);
     if (code < static_cast<int>(PhysType::I64) || code > static_cast<int>(PhysType::Bytes)) return false;
-    if (!width_valid(c.type, c.width)) return false;
-    switch (c.type) {
-      case PhysType::I64:
-      case PhysType::F64:
-      case PhysType::Bool:
-        if (c.pos < l.fixed_start || std::size_t{c.pos} + c.width > l.fixed_end) return false;
-        for (auto b = c.pos - l.fixed_start; b < c.pos - l.fixed_start + c.width; ++b) {
-          if (fixed_used[b]) return false;
-          fixed_used[b] = true;
-        }
-        break;
-      case PhysType::Bytes:
-        if (c.pos >= l.nvar || slot_used[c.pos]) return false;
-        slot_used[c.pos] = true;
-        break;
-    }
+    if (is_fixed(c.type)) continue;  // fixed_columns_valid
+    if (c.width != 0 || c.pos >= l.nvar || slot_used[c.pos]) return false;
+    slot_used[c.pos] = true;
   }
   return true;
 }
@@ -738,7 +728,7 @@ auto locate(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_t po
   // the column, with the bit set) it is damaged.
   auto held = type == PhysType::Bytes
                   ? pos < h->nvar
-                  : width_valid(type, width) && pos >= h->fixed_start() && std::size_t{pos} + width <= h->var_table;
+                  : fixed_width_valid(type, width) && pos >= h->fixed_start() && std::size_t{pos} + width <= h->var_table;
   if (!held) return std::unexpected(ColumnState::Malformed);
   return *h;
 }

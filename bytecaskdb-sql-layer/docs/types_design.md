@@ -610,8 +610,10 @@ values with the edges mixed in:
   past 64 KiB of variable data, and a row over the limit, cut short, longer
   than its variable data or with an unknown flag is refused.
 
-`tests/api_test.cpp` checks the one place a value can be wider than its key
-part: an `INTEGER` and a `SMALLINT` key compared with a `BIGINT` or
+`tests/plan_api_types_test.cpp` checks that an integer past its key part's
+width makes `bc_key_fits` false and the key `BC_E_LIMIT`, never a key cut
+short, and `tests/api_test.cpp` that a database of an earlier format does not
+open, and the one place a value can be wider than its key part: an `INTEGER` and a `SMALLINT` key compared with a `BIGINT` or
 `INTEGER` subquery's value past their range, under every operator.
 
 The plan API's tests (`tests/plan_api_test.cpp`) cover the calls on top:

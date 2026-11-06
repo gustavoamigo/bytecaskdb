@@ -324,9 +324,9 @@ TEST_CASE("key codec: a prefix's successor bounds every key under it", "[sql][co
 
 TEST_CASE("key codec: malformed keys are reported, not over-read", "[sql][codec]") {
   // Every part type, cut at every byte.
-  for (auto part : {KeyPart{PhysType::I64, true, false}, KeyPart{PhysType::I64, true, true, false, 2},
-                    KeyPart{PhysType::I64, false, false, false, 4}, KeyPart{PhysType::F64, true, true},
-                    KeyPart{PhysType::F64, true, false, true},
+  for (auto part : {KeyPart{PhysType::I64, true, false}, KeyPart{PhysType::I64, true, true, 2},
+                    KeyPart{PhysType::I64, false, false, 4}, KeyPart{PhysType::F64, true, true},
+                    KeyPart{PhysType::F64, true, false, 4},
                     KeyPart{PhysType::Bool, true, false}, KeyPart{PhysType::Bytes, true, true},
                     KeyPart{PhysType::Bytes, false, false}}) {
     Bytes k;
@@ -361,6 +361,15 @@ TEST_CASE("key codec: malformed keys are reported, not over-read", "[sql][codec]
   KeyReader b{bad_bool};
   CHECK_FALSE(b.read_bool({PhysType::Bool}).has_value());
   CHECK_FALSE(b.ok());
+
+  // A part of a width no layout has reads nothing, whatever the key holds.
+  Bytes eight(8, std::byte{0x80});
+  KeyReader w3{eight};
+  CHECK_FALSE(w3.read_i64({PhysType::I64, false, false, 3}).has_value());
+  CHECK_FALSE(w3.ok());
+  KeyReader f2{eight};
+  CHECK_FALSE(f2.read_f64({PhysType::F64, false, false, 2}).has_value());
+  CHECK_FALSE(f2.ok());
 }
 
 TEST_CASE("row format: every physical type round-trips, null or not", "[sql][codec]") {
@@ -641,6 +650,13 @@ TEST_CASE("row format: layout_valid holds the format's invariants, and finish re
   CHECK(layout_valid(overlap));
   overlap.columns[1].pos -= 1;
   CHECK_FALSE(layout_valid(overlap));
+  // finish refuses it too, rather than write one column over the other.
+  RowWriter ow{overlap};
+  REQUIRE(ow.set_i64(0, -1));
+  REQUIRE(ow.set_i64(1, 7));
+  Bytes overlapped;
+  CHECK_FALSE(ow.finish(overlapped));
+  CHECK(overlapped.empty());
   auto shared_slot = make_layout(std::array{ColumnDef{0, {SqlKind::Text}, true}, ColumnDef{1, {SqlKind::Text}, true}});
   shared_slot.columns[1].pos = 0;
   CHECK_FALSE(layout_valid(shared_slot));
@@ -743,7 +759,7 @@ TEST_CASE("key codec: SMALLINT, INTEGER and DATE parts take 2 and 4 bytes, order
     // One past either end is no key of the part: nothing is written.
     for (auto past : {lo - 1, hi + 1, std::numeric_limits<std::int64_t>::min(), std::numeric_limits<std::int64_t>::max()}) {
       Bytes k{std::byte{9}};
-      CHECK_FALSE(key_put_i64(k, past, {PhysType::I64, true, false, false, width}));
+      CHECK_FALSE(key_put_i64(k, past, {PhysType::I64, true, false, width}));
       CHECK(k == Bytes{std::byte{9}});
     }
   }
@@ -753,7 +769,7 @@ TEST_CASE("key codec: a REAL part is its float rounding in 4 bytes, ordered as S
   std::mt19937_64 rng{47};
   for (int i = 0; i < 3000; ++i) {
     auto part = with_type(kI64Parts[rng() % 4], PhysType::F64);
-    part.real = true;
+    part.width = 4;
     auto a = random_f64(rng);
     auto b = random_f64(rng);
     Bytes ka, kb;
@@ -776,7 +792,8 @@ TEST_CASE("key codec: a column's key part is its declared width for SMALLINT, IN
   CHECK(key_part_of({SqlKind::SmallInt}, false, false).width == 2);
   CHECK(key_part_of({SqlKind::Integer}, false, false).width == 4);
   CHECK(key_part_of({SqlKind::Date}, true, true).width == 4);
-  CHECK(key_part_of({SqlKind::Real}, false, false).real);
+  CHECK(key_part_of({SqlKind::Real}, false, false).width == 4);
+  CHECK(key_part_of({SqlKind::Double}, false, false).width == 8);
   // A DECIMAL is compared with a parameter of no precision: its key holds any i64.
   CHECK(key_part_of({SqlKind::Decimal, 0, 4, 2}, false, false).width == 8);
   for (auto kind : {SqlKind::BigInt, SqlKind::Timestamp, SqlKind::TimestampTz, SqlKind::Time}) {
