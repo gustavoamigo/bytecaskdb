@@ -753,7 +753,8 @@ def test_vacuum_off_leaves_the_disk_as_written():
     if not server_binary():
         pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
     directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
-    s = Server(directory, extra_args=["--sync", "AT_FILE_ROTATION", "--vacuum", "off"])
+    s = Server(directory, extra_args=["--sync", "AT_FILE_ROTATION", "--vacuum", "off", "--vacuum-busy-interval-ms", "10",
+                                      "--vacuum-idle-interval-ms", "100"])
     try:
         c = connect(s)
         overwrite_wide_rows(c, rounds=6)

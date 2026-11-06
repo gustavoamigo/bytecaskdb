@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "include/bytecask.hpp"
+#include "tests/alloc_faults.h"
 
 import bytecask.sql.api;
 import bytecask.sql.tests.util;
@@ -51,17 +52,23 @@ auto open_wide(const sql_test::TempDir& dir) -> std::unique_ptr<Database> {
   return db;
 }
 
-void insert_rows(Database& db, std::int64_t first, int round) {
-  for (auto id = first; id < first + kRows; ++id) db.execute("INSERT INTO t VALUES ($1, $2)", {id, wide(round, id)});
+// Rows nothing overwrites, written first: the one data file so far holds them,
+// and once the rest go dead around them, vacuum can reclaim that file only by
+// moving them.
+constexpr std::int64_t kKept = 1000;
+constexpr std::int64_t kKeptRows = 8;
+
+void insert_rows(Database& db, std::int64_t first, int round, std::int64_t rows = kRows) {
+  for (auto id = first; id < first + rows; ++id) db.execute("INSERT INTO t VALUES ($1, $2)", {id, wide(round, id)});
 }
 
 void update_rows(Database& db, std::int64_t first, int round) {
   for (auto id = first; id < first + kRows; ++id) db.execute("UPDATE t SET v = $2 WHERE id = $1", {id, wide(round, id)});
 }
 
-auto holds(const Rows& rows, std::int64_t first, int round) -> bool {
-  if (std::ssize(rows.rows) != kRows) return false;
-  for (std::int64_t i = 0; i < kRows; ++i) {
+auto holds(const Rows& rows, std::int64_t first, int round, std::int64_t count = kRows) -> bool {
+  if (std::ssize(rows.rows) != count) return false;
+  for (std::int64_t i = 0; i < count; ++i) {
     const auto& row = rows.rows[static_cast<std::size_t>(i)];
     if (std::get<std::int64_t>(row[0]) != first + i) return false;
     if (std::get<Bytes>(row[1]) != std::get<Bytes>(wide(round, first + i))) return false;
@@ -70,6 +77,17 @@ auto holds(const Rows& rows, std::int64_t first, int round) -> bool {
 }
 
 auto scan(Database& db) -> Rows { return db.execute("SELECT id, v FROM t WHERE id < 1000 ORDER BY id"); }
+
+auto scan_kept(Database& db) -> Rows { return db.execute("SELECT id, v FROM t WHERE id >= 1000 ORDER BY id"); }
+
+auto only_data_file(const sql_test::TempDir& dir) -> std::filesystem::path {
+  std::vector<std::filesystem::path> files;
+  for (const auto& entry : std::filesystem::directory_iterator{dir.path()}) {
+    if (entry.path().extension() == ".data") files.push_back(entry.path());
+  }
+  REQUIRE(files.size() == 1);
+  return files[0];
+}
 
 auto data_bytes(const sql_test::TempDir& dir) -> std::uintmax_t {
   std::uintmax_t total = 0;
@@ -180,22 +198,25 @@ TEST_CASE("vacuum thread: a degraded or closed engine ends it", "[sql][server]")
 
 TEST_CASE("vacuum thread: gives the disk back while rows keep their values, also after a reopen", "[sql][server]") {
   sql_test::TempDir dir{"vacuum_thread"};
+  auto db = open_wide(dir);
+  constexpr auto kRounds = 6;
+  insert_rows(*db, kKept, 0, kKeptRows);
+  const auto first_file = only_data_file(dir);
+  insert_rows(*db, 0, 0);
   {
-    auto db = open_wide(dir);
-    constexpr auto kRounds = 6;
-    insert_rows(*db, 0, 0);
-    {
-      VacuumThread thread{[&] { return db->vacuum(); }, {.busy = 10ms, .idle = 100ms}};
-      for (auto round = 1; round < kRounds; ++round) update_rows(*db, 0, round);
-      // 192 MiB written, 32 MiB of it live. Each sealed file ends at most half
-      // dead, and the active file holds up to 64 MiB more.
-      CHECK(eventually([&] { return data_bytes(dir) <= 128u << 20; }));
-    }
-    CHECK(holds(scan(*db), 0, kRounds - 1));
-    db->close();
-    db = Database::open(dir.path());
-    CHECK(holds(scan(*db), 0, kRounds - 1));
+    VacuumThread thread{[&] { return db->vacuum(); }, {.busy = 10ms, .idle = 100ms}};
+    for (auto round = 1; round < kRounds; ++round) update_rows(*db, 0, round);
+    // 200 MiB written, 40 MiB of it live. Sealed files end at most half dead,
+    // and the active file holds up to 64 MiB more.
+    CHECK(eventually([&] { return data_bytes(dir) <= 144u << 20; }));
+    REQUIRE(eventually([&] { return !std::filesystem::exists(first_file); }));
   }
+  CHECK(holds(scan(*db), 0, kRounds - 1));
+  CHECK(holds(scan_kept(*db), kKept, 0, kKeptRows));
+  db->close();
+  db = Database::open(dir.path());
+  CHECK(holds(scan(*db), 0, kRounds - 1));
+  CHECK(holds(scan_kept(*db), kKept, 0, kKeptRows));
 }
 
 TEST_CASE("Database::vacuum: returns false with nothing to reclaim and throws DbClosed after close()", "[sql][api]") {
@@ -206,37 +227,68 @@ TEST_CASE("Database::vacuum: returns false with nothing to reclaim and throws Db
   CHECK_THROWS_AS(db->vacuum(), DbClosed);
 }
 
+TEST_CASE("Database::vacuum: a threshold of 1.0 reclaims nothing, not even a fully dead file", "[sql][api]") {
+  sql_test::TempDir dir{"vacuum_threshold"};
+  auto db = open_wide(dir);
+  insert_rows(*db, 0, 0);
+  for (auto round = 1; round < 6; ++round) update_rows(*db, 0, round);
+  CHECK_FALSE(db->vacuum({.fragmentation_threshold = 1.0}));
+  CHECK(db->vacuum());
+}
+
+TEST_CASE("Database::vacuum: throws DbDegraded on a degraded engine, which ends the thread", "[sql][api]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation fault seam in this build");
+  sql_test::TempDir dir{"vacuum_degraded"};
+  auto db = open_wide(dir);
+  // The first allocation whose failure leaves a commit's outcome unknown.
+  for (std::int64_t nth = 1; !db->engine_for_testing().is_degraded(); ++nth) {
+    bytecask::testing::ScopedAllocFaults faults{nth, false};
+    try {
+      db->execute("INSERT INTO t VALUES ($1, $2)", {nth, sql_test::bytes("v")});
+    } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch): the loop reads the outcome
+    }
+    REQUIRE(faults.report().fired);
+  }
+  CHECK_THROWS_AS(db->vacuum(), DbDegraded);
+
+  std::atomic<int> passes{0};
+  {
+    VacuumThread thread{[&] {
+                          ++passes;
+                          return db->vacuum();
+                        },
+                        {.busy = 1ms, .idle = 1ms}};
+    REQUIRE(eventually([&] { return passes.load() == 1; }));
+    std::this_thread::sleep_for(50ms);
+  }
+  CHECK(passes.load() == 1);
+  db->engine_for_testing().resume();
+}
+
 TEST_CASE("Database::vacuum: a transaction open across it reads its snapshot and commits with no conflict",
           "[sql][api]") {
   sql_test::TempDir dir{"vacuum_txn"};
   auto db = open_wide(dir);
-  // Rows the rest never overwrites, in the file vacuum will compact: it moves them.
-  constexpr std::int64_t kKept = 1000;
-  insert_rows(*db, kKept, 0);
+  insert_rows(*db, kKept, 0, kKeptRows);
+  const auto first_file = only_data_file(dir);
   insert_rows(*db, 0, 0);
   auto txn = db->begin();
   CHECK(holds(txn.execute("SELECT id, v FROM t WHERE id < 1000 ORDER BY id"), 0, 0));
   for (auto round = 1; round < 6; ++round) update_rows(*db, 0, round);
 
-  auto reclaimed = 0;
-  while (db->vacuum()) ++reclaimed;
-  REQUIRE(reclaimed > 0);
+  while (db->vacuum()) {
+  }
+  // The kept rows were only in this file, so they have moved.
+  REQUIRE_FALSE(std::filesystem::exists(first_file));
+  CHECK(holds(scan_kept(*db), kKept, 0, kKeptRows));
 
   CHECK(holds(txn.execute("SELECT id, v FROM t WHERE id < 1000 ORDER BY id"), 0, 0));
-  CHECK(holds(txn.execute("SELECT id, v FROM t WHERE id >= 1000 ORDER BY id"), kKept, 0));
-  // A few of them: a transaction holds at most 64 MiB of writes.
-  constexpr std::int64_t kWritten = 4;
-  for (auto id = kKept; id < kKept + kWritten; ++id) {
+  CHECK(holds(txn.execute("SELECT id, v FROM t WHERE id >= 1000 ORDER BY id"), kKept, 0, kKeptRows));
+  for (auto id = kKept; id < kKept + kKeptRows; ++id) {
     txn.execute("UPDATE t SET v = $2 WHERE id = $1", {id, wide(7, id)});
   }
   CHECK(txn.commit() == CommitOutcome::Committed);
-  const auto after = db->execute("SELECT id, v FROM t WHERE id >= 1000 ORDER BY id");
-  REQUIRE(std::ssize(after.rows) == kRows);
-  for (std::int64_t i = 0; i < kRows; ++i) {
-    const auto id = kKept + i;
-    CHECK(std::get<Bytes>(after.rows[static_cast<std::size_t>(i)][1]) ==
-          std::get<Bytes>(wide(i < kWritten ? 7 : 0, id)));
-  }
+  CHECK(holds(scan_kept(*db), kKept, 7, kKeptRows));
 }
 
 TEST_CASE("Database::vacuum: a hold cursor reads on across it and keeps the disk blocks until it closes",

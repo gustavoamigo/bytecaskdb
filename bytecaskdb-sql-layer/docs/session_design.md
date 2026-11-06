@@ -296,7 +296,7 @@ an update workload grows the data directory without bound. The server calls:
 | Flag | Default | Takes |
 |---|---|---|
 | `--vacuum` | `on` | `on` or `off`; `off` starts no thread |
-| `--vacuum-fragmentation-threshold` | `0.5` | 0.0 to 1.0 |
+| `--vacuum-fragmentation-threshold` | `0.5` | 0.0 to 1.0; a file qualifies above it, so 1.0 reclaims nothing, with the thread still running |
 | `--vacuum-busy-interval-ms` | `500` | 10 to 3,600,000 |
 | `--vacuum-idle-interval-ms` | `30000` | 100 to 86,400,000 |
 
@@ -312,16 +312,19 @@ reclaimed a file and the idle pause otherwise.
 `Database` because a sync mode is a durability promise `Database` makes;
 vacuum promises nothing, and when to run it is the host's policy, as in the
 plugin. An embedded host calls `Database::vacuum` itself, and one that never
-does never gets its disk back.
+does never gets its disk back. `Database::close()` waits for a call in flight,
+up to a whole file's compaction, so a host stops calling first.
 
-**Start and stop.** It starts before `main` pins itself to a CPU and unblocks
-the stop signals, so it inherits neither. It stops after the sessions and
+**Start and stop.** It starts before the loop threads, so a failed start exits
+1, and before `main` pins itself to a CPU and unblocks the stop signals, so it
+inherits neither. It stops after the sessions and
 before `Database::close()`, waiting for a pass in flight, since the engine
 can't abort one: a stop can take one more compaction of a 64 MiB file.
 
-**Failures.** A failed pass leaves the engine as it was. The first of a run of
+**Failures.** A failed pass changes nothing readable. The first of a run of
 failures is logged, and the pass is retried after the idle pause: ENOSPC,
-EMFILE, or no file id left (#774). `DbDegraded` logs and ends the thread, as
+EMFILE, or no file id left (#774). A failed unlink of the old file comes after
+the file was reclaimed, so it leaves the old file for the next open to resolve. `DbDegraded` logs and ends the thread, as
 the flusher does, since no later pass can succeed; a failed `fdatasync` in a
 pass degrades the engine, so the retry finds that. The server stays up and
 refuses writes, where the plugin aborts.
@@ -393,8 +396,9 @@ already warns when `--listen` names an address that isn't a loopback one.
 A request names its session, and a session outlives any one connection: a
 client can reconnect and continue. That needs a session id and secret (the
 cancellation key above), an owner, and an idle timeout, because an idle
-open transaction holds a snapshot, and a snapshot keeps data files from
-vacuum. The connection-to-session map then goes.
+open transaction holds a snapshot, and a snapshot keeps the disk blocks of the
+files vacuum reclaims (*Background vacuum*). The connection-to-session map
+then goes.
 
 ## Tests
 

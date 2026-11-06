@@ -82,7 +82,7 @@ auto Database::begin(TransactionOptions = {}) -> Transaction;
   returns `Committed`.
 - **After a failed statement the transaction is aborted,** and lets go at
   once of its snapshot, its pinned catalog and its writes: an aborted handle
-  holds back no vacuum, and keeps only its state. As in PostgreSQL: every later `execute()` is refused with SQLSTATE 25P02
+  keeps no disk blocks of files vacuum reclaimed, and keeps only its state. As in PostgreSQL: every later `execute()` is refused with SQLSTATE 25P02
   ("current transaction is aborted, commands ignored until end of
   transaction block"), and `commit()` rolls it back without an error, as
   PostgreSQL's COMMIT does (owner's decision, 2026-10-20).

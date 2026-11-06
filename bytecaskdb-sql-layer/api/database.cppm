@@ -510,7 +510,7 @@ struct TxnHandle {
     cx = nullptr;
     txn = nullptr;
   }
-  // Aborted: what it held is freed now, the snapshot that holds vacuum back
+  // Aborted: what it held is freed now, the snapshot that keeps disk blocks
   // first. Only the state is left, for rollback() or commit() to end.
   void abort() noexcept {
     for (const auto& c : cursors) c->aborted = true;
@@ -810,9 +810,12 @@ public:
   // has a thread for it (docs/session_design.md, *Background vacuum*). Runs
   // concurrently with statements and commits, which wait only for its commit;
   // a second call waits for the first. An open snapshot keeps reading what it
-  // reclaims, and keeps those disk blocks until it is released. Throws
-  // DbClosed, DbDegraded, or what the failed I/O threw, and a failure leaves
-  // the database as it was.
+  // reclaims, and keeps those disk blocks until it is released. close() waits
+  // for a call in flight, up to a whole file's compaction, so a host stops
+  // calling first. Throws DbClosed, DbDegraded, or what the failed I/O threw. A
+  // failure changes nothing readable, but a failed fdatasync degrades the engine
+  // as a commit's does, and a failed unlink of the old file throws after the
+  // file was reclaimed, leaving it for the next open.
   [[nodiscard]] auto vacuum(VacuumOptions opts = {}) -> bool;
   // The engine's operational counters and gauges by name, as DB::stats()
   // gives them; the buffer pool's are all zero on a backend with no pool. Live

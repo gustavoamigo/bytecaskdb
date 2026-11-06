@@ -30,9 +30,8 @@ struct VacuumPacing {
 // destruction, which waits for a pass in flight and interrupts a pause.
 // `pass` returns whether another pass may find more, as DB::vacuum does.
 //
-// A failure is logged once per run of failures and retried: vacuum leaves the
-// engine as it was. DbDegraded ends the thread, since no later pass can
-// succeed, and so does DbClosed.
+// A failure is logged once per run of failures and retried. DbDegraded ends the
+// thread, since no later pass can succeed, and so does DbClosed.
 class VacuumThread {
 public:
   VacuumThread(std::function<bool()> pass, VacuumPacing pacing);

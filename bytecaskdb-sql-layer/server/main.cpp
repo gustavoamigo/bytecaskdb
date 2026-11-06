@@ -773,6 +773,15 @@ int main(int argc, char** argv) {
     (void)uv_timer_init(&sh0.loop, &srv.accept_retry);
     (void)uv_poll_start(&srv.listener_poll, UV_READABLE, on_accept);
 
+    // Before the loop threads: a failed start then exits 1, where unwinding past
+    // them would terminate. Before the pin and the unblock too: it takes neither
+    // loop 0's CPU nor the stop signals. Declared after db, so it is gone before
+    // db on every way out.
+    std::optional<bytecask::sql::VacuumThread> vacuum;
+    if (vacuum_on) {
+      vacuum.emplace([&db, vacuum_opts] { return db->vacuum(vacuum_opts); }, vacuum_pacing);
+    }
+
     std::vector<std::thread> loop_threads;
     loop_threads.reserve(n_loops - 1);
     for (std::size_t i = 1; i < n_loops; ++i) {
@@ -782,13 +791,6 @@ int main(int argc, char** argv) {
         pin_current_thread(cpu);
         (void)uv_run(&sh->loop, UV_RUN_DEFAULT);
       });
-    }
-
-    // Before the pin and the unblock: it takes neither loop 0's CPU nor the stop
-    // signals. Declared after db, so it is gone before db on every way out.
-    std::optional<bytecask::sql::VacuumThread> vacuum;
-    if (vacuum_on) {
-      vacuum.emplace([&db, vacuum_opts] { return db->vacuum(vacuum_opts); }, vacuum_pacing);
     }
 
     if (affinity) pin_current_thread(cpus[0]);
