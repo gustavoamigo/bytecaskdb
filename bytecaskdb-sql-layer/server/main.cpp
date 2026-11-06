@@ -779,7 +779,8 @@ int main(int argc, char** argv) {
     // db on every way out.
     std::optional<bytecask::sql::VacuumThread> vacuum;
     if (vacuum_on) {
-      vacuum.emplace([&db, vacuum_opts] { return db->vacuum(vacuum_opts); }, vacuum_pacing);
+      vacuum.emplace([&db, vacuum_opts] { return db->vacuum(vacuum_opts); }, [&db] { return db->is_degraded(); },
+                     vacuum_pacing);
     }
 
     std::vector<std::thread> loop_threads;

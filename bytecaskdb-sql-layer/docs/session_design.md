@@ -321,13 +321,18 @@ inherits neither. It stops after the sessions and
 before `Database::close()`, waiting for a pass in flight, since the engine
 can't abort one: a stop can take one more compaction of a 64 MiB file.
 
-**Failures.** A failed pass changes nothing readable. The first of a run of
-failures is logged, and the pass is retried after the idle pause: ENOSPC,
-EMFILE, or no file id left (#774). A failed unlink of the old file comes after
-the file was reclaimed, so it leaves the old file for the next open to resolve. `DbDegraded` logs and ends the thread, as
-the flusher does, since no later pass can succeed; a failed `fdatasync` in a
-pass degrades the engine, so the retry finds that. The server stays up and
-refuses writes, where the plugin aborts.
+**Failures.** A failed pass changes nothing readable. It is logged, and retried
+after the idle pause: ENOSPC, EMFILE, or no file id left (#774). A lasting
+failure is logged again every ten passes, five minutes at the default pause. A
+failed unlink of the old file comes after the file was reclaimed, so it leaves
+the old file for the next open to resolve.
+
+A failure that left the engine degraded, or `DbDegraded`, logs and ends the
+thread, as the flusher does, since no later pass can succeed. A failed `fdatasync`
+in a pass degrades the engine and throws the I/O error, so after any failure the
+thread asks `Database::is_degraded`, which makes the log name the failure at once
+rather than after the idle pause. The server stays up and refuses writes, where
+the plugin aborts.
 
 **Snapshots.** Vacuum never consults them, and never waits for one. A
 compacted file's source is unlinked at once, and a snapshot that reaches it

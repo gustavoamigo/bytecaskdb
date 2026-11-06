@@ -16,11 +16,13 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -111,6 +113,31 @@ auto unlinked_held(const sql_test::TempDir& dir) -> int {
   return held;
 }
 
+auto healthy() -> bool { return false; }
+
+// A VacuumLog is a plain function, so what it records is the test's one log.
+struct Logged {
+  std::string what;
+  std::uint64_t failures;
+  bool stops;
+};
+std::mutex logged_mu;
+
+auto logged() -> std::vector<Logged>& {
+  static auto* entries = new std::vector<Logged>;
+  return *entries;
+}
+
+void record(const char* what, std::uint64_t failures, bool stops) {
+  const std::lock_guard<std::mutex> lock{logged_mu};
+  logged().push_back({what, failures, stops});
+}
+
+auto taken_log() -> std::vector<Logged> {
+  const std::lock_guard<std::mutex> lock{logged_mu};
+  return std::exchange(logged(), {});
+}
+
 auto eventually(const std::function<bool()>& done, std::chrono::seconds limit = 60s) -> bool {
   const auto until = std::chrono::steady_clock::now() + limit;
   while (!done()) {
@@ -130,6 +157,7 @@ TEST_CASE("vacuum thread: stopping interrupts a pause rather than waiting it out
                           ++passes;
                           return false;
                         },
+                        healthy,
                         {.busy = kHour, .idle = kHour}};
     REQUIRE(eventually([&] { return passes.load() == 1; }));
   }
@@ -141,7 +169,7 @@ TEST_CASE("vacuum thread: a pass that reclaimed waits the busy pause, one that f
           "[sql][server]") {
   std::atomic<int> passes{0};
   {
-    VacuumThread thread{[&] { return ++passes < 5; }, {.busy = 1ms, .idle = kHour}};
+    VacuumThread thread{[&] { return ++passes < 5; }, healthy, {.busy = 1ms, .idle = kHour}};
     REQUIRE(eventually([&] { return passes.load() == 5; }));
     std::this_thread::sleep_for(50ms);
   }
@@ -155,6 +183,7 @@ TEST_CASE("vacuum thread: a failed pass waits the idle pause and is retried", "[
                           if (++passes < 3) throw std::runtime_error("no space left");
                           return false;
                         },
+                        healthy,
                         {.busy = kHour, .idle = 1ms}};
     CHECK(eventually([&] { return passes.load() >= 3; }));
   }
@@ -165,6 +194,7 @@ TEST_CASE("vacuum thread: a failed pass waits the idle pause and is retried", "[
                             ++passes;
                             throw std::runtime_error("no space left");
                           },
+                          healthy,
                           {.busy = 1ms, .idle = kHour}};
       REQUIRE(eventually([&] { return passes.load() == 1; }));
       std::this_thread::sleep_for(50ms);
@@ -189,11 +219,76 @@ TEST_CASE("vacuum thread: a degraded or closed engine ends it", "[sql][server]")
     };
   }
   {
-    VacuumThread thread{pass, {.busy = 1ms, .idle = 1ms}};
+    VacuumThread thread{pass, healthy, {.busy = 1ms, .idle = 1ms}};
     REQUIRE(eventually([&] { return passes.load() == 1; }));
     std::this_thread::sleep_for(50ms);
   }
   CHECK(passes.load() == 1);
+}
+
+TEST_CASE("vacuum thread: a failure that left the engine degraded ends it at once, naming the failure",
+          "[sql][server]") {
+  (void)taken_log();
+  std::atomic<int> passes{0};
+  {
+    // A failed fdatasync: the I/O error, with the engine degraded by then.
+    VacuumThread thread{[&]() -> bool {
+                          ++passes;
+                          throw std::runtime_error("fdatasync failed");
+                        },
+                        [] { return true; },
+                        {.busy = 1ms, .idle = 1ms},
+                        record};
+    REQUIRE(eventually([&] { return passes.load() == 1; }));
+    std::this_thread::sleep_for(50ms);
+  }
+  CHECK(passes.load() == 1);
+  const auto log = taken_log();
+  REQUIRE(log.size() == 1);
+  CHECK(log[0].what == "fdatasync failed");
+  CHECK(log[0].stops);
+}
+
+TEST_CASE("vacuum thread: a lasting failure is logged again, and a success starts the count over", "[sql][server]") {
+  (void)taken_log();
+  std::atomic<int> passes{0};
+  {
+    // 21 failures, a success, then one more failure.
+    VacuumThread thread{[&]() -> bool {
+                          const auto n = ++passes;
+                          if (n == 22) return true;
+                          if (n > 23) return false;
+                          throw std::runtime_error("no space left");
+                        },
+                        healthy,
+                        {.busy = 1ms, .idle = 1ms},
+                        record};
+    REQUIRE(eventually([&] { return passes.load() > 23; }));
+  }
+  std::vector<std::uint64_t> failures;
+  for (const auto& entry : taken_log()) {
+    CHECK_FALSE(entry.stops);
+    failures.push_back(entry.failures);
+  }
+  CHECK(failures == std::vector<std::uint64_t>{1, 11, 21, 1});
+}
+
+TEST_CASE("vacuum thread: an exception of any type is reported and retried", "[sql][server]") {
+  (void)taken_log();
+  std::atomic<int> passes{0};
+  {
+    VacuumThread thread{[&]() -> bool {
+                          if (++passes < 3) throw 42;
+                          return false;
+                        },
+                        healthy,
+                        {.busy = 1ms, .idle = 1ms},
+                        record};
+    REQUIRE(eventually([&] { return passes.load() >= 3; }));
+  }
+  const auto log = taken_log();
+  REQUIRE_FALSE(log.empty());
+  CHECK(log[0].what == "an exception of unknown type");
 }
 
 TEST_CASE("vacuum thread: gives the disk back while rows keep their values, also after a reopen", "[sql][server]") {
@@ -204,7 +299,7 @@ TEST_CASE("vacuum thread: gives the disk back while rows keep their values, also
   const auto first_file = only_data_file(dir);
   insert_rows(*db, 0, 0);
   {
-    VacuumThread thread{[&] { return db->vacuum(); }, {.busy = 10ms, .idle = 100ms}};
+    VacuumThread thread{[&] { return db->vacuum(); }, [&] { return db->is_degraded(); }, {.busy = 10ms, .idle = 100ms}};
     for (auto round = 1; round < kRounds; ++round) update_rows(*db, 0, round);
     // 200 MiB written, 40 MiB of it live. Sealed files end at most half dead,
     // and the active file holds up to 64 MiB more.
@@ -225,6 +320,7 @@ TEST_CASE("Database::vacuum: returns false with nothing to reclaim and throws Db
   CHECK_FALSE(db->vacuum());
   db->close();
   CHECK_THROWS_AS(db->vacuum(), DbClosed);
+  CHECK_FALSE(db->is_degraded());
 }
 
 TEST_CASE("Database::vacuum: a threshold of 1.0 reclaims nothing, not even a fully dead file", "[sql][api]") {
@@ -240,6 +336,7 @@ TEST_CASE("Database::vacuum: throws DbDegraded on a degraded engine, which ends 
   if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation fault seam in this build");
   sql_test::TempDir dir{"vacuum_degraded"};
   auto db = open_wide(dir);
+  CHECK_FALSE(db->is_degraded());
   // The first allocation whose failure leaves a commit's outcome unknown.
   for (std::int64_t nth = 1; !db->engine_for_testing().is_degraded(); ++nth) {
     // Built outside the faults: only the statement's own allocations are failed.
@@ -251,6 +348,7 @@ TEST_CASE("Database::vacuum: throws DbDegraded on a degraded engine, which ends 
     }
     REQUIRE(faults.report().fired);
   }
+  CHECK(db->is_degraded());
   CHECK_THROWS_AS(db->vacuum(), DbDegraded);
 
   std::atomic<int> passes{0};
@@ -259,6 +357,7 @@ TEST_CASE("Database::vacuum: throws DbDegraded on a degraded engine, which ends 
                           ++passes;
                           return db->vacuum();
                         },
+                        healthy,
                         {.busy = 1ms, .idle = 1ms}};
     REQUIRE(eventually([&] { return passes.load() == 1; }));
     std::this_thread::sleep_for(50ms);

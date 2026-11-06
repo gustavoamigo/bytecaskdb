@@ -817,6 +817,9 @@ public:
   // as a commit's does, and a failed unlink of the old file throws after the
   // file was reclaimed, leaving it for the next open.
   [[nodiscard]] auto vacuum(VacuumOptions opts = {}) -> bool;
+  // Whether a failure has left the engine refusing writes: a failed fdatasync
+  // in a vacuum throws the I/O error, not DbDegraded. False after close().
+  [[nodiscard]] auto is_degraded() const -> bool;
   // The engine's operational counters and gauges by name, as DB::stats()
   // gives them; the buffer pool's are all zero on a backend with no pool. Live
   // values, not one atomic snapshot. Takes no lock another call waits on.
@@ -1381,6 +1384,11 @@ void Database::stop_flusher() {
   }
   flush_cv_.notify_one();
   if (flusher_.joinable()) flusher_.join();
+}
+
+auto Database::is_degraded() const -> bool {
+  const std::shared_lock<std::shared_mutex> lock{life_->mu};
+  return !life_->closed && db_->is_degraded();
 }
 
 auto Database::vacuum(VacuumOptions opts) -> bool {
