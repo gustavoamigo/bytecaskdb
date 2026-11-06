@@ -6,7 +6,8 @@
 // compatibility check and the map from column ids to positions, adds to an
 // execution (a point read's reference and a New-Order-sized one), what one
 // column decode costs, what a nullable text column's null test and read
-// cost, and what bc_update costs when no indexed column changes. Not part of CI. The published
+// cost, and what bc_update costs when no indexed column changes; and the
+// bytes a row of each table takes as a record. Not part of CI. The published
 // numbers were taken in releasedbg (-O3 -march=native, no LTO):
 //   xmake f -m releasedbg --sql_layer=y && xmake build sql_layer_bench && xmake run sql_layer_bench
 // release adds LTO, whose link fails where llvm-ar is older than clang (it
@@ -215,6 +216,59 @@ auto ns_over(A&& a, B&& b, int iters) -> double {
   return diffs[diffs.size() / 2];
 }
 
+// The bytes one row of each TPROC-C table takes in the engine, as the codec
+// lays it out: every column present, integers 1, a VARCHAR(n) n bytes long
+// (the most it holds, so the strings are the same in every format). A
+// record is its key, its value and the engine's 19 bytes of framing; an
+// index entry is its key and the framing. New-Order is the issue #780
+// count: one district, orders and new_order row, an orders_i2 entry, ten
+// order_line and ten stock rows.
+void print_record_bytes(const Catalog& cat) {
+  constexpr std::size_t kFraming = 19;
+  std::printf("record bytes (key + value + %zu framing), every column present:\n", kFraming);
+  auto record = [&](std::string_view name) {
+    const auto& t = *cat.table(name);
+    RowWriter rw{t.layout};
+    for (const auto& c : t.columns) {
+      switch (c.type) {
+        case PhysType::I64: (void)rw.set_i64(c.id, 1); break;
+        case PhysType::F64: (void)rw.set_f64(c.id, 1.0); break;
+        case PhysType::Bool: (void)rw.set_bool(c.id, true); break;
+        case PhysType::Bytes: {
+          std::string s(c.sql.length, 'x');
+          (void)rw.set_bytes(c.id, std::as_bytes(std::span{s}));
+          break;
+        }
+      }
+    }
+    Bytes row, key;
+    (void)rw.finish(row);
+    (void)encode_pk_from_row(t, row, key);
+    auto total = key.size() + row.size() + kFraming;
+    std::printf("  %-10s key %3zu  value %4zu  record %4zu", std::string{name}.c_str(), key.size(), row.size(), total);
+    std::size_t entries = 0;
+    for (const auto& ix : t.indexes) {
+      Bytes ik;
+      (void)encode_index_key_from_row(t, ix, row, ik);
+      std::printf("  %s %zu", ix.name.c_str(), ik.size() + kFraming);
+      entries += ik.size() + kFraming;
+    }
+    std::printf("\n");
+    return std::pair{total, entries};
+  };
+  std::size_t new_order = 0;
+  for (auto name : {"warehouse", "district", "customer", "history", "new_order", "orders", "order_line", "item",
+                    "stock"}) {
+    auto [rec, ix] = record(name);
+    std::string_view n{name};
+    if (n == "district" || n == "new_order") new_order += rec;
+    if (n == "orders") new_order += rec + ix;
+    if (n == "order_line" || n == "stock") new_order += 10 * rec;
+  }
+  std::printf("  New-Order writes (district, orders + orders_i2, new_order, 10 order_line, 10 stock): %zu bytes\n",
+              new_order);
+}
+
 }  // namespace
 
 int main() {
@@ -228,6 +282,7 @@ int main() {
       (void)live.apply(std::get<Ddl>(b.stmt));
     }
     auto cat = live.current();
+    print_record_bytes(*cat);
     // One warehouse row, written straight to the engine.
     const auto& w = *cat->table("warehouse");
     g_warehouse = w.id;

@@ -3,9 +3,11 @@
 //
 // Property tests for the key codec and the row format
 // (docs/types_design.md): encode then decode gives the value back,
-// memcmp order on encoded keys is the typed order, for every part type, ASC
-// and DESC, with nulls first; and a row shorter than its layout reads the
-// columns it predates as null, in both directions.
+// memcmp order on encoded keys is the typed order, for every part type and
+// integer width, ASC and DESC, with nulls first; every column type takes its
+// declared width in a row and round-trips at its range's edges; and a row
+// shorter than its layout reads the columns it predates as null, in both
+// directions.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -122,7 +124,7 @@ void put(Bytes& out, const std::optional<T>& v, KeyPart part) {
   if (!v) {
     key_put_null(out, part);
   } else if constexpr (std::is_same_v<T, std::int64_t>) {
-    key_put_i64(out, *v, part);
+    CHECK(key_put_i64(out, *v, part));
   } else if constexpr (std::is_same_v<T, double>) {
     key_put_f64(out, *v, part);
   } else if constexpr (std::is_same_v<T, bool>) {
@@ -211,7 +213,7 @@ auto encode(const Composite& c) -> Bytes {
   Bytes k;
   key_put_prefix(k, kNsIndex, 7);
   put(k, c.name, kNamePart);
-  key_put_i64(k, c.id, kIdPart);
+  CHECK(key_put_i64(k, c.id, kIdPart));
   put(k, c.score, kScorePart);
   put(k, c.flag, kFlagPart);
   return k;
@@ -263,9 +265,9 @@ TEST_CASE("key codec: bytes parts order by value, a prefix first", "[sql][codec]
   // an i64 of all 0xFF bytes still sorts before "a\0" then anything.
   Bytes a, a0;
   key_put_bytes(a, Bytes{std::byte{'a'}}, {PhysType::Bytes});
-  key_put_i64(a, -1, {PhysType::I64});  // 0x7F 0xFF… after the sign flip
+  CHECK(key_put_i64(a, -1, {PhysType::I64}));  // 0x7F 0xFF… after the sign flip
   key_put_bytes(a0, Bytes{std::byte{'a'}, std::byte{0}}, {PhysType::Bytes});
-  key_put_i64(a0, std::numeric_limits<std::int64_t>::min(), {PhysType::I64});
+  CHECK(key_put_i64(a0, std::numeric_limits<std::int64_t>::min(), {PhysType::I64}));
   CHECK(memcmp_order(a, a0) == std::strong_ordering::less);
 }
 
@@ -310,7 +312,7 @@ TEST_CASE("key codec: a prefix's successor bounds every key under it", "[sql][co
     Bytes prefix;
     key_put_prefix(prefix, kNsIndex, 7);
     put(prefix, a.name, kNamePart);
-    key_put_i64(prefix, a.id, kIdPart);
+    CHECK(key_put_i64(prefix, a.id, kIdPart));
     auto full = encode(a);
     auto succ = key_successor(prefix);
     CHECK(memcmp_order(prefix, full) != std::strong_ordering::greater);
@@ -322,12 +324,14 @@ TEST_CASE("key codec: a prefix's successor bounds every key under it", "[sql][co
 
 TEST_CASE("key codec: malformed keys are reported, not over-read", "[sql][codec]") {
   // Every part type, cut at every byte.
-  for (auto part : {KeyPart{PhysType::I64, true, false}, KeyPart{PhysType::F64, true, true},
+  for (auto part : {KeyPart{PhysType::I64, true, false}, KeyPart{PhysType::I64, true, true, false, 2},
+                    KeyPart{PhysType::I64, false, false, false, 4}, KeyPart{PhysType::F64, true, true},
+                    KeyPart{PhysType::F64, true, false, true},
                     KeyPart{PhysType::Bool, true, false}, KeyPart{PhysType::Bytes, true, true},
                     KeyPart{PhysType::Bytes, false, false}}) {
     Bytes k;
     switch (part.type) {
-      case PhysType::I64: key_put_i64(k, -5, part); break;
+      case PhysType::I64: CHECK(key_put_i64(k, -5, part)); break;
       case PhysType::F64: key_put_f64(k, -2.5, part); break;
       case PhysType::Bool: key_put_bool(k, true, part); break;
       case PhysType::Bytes: key_put_bytes(k, Bytes{std::byte{1}, std::byte{0}, std::byte{2}}, part); break;
@@ -369,9 +373,9 @@ TEST_CASE("row format: every physical type round-trips, null or not", "[sql][cod
       {5, plain_sql_type(PhysType::Bytes), true},
   }};
   auto layout = make_layout(defs);
-  CHECK(layout.bitmap_bytes == 8);
-  CHECK(layout.fixed_start == kRowHeaderBytes + 8);
-  CHECK(layout.fixed_end == layout.fixed_start + 4 * kFixedColumnBytes);
+  CHECK(layout.bitmap_bytes == 3);  // 6 ids and 16 to spare
+  CHECK(layout.fixed_start == kRowHeaderBytes + 3);
+  CHECK(layout.fixed_end == layout.fixed_start + 8 + 8 + 8 + 1);  // two BIGINTs, a DOUBLE, a BOOLEAN
   CHECK(layout.nvar == 2);
   CHECK(layout.find(1)->pos == 0);
   CHECK(layout.find(5)->pos == 1);
@@ -456,7 +460,7 @@ TEST_CASE("row format: a row shorter than the layout reads as null, in both dire
   CHECK(new_layout.find(1)->pos == old_layout.find(1)->pos);
   CHECK(new_layout.find(2)->pos == old_layout.fixed_end);
   CHECK(new_layout.find(3)->pos == 1);
-  CHECK(new_layout.find(4)->pos == old_layout.fixed_end + kFixedColumnBytes);
+  CHECK(new_layout.find(4)->pos == old_layout.fixed_end + 8);  // after the BIGINT
 
   // The newer layout reads the old row: the known columns, null for the rest.
   CHECK(row_column(old_row, *new_layout.find(0)).i64() == 5);
@@ -559,7 +563,7 @@ TEST_CASE("row format: the bitmap is sized at create and has a ceiling", "[sql][
   std::vector<ColumnDef> defs;
   for (std::uint32_t i = 0; i < 48; ++i) defs.emplace_back(i, plain_sql_type(PhysType::I64), true);
   auto layout = make_layout(defs);
-  CHECK(layout.bitmap_bytes == 8);  // 48 ids and 16 to spare fit 64 bits
+  CHECK(layout.bitmap_bytes == 8);  // 48 ids and 16 to spare: 64 bits
   CHECK(layout.id_ceiling() == 64);
   REQUIRE(append_columns(layout, std::array{ColumnDef{63, plain_sql_type(PhysType::Bool), true}}));
   // Past the ceiling: refused, and nothing appended.
@@ -570,30 +574,29 @@ TEST_CASE("row format: the bitmap is sized at create and has a ceiling", "[sql][
   CHECK(layout.find(50) == nullptr);
 
   defs.emplace_back(48, plain_sql_type(PhysType::I64), true);
-  CHECK(make_layout(defs).bitmap_bytes == 16);
-  CHECK(make_layout(std::span<const ColumnDef>{}).bitmap_bytes == 8);
+  CHECK(make_layout(defs).bitmap_bytes == 9);  // byte by byte, not a word at a time
+  CHECK(make_layout(std::span<const ColumnDef>{}).bitmap_bytes == 2);
 
-  // The fixed region ends where the header's 16-bit var_table does.
+  // The bitmap's size is a byte in the header: 255 bytes hold ids below
+  // 2024 with 16 to spare. Past that, refused at create.
   std::vector<ColumnDef> many;
-  for (std::uint32_t i = 0; i < 9000; ++i) many.emplace_back(i, plain_sql_type(PhysType::I64), true);
-  auto wide = make_layout(std::span<const ColumnDef>{many}.first(8000));
+  for (std::uint32_t i = 0; i < 2025; ++i) many.emplace_back(i, plain_sql_type(PhysType::I64), true);
+  auto wide = make_layout(std::span<const ColumnDef>{many}.first(2024));
+  CHECK(wide.bitmap_bytes == 255);
   CHECK(wide.fixed_end <= 0xFFFF);
-  CHECK(wide.columns.size() == 8000);
-  CHECK_FALSE(append_columns(wide, std::span<const ColumnDef>{many}.subspan(8000, 1000)));
-  CHECK(wide.columns.size() == 8000);
   CHECK_THROWS_AS(make_layout(many), std::length_error);
-  // An id large enough that the bitmap alone outgrows the 16-bit header
-  // fields, with only variable columns: refused at create.
-  CHECK_THROWS_AS(make_layout(std::array{ColumnDef{600'000, plain_sql_type(PhysType::Bytes), true}}), std::length_error);
-  CHECK(make_layout(std::array{ColumnDef{500'000, plain_sql_type(PhysType::Bytes), true}}).fixed_start <= 0xFFFF);
+  // ADD COLUMN takes the spare ids, up to the bitmap's last bit.
+  CHECK(wide.id_ceiling() == 2040);
+  CHECK_FALSE(append_columns(wide, std::array{ColumnDef{2040, plain_sql_type(PhysType::I64), true}}));
+  CHECK(wide.columns.size() == 2024);
   CHECK(narrow<std::uint16_t>(0xFFFFu) == 0xFFFF);
   CHECK_THROWS_AS(narrow<std::uint16_t>(0x10000u), std::overflow_error);
   RowWriter ww{wide};
-  for (std::uint32_t i = 0; i < 8000; ++i) REQUIRE(ww.set_i64(i, i));
+  for (std::uint32_t i = 0; i < 2024; ++i) REQUIRE(ww.set_i64(i, i));
   Bytes wide_row;
   REQUIRE(ww.finish(wide_row));
   CHECK(row_valid(wide_row));
-  CHECK(row_column(wide_row, *wide.find(7999)).i64() == 7999);
+  CHECK(row_column(wide_row, *wide.find(2023)).i64() == 2023);
 
   // The row carries the size, and a bit past the bitmap is clear.
   RowWriter w{layout};
@@ -601,7 +604,7 @@ TEST_CASE("row format: the bitmap is sized at create and has a ceiling", "[sql][
   REQUIRE(w.set_bool(63, true));
   Bytes row;
   REQUIRE(w.finish(row));
-  auto bit = [&](std::uint32_t id) { return row_column(row, id, PhysType::Bool, layout.fixed_start).state; };
+  auto bit = [&](std::uint32_t id) { return row_column(row, id, PhysType::Bool, layout.fixed_start, 1).state; };
   CHECK(bit(63) != ColumnState::Absent);
   CHECK(bit(64) == ColumnState::Absent);
   CHECK(bit(1000) == ColumnState::Absent);
@@ -614,15 +617,33 @@ TEST_CASE("row format: layout_valid holds the format's invariants, and finish re
   auto past_ceiling = good;
   past_ceiling.columns[1].col_id = good.id_ceiling();
   CHECK_FALSE(layout_valid(past_ceiling));
-  auto odd_bitmap = good;
-  odd_bitmap.bitmap_bytes = 7;
-  CHECK_FALSE(layout_valid(odd_bitmap));
+  for (std::uint32_t bytes : {0u, 256u}) {
+    auto bad_bitmap = good;
+    bad_bitmap.bitmap_bytes = bytes;
+    bad_bitmap.fixed_start = static_cast<std::uint32_t>(kRowHeaderBytes) + bytes;
+    CHECK_FALSE(layout_valid(bad_bitmap));
+  }
+  auto moved_fixed = good;
+  moved_fixed.fixed_start += 1;
+  CHECK_FALSE(layout_valid(moved_fixed));
   auto bad_type = good;
   bad_type.columns[0].type = static_cast<PhysType>(9);
   CHECK_FALSE(layout_valid(bad_type));
-  auto off_word = good;
-  off_word.columns[0].pos += 1;
-  CHECK_FALSE(layout_valid(off_word));
+  auto past_region = good;
+  past_region.columns[0].pos += 1;  // its 8 bytes run past the fixed region
+  CHECK_FALSE(layout_valid(past_region));
+  auto bad_width = good;
+  bad_width.columns[0].width = 3;
+  CHECK_FALSE(layout_valid(bad_width));
+  // Two fixed columns sharing a byte.
+  const std::array<ColumnDef, 2> two{{{0, {SqlKind::Integer}, false}, {1, {SqlKind::SmallInt}, false}}};
+  auto overlap = make_layout(two);
+  CHECK(layout_valid(overlap));
+  overlap.columns[1].pos -= 1;
+  CHECK_FALSE(layout_valid(overlap));
+  auto shared_slot = make_layout(std::array{ColumnDef{0, {SqlKind::Text}, true}, ColumnDef{1, {SqlKind::Text}, true}});
+  shared_slot.columns[1].pos = 0;
+  CHECK_FALSE(layout_valid(shared_slot));
   auto bad_slot = good;
   bad_slot.columns[1].pos = 5;
   CHECK_FALSE(layout_valid(bad_slot));
@@ -661,9 +682,19 @@ TEST_CASE("row format: malformed rows are rejected, not over-read, and the limit
     CHECK(row_column(cut, *layout.find(0)).state == ColumnState::Malformed);
     CHECK(row_column(cut, *layout.find(1)).state == ColumnState::Malformed);
   }
-  // An offset inside the header or off a word boundary is not a column.
-  CHECK(row_column(row, 0, PhysType::I64, 0).state == ColumnState::Malformed);
-  CHECK(row_column(row, 0, PhysType::I64, layout.fixed_start + 1).state == ColumnState::Malformed);
+  // An offset inside the header, a column past the fixed region or a width
+  // its type is never stored in is not a column.
+  CHECK(row_column(row, 0, PhysType::I64, 0, 8).state == ColumnState::Malformed);
+  CHECK(row_column(row, 0, PhysType::I64, layout.fixed_start + 1, 8).state == ColumnState::Malformed);
+  CHECK(row_column(row, 0, PhysType::I64, layout.fixed_start, 3).state == ColumnState::Malformed);
+  // A byte past the variable data, or a flag no build sets, is a malformed row.
+  auto longer = row;
+  longer.push_back(std::byte{0});
+  CHECK_FALSE(row_valid(longer));
+  CHECK(row_column(longer, *layout.find(0)).state == ColumnState::Malformed);
+  auto flagged = row;
+  flagged[2] |= std::byte{0x02};
+  CHECK_FALSE(row_valid(flagged));
   // A var_end that runs past the row is a malformed row.
   auto bad = row;
   bad[layout.fixed_end] = std::byte{0xFF};
@@ -676,4 +707,193 @@ TEST_CASE("row format: malformed rows are rejected, not over-read, and the limit
   CHECK(out.empty());
   CHECK(w.finish(out, row.size()));
   CHECK(out == row);
+}
+
+TEST_CASE("key codec: SMALLINT, INTEGER and DATE parts take 2 and 4 bytes, order, round-trip, and refuse a value past their width", "[sql][codec]") {
+  std::mt19937_64 rng{46};
+  for (std::uint8_t width : {std::uint8_t{2}, std::uint8_t{4}}) {
+    auto lo = width == 2 ? std::int64_t{std::numeric_limits<std::int16_t>::min()} : std::int64_t{std::numeric_limits<std::int32_t>::min()};
+    auto hi = width == 2 ? std::int64_t{std::numeric_limits<std::int16_t>::max()} : std::int64_t{std::numeric_limits<std::int32_t>::max()};
+    auto gen = [&] {
+      switch (rng() % 6) {
+        case 0: return lo;
+        case 1: return hi;
+        case 2: return std::int64_t{0};
+        case 3: return std::int64_t{-1};
+        default: return lo + static_cast<std::int64_t>(rng() % static_cast<std::uint64_t>(hi - lo + 1));
+      }
+    };
+    for (int i = 0; i < 3000; ++i) {
+      auto part = kI64Parts[rng() % 4];
+      part.width = width;
+      auto a = part.nullable && rng() % 4 == 0 ? OptI64{} : OptI64{gen()};
+      auto b = part.nullable && rng() % 4 == 0 ? OptI64{} : OptI64{gen()};
+      Bytes ka, kb;
+      put(ka, a, part);
+      put(kb, b, part);
+      auto want = typed_order(a, b);
+      if (part.desc) want = reversed(want);
+      CHECK(memcmp_order(ka, kb) == want);
+      CHECK(ka.size() == (part.nullable ? 1u : 0u) + (a ? width : 0u));
+      KeyReader r{ka};
+      CHECK(r.read_i64(part) == a);
+      CHECK(r.ok());
+      CHECK(r.at_end());
+    }
+    // One past either end is no key of the part: nothing is written.
+    for (auto past : {lo - 1, hi + 1, std::numeric_limits<std::int64_t>::min(), std::numeric_limits<std::int64_t>::max()}) {
+      Bytes k{std::byte{9}};
+      CHECK_FALSE(key_put_i64(k, past, {PhysType::I64, true, false, false, width}));
+      CHECK(k == Bytes{std::byte{9}});
+    }
+  }
+}
+
+TEST_CASE("key codec: a REAL part is its float rounding in 4 bytes, ordered as SQL does", "[sql][codec]") {
+  std::mt19937_64 rng{47};
+  for (int i = 0; i < 3000; ++i) {
+    auto part = with_type(kI64Parts[rng() % 4], PhysType::F64);
+    part.real = true;
+    auto a = random_f64(rng);
+    auto b = random_f64(rng);
+    Bytes ka, kb;
+    key_put_f64(ka, a, part);
+    key_put_f64(kb, b, part);
+    // The order of the values the column holds: their float roundings.
+    auto want = f64_order(float_rounding(a), float_rounding(b));
+    if (part.desc) want = reversed(want);
+    CHECK(memcmp_order(ka, kb) == want);
+    CHECK(ka.size() == (part.nullable ? 5u : 4u));
+    KeyReader r{ka};
+    auto got = r.read_f64(part);
+    REQUIRE(got);
+    CHECK(std::bit_cast<std::uint64_t>(*got) == std::bit_cast<std::uint64_t>(canonical(float_rounding(a))));
+    CHECK(r.at_end());
+  }
+}
+
+TEST_CASE("key codec: a column's key part is its declared width for SMALLINT, INTEGER, DATE and REAL, 8 bytes otherwise", "[sql][codec]") {
+  CHECK(key_part_of({SqlKind::SmallInt}, false, false).width == 2);
+  CHECK(key_part_of({SqlKind::Integer}, false, false).width == 4);
+  CHECK(key_part_of({SqlKind::Date}, true, true).width == 4);
+  CHECK(key_part_of({SqlKind::Real}, false, false).real);
+  // A DECIMAL is compared with a parameter of no precision: its key holds any i64.
+  CHECK(key_part_of({SqlKind::Decimal, 0, 4, 2}, false, false).width == 8);
+  for (auto kind : {SqlKind::BigInt, SqlKind::Timestamp, SqlKind::TimestampTz, SqlKind::Time}) {
+    CHECK(key_part_of({kind}, false, false).width == 8);
+  }
+  auto p = key_part_of({SqlKind::Integer}, true, true);
+  CHECK(p.nullable);
+  CHECK(p.desc);
+}
+
+TEST_CASE("row format: fixed columns take their declared widths and hold their type's whole range", "[sql][codec]") {
+  struct Case {
+    SqlType type;
+    std::uint32_t width;
+    std::vector<std::int64_t> edges;  // I64 columns only
+  };
+  constexpr auto i16 = [](auto v) { return static_cast<std::int64_t>(v); };
+  const std::vector<Case> cases{
+      {{SqlKind::SmallInt}, 2, {i16(INT16_MIN), i16(INT16_MAX), -1, 0}},
+      {{SqlKind::Integer}, 4, {INT32_MIN, INT32_MAX, -1, 0}},
+      {{SqlKind::Date}, 4, {-2440588, 2147483494, -1}},  // 4714-11-24 BC, 5874897-12-31
+      {{SqlKind::Decimal, 0, 4, 4}, 2, {-9999, 9999}},
+      {{SqlKind::Decimal, 0, 9, 2}, 4, {-999999999, 999999999}},
+      {{SqlKind::Decimal, 0, 18, 0}, 8, {-999999999999999999, 999999999999999999}},
+      {{SqlKind::BigInt}, 8, {INT64_MIN, INT64_MAX}},
+      {{SqlKind::Timestamp}, 8, {INT64_MIN, INT64_MAX}},
+      {{SqlKind::Time}, 8, {0, 86'400'000'000}},
+      {{SqlKind::Real}, 4, {}},
+      {{SqlKind::Double}, 8, {}},
+      {{SqlKind::Boolean}, 1, {}},
+  };
+  std::vector<ColumnDef> defs;
+  auto widths = std::uint32_t{0};
+  for (std::uint32_t i = 0; i < cases.size(); ++i) {
+    defs.emplace_back(i, cases[i].type, true);
+    CHECK(fixed_width(cases[i].type) == cases[i].width);
+    widths += cases[i].width;
+  }
+  defs.emplace_back(static_cast<std::uint32_t>(cases.size()), SqlType{SqlKind::Text}, true);
+  CHECK(fixed_width({SqlKind::Text}) == 0);
+  auto layout = make_layout(defs);
+  CHECK(layout.fixed_end - layout.fixed_start == widths);  // packed, no padding
+  CHECK(layout_valid(layout));
+
+  std::mt19937_64 rng{48};
+  for (int round = 0; round < 500; ++round) {
+    RowWriter w{layout};
+    std::vector<std::optional<std::uint64_t>> want(cases.size());
+    for (std::uint32_t i = 0; i < cases.size(); ++i) {
+      if (rng() % 5 == 0) continue;  // null
+      const auto& c = cases[i];
+      switch (phys_type(c.type)) {
+        case PhysType::I64: {
+          auto v = c.edges[rng() % c.edges.size()];
+          REQUIRE(w.set_i64(i, v));
+          want[i] = std::bit_cast<std::uint64_t>(v);
+          break;
+        }
+        case PhysType::F64: {
+          auto v = random_f64(rng);
+          REQUIRE(w.set_f64(i, v));
+          want[i] = std::bit_cast<std::uint64_t>(c.type.kind == SqlKind::Real ? float_rounding(v) : v);
+          break;
+        }
+        case PhysType::Bool: {
+          auto v = rng() % 2 == 0;
+          REQUIRE(w.set_bool(i, v));
+          want[i] = v ? 1 : 0;
+          break;
+        }
+        case PhysType::Bytes: break;
+      }
+    }
+    Bytes row;
+    REQUIRE(w.finish(row));
+    REQUIRE(row_valid(row));
+    for (std::uint32_t i = 0; i < cases.size(); ++i) {
+      auto v = row_column(row, *layout.find(i));
+      if (!want[i]) {
+        CHECK(v.state == ColumnState::Absent);
+        continue;
+      }
+      REQUIRE(v.state == ColumnState::Value);
+      if (phys_type(cases[i].type) == PhysType::F64 && std::bit_cast<double>(*want[i]) != std::bit_cast<double>(*want[i])) {
+        CHECK(v.f64() != v.f64());  // a NaN stays a NaN
+      } else {
+        CHECK(v.word == *want[i]);
+      }
+    }
+  }
+
+  // A value past the column's width is refused, never truncated.
+  RowWriter w{layout};
+  CHECK_FALSE(w.set_i64(0, INT16_MAX + 1));
+  CHECK_FALSE(w.set_i64(1, std::int64_t{INT32_MIN} - 1));
+  CHECK_FALSE(w.set_i64(4, std::int64_t{1} << 40));
+  CHECK(w.set_i64(5, std::int64_t{1} << 40));
+}
+
+TEST_CASE("row format: var_end entries are 2 bytes up to 64 KiB of variable data, 4 past it", "[sql][codec]") {
+  const std::array<ColumnDef, 3> defs{{{0, {SqlKind::Integer}, false}, {1, {SqlKind::Text}, true}, {2, {SqlKind::Text}, true}}};
+  auto layout = make_layout(defs);
+  for (std::size_t len : {std::size_t{0}, std::size_t{10}, std::size_t{0xFFFF - 1}, std::size_t{0xFFFF},
+                          std::size_t{0x10000}, std::size_t{300'000}}) {
+    RowWriter w{layout};
+    REQUIRE(w.set_i64(0, 7));
+    auto a = Bytes(len, std::byte{'a'});
+    REQUIRE(w.set_bytes(1, a));
+    REQUIRE(w.set_bytes(2, Bytes{std::byte{'b'}}));
+    Bytes row;
+    REQUIRE(w.finish(row));
+    auto end_bytes = len + 1 <= 0xFFFF ? 2u : 4u;
+    CHECK(std::to_integer<unsigned>(row[2]) == (end_bytes == 4 ? 1u : 0u));  // the flag
+    CHECK(row.size() == layout.fixed_end + 2 * end_bytes + len + 1);
+    CHECK(row_valid(row));
+    CHECK(std::ranges::equal(row_column(row, *layout.find(1)).bytes, a));
+    CHECK(row_column(row, *layout.find(2)).bytes.size() == 1);
+    CHECK(row_column(row, *layout.find(0)).i64() == 7);
+  }
 }

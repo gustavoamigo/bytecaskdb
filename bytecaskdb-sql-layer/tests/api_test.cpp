@@ -840,7 +840,7 @@ TEST_CASE("embedded API: a stored column that does not decode is BC_E_CORRUPT, n
     auto engine = bytecask::DB::open(dir.path());
     auto rewrite = [&](std::int64_t k, auto&& damage) {
       Bytes key = row_prefix(p_id);
-      key_put_i64(key, k, {PhysType::I64});
+      REQUIRE(key_put_i64(key, k, {PhysType::I64}));
       Bytes row;
       REQUIRE(engine.get({}, key, row));
       damage(row);
@@ -1814,6 +1814,53 @@ TEST_CASE("embedded API: expressions over columns in the select list", "[sql][ap
   CHECK(state("SELECT id FROM ce WHERE i * 2 = 4") == "42601");
 }
 
+
+TEST_CASE("embedded API: a narrow integer key compared with a wider subquery's value past its range is a filter, never a truncated key",
+          "[sql][api][subquery]") {
+  sql_test::TempDir dir{"api_sub_narrow"};
+  auto db = Database::open(dir.path());
+  // INTEGER and SMALLINT keys are 4 and 2 bytes (types_design.md, *Key
+  // encoding*); a BIGINT subquery's value may be past either.
+  (void)db->execute("CREATE TABLE n (i INTEGER PRIMARY KEY, s SMALLINT NOT NULL)");
+  (void)db->execute("CREATE INDEX n_s ON n (s)");
+  (void)db->execute("CREATE TABLE w (k INTEGER PRIMARY KEY, big BIGINT, mid INTEGER)");
+  for (auto [id, sv] : {std::pair<std::int64_t, std::int64_t>{-2147483648, -32768}, {-1, -1}, {5, 0}, {2147483647, 32767}}) {
+    (void)db->execute("INSERT INTO n VALUES ($1, $2)", {i(id), i(sv)});
+  }
+  for (const auto* row : {"(1, 3000000000, 40000)", "(2, -3000000000, -40000)", "(3, 5, 5)"}) {
+    (void)db->execute(std::string{"INSERT INTO w VALUES "} + row);
+  }
+  auto ids = [&](std::string_view sql) {
+    std::vector<std::int64_t> out;
+    for (const auto& r : db->execute(sql).rows) out.push_back(std::get<std::int64_t>(r[0]));
+    std::ranges::sort(out);
+    return out;
+  };
+  using V = std::vector<std::int64_t>;
+  const V all{-2147483648, -1, 5, 2147483647};
+  // Past INTEGER above: below it is every row, at or above it none.
+  CHECK(ids("SELECT i FROM n WHERE i < (SELECT MAX(big) FROM w)") == all);
+  CHECK(ids("SELECT i FROM n WHERE i <= (SELECT MAX(big) FROM w)") == all);
+  CHECK(ids("SELECT i FROM n WHERE i > (SELECT MAX(big) FROM w)").empty());
+  CHECK(ids("SELECT i FROM n WHERE i >= (SELECT MAX(big) FROM w)").empty());
+  CHECK(ids("SELECT i FROM n WHERE i = (SELECT MAX(big) FROM w)").empty());
+  // Past INTEGER below.
+  CHECK(ids("SELECT i FROM n WHERE i > (SELECT MIN(big) FROM w)") == all);
+  CHECK(ids("SELECT i FROM n WHERE i >= (SELECT MIN(big) FROM w)") == all);
+  CHECK(ids("SELECT i FROM n WHERE i < (SELECT MIN(big) FROM w)").empty());
+  CHECK(ids("SELECT i FROM n WHERE i <= (SELECT MIN(big) FROM w)").empty());
+  // Inside the range, the wider value still finds its row.
+  CHECK(ids("SELECT i FROM n WHERE i = (SELECT big FROM w WHERE k = 3)") == V{5});
+  // A SMALLINT index part and an INTEGER subquery past it.
+  CHECK(ids("SELECT i FROM n WHERE s < (SELECT MAX(mid) FROM w)") == all);
+  CHECK(ids("SELECT i FROM n WHERE s > (SELECT MAX(mid) FROM w)").empty());
+  CHECK(ids("SELECT i FROM n WHERE s >= (SELECT MIN(mid) FROM w)") == all);
+  CHECK(ids("SELECT i FROM n WHERE s = (SELECT mid FROM w WHERE k = 3)").empty());
+  // A subquery of the key's own width still keys the lookup.
+  CHECK(ids("SELECT i FROM n WHERE i = (SELECT mid FROM w WHERE k = 3)") == V{5});
+  CHECK(db->prepare("SELECT i FROM n WHERE i = (SELECT mid FROM w WHERE k = 3)").plan_source().find("bc_get(") !=
+        std::string::npos);
+}
 
 TEST_CASE("embedded API: CASE, COALESCE and NULLIF over columns, parameters and subqueries", "[sql][api]") {
   sql_test::TempDir dir{"api_case_columns"};

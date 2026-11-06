@@ -1,6 +1,6 @@
 # SQL types, value semantics and the shared codec
 
-Status: **built** (#490): the codec is `bytecaskdb-sql-layer/codec/`, with
+Status: **built** (#490; declared widths in rows and keys, #780): the codec is `bytecaskdb-sql-layer/codec/`, with
 its property tests in `tests/codec_test.cpp`. This covers how SQL values
 map onto the plan API's four physical types (`plan_api_design.md`), what
 nulls, comparisons and arithmetic mean, which functions the compiler may
@@ -19,7 +19,7 @@ bind error with the position of the type name.
 
 | SQL type | Physical | Stored as |
 |---|---|---|
-| `SMALLINT`, `INTEGER`, `BIGINT` | `i64` | The value. Every width is widened: one integer type in storage, in keys and in arithmetic. The declared width is a catalog property, checked on assignment. |
+| `SMALLINT`, `INTEGER`, `BIGINT` | `i64` | The value, in 2, 4 or 8 bytes in a row and in a key (*Row format*, *Key encoding*). Every width is one integer type in the plan language and in arithmetic. The declared width is a catalog property, checked on assignment. |
 | `DOUBLE PRECISION`, `REAL` | `f64` | IEEE 754 binary64. A `REAL` is stored as its `float` rounding, widened, as PostgreSQL stores a float4: 0.1 reads back as 0.100000001490116…, and a finite value past `FLT_MAX` that does not round to infinity as `FLT_MAX`. A `REAL` key or index part is keyed the same way, from a row or a parameter, so a lookup, a bound or an `UPDATE`/`DELETE` by key finds the row by the value it was written with, as a `$1` typed real does in PostgreSQL. A value is rounded in three places: the row writer, keyed by the column's declared type; the key encoder, keyed by the part; and the binder, which parses a `REAL` DEFAULT straight to `float`, rounded once as PostgreSQL's `float4in` rounds, so the catalog holds the value a row stores. A DEFAULT literal that overflows, or underflows to zero, is out of range; one that rounds to a denormal is kept. A `DOUBLE PRECISION` DEFAULT is parsed as a double the same way. |
 | `BOOLEAN` | `bool` | 0 or 1. |
 | `BYTEA` | `bytes` | The bytes. |
@@ -43,9 +43,13 @@ and `CHAR(8 OCTETS)`, which are not PostgreSQL syntax;
 `INTERVAL`, `UUID`, `JSON`, arrays, enums, composite types, `BIT`, `MONEY`,
 `SERIAL` (sequences are a runtime service, deferred in the plan API).
 
-Widening is why the plan language has one integer type: a column declared
-`INTEGER` is an `i64` in the row and in every `bc_*` call, and `2147483647 + 1`
-is not an overflow but an assignment that fails its range check.
+The plan language has one integer type: a column declared `INTEGER` is an
+`i64` in every `bc_*` call, and `2147483647 + 1` is not an overflow but an
+assignment that fails its range check. Storage is narrower: the codec
+writes a column at its declared width and widens it on read, so a width is
+the codec's business and never the plan's. That is safe because the range
+check comes first: a value the row builder accepts fits its column's
+width, and the codec refuses one that does not rather than truncate it.
 
 **Declared widths and lengths are checked on assignment, not on read.**
 The row builder checks every value a statement writes (`bc_row_set_*`,
@@ -123,9 +127,6 @@ Refused with a message, each for a reason:
   **`MIN` and `MAX` of one, and a set operation** that meets one and a
   different type.
 - **A `CHAR` of no length** (`bpchar`), which PostgreSQL leaves unbounded.
-
-A database that holds a table with a `CHAR(n)` column cannot be opened by
-an earlier build (`catalog_design.md`, *Record format*); one without can.
 
 **Text is valid UTF-8.** The row builder refuses a `TEXT`, `VARCHAR` or `CHAR` value
 that is not well-formed UTF-8, or holds a NUL, when it is written
@@ -309,20 +310,49 @@ namespaces are `0x01` catalog, `0x02` table rows, `0x03` index entries.
 | Part | Encoding |
 |---|---|
 | nullable marker | One byte before a nullable part: `0x00` null, `0x01` present. A null part is the marker alone. A non-nullable part has no marker. |
-| `i64` | 8 bytes big-endian with the sign bit flipped. |
-| `f64` | The IEEE 754 bits, big-endian; a positive value (sign clear) has its sign bit flipped, a negative value every bit flipped. Before encoding `−0.0` becomes `0.0` and every NaN becomes the one quiet NaN `0x7FF8000000000000`, so equal values make equal bytes and NaN sorts above `+∞`, as *Comparison* orders it. Decoding returns those canonical values. |
+| `i64` | Big-endian two's complement with the sign bit flipped, at the column's declared width: 2 bytes for `SMALLINT`, 4 for `INTEGER` and `DATE`, 8 for every other integer type. |
+| `f64` | The IEEE 754 bits, big-endian; a positive value (sign clear) has its sign bit flipped, a negative value every bit flipped. Before encoding `−0.0` becomes `0.0` and every NaN becomes the one quiet NaN `0x7FF8000000000000`, so equal values make equal bytes and NaN sorts above `+∞`, as *Comparison* orders it. Decoding returns those canonical values. A `REAL` part is its `float` rounding's 32 bits by the same transform, its NaN `0x7FC00000`. |
 | `bool` | One byte, `0x00` false, `0x01` true. |
 | `bytes` | Every `0x00` byte becomes `0x00 0xFF`; the part ends with `0x00 0x00`. Self-delimiting: a decoder reads to the first `0x00` not followed by `0xFF`. A string sorts before every string it is a prefix of, and the two-byte terminator keeps that true whatever the next part's first byte is: `0x00 0x00` is below `0x00 0xFF`, which is the smallest thing a longer string can continue with. |
 | `DESC` part | The part's bytes as above, marker included, with every bit inverted. Decoding inverts byte by byte before interpreting, so the part stays self-delimiting. Nulls sort last. |
 
 Integer SQL types of every width, decimals, timestamps, dates and times are
 `i64` parts; the order they need is the integer order of their stored value,
-which the sign flip gives. Text is a `bytes` part, compared as bytes; when
+which the sign flip gives at any width. Text is a `bytes` part, compared as bytes; when
 collations arrive, a text part under a non-binary collation is the collation's sort key
 (its weights) written as `bytes`, the row holding the original text. This is
 the slot the plugin's `key_format` 2 uses for `CHARSET_INFO::strnxfrm`
 weights, and the decoder for such a part returns the weights, not the text:
 a covering read of a collated text column goes to the row.
+
+**Integer parts at their declared width.** A `SMALLINT`, `INTEGER` or
+`DATE` part takes 2 or 4 bytes, a `REAL` 4, where every one took 8 before
+#780: an `order_line` key of TPROC-C is 17 bytes, not 37. A part's width is
+its column's, so a row's value always fits its key, and an index entry's
+primary-key suffix is the row key's. A value from anywhere else must fit
+too, and does:
+
+- A parameter is checked against its column's type before the plan runs
+  (*Types*), and `$n ± k` against `INTEGER`, the only type it is compared
+  with.
+- A join compares columns of one type, as the binder refuses any other
+  pair, so a value read from one row fits the other's part.
+- A scalar subquery's value may be a wider integer than its column
+  (`int_col < (SELECT COUNT(*) …)`), and past the column's range a narrow
+  part cannot hold it, nor bound a range with it: clamping to the edge gets
+  one side of every operator wrong. The binder types such a parameter as
+  the subquery's own type, and the search keys only a comparison whose
+  operand's width fits the part (`keyable`): this one is a filter on the
+  row, compared as 64-bit integers, as PostgreSQL compares `int4` with
+  `int8`. A subquery of the column's width still keys the lookup.
+
+Behind those, `key_put_i64` refuses a value past its part's width and
+writes nothing; the plan API's key builder then answers `bc_key_fits` false
+and `bc_key_end` `BC_E_LIMIT`, so no key is ever truncated. A `DECIMAL`
+part stays 8 bytes: a parameter compared with a `DECIMAL(p, s)` is typed
+without its precision (*Types*), so its key must hold any `i64`. Sort and
+group keys (`bc_sort_key_*`, `bc_col_key`) are never stored and keep 8-byte
+integer parts.
 
 **Sort keys.** A sort key (`bc_sort_key_*`, `plan_api_design.md`, *Sort
 keys*) is what a sorter orders by, never stored and never an engine key: no
@@ -387,29 +417,48 @@ fails too.
 
 ```
 u16   layout_generation   ; which offset table decodes this row
-u16   bitmap_bytes        ; size of the null bitmap; a multiple of 8
+u8    flags               ; bit 0: var_end entries are u32, else u16; no other bit is set
+u8    bitmap_bytes        ; size of the null bitmap, 1 to 255
 u16   var_table           ; offset of var_end: where the fixed region ends
 u16   nvar                ; entries in var_end
-u32   row_bytes           ; the whole row; equal to the record's length
 u8[]  null_bitmap         ; bit set = present, indexed by permanent column id
-      fixed columns       ; 8 bytes each, at permanent offsets, little-endian
-u32[] var_end             ; nvar end offsets, relative to the start of var data
+      fixed columns       ; each at its declared width, at permanent offsets, little-endian
+u16[] or u32[] var_end    ; nvar end offsets, relative to the start of var data
 u8[]  var data
 ```
 
-The header is 12 bytes. Every fixed column is one 8-byte word: `i64` and
-`f64` as their bits, `bool` as 0 or 1 (a decoder reads any non-zero word as
-true). Variable column `k` occupies `[var_end[k−1], var_end[k])` of the var
-data, with `var_end[−1]` taken as 0. All integers are little-endian. The row
-sits at an arbitrary offset in a record or an arena, so decoders copy bytes
-and nothing depends on alignment.
+The header is 8 bytes. A fixed column takes its type's width
+(`fixed_width`): `BOOLEAN` 1 byte, 0 or 1 (a decoder reads any non-zero
+byte as true); `SMALLINT` and `DECIMAL(p ≤ 4)` 2; `INTEGER`, `DATE` and
+`DECIMAL(p ≤ 9)` 4; `REAL` 4, its `float`'s bits; `BIGINT`, `DECIMAL(p ≤
+18)`, `TIMESTAMP`, `TIMESTAMPTZ`, `TIME` and `DOUBLE PRECISION` 8. Integers
+are two's complement, sign-extended on read; a `REAL` is widened to the
+`double` it was rounded from, exactly. Fixed columns are packed, with no
+padding. Variable column `k` occupies `[var_end[k−1], var_end[k])` of the
+var data, with `var_end[−1]` taken as 0. All integers are little-endian.
+The row sits at an arbitrary offset in a record or an arena, so decoders
+copy bytes and nothing depends on alignment.
+
+**A width is never a truncation.** The row builder checks a value against
+its column's declared type before the codec sees it (*Types*), and a value
+of the type fits the width: `DATE`'s range is PostgreSQL's, which fits 32
+bits, and a `DECIMAL(p, s)` holds fewer than `10^p` units. `RowWriter`
+checks again and refuses an integer past its column's width rather than
+cut it.
+
+**`var_end` is 2 bytes while it can be.** A row whose variable data is at
+most 65,535 bytes writes 2-byte `var_end` entries and clears flag bit 0; a
+larger one writes 4-byte entries and sets it. The writer knows the data's
+length before it writes the header, so the choice costs nothing, and a
+`stock` row of TPROC-C, eleven variable columns, saves 22 bytes.
 
 **Columns have permanent ids and positions.** A column's id is its bit in
 the bitmap and is never reused. Its position, a byte offset for a fixed
 column or a slot for a variable one, is assigned when the column is added
 and never changes within a layout generation. New columns append to their
 region; a dropped column leaves its position reserved. A type change is a
-new column.
+new column, so a column's width never changes either: the width follows
+from the declared type, which is the column's for life.
 
 **The bitmap says present.** A column whose bit is set has a value at its
 position; a column whose bit is clear is null, whether the writer set it
@@ -424,52 +473,77 @@ hold: a fixed column past the fixed region, a variable slot past `nvar`, or
 a `var_end` that runs past the row. Malformed is `BC_E_CORRUPT` on every
 path that reads a column (`bc_col_*`, `bc_emit_col`, `bc_row_from`, a
 key built from a row, SQL results, `Database::table_rows`), never read as 0,
-empty or NULL (#520). Plans name columns by id, and the runtime maps an id to its position; the decoder still refuses an
-offset inside the header or off a word boundary. Nothing is read past
-the end.
+empty or NULL (#520). Plans name columns by id, and the runtime maps an id to its position and width; the decoder still refuses an
+offset inside the header or bitmap, a column that runs past the fixed
+region, and a width its type is never stored in. Nothing is read past the
+end.
+
+**The row's length is its record's.** The header holds no length: the
+engine hands every row over with its length, so a stored one would only
+repeat it. What a stored length caught, a row cut short or one with bytes
+past its end, the last `var_end` catches instead: the variable data must
+end exactly where the row does (`var_table + entry × nvar + var_end[nvar − 1]`,
+or the end of the `var_end` table when there are no variable columns), or
+the header does not parse. That is one load, so the check stays constant
+time.
 
 **The bitmap is sized at create, with a ceiling.** `bitmap_bytes` is the
-smallest multiple of 64 bits that holds every column id of the table with at
-least 16 ids to spare, fixed when the layout generation is created; a
-bitmap that would push the fixed region past the 16-bit `var_table` is
-refused at create. Adding
-a column uses the next id; when the next id has no bit, `ADD COLUMN` is
-refused until an `ALTER TABLE … REBUILD` starts a new generation with a
-larger bitmap. The size is in the row so that every structural check is
-local to the row: the fixed region starts at `12 + bitmap_bytes`, the
-var_end table at `var_table`, the var data at `var_table + 4 × nvar`, and
-each is checked against `row_bytes`. The sizes in the header exist for the
-same reason: appending a fixed column lengthens the fixed region, so a
-reader holding an older layout's constants cannot find `var_end` from them;
-the row says where it is.
+fewest bytes that hold every column id of the table with at least 16 ids to
+spare, fixed when the layout generation is created; it is a byte in the
+header, so a table's ids stop at 2,039 and one that needs more is refused at
+create. Adding a column uses the next id; when the next id has no bit, `ADD
+COLUMN` is refused until an `ALTER TABLE … REBUILD` starts a new generation
+with a larger bitmap. The size is in the row so that every structural check
+is local to the row: the fixed region starts at `8 + bitmap_bytes`, the
+var_end table at `var_table`, the var data after `nvar` entries of 2 or 4
+bytes, and each is checked against the row's length. The sizes in the
+header exist for the same reason: appending a fixed column lengthens the
+fixed region, so a reader holding an older layout's constants cannot find
+`var_end` from them; the row says where it is.
 
 **Header or trailer.** The alternative weighed was a trailer: `var_table`
-and `nvar` at the row's end, read backwards from `row_bytes`. The two carry
+and `nvar` at the row's end, read backwards from its length. The two carry
 the same bytes. A writer gains nothing from the trailer: `var_table` and
 `nvar` come from the layout, known before the first byte is written, and the
 var_end offsets are not known until the variable data is laid out in either
-design. A reader loses a little: the trailer is found through `row_bytes`,
-which is in the header anyway, so the structure is described in two places,
-and a row cut short loses its description with its tail, where a header
-survives truncation and names what is missing. So the fields are in the
-header.
+design. A reader loses a little: a row cut short loses its description with
+its tail, where a header survives truncation and names what is missing. So
+the fields are in the header.
 
-**The row's length is 32 bits.** A u16 `row_bytes` would cap a row at
-64 KiB, a quarter of what MariaDB allows in a row and below
-what a `TEXT` column is for. `row_bytes` is u32 and the row's ceiling is the
-engine's value limit: 256 MiB less a byte as a hard ceiling, enforced by
-`bc_row_end` as `BC_E_LIMIT`, and the configured `max_value_bytes`, enforced
-by the engine at commit. `var_table` stays u16: a fixed region is 8 bytes a
-column and the bitmap bounds the column count, so it never nears 64 KiB.
+**A row may pass 64 KiB.** The 4-byte `var_end` entries take a row past it,
+up to the engine's value limit: 256 MiB less a byte as a hard ceiling,
+enforced by `bc_row_end` as `BC_E_LIMIT`, and the configured
+`max_value_bytes`, enforced by the engine at commit. `var_table` stays u16:
+a fixed region is at most 8 bytes a column and the 255-byte bitmap bounds
+the column count, so it never nears 64 KiB.
 
 **The format is versioned through the catalog.** A row carries no format
 version of its own: every row belongs to a table, and every table's record
 in the catalog carries the record format, which names the row format its
-positions are for. This row format is the one of record formats 2 and 3
-(3 is the catalog record of #489). Format 1, from an earlier build
-(an 8-byte header, a 16-bit length, a bitmap meaning null), is refused when
-the catalog loads, with an error that says the database is from an earlier
-build, so no row of it is ever decoded under this format.
+positions are for. This row format, and the key encoding above, are those
+of record format 7 (#780). Formats 1 to 6, whose rows put every fixed column
+in an 8-byte word under a 12-byte header and whose keys put every integer
+in 8 bytes, are refused when the catalog loads, with an error that says the
+database is from an earlier build, so no row or key of theirs is ever
+decoded under this format (`catalog_design.md`, *Serialization*).
+
+**Why the narrow format (#780).** The 8-byte words cost the layer about a
+third more bytes per write than the MariaDB plugin on the same TPROC-C
+data: an `order_line` record was 176 bytes against the plugin's 105, its
+value 120 (12 header, 8 bitmap, 72 fixed, 4 `var_end`, 24 data) and its key
+37 against 21. With declared widths it is 108 bytes, its value 72 (8 header,
+4 bitmap, 34 fixed, 2 `var_end`, 24 data) and its key 17, and the rows a
+New-Order writes take 5,162 bytes where they took 6,690 (`sql_layer_bench`
+prints each table's). The plan language keeps one
+integer type; only the codec knows widths, so nothing above it changed. A
+narrower format must not cost more CPU than it saves: the decoder reads a
+width it already holds in the column's slot, with one fixed-size load per
+width. In process (`sql_layer_tprocc`, 4 warehouses, 4 threads, 60 s, two
+runs each, one machine), a load's `.data` went from 538 MB to 398 MB, the
+bytes written per transaction from 4,524 to 3,430 (−24%), and CPU per
+transaction stayed within the runs' noise (484 µs before, 478 after);
+throughput moved within the same noise. A column read costs about 2 ns
+more in `sql_layer_bench`, the row's end checked on every read.
 
 **Generations.** `layout_generation` names the offset table that decodes the
 row. A plan's constants are its own generation's; a row of another
@@ -479,7 +553,9 @@ explicit, and updates rewrite rows into the current generation.
 
 **Result rows** use the same format with a layout derived from the plan's
 `result_types`: column `i` has id `i`, is nullable, and is a fixed column
-or a variable one by its type. The runtime decodes them with that layout.
+or a variable one by its type, at the width of `plain_sql_type`'s type
+(`BIGINT`, `DOUBLE PRECISION`, `BOOLEAN`). The runtime decodes them with
+that layout.
 
 ## What the plugin adopts
 
@@ -523,10 +599,20 @@ values with the edges mixed in:
 - `bc_key_successor` bounds every key under its prefix;
 - a key cut at any byte, or with a bad marker or escape, is reported, not
   over-read;
-- rows of every physical type round-trip, a row written before a column was
-  added reads the column as null, a row written after reads under the older
-  layout, the bitmap ceiling refuses the column that has no bit, and a row
-  over the limit is refused.
+- `SMALLINT`, `INTEGER` and `DATE` parts take 2 and 4 bytes, order and
+  round-trip at their range's edges, and refuse a value one past it; a
+  `REAL` part orders as its `float` rounding in 4 bytes;
+- rows of every physical type round-trip, every column type takes its
+  declared width and holds its range's edges, an integer past its width is
+  refused, a row written before a column was added reads the column as
+  null, a row written after reads under the older layout, the bitmap
+  ceiling refuses the column that has no bit, `var_end` turns to 4 bytes
+  past 64 KiB of variable data, and a row over the limit, cut short, longer
+  than its variable data or with an unknown flag is refused.
+
+`tests/api_test.cpp` checks the one place a value can be wider than its key
+part: an `INTEGER` and a `SMALLINT` key compared with a `BIGINT` or
+`INTEGER` subquery's value past their range, under every operator.
 
 The plan API's tests (`tests/plan_api_test.cpp`) cover the calls on top:
 `bc_key_part_*` on an index scan, `bc_raise` and the duplicate-key path,

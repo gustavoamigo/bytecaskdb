@@ -17,6 +17,7 @@ module;
 #include <limits>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 export module bytecask.sql.key_codec;
@@ -45,8 +46,17 @@ struct KeyPart {
   PhysType type;
   bool nullable{false};
   bool desc{false};
-  bool real{false};  // a REAL column: a double is keyed as its float rounding, as the row stores it
+  // A REAL column: a double is keyed as its float rounding, as the row
+  // stores it, in 4 bytes.
+  bool real{false};
+  // An I64 part's bytes: 2 for SMALLINT, 4 for INTEGER and DATE, 8 for
+  // every other integer type and for sort and group keys.
+  std::uint8_t width{8};
 };
+
+// Whether v is a two's-complement integer of `width` bytes (2, 4 or 8):
+// what a narrow key part or row column holds. False for any other width.
+[[nodiscard]] auto fits_width(std::int64_t v, std::size_t width) -> bool;
 
 // A double as a float holds it, widened back: PostgreSQL's float8 to
 // float4. Infinite at or past 2^128 - 2^103, the first value that rounds
@@ -57,8 +67,11 @@ struct KeyPart {
 void key_put_prefix(Bytes& out, std::uint8_t ns, std::uint32_t id);
 // The typed writers use part.nullable and part.desc; the type is the caller's
 // to have checked.
-void key_put_i64(Bytes& out, std::int64_t v, KeyPart part);
-// -0.0 is written as 0.0 and every NaN as one canonical NaN above +inf.
+// False, and nothing written, if v is outside the part's width: no key of
+// the layout holds it.
+[[nodiscard]] auto key_put_i64(Bytes& out, std::int64_t v, KeyPart part) -> bool;
+// -0.0 is written as 0.0 and every NaN as one canonical NaN above +inf. A
+// REAL part writes the float rounding's 4 bytes, by the same transform.
 void key_put_f64(Bytes& out, double v, KeyPart part);
 void key_put_bool(Bytes& out, bool v, KeyPart part);
 void key_put_bytes(Bytes& out, BytesView v, KeyPart part);
@@ -151,18 +164,50 @@ auto ordered_to_f64(std::uint64_t u) -> double {
   return std::bit_cast<double>((u & kSignBit) != 0 ? u & ~kSignBit : ~u);
 }
 
+// The same transform on a float's 32 bits: what a REAL part holds.
+constexpr auto kSignBit32 = std::uint32_t{1} << 31;
+constexpr auto kCanonicalNaN32 = std::uint32_t{0x7FC0'0000};
+
+auto f32_to_ordered(float v) -> std::uint32_t {
+  if (v != v) return kCanonicalNaN32 | kSignBit32;
+  if (v == 0.0f) v = 0.0f;
+  auto bits = std::bit_cast<std::uint32_t>(v);
+  return (bits & kSignBit32) != 0 ? ~bits : bits | kSignBit32;
+}
+
+auto ordered_to_f32(std::uint32_t u) -> float {
+  return std::bit_cast<float>((u & kSignBit32) != 0 ? u & ~kSignBit32 : ~u);
+}
+
+// The sign bit of an integer `width` bytes wide, as a 64-bit mask.
+constexpr auto sign_bit(std::size_t width) -> std::uint64_t { return std::uint64_t{1} << (8 * width - 1); }
+
+
 }  // namespace
+
+auto fits_width(std::int64_t v, std::size_t width) -> bool {
+  switch (width) {
+    case 2: return std::in_range<std::int16_t>(v);
+    case 4: return std::in_range<std::int32_t>(v);
+    case 8: return true;
+  }
+  return false;
+}
 
 void key_put_prefix(Bytes& out, std::uint8_t ns, std::uint32_t id) {
   out.push_back(std::byte{ns});
   put_be(out, id, 4);
 }
 
-void key_put_i64(Bytes& out, std::int64_t v, KeyPart part) {
+auto key_put_i64(Bytes& out, std::int64_t v, KeyPart part) -> bool {
+  if (!fits_width(v, part.width)) return false;
   auto start = out.size();
   put_marker(out, part);
-  put_be(out, std::bit_cast<std::uint64_t>(v) ^ kSignBit, 8);
+  // Two's complement truncated to the width, sign bit flipped: unsigned
+  // order is integer order at every width.
+  put_be(out, std::bit_cast<std::uint64_t>(v) ^ sign_bit(part.width), part.width);
   if (part.desc) invert_from(out, start);
+  return true;
 }
 
 auto float_rounding(double v) -> double {
@@ -175,10 +220,14 @@ auto float_rounding(double v) -> double {
 }
 
 void key_put_f64(Bytes& out, double v, KeyPart part) {
-  if (part.real) v = float_rounding(v);
   auto start = out.size();
   put_marker(out, part);
-  put_be(out, f64_to_ordered(v), 8);
+  if (part.real) {
+    // float_rounding is a float exactly, or infinite: the cast is exact.
+    put_be(out, f32_to_ordered(static_cast<float>(float_rounding(v))), 4);
+  } else {
+    put_be(out, f64_to_ordered(v), 8);
+  }
   if (part.desc) invert_from(out, start);
 }
 
@@ -247,13 +296,24 @@ auto KeyReader::read_marker(KeyPart part) -> bool {
 
 auto KeyReader::read_i64(KeyPart part) -> std::optional<std::int64_t> {
   if (!read_marker(part)) return std::nullopt;
-  auto u = read_be(part.desc, 8);
+  if (!fits_width(0, part.width)) {  // a width no layout has
+    ok_ = false;
+    return std::nullopt;
+  }
+  auto u = read_be(part.desc, part.width);
   if (!u) return std::nullopt;
-  return std::bit_cast<std::int64_t>(*u ^ kSignBit);
+  // The stored value is v + 2^(8w-1), so subtracting that, modulo 2^64,
+  // flips the sign back and sign-extends in one step.
+  return std::bit_cast<std::int64_t>(*u - sign_bit(part.width));
 }
 
 auto KeyReader::read_f64(KeyPart part) -> std::optional<double> {
   if (!read_marker(part)) return std::nullopt;
+  if (part.real) {
+    auto u = read_be(part.desc, 4);
+    if (!u) return std::nullopt;
+    return static_cast<double>(ordered_to_f32(static_cast<std::uint32_t>(*u)));
+  }
   auto u = read_be(part.desc, 8);
   if (!u) return std::nullopt;
   return ordered_to_f64(*u);

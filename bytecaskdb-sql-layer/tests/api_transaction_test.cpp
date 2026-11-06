@@ -253,7 +253,7 @@ void seed_wide(Database& db, std::int64_t rows) {
       encoded = encoded && w.set_i64(0, id) && w.set_i64(1, id) && w.set_bytes(2, pad) && w.finish(row);
       row_bytes = row.size();
       key_put_prefix(key, kNsRow, t->id);
-      key_put_i64(key, id, part);
+      encoded = encoded && key_put_i64(key, id, part);
       plan.put(key, row);
     }
     REQUIRE(db.engine_for_testing().apply_batch({.sync = false}, std::move(plan)));
@@ -318,9 +318,9 @@ TEST_CASE("embedded API: a sort compiled while its table was small gives way, as
 TEST_CASE("embedded API: a hash join's choice by the budget counts each row's and key's bytes, so the build fits",
           "[sql][api][memory][hash]") {
   sql_test::TempDir dir{"api_mem_hash"};
-  // A row of b holds at least 12 + 8 + 9 x 8 = 92 bytes and its key 9, so a
-  // hash table of n of them at least 192 + n x (240 + 92 + 9): past 64 KiB
-  // from 192 rows. A threshold of the entries alone, 240 bytes each, would be
+  // A row of b holds at least 8 + 4 + 9 x 8 = 84 bytes (its header, a
+  // 4-byte bitmap, nine BIGINTs) and its key 9, so a hash table of n of them
+  // at least 192 + n x (240 + 84 + 9): past 64 KiB from 197 rows. A threshold of the entries alone, 240 bytes each, would be
   // 273.
   auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
   db->execute("CREATE TABLE b (id BIGINT PRIMARY KEY, g BIGINT NOT NULL, j BIGINT, c1 BIGINT, c2 BIGINT, c3 BIGINT, "
@@ -335,13 +335,13 @@ TEST_CASE("embedded API: a hash join's choice by the budget counts each row's an
   insert(1, 20);
   for (std::int64_t i = 1; i <= 30; ++i) db->execute("INSERT INTO pr VALUES ($1, $1)", {i});
   // Compiled at 20 rows of b: the hash join built on b's range, which the
-  // plan counts against 192 when it runs.
+  // plan counts against 197 when it runs.
   const std::string sql = "SELECT b.id, pr.id FROM b, pr WHERE b.g = $1 AND pr.v = b.j";
   const auto& st = db->prepare(sql);
   auto compiled = db->compilations();
   CHECK(db->execute(st, {std::int64_t{1}}).rows.size() == 20);
   REQUIRE(st.plan_source().find("bc_hash_open") != std::string::npos);
-  REQUIRE(st.plan_source().find(", 192);") != std::string::npos);
+  REQUIRE(st.plan_source().find(", 197);") != std::string::npos);
   // 230 rows: the hash join would pass the budget; the count takes pr read
   // once per row of b, which holds a row at a time. Nothing recompiled.
   insert(21, 230);

@@ -983,20 +983,20 @@ TEST_CASE("search: a hash build that may pass the memory budget is a choice poin
   auto plan = [&](std::uint64_t budget) {
     return generate_plan(bound::bind(ast::parse(sql), cat), cat, sql, counts, budget);
   };
-  // A hash table of n rows holds at least 192 + n x (240 + 36 + 9) bytes: a
-  // row of t holds at least its 12-byte header, an 8-byte bitmap and two
-  // fixed columns, and its key a marker and a BIGINT. Past 10,000 from 35
-  // rows. The rows t's range holds when the plan runs decide: below 35 the
+  // A hash table of n rows holds at least 192 + n x (240 + 27 + 9) bytes: a
+  // row of t holds at least its 8-byte header, a 3-byte bitmap and two
+  // BIGINT columns, and its key a marker and a BIGINT. Past 10,000 from 36
+  // rows. The rows t's range holds when the plan runs decide: below 36 the
   // hash join, from it u read once per row of t, which holds nothing.
   auto choice = plan(10'000);
-  CHECK(has(choice, "int64_t count0 = bc_count_range(cx, IDX_3, lo0, hi0, 35);"));
+  CHECK(has(choice, "int64_t count0 = bc_count_range(cx, IDX_3, lo0, hi0, 36);"));
   CHECK(has(choice, "bc_cursor c = bc_scan_open(cx, IDX_3, lo0, lo0, BC_SCAN_PREFIX);"));
   const auto other = choice.source.find("} else {");
   REQUIRE(other != std::string::npos);
   CHECK(choice.source.find("bc_hash_open") < other);
   CHECK(choice.source.find("bc_cursor c1 = bc_scan_open(cx, TBL_4, lo, hi, BC_SCAN_FORWARD);", other) != std::string::npos);
   CHECK(choice.cost == Catch::Approx(8 + 4 * (1 + kHashWeight) + 100 + 40 + 2));
-  CHECK(threshold(choice) == 35);
+  CHECK(threshold(choice) == 36);
   // Under 192 bytes no hash table fits: the plan avoids it.
   auto avoided = plan(100);
   CHECK_FALSE(has(avoided, "bc_hash"));

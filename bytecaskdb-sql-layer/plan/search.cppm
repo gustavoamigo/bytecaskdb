@@ -181,6 +181,13 @@ auto key_eq(const Expr& c) -> bool {
   return is_compare(c) && c.op == Op::Eq && operand_of(c).kind == Expr::Kind::Param;
 }
 auto on_col(const Expr& c, std::uint32_t col) -> bool { return is_compare(c) && col_of(c).col == col; }
+// Whether a key part of the compared column holds every value of the
+// operand: a SMALLINT, INTEGER or DATE part holds its declared width
+// (types_design.md, *Key encoding*), which a subquery's wider integer may be
+// past. A conjunct that is not is a filter on the row, never a key bound.
+auto keyable(const Expr& c) -> bool {
+  return key_part_of(operand_of(c).type, false, false).width <= key_part_of(c.args[0].type, false, false).width;
+}
 
 // The operator of c with its operands swapped: a < b is b > a.
 auto mirrored(Op op) -> Op {
@@ -274,7 +281,7 @@ struct Keyed {
 // The first conjunct of `where` that compares `col` equal to a parameter, or
 // null.
 auto key_eq_on(const Conjuncts& where, std::uint32_t col) -> const Expr* {
-  auto it = std::ranges::find_if(where, [&](const Expr& c) { return on_col(c, col) && key_eq(c); });
+  auto it = std::ranges::find_if(where, [&](const Expr& c) { return on_col(c, col) && key_eq(c) && keyable(c); });
   return it == where.end() ? nullptr : &*it;
 }
 
@@ -357,7 +364,7 @@ struct Bounds {
 auto bounds(const Path& p, const Conjuncts& where) -> Bounds {
   Bounds b;
   auto first = [&](std::uint32_t col, auto pred) -> const Expr* {
-    auto it = std::ranges::find_if(where, [&](const Expr& w) { return on_col(w, col) && pred(w.op); });
+    auto it = std::ranges::find_if(where, [&](const Expr& w) { return on_col(w, col) && pred(w.op) && keyable(w); });
     return it == where.end() ? nullptr : &*it;
   };
   for (const auto& part : p.parts) {

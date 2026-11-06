@@ -1887,9 +1887,9 @@ public:
   }
 
   // Whether a column of type `col` is compared with a subquery's value of
-  // type `sub` as it holds it: integers with integers, a key encoding each
-  // as 64 bits whatever its declared width, so one past the column's type
-  // matches nothing and bounds a range where it falls; a DECIMAL of its
+  // type `sub` as it holds it: integers with integers, compared as 64 bits
+  // whatever their declared widths, so one past the column's type matches
+  // nothing and bounds a range where it falls; a DECIMAL of its
   // scale; strings with strings; any other type its own.
   static void comparable(SqlType sub, const Column& c, std::int32_t pos) {
     auto ok = (is_integer(sub) && is_integer(c.sql)) ||
@@ -3016,7 +3016,12 @@ public:
       auto [table, c] = resolve(*col);
       auto s = subquery(*rhs->subquery, logical::Subquery::Kind::Value, rhs->pos);
       comparable(s.type, *c, rhs->pos);
-      return logical::compare(op, logical::column_of(table, *c), logical::param(s.param, c->sql));
+      // The parameter is typed as the column, unless it is a wider integer
+      // than the column's key part holds: then as itself, which the search
+      // compares as a filter on the row, never through the key
+      // (types_design.md, *Key encoding*).
+      auto wider = is_integer(c->sql) && key_part_of(s.type, false, false).width > key_part_of(c->sql, false, false).width;
+      return logical::compare(op, logical::column_of(table, *c), logical::param(s.param, wider ? s.type : c->sql));
     }
     // A constant: folded to the column's type, where it holds it exactly.
     if (col->kind == ast::Expr::Kind::Column && is_constant(*rhs)) {
