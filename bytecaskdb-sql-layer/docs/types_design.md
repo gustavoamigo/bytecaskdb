@@ -335,20 +335,23 @@ too, and does:
 - A parameter is checked against its column's type before the plan runs
   (*Types*), and `$n ± k` against `INTEGER`, the only type it is compared
   with.
-- A join compares columns of one type, as the binder refuses any other
-  pair, so a value read from one row fits the other's part.
+- A join keys the inner side only by a column whose part holds every value
+  of the column it is compared with (`keyable`, below). The binder joins
+  only columns of one type today, so every join it binds passes; one that
+  did not would be a filter of the inner rows, not a key.
 - A scalar subquery's value may be a wider integer than its column
   (`int_col < (SELECT COUNT(*) …)`), and past the column's range a narrow
   part cannot hold it, nor bound a range with it: clamping to the edge gets
   one side of every operator wrong. The binder types such a parameter as
-  the subquery's own type, and the search keys only a comparison whose
-  operand's width fits the part (`keyable`): this one is a filter on the
-  row, compared as 64-bit integers, as PostgreSQL compares `int4` with
+  the subquery's own type, under `ANY` and `ALL` too, and the search keys
+  only a comparison whose operand's width fits the part (`keyable`): this
+  one is a filter on the row, compared as 64-bit integers, as PostgreSQL compares `int4` with
   `int8`. A subquery of the column's width still keys the lookup.
 
 Behind those, `key_put_i64` refuses a value past its part's width and
 writes nothing; the plan API's key builder then answers `bc_key_fits` false
-and `bc_key_end` `BC_E_LIMIT`, so no key is ever truncated. A `DECIMAL`
+and `bc_key_end` `BC_E_LIMIT`, and `bc_key_param` or `bc_key_params` given
+such a parameter is `BC_E_LIMIT` too, so no key is ever truncated. A `DECIMAL`
 part stays 8 bytes: a parameter compared with a `DECIMAL(p, s)` is typed
 without its precision (*Types*), so its key must hold any `i64`. Sort and
 group keys (`bc_sort_key_*`, `bc_col_key`) are never stored and keep 8-byte
@@ -417,8 +420,8 @@ fails too.
 
 ```
 u16   layout_generation   ; which offset table decodes this row
-u8    flags               ; bit 0: var_end entries are u32, else u16; no other bit is set
-u8    bitmap_bytes        ; size of the null bitmap, 1 to 255
+u16   bitmap_bytes        ; size of the null bitmap, 1 to 32,767, in the low 15 bits;
+                          ; bit 15 set: var_end entries are u32, else u16
 u16   var_table           ; offset of var_end: where the fixed region ends
 u16   nvar                ; entries in var_end
 u8[]  null_bitmap         ; bit set = present, indexed by permanent column id
@@ -447,8 +450,8 @@ checks again and refuses an integer past its column's width rather than
 cut it.
 
 **`var_end` is 2 bytes while it can be.** A row whose variable data is at
-most 65,535 bytes writes 2-byte `var_end` entries and clears flag bit 0; a
-larger one writes 4-byte entries and sets it. The writer knows the data's
+most 65,535 bytes writes 2-byte `var_end` entries and clears bit 15 of
+the bitmap's size field; a larger one writes 4-byte entries and sets it. The writer knows the data's
 length before it writes the header, so the choice costs nothing, and a
 `stock` row of TPROC-C, eleven variable columns, saves 22 bytes.
 
@@ -489,9 +492,10 @@ time.
 
 **The bitmap is sized at create, with a ceiling.** `bitmap_bytes` is the
 fewest bytes that hold every column id of the table with at least 16 ids to
-spare, fixed when the layout generation is created; it is a byte in the
-header, so a table's ids stop at 2,039 and one that needs more is refused at
-create. Adding a column uses the next id; when the next id has no bit, `ADD
+spare, fixed when the layout generation is created; its size is 15 bits of
+the header, so a table's ids stop near 262,000, and one that needs more is
+refused at create. The bit it leaves picks the `var_end` width, so the
+header stays 8 bytes. Adding a column uses the next id; when the next id has no bit, `ADD
 COLUMN` is refused until an `ALTER TABLE … REBUILD` starts a new generation
 with a larger bitmap. The size is in the row so that every structural check
 is local to the row: the fixed region starts at `8 + bitmap_bytes`, the
@@ -514,8 +518,8 @@ the fields are in the header.
 up to the engine's value limit: 256 MiB less a byte as a hard ceiling,
 enforced by `bc_row_end` as `BC_E_LIMIT`, and the configured
 `max_value_bytes`, enforced by the engine at commit. `var_table` stays u16:
-a fixed region is at most 8 bytes a column and the 255-byte bitmap bounds
-the column count, so it never nears 64 KiB.
+it bounds the fixed region and the bitmap together, and a layout that would
+pass it is refused at create, or its `ADD COLUMN` until a `REBUILD`.
 
 **The format is versioned through the catalog.** A row carries no format
 version of its own: every row belongs to a table, and every table's record
@@ -607,8 +611,8 @@ values with the edges mixed in:
   refused, a row written before a column was added reads the column as
   null, a row written after reads under the older layout, the bitmap
   ceiling refuses the column that has no bit, `var_end` turns to 4 bytes
-  past 64 KiB of variable data, and a row over the limit, cut short, longer
-  than its variable data or with an unknown flag is refused.
+  past 64 KiB of variable data, a bitmap past 255 bytes reads, and a row
+  over the limit, cut short or longer than its variable data is refused.
 
 `tests/plan_api_types_test.cpp` checks that an integer past its key part's
 width makes `bc_key_fits` false and the key `BC_E_LIMIT`, never a key cut

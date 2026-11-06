@@ -183,8 +183,9 @@ auto key_eq(const Expr& c) -> bool {
 auto on_col(const Expr& c, std::uint32_t col) -> bool { return is_compare(c) && col_of(c).col == col; }
 // Whether a key part of the compared column holds every value of the
 // operand: a SMALLINT, INTEGER or DATE part holds its declared width
-// (types_design.md, *Key encoding*), which a subquery's wider integer may be
-// past. A conjunct that is not is a filter on the row, never a key bound.
+// (types_design.md, *Key encoding*), which a subquery's wider integer, or a
+// wider column a join compares it with, may be past. A conjunct that is not
+// is a filter on the row, never a key bound or lookup.
 auto keyable(const Expr& c) -> bool {
   return key_part_of(operand_of(c).type, false, false).width <= key_part_of(c.args[0].type, false, false).width;
 }
@@ -1254,7 +1255,8 @@ private:
         continue;
       }
       // Only an equality keys the inner side.
-      auto jt = std::ranges::find_if(on, [&](const Expr& j) { return j.op == Op::Eq && col_of(j).col == id; });
+      // A column whose values the key part may not hold (keyable) is no key.
+      auto jt = std::ranges::find_if(on, [&](const Expr& j) { return j.op == Op::Eq && col_of(j).col == id && keyable(j); });
       if (jt == on.end()) {
         missing.push_back(t.column(id)->name);
         continue;

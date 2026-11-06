@@ -17,6 +17,7 @@ module;
 #include <limits>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -84,6 +85,8 @@ void key_put_prefix(Bytes& out, std::uint8_t ns, std::uint32_t id);
 [[nodiscard]] auto key_put_i64(Bytes& out, std::int64_t v, KeyPart part) -> bool;
 // -0.0 is written as 0.0 and every NaN as one canonical NaN above +inf. A
 // REAL part writes the float rounding's 4 bytes, by the same transform.
+// Throws std::invalid_argument for a part of a width no layout has, which
+// no reader would accept: a bug in whoever built the part.
 void key_put_f64(Bytes& out, double v, KeyPart part);
 void key_put_bool(Bytes& out, bool v, KeyPart part);
 void key_put_bytes(Bytes& out, BytesView v, KeyPart part);
@@ -232,6 +235,9 @@ auto float_rounding(double v) -> double {
 }
 
 void key_put_f64(Bytes& out, double v, KeyPart part) {
+  if (!fixed_width_valid(PhysType::F64, part.width)) {
+    throw std::invalid_argument("an F64 key part of a width no layout has");
+  }
   auto start = out.size();
   put_marker(out, part);
   if (part.width == 4) {

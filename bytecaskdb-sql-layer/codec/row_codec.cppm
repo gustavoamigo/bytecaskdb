@@ -5,8 +5,8 @@
 // format*:
 //
 //   u16   layout_generation
-//   u8    flags              ; bit 0: var_end entries are u32, else u16
-//   u8    bitmap_bytes       ; size of the null bitmap
+//   u16   bitmap_bytes       ; size of the null bitmap in its low 15 bits;
+//                            ; bit 15 set: var_end entries are u32, else u16
 //   u16   var_table          ; offset of var_end: where the fixed region ends
 //   u16   nvar               ; entries in var_end
 //   u8[]  null_bitmap        ; bit set = present, indexed by permanent column id
@@ -166,7 +166,7 @@ struct ColumnDef {
 
 // Assigns positions in column order: fixed columns packed at their widths
 // after the bitmap, variable columns the next slot. Throws std::length_error
-// if the bitmap would outgrow the header's 8-bit size or the fixed region
+// if the bitmap would outgrow the header's 15-bit size or the fixed region
 // its 16-bit var_table.
 [[nodiscard]] auto make_layout(std::span<const ColumnDef> cols, std::uint16_t generation = 1)
     -> RowLayout;
@@ -175,7 +175,7 @@ struct ColumnDef {
 // the fixed region would outgrow the header's 16-bit var_table: the layout
 // needs a REBUILD.
 [[nodiscard]] auto append_columns(RowLayout& layout, std::span<const ColumnDef> cols) -> bool;
-// Whether a layout keeps the format's invariants: a bitmap of 1 to 255
+// Whether a layout keeps the format's invariants: a bitmap of 1 to 32,767
 // bytes, every column id below its ceiling, fixed columns inside the fixed
 // region in position order and none overlapping another, slots below nvar
 // and none used twice,
@@ -269,9 +269,9 @@ namespace bytecask::sql {
 
 namespace {
 
-constexpr std::uint32_t kMaxBitmapBytes = 0xFF;
+constexpr std::uint32_t kMaxBitmapBytes = 0x7FFF;  // the low 15 bits of its header field
 constexpr std::uint32_t kMaxVarTable = 0xFFFF;
-constexpr std::uint8_t kWideVarEnd = 0x01;  // flags bit 0: var_end entries are u32
+constexpr std::uint32_t kWideVarEnd = 0x8000;  // bit 15 of that field: var_end entries are u32
 
 // A little-endian unsigned of W bytes: one fixed-size copy the compiler
 // turns into a single load, where a loop over a runtime width is not.
@@ -338,10 +338,9 @@ struct Header {
 // The header, if it is consistent with the row's length and its regions nest.
 auto header(BytesView row) -> std::optional<Header> {
   if (row.size() < kRowHeaderBytes) return std::nullopt;
-  auto flags = std::to_integer<std::uint8_t>(row[2]);
-  if ((flags & ~kWideVarEnd) != 0) return std::nullopt;  // a bit no build sets
-  Header h{std::to_integer<std::uint32_t>(row[3]), load_u16(row, 4), load_u16(row, 6),
-           (flags & kWideVarEnd) != 0 ? 4u : 2u, row.size()};
+  auto bitmap_field = load_u16(row, 2);
+  Header h{bitmap_field & kMaxBitmapBytes, load_u16(row, 4), load_u16(row, 6),
+           (bitmap_field & kWideVarEnd) != 0 ? 4u : 2u, row.size()};
   if (h.bitmap_bytes == 0 || h.var_table < h.fixed_start() || h.var_data() > h.row_bytes) return std::nullopt;
   // The row ends where its variable data does: a row cut short, or one with
   // bytes past its end, is malformed, as a stored length would show.
@@ -647,8 +646,7 @@ auto RowWriter::finish(Bytes& out, std::size_t max_bytes) const -> bool {
   auto at = out.size();
   out.resize(at + total, std::byte{0});
   store_le(out, at, l.generation, 2);
-  store_le(out, at + 2, end_bytes == 4 ? kWideVarEnd : 0, 1);
-  store_le(out, at + 3, l.bitmap_bytes, 1);
+  store_le(out, at + 2, l.bitmap_bytes | (end_bytes == 4 ? kWideVarEnd : 0), 2);
   store_le(out, at + 4, l.fixed_end, 2);
   store_le(out, at + 6, l.nvar, 2);
 

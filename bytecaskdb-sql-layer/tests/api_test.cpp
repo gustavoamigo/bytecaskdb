@@ -1889,6 +1889,10 @@ TEST_CASE("embedded API: a narrow integer key compared with a wider subquery's v
   CHECK(ids("SELECT i FROM n WHERE s > (SELECT MAX(mid) FROM w)").empty());
   CHECK(ids("SELECT i FROM n WHERE s >= (SELECT MIN(mid) FROM w)") == all);
   CHECK(ids("SELECT i FROM n WHERE s = (SELECT mid FROM w WHERE k = 3)").empty());
+  // ANY and ALL compare against the subquery's extremes, past the range too.
+  CHECK(ids("SELECT i FROM n WHERE i < ANY (SELECT big FROM w)") == all);
+  CHECK(ids("SELECT i FROM n WHERE i > ALL (SELECT big FROM w WHERE big < 0)") == all);
+  CHECK(ids("SELECT i FROM n WHERE i > ANY (SELECT big FROM w WHERE big > 10)").empty());
   // A subquery of the key's own width still keys the lookup.
   CHECK(ids("SELECT i FROM n WHERE i = (SELECT mid FROM w WHERE k = 3)") == V{5});
   CHECK(db->prepare("SELECT i FROM n WHERE i = (SELECT mid FROM w WHERE k = 3)").plan_source().find("bc_get(") !=

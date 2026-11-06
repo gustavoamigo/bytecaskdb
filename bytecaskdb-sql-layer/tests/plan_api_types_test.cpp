@@ -1102,10 +1102,10 @@ TEST_CASE("plan API: an integer past its key part's width is no key: bc_key_fits
   // Built anyway, the key is refused at its end.
   CHECK(run(f, narrow_end, {past}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LIMIT);
-  // A parameter past the part is a plan bug: the compiler checks it first.
+  // A parameter past the part is no key either, the same BC_E_LIMIT.
   CHECK(value(f, narrow_params, {std::int64_t{5}}) == 1);
   CHECK(run(f, narrow_params, {past}) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(bc_error(f.cx) == BC_E_LIMIT);
 }
 
 TEST_CASE("plan API: a charge of several units does not step over the deadline check", "[sql][algebra]") {

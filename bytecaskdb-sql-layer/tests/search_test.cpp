@@ -261,6 +261,9 @@ TEST_CASE("search: only an equality conjunct of a join keys the inner side", "[s
   sql_test::Fixture f;
   f.ddl(CreateTableDdl{"u", {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},
                        {"k"}});
+  // w's key is an INTEGER, its part 4 bytes (below).
+  f.ddl(CreateTableDdl{"w", {ColumnSpec{"k", {SqlKind::Integer}, false, {}}, sql_test::Fixture::col("v", PhysType::I64, true)},
+                       {"k"}});
   const auto& t = *f.cat().table("t");
   const auto& u = *f.cat().table("u");
   auto join = [&](std::vector<Expr> on) {
@@ -282,6 +285,19 @@ TEST_CASE("search: only an equality conjunct of a join keys the inner side", "[s
                     1);
   CHECK(has(g, "bc_key_i64(cx, k0, bc_col_i64(cx, row, COL_1_2));"));
   CHECK(has(g, "!(bc_col_i64(cx, row1, COL_4_1) > bc_col_i64(cx, row, COL_1_2))"));
+
+  // An INTEGER key's 4-byte part cannot hold every BIGINT: w.k = t.qty is
+  // no key of w (keyable) but a filter of its rows, so a t.qty past INTEGER
+  // matches nothing rather than fail the statement.
+  const auto& w = *f.cat().table("w");
+  auto outer = filter(get(t), {logical::compare(Op::Eq, col(t, "id"), p(0))});
+  auto wide = generate(f.cat(),
+                       project(logical::node(logical::Join{std::move(outer), get(w),
+                                                           {logical::compare(Op::Eq, col(w, "k"), col(t, "qty"))}}),
+                               {col(w, "v")}),
+                       1);
+  CHECK_FALSE(has(wide, "bc_key_i64(cx, k0, bc_col_i64(cx, row, COL_1_2));"));
+  CHECK(has(wide, "bc_scan_open"));
 }
 
 TEST_CASE("rewrite: an input folded to Empty empties the Filter above it; Filters over a Join merge", "[sql][search]") {

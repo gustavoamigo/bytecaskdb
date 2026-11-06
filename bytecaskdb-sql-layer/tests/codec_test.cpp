@@ -370,6 +370,9 @@ TEST_CASE("key codec: malformed keys are reported, not over-read", "[sql][codec]
   KeyReader f2{eight};
   CHECK_FALSE(f2.read_f64({PhysType::F64, false, false, 2}).has_value());
   CHECK_FALSE(f2.ok());
+  // Nor is one written: an F64 part of such a width is a bug in its builder.
+  Bytes none;
+  CHECK_THROWS_AS(key_put_f64(none, 1.0, {PhysType::F64, false, false, 2}), std::invalid_argument);
 }
 
 TEST_CASE("row format: every physical type round-trips, null or not", "[sql][codec]") {
@@ -586,26 +589,38 @@ TEST_CASE("row format: the bitmap is sized at create and has a ceiling", "[sql][
   CHECK(make_layout(defs).bitmap_bytes == 9);  // byte by byte, not a word at a time
   CHECK(make_layout(std::span<const ColumnDef>{}).bitmap_bytes == 2);
 
-  // The bitmap's size is a byte in the header: 255 bytes hold ids below
-  // 2024 with 16 to spare. Past that, refused at create.
+  // The fixed region ends where the header's 16-bit var_table does.
   std::vector<ColumnDef> many;
-  for (std::uint32_t i = 0; i < 2025; ++i) many.emplace_back(i, plain_sql_type(PhysType::I64), true);
-  auto wide = make_layout(std::span<const ColumnDef>{many}.first(2024));
-  CHECK(wide.bitmap_bytes == 255);
+  for (std::uint32_t i = 0; i < 9000; ++i) many.emplace_back(i, plain_sql_type(PhysType::I64), true);
+  auto wide = make_layout(std::span<const ColumnDef>{many}.first(8000));
   CHECK(wide.fixed_end <= 0xFFFF);
+  CHECK(wide.columns.size() == 8000);
+  CHECK_FALSE(append_columns(wide, std::span<const ColumnDef>{many}.subspan(8000, 1000)));
+  CHECK(wide.columns.size() == 8000);
   CHECK_THROWS_AS(make_layout(many), std::length_error);
-  // ADD COLUMN takes the spare ids, up to the bitmap's last bit.
-  CHECK(wide.id_ceiling() == 2040);
-  CHECK_FALSE(append_columns(wide, std::array{ColumnDef{2040, plain_sql_type(PhysType::I64), true}}));
-  CHECK(wide.columns.size() == 2024);
+  // The bitmap's size is the low 15 bits of its header field: ids up to
+  // about 262,000. One past, with only variable columns, is refused at create.
+  CHECK(make_layout(std::array{ColumnDef{262'000, plain_sql_type(PhysType::Bytes), true}}).bitmap_bytes <= 0x7FFF);
+  CHECK_THROWS_AS(make_layout(std::array{ColumnDef{262'200, plain_sql_type(PhysType::Bytes), true}}), std::length_error);
   CHECK(narrow<std::uint16_t>(0xFFFFu) == 0xFFFF);
   CHECK_THROWS_AS(narrow<std::uint16_t>(0x10000u), std::overflow_error);
   RowWriter ww{wide};
-  for (std::uint32_t i = 0; i < 2024; ++i) REQUIRE(ww.set_i64(i, i));
+  for (std::uint32_t i = 0; i < 8000; ++i) REQUIRE(ww.set_i64(i, i));
   Bytes wide_row;
   REQUIRE(ww.finish(wide_row));
   CHECK(row_valid(wide_row));
-  CHECK(row_column(wide_row, *wide.find(2023)).i64() == 2023);
+  CHECK(row_column(wide_row, *wide.find(7999)).i64() == 7999);
+  // A row whose bitmap passes 255 bytes reads its columns, past it too.
+  auto big = make_layout(std::array{ColumnDef{0, plain_sql_type(PhysType::I64), false},
+                                    ColumnDef{5000, plain_sql_type(PhysType::Bytes), true}});
+  RowWriter bw{big};
+  REQUIRE(bw.set_i64(0, 42));
+  REQUIRE(bw.set_bytes(5000, Bytes{std::byte{'z'}}));
+  Bytes big_row;
+  REQUIRE(bw.finish(big_row));
+  CHECK(big.bitmap_bytes > 255);
+  CHECK(row_column(big_row, *big.find(0)).i64() == 42);
+  CHECK(row_column(big_row, *big.find(5000)).bytes.size() == 1);
 
   // The row carries the size, and a bit past the bitmap is clear.
   RowWriter w{layout};
@@ -703,14 +718,11 @@ TEST_CASE("row format: malformed rows are rejected, not over-read, and the limit
   CHECK(row_column(row, 0, PhysType::I64, 0, 8).state == ColumnState::Malformed);
   CHECK(row_column(row, 0, PhysType::I64, layout.fixed_start + 1, 8).state == ColumnState::Malformed);
   CHECK(row_column(row, 0, PhysType::I64, layout.fixed_start, 3).state == ColumnState::Malformed);
-  // A byte past the variable data, or a flag no build sets, is a malformed row.
+  // A byte past the variable data is a malformed row.
   auto longer = row;
   longer.push_back(std::byte{0});
   CHECK_FALSE(row_valid(longer));
   CHECK(row_column(longer, *layout.find(0)).state == ColumnState::Malformed);
-  auto flagged = row;
-  flagged[2] |= std::byte{0x02};
-  CHECK_FALSE(row_valid(flagged));
   // A var_end that runs past the row is a malformed row.
   auto bad = row;
   bad[layout.fixed_end] = std::byte{0xFF};
@@ -906,7 +918,7 @@ TEST_CASE("row format: var_end entries are 2 bytes up to 64 KiB of variable data
     Bytes row;
     REQUIRE(w.finish(row));
     auto end_bytes = len + 1 <= 0xFFFF ? 2u : 4u;
-    CHECK(std::to_integer<unsigned>(row[2]) == (end_bytes == 4 ? 1u : 0u));  // the flag
+    CHECK((std::to_integer<unsigned>(row[3]) & 0x80u) == (end_bytes == 4 ? 0x80u : 0u));  // bit 15 of the bitmap field
     CHECK(row.size() == layout.fixed_end + 2 * end_bytes + len + 1);
     CHECK(row_valid(row));
     CHECK(std::ranges::equal(row_column(row, *layout.find(1)).bytes, a));

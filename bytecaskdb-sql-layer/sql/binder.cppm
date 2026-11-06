@@ -1891,6 +1891,15 @@ public:
   // whatever their declared widths, so one past the column's type matches
   // nothing and bounds a range where it falls; a DECIMAL of its
   // scale; strings with strings; any other type its own.
+  // The type of a parameter holding a subquery's value compared with c: c's
+  // type, unless the value is a wider integer than c's key part holds; then
+  // its own, which the search compares as a filter on the row, never through
+  // the key (types_design.md, *Key encoding*).
+  static auto subquery_param_type(SqlType sub, const Column& c) -> SqlType {
+    auto wider = is_integer(c.sql) && key_part_of(sub, false, false).width > key_part_of(c.sql, false, false).width;
+    return wider ? sub : c.sql;
+  }
+
   static void comparable(SqlType sub, const Column& c, std::int32_t pos) {
     auto ok = (is_integer(sub) && is_integer(c.sql)) ||
               (sub.kind == SqlKind::Decimal && c.sql.kind == SqlKind::Decimal && sub.scale == c.sql.scale) ||
@@ -1924,8 +1933,8 @@ public:
     } else {
       auto s = subquery(q, logical::Subquery::Kind::Bounds, pos);
       comparable(s.type, c, pos);
-      auto hi = logical::param(s.param, c.sql);
-      auto lo = logical::param(s.param + 1, c.sql);
+      auto hi = logical::param(s.param, subquery_param_type(s.type, c));
+      auto lo = logical::param(s.param + 1, subquery_param_type(s.type, c));
       flags = s.param + 2;
       switch (op) {
         case ast::ValueCompare::Lt: core = logical::compare(ast::Compare::Op::Lt, x, std::move(hi)); break;
@@ -3016,12 +3025,7 @@ public:
       auto [table, c] = resolve(*col);
       auto s = subquery(*rhs->subquery, logical::Subquery::Kind::Value, rhs->pos);
       comparable(s.type, *c, rhs->pos);
-      // The parameter is typed as the column, unless it is a wider integer
-      // than the column's key part holds: then as itself, which the search
-      // compares as a filter on the row, never through the key
-      // (types_design.md, *Key encoding*).
-      auto wider = is_integer(c->sql) && key_part_of(s.type, false, false).width > key_part_of(c->sql, false, false).width;
-      return logical::compare(op, logical::column_of(table, *c), logical::param(s.param, wider ? s.type : c->sql));
+      return logical::compare(op, logical::column_of(table, *c), logical::param(s.param, subquery_param_type(s.type, *c)));
     }
     // A constant: folded to the column's type, where it holds it exactly.
     if (col->kind == ast::Expr::Kind::Column && is_constant(*rhs)) {

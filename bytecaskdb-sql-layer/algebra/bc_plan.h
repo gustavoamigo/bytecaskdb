@@ -298,14 +298,16 @@ void     bc_key_f64(bc_ctx *, bc_key, double);
 void     bc_key_bool(bc_ctx *, bc_key, bool);
 void     bc_key_bytes(bc_ctx *, bc_key, bc_view);
 void     bc_key_null(bc_ctx *, bc_key);
-void     bc_key_param(bc_ctx *, bc_key, uint32_t i);  /* parameter i as the next part, NULL included */
+void     bc_key_param(bc_ctx *, bc_key, uint32_t i);  /* parameter i as the next part, NULL included; an integer
+                                                       past the part's width is BC_E_LIMIT, as in bc_key_end */
 bc_view  bc_key_end(bc_ctx *, bc_key);
 bool     bc_key_fits(bc_ctx *, bc_key);  /* the key so far is within the engine's key ceiling and each integer
                                            within its part's width (2 bytes for SMALLINT, 4 for INTEGER and
                                            DATE): past either, no row has it, and bc_key_end is BC_E_LIMIT.
-                                           Compiled plans ask it of keys built from a row's strings; an
-                                           integer from a row is of the part's own type */
-bc_view  bc_key_params(bc_ctx *, uint32_t table_or_index, uint32_t first, uint32_t n);  /* parts from params first.. */
+                                           Compiled plans ask it of keys built from a row's strings; the
+                                           search keys a join only by an integer the part holds */
+bc_view  bc_key_params(bc_ctx *, uint32_t table_or_index, uint32_t first, uint32_t n);  /* parts from params first..;
+                                                                                         BC_E_LIMIT as bc_key_param */
 bc_view  bc_key_successor(bc_ctx *, bc_view key);     /* smallest key greater than every key with this prefix */
 
 /* Sort keys: what a sorter orders by, built from parts the plan chooses, each

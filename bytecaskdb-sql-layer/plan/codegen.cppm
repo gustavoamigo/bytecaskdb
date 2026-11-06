@@ -396,11 +396,10 @@ auto key(Writer& w, std::uint32_t object, const std::vector<KeySrc>& parts, bool
       w.line("bc_key_" + suffix(p.type) + "(cx, " + k + ", " + p.value + ");");
     }
   }
-  // Only a string read from a row can be past every key: an integer read
-  // from a row fits the part it keys, as a join compares columns of one
-  // type (the binder refuses any other pair), so its key part has the
-  // column's width (types_design.md, *Key encoding*). A parameter or
-  // $n ± k is checked against the column's type before the plan runs.
+  // Only a string read from a row can be past every key: the search keys
+  // a join only by a column whose part holds every value of the other
+  // (keyable, types_design.md, *Key encoding*), and a parameter or $n ± k
+  // is checked against the column's type before the plan runs.
   auto long_value =
       std::ranges::any_of(parts, [](const KeySrc& p) { return !p.value.empty() && p.type == PhysType::Bytes; });
   if (miss_if_long && long_value) w.line("if (!bc_key_fits(cx, " + k + ")) continue;");

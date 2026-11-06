@@ -1976,11 +1976,12 @@ auto resolve_range(bc_ctx* cx, std::uint32_t table_or_index, bc_view lo, bc_view
   }
   switch (part.type) {
     case PhysType::I64:
-      // A parameter is checked against its column's type before the plan
-      // runs, and the binder compares a subquery's wider integer with a
-      // narrow key column as a filter, never through the key.
+      // No key of the part holds a value past its width: BC_E_LIMIT, as
+      // bc_key_end reports a key built from one. The compiler's plans never
+      // pass one: a parameter is checked against its column's type before
+      // the plan runs, and a subquery's wider integer is no key bound.
       if (!bytecask::sql::key_put_i64(buf, std::get<std::int64_t>(*d), part)) {
-        cx->fail(BC_E_HANDLE, "parameter $" + std::to_string(i + 1) + " is outside its key part's integer width");
+        cx->fail(BC_E_LIMIT, "parameter $" + std::to_string(i + 1) + " is outside its key part's integer width: no key has it");
         return false;
       }
       break;
