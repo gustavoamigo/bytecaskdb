@@ -46,6 +46,7 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <latch>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -783,16 +784,30 @@ int main(int argc, char** argv) {
                      vacuum_pacing);
     }
 
+    // The loops run once all their threads exist: a thread that fails to start
+    // leaves the earlier ones to join, and a running loop stops only through a
+    // shutdown, which loop 0 has not started.
     std::vector<std::thread> loop_threads;
     loop_threads.reserve(n_loops - 1);
-    for (std::size_t i = 1; i < n_loops; ++i) {
-      int cpu = affinity ? cpus[i % cpus.size()] : -1;
-      auto* sh = srv.shards[i].get();
-      loop_threads.emplace_back([sh, cpu] {
-        pin_current_thread(cpu);
-        (void)uv_run(&sh->loop, UV_RUN_DEFAULT);
-      });
+    std::latch loops_decided{1};
+    std::atomic<bool> loops_run{false};
+    try {
+      for (std::size_t i = 1; i < n_loops; ++i) {
+        int cpu = affinity ? cpus[i % cpus.size()] : -1;
+        auto* sh = srv.shards[i].get();
+        loop_threads.emplace_back([sh, cpu, &loops_decided, &loops_run] {
+          pin_current_thread(cpu);
+          loops_decided.wait();
+          if (loops_run.load()) (void)uv_run(&sh->loop, UV_RUN_DEFAULT);
+        });
+      }
+    } catch (...) {
+      loops_decided.count_down();
+      for (auto& t : loop_threads) t.join();
+      throw;
     }
+    loops_run.store(true);
+    loops_decided.count_down();
 
     if (affinity) pin_current_thread(cpus[0]);
     pthread_sigmask(SIG_UNBLOCK, &stop_signals, nullptr);
