@@ -242,9 +242,11 @@ TEST_CASE("Database::vacuum: throws DbDegraded on a degraded engine, which ends 
   auto db = open_wide(dir);
   // The first allocation whose failure leaves a commit's outcome unknown.
   for (std::int64_t nth = 1; !db->engine_for_testing().is_degraded(); ++nth) {
+    // Built outside the faults: only the statement's own allocations are failed.
+    const std::vector<Value> params{nth, sql_test::bytes("v")};
     bytecask::testing::ScopedAllocFaults faults{nth, false};
     try {
-      db->execute("INSERT INTO t VALUES ($1, $2)", {nth, sql_test::bytes("v")});
+      db->execute("INSERT INTO t VALUES ($1, $2)", params);
     } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch): the loop reads the outcome
     }
     REQUIRE(faults.report().fired);
