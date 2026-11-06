@@ -13,6 +13,7 @@ from __future__ import annotations
 import decimal
 import os
 import resource
+import select
 import shutil
 import socket
 import struct
@@ -699,6 +700,50 @@ def test_shutdown_sends_57p01_to_an_idle_connection():
     finally:
         s.stop()
         shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_a_thread_that_fails_to_start_is_an_error_not_an_abort(tmp_path):
+    """Each thread the server starts, failed in turn, as at a thread limit: the
+    engine's, the workers', the vacuum thread and the loops'. Failing a thread
+    past the last one the server starts leaves it serving."""
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    compiler = shutil.which("cc") or shutil.which("clang")
+    if not compiler:
+        pytest.skip("no C compiler for the shim")
+    shim = tmp_path / "fail_thread.so"
+    source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fail_thread.c")
+    subprocess.run([compiler, "-shared", "-fPIC", "-o", str(shim), source, "-ldl"], check=True)
+
+    refused = 0
+    for nth in range(1, 16):
+        directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+        env = dict(os.environ, LD_PRELOAD=str(shim), BYTECASK_FAIL_THREAD=str(nth))
+        proc = subprocess.Popen([server_binary(), "--dir", directory, "--listen", "127.0.0.1:0", "--workers", "4"],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        try:
+            output = []
+            while True:
+                ready, _, _ = select.select([proc.stdout], [], [], 60)
+                assert ready, f"thread {nth}: neither ready nor exited within 60 s"
+                line = proc.stdout.readline()
+                output.append(line)
+                if not line or "ready on" in line:
+                    break
+            serving = "ready on" in output[-1]
+            if serving:
+                proc.send_signal(signal.SIGTERM)
+            output.extend(proc.stdout)
+            status = proc.wait(timeout=60)
+            assert status == (0 if serving else 1), f"thread {nth}: exit {status}: {''.join(output)}"
+            if not serving:
+                refused += 1
+                assert "Resource temporarily unavailable" in "".join(output)
+        finally:
+            proc.kill()
+            proc.wait()
+            shutil.rmtree(directory, ignore_errors=True)
+    assert refused >= 6  # at least the workers, the vacuum thread and one loop's
 
 
 WIDE_ROWS = 32

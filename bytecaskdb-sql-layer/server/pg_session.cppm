@@ -1758,17 +1758,22 @@ public:
       if (wq_.back()->wake_fd < 0) throw std::system_error{errno, std::generic_category(), "eventfd"};
     }
     workers_.reserve(n);
-    for (std::size_t i = 0; i < n; ++i) {
-      int cpu = cpus.empty() ? -1 : cpus[i % cpus.size()];
-      workers_.emplace_back([this, i, cpu] {
-        if (cpu >= 0) {
-          cpu_set_t set;
-          CPU_ZERO(&set);
-          CPU_SET(static_cast<std::size_t>(cpu), &set);
-          (void)pthread_setaffinity_np(pthread_self(), sizeof set, &set);
-        }
-        worker_loop(i);
-      });
+    try {
+      for (std::size_t i = 0; i < n; ++i) {
+        int cpu = cpus.empty() ? -1 : cpus[i % cpus.size()];
+        workers_.emplace_back([this, i, cpu] {
+          if (cpu >= 0) {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(static_cast<std::size_t>(cpu), &set);
+            (void)pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+          }
+          worker_loop(i);
+        });
+      }
+    } catch (...) {
+      shutdown();  // the workers already started: ~Pool does not run for a constructor that throws
+      throw;
     }
   }
 
