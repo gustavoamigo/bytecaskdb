@@ -944,7 +944,10 @@ mode but needs `/tmp` to allow executable mappings.
    - restore the copy (a reflink where the filesystem has them);
    - take a run with `sql_layer_tprocc next-run`, written into the driver's
      header;
-   - start the server on a free port, and wait for its `ready` line;
+   - start the server on a free port, and wait for its `ready` line, up to
+     5 minutes because a large pool touches its arena at open; a server that
+     exits first, or does not make it, fails the script with its log, and
+     is not left running;
    - run `hammerdbcli auto` on a generated file, which sets
      `dbset db pg`, `dbset bm TPC-C`, `diset connection pg_host`,
      `pg_port` and `pg_sslmode disable`, `diset tpcc pg_user` and

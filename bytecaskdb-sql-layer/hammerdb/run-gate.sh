@@ -44,6 +44,7 @@
 #                 create a database; its password goes in PGPASSWORD, which
 #                 the driver's libpq reads too.
 #   XMAKE_FLAGS:  more `xmake f` flags for the build (CI's toolchain).
+#   GATE_READY_TIMEOUT_S: seconds a server may take to report ready (default 300).
 #
 # Each cell appends a row to bytecaskdb-sql-layer/benchmarks/hammerdb_results.csv
 # (ignored by git), with the driver, the sync mode, the server's flags and the
@@ -237,6 +238,31 @@ result() {  # log -> "NOPM TPM" or nothing
   sed -n 's/.*System achieved \([0-9]*\) NOPM from \([0-9]*\) .* TPM.*/\1 \2/p' "$1" | tail -1
 }
 
+# How long a server may take to report ready. A large pool touches its whole
+# arena at open, and the server does not take signals until it is up.
+READY_TIMEOUT_S="${GATE_READY_TIMEOUT_S:-300}"
+
+# 0 once the server's log says ready. Otherwise says why, stops the server if it
+# is still there, and returns 1.
+wait_ready() {  # pid log
+  local deadline=$((SECONDS + READY_TIMEOUT_S))
+  until grep -q "ready on" "$2"; do
+    if ! kill -0 "$1" 2>/dev/null; then
+      echo "run-gate.sh: sql_layer_server exited during startup; its log follows:" >&2
+      cat "$2" >&2
+      return 1
+    fi
+    if ((SECONDS >= deadline)); then
+      echo "run-gate.sh: sql_layer_server was not ready after ${READY_TIMEOUT_S} s; stopping it. Its log follows:" >&2
+      cat "$2" >&2
+      kill -KILL "$1" 2>/dev/null || true
+      wait "$1" 2>/dev/null || true
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
 COUNTERS_CSV="$LAYER/benchmarks/hammerdb_counters.csv"
 mkdir -p "$(dirname "$COUNTERS_CSV")"
 [[ -f "$COUNTERS_CSV" ]] || echo "date,commit,warehouses,users,sync,name,value" >"$COUNTERS_CSV"
@@ -260,8 +286,7 @@ for vu in "${VU_LIST[@]}"; do
     port="$(free_port)"
     "$SERVER" --dir "$cell" --listen "127.0.0.1:$port" --database tprocc "${flags[@]}" >"$DATA_ROOT/server.log" 2>&1 &
     server=$!
-    for _ in $(seq 100); do grep -q "ready on" "$DATA_ROOT/server.log" && break; sleep 0.1; done
-    grep -q "ready on" "$DATA_ROOT/server.log" || { cat "$DATA_ROOT/server.log" >&2; exit 1; }
+    wait_ready "$server" "$DATA_ROOT/server.log" || exit 1
     echo "== $vu users, $WAREHOUSES warehouses, ${RAMPUP}+${DURATION} min, $sync"
     driver 127.0.0.1 "$port" tprocc tprocc "$WAREHOUSES" "$run" ByteCaskDB "$DATA_ROOT/driver.tcl"
     hammerdb "$DATA_ROOT/driver.tcl" "$port" "$vu" "$DATA_ROOT/hammerdb.log"
