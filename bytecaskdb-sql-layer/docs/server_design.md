@@ -98,7 +98,7 @@ costs one lookup in `Database::prepare`'s cache, keyed by the exact text.
 [--buffer-pool-direct-io on|off] [--statement-memory-bytes 67108864] [--max-memory-bytes BYTES]
 [--idle-in-transaction-timeout-ms 60000] [--statement-timeout-ms 0]
 [--transaction-timeout-ms 0] [--idle-session-timeout-ms 0] [--startup-timeout-ms 60000]
-[--vacuum on|off] [--vacuum-fragmentation-threshold 0.5] [--vacuum-busy-interval-ms 500]
+[--vacuum on|off] [--vacuum-fragmentation-threshold 0.7] [--vacuum-busy-interval-ms 500]
 [--vacuum-idle-interval-ms 30000]` serves one
 database directory under one database name, by default the directory's
 last component. It opens the directory with `Database::open`, so it holds
@@ -1042,7 +1042,8 @@ The run script requires W ≥ the user count; the monitor is not a user.
     (`tests/server/fail_thread.c`): an error and exit 1, never an abort;
   - `--vacuum` and its pauses and threshold: on by default the data directory
     shrinks under an overwrite load and SIGTERM still exits 0, off it keeps
-    what was written, and a bad value exits before the server listens.
+    what was written, a sealed file about 63% dead stays at the default
+    threshold and goes at 0.5, and a bad value exits before the server listens.
 - **`tests/vacuum_test.cpp`** (`sql_layer_tests "[sql][server]"`, `"[sql][api]"`):
   `VacuumThread` with a scripted pass (its pauses, a stop during one, a failure
   retried, `DbDegraded` ending it), and over a real database, reclaiming disk,

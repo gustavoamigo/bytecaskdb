@@ -11,7 +11,7 @@
 //                     [--statement-memory-bytes 67108864] [--max-memory-bytes BYTES]
 //                     [--idle-in-transaction-timeout-ms 60000] [--statement-timeout-ms 0]
 //                     [--transaction-timeout-ms 0] [--idle-session-timeout-ms 0] [--startup-timeout-ms 60000]
-//                     [--vacuum on|off] [--vacuum-fragmentation-threshold 0.5]
+//                     [--vacuum on|off] [--vacuum-fragmentation-threshold 0.7]
 //                     [--vacuum-busy-interval-ms 500] [--vacuum-idle-interval-ms 30000]
 //
 // Serves one database directory under one name, by default the directory's
@@ -729,6 +729,9 @@ int main(int argc, char** argv) {
     auto vacuum_on = true;
     if (f.contains("vacuum")) vacuum_on = on_off("vacuum", f["vacuum"]);
     bytecask::sql::VacuumOptions vacuum_opts;
+    // Above the engine's 0.5: each vacuum commit stalls writers, and at 0.5 an
+    // overwrite load keeps it compacting (docs/session_design.md, *Background vacuum*).
+    vacuum_opts.fragmentation_threshold = 0.7;
     if (f.contains("vacuum-fragmentation-threshold")) {
       constexpr auto takes = "a number from 0.0 to 1.0";
       number("vacuum-fragmentation-threshold", f["vacuum-fragmentation-threshold"], takes,
