@@ -214,6 +214,29 @@ void WritePlan::resolve_snapshot_entries() {
   }
 }
 
+void WritePlan::prepare_paths(const EngineState &head,
+                              std::uint64_t generation) {
+  const auto ctx = head.kd_ctx();
+  paths_.assign(writes_.size(), PreparedPath{});
+  for (std::size_t i = 0; i < writes_.size(); ++i) {
+    const auto resolved = resolved_entry(i).has_value();
+    std::visit(
+        [&](const auto &op) {
+          using T = std::decay_t<decltype(op)>;
+          if constexpr (std::is_same_v<T, PointPut>) {
+            kd_prepare_path(head.key_dir, op.key, ctx, !resolved, paths_[i]);
+          } else if constexpr (std::is_same_v<T, PointDel>) {
+            // An unresolved delete erases by key, which reads the key to
+            // find it: a path would not save that read.
+            if (resolved)
+              kd_prepare_path(head.key_dir, op.key, ctx, false, paths_[i]);
+          }
+        },
+        writes_[i]);
+  }
+  paths_generation_ = generation;
+}
+
 auto WritePlan::snapshot_entry(std::size_t i, BytesView key) const
     -> std::optional<KeyDirEntry> {
   if (i < snap_entries_.size()) return snap_entries_[i];
@@ -266,6 +289,8 @@ void TransientEngineState::prepare_write(
 
 void TransientEngineState::apply_writes(
     const WritePlan &plan, std::span<const std::uint64_t> offsets) {
+  PathFollow follow;
+  const auto path = [&](std::size_t w) { return plan.path(w); };
   std::size_t io_idx = 0;
   const auto wc = plan.write_count();
   const bool multi = wc > 1;
@@ -294,10 +319,12 @@ void TransientEngineState::apply_writes(
             // location and reads nothing; anything else is placed by key.
             const auto &at = plan.resolved_entry(w_idx);
             const bool by_location =
-                at && kd_put_at(key_dir_, key_span, *at, entry);
+                at && kd_put_at(key_dir_, key_span, *at, entry, path(w_idx),
+                                follow);
             const auto existing =
                 by_location ? std::optional{kd_hit(*at)}
-                            : kd_put(key_dir_, key_span, entry, kd_ctx());
+                            : kd_put(key_dir_, key_span, entry, kd_ctx(),
+                                     path(w_idx), follow);
             if (existing) {
               const auto dec =
                   entry_size(key_span.size(), existing->value_size());
@@ -310,7 +337,8 @@ void TransientEngineState::apply_writes(
           } else if constexpr (std::is_same_v<T, WritePlan::PointDel>) {
             const std::span<const std::byte> key_span{op.key};
             const auto &at = plan.resolved_entry(w_idx);
-            const bool by_location = at && kd_erase_at(key_dir_, key_span, *at);
+            const bool by_location =
+                at && kd_erase_at(key_dir_, key_span, *at, path(w_idx), follow);
             const auto existing =
                 by_location ? std::optional{kd_hit(*at)}
                             : kd_erase(key_dir_, key_span, kd_ctx());
@@ -383,6 +411,7 @@ auto TransientEngineState::can_apply_puts_checked(const WritePlan &plan)
 auto TransientEngineState::apply_puts_checked(
     const WritePlan &plan, std::span<const std::uint64_t> offsets,
     std::vector<PutUndo> &undo) -> bool {
+  PathFollow follow;
   // One per put applied, newest last. `key` points into the plan, which
   // outlives this call. Reserved up front, so a push never allocates after
   // the descent it records has changed the tree.
@@ -422,12 +451,15 @@ auto TransientEngineState::apply_puts_checked(
     note_pending(offsets[io_idx], next_seq_, key_span, val_size);
     const auto entry = KeyDirEntry::make(next_seq_, offsets[io_idx],
                                          active_file_id_, val_size);
+    const auto *path = plan.path(w_idx);
     if (const auto &at = plan.resolved_entry(w_idx)) {
-      if (!kd_put_at(key_dir_, key_span, *at, entry)) return abandon();
+      if (!kd_put_at(key_dir_, key_span, *at, entry, path, follow))
+        return abandon();
       undo.push_back({key_span, entry, kd_hit(*at)});
     } else {
-      undo.push_back(
-          {key_span, entry, kd_put(key_dir_, key_span, entry, kd_ctx())});
+      undo.push_back({key_span, entry,
+                      kd_put(key_dir_, key_span, entry, kd_ctx(), path,
+                             follow)});
       // An insert that displaced a record: the key appeared since the
       // snapshot. The record goes back with the rest of the plan.
       if (undo.back().was) return abandon();

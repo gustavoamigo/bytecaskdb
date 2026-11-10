@@ -1,0 +1,18 @@
+An overwrite replaced where its path found the key accounts for the record
+it displaced as if its value were empty: the file's live bytes drift from
+what recovery rebuilds (#754).
+Guarded-by: "write paths: overwrites replaced where their path found the key keep the file stats recovery rebuilds"
+
+diff --git a/bytecaskdb/internals.cppm b/bytecaskdb/internals.cppm
+index 5ea099f8..2da422ed 100644
+--- a/bytecaskdb/internals.cppm
++++ b/bytecaskdb/internals.cppm
+@@ -978,7 +978,7 @@ export inline auto kd_put(KeyDirTransient &t, std::span<const std::byte> key,
+     return std::nullopt;
+   // Replaced where the path found it: no record was read here.
+   if (path->displaced_found(*displaced))
+-    return KeyDirHit{*displaced, path->found_value_size};
++    return KeyDirHit{*displaced, 0};
+   return reader.displaced(*displaced);
+ }
+ export inline auto kd_erase_at(KeyDirTransient &t,

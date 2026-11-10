@@ -495,6 +495,20 @@ The result carries `idx`, whether it was `exact`, whether `q` sorts `after` the 
 
 Two engine paths know a key *and* the record they expect it to point at, and need to know whether the directory agrees. Vacuum asks whether a record is still live (the key still resolves to `(source_file, offset)`) and, when it copies a record, remaps the key from its old location to the new one. By the location invariant (§2.2), a record holds one key, so an entry that points at the expected record *is* the key's entry, whatever other entries share its fingerprint. `find_at(leaf, fp, ref)` scans the fingerprints like `find` and compares locations instead of reading keys; `holds(key, ref)`, `replace_at(key, from, to)` and `erase_at(key, from)` are built on it. None of them reads a record, so vacuum's liveness check and remap cost the key directory no I/O, as on the keyed tree.
 
+### 3.5. Paths prepared before the write lock
+
+A write finds its leaf by comparing the key at every inner level, and an insert reads one record to place the key in the leaf. Both can be done earlier, on a version the writer already has, outside the engine's write lock: `prepare_path(key, res, place, p)` records the child index taken at each level, the leaf reached and, with `place`, the position of an absent key in that leaf (`PreparedPath`). Under the lock, the path writes (`upsert`, `replace_at`, `erase_at` with a path and a `PathFollow`) replay the indices instead of comparing keys, and an insert into an unchanged leaf goes where the path says without the read. `route(p, f)` decides, by walking the indices from the live root:
+
+- **Same leaf.** The walk ends at the leaf the path was prepared in. It is the key's leaf, because a leaf's key range only widens while it is in the tree: removing an emptied neighbour widens it, a neighbour's split leaves it alone, and only its own split narrows it, which replaces the leaf. It is also unchanged, because a write changes only the nodes its own session created and that leaf's session has ended. So an absent key's prepared position still holds.
+- **Followed.** The walk ends at the copy of that leaf the plan's previous write made, with no write since: the copy holds the leaf's range, since one write changed it without splitting it. The key is placed by the usual read, since the copy's entries have changed.
+- **By key.** Anything else: the write descends by key, as without a path.
+
+The leaf is named by its address, kept as an integer, and the tag of the session that created it. Nothing keeps that version alive: by the time the path is replayed, a later commit may have copied the leaf, the last version holding it may have been released, and its memory may hold another node, the next copy of the same leaf included. The replay reads only nodes reached from the live root. A live node at the leaf's address with the leaf's tag is the leaf, since tags are never reissued and the leaf's session ended before its version was published. Pinning the version instead would keep alive the head of a flush that failed, and `resume()` cannot derive a state while a successor of it is alive (§5.2).
+
+The ranges argument holds only going forward. A version older than the path's can hold the same leaf with a narrower range, so a path is replayed only on a descendant of the version it was prepared in; the engine checks that (`DB::head_generation_`, `docs/bytecask_design.md`, *Write paths prepared before the section*).
+
+Only the route to the leaf changes. The leaf step is the one the keyed write runs, so a path write decides exactly what the keyed write decides: whether the key was at the expected record, what an insert displaced. The tests prove that against `std::map`: `blind tree model: writes down paths prepared in an earlier version decide what writes by key decide`, with other commits splitting and emptying leaves between preparing and replaying; one test per route; and `blind tree: a path whose leaf was freed and its memory reused is not replayed`.
+
 ---
 
 ## 4. Algorithms
@@ -597,6 +611,7 @@ All operations leave the original tree unchanged and return a new instance.
 *   `PersistentBlindBTree erase(key, R &res) const`
 *   `TransientBlindBTree<LeafBytes> transient() const` — spawns a mutable builder.
 *   `begin()`, `end()` (`std::default_sentinel`), `last()`, `end_iter()`, `lower_bound(key, R &res)` — iterators (§5.4).
+*   `void prepare_path(key, R &res, bool place, PreparedPath &p) const` — where `key` goes in this version, for a write on a later version to replay (§3.5). With `place`, one read to find an absent key's position in its leaf.
 *   `stats()`, `validate(R &res)`, `visit_nodes(f)` — node counts and depth, the debug invariant check, and a walk over node pointers for the memory tests.
 
 A version can be derived from only while it has no live successor; a second derivation throws `std::logic_error`, as on the other trees.
@@ -611,6 +626,7 @@ Operations mutate the tree in place under the session's tag. A consumed or moved
 *   `std::optional<BlindRef> erase(key, R &res)` — the displaced location, if the key was present.
 *   `bool replace_at(key, BlindRef from, BlindRef to)` — points `key`'s entry at `to` if it points at `from`. No read.
 *   `bool erase_at(key, BlindRef from)` — erases `key`'s entry if it points at `from`. No read.
+*   `upsert`, `replace_at` and `erase_at` with a trailing `const PreparedPath &, PathFollow &`, and `route(p, f)` — the writes above, down a path prepared earlier where it still leads to the key's leaf, and by key otherwise (§3.5). `path_stats()` counts replays and misses.
 *   `lower_bound(key, R &res) const`
 *   `PersistentBlindBTree<LeafBytes> persistent() &&` — consumes the builder.
 

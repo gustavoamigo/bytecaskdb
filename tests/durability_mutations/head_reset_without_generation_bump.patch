@@ -1,0 +1,18 @@
+store_head replaces the head without raising head_generation_, so a reset
+to an older state (a failed flush's, resume()'s) leaves the paths found in
+the dropped head usable on a tree that does not descend from it (#754).
+Guarded-by: "write paths: a plan prepared in a head that resume() dropped goes by key"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index b5febf5a..9fa13c4a 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -1804,7 +1804,7 @@ private:
+     const auto version = s->key_dir.version();
+     const auto replaced = std::atomic_exchange(&head_, std::move(s));
+     if (replaced == nullptr) return;  // the first head
+-    if (replaced->key_dir.version() != version) head_generation_.fetch_add(1);
++    (void)version;
+   }
+ #pragma clang diagnostic pop
+ 

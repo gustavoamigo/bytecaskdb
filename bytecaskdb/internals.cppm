@@ -524,6 +524,35 @@ export inline auto kd_erase_at(KeyDirTransient &, std::span<const std::byte>,
                                const KeyDirEntry &) -> bool {
   return false;
 }
+// Paths prepared before the write section (blind key directory only; see
+// PreparedPath). The keyed tree compares keys on its way down and reads no
+// record to place one, so a path would save it nothing: it prepares none,
+// and its writes go by key.
+export inline void kd_prepare_path(const KeyDirTree &,
+                                   std::span<const std::byte>,
+                                   const KeyDirCtx &, bool, PreparedPath &p) {
+  p = {};
+}
+export inline auto kd_put_at(KeyDirTransient &t, std::span<const std::byte> key,
+                             const KeyDirEntry &at, const KeyDirEntry &e,
+                             const PreparedPath *, PathFollow &) -> bool {
+  return kd_put_at(t, key, at, e);
+}
+export inline auto kd_put(KeyDirTransient &t, std::span<const std::byte> key,
+                          const KeyDirEntry &e, const KeyDirCtx &ctx,
+                          const PreparedPath *, PathFollow &)
+    -> std::optional<KeyDirHit> {
+  return kd_put(t, key, e, ctx);
+}
+export inline auto kd_erase_at(KeyDirTransient &t,
+                               std::span<const std::byte> key,
+                               const KeyDirEntry &at, const PreparedPath *,
+                               PathFollow &) -> bool {
+  return kd_erase_at(t, key, at);
+}
+export inline auto kd_path_stats(const KeyDirTransient &) -> PathStats {
+  return {};
+}
 // Undo for a plan applied with its checks folded into the descents (blind
 // key directory only; see TransientEngineState::apply_puts_checked). The
 // keyed tree never takes that path.
@@ -906,6 +935,62 @@ export inline auto kd_erase_at(KeyDirTransient &t,
                                std::span<const std::byte> key,
                                const KeyDirEntry &at) -> bool {
   return t.erase_at(key, to_blind_ref(at));
+}
+// Where `key` goes in `t`, for a write on a later version to replay
+// (PreparedPath). With `place`, also where an absent key would go in its
+// leaf: one read, which the write then does not make.
+export inline void kd_prepare_path(const KeyDirTree &t,
+                                   std::span<const std::byte> key,
+                                   const KeyDirCtx &ctx, bool place,
+                                   PreparedPath &p) {
+  FrameLease lease;
+  ScratchUse scratch{key_read_buffer(), ctx.scratch_bytes};
+  KeyReader reader{ctx, scratch.buf(), lease};
+  t.prepare_path(key, reader, place, p);
+  // A key found in place: the read that found it is the record's, the last
+  // the reader made, so its value size is the found record's.
+  if (p.displaced_found(p.found)) p.found_value_size = reader.value_size;
+}
+// The writes above, down `path` where it still leads to the key's leaf
+// (TransientBlindBTree::route), by key otherwise or when path is null.
+// `follow` is the plan's: one per plan, across its writes.
+export inline auto kd_put_at(KeyDirTransient &t, std::span<const std::byte> key,
+                             const KeyDirEntry &at, const KeyDirEntry &e,
+                             const PreparedPath *path, PathFollow &follow)
+    -> bool {
+  if (!path)
+    return kd_put_at(t, key, at, e);
+  return t.replace_at(key, to_blind_ref(at), to_blind_ref(e), *path, follow);
+}
+export inline auto kd_put(KeyDirTransient &t, std::span<const std::byte> key,
+                          const KeyDirEntry &e, const KeyDirCtx &ctx,
+                          const PreparedPath *path, PathFollow &follow)
+    -> std::optional<KeyDirHit> {
+  if (!path)
+    return kd_put(t, key, e, ctx);
+  FrameLease lease;
+  ScratchUse scratch{key_read_buffer(), ctx.scratch_bytes};
+  KeyReader reader{ctx, scratch.buf(), lease};
+  const auto displaced = t.upsert(
+      key, to_blind_ref(e), reader,
+      [](const BlindRef &, const BlindRef &) { return true; }, *path, follow);
+  if (!displaced)
+    return std::nullopt;
+  // Replaced where the path found it: no record was read here.
+  if (path->displaced_found(*displaced))
+    return KeyDirHit{*displaced, path->found_value_size};
+  return reader.displaced(*displaced);
+}
+export inline auto kd_erase_at(KeyDirTransient &t,
+                               std::span<const std::byte> key,
+                               const KeyDirEntry &at, const PreparedPath *path,
+                               PathFollow &follow) -> bool {
+  if (!path)
+    return kd_erase_at(t, key, at);
+  return t.erase_at(key, to_blind_ref(at), *path, follow);
+}
+export inline auto kd_path_stats(const KeyDirTransient &t) -> PathStats {
+  return t.path_stats();
 }
 // What a put or an erase of the entry `at` displaced: `at`'s own record.
 export inline auto kd_hit(const KeyDirEntry &at) -> KeyDirHit {
