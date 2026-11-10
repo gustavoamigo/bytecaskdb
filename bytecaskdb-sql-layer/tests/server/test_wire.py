@@ -811,6 +811,43 @@ def test_vacuum_off_leaves_the_disk_as_written():
         shutil.rmtree(directory, ignore_errors=True)
 
 
+def oldest_data_file(directory: str) -> str:
+    return min(name for name in os.listdir(directory) if name.endswith(".data"))
+
+
+@pytest.mark.parametrize("threshold,reclaimed", [(None, False), ("0.5", True)])
+def test_the_default_vacuum_threshold_leaves_a_file_under_two_thirds_dead(threshold, reclaimed):
+    """64 MiB written, then 40 of those rows again: the first file is sealed and
+    about 63% dead. The default threshold (0.7) keeps it; 0.5 reclaims it."""
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    args = ["--sync", "AT_FILE_ROTATION", "--vacuum-busy-interval-ms", "10", "--vacuum-idle-interval-ms", "100"]
+    if threshold is not None:
+        args += ["--vacuum-fragmentation-threshold", threshold]
+    s = Server(directory, extra_args=args)
+    try:
+        c = connect(s)
+        c.send(query("CREATE TABLE wide (k INTEGER PRIMARY KEY, v TEXT)"))
+        assert states(c.until_ready()) == []
+        for k in range(2 * WIDE_ROWS):
+            c.send(query(f"INSERT INTO wide VALUES ({k}, '{WIDE_ROW}')"))
+            assert states(c.until_ready()) == []
+        first = oldest_data_file(directory)
+        for k in range(40):
+            c.send(query(f"UPDATE wide SET v = '{WIDE_ROW}' WHERE k = {k}"))
+            assert states(c.until_ready()) == []
+        # A pass every 100 ms: 3 s is about 30 passes over the sealed file.
+        deadline = time.monotonic() + (60 if reclaimed else 3)
+        while os.path.exists(os.path.join(directory, first)) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert os.path.exists(os.path.join(directory, first)) != reclaimed
+        assert s.stop() == 0
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 @pytest.mark.parametrize("flag,value", [
     ("--vacuum", "maybe"),
     ("--vacuum-fragmentation-threshold", "1.5"),

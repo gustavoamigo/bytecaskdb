@@ -296,13 +296,19 @@ an update workload grows the data directory without bound. The server calls:
 | Flag | Default | Takes |
 |---|---|---|
 | `--vacuum` | `on` | `on` or `off`; `off` starts no thread |
-| `--vacuum-fragmentation-threshold` | `0.5` | 0.0 to 1.0; a file qualifies above it, so 1.0 reclaims nothing, with the thread still running |
+| `--vacuum-fragmentation-threshold` | `0.7` | 0.0 to 1.0; a file qualifies above it, so 1.0 reclaims nothing, with the thread still running |
 | `--vacuum-busy-interval-ms` | `500` | 10 to 3,600,000 |
 | `--vacuum-idle-interval-ms` | `30000` | 100 to 86,400,000 |
 
-Names, defaults and ranges are the plugin's, fixed at startup. At 0.5, sealed
+Names, ranges and the pauses' defaults are the plugin's, fixed at startup. The
+threshold's default is 0.7, not the plugin's 0.5: each vacuum commit stalls
+writers (below), and on the plugin at 0.5 that cost 8 to 16% NOPM, more with
+bigger files (#337). On this server with 64 MiB files (TPROC-C, 48 warehouses,
+16 users, 8 GiB pool, `AT_INTERVAL`), 0.7 measured level with 0.5: NOPM within
+1%, µs per commit within 0.4%, about 10% fewer files compacted, and 4 to 6%
+more data on disk (16.6 to 16.9 GiB against 15.9 to 16.0). At 0.5, sealed
 files hold about twice their live bytes at most, as long as vacuum keeps up;
-at 0.9, about ten times.
+at 0.7, about 3.3 times; at 0.9, about ten times.
 
 **The loop.** A pass is one `Database::vacuum`, which reclaims at most one
 file. It runs at once on start, then waits the busy pause after a pass that
