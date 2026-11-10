@@ -12,7 +12,6 @@ module;
 #include <exception>
 #include <filesystem>
 #include <format>
-#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -28,14 +27,16 @@ namespace bytecask {
 
 // Prepares and applies one slot against the transient. Appends nothing: its
 // only I/O is the record reads a key directory that holds no key bytes needs
-// to place keys and check guards. Entries are appended to all_entries;
-// running_offset is advanced by
-// the total byte size of entries produced. Returns false on validation
-// failure (slot.result set to nullopt). durable is left false on success;
-// execute_slots fills it in once the batch's durability is known.
+// to place keys and check guards. A slot that succeeds leaves its entries in
+// scratch.entries, the group's list; every buffer it uses is scratch's.
+// running_offset is advanced by the total byte size of entries produced.
+// Returns false on validation failure (slot.result set to nullopt). durable
+// is left false on success; execute_slots fills it in once the batch's
+// durability is known.
 auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
-                      std::vector<DataEntryView> &all_entries,
-                      std::uint64_t &running_offset, bool can_rotate) -> bool {
+                      CommitScratch &scratch, std::uint64_t &running_offset,
+                      bool can_rotate) -> bool {
+  auto &all_entries = scratch.entries;
   if (slot.plan.empty()) {
     slot.result = CommitResult{};
     return true;
@@ -56,7 +57,20 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
   if (!t.validate_preconditions(slot.plan, rests_on, checked))
     return conflict();
 
-  auto entries = t.prepare_write(slot.plan);
+  // The slot's entries go straight into the group's list, and leave it
+  // again unless the slot is applied: a slot that fails writes nothing.
+  struct SlotEntries {
+    std::vector<DataEntryView> &list;
+    std::size_t first;
+    bool applied{false};
+    ~SlotEntries() {
+      if (!applied)
+        list.erase(list.begin() + static_cast<std::ptrdiff_t>(first),
+                   list.end());
+    }
+  } slot_entries{all_entries, all_entries.size()};
+  t.prepare_write(slot.plan, all_entries);
+  const auto entries = std::span{all_entries}.subspan(slot_entries.first);
   if (entries.empty()) {
     slot.rests_on = rests_on;
     slot.result = CommitResult{};
@@ -81,14 +95,16 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
   // Pre-compute offsets from running_offset (tracks the file position
   // across all slots in the group, without actual I/O). It advances only
   // once the plan is applied: a plan that conflicts writes nothing.
-  std::vector<std::uint64_t> offsets(entries.size());
+  auto &offsets = scratch.offsets;
+  offsets.resize(entries.size());
   auto next_offset = running_offset;
   for (std::size_t i = 0; i < entries.size(); ++i) {
     offsets[i] = next_offset;
     next_offset += entry_size(entries[i].key.size(), entries[i].value.size());
   }
 
-  if (!checked || !t.apply_puts_checked(slot.plan, offsets)) {
+  if (!checked ||
+      !t.apply_puts_checked(slot.plan, offsets, scratch.undo)) {
     // A put the descents could not confirm leaves the plan unapplied: check
     // it in a pass of its own, which settles a real conflict and its
     // rests_on exactly as before, then apply it.
@@ -99,15 +115,23 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
     t.apply_writes(slot.plan, offsets);
   }
   running_offset = next_offset;
+  slot_entries.applied = true;
 
-  const auto committed_sequence = entries.back().sequence;
-
-  all_entries.insert(all_entries.end(),
-                     std::make_move_iterator(entries.begin()),
-                     std::make_move_iterator(entries.end()));
-
-  slot.result = CommitResult{.sequence = committed_sequence};
+  slot.result = CommitResult{.sequence = entries.back().sequence};
   return true;
+}
+
+void DB::CommitScratch::reset(std::size_t limit_bytes) noexcept {
+  const auto release = [limit_bytes]<typename Buf>(Buf &buf) noexcept {
+    buf.clear();
+    if (buf.capacity() * sizeof(typename Buf::value_type) > limit_bytes)
+      buf = Buf{};
+  };
+  release(entries);
+  release(offsets);
+  release(io_offsets);
+  release(pending);
+  release(undo);
 }
 
 // Executor callback shared by solo_writer_ and write_group_ — stage 1 of
@@ -120,6 +144,13 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
 // runs sync / rotate / publish inline, once per max_file_bytes.
 void DB::execute_slots(std::vector<Slot *> &batch) {
   std::lock_guard<std::mutex> wg{*write_mu_};
+  // Destroyed before the lock is released, after every group: the slots'
+  // writers may free their plans as soon as the batch returns.
+  struct ScratchReset {
+    CommitScratch &scratch;
+    std::size_t limit;
+    ~ScratchReset() { scratch.reset(limit); }
+  } scratch_reset{commit_scratch_, scratch_bytes_};
   // Declared after the lock, so it measures only the time the lock is held.
   struct BusyTimer {
     std::atomic<std::int64_t> &total;
@@ -160,10 +191,23 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
   auto current = load_head();
 
   auto t = current->transient();
+  // The transient notes its pending records in the scratch list's capacity,
+  // and gives it back however the group ends. The records borrow the
+  // slots' keys, so the list is emptied before the slots are released.
+  t.pending_.swap(commit_scratch_.pending);
+  struct PendingBack {
+    PendingRecords &transient;
+    PendingRecords &scratch;
+    ~PendingBack() {
+      scratch.swap(transient);
+      scratch.clear();
+    }
+  } pending_back{t.pending_, commit_scratch_.pending};
   auto &file = t.active_file();
   auto initial_offset = static_cast<std::uint64_t>(file.size());
   auto running_offset = initial_offset;
-  std::vector<DataEntryView> all_entries;
+  auto &all_entries = commit_scratch_.entries;
+  all_entries.clear();
   auto any_sync = false;
   // Without an id for the next file the active file cannot be rotated, so a
   // write that would take it to the threshold is refused before any I/O.
@@ -182,7 +226,7 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
       break;
     }
     slot.sync = slot.opts.sync;
-    execute_slot(t, slot, all_entries, running_offset, can_rotate);
+    execute_slot(t, slot, commit_scratch_, running_offset, can_rotate);
     any_sync |= slot.opts.sync;
   }
   batch = batch.first(taken);
@@ -222,7 +266,8 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
   const auto batch_max_seq = t.next_seq() - 1;
 
   // Phase 2: one I/O call for all collected entries.
-  std::vector<std::uint64_t> io_offsets(all_entries.size());
+  auto &io_offsets = commit_scratch_.io_offsets;
+  io_offsets.resize(all_entries.size());
   try {
     file.append_entries(all_entries, io_offsets, scratch_bytes_);
   } catch (...) {
