@@ -100,5 +100,5 @@ CI is `.github/workflows/sql-layer.yml`, with the sanitizers (ASan, TSan, UBSan)
 | `harness/` | `sql_layer_tprocc`, the in-process TPROC-C harness |
 | `python/` | the `bytecask_sql` module the tests use |
 | `tests/` | C++ tests, golden plans, proof, server and functional suites |
-| `docs/` | design documents, one per area: `frontend_design.md`, `planner_design.md`, `plan_api_design.md`, `catalog_design.md`, `types_design.md`, `transaction_design.md`, `server_design.md`, `cursor_design.md` (design; phases 1 to 5 built), `procedures_design.md` (design; phases 1 to 3 built), `testing_design.md` |
+| `docs/` | design documents, one per area: `frontend_design.md`, `planner_design.md`, `plan_api_design.md`, `catalog_design.md`, `types_design.md`, `transaction_design.md`, `server_design.md`, `cursor_design.md` (design; phases 1 to 5 built), `procedures_design.md` (design; phases 1 to 3 built), `plan_language_design.md` (proposed), `testing_design.md` |
 | `CONTRACT.md` | what the layer guarantees, and the test proving each row |
