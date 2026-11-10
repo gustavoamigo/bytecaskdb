@@ -54,7 +54,23 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
 #ifdef BYTECASK_TESTING
   checked = checked && !test_two_pass_;
 #endif
-  if (!t.validate_preconditions(slot.plan, rests_on, checked))
+  // The answer prepared before the section stands if nothing it read was
+  // written since; otherwise the plan is validated here, as before.
+  const auto prepared =
+      recent_writes_->verify(slot.plan.checks_, checked, t.next_seq() - 1,
+                             head_generation_.load()) ==
+      RecentWrites::Verdict::kUnchanged;
+  (prepared ? counters_.validations_prepared
+            : counters_.validations_in_section)
+      .fetch_add(1, std::memory_order_relaxed);
+#ifdef BYTECASK_TESTING
+  if (prepared) {
+    std::uint64_t ignored = 0;
+    if (!t.validate_preconditions(slot.plan, ignored, checked))
+      test_prepared_disagreements_.fetch_add(1, std::memory_order_relaxed);
+  }
+#endif
+  if (!prepared && !t.validate_preconditions(slot.plan, rests_on, checked))
     return conflict();
 
   // The slot's entries go straight into the group's list, and leave it

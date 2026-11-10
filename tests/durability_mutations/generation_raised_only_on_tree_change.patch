@@ -1,0 +1,20 @@
+store_head raises head_generation_ only when the key directory's version
+changes. A failed flush's head can take sequences that change no key, and
+resume() gives them out again: an answer prepared there takes a later write
+of that sequence for one it saw, and a write-write conflict is missed (#754).
+Guarded-by: "prepared validation: a plan prepared in a head whose sequence resume() gives out again is checked again"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index 8a641099..25defdc2 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -1829,7 +1829,8 @@ private:
+   void store_head(std::shared_ptr<EngineState> s) {
+     const auto replaced = std::atomic_exchange(&head_, std::move(s));
+     if (replaced == nullptr) return;  // the first head
+-    head_generation_.fetch_add(1);
++    if (replaced->key_dir.version() != std::atomic_load(&head_)->key_dir.version())
++      head_generation_.fetch_add(1);
+   }
+ #pragma clang diagnostic pop
+ 

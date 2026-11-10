@@ -4,15 +4,14 @@ the dropped head usable on a tree that does not descend from it (#754).
 Guarded-by: "write paths: a plan prepared in a head that resume() dropped goes by key"
 
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index b5febf5a..9fa13c4a 100644
+index 8a641099..38afb2be 100644
 --- a/bytecaskdb/bytecask.cppm
 +++ b/bytecaskdb/bytecask.cppm
-@@ -1804,7 +1804,7 @@ private:
-     const auto version = s->key_dir.version();
+@@ -1829,7 +1829,6 @@ private:
+   void store_head(std::shared_ptr<EngineState> s) {
      const auto replaced = std::atomic_exchange(&head_, std::move(s));
      if (replaced == nullptr) return;  // the first head
--    if (replaced->key_dir.version() != version) head_generation_.fetch_add(1);
-+    (void)version;
+-    head_generation_.fetch_add(1);
    }
  #pragma clang diagnostic pop
  

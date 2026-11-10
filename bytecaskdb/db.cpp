@@ -374,23 +374,28 @@ auto DB::apply_batch(WriteOptions opts,
   if (!test_resolve_by_key_)
 #endif
     slot.plan.resolve_snapshot_entries();
-  if constexpr (kKeyDirReadsKeys) {
+  {
+    // One head for the paths and the validation, and the generation read
+    // before it: a head the engine goes back from later carries the old
+    // generation, and neither is used (store_head). The head is let go
+    // before the writer joins a batch: while it is held, resume() cannot
+    // derive from the published state, and waits (see "Holders of the
+    // head" in docs/bytecask_design.md).
+    const auto generation = head_generation_.load();
+    const auto head = load_head();
+    if constexpr (kKeyDirReadsKeys) {
 #ifdef BYTECASK_TESTING
-    if (!test_no_paths_)
+      if (!test_no_paths_)
 #endif
-    {
-      // The generation first: a head loaded before a resume() reset it then
-      // carries the generation from before, and its paths are not used.
-      // The head is let go before the writer joins a batch: while it is
-      // held, resume() cannot derive from the published state (see "Holders
-      // of the head" in docs/bytecask_design.md).
-      const auto generation = head_generation_.load();
-      const auto head = load_head();
-      slot.plan.prepare_paths(*head, generation);
-#ifdef BYTECASK_TESTING
-      if (test_while_preparing_) test_while_preparing_();
-#endif
+        slot.plan.prepare_paths(*head, generation);
     }
+#ifdef BYTECASK_TESTING
+    if (!test_no_prepared_validation_)
+#endif
+      slot.plan.prepare_validation(*head, generation, *recent_writes_);
+#ifdef BYTECASK_TESTING
+    if (test_while_preparing_) test_while_preparing_();
+#endif
   }
 #ifdef BYTECASK_TESTING
   if (test_after_prepare_) test_after_prepare_();
@@ -473,6 +478,10 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        counters_.write_paths_missed.load(std::memory_order_relaxed)},
       {"bytecask.write_paths_stale",
        counters_.write_paths_stale.load(std::memory_order_relaxed)},
+      {"bytecask.validations_prepared",
+       counters_.validations_prepared.load(std::memory_order_relaxed)},
+      {"bytecask.validations_in_section",
+       counters_.validations_in_section.load(std::memory_order_relaxed)},
       {"bytecask.group_writer_busy_us",
        counters_.group_writer_busy_ns.load(std::memory_order_relaxed) / 1000},
       {"bytecask.file_rotations",
