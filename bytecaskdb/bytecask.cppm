@@ -665,8 +665,11 @@ public:
 
   // State transition: apply all writes from a plan using pre-computed offsets.
   // Cannot fail — pure in-memory mutations.
+  // Here and in apply_puts_checked, the plan's prepared paths
+  // (WritePlan::prepare_paths) must come from a version this transient
+  // descends from: the section drops any that do not (head_generation_).
   void apply_writes(const WritePlan &plan,
-                     std::span<const std::uint64_t> offsets);
+                    std::span<const std::uint64_t> offsets);
 
   // State transition: register a sealed read-only file in place of the old
   // active, then register a new writable file as the new active.
@@ -1785,8 +1788,23 @@ private:
   auto load_head() const -> std::shared_ptr<EngineState> {
     return std::atomic_load(&head_);
   }
-  void store_head(std::shared_ptr<EngineState> s) {
+  // A head execute_group derived from the current one: a descendant of it.
+  void advance_head(std::shared_ptr<EngineState> s) {
     std::atomic_store(&head_, std::move(s));
+  }
+  // Any other head. One whose key directory is not the version of the head
+  // it replaces may not descend from it (after a failed flush the head goes
+  // back to the published state), so it raises head_generation_, which
+  // retires every write path found in an earlier head. Conservative: a
+  // barrier's forward state raises it too, and the paths in flight then go
+  // by key. Raised after the store, so a writer that loaded the replaced
+  // head had read the generation before it (apply_batch reads the
+  // generation first).
+  void store_head(std::shared_ptr<EngineState> s) {
+    const auto version = s->key_dir.version();
+    const auto replaced = std::atomic_exchange(&head_, std::move(s));
+    if (replaced == nullptr) return;  // the first head
+    if (replaced->key_dir.version() != version) head_generation_.fetch_add(1);
   }
 #pragma clang diagnostic pop
 
@@ -1817,6 +1835,13 @@ private:
     void reset(std::size_t limit_bytes) noexcept;
   };
   CommitScratch commit_scratch_;
+  // Raised by store_head whenever the head is replaced by a state that may
+  // not descend from it: after a failed flush the head goes back to the
+  // published state, and resume() builds on that. A write path prepared in a
+  // version is replayed only on its descendants (TransientBlindBTree::route),
+  // so a plan's paths are used only if this has not moved since they were
+  // prepared. apply_batch reads it before it loads the head.
+  std::atomic<std::uint64_t> head_generation_{0};
   mutable Counters counters_;
   // Bookmarks for changes_since to enter a file near from_sequence (#443).
   // Shared with every ChangeIterator, which hands it the bookmarks it lays and
@@ -1906,6 +1931,12 @@ public:
   // fdatasync. Lets a test hold a flush in flight while other writers
   // append behind it.
   std::function<void()> test_before_flush_sync_;
+  // Called by apply_batch on the writer's thread once the plan is resolved
+  // and its write paths prepared, before it joins a batch.
+  std::function<void()> test_after_prepare_;
+  // Called by apply_batch on the writer's thread while it still holds the
+  // head its write paths were prepared in.
+  std::function<void()> test_while_preparing_;
   // Called by store_state on the publishing thread between the state store
   // and the state_gen_ bump, while publishing_ is raised. Lets a test hold a
   // publication in that gap.
@@ -1953,6 +1984,9 @@ public:
   bool test_resolve_by_key_{false};
   // Checks every plan in a pass of its own, as before apply_puts_checked.
   bool test_two_pass_{false};
+  // Prepares no write paths, so every write descends by key, as before
+  // paths were prepared outside the section.
+  bool test_no_paths_{false};
   // Called on the state open or resume() is about to validate, so a test can
   // break it and drive the cold-path consistency checks through their real
   // callers. Static: open has no DB to hang a hook on yet. A plain pointer,
@@ -2255,6 +2289,22 @@ private:
     return i < snap_entries_.size() ? snap_entries_[i] : kNone;
   }
 
+  // Finds, in `head`, where each point write's key goes, on the caller's
+  // thread before the plan joins a batch, so the section can replay the
+  // path instead of descending by key (PreparedPath): every put and every
+  // resolved delete, and for a put not resolved to an entry (an insert, or
+  // any put of a plan without a snapshot) its place in the leaf, which costs
+  // the read the section would otherwise make. Keeps no reference to `head`
+  // (see PreparedPath). `generation` is DB::head_generation_ as read before
+  // `head` was loaded.
+  void prepare_paths(const EngineState &head, std::uint64_t generation);
+  // Write i's prepared path, or null.
+  [[nodiscard]] auto path(std::size_t i) const -> const PreparedPath * {
+    // paths_ is empty or parallel to writes_.
+    if (paths_.empty()) return nullptr;
+    return paths_[i].leaf != 0 ? &paths_[i] : nullptr;
+  }
+
   std::optional<Snapshot> snap_;
   SizeLimits limits_;
   std::vector<WriteOp> writes_;
@@ -2262,6 +2312,9 @@ private:
   std::vector<RangeGuard> range_guards_;
   // Parallel to writes_ once resolve_snapshot_entries ran; empty otherwise.
   std::vector<std::optional<KeyDirEntry>> snap_entries_;
+  // Parallel to writes_ once prepare_paths ran; empty otherwise.
+  std::vector<PreparedPath> paths_;
+  std::uint64_t paths_generation_{0};
   friend class DB;
   friend class TransientEngineState;
 };

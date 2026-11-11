@@ -1,0 +1,18 @@
+Write paths found in a head the engine has gone back from are replayed on
+the resumed tree, which does not descend from it: a leaf there can hold a
+narrower range than the path saw (#754).
+Guarded-by: "write paths: a plan prepared in a head that resume() dropped goes by key"
+
+diff --git a/bytecaskdb/db_commit.cpp b/bytecaskdb/db_commit.cpp
+index c2754ba7..88fa779d 100644
+--- a/bytecaskdb/db_commit.cpp
++++ b/bytecaskdb/db_commit.cpp
+@@ -106,7 +106,7 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
+   // Paths found in a head the engine has since gone back from name leaves
+   // of a tree this transient does not descend from: the plan drops them
+   // and goes by key.
+-  if (slot.plan.paths_generation_ != head_generation_.load()) {
++  if (slot.plan.paths_generation_ != slot.plan.paths_generation_) {
+     if (!slot.plan.paths_.empty()) {
+       counters_.write_paths_stale.fetch_add(1, std::memory_order_relaxed);
+       slot.plan.paths_.clear();

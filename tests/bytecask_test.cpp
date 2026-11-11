@@ -12151,6 +12151,9 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.group_writer_batches",
       "bytecask.group_writer_coalesced",
       "bytecask.write_check_fallbacks",
+      "bytecask.write_paths_replayed",
+      "bytecask.write_paths_missed",
+      "bytecask.write_paths_stale",
       "bytecask.group_writer_busy_us",
       "bytecask.file_rotations",
       "bytecask.fsyncs",
@@ -13428,6 +13431,202 @@ auto blocked_count(const bytecask::DB &db) -> std::int64_t {
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Write paths: apply_batch finds each write's place in the head before the
+// plan joins a batch, and the section replays it while it still leads to the
+// key's leaf (docs/bytecask_design.md, *Write paths prepared before the
+// section*). Paths found in a head that resume() dropped are not replayed.
+// ---------------------------------------------------------------------------
+
+namespace {
+auto path_stat(bytecask::DB &db, const char *name) -> std::int64_t {
+  return db.stats().at(std::string{"bytecask.write_paths_"} + name);
+}
+}  // namespace
+
+// One-write plans without a snapshot overwrite keys present when their path
+// was prepared: the section replaces them where the path found them and
+// takes the displaced record's value size from that read, so the file stats
+// must still match what recovery rebuilds from the files.
+TEST_CASE("write paths: overwrites replaced where their path found the key "
+          "keep the file stats recovery rebuilds", "[bytecask][write_paths]") {
+  TempDir td;
+  const auto path = td.path / "db";
+  const bytecask::Options opts{.max_file_bytes = 8 * 1024};
+  std::vector<FileStatsTuple> before;
+  std::map<std::string, std::string> kv;
+  {
+    auto db = bytecask::DB::open(path, opts);
+    std::mt19937_64 rng{7};
+    for (int i = 0; i < 200; ++i) {
+      const auto k = std::format("k{:03d}", i);
+      (void)db.put({.sync = false}, to_bytes(k), to_bytes(std::string(10, 'a')));
+    }
+    const auto routed = path_stat(db, "replayed");
+    for (int i = 0; i < 2000; ++i) {
+      const auto k = std::format("k{:03d}", rng() % 200);
+      const auto v = std::string(1 + rng() % 200, static_cast<char>('a' + rng() % 26));
+      bytecask::WritePlan plan;
+      plan.put(to_bytes(k), to_bytes(v));
+      plan.put(to_bytes(std::format("n{:05d}", i)), to_bytes("v"));
+      REQUIRE(db.apply_batch({.sync = false}, std::move(plan)));
+    }
+    if constexpr (bytecask::kKeyDirReadsKeys)
+      CHECK(path_stat(db, "replayed") > routed + 2000);
+    kv = collect_kv(db);
+    before = collect_file_stats(db);
+  }
+  auto db = bytecask::DB::open(path, opts);
+  CHECK(collect_kv(db) == kv);
+  auto after = collect_file_stats(db);
+  std::erase_if(after, [](const auto &v) { return std::get<1>(v) == 0; });
+  CHECK(after == before);
+}
+
+// The writer's paths are found in the head that holds a write whose
+// fdatasync then fails. resume() goes back to the published state and
+// replays the file onto it: a tree that does not descend from that head, so
+// none of the paths may be replayed there.
+TEST_CASE("write paths: a plan prepared in a head that resume() dropped "
+          "goes by key", "[bytecask][write_paths][degraded][concurrency]") {
+  TempDir td;
+  const auto path = td.path / "db";
+  std::map<std::string, std::string> expected;
+  {
+    auto db = bytecask::DB::open(path);
+    for (int i = 0; i < 300; ++i) {
+      const auto k = std::format("k{:04d}", i * 2);
+      (void)db.put({.sync = false}, to_bytes(k), to_bytes("v0"));
+      expected[k] = "v0";
+    }
+    FlushGate in_sync;
+    db.test_before_flush_sync_ = in_sync.hook();
+    std::thread failing([&] {
+      // The lone writer takes the flush role: its own fdatasync fails.
+      bytecask::testing::ScopedFaultInjector fail_sync{"io_data_file_sync"};
+      CHECK_THROWS_AS(
+          db.put({.sync = true}, to_bytes("k0101"), to_bytes("lost?")),
+          std::system_error);
+    });
+    in_sync.wait_in_flush();  // its put is in the head, unsynced
+
+    FlushGate prepared;
+    db.test_after_prepare_ = prepared.hook();
+    std::optional<bytecask::CommitResult> result;
+    std::thread writer([&] {
+      bytecask::WritePlan plan{db.snapshot()};
+      plan.put(to_bytes("k0100"), to_bytes("v1"));  // an update
+      plan.put(to_bytes("k0103"), to_bytes("v1"));  // inserts
+      plan.put(to_bytes("k0105"), to_bytes("v1"));
+      plan.del(to_bytes("k0200"));
+      result = db.apply_batch({.sync = false}, std::move(plan));
+    });
+    prepared.wait_in_flush();  // paths prepared in that head
+
+    in_sync.open();
+    failing.join();
+    db.test_before_flush_sync_ = nullptr;
+    const auto degraded = db.is_degraded();
+    if (degraded) CHECK_NOTHROW(db.resume());
+    const auto replayed = path_stat(db, "replayed");
+    prepared.open();
+    writer.join();
+    db.test_after_prepare_ = nullptr;
+    REQUIRE(degraded);
+    REQUIRE(result.has_value());
+    CHECK(path_stat(db, "stale") == (bytecask::kKeyDirReadsKeys ? 1 : 0));
+    CHECK(path_stat(db, "replayed") == replayed);
+    expected["k0100"] = "v1";
+    expected["k0103"] = "v1";
+    expected["k0105"] = "v1";
+    expected.erase("k0200");
+    auto got = collect_kv(db);
+    got.erase("k0101");  // the failed write: replayed by resume() or not
+    CHECK(got == expected);
+  }
+  auto db = bytecask::DB::open(path);
+  auto got = collect_kv(db);
+  got.erase("k0101");
+  CHECK(got == expected);
+}
+
+// A writer preparing its paths holds the head it loaded, built on a write
+// whose fdatasync then fails. Until it lets go the published state cannot
+// be derived from, so resume() waits for it, however long, and succeeds
+// once it does: it never fails for another writer's sake.
+TEST_CASE("resume: waits for a writer still holding a head built on the "
+          "failed write", "[bytecask][write_paths][degraded][concurrency]") {
+  if constexpr (!bytecask::kKeyDirReadsKeys)
+    SKIP("writers prepare no paths, so they hold no head");
+  TempDir td;
+  const auto path = td.path / "db";
+  std::map<std::string, std::string> expected;
+  {
+    auto db = bytecask::DB::open(path);
+    for (int i = 0; i < 300; ++i) {
+      const auto k = std::format("k{:04d}", i * 2);
+      (void)db.put({.sync = false}, to_bytes(k), to_bytes("v0"));
+      expected[k] = "v0";
+    }
+    FlushGate in_sync;
+    db.test_before_flush_sync_ = in_sync.hook();
+    std::thread failing([&] {
+      bytecask::testing::ScopedFaultInjector fail_sync{"io_data_file_sync"};
+      CHECK_THROWS_AS(
+          db.put({.sync = true}, to_bytes("k0101"), to_bytes("lost?")),
+          std::system_error);
+    });
+    in_sync.wait_in_flush();  // its put is in the head, unsynced
+
+    FlushGate preparing;
+    db.test_while_preparing_ = preparing.hook();
+    bool committed = false;
+    std::thread writer([&] {
+      bytecask::WritePlan plan{db.snapshot()};
+      plan.put(to_bytes("k0103"), to_bytes("v1"));
+      try {
+        committed = db.apply_batch({.sync = false}, std::move(plan)).has_value();
+      } catch (const bytecask::DbDegraded &) {
+      }
+    });
+    preparing.wait_in_flush();  // holding that head
+
+    in_sync.open();
+    failing.join();
+    db.test_before_flush_sync_ = nullptr;
+    REQUIRE(db.is_degraded());
+
+    std::atomic<bool> resumed{false};
+    std::exception_ptr resume_error;
+    std::thread resumer([&] {
+      try {
+        db.resume();
+      } catch (...) {
+        resume_error = std::current_exception();
+      }
+      resumed = true;
+    });
+    // resume() waits while the writer holds the head.
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    CHECK_FALSE(resumed.load());
+    CHECK(db.is_degraded());
+    preparing.open();
+    resumer.join();
+    CHECK(resume_error == nullptr);
+    CHECK_FALSE(db.is_degraded());
+    writer.join();
+    db.test_while_preparing_ = nullptr;
+    if (committed) expected["k0103"] = "v1";
+    auto got = collect_kv(db);
+    got.erase("k0101");  // the failed write: replayed by resume() or not
+    CHECK(got == expected);
+  }
+  auto db = bytecask::DB::open(path);
+  auto got = collect_kv(db);
+  got.erase("k0101");
+  CHECK(got == expected);
+}
 
 // The periodic sync of a caller that writes with sync=false: while a
 // synced commit's fdatasync is in flight, a sync-only write waits behind it
@@ -14756,6 +14955,12 @@ TEST_CASE("commit group: groups of plans commit, conflict and recover as the "
     snaps.clear();
     CHECK(commits > 300);
     CHECK(conflicts > 50);
+    // Slots after the first in a group find their paths changed by the
+    // slots before them, so paths are replayed and missed.
+    if constexpr (bytecask::kKeyDirReadsKeys) {
+      CHECK(db.stats().at("bytecask.write_paths_replayed") > 0);
+      CHECK(db.stats().at("bytecask.write_paths_missed") > 0);
+    }
     std::map<std::string, std::string> expected;
     for (const auto &[k, vs] : model) expected[k] = vs.first;
     REQUIRE(collect_kv(db) == expected);

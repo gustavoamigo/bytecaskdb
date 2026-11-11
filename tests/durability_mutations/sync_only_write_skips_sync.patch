@@ -4,14 +4,14 @@ durable. Reverts #192.
 Guarded-by: "apply_batch: an empty sync plan makes earlier unsynced writes*"
 
 diff --git a/bytecaskdb/db_commit.cpp b/bytecaskdb/db_commit.cpp
-index 07f87ad..d890fc7 100644
+index ebfd0ed5..28a44616 100644
 --- a/bytecaskdb/db_commit.cpp
 +++ b/bytecaskdb/db_commit.cpp
-@@ -191,7 +191,6 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
+@@ -268,7 +268,6 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
        if (slot.result) slot.result->durable = slot.sync_through == 0;
      }
      if (sync_only_pending) {
 -      t.note_sync_requested(head_last_seq);
-       store_head(std::move(t).persistent());
+       advance_head(std::move(t).persistent());
      }
      return batch.size();

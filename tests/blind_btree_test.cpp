@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -64,6 +65,7 @@ struct MemResolver {
 using SmallTree = bytecask::PersistentBlindBTree<640>;
 using Tree = bytecask::PersistentBlindBTree<bytecask::kBlindLeafBytes>;
 using SmallLeaf = bd::Leaf<640>;
+using SmallTransient = bytecask::TransientBlindBTree<640>;
 
 auto to_string(std::span<const std::byte> bytes) -> std::string {
   std::string s(bytes.size(), '\0');
@@ -949,4 +951,310 @@ TEST_CASE("blind tree: bulk load spreads leaf fill over a range", "[blind]") {
   }
   CHECK(short_leaves <= 1);
   CHECK(sizes.size() > 5); // spread, not one size
+}
+
+// ---------------------------------------------------------------------------
+// Paths prepared in one version, replayed on a later one (PreparedPath,
+// TransientBlindBTree::route; docs/blind_leaf_btree_design.md, *Paths
+// prepared before the write lock*). A path write must decide exactly what
+// the keyed write decides; only how it reaches the leaf differs.
+// ---------------------------------------------------------------------------
+
+namespace {
+struct PathOp {
+  enum Kind { kUpsert, kReplaceAt, kEraseAt } kind;
+  std::string key;
+  BlindRef at{};  // kReplaceAt, kEraseAt: the record the key had at P
+  bytecask::PreparedPath path;
+};
+}  // namespace
+
+// Plans of updates and erases by location, and of inserts placed at P, are
+// prepared in a version P. Other writes then change the tree (inserts that
+// split leaves, erases that empty them, overwrites), and the plans are
+// applied, each with its own PathFollow, interleaved with more keyed writes.
+// Every outcome and the final tree must match std::map, the tree must stay
+// valid, and paths must both replay and miss.
+TEST_CASE("blind tree model: writes down paths prepared in an earlier "
+          "version decide what writes by key decide", "[blind][model]") {
+  const auto seed = GENERATE(1u, 2u, 3u, 4u);
+  CAPTURE(seed);
+  std::mt19937_64 rng{seed};
+  const auto foreign = foreign_nodes();
+  MemResolver res;
+  std::map<std::string, BlindRef> model;
+  SmallTree t;
+  const auto always = [](const BlindRef &, const BlindRef &) { return true; };
+  std::uint32_t up = 0;
+  std::uint32_t down = 0xFFFFFF;
+  const auto key = [&] {
+    return shaped_key(rng, static_cast<int>(rng() % 4), up, down);
+  };
+  const auto keyed_write = [&](SmallTransient &tr) {
+    const auto k = !model.empty() && rng() % 3 == 0
+                       ? std::next(model.begin(), static_cast<std::ptrdiff_t>(
+                                                      rng() % model.size()))
+                             ->first
+                       : key();
+    if (rng() % 3 == 0) {
+      const auto erased = tr.erase(to_bytes(k), res);
+      REQUIRE(erased.has_value() == model.contains(k));
+      model.erase(k);
+    } else {
+      const auto ref = model.contains(k) ? res.fresh(k) : res.ref(k);
+      (void)tr.upsert(to_bytes(k), ref, res, always);
+      model[k] = ref;
+    }
+  };
+  {
+    auto tr = t.transient();
+    for (int i = 0; i < 400; ++i) keyed_write(tr);
+    t = std::move(tr).persistent();
+  }
+  bytecask::PathStats stats;
+  for (int batch = 0; batch < 60; ++batch) {
+    // P: the version the plans prepare their paths in, pinned until they
+    // are applied.
+    const auto p = t;
+    std::vector<std::vector<PathOp>> plans(1 + rng() % 6);
+    for (auto &plan : plans) {
+      const auto n = 1 + rng() % 8;
+      for (std::size_t i = 0; i < n; ++i) {
+        // Mostly keys near each other, so a plan's writes share leaves.
+        const auto k = !model.empty() && rng() % 2 == 0
+                           ? std::next(model.begin(),
+                                       static_cast<std::ptrdiff_t>(
+                                           rng() % model.size()))
+                                 ->first
+                           : key();
+        PathOp op{PathOp::kUpsert, k, {}, {}};
+        if (model.contains(k) && rng() % 3 != 0) {
+          op.kind = rng() % 4 == 0 ? PathOp::kEraseAt : PathOp::kReplaceAt;
+          op.at = model[k];
+        }
+        p.prepare_path(to_bytes(k), res, op.kind == PathOp::kUpsert, op.path);
+        plan.push_back(std::move(op));
+      }
+    }
+    // Other commits between P and the plans' section.
+    if (rng() % 4 != 0) {
+      auto tr = t.transient();
+      const auto n = rng() % 60;
+      for (std::size_t i = 0; i < n; ++i) keyed_write(tr);
+      t = std::move(tr).persistent();
+    }
+    auto tr = t.transient();
+    for (auto &plan : plans) {
+      bytecask::PathFollow follow;
+      for (auto &op : plan) {
+        const auto &k = op.key;
+        const bool current = model.contains(k) && model[k] == op.at;
+        switch (op.kind) {
+        case PathOp::kUpsert: {
+          const auto ref = model.contains(k) ? res.fresh(k) : res.ref(k);
+          const auto displaced =
+              tr.upsert(to_bytes(k), ref, res, always, op.path, follow);
+          REQUIRE(displaced.has_value() == model.contains(k));
+          if (displaced)
+            REQUIRE(*displaced == model[k]);
+          model[k] = ref;
+          break;
+        }
+        case PathOp::kReplaceAt: {
+          const auto to = res.fresh(k);
+          REQUIRE(tr.replace_at(to_bytes(k), op.at, to, op.path, follow) ==
+                  current);
+          if (current)
+            model[k] = to;
+          break;
+        }
+        case PathOp::kEraseAt:
+          REQUIRE(tr.erase_at(to_bytes(k), op.at, op.path, follow) == current);
+          if (current)
+            model.erase(k);
+          break;
+        }
+        REQUIRE(tr.size() == model.size());
+      }
+      // Another slot of the group, applied by key.
+      if (rng() % 3 == 0) keyed_write(tr);
+    }
+    stats.replayed += tr.path_stats().replayed;
+    stats.missed += tr.path_stats().missed;
+    t = std::move(tr).persistent();
+    t.validate(res);
+    for (const auto &[k, v] : model)
+      REQUIRE(t.get(to_bytes(k), res) == v);
+    std::vector<std::string> want;
+    for (const auto &[k, v] : model)
+      want.push_back(k);
+    REQUIRE(keys_of(t, res) == want);
+  }
+  CAPTURE(stats.replayed, stats.missed);
+  CHECK(stats.replayed > 150);
+  CHECK(stats.missed > 150);
+  check_accounting(foreign, {&t});
+}
+
+// The three routes, one at a time. A path reaches its own leaf while that
+// leaf is unchanged; after the plan's own write it reaches the copy that
+// write made, but only until any other write runs; after a split it
+// reaches neither and the write goes by key.
+TEST_CASE("blind tree: a path is replayed to its leaf, or to the plan's copy "
+          "of it until another write, and missed after a split", "[blind]") {
+  MemResolver res;
+  SmallTree t;
+  const auto always = [](const BlindRef &, const BlindRef &) { return true; };
+  {
+    // Even keys, shuffled: leaves split in halves and keep room.
+    std::vector<std::uint32_t> even;
+    for (std::uint32_t i = 0; i < 200; i += 2) even.push_back(i);
+    std::ranges::shuffle(even, std::mt19937_64{5});
+    auto tr = t.transient();
+    for (const auto i : even)
+      tr.set(to_bytes(counter_key(i)), res.ref(counter_key(i)), res);
+    t = std::move(tr).persistent();
+  }
+  const auto prepare = [&](const SmallTree &v, std::uint32_t i) {
+    bytecask::PreparedPath p;
+    v.prepare_path(to_bytes(counter_key(i)), res, true, p);
+    REQUIRE(p.leaf != 0);
+    REQUIRE(p.pos.has_value());
+    REQUIRE_FALSE(p.pos->exact);  // odd keys are absent
+    return p;
+  };
+  const auto insert = [&](SmallTransient &tr, std::uint32_t i,
+                          const bytecask::PreparedPath &p,
+                          bytecask::PathFollow &f) {
+    const auto before = tr.path_stats();
+    res.reads = 0;
+    REQUIRE_FALSE(tr.upsert(to_bytes(counter_key(i)), res.ref(counter_key(i)),
+                            res, always, p, f)
+                      .has_value());
+    return std::pair{tr.path_stats().replayed - before.replayed,
+                     res.reads};
+  };
+  const auto p = t;
+  // Three keys in one leaf, and one far away.
+  const auto p41 = prepare(p, 41);
+  const auto p43 = prepare(p, 43);
+  const auto p45 = prepare(p, 45);
+  const auto p151 = prepare(p, 151);
+  REQUIRE(p41.leaf == p43.leaf);
+  REQUIRE(p43.leaf == p45.leaf);
+  REQUIRE(p151.leaf != p41.leaf);
+
+  auto tr = t.transient();
+  bytecask::PathFollow f;
+  // Unchanged leaf: replayed, placed where P said, no read.
+  CHECK(insert(tr, 41, p41, f) == std::pair{std::uint64_t{1}, std::size_t{0}});
+  // The plan's own copy of that leaf, just written: followed, placed by a read.
+  CHECK(insert(tr, 43, p43, f).first == 1);
+  // Any other write in between ends the follow: by key.
+  bytecask::PathFollow other;
+  CHECK(insert(tr, 151, p151, other).first == 1);
+  CHECK(insert(tr, 45, p45, f).first == 0);
+  t = std::move(tr).persistent();
+  t.validate(res);
+
+  // A key present at P, overwritten in its unchanged leaf: replaced where the
+  // path found it, with no read, displacing the record it found.
+  {
+    const auto p42_version = t;
+    bytecask::PreparedPath p42;
+    p42_version.prepare_path(to_bytes(counter_key(42)), res, true, p42);
+    REQUIRE(p42.pos.has_value());
+    REQUIRE(p42.pos->exact);
+    auto ow = t.transient();
+    bytecask::PathFollow fo;
+    res.reads = 0;
+    const auto displaced =
+        ow.upsert(to_bytes(counter_key(42)), res.fresh(counter_key(42)), res,
+                  always, p42, fo);
+    CHECK(res.reads == 0);
+    REQUIRE(displaced.has_value());
+    CHECK(*displaced == p42.found);
+    CHECK(p42.displaced_found(*displaced));
+    t = std::move(ow).persistent();
+    t.validate(res);
+  }
+
+  // A split replaces the leaf: a path prepared before it misses.
+  const auto before_split = t;
+  const auto p47 = prepare(before_split, 47);
+  {
+    auto split = t.transient();
+    // Keys between 40 and 41: more than a leaf holds, in that leaf.
+    for (std::uint32_t i = 0; i < 120; ++i) {
+      const auto k = counter_key(40) + std::string(1, static_cast<char>(i));
+      split.set(to_bytes(k), res.ref(k), res);
+    }
+    t = std::move(split).persistent();
+  }
+  auto tr2 = t.transient();
+  bytecask::PathFollow f2;
+  CHECK(insert(tr2, 47, p47, f2).first == 0);
+  t = std::move(tr2).persistent();
+  t.validate(res);
+  CHECK(t.get(to_bytes(counter_key(47)), res).has_value());
+}
+
+// A path's leaf may be freed before the path is replayed: a later commit
+// copies it, and the last version holding it is released. Its memory then
+// goes to another node, here the copy of the same leaf, at the same address
+// with different contents. The path must not take that node for its leaf:
+// the tag tells them apart, and the write goes by key.
+TEST_CASE("blind tree: a path whose leaf was freed and its memory reused is "
+          "not replayed", "[blind]") {
+  MemResolver res;
+  SmallTree t;
+  {
+    std::vector<std::uint32_t> even;
+    for (std::uint32_t i = 0; i < 200; i += 2) even.push_back(i);
+    std::ranges::shuffle(even, std::mt19937_64{7});
+    auto tr = t.transient();
+    for (const auto i : even)
+      tr.set(to_bytes(counter_key(i)), res.ref(counter_key(i)), res);
+    t = std::move(tr).persistent();
+  }
+  bytecask::PreparedPath path;
+  t.prepare_path(to_bytes(counter_key(41)), res, true, path);
+  REQUIRE(path.pos.has_value());
+  REQUIRE_FALSE(path.pos->exact);
+  // Each commit rewrites key 40 in place, copying its leaf (41's), and
+  // releases the version before it, freeing the copy that version held.
+  // The pool hands freed node memory out again; stop once the leaf's
+  // current copy sits where the prepared leaf was.
+  bool reused = false;
+  for (int i = 0; i < 5000 && !reused; ++i) {
+    auto tr = t.transient();
+    const auto k = counter_key(40);
+    const auto from = res.ref(k);
+    const auto to = res.fresh(k);
+    REQUIRE(tr.replace_at(to_bytes(k), from, to));
+    t = std::move(tr).persistent();
+    bytecask::PreparedPath now;
+    t.prepare_path(to_bytes(counter_key(41)), res, true, now);
+    REQUIRE(now.leaf_tag != path.leaf_tag);
+    reused = now.leaf == path.leaf;
+  }
+  // Whether freed memory comes back at that address depends on the
+  // allocator's order, which differs between builds (the pool's batches,
+  // ASan's quarantine, coverage instrumentation). The release build reaches
+  // it; a build that never does has nothing to check.
+  if (!reused)
+    SKIP("node memory was not reused at the prepared leaf's address");
+  auto tr = t.transient();
+  bytecask::PathFollow f;
+  REQUIRE_FALSE(tr.upsert(to_bytes(counter_key(41)), res.ref(counter_key(41)),
+                          res, [](const BlindRef &, const BlindRef &) {
+                            return true;
+                          },
+                          path, f)
+                    .has_value());
+  CHECK(tr.path_stats().replayed == 0);
+  CHECK(tr.path_stats().missed == 1);
+  t = std::move(tr).persistent();
+  t.validate(res);
+  CHECK(t.get(to_bytes(counter_key(41)), res).has_value());
 }

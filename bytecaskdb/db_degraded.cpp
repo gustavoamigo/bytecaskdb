@@ -5,6 +5,7 @@
 
 module;
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -16,6 +17,7 @@ module;
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 #ifdef BYTECASK_TESTING
@@ -71,6 +73,15 @@ void DB::resume() {
   // the end of the barrier — and the resumed state is derived from the
   // published one with those heads already reclaimed.
   store_head(current);
+  // Writers preparing their write paths hold the head they loaded outside
+  // write_mu_, so a head built on the failed flush can outlive the store
+  // above for the length of one prepare, and until it is gone the published
+  // state cannot be derived from. Wait for them however long they take:
+  // writers are refused at entry while the engine is degraded, so no new
+  // holder appears, and each lets go without resume(), write_mu_ or the
+  // flush role (see "Holders of the head" in docs/bytecask_design.md).
+  while (current->key_dir.has_successor())
+    std::this_thread::sleep_for(std::chrono::microseconds{50});
 
   // resume() seals the active file like a rotation does.
   wait_for_hint_backlog();

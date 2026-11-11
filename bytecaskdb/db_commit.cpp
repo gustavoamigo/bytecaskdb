@@ -103,6 +103,15 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
     next_offset += entry_size(entries[i].key.size(), entries[i].value.size());
   }
 
+  // Paths found in a head the engine has since gone back from name leaves
+  // of a tree this transient does not descend from: the plan drops them
+  // and goes by key.
+  if (slot.plan.paths_generation_ != head_generation_.load()) {
+    if (!slot.plan.paths_.empty()) {
+      counters_.write_paths_stale.fetch_add(1, std::memory_order_relaxed);
+      slot.plan.paths_.clear();
+    }
+  }
   if (!checked ||
       !t.apply_puts_checked(slot.plan, offsets, scratch.undo)) {
     // A put the descents could not confirm leaves the plan unapplied: check
@@ -230,6 +239,11 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
     any_sync |= slot.opts.sync;
   }
   batch = batch.first(taken);
+  const auto paths = kd_path_stats(t.key_dir_);
+  counters_.write_paths_replayed.fetch_add(
+      static_cast<std::int64_t>(paths.replayed), std::memory_order_relaxed);
+  counters_.write_paths_missed.fetch_add(
+      static_cast<std::int64_t>(paths.missed), std::memory_order_relaxed);
 
   // A sync slot that appended nothing (an empty, guard-only or no-op plan)
   // still makes the promise every sync=true write makes: on return, every
@@ -256,7 +270,7 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
     }
     if (sync_only_pending) {
       t.note_sync_requested(head_last_seq);
-      store_head(std::move(t).persistent());
+      advance_head(std::move(t).persistent());
     }
     return batch.size();
   }
@@ -326,7 +340,7 @@ void DB::commit_appended(TransientEngineState &t,
 
   if (!t.is_rotation_needed(rotation_threshold_)) {
     assert(t.active_file().size() <= rotation_threshold_);
-    store_head(std::move(t).persistent());
+    advance_head(std::move(t).persistent());
     // durable is filled in by commit_wait once the flush covering this
     // batch has landed.
     return;

@@ -194,6 +194,14 @@ public:
     destroy_all(to_free);
   }
 
+  // Whether a version has been derived from `id` and is still reachable:
+  // while one is, `id` cannot be derived from again (publish throws). The
+  // caller holds a handle to `id`.
+  [[nodiscard]] auto has_successor(std::uint64_t id) -> bool {
+    std::lock_guard<std::mutex> lk{mu_};
+    return find(id)->successor != 0;
+  }
+
   void pin(std::uint64_t id) {
     std::lock_guard<std::mutex> lk{mu_};
     ++find(id)->live;
