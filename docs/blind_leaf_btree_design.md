@@ -966,7 +966,9 @@ sections above describe in full:
   data file API reads an entry given its value size, and every live-bytes
   update already has the key length.
 - **Records not yet written** are resolved from `TransientEngineState`'s
-  `pending_` map, filled as each put or ingested put is applied.
+  `pending_` records, filled as each put or ingested put is applied: a
+  vector sorted by location, whose keys borrow the plan's or the ingested
+  entry's bytes.
 - **Recovery builds the B+ tree and converts it** (`key_dir_from_recovered`).
 - `DB::get` takes the value from the read that confirmed the key.
 

@@ -684,6 +684,48 @@ pool) cost 7–10% on `commit_probe` and 5–9% on sysbench fast-profile
 writes: the serial section stayed as fast, the threads around it slowed,
 and RSS rose 12 MB per thread. The benchmarks now run jemalloc's defaults.
 
+### The serial section's own buffers
+
+After the nodes, the section still allocated for every group: the entry list
+the group appends, each slot's entries and offsets, the append's offsets, the
+undo log of a plan checked in its descents, and a hash-map node plus a key
+copy for every record placed but not yet written (the pending records a key
+directory that reads its keys needs). A `perf` profile of a HammerDB TPROC-C
+cell (16 users, 48 warehouses, 8 GiB buffer pool, glibc `malloc`, a 16-thread
+host) put the allocator at 10.9% of the section's on-CPU samples: 4.1% for
+the entry and offset vectors, 2.7% for the pending records, 1.1% inside
+`apply_puts_checked`, 0.9% for the version chain at publish.
+
+The section now keeps those buffers in `DB::commit_scratch_`, guarded by
+`write_mu_`, and reuses their capacity from group to group:
+
+- `prepare_write` appends a slot's entries straight to the group's list. A
+  slot that then fails (its write-write check, the sequence limit, no file id
+  left) takes them back out before it returns, so only applied slots reach
+  the append (`SlotEntries` in `execute_slot`). Before, a slot's entries were
+  copied to the list only on success; the guard keeps that rule in a
+  destructor, so no failure path can skip it.
+- The pending records are a vector sorted by `file_id << 32 | offset` whose
+  keys borrow the plan's bytes. A group places them at rising offsets, so a
+  put appends. The group's transient borrows the vector and gives it back
+  emptied however the group ends, before its slots return to their writers:
+  no record outlives the plan whose key it names.
+- `apply_puts_checked` takes its undo log from the caller.
+
+`execute_slots` empties every buffer before it releases `write_mu_`, since
+each one holds views into the slots' plans, and frees any grown past
+`Options::thread_scratch_bytes`, the bound a thread's record buffer already
+keeps: a batch of a million writes does not leave its buffers behind.
+
+Measured on HammerDB TPROC-C as above (`bcdboltp`, `AT_INTERVAL` 1,000 ms,
+vacuum off), alternating with `main` in two rounds: alone, −2.6% and −4.7% µs
+per commit and +2.4% and +3.2% NOPM, below the 3% bar in one round. With
+validation and insert positions also moved out of the section (#754), leaving
+it out costs 3.8 and 3.1 µs per commit of the 53.7 the three give together,
+and NOPM 4.1 and 1.5 points, inside the 3.9% spread of the baselines. The
+section's busy share falls as it gets cheaper, so past a few µs the saving
+shows up as idle section time more than as commits.
+
 ## Commit delay
 
 With every commit synced and the disk busy with `fdatasync` back to back,

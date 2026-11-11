@@ -14448,6 +14448,341 @@ TEST_CASE("checked puts: plans checked by their descents commit and conflict "
   CHECK(recovered == stats_before);
 }
 
+TEST_CASE("PendingRecords: records stay sorted by slot, and a slot holds one "
+          "record", "[bytecask][commit_group]") {
+  const std::string k1 = "one";
+  const std::string k2 = "two";
+  const auto key = [](const std::string &s) {
+    return std::as_bytes(std::span{s});
+  };
+  bytecask::PendingRecords p;
+  p.put({.slot = 10, .sequence = 1, .value_size = 3, .key = key(k1)});
+  p.put({.slot = 30, .sequence = 2, .value_size = 4, .key = key(k2)});
+  p.put({.slot = 20, .sequence = 3, .value_size = 5, .key = key(k1)});  // between
+  REQUIRE(p.size() == 3);
+  REQUIRE(p.find(20) != nullptr);
+  CHECK(p.find(20)->sequence == 3);
+  CHECK(p.find(15) == nullptr);
+  CHECK(p.find(31) == nullptr);
+  p.put({.slot = 10, .sequence = 7, .value_size = 9, .key = key(k2)});  // replaces
+  CHECK(p.size() == 3);
+  CHECK(p.find(10)->sequence == 7);
+  CHECK(to_string(p.find(10)->key) == "two");
+  p.erase(20);
+  p.erase(25);   // absent: no change
+  p.erase(100);  // past every record: no change
+  CHECK(p.size() == 2);
+  CHECK(p.find(20) == nullptr);
+  CHECK(p.find(30)->sequence == 2);
+  p.clear();
+  CHECK(p.size() == 0);
+  CHECK(p.find(30) == nullptr);
+}
+
+#ifndef __EMSCRIPTEN__  // threads
+// ---------------------------------------------------------------------------
+// Commit groups: a group's slots are applied in turn into one entry list and
+// written by one append. A slot that fails takes its entries back out, so
+// only what was applied reaches the file (docs/bytecask_design.md, *Commit
+// pipeline*; docs/commit_pipeline_design.md, *The serial section's own
+// buffers*).
+// ---------------------------------------------------------------------------
+
+namespace {
+// Commits plans as one group, in the order given: the first writer leads and
+// holds its batch open until every other plan is queued behind it, one at a
+// time. Returns each plan's result.
+auto commit_as_group(bytecask::DB &db, std::vector<bytecask::WritePlan> plans)
+    -> std::vector<std::optional<bytecask::CommitResult>> {
+  std::vector<std::optional<bytecask::CommitResult>> results(plans.size());
+  if (plans.size() == 1) {
+    results[0] = db.apply_batch({.sync = false}, std::move(plans[0]));
+    return results;
+  }
+  std::mutex mu;
+  std::condition_variable cv;
+  bool leading = false;
+  bool first_batch = true;
+  db.test_write_group().on_batch_start_ = [&] {
+    {
+      std::lock_guard<std::mutex> lk{mu};
+      if (!first_batch) return;
+      first_batch = false;
+      leading = true;
+    }
+    cv.notify_all();
+    db.test_write_group().wait_for_queue_size(plans.size());
+  };
+  std::vector<std::thread> writers;
+  writers.reserve(plans.size());
+  for (std::size_t i = 0; i < plans.size(); ++i) {
+    writers.emplace_back([&, i] {
+      results[i] = db.apply_batch({.sync = false}, std::move(plans[i]));
+    });
+    // Each writer is queued before the next starts. The last needs no wait:
+    // the leader takes the queue as soon as it is full.
+    if (i == 0) {
+      std::unique_lock<std::mutex> lk{mu};
+      cv.wait(lk, [&] { return leading; });
+    } else if (i + 1 < plans.size()) {
+      db.test_write_group().wait_for_queue_size(i + 1);
+    }
+  }
+  for (auto &w : writers) w.join();
+  db.test_write_group().on_batch_start_ = nullptr;
+  return results;
+}
+
+struct LoggedEntry {
+  std::uint64_t sequence;
+  bytecask::EntryType type;
+  std::string key;
+  auto operator==(const LoggedEntry &) const -> bool = default;
+};
+
+// changes_since streams durable entries: an empty sync write makes every
+// earlier one durable first.
+auto change_log(bytecask::DB &db) -> std::vector<LoggedEntry> {
+  (void)db.apply_batch({.sync = true}, bytecask::WritePlan{});
+  std::vector<LoggedEntry> log;
+  auto snap = db.snapshot();
+  for (const auto &e : db.changes_since(snap, 0).entries)
+    log.push_back({e.sequence, e.entry_type, to_string(e.key)});
+  return log;
+}
+}  // namespace
+
+// The middle slot loses its write-write check to the first. Checked in its
+// descents, it fails after its entries are in the group's list; checked in
+// two passes, before. Either way its entries never reach the file: the last
+// slot's sequences follow the first's, and neither changes_since nor a
+// reopen finds the loser's write.
+TEST_CASE("commit group: a slot that fails leaves no entry in the group's "
+          "append", "[bytecask][commit_group][concurrency]") {
+  const auto two_pass = GENERATE(false, true);
+  CAPTURE(two_pass);
+  TempDir td;
+  const auto path = td.path / "db";
+  {
+    auto db = bytecask::DB::open(path);
+    db.test_two_pass_ = two_pass;
+    const auto seed = db.put({.sync = false}, to_bytes("k"), to_bytes("k0"));
+    auto snap_b = db.snapshot();
+    std::vector<bytecask::WritePlan> plans;
+    plans.emplace_back(db.snapshot());
+    plans[0].put(to_bytes("k"), to_bytes("fromA"));
+    plans.emplace_back(std::move(snap_b));
+    plans[1].put(to_bytes("b_new"), to_bytes("fromB"));
+    plans[1].put(to_bytes("k"), to_bytes("fromB"));
+    plans.emplace_back(db.snapshot());
+    plans[2].put(to_bytes("c1"), to_bytes("fromC"));
+    plans[2].put(to_bytes("c2"), to_bytes("fromC"));
+
+    const auto r = commit_as_group(db, std::move(plans));
+    REQUIRE(r[0].has_value());
+    CHECK_FALSE(r[1].has_value());
+    REQUIRE(r[2].has_value());
+    CHECK(db.stats().at("bytecask.group_writer_coalesced") >= 3);
+    const auto a = seed.sequence + 1;
+    CHECK(r[0]->sequence == a);
+    CHECK(r[2]->sequence == a + 4);  // BulkBegin, c1, c2, BulkEnd
+    using enum bytecask::EntryType;
+    const std::vector<LoggedEntry> expected{
+        {seed.sequence, Put, "k"},  {a, Put, "k"},
+        {a + 1, BulkBegin, ""},     {a + 2, Put, "c1"},
+        {a + 3, Put, "c2"},         {a + 4, BulkEnd, ""}};
+    CHECK(change_log(db) == expected);
+    CHECK_FALSE(get_val(db, to_bytes("b_new")).has_value());
+    CHECK(get_str(db, to_bytes("k")) == "fromA");
+  }
+  auto db = bytecask::DB::open(path);
+  CHECK_FALSE(get_val(db, to_bytes("b_new")).has_value());
+  CHECK(get_str(db, to_bytes("k")) == "fromA");
+  CHECK(get_str(db, to_bytes("c2")) == "fromC");
+}
+
+// Groups of snapshot plans (puts, inserts of new keys, deletes, the same key
+// twice, multi-op batches) commit against a model that knows which key each
+// plan's snapshot saw at which sequence. The model, not the engine, decides
+// each outcome: a plan conflicts when a key it writes holds a different live
+// sequence, or none, than at its snapshot, counting the slots before it in
+// its group. Every outcome and sequence must match the model, the change log
+// must hold exactly the committed plans' entries, and serial and parallel
+// recovery must rebuild the contents and the file stats. Inserts in a group
+// place their keys by reading neighbours that earlier slots put but have not
+// written yet (the pending records), and vacuum moves records under the
+// snapshots.
+TEST_CASE("commit group: groups of plans commit, conflict and recover as the "
+          "model says", "[model][commit_group]") {
+  // Vacuum drops dead entries from the files, so with it the change log is
+  // checked to hold only committed entries, each sequence once; without it,
+  // to hold exactly the committed ones.
+  const auto [seed, two_pass, vacuum] =
+      GENERATE(std::tuple{1u, false, false}, std::tuple{2u, true, false},
+               std::tuple{3u, false, true}, std::tuple{4u, true, true});
+  CAPTURE(seed, two_pass, vacuum);
+  TempDir td;
+  const auto path = td.path / "db";
+  const bytecask::Options opts{.max_file_bytes = 16 * 1024};
+  using enum bytecask::EntryType;
+  // Live keys: value and the sequence that put it.
+  std::map<std::string, std::pair<std::string, std::uint64_t>> model;
+  std::vector<LoggedEntry> log;
+  std::vector<FileStatsTuple> stats_before;
+  const auto check_log = [&](const std::vector<LoggedEntry> &found) {
+    if (!vacuum) {
+      CHECK(found.size() == log.size());
+      const auto [f, l] = std::ranges::mismatch(found, log);
+      if (f != found.end()) {
+        CAPTURE(f->sequence, f->key, l == log.end() ? 0 : l->sequence,
+                l == log.end() ? "" : l->key);
+        FAIL_CHECK("the change log differs from the committed entries");
+      }
+      return;
+    }
+    std::set<std::uint64_t> sequences;
+    for (const auto &e : found) {
+      CHECK(sequences.insert(e.sequence).second);
+      const auto it = std::ranges::lower_bound(log, e.sequence, {},
+                                               &LoggedEntry::sequence);
+      CHECK((it != log.end() && *it == e));
+    }
+  };
+  {
+    auto db = bytecask::DB::open(path, opts);
+    db.test_two_pass_ = two_pass;
+    std::mt19937_64 rng{seed};
+    int next_new = 0;
+    const auto key = [&] {
+      return rng() % 4 == 0 ? std::format("n{:05d}", next_new++)
+                            : std::format("k{:02d}", rng() % 24);
+    };
+    const auto value = [&] {
+      return std::string(1 + rng() % 120, static_cast<char>('a' + rng() % 26));
+    };
+    std::uint64_t next_seq = 0;
+    const auto put_outside = [&](const std::string &k, const std::string &v) {
+      const auto r = db.put({.sync = false}, to_bytes(k), to_bytes(v));
+      if (next_seq == 0) next_seq = r.sequence;
+      REQUIRE(r.sequence == next_seq);
+      model[k] = {v, next_seq};
+      log.push_back({next_seq++, Put, k});
+    };
+    for (int i = 0; i < 24; ++i) put_outside(std::format("k{:02d}", i), value());
+
+    // A snapshot with the live sequence of every key it saw.
+    struct Snap {
+      bytecask::Snapshot snap;
+      std::map<std::string, std::uint64_t> seen;
+    };
+    const auto take = [&] {
+      Snap s{db.snapshot(), {}};
+      for (const auto &[k, vs] : model) s.seen[k] = vs.second;
+      return s;
+    };
+    std::vector<Snap> snaps;
+    struct Op {
+      bool del;
+      std::string key;
+      std::string value;
+    };
+    int commits = 0;
+    int conflicts = 0;
+    for (int round = 0; round < 400; ++round) {
+      const auto dice = rng() % 100;
+      if (dice < 8) {
+        put_outside(key(), value());
+        continue;
+      }
+      if (dice < 10 && vacuum) {
+        (void)db.vacuum({.fragmentation_threshold = 0.3});
+        continue;
+      }
+      while (snaps.size() < 6) snaps.push_back(take());
+      const auto n = 1 + rng() % 4;
+      std::vector<bytecask::WritePlan> plans;
+      std::vector<std::vector<Op>> ops(n);
+      std::vector<std::map<std::string, std::uint64_t>> seen(n);
+      for (std::size_t p = 0; p < n; ++p) {
+        const auto i = rng() % snaps.size();
+        seen[p] = std::move(snaps[i].seen);
+        plans.emplace_back(std::move(snaps[i].snap));
+        snaps.erase(snaps.begin() + static_cast<std::ptrdiff_t>(i));
+        const auto count = 1 + rng() % 4;
+        for (std::size_t o = 0; o < count; ++o) {
+          const auto k = o > 0 && rng() % 6 == 0 ? ops[p].back().key : key();
+          if (rng() % 5 == 0) {
+            ops[p].push_back({true, k, {}});
+            plans[p].del(to_bytes(k));
+          } else {
+            ops[p].push_back({false, k, value()});
+            plans[p].put(to_bytes(k), to_bytes(ops[p].back().value));
+          }
+        }
+      }
+      const auto results = commit_as_group(db, std::move(plans));
+      for (std::size_t p = 0; p < n; ++p) {
+        const auto live = [&](const std::string &k) -> std::uint64_t {
+          const auto it = model.find(k);
+          return it == model.end() ? 0 : it->second.second;
+        };
+        const auto at_snap = [&](const std::string &k) -> std::uint64_t {
+          const auto it = seen[p].find(k);
+          return it == seen[p].end() ? 0 : it->second;
+        };
+        const bool conflict = std::ranges::any_of(ops[p], [&](const Op &op) {
+          return live(op.key) != at_snap(op.key);
+        });
+        REQUIRE(results[p].has_value() == !conflict);
+        if (conflict) {
+          ++conflicts;
+          continue;
+        }
+        ++commits;
+        const bool multi = ops[p].size() > 1;
+        if (multi) log.push_back({next_seq++, BulkBegin, ""});
+        for (const auto &op : ops[p]) {
+          if (op.del) {
+            model.erase(op.key);
+          } else {
+            model[op.key] = {op.value, next_seq};
+          }
+          log.push_back({next_seq++, op.del ? Delete : Put, op.key});
+        }
+        if (multi) log.push_back({next_seq++, BulkEnd, ""});
+        REQUIRE(results[p]->sequence == next_seq - 1);
+      }
+    }
+    snaps.clear();
+    CHECK(commits > 300);
+    CHECK(conflicts > 50);
+    std::map<std::string, std::string> expected;
+    for (const auto &[k, vs] : model) expected[k] = vs.first;
+    REQUIRE(collect_kv(db) == expected);
+    check_log(change_log(db));
+    stats_before = collect_file_stats(db);
+  }
+  std::map<std::string, std::string> expected;
+  for (const auto &[k, vs] : model) expected[k] = vs.first;
+  const auto recover = [&](unsigned threads) {
+    const auto copy = td.path / std::format("recovered_{}", threads);
+    std::filesystem::copy(path, copy, std::filesystem::copy_options::recursive);
+    auto o = opts;
+    o.recovery_threads = threads;
+    auto db = bytecask::DB::open(copy, o);
+    CHECK(collect_kv(db) == expected);
+    check_log(change_log(db));
+    auto stats = collect_file_stats(db);
+    // The reopen's own empty active file.
+    std::erase_if(stats, [](const auto &v) { return std::get<1>(v) == 0; });
+    return stats;
+  };
+  const auto serial = recover(1);
+  CHECK(serial == stats_before);
+  CHECK(recover(4) == serial);
+}
+#endif  // __EMSCRIPTEN__
+
 TEST_CASE("pipeline: a writer whose write another thread published sees it "
           "on its next read, even before state_time_ is stored",
           "[pipeline][concurrency]") {

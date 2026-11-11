@@ -221,14 +221,14 @@ auto WritePlan::snapshot_entry(std::size_t i, BytesView key) const
   return kd_get(s.key_dir, key, s.kd_ctx());
 }
 
-auto TransientEngineState::prepare_write(const WritePlan &plan) const
-    -> std::vector<DataEntryView> {
-  std::vector<DataEntryView> entries;
+void TransientEngineState::prepare_write(
+    const WritePlan &plan, std::vector<DataEntryView> &entries) const {
   const auto wc = plan.write_count();
-  if (wc == 0) return entries;
+  if (wc == 0) return;
 
   const bool multi = wc > 1;
-  entries.reserve(multi ? wc + 2 : 1);
+  // No reserve: `entries` is the group's list, and an exact reserve per slot
+  // would reallocate it for every slot. push_back grows it geometrically.
 
   auto seq = next_seq_;
 
@@ -262,8 +262,6 @@ auto TransientEngineState::prepare_write(const WritePlan &plan) const
   if (multi) {
     entries.push_back({seq++, EntryType::BulkEnd, {}, {}});
   }
-
-  return entries;
 }
 
 void TransientEngineState::apply_writes(
@@ -383,17 +381,12 @@ auto TransientEngineState::can_apply_puts_checked(const WritePlan &plan)
 }
 
 auto TransientEngineState::apply_puts_checked(
-    const WritePlan &plan, std::span<const std::uint64_t> offsets) -> bool {
+    const WritePlan &plan, std::span<const std::uint64_t> offsets,
+    std::vector<PutUndo> &undo) -> bool {
   // One per put applied, newest last. `key` points into the plan, which
-  // outlives this call; `undo` does not outlive it.
-  struct Undo {
-    std::span<const std::byte> key;
-    KeyDirEntry now;               // where the plan put the key
-    std::optional<KeyDirHit> was;  // what it replaced; none for an insert
-  };
-  // Reserved up front, so a push never allocates after the descent it
-  // records has changed the tree.
-  std::vector<Undo> undo;
+  // outlives this call. Reserved up front, so a push never allocates after
+  // the descent it records has changed the tree.
+  undo.clear();
   undo.reserve(plan.writes_.size());
 
   const bool multi = plan.write_count() > 1;

@@ -1,0 +1,23 @@
+A slot that fails after prepare_write put its entries in the group's list
+leaves them there, so a write refused by its write-write check reaches the
+file, with sequences the next slot reuses: recovery and changes_since find
+it. Reverts the take-back in execute_slot (#754).
+Guarded-by: "commit group: a slot that fails leaves no entry in the group's append"
+
+diff --git a/bytecaskdb/db_commit.cpp b/bytecaskdb/db_commit.cpp
+index 3e0023c0..f1c06656 100644
+--- a/bytecaskdb/db_commit.cpp
++++ b/bytecaskdb/db_commit.cpp
+@@ -63,11 +63,7 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
+     std::vector<DataEntryView> &list;
+     std::size_t first;
+     bool applied{false};
+-    ~SlotEntries() {
+-      if (!applied)
+-        list.erase(list.begin() + static_cast<std::ptrdiff_t>(first),
+-                   list.end());
+-    }
++    ~SlotEntries() {}
+   } slot_entries{all_entries, all_entries.size()};
+   t.prepare_write(slot.plan, all_entries);
+   const auto entries = std::span{all_entries}.subspan(slot_entries.first);

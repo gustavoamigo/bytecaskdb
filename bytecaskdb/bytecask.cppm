@@ -644,16 +644,24 @@ public:
   // the plan made is undone, and it returns false having changed nothing, for
   // the caller to check and apply the plan in two passes. Guards must have
   // been checked first (validate_preconditions with defer_puts).
+  // `undo` is the caller's buffer, reused across calls: it is cleared here,
+  // and holds views into `plan` once the call returns.
+  struct PutUndo {
+    std::span<const std::byte> key;
+    KeyDirEntry now;               // where the plan put the key
+    std::optional<KeyDirHit> was;  // what it replaced; none for an insert
+  };
   [[nodiscard]] auto apply_puts_checked(const WritePlan &plan,
-                                        std::span<const std::uint64_t> offsets)
-      -> bool;
+                                        std::span<const std::uint64_t> offsets,
+                                        std::vector<PutUndo> &undo) -> bool;
 
-  // Prepare IO plan — pure read, no mutations.
-  // Returns the exact append entries to write: sequence-assigned,
-  // BulkBegin/BulkEnd included for multi-op batches.
-  // Borrows key/value from the WritePlan; the plan must outlive the result.
-  [[nodiscard]] auto prepare_write(const WritePlan &plan) const
-      -> std::vector<DataEntryView>;
+  // Prepare IO plan — pure read, no mutations to the state.
+  // Appends the exact entries to write to `entries`: sequence-assigned,
+  // BulkBegin/BulkEnd included for multi-op batches, none for a plan with
+  // no writes. Borrows key/value from the WritePlan; the plan must outlive
+  // the appended entries.
+  void prepare_write(const WritePlan &plan,
+                     std::vector<DataEntryView> &entries) const;
 
   // State transition: apply all writes from a plan using pre-computed offsets.
   // Cannot fail — pure in-memory mutations.
@@ -771,14 +779,13 @@ private:
     return {nullptr, &files_, &pending_, true, scratch_bytes_};
   }
   // Records a put this transient placed at `offset` of the active file,
-  // before the batch is written. A no-op for key directories that store
-  // their keys.
+  // before the batch is written. `key` must outlive the record (see
+  // PendingRecord). A no-op for key directories that store their keys.
   void note_pending(std::uint64_t offset, std::uint64_t sequence,
                     std::span<const std::byte> key, std::uint32_t value_size) {
     if constexpr (kKeyDirReadsKeys)
-      pending_.insert_or_assign(
-          pending_slot(active_file_id_, offset),
-          PendingRecord{sequence, value_size, {key.begin(), key.end()}});
+      pending_.put({pending_slot(active_file_id_, offset), sequence,
+                    value_size, key});
   }
 
   friend class DB;
@@ -1648,15 +1655,18 @@ private:
   // Writer executors — called by SoloWriter / WriteGroup.
   // Prepares and applies one slot against the transient. Appends nothing:
   // its only I/O is the record reads a key directory that holds no key bytes
-  // needs to place keys and check guards. Appends prepared entries to
-  // all_entries; running_offset is
-  // advanced by the total byte size produced. Returns false on validation
-  // failure (sets slot.result) or when the slot cannot be written (sets
-  // slot.err): its sequences would pass the packed limit, or it would cross
-  // the rotation threshold and no file id is left (can_rotate false).
+  // needs to place keys and check guards. Appends the slot's entries to
+  // scratch.entries, the group's list, only if it succeeds: a slot that
+  // fails leaves the list as it found it. Its other buffers come from
+  // `scratch` too. running_offset is advanced by the total byte size
+  // produced. Returns false on validation failure (sets slot.result) or when
+  // the slot cannot be written (sets slot.err): its sequences would pass the
+  // packed limit, or it would cross the rotation threshold and no file id is
+  // left (can_rotate false).
+  struct CommitScratch;
   auto execute_slot(TransientEngineState &t, EngineSlot &slot,
-                    std::vector<DataEntryView> &all_entries,
-                    std::uint64_t &running_offset, bool can_rotate) -> bool;
+                    CommitScratch &scratch, std::uint64_t &running_offset,
+                    bool can_rotate) -> bool;
   // Executor callback shared by solo_writer_ and write_group_. Runs the
   // batch as consecutive groups, each through execute_group.
   void execute_slots(std::vector<Slot *> &batch);
@@ -1793,6 +1803,20 @@ private:
   std::shared_ptr<BufferPool> pool_;
   SizeLimits size_limits_;
   std::size_t scratch_bytes_;
+  // The commit section's buffers, guarded by write_mu_. They keep their
+  // capacity from batch to batch, so a group allocates nothing for its
+  // entry list, offsets, pending records or undo log (#754). Every view they
+  // hold borrows a slot's plan: execute_slots empties them before the slots
+  // go back to their writers, and frees any grown past scratch_bytes_.
+  struct CommitScratch {
+    std::vector<DataEntryView> entries;   // the group's, in append order
+    std::vector<std::uint64_t> offsets;   // one slot's entries' offsets
+    std::vector<std::uint64_t> io_offsets;
+    PendingRecords pending;               // lent to the group's transient
+    std::vector<TransientEngineState::PutUndo> undo;
+    void reset(std::size_t limit_bytes) noexcept;
+  };
+  CommitScratch commit_scratch_;
   mutable Counters counters_;
   // Bookmarks for changes_since to enter a file near from_sequence (#443).
   // Shared with every ChangeIterator, which hands it the bookmarks it lays and

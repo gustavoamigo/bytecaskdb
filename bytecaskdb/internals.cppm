@@ -16,7 +16,6 @@ module;
 #include <stdexcept>
 #include <string>
 #include <type_traits>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -347,13 +346,60 @@ export class TransientEngineState;
 // written: phase 1 of a commit (validate and apply) runs before the batch's
 // pwritev, so a key directory that reads keys back from the data files must
 // find these in memory. Keyed by file_id << 32 | offset.
+//
+// `key` borrows the bytes of the write that placed the record: a WritePlan's
+// key, or an ingested entry's. Both outlive every read of the record: a plan
+// stays with its slot until the group that applies it ends, and ingest holds
+// its entries for the whole call. The commit section empties the list before
+// its slots go back to their writers (DB::execute_group).
 // ---------------------------------------------------------------------------
 export struct PendingRecord {
+  std::uint64_t slot{0};  // pending_slot(file_id, offset)
   std::uint64_t sequence{0};
   std::uint32_t value_size{0};
-  std::vector<std::byte> key;
+  std::span<const std::byte> key;
 };
-export using PendingRecords = std::unordered_map<std::uint64_t, PendingRecord>;
+
+// Sorted by slot. A batch places its records at rising offsets, so put()
+// appends; a vector kept between groups allocates nothing per record, where a
+// hash map allocated a node and a key copy for each (#754).
+export class PendingRecords {
+public:
+  using value_type = PendingRecord;
+
+  // Adds r, or replaces the record at r.slot.
+  void put(const PendingRecord &r) {
+    if (v_.empty() || v_.back().slot < r.slot) {
+      v_.push_back(r);
+      return;
+    }
+    // r.slot is at most the last record's, so `it` is a record.
+    const auto it = std::ranges::lower_bound(v_, r.slot, {}, &PendingRecord::slot);
+    if (it->slot == r.slot) {
+      *it = r;
+    } else {
+      v_.insert(it, r);
+    }
+  }
+  [[nodiscard]] auto find(std::uint64_t slot) const noexcept
+      -> const PendingRecord * {
+    const auto it = std::ranges::lower_bound(v_, slot, {}, &PendingRecord::slot);
+    return it != v_.end() && it->slot == slot ? &*it : nullptr;
+  }
+  void erase(std::uint64_t slot) noexcept {
+    const auto it = std::ranges::lower_bound(v_, slot, {}, &PendingRecord::slot);
+    if (it != v_.end() && it->slot == slot) v_.erase(it);
+  }
+  void clear() noexcept { v_.clear(); }
+  void swap(PendingRecords &other) noexcept { v_.swap(other.v_); }
+  [[nodiscard]] auto size() const noexcept -> std::size_t { return v_.size(); }
+  [[nodiscard]] auto capacity() const noexcept -> std::size_t {
+    return v_.capacity();
+  }
+
+private:
+  std::vector<PendingRecord> v_;
+};
 
 export inline constexpr auto pending_slot(std::uint32_t file_id,
                                           std::uint64_t offset) noexcept
@@ -601,12 +647,11 @@ export struct KeyReader {
   auto key_at(BlindRef r) -> std::span<const std::byte> {
     last = r;
     if (ctx.pending) {
-      if (auto it = ctx.pending->find(pending_slot(r.file_id, r.offset));
-          it != ctx.pending->end()) {
-        sequence = it->second.sequence;
-        value_size = it->second.value_size;
+      if (const auto *p = ctx.pending->find(pending_slot(r.file_id, r.offset))) {
+        sequence = p->sequence;
+        value_size = p->value_size;
         value = {};
-        return it->second.key;
+        return p->key;
       }
     }
     const auto *f = ctx.file(r.file_id);
