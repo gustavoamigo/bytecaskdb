@@ -2104,7 +2104,7 @@ TEST_CASE("DataFile: a sealed file past 4 GiB keeps its size and its records",
     check(*file);
     // The frame holding the record was admitted, and release_file finds it:
     // a wrapped size counts no frames and frees nothing.
-    pool->release_file(7, file->size());
+    pool->release_file(file->serial(), file->size());
     CHECK(pool->counters().frames_released.load() >= 1);
   }
   std::filesystem::remove(path);

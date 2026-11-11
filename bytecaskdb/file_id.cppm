@@ -33,12 +33,12 @@ export module bytecask.file_id;
 
 namespace bytecask {
 
-// The buffer pool keys a frame by (serial << 20) | frame index, and a file
-// holds at most 2^32 bytes, 2^20 frames of 4 KiB: 44 bits remain for the
-// serial. At a million files a second that is over half a year of a process;
-// a real one creates a few a second.
+// The buffer pool keys a frame by (serial << 22) | frame index (22 bits:
+// 16 GiB of 4 KiB frames, past any record a file can hold), so 42 bits remain
+// for the serial. At a thousand files a second that is 139 years of a
+// process; a real one creates a few a second.
 export inline constexpr std::uint64_t kMaxFileSerial =
-    (std::uint64_t{1} << 44) - 1;
+    (std::uint64_t{1} << 42) - 1;
 
 export class FileIdPool;
 

@@ -391,16 +391,20 @@ private:
   // is always correct — so the reader stops retrying and pays the syscall.
   static constexpr int kMaxRetries = 8;
 
-  // A file holds at most 2^32 bytes (KeyDirEntry's file offset), so 20 bits
-  // index its frames and 44 are left for the serial (kMaxFileSerial).
-  static constexpr unsigned kFrameIndexBits = 20;
-  static_assert((std::uint64_t{kPoolFrameBytes} << kFrameIndexBits) ==
-                (std::uint64_t{1} << 32));
+  // A record starts below 2^32 (KeyDirEntry's file offset) and is at most
+  // kMaxBatchBytes long, so every byte a pool read asks for lies below
+  // 2^33; 22 bits of frame index cover 16 GiB. release_file stops there,
+  // whatever size a file on disk claims.
+  static constexpr unsigned kFrameIndexBits = 22;
+  static constexpr std::uint64_t kMaxFrames = std::uint64_t{1}
+                                              << kFrameIndexBits;
+  static_assert((std::uint64_t{kPoolFrameBytes} << kFrameIndexBits) >=
+                (std::uint64_t{1} << 33));
   static_assert(kMaxFileSerial < (std::uint64_t{1} << (64 - kFrameIndexBits)));
   [[nodiscard]] static auto make_key(std::uint64_t file_key,
                                      std::uint64_t frame_index) noexcept
       -> std::uint64_t {
-    assert(frame_index < (std::uint64_t{1} << kFrameIndexBits));
+    assert(frame_index < kMaxFrames);
     return (file_key << kFrameIndexBits) | frame_index;
   }
   [[nodiscard]] static auto file_of(std::uint64_t key) noexcept
@@ -914,7 +918,8 @@ void FrameLease::reset() noexcept {
 }
 
 void BufferPool::release_file(std::uint64_t file_key, std::uint64_t file_size) {
-  const auto frames = (file_size + kPoolFrameBytes - 1) / kPoolFrameBytes;
+  const auto frames = std::min<std::uint64_t>(
+      (file_size + kPoolFrameBytes - 1) / kPoolFrameBytes, kMaxFrames);
   std::lock_guard<std::mutex> lk{mu_};
   for (std::uint64_t n = 0; n < frames; ++n) {
     const auto i = find(make_key(file_key, n));
