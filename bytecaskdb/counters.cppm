@@ -94,6 +94,11 @@ export struct Counters {
   std::atomic<std::int64_t> write_paths_replayed{0};
   std::atomic<std::int64_t> write_paths_missed{0};
   std::atomic<std::int64_t> write_paths_stale{0};
+  // Plans whose validation, prepared before the section, the section used,
+  // and plans it validated itself: not prepared, refuted at P, or something
+  // they read was written since (RecentWrites).
+  std::atomic<std::int64_t> validations_prepared{0};
+  std::atomic<std::int64_t> validations_in_section{0};
   std::atomic<std::int64_t> file_rotations{0};
   std::atomic<std::int64_t> fsyncs{0};
   // Writers that slept in commit_wait behind an in-flight flush. Zero for

@@ -12154,6 +12154,8 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.write_paths_replayed",
       "bytecask.write_paths_missed",
       "bytecask.write_paths_stale",
+      "bytecask.validations_prepared",
+      "bytecask.validations_in_section",
       "bytecask.group_writer_busy_us",
       "bytecask.file_rotations",
       "bytecask.fsyncs",
@@ -13551,14 +13553,12 @@ TEST_CASE("write paths: a plan prepared in a head that resume() dropped "
   CHECK(got == expected);
 }
 
-// A writer preparing its paths holds the head it loaded, built on a write
+// A writer preparing its plan holds the head it loaded, built on a write
 // whose fdatasync then fails. Until it lets go the published state cannot
 // be derived from, so resume() waits for it, however long, and succeeds
 // once it does: it never fails for another writer's sake.
 TEST_CASE("resume: waits for a writer still holding a head built on the "
           "failed write", "[bytecask][write_paths][degraded][concurrency]") {
-  if constexpr (!bytecask::kKeyDirReadsKeys)
-    SKIP("writers prepare no paths, so they hold no head");
   TempDir td;
   const auto path = td.path / "db";
   std::map<std::string, std::string> expected;
@@ -13625,6 +13625,79 @@ TEST_CASE("resume: waits for a writer still holding a head built on the "
   auto db = bytecask::DB::open(path);
   auto got = collect_kv(db);
   got.erase("k0101");
+  CHECK(got == expected);
+}
+
+// A range guard's scan has no bound, and the writer holds the head through
+// it. resume() waits for it however long it takes, and succeeds once it
+// lets go.
+TEST_CASE("resume: waits for a writer validating range guards",
+          "[bytecask][prepared_validation][degraded][concurrency]") {
+  TempDir td;
+  const auto path = td.path / "db";
+  std::map<std::string, std::string> expected;
+  {
+    auto db = bytecask::DB::open(path);
+    for (int i = 0; i < 300; ++i) {
+      const auto k = std::format("p/{:04d}", i);
+      (void)db.put({.sync = false}, to_bytes(k), to_bytes("v0"));
+      expected[k] = "v0";
+    }
+    FlushGate in_sync;
+    db.test_before_flush_sync_ = in_sync.hook();
+    std::thread failing([&] {
+      bytecask::testing::ScopedFaultInjector fail_sync{"io_data_file_sync"};
+      CHECK_THROWS_AS(
+          db.put({.sync = true}, to_bytes("lost"), to_bytes("?")),
+          std::system_error);
+    });
+    in_sync.wait_in_flush();  // its put is in the head, unsynced
+
+    FlushGate validating;
+    db.test_while_preparing_ = validating.hook();
+    std::optional<bytecask::CommitResult> result;
+    std::thread writer([&] {
+      bytecask::WritePlan plan{db.snapshot()};
+      plan.ensure_range_unchanged(to_bytes("p/"), to_bytes("p0"));
+      plan.put(to_bytes("x"), to_bytes("mine"));
+      result = db.apply_batch({.sync = false}, std::move(plan));
+    });
+    validating.wait_in_flush();  // its range guard validated in that head
+
+    in_sync.open();
+    failing.join();
+    db.test_before_flush_sync_ = nullptr;
+    REQUIRE(db.is_degraded());
+
+    std::atomic<bool> resumed{false};
+    std::exception_ptr resume_error;
+    std::thread resumer([&] {
+      try {
+        db.resume();
+      } catch (...) {
+        resume_error = std::current_exception();
+      }
+      resumed = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    CHECK_FALSE(resumed.load());  // waiting for the writer
+    CHECK(db.is_degraded());
+    validating.open();
+    resumer.join();
+    CHECK(resume_error == nullptr);
+    CHECK_FALSE(db.is_degraded());
+    writer.join();
+    db.test_while_preparing_ = nullptr;
+    REQUIRE(result.has_value());  // nothing in the range changed
+    expected["x"] = "mine";
+    CHECK(db.test_prepared_disagreements_ == 0);
+    auto got = collect_kv(db);
+    got.erase("lost");  // the failed write: replayed by resume() or not
+    CHECK(got == expected);
+  }
+  auto db = bytecask::DB::open(path);
+  auto got = collect_kv(db);
+  got.erase("lost");
   CHECK(got == expected);
 }
 
@@ -14985,6 +15058,663 @@ TEST_CASE("commit group: groups of plans commit, conflict and recover as the "
   const auto serial = recover(1);
   CHECK(serial == stats_before);
   CHECK(recover(4) == serial);
+}
+#endif  // __EMSCRIPTEN__
+
+// ---------------------------------------------------------------------------
+// Validation prepared before the section: apply_batch checks a plan's guards
+// and write-write checks against the published state on the writer's thread,
+// and the section uses that answer unless RecentWrites shows a key it read
+// written since (docs/bytecask_design.md, *Validation prepared before the
+// section*). A key written in between, in another group or earlier in the
+// same one, must send the plan back to the section's own check.
+// ---------------------------------------------------------------------------
+
+namespace {
+auto validation_stat(bytecask::DB &db, const char *name) -> std::int64_t {
+  return db.stats().at(std::string{"bytecask.validations_"} + name);
+}
+
+// The first prepared answer that reads something allocates RecentWrites'
+// table, and the section that finds it starts recording and raises its floor
+// (RecentWrites::verify). Tests of what a later answer sees commit one such
+// plan first.
+void allocate_recent_writes(bytecask::DB &db) {
+  bytecask::WritePlan plan;
+  plan.ensure_absent(to_bytes("__allocate_recent_writes"));
+  plan.put(to_bytes("__allocated"), to_bytes("v"));
+  REQUIRE(db.apply_batch({.sync = false}, std::move(plan)));
+  REQUIRE(db.test_recent_writes().has_table());
+}
+
+// A plan held between its preparation and its batch while `between` runs.
+auto commit_after(bytecask::DB &db, bytecask::WritePlan plan,
+                  const std::function<void()> &between)
+    -> std::optional<bytecask::CommitResult> {
+  FlushGate prepared;
+  db.test_after_prepare_ = prepared.hook();
+  std::optional<bytecask::CommitResult> result;
+  std::thread writer(
+      [&] { result = db.apply_batch({.sync = false}, std::move(plan)); });
+  prepared.wait_in_flush();
+  db.test_after_prepare_ = nullptr;
+  between();
+  prepared.open();
+  writer.join();
+  return result;
+}
+}  // namespace
+
+TEST_CASE("RecentWrites: an answer stands until a key it read is written "
+          "after it, and a floor or a new prefix length sets it aside",
+          "[bytecask][prepared_validation]") {
+  using V = bytecask::RecentWrites::Verdict;
+  const std::string k = "key";
+  const std::string other = "other";
+  const auto bytes = [](const std::string &s) {
+    return std::as_bytes(std::span{s});
+  };
+  bytecask::RecentWrites rw;
+  rw.ensure_table();
+  bytecask::PreparedChecks c;
+  c.held = true;
+  c.writes_checked = true;
+  c.seq = 10;
+  c.probes = {bytecask::key_hash(bytes(k))};
+  const auto write = [&](const std::string &key, std::uint64_t seq) {
+    bytecask::PreparedChecks w;  // not hashed: the section hashes
+    rw.record(w, seq, [&](auto &&f) { f(bytes(key)); });
+  };
+  CHECK(rw.verify(c, false, 10, 0) == V::kUnchanged);
+  write(k, 9);  // before P
+  CHECK(rw.verify(c, false, 10, 0) == V::kUnchanged);
+  write(other, 11);
+  CHECK(rw.verify(c, false, 11, 0) == V::kUnchanged);
+  write(k, 12);
+  CHECK(rw.verify(c, false, 12, 0) == V::kWritten);
+  c.seq = 12;
+  CHECK(rw.verify(c, false, 12, 0) == V::kUnchanged);
+  // Not held, or the writes left to the section that does not check them.
+  c.held = false;
+  CHECK(rw.verify(c, true, 12, 0) == V::kNotHeld);
+  c.held = true;
+  c.writes_checked = false;
+  CHECK(rw.verify(c, false, 12, 0) == V::kNotHeld);
+  CHECK(rw.verify(c, true, 12, 0) == V::kUnchanged);
+  rw.raise_floor(13);
+  CHECK(rw.verify(c, true, 13, 0) == V::kBelowFloor);
+
+  // A prefix range: its length is registered the first time, and trusted
+  // only by answers prepared after that.
+  bytecask::PreparedChecks r;
+  r.held = true;
+  r.writes_checked = true;
+  r.seq = 20;
+  const std::string prefix = "ab";
+  r.ranges = {{bytecask::key_hash(bytes(prefix)), 2}};
+  CHECK(rw.verify(r, false, 20, 0) == V::kNewLength);
+  bytecask::RecentWrites::Lengths lengths{};
+  REQUIRE(rw.lengths(lengths) == 1);
+  CHECK(lengths[0] == 2);
+  CHECK(rw.verify(r, false, 20, 0) == V::kUnchanged);  // prepared at 20 = since
+  write("abc", 21);  // starts with the prefix
+  CHECK(rw.verify(r, false, 21, 0) == V::kWritten);
+  r.seq = 21;
+  write("ax", 22);  // does not
+  CHECK(rw.verify(r, false, 22, 0) == V::kUnchanged);
+  r.seq = 19;
+  CHECK(rw.verify(r, false, 22, 0) == V::kNewLength);
+
+  // A second length is found past the first.
+  bytecask::PreparedChecks r1;
+  r1.held = true;
+  r1.writes_checked = true;
+  r1.seq = 22;
+  r1.ranges = {{bytecask::key_hash(bytes(std::string{"a"})), 1}};
+  CHECK(rw.verify(r1, false, 22, 0) == V::kNewLength);
+  REQUIRE(rw.lengths(lengths) == 2);
+  CHECK(lengths[1] == 1);
+  CHECK(rw.verify(r1, false, 22, 0) == V::kUnchanged);
+  write("az", 23);
+  CHECK(rw.verify(r1, false, 23, 0) == V::kWritten);
+}
+
+// Only a range of exactly the keys that start with `from` is prepared: its
+// `to` is `from` with trailing 0xFF bytes dropped and the last byte raised.
+// Each plan runs twice, so a prefix length registered by the first run is
+// trusted by the second.
+TEST_CASE("RecentWrites: nothing is recorded until the section finds the "
+          "table, which raises the floor", "[bytecask][prepared_validation]") {
+  using V = bytecask::RecentWrites::Verdict;
+  const std::string k = "key";
+  const auto bytes = [](const std::string &s) {
+    return std::as_bytes(std::span{s});
+  };
+  bytecask::RecentWrites rw;
+  bytecask::PreparedChecks nothing;  // a plain put: reads nothing
+  nothing.held = true;
+  nothing.writes_checked = true;
+  nothing.seq = 3;
+  CHECK(rw.verify(nothing, false, 5, 0) == V::kUnchanged);
+  rw.record(nothing, 6, [&](auto &&f) { f(bytes(k)); });
+  CHECK_FALSE(rw.has_table());
+  bytecask::PreparedChecks c;
+  c.held = true;
+  c.writes_checked = true;
+  c.seq = 5;
+  c.probes = {bytecask::key_hash(bytes(k))};
+  // No table yet: the section validates the plan itself.
+  CHECK(rw.verify(c, false, 6, 0) == V::kNotHeld);
+  rw.ensure_table();  // a writer's thread, outside the section
+  REQUIRE(rw.has_table());
+  // Found: the write at 6 was not recorded, so the floor goes to 6.
+  CHECK(rw.verify(c, false, 6, 0) == V::kBelowFloor);
+  c.seq = 6;
+  CHECK(rw.verify(c, false, 6, 0) == V::kUnchanged);
+  rw.record(nothing, 7, [&](auto &&f) { f(bytes(k)); });
+  CHECK(rw.verify(c, false, 7, 0) == V::kWritten);
+  // An answer from a head the engine has since gone back from.
+  c.seq = 7;
+  CHECK(rw.verify(c, false, 7, 0) == V::kUnchanged);
+  CHECK(rw.verify(c, false, 7, 1) == V::kNotHeld);
+}
+
+// A probe that finds its key written returns before the ranges are looked
+// at; a range guard's new prefix length must be registered all the same, or
+// a range guard on a busy key never gets its length tracked.
+TEST_CASE("RecentWrites: a new prefix length is registered even when a key "
+          "the answer read was written", "[bytecask][prepared_validation]") {
+  using V = bytecask::RecentWrites::Verdict;
+  const std::string k = "key";
+  const std::string prefix = "ab";
+  const auto bytes = [](const std::string &s) {
+    return std::as_bytes(std::span{s});
+  };
+  bytecask::RecentWrites rw;
+  rw.ensure_table();
+  bytecask::PreparedChecks c;
+  c.held = true;
+  c.writes_checked = true;
+  c.seq = 10;
+  c.probes = {bytecask::key_hash(bytes(k))};
+  CHECK(rw.verify(c, false, 10, 0) == V::kUnchanged);  // activates
+  bytecask::PreparedChecks w;
+  rw.record(w, 11, [&](auto &&f) { f(bytes(k)); });
+  c.ranges = {{bytecask::key_hash(bytes(prefix)), 2}};
+  CHECK(rw.verify(c, false, 11, 0) != V::kUnchanged);
+  bytecask::RecentWrites::Lengths lengths{};
+  REQUIRE(rw.lengths(lengths) == 1);
+  CHECK(lengths[0] == 2);
+}
+
+// Followers and plain puts read nothing that RecentWrites could answer for,
+// so a database that sees only them never allocates the table.
+TEST_CASE("prepared validation: a database of plain puts never allocates "
+          "the recent-writes table", "[bytecask][prepared_validation]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  for (int i = 0; i < 100; ++i)
+    (void)db.put({.sync = false}, to_bytes(std::format("k{}", i)), to_bytes("v"));
+  bytecask::WritePlan plain;
+  plain.put(to_bytes("x"), to_bytes("v"));
+  plain.del(to_bytes("k1"));
+  REQUIRE(db.apply_batch({.sync = false}, std::move(plain)));
+  CHECK_FALSE(db.test_recent_writes().has_table());
+  bytecask::WritePlan guarded;
+  guarded.ensure_absent(to_bytes("y"));
+  guarded.put(to_bytes("y"), to_bytes("v"));
+  REQUIRE(db.apply_batch({.sync = false}, std::move(guarded)));
+  CHECK(db.test_recent_writes().has_table());
+}
+
+TEST_CASE("prepared validation: only a range guard over one prefix is "
+          "prepared", "[bytecask][prepared_validation]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  (void)db.put({.sync = false}, to_bytes("p1/0"), to_bytes("v"));
+  const auto run = [&](const std::string &from, const std::string &to) {
+    const auto before = validation_stat(db, "prepared");
+    for (int i = 0; i < 2; ++i) {
+      bytecask::WritePlan plan{db.snapshot()};
+      plan.ensure_range_unchanged(to_bytes(from), to_bytes(to));
+      plan.put(to_bytes("x"), to_bytes("v"));
+      REQUIRE(db.apply_batch({.sync = false}, std::move(plan)));
+    }
+    return validation_stat(db, "prepared") - before;
+  };
+  CHECK(run("p1/", "p10") == 1);                         // a prefix
+  CHECK(run(std::string{"a\xFF"}, "b") == 1);            // trailing 0xFF
+  CHECK(run(std::string{"\xFF\xFF"}, std::string{"\xFF\xFF\x01"}) == 0);  // all 0xFF
+  CHECK(run("p1/", "p2") == 0);                          // shorter `to`
+  CHECK(run("p1/", "q10") == 0);                         // another first byte
+  CHECK(run("p1/", "p1:") == 0);                         // last byte not +1
+  CHECK(db.test_prepared_disagreements_ == 0);
+}
+
+TEST_CASE("prepared validation: a guard whose key is written between "
+          "preparing and the section is checked again",
+          "[bytecask][prepared_validation][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  (void)db.put({.sync = false}, to_bytes("there"), to_bytes("v"));
+  (void)db.put({.sync = false}, to_bytes("p1/0"), to_bytes("v"));
+  (void)db.put({.sync = false}, to_bytes("p2/0"), to_bytes("v"));
+  allocate_recent_writes(db);
+  const auto in_section = validation_stat(db, "in_section");
+
+  SECTION("ensure_absent, the key inserted") {
+    bytecask::WritePlan plan{db.snapshot()};
+    plan.ensure_absent(to_bytes("new"));
+    plan.put(to_bytes("x"), to_bytes("mine"));
+    CHECK_FALSE(commit_after(db, std::move(plan), [&] {
+      (void)db.put({.sync = false}, to_bytes("new"), to_bytes("theirs"));
+    }));
+  }
+  SECTION("ensure_present, the key deleted") {
+    bytecask::WritePlan plan;
+    plan.ensure_present(to_bytes("there"));
+    plan.put(to_bytes("x"), to_bytes("mine"));
+    CHECK_FALSE(commit_after(db, std::move(plan), [&] {
+      (void)db.del({.sync = false}, to_bytes("there"));
+    }));
+  }
+  SECTION("ensure_unchanged, the key rewritten") {
+    bytecask::WritePlan plan{db.snapshot()};
+    plan.ensure_unchanged(to_bytes("there"));
+    plan.del(to_bytes("x"));
+    CHECK_FALSE(commit_after(db, std::move(plan), [&] {
+      (void)db.put({.sync = false}, to_bytes("there"), to_bytes("v2"));
+    }));
+  }
+  SECTION("a written key, rewritten (write-write)") {
+    bytecask::WritePlan plan{db.snapshot()};
+    plan.del(to_bytes("p2/0"));  // a delete: checked at P, not in a descent
+    plan.put(to_bytes("there"), to_bytes("mine"));
+    CHECK_FALSE(commit_after(db, std::move(plan), [&] {
+      (void)db.put({.sync = false}, to_bytes("there"), to_bytes("theirs"));
+    }));
+  }
+  SECTION("a prefix range guard, a key with the prefix inserted") {
+    // The first guard over a prefix length registers it and is checked in
+    // the section; the second is the one prepared.
+    {
+      bytecask::WritePlan first{db.snapshot()};
+      first.ensure_range_unchanged(to_bytes("p2/"), to_bytes("p20"));
+      first.put(to_bytes("y"), to_bytes("v"));
+      REQUIRE(db.apply_batch({.sync = false}, std::move(first)));
+    }
+    std::int64_t prepared = 0;
+    bytecask::WritePlan plan{db.snapshot()};
+    plan.ensure_range_unchanged(to_bytes("p1/"), to_bytes("p10"));
+    plan.put(to_bytes("x"), to_bytes("mine"));
+    CHECK_FALSE(commit_after(db, std::move(plan), [&] {
+      (void)db.put({.sync = false}, to_bytes("p1/7"), to_bytes("theirs"));
+      prepared = validation_stat(db, "prepared");
+    }));
+    CHECK(validation_stat(db, "prepared") == prepared);
+  }
+  SECTION("ensure_present, the key removed by a range delete") {
+    bytecask::WritePlan plan;
+    plan.ensure_present(to_bytes("p1/0"));
+    plan.put(to_bytes("x"), to_bytes("mine"));
+    CHECK_FALSE(commit_after(db, std::move(plan), [&] {
+      bytecask::WritePlan range;
+      range.del_range(to_bytes("p1/"), to_bytes("p10"));
+      REQUIRE(db.apply_batch({.sync = false}, std::move(range)));
+    }));
+  }
+  CHECK(validation_stat(db, "in_section") > in_section);
+  CHECK(db.test_prepared_disagreements_ == 0);
+  CHECK_FALSE(get_val(db, to_bytes("x")).has_value());
+}
+
+// Ingest runs as a barrier, whose head reset raises head_generation_: a plan
+// prepared while this node led, held while the node follows another,
+// ingests the guarded key from it and leads again, is checked again.
+TEST_CASE("prepared validation: a plan prepared before an ingested slice is "
+          "checked again",
+          "[bytecask][prepared_validation][replication][concurrency]") {
+  TempDir td;
+  auto d = bytecask::DB::open(td.path / "d");
+  auto s = bytecask::DB::open(td.path / "s",
+                              {.initial_mode = bytecask::Mode::Follower});
+  const auto catch_up = [](bytecask::DB &from, bytecask::DB &to) {
+    auto snap = from.snapshot();
+    auto batch = from.changes_since(snap, to.durable_sequence());
+    std::vector<bytecask::DataEntry> owned;
+    for (const auto &e : batch.entries)
+      owned.push_back({e.sequence, e.entry_type, {e.key.begin(), e.key.end()},
+                       {e.value.begin(), e.value.end()}});
+    std::vector<bytecask::DataEntryView> views;
+    for (const auto &e : owned)
+      views.push_back({e.sequence, e.entry_type, e.key, e.value});
+    if (!views.empty()) to.ingest(batch.header, views);
+  };
+  (void)d.put({.sync = true}, to_bytes("base"), to_bytes("v"));
+  allocate_recent_writes(d);
+  (void)d.apply_batch({.sync = true}, bytecask::WritePlan{});
+  catch_up(d, s);
+
+  bytecask::WritePlan plan;
+  plan.ensure_absent(to_bytes("new"));
+  plan.put(to_bytes("x"), to_bytes("mine"));
+  const auto r = commit_after(d, std::move(plan), [&] {
+    d.set_mode(bytecask::Mode::Follower);
+    s.set_mode(bytecask::Mode::Leader);
+    (void)s.put({.sync = true}, to_bytes("new"), to_bytes("theirs"));
+    catch_up(s, d);
+    REQUIRE(d.contains_key({}, to_bytes("new")));
+    d.set_mode(bytecask::Mode::Leader);
+  });
+  CHECK_FALSE(r.has_value());
+  CHECK_FALSE(d.contains_key({}, to_bytes("x")));
+  CHECK(d.test_prepared_disagreements_ == 0);
+}
+
+// A head can take a sequence without changing the key directory: a range
+// delete over an empty range. If its fdatasync fails and its bytes are lost
+// before resume() reads the file back, resume() gives that sequence out
+// again. A plan prepared in that head must not take the next write of the
+// sequence for one it already saw.
+TEST_CASE("prepared validation: a plan prepared in a head whose sequence "
+          "resume() gives out again is checked again",
+          "[bytecask][prepared_validation][degraded][fsyncgate][concurrency]") {
+  bytecask::testing::ScopedPageCacheModel cache;
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = bytecask::DB::open(dir, fsyncgate_opts(bytecask::IoBackend::Pread));
+  (void)db.put({.sync = true}, to_bytes("base"), to_bytes("v"));
+  allocate_recent_writes(db);
+  REQUIRE(db.apply_batch({.sync = true}, bytecask::WritePlan{}));  // all durable
+
+  FlushGate in_sync;
+  db.test_before_flush_sync_ = in_sync.hook();
+  std::thread failing([&] {
+    bytecask::testing::ScopedFaultInjector fail_sync{"io_data_file_sync"};
+    CHECK_THROWS_AS(
+        db.del_range({.sync = true}, to_bytes("e/"), to_bytes("e0")),
+        std::system_error);
+  });
+  in_sync.wait_in_flush();  // one more sequence in the head, the same tree
+  const auto taken = db.engine_state()->next_seq;
+
+  bytecask::WritePlan plan;
+  plan.ensure_absent(to_bytes("K"));
+  plan.put(to_bytes("w"), to_bytes("mine"));
+  const auto r = commit_after(db, std::move(plan), [&] {
+    in_sync.open();
+    failing.join();
+    db.test_before_flush_sync_ = nullptr;
+    REQUIRE(db.is_degraded());
+    cache.model.restore_device(dir);  // the range delete's bytes are gone
+    db.resume();
+    REQUIRE(db.engine_state()->next_seq == taken);  // given out again
+    (void)db.put({.sync = false}, to_bytes("K"), to_bytes("theirs"));
+  });
+  CHECK_FALSE(r.has_value());
+  CHECK_FALSE(db.contains_key({}, to_bytes("w")));
+  CHECK(db.test_prepared_disagreements_ == 0);
+}
+
+// The plan is validated in the head of a flush whose fdatasync then fails.
+// The engine goes back to the published state and resume() builds on it, so
+// that head is not an ancestor of the one the plan is applied to: its answer
+// is not used, and the section validates the plan (head_generation_).
+TEST_CASE("prepared validation: a plan validated in a head that resume() "
+          "dropped is validated in the section",
+          "[bytecask][prepared_validation][degraded][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  (void)db.put({.sync = false}, to_bytes("there"), to_bytes("v"));
+  allocate_recent_writes(db);
+  FlushGate in_sync;
+  db.test_before_flush_sync_ = in_sync.hook();
+  std::thread failing([&] {
+    bytecask::testing::ScopedFaultInjector fail_sync{"io_data_file_sync"};
+    CHECK_THROWS_AS(db.put({.sync = true}, to_bytes("failed"), to_bytes("v")),
+                    std::system_error);
+  });
+  in_sync.wait_in_flush();
+  FlushGate prepared;
+  db.test_after_prepare_ = prepared.hook();
+  std::optional<bytecask::CommitResult> result;
+  std::thread writer([&] {
+    bytecask::WritePlan plan;
+    plan.ensure_present(to_bytes("there"));
+    plan.put(to_bytes("x"), to_bytes("mine"));
+    result = db.apply_batch({.sync = false}, std::move(plan));
+  });
+  prepared.wait_in_flush();
+  in_sync.open();
+  failing.join();
+  db.test_before_flush_sync_ = nullptr;
+  const auto degraded = db.is_degraded();
+  if (degraded) CHECK_NOTHROW(db.resume());
+  const auto in_section = validation_stat(db, "in_section");
+  const auto prepared_used = validation_stat(db, "prepared");
+  prepared.open();
+  writer.join();
+  db.test_after_prepare_ = nullptr;
+  REQUIRE(degraded);
+  REQUIRE(result.has_value());
+  CHECK(validation_stat(db, "in_section") == in_section + 1);
+  CHECK(validation_stat(db, "prepared") == prepared_used);
+  CHECK(get_str(db, to_bytes("x")) == "mine");
+  CHECK(db.test_prepared_disagreements_ == 0);
+}
+
+TEST_CASE("prepared validation: an answer nothing has touched since is used",
+          "[bytecask][prepared_validation][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  (void)db.put({.sync = false}, to_bytes("there"), to_bytes("v"));
+  allocate_recent_writes(db);
+  std::int64_t prepared = 0;
+  bytecask::WritePlan plan{db.snapshot()};
+  plan.ensure_absent(to_bytes("new"));
+  plan.ensure_present(to_bytes("there"));
+  plan.put(to_bytes("new"), to_bytes("mine"));
+  plan.del(to_bytes("gone"));
+  const auto r = commit_after(db, std::move(plan), [&] {
+    (void)db.put({.sync = false}, to_bytes("unrelated"), to_bytes("v"));
+    prepared = validation_stat(db, "prepared");
+  });
+  REQUIRE(r.has_value());
+  CHECK(validation_stat(db, "prepared") == prepared + 1);
+  CHECK(get_str(db, to_bytes("new")) == "mine");
+  CHECK(db.test_prepared_disagreements_ == 0);
+}
+
+#ifndef __EMSCRIPTEN__  // commit_as_group starts threads
+// Groups of plans with guards (absent, present, unchanged, ranges over one
+// prefix and ranges that are not), deletes and range deletes, against a model
+// that decides each outcome from the keys' live sequences and those each
+// plan's snapshot saw, counting the slots before it in its group. The
+// prepared answer and the section's must agree on every plan, and both must
+// have decided some.
+TEST_CASE("prepared validation: groups of guarded plans commit and conflict "
+          "as the model says", "[model][prepared_validation][concurrency]") {
+  const auto [seed, prepare, two_pass] =
+      GENERATE(std::tuple{1u, true, false}, std::tuple{2u, true, false},
+               std::tuple{3u, true, true}, std::tuple{4u, false, false});
+  CAPTURE(seed, prepare, two_pass);
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.test_two_pass_ = two_pass;
+  db.test_no_prepared_validation_ = !prepare;
+  std::mt19937_64 rng{seed};
+  std::map<std::string, std::pair<std::string, std::uint64_t>> model;
+  std::uint64_t next_seq = 0;
+  const auto key = [&] {
+    return std::format("p{}/{}", rng() % 6, rng() % 8);
+  };
+  const auto value = [&] { return std::string(1 + rng() % 40, 'v'); };
+  const auto put_outside = [&](const std::string &k) {
+    const auto v = value();
+    const auto r = db.put({.sync = false}, to_bytes(k), to_bytes(v));
+    if (next_seq == 0) next_seq = r.sequence;
+    REQUIRE(r.sequence == next_seq);
+    model[k] = {v, next_seq++};
+  };
+  for (int i = 0; i < 30; ++i) put_outside(key());
+
+  struct Snap {
+    bytecask::Snapshot snap;
+    std::map<std::string, std::uint64_t> seen;
+  };
+  std::vector<Snap> snaps;
+  enum class Kind { kPut, kDel, kDelRange, kAbsent, kPresent, kUnchanged, kRange };
+  struct Op {
+    Kind kind;
+    std::string from;  // the key, or a range's start
+    std::string to;
+    std::string value;
+  };
+  int commits = 0;
+  int conflicts = 0;
+  for (int round = 0; round < 500; ++round) {
+    if (rng() % 10 == 0) {
+      put_outside(key());
+      continue;
+    }
+    while (snaps.size() < 6) {
+      Snap s{db.snapshot(), {}};
+      for (const auto &[k, vs] : model) s.seen[k] = vs.second;
+      snaps.push_back(std::move(s));
+    }
+    const auto n = 1 + rng() % 4;
+    std::vector<bytecask::WritePlan> plans;
+    std::vector<std::vector<Op>> ops(n);
+    std::vector<std::map<std::string, std::uint64_t>> seen(n);
+    for (std::size_t p = 0; p < n; ++p) {
+      const auto i = rng() % snaps.size();
+      seen[p] = std::move(snaps[i].seen);
+      plans.emplace_back(std::move(snaps[i].snap));
+      snaps.erase(snaps.begin() + static_cast<std::ptrdiff_t>(i));
+      auto &plan = plans.back();
+      std::set<std::string> guarded;
+      const auto writes = 1 + rng() % 3;
+      for (std::size_t o = 0; o < writes; ++o) {
+        const auto d = rng() % 12;
+        if (d == 0) {
+          const auto f = std::format("p{}/", rng() % 6);
+          auto t = f;
+          t.back() = '0';
+          ops[p].push_back({Kind::kDelRange, f, t, {}});
+          plan.del_range(to_bytes(f), to_bytes(t));
+        } else if (d < 4) {
+          ops[p].push_back({Kind::kDel, key(), {}, {}});
+          plan.del(to_bytes(ops[p].back().from));
+        } else {
+          ops[p].push_back({Kind::kPut, key(), {}, value()});
+          plan.put(to_bytes(ops[p].back().from),
+                   to_bytes(ops[p].back().value));
+        }
+      }
+      const auto guards = rng() % 4;
+      for (std::size_t g = 0; g < guards; ++g) {
+        const auto d = rng() % 5;
+        if (d == 4) {
+          const auto prefix = rng() % 3 != 0;
+          const auto f = prefix ? std::format("p{}/", rng() % 6)
+                                : std::format("p{}/{}", rng() % 6, rng() % 4);
+          auto t = f;
+          if (prefix) {
+            t.back() = '0';
+          } else {
+            t.back() = static_cast<char>(t.back() + 3);
+          }
+          ops[p].push_back({Kind::kRange, f, t, {}});
+          plan.ensure_range_unchanged(to_bytes(f), to_bytes(t));
+          continue;
+        }
+        const auto k = key();
+        if (!guarded.insert(k).second) continue;
+        const auto kind = d == 0   ? Kind::kAbsent
+                          : d == 1 ? Kind::kPresent
+                                   : Kind::kUnchanged;
+        ops[p].push_back({kind, k, {}, {}});
+        if (kind == Kind::kAbsent) plan.ensure_absent(to_bytes(k));
+        if (kind == Kind::kPresent) plan.ensure_present(to_bytes(k));
+        if (kind == Kind::kUnchanged) plan.ensure_unchanged(to_bytes(k));
+      }
+    }
+    const auto results = commit_as_group(db, std::move(plans));
+    for (std::size_t p = 0; p < n; ++p) {
+      const auto live = [&](const std::string &k) -> std::uint64_t {
+        const auto it = model.find(k);
+        return it == model.end() ? 0 : it->second.second;
+      };
+      const auto at_snap = [&](const std::string &k) -> std::uint64_t {
+        const auto it = seen[p].find(k);
+        return it == seen[p].end() ? 0 : it->second;
+      };
+      const auto range_changed = [&](const std::string &f,
+                                     const std::string &t) {
+        std::set<std::string> keys;
+        for (auto it = model.lower_bound(f); it != model.end() && it->first < t; ++it)
+          keys.insert(it->first);
+        for (auto it = seen[p].lower_bound(f);
+             it != seen[p].end() && it->first < t; ++it)
+          keys.insert(it->first);
+        return std::ranges::any_of(
+            keys, [&](const std::string &k) { return live(k) != at_snap(k); });
+      };
+      const bool conflict = std::ranges::any_of(ops[p], [&](const Op &op) {
+        switch (op.kind) {
+        case Kind::kPut:
+        case Kind::kDel:
+        case Kind::kUnchanged:
+          return live(op.from) != at_snap(op.from);
+        case Kind::kDelRange:
+        case Kind::kRange:
+          return range_changed(op.from, op.to);
+        case Kind::kAbsent:
+          return live(op.from) != 0;
+        case Kind::kPresent:
+          return live(op.from) == 0;
+        }
+        return false;
+      });
+      REQUIRE(results[p].has_value() == !conflict);
+      if (conflict) {
+        ++conflicts;
+        continue;
+      }
+      ++commits;
+      std::size_t written = 0;
+      for (const auto &op : ops[p])
+        written += op.kind == Kind::kPut || op.kind == Kind::kDel ||
+                   op.kind == Kind::kDelRange;
+      if (written > 1) ++next_seq;  // BulkBegin
+      for (const auto &op : ops[p]) {
+        if (op.kind == Kind::kPut) {
+          model[op.from] = {op.value, next_seq++};
+        } else if (op.kind == Kind::kDel) {
+          model.erase(op.from);
+          ++next_seq;
+        } else if (op.kind == Kind::kDelRange) {
+          model.erase(model.lower_bound(op.from), model.lower_bound(op.to));
+          ++next_seq;
+        }
+      }
+      if (written > 1) ++next_seq;  // BulkEnd
+      REQUIRE(results[p]->sequence == next_seq - 1);
+    }
+  }
+  snaps.clear();
+  CHECK(commits > 300);
+  CHECK(conflicts > 100);
+  CHECK(db.test_prepared_disagreements_ == 0);
+  if (prepare) {
+    CHECK(validation_stat(db, "prepared") > 100);
+    CHECK(validation_stat(db, "in_section") > 100);
+  } else {
+    CHECK(validation_stat(db, "prepared") == 0);
+  }
+  std::map<std::string, std::string> expected;
+  for (const auto &[k, vs] : model) expected[k] = vs.first;
+  CHECK(collect_kv(db) == expected);
 }
 #endif  // __EMSCRIPTEN__
 

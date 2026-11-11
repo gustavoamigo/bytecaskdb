@@ -42,11 +42,24 @@ TransientEngineState::TransientEngineState(
       scratch_bytes_{scratch_bytes} {}
 
 auto EngineState::transient() const -> TransientEngineState {
-  return TransientEngineState{
+  auto t = TransientEngineState{
       key_dir.transient(), files.transient(), file_stats.transient(),
       active_file_id, next_file_id, next_seq, durable_seq,
       sync_requested_seq, mode, degraded, degraded_reason, change_markers,
       scratch_bytes};
+  t.recent_writes_ = recent_writes;
+  return t;
+}
+
+void TransientEngineState::record_writes(const WritePlan &plan) {
+  if (!recent_writes_) return;
+  recent_writes_->record(plan.checks_, next_seq_ - 1,
+                         [&](auto &&f) { plan.for_each_point_key(f); });
+}
+
+void TransientEngineState::raise_recent_floor() {
+  if (!recent_writes_) return;
+  recent_writes_->raise_floor(next_seq_ > 0 ? next_seq_ - 1 : 0);
 }
 
 void TransientEngineState::append_marker(ChangeMarker m) {
@@ -69,11 +82,19 @@ void TransientEngineState::apply_change_marker(std::uint64_t sequence,
 auto TransientEngineState::validate_preconditions(
     const WritePlan &plan, std::uint64_t &rests_on, bool defer_puts) const
     -> bool {
+  return check_preconditions(key_dir_, kd_ctx(), next_seq_, plan, rests_on,
+                             defer_puts);
+}
+
+template <typename KeyDir>
+auto TransientEngineState::check_preconditions(
+    const KeyDir &key_dir, const KeyDirCtx &ctx, std::uint64_t next_seq,
+    const WritePlan &plan, std::uint64_t &rests_on, bool defer_puts) -> bool {
   const auto *snap_state =
       plan.snap_ ? plan.snap_->state_.get() : nullptr;
   // The head's latest sequence: what an outcome rests on when the entry it
   // read has no sequence of its own (deleted, or absent).
-  const auto head_latest = next_seq_ - 1;
+  const auto head_latest = next_seq - 1;
   const auto read_seq = [&](const std::optional<KeyDirEntry> &cur) {
     return cur ? cur->sequence() : head_latest;
   };
@@ -86,7 +107,7 @@ auto TransientEngineState::validate_preconditions(
   // 1. Point guards.
   for (const auto &[key, guard] : plan.guards_) {
     const std::span<const std::byte> key_span{key};
-    const auto cur_entry = kd_get(key_dir_, key_span, kd_ctx());
+    const auto cur_entry = kd_get(key_dir, key_span, ctx);
 
     switch (guard.precondition) {
     case WritePlan::Precondition::MustExist:
@@ -115,7 +136,9 @@ auto TransientEngineState::validate_preconditions(
   // One that holds read keys absent from both states too, which have no
   // sequence: it rests on the head's latest.
   for (const auto &rg : plan.range_guards_) {
-    if (range_changed(*snap_state, rg.from, rg.to, rests_on)) return false;
+    if (range_changed(key_dir, ctx, next_seq, *snap_state, rg.from, rg.to,
+                      rests_on))
+      return false;
     held_on = head_latest;
   }
 
@@ -130,8 +153,8 @@ auto TransientEngineState::validate_preconditions(
     const auto point_conflict = [&](std::size_t i, const Bytes &key) {
       const std::span<const std::byte> key_span{key};
       const auto snap_entry = plan.snapshot_entry(i, key_span);
-      if (snap_entry && kd_holds(key_dir_, key_span, *snap_entry)) return false;
-      const auto cur_entry = kd_get(key_dir_, key_span, kd_ctx());
+      if (snap_entry && kd_holds(key_dir, key_span, *snap_entry)) return false;
+      const auto cur_entry = kd_get(key_dir, key_span, ctx);
       const bool appeared = !snap_entry && cur_entry;
       const bool deleted = snap_entry && !cur_entry;
       const bool modified = snap_entry && cur_entry &&
@@ -149,7 +172,8 @@ auto TransientEngineState::validate_preconditions(
                           std::is_same_v<T, WritePlan::PointDel>) {
               has_conflict = point_conflict(i, op.key);
             } else if constexpr (std::is_same_v<T, WritePlan::RangeDel>) {
-              has_conflict = range_changed(*snap_state, op.from, op.to, rests_on);
+              has_conflict = range_changed(key_dir, ctx, next_seq, *snap_state,
+                                           op.from, op.to, rests_on);
             }
           },
           plan.writes_[i]);
@@ -161,14 +185,15 @@ auto TransientEngineState::validate_preconditions(
   return true;
 }
 
-auto TransientEngineState::range_changed(const EngineState &snap,
-                                         std::span<const std::byte> from,
-                                         std::span<const std::byte> to,
-                                         std::uint64_t &rests_on) const -> bool {
+template <typename KeyDir>
+auto TransientEngineState::range_changed(
+    const KeyDir &key_dir, const KeyDirCtx &ctx, std::uint64_t next_seq,
+    const EngineState &snap, std::span<const std::byte> from,
+    std::span<const std::byte> to, std::uint64_t &rests_on) -> bool {
   // Keys changed or inserted since the snapshot: present in the head with a
   // sequence the snapshot does not hold for them. A key vacuum relocated
   // keeps its sequence, so it is not a change.
-  for (auto it = kd_lower_bound(key_dir_, from, kd_ctx());
+  for (auto it = kd_lower_bound(key_dir, from, ctx);
        it != std::default_sentinel; ++it) {
     auto [key_span, entry] = *it;
     if (Key{key_span} >= Key{to}) break;
@@ -186,8 +211,8 @@ auto TransientEngineState::range_changed(const EngineState &snap,
        it != std::default_sentinel; ++it) {
     auto [key_span, entry] = *it;
     if (Key{key_span} >= Key{to}) break;
-    if (!kd_get(key_dir_, key_span, kd_ctx())) {
-      rests_on = next_seq_ - 1;
+    if (!kd_get(key_dir, key_span, ctx)) {
+      rests_on = next_seq - 1;
       return true;
     }
   }
@@ -212,6 +237,94 @@ void WritePlan::resolve_snapshot_entries() {
         },
         w);
   }
+}
+
+namespace {
+// Whether [from, to) holds exactly the keys that start with `from`: `to` is
+// the smallest key above every such key. Its bytes are `from`'s with the
+// trailing 0xFF bytes dropped and the last one left raised by one.
+auto is_prefix_range(std::span<const std::byte> from,
+                     std::span<const std::byte> to) -> bool {
+  auto n = from.size();
+  while (n > 0 && from[n - 1] == std::byte{0xFF}) --n;
+  if (n == 0 || to.size() != n) return false;
+  return std::ranges::equal(from.first(n - 1), to.first(n - 1)) &&
+         std::to_integer<unsigned>(to[n - 1]) ==
+             std::to_integer<unsigned>(from[n - 1]) + 1;
+}
+}  // namespace
+
+void WritePlan::prepare_validation(const EngineState &p,
+                                   std::uint64_t generation,
+                                   RecentWrites &recent) {
+  auto &c = checks_;
+  c.held = false;
+  c.hashed = false;
+  c.probes.clear();
+  c.ranges.clear();
+  c.writes.clear();
+  c.prefixes.clear();
+  c.generation = generation;
+  c.seq = p.next_seq - 1;
+  // The written keys are hashed here only once the table exists: before it,
+  // the section records nothing, and a plan that slips in as it appears is
+  // hashed by the section (RecentWrites::record).
+  if (recent.has_table()) {
+    RecentWrites::Lengths lengths{};
+    const auto n = recent.lengths(lengths);
+    c.writes.reserve(writes_.size());
+    c.prefixes.reserve(writes_.size() * n);
+    for_each_point_key([&](std::span<const std::byte> key) {
+      c.writes.push_back(key_hash(key));
+      for (const auto len : std::span{lengths}.first(n)) {
+        if (key.size() >= len) c.prefixes.push_back(key_hash(key.first(len)));
+      }
+    });
+    c.lengths = n;
+    c.hashed = true;
+  }
+
+  // A plan with no writes appends nothing, and its rests_on needs the
+  // section's answer (settle_unappended). A range delete changes keys the
+  // table cannot name.
+  if (writes_.empty() || has_range_delete()) return;
+  // The same check the section makes, deferring the same writes to the
+  // descents that apply them.
+  const auto defer = TransientEngineState::can_apply_puts_checked(*this);
+  c.writes_checked = !snap_ || !defer;
+  // A plan with no guard and no write-write check left to make (no
+  // snapshot, or puts the descents check) has nothing to read: it holds
+  // whatever happens, so no check is made and nothing is probed.
+  const auto checks_writes_at_p = snap_ && !defer;
+  if (guards_.empty() && range_guards_.empty() && !checks_writes_at_p) {
+    c.held = true;
+    return;
+  }
+  for (const auto &rg : range_guards_) {
+    if (!is_prefix_range(rg.from, rg.to)) return;
+  }
+  std::uint64_t ignored = 0;
+  if (!TransientEngineState::check_preconditions(
+          p.key_dir, p.kd_ctx(), p.next_seq, *this, ignored, defer))
+    return;
+  c.probes.reserve(guards_.size() + writes_.size());
+  c.ranges.reserve(range_guards_.size());
+  for (const auto &[key, guard] : guards_) {
+    if (guard.precondition != Precondition::None)
+      c.probes.push_back(key_hash(key));
+  }
+  if (checks_writes_at_p) {
+    for_each_point_key([&](std::span<const std::byte> key) {
+      c.probes.push_back(key_hash(key));
+    });
+  }
+  for (const auto &rg : range_guards_) {
+    c.ranges.push_back({key_hash(rg.from), narrow<std::uint32_t>(rg.from.size())});
+  }
+  // The answer read something: the table must exist for the section to
+  // tell whether it still holds. Allocated here, not under the lock.
+  recent.ensure_table();
+  c.held = true;
 }
 
 void WritePlan::prepare_paths(const EngineState &head,
@@ -392,6 +505,9 @@ void TransientEngineState::apply_writes(
   }
 
   file_stats_.patch(active_file_id_, {.min_sequence = batch_start_seq, .max_sequence = next_seq_ - 1});
+  record_writes(plan);
+  // A range delete changes keys RecentWrites cannot name.
+  if (plan.has_range_delete()) raise_recent_floor();
 }
 
 auto TransientEngineState::can_apply_puts_checked(const WritePlan &plan)
@@ -486,6 +602,7 @@ auto TransientEngineState::apply_puts_checked(
                         {.live_removed = entry_size(u.key.size(),
                                                     u.was->value_size())});
   }
+  record_writes(plan);
   return true;
 }
 
@@ -795,6 +912,7 @@ auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
   s->degraded = degraded_;
   s->degraded_reason = std::move(degraded_reason_);
   s->change_markers = std::move(change_markers_);
+  s->recent_writes = std::move(recent_writes_);
   return s;
 }
 

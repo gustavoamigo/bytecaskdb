@@ -1,0 +1,16 @@
+The section starts recording without raising the floor: an answer prepared
+before it, under writes no one recorded, is taken as unchanged (#754).
+Guarded-by: "RecentWrites: nothing is recorded until the section finds the table\, which raises the floor"
+
+diff --git a/bytecaskdb/internals.cppm b/bytecaskdb/internals.cppm
+index 8d63f7aa..531feeac 100644
+--- a/bytecaskdb/internals.cppm
++++ b/bytecaskdb/internals.cppm
+@@ -483,7 +483,6 @@ public:
+     if (!active_) {
+       if (!has_table()) return Verdict::kNotHeld;
+       active_ = true;
+-      raise_floor(head_last);
+     }
+     if (c.seq < floor_)
+       return Verdict::kBelowFloor;

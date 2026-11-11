@@ -1,0 +1,18 @@
+A validation answer prepared in a head the engine has gone back from is
+trusted in the resumed tree, which does not descend from it (#754).
+Guarded-by: "prepared validation: a plan validated in a head that resume() dropped is validated in the section"
+
+diff --git a/bytecaskdb/internals.cppm b/bytecaskdb/internals.cppm
+index 8d63f7aa..abbc0c90 100644
+--- a/bytecaskdb/internals.cppm
++++ b/bytecaskdb/internals.cppm
+@@ -469,8 +469,7 @@ public:
+     if (!c.held || !(c.writes_checked || writes_checked_here))
+       return Verdict::kNotHeld;
+     // P was a head the engine has since gone back from (store_head).
+-    if (c.generation != generation)
+-      return Verdict::kNotHeld;
++    (void)generation;
+     // An answer that read nothing cannot have changed.
+     if (c.probes.empty() && c.ranges.empty())
+       return Verdict::kUnchanged;

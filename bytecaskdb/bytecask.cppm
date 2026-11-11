@@ -768,14 +768,28 @@ public:
   [[nodiscard]] auto persistent() && -> std::shared_ptr<EngineState>;
 
 private:
-  // Returns true if [from, to) differs between snap and the head: a key
-  // changed, inserted or deleted since snap. Sets rests_on as
+  // validate_preconditions over one version of the key directory, whose
+  // next sequence is next_seq: this transient's, or a published state's,
+  // checked on the writer's thread (WritePlan::prepare_validation).
+  template <typename KeyDir>
+  [[nodiscard]] static auto check_preconditions(const KeyDir &key_dir,
+                                                const KeyDirCtx &ctx,
+                                                std::uint64_t next_seq,
+                                                const WritePlan &plan,
+                                                std::uint64_t &rests_on,
+                                                bool defer_puts) -> bool;
+  // Returns true if [from, to) differs between snap and the version
+  // checked: a key changed, inserted or deleted since snap. Sets rests_on as
   // validate_preconditions documents. Shared by range guards and the
   // implicit W-W check of a planned del_range.
-  [[nodiscard]] auto range_changed(const EngineState &snap,
-                                   std::span<const std::byte> from,
-                                   std::span<const std::byte> to,
-                                   std::uint64_t &rests_on) const -> bool;
+  template <typename KeyDir>
+  [[nodiscard]] static auto range_changed(const KeyDir &key_dir,
+                                          const KeyDirCtx &ctx,
+                                          std::uint64_t next_seq,
+                                          const EngineState &snap,
+                                          std::span<const std::byte> from,
+                                          std::span<const std::byte> to,
+                                          std::uint64_t &rests_on) -> bool;
   // Where key_dir_ reads the keys it does not store: this transient's files
   // and the records it has not written yet.
   [[nodiscard]] auto kd_ctx() const -> KeyDirCtx {
@@ -793,6 +807,7 @@ private:
 
   friend class DB;
   friend struct EngineState;
+  friend class WritePlan;  // prepare_validation's check_preconditions
   TransientEngineState(KeyDirTransient key_dir,
                        TransientU32Table<std::shared_ptr<DataFile>> files,
                        FileStatsTransient file_stats,
@@ -810,6 +825,13 @@ private:
 
   // Adds m to the marker list, which is immutable: copied and replaced.
   void append_marker(ChangeMarker m);
+  // What the mutators that change keys tell RecentWrites, so that no
+  // caller has to: a plan's keys at its last sequence, before the next slot
+  // is verified, or a floor at the last sequence for a range delete, which
+  // names no key. Ingest and resume() run as barriers, whose head reset
+  // retires every prepared answer (head_generation_), so they record nothing.
+  void record_writes(const WritePlan &plan);
+  void raise_recent_floor();
 
   KeyDirTransient key_dir_;
   TransientU32Table<std::shared_ptr<DataFile>> files_;
@@ -827,6 +849,8 @@ private:
   std::string degraded_reason_;
   std::shared_ptr<const std::vector<ChangeMarker>> change_markers_;
   std::size_t scratch_bytes_;
+  // The database's, from the state this transient came from (EngineState).
+  std::shared_ptr<RecentWrites> recent_writes_;
 };
 
 // ---------------------------------------------------------------------------
@@ -1792,19 +1816,20 @@ private:
   void advance_head(std::shared_ptr<EngineState> s) {
     std::atomic_store(&head_, std::move(s));
   }
-  // Any other head. One whose key directory is not the version of the head
-  // it replaces may not descend from it (after a failed flush the head goes
-  // back to the published state), so it raises head_generation_, which
-  // retires every write path found in an earlier head. Conservative: a
-  // barrier's forward state raises it too, and the paths in flight then go
-  // by key. Raised after the store, so a writer that loaded the replaced
+  // Any other head: a barrier's, or the published state after a failed
+  // flush. It may not descend from the head it replaces, in its tree or in
+  // its sequence: a failed flush's head can hold sequences that change no
+  // key, and resume() gives them out again. So it raises head_generation_,
+  // which retires every write path and prepared answer found in an earlier
+  // head, whatever changed. Conservative: a barrier's forward state raises
+  // it too, and the plans in flight then go by key and are validated in the
+  // section. Raised after the store, so a writer that loaded the replaced
   // head had read the generation before it (apply_batch reads the
   // generation first).
   void store_head(std::shared_ptr<EngineState> s) {
-    const auto version = s->key_dir.version();
     const auto replaced = std::atomic_exchange(&head_, std::move(s));
     if (replaced == nullptr) return;  // the first head
-    if (replaced->key_dir.version() != version) head_generation_.fetch_add(1);
+    head_generation_.fetch_add(1);
   }
 #pragma clang diagnostic pop
 
@@ -1842,6 +1867,12 @@ private:
   // so a plan's paths are used only if this has not moved since they were
   // prepared. apply_batch reads it before it loads the head.
   std::atomic<std::uint64_t> head_generation_{0};
+  // The keys written since each plan's prepared validation, for the section
+  // to tell whether that answer still holds (WritePlan::prepare_validation).
+  // Every state the database installs carries it (store_initial_state), and
+  // the transients' mutators record into it.
+  std::shared_ptr<RecentWrites> recent_writes_ =
+      std::make_shared<RecentWrites>();
   mutable Counters counters_;
   // Bookmarks for changes_since to enter a file near from_sequence (#443).
   // Shared with every ChangeIterator, which hands it the bookmarks it lays and
@@ -1987,6 +2018,15 @@ public:
   // Prepares no write paths, so every write descends by key, as before
   // paths were prepared outside the section.
   bool test_no_paths_{false};
+  // Prepares no validation, so the section validates every plan, as before
+  // validation was prepared outside it.
+  bool test_no_prepared_validation_{false};
+  [[nodiscard]] auto test_recent_writes() const -> const RecentWrites & {
+    return *recent_writes_;
+  }
+  // Prepared answers the section used that its own validation, run beside
+  // them in test builds, contradicted. Must stay 0.
+  std::atomic<std::int64_t> test_prepared_disagreements_{0};
   // Called on the state open or resume() is about to validate, so a test can
   // break it and drive the cold-path consistency checks through their real
   // callers. Static: open has no DB to hang a hook on yet. A plain pointer,
@@ -2298,6 +2338,33 @@ private:
   // (see PreparedPath). `generation` is DB::head_generation_ as read before
   // `head` was loaded.
   void prepare_paths(const EngineState &head, std::uint64_t generation);
+  // Validates the plan against `p`, the head the caller loaded after
+  // reading `generation` (DB::head_generation_), on the caller's thread
+  // before it joins a batch, and notes what the answer read (checks_), so
+  // the section can use the answer unless RecentWrites shows one of those
+  // keys written since or the head was reset. A plan with nothing to check
+  // holds without a check. A plan with no writes or a range delete, a range
+  // guard that is not over one prefix, or an answer other than "holds" is
+  // left for the section to validate. An answer that read something has the
+  // table allocated here, outside the lock.
+  void prepare_validation(const EngineState &p, std::uint64_t generation,
+                          RecentWrites &recent);
+  // Calls f(key) for each point write's key, in order.
+  template <typename F> void for_each_point_key(F &&f) const {
+    for (const auto &w : writes_) {
+      if (const auto *put = std::get_if<PointPut>(&w)) {
+        f(std::span<const std::byte>{put->key});
+      } else if (const auto *del = std::get_if<PointDel>(&w)) {
+        f(std::span<const std::byte>{del->key});
+      }
+    }
+  }
+  [[nodiscard]] auto has_range_delete() const -> bool {
+    return std::ranges::any_of(writes_, [](const WriteOp &w) {
+      return std::holds_alternative<RangeDel>(w);
+    });
+  }
+
   // Write i's prepared path, or null.
   [[nodiscard]] auto path(std::size_t i) const -> const PreparedPath * {
     // paths_ is empty or parallel to writes_.
@@ -2315,6 +2382,8 @@ private:
   // Parallel to writes_ once prepare_paths ran; empty otherwise.
   std::vector<PreparedPath> paths_;
   std::uint64_t paths_generation_{0};
+  // Set by prepare_validation; `held` false otherwise.
+  PreparedChecks checks_;
   friend class DB;
   friend class TransientEngineState;
 };
