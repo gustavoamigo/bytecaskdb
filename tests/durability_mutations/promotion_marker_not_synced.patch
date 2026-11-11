@@ -5,15 +5,15 @@ forked follower is not refused (#397).
 Guarded-by: "a promotion whose fdatasync fails degrades and keeps the mode; resume finds its marker once"
 
 diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
-index dcda96c..b8e3365 100644
+index d082bce2..6ca56a08 100644
 --- a/bytecaskdb/db_replication.cpp
 +++ b/bytecaskdb/db_replication.cpp
-@@ -95,7 +95,7 @@ void DB::set_mode(Mode mode) {
+@@ -99,7 +99,7 @@ void DB::set_mode(Mode mode) {
            std::memory_order_relaxed);
        // Publishes t degraded, marker included, on failure: the entry is in
        // the file, and resume() finds it there either way.
 -      sync_active_file(t, current, "set_mode(Leader)");
 +      t.apply_sync(seq);  // mutation: the marker is not synced
        if (t.is_rotation_needed(rotation_threshold_) &&
-           t.file_ids_left() > 0) {
+           file_ids_left() > 0) {
          PreparedRotation rotation;

@@ -10,13 +10,13 @@ Expected: caught (rare).
 Guarded-by: "vacuum that fails between its rename and its commit removes its copy"
 
 diff --git a/bytecaskdb/db_vacuum.cpp b/bytecaskdb/db_vacuum.cpp
-index 056e1d5..dc3d0dc 100644
+index f21ae69..ad32085 100644
 --- a/bytecaskdb/db_vacuum.cpp
 +++ b/bytecaskdb/db_vacuum.cpp
-@@ -318,8 +318,7 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
+@@ -338,8 +338,7 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, const VacuumOptions &opts)
    // rotation minted. Frames the hint scan admits under the buffer pool are
-   // left to eviction if the copy goes: their file id was reserved for it and
-   // is never reused.
+   // left to eviction if the copy goes: they are keyed by the copy's serial,
+   // which is never reused.
 -  cleanup.paths = {dir_ / (stem + ".hint.tmp"), dir_ / (stem + ".hint"),
 -                   final_data_path};
 +  cleanup.armed = false;
