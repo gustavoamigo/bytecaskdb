@@ -101,18 +101,6 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
         old_state->next_seq, new_state->next_seq));
     return;
   }
-  if (new_state->active_file_id < old_state->active_file_id) {
-    deem_as_degraded(std::format(
-        "invariant violation: active_file_id regressed from {} to {}",
-        old_state->active_file_id, new_state->active_file_id));
-    return;
-  }
-  if (new_state->next_file_id < old_state->next_file_id) {
-    deem_as_degraded(std::format(
-        "invariant violation: next_file_id regressed from {} to {}",
-        old_state->next_file_id, new_state->next_file_id));
-    return;
-  }
   if (new_state->durable_seq < old_state->durable_seq) {
     deem_as_degraded(std::format(
         "invariant violation: durable_seq regressed from {} to {}",

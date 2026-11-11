@@ -48,6 +48,8 @@ static inline int portable_fdatasync(int fd) { return fdatasync(fd); }
 
 export module bytecask.data_file;
 
+export import bytecask.file_id;
+
 import bytecask.util;
 import bytecask.buffer_pool;
 import bytecask.data_entry;
@@ -126,11 +128,32 @@ public:
     return path_;
   }
 
+  // The id the engine registered this file under, held for as long as this
+  // object lives (bytecask.file_id). Null for a file the engine has not
+  // registered: vacuum's staging copy, or one a test opens.
+  [[nodiscard]] auto id_lease() const noexcept
+      -> const std::shared_ptr<const FileId> & {
+    return id_;
+  }
+  // The file's process-unique serial. Throws for an unregistered file.
+  [[nodiscard]] auto serial() const -> std::uint64_t {
+    if (!id_) throw std::logic_error{"DataFile: file has no engine id"};
+    return id_->serial();
+  }
+  // Set once, by the factories below, before the file is shared.
+  void adopt_id(std::shared_ptr<const FileId> id) {
+    if (id_) throw std::logic_error{"DataFile: engine id already set"};
+    id_ = std::move(id);
+  }
+
 protected:
   explicit DataFile(std::filesystem::path path) : path_{std::move(path)} {}
   DataFile(DataFile &&) noexcept = default;
   DataFile &operator=(DataFile &&) noexcept = default;
   std::filesystem::path path_;
+
+private:
+  std::shared_ptr<const FileId> id_;
 };
 
 DataFile::~DataFile() = default;
@@ -369,10 +392,10 @@ auto diagnose_fd_read(int fd, const std::filesystem::path &path, Offset offset,
 // header through CRC — lies inside one resident frame below file_size.
 // nullopt otherwise, with nothing pinned; the caller copies instead. That
 // covers a straddling record, a non-resident frame and a lost race alike.
-auto lend_from_pool(BufferPool &pool, std::uint32_t file_id,
+auto lend_from_pool(BufferPool &pool, std::uint64_t file_key,
                     Offset file_size, Offset offset, bool verify,
                     FrameLease &lease) -> std::optional<DataEntryView> {
-  const auto bytes = pool.view(file_id, offset, file_size, lease);
+  const auto bytes = pool.view(file_key, offset, file_size, lease);
   if (bytes.size() < kHeaderSize) {
     lease.reset();
     return std::nullopt;
@@ -394,14 +417,14 @@ auto lend_from_pool(BufferPool &pool, std::uint32_t file_id,
 // when the bytes it needs lie in one resident frame. With verify, that is
 // the whole entry, checked in place. Returns false, with nothing pinned,
 // when they do not; the caller then reads through the pool the long way.
-auto read_value_from_pool(BufferPool &pool, std::uint32_t file_id,
+auto read_value_from_pool(BufferPool &pool, std::uint64_t file_key,
                           Offset file_size, Offset offset,
                           std::uint16_t key_size, std::uint32_t value_size,
                           bool verify, std::vector<std::byte> &out) -> bool {
   FrameLease lease;
   if (verify) {
     const auto total = kHeaderSize + key_size + value_size + kCrcSize;
-    const auto bytes = pool.view(file_id, offset, file_size, lease);
+    const auto bytes = pool.view(file_key, offset, file_size, lease);
     if (bytes.size() < total) return false;
     const auto entry = bytes.first(total);
     (void)parse_header_and_verify(entry);
@@ -409,7 +432,7 @@ auto read_value_from_pool(BufferPool &pool, std::uint32_t file_id,
     out.assign(value.begin(), value.end());
   } else {
     const auto val_offset = offset + kHeaderSize + key_size;
-    const auto bytes = pool.view(file_id, val_offset, file_size, lease);
+    const auto bytes = pool.view(file_key, val_offset, file_size, lease);
     if (bytes.size() < value_size) return false;
     out.assign(bytes.begin(), bytes.begin() + value_size);
   }
@@ -446,8 +469,8 @@ export struct PreadIo {
 // O_DIRECT.
 export class PoolIo {
 public:
-  PoolIo(std::shared_ptr<BufferPool> pool, std::uint32_t file_id) noexcept
-      : pool_{std::move(pool)}, file_id_{file_id} {}
+  PoolIo(std::shared_ptr<BufferPool> pool, std::uint64_t file_key) noexcept
+      : pool_{std::move(pool)}, file_key_{file_key} {}
 
   // The bytes are in memory: reads try lend() and read_value() first.
   static constexpr bool kResident = true;
@@ -457,7 +480,7 @@ public:
     auto at = static_cast<std::uint64_t>(start);
     for (const auto &v : iov) {
       pool_->append_resident(
-          file_id_, at,
+          file_key_, at,
           std::span{static_cast<const std::byte *>(v.iov_base), v.iov_len});
       at += v.iov_len;
     }
@@ -468,7 +491,7 @@ public:
   [[nodiscard]] auto fetch_upto(int fd, Offset offset, std::size_t len,
                                 Offset logical_end, std::byte *dst) const
       -> std::size_t {
-    return pool_->read_upto(file_id_, PoolFile{.buffered = fd, .direct = -1, .sealed = false},
+    return pool_->read_upto(file_key_, PoolFile{.buffered = fd, .direct = -1, .sealed = false},
                             offset, len, logical_end, dst);
   }
 
@@ -478,14 +501,14 @@ public:
   [[nodiscard]] auto lend(Offset offset, bool verify, Offset logical_end,
                           FrameLease &lease) const
       -> std::optional<DataEntryView> {
-    return lend_from_pool(*pool_, file_id_, logical_end, offset, verify,
+    return lend_from_pool(*pool_, file_key_, logical_end, offset, verify,
                           lease);
   }
   [[nodiscard]] auto read_value(Offset offset, std::uint16_t key_size,
                                 std::uint32_t value_size, bool verify,
                                 Offset logical_end,
                                 std::vector<std::byte> &out) const -> bool {
-    return read_value_from_pool(*pool_, file_id_, logical_end, offset,
+    return read_value_from_pool(*pool_, file_key_, logical_end, offset,
                                 key_size, value_size, verify, out);
   }
 
@@ -493,7 +516,7 @@ private:
   // Shared, not borrowed: the file lends spans into the pool's frames and
   // can outlive the DB in an iterator's hands, so the pool outlives the file.
   std::shared_ptr<BufferPool> pool_;  // never null
-  std::uint32_t file_id_;
+  std::uint64_t file_key_;  // the file's serial
 };
 
 // ---------------------------------------------------------------------------
@@ -1513,13 +1536,12 @@ inline void drop_page_cache(int fd, Offset offset = 0,
 // Byte fetching goes to BufferPool::read_at; parsing and CRC verification use
 // the same free functions as every other back-end, so the decoded result is
 // identical by construction. The pool is owned by the DB and outlives every
-// file registered with it. Frames are keyed by the engine's file_id, which the
-// caller reserves before opening the file — see TransientEngineState::
-// reserve_file_id, which exists so vacuum can supply one here.
+// file registered with it. Frames are keyed by the file's serial, from the
+// FileId the caller reserves before opening the file.
 export class ReadOnlyBufferPoolDataFile : public DataFile {
 public:
   [[nodiscard]] static auto openForRead(std::filesystem::path path,
-                                        std::uint32_t file_id,
+                                        std::uint64_t file_key,
                                         std::shared_ptr<BufferPool> pool)
       -> std::shared_ptr<ReadOnlyBufferPoolDataFile> {
     auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -1546,7 +1568,7 @@ public:
     }
     return std::shared_ptr<ReadOnlyBufferPoolDataFile>(
         new ReadOnlyBufferPoolDataFile{std::move(path), fd, direct_fd,
-                                       file_size, file_id, std::move(pool)});
+                                       file_size, file_key, std::move(pool)});
   }
 
   ~ReadOnlyBufferPoolDataFile() override;
@@ -1567,7 +1589,7 @@ public:
                   std::uint32_t value_size, bool verify,
                   std::vector<std::byte> &io_buf,
                   std::vector<std::byte> &out) const override {
-    if (read_value_from_pool(*pool_, file_id_, file_size_, offset, key_size,
+    if (read_value_from_pool(*pool_, file_key_, file_size_, offset, key_size,
                              value_size, verify, out)) {
       return;
     }
@@ -1588,7 +1610,7 @@ public:
                                  bool verify, std::vector<std::byte> &io_buf,
                                  FrameLease &lease) const
       -> DataEntryView override {
-    if (auto lent = lend_from_pool(*pool_, file_id_, file_size_, offset,
+    if (auto lent = lend_from_pool(*pool_, file_key_, file_size_, offset,
                                    verify, lease)) {
       return *lent;
     }
@@ -1607,16 +1629,16 @@ public:
 private:
   ReadOnlyBufferPoolDataFile(std::filesystem::path path, int fd,
                              int direct_fd, Offset file_size,
-                             std::uint32_t file_id,
+                             std::uint64_t file_key,
                              std::shared_ptr<BufferPool> pool)
       : DataFile{std::move(path)}, fd_{fd}, direct_fd_{direct_fd},
-        file_size_{file_size}, file_id_{file_id}, pool_{std::move(pool)} {}
+        file_size_{file_size}, file_key_{file_key}, pool_{std::move(pool)} {}
 
 
   int fd_;
   int direct_fd_;  // -1: no uncached reads here; fills go through fd_
   Offset file_size_;
-  std::uint32_t file_id_;
+  std::uint64_t file_key_;  // the file's serial
   // Shared so the pool outlives every file that lends spans into it.
   std::shared_ptr<BufferPool> pool_;
 
@@ -1630,7 +1652,7 @@ private:
   void fetch(Offset offset, std::size_t len, std::byte *dst,
              Source source) const {
     if (source == Source::Pool) {
-      pool_->read_at(file_id_, PoolFile{.buffered = fd_, .direct = direct_fd_, .sealed = true},
+      pool_->read_at(file_key_, PoolFile{.buffered = fd_, .direct = direct_fd_, .sealed = true},
                      offset, len, file_size_, dst);
       return;
     }
@@ -1677,34 +1699,59 @@ ReadOnlyBufferPoolDataFile::~ReadOnlyBufferPoolDataFile() {
 }
 
 // The back-end for a file that is not an engine file yet — vacuum's staging
-// copy. It has no file_id to key pool frames by (one is reserved only once the
-// copy is complete), so it is written like a Pread file and enters the pool
+// copy. It has no engine id, so no serial to key pool frames by (one is
+// reserved only once the copy is complete), so it is written like a Pread file and enters the pool
 // when it is reopened for read under its final name.
 export [[nodiscard]] inline auto stagingBackend(IoBackend backend) noexcept
     -> IoBackend {
   return backend == IoBackend::BufferPool ? IoBackend::Pread : backend;
 }
 
+[[nodiscard]] inline auto require_id(const std::shared_ptr<const FileId> &id,
+                                     const char *who) -> std::uint64_t {
+  if (id == nullptr) {
+    throw std::logic_error{
+        std::format("{}: IoBackend::BufferPool requires a file id", who)};
+  }
+  return id->serial();
+}
+
+// The file carries id, when given, for its whole life (DataFile::id_lease):
+// every DataFile the engine opens for a file shares the file's FileId.
+template <typename F>
+[[nodiscard]] auto with_id(std::shared_ptr<F> file,
+                           std::shared_ptr<const FileId> id)
+    -> std::shared_ptr<F> {
+  if (id) file->adopt_id(std::move(id));
+  return file;
+}
+
 // Generic factory: returns the read-only DataFile for the selected back-end.
-// BufferPool needs the DB's pool and the file's engine id; both are required
-// there and ignored elsewhere.
+// BufferPool needs the DB's pool and the file's engine id, whose serial keys
+// its frames; both are required there. Every engine file passes its id.
 export [[nodiscard]] inline auto openDataFileForRead(
     std::filesystem::path path, IoBackend backend = IoBackend::Pread,
-    std::shared_ptr<BufferPool> pool = nullptr, std::uint32_t file_id = 0)
-    -> std::shared_ptr<DataFile> {
+    std::shared_ptr<BufferPool> pool = nullptr,
+    std::shared_ptr<const FileId> id = nullptr) -> std::shared_ptr<DataFile> {
   if (backend == IoBackend::BufferPool) {
-    return ReadOnlyBufferPoolDataFile::openForRead(
-        std::move(path), file_id, require_pool(std::move(pool), "openDataFileForRead"));
+    const auto key = require_id(id, "openDataFileForRead");
+    return with_id<DataFile>(
+        ReadOnlyBufferPoolDataFile::openForRead(
+            std::move(path), key,
+            require_pool(std::move(pool), "openDataFileForRead")),
+        std::move(id));
   }
 #ifndef __EMSCRIPTEN__
   if (backend == IoBackend::Mmap) {
     struct stat st {};
     if (::stat(path.c_str(), &st) == 0 && st.st_size > 0) {
-      return ReadOnlyMmapDataFile::openForRead(std::move(path));
+      return with_id<DataFile>(ReadOnlyMmapDataFile::openForRead(std::move(path)),
+                               std::move(id));
     }
   }
 #endif
-  return ReadOnlyPosixDataFile::openForRead(std::move(path));
+  return with_id<DataFile>(ReadOnlyPosixDataFile::openForRead(std::move(path)),
+                           std::move(id));
 }
 
 // Creates the one writable data file for stem in dir: "<stem>.data", or
@@ -1720,7 +1767,8 @@ export [[nodiscard]] inline auto openDataFileForRead(
 export [[nodiscard]] inline auto createDataFileForWrite(
     const std::filesystem::path &dir, const std::string &stem,
     std::string_view suffix, std::size_t capacity, IoBackend backend,
-    std::shared_ptr<BufferPool> pool = nullptr, std::uint32_t file_id = 0)
+    std::shared_ptr<BufferPool> pool = nullptr,
+    std::shared_ptr<const FileId> id = nullptr)
     -> std::shared_ptr<WritableDataFile> {
   const auto hint_path = dir / (stem + ".hint");
   // error_code overload: the question is "is this stem taken", and a stat
@@ -1735,18 +1783,26 @@ export [[nodiscard]] inline auto createDataFileForWrite(
   }
   auto path = dir / (stem + std::string{suffix});
   if (backend == IoBackend::BufferPool) {
-    return WritableBufferPoolDataFile::create(
-        std::move(path), capacity, /*exclusive=*/true,
-        PoolIo{require_pool(std::move(pool), "createDataFileForWrite"), file_id});
+    const auto key = require_id(id, "createDataFileForWrite");
+    return with_id<WritableDataFile>(
+        WritableBufferPoolDataFile::create(
+            std::move(path), capacity, /*exclusive=*/true,
+            PoolIo{require_pool(std::move(pool), "createDataFileForWrite"),
+                   key}),
+        std::move(id));
   }
 #ifndef __EMSCRIPTEN__
   if (backend == IoBackend::Mmap && capacity > 0) {
-    return WritableMmapDataFile::create(std::move(path), capacity,
-                                        /*exclusive=*/true);
+    return with_id<WritableDataFile>(
+        WritableMmapDataFile::create(std::move(path), capacity,
+                                     /*exclusive=*/true),
+        std::move(id));
   }
 #endif
-  return WritablePosixDataFile::create(std::move(path), capacity,
-                                       /*exclusive=*/true);
+  return with_id<WritableDataFile>(
+      WritablePosixDataFile::create(std::move(path), capacity,
+                                    /*exclusive=*/true),
+      std::move(id));
 }
 
 // Moves a staged data file onto its final name, refusing to replace an

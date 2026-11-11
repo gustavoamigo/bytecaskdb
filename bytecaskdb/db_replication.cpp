@@ -101,7 +101,7 @@ void DB::set_mode(Mode mode) {
       // the file, and resume() finds it there either way.
       sync_active_file(t, current, "set_mode(Leader)");
       if (t.is_rotation_needed(rotation_threshold_) &&
-          t.file_ids_left() > 0) {
+          file_ids_left() > 0) {
         PreparedRotation rotation;
         try {
           rotation = prepare_rotation(t);
@@ -182,6 +182,8 @@ auto DB::create_manifest() -> FileManifest {
     const auto stem = data_path.stem().string();
     files.push_back({file_id, data_path, dir_ / (stem + ".hint")});
   }
+  // In log order: names sort as the files were written; ids are reused.
+  std::ranges::sort(files, {}, &FileInfo::data_path);
 
   return FileManifest{Snapshot{manifest_state, size_limits_}, std::move(files), through_seq};
 }
@@ -384,7 +386,7 @@ void DB::ingest(const ChangeHeader &header,
       rest = rest.subspan(chunk.end);
     }
     if (size >= rotation_threshold_) ++rotations;
-    if (rotations > t.file_ids_left()) throw file_ids_exhausted();
+    if (rotations > file_ids_left()) throw file_ids_exhausted();
   }
 
   // Chunk-and-rotate loop: write entries in chunks, rotating between chunks

@@ -236,9 +236,9 @@ TEST_CASE("DataFile::append_entries writes the bytes append_entry would",
   std::filesystem::remove(dir / "bc_test_batched.data");
   std::filesystem::remove(dir / "bc_test_single.data");
   auto batched = bytecask::createDataFileForWrite(dir, "bc_test_batched", ".data", 4 << 20,
-                                                  io_backend, pool, /*file_id=*/21);
+                                                  io_backend, pool, bytecask::FileId::unpooled(21));
   auto single = bytecask::createDataFileForWrite(dir, "bc_test_single", ".data", 4 << 20,
-                                                 io_backend, pool, /*file_id=*/22);
+                                                 io_backend, pool, bytecask::FileId::unpooled(22));
 
   std::mt19937_64 rng{42};
   std::vector<std::string> keys;
@@ -450,7 +450,7 @@ TEST_CASE("WritableDataFile: fresh file has no unwritten extents",
       bytecask::BufferPoolOptions{.capacity_bytes = 4 * kCapacity}, kScratchBytes);
   auto file = bytecask::createDataFileForWrite(
       std::filesystem::temp_directory_path(), "bc_test_zero_fill", ".data",
-      kCapacity, io_backend, pool, /*file_id=*/1);
+      kCapacity, io_backend, pool, bytecask::FileId::unpooled(1));
   CHECK(file->size() == 0);
   // Zero-filled one chunk ahead, not to capacity.
   CHECK(std::filesystem::file_size(path) == bytecask::kZeroFillChunkBytes);
@@ -898,7 +898,7 @@ TEST_CASE("DataFileIterator sweeps across chunk boundaries", "[data_file][iterat
   {
     auto w = bytecask::createDataFileForWrite(dir, "chunks", ".data",
                                               kCapacity, io_backend, pool,
-                                              /*file_id=*/1);
+                                              bytecask::FileId::unpooled(1));
     std::uint64_t seq = 1;
     auto append = [&](std::string value) {
       auto key = std::format("key{:06d}", seq);
@@ -918,7 +918,7 @@ TEST_CASE("DataFileIterator sweeps across chunk boundaries", "[data_file][iterat
     if (sealed) {
       w->shrink_to_fit();
       w.reset();
-      file = bytecask::openDataFileForRead(path, io_backend, pool, 1);
+      file = bytecask::openDataFileForRead(path, io_backend, pool, bytecask::FileId::unpooled(1));
     } else {
       file = std::move(w);  // zero-filled tail past the last entry
     }
@@ -949,7 +949,7 @@ TEST_CASE("DataFileIterator sweeps across chunk boundaries", "[data_file][iterat
       file.reset();
       std::filesystem::resize_file(path,
                                    std::filesystem::file_size(path) - 3);
-      file = bytecask::openDataFileForRead(path, io_backend, pool, 1);
+      file = bytecask::openDataFileForRead(path, io_backend, pool, bytecask::FileId::unpooled(1));
       check_prefix(*file, expected.size() - 1);
     }
 
@@ -962,7 +962,7 @@ TEST_CASE("DataFileIterator sweeps across chunk boundaries", "[data_file][iterat
                                             bytecask::kHeaderSize));
         f.put('!');
       }
-      file = bytecask::openDataFileForRead(path, io_backend, pool, 1);
+      file = bytecask::openDataFileForRead(path, io_backend, pool, bytecask::FileId::unpooled(1));
       CHECK_THROWS_AS(
           [&] {
             for (const auto &e :
@@ -999,7 +999,7 @@ TEST_CASE("DataFile::read_raw stops at size()", "[data_file][iterator]") {
   std::shared_ptr<bytecask::DataFile> file;
   {
     auto w = bytecask::createDataFileForWrite(dir, "raw", ".data", kCapacity,
-                                              io_backend, pool, 1);
+                                              io_backend, pool, bytecask::FileId::unpooled(1));
     for (std::uint64_t seq = 1; seq <= 3; ++seq)
       (void)w->append_entry(seq, bytecask::EntryType::Put, to_bytes("key"),
                             to_bytes("value"));
@@ -1007,7 +1007,7 @@ TEST_CASE("DataFile::read_raw stops at size()", "[data_file][iterator]") {
     if (sealed) {
       w->shrink_to_fit();
       w.reset();
-      file = bytecask::openDataFileForRead(dir / "raw.data", io_backend, pool, 1);
+      file = bytecask::openDataFileForRead(dir / "raw.data", io_backend, pool, bytecask::FileId::unpooled(1));
     } else {
       file = std::move(w);  // zero-filled past size(), never returned
     }
@@ -1480,7 +1480,7 @@ TEST_CASE("DataFile::lend_record reads any record with or without a hint",
       bytecask::BufferPoolOptions{.capacity_bytes = 8 * kCapacity}, kScratchBytes);
   auto writer = bytecask::createDataFileForWrite(
       dir, "bc_test_lend_record", ".data", kCapacity, io_backend, pool,
-      /*file_id=*/7);
+      bytecask::FileId::unpooled(7));
   std::vector<bytecask::Offset> offsets;
   for (std::size_t i = 0; i < recs.size(); ++i)
     offsets.push_back(writer->append_entry(i + 1, bytecask::EntryType::Put,
@@ -1492,7 +1492,7 @@ TEST_CASE("DataFile::lend_record reads any record with or without a hint",
     writer->shrink_to_fit();
     writer.reset();
     file.reset();
-    file = bytecask::openDataFileForRead(path, io_backend, pool, /*file_id=*/8);
+    file = bytecask::openDataFileForRead(path, io_backend, pool, bytecask::FileId::unpooled(8));
   }
 
   std::vector<std::byte> io_buf;
@@ -1541,7 +1541,7 @@ TEST_CASE("DataFile::lend_record rejects a damaged record when verifying",
     f.seekp(static_cast<std::streamoff>(bytecask::kHeaderSize + 1));  // "k[e]y"
     f.put('E');
   }
-  auto file = bytecask::openDataFileForRead(path, io_backend, pool, 9);
+  auto file = bytecask::openDataFileForRead(path, io_backend, pool, bytecask::FileId::unpooled(9));
   std::vector<std::byte> io_buf;
   bytecask::FrameLease lease;
   CHECK_THROWS_AS(file->lend_record(0, 0, true, io_buf, lease),
@@ -1574,7 +1574,7 @@ TEST_CASE("DataFile::lend_record past the end names the file and offset",
       bytecask::BufferPoolOptions{.capacity_bytes = 8 << 20}, kScratchBytes);
   auto writer = bytecask::createDataFileForWrite(
       dir, "bc_test_lend_past_end", ".data", 1 << 20, io_backend, pool,
-      /*file_id=*/11);
+      bytecask::FileId::unpooled(11));
   (void)writer->append_entry(1, bytecask::EntryType::Put, to_bytes("a"),
                              to_bytes("first"));
   const auto second = writer->append_entry(2, bytecask::EntryType::Put,
@@ -1592,7 +1592,7 @@ TEST_CASE("DataFile::lend_record past the end names the file and offset",
   if (sealed) {
     writer.reset();
     file.reset();
-    file = bytecask::openDataFileForRead(path, io_backend, pool, 12);
+    file = bytecask::openDataFileForRead(path, io_backend, pool, bytecask::FileId::unpooled(12));
   }
 
   std::vector<std::byte> io_buf;
@@ -1670,7 +1670,7 @@ TEST_CASE("DataFile: a sealed file's short last frame does not serve a record "
   auto pool = std::make_shared<bytecask::BufferPool>(
       bytecask::BufferPoolOptions{.capacity_bytes = 32 << 20}, kScratchBytes);
   const auto file = bytecask::openDataFileForRead(
-      path, bytecask::IoBackend::BufferPool, pool, 1);
+      path, bytecask::IoBackend::BufferPool, pool, bytecask::FileId::unpooled(1));
   std::vector<std::byte> io_buf;
   std::vector<std::byte> out;
   for (int i = 0; i < 2; ++i) {
@@ -1872,7 +1872,7 @@ TEST_CASE("DataFile::lend_record: a failed pread throws std::system_error",
   std::filesystem::remove(path);
   auto writer = bytecask::createDataFileForWrite(
       dir, "bc_test_lend_io_error", ".data", 1 << 20,
-      bytecask::IoBackend::Pread, nullptr, /*file_id=*/13);
+      bytecask::IoBackend::Pread, nullptr, bytecask::FileId::unpooled(13));
   (void)writer->append_entry(1, bytecask::EntryType::Put, to_bytes("a"),
                              to_bytes("value"));
   writer->sync();
@@ -1882,7 +1882,7 @@ TEST_CASE("DataFile::lend_record: a failed pread throws std::system_error",
     writer.reset();
     file.reset();
     file = bytecask::openDataFileForRead(path, bytecask::IoBackend::Pread,
-                                         nullptr, 14);
+                                         nullptr, bytecask::FileId::unpooled(14));
   }
   // Cut the file under the open descriptor: the record's bytes are gone, and
   // pread returns end of file where the file object expects the record.
@@ -1976,7 +1976,7 @@ TEST_CASE("DataFile: records across buffer pool frames read whole",
   const auto recs = straddlers();
   auto writer = bytecask::createDataFileForWrite(
       dir, "bc_test_straddle", ".data", 1 << 20,
-      bytecask::IoBackend::BufferPool, pool, /*file_id=*/21);
+      bytecask::IoBackend::BufferPool, pool, bytecask::FileId::unpooled(21));
   const auto offsets = write_straddlers(*writer, recs);
   writer->sync();
   std::shared_ptr<bytecask::DataFile> file = writer;
@@ -1985,7 +1985,7 @@ TEST_CASE("DataFile: records across buffer pool frames read whole",
     writer.reset();
     file.reset();
     file = bytecask::openDataFileForRead(path, bytecask::IoBackend::BufferPool,
-                                         pool, /*file_id=*/22);
+                                         pool, bytecask::FileId::unpooled(22));
   }
 
   std::vector<std::byte> io_buf;
@@ -2039,7 +2039,7 @@ TEST_CASE("DataFile: a damaged record across pool frames fails verification",
   auto pool = std::make_shared<bytecask::BufferPool>(
       bytecask::BufferPoolOptions{.capacity_bytes = 8 << 20}, kScratchBytes);
   auto file = bytecask::openDataFileForRead(
-      path, bytecask::IoBackend::BufferPool, pool, /*file_id=*/23);
+      path, bytecask::IoBackend::BufferPool, pool, bytecask::FileId::unpooled(23));
   std::vector<std::byte> io_buf;
   std::vector<std::byte> out;
   bytecask::FrameLease lease;
@@ -2100,7 +2100,7 @@ TEST_CASE("DataFile: a sealed file past 4 GiB keeps its size and its records",
     auto pool = std::make_shared<bytecask::BufferPool>(
         bytecask::BufferPoolOptions{.capacity_bytes = 1 << 20}, kScratchBytes);
     const auto file = bytecask::openDataFileForRead(
-        path, bytecask::IoBackend::BufferPool, pool, /*file_id=*/7);
+        path, bytecask::IoBackend::BufferPool, pool, bytecask::FileId::unpooled(7));
     check(*file);
     // The frame holding the record was admitted, and release_file finds it:
     // a wrapped size counts no frames and frees nothing.

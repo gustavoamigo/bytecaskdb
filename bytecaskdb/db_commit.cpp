@@ -211,7 +211,7 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
   auto any_sync = false;
   // Without an id for the next file the active file cannot be rotated, so a
   // write that would take it to the threshold is refused before any I/O.
-  const auto can_rotate = t.file_ids_left() > 0;
+  const auto can_rotate = file_ids_left() > 0;
 
   // Phase 1: pure in-memory — validate, prepare, pre-compute offsets,
   // apply_writes for each slot sequentially, up to the slot that reaches

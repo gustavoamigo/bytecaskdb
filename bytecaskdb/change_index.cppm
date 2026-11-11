@@ -11,8 +11,9 @@
 //
 // A cache, not state: in memory only, built by scans, never persisted. Every
 // bookmark names a unit boundary that was durable when the scan saw it, in a
-// file that is append-only, so it holds for the file's life; vacuum writes
-// into a new file id and an id is never reused. The scan checks the header at
+// file that is append-only, so it holds for the file's life. Tables are keyed
+// by the file's serial, which is never reused, not its engine id, which is
+// once nothing reads the file (#774). The scan checks the header at
 // the bookmark all the same, and drops the file's table if it does not carry the
 // bookmark's sequence. Bounded: at most max_files tables, least recently used
 // out, and a table that reaches max_bookmarks halves its density, so a file of
@@ -67,14 +68,14 @@ public:
                        std::size_t max_bookmarks = kMaxBookmarksPerFile)
       : max_files_{max_files}, max_bookmarks_{max_bookmarks} {}
 
-  // The last bookmark of file_id at or below `from`: where a scan for the
+  // The last bookmark of file_key at or below `from`: where a scan for the
   // sequences above `from` can start. The unit there is at or below `from`,
   // so the scan's own filter skips it and misses nothing between the bookmark
   // and `from`. nullopt if the file has no table, or none that low.
-  [[nodiscard]] auto seek(std::uint32_t file_id, std::uint64_t from)
+  [[nodiscard]] auto seek(std::uint64_t file_key, std::uint64_t from)
       -> std::optional<Bookmark> {
     std::lock_guard<std::mutex> lk{mu_};
-    auto it = tables_.find(file_id);
+    auto it = tables_.find(file_key);
     if (it == tables_.end()) return std::nullopt;
     it->second.used = ++clock_;
     const auto &bookmarks = it->second.bookmarks;
@@ -84,11 +85,11 @@ public:
     return *std::prev(above);
   }
 
-  // Where a scan of file_id lays its next bookmark. A file without a table
+  // Where a scan of file_key lays its next bookmark. A file without a table
   // starts a spacing in: a bookmark at offset 0 would save nothing.
-  [[nodiscard]] auto plan(std::uint32_t file_id) const -> BookmarkPlan {
+  [[nodiscard]] auto plan(std::uint64_t file_key) const -> BookmarkPlan {
     std::lock_guard<std::mutex> lk{mu_};
-    auto it = tables_.find(file_id);
+    auto it = tables_.find(file_key);
     if (it == tables_.end()) return {kBookmarkSpacing, kBookmarkSpacing, 0};
     return it->second.plan();
   }
@@ -102,15 +103,15 @@ public:
   // the table, the least recently used one out past max_files. nullopt when
   // the bookmarks went to no table: the plan's table is gone, or another has
   // taken its place; the scan then lays no more for this file.
-  [[nodiscard]] auto extend(std::uint32_t file_id, std::uint64_t generation,
+  [[nodiscard]] auto extend(std::uint64_t file_key, std::uint64_t generation,
                             std::span<const Bookmark> bookmarks)
       -> std::optional<BookmarkPlan> {
     std::lock_guard<std::mutex> lk{mu_};
-    auto it = tables_.find(file_id);
+    auto it = tables_.find(file_key);
     if (it == tables_.end()) {
       if (generation != 0) return std::nullopt;
       if (tables_.size() >= max_files_) evict_oldest();
-      it = tables_.try_emplace(file_id).first;
+      it = tables_.try_emplace(file_key).first;
       it->second.generation = ++clock_;
     } else if (it->second.generation != generation) {
       return std::nullopt;
@@ -131,9 +132,9 @@ public:
     return t.plan();
   }
 
-  void forget(std::uint32_t file_id) {
+  void forget(std::uint64_t file_key) {
     std::lock_guard<std::mutex> lk{mu_};
-    tables_.erase(file_id);
+    tables_.erase(file_key);
   }
 
   void clear() {
@@ -156,22 +157,22 @@ public:
     for (const auto &[_, t] : tables_) n += t.bookmarks.size() * sizeof(Bookmark);
     return n;
   }
-  [[nodiscard]] auto file_ids() const -> std::vector<std::uint32_t> {
+  [[nodiscard]] auto file_keys() const -> std::vector<std::uint64_t> {
     std::lock_guard<std::mutex> lk{mu_};
-    std::vector<std::uint32_t> ids;
+    std::vector<std::uint64_t> ids;
     for (const auto &[id, _] : tables_) ids.push_back(id);
     std::ranges::sort(ids);
     return ids;
   }
-  [[nodiscard]] auto bookmarks(std::uint32_t file_id) const
+  [[nodiscard]] auto bookmarks(std::uint64_t file_key) const
       -> std::vector<Bookmark> {
     std::lock_guard<std::mutex> lk{mu_};
-    auto it = tables_.find(file_id);
+    auto it = tables_.find(file_key);
     return it == tables_.end() ? std::vector<Bookmark>{} : it->second.bookmarks;
   }
-  [[nodiscard]] auto spacing(std::uint32_t file_id) const -> Offset {
+  [[nodiscard]] auto spacing(std::uint64_t file_key) const -> Offset {
     std::lock_guard<std::mutex> lk{mu_};
-    auto it = tables_.find(file_id);
+    auto it = tables_.find(file_key);
     return it == tables_.end() ? kBookmarkSpacing : it->second.spacing;
   }
 
@@ -204,7 +205,7 @@ private:
   }
 
   mutable std::mutex mu_;
-  std::unordered_map<std::uint32_t, Table> tables_;
+  std::unordered_map<std::uint64_t, Table> tables_;
   std::uint64_t clock_{0};
   std::size_t max_files_;
   std::size_t max_bookmarks_;

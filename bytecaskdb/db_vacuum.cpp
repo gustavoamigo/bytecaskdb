@@ -211,7 +211,6 @@ auto DB::vacuum_scan_and_copy(
 void DB::vacuum_commit(std::uint32_t old_file_id,
                              const VacuumScanResult &scan,
                              std::shared_ptr<DataFile> new_sealed_file,
-                             std::uint32_t dest_file_id,
                              std::uint64_t decided_at) {
   auto current = load_state_for_write();
   auto t = current->transient();
@@ -224,7 +223,7 @@ void DB::vacuum_commit(std::uint32_t old_file_id,
     if (refused(*current)) throw DbDegraded{degraded_reason()};
     sync_active_file(t, current, "vacuum");
   }
-  t.apply_vacuum(old_file_id, scan, std::move(new_sealed_file), dest_file_id);
+  t.apply_vacuum(old_file_id, scan, std::move(new_sealed_file));
 
   store_state(current, std::move(t).persistent());
 }
@@ -244,11 +243,14 @@ void DB::vacuum_unlink_old_file(
   std::filesystem::remove(old_data_file->path());
   std::filesystem::remove(old_hint_path);
   // Its frames would otherwise hold a frame each until the SIEVE hand came
-  // round, which in a pool that rarely misses is a long time.
+  // round, which in a pool that rarely misses is a long time. Both caches key
+  // by the file's serial: what a reader still on an older state adds after
+  // this is never found by the file that later reuses its id.
+  const auto serial = old_data_file->serial();
   if (pool_) {
-    pool_->release_file(file_id, old_data_file->size());
+    pool_->release_file(serial, old_data_file->size());
   }
-  change_index_->forget(file_id);
+  change_index_->forget(serial);
   counters_.vacuum_files_unlinked.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -261,8 +263,8 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, const VacuumOptions &opts)
     -> bool {
   auto snap = load_state_for_write();
   // Checked again where the id is reserved; here so a vacuum that cannot
-  // finish does not copy the file first.
-  if (snap->next_file_id > KeyDirEntry::kMaxFileId) throw file_ids_exhausted();
+  // finish does not copy the file first. Ids only come back meanwhile.
+  if (file_ids_left() == 0) throw file_ids_exhausted();
   const auto &old_file = **snap->files.get(file_id);
 
   const auto stem = make_data_file_stem();
@@ -334,8 +336,8 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, const VacuumOptions &opts)
   // writes for it, staged or renamed, hint first as recovery removes them.
   // Only once the rename succeeded: until then the final name may be a file
   // rotation minted. Frames the hint scan admits under the buffer pool are
-  // left to eviction if the copy goes: their file id was reserved for it and
-  // is never reused.
+  // left to eviction if the copy goes: they are keyed by the copy's serial,
+  // which is never reused.
   cleanup.paths = {dir_ / (stem + ".hint.tmp"), dir_ / (stem + ".hint"),
                    final_data_path};
   // The source is unlinked once this commits. Were that unlink durable and
@@ -354,26 +356,23 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, const VacuumOptions &opts)
   if (vacuum_cancelled(opts)) return false;
 
   // Reserve the destination id before opening the file, so the file carries
-  // its engine file_id from construction — the buffer pool keys frames by it.
-  // Reading next_file_id_ outside the barrier would race rotation, which
-  // mints from the same counter, so the reservation is published first and
-  // the commit below consumes it.
-  std::uint32_t dest_file_id = 0;
+  // it from construction — the buffer pool keys frames by its serial. Under
+  // the barrier: the write path checks for a free id and then takes one, and
+  // nothing may take it in between. If the vacuum stops before the commit,
+  // the copy's DataFile goes and the id comes back.
+  std::shared_ptr<const FileId> dest_id;
   {
     WriteBarrier barrier{*this};
-    auto current = load_state_for_write();
-    auto t = current->transient();
-    dest_file_id = t.reserve_file_id();
-    store_state(current, std::move(t).persistent());
+    dest_id = reserve_file_id();
   }
 
   auto new_file = openDataFileForRead(final_data_path, io_backend_, pool_,
-                                      dest_file_id);
+                                      std::move(dest_id));
   flush_hints_for(new_file, dir_);
 
   {
     WriteBarrier barrier{*this};
-    vacuum_commit(file_id, scan, new_file, dest_file_id,
+    vacuum_commit(file_id, scan, new_file,
                   snap->next_seq > 0 ? snap->next_seq - 1 : 0);
   }
   // Published: the copy is the file now. A failure from here on, the source's
@@ -402,8 +401,8 @@ void DB::vacuum_remove_file(std::uint32_t file_id) {
   {
     WriteBarrier barrier{*this};
     VacuumScanResult empty{};
-    // No new sealed file, so no id is consumed.
-    vacuum_commit(file_id, empty, nullptr, 0,
+    // No new sealed file, so no id is taken.
+    vacuum_commit(file_id, empty, nullptr,
                   snap->next_seq > 0 ? snap->next_seq - 1 : 0);
   }
   counters_.vacuum_bytes_reclaimed.fetch_add(

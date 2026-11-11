@@ -199,8 +199,8 @@ private:
         in_batch_ = false;
         auto file_ptr = state_->files.get(file_id);
         if (file_ptr) {
-          file_id_ = file_id;
-          plan_ = index_->plan(file_id);
+          file_key_ = (*file_ptr)->serial();
+          plan_ = index_->plan(file_key_);
           laying_ = true;
           Offset start = 0;
           if (min_sequence <= from_sequence_) start = seek(**file_ptr);
@@ -229,13 +229,13 @@ private:
   // check costs one header read.
   auto seek(const DataFile& file) -> Offset {
     auto& counters = index_->counters();
-    if (auto bookmark = index_->seek(file_id_, from_sequence_)) {
+    if (auto bookmark = index_->seek(file_key_, from_sequence_)) {
       if (bookmark_holds(file, *bookmark)) {
         counters.hits.fetch_add(1, std::memory_order_relaxed);
         return bookmark->offset;
       }
-      index_->forget(file_id_);
-      plan_ = index_->plan(file_id_);
+      index_->forget(file_key_);
+      plan_ = index_->plan(file_key_);
     }
     counters.misses.fetch_add(1, std::memory_order_relaxed);
     return 0;
@@ -271,7 +271,7 @@ private:
   void hand_over_bookmarks() noexcept {
     if (pending_bookmarks_.empty()) return;
     try {
-      if (auto next = index_->extend(file_id_, plan_.generation, pending_bookmarks_)) {
+      if (auto next = index_->extend(file_key_, plan_.generation, pending_bookmarks_)) {
         plan_ = *next;
       } else {
         laying_ = false;
@@ -310,7 +310,7 @@ private:
   // Current file's committed entry scanner, and the bookmarks laid in it.
   std::optional<CommittedEntryIterator> entry_iter_;
   bool needs_advance_{false};
-  std::uint32_t file_id_{0};
+  std::uint64_t file_key_{0};  // the current file's serial: the index's key
   BookmarkPlan plan_{};
   bool laying_{false};  // false once the table this scan extends is gone
   std::vector<Bookmark> pending_bookmarks_;

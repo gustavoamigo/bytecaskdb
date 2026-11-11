@@ -78,7 +78,7 @@ void DB::resume() {
   auto t = current->transient();
   // resume() seals the active file and needs an id for the next one; without
   // it nothing is touched and the engine stays degraded until a reopen.
-  if (t.file_ids_left() == 0) throw file_ids_exhausted();
+  if (file_ids_left() == 0) throw file_ids_exhausted();
   const auto old_file_id = t.active_file_id();
   auto &file = t.active_file();
 
@@ -178,7 +178,7 @@ void DB::resume() {
 
   // Open the old active as read-only for hint generation.
   auto read_only_old = openDataFileForRead(file.path(), io_backend_, pool_,
-                                         old_file_id);
+                                           file.id_lease());
 
   // Dispatch hint generation — idempotent (flush_hints_for skips files
   // whose .hint already exists).
@@ -188,15 +188,14 @@ void DB::resume() {
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_resume_file_creation);
 #endif
-  const auto new_file_id = t.reserve_file_id();
-  auto new_file = create_active_file(new_file_id, "io_dir_sync_resume");
+  auto new_file = create_active_file(reserve_file_id(), "io_dir_sync_resume");
+  const auto new_file_serial = new_file->serial();
 
   // Build and publish new state. Replay scanned entries into key_dir so that
   // entries on disk but not yet in EngineState become visible.
   t.apply_resume(old_file_id, committed, valid_offset);
-  t.apply_rotate_file(std::move(read_only_old), std::move(new_file),
-                      new_file_id);
-  if (pool_) pool_->set_active_file(new_file_id);
+  t.apply_rotate_file(std::move(read_only_old), std::move(new_file));
+  if (pool_) pool_->set_active_file(new_file_serial);
   // Every entry replayed was read after rewrite_durably synced it.
   t.apply_sync(t.next_seq() > 0 ? t.next_seq() - 1 : 0);
   t.apply_clear_degraded();

@@ -1012,7 +1012,6 @@ export struct EngineState {
   PersistentU32Table<std::shared_ptr<DataFile>> files;
   FileStatsMap file_stats;
   std::uint32_t active_file_id{};
-  std::uint32_t next_file_id{};
   std::uint64_t next_seq{1};
   std::uint64_t durable_seq{0};
   // Highest sequence written by a sync=true slot. A state whose
@@ -1084,7 +1083,6 @@ export struct EngineState {
   [[nodiscard]] auto closed_copy() const -> std::shared_ptr<EngineState> {
     auto s = std::make_shared<EngineState>(scratch_bytes);
     s->active_file_id = active_file_id;
-    s->next_file_id = next_file_id;
     s->next_seq = next_seq;
     s->durable_seq = durable_seq;
     s->sync_requested_seq = sync_requested_seq;

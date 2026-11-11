@@ -8088,7 +8088,6 @@ auto make_state(
     -> std::shared_ptr<bytecask::EngineState> {
   auto s = std::make_shared<bytecask::EngineState>(std::size_t{1} << 20);
   s->active_file_id = 1;
-  s->next_file_id = 2;
   s->next_seq = 100;
   for (const auto &[k, v] : entries) {
     s->key_dir = s->key_dir.set(to_bytes(k), v);
@@ -11884,6 +11883,133 @@ TEST_CASE("Limits: resume without a file id leaves the engine degraded and "
   db.put({}, to_bytes("c"), to_bytes("3"));
 }
 
+// ---------------------------------------------------------------------------
+// File ids are reused once nothing can read the file they named (#774).
+// CONTRACT.md, *Limits*: "File ids" counts files held at once, not files
+// created; docs/bytecask_design.md, *File id reuse*.
+// ---------------------------------------------------------------------------
+
+namespace {
+// Lets go of what this thread's read cache and the hint worker hold of older
+// states, so a file nothing else reads gives its id back.
+void release_old_states(bytecask::DB &db) {
+  db.test_drain_hints();
+  (void)db.contains_key({}, to_bytes("~"));
+}
+}  // namespace
+
+TEST_CASE("File ids: a server that keeps rotating and vacuuming reuses the "
+          "ids of the files it removed", "[bytecask][limits][file_ids]") {
+  using E = bytecask::KeyDirEntry;
+  TempDir td;
+  const auto dir = td.path / "db";
+  const bytecask::Options opts{.max_file_bytes = 256};
+  // A value past max_file_bytes seals the file it lands in: each overwrite
+  // of "a" leaves the previous file holding nothing live.
+  auto value = [](int i) { return std::string(300, static_cast<char>('a' + i % 26)); };
+  constexpr int kCycles = 40;
+  {
+    auto db = bytecask::DB::open(dir, opts);
+    auto &ids = db.test_file_id_pool();
+    db.put({}, to_bytes("a"), to_bytes(value(0)));
+    db.put({}, to_bytes("a"), to_bytes(value(1)));
+    // No id that was never used is left: every rotation below takes one
+    // that a removed file gave back.
+    db.test_set_next_file_id(E::kMaxFileId + 1);
+    REQUIRE(ids.left() == 0);
+    for (int i = 2; i < kCycles; ++i) {
+      REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+      release_old_states(db);
+      CHECK(ids.left() == 1);
+      db.put({}, to_bytes("a"), to_bytes(value(i)));
+      CHECK(ids.left() == 0);
+      CHECK(get_str(db, to_bytes("a")) == value(i));
+      CHECK(db.engine_state()->active_file_id < 3);
+      CHECK_FALSE(db.is_degraded());
+    }
+  }
+  auto db = bytecask::DB::open(dir, opts);
+  CHECK(get_str(db, to_bytes("a")) == value(kCycles - 1));
+}
+
+TEST_CASE("File ids: a snapshot or a write plan holds the ids of the files it "
+          "can read", "[bytecask][limits][file_ids]") {
+  using E = bytecask::KeyDirEntry;
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 256});
+  auto &ids = db.test_file_id_pool();
+  const std::string v1(300, '1');
+  const std::string v2(300, '2');
+  db.put({}, to_bytes("a"), to_bytes(v1));  // sealed in the first file
+  auto snap = std::make_optional(db.snapshot());
+  db.put({}, to_bytes("a"), to_bytes(v2));
+  db.test_set_next_file_id(E::kMaxFileId + 1);
+
+  // The first file holds nothing live: vacuum removes it, and the snapshot
+  // still reads it.
+  REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+  REQUIRE(db.file_stats().size() == 2);
+  release_old_states(db);
+  CHECK(ids.left() == 0);
+  bytecask::Bytes out;
+  REQUIRE(snap->get({}, to_bytes("a"), out));
+  CHECK(to_string(out) == v1);
+
+  // A plan resolved against the snapshot holds it, and so the file: the
+  // location its W-W check compares names the record it read.
+  auto plan = std::make_optional(bytecask::WritePlan{std::move(*snap)});
+  snap.reset();
+  plan->put(to_bytes("a"), to_bytes("3"));
+  release_old_states(db);
+  CHECK(ids.left() == 0);
+  // "a" changed since the snapshot: the plan conflicts.
+  CHECK_FALSE(db.apply_batch({}, std::move(*plan)));
+  plan.reset();
+  release_old_states(db);
+  CHECK(ids.left() == 1);
+  CHECK(get_str(db, to_bytes("a")) == v2);
+}
+
+TEST_CASE("File ids: a file that reuses an id never reads the buffer pool "
+          "frames of the file that had it", "[bytecask][limits][file_ids]") {
+  TempDir td;
+  auto db = bytecask::DB::open(
+      td.path / "db", {.max_file_bytes = 256,
+                       .io_backend = bytecask::IoBackend::BufferPool,
+                       .buffer_pool = {.capacity_bytes = 1 << 20}});
+  auto &ids = db.test_file_id_pool();
+  const std::string a1(300, '1');
+  const std::string a2(300, '2');
+  const std::string e(300, 'e');
+  db.put({}, to_bytes("a"), to_bytes(a1));  // file 0: [a1]
+  auto snap = std::make_optional(db.snapshot());
+  db.put({}, to_bytes("d"), to_bytes("small"));
+  db.put({}, to_bytes("e"), to_bytes(e));   // file 1: [d, e]
+  db.put({}, to_bytes("a"), to_bytes(a2));  // file 2: [a2]
+  (void)db.del({}, to_bytes("d"));
+  const auto first = db.file_stats().begin()->first;
+  const auto left = ids.left();
+
+  // Only file 0 is all dead: it goes, and vacuum releases its frames.
+  REQUIRE(db.vacuum({.fragmentation_threshold = 0.99}));
+  REQUIRE_FALSE(db.file_stats().contains(first));
+  // A reader still on the old state reads it into the pool again.
+  bytecask::Bytes out;
+  REQUIRE(snap->get({}, to_bytes("a"), out));
+  CHECK(to_string(out) == a1);
+  snap.reset();
+  release_old_states(db);
+  REQUIRE(ids.left() == left + 1);
+
+  // Compacting file 1 takes the id file 0 gave back; its first record, e,
+  // sits where a1 sat in file 0.
+  REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+  CHECK(db.file_stats().contains(first));
+  CHECK(get_str(db, to_bytes("e")) == e);
+  CHECK(get_str(db, to_bytes("a")) == a2);
+  CHECK_FALSE(db.contains_key({}, to_bytes("d")));
+}
+
 TEST_CASE("Limits: durable_sequence waits with a timeout the clock cannot "
           "represent", "[bytecask][limits][concurrency]") {
   TempDir td;
@@ -15385,31 +15511,21 @@ TEST_CASE("pipeline: publishing a state that owes an fdatasync degrades the "
   CHECK(s->durable_seq >= s->sync_requested_seq);
 }
 
-TEST_CASE("pipeline: publishing a state that moves a sequence or a file id "
-          "backwards degrades the engine",
+// File ids are reused (#774), so a file id moving down is no invariant.
+TEST_CASE("pipeline: publishing a state that moves a sequence backwards "
+          "degrades the engine",
           "[pipeline][invariants][degraded][resume]") {
   TempDir td;
-  // A file sealed after every write, so the active file id and the next one
-  // are both past their first values and can move back.
   auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 0});
   db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
   db.put({.sync = true}, to_bytes("k1"), to_bytes("v2"));
 
   const auto before = db.engine_state();
-  REQUIRE(before->active_file_id > 0);
   auto bad = std::make_shared<bytecask::EngineState>(*before);
   std::string reason;
   SECTION("next_seq") {
     bad->next_seq -= 1;
     reason = "next_seq regressed";
-  }
-  SECTION("active_file_id") {
-    bad->active_file_id -= 1;
-    reason = "active_file_id regressed";
-  }
-  SECTION("next_file_id") {
-    bad->next_file_id -= 1;
-    reason = "next_file_id regressed";
   }
   SECTION("durable_seq") {
     bad->durable_seq -= 1;
@@ -15425,8 +15541,6 @@ TEST_CASE("pipeline: publishing a state that moves a sequence or a file id "
   // state before it, and reads are served from it.
   const auto after = db.engine_state();
   CHECK(after->next_seq == before->next_seq);
-  CHECK(after->active_file_id == before->active_file_id);
-  CHECK(after->next_file_id == before->next_file_id);
   CHECK(after->durable_seq == before->durable_seq);
   bytecask::Bytes out;
   REQUIRE(db.get({}, to_bytes("k1"), out));

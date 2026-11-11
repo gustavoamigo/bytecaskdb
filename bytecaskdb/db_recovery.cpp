@@ -221,7 +221,9 @@ auto DB::recovery_prepare_files(EngineState &s)
   auto files_t = s.files.transient();
 
   for (const auto &p : data_paths) {
-    const auto file_id = s.next_file_id++;
+    // Held across the cut below, which drops the file: the reopen keeps the id.
+    const auto id = reserve_file_id();
+    const auto file_id = id->id();
     const auto hint_path = dir_ / (p.stem().string() + ".hint");
     const auto hintless = !std::filesystem::exists(hint_path);
     // A file without a hint was the active file when the last process
@@ -235,7 +237,7 @@ auto DB::recovery_prepare_files(EngineState &s)
     // No writer says where its entries end, so the whole file.
     if (hintless) rewrite_durably(p, std::filesystem::file_size(p));
     auto data_file =
-        openDataFileForRead(p, io_backend_, pool_, file_id);
+        openDataFileForRead(p, io_backend_, pool_, id);
 
     if (hintless) {
       // Whatever lies past the file's last committed record goes, once
@@ -258,12 +260,12 @@ auto DB::recovery_prepare_files(EngineState &s)
         }
       });
       if (cut) {
-        // Same file_id as the open above, deliberately. Under the buffer
-        // pool that open's hint scan may have admitted frames under this id,
-        // but the truncate only drops a tail: every byte below the end is
-        // unchanged, and no reader addresses anything above it. Frames past
-        // the new end are orphans CLOCK reclaims.
-        data_file = openDataFileForRead(p, io_backend_, pool_, file_id);
+        // Same FileId as the open above, so the same serial, deliberately.
+        // Under the buffer pool that open's hint scan may have admitted
+        // frames under it, but the truncate only drops a tail: every byte
+        // below the end is unchanged, and no reader addresses anything above
+        // it. Frames past the new end are orphans CLOCK reclaims.
+        data_file = openDataFileForRead(p, io_backend_, pool_, id);
       }
     }
     files_t.set(file_id, data_file);
