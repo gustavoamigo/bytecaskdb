@@ -1,0 +1,18 @@
+An insert uses the position prepared in a leaf when it reaches the plan's
+changed copy of that leaf, whose entries have moved: the key lands out of
+order (#754).
+Guarded-by: "blind tree model: writes down paths prepared in an earlier version decide what writes by key decide"
+
+diff --git a/bytecaskdb/blind_btree.cppm b/bytecaskdb/blind_btree.cppm
+index a7d70663..ccae95ee 100644
+--- a/bytecaskdb/blind_btree.cppm
++++ b/bytecaskdb/blind_btree.cppm
+@@ -1559,7 +1559,7 @@ public:
+     blind_detail::check_ref(key, ref);
+     ++writes_;
+     const auto r = session_.upsert(root_, key, ref, res, should_replace, p,
+-                                   route_now == Route::kSame && p.pos.has_value());
++                                   route_now != Route::kKey && p.pos.has_value());
+     follow(f);
+     if (!r.changed)
+       return std::nullopt;

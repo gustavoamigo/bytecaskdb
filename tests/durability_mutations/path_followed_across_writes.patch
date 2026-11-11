@@ -1,0 +1,17 @@
+A plan's copy of a leaf is followed even after other writes ran since the
+plan made it, which may have split or freed it (#754).
+Guarded-by: "blind tree: a path is replayed to its leaf\, or to the plan's copy of it until another write\, and missed after a split"
+
+diff --git a/bytecaskdb/blind_btree.cppm b/bytecaskdb/blind_btree.cppm
+index a7d70663..694dd305 100644
+--- a/bytecaskdb/blind_btree.cppm
++++ b/bytecaskdb/blind_btree.cppm
+@@ -1515,7 +1515,7 @@ public:
+     const auto at = node_address(cur);
+     if (at == p.leaf && cur->tag == p.leaf_tag)
+       return Route::kSame;
+-    if (at == f.now && f.write == writes_)
++    if (at == f.now)
+       return Route::kFollowed;
+     return Route::kKey;
+   }

@@ -1251,11 +1251,21 @@ protected:
   // half and its separator (in sep_) up; this places them in the parent.
   template <typename LeafStep>
   auto descend_upsert(N *node, Bytes key, LeafStep &leaf_step) -> Result {
+    const auto by_key = [key](const N *n, std::size_t) {
+      return n->child_index(key);
+    };
+    return descend_upsert_by(node, by_key, 0, leaf_step);
+  }
+  // As descend_upsert, taking at each inner node the child pick(node, depth)
+  // names. A pick that leaves the key's leaf is the caller's error.
+  template <typename Pick, typename LeafStep>
+  auto descend_upsert_by(N *node, const Pick &pick, std::size_t depth,
+                         LeafStep &leaf_step) -> Result {
     if (node->is_leaf)
       return leaf_step(node);
-    const auto idx = node->child_index(key);
+    const std::uint32_t idx = pick(static_cast<const N *>(node), depth);
     auto *child = node->child(idx);
-    const auto r = descend_upsert(child, key, leaf_step);
+    const auto r = descend_upsert_by(child, pick, depth + 1, leaf_step);
     if (!r.changed)
       return {node, nullptr, false, false};
     auto *n = own(node);
@@ -1273,10 +1283,20 @@ protected:
   // discards it and returns a null node, and the parent drops the child.
   template <typename LeafStep>
   auto descend_erase(N *node, Bytes key, LeafStep &leaf_step) -> Result {
+    const auto by_key = [key](const N *n, std::size_t) {
+      return n->child_index(key);
+    };
+    return descend_erase_by(node, by_key, 0, leaf_step);
+  }
+  // As descend_erase, choosing children as descend_upsert_by does.
+  template <typename Pick, typename LeafStep>
+  auto descend_erase_by(N *node, const Pick &pick, std::size_t depth,
+                        LeafStep &leaf_step) -> Result {
     if (node->is_leaf)
       return leaf_step(node);
-    const auto idx = node->child_index(key);
-    const auto r = descend_erase(node->child(idx), key, leaf_step);
+    const std::uint32_t idx = pick(static_cast<const N *>(node), depth);
+    const auto r =
+        descend_erase_by(node->child(idx), pick, depth + 1, leaf_step);
     if (!r.changed)
       return {node, nullptr, false, false};
     auto *n = own(node);
@@ -2258,6 +2278,17 @@ public:
     if (keys != size_)
       throw std::logic_error{"btree: size does not match key count"};
     return leaf_depth;
+  }
+
+public:
+  // The version this tree is: two trees with one version are one tree.
+  [[nodiscard]] auto version() const noexcept -> std::uint64_t {
+    return version_;
+  }
+  // Whether a tree derived from this one is still alive, so this one
+  // cannot be derived from again. The empty tree (version 0) can always be.
+  [[nodiscard]] auto has_successor() const -> bool {
+    return version_ != 0 && chain().has_successor(version_);
   }
 
 private:

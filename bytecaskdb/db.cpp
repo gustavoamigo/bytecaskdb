@@ -375,6 +375,32 @@ auto DB::apply_batch(WriteOptions opts,
   if (!test_resolve_by_key_)
 #endif
     slot.plan.resolve_snapshot_entries();
+  {
+    // One head for the paths and the validation, and the generation read
+    // before it: a head the engine goes back from later carries the old
+    // generation, and neither is used (store_head). The head is let go
+    // before the writer joins a batch: while it is held, resume() cannot
+    // derive from the published state, and waits (see "Holders of the
+    // head" in docs/bytecask_design.md).
+    const auto generation = head_generation_.load();
+    const auto head = load_head();
+    if constexpr (kKeyDirReadsKeys) {
+#ifdef BYTECASK_TESTING
+      if (!test_no_paths_)
+#endif
+        slot.plan.prepare_paths(*head, generation);
+    }
+#ifdef BYTECASK_TESTING
+    if (!test_no_prepared_validation_)
+#endif
+      slot.plan.prepare_validation(*head, generation, *recent_writes_);
+#ifdef BYTECASK_TESTING
+    if (test_while_preparing_) test_while_preparing_();
+#endif
+  }
+#ifdef BYTECASK_TESTING
+  if (test_after_prepare_) test_after_prepare_();
+#endif
 
   const bool use_solo = opts.solo
       || slot.plan.write_bytes() > kGroupWriteMaxBytes;
@@ -447,6 +473,16 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        counters_.group_writer_coalesced.load(std::memory_order_relaxed)},
       {"bytecask.write_check_fallbacks",
        counters_.write_check_fallbacks.load(std::memory_order_relaxed)},
+      {"bytecask.write_paths_replayed",
+       counters_.write_paths_replayed.load(std::memory_order_relaxed)},
+      {"bytecask.write_paths_missed",
+       counters_.write_paths_missed.load(std::memory_order_relaxed)},
+      {"bytecask.write_paths_stale",
+       counters_.write_paths_stale.load(std::memory_order_relaxed)},
+      {"bytecask.validations_prepared",
+       counters_.validations_prepared.load(std::memory_order_relaxed)},
+      {"bytecask.validations_in_section",
+       counters_.validations_in_section.load(std::memory_order_relaxed)},
       {"bytecask.group_writer_busy_us",
        counters_.group_writer_busy_ns.load(std::memory_order_relaxed) / 1000},
       {"bytecask.file_rotations",

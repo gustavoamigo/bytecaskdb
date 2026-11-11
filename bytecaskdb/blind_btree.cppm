@@ -15,6 +15,7 @@
 
 module;
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cassert>
 #include <concepts>
@@ -22,6 +23,7 @@ module;
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -64,6 +66,84 @@ static_assert(kBlindLeafBytes == kBTreeNodeBytes,
 export template <typename R>
 concept BlindKeyResolver = requires(R &r, BlindRef ref) {
   { r.key_at(ref) } -> std::convertible_to<std::span<const std::byte>>;
+};
+
+// ---------------------------------------------------------------------------
+// PreparedPath — where a key goes in one version of the tree, found before
+// the write that uses it, outside the write lock: the child index taken at
+// each inner level, the leaf reached and, for a key absent from that leaf,
+// its place there. A write on a later version replays the indices instead of
+// comparing the key at every level, and skips the placing read, when
+// TransientBlindBTree::route shows they still lead to the key's leaf.
+//
+// The leaf is named by its address, kept as an integer, and its tag, the
+// session that created it. Nothing keeps the version alive, so by the time
+// the path is replayed the leaf may be freed (a later commit copied it and
+// the last version holding it was released) and its memory reused for
+// another node. The replay reads only nodes it reaches from the live root,
+// and compares their address and tag with these: a live node at that
+// address with that tag is the leaf itself, since tags are never reissued,
+// a node keeps its tag for life, and the leaf's session ended before the
+// version holding it was published, so no later node carries its tag.
+// Pinning the version instead would keep a head whose flush failed alive,
+// and resume() cannot derive from a published state while a successor of
+// it is alive.
+// ---------------------------------------------------------------------------
+// Where a key is, or belongs, in a leaf. For an absent key, `j` is its crit
+// bit against the candidate, and `after` says whether it sorts after the
+// candidate's run (the keys that share bits [0, j) with it) or before it.
+export struct LeafPos {
+  std::uint32_t idx{0};
+  bool exact{false};
+  bool after{false};
+  std::uint32_t j{0};
+};
+
+export struct PreparedPath {
+  static constexpr std::size_t kMaxDepth = 12;
+  std::array<std::uint16_t, kMaxDepth> idx{};
+  std::uint8_t depth{0};
+  std::uintptr_t leaf{0};  // 0: no path (an empty or too deep tree)
+  std::uint64_t leaf_tag{0};
+  // Where the key is or belongs in `leaf`, if the path was placed. A key
+  // present there (pos->exact) is at `found`, whose value size the caller's
+  // resolver read with it: the section replaces it in the unchanged leaf
+  // and accounts for what it displaced without reading the record again.
+  std::optional<LeafPos> pos;
+  BlindRef found{};
+  std::uint32_t found_value_size{0};
+  // Whether `displaced`, what a write down this path replaced, is the
+  // record it found at P: its value size is then found_value_size.
+  [[nodiscard]] auto displaced_found(BlindRef displaced) const noexcept
+      -> bool {
+    if (!pos) return false;
+    if (!pos->exact) return false;
+    return displaced == found;
+  }
+};
+
+// The leaf one plan's last path write left (`now`), as of the tree's write
+// count `write`. One per plan, kept by the caller across the plan's writes:
+// every path of a plan was prepared in one version, so while the tree has
+// taken no write since, a path whose indices lead to `now` is one whose
+// indices led to the leaf `now` was copied from. One walk reaches one node.
+export struct PathFollow {
+  std::uintptr_t now{0};
+  std::uint64_t write{0};
+};
+
+// A node's address as an integer: what PreparedPath and PathFollow keep, so
+// that a path to a node since freed holds no pointer to it.
+export template <typename Node>
+[[nodiscard]] auto node_address(const Node *n) noexcept -> std::uintptr_t {
+  return std::bit_cast<std::uintptr_t>(n);
+}
+
+// Path writes that replayed their path, and ones that went by key because
+// it no longer led to their leaf.
+export struct PathStats {
+  std::uint64_t replayed{0};
+  std::uint64_t missed{0};
 };
 
 export template <std::size_t LeafBytes> class PersistentBlindBTree;
@@ -451,15 +531,8 @@ export template <std::size_t LeafBytes> struct Leaf {
     return std::nullopt;
   }
 
-  // Where `q` is or belongs. For an absent key, `j` is its crit bit against
-  // the candidate, and `after` says whether it sorts after the candidate's
-  // run (the keys that share bits [0, j) with it) or before it.
-  struct Pos {
-    std::uint32_t idx{0};
-    bool exact{false};
-    bool after{false};
-    std::uint32_t j{0};
-  };
+  // Where `q` is or belongs (LeafPos).
+  using Pos = LeafPos;
 
   // One read unless the leaf is empty. The run argument: j cannot be a crit
   // bit on the candidate's path, or the search would have followed q's bit
@@ -572,6 +645,51 @@ public:
     });
   }
 
+  // The path writes: as the keyed ones, down the child indices `p` recorded,
+  // which the caller has checked lead to the key's leaf
+  // (TransientBlindBTree::route). They record the leaf they leave in
+  // last_leaf(). For upsert, at_pos says the leaf reached is the one `p` was
+  // prepared in, unchanged since: the key is where `p` says, present
+  // (replaced in place) or absent (inserted there), without the read that
+  // finds it.
+  template <BlindKeyResolver R, typename Pred>
+  auto upsert(N *&root, Bytes key, BlindRef ref, R &res, Pred &should_replace,
+              const PreparedPath &p, bool at_pos) -> Result {
+    return this->write(root, [&]() -> Result {
+      displaced_.reset();
+      const auto fpq = fingerprint(key);
+      auto step = tracked([&](N *leaf) {
+        if (!at_pos)
+          return upsert_leaf(leaf, key, fpq, ref, res, should_replace);
+        if (p.pos->exact)
+          return replace_index(leaf, p.pos->idx, ref, should_replace);
+        return place_absent(leaf, *p.pos, key, fpq, ref, res);
+      });
+      return this->descend_upsert_by(root, by_path(p), 0, step);
+    });
+  }
+  auto replace_at(N *&root, Bytes key, BlindRef from, BlindRef to,
+                  const PreparedPath &p) -> Result {
+    return this->write(root, [&]() -> Result {
+      displaced_.reset();
+      auto step = tracked(replace_step(key, from, to));
+      return this->descend_upsert_by(root, by_path(p), 0, step);
+    });
+  }
+  auto erase_at(N *&root, Bytes key, BlindRef from, const PreparedPath &p)
+      -> Result {
+    return this->write(root, [&]() -> Result {
+      displaced_.reset();
+      auto step = tracked(erase_at_step(key, from));
+      return this->descend_erase_by(root, by_path(p), 0, step);
+    });
+  }
+  // The leaf the last path write changed without splitting it, as it is
+  // now; null after a split, an emptied leaf or a write that changed nothing.
+  [[nodiscard]] auto last_leaf() const noexcept -> const N * {
+    return last_leaf_;
+  }
+
   template <BlindKeyResolver R>
   auto erase(N *&root, Bytes key, R &res) -> Result {
     return this->write(root, [&]() -> Result {
@@ -596,16 +714,7 @@ public:
       displaced_.reset();
       if (!root)
         return {nullptr, nullptr, false, false};
-      const auto fpq = fingerprint(key);
-      auto step = [&](N *leaf) -> Result {
-        const auto idx = L::find_at(leaf, fpq, from);
-        if (!idx)
-          return {leaf, nullptr, false, false};
-        auto *n = own_leaf(leaf);
-        L::set_ref(n, *idx, to);
-        displaced_ = from;
-        return {n, nullptr, true, false};
-      };
+      auto step = replace_step(key, from, to);
       return this->descend_upsert(root, key, step);
     });
   }
@@ -616,18 +725,50 @@ public:
       displaced_.reset();
       if (!root)
         return {nullptr, nullptr, false, false};
-      const auto fpq = fingerprint(key);
-      auto step = [&](N *leaf) -> Result {
-        const auto idx = L::find_at(leaf, fpq, from);
-        if (!idx)
-          return {leaf, nullptr, false, false};
-        return remove_entry(leaf, *idx);
-      };
+      auto step = erase_at_step(key, from);
       return this->descend_erase(root, key, step);
     });
   }
 
 private:
+  static auto by_path(const PreparedPath &p) {
+    return [&p](const N *, std::size_t depth) -> std::uint32_t {
+      return p.idx[depth];
+    };
+  }
+
+  // The leaf steps of replace_at and erase_at, by key or by path.
+  auto replace_step(Bytes key, BlindRef from, BlindRef to) {
+    return [this, fpq = fingerprint(key), from, to](N *leaf) -> Result {
+      const auto idx = L::find_at(leaf, fpq, from);
+      if (!idx)
+        return {leaf, nullptr, false, false};
+      auto *n = own_leaf(leaf);
+      L::set_ref(n, *idx, to);
+      displaced_ = from;
+      return {n, nullptr, true, false};
+    };
+  }
+  auto erase_at_step(Bytes key, BlindRef from) {
+    return [this, fpq = fingerprint(key), from](N *leaf) -> Result {
+      const auto idx = L::find_at(leaf, fpq, from);
+      if (!idx)
+        return {leaf, nullptr, false, false};
+      return remove_entry(leaf, *idx);
+    };
+  }
+  // Wraps a path write's leaf step to record what it leaves in last_leaf_.
+  template <typename Step> auto tracked(Step step) {
+    last_leaf_ = nullptr;
+    return [this, step](N *leaf) mutable -> Result {
+      const auto r = step(leaf);
+      last_leaf_ = r.changed && !r.right ? r.node : nullptr;
+      return r;
+    };
+  }
+
+  const N *last_leaf_{nullptr};
+
   auto remove_entry(N *leaf, std::uint32_t idx) -> Result {
     displaced_ = L::ref_at(leaf, idx);
     auto *n = own_leaf(leaf);
@@ -658,15 +799,28 @@ private:
   auto upsert_leaf(N *leaf, Bytes key, std::uint32_t fpq, BlindRef ref, R &res,
                    Pred &should_replace) -> Result {
     const auto p = L::position(leaf, key, fpq, res);
-    if (p.exact) {
-      const auto existing = L::ref_at(leaf, p.idx);
-      if (!should_replace(existing, ref))
-        return {leaf, nullptr, false, false};
-      auto *n = own_leaf(leaf);
-      L::set_ref(n, p.idx, ref);
-      displaced_ = existing;
-      return {n, nullptr, true, false};
-    }
+    if (p.exact)
+      return replace_index(leaf, p.idx, ref, should_replace);
+    return place_absent(leaf, p, key, fpq, ref, res);
+  }
+
+  // Points the entry at `idx`, the key's, at `ref` if should_replace agrees.
+  template <typename Pred>
+  auto replace_index(N *leaf, std::uint32_t idx, BlindRef ref,
+                     Pred &should_replace) -> Result {
+    const auto existing = L::ref_at(leaf, idx);
+    if (!should_replace(existing, ref))
+      return {leaf, nullptr, false, false};
+    auto *n = own_leaf(leaf);
+    L::set_ref(n, idx, ref);
+    displaced_ = existing;
+    return {n, nullptr, true, false};
+  }
+
+  // Inserts an absent key at its place `p` in `leaf`, splitting a full leaf.
+  template <BlindKeyResolver R>
+  auto place_absent(N *leaf, const typename L::Pos &p, Bytes key,
+                    std::uint32_t fpq, BlindRef ref, R &res) -> Result {
     if (leaf->count < L::kCap) {
       auto *n = own_leaf(leaf);
       L::insert_into(L::arrays(n), n->count, p, fpq, ref);
@@ -992,6 +1146,36 @@ public:
   [[nodiscard]] auto get(Bytes key, R &res) const -> std::optional<BlindRef> {
     return blind_detail::find_ref<LeafBytes>(root_, key, res);
   }
+
+  // Where `key` goes in this version (PreparedPath). With `place`, also
+  // where an absent key would go in its leaf, which costs the read that
+  // placing it costs: the leaf's candidate record.
+  template <BlindKeyResolver R>
+  void prepare_path(Bytes key, R &res, bool place, PreparedPath &p) const {
+    p = {};
+    const N *cur = root_;
+    if (!cur)
+      return;
+    // A child index is below a node's byte size.
+    static_assert(kBTreeNodeBytes <=
+                  std::numeric_limits<std::uint16_t>::max());
+    while (!cur->is_leaf) {
+      if (p.depth == PreparedPath::kMaxDepth) {
+        p = {};
+        return;
+      }
+      const auto i = cur->child_index(key);
+      p.idx[p.depth++] = static_cast<std::uint16_t>(i);
+      cur = cur->child(i);
+    }
+    p.leaf = node_address(cur);
+    p.leaf_tag = cur->tag;
+    if (!place)
+      return;
+    p.pos = L::position(cur, key, blind_detail::fingerprint(key), res);
+    if (p.pos->exact)
+      p.found = L::ref_at(cur, p.pos->idx);
+  }
   template <BlindKeyResolver R>
   [[nodiscard]] auto contains(Bytes key, R &res) const -> bool {
     return get(key, res).has_value();
@@ -1088,6 +1272,17 @@ public:
     if (keys != size_)
       throw std::logic_error{"blind btree: size does not match key count"};
     return leaf_depth;
+  }
+
+public:
+  // The version this tree is: two trees with one version are one tree.
+  [[nodiscard]] auto version() const noexcept -> std::uint64_t {
+    return version_;
+  }
+  // Whether a tree derived from this one is still alive, so this one
+  // cannot be derived from again. The empty tree (version 0) can always be.
+  [[nodiscard]] auto has_successor() const -> bool {
+    return version_ != 0 && chain().has_successor(version_);
   }
 
 private:
@@ -1188,7 +1383,9 @@ public:
       : base_{std::move(other.base_)}, session_{std::move(other.session_)},
         root_{std::exchange(other.root_, nullptr)},
         size_{std::exchange(other.size_, 0)},
-        changed_{std::exchange(other.changed_, false)} {}
+        changed_{std::exchange(other.changed_, false)},
+        writes_{std::exchange(other.writes_, 0)},
+        path_stats_{std::exchange(other.path_stats_, {})} {}
   auto operator=(TransientBlindBTree &&other) noexcept -> TransientBlindBTree & {
     if (this != &other) {
       discard();
@@ -1197,6 +1394,8 @@ public:
       root_ = std::exchange(other.root_, nullptr);
       size_ = std::exchange(other.size_, 0);
       changed_ = std::exchange(other.changed_, false);
+      writes_ = std::exchange(other.writes_, 0);
+      path_stats_ = std::exchange(other.path_stats_, {});
     }
     return *this;
   }
@@ -1226,6 +1425,7 @@ public:
   auto replace_at(Bytes key, BlindRef from, BlindRef to) -> bool {
     ensure_active();
     blind_detail::check_ref(key, to);
+    ++writes_;
     const auto r = session_.replace_at(root_, key, from, to);
     if (!r.changed)
       return false;
@@ -1235,6 +1435,7 @@ public:
   }
   auto erase_at(Bytes key, BlindRef from) -> bool {
     ensure_active();
+    ++writes_;
     const auto r = session_.erase_at(root_, key, from);
     if (!r.changed)
       return false;
@@ -1250,6 +1451,7 @@ public:
       -> std::optional<BlindRef> {
     ensure_active();
     blind_detail::check_ref(key, ref);
+    ++writes_;
     const auto r = session_.upsert(root_, key, ref, res, should_replace);
     if (!r.changed)
       return std::nullopt;
@@ -1263,12 +1465,112 @@ public:
   template <BlindKeyResolver R>
   auto erase(Bytes key, R &res) -> std::optional<BlindRef> {
     ensure_active();
+    ++writes_;
     const auto r = session_.erase(root_, key, res);
     if (!r.changed)
       return std::nullopt;
     changed_ = true;
     --size_;
     return session_.take_displaced();
+  }
+
+  // The writes above, given the key's PreparedPath from an earlier version
+  // and the plan's PathFollow. Each goes down the path where route() says
+  // it still leads to the key's leaf, and by key otherwise; either way it
+  // decides exactly what the keyed write decides, since only the route to
+  // the leaf differs. Counted in path_stats().
+  enum class Route : std::uint8_t {
+    kKey,       // the path no longer leads to the key's leaf
+    kSame,      // to the leaf it was prepared in, unchanged since
+    kFollowed,  // to the copy of it the plan's last write made, just now
+  };
+  // A leaf's key range never narrows while it is in the tree: only its own
+  // split narrows it, and a split replaces the leaf. Whatever was removed or
+  // split around it, a walk that reaches the path's leaf (its address and
+  // tag, see PreparedPath) reaches the leaf that holds the key, and that
+  // leaf is as the path saw it: a write changes only the nodes its own
+  // session made, and that leaf's session has ended. f.now holds the range
+  // of the leaf it was copied from: one write changed it without splitting
+  // it, and no write since (f.write) can have split it or freed it.
+  //
+  // This holds only when the tree is a descendant of the version the path
+  // was prepared in: a version from before it can hold the same leaf with a
+  // narrower range. The caller ensures that (DB::head_generation_).
+  [[nodiscard]] auto route(const PreparedPath &p, const PathFollow &f) const
+      noexcept -> Route {
+    if (p.leaf == 0)
+      return Route::kKey;
+    const N *cur = root_;
+    if (!cur)
+      return Route::kKey;
+    for (std::uint8_t d = 0; d < p.depth; ++d) {
+      // The tree may have lost levels, or entries of this node, since.
+      if (cur->is_leaf)
+        return Route::kKey;
+      if (p.idx[d] > cur->count)
+        return Route::kKey;
+      cur = cur->child(p.idx[d]);
+    }
+    if (!cur->is_leaf)
+      return Route::kKey;
+    const auto at = node_address(cur);
+    if (at == p.leaf && cur->tag == p.leaf_tag)
+      return Route::kSame;
+    if (at == f.now && f.write == writes_)
+      return Route::kFollowed;
+    return Route::kKey;
+  }
+  auto replace_at(Bytes key, BlindRef from, BlindRef to,
+                  const PreparedPath &p, PathFollow &f) -> bool {
+    if (!on_path(p, f))
+      return replace_at(key, from, to);
+    ensure_active();
+    blind_detail::check_ref(key, to);
+    ++writes_;
+    const auto r = session_.replace_at(root_, key, from, to, p);
+    follow(f);
+    if (!r.changed)
+      return false;
+    changed_ = true;
+    (void)session_.take_displaced();
+    return true;
+  }
+  auto erase_at(Bytes key, BlindRef from, const PreparedPath &p, PathFollow &f)
+      -> bool {
+    if (!on_path(p, f))
+      return erase_at(key, from);
+    ensure_active();
+    ++writes_;
+    const auto r = session_.erase_at(root_, key, from, p);
+    follow(f);
+    if (!r.changed)
+      return false;
+    changed_ = true;
+    --size_;
+    return true;
+  }
+  template <BlindKeyResolver R, typename Pred>
+  auto upsert(Bytes key, BlindRef ref, R &res, Pred &&should_replace,
+              const PreparedPath &p, PathFollow &f) -> std::optional<BlindRef> {
+    const auto route_now = route(p, f);
+    count_route(route_now);
+    if (route_now == Route::kKey)
+      return upsert(key, ref, res, should_replace);
+    ensure_active();
+    blind_detail::check_ref(key, ref);
+    ++writes_;
+    const auto r = session_.upsert(root_, key, ref, res, should_replace, p,
+                                   route_now == Route::kSame && p.pos.has_value());
+    follow(f);
+    if (!r.changed)
+      return std::nullopt;
+    changed_ = true;
+    if (r.inserted)
+      ++size_;
+    return session_.take_displaced();
+  }
+  [[nodiscard]] auto path_stats() const noexcept -> PathStats {
+    return path_stats_;
   }
 
   [[nodiscard]] auto persistent() && -> PersistentBlindBTree<LeafBytes> {
@@ -1303,6 +1605,22 @@ private:
   N *root_{nullptr};
   std::size_t size_{0};
   bool changed_{false};
+  std::uint64_t writes_{0};  // every write call, path or keyed (PathFollow)
+  PathStats path_stats_;
+
+  void count_route(Route r) noexcept {
+    ++(r == Route::kKey ? path_stats_.missed : path_stats_.replayed);
+  }
+  auto on_path(const PreparedPath &p, const PathFollow &f) noexcept -> bool {
+    const auto r = route(p, f);
+    count_route(r);
+    return r != Route::kKey;
+  }
+  // After a path write: the plan's next path may follow the leaf it left.
+  void follow(PathFollow &f) const noexcept {
+    const auto *now = session_.last_leaf();
+    f = now ? PathFollow{node_address(now), writes_} : PathFollow{};
+  }
 
   explicit TransientBlindBTree(const PersistentBlindBTree<LeafBytes> &base)
       : base_{base}, root_{base.root_}, size_{base.size_} {}

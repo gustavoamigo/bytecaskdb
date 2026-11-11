@@ -1,0 +1,17 @@
+A written key's prefixes are not recorded in RecentWrites: a prefix range
+guard prepared before a key was inserted under that prefix keeps its
+prepared answer (#754).
+Guarded-by: "prepared validation: a guard whose key is written between preparing and the section is checked again"
+
+diff --git a/bytecaskdb/internals.cppm b/bytecaskdb/internals.cppm
+index 8d63f7aa..21ad6834 100644
+--- a/bytecaskdb/internals.cppm
++++ b/bytecaskdb/internals.cppm
+@@ -512,7 +512,6 @@ public:
+     auto first_length = std::size_t{0};
+     if (c.hashed) {
+       for (const auto h : c.writes) mark(h, seq);
+-      for (const auto h : c.prefixes) mark(h, seq);
+       first_length = c.lengths;
+     } else {
+       for_each_key([&](std::span<const std::byte> key) {

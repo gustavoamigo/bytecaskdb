@@ -1,0 +1,18 @@
+resume() derives from the published state without waiting for a writer
+still preparing in a head built on the failed write: the version chain
+refuses the derivation, and resume() fails with a logic error (#754).
+Guarded-by: "resume: waits for a writer still holding a head built on the failed write"
+
+diff --git a/bytecaskdb/db_degraded.cpp b/bytecaskdb/db_degraded.cpp
+index fb989e60..d9da1412 100644
+--- a/bytecaskdb/db_degraded.cpp
++++ b/bytecaskdb/db_degraded.cpp
+@@ -80,8 +80,6 @@ void DB::resume() {
+   // writers are refused at entry while the engine is degraded, so no new
+   // holder appears, and each lets go without resume(), write_mu_ or the
+   // flush role (see "Holders of the head" in docs/bytecask_design.md).
+-  while (current->key_dir.has_successor())
+-    std::this_thread::sleep_for(std::chrono::microseconds{50});
+ 
+   // resume() seals the active file like a rotation does.
+   wait_for_hint_backlog();

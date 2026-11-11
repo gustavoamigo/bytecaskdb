@@ -189,6 +189,26 @@ TEST_CASE("BTree ordered iteration matches std::map", "[btree]") {
   check_accounting({&t});
 }
 
+// resume() waits on this before it derives from the published state: a
+// version cannot be derived from while a version derived from it lives.
+TEST_CASE("BTree has_successor: true while a version derived from it lives",
+          "[btree]") {
+  CHECK_FALSE(Tree{}.has_successor());  // the empty tree can always be
+  auto t = build({"a", "b"});
+  CHECK_FALSE(t.has_successor());
+  {
+    auto tr = t.transient();
+    tr.set(to_bytes("c"), 3);
+    auto t2 = std::move(tr).persistent();
+    CHECK(t.has_successor());
+    CHECK_FALSE(t2.has_successor());
+  }
+  CHECK_FALSE(t.has_successor());  // the successor's release retracts it
+  auto tr = t.transient();
+  tr.set(to_bytes("d"), 4);
+  CHECK(std::move(tr).persistent().size() == 3U);  // derivable again
+}
+
 TEST_CASE("BTree erase down to empty", "[btree]") {
   std::vector<std::string> keys;
   for (int i = 0; i < 5000; ++i)

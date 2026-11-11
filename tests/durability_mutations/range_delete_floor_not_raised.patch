@@ -1,0 +1,17 @@
+apply_writes does not raise RecentWrites' floor for a range delete: a
+guard prepared before it on a key it removed keeps its prepared answer
+(#754).
+Guarded-by: "prepared validation: a guard whose key is written between preparing and the section is checked again"
+
+diff --git a/bytecaskdb/engine_state.cpp b/bytecaskdb/engine_state.cpp
+index b2dc7a94..6610e85c 100644
+--- a/bytecaskdb/engine_state.cpp
++++ b/bytecaskdb/engine_state.cpp
+@@ -507,7 +507,6 @@ void TransientEngineState::apply_writes(
+   file_stats_.patch(active_file_id_, {.min_sequence = batch_start_seq, .max_sequence = next_seq_ - 1});
+   record_writes(plan);
+   // A range delete changes keys RecentWrites cannot name.
+-  if (plan.has_range_delete()) raise_recent_floor();
+ }
+ 
+ auto TransientEngineState::can_apply_puts_checked(const WritePlan &plan)

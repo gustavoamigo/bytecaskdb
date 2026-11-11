@@ -5,16 +5,21 @@
 
 module;
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <memory>
+#include <new>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -342,6 +347,230 @@ export inline auto marker_at(const std::vector<ChangeMarker> *markers,
 export class TransientEngineState;
 
 // ---------------------------------------------------------------------------
+// The validation a plan made on the writer's thread, against a published
+// state P, before it joined a batch (WritePlan::prepare_validation), and
+// what the answer read. The section uses the answer when RecentWrites shows
+// that nothing it read was written since P.
+// ---------------------------------------------------------------------------
+export struct PreparedChecks {
+  // The plan's guards held at P, and so did its write-write checks when
+  // writes_checked. False also for a plan that was not prepared: then the
+  // section validates it as before.
+  bool held{false};
+  bool writes_checked{false};
+  std::uint64_t seq{0};  // P's last sequence
+  // DB::head_generation_ as read before P, the head, was loaded.
+  std::uint64_t generation{0};
+  // key_hash of each key the answer read: guarded keys, and written keys
+  // when writes_checked.
+  std::vector<std::uint64_t> probes;
+  // Each range guard, a prefix range: its prefix's hash and length.
+  struct Range {
+    std::uint64_t hash;
+    std::uint32_t len;
+  };
+  std::vector<Range> ranges;
+  // Hashes of the keys the plan writes, and of their prefixes at the first
+  // `lengths` prefix lengths RecentWrites had registered, so the section
+  // need not hash them. Without `hashed` it does.
+  bool hashed{false};
+  std::vector<std::uint64_t> writes;
+  std::vector<std::uint64_t> prefixes;
+  std::size_t lengths{0};
+};
+
+// A key's hash for RecentWrites.
+export [[nodiscard]] inline auto key_hash(std::span<const std::byte> key) noexcept
+    -> std::uint64_t {
+  return std::hash<std::string_view>{}(
+      std::string_view{reinterpret_cast<const char *>(key.data()), key.size()});
+}
+
+// ---------------------------------------------------------------------------
+// RecentWrites — which keys the head has written since a given sequence, as
+// far as a fixed table can tell. A slot per key hash holds the highest
+// sequence of any plan that wrote a key hashing there. A collision only
+// makes a key look written, so the table can answer "maybe written" for a
+// key that was not, never "not written" for one that was. Writes that name
+// no key (a range delete, an ingested slice, resume()'s replay) raise a
+// floor instead: an answer prepared below it is not used.
+//
+// Range guards over a prefix are probed by the prefix: a writer records its
+// key's prefix at every prefix length a range guard has used. A length is
+// registered the first time a guard needs it, and trusted only for answers
+// prepared after that, since writes before it did not record it.
+//
+// The table, the floor and the registration belong to the write section
+// (DB::write_mu_). The registered lengths are also read by writers on their
+// own threads, to hash their keys' prefixes before they join a batch.
+// ---------------------------------------------------------------------------
+export class RecentWrites {
+public:
+  static constexpr std::size_t kSlots = std::size_t{1} << 18;
+  static constexpr std::size_t kMaxPrefixLengths = 8;
+  using Lengths = std::array<std::uint32_t, kMaxPrefixLengths>;
+
+  enum class Verdict : std::uint8_t {
+    kUnchanged,     // nothing the answer read was written: use it
+    kNotHeld,       // not prepared, did not hold at P, or P was dropped
+    kBelowFloor,    // prepared before a write that names no key
+    kWritten,       // a key or prefix it read may have been written
+    kNewLength,     // a range guard's prefix length not tracked since P
+  };
+
+  RecentWrites() = default;
+  RecentWrites(const RecentWrites &) = delete;
+  auto operator=(const RecentWrites &) -> RecentWrites & = delete;
+  ~RecentWrites() { delete[] table_.load(std::memory_order_relaxed); }
+
+  // Any thread: the prefix lengths registered so far, in order. Returns how
+  // many; each is in `out` before the count that exposes it.
+  auto lengths(Lengths &out) const noexcept -> std::size_t {
+    const auto n = count_.load(std::memory_order_acquire);
+    for (std::size_t i = 0; i < n; ++i)
+      out[i] = lengths_[i].load(std::memory_order_relaxed);
+    return n;
+  }
+
+  // Any thread: whether the table exists. Without it nothing is recorded,
+  // so a writer need not hash its keys.
+  [[nodiscard]] auto has_table() const noexcept -> bool {
+    return table_.load(std::memory_order_acquire) != nullptr;
+  }
+
+  // Any thread, outside the write lock: allocates the table (2 MiB, zeroed)
+  // if it does not exist yet. Called by a writer whose prepared answer read
+  // something, so a database whose plans read nothing (plain puts, a
+  // follower) never holds it, and the allocation never runs in the section.
+  // Out of memory leaves it unallocated: the plans are validated in the
+  // section, as without it.
+  void ensure_table() noexcept {
+    if (has_table()) return;
+    auto *fresh = new (std::nothrow) std::uint64_t[kSlots]();
+    if (fresh == nullptr) return;
+    std::uint64_t *expected = nullptr;
+    if (!table_.compare_exchange_strong(expected, fresh,
+                                        std::memory_order_acq_rel))
+      delete[] fresh;
+  }
+
+  // Under the write lock: whether the prepared answer still holds for the
+  // head, whose last sequence is head_last and whose generation is
+  // `generation` (DB::head_generation_). writes_checked_here: the section
+  // checks the plan's writes itself (apply_puts_checked), so an answer that
+  // did not check them at P is enough.
+  //
+  // The table records nothing until the section first finds it allocated:
+  // then it raises the floor to head_last, since no write before was
+  // recorded, and no answer prepared before that is used.
+  [[nodiscard]] auto verify(const PreparedChecks &c, bool writes_checked_here,
+                            std::uint64_t head_last, std::uint64_t generation)
+      -> Verdict {
+    if (!c.held || !(c.writes_checked || writes_checked_here))
+      return Verdict::kNotHeld;
+    // P was a head the engine has since gone back from (store_head).
+    if (c.generation != generation)
+      return Verdict::kNotHeld;
+    // An answer that read nothing cannot have changed.
+    if (c.probes.empty() && c.ranges.empty())
+      return Verdict::kUnchanged;
+    // Every new prefix length is registered before anything can return, so
+    // a range guard on a busy key still gets its length tracked.
+    auto untracked = false;
+    for (const auto &r : c.ranges) {
+      if (!tracked_since(r.len, c.seq, head_last)) untracked = true;
+    }
+    if (!active_) {
+      if (!has_table()) return Verdict::kNotHeld;
+      active_ = true;
+      raise_floor(head_last);
+    }
+    if (c.seq < floor_)
+      return Verdict::kBelowFloor;
+    if (untracked)
+      return Verdict::kNewLength;
+    for (const auto h : c.probes) {
+      if (slot(h) > c.seq)
+        return Verdict::kWritten;
+    }
+    for (const auto &r : c.ranges) {
+      if (slot(r.hash) > c.seq)
+        return Verdict::kWritten;
+    }
+    return Verdict::kUnchanged;
+  }
+
+  // Under the write lock, as soon as a plan is applied and before the next
+  // plan is verified: the plan's point writes, at its last sequence `seq`.
+  // for_each_key(f) calls f(key) for each point write's key. Nothing until
+  // the table is active (see verify).
+  template <typename ForEachKey>
+  void record(const PreparedChecks &c, std::uint64_t seq,
+              ForEachKey &&for_each_key) noexcept {
+    if (!active_) return;
+    const auto n = count_.load(std::memory_order_relaxed);
+    auto first_length = std::size_t{0};
+    if (c.hashed) {
+      for (const auto h : c.writes) mark(h, seq);
+      for (const auto h : c.prefixes) mark(h, seq);
+      first_length = c.lengths;
+    } else {
+      for_each_key([&](std::span<const std::byte> key) {
+        mark(key_hash(key), seq);
+      });
+    }
+    for (auto i = first_length; i < n; ++i) {
+      const auto len = lengths_[i].load(std::memory_order_relaxed);
+      for_each_key([&](std::span<const std::byte> key) {
+        if (key.size() >= len) mark(key_hash(key.first(len)), seq);
+      });
+    }
+  }
+
+  // Under the write lock: every key may have changed up to seq.
+  void raise_floor(std::uint64_t seq) noexcept {
+    floor_ = std::max(floor_, seq);
+  }
+
+private:
+  auto slot(std::uint64_t h) noexcept -> std::uint64_t & {
+    return table_.load(std::memory_order_relaxed)[h & (kSlots - 1)];
+  }
+  void mark(std::uint64_t h, std::uint64_t seq) noexcept {
+    auto &s = slot(h);
+    s = std::max(s, seq);
+  }
+  // Whether writes after `seq` all recorded their prefix of length len.
+  // Registers a length seen for the first time: writes after head_last
+  // record it, and answers prepared at or after that can trust it. With no
+  // room left, every range guard over a new length is checked in the
+  // section.
+  auto tracked_since(std::uint32_t len, std::uint64_t seq,
+                     std::uint64_t head_last) noexcept -> bool {
+    const auto n = count_.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < n; ++i) {
+      if (lengths_[i].load(std::memory_order_relaxed) == len)
+        return seq >= since_[i];
+    }
+    if (n == kMaxPrefixLengths) return false;
+    lengths_[n].store(len, std::memory_order_relaxed);
+    since_[n] = head_last;
+    count_.store(n + 1, std::memory_order_release);
+    return false;
+  }
+
+  // Written once, by whichever writer allocates it first; read by writers
+  // (has_table) and the section.
+  std::atomic<std::uint64_t *> table_{nullptr};
+  // The section's, under the write lock.
+  bool active_{false};
+  std::uint64_t floor_{0};
+  std::array<std::atomic<std::uint32_t>, kMaxPrefixLengths> lengths_{};
+  std::array<std::uint64_t, kMaxPrefixLengths> since_{};
+  std::atomic<std::size_t> count_{0};
+};
+
+// ---------------------------------------------------------------------------
 // Records the batch being built has placed in the active file but not yet
 // written: phase 1 of a commit (validate and apply) runs before the batch's
 // pwritev, so a key directory that reads keys back from the data files must
@@ -516,6 +745,10 @@ export inline auto kd_holds(const KeyDirTransient &, std::span<const std::byte>,
                             const KeyDirEntry &) -> bool {
   return false;
 }
+export inline auto kd_holds(const KeyDirTree &, std::span<const std::byte>,
+                            const KeyDirEntry &) -> bool {
+  return false;
+}
 export inline auto kd_put_at(KeyDirTransient &, std::span<const std::byte>,
                              const KeyDirEntry &, const KeyDirEntry &) -> bool {
   return false;
@@ -523,6 +756,35 @@ export inline auto kd_put_at(KeyDirTransient &, std::span<const std::byte>,
 export inline auto kd_erase_at(KeyDirTransient &, std::span<const std::byte>,
                                const KeyDirEntry &) -> bool {
   return false;
+}
+// Paths prepared before the write section (blind key directory only; see
+// PreparedPath). The keyed tree compares keys on its way down and reads no
+// record to place one, so a path would save it nothing: it prepares none,
+// and its writes go by key.
+export inline void kd_prepare_path(const KeyDirTree &,
+                                   std::span<const std::byte>,
+                                   const KeyDirCtx &, bool, PreparedPath &p) {
+  p = {};
+}
+export inline auto kd_put_at(KeyDirTransient &t, std::span<const std::byte> key,
+                             const KeyDirEntry &at, const KeyDirEntry &e,
+                             const PreparedPath *, PathFollow &) -> bool {
+  return kd_put_at(t, key, at, e);
+}
+export inline auto kd_put(KeyDirTransient &t, std::span<const std::byte> key,
+                          const KeyDirEntry &e, const KeyDirCtx &ctx,
+                          const PreparedPath *, PathFollow &)
+    -> std::optional<KeyDirHit> {
+  return kd_put(t, key, e, ctx);
+}
+export inline auto kd_erase_at(KeyDirTransient &t,
+                               std::span<const std::byte> key,
+                               const KeyDirEntry &at, const PreparedPath *,
+                               PathFollow &) -> bool {
+  return kd_erase_at(t, key, at);
+}
+export inline auto kd_path_stats(const KeyDirTransient &) -> PathStats {
+  return {};
 }
 // Undo for a plan applied with its checks folded into the descents (blind
 // key directory only; see TransientEngineState::apply_puts_checked). The
@@ -897,6 +1159,10 @@ export inline auto kd_holds(const KeyDirTransient &t,
                             const KeyDirEntry &at) -> bool {
   return t.holds(key, to_blind_ref(at));
 }
+export inline auto kd_holds(const KeyDirTree &t, std::span<const std::byte> key,
+                            const KeyDirEntry &at) -> bool {
+  return t.holds(key, to_blind_ref(at));
+}
 export inline auto kd_put_at(KeyDirTransient &t, std::span<const std::byte> key,
                              const KeyDirEntry &at, const KeyDirEntry &e)
     -> bool {
@@ -906,6 +1172,62 @@ export inline auto kd_erase_at(KeyDirTransient &t,
                                std::span<const std::byte> key,
                                const KeyDirEntry &at) -> bool {
   return t.erase_at(key, to_blind_ref(at));
+}
+// Where `key` goes in `t`, for a write on a later version to replay
+// (PreparedPath). With `place`, also where an absent key would go in its
+// leaf: one read, which the write then does not make.
+export inline void kd_prepare_path(const KeyDirTree &t,
+                                   std::span<const std::byte> key,
+                                   const KeyDirCtx &ctx, bool place,
+                                   PreparedPath &p) {
+  FrameLease lease;
+  ScratchUse scratch{key_read_buffer(), ctx.scratch_bytes};
+  KeyReader reader{ctx, scratch.buf(), lease};
+  t.prepare_path(key, reader, place, p);
+  // A key found in place: the read that found it is the record's, the last
+  // the reader made, so its value size is the found record's.
+  if (p.displaced_found(p.found)) p.found_value_size = reader.value_size;
+}
+// The writes above, down `path` where it still leads to the key's leaf
+// (TransientBlindBTree::route), by key otherwise or when path is null.
+// `follow` is the plan's: one per plan, across its writes.
+export inline auto kd_put_at(KeyDirTransient &t, std::span<const std::byte> key,
+                             const KeyDirEntry &at, const KeyDirEntry &e,
+                             const PreparedPath *path, PathFollow &follow)
+    -> bool {
+  if (!path)
+    return kd_put_at(t, key, at, e);
+  return t.replace_at(key, to_blind_ref(at), to_blind_ref(e), *path, follow);
+}
+export inline auto kd_put(KeyDirTransient &t, std::span<const std::byte> key,
+                          const KeyDirEntry &e, const KeyDirCtx &ctx,
+                          const PreparedPath *path, PathFollow &follow)
+    -> std::optional<KeyDirHit> {
+  if (!path)
+    return kd_put(t, key, e, ctx);
+  FrameLease lease;
+  ScratchUse scratch{key_read_buffer(), ctx.scratch_bytes};
+  KeyReader reader{ctx, scratch.buf(), lease};
+  const auto displaced = t.upsert(
+      key, to_blind_ref(e), reader,
+      [](const BlindRef &, const BlindRef &) { return true; }, *path, follow);
+  if (!displaced)
+    return std::nullopt;
+  // Replaced where the path found it: no record was read here.
+  if (path->displaced_found(*displaced))
+    return KeyDirHit{*displaced, path->found_value_size};
+  return reader.displaced(*displaced);
+}
+export inline auto kd_erase_at(KeyDirTransient &t,
+                               std::span<const std::byte> key,
+                               const KeyDirEntry &at, const PreparedPath *path,
+                               PathFollow &follow) -> bool {
+  if (!path)
+    return kd_erase_at(t, key, at);
+  return t.erase_at(key, to_blind_ref(at), *path, follow);
+}
+export inline auto kd_path_stats(const KeyDirTransient &t) -> PathStats {
+  return t.path_stats();
 }
 // What a put or an erase of the entry `at` displaced: `at`'s own record.
 export inline auto kd_hit(const KeyDirEntry &at) -> KeyDirHit {
@@ -1026,6 +1348,9 @@ export struct EngineState {
   bool closed{false};
   // Options::thread_scratch_bytes, for the key directory's reads.
   std::size_t scratch_bytes;
+  // The database's RecentWrites, shared by every state and transient of it,
+  // so the transient's mutators record what they change themselves.
+  std::shared_ptr<RecentWrites> recent_writes;
 
   explicit EngineState(std::size_t scratch_limit)
       : scratch_bytes{scratch_limit} {}

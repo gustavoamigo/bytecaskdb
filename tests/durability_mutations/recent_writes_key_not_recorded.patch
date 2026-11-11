@@ -1,0 +1,17 @@
+A plan's written keys are not recorded in RecentWrites: a plan prepared
+before them that read one of them keeps its prepared answer, and a guard
+or write-write check that no longer holds passes (#754).
+Guarded-by: "prepared validation: a guard whose key is written between preparing and the section is checked again"
+
+diff --git a/bytecaskdb/internals.cppm b/bytecaskdb/internals.cppm
+index 8d63f7aa..65f0cc2a 100644
+--- a/bytecaskdb/internals.cppm
++++ b/bytecaskdb/internals.cppm
+@@ -511,7 +511,6 @@ public:
+     const auto n = count_.load(std::memory_order_relaxed);
+     auto first_length = std::size_t{0};
+     if (c.hashed) {
+-      for (const auto h : c.writes) mark(h, seq);
+       for (const auto h : c.prefixes) mark(h, seq);
+       first_length = c.lengths;
+     } else {

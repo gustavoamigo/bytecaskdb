@@ -208,6 +208,7 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
 }
 
 void DB::store_initial_state(std::shared_ptr<EngineState> s) {
+  s->recent_writes = recent_writes_;
   store_head(s);
   store_state(std::move(s));
 }

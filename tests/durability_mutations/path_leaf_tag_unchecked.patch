@@ -1,0 +1,19 @@
+A path's leaf is recognised by its address alone. Once the leaf is freed
+and its memory reused for another node at that address, the path is
+replayed into that node, and an insert goes where the old leaf's position
+said (#754).
+Guarded-by: "blind tree: a path whose leaf was freed and its memory reused is not replayed"
+
+diff --git a/bytecaskdb/blind_btree.cppm b/bytecaskdb/blind_btree.cppm
+index a7d70663..ffae28b2 100644
+--- a/bytecaskdb/blind_btree.cppm
++++ b/bytecaskdb/blind_btree.cppm
+@@ -1513,7 +1513,7 @@ public:
+     if (!cur->is_leaf)
+       return Route::kKey;
+     const auto at = node_address(cur);
+-    if (at == p.leaf && cur->tag == p.leaf_tag)
++    if (at == p.leaf)
+       return Route::kSame;
+     if (at == f.now && f.write == writes_)
+       return Route::kFollowed;
