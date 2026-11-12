@@ -171,8 +171,9 @@ using FileStatsTransient =
 //
 // file_id = (file_id_high << 16) | file_id_low — effective 20 bits (max 1 048 575).
 //
-// file_id is a monotonic integer handle, assigned by DB, that indexes
-// into the engine's file registry. file_offset is the byte offset where
+// file_id is an integer handle, leased by DB (bytecask.file_id), that indexes
+// into the engine's file registry. It is reused once nothing holds the file
+// it named, so ids say nothing of age. file_offset is the byte offset where
 // the full DataEntry begins.
 // ---------------------------------------------------------------------------
 export struct KeyDirEntry {
@@ -589,9 +590,11 @@ export struct PendingRecord {
   std::span<const std::byte> key;
 };
 
-// Sorted by slot. A batch places its records at rising offsets, so put()
-// appends; a vector kept between groups allocates nothing per record, where a
-// hash map allocated a node and a key copy for each (#754).
+// Sorted by slot. A batch places its records at rising offsets in the active
+// file, and a rotation clears the list (TransientEngineState::
+// apply_rotate_file), so put() appends even when the next file takes a lower,
+// reused id. A vector kept between groups allocates nothing per record, where
+// a hash map allocated a node and a key copy for each (#754).
 export class PendingRecords {
 public:
   using value_type = PendingRecord;

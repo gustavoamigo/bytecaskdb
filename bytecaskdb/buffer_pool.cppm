@@ -768,7 +768,7 @@ void BufferPool::read_at(std::uint64_t file_key, PoolFile file,
   if (read_upto(file_key, file, offset, len, file_size, dst) < len) {
     throw std::system_error{
         EIO, std::generic_category(),
-        std::format("BufferPool::read_at: file {} is shorter than the "
+        std::format("BufferPool::read_at: file serial {} is shorter than the "
                     "requested range [{}, {})",
                     file_key, offset, offset + len)};
   }

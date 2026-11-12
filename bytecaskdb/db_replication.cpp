@@ -176,16 +176,24 @@ auto DB::create_manifest() -> FileManifest {
 
   // Build manifest from sealed files, in log order: files hold disjoint
   // sequence ranges, so by first sequence. Ids are reused, and a name orders
-  // files only to the second.
+  // files only to the second. A file holding no sequenced entry (min_sequence
+  // 0, such as the empty active file resume() seals) has no place in the log
+  // and comes first, by name so the order is deterministic.
   std::vector<std::pair<std::uint64_t, FileInfo>> ordered;
   for (const auto [file_id, file_ptr] : manifest_state->files) {
     if (file_id == manifest_state->active_file_id) continue;
+    const auto stats = manifest_state->file_stats.get(file_id);
+    if (!stats)
+      throw std::logic_error{std::format(
+          "create_manifest: file id {} has no file_stats", file_id)};
     const auto data_path = file_ptr->path();
     const auto stem = data_path.stem().string();
-    ordered.push_back({manifest_state->file_stats.get(file_id)->min_sequence,
+    ordered.push_back({stats->min_sequence,
                        {file_id, data_path, dir_ / (stem + ".hint")}});
   }
-  std::ranges::sort(ordered, {}, [](const auto &e) { return e.first; });
+  std::ranges::sort(ordered, {}, [](const auto &e) {
+    return std::tie(e.first, e.second.data_path);
+  });
   std::vector<FileInfo> files;
   files.reserve(ordered.size());
   for (auto &[_, info] : ordered) files.push_back(std::move(info));

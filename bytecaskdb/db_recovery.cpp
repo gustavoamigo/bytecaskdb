@@ -49,8 +49,8 @@ auto sorted_markers(std::vector<ChangeMarker> markers)
 // never has.
 auto is_compaction_of(const std::filesystem::path &copy,
                       const std::filesystem::path &source) -> bool {
-  const auto copy_file = openDataFileForRead(copy);
-  const auto source_file = openDataFileForRead(source);
+  const auto copy_file = openUnregisteredDataFileForRead(copy);
+  const auto source_file = openUnregisteredDataFileForRead(source);
   auto src = scan_committed(*source_file);
   auto it = src.begin();
   for (const auto &[entry, entry_off] : scan_committed(*copy_file)) {
@@ -147,9 +147,11 @@ auto DB::recovery_open(const Options &opts) -> EngineState {
     recovery_undo_interrupted_vacuum(a, b);
     // The next pass numbers files afresh, in name order: a fresh pool, since
     // this one would hand back the ids this pass's files returned first. The
-    // buffer pool keys frames by serial, which no later file shares, so the
-    // frames this pass admitted are orphans, not stale.
+    // frames this pass admitted are keyed by serials no later file has, so
+    // they could only be dead weight: a fresh buffer pool drops them.
     file_ids_ = std::make_shared<FileIdPool>(KeyDirEntry::kMaxFileId);
+    if (pool_)
+      pool_ = std::make_shared<BufferPool>(opts.buffer_pool, scratch_bytes_);
   }
 }
 
@@ -347,7 +349,7 @@ void DB::recovery_check_tail(
   const auto seq = first_sequence(file);
   for (const auto &other : data_paths) {
     if (other == file.path()) continue;
-    const auto other_file = openDataFileForRead(other);
+    const auto other_file = openUnregisteredDataFileForRead(other);
     if (seq != 0 && first_sequence(*other_file) > seq) {
       throw std::runtime_error{std::format(
           "bytecask: corrupt database — data file '{}' does not parse past "

@@ -1080,7 +1080,7 @@ TEST_CASE("DataFileIterator throws when the file shrinks under the sweep",
                             to_bytes("value"));
     w->sync();
   }
-  auto real = bytecask::openDataFileForRead(path);
+  auto real = bytecask::openUnregisteredDataFileForRead(path);
   const ShrunkDataFile shrunk{real, real->size() - 3};
 
   auto it = bytecask::DataFileIterator{shrunk};
@@ -1134,12 +1134,12 @@ TEST_CASE("createDataFileForWrite panics when the data file already exists",
   REQUIRE(std::filesystem::file_size(dir / (stem + ".data")) > 0);
 
   CHECK(dies_by_panic([&] {
-    (void)bytecask::createDataFileForWrite(dir, stem, ".data", 0, bytecask::IoBackend::Pread);
+    (void)bytecask::createUnregisteredDataFileForWrite(dir, stem, ".data", 0, bytecask::IoBackend::Pread);
   }));
 
   // mmap-backed files take a separate open() path — guard both.
   CHECK(dies_by_panic([&] {
-    (void)bytecask::createDataFileForWrite(dir, stem, ".data", 4096, bytecask::IoBackend::Mmap);
+    (void)bytecask::createUnregisteredDataFileForWrite(dir, stem, ".data", 4096, bytecask::IoBackend::Mmap);
   }));
 
   std::filesystem::remove_all(dir);
@@ -1159,12 +1159,12 @@ TEST_CASE("createDataFileForWrite panics when the stem was already hinted",
   REQUIRE_FALSE(std::filesystem::exists(dir / (stem + ".data")));
 
   CHECK(dies_by_panic([&] {
-    (void)bytecask::createDataFileForWrite(dir, stem, ".data", 0, bytecask::IoBackend::Pread);
+    (void)bytecask::createUnregisteredDataFileForWrite(dir, stem, ".data", 0, bytecask::IoBackend::Pread);
   }));
 
   // Vacuum stages under .data.tmp; a hinted stem is off limits there too.
   CHECK(dies_by_panic([&] {
-    (void)bytecask::createDataFileForWrite(dir, stem, ".data.tmp", 0, bytecask::IoBackend::Pread);
+    (void)bytecask::createUnregisteredDataFileForWrite(dir, stem, ".data.tmp", 0, bytecask::IoBackend::Pread);
   }));
 
   std::filesystem::remove_all(dir);
@@ -1176,7 +1176,7 @@ TEST_CASE("createDataFileForWrite accepts an unused stem", "[data_file]") {
   std::filesystem::create_directories(dir);
   const std::string stem = "data_20260912164544_00000001_V01";
 
-  auto file = bytecask::createDataFileForWrite(dir, stem, ".data", 0, bytecask::IoBackend::Pread);
+  auto file = bytecask::createUnregisteredDataFileForWrite(dir, stem, ".data", 0, bytecask::IoBackend::Pread);
   CHECK(file->size() == 0);
   CHECK(file->path() == dir / (stem + ".data"));
   CHECK(std::filesystem::exists(dir / (stem + ".data")));
@@ -1236,7 +1236,7 @@ TEST_CASE("createDataFileForWrite writes an empty mmap file with pread",
   const auto dir = std::filesystem::temp_directory_path() / "bc_test_mmap_cap0";
   std::filesystem::remove_all(dir);
   std::filesystem::create_directories(dir);
-  const auto file = bytecask::createDataFileForWrite(
+  const auto file = bytecask::createUnregisteredDataFileForWrite(
       dir, "data_20260912164544_00000002_V01", ".data", 0,
       bytecask::IoBackend::Mmap);
   CHECK(dynamic_cast<bytecask::WritablePosixDataFile *>(file.get()) != nullptr);
@@ -1528,7 +1528,7 @@ TEST_CASE("DataFile::lend_record rejects a damaged record when verifying",
   auto pool = std::make_shared<bytecask::BufferPool>(
       bytecask::BufferPoolOptions{.capacity_bytes = 8 << 20}, kScratchBytes);
   {
-    auto writer = bytecask::createDataFileForWrite(
+    auto writer = bytecask::createUnregisteredDataFileForWrite(
         dir, "bc_test_lend_record_crc", ".data", 1 << 20,
         bytecask::IoBackend::Pread);
     (void)writer->append_entry(1, bytecask::EntryType::Put, to_bytes("key"),
@@ -1705,7 +1705,7 @@ TEST_CASE("DataFile: a read past the end of file reports a short read",
                                            to_bytes("b"), to_bytes("second"));
   writer->sync();
   std::shared_ptr<bytecask::DataFile> file = writer;
-  if (sealed) file = bytecask::openDataFileForRead(path);
+  if (sealed) file = bytecask::openUnregisteredDataFileForRead(path);
   // Cut the file behind the handle's back, two bytes into the second
   // record's value.
   const auto cut = second + bytecask::kHeaderSize + 1 + 2;
@@ -2023,7 +2023,7 @@ TEST_CASE("DataFile: a damaged record across pool frames fails verification",
       {"value", "vkey", std::string(300, 'w'), bytecask::kHeaderSize + 4 + 150}};
   bytecask::Offset offset = 0;
   {
-    auto writer = bytecask::createDataFileForWrite(
+    auto writer = bytecask::createUnregisteredDataFileForWrite(
         dir, "bc_test_straddle_crc", ".data", 1 << 20,
         bytecask::IoBackend::Pread);
     offset = write_straddlers(*writer, recs)[0];
@@ -2094,7 +2094,7 @@ TEST_CASE("DataFile: a sealed file past 4 GiB keeps its size and its records",
   };
 
   SECTION("pread") {
-    check(*bytecask::openDataFileForRead(path, bytecask::IoBackend::Pread));
+    check(*bytecask::openUnregisteredDataFileForRead(path, bytecask::IoBackend::Pread));
   }
   SECTION("buffer pool") {
     auto pool = std::make_shared<bytecask::BufferPool>(

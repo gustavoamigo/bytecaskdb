@@ -167,7 +167,8 @@ struct SizeLimits {
   std::uint32_t max_value_bytes{4U * 1024 * 1024};
 };
 
-// A sealed file in a FileManifest, which lists them in log order. file_id
+// A sealed file in a FileManifest, which lists them in log order (a file
+// holding no entry first). file_id
 // names the file only within its manifest: once nothing holds a file, a later
 // one reuses its id. Key anything kept across manifests by data_path.
 struct FileInfo {

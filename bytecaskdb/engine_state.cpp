@@ -697,6 +697,11 @@ void TransientEngineState::apply_ingest(
 void TransientEngineState::apply_rotate_file(
     std::shared_ptr<DataFile> sealed_old, std::shared_ptr<DataFile> new_file) {
   const auto new_file_id = new_file->id();
+  // Every record placed in the sealed file was written before the rotation
+  // (a rotation follows a successful append), so the key directory reads it
+  // from the file. Dropping them keeps the list in one file, where offsets
+  // rise: the next file's id may be lower (PendingRecords).
+  pending_.clear();
   files_.set(active_file_id_, std::move(sealed_old));
   active_file_id_ = new_file_id;
   files_.set(active_file_id_, std::move(new_file));

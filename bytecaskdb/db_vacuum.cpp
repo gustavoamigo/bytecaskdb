@@ -262,8 +262,9 @@ void DB::vacuum_unlink_old_file(
 auto DB::vacuum_compact_file(std::uint32_t file_id, const VacuumOptions &opts)
     -> bool {
   auto snap = load_state_for_write();
-  // Checked again where the id is reserved; here so a vacuum that cannot
-  // finish does not copy the file first. Ids only come back meanwhile.
+  // Advisory: the write path may take the last id before the reservation
+  // below, which checks again under the barrier and removes the copy. Here
+  // so a vacuum that cannot finish does not usually copy the file first.
   if (file_ids_left() == 0) throw file_ids_exhausted();
   const auto &old_file = **snap->files.get(file_id);
 
@@ -296,7 +297,7 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, const VacuumOptions &opts)
 #ifdef BYTECASK_TESTING
     FAULT_INJECTION(io_vacuum_compact_tmp_create);
 #endif
-    auto tmp_file = createDataFileForWrite(
+    auto tmp_file = createUnregisteredDataFileForWrite(
         dir_, stem, ".data.tmp", rotation_threshold_,
         stagingBackend(io_backend_));
     scan = vacuum_scan_and_copy(snap, old_file, *tmp_file, file_id,

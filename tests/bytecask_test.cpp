@@ -9740,7 +9740,7 @@ TEST_CASE("vacuum preserves BulkBegin/BulkEnd markers", "[vacuum][batch]") {
   bool found_end = false;
   for (const auto &entry : std::filesystem::directory_iterator{db_path}) {
     if (entry.path().extension() != ".data") continue;
-    auto df_ptr = bytecask::openDataFileForRead(entry.path()); auto &df = *df_ptr;
+    auto df_ptr = bytecask::openUnregisteredDataFileForRead(entry.path()); auto &df = *df_ptr;
     for (const auto &[de, off] :
          std::ranges::subrange{bytecask::DataFileIterator{df}, std::default_sentinel}) {
       if (de.entry_type == bytecask::EntryType::BulkBegin) found_begin = true;
@@ -9787,7 +9787,7 @@ TEST_CASE("vacuum drops batch when all entries are stale",
   bool found_marker = false;
   for (const auto &entry : std::filesystem::directory_iterator{db_path}) {
     if (entry.path().extension() != ".data") continue;
-    auto df_ptr = bytecask::openDataFileForRead(entry.path()); auto &df = *df_ptr;
+    auto df_ptr = bytecask::openUnregisteredDataFileForRead(entry.path()); auto &df = *df_ptr;
     for (const auto &[de, off] :
          std::ranges::subrange{bytecask::DataFileIterator{df}, std::default_sentinel}) {
       if (de.entry_type == bytecask::EntryType::BulkBegin ||

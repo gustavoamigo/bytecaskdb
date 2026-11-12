@@ -1720,13 +1720,12 @@ template <typename F>
   return file;
 }
 
-// Generic factory: returns the read-only DataFile for the selected back-end.
-// BufferPool needs the DB's pool and the file's engine id, whose serial keys
-// its frames; both are required there. Every engine file passes its id.
-export [[nodiscard]] inline auto openDataFileForRead(
-    std::filesystem::path path, IoBackend backend = IoBackend::Pread,
-    std::shared_ptr<BufferPool> pool = nullptr,
-    std::shared_ptr<const FileId> id = nullptr) -> std::shared_ptr<DataFile> {
+// The read-only DataFile for the selected back-end, holding id when given.
+// Callers go through openDataFileForRead or openUnregisteredDataFileForRead.
+[[nodiscard]] inline auto open_data_file_for_read(
+    std::filesystem::path path, IoBackend backend,
+    std::shared_ptr<BufferPool> pool, std::shared_ptr<const FileId> id)
+    -> std::shared_ptr<DataFile> {
   if (backend == IoBackend::BufferPool) {
     const auto key = checked_id(id, "openDataFileForRead").serial();
     return with_id<DataFile>(
@@ -1748,9 +1747,35 @@ export [[nodiscard]] inline auto openDataFileForRead(
                            std::move(id));
 }
 
+// Opens a file the engine registers under id, which the file holds for its
+// life: the id comes back only once every DataFile for it is gone
+// (bytecask.file_id). id is required on every back-end, so no engine file
+// can be opened without one. BufferPool also needs the DB's pool; its frames
+// are keyed by the id's serial.
+export [[nodiscard]] inline auto openDataFileForRead(
+    std::filesystem::path path, IoBackend backend,
+    std::shared_ptr<BufferPool> pool, std::shared_ptr<const FileId> id)
+    -> std::shared_ptr<DataFile> {
+  (void)checked_id(id, "openDataFileForRead");
+  return open_data_file_for_read(std::move(path), backend, std::move(pool),
+                                 std::move(id));
+}
+
+// Opens a file the engine does not register: one recovery compares, or one a
+// test or tool reads. It holds no id, so it cannot go through the buffer
+// pool, whose frames are keyed by an id's serial.
+export [[nodiscard]] inline auto openUnregisteredDataFileForRead(
+    std::filesystem::path path, IoBackend backend = IoBackend::Pread)
+    -> std::shared_ptr<DataFile> {
+  if (backend == IoBackend::BufferPool)
+    throw std::logic_error{
+        "openUnregisteredDataFileForRead: the buffer pool needs a file id"};
+  return open_data_file_for_read(std::move(path), backend, nullptr, nullptr);
+}
+
 // Creates the one writable data file for stem in dir: "<stem>.data", or
-// "<stem>.data.tmp" for vacuum's staging copy. This is how the engine creates
-// every data file it writes to.
+// "<stem>.data.tmp" for vacuum's staging copy, holding id when given. Callers
+// go through createDataFileForWrite or createUnregisteredDataFileForWrite.
 //
 // Panics if the name is already in use — either "<stem><suffix>" exists
 // (rejected by O_EXCL, race-free against a concurrent creator) or a
@@ -1758,11 +1783,10 @@ export [[nodiscard]] inline auto openDataFileForRead(
 // the stem generator returned a name this database already used. Neither is
 // recoverable: the two guards are a pair, so they live in one function that a
 // caller cannot half-apply.
-export [[nodiscard]] inline auto createDataFileForWrite(
+[[nodiscard]] inline auto create_data_file_for_write(
     const std::filesystem::path &dir, const std::string &stem,
     std::string_view suffix, std::size_t capacity, IoBackend backend,
-    std::shared_ptr<BufferPool> pool = nullptr,
-    std::shared_ptr<const FileId> id = nullptr)
+    std::shared_ptr<BufferPool> pool, std::shared_ptr<const FileId> id)
     -> std::shared_ptr<WritableDataFile> {
   const auto hint_path = dir / (stem + ".hint");
   // error_code overload: the question is "is this stem taken", and a stat
@@ -1797,6 +1821,32 @@ export [[nodiscard]] inline auto createDataFileForWrite(
       WritablePosixDataFile::create(std::move(path), capacity,
                                     /*exclusive=*/true),
       std::move(id));
+}
+
+// Creates an active file the engine registers under id: required on every
+// back-end, as for openDataFileForRead.
+export [[nodiscard]] inline auto createDataFileForWrite(
+    const std::filesystem::path &dir, const std::string &stem,
+    std::string_view suffix, std::size_t capacity, IoBackend backend,
+    std::shared_ptr<BufferPool> pool, std::shared_ptr<const FileId> id)
+    -> std::shared_ptr<WritableDataFile> {
+  (void)checked_id(id, "createDataFileForWrite");
+  return create_data_file_for_write(dir, stem, suffix, capacity, backend,
+                                    std::move(pool), std::move(id));
+}
+
+// Creates a file the engine has not registered: vacuum's staging copy, which
+// gets an id only once it is reopened under its final name, or a test's
+// file. Not through the buffer pool (see stagingBackend).
+export [[nodiscard]] inline auto createUnregisteredDataFileForWrite(
+    const std::filesystem::path &dir, const std::string &stem,
+    std::string_view suffix, std::size_t capacity, IoBackend backend)
+    -> std::shared_ptr<WritableDataFile> {
+  if (backend == IoBackend::BufferPool)
+    throw std::logic_error{
+        "createUnregisteredDataFileForWrite: the buffer pool needs a file id"};
+  return create_data_file_for_write(dir, stem, suffix, capacity, backend,
+                                    nullptr, nullptr);
 }
 
 // Moves a staged data file onto its final name, refusing to replace an

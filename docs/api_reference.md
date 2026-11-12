@@ -358,7 +358,7 @@ struct FileInfo {
 // Returned by DB::create_manifest().
 struct FileManifest {
     Snapshot snap;                       // frozen read-only view
-    std::vector<FileInfo> files;         // sealed data + hint files, in log order
+    std::vector<FileInfo> files;         // sealed data + hint files, in log order (empty files first)
     std::uint64_t through_sequence{0};   // last sequence covered
 };
 
