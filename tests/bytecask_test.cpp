@@ -11927,22 +11927,46 @@ TEST_CASE("File ids: a server that keeps rotating and vacuuming reuses the "
       CHECK(db.engine_state()->active_file_id < 3);
       CHECK_FALSE(db.is_degraded());
     }
-    // Ids now say nothing of age; the manifest still lists files in log
-    // order (FileInfo, include/bytecask.hpp). It seals the active file, which
-    // takes the id the next removal gives back.
-    REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
-    release_old_states(db);
-    const auto manifest = db.create_manifest();
-    const auto stats = db.file_stats();
-    REQUIRE(manifest.files.size() >= 2);
-    std::uint64_t prev = 0;
-    for (const auto &f : manifest.files) {
-      CHECK(stats.at(f.file_id).min_sequence >= prev);
-      prev = stats.at(f.file_id).min_sequence;
-    }
   }
   auto db = bytecask::DB::open(dir, opts);
   CHECK(get_str(db, to_bytes("a")) == value(kCycles - 1));
+}
+
+TEST_CASE("File ids: the manifest lists files in log order when a newer file "
+          "has a lower id", "[bytecask][limits][file_ids][replication]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 256});
+  // A value past max_file_bytes seals the file it lands in.
+  const auto big = [](char c) { return std::string(300, c); };
+  db.put({}, to_bytes("a"), to_bytes(big('1')));  // first file: [a]
+  db.put({}, to_bytes("b"), to_bytes(big('b')));
+  db.put({}, to_bytes("a"), to_bytes(big('2')));  // the first file is all dead
+  const auto first = db.file_stats().begin()->first;
+  REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+  release_old_states(db);
+  db.put({}, to_bytes("c"), to_bytes(big('c')));  // the next file reuses `first`
+  db.put({}, to_bytes("d"), to_bytes(big('d')));  // written into it
+  REQUIRE(db.file_stats().contains(first));
+
+  // Files holding entries come in strictly rising sequence order, after any
+  // that hold none (FileInfo, include/bytecask.hpp); the reused id is last.
+  const auto manifest = db.create_manifest();
+  const auto stats = db.file_stats();
+  std::uint64_t prev = 0;
+  std::vector<std::uint32_t> ids_in_order;
+  for (const auto &f : manifest.files) {
+    const auto first_seq = stats.at(f.file_id).min_sequence;
+    if (first_seq == 0) {
+      CHECK(prev == 0);
+      continue;
+    }
+    CHECK(first_seq > prev);
+    prev = first_seq;
+    ids_in_order.push_back(f.file_id);
+  }
+  REQUIRE(ids_in_order.size() >= 3);
+  CHECK(ids_in_order.back() == first);
+  CHECK_FALSE(std::ranges::is_sorted(ids_in_order));
 }
 
 TEST_CASE("File ids: a snapshot or a write plan holds the ids of the files it "
