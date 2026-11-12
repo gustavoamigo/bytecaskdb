@@ -393,8 +393,10 @@ private:
 
   // A record starts below 2^32 (KeyDirEntry's file offset) and is at most
   // kMaxBatchBytes long, so every byte a pool read asks for lies below
-  // 2^33; 22 bits of frame index cover 16 GiB. release_file stops there,
-  // whatever size a file on disk claims.
+  // 2^33; 22 bits of frame index cover 16 GiB. Past that the pool keeps
+  // out, in release builds too, so a frame index never reaches the serial's
+  // bits: read_upto reads straight from the file, view misses,
+  // append_resident and release_file stop at the last frame.
   static constexpr unsigned kFrameIndexBits = 22;
   static constexpr std::uint64_t kMaxFrames = std::uint64_t{1}
                                               << kFrameIndexBits;
@@ -781,6 +783,9 @@ auto BufferPool::read_upto(std::uint64_t file_key, PoolFile file,
   // An oversize entry would evict the working set to hold one value. It
   // lands in the caller's buffer, which is not aligned, so never O_DIRECT.
   if (len > oversize_limit_) return pread_upto(file.buffered, offset, {dst, len});
+  // Past the frames a key can name: never admitted, so read from the file.
+  if (offset + len > kMaxFrames * kPoolFrameBytes)
+    return pread_upto(file.buffered, offset, {dst, len});
 
   // Where the bytes delivered from offset stop: the first end of file a fill
   // meets, or the end of what file_size covers.
@@ -901,6 +906,7 @@ auto BufferPool::view(std::uint64_t file_key, std::uint64_t offset,
   lease.reset();
   if (offset >= file_size) return {};
   const auto frame_index = offset / kPoolFrameBytes;
+  if (frame_index >= kMaxFrames) return {};
   const auto f = find_pinned(make_key(file_key, frame_index));
   if (f == kNoFrame) return {};
   lease = FrameLease{this, f};
@@ -945,7 +951,9 @@ void BufferPool::append_resident(std::uint64_t file_key, std::uint64_t offset,
   if (bytes.empty()) return;
   const auto end = offset + bytes.size();
   std::lock_guard<std::mutex> lk{mu_};
-  for (auto f = offset / kPoolFrameBytes; f <= (end - 1) / kPoolFrameBytes; ++f) {
+  const auto last = std::min<std::uint64_t>((end - 1) / kPoolFrameBytes,
+                                            kMaxFrames - 1);
+  for (auto f = offset / kPoolFrameBytes; f <= last; ++f) {
     const auto frame_start = f * kPoolFrameBytes;
     const auto seg_from = std::max(offset, frame_start);
     const auto seg_to = std::min(end, frame_start + kPoolFrameBytes);

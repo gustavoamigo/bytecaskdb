@@ -21,6 +21,7 @@
 #include <thread>
 #include <vector>
 
+#include <array>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -1091,4 +1092,42 @@ TEST_CASE("BufferPool: readers racing release_file always read the file's "
   for (auto &r : readers) r.join();
   CHECK(bad.load() == 0);
   CHECK(pool.counters().frames_released.load() > 0);
+}
+
+// A frame index takes 22 bits of a key, below the file's serial (#774). Past
+// 2^22 frames a key would name frame 0 of the next serial, so the pool keeps
+// out there, release builds included: a read goes straight to the file and
+// admits nothing another file could find. File a's frame 2^22 and file b's
+// frame 0 are the pair that would share a key.
+TEST_CASE("BufferPool: a read past the frame-index range neither aliases "
+          "another file nor enters the pool", "[buffer_pool]") {
+  constexpr std::uint64_t kFar = (std::uint64_t{1} << 22) * bytecask::kPoolFrameBytes;
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("bc_pool_far_" + std::to_string(::getpid()) + ".bin");
+  const std::array<std::byte, 4> a_bytes{std::byte{'A'}, std::byte{'A'},
+                                         std::byte{'A'}, std::byte{'A'}};
+  const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+  REQUIRE(fd != -1);
+  REQUIRE(::ftruncate(fd, static_cast<off_t>(kFar + bytecask::kPoolFrameBytes)) == 0);
+  REQUIRE(::pwrite(fd, a_bytes.data(), a_bytes.size(), static_cast<off_t>(kFar)) ==
+          static_cast<ssize_t>(a_bytes.size()));
+  const auto file_size = kFar + bytecask::kPoolFrameBytes;
+  ScratchFile b{bytecask::kPoolFrameBytes};
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}, kScratchBytes};
+  const bytecask::PoolFile a{.buffered = fd, .direct = -1, .sealed = true};
+
+  std::array<std::byte, 4> got{};
+  pool.read_at(1, a, kFar, got.size(), file_size, got.data());
+  CHECK(got == a_bytes);
+  CHECK(pool.counters().frames_resident.load() == 0);
+  bytecask::FrameLease lease;
+  CHECK(pool.view(1, kFar, file_size, lease).empty());
+
+  std::vector<std::byte> b_got(16);
+  pool.read_at(2, b.sealed(), 0, b_got.size(), b.size(), b_got.data());
+  CHECK(b_got == b.expected(0, b_got.size()));
+  pool.release_file(1, file_size);  // stops at the last frame a key can name
+  ::close(fd);
+  std::filesystem::remove(path);
 }
