@@ -27,6 +27,7 @@ module;
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 export module bytecask.file_id;
@@ -67,39 +68,62 @@ private:
   std::shared_ptr<FileIdPool> pool_;  // null for an unpooled id
 };
 
+// *id, or std::logic_error naming who wanted a file id and had none.
+export [[nodiscard]] inline auto checked_id(
+    const std::shared_ptr<const FileId> &id, const char *who) -> const FileId & {
+  if (id == nullptr)
+    throw std::logic_error{std::string{who} + ": file has no engine id"};
+  return *id;
+}
+
 // The ids 0..max_id of one DB. Thread-safe: an id comes back on whichever
 // thread drops the last DataFile of its file. The DB takes ids under its
 // write path only, so a count of free ids taken there stays true until the
 // write path takes one: ids only come back in between.
 export class FileIdPool : public std::enable_shared_from_this<FileIdPool> {
 public:
-  explicit FileIdPool(std::uint32_t max_id) : max_id_{max_id} {}
+  explicit FileIdPool(std::uint32_t max_id) : max_id_{max_id} {
+    publish_left();
+  }
 
   // The most recently returned id, else the lowest never used (so open
   // numbers files in name order). Reusing first keeps ids, and the file
   // table's pages, dense. Null when every id is leased.
   [[nodiscard]] auto take() -> std::shared_ptr<const FileId>;
 
-  // How many more ids take() can give now. Grows as ids come back.
-  [[nodiscard]] auto left() const -> std::uint32_t;
+  // How many more ids take() can give now. Grows as ids come back. One load,
+  // no lock: the write path reads it for every commit group.
+  [[nodiscard]] auto left() const noexcept -> std::uint32_t {
+    return left_.load(std::memory_order_relaxed);
+  }
 
   // Starts the never-used ids at id, so a test reaches the ceiling without
-  // creating a million files.
+  // creating a million files. Only forward: an id below next_ may be leased.
   void test_set_next(std::uint32_t id) {
     std::lock_guard<std::mutex> lk{mu_};
+    if (id < next_)
+      throw std::logic_error{"FileIdPool: ids only move forward"};
     next_ = id;
+    publish_left();
   }
 
 private:
   friend class FileId;
   // Cannot fail: take() reserved room for every id it has handed out.
   void give_back(std::uint32_t id) noexcept;
+  // Stores what left() reads. Called under mu_ by every change.
+  void publish_left() noexcept {
+    const auto unused = next_ <= max_id_ ? max_id_ - next_ + 1 : 0;
+    left_.store(static_cast<std::uint32_t>(unused + free_.size()),
+                std::memory_order_relaxed);
+  }
 
   mutable std::mutex mu_;
   std::uint32_t max_id_;
   std::uint64_t next_{0};    // lowest never-used id; 64-bit so it can pass max_id_
   std::uint64_t minted_{0};  // never-used ids handed out: free_ holds at most this many
   std::vector<std::uint32_t> free_;
+  std::atomic<std::uint32_t> left_{0};
 };
 
 namespace {
@@ -148,18 +172,14 @@ auto FileIdPool::take() -> std::shared_ptr<const FileId> {
     ++next_;
     ++minted_;
   }
+  publish_left();
   return lease;
-}
-
-auto FileIdPool::left() const -> std::uint32_t {
-  std::lock_guard<std::mutex> lk{mu_};
-  const auto unused = next_ <= max_id_ ? max_id_ - next_ + 1 : 0;
-  return static_cast<std::uint32_t>(unused + free_.size());
 }
 
 void FileIdPool::give_back(std::uint32_t id) noexcept {
   std::lock_guard<std::mutex> lk{mu_};
   free_.push_back(id);
+  publish_left();
 }
 
 }  // namespace bytecask

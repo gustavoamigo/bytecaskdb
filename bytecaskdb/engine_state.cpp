@@ -696,7 +696,7 @@ void TransientEngineState::apply_ingest(
 
 void TransientEngineState::apply_rotate_file(
     std::shared_ptr<DataFile> sealed_old, std::shared_ptr<DataFile> new_file) {
-  const auto new_file_id = registered_id(*new_file);
+  const auto new_file_id = new_file->id();
   files_.set(active_file_id_, std::move(sealed_old));
   active_file_id_ = new_file_id;
   files_.set(active_file_id_, std::move(new_file));
@@ -718,7 +718,7 @@ void TransientEngineState::apply_vacuum(
   // The destination is registered before the remap: a key directory that
   // reads keys back may resolve an already remapped record while placing the
   // next one.
-  const auto dest_file_id = registered_id(*new_sealed_file);
+  const auto dest_file_id = new_sealed_file->id();
   files_.set(dest_file_id, std::move(new_sealed_file));
 
   auto actual_live_bytes = scan.live_bytes;

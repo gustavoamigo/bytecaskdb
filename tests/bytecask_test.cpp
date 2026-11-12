@@ -11927,6 +11927,19 @@ TEST_CASE("File ids: a server that keeps rotating and vacuuming reuses the "
       CHECK(db.engine_state()->active_file_id < 3);
       CHECK_FALSE(db.is_degraded());
     }
+    // Ids now say nothing of age; the manifest still lists files in log
+    // order (FileInfo, include/bytecask.hpp). It seals the active file, which
+    // takes the id the next removal gives back.
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+    release_old_states(db);
+    const auto manifest = db.create_manifest();
+    const auto stats = db.file_stats();
+    REQUIRE(manifest.files.size() >= 2);
+    std::uint64_t prev = 0;
+    for (const auto &f : manifest.files) {
+      CHECK(stats.at(f.file_id).min_sequence >= prev);
+      prev = stats.at(f.file_id).min_sequence;
+    }
   }
   auto db = bytecask::DB::open(dir, opts);
   CHECK(get_str(db, to_bytes("a")) == value(kCycles - 1));

@@ -135,10 +135,13 @@ public:
       -> const std::shared_ptr<const FileId> & {
     return id_;
   }
-  // The file's process-unique serial. Throws for an unregistered file.
+  // The engine id and the process-unique serial. Throw for an unregistered
+  // file.
+  [[nodiscard]] auto id() const -> std::uint32_t {
+    return checked_id(id_, "DataFile").id();
+  }
   [[nodiscard]] auto serial() const -> std::uint64_t {
-    if (!id_) throw std::logic_error{"DataFile: file has no engine id"};
-    return id_->serial();
+    return checked_id(id_, "DataFile").serial();
   }
   // Set once, by the factories below, before the file is shared.
   void adopt_id(std::shared_ptr<const FileId> id) {
@@ -1707,15 +1710,6 @@ export [[nodiscard]] inline auto stagingBackend(IoBackend backend) noexcept
   return backend == IoBackend::BufferPool ? IoBackend::Pread : backend;
 }
 
-[[nodiscard]] inline auto require_id(const std::shared_ptr<const FileId> &id,
-                                     const char *who) -> std::uint64_t {
-  if (id == nullptr) {
-    throw std::logic_error{
-        std::format("{}: IoBackend::BufferPool requires a file id", who)};
-  }
-  return id->serial();
-}
-
 // The file carries id, when given, for its whole life (DataFile::id_lease):
 // every DataFile the engine opens for a file shares the file's FileId.
 template <typename F>
@@ -1734,7 +1728,7 @@ export [[nodiscard]] inline auto openDataFileForRead(
     std::shared_ptr<BufferPool> pool = nullptr,
     std::shared_ptr<const FileId> id = nullptr) -> std::shared_ptr<DataFile> {
   if (backend == IoBackend::BufferPool) {
-    const auto key = require_id(id, "openDataFileForRead");
+    const auto key = checked_id(id, "openDataFileForRead").serial();
     return with_id<DataFile>(
         ReadOnlyBufferPoolDataFile::openForRead(
             std::move(path), key,
@@ -1783,7 +1777,7 @@ export [[nodiscard]] inline auto createDataFileForWrite(
   }
   auto path = dir / (stem + std::string{suffix});
   if (backend == IoBackend::BufferPool) {
-    const auto key = require_id(id, "createDataFileForWrite");
+    const auto key = checked_id(id, "createDataFileForWrite").serial();
     return with_id<WritableDataFile>(
         WritableBufferPoolDataFile::create(
             std::move(path), capacity, /*exclusive=*/true,

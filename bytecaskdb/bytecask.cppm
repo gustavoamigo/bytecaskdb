@@ -2410,23 +2410,16 @@ constexpr const char *kWriteFaultReason =
     "a write reached the data file but could not be published: call "
     "resume() to recover.";
 
-// The engine id a registered file was opened under (DB::reserve_file_id).
-auto registered_id(const DataFile &file) -> std::uint32_t {
-  const auto &id = file.id_lease();
-  if (!id)
-    throw std::logic_error{"bytecask: data file registered without an id"};
-  return id->id();
-}
-
 // An id is held by every file the engine has open: the live files, and a
 // deleted one until no snapshot, iterator, write plan or manifest still holds
 // the state it was in (bytecask.file_id). So the ceiling is reached only by
-// that many files open at once.
+// that many files open at once. Vacuum cannot help: a compaction needs an id
+// for its copy before the source's comes back.
 auto file_ids_exhausted() -> std::runtime_error {
   return std::runtime_error{std::format(
       "file id space exhausted: all {} file ids are held by open data files, "
       "live or deleted but still held by a snapshot, iterator, write plan or "
-      "manifest. Release those, or vacuum to merge files.",
+      "manifest. Release those, or reopen the database.",
       KeyDirEntry::kMaxFileId + 1)};
 }
 

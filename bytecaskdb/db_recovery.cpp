@@ -145,10 +145,11 @@ auto DB::recovery_open(const Options &opts) -> EngineState {
       }
     }
     recovery_undo_interrupted_vacuum(a, b);
-    // The next pass numbers files afresh, so an id can now name a different
-    // file. The pool keys frames by id; a fresh one holds none of the old.
-    if (pool_)
-      pool_ = std::make_shared<BufferPool>(opts.buffer_pool, scratch_bytes_);
+    // The next pass numbers files afresh, in name order: a fresh pool, since
+    // this one would hand back the ids this pass's files returned first. The
+    // buffer pool keys frames by serial, which no later file shares, so the
+    // frames this pass admitted are orphans, not stale.
+    file_ids_ = std::make_shared<FileIdPool>(KeyDirEntry::kMaxFileId);
   }
 }
 
