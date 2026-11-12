@@ -142,7 +142,7 @@ TEST_CASE("a slice from inside a file enters it at a bookmark and matches a "
   REQUIRE(history.entries.size() == 3000);
 
   auto &idx = db.test_change_index();
-  const auto ids = idx.file_ids();
+  const auto ids = idx.file_keys();
   REQUIRE(ids.size() == 1);
   const auto bookmarks = idx.bookmarks(ids[0]);
   REQUIRE(bookmarks.size() > 100);
@@ -192,7 +192,7 @@ TEST_CASE("bookmarks sit on unit boundaries; a slice from inside a batch leaves 
   const auto history = pull(db, snap, 0);
 
   auto &idx = db.test_change_index();
-  const auto ids = idx.file_ids();
+  const auto ids = idx.file_keys();
   REQUIRE(ids.size() == 1);
   const auto bookmarks = idx.bookmarks(ids[0]);
   REQUIRE(bookmarks.size() > 50);
@@ -220,7 +220,7 @@ TEST_CASE("the active file's table grows with the pulls",
     (void)pull(db, snap, 0);
   }
   auto &idx = db.test_change_index();
-  const auto id = idx.file_ids().at(0);
+  const auto id = idx.file_keys().at(0);
   const auto n1 = idx.bookmarks(id).size();
   REQUIRE(n1 > 10);
 
@@ -233,7 +233,7 @@ TEST_CASE("the active file's table grows with the pulls",
   const auto bookmarks = idx.bookmarks(id);
   CHECK(bookmarks.size() > n1 + 10);
   CHECK(bookmarks.back().sequence > durable1);
-  CHECK(idx.file_ids().size() == 1);
+  CHECK(idx.file_keys().size() == 1);
 }
 
 TEST_CASE("a slice that stops early indexes what it crossed",
@@ -248,7 +248,7 @@ TEST_CASE("a slice that stops early indexes what it crossed",
   REQUIRE(first.entries.size() < 1000);
 
   auto &idx = db.test_change_index();
-  const auto id = idx.file_ids().at(0);
+  const auto id = idx.file_keys().at(0);
   const auto laid = idx.bookmarks(id);
   CHECK(laid.size() >= kBudget / kSpacing - 1);
   CHECK(laid.size() <= kBudget / kSpacing + 1);
@@ -275,7 +275,7 @@ TEST_CASE("bookmarks are handed over during the scan, a bounded number at a time
   for (std::size_t i = 0; i < 6000 && !(it == std::default_sentinel); ++i) ++it;
   REQUIRE(!(it == std::default_sentinel));
   // The scan is still in the file: the first chunk is already in the index.
-  const auto ids = idx.file_ids();
+  const auto ids = idx.file_keys();
   REQUIRE(ids.size() == 1);
   const auto mid = idx.bookmarks(ids[0]).size();
   CHECK(mid >= 256);
@@ -300,7 +300,7 @@ TEST_CASE("a scan whose table was evicted does not start a tail-only one",
     auto it = std::move(batch.entries).begin();
     for (std::size_t i = 0; i < 6000; ++i) ++it;  // past the first hand-over
     REQUIRE(idx.files() == 1);
-    const auto id = idx.file_ids().at(0);
+    const auto id = idx.file_keys().at(0);
     idx.forget(id);  // what eviction by other pulls would do
     while (!(it == std::default_sentinel)) ++it;
   }
@@ -308,7 +308,7 @@ TEST_CASE("a scan whose table was evicted does not start a tail-only one",
   // first bookmark or not at all, so a scan from the first byte can rebuild it.
   CHECK(idx.files() == 0);
   const auto history = pull(db, snap, 0);
-  const auto bookmarks = idx.bookmarks(idx.file_ids().at(0));
+  const auto bookmarks = idx.bookmarks(idx.file_keys().at(0));
   REQUIRE(bookmarks.size() > 400);
   CHECK(bookmarks.front().offset < 2 * kSpacing);
   (void)check_slices(db, snap, history, 997);
@@ -329,7 +329,7 @@ TEST_CASE("nothing above the durable sequence gets a bookmark",
   REQUIRE(history.entries.back().sequence == durable);
 
   auto &idx = db.test_change_index();
-  const auto bookmarks = idx.bookmarks(idx.file_ids().at(0));
+  const auto bookmarks = idx.bookmarks(idx.file_keys().at(0));
   REQUIRE(!bookmarks.empty());
   for (const auto &f : bookmarks) CHECK(f.sequence <= durable);
 }
@@ -346,11 +346,11 @@ TEST_CASE("a compacted file is scanned from its first byte and indexed again",
   (void)db.apply_batch({.sync = true}, bytecask::WritePlan{});
 
   auto &idx = db.test_change_index();
-  std::vector<std::uint32_t> before;
+  std::vector<std::uint64_t> before;
   {
     const auto snap = db.snapshot();
     const auto history = pull(db, snap, 0);
-    before = idx.file_ids();
+    before = idx.file_keys();
     REQUIRE(before.size() > 1);
     // The first file's survivors start above the dead run.
     const auto from = history.entries.at(170).sequence;
@@ -362,13 +362,13 @@ TEST_CASE("a compacted file is scanned from its first byte and indexed again",
   REQUIRE(db.vacuum());
   // The compacted file is gone from the index; its copy is a new id that
   // no scan has crossed yet.
-  const auto after = idx.file_ids();
+  const auto after = idx.file_keys();
   CHECK(!std::ranges::contains(after, before.front()));
   CHECK(after.size() == before.size() - 1);
 
   const auto snap = db.snapshot();
   const auto history = pull(db, snap, 0);
-  const auto copy = idx.file_ids().back();
+  const auto copy = idx.file_keys().back();
   CHECK(copy > before.back());
   // A sequence the copy holds, past its first bookmark.
   const auto from = history.entries.at(50).sequence;
@@ -393,7 +393,7 @@ TEST_CASE("a bookmark that does not hold is dropped and the file scanned from it
   const auto durable = db.durable_sequence();
   const auto history = pull(db, snap, 0);
   auto &idx = db.test_change_index();
-  const auto id = idx.file_ids().at(0);
+  const auto id = idx.file_keys().at(0);
   const auto bookmarks = idx.bookmarks(id);
   REQUIRE(bookmarks.size() > 3);
   const auto from = durable - 1;
@@ -479,7 +479,7 @@ TEST_CASE("ChangeIndex: seek returns the last bookmark at or below from",
   CHECK(idx.plan(2).next_offset == kSpacing);
   CHECK(idx.plan(2).spacing == kSpacing);
   CHECK(idx.plan(2).generation == 0);
-  CHECK(idx.file_ids() == std::vector<std::uint32_t>{1});
+  CHECK(idx.file_keys() == std::vector<std::uint64_t>{1});
   idx.forget(1);
   CHECK(!idx.seek(1, 1000));
   CHECK(idx.files() == 0);
@@ -532,10 +532,10 @@ TEST_CASE("ChangeIndex: the least recently used table goes past max_files",
   REQUIRE(idx.extend(2, 0, std::vector<Bookmark>{{20, 4096}}));
   (void)idx.seek(1, 10);  // 1 is now the more recent
   REQUIRE(idx.extend(3, 0, std::vector<Bookmark>{{30, 4096}}));
-  CHECK(idx.file_ids() == std::vector<std::uint32_t>{1, 3});
+  CHECK(idx.file_keys() == std::vector<std::uint64_t>{1, 3});
   REQUIRE(idx.extend(1, one->generation, std::vector<Bookmark>{{11, 8192}}));  // 1 again
   REQUIRE(idx.extend(4, 0, std::vector<Bookmark>{{40, 4096}}));
-  CHECK(idx.file_ids() == std::vector<std::uint32_t>{1, 4});
+  CHECK(idx.file_keys() == std::vector<std::uint64_t>{1, 4});
 }
 
 TEST_CASE("ChangeIndex: a full table keeps every other bookmark and doubles its "

@@ -7,7 +7,8 @@
 // PersistentU32Table<V> / TransientU32Table<V>: a paged direct-addressing
 // table. A lookup is two indexes; a write copies the directory and the pages
 // it touches, and memory follows the pages holding keys. For clustered keys
-// (file ids are minted in sequence and capped at KeyDirEntry::kMaxFileId):
+// (file ids are dense: returned ids are taken first, and capped at
+// KeyDirEntry::kMaxFileId):
 // the files map, read on every record access, and the base of file_stats'
 // patch map (patch_map.cppm), written at each squash.
 //

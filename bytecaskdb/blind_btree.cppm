@@ -42,8 +42,9 @@ import bytecask.version_chain;
 
 namespace bytecask {
 
-// Where the record holding a key lives. Within one process a (file_id,
-// offset) pair names at most one record, so equal locations mean the same
+// Where the record holding a key lives. While any version can hold it, a
+// (file_id, offset) pair names one record — an id is reused only once nothing
+// holds its file (bytecask.file_id) — so equal locations mean the same
 // record. Sizes are the record's own business: its header has them.
 export struct BlindRef {
   std::uint32_t file_id{0};

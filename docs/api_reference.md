@@ -345,7 +345,9 @@ public:
                                   std::size_t limit) const -> std::size_t;
 };
 
-// Sealed file descriptor returned by create_manifest().
+// Sealed file descriptor returned by create_manifest(). file_id names the file
+// only within this manifest: once nothing holds a file, its id is reused by a
+// later one. Key anything kept across manifests by data_path.
 struct FileInfo {
     std::uint32_t file_id;
     std::filesystem::path data_path;
@@ -356,7 +358,7 @@ struct FileInfo {
 // Returned by DB::create_manifest().
 struct FileManifest {
     Snapshot snap;                       // frozen read-only view
-    std::vector<FileInfo> files;         // sealed data + hint files
+    std::vector<FileInfo> files;         // sealed data + hint files, in log order (empty files first)
     std::uint64_t through_sequence{0};   // last sequence covered
 };
 

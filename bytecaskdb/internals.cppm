@@ -171,8 +171,9 @@ using FileStatsTransient =
 //
 // file_id = (file_id_high << 16) | file_id_low — effective 20 bits (max 1 048 575).
 //
-// file_id is a monotonic integer handle, assigned by DB, that indexes
-// into the engine's file registry. file_offset is the byte offset where
+// file_id is an integer handle, leased by DB (bytecask.file_id), that indexes
+// into the engine's file registry. It is reused once nothing holds the file
+// it named, so ids say nothing of age. file_offset is the byte offset where
 // the full DataEntry begins.
 // ---------------------------------------------------------------------------
 export struct KeyDirEntry {
@@ -589,9 +590,11 @@ export struct PendingRecord {
   std::span<const std::byte> key;
 };
 
-// Sorted by slot. A batch places its records at rising offsets, so put()
-// appends; a vector kept between groups allocates nothing per record, where a
-// hash map allocated a node and a key copy for each (#754).
+// Sorted by slot. A batch places its records at rising offsets in the active
+// file, and a rotation clears the list (TransientEngineState::
+// apply_rotate_file), so put() appends even when the next file takes a lower,
+// reused id. A vector kept between groups allocates nothing per record, where
+// a hash map allocated a node and a key copy for each (#754).
 export class PendingRecords {
 public:
   using value_type = PendingRecord;
@@ -1334,7 +1337,6 @@ export struct EngineState {
   PersistentU32Table<std::shared_ptr<DataFile>> files;
   FileStatsMap file_stats;
   std::uint32_t active_file_id{};
-  std::uint32_t next_file_id{};
   std::uint64_t next_seq{1};
   std::uint64_t durable_seq{0};
   // Highest sequence written by a sync=true slot. A state whose
@@ -1409,7 +1411,6 @@ export struct EngineState {
   [[nodiscard]] auto closed_copy() const -> std::shared_ptr<EngineState> {
     auto s = std::make_shared<EngineState>(scratch_bytes);
     s->active_file_id = active_file_id;
-    s->next_file_id = next_file_id;
     s->next_seq = next_seq;
     s->durable_seq = durable_seq;
     s->sync_requested_seq = sync_requested_seq;

@@ -674,31 +674,19 @@ public:
   // State transition: register a sealed read-only file in place of the old
   // active, then register a new writable file as the new active.
   // Cannot fail.
-  // new_file_id must come from reserve_file_id(): the new active file is
-  // created before this runs, and under the buffer pool it carries its id
-  // from construction so the writer can key its frames.
+  // new_file is registered under the id it was created with
+  // (DB::reserve_file_id), which it holds for its life.
   void apply_rotate_file(std::shared_ptr<DataFile> sealed_old,
-                         std::shared_ptr<DataFile> new_file,
-                         std::uint32_t new_file_id);
+                         std::shared_ptr<DataFile> new_file);
 
   // State transition: remap keys after vacuum scan+copy.
   // Cannot fail.
-  // Mints the next file id without registering a file under it. Vacuum needs
-  // the id before it opens the compacted file, because the buffer pool keys
-  // frames by file_id and the file must carry its id from construction.
-  // Reserving under the write barrier is what keeps it disjoint from the id
-  // rotation mints on the same counter. A reserved id that is never used
-  // simply leaves a gap, which is harmless: ids are monotonic within a
-  // process and are reassigned from scratch at recovery.
-  [[nodiscard]] auto reserve_file_id() -> std::uint32_t;
-
-  // Remaps the scan's live entries from old_file_id to new_sealed_file, which
-  // must carry an id reserved by reserve_file_id(). A null new_sealed_file
-  // removes old_file_id outright: its scan must hold no live entries, and
-  // dest_file_id is ignored.
+  // Remaps the scan's live entries from old_file_id to new_sealed_file,
+  // registered under the id it was opened with (DB::reserve_file_id). A null
+  // new_sealed_file removes old_file_id outright: its scan must hold no live
+  // entries.
   void apply_vacuum(std::uint32_t old_file_id, const VacuumScanResult &scan,
-                    std::shared_ptr<DataFile> new_sealed_file,
-                    std::uint32_t dest_file_id);
+                    std::shared_ptr<DataFile> new_sealed_file);
 
   // State transition: replay valid committed entries from a resume() scan.
   // Uses sequence-wins resolution to update key_dir and file_stats. Advances
@@ -750,13 +738,6 @@ public:
   [[nodiscard]] auto active_file_ptr() const -> std::shared_ptr<DataFile>;
   [[nodiscard]] auto active_file_id() const noexcept -> std::uint32_t;
   [[nodiscard]] auto is_rotation_needed(std::uint64_t threshold) const -> bool;
-  // How many more ids reserve_file_id can give.
-  [[nodiscard]] auto file_ids_left() const noexcept -> std::uint32_t;
-#ifdef BYTECASK_TESTING
-  // Starts the id counter near its ceiling, so a test reaches it without
-  // creating a million files.
-  void test_set_next_file_id(std::uint32_t id) { next_file_id_ = id; }
-#endif
 
   // Returns the current next_seq value — used to capture the post-write sequence
   // before consuming the transient on sync failure (F/G).
@@ -812,7 +793,6 @@ private:
                        TransientU32Table<std::shared_ptr<DataFile>> files,
                        FileStatsTransient file_stats,
                        std::uint32_t active_file_id,
-                       std::uint32_t next_file_id,
                        std::uint64_t next_seq,
                        std::uint64_t durable_seq,
                        std::uint64_t sync_requested_seq,
@@ -840,7 +820,6 @@ private:
   PendingRecords pending_;
   FileStatsTransient file_stats_;
   std::uint32_t active_file_id_;
-  std::uint32_t next_file_id_;
   std::uint64_t next_seq_;
   std::uint64_t durable_seq_;
   std::uint64_t sync_requested_seq_;
@@ -1258,16 +1237,16 @@ public:
     return load_state();
   }
 
-  // Starts the file id counter at id, so a test reaches its ceiling without
-  // creating a million files. Ids only move forward: id must not be below
-  // the current counter.
+  // Starts the never-used file ids at id, so a test reaches the ceiling
+  // without creating a million files. Ids already handed out stay leased.
   void test_set_next_file_id(std::uint32_t id) {
     WriteBarrier barrier{*this};
-    auto current = load_state_for_write();
-    auto t = current->transient();
-    t.test_set_next_file_id(id);
-    store_state(current, std::move(t).persistent());
+    file_ids_->test_set_next(id);
   }
+  [[nodiscard]] auto test_file_id_pool() -> FileIdPool & { return *file_ids_; }
+  // Waits for the hint worker, which holds each sealed file until its hint
+  // is written.
+  void test_drain_hints() { worker_.drain(); }
 
   // Exposed for testing: validates structural consistency of an EngineState.
   void test_validate_state_consistency(const EngineState &s) const {
@@ -1412,17 +1391,25 @@ private:
   struct PreparedRotation {
     std::shared_ptr<DataFile> sealed;
     std::shared_ptr<WritableDataFile> next;
-    std::uint32_t next_id{0};
   };
   [[nodiscard]] auto prepare_rotation(TransientEngineState &t)
       -> PreparedRotation;
   void finish_rotation(TransientEngineState &t, PreparedRotation r);
-  // Creates the active file for file_id under a fresh stem and syncs dir_,
+  // Creates the active file for id under a fresh stem and syncs dir_,
   // so the file's name is durable before any write into it is acknowledged.
   // checkpoint names the caller's fault injection point.
-  [[nodiscard]] auto create_active_file(std::uint32_t file_id,
+  [[nodiscard]] auto create_active_file(std::shared_ptr<const FileId> id,
                                         const char *checkpoint)
       -> std::shared_ptr<WritableDataFile>;
+  // An id for a new data file, leased to the DataFiles opened for it and
+  // reused once the last of them is gone (bytecask.file_id). Throws
+  // file_ids_exhausted() when every id is held. The write path takes ids
+  // only under write_mu_ (vacuum under a WriteBarrier), so file_ids_left()
+  // read there holds until it takes one.
+  [[nodiscard]] auto reserve_file_id() -> std::shared_ptr<const FileId>;
+  [[nodiscard]] auto file_ids_left() const -> std::uint32_t {
+    return file_ids_->left();
+  }
 
   // Degrade — sets the engine to write-blocked state with a reason.
   // Used by store_state invariant checks; error catch blocks use
@@ -1494,7 +1481,7 @@ private:
   // judged the file's records dead by. Caller must hold write_mu_.
   void vacuum_commit(std::uint32_t old_file_id, const VacuumScanResult &scan,
                      std::shared_ptr<DataFile> new_sealed_file,
-                     std::uint32_t dest_file_id, std::uint64_t decided_at);
+                     std::uint64_t decided_at);
   // fdatasyncs the active file and advances t's durable_seq to its last
   // sequence. On failure degrades, publishes the degraded state over
   // current, and rethrows. Caller holds the write barrier.
@@ -1844,6 +1831,10 @@ private:
   // Shared with every pool-backed data file: a file lends spans into the
   // pool's frames and can outlive the DB in an iterator's hands.
   std::shared_ptr<BufferPool> pool_;
+  // Every data file's id. Shared: a DataFile that outlives the DB in a
+  // snapshot's hands gives its id back here when it goes.
+  std::shared_ptr<FileIdPool> file_ids_{
+      std::make_shared<FileIdPool>(KeyDirEntry::kMaxFileId)};
   SizeLimits size_limits_;
   std::size_t scratch_bytes_;
   // The commit section's buffers, guarded by write_mu_. They keep their
@@ -2419,13 +2410,16 @@ constexpr const char *kWriteFaultReason =
     "a write reached the data file but could not be published: call "
     "resume() to recover.";
 
-// Ids are given out from the directory's contents at each open and never
-// reused within a process, so the ceiling is reached by files created since
-// open, and a reopen renumbers.
+// An id is held by every file the engine has open: the live files, and a
+// deleted one until no snapshot, iterator, write plan or manifest still holds
+// the state it was in (bytecask.file_id). So the ceiling is reached only by
+// that many files open at once. Vacuum cannot help: a compaction needs an id
+// for its copy before the source's comes back.
 auto file_ids_exhausted() -> std::runtime_error {
   return std::runtime_error{std::format(
-      "file id space exhausted: this process has used all {} file ids. "
-      "Reopen the database to renumber its files.",
+      "file id space exhausted: all {} file ids are held by open data files, "
+      "live or deleted but still held by a snapshot, iterator, write plan or "
+      "manifest. Release those, or reopen the database.",
       KeyDirEntry::kMaxFileId + 1)};
 }
 

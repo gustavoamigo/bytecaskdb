@@ -11,6 +11,7 @@
 module;
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -34,6 +35,7 @@ module;
 export module bytecask.buffer_pool;
 
 import bytecask.counters;
+import bytecask.file_id;
 import bytecask.util;
 
 namespace bytecask {
@@ -191,7 +193,11 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// BufferPool — fixed-size frame cache keyed by (file_id, frame_index).
+// BufferPool — fixed-size frame cache keyed by (file_key, frame_index).
+//
+// file_key is the file's serial (bytecask.file_id), never reused in the
+// process, not its engine id, which is reused once nothing reads the file
+// (#774): frames a deleted file left behind can never be found by another.
 //
 // An arena of 4 KiB frames, an open-addressed index of 16-byte slots — key,
 // frame number, visited bit and a seqlock version — a pin count per frame, and
@@ -283,21 +289,21 @@ public:
     return counters_;
   }
 
-  // Reads exactly len bytes at offset of file_id's file into dst, serving what
+  // Reads exactly len bytes at offset of file_key's file into dst, serving what
   // is resident and filling the rest. file_size bounds every read: a frame
   // may hold fewer than kPoolFrameBytes valid bytes, with no per-frame length,
   // because nothing at or past file_size is ever served from one. A read that
   // crosses file_size goes to the device and comes up short there.
   //
   // Throws std::system_error if the underlying read fails or comes up short.
-  void read_at(std::uint32_t file_id, PoolFile file, std::uint64_t offset,
+  void read_at(std::uint64_t file_key, PoolFile file, std::uint64_t offset,
                std::size_t len, std::uint64_t file_size, std::byte *dst);
 
   // read_at, except that the file ending first is not an error: returns how
   // many bytes from offset were read, short only where the file ends. Only
   // frames read whole are admitted, and a sealed file's last frame once the
   // read reached file_size. Throws std::system_error if a read fails.
-  [[nodiscard]] auto read_upto(std::uint32_t file_id, PoolFile file,
+  [[nodiscard]] auto read_upto(std::uint64_t file_key, PoolFile file,
                                std::uint64_t offset, std::size_t len,
                                std::uint64_t file_size, std::byte *dst)
       -> std::size_t;
@@ -309,7 +315,7 @@ public:
   // reads through read_at. Counts nothing: the caller records a hit with
   // note_hit() once it has used the span, since a span too short for its
   // entry sends it to read_at, which counts that read itself.
-  [[nodiscard]] auto view(std::uint32_t file_id, std::uint64_t offset,
+  [[nodiscard]] auto view(std::uint64_t file_key, std::uint64_t offset,
                           std::uint64_t file_size, FrameLease &lease)
       -> std::span<const std::byte>;
   void note_hit() noexcept { counters_.hits.add(1); }
@@ -321,15 +327,15 @@ public:
   // to the hand. A reader still on the deleted file (a snapshot keeps its
   // descriptor open) fills what it needs again. file_size bounds the frames
   // to look up.
-  void release_file(std::uint32_t file_id, std::uint64_t file_size);
+  void release_file(std::uint64_t file_key, std::uint64_t file_size);
 
   // The active file's frames are never evicted: the hand skips them, and the
   // engine moves this at rotation (under the write lock), at which point the
   // previous active file's frames become ordinary — no sweep, one comparison
   // in the victim check. kNoActiveFile pins nothing.
-  static constexpr std::uint32_t kNoActiveFile = ~std::uint32_t{0};
-  void set_active_file(std::uint32_t file_id) noexcept {
-    active_file_id_.store(file_id, std::memory_order_relaxed);
+  static constexpr std::uint64_t kNoActiveFile = ~std::uint64_t{0};
+  void set_active_file(std::uint64_t file_key) noexcept {
+    active_file_key_.store(file_key, std::memory_order_relaxed);
   }
 
   // The writer just appended bytes at [offset, offset + bytes.size()) of the
@@ -340,7 +346,7 @@ public:
   // A frame not yet
   // resident is admitted with its written prefix. Best effort: if no frame can
   // be claimed the bytes stay on disk and reads take the buffered fallback.
-  void append_resident(std::uint32_t file_id, std::uint64_t offset,
+  void append_resident(std::uint64_t file_key, std::uint64_t offset,
                        std::span<const std::byte> bytes);
 
   [[nodiscard]] auto direct_io() const noexcept -> bool { return direct_io_; }
@@ -385,11 +391,27 @@ private:
   // is always correct — so the reader stops retrying and pays the syscall.
   static constexpr int kMaxRetries = 8;
 
-  [[nodiscard]] static auto make_key(std::uint32_t file_id,
+  // A record starts below 2^32 (KeyDirEntry's file offset) and is at most
+  // kMaxBatchBytes long, so every byte a pool read asks for lies below
+  // 2^33; 22 bits of frame index cover 16 GiB. Past that the pool keeps
+  // out, in release builds too, so a frame index never reaches the serial's
+  // bits: read_upto reads straight from the file, view misses,
+  // append_resident and release_file stop at the last frame.
+  static constexpr unsigned kFrameIndexBits = 22;
+  static constexpr std::uint64_t kMaxFrames = std::uint64_t{1}
+                                              << kFrameIndexBits;
+  static_assert((std::uint64_t{kPoolFrameBytes} << kFrameIndexBits) >=
+                (std::uint64_t{1} << 33));
+  static_assert(kMaxFileSerial < (std::uint64_t{1} << (64 - kFrameIndexBits)));
+  [[nodiscard]] static auto make_key(std::uint64_t file_key,
                                      std::uint64_t frame_index) noexcept
       -> std::uint64_t {
-    return (static_cast<std::uint64_t>(file_id) << 32) |
-           (frame_index & 0xFFFFFFFFULL);
+    assert(frame_index < kMaxFrames);
+    return (file_key << kFrameIndexBits) | frame_index;
+  }
+  [[nodiscard]] static auto file_of(std::uint64_t key) noexcept
+      -> std::uint64_t {
+    return key >> kFrameIndexBits;
   }
 
   [[nodiscard]] static auto hash_key(std::uint64_t k) noexcept -> std::size_t {
@@ -653,12 +675,12 @@ private:
   // a caller's loop body. Returns the victim's slot, or kNoSlot if nothing
   // could be claimed.
   [[nodiscard]] auto sieve_victim() noexcept -> std::size_t {
-    const auto active = active_file_id_.load(std::memory_order_relaxed);
+    const auto active = active_file_key_.load(std::memory_order_relaxed);
     auto f = hand_ != kNoFrame ? hand_ : oldest_;
     for (std::size_t steps = 0; steps <= 2 * used_frames_ + 2; ++steps) {
       const auto next = newer_[f] != kNoFrame ? newer_[f] : oldest_;
       const auto k = frame_keys_[f];
-      if ((k >> 32) != active) {
+      if (file_of(k) != active) {
         const auto i = find(k);  // every listed frame is indexed
         auto &s = table_[i];
         if ((s.frame.load(std::memory_order_relaxed) & kRefBit) != 0) {
@@ -737,22 +759,22 @@ private:
   // list, or dead and in free_frames_.
   std::size_t used_frames_{0};
   std::vector<std::uint32_t> free_frames_;  // guarded by mu_
-  std::atomic<std::uint32_t> active_file_id_{kNoActiveFile};
+  std::atomic<std::uint64_t> active_file_key_{kNoActiveFile};
 };
 
-void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
+void BufferPool::read_at(std::uint64_t file_key, PoolFile file,
                          std::uint64_t offset, std::size_t len,
                          std::uint64_t file_size, std::byte *dst) {
-  if (read_upto(file_id, file, offset, len, file_size, dst) < len) {
+  if (read_upto(file_key, file, offset, len, file_size, dst) < len) {
     throw std::system_error{
         EIO, std::generic_category(),
-        std::format("BufferPool::read_at: file {} is shorter than the "
+        std::format("BufferPool::read_at: file serial {} is shorter than the "
                     "requested range [{}, {})",
-                    file_id, offset, offset + len)};
+                    file_key, offset, offset + len)};
   }
 }
 
-auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
+auto BufferPool::read_upto(std::uint64_t file_key, PoolFile file,
                            std::uint64_t offset, std::size_t len,
                            std::uint64_t file_size, std::byte *dst)
     -> std::size_t {
@@ -761,6 +783,9 @@ auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
   // An oversize entry would evict the working set to hold one value. It
   // lands in the caller's buffer, which is not aligned, so never O_DIRECT.
   if (len > oversize_limit_) return pread_upto(file.buffered, offset, {dst, len});
+  // Past the frames a key can name: never admitted, so read from the file.
+  if (offset + len > kMaxFrames * kPoolFrameBytes)
+    return pread_upto(file.buffered, offset, {dst, len});
 
   // Where the bytes delivered from offset stop: the first end of file a fill
   // meets, or the end of what file_size covers.
@@ -816,7 +841,7 @@ auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
       // Unvisited: the miss that brought it in is its first read, and what
       // earns it a place is a second one. Admitted visited, a frame read once
       // would survive a whole pass of the hand and SIEVE would be CLOCK.
-      if (admit(make_key(file_id, f), buf + (frame_start - run_start),
+      if (admit(make_key(file_key, f), buf + (frame_start - run_start),
                 frame_len, false)) {
         counters_.fills.fetch_add(1, std::memory_order_relaxed);
       }
@@ -859,7 +884,7 @@ auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
   bool in_run = false;
   std::uint64_t run_start = 0;
   for (auto f = first; f <= last; ++f) {
-    if (!crosses_end && copy_out(make_key(file_id, f), f, offset, len, dst)) {
+    if (!crosses_end && copy_out(make_key(file_key, f), f, offset, len, dst)) {
       if (in_run) {
         fill_missing(run_start, f - 1);
         in_run = false;
@@ -875,13 +900,14 @@ auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
   return avail > offset ? static_cast<std::size_t>(avail - offset) : 0;
 }
 
-auto BufferPool::view(std::uint32_t file_id, std::uint64_t offset,
+auto BufferPool::view(std::uint64_t file_key, std::uint64_t offset,
                       std::uint64_t file_size, FrameLease &lease)
     -> std::span<const std::byte> {
   lease.reset();
   if (offset >= file_size) return {};
   const auto frame_index = offset / kPoolFrameBytes;
-  const auto f = find_pinned(make_key(file_id, frame_index));
+  if (frame_index >= kMaxFrames) return {};
+  const auto f = find_pinned(make_key(file_key, frame_index));
   if (f == kNoFrame) return {};
   lease = FrameLease{this, f};
   const auto frame_start = frame_index * kPoolFrameBytes;
@@ -897,11 +923,12 @@ void FrameLease::reset() noexcept {
   }
 }
 
-void BufferPool::release_file(std::uint32_t file_id, std::uint64_t file_size) {
-  const auto frames = (file_size + kPoolFrameBytes - 1) / kPoolFrameBytes;
+void BufferPool::release_file(std::uint64_t file_key, std::uint64_t file_size) {
+  const auto frames = std::min<std::uint64_t>(
+      (file_size + kPoolFrameBytes - 1) / kPoolFrameBytes, kMaxFrames);
   std::lock_guard<std::mutex> lk{mu_};
   for (std::uint64_t n = 0; n < frames; ++n) {
-    const auto i = find(make_key(file_id, n));
+    const auto i = find(make_key(file_key, n));
     if (i == kNoSlot) continue;
     const auto f = table_[i].frame.load(std::memory_order_relaxed) & ~kRefBit;
     // Claimed as sieve_victim claims a victim; a pinned frame is left to it.
@@ -919,19 +946,21 @@ void BufferPool::release_file(std::uint32_t file_id, std::uint64_t file_size) {
   note_resident();
 }
 
-void BufferPool::append_resident(std::uint32_t file_id, std::uint64_t offset,
+void BufferPool::append_resident(std::uint64_t file_key, std::uint64_t offset,
                                  std::span<const std::byte> bytes) {
   if (bytes.empty()) return;
   const auto end = offset + bytes.size();
   std::lock_guard<std::mutex> lk{mu_};
-  for (auto f = offset / kPoolFrameBytes; f <= (end - 1) / kPoolFrameBytes; ++f) {
+  const auto last = std::min<std::uint64_t>((end - 1) / kPoolFrameBytes,
+                                            kMaxFrames - 1);
+  for (auto f = offset / kPoolFrameBytes; f <= last; ++f) {
     const auto frame_start = f * kPoolFrameBytes;
     const auto seg_from = std::max(offset, frame_start);
     const auto seg_to = std::min(end, frame_start + kPoolFrameBytes);
     const auto *src = bytes.data() + (seg_from - offset);
     const auto seg_len = static_cast<std::size_t>(seg_to - seg_from);
     const auto in_frame = static_cast<std::size_t>(seg_from - frame_start);
-    const auto key = make_key(file_id, f);
+    const auto key = make_key(file_key, f);
 
     if (const auto s = find(key); s != kNoSlot) {
       // Extends the frame past the size every reader is bounded by: the

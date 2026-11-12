@@ -137,9 +137,10 @@ DB::DB(std::filesystem::path dir, Options opts)
         static_cast<std::int64_t>(s.key_dir.size());
     // Count files opened during recovery.
     counters_.files_opened.store(file_count, std::memory_order_relaxed);
-    s.active_file_id = s.next_file_id++;
-    auto new_active = create_active_file(s.active_file_id, "io_dir_sync_open");
-    if (pool_) pool_->set_active_file(s.active_file_id);
+    auto active_id = reserve_file_id();
+    s.active_file_id = active_id->id();
+    auto new_active = create_active_file(std::move(active_id), "io_dir_sync_open");
+    if (pool_) pool_->set_active_file(new_active->serial());
     // +1 for the new active file.
     counters_.files_opened.fetch_add(1, std::memory_order_relaxed);
     auto files_t = s.files.transient();

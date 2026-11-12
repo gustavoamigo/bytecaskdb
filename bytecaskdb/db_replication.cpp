@@ -101,7 +101,7 @@ void DB::set_mode(Mode mode) {
       // the file, and resume() finds it there either way.
       sync_active_file(t, current, "set_mode(Leader)");
       if (t.is_rotation_needed(rotation_threshold_) &&
-          t.file_ids_left() > 0) {
+          file_ids_left() > 0) {
         PreparedRotation rotation;
         try {
           rotation = prepare_rotation(t);
@@ -174,14 +174,29 @@ auto DB::create_manifest() -> FileManifest {
   // Wait for all background hint generation to complete.
   worker_.drain();
 
-  // Build manifest from sealed files.
-  std::vector<FileInfo> files;
+  // Build manifest from sealed files, in log order: files hold disjoint
+  // sequence ranges, so by first sequence. Ids are reused, and a name orders
+  // files only to the second. A file holding no sequenced entry (min_sequence
+  // 0, such as the empty active file resume() seals) has no place in the log
+  // and comes first, by name so the order is deterministic.
+  std::vector<std::pair<std::uint64_t, FileInfo>> ordered;
   for (const auto [file_id, file_ptr] : manifest_state->files) {
     if (file_id == manifest_state->active_file_id) continue;
+    const auto stats = manifest_state->file_stats.get(file_id);
+    if (!stats)
+      throw std::logic_error{std::format(
+          "create_manifest: file id {} has no file_stats", file_id)};
     const auto data_path = file_ptr->path();
     const auto stem = data_path.stem().string();
-    files.push_back({file_id, data_path, dir_ / (stem + ".hint")});
+    ordered.push_back({stats->min_sequence,
+                       {file_id, data_path, dir_ / (stem + ".hint")}});
   }
+  std::ranges::sort(ordered, {}, [](const auto &e) {
+    return std::tie(e.first, e.second.data_path);
+  });
+  std::vector<FileInfo> files;
+  files.reserve(ordered.size());
+  for (auto &[_, info] : ordered) files.push_back(std::move(info));
 
   return FileManifest{Snapshot{manifest_state, size_limits_}, std::move(files), through_seq};
 }
@@ -384,7 +399,7 @@ void DB::ingest(const ChangeHeader &header,
       rest = rest.subspan(chunk.end);
     }
     if (size >= rotation_threshold_) ++rotations;
-    if (rotations > t.file_ids_left()) throw file_ids_exhausted();
+    if (rotations > file_ids_left()) throw file_ids_exhausted();
   }
 
   // Chunk-and-rotate loop: write entries in chunks, rotating between chunks

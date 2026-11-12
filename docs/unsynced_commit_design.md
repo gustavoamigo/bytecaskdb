@@ -130,8 +130,9 @@ stays the next step if handoffs measure as the limit after D1–D4.
 ### D3 — Record locations as version tokens (T2)
 
 A key's record location, `(file_id, offset)`, names one immutable record for
-the life of the process: file ids are never reused (`CONTRACT.md`) and an
-offset in an append-only file holds one record. Two states that map a key to
+as long as anything holds it: a file id is reused only once nothing holds its
+file (`docs/bytecask_design.md`, *File id reuse*) and an offset in an
+append-only file holds one record. Two states that map a key to
 the same location map it to the same version.
 
 **Resolve outside the lock.** Before submitting, on the writer's own thread,

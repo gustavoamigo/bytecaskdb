@@ -380,7 +380,7 @@ The leaf size is a template parameter, in bytes, and the capacity follows from i
 - `fp(key[i])` describes the record at `loc[i]`, and that record is a `Put` whose key is `key[i]`.
 - `top` is the index §2.3 defines for the leaf's current entries. It is rebuilt after every change to the entries, and debug `validate()` recomputes and compares it.
 - Every `loc` in a published version names bytes already written to the data file. Every `loc` in the writer's transient names bytes written *or* bytes in the batch the writer is building (§2.5).
-- Within one process, a `(file_id, offset)` pair names at most one record, ever. File ids come from `next_file_id_++` and are never reused; files are append-only; `resume()` trims only bytes no version references and then seals the file. This is what makes location equality mean record equality, which the no-read operations in §3.4 rely on.
+- While any version can hold it, a `(file_id, offset)` pair names one record. A file id is reused only once nothing holds its file (`docs/bytecask_design.md`, *File id reuse*), so no version holding a location sees the id reused; files are append-only; `resume()` trims only bytes no version references and then seals the file. This is what makes location equality mean record equality, which the no-read operations in §3.4 rely on.
 - The `meta` words past `count` are zero or stale entries, never uninitialised: the fingerprint scan compares all of them before masking, so a fresh leaf zeroes them at allocation.
 
 ### 2.3. The top index

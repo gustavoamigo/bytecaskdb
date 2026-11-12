@@ -26,15 +26,14 @@ TransientEngineState::TransientEngineState(
     KeyDirTransient key_dir,
     TransientU32Table<std::shared_ptr<DataFile>> files,
     FileStatsTransient file_stats,
-    std::uint32_t active_file_id, std::uint32_t next_file_id,
-    std::uint64_t next_seq, std::uint64_t durable_seq,
+    std::uint32_t active_file_id, std::uint64_t next_seq, std::uint64_t durable_seq,
     std::uint64_t sync_requested_seq,
     Mode mode, bool degraded, std::string degraded_reason,
     std::shared_ptr<const std::vector<ChangeMarker>> change_markers,
     std::size_t scratch_bytes)
     : key_dir_{std::move(key_dir)}, files_{std::move(files)},
       file_stats_{std::move(file_stats)}, active_file_id_{active_file_id},
-      next_file_id_{next_file_id}, next_seq_{next_seq},
+      next_seq_{next_seq},
       durable_seq_{durable_seq}, sync_requested_seq_{sync_requested_seq},
       mode_{mode}, degraded_{degraded},
       degraded_reason_{std::move(degraded_reason)},
@@ -44,7 +43,7 @@ TransientEngineState::TransientEngineState(
 auto EngineState::transient() const -> TransientEngineState {
   auto t = TransientEngineState{
       key_dir.transient(), files.transient(), file_stats.transient(),
-      active_file_id, next_file_id, next_seq, durable_seq,
+      active_file_id, next_seq, durable_seq,
       sync_requested_seq, mode, degraded, degraded_reason, change_markers,
       scratch_bytes};
   t.recent_writes_ = recent_writes;
@@ -696,28 +695,22 @@ void TransientEngineState::apply_ingest(
 }
 
 void TransientEngineState::apply_rotate_file(
-    std::shared_ptr<DataFile> sealed_old,
-    std::shared_ptr<DataFile> new_file, std::uint32_t new_file_id) {
+    std::shared_ptr<DataFile> sealed_old, std::shared_ptr<DataFile> new_file) {
+  const auto new_file_id = new_file->id();
+  // Every record placed in the sealed file was written before the rotation
+  // (a rotation follows a successful append), so the key directory reads it
+  // from the file. Dropping them keeps the list in one file, where offsets
+  // rise: the next file's id may be lower (PendingRecords).
+  pending_.clear();
   files_.set(active_file_id_, std::move(sealed_old));
   active_file_id_ = new_file_id;
   files_.set(active_file_id_, std::move(new_file));
   file_stats_.set(active_file_id_, FileStats{});
 }
 
-auto TransientEngineState::file_ids_left() const noexcept -> std::uint32_t {
-  return next_file_id_ > KeyDirEntry::kMaxFileId
-             ? 0
-             : KeyDirEntry::kMaxFileId - next_file_id_ + 1;
-}
-
-auto TransientEngineState::reserve_file_id() -> std::uint32_t {
-  if (file_ids_left() == 0) throw file_ids_exhausted();
-  return next_file_id_++;
-}
-
 void TransientEngineState::apply_vacuum(
     std::uint32_t old_file_id, const VacuumScanResult &scan,
-    std::shared_ptr<DataFile> new_sealed_file, std::uint32_t dest_file_id) {
+    std::shared_ptr<DataFile> new_sealed_file) {
   if (!new_sealed_file) {
     // Removal: nothing in the file is live, so there is nothing to remap.
     if (!scan.mappings.empty())
@@ -730,6 +723,7 @@ void TransientEngineState::apply_vacuum(
   // The destination is registered before the remap: a key directory that
   // reads keys back may resolve an already remapped record while placing the
   // next one.
+  const auto dest_file_id = new_sealed_file->id();
   files_.set(dest_file_id, std::move(new_sealed_file));
 
   auto actual_live_bytes = scan.live_bytes;
@@ -904,7 +898,6 @@ auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
   s->files = std::move(files_).persistent();
   s->file_stats = std::move(file_stats_).persistent();
   s->active_file_id = active_file_id_;
-  s->next_file_id = next_file_id_;
   s->next_seq = next_seq_;
   s->durable_seq = durable_seq_;
   s->sync_requested_seq = sync_requested_seq_;

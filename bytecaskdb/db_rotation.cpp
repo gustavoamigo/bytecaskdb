@@ -37,30 +37,37 @@ auto DB::prepare_rotation(TransientEngineState &t) -> PreparedRotation {
   wait_for_hint_backlog();
   t.active_file().shrink_to_fit();
   auto read_only_old = openDataFileForRead(t.active_file().path(), io_backend_, pool_,
-                                         t.active_file_id());
+                                           t.active_file().id_lease());
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_rotate_file_creation);
 #endif
-  const auto new_file_id = t.reserve_file_id();
-  auto new_file = create_active_file(new_file_id, "io_dir_sync_rotate");
-  return {std::move(read_only_old), std::move(new_file), new_file_id};
+  auto new_file = create_active_file(reserve_file_id(), "io_dir_sync_rotate");
+  return {std::move(read_only_old), std::move(new_file)};
 }
 
 void DB::finish_rotation(TransientEngineState &t, PreparedRotation r) {
 #ifdef BYTECASK_TESTING
   if (test_in_finish_rotation_) test_in_finish_rotation_();
 #endif
-  t.apply_rotate_file(r.sealed, std::move(r.next), r.next_id);
+  const auto next_serial = r.next->serial();
+  t.apply_rotate_file(r.sealed, std::move(r.next));
   // The sealed file's frames become evictable and the new file's pinned.
-  if (pool_) pool_->set_active_file(r.next_id);
+  if (pool_) pool_->set_active_file(next_serial);
   dispatch_hint(std::move(r.sealed));
 }
 
-auto DB::create_active_file(std::uint32_t file_id, const char *checkpoint)
+auto DB::reserve_file_id() -> std::shared_ptr<const FileId> {
+  auto id = file_ids_->take();
+  if (!id) throw file_ids_exhausted();
+  return id;
+}
+
+auto DB::create_active_file(std::shared_ptr<const FileId> id,
+                            const char *checkpoint)
     -> std::shared_ptr<WritableDataFile> {
   auto file = createDataFileForWrite(dir_, make_data_file_stem(), ".data",
                                      rotation_threshold_, io_backend_, pool_,
-                                     file_id);
+                                     std::move(id));
   // On failure the created file is left behind empty, which is the state a
   // crash right after the create leaves too; the next open recovers it.
   sync_directory(dir_, checkpoint);
