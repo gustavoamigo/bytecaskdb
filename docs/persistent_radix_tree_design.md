@@ -331,7 +331,8 @@ both inputs intact.
 the smallest live tag of its lineage in `[S, R)`. It is freed the moment no
 such version exists — at publish if none is alive, otherwise when the version
 it is parked on dies and nothing in the window is left. A version's death
-re-examines only the nodes parked on it, never a scan. This is what keeps a
+looks only at the parcels parked on it, never a scan, and moves each whole to
+the next live version in its window. This is what keeps a
 long-lived `db.snapshot()` holding exactly the nodes it can still reach
 rather than everything retired since it was taken — the behaviour reference
 counting gave and the property the memory tests check.

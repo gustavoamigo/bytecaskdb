@@ -1,0 +1,22 @@
+A retraction drops a parcel held whole for want of memory as if all of
+its nodes were live in the version it falls back to. The ones the dead
+segment created are reached by nothing and are never freed.
+Guarded-by: "alloc sweep: a parcel held whole is freed in part when the head above it is retracted"
+
+diff --git a/bytecaskdb/version_chain.cppm b/bytecaskdb/version_chain.cppm
+index 998ffba4..741142cc 100644
+--- a/bytecaskdb/version_chain.cppm
++++ b/bytecaskdb/version_chain.cppm
+@@ -406,12 +406,6 @@ private:
+       if (p.retired_by <= floor)
+         return false;
+       Traits::account_retired(-static_cast<std::int64_t>(p.nodes.size()));
+-      if (p.unsplit) {
+-        for (auto *n : p.nodes) {
+-          if (Traits::tag(n) > floor)
+-            Traits::destroy(n);
+-        }
+-      }
+       return true;
+     };
+     if (!rec.parked.nodes.empty() && dropped(rec.parked))
