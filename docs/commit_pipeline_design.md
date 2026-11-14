@@ -684,6 +684,29 @@ pool) cost 7–10% on `commit_probe` and 5–9% on sysbench fast-profile
 writes: the serial section stayed as fast, the threads around it slowed,
 and RSS rose 12 MB per thread. The benchmarks now run jemalloc's defaults.
 
+**The next node is prefetched.** A recycled node was last touched by the
+thread that freed it, usually a reader on another core, and the committer
+writes all of it, so each node it took cost it cache misses on memory it
+was about to overwrite. `NodePool::take` asks for the lines of the node its
+cache hands out next, in a writable state; they arrive while the caller
+fills the node it just took. HammerDB TPROC-C through `sql_layer_server`
+(48 warehouses, 16 users, interval sync, Ryzen 7 3700X), one binary with
+the prefetch switched on and off pseudo-randomly every 256 commit groups,
+8.0M commits, 33 nodes taken per commit:
+
+| Per commit | Without | Effect of the prefetch |
+|---|---:|---:|
+| Key directory update | 25.2 µs | −2.06 ± 0.11 µs |
+| Publish | 6.8 µs | +0.32 ± 0.02 µs |
+| Commit section | 45.5 µs | −1.70 ± 0.34 µs |
+
+Prefetching two or four takes ahead measured the same as one.
+
+Where the taker already has the pool's nodes in its cache the prefetch is
+only cost: `map_bench`'s single-threaded `BTree/PersistentSet` build is
+1.3% to 2.0% slower with it (one binary, the prefetch on and off, five
+alternating runs each). No `engine_bench` row moved in the same comparison.
+
 ### The serial section's own buffers
 
 After the nodes, the section still allocated for every group: the entry list
