@@ -684,6 +684,43 @@ pool) cost 7–10% on `commit_probe` and 5–9% on sysbench fast-profile
 writes: the serial section stayed as fast, the threads around it slowed,
 and RSS rose 12 MB per thread. The benchmarks now run jemalloc's defaults.
 
+**The next node is prefetched.** A recycled node was last touched by the
+thread that freed it, usually a reader on another core, and the committer
+writes its header and entries, spread over most of its lines, so each node
+it took cost it cache misses on memory it was about to overwrite.
+`NodePool::take` asks for the 16 lines from the first byte of the node its
+cache hands out next, in a writable state; they arrive while the caller
+fills the node it just took. HammerDB TPROC-C through
+`sql_layer_server` (48 warehouses, 16 users, interval sync, Ryzen 7 3700X), one binary with
+the prefetch switched on and off pseudo-randomly every 256 commit groups,
+8.0M commits, 33 nodes taken per commit:
+
+| Per commit | Without | Effect of the prefetch |
+|---|---:|---:|
+| Key directory update | 25.2 µs | −2.06 ± 0.11 µs |
+| Publish | 6.8 µs | +0.32 ± 0.02 µs |
+| Commit section | 45.5 µs | −1.70 ± 0.34 µs |
+
+Prefetching two or four takes ahead measured the same as one.
+
+Sixteen lines do not always cover the node. glibc aligns a 1 KiB
+allocation to 16 bytes, and its nodes start evenly at the four 16-byte
+offsets of a line, so three in four reach into a 17th line with their last
+16 to 48 bytes, which is not asked for. jemalloc places 1 KiB objects on
+1,024-byte slots, and there 16 lines are the whole node. Asking for the 17th
+line too, with a loop that starts at the line holding the node's first
+byte, was dropped for its cost; its effect on TPROC-C was not measured. In
+one binary with the prefetch on and off, five runs each, it made
+`map_bench`'s single-threaded `BTree/PersistentSet` 6.1% to 6.5% slower,
+against 1.3% to 2.0% for the fixed 16, and `Blind1024/PersistentSet/100000`
+12.6% slower. Its count depends on the address, so the compiler keeps the
+loop instead of unrolling it.
+
+Where the taker already has the pool's nodes in its cache the prefetch is
+only cost: `map_bench`'s single-threaded `BTree/PersistentSet` build is
+1.3% to 2.0% slower with it (one binary, the prefetch on and off, five
+alternating runs each). No `engine_bench` row moved in the same comparison.
+
 ### The serial section's own buffers
 
 After the nodes, the section still allocated for every group: the entry list
