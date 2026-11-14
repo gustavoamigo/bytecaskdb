@@ -574,7 +574,10 @@ them back to the next allocation instead.
   allocator hands memory out: in free order, recycled nodes scatter a new
   tree across memory (`engine_bench` `Get` −5%). The 256-node bound keeps a
   refill's lock hold and sort short and lets recovery threads share the
-  pool (taking the whole list cost recovery 11% at 8 threads).
+  pool (taking the whole list cost recovery 11% at 8 threads). A take also
+  prefetches, for writing, the node the cache hands out next: a recycled
+  node was last touched by the thread that freed it, and its taker writes
+  all of it (`docs/commit_pipeline_design.md`, *Node allocation*).
 - A thread's cache, at most 256 nodes (256 KiB), returns to the shared
   list when the thread exits. The list is process-wide and never
   destroyed, so a free during process exit touches no dead mutex.

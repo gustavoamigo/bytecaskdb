@@ -182,6 +182,7 @@ public:
       if (!cache.empty()) {
         auto *p = cache.back();
         cache.pop_back();
+        if (!cache.empty()) prefetch_for_write(cache.back());
         return p;
       }
     }
@@ -245,6 +246,7 @@ private:
   // thread sort every pooled node while the others waited (Recovery, 8
   // threads: -11%).
   static constexpr std::size_t kRefill = 256;
+  static constexpr std::size_t kCacheLineBytes = 64;
 
   struct Shared {
     std::mutex mu;
@@ -262,6 +264,18 @@ private:
       return bytes == kBTreeNodeBytes;
     else
       return false;
+  }
+
+  // A hint, no access: asks for the node's cache lines in a writable state.
+  // The node taken next is written across its whole length a few hundred
+  // nanoseconds after this one, and a recycled node was last touched by
+  // whichever thread freed it, so its lines are rarely in the taker's cache.
+  // Asked for one take ahead, they arrive while the caller fills the node it
+  // just took (docs/commit_pipeline_design.md, "Node allocation").
+  static void prefetch_for_write(const void *node) noexcept {
+    const auto *p = static_cast<const char *>(node);
+    for (std::size_t off = 0; off < kBTreeNodeBytes; off += kCacheLineBytes)
+      __builtin_prefetch(p + off, 1, 3);
   }
 
   static void refill(std::vector<void *> &cache) {
