@@ -1738,7 +1738,7 @@ property that every single-point corruption of a valid tree makes
 | `BulkLoader::first_leaf`: `levels_.empty() \|\| levels_[0].children.empty()` | Simplified: a level exists only once a child was added. |
 | `BulkLoader::admit`: `!prev_last_.empty() \|\| !levels_.empty()` | Simplified to `!first_leaf()`: a previous last key implies a sealed leaf. |
 | `emit_separators`: `is_leaf \|\| next == targets.size()` | Simplified: entered only while a target is left. |
-| `VersionChain::blocker_for`: `it != end && it->tag < retired_by` | Simplified to the record range `[seat_for(node_tag), seat_for(retired_by))`: the lineage's head always sits at or above `retired_by`. |
+| `VersionChain::blocker_for`: `it != end && it->tag < retired_by` | Simplified to the record range `[seat_for(from), seat_for(retired_by))`: the lineage's head always sits at or above `retired_by`. |
 | blind `split_leaf`: `idx == 0 && last_pos == 0` | Model: descending streams. |
 | Iterator `==` (both trees) | Model: seeks compared pairwise against `std::map` iterators. |
 | Iterator seek: `!cur \|\| cur->count == 0` (both trees) | Exempt (C2): no version holds an empty leaf; the guard keeps `count - 1` from wrapping. |
@@ -2959,6 +2959,7 @@ A site whose break nothing has to catch says why instead.
 | Key directory: a dropped transient is freed without allocating | `alloc sweep: a transient tree is freed when nothing can be allocated` | `free_subtree_allocates` | #364 |
 | Key directory: `publish` reserves its record before it links the base | `alloc sweep: a failed publication leaves the base derivable` | `publish_links_before_reserving` | #364 |
 | Key directory: releasing a version never throws for want of memory | `alloc sweep: a version is released when nothing can be allocated` | `release_queue_allocates` | #390 |
+| Key directory: a parcel held whole for want of memory is split when its holder dies, not handed on whole | `alloc sweep: a parcel held whole is split when its holder dies` | `unsplit_parcel_moved_whole` | #390 |
 | Key directory: a write frees the nodes it replaced only after the root reaches their replacement | `alloc sweep: a transient whose write fails partway is freed once`, under ASan: elsewhere the node pool takes a double free without a report (#583) | `replaced_node_freed_at_once` | #585 |
 | Key directory: a join of bulk-built ranges hands each leaf over without a throw in between | `alloc sweep: a bulk build that fails partway frees each node once`, under ASan | `bulk_join_leaf_two_owners` | #588 |
 | Key directory: a level keeps its children until the node above them has joined the next level | `alloc sweep: a bulk build that fails partway frees each node once`, under ASan | `bulk_level_child_two_owners` | #588 |

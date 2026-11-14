@@ -722,6 +722,81 @@ TEST_CASE("BTree chain contract and retraction", "[btree]") {
   }
 }
 
+// The free rule, against reachability as the model
+// (docs/radix_tree_epoch_reclamation_design.md, *The free rule*): a retired
+// node stays parked exactly while a live version reaches it. After every
+// step nothing a live version reaches was freed, and nothing is parked that
+// no live version reaches.
+//
+// Versions are derived from the head, one to three writes each, and dropped
+// in a random order. So versions die inside the chain holding parcels that
+// move on to a later version or are freed, a version retires nodes created
+// by several earlier ones, and heads are retracted.
+TEST_CASE("BTree free rule: a node is parked exactly while a live version "
+          "reaches it",
+          "[btree]") {
+  auto &acc = bytecask::btree_detail::btree_accounting<int>();
+  std::vector<std::string> keys;
+  for (int i = 0; i < 3000; ++i)
+    keys.push_back("key_" + std::to_string(i));
+  std::mt19937 rng{7};
+  std::vector<Tree> live;  // one lineage, oldest first; back() is the head
+  live.push_back(build(keys));
+  auto reached_by = [&live](std::size_t first, std::size_t last) {
+    std::set<const void *> seen;
+    for (auto i = first; i < last; ++i)
+      live[i].visit_nodes([&](const void *n) { seen.insert(n); });
+    return seen;
+  };
+  std::size_t handed_on = 0;
+  std::size_t freed_at_death = 0;
+  for (int step = 0; step < 1500; ++step) {
+    // Parked nodes only the dying version reaches among it and the older
+    // ones: the nodes parked on it.
+    std::vector<const void *> held;
+    if (live.size() == 1 || (live.size() < 6 && rng() % 3 != 0)) {
+      auto tr = live.back().transient();
+      // The first write always changes the tree: every version is distinct.
+      tr.set(to_bytes("key_" + std::to_string(rng() % 3200)), -step - 1);
+      for (auto more = rng() % 3; more > 0; --more) {
+        const auto key = "key_" + std::to_string(rng() % 3200);
+        if (rng() % 4 == 0)
+          (void)tr.erase(to_bytes(key));
+        else
+          tr.set(to_bytes(key), -step - 1);
+      }
+      live.push_back(std::move(tr).persistent());
+    } else {
+      const auto victim = rng() % live.size();
+      if (live[victim].has_successor()) {
+        const auto older = reached_by(0, victim);
+        const auto own = reached_by(victim, victim + 1);
+        for (const auto *n : Tree::parked_nodes()) {
+          if (own.contains(n) && !older.contains(n))
+            held.push_back(n);
+        }
+      }
+      live.erase(live.begin() + static_cast<std::ptrdiff_t>(victim));
+    }
+
+    const auto reached = reached_by(0, live.size());
+    const auto parked = Tree::parked_nodes();
+    INFO("step " << step << ", " << live.size() << " live versions");
+    REQUIRE(std::ranges::all_of(parked, [&](const void *n) {
+      return reached.contains(n);
+    }));
+    REQUIRE(acc.allocated.load() - acc.freed.load() ==
+            static_cast<std::int64_t>(reached.size()));
+    REQUIRE(acc.retired.load() == static_cast<std::int64_t>(parked.size()));
+    const std::set<const void *> still_parked{parked.begin(), parked.end()};
+    for (const auto *n : held)
+      ++(still_parked.contains(n) ? handed_on : freed_at_death);
+  }
+  // The walk reaches both ends of a parcel's move.
+  CHECK(handed_on > 100);
+  CHECK(freed_at_death > 100);
+}
+
 TEST_CASE("BTree upsert with predicate", "[btree]") {
   auto t = build({"a", "b", "c"});
   auto tr = t.transient();

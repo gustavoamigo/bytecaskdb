@@ -1,0 +1,21 @@
+A parcel held whole because it could not be split is moved whole when its
+holder dies, like a parcel whose nodes share their blocker. Its nodes do
+not: the ones no version reaches any more stay parked on the next version
+instead of being freed.
+Guarded-by: "alloc sweep: a parcel held whole is split when its holder dies"
+
+diff --git a/bytecaskdb/version_chain.cppm b/bytecaskdb/version_chain.cppm
+index c8ec0fca..ef84362b 100644
+--- a/bytecaskdb/version_chain.cppm
++++ b/bytecaskdb/version_chain.cppm
+@@ -490,10 +490,6 @@ private:
+   // want of memory is the exception, and is split now.
+   void pass_on(Parcel parcel, std::uint64_t dead,
+                std::vector<Node *> &out) noexcept {
+-    if (parcel.unsplit) {
+-      park(std::move(parcel), out);
+-      return;
+-    }
+     const auto next = blocker_for(dead, parcel);
+     assert(std::ranges::all_of(parcel.nodes, [&](Node *n) {
+       return blocker_for(Traits::tag(n), parcel) == next;

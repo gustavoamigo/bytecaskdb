@@ -98,9 +98,28 @@ its head to the published state before deriving.
 smallest live tag of its lineage in `[S, R)`. If there is none, the node is
 freed. Otherwise it is *parked* on that version.
 
-When a version with a successor loses its last handle, only the nodes
-parked on it are re-examined: each moves to the next live version in its
+When a version with a successor loses its last handle, only the parcels
+parked on it are looked at: each moves to the next live version in its
 window, or is freed. There is no scan of everything retired.
+
+A parcel moves whole, and no node of it is read. The nodes parked together
+share their blocker `V`: each was created at or below `V`, and no version of
+the lineage from its creator up to `V` is alive. No version is born inside a
+parked parcel's window either: a new version's tag is above every tag of its
+lineage, and retraction drops the parcels retired above the version it falls
+back to. The live versions in a window only go away, then, so when `V` dies
+the next blocker is the same for every node: the smallest live tag of the
+lineage in `(V, R)`. This replaced asking `blocker_for` once per node, which
+gave the same answer for each and read every node's tag to get it. The
+engine releases the version it replaced after every publish, so that ran
+under the chain's mutex once per commit group, on nodes that had gone cold.
+On TPROC-C at 16 virtual users it cost 2.4 µs of each commit's 45 µs in the
+commit section, 2.0 of them the committer waiting for that mutex.
+
+The one parcel whose nodes do not share a blocker is the one that could not
+be split for want of memory (`bytecask_design.md`, *A failure after the
+append that no handler degrades for*). It is marked, and is split when its
+holder dies.
 
 Retention is per node, not per epoch. A first version on the radix tree
 freed a whole retired list once no older version was alive; one long-lived

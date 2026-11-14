@@ -1660,12 +1660,17 @@ TEST_CASE("alloc sweep: a version is released when nothing can be allocated",
 // w copied) and by t (the middle path), none by v. Each allocation of x's
 // publication is failed in turn; one of them is the split, and the parcel is
 // held whole on t. w dies holding nothing of it. When t dies the parcel is
-// looked at again: t's nodes are still reached by v, w's by nothing.
+// looked at again: t's nodes are still reached by v, w's by nothing. So
+// nothing of this lineage stays parked that v or x does not reach.
 TEST_CASE("alloc sweep: a parcel held whole is split when its holder dies",
           "[alloc_sweep]") {
   const ExpectedLeaks leaks;
   for (long n = 1;; ++n) {
     REQUIRE(n <= kMaxAllocations);
+    // What other trees of this value type have parked, e.g. the state a
+    // thread's read cache still holds after an earlier test's DB closed.
+    const auto others = Tree::parked_nodes();
+    const std::set<const void *> foreign{others.begin(), others.end()};
     KeyStore res;
     auto derive = [&res](const Tree &base,
                          std::initializer_list<std::string> ks) {
@@ -1696,10 +1701,17 @@ TEST_CASE("alloc sweep: a parcel held whole is split when its holder dies",
     t.reset();
     (void)v->validate(res);
     REQUIRE(v->size() == keys + 1);
+    std::set<const void *> reached;
+    v->visit_nodes([&](const void *node) { reached.insert(node); });
     if (x) {
       (void)x->validate(res);
       REQUIRE(x->contains(to_bytes("user::5::y"), res));
+      x->visit_nodes([&](const void *node) { reached.insert(node); });
     }
+    const auto parked = Tree::parked_nodes();
+    REQUIRE(std::ranges::none_of(parked, [&](const void *node) {
+      return !foreign.contains(node) && !reached.contains(node);
+    }));
     if (!fired) break;
   }
 }

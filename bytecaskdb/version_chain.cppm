@@ -106,9 +106,22 @@ void free_node_subtree_if(typename Traits::Node *root,
 // blocks it — the smallest live tag of its lineage in [S, R) — and freed the
 // moment no such version exists: at publish when none is alive, otherwise
 // when the version it is parked on dies and nothing in the window is left.
-// That test is blocker_for. A version's death re-examines only the nodes
+// That test is blocker_for. A version's death looks only at the parcels
 // parked on it, never a scan, so a long-lived snapshot holds exactly the
 // nodes it can still reach, not everything retired since it was taken.
+//
+// A parked parcel moves whole. Its nodes share their blocker (park), so each
+// was created at or below the version holding it, with no live version of
+// the lineage from its creator up to that one. And no version is born inside
+// a parked parcel's window: a new version's tag is above every tag of its
+// lineage, and retraction drops the parcels retired above the version it
+// falls back to. The live versions in the window only ever go away, then,
+// and when the holder dies what still reaches the nodes is the same for all
+// of them: the next live version of the lineage between the holder and the
+// retiring one. The parcel is handed there, or freed, without a node being
+// read (pass_on). That matters because the engine releases the version it
+// replaced after every publish, under the lock every publish takes, and a
+// parked node is cold by then.
 //
 // Retraction. When a version with no successor loses its last handle, the
 // lineage shrinks back to its newest live predecessor F, or ends if there is
@@ -142,10 +155,10 @@ void free_node_subtree_if(typename Traits::Node *root,
 // because memory just ran out, so releasing one never throws for want of it
 // (#390): a node that cannot be queued to be freed after the lock is freed
 // under it, a mixed parcel that cannot be split is held whole by the
-// smallest version still reaching any of it, and a parcel that cannot be
-// added to a record is leaked. Each costs time or memory, never a node freed
-// while reachable. Publishing reserves its record before it links the base,
-// and parks its parcel the same way.
+// smallest version still reaching any of it and split when that one dies,
+// and a parcel that cannot be added to a record is leaked. Each costs time
+// or memory, never a node freed while reachable. Publishing reserves its
+// record before it links the base, and parks its parcel the same way.
 // ---------------------------------------------------------------------------
 export template <typename Traits> class VersionChain {
 public:
@@ -214,8 +227,9 @@ public:
   // out, so it must not throw for want of memory (#390). It still allocates
   // on the common path — the list of nodes to free after the lock, a parcel
   // spilling into a record's `more` — but each of those has a fallback that
-  // needs none: free the node now, under the lock (free_later), or keep the
-  // parcel on a version that is certainly still alive (park).
+  // needs none: free the node now, under the lock (free_later), leak the
+  // parcel (hold), or, for a parcel being split, keep it whole on a version
+  // that is certainly still alive (park).
   void unpin(std::uint64_t id, Node *root) noexcept {
     std::vector<Node *> to_free;
     {
@@ -233,9 +247,9 @@ public:
         auto more = std::move(it->more);
         records_.erase(it);
         if (!parked.nodes.empty())
-          park(std::move(parked), to_free);
+          pass_on(std::move(parked), id, to_free);
         for (auto &parcel : more)
-          park(std::move(parcel), to_free);
+          pass_on(std::move(parcel), id, to_free);
       } else {
         retract(it, root);
       }
@@ -286,10 +300,15 @@ private:
   // Nodes retired by one session. `retired_by` closes their reachability
   // window: a version of `lineage` with a tag at or above it was derived
   // from that session and cannot reach them.
+  //
+  // The nodes of a parked parcel share their blocker, the version holding
+  // it, unless `unsplit`: then it is held whole by the smallest of its
+  // nodes' blockers because it could not be split (park).
   struct Parcel {
     std::vector<Node *> nodes;
     std::uint64_t retired_by{0};
     std::uint64_t lineage{0};
+    bool unsplit{false};
   };
 
   // One live version. Kept in one vector sorted by tag: there are a handful
@@ -387,13 +406,14 @@ private:
   }
 
   // The free rule. The live version that still reaches a node created by
-  // session `node_tag` and retired by `parcel.retired_by`: the smallest live
-  // tag of the parcel's lineage in [node_tag, retired_by). Returns 0 when
-  // no version reaches the node any more and it can be freed.
-  [[nodiscard]] auto blocker_for(std::uint64_t node_tag, const Parcel &parcel)
+  // session `from` and retired by `parcel.retired_by`: the smallest live
+  // tag of the parcel's lineage in [from, retired_by). Returns 0 when no
+  // version reaches the node any more and it can be freed. pass_on asks it
+  // from the version a parcel was parked on, once that one is gone.
+  [[nodiscard]] auto blocker_for(std::uint64_t from, const Parcel &parcel)
       -> std::uint64_t {
     const auto window_end = seat_for(parcel.retired_by);
-    for (auto it = seat_for(node_tag); it < window_end; ++it) {
+    for (auto it = seat_for(from); it < window_end; ++it) {
       if (it->lineage == parcel.lineage)
         return it->tag;
     }
@@ -407,9 +427,11 @@ private:
   //
   // Never throws for want of memory. Splitting a mixed parcel allocates;
   // when it cannot, the whole parcel is held by the smallest of its
-  // blockers. That is safe, if late: no node is freed while a version still
-  // reaches it, and the parcel is looked at again when that version dies.
+  // blockers and marked `unsplit`. That is safe, if late: no node is freed
+  // while a version still reaches it, and the parcel comes back here to be
+  // split when that version dies (pass_on).
   void park(Parcel parcel, std::vector<Node *> &out) noexcept {
+    parcel.unsplit = false;
     std::uint64_t first = 0;
     std::uint64_t smallest = 0;
     bool uniform = true;
@@ -456,8 +478,30 @@ private:
       // went to `out` goes back, since the parcel keeps it.
       out.erase(out.begin() + static_cast<std::ptrdiff_t>(out_size),
                 out.end());
+      parcel.unsplit = true;
       hold(smallest, std::move(parcel));
     }
+  }
+
+  // Under mu_: `parcel` was parked on `dead`, whose record has just left the
+  // chain. Hands it whole to the next live version still reaching its nodes,
+  // or to `out` when none does — the class comment says why that is the
+  // same version for every node, so none is read. A parcel held whole for
+  // want of memory is the exception, and is split now.
+  void pass_on(Parcel parcel, std::uint64_t dead,
+               std::vector<Node *> &out) noexcept {
+    if (parcel.unsplit) {
+      park(std::move(parcel), out);
+      return;
+    }
+    const auto next = blocker_for(dead, parcel);
+    assert(std::ranges::all_of(parcel.nodes, [&](Node *n) {
+      return blocker_for(Traits::tag(n), parcel) == next;
+    }));
+    if (next == 0)
+      free_later(parcel.nodes, out);
+    else
+      hold(next, std::move(parcel));
   }
 
   // Under mu_: hands a parcel to the version that still reaches it. A
