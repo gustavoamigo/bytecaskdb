@@ -67,6 +67,7 @@
 import bytecask;
 import bytecask.blind_btree;
 import bytecask.btree;
+import bytecask.version_chain;
 
 #include "proof/invariants.h"
 #include "sweep_operations.h"
@@ -1660,12 +1661,21 @@ TEST_CASE("alloc sweep: a version is released when nothing can be allocated",
 // w copied) and by t (the middle path), none by v. Each allocation of x's
 // publication is failed in turn; one of them is the split, and the parcel is
 // held whole on t. w dies holding nothing of it. When t dies the parcel is
-// looked at again: t's nodes are still reached by v, w's by nothing.
+// looked at again: t's nodes are still reached by v, w's by nothing. So
+// nothing of this lineage stays parked that v or x does not reach.
 TEST_CASE("alloc sweep: a parcel held whole is split when its holder dies",
           "[alloc_sweep]") {
   const ExpectedLeaks leaks;
+  // Nodes parked once w is gone: in the run without a fault, and the most
+  // in any run with one. Only a parcel held whole keeps w's nodes parked.
+  std::size_t parked_clean = 0;
+  std::size_t parked_most = 0;
   for (long n = 1;; ++n) {
     REQUIRE(n <= kMaxAllocations);
+    // What other trees of this value type have parked, e.g. the state a
+    // thread's read cache still holds after an earlier test's DB closed.
+    const auto others = Tree::parked_nodes();
+    const std::set<const void *> foreign{others.begin(), others.end()};
     KeyStore res;
     auto derive = [&res](const Tree &base,
                          std::initializer_list<std::string> ks) {
@@ -1693,15 +1703,117 @@ TEST_CASE("alloc sweep: a parcel held whole is split when its holder dies",
     }
     INFO("allocation " << n << " of the publication failed");
     w.reset();
+    const auto parked_after_w = Tree::parked_nodes().size();
+    if (fired)
+      parked_most = std::max(parked_most, parked_after_w);
+    else
+      parked_clean = parked_after_w;
     t.reset();
     (void)v->validate(res);
     REQUIRE(v->size() == keys + 1);
+    std::set<const void *> reached;
+    v->visit_nodes([&](const void *node) { reached.insert(node); });
     if (x) {
       (void)x->validate(res);
       REQUIRE(x->contains(to_bytes("user::5::y"), res));
+      x->visit_nodes([&](const void *node) { reached.insert(node); });
     }
+    const auto parked = Tree::parked_nodes();
+    REQUIRE(std::ranges::none_of(parked, [&](const void *node) {
+      return !foreign.contains(node) && !reached.contains(node);
+    }));
+    // Those other trees are still parked as they were, so no address in
+    // `foreign` was freed and handed to this lineage, which would excuse
+    // one of its nodes above.
+    const std::set<const void *> still{parked.begin(), parked.end()};
+    REQUIRE(std::ranges::all_of(
+        foreign, [&](const void *node) { return still.contains(node); }));
     if (!fired) break;
   }
+  // The sweep reached the parcel it is about.
+  REQUIRE(parked_most > parked_clean);
+}
+
+namespace {
+
+// A version chain over nodes the test owns, so it sees every free.
+struct ChainNode {
+  std::uint64_t tag{0};
+  std::vector<ChainNode *> children;
+  int frees{0};
+};
+
+struct ChainNodeTraits {
+  using Node = ChainNode;
+  static auto tag(const ChainNode *n) -> std::uint64_t { return n->tag; }
+  template <typename F> static void for_each_child(ChainNode *n, F &&f) {
+    for (auto *c : n->children)
+      f(c);
+  }
+  static void destroy(ChainNode *n) noexcept { ++n->frees; }
+  static void account_retired(std::int64_t) noexcept {}
+};
+
+}  // namespace
+
+// The parcel of the test above when the head over its holder is retracted
+// instead (#390). f, w and r in one lineage: w replaced f's root and leaf a,
+// r replaced w's root, w's leaf b and f's leaf x. r's parcel mixes nodes w
+// created, blocked by w, with x, blocked by f; each allocation of r's
+// publication is failed in turn, and when the one that fails is the split
+// the parcel is held whole on f. w dies holding nothing of it, and r is
+// retracted onto f: x is f's again, and w's nodes are reached by nothing.
+// By the time the lineage ends every node has been freed exactly once.
+TEST_CASE("alloc sweep: a parcel held whole is freed in part when the head "
+          "above it is retracted",
+          "[alloc_sweep]") {
+  auto &chain = bytecask::VersionChain<ChainNodeTraits>::instance();
+  long held_whole = 0;
+  for (long n = 1;; ++n) {
+    REQUIRE(n <= kMaxAllocations);
+    const auto f = bytecask::new_version_tag();
+    const auto w = bytecask::new_version_tag();
+    const auto r = bytecask::new_version_tag();
+    ChainNode a{f, {}}, x{f, {}};
+    ChainNode froot{f, {&a, &x}};
+    ChainNode b{w, {}};
+    ChainNode wroot{w, {&b, &x}};
+    ChainNode c{r, {}}, y{r, {}};
+    ChainNode rroot{r, {&c, &y}};
+    std::vector<ChainNode *> retired;
+    chain.publish(f, 0, retired);
+    retired = {&froot, &a};
+    chain.publish(w, f, retired);
+    retired = {&wroot, &b, &x};
+    bool published = true;
+    bool fired = false;
+    {
+      ScopedAllocFaults faults{n, false};
+      try {
+        chain.publish(r, w, retired);
+      } catch (const std::bad_alloc &) {
+        published = false;
+      }
+      fired = faults.report().fired;
+    }
+    INFO("allocation " << n << " of the publication failed");
+    chain.unpin(w, &wroot);
+    // Split, w's nodes were parked on w and freed with it; held whole, they
+    // are still parked on f.
+    if (published && wroot.frees == 0)
+      ++held_whole;
+    if (published)
+      chain.unpin(r, &rroot);
+    chain.unpin(f, &froot);
+    for (const auto *node : {&a, &x, &froot, &b, &wroot})
+      CHECK(node->frees == 1);
+    // A publication that failed leaves r's nodes to its session.
+    for (const auto *node : {&c, &y, &rroot})
+      CHECK(node->frees == (published ? 1 : 0));
+    if (!fired) break;
+  }
+  // The sweep reached the parcel it is about.
+  REQUIRE(held_whole > 0);
 }
 
 #else  // BYTECASK_NO_ALLOC_FAULTS
