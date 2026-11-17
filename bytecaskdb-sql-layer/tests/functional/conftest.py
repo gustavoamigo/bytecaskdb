@@ -76,7 +76,7 @@ def pytest_runtest_makereport(item, call):
 
 class _Results:
     """results.json: one entry per case with its suite, id, features, whether
-    it is marked not implemented, and its outcome: pass, fail or skip."""
+    it is marked not implemented, whether PostgreSQL refuses it too, and its outcome: pass, fail or skip."""
 
     def __init__(self, config):
         self.config = config
@@ -91,6 +91,7 @@ class _Results:
             "id": case.id,
             "features": list(case.features),
             "marked": case.unimplemented,
+            "postgresql_refuses": case.postgresql_refuses,
             "outcome": "pass",
         })
         # A failure in any phase, a server that didn't start included, is the case's failure.

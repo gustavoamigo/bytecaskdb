@@ -26,7 +26,9 @@ How much of each suite the layer passes, from the functional suite's conformance
 | ByteCaskDB features | 100% | 13/13 cases | results |
 | TPROC-C | 100% | 1/1 case: five transactions, then consistency conditions 1–9 | consistency conditions 1–9 |
 
-The suite is young: its cases are the first of the plan in `docs/functional_testing_design.md`, so a high percentage means few cases, not wide coverage. Of the sqltest tests that fail, the largest groups need `GRANT` and `REVOKE`; the rest stop at many smaller gaps.
+PostgreSQL 17 itself refuses 120 of sqltest's tests (non-PostgreSQL syntax such as `CHARACTERS` length units), so 623/743 is the most a PostgreSQL dialect can pass; the layer passes 521 of those 623 (84%). Of the rest, the largest group needs `GRANT` and `REVOKE`; the others stop at many smaller gaps.
+
+The suite is young: its cases are the first of the plan in `docs/functional_testing_design.md`, so a high percentage means few cases, not wide coverage.
 
 ## Current state
 

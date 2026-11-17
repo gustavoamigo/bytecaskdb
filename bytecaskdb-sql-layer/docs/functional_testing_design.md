@@ -121,6 +121,28 @@ the row says 2016.
   rest stop at forms the dialect leaves out. The list is
   `tests/functional/not_implemented/sqltest.txt`.
 
+#### The PostgreSQL ceiling
+
+PostgreSQL 17 refuses 120 of sqltest's 743 tests (measured 2026-11-17,
+each test on a fresh database, a cursor test inside `BEGIN` when
+PostgreSQL's only objection is `DECLARE` outside a block). Most use
+syntax PostgreSQL doesn't have: `CHARACTERS` and `OCTETS` as length
+units, sqltest's `VARING`, `GRANT` on methods, collations, translations
+and `UNDER`, `OPEN` and `FETCH … INTO`, `* AS (c, d)`, `WHEN` with a
+list. The rest are errors in PostgreSQL: `GRANTED BY` another role,
+`WHERE CURRENT OF` a cursor never fetched, a cast of a time to a
+timestamp. The layer speaks PostgreSQL's dialect, so these stay not
+implemented: accepting them means inventing semantics PostgreSQL has
+none of (owner decision, 2026-11-17).
+
+- **The mark:** their line in the list has a comment starting
+  `not PostgreSQL:`, with the SQLSTATE and message PostgreSQL gives.
+- **The report** counts them and adds a line under its table: the
+  layer's coverage of the 623 tests PostgreSQL accepts. 623 is the
+  target for the SQL:2016 Core row.
+- **Re-measure** when sqltest's pin moves: a marked test PostgreSQL
+  accepts loses its mark.
+
 ### PostgreSQL features and ByteCaskDB features: our cases
 
 Cases we write, in YAML, in `cases/`.
