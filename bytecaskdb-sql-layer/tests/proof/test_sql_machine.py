@@ -2785,6 +2785,10 @@ def test_binder_refusals_carry_postgresqls_sqlstate(dsn):
             ("UPDATE t0 SET c3 = c6 WHERE c0 = $1", (1,), "42804"),
             ("UPDATE t0 SET c2 = c3 WHERE c0 = $1", (1,), "42804"),
             ("UPDATE t0 SET c4 = c6 WHERE c0 = $1", (1,), "42804"),
+            # An arithmetic operator PostgreSQL has none of: 42883; one it finds ambiguous: 42725.
+            ("SELECT DATE '2026-01-01' + DATE '2026-01-01' FROM t0 WHERE c0 = $1", (1,), "42883"),
+            ("SELECT c6 - DATE '2026-01-01' FROM t0 WHERE c0 = $1", (1,), "42883"),
+            ("SELECT TIME '10:00' + TIME '10:00' FROM t0 WHERE c0 = $1", (1,), "42725"),
             # 0A000 and 22003.
             ("SELECT sum(c6) FROM t0 WHERE c0 = $1 FOR UPDATE", (1,), "0A000"),
             ("UPDATE t0 SET c5 = c5 + 100000000000000000 WHERE c0 = $1", (1,), "22003"),

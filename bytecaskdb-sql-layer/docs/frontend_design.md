@@ -177,6 +177,9 @@ kind the transformer doesn't take is refused with its position.
 - **`+`, `-`, `*`, `/`, comparisons, `IS [NOT] NULL`, `AND`, `OR` and
   `NOT` of columns** are values in a select list (*Expressions over
   columns*, below).
+- **`DATE - DATE`** is PostgreSQL's `date_mi`: the `integer` count of days
+  from the second to the first, of constants and columns alike (*Date and
+  time arithmetic*, below).
 - **`CASE`, `COALESCE` and `NULLIF`** of constants fold. Of a column, a
   parameter or a subquery they are values in a select list (*Expressions
   over columns*, below). The result type is PostgreSQL's union rule: unknown
@@ -622,7 +625,11 @@ That includes:
   (#671);
 - a cast of anything but a constant (a parameter beside a column of the
   cast's type excepted), a numeric literal of more than 18 digits, a string literal in arithmetic, unary `-` or `abs`
-  of a parameter, and a constant beside an aggregate.
+  of a parameter, and a constant beside an aggregate;
+- date and time arithmetic other than `DATE - DATE`: `date ± integer`,
+  `date + time`, any operator whose result is an `interval` (PostgreSQL has
+  them; the layer has no `interval` type), and a `$n` or an unknown literal
+  beside a date or time value under `+`, `*` or `/`.
 
 The list and its order of work are #534.
 
@@ -646,6 +653,8 @@ recompile after a DDL folds them again, to the types they meet then.
 - Unary `+` and `-`, and `+`, `-`, `*` and `/` of constants, fold with
   PostgreSQL's result types and range checks: `2147483647 + 1` is "integer out of
   range" (22003), `1 + 1.5` the numeric 2.5, `1 + NULL` an integer NULL.
+  `DATE '2026-10-25' - DATE '2026-01-01'` is the integer 297, `DATE
+  '2026-01-01' - NULL` an integer NULL.
 - A comparison of constants (`=`, `<>`, `<`, `<=`, `>`, `>=`) folds to a
   `boolean`, NULL if either side is: numbers exactly whatever their
   scales, a float with NaN above every value, strings and bytes bytewise
@@ -780,6 +789,27 @@ until then.
   as in a `WHERE`; one beside another parameter, a constant or an
   expression is refused (42601). An unknown literal or `NULL` takes the
   other operand's type (`i + '1'`, `z = NULL`).
+- **Date and time arithmetic.** `DATE - DATE` is an `integer`, the days
+  between them: a date is a count of days from 1970, so it is one
+  subtraction, exact over the type's whole range (4714-11-24 BC to
+  5874897-12-31, a difference of at most 2147483493). A `$n`, an unknown
+  literal or `NULL` beside a `DATE` under `-` is read as a `DATE`, as
+  PostgreSQL resolves it (`d - $1`, `d - '2026-01-01'`, `'2026-01-01' -
+  DATE '2020-01-01'`). Under `+`, `*` or `/` the operator is decided as
+  PostgreSQL resolves it for an operand of type unknown, before that
+  operand is read as the other's type, so a literal that is not a valid
+  date or time answers as one that is (`temporal_untyped_operator`):
+  `date + unknown` is 42725 (PostgreSQL has `date + integer`, `+
+  interval` and `+ time` and cannot choose), `date` or `timestamp` under `*`
+  or `/`, and `unknown / time`, are 42883; the forms PostgreSQL runs (`time
+  + unknown` and `timestamp + unknown` as an interval, a time scaled by
+  a number) are refused (42601). Of the other operators over date and time
+  types (`temporal_operator`), those PostgreSQL has, its implicit casts
+  included, are refused (42601): `date ± integer`, `date + time`, a
+  timestamp's or a time's difference (an `interval`), `date - timestamp`,
+  `time * number`. A pair PostgreSQL has no operator for is 42883 (`date +
+  date`, `date * date`, `date - numeric`, `date - bigint`, `integer -
+  date`), and `time + time` is 42725, ambiguous there.
 - **Held within 18 digits.** A numeric operand brought to a finer scale
   (`d + i`, `d < i`) must stay inside the 18 digits a `DECIMAL` holds, by
   its type, or by its value for a constant; a `bigint` beside a `DECIMAL`

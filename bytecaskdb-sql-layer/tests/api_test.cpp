@@ -1885,6 +1885,87 @@ TEST_CASE("embedded API: expressions over columns in the select list", "[sql][ap
 }
 
 
+TEST_CASE("embedded API: DATE - DATE is the INTEGER count of days between them", "[sql][api]") {
+  sql_test::TempDir dir{"api_date_difference"};
+  auto db = Database::open(dir.path());
+  auto null = Value{};
+  constexpr std::int64_t kMinDate = -2'440'588;     // 4714-11-24 BC, the type's first day
+  constexpr std::int64_t kMaxDate = 2'145'042'905;  // 5874897-12-31, its last
+  (void)db->execute("CREATE TABLE dd (id INTEGER PRIMARY KEY, d DATE, e DATE, ts TIMESTAMP, t TIME, n INTEGER)");
+  constexpr auto kIns = "INSERT INTO dd VALUES ($1, $2, $3, $4, $5, $6)";
+  (void)db->execute(kIns, {i(1), i(20'751), i(-1), i(0), i(0), i(1)});  // 2026-10-25, 1969-12-31
+  (void)db->execute(kIns, {i(2), i(kMinDate), i(kMaxDate), null, null, null});
+  (void)db->execute(kIns, {i(3), null, i(0), null, null, null});
+  auto state = [&](std::string_view sql, std::vector<Value> params = {}) -> std::string {
+    try {
+      (void)db->execute(db->prepare(sql), params);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+
+  // Of columns: before 1970, at the type's ends both ways, NULL.
+  auto cols = db->execute("SELECT d - e, e - d, d - DATE '1970-01-01' FROM dd ORDER BY id");
+  CHECK(cols.rows == Grid{{i(20'752), i(-20'752), i(20'751)},
+                          {i(-2'147'483'493), i(2'147'483'493), i(kMinDate)},
+                          {null, null, null}});
+  CHECK(cols.types == std::vector<SqlType>(3, SqlType{SqlKind::Integer}));
+  CHECK(db->execute("SELECT d - e - n, (d - e) * 2 FROM dd WHERE id = 1").rows == Grid{{i(20'751), i(41'504)}});
+
+  // An untyped $1 or literal beside a DATE is read as one, as PostgreSQL resolves it.
+  const auto& by_param = db->prepare("SELECT d - $1, $1 - e FROM dd WHERE id = $2");
+  CHECK(db->execute(by_param, {i(0), i(1)}).rows == Grid{{i(20'751), i(1)}});
+  CHECK(db->execute(by_param, {i(kMaxDate), i(2)}).rows == Grid{{i(-2'147'483'493), i(0)}});
+  CHECK(db->execute(by_param, {null, i(1)}).rows == Grid{{null, null}});
+  CHECK(db->execute("SELECT d - '1969-12-31', d - NULL FROM dd WHERE id = 1").rows == Grid{{i(20'752), null}});
+  CHECK(state("SELECT d - 'x' FROM dd") == "22007");
+
+  // Constants fold.
+  auto folded = db->execute("SELECT DATE '5874897-12-31' - DATE '4714-11-24 BC', DATE '1969-12-31' - DATE '1970-01-01', "
+                            "DATE '2026-01-01' - '2020-01-01', '2020-01-01' - DATE '2026-01-01', DATE '2026-01-01' - NULL");
+  CHECK(folded.rows == Grid{{i(2'147'483'493), i(-1), i(2'192), i(-2'192), null}});
+  CHECK(folded.types == std::vector<SqlType>(5, SqlType{SqlKind::Integer}));
+
+  // No such operator in PostgreSQL: 42883; time + time is ambiguous there: 42725.
+  for (const auto* sql : {"SELECT d + e FROM dd", "SELECT d * e FROM dd", "SELECT d - 1.5 FROM dd", "SELECT n - d FROM dd",
+                          "SELECT DATE '2026-01-01' + DATE '2026-01-01'", "SELECT DATE '2026-01-01' - 5::bigint"}) {
+    CHECK(state(sql) == "42883");
+  }
+  CHECK(state("SELECT t + t FROM dd") == "42725");
+  CHECK(state("SELECT TIME '10:00' + TIME '10:00'") == "42725");
+  // Operators PostgreSQL has and the layer does not yet: refused, not 42883.
+  for (const auto* sql : {"SELECT d + n FROM dd", "SELECT d - 1 FROM dd", "SELECT 1 + d FROM dd", "SELECT d - ts FROM dd",
+                          "SELECT ts - ts FROM dd", "SELECT t - t FROM dd", "SELECT d + t FROM dd", "SELECT t * 2 FROM dd",
+                          "SELECT DATE '2026-01-01' + 1"}) {
+    CHECK(state(sql) == "42601");
+  }
+
+  // A $n, an unknown literal or NULL beside a date or time value under +, *
+  // or /: decided as PostgreSQL resolves the operator, before the untyped
+  // operand is read as the other's type, so a literal that is not a valid
+  // DATE or TIME answers the same as one that is.
+  for (const auto* sql : {"SELECT d + '1' FROM dd", "SELECT d + '2020-01-01' FROM dd", "SELECT '2020-01-01' + d FROM dd",
+                          "SELECT d + NULL FROM dd", "SELECT DATE '2026-01-01' + NULL", "SELECT DATE '2026-01-01' + '1'"}) {
+    CHECK(state(sql) == "42725");  // date + unknown: date + integer, + interval, + time
+  }
+  for (const auto* sql : {"SELECT d * '2' FROM dd", "SELECT d * NULL FROM dd", "SELECT d / '2' FROM dd", "SELECT ts * '2' FROM dd",
+                          "SELECT '2' / t FROM dd", "SELECT TIMESTAMP '2026-01-01 00:00' / NULL"}) {
+    CHECK(state(sql) == "42883");
+  }
+  for (const auto* sql : {"SELECT t + '1' FROM dd", "SELECT t + '01:00' FROM dd", "SELECT t * '2' FROM dd", "SELECT t / '2' FROM dd",
+                          "SELECT '2' * t FROM dd", "SELECT ts + '1' FROM dd", "SELECT TIME '10:00' + NULL",
+                          "SELECT TIME '10:00' * '2'"}) {
+    CHECK(state(sql) == "42601");  // PostgreSQL runs these: time + interval, time scaled, timestamp + interval
+  }
+  CHECK(state("SELECT d + $1 FROM dd", {i(1)}) == "42725");
+  CHECK(state("SELECT d * $1 FROM dd", {i(1)}) == "42883");
+  CHECK(state("SELECT $1 / t FROM dd", {i(1)}) == "42883");
+  CHECK(state("SELECT t * $1 FROM dd", {i(1)}) == "42601");
+}
+
 TEST_CASE("embedded API: a database written before #780's row and key format is refused when it opens", "[sql][api]") {
   sql_test::TempDir dir{"api_old_format"};
   {
