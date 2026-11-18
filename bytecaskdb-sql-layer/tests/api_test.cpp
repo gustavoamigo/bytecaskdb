@@ -166,6 +166,14 @@ TEST_CASE("embedded API: CREATE ROLE, GRANT and REVOKE are DDL kept in the catal
     CHECK(db->prepare("GRANT SELECT ON t TO r").command() == Command::Grant);
     CHECK(db->prepare("REVOKE SELECT ON t FROM r").command() == Command::Revoke);
     CHECK(db->prepare("DROP ROLE r").command() == Command::DropRole);
+    CHECK(db->prepare("CREATE DOMAIN d AS INTEGER").command() == Command::CreateDomain);
+    CHECK(db->prepare("CREATE TYPE ty").command() == Command::CreateType);
+    CHECK(db->prepare("CREATE SEQUENCE s").command() == Command::CreateSequence);
+    CHECK(db->prepare("DROP DOMAIN d").command() == Command::DropDomain);
+    CHECK(db->prepare("DROP TYPE ty").command() == Command::DropType);
+    CHECK(db->prepare("DROP SEQUENCE s").command() == Command::DropSequence);
+    CHECK(db->execute("DROP SEQUENCE IF EXISTS s").notices.at(0).message == "sequence \"s\" does not exist, skipping");
+    CHECK(db->execute("DROP DOMAIN IF EXISTS d").notices.at(0).message == "type \"d\" does not exist, skipping");
     (void)db->execute("CREATE ROLE r");
     (void)db->execute("GRANT SELECT, UPDATE (v) ON t TO r, PUBLIC");
     const auto* t = db->catalog()->table("t");

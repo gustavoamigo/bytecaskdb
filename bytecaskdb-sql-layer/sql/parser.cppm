@@ -120,6 +120,7 @@ auto type_ast(const PgQuery__TypeName* tn, std::string name, std::int32_t pos) -
 
 auto expr(const PgQuery__Node* n) -> Expr;
 auto literal(const PgQuery__Node* n) -> Literal;
+auto object_name(const PgQuery__Node* n, std::int32_t pos) -> std::string;
 auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select;
 
 // A subquery's SELECT, parsed as any SELECT is.
@@ -792,6 +793,12 @@ auto drop(const PgQuery__DropStmt* s, std::int32_t pos) -> Statement {
   }
   const auto* obj = s->objects[0];
   if (s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_PROCEDURE) return drop_procedure(s, pos);
+  using K = DropTypeOrSequence::Kind;
+  auto other = s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_DOMAIN     ? std::optional{K::Domain}
+               : s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_TYPE     ? std::optional{K::Type}
+               : s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_SEQUENCE ? std::optional{K::Sequence}
+                                                                          : std::nullopt;
+  if (other) return DropTypeOrSequence{*other, object_name(obj, pos), s->missing_ok != 0, pos};
   if (obj->node_case != PG_QUERY__NODE__NODE_LIST || obj->list->n_items != 1) {
     reject("schema-qualified names are not supported", pos);
   }
@@ -833,6 +840,52 @@ auto drop_role(const PgQuery__DropRoleStmt* s, std::int32_t pos) -> DropRole {
   return out;
 }
 
+// One name a DROP or a GRANT lists: a relation's RangeVar, a type's TypeName
+// or a list of one String. A qualified one is refused.
+auto object_name(const PgQuery__Node* n, std::int32_t pos) -> std::string {
+  if (n->node_case == PG_QUERY__NODE__NODE_RANGE_VAR) {
+    const auto* rv = n->range_var;
+    if (!empty(rv->schemaname) || !empty(rv->catalogname)) reject("schema-qualified names are not supported", rv->location);
+    return rv->relname;
+  }
+  if (n->node_case == PG_QUERY__NODE__NODE_TYPE_NAME) {
+    const auto* tn = n->type_name;
+    if (tn->n_names != 1 || tn->n_typmods != 0 || tn->n_array_bounds != 0) reject("a type is named by one name", tn->location);
+    return str(tn->names[0]);
+  }
+  if (n->node_case == PG_QUERY__NODE__NODE_LIST && n->list->n_items == 1) return str(n->list->items[0]);
+  reject("schema-qualified names are not supported", pos);
+}
+
+// CREATE DOMAIN name [AS] type: no constraint, DEFAULT or COLLATE yet.
+auto create_domain(const PgQuery__CreateDomainStmt* s, std::int32_t pos) -> CreateDomain {
+  if (s->n_domainname != 1) reject("schema-qualified names are not supported", pos);
+  if (s->n_constraints != 0 || s->coll_clause != nullptr) {
+    reject("a domain's DEFAULT, NOT NULL, CHECK and COLLATE are not supported yet", pos);
+  }
+  return CreateDomain{str(s->domainname[0]), type_ast(s->type_name, "", pos), pos};
+}
+
+// CREATE SEQUENCE [IF NOT EXISTS] name, with no option yet.
+auto create_sequence(const PgQuery__CreateSeqStmt* s, std::int32_t pos) -> CreateSequence {
+  const auto* rv = s->sequence;
+  if (!empty(rv->schemaname) || !empty(rv->catalogname)) reject("schema-qualified names are not supported", rv->location);
+  if (!empty(rv->relpersistence) && rv->relpersistence[0] != 'p') reject("CREATE TEMPORARY SEQUENCE is not supported", pos);
+  if (s->n_options != 0 || s->for_identity) reject("a sequence's options are not supported yet", pos);
+  return CreateSequence{rv->relname, s->if_not_exists != 0, pos};
+}
+
+// CREATE TYPE name, the shell type; any other CREATE TYPE, and the other
+// definitions PostgreSQL's DefineStmt carries (aggregates, operators, …),
+// are refused.
+auto create_type(const PgQuery__DefineStmt* s, std::int32_t pos) -> CreateType {
+  if (s->kind != PG_QUERY__OBJECT_TYPE__OBJECT_TYPE || s->n_definition != 0 || s->n_args != 0 || s->replace) {
+    reject("only CREATE TYPE name, a shell type, is supported", pos);
+  }
+  if (s->n_defnames != 1) reject("schema-qualified names are not supported", pos);
+  return CreateType{str(s->defnames[0]), pos};
+}
+
 // GRANT and REVOKE of privileges ON [TABLE] names TO or FROM roles or
 // PUBLIC. Not of other objects, ON ALL TABLES IN SCHEMA, role membership or
 // ALTER DEFAULT PRIVILEGES. RESTRICT and CASCADE are taken, and alike: a
@@ -842,18 +895,22 @@ auto grant(const PgQuery__GrantStmt* s, std::int32_t pos) -> Grant {
   if (s->targtype != PG_QUERY__GRANT_TARGET_TYPE__ACL_TARGET_OBJECT) {
     reject("GRANT and REVOKE ON ALL … IN SCHEMA are not supported", pos);
   }
-  if (s->objtype != PG_QUERY__OBJECT_TYPE__OBJECT_TABLE) {
-    reject("GRANT and REVOKE are supported on tables and views only", pos);
-  }
   Grant out;
+  if (s->objtype == PG_QUERY__OBJECT_TYPE__OBJECT_TABLE) {
+    out.target = Grant::Target::Table;
+  } else if (s->objtype == PG_QUERY__OBJECT_TYPE__OBJECT_SEQUENCE) {
+    out.target = Grant::Target::Sequence;
+  } else if (s->objtype == PG_QUERY__OBJECT_TYPE__OBJECT_DOMAIN) {
+    out.target = Grant::Target::Domain;
+  } else if (s->objtype == PG_QUERY__OBJECT_TYPE__OBJECT_TYPE) {
+    out.target = Grant::Target::Type;
+  } else {
+    reject("GRANT and REVOKE are supported on tables, views, sequences, domains and types only", pos);
+  }
   out.grant = s->is_grant != 0;
   out.grant_option = s->grant_option != 0;
   out.pos = pos;
-  for (std::size_t i = 0; i < s->n_objects; ++i) {
-    const auto* rv = s->objects[i]->range_var;
-    if (!empty(rv->schemaname) || !empty(rv->catalogname)) reject("schema-qualified names are not supported", rv->location);
-    out.objects.emplace_back(rv->relname);
-  }
+  for (std::size_t i = 0; i < s->n_objects; ++i) out.objects.push_back(object_name(s->objects[i], pos));
   for (std::size_t i = 0; i < s->n_privileges; ++i) {
     const auto* p = s->privileges[i]->access_priv;
     PrivilegeAst priv{empty(p->priv_name) ? "all" : p->priv_name, {}};
@@ -1487,6 +1544,9 @@ auto parse(std::string_view sql) -> Statement {
   if (n->node_case == PG_QUERY__NODE__NODE_CREATE_ROLE_STMT) return create_role(n->create_role_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_DROP_ROLE_STMT) return drop_role(n->drop_role_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_GRANT_STMT) return grant(n->grant_stmt, pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_CREATE_DOMAIN_STMT) return create_domain(n->create_domain_stmt, pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_CREATE_SEQ_STMT) return create_sequence(n->create_seq_stmt, pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_DEFINE_STMT) return create_type(n->define_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_INSERT_STMT) return insert(n->insert_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_SELECT_STMT) return select(n->select_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_UPDATE_STMT) return update(n->update_stmt, pos);

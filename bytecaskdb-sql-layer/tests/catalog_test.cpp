@@ -1319,6 +1319,160 @@ TEST_CASE("catalog: a role's record and name entry, and a privileges record, mus
   db.close();
 }
 
+TEST_CASE("catalog: domains, shell types and sequences are records of their namespaces, survive a reopen, and take grants",
+          "[sql][catalog][roles]") {
+  sql_test::TempDir dir{"catalog_types"};
+  std::uint32_t d_id = 0, s_id = 0;
+  auto on = [](GrantDdl g, GrantDdl::Target target) {
+    g.target = target;
+    return g;
+  };
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    (void)live.apply(create_t());
+    (void)live.apply(CreateRoleDdl{"r"});
+    // The type namespace holds domains, shell types and every table's and view's row type.
+    (void)live.apply(CreateDomainDdl{"d", SqlType{SqlKind::Integer}});
+    CHECK(refused_state(live, CreateDomainDdl{"d", SqlType{SqlKind::Integer}}) == "42710");
+    CHECK(refused_state(live, CreateDomainDdl{"t", SqlType{SqlKind::Integer}}) == "42710");
+    CHECK(refused_state(live, CreateTypeDdl{"t"}) == "42710");
+    CHECK(refused_state(live, CreateTableDdl{"d", {col("a", SqlKind::BigInt)}, {"a"}}) == "42710");
+    (void)live.apply(CreateTypeDdl{"sh"});
+    CHECK(refused_state(live, CreateTypeDdl{"sh"}) == "42710");
+    // A sequence is a relation, with no row type.
+    (void)live.apply(CreateSequenceDdl{"s"});
+    CHECK(refused_state(live, CreateSequenceDdl{"t"}) == "42P07");
+    CHECK(refused_state(live, CreateTableDdl{"s", {col("a", SqlKind::BigInt)}, {"a"}}) == "42P07");
+    CHECK(refused_state(live, CreateSequenceDdl{"s", true}).empty());
+    (void)live.apply(CreateDomainDdl{"s", SqlType{SqlKind::Text}});
+    d_id = live.current()->type("d")->id;
+    s_id = live.current()->sequence("s")->id;
+    // Grants by the kind ON names: USAGE of a domain; USAGE, SELECT, UPDATE of a sequence.
+    CHECK(refused_state(live, on(grant({"d"}, {"r"}, {{"select", {}}}), GrantDdl::Target::Domain)) == "0LP01");
+    CHECK(refused_state(live, on(grant({"s"}, {"r"}, {{"insert", {}}}), GrantDdl::Target::Sequence)) == "0LP01");
+    CHECK(refused_state(live, on(grant({"t"}, {"r"}), GrantDdl::Target::Domain)) == "42809");
+    CHECK(refused_state(live, on(grant({"t"}, {"r"}), GrantDdl::Target::Sequence)) == "42809");
+    CHECK(refused_state(live, on(grant({"nope"}, {"r"}), GrantDdl::Target::Domain)) == "42704");
+    CHECK(refused_state(live, on(grant({"sh"}, {"r"}), GrantDdl::Target::Type)) == "42704");  // only a shell
+    (void)live.apply(on(grant({"d"}, {"r"}), GrantDdl::Target::Domain));
+    (void)live.apply(on(grant({"s"}, {"r"}, {{"select", {}}, {"usage", {}}}), GrantDdl::Target::Sequence));
+    CHECK(live.current()->acl(d_id).front().privileges == privilege::kUsage);
+    CHECK(live.current()->acl(s_id).front().privileges == (privilege::kSelect | privilege::kUsage));
+    CHECK(refused_state(live, DropRoleDdl{{"r"}}) == "2BP01");
+    // The wrong drop for the kind.
+    CHECK(refused_state(live, DropTableDdl{"s"}) == "42809");
+    CHECK(refused_state(live, DropSequenceDdl{"t"}) == "42809");
+    CHECK(refused_state(live, DropTypeDdl{"sh", true}) == "42809");  // DROP DOMAIN of a shell type
+    CHECK(refused_state(live, DropTypeDdl{"nope", true}) == "42704");
+    CHECK(refused_state(live, DropSequenceDdl{"nope"}) == "42P01");
+    db.close();
+  }
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    auto cat = live.current();
+    REQUIRE(cat->type("d") != nullptr);
+    CHECK(cat->type("d")->kind == TypeObject::Kind::Domain);
+    CHECK(cat->type("d")->base == SqlType{SqlKind::Integer});
+    CHECK(cat->type("sh")->kind == TypeObject::Kind::Shell);
+    CHECK(cat->sequence("s")->id == s_id);
+    CHECK(cat->acl(s_id).size() == 1);
+    // CREATE DOMAIN fills a shell type in, under its id.
+    auto sh = cat->type("sh")->id;
+    (void)live.apply(CreateDomainDdl{"sh", SqlType{SqlKind::BigInt}});
+    CHECK(live.current()->type("sh")->id == sh);
+    CHECK(live.current()->type("sh")->kind == TypeObject::Kind::Domain);
+    // Drops take the grants with them.
+    (void)live.apply(DropTypeDdl{"d", true});
+    (void)live.apply(DropSequenceDdl{"s"});
+    (void)live.apply(DropTypeDdl{"sh", false});
+    CHECK(live.current()->acls().empty());
+    (void)live.apply(DropRoleDdl{{"r"}});
+    CHECK(!db.snapshot().contains_key({}, type_record_key(d_id)));
+    CHECK(!db.snapshot().contains_key({}, sequence_record_key(s_id)));
+    db.close();
+  }
+}
+
+TEST_CASE("catalog: a type's and a sequence's records and name entries must agree at load; a damaged one is refused",
+          "[sql][catalog][roles]") {
+  sql_test::TempDir dir{"catalog_types_damage"};
+  std::uint32_t d_id = 0, s_id = 0;
+  Bytes domain, domain_entry, seq, seq_entry;
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    (void)live.apply(CreateDomainDdl{"d", SqlType{SqlKind::Decimal, 0, 10, 2}});
+    (void)live.apply(CreateSequenceDdl{"s"});
+    d_id = live.current()->type("d")->id;
+    s_id = live.current()->sequence("s")->id;
+    REQUIRE(db.snapshot().get({}, type_record_key(d_id), domain));
+    REQUIRE(db.snapshot().get({}, type_name_key("d"), domain_entry));
+    REQUIRE(db.snapshot().get({}, sequence_record_key(s_id), seq));
+    REQUIRE(db.snapshot().get({}, name_entry_key("s"), seq_entry));
+    db.close();
+  }
+  auto put = [&](const Bytes& key, const Bytes& value) {
+    auto db = DB::open(dir.path());
+    db.put({}, key, value);
+    db.close();
+  };
+  auto restore = [&] {
+    put(type_record_key(d_id), domain);
+    put(type_name_key("d"), domain_entry);
+    put(sequence_record_key(s_id), seq);
+    put(name_entry_key("s"), seq_entry);
+  };
+  auto refused_with = [&](const Bytes& key, const Bytes& value) {
+    put(key, value);
+    {
+      auto db = DB::open(dir.path());
+      CHECK_THROWS_AS(LiveCatalog{db}, std::runtime_error);
+      (void)db.del({}, key);
+      db.close();
+    }
+    restore();
+  };
+  for (const auto& [key, record] : {std::pair{type_record_key(d_id), domain}, std::pair{sequence_record_key(s_id), seq}}) {
+    INFO("record size " << record.size());
+    for (std::size_t n = 0; n < record.size(); ++n) {
+      refused_with(key, Bytes(record.begin(), record.begin() + static_cast<std::ptrdiff_t>(n)));
+    }
+    auto later = record;
+    later[1] = std::byte{2};
+    refused_with(key, later);
+    auto longer = record;
+    longer.push_back(std::byte{0});
+    refused_with(key, longer);
+  }
+  refused_with(type_record_key(d_id + 1), domain);
+  refused_with(sequence_record_key(s_id + 1), seq);
+  auto changed = [](Bytes r, std::size_t at, std::byte b) {
+    r[at] = b;
+    return r;
+  };
+  // The domain's kind (after the format, the id and the name "d"), then its base type's kind.
+  constexpr std::size_t kKindAt = 2 + 4 + 2 + 1;
+  refused_with(type_record_key(d_id), changed(domain, kKindAt, std::byte{9}));
+  refused_with(type_record_key(d_id), changed(domain, kKindAt + 1, std::byte{0xEE}));
+  // A name entry of another kind, or missing.
+  refused_with(type_name_key("d"), changed(domain_entry, 0, std::byte{5}));
+  refused_with(name_entry_key("s"), changed(seq_entry, 0, std::byte{1}));
+  refused_with(type_name_key("e"), domain_entry);
+  {
+    auto db = DB::open(dir.path());
+    (void)db.del({}, name_entry_key("s"));
+    CHECK_THROWS_AS(LiveCatalog{db}, std::runtime_error);
+    db.close();
+  }
+  restore();
+  auto db = DB::open(dir.path());
+  LiveCatalog live{db};
+  CHECK(live.current()->type("d")->base == SqlType{SqlKind::Decimal, 0, 10, 2});
+  db.close();
+}
+
 TEST_CASE("catalog: a procedure is a record and a name entry of its own namespace, survives a reopen, and is replaced or dropped",
           "[sql][catalog][procedure]") {
   sql_test::TempDir dir{"catalog_procedure"};

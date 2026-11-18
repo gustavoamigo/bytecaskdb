@@ -75,3 +75,58 @@
     - DROP TABLE gs
     - DROP ROLE IF EXISTS gs1
     - DROP ROLE IF EXISTS gs2
+
+- name: domains, shell types and sequences, their namespaces and their grants
+  features: [S011, T176, F031-03, F031-19]
+  setup:
+    - CREATE TABLE gd (a INTEGER PRIMARY KEY)
+    - CREATE ROLE gd1
+  steps:
+    - sql: CREATE DOMAIN gdd AS INTEGER
+    - sql: CREATE TYPE gdt
+    - sql: CREATE SEQUENCE gds
+    # Types share a namespace with tables' row types; sequences with relations.
+    - sql: CREATE DOMAIN gd AS INTEGER
+      error: "42710"
+    - sql: CREATE TABLE gdd (a INTEGER)
+      error: "42710"
+    - sql: CREATE TYPE gdd
+      error: "42710"
+    - sql: CREATE SEQUENCE gd
+      error: "42P07"
+    - sql: CREATE SEQUENCE IF NOT EXISTS gds
+    - sql: GRANT ALL PRIVILEGES ON DOMAIN gdd TO gd1
+    - sql: GRANT USAGE, SELECT, UPDATE ON SEQUENCE gds TO gd1 WITH GRANT OPTION
+    - sql: GRANT SELECT ON DOMAIN gdd TO gd1
+      error: "0LP01"
+    - sql: GRANT INSERT ON SEQUENCE gds TO gd1
+      error: "0LP01"
+    - sql: GRANT USAGE ON TYPE gdt TO gd1
+      error: "42704"
+    - sql: GRANT USAGE ON DOMAIN gd TO gd1
+      error: "42809"
+    - sql: GRANT USAGE ON SEQUENCE gd TO gd1
+      error: "42809"
+    - sql: DROP ROLE gd1
+      error: "2BP01"
+    - sql: REVOKE ALL PRIVILEGES ON DOMAIN gdd FROM gd1
+    - sql: REVOKE ALL PRIVILEGES ON SEQUENCE gds FROM gd1
+    # A domain over a shell type fills it in.
+    - sql: CREATE DOMAIN gdt AS TEXT
+    - sql: DROP DOMAIN gd
+      error: "42809"
+    - sql: DROP SEQUENCE gd
+      error: "42809"
+    - sql: DROP TABLE gds
+      error: "42809"
+    - sql: DROP DOMAIN IF EXISTS nope
+    - sql: DROP SEQUENCE gds
+    - sql: DROP TYPE gdt
+    - sql: DROP DOMAIN gdd
+    - sql: DROP ROLE gd1
+  teardown:
+    - DROP TABLE gd
+    - DROP DOMAIN IF EXISTS gdd
+    - DROP TYPE IF EXISTS gdt
+    - DROP SEQUENCE IF EXISTS gds
+    - DROP ROLE IF EXISTS gd1

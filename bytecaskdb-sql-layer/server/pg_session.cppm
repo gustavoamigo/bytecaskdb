@@ -449,6 +449,12 @@ auto command_name(Command c) -> std::string_view {
     case Command::DropRole: return "DROP ROLE";
     case Command::Grant: return "GRANT";
     case Command::Revoke: return "REVOKE";
+    case Command::CreateDomain: return "CREATE DOMAIN";
+    case Command::CreateType: return "CREATE TYPE";
+    case Command::CreateSequence: return "CREATE SEQUENCE";
+    case Command::DropDomain: return "DROP DOMAIN";
+    case Command::DropType: return "DROP TYPE";
+    case Command::DropSequence: return "DROP SEQUENCE";
   }
   return {};
 }
@@ -472,6 +478,12 @@ auto command_tag(Command c, const Rows& r) -> std::string {
     case Command::DropRole: return "DROP ROLE";
     case Command::Grant: return "GRANT";
     case Command::Revoke: return "REVOKE";
+    case Command::CreateDomain: return "CREATE DOMAIN";
+    case Command::CreateType: return "CREATE TYPE";
+    case Command::CreateSequence: return "CREATE SEQUENCE";
+    case Command::DropDomain: return "DROP DOMAIN";
+    case Command::DropType: return "DROP TYPE";
+    case Command::DropSequence: return "DROP SEQUENCE";
   }
   return {};
 }

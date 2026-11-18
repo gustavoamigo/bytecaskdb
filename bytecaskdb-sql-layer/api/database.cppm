@@ -234,6 +234,12 @@ enum class Command {
   DropRole,
   Grant,
   Revoke,
+  CreateDomain,
+  CreateType,
+  CreateSequence,
+  DropDomain,
+  DropType,
+  DropSequence,
 };
 
 // A result column: its name and SQL type, as a client is told them before
@@ -1284,6 +1290,15 @@ auto Statement::command() const -> Command {
           return Command::DropRole;
         } else if constexpr (std::is_same_v<T, ast::Grant>) {
           return st.grant ? Command::Grant : Command::Revoke;
+        } else if constexpr (std::is_same_v<T, ast::CreateDomain>) {
+          return Command::CreateDomain;
+        } else if constexpr (std::is_same_v<T, ast::CreateType>) {
+          return Command::CreateType;
+        } else if constexpr (std::is_same_v<T, ast::CreateSequence>) {
+          return Command::CreateSequence;
+        } else if constexpr (std::is_same_v<T, ast::DropTypeOrSequence>) {
+          using K = ast::DropTypeOrSequence::Kind;
+          return st.kind == K::Domain ? Command::DropDomain : st.kind == K::Type ? Command::DropType : Command::DropSequence;
         } else {
           static_assert(std::is_same_v<T, ast::AddColumn>);
           return Command::AlterTable;
@@ -1626,6 +1641,12 @@ auto skipped(const Ddl& ddl) -> Notice {
           return {"00000", "view \"" + d.name + "\" does not exist, skipping"};
         } else if constexpr (std::is_same_v<T, DropRoleDdl>) {
           return {"00000", "role \"" + d.names.front() + "\" does not exist, skipping"};
+        } else if constexpr (std::is_same_v<T, DropTypeDdl>) {
+          return {"00000", "type \"" + d.name + "\" does not exist, skipping"};
+        } else if constexpr (std::is_same_v<T, DropSequenceDdl>) {
+          return {"00000", "sequence \"" + d.name + "\" does not exist, skipping"};
+        } else if constexpr (std::is_same_v<T, CreateSequenceDdl>) {
+          return {"42P07", "relation \"" + d.name + "\" already exists, skipping"};
         } else if constexpr (std::is_same_v<T, DropProcedureDdl>) {
           std::string args;
           for (const auto& t : d.arg_types.value_or(std::vector<SqlType>{})) {

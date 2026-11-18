@@ -544,11 +544,27 @@ and `REVOKE` on tables and views (#653, its first step):
   of a list with one, and nothing is dropped. A missing role is 42704; with
   `IF EXISTS`, a NOTICE per missing name. A drop of a table or view takes
   its privileges with it.
+- **`GRANT` and `REVOKE` `ON SEQUENCE`, `ON DOMAIN` and `ON TYPE`**, of the
+  privileges each takes (`catalog_design.md`, *Domains, shell types and
+  sequences*), with PostgreSQL's errors: 42704 for a missing type or a
+  shell one, 42P01 for a missing sequence, 42809 for an object of another
+  kind, 0LP01 for a privilege the kind does not take.
 - **Refused (42601):** `CREATE ROLE`'s options and `CREATE USER`, since the
-  layer has no logins or role attributes. Also refused: `GRANT` on any
-  other kind of object, `ON ALL TABLES IN SCHEMA`, role membership (`GRANT
-  role TO role`), `ALTER DEFAULT PRIVILEGES`, and `CURRENT_USER`,
-  `CURRENT_ROLE` or `SESSION_USER` as a grantee.
+  layer has no logins or role attributes. Also refused: `GRANT` on other
+  kinds of objects (functions, procedures, schemas, …), `ON TABLE` of a
+  sequence, `ON ALL TABLES IN SCHEMA`, role membership (`GRANT role TO
+  role`), `ALTER DEFAULT PRIVILEGES`, and `CURRENT_USER`, `CURRENT_ROLE` or
+  `SESSION_USER` as a grantee.
+
+**Domains, shell types and sequences**: `CREATE DOMAIN name [AS] type`,
+`CREATE TYPE name` (a shell type), `CREATE SEQUENCE [IF NOT EXISTS] name`,
+and `DROP DOMAIN`, `DROP TYPE` and `DROP SEQUENCE [IF EXISTS]`. They are
+stored and granted on, with PostgreSQL's namespaces and errors. None is
+usable yet.
+- Refused (42601): a domain's `DEFAULT`, `NOT NULL`, `CHECK` and
+  `COLLATE`, a column of a domain's type, a sequence's options,
+  `nextval`, `currval`, `setval` and `SERIAL`, and every other form of
+  `CREATE TYPE`.
 
 **Refused**, with a message and the node's position: everything not above.
 That includes:

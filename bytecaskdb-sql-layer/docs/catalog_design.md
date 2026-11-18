@@ -119,7 +119,10 @@ Namespace `0x01`, as the plugin's catalog is:
 | `01 06 <name>` | Procedure name entry: kind 4 and id (4, big-endian). Procedures have a namespace of their own. |
 | `01 07 <id:4>` | The role record (*Roles and privileges*). |
 | `01 08 <name>` | Role name entry: kind 5 and id (4, big-endian). Roles have a namespace of their own. |
-| `01 09 <id:4>` | The privileges (ACL) of the table or view of that id (*Roles and privileges*). |
+| `01 09 <id:4>` | The privileges (ACL) of the table, view, sequence or type of that id (*Roles and privileges*). |
+| `01 0A <id:4>` | A type record: a domain or a shell type (*Domains, shell types and sequences*). |
+| `01 0B <name>` | Type name entry: kind 7 and id. Domains and shell types share this namespace, and a table's or view's name counts in it, as its row type does in PostgreSQL. |
+| `01 0C <id:4>` | A sequence record. Its name entry is `01 03`, kind 6: sequences are relations, with no row type. |
 
 **The counters are 8 bytes**, and the next id at most one past
 `kMaxObjectId`; any other value is refused at load. **One id counter** gives every table, index and layout its id, so an id
@@ -372,6 +375,36 @@ records are.
   - entries out of order.
 
   A later format is refused, as for the other records.
+
+## Domains, shell types and sequences
+
+Objects of their own, stored and granted on. None is usable yet: a domain
+is not a column's type, a shell type is for nothing (as in PostgreSQL),
+and a sequence gives no values.
+- **A type record**: `u16` format (1), `u32` id, `str` name, `u8` kind (1
+  shell, 2 domain). A domain adds its base type: `u8` kind, `u32` length,
+  `u8` precision, `u8` scale.
+- **A sequence record**: `u16` format (1), `u32` id, `str` name. Its
+  options and its counter are not built.
+- **Namespaces.**
+  - A domain or a shell type is refused where a type, table or view holds
+    the name (42710), and a `CREATE TABLE` or `CREATE VIEW` where a type
+    does (42710).
+  - A sequence is refused where any relation holds the name (42P07).
+  - `CREATE DOMAIN` over a shell type fills it in: the domain takes the
+    shell's id.
+- **Privileges.** A domain or a type takes `USAGE`, a sequence `USAGE`,
+  `SELECT` and `UPDATE`, in the ACL record a table's would be in. A shell
+  type takes none: a grant on one is 42704 (*only a shell*), as in
+  PostgreSQL.
+- **Drops.** `DROP DOMAIN` drops a domain, `DROP TYPE` a domain or a shell
+  type, `DROP SEQUENCE` a sequence, each with its ACL. A drop by the wrong
+  statement is 42809.
+- **Load checks** refuse as corruption:
+  - a type or sequence record under another id's key, or a later format;
+  - a missing, extra or mistyped name entry;
+  - a type of a table's or view's name;
+  - an ACL entry with a privilege its object's kind does not take.
 
 ## Views
 

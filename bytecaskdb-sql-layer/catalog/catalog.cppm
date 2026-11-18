@@ -389,10 +389,31 @@ struct Role {
 namespace privilege {
 inline constexpr std::uint16_t kSelect = 1, kInsert = 2, kUpdate = 4, kDelete = 8, kTruncate = 16, kReferences = 32,
                                kTrigger = 64, kMaintain = 128;
-inline constexpr std::uint16_t kAll = 255;
-// The privileges a column takes.
+inline constexpr std::uint16_t kAll = 255;  // a table's or view's: all of them but USAGE
+inline constexpr std::uint16_t kUsage = 256;
+// The privileges a column takes, a sequence takes, a domain or type takes.
 inline constexpr std::uint16_t kColumns = kSelect | kInsert | kUpdate | kReferences;
+inline constexpr std::uint16_t kSequence = kSelect | kUpdate | kUsage;
+inline constexpr std::uint16_t kType = kUsage;
 }  // namespace privilege
+
+// A type of the type namespace, which tables' and views' row types share
+// too: a domain over a base type, or a shell type (CREATE TYPE name), which
+// nothing can use, as in PostgreSQL. A domain is not yet a column's type.
+struct TypeObject {
+  enum class Kind : std::uint8_t { Shell = 1, Domain = 2 };
+  std::uint32_t id{0};
+  std::string name;
+  Kind kind{Kind::Shell};
+  SqlType base{};  // a domain's
+};
+
+// A sequence: a name of the relation namespace, and an id. Its options and
+// its counter, nextval and the rest are not built.
+struct Sequence {
+  std::uint32_t id{0};
+  std::string name;
+};
 
 // The grantee PUBLIC, and the bootstrap superuser: never an object id, which
 // stays at or below 2^24 - 1.
@@ -523,7 +544,29 @@ struct DropRoleDdl {
 // GRANT or REVOKE, as written: the catalog resolves and checks every name,
 // in PostgreSQL's order (the objects, the grantees and the grantor, the
 // privileges, their columns).
+struct CreateDomainDdl {
+  std::string name;
+  SqlType base;
+};
+struct CreateTypeDdl {
+  std::string name;
+};
+struct CreateSequenceDdl {
+  std::string name;
+  bool if_not_exists{false};
+};
+// DROP DOMAIN (`domain`) or DROP TYPE, which drops a domain too.
+struct DropTypeDdl {
+  std::string name;
+  bool domain{false};
+  bool if_exists{false};
+};
+struct DropSequenceDdl {
+  std::string name;
+  bool if_exists{false};
+};
 struct GrantDdl {
+  enum class Target { Table, Sequence, Domain, Type };
   struct Privilege {
     std::string name;  // "select", …, or "all"
     std::vector<std::string> columns;
@@ -534,9 +577,11 @@ struct GrantDdl {
   std::vector<std::string> objects;
   std::vector<std::string> grantees;  // "" is PUBLIC
   std::optional<std::string> grantor;
+  Target target{Target::Table};  // what ON names: a table or view, a sequence, a domain, a type
 };
 using Ddl = std::variant<CreateTableDdl, CreateIndexDdl, DropTableDdl, DropIndexDdl, AddColumnDdl, CreateViewDdl,
-                         DropViewDdl, CreateProcedureDdl, DropProcedureDdl, CreateRoleDdl, DropRoleDdl, GrantDdl>;
+                         DropViewDdl, CreateProcedureDdl, DropProcedureDdl, CreateRoleDdl, DropRoleDdl, GrantDdl,
+                         CreateDomainDdl, CreateTypeDdl, CreateSequenceDdl, DropTypeDdl, DropSequenceDdl>;
 
 class Catalog {
 public:
@@ -563,6 +608,10 @@ public:
   [[nodiscard]] auto view(std::uint32_t id) const -> const View*;
   [[nodiscard]] auto procedures() const -> const std::map<std::uint32_t, Procedure>& { return procedures_; }
   [[nodiscard]] auto procedure(std::string_view name) const -> const Procedure*;
+  [[nodiscard]] auto types() const -> const std::map<std::uint32_t, TypeObject>& { return types_; }
+  [[nodiscard]] auto type(std::string_view name) const -> const TypeObject*;
+  [[nodiscard]] auto sequences() const -> const std::map<std::uint32_t, Sequence>& { return sequences_; }
+  [[nodiscard]] auto sequence(std::string_view name) const -> const Sequence*;
   [[nodiscard]] auto roles() const -> const std::map<std::uint32_t, Role>& { return roles_; }
   [[nodiscard]] auto role(std::string_view name) const -> const Role*;
   // A table's or view's ACL, by its id: empty when nothing is granted on it.
@@ -628,6 +677,9 @@ private:
   std::map<std::string, std::uint32_t, std::less<>> names_;  // table, index or view name -> id
   std::map<std::uint32_t, Procedure> procedures_;
   std::map<std::string, std::uint32_t, std::less<>> procedure_names_;  // a namespace of their own
+  std::map<std::uint32_t, TypeObject> types_;
+  std::map<std::string, std::uint32_t, std::less<>> type_names_;  // the type namespace: domains and shell types
+  std::map<std::uint32_t, Sequence> sequences_;                   // named in names_, the relation namespace
   std::map<std::uint32_t, Role> roles_;
   std::map<std::string, std::uint32_t, std::less<>> role_names_;  // a namespace of their own
   std::map<std::uint32_t, std::vector<AclEntry>> acls_;           // object id -> its ACL, never empty
@@ -742,6 +794,9 @@ private:
 [[nodiscard]] auto role_record_key(std::uint32_t role_id) -> Bytes;
 [[nodiscard]] auto role_name_key(std::string_view name) -> Bytes;
 [[nodiscard]] auto acl_record_key(std::uint32_t object_id) -> Bytes;
+[[nodiscard]] auto type_record_key(std::uint32_t type_id) -> Bytes;
+[[nodiscard]] auto type_name_key(std::string_view name) -> Bytes;
+[[nodiscard]] auto sequence_record_key(std::uint32_t sequence_id) -> Bytes;
 [[nodiscard]] auto name_entry_key(std::string_view name) -> Bytes;
 // Every row key of a table starts with its row prefix: kNsRow, the table id.
 [[nodiscard]] auto row_prefix(std::uint32_t table_id) -> Bytes;
@@ -767,6 +822,10 @@ void for_each_row(const Snapshot& snap, std::uint32_t table_id, Visit&& visit) {
 [[nodiscard]] auto parse_procedure(BytesView record) -> Procedure;
 [[nodiscard]] auto serialize_role(const Role& r) -> Bytes;
 [[nodiscard]] auto parse_role(BytesView record) -> Role;
+[[nodiscard]] auto serialize_type(const TypeObject& t) -> Bytes;
+[[nodiscard]] auto parse_type(BytesView record) -> TypeObject;
+[[nodiscard]] auto serialize_sequence(const Sequence& s) -> Bytes;
+[[nodiscard]] auto parse_sequence(BytesView record) -> Sequence;
 [[nodiscard]] auto serialize_acl(std::uint32_t object, const std::vector<AclEntry>& acl) -> Bytes;
 // The object id and its entries, checked sorted, one per (column, grantee),
 // each with a privilege and no grant option it lacks.
@@ -795,6 +854,9 @@ constexpr std::byte kSubProcedureName{0x06};
 constexpr std::byte kSubRole{0x07};
 constexpr std::byte kSubRoleName{0x08};
 constexpr std::byte kSubAcl{0x09};
+constexpr std::byte kSubType{0x0A};
+constexpr std::byte kSubTypeName{0x0B};
+constexpr std::byte kSubSequence{0x0C};
 constexpr std::byte kCounterNextId{0x01};
 constexpr std::byte kCounterVersion{0x02};
 constexpr std::uint8_t kKindTable = 1;
@@ -806,6 +868,10 @@ constexpr std::uint16_t kProcedureRecordFormat = 1;
 constexpr std::uint8_t kKindRole = 5;
 constexpr std::uint16_t kRoleRecordFormat = 1;
 constexpr std::uint16_t kAclRecordFormat = 1;
+constexpr std::uint8_t kKindSequence = 6;
+constexpr std::uint8_t kKindType = 7;
+constexpr std::uint16_t kTypeRecordFormat = 1;
+constexpr std::uint16_t kSequenceRecordFormat = 1;
 
 using DdlOp = Catalog::DdlOp;
 
@@ -1437,6 +1503,26 @@ auto role_name_key(std::string_view name) -> Bytes {
   return k;
 }
 
+auto type_record_key(std::uint32_t id) -> Bytes {
+  auto k = Bytes{std::byte{kNsCatalog}, kSubType};
+  auto idb = be_bytes(id, 4);
+  k.insert(k.end(), idb.begin(), idb.end());
+  return k;
+}
+
+auto type_name_key(std::string_view name) -> Bytes {
+  Bytes k{std::byte{kNsCatalog}, kSubTypeName};
+  for (auto c : name) k.push_back(static_cast<std::byte>(c));
+  return k;
+}
+
+auto sequence_record_key(std::uint32_t id) -> Bytes {
+  auto k = Bytes{std::byte{kNsCatalog}, kSubSequence};
+  auto idb = be_bytes(id, 4);
+  k.insert(k.end(), idb.begin(), idb.end());
+  return k;
+}
+
 auto acl_record_key(std::uint32_t object) -> Bytes {
   auto k = Bytes{std::byte{kNsCatalog}, kSubAcl};
   auto idb = be_bytes(object, 4);
@@ -1642,6 +1728,72 @@ auto parse_role(BytesView in) -> Role {
   return role;
 }
 
+// A type record: u16 format, u32 id, str name, u8 kind (1 shell, 2 domain),
+// and a domain's base type: u8 kind, u32 length, u8 precision, u8 scale.
+auto serialize_type(const TypeObject& t) -> Bytes {
+  RecordWriter w;
+  w.u16(kTypeRecordFormat);
+  w.u32(t.id);
+  w.str(t.name);
+  w.u8(static_cast<std::uint8_t>(t.kind));
+  if (t.kind == TypeObject::Kind::Domain) {
+    w.u8(static_cast<std::uint8_t>(t.base.kind));
+    w.u32(t.base.length);
+    w.u8(t.base.precision);
+    w.u8(t.base.scale);
+  }
+  return w.bytes();
+}
+
+auto parse_type(BytesView in) -> TypeObject {
+  RecordReader r{in};
+  auto format = r.u16();
+  if (format != kTypeRecordFormat) {
+    throw std::runtime_error("catalog type record format " + std::to_string(format) + " is not " +
+                             std::to_string(kTypeRecordFormat) + ": the database was written by a later SQL-layer build");
+  }
+  TypeObject t;
+  t.id = r.u32();
+  t.name = r.str();
+  auto kind = r.u8();
+  if (kind != 1 && kind != 2) corrupt("type " + t.name + " has an unknown kind");
+  t.kind = static_cast<TypeObject::Kind>(kind);
+  if (t.kind == TypeObject::Kind::Domain) {
+    t.base.kind = static_cast<SqlKind>(r.u8());
+    t.base.length = r.u32();
+    t.base.precision = r.u8();
+    t.base.scale = r.u8();
+    if (!sql_type_valid(t.base)) corrupt("domain " + t.name + " has an invalid type");
+  }
+  r.expect_end("record of type " + t.name);
+  if (t.name.empty()) corrupt("a type has no name");
+  return t;
+}
+
+// A sequence record: u16 format, u32 id, str name.
+auto serialize_sequence(const Sequence& s) -> Bytes {
+  RecordWriter w;
+  w.u16(kSequenceRecordFormat);
+  w.u32(s.id);
+  w.str(s.name);
+  return w.bytes();
+}
+
+auto parse_sequence(BytesView in) -> Sequence {
+  RecordReader r{in};
+  auto format = r.u16();
+  if (format != kSequenceRecordFormat) {
+    throw std::runtime_error("catalog sequence record format " + std::to_string(format) + " is not " +
+                             std::to_string(kSequenceRecordFormat) + ": the database was written by a later SQL-layer build");
+  }
+  Sequence s;
+  s.id = r.u32();
+  s.name = r.str();
+  r.expect_end("record of sequence " + s.name);
+  if (s.name.empty()) corrupt("a sequence has no name");
+  return s;
+}
+
 // An ACL record: u16 format, u32 object id, u32 n { u32 grantee, u32 column,
 // u16 privileges, u16 grant options, u32 grantor }.
 auto serialize_acl(std::uint32_t object, const std::vector<AclEntry>& acl) -> Bytes {
@@ -1676,8 +1828,9 @@ auto parse_acl(BytesView in) -> std::pair<std::uint32_t, std::vector<AclEntry>> 
     e.privileges = r.u16();
     e.grant_options = r.u16();
     e.grantor = r.u32();
-    auto allowed = e.column == kWholeObject ? privilege::kAll : privilege::kColumns;
-    if (e.privileges == 0 || (e.privileges & ~allowed) != 0 || (e.grant_options & ~e.privileges) != 0) {
+    // Which privileges the object takes is checked at load, by its kind.
+    if (e.privileges == 0 || (e.privileges & ~(privilege::kAll | privilege::kUsage)) != 0 ||
+        (e.grant_options & ~e.privileges) != 0) {
       corrupt("privileges of object " + std::to_string(object) + " hold an invalid entry");
     }
     if (!acl.empty() && std::tuple{acl.back().column, acl.back().grantee} >= std::tuple{e.column, e.grantee}) {
@@ -1931,6 +2084,24 @@ auto Catalog::load(const Snapshot& snap) -> Catalog {
     }
     cat.roles_.emplace(parsed.id, std::move(parsed));
   }
+  auto types = Bytes{std::byte{kNsCatalog}, kSubType};
+  for (const auto& e : snap.iter_from({}, types)) {
+    if (!has_prefix(e.key, types)) break;
+    auto parsed = parse_type(e.value);
+    if (e.key.size() != types.size() + 4 || be_value(e.key.subspan(types.size())) != parsed.id) {
+      corrupt("record of type " + parsed.name + " is under another id's key");
+    }
+    cat.types_.emplace(parsed.id, std::move(parsed));
+  }
+  auto sequences = Bytes{std::byte{kNsCatalog}, kSubSequence};
+  for (const auto& e : snap.iter_from({}, sequences)) {
+    if (!has_prefix(e.key, sequences)) break;
+    auto parsed = parse_sequence(e.value);
+    if (e.key.size() != sequences.size() + 4 || be_value(e.key.subspan(sequences.size())) != parsed.id) {
+      corrupt("record of sequence " + parsed.name + " is under another id's key");
+    }
+    cat.sequences_.emplace(parsed.id, std::move(parsed));
+  }
   auto acls = Bytes{std::byte{kNsCatalog}, kSubAcl};
   for (const auto& e : snap.iter_from({}, acls)) {
     if (!has_prefix(e.key, acls)) break;
@@ -1963,6 +2134,8 @@ auto Catalog::load(const Snapshot& snap) -> Catalog {
     }
   }
   objects += cat.views_.size();
+  for (const auto& [id, s] : cat.sequences_) use(id);
+  objects += cat.sequences_.size();
   std::size_t entries = 0;
   auto names = Bytes{std::byte{kNsCatalog}, kSubName};
   for (const auto& e : snap.iter_from({}, names)) {
@@ -1971,12 +2144,34 @@ auto Catalog::load(const Snapshot& snap) -> Catalog {
     auto it = cat.names_.find(name);
     auto kind = e.value.empty() ? 0 : std::to_integer<std::uint8_t>(e.value[0]);
     if (it == cat.names_.end() || e.value.size() != 5 || be_value(e.value.subspan(1)) != it->second ||
-        kind != (cat.tables_.contains(it->second) ? kKindTable : cat.views_.contains(it->second) ? kKindView : kKindIndex)) {
+        kind != (cat.tables_.contains(it->second)      ? kKindTable
+                 : cat.views_.contains(it->second)     ? kKindView
+                 : cat.sequences_.contains(it->second) ? kKindSequence
+                                                       : kKindIndex)) {
       corrupt("name entry " + name + " does not match the records");
     }
     ++entries;
   }
-  if (entries != objects || cat.names_.size() != objects) corrupt("a table, index or view has no name entry");
+  if (entries != objects || cat.names_.size() != objects) corrupt("a table, index, view or sequence has no name entry");
+  // The type namespace: each domain or shell type has its entry, and none
+  // shares a name with a table's or view's row type.
+  for (const auto& [id, t] : cat.types_) {
+    use(id);
+    if (cat.table(t.name) != nullptr || cat.view(t.name) != nullptr) corrupt("type " + t.name + " shares a relation's row type name");
+  }
+  std::size_t type_entries = 0;
+  auto type_names = Bytes{std::byte{kNsCatalog}, kSubTypeName};
+  for (const auto& e : snap.iter_from({}, type_names)) {
+    if (!has_prefix(e.key, type_names)) break;
+    auto name = as_string(e.key.subspan(type_names.size()));
+    auto it = cat.type_names_.find(name);
+    if (it == cat.type_names_.end() || e.value.size() != 5 || std::to_integer<std::uint8_t>(e.value[0]) != kKindType ||
+        be_value(e.value.subspan(1)) != it->second) {
+      corrupt("type name entry " + name + " does not match the records");
+    }
+    ++type_entries;
+  }
+  if (type_entries != cat.types_.size()) corrupt("a type has no name entry");
   for (const auto& [id, p] : cat.procedures_) use(id);
   std::size_t procedure_entries = 0;
   auto procedure_names = Bytes{std::byte{kNsCatalog}, kSubProcedureName};
@@ -2005,15 +2200,22 @@ auto Catalog::load(const Snapshot& snap) -> Catalog {
     ++role_entries;
   }
   if (role_entries != cat.roles_.size()) corrupt("a role has no name entry");
-  // Each ACL is of a table or view, its columns that object's, its grantees
-  // PUBLIC or a role, its grantor the bootstrap superuser or a role.
+  // Each ACL is of a table, view, sequence or type, its privileges that
+  // kind's, its columns a table's or view's, its grantees PUBLIC or a role,
+  // its grantor the bootstrap superuser or a role.
   for (const auto& [object, acl] : cat.acls_) {
     const auto* t = cat.table(object);
     const auto* v = cat.view(object);
-    if (t == nullptr && v == nullptr) corrupt("privileges of object " + std::to_string(object) + ", no table or view");
+    auto relation = t != nullptr || v != nullptr;
+    auto allowed = relation ? privilege::kAll : cat.sequences_.contains(object) ? privilege::kSequence : privilege::kType;
+    if (!relation && !cat.sequences_.contains(object) && !cat.types_.contains(object)) {
+      corrupt("privileges of object " + std::to_string(object) + ", no table, view, sequence or type");
+    }
     for (const auto& e : acl) {
-      auto column_ok = e.column == kWholeObject || (t != nullptr ? t->column(e.column) != nullptr && !t->column(e.column)->hidden
-                                                                  : e.column < v->columns.size());
+      auto bits_ok = (e.privileges & ~(e.column == kWholeObject ? allowed : privilege::kColumns)) == 0;
+      auto column_ok = bits_ok && (e.column == kWholeObject ||
+                                   (relation && (t != nullptr ? t->column(e.column) != nullptr && !t->column(e.column)->hidden
+                                                              : e.column < v->columns.size())));
       auto grantee_ok = e.grantee == kPublic || cat.roles_.contains(e.grantee);
       auto grantor_ok = e.grantor == kBootstrapRole || cat.roles_.contains(e.grantor);
       if (!column_ok || !grantee_ok || !grantor_ok) {
@@ -2033,6 +2235,8 @@ auto Catalog::clone() const -> Catalog {
   c.procedures_ = procedures_;
   c.roles_ = roles_;
   c.acls_ = acls_;
+  c.types_ = types_;
+  c.sequences_ = sequences_;
   c.rebuild_lookups();
   return c;
 }
@@ -2054,6 +2258,10 @@ void Catalog::rebuild_lookups() {
   for (const auto& [id, r] : roles_) {
     if (!role_names_.emplace(r.name, id).second) corrupt("role name " + r.name + " is used twice");
   }
+  type_names_.clear();
+  for (const auto& [id, t] : types_) {
+    if (!type_names_.emplace(t.name, id).second) corrupt("type name " + t.name + " is used twice");
+  }
   key_layouts_.clear();
   auto name_taken = [&](const std::string& n) {
     if (names_.contains(n)) corrupt("name " + n + " is used twice");
@@ -2061,6 +2269,10 @@ void Catalog::rebuild_lookups() {
   for (const auto& [id, v] : views_) {
     name_taken(v.name);
     names_[v.name] = id;
+  }
+  for (const auto& [id, s] : sequences_) {
+    name_taken(s.name);
+    names_[s.name] = id;
   }
   for (const auto& [id, t] : tables_) {
     name_taken(t.name);
@@ -2106,6 +2318,18 @@ auto Catalog::view(std::uint32_t id) const -> const View* {
 auto Catalog::procedure(std::string_view name) const -> const Procedure* {
   auto it = procedure_names_.find(name);
   return it == procedure_names_.end() ? nullptr : &procedures_.at(it->second);
+}
+
+auto Catalog::type(std::string_view name) const -> const TypeObject* {
+  auto it = type_names_.find(name);
+  return it == type_names_.end() ? nullptr : &types_.at(it->second);
+}
+
+auto Catalog::sequence(std::string_view name) const -> const Sequence* {
+  auto it = names_.find(name);
+  if (it == names_.end()) return nullptr;
+  auto s = sequences_.find(it->second);
+  return s == sequences_.end() ? nullptr : &s->second;
 }
 
 auto Catalog::role(std::string_view name) const -> const Role* {
@@ -2183,6 +2407,10 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   auto name_free = [&](const std::string& name) {
     if (names_.contains(name)) throw DdlRefused("relation \"" + name + "\" already exists", kDuplicateTable);
   };
+  // A table's or view's row type, a domain and a shell type share one namespace.
+  auto type_free = [&](const std::string& name) {
+    if (type_names_.contains(name)) throw DdlRefused("type \"" + name + "\" already exists", kDuplicateObject);
+  };
   auto find_table = [&](const std::string& name) -> const Table& {
     const auto* t = table(name);
     if (t == nullptr && view(name) != nullptr) throw DdlRefused("\"" + name + "\" is not a table", kWrongObjectType);
@@ -2239,6 +2467,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       unique.push_back(u);
     }
     name_free(name);
+    type_free(name);
     if (ct->columns.empty()) throw DdlRefused("a table needs columns", kFeatureNotSupported);
     Table t;
     t.name = name;
@@ -2362,6 +2591,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     if (found == nullptr) {
       if (view(dt->name) != nullptr) throw DdlRefused("\"" + std::string{dt->name} + "\" is not a table", kWrongObjectType);
       if (index(dt->name).first != nullptr) throw DdlRefused("\"" + std::string{dt->name} + "\" is an index", kWrongObjectType);
+      if (sequence(dt->name) != nullptr) throw DdlRefused("\"" + std::string{dt->name} + "\" is not a table", kWrongObjectType);
       if (dt->if_exists) return nullptr;
       throw DdlRefused("table \"" + std::string{dt->name} + "\" does not exist", kUndefinedTable);
     }
@@ -2389,7 +2619,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   if (const auto* di = std::get_if<DropIndexDdl>(&ddl)) {
     auto [owner, found] = index(di->name);
     if (found == nullptr) {
-      if (table(di->name) != nullptr || view(di->name) != nullptr) {
+      if (table(di->name) != nullptr || view(di->name) != nullptr || sequence(di->name) != nullptr) {
         throw DdlRefused("\"" + std::string{di->name} + "\" is not an index", kWrongObjectType);
       }
       if (di->if_exists) return nullptr;
@@ -2409,6 +2639,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
 
   if (const auto* cv = std::get_if<CreateViewDdl>(&ddl)) {
     name_free(cv->name);
+    type_free(cv->name);
     View v{0, cv->name, cv->definition, cv->depends_on, cv->columns};
     std::ranges::sort(v.depends_on);
     v.depends_on.erase(std::unique(v.depends_on.begin(), v.depends_on.end()), v.depends_on.end());
@@ -2428,7 +2659,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   if (const auto* dv = std::get_if<DropViewDdl>(&ddl)) {
     const auto* found = view(dv->name);
     if (found == nullptr) {
-      if (table(dv->name) != nullptr || index(dv->name).first != nullptr) {
+      if (table(dv->name) != nullptr || index(dv->name).first != nullptr || sequence(dv->name) != nullptr) {
         throw DdlRefused("\"" + dv->name + "\" is not a view", kWrongObjectType);
       }
       if (dv->if_exists) return nullptr;
@@ -2537,18 +2768,129 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     return finish();
   }
 
+  if (const auto* cd = std::get_if<CreateDomainDdl>(&ddl)) {
+    // A shell type of the name is filled in, as PostgreSQL's TypeCreate
+    // does: the domain takes its id, and so keeps what was granted on it.
+    const auto* shell = type(cd->name);
+    if ((shell != nullptr && shell->kind != TypeObject::Kind::Shell) || table(cd->name) != nullptr || view(cd->name) != nullptr) {
+      throw DdlRefused("type \"" + cd->name + "\" already exists", kDuplicateObject);
+    }
+    if (!sql_type_valid(cd->base)) throw DdlRefused("domain " + cd->name + " has an invalid type", kFeatureNotSupported);
+    TypeObject t{shell != nullptr ? shell->id : reserve_ids(next->next_id_, 1), cd->name, TypeObject::Kind::Domain, cd->base};
+    if (shell == nullptr) {
+      put_op(ops, DdlOp::Kind::EnsureAbsent, type_name_key(t.name));
+      put_op(ops, DdlOp::Kind::Put, type_name_key(t.name), name_value(kKindType, t.id));
+    }
+    put_op(ops, DdlOp::Kind::Put, type_record_key(t.id), serialize_type(t));
+    next->types_.insert_or_assign(t.id, std::move(t));
+    return finish();
+  }
+
+  if (const auto* cty = std::get_if<CreateTypeDdl>(&ddl)) {
+    if (type(cty->name) != nullptr || table(cty->name) != nullptr || view(cty->name) != nullptr) {
+      throw DdlRefused("type \"" + cty->name + "\" already exists", kDuplicateObject);
+    }
+    TypeObject t{reserve_ids(next->next_id_, 1), cty->name, TypeObject::Kind::Shell, {}};
+    put_op(ops, DdlOp::Kind::EnsureAbsent, type_name_key(t.name));
+    put_op(ops, DdlOp::Kind::Put, type_name_key(t.name), name_value(kKindType, t.id));
+    put_op(ops, DdlOp::Kind::Put, type_record_key(t.id), serialize_type(t));
+    next->types_.emplace(t.id, std::move(t));
+    return finish();
+  }
+
+  if (const auto* cs = std::get_if<CreateSequenceDdl>(&ddl)) {
+    if (names_.contains(cs->name)) {
+      if (cs->if_not_exists) return nullptr;
+      throw DdlRefused("relation \"" + cs->name + "\" already exists", kDuplicateTable);
+    }
+    Sequence s{reserve_ids(next->next_id_, 1), cs->name};
+    put_op(ops, DdlOp::Kind::EnsureAbsent, name_entry_key(s.name));
+    put_op(ops, DdlOp::Kind::Put, name_entry_key(s.name), name_value(kKindSequence, s.id));
+    put_op(ops, DdlOp::Kind::Put, sequence_record_key(s.id), serialize_sequence(s));
+    next->sequences_.emplace(s.id, std::move(s));
+    return finish();
+  }
+
+  if (const auto* dty = std::get_if<DropTypeDdl>(&ddl)) {
+    const auto* found = type(dty->name);
+    if (found == nullptr) {
+      if (table(dty->name) != nullptr || view(dty->name) != nullptr) {
+        if (dty->domain) throw DdlRefused("\"" + dty->name + "\" is not a domain", kWrongObjectType);
+        throw DdlRefused("cannot drop type " + dty->name + " because table or view " + dty->name + " requires it",
+                         kDependentObjectsStillExist);
+      }
+      if (dty->if_exists) return nullptr;
+      throw DdlRefused("type \"" + dty->name + "\" does not exist", kUndefinedObject);
+    }
+    if (dty->domain && found->kind != TypeObject::Kind::Domain) {
+      throw DdlRefused("\"" + dty->name + "\" is not a domain", kWrongObjectType);
+    }
+    put_op(ops, DdlOp::Kind::Del, type_record_key(found->id));
+    put_op(ops, DdlOp::Kind::Del, type_name_key(found->name));
+    if (acls_.contains(found->id)) put_op(ops, DdlOp::Kind::Del, acl_record_key(found->id));
+    next->acls_.erase(found->id);
+    next->types_.erase(found->id);
+    return finish();
+  }
+
+  if (const auto* ds = std::get_if<DropSequenceDdl>(&ddl)) {
+    const auto* found = sequence(ds->name);
+    if (found == nullptr) {
+      if (names_.contains(ds->name)) throw DdlRefused("\"" + ds->name + "\" is not a sequence", kWrongObjectType);
+      if (ds->if_exists) return nullptr;
+      throw DdlRefused("sequence \"" + ds->name + "\" does not exist", kUndefinedTable);
+    }
+    put_op(ops, DdlOp::Kind::Del, sequence_record_key(found->id));
+    put_op(ops, DdlOp::Kind::Del, name_entry_key(found->name));
+    if (acls_.contains(found->id)) put_op(ops, DdlOp::Kind::Del, acl_record_key(found->id));
+    next->acls_.erase(found->id);
+    next->sequences_.erase(found->id);
+    return finish();
+  }
+
   if (const auto* g = std::get_if<GrantDdl>(&ddl)) {
-    // The objects, a table or a view each.
+    using Target = GrantDdl::Target;
+    // The objects, of the kind ON names, in PostgreSQL's words when one is not.
     std::vector<std::uint32_t> objects;
     for (const auto& name : g->objects) {
-      if (const auto* t = table(name)) {
-        objects.push_back(t->id);
-      } else if (const auto* v = view(name)) {
-        objects.push_back(v->id);
-      } else if (index(name).first != nullptr) {
-        throw DdlRefused("\"" + name + "\" is an index", kWrongObjectType);
-      } else {
-        throw DdlRefused("relation \"" + name + "\" does not exist", kUndefinedTable);
+      switch (g->target) {
+        case Target::Table:
+          if (const auto* t = table(name)) {
+            objects.push_back(t->id);
+          } else if (const auto* v = view(name)) {
+            objects.push_back(v->id);
+          } else if (index(name).first != nullptr) {
+            throw DdlRefused("\"" + name + "\" is an index", kWrongObjectType);
+          } else if (sequence(name) != nullptr) {
+            throw DdlRefused("GRANT ON TABLE of sequence \"" + name + "\" is not supported: grant ON SEQUENCE",
+                             kFeatureNotSupported);
+          } else {
+            throw DdlRefused("relation \"" + name + "\" does not exist", kUndefinedTable);
+          }
+          break;
+        case Target::Sequence:
+          if (const auto* s = sequence(name)) {
+            objects.push_back(s->id);
+          } else if (names_.contains(name)) {
+            throw DdlRefused("\"" + name + "\" is not a sequence", kWrongObjectType);
+          } else {
+            throw DdlRefused("relation \"" + name + "\" does not exist", kUndefinedTable);
+          }
+          break;
+        case Target::Domain:
+        case Target::Type:
+          if (const auto* ty = type(name); ty != nullptr && ty->kind == TypeObject::Kind::Shell) {
+            throw DdlRefused("type \"" + name + "\" is only a shell", kUndefinedObject);  // nothing may use one
+          } else if (ty != nullptr) {
+            objects.push_back(ty->id);
+          } else if (g->target == Target::Domain && (table(name) != nullptr || view(name) != nullptr)) {
+            throw DdlRefused("\"" + name + "\" is not a domain", kWrongObjectType);
+          } else if (table(name) != nullptr || view(name) != nullptr) {
+            throw DdlRefused("GRANT ON TYPE of a table's or view's row type is not supported", kFeatureNotSupported);
+          } else {
+            throw DdlRefused("type \"" + name + "\" does not exist", kUndefinedObject);
+          }
+          break;
       }
     }
     auto role_id = [&](const std::string& name) {
@@ -2568,13 +2910,26 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       (void)role_id(*g->grantor);
       throw DdlRefused("grantor must be current user", kFeatureNotSupported);
     }
-    // The privileges: on the whole object, and per column name.
-    auto bit = [](const std::string& name, bool column) -> std::uint16_t {
+    // The privileges: on the whole object, and per column name, each one the
+    // object's kind takes (0LP01 otherwise, as an unrecognized one is 42601).
+    auto [kind_name, allowed] = [&]() -> std::pair<std::string, std::uint16_t> {
+      switch (g->target) {
+        case Target::Table: return {"table", privilege::kAll};
+        case Target::Sequence: return {"sequence", privilege::kSequence};
+        case Target::Domain: return {"domain", privilege::kType};
+        case Target::Type: return {"type", privilege::kType};
+      }
+      return {"table", privilege::kAll};
+    }();
+    auto bit = [&](const std::string& name, bool column) -> std::uint16_t {
       using namespace privilege;
-      static constexpr std::array<std::pair<std::string_view, std::uint16_t>, 8> kNames{
-          {{"select", kSelect}, {"insert", kInsert}, {"update", kUpdate}, {"delete", kDelete},
-           {"truncate", kTruncate}, {"references", kReferences}, {"trigger", kTrigger}, {"maintain", kMaintain}}};
-      if (name == "all") return column ? kColumns : kAll;
+      static constexpr std::array<std::pair<std::string_view, std::uint16_t>, 9> kNames{
+          {{"select", kSelect}, {"insert", kInsert}, {"update", kUpdate}, {"delete", kDelete}, {"truncate", kTruncate},
+           {"references", kReferences}, {"trigger", kTrigger}, {"maintain", kMaintain}, {"usage", kUsage}}};
+      if (column && g->target != Target::Table) {
+        throw DdlRefused("column privileges are only valid for relations", kInvalidGrantOperation);
+      }
+      if (name == "all") return column ? kColumns : allowed;
       auto upper = [&] {
         std::string u;
         for (auto c : name) u.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
@@ -2582,20 +2937,23 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       };
       for (const auto& [n, b] : kNames) {
         if (n != name) continue;
-        if (column && (b & kColumns) == 0) throw DdlRefused("invalid privilege type " + upper() + " for column", kInvalidGrantOperation);
+        if ((b & (column ? kColumns : allowed)) == 0) {
+          throw DdlRefused("invalid privilege type " + upper() + " for " + (column ? "column" : kind_name),
+                           kInvalidGrantOperation);
+        }
         return b;
       }
-      static constexpr std::array<std::string_view, 8> kOtherObjects{"usage", "execute", "create", "connect",
-                                                                     "temporary", "temp", "set", "alter system"};
+      static constexpr std::array<std::string_view, 7> kOtherObjects{"execute", "create", "connect", "temporary",
+                                                                     "temp", "set", "alter system"};
       if (std::ranges::find(kOtherObjects, name) != kOtherObjects.end()) {
-        throw DdlRefused("invalid privilege type " + upper() + " for " + (column ? "column" : "table"),
+        throw DdlRefused("invalid privilege type " + upper() + " for " + (column ? "column" : kind_name),
                          kInvalidGrantOperation);
       }
       throw DdlRefused("unrecognized privilege type \"" + name + "\"", kSyntaxError);
     };
     std::uint16_t whole = 0;
     std::vector<std::pair<std::string, std::uint16_t>> by_column;
-    if (g->privileges.empty()) whole = privilege::kAll;
+    if (g->privileges.empty()) whole = allowed;
     for (const auto& p : g->privileges) {
       if (p.columns.empty()) {
         whole |= bit(p.name, false);
@@ -2643,7 +3001,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
           for (const auto& [c, b] : columns) give(entry(c, grantee), b);
         } else {
           for (auto& e : acl) {
-            if (e.grantee == grantee) take(e, whole & (e.column == kWholeObject ? privilege::kAll : privilege::kColumns));
+            if (e.grantee == grantee) take(e, whole & (e.column == kWholeObject ? allowed : privilege::kColumns));
           }
           for (const auto& [c, b] : columns) {
             for (auto& e : acl) {

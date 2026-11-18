@@ -80,12 +80,10 @@ e152_01_01_02  # ISOLATION LEVEL SERIALIZABLE: transactions run at snapshot isol
 f031_03_03_09  # not PostgreSQL: `GRANT UNDER ON TABLE_F031_03_03_09 TO ROLE_F031_03_03_09`; PostgreSQL 17 gives 42601, "unrecognized privilege type "under""
 f031_03_04_01  # not PostgreSQL: `GRANT EXECUTE ON TABLE_F031_03_04_01 TO ROLE_F031_03_04_01`; PostgreSQL 17 gives 42P01, "relation "table_f031_03_04_01" does not exist"
 f031_03_04_02  # not PostgreSQL: `GRANT USAGE ON TABLE_F031_03_04_02 TO ROLE_F031_03_04_02`; PostgreSQL 17 gives 42P01, "relation "table_f031_03_04_02" does not exist"
-f031_03_06_01  # CREATE DOMAIN: domains are not built
 f031_03_07_01  # not PostgreSQL: `CREATE COLLATION COLLATION1 FROM 'de_DE'`; PostgreSQL 17 gives 42601, "syntax error at or near "'de_DE'""
 f031_03_08_01  # not PostgreSQL: `CREATE CHARACTER SET CHARACTERSET1`; PostgreSQL 17 gives 42601, "syntax error at or near "CHARACTER""
 f031_03_09_01  # not PostgreSQL: `CREATE TRANSLATION TRANSLATION1`; PostgreSQL 17 gives 42601, "syntax error at or near "TRANSLATION""
 f031_03_10_01  # not PostgreSQL: `GRANT ALL PRIVILEGES ON TYPE TYPE1 TO ROLE_F031_03_10_01`; PostgreSQL 17 gives 42704, "type "type1" is only a shell"
-f031_03_11_01  # CREATE SEQUENCE: sequences are not built
 f031_03_12_01  # not PostgreSQL: `GRANT ALL PRIVILEGES ON CONSTRUCTOR METHOD BAR FOR BAZ TO ROLE_F031_03_12_01`; PostgreSQL 17 gives 42601, "syntax error at or near "METHOD""
 f031_03_12_02  # not PostgreSQL: `GRANT ALL PRIVILEGES ON CONSTRUCTOR METHOD BAR TO ROLE_F031_03_12_02`; PostgreSQL 17 gives 42601, "syntax error at or near "METHOD""
 f031_03_12_03  # not PostgreSQL: `GRANT ALL PRIVILEGES ON FUNCTION BAR FOR BAZ TO ROLE_F031_03_12_03`; PostgreSQL 17 gives 42601, "syntax error at or near "FOR""
@@ -112,12 +110,10 @@ f031_19_01_04  # not PostgreSQL: `REVOKE SELECT ON TABLE_F031_19_01_04 FROM ROLE
 f031_19_02_02  # not PostgreSQL: `REVOKE EXECUTE ON TABLE_F031_19_02_02 FROM ROLE_F031_19_02_02`; PostgreSQL 17 gives 0LP01, "invalid privilege type EXECUTE for relation"
 f031_19_02_10  # not PostgreSQL: `REVOKE UNDER ON TABLE_F031_19_02_10 FROM ROLE_F031_19_02_10`; PostgreSQL 17 gives 42601, "unrecognized privilege type "under""
 f031_19_02_13  # not PostgreSQL: `REVOKE USAGE ON TABLE_F031_19_02_13 FROM ROLE_F031_19_02_13`; PostgreSQL 17 gives 0LP01, "invalid privilege type USAGE for table"
-f031_19_04_01  # CREATE DOMAIN: domains are not built
 f031_19_05_01  # not PostgreSQL: `CREATE COLLATION COLLATION1 FROM 'de_DE'`; PostgreSQL 17 gives 42601, "syntax error at or near "'de_DE'""
 f031_19_06_01  # not PostgreSQL: `CREATE CHARACTER SET CHARACTERSET1`; PostgreSQL 17 gives 42601, "syntax error at or near "CHARACTER""
 f031_19_07_01  # not PostgreSQL: `CREATE TRANSLATION TRANSLATION1`; PostgreSQL 17 gives 42601, "syntax error at or near "TRANSLATION""
 f031_19_08_01  # not PostgreSQL: `REVOKE ALL PRIVILEGES ON TYPE TYPE1 FROM ROLE_F031_19_08_01`; PostgreSQL 17 gives 42704, "type "type1" is only a shell"
-f031_19_09_01  # CREATE SEQUENCE: sequences are not built
 f031_19_10_01  # not PostgreSQL: `REVOKE ALL PRIVILEGES ON CONSTRUCTOR METHOD BAR FOR BAZ FROM ROLE_F031_19_10_01`; PostgreSQL 17 gives 42601, "syntax error at or near "METHOD""
 f031_19_10_02  # not PostgreSQL: `REVOKE ALL PRIVILEGES ON CONSTRUCTOR METHOD BAR FROM ROLE_F031_19_10_02`; PostgreSQL 17 gives 42601, "syntax error at or near "METHOD""
 f031_19_10_03  # not PostgreSQL: `REVOKE ALL PRIVILEGES ON FUNCTION BAR FOR BAZ FROM ROLE_F031_19_10_03`; PostgreSQL 17 gives 42601, "syntax error at or near "FOR""
@@ -159,6 +155,5 @@ f311_04_01_02  # CREATE SCHEMA, and a view in it: schemas are not built (#713)
 f311_04_01_03  # CREATE SCHEMA, and a view in it: schemas are not built (#713)
 f311_05_01_01  # CREATE SCHEMA: schemas are not built (#713)
 f311_05_01_02  # CREATE SCHEMA: schemas are not built (#713)
-s011_01_01  # CREATE TYPE with no definition makes a shell type in PostgreSQL, which nothing can use: not built
 s011_01_02  # not PostgreSQL: CREATE TYPE name AS <data type> (PostgreSQL has CREATE DOMAIN); PostgreSQL 17 gives 42601, "syntax error at or near "INT""
 s011_02_01  # not PostgreSQL: CREATE TYPE name AS <data type> (PostgreSQL has CREATE DOMAIN); PostgreSQL 17 gives 42601, "syntax error at or near "INT""

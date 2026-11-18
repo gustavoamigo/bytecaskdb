@@ -174,7 +174,8 @@ TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql]
   CHECK(rejected_at("SELECT id FROM t WHERE id ILIKE $1") >= 0);
   CHECK(rejected_at("SELEC id FROM t") == 0);                   // PostgreSQL's own syntax error
   CHECK(rejected_at("SELECT id FROM t; SELECT id FROM t") == -1);
-  CHECK(rejected_at("DROP SEQUENCE s") == 0);
+  CHECK(rejected_at("DROP SEQUENCE s CASCADE") == 0);
+  CHECK(std::get<DropTypeOrSequence>(parse("DROP SEQUENCE IF EXISTS s")).if_exists);
   CHECK(rejected_at("DROP TABLE t CASCADE") == 0);
   CHECK(rejected_at("ALTER TABLE t DROP COLUMN x") == 0);
   CHECK_THROWS_AS(parse("CREATE INDEX u ON t (name NULLS LAST)"), SqlError);
