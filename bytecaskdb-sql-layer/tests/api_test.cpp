@@ -2183,6 +2183,37 @@ TEST_CASE("embedded API: a narrow integer key compared with a wider subquery's v
         std::string::npos);
 }
 
+TEST_CASE("embedded API: a $n only a subquery names is one of the statement's parameters", "[sql][api][subquery]") {
+  sql_test::TempDir dir{"api_sub_param"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE t0 (c0 BIGINT NOT NULL, c1 BIGINT NOT NULL, PRIMARY KEY (c0))");
+  auto ids = [&](std::string_view sql, std::vector<Value> params) {
+    std::vector<std::int64_t> out;
+    for (const auto& r : db->execute(sql, std::move(params)).rows) out.push_back(std::get<std::int64_t>(r[0]));
+    return out;
+  };
+  using V = std::vector<std::int64_t>;
+  const auto* only_sub = "SELECT c0 FROM t0 WHERE c0 IN (SELECT c0 FROM t0 WHERE c0 = $1) ORDER BY c0";
+  // Each $n takes its own slot, never one of the constants' after it.
+  CHECK(ids(only_sub, {i(0)}).empty());
+  for (const auto* row : {"(0, 10)", "(1, 20)", "(2, 10)", "(3, 30)"}) {
+    (void)db->execute(std::string{"INSERT INTO t0 VALUES "} + row);
+  }
+  CHECK(ids(only_sub, {i(0)}) == V{0});
+  CHECK(ids(only_sub, {i(9)}).empty());
+  // A constant beside the $n in the subquery's WHERE.
+  const auto* with_const = "SELECT c0 FROM t0 WHERE c0 IN (SELECT c0 FROM t0 WHERE c1 = 10 AND c0 > $1) ORDER BY c0";
+  CHECK(ids(with_const, {i(0)}) == V{2});
+  CHECK(ids(with_const, {i(2)}).empty());
+  // A $n in the outer WHERE too, numbered before and after the subquery's.
+  CHECK(ids("SELECT c0 FROM t0 WHERE c0 > $1 AND c0 IN (SELECT c0 FROM t0 WHERE c1 = $2) ORDER BY c0", {i(0), i(10)}) ==
+        V{2});
+  CHECK(ids("SELECT c0 FROM t0 WHERE c0 IN (SELECT c0 FROM t0 WHERE c1 = $2) AND c0 < $1 ORDER BY c0", {i(3), i(10)}) ==
+        V{0, 2});
+  CHECK(ids("SELECT c0 FROM t0 WHERE c1 = (SELECT c1 FROM t0 WHERE c0 = $1) AND c0 <> 5 ORDER BY c0", {i(2)}) == V{0, 2});
+  CHECK(ids("SELECT c0 FROM t0 WHERE c1 = (SELECT c1 FROM t0 WHERE c0 = $1) AND c0 <> 5 ORDER BY c0", {i(7)}).empty());
+}
+
 TEST_CASE("embedded API: CASE, COALESCE and NULLIF over columns, parameters and subqueries", "[sql][api]") {
   sql_test::TempDir dir{"api_case_columns"};
   auto db = Database::open(dir.path());

@@ -135,6 +135,10 @@ constexpr std::uint32_t kNoCursor = UINT32_MAX;
 constexpr std::uint32_t kNoStep = UINT32_MAX;
 // A pinned view's handle: its index in the pinned views, with this bit set.
 constexpr std::uint32_t kPinnedView = 1u << 31;
+// A view of a parameter a subquery or bc_sub_arg_* set: its ViewEntry's
+// cursor is the parameter's index with this bit, and its step the
+// parameter's generation, so a rewrite of the parameter makes it stale.
+constexpr std::uint32_t kParamOwner = 1u << 31;
 // The arena grows in chunks of this size, or one chunk per copy larger than
 // it.
 constexpr std::size_t kArenaChunk = 64u << 10;
@@ -982,6 +986,7 @@ struct bc_ctx {
     std::uint32_t owner;
     Loop loop;
     Mark mark;
+    std::uint64_t id;  // drawn by next_gen: a step that replaces another at its depth is told apart
   };
   std::vector<Step> steps;
   std::vector<Effect> effects;
@@ -1065,8 +1070,8 @@ struct bc_ctx {
 
   // A subquery's rows while it runs, bc_sub_begin to bc_sub_end: folded
   // here, never a result row. Then what the subqueries left until reset:
-  // the parameters they set, by index, over the caller's NULLs, and each
-  // BC_SUB_SET's values, encoded by sub_key.
+  // the parameters they and bc_sub_arg_* set, by index, over the caller's
+  // NULLs, and each BC_SUB_SET's values, encoded by sub_key.
   struct Sub {
     std::uint32_t id{0};
     std::int32_t kind{BC_SUB_VALUE};
@@ -1077,10 +1082,29 @@ struct bc_ctx {
     bool saw_null{false};
     Datum value;                   // BC_SUB_VALUE: its row's
     std::optional<Datum> lo, hi;   // BC_SUB_BOUNDS: the non-NULL extremes
+    // Where the handle tables and the blocking structures stood at
+    // bc_sub_begin: bc_sub_end releases what the run made after. `steps` is
+    // the loop depth then, and `top` the id of the innermost step (0: none),
+    // so a loop outside the subquery that moved inside it is seen.
+    Mark mark{};
+    std::size_t steps{0}, aggs{0}, sorters{0}, hashes{0};
+    std::uint64_t top{0};
   };
   std::optional<Sub> sub;
-  std::vector<std::optional<Datum>> sub_params;  // sized once, so a parameter's address is stable
-  std::map<std::uint32_t, std::set<Bytes, BytesLess>> sub_sets;
+  // A parameter a subquery or bc_sub_arg_* set: its value, the generation
+  // its views carry (a new one per write, so a view of the old value goes
+  // stale), and what its bytes are charged.
+  struct SubParam {
+    std::optional<Datum> value;
+    std::uint64_t gen{0};
+    std::uint64_t held{0};
+  };
+  std::vector<SubParam> sub_params;  // sized once, to the caller's parameters
+  struct SubSet {
+    std::set<Bytes, BytesLess> values;
+    std::uint64_t held{0};  // what its values are charged, released when its id runs again
+  };
+  std::map<std::uint32_t, SubSet> sub_sets;
 
   bc_ctx(bytecask::DB* d, LiveCatalog* l) : db{d}, live{l} {}
 
@@ -1282,7 +1306,13 @@ struct bc_ctx {
       return nullptr;
     }
     const auto& e = *found;
-    if (e.cursor != kNoCursor && (e.cursor >= cursors.size() || cursors[e.cursor].step != e.step)) {
+    if (e.cursor != kNoCursor && (e.cursor & kParamOwner) != 0) {
+      auto i = e.cursor & ~kParamOwner;
+      if (i >= sub_params.size() || sub_params[i].gen != e.step) {
+        fail(BC_E_HANDLE, "view read after its parameter was set again");
+        return nullptr;
+      }
+    } else if (e.cursor != kNoCursor && (e.cursor >= cursors.size() || cursors[e.cursor].step != e.step)) {
       fail(BC_E_HANDLE, "view read after its cursor moved");
       return nullptr;
     }
@@ -1328,7 +1358,7 @@ struct bc_ctx {
       fail(BC_E_HANDLE, "parameter index out of range");
       return nullptr;
     }
-    if (i < sub_params.size() && sub_params[i]) return &*sub_params[i];  // a subquery's
+    if (i < sub_params.size() && sub_params[i].value) return &*sub_params[i].value;  // a subquery's
     return &params->values[i];
   }
 
@@ -1470,7 +1500,7 @@ struct bc_ctx {
   // Starts a step of the loop `owner` drives: what is allocated from here
   // is the step's.
   void begin_step(std::uint32_t owner, Loop loop, std::uint32_t& scope) {
-    steps.push_back({owner, loop, mark()});
+    steps.push_back({owner, loop, mark(), next_gen()});
     scope = static_cast<std::uint32_t>(steps.size() - 1);
   }
 
@@ -3507,6 +3537,11 @@ bc_view bc_param_bytes(bc_ctx* cx, uint32_t i) {
   BC_GUARD_BEGIN
   const auto* v = cx->param_as<Bytes>(i, "bytes");
   if (v == nullptr) return {};
+  // A parameter a subquery or bc_sub_arg_* set can be set again: its view
+  // carries the generation it read, and goes stale with it.
+  if (i < cx->sub_params.size() && cx->sub_params[i].value) {
+    return cx->make_view(v->data(), v->size(), kParamOwner | i, cx->sub_params[i].gen);
+  }
   return cx->make_view(v->data(), v->size());
   BC_GUARD_END(cx)
   return {};
@@ -3590,6 +3625,8 @@ void emit_decoded(bc_ctx* cx, const std::optional<T>& v, bool corrupt, bool has_
 }  // extern "C++"
 
 // ---------------------------------------------------------------- subqueries
+
+static auto group_bytes(const bc_ctx::Agg& a, std::size_t key_bytes) -> std::uint64_t;
 
 extern "C++" {
 namespace {
@@ -3679,8 +3716,10 @@ void end_sub_row(bc_ctx* cx) {
       }
       auto& set = cx->sub_sets[s.id];
       auto k = sub_key(v);
-      if (set.contains(k) || !cx->take(k.size() + kHashEntryBytes)) return;
-      set.insert(std::move(k));
+      auto bytes = k.size() + kHashEntryBytes;
+      if (set.values.contains(k) || !cx->take(bytes)) return;
+      set.values.insert(std::move(k));
+      set.held += bytes;
       return;
     }
     default: cx->fail(BC_L_PLAN, "unknown subquery kind");
@@ -3701,8 +3740,59 @@ auto sub_has(bc_ctx* cx, std::uint32_t sub, const Datum& v) -> bool {
     cx->fail(BC_E_HANDLE, "no BC_SUB_SET subquery " + std::to_string(sub) + " has run");
     return false;
   }
-  return it->second.contains(sub_key(v));
+  return it->second.values.contains(sub_key(v));
 }
+
+// Whether parameters [i, i + n) are all ones the caller passed as NULL: the
+// only ones a plan may set, so it never overwrites a value it was given.
+auto caller_null(const bc_ctx* cx, std::uint32_t i, std::uint32_t n) -> bool {
+  if (cx->params == nullptr || std::uint64_t{i} + n > cx->params->values.size()) return false;
+  for (auto j = i; j < i + n; ++j)
+    if (!std::holds_alternative<std::monostate>(cx->params->values[j])) return false;
+  return true;
+}
+
+// Sets parameter i, one the caller passed as NULL, for the rest of the plan
+// to read: its bytes charged, and a new generation, so a view of the old
+// value is stale. False, and the error, past the budget.
+[[nodiscard]] auto set_sub_param(bc_ctx* cx, std::uint32_t i, Datum d) -> bool {
+  if (cx->sub_params.empty()) cx->sub_params.resize(cx->params->values.size());
+  auto& p = cx->sub_params[i];
+  const auto* b = std::get_if<Bytes>(&d);
+  if (!cx->rehold(p.held, b == nullptr ? 0 : b->size())) return false;
+  p.value = std::move(d);
+  p.gen = cx->next_gen();
+  return true;
+}
+
+// What a sorter, a hash table and an aggregate are charged, as their opens
+// and adds take it: released when a subquery that opened them ends.
+auto held_bytes(const Sorter& s) -> std::uint64_t {
+  std::uint64_t n = kSorterBytes;
+  for (const auto& e : s.entries) n += e.data.size() + kSortEntryBytes;
+  return n;
+}
+auto held_bytes(const Hash& h) -> std::uint64_t {
+  std::uint64_t n = kHashBytes;
+  for (const auto& e : h.entries) n += e.payload.size() + kHashEntryBytes;
+  for (const auto& [key, chain] : h.index) n += key.size();
+  return n;
+}
+auto held_bytes(const bc_ctx::Agg& a) -> std::uint64_t {
+  std::uint64_t n = kAggBytes + std::uint64_t{a.slots} * sizeof(SlotKind);
+  for (const auto& [key, i] : a.index) n += group_bytes(a, key.size());
+  return n;
+}
+
+// Drops the structures of `v` past its first n, and releases their charge.
+template <typename T>
+void truncate_held(bc_ctx* cx, std::vector<T>& v, std::size_t n) noexcept {
+  std::uint64_t released = 0;
+  for (auto i = n; i < v.size(); ++i) released += held_bytes(v[i]);
+  v.erase(v.begin() + static_cast<std::ptrdiff_t>(n), v.end());
+  cx->release(released);
+}
+
 }  // namespace
 }  // extern "C++"
 
@@ -3710,14 +3800,32 @@ void bc_sub_begin(bc_ctx* cx, uint32_t sub, int32_t kind, int32_t type, uint32_t
   BC_GUARD_BEGIN
   if (!cx->ok()) return;
   auto t = type > 0 && type < 256 ? phys_type(static_cast<std::uint8_t>(type)) : std::nullopt;
-  if (cx->sub || cx->emit || !t || kind < BC_SUB_VALUE || kind > BC_SUB_SET || cx->params == nullptr ||
-      std::uint64_t{param} + sub_params_of(kind) > cx->params->values.size() || cx->sub_sets.contains(sub)) {
-    cx->fail(BC_E_HANDLE, "bc_sub_begin: a subquery running, a row begun, an unknown kind or type, its "
-                          "parameters past the given ones, or its id run before");
+  if (cx->sub || cx->emit || !t || kind < BC_SUB_VALUE || kind > BC_SUB_SET ||
+      !caller_null(cx, param, sub_params_of(kind))) {
+    cx->fail(BC_E_HANDLE, "bc_sub_begin: a subquery running, a row begun, an unknown kind or type, or its "
+                          "parameters past the given ones or ones the caller gave");
     return;
   }
   std::array<PhysType, 1> types{*t};
-  cx->sub.emplace(bc_ctx::Sub{sub, kind, *t, param, bytecask::sql::make_result_layout(types)});
+  bc_ctx::Sub s;
+  s.id = sub;
+  s.kind = kind;
+  s.type = *t;
+  s.param = param;
+  s.layout = bytecask::sql::make_result_layout(types);
+  s.mark = cx->mark();
+  s.steps = cx->steps.size();
+  s.top = cx->steps.empty() ? 0 : cx->steps.back().id;
+  s.aggs = cx->aggs.size();
+  s.sorters = cx->sorters.size();
+  s.hashes = cx->hashes.size();
+  // A run again, with new arguments: its set starts empty, and what the
+  // last run's set held is released.
+  if (auto it = cx->sub_sets.find(sub); it != cx->sub_sets.end()) {
+    cx->release(it->second.held);
+    cx->sub_sets.erase(it);
+  }
+  cx->sub.emplace(std::move(s));
   if (kind == BC_SUB_SET) cx->sub_sets[sub];  // run, so bc_sub_has_* knows it
   BC_GUARD_END(cx)
 }
@@ -3731,22 +3839,30 @@ void bc_sub_end(bc_ctx* cx) {
   }
   auto s = std::move(*cx->sub);
   cx->sub.reset();
-  if (cx->sub_params.empty()) cx->sub_params.resize(cx->params->values.size());
-  auto set = [&](std::uint32_t i, Datum d) { cx->sub_params[s.param + i] = std::move(d); };
+  // What the run made goes, its sorters, hash tables and aggregates with
+  // its handles, so a subquery run once per outer row holds one run's
+  // worth. Its loops' steps end first. A loop outside it that moved inside
+  // it already released what the run made after that loop's step began.
+  auto outer_moved = cx->steps.size() < s.steps || (s.steps != 0 && cx->steps[s.steps - 1].id != s.top);
+  if (outer_moved) {
+    cx->fail(BC_E_HANDLE, "bc_sub_end: a loop outside the subquery moved inside it");
+    return;
+  }
+  if (cx->steps.size() > s.steps) cx->end_steps_from(static_cast<std::uint32_t>(s.steps));
+  cx->roll_back(s.mark);
+  truncate_held(cx, cx->aggs, s.aggs);
+  truncate_held(cx, cx->sorters, s.sorters);
+  truncate_held(cx, cx->hashes, s.hashes);
+  auto set = [&](std::uint32_t i, Datum d) { return set_sub_param(cx, s.param + i, std::move(d)); };
   auto flag = [&] { return s.saw_null ? Datum{} : Datum{false}; };
   switch (s.kind) {
-    case BC_SUB_VALUE: set(0, std::move(s.value)); break;
-    case BC_SUB_EXISTS: set(0, s.rows > 0); break;
+    case BC_SUB_VALUE: (void)set(0, std::move(s.value)); break;
+    case BC_SUB_EXISTS: (void)set(0, s.rows > 0); break;
     case BC_SUB_BOUNDS:
-      set(0, s.hi ? std::move(*s.hi) : Datum{});
-      set(1, s.lo ? std::move(*s.lo) : Datum{});
-      set(2, flag());
-      set(3, s.rows > 0);
+      (void)(set(0, s.hi ? std::move(*s.hi) : Datum{}) && set(1, s.lo ? std::move(*s.lo) : Datum{}) &&
+             set(2, flag()) && set(3, s.rows > 0));
       break;
-    case BC_SUB_SET:
-      set(0, flag());
-      set(1, s.rows > 0);
-      break;
+    case BC_SUB_SET: (void)(set(0, flag()) && set(1, s.rows > 0)); break;
     default: break;
   }
   BC_GUARD_END(cx)
@@ -3780,6 +3896,55 @@ bool bc_sub_has_bytes(bc_ctx* cx, uint32_t sub, bc_view v) {
   return sub_has(cx, sub, Datum{Bytes(b->begin(), b->end())});
   BC_GUARD_END(cx)
   return {};
+}
+
+extern "C++" {
+namespace {
+// An argument of a subquery's next run: parameter i, which the caller must
+// have passed as NULL, so a plan never overwrites a value it was given.
+void sub_arg(bc_ctx* cx, std::uint32_t i, Datum d) {
+  if (!cx->ok()) return;
+  if (!caller_null(cx, i, 1)) {
+    cx->fail(BC_E_HANDLE, "bc_sub_arg: parameter $" + std::to_string(i + 1) +
+                              " is past the given ones or one the caller gave");
+    return;
+  }
+  (void)set_sub_param(cx, i, std::move(d));
+}
+}  // namespace
+}  // extern "C++"
+
+void bc_sub_arg_null(bc_ctx* cx, uint32_t i) {
+  BC_GUARD_BEGIN
+  sub_arg(cx, i, Datum{});
+  BC_GUARD_END(cx)
+}
+
+void bc_sub_arg_i64(bc_ctx* cx, uint32_t i, int64_t v) {
+  BC_GUARD_BEGIN
+  sub_arg(cx, i, Datum{v});
+  BC_GUARD_END(cx)
+}
+
+void bc_sub_arg_f64(bc_ctx* cx, uint32_t i, double v) {
+  BC_GUARD_BEGIN
+  sub_arg(cx, i, Datum{v});
+  BC_GUARD_END(cx)
+}
+
+void bc_sub_arg_bool(bc_ctx* cx, uint32_t i, bool v) {
+  BC_GUARD_BEGIN
+  sub_arg(cx, i, Datum{v});
+  BC_GUARD_END(cx)
+}
+
+// The bytes are copied before the parameter is set: `v` may be a view of it.
+void bc_sub_arg_bytes(bc_ctx* cx, uint32_t i, bc_view v) {
+  BC_GUARD_BEGIN
+  auto b = cx->resolve(v);
+  if (!b) return;
+  sub_arg(cx, i, Datum{Bytes(b->begin(), b->end())});
+  BC_GUARD_END(cx)
 }
 
 void bc_emit_i64(bc_ctx* cx, int64_t v) {
