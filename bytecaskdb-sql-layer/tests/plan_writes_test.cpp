@@ -585,6 +585,21 @@ void update_two_to_one_b(bc_ctx* cx) {
     bc_update(cx, kW, old, bc_row_end(cx, r));
   }
 }
+// The row at key $1 moved to $2, then the row at $3 to $4: as the snapshot
+// holds them, as an UPDATE's scan reads them.
+void move_two(bc_ctx* cx) {
+  for (std::uint32_t at : {0U, 2U}) {
+    bool found = false;
+    bc_view old = bc_get(cx, bc_key_params(cx, kW, at, 1), &found);
+    if (!found) {
+      bc_raise(cx, BC_C_CHECK, kW);  // a test plan's missing row: not a duplicate
+      return;
+    }
+    bc_row r = bc_row_from(cx, kW, old);
+    bc_row_set_param(cx, r, kId, at + 1);
+    bc_update(cx, kW, old, bc_row_end(cx, r));
+  }
+}
 // A row's key moved away, then inserted again in the same plan.
 void move_then_insert(bc_ctx* cx) {
   bool found = false;
@@ -651,9 +666,7 @@ TEST_CASE("plan writes: a second write of one row in one plan is refused", "[sql
   CHECK(g_runs == 2);  // insert_w twice, in the one run
   CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);
   CHECK(bc_error_detail(f.cx) == unique_on(kW));
-  // A key the plan moved away is no duplicate, but a second write of it.
-  CHECK(run(f, move_then_insert, {std::int64_t{1}, std::int64_t{5}, std::int64_t{0}}) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+
   // A range delete is a write of every row in its range.
   CHECK(run(f, insert_then_del_range, {std::int64_t{2}, std::int64_t{2}, bytes("y"), std::int64_t{0}}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
@@ -674,6 +687,34 @@ TEST_CASE("plan writes: a second write of one row in one plan is refused", "[sql
   CHECK(run(f, del_range_then_insert_outside,
             {std::int64_t{9}, std::int64_t{9}, bytes("z"), std::int64_t{0}, std::int64_t{5}}) == BC_COMMITTED);
   CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 1);
+  check_indexes_exact(f);
+}
+
+TEST_CASE("plan writes: a key one plan vacated takes a new row, and one it filled is a duplicate", "[sql][algebra][writes]") {
+  // UPDATE … SET id = id - 1 as PostgreSQL's row-by-row unique check runs it:
+  // a row moves into the key an earlier row of the statement moved out of.
+  Fixture f;
+  create_w(f);
+  REQUIRE(run(f, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("x"), std::int64_t{0}}) == BC_COMMITTED);
+  CHECK(run(f, move_then_insert, {std::int64_t{1}, std::int64_t{5}, std::int64_t{0}}) == BC_COMMITTED);
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 2);
+  check_indexes_exact(f);
+  // Back: the row at 5 moves to 7, and the one at 1 into the 5 it left.
+  CHECK(run(f, move_two, {std::int64_t{5}, std::int64_t{7}, std::int64_t{1}, std::int64_t{5}}) == BC_COMMITTED);
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 2);
+  check_indexes_exact(f);
+  // A key the plan moved a row into is a duplicate for the next, never retried.
+  g_runs = 0;
+  CHECK(run(f, move_two, {std::int64_t{5}, std::int64_t{9}, std::int64_t{7}, std::int64_t{9}}, {}, 3) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);
+  CHECK(bc_error_detail(f.cx) == unique_on(kW));
+  // A key a row not yet moved still holds is a duplicate too.
+  CHECK(run(f, move_two, {std::int64_t{5}, std::int64_t{7}, std::int64_t{7}, std::int64_t{9}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);
+  // A row moved twice is a second write of it.
+  CHECK(run(f, move_two, {std::int64_t{5}, std::int64_t{9}, std::int64_t{5}, std::int64_t{11}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 2);
   check_indexes_exact(f);
 }
 

@@ -2612,13 +2612,20 @@ auto write_row(bc_ctx* cx, const Table& t, bc_view row, bool stored) -> std::opt
 // Records a row key this statement writes, and whether the row is there
 // after the write (`present`). One statement affects a row at most once, so
 // a second write of it, or a write into a range it deleted, is a wrong plan
-// (BC_E_HANDLE), with one exception: an insert over a row the statement
-// already put there is a duplicate key, as INSERT … VALUES (1, …), (1, …)
-// is, and raises BC_C_UNIQUE. The keys and the deleted ranges are sorted:
-// a lookup each per write.
+// (BC_E_HANDLE), with two exceptions for `insert`, a write that puts a new
+// row at the key (an INSERT, or an UPDATE moving a row's primary key): over
+// a row the statement already put there it is a duplicate key, as INSERT …
+// VALUES (1, …), (1, …) is, and raises BC_C_UNIQUE; into a key the statement
+// vacated (an UPDATE moved its row away) it takes the key, as PostgreSQL's
+// row-by-row unique check lets UPDATE t SET id = id - 1 do. The keys and the
+// deleted ranges are sorted: a lookup each per write.
 [[nodiscard]] auto first_write(bc_ctx* cx, const Table& t, BytesView pk, bool present, bool insert = false) -> bool {
   if (auto it = cx->written_rows.find(pk); it != cx->written_rows.end()) {
-    if (insert && it->second) {
+    if (insert && !it->second) {
+      it->second = true;
+      return true;
+    }
+    if (insert) {
       cx->raise(BC_C_UNIQUE, t.id);
     } else {
       cx->fail(BC_E_HANDLE, "a row of table " + t.name + " written twice in one statement");
@@ -2632,6 +2639,14 @@ auto write_row(bc_ctx* cx, const Table& t, bc_view row, bool stored) -> std::opt
   if (!cx->take(buffer_bytes(pk.size()) + kWrittenRowNodeBytes)) return false;
   cx->written_rows.emplace(Bytes(pk.begin(), pk.end()), present);
   return true;
+}
+
+// Whether this statement vacated row key `pk` (moved or deleted its row). It
+// is then free whatever the view holds: the vacating write is in this plan,
+// and the engine checks it for a change since the snapshot.
+[[nodiscard]] auto vacated_here(const bc_ctx* cx, BytesView pk) -> bool {
+  auto it = cx->written_rows.find(pk);
+  return it != cx->written_rows.end() && !it->second;
 }
 
 [[nodiscard]] auto encode_pk(bc_ctx* cx, const Table& t, BytesView row, Bytes& out) -> bool {
@@ -5425,12 +5440,14 @@ void bc_insert(bc_ctx* cx, uint32_t table, bc_view row) {
   auto r = write_row(cx, *t, row, false);
   if (!r) return;
   Bytes pk;
-  if (!encode_pk(cx, *t, *r, pk) || !first_write(cx, *t, pk, true, true)) return;
+  if (!encode_pk(cx, *t, *r, pk)) return;
+  auto vacated = vacated_here(cx, pk);
+  if (!first_write(cx, *t, pk, true, true)) return;
   std::vector<Entry> entries(t->indexes.size());
   for (std::size_t i = 0; i < t->indexes.size(); ++i) {
     if (!encode_entry(cx, *t, t->indexes[i], *r, entries[i])) return;
   }
-  if (!pk_free(cx, *t, pk)) return;
+  if (!vacated && !pk_free(cx, *t, pk)) return;
   for (std::size_t i = 0; i < t->indexes.size(); ++i) {
     // Nulls are distinct: an entry with a null part collides with nothing.
     if (t->indexes[i].unique && !entries[i].has_null && !unique_free(cx, t->indexes[i], entries[i])) return;
@@ -5459,7 +5476,8 @@ void bc_update(bc_ctx* cx, uint32_t table, bc_view old, bc_view row) {
     if (!encode_pk(cx, *t, *n, pk_new)) return;
     moved_pk = pk_old != pk_new;
   }
-  if (!first_write(cx, *t, pk_old, !moved_pk) || (moved_pk && !first_write(cx, *t, pk_new, true))) return;
+  auto vacated = moved_pk && vacated_here(cx, pk_new);
+  if (!first_write(cx, *t, pk_old, !moved_pk) || (moved_pk && !first_write(cx, *t, pk_new, true, true))) return;
   // Only the entries whose keys changed move; with the primary key, all do.
   // An index none of whose columns changed is not encoded.
   struct Move {
@@ -5474,7 +5492,7 @@ void bc_update(bc_ctx* cx, uint32_t table, bc_view old, bc_view row) {
     if (!encode_entry(cx, *t, ix, *o, m.from) || !encode_entry(cx, *t, ix, *n, m.to)) return;
     if (m.from.key != m.to.key) moves.push_back(std::move(m));
   }
-  if (moved_pk && !pk_free(cx, *t, pk_new)) return;
+  if (moved_pk && !vacated && !pk_free(cx, *t, pk_new)) return;
   for (const auto& m : moves) {
     // A row never collides with itself: checked only when the prefix changed.
     if (m.ix->unique && !m.to.has_null && !std::ranges::equal(m.from.prefix(), m.to.prefix()) &&
