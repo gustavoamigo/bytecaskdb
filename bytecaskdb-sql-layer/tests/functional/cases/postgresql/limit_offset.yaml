@@ -53,7 +53,6 @@
 
 - name: OFFSET skips rows before LIMIT counts
   features: [pg:limit-offset]
-  unimplemented: true
   ordered: true
   setup:
     - CREATE TABLE lo2 (id INTEGER PRIMARY KEY, v INTEGER)
@@ -81,3 +80,76 @@
       expected: []
   teardown:
     - DROP TABLE lo2
+
+- name: OFFSET in every query shape
+  features: [pg:limit-offset]
+  setup:
+    - CREATE TABLE lo3 (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)
+    - CREATE TABLE lo4 (id INTEGER PRIMARY KEY, w INTEGER)
+    - INSERT INTO lo3 VALUES (1, 1, 10)
+    - INSERT INTO lo3 VALUES (2, 2, 20)
+    - INSERT INTO lo3 VALUES (3, 0, 30)
+    - INSERT INTO lo3 VALUES (4, 1, 40)
+    - INSERT INTO lo3 VALUES (5, 2, 50)
+    - INSERT INTO lo4 VALUES (1, 100)
+    - INSERT INTO lo4 VALUES (2, 200)
+    - INSERT INTO lo4 VALUES (3, 300)
+  steps:
+    - sql: SELECT id FROM lo3 ORDER BY v DESC LIMIT 2 OFFSET 1
+      expected: [[4], [3]]
+      ordered: true
+    - sql: SELECT id FROM lo3 ORDER BY id OFFSET NULL LIMIT 1
+      expected: [[1]]
+      ordered: true
+    # A query of one aggregate row has none past OFFSET 1.
+    - sql: SELECT count(*) FROM lo3 OFFSET 1
+      expected: []
+    - sql: SELECT min(v) FROM lo3 OFFSET 1
+      expected: []
+    - sql: SELECT g, count(*) FROM lo3 GROUP BY g ORDER BY g OFFSET 1
+      expected: [[1, 2], [2, 2]]
+      ordered: true
+    - sql: SELECT DISTINCT g FROM lo3 ORDER BY g OFFSET 2
+      expected: [[2]]
+      ordered: true
+    - sql: SELECT lo3.id, w FROM lo3 JOIN lo4 ON lo3.id = lo4.id ORDER BY lo3.id LIMIT 1 OFFSET 1
+      expected: [[2, 200]]
+    - sql: SELECT (SELECT id FROM lo4 ORDER BY id LIMIT 1 OFFSET 2)
+      expected: [[3]]
+    - sql: SELECT id FROM lo3 WHERE EXISTS (SELECT 1 FROM lo4 ORDER BY id OFFSET 3)
+      expected: []
+    - sql: SELECT id FROM lo3 WHERE id IN (SELECT id FROM lo4 ORDER BY id OFFSET 1)
+      expected: [[2], [3]]
+    - sql: SELECT 1 OFFSET 1
+      expected: []
+    - sql: SELECT id FROM lo3 ORDER BY id OFFSET -1
+      error: "2201X"
+    - sql: SELECT id FROM lo3 ORDER BY id LIMIT -1
+      error: "2201W"
+  teardown:
+    - DROP TABLE lo3
+    - DROP TABLE lo4
+
+- name: a cursor reads past OFFSET in both directions
+  features: [pg:limit-offset, E121-01]
+  setup:
+    - CREATE TABLE lo5 (id INTEGER PRIMARY KEY)
+    - INSERT INTO lo5 VALUES (1)
+    - INSERT INTO lo5 VALUES (2)
+    - INSERT INTO lo5 VALUES (3)
+    - INSERT INTO lo5 VALUES (4)
+  steps:
+    - sql: BEGIN
+    - sql: DECLARE c SCROLL CURSOR FOR SELECT id FROM lo5 ORDER BY id OFFSET 1
+    - sql: FETCH 2 FROM c
+      expected: [[2], [3]]
+      ordered: true
+    - sql: FETCH PRIOR FROM c
+      expected: [[2]]
+    - sql: FETCH ALL FROM c
+      expected: [[3], [4]]
+      ordered: true
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE lo5

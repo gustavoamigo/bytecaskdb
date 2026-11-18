@@ -182,7 +182,9 @@ TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql]
   CHECK(rejected_at("SELECT min(qty + $2) FROM t WHERE id = $1") == 7);
   CHECK(rejected_at("SELECT sum(DISTINCT qty + 1) FROM t WHERE id = $1") == 7);
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 LIMIT $2"), SqlError);
-  CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 OFFSET 1"), SqlError);
+  CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 OFFSET $2"), SqlError);
+  CHECK(rejected_at("SELECT id FROM t WHERE id = $1 OFFSET -1") == 38);
+  CHECK_THROWS_AS(parse("SELECT id FROM t UNION SELECT id FROM t OFFSET 1"), SqlError);
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 ORDER BY qty + $2"), SqlError);
 }
 
@@ -249,6 +251,10 @@ TEST_CASE("parser: COUNT, ORDER BY, LIMIT and column + parameter", "[sql][parser
   CHECK_FALSE(std::get<Select>(parse("SELECT id FROM t WHERE id = $1 LIMIT ALL")).limit);
   CHECK_FALSE(std::get<Select>(parse("SELECT id FROM t WHERE id = $1 LIMIT NULL")).limit);
   CHECK(std::get<Select>(parse("SELECT id FROM t WHERE id = $1 LIMIT 10000000000")).limit == 10000000000);
+  // OFFSET: a count of rows skipped, 0 for none or NULL.
+  CHECK(std::get<Select>(parse("SELECT id FROM t WHERE id = $1 LIMIT 2 OFFSET 5")).offset == 5);
+  CHECK(std::get<Select>(parse("SELECT id FROM t WHERE id = $1 OFFSET NULL")).offset == 0);
+  CHECK(std::get<Select>(parse("SELECT id FROM t WHERE id = $1")).offset == 0);
   auto u = std::get<Update>(parse("UPDATE t SET qty = qty + $2 WHERE id = $1"));
   CHECK(u.set[0].value.kind == Expr::Kind::Add);
 }

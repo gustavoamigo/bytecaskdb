@@ -555,7 +555,7 @@ output.
 | UPDATE or DELETE of many rows | `Update`, `Delete` over a `Scan` | the scan, with `bc_update` / `bc_delete` per row; `bc_emit_count` with the rows written |
 | `ORDER BY` an access path gives | none | the search picks a path in that order |
 | Any other `ORDER BY` | `Sort` | `bc_sorter_*` (*Sorts*) |
-| `LIMIT` | `Limit` | an `int64_t` counter in the loop's condition, so the cursor never steps past the limit |
+| `LIMIT` | `Limit` | an `int64_t` counter in the loop's condition, so the cursor never steps past the limit. Under `OFFSET o`, `LIMIT l` is `Limit` n = o + l (every row without a `LIMIT`) with offset o: what is below sees n, and the loop passes on a row only once the counter reaches o. A one-row aggregate under an offset emits nothing; a plan with an offset is never resumed, which would skip its rows again |
 | `COUNT(*)`, `COUNT(col NOT NULL)`, no residual | `CountRange` | `bc_count_range` over the access path's range |
 | `COUNT`, `SUM` otherwise | `Aggregate` | an accumulator local, `bc_add`; a "seen" `bool` for SUM's NULL. Over at most one row no accumulator: its input's misses are the condition its row is emitted under |
 | `COUNT(DISTINCT col)`, one row | `Aggregate` | `bc_agg_group` keyed by the column, then a count of `bc_agg_next` |
@@ -603,8 +603,8 @@ over `bc_sorter_*`, and compared with the plans in the order.
   covering scan's entry is `bc_sort_key_<type>` of `bc_key_part_<type>`,
   `bc_sort_key_null` where the entry's part is NULL; never a `DOUBLE`,
   which the key does not hold exactly.
-- `ORDER BY … LIMIT n` opens the sorter with `keep = n`, and its loop keeps
-  the `LIMIT`'s counter. `LIMIT 0` needs no order and sorts nothing.
+- `ORDER BY … LIMIT n` opens the sorter with `keep = n` (`OFFSET`'s rows
+  included), and its loop keeps the `LIMIT`'s counter. `LIMIT 0` needs no order and sorts nothing.
 - A sorter holds one view per row, so there is a sorter per loop of the
   plan whose row is read above the sort, by the result or by a lookup by key
   repeated there, each holding that loop's table's row, all fed the same

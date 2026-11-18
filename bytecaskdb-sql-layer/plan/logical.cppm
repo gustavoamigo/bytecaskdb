@@ -17,6 +17,7 @@
 
 module;
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -238,10 +239,16 @@ struct Sort {
   std::vector<SortKey> keys;
 };
 
-// The first n rows.
+// Every row: a Limit of an OFFSET without a LIMIT.
+inline constexpr std::int64_t kAllRows = std::numeric_limits<std::int64_t>::max();
+
+// The first n rows, less the first `offset` of them (LIMIT l OFFSET o is n =
+// o + l, offset o): n bounds what the rows below must give, and only what
+// emits them drops the offset's.
 struct Limit {
   NodePtr input;
   std::int64_t n{0};
+  std::int64_t offset{0};
 };
 
 // One row of VALUES: per table column, in column order, its value, or

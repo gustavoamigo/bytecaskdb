@@ -712,7 +712,8 @@ void read_rows(Candidate& c, const std::vector<std::size_t>& rels) {
 
 // A SELECT's result rows over its source, or one aggregate row.
 struct SelectParts {
-  std::optional<std::int64_t> limit;
+  std::optional<std::int64_t> limit;  // n, the rows a Limit passes, its offset's included
+  std::int64_t offset{0};
   const logical::Project* project{nullptr};
   const logical::Aggregate* aggregate{nullptr};
   const logical::Sort* sort{nullptr};
@@ -720,11 +721,22 @@ struct SelectParts {
   const logical::Node* source{nullptr};  // Filter? -> Get, a Join of them, or Empty
 };
 
+// What a top-n sorter under a LIMIT keeps: the rows the Limit passes, its
+// OFFSET's included; every row (0) without a LIMIT.
+auto kept(std::optional<std::int64_t> limit) -> std::int64_t {
+  return limit && *limit != logical::kAllRows ? *limit : 0;
+}
+
+// Whether a query of one aggregate row emits it: not under LIMIT 0, nor past
+// an OFFSET.
+auto emits_one(const SelectParts& s) -> bool { return (!s.limit || *s.limit > 0) && s.offset == 0; }
+
 auto select_parts(const logical::Node& root) -> SelectParts {
   SelectParts s;
   const auto* n = &root;
   if (const auto* l = std::get_if<logical::Limit>(&n->op)) {
     s.limit = l->n;
+    s.offset = l->offset;
     n = l->input.get();
   }
   if (const auto* p = std::get_if<logical::Project>(&n->op)) {
@@ -2196,8 +2208,7 @@ private:
     auto leaf = physical::node(physical::Empty{});
     std::vector<Finished> out;
     if (s.aggregate != nullptr) {
-      auto emits = !s.limit || *s.limit > 0;
-      out.push_back({physical::node(physical::Aggregate{std::move(leaf), s.aggregate->aggs[0].expr, emits}), {}, {}, 0});
+      out.push_back({physical::node(physical::Aggregate{std::move(leaf), s.aggregate->aggs[0].expr, emits_one(s)}), {}, {}, 0});
       return out;
     }
     out.push_back({emit(s, std::move(leaf), emit_targets(s)), {}, {}, 0});
@@ -2247,7 +2258,7 @@ private:
   // Emit, under LIMIT.
   static auto emit(const SelectParts& s, physical::NodePtr rows, std::vector<physical::EmitTarget> targets)
       -> physical::NodePtr {
-    if (s.limit) rows = physical::node(physical::Limit{std::move(rows), *s.limit});
+    if (s.limit) rows = physical::node(physical::Limit{std::move(rows), *s.limit, s.offset});
     return physical::node(physical::Emit{std::move(rows), std::move(targets)});
   }
 
@@ -2281,7 +2292,7 @@ private:
       for (const auto& k : s.sort->keys) order_by.push_back({k.expr.col, k.desc, k.nulls_first});
     }
     const auto ordered = ordered_items(q, order_by);
-    SortSpec sort{{}, s.limit.value_or(0)};
+    SortSpec sort{{}, kept(s.limit)};
     for (const auto& o : ordered) sort.keys.push_back({o.col, o.desc, o.nulls_first});
     const auto* agg = s.aggregate != nullptr ? &s.aggregate->aggs[0].expr : nullptr;
     auto for_update = std::ranges::any_of(q.rels, [](const Rel& r) { return r.get->for_update; });
@@ -2302,7 +2313,7 @@ private:
       q.above.insert(q.above.end(), read_above.begin(), read_above.end());
     }
     auto searched = candidates(q, ordered, used, !for_update && !distinct, sorting);
-    auto emits = !s.limit || *s.limit > 0;
+    auto emits = emits_one(s);
     const auto sink = agg == nullptr ? Sink{s.limit} : Sink{std::nullopt, distinct};
     const auto* order = sorting ? &sort : nullptr;
     const auto hashes = std::ranges::any_of(searched.plans, [](const Candidate& c) { return c.hash() != nullptr; });
@@ -2346,6 +2357,7 @@ private:
   // Sort? -> Filter? (its HAVING) -> Aggregate -> its source.
   struct GroupParts {
     std::optional<std::int64_t> limit;
+    std::int64_t offset{0};
     const logical::Sort* sort{nullptr};
     const logical::Filter* having{nullptr};
     const logical::Aggregate* aggregate{nullptr};
@@ -2379,6 +2391,7 @@ private:
     const auto* n = &root;
     if (const auto* l = std::get_if<logical::Limit>(&n->op)) {
       g.limit = l->n;
+      g.offset = l->offset;
       n = l->input.get();
     }
     if (const auto* o = std::get_if<logical::Sort>(&n->op)) {
@@ -2503,7 +2516,7 @@ private:
       return n;
     };
     auto rooted = [&](physical::NodePtr rows) {
-      if (g.limit) rows = physical::node(physical::Limit{std::move(rows), *g.limit});
+      if (g.limit) rows = physical::node(physical::Limit{std::move(rows), *g.limit, g.offset});
       return physical::node(physical::GroupEmit{std::move(rows), outputs});
     };
     std::vector<Finished> out;
@@ -2530,7 +2543,7 @@ private:
       }
     }
     const auto ordered = ordered_items(q, order_by);
-    SortSpec sort{{}, g.limit.value_or(0)};
+    SortSpec sort{{}, kept(g.limit)};
     for (const auto& o : ordered) sort.keys.push_back({o.col, o.desc, o.nulls_first});
     // The keys the WHERE does not make constant, which a stream's rows come
     // grouped by, and which number the groups. With no GROUP BY, no
@@ -2562,7 +2575,7 @@ private:
     // after its range: answered from the keys.
     if (keys.empty() && having.empty()) {
       for (const auto& c : searched.plans) {
-        if (auto f = from_keys(q, c, outputs, !g.limit || *g.limit > 0)) out.push_back(std::move(*f));
+        if (auto f = from_keys(q, c, outputs, (!g.limit || *g.limit > 0) && g.offset == 0)) out.push_back(std::move(*f));
       }
     }
     const auto hashes = std::ranges::any_of(searched.plans, [](const Candidate& c) { return c.hash() != nullptr; });

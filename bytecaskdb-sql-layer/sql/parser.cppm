@@ -889,22 +889,30 @@ auto create_view(const PgQuery__ViewStmt* s, std::int32_t pos) -> CreateView {
   return CreateView{std::move(name), std::move(columns), select(s->query->select_stmt, pos), pos};
 }
 
-// LIMIT: an integer constant, or ALL or NULL (no limit). A negative one is
-// refused, as PostgreSQL refuses it (2201W).
-auto limit(const PgQuery__SelectStmt* s) -> std::optional<std::int64_t> {
-  if (s->limit_option == PG_QUERY__LIMIT_OPTION__LIMIT_OPTION_WITH_TIES) reject("FETCH … WITH TIES is not supported", -1);
-  const auto* n = s->limit_count;
+// LIMIT's or OFFSET's count: an integer constant, or NULL (none), as is
+// LIMIT ALL. A negative one is refused, as PostgreSQL refuses it (2201W for
+// LIMIT, 2201X for OFFSET).
+auto row_count(const PgQuery__Node* n, const char* clause, SqlState negative) -> std::optional<std::int64_t> {
   if (n == nullptr) return std::nullopt;
-  if (n->node_case != PG_QUERY__NODE__NODE_A_CONST) reject("LIMIT takes an integer constant", -1);
+  if (n->node_case != PG_QUERY__NODE__NODE_A_CONST) reject(std::string{clause} + " takes an integer constant", -1);
   auto l = literal(n);
   if (l.kind == Literal::Kind::Null) return std::nullopt;
   std::int64_t v = 0;
   auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
   if (l.kind != Literal::Kind::Integer || ec != std::errc{} || end != l.text.data() + l.text.size()) {
-    reject("LIMIT takes an integer constant", l.pos);
+    reject(std::string{clause} + " takes an integer constant", l.pos);
   }
-  if (v < 0) reject("LIMIT must not be negative", l.pos);
+  if (v < 0) reject(std::string{clause} + " must not be negative", l.pos, negative);
   return v;
+}
+
+auto limit(const PgQuery__SelectStmt* s) -> std::optional<std::int64_t> {
+  if (s->limit_option == PG_QUERY__LIMIT_OPTION__LIMIT_OPTION_WITH_TIES) reject("FETCH … WITH TIES is not supported", -1);
+  return row_count(s->limit_count, "LIMIT", kInvalidRowCountInLimit);
+}
+
+auto offset(const PgQuery__SelectStmt* s) -> std::int64_t {
+  return row_count(s->limit_offset, "OFFSET", kInvalidRowCountInOffset).value_or(0);
 }
 
 // Table aliases: a qualifier naming an alias is rewritten to its table, and
@@ -1053,7 +1061,8 @@ auto order_items(const PgQuery__SelectStmt* s, std::int32_t pos) -> std::vector<
 // SELECT is; a parenthesised one keeps its ORDER BY and LIMIT.
 auto set_operation(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   if (s->larg == nullptr || s->rarg == nullptr) reject("a set operation needs two queries", pos);
-  if (s->limit_offset != nullptr || s->with_clause != nullptr) reject("SELECT clause not supported", pos);
+  if (s->with_clause != nullptr) reject("SELECT clause not supported", pos);
+  if (s->limit_offset != nullptr) reject("OFFSET of a set operation is not supported yet", pos);
   if (s->n_locking_clause != 0) {
     reject("FOR UPDATE is not allowed with UNION/INTERSECT/EXCEPT", pos, kFeatureNotSupported);
   }
@@ -1139,13 +1148,14 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   auto distinct = s->n_distinct_clause == 1 &&
                   (s->distinct_clause[0] == nullptr || s->distinct_clause[0]->node_case == PG_QUERY__NODE__NODE__NOT_SET);
   if (s->n_distinct_clause != 0 && !distinct) reject("DISTINCT ON is not supported", pos);
-  if (s->group_distinct || s->limit_offset != nullptr || s->n_locking_clause > 1 || s->with_clause != nullptr ||
+  if (s->group_distinct || s->n_locking_clause > 1 || s->with_clause != nullptr ||
       s->n_window_clause != 0 || s->into_clause != nullptr) {
     reject("SELECT clause not supported", pos);
   }
   Select sel;
   sel.from = std::move(items);
   sel.limit = limit(s);
+  sel.offset = offset(s);
   sel.pos = pos;
   sel.distinct = distinct;
   if (s->n_locking_clause == 1) {

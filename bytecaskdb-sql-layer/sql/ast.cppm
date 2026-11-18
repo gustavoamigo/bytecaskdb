@@ -296,6 +296,7 @@ struct Select {
   std::vector<Compare> where;
   std::vector<OrderItem> order_by;
   std::optional<std::int64_t> limit;  // nullopt: none, LIMIT ALL or LIMIT NULL
+  std::int64_t offset{0};             // OFFSET n: the rows skipped before LIMIT counts
   std::int32_t pos{-1};
   bool for_update{false};  // FOR UPDATE: a guard on each row returned, never a lock
   std::vector<Expr> group_by;  // GROUP BY's columns, as written
@@ -344,6 +345,7 @@ struct SetOperation {
   for (const auto& c : s.where) out.where.push_back(clone(c));
   out.order_by = s.order_by;
   out.limit = s.limit;
+  out.offset = s.offset;
   out.pos = s.pos;
   out.for_update = s.for_update;
   for (const auto& e : s.group_by) out.group_by.push_back(clone(e));

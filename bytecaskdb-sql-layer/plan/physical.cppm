@@ -243,10 +243,12 @@ struct Sort {
   bool groups{false};
 };
 
-// The first n rows of Emit's input.
+// The first n rows of Emit's input, less the first `offset` of them, as
+// logical::Limit.
 struct Limit {
   NodePtr input;
   std::int64_t n{0};
+  std::int64_t offset{0};
 };
 
 // A result column that is a parameter, the same in every row: a constant
@@ -1252,6 +1254,7 @@ private:
             if (parent == nullptr || (!std::holds_alternative<Emit>(parent->op) && !std::holds_alternative<GroupEmit>(parent->op))) {
               broken("a LIMIT not under the rows emitted");
             }
+            if (op.offset < 0 || op.offset > op.n) broken("a LIMIT whose OFFSET is negative or past it");
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Emit>) {
             for (const auto& t : op.targets) {

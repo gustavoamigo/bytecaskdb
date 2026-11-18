@@ -1881,8 +1881,13 @@ public:
     SqlType type{SqlKind::Boolean};
     std::string name = "?column?";
     if (kind == K::Exists) {
-      const auto* l = std::get_if<logical::Limit>(&root->op);
-      if (l == nullptr || l->n > 1) root = logical::node(logical::Limit{std::move(root), 1});
+      // EXISTS needs one row: past the OFFSET, if there is one.
+      auto* l = std::get_if<logical::Limit>(&root->op);
+      if (l == nullptr) {
+        root = logical::node(logical::Limit{std::move(root), 1});
+      } else if (l->n - l->offset > 1) {
+        l->n = l->offset + 1;
+      }
     } else {
       const auto& outs = outputs_of(*root);
       if (outs.size() != 1) throw SqlError{"subquery must return only one column", pos};
@@ -3313,6 +3318,16 @@ public:
   // or of a table whose primary key is (42803): PostgreSQL's functional
   // dependency, so it is the same in every row of a group, read from any
   // one (Aggregate::dependent), and the GROUP BY stays as written.
+  // LIMIT and OFFSET over a query's rows: a Limit passing its first n rows
+  // and dropping the first `offset` of them, n the two counts' sum, or every
+  // row without a LIMIT (logical::kAllRows).
+  static auto limited(logical::NodePtr rows, const ast::Select& s) -> logical::NodePtr {
+    if (!s.limit && s.offset == 0) return rows;
+    auto n = logical::kAllRows;
+    if (s.limit && __builtin_add_overflow(*s.limit, s.offset, &n)) n = logical::kAllRows;
+    return logical::node(logical::Limit{std::move(rows), n, s.offset});
+  }
+
   auto select(const ast::Select& s) -> logical::NodePtr {
     if (s.set) return set_operation(s);
     if (s.from.empty()) return select_without_from(s);
@@ -3493,7 +3508,7 @@ public:
       if (!keys.empty()) rows = logical::node(logical::Sort{std::move(rows), std::move(keys)});
       rows = logical::node(logical::Project{std::move(rows), std::move(targets)});
     }
-    if (s.limit) rows = logical::node(logical::Limit{std::move(rows), *s.limit});
+    rows = limited(std::move(rows), s);
     for (std::size_t k = 1; k < n; ++k) {
       if (outer[k]) nullable_above_join(*rows, rels[k]->id);
     }
@@ -3580,6 +3595,7 @@ public:
       return arm;
     }
     if (q.for_update) throw SqlError{"FOR UPDATE is not allowed with UNION/INTERSECT/EXCEPT", q.pos, kFeatureNotSupported};
+    if (q.offset != 0) not_yet("OFFSET in an arm of a set operation", q.pos);
     Arm arm;
     arm.node = select(q);
     const logical::Node* n = arm.node.get();
@@ -3749,7 +3765,7 @@ public:
     }
     named(s.targets, targets);
     auto rows = logical::node(logical::Project{logical::node(logical::OneRow{}), std::move(targets)});
-    if (s.limit) rows = logical::node(logical::Limit{std::move(rows), *s.limit});
+    rows = limited(std::move(rows), s);
     return rows;
   }
 
@@ -4254,7 +4270,7 @@ private:
     const auto& name = s.from[0].table;
     if (view.set) not_yet("reading a view defined with a set operation", s.from[0].pos);
     auto grouped = aggregated(view);
-    if (view.distinct || view.limit) not_yet("a view defined with DISTINCT or LIMIT", s.from[0].pos);
+    if (view.distinct || view.limit || view.offset != 0) not_yet("a view defined with DISTINCT, LIMIT or OFFSET", s.from[0].pos);
     if (view.for_update) not_yet("a view defined FOR UPDATE", s.from[0].pos);
     auto again = aggregated(s) || s.distinct;
     std::vector<ast::Expr> targets;
@@ -4407,7 +4423,7 @@ private:
     for (const auto& side : sides) {
       if (side.view == nullptr) continue;
       const auto& v = side.view->select;
-      if (v.from.size() != 1 || aggregated(v) || v.distinct || v.limit || v.for_update) {
+      if (v.from.size() != 1 || aggregated(v) || v.distinct || v.limit || v.offset != 0 || v.for_update) {
         not_yet("a join of view \"" + side.name + "\", which is not a plain SELECT of one table", join.pos);
       }
       if (outer && !v.where.empty()) not_yet("an outer join of view \"" + side.name + "\", which has a WHERE", join.pos);
