@@ -2523,8 +2523,9 @@ private:
   // CHECK constraints the row is first tested: each is evaluated over the
   // row as written, and one that is false (not NULL) raises 23514 before
   // anything is written, so a refused row leaves no index entry.
-  void write_checked(std::uint32_t table, const std::vector<Expr>& checks, const std::string& call) {
-    if (checks.empty()) {
+  // With `keep` the row stays in hand as `nr` after it is written, for RETURNING.
+  void write_checked(std::uint32_t table, const std::vector<Expr>& checks, const std::string& call, bool keep = false) {
+    if (checks.empty() && !keep) {
       w_.line(call + "bc_row_end(cx, r));");
       return;
     }
@@ -2551,7 +2552,8 @@ private:
       for (const auto& [col, e] : row) {
         w_.line("bc_row_set_param(cx, r, " + w_.col(col) + ", " + std::to_string(e.param) + ");");
       }
-      write_checked(s.table, s.checks, "bc_insert(cx, " + w_.tbl(s.table) + ", ");
+      write_checked(s.table, s.checks, "bc_insert(cx, " + w_.tbl(s.table) + ", ", !s.returning.empty());
+      returned(s.table, "nr", s.returning);
       if (blocks) w_.close();
     }
     w_.line("bc_emit_count(cx, " + std::to_string(s.rows.size()) + ");");
@@ -2583,12 +2585,30 @@ private:
       w_.line("bc_row r = bc_row_from(cx, " + w_.tbl(s.table) + ", old);");
       for (const auto& [col, e] : s.set) set(col, e);
       // The runtime moves the index entries whose keys changed.
-      write_checked(s.table, s.checks, "bc_update(cx, " + w_.tbl(s.table) + ", old, ");
+      write_checked(s.table, s.checks, "bc_update(cx, " + w_.tbl(s.table) + ", old, ", !s.returning.empty());
+      returned(s.table, "nr", s.returning);
     });
   }
 
   void produce(const physical::Delete& s, const Consume&) {
-    write_rows(s.table, *s.input, [&] { w_.line("bc_delete(cx, " + w_.tbl(s.table) + ", old);"); });
+    write_rows(s.table, *s.input, [&] {
+      w_.line("bc_delete(cx, " + w_.tbl(s.table) + ", old);");
+      returned(s.table, "old", s.returning);
+    });
+  }
+
+  // RETURNING: a result row of `list` over `row`, the row of `table` just
+  // written (or, for a DELETE, as it was). Each value is evaluated before
+  // the row begins, as an Emit's are.
+  void returned(std::uint32_t table, const std::string& row, const std::vector<Expr>& list) {
+    if (list.empty()) return;
+    auto outer = std::exchange(rows_, std::vector<Binding>{{table, row}});
+    std::vector<Val> values;
+    for (const auto& e : list) values.push_back(eval(e));
+    w_.line("bc_emit_begin(cx);");
+    for (const auto& v : values) emit_val(v);
+    w_.line("bc_emit_end(cx);");
+    rows_ = std::move(outer);
   }
 
   // SET col = e, from the row as read: a parameter as given, NULL included;
@@ -3017,6 +3037,7 @@ auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std
                         std::is_same_v<T, physical::Delete>) {
             // The runtime maintains the table's indexes: a write plan names none.
             out.tables_written = {op.table};
+            out.returns_rows = !op.returning.empty();
           } else {
             out.returns_rows = true;
           }

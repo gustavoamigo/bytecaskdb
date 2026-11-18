@@ -1958,9 +1958,9 @@ auto Database::results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows {
     const std::uint8_t* row = nullptr;
     std::uint32_t len = 0;
     while (bc_ctx_next_result(cx, &row, &len)) {
-      // Result rows are decoded after the commit. That is safe while the
-      // compiled write plans emit no rows (only bc_emit_count): a RETURNING
-      // will have to decode its rows before it commits.
+      // Result rows are decoded after the commit: the context holds the
+      // rows of the attempt that committed (each attempt begins with none),
+      // copies of the values, a RETURNING's among them.
       auto values = decode_row(c.result_layout, std::as_bytes(std::span{row, len}));
       if (!values) {
         bc_ctx_reset(cx);

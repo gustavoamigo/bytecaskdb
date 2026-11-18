@@ -22,7 +22,7 @@ How much of each suite the layer passes, from the functional suite's conformance
 | Suite | Coverage | Tests | Checks |
 |---|---|---|---|
 | SQL:2016 Core (sqltest) | 80% | 592/743 tests | statement accepted |
-| PostgreSQL features | 94% | 320/341 cases | results |
+| PostgreSQL features | 95% | 323/341 cases | results |
 | ByteCaskDB features | 100% | 13/13 cases | results |
 | TPROC-C | 100% | 1/1 case: five transactions, then consistency conditions 1–9 | consistency conditions 1–9 |
 
@@ -56,7 +56,7 @@ Not built yet (each is refused, with a message):
 - more than eight tables, `FULL JOIN`, `RIGHT JOIN` of more than two tables, `USING` or `NATURAL` after the first join, a join in parentheses, `FOR UPDATE` of a join, correlated or nested subqueries and subqueries in `FROM`, `DISTINCT ON`;
 - `IS DISTINCT FROM`, a predicate in `HAVING`;
 - `CHAR(n)` as a key, `UNIQUE` or index column, compared with a parameter, cast to, under `LIKE`, `MIN` or `MAX`; a length in `CHARACTERS` or `OCTETS` is not PostgreSQL syntax;
-- `RETURNING`, `ON CONFLICT`, `VALUES` outside `INSERT`;
+- `RETURNING` in a procedure, `ON CONFLICT`, `VALUES` outside `INSERT`;
 - a numeric quotient of columns, `REAL` and `DOUBLE PRECISION` arithmetic (but unary minus and `abs`), an expression in `ORDER BY`, `GROUP BY`, `SET`, a `WHERE` or an aggregated select list, `CASE` over `REAL` or `DOUBLE PRECISION` beside other numbers, `GREATEST` and `LEAST`, `OVERLAY` of columns and parameters, a string function in a `WHERE`, `||` of a boolean, float or date, the pattern `SUBSTRING`, `EXTRACT`, `CAST` of anything but a constant or a parameter beside a column of the cast's type, a float cast to text, `CURRENT_TIME` (`TIME WITH TIME ZONE`), the time in a `WHERE`, date arithmetic; a numeric literal past 18 digits, and a constant compared with a column whose type does not hold it exactly (`smallint_col = 40000`);
 - a table of no columns, `ALTER TABLE … ADD CONSTRAINT` and `ADD COLUMN … CHECK`, a default that is neither a constant nor the clock, `ADD COLUMN` with a `DEFAULT` of the clock, enforcing a foreign key, `ON DELETE CASCADE` and the other actions, `UNIQUE NULLS NOT DISTINCT` or `INCLUDE`, `TRUNCATE`;
 - `SELECT` without `FROM` but of constants, a constant beside an aggregate, `EXPLAIN`, `SAVEPOINT`, sequences, serializable isolation (`SERIALIZABLE` is refused; the other levels are accepted and run at snapshot isolation), transactional DDL;

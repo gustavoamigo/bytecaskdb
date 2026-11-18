@@ -802,7 +802,7 @@ private:
           using T = std::decay_t<decltype(op)>;
           if constexpr (std::is_same_v<T, logical::Insert>) {
             constants(*op.table);
-            physical::Insert ins{op.table->id, {}, op.checks};
+            physical::Insert ins{op.table->id, {}, op.checks, returned(op.returning)};
             for (const auto& values : op.rows) {
               auto& row = ins.rows.emplace_back();
               for (std::size_t i = 0; i < op.table->columns.size(); ++i) {
@@ -816,18 +816,29 @@ private:
           } else if constexpr (std::is_same_v<T, logical::Update>) {
             constants(*op.table);
             return write_rows(*op.input, [&](physical::NodePtr rows) {
-              return physical::node(physical::Update{std::move(rows), op.table->id, op.set, op.checks});
+              return physical::node(physical::Update{std::move(rows), op.table->id, op.set, op.checks, returned(op.returning)});
             });
           } else if constexpr (std::is_same_v<T, logical::Delete>) {
             constants(*op.table);
             return write_rows(*op.input, [&](physical::NodePtr rows) {
-              return physical::node(physical::Delete{std::move(rows), op.table->id});
+              return physical::node(physical::Delete{std::move(rows), op.table->id, returned(op.returning)});
             });
           } else {
             return select(root);
           }
         },
         root.op);
+  }
+
+  // RETURNING's expressions, each the plan's result column.
+  auto returned(const std::vector<logical::Output>& outs) -> std::vector<Expr> {
+    result_.clear();
+    std::vector<Expr> out;
+    for (const auto& o : outs) {
+      result_.push_back({o.name, o.expr.type});
+      out.push_back(o.expr);
+    }
+    return out;
   }
 
   // The constants of a table the plan reads. An index and the parts of its

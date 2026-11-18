@@ -1466,7 +1466,7 @@ Each slice was one PR, or a few, with its tests.
    aggregates in one select list.
 
 The rest of the dialect stays in #534: aliases of a join and of columns,
-expressions, `RETURNING`, correlated subqueries,
+expressions, correlated subqueries,
 `FULL JOIN`, `FOR UPDATE` on joins, and `EXPLAIN`. The serializable guards,
 the plan cache and procedures (#495) keep their own designs.
 

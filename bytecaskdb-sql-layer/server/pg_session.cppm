@@ -1344,7 +1344,7 @@ private:
                       : in_block_                ? txn_->execute(stmt, {}, opts)
                       : implicit_                ? implicit_->execute(stmt, {}, opts)
                                                  : db_.execute(stmt, {}, opts);
-          if (stmt.command() == Command::Select) {
+          if (returns_rows(stmt)) {
             std::vector<ResultColumn> cols;
             for (std::size_t i = 0; i < rows.columns.size(); ++i) cols.push_back({rows.columns[i], rows.types.at(i)});
             row_description(cols);
@@ -1478,6 +1478,11 @@ private:
     simple_reply('2');
   }
 
+  // A SELECT, or a write with RETURNING: its rows are described and sent.
+  static auto returns_rows(const Statement& stmt) -> bool {
+    return stmt.command() == Command::Select || !stmt.columns().empty();
+  }
+
   void describe_result(const Prepared& p) {
     if (p.kind == Classified::Kind::Stats) {
       row_description(stats_columns());
@@ -1494,7 +1499,7 @@ private:
       }
       return;
     }
-    if (p.stmt != nullptr && p.stmt->command() == Command::Select) {
+    if (p.stmt != nullptr && returns_rows(*p.stmt)) {
       row_description(p.stmt->columns());
     } else {
       no_data();
