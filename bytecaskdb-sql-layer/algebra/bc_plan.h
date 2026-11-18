@@ -277,10 +277,24 @@ bool    bc_bytes_prefix(bc_ctx *, bc_view prefix, bc_view);
    - bc_substr: PostgreSQL's substring(s FROM from FOR count) of UTF-8 text,
      in characters: a start before the first character takes from it, those
      before counting toward `count`; INT64_MAX is to the end; a negative
-     count is BC_E_ARITH, "negative substring length not allowed" (22011). */
+     count is BC_E_ARITH, "negative substring length not allowed" (22011);
+   - bc_text_case: upper (true) or lower case, of ASCII letters only, as
+     COLLATE "C" folds;
+   - bc_trim: s without the characters of `set` from its start
+     (BC_TRIM_LEADING), its end (BC_TRIM_TRAILING) or both; with
+     BC_TRIM_SPACES the set is a space and `set` is not read.
+   And numbers of text: bc_char_length, its characters; bc_octet_length, its
+   bytes; bc_position, the 1-based character `needle` first starts at in s,
+   0 for none and 1 for an empty needle. */
 bc_view bc_concat(bc_ctx *, bc_view a, bc_view b);
 bc_view bc_number_text(bc_ctx *, int64_t v, uint32_t scale);
 bc_view bc_substr(bc_ctx *, bc_view s, int64_t from, int64_t count);
+bc_view bc_text_case(bc_ctx *, bc_view s, bool upper);
+enum bc_trim_how { BC_TRIM_LEADING = 1, BC_TRIM_TRAILING = 2, BC_TRIM_SPACES = 4 };
+bc_view bc_trim(bc_ctx *, bc_view s, bc_view set, uint32_t how);
+int64_t bc_char_length(bc_ctx *, bc_view s);
+int64_t bc_octet_length(bc_ctx *, bc_view s);
+int64_t bc_position(bc_ctx *, bc_view s, bc_view needle);
 /* PostgreSQL 17's random(lo, hi): an integer drawn uniformly from lo to hi,
    both included; lo > hi is BC_E_ARITH, "lower bound must be less than or
    equal to upper bound" (22023). Not repeatable: each thread draws from its

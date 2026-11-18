@@ -2176,9 +2176,8 @@ TEST_CASE("embedded API: || and the string functions of constants fold as Postgr
   (void)db->execute("INSERT INTO sf VALUES (1, 'ab' || 'c')");
   (void)db->execute("INSERT INTO sf VALUES (2, UPPER('x'))");
   CHECK(db->execute("SELECT v FROM sf WHERE v = LOWER('ABC')").rows == Grid{{text("abc")}});
-  // || of a column is built (below, "|| and SUBSTRING of columns"); the other functions of a column are not yet.
-  CHECK(db->execute("SELECT v || 'x' FROM sf WHERE id = 1").rows == Grid{{text("abcx")}});
-  CHECK(state("SELECT UPPER(v) FROM sf") == "42601");
+  // Of a column they are select-list values (below); in a WHERE, not yet.
+  CHECK(db->execute("SELECT v || 'x', UPPER(v) FROM sf WHERE id = 1").rows == Grid{{text("abcx"), text("ABC")}});
   CHECK(state("SELECT id FROM sf WHERE UPPER(v) = 'ABC'") == "42601");
 }
 
@@ -3198,8 +3197,39 @@ TEST_CASE("embedded API: concatenation and SUBSTRING of columns build text per r
   CHECK(state("SELECT substring(name FROM 1 FOR -1) FROM s WHERE id = 1") == "22011");
   CHECK(state("SELECT id || big FROM s") == "42883");          // no text operand
   CHECK(state("SELECT name || ok FROM s") == "42601");         // a boolean's text: not built
-  CHECK(state("SELECT upper(name) FROM s") == "42601");        // the other functions of columns: #671
+  CHECK(state("SELECT overlay(name PLACING 'x' FROM 1) FROM s") == "42601");  // OVERLAY of a column: #671
   CHECK(state("SELECT substring(name FROM big) FROM s") == "42883");  // a bigint start
+}
+
+TEST_CASE("embedded API: UPPER, LOWER, TRIM, POSITION and the lengths of columns are PostgreSQL's, per row", "[sql][api]") {
+  sql_test::TempDir dir{"api_text_functions"};
+  auto db = Database::open(dir.path());
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  (void)db->execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v VARCHAR(10), w TEXT, n INTEGER)");
+  (void)db->execute("INSERT INTO s VALUES (1, ' héLlo ', 'l', 1)");
+  (void)db->execute("INSERT INTO s VALUES (2, NULL, 'x', 2)");
+  auto rows = db->execute("SELECT upper(v), lower(v), char_length(v), character_length(v), octet_length(v) FROM s ORDER BY id");
+  CHECK(rows.columns == std::vector<std::string>{"upper", "lower", "char_length", "character_length", "octet_length"});
+  CHECK(rows.rows == Grid{{text(" HéLLO "), text(" héllo "), i(7), i(7), i(8)}, {Value{}, Value{}, Value{}, Value{}, Value{}}});
+  CHECK(db->execute("SELECT trim(v), trim(leading from v), trim(trailing from v), trim(both ' o' from v), position(w in v), "
+                    "position('' in v), position('z' in v) FROM s WHERE id = 1")
+            .rows == Grid{{text("héLlo"), text("héLlo "), text(" héLlo"), text("héLl"), i(5), i(1), i(0)}});
+  CHECK(db->execute("SELECT position(w in v), trim(w from v), upper(v) || '!' FROM s WHERE id = 2").rows ==
+        Grid{{Value{}, Value{}, Value{}}});
+  CHECK(db->execute("SELECT char_length(v) + n FROM s WHERE id = 1").rows == Grid{{i(8)}});
+  // A $n only inside a call is the statement's own: a constant beside it takes a slot after it.
+  CHECK(db->execute("SELECT position('b' in $1), $1 || 'q', upper($1) FROM s WHERE id = 1", {sql_test::bytes("xbz")}).rows ==
+        Grid{{i(2), text("xbzq"), text("XBZ")}});
+  CHECK(state("SELECT upper(n) FROM s") == "42883");
+  CHECK(state("SELECT position(n in v) FROM s") == "42883");
 }
 
 TEST_CASE("embedded API: a procedure builds text from its variables, as TPROC-C's Payment does", "[sql][api][procedure]") {

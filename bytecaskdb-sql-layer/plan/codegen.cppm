@@ -743,6 +743,7 @@ private:
       case Expr::Kind::Coalesce:
       case Expr::Kind::Concat:
       case Expr::Kind::Substr:
+      case Expr::Kind::TextFn:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
       case Expr::Kind::Abs:
@@ -788,6 +789,7 @@ private:
       case Expr::Kind::Coalesce:
       case Expr::Kind::Concat:
       case Expr::Kind::Substr:
+      case Expr::Kind::TextFn:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
       case Expr::Kind::Abs:
@@ -1499,6 +1501,7 @@ private:
       case Expr::Kind::Coalesce: return eval_coalesce(e);
       case Expr::Kind::Concat: return eval_concat(e);
       case Expr::Kind::Substr: return eval_substr(e);
+      case Expr::Kind::TextFn: return eval_text(e);
       case Expr::Kind::Random: {
         auto lo = eval(e.args[0]);
         auto hi = eval(e.args[1]);
@@ -1565,6 +1568,7 @@ private:
       case Expr::Kind::Coalesce:
       case Expr::Kind::Concat:
       case Expr::Kind::Substr:
+      case Expr::Kind::TextFn:
       case Expr::Kind::Random:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
@@ -1652,6 +1656,36 @@ private:
     auto n = count ? count->value : constant(std::numeric_limits<std::int64_t>::max());
     return guarded("bc_view", "bc_empty(cx)", null, "bc_substr(cx, " + s.value + ", " + from.value + ", " + n + ")",
                    PhysType::Bytes);
+  }
+
+  // A string function of text: NULL if any operand is.
+  auto eval_text(const Expr& e) -> Val {
+    using T = logical::Expr::Text;
+    std::vector<Val> args;
+    std::string null;
+    for (const auto& a : e.args) {
+      args.push_back(eval(a));
+      null = either(null, args.back().null);
+    }
+    const auto& s = args[0].value;
+    auto text = [&](const std::string& call) { return guarded("bc_view", "bc_empty(cx)", null, call, PhysType::Bytes); };
+    auto number = [&](const std::string& call) { return guarded("int64_t", "0", null, call, PhysType::I64); };
+    auto trim = [&](const char* how) {
+      auto set = args.size() == 2 ? args[1].value : std::string{"bc_empty(cx)"};
+      auto flags = std::string{how} + (args.size() == 2 ? "" : " | BC_TRIM_SPACES");
+      return text("bc_trim(cx, " + s + ", " + set + ", " + flags + ")");
+    };
+    switch (e.text) {
+      case T::Upper: return text("bc_text_case(cx, " + s + ", true)");
+      case T::Lower: return text("bc_text_case(cx, " + s + ", false)");
+      case T::CharLength: return number("bc_char_length(cx, " + s + ")");
+      case T::OctetLength: return number("bc_octet_length(cx, " + s + ")");
+      case T::Btrim: return trim("BC_TRIM_LEADING | BC_TRIM_TRAILING");
+      case T::Ltrim: return trim("BC_TRIM_LEADING");
+      case T::Rtrim: return trim("BC_TRIM_TRAILING");
+      case T::Position: return number("bc_position(cx, " + s + ", " + args[1].value + ")");
+    }
+    throw std::logic_error{"physical plan: a string function codegen does not print"};
   }
 
   // A local `type v = fallback`, set to `value` unless `null`; the Val of

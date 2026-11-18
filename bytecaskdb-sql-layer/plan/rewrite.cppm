@@ -158,6 +158,7 @@ auto fold(Expr& e) -> bool {
     case Kind::Coalesce:
     case Kind::Concat:
     case Kind::Substr:
+    case Kind::TextFn:
     case Kind::Mod:
     case Kind::Neg:
     case Kind::Abs:
