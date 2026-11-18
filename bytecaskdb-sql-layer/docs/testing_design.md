@@ -421,7 +421,7 @@ the client rolls back.
 **The load.** HammerDB loads with multi-row `INSERT … VALUES` built as
 text. The harness's loader inserts one row per prepared statement, `INSERT
 INTO t (…) VALUES ($1, …)`, many rows to a transaction (*The TPROC-C
-harness*). Multi-row `VALUES` is #534.
+harness*).
 
 
 ## The TPROC-C harness

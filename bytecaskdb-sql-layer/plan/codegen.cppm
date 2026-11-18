@@ -2435,14 +2435,21 @@ private:
   }
 
   void produce(const physical::Insert& s, const Consume&) {
-    // bc_row_begin sets every column to its default; a column not given keeps
-    // it. The runtime checks the keys and writes the index entries.
-    w_.line("bc_row r = bc_row_begin(cx, " + w_.tbl(s.table) + ");");
-    for (const auto& [col, e] : s.values) {
-      w_.line("bc_row_set_param(cx, r, " + w_.col(col) + ", " + std::to_string(e.param) + ");");
+    // Each row in a block of its own, in order. bc_row_begin sets every
+    // column to its default; a column not given keeps it. The runtime checks
+    // the keys and writes the index entries; an error it raises is sticky,
+    // so the rows after one that fails are not written.
+    const auto blocks = s.rows.size() > 1;
+    for (const auto& row : s.rows) {
+      if (blocks) w_.open("");
+      w_.line("bc_row r = bc_row_begin(cx, " + w_.tbl(s.table) + ");");
+      for (const auto& [col, e] : row) {
+        w_.line("bc_row_set_param(cx, r, " + w_.col(col) + ", " + std::to_string(e.param) + ");");
+      }
+      write_checked(s.table, s.checks, "bc_insert(cx, " + w_.tbl(s.table) + ", ");
+      if (blocks) w_.close();
     }
-    write_checked(s.table, s.checks, "bc_insert(cx, " + w_.tbl(s.table) + ", ");
-    w_.line("bc_emit_count(cx, 1);");
+    w_.line("bc_emit_count(cx, " + std::to_string(s.rows.size()) + ");");
   }
 
   // Each row of an UPDATE or DELETE as `old`, `write` printing what is done

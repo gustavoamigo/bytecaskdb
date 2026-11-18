@@ -75,16 +75,27 @@ TEST_CASE("binder: names become ids, parameters get types from use", "[sql][bind
     const auto& s = get<logical::Insert>(b);
     CHECK(s.table->id == 1);
     CHECK(b.param_types == std::vector<PhysType>{PhysType::I64, PhysType::Bytes, PhysType::I64});
-    REQUIRE(s.values.size() == 3);
-    CHECK(s.values[1]->param == 1);
+    REQUIRE(s.rows.size() == 1);
+    REQUIRE(s.rows[0].size() == 3);
+    CHECK(s.rows[0][1]->param == 1);
+  }
+  {
+    // Each VALUES row binds as one INSERT of it, its parameters typed by its columns.
+    auto b = bind_sql(cat, "INSERT INTO t (id, qty) VALUES ($1, $2), ($3, $4)");
+    const auto& s = get<logical::Insert>(b);
+    CHECK(b.param_types == std::vector<PhysType>{PhysType::I64, PhysType::I64, PhysType::I64, PhysType::I64});
+    REQUIRE(s.rows.size() == 2);
+    CHECK(s.rows[1][0]->param == 2);
+    CHECK(s.rows[1][2]->param == 3);
+    CHECK_FALSE(s.rows[1][1].has_value());
   }
   {
     auto b = bind_sql(cat, "INSERT INTO t (qty, id) VALUES ($1, $2)");
     const auto& s = get<logical::Insert>(b);
     CHECK(b.param_types == std::vector<PhysType>{PhysType::I64, PhysType::I64});
-    CHECK(s.values[0]->param == 1);
-    CHECK_FALSE(s.values[1].has_value());  // name is not given: its default, NULL
-    CHECK(s.values[2]->param == 0);
+    CHECK(s.rows[0][0]->param == 1);
+    CHECK_FALSE(s.rows[0][1].has_value());  // name is not given: its default, NULL
+    CHECK(s.rows[0][2]->param == 0);
   }
   {
     auto b = bind_sql(cat, "SELECT id, qty FROM t WHERE id = $1");

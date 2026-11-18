@@ -864,9 +864,15 @@ auto insert(const PgQuery__InsertStmt* s, std::int32_t pos) -> Insert {
   Insert ins{relation(s->relation), {}, {}, pos};
   for (std::size_t i = 0; i < s->n_cols; ++i) ins.columns.emplace_back(s->cols[i]->res_target->name);
   const auto* sel = s->select_stmt == nullptr ? nullptr : s->select_stmt->select_stmt;
-  if (sel == nullptr || sel->n_values_lists != 1) reject("INSERT takes exactly one VALUES row", s->relation->location);
-  const auto* row = sel->values_lists[0]->list;
-  for (std::size_t i = 0; i < row->n_items; ++i) ins.values.push_back(expr(row->items[i]));
+  if (sel == nullptr || sel->n_values_lists == 0) reject("INSERT takes VALUES rows", s->relation->location);
+  for (std::size_t r = 0; r < sel->n_values_lists; ++r) {
+    const auto* row = sel->values_lists[r]->list;
+    auto& values = ins.rows.emplace_back();
+    for (std::size_t i = 0; i < row->n_items; ++i) values.push_back(expr(row->items[i]));
+    if (values.size() != ins.rows.front().size()) {
+      reject("VALUES lists must all be the same length", values.empty() ? pos : values.front().pos);
+    }
+  }
   return ins;
 }
 

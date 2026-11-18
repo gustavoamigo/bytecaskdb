@@ -323,8 +323,6 @@
 
 - name: a multi-row VALUES
   features: [E101-01]
-  # INSERT takes exactly one VALUES row
-  unimplemented: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
   steps:
@@ -379,3 +377,67 @@
       error: "23502"
   teardown:
     - DROP TABLE t
+
+- name: a multi-row INSERT is one statement
+  features: [E101-01]
+  setup:
+    - CREATE TABLE mr (id INTEGER PRIMARY KEY, v INTEGER DEFAULT 7 CHECK (v > 0), u INTEGER UNIQUE)
+  steps:
+    - sql: INSERT INTO mr VALUES (1, 10, 1), (2, 20, 2)
+      rowcount: 2
+    # A row that fails writes none of the statement's rows: a key twice in
+    # the statement, a key already there, a CHECK, a UNIQUE.
+    - sql: INSERT INTO mr VALUES (3, 30, 3), (3, 31, 4)
+      error: "23505"
+    - sql: INSERT INTO mr VALUES (4, 40, 4), (1, 1, 9)
+      error: "23505"
+    - sql: INSERT INTO mr VALUES (5, 50, 5), (6, -1, 6)
+      error: "23514"
+    - sql: INSERT INTO mr VALUES (7, 1, 7), (8, 1, 7)
+      error: "23505"
+    - sql: INSERT INTO mr (id) VALUES (10), (11)
+      rowcount: 2
+    - sql: INSERT INTO mr VALUES (12, DEFAULT, NULL), (13, 3, NULL)
+      rowcount: 2
+    - sql: INSERT INTO mr VALUES (14, 1), (15)
+      error: "42601"
+    - sql: SELECT id, v, u FROM mr
+      expected:
+        - [1, 10, 1]
+        - [10, 7, null]
+        - [11, 7, null]
+        - [12, 7, null]
+        - [13, 3, null]
+        - [2, 20, 2]
+  teardown:
+    - DROP TABLE mr
+
+- name: a multi-row INSERT into a table without a primary key keeps duplicates
+  features: [E101-01]
+  setup:
+    - CREATE TABLE mrn (a INTEGER, b TEXT)
+  steps:
+    - sql: INSERT INTO mrn VALUES ($1, $2), ($3, $4), (NULL, NULL)
+      params: [1, a, 1, a]
+      rowcount: 3
+    - sql: SELECT a, b FROM mrn
+      expected: [[null, null], [1, a], [1, a]]
+  teardown:
+    - DROP TABLE mrn
+
+- name: a multi-row INSERT in a transaction is undone with it
+  features: [E101-01]
+  setup:
+    - CREATE TABLE mrt (id INTEGER PRIMARY KEY)
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO mrt VALUES (1), (2), (3)
+      rowcount: 3
+    - sql: SELECT id FROM mrt
+      expected: [[1], [2], [3]]
+    - sql: ROLLBACK
+    - sql: SELECT id FROM mrt
+      expected: []
+  teardown:
+    - ROLLBACK
+    - DROP TABLE mrt

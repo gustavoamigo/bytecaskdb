@@ -1,0 +1,1 @@
+INSERT INTO t VALUES ($1, $2, $3), (4, DEFAULT, 5)
