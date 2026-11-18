@@ -446,9 +446,18 @@ TEST_CASE("physical: a plan holds one hash join, and a predicate over two tables
   };
   CHECK(refusal(with(over(t_v, u_v))).empty());
   refused(with(over(t_v, w_v)), "a predicate that reads a column of a table not in hand");
-  // Two columns of one type only, and never a DOUBLE.
-  refused(with(over(t_v, u_b)), "a column of its type");
-  refused(with(over(kD, u_v)), "a column of its type");
+  // Two columns of one physical type, or an integer with a float; DECIMALs at one scale.
+  refused(with(over(t_v, u_b)), "types it does not relate");
+  auto scaled = [&](std::uint8_t a, std::uint8_t b) {
+    auto lt = logical::column(t_v, SqlType{SqlKind::Decimal, 10, a, a});
+    auto rt = logical::column(u_v, SqlType{SqlKind::Decimal, 10, b, b});
+    auto lt_eq = logical::compare(ast::Compare::Op::Eq, std::move(lt), std::move(rt));
+    auto f = node(physical::Filter{hash(node(scan({p(0)}, {})), scan_of(2), t_v, u_v, 1),
+                                   {logical::predicate_of(logical::Expr::Kind::Not, {std::move(lt_eq)})}});
+    return with(std::move(f));
+  };
+  CHECK(refusal(scaled(2, 2)).empty());
+  refused(scaled(2, 1), "types it does not relate");
   // The inner side of a nested loop reads the outer side's rows too: as a left outer join's match does.
   auto inner = [&](logical::ColumnRef a, logical::ColumnRef b) {
     auto filtered = node(physical::Filter{scan_of(2), {both_columns(a, b)}});

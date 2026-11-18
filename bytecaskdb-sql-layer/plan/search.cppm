@@ -235,6 +235,13 @@ auto reads(const Tables& ts, const Expr& e) -> bool {
 
 enum class Use { Ok, NoColumn, Operand, Columns };
 
+// Whether c compares two columns of one table: a filter of its rows alone
+// (Rel::preds), never a key bound.
+auto columns_compared(const Expr& c) -> bool {
+  return is_compare(c) && c.args[0].kind == Expr::Kind::Column && c.args[1].kind == Expr::Kind::Column &&
+         c.args[0].col.table == c.args[1].col.table;
+}
+
 // The one test of a conjunct the search can use, on a table's Filter and in
 // a Join's predicate alike: a column of `here` compared with a parameter, with
 // $n ± k, or with a column of `other`. For a Filter `other` is empty; for a
@@ -505,7 +512,7 @@ struct Cross {
 struct Rel {
   const logical::Get* get{nullptr};
   Conjuncts where;  // its comparisons, which its access paths may take
-  Conjuncts preds;  // its predicates (logical::is_predicate): filters only
+  Conjuncts preds;  // its predicates (logical::is_predicate) and comparisons of two of its columns: filters only
   bool outer{false};  // the right side of a left outer join of it and the tables before it
 
   [[nodiscard]] auto table() const -> const Table& { return *get->table; }
@@ -897,7 +904,7 @@ private:
       const auto& t = *g->table;
       Rel rel{g, {}, {}};
       for (const auto& c : f->conjuncts) {
-        if (logical::is_predicate(c)) {
+        if (logical::is_predicate(c) || columns_compared(c)) {
           rel.preds.push_back(c);
           continue;
         }
@@ -963,7 +970,7 @@ private:
         }
         continue;
       }
-      if (logical::is_predicate(c)) {
+      if (logical::is_predicate(c) || (single && columns_compared(c))) {
         if (cols.empty()) no_plan("a predicate (AND, OR, NOT, IS NULL) that reads no column");
         // A filter of the one table whose columns it reads; of several, of
         // their pairs.

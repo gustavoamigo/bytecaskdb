@@ -441,14 +441,21 @@ auto op_text(Op op) -> std::string {
   return "==";
 }
 
-// `a op b` as C for two values of physical type `type`: text and bytes
-// compare as bytes (COLLATE "C"), a DOUBLE in PostgreSQL's float8 order
-// (-0.0 equal to 0.0, NaN equal to NaN and above every other value), the
-// rest as C compares them.
-auto compare_text(PhysType type, Op op, const std::string& a, const std::string& b) -> std::string {
-  switch (type) {
+// `a op b` as C for values of SQL types `at` and `bt`, of one physical type
+// or an integer with a float: text and bytes compare as bytes (COLLATE "C"),
+// a float in PostgreSQL's float8 order (-0.0 equal to 0.0, NaN equal to NaN
+// and above every other value), an integer beside one cast to double as
+// PostgreSQL casts it to float8, the rest as C compares them.
+auto compare_text(SqlType at, SqlType bt, Op op, const std::string& a, const std::string& b) -> std::string {
+  auto x = phys_type(at);
+  auto y = phys_type(bt);
+  if (x == PhysType::F64 || y == PhysType::F64) {
+    auto as_double = [](PhysType t, const std::string& v) { return t == PhysType::F64 ? v : "(double)(" + v + ")"; };
+    return "bc_cmp_f64(" + as_double(x, a) + ", " + as_double(y, b) + ") " + op_text(op) + " 0";
+  }
+  switch (x) {
     case PhysType::Bytes: return "bc_bytes_cmp(cx, " + a + ", " + b + ") " + op_text(op) + " 0";
-    case PhysType::F64: return "bc_cmp_f64(" + a + ", " + b + ") " + op_text(op) + " 0";
+    case PhysType::F64:
     case PhysType::I64:
     case PhysType::Bool: break;
   }
@@ -819,7 +826,7 @@ private:
       case Expr::Kind::Random: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
     }
     auto col = read_col(lhs);
-    return {out, compare_text(lhs.type, c.op, col, value)};
+    return {out, compare_text(c.args[0].type, rhs.type, c.op, col, value)};
   }
 
   void produce(const physical::Node& n, const Consume& k) {
@@ -1735,7 +1742,7 @@ private:
     auto scale = std::max(decimal_scale(lt), decimal_scale(rt));
     auto x = at_scale(a, lt, scale);
     auto y = at_scale(b, rt, scale);
-    return guarded("bool", "0", either(a.null, b.null), compare_text(a.type, e.op, x, y), PhysType::Bool);
+    return guarded("bool", "0", either(a.null, b.null), compare_text(lt, rt, e.op, x, y), PhysType::Bool);
   }
 
   // AND and OR in SQL's three-valued logic, an operand evaluated only while
@@ -2051,9 +2058,9 @@ private:
     const auto& lhs = c.args[0];
     const auto& rhs = c.args[1];
     auto [is_null, value] = group_value(lhs);
-    auto type = lhs.kind == Expr::Kind::Column ? lhs.col.type : folds_f64(lhs) ? PhysType::F64 : PhysType::I64;
+    // The parameter is read as the key's or the aggregate's type.
     auto out = (is_null.empty() ? "" : is_null + " || ") + param_null(rhs.param);
-    return out + " || !(" + compare_text(type, c.op, value, param(type, rhs.param)) + ")";
+    return out + " || !(" + compare_text(lhs.type, lhs.type, c.op, value, param(lhs.phys(), rhs.param)) + ")";
   }
 
   // One output of the group in hand: a key, an aggregate, or an AVG's sum

@@ -84,7 +84,9 @@ statement's own (`frontend_design.md`, *Literals*). A predicate (`And`,
 `Or`, `Not` of comparisons, and `IsNull` of a column) is a conjunct of its
 own: the search keeps a table's predicates apart from its comparisons
 (`Rel::preds`), no access path takes one, and each is a filter after the
-path's. Codegen prints one as two C conditions, true and false, SQL's
+path's. A comparison of two columns of one table is kept with them
+(`columns_compared`): a filter of its rows, never a key bound, from a
+`WHERE` or from a join's `ON` on one side alone. Codegen prints one as two C conditions, true and false, SQL's
 three-valued logic with unknown neither. In a select list the same kinds
 are values (*Expressions over columns*). The
 binder's own rules are the frontend's: one SQL type per `$n`, and the
@@ -1325,6 +1327,11 @@ are refused). Codegen prints it as `bc_cmp_f64(a, b) op 0`, which
 is PostgreSQL's `float8_cmp_internal`: `-0.0` equals `0.0`, NaN equals NaN
 and is above every other value, `+inf` included; one `compare_text` helper
 prints it for a filter, a predicate, a `HAVING` and a comparison as a value.
+`compare_text` takes the operands' SQL types: an integer beside a float, two
+columns of one table (*The pipeline*), is cast to double, PostgreSQL's cast
+to float8. `physical::check` takes two columns of one physical type or an
+integer with a float, and of one `DECIMAL` scale: the comparison does not
+rescale, so the binder refuses two scales.
 A key range compares in the same order, as the key encoding writes `-0.0`
 as `0.0` and every NaN as one, so a key and a filter agree.
 
@@ -1355,7 +1362,8 @@ with uncompilable C:
   search plans an Aggregate`);
 - a conjunct `use_of` refuses (`no plan: a conjunct on <table> that does
   not compare one of its columns`, `… compares two columns outside a
-  join`, `a join conjunct that does not compare a column of each side`,
+  join` (a column of another table on a table's `Filter`), `a join conjunct
+  that does not compare a column of each side`,
   `a conjunct that reads no column`, `a predicate (…) that reads no column`);
   a table read twice with no instance for each use; a left outer join whose
   right side is more than one table; more than 32 tables;

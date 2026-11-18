@@ -611,6 +611,19 @@ private:
     if (std::ranges::find(p_.computed, computed_of(e, table)) == p_.computed.end()) broken("a $n ± k the plan does not compute");
   }
 
+  // A comparison of two columns: of one physical type, or an integer with a
+  // float, which compares as float8, and a DECIMAL at one scale, which the
+  // comparison does not rescale.
+  void compared_columns(const Expr& c) const {
+    if (c.args[0].kind != Expr::Kind::Column || c.args[1].kind != Expr::Kind::Column) return;
+    auto number = [](PhysType t) { return t == PhysType::I64 || t == PhysType::F64; };
+    auto x = c.args[0].col.type;
+    auto y = c.args[1].col.type;
+    if ((x != y && !(number(x) && number(y))) || decimal_scale(c.args[0].type) != decimal_scale(c.args[1].type)) {
+      broken("a comparison of two columns of types it does not relate");
+    }
+  }
+
   // A column codegen reads, from the row or, for a table a covering scan
   // reads, from the entry's key: never a DOUBLE from a key, whose encoding
   // writes -0.0 as 0.0 and every NaN as one NaN.
@@ -711,7 +724,7 @@ private:
   }
 
   // A predicate filter: AND, OR and NOT of comparisons of a column with a
-  // parameter, a constant or a column of the same type, and
+  // parameter, a constant or a column (compared_columns), and
   // IS NULL of a column. It reads rows in hand: the tables `here` gives rows
   // to, and those of the loops outside it (outer_).
   void predicate(const Expr& e, const std::vector<std::uint32_t>& here) const {
@@ -751,9 +764,10 @@ private:
       case Expr::Kind::Compare:
         if (e.args[0].kind != Expr::Kind::Column ||
             (e.args[1].kind != Expr::Kind::Param && e.args[1].kind != Expr::Kind::Const &&
-             (e.args[1].kind != Expr::Kind::Column || e.args[1].col.type != e.args[0].col.type))) {
-          broken("a predicate's comparison other than of a column with a parameter or a column of its type");
+             e.args[1].kind != Expr::Kind::Column)) {
+          broken("a predicate's comparison other than of a column with a parameter, a constant or a column");
         }
+        compared_columns(e);
         params(e.args[1]);
         reads(e);
         return;
@@ -1107,6 +1121,7 @@ private:
                 continue;
               }
               if (c.kind != Expr::Kind::Compare) continue;
+              compared_columns(c);
               operand(c.args[1], c.args[0].col.table);
               reads(c);
             }
@@ -1235,6 +1250,7 @@ private:
                 continue;
               }
               if (c.kind != Expr::Kind::Compare) continue;
+              compared_columns(c);
               operand(c.args[1], c.args[0].col.table);
               reads(c);
             }

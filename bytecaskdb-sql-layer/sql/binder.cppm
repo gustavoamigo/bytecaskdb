@@ -3369,11 +3369,12 @@ public:
     }
     if (col->kind == ast::Expr::Kind::Column && param_cast(*rhs)) rhs = uncast_param(rhs, *resolve(*col).second);
     // A column of one relation against a column of another, inside AND, OR or
-    // NOT: <> is NOT =. Two columns of one relation are not taken yet.
+    // NOT: <> is NOT =. Two columns of one relation: a filter of its rows.
     if (col->kind == ast::Expr::Kind::Column && rhs->kind == ast::Expr::Kind::Column) {
       auto [lt, lc] = resolve(*col);
       auto [rt, rc] = resolve(*rhs);
-      if (lt != rt) return joined_compare(op, lt, *lc, rt, *rc, w.pos);
+      if (lt != rt) return joined_compare(op, written_op(w, op), lt, *lc, rt, *rc, w.pos);
+      return columns_compare(w, op, lt, *lc, *rc);
     }
     // A scalar subquery: its value, a parameter it sets before the plan runs.
     if (col->kind == ast::Expr::Kind::Column && rhs->kind == ast::Expr::Kind::Subquery) {
@@ -3498,18 +3499,66 @@ public:
   }
 
   // A column of one relation compared with a column of another, of one SQL
-  // type, by any of the operators.
+  // type, by any of the operators; two columns of one relation, a filter of
+  // its rows (columns_compare).
   auto join_on(std::span<const Table* const> rels, const ast::Compare& w) const -> logical::Expr {
     auto [ls, lc] = column(rels, w.lhs);
     auto [rs, rc] = column(rels, w.rhs);
-    if (ls == rs) throw SqlError{"comparing two columns of one table is not supported yet", w.pos};
-    return joined_compare(w.op, rels[ls]->id, *lc, rels[rs]->id, *rc, w.pos);
+    if (ls == rs) return columns_compare(w, w.op, rels[ls]->id, *lc, *rc);
+    return joined_compare(w.op, written_op(w, w.op), rels[ls]->id, *lc, rels[rs]->id, *rc, w.pos);
   }
 
-  // l.lc <op> r.rc, columns of one SQL type: two of different ones are
-  // refused (docs/frontend_design.md, *Known differences*).
-  static auto joined_compare(ast::Compare::Op op, std::uint32_t l, const Column& lc, std::uint32_t r, const Column& rc,
-                             std::int32_t pos) -> logical::Expr {
+  // t.lc <op> t.rc, two columns of one table: a filter of its rows, never a
+  // key bound. Of one compared type (compared_type: VARCHAR or CHAR(n) with
+  // TEXT, a DECIMAL of scale 0 with a BIGINT), two integers, two floats, or an
+  // integer with a float, which compares as float8, as PostgreSQL casts the
+  // integer. Two DECIMALs of different scales, or a DECIMAL with another
+  // number, are not supported yet: the comparison does not rescale. Nor is
+  // a CHAR(n) with a VARCHAR, which PostgreSQL compares as bpchar, its
+  // trailing spaces ignored on both sides, nor a date with a timestamp. A
+  // pair PostgreSQL has no operator for is 42883, named in the order written.
+  static auto columns_compare(const ast::Compare& w, ast::Compare::Op op, std::uint32_t table, const Column& lc,
+                              const Column& rc) -> logical::Expr {
+    auto integral = [](SqlType t) { return is_integer(compared_type(t).identity); };
+    auto floating = [](SqlType t) { return t.kind == SqlKind::Real || t.kind == SqlKind::Double; };
+    auto number = [&](SqlType t) { return integral(t) || floating(t); };
+    auto a = lc.sql;
+    auto b = rc.sql;
+    if ((compared_type(a).identity == compared_type(b).identity && !bpchar_pair(a, b)) || (number(a) && number(b))) {
+      return logical::compare(op, logical::column_of(table, lc), logical::column_of(table, rc));
+    }
+    no_operator(a, written_op(w, op), b, w.pos);
+    not_yet("comparing " + lc.name + " (" + sql_type_name(a) + ") with " + rc.name + " (" + sql_type_name(b) + ")", w.pos);
+  }
+
+  // Throws PostgreSQL's 42883 when it has no operator comparing a with b:
+  // types of two classes, or a TIME with another temporal type. Columns of
+  // one class that the layer does not compare yet are the caller's to refuse.
+  static void no_operator(SqlType a, std::string_view written, SqlType b, std::int32_t pos) {
+    auto time = [](SqlType t) { return t.kind == SqlKind::Time; };
+    if (type_class(a.kind) == type_class(b.kind) && time(a) == time(b)) return;
+    throw SqlError{"operator does not exist: " + pg_type_name(a) + " " + std::string{written} + " " + pg_type_name(b), pos,
+                   kUndefinedFunction};
+  }
+
+  // A CHAR(n) with a VARCHAR: PostgreSQL compares the two as bpchar, the
+  // trailing spaces of both ignored, where the layer would compare the
+  // VARCHAR's bytes with the spaces kept.
+  static auto bpchar_pair(SqlType a, SqlType b) -> bool {
+    return (a.kind == SqlKind::Char && b.kind == SqlKind::Varchar) || (a.kind == SqlKind::Varchar && b.kind == SqlKind::Char);
+  }
+
+  // l.lc <op> r.rc, columns of one SQL type: a pair PostgreSQL has no
+  // operator for is its 42883 (no_operator, the operator as written); two
+  // of different types it does compare are refused (docs/frontend_design.md,
+  // *Known differences*, #823), and a CHAR(n) with a VARCHAR (bpchar_pair)
+  // is not supported yet.
+  static auto joined_compare(ast::Compare::Op op, std::string_view written, std::uint32_t l, const Column& lc,
+                             std::uint32_t r, const Column& rc, std::int32_t pos) -> logical::Expr {
+    no_operator(lc.sql, written, rc.sql, pos);
+    if (bpchar_pair(lc.sql, rc.sql)) {
+      not_yet("comparing " + lc.name + " (" + sql_type_name(lc.sql) + ") with " + rc.name + " (" + sql_type_name(rc.sql) + ")", pos);
+    }
     if (compared_type(lc.sql).identity != compared_type(rc.sql).identity) {
       throw SqlError{"comparing " + lc.name + " (" + sql_type_name(lc.sql) + ") with " + rc.name + " (" +
                          sql_type_name(rc.sql) + ") is not supported: a join compares columns of one type",
@@ -3547,7 +3596,7 @@ public:
                          item.pos, kUndefinedColumn};
         }
       }
-      out.push_back(joined_compare(ast::Compare::Op::Eq, left.id, *left.column(name), right.id, *right.column(name), item.pos));
+      out.push_back(joined_compare(ast::Compare::Op::Eq, "=", left.id, *left.column(name), right.id, *right.column(name), item.pos));
     }
     return out;
   }

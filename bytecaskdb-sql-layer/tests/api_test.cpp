@@ -2723,6 +2723,56 @@ TEST_CASE("embedded API: a filter on a DOUBLE or REAL compares in PostgreSQL's f
   CHECK(run("SELECT g FROM fc WHERE id >= $1 AND id <= $2 GROUP BY g HAVING sum(f) >= $3", {i(2), i(4), Value{1.5}}) == Grid{{i(0)}});
 }
 
+TEST_CASE("embedded API: two columns of one table compare as a filter of its rows", "[sql][api]") {
+  sql_test::TempDir dir{"api_column_compare"};
+  auto db = Database::open(dir.path());
+  auto run = [&](std::string_view sql, const std::vector<Value>& params = {}) { return db->execute(sql, params).rows; };
+  auto ids = [&](std::string_view sql, const std::vector<Value>& params = {}) {
+    std::vector<std::int64_t> out;
+    for (const auto& r : run(sql, params)) out.push_back(std::get<std::int64_t>(r[0]));
+    std::ranges::sort(out);
+    return out;
+  };
+  using Ids = std::vector<std::int64_t>;
+  const auto nan = std::numeric_limits<double>::quiet_NaN();
+  (void)run("CREATE TABLE cc (id INTEGER PRIMARY KEY, i INTEGER, s SMALLINT, b BIGINT, f DOUBLE PRECISION, r REAL, "
+            "t TEXT, v VARCHAR(8), c CHAR(4))");
+  auto row = [&](int id, Value iv, Value sv, Value bv, Value fv, Value rv, Value tv, Value vv, Value cv) {
+    (void)db->execute("INSERT INTO cc VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)", {i(id), iv, sv, bv, fv, rv, tv, vv, cv});
+  };
+  auto text = [](std::string_view x) { return Value{sql_test::bytes(x)}; };
+  row(1, i(1), i(1), i(1), Value{1.5}, Value{1.0}, text("a"), text("a"), text("a"));
+  row(2, i(2), i(3), i(2), Value{2.0}, Value{2.0}, text("b "), text("b"), text("b"));
+  row(3, i(3), i(2), i(9007199254740993), Value{9007199254740992.0}, Value{nan}, text("c"), text("d"), text("c"));
+  row(4, i(16777217), kNull, i(4), Value{nan}, Value{16777216.0}, kNull, text("e"), text("e"));
+  row(5, i(0), i(0), i(0), Value{-0.0}, Value{0.0}, text("x"), text("x"), kNull);
+  // An integer with a DOUBLE or REAL: as float8, PostgreSQL's cast of the
+  // integer, NaN above every number and -0.0 equal to 0.0.
+  CHECK(ids("SELECT id FROM cc WHERE i >= f") == Ids{2, 5});
+  CHECK(ids("SELECT id FROM cc WHERE i < f") == Ids{1, 3, 4});
+  CHECK(ids("SELECT id FROM cc WHERE f = i") == Ids{2, 5});
+  CHECK(ids("SELECT id FROM cc WHERE b = f") == Ids{2, 3, 5});  // 2^53 + 1 is 2^53 as a float8
+  CHECK(ids("SELECT id FROM cc WHERE i = r") == Ids{1, 2, 5});  // 2^24 + 1 is not 2^24 as a float8
+  CHECK(ids("SELECT id FROM cc WHERE r > f") == Ids{3});
+  CHECK(ids("SELECT id FROM cc WHERE r = f") == Ids{2, 5});
+  // Integers of any width; the operator as written; inside AND, OR and NOT.
+  CHECK(ids("SELECT id FROM cc WHERE s < i") == Ids{3});
+  CHECK(ids("SELECT id FROM cc WHERE i <> b") == Ids{3, 4});
+  CHECK(ids("SELECT id FROM cc WHERE NOT (s = b) OR id = $1", {i(1)}) == Ids{1, 2, 3});
+  CHECK(ids("SELECT id FROM cc WHERE id >= $1 AND i = b", {i(2)}) == Ids{2, 5});
+  // TEXT with VARCHAR and CHAR(n) as text: the CHAR's spaces cut, the other's kept.
+  CHECK(ids("SELECT id FROM cc WHERE t = v") == Ids{1, 5});
+  CHECK(ids("SELECT id FROM cc WHERE c = t") == Ids{1, 3});
+  CHECK(ids("SELECT id FROM cc WHERE v > t") == Ids{3});
+  // In a join, of one table's rows, and in UPDATE and DELETE.
+  CHECK(run("SELECT a.id, b.id FROM cc a JOIN cc b ON a.id = b.i AND b.s < b.b ORDER BY a.id") == Grid{{i(3), i(3)}});
+  CHECK(run("SELECT a.id, b.id FROM cc a LEFT JOIN cc b ON a.id = b.id AND b.i < b.f WHERE a.id <= $1 ORDER BY a.id", {i(2)}) ==
+        Grid{{i(1), i(1)}, {i(2), kNull}});
+  CHECK(db->execute("UPDATE cc SET s = b WHERE s > i").affected == 1);
+  CHECK(db->execute("DELETE FROM cc WHERE i > r").affected == 1);
+  CHECK(ids("SELECT id FROM cc WHERE s = b") == Ids{1, 2, 5});
+}
+
 TEST_CASE("embedded API: the distinct values of an aggregate are held in the statement's memory and fail past it", "[sql][api][aggregate]") {
   sql_test::TempDir dir{"api_distinct_agg_mem"};
   auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});

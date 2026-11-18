@@ -309,6 +309,10 @@ TEST_CASE("codegen: what the planner refuses, with its message, and what it sort
   CHECK(refusal("SELECT k FROM fd WHERE k = $1 AND d < $2") == "accepted");
   CHECK(generate(f.cat(), "SELECT k FROM fd WHERE k = $1 AND d < $2").source.find("bc_cmp_f64(bc_col_f64(cx, row, COL_") !=
         std::string::npos);
+  // A DOUBLE beside an integer column of its table: the integer cast to double, in float8 order.
+  CHECK(refusal("SELECT k FROM fd WHERE d < k") == "accepted");
+  CHECK(generate(f.cat(), "SELECT k FROM fd WHERE d < k").source.find("bc_cmp_f64(bc_col_f64(cx, row, COL_") != std::string::npos);
+  CHECK(generate(f.cat(), "SELECT k FROM fd WHERE d < k").source.find(", (double)(bc_col_i64(cx, row, COL_") != std::string::npos);
   // $n + k bounds a range on a key, but compared by = it is a filter: it names no key.
   f.ddl(CreateTableDdl{"ik", {{"k", {SqlKind::Integer}, false, {}}}, {"k"}});
   CHECK(refusal("SELECT k FROM ik WHERE k >= $1 + 1") == "accepted");

@@ -104,10 +104,11 @@ are PostgreSQL's:
 - `'ab'` and `'ab   '` are one value: they compare equal, group, sort and
   `DISTINCT` together, and compare as the shorter run of the other's
   characters. Two `CHAR`s of different `n` compare the same way.
-- A `CHAR(n)` beside a `VARCHAR` or `TEXT` compares as text with the
-  `CHAR`'s spaces cut and the other's kept, as PostgreSQL's implicit cast
-  does: `CHAR(10)` `'foo'` equals `VARCHAR` `'foo'` and differs from
-  `'foo '`.
+- A `CHAR(n)` beside a `TEXT` column compares as text with the `CHAR`'s spaces cut and the other's kept, as PostgreSQL's
+  implicit cast does: `CHAR(10)` `'foo'` equals `TEXT` `'foo'` and differs
+  from `'foo '`. Beside a `VARCHAR` column PostgreSQL compares the two as
+  `bpchar`, the `VARCHAR`'s trailing spaces ignored too, so the layer
+  refuses that pair (below).
 - A value of more than `n` code points is cut when the excess is only
   spaces and refused otherwise (22001, `value too long for type
   character(n)`). This is PostgreSQL's rule; `VARCHAR(n)` refuses both.
@@ -122,6 +123,9 @@ Refused with a message, each for a reason:
 - **A parameter compared with a `CHAR(n)` column** (42601), for the same
   reason: a constant is cut when the statement is bound, a parameter would
   have to be cut at run time. A parameter that is only assigned works.
+- **A `CHAR(n)` column compared with a `VARCHAR` column** (42601), in one
+  table or a join: PostgreSQL's `bpchar` comparison ignores the `VARCHAR`'s
+  trailing spaces, which the layer stores.
 - **A cast to `CHAR(n)`, `LIKE` on a `CHAR(n)`** (PostgreSQL's `bpchar`
   `LIKE` keeps the padding significant, which stored values do not),
   **`MIN` and `MAX` of one, and a set operation** that meets one and a
