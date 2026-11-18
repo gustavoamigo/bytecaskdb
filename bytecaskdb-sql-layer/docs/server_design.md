@@ -667,12 +667,18 @@ are:
 - `BYTEA`: hex (`\x…`) and escape format (`\\`, `\nnn`).
 - text: the bytes; the layer checks UTF-8 (`22021`).
 - `TIMESTAMP`: `YYYY-MM-DD`, then optionally a space or `T` and
-  `HH:MM[:SS[.f…f]]` with up to 6 fraction digits, then optionally ` BC`.
+  `HH:MM[:SS[.f…f]]`, then optionally ` BC`.
 - `DATE`: `YYYY-MM-DD`, optionally ` BC`.
 - `TIME`: `HH:MM[:SS[.f…f]]`.
+- In both, as PostgreSQL's `DecodeTime` reads them: a fraction of any
+  number of digits, rounded to the microsecond as `rint(strtod(".f…f") *
+  10^6)` rounds it (to even, so `.1234565` is `.123456`), carrying into the
+  seconds; second 60, a leap second, as the next minute's first; hour 24,
+  minute 59 and second 60 at most, and at most `24:00:00` in all, which a
+  timestamp reads as the next day's midnight (22008 past it).
 
 Other datetime forms (`now`, `epoch`, `infinity`, a time zone, names of
-months, more than 6 fraction digits) are `22007`. That is a known
+months) are `22007`. That is a known
 difference: the driver writes ISO.
 
 ## Errors
