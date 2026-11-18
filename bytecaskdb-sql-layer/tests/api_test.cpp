@@ -2490,18 +2490,42 @@ TEST_CASE("embedded API: a view is read as a table, expanded at each use, and ke
     CHECK(run("SELECT a FROM g WHERE a > 100").empty());
     (void)run("CREATE VIEW ga AS SELECT a FROM vt GROUP BY a HAVING a >= 30");
     CHECK(run("SELECT a FROM ga ORDER BY a") == Grid{{i(30)}, {i(40)}});
-    // Grouping a grouped view again by its own groups is the view; otherwise it waits for derived tables.
+    // Grouping a grouped view again by its own groups is the view.
     CHECK(run("SELECT a FROM ga GROUP BY a ORDER BY a") == Grid{{i(30)}, {i(40)}});
     CHECK(run("SELECT a FROM ga WHERE a = 40 GROUP BY a HAVING a = 40") == Grid{{i(40)}});
     CHECK(run("SELECT a FROM ga WHERE a = 40 GROUP BY a HAVING a = 30").empty());
     // MIN, MAX and COUNT(DISTINCT) cannot tell a value once from many: they read the base rows the view keeps.
     CHECK(run("SELECT MAX(a), MIN(a) FROM ga") == Grid{{i(40), i(30)}});
     CHECK(run("SELECT COUNT(DISTINCT a) FROM ga WHERE a < 40") == Grid{{i(1)}});
-    CHECK(state(*db, "SELECT SUM(a) FROM ga") == "42601");
-    CHECK(state(*db, "SELECT COUNT(*) FROM ga") == "42601");
-    CHECK(state(*db, "SELECT DISTINCT a FROM ga") == "42601");
-    CHECK(state(*db, "SELECT a, n FROM g GROUP BY a") == "42601");
+    // Any other aggregate reads the view's groups as rows: a derived relation.
+    CHECK(run("SELECT SUM(a) FROM ga") == Grid{{i(70)}});
+    CHECK(run("SELECT COUNT(*) FROM ga") == Grid{{i(2)}});
+    CHECK(run("SELECT DISTINCT a FROM ga ORDER BY a") == Grid{{i(30)}, {i(40)}});
+    CHECK(run("SELECT SUM(n), MAX(lo) FROM g WHERE a < 40") == Grid{{i(4), i(3)}});
+    CHECK(run("SELECT n, COUNT(*) FROM g GROUP BY n ORDER BY n") == Grid{{i(1), i(3)}, {i(2), i(1)}});
+    // A derived relation has no primary key: a column it does not group is 42803, as PostgreSQL's.
+    CHECK(state(*db, "SELECT a, n FROM g GROUP BY a") == "42803");
     CHECK(state(*db, "SELECT a FROM g JOIN vu ON g.a = vu.id") == "42601");
+    // The statement's LIMIT and OFFSET count the relation's rows above, never the view's groups.
+    CHECK(run("SELECT COUNT(*) FROM g LIMIT 1") == Grid{{i(4)}});
+    CHECK(run("SELECT DISTINCT n FROM g ORDER BY n LIMIT 1") == Grid{{i(1)}});
+    CHECK(run("SELECT n, COUNT(*) FROM g GROUP BY n ORDER BY n DESC LIMIT 1 OFFSET 1") == Grid{{i(1), i(3)}});
+    // A view of one group (no GROUP BY) filtered by constants, a column's or a key's range: its
+    // group over the rows it keeps, over none too. A point lookup may end the plan before it
+    // reads, which gives no group: refused.
+    (void)run("CREATE VIEW c1 AS SELECT COUNT(*) AS c, SUM(a) AS s FROM vt WHERE a > 15");
+    CHECK(run("SELECT SUM(c), MAX(s) FROM c1") == Grid{{i(3), i(90)}});
+    (void)run("CREATE VIEW c2 AS SELECT COUNT(*) AS c FROM vt WHERE id > 1 AND id < 4");
+    CHECK(run("SELECT SUM(c) FROM c2") == Grid{{i(2)}});
+    (void)run("CREATE VIEW c3 AS SELECT COUNT(*) AS c, SUM(a) AS s FROM vt WHERE id < 0");
+    CHECK(run("SELECT COUNT(*), SUM(c), MAX(s) FROM c3") == Grid{{i(1), i(0), Value{}}});
+    (void)run("CREATE VIEW c4 AS SELECT COUNT(*) AS c FROM vt WHERE id = 3");
+    CHECK(state(*db, "SELECT SUM(c) FROM c4") == "0A000");
+    // One level: a view that reads a grouped view as a relation is not read as one.
+    (void)run("CREATE VIEW gg AS SELECT n, SUM(lo) AS s FROM g GROUP BY n");
+    CHECK(run("SELECT n, s FROM gg ORDER BY n") == Grid{{i(1), i(2 + 3 + 4)}, {i(2), i(1)}});
+    CHECK(state(*db, "SELECT SUM(s) FROM gg") == "42601");
+    for (auto v : {"gg", "c1", "c2", "c3", "c4"}) (void)run(std::string{"DROP VIEW "} + v);
 
     // A view that cuts rows (DISTINCT, LIMIT) is created, and not read yet.
     (void)run("CREATE VIEW d AS SELECT DISTINCT a FROM vt");

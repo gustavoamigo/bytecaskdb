@@ -9,7 +9,7 @@
 //
 // The operators are Empty, the access paths, the joins (an index nested
 // loop, a nested loop and a hash join), the choice points, Filter, Sort,
-// Limit, Aggregate, GroupAggregate and the sinks: Emit for result rows,
+// Limit, Aggregate, GroupAggregate, Derived and the sinks: Emit for result rows,
 // GroupEmit for a GroupAggregate's, Insert, Update, Delete. check()
 // enforces what the types can't express.
 
@@ -319,7 +319,8 @@ struct GroupAggregate {
 
 // Where a GroupAggregate keeps what it gives for a group, by bc_agg_* slots
 // (group_layout, of its columns()): slot 0 counts its rows; a BIGINT-like
-// column (an I64), a key or dependent, takes a slot holding its value,
+// column (an I64), a key or dependent, or a derived relation's BOOLEAN,
+// takes a slot holding its value,
 // folded once; any other is read from a row of its table, the group's
 // first, held in a hash table under the group's key, one per such table
 // (`held`); each aggregate takes
@@ -338,7 +339,9 @@ struct GroupLayout {
 [[nodiscard]] auto group_layout(const std::vector<ColumnRef>& columns, const std::vector<Expr>& aggs) -> GroupLayout {
   GroupLayout l;
   for (const auto& k : columns) {
-    if (k.type == PhysType::I64) {
+    // A derived relation's column is in a local, never a row: a BOOLEAN
+    // takes a slot too, as 0 or 1.
+    if (k.type == PhysType::I64 || (k.type == PhysType::Bool && Table::derived(k.table))) {
       l.key_slot.emplace_back(l.slots++);
       continue;
     }
@@ -364,6 +367,18 @@ struct GroupLayout {
 struct GroupEmit {
   NodePtr input;
   std::vector<Expr> outputs;
+};
+
+// A derived relation's rows (docs/planner_design.md, *Derived relations*):
+// the groups of a grouped view's query, whose plan `input` is a GroupEmit,
+// its i-th output columns[i], a column of `table` (Table::derived). Nothing
+// is read or held: for each group the query gives, its outputs are bound to
+// locals and the plan above runs on them, inside the query's loop over its
+// groups. The query's choice points are the plan's.
+struct Derived {
+  NodePtr input;
+  std::uint32_t table{0};
+  std::vector<ColumnRef> columns;
 };
 
 // The columns given, in table order, each from a parameter; the rest keep
@@ -417,7 +432,7 @@ struct Delete {
 
 struct Node {
   std::variant<Empty, OneRow, PointGet, Scan, NullSplitScan, CountRange, KeyAggregates, IndexJoin, NestedLoop, HashJoin, Choice,
-               Filter, Sort, Limit, Emit, Aggregate, GroupAggregate, GroupEmit, Insert, InsertFrom, Update, Delete>
+               Filter, Sort, Limit, Emit, Aggregate, GroupAggregate, GroupEmit, Derived, Insert, InsertFrom, Update, Delete>
       op;
 };
 
@@ -970,6 +985,12 @@ private:
       tables_of(*h->build, out);
     }
     if (const auto* g = std::get_if<GroupAggregate>(&n.op)) tables_of(*g->input, out);
+    if (const auto* d = std::get_if<Derived>(&n.op)) out.push_back(d->table);
+  }
+
+  // Whether a node's rows are a derived relation's, which no row holds.
+  static auto of_derived(const Node& n) -> bool {
+    return std::ranges::any_of(tables_of(n), [](std::uint32_t t) { return Table::derived(t); });
   }
   static auto tables_of(const Node& n) -> std::vector<std::uint32_t> {
     std::vector<std::uint32_t> out;
@@ -1345,6 +1366,7 @@ private:
               node(*op.input, &n);
               return;
             }
+            if (of_derived(*op.input)) broken("a sort of a derived relation's rows, which no sorter holds");
             // A sorter per loop it holds, outer first, each holding its
             // loop's row; a covering scan's entry has none.
             auto held = op.payloads.begin();
@@ -1384,6 +1406,7 @@ private:
             if (op.offset < 0 || op.offset > op.n) broken("a LIMIT whose OFFSET is negative or past it");
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Emit>) {
+            if (of_derived(*op.input)) broken("rows emitted from a derived relation, which only a grouped aggregate reads");
             for (const auto& t : op.targets) {
               if (const auto* c = std::get_if<ColumnRef>(&t)) {
                 read(*c);
@@ -1413,6 +1436,7 @@ private:
             }
             argument(op.agg);
             reads(op.agg);
+            if (of_derived(*op.input)) broken("an aggregate row over a derived relation, which only a grouped aggregate reads");
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, GroupAggregate>) {
             // Over Empty no row is read: a key or an argument of a table the
@@ -1437,6 +1461,7 @@ private:
             if (!op.streamed) {
               for (auto t : group_layout(columns, op.aggs).held) {
                 if (std::ranges::find(covering_, t) != covering_.end()) broken("a structure of groups that holds a covering scan's entry");
+                if (Table::derived(t)) broken("a structure of groups that holds a row of a derived relation");
               }
             }
             for (const auto& a : op.aggs) {
@@ -1466,6 +1491,21 @@ private:
                 auto known = o.kind == Expr::Kind::Column ? std::ranges::find(columns, o.col) != columns.end()
                                                           : std::ranges::find(g->aggs, o) != g->aggs.end();
                 if (!known) broken("a grouped output that is no key or aggregate of its groups");
+              }
+            }
+            node(*op.input, &n);
+          } else if constexpr (std::is_same_v<T, Derived>) {
+            // Its columns are its query's outputs, in order, each of the
+            // output's type: what codegen binds to a local of that type.
+            if (!Table::derived(op.table)) broken("a derived relation with the id of a table");
+            const auto* e = std::get_if<GroupEmit>(&op.input->op);
+            if (e == nullptr) broken("a derived relation whose query's rows are not a GroupEmit's");
+            if (e->outputs.size() != op.columns.size()) broken("a derived relation of other columns than its query gives");
+            for (std::size_t i = 0; i < op.columns.size(); ++i) {
+              const auto& c = op.columns[i];
+              const auto& o = e->outputs[i];
+              if (c.table != op.table || c.col != i || o.type.kind == SqlKind::Numeric || c.type != o.phys()) {
+                broken("a derived relation's column that is not its query's output");
               }
             }
             node(*op.input, &n);

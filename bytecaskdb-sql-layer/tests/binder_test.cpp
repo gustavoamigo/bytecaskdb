@@ -1689,3 +1689,64 @@ TEST_CASE("binder: $n::T in a value types $n as T; a SELECT without FROM binds a
   CHECK(get<logical::Project>(bind_sql(cat, "SELECT qty % 2 FROM t")).exprs[0].name == "?column?");
   CHECK(get<logical::Project>(bind_sql(cat, "SELECT (SELECT 1) % 2")).exprs[0].name == "?column?");
 }
+
+TEST_CASE("binder: a query that aggregates over a grouped view reads it as a derived relation", "[sql][binder][view]") {
+  sql_test::Fixture f;
+  auto view = [&](std::string_view sql) { f.ddl(std::get<Ddl>(bind_sql(f.cat(), sql).stmt)); };
+  view("CREATE VIEW h AS SELECT qty, MIN(id) AS lo, COUNT(*) AS n FROM t GROUP BY qty");
+  view("CREATE VIEW k AS SELECT name, COUNT(*) AS c FROM t GROUP BY name");
+  view("CREATE VIEW g AS SELECT qty FROM t GROUP BY qty");
+  view("CREATE VIEW a AS SELECT qty, AVG(qty) AS m FROM t GROUP BY qty");
+  view("CREATE VIEW hh AS SELECT n, SUM(lo) AS s FROM h GROUP BY n");
+  const auto& cat = f.cat();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+      return "bound";
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what();
+    }
+  };
+  {
+    auto b = bind_sql(cat, "SELECT SUM(lo), n FROM h WHERE lo > 0 GROUP BY n");
+    const auto& d = get<logical::Derived>(b);
+    REQUIRE(d.table != nullptr);
+    CHECK(Table::derived(d.table->id));
+    CHECK(d.table->name == "h");
+    CHECK(d.table->pk_col_ids.empty());
+    REQUIRE(d.table->columns.size() == 3);
+    // Each column's NULLs are its output's: the grouped column's, COUNT never, MIN always.
+    CHECK(d.table->columns[0].name == "qty");
+    CHECK(d.table->columns[0].nullable);
+    CHECK(d.table->columns[1].nullable);
+    CHECK_FALSE(d.table->columns[2].nullable);
+    CHECK(d.table->columns[2].sql == SqlType{SqlKind::BigInt});
+    // Its query is the view's: grouped, a plan of its own below the relation.
+    REQUIRE(d.plan != nullptr);
+    CHECK(find<logical::Aggregate>(*d.plan) != nullptr);
+    // The outer query groups and filters the relation's columns.
+    const auto& agg = get<logical::Aggregate>(b);
+    REQUIRE(agg.group_by.size() == 1);
+    CHECK(agg.group_by[0].col.table == d.table->id);
+    // The bound statement owns the relation's table.
+    CHECK(std::ranges::any_of(b.instances, [&](const auto& t) { return t.get() == d.table; }));
+  }
+  // A grouped view merged as before: no derived relation.
+  CHECK(find<logical::Derived>(root(bind_sql(cat, "SELECT qty FROM g GROUP BY qty"))) == nullptr);
+  CHECK(find<logical::Derived>(root(bind_sql(cat, "SELECT MAX(qty) FROM g"))) == nullptr);
+  CHECK(find<logical::Derived>(root(bind_sql(cat, "SELECT qty, n FROM h"))) == nullptr);
+  // Aggregated otherwise, read as a relation; an aggregate's column grouped by too.
+  CHECK(find<logical::Derived>(root(bind_sql(cat, "SELECT COUNT(*) FROM g"))) != nullptr);
+  CHECK(find<logical::Derived>(root(bind_sql(cat, "SELECT n, COUNT(*) FROM h GROUP BY n"))) != nullptr);
+  // No primary key: an ungrouped column is 42803, as in PostgreSQL.
+  CHECK(state("SELECT qty, lo FROM h GROUP BY qty") ==
+        "42803 column \"h.lo\" must appear in the GROUP BY clause or be used in an aggregate function");
+  CHECK(state("SELECT name, SUM(c) FROM k GROUP BY name") ==
+        "42601 grouping a grouped view's rows by a bytea column is not supported yet");
+  CHECK(state("SELECT SUM(m) FROM a").starts_with("42601 aggregating over a grouped view's AVG of an integer"));
+  CHECK(state("SELECT SUM(lo) FROM h WHERE nope = 1") == "42703 column \"nope\" does not exist");
+  // One level: a view that reads a grouped view as a relation is read, and not aggregated over.
+  CHECK(state("SELECT n, s FROM hh") == "bound");
+  CHECK(state("SELECT SUM(s) FROM hh") ==
+        "42601 aggregating over a view that aggregates over a grouped view is not supported yet");
+}

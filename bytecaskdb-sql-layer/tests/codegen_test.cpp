@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 import bytecask.sql.codegen;
@@ -474,4 +475,20 @@ END $$)",
   CHECK(g.source.find("while (bc_range_next(px, 0, 4))") != std::string::npos);
   CHECK(g.source.find("while (bc_loop(px))") != std::string::npos);
   CHECK(g.source.find("s0(bc_stmt_begin(px, 0));") != std::string::npos);
+}
+
+TEST_CASE("codegen: a derived relation binds each of its query's groups to locals for the plan above", "[sql][codegen][view]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(bound::bind(ast::parse("CREATE VIEW v AS SELECT qty, MIN(id) AS lo FROM t GROUP BY qty"), f.cat()).stmt));
+  const auto& cat = f.cat();
+  auto plan = generate(cat, "SELECT SUM(lo) FROM v WHERE lo > $1");
+  INFO(plan.source);
+  // The view's groups, each output in a local, then the outer fold in a block a miss leaves.
+  CHECK(plan.source.find("bool d0_n1 = ") != std::string::npos);
+  CHECK(plan.source.find("int64_t d0_v1 = INT64_C(0);") != std::string::npos);
+  CHECK(plan.source.find("if (d0_n1 || bc_param_null(cx, 0) || !(d0_v1 > bc_param_i64(cx, 0))) continue;") != std::string::npos);
+  CHECK(plan.source.find("} while (0);") != std::string::npos);
+  // It reads the view's table, as the view's query does.
+  CHECK(plan.objects_read == std::vector<std::uint32_t>{cat.table("t")->id});
+  CHECK_FALSE(plan.resumable);
 }

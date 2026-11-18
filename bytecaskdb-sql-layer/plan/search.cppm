@@ -93,13 +93,18 @@ inline constexpr std::size_t kMaxChoices = 4;
 // the first plan of a choice point by the count it holds, the other its
 // second. Throws FeatureNotSupported, its message starting "no plan:", when no
 // plan computes it or the logical plan has a shape the search does not plan.
+// `never_null` names the parameters whose value is never NULL: the
+// statement's constants that are not NULL (bound::Bound::fixed), which a
+// check for NULL never ends the plan on.
 [[nodiscard]] auto search(const logical::Node& root, const Catalog& cat, const RowCounts& counts = {},
-                          std::uint64_t memory_bytes = 0) -> physical::Plan;
+                          std::uint64_t memory_bytes = 0, const std::vector<std::uint32_t>& never_null = {})
+    -> physical::Plan;
 
 // Every plan the search costs for the statement, none pruned, cheapest first
 // (*Tests*, alternatives agree). Refuses what search refuses.
 [[nodiscard]] auto search_all(const logical::Node& root, const Catalog& cat, const RowCounts& counts = {},
-                              std::uint64_t memory_bytes = 0) -> std::vector<physical::Plan>;
+                              std::uint64_t memory_bytes = 0, const std::vector<std::uint32_t>& never_null = {})
+    -> std::vector<physical::Plan>;
 
 // The threshold of a choice point between two plans whose costs, at a count
 // x of the first plan's range, are first(x) and second(x): the least x in
@@ -153,7 +158,7 @@ using Conjuncts = std::vector<Expr>;
 // An operator's name, for a refusal of a shape the search does not plan.
 auto op_name(const logical::Node& n) -> std::string {
   constexpr const char* kNames[] = {"Get",  "Empty", "OneRow", "Filter", "Project", "Join",  "Aggregate",
-                                    "Sort", "Limit", "SetOp", "Insert", "InsertFrom", "Update", "Delete"};
+                                    "Sort", "Limit", "SetOp", "Insert", "InsertFrom", "Update", "Delete", "Derived"};
   static_assert(std::size(kNames) == std::variant_size_v<decltype(n.op)>);
   return kNames[n.op.index()];
 }
@@ -749,8 +754,9 @@ struct Finished {
 
 class Search {
 public:
-  Search(const Catalog& cat, const RowCounts& counts, std::uint64_t memory, bool all)
-      : cat_{cat}, counts_{counts}, memory_{memory}, all_{all} {}
+  Search(const Catalog& cat, const RowCounts& counts, std::uint64_t memory, bool all,
+         const std::vector<std::uint32_t>& never_null)
+      : cat_{cat}, counts_{counts}, memory_{memory}, all_{all}, never_null_{never_null} {}
 
   // The statement's plans, cheapest first: one, or every one costed.
   auto plans(const logical::Node& root) -> std::vector<physical::Plan> {
@@ -2252,7 +2258,7 @@ private:
   }
 
   auto select(const logical::Node& root) -> std::vector<Finished> {
-    if (grouped(root)) return group_select(root);
+    if (grouped(root) || derived_below(root) != nullptr) return group_select(root);
     auto s = select_parts(root);
     result(s);
     if (const auto* e = std::get_if<logical::Empty>(&s.source->op)) return nothing(s, *e);
@@ -2376,6 +2382,20 @@ private:
     // of a DOUBLE takes the grouped route.
     return e.kind != Expr::Kind::Aggregate || (e.fn != Expr::Fn::Count && e.fn != Expr::Fn::Sum) ||
            (e.fn == Expr::Fn::Sum && (e.distinct || e.args[0].phys() == PhysType::F64));
+  }
+
+  // The derived relation an aggregated SELECT reads, under its WHERE, or
+  // null: Limit? -> Sort? -> Filter? -> Aggregate -> Filter? -> Derived.
+  static auto derived_below(const logical::Node& root) -> const logical::Derived* {
+    const auto* n = &root;
+    if (const auto* l = std::get_if<logical::Limit>(&n->op)) n = l->input.get();
+    if (const auto* o = std::get_if<logical::Sort>(&n->op)) n = o->input.get();
+    if (const auto* f = std::get_if<logical::Filter>(&n->op)) n = f->input.get();
+    const auto* a = std::get_if<logical::Aggregate>(&n->op);
+    if (a == nullptr) return nullptr;
+    n = a->input.get();
+    if (const auto* f = std::get_if<logical::Filter>(&n->op)) n = f->input.get();
+    return std::get_if<logical::Derived>(&n->op);
   }
 
   static auto group_parts(const logical::Node& root) -> GroupParts {
@@ -2520,6 +2540,24 @@ private:
       out.push_back({rooted(branch(physical::node(physical::Empty{}), keys.empty(), nullptr)), {}, {}, 0});
       return out;
     }
+    if (const auto* d = derived_below(root)) {
+      // Its groups in a structure, or one group streamed: a derived
+      // relation's rows come in no order a stream could group by, and none
+      // an ORDER BY could use.
+      SortSpec sort{{}, kept(g.limit)};
+      std::vector<OrderItem> ordered;
+      for (const auto& o : order_by) {
+        if (std::ranges::none_of(ordered, [&](const OrderItem& p) { return p.same_key(o); })) ordered.push_back(o);
+      }
+      for (const auto& o : ordered) sort.keys.push_back(o.part());
+      const auto* where = std::get_if<logical::Filter>(&source->op);
+      for (auto& f : derived_rows(*d, where != nullptr ? where->conjuncts : Conjuncts{})) {
+        auto sorts = !keys.empty() && !sort.keys.empty();
+        out.push_back({rooted(branch(std::move(f.root), keys.empty(), sorts ? &sort : nullptr)), std::move(f.null_checks),
+                       std::move(f.computed), f.cost});
+      }
+      return out;
+    }
     Query q;
     flatten(*source, q);
     for (const auto& rel : q.rels) constants(rel.table());
@@ -2655,6 +2693,66 @@ private:
     return out;
   }
 
+  // A derived relation's rows under the query's WHERE, one per plan of its
+  // query (docs/planner_design.md, *Derived relations*): that query searched
+  // alone, as a SELECT of its own, its groups always a GroupAggregate's so a
+  // GroupEmit gives them (never one aggregate row or the keys' answer),
+  // every plan of it when the search returns them all. Its constants join
+  // the statement's; its parameters checked for NULL and its $n ± k are the
+  // statement's: a NULL that matches no row of a query with GROUP BY gives
+  // no group, so no row of the relation, which is what the statement's
+  // plan gives when it ends before reading. A query of one group of every
+  // row gives its group over no rows too, so where its plan may end before
+  // it reads (a parameter that may be NULL checked, a point lookup that
+  // misses) that plan is not taken; none left is a refusal. A constant that
+  // is not NULL (never_null_) never ends it, so a filter or range on
+  // constants is taken. The WHERE compares the relation's
+  // columns with parameters, constants or each other, or is a predicate.
+  auto derived_rows(const logical::Derived& d, const Conjuncts& where) -> std::vector<Finished> {
+    for (const auto& c : where) {
+      if (logical::is_predicate(c) || c.kind == Expr::Kind::Const) continue;
+      if (!is_compare(c) || c.args[0].kind != Expr::Kind::Column ||
+          (operand_of(c).kind != Expr::Kind::Param && operand_of(c).kind != Expr::Kind::Column)) {
+        no_plan("a conjunct on a derived relation other than a comparison of its column with a parameter or a column");
+      }
+    }
+    tables_.emplace(d.table->id, d.table);
+    Search sub{cat_, counts_, memory_, all_, never_null_};
+    sub.note_tables(*d.plan);
+    auto inner = sub.group_select(*d.plan);
+    for (const auto& c : sub.constants_) {
+      if (std::ranges::none_of(constants_, [&](const Catalog::PlanConstant& k) { return k.name == c.name; })) constants_.push_back(c);
+    }
+    std::vector<ColumnRef> columns;
+    for (const auto& c : d.table->columns) columns.push_back(logical::column_of(d.table->id, c).col);
+    std::vector<Finished> out;
+    for (auto& f : inner) {
+      const auto* e = std::get_if<physical::GroupEmit>(&f.root->op);
+      if (e == nullptr) continue;
+      // A choice point by the budget chooses between two plans of the same groups.
+      const auto* below = e->input.get();
+      if (const auto* c = std::get_if<physical::Choice>(&below->op)) below = c->below.get();
+      const auto* g = physical::group_below(*below);
+      if (g == nullptr) continue;
+      const auto may_be_null = [&](std::uint32_t p) { return !std::ranges::contains(never_null_, p); };
+      if (g->keys.empty() && (std::ranges::any_of(f.null_checks, may_be_null) || one_row(*g->input))) continue;
+      auto rows = physical::node(physical::Derived{std::move(f.root), d.table->id, columns});
+      if (!where.empty()) rows = physical::node(physical::Filter{std::move(rows), where});
+      out.push_back({std::move(rows), std::move(f.null_checks), std::move(f.computed), f.cost});
+    }
+    if (out.empty()) no_plan("a derived relation of one group whose query's plan may end before it reads a row");
+    return out;
+  }
+
+  // Whether a plan's rows are at most one, read once: a point lookup, then
+  // lookups by key, under filters.
+  static auto one_row(const physical::Node& n) -> bool {
+    if (std::holds_alternative<physical::PointGet>(n.op)) return true;
+    if (const auto* f = std::get_if<physical::Filter>(&n.op)) return one_row(*f->input);
+    if (const auto* j = std::get_if<physical::IndexJoin>(&n.op)) return one_row(*j->outer);
+    return false;
+  }
+
   // Aggregates of one group of every row answered from the keys of `c`'s
   // range (KeyAggregates), where each is COUNT(*), or MIN or MAX of one
   // column, the ASC part after the scan's prefix, and nothing filters a
@@ -2715,6 +2813,7 @@ private:
   const RowCounts& counts_;
   std::uint64_t memory_;  // the statement's memory budget, 0 for none
   bool all_;
+  const std::vector<std::uint32_t>& never_null_;  // parameters never NULL: constants that are not
   std::map<std::uint32_t, double> rows_;
   std::vector<Catalog::PlanConstant> constants_;
   std::map<std::uint32_t, const Table*> tables_;  // by id, the statement's, instances among them
@@ -2723,14 +2822,14 @@ private:
 
 }  // namespace
 
-auto search(const logical::Node& root, const Catalog& cat, const RowCounts& counts, std::uint64_t memory_bytes)
-    -> physical::Plan {
-  return std::move(Search{cat, counts, memory_bytes, false}.plans(root).front());
+auto search(const logical::Node& root, const Catalog& cat, const RowCounts& counts, std::uint64_t memory_bytes,
+            const std::vector<std::uint32_t>& never_null) -> physical::Plan {
+  return std::move(Search{cat, counts, memory_bytes, false, never_null}.plans(root).front());
 }
 
-auto search_all(const logical::Node& root, const Catalog& cat, const RowCounts& counts, std::uint64_t memory_bytes)
-    -> std::vector<physical::Plan> {
-  return Search{cat, counts, memory_bytes, true}.plans(root);
+auto search_all(const logical::Node& root, const Catalog& cat, const RowCounts& counts, std::uint64_t memory_bytes,
+                const std::vector<std::uint32_t>& never_null) -> std::vector<physical::Plan> {
+  return Search{cat, counts, memory_bytes, true, never_null}.plans(root);
 }
 
 }  // namespace bytecask::sql

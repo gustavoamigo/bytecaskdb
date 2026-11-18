@@ -330,6 +330,12 @@ struct Table {
   // several tables*).
   static constexpr std::uint32_t kInstanceBase = std::uint32_t{1} << 30;
   std::uint32_t source{0};
+  // A derived relation, a grouped view a query reads as rows of its own: a
+  // table the binder makes and owns, whose columns are its query's outputs,
+  // with an id in [kDerivedBase, kDerivedEnd) and no storage, key or index.
+  static constexpr std::uint32_t kDerivedBase = std::uint32_t{1} << 29;
+  static constexpr std::uint32_t kDerivedEnd = kDerivedBase + (std::uint32_t{1} << 20);
+  [[nodiscard]] static constexpr auto derived(std::uint32_t id) -> bool { return id >= kDerivedBase && id < kDerivedEnd; }
 
   // The table whose rows this one reads: its own, or its source's.
   [[nodiscard]] auto storage_id() const -> std::uint32_t;

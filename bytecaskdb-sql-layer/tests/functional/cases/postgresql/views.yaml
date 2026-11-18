@@ -1,7 +1,7 @@
 # Views: CREATE VIEW and DROP VIEW, read like a table in FROM. A view is its
-# query, read again at each use. INSERT writes through a simple view; UPDATE
-# and DELETE through one, WITH CHECK OPTION, and a query that aggregates over
-# a grouped view, beyond MIN and MAX of one with no aggregate, are not built.
+# query, read again at each use. INSERT writes through a simple view; a query
+# that aggregates over a grouped view reads its groups as rows. UPDATE and
+# DELETE through a view, and WITH CHECK OPTION, are not built.
 
 - name: a view reads its table's rows as they are when it is read
   features: [F031-02]
@@ -291,8 +291,6 @@
 
 - name: a query that aggregates over a grouped view
   features: [F131-03]
-  unimplemented: true
-  # needs a derived table: refused (42601), the aggregate of the view's own aggregate
   setup:
     - CREATE TABLE vw8 (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)
     - CREATE VIEW vw8_h AS SELECT a, MIN(b) AS lo FROM vw8 GROUP BY a
@@ -308,6 +306,43 @@
   teardown:
     - DROP VIEW vw8_h
     - DROP TABLE vw8
+
+- name: an aggregate over a view of one group whose WHERE compares with constants
+  features: [F131-03]
+  setup:
+    - CREATE TABLE vw10 (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)
+    - INSERT INTO vw10 VALUES (1, 1, 1), (2, 1, 2), (3, 2, 3), (4, 3, 4), (5, 4, 5)
+    - CREATE VIEW vw10_f AS SELECT COUNT(*) AS c, SUM(b) AS s FROM vw10 WHERE a > 1
+    - CREATE VIEW vw10_r AS SELECT COUNT(*) AS c FROM vw10 WHERE id BETWEEN 2 AND 4
+    - CREATE VIEW vw10_e AS SELECT COUNT(*) AS c, SUM(b) AS s FROM vw10 WHERE id < 0
+  steps:
+    - sql: SELECT SUM(c), MAX(s) FROM vw10_f
+      expected: [[3, 12]]
+    - sql: SELECT SUM(c) FROM vw10_r
+      expected: [[3]]
+    # its one group over no rows: COUNT 0, SUM NULL
+    - sql: SELECT COUNT(*), SUM(c), MAX(s) FROM vw10_e
+      expected: [[1, 0, null]]
+  teardown:
+    - DROP VIEW vw10_e
+    - DROP VIEW vw10_r
+    - DROP VIEW vw10_f
+    - DROP TABLE vw10
+
+- name: an aggregate over a view of one group read by a point lookup
+  features: [F131-03]
+  unimplemented: true
+  # the plan may end before it reads, which gives no group: refused (0A000), #833
+  setup:
+    - CREATE TABLE vw11 (id INTEGER PRIMARY KEY, a INTEGER)
+    - INSERT INTO vw11 VALUES (1, 1), (3, 2)
+    - CREATE VIEW vw11_p AS SELECT COUNT(*) AS c FROM vw11 WHERE id = 3
+  steps:
+    - sql: SELECT SUM(c) FROM vw11_p
+      expected: [[1]]
+  teardown:
+    - DROP VIEW vw11_p
+    - DROP TABLE vw11
 
 - name: MIN, MAX and COUNT(DISTINCT) over a grouped view that has no aggregate read the base rows' values
   features: [F131-04]
@@ -334,9 +369,9 @@
     - sql: SELECT a, MAX(b) FROM vw9_g GROUP BY a ORDER BY a
       expected: [[1, 5], [2, 7]]
       ordered: true
-    # SUM and COUNT count the view's rows, one per group: still refused
+    # SUM and COUNT count the view's rows, one per group
     - sql: SELECT SUM(b) FROM vw9_g
-      error: "42601"
+      expected: [[12]]
   teardown:
     - DROP VIEW vw9_g
     - DROP TABLE vw9

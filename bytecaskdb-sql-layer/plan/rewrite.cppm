@@ -13,6 +13,8 @@
 //      Filters in a row become one, so a Get has at most one;
 //   3. projection pruning: each operator's `output` is the columns
 //      something above it reads.
+// A derived relation's query (logical::Derived) is a query of its own,
+// rewritten alone first; to the plan around it the relation is a leaf.
 
 module;
 #include <algorithm>
@@ -199,12 +201,16 @@ auto fold_conjuncts(std::vector<Expr>& conjuncts, bool& never) -> bool {
   return changed || dropped > 0;
 }
 
-// The tables a subtree reads.
-void tables_of(const Node& n, std::vector<const Table*>& out);
+// The tables a subtree reads: a derived relation's own table, or, `base`,
+// the tables its query reads.
+void tables_of(const Node& n, std::vector<const Table*>& out, bool base = false);
 
+// No rows, naming the tables the subtree read, so the plan still depends on
+// them: a derived relation's by the tables of its query, which the catalog
+// holds.
 auto empty_of(const Node& n) -> Node {
   Empty e;
-  tables_of(n, e.tables);
+  tables_of(n, e.tables, true);
   return Node{std::move(e), {}};
 }
 
@@ -268,7 +274,7 @@ auto fold_constants(Node& n) -> bool {
   return changed;
 }
 
-void tables_of(const Node& n, std::vector<const Table*>& out) {
+void tables_of(const Node& n, std::vector<const Table*>& out, bool base) {
   if (const auto* g = std::get_if<Get>(&n.op)) {
     out.push_back(g->table);
     return;
@@ -277,12 +283,34 @@ void tables_of(const Node& n, std::vector<const Table*>& out) {
     out.insert(out.end(), e->tables.begin(), e->tables.end());
     return;
   }
-  if (const auto* j = std::get_if<Join>(&n.op)) {
-    tables_of(*j->left, out);
-    tables_of(*j->right, out);
+  if (const auto* d = std::get_if<Derived>(&n.op)) {
+    if (base) {
+      tables_of(*d->plan, out, true);
+    } else {
+      out.push_back(d->table);
+    }
     return;
   }
-  if (const auto* in = input_of(n); in != nullptr && *in) tables_of(**in, out);
+  if (const auto* j = std::get_if<Join>(&n.op)) {
+    tables_of(*j->left, out, base);
+    tables_of(*j->right, out, base);
+    return;
+  }
+  if (const auto* in = input_of(n); in != nullptr && *in) tables_of(**in, out, base);
+}
+
+// Each derived relation's query, rewritten alone, as a query of its own.
+void rewrite_derived(Node& n) {
+  if (auto* d = std::get_if<Derived>(&n.op)) {
+    rewrite(*d->plan);
+    return;
+  }
+  if (auto* j = std::get_if<Join>(&n.op)) {
+    rewrite_derived(*j->left);
+    rewrite_derived(*j->right);
+    return;
+  }
+  if (auto* in = input_of(n); in != nullptr && *in) rewrite_derived(**in);
 }
 
 // Whether e is a predicate that reads no column: a subquery's EXISTS or
@@ -463,6 +491,7 @@ void rewrite(Node& root) {
     rewrite(*set->right);
     return;
   }
+  rewrite_derived(root);
   while (fold_constants(root)) {
   }
   while (push_down(root)) {
