@@ -1675,7 +1675,7 @@ TEST_CASE("embedded API: * and / of constants fold as PostgreSQL's operators typ
   CHECK(state("SELECT 2147483647 * 2") == "22003");
   CHECK(state("SELECT 9223372036854775807 * 2") == "22003");
   CHECK(state("SELECT (-9223372036854775807 - 1) / -1") == "22003");
-  CHECK(state("SELECT 1 % 2") == "42601");
+  CHECK(state("SELECT 1 % 0") == "22012");
 }
 
 TEST_CASE("embedded API: a numeric quotient of constants has PostgreSQL's scale", "[sql][api]") {
@@ -1832,8 +1832,8 @@ TEST_CASE("embedded API: expressions over columns in the select list", "[sql][ap
   // What is still refused.
   CHECK(state("SELECT f * 2 FROM ce") == "42601");               // REAL and DOUBLE PRECISION arithmetic
   CHECK(state("SELECT f < 1 FROM ce") == "42601");
-  CHECK(state("SELECT -i FROM ce") == "42601");
-  CHECK(state("SELECT i % 2 FROM ce") == "42601");
+  CHECK(state("SELECT -f < 1 FROM ce") == "42601");
+  CHECK(state("SELECT abs(f) < 1 FROM ce") == "42601");  // a comparison of floats as a value
   CHECK(state("SELECT SUM(i) + 1 FROM ce") == "42601");
   CHECK(state("SELECT i + 1, COUNT(*) FROM ce GROUP BY i") == "42601");
   CHECK(state("SELECT $1 + 1 FROM ce") == "42601");

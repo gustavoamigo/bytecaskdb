@@ -192,8 +192,6 @@
 
 - name: modulo
   features: [E011-04]
-  # % is not supported yet
-  unimplemented: true
   ordered: true
   setup:
     - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
@@ -249,8 +247,6 @@
 
 - name: unary minus and ABS
   features: [E011-04]
-  # unary minus and ABS are not supported yet
-  unimplemented: true
   ordered: true
   setup:
     - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
@@ -309,3 +305,43 @@
       expected: [["2.0000000000000000"]]
   teardown:
     - DROP TABLE n
+
+- name: "%, unary minus and abs keep their operand's type and range"
+  features: [E011-04]
+  setup:
+    - CREATE TABLE sg (id INTEGER PRIMARY KEY, s SMALLINT, i INTEGER, b BIGINT, f DOUBLE PRECISION, d DECIMAL(6,2))
+    - INSERT INTO sg VALUES (1, -32768, -2147483648, -9223372036854775807, -1.5, -7.25)
+    - INSERT INTO sg VALUES (2, 7, 7, 7, '-0', 2.10)
+    - INSERT INTO sg VALUES (3, NULL, NULL, NULL, NULL, NULL)
+  steps:
+    # % truncates toward zero, of the dividend's sign; a numeric at the finer scale.
+    - sql: SELECT id, i % 3, s % 2, b % -1, d % 2.1, i % b FROM sg
+      expected:
+        - [1, -2, 0, 0, "-0.95", -2147483648]
+        - [2, 1, 1, 0, "0.00", 0]
+        - [3, null, null, null, null, null]
+    - sql: SELECT id, -s, -i, -b, -d, -f, abs(s), abs(i), abs(d), abs(f) FROM sg WHERE id <> 1
+      expected:
+    # The negation of a type's least value is outside it.
+        - [2, -7, -7, -7, "-2.10", 0, 7, 7, "2.10", 0]
+        - [3, null, null, null, null, null, null, null, null, null]
+    - sql: SELECT -s FROM sg WHERE id = 1
+      error: "22003"
+    - sql: SELECT abs(i) FROM sg WHERE id = 1
+      error: "22003"
+    - sql: SELECT i % 0 FROM sg WHERE id = 2
+      error: "22012"
+    - sql: SELECT d % 0 FROM sg WHERE id = 2
+      error: "22012"
+    - sql: SELECT f % 2 FROM sg
+      error: "42883"
+    - sql: SELECT abs(b), -b FROM sg WHERE id = 1
+      expected: [["9223372036854775807", "9223372036854775807"]]
+    - sql: SELECT 7 % 3, -7 % 3, 7.5 % 2, -7.25 % 2.1, '7' % 2, abs(-2.50), abs('-1.5'), -(-5)
+      expected: [[1, -1, "1.5", "-0.95", 1, "2.50", "1.5", 5]]
+    - sql: SELECT -((-32768)::smallint)
+      error: "22003"
+    - sql: SELECT abs(true)
+      error: "42883"
+  teardown:
+    - DROP TABLE sg

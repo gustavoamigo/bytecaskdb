@@ -743,6 +743,9 @@ private:
       case Expr::Kind::Coalesce:
       case Expr::Kind::Concat:
       case Expr::Kind::Substr:
+      case Expr::Kind::Mod:
+      case Expr::Kind::Neg:
+      case Expr::Kind::Abs:
       case Expr::Kind::Random:
       case Expr::Kind::Aggregate: break;
     }
@@ -785,6 +788,9 @@ private:
       case Expr::Kind::Coalesce:
       case Expr::Kind::Concat:
       case Expr::Kind::Substr:
+      case Expr::Kind::Mod:
+      case Expr::Kind::Neg:
+      case Expr::Kind::Abs:
       case Expr::Kind::Random: throw std::logic_error{"physical plan: a filter operand codegen does not print"};
     }
     auto col = read_col(lhs);
@@ -1475,6 +1481,9 @@ private:
       case Expr::Kind::Sub:
       case Expr::Kind::Mul:
       case Expr::Kind::Div: return eval_arithmetic(e);
+      case Expr::Kind::Mod: return eval_mod(e);
+      case Expr::Kind::Neg:
+      case Expr::Kind::Abs: return eval_sign(e);
       case Expr::Kind::Compare: return eval_compare(e);
       case Expr::Kind::IsNull: {
         auto v = eval(e.args[0]);
@@ -1556,12 +1565,65 @@ private:
       case Expr::Kind::Coalesce:
       case Expr::Kind::Concat:
       case Expr::Kind::Substr:
-      case Expr::Kind::Random: throw std::logic_error{"physical plan: not an arithmetic expression"};
+      case Expr::Kind::Random:
+      case Expr::Kind::Mod:
+      case Expr::Kind::Neg:
+      case Expr::Kind::Abs: throw std::logic_error{"physical plan: not an arithmetic expression"};
     }
     if (e.type.kind == SqlKind::SmallInt || e.type.kind == SqlKind::Integer) {
       call = "bc_check_int(cx, " + call + ", " + (e.type.kind == SqlKind::SmallInt ? "BC_SMALLINT" : "BC_INTEGER") + ", 0)";
     }
     return guarded("int64_t", "0", either(a.null, b.null), call, PhysType::I64);
+  }
+
+  // a % b at the result's scale: the plan API's bc_mod (a zero divisor is
+  // 22012, INT64_MIN % -1 is 0). The remainder is below the divisor, so no
+  // range check.
+  auto eval_mod(const Expr& e) -> Val {
+    auto a = eval(e.args[0]);
+    auto b = eval(e.args[1]);
+    auto scale = decimal_scale(e.type);
+    auto call = "bc_mod(cx, " + at_scale(a, e.args[0].type, scale) + ", " + at_scale(b, e.args[1].type, scale) + ")";
+    return guarded("int64_t", "0", either(a.null, b.null), call, PhysType::I64);
+  }
+
+  // -x and abs(x), of x's type. An integer's is 0 - x, its range checked as
+  // its type's operator does ("bigint out of range" past 64 bits); a
+  // DECIMAL's cannot leave 18 digits. A float's is IEEE: -x, and abs as
+  // 0.0 - x for x <= 0, so abs(-0.0) is 0 as PostgreSQL's fabs gives it.
+  auto eval_sign(const Expr& e) -> Val {
+    auto x = eval(e.args[0]);
+    auto abs = e.kind == Expr::Kind::Abs;
+    if (x.type == PhysType::F64) {
+      auto value = abs ? "(" + x.value + " <= 0 ? 0.0 - " + x.value + " : " + x.value + ")" : "(-" + x.value + ")";
+      return guarded("double", "0", x.null, value, PhysType::F64);
+    }
+    std::string neg;
+    switch (e.type.kind) {
+      case SqlKind::BigInt: neg = "bc_sub_bigint(cx, 0, " + x.value + ", 0)"; break;
+      case SqlKind::SmallInt:
+      case SqlKind::Integer:
+        neg = "bc_check_int(cx, bc_sub(cx, 0, " + x.value + "), " +
+              (e.type.kind == SqlKind::SmallInt ? "BC_SMALLINT" : "BC_INTEGER") + ", 0)";
+        break;
+      case SqlKind::Decimal: neg = "bc_sub(cx, 0, " + x.value + ")"; break;
+      case SqlKind::Real:
+      case SqlKind::Double:
+      case SqlKind::Numeric:
+      case SqlKind::Boolean:
+      case SqlKind::Text:
+      case SqlKind::Varchar:
+      case SqlKind::Char:
+      case SqlKind::Bytea:
+      case SqlKind::Date:
+      case SqlKind::Time:
+      case SqlKind::Timestamp:
+      case SqlKind::TimestampTz: throw std::logic_error{"physical plan: - or abs of other than an integer or a DECIMAL"};
+    }
+    // The operand is a local or a column read: evaluated once, and the
+    // negation only where it is taken.
+    auto value = abs ? "(" + x.value + " < 0 ? " + neg + " : " + x.value + ")" : neg;
+    return guarded("int64_t", "0", x.null, value, PhysType::I64);
   }
 
   // a || b: text with text, an integer or a DECIMAL through its text. NULL if
