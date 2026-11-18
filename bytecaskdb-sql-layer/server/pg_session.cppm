@@ -437,6 +437,8 @@ auto command_name(Command c) -> std::string_view {
     case Command::Update: return "UPDATE";
     case Command::Delete: return "DELETE";
     case Command::CreateTable: return "CREATE TABLE";
+    case Command::CreateTableAs: return "CREATE TABLE AS";
+    case Command::SelectInto: return "SELECT INTO";
     case Command::CreateIndex: return "CREATE INDEX";
     case Command::DropTable: return "DROP TABLE";
     case Command::DropIndex: return "DROP INDEX";
@@ -466,6 +468,10 @@ auto command_tag(Command c, const Rows& r) -> std::string {
     case Command::Update: return "UPDATE " + std::to_string(r.affected);
     case Command::Delete: return "DELETE " + std::to_string(r.affected);
     case Command::CreateTable: return "CREATE TABLE";
+    // As PostgreSQL: SELECT n for the rows written, CREATE TABLE AS when the
+    // query did not run (WITH NO DATA, or IF NOT EXISTS skipped it).
+    case Command::CreateTableAs:
+    case Command::SelectInto: return r.affected >= 0 ? "SELECT " + std::to_string(r.affected) : "CREATE TABLE AS";
     case Command::CreateIndex: return "CREATE INDEX";
     case Command::DropTable: return "DROP TABLE";
     case Command::DropIndex: return "DROP INDEX";

@@ -668,6 +668,49 @@ def test_a_ddl_that_if_exists_skips_sends_postgresqls_notice_before_its_tag(serv
     assert b"N" not in [k for k, _ in c.until_ready()]
 
 
+def test_create_table_as_and_select_into_answer_postgresqls_tags_with_no_row_description(server):
+    c = connect(server)
+    c.send(query("CREATE TABLE ctas_src (id INTEGER PRIMARY KEY, v TEXT)"))
+    c.until_ready()
+    c.send(query("INSERT INTO ctas_src VALUES (1, 'a'), (2, 'b')"))
+    c.until_ready()
+    cases = [
+        ("CREATE TABLE ctas_a AS SELECT * FROM ctas_src", "SELECT 2"),
+        ("SELECT v INTO ctas_b FROM ctas_src WHERE id = 1", "SELECT 1"),
+        ("CREATE TABLE ctas_c AS SELECT id FROM ctas_src WITH NO DATA", "CREATE TABLE AS"),
+    ]
+    for sql, tag in cases:
+        c.send(query(sql))
+        got = c.until_ready()
+        assert states(got) == [], sql
+        assert b"T" not in [k for k, _ in got], sql
+        assert fields_tag(got) == tag, sql
+    # IF NOT EXISTS of a name taken: PostgreSQL's notice, then CREATE TABLE AS.
+    for message in (query("CREATE TABLE IF NOT EXISTS ctas_a AS SELECT 1"),
+                    parse("CREATE TABLE IF NOT EXISTS ctas_a AS SELECT $1::int") + bind(["5"]) + execute() + SYNC):
+        c.send(message)
+        got = c.until_ready()
+        notice = fields(next(b for k, b in got if k == b"N"))
+        assert (notice["C"], notice["M"]) == ("42P07", 'relation "ctas_a" already exists, skipping')
+        assert fields_tag(got) == "CREATE TABLE AS"
+    # Its query's parameters are the statement's.
+    c.send(parse("CREATE TABLE ctas_d AS SELECT v FROM ctas_src WHERE id = $1") + bind(["2"]) + execute() + SYNC)
+    assert fields_tag(c.until_ready()) == "SELECT 1"
+    assert data(run(c, "SELECT v FROM ctas_d", [])) == [["b"]]
+    c.send(query("CREATE TABLE ctas_e AS SELECT $1::int"))
+    assert states(c.until_ready()) == ["42P02"]
+    # A read-only block names the statement as written.
+    for sql, name in (("SELECT 1 INTO ctas_f", "SELECT INTO"), ("CREATE TABLE ctas_f AS SELECT 1", "CREATE TABLE AS")):
+        c.send(query("BEGIN READ ONLY"))
+        c.until_ready()
+        c.send(query(sql))
+        got = c.until_ready()
+        error = fields(next(b for k, b in got if k == b"E"))
+        assert (error["C"], error["M"]) == ("25006", f"cannot execute {name} in a read-only transaction")
+        c.send(query("ROLLBACK"))
+        c.until_ready()
+
+
 def test_call_as_hammerdb_sends_it_returns_the_out_row_and_the_tag_call(server):
     c = connect(server)
     for sql in ("CREATE TABLE stock (id INTEGER PRIMARY KEY, qty INTEGER, at TIMESTAMP)",

@@ -577,6 +577,56 @@ EXISTS] name`:
   checks the tables a plan reads and not the views it came through
   (`Statement`'s plan records them, `bound::Bound::views`).
 
+**`CREATE TABLE AS` and `SELECT … INTO`**, `CREATE TABLE [IF NOT EXISTS]
+name [(column, …)] AS SELECT … [WITH [NO] DATA]` and `SELECT … INTO [TABLE]
+name …`, one statement (`ast::CreateTableAs`) that remembers which form was
+written:
+- **A table of the query's columns.** Each column is named as the select
+  list names it (`now()` as `now`), or by the column list, which may name
+  fewer than there are columns; each has the query's result type (a
+  `VARCHAR` of no length is `TEXT`, as a column declared so is). A `CASE`
+  with an `ELSE` or a `COALESCE` whose branches are all one `VARCHAR(n)` or
+  `CHAR(n)`, none a literal or a `$n`, keeps that length, as PostgreSQL's
+  exprTypmod does; with a literal among them it has none. The table has no primary key, so
+  its rows are under hidden row ids 1 to n, and no constraint or default.
+- **Bound at prepare, run at execute.** The query is bound and planned when
+  the statement is prepared, so its errors (42P01, 42703, …) come first,
+  as PostgreSQL analyses it first. Its parameters are the statement's: over
+  the extended protocol `$n` binds as in a `SELECT`; over the simple one it
+  is 42P02, as in PostgreSQL. A literal's input error ('abc'::int is
+  22P02, DATE '2020-13-01' 22008, '40000'::smallint 22003) is raised at
+  prepare, before the name check, as PostgreSQL's analysis reads the
+  literal (`ast::SqlError::at_analysis`). A data exception of folding a
+  constant (1/0 is 22012, 40000::smallint 22003) is kept and raised at
+  execute, after the name check, since PostgreSQL folds constants when it
+  plans, after it looked for the table. The query is then compiled with
+  that constant NULL, for the statement's parameters only, and never run.
+  Only a constant in the select list, `GROUP BY`, `WHERE`, `ON` or `HAVING`
+  of the query itself is replaced so; one in a set operation's arm or a
+  subquery raises its error at prepare, before the name check.
+- **PostgreSQL's order at execute.** A relation of the name is 42P07, or
+  with `IF NOT EXISTS` a NOTICE and nothing else; then more names than
+  columns is 42601 ("too many column names were specified"), a name twice
+  42701; then the query runs, autocommit, and its rows and the table are
+  one DDL: the table's record and every row in one batch
+  (`catalog_design.md`, *CREATE TABLE AS*). A concurrent DDL that takes the
+  name first makes it 42P07, or the NOTICE.
+- **Tag:** `SELECT n`, the rows written; `CREATE TABLE AS` for `WITH NO
+  DATA` (the query is not run) and for an `IF NOT EXISTS` skip. A read-only
+  block refuses it as `SELECT INTO` or `CREATE TABLE AS`, as written
+  (25006). It is DDL: not inside a transaction (0A000).
+- **Refused (0A000):** `TEMP`, `UNLOGGED`, `WITH (…)`, `USING`,
+  `TABLESPACE`, `CREATE MATERIALIZED VIEW` and `CREATE TABLE … AS EXECUTE`;
+  a result column of a `NUMERIC` of no declared precision (an `AVG`, a
+  literal `1.5`) until such columns exist; a query of no columns; `INTO` in
+  the first arm of a set operation, which PostgreSQL takes as the
+  statement's. `ON COMMIT` is 42P16, as PostgreSQL refuses it on a table that
+  is not temporary; `INTO` in another arm is 42601, as there, and in a
+  subquery 42601. `WITH NO DATA` of a query whose constant raises an error
+  (`SELECT 1/0 … WITH NO DATA`) is refused (0A000): PostgreSQL does not plan
+  that query, so creates the table, but the stand-in lost the column's
+  type.
+
 **Procedures**, `CREATE [OR REPLACE] PROCEDURE name (args) LANGUAGE plpgsql
 AS …` and `DROP PROCEDURE [IF EXISTS] name [(argtype, …)]`
 (`procedures_design.md`):
@@ -1143,6 +1193,11 @@ fail on them.
   evaluated only when taken (*Expressions over columns*).
 - **A numeric `CASE` or `COALESCE` over columns has one scale,** the
   finest of its branches; PostgreSQL's keeps each value's own.
+- **A `CASE` of one `CHAR(n)` branch and no `ELSE` is a `CHAR(n)`.**
+  PostgreSQL's is a `bpchar` of no length (the default NULL has none),
+  unless its planner folds the `CASE` away (`CASE WHEN true THEN c END`), so
+  a `CREATE TABLE AS` of it there takes a longer value the layer's table
+  refuses (22001). The layer has no `CHAR` of no length.
 
 - **A view is bound again at each use,** so one its tables have outgrown
   is refused (0A000) until it is dropped and created again: a `SELECT *`
@@ -1158,8 +1213,14 @@ Gaps, not decisions: PostgreSQL runs each, and the layer refuses it until
 it is built. The functional suite marks the cases that need one as not
 implemented (`functional_testing_design.md`).
 
-- **A table needs columns.** The layer refuses `CREATE TABLE t ()` (0A000);
-  PostgreSQL accepts a table of no columns.
+- **A table needs columns.** The layer refuses `CREATE TABLE t ()` and a
+  `CREATE TABLE AS` of a query of no columns (0A000); PostgreSQL accepts a
+  table of no columns.
+- **`CREATE TABLE AS` is narrower.** PostgreSQL creates temporary and
+  unlogged tables, columns of a `NUMERIC` of no precision (waiting for
+  that column type), takes `SELECT … INTO` in a set operation's first
+  arm, and creates the table of `WITH NO DATA` over a query whose constant
+  raises an error; the layer refuses each (0A000).
 - **A set operation cannot be ordered, and its arms are plain.** PostgreSQL
   sorts the combined rows with `ORDER BY` and combines queries that group,
   aggregate or select `DISTINCT`. Here a set operation streams its arms

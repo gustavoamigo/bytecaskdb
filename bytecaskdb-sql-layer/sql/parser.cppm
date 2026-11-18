@@ -121,7 +121,9 @@ auto type_ast(const PgQuery__TypeName* tn, std::string name, std::int32_t pos) -
 auto expr(const PgQuery__Node* n) -> Expr;
 auto literal(const PgQuery__Node* n) -> Literal;
 auto object_name(const PgQuery__Node* n, std::int32_t pos) -> std::string;
-auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select;
+// `into_taken`: the statement's INTO, which its caller reads (SELECT … INTO);
+// an INTO anywhere else is refused.
+auto select(const PgQuery__SelectStmt* s, std::int32_t pos, bool into_taken = false) -> Select;
 
 // A subquery's SELECT, parsed as any SELECT is.
 auto subquery(const PgQuery__SubLink* l) -> std::shared_ptr<const Select> {
@@ -252,6 +254,7 @@ auto expr(const PgQuery__Node* n) -> Expr {
         !f->agg_within_group && !f->func_variadic) {
       Expr e{Expr::Kind::Clock, {}, 0, nullptr, nullptr, f->location};
       e.func = "current_timestamp";
+      e.column = "now";  // its output name, as PostgreSQL names the call
       e.constant = -1;
       return e;
     }
@@ -1283,11 +1286,30 @@ auto order_items(const PgQuery__SelectStmt* s, std::int32_t pos) -> std::vector<
   return out;
 }
 
+// An INTO in a set operation's arms. PostgreSQL takes the leftmost arm's as
+// the statement's (a gap here: refused, 0A000) and refuses any other.
+void refuse_arm_into(const PgQuery__SelectStmt* s, bool leftmost, std::int32_t pos) {
+  if (s == nullptr) return;
+  if (s->op != PG_QUERY__SET_OPERATION__SETOP_NONE) {
+    refuse_arm_into(s->larg, leftmost, pos);
+    refuse_arm_into(s->rarg, false, pos);
+    return;
+  }
+  if (s->into_clause == nullptr) return;
+  auto at = s->into_clause->rel != nullptr ? s->into_clause->rel->location : pos;
+  if (leftmost) {
+    reject("SELECT … INTO of a set operation is not supported yet: use CREATE TABLE … AS", at, kFeatureNotSupported);
+  }
+  reject("INTO is only allowed on first SELECT of UNION/INTERSECT/EXCEPT", at);
+}
+
 // UNION, INTERSECT or EXCEPT of the statement's two queries, whose own
 // ORDER BY and LIMIT are the combined rows'. Each arm is parsed as any
 // SELECT is; a parenthesised one keeps its ORDER BY and LIMIT.
 auto set_operation(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   if (s->larg == nullptr || s->rarg == nullptr) reject("a set operation needs two queries", pos);
+  refuse_arm_into(s->larg, true, pos);
+  refuse_arm_into(s->rarg, false, pos);
   if (s->with_clause != nullptr) reject("SELECT clause not supported", pos);
   if (s->limit_offset != nullptr) reject("OFFSET of a set operation is not supported yet", pos);
   if (s->n_locking_clause != 0) {
@@ -1353,7 +1375,7 @@ void join_items(const PgQuery__Node* n, std::int32_t pos, std::vector<FromItem>&
   items.push_back(std::move(item));
 }
 
-auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
+auto select(const PgQuery__SelectStmt* s, std::int32_t pos, bool into_taken) -> Select {
   if (s->op != PG_QUERY__SET_OPERATION__SETOP_NONE) return set_operation(s, pos);
   // No table, or tables joined: FROM a, b, c, or a [INNER] JOIN b ON … JOIN
   // c …, whose ON conjuncts join the WHERE's.
@@ -1376,7 +1398,7 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
                   (s->distinct_clause[0] == nullptr || s->distinct_clause[0]->node_case == PG_QUERY__NODE__NODE__NOT_SET);
   if (s->n_distinct_clause != 0 && !distinct) reject("DISTINCT ON is not supported", pos);
   if (s->group_distinct || s->n_locking_clause > 1 || s->with_clause != nullptr ||
-      s->n_window_clause != 0 || s->into_clause != nullptr) {
+      s->n_window_clause != 0 || (s->into_clause != nullptr && !into_taken)) {
     reject("SELECT clause not supported", pos);
   }
   Select sel;
@@ -1468,6 +1490,59 @@ auto del(const PgQuery__DeleteStmt* s, std::int32_t pos) -> Delete {
   }
   d.returning = returning_list(s->returning_list, s->n_returning_list);
   return d;
+}
+
+// The table an INTO clause names, of CREATE TABLE AS or SELECT … INTO: a
+// permanent table with no options. TEMP, UNLOGGED, WITH (…), USING and
+// TABLESPACE are not supported (0A000); ON COMMIT is PostgreSQL's error
+// on a table that is not temporary.
+auto into_target(const PgQuery__IntoClause* into, CreateTableAs& out) -> void {
+  if (into == nullptr || into->rel == nullptr) reject("expected a table", out.pos);
+  const auto* rv = into->rel;
+  out.table = relation(rv);
+  if (!empty(rv->relpersistence) && rv->relpersistence[0] == 't') {
+    reject("temporary tables are not supported", rv->location, kFeatureNotSupported);
+  }
+  if (!empty(rv->relpersistence) && rv->relpersistence[0] == 'u') {
+    reject("unlogged tables are not supported", rv->location, kFeatureNotSupported);
+  }
+  if (into->on_commit != PG_QUERY__ON_COMMIT_ACTION__ONCOMMIT_NOOP &&
+      into->on_commit != PG_QUERY__ON_COMMIT_ACTION__ON_COMMIT_ACTION_UNDEFINED) {
+    reject("ON COMMIT can only be used on temporary tables", rv->location, kInvalidTableDefinition);
+  }
+  if (into->n_options != 0) reject("storage parameters (WITH …) are not supported", rv->location, kFeatureNotSupported);
+  if (!empty(into->access_method)) reject("USING an access method is not supported", rv->location, kFeatureNotSupported);
+  if (!empty(into->table_space_name)) reject("TABLESPACE is not supported", rv->location, kFeatureNotSupported);
+  for (std::size_t i = 0; i < into->n_col_names; ++i) out.columns.push_back(str(into->col_names[i]));
+  out.with_data = !into->skip_data;
+}
+
+auto create_table_as(const PgQuery__CreateTableAsStmt* s, std::int32_t pos) -> CreateTableAs {
+  CreateTableAs out;
+  out.pos = pos;
+  if (s->objtype == PG_QUERY__OBJECT_TYPE__OBJECT_MATVIEW) {
+    reject("materialized views are not supported", pos, kFeatureNotSupported);
+  }
+  into_target(s->into, out);
+  out.if_not_exists = s->if_not_exists;
+  if (s->query != nullptr && s->query->node_case == PG_QUERY__NODE__NODE_EXECUTE_STMT) {
+    reject("CREATE TABLE AS EXECUTE is not supported", pos, kFeatureNotSupported);
+  }
+  if (s->query == nullptr || s->query->node_case != PG_QUERY__NODE__NODE_SELECT_STMT) {
+    reject("CREATE TABLE AS takes a SELECT", pos);
+  }
+  out.query = select(s->query->select_stmt, pos);
+  return out;
+}
+
+// SELECT … INTO name: CREATE TABLE name AS the SELECT without its INTO.
+auto select_into(const PgQuery__SelectStmt* s, std::int32_t pos) -> CreateTableAs {
+  CreateTableAs out;
+  out.form = CreateTableAs::Form::SelectInto;
+  out.pos = pos;
+  into_target(s->into_clause, out);
+  out.query = select(s, pos, true);
+  return out;
 }
 
 // Owns libpg_query's and protobuf-c's results for the length of a parse.
@@ -1635,7 +1710,11 @@ auto parse(std::string_view sql) -> Statement {
   if (n->node_case == PG_QUERY__NODE__NODE_CREATE_SEQ_STMT) return create_sequence(n->create_seq_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_DEFINE_STMT) return create_type(n->define_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_INSERT_STMT) return insert(n->insert_stmt, pos);
-  if (n->node_case == PG_QUERY__NODE__NODE_SELECT_STMT) return select(n->select_stmt, pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_CREATE_TABLE_AS_STMT) return create_table_as(n->create_table_as_stmt, pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_SELECT_STMT) {
+    if (n->select_stmt->into_clause != nullptr) return select_into(n->select_stmt, pos);
+    return select(n->select_stmt, pos);
+  }
   if (n->node_case == PG_QUERY__NODE__NODE_UPDATE_STMT) return update(n->update_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_DELETE_STMT) return del(n->delete_stmt, pos);
   reject("statement not supported", pos);

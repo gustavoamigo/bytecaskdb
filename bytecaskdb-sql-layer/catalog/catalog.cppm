@@ -486,6 +486,10 @@ struct CheckSpec {
 // `if_not_exists`: a relation of the name makes it change nothing. With no
 // columns it is only that: the binder found the name taken, and skipped the
 // definition unread, as PostgreSQL skips it.
+// `rows`: CREATE TABLE AS's rows, one value per column, each of its
+// column's physical type and within its SQL type. Only for a table with no
+// primary key: they are written in the table's batch under row ids 1..n,
+// as a backfill, within its limit.
 struct CreateTableDdl {
   std::string name;
   std::vector<ColumnSpec> columns;
@@ -493,6 +497,7 @@ struct CreateTableDdl {
   std::vector<UniqueSpec> unique;
   std::vector<CheckSpec> checks;
   bool if_not_exists{false};
+  std::vector<std::vector<Datum>> rows;
 };
 struct CreateIndexDdl {
   std::string name;
@@ -2534,6 +2539,32 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       t.checks.push_back({chosen, c.expr});
     }
     put_op(ops, DdlOp::Kind::Put, table_record_key(t.id), serialize_table(t));
+    if (!ct->rows.empty()) {
+      // CREATE TABLE AS: each row under the next row id, in the same batch.
+      if (!ct->pk.empty() || !t.indexes.empty()) throw std::logic_error("CREATE TABLE AS rows for a table with keys");
+      backfill = true;
+      BackfillBudget budget{t.name, backfill_limit};
+      RowWriter w{t.layout};  // every column is set for each row: no reset between them
+      const auto& hidden = t.columns.back();
+      std::int64_t id = 0;
+      for (const auto& values : ct->rows) {
+        if (values.size() + 1 != t.columns.size()) throw std::logic_error("CREATE TABLE AS row of the wrong width");
+        for (std::size_t i = 0; i < values.size(); ++i) {
+          const auto& c = t.columns[i];
+          if (!datum_fits(values[i], c.type) || out_of_range(c.sql, values[i])) {
+            throw std::logic_error("CREATE TABLE AS value outside column " + c.name + "'s type");
+          }
+          if (!set_datum(w, c.id, values[i])) throw std::logic_error("CREATE TABLE AS value of the wrong type");
+        }
+        if (!w.set_i64(hidden.id, ++id)) throw std::logic_error("CREATE TABLE AS row id");
+        Bytes row;
+        if (!w.finish(row)) throw std::length_error("a row of table " + t.name + " is over the value limit");
+        Bytes key;
+        if (!encode_pk_from_row(t, row, key)) throw std::logic_error("CREATE TABLE AS row key");
+        budget.charge(key.size() + row.size());
+        put_op(ops, DdlOp::Kind::Put, std::move(key), std::move(row));
+      }
+    }
     next->put_table(std::move(t));
     return finish();
   }

@@ -26,6 +26,7 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <algorithm>
 #include <functional>
@@ -92,7 +93,10 @@ struct Rows {
   // an AVG's, is its text, as bytes: more digits than an int64_t holds.
   std::vector<SqlType> types;
   std::vector<std::vector<Value>> rows;
-  std::int64_t affected{-1};  // INSERT, UPDATE, DELETE: rows changed
+  // INSERT, UPDATE, DELETE: rows changed. CREATE TABLE AS and SELECT …
+  // INTO: rows written, -1 when the query did not run (WITH NO DATA, or IF
+  // NOT EXISTS skipped the statement).
+  std::int64_t affected{-1};
   std::vector<Notice> notices;
 };
 
@@ -222,6 +226,8 @@ enum class Command {
   Update,
   Delete,
   CreateTable,
+  CreateTableAs,  // CREATE TABLE … AS
+  SelectInto,     // SELECT … INTO: CREATE TABLE AS, written as a SELECT
   CreateIndex,
   DropTable,
   DropIndex,
@@ -338,6 +344,15 @@ private:
   std::string sql_;
   ast::Statement ast_;
   bool ddl_{false};
+  // CREATE TABLE AS and SELECT … INTO: the query, prepared with the
+  // statement. Its parameters are the statement's. Null for any other.
+  std::unique_ptr<Statement> query_;
+  // The data exception (22xxx) folding the query's constants threw at
+  // prepare, as 1/0 does: PostgreSQL folds them when it plans the query,
+  // after it has looked for the table, so it is thrown when the statement
+  // runs, after that check. query_'s plan is then a stand-in, the constant
+  // NULL, that gives the statement's parameters and never runs.
+  std::exception_ptr query_error_;
   const Database* owner_{nullptr};  // the Database that prepared it, the only one it runs on
   mutable std::mutex mu_;                             // held only to copy or swap compiled_
   mutable std::shared_ptr<const Compiled> compiled_;  // null for DDL
@@ -984,6 +999,17 @@ private:
   static auto results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows;
   static auto quotients(const GeneratedPlan& p, std::vector<Value> values) -> std::vector<Value>;
   static auto padded(const std::vector<SqlType>& types, std::vector<Value> values) -> std::vector<Value>;
+  // CREATE TABLE AS's query, of a constant whose folding threw `error`:
+  // compiled with each such constant NULL (bound::null_failing_constant),
+  // for the statement's parameters. Null where no stand-in compiles.
+  auto stand_in(const Statement& query, const ast::SqlError& error) -> std::shared_ptr<const Compiled>;
+  // Commits a DDL; whether it changed the catalog (false: IF [NOT] EXISTS
+  // skipped it). Throws the API's errors for the catalog's failures.
+  auto run_ddl(const Ddl& ddl) -> bool;
+  // CREATE TABLE AS and SELECT … INTO (docs/frontend_design.md, *The
+  // dialect*; docs/catalog_design.md, *CREATE TABLE AS*): the query's rows,
+  // autocommit, then the table and its rows as one DDL.
+  auto create_table_as(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts) -> Rows;
   // An autocommit context: one per call in flight, kept for the next.
   [[nodiscard]] auto acquire_context() -> bc_ctx*;
   void release_context(bc_ctx* cx) noexcept;
@@ -1212,6 +1238,7 @@ auto sqlstate(const std::exception& e) noexcept -> std::string_view {
 }
 
 auto Statement::param_types() const -> std::vector<PhysType> {
+  if (query_) return query_->param_types();
   auto c = compiled();
   if (!c) return {};
   const auto& all = c->plan->param_types;  // the constants' last: not the caller's to bind
@@ -1229,6 +1256,7 @@ auto Statement::is_resumable() const -> bool {
 }
 
 auto Statement::params() const -> std::vector<ParamInfo> {
+  if (query_) return query_->params();
   auto c = compiled();
   if (!c) return {};
   auto out = c->params;
@@ -1270,6 +1298,8 @@ auto Statement::command() const -> Command {
           return Command::Delete;
         } else if constexpr (std::is_same_v<T, ast::CreateTable>) {
           return Command::CreateTable;
+        } else if constexpr (std::is_same_v<T, ast::CreateTableAs>) {
+          return st.form == ast::CreateTableAs::Form::SelectInto ? Command::SelectInto : Command::CreateTableAs;
         } else if constexpr (std::is_same_v<T, ast::CreateIndex>) {
           return Command::CreateIndex;
         } else if constexpr (std::is_same_v<T, ast::DropTable>) {
@@ -1496,6 +1526,23 @@ auto Database::row_counts() const -> RowCounts {
   };
 }
 
+auto Database::stand_in(const Statement& query, const ast::SqlError& error) -> std::shared_ptr<const Compiled> {
+  auto copy = std::make_unique<Statement>();
+  copy->sql_ = query.sql_;
+  copy->ast_ = ast::clone(std::get<ast::Select>(query.ast_));
+  auto pos = error.pos();
+  for (int tries = 0; tries < 64; ++tries) {  // a constant at a time: each has its own position
+    if (!bound::null_failing_constant(std::get<ast::Select>(copy->ast_), pos)) return nullptr;
+    try {
+      return build(*copy);
+    } catch (const ast::SqlError& e) {
+      if (!e.sqlstate().starts_with("22") || e.at_analysis()) return nullptr;
+      pos = e.pos();
+    }
+  }
+  return nullptr;
+}
+
 auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
   auto cat = live_->current();
   auto bound = bound::bind(s.ast_, *cat);
@@ -1578,7 +1625,32 @@ auto Database::prepare_locked(std::string_view sql, bool cursor_query) -> const 
   if (cursor_query) {
     if (auto* select = std::get_if<ast::Select>(&s->ast_)) select->row_key = true;
   }
-  s->compiled_ = build(*s);
+  if (const auto* ctas = std::get_if<ast::CreateTableAs>(&s->ast_)) {
+    // Its query is bound now, as PostgreSQL analyses it before it runs: its
+    // errors are the statement's at prepare. The text is the statement's, so
+    // a position is into it.
+    auto q = std::make_unique<Statement>();
+    q->sql_ = s->sql_;
+    q->ast_ = ast::clone(ctas->query);
+    q->owner_ = this;
+    try {
+      q->compiled_ = build(*q);
+    } catch (const ast::SqlError& e) {
+      // A data exception of folding a constant (1/0) is PostgreSQL's when it
+      // plans the query, after it has looked for the table: it is thrown
+      // when the statement runs. The query is compiled with that constant
+      // NULL, for its parameters only: it never runs. One raised as the
+      // query is analysed ('abc'::int), or one the stand-in cannot be found
+      // for, is thrown now.
+      if (!e.sqlstate().starts_with("22") || e.at_analysis()) throw;
+      s->query_error_ = std::current_exception();
+      q->compiled_ = stand_in(*q, e);
+      if (!q->compiled_) throw;
+    }
+    s->query_ = std::move(q);
+  } else {
+    s->compiled_ = build(*s);
+  }
   s->ddl_ = s->compiled_ == nullptr;
   s->owner_ = this;
   std::unique_lock<std::shared_mutex> lock{cache_mu_};
@@ -1682,21 +1754,14 @@ auto Database::execute_locked(const Statement& stmt, const std::vector<Value>& p
     -> Rows {
   if (stmt.owner_ != this) throw std::logic_error("the statement was prepared on another database");
   if (!stmt.current_of().empty()) throw ParamError("WHERE CURRENT OF needs a cursor of a transaction");
+  if (stmt.query_) return create_table_as(stmt, params, opts);
   if (stmt.is_ddl()) {
     if (!params.empty()) throw ParamError("DDL takes no parameters");
     auto before = live_->current();
     auto bound = bound::bind(stmt.ast_, *before);
     const auto& ddl = std::get<Ddl>(bound.stmt);
     Rows out;
-    try {
-      out.notices = skip_notices(ddl, *before, live_->run(ddl).changed);
-    } catch (const ConstraintViolation& e) {
-      throw ExecError(e.what(), BC_E_CONSTRAINT, e.detail().encode());
-    } catch (const DdlInProgress&) {
-      throw_serialization_failure(kDdlInProgress);  // a DDL never waits for another
-    } catch (const CommitOutcomeUnknown&) {
-      throw TransactionResolutionUnknown{};
-    }
+    out.notices = skip_notices(ddl, *before, run_ddl(ddl));
     out.affected = 0;
     return out;
   }
@@ -1709,6 +1774,142 @@ auto Database::execute_locked(const Statement& stmt, const std::vector<Value>& p
     release_context(cx);
     throw;
   }
+}
+
+auto Database::run_ddl(const Ddl& ddl) -> bool {
+  try {
+    return live_->run(ddl).changed;
+  } catch (const ConstraintViolation& e) {
+    throw ExecError(e.what(), BC_E_CONSTRAINT, e.detail().encode());
+  } catch (const DdlInProgress&) {
+    throw_serialization_failure(kDdlInProgress);  // a DDL never waits for another
+  } catch (const CommitOutcomeUnknown&) {
+    throw TransactionResolutionUnknown{};
+  }
+}
+
+namespace {
+
+// The table CREATE TABLE AS makes of a query's result columns, in
+// PostgreSQL's order of refusals: more names than columns (42601), then a
+// name twice (42701). A column of no type a table holds yet is refused
+// (0A000): a NUMERIC of no declared precision (an AVG, a literal 1.5),
+// until such columns exist; and a table of no columns, which a CreateTableDdl
+// with none would read as a skip. VARCHAR of no length is TEXT, as a column
+// declared so is.
+auto ctas_columns(const ast::CreateTableAs& ctas, const std::vector<std::string>& names,
+                  const std::vector<SqlType>& types) -> std::vector<ColumnSpec> {
+  const auto* what = ctas.form == ast::CreateTableAs::Form::SelectInto ? "SELECT … INTO" : "CREATE TABLE AS";
+  if (ctas.columns.size() > names.size()) {
+    throw ast::SqlError{"too many column names were specified", -1, kSyntaxError};
+  }
+  std::vector<ColumnSpec> out;
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    ColumnSpec c;
+    c.name = i < ctas.columns.size() ? ctas.columns[i] : names[i];
+    c.sql = types.at(i);
+    if (std::ranges::contains(out, c.name, &ColumnSpec::name)) {
+      throw ast::SqlError{"column \"" + c.name + "\" specified more than once", -1, kDuplicateColumn};
+    }
+    out.push_back(std::move(c));
+  }
+  if (out.empty()) throw FeatureNotSupported(std::string{what} + " of no columns is not supported");
+  for (auto& c : out) {
+    if (c.sql.kind == SqlKind::Varchar && c.sql.length == 0) c.sql = SqlType{SqlKind::Text};
+    if (c.sql.kind == SqlKind::Numeric || (c.sql.kind == SqlKind::Decimal && c.sql.precision == 0)) {
+      throw FeatureNotSupported(std::string{what} + " of column \"" + c.name +
+                                "\", a numeric of no declared precision, is not supported yet: cast it to "
+                                "NUMERIC(p, s)");
+    }
+    if (!sql_type_valid(c.sql)) {
+      throw FeatureNotSupported(std::string{what} + " of column \"" + c.name + "\" of type " +
+                                sql_type_name(c.sql) + " is not supported");
+    }
+  }
+  return out;
+}
+
+// A result row as its table stores it: a CHAR(n) without the trailing
+// spaces a result pads it with. Each value is checked against its column's
+// type, as an INSERT's is.
+auto ctas_row(const std::vector<ColumnSpec>& columns, std::vector<Value> values) -> std::vector<Datum> {
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    const auto& c = columns.at(i);
+    if (!datum_fits(values[i], phys_type(c.sql))) {
+      throw ExecError("a value of column " + c.name + " is not of its type", BC_E_CORRUPT);
+    }
+    if (auto* b = std::get_if<Bytes>(&values[i]); b != nullptr && c.sql.kind == SqlKind::Char) {
+      while (!b->empty() && b->back() == std::byte{' '}) b->pop_back();
+    }
+    if (auto why = out_of_range(c.sql, values[i])) {
+      throw ExecError(*why, BC_E_CONSTRAINT, ConstraintDetail{BC_C_RANGE, 0}.encode());
+    }
+  }
+  return values;
+}
+
+}  // namespace
+
+auto Database::create_table_as(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts)
+    -> Rows {
+  const auto& ctas = std::get<ast::CreateTableAs>(stmt.ast_);
+  const auto& query = *stmt.query_;
+  Rows out;
+  CreateTableDdl ddl;
+  ddl.name = ctas.table;
+  ddl.if_not_exists = ctas.if_not_exists;
+  // As PostgreSQL: a relation of the name is found before the query is
+  // planned, and IF NOT EXISTS then skips the statement.
+  {
+    auto cat = live_->current();
+    if (cat->table(ctas.table) != nullptr || cat->view(ctas.table) != nullptr || cat->index(ctas.table).first != nullptr ||
+        cat->sequence(ctas.table) != nullptr) {
+      if (!ctas.if_not_exists) throw DdlRefused("relation \"" + ctas.table + "\" already exists", kDuplicateTable);
+      out.notices.push_back(skipped(Ddl{ddl}));
+      return out;
+    }
+  }
+  if (stmt.query_error_) {
+    // PostgreSQL does not plan the query of WITH NO DATA, so creates the
+    // table: its column of the failing constant has the constant's type,
+    // which the stand-in lost.
+    if (!ctas.with_data) {
+      throw FeatureNotSupported(std::string{"WITH NO DATA of a query whose constant raises an error is not supported"});
+    }
+    std::rethrow_exception(stmt.query_error_);
+  }
+  auto* cx = acquire_context();
+  try {
+    // The table's columns are checked before the query runs, against the
+    // plan that will run; then again against the rows' own, which a DDL
+    // meanwhile may have recompiled.
+    auto c = fitting_plan(cx, query, params);
+    check_params(*c, params);
+    ddl.columns = ctas_columns(ctas, c->columns, c->column_types);
+    if (ctas.with_data) {
+      auto rows = run(cx, query, params, nullptr, clock_now(), opts);
+      ddl.columns = ctas_columns(ctas, rows.columns, rows.types);
+      ddl.rows.reserve(rows.rows.size());
+      for (auto& r : rows.rows) ddl.rows.push_back(ctas_row(ddl.columns, std::move(r)));
+    }
+    release_context(cx);
+  } catch (...) {
+    release_context(cx);
+    throw;
+  }
+  auto n = std::ssize(ddl.rows);
+  bool changed = false;
+  try {
+    changed = run_ddl(ddl);
+  } catch (const std::length_error& e) {
+    throw ExecError(e.what(), BC_E_LIMIT);  // the backfill, a row or the ids over the engine's limits: 54000
+  }
+  if (!changed) {
+    out.notices.push_back(skipped(Ddl{std::move(ddl)}));
+    return out;
+  }
+  out.affected = ctas.with_data ? n : -1;
+  return out;
 }
 
 auto Database::fitting_plan(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params)
@@ -2022,10 +2223,11 @@ auto Database::quotients(const GeneratedPlan& p, std::vector<Value> values) -> s
 void Database::refit(const Statement& stmt) {
   auto lock = enter();
   if (stmt.owner_ != this) throw std::logic_error("the statement was prepared on another database");
-  if (stmt.is_ddl()) return;
+  const auto& fit = stmt.query_ ? *stmt.query_ : stmt;  // CREATE TABLE AS: its query's parameters
+  if (fit.is_ddl() || stmt.query_error_) return;
   auto* cx = acquire_context();
   try {
-    (void)fitting_plan(cx, stmt, {});
+    (void)fitting_plan(cx, fit, {});
     release_context(cx);
   } catch (...) {
     release_context(cx);

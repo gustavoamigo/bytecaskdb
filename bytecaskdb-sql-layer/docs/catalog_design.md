@@ -488,6 +488,7 @@ disk and in memory, as it was.
 | Statement | Batch |
 |---|---|
 | `CREATE TABLE` | Record, name entry (`ensure_absent`), counters. Two ids: the table and its first layout. The bitmap is sized as the row format says. Without a primary key, the record holds the hidden row id (*Tables without a primary key*). Each `UNIQUE` constraint is a unique index in the same record and batch, with its own name entry (*UNIQUE constraints*). A table of no columns is refused (0A000); PostgreSQL takes one. |
+| `CREATE TABLE AS`, `SELECT … INTO` | As `CREATE TABLE` of no primary key, plus every row of the query under row ids 1 to n (*CREATE TABLE AS*). |
 | `CREATE [UNIQUE] INDEX … (col [DESC], …)` | Record with the index, name entry (`ensure_absent`), counters, an entry per existing row, `ensure_range_unchanged` over the table's rows. A unique index whose rows already hold a duplicate is refused. |
 | `DROP TABLE` | Record and name entries deleted; `del_range` over `02 <table_id>` and over `03 <index_id>` per index. Refused (2BP01) while a view reads the table. |
 | `DROP INDEX` | Record without the index, name entry deleted, `del_range` over `03 <index_id>`. |
@@ -525,6 +526,30 @@ while the index is invisible to reads but maintained by writes, needs an
 index state in the record ("write-only") and plans that respect it; it is
 deferred (#505), and the schema is created before the data until then. The
 TPROC-C schema is.
+
+### CREATE TABLE AS
+
+`CREATE TABLE … AS` and `SELECT … INTO` (`frontend_design.md`, *The
+dialect*) run their query first, autocommit, on a snapshot of its own; the
+API then hands the rows to the catalog in the `CreateTableDdl` (`rows`),
+each value of its column's type, and the catalog writes the table's record,
+its name entry and each row in one batch, row i under the hidden row id i.
+So the table exists with all its rows or not at all: a reader, or a crash,
+before the batch commits finds no table and no row (the test holds the
+commit at `LiveCatalog`'s commit hook, where a reader sees no row key in the
+engine, and throws there to stand for a crash, then reopens). The rows are the
+query's snapshot: a write committed after the query ran and before the DDL
+commits is not in them, as in any transaction whose writes (here, a new
+table's keys alone) conflict with nothing. The table's first `INSERT`
+seeds its row ids from the engine, so it draws n + 1 (*Tables without a
+primary key*).
+
+Two limits bound the rows, and the statement's memory budget comes first:
+the query's result is gathered under `statement_memory_bytes` (64 MiB by
+default), and a result past it is 54000 before any batch is built. The
+rows written are charged to the backfill's 1 GiB limit, which a budget set
+above it reaches; past it the statement is 54000 too (the API's
+`ExecError` `BC_E_LIMIT`), with nothing written.
 
 ## Bootstrapping
 

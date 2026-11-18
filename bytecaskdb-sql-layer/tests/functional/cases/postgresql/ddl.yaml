@@ -409,3 +409,198 @@
     - DROP VIEW inev
     - DROP TABLE ine
     - DROP TABLE ine2
+
+- name: CREATE TABLE AS makes a table of a query's columns and rows
+  features: [T172]
+  setup:
+    - CREATE TABLE ctsrc (id INTEGER PRIMARY KEY, v VARCHAR(5), c CHAR(3))
+    - INSERT INTO ctsrc VALUES (1, 'a', 'x'), (2, 'b', 'yy'), (3, NULL, NULL)
+  steps:
+    - sql: CREATE TABLE cta AS SELECT id, v, c FROM ctsrc WHERE id < $1
+      params: [3]
+      rowcount: 2
+    - sql: SELECT id, v, c FROM cta
+      expected: [[1, a, "x  "], [2, b, "yy "]]
+    # The columns keep the query's types: VARCHAR(5) refuses six characters.
+    - sql: INSERT INTO cta VALUES (4, 'abcdef', NULL)
+      error: "22001"
+    - sql: INSERT INTO cta VALUES (4, 'd', NULL)
+      rowcount: 1
+    - sql: CREATE TABLE ctb (x, y) AS SELECT id, v, c FROM ctsrc
+      rowcount: 3
+    - sql: SELECT x, y, c FROM ctb WHERE x = $1
+      params: [3]
+      expected: [[3, null, null]]
+    - sql: CREATE TABLE ctc AS SELECT id FROM ctsrc UNION SELECT 9
+      rowcount: 4
+    - sql: SELECT COUNT(*) FROM ctc
+      expected: [[4]]
+    - sql: CREATE TABLE ctd AS SELECT id FROM ctsrc WITH NO DATA
+    - sql: SELECT id FROM ctd
+      expected: []
+  teardown:
+    - DROP TABLE cta
+    - DROP TABLE ctb
+    - DROP TABLE ctc
+    - DROP TABLE ctd
+    - DROP TABLE ctsrc
+
+- name: SELECT INTO makes a table, as CREATE TABLE AS does
+  features: [pg:select-into]
+  setup:
+    - CREATE TABLE sisrc (id INTEGER PRIMARY KEY, v TEXT)
+    - INSERT INTO sisrc VALUES (1, 'a'), (2, 'b')
+  steps:
+    - sql: SELECT v, id INTO sib FROM sisrc WHERE id = $1
+      params: [2]
+      rowcount: 1
+    - sql: SELECT v, id FROM sib
+      expected: [[b, 2]]
+    - sql: SELECT 1 UNION SELECT 2 INTO sic
+      error: "42601"
+  teardown:
+    - DROP TABLE sib
+    - DROP TABLE sisrc
+
+- name: CREATE TABLE AS finds a relation of its name before its query's errors
+  features: [T172, pg:if-not-exists]
+  setup:
+    - CREATE TABLE cte (id INTEGER PRIMARY KEY)
+  steps:
+    - sql: CREATE TABLE cte AS SELECT 1
+      error: "42P07"
+    - sql: SELECT 1/0 INTO cte
+      error: "42P07"
+    - sql: CREATE TABLE IF NOT EXISTS cte AS SELECT 1/0
+    - sql: CREATE TABLE cte2 AS SELECT 1/0
+      error: "22012"
+    - sql: CREATE TABLE cte2 AS SELECT nope FROM cte
+      error: "42703"
+    - sql: CREATE TABLE cte2 (a, b) AS SELECT 1
+      error: "42601"
+    - sql: CREATE TABLE cte2 (a, a) AS SELECT 1, 2
+      error: "42701"
+    - sql: CREATE TABLE cte2 AS SELECT 1 AS q, 2 AS q
+      error: "42701"
+    # Folded when the query is planned, after the name is looked for.
+    - sql: CREATE TABLE cte AS SELECT 2147483647 + 1
+      error: "42P07"
+    - sql: CREATE TABLE cte AS SELECT 40000::smallint
+      error: "42P07"
+    - sql: CREATE TABLE cte AS SELECT id FROM cte WHERE id > 1/0
+      error: "42P07"
+    - sql: CREATE TABLE cte2 AS SELECT id FROM cte WHERE id > 1/0
+      error: "22012"
+    # A literal's input error is the analysis's: before the name.
+    - sql: CREATE TABLE cte AS SELECT 'abc'::int
+      error: "22P02"
+    - sql: CREATE TABLE IF NOT EXISTS cte AS SELECT 'abc'::int
+      error: "22P02"
+    - sql: CREATE TABLE cte AS SELECT DATE '2020-13-01'
+      error: "22008"
+    - sql: CREATE TABLE cte AS SELECT '40000'::smallint
+      error: "22003"
+    # A parameter beside the failing constant is still the statement's.
+    - sql: CREATE TABLE cte AS SELECT 1/0 AS a, $1::int AS b
+      params: [5]
+      error: "42P07"
+    - sql: CREATE TABLE IF NOT EXISTS cte AS SELECT 1/0 AS a, $1::int AS b
+      params: [5]
+    - sql: CREATE TABLE cte2 AS SELECT 1/0 AS a, $1::int AS b
+      params: [5]
+      error: "22012"
+    - sql: SELECT $1::int + 1/0 AS a INTO cte2
+      params: [5]
+      error: "22012"
+  teardown:
+    - DROP TABLE cte
+
+- name: CREATE TABLE AS keeps the length CASE and COALESCE keep
+  features: [T172]
+  setup:
+    - CREATE TABLE ctl (id INTEGER PRIMARY KEY, v VARCHAR(3), c CHAR(2))
+    - INSERT INTO ctl VALUES (1, 'ab', 'a')
+  steps:
+    - sql: CREATE TABLE ctl2 AS SELECT COALESCE(v, v) AS x, COALESCE(c, c) AS y, CASE WHEN id = 1 THEN c ELSE c END AS z, COALESCE(v, 'q') AS w FROM ctl
+      rowcount: 1
+    - sql: SELECT x, y, z, w FROM ctl2
+      expected: [[ab, "a ", "a ", ab]]
+    - sql: INSERT INTO ctl2 (x) VALUES ('abcdefgh')
+      error: "22001"
+    - sql: INSERT INTO ctl2 (y) VALUES ('abc')
+      error: "22001"
+    - sql: INSERT INTO ctl2 (z) VALUES ('abc')
+      error: "22001"
+    # a literal among the branches: no length, as PostgreSQL's VARCHAR
+    - sql: INSERT INTO ctl2 (w) VALUES ('abcdefgh')
+      rowcount: 1
+  teardown:
+    - DROP TABLE ctl2
+    - DROP TABLE ctl
+
+- name: CREATE TABLE AS names now()'s column now
+  features: [T172]
+  steps:
+    - sql: CREATE TABLE ctnow AS SELECT now(), current_timestamp
+      rowcount: 1
+    - sql: SELECT "now" IS NOT NULL, "current_timestamp" IS NOT NULL FROM ctnow
+      expected: [[true, true]]
+  teardown:
+    - DROP TABLE ctnow
+
+- name: CREATE TABLE AS WITH NO DATA of a query whose constant raises an error
+  features: [T172]
+  # PostgreSQL does not plan the query, so creates the table; the layer
+  # refuses it (0A000)
+  unimplemented: true
+  steps:
+    - sql: CREATE TABLE ctnd AS SELECT 1/0 AS x WITH NO DATA
+    - sql: SELECT x FROM ctnd
+      expected: []
+  teardown:
+    - DROP TABLE ctnd
+
+- name: CREATE TABLE AS of a NUMERIC of no precision
+  features: [T172]
+  # a NUMERIC of no declared precision is not a column type yet (0A000)
+  unimplemented: true
+  steps:
+    - sql: CREATE TABLE ctn AS SELECT 1.5 AS x
+      rowcount: 1
+    - sql: SELECT x FROM ctn
+      expected: [["1.5"]]
+  teardown:
+    - DROP TABLE ctn
+
+- name: CREATE TABLE AS of no columns
+  features: [T172]
+  # a table of no columns is not built (0A000)
+  unimplemented: true
+  steps:
+    - sql: CREATE TABLE ctz AS SELECT
+      rowcount: 1
+  teardown:
+    - DROP TABLE ctz
+
+- name: CREATE TEMP TABLE AS and SELECT INTO TEMP
+  features: [pg:select-into]
+  # temporary tables are not built (0A000)
+  unimplemented: true
+  steps:
+    - sql: CREATE TEMP TABLE ctt AS SELECT 1 AS x
+      rowcount: 1
+    - sql: SELECT 2 AS x INTO TEMP ctt2
+      rowcount: 1
+  teardown:
+    - DROP TABLE ctt
+    - DROP TABLE ctt2
+
+- name: SELECT INTO in the first arm of a set operation
+  features: [pg:select-into]
+  # INTO in a set operation's arm is refused (0A000); PostgreSQL takes the first arm's as the statement's
+  unimplemented: true
+  steps:
+    - sql: SELECT 1 AS x INTO ctu UNION SELECT 2
+      rowcount: 2
+  teardown:
+    - DROP TABLE ctu

@@ -3685,3 +3685,203 @@ END $$)");
     CHECK(std::string{sqlstate(e)} == "22023");
   }
 }
+
+TEST_CASE("embedded API: CREATE TABLE AS and SELECT … INTO make a table of a query's columns and rows",
+          "[sql][api][ctas]") {
+  sql_test::TempDir dir{"api_ctas"};
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  auto state = [](Database& db, std::string_view sql, const std::vector<Value>& params = {}) -> std::string {
+    try {
+      (void)db.execute(sql, params);
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  {
+    auto db = Database::open(dir.path());
+    (void)db->execute("CREATE TABLE src (a INTEGER PRIMARY KEY, b TEXT, c VARCHAR(5), d CHAR(3), e NUMERIC(5,2), f VARCHAR)");
+    (void)db->execute("INSERT INTO src VALUES (1, 'x', 'ab', 'a', 1.5, 'q'), (2, 'y', NULL, 'bb', NULL, NULL)");
+    CHECK(db->prepare("CREATE TABLE c AS SELECT 1").command() == Command::CreateTableAs);
+    CHECK(db->prepare("SELECT 1 INTO c").command() == Command::SelectInto);
+    CHECK(db->prepare("SELECT 1 INTO c").is_ddl());
+    CHECK(db->prepare("SELECT 1 INTO c").columns().empty());  // it returns no rows
+
+    // The rows written are the count; the columns keep the query's types.
+    auto r = db->execute("CREATE TABLE c1 AS SELECT * FROM src");
+    CHECK(r.affected == 2);
+    CHECK(r.notices.empty());
+    const auto* t = db->catalog()->table("c1");
+    REQUIRE(t != nullptr);
+    REQUIRE(t->columns.size() == 7);  // and the hidden row id
+    CHECK(t->columns[0].sql == SqlType{SqlKind::Integer});
+    CHECK(t->columns[2].sql == SqlType{SqlKind::Varchar, 5});
+    CHECK(t->columns[3].sql == SqlType{SqlKind::Char, 3});
+    CHECK(t->columns[4].sql == SqlType{SqlKind::Decimal, 0, 5, 2});
+    CHECK(t->columns[5].sql == SqlType{SqlKind::Text});  // VARCHAR of no length, as a column declared so
+    CHECK(t->columns[6].hidden);
+    // CASE and COALESCE of one VARCHAR(n) or CHAR(n) keep its length; now()
+    // is named now.
+    (void)db->execute("CREATE TABLE c9 AS SELECT COALESCE(c, c) AS x, CASE WHEN a = 1 THEN d ELSE d END AS y, "
+                      "COALESCE(c, 'z') AS z, now() FROM src");
+    const auto* t9 = db->catalog()->table("c9");
+    REQUIRE(t9 != nullptr);
+    CHECK(t9->columns[0].sql == SqlType{SqlKind::Varchar, 5});
+    CHECK(t9->columns[1].sql == SqlType{SqlKind::Char, 3});
+    CHECK(t9->columns[2].sql == SqlType{SqlKind::Text});
+    CHECK(t9->columns[3].name == "now");
+    CHECK(db->execute("SELECT a, b, d FROM c1 ORDER BY a").rows ==
+          Grid{{i(1), text("x"), text("a  ")}, {i(2), text("y"), text("bb ")}});
+    CHECK(state(*db, "INSERT INTO c1 (c) VALUES ('toolong')") == "22001");  // VARCHAR(5) kept
+    // Row ids continue after the rows written.
+    (void)db->execute("INSERT INTO c1 (a) VALUES (3)");
+    CHECK(db->execute("SELECT COUNT(*) FROM c1").rows == Grid{{i(3)}});
+
+    CHECK(db->execute("SELECT a AS z INTO c2 FROM src WHERE a = 2").affected == 1);
+    CHECK(db->execute("SELECT z FROM c2").rows == Grid{{i(2)}});
+    // Fewer names than columns rename the first ones.
+    (void)db->execute("CREATE TABLE c3 (x) AS SELECT a, b FROM src WHERE a = 1");
+    CHECK(db->execute("SELECT * FROM c3").columns == std::vector<std::string>{"x", "b"});
+    // A set operation, a view, an aggregate and a parameter as the query.
+    CHECK(db->execute("CREATE TABLE c4 AS SELECT a FROM src UNION SELECT 7").affected == 3);
+    (void)db->execute("CREATE VIEW v AS SELECT b FROM src");
+    CHECK(db->execute("CREATE TABLE c5 AS SELECT COUNT(*) AS n FROM v").affected == 1);
+    CHECK(db->execute("SELECT n FROM c5").rows == Grid{{i(2)}});
+    const auto& with_param = db->prepare("CREATE TABLE c6 AS SELECT a FROM src WHERE a = $1");
+    REQUIRE(with_param.params().size() == 1);
+    CHECK(db->execute(with_param, {i(2)}).affected == 1);
+    CHECK(db->execute("SELECT a FROM c6").rows == Grid{{i(2)}});
+
+    // WITH NO DATA: the table and no rows; the query is not run.
+    r = db->execute("CREATE TABLE c7 AS SELECT a FROM src WITH NO DATA");
+    CHECK(r.affected == -1);
+    CHECK(db->execute("SELECT a FROM c7").rows.empty());
+
+    // A relation of the name is found first, before the query's own errors
+    // at run (1/0, folded when PostgreSQL plans it), and IF NOT EXISTS skips.
+    CHECK(state(*db, "CREATE TABLE c1 AS SELECT 1") == "42P07");
+    CHECK(state(*db, "SELECT 1/0 INTO c1") == "42P07");
+    CHECK(state(*db, "SELECT 1/0 INTO c8") == "22012");
+    CHECK(state(*db, "CREATE TABLE v AS SELECT 1") == "42P07");
+    r = db->execute("CREATE TABLE IF NOT EXISTS c1 AS SELECT 1/0");
+    CHECK(r.affected == -1);
+    REQUIRE(r.notices.size() == 1);
+    CHECK(r.notices[0].sqlstate == "42P07");
+    CHECK(r.notices[0].message == "relation \"c1\" already exists, skipping");
+    // A literal's input error is the analysis's: before the name check.
+    CHECK(state(*db, "CREATE TABLE c1 AS SELECT 'abc'::int") == "22P02");
+    CHECK(state(*db, "CREATE TABLE IF NOT EXISTS c1 AS SELECT 'abc'::int") == "22P02");
+    CHECK(state(*db, "CREATE TABLE c1 AS SELECT 40000::smallint") == "42P07");
+    // A parameter beside a constant that fails to fold is still the statement's.
+    const auto& failing = db->prepare("CREATE TABLE c1 AS SELECT 1/0 AS a, $1::int AS b");
+    REQUIRE(failing.params().size() == 1);
+    CHECK(state(*db, "CREATE TABLE c1 AS SELECT 1/0 AS a, $1::int AS b", {i(5)}) == "42P07");
+    CHECK(state(*db, "CREATE TABLE c8 AS SELECT 1/0 AS a, $1::int AS b", {i(5)}) == "22012");
+    CHECK(state(*db, "CREATE TABLE c8 AS SELECT a FROM src WHERE a > 1/0 AND a = $1", {i(5)}) == "22012");
+    CHECK(db->execute("CREATE TABLE IF NOT EXISTS c1 AS SELECT 1/0 AS a, $1::int AS b", {i(5)}).notices.size() == 1);
+    CHECK(state(*db, "CREATE TABLE c8 AS SELECT 1/0 AS x WITH NO DATA") == "0A000");
+    CHECK(state(*db, "CREATE TABLE c8 AS SELECT nope FROM src") == "42703");  // bound at prepare
+    CHECK(state(*db, "CREATE TABLE c8 (x, y, z) AS SELECT 1, 2") == "42601");
+    CHECK(state(*db, "CREATE TABLE c8 (x, x) AS SELECT 1, 2") == "42701");
+    CHECK(state(*db, "CREATE TABLE c8 AS SELECT 1 AS q, 2 AS q") == "42701");
+    // Not built yet: a NUMERIC of no precision, and a table of no columns.
+    CHECK(state(*db, "CREATE TABLE c8 AS SELECT 1.5") == "0A000");
+    CHECK(state(*db, "CREATE TABLE c8 AS SELECT AVG(a) FROM src") == "0A000");
+    CHECK(state(*db, "CREATE TABLE c8 AS SELECT") == "0A000");
+    CHECK(db->catalog()->table("c8") == nullptr);
+    // DDL: never in a transaction.
+    auto txn = db->begin();
+    CHECK_THROWS_AS(txn.execute("SELECT 1 INTO c8"), FeatureNotSupported);
+    txn.rollback();
+    db->close();
+  }
+  {
+    // Kept: the table, its rows and its next row id.
+    auto db = Database::open(dir.path());
+    CHECK(db->execute("SELECT COUNT(*) FROM c1").rows == Grid{{i(3)}});
+    (void)db->execute("INSERT INTO c4 VALUES (8)");
+    CHECK(db->execute("SELECT a FROM c4 ORDER BY a").rows == Grid{{i(1)}, {i(2)}, {i(7)}, {i(8)}});
+    db->close();
+  }
+}
+
+namespace {
+// The rows of every table the engine holds, read from the engine.
+auto row_keys(bytecask::DB& engine) -> std::size_t {
+  auto ns = row_prefix(0);
+  ns.resize(1);  // the rows' namespace
+  std::size_t n = 0;
+  for (const auto& e : engine.iter_from({}, ns)) {
+    if (!has_prefix(e.key, ns)) break;
+    ++n;
+  }
+  return n;
+}
+}  // namespace
+
+TEST_CASE("embedded API: CREATE TABLE AS writes its table and rows in one batch, within the statement's budget",
+          "[sql][api][ctas]") {
+  sql_test::TempDir dir{"api_ctas_atomic"};
+  {
+    auto db = Database::open(dir.path());
+    (void)db->execute("CREATE TABLE src (a INTEGER PRIMARY KEY, b TEXT)");
+    for (std::int64_t k = 1; k <= 50; ++k) (void)db->execute("INSERT INTO src VALUES ($1, 'some text')", {i(k)});
+    // Held mid-commit, before the batch reaches the engine: neither the table
+    // nor any of its rows is there, in the catalog or the engine (only src's
+    // 50 rows are), so the rows were not written in a batch of their own
+    // before the table's.
+    auto version = db->catalog()->version();
+    CHECK(row_keys(db->engine_for_testing()) == 50);
+    std::string seen;
+    std::size_t rows_seen = 0;
+    db->live_catalog_for_testing().set_commit_hook_for_testing([&] {
+      std::thread reader{[&] {
+        seen = db->catalog()->table("c") == nullptr && db->catalog()->version() == version ? "absent" : "present";
+        rows_seen = row_keys(db->engine_for_testing());
+      }};
+      reader.join();
+    });
+    CHECK(db->execute("CREATE TABLE c AS SELECT a, b FROM src").affected == 50);
+    db->live_catalog_for_testing().set_commit_hook_for_testing({});
+    CHECK(seen == "absent");
+    CHECK(rows_seen == 50);
+    CHECK(db->catalog()->version() == version + 1);
+    CHECK(db->execute("SELECT COUNT(*) FROM c").rows == Grid{{i(50)}});
+    CHECK(row_keys(db->engine_for_testing()) == 100);  // the table's rows came with it
+
+    // A crash before the batch reaches the engine (the hook throws, and the
+    // database is closed and reopened, below): no table and no row.
+    db->live_catalog_for_testing().set_commit_hook_for_testing([] { throw std::runtime_error{"crash"}; });
+    CHECK_THROWS(db->execute("CREATE TABLE crashed AS SELECT a, b FROM src"));
+    db->live_catalog_for_testing().set_commit_hook_for_testing({});
+
+    // The batch's limit refuses it whole (54000), nothing written.
+    db->live_catalog_for_testing().set_backfill_limit_for_testing(512);
+    try {
+      (void)db->execute("CREATE TABLE d AS SELECT a, b FROM src");
+      FAIL("ran");
+    } catch (const ExecError& e) {
+      CHECK(sqlstate(e) == "54000");
+    }
+    db->live_catalog_for_testing().set_backfill_limit_for_testing(LiveCatalog::kMaxBackfillBytes);
+    CHECK(db->catalog()->table("d") == nullptr);
+    CHECK(db->catalog()->version() == version + 1);
+    db->close();
+  }
+  {
+    // The statement's memory budget bounds the query's rows first: 54000,
+    // before any batch is built.
+    auto db = Database::open(dir.path(), DatabaseOptions{.statement_memory_bytes = 512});
+    try {
+      (void)db->execute("CREATE TABLE d AS SELECT a, b FROM src");
+      FAIL("ran");
+    } catch (const ExecError& e) {
+      CHECK(sqlstate(e) == "54000");
+    }
+    CHECK(db->catalog()->table("d") == nullptr);
+    CHECK(db->execute("SELECT COUNT(*) FROM c").rows == Grid{{i(50)}});  // after a reopen
+    CHECK(db->catalog()->table("crashed") == nullptr);
+    CHECK(row_keys(db->engine_for_testing()) == 100);
+    db->close();
+  }
+}
