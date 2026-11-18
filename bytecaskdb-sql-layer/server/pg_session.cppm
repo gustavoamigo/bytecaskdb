@@ -741,7 +741,7 @@ private:
   // ------------------------------------------------------------ replies
 
   void send_fields(char type, const char* severity, std::string_view state, std::string_view message,
-                   std::int32_t position) {
+                   std::int32_t position, std::string_view detail = {}, std::string_view hint = {}) {
     out_.begin(type);
     out_.raw('S');
     out_.cstr(severity);
@@ -751,6 +751,14 @@ private:
     out_.cstr(state);
     out_.raw('M');
     out_.cstr(message);
+    if (!detail.empty()) {
+      out_.raw('D');
+      out_.cstr(detail);
+    }
+    if (!hint.empty()) {
+      out_.raw('H');
+      out_.cstr(hint);
+    }
     if (position > 0) {
       out_.raw('P');
       out_.cstr(std::to_string(position));
@@ -791,7 +799,7 @@ private:
     } catch (const ProtocolError& e) {
       error("08P01", e.what());
     } catch (const ast::SqlError& e) {
-      error(sqlstate(e), e.what(), e.pos() < 0 ? 0 : char_position(text, e.pos()));
+      send_fields('E', "ERROR", sqlstate(e), e.what(), e.pos() < 0 ? 0 : char_position(text, e.pos()), e.detail(), e.hint());
     } catch (const std::exception& e) {
       // A statement stopped by its transaction's deadline ends the session,
       // as PostgreSQL's transaction_timeout does; otherwise 57014 is a

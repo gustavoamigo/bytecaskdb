@@ -1,6 +1,7 @@
 # Views: CREATE VIEW and DROP VIEW, read like a table in FROM. A view is its
-# query, read again at each use. Updatable views, WITH CHECK OPTION, and a
-# query that aggregates over a grouped view, beyond MIN and MAX of one with no aggregate, are not built.
+# query, read again at each use. INSERT writes through a simple view; UPDATE
+# and DELETE through one, WITH CHECK OPTION, and a query that aggregates over
+# a grouped view, beyond MIN and MAX of one with no aggregate, are not built.
 
 - name: a view reads its table's rows as they are when it is read
   features: [F031-02]
@@ -113,8 +114,6 @@
 
 - name: INSERT through a simple view reaches its table
   features: [F031-02]
-  unimplemented: true
-  # updatable views: INSERT, UPDATE and DELETE on a view are refused (0A000)
   setup:
     - CREATE TABLE vw4 (id INTEGER PRIMARY KEY, v INTEGER)
     - CREATE VIEW vw4_v AS SELECT id, v FROM vw4
@@ -127,6 +126,85 @@
   teardown:
     - DROP VIEW vw4_v
     - DROP TABLE vw4
+
+- name: INSERT through a view fills the table's columns the view selects
+  features: [F031-02, pg:returning]
+  setup:
+    - CREATE TABLE vw6 (id INTEGER PRIMARY KEY, v INTEGER DEFAULT 7, w TEXT)
+    - CREATE VIEW vw6_v (k, val) AS SELECT id, v FROM vw6 WHERE v > 100
+    - CREATE VIEW vw6_vv AS SELECT val, k FROM vw6_v
+  steps:
+    # the row fills the view's first columns; the table's default the rest
+    - sql: INSERT INTO vw6_v VALUES ($1)
+      params: [1]
+      rowcount: 1
+    # the view's WHERE is not checked, and RETURNING gives the view's columns
+    - sql: INSERT INTO vw6_vv (k, val) VALUES ($1, $2) RETURNING *
+      params: [2, 20]
+      expected: [[20, 2]]
+    - sql: SELECT id, v, w FROM vw6 ORDER BY id
+      expected: [[1, 7, null], [2, 20, null]]
+    - sql: SELECT k FROM vw6_v
+      expected: []
+  teardown:
+    - DROP VIEW vw6_vv
+    - DROP VIEW vw6_v
+    - DROP TABLE vw6
+
+- name: INSERT through a view PostgreSQL cannot write through is refused
+  features: [F031-02]
+  setup:
+    - CREATE TABLE vw7 (id INTEGER PRIMARY KEY, v INTEGER)
+    - CREATE VIEW vw7_d AS SELECT DISTINCT id FROM vw7
+    - CREATE VIEW vw7_g AS SELECT v, COUNT(*) AS n FROM vw7 GROUP BY v
+    - CREATE VIEW vw7_e AS SELECT id, v + 1 AS v1 FROM vw7
+    - CREATE VIEW vw7_2 AS SELECT id, id AS id2 FROM vw7
+    - CREATE VIEW vw7_l AS SELECT id FROM vw7 LIMIT 5
+    - CREATE VIEW vw7_la AS SELECT id FROM vw7 LIMIT ALL
+    - CREATE VIEW vw7_ln AS SELECT id FROM vw7 LIMIT NULL
+    - CREATE VIEW vw7_o AS SELECT id FROM vw7 OFFSET 0
+  steps:
+    - sql: INSERT INTO vw7_d VALUES ($1)
+      params: [1]
+      error: "55000"
+    - sql: INSERT INTO vw7_g (v) VALUES ($1)
+      params: [1]
+      error: "55000"
+    # LIMIT or OFFSET written, even one that limits nothing
+    - sql: INSERT INTO vw7_l VALUES ($1)
+      params: [1]
+      error: "55000"
+    - sql: INSERT INTO vw7_la VALUES ($1)
+      params: [1]
+      error: "55000"
+    - sql: INSERT INTO vw7_ln VALUES ($1)
+      params: [1]
+      error: "55000"
+    - sql: INSERT INTO vw7_o VALUES ($1)
+      params: [1]
+      error: "55000"
+    # a column that is an expression; two view columns of one table column
+    - sql: INSERT INTO vw7_e VALUES ($1, $2)
+      params: [1, 2]
+      error: "0A000"
+    - sql: INSERT INTO vw7_2 VALUES ($1, $2)
+      params: [1, 1]
+      error: "42601"
+    - sql: INSERT INTO vw7_e (id) VALUES ($1)
+      params: [3]
+      rowcount: 1
+    - sql: SELECT id, v FROM vw7
+      expected: [[3, null]]
+  teardown:
+    - DROP VIEW vw7_o
+    - DROP VIEW vw7_ln
+    - DROP VIEW vw7_la
+    - DROP VIEW vw7_l
+    - DROP VIEW vw7_2
+    - DROP VIEW vw7_e
+    - DROP VIEW vw7_g
+    - DROP VIEW vw7_d
+    - DROP TABLE vw7
 
 - name: DROP VIEW, and what keeps a table or a view from being dropped
   features: [F031-16]

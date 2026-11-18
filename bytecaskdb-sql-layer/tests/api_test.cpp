@@ -2508,8 +2508,47 @@ TEST_CASE("embedded API: a view is read as a table, expanded at each use, and ke
     CHECK(state(*db, "SELECT a FROM d") == "42601");
     CHECK(state(*db, "CREATE VIEW dp AS SELECT a FROM vt WHERE a = $1") == "42P02");
 
-    // A view is read-only here.
-    CHECK(state(*db, "INSERT INTO v VALUES (9, 9, 'q')") == "0A000");
+    // INSERT through a view of one table writes the table: the view's columns are the
+    // table's they select; its WHERE is not checked (no WITH CHECK OPTION).
+    CHECK(db->execute("INSERT INTO v VALUES (9, 9, 'q')").affected == 1);
+    CHECK(run("SELECT a, b FROM vt WHERE id = 9") == Grid{{i(9), text("q")}});
+    CHECK(run("SELECT id FROM v WHERE id = 9").empty());
+    // A row shorter than the view fills its first columns; the table's defaults the rest.
+    CHECK(db->execute("INSERT INTO w VALUES (10)").affected == 1);
+    CHECK(run("SELECT a, b FROM vt WHERE id = 10") == Grid{{Value{}, Value{}}});
+    // A column list, RETURNING over the view's columns, a view of a view, and a FROM alias's names.
+    CHECK(run("INSERT INTO v (b, id) VALUES ('r', 11) RETURNING *") == Grid{{i(11), Value{}, text("r")}});
+    (void)run("CREATE VIEW ww AS SELECT y, x FROM w");
+    CHECK(run("INSERT INTO ww VALUES (120, 12) RETURNING x + 1, y") == Grid{{i(13), i(120)}});
+    CHECK(run("SELECT a FROM vt WHERE id = 12") == Grid{{i(120)}});
+    (void)run("CREATE VIEW al AS SELECT x.p, x.q FROM vt AS x (p, q)");
+    CHECK(run("INSERT INTO al VALUES (13, 130) RETURNING p, q") == Grid{{i(13), i(130)}});
+    CHECK(db->execute("INSERT INTO v SELECT id + 100, aa, b FROM v WHERE id = 3").affected == 1);
+    CHECK(run("SELECT a FROM vt WHERE id = 103") == Grid{{i(30)}});
+    // What PostgreSQL refuses: a view it cannot write through (55000), a column that is an
+    // expression (0A000), two view columns of one table column (42601), a row too long (42601).
+    CHECK(state(*db, "INSERT INTO d VALUES (1)") == "55000");
+    CHECK(state(*db, "INSERT INTO g (a) VALUES (1)") == "55000");
+    CHECK(state(*db, "INSERT INTO one VALUES (1)") == "55000");
+    CHECK(state(*db, "INSERT INTO k VALUES (14, 7)") == "0A000");
+    CHECK(state(*db, "INSERT INTO k (id) VALUES (14)") == "ran");
+    (void)run("CREATE VIEW twice AS SELECT id, id AS id2 FROM vt");
+    CHECK(state(*db, "INSERT INTO twice VALUES (15, 15)") == "42601");
+    CHECK(state(*db, "INSERT INTO w VALUES (16, 1, 2)") == "42601");
+    CHECK(state(*db, "INSERT INTO w (nope) VALUES (16)") == "42703");
+    try {
+      (void)db->execute("INSERT INTO d VALUES (1)");
+      FAIL("an INSERT through a DISTINCT view ran");
+    } catch (const ast::SqlError& e) {
+      CHECK(std::string{e.what()} == "cannot insert into view \"d\"");
+      CHECK(e.detail() == "Views containing DISTINCT are not automatically updatable.");
+      CHECK(e.hint().starts_with("To enable inserting into the view"));
+    }
+    (void)run("DROP VIEW twice");
+    (void)run("DROP VIEW ww");
+    (void)run("DROP VIEW al");
+    (void)run("DELETE FROM vt WHERE id > 5");
+    // UPDATE and DELETE of a view, and DDL against one, are refused.
     CHECK(state(*db, "UPDATE v SET aa = 1") == "0A000");
     CHECK(state(*db, "DELETE FROM v") == "0A000");
     CHECK(state(*db, "CREATE INDEX vi ON v (id)") == "0A000");

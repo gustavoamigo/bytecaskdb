@@ -693,6 +693,10 @@ difference: the driver writes ISO.
 - `S` and `V`: `ERROR`, or `FATAL` before the connection closes;
 - `C`: the SQLSTATE;
 - `M`: the exception's message;
+- `D` and `H`: for an `ast::SqlError` that has them, PostgreSQL's DETAIL
+  and HINT (`ast::SqlError::detail`, `hint`; an `INSERT` through a view
+  PostgreSQL does not write through is the first to carry them). Other
+  errors send neither, where PostgreSQL may;
 - `P`: for an `ast::SqlError`, its position, one-based and in characters,
   converted from the layer's byte offset.
 

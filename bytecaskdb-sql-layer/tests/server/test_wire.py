@@ -370,6 +370,21 @@ def test_a_binder_error_carries_its_sqlstate_on_the_wire(server):
         assert f["C"] == state and int(f["P"]) > 0, (sql, f)
 
 
+def test_an_error_carries_postgresqls_detail_and_hint(server):
+    c = connect(server)
+    for sql in ("CREATE TABLE detail_t (k BIGINT PRIMARY KEY)", "CREATE VIEW detail_v AS SELECT DISTINCT k FROM detail_t"):
+        c.send(query(sql))
+        c.until_ready()
+    c.send(query("INSERT INTO detail_v VALUES (1)"))
+    f = fields(c.until_ready()[0][1])
+    assert f["C"] == "55000" and f["M"] == 'cannot insert into view "detail_v"', f
+    assert f["D"] == "Views containing DISTINCT are not automatically updatable.", f
+    assert f["H"].startswith("To enable inserting into the view"), f
+    c.send(query("SELECT k FROM detail_t WHERE nope = 1"))
+    f = fields(c.until_ready()[0][1])
+    assert "D" not in f and "H" not in f, f
+
+
 # ---------------------------------------------------------------- extended query
 
 

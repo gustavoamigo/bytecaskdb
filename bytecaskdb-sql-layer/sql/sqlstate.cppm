@@ -68,6 +68,7 @@ inline constexpr SqlState kReservedName{"42939"};
 inline constexpr SqlState kInvalidGrantOperation{"0LP01"};
 inline constexpr SqlState kInvalidRowCountInOffset{"2201X"};
 inline constexpr SqlState kInvalidTableDefinition{"42P16"};
+inline constexpr SqlState kObjectNotInPrerequisiteState{"55000"};
 
 // The constant above whose code is `code`, or nullopt.
 [[nodiscard]] constexpr auto known_sqlstate(std::string_view code) noexcept -> std::optional<SqlState> {

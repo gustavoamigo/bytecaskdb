@@ -2955,10 +2955,19 @@ public:
     return out;
   }
 
+  // The table an UPDATE or DELETE writes; a view is refused (#678).
+  auto updated_table(const std::string& name, std::int32_t pos) const -> const Table* {
+    if (cat_.table(name) == nullptr && cat_.view(name) != nullptr) {
+      throw SqlError{"\"" + name + "\" is a view: UPDATE and DELETE through a view are not supported yet (#678)", pos,
+                     kFeatureNotSupported};
+    }
+    return table(name, pos);
+  }
+
   auto table(const std::string& name, std::int32_t pos) const -> const Table* {
     const auto* t = cat_.table(name);
     if (t == nullptr && cat_.view(name) != nullptr) {
-      throw SqlError{"\"" + name + "\" is a view, not a table: views are not updatable", pos, kFeatureNotSupported};
+      throw SqlError{"\"" + name + "\" is a view, not a table", pos, kFeatureNotSupported};
     }
     if (t == nullptr) throw SqlError{"relation \"" + name + "\" does not exist", pos, kUndefinedTable};
     return t;
@@ -4759,8 +4768,25 @@ public:
       return std::optional<ast::Statement>{std::in_place, std::in_place_type<ast::Select>, expand(*s)};
     }
     if (const auto* i = std::get_if<ast::Insert>(&stmt)) {
-      if (!i->query || !mentions(*i->query)) return std::nullopt;
-      ast::Insert out{i->table, i->columns, {}, i->pos, cloned(i->returning), std::make_shared<const ast::Select>(expand(*i->query))};
+      const auto* view = cat_.view(i->table);
+      auto found = view != nullptr;
+      ast::Insert out{i->table, i->columns, {}, i->pos, cloned(i->returning), i->query};
+      if (i->query && mentions(*i->query)) {
+        out.query = std::make_shared<const ast::Select>(expand(*i->query));
+        found = true;
+      }
+      auto expand_slot = [&](std::shared_ptr<const ast::Select>& q) {
+        if (!mentions(*q)) return;
+        q = std::make_shared<const ast::Select>(expand(*q));
+        found = true;
+      };
+      for (const auto& row : i->rows) {
+        out.rows.push_back(cloned(row));
+        for (auto& e : out.rows.back()) subqueries_in(e, expand_slot);
+      }
+      if (view != nullptr) into_base_table(out, *view);
+      for (auto& e : out.returning) subqueries_in(e, expand_slot);
+      if (!found) return std::nullopt;
       return std::optional<ast::Statement>{std::in_place, std::in_place_type<ast::Insert>, std::move(out)};
     }
     if (const auto* u = std::get_if<ast::Update>(&stmt)) {
@@ -4824,6 +4850,162 @@ public:
 
 private:
   static constexpr int kMaxDepth = 16;
+
+  // INSERT INTO view: written to the view's one base table, as PostgreSQL's
+  // automatically updatable views are (docs/frontend_design.md, *Views*).
+  // The view's columns the statement fills become the base columns they
+  // are, its RETURNING the view's columns over the row written. The view's
+  // WHERE does not apply: there is no WITH CHECK OPTION. Errors come in
+  // PostgreSQL's order: the column list, the row's width, the view's shape
+  // (55000), each column filled (0A000), two filling one base column (42601).
+  void into_base_table(ast::Insert& s, const View& v) {
+    const auto& b = body(v);
+    std::vector<std::string> filled;
+    if (s.columns.empty()) {
+      auto width = s.query ? query_width(*s.query) : s.rows.front().size();
+      if (width > v.columns.size()) throw SqlError{"INSERT has more expressions than target columns", s.pos};
+      filled.assign(v.columns.begin(), v.columns.begin() + static_cast<std::ptrdiff_t>(width));
+    } else {
+      for (const auto& name : s.columns) {
+        if (std::ranges::find(v.columns, name) == v.columns.end()) {
+          throw SqlError{"column \"" + name + "\" of relation \"" + v.name + "\" does not exist", s.pos, kUndefinedColumn};
+        }
+        if (std::ranges::contains(filled, name)) {
+          throw SqlError{"column \"" + name + "\" specified more than once", s.pos, kDuplicateColumn};
+        }
+        filled.push_back(name);
+      }
+    }
+    // Each view of the chain down to the table, its own definition as
+    // written, as PostgreSQL rewrites them one at a time: its shape, then the
+    // columns filled, each mapped to its relation's, which must differ.
+    std::string table;
+    for (const auto* at = &v; at != nullptr;) {
+      auto parsed = ast::parse(at->definition);
+      const auto& q = std::get<ast::CreateView>(parsed).query;
+      if (auto why = not_updatable(q); !why.empty()) {
+        throw SqlError{"cannot insert into view \"" + at->name + "\"", s.pos, kObjectNotInPrerequisiteState}.with_notes(
+            why, "To enable inserting into the view, provide an INSTEAD OF INSERT trigger or an unconditional ON INSERT DO INSTEAD rule.");
+      }
+      const auto& item = q.from[0];
+      // The FROM item's columns as its relation names them, and as the query does.
+      auto inner = relation_columns(item.table);
+      auto named = inner;
+      for (std::size_t k = 0; k < item.column_aliases.size() && k < named.size(); ++k) named[k] = item.column_aliases[k];
+      std::vector<ast::Expr> items;
+      for (const auto& e : q.targets) {
+        if (e.kind != ast::Expr::Kind::Star) {
+          items.push_back(ast::clone(e));
+          continue;
+        }
+        for (const auto& name : named) items.push_back(column_named(e, "", name));
+      }
+      std::vector<std::string> next;
+      for (const auto& name : filled) {
+        const auto& e = items.at(static_cast<std::size_t>(std::ranges::find(at->columns, name) - at->columns.begin()));
+        if (e.kind != ast::Expr::Kind::Column) {
+          throw SqlError{"cannot insert into column \"" + name + "\" of view \"" + at->name + "\"", s.pos, kFeatureNotSupported}
+              .with_notes("View columns that are not columns of their base relation are not updatable.", "");
+        }
+        auto k = std::ranges::find(named, e.column);
+        if (k == named.end()) not_yet("inserting into a view column that is no column of its relation", s.pos);
+        const auto& column = inner[static_cast<std::size_t>(k - named.begin())];
+        if (std::ranges::contains(next, column)) throw SqlError{"multiple assignments to same column \"" + column + "\"", -1};
+        next.push_back(column);
+      }
+      filled = std::move(next);
+      table = item.table;
+      at = cat_.view(item.table);
+    }
+    // RETURNING reads the view's body, merged down to the table.
+    const auto& item = b.select.from.at(0);
+    const auto* base = cat_.table(item.table);
+    if (base == nullptr || base->name != table) throw std::logic_error{"an updatable view's body reads another table"};
+    auto visible = relation_columns(table);
+    auto base_name = [&](const std::string& column) {
+      auto at = std::ranges::find(item.column_aliases, column);
+      if (at == item.column_aliases.end()) return column;
+      return visible.at(static_cast<std::size_t>(at - item.column_aliases.begin()));
+    };
+    auto item_of = [&](const std::string& name) -> const ast::Expr& {
+      return b.select.targets.at(static_cast<std::size_t>(std::ranges::find(v.columns, name) - v.columns.begin()));
+    };
+    s.table = table;
+    s.columns = std::move(filled);
+    // RETURNING: * is the view's columns; each the item it is, over the base row.
+    std::vector<ast::Expr> returning;
+    for (auto& e : s.returning) {
+      if (e.kind != ast::Expr::Kind::Star) {
+        returning.push_back(std::move(e));
+        continue;
+      }
+      if (!e.table.empty() && e.table != v.name) {
+        throw SqlError{"missing FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable};
+      }
+      for (const auto& name : v.columns) returning.push_back(column_named(e, "", name));
+    }
+    auto to_base = [&](ast::Expr& ref) -> std::optional<ast::Expr> { return column_named(ref, "", base_name(ref.column)); };
+    auto swap = [&](ast::Expr& ref) -> std::optional<ast::Expr> {
+      if (!ref.table.empty() && ref.table != v.name) {
+        throw SqlError{"missing FROM-clause entry for table \"" + ref.table + "\"", ref.pos, kUndefinedTable};
+      }
+      if (std::ranges::find(v.columns, ref.column) == v.columns.end()) {
+        throw SqlError{"column \"" + ref.column + "\" does not exist", ref.pos, kUndefinedColumn};
+      }
+      auto out = ast::clone(item_of(ref.column));
+      swap_columns(out, to_base);
+      return out;
+    };
+    for (auto& e : returning) {
+      auto name = e.kind == ast::Expr::Kind::Column ? (e.alias.empty() ? e.column : e.alias) : e.alias;
+      swap_columns(e, swap);
+      e.alias = name;
+    }
+    s.returning = std::move(returning);
+  }
+
+  // A table's or view's columns, in order; a table's hidden row id is none.
+  auto relation_columns(const std::string& name) const -> std::vector<std::string> {
+    if (const auto* w = cat_.view(name)) return w->columns;
+    std::vector<std::string> out;
+    for (const auto& c : cat_.table(name)->columns) {
+      if (!c.hidden) out.push_back(c.name);
+    }
+    return out;
+  }
+
+  // Why PostgreSQL would not write through a view of this definition, its
+  // DETAIL; empty where it would.
+  static auto not_updatable(const ast::Select& q) -> std::string {
+    auto aggregates = [](const ast::Expr& e) { return has_aggregate(e); };
+    if (q.distinct) return "Views containing DISTINCT are not automatically updatable.";
+    if (!q.group_by.empty()) return "Views containing GROUP BY are not automatically updatable.";
+    if (!q.having.empty()) return "Views containing HAVING are not automatically updatable.";
+    if (q.set) return "Views containing UNION, INTERSECT, or EXCEPT are not automatically updatable.";
+    if (q.limit_written) return "Views containing LIMIT or OFFSET are not automatically updatable.";
+    if (std::ranges::any_of(q.targets, aggregates) ||
+        std::ranges::any_of(q.order_by, [&](const ast::OrderItem& o) { return aggregates(o.expr); })) {
+      return "Views that return aggregate functions are not automatically updatable.";
+    }
+    if (q.from.size() != 1) return "Views that do not select from a single table or view are not automatically updatable.";
+    return {};
+  }
+
+  static auto has_aggregate(const ast::Expr& e) -> bool {
+    if (e.kind == ast::Expr::Kind::Aggregate) return true;
+    return (e.lhs && has_aggregate(*e.lhs)) || (e.rhs && has_aggregate(*e.rhs)) ||
+           std::ranges::any_of(e.args, [](const ast::Expr& a) { return has_aggregate(a); });
+  }
+
+  // The number of columns a query gives, its stars written out.
+  auto query_width(const ast::Select& q) -> std::size_t {
+    if (q.set) return query_width(q.set->left);
+    if (std::ranges::none_of(q.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Star; })) {
+      return q.targets.size();
+    }
+    Binder scratch{cat_, 0};
+    return scratch.expand_stars(q, scratch.relations(q)).size();
+  }
 
   [[nodiscard]] auto mentions(const ast::Select& s) const -> bool {
     if (s.set) return mentions(s.set->left) || mentions(s.set->right);
@@ -5442,7 +5624,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
     const auto* t = cat.table(table);
     if (t == nullptr) {
       if (cat.view(table) != nullptr) {
-        throw SqlError{"\"" + table + "\" is a view, not a table: views are not updatable", pos, kFeatureNotSupported};
+        throw SqlError{"\"" + table + "\" is a view: UPDATE and DELETE through a view are not supported yet (#678)", pos, kFeatureNotSupported};
       }
       throw SqlError{"relation \"" + table + "\" does not exist", pos, kUndefinedTable};
     }
@@ -5613,7 +5795,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
         } else if constexpr (std::is_same_v<T, ast::Select>) {
           return {b.select(s), s.pos};
         } else if constexpr (std::is_same_v<T, ast::Update>) {
-          const auto* t = b.table(s.table, s.pos);
+          const auto* t = b.updated_table(s.table, s.pos);
           std::vector<std::pair<logical::ColumnRef, logical::Expr>> set;
           for (const auto& a : s.set) {
             // A primary key column too: the row moves to its new key, each
@@ -5634,7 +5816,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           return {logical::node(logical::Update{std::move(rows), t, std::move(set), b.checks(*t), b.returning(*t, s.returning)}),
                   s.pos};
         } else {
-          const auto* t = b.table(s.table, s.pos);
+          const auto* t = b.updated_table(s.table, s.pos);
           b.set_scope({t});
           auto rows = Binder::rows(*t, s.current_of.empty() ? b.where(*t, s.where) : b.current_of(*t, own, s.pos));
           return {logical::node(logical::Delete{std::move(rows), t, b.returning(*t, s.returning)}), s.pos};
