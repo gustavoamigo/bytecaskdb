@@ -354,6 +354,8 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_position", fn_addr(bc_position)},
       {"bc_random", fn_addr(bc_random)},
       {"bc_like", fn_addr(bc_like)},
+      {"bc_ilike", fn_addr(bc_ilike)},
+      {"bc_like_escape", fn_addr(bc_like_escape)},
       {"bc_sub_begin", fn_addr(bc_sub_begin)},
       {"bc_sub_end", fn_addr(bc_sub_end)},
       {"bc_sub_has_i64", fn_addr(bc_sub_has_i64)},

@@ -493,23 +493,29 @@ auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t p
       if (negate) return negated(std::move(c));
       return c;
     }
-    case PG_QUERY__A__EXPR__KIND__AEXPR_LIKE: {
-      // ~~ is LIKE, !~~ NOT LIKE; ESCAPE comes as like_escape(pattern, escape).
+    case PG_QUERY__A__EXPR__KIND__AEXPR_LIKE:
+    case PG_QUERY__A__EXPR__KIND__AEXPR_ILIKE: {
+      // ~~ is LIKE, !~~ NOT LIKE, ~~* and !~~* the ILIKEs; ESCAPE comes as
+      // like_escape(pattern, escape), a string literal or a $n.
       auto op = a->n_name == 1 ? str(a->name[0]) : "";
       Compare c{Compare::Op::Eq, expr(a->lexpr), {}, a->location, on};
       c.kind = Compare::Kind::Like;
+      c.fold = a->kind == PG_QUERY__A__EXPR__KIND__AEXPR_ILIKE;
       const auto* r = a->rexpr;
       if (r != nullptr && r->node_case == PG_QUERY__NODE__NODE_FUNC_CALL &&
           str(r->func_call->funcname[r->func_call->n_funcname - 1]) == "like_escape" && r->func_call->n_args == 2) {
         const auto* e = r->func_call->args[1];
-        if (e->node_case != PG_QUERY__NODE__NODE_A_CONST || e->a_const->val_case != PG_QUERY__A__CONST__VAL_SVAL) {
-          reject("ESCAPE takes a string literal", a->location);
+        if (e->node_case == PG_QUERY__NODE__NODE_PARAM_REF) {
+          c.escape_param = expr(e).param;
+        } else if (e->node_case == PG_QUERY__NODE__NODE_A_CONST && e->a_const->val_case == PG_QUERY__A__CONST__VAL_SVAL) {
+          c.escape = e->a_const->sval->sval;
+        } else {
+          reject("ESCAPE takes a string literal or a parameter", a->location);
         }
-        c.escape = e->a_const->sval->sval;
         r = r->func_call->args[0];
       }
       c.rhs = expr(r);
-      if (op == "!~~") return negated(std::move(c));
+      if (op == "!~~" || op == "!~~*") return negated(std::move(c));
       return c;
     }
     case PG_QUERY__A__EXPR__KIND__AEXPR_IN: {
@@ -532,7 +538,6 @@ auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t p
     case PG_QUERY__A__EXPR__KIND__AEXPR_OP_ALL:
     case PG_QUERY__A__EXPR__KIND__AEXPR_DISTINCT:
     case PG_QUERY__A__EXPR__KIND__AEXPR_NOT_DISTINCT:
-    case PG_QUERY__A__EXPR__KIND__AEXPR_ILIKE: reject("ILIKE is not supported: its case folding is a locale's", a->location);
     case PG_QUERY__A__EXPR__KIND__AEXPR_NULLIF:
     case PG_QUERY__A__EXPR__KIND__AEXPR_SIMILAR:
     case _PG_QUERY__A__EXPR__KIND_IS_INT_SIZE: break;

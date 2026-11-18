@@ -723,11 +723,11 @@ private:
         reads(e);
         return;
       case Expr::Kind::Like:
-        if (e.args.size() != 2 || e.args[0].kind != Expr::Kind::Column || e.args[0].col.type != PhysType::Bytes ||
-            e.args[1].kind != Expr::Kind::Param) {
-          broken("LIKE of other than a text column and a parameter");
+        if (e.args.size() < 2 || e.args.size() > 3 || e.args[0].kind != Expr::Kind::Column || e.args[0].col.type != PhysType::Bytes ||
+            e.args[1].kind != Expr::Kind::Param || (e.args.size() == 3 && e.args[2].kind != Expr::Kind::Param)) {
+          broken("LIKE of other than a text column and parameters");
         }
-        params(e.args[1]);
+        for (std::size_t i = 1; i < e.args.size(); ++i) params(e.args[i]);
         reads(e);
         return;
       case Expr::Kind::Compare:

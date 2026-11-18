@@ -714,10 +714,19 @@ private:
       }
       case Expr::Kind::IsNull: return (want ? "" : "!") + col_null(e.args[0].col);  // never unknown
       case Expr::Kind::Like: {
+        // ESCAPE $n is checked, and its code point taken, at each row: a
+        // parameter's value is known only when the plan runs.
         const auto& col = e.args[0].col;
         auto p = e.args[1].param;
-        auto match = "bc_like(cx, " + read_col(col) + ", " + param(PhysType::Bytes, p) + ", " + std::to_string(e.constant) + ")";
-        return "!(" + col_null(col) + " || " + param_null(p) + ") && " + (want ? "" : "!") + match;
+        auto null = col_null(col) + " || " + param_null(p);
+        auto escape = std::to_string(e.constant);
+        if (e.args.size() == 3) {
+          null += " || " + param_null(e.args[2].param);
+          escape = "bc_like_escape(cx, " + param(PhysType::Bytes, e.args[2].param) + ")";
+        }
+        auto match = std::string{e.fold ? "bc_ilike" : "bc_like"} + "(cx, " + read_col(col) + ", " + param(PhysType::Bytes, p) + ", " +
+                     escape + ")";
+        return "!(" + null + ") && " + (want ? "" : "!") + match;
       }
       case Expr::Kind::Const: return (e.constant != 0) == want ? "1" : "0";
       case Expr::Kind::Compare: {

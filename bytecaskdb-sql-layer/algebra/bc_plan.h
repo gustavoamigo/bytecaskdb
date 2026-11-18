@@ -304,6 +304,10 @@ bool    bc_like(bc_ctx *, bc_view text, bc_view pattern, int32_t escape);  /* Po
                                                    _ one character, % any run, the escape (a code point, -1 for
                                                    none) quoting the next; an escape it reaches at the pattern's
                                                    end is BC_E_PATTERN */
+bool    bc_ilike(bc_ctx *, bc_view text, bc_view pattern, int32_t escape);  /* bc_like with ASCII letters of the
+                                                   pattern's literals matching either case, as ILIKE under COLLATE "C" */
+int32_t bc_like_escape(bc_ctx *, bc_view escape);  /* an ESCAPE's code point, -1 for '' (none); more than one
+                                                   character is BC_E_PATTERN, "invalid escape string" */
 
 /* Keys */
 bc_key   bc_key_begin(bc_ctx *, uint32_t table_or_index);

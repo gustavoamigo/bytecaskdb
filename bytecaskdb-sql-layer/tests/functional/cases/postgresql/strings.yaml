@@ -90,8 +90,6 @@
 
 - name: LIKE with an ESCAPE character
   features: [E061-05]
-  # WHERE must compare a column
-  unimplemented: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR(20))
   steps:
@@ -121,8 +119,6 @@
 
 - name: ILIKE ignores case
   features: [pg:ilike]
-  # WHERE must compare a column
-  unimplemented: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR(20))
   steps:

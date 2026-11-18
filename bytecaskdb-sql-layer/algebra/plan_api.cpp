@@ -4078,6 +4078,13 @@ auto code_point(BytesView s, std::size_t i, std::size_t n) -> std::int32_t {
 
 enum class Like { Match, NoMatch, BadPattern };
 
+// An ASCII letter's lower case; any other byte, a UTF-8 lead or continuation
+// byte among them, as it is.
+auto ascii_lower(std::byte b) -> std::byte {
+  auto c = std::to_integer<unsigned>(b);
+  return c >= 'A' && c <= 'Z' ? static_cast<std::byte>(c - 'A' + 'a') : b;
+}
+
 // PostgreSQL's LIKE (MatchText) of UTF-8 text, case-sensitive: % matches
 // any run of characters, _ one, the escape the character after it as
 // written, and any other character itself, byte for byte. Greedy, with one
@@ -4085,7 +4092,7 @@ enum class Like { Match, NoMatch, BadPattern };
 // text at each retry. No allocation. An escape the match reaches with
 // nothing after it is a bad pattern, as PostgreSQL raises it only when its
 // match gets there.
-auto like(BytesView s, BytesView p, std::int32_t escape) -> Like {
+auto like(BytesView s, BytesView p, std::int32_t escape, bool fold) -> Like {
   struct Token {
     enum class Kind { Any, One, Literal } kind;
     std::size_t at, len;   // the token in p: its bytes
@@ -4120,7 +4127,9 @@ auto like(BytesView s, BytesView p, std::int32_t escape) -> Like {
         pi += t->len;
         continue;
       }
-      if (si + t->n <= s.size() && std::ranges::equal(s.subspan(si, t->n), p.subspan(t->lit, t->n))) {
+      if (si + t->n <= s.size() && std::ranges::equal(s.subspan(si, t->n), p.subspan(t->lit, t->n), [&](std::byte a, std::byte b) {
+            return fold ? ascii_lower(a) == ascii_lower(b) : a == b;
+          })) {
         si += t->n;
         pi += t->len;
         continue;
@@ -4138,17 +4147,48 @@ auto like(BytesView s, BytesView p, std::int32_t escape) -> Like {
 
 }  // namespace
 
-bool bc_like(bc_ctx* cx, bc_view text, bc_view pattern, int32_t escape) {
-  BC_GUARD_BEGIN
+namespace {
+
+auto like_of(bc_ctx* cx, bc_view text, bc_view pattern, int32_t escape, bool fold) -> bool {
   auto v = cx->resolve2(text, pattern);
   if (!v) return false;
-  switch (like(v->first, v->second, escape)) {
+  switch (like(v->first, v->second, escape, fold)) {
     case Like::Match: return true;
     case Like::NoMatch: return false;
     case Like::BadPattern:
       cx->fail(BC_E_PATTERN, "LIKE pattern must not end with escape character");
       return false;
   }
+  return false;
+}
+
+}  // namespace
+
+bool bc_like(bc_ctx* cx, bc_view text, bc_view pattern, int32_t escape) {
+  BC_GUARD_BEGIN
+  return like_of(cx, text, pattern, escape, false);
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bool bc_ilike(bc_ctx* cx, bc_view text, bc_view pattern, int32_t escape) {
+  BC_GUARD_BEGIN
+  return like_of(cx, text, pattern, escape, true);
+  BC_GUARD_END(cx)
+  return {};
+}
+
+int32_t bc_like_escape(bc_ctx* cx, bc_view escape) {
+  BC_GUARD_BEGIN
+  auto e = cx->resolve(escape);
+  if (!e) return -1;
+  if (e->empty()) return -1;
+  auto n = char_len(*e, 0);
+  if (n != e->size()) {
+    cx->fail(BC_E_PATTERN, "invalid escape string");
+    return -1;
+  }
+  return code_point(*e, 0, n);
   BC_GUARD_END(cx)
   return {};
 }

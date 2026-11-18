@@ -708,6 +708,11 @@ greedily with one backtrack point, the last `%`, and allocates nothing. An
 escape the match reaches with nothing after it sets `BC_E_PATTERN`
 ("LIKE pattern must not end with escape character", SQLSTATE 22025) and
 returns false; as in PostgreSQL, one the match never reaches is no error.
+`bc_ilike` is the same match with the ASCII letters of the pattern's
+literals matching either case (ILIKE under `COLLATE "C"`); the escape is
+compared before folding. `bc_like_escape` reads an `ESCAPE $n` at run time:
+its code point, -1 for `''`, `BC_E_PATTERN` ("invalid escape string",
+22025) for more than one character.
 
 `bc_add_bigint` and `bc_sub_bigint` are `bc_add` and `bc_sub` for a value
 that is stored in a BIGINT column (`SET col = col ± $n`): the only integer
