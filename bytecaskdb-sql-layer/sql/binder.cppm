@@ -3302,9 +3302,20 @@ public:
       }
       case K::And: return tree(logical::Expr::Kind::And);
       case K::Or: return tree(logical::Expr::Kind::Or);
-      case K::Not: return tree(logical::Expr::Kind::Not);
+      case K::Not:
+        if (null_constant(w.args[0])) not_yet("NULL under NOT in a predicate", w.pos);
+        return tree(logical::Expr::Kind::Not);
+      // TRUE or FALSE. A NULL is never true, so as a filter it is FALSE
+      // wherever no NOT is above it.
+      case K::Const: return logical::constant(w.truth.value_or(false) ? 1 : 0, SqlType{SqlKind::Boolean});
     }
     std::unreachable();
+  }
+
+  // Whether predicate c holds a NULL constant.
+  static auto null_constant(const ast::Compare& c) -> bool {
+    if (c.kind == ast::Compare::Kind::Const) return !c.truth.has_value();
+    return std::ranges::any_of(c.args, [](const ast::Compare& a) { return null_constant(a); });
   }
 
   // A comparison's operand other than a column: a parameter, or $n ± an
@@ -4087,7 +4098,7 @@ public:
   // on an aggregate of a DOUBLE PRECISION column: it needs PostgreSQL's NaN
   // and -0.0 rules, as a filter on one does.
   auto having_conjunct(const ast::Compare& w, const auto& resolve, const auto& grouped) -> logical::Expr {
-    if (w.kind != ast::Compare::Kind::Compare) not_yet("HAVING with AND, OR, NOT, IS NULL, <>, BETWEEN or IN", w.pos);
+    if (w.kind != ast::Compare::Kind::Compare) not_yet("HAVING with AND, OR, NOT, IS NULL, <>, BETWEEN, IN or a constant", w.pos);
     const auto* lhs = &w.lhs;
     const auto* rhs = &w.rhs;
     auto op = w.op;
@@ -4323,7 +4334,8 @@ void qualify(ast::Compare& c, const std::string& table) {
     case K::Not:
       for (auto& a : c.args) qualify(a, table);
       break;
-    case K::Exists: break;
+    case K::Exists:
+    case K::Const: break;
   }
 }
 
@@ -4371,7 +4383,8 @@ void swap_columns(ast::Compare& c, const ColumnSwap& swap) {
     case K::Not:
       for (auto& a : c.args) swap_columns(a, swap);
       break;
-    case K::Exists: break;
+    case K::Exists:
+    case K::Const: break;
   }
 }
 
@@ -4403,7 +4416,8 @@ auto over_group(const ast::Compare& c, const std::vector<ast::Expr>& group) -> b
     case K::And:
     case K::Or:
     case K::Not: return std::ranges::all_of(c.args, [&](const ast::Compare& a) { return over_group(a, group); });
-    case K::Exists: return true;
+    case K::Exists:
+    case K::Const: return true;
   }
   return false;
 }

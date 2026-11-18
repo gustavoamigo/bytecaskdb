@@ -119,8 +119,10 @@ errors it raises.
 ## Rewrites
 
 A fixed list, applied in order, each to a fixpoint. None needs a cost.
-1. **Constant folding.** An expression of constants becomes a constant; a
-   conjunct that is always true is dropped. Two constants compare by their
+1. **Constant folding.** An expression of constants becomes a constant,
+   and `AND`, `OR` and `NOT` drop or settle on a `TRUE` or `FALSE` operand
+   (`a OR TRUE` is `TRUE`, `a AND TRUE` is `a`); a conjunct that is always
+   true is dropped. Two constants compare by their
    SQL types: exact numbers at the larger of their scales, a `BOOLEAN`,
    `DATE`, `TIMESTAMP` or `TIME` only with one of its own type, anything
    else not at all; two add only when both are in the result's
@@ -128,8 +130,12 @@ A fixed list, applied in order, each to a fixpoint. None needs a cost.
    it reads, with an `Empty` naming the tables it replaced; a `Join` with an
    `Empty` side is `Empty`, but for a left outer join's right side, which
    leaves the left rows NULL-extended. The search plans it as no rows, read from
-   nothing. Today's dialect rarely gives it anything to fold: a `WHERE`
-   compares a column with a parameter.
+   nothing. A left outer join's `ON` that is always false empties nothing:
+   the constant stays in its predicate, and the search makes it a filter of
+   the right table's rows (a conjunct of no table, which no rel's mask
+   names), so each left row finds no pair and is NULL-extended. A
+   `WHERE` or `ON` of `TRUE`, `FALSE` or `NULL` (`frontend_design.md`,
+   *The dialect*) and comparisons of constants are what it folds.
 2. **Predicate pushdown.** A conjunct moves to the lowest operator whose
    columns it reads: onto the table it reads, or onto the `Join` that has
    every table it reads, whether it compares two columns or is a predicate
@@ -431,7 +437,11 @@ point lookup, and in an `UPDATE`; `no_choice_under_limit` the `LIMIT` case.
 ## The physical plan and codegen
 
 The physical plan's operators:
-- `Empty`, no rows and no read: the sink reports what it gives for none;
+- `Empty`, no rows and no read: the sink reports what it gives for none.
+  A `GroupAggregate` over it (a `WHERE FALSE` under a `GROUP BY`,
+  `DISTINCT`, `MIN` or `MAX`) gives one group of NULLs and zero counts
+  with no key and no group with one; its keys and arguments name columns
+  of no row, so the checker does not ask that its input read their tables;
 - `OneRow`, one row of no columns and no read: its consumer runs once. A
   plan of `Emit` over it is the one that names no table, so it has no
   constants;

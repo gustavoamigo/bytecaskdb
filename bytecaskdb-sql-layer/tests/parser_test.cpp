@@ -721,3 +721,29 @@ TEST_CASE("parser: CALL is read apart from the statements, its arguments as expr
   CHECK_THROWS_AS(parse_call("CALL s.p(1)"), SqlError);
   CHECK_THROWS_AS(parse("CALL p(1)"), SqlError);  // not a prepared statement
 }
+
+TEST_CASE("parser: TRUE, FALSE or NULL as a WHERE or ON conjunct; a number is 42804", "[sql][parser]") {
+  auto sel = std::get<Select>(parse("SELECT a.id FROM a JOIN b ON TRUE WHERE FALSE AND (a.id = 1 OR NULL)"));
+  REQUIRE(sel.where.size() == 3);
+  CHECK((sel.where[0].kind == Compare::Kind::Const && sel.where[0].truth == std::optional<bool>{true} && sel.where[0].on == 1));
+  CHECK((sel.where[1].kind == Compare::Kind::Const && sel.where[1].truth == std::optional<bool>{false} && sel.where[1].on == 0));
+  REQUIRE(sel.where[2].kind == Compare::Kind::Or);
+  CHECK((sel.where[2].args[1].kind == Compare::Kind::Const && !sel.where[2].args[1].truth));
+  for (auto [sql, message] : {std::pair{"SELECT id FROM t WHERE 1", "argument of WHERE must be type boolean, not type integer"},
+                              {"SELECT a.id FROM a JOIN b ON 1.5", "argument of JOIN/ON must be type boolean, not type numeric"},
+                              // Under AND, OR or NOT, the operator is named; past int4 an integer is a bigint.
+                              {"SELECT id FROM t WHERE id = 1 AND 1", "argument of AND must be type boolean, not type integer"},
+                              {"SELECT id FROM t WHERE id = 1 OR (NOT 2)", "argument of NOT must be type boolean, not type integer"},
+                              {"SELECT id FROM t WHERE id = 1 OR 2.5", "argument of OR must be type boolean, not type numeric"},
+                              {"SELECT id FROM t WHERE 9999999999", "argument of WHERE must be type boolean, not type bigint"},
+                              {"SELECT id FROM t WHERE 99999999999999999999", "argument of WHERE must be type boolean, not type numeric"}}) {
+    INFO(sql);
+    try {
+      (void)parse(sql);
+      FAIL("accepted");
+    } catch (const SqlError& e) {
+      CHECK(std::string{e.what()} == message);
+      CHECK(e.sqlstate() == "42804");
+    }
+  }
+}

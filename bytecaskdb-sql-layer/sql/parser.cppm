@@ -385,7 +385,8 @@ auto compare_op(const std::string& op, std::int32_t pos) -> Compare::Op {
   reject("operator " + op + " is not supported in WHERE", pos);
 }
 
-auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t pos, std::uint32_t on = 0) -> Compare;
+auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t pos, std::uint32_t on = 0,
+               std::string_view arg_of = {}) -> Compare;
 
 auto compare_of(Compare::Op op, Expr lhs, Expr rhs, std::int32_t pos, std::uint32_t on) -> Compare {
   return Compare{op, std::move(lhs), std::move(rhs), pos, on};
@@ -408,13 +409,46 @@ auto negated(Compare c) -> Compare {
 
 // A WHERE clause's conjunct, as a comparison or a predicate over them:
 // AND, OR, NOT, IS [NOT] NULL, <> (NOT =), BETWEEN [SYMMETRIC] (>= and <=;
-// SYMMETRIC either way round) and [NOT] IN of a list (= of each, OR'd).
-auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t pos, std::uint32_t on) -> Compare {
+// SYMMETRIC either way round) and [NOT] IN of a list (= of each, OR'd); or
+// TRUE, FALSE or NULL. A numeric constant is PostgreSQL's 42804, naming
+// what it is an argument of: `arg_of`, the AND, OR or NOT around it, else
+// the clause.
+auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t pos, std::uint32_t on,
+               std::string_view arg_of) -> Compare {
   if (n == nullptr) reject(clause + " must compare a column", pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_A_CONST && n->a_const->val_case != PG_QUERY__A__CONST__VAL_SVAL) {
+    auto l = literal(n);
+    Compare c{Compare::Op::Eq, {}, {}, l.pos, on};
+    c.kind = Compare::Kind::Const;
+    switch (l.kind) {
+      case Literal::Kind::Null: return c;
+      case Literal::Kind::Bool: c.truth = l.b; return c;
+      case Literal::Kind::Integer:
+      case Literal::Kind::Number: {
+        // PostgreSQL's type of the literal: integer within int4, then
+        // bigint within int8, then numeric.
+        auto type = std::string{"numeric"};
+        if (l.kind == Literal::Kind::Integer) {
+          std::int64_t v = 0;
+          const auto* end = l.text.data() + l.text.size();
+          if (auto r = std::from_chars(l.text.data(), end, v); r.ec == std::errc{} && r.ptr == end) {
+            type = std::in_range<std::int32_t>(v) ? "integer" : "bigint";
+          }
+        }
+        auto of = arg_of.empty() ? (clause == "ON" ? std::string{"JOIN/ON"} : clause) : std::string{arg_of};
+        reject("argument of " + of + " must be type boolean, not type " + type, l.pos, kDatatypeMismatch);
+      }
+      case Literal::Kind::String: break;
+    }
+    reject(clause + " must compare a column", l.pos);
+  }
   if (n->node_case == PG_QUERY__NODE__NODE_BOOL_EXPR) {
     const auto* b = n->bool_expr;
     std::vector<Compare> args;
-    for (std::size_t i = 0; i < b->n_args; ++i) args.push_back(predicate(b->args[i], clause, pos, on));
+    const auto* op = b->boolop == PG_QUERY__BOOL_EXPR_TYPE__AND_EXPR  ? "AND"
+                     : b->boolop == PG_QUERY__BOOL_EXPR_TYPE__OR_EXPR ? "OR"
+                                                                       : "NOT";
+    for (std::size_t i = 0; i < b->n_args; ++i) args.push_back(predicate(b->args[i], clause, pos, on, op));
     switch (b->boolop) {
       case PG_QUERY__BOOL_EXPR_TYPE__AND_EXPR: return of_kind(Compare::Kind::And, std::move(args), b->location, on);
       case PG_QUERY__BOOL_EXPR_TYPE__OR_EXPR: return of_kind(Compare::Kind::Or, std::move(args), b->location, on);
@@ -551,15 +585,16 @@ auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t p
 
 // A WHERE clause as a list of conjuncts: its top-level AND's, each a
 // comparison or a predicate.
+// `arg_of`: AND, once inside one.
 void where(const PgQuery__Node* n, std::vector<Compare>& out, const std::string& clause = "WHERE",
-           std::int32_t pos = -1, std::uint32_t on = 0) {
+           std::int32_t pos = -1, std::uint32_t on = 0, std::string_view arg_of = {}) {
   if (n == nullptr) return;
   if (n->node_case == PG_QUERY__NODE__NODE_BOOL_EXPR && n->bool_expr->boolop == PG_QUERY__BOOL_EXPR_TYPE__AND_EXPR) {
     const auto* b = n->bool_expr;
-    for (std::size_t i = 0; i < b->n_args; ++i) where(b->args[i], out, clause, pos, on);
+    for (std::size_t i = 0; i < b->n_args; ++i) where(b->args[i], out, clause, pos, on, "AND");
     return;
   }
-  out.push_back(predicate(n, clause, pos, on));
+  out.push_back(predicate(n, clause, pos, on, arg_of));
 }
 
 auto literal(const PgQuery__Node* n) -> Literal {

@@ -1318,8 +1318,11 @@ private:
             reads(op.agg);
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, GroupAggregate>) {
+            // Over Empty no row is read: a key or an argument of a table the
+            // constant-false WHERE or ON emptied names a column of no row.
             auto in = tables_of(*op.input);
-            auto of_input = [&](const ColumnRef& c) { return std::ranges::find(in, c.table) != in.end(); };
+            const auto no_rows = std::holds_alternative<Empty>(op.input->op);
+            auto of_input = [&](const ColumnRef& c) { return no_rows || std::ranges::find(in, c.table) != in.end(); };
             if (!op.streamed && op.keys.empty()) broken("a structure of groups with no key");
             if (op.keys.empty() && !op.dependent.empty()) broken("a dependent column of one group of every row");
             const auto columns = op.columns();

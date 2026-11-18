@@ -257,6 +257,51 @@ TEST_CASE("rewrite: folding compares constants by their SQL type", "[sql][search
   CHECK(kept(sums) == 2);
 }
 
+TEST_CASE("rewrite: TRUE and FALSE fold out of AND, OR and NOT", "[sql][search]") {
+  sql_test::Fixture f;
+  const auto& t = *f.cat().table("t");
+  auto b = [](bool v) { return logical::constant(v ? 1 : 0, SqlType{SqlKind::Boolean}); };
+  auto id = [&] { return logical::compare(Op::Eq, col(t, "id"), p(0)); };
+  auto of = [](Expr::Kind k, std::vector<Expr> args) { return logical::predicate_of(k, std::move(args)); };
+  // The Filter's input after the rewrites.
+  auto folded = [&](Expr c) -> logical::NodePtr {
+    auto root = project(filter(get(t), {std::move(c)}), {col(t, "id")});
+    logical::rewrite(*root);
+    return std::move(std::get<logical::Project>(root->op).input);
+  };
+  auto only_id = [&](const logical::NodePtr& n) {
+    const auto* fl = std::get_if<logical::Filter>(&n->op);
+    return fl != nullptr && fl->conjuncts.size() == 1 && fl->conjuncts[0] == id();
+  };
+  std::vector<Expr> one;
+  one.push_back(b(false));
+  CHECK(std::holds_alternative<logical::Get>(folded(of(Expr::Kind::Not, std::move(one)))->op));
+  CHECK(std::holds_alternative<logical::Get>(folded(of(Expr::Kind::Or, [&] {
+    std::vector<Expr> v;
+    v.push_back(id());
+    v.push_back(b(true));
+    return v;
+  }()))->op));
+  CHECK(std::holds_alternative<logical::Empty>(folded(of(Expr::Kind::And, [&] {
+    std::vector<Expr> v;
+    v.push_back(id());
+    v.push_back(b(false));
+    return v;
+  }()))->op));
+  CHECK(only_id(folded(of(Expr::Kind::Or, [&] {
+    std::vector<Expr> v;
+    v.push_back(b(false));
+    v.push_back(id());
+    return v;
+  }()))));
+  CHECK(only_id(folded(of(Expr::Kind::And, [&] {
+    std::vector<Expr> v;
+    v.push_back(id());
+    v.push_back(b(true));
+    return v;
+  }()))));
+}
+
 TEST_CASE("search: only an equality conjunct of a join keys the inner side", "[sql][search]") {
   sql_test::Fixture f;
   f.ddl(CreateTableDdl{"u", {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},

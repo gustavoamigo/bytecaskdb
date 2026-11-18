@@ -693,7 +693,9 @@ TEST_CASE("binder: OR, NOT, IS NULL, <>, BETWEEN and IN are predicates over comp
         "$n + k and $n - k inside AND, OR or NOT is not supported yet");
   CHECK(rejected(cat, "SELECT id FROM t WHERE 1 IS NULL").first == "IS NULL of other than a column is not supported yet");
   CHECK(rejected(cat, "SELECT qty FROM t GROUP BY qty HAVING qty <> 1").first ==
-        "HAVING with AND, OR, NOT, IS NULL, <>, BETWEEN or IN is not supported yet");
+        "HAVING with AND, OR, NOT, IS NULL, <>, BETWEEN, IN or a constant is not supported yet");
+  // NULL is FALSE as a filter, but not under NOT, where it stays unknown.
+  CHECK(rejected(cat, "SELECT id FROM t WHERE NOT (qty = 1 OR NULL)").first == "NULL under NOT in a predicate is not supported yet");
   CHECK(bind_sql(cat, "SELECT id FROM t WHERE qty = $1 OR qty <> $2").param_types ==
         std::vector<PhysType>{PhysType::I64, PhysType::I64});
 }

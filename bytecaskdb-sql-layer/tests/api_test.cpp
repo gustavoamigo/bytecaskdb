@@ -1383,6 +1383,8 @@ TEST_CASE("embedded API: every plan the search costed returns the same rows", "[
       {"SELECT o.k, p.v FROM o LEFT JOIN p ON p.k = o.c WHERE a = $1", {i(1)}, false, 1},
       {"SELECT o.k, p.v FROM o LEFT JOIN p ON p.k = o.c AND p.v > $2 WHERE a = $1", {i(1), i(1)}, false, 1},
       {"SELECT o.k, p.v FROM o LEFT JOIN p ON p.v = o.b WHERE a = $1", {i(2)}, false, 1},
+      {"SELECT o.k, p.v FROM o LEFT JOIN p ON p.k = o.c AND FALSE WHERE a = $1", {i(1)}, false, 1},
+      {"SELECT o.k, p.v FROM o JOIN p ON TRUE WHERE a = $1 AND p.k < $2", {i(1), i(3)}, false, 2},
       {"SELECT o.k, p.v FROM p RIGHT JOIN o ON p.k = o.c WHERE a = $1 AND p.v IS NULL", {i(3)}, false, 1},
       {"SELECT count(p.v) FROM o LEFT JOIN p ON p.k = o.c WHERE a = $1", {i(0)}, false, 1},
       {"SELECT o.k, p.v FROM o LEFT JOIN p ON p.k = o.c WHERE a = $1 ORDER BY p.v, o.k", {i(1)}, true, 1},
@@ -1457,6 +1459,25 @@ TEST_CASE("embedded API: a left outer join NULL-extends each left row no right r
   CHECK(rows("SELECT count(r.a), count(*) FROM l LEFT JOIN r ON l.a = r.a WHERE l.k = 3") == Grid{{i(0), i(1)}});
   CHECK(rows("SELECT l.k, r.j FROM l LEFT JOIN r ON r.j = 99 ORDER BY l.k") ==
         Grid{{i(1), Value{}}, {i(2), Value{}}, {i(3), Value{}}});
+  // A constant ON: FALSE (or NULL) pairs no row, so each left row is NULL-extended; TRUE pairs every one.
+  const Grid none{{i(1), Value{}}, {i(2), Value{}}, {i(3), Value{}}};
+  CHECK(rows("SELECT l.k, r.j FROM l LEFT JOIN r ON FALSE ORDER BY l.k") == none);
+  CHECK(rows("SELECT l.k, r.j FROM l LEFT JOIN r ON NULL ORDER BY l.k") == none);
+  CHECK(rows("SELECT l.k, r.j FROM l LEFT JOIN r ON l.a = r.a AND FALSE ORDER BY l.k") == none);
+  CHECK(rows("SELECT l.k, r.j FROM l LEFT JOIN r ON TRUE WHERE l.k = 3 ORDER BY r.j") ==
+        Grid{{i(3), i(10)}, {i(3), i(11)}, {i(3), i(12)}});
+  CHECK(rows("SELECT count(*) FROM l JOIN r ON TRUE") == Grid{{i(9)}});
+  CHECK(rows("SELECT count(*) FROM l JOIN r ON FALSE") == Grid{{i(0)}});
+  CHECK(rows("SELECT l.k FROM l WHERE NOT FALSE AND (l.k = 1 OR NULL)") == Grid{{i(1)}});
+  CHECK(rows("SELECT l.k FROM l WHERE NULL").empty());
+  // Aggregates and groups over the rows a constant FALSE leaves, none: one
+  // row of NULL and 0 with no GROUP BY, and no group with one.
+  CHECK(rows("SELECT min(l.a), max(l.k), count(*), sum(l.a) FROM l WHERE FALSE") == Grid{{Value{}, Value{}, i(0), Value{}}});
+  CHECK(rows("SELECT min(r.j) FROM l JOIN r ON FALSE") == Grid{{Value{}}});
+  CHECK(rows("SELECT l.a, count(*) FROM l WHERE NULL GROUP BY l.a").empty());
+  CHECK(rows("SELECT l.a, max(r.j) FROM l JOIN r ON FALSE GROUP BY l.a").empty());
+  CHECK(rows("SELECT DISTINCT l.a FROM l WHERE l.k > 1 AND FALSE").empty());
+  CHECK(rows("SELECT l.k FROM l WHERE l.a = (SELECT max(r.j) FROM r WHERE NULL)").empty());
   CHECK_THROWS_AS(db->execute("SELECT l.k FROM l FULL JOIN r ON l.a = r.a"), ast::SqlError);
   // The right side keyed by a parameter and a left column: a NULL parameter,
   // or a left value too long for any key, matches nothing, and the left row

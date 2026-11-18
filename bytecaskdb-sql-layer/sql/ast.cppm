@@ -119,7 +119,7 @@ struct Expr {
 // hi; a = x OR a = y.
 struct Compare {
   enum class Op { Eq, Lt, Le, Gt, Ge };
-  enum class Kind { Compare, And, Or, Not, IsNull, Like, Exists, Quantified };
+  enum class Kind { Compare, And, Or, Not, IsNull, Like, Exists, Quantified, Const };
   Op op;
   Expr lhs, rhs;
   std::int32_t pos{-1};
@@ -133,6 +133,7 @@ struct Compare {
   ValueCompare quantified{ValueCompare::Eq};
   bool all{false};
   bool ne{false};  // Compare, Eq: written <> (or !=), under its NOT; an error names <>
+  std::optional<bool> truth;  // Const: TRUE or FALSE; none for NULL
 };
 
 // A copy of e, which owns its operands: what BETWEEN and IN repeat.

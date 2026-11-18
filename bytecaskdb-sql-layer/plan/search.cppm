@@ -979,6 +979,14 @@ private:
       q.any_outer = true;
     }
     for (const auto& c : j->predicate) {
+      // Constant folding leaves FALSE (or NULL) only in a left outer join's
+      // ON: it pairs no right row, so each left row is NULL-extended. A
+      // filter of the right side's rows, as an ON conjunct on the left alone.
+      if (c.kind == logical::Expr::Kind::Const) {
+        if (!j->left_outer) no_plan("a constant ON conjunct of an inner join");
+        q.rels[right_from].preds.push_back(c);
+        continue;
+      }
       std::vector<ColumnRef> cols;
       logical::columns_of(c, cols);
       // The rels the conjunct reads, as a mask; a column of a table the query does not have is no
