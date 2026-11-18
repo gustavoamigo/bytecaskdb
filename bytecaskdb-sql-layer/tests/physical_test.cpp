@@ -15,6 +15,7 @@
 #include <vector>
 
 import bytecask.sql.physical;
+import bytecask.sql.text;
 
 using namespace bytecask::sql;
 using physical::node;
@@ -571,6 +572,24 @@ TEST_CASE("physical: check refuses an expression result column codegen can't pri
   auto lone_branch = logical::expr(Kind::Coalesce, big);
   lone_branch.args = {id};
   refused(emitting(lone_branch), "wrong number of operands");
+
+  // EXTRACT: a field its operand's type has, at the field's scale.
+  auto extract = [](DateField f, SqlType of, std::uint8_t scale) {
+    auto e = logical::expr(Kind::Extract, SqlType{SqlKind::Decimal, 0, 0, scale});
+    e.constant = static_cast<std::int64_t>(f);
+    e.args.push_back(logical::param(1, of));
+    return e;
+  };
+  const auto date = SqlType{SqlKind::Date};
+  CHECK(refusal(emitting(extract(DateField::Year, date, 0))).empty());
+  CHECK(refusal(emitting(extract(DateField::Second, SqlType{SqlKind::Time}, 6))).empty());
+  refused(emitting(extract(DateField::Hour, date, 0)), "EXTRACT of a field");
+  refused(emitting(extract(DateField::Year, date, 6)), "EXTRACT of a field");
+  refused(emitting(extract(DateField::Year, big, 0)), "EXTRACT of a field");
+  refused(emitting(extract(DateField::Julian, SqlType{SqlKind::Timestamp}, 0)), "EXTRACT of a field");  // not built
+  auto past = extract(DateField::Year, date, 0);
+  past.constant = 99;
+  refused(emitting(past), "EXTRACT of a field");
 }
 
 TEST_CASE("physical: check refuses a grouped aggregate codegen can't print", "[sql][physical][group]") {

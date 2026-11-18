@@ -526,6 +526,53 @@ TEST_CASE("plan API: bc_like is PostgreSQL's LIKE of UTF-8 text", "[sql][algebra
 }
 
 namespace {
+// EXTRACT(field $2 FROM $1) of source $3.
+void extract_row(bc_ctx* cx) {
+  auto v = bc_extract(cx, bc_param_i64(cx, 0), static_cast<std::uint32_t>(bc_param_i64(cx, 1)),
+                      static_cast<std::uint32_t>(bc_param_i64(cx, 2)));
+  bc_emit_begin(cx);
+  bc_emit_i64(cx, v);
+  bc_emit_end(cx);
+}
+}  // namespace
+
+TEST_CASE("plan API: bc_extract is EXTRACT's scaled value; a field its source lacks is BC_E_HANDLE", "[sql][algebra]") {
+  constexpr std::int64_t k20200304 = 18'325;  // days since 1970-01-01
+  constexpr std::int64_t kMicrosPerSecond = 1'000'000;
+  auto extract = [](std::int64_t v, std::int64_t field, std::int64_t source) -> std::int64_t {
+    INFO("field " << field << " source " << source);
+    Fixture f;
+    REQUIRE(run(f, extract_row, {v, field, source}, kI64Row) == BC_COMMITTED);
+    auto rows = f.results(kI64Row);
+    REQUIRE(rows.size() == 1);
+    return std::get<std::int64_t>(rows[0][0]);
+  };
+  CHECK(extract(k20200304, BC_FIELD_YEAR, BC_SOURCE_DATE) == 2020);
+  CHECK(extract(k20200304, BC_FIELD_JULIAN, BC_SOURCE_DATE) == 2'458'913);
+  auto ts = (k20200304 * 86'400 + 5 * 3'600 + 6 * 60 + 7) * kMicrosPerSecond + 500'000;  // 05:06:07.5
+  CHECK(extract(ts, BC_FIELD_HOUR, BC_SOURCE_TIMESTAMPTZ) == 5);
+  CHECK(extract(ts, BC_FIELD_SECOND, BC_SOURCE_TIMESTAMP) == 7'500'000);  // 7.500000
+  CHECK(extract(ts, BC_FIELD_MILLISECONDS, BC_SOURCE_TIMESTAMP) == 7'500'000);  // 7500.000
+  // HOUR of a DATE, codes outside the enums, and EPOCH and JULIAN of a
+  // timestamp (not built) are refused, never computed.
+  const std::array<std::array<std::int64_t, 2>, 7> refused{{
+      {BC_FIELD_HOUR, BC_SOURCE_DATE},
+      {0, BC_SOURCE_DATE},
+      {99, BC_SOURCE_DATE},
+      {BC_FIELD_YEAR, 0},
+      {BC_FIELD_YEAR, 5},
+      {BC_FIELD_JULIAN, BC_SOURCE_TIMESTAMP},
+      {BC_FIELD_EPOCH, BC_SOURCE_TIMESTAMPTZ},
+  }};
+  for (const auto& [field, source] : refused) {
+    INFO("field " << field << " source " << source);
+    Fixture f;
+    CHECK(run(f, extract_row, {ts, field, source}, kI64Row) == BC_FAILED);
+    CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  }
+}
+
+namespace {
 // $1 ILIKE $2 with escape $3, the escape's text given to bc_like_escape.
 void ilike_row(bc_ctx* cx) {
   bool m = bc_ilike(cx, bc_param_bytes(cx, 0), bc_param_bytes(cx, 1), bc_like_escape(cx, bc_param_bytes(cx, 2)));

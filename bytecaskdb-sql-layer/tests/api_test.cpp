@@ -2023,6 +2023,82 @@ TEST_CASE("embedded API: DATE - DATE is the INTEGER count of days between them",
   CHECK(state("SELECT t * $1 FROM dd", {i(1)}) == "42601");
 }
 
+TEST_CASE("embedded API: EXTRACT of a DATE, TIME or TIMESTAMP is PostgreSQL's numeric of the field", "[sql][api]") {
+  sql_test::TempDir dir{"api_extract"};
+  auto db = Database::open(dir.path());
+  auto null = Value{};
+  (void)db->execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP, tz TIMESTAMPTZ, t TIME, n INTEGER)");
+  (void)db->execute("INSERT INTO ev VALUES (1, '2026-10-25', '2026-10-25 12:34:56.789', '2026-10-25 12:00:00+02', '12:34:56.5', 1)");
+  (void)db->execute("INSERT INTO ev VALUES (2, '0044-03-15 BC', '0044-03-15 01:02:03 BC', NULL, '24:00:00', 2)");
+  (void)db->execute("INSERT INTO ev VALUES (3, NULL, NULL, NULL, NULL, 3)");
+  auto state = [&](std::string_view sql, std::vector<Value> params = {}) -> std::string {
+    try {
+      (void)db->execute(db->prepare(sql), params);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+
+  // A DATE's fields, as PostgreSQL 17 gives them (before 1 AD too), NULL of NULL.
+  auto dates = db->execute(
+      "SELECT EXTRACT(YEAR FROM d), EXTRACT(MONTH FROM d), EXTRACT(DAY FROM d), EXTRACT(DOW FROM d), EXTRACT(DOY FROM d), "
+      "EXTRACT(QUARTER FROM d), EXTRACT(WEEK FROM d), EXTRACT(ISOYEAR FROM d), EXTRACT(ISODOW FROM d), "
+      "EXTRACT(CENTURY FROM d), EXTRACT(MILLENNIUM FROM d), EXTRACT(DECADE FROM d), EXTRACT(JULIAN FROM d), "
+      "EXTRACT(EPOCH FROM d) FROM ev ORDER BY id");
+  CHECK(dates.rows == Grid{{i(2026), i(10), i(25), i(0), i(298), i(4), i(43), i(2026), i(7), i(21), i(3), i(202), i(2'461'339),
+                            i(1'792'886'400)},
+                           {i(-44), i(3), i(15), i(5), i(74), i(1), i(11), i(-44), i(5), i(-1), i(-1), i(-5), i(1'705'428),
+                            i(-63'517'824'000)},
+                           std::vector<Value>(14, null)});
+  CHECK(dates.types == std::vector<SqlType>(14, SqlType{SqlKind::Decimal, 0, 0, 0}));
+  CHECK(dates.columns == std::vector<std::string>(14, "extract"));
+
+  // Time of day: SECOND at scale 6, MILLISECONDS at 3, MICROSECONDS whole;
+  // a TIMESTAMPTZ in UTC.
+  auto times = db->execute(
+      "SELECT EXTRACT(HOUR FROM ts), EXTRACT(MINUTE FROM ts), EXTRACT(SECOND FROM ts), EXTRACT(MILLISECONDS FROM ts), "
+      "EXTRACT(MICROSECONDS FROM ts), EXTRACT(HOUR FROM tz), EXTRACT(TIMEZONE FROM tz), EXTRACT(HOUR FROM t), "
+      "EXTRACT(EPOCH FROM t) FROM ev WHERE id = 1");
+  CHECK(times.rows == Grid{{i(12), i(34), i(56'789'000), i(56'789'000), i(56'789'000), i(10), i(0), i(12), i(45'296'500'000)}});
+  CHECK(times.types == std::vector<SqlType>{SqlType{SqlKind::Decimal, 0, 0, 0}, SqlType{SqlKind::Decimal, 0, 0, 0},
+                                            SqlType{SqlKind::Decimal, 0, 0, 6}, SqlType{SqlKind::Decimal, 0, 0, 3},
+                                            SqlType{SqlKind::Decimal, 0, 0, 0}, SqlType{SqlKind::Decimal, 0, 0, 0},
+                                            SqlType{SqlKind::Decimal, 0, 0, 0}, SqlType{SqlKind::Decimal, 0, 0, 0},
+                                            SqlType{SqlKind::Decimal, 0, 0, 6}});
+  CHECK(db->execute("SELECT EXTRACT(HOUR FROM t), EXTRACT(YEAR FROM ts) FROM ev WHERE id = 2").rows == Grid{{i(24), i(-44)}});
+
+  // Any spelling PostgreSQL's units take; a constant folds to the same value;
+  // a typed $n and the clock are values like a column.
+  CHECK(db->execute("SELECT EXTRACT('Years' FROM d), EXTRACT(\"MON\" FROM d), EXTRACT(microsecondsxyz FROM ts), "
+                    "EXTRACT(msecond FROM ts), EXTRACT(usecond FROM ts) FROM ev WHERE id = 1")
+            .rows == Grid{{i(2026), i(10), i(56'789'000), i(56'789'000), i(56'789'000)}});
+  CHECK(db->execute("SELECT EXTRACT(WEEK FROM DATE '2026-10-25'), EXTRACT(SECOND FROM TIMESTAMP '2026-10-25 12:34:56.789'), "
+                    "EXTRACT(FOO FROM CAST(NULL AS DATE))")
+            .rows == Grid{{i(43), i(56'789'000), null}});
+  CHECK(db->execute(db->prepare("SELECT EXTRACT(DOY FROM $1::date)"), {i(365)}).rows == Grid{{i(1)}});  // 1971-01-01
+  CHECK(db->execute("SELECT EXTRACT(YEAR FROM CURRENT_DATE) > 2000, EXTRACT(YEAR FROM d) + n FROM ev WHERE id = 1").rows ==
+        Grid{{Value{true}, i(2027)}});
+
+  // A unit no type has, one the type lacks; an operand of no type or another type.
+  CHECK(state("SELECT EXTRACT(FOO FROM d) FROM ev") == "22023");
+  CHECK(state("SELECT EXTRACT(HOUR FROM d) FROM ev") == "0A000");
+  CHECK(state("SELECT EXTRACT(NOW FROM d) FROM ev") == "0A000");
+  CHECK(state("SELECT EXTRACT(YEAR FROM t) FROM ev") == "0A000");
+  CHECK(state("SELECT EXTRACT(TIMEZONE FROM ts) FROM ev") == "0A000");
+  CHECK(state("SELECT EXTRACT(HOUR FROM DATE '2026-01-01')") == "0A000");
+  CHECK(state("SELECT EXTRACT(YEAR FROM $1)", {i(1)}) == "42725");
+  CHECK(state("SELECT EXTRACT(YEAR FROM '2026-01-01')") == "42725");
+  CHECK(state("SELECT EXTRACT(YEAR FROM NULL)") == "42725");
+  CHECK(state("SELECT EXTRACT(YEAR FROM n) FROM ev") == "42883");
+  CHECK(state("SELECT EXTRACT(YEAR FROM 1.5)") == "42883");
+  // Not built: EPOCH and JULIAN of a timestamp, past 18 digits or a fraction of a day.
+  CHECK(state("SELECT EXTRACT(EPOCH FROM ts) FROM ev") == "42601");
+  CHECK(state("SELECT EXTRACT(JULIAN FROM TIMESTAMP '2026-01-01 00:00')") == "42601");
+}
+
 TEST_CASE("embedded API: a database written before #780's row and key format is refused when it opens", "[sql][api]") {
   sql_test::TempDir dir{"api_old_format"};
   {

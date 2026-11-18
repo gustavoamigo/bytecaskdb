@@ -28,6 +28,7 @@ module;
 export module bytecask.sql.physical;
 
 export import bytecask.sql.logical;
+import bytecask.sql.text;
 
 export namespace bytecask::sql::physical {
 
@@ -742,6 +743,17 @@ private:
         operands(2, 2);
         if (e.args[0].phys() != PhysType::I64 || e.args[1].phys() != PhysType::I64) broken("random of other than integers");
         break;
+      case Expr::Kind::Extract: {
+        operands(1, 1);
+        auto source = e.args[0].type.kind;
+        auto field = static_cast<DateField>(e.constant);
+        if ((source != SqlKind::Date && source != SqlKind::Time && source != SqlKind::Timestamp && source != SqlKind::TimestampTz) ||
+            e.constant < 1 || e.constant > static_cast<std::int64_t>(DateField::TimezoneMinute) || !date_field_built(field, source) ||
+            e.type.kind != SqlKind::Decimal || decimal_scale(e.type) != date_field_scale(field, source)) {
+          broken("EXTRACT of a field its operand's type has no value for, or of the wrong scale");
+        }
+        break;
+      }
       case Expr::Kind::TextFn:
         operands(1, 2);
         for (const auto& a : e.args) {
@@ -857,6 +869,7 @@ private:
       case Expr::Kind::Concat:
       case Expr::Kind::Substr:
       case Expr::Kind::TextFn:
+      case Expr::Kind::Extract:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
       case Expr::Kind::Abs:

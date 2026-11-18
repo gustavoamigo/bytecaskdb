@@ -1463,6 +1463,54 @@ auto fold_abs(Constant x, std::int32_t pos) -> Constant {
   return x;
 }
 
+// EXTRACT(unit FROM x), which PostgreSQL's grammar spells
+// pg_catalog.extract('unit', x). Resolved as PostgreSQL resolves the call:
+// x of no type (an unknown literal, NULL, a bare $n) fits several of its
+// forms (42725), and a type other than a date or time none (42883). The
+// unit is a string constant.
+auto extract_unit_text(const Constant& unit, std::int32_t pos) -> std::string {
+  if (is_null(unit) || !(unit.unknown || is_string(unit.type))) not_yet("EXTRACT of a unit other than a name or a string", pos);
+  return ascii_case(text_of(unit), false);
+}
+
+void extract_source(const Constant& unit, std::optional<SqlType> source, std::int32_t pos) {
+  auto first = unit.unknown ? std::string{"unknown"} : pg_type_name(unit.type);
+  if (!source) {
+    throw SqlError{"function pg_catalog.extract(" + first + ", unknown) is not unique", pos, kAmbiguousFunction};
+  }
+  auto k = source->kind;
+  if (k != SqlKind::Date && k != SqlKind::Time && k != SqlKind::Timestamp && k != SqlKind::TimestampTz) {
+    throw SqlError{"function pg_catalog.extract(" + first + ", " + pg_type_name(*source) + ") does not exist", pos, kUndefinedFunction};
+  }
+}
+
+// The field a unit names for a value of `source`, and EXTRACT's numeric of
+// it: a unit no type has is 22023, one `source` lacks 0A000, as
+// PostgreSQL's date_part reports them. EPOCH and JULIAN of a timestamp,
+// whose values pass the 18 digits of the layer's numeric or are fractions
+// of a day, are not built.
+auto extract_field_type(const std::string& unit, SqlType source, std::int32_t pos) -> std::pair<DateField, SqlType> {
+  auto u = date_unit(unit);
+  if (u.kind == DateUnit::Kind::Unknown) {
+    throw SqlError{"unit \"" + unit + "\" not recognized for type " + pg_type_name(source), pos, kInvalidParameterValue};
+  }
+  if (u.kind == DateUnit::Kind::Reserved || !date_field_of(u.field, source.kind)) {
+    throw SqlError{"unit \"" + unit + "\" not supported for type " + pg_type_name(source), pos, kFeatureNotSupported};
+  }
+  if (!date_field_built(u.field, source.kind)) {
+    not_yet(u.field == DateField::Epoch ? "EXTRACT(EPOCH FROM a timestamp)" : "EXTRACT(JULIAN FROM a timestamp)", pos);
+  }
+  return {u.field, numeric_type(date_field_scale(u.field, source.kind))};
+}
+
+auto fold_extract(const Constant& unit, const Constant& x, std::int32_t pos) -> Constant {
+  auto name = extract_unit_text(unit, pos);
+  extract_source(unit, x.unknown ? std::nullopt : std::optional{x.type}, pos);
+  if (is_null(x)) return {std::monostate{}, numeric_type(0), false, {}, pos};  // strict: the unit is not read
+  auto [field, type] = extract_field_type(name, x.type, pos);
+  return {extract_field(field, x.type.kind, std::get<std::int64_t>(x.value)), type, false, {}, pos};
+}
+
 auto fold_function(const ast::Expr& e) -> Constant {
   std::vector<Constant> given;
   for (const auto& a : e.args) given.push_back(fold(a));
@@ -1470,6 +1518,10 @@ auto fold_function(const ast::Expr& e) -> Constant {
   const std::string name = e.func == "substr" ? "substring" : e.func;
   if (name == "||") return fold_concat(given[0], given[1], e.pos);
   if (name == "%") return fold_mod(given[0], given[1], e.pos);
+  if (name == "extract") {
+    if (given.size() != 2) no_function("pg_catalog.extract", given, e.pos);
+    return fold_extract(given[0], given[1], e.pos);
+  }
   if (name == "abs") {
     if (given.size() != 1) no_function(name, given, e.pos);
     return fold_abs(given[0], e.pos);
@@ -2437,6 +2489,20 @@ public:
       }
       auto out = logical::expr(logical::Expr::Kind::Abs, v.type);
       out.args.push_back(std::move(v));
+      return out;
+    }
+    if (e.func == "extract") {
+      if (e.args.size() != 2) not_yet("pg_catalog.extract of other than two arguments", e.pos);
+      if (!is_constant(e.args[0])) not_yet("EXTRACT of a unit other than a name or a string", e.pos);
+      auto unit = fold(e.args[0]);
+      auto name = extract_unit_text(unit, e.pos);
+      if (e.args[1].kind == ast::Expr::Kind::Param) extract_source(unit, std::nullopt, e.pos);
+      auto x = value(e.args[1], resolve);
+      extract_source(unit, x.type, e.pos);
+      auto [field, type] = extract_field_type(name, x.type, e.pos);
+      auto out = logical::expr(logical::Expr::Kind::Extract, type);
+      out.constant = static_cast<std::int64_t>(field);
+      out.args.push_back(std::move(x));
       return out;
     }
     if (e.func == "||") {

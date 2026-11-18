@@ -781,6 +781,7 @@ private:
       case Expr::Kind::Concat:
       case Expr::Kind::Substr:
       case Expr::Kind::TextFn:
+      case Expr::Kind::Extract:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
       case Expr::Kind::Abs:
@@ -827,6 +828,7 @@ private:
       case Expr::Kind::Concat:
       case Expr::Kind::Substr:
       case Expr::Kind::TextFn:
+      case Expr::Kind::Extract:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
       case Expr::Kind::Abs:
@@ -1547,6 +1549,7 @@ private:
       case Expr::Kind::Concat: return eval_concat(e);
       case Expr::Kind::Substr: return eval_substr(e);
       case Expr::Kind::TextFn: return eval_text(e);
+      case Expr::Kind::Extract: return eval_extract(e);
       case Expr::Kind::Random: {
         auto lo = eval(e.args[0]);
         auto hi = eval(e.args[1]);
@@ -1620,6 +1623,7 @@ private:
       case Expr::Kind::Concat:
       case Expr::Kind::Substr:
       case Expr::Kind::TextFn:
+      case Expr::Kind::Extract:
       case Expr::Kind::Random:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
@@ -1629,6 +1633,18 @@ private:
       call = "bc_check_int(cx, " + call + ", " + (e.type.kind == SqlKind::SmallInt ? "BC_SMALLINT" : "BC_INTEGER") + ", 0)";
     }
     return guarded("int64_t", "0", either(a.null, b.null), call, PhysType::I64);
+  }
+
+  // EXTRACT(field FROM x): the plan API's bc_extract, its field the
+  // binder's DateField code and its source x's type.
+  auto eval_extract(const Expr& e) -> Val {
+    auto x = eval(e.args[0]);
+    auto source = std::string{e.args[0].type.kind == SqlKind::Date        ? "BC_SOURCE_DATE"
+                              : e.args[0].type.kind == SqlKind::Time      ? "BC_SOURCE_TIME"
+                              : e.args[0].type.kind == SqlKind::Timestamp ? "BC_SOURCE_TIMESTAMP"
+                                                                          : "BC_SOURCE_TIMESTAMPTZ"};
+    auto call = "bc_extract(cx, " + x.value + ", " + std::to_string(e.constant) + ", " + source + ")";
+    return guarded("int64_t", "0", x.null, call, PhysType::I64);
   }
 
   // a % b at the result's scale: the plan API's bc_mod (a zero divisor is

@@ -180,6 +180,7 @@ auto fold(Expr& e) -> bool {
     case Kind::Concat:
     case Kind::Substr:
     case Kind::TextFn:
+    case Kind::Extract:
     case Kind::Mod:
     case Kind::Neg:
     case Kind::Abs:

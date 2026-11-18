@@ -207,6 +207,43 @@ kind the transformer doesn't take is refused with its position.
 - **`DATE - DATE`** is PostgreSQL's `date_mi`: the `integer` count of days
   from the second to the first, of constants and columns alike (*Date and
   time arithmetic*, below).
+- **`EXTRACT(unit FROM x)`** is PostgreSQL 17's `pg_catalog.extract(text,
+  x)` of a `DATE`, `TIME`, `TIMESTAMP` or `TIMESTAMPTZ`, of a constant
+  (folded), a column, a typed `$n`, the time or any value expression in a
+  select list, `ORDER BY` or `RETURNING` (`Expr::Kind::Extract`, the field
+  in `constant`; `bc_extract`). The constant fold and the plan API share
+  one implementation (`extract_field`, `sql/text.cppm`).
+  - The unit is a name or a string, read as PostgreSQL's `date_part` reads
+    it: lower-cased, every spelling of its token tables (`years`, `yr`,
+    `mon`, `msec`, `msecond`, `usecond`, `isodow`, `j`), a name longer than ten characters
+    matched on its first ten. A unit no type has is 22023 (`unit "foo" not
+    recognized for type date`), a reserved word other than `epoch`
+    (`now`, `infinity`) or a unit the operand's type lacks 0A000 (`unit
+    "hour" not supported for type date`), the type named as PostgreSQL
+    names it.
+  - The operand resolves as PostgreSQL's overloads do: one of no type, a
+    bare `$n`, an unknown literal or `NULL`, fits several (42725,
+    `function pg_catalog.extract(unknown, unknown) is not unique`), and
+    any other type none (42883). A `NULL` value gives `NULL` without
+    reading the unit, as the function is strict.
+  - The result is a `numeric` of PostgreSQL's scale: 6 for `SECOND` and
+    `EPOCH` of a `TIME`, 3 for `MILLISECONDS`, 0 for the rest
+    (`MICROSECONDS`, `MINUTE`, `HOUR`, `DAY`, `MONTH`, `QUARTER`, `WEEK`,
+    `YEAR`, `ISOYEAR`, `DECADE`, `CENTURY`, `MILLENNIUM`, `DOW`, `ISODOW`,
+    `DOY`, `JULIAN` and `EPOCH` of a `DATE`, and `TIMEZONE`,
+    `TIMEZONE_HOUR`, `TIMEZONE_MINUTE` of a `TIMESTAMPTZ`, all 0 in the
+    layer's one zone, UTC). The calendar is the proleptic Gregorian one,
+    with PostgreSQL's years before 1 AD (1 BC is `-1`; decade 0 is 9 BC
+    to 1 BC); a `TIMESTAMPTZ`'s fields are its UTC ones.
+  - Refused (42601): `EPOCH` of a `TIMESTAMP` or `TIMESTAMPTZ`, whose
+    microseconds pass the 18 digits of the layer's `numeric` after year
+    33658; `JULIAN` of one, a fraction of a day of twenty places; a unit
+    other than a name or a string constant (`pg_catalog.extract($1, d)`).
+    `bc_extract` refuses those two fields of a timestamp too (BC_E_HANDLE),
+    as the physical check does (`date_field_built`), so a plan written by
+    hand cannot reach a value the binder never asks for.
+    `EXTRACT` in a `WHERE` or `GROUP BY` is refused as any expression
+    there is.
 - **`CASE`, `COALESCE` and `NULLIF`** of constants fold. Of a column, a
   parameter or a subquery they are values in a select list (*Expressions
   over columns*, below). The result type is PostgreSQL's union rule: unknown
@@ -794,6 +831,8 @@ That includes:
   than its column's type; a cast parameter inside an expression in `SET`,
   a `WHERE` or `HAVING`, or in an aggregated select list; a numeric literal of more than 18 digits, a string literal in arithmetic, unary `-` or `abs`
   of a parameter, and a constant beside an aggregate;
+- `EXTRACT(EPOCH FROM …)` and `EXTRACT(JULIAN FROM …)` of a timestamp,
+  and `EXTRACT` of a unit given other than as a name or a string;
 - date and time arithmetic other than `DATE - DATE`: `date ± integer`,
   `date + time`, any operator whose result is an `interval` (PostgreSQL has
   them; the layer has no `interval` type), and a `$n` or an unknown literal
@@ -1270,6 +1309,16 @@ fail on them.
   unless its planner folds the `CASE` away (`CASE WHEN true THEN c END`), so
   a `CREATE TABLE AS` of it there takes a longer value the layer's table
   refuses (22001). The layer has no `CHAR` of no length.
+
+- **`EXTRACT`'s unit is checked when the statement is bound,** so a unit
+  the operand's type lacks (0A000) or no type has (22023) refuses the
+  statement even where no row reaches it, an empty table or a column of
+  only `NULL`s, or where the value is a typed parameter bound to `NULL`
+  (`EXTRACT(HOUR FROM $1::date)` given `NULL` is 0A000; PostgreSQL gives
+  `NULL`). PostgreSQL reads the unit at each call and never calls the
+  function for those. A `NULL` constant folds to `NULL` before the unit is
+  read, as in PostgreSQL. The error is the one PostgreSQL gives the first
+  row it reads.
 
 - **A view is bound again at each use,** so one its tables have outgrown
   is refused (0A000) until it is dropped and created again: a `SELECT *`

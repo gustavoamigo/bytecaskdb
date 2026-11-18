@@ -195,8 +195,6 @@
 
 - name: EXTRACT of the year
   features: [pg:extract]
-  # function extract is not supported
-  unimplemented: true
   ordered: true
   setup:
     - CREATE TABLE dt (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)
@@ -213,6 +211,31 @@
     - sql: SELECT id, EXTRACT(YEAR FROM d) FROM dt WHERE id >= $1 ORDER BY id
       params: [0]
       expected: [[1, 2026], [2, 2026], [3, 1999]]
+  teardown:
+    - DROP TABLE dt
+
+- name: EXTRACT of a time field, and a unit the type lacks
+  features: [pg:extract]
+  ordered: true
+  setup:
+    - CREATE TABLE dt (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)
+  steps:
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [1, "2026-10-25", "2026-10-25 12:34:56.789"]
+      rowcount: 1
+    - sql: INSERT INTO dt VALUES ($1, $2, $3)
+      params: [2, "0044-03-15 BC", "0044-03-15 01:02:03 BC"]
+      rowcount: 1
+    - sql: SELECT id, EXTRACT(HOUR FROM ts), EXTRACT(MINUTE FROM ts), EXTRACT(SECOND FROM ts), EXTRACT(DOW FROM d), EXTRACT(WEEK FROM d) FROM dt WHERE id >= $1 ORDER BY id
+      params: [0]
+      expected: [[1, 12, 34, "56.789000", 0, 43], [2, 1, 2, "3.000000", 5, 11]]
+    - sql: SELECT EXTRACT(HOUR FROM d) FROM dt
+      error: "0A000"
+    - sql: SELECT EXTRACT(FORTNIGHT FROM d) FROM dt
+      error: "22023"
+    - sql: SELECT EXTRACT(YEAR FROM $1)
+      params: ["2026-10-25"]
+      error: "42725"
   teardown:
     - DROP TABLE dt
 
