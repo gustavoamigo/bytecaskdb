@@ -120,9 +120,19 @@ kind the transformer doesn't take is refused with its position.
   then what tell the two apart. The table's own name qualifies nothing while
   it is aliased (42P01, as PostgreSQL), nor may two `FROM` items share a name
   (42712, `FROM t, t` among them). A select-list item takes `[AS] name`,
-  which names its output column; an unqualified `ORDER BY name` that is such
-  a name orders by that item (PostgreSQL looks at output names first there,
-  at input columns first in `GROUP BY`, which takes no output name here). A
+  which names its output column, as an unaliased column item's name names
+  its own; an unqualified `ORDER BY name` that is such a name orders by that
+  item (PostgreSQL looks at output names first there, at input columns first
+  in `GROUP BY`, which takes no output name here). The parser resolves the
+  name to the item's column (`resolve_output_names`, before positions are
+  resolved, so `ORDER BY 1` names item 1 whatever another item is called);
+  where the item is an expression it refuses the `ORDER BY` (42601), since
+  the output name hides any input column of that name and ordering by that
+  column would order by the wrong values (`SELECT -a AS a ... ORDER BY a`).
+  Two items of the name that differ are 42702, as in PostgreSQL; one column
+  named twice is one item. Two expressions of one name are refused (42601)
+  without deciding whether they are the same (PostgreSQL orders by an
+  expression written twice, and raises 42702 for two different ones). A
   subquery resolves its own aliases; it cannot name the outer query's
   (correlation is refused). `t AS x (c1, c2)` renames the table's first
   columns (the binder renames them in the alias's table instance, which is

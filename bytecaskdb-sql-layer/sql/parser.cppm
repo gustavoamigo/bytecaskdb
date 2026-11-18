@@ -1118,6 +1118,46 @@ void requalify(Compare& c, const Names& n) {
   for (auto& a : c.args) requalify(a, n);
 }
 
+// An unqualified ORDER BY name of a plain SELECT is an output name first, as
+// PostgreSQL reads it: an item's AS name, or an unaliased column's name. It
+// orders by that item, which hides any input column of the name; only a name
+// no item has is an input column. Two different items of the name are 42702,
+// the same column twice is one. An item that is an expression is refused: the
+// layer orders by columns. Runs before resolve_positions, whose positions
+// already name their item.
+void resolve_output_names(Select& sel) {
+  auto output_name = [](const Expr& t) -> const std::string& {
+    return t.alias.empty() && t.kind == Expr::Kind::Column ? t.column : t.alias;
+  };
+  // Two column items are one where they name one column, a qualified and an
+  // unqualified reference included (the binder rejects the latter if ambiguous).
+  auto same_column = [](const Expr& x, const Expr& y) {
+    return x.kind == Expr::Kind::Column && y.kind == Expr::Kind::Column && x.column == y.column &&
+           (x.table == y.table || x.table.empty() || y.table.empty());
+  };
+  for (auto& o : sel.order_by) {
+    if (o.position != 0 || !o.table.empty()) continue;
+    std::vector<const Expr*> hits;
+    for (const auto& t : sel.targets) {
+      if (t.kind != Expr::Kind::Star && output_name(t) == o.column) hits.push_back(&t);
+    }
+    if (hits.empty()) continue;
+    for (std::size_t i = 0; i < hits.size(); ++i) {
+      for (std::size_t j = 0; j < i; ++j) {
+        // Whether two expressions are one is left undecided: either is refused below.
+        auto both_expressions = hits[i]->kind != Expr::Kind::Column && hits[j]->kind != Expr::Kind::Column;
+        if (!both_expressions && !same_column(*hits[i], *hits[j])) {
+          reject("ORDER BY \"" + o.column + "\" is ambiguous", o.pos, kAmbiguousColumn);
+        }
+      }
+    }
+    if (hits.front()->kind != Expr::Kind::Column) reject("ORDER BY an output name of an expression is not supported yet", o.pos);
+    const auto* hit = *std::ranges::max_element(hits, {}, [](const Expr* t) { return !t->table.empty(); });
+    o.column = hit->column;
+    o.table = hit->table;
+  }
+}
+
 // ORDER BY 2 of a plain SELECT orders by the second select-list item, which
 // must be a column (the layer orders by columns); the item's AS name or its
 // column's is what ORDER BY then names. A position past the list is 42P10. An
@@ -1154,19 +1194,6 @@ void resolve_aliases(Select& sel) {
   }
   // Renamed columns exist only under the alias, which the binder reads.
   for (const auto& item : sel.from) names.keep = names.keep || !item.column_aliases.empty();
-  for (auto& o : sel.order_by) {
-    if (!o.table.empty()) continue;
-    const Expr* hit = nullptr;
-    for (const auto& t : sel.targets) {
-      if (t.alias != o.column) continue;
-      if (hit != nullptr) reject("ORDER BY \"" + o.column + "\" is ambiguous", o.pos);
-      hit = &t;
-    }
-    if (hit != nullptr && hit->kind == Expr::Kind::Column) {
-      o.column = hit->column;
-      o.table = hit->table;
-    }
-  }
   if (std::ranges::all_of(names.aliases, [](const std::string& a) { return a.empty(); })) return;
   for (auto& e : sel.targets) requalify(e, names);
   for (auto& c : sel.where) requalify(c, names);
@@ -1355,6 +1382,7 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
     sel.group_by.push_back(expr(g));
   }
   where(s->having_clause, sel.having, "HAVING", pos);
+  resolve_output_names(sel);
   resolve_positions(sel);
   resolve_aliases(sel);
   return sel;

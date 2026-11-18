@@ -28,3 +28,48 @@
       error: "42601"
   teardown:
     - DROP TABLE ob
+
+- name: ORDER BY an output name orders by its item, not the input column it hides
+  features: [F850]
+  ordered: true
+  setup:
+    - CREATE TABLE oa (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)
+    - INSERT INTO oa VALUES (1, 30, 'x')
+    - INSERT INTO oa VALUES (2, 10, 'z')
+    - INSERT INTO oa VALUES (3, NULL, 'y')
+    - INSERT INTO oa VALUES (4, 20, 'y')
+  steps:
+    - sql: SELECT b AS a, a AS b FROM oa ORDER BY a, b
+      expected: [["x", 30], ["y", 20], ["y", null], ["z", 10]]
+    - sql: SELECT a, id AS a2, b AS id FROM oa ORDER BY id DESC, a
+      expected: [[10, 2, "z"], [20, 4, "y"], [null, 3, "y"], [30, 1, "x"]]
+    - sql: SELECT a, -id AS a FROM oa ORDER BY 1
+      expected: [[10, -2], [20, -4], [30, -1], [null, -3]]
+    - sql: SELECT a AS b, b AS a FROM oa ORDER BY 1
+      expected: [[10, "z"], [20, "y"], [30, "x"], [null, "y"]]
+    - sql: SELECT a AS b, b AS a FROM oa ORDER BY 2, 1
+      expected: [[30, "x"], [20, "y"], [null, "y"], [10, "z"]]
+    - sql: SELECT b AS a, a FROM oa ORDER BY a
+      error: "42702"
+    - sql: SELECT a AS x, b AS x FROM oa ORDER BY x
+      error: "42702"
+    - sql: SELECT a AS x, a AS x FROM oa ORDER BY x
+      expected: [[10, 10], [20, 20], [30, 30], [null, null]]
+  teardown:
+    - DROP TABLE oa
+
+- name: ORDER BY an output name of an expression
+  features: [F850]
+  # ORDER BY an output name of an expression is not supported yet
+  unimplemented: true
+  ordered: true
+  setup:
+    - CREATE TABLE oe (id INTEGER PRIMARY KEY, a INTEGER)
+    - INSERT INTO oe VALUES (1, 30)
+    - INSERT INTO oe VALUES (2, 10)
+    - INSERT INTO oe VALUES (4, 20)
+  steps:
+    - sql: SELECT -a AS a FROM oe ORDER BY a
+      expected: [[-30], [-20], [-10]]
+  teardown:
+    - DROP TABLE oe
