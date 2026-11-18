@@ -1157,6 +1157,7 @@ void requalify(Expr& e, const Names& n) {
   }
   if (e.lhs) requalify(*e.lhs, n);
   if (e.rhs) requalify(*e.rhs, n);
+  for (auto& a : e.args) requalify(a, n);
 }
 
 void requalify(Compare& c, const Names& n) {
@@ -1167,48 +1168,45 @@ void requalify(Compare& c, const Names& n) {
 
 // An unqualified ORDER BY name of a plain SELECT is an output name first, as
 // PostgreSQL reads it: an item's AS name, or an unaliased column's name. It
-// orders by that item, which hides any input column of the name; only a name
-// no item has is an input column. Two different items of the name are 42702,
-// the same column twice is one. An item that is an expression is refused: the
-// layer orders by columns. Runs before resolve_positions, whose positions
-// already name their item.
+// orders by that item's expression, which hides any input column of the
+// name; only a name no item has is an input column. Two items of the name
+// are 42702 unless they are one: the same column, or expressions written
+// alike. Runs before resolve_positions, whose positions already name their
+// item.
 void resolve_output_names(Select& sel) {
   auto output_name = [](const Expr& t) -> const std::string& {
     return t.alias.empty() && t.kind == Expr::Kind::Column ? t.column : t.alias;
   };
   // Two column items are one where they name one column, a qualified and an
   // unqualified reference included (the binder rejects the latter if ambiguous).
-  auto same_column = [](const Expr& x, const Expr& y) {
-    return x.kind == Expr::Kind::Column && y.kind == Expr::Kind::Column && x.column == y.column &&
-           (x.table == y.table || x.table.empty() || y.table.empty());
+  auto same_item = [](const Expr& x, const Expr& y) {
+    if (x.kind == Expr::Kind::Column && y.kind == Expr::Kind::Column) {
+      return x.column == y.column && (x.table == y.table || x.table.empty() || y.table.empty());
+    }
+    return same_expr(x, y);
   };
   for (auto& o : sel.order_by) {
-    if (o.position != 0 || !o.table.empty()) continue;
+    if (o.position != 0 || o.expr.kind != Expr::Kind::Column || !o.expr.table.empty()) continue;
     std::vector<const Expr*> hits;
     for (const auto& t : sel.targets) {
-      if (t.kind != Expr::Kind::Star && output_name(t) == o.column) hits.push_back(&t);
+      if (t.kind != Expr::Kind::Star && output_name(t) == o.expr.column) hits.push_back(&t);
     }
     if (hits.empty()) continue;
     for (std::size_t i = 0; i < hits.size(); ++i) {
       for (std::size_t j = 0; j < i; ++j) {
-        // Whether two expressions are one is left undecided: either is refused below.
-        auto both_expressions = hits[i]->kind != Expr::Kind::Column && hits[j]->kind != Expr::Kind::Column;
-        if (!both_expressions && !same_column(*hits[i], *hits[j])) {
-          reject("ORDER BY \"" + o.column + "\" is ambiguous", o.pos, kAmbiguousColumn);
+        if (!same_item(*hits[i], *hits[j])) {
+          reject("ORDER BY \"" + o.expr.column + "\" is ambiguous", o.pos, kAmbiguousColumn);
         }
       }
     }
-    if (hits.front()->kind != Expr::Kind::Column) reject("ORDER BY an output name of an expression is not supported yet", o.pos);
     const auto* hit = *std::ranges::max_element(hits, {}, [](const Expr* t) { return !t->table.empty(); });
-    o.column = hit->column;
-    o.table = hit->table;
+    o.expr = clone(*hit);
   }
 }
 
-// ORDER BY 2 of a plain SELECT orders by the second select-list item, which
-// must be a column (the layer orders by columns); the item's AS name or its
-// column's is what ORDER BY then names. A position past the list is 42P10. An
-// item after a * has no position yet: the stars are expanded by the binder.
+// ORDER BY 2 of a plain SELECT orders by the second select-list item's
+// expression. A position past the list is 42P10. An item after a * has no
+// position yet: the stars are expanded by the binder.
 void resolve_positions(Select& sel) {
   for (auto& o : sel.order_by) {
     if (o.position == 0) continue;
@@ -1217,10 +1215,7 @@ void resolve_positions(Select& sel) {
     if (std::cmp_greater(o.position, sel.targets.size())) {
       reject("ORDER BY position " + std::to_string(o.position) + " is not in select list", o.pos, kInvalidColumnReference);
     }
-    const auto& t = sel.targets[static_cast<std::size_t>(o.position - 1)];
-    if (t.kind != Expr::Kind::Column) reject("ORDER BY position of other than a column is not supported yet", o.pos);
-    o.column = t.column;
-    o.table = t.table;
+    o.expr = clone(sel.targets[static_cast<std::size_t>(o.position - 1)]);
     o.position = 0;
   }
 }
@@ -1246,29 +1241,20 @@ void resolve_aliases(Select& sel) {
   for (auto& c : sel.where) requalify(c, names);
   for (auto& c : sel.having) requalify(c, names);
   for (auto& e : sel.group_by) requalify(e, names);
-  for (auto& o : sel.order_by) {
-    Expr e{Expr::Kind::Column, o.column, 0, nullptr, nullptr, o.pos};
-    e.table = o.table;
-    requalify(e, names);
-    o.table = e.table;
-  }
+  for (auto& o : sel.order_by) requalify(o.expr, names);
   if (names.keep) return;
   for (auto& item : sel.from) item.alias.clear();
 }
 
-// ORDER BY's columns, in order.
+// ORDER BY's keys, in order: expressions, or select-list positions.
 auto order_items(const PgQuery__SelectStmt* s, std::int32_t pos) -> std::vector<OrderItem> {
   std::vector<OrderItem> out;
   for (std::size_t i = 0; i < s->n_sort_clause; ++i) {
     const auto* sb = s->sort_clause[i]->sort_by;
-    // libpg_query records no position for a SortBy: report its column's.
-    auto is_const = sb->node != nullptr && sb->node->node_case == PG_QUERY__NODE__NODE_A_CONST;
-    if (sb->node == nullptr || (sb->node->node_case != PG_QUERY__NODE__NODE_COLUMN_REF && !is_const)) {
-      reject("ORDER BY takes columns", pos);
-    }
-    Expr col;
+    if (sb->node == nullptr) reject("ORDER BY takes expressions", pos);
+    Expr key{Expr::Kind::Const, {}, 0, nullptr, nullptr, -1};  // a position's: none
     std::int64_t position = 0;
-    if (is_const) {
+    if (sb->node->node_case == PG_QUERY__NODE__NODE_A_CONST) {
       // An integer is a select-list position, as PostgreSQL reads it; any
       // other constant orders by nothing it accepts.
       auto l = literal(sb->node);
@@ -1277,16 +1263,18 @@ auto order_items(const PgQuery__SelectStmt* s, std::int32_t pos) -> std::vector<
         reject("non-integer constant in ORDER BY", l.pos);
       }
       if (position < 1) reject("ORDER BY position " + l.text + " is not in select list", l.pos, kInvalidColumnReference);
-      col.pos = l.pos;
+      key.pos = l.pos;
     } else {
-      col = expr(sb->node);
+      key = expr(sb->node);
+      // PostgreSQL orders by the whole row; the layer has no row values.
+      if (key.kind == Expr::Kind::Star) reject("ORDER BY a whole row (table.*) is not supported yet", key.pos);
     }
-    if (sb->sortby_dir == PG_QUERY__SORT_BY_DIR__SORTBY_USING) reject("ORDER BY ... USING is not supported", col.pos);
+    if (sb->sortby_dir == PG_QUERY__SORT_BY_DIR__SORTBY_USING) reject("ORDER BY ... USING is not supported", key.pos);
     std::optional<bool> nulls_first;
     if (sb->sortby_nulls == PG_QUERY__SORT_BY_NULLS__SORTBY_NULLS_FIRST) nulls_first = true;
     if (sb->sortby_nulls == PG_QUERY__SORT_BY_NULLS__SORTBY_NULLS_LAST) nulls_first = false;
-    out.push_back({col.column, position, sb->sortby_dir == PG_QUERY__SORT_BY_DIR__SORTBY_DESC, col.pos, col.table,
-                   nulls_first});
+    auto at = key.pos;
+    out.push_back({std::move(key), position, sb->sortby_dir == PG_QUERY__SORT_BY_DIR__SORTBY_DESC, at, nulls_first});
   }
   return out;
 }

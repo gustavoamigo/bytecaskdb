@@ -2849,7 +2849,68 @@ TEST_CASE("embedded API: ORDER BY of a set operation's rows sorts them as a SELE
   CHECK(state("SELECT x FROM oa UNION SELECT y FROM ob ORDER BY y") == "42703");
   CHECK(state("SELECT x FROM oa UNION SELECT y FROM ob ORDER BY oa.x") == "42P01");
   CHECK(state("SELECT x, x FROM oa UNION SELECT y, y FROM ob ORDER BY x") == "42702");
-  CHECK(state("SELECT x FROM oa UNION SELECT y FROM ob ORDER BY x + 1") == "42601");
+  CHECK(state("SELECT x FROM oa UNION SELECT y FROM ob ORDER BY x + 1") == "0A000");  // only output columns, as PostgreSQL
+}
+
+TEST_CASE("embedded API: ORDER BY an expression of the FROM columns sorts by its value per row", "[sql][api]") {
+  sql_test::TempDir dir{"api_order_expr"};
+  auto db = Database::open(dir.path());
+  auto run = [&](std::string_view sql, const std::vector<Value>& params = {}) { return db->execute(sql, params).rows; };
+  (void)run("CREATE TABLE oe (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, s SMALLINT)");
+  (void)run("CREATE TABLE of2 (id INTEGER PRIMARY KEY, a INTEGER)");
+  (void)run("CREATE INDEX oe_a ON oe (a)");
+  (void)run("INSERT INTO oe VALUES (1, 30, 'x', 200), (2, 10, 'z', 300), (3, NULL, 'y', 1), (4, 20, 'y', -5)");
+  (void)run("INSERT INTO of2 VALUES (1, 5), (2, 6)");
+  // NULL sorts last ascending and first descending, as a column's does.
+  CHECK(run("SELECT id FROM oe ORDER BY a + 5") == Grid{{i(2)}, {i(4)}, {i(1)}, {i(3)}});
+  CHECK(run("SELECT id FROM oe ORDER BY -a") == Grid{{i(1)}, {i(4)}, {i(2)}, {i(3)}});
+  CHECK(run("SELECT id FROM oe ORDER BY -a DESC NULLS LAST") == Grid{{i(2)}, {i(4)}, {i(1)}, {i(3)}});
+  CHECK(run("SELECT id FROM oe ORDER BY a % 7 NULLS FIRST, id") == Grid{{i(3)}, {i(1)}, {i(2)}, {i(4)}});
+  CHECK(run("SELECT id FROM oe ORDER BY b || 'a' DESC, id") == Grid{{i(2)}, {i(3)}, {i(4)}, {i(1)}});
+  CHECK(run("SELECT id FROM oe ORDER BY coalesce(a, 0), id") == Grid{{i(3)}, {i(2)}, {i(4)}, {i(1)}});
+  // An index on a gives a's order, never -a's: the plan sorts, keeping LIMIT's rows.
+  CHECK(run("SELECT id FROM oe WHERE a > 5 ORDER BY -a LIMIT 2") == Grid{{i(1)}, {i(4)}});
+  CHECK(db->prepare("SELECT id FROM oe WHERE a > 5 ORDER BY -a LIMIT 2").plan_source().find("bc_sorter_open(cx, 2)") !=
+        std::string::npos);
+  // An output name or a position of an expression orders by the expression.
+  CHECK(run("SELECT -a AS a FROM oe ORDER BY a") == Grid{{i(-30)}, {i(-20)}, {i(-10)}, {kNull}});
+  CHECK(run("SELECT a + 1 FROM oe ORDER BY 1 DESC") == Grid{{kNull}, {i(31)}, {i(21)}, {i(11)}});
+  // Columns of two joined tables, and a constant key, which orders nothing.
+  CHECK(run("SELECT oe.id FROM oe JOIN of2 ON oe.id = of2.id ORDER BY oe.a + of2.a") == Grid{{i(2)}, {i(1)}});
+  CHECK(run("SELECT id FROM oe ORDER BY 1 + 1, id DESC") == Grid{{i(4)}, {i(3)}, {i(2)}, {i(1)}});
+  // An alias's column inside a function's args.
+  CHECK(run("SELECT x.id FROM oe x ORDER BY abs(x.a - 25), x.id") == Grid{{i(1)}, {i(4)}, {i(2)}, {i(3)}});
+  // A key's error is the statement's: 200 * 200 is past SMALLINT.
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  CHECK(state("SELECT id FROM oe ORDER BY s * s") == "22003");
+  CHECK(state("SELECT id FROM oe ORDER BY id / 0") == "22012");
+  // DISTINCT orders by selected items only (42P10); two output names of
+  // different expressions are ambiguous (42702).
+  CHECK(state("SELECT DISTINCT a FROM oe ORDER BY a + 1") == "42P10");
+  CHECK(state("SELECT a + 1 AS x, a + 2 AS x FROM oe ORDER BY x") == "42702");
+  // Not yet: random(), a whole row, and an expression key of an aggregated query.
+  CHECK(state("SELECT id FROM oe ORDER BY random(1, 9)") == "42601");
+  CHECK(state("SELECT id FROM oe ORDER BY oe.*") == "42601");
+  CHECK(state("SELECT a FROM oe GROUP BY a ORDER BY a + 1") == "42601");
+  CHECK(state("SELECT count(*) AS n FROM oe ORDER BY n") == "42601");
+  // A correlated subquery is refused (42601) inside a function's args too,
+  // whether the subquery is the arg or the outer column is an arg within it.
+  CHECK(state("SELECT id FROM oe ORDER BY coalesce((SELECT a FROM of2 WHERE of2.id = oe.id), 0)") == "42601");
+  CHECK(state("SELECT id FROM oe ORDER BY (SELECT coalesce(oe.a, 0) FROM of2 WHERE of2.id = 1)") == "42601");
+  // A view's column that is an expression, and a view's own ORDER BY of one.
+  (void)run("CREATE VIEW ov AS SELECT id, -a AS na FROM oe");
+  CHECK(run("SELECT id FROM ov ORDER BY na + 1 DESC NULLS LAST") == Grid{{i(2)}, {i(4)}, {i(1)}, {i(3)}});
+  (void)run("CREATE VIEW ov2 AS SELECT id FROM oe ORDER BY a * -1");
+  CHECK(run("SELECT id FROM ov2") == Grid{{i(1)}, {i(4)}, {i(2)}, {i(3)}});
 }
 
 TEST_CASE("embedded API: ORDER BY of a set operation's rows is charged to the statement's budget, a LIMIT bounds it", "[sql][api][setop]") {

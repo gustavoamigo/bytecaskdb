@@ -987,6 +987,22 @@ TEST_CASE("binder: COUNT, ORDER BY and column + parameter", "[sql][binder]") {
     CHECK(std::get<logical::Limit>(root(b).op).n == 2);
   }
   {
+    // ORDER BY an expression of the FROM columns: its value, bound as a
+    // select item is. A constant orders nothing; a bare $n is text where
+    // nothing before typed it, as PostgreSQL types it.
+    auto b = bind_sql(cat, "SELECT id FROM t ORDER BY qty + 1 DESC");
+    const auto& keys = get<logical::Sort>(b).keys;
+    REQUIRE(keys.size() == 1);
+    CHECK(keys[0].expr.kind == logical::Expr::Kind::Add);
+    CHECK(keys[0].desc);
+    auto p = bind_sql(cat, "SELECT id FROM t ORDER BY $1, 1 + 1, qty");
+    CHECK(p.param_types.at(0) == PhysType::Bytes);  // 1 + 1 is a hidden parameter after it
+    CHECK(get<logical::Sort>(p).keys.size() == 1);
+    auto q = bind_sql(cat, "SELECT id FROM t WHERE qty = $1 ORDER BY $1");
+    CHECK(q.param_types == std::vector<PhysType>{PhysType::I64});
+    CHECK(find<logical::Sort>(root(q)) == nullptr);
+  }
+  {
     // NULLS FIRST and NULLS LAST as written; ASC's default is last.
     auto b = bind_sql(cat, "SELECT id FROM t WHERE name = $1 ORDER BY qty NULLS FIRST, name DESC NULLS LAST, id");
     const auto& keys = get<logical::Sort>(b).keys;

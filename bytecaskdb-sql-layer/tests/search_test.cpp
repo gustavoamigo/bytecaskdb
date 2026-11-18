@@ -631,6 +631,26 @@ TEST_CASE("search: a plan in the ORDER BY's order is kept, and compared with a c
   CHECK_FALSE(has(plan_sql(cat, sql + " LIMIT 0", {{"o", 10'000}}), "bc_sorter"));
 }
 
+TEST_CASE("search: no index gives an ORDER BY expression's order: the plan sorts by its value", "[sql][search][cost]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"o",
+                       {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, false),
+                        Fixture::col("b", PhysType::I64, false)},
+                       {"k"}});
+  f.ddl(CreateIndexDdl{"o_ab", "o", {{"a"}, {"b"}}});
+  const auto& cat = f.cat();
+  // o_ab gives b's order under a = $1: no sort.
+  CHECK_FALSE(has(plan_sql(cat, "SELECT k FROM o WHERE a = $1 ORDER BY b", {{"o", 10'000}}), "bc_sorter"));
+  // b + 1 is in the same order, but no path's order is an expression's: the
+  // key is evaluated per row into the sorter.
+  auto by_expr = plan_sql(cat, "SELECT k FROM o WHERE a = $1 ORDER BY b + 1 LIMIT 3", {{"o", 10'000}});
+  CHECK(has(by_expr, "bc_sorter s0 = bc_sorter_open(cx, 3);"));
+  CHECK(has(by_expr, "bc_sort_key_i64(cx, sk, "));
+  // A column key after an expression key is no index's order either.
+  CHECK(has(plan_sql(cat, "SELECT k FROM o WHERE a = $1 ORDER BY -b, b", {{"o", 10'000}}), "bc_sorter"));
+}
+
 TEST_CASE("search: a point lookup beats a unique index's one entry; a covering scan beats a fetching one",
           "[sql][search][cost]") {
   sql_test::Fixture f;

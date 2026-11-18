@@ -2123,14 +2123,14 @@ public:
           outer_names(e)) {
         return true;
       }
-      return (e.lhs && in_expr(*e.lhs)) || (e.rhs && in_expr(*e.rhs));
+      return (e.lhs && in_expr(*e.lhs)) || (e.rhs && in_expr(*e.rhs)) || std::ranges::any_of(e.args, in_expr);
     };
     std::function<bool(const ast::Compare&)> in_compare = [&](const ast::Compare& c) {
       return in_expr(c.lhs) || in_expr(c.rhs) || std::ranges::any_of(c.args, in_compare);
     };
     return std::ranges::any_of(q.targets, in_expr) || std::ranges::any_of(q.where, in_compare) ||
            std::ranges::any_of(q.having, in_compare) || std::ranges::any_of(q.group_by, in_expr) ||
-           std::ranges::any_of(q.order_by, [&](const ast::OrderItem& o) { return in_expr(column_ref(o)); });
+           std::ranges::any_of(q.order_by, [&](const ast::OrderItem& o) { return in_expr(o.expr); });
   }
 
   // Whether a column of type `col` is compared with a subquery's value of
@@ -2905,13 +2905,6 @@ public:
     const auto* c = t.column(name);
     if (c == nullptr) throw SqlError{"column \"" + name + "\" does not exist", pos, kUndefinedColumn};
     return c;
-  }
-
-  // An ORDER BY item's column, as a column reference.
-  static auto column_ref(const ast::OrderItem& o) -> ast::Expr {
-    ast::Expr e{ast::Expr::Kind::Column, o.column, 0, nullptr, nullptr, o.pos};
-    e.table = o.table;
-    return e;
   }
 
   // A column reference of a one-table statement: qualified by that table's
@@ -3812,8 +3805,13 @@ public:
         auto ref = resolve(e);
         return std::ranges::any_of(list, [&](const ast::Expr& t) { return t.kind == ast::Expr::Kind::Column && resolve(t) == ref; });
       };
+      // An expression key is selected where an item is written alike.
+      auto key_selected = [&](const ast::Expr& e) {
+        if (e.kind == ast::Expr::Kind::Column) return selected(e);
+        return std::ranges::any_of(list, [&](const ast::Expr& t) { return ast::same_expr(t, e); });
+      };
       for (const auto& o : s.order_by) {
-        if (!selected(column_ref(o))) {
+        if (!key_selected(o.expr)) {
           throw SqlError{"for SELECT DISTINCT, ORDER BY expressions must appear in select list", o.pos,
                          kInvalidColumnReference};
         }
@@ -3895,9 +3893,14 @@ public:
     }
     std::vector<logical::SortKey> keys;
     for (const auto& o : s.order_by) {
-      auto [t, c] = resolve(column_ref(o));
-      auto key = aggregated ? grouped(*t, *c, o.pos) : logical::column_of(t->id, *c);
-      keys.push_back({std::move(key), o.desc, o.nulls_first.value_or(o.desc)});
+      if (o.expr.kind == ast::Expr::Kind::Column) {
+        auto [t, c] = resolve(o.expr);
+        auto key = aggregated ? grouped(*t, *c, o.pos) : logical::column_of(t->id, *c);
+        keys.push_back({std::move(key), o.desc, o.nulls_first.value_or(o.desc)});
+        continue;
+      }
+      if (aggregated) not_yet("ORDER BY an expression in a grouped or aggregated query", o.pos);
+      if (auto key = order_key(o.expr, resolve)) keys.push_back({std::move(*key), o.desc, o.nulls_first.value_or(o.desc)});
     }
 
     auto rows = logical::node(logical::Get{rels[0], !joined && s.for_update});
@@ -3921,6 +3924,34 @@ public:
     return rows;
   }
 
+  // An ORDER BY key of a query that is not aggregated, an expression of its
+  // FROM columns bound as a select item is (plain_output), and evaluated per
+  // row by the sort. A constant orders nothing and is no key (nullopt): a bare
+  // $n is typed as text where nothing before typed it, as PostgreSQL types
+  // it there. random() and an aggregate are refused.
+  auto order_key(const ast::Expr& e, const Resolve& resolve) -> std::optional<logical::Expr> {
+    std::function<bool(const ast::Expr&, ast::Expr::Kind, const char*)> holds = [&](const ast::Expr& x, ast::Expr::Kind k,
+                                                                                    const char* func) {
+      if (x.kind == k && (func == nullptr || x.func == func)) return true;
+      return (x.lhs && holds(*x.lhs, k, func)) || (x.rhs && holds(*x.rhs, k, func)) ||
+             std::ranges::any_of(x.args, [&](const ast::Expr& a) { return holds(a, k, func); });
+    };
+    if (holds(e, ast::Expr::Kind::Func, "random")) not_yet("ORDER BY random()", e.pos);
+    if (holds(e, ast::Expr::Kind::Aggregate, nullptr)) not_yet("an aggregate in ORDER BY", e.pos);
+    if (e.kind == ast::Expr::Kind::Param) {
+      if (params_.size() <= e.param || !params_[e.param].first) {
+        const auto text = SqlType{SqlKind::Text};
+        const auto& col = typed_params_.emplace_back(
+            Column{0, "$" + std::to_string(e.param + 1), text, phys_type(text), true, std::monostate{}});
+        use_param(e.param, phys_type(text), e.pos, col, 0, Use::Operand);
+      }
+      return std::nullopt;
+    }
+    auto key = plain_output(e, resolve).expr;
+    if (key.kind == logical::Expr::Kind::Param || key.kind == logical::Expr::Kind::Const) return std::nullopt;
+    return key;
+  }
+
   // An arm of a set operation: its rows, and for each column whether it is
   // an untyped literal, which PostgreSQL types by the other arm.
   struct Arm {
@@ -3941,7 +3972,7 @@ public:
 
   // An ORDER BY item of a set operation's rows: an output column by name
   // (the left arm's) or by position, as PostgreSQL takes them, and nothing
-  // else.
+  // else: an expression is 0A000, as there.
   static auto set_order(const ast::OrderItem& o, const std::vector<logical::Output>& outputs) -> logical::SetOp::Order {
     auto nulls_first = o.nulls_first.value_or(o.desc);
     if (o.position != 0) {
@@ -3951,16 +3982,20 @@ public:
       }
       return {static_cast<std::size_t>(o.position - 1), o.desc, nulls_first};
     }
-    if (!o.table.empty()) {
-      throw SqlError{"missing FROM-clause entry for table \"" + o.table + "\"", o.pos, kUndefinedTable};
+    if (o.expr.kind != ast::Expr::Kind::Column) {
+      throw SqlError{"invalid UNION/INTERSECT/EXCEPT ORDER BY clause", o.pos, kFeatureNotSupported};
+    }
+    const auto& name = o.expr.column;
+    if (!o.expr.table.empty()) {
+      throw SqlError{"missing FROM-clause entry for table \"" + o.expr.table + "\"", o.pos, kUndefinedTable};
     }
     std::optional<std::size_t> hit;
     for (std::size_t i = 0; i < outputs.size(); ++i) {
-      if (outputs[i].name != o.column) continue;
-      if (hit) throw SqlError{"ORDER BY \"" + o.column + "\" is ambiguous", o.pos, kAmbiguousColumn};
+      if (outputs[i].name != name) continue;
+      if (hit) throw SqlError{"ORDER BY \"" + name + "\" is ambiguous", o.pos, kAmbiguousColumn};
       hit = i;
     }
-    if (!hit) throw SqlError{"column \"" + o.column + "\" does not exist", o.pos, kUndefinedColumn};
+    if (!hit) throw SqlError{"column \"" + name + "\" does not exist", o.pos, kUndefinedColumn};
     return {*hit, o.desc, nulls_first};
   }
 
@@ -4834,7 +4869,7 @@ private:
     for (const auto& c : view.where) where.push_back(ast::clone(c));
     for (auto& c : s.where) where.push_back(std::move(c));
     s.where = std::move(where);
-    if (s.order_by.empty() && !s.distinct) s.order_by = view.order_by;
+    if (s.order_by.empty() && !s.distinct) s.order_by = ast::clone(view.order_by);
   }
 
   // A grouped view without aggregates, whose HAVING tests group columns alone,
@@ -4871,11 +4906,7 @@ private:
   static auto regroup(ast::Select& s, const ast::Select& view) -> bool {
     const auto& group = view.group_by;
     auto in_group = [&](const ast::Expr& e) { return is_group_column(e, group); };
-    auto ordered_by_group = [&](const ast::OrderItem& o) {
-      return std::ranges::any_of(group, [&](const ast::Expr& g) {
-        return g.column == o.column && (o.table.empty() || g.table.empty() || g.table == o.table);
-      });
-    };
+    auto ordered_by_group = [&](const ast::OrderItem& o) { return is_group_column(o.expr, group); };
     auto groups_alike = std::ranges::all_of(s.group_by, in_group) &&
                         std::ranges::all_of(group, [&](const ast::Expr& g) {
                           return std::ranges::any_of(s.group_by, [&](const ast::Expr& e) { return same_column(e, g); });
@@ -4897,7 +4928,7 @@ private:
   }
 
   // The query's clauses, each view column replaced by its item. A select-list
-  // column keeps its view name; a grouping or sort column must stay a column.
+  // column keeps its view name; a grouping column must stay a column.
   void apply(ast::Select& s, const ColumnSwap& swap) {
     for (auto& e : s.targets) {
       auto name = e.kind == ast::Expr::Kind::Column ? (e.alias.empty() ? e.column : e.alias) : std::string{};
@@ -4910,14 +4941,7 @@ private:
       swap_columns(g, swap);
       if (g.kind != ast::Expr::Kind::Column) not_yet("grouping by a view column that is an expression", g.pos);
     }
-    for (auto& o : s.order_by) {
-      auto ref = ast::Expr{ast::Expr::Kind::Column, o.column, 0, nullptr, nullptr, o.pos};
-      ref.table = o.table;
-      swap_columns(ref, swap);
-      if (ref.kind != ast::Expr::Kind::Column) not_yet("ordering by a view column that is an expression", o.pos);
-      o.column = ref.column;
-      o.table = ref.table;
-    }
+    for (auto& o : s.order_by) swap_columns(o.expr, swap);
   }
 
   // FROM view JOIN table, a table JOIN view, or two views, inner or outer:

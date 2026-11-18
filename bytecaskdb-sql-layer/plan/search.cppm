@@ -354,10 +354,21 @@ auto paths(const Table& t) -> std::vector<Path> {
   return out;
 }
 
+// An ORDER BY key: a column, or an expression over the row's columns, which
+// no access path's order gives.
 struct OrderItem {
-  ColumnRef col;
+  std::variant<ColumnRef, Expr> key;
   bool desc;
   bool nulls_first;
+
+  // The key's column; nullptr for an expression.
+  [[nodiscard]] auto column() const -> const ColumnRef* { return std::get_if<ColumnRef>(&key); }
+  // The key a sort builds of it.
+  [[nodiscard]] auto part() const -> physical::SortPart {
+    if (const auto* c = column()) return {*c, desc, nulls_first};
+    return {physical::ExprTarget{std::get<Expr>(key)}, desc, nulls_first};
+  }
+  [[nodiscard]] auto same_key(const OrderItem& o) const -> bool { return key == o.key; }
 };
 
 // A statement's GROUP BY columns the WHERE does not make constant, which an
@@ -401,9 +412,11 @@ auto direction(const Path& p, std::size_t run, std::uint32_t table, const std::v
   if (run + ordered.size() > p.parts.size()) return std::nullopt;
   auto reverse = false;
   for (std::size_t i = 0; i < ordered.size(); ++i) {
+    const auto* c = ordered[i].column();
+    if (c == nullptr) return std::nullopt;
     const auto& part = p.parts[run + i];
     auto rev = ordered[i].desc != part.desc;
-    if (ordered[i].col.table != table || part.col != ordered[i].col.col || (i > 0 && rev != reverse)) {
+    if (c->table != table || part.col != c->col || (i > 0 && rev != reverse)) {
       return std::nullopt;
     }
     reverse = rev;
@@ -891,7 +904,8 @@ private:
     Conjuncts post;
     std::vector<Cross> cross;
     std::vector<ColumnRef> above;    // what a SELECT reads above a sort: its result's columns
-    std::vector<ColumnRef> sort_by;  // the ORDER BY's columns a sort keys on
+    std::vector<ColumnRef> sort_by;  // the ORDER BY's columns a sort keys on, those its expressions read too
+    bool sort_by_expression{false};  // some ORDER BY key is an expression: no probe side is sorted
 
     [[nodiscard]] auto index_of(std::uint32_t table) const -> std::size_t {
       for (std::size_t i = 0; i < rels.size(); ++i) {
@@ -1051,7 +1065,9 @@ private:
     auto split = false;
     for (std::size_t i = 0; i < ordered.size(); ++i) {
       // A part the WHERE compares holds no NULLs in the rows it matches.
-      const auto* col = t.column(ordered[i].col.col);
+      const auto* key = ordered[i].column();
+      if (key == nullptr) return std::nullopt;
+      const auto* col = t.column(key->col);
       auto compared = std::ranges::any_of(where, [&](const auto& w) { return on_col(w, col->id); });
       if (!col->nullable || compared) continue;
       // The key order puts an ASC part's NULLs first and a DESC part's last,
@@ -1980,7 +1996,7 @@ private:
     const auto d = *c.driving();
     const auto rel = d == 0 ? c.first : rel_of(c.steps[d - 1]);
     const auto table = q.rels[rel].table().id;
-    c.probe_sorted = c.hash() != nullptr &&
+    c.probe_sorted = c.hash() != nullptr && !q.sort_by_expression &&
                      std::ranges::all_of(q.sort_by, [&](const ColumnRef& col) { return col.table == table; });
     read_rows(c, c.probe_sorted ? std::vector<std::size_t>{rel} : held_rels(q, c));
   }
@@ -2138,7 +2154,11 @@ private:
     }
     if (s.sort != nullptr) {
       for (const auto& k : s.sort->keys) {
-        if (!column(k.expr)) no_plan("an ORDER BY key that is not a column of its tables");
+        std::vector<ColumnRef> cols;
+        logical::columns_of(k.expr, cols);
+        if (!std::ranges::all_of(cols, [&](const ColumnRef& c) { return std::ranges::find(tables, c.table) != tables.end(); })) {
+          no_plan("an ORDER BY key that is not an expression of columns of its tables");
+        }
       }
     }
   }
@@ -2208,14 +2228,16 @@ private:
     return physical::node(physical::Emit{std::move(rows), std::move(targets)});
   }
 
-  // The ORDER BY, without the columns the WHERE makes constant and those
+  // The ORDER BY, without the columns the WHERE makes constant and the keys
   // already ordered by.
   static auto ordered_items(const Query& q, const std::vector<OrderItem>& order_by) -> std::vector<OrderItem> {
     std::vector<OrderItem> out;
     for (const auto& o : order_by) {
-      const auto& where = q.rels[q.index_of(o.col.table)].where;
-      auto constant = std::ranges::any_of(where, [&](const auto& w) { return on_col(w, o.col.col) && w.op == Op::Eq; });
-      auto repeated = std::ranges::any_of(out, [&](const auto& p) { return p.col == o.col; });
+      const auto* c = o.column();
+      auto constant = c != nullptr && std::ranges::any_of(q.rels[q.index_of(c->table)].where, [&](const auto& w) {
+        return on_col(w, c->col) && w.op == Op::Eq;
+      });
+      auto repeated = std::ranges::any_of(out, [&](const OrderItem& p) { return p.same_key(o); });
       if (!constant && !repeated) out.push_back(o);
     }
     return out;
@@ -2235,11 +2257,17 @@ private:
     // LIMIT 0 returns no row, in any order.
     std::vector<OrderItem> order_by;
     if (s.sort != nullptr && (!s.limit || *s.limit > 0)) {
-      for (const auto& k : s.sort->keys) order_by.push_back({k.expr.col, k.desc, k.nulls_first});
+      for (const auto& k : s.sort->keys) {
+        if (k.expr.kind == Expr::Kind::Column) {
+          order_by.push_back({k.expr.col, k.desc, k.nulls_first});
+        } else {
+          order_by.push_back({k.expr, k.desc, k.nulls_first});
+        }
+      }
     }
     const auto ordered = ordered_items(q, order_by);
     SortSpec sort{{}, kept(s.limit)};
-    for (const auto& o : ordered) sort.keys.push_back({o.col, o.desc, o.nulls_first});
+    for (const auto& o : ordered) sort.keys.push_back(o.part());
     const auto* agg = s.aggregate != nullptr ? &s.aggregate->aggs[0].expr : nullptr;
     auto for_update = std::ranges::any_of(q.rels, [](const Rel& r) { return r.get->for_update; });
     // FOR UPDATE reads each row, whose key it guards; COUNT(DISTINCT) keys
@@ -2251,8 +2279,17 @@ private:
     auto used = s.below->output;
     if (sorting) {
       for (const auto& o : ordered) {
-        q.sort_by.push_back(o.col);
-        if (std::ranges::find(used, o.col) == used.end()) used.push_back(o.col);
+        std::vector<ColumnRef> cols;
+        if (const auto* c = o.column()) {
+          cols.push_back(*c);
+        } else {
+          logical::columns_of(std::get<Expr>(o.key), cols);
+          q.sort_by_expression = true;
+        }
+        for (const auto& col : cols) {
+          q.sort_by.push_back(col);
+          if (std::ranges::find(used, col) == used.end()) used.push_back(col);
+        }
       }
       std::vector<ColumnRef> read_above;
       for (const auto& o : s.project->exprs) logical::columns_of(o.expr, read_above);
@@ -2382,7 +2419,10 @@ private:
     for (const auto& d : l.distinct) per += 1 + key + least_part_bytes(d, false) + kGroupEntryBytes + kAggSlotBytes;
     if (sort != nullptr) {
       per += kSortEntryBytes + key;
-      for (const auto& part : sort->keys) per += least_part_bytes(part.col, part.col.nullable);
+      for (const auto& part : sort->keys) {
+        const auto& col = std::get<ColumnRef>(part.key);  // a GROUP BY's keys are columns
+        per += least_part_bytes(col, col.nullable);
+      }
     }
     return least_past(memory_, fixed, per);
   }
@@ -2483,7 +2523,7 @@ private:
     }
     const auto ordered = ordered_items(q, order_by);
     SortSpec sort{{}, kept(g.limit)};
-    for (const auto& o : ordered) sort.keys.push_back({o.col, o.desc, o.nulls_first});
+    for (const auto& o : ordered) sort.keys.push_back(o.part());
     // The keys the WHERE does not make constant, which a stream's rows come
     // grouped by, and which number the groups. With no GROUP BY, no
     // grouping: one group of every row, which any plan gives.
@@ -2568,7 +2608,8 @@ private:
       if (!ordered.empty()) {
         auto sorted = q;
         sorted.sort_by.clear();
-        for (const auto& o : ordered) sorted.sort_by.push_back(o.col);
+        // A grouped ORDER BY keys only columns (above).
+        for (const auto& o : ordered) sorted.sort_by.push_back(std::get<ColumnRef>(o.key));
         sorted.above = columns;
         for (const auto& a : aggs) {
           if (!a.args.empty()) sorted.above.push_back(a.args[0].col);

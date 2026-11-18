@@ -9,6 +9,7 @@
 // prototype: replaced by the designed front end (#492).
 
 module;
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -165,6 +166,47 @@ struct Compare {
   return out;
 }
 
+// An ORDER BY key: an expression of the FROM columns, a column reference
+// the most common one. An output name or a position of a plain SELECT's
+// select item is that item's expression, as the parser resolves it.
+struct OrderItem {
+  Expr expr;
+  // ORDER BY 2: the select-list position, 1-based, and no expression. The
+  // parser resolves it in a plain SELECT; a set operation's the binder does.
+  std::int64_t position{0};
+  bool desc{false};
+  std::int32_t pos{-1};
+  // NULLS FIRST (true) or NULLS LAST (false); nullopt for PostgreSQL's
+  // default, last under ASC and first under DESC.
+  std::optional<bool> nulls_first;
+};
+
+[[nodiscard]] auto clone(const OrderItem& o) -> OrderItem {
+  return {clone(o.expr), o.position, o.desc, o.pos, o.nulls_first};
+}
+
+[[nodiscard]] auto clone(const std::vector<OrderItem>& order_by) -> std::vector<OrderItem> {
+  std::vector<OrderItem> out;
+  for (const auto& o : order_by) out.push_back(clone(o));
+  return out;
+}
+
+// Whether two expressions are written alike, as PostgreSQL's equal() finds
+// two select items or an ORDER BY key and a select item one: their kinds,
+// names, constants and operands; never their positions or AS names. A
+// subquery is the same one only as the same parse.
+[[nodiscard]] auto same_expr(const Expr& a, const Expr& b) -> bool {
+  auto both = [](const std::unique_ptr<Expr>& x, const std::unique_ptr<Expr>& y) {
+    return x == nullptr ? y == nullptr : y != nullptr && same_expr(*x, *y);
+  };
+  return a.kind == b.kind && a.column == b.column && a.param == b.param && a.table == b.table &&
+         a.constant == b.constant && a.fn == b.fn && a.distinct == b.distinct && a.negated == b.negated &&
+         a.literal.kind == b.literal.kind && a.literal.text == b.literal.text && a.literal.b == b.literal.b &&
+         a.cmp == b.cmp && a.cast_type == b.cast_type && a.cast_typmods == b.cast_typmods && a.subquery == b.subquery &&
+         a.func == b.func && both(a.lhs, b.lhs) && both(a.rhs, b.rhs) &&
+         std::ranges::equal(a.args, b.args, same_expr);
+}
+
 // A FOREIGN KEY constraint of CREATE TABLE, on a column (REFERENCES) or
 // on the table: its name, "" for none, its columns, and the table and
 // columns it references, none for that table's primary key. Checked
@@ -267,18 +309,6 @@ struct Insert {
   std::shared_ptr<const Select> query;
 };
 
-struct OrderItem {
-  std::string column;
-  // ORDER BY 2: the select-list position, 1-based, and no column. The parser
-  // resolves it in a plain SELECT; a set operation's the binder does.
-  std::int64_t position{0};
-  bool desc{false};
-  std::int32_t pos{-1};
-  std::string table;  // the table it is qualified by, "" for none
-  // NULLS FIRST (true) or NULLS LAST (false); nullopt for PostgreSQL's
-  // default, last under ASC and first under DESC.
-  std::optional<bool> nulls_first;
-};
 
 struct SetOperation;
 
@@ -367,7 +397,7 @@ struct SetOperation {
   }
   out.from = s.from;
   for (const auto& c : s.where) out.where.push_back(clone(c));
-  out.order_by = s.order_by;
+  out.order_by = clone(s.order_by);
   out.limit = s.limit;
   out.offset = s.offset;
   out.pos = s.pos;

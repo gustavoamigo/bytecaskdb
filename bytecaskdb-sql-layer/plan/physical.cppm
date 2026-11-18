@@ -209,10 +209,20 @@ struct Filter {
   std::vector<Expr> conjuncts;
 };
 
-// One part of a sort key: a column of a row in hand, in its direction, its
-// NULLs first or last.
+// A result column that is an expression over the row's columns, parameters
+// and constants, evaluated for each row (docs/planner_design.md,
+// *Expressions over columns*). Never a bare column or parameter, which have
+// targets of their own.
+struct ExprTarget {
+  Expr expr;
+};
+
+// One part of a sort key, in its direction, its NULLs first or last: a
+// column of a row in hand, or an expression over the rows in hand (ORDER BY
+// a + 5), evaluated as the row is added. A GROUP BY's sort of groups keys on
+// columns alone.
 struct SortPart {
-  ColumnRef col;
+  std::variant<ColumnRef, ExprTarget> key;
   bool desc{false};
   bool nulls_first{false};
 };
@@ -256,13 +266,6 @@ struct Limit {
 struct ParamTarget {
   std::uint32_t param{0};
   PhysType type{PhysType::I64};
-};
-// A result column that is an expression over the row's columns, parameters
-// and constants, evaluated for each row (docs/planner_design.md,
-// *Expressions over columns*). Never a bare column or parameter, which have
-// targets of their own.
-struct ExprTarget {
-  Expr expr;
 };
 // A result column: a column, from the row or from the entry's key when the
 // scan covers, a parameter, or an expression.
@@ -1307,7 +1310,10 @@ private:
               if (g == nullptr || g->streamed) broken("a sort of groups not over a structure of them");
               const auto columns = g->columns();
               for (const auto& k : op.keys) {
-                if (std::ranges::find(columns, k.col) == columns.end()) broken("a sort of groups by a column not of them");
+                const auto* c = std::get_if<ColumnRef>(&k.key);
+                if (c == nullptr || std::ranges::find(columns, *c) == columns.end()) {
+                  broken("a sort of groups by a column not of them");
+                }
               }
               node(*op.input, &n);
               return;
@@ -1324,8 +1330,19 @@ private:
             }
             auto in = tables_of(*op.input);
             for (const auto& k : op.keys) {
-              if (std::ranges::find(in, k.col.table) == in.end()) broken("a sort key outside its input's tables");
-              read(k.col);
+              std::vector<ColumnRef> cols;
+              if (const auto* c = std::get_if<ColumnRef>(&k.key)) {
+                cols.push_back(*c);
+              } else {
+                const auto& x = std::get<ExprTarget>(k.key).expr;
+                value(x);
+                params(x);
+                logical::columns_of(x, cols);
+              }
+              for (const auto& c : cols) {
+                if (std::ranges::find(in, c.table) == in.end()) broken("a sort key outside its input's tables");
+                read(c);
+              }
             }
             // A row's NULL is tested before it is added, from a row in hand.
             for (const auto& c : op.not_null) {
