@@ -1469,6 +1469,22 @@ TEST_CASE("binder: a chain of joins is a left-deep tree, each ON bound against t
     CHECK(get<logical::Filter>(b).conjuncts[0].args[0].col.nullable);
   }
   {
+    // A RIGHT JOIN first swaps its two tables: the preserved one is the left of the first join, the other is
+    // NULL-able in the ON of the join after it.
+    auto b = bind_sql(cat, "SELECT t.id FROM t RIGHT JOIN u ON t.qty = u.qty JOIN w ON t.id = w.j");
+    CHECK(tables_of(root(b)) == std::vector<std::string>{"u", "t", "w"});
+    const auto& top = get<logical::Join>(b);
+    CHECK_FALSE(top.left_outer);
+    const auto& first = std::get<logical::Join>(top.left->op);
+    CHECK(first.left_outer);
+    REQUIRE(first.predicate.size() == 1);
+    REQUIRE(get<logical::Filter>(b).conjuncts.size() == 1);
+    const auto& later = get<logical::Filter>(b).conjuncts[0];
+    CHECK(later.args[0].col.table == cat.table("t")->id);
+    CHECK(later.args[0].col.nullable);  // t.id, a primary key, read from a row the RIGHT JOIN may NULL-extend
+    CHECK_FALSE(later.args[1].col.nullable);
+  }
+  {
     // An inner join after an outer one is inner; the ON's columns of the outer join's right table are NULL-able.
     auto b = bind_sql(cat, "SELECT t.id FROM t LEFT JOIN u ON t.qty = u.qty JOIN w ON u.k = w.j");
     const auto& top = get<logical::Join>(b);
@@ -1479,8 +1495,8 @@ TEST_CASE("binder: a chain of joins is a left-deep tree, each ON bound against t
   // The names an ON may use, and what is not taken yet.
   CHECK(rejected(cat, "SELECT t.id FROM t JOIN u ON t.qty = w.qty JOIN w ON u.qty = w.qty").first ==
         "missing FROM-clause entry for table \"w\"");
-  CHECK(rejected(cat, "SELECT t.id FROM t RIGHT JOIN u ON t.qty = u.qty JOIN w ON u.qty = w.qty").first ==
-        "a RIGHT JOIN of more than two tables is not supported yet");
+  CHECK(rejected(cat, "SELECT t.id FROM t JOIN u ON t.qty = u.qty RIGHT JOIN w ON u.qty = w.qty").first ==
+        "a RIGHT JOIN after the first join is not supported yet");
   CHECK(rejected(cat, "SELECT t.id FROM t JOIN u ON t.qty = u.qty NATURAL JOIN w").first ==
         "USING or NATURAL after the first join is not supported yet");
   CHECK(rejected(cat, "SELECT t.id FROM t JOIN u USING (qty) JOIN w USING (qty)").first ==

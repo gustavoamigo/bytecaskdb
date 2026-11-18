@@ -1536,6 +1536,11 @@ TEST_CASE("embedded API: joins of three or more tables, a table with itself, and
         Grid{{i(0), Value{}, Value{}}, {i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(2), i(3), i(3)}, {i(3), i(2), i(2)}, {i(3), i(3), i(3)}, {i(4), Value{}, Value{}}, {i(5), Value{}, Value{}}});
   CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1 LEFT JOIN h2 ON h1.a = h2.a JOIN h3 ON h2.id = h3.k ORDER BY 1, 2, 3") ==
         Grid{{i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(2), i(3), i(3)}, {i(3), i(2), i(2)}, {i(3), i(3), i(3)}});
+  // A RIGHT JOIN as the first join is the LEFT JOIN of its tables swapped, and later joins follow it.
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h2 RIGHT JOIN h1 ON h1.a = h2.a JOIN h3 ON h2.a = h3.a ORDER BY 1, 2, 3") ==
+        Grid{{i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(2), i(3), i(2)}, {i(3), i(2), i(2)}, {i(3), i(3), i(2)}});
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h2 RIGHT JOIN h1 ON h1.a = h2.a LEFT JOIN h3 ON h2.id = h3.k ORDER BY 1, 2, 3") ==
+        Grid{{i(0), Value{}, Value{}}, {i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(2), i(3), i(3)}, {i(3), i(2), i(2)}, {i(3), i(3), i(3)}, {i(4), Value{}, Value{}}, {i(5), Value{}, Value{}}});
   CHECK(rows("SELECT h1.a, count(h2.id), count(h3.k), count(*) FROM h1 LEFT JOIN h2 ON h1.a = h2.a LEFT JOIN h3 ON h2.a = h3.a GROUP BY h1.a ORDER BY 1") ==
         Grid{{i(1), i(1), i(1), i(1)}, {i(2), i(4), i(4), i(4)}, {i(3), i(0), i(0), i(1)}, {i(5), i(0), i(0), i(1)}, {Value{}, i(0), i(0), i(1)}});
   // a table joined with itself
@@ -1590,7 +1595,7 @@ TEST_CASE("embedded API: joins of three or more tables, a table with itself, and
   CHECK(state("SELECT 1 FROM h1 x, h2 x") == "42712");
   CHECK(state("SELECT 1 FROM h1 JOIN h2 ON h1.a = h3.a JOIN h3 ON h2.a = h3.a") == "42P01");
   // What the layer does not take yet is refused, never answered wrongly.
-  CHECK(state("SELECT 1 FROM h1 x RIGHT JOIN h2 y ON x.a = y.a JOIN h3 z ON y.a = z.a") == "42601");
+  CHECK(state("SELECT 1 FROM h1 x JOIN h2 y ON x.a = y.a RIGHT JOIN h3 z ON y.a = z.a") == "42601");
   CHECK(state("SELECT 1 FROM h1 NATURAL JOIN h2 NATURAL JOIN h3") == "42601");
   CHECK(state("SELECT 1 FROM h1 x, h1 y, h1 z, h1 w, h1 v, h1 u, h1 t, h1 s, h1 r") == "42601");  // nine tables
   CHECK(state("SELECT 1 FROM h1 x JOIN h1 y ON x.id = y.id FOR UPDATE") == "42601");

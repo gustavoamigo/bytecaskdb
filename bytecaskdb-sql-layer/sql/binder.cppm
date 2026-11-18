@@ -3648,7 +3648,9 @@ public:
       if (s.for_update) throw SqlError{"FOR UPDATE on a join is not supported yet", s.pos};
       for (std::size_t k = 1; k < n; ++k) {
         outer[k] = s.from[k].kind != ast::JoinKind::Inner;
-        if (s.from[k].kind == ast::JoinKind::Right && n > 2) not_yet("a RIGHT JOIN of more than two tables", s.from[k].pos);
+        // RIGHT as the first join swaps its two tables below; after a left-deep
+        // prefix it would put the next table's rows outside the rows before it.
+        if (s.from[k].kind == ast::JoinKind::Right && k > 1) not_yet("a RIGHT JOIN after the first join", s.from[k].pos);
       }
       // USING and NATURAL join the first two tables.
       auto first = using_conjuncts(*rels[0], *rels[1], s.from[1]);

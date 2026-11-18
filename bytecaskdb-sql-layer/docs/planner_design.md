@@ -758,7 +758,8 @@ marks it; a key a later join builds from it keeps the mark, so a row of
 NULLs is a miss and never a key of whatever the column's bytes hold). So an
 inner join after an outer one drops the rows it NULL-extended where its `ON`
 reads them, and one before it does not. `RIGHT JOIN` is a left join of its
-two tables swapped, so it is taken only of two tables; `USING` and `NATURAL`
+two tables swapped, so it is taken only as the first join, where the swap
+keeps the chain left-deep; `USING` and `NATURAL`
 only for the first join.
 
 **A comparison, and a predicate over both sides.** Any comparison of a
