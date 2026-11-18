@@ -4771,7 +4771,13 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
       [&](const auto& s) -> std::pair<std::variant<Ddl, logical::NodePtr>, std::int32_t> {
         using T = std::decay_t<decltype(s)>;
         if constexpr (std::is_same_v<T, ast::CreateTable>) {
-          CreateTableDdl out{s.table, {}, s.pk, {}, {}};
+          // IF NOT EXISTS and the name taken: PostgreSQL skips the statement
+          // before it reads the definition, so a wrong one is skipped too.
+          if (s.if_not_exists && (cat.table(s.table) != nullptr || cat.view(s.table) != nullptr ||
+                                  cat.index(s.table).first != nullptr)) {
+            return {Ddl{CreateTableDdl{s.table, {}, {}, {}, {}, true}}, s.pos};
+          }
+          CreateTableDdl out{s.table, {}, s.pk, {}, {}, s.if_not_exists};
           for (const auto& c : s.columns) {
             out.columns.push_back(column_spec(c));
             if (c.primary_key) out.pk.push_back(c.name);

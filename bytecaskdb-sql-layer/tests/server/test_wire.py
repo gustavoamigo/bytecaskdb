@@ -622,6 +622,37 @@ def test_create_and_drop_procedure_have_their_command_tags(server):
     assert states(c.until_ready()) == ["0A000"]  # two statements: the simple protocol takes one
 
 
+def test_a_ddl_that_if_exists_skips_sends_postgresqls_notice_before_its_tag(server):
+    c = connect(server)
+    for sql in ("CREATE TABLE skipped (id INTEGER PRIMARY KEY)", "CREATE VIEW skipped_v AS SELECT id FROM skipped"):
+        c.send(query(sql))
+        assert states(c.until_ready()) == []
+    cases = [
+        # Taken by a table or a view: skipped before the definition is read.
+        ("CREATE TABLE IF NOT EXISTS skipped (a INTEGER, a INTEGER)", "CREATE TABLE", "42P07",
+         'relation "skipped" already exists, skipping'),
+        ("CREATE TABLE IF NOT EXISTS skipped_v (a INTEGER)", "CREATE TABLE", "42P07",
+         'relation "skipped_v" already exists, skipping'),
+        ("DROP TABLE IF EXISTS nope", "DROP TABLE", "00000", 'table "nope" does not exist, skipping'),
+        ("DROP INDEX IF EXISTS nope", "DROP INDEX", "00000", 'index "nope" does not exist, skipping'),
+        ("DROP VIEW IF EXISTS nope", "DROP VIEW", "00000", 'view "nope" does not exist, skipping'),
+        ("DROP PROCEDURE IF EXISTS nope(INTEGER, TEXT)", "DROP PROCEDURE", "00000",
+         "procedure nope(pg_catalog.int4,text) does not exist, skipping"),
+    ]
+    for sql, tag, state, text in cases:
+        for message in (query(sql), parse(sql) + bind([]) + execute() + SYNC):
+            c.send(message)
+            got = c.until_ready()
+            kinds = [k for k, _ in got]
+            assert b"N" in kinds and kinds.index(b"N") < kinds.index(b"C"), sql
+            notice = fields(next(b for k, b in got if k == b"N"))
+            assert (notice["S"], notice["C"], notice["M"]) == ("NOTICE", state, text)
+            assert fields_tag(got) == tag
+    # A DDL that changes the catalog sends none.
+    c.send(query("CREATE TABLE IF NOT EXISTS fresh (id INTEGER PRIMARY KEY)"))
+    assert b"N" not in [k for k, _ in c.until_ready()]
+
+
 def test_call_as_hammerdb_sends_it_returns_the_out_row_and_the_tag_call(server):
     c = connect(server)
     for sql in ("CREATE TABLE stock (id INTEGER PRIMARY KEY, qty INTEGER, at TIMESTAMP)",

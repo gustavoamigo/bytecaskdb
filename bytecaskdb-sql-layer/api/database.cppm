@@ -78,6 +78,14 @@ using bytecask::VacuumOptions;
 // as text (Rows).
 [[nodiscard]] auto average_text(std::int64_t sum, std::int64_t count, std::uint8_t scale) -> std::string;
 
+// What a statement reports besides its result, as PostgreSQL's NOTICE: a
+// DDL that IF EXISTS or IF NOT EXISTS skipped, with PostgreSQL's SQLSTATE
+// and text.
+struct Notice {
+  std::string sqlstate;
+  std::string message;
+};
+
 struct Rows {
   std::vector<std::string> columns;
   // Each column's SQL type, as the catalog declares it. A NUMERIC's value,
@@ -85,6 +93,7 @@ struct Rows {
   std::vector<SqlType> types;
   std::vector<std::vector<Value>> rows;
   std::int64_t affected{-1};  // INSERT, UPDATE, DELETE: rows changed
+  std::vector<Notice> notices;
 };
 
 // Which of a read statement's rows a run returns: the first `skip` are
@@ -1567,6 +1576,59 @@ auto Database::execute(const Statement& stmt, const std::vector<Value>& params, 
   }
 }
 
+namespace {
+
+// A procedure argument's type as PostgreSQL's notices name it.
+auto notice_type_name(SqlKind k) -> std::string_view {
+  switch (k) {
+    case SqlKind::SmallInt: return "pg_catalog.int2";
+    case SqlKind::Integer: return "pg_catalog.int4";
+    case SqlKind::BigInt: return "pg_catalog.int8";
+    case SqlKind::Real: return "pg_catalog.float4";
+    case SqlKind::Double: return "pg_catalog.float8";
+    case SqlKind::Decimal:
+    case SqlKind::Numeric: return "pg_catalog.numeric";
+    case SqlKind::Boolean: return "pg_catalog.bool";
+    case SqlKind::Text: return "text";
+    case SqlKind::Varchar: return "pg_catalog.varchar";
+    case SqlKind::Char: return "pg_catalog.bpchar";
+    case SqlKind::Bytea: return "bytea";
+    case SqlKind::Date: return "date";
+    case SqlKind::Time: return "pg_catalog.time";
+    case SqlKind::Timestamp: return "pg_catalog.timestamp";
+    case SqlKind::TimestampTz: return "timestamptz";
+  }
+  return "";
+}
+
+// The NOTICE PostgreSQL gives for a DDL that IF [NOT] EXISTS skipped.
+auto skipped(const Ddl& ddl) -> Notice {
+  return std::visit(
+      [](const auto& d) -> Notice {
+        using T = std::decay_t<decltype(d)>;
+        if constexpr (std::is_same_v<T, CreateTableDdl>) {
+          return {"42P07", "relation \"" + d.name + "\" already exists, skipping"};
+        } else if constexpr (std::is_same_v<T, DropTableDdl>) {
+          return {"00000", "table \"" + d.name + "\" does not exist, skipping"};
+        } else if constexpr (std::is_same_v<T, DropIndexDdl>) {
+          return {"00000", "index \"" + d.name + "\" does not exist, skipping"};
+        } else if constexpr (std::is_same_v<T, DropViewDdl>) {
+          return {"00000", "view \"" + d.name + "\" does not exist, skipping"};
+        } else if constexpr (std::is_same_v<T, DropProcedureDdl>) {
+          std::string args;
+          for (const auto& t : d.arg_types.value_or(std::vector<SqlType>{})) {
+            args += (args.empty() ? "" : ",") + std::string{notice_type_name(t.kind)};
+          }
+          return {"00000", "procedure " + d.name + "(" + args + ") does not exist, skipping"};
+        } else {
+          throw std::logic_error("a DDL that never skips changed nothing");
+        }
+      },
+      ddl);
+}
+
+}  // namespace
+
 auto Database::execute_locked(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts)
     -> Rows {
   if (stmt.owner_ != this) throw std::logic_error("the statement was prepared on another database");
@@ -1574,8 +1636,11 @@ auto Database::execute_locked(const Statement& stmt, const std::vector<Value>& p
   if (stmt.is_ddl()) {
     if (!params.empty()) throw ParamError("DDL takes no parameters");
     auto bound = bound::bind(stmt.ast_, *live_->current());
+    const auto& ddl = std::get<Ddl>(bound.stmt);
+    Rows out;
     try {
-      (void)live_->apply(std::get<Ddl>(bound.stmt));
+      // No new catalog: IF EXISTS or IF NOT EXISTS skipped the statement.
+      if (!live_->run(ddl).changed) out.notices.push_back(skipped(ddl));
     } catch (const ConstraintViolation& e) {
       throw ExecError(e.what(), BC_E_CONSTRAINT, e.detail().encode());
     } catch (const DdlInProgress&) {
@@ -1583,7 +1648,6 @@ auto Database::execute_locked(const Statement& stmt, const std::vector<Value>& p
     } catch (const CommitOutcomeUnknown&) {
       throw TransactionResolutionUnknown{};
     }
-    Rows out;
     out.affected = 0;
     return out;
   }

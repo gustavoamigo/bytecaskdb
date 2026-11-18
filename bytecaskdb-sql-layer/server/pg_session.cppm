@@ -738,6 +738,12 @@ private:
   }
   void warning(std::string_view state, std::string_view message) { send_fields('N', "WARNING", state, message, 0); }
 
+  // A statement's notices (Rows::notices), each a NoticeResponse before its
+  // CommandComplete, as PostgreSQL sends them.
+  void notices(const Rows& rows) {
+    for (const auto& n : rows.notices) send_fields('N', "NOTICE", n.sqlstate, n.message, 0);
+  }
+
   // The session ends after it: nothing more is read or run, and any open
   // transaction is rolled back.
   void fatal(std::string_view state, std::string_view message) {
@@ -1324,6 +1330,7 @@ private:
             row_description(cols);
             data_rows(rows);
           }
+          notices(rows);
           complete(command_tag(stmt.command(), rows));
           break;
         }
@@ -1596,6 +1603,7 @@ private:
 
   void reply(const Statement& stmt, const Rows& rows) {
     data_rows(rows);
+    notices(rows);
     complete(command_tag(stmt.command(), rows));
   }
 

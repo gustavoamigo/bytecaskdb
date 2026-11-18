@@ -690,7 +690,10 @@ difference: the driver writes ISO.
 - `P`: for an `ast::SqlError`, its position, one-based and in characters,
   converted from the layer's byte offset.
 
-Warnings are `NoticeResponse` with `S` `WARNING`.
+Warnings are `NoticeResponse` with `S` `WARNING`. A statement's notices
+(`Rows::notices`: a DDL that `IF EXISTS` or `IF NOT EXISTS` skipped) are
+`NoticeResponse` with `S` `NOTICE`, PostgreSQL's SQLSTATE and text, sent
+before the statement's `CommandComplete` in both protocols.
 
 The SQLSTATE comes from one function in the API, `sqlstate(const
 std::exception&)` (*What it uses from the embedded API*, 4). The server, the Python binding and

@@ -381,12 +381,16 @@ struct CheckSpec {
   std::string expr;
   std::string column;
 };
+// `if_not_exists`: a relation of the name makes it change nothing. With no
+// columns it is only that: the binder found the name taken, and skipped the
+// definition unread, as PostgreSQL skips it.
 struct CreateTableDdl {
   std::string name;
   std::vector<ColumnSpec> columns;
   std::vector<std::string> pk;
   std::vector<UniqueSpec> unique;
   std::vector<CheckSpec> checks;
+  bool if_not_exists{false};
 };
 struct CreateIndexDdl {
   std::string name;
@@ -568,6 +572,13 @@ public:
   // Returns the version it published; throws as prepare does, DdlInProgress
   // as commit does, or std::runtime_error when every attempt conflicted.
   auto apply(const Ddl& ddl) -> std::shared_ptr<const Catalog>;
+  // apply, and whether the DDL changed the catalog: false when IF EXISTS or
+  // IF NOT EXISTS skipped it, and `catalog` is then the version it read.
+  struct Applied {
+    std::shared_ptr<const Catalog> catalog;
+    bool changed{false};
+  };
+  auto run(const Ddl& ddl) -> Applied;
 
   static constexpr int kDdlAttempts = 3;
 
@@ -1880,6 +1891,10 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
 
   if (const auto* ct = std::get_if<CreateTableDdl>(&ddl)) {
     auto name = std::string{ct->name};
+    // IF NOT EXISTS: a name taken now changes nothing. One the binder found
+    // taken, and a DDL since has freed, is a conflict with that DDL.
+    if (ct->if_not_exists && names_.contains(name)) return nullptr;
+    if (ct->if_not_exists && ct->columns.empty()) throw DdlInProgress{};
     // PostgreSQL's order: the statement's own columns and key parts are
     // refused before a name already taken (42701, 42703 over 42P07); a table
     // of no columns and a column of an unsupported type or default, which
@@ -2343,7 +2358,9 @@ auto LiveCatalog::commit_locked(Prepared p) -> bool {
   }
 }
 
-auto LiveCatalog::apply(const Ddl& ddl) -> std::shared_ptr<const Catalog> {
+auto LiveCatalog::apply(const Ddl& ddl) -> std::shared_ptr<const Catalog> { return run(ddl).catalog; }
+
+auto LiveCatalog::run(const Ddl& ddl) -> Applied {
   // One DDL at a time from prepare to publication, so a retry is only ever
   // for a write that raced a backfill, never for another DDL of this
   // catalog. A second DDL does not wait for the first: it fails at once.
@@ -2352,9 +2369,9 @@ auto LiveCatalog::apply(const Ddl& ddl) -> std::shared_ptr<const Catalog> {
   if (!lock.owns_lock()) throw DdlInProgress();
   for (int attempt = 0; attempt < kDdlAttempts; ++attempt) {
     auto p = prepare(ddl);
-    if (!p.next) return p.base;
+    if (!p.next) return {p.base, false};
     auto next = p.next;  // what this DDL publishes; current() may be a later DDL's once the lock is released
-    if (commit_locked(std::move(p))) return next;
+    if (commit_locked(std::move(p))) return {next, true};
   }
   throw std::runtime_error("DDL conflicted with concurrent writes on every attempt");
 }

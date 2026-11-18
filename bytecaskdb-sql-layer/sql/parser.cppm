@@ -687,6 +687,7 @@ auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos, std::string_vi
     reject("CREATE TABLE option not supported", s->relation->location);
   }
   CreateTable t{relation(s->relation), {}, {}, pos};
+  t.if_not_exists = s->if_not_exists;
   // One PRIMARY KEY, on a column or on the table: PostgreSQL refuses a
   // second (42P16), so two column-level ones are not a composite key.
   auto primary_keys = 0;
