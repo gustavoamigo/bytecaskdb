@@ -169,6 +169,37 @@ TEST_CASE("catalog: every table record is format 7, its CHECK constraints its ta
   CHECK_THROWS_AS(parse_table(serialize_table(t)), std::runtime_error);
 }
 
+TEST_CASE("catalog: a clock default trails its column's entry, and only a column of a type that takes it holds one",
+          "[sql][catalog]") {
+  auto t = rich_table();
+  t.checks.clear();
+  auto plain = serialize_table(t);
+  t.columns.back().sql = SqlType{SqlKind::Timestamp};
+  t.columns.back().default_value = std::monostate{};
+  t.columns.back().clock_default = ClockDefault{ClockDefault::Fn::LocalTimestamp, 3};
+  auto rec = serialize_table(t);
+  CHECK(rec.size() == plain.size() + 2);  // the function and the precision, nothing else
+  auto u = parse_table(rec);
+  REQUIRE(u.columns.back().clock_default);
+  CHECK(*u.columns.back().clock_default == ClockDefault{ClockDefault::Fn::LocalTimestamp, 3});
+  CHECK(!parse_table(plain).columns.back().clock_default);
+  CHECK(serialize_table(u) == rec);
+  for (std::size_t n = 0; n < rec.size(); ++n) {
+    INFO(n);
+    CHECK_THROWS_AS(parse_table(BytesView{rec}.first(n)), std::runtime_error);
+  }
+  // A clock no column of its type takes, an unknown function or precision, and one beside a constant default.
+  auto refused = [&](auto change) {
+    auto v = t;
+    change(v.columns.back());
+    CHECK_THROWS_AS(parse_table(serialize_table(v)), std::runtime_error);
+  };
+  refused([](Column& c) { c.clock_default->fn = ClockDefault::Fn::CurrentDate; });  // a date to a timestamp: midnight
+  refused([](Column& c) { c.clock_default->fn = static_cast<ClockDefault::Fn>(9); });
+  refused([](Column& c) { c.clock_default->precision = 7; });
+  refused([](Column& c) { c.default_value = std::int64_t{1}; });
+}
+
 TEST_CASE("catalog: CHECK constraints are named as PostgreSQL names them and survive a reopen", "[sql][catalog]") {
   sql_test::TempDir dir{"catalog_check"};
   auto db = DB::open(dir.path());
