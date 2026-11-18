@@ -240,8 +240,6 @@
 
 - name: an aggregate over an expression
   features: [E091-05]
-  # * is not supported in an expression
-  unimplemented: true
   setup:
     - CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)
   steps:

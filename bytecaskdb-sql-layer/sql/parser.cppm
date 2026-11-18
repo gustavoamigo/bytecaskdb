@@ -263,7 +263,7 @@ auto expr(const PgQuery__Node* n) -> Expr {
       reject("function " + name + " is not supported", f->location);
     }
     auto refuse = [&] [[noreturn]] {
-      reject("only COUNT(*), and COUNT, SUM, MIN, MAX and AVG of a column, ALL or DISTINCT, are supported", f->location);
+      reject("only COUNT(*), and COUNT, SUM, MIN, MAX and AVG of one argument, ALL or DISTINCT, are supported", f->location);
     };
     if (f->n_agg_order != 0 || f->agg_filter != nullptr ||
         f->over != nullptr || f->agg_within_group || f->func_variadic) {
@@ -276,11 +276,12 @@ auto expr(const PgQuery__Node* n) -> Expr {
            : name == "max" ? Expr::Fn::Max
                            : Expr::Fn::Avg;
     e.distinct = f->agg_distinct;
-    if (f->agg_star && e.fn == Expr::Fn::Count) return e;
-    if (f->agg_star || f->n_args != 1 || f->args[0]->node_case != PG_QUERY__NODE__NODE_COLUMN_REF) refuse();
-    auto arg = expr(f->args[0]);
-    e.column = arg.column;
-    e.table = arg.table;
+    if (f->agg_star && e.fn == Expr::Fn::Count) {
+      e.star = true;
+      return e;
+    }
+    if (f->agg_star || f->n_args != 1) refuse();
+    e.args.push_back(operand(f->args[0]));
     return e;
   }
   if (n->node_case == PG_QUERY__NODE__NODE_A_CONST) return literal_expr(literal(n));

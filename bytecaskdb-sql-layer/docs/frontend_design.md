@@ -425,6 +425,24 @@ in any order, on any columns, and of predicates over them.
 - `COUNT(*)` counts rows, `COUNT(col)` non-NULL values, `COUNT(DISTINCT
   col)` distinct non-NULL values. All three are `bigint`, and 0 over no
   rows.
+- The argument of `COUNT`, `SUM`, `MIN`, `MAX` and `AVG` is a column or
+  any expression of the `FROM` columns a select list takes (*Expressions
+  over columns*): `SUM(v * 2)`, `COUNT(1)`, `MAX(CASE … END)`, a view
+  column that is an expression. It is evaluated once per row, where the
+  row is read, and folded as a column's value is: NULL is skipped, and the
+  call is typed by the expression's type as by a column's (`SUM` of an
+  `INTEGER` product is `bigint`). An error it raises is the statement's
+  (22003 for an `INTEGER` product past its range, 22012), raised by a row
+  whose operands are not NULL, as PostgreSQL evaluates it. An aggregate
+  inside the argument is 42803, "aggregate function calls cannot be
+  nested"; a bare `$n` nothing else types, or a bare NULL or quoted
+  literal (no cast), is of unknown type: 42725 under `SUM` and `AVG`
+  ("function sum(unknown) is not unique"), and 42P18 for the `$n` under
+  `COUNT`, as PostgreSQL refuses them (`COUNT` of such a literal counts it). The parser keeps the argument whole
+  (`ast::Expr::args`, `star` for `COUNT(*)`); the binder binds it as a
+  select item's expression. The plans that answer an aggregate from the
+  keys (`KeyAggregates`, `CountRange`) take a column argument only; any
+  other is folded by a loop over the rows.
 - Every aggregate over a column takes `ALL` (the default) or `DISTINCT`.
   `DISTINCT` folds each distinct non-NULL value of the column once: a
   `DOUBLE PRECISION`'s `-0.0` and `0.0` are one value and NaN is one, as
@@ -432,8 +450,9 @@ in any order, on any columns, and of predicates over them.
   x)` are `MIN(x)` and `MAX(x)`, bound as such. The values seen are held
   per group in the statement's memory, a key each, and a statement that
   passes its budget fails with 54000, never spilling (`planner_design.md`,
-  *Memory*). The argument is a column: `SUM(DISTINCT a + 1)` is refused, as
-  is every aggregate of an expression (42601).
+  *Memory*). With `DISTINCT` the argument is a column: `SUM(DISTINCT a +
+  1)` is not taken yet (0A000), since the distinct values are keyed by the
+  column's encoding.
 - `SUM` over `SMALLINT` or `INTEGER` is `bigint`. Over `BIGINT` or
   `DECIMAL` it is `numeric`, kept at the input's scale. It is NULL over no
   rows.
@@ -480,7 +499,9 @@ and with a constant selected or `DISTINCT ON`, it is not taken yet.
   index's order can still stream the groups. Anything else is 42803,
   PostgreSQL's message.
 - `HAVING` is a conjunction of comparisons of a grouped column or an
-  aggregate with a parameter. The parameter takes the column's type, or the
+  aggregate with a parameter. An aggregate written as the select list
+  writes it is the same call, which the planner finds by its bound
+  expression and folds once; any other is folded alongside. The parameter takes the column's type, or the
   aggregate's: `COUNT`'s and an integer `SUM`'s `bigint`, a `SUM` of a
   BIGINT or DECIMAL its numeric, checked as a BIGINT at its scale, `MIN`'s
   and `MAX`'s their column's. A parameter an earlier use typed, in the
@@ -740,8 +761,9 @@ That includes:
   `NULL` constant under `NOT`, and a string constant as a `WHERE` or `ON`;
 - correlated and nested subqueries and the others above, derived tables;
 - `DISTINCT ON`, `DISTINCT` of a constant or over groups it does not select
-  every key of, `GROUP BY` of an expression, and `HAVING` of anything but
-  the comparisons above;
+  every key of, an aggregate of `DISTINCT` values of an expression (0A000),
+  `GROUP BY` of an expression, and `HAVING` of anything but the
+  comparisons above;
 - `FULL JOIN`, an outer join's `ON` comparing an expression of columns,
   more than eight tables, a `RIGHT JOIN` after the first join, `USING` or
   `NATURAL` after the first join, a join in parentheses or among commas,
@@ -1019,7 +1041,8 @@ until then.
   and the layer's result type has one. `REAL` and `DOUBLE PRECISION`
   arithmetic and comparison as a value (unary `-` and `abs` of one are
   taken). A cast, an
-  aggregate inside an expression, an expression in the select list of an
+  aggregate inside an expression (an expression is taken inside an
+  aggregate, *Aggregates*), an expression in the select list of an
   aggregated query or under `DISTINCT`, an expression in the `ORDER BY` of
   a grouped or aggregated query, in `GROUP BY`, `SET` or a `WHERE`.
 

@@ -2136,29 +2136,25 @@ private:
 
   // Each column the SELECT names is a column of one of its tables.
   static void check_columns(const SelectParts& s, const Tables& tables) {
-    auto column = [&](const Expr& e) { return reads(tables, e); };
+    auto of_tables = [&](const Expr& e) {
+      std::vector<ColumnRef> cols;
+      logical::columns_of(e, cols);
+      return std::ranges::all_of(cols, [&](const ColumnRef& c) { return std::ranges::find(tables, c.table) != tables.end(); });
+    };
     if (s.project != nullptr) {
       for (const auto& o : s.project->exprs) {
-        std::vector<ColumnRef> cols;
-        logical::columns_of(o.expr, cols);
-        if (!std::ranges::all_of(cols, [&](const ColumnRef& c) { return std::ranges::find(tables, c.table) != tables.end(); })) {
-          no_plan("a result column that is not an expression of columns of its tables");
-        }
+        if (!of_tables(o.expr)) no_plan("a result column that is not an expression of columns of its tables");
       }
     } else {
       if (s.aggregate->aggs.size() != 1) no_plan("an Aggregate of other than one aggregate call");
       const auto& a = s.aggregate->aggs[0].expr;
-      if (a.kind != Expr::Kind::Aggregate || (!a.args.empty() && !column(a.args[0]))) {
-        no_plan("an aggregate call that does not take a column of its tables");
+      if (a.kind != Expr::Kind::Aggregate || !of_tables(a)) {
+        no_plan("an aggregate call that does not take an expression of columns of its tables");
       }
     }
     if (s.sort != nullptr) {
       for (const auto& k : s.sort->keys) {
-        std::vector<ColumnRef> cols;
-        logical::columns_of(k.expr, cols);
-        if (!std::ranges::all_of(cols, [&](const ColumnRef& c) { return std::ranges::find(tables, c.table) != tables.end(); })) {
-          no_plan("an ORDER BY key that is not an expression of columns of its tables");
-        }
+        if (!of_tables(k.expr)) no_plan("an ORDER BY key that is not an expression of columns of its tables");
       }
     }
   }
@@ -2312,7 +2308,8 @@ private:
       }
       // The keys answer COUNT when nothing filters a row.
       const auto* scan = bare_scan(c);
-      if (scan != nullptr && !agg->distinct && agg->fn == Expr::Fn::Count) {
+      if (scan != nullptr && !agg->distinct && agg->fn == Expr::Fn::Count &&
+          (agg->args.empty() || agg->args[0].kind == Expr::Kind::Column)) {
         // Every entry of the range is a row to count, unless the argument can
         // be NULL in one: the WHERE compares every column it names, so those
         // hold none.
@@ -2366,7 +2363,7 @@ private:
     // The one aggregate row sums integers whole; a SUM of DISTINCT values or
     // of a DOUBLE takes the grouped route.
     return e.kind != Expr::Kind::Aggregate || (e.fn != Expr::Fn::Count && e.fn != Expr::Fn::Sum) ||
-           (e.fn == Expr::Fn::Sum && (e.distinct || e.args[0].col.type == PhysType::F64));
+           (e.fn == Expr::Fn::Sum && (e.distinct || e.args[0].phys() == PhysType::F64));
   }
 
   static auto group_parts(const logical::Node& root) -> GroupParts {
@@ -2482,9 +2479,8 @@ private:
       }
     }
     for (const auto& a : aggs) {
-      if ((a.fn != Expr::Fn::Count || a.distinct) && (a.args.empty() || a.args[0].kind != Expr::Kind::Column)) {
-        no_plan("an aggregate call that does not take a column of its tables");
-      }
+      if ((a.fn != Expr::Fn::Count || a.distinct) && a.args.empty()) no_plan("an aggregate call with no argument");
+      if (a.distinct && a.args[0].kind != Expr::Kind::Column) no_plan("an aggregate of DISTINCT values of other than a column");
     }
     std::vector<OrderItem> order_by;
     if (g.sort != nullptr && (!g.limit || *g.limit > 0)) {
@@ -2519,7 +2515,9 @@ private:
     auto of_tables = [&](const ColumnRef& c) { return std::ranges::find(tables, c.table) != tables.end(); };
     if (!std::ranges::all_of(columns, of_tables)) no_plan("a GROUP BY key that is not a column of its tables");
     for (const auto& a : aggs) {
-      if (!a.args.empty() && !of_tables(a.args[0].col)) no_plan("an aggregate call that does not take a column of its tables");
+      std::vector<ColumnRef> cols;
+      if (!a.args.empty()) logical::columns_of(a.args[0], cols);
+      if (!std::ranges::all_of(cols, of_tables)) no_plan("an aggregate call that does not take an expression of columns of its tables");
     }
     const auto ordered = ordered_items(q, order_by);
     SortSpec sort{{}, kept(g.limit)};
@@ -2612,7 +2610,7 @@ private:
         for (const auto& o : ordered) sorted.sort_by.push_back(std::get<ColumnRef>(o.key));
         sorted.above = columns;
         for (const auto& a : aggs) {
-          if (!a.args.empty()) sorted.above.push_back(a.args[0].col);
+          if (!a.args.empty()) logical::columns_of(a.args[0], sorted.above);
         }
         avoiding_ordered = without_hash(sorted, structured, sink_of(true, false), &rows_sort);
       }

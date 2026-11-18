@@ -189,8 +189,7 @@ TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql]
   CHECK(rejected_at("SELECT id FROM t WHERE id = $1 LIMIT 1.5") == 37);
   CHECK(rejected_at("SELECT stddev(qty) FROM t WHERE id = $1") == 7);
   CHECK(rejected_at("SELECT sum(*) FROM t WHERE id = $1") == 7);
-  CHECK(rejected_at("SELECT min(qty + $2) FROM t WHERE id = $1") == 7);
-  CHECK(rejected_at("SELECT sum(DISTINCT qty + 1) FROM t WHERE id = $1") == 7);
+  CHECK(rejected_at("SELECT sum(qty, id) FROM t WHERE id = $1") == 7);
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 LIMIT $2"), SqlError);
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 OFFSET $2"), SqlError);
   CHECK(rejected_at("SELECT id FROM t WHERE id = $1 OFFSET -1") == 38);
@@ -290,14 +289,23 @@ TEST_CASE("parser: COUNT, ORDER BY, LIMIT and column + parameter", "[sql][parser
   REQUIRE(s.targets.size() == 2);
   CHECK(s.targets[0].kind == Expr::Kind::Aggregate);
   CHECK(s.targets[0].fn == Expr::Fn::Count);
-  CHECK(s.targets[0].column.empty());
-  CHECK(s.targets[1].column == "qty");
+  CHECK(s.targets[0].star);
+  CHECK(s.targets[0].args.empty());
+  CHECK_FALSE(s.targets[1].star);
+  REQUIRE(s.targets[1].args.size() == 1);
+  CHECK(s.targets[1].args[0].column == "qty");
   auto sum_min = std::get<Select>(parse("SELECT sum(qty), pg_catalog.min(t.qty) FROM t WHERE name = $1"));
   REQUIRE(sum_min.targets.size() == 2);
   CHECK(sum_min.targets[0].fn == Expr::Fn::Sum);
-  CHECK(sum_min.targets[0].column == "qty");
+  CHECK(sum_min.targets[0].args.at(0).column == "qty");
   CHECK(sum_min.targets[1].fn == Expr::Fn::Min);
-  CHECK(sum_min.targets[1].table == "t");
+  CHECK(sum_min.targets[1].args.at(0).table == "t");
+  // The argument is any expression, kept whole for the binder.
+  auto expr_arg = std::get<Select>(parse("SELECT sum(qty * 2), count(1), max(sum(qty)) FROM t"));
+  REQUIRE(expr_arg.targets.size() == 3);
+  CHECK(expr_arg.targets[0].args.at(0).kind == Expr::Kind::Mul);
+  CHECK(expr_arg.targets[1].args.at(0).kind == Expr::Kind::Const);
+  CHECK(expr_arg.targets[2].args.at(0).kind == Expr::Kind::Aggregate);
   auto distinct = std::get<Select>(parse("SELECT count(DISTINCT qty) FROM t WHERE name = $1"));
   CHECK(distinct.targets[0].fn == Expr::Fn::Count);
   CHECK(distinct.targets[0].distinct);

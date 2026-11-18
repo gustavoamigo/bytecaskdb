@@ -1561,6 +1561,12 @@ private:
     throw std::logic_error{"physical plan: an expression over columns codegen does not print"};
   }
 
+  // The negation of a NULL test, as C: parenthesized where it is a
+  // disjunction (either).
+  [[nodiscard]] static auto is_not(const std::string& null) -> std::string {
+    return null.find("||") == std::string::npos ? "!" + null : "!(" + null + ")";
+  }
+
   [[nodiscard]] static auto either(const std::string& a, const std::string& b) -> std::string {
     return a.empty() ? b : b.empty() ? a : a + " || " + b;
   }
@@ -1888,8 +1894,19 @@ private:
     w_.line("bc_emit_end(cx);");
   }
 
-  // The aggregate's argument in the row in hand: its NULL test and its
-  // value, from the entry's key when the scan covers.
+  // An aggregate's argument for the row in hand, evaluated once, as eval
+  // prints it where the call is: whether it is NULL ("" if never) and its
+  // value. An error it raises (22003, 22012) is the statement's. Of the one
+  // aggregate row's loop, a column is read as arg_of_row reads it.
+  auto agg_arg(const Expr& a, bool row_loop = false) -> Val {
+    const auto& x = a.args[0];
+    if (!row_loop || x.kind != Expr::Kind::Column) return eval(x);
+    auto [is_null, value] = arg_of_row(x.col);
+    return {x.col.nullable ? is_null : "", value, x.col.type};
+  }
+
+  // A column argument in the row in hand: its NULL test and its value, from
+  // the entry's key when the scan covers.
   auto arg_of_row(const ColumnRef& arg) -> std::pair<std::string, std::string> {
     const auto& b = binding(arg.table);
     if (b.covering) {
@@ -1941,20 +1958,20 @@ private:
       w_.line("++n;");  // COUNT(*)
       return;
     }
-    const auto& arg = a.args[0].col;
-    auto [is_null, value] = arg_of_row(arg);
     if (a.distinct) {
+      const auto& arg = a.args[0].col;
       auto group = "bc_agg_group(cx, groups, bc_col_key(cx, " + row_of(arg) + ", " + w_.col(arg) + "));";
-      w_.line(arg.nullable ? "if (!" + is_null + ") " + group : group);
+      w_.line(arg.nullable ? "if (!" + arg_of_row(arg).first + ") " + group : group);
       return;
     }
+    auto v = agg_arg(a, true);
     switch (a.fn) {
-      case Expr::Fn::Count: w_.line("if (!" + is_null + ") ++n;"); return;
+      case Expr::Fn::Count: w_.line(v.null.empty() ? "++n;" : "if (" + is_not(v.null) + ") ++n;"); return;
       case Expr::Fn::Sum:
-        if (arg.nullable) w_.open("if (!" + is_null + ")");
-        w_.line("sum = bc_add(cx, sum, " + value + ");");
+        if (!v.null.empty()) w_.open("if (" + is_not(v.null) + ")");
+        w_.line("sum = bc_add(cx, sum, " + v.value + ");");
         w_.line("seen = true;");
-        if (arg.nullable) w_.close();
+        if (!v.null.empty()) w_.close();
         return;
       case Expr::Fn::Min:
       case Expr::Fn::Max:
@@ -1966,6 +1983,29 @@ private:
   // NULL as NULL (COUNT: 1, or 0 for a NULL argument); over none, COUNT 0 and
   // SUM NULL.
   void emit_one_row(const Expr& a, const std::string& hit) {
+    if (a.args.size() == 1 && a.args[0].kind != Expr::Kind::Column) {
+      // An expression: evaluated where the row is in hand.
+      if (a.fn == Expr::Fn::Count) w_.line("int64_t n = 0;");
+      if (a.fn != Expr::Fn::Count) w_.line("bc_emit_begin(cx);");
+      w_.open("if (" + hit + ")");
+      auto v = eval(a.args[0]);
+      if (a.fn == Expr::Fn::Count) {
+        w_.line(v.null.empty() ? "n = 1;" : "if (" + is_not(v.null) + ") n = 1;");
+      } else {
+        emit_val(v);
+      }
+      if (a.fn != Expr::Fn::Count) {
+        w_.otherwise();
+        w_.line("bc_emit_null(cx);");
+      }
+      w_.close();
+      if (a.fn == Expr::Fn::Count) {
+        emit_count("n");
+      } else {
+        w_.line("bc_emit_end(cx);");
+      }
+      return;
+    }
     if (a.fn != Expr::Fn::Count) {
       const auto& arg = a.args[0].col;
       w_.line("bc_emit_begin(cx);");
@@ -2226,17 +2266,17 @@ private:
     for (std::size_t j = 0; j < op.aggs.size(); ++j) {
       const auto& a = op.aggs[j];
       if (a.args.empty() || a.distinct) continue;  // COUNT(*): slot 0
-      const auto& arg = a.args[0].col;
-      if (arg.nullable) w_.open("if (!" + col_null(arg) + ")");
-      for (const auto& line : structure_fold(g, j, gg)) w_.line(line);
-      if (arg.nullable) w_.close();
+      auto v = agg_arg(a);
+      if (!v.null.empty()) w_.open("if (" + is_not(v.null) + ")");
+      for (const auto& line : structure_fold(g, j, gg, v.value)) w_.line(line);
+      if (!v.null.empty()) w_.close();
     }
     for (std::size_t m = 0; m < g.layout.distinct.size(); ++m) {
       const auto& arg = g.layout.distinct[m];
       std::vector<std::string> folds;
       for (std::size_t j = 0; j < op.aggs.size(); ++j) {
         if (!op.aggs[j].distinct || op.aggs[j].args[0].col != arg) continue;
-        for (auto& line : structure_fold(g, j, gg)) folds.push_back(std::move(line));
+        for (auto& line : structure_fold(g, j, gg, read_col(arg))) folds.push_back(std::move(line));
       }
       if (arg.nullable) w_.open("if (!" + col_null(arg) + ")");
       distinct_value(g, arg, gr, folds);
@@ -2246,16 +2286,16 @@ private:
 
   // Whether the aggregate folds doubles: a SUM, AVG, MIN or MAX of a DOUBLE.
   static auto folds_f64(const Expr& a) -> bool {
-    return a.fn != Expr::Fn::Count && !a.args.empty() && a.args[0].col.type == PhysType::F64;
+    return a.fn != Expr::Fn::Count && !a.args.empty() && a.args[0].phys() == PhysType::F64;
   }
 
-  // The statements folding the row in hand's argument of aggregate j into
-  // its slots of group `gg`.
-  auto structure_fold(const Group& g, std::size_t j, const std::string& gg) -> std::vector<std::string> {
+  // The statements folding the row in hand's argument of aggregate j, its
+  // value `v`, into its slots of group `gg`.
+  auto structure_fold(const Group& g, std::size_t j, const std::string& gg, const std::string& v) const
+      -> std::vector<std::string> {
     const auto& a = g.op->aggs[j];
-    const auto& arg = a.args[0].col;
     const auto slot = std::to_string(g.layout.agg_slot[j]);
-    const auto at = "(cx, " + gg + ", " + slot + ", " + read_col(arg) + ");";
+    const auto at = "(cx, " + gg + ", " + slot + ", " + v + ");";
     const auto f64 = folds_f64(a);
     switch (a.fn) {
       case Expr::Fn::Count: return {"bc_agg_count(cx, " + gg + ", " + slot + ");"};
@@ -2418,15 +2458,14 @@ private:
     w_.close();
   }
 
-  // The statements folding the row in hand's argument of aggregate j into
-  // the streamed group's locals: x<j> the count, sum, minimum or maximum,
-  // xs<j> whether a value was folded, xc<j> an AVG's count.
-  auto local_fold(const Group& g, std::size_t j) -> std::vector<std::string> {
+  // The statements folding the row in hand's argument of aggregate j, its
+  // value `v`, into the streamed group's locals: x<j> the count, sum,
+  // minimum or maximum, xs<j> whether a value was folded, xc<j> an AVG's
+  // count.
+  static auto local_fold(const Group& g, std::size_t j, const std::string& v) -> std::vector<std::string> {
     const auto& a = g.op->aggs[j];
-    const auto& arg = a.args[0].col;
     const auto x = local("x", g, j);
     const auto xs = local("xs", g, j);
-    const auto v = read_col(arg);
     const auto f64 = folds_f64(a);
     auto sum = x + " = " + (f64 ? "bc_add_f64" : "bc_add") + "(cx, " + x + ", " + v + ");";
     switch (a.fn) {
@@ -2457,7 +2496,11 @@ private:
     // it, however many reads of its arguments follow.
     auto covered = std::ranges::find_if(rows_, [&](const Binding& b) {
       return b.covering &&
-             std::ranges::any_of(op.aggs, [&](const Expr& a) { return !a.args.empty() && a.args[0].col.table == b.table; });
+             std::ranges::any_of(op.aggs, [&](const Expr& a) {
+               std::vector<ColumnRef> cols;
+               if (!a.args.empty()) logical::columns_of(a.args[0], cols);
+               return std::ranges::any_of(cols, [&](const ColumnRef& c) { return c.table == b.table; });
+             });
     });
     if (covered != rows_.end()) {
       w_.line("bc_view key = bc_scan_key(cx, " + covered->cursor + ");");
@@ -2470,17 +2513,17 @@ private:
         continue;
       }
       if (a.distinct) continue;
-      const auto& arg = a.args[0].col;
-      if (arg.nullable) w_.open("if (!" + col_null(arg) + ")");
-      for (const auto& line : local_fold(g, j)) w_.line(line);
-      if (arg.nullable) w_.close();
+      auto v = agg_arg(a);
+      if (!v.null.empty()) w_.open("if (" + is_not(v.null) + ")");
+      for (const auto& line : local_fold(g, j, v.value)) w_.line(line);
+      if (!v.null.empty()) w_.close();
     }
     for (std::size_t m = 0; m < g.layout.distinct.size(); ++m) {
       const auto& arg = g.layout.distinct[m];
       std::vector<std::string> folds;
       for (std::size_t j = 0; j < op.aggs.size(); ++j) {
         if (!op.aggs[j].distinct || op.aggs[j].args[0].col != arg) continue;
-        for (auto& line : local_fold(g, j)) folds.push_back(std::move(line));
+        for (auto& line : local_fold(g, j, read_col(arg))) folds.push_back(std::move(line));
       }
       if (arg.nullable) w_.open("if (!" + col_null(arg) + ")");
       distinct_value(g, arg, "", folds);
