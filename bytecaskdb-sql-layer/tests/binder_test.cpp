@@ -1750,3 +1750,53 @@ TEST_CASE("binder: a query that aggregates over a grouped view reads it as a der
   CHECK(state("SELECT SUM(s) FROM hh") ==
         "42601 aggregating over a view that aggregates over a grouped view is not supported yet");
 }
+
+TEST_CASE("binder: a grouped view joined with a table is a derived relation, its query's table read again by an instance",
+          "[sql][binder][view]") {
+  sql_test::Fixture f;
+  auto view = [&](std::string_view sql) { f.ddl(std::get<Ddl>(bind_sql(f.cat(), sql).stmt)); };
+  f.ddl(CreateTableDdl{"u", {sql_test::Fixture::col("id", PhysType::I64, false), sql_test::Fixture::col("qty", PhysType::I64, true)}, {"id"}});
+  view("CREATE VIEW h AS SELECT qty, COUNT(*) AS n FROM t GROUP BY qty");
+  view("CREATE VIEW p AS SELECT id, qty FROM u");
+  view("CREATE VIEW hh AS SELECT n, COUNT(*) AS m FROM h GROUP BY n");
+  const auto& cat = f.cat();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+      return "bound";
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what();
+    }
+  };
+  {
+    // USING: the view's rows drive, its column is the join's.
+    auto b = bind_sql(cat, "SELECT qty, n, id FROM h JOIN u USING (qty)");
+    const auto& j = get<logical::Join>(b);
+    const auto* d = std::get_if<logical::Derived>(&j.left->op);
+    REQUIRE(d != nullptr);
+    CHECK(Table::derived(d->table->id));
+    CHECK(find<logical::Get>(*j.right)->table->name == "u");
+    const auto& p = get<logical::Project>(b);
+    CHECK(p.exprs[0].expr.col.table == d->table->id);
+  }
+  {
+    // A table the view's query reads is read by an instance of its own.
+    auto b = bind_sql(cat, "SELECT h.n, t.name FROM t JOIN h ON t.qty = h.qty");
+    const auto& j = get<logical::Join>(b);
+    const auto* g = std::get_if<logical::Get>(&j.left->op);
+    REQUIRE(g != nullptr);
+    CHECK(g->table->id >= Table::kInstanceBase);
+    CHECK(g->table->source == cat.table("t")->id);
+    CHECK(std::get_if<logical::Derived>(&j.right->op) != nullptr);
+  }
+  CHECK(state("SELECT * FROM h NATURAL JOIN u") == "bound");
+  CHECK(state("SELECT * FROM u RIGHT JOIN h ON u.qty = h.qty") == "bound");
+  CHECK(state("SELECT * FROM u LEFT JOIN h ON u.qty = h.qty") ==
+        "42601 a grouped view on the NULL-extended side of an outer join is not supported yet");
+  CHECK(state("SELECT COUNT(*) FROM h JOIN u USING (qty)") ==
+        "42601 grouping, aggregating or DISTINCT over a join of a grouped view is not supported yet");
+  CHECK(state("SELECT * FROM h JOIN p USING (qty)") == "42601 a join of a grouped view with another view is not supported yet");
+  CHECK(state("SELECT * FROM hh JOIN u ON u.qty = hh.n") ==
+        "42601 a join of a view that aggregates over a grouped view is not supported yet");
+  CHECK(state("SELECT * FROM h JOIN u USING (nope)") == "42703 column \"nope\" specified in USING clause does not exist in left table");
+}

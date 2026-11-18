@@ -698,8 +698,19 @@ TEST_CASE("physical: a derived relation is its query's groups, read by a grouped
   refused(plan(outer(groups(), {dk}), {}), "other columns than its query gives");
   refused(plan(outer(groups(), {dn, dk}), {}), "not its query's output");
   refused(plan(outer(emit(get({p(0)})), {dk}), {0}), "not a GroupEmit's");
-  // No row holds it: nothing emits, sorts or keeps a row of it.
-  refused(plan(emit(node(physical::Derived{groups(), d, {dk, dn}}), {dk}), {}), "rows emitted from a derived relation");
+  // Its rows are emitted from its locals, as a join's outer side; no row holds it: nothing
+  // sorts, holds or looks up a row of it.
+  CHECK(refusal(plan(emit(node(physical::Derived{groups(), d, {dk, dn}}), {dk}), {})).empty());
+  refused(plan(emit(node(physical::IndexJoin{node(physical::Derived{groups(), d, {dk, dn}}), d, {logical::column(dk, big)}}), {dk}), {}),
+          "a derived relation looked up by key");
+  {
+    physical::HashJoin hj;
+    hj.build = node(physical::Derived{groups(), d, {dk, dn}});
+    hj.probe = node(scan({}, physical::Range{}));
+    hj.keys = {{dk, kId}};
+    hj.held = d;
+    refused(plan(emit(node(std::move(hj)), {dk}), {}), "holds a derived relation's rows");
+  }
   const logical::ColumnRef text{d, 0, PhysType::Bytes, true};
   auto by_text = node(physical::GroupAggregate{node(physical::Derived{groups(), d, {dk, dn}}), {text}, {count}, false, {}});
   refused(plan(node(physical::GroupEmit{std::move(by_text), {count}}), {}), "holds a row of a derived relation");

@@ -307,6 +307,84 @@
     - DROP VIEW vw8_h
     - DROP TABLE vw8
 
+- name: a grouped view joined with a table reads its groups as the join's outer rows
+  features: [F131-02]
+  setup:
+    - CREATE TABLE vw12 (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)
+    - CREATE TABLE vw12_t (k INTEGER PRIMARY KEY, a INTEGER)
+    - INSERT INTO vw12 VALUES (1, 1, 5), (2, 1, 7), (3, 2, 9), (4, NULL, 1)
+    - INSERT INTO vw12_t VALUES (1, 1), (2, 2), (3, 3), (4, NULL), (5, 1)
+    - CREATE VIEW vw12_g AS SELECT a, COUNT(*) AS n, SUM(b) AS s FROM vw12 GROUP BY a
+  steps:
+    - sql: SELECT a FROM vw12_g JOIN vw12_t USING (a)
+      expected: [[1], [1], [2]]
+    - sql: SELECT * FROM vw12_g JOIN vw12_t USING (a)
+      expected: [[1, 2, 12, 1], [1, 2, 12, 5], [2, 1, 9, 2]]
+    - sql: SELECT * FROM vw12_t NATURAL JOIN vw12_g WHERE k > 1
+      expected: [[1, 5, 2, 12], [2, 2, 1, 9]]
+    - sql: SELECT vw12_g.s, vw12_t.k FROM vw12_t, vw12_g WHERE vw12_t.a = vw12_g.a AND vw12_t.k > 1
+      expected: [[9, 2], [12, 5]]
+    # the view's groups the table matches none of are kept, NULL-extended
+    - sql: SELECT vw12_g.a, n, k FROM vw12_g LEFT JOIN vw12_t ON vw12_t.a = vw12_g.a AND vw12_t.k < 5
+      expected: [[1, 2, 1], [2, 1, 2], [null, 1, null]]
+    # the table the view reads, joined again
+    - sql: SELECT vw12_g.n, vw12.id FROM vw12_g JOIN vw12 ON vw12.a = vw12_g.a WHERE vw12_g.s > 10
+      expected: [[2, 1], [2, 2]]
+    - sql: SELECT k FROM vw12_g JOIN vw12_t USING (a) WHERE a = $1
+      params: [2]
+      expected: [[2]]
+  teardown:
+    - DROP VIEW vw12_g
+    - DROP TABLE vw12_t
+    - DROP TABLE vw12
+
+- name: a grouped view on the NULL-extended side of an outer join, or sorted in a join
+  features: [F131-02]
+  unimplemented: true
+  # the view's groups are read only as the join's outer rows, never held by a sorter: refused (42601, 0A000), #834
+  setup:
+    - CREATE TABLE vw13 (id INTEGER PRIMARY KEY, a INTEGER)
+    - CREATE TABLE vw13_t (k INTEGER PRIMARY KEY, a INTEGER)
+    - INSERT INTO vw13 VALUES (1, 1), (2, 1)
+    - INSERT INTO vw13_t VALUES (1, 1), (2, 2)
+    - CREATE VIEW vw13_g AS SELECT a, COUNT(*) AS n FROM vw13 GROUP BY a
+  steps:
+    - sql: SELECT k, n FROM vw13_t LEFT JOIN vw13_g USING (a)
+      expected: [[1, 2], [2, null]]
+    - sql: SELECT k, n FROM vw13_g JOIN vw13_t USING (a) ORDER BY k
+      expected: [[1, 2]]
+      ordered: true
+  teardown:
+    - DROP VIEW vw13_g
+    - DROP TABLE vw13_t
+    - DROP TABLE vw13
+
+- name: a grouped view in a grouped join, joined with another view, or under another grouped view in a join
+  features: [F131-02]
+  unimplemented: true
+  # refused (42601): an aggregate over a join of a grouped view, a grouped view joined with another view, a join of a view that aggregates over a grouped view, #835
+  setup:
+    - CREATE TABLE vw14 (id INTEGER PRIMARY KEY, a INTEGER)
+    - CREATE TABLE vw14_t (k INTEGER PRIMARY KEY, a INTEGER)
+    - INSERT INTO vw14 VALUES (1, 1), (2, 1), (3, 2)
+    - INSERT INTO vw14_t VALUES (1, 1), (2, 2)
+    - CREATE VIEW vw14_g AS SELECT a, COUNT(*) AS n FROM vw14 GROUP BY a
+    - CREATE VIEW vw14_p AS SELECT k, a FROM vw14_t
+    - CREATE VIEW vw14_gg AS SELECT n, COUNT(*) AS m FROM vw14_g GROUP BY n
+  steps:
+    - sql: SELECT COUNT(*), SUM(n) FROM vw14_g JOIN vw14_t USING (a)
+      expected: [[2, 3]]
+    - sql: SELECT k, n FROM vw14_g JOIN vw14_p USING (a)
+      expected: [[1, 2], [2, 1]]
+    - sql: SELECT k, m FROM vw14_gg JOIN vw14_t ON vw14_t.k = vw14_gg.n
+      expected: [[1, 1], [2, 1]]
+  teardown:
+    - DROP VIEW vw14_gg
+    - DROP VIEW vw14_p
+    - DROP VIEW vw14_g
+    - DROP TABLE vw14_t
+    - DROP TABLE vw14
+
 - name: an aggregate over a view of one group whose WHERE compares with constants
   features: [F131-03]
   setup:

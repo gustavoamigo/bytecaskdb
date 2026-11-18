@@ -1528,6 +1528,8 @@ private:
         const auto& t = std::get<ColumnRef>(e.targets[i]);
         if (const auto& b = binding(t.table); b.covering) {
           w_.line("bc_emit_key_part(cx, " + key_part(b, t) + ";");
+        } else if (b.derived) {
+          emit_val({t.nullable ? col_null(t) : "", read_col(t), t.type});
         } else {
           w_.line("bc_emit_col(cx, " + row_of(t) + ", " + w_.col(t) + ");");
         }
@@ -2624,11 +2626,11 @@ private:
   // type's zero then); then k, the plan above, on them, inside `do { … }
   // while (0)` so a miss (`continue`) leaves it for the next group, wherever
   // the query gives the group: in its loop over groups, in its input's loop,
-  // or after it. The statement's LIMIT counts the groups above, never the
-  // query's: limit_ is reset to the arm's own around it. Today no Limit's
-  // counter reaches here (a structure clears it before its input, and a
-  // stream over a derived relation is of one group, which a Limit does not
-  // loop over); the reset keeps that true of a stream that groups.
+  // or after it. The statement's LIMIT counts the rows or groups above,
+  // never the query's: limit_ is reset to the arm's own around it, and the
+  // plan above runs for a group only while the LIMIT is not met. A join of
+  // the relation (its rows the plan's outermost loop) counts its pairs so,
+  // a lookup by key per group included, which no loop of its own stops.
   void produce(const physical::Derived& d, const Consume& k) {
     const auto& e = std::get<physical::GroupEmit>(d.input->op);
     const auto name = "d" + std::to_string(derived_++);
@@ -2652,12 +2654,16 @@ private:
         w_.line(c_type(type) + " " + v + " = " + zero(type) + ";");
         w_.line("if (!" + n + ") " + v + " = " + value + ";");
       }
-      rows_.push_back({d.table, name, false, 0, false, "c", false, true});
+      rows_.push_back({d.table, name, false, 0, false, "c", true, true});
       auto was_loop = std::exchange(loop_, true);
       auto outer = std::exchange(limit_, limit);
+      // The statement's LIMIT, met, leaves the groups after it unread by
+      // the plan above, a lookup by key as much as a loop.
+      if (!limit.empty()) w_.open("if (" + limit + ")");
       w_.open("do");
       k();
       w_.close(" while (0);");
+      if (!limit.empty()) w_.close();
       limit_ = outer;
       loop_ = was_loop;
       rows_.pop_back();

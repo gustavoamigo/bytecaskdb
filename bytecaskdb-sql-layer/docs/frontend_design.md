@@ -640,12 +640,15 @@ EXISTS] name`:
   only. A view of views is expanded through, to a depth of 16.
 - **Where it is read:** alone, as the table of a `FROM`; inner, `LEFT` and
   `RIGHT` joined with a table or another view; in a subquery, and in the
-  subquery of an `UPDATE`'s or `DELETE`'s `WHERE`. A joined view must be a
-  plain `SELECT` of one table. Its columns are qualified by that table, so
-  one the other side lacks never changes meaning, and one both have is
-  42702. Refused (42601): `USING` or `NATURAL` on a view, an outer join of
-  a view with a `WHERE`, and two views of one table (a table joined with
-  itself).
+  subquery of an `UPDATE`'s or `DELETE`'s `WHERE`. A joined view merged
+  into the query must be a plain `SELECT` of one table. Its columns are
+  qualified by that table, so one the other side lacks never changes
+  meaning, and one both have is 42702. A grouped view joined with a table
+  is not merged: it is a derived relation (below), and the join is any
+  join of two relations, `USING` and `NATURAL` included. Refused (42601):
+  `USING` or `NATURAL` on a merged view, an outer join of a merged view
+  with a `WHERE`, two views of one table (a table joined with itself), and
+  a grouped view joined with another view.
 - **Over a grouped view** (`GROUP BY`, `HAVING` or an aggregate) a query
   selects its columns, orders by its group columns, and its `WHERE` keeps
   groups: it becomes the view's `HAVING`. It may group again by exactly the
@@ -673,7 +676,20 @@ EXISTS] name`:
   (42601): a `GROUP BY` or `DISTINCT` of a column held other than as an
   integer or a boolean (text, bytea, a float) (#833), a view column that is
   an `AVG` of an integer or `DECIMAL` (PostgreSQL's `numeric`, two plan
-  columns), a join of such a view, and a view that itself reads one.
+  columns), and a view that itself reads one.
+- **A grouped view joined with a table** is a derived relation too
+  (`ViewExpander::merge_two`, `derived_item`): `SELECT a FROM v JOIN t
+  USING (a)`, whatever the query selects. The binder binds it as above; a
+  table the view's query reads, joined again, is read by an instance of its
+  own (`Binder::instance`), since the view's query reads it by its own id
+  in the loops the join runs inside. Its rows are read only as the join's
+  outer rows, so refused (42601): the view on an outer join's
+  NULL-extended side (`t LEFT JOIN v`, `v RIGHT JOIN t`), stricter than
+  PostgreSQL (#834); a query that groups, aggregates or selects `DISTINCT`
+  over the join; the view joined with another view; and a join of a view
+  that aggregates over a grouped view, a derived relation inside a derived
+  relation (#835). Refused (0A000) by the planner: `ORDER BY` over the
+  join, whose sort would hold the view's rows (#834).
   Refused (0A000) by the planner: a view of one group of every row (no
   `GROUP BY`) whose every plan may end before it reads: a point lookup, or
   a comparison with NULL or with a subquery's value (#833). Its `WHERE` on
@@ -1391,9 +1407,11 @@ implemented (`functional_testing_design.md`).
   REPLACE VIEW`, and joins any view, or reads one with `DISTINCT`, `LIMIT`
   or a set operation, as a subquery in `FROM`. Here a view's query is
   merged into the statement, and only a grouped view that a query
-  aggregates over is read as a derived relation, grouped by integer and
-  boolean columns only (#833); the rest wait for updatable views and
-  derived tables in joins.
+  aggregates over, or that is joined with a table, is read as a derived
+  relation, grouped by integer and boolean columns only (#833), and in a
+  join only as the outer side of a join with a table, unsorted and
+  ungrouped (#834, #835); the rest wait for updatable
+  views and derived tables in general.
 
 ## Decisions
 

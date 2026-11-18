@@ -1662,3 +1662,40 @@ TEST_CASE("search: a table read twice has an instance for each use, and the plan
   CHECK(has(g, "TBL_1073741825 y"));
   CHECK(has(g, "COL_1073741824_0 x.id"));
 }
+
+TEST_CASE("search: a grouped view joined with a table drives the join, costed by its query's estimate of its groups",
+          "[sql][search][join][view]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"u", {Fixture::col("id", PhysType::I64, false), Fixture::col("qty", PhysType::I64, true)}, {"id"}});
+  f.ddl(std::get<Ddl>(bound::bind(ast::parse("CREATE VIEW h AS SELECT qty, COUNT(*) AS n FROM t GROUP BY qty"), f.cat()).stmt));
+  const auto& cat = f.cat();
+  auto counts = [](const Table&) -> std::optional<std::uint64_t> { return 10'000; };
+  // Every plan reads the view's groups first, each group's outputs in locals, and looks u
+  // up by key, scans it per group or probes a hash table built on it; none holds the groups.
+  const std::string by_key = "SELECT h.n, u.qty FROM h JOIN u ON u.id = h.qty";
+  const std::string by_value = "SELECT h.n, u.id FROM h JOIN u ON u.qty = h.qty";
+  auto hashed = false;
+  for (const auto& sql : {by_key, by_value}) {
+    auto all = generate_alternatives(bound::bind(ast::parse(sql), cat), cat, sql, counts);
+    REQUIRE(all.size() > 1);
+    for (const auto& g : all) {
+      INFO(g.source);
+      CHECK(has(g, "bool d0_n0 = "));
+      CHECK(g.source.find("bc_agg_next") < g.source.find("do {"));
+      CHECK_FALSE(has(g, "bc_sorter"));
+      hashed = hashed || has(g, "bc_hash_open");
+    }
+  }
+  CHECK(hashed);
+  // The cheapest looks u up by key per group: the view's 1,000 groups of 10,000 rows.
+  auto best = plan_sql(cat, by_key, {{"t", 10'000}, {"u", 10'000}});
+  INFO(best.source);
+  CHECK(has(best, "bc_get("));
+  CHECK_FALSE(has(best, "bc_hash_open"));
+  // The table the view reads, joined again, is an instance of its own.
+  auto self = plan_sql(cat, "SELECT h.n, t.name FROM h JOIN t USING (qty)");
+  CHECK(has(self, "TBL_1073741824 = 1"));
+  // ORDER BY would sort the view's rows, which no sorter holds.
+  CHECK_THROWS_AS(plan_sql(cat, "SELECT h.n FROM h JOIN u ON u.id = h.qty ORDER BY u.qty"), ast::FeatureNotSupported);
+}
