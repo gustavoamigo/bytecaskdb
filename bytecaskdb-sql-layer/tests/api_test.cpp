@@ -436,21 +436,30 @@ TEST_CASE("embedded API: compatibility decides which cached plans recompile", "[
   (void)db->execute("DROP INDEX t_by_name");
   CHECK(ids(db->execute(by_name, {bytes("a"), bytes("b")})) == std::vector<std::int64_t>{1});
   CHECK(by_name.plan_source().find("IDX_3") == std::string::npos);
-  // One that then has no plan, a filter on a DOUBLE only its index took, is
-  // refused; the write plans keep running, uncompiled.
+  // A filter on a DOUBLE its index took is a filter on the row once the
+  // index is dropped.
   (void)db->execute("ALTER TABLE t ADD COLUMN d DOUBLE PRECISION DEFAULT 1.5");
   (void)db->execute("CREATE INDEX t_by_d ON t (d)");
   const auto& by_d = db->prepare("SELECT id FROM t WHERE d >= $1");
   CHECK(ids(db->execute(by_d, {Value{1.0}})) == std::vector<std::int64_t>{1, 2, 3});
-  const auto by_d_index = "IDX_" + std::to_string(db->catalog()->index("t_by_d").second->id);
-  compiled = db->compilations();
+  CHECK(by_d.plan_source().find("IDX_") != std::string::npos);
   (void)db->execute("DROP INDEX t_by_d");
-  CHECK_THROWS_AS(db->execute(by_d, {Value{1.0}}), FeatureNotSupported);
+  CHECK(ids(db->execute(by_d, {Value{1.0}})) == std::vector<std::int64_t>{1, 2, 3});
+  CHECK(by_d.plan_source().find("IDX_") == std::string::npos);
+  // One that then fails to recompile, its other table dropped, is refused;
+  // the write plans keep running, uncompiled.
+  (void)db->execute("CREATE TABLE dd (k BIGINT PRIMARY KEY, d DOUBLE PRECISION)");
+  const auto& dd_by_d = db->prepare("SELECT k FROM dd WHERE d >= $1");
+  CHECK(db->execute(dd_by_d, {Value{1.0}}).rows.empty());
+  const auto dd_source = dd_by_d.plan_source();
+  compiled = db->compilations();
+  (void)db->execute("DROP TABLE dd");
+  CHECK_THROWS_AS(db->execute(dd_by_d, {Value{1.0}}), ast::SqlError);
   // A failed recompile keeps the statement's old plan whole and still
   // incompatible: the next execute tries again and fails the same way,
   // never running the old code (ASan checks the schema ref it reads).
-  CHECK_THROWS_AS(db->execute(by_d, {Value{1.0}}), FeatureNotSupported);
-  CHECK(by_d.plan_source().find(by_d_index) != std::string::npos);
+  CHECK_THROWS_AS(db->execute(dd_by_d, {Value{1.0}}), ast::SqlError);
+  CHECK(dd_by_d.plan_source() == dd_source);
   CHECK(db->execute(insert, {i(4), bytes("date"), i(40)}).affected == 1);
   CHECK(db->execute(by_id, {i(4)}).rows == Grid{{i(4), i(40)}});
   CHECK(db->compilations() == compiled);
@@ -1301,10 +1310,8 @@ TEST_CASE("embedded API: sqlstate reports PostgreSQL's SQLSTATE for each error",
   CHECK(state([&] { (void)db->execute("INSERT INTO s VALUES ($1, $2)", {i(2), kNull}); }) == "23502");
   CHECK(state([&] { (void)db->execute("INSERT INTO s VALUES ($1, $2)", {i(3), i(1 << 16)}); }) == "22003");
   CHECK(state([&] { (void)db->execute("SELEC 1"); }) == "42601");
-  // The planner's refusal: a statement in the subset it can't plan, a
-  // filter on a DOUBLE PRECISION column.
-  (void)db->execute("CREATE TABLE sd (k BIGINT PRIMARY KEY, d DOUBLE PRECISION)");
-  CHECK(state([&] { (void)db->execute("SELECT k FROM sd WHERE d < $1", {Value{1.0}}); }) == "0A000");
+  // A feature PostgreSQL refuses as not supported: FOR UPDATE with DISTINCT.
+  CHECK(state([&] { (void)db->execute("SELECT DISTINCT n FROM s FOR UPDATE"); }) == "0A000");
   CHECK(state([&] { (void)db->execute("CREATE TABLE s (k BIGINT PRIMARY KEY)"); }) == "42P07");
   CHECK(state([&] { (void)db->execute("DROP TABLE nope"); }) == "42P01");
   CHECK(state([&] { (void)db->execute("SELECT n FROM nope WHERE k = $1", {i(1)}); }) == "42P01");
@@ -2664,6 +2671,56 @@ TEST_CASE("embedded API: SUM, AVG, MIN and MAX of a DOUBLE, and DISTINCT values,
   } catch (const ExecError& e) {
     CHECK(std::string{sqlstate(e)} == "22003");
   }
+}
+
+TEST_CASE("embedded API: a filter on a DOUBLE or REAL compares in PostgreSQL's float8 order", "[sql][api]") {
+  sql_test::TempDir dir{"api_double_compare"};
+  auto db = Database::open(dir.path());
+  auto run = [&](std::string_view sql, const std::vector<Value>& params = {}) { return db->execute(sql, params).rows; };
+  auto ids = [&](std::string_view sql, const std::vector<Value>& params = {}) {
+    std::vector<std::int64_t> out;
+    for (const auto& r : run(sql, params)) out.push_back(std::get<std::int64_t>(r[0]));
+    std::ranges::sort(out);
+    return out;
+  };
+  using Ids = std::vector<std::int64_t>;
+  const auto nan = std::numeric_limits<double>::quiet_NaN();
+  const auto inf = std::numeric_limits<double>::infinity();
+  (void)run("CREATE TABLE fc (id INTEGER PRIMARY KEY, f DOUBLE PRECISION, r REAL, g INTEGER)");
+  const std::vector<std::pair<int, std::optional<double>>> rows{{1, nan}, {2, -0.0}, {3, 0.0}, {4, 1.5}, {5, inf}, {6, -inf}, {7, {}}};
+  for (const auto& [id, f] : rows) {
+    auto v = f ? Value{*f} : kNull;
+    (void)db->execute("INSERT INTO fc VALUES ($1, $2, $3, $4)", {i(id), v, v, i(id % 2)});
+  }
+  // NaN equals NaN and is above +inf; -0.0 equals 0.0; NULL matches nothing.
+  CHECK(ids("SELECT id FROM fc WHERE f = $1", {Value{nan}}) == Ids{1});
+  CHECK(ids("SELECT id FROM fc WHERE f > $1", {Value{inf}}) == Ids{1});
+  CHECK(ids("SELECT id FROM fc WHERE f = $1", {Value{0.0}}) == Ids{2, 3});
+  CHECK(ids("SELECT id FROM fc WHERE f = $1", {Value{-0.0}}) == Ids{2, 3});
+  CHECK(ids("SELECT id FROM fc WHERE f < $1", {Value{0.0}}) == Ids{6});
+  CHECK(ids("SELECT id FROM fc WHERE f >= $1 AND id >= $2", {Value{1.0}, i(0)}) == Ids{1, 4, 5});
+  CHECK(ids("SELECT id FROM fc WHERE f <> $1", {Value{nan}}) == Ids{2, 3, 4, 5, 6});
+  CHECK(ids("SELECT id FROM fc WHERE NOT (f < $1) OR f IS NULL", {Value{1.5}}) == Ids{1, 4, 5, 7});
+  CHECK(ids("SELECT id FROM fc WHERE f BETWEEN $1 AND $2", {Value{-0.0}, Value{inf}}) == Ids{2, 3, 4, 5});
+  CHECK(ids("SELECT id FROM fc WHERE f IN ($1, $2)", {Value{nan}, Value{0.0}}) == Ids{1, 2, 3});
+  // A REAL compares the float of the parameter, as PostgreSQL types $n real.
+  (void)db->execute("UPDATE fc SET r = $1 WHERE id = $2", {Value{0.1}, i(4)});
+  CHECK(ids("SELECT id FROM fc WHERE r = $1", {Value{0.1}}) == Ids{4});
+  CHECK(ids("SELECT id FROM fc WHERE r <= $1 AND r > $2", {Value{0.1}, Value{0.0}}) == Ids{4});
+  CHECK(ids("SELECT id FROM fc WHERE r = $1", {Value{nan}}) == Ids{1});
+  // And a REAL constant, the float its text rounds to.
+  CHECK(ids("SELECT id FROM fc WHERE r = '0.1'") == Ids{4});
+  CHECK(ids("SELECT id FROM fc WHERE r IN ('0.1', 'NaN')") == Ids{1, 4});
+  // Joined: a DOUBLE equality filters the pairs, NaN with NaN and -0.0 with 0.0.
+  CHECK(run("SELECT a.id, b.id FROM fc a JOIN fc b ON a.f = b.f WHERE a.id < b.id") == Grid{{i(2), i(3)}});
+  CHECK(run("SELECT a.id, b.id FROM fc a LEFT JOIN fc b ON a.f = b.f AND a.id < b.id WHERE a.id <= $1 ORDER BY a.id", {i(3)}) ==
+        Grid{{i(1), kNull}, {i(2), i(3)}, {i(3), kNull}});
+  // HAVING on a grouped DOUBLE and on aggregates of one.
+  CHECK(run("SELECT f FROM fc GROUP BY f HAVING f > $1 ORDER BY f LIMIT 2", {Value{1.0}}) == Grid{{Value{1.5}}, {Value{inf}}});
+  CHECK(run("SELECT count(*) FROM fc GROUP BY f HAVING f >= $1", {Value{nan}}) == Grid{{i(1)}});
+  CHECK(run("SELECT g FROM fc GROUP BY g HAVING max(f) = $1", {Value{nan}}) == Grid{{i(1)}});
+  CHECK(run("SELECT g FROM fc GROUP BY g HAVING min(f) < $1", {Value{0.0}}) == Grid{{i(0)}});
+  CHECK(run("SELECT g FROM fc WHERE id >= $1 AND id <= $2 GROUP BY g HAVING sum(f) >= $3", {i(2), i(4), Value{1.5}}) == Grid{{i(0)}});
 }
 
 TEST_CASE("embedded API: the distinct values of an aggregate are held in the statement's memory and fail past it", "[sql][api][aggregate]") {

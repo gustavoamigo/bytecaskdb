@@ -341,6 +341,7 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_add_f64", fn_addr(bc_add_f64)},
       {"bc_min_f64", fn_addr(bc_min_f64)},
       {"bc_max_f64", fn_addr(bc_max_f64)},
+      {"bc_cmp_f64", fn_addr(bc_cmp_f64)},
       {"bc_bytes_eq", fn_addr(bc_bytes_eq)},
       {"bc_bytes_cmp", fn_addr(bc_bytes_cmp)},
       {"bc_bytes_prefix", fn_addr(bc_bytes_prefix)},

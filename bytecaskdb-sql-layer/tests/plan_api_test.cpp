@@ -2148,3 +2148,19 @@ TEST_CASE("plan API: a structure's loops hold the same bytes at every step, and 
   REQUIRE(held_at_step.size() == kRows);
   CHECK(std::ranges::all_of(held_at_step, [&](auto h) { return h == held_at_step.front(); }));
 }
+
+TEST_CASE("plan API: bc_cmp_f64 is PostgreSQL's float8 order: -0.0 is 0.0, NaN is NaN and above +inf", "[sql][plan_api]") {
+  constexpr auto kNan = std::numeric_limits<double>::quiet_NaN();
+  constexpr auto kInf = std::numeric_limits<double>::infinity();
+  CHECK(bc_cmp_f64(1.0, 2.0) == -1);
+  CHECK(bc_cmp_f64(2.0, 1.0) == 1);
+  CHECK(bc_cmp_f64(1.5, 1.5) == 0);
+  CHECK(bc_cmp_f64(-0.0, 0.0) == 0);
+  CHECK(bc_cmp_f64(0.0, -0.0) == 0);
+  CHECK(bc_cmp_f64(kNan, kNan) == 0);
+  CHECK(bc_cmp_f64(-kNan, kNan) == 0);  // every NaN is one value
+  CHECK(bc_cmp_f64(kNan, kInf) == 1);
+  CHECK(bc_cmp_f64(kInf, kNan) == -1);
+  CHECK(bc_cmp_f64(-kInf, -1e308) == -1);
+  CHECK(bc_cmp_f64(kNan, -kInf) == 1);
+}

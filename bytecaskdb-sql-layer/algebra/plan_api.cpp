@@ -5439,6 +5439,8 @@ double bc_add_f64(bc_ctx* cx, double a, double b) {
 // As float8smaller and float8larger: of equal values (-0.0 and 0.0) the second.
 double bc_min_f64(double a, double b) { return less_f64(a, b) ? a : b; }
 double bc_max_f64(double a, double b) { return less_f64(b, a) ? a : b; }
+// As float8_cmp_internal: NaN equals NaN and is above every other value.
+int bc_cmp_f64(double a, double b) { return less_f64(a, b) ? -1 : less_f64(b, a) ? 1 : 0; }
 void bc_agg_add_f64(bc_ctx* cx, bc_group g, uint32_t slot, double v) {
   BC_GUARD_BEGIN
   auto* s = fold_slot(cx, g, slot, SlotKind::SumF64);

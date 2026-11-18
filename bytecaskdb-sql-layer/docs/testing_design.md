@@ -143,12 +143,8 @@ The rules, by what they test.
   now and then, one item's `NULLS FIRST` or `LAST` now and then; or of one
   to three of any columns, each `ASC` or `DESC`, `NULLS FIRST`, `LAST` or
   neither, which a sort mostly gives; maybe a `LIMIT`. Now and then no key
-  conjunct at all, only filters or none: a full scan. A model of the
-  planner (`served`) says whether some plan serves it: if not, the layer
-  must refuse it with `no plan:` and SQLSTATE 0A000, and PostgreSQL is not
-  asked. It refuses only a filter on a DOUBLE or REAL column no key takes,
-  and a `HAVING` on a grouped one. If it does,
-  the rows are compared in `ORDER BY` order, as a multiset within each run
+  conjunct at all, only filters or none: a full scan. The planner serves
+  every one, a filter on a DOUBLE or REAL column included; the rows are compared in `ORDER BY` order, as a multiset within each run
   of equal sort keys, and a run the `LIMIT` cuts must be drawn from
   PostgreSQL's (`oracle.same_rows`, against PostgreSQL's rows without the
   `LIMIT`).
@@ -183,13 +179,12 @@ The rules, by what they test.
 - **UPDATE and DELETE by a key**: the same `WHERE` as `SELECT`, every row
   it matches; the `UPDATE` sets a non-key column to a parameter, or adds
   one to or subtracts one from a SMALLINT, INTEGER or NUMERIC(6, 2) column
-  no unique index holds. `served` decides whether the layer plans it, as
-  for a `SELECT` without `ORDER BY`; the counts must agree.
+  no unique index holds. The counts must agree.
 
 **Filters, computed bounds and joins on a column:**
 - **Filters**: zero to two conjuncts on any column, by any operator, beside
-  the key's, in `SELECT`, `UPDATE` and `DELETE`. `served` refuses one on a
-  DOUBLE or REAL column.
+  the key's, in `SELECT`, `UPDATE` and `DELETE`, a DOUBLE or REAL one
+  compared in float8 order (NaN and `-0.0` among the values).
 - **$n ± k**: now and then an INTEGER conjunct's operand is `$n + k`, k
   from -30 to 30, mostly the same value; PostgreSQL's side writes
   `$n::integer + k`. Compared by `=`, it is a filter.
@@ -198,9 +193,8 @@ The rules, by what they test.
   to a column of the first of its type or to a parameter, the first's
   conjuncts from a key path, maybe a filter on the second; targets with a
   `LIMIT`, or `COUNT(DISTINCT)` of either table's column, and now and then
-  an `ORDER BY` of either table's columns. `join_served` says whether
-  either table can be the outer one; where no key reaches either table, a
-  hash join or a nested loop reading one once per row of the other serves
+  an `ORDER BY` of either table's columns. Where no key reaches either
+  table, a hash join or a nested loop reading one once per row of the other serves
   it, whatever its `ORDER BY`.
 - **A join no key reaches**: two tables, each scanned by parameters or in
   full, linked by up to two equalities of columns of one type, key

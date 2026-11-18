@@ -678,6 +678,7 @@ double  bc_i64_to_f64(int64_t);                 /* always defined */
 double  bc_add_f64(bc_ctx *, double, double);   /* PostgreSQL's float8 sum: finite operands that overflow → error */
 double  bc_min_f64(double, double);             /* PostgreSQL's order: NaN above +inf; of equal values the second */
 double  bc_max_f64(double, double);
+int     bc_cmp_f64(double, double);              /* -1, 0 or 1: float8 order, -0.0 = 0.0, NaN = NaN above +inf */
 bool    bc_bytes_eq(bc_ctx *, bc_view, bc_view);
 int     bc_bytes_cmp(bc_ctx *, bc_view, bc_view);       /* memcmp order */
 bool    bc_bytes_prefix(bc_ctx *, bc_view prefix, bc_view);
@@ -730,6 +731,12 @@ infinity or NaN carries through. `bc_min_f64` and `bc_max_f64` order as
 PostgreSQL's `float8` does, NaN above every number and `-0.0` equal to
 `0.0`; of equal values they return the second, as `float8smaller` and
 `float8larger` do. They allocate nothing and cannot fail.
+
+`bc_cmp_f64` is PostgreSQL's `float8_cmp_internal`: -1, 0 or 1 in the same
+order, so `-0.0` equals `0.0` and NaN equals NaN and is above every other
+value. A filter on a DOUBLE or REAL column compares by it
+(`bc_cmp_f64(a, b) < 0` for `a < b`); C's operators would make NaN equal to
+nothing and below nothing. It allocates nothing and cannot fail.
 
 `bc_check_int` is the range check of a computed integer: it returns `v` when it is inside the SQL type the
 compiler resolved, `BC_SMALLINT` or `BC_INTEGER`, and otherwise sets

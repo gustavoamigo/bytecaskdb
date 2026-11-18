@@ -266,6 +266,7 @@ double  bc_i64_to_f64(int64_t);                 /* always defined */
 double  bc_add_f64(bc_ctx *, double, double);   /* PostgreSQL's float8 sum: finite operands that overflow → error */
 double  bc_min_f64(double, double);             /* PostgreSQL's order: NaN above +inf; of equal values (-0.0, 0.0) the second, as float8smaller */
 double  bc_max_f64(double, double);
+int     bc_cmp_f64(double, double);              /* -1, 0 or 1 in PostgreSQL's float8 order: -0.0 = 0.0, NaN = NaN and above +inf */
 bool    bc_bytes_eq(bc_ctx *, bc_view, bc_view);
 int     bc_bytes_cmp(bc_ctx *, bc_view, bc_view);       /* memcmp order */
 bool    bc_bytes_prefix(bc_ctx *, bc_view prefix, bc_view);

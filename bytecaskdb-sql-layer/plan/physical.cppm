@@ -202,8 +202,8 @@ struct Choice {
 };
 
 // The rows every conjunct holds for, run as soon as the row is read. NULL
-// on either side of a comparison rejects the row. Never on a DOUBLE or REAL
-// column.
+// on either side of a comparison rejects the row. A DOUBLE or REAL compares
+// in PostgreSQL's float8 order, the row's value, never a key's.
 struct Filter {
   NodePtr input;
   std::vector<Expr> conjuncts;
@@ -711,7 +711,7 @@ private:
   }
 
   // A predicate filter: AND, OR and NOT of comparisons of a column with a
-  // parameter, a constant or a column of the same type, none of a DOUBLE, and
+  // parameter, a constant or a column of the same type, and
   // IS NULL of a column. It reads rows in hand: the tables `here` gives rows
   // to, and those of the loops outside it (outer_).
   void predicate(const Expr& e, const std::vector<std::uint32_t>& here) const {
@@ -749,10 +749,10 @@ private:
         reads(e);
         return;
       case Expr::Kind::Compare:
-        if (e.args[0].kind != Expr::Kind::Column || e.args[0].col.type == PhysType::F64 ||
+        if (e.args[0].kind != Expr::Kind::Column ||
             (e.args[1].kind != Expr::Kind::Param && e.args[1].kind != Expr::Kind::Const &&
              (e.args[1].kind != Expr::Kind::Column || e.args[1].col.type != e.args[0].col.type))) {
-          broken("a predicate's comparison other than of a column, not a DOUBLE, with a parameter or a column of its type");
+          broken("a predicate's comparison other than of a column with a parameter or a column of its type");
         }
         params(e.args[1]);
         reads(e);
@@ -1107,9 +1107,6 @@ private:
                 continue;
               }
               if (c.kind != Expr::Kind::Compare) continue;
-              if (c.args[0].kind == Expr::Kind::Column && c.args[0].col.type == PhysType::F64) {
-                broken("a match conjunct on a DOUBLE column");
-              }
               operand(c.args[1], c.args[0].col.table);
               reads(c);
             }
@@ -1226,7 +1223,6 @@ private:
                 auto known = lhs.kind == Expr::Kind::Column ? std::ranges::find(columns, lhs.col) != columns.end()
                                                             : std::ranges::find(g->aggs, lhs) != g->aggs.end();
                 if (!known || c.args[1].kind != Expr::Kind::Param) broken("a HAVING that compares no key or aggregate of its groups");
-                if (lhs.kind == Expr::Kind::Column && lhs.col.type == PhysType::F64) broken("a filter on a DOUBLE column");
                 params(c);
               }
               node(*op.input, &n);
@@ -1239,9 +1235,6 @@ private:
                 continue;
               }
               if (c.kind != Expr::Kind::Compare) continue;
-              if (c.args[0].kind == Expr::Kind::Column && c.args[0].col.type == PhysType::F64) {
-                broken("a filter on a DOUBLE column");
-              }
               operand(c.args[1], c.args[0].col.table);
               reads(c);
             }

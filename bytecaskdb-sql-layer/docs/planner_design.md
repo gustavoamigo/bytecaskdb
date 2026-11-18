@@ -84,8 +84,7 @@ statement's own (`frontend_design.md`, *Literals*). A predicate (`And`,
 `Or`, `Not` of comparisons, and `IsNull` of a column) is a conjunct of its
 own: the search keeps a table's predicates apart from its comparisons
 (`Rel::preds`), no access path takes one, and each is a filter after the
-path's, refused (`no plan:`) where it compares a REAL or DOUBLE column, as a
-comparison is. Codegen prints one as two C conditions, true and false, SQL's
+path's. Codegen prints one as two C conditions, true and false, SQL's
 three-valued logic with unknown neither. In a select list the same kinds
 are values (*Expressions over columns*). The
 binder's own rules are the frontend's: one SQL type per `$n`, and the
@@ -214,7 +213,8 @@ from each set of k − 1 and one more table, read one of four ways:
   the outer side is not at most one row.
 
 The join's conjuncts between the new table and those already read filter
-its rows, or the pairs, refused on a DOUBLE or REAL column alike. Bushy
+its rows, or the pairs, a DOUBLE or REAL column's alike (*Filters on DOUBLE
+and REAL columns*). Bushy
 trees and merge joins wait for a workload that needs them. Sets are bit
 masks of up to 32 tables; the front end takes eight, which bounds the
 search to 255 sets (*Joins of several tables*).
@@ -677,8 +677,10 @@ physical values, and a part of one physical type gives equal values equal
 bytes, read from a row or from a covering scan's entry. A row with a NULL
 in any join column is neither put nor probed, since `=` never holds for
 NULL; a probe side sorted before it probes drops it before the sorter, so
-it is neither copied nor charged. A join column of type DOUBLE PRECISION or
-REAL is refused, as a nested loop's is.
+it is neither copied nor charged. An equality of DOUBLE PRECISION or REAL
+columns is no hash key: float8's `=` holds `-0.0` equal to `0.0` and every
+NaN equal, which bytes don't. It filters the pairs, as any other conjunct
+does, and a join with no other equality is no hash join.
 
 **Codegen.** The build side's loop, in a block of its own, builds each
 row's key and puts the row. Then the probe side's loop builds its key,
@@ -768,8 +770,7 @@ no equality keys the inner table, the comparison filters the pairs of a
 nested loop. A predicate over two tables' columns (`NOT (a.x = b.y)`, `OR`,
 `IS NULL` among comparisons) is a `Cross`: a filter of the pairs, run by the
 step that reads the last of its tables, or an outer join's `ON`, by that
-join's own step, as a match. It is refused on a DOUBLE or REAL column like
-any filter. `physical::check` takes such a predicate only over rows in hand
+join's own step, as a match. `physical::check` takes such a predicate only over rows in hand
 (the loops' tables and the outer side's), so a plan that evaluated it early
 would not be printed.
 
@@ -1314,22 +1315,36 @@ results to the client is part of the transport design.
 Plans are only ever ours and are regenerated from SQL, so changing these
 signatures broke no stored plan.
 
+## Filters on DOUBLE and REAL columns
+
+A comparison on a DOUBLE PRECISION or REAL column that no key takes is a
+filter, of the row's value: in a `WHERE`, an `ON`, a predicate, a join's
+pairs, an outer join's match and a `HAVING` (a grouped REAL or DOUBLE PRECISION column, or
+`SUM`, `MIN` or `MAX` of a DOUBLE PRECISION one: those aggregates of a REAL
+are refused). Codegen prints it as `bc_cmp_f64(a, b) op 0`, which
+is PostgreSQL's `float8_cmp_internal`: `-0.0` equals `0.0`, NaN equals NaN
+and is above every other value, `+inf` included; one `compare_text` helper
+prints it for a filter, a predicate, a `HAVING` and a comparison as a value.
+A key range compares in the same order, as the key encoding writes `-0.0`
+as `0.0` and every NaN as one, so a key and a filter agree.
+
+What stays out: a DOUBLE as a hash key (*Hash joins*), and a DOUBLE read
+from a key (a covering scan reads its row: the key's `-0.0` is `0.0` and its
+NaN canonical). A REAL compares the float its operand rounds to, as
+PostgreSQL types the operand float4: the binder rounds a constant
+(`Binder::fixed`), and the API a `$n` compared with a REAL column
+(`Database::plan_params`), so `real_col = $1` with `$1 = 0.1` matches the
+row written with 0.1. A subquery's set (`bc_sub_has_f64`) keys `-0.0` as
+`0.0` and every NaN as one, the same equality.
+
 ## What the search refuses
 
-A statement is refused only when no plan computes it: the search tries
-every plan, and records each failure where it happens, with the plan it
-stops (an access path, or a step that adds a table to a set). A plan that
-fails is carried on as far as its tables reach, so a failure counts only
-when its plan reaches every table. Where plans fail for different reasons,
-the refusal is the first one of the furthest stage a plan of every table
-reached.
+Every statement of the dialect has a plan: every table has a full scan, a
+join a nested loop, and every conjunct no key takes is a filter, a DOUBLE
+or REAL one included (*Filters on DOUBLE and REAL columns*). The search
+keeps no failed plans.
 
-| # | Refused | Message |
-|---|---|---|
-| 1 | Every plan leaves a filter, a join conjunct or a hash key on a DOUBLE or REAL column | `no plan: a filter on column "<column>", a REAL or DOUBLE PRECISION, is not supported yet` |
-| 2 | A `HAVING` comparison on a grouped DOUBLE or REAL column | the same message |
-
-The refusal is a `FeatureNotSupported`, SQLSTATE 0A000, whose message
+The planner's refusal is a `FeatureNotSupported`, SQLSTATE 0A000, whose message
 starts `no plan:`, raised after binding and before anything runs. It
 carries no position: the search works on the logical plan, which keeps
 none. A logical plan the search can't use, which today's binder never
@@ -1350,10 +1365,9 @@ with uncompilable C:
   `HAVING` conjunct that does not compare a grouped column or an aggregate
   with a parameter.
 
-PostgreSQL runs each of these; they are the entry of `frontend_design.md`'s
-*Known differences* that is a feature gap. A table no key reaches, an
-`ORDER BY` no index gives, an `ORDER BY` on a join, any NULL placement, a
-join no key reaches and an `ORDER BY` over a plan of two loops are planned.
+A table no key reaches, an `ORDER BY` no index gives, an `ORDER BY` on a
+join, any NULL placement, a join no key reaches and an `ORDER BY` over a
+plan of two loops are planned.
 
 ## Tests
 
@@ -1422,8 +1436,8 @@ join no key reaches and an `ORDER BY` over a plan of two loops are planned.
   and of an argument not held as `I64`.
 - **Codegen** (`codegen_test`): bound forms, writes of many rows, `MIN`
   from its first entry past the NULLs or by a loop as one group, `SUM` by a
-  loop, `DOUBLE` columns read from rows, refusals with their messages, and
-  `FOR UPDATE`.
+  loop, `DOUBLE` columns read from rows and compared by `bc_cmp_f64`,
+  refusals with their messages, and `FOR UPDATE`.
 - **The budget at run time** (`api_transaction_test`): a sort compiled at
   10 rows under 64 KiB, run at 1,000, takes the index in its order; a hash
   join compiled at 20 rows of its build side counts its range by its rows'
@@ -1448,8 +1462,11 @@ join no key reaches and an `ORDER BY` over a plan of two loops are planned.
   aggregates, a `HAVING` reusing the `WHERE`'s `$n` on an integral column,
   a `NUMERIC(18, 0)` among them (`having_reuses_a_parameter`); no `GROUP
   BY` with several aggregates; and grouped joins (`group_by`,
-  `group_by_join`). Its models `served` and `join_served` say whether some
-  plan serves a statement: what they don't serve is the `DOUBLE` filter.
+  `group_by_join`). Every statement it draws is planned: a planner refusal
+  fails the step. A DOUBLE or REAL is filtered on as any column is
+  (`test_filters_on_double_and_real_agree_with_postgresql`: NaN, `-0.0`,
+  infinities and a REAL's rounded `$n`, by key, by filter, joined and
+  grouped).
   Fixed cases: `test_joins_of_several_tables_with_themselves_and_on_any_comparison`
   (three or more tables, a table with itself, any comparison, a chain of
   left joins, through the layer, the server and every costed plan), `test_both_plans_of_a_choice_point_agree`,
