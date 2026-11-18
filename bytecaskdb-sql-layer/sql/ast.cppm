@@ -132,6 +132,7 @@ struct Compare {
   std::shared_ptr<const Select> subquery;  // Exists, Quantified
   ValueCompare quantified{ValueCompare::Eq};
   bool all{false};
+  bool ne{false};  // Compare, Eq: written <> (or !=), under its NOT; an error names <>
 };
 
 // A copy of e, which owns its operands: what BETWEEN and IN repeat.
@@ -342,6 +343,7 @@ struct SetOperation {
   out.subquery = c.subquery;
   out.quantified = c.quantified;
   out.all = c.all;
+  out.ne = c.ne;
   return out;
 }
 

@@ -746,11 +746,37 @@ are one instant.
   midnight, is refused. A column's `DEFAULT` of the clock is the same
   assignment, made where the `INSERT` leaves the column out or writes
   `DEFAULT` (`catalog_design.md`, *What a table records*).
+- **Compared in a `WHERE`.** A column compared with the time, on either
+  side, inside `AND`, `OR` and `NOT`, in a `SELECT`'s, `UPDATE`'s,
+  `DELETE`'s or subquery's `WHERE`, is a comparison with a parameter of
+  the column's type that the API fills on every run, so the plan's key
+  range is the run's. The pairs are:
+  - a `DATE` with `CURRENT_DATE`, a `TIME` with `LOCALTIME`;
+  - a `TIMESTAMP` or `TIMESTAMPTZ` with `CURRENT_TIMESTAMP`, `now()` or
+    `LOCALTIMESTAMP`. PostgreSQL compares a timestamp with a timestamptz
+    in the session's time zone; the layer's is UTC, so the two are the
+    same instant and the comparison is the plain one.
+
+  A pair PostgreSQL has no operator for (an integer or a text with any of
+  them, a `TIME` with a date or a timestamp, a `DATE` with `LOCALTIME`)
+  is 42883, its types named in the order written and its operator as
+  written: the parser writes `<>` and `!=` as `NOT (=)`, and the
+  comparison under that `NOT` remembers it was a `<>`
+  (`ast::Compare::ne`), as a typed constant's 42883 does. A `DATE` with a
+  timestamp, or a timestamp with `CURRENT_DATE`, compares the date's
+  midnight and is refused (42601).
+- **The placeholder.** The value a clock slot holds in the bound
+  statement is 0, a placeholder: nothing folds it or checks it as the
+  statement's value.
 - **Refused.** `CURRENT_TIME` is `time with time zone`, a type the layer
   lacks: refused with 42601, not read as `LOCALTIME`. Also refused: the
-  time in a `WHERE` or inside an aggregated select list, `ADD COLUMN` with
-  a `DEFAULT` of the clock, and `USER` and the other SQL value
-  functions.
+  time inside an aggregated select list, in a value expression of a
+  `WHERE` (`d < CURRENT_DATE - 1`), compared in a `WHERE` with anything
+  but a column (a constant, a parameter or the time:
+  `CURRENT_DATE > DATE '2020-01-01'`, `$1 < CURRENT_DATE`), in a
+  procedure's statement (0A000 at the first call,
+  `procedures_design.md`), `ADD COLUMN` with a `DEFAULT` of the clock, and
+  `USER` and the other SQL value functions.
 
 ### Expressions over columns
 

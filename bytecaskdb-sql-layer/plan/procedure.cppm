@@ -222,7 +222,7 @@ private:
     sp.params = st.bound.params;
     sp.fixed = st.bound.fixed;
     sp.views = st.bound.views;
-    if (!st.bound.clocks.empty()) refuse("CURRENT_DATE, LOCALTIME and LOCALTIMESTAMP in a procedure's statement");
+    if (!st.bound.clocks.empty()) refuse("the time (CURRENT_DATE, CURRENT_TIMESTAMP, now(), LOCALTIME, LOCALTIMESTAMP) in a procedure's statement");
     sp.param_vars = std::move(st.param_vars);
     sp.into = x.into;
     sp.strict = x.strict;

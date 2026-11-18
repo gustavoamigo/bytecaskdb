@@ -173,13 +173,13 @@
 
 - name: CURRENT_DATE has no row to compare, but is a DATE
   features: [F051-06]
-  # expression not supported
-  unimplemented: true
   setup:
     - CREATE TABLE dt (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)
   steps:
+    # Row 1 is after any date the suite runs on, so the result does not
+    # depend on the run date.
     - sql: INSERT INTO dt VALUES ($1, $2, $3)
-      params: [1, "2026-10-25", "2026-10-25 12:00:00"]
+      params: [1, "2999-10-25", "2999-10-25 12:00:00"]
       rowcount: 1
     - sql: INSERT INTO dt VALUES ($1, $2, $3)
       params: [2, "2026-02-28", "2026-02-28 23:59:59.999999"]

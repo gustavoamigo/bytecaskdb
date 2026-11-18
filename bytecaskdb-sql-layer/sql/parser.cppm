@@ -463,7 +463,11 @@ auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t p
     case PG_QUERY__A__EXPR__KIND__AEXPR_OP: {
       if (a->n_name != 1 || a->lexpr == nullptr) break;
       auto op = str(a->name[0]);
-      if (op == "<>") return negated(compare_of(Compare::Op::Eq, expr(a->lexpr), expr(a->rexpr), a->location, on));
+      if (op == "<>") {
+        auto eq = compare_of(Compare::Op::Eq, expr(a->lexpr), expr(a->rexpr), a->location, on);
+        eq.ne = true;
+        return negated(std::move(eq));
+      }
       return compare_of(compare_op(op, a->location), expr(a->lexpr), expr(a->rexpr), a->location, on);
     }
     case PG_QUERY__A__EXPR__KIND__AEXPR_BETWEEN:
