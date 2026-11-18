@@ -1260,6 +1260,30 @@ TEST_CASE("embedded API: a statement describes its parameters, result and comman
   CHECK(db->prepare("DROP TABLE a").command() == Command::DropTable);
 }
 
+TEST_CASE("embedded API: $n::T in a SELECT without FROM is of type T and range-checked as one", "[sql][api]") {
+  sql_test::TempDir dir{"api_param_cast"};
+  auto db = Database::open(dir.path());
+  const auto& q = db->prepare("SELECT $1::integer, $1::integer + 1");
+  REQUIRE(q.params().size() == 1);
+  CHECK(q.params()[0].type == SqlType{SqlKind::Integer});
+  REQUIRE(q.columns().size() == 2);
+  CHECK(q.columns()[0].name == "int4");
+  CHECK(q.columns()[1].name == "?column?");
+  CHECK(db->execute("SELECT $1::integer, $1::integer + 1", {i(41)}).rows == Grid{{i(41), i(42)}});
+  CHECK(db->execute("SELECT $1::integer + 1", {kNull}).rows == Grid{{kNull}});
+  auto state = [&](std::int64_t v) -> std::string {
+    try {
+      (void)db->execute("SELECT $1::integer + 1", {i(v)});
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  CHECK(state(2147483646) == "ran");
+  CHECK(state(2147483647) == "22003");  // the sum
+  CHECK(state(2147483648) == "22003");  // $1 itself
+}
+
 TEST_CASE("embedded API: sqlstate reports PostgreSQL's SQLSTATE for each error", "[sql][api][server]") {
   sql_test::TempDir dir{"api_sqlstate"};
   auto db = Database::open(dir.path());

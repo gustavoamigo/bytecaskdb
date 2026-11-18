@@ -441,6 +441,21 @@ def test_literals_are_no_parameters_and_their_columns_have_postgresqls_types(ser
     assert data(run(c, sql)) == [["2016-03-26", "t", "5"]]
 
 
+def test_a_parameter_cast_in_a_select_without_from_takes_the_cast_s_type(server):
+    c = connect(server)
+    sql = "SELECT $1::integer, $1::integer + 1"
+    c.send(parse(sql, "q"), describe("S", "q"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"1tTZ"
+    assert struct.unpack("!hi", out[1][1]) == (1, 23)  # $1 is an INTEGER, as its cast types it
+    assert row_description(out[2][1]) == [("int4", 23), ("?column?", 23)]
+    assert data(run(c, sql, ["41"])) == [["41", "42"]]
+    assert data(run(c, sql, [None])) == [[None, None]]
+    assert states(run(c, sql, ["2147483647"])) == ["22003"]  # the sum is past INTEGER
+    assert states(run(c, sql, ["2147483648"])) == ["22003"]  # $1 is
+    assert states(run(c, sql, ["x"])) == ["22P02"]
+
+
 def test_a_parameter_its_type_does_not_take_is_22p02(server):
     c = connect(server)
     table(c)

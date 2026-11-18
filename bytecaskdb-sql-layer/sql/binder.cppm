@@ -2281,7 +2281,18 @@ public:
       case K::Star: throw SqlError{"syntax error at or near \"*\"", e.pos};
       case K::Plus:
       case K::Neg: return sign_value(e, resolve);
-      case K::Cast: not_yet("a cast of other than a constant", e.pos);
+      case K::Cast: {
+        // $n::T types $n as T, as PostgreSQL types an untyped $n by its
+        // cast; a cast of anything else that is not a constant is not
+        // taken yet.
+        if (!param_cast(e)) not_yet("a cast of other than a constant or a parameter", e.pos);
+        if (modified_cast(e)) not_yet("a cast of a parameter to DECIMAL, VARCHAR(n) or CHAR(n)", e.pos);
+        auto as = cast_type(e);
+        const auto& col =
+            typed_params_.emplace_back(Column{0, "$" + std::to_string(e.rhs->param + 1), as, phys_type(as), true, std::monostate{}});
+        use_param(e.rhs->param, phys_type(as), e.rhs->pos, col, 0, Use::Operand);
+        return logical::param(e.rhs->param, as);
+      }
       case K::Case:
       case K::Coalesce:
       case K::NullIf: return conditional_value(e, resolve);
@@ -3090,6 +3101,8 @@ public:
       if (auto why = out_of_range(target.sql, v)) out_of_type(*why, k.pos);
       return fixed(std::move(v), target.sql);
     }
+    // $n::T assigned to a column of type T binds as $n, as in a WHERE.
+    if (param_cast(e)) return value(t, *uncast_param(&e, target), target);
     switch (e.kind) {
       case ast::Expr::Kind::Param:
         use_param(e.param, want, e.pos, target, t.id, Use::Assigned);
@@ -3139,7 +3152,7 @@ public:
       case ast::Expr::Kind::Not:
       case ast::Expr::Kind::And:
       case ast::Expr::Kind::Or: not_yet("IS NULL, AND, OR and NOT of other than constants as a value", e.pos);
-      case ast::Expr::Kind::Cast: not_yet("a cast of other than a constant", e.pos);
+      case ast::Expr::Kind::Cast: not_yet("a cast of other than a constant or a parameter", e.pos);
       case ast::Expr::Kind::Clock: {
         auto d = clock_default(e.func, e.constant, target.sql, target.name, e.pos);
         return clock_reading(d, target);
@@ -3312,10 +3325,18 @@ public:
   // VARCHAR(n) or CHAR(n), whose casts round, cut or pad to the modifier.
   static auto uncast_param(const ast::Expr* e, const Column& c) -> const ast::Expr* {
     if (!param_cast(*e)) return e;
-    auto t = sql_type(ast::ColumnDefAst{"", e->cast_type, e->cast_typmods, false, false, std::nullopt, e->pos, {}});
-    auto modified = t.kind == SqlKind::Decimal || t.kind == SqlKind::Varchar || t.kind == SqlKind::Char;
-    if (t.kind != c.sql.kind || modified) not_yet("a cast of a parameter to other than its column's type", e->pos);
+    if (modified_cast(*e) || cast_type(*e).kind != c.sql.kind) not_yet("a cast of a parameter to other than its column's type", e->pos);
     return e->rhs.get();
+  }
+
+  // A cast to DECIMAL, VARCHAR(n) or CHAR(n), which rounds, cuts or pads
+  // to the modifier: a parameter cast to one is not taken yet.
+  static auto modified_cast(const ast::Expr& e) -> bool {
+    return e.cast_type == "numeric" || e.cast_type == "bpchar" || (e.cast_type == "varchar" && !e.cast_typmods.empty());
+  }
+
+  static auto cast_type(const ast::Expr& e) -> SqlType {
+    return sql_type(ast::ColumnDefAst{"", e.cast_type, e.cast_typmods, false, false, std::nullopt, e.pos, {}});
   }
 
   // One WHERE conjunct as column <op> operand, the column resolved by
@@ -3942,7 +3963,7 @@ public:
 
   // A select-list item of no aggregated query, named as PostgreSQL names
   // it: a column by its name, a CASE, COALESCE or NULLIF by the word, a
-  // function by its own, any other expression ?column?.
+  // function by its own, $n::T by its type, any other expression ?column?.
   auto plain_output(const ast::Expr& e, const Resolve& resolve) -> logical::Output {
     if (e.kind == ast::Expr::Kind::Clock) return clock(e);
     if (e.kind == ast::Expr::Kind::Subquery) return subquery_output(e);
@@ -3951,7 +3972,8 @@ public:
       auto name = e.kind == ast::Expr::Kind::Case                       ? std::string{"case"}
                   : e.kind == ast::Expr::Kind::Coalesce                 ? std::string{"coalesce"}
                   : e.kind == ast::Expr::Kind::NullIf                   ? std::string{"nullif"}
-                  : e.kind == ast::Expr::Kind::Func && e.func != "||" ? e.func
+                  : e.kind == ast::Expr::Kind::Func && e.func != "||" && e.func != "%" ? e.func
+                  : param_cast(e)                                       ? e.cast_type
                                                                         : std::string{"?column?"};
       return {value(e, resolve), name};
     }
@@ -4034,8 +4056,9 @@ public:
     return out;
   }
 
-  // A SELECT without FROM: its constants, one row of them, under its LIMIT.
-  // A column is a column of no table (42703), as in PostgreSQL.
+  // A SELECT without FROM: one row of its items, under its LIMIT. An item
+  // is any select-list expression with no column in it: a column is a
+  // column of no table (42703), as in PostgreSQL.
   auto select_without_from(const ast::Select& s) -> logical::NodePtr {
     for (const auto& e : s.targets) {
       if (e.kind == ast::Expr::Kind::Star) throw SqlError{"SELECT * with no tables specified is not valid", e.pos};
@@ -4043,22 +4066,12 @@ public:
     if (!s.where.empty() || !s.group_by.empty() || !s.having.empty() || !s.order_by.empty() || s.for_update) {
       not_yet("a SELECT without FROM with WHERE, GROUP BY, HAVING, ORDER BY or FOR UPDATE", s.pos);
     }
+    Resolve no_table = [](const ast::Expr& e) -> std::pair<const Table*, const Column*> {
+      if (!e.table.empty()) throw SqlError{"missing FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable};
+      throw SqlError{"column \"" + e.column + "\" does not exist", e.pos, kUndefinedColumn};
+    };
     std::vector<logical::Output> targets;
-    for (const auto& e : s.targets) {
-      if (e.kind == ast::Expr::Kind::Column) {
-        throw SqlError{"column \"" + e.column + "\" does not exist", e.pos, kUndefinedColumn};
-      }
-      if (e.kind == ast::Expr::Kind::Subquery) {
-        targets.push_back(subquery_output(e));
-        continue;
-      }
-      if (e.kind == ast::Expr::Kind::Clock) {
-        targets.push_back(clock(e));
-        continue;
-      }
-      if (!is_constant(e)) not_yet("a SELECT without FROM of other than constants and subqueries", e.pos);
-      targets.push_back(constant_output(e));
-    }
+    for (const auto& e : s.targets) targets.push_back(plain_output(e, no_table));
     named(s.targets, targets);
     auto rows = logical::node(logical::Project{logical::node(logical::OneRow{}), std::move(targets)});
     rows = limited(std::move(rows), s);
