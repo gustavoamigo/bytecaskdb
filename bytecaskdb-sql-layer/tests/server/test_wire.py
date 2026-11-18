@@ -668,6 +668,21 @@ def test_a_ddl_that_if_exists_skips_sends_postgresqls_notice_before_its_tag(serv
     assert b"N" not in [k for k, _ in c.until_ready()]
 
 
+def test_insert_select_answers_insert_0_n_and_takes_its_querys_parameters(server):
+    c = connect(server)
+    for sql in ("CREATE TABLE ins_src (id INTEGER PRIMARY KEY, v TEXT)", "INSERT INTO ins_src VALUES (1, 'a'), (2, 'b')",
+                "CREATE TABLE ins_dst (id INTEGER, v TEXT)"):
+        c.send(query(sql))
+        c.until_ready()
+    c.send(query("INSERT INTO ins_dst SELECT * FROM ins_src"))
+    assert fields_tag(c.until_ready()) == "INSERT 0 2"
+    c.send(parse("INSERT INTO ins_dst (v, id) SELECT $1, id FROM ins_src WHERE id = $2") + bind(["z", "2"]) + execute() + SYNC)
+    assert fields_tag(c.until_ready()) == "INSERT 0 1"
+    c.send(query("INSERT INTO ins_dst SELECT * FROM ins_src WHERE id > 5"))
+    assert fields_tag(c.until_ready()) == "INSERT 0 0"
+    assert data(run(c, "SELECT id, v FROM ins_dst WHERE v = $1", ["z"])) == [["2", "z"]]
+
+
 def test_create_table_as_and_select_into_answer_postgresqls_tags_with_no_row_description(server):
     c = connect(server)
     c.send(query("CREATE TABLE ctas_src (id INTEGER PRIMARY KEY, v TEXT)"))

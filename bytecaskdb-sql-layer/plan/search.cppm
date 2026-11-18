@@ -153,7 +153,7 @@ using Conjuncts = std::vector<Expr>;
 // An operator's name, for a refusal of a shape the search does not plan.
 auto op_name(const logical::Node& n) -> std::string {
   constexpr const char* kNames[] = {"Get",  "Empty", "OneRow", "Filter", "Project", "Join",  "Aggregate",
-                                    "Sort", "Limit", "SetOp", "Insert", "Update", "Delete"};
+                                    "Sort", "Limit", "SetOp", "Insert", "InsertFrom", "Update", "Delete"};
   static_assert(std::size(kNames) == std::variant_size_v<decltype(n.op)>);
   return kNames[n.op.index()];
 }
@@ -776,6 +776,31 @@ private:
             }
             std::vector<Finished> out;
             out.push_back({physical::node(std::move(ins)), {}, {}, 1});
+            return out;
+          } else if constexpr (std::is_same_v<T, logical::InsertFrom>) {
+            // The query's plans, each a SELECT's, written into the table.
+            constants(*op.table);
+            auto out = select(*op.input);
+            auto returning = returned(op.returning);
+            // Each column with its declared type and the type of the
+            // query's value for it, which check proves assigns.
+            const auto* rows = op.input.get();
+            while (std::holds_alternative<logical::Limit>(rows->op) || std::holds_alternative<logical::Sort>(rows->op)) {
+              rows = logical::input_of(*rows)->get();
+            }
+            const auto* project = std::get_if<logical::Project>(&rows->op);
+            if (project == nullptr || project->exprs.size() != op.columns.size()) {
+              no_plan("an insert of a query that is not a SELECT of its columns");
+            }
+            std::vector<physical::InsertFrom::Filled> filled;
+            for (std::size_t i = 0; i < op.columns.size(); ++i) {
+              const auto& c = op.columns[i];
+              filled.push_back({c, op.table->column(c.col)->sql, project->exprs[i].expr.type});
+            }
+            for (auto& f : out) {
+              if (!std::holds_alternative<physical::Emit>(f.root->op)) no_plan("an insert of a query whose rows are not an Emit's");
+              f.root = physical::node(physical::InsertFrom{std::move(f.root), op.table->id, filled, op.fixed, op.checks, returning});
+            }
             return out;
           } else if constexpr (std::is_same_v<T, logical::Update>) {
             constants(*op.table);

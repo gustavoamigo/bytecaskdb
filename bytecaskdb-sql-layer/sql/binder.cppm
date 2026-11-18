@@ -452,6 +452,11 @@ auto pg_type_name(SqlType t) -> std::string {
 
 // A form the layer does not take yet: 42601, where PostgreSQL runs it.
 [[noreturn]] void not_yet(const std::string& what, std::int32_t pos) { throw SqlError{what + " is not supported yet", pos}; }
+// A gap PostgreSQL's dialect has and the layer refuses as PostgreSQL refuses
+// a feature it lacks (0A000).
+[[noreturn]] void not_supported(const std::string& what, std::int32_t pos) {
+  throw SqlError{what + " is not supported yet", pos, kFeatureNotSupported};
+}
 
 auto integer_constant(std::int64_t v, std::int32_t pos) -> Constant {
   return {v, SqlType{std::in_range<std::int32_t>(v) ? SqlKind::Integer : SqlKind::BigInt}, false, {}, pos};
@@ -1780,6 +1785,7 @@ auto param_count(const ast::Statement& stmt) -> std::uint32_t {
           for (const auto& row : s.rows) {
             for (const auto& e : row) params_in(e, n);
           }
+          if (s.query) n = std::max(n, select_param_count(*s.query));
           for (const auto& e : s.returning) params_in(e, n);
         } else if constexpr (std::is_same_v<T, ast::Select>) {
           n = select_param_count(s);
@@ -1949,6 +1955,14 @@ public:
   // `own_params`: how many parameters the statement's text names, $1 to
   // its largest $n, each of which must get a type.
   Binder(const Catalog& cat, std::uint32_t own_params) : cat_{cat}, own_params_{own_params} { params_.resize(own_params); }
+
+  // What INSERT … SELECT's query fills (assign): `listed`, the statement
+  // names its columns; else they are the table's, the leading ones filled.
+  struct AssignTo {
+    const Table* table;
+    std::vector<const Column*> columns;
+    bool listed;
+  };
 
   // A constant's value as a parameter the API binds after the statement's
   // own. Its value is checked here or where it is written, so it has no
@@ -3719,8 +3733,13 @@ public:
   }
 
   auto select(const ast::Select& s) -> logical::NodePtr {
-    if (s.set) return set_operation(s);
-    if (s.from.empty()) return select_without_from(s);
+    // Only this query's select list is assigned, not a subquery's.
+    auto assign = std::exchange(assign_, std::nullopt);
+    if (s.set) {
+      if (assign) not_supported("INSERT … SELECT of a set operation (UNION, INTERSECT, EXCEPT)", s.pos);
+      return set_operation(s);
+    }
+    if (s.from.empty()) return select_without_from(s, assign);
     auto rels = relations(s);
     auto starred = std::ranges::any_of(s.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Star; });
     std::vector<ast::Expr> expanded;
@@ -3828,7 +3847,9 @@ public:
       return g;
     };
     std::vector<logical::Output> targets;
-    for (const auto& e : list) {
+    std::vector<bool> deferred(list.size(), false);
+    for (std::size_t i = 0; i < list.size(); ++i) {
+      const auto& e = list[i];
       if (e.kind == ast::Expr::Kind::Aggregate) {
         if (e.column.empty()) {
           targets.push_back(aggregate(nullptr, 0, e));
@@ -3839,6 +3860,11 @@ public:
         continue;
       }
       if (!aggregated) {
+        if (assign && assigned_later(e)) {
+          deferred[i] = true;
+          targets.push_back({logical::Expr{}, {}});
+          continue;
+        }
         targets.push_back(plain_output(e, resolve));
         continue;
       }
@@ -3853,6 +3879,7 @@ public:
       targets.push_back({grouped(*t, *c, e.pos), c->name});
     }
     named(list, targets);
+    if (assign) assign_outputs(*assign, list, deferred, targets, s.pos);
     if (s.row_key && row_key_allowed_ && !joined && !aggregated) {
       const auto& t = *rels[0];
       for (auto id : t.pk_col_ids) targets.push_back({logical::column_of(t.id, *t.column(id)), "?key?"});
@@ -4063,6 +4090,55 @@ public:
         n.op);
   }
 
+  // A select-list item an INSERT … SELECT binds against the column it
+  // fills, as a VALUES item is (value): a constant, whose unknown literal
+  // or NULL takes the column's type, and a $n, typed by the column.
+  static auto assigned_later(const ast::Expr& e) -> bool { return is_constant(e) || e.kind == ast::Expr::Kind::Param; }
+
+  // An INSERT … SELECT's select list as the values of the columns it fills,
+  // checked as PostgreSQL checks them: their number (42601), then each in
+  // order, a deferred item bound against its column, any other of a type
+  // that assigns to it (assigns_to). Sets assigned_.
+  void assign_outputs(const AssignTo& to, const std::vector<ast::Expr>& list, const std::vector<bool>& deferred,
+                      std::vector<logical::Output>& targets, std::int32_t pos) {
+    auto columns = to.columns;
+    if (targets.size() > columns.size()) {
+      throw SqlError{"INSERT has more expressions than target columns", list[columns.size()].pos};
+    }
+    if (to.listed && targets.size() < columns.size()) throw SqlError{"INSERT has more target columns than expressions", pos};
+    columns.resize(targets.size());
+    for (std::size_t i = 0; i < targets.size(); ++i) {
+      if (deferred[i]) {
+        auto name = std::move(targets[i].name);
+        targets[i] = {value(*to.table, list[i], *columns[i]), std::move(name)};
+      } else {
+        assigns_to(targets[i].expr.type, *columns[i], list[i].pos);
+      }
+    }
+    assigned_ = std::move(columns);
+  }
+
+  // A value of type `from` written into column c by INSERT … SELECT: one of
+  // c's type or of its family, which the row builder range-checks (an
+  // integer into a SMALLINT, a TEXT into a VARCHAR(n)), a REAL or DOUBLE
+  // PRECISION into the other, or an integer into either, which the plan
+  // converts. A pair PostgreSQL refuses is 42804; any other assignment cast
+  // it makes is not taken yet (0A000, #824).
+  static void assigns_to(SqlType from, const Column& c, std::int32_t pos) {
+    const auto to = c.sql;
+    if (from.kind != SqlKind::Numeric && assignable(from, to) && (to.kind != SqlKind::Char || from == to)) return;
+    if (is_float(to) && (is_float(from) || is_integer(from))) return;
+    if (auto refusal = type_refusal(from.kind, to.kind, true)) {
+      throw SqlError{"column \"" + c.name + "\" is of type " + pg_type_name(to) + " but expression is of type " + pg_type_name(from),
+                     pos, *refusal};
+    }
+    const auto from_name = pg_type_name(from);
+    const std::string article = from_name.find_first_of("aeiou") == 0 ? "an " : "a ";
+    not_supported("INSERT … SELECT of " + article + from_name + " value into column \"" + c.name + "\" of type " +
+                      pg_type_name(to),
+                  pos);
+  }
+
   // A select-list item of no aggregated query, named as PostgreSQL names
   // it: a column by its name, a CASE, COALESCE or NULLIF by the word, a
   // function by its own, $n::T by its type, any other expression ?column?.
@@ -4161,7 +4237,7 @@ public:
   // A SELECT without FROM: one row of its items, under its LIMIT. An item
   // is any select-list expression with no column in it: a column is a
   // column of no table (42703), as in PostgreSQL.
-  auto select_without_from(const ast::Select& s) -> logical::NodePtr {
+  auto select_without_from(const ast::Select& s, const std::optional<AssignTo>& assign) -> logical::NodePtr {
     for (const auto& e : s.targets) {
       if (e.kind == ast::Expr::Kind::Star) throw SqlError{"SELECT * with no tables specified is not valid", e.pos};
     }
@@ -4173,8 +4249,14 @@ public:
       throw SqlError{"column \"" + e.column + "\" does not exist", e.pos, kUndefinedColumn};
     };
     std::vector<logical::Output> targets;
-    for (const auto& e : s.targets) targets.push_back(plain_output(e, no_table));
+    std::vector<bool> deferred(s.targets.size(), false);
+    for (std::size_t i = 0; i < s.targets.size(); ++i) {
+      const auto& e = s.targets[i];
+      deferred[i] = assign && assigned_later(e);
+      targets.push_back(deferred[i] ? logical::Output{logical::Expr{}, {}} : plain_output(e, no_table));
+    }
     named(s.targets, targets);
+    if (assign) assign_outputs(*assign, s.targets, deferred, targets, s.pos);
     auto rows = logical::node(logical::Project{logical::node(logical::OneRow{}), std::move(targets)});
     rows = limited(std::move(rows), s);
     return rows;
@@ -4311,6 +4393,12 @@ public:
   // The query reads a view, whose rows are no table's: no key is added.
   void forbid_row_key() { row_key_allowed_ = false; }
 
+  // INSERT … SELECT: the next select() binds its rows as the values of
+  // `table`'s `columns`, in order (assign_outputs).
+  void assign(AssignTo to) { assign_ = std::move(to); }
+  // The columns the select()'s outputs fill, one per output.
+  [[nodiscard]] auto take_assigned() -> std::vector<const Column*> { return std::move(assigned_); }
+
 private:
   // A parameter's type from its uses, which all agree.
   struct ParamUse {
@@ -4347,6 +4435,8 @@ private:
 
   const Catalog& cat_;
   std::uint32_t own_params_;
+  std::optional<AssignTo> assign_;          // see assign()
+  std::vector<const Column*> assigned_;     // see take_assigned()
   bool row_key_allowed_{true};
   std::uint32_t key_columns_{0};
   std::uint32_t key_table_{0};
@@ -4544,6 +4634,11 @@ public:
     if (const auto* s = std::get_if<ast::Select>(&stmt)) {
       if (!mentions(*s)) return std::nullopt;
       return std::optional<ast::Statement>{std::in_place, std::in_place_type<ast::Select>, expand(*s)};
+    }
+    if (const auto* i = std::get_if<ast::Insert>(&stmt)) {
+      if (!i->query || !mentions(*i->query)) return std::nullopt;
+      ast::Insert out{i->table, i->columns, {}, i->pos, cloned(i->returning), std::make_shared<const ast::Select>(expand(*i->query))};
+      return std::optional<ast::Statement>{std::in_place, std::in_place_type<ast::Insert>, std::move(out)};
     }
     if (const auto* u = std::get_if<ast::Update>(&stmt)) {
       ast::Update out{u->table, {}, {}, u->pos, u->current_of};
@@ -4954,6 +5049,7 @@ public:
             select(st);
           } else if constexpr (std::is_same_v<T, ast::Insert>) {
             if (!st.returning.empty()) not_yet("RETURNING in a procedure", st.pos);
+            if (st.query) not_supported("INSERT … SELECT in a procedure", st.pos);
             for (auto& row : st.rows) {
               for (auto& v : row) names(v);
               for (auto& v : row) expr(v);
@@ -5167,6 +5263,59 @@ auto bind_procedure_statement(const std::string& sql, const Table& frame, const 
   return out;
 }
 
+namespace {
+
+// An INSERT's column list: each a column of t, named once (42701).
+auto listed_columns(const Table& t, const ast::Insert& s) -> std::vector<const Column*> {
+  std::vector<const Column*> out;
+  for (const auto& name : s.columns) {
+    const auto* c = t.column(name);
+    if (c == nullptr || c->hidden) {
+      throw SqlError{"column \"" + name + "\" of relation \"" + t.name + "\" does not exist", s.pos, kUndefinedColumn};
+    }
+    if (std::ranges::contains(out, c)) throw SqlError{"column \"" + name + "\" specified more than once", s.pos, kDuplicateColumn};
+    out.push_back(c);
+  }
+  return out;
+}
+
+// INSERT … SELECT: the query bound with its select list as the values of
+// the columns written (Binder::assign), a SELECT of rows: refused (0A000)
+// where it groups, aggregates, is DISTINCT, or is a set operation, whose
+// rows the plan gives through no Emit (#682). A column left out takes its
+// default, a DEFAULT of the clock the statement's reading.
+auto insert_query(Binder& b, const Table& t, const ast::Insert& s) -> logical::NodePtr {
+  std::vector<const Column*> columns;
+  if (s.columns.empty()) {
+    // The hidden row id is no column a statement fills.
+    for (const auto& c : t.columns) {
+      if (!c.hidden) columns.push_back(&c);
+    }
+  } else {
+    columns = listed_columns(t, s);
+  }
+  b.assign({&t, std::move(columns), !s.columns.empty()});
+  auto rows = b.select(*s.query);
+  const auto* n = rows.get();
+  while (std::holds_alternative<logical::Limit>(n->op) || std::holds_alternative<logical::Sort>(n->op)) {
+    n = logical::input_of(*n)->get();
+  }
+  if (!std::holds_alternative<logical::Project>(n->op)) {
+    not_supported("INSERT … SELECT of an aggregated, grouped or DISTINCT query", s.query->pos);
+  }
+  logical::InsertFrom out{std::move(rows), &t, {}, {}, b.checks(t), b.returning(t, s.returning)};
+  const auto filled = b.take_assigned();
+  for (const auto* c : filled) out.columns.push_back(logical::column_of(t.id, *c).col);
+  for (const auto& c : t.columns) {
+    if (c.clock_default && !std::ranges::contains(filled, &c)) {
+      out.fixed.emplace_back(logical::column_of(t.id, c).col, b.clock_reading(*c.clock_default, c));
+    }
+  }
+  return logical::node(std::move(out));
+}
+
+}  // namespace
+
 auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
   if (const auto* cv = std::get_if<ast::CreateView>(&stmt)) return bind_create_view(*cv, cat);
   ViewExpander views{cat};
@@ -5305,6 +5454,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           throw std::logic_error("CREATE TABLE AS is bound through its query");
         } else if constexpr (std::is_same_v<T, ast::Insert>) {
           const auto* t = b.table(s.table, s.pos);
+          if (s.query) return {insert_query(b, *t, s), s.pos};
           logical::Insert out{t, {}, {}};
           const auto width = s.rows.front().size();  // every row's: the parser checked
           std::vector<const Column*> targets;
@@ -5320,16 +5470,11 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
               throw SqlError{"INSERT has more expressions than target columns", s.pos};
             }
           } else {
-            for (const auto& name : s.columns) targets.push_back(Binder::column(*t, name, s.pos));
+            targets = listed_columns(*t, s);
           }
           if (targets.size() != width) {
             throw SqlError{"INSERT has " + std::to_string(width) + " values for " + std::to_string(targets.size()) + " columns",
                            s.pos};
-          }
-          for (std::size_t i = 0; i < targets.size(); ++i) {
-            if (std::ranges::count(targets, targets[i]) > 1) {
-              throw SqlError{"column \"" + targets[i]->name + "\" specified more than once", s.pos, kDuplicateColumn};
-            }
           }
           // Each row is written as one INSERT of it would be, in order. A
           // column left out with a clock default takes the statement's reading.

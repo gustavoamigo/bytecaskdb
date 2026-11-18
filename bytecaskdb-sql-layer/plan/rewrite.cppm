@@ -439,6 +439,9 @@ auto prune(Node& n, std::vector<ColumnRef> needed) -> bool {
             }
             changed = prune(**side, mine) || changed;
           }
+        } else if constexpr (std::is_same_v<T, InsertFrom>) {
+          // Its query's select list is what it reads.
+          changed = prune(*op.input, {}) || changed;
         } else if constexpr (std::is_same_v<T, Update> || std::is_same_v<T, Delete>) {
           // A write reads each row whole: bc_row_from copies it.
           changed = prune(*op.input, all_columns(*op.table)) || changed;

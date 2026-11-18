@@ -371,6 +371,30 @@ struct Insert {
   std::vector<Expr> returning;  // RETURNING's: one result row per row written, over the row as written
 };
 
+// INSERT … SELECT: each row its input, an Emit, gives, written as a row of
+// the table, read from the snapshot the statement began on, so its own
+// rows never feed back into it. The Emit's i-th target fills columns[i]: a
+// NULL is set as NULL, never left to the column's default, and an integer
+// meeting a DOUBLE or REAL column is converted. Each column carries its
+// declared type and the SQL type of the query's value for it, which check
+// proves assigns as the binder's rule says, so a plan never writes a value
+// of another scale or kind than its column's. `fixed` and the defaults
+// bc_row_begin writes fill the columns left out; `checks` and `returning`
+// are as Insert's. Its count is the rows written.
+struct InsertFrom {
+  struct Filled {
+    ColumnRef column;
+    SqlType declared;  // the column's
+    SqlType value;     // the query's i-th output's
+  };
+  NodePtr input;
+  std::uint32_t table{0};
+  std::vector<Filled> columns;
+  std::vector<std::pair<ColumnRef, Expr>> fixed;
+  std::vector<Expr> checks;
+  std::vector<Expr> returning;
+};
+
 // UPDATE and DELETE write each row their input gives, read from the
 // snapshot the statement began on.
 struct Update {
@@ -389,7 +413,7 @@ struct Delete {
 
 struct Node {
   std::variant<Empty, OneRow, PointGet, Scan, NullSplitScan, CountRange, KeyAggregates, IndexJoin, NestedLoop, HashJoin, Choice,
-               Filter, Sort, Limit, Emit, Aggregate, GroupAggregate, GroupEmit, Insert, Update, Delete>
+               Filter, Sort, Limit, Emit, Aggregate, GroupAggregate, GroupEmit, Insert, InsertFrom, Update, Delete>
       op;
 };
 
@@ -505,6 +529,25 @@ namespace bytecask::sql::physical {
 namespace {
 
 [[noreturn]] void broken(const std::string& rule) { throw std::logic_error{"physical plan: " + rule}; }
+
+// Whether INSERT … SELECT writes a value of type `from` into a column
+// declared `to` as codegen prints it: held as the column is, at its scale,
+// and of its kind or family (integers; TEXT and VARCHAR), a CHAR(n) only
+// from its own type; or a float or an integer into a float, which codegen
+// converts. The binder's assigns_to takes no pair outside these.
+auto assigns(SqlType from, SqlType to) -> bool {
+  auto is_float = [](SqlType t) { return t.kind == SqlKind::Real || t.kind == SqlKind::Double; };
+  auto family = [](SqlKind k) {
+    if (k == SqlKind::SmallInt || k == SqlKind::Integer || k == SqlKind::BigInt) return 1;
+    if (k == SqlKind::Text || k == SqlKind::Varchar) return 2;
+    return 0;
+  };
+  if (from.kind == SqlKind::Numeric) return false;
+  if (is_float(to)) return is_float(from) || family(from.kind) == 1;
+  if (to.kind == SqlKind::Char) return from == to;
+  if (phys_type(from) != phys_type(to) || decimal_scale(from) != decimal_scale(to)) return false;
+  return from.kind == to.kind || (family(from.kind) != 0 && family(from.kind) == family(to.kind));
+}
 
 // A SELECT without FROM's plan, Emit over OneRow under its LIMIT: the one
 // plan that names no table, and so has no constants.
@@ -1384,6 +1427,37 @@ private:
             }
             for (const auto& c : op.checks) params(c);
             returned(op.table, op.returning);
+          } else if constexpr (std::is_same_v<T, InsertFrom>) {
+            if (parent != nullptr) broken("an insert of a query's rows under another operator");
+            const auto* e = std::get_if<Emit>(&op.input->op);
+            if (e == nullptr) broken("an insert of a query's rows that are not an Emit's");
+            if (e->targets.size() != op.columns.size()) broken("an insert of a query of other columns than it fills");
+            for (std::size_t i = 0; i < op.columns.size(); ++i) {
+              const auto& [to, declared, value] = op.columns[i];
+              if (to.table != op.table) broken("an insert into a column of another table");
+              if (phys_type(declared) != to.type) broken("an insert into a column held as another type than it is declared");
+              // The target gives the value as its SQL type says: an
+              // expression of that type, a column or parameter held as it.
+              const auto given = std::visit(
+                  [&](const auto& t) -> bool {
+                    using U = std::decay_t<decltype(t)>;
+                    if constexpr (std::is_same_v<U, ExprTarget>) {
+                      return t.expr.type == value;
+                    } else {
+                      return t.type == phys_type(value);
+                    }
+                  },
+                  e->targets[i]);
+              if (!given) broken("an insert of a query's value of another type than it states");
+              if (!assigns(value, declared)) broken("an insert of a value into a column of a type it does not convert to");
+            }
+            for (const auto& [col, x] : op.fixed) {
+              if (x.kind != Expr::Kind::Param) broken("an insert's fixed column set from other than a parameter");
+              param(x.param);
+            }
+            for (const auto& c : op.checks) params(c);
+            returned(op.table, op.returning);
+            node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Update>) {
             returned(op.table, op.returning);
             if (op.set.empty()) broken("an update that sets no column");

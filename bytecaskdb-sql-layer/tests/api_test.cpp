@@ -3885,3 +3885,113 @@ TEST_CASE("embedded API: CREATE TABLE AS writes its table and rows in one batch,
     db->close();
   }
 }
+
+TEST_CASE("embedded API: INSERT … SELECT writes each of a query's rows as an INSERT of it would be", "[sql][api][insert]") {
+  sql_test::TempDir dir{"api_insert_select"};
+  auto db = Database::open(dir.path());
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  auto state = [&](std::string_view sql, const std::vector<Value>& params = {}) -> std::string {
+    try {
+      (void)db->execute(sql, params);
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  (void)db->execute("CREATE TABLE src (a INTEGER PRIMARY KEY, b BIGINT, c VARCHAR(10), d DOUBLE PRECISION)");
+  (void)db->execute("INSERT INTO src VALUES (1, 10, 'one', 1.5), (2, NULL, 'two', NULL), (3, 30, NULL, 3.5)");
+  (void)db->execute("CREATE TABLE dst (k INTEGER DEFAULT 7, v BIGINT DEFAULT 9, s TEXT, f DOUBLE PRECISION, r REAL, "
+                    "n VARCHAR(3), at DATE DEFAULT CURRENT_DATE)");
+  CHECK(db->prepare("INSERT INTO dst SELECT a FROM src").command() == Command::Insert);
+
+  // The leading columns, in order; the rest take their defaults, the clock's
+  // read by the statement.
+  CHECK(db->execute("INSERT INTO dst SELECT a, b FROM src WHERE a <= 2").affected == 2);
+  CHECK(db->execute("SELECT k, v, s, at IS NOT NULL FROM dst ORDER BY k").rows ==
+        Grid{{i(1), i(10), kNull, Value{true}}, {i(2), kNull, kNull, Value{true}}});
+  // A column list in any order; a NULL is written as NULL, not the column's
+  // default; an integer meets a DOUBLE or REAL column converted.
+  (void)db->execute("DELETE FROM dst");
+  CHECK(db->execute("INSERT INTO dst (s, v, k, f, r) SELECT c, a, b, a, b FROM src ORDER BY a").affected == 3);
+  CHECK(db->execute("SELECT k, v, s, f, r FROM dst ORDER BY v").rows ==
+        Grid{{i(10), i(1), text("one"), Value{1.0}, Value{10.0}},
+             {kNull, i(2), text("two"), Value{2.0}, kNull},
+             {i(30), i(3), kNull, Value{3.0}, Value{30.0}}});
+  // A literal of no type, NULL and a parameter take the column's type, as a
+  // VALUES item does.
+  (void)db->execute("DELETE FROM dst");
+  CHECK(db->execute("INSERT INTO dst (k, v, s, n) SELECT '5', NULL, $1, 'ab' FROM src WHERE a = $2", {text("p"), i(1)}).affected == 1);
+  CHECK(db->execute("SELECT k, v, s, n FROM dst").rows == Grid{{i(5), kNull, text("p"), text("ab")}});
+  CHECK(db->execute("INSERT INTO dst (k) SELECT 1").affected == 1);  // without FROM
+  // No row, LIMIT 0 and an OFFSET past the rows write nothing.
+  CHECK(db->execute("INSERT INTO dst (k) SELECT a FROM src WHERE a > 100").affected == 0);
+  CHECK(db->execute("INSERT INTO dst (k) SELECT a FROM src WHERE FALSE").affected == 0);
+  CHECK(db->execute("INSERT INTO dst (k) SELECT a FROM src LIMIT 0").affected == 0);
+  CHECK(db->execute("INSERT INTO dst (k) SELECT a FROM src ORDER BY a OFFSET 2 LIMIT 5").affected == 1);
+  // The plan writes each row the query emits, a NULL as NULL, and counts
+  // them apart from a LIMIT's counter.
+  const auto plan = db->prepare("INSERT INTO dst (k, v) SELECT a, b FROM src ORDER BY a LIMIT 2").plan_source();
+  CHECK(plan.find("bc_row_set_null(cx, r, ") != std::string::npos);
+  CHECK(plan.find("int64_t n = 0;") != std::string::npos);
+  CHECK(plan.find("bc_emit_count(cx, inserted);") != std::string::npos);
+  CHECK(db->execute("INSERT INTO dst (k, v) SELECT a, b FROM src ORDER BY a LIMIT 2").affected == 2);
+  // RETURNING gives each row as written.
+  CHECK(db->execute("INSERT INTO dst (k) SELECT a FROM src WHERE a = 2 RETURNING k, v").rows == Grid{{i(2), i(9)}});
+  // A view and a join as the query.
+  (void)db->execute("CREATE VIEW sv AS SELECT a, c FROM src WHERE a < 3");
+  CHECK(db->execute("INSERT INTO dst (k, s) SELECT a, c FROM sv").affected == 2);
+  CHECK(db->execute("INSERT INTO dst (k) SELECT x.a FROM src x JOIN src y ON x.a = y.a").affected == 3);
+
+  CHECK(db->execute("INSERT INTO dst (n) SELECT c FROM src").affected == 3);  // each fits VARCHAR(3)
+  // Data errors are the row builder's, and the statement writes nothing.
+  const auto before = db->execute("SELECT COUNT(*) FROM dst").rows;
+  CHECK(state("INSERT INTO dst (n) SELECT c || 'xx' FROM src") == "22001");
+  CHECK(state("INSERT INTO dst (k) SELECT b * 1000000000 FROM src") == "22003");
+  CHECK(state("INSERT INTO dst (k) SELECT 'x'") == "22P02");
+  CHECK(db->execute("SELECT COUNT(*) FROM dst").rows == before);
+
+  // PostgreSQL's analysis errors.
+  CHECK(state("INSERT INTO dst (k) SELECT a, b FROM src") == "42601");
+  CHECK(state("INSERT INTO dst (k, v) SELECT a FROM src") == "42601");
+  CHECK(state("INSERT INTO dst SELECT a, a, c, d, d, c, a, a FROM src") == "42601");
+  CHECK(state("INSERT INTO dst (k, k) SELECT a, a FROM src") == "42701");
+  CHECK(state("INSERT INTO dst (zz) SELECT a FROM src") == "42703");
+  CHECK(state("INSERT INTO dst (k) SELECT zz FROM src") == "42703");
+  CHECK(state("INSERT INTO nope SELECT a FROM src") == "42P01");
+  CHECK(state("INSERT INTO dst (k) SELECT c FROM src") == "42804");  // VARCHAR into INTEGER
+  CHECK(state("INSERT INTO dst (at) SELECT a FROM src") == "42804");
+  CHECK(state("INSERT INTO dst (k) SELECT $1::text") == "42804");
+  // Not yet: an assignment cast the plan does not make (#824), and a query
+  // whose rows come through no Emit (#682).
+  CHECK(state("INSERT INTO dst (s) SELECT a FROM src") == "0A000");
+  CHECK(state("INSERT INTO dst (k) SELECT d FROM src") == "0A000");
+  CHECK(state("INSERT INTO dst (k) SELECT COUNT(*) FROM src") == "0A000");
+  CHECK(state("INSERT INTO dst (k) SELECT a FROM src GROUP BY a") == "0A000");
+  CHECK(state("INSERT INTO dst (k) SELECT DISTINCT a FROM src") == "0A000");
+  CHECK(state("INSERT INTO dst (k) SELECT a FROM src UNION SELECT 1") == "0A000");
+  CHECK(db->execute("SELECT COUNT(*) FROM dst").rows == before);
+}
+
+TEST_CASE("embedded API: INSERT … SELECT reads the snapshot its statement began on, never its own rows",
+          "[sql][api][insert]") {
+  sql_test::TempDir dir{"api_insert_select_snapshot"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE t (a INTEGER, b TEXT)");
+  (void)db->execute("INSERT INTO t VALUES (1, 'x'), (2, 'y')");
+  // Each run doubles the table once: the scan does not see the rows written.
+  CHECK(db->execute("INSERT INTO t SELECT * FROM t").affected == 2);
+  CHECK(db->execute("INSERT INTO t SELECT * FROM t").affected == 4);
+  CHECK(db->execute("SELECT COUNT(*) FROM t").rows == Grid{{i(8)}});
+  CHECK(db->execute("SELECT COUNT(*) FROM t WHERE a = 2").rows == Grid{{i(4)}});
+  // A table with a key: its own rows again are duplicates, and nothing is written.
+  (void)db->execute("CREATE TABLE k (a INTEGER PRIMARY KEY)");
+  (void)db->execute("INSERT INTO k VALUES (1), (2)");
+  try {
+    (void)db->execute("INSERT INTO k SELECT a FROM k");
+    FAIL("a duplicate key was written");
+  } catch (const std::exception& e) {
+    CHECK(sqlstate(e) == "23505");
+  }
+  CHECK(db->execute("INSERT INTO k SELECT a + 2 FROM k").affected == 2);
+  CHECK(db->execute("SELECT a FROM k ORDER BY a").rows == Grid{{i(1)}, {i(2)}, {i(3)}, {i(4)}});
+}

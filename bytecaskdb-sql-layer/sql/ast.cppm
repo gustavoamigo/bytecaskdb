@@ -260,9 +260,11 @@ struct AddColumn {
 struct Insert {
   std::string table;
   std::vector<std::string> columns;  // empty: every column, in order
-  std::vector<std::vector<Expr>> rows;  // VALUES' rows, each of one length
+  std::vector<std::vector<Expr>> rows;  // VALUES' rows, each of one length; none with a query
   std::int32_t pos{-1};
   std::vector<Expr> returning;  // RETURNING's list, empty for none
+  // INSERT … SELECT: the query whose rows are written, in place of VALUES.
+  std::shared_ptr<const Select> query;
 };
 
 struct OrderItem {

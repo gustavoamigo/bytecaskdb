@@ -517,9 +517,13 @@ public:
   void plan(const physical::Node& root) {
     subqueries();
     print_computed(w_);
-    // LIMIT 0 returns nothing, so nothing is read.
-    if (limit_zero(root)) return;
+    // LIMIT 0 returns nothing, so nothing is read: a write of its rows
+    // reports it wrote none.
     no_rows_ = no_rows(root);
+    if (limit_zero(root)) {
+      for (const auto& line : no_rows_) w_.line(line);
+      return;
+    }
     if (!w_.p().null_checks.empty()) return_if_null(w_, w_.p().null_checks, no_rows_);
     produce(root, [] {});
   }
@@ -584,7 +588,8 @@ public:
     return std::visit(
         [](const auto& op) -> std::vector<std::string> {
           using T = std::decay_t<decltype(op)>;
-          if constexpr (std::is_same_v<T, physical::Update> || std::is_same_v<T, physical::Delete>) {
+          if constexpr (std::is_same_v<T, physical::Update> || std::is_same_v<T, physical::Delete> ||
+                        std::is_same_v<T, physical::InsertFrom>) {
             return {"bc_emit_count(cx, 0);"};
           } else if constexpr (std::is_same_v<T, physical::Aggregate>) {
             return op.emits ? empty_row({op.agg}) : std::vector<std::string>{};
@@ -629,6 +634,8 @@ private:
           } else if constexpr (std::is_same_v<T, physical::Aggregate> || std::is_same_v<T, physical::CountRange> ||
                                std::is_same_v<T, physical::KeyAggregates>) {
             return !op.emits;
+          } else if constexpr (std::is_same_v<T, physical::InsertFrom>) {
+            return limit_zero(*op.input);
           } else {
             return false;
           }
@@ -2572,6 +2579,45 @@ private:
     w_.line("bc_emit_count(cx, " + std::to_string(s.rows.size()) + ");");
   }
 
+  // INSERT … SELECT: the query's Emit, whose rows go to a sink that writes
+  // each as a row of the table, in a block of its own, as an INSERT of it
+  // alone would be; then the count of rows written. Where a row is missing
+  // the rest is in an `if` (miss), closed after the query, as an arm's.
+  void produce(const physical::InsertFrom& s, const Consume&) {
+    const std::string count = "inserted";
+    w_.line("int64_t " + count + " = 0;");
+    const Sink sink = [&](Writer& w, const Row& row) {
+      w.open("");
+      w.line("bc_row r = bc_row_begin(cx, " + w.tbl(s.table) + ");");
+      for (std::size_t i = 0; i < s.columns.size(); ++i) {
+        const auto& col = s.columns[i].column;
+        const auto& v = row[i];
+        // An integer into a DOUBLE or REAL column: physical::check allows no other pair of types.
+        auto value = v.type == col.type ? v.value : "bc_i64_to_f64(" + v.value + ")";
+        w.open("if (" + v.null + ")");
+        w.line("bc_row_set_null(cx, r, " + w.col(col) + ");");
+        w.otherwise();
+        w.line("bc_row_set_" + suffix(col.type) + "(cx, r, " + w.col(col) + ", " + value + ");");
+        w.close();
+      }
+      for (const auto& [col, e] : s.fixed) {
+        w.line("bc_row_set_param(cx, r, " + w.col(col) + ", " + std::to_string(e.param) + ");");
+      }
+      write_checked(s.table, s.checks, "bc_insert(cx, " + w.tbl(s.table) + ", ", !s.returning.empty());
+      returned(s.table, "nr", s.returning);
+      w.line("++" + count + ";");
+      w.close();
+    };
+    sink_ = &sink;
+    // The count below is what no rows report: an Empty source prints nothing.
+    auto none = std::exchange(no_rows_, {});
+    produce(*s.input, [] {});
+    no_rows_ = std::move(none);
+    for (; open_ > 0; --open_) w_.close();
+    sink_ = nullptr;
+    w_.line("bc_emit_count(cx, " + count + ");");
+  }
+
   // Each row of an UPDATE or DELETE as `old`, `write` printing what is done
   // with it; then the count of rows written. A scan reads the snapshot the
   // statement began on: its own writes never feed back into it.
@@ -3046,8 +3092,8 @@ auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std
     std::visit(
         [&](const auto& op) {
           using T = std::decay_t<decltype(op)>;
-          if constexpr (std::is_same_v<T, physical::Insert> || std::is_same_v<T, physical::Update> ||
-                        std::is_same_v<T, physical::Delete>) {
+          if constexpr (std::is_same_v<T, physical::Insert> || std::is_same_v<T, physical::InsertFrom> ||
+                        std::is_same_v<T, physical::Update> || std::is_same_v<T, physical::Delete>) {
             // The runtime maintains the table's indexes: a write plan names none.
             out.tables_written = {op.table};
             out.returns_rows = !op.returning.empty();

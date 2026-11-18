@@ -59,6 +59,30 @@ kind the transformer doesn't take is refused with its position.
   that fails writes none of them. Rows of different lengths are 42601, as
   in PostgreSQL. The plan writes each row in a block of its own, so a
   statement's plan grows with its rows.
+- `INSERT … SELECT`, with or without a column list: each row of the query
+  is written as an `INSERT` of it alone would be, and a row that fails
+  writes none of them. The query reads the snapshot the statement began
+  on, so `INSERT INTO t SELECT * FROM t` doubles `t` once. Its select list
+  fills the columns listed, or the table's leading columns; a column left
+  out takes its default, and a NULL given is written as NULL. As in
+  PostgreSQL the column list is checked first (42703, 42701), then the
+  query, then the number of values (42601, "INSERT has more expressions
+  than target columns" or "more target columns than expressions"), then
+  each value against its column in order. A constant, an unknown literal,
+  `NULL` and a `$n` are bound against their column as a `VALUES` item is
+  (`'5'` is an INTEGER, `'x'` 22P02). Any other value must be of its
+  column's type or family: an integer into an integer column, `TEXT` or
+  `VARCHAR` into `TEXT` or `VARCHAR(n)`, a `DECIMAL` of the same scale,
+  `CHAR(n)` of the same length, which the row builder checks as it checks
+  a parameter (22003, 22001); a `REAL` or `DOUBLE PRECISION` into the
+  other; an integer into either, which the plan converts. A pair PostgreSQL
+  has no assignment cast for is 42804, its message PostgreSQL's (without
+  its hint); every other assignment cast PostgreSQL makes is refused
+  (0A000, #824). Refused too (0A000): a query that aggregates, groups or is
+  `DISTINCT`, and a set operation, whose rows the plan gives through no
+  `Emit` (#682); and `INSERT … SELECT` in a procedure. The plan is the
+  query's, its rows sent to the write (`planner_design.md`, *INSERT …
+  SELECT*).
 - `RETURNING` of an `INSERT`, `UPDATE` or `DELETE`: a result row per row
   written, its list bound as a select list over the one table (`*`,
   columns, constants, parameters, expressions, each named as a select
@@ -707,6 +731,12 @@ That includes:
   other than a column;
 - `RETURNING` in a procedure; `VALUES` outside `INSERT`; `OFFSET` on a set operation, in one of
   its arms or in a view;
+- `INSERT … SELECT` of an aggregated, grouped or `DISTINCT` query or a set
+  operation (#682), of a value outside its column's type or family that
+  PostgreSQL assigns (a conversion through text, `CHAR(n)` into another
+  string type or length, a `DECIMAL` of another scale or into or out of an
+  integer or float, a date or time into another date or time type, #824),
+  or in a procedure (0A000);
 - `CASE` or `COALESCE` of a float beside another number, a `BETWEEN` or
   `IN` as a value, `GREATEST` and `LEAST`, `CASE` outside the plain select
   list (#685);
