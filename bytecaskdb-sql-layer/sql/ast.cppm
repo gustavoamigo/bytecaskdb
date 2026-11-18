@@ -422,8 +422,41 @@ struct DropProcedure {
   std::int32_t pos{-1};
 };
 
+// CREATE ROLE name, with no option: the layer has no logins (#653).
+struct CreateRole {
+  std::string role;
+  std::int32_t pos{-1};
+};
+
+// DROP ROLE [IF EXISTS] name [, …].
+struct DropRole {
+  std::vector<std::string> roles;
+  bool if_exists{false};
+  std::int32_t pos{-1};
+};
+
+// One privilege of a GRANT or REVOKE, as written: PostgreSQL's lower-case
+// name ("select", …, or "all"), and the columns of a column privilege.
+struct PrivilegeAst {
+  std::string name;
+  std::vector<std::string> columns;
+};
+
+// GRANT or REVOKE of privileges on tables and views (docs/frontend_design.md,
+// *Roles and privileges*). Names are checked when the catalog applies it, in
+// PostgreSQL's order.
+struct Grant {
+  bool grant{true};                      // false: REVOKE
+  bool grant_option{false};              // GRANT … WITH GRANT OPTION, REVOKE GRANT OPTION FOR …
+  std::vector<PrivilegeAst> privileges;  // empty: ALL PRIVILEGES
+  std::vector<std::string> objects;
+  std::vector<std::string> grantees;     // "" is PUBLIC
+  std::optional<std::string> grantor;    // GRANTED BY a role named; nullopt for none or the current user
+  std::int32_t pos{-1};
+};
+
 using Statement = std::variant<CreateTable, CreateIndex, DropTable, DropIndex, AddColumn, CreateView, DropView,
-                               CreateProcedure, DropProcedure, Insert, Select, Update, Delete>;
+                               CreateProcedure, DropProcedure, CreateRole, DropRole, Grant, Insert, Select, Update, Delete>;
 
 // Cursor statements (docs/cursor_design.md). They are not a Statement: they
 // name a session's cursor and carry no plan, so the session runs them, as it

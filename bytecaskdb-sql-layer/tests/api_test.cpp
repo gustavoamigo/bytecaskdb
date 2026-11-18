@@ -156,6 +156,41 @@ TEST_CASE("embedded API: IF NOT EXISTS and IF EXISTS skip a DDL with PostgreSQL'
   db->close();
 }
 
+TEST_CASE("embedded API: CREATE ROLE, GRANT and REVOKE are DDL kept in the catalog, with PostgreSQL's tags and notices",
+          "[sql][api][roles]") {
+  sql_test::TempDir dir{"api"};
+  {
+    auto db = Database::open(dir.path());
+    (void)db->execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+    CHECK(db->prepare("CREATE ROLE r").command() == Command::CreateRole);
+    CHECK(db->prepare("GRANT SELECT ON t TO r").command() == Command::Grant);
+    CHECK(db->prepare("REVOKE SELECT ON t FROM r").command() == Command::Revoke);
+    CHECK(db->prepare("DROP ROLE r").command() == Command::DropRole);
+    (void)db->execute("CREATE ROLE r");
+    (void)db->execute("GRANT SELECT, UPDATE (v) ON t TO r, PUBLIC");
+    const auto* t = db->catalog()->table("t");
+    CHECK(db->catalog()->acl(t->id).size() == 4);  // per grantee, the table's and the column's
+    // Every session is the superuser: nothing is denied.
+    (void)db->execute("INSERT INTO t VALUES (1, 2)");
+    CHECK(db->execute("SELECT v FROM t").rows.size() == 1);
+    auto r = db->execute("DROP ROLE IF EXISTS nope, other");
+    REQUIRE(r.notices.size() == 2);
+    CHECK(r.notices[1].sqlstate == "00000");
+    CHECK(r.notices[1].message == "role \"other\" does not exist, skipping");
+    CHECK_THROWS(db->execute("DROP ROLE r"));  // it holds privileges (2BP01)
+    db->close();
+  }
+  {
+    auto db = Database::open(dir.path());
+    REQUIRE(db->catalog()->role("r") != nullptr);
+    (void)db->execute("REVOKE ALL ON t FROM r, PUBLIC");
+    CHECK(db->catalog()->acl(db->catalog()->table("t")->id).empty());
+    CHECK(db->execute("DROP ROLE r").notices.empty());
+    CHECK(db->catalog()->roles().empty());
+    db->close();
+  }
+}
+
 TEST_CASE("embedded API: a cached write plan maintains an index created after it", "[sql][api]") {
   sql_test::TempDir dir{"api_ddl"};
   auto db = Database::open(dir.path());

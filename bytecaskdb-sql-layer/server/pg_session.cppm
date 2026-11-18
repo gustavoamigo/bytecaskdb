@@ -445,6 +445,10 @@ auto command_name(Command c) -> std::string_view {
     case Command::DropView: return "DROP VIEW";
     case Command::CreateProcedure: return "CREATE PROCEDURE";
     case Command::DropProcedure: return "DROP PROCEDURE";
+    case Command::CreateRole: return "CREATE ROLE";
+    case Command::DropRole: return "DROP ROLE";
+    case Command::Grant: return "GRANT";
+    case Command::Revoke: return "REVOKE";
   }
   return {};
 }
@@ -464,6 +468,10 @@ auto command_tag(Command c, const Rows& r) -> std::string {
     case Command::DropView: return "DROP VIEW";
     case Command::CreateProcedure: return "CREATE PROCEDURE";
     case Command::DropProcedure: return "DROP PROCEDURE";
+    case Command::CreateRole: return "CREATE ROLE";
+    case Command::DropRole: return "DROP ROLE";
+    case Command::Grant: return "GRANT";
+    case Command::Revoke: return "REVOKE";
   }
   return {};
 }

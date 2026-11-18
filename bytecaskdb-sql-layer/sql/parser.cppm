@@ -792,6 +792,75 @@ auto drop(const PgQuery__DropStmt* s, std::int32_t pos) -> Statement {
   reject("only DROP TABLE, DROP INDEX, DROP VIEW and DROP PROCEDURE are supported", pos);
 }
 
+// ------------------------------------------------------- roles and privileges
+
+// CREATE ROLE name, with no option. The layer has no logins (#653): who a
+// session is comes from outside it, so LOGIN, PASSWORD and the like, and
+// CREATE USER, which is CREATE ROLE … LOGIN, are not taken.
+auto create_role(const PgQuery__CreateRoleStmt* s, std::int32_t pos) -> CreateRole {
+  if (s->stmt_type != PG_QUERY__ROLE_STMT_TYPE__ROLESTMT_ROLE) reject("CREATE USER and CREATE GROUP are not supported: the layer has no logins", pos);
+  if (s->n_options != 0) reject("CREATE ROLE takes no options: the layer has no logins or role attributes", pos);
+  return CreateRole{s->role, pos};
+}
+
+// A RoleSpec naming a role: its name.
+auto named_role(const PgQuery__RoleSpec* r, const char* where, std::int32_t pos) -> std::string {
+  if (r->roletype != PG_QUERY__ROLE_SPEC_TYPE__ROLESPEC_CSTRING) {
+    reject(std::string{"CURRENT_USER, CURRENT_ROLE and SESSION_USER are not supported in "} + where, pos);
+  }
+  return r->rolename;
+}
+
+auto drop_role(const PgQuery__DropRoleStmt* s, std::int32_t pos) -> DropRole {
+  DropRole out{{}, s->missing_ok != 0, pos};
+  for (std::size_t i = 0; i < s->n_roles; ++i) {
+    const auto* r = s->roles[i]->role_spec;
+    if (r->roletype != PG_QUERY__ROLE_SPEC_TYPE__ROLESPEC_CSTRING) {
+      reject("cannot use special role specifier in DROP ROLE", r->location, kInvalidParameterValue);
+    }
+    out.roles.emplace_back(r->rolename);
+  }
+  return out;
+}
+
+// GRANT and REVOKE of privileges ON [TABLE] names TO or FROM roles or
+// PUBLIC. Not of other objects, ON ALL TABLES IN SCHEMA, role membership or
+// ALTER DEFAULT PRIVILEGES. RESTRICT and CASCADE are taken, and alike: a
+// session is the bootstrap superuser, so every grant's grantor is the
+// owner and no grant depends on another's grant option.
+auto grant(const PgQuery__GrantStmt* s, std::int32_t pos) -> Grant {
+  if (s->targtype != PG_QUERY__GRANT_TARGET_TYPE__ACL_TARGET_OBJECT) {
+    reject("GRANT and REVOKE ON ALL … IN SCHEMA are not supported", pos);
+  }
+  if (s->objtype != PG_QUERY__OBJECT_TYPE__OBJECT_TABLE) {
+    reject("GRANT and REVOKE are supported on tables and views only", pos);
+  }
+  Grant out;
+  out.grant = s->is_grant != 0;
+  out.grant_option = s->grant_option != 0;
+  out.pos = pos;
+  for (std::size_t i = 0; i < s->n_objects; ++i) {
+    const auto* rv = s->objects[i]->range_var;
+    if (!empty(rv->schemaname) || !empty(rv->catalogname)) reject("schema-qualified names are not supported", rv->location);
+    out.objects.emplace_back(rv->relname);
+  }
+  for (std::size_t i = 0; i < s->n_privileges; ++i) {
+    const auto* p = s->privileges[i]->access_priv;
+    PrivilegeAst priv{empty(p->priv_name) ? "all" : p->priv_name, {}};
+    for (std::size_t k = 0; k < p->n_cols; ++k) priv.columns.push_back(str(p->cols[k]));
+    out.privileges.push_back(std::move(priv));
+  }
+  for (std::size_t i = 0; i < s->n_grantees; ++i) {
+    const auto* r = s->grantees[i]->role_spec;
+    out.grantees.push_back(r->roletype == PG_QUERY__ROLE_SPEC_TYPE__ROLESPEC_PUBLIC ? std::string{}
+                                                                                    : named_role(r, "a grantee", r->location));
+  }
+  if (s->grantor != nullptr && s->grantor->roletype == PG_QUERY__ROLE_SPEC_TYPE__ROLESPEC_CSTRING) {
+    out.grantor = s->grantor->rolename;
+  }
+  return out;
+}
+
 // CREATE [OR REPLACE] PROCEDURE name (args) LANGUAGE plpgsql AS 'body':
 // arguments IN, INOUT or OUT, named, without a default; no other option.
 // The body's PL/pgSQL syntax is checked as PostgreSQL checks it with
@@ -1405,6 +1474,9 @@ auto parse(std::string_view sql) -> Statement {
   if (n->node_case == PG_QUERY__NODE__NODE_CALL_STMT) {
     reject("CALL runs as a simple Query, not as a prepared statement", pos, kFeatureNotSupported);
   }
+  if (n->node_case == PG_QUERY__NODE__NODE_CREATE_ROLE_STMT) return create_role(n->create_role_stmt, pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_DROP_ROLE_STMT) return drop_role(n->drop_role_stmt, pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_GRANT_STMT) return grant(n->grant_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_INSERT_STMT) return insert(n->insert_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_SELECT_STMT) return select(n->select_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_UPDATE_STMT) return update(n->update_stmt, pos);

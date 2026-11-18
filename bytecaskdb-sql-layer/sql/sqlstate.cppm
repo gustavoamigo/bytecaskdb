@@ -63,6 +63,8 @@ inline constexpr SqlState kInvalidEscapeSequence{"22025"};
 inline constexpr SqlState kSubstringError{"22011"};
 inline constexpr SqlState kCannotCoerce{"42846"};
 inline constexpr SqlState kInvalidRowCountInLimit{"2201W"};
+inline constexpr SqlState kReservedName{"42939"};
+inline constexpr SqlState kInvalidGrantOperation{"0LP01"};
 inline constexpr SqlState kInvalidRowCountInOffset{"2201X"};
 
 // The constant above whose code is `code`, or nullopt.
@@ -72,7 +74,7 @@ inline constexpr SqlState kInvalidRowCountInOffset{"2201X"};
                  kDuplicateColumn, kDuplicateTable, kDuplicateObject, kAmbiguousColumn, kDuplicateAlias, kIndeterminateDatatype, kWrongObjectType, kInvalidColumnReference, kInvalidForeignKey, kDependentObjectsStillExist, kUndefinedParameter, kDuplicateFunction, kInvalidFunctionDefinition, kNullValueNotAllowed, kNoDataFound, kTooManyRows,
                  kInvalidTextRepresentation, kStringDataRightTruncation, kInvalidDatetimeFormat,
                  kDatetimeFieldOverflow, kCharacterNotInRepertoire, kInvalidParameterValue, kInvalidEscapeSequence, kSubstringError, kCannotCoerce,
-                 kInvalidRowCountInLimit, kInvalidRowCountInOffset}) {
+                 kInvalidRowCountInLimit, kInvalidRowCountInOffset, kReservedName, kInvalidGrantOperation}) {
     if (s.view() == code) return s;
   }
   return std::nullopt;

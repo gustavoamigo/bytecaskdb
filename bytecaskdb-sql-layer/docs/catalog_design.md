@@ -98,6 +98,9 @@ Namespace `0x01`, as the plugin's catalog is:
 | `01 04 <id:4>` | The view record (*Views*). |
 | `01 05 <id:4>` | The procedure record (`procedures_design.md`, *Catalog record*). |
 | `01 06 <name>` | Procedure name entry: kind 4 and id (4, big-endian). Procedures have a namespace of their own. |
+| `01 07 <id:4>` | The role record (*Roles and privileges*). |
+| `01 08 <name>` | Role name entry: kind 5 and id (4, big-endian). Roles have a namespace of their own. |
+| `01 09 <id:4>` | The privileges (ACL) of the table or view of that id (*Roles and privileges*). |
 
 **The counters are 8 bytes**, and the next id at most one past
 `kMaxObjectId`; any other value is refused at load. **One id counter** gives every table, index and layout its id, so an id
@@ -319,6 +322,37 @@ unique within a table and never collide with a relation.
   and the constraint; the SQLSTATE is the same.
 - **Not built:** `ALTER TABLE ADD CONSTRAINT`, `ADD COLUMN … CHECK`,
   `NO INHERIT`, `NOT VALID` and `DEFERRABLE`.
+
+## Roles and privileges
+
+What #653's first step stores. The format is little-endian, as the other
+records are.
+- **A role record**: `u16` format (1), `u32` id, `str` name. Its id is
+  drawn from the one counter. The bootstrap superuser every session is
+  stays implicit: it is never written, has no name, and its id is
+  `kBootstrapRole`, `0x01000000`, past every object id.
+- **One ACL record per table or view** with a grant: `u16` format (1),
+  `u32` object id, `u32` n, then n entries, each a `u32` grantee (0 for
+  `PUBLIC`), a `u32` column, a `u16` of privileges, a `u16` of grant
+  options and a `u32` grantor.
+  - The column is a table's column id or a view's column position, or
+    `kWholeObject`, `0xFFFFFFFF`, for the object itself.
+  - The privileges are PostgreSQL's `arwdDxtm` as bits 1 to 128. A
+    column's are `SELECT`, `INSERT`, `UPDATE` and `REFERENCES` only.
+  - The grantor is the superuser while every session is one.
+- **Entries are sorted by (column, grantee)**, one each, and each holds a
+  privilege. A `REVOKE` that leaves an object none deletes the record, and
+  a `DROP TABLE` or `DROP VIEW` deletes it.
+- **Load checks** refuse as corruption any of the following:
+  - a role or ACL record under another id's key;
+  - a role without its name entry, or a name entry without its role;
+  - an ACL of no table or view;
+  - an entry of a missing column or role;
+  - an entry with no privilege, an option it lacks, or a column privilege
+    a column cannot take;
+  - entries out of order.
+
+  A later format is refused, as for the other records.
 
 ## Views
 
