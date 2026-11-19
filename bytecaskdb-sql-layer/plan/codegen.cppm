@@ -11,8 +11,9 @@
 // cursors. It makes no choice of its own and reads the plan alone, never the
 // catalog.
 //
-// Writes are bc_insert, bc_update and bc_delete: the runtime maintains the
-// indexes (docs/plan_api_design.md, *Decisions, not mechanics*).
+// Writes are bc_insert (bc_insert_on_conflict for ON CONFLICT DO NOTHING),
+// bc_update and bc_delete: the runtime maintains the indexes
+// (docs/plan_api_design.md, *Decisions, not mechanics*).
 
 module;
 #include <algorithm>
@@ -2801,16 +2802,13 @@ private:
     return out;
   }
 
-  // Ends the row `r` and writes it with `call` + the row + ");". With
+  // Ends the row `r` and gives what the write takes as its row. With
   // CHECK constraints the row is first tested: each is evaluated over the
   // row as written, and one that is false (not NULL) raises 23514 before
   // anything is written, so a refused row leaves no index entry.
   // With `keep` the row stays in hand as `nr` after it is written, for RETURNING.
-  void write_checked(std::uint32_t table, const std::vector<Expr>& checks, const std::string& call, bool keep = false) {
-    if (checks.empty() && !keep) {
-      w_.line(call + "bc_row_end(cx, r));");
-      return;
-    }
+  auto checked_row(std::uint32_t table, const std::vector<Expr>& checks, bool keep) -> std::string {
+    if (checks.empty() && !keep) return "bc_row_end(cx, r)";
     w_.line("bc_view nr = bc_row_end(cx, r);");
     auto outer = std::exchange(rows_, std::vector<Binding>{{table, "nr"}});
     for (const auto& c : checks) {
@@ -2819,7 +2817,33 @@ private:
       w_.line("if (" + unknown + "!(" + v.value + ")) bc_raise(cx, BC_C_CHECK, " + std::to_string(table) + ");");
     }
     rows_ = std::move(outer);
-    w_.line(call + "nr);");
+    return "nr";
+  }
+
+  // Writes the row `r` with `call` + the row + ");", checked as checked_row says.
+  void write_checked(std::uint32_t table, const std::vector<Expr>& checks, const std::string& call, bool keep = false) {
+    w_.line(call + checked_row(table, checks, keep) + ");");
+  }
+
+  // Inserts the row `r` and gives its RETURNING row; with ON CONFLICT DO
+  // NOTHING's arbiter, only when the row is written, counting it in
+  // `count`. NOT NULL (bc_row_end) and CHECK are tested first, as
+  // PostgreSQL tests them before the arbiter; their error is sticky, and
+  // bc_insert_on_conflict then writes nothing.
+  void insert_row(std::uint32_t table, const std::vector<Expr>& checks, const std::vector<Expr>& returning,
+                  std::optional<std::uint32_t> arbiter, const std::string& count) {
+    if (!arbiter) {
+      write_checked(table, checks, "bc_insert(cx, " + w_.tbl(table) + ", ", !returning.empty());
+      returned(table, "nr", returning);
+      if (!count.empty()) w_.line("++" + count + ";");
+      return;
+    }
+    auto row = checked_row(table, checks, !returning.empty());
+    auto by = *arbiter == logical::kAnyArbiter ? std::string{"BC_ARBITER_ANY"} : w_.obj(*arbiter);
+    w_.open("if (bc_insert_on_conflict(cx, " + w_.tbl(table) + ", " + row + ", " + by + "))");
+    returned(table, "nr", returning);
+    w_.line("++" + count + ";");
+    w_.close();
   }
 
   void produce(const physical::Insert& s, const Consume&) {
@@ -2827,6 +2851,9 @@ private:
     // column to its default; a column not given keeps it. The runtime checks
     // the keys and writes the index entries; an error it raises is sticky,
     // so the rows after one that fails are not written.
+    // With ON CONFLICT DO NOTHING the count is the rows written.
+    const std::string count = s.arbiter ? "inserted" : "";
+    if (s.arbiter) w_.line("int64_t " + count + " = 0;");
     const auto blocks = s.rows.size() > 1;
     for (const auto& row : s.rows) {
       if (blocks) w_.open("");
@@ -2834,11 +2861,10 @@ private:
       for (const auto& [col, e] : row) {
         w_.line("bc_row_set_param(cx, r, " + w_.col(col) + ", " + std::to_string(e.param) + ");");
       }
-      write_checked(s.table, s.checks, "bc_insert(cx, " + w_.tbl(s.table) + ", ", !s.returning.empty());
-      returned(s.table, "nr", s.returning);
+      insert_row(s.table, s.checks, s.returning, s.arbiter, count);
       if (blocks) w_.close();
     }
-    w_.line("bc_emit_count(cx, " + std::to_string(s.rows.size()) + ");");
+    w_.line("bc_emit_count(cx, " + (s.arbiter ? count : std::to_string(s.rows.size())) + ");");
   }
 
   // INSERT … SELECT: the query's Emit, whose rows go to a sink that writes
@@ -2865,9 +2891,7 @@ private:
       for (const auto& [col, e] : s.fixed) {
         w.line("bc_row_set_param(cx, r, " + w.col(col) + ", " + std::to_string(e.param) + ");");
       }
-      write_checked(s.table, s.checks, "bc_insert(cx, " + w.tbl(s.table) + ", ", !s.returning.empty());
-      returned(s.table, "nr", s.returning);
-      w.line("++" + count + ";");
+      insert_row(s.table, s.checks, s.returning, s.arbiter, count);
       w.close();
     };
     sink_ = &sink;

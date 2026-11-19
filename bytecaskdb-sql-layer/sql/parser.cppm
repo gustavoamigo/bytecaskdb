@@ -1057,11 +1057,42 @@ auto returning_list(PgQuery__Node** list, std::size_t n) -> std::vector<Expr> {
   return out;
 }
 
-auto insert(const PgQuery__InsertStmt* s, std::int32_t pos) -> Insert {
-  if (s->on_conflict_clause != nullptr || s->with_clause != nullptr) {
-    reject("INSERT option not supported", s->relation->location);
+// ON CONFLICT DO NOTHING, with no target or a list of columns: DO UPDATE,
+// ON CONSTRAINT, an inference WHERE and an expression, collation or
+// operator class in the target are refused (0A000); ASC/DESC or NULLS
+// FIRST/LAST on a target column is 42P10, as in PostgreSQL.
+auto on_conflict(const PgQuery__OnConflictClause* c) -> Insert::OnConflict {
+  if (c->action == PG_QUERY__ON_CONFLICT_ACTION__ONCONFLICT_UPDATE) {
+    reject("ON CONFLICT DO UPDATE is not supported yet", c->location, kFeatureNotSupported);
   }
+  Insert::OnConflict out{{}, c->location};
+  const auto* infer = c->infer;
+  if (infer == nullptr) return out;
+  if (!empty(infer->conname)) reject("ON CONFLICT ON CONSTRAINT is not supported yet", infer->location, kFeatureNotSupported);
+  if (infer->where_clause != nullptr) {
+    reject("ON CONFLICT with a WHERE on its target is not supported yet", infer->location, kFeatureNotSupported);
+  }
+  for (std::size_t i = 0; i < infer->n_index_elems; ++i) {
+    const auto* e = infer->index_elems[i]->index_elem;
+    if (e->ordering != PG_QUERY__SORT_BY_DIR__SORTBY_DEFAULT) {
+      reject("ASC/DESC is not allowed in ON CONFLICT clause", infer->location, kInvalidColumnReference);
+    }
+    if (e->nulls_ordering != PG_QUERY__SORT_BY_NULLS__SORTBY_NULLS_DEFAULT) {
+      reject("NULLS FIRST/LAST is not allowed in ON CONFLICT clause", infer->location, kInvalidColumnReference);
+    }
+    if (e->expr != nullptr || empty(e->name) || e->n_collation != 0 || e->n_opclass != 0) {
+      reject("ON CONFLICT on an expression, a collation or an operator class is not supported yet", infer->location,
+             kFeatureNotSupported);
+    }
+    out.columns.emplace_back(e->name);
+  }
+  return out;
+}
+
+auto insert(const PgQuery__InsertStmt* s, std::int32_t pos) -> Insert {
+  if (s->with_clause != nullptr) reject("INSERT option not supported", s->relation->location);
   Insert ins{relation(s->relation), {}, {}, pos};
+  if (s->on_conflict_clause != nullptr) ins.on_conflict = on_conflict(s->on_conflict_clause);
   for (std::size_t i = 0; i < s->n_cols; ++i) ins.columns.emplace_back(s->cols[i]->res_target->name);
   const auto* sel = s->select_stmt == nullptr ? nullptr : s->select_stmt->select_stmt;
   if (sel == nullptr) reject("INSERT takes VALUES rows or a query", s->relation->location);

@@ -937,3 +937,231 @@ TEST_CASE("plan writes: a row written by one run is refused to a later run of th
   CHECK(bc_error_detail(f.cx) == unique_on(kW));
   bc_ctx_reset(f.cx);
 }
+
+namespace {
+
+std::uint32_t g_arbiter = 0;
+
+// INSERT INTO w VALUES ($1, $2, $3, $4) ON CONFLICT (g_arbiter's) DO NOTHING
+void insert_w_on_conflict(bc_ctx* cx) {
+  ++g_runs;
+  bc_row r = bc_row_begin(cx, kW);
+  bc_row_set_param(cx, r, kId, 0);
+  bc_row_set_param(cx, r, kA, 1);
+  bc_row_set_param(cx, r, kB, 2);
+  bc_row_set_param(cx, r, kC, 3);
+  bc_emit_count(cx, bc_insert_on_conflict(cx, kW, bc_row_end(cx, r), g_arbiter) ? 1 : 0);
+}
+
+// INSERT INTO w (id, b, c) VALUES ($1, $2, 0), ($3, $4, 0) ON CONFLICT … DO NOTHING
+void insert_two_on_conflict(bc_ctx* cx) {
+  int64_t n = 0;
+  for (uint32_t p = 0; p < 4; p += 2) {
+    bc_row r = bc_row_begin(cx, kW);
+    bc_row_set_param(cx, r, kId, p);
+    bc_row_set_param(cx, r, kB, p + 1);
+    bc_row_set_i64(cx, r, kC, 0);
+    if (bc_insert_on_conflict(cx, kW, bc_row_end(cx, r), g_arbiter)) ++n;
+  }
+  bc_emit_count(cx, n);
+}
+
+// DELETE FROM w WHERE id = $1, then INSERT INTO w (id, c) VALUES ($1, 0) ON
+// CONFLICT (id) DO NOTHING: the key it vacated takes the row.
+void delete_then_insert_on_conflict(bc_ctx* cx) {
+  bool found = false;
+  bc_view old = bc_get(cx, bc_key_params(cx, kW, 0, 1), &found);
+  if (found) bc_delete(cx, kW, old);
+  bc_row r = bc_row_begin(cx, kW);
+  bc_row_set_param(cx, r, kId, 0);
+  bc_row_set_i64(cx, r, kC, 0);
+  bc_emit_count(cx, bc_insert_on_conflict(cx, kW, bc_row_end(cx, r), kW) ? 1 : 0);
+}
+
+}  // namespace
+
+TEST_CASE("plan writes: bc_insert_on_conflict skips a row whose arbiter key is taken and checks the other keys",
+          "[sql][algebra][writes]") {
+  Fixture f;
+  create_w(f);
+  REQUIRE(run(f, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("x"), std::int64_t{0}}) == BC_COMMITTED);
+  auto skipped = [&](std::uint32_t arbiter, std::vector<bc_value> p) {
+    g_arbiter = arbiter;
+    g_runs = 0;
+    REQUIRE(run(f, insert_w_on_conflict, std::move(p), {}, 3) == BC_COMMITTED);
+    CHECK(g_runs == 1);
+    CHECK(bc_ctx_affected(f.cx) == 0);
+  };
+  auto refused = [&](std::uint32_t arbiter, std::vector<bc_value> p, std::uint32_t detail) {
+    g_arbiter = arbiter;
+    g_runs = 0;
+    CHECK(run(f, insert_w_on_conflict, std::move(p), {}, 3) == BC_FAILED);
+    CHECK(g_runs == 1);
+    CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);
+    CHECK(bc_error_detail(f.cx) == detail);
+  };
+  // The primary key as the arbiter: its duplicate is skipped, another unique
+  // index's is still 23505.
+  skipped(kW, {std::int64_t{1}, std::int64_t{2}, bytes("y"), std::int64_t{0}});
+  refused(kW, {std::int64_t{2}, std::int64_t{2}, bytes("x"), std::int64_t{0}}, unique_on(kWB));
+  // A unique index as the arbiter, a DESC part and a two-part one; then the primary key is the other.
+  skipped(kWB, {std::int64_t{2}, std::int64_t{2}, bytes("x"), std::int64_t{0}});
+  skipped(kWCA, {std::int64_t{2}, std::int64_t{1}, bytes("z"), std::int64_t{0}});
+  refused(kWB, {std::int64_t{1}, std::int64_t{2}, bytes("y"), std::int64_t{0}}, unique_on(kW));
+  // Any unique key.
+  skipped(BC_ARBITER_ANY, {std::int64_t{1}, std::int64_t{2}, bytes("y"), std::int64_t{0}});
+  skipped(BC_ARBITER_ANY, {std::int64_t{2}, std::int64_t{2}, bytes("x"), std::int64_t{0}});
+  skipped(BC_ARBITER_ANY, {std::int64_t{2}, std::int64_t{1}, bytes("z"), std::int64_t{0}});
+  // Nulls are distinct: an arbiter entry with a null part takes the row.
+  g_arbiter = kWB;
+  REQUIRE(run(f, insert_w_on_conflict, {std::int64_t{2}, std::int64_t{2}, bc_value{}, std::int64_t{0}}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == 1);
+  g_arbiter = BC_ARBITER_ANY;
+  REQUIRE(run(f, insert_w_on_conflict, {std::int64_t{3}, std::int64_t{3}, bytes("z"), std::int64_t{0}}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == 1);
+  // An arbiter that is no unique key of the table is a plan bug.
+  g_arbiter = kWA;
+  CHECK(run(f, insert_w_on_conflict, {std::int64_t{4}, std::int64_t{4}, bytes("w"), std::int64_t{0}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  // NOT NULL is checked first: its error is sticky, and nothing is skipped or written.
+  g_arbiter = kW;
+  CHECK(run(f, insert_w_on_conflict, {std::int64_t{1}, std::int64_t{1}, bytes("x"), bc_value{}}) == BC_FAILED);
+  CHECK(bc_error_detail(f.cx) == not_null_on(kW));
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 3);
+  check_indexes_exact(f);
+}
+
+TEST_CASE("plan writes: bc_insert_on_conflict skips a key the execution wrote and takes one it vacated",
+          "[sql][algebra][writes]") {
+  Fixture f;
+  create_w(f);
+  g_arbiter = kW;
+  REQUIRE(run(f, insert_two_on_conflict, {std::int64_t{1}, bytes("x"), std::int64_t{1}, bytes("y")}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == 1);
+  g_arbiter = kWB;
+  REQUIRE(run(f, insert_two_on_conflict, {std::int64_t{2}, bytes("z"), std::int64_t{3}, bytes("z")}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == 1);
+  // The second row's primary key, not its arbiter, is the first row's: 23505.
+  CHECK(run(f, insert_two_on_conflict, {std::int64_t{4}, bytes("p"), std::int64_t{4}, bytes("q")}) == BC_FAILED);
+  CHECK(bc_error_detail(f.cx) == unique_on(kW));
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 2);
+  REQUIRE(run(f, delete_then_insert_on_conflict, {std::int64_t{1}}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == 1);
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 2);
+  check_indexes_exact(f);
+}
+
+TEST_CASE("plan writes: an arbiter key a concurrent commit took is a conflict, and the retry skips the row",
+          "[sql][algebra][writes]") {
+  // The arbiter key pushes no insert claim: the commit is BC_CONFLICT, never
+  // BC_C_UNIQUE, and an autocommit retry reads the row and skips it.
+  Fixture f;
+  create_w(f);
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+  auto ref = sr.get();
+  auto* other = bc_ctx_new(&f.bdb, &f.bcat);
+  REQUIRE(other != nullptr);
+  auto race = [&](std::uint32_t arbiter, std::vector<bc_value> mine, std::vector<bc_value> theirs) {
+    g_arbiter = arbiter;
+    auto pa = params(std::move(mine));
+    auto pb = params(std::move(theirs));
+    bc_ctx_begin(f.cx, &pa, {});
+    bc_ctx_run(f.cx, insert_w_on_conflict, &ref);
+    REQUIRE(bc_error(f.cx) == BC_OK);
+    CHECK(bc_ctx_affected(f.cx) == 1);
+    CHECK(bc_execute(other, insert_w, &ref, &pb, {}, false, 0) == BC_COMMITTED);
+    CHECK(bc_ctx_commit(f.cx, false) == BC_CONFLICT);
+    bc_ctx_reset(f.cx);
+    g_runs = 0;
+    CHECK(bc_execute(f.cx, insert_w_on_conflict, &ref, &pa, {}, false, 3) == BC_COMMITTED);
+    CHECK(g_runs == 1);
+    CHECK(bc_ctx_affected(f.cx) == 0);
+  };
+  SECTION("the primary key") {
+    race(kW, {std::int64_t{1}, std::int64_t{1}, bytes("a"), std::int64_t{0}},
+         {std::int64_t{1}, std::int64_t{2}, bytes("b"), std::int64_t{1}});
+  }
+  SECTION("a unique index, under another primary key") {
+    race(kWB, {std::int64_t{1}, std::int64_t{1}, bytes("a"), std::int64_t{0}},
+         {std::int64_t{2}, std::int64_t{2}, bytes("a"), std::int64_t{1}});
+  }
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 1);
+  bc_ctx_free(other);
+  check_indexes_exact(f);
+}
+
+TEST_CASE("plan writes: every unique key over the arbiter's columns is an arbiter, and its race a conflict",
+          "[sql][algebra][writes]") {
+  // A key a commit took after the transaction's snapshot, before its
+  // statement ran: a unique key over the arbiter's columns takes no insert
+  // claim either, so the commit is BC_CONFLICT, never BC_C_UNIQUE on it.
+  Fixture f;
+  create_w(f);
+  auto race = [&](std::uint32_t arbiter, std::vector<bc_value> mine, std::vector<bc_value> theirs) {
+    SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+    auto ref = sr.get();
+    auto* other = bc_ctx_new(&f.bdb, &f.bcat);
+    REQUIRE(other != nullptr);
+    g_arbiter = arbiter;
+    auto pa = params(std::move(mine));
+    auto pb = params(std::move(theirs));
+    // A transaction's commit tells a duplicate (BC_FAILED, BC_C_UNIQUE)
+    // from a conflict.
+    auto* txn = bc_txn_new(&f.bdb, &f.bcat, 64u << 20);
+    REQUIRE(txn != nullptr);
+    bc_ctx_begin_txn(f.cx, txn, &pa, {});
+    CHECK(bc_execute(other, insert_w, &ref, &pb, {}, false, 0) == BC_COMMITTED);
+    bc_ctx_run(f.cx, insert_w_on_conflict, &ref);
+    REQUIRE(bc_error(f.cx) == BC_OK);
+    CHECK(bc_ctx_affected(f.cx) == 1);
+    REQUIRE(bc_txn_add(f.cx));
+    bc_ctx_reset(f.cx);
+    CHECK(bc_txn_commit(txn, false) == BC_CONFLICT);
+    CHECK(bc_txn_error(txn) == BC_OK);
+    bc_txn_free(txn);
+    g_runs = 0;
+    CHECK(bc_execute(f.cx, insert_w_on_conflict, &ref, &pa, {}, false, 3) == BC_COMMITTED);
+    CHECK(g_runs == 1);
+    CHECK(bc_ctx_affected(f.cx) == 0);
+    bc_ctx_free(other);
+  };
+  SECTION("a unique index beside another over the same columns") {
+    // w_ac (a, c) beside w_ca (c, a DESC): naming w_ca arbitrates both.
+    f.ddl(bytecask::sql::CreateIndexDdl{"w_ac", "w", {{"a"}, {"c"}}, true});
+    race(kWCA, {std::int64_t{1}, std::int64_t{1}, bytes("a"), std::int64_t{0}},
+         {std::int64_t{2}, std::int64_t{1}, bytes("b"), std::int64_t{0}});
+  }
+  SECTION("the primary key beside a unique index over its column") {
+    f.ddl(bytecask::sql::CreateIndexDdl{"w_id", "w", {{"id"}}, true});
+    race(kW, {std::int64_t{1}, std::int64_t{1}, bytes("a"), std::int64_t{0}},
+         {std::int64_t{1}, std::int64_t{2}, bytes("b"), std::int64_t{1}});
+  }
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 1);
+  check_indexes_exact(f);
+}
+
+TEST_CASE("plan writes: a conflicting row a concurrent commit deletes is still skipped (a known difference)",
+          "[sql][algebra][writes]") {
+  // The owner's decision: the check reads the snapshot and guards nothing,
+  // so the skip stands; PostgreSQL (READ COMMITTED and REPEATABLE READ)
+  // would insert the row.
+  Fixture f;
+  create_w(f);
+  REQUIRE(run(f, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("x"), std::int64_t{0}}) == BC_COMMITTED);
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+  auto ref = sr.get();
+  auto* other = bc_ctx_new(&f.bdb, &f.bcat);
+  REQUIRE(other != nullptr);
+  g_arbiter = kW;
+  auto pa = params({std::int64_t{1}, std::int64_t{2}, bytes("y"), std::int64_t{0}});
+  auto pb = params({std::int64_t{1}});
+  bc_ctx_begin(f.cx, &pa, {});
+  bc_ctx_run(f.cx, insert_w_on_conflict, &ref);
+  REQUIRE(bc_error(f.cx) == BC_OK);
+  CHECK(bc_ctx_affected(f.cx) == 0);
+  CHECK(bc_execute(other, delete_w, &ref, &pb, {}, false, 0) == BC_COMMITTED);
+  CHECK(bc_ctx_commit(f.cx, false) == BC_COMMITTED);
+  bc_ctx_reset(f.cx);
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 0);
+  bc_ctx_free(other);
+}

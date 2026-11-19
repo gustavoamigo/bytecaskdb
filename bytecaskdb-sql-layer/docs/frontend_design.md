@@ -83,6 +83,32 @@ kind the transformer doesn't take is refused with its position.
   `Emit` (#682); and `INSERT … SELECT` in a procedure. The plan is the
   query's, its rows sent to the write (`planner_design.md`, *INSERT …
   SELECT*).
+- `INSERT … ON CONFLICT DO NOTHING`, of `VALUES` or a query: a row whose
+  key under the arbiter is taken is skipped, and the rest are written. With
+  no target the arbiter is every unique constraint, the primary key and each
+  unique index; with a list of columns it is every one whose columns are
+  the list's, as a set (`(b, a)` and `(a, a)` name what `(a, b)` and `(a)`
+  do, and unique indexes on `(a, b)` and `(b, a)` are both arbiters of
+  either), as PostgreSQL infers it: a column the table lacks is 42703, no
+  matching constraint is 42P10 ("there is no unique or exclusion constraint
+  matching the ON CONFLICT specification"), and so are `ASC`, `DESC` and
+  `NULLS FIRST`/`LAST` on a target column. A key is taken when a row the
+  statement wrote holds it (`VALUES (1, …), (1, …)` writes the first) or
+  the statement's view does and the statement did not vacate it; a key
+  with a NULL part conflicts with nothing. A duplicate under another unique
+  constraint is 23505, as without `ON CONFLICT`. NOT NULL (23502) and
+  `CHECK` (23514) are tested first, so a row that breaks one fails the
+  statement even where it would have been skipped, as in PostgreSQL. The
+  count and `RETURNING` are the rows written. The plan calls
+  `bc_insert_on_conflict` per row (`plan_api_design.md`), which decides
+  before it records anything, so a skip leaves no trace, and takes no
+  insert claim on an arbiter key: a concurrent commit of that key makes the
+  commit a conflict, retried in autocommit, where the retry reads the row
+  and skips it, and 40001 in a transaction. A row skipped because the
+  snapshot holds it stays skipped when a concurrent commit deletes it
+  (*Known differences*). Refused (0A000): `DO UPDATE`, `ON CONSTRAINT`, a
+  `WHERE` on the target, an expression, collation or operator class in it,
+  `ON CONFLICT` into a view, and in a procedure.
 - `RETURNING` of an `INSERT`, `UPDATE` or `DELETE`: a result row per row
   written, its list bound as a select list over the one table (`*`,
   columns, constants, parameters, expressions, each named as a select
@@ -994,6 +1020,9 @@ That includes:
   `FOR UPDATE` of a join (#697), an alias of a join, an output name in `GROUP BY`;
 - `RETURNING` in a procedure; `VALUES` outside `INSERT`; `OFFSET` on a set operation, in one of
   its arms or in a view;
+- `ON CONFLICT DO UPDATE`, `ON CONFLICT ON CONSTRAINT`, a `WHERE`, an
+  expression, a collation or an operator class in `ON CONFLICT`'s target,
+  and `ON CONFLICT` into a view or in a procedure (0A000);
 - `INSERT … SELECT` of an aggregated, grouped or `DISTINCT` query or a set
   operation (#682), of a value outside its column's type or family that
   PostgreSQL assigns (a conversion through text, `CHAR(n)` into another
@@ -1522,8 +1551,19 @@ fail on them.
   view after `ALTER TABLE … ADD COLUMN`. PostgreSQL keeps the columns the
   star gave it.
 
-Each is a refusal or an error, not a different answer. Everything else in
-the dialect matches PostgreSQL, and the proof machine checks that it does.
+- **`ON CONFLICT DO NOTHING` skips a row whose conflicting row a
+  concurrent commit deletes** (owner decision, 2026-11-19). The check reads
+  the statement's snapshot and guards nothing, so a row the snapshot holds
+  under the arbiter is skipped even when another session's commit deletes
+  it before this statement commits, and the statement commits with the row
+  not written. PostgreSQL, in `READ COMMITTED` and in `REPEATABLE READ`,
+  waits for the deleting transaction and then inserts the row. A guard on the row would make the
+  commit a conflict, and the autocommit retry would insert it; that costs
+  a guard per skipped row and was not taken.
+
+Each is a refusal or an error, not a different answer, except the last.
+Everything else in the dialect matches PostgreSQL, and the proof machine
+checks that it does.
 
 ## What the layer doesn't do yet
 

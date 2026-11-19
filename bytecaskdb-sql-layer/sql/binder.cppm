@@ -5459,7 +5459,7 @@ public:
     if (const auto* i = std::get_if<ast::Insert>(&stmt)) {
       const auto* view = cat_.view(i->table);
       auto found = view != nullptr;
-      ast::Insert out{i->table, i->columns, {}, i->pos, cloned(i->returning), i->query};
+      ast::Insert out{i->table, i->columns, {}, i->pos, cloned(i->returning), i->query, i->on_conflict};
       if (i->query && mentions(*i->query)) {
         out.query = std::make_shared<const ast::Select>(expand(*i->query));
         found = true;
@@ -5548,6 +5548,7 @@ private:
   // PostgreSQL's order: the column list, the row's width, the view's shape
   // (55000), each column filled (0A000), two filling one base column (42601).
   void into_base_table(ast::Insert& s, const View& v) {
+    if (s.on_conflict) not_supported("INSERT … ON CONFLICT into a view", s.on_conflict->pos);
     const auto& b = body(v);
     std::vector<std::string> filled;
     if (s.columns.empty()) {
@@ -6166,6 +6167,7 @@ public:
           } else if constexpr (std::is_same_v<T, ast::Insert>) {
             if (!st.returning.empty()) not_yet("RETURNING in a procedure", st.pos);
             if (st.query) not_supported("INSERT … SELECT in a procedure", st.pos);
+            if (st.on_conflict) not_supported("INSERT … ON CONFLICT in a procedure", st.on_conflict->pos);
             for (auto& row : st.rows) {
               for (auto& v : row) names(v);
               for (auto& v : row) expr(v);
@@ -6398,6 +6400,27 @@ auto listed_columns(const Table& t, const ast::Insert& s) -> std::vector<const C
   return out;
 }
 
+// ON CONFLICT DO NOTHING's arbiter: with no target any unique constraint,
+// else one whose columns are the target's, as a set, as PostgreSQL infers
+// it: the primary key (the table's id) or a unique index. The runtime makes
+// every unique key over those columns an arbiter. A column the table lacks
+// is 42703; no such constraint, 42P10.
+auto arbiter(const Table& t, const ast::Insert::OnConflict& oc) -> std::uint32_t {
+  if (oc.columns.empty()) return logical::kAnyArbiter;
+  std::set<std::uint32_t> target;
+  for (const auto& name : oc.columns) target.insert(Binder::column(t, name, oc.pos)->id);
+  auto same = [&](const auto& ids) { return std::set<std::uint32_t>(ids.begin(), ids.end()) == target; };
+  if (t.row_id() == nullptr && same(t.pk_col_ids)) return t.id;
+  for (const auto& ix : t.indexes) {
+    if (!ix.unique) continue;
+    std::vector<std::uint32_t> cols;
+    for (const auto& p : ix.parts) cols.push_back(p.col_id);
+    if (same(cols)) return ix.id;
+  }
+  throw SqlError{"there is no unique or exclusion constraint matching the ON CONFLICT specification", oc.pos,
+                 kInvalidColumnReference};
+}
+
 // INSERT … SELECT: the query bound with its select list as the values of
 // the columns written (Binder::assign), a SELECT of rows: refused (0A000)
 // where it groups, aggregates, is DISTINCT, or is a set operation, whose
@@ -6422,7 +6445,8 @@ auto insert_query(Binder& b, const Table& t, const ast::Insert& s) -> logical::N
   if (!std::holds_alternative<logical::Project>(n->op)) {
     not_supported("INSERT … SELECT of an aggregated, grouped or DISTINCT query", s.query->pos);
   }
-  logical::InsertFrom out{std::move(rows), &t, {}, {}, b.checks(t), b.returning(t, s.returning)};
+  logical::InsertFrom out{std::move(rows), &t, {}, {}, b.checks(t), b.returning(t, s.returning), {}};
+  if (s.on_conflict) out.arbiter = arbiter(t, *s.on_conflict);
   const auto filled = b.take_assigned();
   for (const auto* c : filled) out.columns.push_back(logical::column_of(t.id, *c).col);
   for (const auto& c : t.columns) {
@@ -6616,6 +6640,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           // row is built (BC_C_NOT_NULL), as a NULL given for it is.
           out.checks = b.checks(*t);
           out.returning = b.returning(*t, s.returning);
+          if (s.on_conflict) out.arbiter = arbiter(*t, *s.on_conflict);
           return {logical::node(std::move(out)), s.pos};
         } else if constexpr (std::is_same_v<T, ast::Select>) {
           return {b.select(s), s.pos};

@@ -822,7 +822,7 @@ private:
           using T = std::decay_t<decltype(op)>;
           if constexpr (std::is_same_v<T, logical::Insert>) {
             constants(*op.table);
-            physical::Insert ins{op.table->id, {}, op.checks, returned(op.returning)};
+            physical::Insert ins{op.table->id, {}, op.checks, returned(op.returning), op.arbiter};
             for (const auto& values : op.rows) {
               auto& row = ins.rows.emplace_back();
               for (std::size_t i = 0; i < op.table->columns.size(); ++i) {
@@ -855,7 +855,7 @@ private:
             }
             for (auto& f : out) {
               if (!std::holds_alternative<physical::Emit>(f.root->op)) no_plan("an insert of a query whose rows are not an Emit's");
-              f.root = physical::node(physical::InsertFrom{std::move(f.root), op.table->id, filled, op.fixed, op.checks, returning});
+              f.root = physical::node(physical::InsertFrom{std::move(f.root), op.table->id, filled, op.fixed, op.checks, returning, op.arbiter});
             }
             return out;
           } else if constexpr (std::is_same_v<T, logical::Update>) {

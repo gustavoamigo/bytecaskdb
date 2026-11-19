@@ -389,6 +389,7 @@ struct Insert {
   std::vector<std::vector<std::pair<ColumnRef, Expr>>> rows;  // each row's columns, written in order
   std::vector<Expr> checks;  // logical::Insert's, evaluated over each row as written
   std::vector<Expr> returning;  // RETURNING's: one result row per row written, over the row as written
+  std::optional<std::uint32_t> arbiter;  // logical::Insert's: its count is then the rows written
 };
 
 // INSERT … SELECT: each row its input, an Emit, gives, written as a row of
@@ -399,8 +400,8 @@ struct Insert {
 // declared type and the SQL type of the query's value for it, which check
 // proves assigns as the binder's rule says, so a plan never writes a value
 // of another scale or kind than its column's. `fixed` and the defaults
-// bc_row_begin writes fill the columns left out; `checks` and `returning`
-// are as Insert's. Its count is the rows written.
+// bc_row_begin writes fill the columns left out; `checks`, `returning` and
+// `arbiter` are as Insert's. Its count is the rows written.
 struct InsertFrom {
   struct Filled {
     ColumnRef column;
@@ -413,6 +414,7 @@ struct InsertFrom {
   std::vector<std::pair<ColumnRef, Expr>> fixed;
   std::vector<Expr> checks;
   std::vector<Expr> returning;
+  std::optional<std::uint32_t> arbiter;
 };
 
 // UPDATE and DELETE write each row their input gives, read from the

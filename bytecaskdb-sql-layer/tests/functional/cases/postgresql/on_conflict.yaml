@@ -2,7 +2,6 @@
 
 - name: ON CONFLICT DO NOTHING skips the row
   features: [pg:on-conflict]
-  unimplemented: true
   setup:
     - CREATE TABLE oc (id INTEGER PRIMARY KEY, v INTEGER)
   steps:

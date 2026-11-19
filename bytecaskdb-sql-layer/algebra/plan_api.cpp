@@ -19,9 +19,10 @@
 // such a loop too. Pins, the contents of structures, the write set and the
 // result rows are kept elsewhere, and outlive the step.
 //
-// The writes (bc_insert, bc_update, bc_delete, bc_del_range) derive every
-// index entry from the row and the pinned catalog version, and run the
-// unique checks; a plan never writes a key itself.
+// The writes (bc_insert, bc_insert_on_conflict, bc_update, bc_delete,
+// bc_del_range) derive every index entry from the row and the pinned
+// catalog version, and run the unique checks; a plan never writes a key
+// itself.
 
 // Standard library headers before the module imports, for the reason
 // bytecaskdb/bytecask_hpp.cpp gives (LLVM 22's abi_tag redeclaration error).
@@ -2738,6 +2739,38 @@ void lock_row(bc_ctx* cx, BytesView pk, BytesView row) {
   (void)cx->push_lock(pk, row_fingerprint(row));
 }
 
+// Records a unique prefix this execution gives a row, charged first: false,
+// and its charge gone, when it already gave one a row, which the view cannot see.
+[[nodiscard]] auto record_unique(bc_ctx* cx, const Index& ix, BytesView prefix) -> bool {
+  const auto n = buffer_bytes(prefix.size()) + kUniqueNodeBytes;
+  if (!cx->take(n)) return false;
+  if (!cx->unique_written.emplace(ix.id, Bytes(prefix.begin(), prefix.end())).second) {
+    cx->release(n);
+    return false;
+  }
+  return true;
+}
+
+// Whether the view holds an entry with this unique prefix, nullopt with the
+// error set; the caller charged the first read. `claim` is set to whether
+// the snapshot holds it free too: as pk_free, a key free only because an
+// earlier statement deleted it is no claim.
+[[nodiscard]] auto prefix_taken(bc_ctx* cx, BytesView prefix, BytesView end, bool& claim) -> std::optional<bool> {
+  claim = true;
+  if (cx->overlay != nullptr && cx->overlay->meets(prefix, end)) {
+    // The overlay holds entries with this prefix, or deleted some: the
+    // first entry the view holds at or after it decides, each read charged.
+    ViewEntries entries{*cx->base, cx->overlay, prefix, end, false};
+    auto taken = entries.next(cx);
+    if (!cx->ok()) return std::nullopt;
+    if (taken) return true;
+    if (!cx->charge()) return std::nullopt;
+    claim = !holds_prefix(*cx->base, prefix);
+    return false;
+  }
+  return holds_prefix(*cx->base, prefix);
+}
+
 // No entry has this unique index prefix in the view, and no earlier write
 // of this execution gave a row it, or BC_C_UNIQUE on the index; the range
 // guard covers the race, since a duplicate is another row's entry, a key
@@ -2749,32 +2782,15 @@ void lock_row(bc_ctx* cx, BytesView pk, BytesView row) {
 [[nodiscard]] auto unique_free(bc_ctx* cx, const Index& ix, const Entry& entry) -> bool {
   auto prefix = entry.prefix();
   if (!cx->charge()) return false;
-  // Recorded, charged first; one this execution already gave a row, which
-  // the view cannot see, is not inserted again, and its charge goes.
-  const auto n = buffer_bytes(prefix.size()) + kUniqueNodeBytes;
-  if (!cx->take(n)) return false;
-  if (!cx->unique_written.emplace(ix.id, Bytes(prefix.begin(), prefix.end())).second) {
-    cx->release(n);
-    cx->raise(BC_C_UNIQUE, ix.id);
+  if (!record_unique(cx, ix, prefix)) {
+    if (cx->ok()) cx->raise(BC_C_UNIQUE, ix.id);
     return false;
   }
-  auto in_snapshot = [&] { return holds_prefix(*cx->base, prefix); };
   auto end = bytecask::sql::key_successor(prefix);
-  // As pk_free: a claim when the snapshot holds the prefix free too.
   auto claim = true;
-  if (cx->overlay != nullptr && cx->overlay->meets(prefix, end)) {
-    // The overlay holds entries with this prefix, or deleted some: the
-    // first entry the view holds at or after it decides, each read charged.
-    ViewEntries entries{*cx->base, cx->overlay, prefix, end, false};
-    auto taken = entries.next(cx);
-    if (!cx->ok()) return false;
-    if (taken) {
-      cx->raise(BC_C_UNIQUE, ix.id);
-      return false;
-    }
-    if (!cx->charge()) return false;
-    claim = !in_snapshot();
-  } else if (in_snapshot()) {
+  auto taken = prefix_taken(cx, prefix, end, claim);
+  if (!taken) return false;
+  if (*taken) {
     cx->raise(BC_C_UNIQUE, ix.id);
     return false;
   }
@@ -5788,28 +5804,137 @@ bool bc_agg_null(bc_ctx* cx, bc_group g, uint32_t slot) {
 
 // -------------------------------------------------------------------- writes
 
+namespace {
+
+// A row an INSERT writes: its table, its bytes, its primary key and its
+// index entries, encoded before anything is checked or recorded.
+struct NewRow {
+  const Table* t{nullptr};
+  BytesView row;
+  Bytes pk;
+  std::vector<Entry> entries;
+};
+
+// (Results through `out` here: these functions have C linkage.)
+[[nodiscard]] auto new_row(bc_ctx* cx, uint32_t table, bc_view row, NewRow& n) -> bool {
+  n.t = cx->table(table, true);
+  if (n.t == nullptr) return false;
+  auto r = write_row(cx, *n.t, row, false);
+  if (!r) return false;
+  n.row = *r;
+  n.entries.resize(n.t->indexes.size());
+  if (!encode_pk(cx, *n.t, *r, n.pk)) return false;
+  for (std::size_t i = 0; i < n.t->indexes.size(); ++i) {
+    if (!encode_entry(cx, *n.t, n.t->indexes[i], *r, n.entries[i])) return false;
+  }
+  return true;
+}
+
+// The unique keys ON CONFLICT's `arbiter` covers, by object id, into
+// `out`: the table's (its primary key) and its unique indexes'.
+// BC_ARBITER_ANY covers each; a named key covers every unique key over its
+// columns, as a set, as PostgreSQL makes each such index an arbiter. False
+// when `arbiter` is no unique key of the table.
+[[nodiscard]] auto arbiter_keys(const Table& t, std::uint32_t arbiter, std::vector<std::uint32_t>& out) -> bool {
+  std::vector<std::pair<std::uint32_t, std::set<std::uint32_t>>> keys;
+  keys.emplace_back(t.id, std::set<std::uint32_t>(t.pk_col_ids.begin(), t.pk_col_ids.end()));
+  for (const auto& ix : t.indexes) {
+    if (!ix.unique) continue;
+    auto& [id, cols] = keys.emplace_back(ix.id, std::set<std::uint32_t>{});
+    for (const auto& p : ix.parts) cols.insert(p.col_id);
+  }
+  const auto named = std::ranges::find_if(keys, [&](const auto& k) { return k.first == arbiter; });
+  if (arbiter != BC_ARBITER_ANY && named == keys.end()) return false;
+  for (const auto& [id, cols] : keys) {
+    if (arbiter == BC_ARBITER_ANY || cols == named->second) out.push_back(id);
+  }
+  return true;
+}
+
+// Whether `arbiters`, arbiter_keys' (none for a plain INSERT), cover object `id`.
+[[nodiscard]] auto arbiter_covers(std::span<const std::uint32_t> arbiters, std::uint32_t id) -> bool {
+  return std::ranges::find(arbiters, id) != arbiters.end();
+}
+
+// An arbiter's unique prefix the row takes, checked free in the view: its
+// range guard, recorded as unique_free records one, and no claim.
+[[nodiscard]] auto take_arbiter_prefix(bc_ctx* cx, const Index& ix, const Entry& entry) -> bool {
+  auto prefix = entry.prefix();
+  if (!record_unique(cx, ix, prefix)) {
+    if (cx->ok()) cx->fail(BC_E_HANDLE, "an arbiter prefix of index " + ix.name + " taken after it was checked free");
+    return false;
+  }
+  cx->push_effect(EffectKind::GuardUniqueRange, prefix, bytecask::sql::key_successor(prefix));
+  return true;
+}
+
+// Checks the row's keys and writes the row and its entries. A key under
+// `arbiters` was checked free by bc_insert_on_conflict: it takes no insert
+// claim, so a concurrent commit of it is a conflict, never BC_C_UNIQUE.
+void insert_row(bc_ctx* cx, NewRow& n, std::span<const std::uint32_t> arbiters) {
+  const auto& t = *n.t;
+  auto vacated = vacated_here(cx, n.pk);
+  if (!first_write(cx, t, n.pk, true, true)) return;
+  if (!vacated && !arbiter_covers(arbiters, t.id) && !pk_free(cx, t, n.pk)) return;
+  for (std::size_t i = 0; i < t.indexes.size(); ++i) {
+    const auto& ix = t.indexes[i];
+    // Nulls are distinct: an entry with a null part collides with nothing.
+    if (!ix.unique || n.entries[i].has_null) continue;
+    if (!(arbiter_covers(arbiters, ix.id) ? take_arbiter_prefix(cx, ix, n.entries[i]) : unique_free(cx, ix, n.entries[i]))) {
+      return;
+    }
+  }
+  cx->push_effect(EffectKind::Put, std::move(n.pk), n.row);
+  for (auto& e : n.entries) cx->push_effect(EffectKind::Put, std::move(e.key));
+}
+
+// Whether ON CONFLICT DO NOTHING skips the row: a key under an arbiter is
+// a row this execution wrote, or one the view holds that it did not vacate.
+// Reads, charged, and records nothing; true too once an error is set.
+[[nodiscard]] auto conflicts(bc_ctx* cx, const NewRow& n, std::span<const std::uint32_t> arbiters) -> bool {
+  const auto& t = *n.t;
+  if (arbiter_covers(arbiters, t.id)) {
+    auto it = cx->written_rows.find(n.pk);
+    if (it != cx->written_rows.end() && it->second) return true;
+    if (it == cx->written_rows.end() && (!cx->charge() || view_contains(cx, n.pk))) return true;
+  }
+  for (std::size_t i = 0; i < t.indexes.size(); ++i) {
+    const auto& ix = t.indexes[i];
+    if (!ix.unique || !arbiter_covers(arbiters, ix.id) || n.entries[i].has_null) continue;
+    auto prefix = n.entries[i].prefix();
+    if (cx->unique_written.contains({ix.id, Bytes(prefix.begin(), prefix.end())})) return true;
+    if (!cx->charge()) return true;
+    auto claim = true;
+    auto taken = prefix_taken(cx, prefix, bytecask::sql::key_successor(prefix), claim);
+    if (!taken || *taken) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
 void bc_insert(bc_ctx* cx, uint32_t table, bc_view row) {
   BC_GUARD_BEGIN
-  const auto* t = cx->table(table, true);
-  if (t == nullptr) return;
-  auto r = write_row(cx, *t, row, false);
-  if (!r) return;
-  Bytes pk;
-  if (!encode_pk(cx, *t, *r, pk)) return;
-  auto vacated = vacated_here(cx, pk);
-  if (!first_write(cx, *t, pk, true, true)) return;
-  std::vector<Entry> entries(t->indexes.size());
-  for (std::size_t i = 0; i < t->indexes.size(); ++i) {
-    if (!encode_entry(cx, *t, t->indexes[i], *r, entries[i])) return;
-  }
-  if (!vacated && !pk_free(cx, *t, pk)) return;
-  for (std::size_t i = 0; i < t->indexes.size(); ++i) {
-    // Nulls are distinct: an entry with a null part collides with nothing.
-    if (t->indexes[i].unique && !entries[i].has_null && !unique_free(cx, t->indexes[i], entries[i])) return;
-  }
-  cx->push_effect(EffectKind::Put, std::move(pk), *r);
-  for (auto& e : entries) cx->push_effect(EffectKind::Put, std::move(e.key));
+  NewRow n{};
+  if (new_row(cx, table, row, n)) insert_row(cx, n, {});
   BC_GUARD_END(cx)
+}
+
+bool bc_insert_on_conflict(bc_ctx* cx, uint32_t table, bc_view row, uint32_t arbiter) {
+  BC_GUARD_BEGIN
+  NewRow n{};
+  if (!new_row(cx, table, row, n)) return false;
+  const auto& t = *n.t;
+  std::vector<std::uint32_t> arbiters;
+  if (!arbiter_keys(t, arbiter, arbiters)) {
+    cx->fail(BC_E_HANDLE, "arbiter " + std::to_string(arbiter) + " is neither table " + t.name + " nor a unique index of it");
+    return false;
+  }
+  if (conflicts(cx, n, arbiters)) return false;
+  insert_row(cx, n, arbiters);
+  return cx->ok();
+  BC_GUARD_END(cx)
+  return false;
 }
 
 void bc_update(bc_ctx* cx, uint32_t table, bc_view old, bc_view row) {

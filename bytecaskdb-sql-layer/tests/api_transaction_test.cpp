@@ -1770,3 +1770,55 @@ TEST_CASE("embedded API: a cursor's copy of its transaction's writes counts agai
   CHECK(t.commit() == CommitOutcome::RolledBack);
   CHECK(db->memory_used_for_testing() == 0);
 }
+
+TEST_CASE("embedded API: ON CONFLICT DO NOTHING in a transaction skips its own rows, and a key a concurrent commit "
+          "took is 40001",
+          "[sql][api][txn]") {
+  sql_test::TempDir dir{"api_txn"};
+  auto db = open_db(dir);
+  constexpr auto kInsert = "INSERT INTO acct VALUES ($1, $2) ON CONFLICT (id) DO NOTHING";
+  auto a = db->begin();
+  CHECK(a.execute(kInsert, {std::int64_t{1}, std::int64_t{10}}).affected == 1);
+  CHECK(a.execute(kInsert, {std::int64_t{1}, std::int64_t{11}}).affected == 0);  // the transaction's own row
+  (void)a.execute("DELETE FROM acct WHERE id = $1", {std::int64_t{1}});
+  CHECK(a.execute(kInsert, {std::int64_t{1}, std::int64_t{12}}).affected == 1);  // free again in its view
+  CHECK(a.execute(kInsert, {std::int64_t{2}, std::int64_t{20}}).affected == 1);
+  // A concurrent commit takes key 2: the arbiter took no claim, so the
+  // commit is a conflict, not 23505.
+  db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{2}, std::int64_t{99}});
+  try {
+    (void)a.commit();
+    FAIL("the commit did not conflict");
+  } catch (const SerializationFailure& e) {
+    CHECK(e.conflict());
+  }
+  CHECK(balance(*db, 1) == std::nullopt);
+  CHECK(balance(*db, 2) == 99);
+  // An autocommit statement raced the same way retries and skips: here the
+  // row is already there, and the statement skips it.
+  CHECK(db->execute(kInsert, {std::int64_t{2}, std::int64_t{0}}).affected == 0);
+  CHECK(balance(*db, 2) == 99);
+}
+
+TEST_CASE("embedded API: ON CONFLICT DO NOTHING arbitrates every unique index over its target's columns",
+          "[sql][api][txn]") {
+  // (a, b) and (b, a) are both arbiters of ON CONFLICT (a, b), as in
+  // PostgreSQL: a concurrent commit of the key is 40001, never 23505.
+  sql_test::TempDir dir{"api_txn"};
+  auto db = open_db(dir);
+  db->execute("CREATE TABLE pair (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)");
+  db->execute("CREATE UNIQUE INDEX pair_ab ON pair (a, b)");
+  db->execute("CREATE UNIQUE INDEX pair_ba ON pair (b, a)");
+  auto t = db->begin();
+  (void)t.execute("SELECT count(*) FROM pair");
+  db->execute("INSERT INTO pair VALUES (7, 7, 7)");
+  CHECK(t.execute("INSERT INTO pair VALUES (8, 7, 7) ON CONFLICT (a, b) DO NOTHING").affected == 1);
+  try {
+    (void)t.commit();
+    FAIL("the commit did not conflict");
+  } catch (const SerializationFailure& e) {
+    CHECK(e.conflict());
+  }
+  CHECK(db->execute("INSERT INTO pair VALUES (8, 7, 7) ON CONFLICT (b, a) DO NOTHING").affected == 0);
+  CHECK(db->execute("SELECT id FROM pair").rows.size() == 1);
+}
