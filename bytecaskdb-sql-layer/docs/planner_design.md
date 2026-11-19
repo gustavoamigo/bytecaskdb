@@ -741,9 +741,13 @@ sorted above the join (*Sorts*).
 ### Joins of several tables
 
 **The tree.** A `FROM` of tables is a left-deep tree of `Join`s, one per
-item after the first: `a JOIN b … JOIN c …`, or a comma list. The binder
-checks each `ON` against the items up to its own (a later table is 42P01, as
-PostgreSQL). An inner join's `ON` goes with the `WHERE`'s conjuncts and
+item after the first: `a JOIN b … JOIN c …`, a comma list, or both, an
+inner join in parentheses flattened into the list by the parser. The binder
+checks each `ON` against the items of its own join, up to its own (a later
+table is 42P01, one before a join in parentheses or after a comma 42P01 or
+42703, as PostgreSQL). Such an `ON` reads none of the items before its
+join, so the chain's left side under it pairs its rows with every row
+before, as PostgreSQL's tree does, a `LEFT JOIN` after a comma included. An inner join's `ON` goes with the `WHERE`'s conjuncts and
 pushdown moves it to the lowest `Join` that has its tables; an outer join's
 stays its own. The front end takes at most eight tables
 (`kMaxFrom`): the search is a pass over the subsets of them, 255 sets

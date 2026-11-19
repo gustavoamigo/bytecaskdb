@@ -145,6 +145,9 @@ struct Compare {
   Expr lhs, rhs;
   std::int32_t pos{-1};
   std::uint32_t on{0};  // 0: the WHERE's; k: the ON conjunct of Select::from[k]
+  // An ON's first FROM item: it sees from[on_from] to from[on], the items of
+  // its own join. 0 but for a join in parentheses or after a comma.
+  std::uint32_t on_from{0};
   Kind kind{Kind::Compare};
   std::vector<Compare> args;  // And, Or: two or more; Not: one
   std::optional<std::string> escape;  // Like: ESCAPE's string; none for the default, a backslash
@@ -340,6 +343,9 @@ struct FromItem {
   // qualifier that names an alias to its table, so the alias stays only for a
   // query that names one table twice, where it tells the two apart.
   std::string alias;
+  // The name the statement gives the item, its alias else its table, kept
+  // where `alias` is dropped: what an error about the item names.
+  std::string written;
   // t AS x (a, b): the names of the table's first columns in this query.
   std::vector<std::string> column_aliases;
   std::int32_t pos{-1};
@@ -399,6 +405,7 @@ struct SetOperation {
 [[nodiscard]] auto clone(const Compare& c) -> Compare {
   Compare out{c.op, clone(c.lhs), clone(c.rhs), c.pos};
   out.on = c.on;
+  out.on_from = c.on_from;
   out.kind = c.kind;
   for (const auto& a : c.args) out.args.push_back(clone(a));
   out.escape = c.escape;

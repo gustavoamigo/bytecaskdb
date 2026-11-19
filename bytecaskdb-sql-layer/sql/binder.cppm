@@ -3108,13 +3108,29 @@ public:
     return column(t, e.column, e.pos);
   }
 
+  // The FROM items before the part of a FROM an ON reads, and the names
+  // the statement gives them: what PostgreSQL names where the ON reads a
+  // column only they have (column).
+  struct Hidden {
+    std::span<const Table* const> rels;
+    std::span<const std::string> names;
+  };
+
   // A column reference of a join: the relation whose name it carries, or,
   // unqualified, the column of that name among the join's columns
   // (JoinScope) of the relations in scope, a USING or NATURAL column one
   // column; a name more than one has is ambiguous (42702). A USING's alias
   // names that join's USING columns alone.
-  auto column(std::span<const Table* const> rels, const ast::Expr& e) const -> std::pair<std::uint32_t, const Column*> {
-    if (const auto* level = joins_.level(rels.size())) {
+  //
+  // `rels` is a prefix of the FROM items, or, for an ON in parentheses or
+  // after a comma, the items of its own join, the FROM items before them
+  // `hidden`: a name only those have is PostgreSQL's 42703 with its DETAIL.
+  // Such a join has no USING (the parser refuses it), so its columns are
+  // its relations'.
+  auto column(std::span<const Table* const> rels, const ast::Expr& e, const Hidden& hidden = {}) const
+      -> std::pair<std::uint32_t, const Column*> {
+    const auto* level = hidden.rels.empty() ? joins_.level(rels.size()) : nullptr;
+    if (level != nullptr) {
       auto at = [&](const JoinColumn& j) -> std::pair<std::uint32_t, const Column*> {
         auto side = std::ranges::find(rels, j.table);
         if (side == rels.end()) throw std::logic_error{"a join column of a relation out of scope"};
@@ -3147,7 +3163,23 @@ public:
     if (!e.table.empty() && std::ranges::none_of(rels, [&](const Table* t) { return t->name == e.table; })) {
       throw SqlError{"missing FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable};
     }
-    throw SqlError{"column \"" + e.column + "\" does not exist", e.pos, kUndefinedColumn};
+    SqlError missing{"column \"" + e.column + "\" does not exist", e.pos, kUndefinedColumn};
+    std::vector<std::size_t> out_of_reach;
+    for (std::size_t i = 0; e.table.empty() && i < hidden.rels.size(); ++i) {
+      if (hidden.rels[i]->column(e.column) != nullptr) out_of_reach.push_back(i);
+    }
+    if (out_of_reach.size() == 1) {
+      throw std::move(missing).with_notes("There is a column named \"" + e.column + "\" in table \"" +
+                                              hidden.names[out_of_reach[0]] +
+                                              "\", but it cannot be referenced from this part of the query.",
+                                          "");
+    }
+    if (out_of_reach.size() > 1) {
+      throw std::move(missing).with_notes("There are columns named \"" + e.column +
+                                              "\", but they are in tables that cannot be referenced from this part of the query.",
+                                          "Try using a table-qualified name.");
+    }
+    throw missing;
   }
 
   // Gives parameter $n+1 a type from one use with `col`, which sets its
@@ -3783,21 +3815,27 @@ public:
   // The conjuncts of one clause of a join: the WHERE's (`join` 0) or the ON
   // of from[join], each a comparison of a column of one relation with a
   // parameter, or of columns of two relations, in the order written. An ON
-  // sees the relations up to its own; one it names later is 42P01.
-  auto conjuncts(std::span<const Table* const> rels, const std::vector<ast::Compare>& in, std::uint32_t join)
-      -> std::vector<logical::Expr> {
-    auto visible = rels.first(join == 0 ? rels.size() : std::min<std::size_t>(join + 1, rels.size()));
+  // sees the relations of its own join, up to from[join] and from
+  // from[on_from] (ast::Compare::on_from); one it names later is 42P01, a
+  // name of one before it 42P01 (the parser's) or 42703. `written` names
+  // each relation as the statement does.
+  auto conjuncts(std::span<const Table* const> rels, std::span<const std::string> written,
+                 const std::vector<ast::Compare>& in, std::uint32_t join) -> std::vector<logical::Expr> {
     std::vector<logical::Expr> out;
     for (const auto* c : top_level(in)) {
       const auto& w = *c;
       if (w.on != join) continue;
+      auto end = join == 0 ? rels.size() : std::min<std::size_t>(join + 1, rels.size());
+      auto first = std::min<std::size_t>(w.on_from, end);
+      auto visible = rels.subspan(first, end - first);
+      Hidden hidden{rels.first(first), written.first(first)};
       if (w.kind == ast::Compare::Kind::Compare && w.lhs.kind == ast::Expr::Kind::Column &&
           w.rhs.kind == ast::Expr::Kind::Column) {
-        out.push_back(join_on(visible, w));
+        out.push_back(join_on(visible, w, hidden));
         continue;
       }
       out.push_back(predicate(w, [&](const ast::Expr& e) {
-        auto [side, col] = column(visible, e);
+        auto [side, col] = column(visible, e, hidden);
         return std::pair{visible[side]->id, col};
       }));
     }
@@ -3807,9 +3845,9 @@ public:
   // A column of one relation compared with a column of another, of one SQL
   // type, by any of the operators; two columns of one relation, a filter of
   // its rows (columns_compare).
-  auto join_on(std::span<const Table* const> rels, const ast::Compare& w) const -> logical::Expr {
-    auto [ls, lc] = column(rels, w.lhs);
-    auto [rs, rc] = column(rels, w.rhs);
+  auto join_on(std::span<const Table* const> rels, const ast::Compare& w, const Hidden& hidden = {}) const -> logical::Expr {
+    auto [ls, lc] = column(rels, w.lhs, hidden);
+    auto [rs, rc] = column(rels, w.rhs, hidden);
     if (ls == rs) return columns_compare(w, w.op, rels[ls]->id, *lc, *rc);
     return joined_compare(w.op, written_op(w, w.op), rels[ls]->id, *lc, rels[rs]->id, *rc, w.pos);
   }
@@ -4116,6 +4154,8 @@ public:
     // Join k's ON, for each outer join k.
     std::vector<std::vector<logical::Expr>> on(n);
     std::vector<bool> outer(n, false);
+    std::vector<std::string> written;
+    for (const auto& item : s.from) written.push_back(item.written.empty() ? item.name() : item.written);
     set_scope(rels);
     if (joined) {
       if (s.for_update) throw SqlError{"FOR UPDATE on a join is not supported yet", s.pos};
@@ -4131,6 +4171,7 @@ public:
       // alone is that table's, as in PostgreSQL.
       if (s.from[1].kind == ast::JoinKind::Right) {
         std::swap(rels[0], rels[1]);
+        std::swap(written[0], written[1]);
         set_scope(rels);
       }
       // A derived relation's rows are read only as the plan's outermost
@@ -4141,7 +4182,7 @@ public:
         }
       }
       for (std::size_t k = 1; k < n; ++k) {
-        auto here = conjuncts(rels, s.where, static_cast<std::uint32_t>(k));
+        auto here = conjuncts(rels, written, s.where, static_cast<std::uint32_t>(k));
         here.insert(here.begin(), std::make_move_iterator(using_equal[k].begin()), std::make_move_iterator(using_equal[k].end()));
         // A column of a NULL-extended relation is NULL-able in the ON of every later join.
         for (auto& e : here) {
@@ -4152,7 +4193,7 @@ public:
         auto& into = outer[k] ? on[k] : where_conjuncts;
         into.insert(into.end(), std::make_move_iterator(here.begin()), std::make_move_iterator(here.end()));
       }
-      auto rest = conjuncts(rels, s.where, 0);
+      auto rest = conjuncts(rels, written, s.where, 0);
       where_conjuncts.insert(where_conjuncts.end(), std::make_move_iterator(rest.begin()), std::make_move_iterator(rest.end()));
     } else {
       where_conjuncts = where(*rels[0], s.where);

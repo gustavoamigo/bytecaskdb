@@ -1665,6 +1665,45 @@ TEST_CASE("binder: a chain of joins is a left-deep tree, each ON bound against t
   CHECK(rejected(cat, "SELECT t.id FROM t AS k JOIN u USING (qty) AS t").first == "column t.id does not exist");
 }
 
+TEST_CASE("binder: an ON in parentheses or after a comma reads its own join's tables only", "[sql][binder][join]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE u (k BIGINT PRIMARY KEY, qty BIGINT)").stmt));
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE w (j BIGINT PRIMARY KEY, qty BIGINT, z BIGINT)").stmt));
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE v (z BIGINT PRIMARY KEY)").stmt));
+  const auto& cat = f.cat();
+  // The inner join's ON and the outer one's are both inner: conjuncts above the three tables.
+  CHECK(get<logical::Filter>(bind_sql(cat, "SELECT t.id FROM t JOIN (u JOIN w ON u.qty = w.qty) ON t.id = u.k"))
+            .conjuncts.size() == 2);
+  // An unqualified name resolves among the ON's own tables: qty is u's and w's, not t's too.
+  CHECK(rejected(cat, "SELECT t.id FROM t, u JOIN w ON qty = 1").first == "column reference \"qty\" is ambiguous");
+  CHECK_NOTHROW(bind_sql(cat, "SELECT t.id FROM t, u JOIN w ON k = j"));
+  // A USING join before a comma: the later ON's tables are its own, whatever the join before merged.
+  CHECK_NOTHROW(bind_sql(cat, "SELECT t.id FROM t JOIN u USING (qty), w JOIN v ON w.z = v.z"));
+  // A name only a table before the ON's join has is 42703, with PostgreSQL's DETAIL naming that table, or
+  // saying there are several.
+  auto missing = [&](std::string_view sql) -> std::pair<std::string, std::string> {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      CHECK(e.sqlstate() == "42703");
+      return {std::string{e.detail()}, std::string{e.hint()}};
+    }
+    FAIL("accepted: " << sql);
+    return {};
+  };
+  CHECK(missing("SELECT 1 FROM t AS x, u JOIN v ON name = v.z").first ==
+        "There is a column named \"name\" in table \"x\", but it cannot be referenced from this part of the query.");
+  CHECK(missing("SELECT 1 FROM w, t, u JOIN v ON j = v.z").first ==
+        "There is a column named \"j\" in table \"w\", but it cannot be referenced from this part of the query.");
+  auto several = missing("SELECT 1 FROM w, w AS y, u JOIN v ON j = v.z");
+  CHECK(several.first == "There are columns named \"j\", but they are in tables that cannot be referenced from this part of the query.");
+  CHECK(several.second == "Try using a table-qualified name.");
+  // A later table, or a USING alias before the ON's join, is missing (42P01), as in PostgreSQL.
+  CHECK(rejected(cat, "SELECT 1 FROM u JOIN v ON w.z = v.z, w").first == "missing FROM-clause entry for table \"w\"");
+  CHECK(rejected(cat, "SELECT 1 FROM t JOIN u USING (qty) AS q, w JOIN v ON q.qty = 1").first ==
+        "missing FROM-clause entry for table \"q\"");
+}
+
 TEST_CASE("binder: a table read twice is two instances of it, named as the query names them", "[sql][binder][join]") {
   sql_test::Fixture f;
   const auto& cat = f.cat();

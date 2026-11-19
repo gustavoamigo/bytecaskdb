@@ -891,8 +891,6 @@
 
 - name: a join in parentheses
   features: [F041-05]
-  # only an inner, LEFT or RIGHT join of tables, each joined to the ones before it, is supported
-  unimplemented: true
   setup:
     - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)
     - CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)
@@ -907,6 +905,10 @@
   steps:
     - sql: SELECT a.id, b.id, c.id FROM a JOIN (b JOIN c ON b.k = c.k) ON a.k = b.k
       expected: [[1, 1, 1]]
+    - sql: SELECT count(*) FROM a JOIN (b JOIN c ON b.k = c.k) ON a.k = c.k
+      expected: [[1]]
+    - sql: SELECT a.id FROM a JOIN (b JOIN c ON a.k = c.k) ON a.k = b.k
+      error: "42P01"
   teardown:
     - DROP TABLE a
     - DROP TABLE b
@@ -914,8 +916,6 @@
 
 - name: a join inside a list of tables
   features: [F041-03]
-  # a join inside a list of tables is not supported
-  unimplemented: true
   setup:
     - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)
     - CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)
@@ -930,6 +930,10 @@
   steps:
     - sql: SELECT a.id, b.id, c.id FROM a LEFT JOIN b ON a.k = b.k, c WHERE c.k = a.k
       expected: [[1, 1, 1], [2, null, 2]]
+    - sql: SELECT a.id, b.id, c.id FROM a, b LEFT JOIN c ON b.k = c.k
+      expected: [[1, 1, 1], [1, 2, null], [2, 1, 1], [2, 2, null], [3, 1, 1], [3, 2, null]]
+    - sql: SELECT a.id FROM a, b JOIN c ON a.k = c.k
+      error: "42P01"
   teardown:
     - DROP TABLE a
     - DROP TABLE b
