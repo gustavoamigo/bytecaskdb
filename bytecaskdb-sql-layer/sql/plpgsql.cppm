@@ -318,15 +318,25 @@ private:
 
 auto read_body(std::string_view create_procedure, std::size_t nargs, std::int32_t pos) -> Function {
   std::string text{create_procedure};
-  auto parsed = pg_query_parse_plpgsql(text.c_str());
   std::optional<std::string> error;
   std::string tree;
-  if (parsed.error != nullptr) {
-    error = parsed.error->message;
-  } else if (parsed.plpgsql_funcs != nullptr) {
-    tree = parsed.plpgsql_funcs;
+  {
+    // Freed on every path: copying the message or the tree can throw
+    // std::bad_alloc, which would otherwise leak libpg_query's result.
+    struct Parsed {
+      PgQueryPlpgsqlParseResult result;
+      explicit Parsed(PgQueryPlpgsqlParseResult r) : result{r} {}
+      Parsed(const Parsed&) = delete;
+      auto operator=(const Parsed&) -> Parsed& = delete;
+      ~Parsed() { pg_query_free_plpgsql_parse_result(result); }
+    };
+    const Parsed parsed{pg_query_parse_plpgsql(text.c_str())};
+    if (parsed.result.error != nullptr) {
+      error = parsed.result.error->message;
+    } else if (parsed.result.plpgsql_funcs != nullptr) {
+      tree = parsed.result.plpgsql_funcs;
+    }
   }
-  pg_query_free_plpgsql_parse_result(parsed);
   if (error) throw ast::SqlError{*error, pos};
   auto funcs = json::parse(tree);
   if (funcs.kind != json::Value::Kind::Array || funcs.items.size() != 1) {

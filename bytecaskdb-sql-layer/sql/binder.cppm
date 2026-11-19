@@ -112,6 +112,14 @@ struct Bound {
 
 // Throws ast::SqlError with a message and the position of the offending node.
 [[nodiscard]] auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound;
+// The same with $1 .. $n of the types `fixed_params` gives, as PostgreSQL
+// binds a statement with declared parameter types: a prepared statement's,
+// bound again after a DDL (docs/transaction_design.md, *A transaction binds
+// only against its own catalog*). A parameter so typed compared with an
+// integer column of another width is taken, as PostgreSQL's cross-type
+// operators take it, and range-checked as its own type; any other use the
+// type does not fit is the binder's error, 42883 across type classes.
+[[nodiscard]] auto bind(const ast::Statement& stmt, const Catalog& cat, std::span<const SqlType> fixed_params) -> Bound;
 
 // CREATE TABLE AS's query, its parameters wanted although folding one of its
 // constants raised a data exception at `pos` (docs/frontend_design.md, *The
@@ -2088,6 +2096,18 @@ public:
   // its largest $n, each of which must get a type.
   Binder(const Catalog& cat, std::uint32_t own_params) : cat_{cat}, own_params_{own_params} { params_.resize(own_params); }
 
+  // $1 .. $n start typed (bind's fixed_params): each as a column of its type,
+  // which its first use is then checked against.
+  void fix_params(std::span<const SqlType> types) {
+    if (params_.size() < types.size()) params_.resize(types.size());
+    for (std::size_t i = 0; i < types.size(); ++i) {
+      const auto& col = typed_params_.emplace_back(
+          Column{0, "$" + std::to_string(i + 1), types[i], phys_type(types[i]), true, std::monostate{}});
+      params_[i].first = ParamUse::FirstUse{phys_type(types[i]), &col, Use::Compared};
+    }
+    fixed_params_ = types.size();
+  }
+
   // What INSERT … SELECT's query fills (assign): `listed`, the statement
   // names its columns; else they are the table's, the leading ones filled.
   struct AssignTo {
@@ -3290,6 +3310,22 @@ public:
     if (col.sql.kind == SqlKind::Numeric && use != Use::Assigned) refuse_numeric("a parameter compared or computed with a NUMERIC", pos);
     if (params_.size() <= n) params_.resize(n + 1);
     auto& p = params_[n];
+    if (n < fixed_params_ && p.first) {
+      const auto& fixed = p.first->col->sql;
+      // A fixed integer type used with an integer column of another width:
+      // PostgreSQL's cross-type operator or assignment cast. Its value is
+      // checked as its own type before the plan runs, as PostgreSQL's Bind
+      // reads it as that type, however it is used.
+      auto integral = [](SqlKind k) { return k == SqlKind::SmallInt || k == SqlKind::Integer || k == SqlKind::BigInt; };
+      if (p.first->phys == t && integral(fixed.kind) && integral(col.sql.kind) && fixed.kind != col.sql.kind) {
+        if (use != Use::Assigned) p.assigned_only = false;
+        narrow(p, compared_type(fixed).range, table);
+        return;
+      }
+      if (p.first->phys != t || compared_type(fixed).identity != compared_type(col.sql).identity) {
+        fixed_misfit(n, fixed, col, use, pos);
+      }
+    }
     // PostgreSQL's code only for two comparisons. It types a $n by its first
     // use, which for UPDATE is a WHERE before the SET the layer binds first,
     // and refuses two assignments of one $n whatever their types (42P08):
@@ -3328,6 +3364,27 @@ public:
     } else {
       narrow(p, compared_type(col.sql).range, table);
     }
+  }
+
+  // A $n whose fixed type (fix_params) does not fit its use with `col`. Where
+  // PostgreSQL has no operator or assignment cast either, its SQLSTATE:
+  // 42883, or 42804 for an assignment, in its words. Where it converts the
+  // value (an integer compared with a DOUBLE PRECISION, any value assigned to
+  // a string), the layer, which would have to convert it before the plan
+  // runs, does not yet: 42601 (docs/frontend_design.md, *Fixed parameter
+  // types*).
+  [[noreturn]] static void fixed_misfit(std::uint32_t n, SqlType fixed, const Column& col, Use use, std::int32_t pos) {
+    auto param = "parameter $" + std::to_string(n + 1) + " of type " + sql_type_name(fixed);
+    auto assigned = use == Use::Assigned;
+    auto refusal = type_refusal(fixed.kind, col.sql.kind, assigned);
+    if (refusal && assigned) {
+      throw SqlError{"column \"" + col.name + "\" is of type " + sql_type_name(col.sql) + " but expression is of type " +
+                         sql_type_name(fixed),
+                     pos, *refusal};
+    }
+    auto with = (assigned ? " assigned to " : " used with ") + col.name + " (" + sql_type_name(col.sql) + ")";
+    if (refusal) throw SqlError{param + " cannot be" + with, pos, *refusal};
+    throw SqlError{param + with + " is not supported yet", pos};
   }
 
   // UPDATE's SET col = $n: $n is also checked before the plan runs, against
@@ -5271,6 +5328,7 @@ private:
   };
   std::vector<DerivedRelation> derived_;
   std::vector<ParamUse> params_;
+  std::size_t fixed_params_{0};      // $1 .. $fixed_params_ were typed by fix_params
   std::deque<Column> typed_params_;  // what a $n typed by its place (function_value) is used as; never moves
   std::vector<Datum> fixed_;  // the constants' values, $own_params_ + 1 onwards
   std::vector<PhysType> fixed_types_;
@@ -6565,7 +6623,9 @@ auto insert_query(Binder& b, const Table& t, const ast::Insert& s) -> logical::N
 
 }  // namespace
 
-auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
+auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound { return bind(stmt, cat, {}); }
+
+auto bind(const ast::Statement& stmt, const Catalog& cat, std::span<const SqlType> fixed_params) -> Bound {
   if (const auto* cv = std::get_if<ast::CreateView>(&stmt)) return bind_create_view(*cv, cat);
   ViewExpander views{cat};
   auto expanded = views.statement(stmt);
@@ -6589,6 +6649,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
   if (const auto* u = std::get_if<ast::Update>(&target)) positioned(u->table, u->current_of, u->pos);
   if (const auto* d = std::get_if<ast::Delete>(&target)) positioned(d->table, d->current_of, d->pos);
   Binder b{cat, own + key_params};
+  b.fix_params(fixed_params);
   if (!views.used().empty()) b.forbid_row_key();
   auto bound_stmt = std::visit(
       [&](const auto& s) -> std::pair<std::variant<Ddl, logical::NodePtr>, std::int32_t> {

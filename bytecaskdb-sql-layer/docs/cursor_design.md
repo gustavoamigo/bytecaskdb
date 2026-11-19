@@ -1050,6 +1050,19 @@ forgets it instead. While the transaction is aborted, cursors are kept open
 for the rollback and a fetch is 25P02. The mechanism, a count of cursors
 opened at each savepoint, is in `transaction_design.md`, *Savepoints*.
 
+A cursor holds the plan it was opened on, the shared one or its
+transaction's private one (`PlanRef`, transaction_design.md, *Mechanism:
+plans compiled against the transaction's catalog*), so a rebind, the
+transaction's plan map dropping a plan, or the transaction's end, changes
+nothing it reads. A private plan's estimate is reserved with the cursor's
+overlay pin, so a hold cursor's share carries it past the commit and its
+close gives it back. The keyed twin a cursor reads (*`WHERE CURRENT OF`*)
+follows the transaction's rule under its own key; only the planner's
+refusal to plan the query with the key (`FeatureNotSupported`) falls back
+to the plain plan, and any other failure, a 54000 among them, fails the
+open. A DECLARE runs its query by text: it returns rows, so it has no
+result type to keep.
+
 ## Deferred
 
 - `FETCH LAST` and `BACKWARD` by a reverse run, without replay: #725.

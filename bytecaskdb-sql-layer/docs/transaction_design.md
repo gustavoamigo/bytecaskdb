@@ -285,9 +285,10 @@ O(overlay) time and memory per savepoint followed by a write, charged to
 quadratic in the transaction's writes. A per-mark undo log would make it
 O(statement) (#850).
 
-**What does not change.** A statement that fails with 40001 because its
-plan no longer fits the catalog the transaction pinned ends the
-transaction, savepoints or not.
+**What does not change.** A statement that fails with 40001 under the rule's
+exceptions 1 and 2 (*A transaction binds only against its own catalog*)
+ends the transaction, savepoints or not. A ROLLBACK TO keeps the
+transaction's private plans: a mark does not record them.
 
 ## Commit and conflicts
 
@@ -469,8 +470,9 @@ The transaction keeps its pinned catalog and conflicts at commit if it
 wrote a table the DDL changed.
 
 - The catalog version is pinned with the snapshot at the transaction's
-  first statement. Every statement of the transaction is verified against
-  that version, and its index maintenance follows that version's indexes.
+  first statement. Every statement of the transaction is bound against
+  that catalog, and only that one (*A transaction binds only against its
+  own catalog*), and its index maintenance follows that version's indexes.
 - A DDL that commits meanwhile changes the catalog records of the tables it
   touches. A transaction that wrote one of those tables conflicts at commit
   through the existing catalog-record guard, and gets 40001. A transaction
@@ -478,14 +480,14 @@ wrote a table the DDL changed.
   took `FOR UPDATE` rows the DDL rewrote (an `ADD COLUMN … DEFAULT`): its
   guards see the change, and it gets 40001. PostgreSQL would make the DDL
   wait for those row locks; never waiting, the reader fails instead.
-- A statement whose plan doesn't verify against the pinned version (cached
-  against a newer catalog, naming a column the pin lacks) fails with 40001
-  and closes the transaction, rather than recompiling against a catalog
-  older than the cache. This is rare and loses nothing a retry wouldn't
-  recover. On the transaction's first statement, which has read nothing
-  yet, a DDL that raced the pin is not a failure: the transaction is
-  pinned again, to the live catalog and a new snapshot, as PostgreSQL takes
-  the snapshot when the first statement starts.
+- A statement is compiled against the pinned catalog, and is 40001 only by
+  the rule's exceptions 1 and 2: a binder error while the live catalog is
+  past the pin, or result columns fixed at a later catalog that differ at
+  the pin. Either closes the transaction, and loses nothing a retry
+  wouldn't recover. On the transaction's first statement, which has read
+  nothing yet, a DDL that raced the pin is not a failure: the transaction
+  is pinned again, to the live catalog and a new snapshot, as PostgreSQL
+  takes the snapshot when the first statement starts.
 - **A DDL never waits for another DDL either.** One that finds another DDL
   of its catalog in progress fails at once, writing nothing, with 40001,
   and may be retried. The one wait left is a statement's pin: it waits for
@@ -577,10 +579,15 @@ differences*.
   These calls are internal: the embedded API's `Transaction` is their only
   caller, and it keeps their protocol by construction. One context per
   transaction; each statement is `bc_ctx_begin_txn`, `bc_ctx_run`,
-  `bc_txn_add`, then `bc_ctx_reset`, except that a statement refused with
-  `BC_L_INCOMPATIBLE` before it ran may be reset and begun again; after
-  any other failed statement the transaction is only freed; and one
-  `bc_txn_commit`, with no statement open. The runtime does not defend
+  `bc_txn_add`, then `bc_ctx_reset`; after a failed statement the
+  transaction is only freed, or rolled back to a mark; and one
+  `bc_txn_commit`, with no statement open. A statement's plan is bound at
+  the pin before it begins (`bc_txn_pinned_catalog` pins first), so the
+  first statement's re-pin (`bc_txn_repin`) comes before its begin, and a
+  plan refused with `BC_L_INCOMPATIBLE` is a bug, reported as 40001. The
+  private plans are charged with `bc_txn_charge_plans` and returned with
+  `bc_txn_release_plans`, a term of their own beside `held`; a cursor's
+  pin reserves its private plan with `bc_txn_overlay_pin_reserving`. The runtime does not defend
   against use out of this order, and the contract does not cover it. The
   checks it does make (a second context or a commit with a statement open
   refused as `BC_E_HANDLE`) are a debugging aid, not a guarantee.
@@ -654,11 +661,14 @@ reason.
 | `INSERT … ON CONFLICT DO NOTHING` whose conflicting row a concurrent transaction deletes and commits waits for it, then inserts the row. | The row is skipped, as the statement's snapshot holds its key, and the commit succeeds. | Owner decision (2026-11-19), not the rule *never wait*: a guard per skipped row would make the commit a conflict and an autocommit retry insert the row; it was not taken. |
 | `SELECT … FOR UPDATE` locks the rows: other writers wait. | It guards them: the guarding transaction gets 40001 at commit if a writer of those rows committed first. A writer is never held back. | A guard, not a lock. |
 | DDL waits for the locks of open transactions on its table. | DDL commits at once. An open transaction that wrote the table gets 40001 at commit. | DDL never waits. |
+| REPEATABLE READ: catalog lookups read the latest committed catalog, so a later CREATE TABLE is visible and empty, a later ADD COLUMN shows its default on old rows, a later TRUNCATE or rewrite shows 0 rows. READ COMMITTED: each statement takes the latest catalog and a new snapshot. | Every level reads the catalog of its first statement (*A transaction binds only against its own catalog*). A statement whose binding fails at the pin after the catalog moved, such as one naming an object created later, is 40001. A table dropped later is still read; a column added later is not seen; a view or table dropped and created again is read as at the pin. | A catalog consistent with the snapshot; one snapshot per transaction (*Isolation*). |
+| A 40001 in a transaction is recoverable: ROLLBACK TO a savepoint, then COMMIT. | The rule's 40001s (exceptions 1 and 2) end the transaction, savepoints or not (CONTRACT.md, the 40001 row). | A no-DDL transaction's 40001 ends it. |
+| A statement Parsed in a transaction fixes the latest catalog's result columns, and runs after COMMIT with them. | One Parsed in a transaction whose pin was behind fixes the pin's columns; run after COMMIT in autocommit, it is 0A000 when they differ at the live catalog (exception 3). | A transaction binds only against its own catalog. |
 | On a standby, `SELECT … FOR UPDATE` is refused at the statement (25006). | On a follower it runs, and a transaction that used it fails at commit with the engine's refusal of writes, as its writes would; in autocommit it reads as the `SELECT` does. | Its guards are checked by the engine at commit, which a follower refuses. |
 
 ## Transactional DDL
 
-Status: **design, approved by the owner on 2026-11-19; not built yet.** The owner's answers are recorded in *Owner's decisions on transactional DDL*. Stage 0 comes first, and edits *DDL during an open transaction* (stage 0's *Docs*). Once transactional DDL is built, this section replaces *DDL during an open transaction*, and the edits listed under *Edits to this document once transactional DDL is built* are made.
+Status: **design, approved by the owner on 2026-11-19. Stage 0 is built; stages 1 to 4 are not.** Where building stage 0 found the design incomplete against the code, the stage's entry says what was done instead (*Stage 0 as built*). The owner's answers are recorded in *Owner's decisions on transactional DDL*. Stage 0 comes first, and edits *DDL during an open transaction* (stage 0's *Docs*). Once transactional DDL is built, this section replaces *DDL during an open transaction*, and the edits listed under *Edits to this document once transactional DDL is built* are made.
 
 This section applies the two standing rules: do what PostgreSQL does, and never wait. Behaviour observed on PostgreSQL 17.12 is cited as "PG 17".
 
@@ -718,7 +728,7 @@ At commit, the new catalog is published exactly as an autocommit DDL publishes i
 
   A retry of items 1 and 2 runs the statement against the new catalog and reports its real result there. These are errors where today the statement may run, never wrong results. A 40001 here ends a transaction that has run no DDL, savepoints or not, as today (CONTRACT.md:185). Stage 0 names CONTRACT.md:185 as narrowed by items 1 and 2.
 
-  One more error is not an exception of the rule: a held or Parsed statement keeps the parameter types it fixed, so a fixed type that no longer fits is the binder's error (40001 at a stale pin, item 1), where today the statement binds again with inferred types and runs. This matches PG 17, and narrows today: stage 0 names CONTRACT.md:171, :256 and the server row as narrowed by it.
+  One more error is not an exception of the rule: a held or Parsed statement keeps the parameter types it fixed, so a fixed type that no longer fits is the binder's error (40001 at a stale pin, item 1), where today the statement binds again with inferred types and runs. This matches PG 17 for a type PG 17 refuses too and for integers of another width; a conversion PG 17 makes and the layer does not (an integer to a float, a DECIMAL or a string) is refused (42601, *Stage 0 as built*), and narrows today: stage 0 names CONTRACT.md:171, :256 and the server row as narrowed by it.
 
 ### Catalog snapshots and isolation levels with DDL
 
@@ -956,6 +966,17 @@ Each stage is one PR that ships on its own. Each says what it still refuses, upd
   - the proof machine runs `SELECT *` across ADD COLUMN by Simple Query and by a prepared statement, and compares with PostgreSQL.
 - Faults: an allocation-failure sweep, in `plan_alloc_faults_test`'s shape, over a private compile (the build of the `TxnPlan`, its charge, its insert in the map), a private procedure compile, a cursor's private twin, and an autocommit rebind that puts a new `Statement` in the cache. A failure fails the statement as any allocation failure in a transaction does, and leaves the shared cache and the map as they were.
 - Still refused: everything refused today.
+
+**Stage 0 as built.** These are the smallest changes to the design above that the code needed; the guarantees are the ones stated.
+- **A text no one has prepared, at a live pin.** A transaction whose pin is the live catalog prepares a text not in the shared cache there, as `Database::prepare` would, and runs that shared plan; a plan bound at the live published catalog is no transaction's own. Without it, every transaction would compile each text it runs by text privately, which the stage's cost does not state ("a text run only inside transactions compiles privately in every transaction after a DDL"). A transaction whose pin is behind, or whose text's shared plan is behind, adds nothing to the cache, as the tests require.
+- **A pin a refit took is not re-pinned.** The first statement re-pins only a pin it took itself. A pin taken earlier by `Transaction::refit` (a Parse or Bind in a block) is older than a DDL since, not raced by it: a portal bound in the block before the DDL runs at that pin, as the stage's portal test requires.
+- **The private mark** of a record is stage 2's: no catalog is private in stage 0, so `StatementRecord` carries none yet.
+- **Fixed parameter types** need the binder: `bind` takes the types a statement fixed, and each `$n` starts typed. A fixed integer type compared with, or assigned to, an integer column of another width is taken, as PostgreSQL's cross-type operators and assignment casts are, and its value is range-checked as its own type (22003), as PostgreSQL's Bind reads it. Any other mismatch is the binder's refusal. Where PostgreSQL has no operator or assignment cast either, it is PostgreSQL's SQLSTATE: 42883 for a comparison, 42804 for an assignment. Where PostgreSQL converts the value (an integer `$n` compared with or assigned to a float or DECIMAL column, any value assigned to a string column), the layer does not yet, and refuses with 42601 (frontend_design.md, *Fixed parameter types*). So keeping the fixed types matches PG 17 only for the integer widths and the refusals; for those conversions it is a refusal where PG 17 runs the statement, and where the layer before stage 0 bound it again with inferred types and ran it.
+- **`Database::call`** compiles a procedure into the shared map (`procedure_plan`) when its transaction's pin is the live catalog; `Transaction::call` never does.
+- **The fault sweep** asserts that a failed statement leaves the shared cache as it was and the plan map's charge equal to its plans: a plan compiled before a later failure of the same statement (a cursor's pin, a procedure's run) stays in the map, valid at the pin.
+- **Tests not built as listed:** a Bind in a block of a statement Parsed outside it after the block's pin cannot happen on one connection (the block is open), so exception 2 is tested embedded ("rebind: B adds a column; T reads t with the columns of its pin"); the run-counting hook on the cache's `Statement` is replaced by the compile counter; a DDL Parsed in a block and never executed is tested on the wire (`test_a_ddl_parsed_in_a_block_and_never_executed_leaves_it_open`); types, domains and procedures created after the pin are tested through the procedure (CALL, `Transaction::procedure`), tables and views, since DDL naming them is refused in a transaction (0A000).
+- **`sql_layer_bench`, before (base) and after (stage 0), releasedbg, one run each:** `bc_ctx_run` of an empty plan 18.1 / 16.9 ns; point read, verify and map ids 45.5 / 44.4 ns; New-Order, verify and map ids 974.7 / 906.3 ns; `bc_col_i64` + `bc_add` 27.5 / 29.1 ns; nullable VARCHAR column 44.1 / 40.6 ns; Payment's `bc_update` 832.4 / 969.5 ns. Run to run these vary by about 15% (a second base run gave 1124.9 and 903.8 ns for the last two), so stage 0 shows no change on the bench. The bench measures the runtime below the cache: it runs no DDL, so the one recompile per cached plan after a DDL and the private compiles in a transaction are not on it.
+- `TxnPlan` gives its `Compiled` by reference, to its friends only; `Compiled` is neither copied nor moved, since its schema ref points into it.
 
 **Stage 1: DDL bound where it runs.**
 - `prepare_locked` classifies DDL from its syntax tree, as a transaction does from stage 0, and binds it at execute, against the catalog it runs in. A cached DDL `Statement` holds its parse and no plan, as today.

@@ -1646,6 +1646,11 @@ struct bc_txn {
   // (effect_bytes, claim_bytes, lock_bytes, table_bytes), its WritePlan
   // entry included.
   std::uint64_t held{0};
+  // What the transaction's private plans are charged (bc_txn_charge_plans):
+  // the API's plan map, compiled against the pinned catalog. Not part of
+  // `held`, so a mark neither records nor restores it; an abort that drops
+  // the pin zeroes it, with the plans its holder then frees.
+  std::uint64_t plan_bytes{0};
   std::uint64_t statements{0};         // statements wholly added
   // A statement failed: nothing but bc_txn_free is left. Set before any
   // part of a failing statement could reach the overlay or the guards, so
@@ -1763,7 +1768,9 @@ namespace {
 // replaces or erases others only frees. So the commit needs nothing its
 // statements were not held to.
 // The marks' overlays count as the pins' do.
-auto txn_holds(const bc_txn& t) -> std::uint64_t { return t.overlay->bytes + t.held + t.pinned_bytes + t.marked_bytes; }
+auto txn_holds(const bc_txn& t) -> std::uint64_t {
+  return t.overlay->bytes + t.held + t.pinned_bytes + t.marked_bytes + t.plan_bytes;
+}
 
 // What the transaction reserves of the memory cap for itself: txn_holds but
 // the pins hold cursors reserve.
@@ -1836,6 +1843,7 @@ void txn_abort(bc_txn* txn) noexcept {
   txn->locks = {};
   txn->written = {};
   txn->held = 0;
+  txn->plan_bytes = 0;  // the plans were for the pin dropped above
   txn->release_memory();
 }
 
@@ -3316,7 +3324,78 @@ bool bc_txn_repin(bc_txn* txn) {
   return true;
 }
 
-bc_overlay* bc_txn_overlay_pin(bc_txn* txn) {
+}  // extern "C"
+
+namespace {
+
+// Reserves what the transaction holds plus `extra` on the memory cap, when
+// there is one; false, with the transaction's error set, if the cap has no room.
+auto txn_reserve_with(bc_txn* txn, std::uint64_t extra) -> bool {
+  if (txn->memory == nullptr || cap_holds(*txn) + extra <= txn->reserved) return true;
+  const auto need = cap_holds(*txn) + extra - txn->reserved;
+  const auto grant = cap_reserve(*txn->memory, need, need);
+  if (grant == 0) {
+    txn->sink().fail(BC_E_MEMORY, cap_message(*txn->memory));
+    return false;
+  }
+  txn->reserved += grant;
+  return true;
+}
+
+// The snapshot and catalog of the first statement, pinned together.
+void txn_pin(bc_txn* txn) {
+  if (txn->snap) return;
+  auto p = txn->live->pin();
+  txn->pinned = std::move(p.cat);
+  txn->snap.emplace(std::move(p.snap));
+}
+
+}  // namespace
+
+auto bc_txn_pinned_catalog(bc_txn* txn) -> std::shared_ptr<const bytecask::sql::Catalog> {
+  if (txn->aborted || txn->done || txn->attached != nullptr) {
+    throw std::logic_error("bc_txn_pinned_catalog needs an open transaction with no statement open");
+  }
+  txn_pin(txn);
+  return txn->pinned;
+}
+
+auto bc_txn_first_statement(const bc_txn* txn) noexcept -> bool { return txn->statements == 0 && txn->pins == 0; }
+
+auto bc_txn_charge_plans(bc_txn* txn, std::uint64_t bytes) noexcept -> bool {
+  try {
+    txn->sink().clear();
+    if (txn_holds(*txn) + bytes > txn->max_bytes) {
+      txn->sink().fail(BC_E_LIMIT, "the transaction's plans would pass its bound of " + std::to_string(txn->max_bytes) +
+                                       " bytes");
+      return false;
+    }
+    if (!txn_reserve_with(txn, bytes)) return false;
+    txn->plan_bytes += bytes;
+    return true;
+  } catch (...) {
+    txn->fail_current_exception();
+    return false;
+  }
+}
+
+void bc_txn_release_plans(bc_txn* txn, std::uint64_t bytes) noexcept {
+  txn->plan_bytes -= std::min(bytes, txn->plan_bytes);
+  txn_trim_reservation(txn);
+}
+
+#ifdef BYTECASK_SQL_TESTING
+auto bc_txn_plan_bytes_for_testing(const bc_txn* txn) noexcept -> std::uint64_t { return txn->plan_bytes; }
+auto bc_txn_cap_holds_for_testing(const bc_txn* txn) noexcept -> std::uint64_t { return cap_holds(*txn); }
+#endif
+
+extern "C" {
+
+bc_overlay* bc_txn_overlay_pin(bc_txn* txn) { return bc_txn_overlay_pin_reserving(txn, 0); }
+
+}  // extern "C"
+
+auto bc_txn_overlay_pin_reserving(bc_txn* txn, std::uint64_t extra) -> bc_overlay* {
   BC_GUARD_BEGIN
   txn->sink().clear();
   if (txn->aborted || txn->done) {
@@ -3329,12 +3408,8 @@ bc_overlay* bc_txn_overlay_pin(bc_txn* txn) {
   }
   // The snapshot and catalog are the transaction's from here, as a first
   // statement would pin them.
-  if (!txn->snap) {
-    auto p = txn->live->pin();
-    txn->pinned = std::move(p.cat);
-    txn->snap.emplace(std::move(p.snap));
-  }
-  const auto reserve = txn->overlay->bytes;
+  txn_pin(txn);
+  const auto reserve = txn->overlay->bytes + extra;
   if (txn_holds(*txn) + reserve > txn->max_bytes) {
     txn->sink().fail(BC_E_LIMIT, "a cursor's copy of the transaction's writes would pass its bound of " +
                                      std::to_string(txn->max_bytes) + " bytes");
@@ -3362,6 +3437,8 @@ bc_overlay* bc_txn_overlay_pin(bc_txn* txn) {
   if (txn != nullptr) txn_abort(txn);
   return nullptr;
 }
+
+extern "C" {
 
 bc_hold* bc_txn_hold(bc_txn* txn, bc_overlay* pin) {
   BC_GUARD_BEGIN

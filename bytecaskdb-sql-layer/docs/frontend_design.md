@@ -1372,6 +1372,35 @@ PostgreSQL infers one type and runs the statement (*Known differences*).
 A parameter's range is checked against the narrowest of its uses before
 the plan runs, and a refusal names that use's table.
 
+**Fixed parameter types.** A prepared statement keeps the parameter types
+it was first bound with, as PostgreSQL's does, and is bound again with them
+after a DDL (`bind` with fixed types): each `$n` starts typed. A fixed
+integer type compared with, or assigned to, an integer column of another
+width is taken, as PostgreSQL's cross-type operators (`int8 = int4`) and
+assignment casts take it, and its value is range-checked as the fixed type
+before the plan runs (22003), as PostgreSQL's Bind reads it, so an `integer`
+`$1` assigned to a column now `bigint` refuses 5000000000. Any other use the
+type does not fit is the binder's error:
+
+- where PostgreSQL has no operator or assignment cast either, its SQLSTATE:
+  42883 for a comparison (an `integer` `$1` compared with a `date` or `text`
+  column, "parameter $1 of type integer cannot be used with a (date)", not
+  PostgreSQL's "operator does not exist: date = integer"), and 42804 for an
+  assignment, in PostgreSQL's words;
+- where PostgreSQL converts the value, refused (42601, *Known
+  differences*): an integer `$n` compared with or assigned to a float or
+  `DECIMAL` column, and any value assigned to a string column.
+
+PostgreSQL reads a parameter's value as its fixed type at Bind, before it
+revalidates the plan: a date sent for an `integer` `$1` is 22P02 there and
+the binder's error here.
+
+**Binding again after a DDL.** A cached statement is bound again at the
+live catalog after any DDL (`catalog_design.md`, *Compatibility*), so `*`,
+`t.*` and NATURAL expand to the columns the tables have then, USING resolves
+again, and a name a new column makes ambiguous is 42702. A statement run by
+text returns those columns; a prepared one whose columns change is 0A000.
+
 **Errors.** A parse or bind error is an `ast::SqlError` with a message and a
 position, and the SQLSTATE PostgreSQL refuses the same statement with, or
 42601 for a form the layer does not support (`server_design.md`, *Errors*).
@@ -1441,6 +1470,12 @@ fail on them.
   bpchar. Two columns of one table compare across the numeric types above
   (*`WHERE`*); joining them is #823. TPROC-C compares columns of one type
   only.
+- **A prepared statement's fixed parameter type that PostgreSQL would
+  convert is refused** (*Fixed parameter types*). After a DDL makes `a` a
+  `DOUBLE PRECISION`, a `DECIMAL` or a `TEXT`, a statement prepared with
+  `a INTEGER` and `WHERE a = $1`, `SET a = $1` or `VALUES ($1)` is 42601
+  until it is prepared again; PostgreSQL converts the `int4` value and runs
+  it. Integers of another width run, range-checked as the fixed type.
 - **A parameter used with columns of two SQL types is refused** (*Binding*).
   `WHERE a = $1 AND b = $1`, with `a DOUBLE PRECISION` and `b REAL`,
   `INTEGER` and `BIGINT`, or `DECIMAL`s of two scales, is refused, and so

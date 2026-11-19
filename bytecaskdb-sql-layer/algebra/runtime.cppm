@@ -15,6 +15,7 @@ module;
 #include <stdexcept>
 #include <expected>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -96,7 +97,31 @@ struct bc_proc {
 // snapshot, since it reads no table.
 void bc_ctx_begin_frame(bc_ctx* cx, const bc_params* params, bc_budget budget);
 
+// The transaction's private plans (docs/transaction_design.md, *Mechanism:
+// plans compiled against the transaction's catalog). The API compiles them
+// against the catalog the transaction pinned, which bc_txn_pinned_catalog
+// pins first if no statement has: with the snapshot, as a first statement
+// would. It throws std::logic_error for an aborted or ended transaction or
+// one with a statement open, and what the pin throws.
+std::shared_ptr<const bytecask::sql::Catalog> bc_txn_pinned_catalog(bc_txn* txn);
+// No statement was added and no cursor pinned the overlay: bc_txn_repin would re-pin.
+bool bc_txn_first_statement(const bc_txn* txn) noexcept;
+// Charges `bytes` of private plans to max_bytes and the memory cap: false,
+// with bc_txn_error BC_E_LIMIT or BC_E_MEMORY and nothing charged, when
+// either has no room. The transaction is not aborted. The charge is not a
+// mark's: a rollback to one keeps it. An abort that drops the pin zeroes it.
+bool bc_txn_charge_plans(bc_txn* txn, std::uint64_t bytes) noexcept;
+// Returns what bc_txn_charge_plans charged, once the plans are dropped.
+void bc_txn_release_plans(bc_txn* txn, std::uint64_t bytes) noexcept;
+// bc_txn_overlay_pin, the pin also reserving `extra` bytes against max_bytes
+// until released: a cursor's private plan (docs/cursor_design.md).
+bc_overlay* bc_txn_overlay_pin_reserving(bc_txn* txn, std::uint64_t extra);
+
 #ifdef BYTECASK_SQL_TESTING
+// Test only: what bc_txn_charge_plans charged and not released, and what
+// the transaction reserves of the memory cap for itself.
+std::uint64_t bc_txn_plan_bytes_for_testing(const bc_txn* txn) noexcept;
+std::uint64_t bc_txn_cap_holds_for_testing(const bc_txn* txn) noexcept;
 // Test only (sql_layer_testing): runs `hook` in every bc_ctx_commit of the
 // context, after the plan ran and before its batch reaches the engine, so a
 // test can make the commit conflict. An empty function removes it.
@@ -118,7 +143,14 @@ export using ::bc_proc;
 export using ::bc_proc_fn;
 export using ::bc_ctx_begin_frame;
 export using ::bc_ctx_affected;
+export using ::bc_txn_pinned_catalog;
+export using ::bc_txn_first_statement;
+export using ::bc_txn_charge_plans;
+export using ::bc_txn_release_plans;
+export using ::bc_txn_overlay_pin_reserving;
 #ifdef BYTECASK_SQL_TESTING
+export using ::bc_txn_plan_bytes_for_testing;
+export using ::bc_txn_cap_holds_for_testing;
 export using ::bc_ctx_before_commit_for_testing;
 export using ::bc_ctx_held_for_testing;
 export using ::bc_ctx_write_set_slots_for_testing;

@@ -206,11 +206,12 @@ TEST_CASE("embedded API: a cached write plan maintains an index created after it
   const auto& insert = db->prepare(kInsert);
   (void)db->execute(insert, {i(1), bytes("apple"), i(10)});
   auto compiled = db->compilations();
-  // The index is created after the plan, which names no index: the runtime
-  // writes the entry, and the plan is not recompiled.
+  // The index is created after the plan, which names no index: the plan
+  // binds again once after the DDL, as every cached plan does, and the
+  // runtime writes the entry.
   (void)db->execute(kCreateIndex);
   (void)db->execute(insert, {i(2), bytes("apple"), i(20)});
-  CHECK(db->compilations() == compiled);
+  CHECK(db->compilations() == compiled + 1);
   CHECK(insert.plan_source().find("IDX_") == std::string::npos);
   // Row 1 was backfilled by CREATE INDEX, row 2 by the cached INSERT.
   CHECK(ids(db->execute(kByName, {bytes("apple"), bytes("apple\x01")})) == std::vector<std::int64_t>{1, 2});
@@ -228,8 +229,8 @@ TEST_CASE("embedded API: a plan the catalog refuses is recompiled and run again"
   CHECK(db->execute(by_id, {i(1)}).rows == Grid{{i(1), i(10)}});
   auto compiled = db->compilations();
 
-  // The table is dropped and created again: new ids, so every cached plan is
-  // refused by bc_ctx_run, recompiled from its text, and runs on the new table.
+  // The table is dropped and created again: the catalog moved, so every
+  // cached plan binds again at its next run, and runs on the new table.
   (void)db->execute("DROP TABLE t");
   (void)db->execute(kCreateTable);
   (void)db->execute(kCreateIndex);
@@ -237,32 +238,38 @@ TEST_CASE("embedded API: a plan the catalog refuses is recompiled and run again"
   CHECK(db->execute(by_id, {i(2)}).rows == Grid{{i(2), i(20)}});
   CHECK(db->execute(by_id, {i(1)}).rows.empty());
   CHECK(ids(db->execute(by_name, {bytes("a"), bytes("c")})) == std::vector<std::int64_t>{2});
+  // Each of the three plans binds again once after the three DDL: only the
+  // version a plan is behind matters, not how far behind.
   CHECK(db->compilations() == compiled + 3);
-  // Once recompiled they run without another compile.
+  // Once bound again they run without another compile.
   CHECK(db->execute(insert, {i(3), bytes("cherry"), i(30)}).affected == 1);
   CHECK(db->compilations() == compiled + 3);
-  // Parameters a plan the catalog still accepts does not take are refused
-  // without a compile, however often they are sent: the runtime says the
-  // plan fits (bc_ctx_check).
+  // Parameters the plan does not take are refused without a compile,
+  // however often they are sent.
   for (int k = 0; k < 3; ++k) {
     CHECK_THROWS_AS(db->execute(insert, {i(9), bytes("x"), bytes("y")}), ParamError);
   }
   CHECK(db->compilations() == compiled + 3);
-  // A DDL that leaves the plan compatible moves the version: the runtime is
-  // asked, says the plan fits, and the parameters are refused uncompiled.
+  // Any DDL moves the version: the plan binds again, once.
   (void)db->execute("CREATE TABLE elsewhere (k BIGINT PRIMARY KEY)");
   CHECK_THROWS_AS(db->execute(insert, {i(9), bytes("x"), bytes("y")}), ParamError);
-  CHECK(db->compilations() == compiled + 3);
+  CHECK(db->compilations() == compiled + 4);
   CHECK(db->execute(insert, {i(9), bytes("x"), i(90)}).affected == 1);
-  CHECK(db->compilations() == compiled + 3);
+  CHECK(db->compilations() == compiled + 4);
 
-  // The parameters are checked against the recompiled plan: qty is now
-  // bytes. Parameters of the new types are taken at once, though the stale
-  // plan would have refused them; old-typed ones are refused before the run.
+  // qty is now bytes. The held INSERT keeps the parameter types it fixed,
+  // as a PostgreSQL prepared statement does: a BIGINT $3 for a BYTEA column
+  // is the binder's error. By text the statement binds afresh, with the new
+  // types, and a later prepare of the text returns that statement.
   (void)db->execute("DROP TABLE t");
   (void)db->execute("CREATE TABLE t (id BIGINT PRIMARY KEY, name BYTEA, qty BYTEA)");
-  CHECK(db->execute(insert, {i(4), bytes("date"), bytes("forty")}).affected == 1);
-  CHECK_THROWS_AS(db->execute(insert, {i(5), bytes("elder"), i(50)}), ParamError);
+  CHECK_THROWS_AS(db->execute(insert, {i(4), bytes("date"), bytes("forty")}), ast::SqlError);
+  CHECK(db->execute(kInsert, {i(4), bytes("date"), bytes("forty")}).affected == 1);
+  CHECK_THROWS_AS(db->execute(kInsert, {i(5), bytes("elder"), i(50)}), ParamError);
+  CHECK(&db->prepare(kInsert) != &insert);
+  CHECK(db->prepare(kInsert).params().at(2).type == SqlType{SqlKind::Bytea});
+  CHECK(insert.params().at(2).type == SqlType{SqlKind::BigInt});
+  // Back to BIGINT: the held statement fits again and runs.
   (void)db->execute("DROP TABLE t");
   (void)db->execute(kCreateTable);
   CHECK_THROWS_AS(db->execute(insert, {i(6), bytes("fig"), bytes("sixty")}), ParamError);
@@ -283,13 +290,13 @@ TEST_CASE("embedded API: a plan that reads a table twice is recompiled when the 
   // named the instances would never be found fit, or never refused.
   CHECK(pairs.plan_source().find("// objects: ") != std::string::npos);
   auto compiled = db->compilations();
-  // A DDL that leaves the plan compatible: no compile. An index: the plan keeps its table's key.
+  // A DDL binds the plan again; it reads the same rows. A column: the plan keeps its table's key.
   (void)db->execute("CREATE TABLE elsewhere (k BIGINT PRIMARY KEY)");
   CHECK(db->execute(pairs, {i(0)}).rows == Grid{{i(1), i(2)}, {i(1), i(3)}});
   (void)db->execute("ALTER TABLE s ADD COLUMN extra BIGINT");
   CHECK(db->execute(pairs, {i(0)}).rows == Grid{{i(1), i(2)}, {i(1), i(3)}});
-  // The table dropped and created again, with other rows: new ids, so the plan is refused, compiled again,
-  // and reads the new table through both uses.
+  // The table dropped and created again, with other rows: new ids, and the plan, bound again, reads the new
+  // table through both uses.
   (void)db->execute("DROP TABLE s");
   (void)db->execute("CREATE TABLE s (id BIGINT PRIMARY KEY, parent BIGINT)");
   (void)db->execute("INSERT INTO s VALUES ($1, $2)", {i(7), i(0)});
@@ -306,14 +313,24 @@ TEST_CASE("embedded API: parameters are checked against the plan that will run",
   (void)db->execute("CREATE TABLE t (k INTEGER PRIMARY KEY, v BIGINT)");
   const auto& by_k = db->prepare("SELECT v FROM t WHERE k = $1");
   CHECK(db->execute(by_k, {i(1)}).rows.empty());
-  // The key is recreated as BIGINT: the parameter's physical type is the
-  // same, so the cached plan's types fit, but its INTEGER range is the
-  // dropped table's. The plan is verified, recompiled, and only then is
-  // the parameter checked, against BIGINT.
+  // The key is recreated as BIGINT. By text the statement binds afresh: $1
+  // is BIGINT, and the parameter is checked against it. The held statement
+  // keeps the INTEGER $1 it fixed, as PostgreSQL's prepared statement does:
+  // bound again at INTEGER, compared with the BIGINT key, and a value
+  // outside INTEGER is refused before the run (22003).
   (void)db->execute("DROP TABLE t");
   (void)db->execute("CREATE TABLE t (k BIGINT PRIMARY KEY, v BIGINT)");
   (void)db->execute("INSERT INTO t VALUES ($1, $2)", {i(3'000'000'000), i(7)});
-  CHECK(db->execute(by_k, {i(3'000'000'000)}).rows == Grid{{i(7)}});
+  (void)db->execute("INSERT INTO t VALUES ($1, $2)", {i(5), i(8)});
+  CHECK(db->execute("SELECT v FROM t WHERE k = $1", {i(3'000'000'000)}).rows == Grid{{i(7)}});
+  CHECK(db->execute(by_k, {i(5)}).rows == Grid{{i(8)}});
+  CHECK(by_k.params().at(0).type == SqlType{SqlKind::Integer});
+  try {
+    (void)db->execute(by_k, {i(3'000'000'000)});
+    FAIL("ran");
+  } catch (const ExecError& e) {
+    CHECK(sqlstate(e) == "22003");
+  }
   // Of an UPDATE's parameters out of range, a SET value's is reported
   // first, as PostgreSQL folds the target list before the WHERE.
   (void)db->execute("CREATE TABLE u (s VARCHAR(4) NOT NULL, n SMALLINT PRIMARY KEY)");
@@ -325,35 +342,39 @@ TEST_CASE("embedded API: parameters are checked against the plan that will run",
   }
 }
 
-TEST_CASE("embedded API: a cached plan is checked once per catalog version", "[sql][api][catalog]") {
-  sql_test::TempDir dir{"api_plan_checks"};
+TEST_CASE("embedded API: a cached plan rebinds once after each DDL, a GRANT included, and not again",
+          "[sql][api][catalog]") {
+  sql_test::TempDir dir{"api_plan_rebinds"};
   auto db = Database::open(dir.path());
   (void)db->execute("CREATE TABLE t (k BIGINT PRIMARY KEY, v BIGINT)");
   const auto& by_k = db->prepare("SELECT v FROM t WHERE k = $1");
   (void)db->execute(by_k, {i(1)});
-  CHECK(db->plan_checks_for_testing() == 0);  // compiled against the current version
-  // A DDL on another table moves the version: the plan is checked once, still
-  // fits, and is marked with that version; later runs are not checked.
-  (void)db->execute("CREATE TABLE elsewhere (k BIGINT PRIMARY KEY)");
+  (void)db->execute("SELECT k FROM t WHERE v = $1", {i(1)});
   auto compiled = db->compilations();
   for (int k = 0; k < 3; ++k) (void)db->execute(by_k, {i(1)});
-  CHECK(db->plan_checks_for_testing() == 1);
-  CHECK(db->compilations() == compiled);
-  // Another DDL: one more check.
-  (void)db->execute("DROP TABLE elsewhere");
+  CHECK(db->compilations() == compiled);  // bound at the live catalog
+  // A DDL on another table moves the version: each cached text binds again
+  // once, held or by text, and runs without another compile after.
+  (void)db->execute("CREATE TABLE elsewhere (k BIGINT PRIMARY KEY)");
+  for (int k = 0; k < 3; ++k) {
+    (void)db->execute(by_k, {i(1)});
+    (void)db->execute("SELECT v FROM t WHERE k = $1", {i(1)});
+    (void)db->execute("SELECT k FROM t WHERE v = $1", {i(1)});
+  }
+  CHECK(db->compilations() == compiled + 2);
+  // A GRANT is a DDL: one more rebind each.
+  (void)db->execute("CREATE ROLE r");
+  (void)db->execute("GRANT SELECT ON t TO r");
   for (int k = 0; k < 3; ++k) (void)db->execute(by_k, {i(1)});
-  CHECK(db->plan_checks_for_testing() == 2);
-  CHECK(db->compilations() == compiled);
-  // A plan marked as fitting is checked again after a DDL that breaks it,
-  // recompiled, and runs on the new table.
+  CHECK(db->compilations() == compiled + 3);
+  // Bound again after the table is dropped and created again, it runs on the new table.
   (void)db->execute("DROP TABLE t");
   (void)db->execute("CREATE TABLE t (k BIGINT PRIMARY KEY, v BIGINT)");
   (void)db->execute("INSERT INTO t VALUES ($1, $2)", {i(1), i(9)});
   CHECK(db->execute(by_k, {i(1)}).rows == Grid{{i(9)}});
-  CHECK(db->plan_checks_for_testing() == 3);
-  CHECK(db->compilations() == compiled + 2);  // the INSERT's first compile, and by_k's recompile
+  CHECK(db->compilations() == compiled + 5);  // the INSERT's first compile, and by_k's rebind
   CHECK(db->execute(by_k, {i(1)}).rows == Grid{{i(9)}});
-  CHECK(db->plan_checks_for_testing() == 3);
+  CHECK(db->compilations() == compiled + 5);
 }
 
 TEST_CASE("embedded API: a parameter compared with DECIMALs of two scales is refused", "[sql][api]") {
@@ -398,7 +419,8 @@ TEST_CASE("embedded API: a DOUBLE read through an index keeps -0.0", "[sql][api]
   CHECK(std::signbit(std::get<double>(rows[0][0])));
 }
 
-TEST_CASE("embedded API: compatibility decides which cached plans recompile", "[sql][api][catalog]") {
+TEST_CASE("embedded API: every cached plan recompiles once after a DDL, ADD COLUMN and CREATE INDEX included",
+          "[sql][api][catalog]") {
   sql_test::TempDir dir{"api_compat"};
   auto db = Database::open(dir.path());
   (void)db->execute(kCreateTable);
@@ -412,23 +434,29 @@ TEST_CASE("embedded API: compatibility decides which cached plans recompile", "[
   auto compiled = db->compilations();
   CHECK(compiled == 3);
 
-  // ADD COLUMN invalidates nothing; rows the old INSERT writes take the default.
+  // ADD COLUMN: each cached plan binds again once, and runs with its
+  // columns unchanged; rows the INSERT without a column list writes take the
+  // default. A second run compiles nothing.
   (void)db->execute("ALTER TABLE t ADD COLUMN tag BIGINT DEFAULT 5");
   CHECK(db->execute(insert, {i(2), bytes("banana"), i(20)}).affected == 1);
   CHECK(db->execute(by_id, {i(2)}).rows == Grid{{i(2), i(20)}});
   CHECK(ids(db->execute(by_name, {bytes("a"), bytes("c")})) == std::vector<std::int64_t>{1, 2});
-  CHECK(db->compilations() == compiled);
+  CHECK(db->compilations() == compiled + 3);
+  CHECK(db->execute(by_id, {i(2)}).rows == Grid{{i(2), i(20)}});
+  CHECK(db->compilations() == compiled + 3);
   // Row 1, written before the column, was rewritten with the default.
   CHECK(db->execute("SELECT id, tag FROM t WHERE id = $1", {i(1)}).rows == Grid{{i(1), i(5)}});
   CHECK(db->execute("SELECT id, tag FROM t WHERE id = $1", {i(2)}).rows == Grid{{i(2), i(5)}});
   compiled = db->compilations();
 
-  // CREATE INDEX recompiles nothing: the write plans maintain it.
+  // CREATE INDEX: each plan binds again once; the writes maintain the index.
   (void)db->execute("CREATE INDEX t_by_qty ON t (qty)");
   (void)db->execute(by_id, {i(1)});
   (void)db->execute(by_name, {bytes("a"), bytes("b")});
   CHECK(db->execute(insert, {i(3), bytes("cherry"), i(30)}).affected == 1);
-  CHECK(db->compilations() == compiled);
+  CHECK(db->compilations() == compiled + 3);
+  (void)db->execute(by_id, {i(1)});
+  CHECK(db->compilations() == compiled + 3);
   CHECK(ids(db->execute("SELECT id FROM t WHERE qty >= $1", {i(15)})) == std::vector<std::int64_t>{2, 3});
   compiled = db->compilations();
 
@@ -446,8 +474,8 @@ TEST_CASE("embedded API: compatibility decides which cached plans recompile", "[
   (void)db->execute("DROP INDEX t_by_d");
   CHECK(ids(db->execute(by_d, {Value{1.0}})) == std::vector<std::int64_t>{1, 2, 3});
   CHECK(by_d.plan_source().find("IDX_") == std::string::npos);
-  // One that then fails to recompile, its other table dropped, is refused;
-  // the write plans keep running, uncompiled.
+  // One that then fails to bind again, its table dropped, is refused; the
+  // other plans bind again once and run.
   (void)db->execute("CREATE TABLE dd (k BIGINT PRIMARY KEY, d DOUBLE PRECISION)");
   const auto& dd_by_d = db->prepare("SELECT k FROM dd WHERE d >= $1");
   CHECK(db->execute(dd_by_d, {Value{1.0}}).rows.empty());
@@ -455,16 +483,16 @@ TEST_CASE("embedded API: compatibility decides which cached plans recompile", "[
   compiled = db->compilations();
   (void)db->execute("DROP TABLE dd");
   CHECK_THROWS_AS(db->execute(dd_by_d, {Value{1.0}}), ast::SqlError);
-  // A failed recompile keeps the statement's old plan whole and still
-  // incompatible: the next execute tries again and fails the same way,
-  // never running the old code (ASan checks the schema ref it reads).
+  // A failed rebind keeps the statement's old plan whole and behind the
+  // catalog: the next execute tries again and fails the same way, never
+  // running the old code (ASan checks the schema ref it reads).
   CHECK_THROWS_AS(db->execute(dd_by_d, {Value{1.0}}), ast::SqlError);
   CHECK(dd_by_d.plan_source() == dd_source);
   CHECK(db->execute(insert, {i(4), bytes("date"), i(40)}).affected == 1);
   CHECK(db->execute(by_id, {i(4)}).rows == Grid{{i(4), i(40)}});
-  CHECK(db->compilations() == compiled);
+  CHECK(db->compilations() == compiled + 2);
 
-  // DROP TABLE: every plan on it is refused at recompile.
+  // DROP TABLE: every plan on it is refused when it binds again.
   (void)db->execute("DROP TABLE t");
   try {
     (void)db->execute(by_id, {i(1)});
@@ -1331,19 +1359,40 @@ TEST_CASE("embedded API: sqlstate reports PostgreSQL's SQLSTATE for each error",
   CHECK(sqlstate(std::runtime_error{"x"}) == "XX000");
 }
 
-TEST_CASE("embedded API: refit describes a cached statement against the live catalog", "[sql][api][server]") {
+TEST_CASE("embedded API: refit binds a held statement again with the types it fixed", "[sql][api][server]") {
   sql_test::TempDir dir{"api_refit"};
   auto db = Database::open(dir.path());
   (void)db->execute("CREATE TABLE r (k BIGINT PRIMARY KEY, v BIGINT)");
   const auto& select = db->prepare("SELECT v FROM r WHERE k = $1");
   CHECK(select.params().at(0).type == SqlType{SqlKind::BigInt});
+  // Another column type, same parameter: bound again, and the same record.
+  (void)db->execute("ALTER TABLE r ADD COLUMN w BIGINT");
+  db->refit(select);
+  CHECK(select.params().at(0).type == SqlType{SqlKind::BigInt});
+  // A key of another type: the BIGINT $1 it fixed no longer fits (42883,
+  // double precision = bigint has an operator in PostgreSQL, not here: the
+  // binder's refusal), and its result column changed: refit refuses it, and
+  // params() keeps what the statement fixed.
   (void)db->execute("DROP TABLE r");
   (void)db->execute("CREATE TABLE r (k DOUBLE PRECISION PRIMARY KEY, v TEXT)");
-  CHECK(select.params().at(0).type == SqlType{SqlKind::BigInt});  // the plan it would have run
-  db->refit(select);
-  CHECK(select.params().at(0).type == SqlType{SqlKind::Double});
-  CHECK(select.columns().at(0).type == SqlType{SqlKind::Text});
-  CHECK(db->execute(select, {2.5}).rows.empty());
+  CHECK_THROWS(db->refit(select));
+  CHECK(select.params().at(0).type == SqlType{SqlKind::BigInt});
+  CHECK(select.columns().at(0).type == SqlType{SqlKind::BigInt});
+  // By text the statement binds afresh, and describes the live catalog.
+  auto record = db->refit("SELECT v FROM r WHERE k = $1", ResultCheck::none());
+  CHECK(record.params.at(0).type == SqlType{SqlKind::Double});
+  CHECK(record.columns.at(0).type == SqlType{SqlKind::Text});
+  CHECK(db->execute("SELECT v FROM r WHERE k = $1", {2.5}).rows.empty());
+  // Its result column changed, so a record fixed before is 0A000.
+  (void)db->execute("DROP TABLE r");
+  (void)db->execute("CREATE TABLE r (k DOUBLE PRECISION PRIMARY KEY, v BIGINT)");
+  try {
+    (void)db->refit("SELECT v FROM r WHERE k = $1", ResultCheck::given(record));
+    FAIL("refit");
+  } catch (const FeatureNotSupported& e) {
+    CHECK(sqlstate(e) == "0A000");
+    CHECK(std::string{e.what()} == "cached plan must not change result type");
+  }
 }
 
 TEST_CASE("embedded API: every plan the search costed returns the same rows", "[sql][api][search]") {
