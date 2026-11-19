@@ -1,6 +1,7 @@
 # Plan API: a physical algebra for generated plans
 
-Status: **built**, revision 17 (revision 17 with
+Status: **built**, revision 18 (revision 18 with
+`bc_insert_or_existing`, for `INSERT … ON CONFLICT DO UPDATE`; revision 17 with
 `bc_insert_on_conflict`, for `INSERT … ON CONFLICT DO NOTHING`; revision 16 with `BC_T_NUM`,
 `bc_num_quotient` and `bc_emit_num`, so an `AVG` of an integer or a
 `DECIMAL` is one result column; revision 15 with `bc_sub_arg_*`, so a
@@ -402,7 +403,9 @@ exceptions are writes that put a new row at a key, a `bc_insert`, a
   (1, …)`, a duplicate key, and raises `BC_C_UNIQUE` (SQLSTATE 23505, as
   PostgreSQL reports it), never retried; `bc_insert_on_conflict` with the
   key under its arbiter skips the row instead, as `ON CONFLICT DO NOTHING`
-  skips the second of two rows with one key;
+  skips the second of two rows with one key, and `bc_insert_or_existing`
+  raises `BC_E_CARDINALITY` (21000), as `ON CONFLICT DO UPDATE` refuses to
+  affect a row twice;
 - into a key the plan vacated (it moved or deleted the row there), it takes
   the key, whatever the snapshot holds: the vacating write is in the plan,
   and the engine checks it for a concurrent change. That is PostgreSQL's
@@ -421,7 +424,8 @@ execution that give two rows one unique value are `BC_C_UNIQUE` too, or
 under `bc_insert_on_conflict`'s arbiter a skip: the runtime records each
 unique prefix the execution writes, which its snapshot can't see.
 `bc_insert_on_conflict` reads these records and the view before it records
-anything, so a row it skips leaves none.
+anything, so a row it skips leaves none; so does `bc_insert_or_existing`,
+which gives the row that holds the key instead of skipping.
 Read-your-own-writes across statements in an interactive transaction is an
 overlay the reads and cursors read through: `docs/transaction_design.md`,
 *The transaction's view*.
@@ -1037,6 +1041,7 @@ catalog record makes a commit that raced a `CREATE INDEX` a conflict.
 ```c
 void    bc_insert(bc_ctx *, uint32_t table, bc_view row);
 bool    bc_insert_on_conflict(bc_ctx *, uint32_t table, bc_view row, uint32_t arbiter);  /* or BC_ARBITER_ANY */
+bool    bc_insert_or_existing(bc_ctx *, uint32_t table, bc_view row, uint32_t arbiter, bc_view *existing);
 void    bc_update(bc_ctx *, uint32_t table, bc_view old, bc_view row);
 void    bc_delete(bc_ctx *, uint32_t table, bc_view old);
 void    bc_del_range(bc_ctx *, uint32_t table, bc_view lo, bc_view hi);
@@ -1046,12 +1051,13 @@ void    bc_del_range(bc_ctx *, uint32_t table, bc_view lo, bc_view hi);
 |---|---|---|---|
 | `bc_insert` | Inserts `row`, a row of `table`'s current layout. Checks on the snapshot that its primary key is free and that, for each unique index, no entry has the row's index parts (skipped when one of them is null: nulls are distinct); a duplicate is `BC_E_CONSTRAINT` with `BC_C_UNIQUE` and the table's or the index's id. Then writes the row and one entry per index, and a range guard over each checked unique prefix for the race. | 1, plus 1 per unique index | `put` per row and entry, `ensure_range_unchanged` per unique index |
 | `bc_insert_on_conflict` | `INSERT … ON CONFLICT DO NOTHING`: `bc_insert` of `row`, unless its key under `arbiter` is taken, when it writes nothing and returns false. `arbiter` is `table` (its primary key), one of its unique indexes, or `BC_ARBITER_ANY` (both); another object is `BC_E_HANDLE`. A named one stands for every unique key over its columns, as a set, as PostgreSQL makes each matching index an arbiter. Taken, in this order: a row this execution wrote holds the primary key (skip); this execution vacated it (insert); the view holds it (skip); an arbiter index prefix this execution gave a row, or one the view holds (skip). A key with a null part is never taken. The decision records nothing. An inserted row's arbiter keys take no insert claim, so a concurrent commit of one is `BC_CONFLICT`, never `BC_C_UNIQUE`; an arbiter index keeps its range guard. The other unique keys are checked as `bc_insert` checks them. Returns false once an error is set: the plan's `bc_row_end` (NOT NULL) and `CHECK` come first, and their error is sticky. Revision 17. | as `bc_insert`, plus 1 per arbiter key it skips on | as `bc_insert`; none when it skips |
+| `bc_insert_or_existing` | `INSERT … ON CONFLICT DO UPDATE`: as `bc_insert_on_conflict`, but where the row's key under `arbiter` is taken it sets `*existing` to the row the view holds at that key and returns false; the plan builds the new row from it (`bc_row_from`) and writes it with `bc_update`. The holder is looked for under the primary key first, then under each arbiter index in order. A key a row this execution wrote holds, or an arbiter prefix whose holder in the view is a row this execution wrote and that kept the prefix, is `BC_E_CARDINALITY` ("ON CONFLICT DO UPDATE command cannot affect row a second time"): one statement affects a row once. A primary key this execution vacated is free, and so is a unique prefix a `bc_update` of this execution took from its row (the execution records each such prefix, since the view still shows the row's old entry); the row is inserted. `*existing` is the empty view when the row is inserted or an error is set. The holder's row key is the one the commit checks, through the `bc_update` that writes it, so a concurrent change of the row is `BC_CONFLICT`. Revision 18. | as `bc_insert_on_conflict`, plus 1 for the holder's row | as `bc_insert`, or none (the plan's `bc_update` writes) |
 | `bc_update` | Replaces `old`, a stored row of `table`, with `row`. Writes the row; for each index, compares the entry `old` has with the one `row` has and, only where they differ, deletes the old and writes the new. An index none of whose columns changed encoding is not encoded at all, nor is the new primary key when its columns did not change, so an update of unindexed columns builds no index key. A unique index is checked, as for `bc_insert`, only when its prefix changed, so a row never collides with itself. A changed primary key moves the row: the old key deleted, the new one checked and written, and every entry moved, since each carries the primary key. | 1 per unique index whose prefix changed, plus 1 if the primary key changed | `put`, `del` |
 | `bc_delete` | Deletes `old`, a stored row of `table`, and its entry in every index. | 0 | `del` per row and entry |
 | `bc_del_range` | Deletes the rows of `table` whose primary keys are in `[lo, hi)`, row keys or prefixes of `table` (empty: its start or its end), with their index entries. `lo >= hi` deletes nothing. A table with no secondary index takes one range delete whatever the range holds; otherwise the runtime scans the range to delete each row's entries. | 0 without secondary indexes; else 1 per row in the range, plus 1 for the record that ends it, each charged before it is read | `del_range`, then `del` per entry |
 
-`old` must be a stored row, read in this execution by `bc_get` or
-`bc_scan_row`: the entries removed are derived from it, so a row the plan
+`old` must be a stored row, read in this execution by `bc_get`,
+`bc_scan_row` or `bc_insert_or_existing`: the entries removed are derived from it, so a row the plan
 built would remove entries the snapshot does not hold and leave its real
 ones behind. Anything else is `BC_E_HANDLE`, and so is a second write of a
 row key this plan already wrote, for the same reason. A `bc_del_range` is a

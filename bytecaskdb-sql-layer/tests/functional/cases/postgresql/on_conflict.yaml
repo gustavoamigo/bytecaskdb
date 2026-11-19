@@ -22,7 +22,6 @@
 
 - name: ON CONFLICT DO UPDATE changes the row there
   features: [pg:on-conflict]
-  unimplemented: true
   setup:
     - CREATE TABLE oc2 (id INTEGER PRIMARY KEY, v INTEGER)
   steps:

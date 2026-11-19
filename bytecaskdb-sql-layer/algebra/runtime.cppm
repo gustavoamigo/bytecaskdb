@@ -453,6 +453,7 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_agg_null", fn_addr(bc_agg_null)},
       {"bc_insert", fn_addr(bc_insert)},
       {"bc_insert_on_conflict", fn_addr(bc_insert_on_conflict)},
+      {"bc_insert_or_existing", fn_addr(bc_insert_or_existing)},
       {"bc_update", fn_addr(bc_update)},
       {"bc_delete", fn_addr(bc_delete)},
       {"bc_del_range", fn_addr(bc_del_range)},

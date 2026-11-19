@@ -11,8 +11,9 @@
 // cursors. It makes no choice of its own and reads the plan alone, never the
 // catalog.
 //
-// Writes are bc_insert (bc_insert_on_conflict for ON CONFLICT DO NOTHING),
-// bc_update and bc_delete: the runtime maintains the indexes
+// Writes are bc_insert (bc_insert_on_conflict for ON CONFLICT DO NOTHING,
+// bc_insert_or_existing for DO UPDATE), bc_update and bc_delete: the
+// runtime maintains the indexes
 // (docs/plan_api_design.md, *Decisions, not mechanics*).
 
 module;
@@ -2829,9 +2830,13 @@ private:
   // NOTHING's arbiter, only when the row is written, counting it in
   // `count`. NOT NULL (bc_row_end) and CHECK are tested first, as
   // PostgreSQL tests them before the arbiter; their error is sticky, and
-  // bc_insert_on_conflict then writes nothing.
+  // bc_insert_on_conflict then writes nothing. With DO UPDATE's `update`,
+  // the row that holds the key is read (bc_insert_or_existing) and updated
+  // in its place as an UPDATE updates it, its CHECK tested again, and its
+  // RETURNING row is the row as updated; each row proposed is counted.
   void insert_row(std::uint32_t table, const std::vector<Expr>& checks, const std::vector<Expr>& returning,
-                  std::optional<std::uint32_t> arbiter, const std::string& count) {
+                  std::optional<std::uint32_t> arbiter, const std::string& count,
+                  const std::vector<std::pair<ColumnRef, Expr>>* update = nullptr) {
     if (!arbiter) {
       write_checked(table, checks, "bc_insert(cx, " + w_.tbl(table) + ", ", !returning.empty());
       returned(table, "nr", returning);
@@ -2840,10 +2845,27 @@ private:
     }
     auto row = checked_row(table, checks, !returning.empty());
     auto by = *arbiter == logical::kAnyArbiter ? std::string{"BC_ARBITER_ANY"} : w_.obj(*arbiter);
-    w_.open("if (bc_insert_on_conflict(cx, " + w_.tbl(table) + ", " + row + ", " + by + "))");
+    if (update == nullptr) {
+      w_.open("if (bc_insert_on_conflict(cx, " + w_.tbl(table) + ", " + row + ", " + by + "))");
+      returned(table, "nr", returning);
+      w_.line("++" + count + ";");
+      w_.close();
+      return;
+    }
+    w_.reads(table);
+    w_.line("bc_view old = bc_empty(cx);");
+    w_.open("if (bc_insert_or_existing(cx, " + w_.tbl(table) + ", " + row + ", " + by + ", &old))");
     returned(table, "nr", returning);
-    w_.line("++" + count + ";");
+    w_.otherwise();
+    // An inner block: its `r` and `nr` are the updated row's.
+    w_.line("bc_row r = bc_row_from(cx, " + w_.tbl(table) + ", old);");
+    auto outer = std::exchange(rows_, std::vector<Binding>{{table, "old"}});
+    for (const auto& [col, e] : *update) set(col, e);
+    rows_ = std::move(outer);
+    write_checked(table, checks, "bc_update(cx, " + w_.tbl(table) + ", old, ", !returning.empty());
+    returned(table, "nr", returning);
     w_.close();
+    w_.line("++" + count + ";");
   }
 
   void produce(const physical::Insert& s, const Consume&) {
@@ -2852,16 +2874,17 @@ private:
     // the keys and writes the index entries; an error it raises is sticky,
     // so the rows after one that fails are not written.
     // With ON CONFLICT DO NOTHING the count is the rows written.
+    // With DO UPDATE it is the rows inserted or updated.
     const std::string count = s.arbiter ? "inserted" : "";
     if (s.arbiter) w_.line("int64_t " + count + " = 0;");
     const auto blocks = s.rows.size() > 1;
-    for (const auto& row : s.rows) {
+    for (std::size_t i = 0; i < s.rows.size(); ++i) {
       if (blocks) w_.open("");
       w_.line("bc_row r = bc_row_begin(cx, " + w_.tbl(s.table) + ");");
-      for (const auto& [col, e] : row) {
+      for (const auto& [col, e] : s.rows[i]) {
         w_.line("bc_row_set_param(cx, r, " + w_.col(col) + ", " + std::to_string(e.param) + ");");
       }
-      insert_row(s.table, s.checks, s.returning, s.arbiter, count);
+      insert_row(s.table, s.checks, s.returning, s.arbiter, count, s.update.empty() ? nullptr : &s.update[i]);
       if (blocks) w_.close();
     }
     w_.line("bc_emit_count(cx, " + (s.arbiter ? count : std::to_string(s.rows.size())) + ");");

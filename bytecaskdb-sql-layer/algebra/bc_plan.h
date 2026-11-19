@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
    Copyright (c) 2026 Gustavo Amigo
 
-   bc_plan.h — the plan API of docs/plan_api_design.md (revision 17). A plan is
+   bc_plan.h — the plan API of docs/plan_api_design.md (revision 18). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
    and bc_params are opaque here and built by the runtime
@@ -55,7 +55,8 @@ enum bc_error_code {
   BC_E_UNKNOWN,     /* a commit failed and degraded the engine: its batch may have reached the data
                        file, so its outcome is unknown, never "nothing written" (SQLSTATE 08007) */
   BC_E_PATTERN,     /* bc_like reached a pattern's escape character at its end (SQLSTATE 22025) */
-  BC_E_CARDINALITY, /* a BC_SUB_VALUE subquery emitted a second row (SQLSTATE 21000) */
+  BC_E_CARDINALITY, /* a BC_SUB_VALUE subquery emitted a second row, or bc_insert_or_existing
+                       met a row this execution wrote (SQLSTATE 21000) */
 };
 
 /* What a subquery's rows are folded into, from bc_sub_begin to bc_sub_end:
@@ -499,6 +500,13 @@ void bc_insert(bc_ctx *, uint32_t table, bc_view row);
    as bc_insert checks it (BC_C_UNIQUE). False, too, once an error is set. */
 #define BC_ARBITER_ANY UINT32_C(0xFFFFFFFF)
 bool bc_insert_on_conflict(bc_ctx *, uint32_t table, bc_view row, uint32_t arbiter);
+/* INSERT … ON CONFLICT DO UPDATE: as bc_insert_on_conflict, but where the row's key under
+   `arbiter` is taken, *existing is the row the view holds at that key, of the primary key first,
+   then of the unique indexes in their order: the row the plan then updates with bc_update. A key a
+   row this execution wrote holds, or one a row it wrote held in the view and kept, is
+   BC_E_CARDINALITY: one statement affects a row once. A key its writes vacated is free. *existing is the empty view when the row is inserted or an
+   error is set. */
+bool bc_insert_or_existing(bc_ctx *, uint32_t table, bc_view row, uint32_t arbiter, bc_view *existing);
 void bc_update(bc_ctx *, uint32_t table, bc_view old, bc_view row);
 void bc_delete(bc_ctx *, uint32_t table, bc_view old);
 void bc_del_range(bc_ctx *, uint32_t table, bc_view lo, bc_view hi);

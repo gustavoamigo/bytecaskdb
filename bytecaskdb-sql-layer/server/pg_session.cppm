@@ -808,7 +808,7 @@ private:
         fatal("25P04", "terminating connection due to transaction timeout");
         return;
       }
-      error(sqlstate(e), e.what());
+      send_fields('E', "ERROR", sqlstate(e), e.what(), 0, {}, error_hint(e));
     }
   }
 

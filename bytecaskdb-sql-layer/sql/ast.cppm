@@ -314,6 +314,12 @@ struct AddColumn {
   std::int32_t pos{-1};
 };
 
+struct Assignment {
+  std::string column;
+  Expr value;
+  std::int32_t pos{-1};
+};
+
 struct Insert {
   std::string table;
   std::vector<std::string> columns;  // empty: every column, in order
@@ -322,11 +328,12 @@ struct Insert {
   std::vector<Expr> returning;  // RETURNING's list, empty for none
   // INSERT … SELECT: the query whose rows are written, in place of VALUES.
   std::shared_ptr<const Select> query;
-  // ON CONFLICT DO NOTHING: the columns its target names, empty for a
-  // conflict on any unique constraint.
+  // ON CONFLICT: the columns its target names, empty for a conflict on any
+  // unique constraint; DO UPDATE's SET list, none for DO NOTHING.
   struct OnConflict {
     std::vector<std::string> columns;
     std::int32_t pos{-1};
+    std::shared_ptr<const std::vector<Assignment>> update;
   };
   std::optional<OnConflict> on_conflict;
 };
@@ -452,12 +459,6 @@ struct SetOperation {
   out.set = s.set;  // never changed once parsed: shared
   return out;
 }
-
-struct Assignment {
-  std::string column;
-  Expr value;
-  std::int32_t pos{-1};
-};
 
 struct Update {
   std::string table;

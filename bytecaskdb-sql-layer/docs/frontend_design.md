@@ -106,9 +106,40 @@ kind the transformer doesn't take is refused with its position.
   commit a conflict, retried in autocommit, where the retry reads the row
   and skips it, and 40001 in a transaction. A row skipped because the
   snapshot holds it stays skipped when a concurrent commit deletes it
-  (*Known differences*). Refused (0A000): `DO UPDATE`, `ON CONSTRAINT`, a
+  (*Known differences*). Refused (0A000): `ON CONSTRAINT`, a
   `WHERE` on the target, an expression, collation or operator class in it,
   `ON CONFLICT` into a view, and in a procedure.
+- `INSERT … VALUES … ON CONFLICT (columns) DO UPDATE SET …`: a row whose
+  key under the arbiter (inferred as for `DO NOTHING`) is taken updates the
+  row that holds it instead, and the rest are inserted. `DO UPDATE` with no
+  target is 42601 ("ON CONFLICT DO UPDATE requires inference specification
+  or constraint name"), as in PostgreSQL. The `SET` binds over two
+  relations, the target table and `excluded`, the row proposed: a column
+  qualified by the table's name is the holder's, bound as `UPDATE`'s `SET`
+  binds (a column, column ± a parameter or integer, a constant, a
+  parameter, `DEFAULT`); `excluded.col` is the value the row proposed for
+  `col`, its parameter, or `col`'s default where the row leaves it out. An
+  unqualified column is 42702 ("column reference … is ambiguous"), an
+  unknown `excluded` column 42703 ("column excluded.x does not exist"), an
+  unknown target 42703 ("column … of relation … does not exist"), a column
+  set twice 42601. `excluded.col` is assigned to a column of its type or of
+  another integer type (the row builder checks the range); a type
+  PostgreSQL does not assign from is 42804 ("column … is of type … but
+  expression is of type …"), another is refused (42601, not yet), and so is
+  `excluded` inside an expression (`excluded.v + 1`). The updated row is
+  checked as `UPDATE` checks it: `CHECK` again (23514), a primary key moved
+  onto another row's (23505), and a moved key leaves its old key free, so a
+  later row of the statement with that key is inserted. A row the statement
+  already inserted or updated, hit again, is 21000 ("ON CONFLICT DO UPDATE
+  command cannot affect row a second time", with PostgreSQL's hint); so is
+  a key under an arbiter index whose holder the statement updated and that
+  kept it. A unique key an update of the statement took from its row is
+  free, as a moved primary key is: a later row with it is inserted. The count is the rows inserted or updated, and `RETURNING` gives
+  each as written: the inserted row, or the row as updated. The plan calls
+  `bc_insert_or_existing` per row (`plan_api_design.md`), and on a taken
+  key builds the new row from the holder and writes it with `bc_update`.
+  Refused: `DO UPDATE … WHERE` (0A000), `INSERT … SELECT … ON CONFLICT DO
+  UPDATE` (42601, not yet), and the refusals of `DO NOTHING`.
 - `RETURNING` of an `INSERT`, `UPDATE` or `DELETE`: a result row per row
   written, its list bound as a select list over the one table (`*`,
   columns, constants, parameters, expressions, each named as a select
@@ -1020,9 +1051,12 @@ That includes:
   `FOR UPDATE` of a join (#697), an alias of a join, an output name in `GROUP BY`;
 - `RETURNING` in a procedure; `VALUES` outside `INSERT`; `OFFSET` on a set operation, in one of
   its arms or in a view;
-- `ON CONFLICT DO UPDATE`, `ON CONFLICT ON CONSTRAINT`, a `WHERE`, an
+- `ON CONFLICT ON CONSTRAINT`, a `WHERE`, an
   expression, a collation or an operator class in `ON CONFLICT`'s target,
-  and `ON CONFLICT` into a view or in a procedure (0A000);
+  `DO UPDATE … WHERE`, and `ON CONFLICT` into a view or in a procedure
+  (0A000); `INSERT … SELECT … ON CONFLICT DO UPDATE`, `excluded` inside an
+  expression, and `excluded.col` into a column of another type PostgreSQL
+  assigns to (42601, not yet);
 - `INSERT … SELECT` of an aggregated, grouped or `DISTINCT` query or a set
   operation (#682), of a value outside its column's type or family that
   PostgreSQL assigns (a conversion through text, `CHAR(n)` into another
@@ -1485,7 +1519,9 @@ fail on them.
   so its outcome depends on the order it visits them. Two rows given one
   value are 23505 on both
   (`test_one_unique_value_given_to_two_rows_is_23505`). The machine adds to
-  no column a unique index holds.
+  no column a unique index holds. `ON CONFLICT DO UPDATE`'s `SET` checks a
+  new unique value the same way; a proposed row whose arbiter key an
+  earlier row's update left is inserted, as in PostgreSQL.
 - **A sort, a structure of groups, or the keys a set operation tells
   duplicates apart by, past the statement's memory budget fails** with
   54000, where PostgreSQL spills it to disk (`planner_design.md`, *Memory*

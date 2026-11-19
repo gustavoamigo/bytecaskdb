@@ -209,6 +209,9 @@ public:
 // the PostgreSQL server reports it, and the proof oracle compares it with
 // PostgreSQL's.
 [[nodiscard]] auto sqlstate(const std::exception& e) noexcept -> std::string_view;
+// The HINT PostgreSQL reports with the error, empty for none: an
+// ast::SqlError's own, and the one PostgreSQL gives a runtime error.
+[[nodiscard]] auto error_hint(const std::exception& e) noexcept -> std::string_view;
 
 class Database;
 
@@ -1169,6 +1172,16 @@ auto sqlstate(const std::exception& e) noexcept -> std::string_view {
   if (dynamic_cast<const DbClosed*>(&e) != nullptr) return "57P01";
   if (dynamic_cast<const std::bad_alloc*>(&e) != nullptr) return "53200";
   return "XX000";
+}
+
+auto error_hint(const std::exception& e) noexcept -> std::string_view {
+  if (const auto* x = dynamic_cast<const ast::SqlError*>(&e)) return x->hint();
+  const auto* x = dynamic_cast<const ExecError*>(&e);
+  if (x != nullptr && !x->conflict() && x->code() == BC_E_CARDINALITY &&
+      std::string_view{x->what()} == "ON CONFLICT DO UPDATE command cannot affect row a second time") {
+    return "Ensure that no rows proposed for insertion within the same command have duplicate constrained values.";
+  }
+  return {};
 }
 
 auto Statement::param_types() const -> std::vector<PhysType> {

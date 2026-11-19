@@ -1911,6 +1911,9 @@ auto param_count(const ast::Statement& stmt) -> std::uint32_t {
             for (const auto& e : row) params_in(e, n);
           }
           if (s.query) n = std::max(n, select_param_count(*s.query));
+          if (s.on_conflict && s.on_conflict->update) {
+            for (const auto& a : *s.on_conflict->update) params_in(a.value, n);
+          }
           for (const auto& e : s.returning) params_in(e, n);
         } else if constexpr (std::is_same_v<T, ast::Select>) {
           n = select_param_count(s);
@@ -6421,6 +6424,108 @@ auto arbiter(const Table& t, const ast::Insert::OnConflict& oc) -> std::uint32_t
                  kInvalidColumnReference};
 }
 
+// SET col = e of an UPDATE or of ON CONFLICT DO UPDATE, e bound over the
+// row as read. A constant is checked against the column's type now, as
+// PostgreSQL folds its cast when it plans the statement; a parameter
+// before the plan runs (Binder::check_assigned).
+auto assigned_value(Binder& b, const Table& t, const ast::Expr& e, const Column& c) -> logical::Expr {
+  auto v = b.value(t, e, c);
+  if (v.kind == logical::Expr::Kind::Param && b.is_fixed(v.param)) {
+    if (auto why = out_of_range(c.sql, b.fixed_value(v.param))) out_of_type(*why, e.pos);
+  } else if (v.kind == logical::Expr::Kind::Param) {
+    b.check_assigned(v.param, c, t.id);
+  }
+  return v;
+}
+
+// ON CONFLICT DO UPDATE's SET, one list per row of VALUES (`rows`, the
+// values bound for each column): each column from an expression over the
+// row that holds the key, its columns qualified by the table's name, or
+// from EXCLUDED.col, the value the row proposed for col: its parameter, or
+// col's default. EXCLUDED.col is assigned to a column of its type, or of
+// another integer type, which the row builder checks the value against; a
+// type PostgreSQL does not assign from is 42804. An unqualified column is
+// ambiguous (42702), as both relations have it. EXCLUDED inside an
+// expression is not supported yet.
+auto conflict_update(Binder& b, const Table& t, const std::vector<ast::Assignment>& set,
+                     const std::vector<std::vector<std::optional<logical::Expr>>>& rows)
+    -> std::vector<std::vector<std::pair<logical::ColumnRef, logical::Expr>>> {
+  constexpr std::string_view kExcluded = "excluded";
+  auto excluded_column = [&](const ast::Expr& e) {
+    const auto* c = t.column(e.column);
+    if (c == nullptr || c->hidden) throw SqlError{"column excluded." + e.column + " does not exist", e.pos, kUndefinedColumn};
+    return c;
+  };
+  // The references inside a value: none unqualified, no EXCLUDED.
+  auto qualified = [&](this const auto& self, const ast::Expr& e) -> void {
+    if (e.kind == ast::Expr::Kind::Column && e.table == kExcluded) {
+      (void)excluded_column(e);
+      not_yet("EXCLUDED in an expression", e.pos);
+    }
+    if (e.kind == ast::Expr::Kind::Column && e.table.empty()) {
+      (void)Binder::column(t, e.column, e.pos);
+      throw SqlError{"column reference \"" + e.column + "\" is ambiguous", e.pos, kAmbiguousColumn};
+    }
+    if (e.lhs) self(*e.lhs);
+    if (e.rhs) self(*e.rhs);
+    for (const auto& a : e.args) self(a);
+  };
+  // Each assignment: its column and its value, or the column EXCLUDED gives.
+  struct Item {
+    logical::ColumnRef target;
+    std::optional<logical::Expr> value;
+    const Column* excluded{nullptr};
+  };
+  std::vector<Item> items;
+  std::set<std::uint32_t> assigned;
+  for (const auto& a : set) {
+    const auto* c = t.column(a.column);
+    if (c == nullptr || c->hidden) {
+      throw SqlError{"column \"" + a.column + "\" of relation \"" + t.name + "\" does not exist", a.pos, kUndefinedColumn};
+    }
+    if (!assigned.insert(c->id).second) throw SqlError{"multiple assignments to same column \"" + a.column + "\"", a.pos};
+    const auto& e = a.value;
+    auto target = logical::column_of(t.id, *c).col;
+    if (e.kind == ast::Expr::Kind::Column && e.table == kExcluded) {
+      const auto* x = excluded_column(e);
+      if (x->sql != c->sql && !(is_integer(x->sql) && is_integer(c->sql))) {
+        if (auto state = type_refusal(x->sql.kind, c->sql.kind, true)) {
+          throw SqlError{"column \"" + c->name + "\" is of type " + pg_type_name(c->sql) + " but expression is of type " +
+                             pg_type_name(x->sql),
+                         e.pos, *state}
+              .with_notes("", "You will need to rewrite or cast the expression.");
+        }
+        not_yet("EXCLUDED." + x->name + " assigned to a column of another type", e.pos);
+      }
+      items.push_back({target, std::nullopt, x});
+      continue;
+    }
+    qualified(e);
+    items.push_back({target, assigned_value(b, t, e, *c), nullptr});
+  }
+  // A column the rows leave out proposes its default, bound once.
+  std::map<std::size_t, logical::Expr> defaults;
+  std::vector<std::vector<std::pair<logical::ColumnRef, logical::Expr>>> out;
+  for (const auto& row : rows) {
+    auto& list = out.emplace_back();
+    for (const auto& it : items) {
+      if (it.value) {
+        list.emplace_back(it.target, *it.value);
+        continue;
+      }
+      auto at = static_cast<std::size_t>(it.excluded - t.columns.data());
+      if (row[at]) {
+        list.emplace_back(it.target, *row[at]);
+        continue;
+      }
+      auto d = defaults.find(at);
+      if (d == defaults.end()) d = defaults.emplace(at, b.fixed(it.excluded->default_value, it.excluded->sql)).first;
+      list.emplace_back(it.target, d->second);
+    }
+  }
+  return out;
+}
+
 // INSERT … SELECT: the query bound with its select list as the values of
 // the columns written (Binder::assign), a SELECT of rows: refused (0A000)
 // where it groups, aggregates, is DISTINCT, or is a set operation, whose
@@ -6445,6 +6550,7 @@ auto insert_query(Binder& b, const Table& t, const ast::Insert& s) -> logical::N
   if (!std::holds_alternative<logical::Project>(n->op)) {
     not_supported("INSERT … SELECT of an aggregated, grouped or DISTINCT query", s.query->pos);
   }
+  if (s.on_conflict && s.on_conflict->update) not_yet("INSERT … SELECT … ON CONFLICT DO UPDATE", s.on_conflict->pos);
   logical::InsertFrom out{std::move(rows), &t, {}, {}, b.checks(t), b.returning(t, s.returning), {}};
   if (s.on_conflict) out.arbiter = arbiter(t, *s.on_conflict);
   const auto filled = b.take_assigned();
@@ -6641,6 +6747,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           out.checks = b.checks(*t);
           out.returning = b.returning(*t, s.returning);
           if (s.on_conflict) out.arbiter = arbiter(*t, *s.on_conflict);
+          if (s.on_conflict && s.on_conflict->update) out.update = conflict_update(b, *t, *s.on_conflict->update, out.rows);
           return {logical::node(std::move(out)), s.pos};
         } else if constexpr (std::is_same_v<T, ast::Select>) {
           return {b.select(s), s.pos};
@@ -6651,15 +6758,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
             // A primary key column too: the row moves to its new key, each
             // row's checked in turn, as PostgreSQL's unique check does.
             const auto* c = Binder::column(*t, a.column, a.pos);
-            auto v = b.value(*t, a.value, *c);
-            // A constant is checked against the column's type now, as
-            // PostgreSQL folds its cast when it plans the statement.
-            if (v.kind == logical::Expr::Kind::Param && b.is_fixed(v.param)) {
-              if (auto why = out_of_range(c->sql, b.fixed_value(v.param))) out_of_type(*why, a.value.pos);
-            } else if (v.kind == logical::Expr::Kind::Param) {
-              b.check_assigned(v.param, *c, t->id);
-            }
-            set.emplace_back(logical::column_of(t->id, *c).col, std::move(v));
+            set.emplace_back(logical::column_of(t->id, *c).col, assigned_value(b, *t, a.value, *c));
           }
           b.set_scope({t});
           auto rows = Binder::rows(*t, s.current_of.empty() ? b.where(*t, s.where) : b.current_of(*t, own, s.pos));

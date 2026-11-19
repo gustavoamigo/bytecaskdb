@@ -249,7 +249,9 @@ duplicate.
   PostgreSQL reports as 40001 too. Nor is a key under the arbiter of an
   `INSERT … ON CONFLICT DO NOTHING` (`bc_insert_on_conflict`): a
   concurrent commit of it is 40001, as in PostgreSQL's REPEATABLE READ,
-  where the inserter cannot see the row it would skip on.
+  where the inserter cannot see the row it would skip on. `DO UPDATE`
+  (`bc_insert_or_existing`) is the same where it inserts; where it
+  updates, the row it updates is a written key the commit checks.
 - **How the commit decides.** On `BC_CONFLICT`, take a fresh snapshot, the
   latest committed state, and check the claims in log order:
   `contains_key` for a primary key, the first key at or after a prefix for
@@ -552,6 +554,7 @@ reason.
 | A second updater of a row waits for the first transaction, then gets 40001 at its statement if the first committed. | Both update. The second to commit gets 40001 at `commit()`. | No row locks: conflicts are found at commit. |
 | A second inserter of a unique key waits, then gets 23505 at its `INSERT`. | Both insert. The second to commit gets 23505 at `commit()` (*Commit and conflicts*). | The same outcome, reported at commit instead of after a wait. |
 | `INSERT … ON CONFLICT DO NOTHING` whose arbiter key a concurrent transaction inserts waits, then gets 40001. | Both insert. The second to commit gets 40001 at `commit()`; in autocommit the statement is retried and skips the row. | The same outcome, reported at commit. |
+| `INSERT … ON CONFLICT DO UPDATE` whose conflicting row a concurrent transaction updates or deletes waits, then gets 40001. | Both write. The second to commit gets 40001 at `commit()`; in autocommit the statement is retried and updates the row as committed, or inserts where it was deleted. | The same outcome, reported at commit; no retry inside the statement (owner decision, as for `DO NOTHING`). |
 | `INSERT … ON CONFLICT DO NOTHING` whose conflicting row a concurrent transaction deletes and commits waits for it, then inserts the row. | The row is skipped, as the statement's snapshot holds its key, and the commit succeeds. | Owner decision (2026-11-19), not the rule *never wait*: a guard per skipped row would make the commit a conflict and an autocommit retry insert the row; it was not taken. |
 | `SELECT … FOR UPDATE` locks the rows: other writers wait. | It guards them: the guarding transaction gets 40001 at commit if a writer of those rows committed first. A writer is never held back. | A guard, not a lock. |
 | DDL waits for the locks of open transactions on its table. | DDL commits at once. An open transaction that wrote the table gets 40001 at commit. | DDL never waits. |
