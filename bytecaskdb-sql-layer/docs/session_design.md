@@ -385,7 +385,10 @@ runs, through the open block's transaction or in autocommit, where the
 plan comes from `Database::prepare`'s cache, which is shared by every
 session and keyed by statement text (server_design.md, *Extended query*).
 #549 bounds that cache; holding no plan, a named statement keeps nothing
-the cache may evict.
+the cache may evict. A SELECT portal bound in a block holds what its plan reads
+(`PortalReads`), so that a DDL of the block on it is 55006; a `ROLLBACK TO`
+drops the portals bound since its savepoint, and a simple `Query` the
+unnamed portal, as in PostgreSQL (server_design.md, *Extended query*).
 
 ## TLS and authentication
 

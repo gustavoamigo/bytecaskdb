@@ -2524,7 +2524,7 @@ def test_an_implicit_block_binds_against_the_catalog_of_its_first_execute(server
 def test_a_ddl_parsed_in_a_block_and_never_executed_leaves_it_open(server):
     """docs/transaction_design.md, stage 0's tests: Parse of a DDL in a block
     is no error and the block stays open; executing a Parsed CREATE TABLE AS
-    there is 0A000 (DDL in a transaction is not built yet)."""
+    there is 0A000 (CREATE TABLE AS in a transaction is stage 4)."""
     c = connect(server)
     q(c, "CREATE TABLE r (k INTEGER PRIMARY KEY, a INTEGER)")
     q(c, "BEGIN")
@@ -2545,28 +2545,220 @@ def test_a_ddl_parsed_in_a_block_and_never_executed_leaves_it_open(server):
     assert columns(q(c, "SELECT * FROM r")) == ["k", "a"]
 
 
-def test_ddl_in_a_begin_block_is_refused_and_fails_the_block(server):
-    """docs/transaction_design.md, stage 2: the embedded Transaction runs
-    DDL, a BEGIN block does not yet (stage 3). By Simple Query and by
-    Execute, DDL in a block is 0A000 and fails the block, which ROLLBACK
-    ends with nothing written; in a READ ONLY block it is 25006 first, as
-    PostgreSQL's."""
-    c = connect(server)
+def test_ddl_in_a_begin_block_runs_in_the_block_and_rollback_undoes_it(server):
+    """docs/transaction_design.md, stage 3: DDL in a BEGIN block, by Simple
+    Query and by Execute, is a statement of the block. Its statements see
+    the new table; ROLLBACK undoes all of it, and a statement Parsed on it
+    is 42P01 at its next Bind, as PostgreSQL's revalidation reports it."""
+    c, other = connect(server), connect(server)
+    for create in ("simple", "extended"):
+        q(c, "BEGIN")
+        ddl = "CREATE TABLE in_block (k INTEGER PRIMARY KEY, v TEXT)"
+        if create == "simple":
+            out = q(c, ddl)
+        else:
+            c.send(parse(ddl), bind([]), execute(), SYNC)
+            out = c.until_ready()
+        assert states(out) == [] and fields_tag(out) == "CREATE TABLE" and status(out) == "T", create
+        c.send(parse("INSERT INTO in_block VALUES ($1, $2)", "ins"), bind(["1", "a"], "ins"), execute(), SYNC)
+        assert states(c.until_ready()) == []
+        c.send(parse("SELECT k, v FROM in_block WHERE k = $1", "sel"), describe("S", "sel"),
+               bind(["1"], "sel"), describe("P"), execute(), SYNC)
+        out = c.until_ready()
+        assert states(out) == [] and columns(out) == ["k", "v"] and data(out) == [["1", "a"]]
+        assert states(q(other, "SELECT k FROM in_block")) == ["42P01"]  # uncommitted: not seen
+        assert status(q(c, "ROLLBACK")) == "I"
+        for name in ("sel", "ins"):
+            c.send(bind(["1"] if name == "sel" else ["2", "b"], name), execute(), SYNC)
+            assert states(c.until_ready()) == ["42P01"], name
+        assert states(q(c, "SELECT k FROM in_block")) == ["42P01"]
+        c.send(close_statement("ins"), close_statement("sel"), SYNC)
+        c.until_ready()
+    # COMMIT publishes the table with its rows.
+    q(c, "BEGIN")
+    q(c, "CREATE TABLE in_block (k INTEGER PRIMARY KEY, v TEXT)")
+    q(c, "INSERT INTO in_block VALUES (1, 'a')")
+    q(c, "CREATE INDEX in_block_v ON in_block (v)")
+    assert status(q(c, "COMMIT")) == "I"
+    assert data(q(other, "SELECT k, v FROM in_block WHERE v = 'a'")) == [["1", "a"]]
+    # A DDL in a failed block is 25P02, and in a READ ONLY block 25006, as PostgreSQL's.
     q(c, "BEGIN")
     out = q(c, "CREATE TABLE in_block (k INTEGER PRIMARY KEY)")
-    assert states(out) == ["0A000"] and status(out) == "E"
-    q(c, "ROLLBACK")
-    q(c, "BEGIN")
-    c.send(parse("CREATE TABLE in_block (k INTEGER PRIMARY KEY)"), bind([]), execute(), SYNC)
-    out = c.until_ready()
-    assert states(out) == ["0A000"] and status(out) == "E"
+    assert states(out) == ["42P07"] and status(out) == "E"
+    out = q(c, "DROP TABLE in_block")
+    assert states(out) == ["25P02"] and status(out) == "E"
+    # Only a syntax error comes before 25P02, not what parse analysis refuses (42P16).
+    assert states(q(c, "CREATE TABLE w (a INTEGER PRIMARY KEY, PRIMARY KEY (a))")) == ["25P02"]
+    assert states(q(c, "CREATE TABL w (a INTEGER)")) == ["42601"]
     q(c, "ROLLBACK")
     q(c, "BEGIN READ ONLY")
-    out = q(c, "CREATE TABLE in_block (k INTEGER PRIMARY KEY)")
+    out = q(c, "CREATE TABLE read_only (k INTEGER PRIMARY KEY)")
     assert states(out) == ["25006"] and status(out) == "E"
     q(c, "ROLLBACK")
-    out = q(c, "SELECT * FROM in_block")
-    assert states(out) == ["42P01"]
+    assert states(q(c, "SELECT * FROM read_only")) == ["42P01"]
+
+
+def close_statement(name: str) -> bytes:
+    return message(b"C", b"S" + cstr(name))
+
+
+def close_portal(name: str) -> bytes:
+    return message(b"C", b"P" + cstr(name))
+
+
+def test_a_statement_parsed_after_the_block_s_ddl_keeps_its_columns_after_rollback(server):
+    """A Parse after ADD COLUMN in a block fixes the block's columns. After
+    ROLLBACK, its Bind is 0A000 in autocommit, in a new block at the same
+    catalog, and in one pinned after another session's ADD COLUMN, and again
+    on retry: as PostgreSQL 17."""
+    c, other = connect(server), connect(server)
+    q(c, "CREATE TABLE r (k INTEGER PRIMARY KEY, a INTEGER)")
+    q(c, "INSERT INTO r VALUES (1, 10)")
+    q(c, "BEGIN")
+    q(c, "ALTER TABLE r ADD COLUMN b INTEGER DEFAULT 3")
+    c.send(parse("SELECT * FROM r", "s"), describe("S", "s"), bind([], "s"), execute(), SYNC)
+    out = c.until_ready()
+    assert states(out) == [] and columns(out) == ["k", "a", "b"] and data(out) == [["1", "10", "3"]]
+    q(c, "ROLLBACK")
+    for _ in range(2):
+        c.send(bind([], "s"), execute(), SYNC)
+        assert states(c.until_ready()) == ["0A000"]
+    for _ in range(2):
+        q(c, "BEGIN")
+        q(c, "SELECT 1")
+        c.send(bind([], "s"), execute(), SYNC)
+        out = c.until_ready()
+        assert states(out) == ["0A000"] and status(out) == "E"
+        q(c, "ROLLBACK")
+    assert states(q(other, "ALTER TABLE r ADD COLUMN c INTEGER")) == []
+    for _ in range(2):
+        q(c, "BEGIN")
+        q(c, "SELECT 1")
+        c.send(bind([], "s"), execute(), SYNC)
+        out = c.until_ready()
+        assert states(out) == ["0A000"] and status(out) == "E"
+        q(c, "ROLLBACK")
+
+
+def test_a_ddl_on_what_a_portal_of_the_block_reads_is_55006(server):
+    """As PostgreSQL's CheckTableNotInUse: a SELECT portal bound in the block,
+    named, executed or not, holds what its plan reads until it is closed, the block
+    ends, or a ROLLBACK TO drops it. A Simple Query takes the unnamed portal
+    for itself, so the unnamed one never refuses a Simple Query's DDL."""
+    c = connect(server)
+    q(c, "CREATE TABLE r (k INTEGER PRIMARY KEY, a INTEGER)")
+    q(c, "INSERT INTO r VALUES (1, 10)")
+    in_use = "because it is being used by active queries in this session"
+    for executed in (False, True):
+        for ddl, message_ in (("DROP TABLE r", 'cannot DROP TABLE "r"'),
+                              ("CREATE INDEX r_a ON r (a)", 'cannot CREATE INDEX "r"'),
+                              ("ALTER TABLE r ADD COLUMN b INTEGER", 'cannot ALTER TABLE "r"')):
+            q(c, "BEGIN")
+            c.send(parse("SELECT * FROM r", "s"), bind([], "s", "p"), *([execute("p")] if executed else []), SYNC)
+            assert states(c.until_ready()) == []
+            out = q(c, ddl)
+            assert states(out) == ["55006"] and status(out) == "E", ddl
+            assert fields(next(b for k, b in out if k == b"E"))["M"] == f"{message_} {in_use}"
+            q(c, "ROLLBACK")
+            c.send(close_statement("s"), SYNC)
+            c.until_ready()
+    # A closed portal, the unnamed one before a Simple Query, a portal bound
+    # since a savepoint rolled back to, and one on another table hold nothing.
+    q(c, "CREATE TABLE u (k INTEGER PRIMARY KEY)")
+    q(c, "BEGIN")
+    c.send(parse("SELECT * FROM r", "s"), bind([], "s", "p"), close_portal("p"), bind([], "s"), execute(), SYNC)
+    assert states(c.until_ready()) == []
+    q(c, "SAVEPOINT a")
+    c.send(parse("SELECT k FROM u", "su"), bind([], "su", "pu"), bind([], "s", "p2"), SYNC)
+    assert states(c.until_ready()) == []
+    assert states(q(c, "CREATE INDEX u_k ON u (k)")) == ["55006"]
+    q(c, "ROLLBACK TO a")
+    c.send(execute("p2"), SYNC)
+    assert states(c.until_ready()) == ["34000"]  # gone with the savepoint, as in PostgreSQL
+    q(c, "ROLLBACK TO a")
+    c.send(bind([], "su", "pu"), SYNC)
+    assert states(c.until_ready()) == []
+    out = q(c, "ALTER TABLE r ADD COLUMN b INTEGER")
+    assert states(out) == [] and status(out) == "T"
+    # A RELEASE hands the savepoint's portals to the block: a ROLLBACK TO a
+    # later savepoint keeps pu, which still holds u.
+    q(c, "RELEASE a")
+    q(c, "SAVEPOINT b")
+    q(c, "ROLLBACK TO b")
+    assert states(q(c, "DROP TABLE u")) == ["55006"]
+    q(c, "ROLLBACK")
+    assert columns(q(c, "SELECT * FROM r")) == ["k", "a"]
+
+
+def test_a_ddl_on_the_table_of_a_dml_portal_of_the_block_runs(server):
+    """As PostgreSQL 17: only a SELECT portal opens its relations at Bind
+    (PortalStart). An INSERT, UPDATE or DELETE portal, with RETURNING or
+    not, executed or not, holds nothing, so a DROP TABLE, ALTER TABLE or
+    CREATE INDEX on its table runs."""
+    c = connect(server)
+    q(c, "CREATE TABLE d (k INTEGER PRIMARY KEY, a INTEGER)")
+    q(c, "INSERT INTO d VALUES (1, 10)")
+    for dml in ("INSERT INTO d VALUES (2, 20)", "INSERT INTO d VALUES (2, 20) RETURNING k",
+                "UPDATE d SET a = 11 WHERE k = 1", "DELETE FROM d WHERE k = 1"):
+        for executed in (False, True):
+            for ddl in ("DROP TABLE d", "ALTER TABLE d ADD COLUMN b INTEGER", "CREATE INDEX d_a ON d (a)"):
+                q(c, "BEGIN")
+                c.send(parse(dml, "s"), bind([], "s", "p"), *([execute("p")] if executed else []), SYNC)
+                assert states(c.until_ready()) == [], dml
+                out = q(c, ddl)
+                assert states(out) == [] and status(out) == "T", (dml, executed, ddl)
+                q(c, "ROLLBACK")
+                c.send(close_statement("s"), SYNC)
+                c.until_ready()
+    assert data(q(c, "SELECT k, a FROM d")) == [["1", "10"]]
+
+
+def test_savepoints_across_ddl_in_a_block(server):
+    """ROLLBACK TO undoes the DDL since the savepoint and keeps the rows
+    before it; RELEASE keeps it; a failed DDL is reopened by ROLLBACK TO."""
+    c = connect(server)
+    q(c, "BEGIN")
+    q(c, "CREATE TABLE r (k INTEGER PRIMARY KEY, a INTEGER)")
+    q(c, "INSERT INTO r VALUES (1, 10)")
+    q(c, "SAVEPOINT s")
+    q(c, "ALTER TABLE r ADD COLUMN b INTEGER DEFAULT 5")
+    q(c, "CREATE TABLE u (k INTEGER PRIMARY KEY)")
+    assert columns(q(c, "SELECT * FROM r")) == ["k", "a", "b"]
+    out = q(c, "ROLLBACK TO s")
+    assert states(out) == [] and status(out) == "T"
+    out = q(c, "SELECT * FROM r")
+    assert columns(out) == ["k", "a"] and data(out) == [["1", "10"]]
+    assert states(q(c, "SELECT k FROM u")) == ["42P01"]
+    q(c, "ROLLBACK TO s")
+    out = q(c, "CREATE TABLE r (k INTEGER PRIMARY KEY)")
+    assert states(out) == ["42P07"] and status(out) == "E"
+    assert states(q(c, "ROLLBACK TO s")) == []
+    q(c, "SAVEPOINT t")
+    q(c, "CREATE INDEX r_a ON r (a)")
+    q(c, "RELEASE t")
+    assert status(q(c, "COMMIT")) == "I"
+    out = q(c, "SELECT k, a FROM r WHERE a = 10")
+    assert data(out) == [["1", "10"]]
+    assert states(q(c, "DROP INDEX r_a")) == []
+
+
+def test_a_block_that_ran_ddl_is_40001_once_another_ddl_commits(server):
+    """docs/transaction_design.md, *Catalog snapshots and isolation levels
+    with DDL*: a known difference from PostgreSQL, which runs it. The
+    block's next statement is 40001; ROLLBACK TO a savepoint before its DDL
+    reopens it, and nothing of the DDL is written."""
+    c, other = connect(server), connect(server)
+    q(c, "BEGIN")
+    q(c, "SAVEPOINT s")
+    q(c, "CREATE TABLE x (k INTEGER PRIMARY KEY)")
+    assert states(q(other, "CREATE TABLE y (k INTEGER PRIMARY KEY)")) == []
+    out = q(c, "SELECT 1")
+    assert states(out) == ["40001"] and status(out) == "E"
+    out = q(c, "ROLLBACK TO s")
+    assert states(out) == [] and status(out) == "T"
+    assert data(q(c, "SELECT 1")) == [["1"]]
+    assert fields_tag(q(c, "COMMIT")) == "COMMIT"
+    assert states(q(c, "SELECT k FROM x")) == ["42P01"]
 
 
 def test_a_ddl_is_bound_at_execute_and_a_query_at_parse(server):

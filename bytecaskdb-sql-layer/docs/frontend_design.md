@@ -1661,11 +1661,13 @@ implemented (`functional_testing_design.md`).
   the column type, not yet the conversion of a query's values to it), takes `SELECT … INTO` in a set operation's first
   arm, and creates the table of `WITH NO DATA` over a query whose constant
   raises an error; the layer refuses each (0A000).
-- **DDL is transactional in the embedded API only.** A `Transaction` runs
-  DDL as a step of the transaction, published at its commit
-  (`transaction_design.md`, *Transactional DDL*). Over the wire, DDL inside
-  a `BEGIN` block, and `CREATE TABLE AS` or `SELECT … INTO` in any
-  transaction, are refused (0A000); PostgreSQL runs both.
+- **DDL is transactional in a `Transaction` and a `BEGIN` block, not in
+  an implicit block.** A `Transaction`, and over the wire a `BEGIN` block,
+  runs DDL as a step of the transaction, published at its commit
+  (`transaction_design.md`, *Transactional DDL*). Over the wire, a DDL in
+  an extended-query block of several statements, and `CREATE TABLE AS` or
+  `SELECT … INTO` in any transaction, are refused (0A000); PostgreSQL runs
+  both.
 - **A set operation cannot be ordered, and its arms are plain.** PostgreSQL
   sorts the combined rows with `ORDER BY` and combines queries that group,
   aggregate or select `DISTINCT`. Here a set operation streams its arms

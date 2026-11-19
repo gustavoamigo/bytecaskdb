@@ -18,6 +18,7 @@ module;
 #include <sys/eventfd.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cctype>
@@ -533,6 +534,10 @@ struct CursorReply {
 struct Portal {
   Prepared prepared;
   std::vector<Value> params;
+  // What its plan reads, bound in a block: a DDL of the block on it is 55006
+  // while the portal lives (Transaction::bind_portal).
+  std::shared_ptr<const PortalReads> reads;
+  std::size_t savepoints{0};  // the block's savepoints when it was bound: a ROLLBACK TO past them drops it
 };
 
 }  // namespace
@@ -1039,10 +1044,10 @@ private:
     }
   }
 
-  // As PostgreSQL: in a failed block a statement that does not parse reports
-  // that, and one that does is 25P02, before it is bound.
+  // As PostgreSQL: in a failed block a syntax error reports that, and any
+  // other statement is 25P02, before it is analysed or bound.
   void refuse_sql_if_failed(const std::string& sql) const {
-    if (in_block_ && failed_) (void)ast::parse(sql);
+    if (in_block_ && failed_) ast::check_syntax(sql);
     refuse_if_failed();
   }
 
@@ -1108,6 +1113,8 @@ private:
         // PostgreSQL ends each released subtransaction, which restores its read-only mode.
         read_only_ = savepoints_.at(k).read_only;
         savepoints_.erase(savepoints_.begin() + static_cast<std::ptrdiff_t>(k), savepoints_.end());
+        // PostgreSQL hands a released subtransaction's portals to its parent.
+        for (auto& [n, portal] : portals_) portal.savepoints = std::min(portal.savepoints, savepoints_.size());
         return "RELEASE";
       }
       case Control::RollbackTo: {
@@ -1116,6 +1123,8 @@ private:
         auto k = find_savepoint(savepoint).value_or(0);
         read_only_ = savepoints_.at(k).read_only;
         savepoints_.erase(savepoints_.begin() + static_cast<std::ptrdiff_t>(k + 1), savepoints_.end());
+        // As PostgreSQL's AtSubAbort_Portals: the portals bound since the savepoint go.
+        std::erase_if(portals_, [&](const auto& e) { return e.second.savepoints > k; });
         failed_ = false;
         forget_closed_cursors();
         return "ROLLBACK";
@@ -1244,15 +1253,21 @@ private:
     return b != nullptr ? b->refit(sql, ResultCheck::none()) : db_.refit(sql, ResultCheck::none());
   }
 
-  // A Parsed statement checked where it runs, against the record Parse fixed.
-  void refit_given(const Prepared& p) {
-    if (!p.record || p.kind != Classified::Kind::Sql) return;
+  // A Parsed statement checked where it runs, against the record Parse
+  // fixed. For a portal Bind makes in a block, what its plan reads, for the
+  // portal to hold.
+  enum class Use { Describe, Bind };
+  auto refit_given(const Prepared& p, Use use) -> std::shared_ptr<const PortalReads> {
+    if (!p.record || p.kind != Classified::Kind::Sql) return nullptr;
+    const auto check = ResultCheck::given(*p.record);
     auto* b = block();
+    if (b != nullptr && use == Use::Bind) return b->bind_portal(p.sql, check).second;
     if (b != nullptr) {
-      (void)b->refit(p.sql, ResultCheck::given(*p.record));
+      (void)b->refit(p.sql, check);
     } else {
-      (void)db_.refit(p.sql, ResultCheck::given(*p.record));
+      (void)db_.refit(p.sql, check);
     }
+    return nullptr;
   }
 
   // The record of a cursor statement's query: a DECLARE's, else none.
@@ -1406,6 +1421,7 @@ private:
   // implicit transaction, which commits when the Query ends, as in
   // PostgreSQL.
   void simple(Body& body) {
+    portals_.erase("");  // as PostgreSQL's exec_simple_query, which takes the unnamed portal for itself
     try {
       auto text = std::string{body.cstr()};
       last_text_ = text;  // a cursor statement's parse error is a position into it
@@ -1449,7 +1465,6 @@ private:
           if (!record.params.empty()) throw SessionError("there is no parameter $1", "42P02");
           if (implicit_ && record.ddl) refuse_ddl_beside_others();
           enter_statement(record.command);
-          if (in_block_ && record.ddl) refuse_ddl_in_block();
           auto opts = run_options();
           const auto none = ResultCheck::none();
           auto rows = !record.current_of.empty() ? run_positioned(c.sql, record, none, {}, opts)
@@ -1559,7 +1574,7 @@ private:
     for (std::int16_t i = 0; i < formats; ++i) {
       if (body.i16() != 0) throw SessionError("binary format is not supported", "0A000");
     }
-    refit_given(p);  // binds where it runs, with the types Parse fixed
+    auto reads = refit_given(p, Use::Bind);  // binds where it runs, with the types Parse fixed
     auto infos = p.record ? p.record->params : std::vector<ParamInfo>{};
     auto n = body.i16();
     if (n < 0 || static_cast<std::size_t>(n) != infos.size()) {
@@ -1570,7 +1585,7 @@ private:
     if (p.kind == Classified::Kind::Sql || p.kind == Classified::Kind::Cursor || p.kind == Classified::Kind::Stats) {
       refuse_if_failed();
     }
-    Portal out{p, {}};
+    Portal out{p, {}, std::move(reads), savepoints_.size()};
     for (std::int16_t i = 0; i < n; ++i) {
       auto len = body.i32();
       if (len < 0) {
@@ -1624,7 +1639,7 @@ private:
     auto name = std::string{body.cstr()};
     if (what == 'S') {
       const auto& p = find_statement(name);
-      refit_given(p);
+      (void)refit_given(p, Use::Describe);
       auto infos = p.record ? p.record->params : std::vector<ParamInfo>{};
       out_.begin('t');
       out_.i16(static_cast<std::int16_t>(infos.size()));
@@ -1633,7 +1648,7 @@ private:
       describe_result(p);
     } else if (what == 'P') {
       const auto& p = find_portal(name).prepared;
-      refit_given(p);
+      (void)refit_given(p, Use::Describe);
       describe_result(p);
     } else {
       throw SessionError("invalid DESCRIBE message subtype", "08P01");
@@ -1711,7 +1726,6 @@ private:
     if (!record.current_of.empty()) {
       rows = run_positioned(p.sql, record, check, portal.params, run_options());
     } else if (in_block_) {
-      if (record.ddl) refuse_ddl_in_block();
       rows = txn_->execute(p.sql, check, portal.params, run_options());
     } else if (implicit_) {
       if (record.ddl) refuse_ddl_beside_others();
@@ -1804,13 +1818,6 @@ private:
 
   [[noreturn]] static void refuse_ddl_beside_others() {
     throw SessionError("DDL in a block of several statements is not supported: send it alone", "0A000");
-  }
-
-  // The embedded Transaction runs DDL (docs/transaction_design.md, stage 2);
-  // a BEGIN block does not yet (stage 3): its portals and named statements
-  // across the block's DDL are not built.
-  [[noreturn]] static void refuse_ddl_in_block() {
-    throw SessionError("DDL inside a transaction is not supported: run it outside one", "0A000");
   }
 
   void close_msg(Body& body) {

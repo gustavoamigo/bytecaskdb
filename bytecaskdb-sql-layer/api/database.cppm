@@ -671,6 +671,15 @@ struct CursorState {
   void close() noexcept;
 };
 
+// What a query portal of a session reads: the tables and indexes its plan
+// names, as PostgreSQL's PortalStart opens them at Bind for a plain SELECT
+// (an INSERT, UPDATE or DELETE portal holds none). While the caller holds it,
+// a DDL of the transaction on what it reads is 55006, as for an open cursor
+// (Transaction::bind_portal).
+struct PortalReads {
+  std::vector<std::uint32_t> objects;
+};
+
 // A savepoint of a transaction: its name, and how many cursors the
 // transaction had opened when it was taken. The runtime's mark of the same
 // depth holds the rest.
@@ -689,6 +698,9 @@ struct TxnHandle {
   std::vector<std::shared_ptr<CursorState>> cursors;  // open; closed before the snapshot is released
   std::uint64_t cursors_opened{0};
   std::vector<Savepoint> savepoints;  // oldest first, one per runtime mark
+  // The portals bound in the transaction (Transaction::bind_portal): each
+  // counts for 55006 while its holder keeps it.
+  std::vector<std::weak_ptr<const PortalReads>> portals;
   // The transaction's private plans (docs/transaction_design.md, *The plan
   // map*), by cache key: the text, "\x01" + the text for a cursor's keyed
   // twin, "\x02" + the name for a procedure. An entry is used only while its
@@ -738,6 +750,7 @@ struct TxnHandle {
     for (const auto& c : cursors) c->close();
     cursors.clear();
     savepoints.clear();
+    portals.clear();
     plans.clear();  // the transaction's charge goes with it
     plan_charge = 0;
     bc_ctx_free(cx);
@@ -919,6 +932,15 @@ public:
   // transaction.
   auto refit(const Statement& stmt) -> StatementRecord;
   auto refit(std::string_view sql, const ResultCheck& check) -> StatementRecord;
+  // refit(sql, check) for a portal the caller binds (the server's Bind), and
+  // what the plan it would run reads; null for a DDL text and for an INSERT,
+  // UPDATE or DELETE, which PostgreSQL opens only as it runs. While the caller
+  // holds it, a DDL of the transaction on a table it reads, or an index it
+  // scans, is 55006 "… because it is being used by active queries in this
+  // session", as for an open cursor (docs/server_design.md, *Extended
+  // query*). Throws as refit does.
+  auto bind_portal(std::string_view sql, const ResultCheck& check)
+      -> std::pair<StatementRecord, std::shared_ptr<const PortalReads>>;
   // The text and its record, from refit(sql, none): a value to run later
   // through any execute form that takes a ResultCheck, here, in another
   // transaction or in autocommit. Puts nothing in the shared cache. Throws
@@ -1098,7 +1120,8 @@ private:
   void check_doomed() const;
   auto run_locked(const Target& t, const std::vector<Value>& params, const ExecutionOptions& opts,
                   WindowRows* window = nullptr, RowWindow range = {}, const CursorState* positioned = nullptr) -> Rows;
-  auto refit_locked(const Target& t) -> StatementRecord;
+  // `reads`, when given, is set to what the plan reads, null for a DDL.
+  auto refit_locked(const Target& t, std::shared_ptr<const PortalReads>* reads = nullptr) -> StatementRecord;
   auto open_locked(const Target& t, const std::vector<Value>& params, Holdability hold, Scrolling scrolling) -> Cursor;
   auto call_locked(std::string_view procedure, const std::vector<Value>& args, const ExecutionOptions& opts,
                    bool share) -> Rows;
@@ -3265,6 +3288,7 @@ void Transaction::check_in_use(const Ddl& ddl, const Catalog& cat) const {
   // PostgreSQL's CheckTableNotInUse: a DDL that changes what an open cursor
   // reads is refused, whatever the cursor has fetched. A cursor's plan names
   // every table and index it reads (its schema ref).
+  // A session's bound portals count with the cursors (bind_portal).
   auto read_by_a_cursor = [&](auto&& reads) {
     for (const auto& c : h_->cursors) {
       if (!c->live.load() || !c->compiled) continue;
@@ -3272,6 +3296,10 @@ void Transaction::check_in_use(const Ddl& ddl, const Catalog& cat) const {
       const std::span<const std::uint32_t> read{ref.objects_read, ref.objects_read == nullptr ? 0 : ref.n_read};
       const std::span<const std::uint32_t> written{ref.tables_written, ref.tables_written == nullptr ? 0 : ref.n_written};
       if (std::ranges::any_of(read, reads) || std::ranges::any_of(written, reads)) return true;
+    }
+    for (const auto& w : h_->portals) {
+      const auto p = w.lock();
+      if (p != nullptr && std::ranges::any_of(p->objects, reads)) return true;
     }
     return false;
   };
@@ -3376,7 +3404,7 @@ auto Transaction::run_ddl(const ast::Statement& st, const std::vector<Value>& pa
   return out;
 }
 
-auto Transaction::refit_locked(const Target& t) -> StatementRecord {
+auto Transaction::refit_locked(const Target& t, std::shared_ptr<const PortalReads>* reads) -> StatementRecord {
   return as_statement([&] {
     auto plan = plan_for(t, true);
     if (!plan) {
@@ -3388,6 +3416,17 @@ auto Transaction::refit_locked(const Target& t) -> StatementRecord {
       return out;
     }
     const auto& c = plan.get();
+    // Only a query's portal holds what it reads: PostgreSQL's PortalStart
+    // starts the executor at Bind for a plain SELECT alone. An INSERT, UPDATE
+    // or DELETE portal, RETURNING or not, opens its tables only while it runs.
+    const auto& ref = c.ref;
+    if (reads != nullptr && (ref.tables_written == nullptr || ref.n_written == 0)) {
+      auto r = std::make_shared<PortalReads>();
+      if (ref.objects_read != nullptr) r->objects.assign(ref.objects_read, ref.objects_read + ref.n_read);
+      std::erase_if(h_->portals, [](const auto& w) { return w.expired(); });
+      h_->portals.push_back(r);
+      *reads = std::move(r);
+    }
     StatementRecord out;
     out.params = caller_params(c);
     out.columns = result_columns_of(c);
@@ -3431,9 +3470,9 @@ auto Transaction::execute(std::string_view sql, const ResultCheck& check, const 
   if (!h_) throw std::logic_error("the transaction has ended");
   std::shared_lock<std::shared_mutex> lock{life_->mu};
   if (h_->state.load() == TxnState::Aborted && !life_->closed && !db_->cached(sql)) {
-    // As in PostgreSQL, a statement that does not parse reports that, not
-    // 25P02: the text is parsed before the transaction's state is checked.
-    (void)ast::parse(sql);
+    // As in PostgreSQL, a syntax error reports that, not 25P02: the raw
+    // parse comes before the transaction's state is checked, its analysis after.
+    ast::check_syntax(sql);
   }
   check_usable();
   const auto given = check.kind == ResultCheck::Kind::Given;
@@ -3454,6 +3493,17 @@ auto Transaction::refit(std::string_view sql, const ResultCheck& check) -> State
   check_usable();
   const auto given = check.kind == ResultCheck::Kind::Given;
   return refit_locked(Target{sql, nullptr, given ? &check.record : nullptr});
+}
+
+auto Transaction::bind_portal(std::string_view sql, const ResultCheck& check)
+    -> std::pair<StatementRecord, std::shared_ptr<const PortalReads>> {
+  if (!h_) throw std::logic_error("the transaction has ended");
+  std::shared_lock<std::shared_mutex> lock{life_->mu};
+  check_usable();
+  const auto given = check.kind == ResultCheck::Kind::Given;
+  std::shared_ptr<const PortalReads> reads;
+  auto record = refit_locked(Target{sql, nullptr, given ? &check.record : nullptr}, &reads);
+  return {std::move(record), std::move(reads)};
 }
 
 auto Transaction::execute_current_of(const Statement& stmt, const std::vector<Value>& params, const Cursor& cursor,

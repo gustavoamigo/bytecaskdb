@@ -299,9 +299,19 @@ TEST_CASE("txn DDL: a duplicate name is 42P07 and aborts; a skipped IF NOT EXIST
   sql_test::TempDir dir{"txn_ddl_dup"};
   auto db = open(dir);
   {
+    // Two primary keys is parse analysis's 42P16, in an open transaction as in autocommit.
+    auto t = db->begin();
+    CHECK(state([&] { (void)t.execute("CREATE TABLE w (a INT PRIMARY KEY, PRIMARY KEY (a))"); }) == "42P16");
+    CHECK(state([&] { (void)db->execute("CREATE TABLE w (a INT PRIMARY KEY, PRIMARY KEY (a))"); }) == "42P16");
+  }
+  {
     auto t = db->begin();
     CHECK(state([&] { (void)t.execute("CREATE TABLE t (k BIGINT PRIMARY KEY)"); }) == "42P07");
     CHECK(t.is_aborted());
+    // As PostgreSQL: once aborted, only a syntax error is reported before
+    // 25P02; what parse analysis refuses (two primary keys, 42P16) is not.
+    CHECK(state([&] { (void)t.execute("CREATE TABLE w (a INT PRIMARY KEY, PRIMARY KEY (a))"); }) == "25P02");
+    CHECK(state([&] { (void)t.execute("CREATE TABL w (a INT)"); }) == "42601");
   }
   auto t = db->begin();
   auto out = t.execute("CREATE TABLE IF NOT EXISTS t (k BIGINT PRIMARY KEY)");
@@ -394,6 +404,37 @@ TEST_CASE("txn DDL: DDL on what an open cursor of the transaction reads is 55006
     CHECK(u.commit() == CommitOutcome::Committed);
     CHECK(held.fetch(10).rows == Grid{{i(1)}});
   }
+}
+
+TEST_CASE("txn DDL: a portal bound in the transaction counts for 55006 while it is held",
+          "[sql][api][txn][ddl][server]") {
+  // The server's Bind (Transaction::bind_portal): PostgreSQL's PortalStart
+  // opens what the portal reads, and a DDL on it is 55006 until the portal goes.
+  sql_test::TempDir dir{"txn_ddl_portal"};
+  auto db = open(dir);
+  (void)db->execute("CREATE TABLE u (k BIGINT PRIMARY KEY)");
+  auto t = db->begin();
+  auto [record, reads] = t.bind_portal("SELECT k, a FROM t", ResultCheck::none());
+  REQUIRE(reads != nullptr);
+  CHECK(record.columns.size() == 2);
+  auto [ddl_record, ddl_reads] = t.bind_portal("DROP TABLE u", ResultCheck::none());
+  CHECK(ddl_record.ddl);
+  CHECK(ddl_reads == nullptr);  // a DDL text reads nothing until it runs
+  (void)t.execute("DROP TABLE u");  // a table no portal reads
+  CHECK(message([&] { (void)t.execute("ALTER TABLE t ADD COLUMN b BIGINT"); }) ==
+        "cannot ALTER TABLE \"t\" because it is being used by active queries in this session");
+  CHECK(t.is_aborted());
+  t.rollback();
+  auto v = db->begin();
+  {
+    auto held = v.bind_portal("SELECT k FROM t", ResultCheck::none()).second;
+    CHECK(state([&] { (void)v.execute("CREATE INDEX t_k ON t (k)"); }) == "55006");
+  }
+  v.rollback();
+  auto w = db->begin();
+  (void)w.bind_portal("SELECT k FROM t", ResultCheck::none());  // dropped at once: holds nothing
+  (void)w.execute("CREATE INDEX t_k ON t (k)");
+  CHECK(w.commit() == CommitOutcome::Committed);
 }
 
 TEST_CASE("txn DDL: a WITH HOLD cursor over a table the transaction created reads it after COMMIT",
