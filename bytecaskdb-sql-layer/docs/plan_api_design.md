@@ -1,6 +1,8 @@
 # Plan API: a physical algebra for generated plans
 
-Status: **built**, revision 15 (revision 15 with `bc_sub_arg_*`, so a
+Status: **built**, revision 16 (revision 16 with `BC_T_NUM`,
+`bc_num_quotient` and `bc_emit_num`, so an `AVG` of an integer or a
+`DECIMAL` is one result column; revision 15 with `bc_sub_arg_*`, so a
 subquery runs again with arguments, and `bc_sub_end` releasing what its run
 made; revision 14 with `bc_concat`, `bc_number_text` and
 `bc_substr`, for `||` and `SUBSTRING` of columns, and `algebra/bc_proc.h` for
@@ -536,8 +538,14 @@ typedef struct {
   const uint8_t    *result_types;    uint32_t n_result;         /* bc_type codes */
 } bc_schema_ref;
 
-enum bc_type { BC_T_I64 = 1, BC_T_F64 = 2, BC_T_BOOL = 3, BC_T_BYTES = 4 };
+enum bc_type { BC_T_I64 = 1, BC_T_F64 = 2, BC_T_BOOL = 3, BC_T_BYTES = 4, BC_T_NUM = 5 };
 ```
+
+`BC_T_NUM` is PostgreSQL's `numeric` as its text (`numeric_out`), held as a
+view, as bytes are: a result or subquery column a plan computes and emits
+(today an `AVG` of an integer or a `DECIMAL`), never a key's part. The
+compiler refuses to key, compare or deduplicate one (`std::logic_error`),
+and the runtime's key builders refuse one the same way.
 
 A plan's constants are ids, emitted by the compiler from the catalog
 (`Catalog::constants`) and named from ids too, so that no SQL name has to be
@@ -640,6 +648,7 @@ void     bc_emit_i64(bc_ctx *, int64_t);
 void     bc_emit_f64(bc_ctx *, double);
 void     bc_emit_bool(bc_ctx *, bool);
 void     bc_emit_bytes(bc_ctx *, bc_view);
+void     bc_emit_num(bc_ctx *, bc_view);              /* a BC_T_NUM column: numeric text, as bc_num_quotient's */
 void     bc_emit_null(bc_ctx *);
 void     bc_emit_col(bc_ctx *, bc_view row, uint32_t col);                /* the column, NULL as NULL */
 void     bc_emit_key_part(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);   /* not a DOUBLE part: BC_E_HANDLE */
@@ -686,6 +695,10 @@ int     bc_bytes_cmp(bc_ctx *, bc_view, bc_view);       /* memcmp order */
 bool    bc_bytes_prefix(bc_ctx *, bc_view prefix, bc_view);
 bc_view bc_concat(bc_ctx *, bc_view a, bc_view b);             /* a then b: new bytes the statement holds */
 bc_view bc_number_text(bc_ctx *, int64_t v, uint32_t scale);    /* an integer or a DECIMAL at `scale`, as PostgreSQL prints it */
+bc_view bc_num_quotient(bc_ctx *, int64_t sum, int64_t count, uint32_t scale);  /* PostgreSQL's AVG of an integer or a
+                                                   DECIMAL, numeric text (BC_T_NUM): numeric_div of sum, at `scale`,
+                                                   by count at select_div_scale's scale, rounded half away from
+                                                   zero; count < 1 or scale > 18 is BC_E_HANDLE */
 bc_view bc_substr(bc_ctx *, bc_view s, int64_t from, int64_t count);  /* PostgreSQL's substring of UTF-8 text, in
                                                    characters; INT64_MAX: to the end; a negative count is
                                                    BC_E_ARITH (22011) */

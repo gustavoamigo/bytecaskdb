@@ -181,6 +181,7 @@ auto type_name(PhysType t) -> std::string {
     case PhysType::Bytes: return "bytea";
     case PhysType::F64: return "double precision";
     case PhysType::Bool: return "boolean";
+    case PhysType::Num: return "numeric";
   }
   return "?";
 }
@@ -4940,7 +4941,7 @@ public:
   // BIGINT is (compared_type), MIN's and MAX's their column's; SUM's, MIN's
   // and MAX's of a DOUBLE PRECISION a double precision, compared in
   // PostgreSQL's float8 order. HAVING on AVG is not supported: its quotient
-  // is no type the plan holds.
+  // is numeric text (PhysType::Num), which a plan does not compare.
   auto having_conjunct(const ast::Compare& w, const auto& resolve, const auto& grouped) -> logical::Expr {
     if (w.kind != ast::Compare::Kind::Compare) not_yet("HAVING with AND, OR, NOT, IS NULL, <>, BETWEEN, IN or a constant", w.pos);
     const auto* lhs = &w.lhs;

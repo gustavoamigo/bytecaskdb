@@ -79,6 +79,7 @@ auto params_for(const Statement& s) -> std::vector<Value> {
       case PhysType::F64: out.emplace_back(1.5 + static_cast<double>(n)); break;
       case PhysType::Bool: out.emplace_back(n % 2 == 0); break;
       case PhysType::Bytes: out.emplace_back(sql_test::bytes(n % 2 == 0 ? "n2" : "n4")); break;
+      case PhysType::Num: FAIL("no parameter is a NUMERIC"); break;
     }
   }
   return out;

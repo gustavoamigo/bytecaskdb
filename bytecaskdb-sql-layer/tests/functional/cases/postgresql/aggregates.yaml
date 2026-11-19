@@ -108,6 +108,48 @@
   teardown:
     - DROP TABLE g
 
+- name: AVG of an integer and a DECIMAL carried through GROUP BY, ORDER BY and LIMIT
+  features: [E091-01]
+  setup:
+    - CREATE TABLE ga (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, d DECIMAL(10,2))
+  steps:
+    - sql: INSERT INTO ga VALUES ($1, $2, $3, $4)
+      params: [1, 1, 10, "1.25"]
+      rowcount: 1
+    - sql: INSERT INTO ga VALUES ($1, $2, $3, $4)
+      params: [2, 1, 21, "2.50"]
+      rowcount: 1
+    - sql: INSERT INTO ga VALUES ($1, $2, $3, $4)
+      params: [3, 2, 30, null]
+      rowcount: 1
+    - sql: INSERT INTO ga VALUES ($1, $2, $3, $4)
+      params: [4, 2, null, "7.00"]
+      rowcount: 1
+    - sql: INSERT INTO ga VALUES ($1, $2, $3, $4)
+      params: [5, null, 50, "0.10"]
+      rowcount: 1
+    - sql: INSERT INTO ga VALUES ($1, $2, $3, $4)
+      params: [6, 3, -7, "-3.33"]
+      rowcount: 1
+    - sql: INSERT INTO ga VALUES ($1, $2, $3, $4)
+      params: [7, 3, 8, "1.00"]
+      rowcount: 1
+    - sql: SELECT k, AVG(v), AVG(d) FROM ga WHERE id >= $1 GROUP BY k ORDER BY k DESC LIMIT 3
+      params: [0]
+      expected:
+        - [null, "50.0000000000000000", "0.10000000000000000000"]
+        - [3, "0.50000000000000000000", "-1.16500000000000000000"]
+        - [2, "30.0000000000000000", "7.0000000000000000"]
+    - sql: SELECT k, AVG(v), AVG(d) FROM ga WHERE id >= $1 GROUP BY k ORDER BY k DESC
+      params: [0]
+      expected:
+        - [null, "50.0000000000000000", "0.10000000000000000000"]
+        - [3, "0.50000000000000000000", "-1.16500000000000000000"]
+        - [2, "30.0000000000000000", "7.0000000000000000"]
+        - [1, "15.5000000000000000", "1.8750000000000000"]
+  teardown:
+    - DROP TABLE ga
+
 - name: HAVING keeps the groups that pass
   features: [E051-06]
   setup:

@@ -200,6 +200,7 @@ public:
   [[nodiscard]] auto set_i64(std::uint32_t col_id, std::int64_t v) -> bool;
   [[nodiscard]] auto set_f64(std::uint32_t col_id, double v) -> bool;
   [[nodiscard]] auto set_bool(std::uint32_t col_id, bool v) -> bool;
+  // A BYTES or a NUM column's value: a NUM's is its numeric text.
   [[nodiscard]] auto set_bytes(std::uint32_t col_id, BytesView v) -> bool;
   [[nodiscard]] auto set_null(std::uint32_t col_id) -> bool;
   // The id of a non-nullable column that is null, if there is one.
@@ -367,7 +368,8 @@ auto widen(PhysType type, std::uint64_t raw, std::uint32_t width) -> std::uint64
       }
       return raw;
     case PhysType::Bool: return raw != 0 ? 1 : 0;  // any non-zero byte is true
-    case PhysType::Bytes: return 0;
+    case PhysType::Bytes:
+    case PhysType::Num: return 0;
   }
   return 0;
 }
@@ -446,8 +448,8 @@ auto phys_type(SqlType t) -> PhysType {
     case SqlKind::Bytea:
     case SqlKind::Text:
     case SqlKind::Varchar:
-    case SqlKind::Char:
-    case SqlKind::Numeric: return PhysType::Bytes;
+    case SqlKind::Char: return PhysType::Bytes;
+    case SqlKind::Numeric: return PhysType::Num;
   }
   return PhysType::Bytes;
 }
@@ -489,6 +491,7 @@ auto plain_sql_type(PhysType t) -> SqlType {
     case PhysType::F64: return {SqlKind::Double};
     case PhysType::Bool: return {SqlKind::Boolean};
     case PhysType::Bytes: return {SqlKind::Bytea};
+    case PhysType::Num: return {SqlKind::Numeric};
   }
   return {SqlKind::Bytea};
 }
@@ -573,8 +576,9 @@ auto RowWriter::set_bool(std::uint32_t col_id, bool v) -> bool {
 }
 
 auto RowWriter::set_bytes(std::uint32_t col_id, BytesView v) -> bool {
-  auto i = index_of(col_id, PhysType::Bytes);
-  if (!i) return false;
+  // A NUMERIC is its text, held as bytes are.
+  auto i = index_of(col_id, std::nullopt);
+  if (!i || is_fixed(layout_->columns[*i].type)) return false;
   present_[*i] = true;
   // A CHAR(n) keeps no trailing spaces: every value stored passes here.
   if (layout_->columns[*i].sql.kind == SqlKind::Char) {
@@ -685,7 +689,7 @@ auto layout_valid(const RowLayout& l) -> bool {
     if (c.col_id >= l.id_ceiling()) return false;
     // A type code no build knows (a damaged record) is out of the enum's range.
     auto code = static_cast<int>(c.type);
-    if (code < static_cast<int>(PhysType::I64) || code > static_cast<int>(PhysType::Bytes)) return false;
+    if (code < static_cast<int>(PhysType::I64) || code > static_cast<int>(PhysType::Num)) return false;
     if (is_fixed(c.type)) continue;  // fixed_columns_valid
     if (c.width != 0 || c.pos >= l.nvar || slot_used[c.pos]) return false;
     slot_used[c.pos] = true;
@@ -724,7 +728,7 @@ auto locate(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_t po
   if (bit == 0) return std::unexpected(ColumnState::Absent);
   // Present: the row must hold it. Outside its regions (a row that predates
   // the column, with the bit set) it is damaged.
-  auto held = type == PhysType::Bytes
+  auto held = !is_fixed(type)
                   ? pos < h->nvar
                   : fixed_width_valid(type, width) && pos >= h->fixed_start() && std::size_t{pos} + width <= h->var_table;
   if (!held) return std::unexpected(ColumnState::Malformed);
@@ -747,7 +751,7 @@ auto row_column(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_
     -> ColumnRead {
   auto h = locate(row, col_id, type, pos, width);
   if (!h) return {.state = h.error(), .word = 0, .bytes = {}};
-  if (type != PhysType::Bytes) {
+  if (is_fixed(type)) {
     return {.state = ColumnState::Value, .word = widen(type, load_le(row, pos, width), width), .bytes = {}};
   }
   auto b = var_bounds(row, *h, pos);
@@ -761,7 +765,7 @@ auto row_column_equal(BytesView a, BytesView b, const ColumnSlot& col) -> std::o
   if (x.state == ColumnState::Malformed || y.state == ColumnState::Malformed) return std::nullopt;
   if (x.state != y.state) return false;
   if (x.state == ColumnState::Absent) return true;
-  if (col.type == PhysType::Bytes) return std::ranges::equal(x.bytes, y.bytes);
+  if (!is_fixed(col.type)) return std::ranges::equal(x.bytes, y.bytes);
   return x.word == y.word;
 }
 

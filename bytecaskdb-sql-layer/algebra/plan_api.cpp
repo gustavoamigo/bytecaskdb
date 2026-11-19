@@ -118,6 +118,7 @@ static_assert(static_cast<int>(PhysType::I64) == BC_T_I64);
 static_assert(static_cast<int>(PhysType::F64) == BC_T_F64);
 static_assert(static_cast<int>(PhysType::Bool) == BC_T_BOOL);
 static_assert(static_cast<int>(PhysType::Bytes) == BC_T_BYTES);
+static_assert(static_cast<int>(PhysType::Num) == BC_T_NUM);
 // A handle's generation never repeats within a context: one is drawn per
 // handle, and at one a nanosecond 64 bits last five centuries. Step rollback
 // reuses slots, so a counter that wrapped would let a stale handle resolve
@@ -749,6 +750,7 @@ auto phys_type(std::uint8_t code) -> std::optional<PhysType> {
     case BC_T_F64: return PhysType::F64;
     case BC_T_BOOL: return PhysType::Bool;
     case BC_T_BYTES: return PhysType::Bytes;
+    case BC_T_NUM: return PhysType::Num;
     default: return std::nullopt;
   }
 }
@@ -759,6 +761,7 @@ auto type_name(PhysType t) -> const char* {
     case PhysType::F64: return "a double";
     case PhysType::Bool: return "a boolean";
     case PhysType::Bytes: return "bytes";
+    case PhysType::Num: return "a numeric";
   }
   return "a value";
 }
@@ -2020,6 +2023,7 @@ auto resolve_range(bc_ctx* cx, std::uint32_t table_or_index, bc_view lo, bc_view
     case PhysType::F64: bytecask::sql::key_put_f64(buf, std::get<double>(*d), part); break;
     case PhysType::Bool: bytecask::sql::key_put_bool(buf, std::get<bool>(*d), part); break;
     case PhysType::Bytes: bytecask::sql::key_put_bytes(buf, std::get<Bytes>(*d), part); break;
+    case PhysType::Num: throw std::logic_error("a key part that is a NUMERIC");
   }
   return true;
 }
@@ -2093,6 +2097,7 @@ auto sort_value_max_bytes(PhysType type, std::size_t len) -> std::uint64_t {
     case PhysType::F64: return 8;
     case PhysType::Bool: return 1;
     case PhysType::Bytes: return 2 * std::uint64_t{len} + 2;
+    case PhysType::Num: throw std::logic_error("a sort key part that is a NUMERIC");
   }
   return 0;
 }
@@ -2151,6 +2156,7 @@ void key_put_column(Bytes& out, const bytecask::sql::ColumnRead& v, KeyPart part
     case PhysType::F64: bytecask::sql::key_put_f64(out, v.f64(), part); break;
     case PhysType::Bool: bytecask::sql::key_put_bool(out, v.boolean(), part); break;
     case PhysType::Bytes: bytecask::sql::key_put_bytes(out, v.bytes, part); break;
+    case PhysType::Num: throw std::logic_error("a sort or group key part that is a NUMERIC");
   }
 }
 
@@ -3687,7 +3693,8 @@ void end_sub_row(bc_ctx* cx) {
       case PhysType::I64: v = r.i64(); break;
       case PhysType::F64: v = r.f64(); break;
       case PhysType::Bool: v = r.boolean(); break;
-      case PhysType::Bytes: v = Bytes(r.bytes.begin(), r.bytes.end()); break;
+      case PhysType::Bytes:
+      case PhysType::Num: v = Bytes(r.bytes.begin(), r.bytes.end()); break;
     }
   }
   ++s.rows;
@@ -3977,6 +3984,15 @@ void bc_emit_bytes(bc_ctx* cx, bc_view v) {
   BC_GUARD_END(cx)
 }
 
+void bc_emit_num(bc_ctx* cx, bc_view v) {
+  BC_GUARD_BEGIN
+  if (!emit_slot(cx, PhysType::Num)) return;
+  auto b = cx->resolve(v);
+  if (!b) return;
+  emit_bytes(cx, *b);
+  BC_GUARD_END(cx)
+}
+
 void bc_emit_null(bc_ctx* cx) {
   BC_GUARD_BEGIN
   if (!emit_slot(cx, std::nullopt)) return;
@@ -3998,7 +4014,8 @@ void bc_emit_col(bc_ctx* cx, bc_view row, uint32_t col) {
     case PhysType::I64: return emit_value(cx, v->i64());
     case PhysType::F64: return emit_value(cx, v->f64());
     case PhysType::Bool: return emit_value(cx, v->boolean());
-    case PhysType::Bytes: return emit_value(cx, v->bytes);
+    case PhysType::Bytes:
+    case PhysType::Num: return emit_value(cx, v->bytes);
   }
   BC_GUARD_END(cx)
 }
@@ -4020,6 +4037,7 @@ void bc_emit_key_part(bc_ctx* cx, uint32_t table_or_index, bc_view key, uint32_t
     case PhysType::F64: return emit(r.read_f64(at->part));
     case PhysType::Bool: return emit(r.read_bool(at->part));
     case PhysType::Bytes: return emit(r.read_bytes(at->part));
+    case PhysType::Num: throw std::logic_error("a key part that is a NUMERIC");
   }
   BC_GUARD_END(cx)
 }
@@ -4217,6 +4235,19 @@ bc_view bc_number_text(bc_ctx* cx, int64_t v, uint32_t scale) {
   }
   if (v < 0) digits.insert(0, 1, '-');
   auto b = std::as_bytes(std::span{digits.data(), digits.size()});
+  return cx->arena_view(BytesView{b});
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_view bc_num_quotient(bc_ctx* cx, int64_t sum, int64_t count, uint32_t scale) {
+  BC_GUARD_BEGIN
+  if (count < 1 || scale > 18) {
+    cx->fail(BC_E_HANDLE, "bc_num_quotient: a count below 1 or a scale past 18");
+    return {};
+  }
+  auto text = bytecask::sql::average_text(sum, count, static_cast<std::uint8_t>(scale));
+  auto b = std::as_bytes(std::span{text.data(), text.size()});
   return cx->arena_view(BytesView{b});
   BC_GUARD_END(cx)
   return {};

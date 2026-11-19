@@ -36,10 +36,12 @@ inline constexpr std::size_t kKeyPrefixBytes = 5;
 inline constexpr std::size_t kMaxKeyBytes = 65535;
 
 // The physical types of docs/plan_api_design.md; the values are bc_type's.
-enum class PhysType : std::uint8_t { I64 = 1, F64 = 2, Bool = 3, Bytes = 4 };
+// Num is PostgreSQL's numeric as its text (numeric_out), held as bytes are:
+// a value a plan carries and emits, never a key's part nor compared.
+enum class PhysType : std::uint8_t { I64 = 1, F64 = 2, Bool = 3, Bytes = 4, Num = 5 };
 
 // Whether a column of this type lives in a row's fixed region.
-[[nodiscard]] constexpr auto is_fixed(PhysType t) noexcept -> bool { return t != PhysType::Bytes; }
+[[nodiscard]] constexpr auto is_fixed(PhysType t) noexcept -> bool { return t != PhysType::Bytes && t != PhysType::Num; }
 
 // One part of a key layout: its type, whether it carries a null marker, and
 // whether it is inverted (DESC).
@@ -62,7 +64,8 @@ struct KeyPart {
     case PhysType::I64: return width == 2 || width == 4 || width == 8;
     case PhysType::F64: return width == 4 || width == 8;
     case PhysType::Bool: return width == 1;
-    case PhysType::Bytes: return false;
+    case PhysType::Bytes:
+    case PhysType::Num: return false;
   }
   return false;
 }
@@ -376,6 +379,7 @@ auto KeyReader::skip(KeyPart part) -> bool {
     case PhysType::F64: (void)read_f64(part); break;
     case PhysType::Bool: (void)read_bool(part); break;
     case PhysType::Bytes: (void)read_bytes(part); break;
+    case PhysType::Num: throw std::logic_error("a key part that is a NUMERIC");
   }
   return ok_;
 }

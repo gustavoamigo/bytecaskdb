@@ -69,6 +69,7 @@ struct Fixture {
       case bytecask::sql::PhysType::F64: kind = SqlKind::Double; break;
       case bytecask::sql::PhysType::Bool: kind = SqlKind::Boolean; break;
       case bytecask::sql::PhysType::Bytes: kind = SqlKind::Bytea; break;
+      case bytecask::sql::PhysType::Num: kind = SqlKind::Numeric; break;
     }
     return {std::move(name), {kind}, nullable, {}};
   }

@@ -44,10 +44,8 @@ void plan(bc_ctx *cx) {
       }
       if (bc_agg_null(cx, g0, 3)) {
         bc_emit_null(cx);
-        bc_emit_null(cx);
       } else {
-        bc_emit_i64(cx, bc_agg_i64(cx, g0, 3));
-        bc_emit_i64(cx, bc_agg_i64(cx, g0, 4));
+        bc_emit_num(cx, bc_num_quotient(cx, bc_agg_i64(cx, g0, 3), bc_agg_i64(cx, g0, 4), 0));
       }
       bc_emit_end(cx);
     }

@@ -468,14 +468,6 @@ struct ResultColumn {
   SqlType sql;
 };
 
-// The plan's columns a result column of type `t` is: a NUMERIC, an AVG, two
-// I64, its sum and its count, which the API divides as PostgreSQL's numeric
-// division does; any other one column of its physical type.
-[[nodiscard]] auto plan_columns(SqlType t) -> std::vector<PhysType> {
-  if (t.kind == SqlKind::Numeric) return {PhysType::I64, PhysType::I64};
-  return {phys_type(t)};
-}
-
 struct Plan;
 
 // A set operation's plan (docs/planner_design.md, *Set operations*): a tree

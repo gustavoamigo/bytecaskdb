@@ -1735,6 +1735,13 @@ void sum_two(bc_ctx* cx) {
   bc_emit_end(cx);
 }
 
+// $1 / $2 at scale $3, PostgreSQL's numeric average, as one BC_T_NUM column.
+void num_quotient(bc_ctx* cx) {
+  bc_emit_begin(cx);
+  bc_emit_num(cx, bc_num_quotient(cx, bc_param_i64(cx, 0), bc_param_i64(cx, 1), static_cast<uint32_t>(bc_param_i64(cx, 2))));
+  bc_emit_end(cx);
+}
+
 // $1 to $4 folded into a double minimum and maximum, and into the helpers
 // of the same order: PostgreSQL's, NaN above every number.
 void minmax_f64(bc_ctx* cx) {
@@ -1842,6 +1849,19 @@ TEST_CASE("plan API: an aggregate's slots fold SUM, MIN, MAX and COUNT, and an i
   CHECK(run_rows(f, aggregates, {bytes("a")}, types) == BC_COMMITTED);
   CHECK(f.results(types) == std::vector<R>{R{std::int64_t{2}, std::int64_t{2}, std::int64_t{12}, std::int64_t{5},
                                              std::int64_t{7}, 6.0}});
+
+  // An AVG of an integer or a DECIMAL: numeric text in one BC_T_NUM column.
+  const std::vector<PhysType> num{PhysType::Num};
+  CHECK(run_rows(f, num_quotient, {std::int64_t{-310}, std::int64_t{4}, std::int64_t{2}}, num) == BC_COMMITTED);
+  CHECK(f.results(num) == std::vector<R>{R{bytes("-0.77500000000000000000")}});
+  CHECK(run_rows(f, num_quotient, {std::int64_t{5}, std::int64_t{0}, std::int64_t{0}}, num) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);  // no quotient of no rows: the plan emits NULL
+  CHECK(run_rows(f, num_quotient, {std::int64_t{5}, std::int64_t{1}, std::int64_t{19}}, num) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  // A numeric is not bytes: its column takes bc_emit_num alone.
+  CHECK(run_rows(f, num_quotient, {std::int64_t{3}, std::int64_t{2}, std::int64_t{0}}, {PhysType::Bytes}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_PLAN);
 
   const std::vector<PhysType> two{PhysType::I64, PhysType::F64};
   constexpr auto kMax = std::numeric_limits<std::int64_t>::max();

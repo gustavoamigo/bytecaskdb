@@ -85,6 +85,7 @@ void encode_keys(bc_ctx* cx) {
         case PhysType::F64: bc_sort_key_f64(cx, k, bc_param_f64(cx, i), dir, nulls); break;
         case PhysType::Bool: bc_sort_key_bool(cx, k, bc_param_bool(cx, i), dir, nulls); break;
         case PhysType::Bytes: bc_sort_key_bytes(cx, k, bc_param_bytes(cx, i), dir, nulls); break;
+        case PhysType::Num: FAIL("no sort key part is a NUMERIC"); break;
       }
     }
     bc_emit_begin(cx);
@@ -164,6 +165,7 @@ auto pg_cmp(const bc_value& a, const bc_value& b, const SortPart& part) -> std::
       }
       break;
     }
+    case PhysType::Num: FAIL("no sort key part is a NUMERIC"); break;
   }
   if (part.dir == BC_SORT_ASC || std::is_eq(c)) return c;
   return std::is_lt(c) ? std::weak_ordering::greater : std::weak_ordering::less;
@@ -320,6 +322,7 @@ TEST_CASE("sort key: random keys of one to three parts sort as PostgreSQL's rule
         for (auto& c : b) c = std::byte{kAlphabet[rng() % kAlphabet.size()]};
         return b;
       }
+      case PhysType::Num: break;  // no sort key part is one
     }
     return kNull;
   };

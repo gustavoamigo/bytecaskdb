@@ -55,9 +55,7 @@ struct GeneratedPlan {
   bool returns_rows{false};
   std::vector<PhysType> result_types;  // the plan's result layout, for its bc_schema_ref
   // Each result column's name and SQL type, as PostgreSQL names and types
-  // it: a column's own, or "count", a bigint. A NUMERIC, an AVG, is two of
-  // result_types, its sum and its count, that the API divides as
-  // PostgreSQL's numeric division does.
+  // it: a column's own, or "count", a bigint; one of result_types each.
   std::vector<std::string> result_names;
   std::vector<SqlType> result_sql;
   // What its bc_schema_ref lists (docs/catalog_design.md,
@@ -176,9 +174,21 @@ auto suffix(PhysType t) -> std::string {
     case PhysType::F64: return "f64";
     case PhysType::Bool: return "bool";
     case PhysType::Bytes: return "bytes";
+    case PhysType::Num: return "num";
   }
   return "i64";
 }
+
+// The suffix of a key's, a sort key's or a set's call for a value of type t:
+// a NUMERIC is carried and emitted, never keyed, compared or deduplicated.
+auto key_suffix(PhysType t) -> std::string {
+  if (t == PhysType::Num) throw std::logic_error{"physical plan: a NUMERIC in a key, a sort key or a set"};
+  return suffix(t);
+}
+
+// The suffix of a sort key part that only carries a value of type t, never
+// orders by it: a NUMERIC rides as its text, bytes.
+auto carry_suffix(PhysType t) -> std::string { return t == PhysType::Num ? "bytes" : suffix(t); }
 
 // One line of the plan's header, as a // comment. SQL and names are the
 // user's, and none of their bytes may reach the C lexer as anything but
@@ -346,7 +356,8 @@ auto zero(PhysType t) -> std::string {
     case PhysType::I64: return "INT64_C(0)";
     case PhysType::F64: return "0.0";
     case PhysType::Bool: return "false";
-    case PhysType::Bytes: return "bc_empty(cx)";
+    case PhysType::Bytes:
+    case PhysType::Num: return "bc_empty(cx)";
   }
   return "INT64_C(0)";
 }
@@ -356,7 +367,8 @@ auto c_type(PhysType t) -> std::string {
     case PhysType::I64: return "int64_t";
     case PhysType::F64: return "double";
     case PhysType::Bool: return "bool";
-    case PhysType::Bytes: return "bc_view";
+    case PhysType::Bytes:
+    case PhysType::Num: return "bc_view";
   }
   return "int64_t";
 }
@@ -414,7 +426,7 @@ auto key(Writer& w, std::uint32_t object, const std::vector<KeySrc>& parts, bool
     } else if (p.value.empty()) {
       w.line("bc_key_null(cx, " + k + ");");
     } else {
-      w.line("bc_key_" + suffix(p.type) + "(cx, " + k + ", " + p.value + ");");
+      w.line("bc_key_" + key_suffix(p.type) + "(cx, " + k + ", " + p.value + ");");
     }
   }
   // Only a string read from a row can be past every key: the search keys
@@ -476,6 +488,7 @@ auto compare_text(SqlType at, SqlType bt, Op op, const std::string& a, const std
   }
   switch (x) {
     case PhysType::Bytes: return "bc_bytes_cmp(cx, " + a + ", " + b + ") " + op_text(op) + " 0";
+    case PhysType::Num: throw std::logic_error{"physical plan: a comparison of a NUMERIC"};
     case PhysType::F64:
     case PhysType::I64:
     case PhysType::Bool: break;
@@ -498,8 +511,7 @@ auto count_row(const std::string& n) -> std::vector<std::string> {
   return {"bc_emit_begin(cx);", "bc_emit_i64(cx, " + n + ");", "bc_emit_end(cx);"};
 }
 
-// The row of aggregates over no rows: each COUNT 0, anything else NULL in
-// each of its plan's columns (physical::plan_columns).
+// The row of aggregates over no rows: each COUNT 0, anything else NULL.
 auto empty_row(const std::vector<Expr>& outputs) -> std::vector<std::string> {
   std::vector<std::string> out{"bc_emit_begin(cx);"};
   for (const auto& o : outputs) {
@@ -507,7 +519,7 @@ auto empty_row(const std::vector<Expr>& outputs) -> std::vector<std::string> {
       out.emplace_back("bc_emit_i64(cx, 0);");
       continue;
     }
-    for (std::size_t i = 0; i < physical::plan_columns(o.type).size(); ++i) out.emplace_back("bc_emit_null(cx);");
+    out.emplace_back("bc_emit_null(cx);");
   }
   out.emplace_back("bc_emit_end(cx);");
   return out;
@@ -644,6 +656,7 @@ public:
       case PhysType::F64: return "BC_T_F64";
       case PhysType::Bool: return "BC_T_BOOL";
       case PhysType::Bytes: return "BC_T_BYTES";
+      case PhysType::Num: return "BC_T_NUM";
     }
     return "BC_T_I64";
   }
@@ -745,7 +758,7 @@ private:
   auto read_col(const ColumnRef& c) -> std::string {
     const auto& b = binding(c.table);
     if (b.derived) return b.row + "_v" + std::to_string(c.col);
-    if (b.covering) return "bc_key_part_" + suffix(c.type) + "(cx, " + key_part(b, c);
+    if (b.covering) return "bc_key_part_" + key_suffix(c.type) + "(cx, " + key_part(b, c);
     return "bc_col_" + suffix(c.type) + "(cx, " + row_of(c) + ", " + w_.col(c) + ")";
   }
   auto col_null(const ColumnRef& c) -> std::string {
@@ -838,7 +851,7 @@ private:
       }
       case Expr::Kind::InSet: {  // the column's value among a subquery's
         const auto& col = e.args[0].col;
-        auto has = "bc_sub_has_" + suffix(col.type) + "(cx, " + std::to_string(e.constant) + ", " + read_col(col) + ")";
+        auto has = "bc_sub_has_" + key_suffix(col.type) + "(cx, " + std::to_string(e.constant) + ", " + read_col(col) + ")";
         return "!(" + col_null(col) + ") && " + (want ? "" : "!") + has;
       }
       case Expr::Kind::Column:
@@ -1328,7 +1341,7 @@ private:
     const auto k = "hk" + i;
     w_.line("bc_sort_key " + k + " = bc_sort_key_begin(cx);");
     for (const auto& c : cols) {
-      w_.line("bc_sort_key_" + suffix(c.type) + "(cx, " + k + ", " + read_col(c) + ", BC_SORT_ASC, BC_SORT_NULLS_FIRST);");
+      w_.line("bc_sort_key_" + key_suffix(c.type) + "(cx, " + k + ", " + read_col(c) + ", BC_SORT_ASC, BC_SORT_NULLS_FIRST);");
     }
     return "bc_sort_key_end(cx, " + k + ")";
   }
@@ -1456,7 +1469,7 @@ private:
     if (const auto* x = std::get_if<physical::ExprTarget>(&part.key)) {
       auto v = eval(x->expr);
       is_null = v.null;
-      value = "bc_sort_key_" + suffix(v.type) + "(cx, sk, " + v.value + ", " + placed;
+      value = "bc_sort_key_" + key_suffix(v.type) + "(cx, sk, " + v.value + ", " + placed;
     } else {
       const auto& c = std::get<ColumnRef>(part.key);
       if (!binding(c.table).covering) {
@@ -1464,7 +1477,7 @@ private:
         return;
       }
       is_null = c.nullable ? col_null(c) : "";
-      value = "bc_sort_key_" + suffix(c.type) + "(cx, sk, " + read_col(c) + ", " + placed;
+      value = "bc_sort_key_" + key_suffix(c.type) + "(cx, sk, " + read_col(c) + ", " + placed;
     }
     if (is_null.empty()) {
       w_.line(value);
@@ -1923,7 +1936,8 @@ private:
       case PhysType::I64: w_.line("int64_t v" + id + " = 0;"); break;
       case PhysType::F64: w_.line("double v" + id + " = 0;"); break;
       case PhysType::Bool: w_.line("bool v" + id + " = 0;"); break;
-      case PhysType::Bytes: w_.line("bc_view v" + id + "; v" + id + ".i = 0; v" + id + ".g = 0;"); break;
+      case PhysType::Bytes:
+      case PhysType::Num: w_.line("bc_view v" + id + "; v" + id + ".i = 0; v" + id + ".g = 0;"); break;
     }
     w_.line("bool n" + id + " = 1;");
     return id;
@@ -2267,8 +2281,15 @@ private:
     return sum + " / bc_i64_to_f64(" + count + ")";
   }
 
-  // One output of the group in hand: a key, an aggregate, or an AVG's sum
-  // and count, NULL as NULL.
+  // PostgreSQL's numeric average of an integer or a DECIMAL, its sum at the
+  // argument's scale: numeric text.
+  static auto num_average(const Expr& e, const std::string& sum, const std::string& count) -> std::string {
+    return "bc_num_quotient(cx, " + sum + ", " + count + ", " + std::to_string(e.type.scale) + ")";
+  }
+
+  // One output of the group in hand: a key or an aggregate, NULL as NULL. An
+  // AVG is its sum over its count: a DOUBLE's float8 quotient, any other's
+  // numeric text (bc_num_quotient).
   void emit_group(const Expr& e) {
     const auto& g = *group_;
     if (e.kind == Expr::Kind::Column) {
@@ -2281,13 +2302,11 @@ private:
       auto [is_null, sum, count] = average(e);
       w_.open("if (" + is_null + ")");
       w_.line("bc_emit_null(cx);");
-      if (!folds_f64(e)) w_.line("bc_emit_null(cx);");
       w_.otherwise();
       if (folds_f64(e)) {
         w_.line("bc_emit_f64(cx, " + float_average(sum, count) + ");");
       } else {
-        w_.line("bc_emit_i64(cx, " + sum + ");");
-        w_.line("bc_emit_i64(cx, " + count + ");");
+        w_.line("bc_emit_num(cx, " + num_average(e, sum, count) + ");");
       }
       w_.close();
       return;
@@ -2315,7 +2334,7 @@ private:
       w_.line("bc_sort_key_col(cx, " + k + ", " + b.row + ", " + w_.col(c) + ", BC_SORT_ASC, BC_SORT_NULLS_FIRST);");
       return;
     }
-    auto value = "bc_sort_key_" + suffix(c.type) + "(cx, " + k + ", " + read_col(c) + ", BC_SORT_ASC, BC_SORT_NULLS_FIRST);";
+    auto value = "bc_sort_key_" + key_suffix(c.type) + "(cx, " + k + ", " + read_col(c) + ", BC_SORT_ASC, BC_SORT_NULLS_FIRST);";
     if (!c.nullable) {
       w_.line(value);
       return;
@@ -2338,7 +2357,7 @@ private:
       return;
     }
     auto [is_null, value] = group_value(Expr{logical::column(col, {})});
-    auto put = "bc_sort_key_" + suffix(col.type) + "(cx, sk, " + value + ", " + dir + ");";
+    auto put = "bc_sort_key_" + key_suffix(col.type) + "(cx, sk, " + value + ", " + dir + ");";
     if (is_null.empty()) {
       w_.line(put);
       return;
@@ -3027,7 +3046,8 @@ private:
   // sorter, as it is in hand: keyed by the ORDER BY columns, each with its
   // direction and NULL placement, its payload a sort key of all the columns,
   // each ascending, which the loop after the arms reads back part by part
-  // (bc_sort_key_part_*). A LIMIT is the sorter's `keep`: it holds the first n
+  // (bc_sort_key_part_*). The payload only carries, so a NUMERIC rides in it
+  // as bytes; only an ORDER BY key part throws for one. A LIMIT is the sorter's `keep`: it holds the first n
   // in order and no more, and every arm is read whole. Without one the sorter
   // holds every row, charged to the statement's budget.
   void ordered(std::int64_t keep) {
@@ -3046,7 +3066,7 @@ private:
       const auto at = std::to_string(part++);
       w_.line("bool " + n + " = bc_sort_key_part_null(cx, " + held + ", " + at + ");");
       w_.line(c_type(type) + " " + x + " = " + zero(type) + ";");
-      w_.line("if (!" + n + ") " + x + " = bc_sort_key_part_" + suffix(type) + "(cx, " + held + ", " + at + ");");
+      w_.line("if (!" + n + ") " + x + " = bc_sort_key_part_" + carry_suffix(type) + "(cx, " + held + ", " + at + ");");
       if (type == PhysType::F64) {
         const auto neg = std::to_string(part++);
         w_.line("if (bc_sort_key_part_bool(cx, " + held + ", " + neg + ")) " + x + " *= -1.0;");
@@ -3061,11 +3081,11 @@ private:
     if (row.size() != p_.set->types.size()) {
       throw std::logic_error{"physical plan: a set operation row of other columns than its types"};
     }
-    auto part = [&](const std::string& key, const Val& v, const std::string& placed) {
+    auto part = [&](const std::string& key, const Val& v, const std::string& placed, const std::string& fn) {
       w.open("if (" + v.null + ")");
       w.line("bc_sort_key_null(cx, " + key + ", " + placed + ");");
       w.otherwise();
-      w.line("bc_sort_key_" + suffix(v.type) + "(cx, " + key + ", " + v.value + ", " + placed + ");");
+      w.line("bc_sort_key_" + fn + "(cx, " + key + ", " + v.value + ", " + placed + ");");
       w.close();
     };
     const auto k = fresh("k");
@@ -3073,14 +3093,15 @@ private:
     for (const auto& o : p_.set_order) {
       part(k, row[o.column],
            std::string{o.desc ? "BC_SORT_DESC" : "BC_SORT_ASC"} + ", " +
-               (o.nulls_first ? "BC_SORT_NULLS_FIRST" : "BC_SORT_NULLS_LAST"));
+               (o.nulls_first ? "BC_SORT_NULLS_FIRST" : "BC_SORT_NULLS_LAST"),
+           key_suffix(row[o.column].type));
     }
     const auto key = fresh("v");
     w.line("bc_view " + key + " = bc_sort_key_end(cx, " + k + ");");
     const auto d = fresh("k");
     w.line("bc_sort_key " + d + " = bc_sort_key_begin(cx);");
     for (const auto& v : row) {
-      part(d, v, "BC_SORT_ASC, BC_SORT_NULLS_LAST");
+      part(d, v, "BC_SORT_ASC, BC_SORT_NULLS_LAST", carry_suffix(v.type));
       // The key holds -0.0 as 0.0; the sign of a zero rides in a part of its own.
       if (v.type == PhysType::F64) {
         w.line("bc_sort_key_bool(cx, " + d + ", !" + v.null + " && " + v.value + " == 0.0 && 1.0 / " + v.value +
@@ -3153,7 +3174,7 @@ private:
       w.open("if (" + v.null + ")");
       w.line("bc_sort_key_null(cx, " + k + ", BC_SORT_ASC, BC_SORT_NULLS_LAST);");
       w.otherwise();
-      w.line("bc_sort_key_" + suffix(v.type) + "(cx, " + k + ", " + v.value + ", BC_SORT_ASC, BC_SORT_NULLS_LAST);");
+      w.line("bc_sort_key_" + key_suffix(v.type) + "(cx, " + k + ", " + v.value + ", BC_SORT_ASC, BC_SORT_NULLS_LAST);");
       w.close();
     }
     auto g = fresh("g");
@@ -3330,8 +3351,7 @@ auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std
         p.root->op);
   }
   for (const auto& r : p.result) {
-    const auto columns = physical::plan_columns(r.sql);
-    out.result_types.insert(out.result_types.end(), columns.begin(), columns.end());
+    out.result_types.push_back(phys_type(r.sql));
     out.result_names.push_back(r.name);
     out.result_sql.push_back(r.sql);
   }
@@ -3491,6 +3511,7 @@ private:
         case PhysType::F64: return "bc_var_set_f64(px, " + slot + ", " + v.value + ");";
         case PhysType::Bool: return "bc_var_set_bool(px, " + slot + ", " + v.value + ");";
         case PhysType::Bytes: return "bc_var_set_bytes(px, " + slot + ", " + v.value + ");";
+        case PhysType::Num: throw std::logic_error{"procedure: a variable set to a NUMERIC"};
       }
       return {};
     }();

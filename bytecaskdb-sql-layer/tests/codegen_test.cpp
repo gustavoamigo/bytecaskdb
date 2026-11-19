@@ -19,6 +19,7 @@
 import bytecask.sql.codegen;
 import bytecask.sql.procedure;
 import bytecask.sql.parser;
+import bytecask.sql.tcc_loader;
 import bytecask.sql.tests.fixture;
 
 using namespace bytecask::sql;
@@ -90,6 +91,15 @@ TEST_CASE("codegen: what the runtime needs besides the text", "[sql][codegen]") 
   CHECK_FALSE(upd.returns_rows);
   CHECK(upd.tables_written == std::vector<std::uint32_t>{1});  // its indexes are the runtime's
   CHECK(upd.param_types == std::vector<PhysType>{PhysType::I64, PhysType::I64});
+}
+
+TEST_CASE("codegen: an AVG of an integer is one result column, its numeric text", "[sql][codegen][group]") {
+  sql_test::Fixture f;
+  auto avg = generate(f.cat(), "SELECT count(*), avg(qty) FROM t WHERE id >= $1");
+  CHECK(avg.result_types == std::vector<PhysType>{PhysType::I64, PhysType::Num});
+  CHECK(avg.result_sql.size() == 2);
+  CHECK(avg.source.find("bc_emit_num(cx, bc_num_quotient(cx, ") != std::string::npos);
+  CHECK_NOTHROW(TccPlan::compile(avg.source));
 }
 
 TEST_CASE("codegen: the other bound forms produce plans; no rule, no plan", "[sql][codegen]") {
@@ -240,9 +250,12 @@ TEST_CASE("codegen: over no rows, only a COUNT call is 0; anything else is NULL"
   REQUIRE(column.fn == logical::Expr::Fn::Count);
   physical::Scan rows{1, 3, {}, physical::Range{}, false, false, false};
   auto g = physical::node(physical::GroupAggregate{physical::node(std::move(rows)), {}, {count}, true, {}});
-  auto root = physical::node(physical::GroupEmit{std::move(g), {column, count}});
-  CHECK(no_rows_lines(*root) ==
-        std::vector<std::string>{"bc_emit_begin(cx);", "bc_emit_null(cx);", "bc_emit_i64(cx, 0);", "bc_emit_end(cx);"});
+  // An AVG is one column, NULL, a NUMERIC's as any other's.
+  auto avg = logical::expr(logical::Expr::Kind::Aggregate, SqlType{SqlKind::Numeric});
+  avg.fn = logical::Expr::Fn::Avg;
+  auto root = physical::node(physical::GroupEmit{std::move(g), {column, count, avg}});
+  CHECK(no_rows_lines(*root) == std::vector<std::string>{"bc_emit_begin(cx);", "bc_emit_null(cx);", "bc_emit_i64(cx, 0);",
+                                                          "bc_emit_null(cx);", "bc_emit_end(cx);"});
 }
 
 TEST_CASE("codegen: a DOUBLE result column is read from the row, never the index key", "[sql][codegen]") {
