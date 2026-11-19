@@ -1141,6 +1141,7 @@ auto offset(const PgQuery__SelectStmt* s) -> std::int64_t {
 struct Names {
   std::vector<std::string> tables;
   std::vector<std::string> aliases;
+  std::vector<std::string> joins;  // USING aliases: each names a join, not a table
   bool keep{false};
   bool open{false};
 
@@ -1217,7 +1218,7 @@ void requalify(Expr& e, const Names& n) {
     while (visible < n.tables.size() && !named(visible)) ++visible;
     if (visible < n.tables.size()) {
       if (!n.keep && !n.aliases[visible].empty()) e.table = n.tables[visible];
-    } else if (!n.open) {
+    } else if (!n.open && !std::ranges::contains(n.joins, e.table)) {
       for (std::size_t i = 0; i < n.tables.size(); ++i) {
         if (!n.aliases[i].empty() && e.table == n.tables[i]) {
           reject("invalid reference to FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable);
@@ -1320,13 +1321,30 @@ void resolve_aliases(Select& sel, bool nested) {
   for (const auto& item : sel.from) {
     names.tables.push_back(item.table);
     names.aliases.push_back(item.alias);
+    if (!item.using_alias.empty()) names.joins.push_back(item.using_alias);
   }
   for (std::size_t i = 0; i < names.tables.size(); ++i) {
+    // A USING alias with the name of a table the FROM aliases otherwise
+    // would be that table once the aliases are dropped.
+    names.keep = names.keep || std::ranges::contains(names.joins, names.tables[i]);
     for (std::size_t j = 0; j < i; ++j) {
       if (names.visible(i) == names.visible(j)) {
         reject("table name \"" + names.visible(i) + "\" specified more than once", sel.from[i].pos, kDuplicateAlias);
       }
       names.keep = names.keep || names.tables[i] == names.tables[j];
+    }
+    // A USING alias names its join in the same FROM, as a table or alias
+    // does: no two of these names may match (42712).
+    auto twice = [&] [[noreturn]] (const std::string& name) {
+      reject("table name \"" + name + "\" specified more than once", sel.from[i].pos, kDuplicateAlias);
+    };
+    for (std::size_t j = 0; j < i; ++j) {
+      if (!sel.from[j].using_alias.empty() && sel.from[j].using_alias == names.visible(i)) twice(names.visible(i));
+    }
+    const auto& alias = sel.from[i].using_alias;
+    if (alias.empty()) continue;
+    for (std::size_t j = 0; j <= i; ++j) {
+      if (names.visible(j) == alias || (j < i && sel.from[j].using_alias == alias)) twice(alias);
     }
   }
   // Renamed columns exist only under the alias, which the binder reads.

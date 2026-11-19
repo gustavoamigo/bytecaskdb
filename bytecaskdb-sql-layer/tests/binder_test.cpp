@@ -1620,16 +1620,49 @@ TEST_CASE("binder: a chain of joins is a left-deep tree, each ON bound against t
         "missing FROM-clause entry for table \"w\"");
   CHECK(rejected(cat, "SELECT t.id FROM t JOIN u ON t.qty = u.qty RIGHT JOIN w ON u.qty = w.qty").first ==
         "a RIGHT JOIN after the first join is not supported yet");
+  // A later join's USING or NATURAL reads the columns of the join before it: a name two of them have is refused.
   CHECK(rejected(cat, "SELECT t.id FROM t JOIN u ON t.qty = u.qty NATURAL JOIN w").first ==
-        "USING or NATURAL after the first join is not supported yet");
-  CHECK(rejected(cat, "SELECT t.id FROM t JOIN u USING (qty) JOIN w USING (qty)").first ==
-        "USING or NATURAL after the first join is not supported yet");
+        "common column name \"qty\" appears more than once in left table");
+  CHECK(rejected(cat, "SELECT t.id FROM t JOIN u ON t.qty = u.qty JOIN w USING (j)").first ==
+        "column \"j\" specified in USING clause does not exist in left table");
+  {
+    // The first join's USING column is one column, t's: the second USING compares it with w's.
+    auto b = bind_sql(cat, "SELECT qty FROM t JOIN u USING (qty) JOIN w USING (qty)");
+    const auto& on = get<logical::Filter>(b).conjuncts;
+    REQUIRE(on.size() == 2);
+    CHECK(on[0].args[0].col.table == cat.table("t")->id);
+    CHECK(on[0].args[1].col.table == cat.table("u")->id);
+    CHECK(on[1].args[0].col.table == cat.table("t")->id);
+    CHECK(on[1].args[1].col.table == cat.table("w")->id);
+    CHECK(get<logical::Project>(b).exprs[0].expr.col.table == cat.table("t")->id);
+    // SELECT * gives qty once, first, then each table's other columns.
+    std::vector<std::string> names;
+    for (const auto& o : get<logical::Project>(bind_sql(cat, "SELECT * FROM t JOIN u USING (qty) JOIN w USING (qty)")).exprs) {
+      names.push_back(o.name);
+    }
+    CHECK(names.front() == "qty");
+    CHECK(std::ranges::count(names, "qty") == 1);
+  }
   CHECK(rejected(cat, "SELECT qty FROM t JOIN u ON t.qty = u.qty JOIN w ON u.qty = w.qty").first ==
         "column reference \"qty\" is ambiguous");
   // The first join's USING column is the left table's, unless a third table has the name.
   CHECK(rejected(cat, "SELECT qty FROM t JOIN u USING (qty) JOIN w ON w.j = t.id").first ==
         "column reference \"qty\" is ambiguous");
   CHECK_NOTHROW(bind_sql(cat, "SELECT * FROM t JOIN u USING (qty) JOIN w ON w.j = t.id"));
+  // A USING alias is a FROM name: it may match no other alias or table name of the FROM (42712).
+  for (auto [sql, name] : std::vector<std::pair<std::string_view, std::string>>{
+           {"SELECT q.qty FROM t JOIN u USING (qty) AS q JOIN w USING (qty) AS q", "q"},
+           {"SELECT w.qty FROM t JOIN u USING (qty) AS w JOIN w USING (qty)", "w"},
+           {"SELECT t.id FROM t JOIN u USING (qty) JOIN w USING (qty) AS u", "u"},
+           {"SELECT k.qty FROM t AS k JOIN u USING (qty) AS k", "k"},
+           {"SELECT t.qty FROM t JOIN u USING (qty) AS t", "t"},
+           {"SELECT q.qty FROM t JOIN u USING (qty) AS q JOIN w AS q ON true", "q"}}) {
+    CAPTURE(sql);
+    CHECK(rejected(cat, sql).first == "table name \"" + name + "\" specified more than once");
+  }
+  // A table the FROM aliases leaves its name free for a USING alias, which then names the join.
+  CHECK_NOTHROW(bind_sql(cat, "SELECT t.qty, k.id FROM t AS k JOIN u USING (qty) AS t"));
+  CHECK(rejected(cat, "SELECT t.id FROM t AS k JOIN u USING (qty) AS t").first == "column t.id does not exist");
 }
 
 TEST_CASE("binder: a table read twice is two instances of it, named as the query names them", "[sql][binder][join]") {

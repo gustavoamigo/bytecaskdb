@@ -63,6 +63,7 @@ BINDER_STATES = frozenset(
         "0A000",  # FOR UPDATE with an aggregate; but see layer_only
         "22003",  # a literal operand past DECIMAL's digits, as a stored value past its column
         "42830",  # a FOREIGN KEY no unique key of the referenced table matches
+        "42712",  # two FROM names alike, a USING alias among them
     }
 )
 

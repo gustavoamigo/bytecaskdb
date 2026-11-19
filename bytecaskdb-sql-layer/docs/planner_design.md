@@ -782,8 +782,10 @@ NULLs is a miss and never a key of whatever the column's bytes hold). So an
 inner join after an outer one drops the rows it NULL-extended where its `ON`
 reads them, and one before it does not. `RIGHT JOIN` is a left join of its
 two tables swapped, so it is taken only as the first join, where the swap
-keeps the chain left-deep; `USING` and `NATURAL`
-only for the first join.
+keeps the chain left-deep. `USING` and `NATURAL` at any join are its
+equalities, bound by the binder to the left side's merged column and the
+right table's: the planner sees an inner join's as `WHERE` conjuncts and an
+outer join's as its `ON`, like any.
 
 **A comparison, and a predicate over both sides.** Any comparison of a
 column of each table joins them, as `=` does: `use_of` takes it, and where

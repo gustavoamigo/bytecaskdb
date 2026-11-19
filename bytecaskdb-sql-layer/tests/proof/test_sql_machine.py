@@ -1963,6 +1963,18 @@ def test_join_using_and_natural_join(dsn):
             assert m.both(sql).error is None
         assert m.both("SELECT c2 FROM t0 JOIN t1 USING (c1)").error == "42702"
         assert m.both("SELECT c0 FROM t0 JOIN t1 USING (c3)").error == "42703"
+        # After the first join, USING and NATURAL read the join before them.
+        m.create(Table("t2", [Column("c4", o.BIGINT), Column("c1", o.INTEGER), Column("c2", o.TEXT)], ["c4"]))
+        for row in ({"c4": 20, "c1": 1, "c2": "x"}, {"c4": 21, "c1": 2, "c2": "y"}, {"c4": 22, "c1": None, "c2": "z"}):
+            assert m.insert("t2", row, all_columns=True).error is None
+        for sql in ("SELECT c1, t0.c0, t1.c3, t2.c4 FROM t0 JOIN t1 USING (c1) JOIN t2 USING (c1) ORDER BY t1.c3, t2.c4",
+                    "SELECT c1, c2, t1.c3, t2.c4 FROM t0 NATURAL JOIN t1 NATURAL JOIN t2 ORDER BY t2.c4, t1.c3",
+                    "SELECT * FROM t0 JOIN t1 USING (c1, c2) JOIN t2 USING (c2) ORDER BY t2.c4, t1.c3",
+                    "SELECT q.c1, r.c1, t1.c3 FROM t0 JOIN t1 USING (c1) AS q JOIN t2 USING (c1) AS r ORDER BY q.c1, t1.c3"):
+            assert m.both(sql).error is None
+        assert m.both("SELECT t2.c4 FROM t0 JOIN t1 USING (c1) JOIN t2 USING (c2)").error == "42702"
+        assert m.both("SELECT t2.c4 FROM t0 JOIN t1 ON t0.c0 = t1.c3 JOIN t2 USING (c4)").error == "42703"
+        assert m.both("SELECT q.c1 FROM t0 JOIN t1 USING (c1) AS q JOIN t2 USING (c1) AS q").error == "42712"
         m.check()
     finally:
         m.teardown()
@@ -2078,11 +2090,10 @@ def test_joins_of_several_tables_with_themselves_and_on_any_comparison(dsn):
             if not sql.startswith("SELECT * "):
                 pg = o.run_pg(m.pg.conn, sql)
                 m.alternatives_agree(sql, (), [], pg.rows, None, None)
-        # The errors PostgreSQL gives for a name used wrongly (42712 is one the oracle
-        # calls "refused", as it does any state it does not compare).
+        # The errors PostgreSQL gives for a name used wrongly.
         for sql, state in (("SELECT c0 FROM t0 x JOIN t0 y ON x.c0 = y.c0", "42702"),
                            ("SELECT t0.c0 FROM t0 x JOIN t0 y ON x.c0 = y.c0", "42P01"),
-                           ("SELECT x.c0 FROM t0 x JOIN t0 x ON x.c0 = x.c0", "refused"),
+                           ("SELECT x.c0 FROM t0 x JOIN t0 x ON x.c0 = x.c0", "42712"),
                            ("SELECT 1 FROM t0 JOIN t1 ON t0.c1 = t2.c1 JOIN t2 ON t1.c1 = t2.c1", "42P01")):
             assert m.both(sql).error == state, sql
         m.check()

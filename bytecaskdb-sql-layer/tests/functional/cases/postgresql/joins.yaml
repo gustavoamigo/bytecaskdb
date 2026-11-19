@@ -739,8 +739,6 @@
 
 - name: USING after the first join of three tables
   features: [F041-01]
-  # USING or NATURAL after the first join is not supported yet
-  unimplemented: true
   setup:
     - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)
     - CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)
@@ -755,6 +753,12 @@
   steps:
     - sql: SELECT a.id, b.id, c.id FROM a JOIN b USING (k) JOIN c USING (k)
       expected: [[1, 1, 1]]
+    - sql: SELECT q.k FROM a JOIN b USING (k) AS q JOIN c USING (k) AS q
+      error: "42712"
+    - sql: SELECT c.k FROM a JOIN b USING (k) AS c JOIN c USING (k)
+      error: "42712"
+    - sql: SELECT a.k, x.id FROM a AS x JOIN b USING (k) AS a JOIN c USING (k)
+      expected: [[1, 1]]
   teardown:
     - DROP TABLE a
     - DROP TABLE b
@@ -762,8 +766,6 @@
 
 - name: NATURAL JOIN of three tables
   features: [F401-01]
-  # USING or NATURAL after the first join is not supported yet
-  unimplemented: true
   setup:
     - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)
     - CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)
