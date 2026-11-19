@@ -1472,9 +1472,10 @@ auto set_operation(const PgQuery__SelectStmt* s, std::int32_t pos, bool nested) 
   return sel;
 }
 
-// The most tables one SELECT reads: the search plans their join order by a
-// pass over the subsets of them (docs/planner_design.md, *Joins of several tables*).
-constexpr std::size_t kMaxFrom = 8;
+// The most tables one SELECT reads: the search holds a set of them as the
+// bits of a 32-bit mask (docs/planner_design.md, *Joins of several tables*).
+// PostgreSQL has no such cap.
+constexpr std::size_t kMaxFrom = 32;
 
 // A FROM item that is a table, with its alias.
 auto from_item(const PgQuery__RangeVar* rv) -> FromItem {
@@ -1578,7 +1579,10 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos, bool into_taken, boo
     if (from->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) reject("SELECT reads tables", pos);
     items.push_back(from_item(from->range_var));
   }
-  if (items.size() > kMaxFrom) reject("SELECT reads at most " + std::to_string(kMaxFrom) + " tables", pos);
+  if (items.size() > kMaxFrom) {
+    reject("joins of more than " + std::to_string(kMaxFrom) + " tables are not supported", items[kMaxFrom].pos,
+           kFeatureNotSupported);
+  }
   // DISTINCT is a list of one empty node; DISTINCT ON a list of its expressions.
   auto distinct = s->n_distinct_clause == 1 &&
                   (s->distinct_clause[0] == nullptr || s->distinct_clause[0]->node_case == PG_QUERY__NODE__NODE__NOT_SET);

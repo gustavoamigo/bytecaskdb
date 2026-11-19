@@ -87,6 +87,11 @@ inline constexpr double kHashWeight = 0.3;
 // The most choice points one plan carries (*Decisions*, 11); past them the
 // search takes its compile-time choice.
 inline constexpr std::size_t kMaxChoices = 4;
+// The most tables whose join orders the search tries all of; past them the
+// tables join in FROM order, each step still choosing its access and join
+// method. The pass over subsets grows as 2^n (docs/planner_design.md,
+// *Joins of several tables*).
+inline constexpr std::size_t kExhaustiveJoin = 12;
 
 // The cheapest plan for a rewritten logical plan, its cost in Plan::cost.
 // `memory_bytes` is the statement's memory budget, bc_budget::max_bytes (0:
@@ -1540,7 +1545,9 @@ private:
 
   // Every plan of the whole statement's set of tables, by dynamic
   // programming over sets of tables, each set from the sets one smaller;
-  // every table has a full scan, so some plan reaches them all. `ordered` is the ORDER BY without the columns the WHERE
+  // every table has a full scan, so some plan reaches them all. With an
+  // outer join, or more than kExhaustiveJoin tables, the sets are the FROM
+  // order's prefixes only (a derived relation first), so the pass is linear. `ordered` is the ORDER BY without the columns the WHERE
   // makes constant. With `sorts`, a plan not in its order sorts its rows, the
   // loops its sorters hold reading them (read_for_sort): each candidate is
   // kept and pruned at the cost of the plan it becomes.
@@ -1575,6 +1582,8 @@ private:
         keep(best, std::move(c), full);
       }
     }
+    const auto in_order = q.any_outer || n > kExhaustiveJoin;
+    const auto lead = driver ? 1u << *driver : 0u;
     for (std::size_t size = 2; size <= n; ++size) {
       std::vector<std::pair<std::uint32_t, std::size_t>> extend;
       for (const auto& [set, cands] : best) {
@@ -1584,8 +1593,8 @@ private:
         }
       }
       for (const auto& [set, t] : extend) {
-        // With an outer join, the tables in FROM order: each joined to those before it.
-        if (q.any_outer && set != (1u << t) - 1) continue;
+        // In FROM order, each table joined to those before it.
+        if (in_order && set != (((1u << t) - 1) | lead)) continue;
         if (driver && t == *driver) continue;
         auto on = joins(q, t, set);
         auto cross = crosses(q, t, set);

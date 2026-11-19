@@ -115,7 +115,7 @@ kind the transformer doesn't take is refused with its position.
 - `GROUP BY` of columns, and `HAVING`, below. A query with a `GROUP BY`, a
   `HAVING` or an aggregate is aggregated; without `GROUP BY` it returns
   exactly one row, or none where its `HAVING` is false.
-- `FROM`: one table, or up to eight joined by a comma list, `[INNER] JOIN …
+- `FROM`: one table, or up to 32 joined by a comma list, `[INNER] JOIN …
   ON`, `CROSS JOIN` or `LEFT [OUTER] JOIN … ON`, one after the other
   (`a JOIN b ON … LEFT JOIN c ON …`, each join's right side a table and its
   left side the tables before it), `JOIN … USING (cols) [AS alias]` and
@@ -956,7 +956,7 @@ That includes:
 - a `FULL JOIN` that is not the whole `FROM` of two tables (#712), or under
   an aggregate, `GROUP BY`, `DISTINCT`, `OFFSET`, `INSERT … SELECT` or a set
   operation, or of a grouped view, an outer join's `ON` comparing an expression of columns,
-  more than eight tables, a `RIGHT JOIN` of a join that has an outer join,
+  more than 32 tables (0A000, *Known differences*), a `RIGHT JOIN` of a join that has an outer join,
   an outer join in parentheses or of a join in parentheses, `USING` or `NATURAL` in
   parentheses or after a comma,
   `FOR UPDATE` of a join (#697), an alias of a join, an output name in `GROUP BY`;
@@ -1309,6 +1309,16 @@ search refuses*).
 
 The proof machine expects each one, or doesn't generate it, so it doesn't
 fail on them.
+
+- **A `SELECT` joins at most 32 tables** (owner decision, 2026-11-18). A
+  33rd is refused, 0A000 `joins of more than 32 tables are not supported`,
+  at the 33rd table; PostgreSQL has no cap. The search holds a set of
+  tables as a 32-bit mask, and past 12 tables joins them in `FROM` order
+  (`planner_design.md`, *Joins of several tables*): there a table not
+  joined to any table written before it is crossed with all of them, at a
+  cost that grows with the product of their row counts (a 13-table star of
+  4-row tables, its centre written last, takes 29 s; PostgreSQL reorders
+  it). The machine joins fewer.
 
 - **An `UPDATE` of a primary key checks each row's new key in the order
   it reads the rows**, key order for a scan, as PostgreSQL checks them in

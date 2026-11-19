@@ -9,7 +9,9 @@ full scans and sorts (#591, closing #533); hash joins (#600) and `GROUP
 BY` (#609); then the closing PR, which fixed #609's last review findings
 and wrote this document as built; then joins of up to eight tables, a table
 read twice and joins on any comparison (#663, *Joins of several tables*);
-then a correlated subquery, run per outer row (#714, *Subqueries*).
+then a correlated subquery, run per outer row (#714, *Subqueries*); then
+joins of up to 32 tables, every order tried up to 12 (*Joins of several
+tables*).
 The first of the post-MVP designs (#487, *Next*). The parser, the plan API
 and TinyCC are unchanged by it; the binder's output changed. The rest of
 the dialect is #534's (*Slices*).
@@ -224,8 +226,9 @@ The join's conjuncts between the new table and those already read filter
 its rows, or the pairs, a DOUBLE or REAL column's alike (*Filters on DOUBLE
 and REAL columns*). Bushy
 trees and merge joins wait for a workload that needs them. Sets are bit
-masks of up to 32 tables; the front end takes eight, which bounds the
-search to 255 sets (*Joins of several tables*).
+masks of up to 32 tables, which the front end takes; the search tries
+every order up to 12 of them, and joins more in `FROM` order (*Joins of
+several tables*).
 
 The search keeps the cheapest plan per set of tables, per row count (at
 most one, or more), per order (the `ORDER BY`'s, or none) and per grouping
@@ -749,10 +752,48 @@ table is 42P01, one before a join in parentheses or after a comma 42P01 or
 join, so the chain's left side under it pairs its rows with every row
 before, as PostgreSQL's tree does, a `LEFT JOIN` after a comma included. An inner join's `ON` goes with the `WHERE`'s conjuncts and
 pushdown moves it to the lowest `Join` that has its tables; an outer join's
-stays its own. The front end takes at most eight tables
-(`kMaxFrom`): the search is a pass over the subsets of them, 255 sets
-at eight, each extended by each table left (the bit masks allow 32, which
-would be 2^32).
+stays its own. The front end takes at most 32 tables (`kMaxFrom`), the
+width of the search's bit masks; a 33rd is refused, 0A000 `joins of more
+than 32 tables are not supported` (PostgreSQL has no cap:
+`frontend_design.md`, *Known differences*).
+
+**How many orders are tried.** Up to 12 tables (`kExhaustiveJoin`) the
+search is a pass over the subsets of them, each extended by each table
+left: 4,095 sets at 12, every left-deep order costed. Past 12, the tables
+join in `FROM` order: each next table joined to the plan of those before
+it (a derived relation first), its access path and join method (a probe
+by key, a scan read once or per outer row, a hash join) still chosen by
+cost at each step, and the plans still kept per row count, order and
+grouping. A join with an outer join is in `FROM` order at any size, as
+above. The cut is at 12 because the pass grows as 2^n: planning a
+statement (`generate_plan`, the search and the printing of its source,
+release build, a 2.1 GHz Xeon, every table costed at 1,000 rows) took
+
+| Tables | Chain (`jN.k = jN-1.v`) | Star (each keyed by `j0.v`) | Every pair joined (`ji.v = jj.v`) |
+|---|---|---|---|
+| 8 | 2.0 ms | 1.6 ms | 5.5 ms |
+| 10 | 12 ms | 11 ms | 36 ms |
+| 11 | 29 ms | 26 ms | 91 ms |
+| 12 | 54 ms | 48 ms | 233 ms |
+| 13, `FROM` order | 0.4 ms | 0.3 ms | 1.4 ms |
+| 32, `FROM` order | 1.0 ms | 0.9 ms | 8.9 ms |
+
+Each table past 11 doubles to triples it, so 13 tables tried every way
+would take most of a second and 16 tens of seconds, against a statement
+whose first run compiles its plan with TinyCC in milliseconds. In `FROM`
+order the pass is linear in the tables, so the order written is the
+order joined: a table whose key the tables before it reach is looked up.
+A table no `WHERE` or `ON` joins to a table written before it is crossed
+with all of them, so the rows before the join that filters them are the
+product of those tables' row counts. A star of 13 tables of 4 rows each,
+the centre `c0` written last (`FROM c1, …, c12, c0 WHERE c1.id = c0.id AND
+… AND c12.id = c0.id`), crosses 4^12 rows: 29 s, and 101 s at 14 tables,
+where PostgreSQL answers at once; the same star with `c0` written first
+takes under 0.1 s. That is the price of the cap: past 12, write the tables
+in an order each is joined to one before it. PostgreSQL bounds its search too: from 12
+tables (`geqo_threshold`) it searches orders genetically; the layer takes
+the order written instead, which is predictable and which the author
+controls.
 
 **A table read twice.** `ColumnRef::table` names a table by id, and the plan
 reads by it, so two uses of a table need two ids. The binder gives each use
@@ -1823,3 +1864,7 @@ The owner's answers to the open questions (2026-10-24):
 10. **No recompiling when counts age**, until a workload shows a plan going
     stale.
 11. **At most 4 choice points per plan.**
+
+The owner's, 2026-11-18:
+12. **Joins of up to 32 tables, every order tried up to 12, `FROM` order
+    beyond** (*Joins of several tables*); a 33rd table is 0A000.

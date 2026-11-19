@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <limits>
 #include <map>
 #include <optional>
@@ -1726,4 +1727,53 @@ TEST_CASE("search: a grouped view joined with a table drives the join, costed by
   CHECK(has(self, "TBL_1073741824 = 1"));
   // ORDER BY would sort the view's rows, which no sorter holds.
   CHECK_THROWS_AS(plan_sql(cat, "SELECT h.n FROM h JOIN u ON u.id = h.qty ORDER BY u.qty"), ast::FeatureNotSupported);
+}
+
+TEST_CASE("search: joins of up to 32 tables are planned, every order tried up to 12, FROM order past them",
+          "[sql][search][join]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  for (auto i = 0; i < 32; ++i) {
+    f.ddl(CreateTableDdl{"j" + std::to_string(i), {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  }
+  const auto& cat = f.cat();
+  // A chain of `n` tables, j0 joined to j1 by j1's key, and so on: listed from
+  // j0 (`forward`) or from the last (`backward`).
+  auto chain = [](int n, bool forward) {
+    std::string from;
+    std::string where;
+    for (auto i = 0; i < n; ++i) {
+      auto at = forward ? i : n - 1 - i;
+      from += (i == 0 ? "" : ", ") + std::string{"j"} + std::to_string(at);
+      if (i > 0) where += (i == 1 ? " WHERE " : " AND ") + std::format("j{}.k = j{}.v", i, i - 1);
+    }
+    return "SELECT count(*) FROM " + from + where;
+  };
+  auto rows = [] {
+    std::map<std::string, std::uint64_t> out;
+    for (auto i = 0; i < 32; ++i) out["j" + std::to_string(i)] = 1000;
+    return out;
+  }();
+  // Every order is tried up to 12 tables: listed either way, the chain is one
+  // scan of j0 and a lookup of each next table by its key.
+  for (auto forward : {true, false}) {
+    auto g = plan_sql(cat, chain(12, forward), rows);
+    INFO(g.source);
+    CHECK(occurrences(g.source, "bc_scan_open(") == 1);
+  }
+  // Past 12, the tables join in FROM order: listed from j0, one scan and
+  // lookups; listed backward, each table is read before the one whose key
+  // reaches it, so the plan scans more than one table.
+  for (auto n : {13, 32}) {
+    auto forward = plan_sql(cat, chain(n, true), rows);
+    CHECK(occurrences(forward.source, "bc_scan_open(") == 1);
+    CHECK(occurrences(plan_sql(cat, chain(n, false), rows).source, "bc_scan_open(") > 1);
+  }
+  // A star of 12, each table keyed by j0's column: one scan of j0, the rest
+  // looked up, whatever the order written.
+  std::string star = "SELECT count(*) FROM j11, j10, j9, j8, j7, j6, j5, j4, j3, j2, j1, j0 WHERE j1.k = j0.v";
+  for (auto i = 2; i < 12; ++i) star += std::format(" AND j{}.k = j0.v", i);
+  auto g = plan_sql(cat, star, rows);
+  INFO(g.source);
+  CHECK(occurrences(g.source, "bc_scan_open(") == 1);
 }
