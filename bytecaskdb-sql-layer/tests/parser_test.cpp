@@ -167,7 +167,7 @@ TEST_CASE("parser: CHECK on a column or the table keeps the text between its par
 TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql][parser]") {
   //                    0         1         2         3
   //                    0123456789012345678901234567890123456789
-  CHECK(rejected_at("SELECT id FROM t FULL JOIN u ON t.id = u.id") == 27);
+  CHECK(rejected_at("SELECT id FROM t FULL JOIN u ON t.id = u.id JOIN v ON v.id = u.id") == 27);
   CHECK(rejected_at("SELECT id FROM a, b, c, d, e, f, g, h, i WHERE id = $1") >= 0);  // nine tables
   CHECK(rejected_at("SELECT id FROM t WHERE id = B'1'") == 28);  // a bit-string literal
   CHECK(rejected_at("VALUES (1)") == 0);
@@ -518,10 +518,28 @@ TEST_CASE("parser: a chain of joins, each with its own ON, kind and USING", "[sq
   CHECK(list.where.empty());
   // CROSS JOIN is an inner join with no condition.
   CHECK(std::get<Select>(parse("SELECT 1 FROM a CROSS JOIN b")).from.size() == 2);
-  // At most 8 tables; FULL and an alias of a join are refused.
+  // At most 8 tables; an alias of a join is refused. FULL is the whole FROM
+  // of two tables, never in a chain, in parentheses or after a comma (#712).
   CHECK(std::get<Select>(parse("SELECT 1 FROM a, b, c, d, e, f, g, h")).from.size() == 8);
   CHECK_THROWS_AS(parse("SELECT 1 FROM a, b, c, d, e, f, g, h, i"), SqlError);
-  CHECK_THROWS_AS(parse("SELECT 1 FROM a FULL JOIN b ON a.k = b.k"), SqlError);
+  auto full = std::get<Select>(parse("SELECT 1 FROM a FULL JOIN b ON a.k = b.k"));
+  REQUIRE(full.from.size() == 2);
+  CHECK(full.from[1].kind == JoinKind::Full);
+  CHECK(full.where.size() == 1);
+  CHECK(full.where[0].on == 1);
+  CHECK(std::get<Select>(parse("SELECT 1 FROM a FULL OUTER JOIN b USING (k)")).from[1].kind == JoinKind::Full);
+  for (auto sql : {"SELECT 1 FROM a FULL JOIN b ON a.k = b.k JOIN c ON c.k = b.k", "SELECT 1 FROM c JOIN a FULL JOIN b ON a.k = b.k ON c.k = a.k",
+                   "SELECT 1 FROM c, a FULL JOIN b ON a.k = b.k", "SELECT 1 FROM c JOIN b ON c.k = b.k FULL JOIN a ON a.k = b.k",
+                   "SELECT 1 FROM a FULL JOIN (b JOIN c ON b.k = c.k) ON a.k = b.k"}) {
+    INFO(sql);
+    std::string why;
+    try {
+      (void)parse(sql);
+    } catch (const SqlError& e) {
+      why = e.what();
+    }
+    CHECK(why == "a FULL JOIN that is not the whole FROM of two tables is not supported yet");
+  }
   CHECK_THROWS_AS(parse("SELECT 1 FROM (a JOIN b ON a.k = b.k) AS j"), SqlError);
 }
 

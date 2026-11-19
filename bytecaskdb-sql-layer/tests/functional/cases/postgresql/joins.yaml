@@ -908,8 +908,6 @@
 
 - name: FULL JOIN of two tables
   features: [F401-02]
-  # FULL JOIN is not supported
-  unimplemented: true
   setup:
     - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)
     - CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)
@@ -924,6 +922,14 @@
   steps:
     - sql: SELECT a.id, b.id FROM a FULL JOIN b ON a.k = b.k
       expected: [[null, 2], [1, 1], [2, null], [3, null]]
+    - sql: SELECT a.id, b.id FROM a FULL OUTER JOIN b ON a.k = b.k AND b.id > 1 ORDER BY 1, 2
+      expected: [[1, null], [2, null], [3, null], [null, 1], [null, 2]]
+    - sql: SELECT a.id, b.id FROM a FULL JOIN b ON a.k = b.k WHERE a.id IS NULL OR b.id IS NULL ORDER BY 1, 2
+      expected: [[2, null], [3, null], [null, 2]]
+    - sql: SELECT k, a.id FROM a FULL JOIN b USING (k) ORDER BY b.id, a.id
+      expected: [[1, 1], [3, null], [2, 2], [null, 3]]
+    - sql: SELECT a.id FROM a FULL JOIN b ON a.k < b.k
+      error: "0A000"
   teardown:
     - DROP TABLE a
     - DROP TABLE b

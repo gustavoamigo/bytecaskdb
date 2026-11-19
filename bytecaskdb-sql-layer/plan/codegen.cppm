@@ -3010,7 +3010,7 @@ public:
     }
     stream(*p_.set, [&](Writer& w, const Row& row) {
       if (limit) w.open("if (" + stop_ + ")");
-      emit(w, row);
+      emit(w, row, p_.result.size());
       if (limit) {
         w.line("setcount = bc_add(cx, setcount, INT64_C(1));");
         w.close();
@@ -3053,7 +3053,7 @@ private:
       }
       row.push_back({n, x, type});
     }
-    emit(w_, row);
+    emit(w_, row, p_.result.size());
     w_.close();
   }
 
@@ -3092,9 +3092,12 @@ private:
 
   auto fresh(const std::string& what) -> std::string { return "set" + what + std::to_string(ids_++); }
 
-  static void emit(Writer& w, const Row& row) {
+  // The row's first `returned` columns: the rest are the hidden ORDER BY
+  // keys of a FULL JOIN (logical::SetOp::hidden).
+  static void emit(Writer& w, const Row& row, std::size_t returned) {
     w.line("bc_emit_begin(cx);");
-    for (const auto& v : row) {
+    for (std::size_t i = 0; i < returned; ++i) {
+      const auto& v = row.at(i);
       w.open("if (" + v.null + ")");
       w.line("bc_emit_null(cx);");
       w.otherwise();
@@ -3385,6 +3388,7 @@ auto set_tree(const logical::Node& n, const Catalog& cat, const RowCounts& count
     out->left = set_tree(*s->left, cat, counts, memory_bytes, param_types, never_null, into);
     out->right = set_tree(*s->right, cat, counts, memory_bytes, param_types, never_null, into);
     for (const auto& o : s->outputs) out->types.push_back(o.expr.type);
+    for (const auto& o : s->hidden) out->types.push_back(o.expr.type);
     return out;
   }
   auto arm = search(n, cat, counts, memory_bytes, never_null);

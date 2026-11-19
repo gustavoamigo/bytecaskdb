@@ -334,6 +334,9 @@ struct SetOp {
   Kind kind{Kind::Union};
   bool all{false};
   std::vector<Output> outputs;
+  // Columns after `outputs` the arms give and the statement does not
+  // return: a FULL JOIN's ORDER BY keys it does not select (the binder).
+  std::vector<Output> hidden;
   std::vector<Order> order;
 };
 

@@ -584,7 +584,9 @@ auto of_no_table(const Node& root) -> bool {
 
 class Checker {
 public:
-  explicit Checker(const Plan& p) : p_{p} {}
+  explicit Checker(const Plan& p) : p_{p}, subs_{p.subs} {}
+  // A set operation's arm: its InSet tests a set of the statement's subqueries.
+  Checker(const Plan& p, const std::vector<Sub>& subs) : p_{p}, subs_{subs} {}
 
   void plan() {
     if (p_.set) {
@@ -592,6 +594,10 @@ public:
       if (p_.set_limit && *p_.set_limit < 0) broken("a negative LIMIT");
       for (const auto& o : p_.set_order) {
         if (o.column >= p_.set->types.size()) broken("a set operation ordered by a column it does not have");
+      }
+      // Columns it does not return are ORDER BY keys only.
+      if (p_.result.size() > p_.set->types.size() || (p_.result.size() < p_.set->types.size() && p_.set_order.empty())) {
+        broken("a set operation returning other columns than it orders and gives");
       }
       subqueries();
       arms(*p_.set);
@@ -657,7 +663,7 @@ private:
       broken("a set operation arm that is not a SELECT of rows with no subquery of its own");
     }
     if (std::get<Emit>(leaf.root->op).targets.size() != n.types.size()) broken("a set operation arm of other columns");
-    check(leaf);
+    Checker{leaf, p_.subs}.plan();
   }
 
   void params(const Expr& e) const {
@@ -875,8 +881,8 @@ private:
       case Expr::Kind::InSet: {
         // Of a column of its subquery's set's type.
         auto i = static_cast<std::size_t>(e.constant);
-        if (e.args.size() != 1 || e.args[0].kind != Expr::Kind::Column || e.constant < 0 || i >= p_.subs.size() ||
-            p_.subs[i].kind != logical::Subquery::Kind::Set || phys_type(p_.subs[i].type) != e.args[0].col.type) {
+        if (e.args.size() != 1 || e.args[0].kind != Expr::Kind::Column || e.constant < 0 || i >= subs_.size() ||
+            subs_[i].kind != logical::Subquery::Kind::Set || phys_type(subs_[i].type) != e.args[0].col.type) {
           broken("IN of a subquery of other than a column of its set's type");
         }
         reads(e);
@@ -1602,6 +1608,7 @@ private:
   }
 
   const Plan& p_;
+  const std::vector<Sub>& subs_;  // the statement's: an arm's InSet reads them
   std::vector<const Choice*> second_;    // the choice points whose second plan is taken
   std::vector<std::uint32_t> covering_;  // every table a covering scan reads, in the branches taken
   // The parameters an outer nested loop's guard checks, while its inner

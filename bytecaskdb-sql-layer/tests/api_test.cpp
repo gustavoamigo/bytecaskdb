@@ -1448,6 +1448,67 @@ TEST_CASE("embedded API: every plan the search costed returns the same rows", "[
   }
 }
 
+TEST_CASE("embedded API: a FULL JOIN keeps the rows of both sides, NULL-extended where the ON matches none", "[sql][api]") {
+  sql_test::TempDir dir{"api_full_join"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE l (k INTEGER PRIMARY KEY, a INTEGER)");
+  (void)db->execute("CREATE TABLE r (j INTEGER PRIMARY KEY, a INTEGER)");
+  (void)db->execute("CREATE TABLE n (a INTEGER, s INTEGER)");  // no primary key: a hidden row id
+  (void)db->execute("INSERT INTO l VALUES (1, 1), (2, 2), (3, NULL)");
+  (void)db->execute("INSERT INTO r VALUES (10, 1), (11, 1), (12, 4), (13, NULL)");
+  (void)db->execute("INSERT INTO n VALUES (2, 20), (NULL, 21), (5, 22)");
+  auto rows = [&](std::string_view sql) { return db->execute(sql).rows; };
+  auto sorted = [](Grid g) {
+    std::ranges::sort(g);
+    return g;
+  };
+  const Value null{};
+  // Every pair the ON makes, each row of l it pairs with nothing, then each
+  // row of r: a NULL key matches nothing, on either side.
+  const Grid both{{i(1), i(10)}, {i(1), i(11)}, {i(2), null}, {i(3), null}, {null, i(12)}, {null, i(13)}};
+  CHECK(rows("SELECT l.k, r.j FROM l FULL JOIN r ON l.a = r.a ORDER BY l.k, r.j") == both);
+  CHECK(sorted(rows("SELECT l.k, r.j FROM l FULL OUTER JOIN r ON r.a = l.a")) == sorted(both));
+  // The ON decides the pairs; the WHERE is applied after the NULL-extension.
+  CHECK(rows("SELECT l.k, r.j FROM l FULL JOIN r ON l.a = r.a AND r.j > 10 ORDER BY l.k, r.j") ==
+        Grid{{i(1), i(11)}, {i(2), null}, {i(3), null}, {null, i(10)}, {null, i(12)}, {null, i(13)}});
+  CHECK(rows("SELECT l.k, r.j FROM l FULL JOIN r ON l.a = r.a WHERE r.j IS NULL ORDER BY l.k") ==
+        Grid{{i(2), null}, {i(3), null}});
+  CHECK(rows("SELECT l.k, r.j FROM l FULL JOIN r ON l.a = r.a WHERE l.k IS NULL ORDER BY r.j") ==
+        Grid{{null, i(12)}, {null, i(13)}});
+  // ON TRUE pairs every row; ON FALSE none.
+  CHECK(rows("SELECT l.k, r.j FROM l FULL JOIN r ON TRUE").size() == 12);
+  CHECK(rows("SELECT l.k, r.j FROM l FULL JOIN r ON FALSE").size() == 7);
+  // USING: the merged column is the side's that has a row.
+  CHECK(rows("SELECT a, l.k, r.j FROM l FULL JOIN r USING (a) ORDER BY a, l.k, r.j") ==
+        Grid{{i(1), i(1), i(10)}, {i(1), i(1), i(11)}, {i(2), i(2), null}, {i(4), null, i(12)}, {null, i(3), null}, {null, null, i(13)}});
+  // A table with no primary key on either side.
+  CHECK(rows("SELECT n.s, l.k FROM n FULL JOIN l ON n.a = l.a ORDER BY n.s, l.k") ==
+        Grid{{i(20), i(2)}, {i(21), null}, {i(22), null}, {null, i(1)}, {null, i(3)}});
+  CHECK(rows("SELECT l.k, n.s FROM l FULL JOIN n ON n.a = l.a ORDER BY n.s, l.k") ==
+        Grid{{i(2), i(20)}, {null, i(21)}, {null, i(22)}, {i(1), null}, {i(3), null}});
+  // ORDER BY a column it does not select, and a LIMIT over the sorted rows.
+  CHECK(rows("SELECT l.k FROM l FULL JOIN r ON l.a = r.a ORDER BY r.j DESC, l.k LIMIT 3") == Grid{{i(2)}, {i(3)}, {null}});
+  CHECK(rows("SELECT l.k, r.j FROM l FULL JOIN r ON l.a = r.a LIMIT 2").size() == 2);
+  // A table joined to itself.
+  CHECK(rows("SELECT x.k, y.k FROM l AS x FULL JOIN l AS y ON x.a = y.k ORDER BY x.k, y.k") ==
+        Grid{{i(1), i(1)}, {i(2), i(2)}, {i(3), null}, {null, i(3)}});
+  // A view of a FULL JOIN, its WHERE and the query's above the join.
+  (void)db->execute("CREATE VIEW v AS SELECT l.k, r.j FROM l FULL JOIN r ON l.a = r.a");
+  CHECK(rows("SELECT j FROM v WHERE k IS NULL ORDER BY j") == Grid{{i(12)}, {i(13)}});
+  CHECK_THROWS_AS(db->execute("SELECT l.k FROM l FULL JOIN r ON l.a < r.a"), ast::SqlError);
+  // NOT (a <> b) is a = b, as PostgreSQL reads it: joinable.
+  CHECK(rows("SELECT l.k, r.j FROM l FULL JOIN r ON NOT (l.a <> r.a) ORDER BY l.k, r.j") == both);
+  // A bare $n ORDER BY key sorts on nothing but is the statement's parameter.
+  const auto& by_param = db->prepare("SELECT l.k, r.j FROM l FULL JOIN r ON l.a = r.a ORDER BY $1, 1, 2");
+  CHECK(by_param.params().size() == 1);
+  CHECK(db->execute(by_param, {bytes("5")}).rows == both);  // text, as PostgreSQL types it there
+  // The WHERE's IN and NOT IN of a subquery test each arm's rows against one set.
+  CHECK(rows("SELECT l.k, r.j FROM l FULL JOIN r ON l.a = r.a WHERE r.j IN (SELECT j FROM r WHERE j > 10) ORDER BY r.j") ==
+        Grid{{i(1), i(11)}, {null, i(12)}, {null, i(13)}});
+  CHECK(rows("SELECT l.k, r.j FROM l FULL JOIN r ON l.a = r.a WHERE l.k NOT IN (SELECT a FROM r WHERE a IS NOT NULL) "
+             "ORDER BY l.k") == Grid{{i(2), null}, {i(3), null}});
+}
+
 TEST_CASE("embedded API: a left outer join NULL-extends each left row no right row matches", "[sql][api]") {
   sql_test::TempDir dir{"api_outer_join"};
   auto db = Database::open(dir.path());
@@ -1491,7 +1552,6 @@ TEST_CASE("embedded API: a left outer join NULL-extends each left row no right r
   CHECK(rows("SELECT l.a, max(r.j) FROM l JOIN r ON FALSE GROUP BY l.a").empty());
   CHECK(rows("SELECT DISTINCT l.a FROM l WHERE l.k > 1 AND FALSE").empty());
   CHECK(rows("SELECT l.k FROM l WHERE l.a = (SELECT max(r.j) FROM r WHERE NULL)").empty());
-  CHECK_THROWS_AS(db->execute("SELECT l.k FROM l FULL JOIN r ON l.a = r.a"), ast::SqlError);
   // The right side keyed by a parameter and a left column: a NULL parameter,
   // or a left value too long for any key, matches nothing, and the left row
   // stays, NULL-extended.
@@ -2978,6 +3038,11 @@ TEST_CASE("embedded API: a set operation streams its arms, names its columns fro
         sorted(Grid{{bytes("apple")}, {bytes("apple")}, {bytes("banana")}}));
   CHECK(sorted(run("SELECT name FROM sj WHERE g = $1 EXCEPT SELECT name FROM sj WHERE g = $2", {i(2), i(1)})) ==
         sorted(Grid{{bytes("cherry")}}));
+
+  // An arm's IN or NOT IN of a subquery tests the statement's set, run once before the arms.
+  CHECK(sorted(run("SELECT id FROM sa WHERE id IN (SELECT y FROM sb) UNION ALL SELECT id FROM sb WHERE id NOT IN "
+                   "(SELECT x FROM sa WHERE x IS NOT NULL)")) == sorted(Grid{{i(2)}, {i(3)}, {i(3)}, {i(4)}, {i(5)}}));
+  CHECK(sorted(run("SELECT x FROM sa INTERSECT SELECT y FROM sb WHERE y IN (SELECT x FROM sa)")) == Grid{{i(2)}});
 
   // Inside a transaction a set operation reads what the transaction wrote.
   auto txn = db->begin();

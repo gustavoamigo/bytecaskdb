@@ -545,7 +545,12 @@ TEST_CASE("binder: JOIN USING and NATURAL JOIN compare their columns by =, each 
   CHECK(rejected(cat, "SELECT k FROM l JOIN r USING (k)").first ==
         "column \"k\" specified in USING clause does not exist in right table");
   CHECK(state("SELECT k FROM l JOIN r USING (a, a)") == "42701");
-  CHECK(rejected(cat, "SELECT k FROM l FULL JOIN r USING (a)").first == "FULL JOIN is not supported");
+  // FULL JOIN USING: the left arm's merged column is l's, the right arm's r's,
+  // which is COALESCE(l.a, r.a) row by row.
+  auto full = bind_sql(cat, "SELECT a FROM l FULL JOIN r USING (a)");
+  const auto& set = std::get<logical::SetOp>(root(full).op);
+  CHECK(find<logical::Project>(*set.left)->exprs[0].expr.col.table == l->id);
+  CHECK(find<logical::Project>(*set.right)->exprs[0].expr.col.table == r->id);
 }
 
 TEST_CASE("binder: LEFT and RIGHT JOIN are a left outer join, ON its predicate, WHERE above it", "[sql][binder]") {
@@ -575,7 +580,109 @@ TEST_CASE("binder: LEFT and RIGHT JOIN are a left outer join, ON its predicate, 
   }
   CHECK_FALSE(get<logical::Join>(bind_sql(cat, "SELECT l.k FROM l JOIN r ON l.a = r.a")).left_outer);
   CHECK(get<logical::Join>(bind_sql(cat, "SELECT l.k FROM l LEFT JOIN r USING (a)")).left_outer);
-  CHECK(rejected(cat, "SELECT l.k FROM l FULL JOIN r ON l.a = r.a").first == "FULL JOIN is not supported");
+}
+
+TEST_CASE("binder: FULL JOIN is a UNION ALL of a left outer join and an anti-join arm, WHERE above each", "[sql][binder]") {
+  sql_test::Fixture f;
+  for (auto ddl : {"CREATE TABLE l (k INTEGER PRIMARY KEY, a INTEGER NOT NULL)",
+                   "CREATE TABLE r (j INTEGER PRIMARY KEY, a INTEGER NOT NULL)", "CREATE TABLE n (a INTEGER)",
+                   "CREATE VIEW gv AS SELECT a, count(*) AS c FROM l GROUP BY a"}) {
+    f.ddl(std::get<Ddl>(bind_sql(f.cat(), ddl).stmt));
+  }
+  const auto& cat = f.cat();
+  const auto* l = cat.table("l");
+  const auto* r = cat.table("r");
+  auto table_of = [](const logical::Node& n) { return std::get<logical::Get>(n.op).table->id; };
+  auto b = bind_sql(cat, "SELECT l.k, r.j FROM l FULL JOIN r ON l.a = r.a AND r.j > 1 WHERE l.k < 5 OR r.j < 5");
+  const auto& set = std::get<logical::SetOp>(root(b).op);
+  CHECK(set.kind == logical::SetOp::Kind::Union);
+  CHECK(set.all);
+  CHECK(set.outputs.size() == 2);
+  CHECK(set.hidden.empty());
+  // The left arm: every row of l, r NULL-extended, the WHERE above.
+  const auto& lj = *find<logical::Join>(*set.left);
+  CHECK(lj.left_outer);
+  CHECK(table_of(*lj.left) == l->id);
+  CHECK(table_of(*lj.right) == r->id);
+  CHECK(lj.predicate.size() == 2);
+  CHECK(find<logical::Filter>(*set.left)->conjuncts.size() == 1);
+  // The right arm: every row of r, l NULL-extended, kept where l's primary
+  // key is NULL: the rows of r no row of l matched. Its ON is the left
+  // arm's; the WHERE is above it.
+  const auto& rj = *find<logical::Join>(*set.right);
+  CHECK(rj.left_outer);
+  CHECK(table_of(*rj.left) == r->id);
+  CHECK(table_of(*rj.right) == l->id);
+  CHECK(rj.predicate.size() == 2);
+  const auto& above = find<logical::Filter>(*set.right)->conjuncts;
+  REQUIRE(above.size() == 2);
+  CHECK(above[1].kind == logical::Expr::Kind::IsNull);
+  CHECK(above[1].args.at(0).col.table == l->id);
+  CHECK(above[1].args.at(0).col.col == l->pk_col_ids[0]);
+  CHECK(above[1].args.at(0).col.nullable);
+  // Each side's columns are NULL-able in the arm that NULL-extends it.
+  CHECK(find<logical::Project>(*set.left)->exprs[1].expr.col.nullable);
+  CHECK(find<logical::Project>(*set.right)->exprs[0].expr.col.nullable);
+  // A table with no primary key is told NULL-extended by its hidden row id.
+  auto hidden_key = bind_sql(cat, "SELECT n.a FROM n FULL JOIN r ON n.a = r.a");
+  const auto& anti = find<logical::Filter>(*std::get<logical::SetOp>(root(hidden_key).op).right)->conjuncts;
+  REQUIRE(anti.size() == 1);
+  CHECK(cat.table("n")->column(anti[0].args.at(0).col.col)->hidden);
+
+  // ORDER BY a selected item is its column; any other key is a hidden
+  // column of both arms, after the returned ones. A LIMIT is the root's.
+  auto ordered = bind_sql(cat, "SELECT l.k FROM l FULL JOIN r ON l.a = r.a ORDER BY r.j DESC, l.k LIMIT 3");
+  REQUIRE(std::holds_alternative<logical::Limit>(root(ordered).op));
+  const auto& top = std::get<logical::SetOp>(std::get<logical::Limit>(root(ordered).op).input->op);
+  CHECK(top.outputs.size() == 1);
+  CHECK(top.hidden.size() == 1);
+  REQUIRE(top.order.size() == 2);
+  CHECK((top.order[0].column == 1 && top.order[0].desc && top.order[0].nulls_first));
+  CHECK((top.order[1].column == 0 && !top.order[1].desc));
+  CHECK(find<logical::Project>(*top.left)->exprs.size() == 2);
+  CHECK(find<logical::Project>(*top.right)->exprs.size() == 2);
+
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what();
+    }
+    return "bound";
+  };
+  // As PostgreSQL plans it: by a merge or hash join, so some conjunct of
+  // the ON is an equality of an expression of each side, or none reads a column.
+  CHECK(state("SELECT l.k FROM l FULL JOIN r ON l.a = r.a AND l.k > r.j") == "bound");
+  CHECK(state("SELECT l.k FROM l FULL JOIN r ON TRUE") == "bound");
+  CHECK(state("SELECT l.k FROM l FULL JOIN r ON FALSE") == "bound");
+  const auto* unjoinable = "0A000 FULL JOIN is only supported with merge-joinable or hash-joinable join conditions";
+  CHECK(state("SELECT l.k FROM l FULL JOIN r ON l.a < r.a") == unjoinable);
+  CHECK(state("SELECT l.k FROM l FULL JOIN r ON l.a = r.a OR l.k = r.j") == unjoinable);
+  CHECK(state("SELECT l.k FROM l FULL JOIN r ON l.a = 1") == unjoinable);
+  // Each NOT pushed down first, as PostgreSQL's negate_clause: NOT (a <> b) is a = b.
+  CHECK(state("SELECT l.k FROM l FULL JOIN r ON NOT (l.a <> r.a)") == "bound");
+  CHECK(state("SELECT l.k FROM l FULL JOIN r ON NOT (l.a <> r.a OR l.k < r.j)") == "bound");
+  CHECK(state("SELECT l.k FROM l FULL JOIN r ON l.a <> r.a") == unjoinable);
+  CHECK(state("SELECT l.k FROM l FULL JOIN r ON NOT (l.a = r.a AND l.k = r.j)") == unjoinable);
+  CHECK(state("SELECT l.k FROM l FULL JOIN r ON l.a = r.a FOR UPDATE") ==
+        "0A000 FOR UPDATE cannot be applied to the nullable side of an outer join");
+  // Not in this cut.
+  for (auto sql : {"SELECT count(*) FROM l FULL JOIN r ON l.a = r.a", "SELECT DISTINCT l.k FROM l FULL JOIN r ON l.a = r.a",
+                   "SELECT l.k FROM l FULL JOIN r ON l.a = r.a GROUP BY l.k"}) {
+    INFO(sql);
+    CHECK(state(sql) == "42601 an aggregate, GROUP BY or DISTINCT over a FULL JOIN is not supported yet");
+  }
+  CHECK(state("SELECT l.k FROM l FULL JOIN r ON l.a = r.a OFFSET 1") == "42601 OFFSET over a FULL JOIN is not supported yet");
+  CHECK(state("SELECT l.k FROM l FULL JOIN r ON l.a = r.a UNION SELECT 1") ==
+        "42601 a FULL JOIN in an arm of a set operation (UNION, INTERSECT, EXCEPT) is not supported yet");
+  CHECK(state("INSERT INTO n SELECT l.k FROM l FULL JOIN r ON l.a = r.a") ==
+        "42601 INSERT … SELECT of a FULL JOIN is not supported yet");
+  CHECK(state("SELECT gv.a, r.j FROM gv FULL JOIN r ON gv.a = r.a") == "42601 a grouped view in a FULL JOIN is not supported yet");
+  CHECK(state("SELECT gv.a, r.j FROM r FULL JOIN gv ON gv.a = r.a") == "42601 a grouped view in a FULL JOIN is not supported yet");
+  // A bare $n ORDER BY key is the statement's parameter, typed as PostgreSQL types it there.
+  CHECK(bind_sql(cat, "SELECT l.k FROM l FULL JOIN r ON l.a = r.a ORDER BY $1, 1").param_types ==
+        bind_sql(cat, "SELECT l.k FROM l LEFT JOIN r ON l.a = r.a ORDER BY $1, 1").param_types);
+  CHECK(bind_sql(cat, "SELECT l.k FROM l FULL JOIN r ON l.a = r.a ORDER BY $1, 1").param_types.size() == 1);
 }
 
 TEST_CASE("binder: an uncorrelated subquery is bound to run first, its values in hidden parameters", "[sql][binder]") {

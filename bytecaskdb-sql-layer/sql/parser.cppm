@@ -1502,9 +1502,10 @@ void scope_on(Compare& c, std::uint32_t first) {
 // for a nested tree or one after a comma) to its last. A LEFT or RIGHT join
 // in parentheses or of a join in parentheses would not, and is refused, as
 // is USING or NATURAL there or after a comma, whose left side is not every
-// item before it.
+// item before it. A FULL join is only the whole FROM, of two tables:
+// `whole` says the tree is.
 void join_items(const PgQuery__Node* n, std::int32_t pos, std::vector<FromItem>& items, std::vector<Compare>& on,
-                std::uint32_t first, bool nested) {
+                std::uint32_t first, bool nested, bool whole) {
   if (n != nullptr && n->node_case == PG_QUERY__NODE__NODE_RANGE_VAR) {
     items.push_back(from_item(n->range_var));
     return;
@@ -1514,15 +1515,22 @@ void join_items(const PgQuery__Node* n, std::int32_t pos, std::vector<FromItem>&
   const auto* r = j != nullptr ? j->rarg : nullptr;
   auto at = r != nullptr && r->node_case == PG_QUERY__NODE__NODE_RANGE_VAR ? r->range_var->location : pos;
   if (j == nullptr) reject("SELECT reads tables", pos);
-  if (j->jointype == PG_QUERY__JOIN_TYPE__JOIN_FULL) reject("FULL JOIN is not supported", at);
   auto kind = j->jointype == PG_QUERY__JOIN_TYPE__JOIN_LEFT    ? JoinKind::Left
               : j->jointype == PG_QUERY__JOIN_TYPE__JOIN_RIGHT ? JoinKind::Right
+              : j->jointype == PG_QUERY__JOIN_TYPE__JOIN_FULL  ? JoinKind::Full
                                                                : JoinKind::Inner;
   auto table = r != nullptr && r->node_case == PG_QUERY__NODE__NODE_RANGE_VAR;
   auto join = r != nullptr && r->node_case == PG_QUERY__NODE__NODE_JOIN_EXPR;
+  // A FULL JOIN is the union of two plans of its two tables (the binder),
+  // so it is the whole FROM: never in a chain, in parentheses or after a
+  // comma (#712).
+  auto two_tables = j->larg != nullptr && j->larg->node_case == PG_QUERY__NODE__NODE_RANGE_VAR && table;
+  if (kind == JoinKind::Full && !(whole && two_tables && j->alias == nullptr)) {
+    reject("a FULL JOIN that is not the whole FROM of two tables is not supported yet", at);
+  }
   if ((j->jointype != PG_QUERY__JOIN_TYPE__JOIN_INNER && kind == JoinKind::Inner) || j->alias != nullptr ||
       j->larg == nullptr || !(table || join)) {
-    reject("only an inner, LEFT or RIGHT join of tables, without an alias, is supported", at);
+    reject("only an inner, LEFT, RIGHT or FULL join of tables, without an alias, is supported", at);
   }
   if (kind != JoinKind::Inner && (nested || join)) {
     reject("a LEFT or RIGHT join in parentheses, or of a join in parentheses, is not supported yet", at);
@@ -1531,9 +1539,9 @@ void join_items(const PgQuery__Node* n, std::int32_t pos, std::vector<FromItem>&
   if (merges && (first != 0 || join)) {
     reject("USING or NATURAL in a join in parentheses, of one, or after a comma is not supported yet", at);
   }
-  join_items(j->larg, pos, items, on, first, nested);
+  join_items(j->larg, pos, items, on, first, nested, false);
   if (join) {
-    join_items(r, pos, items, on, static_cast<std::uint32_t>(items.size()), true);
+    join_items(r, pos, items, on, static_cast<std::uint32_t>(items.size()), true, false);
   } else {
     auto item = from_item(r->range_var);
     item.kind = kind;
@@ -1564,7 +1572,7 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos, bool into_taken, boo
   for (std::size_t i = 0; i < s->n_from_clause; ++i) {
     const auto* from = s->from_clause[i];
     if (from->node_case == PG_QUERY__NODE__NODE_JOIN_EXPR) {
-      join_items(from, pos, items, on, static_cast<std::uint32_t>(items.size()), false);
+      join_items(from, pos, items, on, static_cast<std::uint32_t>(items.size()), false, s->n_from_clause == 1);
       continue;
     }
     if (from->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) reject("SELECT reads tables", pos);
