@@ -199,9 +199,95 @@ SQLSTATE 25P02 until the transaction ends: `rollback()`, or `commit()`,
 which rolls back and returns `RolledBack`. The statement's own error is
 what `execute()` raises; 25P02 is for the statements after it.
 
-User `SAVEPOINT` / `ROLLBACK TO` are **later**: TPROC-C doesn't use them.
-When they come they are a mark in the log plus a copy of the overlay's
-state at the mark, as `MariaDBTxn` keeps them; nothing here blocks that.
+User savepoints build on the same rule: *Savepoints* below.
+
+## Savepoints
+
+`SAVEPOINT`, `ROLLBACK TO SAVEPOINT` and `RELEASE SAVEPOINT` behave as in
+PostgreSQL 17. The embedded API has `Transaction::savepoint`, `rollback_to`
+and `release`; the server runs the statements on an explicit block's
+transaction.
+
+**A savepoint is a mark.** `bc_txn_savepoint` pushes a `TxnMark`: a
+`shared_ptr` to the transaction's overlay, the lengths of its guards,
+claims, locks and written tables, and `held`. Those vectors only grow
+between marks, so their lengths are enough to cut them back. A mark taken
+before the first statement pins nothing: a savepoint takes no snapshot, as
+in PostgreSQL.
+
+**The overlay is shared copy-on-write, as a cursor's pin is.** The mark
+copies nothing. The first statement after it that writes clones the
+overlay in `bc_txn_add` (`own_overlay`), and the mark keeps the old one.
+That copy is charged to `max_bytes` from the clone on (`marked_bytes`,
+counted by `txn_holds`; marks that share an overlay count it once). Before
+the clone, each call of the statement counts the copy it would force
+(`mark_pending`), so a statement that would pass the bound because of a
+mark fails at its call with `BC_E_LIMIT`, as any other. So `SAVEPOINT`
+itself never fails for room, and a block of savepoints with no write
+between them costs nothing.
+
+**`ROLLBACK TO` restores the mark.** `bc_txn_rollback_to` drops the marks
+above it, points the overlay back at the mark's, cuts the vectors back,
+and restores `held`; the mark stays, as PostgreSQL's savepoint stays after
+`ROLLBACK TO`. The snapshot, the pinned catalog and the cursors' pins stay.
+It takes an aborted transaction back to open, and a healthy one too: an
+error the API raised before a statement reached the runtime (a bind error,
+a DDL refused, `Transaction::fail`) leaves the runtime's transaction
+healthy. The reservation on the memory cap shrinks to what is left.
+
+**`RELEASE` drops marks.** `bc_txn_release` drops the mark and those above
+it; the writes since stay. An overlay only a dropped mark held goes with it.
+
+**An abort with marks keeps the snapshot.** Without marks an abort frees
+everything at once (*Statements inside a transaction*). With marks
+`txn_abort` keeps the snapshot, the catalog and the marks, and goes back to
+the newest mark, so what the failed statements wrote is freed all the same.
+The API's `TxnHandle::abort` keeps the context, the cursors and the
+savepoints. Every call but `rollback_to`, `commit` and `rollback` is then
+25P02, as before.
+
+**Names.** The API matches names exactly, newest first, so a name taken
+again hides the older until released or rolled back past. An unknown name
+is `ast::SqlError` 3B001, "savepoint "x" does not exist", and aborts the
+transaction, as any error does in PostgreSQL; in an aborted transaction it
+stays aborted. The server parses the statements with PostgreSQL's grammar
+(libpg_query), which folds an unquoted name to lower case.
+
+**Cursors (#727): PostgreSQL's rule.** Each cursor records how many cursors
+its transaction had opened before it, and each savepoint the count at its
+mark. `rollback_to` closes the cursors opened since the savepoint, hold
+cursors included. Those opened before stay open where they stand: a fetch
+is not undone. A cursor whose own fetch failed is closed and *failed*
+(`Cursor::is_failed`): it cannot be run, which the server reports as
+PostgreSQL does (55000, "portal "c" cannot be run"), until it is closed. If
+the rollback goes to a savepoint taken before it was declared, it is
+forgotten instead (34000 when named). While the transaction is aborted, a
+fetch is 25P02.
+
+**The server.** Outside an explicit block, an implicit one included, each
+statement is 25P01, "SAVEPOINT can only be used in transaction blocks" (or
+`RELEASE SAVEPOINT`, `ROLLBACK TO SAVEPOINT`). In a failed block,
+`SAVEPOINT` and `RELEASE` are 25P02 and `ROLLBACK TO` ends the failure. A
+failed block's transaction is aborted (`Transaction::fail`), not ended, so
+the savepoints survive the error. Each savepoint records the block's
+read-only mode, which `ROLLBACK TO` and `RELEASE` restore, as PostgreSQL's
+end of a subtransaction does. While a savepoint is open, `SET TRANSACTION
+ISOLATION LEVEL` naming a level other than the block's own is 25001, "must
+not be called in a subtransaction" (the block's own level is taken), and
+`SET TRANSACTION READ WRITE` in a read-only block is 25001, "cannot set
+transaction read-write mode inside a read-only transaction", as PostgreSQL
+17 reports them. The tags are `SAVEPOINT`, `ROLLBACK` and `RELEASE`.
+
+**Cost.** The first write after each savepoint copies the whole overlay:
+O(overlay) time and memory per savepoint followed by a write, charged to
+`max_bytes`. A client that wraps every statement in a savepoint (psql's
+`ON_ERROR_ROLLBACK`, a driver's autosave) pays it per statement, which is
+quadratic in the transaction's writes. A per-mark undo log would make it
+O(statement) (#850).
+
+**What does not change.** A statement that fails with 40001 because its
+plan no longer fits the catalog the transaction pinned ends the
+transaction, savepoints or not.
 
 ## Commit and conflicts
 
@@ -453,6 +539,10 @@ differences*.
   `bc_txn_repin` is refused while a pin is live: the snapshot a cursor reads
   does not move. The pin also pins the snapshot and catalog if no statement
   has.
+- **Savepoints.** A savepoint charges nothing; the first write after it
+  copies the overlay for it, charged as a pin's copy is, and O(overlay) in
+  time: a savepoint around every statement is quadratic in the
+  transaction's writes (*Savepoints*, #850).
 - **Memory.** The overlay allocates from the heap. A failed allocation is
   `BC_E_MEMORY` for the statement, never an abort and never an exception
   into a plan (`CONTRACT.md`, *Plan safety*). An allocation-failure sweep
@@ -522,6 +612,12 @@ for their shape.
   - a failed statement writes nothing, every later `execute()` is 25P02,
     and `commit()` rolls back;
   - the snapshot is taken at the first statement, not at `begin()`.
+- **Savepoints:** `transaction_test.cpp` (a rollback to a mark and the
+  mark staying, an abort with a mark keeping the snapshot, release, the
+  mark's copy charged at the first write), `api_transaction_test.cpp`,
+  `api_cursor_test.cpp` (#727's cursor rule) and the wire tests
+  `test_savepoints_*` and `test_rollback_to_closes_the_cursors_declared_after_the_savepoint`,
+  over simple and extended Query.
 - **Commit:**
   - first-committer-wins across transactions (lost-update, delete against
     update);
@@ -569,7 +665,6 @@ Not built. Each gets an issue when it is picked up.
 | Token transactions across requests (the transport design, #487) | The handle is the token's in-process half; a token names a handle held with a TTL. |
 | Procedures retried in the runtime (#495) | A procedure is a transaction whose statements are all the runtime's, so its retry is a loop around `begin` … `commit`. |
 | Serializable and read committed | Guards are emitted per isolation level by the compiler, and the transaction already keeps guards. |
-| User `SAVEPOINT` / `ROLLBACK TO` | A log mark and an overlay copy, as statement rollback already is. |
 | Sequences and auto-increment | A runtime service at commit, outside the plan (`docs/plan_api_design.md`, *Deferred*). TPROC-C's ids come from rows it reads and updates. |
 | Deadlines turned into budgets | The budget is per statement already; a transaction deadline divides into it. |
 | Bulk load | A transaction mode that flushes its log in batches, as `MariaDBTxn`'s bulk-copy mode does, into a keyspace no one else reads yet. |

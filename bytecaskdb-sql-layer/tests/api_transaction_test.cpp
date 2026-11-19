@@ -1822,3 +1822,117 @@ TEST_CASE("embedded API: ON CONFLICT DO NOTHING arbitrates every unique index ov
   CHECK(db->execute("INSERT INTO pair VALUES (8, 7, 7) ON CONFLICT (b, a) DO NOTHING").affected == 0);
   CHECK(db->execute("SELECT id FROM pair").rows.size() == 1);
 }
+
+TEST_CASE("embedded API: rollback_to undoes the statements since a savepoint, which stays; release keeps them",
+          "[sql][api][txn][savepoint]") {
+  sql_test::TempDir dir{"api_txn"};
+  auto db = open_db(dir);
+  auto t = db->begin();
+  t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{10}});
+  t.savepoint("a");
+  t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{2}, std::int64_t{20}});
+  t.savepoint("b");
+  t.execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{11}});
+  CHECK(txn_balance(t, 1) == 11);
+  t.rollback_to("b");
+  CHECK(txn_balance(t, 1) == 10);
+  CHECK(txn_balance(t, 2) == 20);
+  t.rollback_to("a");  // past b, which goes
+  CHECK(txn_balance(t, 2) == std::nullopt);
+  CHECK_THROWS_AS(t.release("b"), ast::SqlError);  // 3B001, and it aborts as any failed statement
+  CHECK(t.is_aborted());
+  t.rollback_to("a");  // a stayed: the abort is undone
+  CHECK_FALSE(t.is_aborted());
+  t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{3}, std::int64_t{30}});
+  t.savepoint("a");  // a name taken again hides the older
+  t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{4}, std::int64_t{40}});
+  t.release("a");    // the newer: the write since stays
+  t.rollback_to("a");  // the older
+  CHECK(txn_balance(t, 3) == std::nullopt);
+  t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{5}, std::int64_t{50}});
+  t.release("a");
+  CHECK_THROWS_AS(t.rollback_to("a"), ast::SqlError);
+  CHECK(t.commit() == CommitOutcome::RolledBack);  // the failed rollback_to aborted it
+  CHECK(balance(*db, 1) == std::nullopt);
+  auto u = db->begin();
+  u.savepoint("s");
+  u.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{6}, std::int64_t{60}});
+  u.release("s");
+  CHECK(u.commit() == CommitOutcome::Committed);
+  CHECK(balance(*db, 6) == 60);
+  auto v = db->begin();
+  try {
+    v.rollback_to("nope");
+    FAIL("an unknown savepoint was rolled back to");
+  } catch (const ast::SqlError& e) {
+    CHECK(sqlstate(e) == "3B001");
+    CHECK(std::string_view{e.what()} == "savepoint \"nope\" does not exist");
+  }
+}
+
+TEST_CASE("embedded API: a failed statement after a savepoint aborts the transaction, and rollback_to reopens it "
+          "on the same snapshot",
+          "[sql][api][txn][savepoint]") {
+  sql_test::TempDir dir{"api_txn"};
+  auto db = open_db(dir);
+  auto t = db->begin();
+  t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{10}});
+  t.savepoint("s");
+  t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{2}, std::int64_t{20}});
+  SECTION("a statement that fails as it runs") {
+    CHECK_THROWS_AS(t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{2}}), ExecError);
+  }
+  SECTION("a statement refused before it runs") {
+    CHECK_THROWS_AS(t.execute("SELECT bal FROM nope"), ast::SqlError);
+  }
+  SECTION("an error the caller raised") { t.fail(); }
+  REQUIRE(t.is_aborted());
+  CHECK_THROWS_AS(t.execute("SELECT bal FROM acct WHERE id = $1", {std::int64_t{1}}), TransactionAborted);
+  CHECK_THROWS_AS(t.savepoint("t"), TransactionAborted);
+  CHECK_THROWS_AS(t.release("s"), TransactionAborted);
+  db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{9}, std::int64_t{90}});  // after the snapshot
+  t.rollback_to("s");
+  CHECK(txn_balance(t, 1) == 10);
+  CHECK(txn_balance(t, 2) == std::nullopt);
+  CHECK(txn_balance(t, 9) == std::nullopt);  // the snapshot is the one the first statement took
+  t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{3}, std::int64_t{30}});
+  CHECK(t.commit() == CommitOutcome::Committed);
+  CHECK(balance(*db, 1) == 10);
+  CHECK(balance(*db, 2) == std::nullopt);
+  CHECK(balance(*db, 3) == 30);
+}
+
+TEST_CASE("embedded API: a savepoint charges nothing; the first write after it keeps a copy charged to max_bytes",
+          "[sql][api][txn][savepoint]") {
+  sql_test::TempDir dir{"api_txn"};
+  auto db = open_db(dir);
+  // How many rows a transaction of this bound holds.
+  constexpr std::uint64_t kBound = 16384;
+  auto fit = std::int64_t{0};
+  {
+    auto p = db->begin(TransactionOptions{kBound});
+    try {
+      for (;; ++fit) p.execute("INSERT INTO acct VALUES ($1, $2)", {fit, fit});
+    } catch (const ExecError& e) {
+      REQUIRE(e.code() == BC_E_LIMIT);
+    }
+  }
+  REQUIRE(fit >= 5);
+  auto t = db->begin(TransactionOptions{kBound});
+  const auto n = fit * 4 / 5;
+  for (std::int64_t i = 0; i < n; ++i) t.execute("INSERT INTO acct VALUES ($1, $2)", {i, i});
+  for (auto i = 0; i < 100; ++i) t.savepoint("s");  // none charges
+  t.execute("SELECT bal FROM acct WHERE id = $1", {std::int64_t{0}});  // a read keeps no copy
+  try {
+    t.execute("INSERT INTO acct VALUES ($1, $2)", {n, n});
+    FAIL("the copy for the savepoints fits");
+  } catch (const ExecError& e) {
+    CHECK(e.code() == BC_E_LIMIT);
+    CHECK(sqlstate(e) == "54000");
+  }
+  t.rollback_to("s");
+  for (auto i = 0; i < 100; ++i) t.release("s");
+  t.execute("INSERT INTO acct VALUES ($1, $2)", {n, n});  // no copy kept: it fits
+  CHECK(t.commit() == CommitOutcome::Committed);
+  CHECK(balance(*db, n) == n);
+}

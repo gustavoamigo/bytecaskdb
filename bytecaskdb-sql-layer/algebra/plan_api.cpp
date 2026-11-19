@@ -1589,6 +1589,20 @@ struct bc_ctx {
   }
 };
 
+// A savepoint's mark (docs/transaction_design.md, *Savepoints*): the
+// transaction as it stood between two statements. The overlay is shared
+// with the transaction, copy-on-write as a cursor's pin is, so a mark costs
+// nothing until a write follows it; the vectors only grow between marks,
+// so their lengths are enough to cut them back.
+struct TxnMark {
+  std::shared_ptr<Overlay> overlay;
+  std::size_t guards;
+  std::size_t claims;
+  std::size_t locks;
+  std::size_t written;
+  std::uint64_t held;
+};
+
 // A transaction (docs/transaction_design.md): the snapshot and catalog
 // version its statements read, pinned at its first statement; the log of
 // every effect its statements made, in order; and the overlay that log
@@ -1617,6 +1631,13 @@ struct bc_txn {
   // (cap_holds).
   std::uint64_t pinned_by_holds{0};
   std::uint64_t pins{0};  // bc_overlay handles live
+  // The savepoints' marks, oldest first (bc_txn_savepoint).
+  std::vector<TxnMark> marks;
+  // What the marks' overlays hold beyond the current one: each overlay a
+  // write cloned away from, once (recount_marks). Charged when the clone is
+  // made, at bc_txn_add; txn_room counts the copy a write would keep before
+  // that, so the statement that passes the bound fails at its call.
+  std::uint64_t marked_bytes{0};
   std::vector<Effect> guards;          // the statements' guards, in their order
   std::vector<Claim> claims;           // the statements' insert claims, in their order
   std::vector<Lock> locks;             // the statements' rows locked or written, in their order
@@ -1659,11 +1680,31 @@ struct bc_txn {
     if (reserved != 0) memory->used.fetch_sub(std::exchange(reserved, 0), std::memory_order_relaxed);
   }
 
-  // The overlay to write to: cloned first when a pin shares it. A throw
-  // leaves the transaction's overlay and the pin's as they were.
+  // The overlay to write to: cloned first when a pin or a mark shares it.
+  // A throw leaves the transaction's overlay and the pin's as they were.
   auto own_overlay() -> Overlay& {
     if (overlay.use_count() > 1) overlay = std::make_shared<Overlay>(*overlay);
     return *overlay;
+  }
+
+  // The copy the next write would keep for the newest mark: the overlay's
+  // bytes while that mark shares it, else nothing.
+  [[nodiscard]] auto mark_pending() const noexcept -> std::uint64_t {
+    return !marks.empty() && marks.back().overlay == overlay ? overlay->bytes : 0;
+  }
+
+  // Counts what the marks keep. Marks that share an overlay are adjacent (no
+  // write was made between them, and a rollback drops every mark above the
+  // one it restores), so each overlay is counted once; the current one is
+  // counted as the overlay.
+  void recount_marks() noexcept {
+    marked_bytes = 0;
+    const Overlay* last = nullptr;
+    for (const auto& m : marks) {
+      if (m.overlay == overlay || m.overlay.get() == last) continue;
+      last = m.overlay.get();
+      marked_bytes += m.overlay->bytes;
+    }
   }
 };
 
@@ -1721,7 +1762,8 @@ namespace {
 // merging an effect into the overlay adds at most one node, and one that
 // replaces or erases others only frees. So the commit needs nothing its
 // statements were not held to.
-auto txn_holds(const bc_txn& t) -> std::uint64_t { return t.overlay->bytes + t.held + t.pinned_bytes; }
+// The marks' overlays count as the pins' do.
+auto txn_holds(const bc_txn& t) -> std::uint64_t { return t.overlay->bytes + t.held + t.pinned_bytes + t.marked_bytes; }
 
 // What the transaction reserves of the memory cap for itself: txn_holds but
 // the pins hold cursors reserve.
@@ -1732,7 +1774,7 @@ auto cap_holds(const bc_txn& t) -> std::uint64_t { return txn_holds(t) - t.pinne
 // The check each of a statement's calls makes (push_write), on the write
 // set as it would be: it bounds what bc_txn_add takes in.
 auto bc_ctx::txn_room(std::uint64_t bytes) -> bool {
-  if (txn_holds(*txn) + bytes <= txn->max_bytes) return true;
+  if (txn_holds(*txn) + txn->mark_pending() + bytes <= txn->max_bytes) return true;
   fail(BC_E_LIMIT, "the transaction's writes would pass its bound of " + std::to_string(txn->max_bytes) + " bytes");
   return false;
 }
@@ -1751,12 +1793,41 @@ void txn_drop_context(bc_txn* txn) noexcept {
   if (txn->attached != nullptr) txn->attached->detach_from_txn();
 }
 
+// Returns what the transaction reserves of the memory cap beyond what it
+// holds, after a rollback to a mark or a release let go of some.
+void txn_trim_reservation(bc_txn* txn) noexcept {
+  if (txn->memory == nullptr || txn->reserved <= cap_holds(*txn)) return;
+  txn->memory->used.fetch_sub(txn->reserved - cap_holds(*txn), std::memory_order_relaxed);
+  txn->reserved = cap_holds(*txn);
+}
+
+// Puts the transaction back as it stood at `m`: its overlay, and its
+// guards, claims, locks and tables cut back to the mark's lengths. The
+// snapshot, the catalog, the pins and the marks stay.
+void txn_restore(bc_txn* txn, const TxnMark& m) noexcept {
+  txn->overlay = m.overlay;
+  txn->guards.erase(txn->guards.begin() + static_cast<std::ptrdiff_t>(m.guards), txn->guards.end());
+  txn->claims.erase(txn->claims.begin() + static_cast<std::ptrdiff_t>(m.claims), txn->claims.end());
+  txn->locks.erase(txn->locks.begin() + static_cast<std::ptrdiff_t>(m.locks), txn->locks.end());
+  txn->written.erase(txn->written.begin() + static_cast<std::ptrdiff_t>(m.written), txn->written.end());
+  txn->held = m.held;
+  txn->recount_marks();
+  txn_trim_reservation(txn);
+}
+
 // Aborts the transaction: a failed statement leaves only bc_txn_free, so
 // what it holds goes now, the snapshot that keeps disk blocks first. The
-// contexts begun on it are detached; each keeps its error.
+// contexts begun on it are detached; each keeps its error. A transaction
+// with marks may be rolled back to one (bc_txn_rollback_to): it keeps its
+// snapshot and catalog, and goes back to its newest mark, so what the
+// failed statements wrote goes now all the same.
 void txn_abort(bc_txn* txn) noexcept {
   txn->aborted = true;
   txn_drop_context(txn);
+  if (!txn->marks.empty()) {
+    txn_restore(txn, txn->marks.back());
+    return;
+  }
   txn->snap.reset();
   txn->pinned.reset();
   txn->overlay = std::make_shared<Overlay>();  // a pin keeps the one it holds
@@ -3392,7 +3463,10 @@ bool bc_txn_add(bc_ctx* cx) {
   auto writes = std::ranges::any_of(cx->effects, [](const Effect& e) {
     return e.kind == EffectKind::Put || e.kind == EffectKind::Del || e.kind == EffectKind::DelRange;
   });
-  if (writes) (void)txn->own_overlay();  // before the first write: a clone that fails changes nothing
+  if (writes) {
+    (void)txn->own_overlay();  // before the first write: a clone that fails changes nothing
+    txn->recount_marks();      // a mark that shared the overlay keeps the copy: charged now
+  }
   for (auto& e : cx->effects) {
     switch (e.kind) {
       case EffectKind::Put: txn->overlay->put(std::move(e.a), std::move(e.b)); break;
@@ -3449,6 +3523,58 @@ bool bc_txn_add(bc_ctx* cx) {
   BC_GUARD_END(cx)
   if (txn != nullptr) txn_abort(txn);
   return false;
+}
+
+uint32_t bc_txn_savepoint(bc_txn* txn) {
+  BC_GUARD_BEGIN
+  txn->sink().clear();
+  if (txn->aborted || txn->done || txn->attached != nullptr) {
+    txn->sink().fail(BC_E_HANDLE, txn->done      ? "the transaction has ended"
+                                  : txn->aborted ? "the transaction is aborted"
+                                                 : "a statement of this transaction is still open on a context: reset it first");
+    return 0;
+  }
+  if (txn->marks.size() >= std::numeric_limits<std::uint32_t>::max()) {
+    txn->sink().fail(BC_E_LIMIT, "too many savepoints");
+    return 0;
+  }
+  // The mark shares the overlay: it charges nothing until a write clones it.
+  txn->marks.push_back(TxnMark{txn->overlay, txn->guards.size(), txn->claims.size(), txn->locks.size(),
+                               txn->written.size(), txn->held});
+  return static_cast<std::uint32_t>(txn->marks.size());
+  BC_GUARD_END(txn)
+  return 0;  // nothing was pushed: the transaction is as it was
+}
+
+bool bc_txn_rollback_to(bc_txn* txn, uint32_t depth) {
+  BC_GUARD_BEGIN
+  txn->sink().clear();
+  if (txn->done || depth == 0 || depth > txn->marks.size() || txn->attached != nullptr) {
+    txn->sink().fail(BC_E_HANDLE, "bc_txn_rollback_to needs a live mark of a transaction with no statement open");
+    return false;
+  }
+  // Allocates nothing: the marks above go, and the vectors are cut back.
+  txn->marks.erase(txn->marks.begin() + depth, txn->marks.end());
+  txn_restore(txn, txn->marks.back());
+  txn->aborted = false;
+  return true;
+  BC_GUARD_END(txn)
+  return false;  // only a refusal's message can throw, before anything changed
+}
+
+bool bc_txn_release(bc_txn* txn, uint32_t depth) {
+  BC_GUARD_BEGIN
+  txn->sink().clear();
+  if (txn->aborted || txn->done || depth == 0 || depth > txn->marks.size() || txn->attached != nullptr) {
+    txn->sink().fail(BC_E_HANDLE, "bc_txn_release needs a live mark of an open transaction with no statement open");
+    return false;
+  }
+  txn->marks.erase(txn->marks.begin() + (depth - 1), txn->marks.end());
+  txn->recount_marks();
+  txn_trim_reservation(txn);
+  return true;
+  BC_GUARD_END(txn)
+  return false;  // only a refusal's message can throw, before anything changed
 }
 
 enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {

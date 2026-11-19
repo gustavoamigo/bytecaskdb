@@ -25,7 +25,8 @@ In:
 - the simple query protocol (`Query`), and the extended one (`Parse`,
   `Bind`, `Describe`, `Execute`, `Sync`, `Close`, `Flush`);
 - text-format parameters and results, with each type's PostgreSQL OID;
-- `BEGIN`, `COMMIT` and `ROLLBACK` as SQL statements;
+- `BEGIN`, `COMMIT` and `ROLLBACK` as SQL statements, and `SAVEPOINT`,
+  `ROLLBACK TO` and `RELEASE`;
 - one session per connection;
 - errors as `ErrorResponse`, with PostgreSQL's SQLSTATE for every error the
   layer raises;
@@ -340,8 +341,10 @@ must still change it:
 The rules:
 - `BEGIN` makes the block explicit: `T`.
 - Any `ErrorResponse` inside an explicit block makes it `E`, whatever
-  raised it. The server rolls back the `Transaction` if it is still open.
-- In `E`, every statement but `COMMIT` and `ROLLBACK` is `25P02`, checked
+  raised it. The server aborts the `Transaction` if it is still open
+  (`Transaction::fail`), which keeps its savepoints.
+- `ROLLBACK TO` a savepoint in `E` returns the block to `T`.
+- In `E`, every statement but `COMMIT`, `ROLLBACK` and `ROLLBACK TO` is `25P02`, checked
   by the session before anything reaches the layer. As in PostgreSQL, a
   statement that does not parse reports its syntax error instead: it is
   parsed first, and refused before it is bound.
@@ -373,8 +376,11 @@ exposes as calls, not as statements.
   `REPEATABLE READ` asks and more than the other two do. `SERIALIZABLE` is
   `0A000`, because snapshot isolation allows write skew and the guards that
   would prevent it are not built. `SET TRANSACTION` outside a block is
-  `WARNING 25P01`; an isolation level, or `READ WRITE` after `READ ONLY`,
-  once the block has run a statement is `25001`. `SET LOCAL TRANSACTION`
+  `WARNING 25P01`; once the block has run a statement, an isolation level
+  other than the block's own (`READ COMMITTED` unless `BEGIN` or an earlier
+  `SET TRANSACTION` named another), or `READ WRITE` after `READ ONLY`, is
+  `25001`. The block's own level is taken, as PostgreSQL's
+  `check_transaction_isolation` takes any level that does not change it. `SET LOCAL TRANSACTION`
   and `SET SESSION TRANSACTION` are `SET TRANSACTION`, as in PostgreSQL:
   the modes last for the open block either way. `SET SESSION
   CHARACTERISTICS AS TRANSACTION` is `0A000`.
@@ -388,6 +394,17 @@ exposes as calls, not as statements.
   status*). With no transaction open, `COMMIT` is `WARNING 25P01` and the tag `COMMIT`.
 - **`ROLLBACK`** calls `rollback()`; the tag is `ROLLBACK`. With no
   transaction open it is `WARNING 25P01`.
+- **`SAVEPOINT name`, `ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] name`
+  and `RELEASE [SAVEPOINT] name`** call `savepoint()`, `rollback_to()` and
+  `release()`, with the tags `SAVEPOINT`, `ROLLBACK` and `RELEASE`. They are
+  read by PostgreSQL's grammar (`ast::parse_savepoint`), which folds an
+  unquoted name. Outside an explicit block each is the error `25P01`, as in
+  PostgreSQL; an unknown name is `3B001`. The block's savepoints keep the
+  read-only mode they were taken in, and `ROLLBACK TO` and `RELEASE` restore
+  it; while one is open, an isolation level other than the block's own is
+  `25001`, and so is `READ WRITE` in a read-only block
+  (`transaction_design.md`, *Savepoints*). A syntax error in these statements reports the end
+  of input where PostgreSQL, given the trailing `;`, names the `;`.
 
 - **`SET [SESSION] client_encoding {TO | =} 'UTF8'`**, or another encoding
   startup takes, is the one `SET` taken: the tag is `SET`, with a
