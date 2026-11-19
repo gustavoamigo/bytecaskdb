@@ -11,7 +11,9 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <functional>
 #include <future>
+#include <map>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -52,8 +54,8 @@ auto constant(const std::vector<Catalog::PlanConstant>& cs, std::string_view n) 
   return it->value;
 }
 
-// A row of t, written straight to the engine.
-void put_t_row(DB& db, const Catalog& cat, std::int64_t id, std::string_view name, std::int64_t qty) {
+// A row of t: its primary key and its row.
+auto t_row(const Catalog& cat, std::int64_t id, std::string_view name, std::int64_t qty) -> std::pair<Bytes, Bytes> {
   const auto& t = *cat.table("t");
   RowWriter w{t.layout};
   REQUIRE(w.set_i64(t.column("id")->id, id));
@@ -62,7 +64,35 @@ void put_t_row(DB& db, const Catalog& cat, std::int64_t id, std::string_view nam
   Bytes row, pk;
   REQUIRE(w.finish(row));
   REQUIRE(encode_pk_from_row(t, row, pk));
+  return {std::move(pk), std::move(row)};
+}
+
+// A row of t, written straight to the engine.
+void put_t_row(DB& db, const Catalog& cat, std::int64_t id, std::string_view name, std::int64_t qty) {
+  auto [pk, row] = t_row(cat, id, name, qty);
   db.put({}, pk, row);
+}
+
+// Rows held in memory, not in a snapshot: what a backfill reads in a
+// transaction is its view, not the engine's.
+class MapRows final : public RowSource {
+public:
+  std::map<Bytes, Bytes> rows;
+  void scan(BytesView prefix, const std::function<void(BytesView, BytesView)>& visit) const override {
+    for (auto it = rows.lower_bound(Bytes{prefix.begin(), prefix.end()}); it != rows.end(); ++it) {
+      if (!has_prefix(it->first, prefix)) break;
+      visit(it->first, it->second);
+    }
+  }
+};
+
+// The keys `ops` puts under `prefix`.
+auto puts_under(const std::vector<Catalog::DdlOp>& ops, const Bytes& prefix) -> std::vector<Bytes> {
+  std::vector<Bytes> out;
+  for (const auto& op : ops) {
+    if (op.kind == Catalog::DdlOp::Kind::Put && has_prefix(op.a, prefix)) out.push_back(op.a);
+  }
+  return out;
 }
 
 // Every key in the engine starting with `prefix`.
@@ -930,6 +960,61 @@ TEST_CASE("catalog: a backfill past the batch limit is refused before it gathers
   live.set_backfill_limit_for_testing(LiveCatalog::kMaxBackfillBytes);
   (void)live.apply(CreateIndexDdl{"t_by_name", "t", {{"name"}}});
   CHECK(count_prefix(db, prefix_of(kNsIndex, 3)) == 50);
+}
+
+TEST_CASE("catalog: a backfill reads the rows of its RowSource, not the engine's", "[sql][catalog]") {
+  sql_test::TempDir dir{"catalog_row_source"};
+  auto db = DB::open(dir.path());
+  LiveCatalog live{db};
+  (void)live.apply(create_t());
+  auto cat = live.current();
+  // The engine holds rows 1 and 2; the source holds rows 1 and 3.
+  put_t_row(db, *cat, 1, "bob", 10);
+  put_t_row(db, *cat, 2, "amy", 20);
+  MapRows source;
+  source.rows.insert(t_row(*cat, 1, "bob", 10));
+  source.rows.insert(t_row(*cat, 3, "cy", 30));
+  const auto& t = *cat->table("t");
+
+  SECTION("CREATE INDEX indexes the source's rows") {
+    std::vector<Catalog::DdlOp> ops;
+    auto backfill = false;
+    auto next = cat->next_version(CreateIndexDdl{"t_by_name", "t", {{"name"}}}, source, ops, backfill,
+                                  LiveCatalog::kMaxBackfillBytes);
+    REQUIRE(next != nullptr);
+    CHECK(backfill);
+    const auto& ix = next->table("t")->indexes.at(0);
+    std::vector<Bytes> want;
+    for (const auto& [pk, row] : source.rows) {
+      Bytes k;
+      REQUIRE(encode_index_key_from_row(*next->table("t"), ix, row, k));
+      want.push_back(std::move(k));
+    }
+    CHECK(puts_under(ops, prefix_of(kNsIndex, ix.id)) == want);
+  }
+  SECTION("ADD COLUMN … DEFAULT rewrites the source's rows") {
+    std::vector<Catalog::DdlOp> ops;
+    auto backfill = false;
+    auto next = cat->next_version(AddColumnDdl{"t", col("x", SqlKind::BigInt, true, std::int64_t{7})}, source, ops,
+                                  backfill, LiveCatalog::kMaxBackfillBytes);
+    REQUIRE(next != nullptr);
+    CHECK(backfill);
+    std::vector<Bytes> want;
+    for (const auto& [pk, row] : source.rows) want.push_back(pk);
+    CHECK(puts_under(ops, row_prefix(t.id)) == want);
+  }
+  SECTION("a unique index over the source's duplicates is refused, though the engine's rows are unique") {
+    source.rows.insert(t_row(*cat, 4, "bob", 40));
+    std::vector<Catalog::DdlOp> ops;
+    auto backfill = false;
+    CHECK_THROWS_AS((void)cat->next_version(CreateIndexDdl{"t_name_u", "t", {{"name"}}, true}, source, ops, backfill,
+                                            LiveCatalog::kMaxBackfillBytes),
+                    ConstraintViolation);
+  }
+  SECTION("an autocommit DDL reads the engine's snapshot") {
+    (void)live.apply(CreateIndexDdl{"t_by_name", "t", {{"name"}}});
+    CHECK(count_prefix(db, prefix_of(kNsIndex, live.current()->table("t")->indexes.at(0).id)) == 2);
+  }
 }
 
 TEST_CASE("catalog: name entries and records must agree at load", "[sql][catalog]") {

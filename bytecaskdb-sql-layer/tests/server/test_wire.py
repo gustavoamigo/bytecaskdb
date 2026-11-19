@@ -2545,6 +2545,26 @@ def test_a_ddl_parsed_in_a_block_and_never_executed_leaves_it_open(server):
     assert columns(q(c, "SELECT * FROM r")) == ["k", "a"]
 
 
+def test_a_ddl_is_bound_at_execute_and_a_query_at_parse(server):
+    """docs/transaction_design.md, stage 1, as PostgreSQL 17: Parse and
+    Describe of a DDL naming a table that does not exist are no error, its
+    Execute is 42P01, and once the table exists the same statement runs.
+    A query's binder error is still Parse's."""
+    c = connect(server)
+    c.send(parse("CREATE INDEX x_a ON x (a)", "ix"), describe("S", "ix"), SYNC)
+    out = c.until_ready()
+    assert states(out) == [] and status(out) == "I"
+    c.send(bind([], "ix"), execute(), SYNC)
+    out = c.until_ready()
+    assert states(out) == ["42P01"] and status(out) == "I"
+    q(c, "CREATE TABLE x (k INTEGER PRIMARY KEY, a INTEGER)")
+    c.send(bind([], "ix"), execute(), SYNC)
+    out = c.until_ready()
+    assert states(out) == [] and status(out) == "I"
+    c.send(parse("SELECT a FROM nosuch", "sel"), SYNC)
+    assert states(c.until_ready()) == ["42P01"]
+
+
 def test_a_parsed_int4_parameter_assigned_to_a_column_now_bigint_is_range_checked_as_int4(server):
     """PostgreSQL's Bind reads the value as the type fixed at Parse: 22003
     for 5000000000 sent for an int4 $n, whatever column it is assigned to."""

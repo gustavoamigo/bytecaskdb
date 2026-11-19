@@ -511,7 +511,9 @@ its pin, and otherwise compiles the statement privately at the pin.
 
 ## DDL
 
-Every DDL statement is one atomic batch: the table record, the name entries
+A DDL statement is bound when it runs, against the catalog it runs in, not
+when it is prepared (`frontend_design.md`, *Binding*). Every DDL statement
+is one atomic batch: the table record, the name entries
 and the counters, plus the rows a backfill writes or the ranges a drop
 deletes. It is built on a snapshot and guarded by `ensure_unchanged` on the
 catalog version, so a second writer of the catalog makes it a conflict
@@ -553,7 +555,12 @@ from the snapshot and write in the same batch as the catalog record, so the
 index or column exists with all its entries or not at all, with no state in
 between for a plan to see. The range guard makes a write to the table that
 commits during the backfill a conflict; the DDL is retried up to three
-times on a fresh snapshot and then fails. A backfill counts the bytes it
+times on a fresh snapshot and then fails. `Catalog::next_version` reads
+the rows through a `RowSource`, an ordered scan of one key prefix:
+autocommit DDL gives it its snapshot (`SnapshotRows`), and a DDL in a
+transaction will give it the transaction's view of its snapshot and its own
+writes (`transaction_design.md`, *Mechanism: the transaction's private
+catalog*). A backfill counts the bytes it
 gathers and is refused, with an error that says so, as soon as they pass the
 1 GiB limit, before it has read the rest of the table into memory. The alternative, batches written
 while the index is invisible to reads but maintained by writes, needs an

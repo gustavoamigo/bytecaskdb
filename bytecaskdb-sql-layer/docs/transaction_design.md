@@ -668,7 +668,7 @@ reason.
 
 ## Transactional DDL
 
-Status: **design, approved by the owner on 2026-11-19. Stage 0 is built; stages 1 to 4 are not.** Where building stage 0 found the design incomplete against the code, the stage's entry says what was done instead (*Stage 0 as built*). The owner's answers are recorded in *Owner's decisions on transactional DDL*. Stage 0 comes first, and edits *DDL during an open transaction* (stage 0's *Docs*). Once transactional DDL is built, this section replaces *DDL during an open transaction*, and the edits listed under *Edits to this document once transactional DDL is built* are made.
+Status: **design, approved by the owner on 2026-11-19. Stages 0 and 1 are built; stages 2 to 4 are not.** Where building a stage found the design incomplete against the code, the stage's entry says what was done instead (*Stage 0 as built*, *Stage 1 as built*). The owner's answers are recorded in *Owner's decisions on transactional DDL*. Stage 0 comes first, and edits *DDL during an open transaction* (stage 0's *Docs*). Once transactional DDL is built, this section replaces *DDL during an open transaction*, and the edits listed under *Edits to this document once transactional DDL is built* are made.
 
 This section applies the two standing rules: do what PostgreSQL does, and never wait. Behaviour observed on PostgreSQL 17.12 is cited as "PG 17".
 
@@ -988,6 +988,13 @@ Each stage is one PR that ships on its own. Each says what it still refuses, upd
   - a DDL with a binder error prepares and throws at execute; a non-DDL statement's binder error is still thrown at prepare;
   - a `RowSource` test backfills from a source that is not a snapshot.
 - Still refused: everything refused today.
+
+**Stage 1 as built.**
+- **`SnapshotRows` adapts a `Snapshot`.** `Snapshot` is the engine's type, and no stage changes the engine, so it cannot implement `RowSource` itself. `RowSource` is an interface of the catalog module with one call, `scan(prefix, visit)`; `SnapshotRows` implements it over a snapshot, and `LiveCatalog::prepare` passes one. Stage 2's view of the transaction implements it too.
+- **`Catalog::next_version` is public**, as stage 2's `Transaction` calls it outside `LiveCatalog`; the `RowSource` test calls it with a source that is not a snapshot.
+- **A DDL with a binder error is cached** like any other DDL text, as its parse: before, `prepare` threw and cached nothing.
+- **Over the wire**, Parse and Describe of a DDL with a binder error are no error, and its Execute is: PostgreSQL 17 does the same (`test_a_ddl_is_bound_at_execute_and_a_query_at_parse`).
+- `CREATE TABLE AS` and `SELECT … INTO` bind their query at prepare, as before; stage 4 makes them transactional.
 
 **Stage 2: DDL in an embedded `Transaction`.**
 - All `Ddl` variants except CREATE TABLE AS run in a transaction, with `bc_txn::catalog`, `bc_txn_ddl`, `Published` and `TxnCatalog`, marks that carry the catalog, the 55006 rule, the doomed check, the commit classification, and the commit through `LiveCatalog::commit`. Stage 0's private plans are compiled against `txn->catalog`; `Transaction::prepare` is added.
