@@ -9,10 +9,11 @@
 //
 // Values cross as Python values by the column's SQL type: integers as int,
 // DOUBLE PRECISION and REAL as float, BOOLEAN as bool, BYTEA as bytes, TEXT
-// and VARCHAR as str, DECIMAL as decimal.Decimal; the date and time types
+// and VARCHAR as str, DECIMAL and NUMERIC as decimal.Decimal; the date and time types
 // as their stored integer. Parameters are a list or a tuple, and go by
 // Python type: None, bool, int (within BIGINT), float, str (as UTF-8, so
-// not one with a lone surrogate) and bytes. Any other params object, a str,
+// not one with a lone surrogate), bytes, and decimal.Decimal as its text,
+// as a str (for a NUMERIC column; a string column stores the text). Any other params object, a str,
 // a buffer (bytes, bytearray, memoryview), a dict or a set among them, is
 // refused: its items are not the placeholders' values in order.
 //
@@ -134,7 +135,16 @@ auto to_datum(nb::handle v, std::size_t i) -> sql::Value {
     auto b = nb::cast<nb::bytes>(v);
     return to_bytes({b.c_str(), b.size()});
   }
-  throw sql::ParamError(param + " is not None, bool, int, float, str or bytes");
+  // A decimal.Decimal: its text, as a str is, which a NUMERIC column reads as
+  // numeric_in does ("1.50", "1E+2", "NaN"). It is not tagged as a numeric:
+  // a TEXT, VARCHAR or BYTEA column stores the text, where PostgreSQL
+  // refuses a numeric (42804); a DECIMAL(p, s) or other typed column
+  // refuses it as a parameter of the wrong type.
+  if (nb::isinstance(v, decimal_type)) {
+    auto text = nb::cast<std::string>(nb::str(v));
+    return to_bytes(text);
+  }
+  throw sql::ParamError(param + " is not None, bool, int, float, str, bytes or decimal.Decimal");
 }
 
 auto bytes_view(const sql::Bytes& b) -> std::string_view {

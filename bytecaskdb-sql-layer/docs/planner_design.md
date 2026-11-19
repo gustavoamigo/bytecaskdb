@@ -1519,7 +1519,9 @@ covering-scan key part, a subquery's IN set, a hash join's key, a sort key
 part (ORDER BY, GROUP BY, DISTINCT), a set operation's ORDER BY key or its
 dedupe group key, a comparison, and a procedure variable. Its SQL type
 is a kind of its own, `SqlKind::Numeric`, PostgreSQL's numeric of no
-declared precision, which no column has; a result row carries its value as
+declared precision, the type of a NUMERIC column declared without one
+(`types_design.md`, *NUMERIC without a precision*), which CREATE TABLE AS
+does not map an AVG to yet; a result row carries its value as
 its text, and every reader of `Rows` (the Python binding, `pg_text`, the
 harness) decides by the kind. Its sum is an
 integer sum, as `SUM`'s, with its 64-bit limit (`frontend_design.md`,

@@ -1727,8 +1727,9 @@ namespace {
 // The table CREATE TABLE AS makes of a query's result columns, in
 // PostgreSQL's order of refusals: more names than columns (42601), then a
 // name twice (42701). A column of no type a table holds yet is refused
-// (0A000): a NUMERIC of no declared precision (an AVG, a literal 1.5),
-// until such columns exist; and a table of no columns, which a CreateTableDdl
+// (0A000): a NUMERIC of no declared precision (a NUMERIC column, an AVG, a
+// literal 1.5), which a NUMERIC column could hold but CTAS does not map to
+// one yet; and a table of no columns, which a CreateTableDdl
 // with none would read as a skip. VARCHAR of no length is TEXT, as a column
 // declared so is.
 auto ctas_columns(const ast::CreateTableAs& ctas, const std::vector<std::string>& names,
@@ -1751,9 +1752,10 @@ auto ctas_columns(const ast::CreateTableAs& ctas, const std::vector<std::string>
   for (auto& c : out) {
     if (c.sql.kind == SqlKind::Varchar && c.sql.length == 0) c.sql = SqlType{SqlKind::Text};
     if (c.sql.kind == SqlKind::Numeric || (c.sql.kind == SqlKind::Decimal && c.sql.precision == 0)) {
+      // Only a constant's cast is taken: a NUMERIC column's or an AVG's is not.
       throw FeatureNotSupported(std::string{what} + " of column \"" + c.name +
-                                "\", a numeric of no declared precision, is not supported yet: cast it to "
-                                "NUMERIC(p, s)");
+                                "\", a numeric of no declared precision, is not supported yet" +
+                                (c.sql.kind == SqlKind::Decimal ? ": cast it to NUMERIC(p, s)" : ""));
     }
     if (!sql_type_valid(c.sql)) {
       throw FeatureNotSupported(std::string{what} + " of column \"" + c.name + "\" of type " +

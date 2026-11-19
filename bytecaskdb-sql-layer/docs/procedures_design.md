@@ -240,7 +240,7 @@ u16 nargs { u8 mode, str name, u8 kind, u32 length, u8 precision, u8 scale }
 
 | Part | Accepted | Refused |
 |---|---|---|
-| Arguments | `IN` (the default), `INOUT`, `OUT`, named, of any column type of `types_design.md` | `VARIADIC`; an unnamed argument; a `DEFAULT`; a type the layer lacks, such as `NUMERIC` without a precision (0A000 or 42601, as a column of that type is); two arguments of one name (42P13) |
+| Arguments | `IN` (the default), `INOUT`, `OUT`, named, of any column type of `types_design.md` | `VARIADIC`; an unnamed argument; a `DEFAULT`; a type the layer lacks, or `NUMERIC` without a precision, which only a column takes yet (0A000 or 42601); two arguments of one name (42P13) |
 | Language | `LANGUAGE plpgsql` | any other language, `BEGIN ATOMIC` bodies (0A000) |
 | Options | none | `SECURITY DEFINER`, `SET`, any other option (0A000) |
 | Body | PL/pgSQL that `pg_query_parse_plpgsql` reads | a body that does not parse (42601) |

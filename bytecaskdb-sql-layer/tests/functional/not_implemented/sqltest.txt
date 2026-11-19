@@ -6,9 +6,6 @@
 # with its SQLSTATE and message. The layer speaks PostgreSQL's dialect, so these stay
 # here: the report counts them and gives the coverage of the tests PostgreSQL accepts
 # (docs/functional_testing_design.md, *The PostgreSQL ceiling*).
-e011_03_01_03  # NUMERIC, DEC and DECIMAL without a precision is arbitrary precision: a DECIMAL is stored in 64 bits, so it needs a precision (#714)
-e011_03_01_06  # NUMERIC, DEC and DECIMAL without a precision is arbitrary precision: a DECIMAL is stored in 64 bits, so it needs a precision (#714)
-e011_03_01_09  # NUMERIC, DEC and DECIMAL without a precision is arbitrary precision: a DECIMAL is stored in 64 bits, so it needs a precision (#714)
 e021_01_01_02  # not PostgreSQL: CHARACTERS or OCTETS after the length; PostgreSQL 17 gives 42601, "syntax error at or near "CHARACTERS""
 e021_01_01_03  # not PostgreSQL: CHARACTERS or OCTETS after the length; PostgreSQL 17 gives 42601, "syntax error at or near "OCTETS""
 e021_01_01_06  # not PostgreSQL: CHARACTERS or OCTETS after the length; PostgreSQL 17 gives 42601, "syntax error at or near "CHARACTERS""

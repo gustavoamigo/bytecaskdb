@@ -543,7 +543,12 @@ enum bc_type { BC_T_I64 = 1, BC_T_F64 = 2, BC_T_BOOL = 3, BC_T_BYTES = 4, BC_T_N
 
 `BC_T_NUM` is PostgreSQL's `numeric` as its text (`numeric_out`), held as a
 view, as bytes are: a result or subquery column a plan computes and emits
-(today an `AVG` of an integer or a `DECIMAL`), never a key's part. The
+(an `AVG` of an integer or a `DECIMAL`), or a column declared `NUMERIC`
+without a precision, never a key's part. A column of it is read with
+`bc_col_bytes` and set with `bc_row_set_bytes` or `bc_row_set_param`, which
+store the text as PostgreSQL's `numeric_in` reads it, written back as
+`numeric_out` writes it, and refuse text that is no number with
+`BC_C_RANGE` (22P02, or 22003 past numeric's format). The
 compiler refuses to key, compare or deduplicate one (`std::logic_error`),
 and the runtime's key builders refuse one the same way.
 
@@ -901,7 +906,7 @@ bool     bc_col_null(bc_ctx *, bc_view row, uint32_t col);   /* the bitmap bit: 
 int64_t  bc_col_i64(bc_ctx *, bc_view row, uint32_t col);
 double   bc_col_f64(bc_ctx *, bc_view row, uint32_t col);
 bool     bc_col_bool(bc_ctx *, bc_view row, uint32_t col);
-bc_view  bc_col_bytes(bc_ctx *, bc_view row, uint32_t col); /* a sub-view; same lifetime as row */
+bc_view  bc_col_bytes(bc_ctx *, bc_view row, uint32_t col); /* a sub-view; same lifetime as row; a NUMERIC's text */
 bc_view  bc_col_key(bc_ctx *, bc_view row, uint32_t col);   /* the value as a mem-comparable key part */
 bc_view  bc_row_key(bc_ctx *, uint32_t table, bc_view row);  /* the row's primary key, from its columns */
 
@@ -910,7 +915,7 @@ bc_row   bc_row_from(bc_ctx *, uint32_t table, bc_view old);  /* copy, then over
 void     bc_row_set_i64(bc_ctx *, bc_row, uint32_t col, int64_t);
 void     bc_row_set_f64(bc_ctx *, bc_row, uint32_t col, double);
 void     bc_row_set_bool(bc_ctx *, bc_row, uint32_t col, bool);
-void     bc_row_set_bytes(bc_ctx *, bc_row, uint32_t col, bc_view);
+void     bc_row_set_bytes(bc_ctx *, bc_row, uint32_t col, bc_view);  /* a NUMERIC column: text read as numeric_in */
 void     bc_row_set_null(bc_ctx *, bc_row, uint32_t col);
 void     bc_row_set_param(bc_ctx *, bc_row, uint32_t col, uint32_t i);   /* parameter i, NULL included */
 bc_view  bc_row_end(bc_ctx *, bc_row);

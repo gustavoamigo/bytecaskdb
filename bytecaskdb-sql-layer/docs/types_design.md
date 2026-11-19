@@ -8,7 +8,7 @@ call, and the two on-disk formats: the key encoding and the row format,
 which the MariaDB plugin would share (*What the plugin adopts*). Nothing in
 the engine changes for it.
 
-The plan API deals in `i64`, `f64`, `bool` and `bytes`. Everything SQL knows
+The plan API deals in `i64`, `f64`, `bool` and `bytes`, and `num`, a NUMERIC's text held as bytes are. Everything SQL knows
 beyond those four is a rule the compiler applies: a scale, an epoch, a range
 check, a collation. Those rules live here.
 
@@ -25,23 +25,56 @@ bind error with the position of the type name.
 | `BYTEA` | `bytes` | The bytes. |
 | `TEXT`, `VARCHAR(n)` | `bytes` | UTF-8. Compared as bytes (binary collation). `n` counts code points and is a catalog property, checked on assignment. |
 | `CHAR(n)`, `CHARACTER(n)` (`CHAR` is `CHAR(1)`) | `bytes` | UTF-8 without its trailing spaces, tag `SqlKind::Char` (16). `n` counts code points and is a catalog property. A result returns it padded with spaces to `n` code points (*CHAR(n)*). |
-| `DECIMAL(p, s)`, `NUMERIC(p, s)`, p ≤ 18 | `i64` | The value times 10^s, exactly. `p` and `s` are catalog properties of the column. `s` defaults to 0; `p` is required. |
+| `DECIMAL(p, s)`, `NUMERIC(p, s)`, p ≤ 18 | `i64` | The value times 10^s, exactly. `p` and `s` are catalog properties of the column. `s` defaults to 0. |
+| `NUMERIC`, `DECIMAL`, `DEC` without a precision | `num` (`PhysType::Num`) | PostgreSQL's text of the value (`numeric_out`): every digit and the scale it was written with (1.50 stays 1.50, 1.5e1 is 15.0), `NaN`, `Infinity`, `-Infinity`, in a row's variable region as bytes are. Tag `SqlKind::Numeric` (14). A column's type only (*NUMERIC without a precision*). |
 | `TIMESTAMP` | `i64` | Microseconds since 1970-01-01 00:00:00, no time zone; from 4714-11-24 BC, PostgreSQL's first. |
 | `TIMESTAMP WITH TIME ZONE`, `TIMESTAMPTZ` | `i64` | The same microseconds, as an instant in UTC; told apart from `TIMESTAMP` by its catalog type tag (`SqlKind::TimestampTz`, 15), not by its bytes. Keys and rows encode it as a `TIMESTAMP`. |
 | `DATE` | `i64` | Days since 1970-01-01, in PostgreSQL's range: 4714-11-24 BC to 5874897-12-31. |
 | `TIME` | `i64` | Microseconds since midnight, in [0, 86 400 000 000]: 24:00:00 included, as in PostgreSQL. |
 
-A result has one more type no column has: `NUMERIC` of no declared
-precision (`SqlKind::Numeric`), `AVG`'s, carried in a result row as its
-text, since its digits can pass 64 bits (`planner_design.md`, *Aggregates*). A `SUM` of a `BIGINT` or `DECIMAL` is a `DECIMAL` of no declared
-precision, its scaled `i64`.
+`AVG` of an integer or `DECIMAL` is a `NUMERIC` of no declared precision
+too, carried in a result row as its text, since its digits can pass 64
+bits (`planner_design.md`, *Aggregates*). A `SUM` of a `BIGINT` or
+`DECIMAL` is a `DECIMAL` of no declared precision, its scaled `i64`.
 
-Rejected, each for a reason that is not "later": `NUMERIC` with
-no precision or with p > 18 (does not fit `i64`); `CHAR(8 CHARACTERS)`
+Rejected, each for a reason that is not "later": `NUMERIC(p, s)` with
+p > 18 (does not fit `i64`); `CHAR(8 CHARACTERS)`
 and `CHAR(8 OCTETS)`, which are not PostgreSQL syntax;
 `TIMESTAMP(p) WITH TIME ZONE` for p other than 6, which would round on store; `TIME WITH TIME ZONE`;
 `INTERVAL`, `UUID`, `JSON`, arrays, enums, composite types, `BIT`, `MONEY`,
 `SERIAL` (sequences are a runtime service, deferred in the plan API).
+
+### NUMERIC without a precision
+
+A column declared `NUMERIC`, `DECIMAL` or `DEC` without a precision holds
+a value of any digits, as PostgreSQL's does, stored as its `numeric_out`
+text. Every write reads its value as `numeric_in` reads text (`numeric_in`
+in `sql/text.cppm`): surrounding spaces, an exponent, `_` between digits,
+`0x`, `0o` and `0b` integers, `NaN` and the infinities; at most 131072
+digits before the point and 16383 after (22003, *value overflows numeric
+format*); anything else 22P02. A number literal is read from its text, so
+it is not bounded by `DECIMAL`'s 18 digits; a `DECIMAL(p, s)` or integer
+constant is written at its own scale. The runtime reads a parameter or a
+value set into the column (`bc_row_set_param`, `bc_row_set_bytes`) the same
+way, so the column only ever holds that form, whatever text a client sent;
+bytes that are not UTF-8 are refused before it reads them (22021, as for a
+`TEXT` column). The Python binding sends a `decimal.Decimal` as its text,
+untagged, so a string column takes it as text where PostgreSQL refuses a
+numeric (42804).
+
+Stored as text, its bytes are not its order or its equality (1.5 = 1.50 in
+PostgreSQL), so until the column has an order-preserving key form and
+arithmetic it is carried, never compared: a primary key, unique, index or
+foreign-key column of it, a comparison (WHERE, ON, a join's USING, a
+parameter beside it), ORDER BY, GROUP BY, DISTINCT, a set operation other
+than UNION ALL, arithmetic, an aggregate other than COUNT, a cast of it or
+to it, a subquery of it, a domain or a procedure argument of it are 0A000.
+A comparison with a value of no number type is PostgreSQL's 42883 (no
+operator, `numeric = boolean`), and a string literal that is no number
+22P02, before the 0A000.
+It is written, read, returned (RETURNING, a view's column), tested with IS
+[NOT] NULL, counted, defaulted (DEFAULT, ADD COLUMN) and carried by CASE and
+COALESCE of NUMERICs and by INSERT … SELECT from another NUMERIC.
 
 The plan language has one integer type: a column declared `INTEGER` is an
 `i64` in every `bc_*` call, and `2147483647 + 1` is not an overflow but an

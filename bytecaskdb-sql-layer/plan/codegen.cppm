@@ -186,8 +186,9 @@ auto key_suffix(PhysType t) -> std::string {
   return suffix(t);
 }
 
-// The suffix of a sort key part that only carries a value of type t, never
-// orders by it: a NUMERIC rides as its text, bytes.
+// The suffix of a call that only carries a value of type t, never orders or
+// compares it (a sort key part that carries it, a column read or a row's
+// set): a NUMERIC rides as its text, bytes.
 auto carry_suffix(PhysType t) -> std::string { return t == PhysType::Num ? "bytes" : suffix(t); }
 
 // One line of the plan's header, as a // comment. SQL and names are the
@@ -374,7 +375,7 @@ auto c_type(PhysType t) -> std::string {
 }
 
 auto param(PhysType t, std::uint32_t n) -> std::string {
-  return "bc_param_" + suffix(t) + "(cx, " + std::to_string(n) + ")";
+  return "bc_param_" + carry_suffix(t) + "(cx, " + std::to_string(n) + ")";
 }
 
 // An int64_t constant as C text: INT64_MIN has no literal.
@@ -759,7 +760,7 @@ private:
     const auto& b = binding(c.table);
     if (b.derived) return b.row + "_v" + std::to_string(c.col);
     if (b.covering) return "bc_key_part_" + key_suffix(c.type) + "(cx, " + key_part(b, c);
-    return "bc_col_" + suffix(c.type) + "(cx, " + row_of(c) + ", " + w_.col(c) + ")";
+    return "bc_col_" + carry_suffix(c.type) + "(cx, " + row_of(c) + ", " + w_.col(c) + ")";
   }
   auto col_null(const ColumnRef& c) -> std::string {
     const auto& b = binding(c.table);
@@ -2233,7 +2234,7 @@ private:
       auto j = key_index(g, c);
       if (auto row = held_row(g, c)) {
         return {"bc_col_null(cx, " + *row + ", " + w_.col(c) + ")",
-                "bc_col_" + suffix(c.type) + "(cx, " + *row + ", " + w_.col(c) + ")"};
+                "bc_col_" + carry_suffix(c.type) + "(cx, " + *row + ", " + w_.col(c) + ")"};
       }
       if (g.op->streamed) return {c.nullable ? local("kn", g, j) : "", local("kv", g, j)};
       auto slot = std::to_string(*g.layout.key_slot[j]);
@@ -2858,7 +2859,7 @@ private:
         w.open("if (" + v.null + ")");
         w.line("bc_row_set_null(cx, r, " + w.col(col) + ");");
         w.otherwise();
-        w.line("bc_row_set_" + suffix(col.type) + "(cx, r, " + w.col(col) + ", " + value + ");");
+        w.line("bc_row_set_" + carry_suffix(col.type) + "(cx, r, " + w.col(col) + ", " + value + ");");
         w.close();
       }
       for (const auto& [col, e] : s.fixed) {
@@ -2938,7 +2939,7 @@ private:
       w_.line("bc_row_set_param(cx, r, " + w_.col(col) + ", " + std::to_string(e.param) + ");");
       return;
     }
-    auto store = "bc_row_set_" + suffix(col.type) + "(cx, r, " + w_.col(col) + ", ";
+    auto store = "bc_row_set_" + carry_suffix(col.type) + "(cx, r, " + w_.col(col) + ", ";
     const auto& src = e.kind == Expr::Kind::Column ? e.col : e.args[0].col;
     std::string value, null_if;
     auto null_src = src.nullable ? col_null(src) : "";

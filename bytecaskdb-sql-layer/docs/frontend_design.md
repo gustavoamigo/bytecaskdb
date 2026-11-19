@@ -652,8 +652,9 @@ and with a constant selected or `DISTINCT ON`, it is not taken yet.
   `MIN` or `MAX` of a `DOUBLE PRECISION` column compares a `double
   precision`, in float8 order.
 - `AVG`'s result is PostgreSQL's numeric of no declared precision, a SQL
-  type of its own (`SqlKind::Numeric`): no column has it, and a result row
-  carries its value as its text.
+  type of its own (`SqlKind::Numeric`), the type of a `NUMERIC` column
+  declared without a precision; a result row carries its value as its
+  text. A subquery of it is refused (0A000).
 - `ORDER BY` takes grouped columns; it sorts the groups, and `LIMIT` counts
   them.
 
@@ -871,7 +872,8 @@ written:
 - **Refused (0A000):** `TEMP`, `UNLOGGED`, `WITH (…)`, `USING`,
   `TABLESPACE`, `CREATE MATERIALIZED VIEW` and `CREATE TABLE … AS EXECUTE`;
   a result column of a `NUMERIC` of no declared precision (an `AVG`, a
-  literal `1.5`) until such columns exist; a query of no columns; `INTO` in
+  literal `1.5`, a `NUMERIC` column), whose values the follow-up of
+  `NUMERIC` columns will convert; a query of no columns; `INTO` in
   the first arm of a set operation, which PostgreSQL takes as the
   statement's. `ON COMMIT` is 42P16, as PostgreSQL refuses it on a table that
   is not temporary; `INTO` in another arm is 42601, as there, and in a
@@ -945,8 +947,37 @@ usable yet.
   `nextval`, `currval`, `setval` and `SERIAL`, and every other form of
   `CREATE TYPE`.
 
+**NUMERIC without a precision.** `NUMERIC`, `DECIMAL` and `DEC` without a
+precision declare a column of any digits, stored as PostgreSQL's
+`numeric_out` text, the scale kept (`types_design.md`, *NUMERIC without a
+precision*): written by `INSERT` (a number literal of any digits, a string
+or a `$n` read as `numeric_in` reads it, an integer or `DECIMAL` constant
+at its scale, another `NUMERIC` by `INSERT … SELECT`), `UPDATE`'s `SET` of
+those or of another `NUMERIC` column, `DEFAULT` and `ADD COLUMN`; read,
+returned by `RETURNING` and a view, tested by `IS [NOT] NULL` and `CHECK`
+over that, counted by `COUNT`, and carried by `CASE` and `COALESCE` of
+`NUMERIC`s and `UNION ALL`. Text that is no number is 22P02, past
+numeric's format 22003, not UTF-8 22021; a boolean, string or date value
+`INSERT` or `SET` assigns, or a boolean `DEFAULT`, is 42804, as in
+PostgreSQL (a date `DEFAULT` is 42601, as any non-literal `DEFAULT` is). A
+comparison with a boolean, string or date value is 42883, a string literal
+that is no number 22P02, as in PostgreSQL. A Python `decimal.Decimal`
+parameter is sent as its text, so a string column stores it where
+PostgreSQL refuses it (42804). Refused (0A000) until it has an order and arithmetic: a key,
+`UNIQUE`, index or `FOREIGN KEY` column of it; comparing it (a `WHERE`, an
+`ON`, `USING`, `NATURAL`, `NULLIF`, `IN`, `BETWEEN`, a `$n` beside it);
+`ORDER BY`, `GROUP BY`, `DISTINCT`, `UNION`, `INTERSECT`, `EXCEPT`; `+`,
+`-`, `*`, `/`, `%`, unary `-`, `abs`, `||`; an aggregate but `COUNT`, and
+`COUNT(DISTINCT …)`; a cast of it or to it (`'1.5'::numeric`,
+`$1::numeric`), but a `$n` cast to it assigned to it; a `DOUBLE PRECISION` or `REAL` value assigned
+to it, and it assigned to a column of another type; a subquery of it; a
+domain or procedure argument of it.
+
 **Refused**, with a message and the node's position: everything not above.
 That includes:
+- a `NUMERIC` column without a precision compared, ordered, grouped,
+  computed, aggregated (but by `COUNT`) or cast, or as a key (0A000,
+  *NUMERIC without a precision*);
 - `IS DISTINCT FROM`, and a predicate or a constant in `HAVING`; a
   `NULL` constant under `NOT`, and a string constant as a `WHERE` or `ON`;
 - correlated subqueries but the slice above (#836), nested subqueries and the others above, a subquery in `FROM`, and a derived relation but a grouped view aggregated over;
@@ -1504,8 +1535,8 @@ implemented (`functional_testing_design.md`).
   `CREATE TABLE AS` of a query of no columns (0A000); PostgreSQL accepts a
   table of no columns.
 - **`CREATE TABLE AS` is narrower.** PostgreSQL creates temporary and
-  unlogged tables, columns of a `NUMERIC` of no precision (waiting for
-  that column type), takes `SELECT … INTO` in a set operation's first
+  unlogged tables, columns of a `NUMERIC` of no precision (the layer has
+  the column type, not yet the conversion of a query's values to it), takes `SELECT … INTO` in a set operation's first
   arm, and creates the table of `WITH NO DATA` over a query whose constant
   raises an error; the layer refuses each (0A000).
 - **A set operation cannot be ordered, and its arms are plain.** PostgreSQL

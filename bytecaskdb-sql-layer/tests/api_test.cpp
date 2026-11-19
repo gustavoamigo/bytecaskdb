@@ -3810,7 +3810,7 @@ TEST_CASE("embedded API: CREATE and DROP PROCEDURE are DDL, kept in the catalog 
     CHECK(db->catalog()->procedure("neword")->definition == neword);
     CHECK(state(*db, neword) == "42723");
     CHECK(state(*db, "CREATE PROCEDURE p(a INT, a INT) LANGUAGE plpgsql AS $$ BEGIN END $$") == "42P13");
-    CHECK(state(*db, "CREATE PROCEDURE p(a NUMERIC) LANGUAGE plpgsql AS $$ BEGIN END $$") == "42601");  // no precision
+    CHECK(state(*db, "CREATE PROCEDURE p(a NUMERIC) LANGUAGE plpgsql AS $$ BEGIN END $$") == "0A000");  // no precision: a column's type only
     CHECK(state(*db, "CREATE PROCEDURE p(a INT) LANGUAGE plpgsql AS $$ BEGIN IF END $$") == "42601");
     CHECK(state(*db, "CREATE OR REPLACE PROCEDURE neword(no_w_id BIGINT, INOUT no_c_last VARCHAR(16), OUT total "
                      "NUMERIC(12, 2)) LANGUAGE plpgsql AS $$ BEGIN END $$") == "0A000");  // an overload

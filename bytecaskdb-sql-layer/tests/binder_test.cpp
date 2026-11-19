@@ -725,7 +725,8 @@ TEST_CASE("binder: an uncorrelated subquery is bound to run first, its values in
         "42601 a subquery inside a subquery is not supported yet");
   CHECK(state("SELECT id FROM t WHERE id = (SELECT k, w FROM u)") == "42601 subquery must return only one column");
   CHECK(state("SELECT id FROM t WHERE id IN (SELECT k FROM u FOR UPDATE)") == "42601 FOR UPDATE in a subquery is not supported yet");
-  CHECK(state("SELECT id FROM t WHERE id = (SELECT AVG(k) FROM u)") == "42601 a subquery of AVG is not supported yet");
+  CHECK(state("SELECT id FROM t WHERE id = (SELECT AVG(k) FROM u)") ==
+        "0A000 a subquery of a NUMERIC value (NUMERIC without a precision) is not supported yet");
   CHECK(state("UPDATE t SET qty = (SELECT MAX(k) FROM u) WHERE id = 1") == "42601 a subquery assigned to a column is not supported yet");
   CHECK(state("SELECT id FROM t WHERE id = (SELECT w FROM u)").starts_with("42601 comparing id (bigint) with a subquery of text"));
   CHECK(state("SELECT COUNT(*), (SELECT 1) FROM t") == "42601 a subquery in the select list of an aggregated query is not supported yet");
@@ -1124,7 +1125,6 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
         "the clock's date assigned to a timestamp without time zone column is not supported yet");
   CHECK(rejected(cat, "ALTER TABLE t ADD COLUMN d DATE DEFAULT CURRENT_DATE").first ==
         "ADD COLUMN … DEFAULT of the clock is not supported yet");
-  CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v NUMERIC)").first.starts_with("NUMERIC needs a precision"));
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v NUMERIC(19, 2))").first.starts_with("NUMERIC(19, 2)"));
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v TIMESTAMPTZ DEFAULT 0)").first ==
         "a DEFAULT for type timestamptz is not supported yet");
