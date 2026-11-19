@@ -1970,7 +1970,8 @@ private:
 
   // The tables, by position in FROM order, of the loops whose rows a sort
   // above the candidate holds, outer first: those read above it, by the
-  // result or by a lookup by key repeated there. Every other loop's row is
+  // result or by a lookup by key repeated there, its key or, a left outer
+  // one's, the ON that decides its pairs (#838). Every other loop's row is
   // read only below the sort, for its key, filters and joins, and is not
   // held; with none held, one sorter holds the keys alone.
   static auto held_rels(const Query& q, const Candidate& c) -> std::vector<std::size_t> {
@@ -1978,6 +1979,9 @@ private:
     for (auto i = c.after_first_loop(); i < c.steps.size(); ++i) {
       if (const auto* pr = std::get_if<Probe>(&c.steps[i])) {
         for (const auto& e : pr->key) logical::columns_of(e, read);
+        if (q.rels[pr->rel].outer) {
+          for (const auto& f : pr->filters) logical::columns_of(f, read);
+        }
       }
     }
     std::vector<std::size_t> out;
@@ -2226,15 +2230,21 @@ private:
     return physical::node(physical::Emit{std::move(rows), std::move(targets)});
   }
 
+  // Whether the WHERE makes a column constant: an equality on it. Never a
+  // column of an outer join's right side, whose conjuncts are its ON: a row
+  // the join NULL-extends holds NULL there (#838).
+  static auto made_constant(const Query& q, const ColumnRef& c) -> bool {
+    const auto& rel = q.rels[q.index_of(c.table)];
+    return !rel.outer && std::ranges::any_of(rel.where, [&](const auto& w) { return on_col(w, c.col) && w.op == Op::Eq; });
+  }
+
   // The ORDER BY, without the columns the WHERE makes constant and the keys
   // already ordered by.
   static auto ordered_items(const Query& q, const std::vector<OrderItem>& order_by) -> std::vector<OrderItem> {
     std::vector<OrderItem> out;
     for (const auto& o : order_by) {
       const auto* c = o.column();
-      auto constant = c != nullptr && std::ranges::any_of(q.rels[q.index_of(c->table)].where, [&](const auto& w) {
-        return on_col(w, c->col) && w.op == Op::Eq;
-      });
+      auto constant = c != nullptr && made_constant(q, *c);
       auto repeated = std::ranges::any_of(out, [&](const OrderItem& p) { return p.same_key(o); });
       if (!constant && !repeated) out.push_back(o);
     }
@@ -2529,8 +2539,7 @@ private:
     // grouping: one group of every row, which any plan gives.
     std::vector<ColumnRef> grouping;
     for (const auto& k : keys) {
-      const auto& where = q.rels[q.index_of(k.table)].where;
-      if (std::ranges::none_of(where, [&](const auto& w) { return on_col(w, k.col) && w.op == Op::Eq; })) grouping.push_back(k);
+      if (!made_constant(q, k)) grouping.push_back(k);
     }
     auto distinct = std::ranges::any_of(aggs, [](const Expr& a) { return a.distinct; });
     // A stream keeps its columns in locals, integers and booleans, read from

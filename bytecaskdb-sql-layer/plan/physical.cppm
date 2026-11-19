@@ -1186,6 +1186,9 @@ private:
             auto here = tables_of(*op.outer);
             here.push_back(op.inner);
             for (const auto& c : op.match) {
+              std::vector<ColumnRef> cols;
+              logical::columns_of(c, cols);
+              for (const auto& col : cols) held_above(*op.outer, col);
               if (logical::is_predicate(c)) {
                 predicate(c, here);
                 continue;
