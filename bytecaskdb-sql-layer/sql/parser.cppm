@@ -16,6 +16,7 @@ module;
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -122,15 +123,16 @@ auto expr(const PgQuery__Node* n) -> Expr;
 auto literal(const PgQuery__Node* n) -> Literal;
 auto object_name(const PgQuery__Node* n, std::int32_t pos) -> std::string;
 // `into_taken`: the statement's INTO, which its caller reads (SELECT … INTO);
-// an INTO anywhere else is refused.
-auto select(const PgQuery__SelectStmt* s, std::int32_t pos, bool into_taken = false) -> Select;
+// an INTO anywhere else is refused. `nested`: a subquery's, whose
+// qualifiers may name the query around it (resolve_aliases).
+auto select(const PgQuery__SelectStmt* s, std::int32_t pos, bool into_taken = false, bool nested = false) -> Select;
 
 // A subquery's SELECT, parsed as any SELECT is.
 auto subquery(const PgQuery__SubLink* l) -> std::shared_ptr<const Select> {
   if (l->subselect == nullptr || l->subselect->node_case != PG_QUERY__NODE__NODE_SELECT_STMT) {
     reject("a subquery must be a SELECT", l->location);
   }
-  return std::make_shared<const Select>(select(l->subselect->select_stmt, l->location));
+  return std::make_shared<const Select>(select(l->subselect->select_stmt, l->location, false, true));
 }
 
 auto value_compare(const std::string& op, std::int32_t pos) -> ValueCompare {
@@ -1131,25 +1133,91 @@ auto offset(const PgQuery__SelectStmt* s) -> std::int64_t {
 // which are then what tells its items apart: the qualifiers are checked and
 // left as written. An ORDER BY name that is a select-list item's AS name, and
 // no qualified one, orders by that item's column, as PostgreSQL resolves it
-// before the tables' columns. A subquery resolves its own.
+// before the tables' columns. A subquery resolves its own. A subquery that
+// names a table it aliases by the table's own name may mean the query around
+// it, as PostgreSQL reads `FROM t WHERE EXISTS (SELECT 1 FROM t AS x WHERE
+// x.a = t.b)`: it keeps its aliases and that qualifier as written (`open`),
+// and the binder resolves it against the outer query, or refuses it (42P01).
 struct Names {
   std::vector<std::string> tables;
   std::vector<std::string> aliases;
   bool keep{false};
+  bool open{false};
 
   [[nodiscard]] auto visible(std::size_t i) const -> const std::string& {
     return aliases[i].empty() ? tables[i] : aliases[i];
   }
 };
 
+void requalify(Expr& e, const Names& n);
+void requalify(Compare& c, const Names& n);
+
+// A subquery's qualifiers that name the query around it: an alias of the
+// outer query is its table, as the outer query's own qualifiers are; a name
+// of the subquery's own FROM is its own. One level: a subquery inside a
+// subquery is refused by the binder.
+void requalify_outer(Expr& e, const Names& outer, const std::vector<std::string>& own) {
+  if (!e.table.empty() && !std::ranges::contains(own, e.table)) {
+    for (std::size_t i = 0; i < outer.tables.size(); ++i) {
+      if (outer.aliases[i].empty()) continue;
+      if (e.table == outer.aliases[i]) {
+        // The subquery reads the outer table too: the name would be its own.
+        if (std::ranges::contains(own, outer.tables[i])) {
+          reject("a subquery that reads the table of the query around it, naming the outer one by an alias, is not supported yet (#836)",
+                 e.pos);
+        }
+        e.table = outer.tables[i];
+        break;
+      }
+      if (e.table == outer.tables[i]) {
+        reject("invalid reference to FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable);
+      }
+    }
+  }
+  if (e.lhs) requalify_outer(*e.lhs, outer, own);
+  if (e.rhs) requalify_outer(*e.rhs, outer, own);
+  for (auto& a : e.args) requalify_outer(a, outer, own);
+}
+
+void requalify_outer(Compare& c, const Names& outer, const std::vector<std::string>& own) {
+  requalify_outer(c.lhs, outer, own);
+  requalify_outer(c.rhs, outer, own);
+  for (auto& a : c.args) requalify_outer(a, outer, own);
+}
+
+void requalify_outer(Select& q, const Names& outer) {
+  if (q.set) {
+    auto set = std::make_shared<SetOperation>(SetOperation{q.set->kind, q.set->all, clone(q.set->left), clone(q.set->right)});
+    requalify_outer(set->left, outer);
+    requalify_outer(set->right, outer);
+    q.set = std::move(set);
+    return;
+  }
+  std::vector<std::string> own;
+  for (const auto& item : q.from) own.push_back(item.name());
+  for (auto& e : q.targets) requalify_outer(e, outer, own);
+  for (auto& c : q.where) requalify_outer(c, outer, own);
+  for (auto& c : q.having) requalify_outer(c, outer, own);
+  for (auto& e : q.group_by) requalify_outer(e, outer, own);
+  for (auto& o : q.order_by) requalify_outer(o.expr, outer, own);
+}
+
+// A subquery is shared once parsed: requalified as a copy.
+auto requalified(const Select& q, const Names& outer) -> std::shared_ptr<const Select> {
+  auto copy = std::make_shared<Select>(clone(q));
+  requalify_outer(*copy, outer);
+  return copy;
+}
+
 void requalify(Expr& e, const Names& n) {
+  if (e.subquery && !n.keep) e.subquery = requalified(*e.subquery, n);
   if (!e.table.empty()) {
     auto named = [&](std::size_t i) { return n.visible(i) == e.table; };
     std::size_t visible = 0;
     while (visible < n.tables.size() && !named(visible)) ++visible;
     if (visible < n.tables.size()) {
       if (!n.keep && !n.aliases[visible].empty()) e.table = n.tables[visible];
-    } else {
+    } else if (!n.open) {
       for (std::size_t i = 0; i < n.tables.size(); ++i) {
         if (!n.aliases[i].empty() && e.table == n.tables[i]) {
           reject("invalid reference to FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable);
@@ -1163,6 +1231,7 @@ void requalify(Expr& e, const Names& n) {
 }
 
 void requalify(Compare& c, const Names& n) {
+  if (c.subquery && !n.keep) c.subquery = requalified(*c.subquery, n);
   requalify(c.lhs, n);
   requalify(c.rhs, n);
   for (auto& a : c.args) requalify(a, n);
@@ -1222,7 +1291,31 @@ void resolve_positions(Select& sel) {
   }
 }
 
-void resolve_aliases(Select& sel) {
+// Whether a qualifier of sel's own clauses, not its subqueries', names a
+// table sel aliases by the table's name, which the alias hides.
+auto names_hidden(const Select& sel, const Names& n) -> bool {
+  auto hidden = [&](const std::string& table) {
+    if (table.empty()) return false;
+    for (std::size_t i = 0; i < n.tables.size(); ++i) {
+      if (n.visible(i) == table) return false;
+    }
+    for (std::size_t i = 0; i < n.tables.size(); ++i) {
+      if (!n.aliases[i].empty() && n.tables[i] == table) return true;
+    }
+    return false;
+  };
+  std::function<bool(const Expr&)> in_expr = [&](const Expr& e) {
+    return hidden(e.table) || (e.lhs && in_expr(*e.lhs)) || (e.rhs && in_expr(*e.rhs)) || std::ranges::any_of(e.args, in_expr);
+  };
+  std::function<bool(const Compare&)> in_compare = [&](const Compare& c) {
+    return in_expr(c.lhs) || in_expr(c.rhs) || std::ranges::any_of(c.args, in_compare);
+  };
+  return std::ranges::any_of(sel.targets, in_expr) || std::ranges::any_of(sel.where, in_compare) ||
+         std::ranges::any_of(sel.having, in_compare) || std::ranges::any_of(sel.group_by, in_expr) ||
+         std::ranges::any_of(sel.order_by, [&](const OrderItem& o) { return in_expr(o.expr); });
+}
+
+void resolve_aliases(Select& sel, bool nested) {
   Names names;
   for (const auto& item : sel.from) {
     names.tables.push_back(item.table);
@@ -1238,6 +1331,10 @@ void resolve_aliases(Select& sel) {
   }
   // Renamed columns exist only under the alias, which the binder reads.
   for (const auto& item : sel.from) names.keep = names.keep || !item.column_aliases.empty();
+  if (nested && names_hidden(sel, names)) {
+    names.keep = true;
+    names.open = true;
+  }
   if (std::ranges::all_of(names.aliases, [](const std::string& a) { return a.empty(); })) return;
   for (auto& e : sel.targets) requalify(e, names);
   for (auto& c : sel.where) requalify(c, names);
@@ -1301,7 +1398,7 @@ void refuse_arm_into(const PgQuery__SelectStmt* s, bool leftmost, std::int32_t p
 // UNION, INTERSECT or EXCEPT of the statement's two queries, whose own
 // ORDER BY and LIMIT are the combined rows'. Each arm is parsed as any
 // SELECT is; a parenthesised one keeps its ORDER BY and LIMIT.
-auto set_operation(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
+auto set_operation(const PgQuery__SelectStmt* s, std::int32_t pos, bool nested) -> Select {
   if (s->larg == nullptr || s->rarg == nullptr) reject("a set operation needs two queries", pos);
   refuse_arm_into(s->larg, true, pos);
   refuse_arm_into(s->rarg, false, pos);
@@ -1319,7 +1416,7 @@ auto set_operation(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   sel.limit = limit(s);
   sel.limit_written = s->limit_count != nullptr;
   sel.order_by = order_items(s, pos);
-  sel.set = std::make_shared<const SetOperation>(SetOperation{kind, s->all != 0, select(s->larg, pos), select(s->rarg, pos)});
+  sel.set = std::make_shared<const SetOperation>(SetOperation{kind, s->all != 0, select(s->larg, pos, false, nested), select(s->rarg, pos, false, nested)});
   return sel;
 }
 
@@ -1371,8 +1468,8 @@ void join_items(const PgQuery__Node* n, std::int32_t pos, std::vector<FromItem>&
   items.push_back(std::move(item));
 }
 
-auto select(const PgQuery__SelectStmt* s, std::int32_t pos, bool into_taken) -> Select {
-  if (s->op != PG_QUERY__SET_OPERATION__SETOP_NONE) return set_operation(s, pos);
+auto select(const PgQuery__SelectStmt* s, std::int32_t pos, bool into_taken, bool nested) -> Select {
+  if (s->op != PG_QUERY__SET_OPERATION__SETOP_NONE) return set_operation(s, pos, nested);
   // No table, or tables joined: FROM a, b, c, or a [INNER] JOIN b ON … JOIN
   // c …, whose ON conjuncts join the WHERE's.
   if (s->n_values_lists != 0) reject("VALUES is supported only in INSERT", pos);
@@ -1442,7 +1539,7 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos, bool into_taken) -> 
   where(s->having_clause, sel.having, "HAVING", pos);
   resolve_output_names(sel);
   resolve_positions(sel);
-  resolve_aliases(sel);
+  resolve_aliases(sel, nested);
   return sel;
 }
 

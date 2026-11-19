@@ -43,8 +43,6 @@ e051_08_01_05  # not PostgreSQL: `* AS (c, d)` renames the star's columns (SQL s
 e051_08_01_07  # not PostgreSQL: `* AS (c, d)` renames the star's columns (SQL standard only); PostgreSQL 17 gives 42601, "syntax error at or near "AS""
 e051_08_01_09  # not PostgreSQL: `* AS (c, d)` renames the star's columns (SQL standard only); PostgreSQL 17 gives 42601, "syntax error at or near "(""
 e051_08_01_11  # not PostgreSQL: `* AS (c, d)` renames the star's columns (SQL standard only); PostgreSQL 17 gives 42601, "syntax error at or near "(""
-e061_13_01_01  # a correlated subquery (one that reads a column of the query around it) is not built (#714)
-e061_13_01_02  # a correlated subquery (one that reads a column of the query around it) is not built (#714)
 e081_09_01_01  # not PostgreSQL: `GRANT USAGE ON TABLE TABLE_E081_09_01_011 TO ROLE_E081_09_01_01`; PostgreSQL 17 gives 42P01, "relation "table_e081_09_01_011" does not exist"
 e081_09_01_02  # not PostgreSQL: `GRANT USAGE ON TABLE_E081_09_01_021 TO ROLE_E081_09_01_02`; PostgreSQL 17 gives 42P01, "relation "table_e081_09_01_021" does not exist"
 e081_10_01_01  # not PostgreSQL: `GRANT EXECUTE ON TABLE TABLE_E081_10_01_011 TO ROLE_E081_10_01_01`; PostgreSQL 17 gives 42P01, "relation "table_e081_10_01_011" does not exist"

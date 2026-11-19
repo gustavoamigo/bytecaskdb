@@ -1608,6 +1608,127 @@ TEST_CASE("embedded API: joins of three or more tables, a table with itself, and
   CHECK(state("SELECT 1 FROM h1 x JOIN h1 y ON x.id = y.id FOR UPDATE") == "42601");
 }
 
+TEST_CASE("embedded API: a correlated subquery runs for each outer row, on the statement's snapshot", "[sql][api]") {
+  sql_test::TempDir dir{"api_correlated"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE g (id INTEGER PRIMARY KEY, v INTEGER, s TEXT)");
+  (void)db->execute("CREATE TABLE h (k INTEGER PRIMARY KEY, w INTEGER, t TEXT)");
+  (void)db->execute("INSERT INTO g VALUES (1, 1, 'x'), (2, 2, 'y'), (3, NULL, 'z'), (4, 4, NULL), (5, 5, 'x')");
+  (void)db->execute("INSERT INTO h VALUES (1, 1, 'x'), (2, 2, 'q'), (3, NULL, 'z'), (4, 4, 'x'), (5, 4, NULL)");
+  auto ids = [&](std::string_view sql, std::vector<Value> params = {}) {
+    std::vector<std::int64_t> out;
+    for (const auto& r : db->execute(sql, params).rows) out.push_back(std::get<std::int64_t>(r[0]));
+    std::ranges::sort(out);
+    return out;
+  };
+  using V = std::vector<std::int64_t>;
+  // e061_13_01_01 and _02: b = a reads the outer row's a; a NULL a matches
+  // no row, so NOT IN of its empty set is true.
+  CHECK(ids("SELECT v FROM g WHERE v IN (SELECT w FROM h WHERE w = v)") == V{1, 2, 4});
+  CHECK(db->execute("SELECT v FROM g WHERE v NOT IN (SELECT w FROM h WHERE w = v) ORDER BY v").rows ==
+        Grid{{i(5)}, {Value{}}});
+  CHECK(ids("SELECT id FROM g WHERE EXISTS (SELECT 1 FROM h WHERE h.t = g.s)") == V{1, 3, 5});
+  CHECK(ids("SELECT id FROM g WHERE NOT EXISTS (SELECT 1 FROM h WHERE h.t = g.s)") == V{2, 4});
+  CHECK(ids("SELECT id FROM g WHERE v >= ALL (SELECT w FROM h WHERE h.k <= g.id)") == V{1, 2});
+  CHECK(ids("SELECT id FROM g WHERE v > ANY (SELECT w FROM h WHERE h.t = g.s)") == V{5});
+  CHECK(ids("SELECT id FROM g WHERE v IN (SELECT MAX(w) FROM h WHERE h.k <= g.id)") == V{1, 2, 4});
+  CHECK(ids("SELECT id FROM g WHERE v IN (SELECT COUNT(*) FROM h WHERE h.w = g.v)") == V{1});
+  // Beside the statement's own parameters, and an alias of the outer table.
+  CHECK(ids("SELECT id FROM g o WHERE v > $1 AND EXISTS (SELECT 1 FROM h WHERE h.w = o.v AND h.k > $2)", {i(1), i(3)}) == V{4});
+  // A $n only a subquery names is the statement's, before its constants.
+  CHECK(ids("SELECT id FROM g WHERE v IN (SELECT w FROM h WHERE h.k > $1)", {i(3)}) == V{4});
+  CHECK(ids("SELECT COUNT(*) FROM g WHERE id = $1 AND EXISTS (SELECT 1 FROM h WHERE h.w = g.v)", {i(4)}) == V{1});
+  CHECK(ids("SELECT COUNT(*) FROM g WHERE id = $1 AND EXISTS (SELECT 1 FROM h WHERE h.w = g.v)", {i(3)}) == V{0});
+  // A write's run reads the rows as they were before the statement.
+  CHECK(db->execute("DELETE FROM g WHERE EXISTS (SELECT 1 FROM g x WHERE x.id = 5) AND v IN (SELECT w FROM h WHERE h.k = g.id)")
+            .affected == 3);
+  CHECK(ids("SELECT id FROM g") == V{3, 5});
+  CHECK(db->execute("UPDATE g SET v = 7 WHERE NOT EXISTS (SELECT 1 FROM h WHERE h.w = g.v)").affected == 2);
+
+  // The outer table read again under an alias, the outer one named by its
+  // own name, as PostgreSQL reads it; an UPDATE and a DELETE whose run reads
+  // the table they write sees it as it was before the statement.
+  (void)db->execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)");
+  (void)db->execute("INSERT INTO s VALUES (1, 5), (2, 1), (3, NULL)");
+  CHECK(ids("SELECT id FROM s WHERE EXISTS (SELECT 1 FROM s AS x WHERE x.id = s.v)") == V{2});
+  CHECK(ids("SELECT id FROM s WHERE NOT EXISTS (SELECT 1 FROM s x WHERE id = s.v)") == V{1, 3});
+  // No v is 2 or 3 before the statement: rows 2 and 3 are set, though row
+  // 3's run comes after row 2's v became 3.
+  CHECK(db->execute("UPDATE s SET v = 3 WHERE NOT EXISTS (SELECT 1 FROM s x WHERE x.v = s.id)").affected == 2);
+  CHECK(db->execute("SELECT id, v FROM s ORDER BY id").rows == Grid{{i(1), i(5)}, {i(2), i(3)}, {i(3), i(3)}});
+  // A chain 1 -> 2 -> 3 -> 1: each row's v names a row before the
+  // statement, row 1 included though deleted before row 3's run.
+  (void)db->execute("DELETE FROM s");
+  (void)db->execute("INSERT INTO s VALUES (1, 2), (2, 3), (3, 1), (4, NULL)");
+  CHECK(db->execute("DELETE FROM s WHERE EXISTS (SELECT 1 FROM s x WHERE x.id = s.v)").affected == 3);
+  CHECK(ids("SELECT id FROM s") == V{4});
+
+  // GROUP BY, ORDER BY and LIMIT in the subquery.
+  (void)db->execute("CREATE TABLE p (id INTEGER PRIMARY KEY, v INTEGER)");
+  (void)db->execute("CREATE TABLE q (k INTEGER PRIMARY KEY, w INTEGER, t TEXT)");
+  (void)db->execute("INSERT INTO p VALUES (1, 2), (2, 9), (3, 4), (4, 5)");
+  (void)db->execute("INSERT INTO q VALUES (1, 2, 'a'), (2, 2, 'b'), (3, 4, 'a'), (4, 5, 'b'), (5, 7, 'a')");
+  // The largest w per t among k >= id: for 1 7 and 5; 2 7 and 5; 3 7 and 5; 4 7 and 5.
+  CHECK(ids("SELECT id FROM p WHERE v IN (SELECT MAX(w) FROM q WHERE q.k >= p.id GROUP BY t)") == V{4});
+  // The smallest w among k >= id: 2, 2, 4, 5.
+  CHECK(ids("SELECT id FROM p WHERE v IN (SELECT w FROM q WHERE q.k >= p.id ORDER BY w LIMIT 1)") == V{1, 3, 4});
+
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)} + " " + e.what();
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what();
+    }
+    return std::string{"ran"};
+  };
+  auto refused = [&](std::string_view sql, std::string_view why) {
+    INFO(sql);
+    CHECK(state(sql) == "42601 " + std::string{why} + " is not supported yet");
+  };
+  // Refused, each precisely (#836).
+  (void)db->execute("CREATE VIEW qv AS SELECT k, w FROM q");
+  (void)db->execute("CREATE VIEW qg AS SELECT w, COUNT(*) AS n FROM q GROUP BY w");
+  refused("SELECT id FROM p WHERE EXISTS (SELECT 1 FROM qv WHERE qv.w = p.v)", "a correlated subquery where a view is read");
+  refused("SELECT id FROM p WHERE EXISTS (SELECT 1 FROM qg WHERE qg.w = p.v)", "a correlated subquery where a view is read");
+  refused("SELECT w FROM qg WHERE EXISTS (SELECT 1 FROM q WHERE q.w = qg.w)", "a correlated subquery where a view is read");
+  refused("DELETE FROM p WHERE EXISTS (SELECT 1 FROM qv WHERE qv.w = p.v)", "a correlated subquery where a view is read");
+  refused("SELECT id FROM p WHERE EXISTS (SELECT 1 WHERE p.v = 1)", "a correlated subquery without FROM");
+  refused("SELECT id FROM p WHERE v IN (SELECT MAX(w) FROM q WHERE q.k <= p.id GROUP BY p.v)",
+          "a column of the query around a subquery in its GROUP BY");
+  refused("SELECT id FROM p WHERE v IN (SELECT w FROM q WHERE q.k <= p.id ORDER BY p.v)",
+          "a column of the query around a subquery in its ORDER BY");
+  refused("SELECT id FROM p WHERE v IN (SELECT MAX(w) FROM q WHERE q.k <= p.id HAVING MAX(w) > p.v)",
+          "a column of the query around a subquery in its HAVING");
+  // The outer table, aliased, read again by its name in the subquery.
+  CHECK(state("SELECT id FROM p o WHERE EXISTS (SELECT 1 FROM p WHERE p.v = o.id)")
+            .starts_with("42601 a subquery that reads the table of the query around it, naming the outer one by an alias"));
+  // A join in the subquery, the outer table among its tables under an alias.
+  refused("SELECT id FROM p WHERE EXISTS (SELECT 1 FROM q JOIN p x ON x.id = q.k WHERE q.w = p.v)",
+          "a correlated subquery of a join");
+  // A pair the layer does not compare: the outer column named as such.
+  (void)db->execute("CREATE TABLE n (k INTEGER PRIMARY KEY, d NUMERIC(10,2))");
+  refused("SELECT id FROM p WHERE EXISTS (SELECT 1 FROM n WHERE n.d = p.v)",
+          "comparing d (numeric(10,2)) with the outer column v (integer) in a correlated subquery");
+  // A name the subquery's alias hides and no outer table has: 42P01.
+  CHECK(state("SELECT id FROM p WHERE EXISTS (SELECT 1 FROM q AS x WHERE q.k = 1)").starts_with("42P01"));
+  // In a procedure's statement.
+  (void)db->execute(R"(CREATE PROCEDURE cp(x INTEGER) LANGUAGE plpgsql AS $$
+    BEGIN UPDATE p SET v = x WHERE EXISTS (SELECT 1 FROM q WHERE q.w = p.v); END $$)");
+  auto call_state = [&]() -> std::string {
+    try {
+      (void)db->call("cp", {i(1)});
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)} + " " + e.what();
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what();
+    }
+    return std::string{"ran"};
+  };
+  CHECK(call_state() == "42601 a correlated subquery in a procedure's statement is not supported yet");
+}
+
 TEST_CASE("embedded API: an uncorrelated subquery runs once, on the statement's snapshot, before its plan",
           "[sql][api]") {
   sql_test::TempDir dir{"api_subquery"};

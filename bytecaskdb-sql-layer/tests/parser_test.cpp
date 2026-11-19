@@ -555,6 +555,24 @@ TEST_CASE("parser: an alias is rewritten to its table, and kept where a table is
   CHECK_THROWS_AS(parse("SELECT 1 FROM t, t"), SqlError);
   CHECK_THROWS_AS(parse("SELECT 1 FROM t x, u x"), SqlError);
   CHECK_THROWS_AS(parse("SELECT t.id FROM t x JOIN t y ON x.k = y.k"), SqlError);
+  // A subquery's qualifier naming the outer query's alias is the outer
+  // table's; one naming the subquery's own table stays its own.
+  auto outer = std::get<Select>(parse("SELECT id FROM t AS o WHERE EXISTS (SELECT 1 FROM u WHERE u.k = o.k)"));
+  REQUIRE(outer.where[0].subquery != nullptr);
+  const auto& inner = outer.where[0].subquery->where[0];
+  CHECK(inner.lhs.table == "u");
+  CHECK(inner.rhs.table == "t");
+  CHECK_THROWS_AS(parse("SELECT id FROM t AS o WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k)"), SqlError);  // hidden by o
+  // The outer table read again in the subquery: o would become its own t.
+  CHECK_THROWS_AS(parse("SELECT id FROM t AS o WHERE EXISTS (SELECT 1 FROM t WHERE t.k = o.k)"), SqlError);
+  // A subquery's qualifier naming the table it aliases may name the outer
+  // query's: the subquery keeps its alias and that qualifier, for the binder.
+  auto self = std::get<Select>(parse("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t AS x WHERE x.k = t.k)"));
+  REQUIRE(self.where[0].subquery != nullptr);
+  CHECK(self.where[0].subquery->from[0].alias == "x");
+  CHECK(self.where[0].subquery->where[0].lhs.table == "x");
+  CHECK(self.where[0].subquery->where[0].rhs.table == "t");
+  CHECK_THROWS_AS(parse("SELECT t.k FROM t AS x"), SqlError);  // no query around it
 }
 
 TEST_CASE("parser: DECLARE, FETCH, MOVE and CLOSE", "[sql][parser][cursor]") {

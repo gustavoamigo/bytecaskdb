@@ -446,6 +446,36 @@ TEST_CASE("codegen: a subquery is a function of its own, run first into its para
   CHECK(has(all, "bc_sub_begin(cx, 0, BC_SUB_BOUNDS, BC_T_I64, 0);"));
 }
 
+TEST_CASE("codegen: a correlated subquery runs at its conjunct, for the row in hand", "[sql][codegen]") {
+  sql_test::Fixture f;
+  f.ddl(CreateTableDdl{"u", {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},
+                       {"k"}});
+  auto has = [](const GeneratedPlan& p, std::string_view s) { return p.source.find(s) != std::string::npos; };
+  // The outer column is parameter 2, after $1 and $2; the subquery keys its
+  // scan by $2 and compares v with the argument.
+  auto p = generate(f.cat(), "SELECT id FROM t WHERE qty > $1 AND EXISTS (SELECT 1 FROM u WHERE u.v = t.qty AND u.k > $2)");
+  CHECK(has(p, "static void sub0(bc_ctx *cx) {\n  if (bc_param_null(cx, 2) || bc_param_null(cx, 1)) {"));
+  // Not run first: in the loop, after the uncorrelated conjunct, its
+  // argument set from the row in hand, then tested.
+  CHECK(p.source.find("bc_sub_begin") > p.source.find("while (bc_scan_next(cx, c))"));
+  CHECK(p.source.find("bc_sub_begin") > p.source.find("bc_param_i64(cx, 0))) continue;"));
+  CHECK(has(p, "    if (bc_col_null(cx, row, COL_1_2)) {\n      bc_sub_arg_null(cx, 2);\n    } else {\n"
+               "      bc_sub_arg_i64(cx, 2, bc_col_i64(cx, row, COL_1_2));\n    }\n"
+               "    bc_sub_begin(cx, 0, BC_SUB_EXISTS, BC_T_BOOL, 4);\n    sub0(cx);\n    bc_sub_end(cx);\n"
+               "    if (!(!bc_param_null(cx, 4) && bc_param_bool(cx, 4))) continue;"));
+  // The wrap keeps the argument and the subquery's flags out of the
+  // outer plan's NULL checks: the plan ends early only on $1.
+  CHECK(has(p, "void plan(bc_ctx *cx) {\n  if (bc_param_null(cx, 0)) {\n    return;"));
+  CHECK(!has(p, "bc_param_null(cx, 0) || bc_param_null(cx, 2)"));
+  auto in = generate(f.cat(), "SELECT id FROM t WHERE qty NOT IN (SELECT v FROM u WHERE u.k = t.qty)");
+  CHECK(has(in, "bc_sub_begin(cx, 0, BC_SUB_SET, BC_T_I64, 1);"));
+  CHECK(has(in, "void plan(bc_ctx *cx) {\n  bc_view lo"));
+  // Over a one-row aggregate's lookup, the run is for a row that is there.
+  auto one = generate(f.cat(), "SELECT COUNT(*) FROM t WHERE id = $1 AND EXISTS (SELECT 1 FROM u WHERE u.k = t.qty)");
+  CHECK(has(one, "if (found) {\n"));
+  CHECK(one.source.find("if (found) {") < one.source.find("bc_sub_begin"));
+}
+
 TEST_CASE("codegen: a procedure is one file: proc(), each statement as s<i>, the constants once", "[sql][codegen][procedure]") {
   sql_test::Fixture f;
   Procedure p{1000, "p", R"(CREATE PROCEDURE p(k INTEGER, INOUT q INTEGER) LANGUAGE plpgsql AS $$

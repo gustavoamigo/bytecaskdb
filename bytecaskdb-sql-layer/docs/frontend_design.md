@@ -157,8 +157,19 @@ kind the transformer doesn't take is refused with its position.
   `-a`. Two items of the name are 42702 unless they are one, as in
   PostgreSQL: one column named twice, qualified or not, or one expression
   written twice alike (`ast::same_expr`, PostgreSQL's `equal()`). A
-  subquery resolves its own aliases; it cannot name the outer query's
-  (correlation is refused). `t AS x (c1, c2)` renames the table's first
+  subquery resolves its own aliases; a qualifier in it that names the
+  outer query's alias is the outer table's, as in the outer query (a
+  correlated subquery, *Subqueries* below). One that names a table the
+  subquery itself aliases, the outer query's table read again under an
+  alias (`FROM t WHERE EXISTS (SELECT 1 FROM t AS x WHERE x.a = t.b)`), may
+  name the outer table, as PostgreSQL reads it: the subquery then keeps its
+  aliases and that qualifier as written (`Names::open`), and the binder
+  resolves it against the outer query's tables, or, where none is named so,
+  refuses it with 42P01 (PostgreSQL's SQLSTATE, the binder's "missing
+  FROM-clause entry" wording). At the top level such a qualifier is 42P01
+  in the parser, as before. An outer alias of a table the subquery also
+  reads (`FROM t AS o WHERE EXISTS (SELECT 1 FROM t WHERE t.a = o.a)`) is
+  42601, since it would name the subquery's own table (#836). `t AS x (c1, c2)` renames the table's first
   columns (the binder renames them in the alias's table instance, which is
   already a copy; the parser keeps the alias so qualifiers are resolved
   there). The old names are gone (42703), the unnamed columns keep theirs,
@@ -415,10 +426,33 @@ in any order, on any columns, and of predicates over them.
   other type its own. A scalar one is a parameter to the plan, so
   `id = (SELECT MAX(k) FROM u)` is a key lookup. A `$n` only a subquery
   names is one of the statement's parameters, as any `$n`.
+- **Correlated subqueries**, a narrow slice (#714): `[NOT] EXISTS`, `[NOT]
+  IN`, `ANY` and `ALL` as above, in the `WHERE` of a `SELECT`, `UPDATE` or
+  `DELETE` of one table, the subquery itself of one table, where each
+  column of the outer table it reads is compared with a column of its own
+  in its `WHERE` (`b = a`, `t2.b < t1.a`, inside `AND`, `OR` and `NOT`
+  too). PostgreSQL's semantics, run for each outer row that reaches the
+  conjunct (`planner_design.md`, *Subqueries*): a NULL outer value compares
+  as NULL, so `b = a` matches no row and `a NOT IN (…)` of that row is
+  true. The two columns compare as a subquery's value does above (a pair
+  outside those is 42601, its message naming the outer column), and a pair
+  PostgreSQL has no operator for is its 42883, in the order written. The
+  subquery may read the outer table again under an alias, so an `UPDATE` or
+  `DELETE` may test the table it writes; each run reads it as it was before
+  the statement.
+  Its `SELECT` may aggregate (`COUNT`, `SUM`, `MIN`, `MAX`), group, order
+  and limit as any subquery may. Refused, each with its own 42601 (#836): a
+  correlated scalar subquery (`x = (SELECT …)`, or in a select list); one in
+  a query of a join, outside a `WHERE`, in an arm of a set operation, or in
+  a procedure's statement; one of a join, of a set operation or without
+  `FROM`; an outer column anywhere else (its select list,
+  `GROUP BY`, `HAVING`, `ORDER BY`, `IS NULL`, `LIKE`, arithmetic, compared
+  with a constant or with another outer column); either column a `CHAR(n)`;
+  and one where a view is read, around it or in it.
 - Not yet: `$n ± k` inside one, one of both tables' columns in a
   join, in `HAVING`, `LIKE` of a BYTEA column, `IS DISTINCT FROM`, `NULL`
-  under `NOT`, a string as a boolean, a constant in `HAVING`; a subquery that reads a column of the
-  query around it (correlated), one inside another, in `FROM`, `FOR UPDATE`
+  under `NOT`, a string as a boolean, a constant in `HAVING`; a correlated
+  subquery but the slice above, one inside another, in `FROM`, `FOR UPDATE`
   in one, one of `AVG`, assigned by `SET` or `VALUES`, beside an aggregate,
   or compared with other than a column.
 - Comparing two columns of different SQL types in a join is refused
@@ -850,7 +884,7 @@ usable yet.
 That includes:
 - `IS DISTINCT FROM`, and a predicate or a constant in `HAVING`; a
   `NULL` constant under `NOT`, and a string constant as a `WHERE` or `ON`;
-- correlated and nested subqueries and the others above, a subquery in `FROM`, and a derived relation but a grouped view aggregated over;
+- correlated subqueries but the slice above (#836), nested subqueries and the others above, a subquery in `FROM`, and a derived relation but a grouped view aggregated over;
 - `DISTINCT ON`, `DISTINCT` of a constant or over groups it does not select
   every key of, an aggregate of `DISTINCT` values of an expression (0A000),
   `GROUP BY` of an expression, and `HAVING` of anything but the

@@ -1059,8 +1059,8 @@ A plan runs each uncorrelated subquery of its statement first, as a
 function of its own, and what that function emits between `bc_sub_begin`
 and `bc_sub_end` is folded, never a result row (`planner_design.md`,
 *Subqueries*). A subquery can run again, with arguments the plan sets
-first in parameters of its own (`bc_sub_arg_*`): the shape a correlated
-subquery needs, one run per outer row:
+first in parameters of its own (`bc_sub_arg_*`): a correlated subquery,
+one run per outer row (`planner_design.md`, *Subqueries*):
 
 ```c
 enum bc_sub_kind { BC_SUB_VALUE = 0, BC_SUB_EXISTS = 1, BC_SUB_BOUNDS = 2, BC_SUB_SET = 3 };

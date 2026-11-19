@@ -612,10 +612,8 @@ TEST_CASE("binder: an uncorrelated subquery is bound to run first, its values in
   CHECK(get<logical::Project>(sel).exprs[0].name == "w");
   CHECK(get<logical::Project>(sel).exprs[0].expr.kind == logical::Expr::Kind::Param);
   CHECK(state("SELECT (SELECT MAX(k) FROM u)") == "bound");
-  // Refused: correlated, nested, of two columns, FOR UPDATE, AVG, assigned,
-  // compared across types, beside an aggregate.
-  CHECK(state("SELECT id FROM t WHERE id IN (SELECT k FROM u WHERE k = qty)").starts_with("42601 a correlated subquery"));
-  CHECK(state("SELECT id FROM t WHERE id IN (SELECT k FROM u WHERE u.k = t.qty)").starts_with("42601 a correlated subquery"));
+  // Refused: nested, of two columns, FOR UPDATE, AVG, assigned, compared
+  // across types, beside an aggregate.
   CHECK(state("SELECT id FROM t WHERE id IN (SELECT k FROM u WHERE k IN (SELECT k FROM u))") ==
         "42601 a subquery inside a subquery is not supported yet");
   CHECK(state("SELECT id FROM t WHERE id = (SELECT k, w FROM u)") == "42601 subquery must return only one column");
@@ -625,6 +623,85 @@ TEST_CASE("binder: an uncorrelated subquery is bound to run first, its values in
   CHECK(state("SELECT id FROM t WHERE id = (SELECT w FROM u)").starts_with("42601 comparing id (bigint) with a subquery of text"));
   CHECK(state("SELECT COUNT(*), (SELECT 1) FROM t") == "42601 a subquery in the select list of an aggregated query is not supported yet");
   CHECK(state("SELECT id FROM t WHERE (SELECT 1) IN (SELECT k FROM u)").starts_with("42601"));
+}
+
+TEST_CASE("binder: a correlated subquery takes each outer column as an argument of its own", "[sql][binder]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE u (k INTEGER PRIMARY KEY, w TEXT, s SMALLINT, b BIGINT, c CHAR(2))").stmt));
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE r (j INTEGER PRIMARY KEY, x TEXT)").stmt));
+  const auto& cat = f.cat();
+  using SK = logical::Subquery::Kind;
+  using K = logical::Expr::Kind;
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what();
+    }
+    return "bound";
+  };
+  const auto* t = cat.table("t");
+  const auto qty = logical::column_of(t->id, *t->column("qty")).col;
+  const auto id = logical::column_of(t->id, *t->column("id")).col;
+  // e061_13_01_01: k = qty compares k with a parameter the outer row sets,
+  // after the statement's own; the same column twice is one argument.
+  auto b = bind_sql(cat, "SELECT id FROM t WHERE id > $1 AND qty IN (SELECT k FROM u WHERE k = qty OR u.s = t.id)");
+  REQUIRE(b.subqueries.size() == 1);
+  const auto& sub = b.subqueries[0];
+  CHECK(sub.kind == SK::Set);
+  REQUIRE(sub.args.size() == 2);
+  CHECK(sub.args[0].col == qty);
+  CHECK(sub.args[0].param == 1);
+  CHECK(sub.args[1].col == id);
+  CHECK(b.param_types.size() == 1 + 2 + 2);  // $1, the arguments, the set's flags
+  CHECK(std::ranges::all_of(b.fixed, [](const Datum& d) { return std::holds_alternative<std::monostate>(d); }));
+  const auto* found = find<logical::Filter>(*sub.plan);
+  REQUIRE(found != nullptr);
+  const auto& filter = *found;
+  REQUIRE(filter.conjuncts.size() == 1);
+  CHECK(filter.conjuncts[0].kind == K::Or);
+  CHECK(filter.conjuncts[0].args[0].args[1].kind == K::Param);
+  CHECK(filter.conjuncts[0].args[0].args[1].param == 1);
+  auto twice = bind_sql(cat, "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.qty AND t.qty < u.k AND u.k = id)");
+  REQUIRE(twice.subqueries[0].args.size() == 2);
+  CHECK(twice.subqueries[0].args[0].col == qty);
+  CHECK(twice.subqueries[0].args[1].col == id);
+  // An outer column written first is mirrored: t.qty < u.k is u.k > the argument.
+  const auto* twice_filter = find<logical::Filter>(*twice.subqueries[0].plan);
+  REQUIRE(twice_filter != nullptr);
+  const auto& conj = twice_filter->conjuncts;
+  CHECK(conj[1].op == ast::Compare::Op::Gt);
+  // NOT IN, ANY, ALL, in UPDATE and DELETE.
+  CHECK(state("SELECT id FROM t WHERE qty NOT IN (SELECT k FROM u WHERE k = qty)") == "bound");
+  CHECK(state("SELECT id FROM t WHERE qty > ALL (SELECT k FROM u WHERE u.b >= t.id)") == "bound");
+  CHECK(state("UPDATE t SET qty = 1 WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.qty)") == "bound");
+  CHECK(state("DELETE FROM t WHERE qty = ANY (SELECT MAX(k) FROM u WHERE u.k < t.qty)") == "bound");
+  // Two columns PostgreSQL has no operator for: its 42883, in the order written.
+  CHECK(state("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE t.qty = u.w)") ==
+        "42883 operator does not exist: bigint = text");
+  // Refused, each precisely (#836).
+  auto refused = [&](std::string_view sql, std::string_view why) {
+    INFO(sql);
+    CHECK(state(sql) == "42601 " + std::string{why} + " is not supported yet");
+  };
+  refused("SELECT id FROM t WHERE qty = (SELECT k FROM u WHERE u.k = t.id)", "a correlated scalar subquery");
+  refused("SELECT (SELECT k FROM u WHERE u.k = t.id) FROM t", "a correlated scalar subquery");
+  refused("SELECT j FROM r JOIN u ON u.k = r.j WHERE EXISTS (SELECT 1 FROM t WHERE t.qty = r.j)",
+          "a correlated subquery in a query of a join");
+  refused("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.id UNION SELECT 1 FROM r)",
+          "a correlated subquery of a set operation (UNION, INTERSECT, EXCEPT)");
+  refused("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u JOIN r ON r.j = u.k WHERE u.k = t.id)",
+          "a correlated subquery of a join");
+  refused("SELECT id FROM t WHERE EXISTS (SELECT t.qty FROM u)", "a column of the query around a subquery in its select list");
+  refused("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.qty + 1)",
+          "a column of the query around a subquery other than compared with a column of the subquery");
+  refused("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE t.qty = 1)",
+          "a column of the query around a subquery other than compared with a column of the subquery");
+  refused("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE t.name IS NULL)",
+          "a column of the query around a subquery other than compared with a column of the subquery");
+  refused("SELECT j FROM r WHERE EXISTS (SELECT 1 FROM u WHERE u.c = r.x)", "a correlated subquery comparing a CHAR(n) column");
+  refused("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k IN (SELECT k FROM u WHERE u.k = t.id))",
+          "a subquery inside a subquery");
 }
 
 TEST_CASE("binder: OR, NOT, IS NULL, <>, BETWEEN and IN are predicates over comparisons", "[sql][binder]") {
@@ -1348,6 +1425,7 @@ TEST_CASE("binder: a set operation binds its arms alone and resolves their colum
   CHECK(state("SELECT id FROM t WHERE qty IN (SELECT big, k FROM u UNION SELECT k, k FROM u)") == "42601");
   CHECK(state("SELECT id FROM t WHERE EXISTS (SELECT big, k FROM u UNION SELECT k, k FROM u)") == "bound");
   CHECK(state("SELECT id FROM t WHERE qty IN (SELECT big FROM u WHERE k = id UNION SELECT k FROM u)") == "42601");  // correlated
+  CHECK(state("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.id) UNION SELECT k FROM u") == "42601");  // in an arm
   CHECK(state("SELECT id FROM t WHERE qty IN (SELECT k FROM u WHERE big IN (SELECT k FROM u UNION SELECT k FROM u) UNION SELECT k FROM u)") ==
         "42601");  // a subquery inside one
   CHECK(state("SELECT qty FROM t UNION SELECT big FROM u WHERE big IN (SELECT k FROM u UNION SELECT n FROM u)") == "bound");

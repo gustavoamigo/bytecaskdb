@@ -8,7 +8,8 @@ API's sorters, hash tables, aggregate slots and sort keys (#577, #581);
 full scans and sorts (#591, closing #533); hash joins (#600) and `GROUP
 BY` (#609); then the closing PR, which fixed #609's last review findings
 and wrote this document as built; then joins of up to eight tables, a table
-read twice and joins on any comparison (#663, *Joins of several tables*).
+read twice and joins on any comparison (#663, *Joins of several tables*);
+then a correlated subquery, run per outer row (#714, *Subqueries*).
 The first of the post-MVP designs (#487, *Next*). The parser, the plan API
 and TinyCC are unchanged by it; the binder's output changed. The rest of
 the dialect is #534's (*Slices*).
@@ -158,7 +159,8 @@ A fixed list, applied in order, each to a fixpoint. None needs a cost.
    above it reads. A read is covering when every column the operators above
    take is in the key; a column only a key bound reads need not be.
 
-Subquery decorrelation joins the list with correlated subqueries. The two
+Subquery decorrelation is not among them: a correlated subquery runs once
+per outer row (*Subqueries*). The two
 rewrites of TPROC-C statements (`testing_design.md`, *The TPROC-C
 statements*) are made by hand in the statement text.
 
@@ -882,13 +884,34 @@ first, between `bc_sub_begin` and `bc_sub_end`, which fold what it emits
 into its parameters and set (`plan_api_design.md`, *Subqueries*); then its
 computed values, NULL checks and pipeline run as without one.
 
-The plan API can run a subquery again, after setting arguments in
-parameters of its own (`bc_sub_arg_*`), and releases what each run sorted,
-hashed or grouped at its `bc_sub_end`, so one run per outer row holds one
-run's worth: the runtime half of a correlated subquery. The planner does
-not use it yet.
+A correlated subquery (`frontend_design.md`, *Correlated subqueries*, the
+slice built) is listed the same way, with its arguments
+(`logical::Subquery::args`): each column of the outer query's one table it
+reads becomes a hidden parameter of its own, NULL in the constants, which
+the subquery compares with its column as it would a caller's `$n`. So
+`b = a` keys the subquery's scan or lookup of `b`, and a NULL `a` ends its
+run before it reads, with what its sink gives for no rows (`COUNT` 0). It
+is searched alone as any subquery is. Its predicate in the outer `WHERE`
+is the same `Truth` or `InSet` wrap, never a comparison of its own, so its
+parameters are never a key bound or a NULL check of the outer plan, which
+runs before the arguments are set: they are a filter of the outer row.
 
-Not planned yet: a correlated subquery, one inside another, one in `FROM`
+The run is not printed first. The outer `Filter` prints its conjuncts that
+test no correlated subquery first; then, for each that does, the run for
+the row in hand before its test: each argument set from the row's column
+(`bc_sub_arg_*`, `bc_sub_arg_null` for a NULL), then `bc_sub_begin`,
+`sub<i>` and `bc_sub_end`, as above. A row the earlier conjuncts reject
+runs nothing. Over a one-row aggregate's single row, whose misses join a
+condition instead of ending the plan, the run is in an `if` of that
+condition, so it runs only for a row that is there and has passed. The plan
+API releases what each run sorted, hashed or grouped at its `bc_sub_end`,
+so one run per outer row holds one run's worth, and reads the statement's
+snapshot, never the rows a write has written so far. A set operation's arms
+are printed apart from the statement's subqueries, so the binder refuses a
+correlated subquery in one.
+
+Not planned yet: a correlated subquery but that slice (#836), so no
+decorrelation into a semi-join or anti-join; one inside another, one in `FROM`
 (a derived table, but the grouped view of *Derived relations*), and `IN
 (SELECT …)` as a semi-join that probes the outer table's key per value,
 which #659 tracks.
@@ -1693,7 +1716,7 @@ Each slice was one PR, or a few, with its tests.
    aggregates in one select list.
 
 The rest of the dialect stays in #534: aliases of a join and of columns,
-expressions, correlated subqueries,
+expressions, correlated subqueries beyond *Subqueries*' slice,
 `FULL JOIN`, `FOR UPDATE` on joins, and `EXPLAIN`. The serializable guards,
 the plan cache and procedures (#495) keep their own designs.
 

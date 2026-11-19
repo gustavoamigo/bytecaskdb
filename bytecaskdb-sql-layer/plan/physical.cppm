@@ -490,14 +490,17 @@ struct SetPlan {
   std::vector<SqlType> types;
 };
 
-// An uncorrelated subquery's plan, run before the statement's own: its rows
-// folded as `kind` says into the parameters from `param` on, and for a Set
-// into the set InSet tests by its index here (logical::Subquery).
+// A subquery's plan: its rows folded as `kind` says into the parameters
+// from `param` on, and for a Set into the set InSet tests by its index here
+// (logical::Subquery). Uncorrelated, it runs before the statement's own;
+// correlated (`args`), before each conjunct that tests it, for the row in
+// hand, its arguments set from that row's columns.
 struct Sub {
   std::shared_ptr<const Plan> plan;
   logical::Subquery::Kind kind{logical::Subquery::Kind::Value};
   SqlType type{};
   std::uint32_t param{0};
+  std::vector<logical::Subquery::Arg> args;
 };
 
 struct Plan {
@@ -623,9 +626,15 @@ private:
   void subqueries() const {
     for (const auto& s : p_.subs) {
       if (!s.plan || !s.plan->subs.empty()) broken("a subquery with no plan, or one of its own");
-      using K = logical::Subquery::Kind;
-      auto n = s.kind == K::Bounds ? 4u : s.kind == K::Set ? 2u : 1u;
+      auto n = logical::Subquery::params(s.kind);
       if (std::uint64_t{s.param} + n > p_.param_types.size()) broken("a subquery's parameters past the statement's");
+      // An argument is a parameter of its own, of its column's type: a
+      // conjunct's run sets it from the row in hand.
+      for (const auto& a : s.args) {
+        param(a.param);
+        if (p_.param_types[a.param] != a.col.type) broken("a subquery argument of other than its column's type");
+        if (a.param >= s.param && a.param < s.param + n) broken("a subquery argument among the parameters it sets");
+      }
       check(*s.plan);
     }
   }
