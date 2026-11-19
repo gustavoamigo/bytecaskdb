@@ -1601,6 +1601,13 @@ struct TxnMark {
   std::size_t locks;
   std::size_t written;
   std::uint64_t held;
+  // The transaction's catalog at the mark (docs/transaction_design.md,
+  // *Mechanism: savepoint marks carry the catalog*): a rollback to the mark
+  // undoes the DDL since in memory, as the overlay undoes it in the batch.
+  // Null for the pinned catalog, which a mark taken before the first
+  // statement, or a re-pin after it, has not seen.
+  std::shared_ptr<const Catalog> catalog;
+  bool backfill;
 };
 
 // A transaction (docs/transaction_design.md): the snapshot and catalog
@@ -1614,6 +1621,13 @@ struct bc_txn {
   std::uint64_t max_bytes;
 
   std::shared_ptr<const Catalog> pinned;
+  // The catalog its statements are bound and run against: `pinned`, until
+  // its first DDL that changes something; then that DDL's private next
+  // version (bc_txn_ddl). The transaction has run DDL while the two differ.
+  std::shared_ptr<const Catalog> catalog;
+  // A DDL of it rewrote or indexed rows: its commit's engine refusal of the
+  // batch is the backfill's.
+  bool backfill{false};
   std::optional<bytecask::Snapshot> snap;  // engaged from the first statement to the commit
   // The writes: the commit is built from the overlay, its ranges first,
   // since every point in it is newer than any range over it. Shared with the
@@ -1651,6 +1665,10 @@ struct bc_txn {
   // `held`, so a mark neither records nor restores it; an abort that drops
   // the pin zeroes it, with the plans its holder then frees.
   std::uint64_t plan_bytes{0};
+  // What the catalogs it holds besides `pinned` are charged: its current
+  // one and those its marks keep, each distinct one once, by
+  // Catalog::estimated_bytes (recount_catalogs).
+  std::uint64_t catalog_bytes{0};
   std::uint64_t statements{0};         // statements wholly added
   // A statement failed: nothing but bc_txn_free is left. Set before any
   // part of a failing statement could reach the overlay or the guards, so
@@ -1698,6 +1716,24 @@ struct bc_txn {
     return !marks.empty() && marks.back().overlay == overlay ? overlay->bytes : 0;
   }
 
+  [[nodiscard]] auto has_ddl() const noexcept -> bool { return catalog != pinned; }
+
+  // What the catalogs would be charged with `current` the transaction's
+  // catalog. The marks' catalogs only move forward, mark to mark, to the
+  // current one, so each distinct one is counted once by skipping repeats.
+  [[nodiscard]] auto catalog_charge(const Catalog* current) const noexcept -> std::uint64_t {
+    std::uint64_t out = 0;
+    const Catalog* last = pinned.get();
+    auto count = [&](const Catalog* c) {
+      if (c != nullptr && c != last && c != pinned.get()) out += c->estimated_bytes();
+      last = c;
+    };
+    for (const auto& m : marks) count(m.catalog.get());
+    count(current);
+    return out;
+  }
+  void recount_catalogs() noexcept { catalog_bytes = catalog_charge(catalog.get()); }
+
   // Counts what the marks keep. Marks that share an overlay are adjacent (no
   // write was made between them, and a rollback drops every mark above the
   // one it restores), so each overlay is counted once; the current one is
@@ -1720,6 +1756,8 @@ struct bc_overlay {
   std::shared_ptr<const Overlay> view;
   bc_txn* owner;
   std::uint64_t reserved;
+  // The transaction's catalog when pinned: a hold reads the view with it.
+  std::shared_ptr<const Catalog> catalog;
   // A hold cursor took this pin over (bc_txn_hold), and with it `held_share`
   // of the memory cap, which the transaction's reservation leaves out
   // (pinned_by_holds) until the pin is released.
@@ -1769,7 +1807,7 @@ namespace {
 // statements were not held to.
 // The marks' overlays count as the pins' do.
 auto txn_holds(const bc_txn& t) -> std::uint64_t {
-  return t.overlay->bytes + t.held + t.pinned_bytes + t.marked_bytes + t.plan_bytes;
+  return t.overlay->bytes + t.held + t.pinned_bytes + t.marked_bytes + t.plan_bytes + t.catalog_bytes;
 }
 
 // What the transaction reserves of the memory cap for itself: txn_holds but
@@ -1808,11 +1846,14 @@ void txn_trim_reservation(bc_txn* txn) noexcept {
   txn->reserved = cap_holds(*txn);
 }
 
-// Puts the transaction back as it stood at `m`: its overlay, and its
-// guards, claims, locks and tables cut back to the mark's lengths. The
-// snapshot, the catalog, the pins and the marks stay.
+// Puts the transaction back as it stood at `m`: its overlay and catalog, and
+// its guards, claims, locks and tables cut back to the mark's lengths. The
+// snapshot, the pinned catalog, the pins and the marks stay.
 void txn_restore(bc_txn* txn, const TxnMark& m) noexcept {
   txn->overlay = m.overlay;
+  txn->catalog = m.catalog ? m.catalog : txn->pinned;
+  txn->backfill = m.backfill;
+  txn->recount_catalogs();
   txn->guards.erase(txn->guards.begin() + static_cast<std::ptrdiff_t>(m.guards), txn->guards.end());
   txn->claims.erase(txn->claims.begin() + static_cast<std::ptrdiff_t>(m.claims), txn->claims.end());
   txn->locks.erase(txn->locks.begin() + static_cast<std::ptrdiff_t>(m.locks), txn->locks.end());
@@ -1837,6 +1878,9 @@ void txn_abort(bc_txn* txn) noexcept {
   }
   txn->snap.reset();
   txn->pinned.reset();
+  txn->catalog.reset();  // the private one goes with the pin
+  txn->catalog_bytes = 0;
+  txn->backfill = false;
   txn->overlay = std::make_shared<Overlay>();  // a pin keeps the one it holds
   txn->guards = {};
   txn->claims = {};
@@ -3161,9 +3205,12 @@ void bc_ctx_begin_txn(bc_ctx* cx, bc_txn* txn, const bc_params* params, bc_budge
   if (!txn->snap) {
     auto p = txn->live->pin();
     txn->pinned = std::move(p.cat);
+    txn->catalog = txn->pinned;
     txn->snap.emplace(std::move(p.snap));
   }
-  cx->pinned = txn->pinned;
+  // The transaction's catalog, its own DDL included: every check the run
+  // makes (verify, layouts, index maintenance) reads it.
+  cx->pinned = txn->catalog;
   cx->cat = cx->pinned.get();
   cx->base = &*txn->snap;
   cx->overlay = txn->overlay.get();
@@ -3321,6 +3368,7 @@ bool bc_txn_repin(bc_txn* txn) {
   if (txn->statements != 0 || txn->pins != 0 || txn->aborted || txn->done || txn->attached != nullptr) return false;
   txn->snap.reset();
   txn->pinned.reset();
+  txn->catalog.reset();
   return true;
 }
 
@@ -3347,6 +3395,7 @@ void txn_pin(bc_txn* txn) {
   if (txn->snap) return;
   auto p = txn->live->pin();
   txn->pinned = std::move(p.cat);
+  txn->catalog = txn->pinned;
   txn->snap.emplace(std::move(p.snap));
 }
 
@@ -3359,6 +3408,15 @@ auto bc_txn_pinned_catalog(bc_txn* txn) -> std::shared_ptr<const bytecask::sql::
   txn_pin(txn);
   return txn->pinned;
 }
+
+auto bc_txn_catalog(bc_txn* txn) -> std::shared_ptr<const bytecask::sql::Catalog> {
+  (void)bc_txn_pinned_catalog(txn);
+  return txn->catalog;
+}
+
+auto bc_txn_has_ddl(const bc_txn* txn) noexcept -> bool { return txn->has_ddl(); }
+
+auto bc_txn_current_catalog(const bc_txn* txn) noexcept -> const Catalog* { return txn->catalog.get(); }
 
 auto bc_txn_first_statement(const bc_txn* txn) noexcept -> bool { return txn->statements == 0 && txn->pins == 0; }
 
@@ -3429,7 +3487,7 @@ auto bc_txn_overlay_pin_reserving(bc_txn* txn, std::uint64_t extra) -> bc_overla
     }
     txn->reserved += grant;
   }
-  auto pin = std::make_unique<bc_overlay>(bc_overlay{txn->overlay, txn, reserve});
+  auto pin = std::make_unique<bc_overlay>(bc_overlay{txn->overlay, txn, reserve, txn->catalog});
   txn->pinned_bytes += reserve;
   ++txn->pins;
   return pin.release();
@@ -3456,7 +3514,9 @@ bc_hold* bc_txn_hold(bc_txn* txn, bc_overlay* pin) {
   // reserved it, so the transaction holds at least that much) to the hold's.
   // What moves is what the transaction stops counting: the two stay equal.
   const auto moved = txn->memory != nullptr ? std::min(pin->reserved, txn->reserved) : 0;
-  auto* hold = new bc_hold{txn->snap->clone(), txn->pinned, pin->view, txn->memory, moved};
+  // The catalog the cursor was declared under: a table the transaction
+  // created is in it, read after the commit as the view holds its rows.
+  auto* hold = new bc_hold{txn->snap->clone(), pin->catalog, pin->view, txn->memory, moved};
   txn->reserved -= moved;
   txn->pinned_by_holds += moved;
   pin->held = true;
@@ -3602,6 +3662,136 @@ bool bc_txn_add(bc_ctx* cx) {
   return false;
 }
 
+}  // extern "C"
+
+namespace {
+
+// A transaction's view of one key prefix: its snapshot's entries with its
+// overlay over them, merged in key order, as a statement of it reads them.
+// What a DDL's backfill reads in a transaction (Catalog::next_version), so
+// a row the transaction wrote is indexed or rewritten and one it deleted is
+// not. Holds the overlay it was made on, and the transaction's snapshot by
+// reference: used while the DDL runs, before anything else of the
+// transaction can.
+class TxnRows final : public bytecask::sql::RowSource {
+public:
+  TxnRows(const bytecask::Snapshot& snap, std::shared_ptr<const Overlay> overlay)
+      : snap_{snap}, overlay_{std::move(overlay)} {}
+  ~TxnRows() override;
+  TxnRows(const TxnRows&) = delete;
+  TxnRows& operator=(const TxnRows&) = delete;
+
+  void scan(BytesView prefix, const std::function<void(BytesView, BytesView)>& visit) const override {
+    const auto& ov = *overlay_;
+    auto entries = snap_.iter_from({}, prefix);
+    auto s = entries.begin();
+    auto p = ov.points.lower_bound(prefix);
+    auto snap_live = [&] { return s != entries.end() && has_prefix((*s).key, prefix); };
+    auto point_live = [&] { return p != ov.points.end() && has_prefix(p->first, prefix); };
+    for (;;) {
+      // A snapshot entry the overlay decides is the overlay's to give, or to hide.
+      while (snap_live() && (ov.points.contains((*s).key) || ov.covered((*s).key))) ++s;
+      const auto from_snap = snap_live();
+      const auto from_point = point_live();
+      if (!from_snap && !from_point) return;
+      if (from_point && (!from_snap || std::ranges::lexicographical_compare(p->first, (*s).key))) {
+        if (p->second) visit(p->first, *p->second);
+        ++p;
+      } else {
+        visit((*s).key, (*s).value);
+        ++s;
+      }
+    }
+  }
+
+private:
+  const bytecask::Snapshot& snap_;
+  std::shared_ptr<const Overlay> overlay_;
+};
+
+TxnRows::~TxnRows() = default;
+
+}  // namespace
+
+auto bc_txn_rows(bc_txn* txn) -> std::unique_ptr<bytecask::sql::RowSource> {
+  (void)bc_txn_pinned_catalog(txn);  // the snapshot is the transaction's from here
+  return std::make_unique<TxnRows>(*txn->snap, txn->overlay);
+}
+
+auto bc_txn_ddl(bc_txn* txn, std::shared_ptr<const Catalog> next, std::vector<Catalog::DdlOp>& ops,
+                bool backfill) noexcept -> bool {
+  using Kind = Catalog::DdlOp::Kind;
+  try {
+    txn->sink().clear();
+    if (txn->aborted || txn->done || txn->attached != nullptr || !txn->snap || !next) {
+      txn->sink().fail(BC_E_HANDLE, "bc_txn_ddl needs an open transaction with no statement open, and a catalog");
+      return false;
+    }
+    // The ops of a DDL that changed the catalog guard and bump its version
+    // (docs/catalog_design.md, *DDL*): the commit's one version guard then
+    // stands for the name and record guards dropped below.
+    const auto version = bytecask::sql::catalog_version_key();
+    const auto bumps = std::ranges::any_of(ops, [&](const auto& op) { return op.kind == Kind::Put && op.a == version; });
+    const auto guards = std::ranges::any_of(ops, [&](const auto& op) {
+      return op.kind == Kind::EnsureUnchanged && op.a == version;
+    });
+    if (!bumps || !guards) {
+      txn->sink().fail(BC_E_HANDLE, "a DDL's batch that does not guard and bump the catalog version");
+      return false;
+    }
+    // Aborted until the DDL is wholly in, as a statement's writes are.
+    txn->aborted = true;
+    (void)txn->own_overlay();  // before the first write: a clone that fails changes nothing
+    txn->recount_marks();      // a mark that shared the overlay keeps the copy
+    for (auto& op : ops) {
+      switch (op.kind) {
+        case Kind::Put: txn->overlay->put(std::move(op.a), std::move(op.b)); break;
+        case Kind::Del: txn->overlay->del(std::move(op.a)); break;
+        case Kind::DelRange: txn->overlay->del_range(std::move(op.a), std::move(op.b)); break;
+        case Kind::EnsureRangeUnchanged: {
+          // A backfill's rows: a write to them since the snapshot is the commit's conflict.
+          Effect e{EffectKind::GuardRange, std::move(op.a), std::move(op.b)};
+          const auto bytes = effect_bytes(true, e);
+          txn->guards.push_back(std::move(e));
+          txn->held += bytes;
+          break;
+        }
+        // Checked against the head at commit, a name guard would fail a
+        // transaction that drops a name and takes it again; the commit's
+        // version guard covers what they guard.
+        case Kind::EnsureAbsent:
+        case Kind::EnsureUnchanged: break;
+      }
+      Bytes{}.swap(op.a);  // freed once the overlay holds it: a backfill is in memory about once
+      Bytes{}.swap(op.b);
+    }
+    const auto charge = txn->catalog_charge(next.get());
+    if (txn_holds(*txn) - txn->catalog_bytes + charge > txn->max_bytes) {
+      txn->sink().fail(BC_E_LIMIT, "the transaction's DDL would pass its bound of " + std::to_string(txn->max_bytes) +
+                                       " bytes; run the DDL outside a transaction");
+      txn_abort(txn);
+      return false;
+    }
+    if (!txn_reserve_with(txn, charge > txn->catalog_bytes ? charge - txn->catalog_bytes : 0)) {
+      txn_abort(txn);
+      return false;
+    }
+    // Last, and nothing here throws: the DDL is the transaction's.
+    txn->catalog = std::move(next);
+    txn->catalog_bytes = charge;
+    txn->backfill = txn->backfill || backfill;
+    ++txn->statements;
+    txn->aborted = false;
+    return true;
+  } catch (...) {
+    txn->fail_current_exception();
+    txn_abort(txn);
+    return false;
+  }
+}
+
+extern "C" {
+
 uint32_t bc_txn_savepoint(bc_txn* txn) {
   BC_GUARD_BEGIN
   txn->sink().clear();
@@ -3617,7 +3807,8 @@ uint32_t bc_txn_savepoint(bc_txn* txn) {
   }
   // The mark shares the overlay: it charges nothing until a write clones it.
   txn->marks.push_back(TxnMark{txn->overlay, txn->guards.size(), txn->claims.size(), txn->locks.size(),
-                               txn->written.size(), txn->held});
+                               txn->written.size(), txn->held, txn->has_ddl() ? txn->catalog : nullptr,
+                               txn->backfill});
   return static_cast<std::uint32_t>(txn->marks.size());
   BC_GUARD_END(txn)
   return 0;  // nothing was pushed: the transaction is as it was
@@ -3648,11 +3839,55 @@ bool bc_txn_release(bc_txn* txn, uint32_t depth) {
   }
   txn->marks.erase(txn->marks.begin() + (depth - 1), txn->marks.end());
   txn->recount_marks();
+  txn->recount_catalogs();
   txn_trim_reservation(txn);
   return true;
   BC_GUARD_END(txn)
   return false;  // only a refusal's message can throw, before anything changed
 }
+
+}  // extern "C"
+
+namespace {
+
+// The commit of a transaction that ran DDL (docs/transaction_design.md,
+// *Mechanism: committing and publishing a transaction's catalog changes*):
+// its plan, writes and guards built as any transaction's, published through
+// LiveCatalog::commit, as an autocommit DDL is, so its catalog takes effect
+// with its batch or not at all, synced. One guard on the catalog version
+// stands for the catalog-record guards: every DDL published since the
+// snapshot moved it.
+auto commit_ddl(bc_txn* txn, ErrorSink out, bytecask::WritePlan plan) -> bc_commit_result {
+  plan.ensure_unchanged(bytecask::sql::catalog_version_key());
+  LiveCatalog::Prepared p{txn->pinned, txn->catalog, std::make_unique<bytecask::WritePlan>(std::move(plan)),
+                          txn->backfill};
+  bool applied = false;
+  try {
+    applied = txn->live->commit(std::move(p));
+  } catch (const bytecask::sql::DdlInProgress&) {
+    return BC_CONFLICT;  // another DDL is publishing: this one does not wait
+  } catch (const bytecask::sql::CommitOutcomeUnknown& e) {
+    out.unknown(e.what());
+    return BC_FAILED;
+  } catch (...) {
+    out.fail_current_exception();
+    return BC_FAILED;
+  }
+  if (applied) return BC_COMMITTED;
+  // Which guard failed: with a DDL published since, a taken key may be a
+  // private id's collision, not a duplicate, and the version guard failed
+  // anyway: 40001. With none, it is classified as any transaction's.
+  try {
+    if (txn->live->head_version() != txn->pinned->version()) return BC_CONFLICT;
+  } catch (...) {
+    return BC_CONFLICT;
+  }
+  return conflict_or_duplicate(out, *txn->db, txn->claims, txn->locks, txn->overlay.get());
+}
+
+}  // namespace
+
+extern "C" {
 
 enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
   // It touches no context, and reports through the transaction.
@@ -3717,6 +3952,7 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
       case EffectKind::DelRange: break;  // never kept as guards
     }
   }
+  if (txn->has_ddl()) return commit_ddl(txn, out, std::move(plan));
   // As bc_ctx_commit: a DDL on a table the transaction wrote, committed
   // since its snapshot, makes the commit a conflict.
   for (auto id : txn->written) plan.ensure_unchanged(bytecask::sql::table_record_key(id));

@@ -512,7 +512,10 @@ its pin, and otherwise compiles the statement privately at the pin.
 ## DDL
 
 A DDL statement is bound when it runs, against the catalog it runs in, not
-when it is prepared (`frontend_design.md`, *Binding*). Every DDL statement
+when it is prepared (`frontend_design.md`, *Binding*). In autocommit that
+is the live catalog, and the DDL commits at once; in a transaction it is
+the transaction's catalog, and the DDL is a step of the transaction,
+published at its commit (`transaction_design.md`, *Transactional DDL*). Every DDL statement
 is one atomic batch: the table record, the name entries
 and the counters, plus the rows a backfill writes or the ranges a drop
 deletes. It is built on a snapshot and guarded by `ensure_unchanged` on the
@@ -549,6 +552,33 @@ refused, as is a column whose id has no bit in the layout's bitmap (it needs
 a `REBUILD`, which doesn't exist yet, #503). Ids taken by a DDL are not reused, even when
 it is dropped later.
 
+**Every catalog write bumps the version.** Every write to the catalog
+namespace `01` goes through `Catalog::next_version`, and every
+`next_version` that changes something guards (`ensure_unchanged`) and puts
+the version key. A transaction's DDL relies on it: `bc_txn_ddl` asserts
+both are in the batch it is given, then drops the name entries'
+`ensure_absent` and the version guard, which a transaction that drops a
+name and takes it again would fail at its commit, and the commit guards the
+version key once instead. Any DDL that took a name, or changed a record,
+since the transaction's snapshot moved the version, so that one guard
+stands for them all. Autocommit DDL keeps its guards and does not rely on
+it. The exceptions: the test seam `conflict_on_every_commit_for_testing`
+rewrites table records unchanged with a plain put (test-only, and it
+creates no name); and a sequence counter (`nextval`, not built) would write
+namespace `01` without a DDL, and must then go around a transaction's
+overlay and be named here.
+
+**A version number names only a published catalog.** A transaction's DDL
+makes a private catalog numbered its base plus one per DDL, and two open
+transactions may each hold a different catalog of the same number. Only
+`LiveCatalog` publishes one; a transaction's commit publishes its private
+catalog through `LiveCatalog::commit`, whose version guard proved that none
+was published since its base, so the number it publishes is above every one
+published before. Versions are not contiguous. Every cache keyed by version
+(the shared plan cache, the shared procedure map) is consulted with a
+published catalog's version only: a transaction that has run DDL compiles
+every statement privately.
+
 **Backfill is one batch, bounded by the engine's 1 GiB plan limit.**
 `CREATE INDEX` and `ADD COLUMN … DEFAULT` on a populated table read every row
 from the snapshot and write in the same batch as the catalog record, so the
@@ -558,11 +588,13 @@ commits during the backfill a conflict; the DDL is retried up to three
 times on a fresh snapshot and then fails. `Catalog::next_version` reads
 the rows through a `RowSource`, an ordered scan of one key prefix:
 autocommit DDL gives it its snapshot (`SnapshotRows`), and a DDL in a
-transaction will give it the transaction's view of its snapshot and its own
-writes (`transaction_design.md`, *Mechanism: the transaction's private
-catalog*). A backfill counts the bytes it
-gathers and is refused, with an error that says so, as soon as they pass the
-1 GiB limit, before it has read the rest of the table into memory. The alternative, batches written
+transaction gives it the transaction's view of its snapshot and its own
+writes (`bc_txn_rows`; `transaction_design.md`, *Mechanism: the
+transaction's private catalog*). A backfill counts the bytes it
+gathers and is refused (`BackfillTooLarge`), with an error that says so, as
+soon as they pass the 1 GiB limit, before it has read the rest of the table
+into memory; in a transaction, as soon as they pass the transaction's
+`max_bytes` if that is less (54000, "run the DDL outside a transaction"). The alternative, batches written
 while the index is invisible to reads but maintained by writes, needs an
 index state in the record ("write-only") and plans that respect it; it is
 deferred (#505), and the schema is created before the data until then. The

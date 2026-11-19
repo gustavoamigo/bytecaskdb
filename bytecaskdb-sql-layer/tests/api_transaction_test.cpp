@@ -1227,16 +1227,20 @@ TEST_CASE("embedded API: a key a transaction inserted that a concurrent commit t
   }
 }
 
-TEST_CASE("embedded API: DDL given to a transaction is 0A000 and aborts it", "[sql][api][txn]") {
+TEST_CASE("embedded API: CREATE TABLE AS given to a transaction is 0A000 and aborts it", "[sql][api][txn]") {
   sql_test::TempDir dir{"api_txn"};
   auto db = open_db(dir);
   auto t = db->begin();
   t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{10}});
-  CHECK_THROWS_AS(t.execute("CREATE INDEX acct_bal ON acct (bal)"), FeatureNotSupported);
+  CHECK_THROWS_AS(t.execute("CREATE TABLE copy AS SELECT id FROM acct"), FeatureNotSupported);
   CHECK(t.is_aborted());
-  CHECK(db->catalog()->index("acct_bal").second == nullptr);
+  CHECK(db->catalog()->table("copy") == nullptr);
   CHECK(t.commit() == CommitOutcome::RolledBack);
   CHECK(balance(*db, 1) == std::nullopt);
+  // SELECT … INTO is CREATE TABLE AS too.
+  auto u = db->begin();
+  CHECK_THROWS_AS(u.execute("SELECT id INTO copy FROM acct"), FeatureNotSupported);
+  CHECK(u.is_aborted());
 }
 
 TEST_CASE("embedded API: a DDL on a table an open transaction wrote makes its commit 40001; one it read does not",

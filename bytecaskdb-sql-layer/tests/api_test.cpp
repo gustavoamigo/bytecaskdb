@@ -1389,7 +1389,7 @@ TEST_CASE("embedded API: sqlstate reports PostgreSQL's SQLSTATE for each error",
   CHECK(state([&] { (void)db->table_rows("nope"); }) == "42P01");
   CHECK(state([&] { (void)db->execute("SELECT n FROM s WHERE k = $1", {}); }) == "08P01");
   auto txn = db->begin();
-  CHECK(state([&] { (void)txn.execute("CREATE TABLE u (k BIGINT PRIMARY KEY)"); }) == "0A000");
+  CHECK(state([&] { (void)txn.execute("CREATE TABLE u AS SELECT k FROM s"); }) == "0A000");
   CHECK(state([&] { (void)txn.execute("SELECT n FROM s WHERE k = $1", {i(1)}); }) == "25P02");
   CHECK(sqlstate(SerializationFailure{"x"}) == "40001");
   CHECK(sqlstate(ExecError::conflicted("x")) == "40001");
@@ -3908,8 +3908,10 @@ TEST_CASE("embedded API: CREATE and DROP PROCEDURE are DDL, kept in the catalog 
     CHECK(state(*db, "CREATE TABLE neword (id INTEGER PRIMARY KEY)") == "ran");  // its own namespace
     {
       auto txn = db->begin();
-      CHECK_THROWS_AS(txn.execute("DROP PROCEDURE neword"), FeatureNotSupported);  // DDL, refused in a block
+      (void)txn.execute("DROP PROCEDURE neword");  // DDL of the transaction: rolled back with it
+      CHECK(txn.procedure("neword") == nullptr);
       txn.rollback();
+      CHECK(db->catalog()->procedure("neword") != nullptr);
     }
   }
   {

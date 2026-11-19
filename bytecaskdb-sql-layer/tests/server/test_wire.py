@@ -2545,6 +2545,30 @@ def test_a_ddl_parsed_in_a_block_and_never_executed_leaves_it_open(server):
     assert columns(q(c, "SELECT * FROM r")) == ["k", "a"]
 
 
+def test_ddl_in_a_begin_block_is_refused_and_fails_the_block(server):
+    """docs/transaction_design.md, stage 2: the embedded Transaction runs
+    DDL, a BEGIN block does not yet (stage 3). By Simple Query and by
+    Execute, DDL in a block is 0A000 and fails the block, which ROLLBACK
+    ends with nothing written; in a READ ONLY block it is 25006 first, as
+    PostgreSQL's."""
+    c = connect(server)
+    q(c, "BEGIN")
+    out = q(c, "CREATE TABLE in_block (k INTEGER PRIMARY KEY)")
+    assert states(out) == ["0A000"] and status(out) == "E"
+    q(c, "ROLLBACK")
+    q(c, "BEGIN")
+    c.send(parse("CREATE TABLE in_block (k INTEGER PRIMARY KEY)"), bind([]), execute(), SYNC)
+    out = c.until_ready()
+    assert states(out) == ["0A000"] and status(out) == "E"
+    q(c, "ROLLBACK")
+    q(c, "BEGIN READ ONLY")
+    out = q(c, "CREATE TABLE in_block (k INTEGER PRIMARY KEY)")
+    assert states(out) == ["25006"] and status(out) == "E"
+    q(c, "ROLLBACK")
+    out = q(c, "SELECT * FROM in_block")
+    assert states(out) == ["42P01"]
+
+
 def test_a_ddl_is_bound_at_execute_and_a_query_at_parse(server):
     """docs/transaction_design.md, stage 1, as PostgreSQL 17: Parse and
     Describe of a DDL naming a table that does not exist are no error, its

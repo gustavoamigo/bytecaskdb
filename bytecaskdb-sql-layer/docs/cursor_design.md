@@ -1063,6 +1063,22 @@ to the plain plan, and any other failure, a 54000 among them, fails the
 open. A DECLARE runs its query by text: it returns rows, so it has no
 result type to keep.
 
+**Cursors and the transaction's DDL** (`transaction_design.md`, *Savepoints,
+cursors, portals and prepared statements across DDL*, stage 2). As
+PostgreSQL's CheckTableNotInUse, a DDL that changes what an open cursor of
+the transaction reads is 55006, and aborts the transaction, whatever the
+cursor has fetched: DROP TABLE, CREATE INDEX or ALTER TABLE of a table its
+plan reads ("cannot DROP TABLE "t" because it is being used by active
+queries in this session"), and DROP INDEX of an index its plan scans. The
+check reads the objects the cursor's plan names (its schema ref); a plan
+that reads the table without the index does not hold the index. CREATE
+VIEW, DROP VIEW and DDL on what no open cursor reads run. A hold cursor of
+an earlier transaction is not counted: it reads its own view. The overlay
+pin a cursor takes at DECLARE records the transaction's catalog of that
+moment, and a hold cursor keeps it: one over a table the transaction
+created reads it after COMMIT. The server's portals count with the cursors
+from stage 3, which runs DDL in a block.
+
 ## Deferred
 
 - `FETCH LAST` and `BACKWARD` by a reverse run, without replay: #725.

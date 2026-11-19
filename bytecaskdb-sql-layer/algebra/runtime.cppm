@@ -104,6 +104,33 @@ void bc_ctx_begin_frame(bc_ctx* cx, const bc_params* params, bc_budget budget);
 // would. It throws std::logic_error for an aborted or ended transaction or
 // one with a statement open, and what the pin throws.
 std::shared_ptr<const bytecask::sql::Catalog> bc_txn_pinned_catalog(bc_txn* txn);
+// The catalog the transaction's statements bind against: the pinned one,
+// pinned first as bc_txn_pinned_catalog does, plus the transaction's own
+// DDL (docs/transaction_design.md, *Mechanism: the transaction's private
+// catalog*). Throws as bc_txn_pinned_catalog does.
+std::shared_ptr<const bytecask::sql::Catalog> bc_txn_catalog(bc_txn* txn);
+// The transaction's catalog as it stands, without pinning: null before its
+// first statement and after an abort that dropped its pin.
+const bytecask::sql::Catalog* bc_txn_current_catalog(const bc_txn* txn) noexcept;
+// The transaction has run DDL: its catalog is not the one it pinned. A
+// rollback to a mark taken before its first DDL makes it false again.
+bool bc_txn_has_ddl(const bc_txn* txn) noexcept;
+// The rows a DDL of the transaction reads: its snapshot with its writes
+// over them, one key prefix at a time. Valid until the transaction's next
+// statement, DDL or commit. Pins first; throws as bc_txn_pinned_catalog does.
+std::unique_ptr<bytecask::sql::RowSource> bc_txn_rows(bc_txn* txn);
+// A DDL of the transaction: `next`, the catalog Catalog::next_version made
+// from bc_txn_catalog, and its batch `ops`, which must guard and bump the
+// catalog version. The writes join the overlay (each op's bytes freed as it
+// does), a backfill's row guards join the transaction's guards, the name
+// and version guards are dropped (the commit guards the version), and the
+// catalog is charged to max_bytes and the memory cap; then `next` is the
+// transaction's catalog. False with bc_txn_error set when it fails (BC_E_LIMIT
+// past max_bytes, BC_E_MEMORY), and the transaction is aborted, as for a
+// failed statement: back to its newest mark, catalog included, if it has one.
+// `backfill`: the DDL rewrote or indexed rows.
+bool bc_txn_ddl(bc_txn* txn, std::shared_ptr<const bytecask::sql::Catalog> next,
+                std::vector<bytecask::sql::Catalog::DdlOp>& ops, bool backfill) noexcept;
 // No statement was added and no cursor pinned the overlay: bc_txn_repin would re-pin.
 bool bc_txn_first_statement(const bc_txn* txn) noexcept;
 // Charges `bytes` of private plans to max_bytes and the memory cap: false,
@@ -145,6 +172,11 @@ export using ::bc_ctx_begin_frame;
 export using ::bc_ctx_affected;
 export using ::bc_txn_pinned_catalog;
 export using ::bc_txn_first_statement;
+export using ::bc_txn_catalog;
+export using ::bc_txn_has_ddl;
+export using ::bc_txn_current_catalog;
+export using ::bc_txn_rows;
+export using ::bc_txn_ddl;
 export using ::bc_txn_charge_plans;
 export using ::bc_txn_release_plans;
 export using ::bc_txn_overlay_pin_reserving;

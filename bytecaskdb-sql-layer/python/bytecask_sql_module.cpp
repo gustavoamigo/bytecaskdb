@@ -29,7 +29,7 @@
 // bytecask_sql.TransactionAborted (SQLSTATE 25P02) for a statement on a
 // transaction a statement failed in; bytecask_sql.TransactionResolutionUnknown
 // (08007) for a commit whose outcome is unknown; bytecask_sql.FeatureNotSupported
-// (0A000), a SqlError, for a DDL statement given to a transaction and for a
+// (0A000), a SqlError, for CREATE TABLE AS given to a transaction and for a
 // statement the planner can't plan ("no plan: ..."). A transaction whose commit
 // conflicts raises ExecError with conflict set (40001). All
 // derive from bytecask_sql.Error. Anything else, an engine refusal at run

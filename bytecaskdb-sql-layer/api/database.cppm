@@ -246,6 +246,9 @@ enum class Command {
   DropSequence,
 };
 
+// The command's name, as PostgreSQL's messages give it: "CREATE TABLE".
+[[nodiscard]] auto command_name(Command c) -> std::string_view;
+
 // A result column: its name and SQL type, as a client is told them before
 // the statement runs.
 struct ResultColumn {
@@ -267,6 +270,12 @@ struct StatementRecord {
   Command command{Command::Select};
   bool ddl{false};  // runs no plan: a DDL, CREATE TABLE AS, SELECT … INTO
   std::uint64_t version{0};
+  // Fixed at a transaction's private catalog, after its own DDL: `version`
+  // is then the published catalog that transaction was based on, and its
+  // columns may be those of a catalog later than it, the one the
+  // transaction published at its commit (docs/transaction_design.md,
+  // *Savepoints, cursors, portals and prepared statements across DDL*).
+  bool private_catalog{false};
   // An UPDATE or DELETE ... WHERE CURRENT OF: the cursor it names, and the
   // table it writes; empty for any other statement.
   std::string current_of;
@@ -435,9 +444,15 @@ private:
   friend class Database;
   friend class Transaction;
   friend class PlanRef;
-  explicit TxnPlan(std::shared_ptr<const Catalog> cat) : catalog_{std::move(cat)} {}
+  TxnPlan(std::shared_ptr<const Catalog> cat, std::uint64_t base, bool is_private)
+      : catalog_{std::move(cat)}, version_{base}, private_{is_private} {}
   [[nodiscard]] auto compiled() const -> const Statement::Compiled& { return *compiled_; }
   std::shared_ptr<const Catalog> catalog_;
+  // The published catalog it was compiled at: the transaction's pin, also
+  // after the transaction's own DDL, when `private_` says its catalog is
+  // the transaction's private one.
+  std::uint64_t version_{0};
+  bool private_{false};
   std::shared_ptr<const ast::Statement> parse_;
   std::optional<Statement::Compiled> compiled_;  // a statement's
   std::optional<CompiledProcedure> procedure_;   // a procedure's
@@ -469,6 +484,27 @@ private:
   [[nodiscard]] auto get() const -> const Statement::Compiled& { return shared_ ? *shared_ : private_->compiled(); }
   std::shared_ptr<const Statement::Compiled> shared_;
   std::shared_ptr<const TxnPlan> private_;
+};
+
+// A statement Transaction::prepare described (docs/transaction_design.md,
+// *Mechanism: plans compiled against the transaction's catalog*): its text
+// and its record, as the server's named statement holds them. It holds no
+// plan, so it outlives its transaction: run with check() through any
+// transaction's or the Database's execute forms that take a ResultCheck, it
+// resolves its text where it runs, keeping its parameter types and result
+// columns. A text naming a table its transaction created and did not commit
+// is then 42P01.
+class TxnStatement {
+public:
+  [[nodiscard]] auto sql() const -> const std::string& { return sql_; }
+  [[nodiscard]] auto record() const -> const StatementRecord& { return record_; }
+  [[nodiscard]] auto check() const -> ResultCheck { return ResultCheck::given(record_); }
+
+private:
+  friend class Transaction;
+  TxnStatement(std::string sql, StatementRecord record) : sql_{std::move(sql)}, record_{std::move(record)} {}
+  std::string sql_;
+  StatementRecord record_;
 };
 
 struct TransactionOptions {
@@ -661,6 +697,23 @@ struct TxnHandle {
   // already.
   std::map<std::string, std::shared_ptr<const TxnPlan>, std::less<>> plans;
   std::uint64_t plan_charge{0};
+  std::uint64_t max_bytes{0};  // TransactionOptions::max_bytes
+
+  // Drops the private plans compiled for another catalog than `cat`, and
+  // returns their charge: a rollback to a mark undid the DDL they followed.
+  void drop_plans_not_for(const Catalog* cat) noexcept {
+    std::uint64_t dropped = 0;
+    for (auto it = plans.begin(); it != plans.end();) {
+      if (it->second->catalog().get() == cat) {
+        ++it;
+        continue;
+      }
+      dropped += it->second->estimate();
+      it = plans.erase(it);
+    }
+    if (txn != nullptr) bc_txn_release_plans(txn, dropped);
+    plan_charge -= std::min(dropped, plan_charge);
+  }
 
   // Drops the private plans and returns their charge to the transaction.
   void clear_plans() noexcept {
@@ -817,7 +870,30 @@ public:
 
   // Runs one statement in the transaction. Throws what Database::execute
   // throws for a statement that fails, and the transaction is then aborted;
-  // TransactionAborted if it already is. A DDL statement is refused (0A000).
+  // TransactionAborted if it already is.
+  //
+  // A DDL statement is part of the transaction (docs/transaction_design.md,
+  // *Transactional DDL*): later statements see it, and commit() publishes it
+  // with the transaction's writes, or nothing; a rollback, an abort, or a
+  // rollback_to() a savepoint taken before it undoes it. Other sessions see
+  // nothing of it until then, and never wait for it. It is bound against
+  // the transaction's catalog. CREATE TABLE AS and SELECT … INTO are refused
+  // (0A000). Its errors are the ones it has outside a transaction, and:
+  // DdlRefused 25006 on a follower; DdlRefused 55006 for a DROP TABLE,
+  // CREATE INDEX or ALTER TABLE of a table an open cursor of the transaction
+  // reads, or a DROP INDEX of an index one scans; SerializationFailure
+  // (40001) when the live catalog has moved past the one the transaction
+  // pinned, unless it is the transaction's first statement, which pins again;
+  // ExecError BC_E_LIMIT (54000) when its backfill or what it adds would
+  // pass TransactionOptions::max_bytes, or its backfill the engine's 1 GiB
+  // batch. A DDL that IF [NOT] EXISTS skips changes nothing, and returns its
+  // notice.
+  //
+  // Once the transaction has run DDL, every statement but rollback() and
+  // rollback_to() is SerializationFailure once another DDL has published:
+  // the transaction's commit could only conflict. That failure aborts the
+  // transaction, as any failed statement does, and rollback_to() a savepoint
+  // taken before its first DDL lets it go on.
   //
   // Every statement is bound against the catalog the transaction pinned at
   // its first statement (docs/transaction_design.md, *A transaction binds
@@ -830,8 +906,8 @@ public:
   // The forms by text bind with inferred parameter types and return the
   // pinned catalog's columns, or follow `check`. While the live catalog is
   // past the pin, any binder error is SerializationFailure: the pinned
-  // catalog lacks what the statement needs. A SerializationFailure ends the
-  // transaction.
+  // catalog lacks what the statement needs. A SerializationFailure ends a
+  // transaction that has run no DDL.
   auto execute(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts = {}) -> Rows;
   auto execute(std::string_view sql, const std::vector<Value>& params = {}, const ExecutionOptions& opts = {}) -> Rows;
   auto execute(std::string_view sql, const ResultCheck& check, const std::vector<Value>& params,
@@ -843,6 +919,12 @@ public:
   // transaction.
   auto refit(const Statement& stmt) -> StatementRecord;
   auto refit(std::string_view sql, const ResultCheck& check) -> StatementRecord;
+  // The text and its record, from refit(sql, none): a value to run later
+  // through any execute form that takes a ResultCheck, here, in another
+  // transaction or in autocommit. Puts nothing in the shared cache. Throws
+  // as refit does. A record fixed after the transaction's own DDL is marked
+  // so (StatementRecord::private_catalog).
+  auto prepare(std::string_view sql) -> TxnStatement;
   // The stored procedure `name` as the transaction's catalog has it; null
   // when it has none (the caller's 42883). SerializationFailure, the
   // transaction ended, when it has none and the live catalog is past the pin.
@@ -988,6 +1070,9 @@ private:
     const Statement* held{nullptr};
     const StatementRecord* given{nullptr};
     bool cursor_query{false};  // the keyed twin a cursor reads
+    // A text no one has prepared may be prepared in the shared cache at a
+    // live pin; Transaction::prepare puts nothing there.
+    bool share{true};
   };
   Transaction(Database& db, TransactionOptions opts);
   // Under life_->mu, shared: refuses a call on a closed database or an
@@ -1000,6 +1085,17 @@ private:
   // statement a DDL raced, and throws 0A000 for DDL, the rule's 40001s and
   // 0A000, and the binder's errors. Null for a DDL text when `describe`.
   auto plan_for(const Target& t, bool describe = false) -> PlanRef;
+  auto plan_for(const Target& t, const std::shared_ptr<const ast::Statement>& parse) -> PlanRef;
+  // The target's parse, which depends on no catalog: the held statement's,
+  // the shared cache's or a private plan's for the text, else parsed now.
+  auto parse_of(const Target& t) -> std::shared_ptr<const ast::Statement>;
+  // Runs a DDL as a step of the transaction (docs/transaction_design.md,
+  // *Mechanism: the transaction's private catalog*).
+  auto run_ddl(const ast::Statement& st, const std::vector<Value>& params) -> Rows;
+  // 55006 for a DDL on what an open cursor of the transaction reads.
+  void check_in_use(const Ddl& ddl, const Catalog& cat) const;
+  // 40001 for a transaction that has run DDL once another DDL has published.
+  void check_doomed() const;
   auto run_locked(const Target& t, const std::vector<Value>& params, const ExecutionOptions& opts,
                   WindowRows* window = nullptr, RowWindow range = {}, const CursorState* positioned = nullptr) -> Rows;
   auto refit_locked(const Target& t) -> StatementRecord;
@@ -1264,13 +1360,46 @@ private:
   // Replaces `old` in the cache with a statement of the same text and
   // `plan`; `old` stays valid until close(). The cache's statement after.
   auto replace_cached(const Statement& old, std::shared_ptr<const Compiled> plan) -> const Statement&;
-  // A transaction's plan for its target at its pinned catalog `pin`: the
-  // shared plan bound at exactly `pin`, the transaction's private one for
-  // it, or a private compile, charged and kept in its map.
-  auto txn_plan(TxnHandle& h, const Transaction::Target& t, const std::shared_ptr<const Catalog>& pin,
+  struct TxnCatalog;
+  // The version of a catalog every session sees: the only kind a version
+  // names, since two transactions may each hold a private catalog of the
+  // same number. Only a TxnCatalog whose catalog is still its pin makes one,
+  // and the transaction's version-keyed sites (shared_txn_plan,
+  // shared_procedure) take it, so a private catalog cannot reach them.
+  class Published {
+  public:
+    [[nodiscard]] auto version() const -> std::uint64_t { return version_; }
+
+  private:
+    friend struct TxnCatalog;
+    explicit Published(std::uint64_t version) : version_{version} {}
+    std::uint64_t version_;
+  };
+  // A transaction's catalog (docs/transaction_design.md, *Mechanism: plans
+  // compiled against the transaction's catalog*): the published catalog it
+  // pinned, and its own, which is that one until its first DDL.
+  struct TxnCatalog {
+    std::shared_ptr<const Catalog> base;
+    std::shared_ptr<const Catalog> cat;
+    [[nodiscard]] auto published() const -> std::optional<Published> {
+      if (cat != base) return std::nullopt;
+      return Published{base->version()};
+    }
+  };
+  // A transaction's plan for its target at its catalog: the shared plan
+  // bound at exactly its published catalog, the transaction's private one
+  // for its catalog, or a private compile, charged and kept in its map.
+  auto txn_plan(TxnHandle& h, const Transaction::Target& t, const TxnCatalog& tc,
                 const std::shared_ptr<const ast::Statement>& parse) -> PlanRef;
-  // A procedure's plan at the transaction's catalog `pin`.
-  auto txn_procedure(TxnHandle& h, const Procedure& def, const std::shared_ptr<const Catalog>& pin, bool share)
+  // The shared plan for `t` bound at exactly `at`, at the types `fixed`
+  // (inferred when none); nullopt when there is none.
+  auto shared_txn_plan(const Transaction::Target& t, const std::string& key,
+                       const std::optional<std::vector<SqlType>>& fixed, const Published& at) -> std::optional<PlanRef>;
+  // A procedure's plan at the transaction's catalog.
+  auto txn_procedure(TxnHandle& h, const Procedure& def, const TxnCatalog& tc, bool share)
+      -> std::shared_ptr<const CompiledProcedure>;
+  // The shared procedure plan compiled at exactly `at`; null when there is none.
+  auto shared_procedure(const Procedure& def, bool share, const Published& at)
       -> std::shared_ptr<const CompiledProcedure>;
   // What the search costs plans with: each table's row count, counted on a
   // snapshot taken now.
@@ -1551,6 +1680,37 @@ auto Statement::columns() const -> std::vector<ResultColumn> {
   if (!c || !c->plan->returns_rows) return out;
   for (std::size_t i = 0; i < c->columns.size(); ++i) out.push_back({c->columns[i], c->column_types.at(i)});
   return out;
+}
+
+auto command_name(Command c) -> std::string_view {
+  switch (c) {
+    case Command::Select: return "SELECT";
+    case Command::Insert: return "INSERT";
+    case Command::Update: return "UPDATE";
+    case Command::Delete: return "DELETE";
+    case Command::CreateTable: return "CREATE TABLE";
+    case Command::CreateTableAs: return "CREATE TABLE AS";
+    case Command::SelectInto: return "SELECT INTO";
+    case Command::CreateIndex: return "CREATE INDEX";
+    case Command::DropTable: return "DROP TABLE";
+    case Command::DropIndex: return "DROP INDEX";
+    case Command::AlterTable: return "ALTER TABLE";
+    case Command::CreateView: return "CREATE VIEW";
+    case Command::DropView: return "DROP VIEW";
+    case Command::CreateProcedure: return "CREATE PROCEDURE";
+    case Command::DropProcedure: return "DROP PROCEDURE";
+    case Command::CreateRole: return "CREATE ROLE";
+    case Command::DropRole: return "DROP ROLE";
+    case Command::Grant: return "GRANT";
+    case Command::Revoke: return "REVOKE";
+    case Command::CreateDomain: return "CREATE DOMAIN";
+    case Command::CreateType: return "CREATE TYPE";
+    case Command::CreateSequence: return "CREATE SEQUENCE";
+    case Command::DropDomain: return "DROP DOMAIN";
+    case Command::DropType: return "DROP TYPE";
+    case Command::DropSequence: return "DROP SEQUENCE";
+  }
+  return {};
 }
 
 auto Statement::command() const -> Command { return command_of(ast_); }
@@ -2824,6 +2984,7 @@ Transaction::Transaction(Database& db, TransactionOptions opts)
     throw;
   }
   h_->started_us = db.clock_now();
+  h_->max_bytes = opts.max_bytes;
   h_->state.store(TxnState::Open);
 }
 
@@ -2883,44 +3044,58 @@ auto with_cursor_key(const Compiled& stmt, const CursorState& cursor, const std:
 }
 }  // namespace
 
-auto Database::txn_plan(TxnHandle& h, const Transaction::Target& t, const std::shared_ptr<const Catalog>& pin,
+auto Database::shared_txn_plan(const Transaction::Target& t, const std::string& key,
+                               const std::optional<std::vector<SqlType>>& fixed, const Published& at)
+    -> std::optional<PlanRef> {
+  if (t.held != nullptr && !t.cursor_query) {
+    auto c = t.held->compiled();
+    if (c->plan->catalog_version == at.version()) return PlanRef{c};
+    return std::nullopt;
+  }
+  const auto* s = cached_statement(key);
+  // A text no one has prepared, at a pin that is the live catalog: prepared
+  // in the shared cache there, as Database::prepare would, since a plan
+  // bound at the live catalog is no transaction's own.
+  if (s == nullptr && t.share && live_->current()->version() == at.version()) {
+    s = &prepare_locked(t.sql, t.cursor_query);
+  }
+  if (s != nullptr && !s->is_ddl()) {
+    auto c = s->compiled();
+    if (c->plan->catalog_version == at.version() && (!fixed || caller_types(*c) == *fixed)) return PlanRef{c};
+  }
+  return std::nullopt;
+}
+
+auto Database::txn_plan(TxnHandle& h, const Transaction::Target& t, const TxnCatalog& tc,
                         const std::shared_ptr<const ast::Statement>& parse) -> PlanRef {
-  const auto version = pin->version();
+  // The shared plan only at the transaction's published catalog: one that
+  // has run DDL compiles every statement privately.
+  const auto published = tc.published();
   auto key = t.cursor_query ? "\x01" + std::string{t.sql} : std::string{t.sql};
   // The types the run fixed: a held statement's or the caller's record's;
   // none for a run by text, which infers them.
   std::optional<std::vector<SqlType>> fixed;
   if (t.held != nullptr) {
-    auto c = t.held->compiled();
-    if (!t.cursor_query && c->plan->catalog_version == version) return PlanRef{c};
-    fixed = caller_types(*c);
+    fixed = caller_types(*t.held->compiled());
   } else if (t.given != nullptr) {
     fixed = types_of(t.given->params);
   }
-  // The shared plan, only when it was bound at exactly the pin.
-  if (t.held == nullptr || t.cursor_query) {
-    const auto* s = cached_statement(key);
-    // A text no one has prepared, at a pin that is the live catalog: prepared
-    // in the shared cache there, as Database::prepare would, since a plan
-    // bound at the live catalog is no transaction's own.
-    if (s == nullptr && live_->current()->version() == version) s = &prepare_locked(t.sql, t.cursor_query);
-    if (s != nullptr && !s->is_ddl()) {
-      auto c = s->compiled();
-      if (c->plan->catalog_version == version && (!fixed || caller_types(*c) == *fixed)) return PlanRef{c};
-    }
+  if (published) {
+    if (auto shared = shared_txn_plan(t, key, fixed, *published)) return std::move(*shared);
   }
   // The transaction's own, compiled for this catalog at these types.
   auto it = h.plans.find(key);
   if (it != h.plans.end()) {
     const auto& e = *it->second;
-    if (e.catalog_ == pin && (fixed ? caller_types(e.compiled()) == *fixed : e.inferred_)) return PlanRef{it->second};
+    if (e.catalog_ == tc.cat && (fixed ? caller_types(e.compiled()) == *fixed : e.inferred_)) return PlanRef{it->second};
   }
-  // Compiled privately against the pin, never into the shared cache.
-  std::shared_ptr<TxnPlan> plan{new TxnPlan{pin}};
+  // Compiled privately against the transaction's catalog, never into the shared cache.
+  std::shared_ptr<TxnPlan> plan{new TxnPlan{tc.cat, tc.base->version(), !published}};
   plan->parse_ = parse;
   plan->inferred_ = !fixed;
   plan->compiled_.emplace();
-  build_into(*plan->compiled_, *parse, t.sql, *pin, fixed ? std::span<const SqlType>{*fixed} : std::span<const SqlType>{});
+  build_into(*plan->compiled_, *parse, t.sql, *tc.cat,
+             fixed ? std::span<const SqlType>{*fixed} : std::span<const SqlType>{});
   plan->estimate_ = kTxnPlanBytes + plan->compiled_->plan->source.size();
   if (!bc_txn_charge_plans(h.txn, plan->estimate_)) {
     std::string message;
@@ -2949,10 +3124,18 @@ auto Database::txn_plan(TxnHandle& h, const Transaction::Target& t, const std::s
 
 template <typename F>
 auto Transaction::as_statement(F&& body) -> decltype(body()) {
+  // Whether the transaction has run DDL as the statement starts: its 40001s
+  // abort it, recoverably, where a transaction with none ends.
+  const auto ddl = h_->txn != nullptr && bc_txn_has_ddl(h_->txn);
   try {
+    check_doomed();
     return body();
   } catch (const SerializationFailure&) {
-    end_locked();
+    if (ddl) {
+      h_->abort();
+    } else {
+      end_locked();
+    }
     throw;
   } catch (...) {
     // Every other error aborts the transaction, as in PostgreSQL: a
@@ -2962,35 +3145,43 @@ auto Transaction::as_statement(F&& body) -> decltype(body()) {
   }
 }
 
-auto Transaction::plan_for(const Target& t, bool describe) -> PlanRef {
-  auto& h = *h_;
-  // The parse, which depends on no catalog: the held statement's, the
-  // shared cache's or a private plan's for the text, else parsed now. A
-  // syntax error is the statement's, whatever the catalog.
-  std::shared_ptr<const ast::Statement> parse;
+void Transaction::check_doomed() const {
+  // A transaction that has run DDL can only conflict at its commit once
+  // another DDL has published: its next statement says so
+  // (docs/transaction_design.md, *Catalog snapshots and isolation levels
+  // with DDL*).
+  if (h_->txn == nullptr || !bc_txn_has_ddl(h_->txn)) return;
+  if (db_->live_->current()->version() != bc_txn_catalog_version(h_->txn)) throw_serialization_failure(kCatalogChanged);
+}
+
+auto Transaction::parse_of(const Target& t) -> std::shared_ptr<const ast::Statement> {
   const auto key = t.cursor_query ? "\x01" + std::string{t.sql} : std::string{t.sql};
   const Statement* source = t.held != nullptr && !t.cursor_query ? t.held : db_->cached_statement(key);
-  if (source != nullptr) {
-    if (source->is_ddl()) {
-      if (describe) return {};
-      throw FeatureNotSupported("DDL inside a transaction is not supported: run it outside one");
-    }
-    // Aliases the statement, which lives until close(), as the transaction may not.
-    parse = std::shared_ptr<const ast::Statement>{std::shared_ptr<const void>{}, &source->ast_};
-  } else if (auto it = h.plans.find(key); it != h.plans.end()) {
-    parse = it->second->parse_;
-  } else {
-    auto st = std::make_shared<ast::Statement>(ast::parse(t.sql));
-    if (!is_dml(*st)) {
-      if (describe) return {};
-      throw FeatureNotSupported("DDL inside a transaction is not supported: run it outside one");
-    }
-    if (auto* select = std::get_if<ast::Select>(st.get()); select != nullptr && t.cursor_query) select->row_key = true;
-    parse = std::move(st);
+  // Aliases the statement, which lives until close(), as the transaction may not.
+  if (source != nullptr) return std::shared_ptr<const ast::Statement>{std::shared_ptr<const void>{}, &source->ast_};
+  if (auto it = h_->plans.find(key); it != h_->plans.end()) return it->second->parse_;
+  // A syntax error is the statement's, whatever the catalog.
+  auto st = std::make_shared<ast::Statement>(ast::parse(t.sql));
+  if (auto* select = std::get_if<ast::Select>(st.get()); select != nullptr && t.cursor_query) select->row_key = true;
+  return st;
+}
+
+auto Transaction::plan_for(const Target& t, bool describe) -> PlanRef {
+  auto parse = parse_of(t);
+  if (!is_dml(*parse)) {
+    if (describe) return {};
+    throw std::logic_error("a DDL has no plan");
   }
-  // What the run fixed: its result columns, and the version that fixed them.
+  return plan_for(t, parse);
+}
+
+auto Transaction::plan_for(const Target& t, const std::shared_ptr<const ast::Statement>& parse) -> PlanRef {
+  auto& h = *h_;
+  // What the run fixed: its result columns, the version that fixed them,
+  // and whether that was a transaction's private catalog.
   std::optional<std::vector<ResultColumn>> columns;
   std::uint64_t fixed_at = 0;
+  bool fixed_private = false;
   if (t.held != nullptr) {
     auto c = t.held->compiled();
     columns = result_columns_of(*c);
@@ -2998,20 +3189,24 @@ auto Transaction::plan_for(const Target& t, bool describe) -> PlanRef {
   } else if (t.given != nullptr) {
     columns = t.given->columns;
     fixed_at = t.given->version;
+    fixed_private = t.given->private_catalog;
   }
   for (auto attempt = 0;; ++attempt) {
     // A first statement that takes the pin itself: one a refit took earlier
     // (a Parse or Bind in a block) is not raced by a DDL since, but older.
     const auto fresh = bc_txn_catalog_version(h.txn) == 0;
-    auto pin = bc_txn_pinned_catalog(h.txn);
+    auto cat = bc_txn_catalog(h.txn);
 #ifdef BYTECASK_SQL_TESTING
     if (db_->after_txn_pin_) db_->after_txn_pin_();
 #endif
+    const Database::TxnCatalog tc{bc_txn_pinned_catalog(h.txn), cat};
+    const auto base = tc.base->version();
+    const auto ddl = bc_txn_has_ddl(h.txn);
     const auto first = fresh && bc_txn_first_statement(h.txn);
     PlanRef plan;
     std::exception_ptr bind_error;
     try {
-      plan = db_->txn_plan(h, t, pin, parse);
+      plan = db_->txn_plan(h, t, tc, parse);
     } catch (const ast::SqlError&) {
       bind_error = std::current_exception();
     }
@@ -3020,20 +3215,28 @@ auto Transaction::plan_for(const Target& t, bool describe) -> PlanRef {
     const auto live = db_->live_->current()->version();
     // The first statement has read nothing: a pin a DDL has since moved past
     // is taken again from the live catalog, as if it had been taken after.
-    if (live != pin->version() && first && attempt < kTxnPlanAttempts) {
+    if (live != base && first && attempt < kTxnPlanAttempts) {
       if (bc_txn_repin(h.txn)) {
         h.clear_plans();
         continue;
       }
     }
     if (bind_error) {
-      // Exception 1: the pinned catalog lacks what the statement needs.
-      if (live != pin->version()) throw_serialization_failure(kCatalogChanged);
+      // Exception 1: the pinned catalog lacks what the statement needs. A
+      // transaction that has run DDL reports its own catalog's errors: one
+      // whose base is behind was refused before (check_doomed).
+      if (live != base && !ddl) throw_serialization_failure(kCatalogChanged);
       std::rethrow_exception(bind_error);
     }
     if (changed) {
-      if (fixed_at > pin->version()) throw_serialization_failure(kCatalogChanged);  // exception 2
-      throw_result_type_changed();                                                // exception 3
+      // Exception 2: fixed at a catalog this transaction does not see. A
+      // record fixed after another transaction's own DDL at this base may
+      // hold the columns that transaction then published, while the live
+      // catalog is past the base.
+      if (fixed_at > base || (fixed_private && fixed_at == base && !ddl && live != base)) {
+        throw_serialization_failure(kCatalogChanged);
+      }
+      throw_result_type_changed();  // exception 3
     }
     return plan;
   }
@@ -3042,7 +3245,12 @@ auto Transaction::plan_for(const Target& t, bool describe) -> PlanRef {
 auto Transaction::run_locked(const Target& t, const std::vector<Value>& params, const ExecutionOptions& opts,
                              WindowRows* window, RowWindow range, const CursorState* positioned) -> Rows {
   return as_statement([&] {
-    auto plan = plan_for(t);
+    auto parse = parse_of(t);
+    if (!is_dml(*parse)) {
+      if (positioned != nullptr || window != nullptr) throw std::invalid_argument("a DDL returns no rows and names no cursor");
+      return run_ddl(*parse, params);
+    }
+    auto plan = plan_for(t, parse);
     const auto& c = plan.get();
     if (positioned != nullptr) {
       return db_->run_txn(h_->cx, c, with_cursor_key(c, *positioned, params), h_->txn, h_->started_us, opts, window,
@@ -3051,6 +3259,121 @@ auto Transaction::run_locked(const Target& t, const std::vector<Value>& params, 
     if (c.key_params != 0) throw ParamError("WHERE CURRENT OF needs a cursor: use execute_current_of");
     return db_->run_txn(h_->cx, c, params, h_->txn, h_->started_us, opts, window, range);
   });
+}
+
+void Transaction::check_in_use(const Ddl& ddl, const Catalog& cat) const {
+  // PostgreSQL's CheckTableNotInUse: a DDL that changes what an open cursor
+  // reads is refused, whatever the cursor has fetched. A cursor's plan names
+  // every table and index it reads (its schema ref).
+  auto read_by_a_cursor = [&](auto&& reads) {
+    for (const auto& c : h_->cursors) {
+      if (!c->live.load() || !c->compiled) continue;
+      const auto& ref = c->plan().ref;
+      const std::span<const std::uint32_t> read{ref.objects_read, ref.objects_read == nullptr ? 0 : ref.n_read};
+      const std::span<const std::uint32_t> written{ref.tables_written, ref.tables_written == nullptr ? 0 : ref.n_written};
+      if (std::ranges::any_of(read, reads) || std::ranges::any_of(written, reads)) return true;
+    }
+    return false;
+  };
+  auto table_in_use = [&](std::string_view command, const std::string& name) {
+    const auto* t = cat.table(name);
+    if (t == nullptr) return;
+    auto reads = [&](std::uint32_t id) {
+      return id == t->id || std::ranges::any_of(t->indexes, [&](const Index& ix) { return ix.id == id; });
+    };
+    if (read_by_a_cursor(reads)) {
+      throw DdlRefused("cannot " + std::string{command} + " \"" + name +
+                           "\" because it is being used by active queries in this session",
+                       kObjectInUse);
+    }
+  };
+  if (const auto* d = std::get_if<DropTableDdl>(&ddl)) {
+    // PostgreSQL checks dependencies before CheckTableNotInUse: a table a
+    // view depends on is 2BP01, which next_version raises.
+    const auto* t = cat.table(d->name);
+    if (t == nullptr || cat.find_view_dependent(t->id) == nullptr) table_in_use("DROP TABLE", d->name);
+  } else if (const auto* ci = std::get_if<CreateIndexDdl>(&ddl)) {
+    table_in_use("CREATE INDEX", ci->table);
+  } else if (const auto* ac = std::get_if<AddColumnDdl>(&ddl)) {
+    table_in_use("ALTER TABLE", ac->table);
+  } else if (const auto* di = std::get_if<DropIndexDdl>(&ddl)) {
+    // Only a cursor that scans the index: one that reads its table some
+    // other way does not hold it (PostgreSQL's index_drop).
+    const auto [table, ix] = cat.index(di->name);
+    if (ix != nullptr && read_by_a_cursor([id = ix->id](std::uint32_t o) { return o == id; })) {
+      throw DdlRefused("cannot DROP INDEX \"" + di->name + "\" because it is being used by active queries in this session",
+                       kObjectInUse);
+    }
+  }
+}
+
+auto Transaction::run_ddl(const ast::Statement& st, const std::vector<Value>& params) -> Rows {
+  auto& h = *h_;
+  if (std::holds_alternative<ast::CreateTableAs>(st)) {
+    throw FeatureNotSupported("CREATE TABLE AS inside a transaction is not supported: run it outside one");
+  }
+  if (!params.empty()) throw ParamError("DDL takes no parameters");
+  // As PostgreSQL refuses DDL on a standby: a transaction's DDL reaches the
+  // engine only at its commit, which a follower would refuse.
+  if (db_->db_->mode() == bytecask::Mode::Follower) {
+    throw DdlRefused("cannot execute " + std::string{command_name(Statement::command_of(st))} +
+                         " in a read-only transaction",
+                     kReadOnlySqlTransaction);
+  }
+  // The DDL builds on the published catalog it pinned, which must still be
+  // the live one: its commit would conflict with any DDL published since.
+  // A first statement pins again instead, as it would for any statement.
+  std::shared_ptr<const Catalog> cat;
+  for (auto attempt = 0;; ++attempt) {
+    const auto fresh = bc_txn_catalog_version(h.txn) == 0;
+    cat = bc_txn_catalog(h.txn);
+#ifdef BYTECASK_SQL_TESTING
+    if (db_->after_txn_pin_) db_->after_txn_pin_();
+#endif
+    if (db_->live_->current()->version() == bc_txn_catalog_version(h.txn)) break;
+    if (fresh && bc_txn_first_statement(h.txn) && attempt < kTxnPlanAttempts && bc_txn_repin(h.txn)) {
+      h.clear_plans();
+      continue;
+    }
+    throw_serialization_failure(kCatalogChanged);
+  }
+  auto bound = bound::bind(st, *cat);
+  const auto& ddl = std::get<Ddl>(bound.stmt);
+  check_in_use(ddl, *cat);
+  std::vector<Catalog::DdlOp> ops;
+  auto backfill = false;
+  std::shared_ptr<const Catalog> next;
+  {
+    // The backfill reads the transaction's view, its own writes included,
+    // and is bounded by the transaction's bound as well as the engine's batch.
+    const auto rows = bc_txn_rows(h.txn);
+    const auto limit = static_cast<std::size_t>(std::min<std::uint64_t>(h.max_bytes, db_->live_->backfill_limit()));
+    try {
+      next = cat->next_version(ddl, *rows, ops, backfill, limit);
+    } catch (const BackfillTooLarge& e) {
+      throw ExecError("backfill of table \"" + e.table() + "\" does not fit the transaction's bound of " +
+                          std::to_string(limit) + " bytes: run the DDL outside a transaction",
+                      BC_E_LIMIT);
+    } catch (const ConstraintViolation& e) {
+      throw ExecError(e.what(), BC_E_CONSTRAINT, e.detail().encode());
+    }
+  }
+  Rows out;
+  out.notices = skip_notices(ddl, *cat, next != nullptr);
+  out.affected = 0;
+  // A DDL IF [NOT] EXISTS skipped is no DDL of the transaction: nothing changes.
+  if (!next) return out;
+  if (!bc_txn_ddl(h.txn, std::move(next), ops, backfill)) {
+    std::string message;
+    try {
+      message = bc_txn_error_message(h.txn);
+    } catch (const std::bad_alloc&) {  // NOLINT(bugprone-empty-catch): the message is dropped, not the outcome
+    }
+    throw_error(bc_txn_error(h.txn), bc_txn_error_detail(h.txn), message);
+  }
+  // The private plans were for the catalog the DDL replaced.
+  h.clear_plans();
+  return out;
 }
 
 auto Transaction::refit_locked(const Target& t) -> StatementRecord {
@@ -3068,7 +3391,10 @@ auto Transaction::refit_locked(const Target& t) -> StatementRecord {
     StatementRecord out;
     out.params = caller_params(c);
     out.columns = result_columns_of(c);
-    out.version = c.plan->catalog_version;
+    // A private plan's version is its transaction's published base; one
+    // compiled after the transaction's own DDL is marked so.
+    out.version = plan.private_ ? plan.private_->version_ : c.plan->catalog_version;
+    out.private_catalog = plan.private_ && plan.private_->private_;
     const auto* s = t.held != nullptr ? t.held : db_->cached_statement(t.sql);
     out.command = s != nullptr ? s->command() : Statement::command_of(*plan.private_->parse_);
     if (const auto* u = std::get_if<ast::Update>(s != nullptr ? &s->ast_ : plan.private_->parse_.get())) {
@@ -3080,6 +3406,14 @@ auto Transaction::refit_locked(const Target& t) -> StatementRecord {
     }
     return out;
   });
+}
+
+auto Transaction::prepare(std::string_view sql) -> TxnStatement {
+  if (!h_) throw std::logic_error("the transaction has ended");
+  std::shared_lock<std::shared_mutex> lock{life_->mu};
+  check_usable();
+  auto record = refit_locked(Target{.sql = sql, .share = false});
+  return TxnStatement{std::string{sql}, std::move(record)};
 }
 
 auto Transaction::execute(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts)
@@ -3168,8 +3502,10 @@ auto Transaction::execute_window(std::string_view sql, const ResultCheck& check,
   const Target t{sql, nullptr, given ? &check.record : nullptr};
   // The plan that runs says whether the statement returns rows; asking
   // aborts nothing.
-  auto plan = as_statement([&] { return plan_for(t); });
-  if (!plan.get().plan->returns_rows) throw std::invalid_argument("execute_window needs a statement that returns rows");
+  auto plan = as_statement([&] { return plan_for(t, true); });
+  if (!plan || !plan.get().plan->returns_rows) {
+    throw std::invalid_argument("execute_window needs a statement that returns rows");
+  }
   WindowRows out;
   out.rows = run_locked(t, params, opts, &out, window);
   return out;
@@ -3493,29 +3829,39 @@ void Cursor::close() noexcept {
   s_->close();
 }
 
-auto Database::txn_procedure(TxnHandle& h, const Procedure& def, const std::shared_ptr<const Catalog>& pin, bool share)
+auto Database::shared_procedure(const Procedure& def, bool share, const Published& at)
     -> std::shared_ptr<const CompiledProcedure> {
-  const auto version = pin->version();
-  // The shared plan, only when compiled at exactly the pin. A procedure
-  // called in autocommit (Database::call) compiles it there when the pin is live.
   {
     std::lock_guard<std::mutex> lock{procedures_mu_};
     auto it = procedures_.find(def.name);
-    if (it != procedures_.end() && it->second->id == def.id && it->second->catalog_version == version) return it->second;
+    if (it != procedures_.end() && it->second->id == def.id && it->second->catalog_version == at.version()) {
+      return it->second;
+    }
   }
-  if (share && live_->current()->version() == version) {
+  if (share && live_->current()->version() == at.version()) {
     auto p = procedure_plan(def);
-    if (p->catalog_version == version && p->id == def.id) return p;
+    if (p->catalog_version == at.version() && p->id == def.id) return p;
+  }
+  return nullptr;
+}
+
+auto Database::txn_procedure(TxnHandle& h, const Procedure& def, const TxnCatalog& tc, bool share)
+    -> std::shared_ptr<const CompiledProcedure> {
+  // The shared plan, only when compiled at exactly the pin, by a transaction
+  // that has run no DDL. A procedure called in autocommit (Database::call)
+  // compiles it there when the pin is live.
+  if (const auto published = tc.published()) {
+    if (auto p = shared_procedure(def, share, *published)) return p;
   }
   auto key = "\x02" + def.name;
   auto it = h.plans.find(key);
-  if (it != h.plans.end() && it->second->catalog_ == pin && it->second->procedure_->id == def.id) {
+  if (it != h.plans.end() && it->second->catalog_ == tc.cat && it->second->procedure_->id == def.id) {
     // Aliases the TxnPlan, which keeps the procedure alive.
     return {it->second, &*it->second->procedure_};
   }
-  std::shared_ptr<TxnPlan> plan{new TxnPlan{pin}};
+  std::shared_ptr<TxnPlan> plan{new TxnPlan{tc.cat, tc.base->version(), !tc.published()}};
   plan->procedure_.emplace();
-  build_procedure(*plan->procedure_, def, *pin);
+  build_procedure(*plan->procedure_, def, *tc.cat);
   plan->estimate_ = kTxnPlanBytes + plan->procedure_->gen.source.size();
   if (!bc_txn_charge_plans(h.txn, plan->estimate_)) {
     std::string message;
@@ -3550,11 +3896,14 @@ auto Transaction::procedure(std::string_view name) -> std::shared_ptr<const Proc
   return as_statement([&]() -> std::shared_ptr<const Procedure> {
     for (auto attempt = 0;; ++attempt) {
       const auto fresh = bc_txn_catalog_version(h_->txn) == 0;
-      auto pin = bc_txn_pinned_catalog(h_->txn);
-      const auto* def = pin->procedure(name);
-      if (def != nullptr) return {pin, def};
-      // A binder error at a stale pin (exception 1); a first statement re-pins.
-      if (db_->live_->current()->version() == pin->version()) return nullptr;
+      auto cat = bc_txn_catalog(h_->txn);
+      const auto* def = cat->procedure(name);
+      if (def != nullptr) return {cat, def};
+      // A binder error at a stale pin (exception 1); a first statement
+      // re-pins. A transaction that has run DDL reports its own catalog's.
+      if (bc_txn_has_ddl(h_->txn) || db_->live_->current()->version() == bc_txn_catalog_version(h_->txn)) {
+        return nullptr;
+      }
       if (fresh && bc_txn_first_statement(h_->txn) && attempt < kTxnPlanAttempts && bc_txn_repin(h_->txn)) {
         h_->clear_plans();
         continue;
@@ -3579,9 +3928,11 @@ auto Transaction::call_locked(std::string_view procedure, const std::vector<Valu
       // The procedure as the transaction's catalog has it, compiled there.
       // The hook runs as each statement of the body begins (run_procedure).
       const auto fresh = bc_txn_catalog_version(h_->txn) == 0;
-      auto pin = bc_txn_pinned_catalog(h_->txn);
+      auto cat = bc_txn_catalog(h_->txn);
+      const Database::TxnCatalog tc{bc_txn_pinned_catalog(h_->txn), cat};
+      const auto base = tc.base->version();
       const auto first = fresh && bc_txn_first_statement(h_->txn);
-      const auto* def = pin->procedure(procedure);
+      const auto* def = cat->procedure(procedure);
       std::shared_ptr<const CompiledProcedure> plan;
       std::exception_ptr bind_error;
       if (def == nullptr) {
@@ -3589,18 +3940,18 @@ auto Transaction::call_locked(std::string_view procedure, const std::vector<Valu
             ast::SqlError{"procedure " + std::string{procedure} + " does not exist", -1, kUndefinedFunction});
       } else {
         try {
-          plan = db_->txn_procedure(*h_, *def, pin, share);
+          plan = db_->txn_procedure(*h_, *def, tc, share);
         } catch (const ast::SqlError&) {
           bind_error = std::current_exception();
         }
       }
       const auto live = db_->live_->current()->version();
-      if (live != pin->version() && first && attempt < kTxnPlanAttempts && bc_txn_repin(h_->txn)) {
+      if (live != base && first && attempt < kTxnPlanAttempts && bc_txn_repin(h_->txn)) {
         h_->clear_plans();
         continue;
       }
       if (bind_error) {
-        if (live != pin->version()) throw_serialization_failure(kCatalogChanged);
+        if (live != base && !bc_txn_has_ddl(h_->txn)) throw_serialization_failure(kCatalogChanged);
         std::rethrow_exception(bind_error);
       }
       return db_->run_procedure(*plan, *def, args, *h_, opts);
@@ -3627,6 +3978,7 @@ void Transaction::savepoint(std::string_view name) {
   std::shared_lock<std::shared_mutex> lock{life_->mu};
   check_usable();
   try {
+    check_doomed();
     // Room first, so that nothing after the runtime's mark can fail.
     Savepoint sp{std::string{name}, h_->cursors_opened};
     h_->savepoints.reserve(h_->savepoints.size() + 1);
@@ -3658,6 +4010,9 @@ void Transaction::rollback_to(std::string_view name) {
     h_->abort();
     throw std::logic_error("the runtime refused a rollback to a live savepoint");
   }
+  // The DDL since the mark is undone with its catalog: plans compiled for
+  // that catalog are never used again (TxnHandle::plans), and go.
+  h_->drop_plans_not_for(bc_txn_current_catalog(h_->txn));
   // The cursors opened since the savepoint close, a failed one with them:
   // forgotten, as if never opened. Those opened before stay as they are.
   const auto since = h_->savepoints[k].cursors;
@@ -3675,6 +4030,12 @@ void Transaction::release(std::string_view name) {
   if (!h_) throw std::logic_error("the transaction has ended");
   std::shared_lock<std::shared_mutex> lock{life_->mu};
   check_usable();
+  try {
+    check_doomed();
+  } catch (...) {
+    h_->abort();
+    throw;
+  }
   auto k = find_savepoint(name);
   if (!bc_txn_release(h_->txn, static_cast<std::uint32_t>(k + 1))) {
     h_->abort();
