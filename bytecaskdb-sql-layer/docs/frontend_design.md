@@ -144,8 +144,7 @@ kind the transformer doesn't take is refused with its position.
   join in parentheses would NULL-extend other rows than the chain's and is
   refused (42601), and so is `USING` or `NATURAL` in parentheses, of a
   join in parentheses or after a comma, whose left side is not every item
-  before it. A `RIGHT JOIN` as the first join of a comma item is a `RIGHT
-  JOIN` after the first join, refused. It compares columns of two tables by any of `=`,
+  before it. It compares columns of two tables by any of `=`,
   `<`, `<=`, `>`, `>=` and `<>`, or is a predicate (`AND`, `OR`, `NOT`, `IS
   NULL`) over columns of both, or a boolean constant (`ON TRUE` pairs every
   row; `ON FALSE` none); NULL is true of none. `USING` and `NATURAL`
@@ -160,8 +159,8 @@ kind the transformer doesn't take is refused with its position.
   lacks 42703 (`… does not exist in left table`); one the right table lacks
   is 42703, one named twice 42701, each checked name by name in
   PostgreSQL's order. A merged column is its left side's column, equal to
-  the right's in every pair (the preserved table's for the first join's
-  `RIGHT JOIN`); a later join's `USING` compares that column with its
+  the right's in every pair (the preserved table's for a `RIGHT JOIN`); a
+  later join's `USING` compares that column with its
   right table's. A name alone resolves against the columns of the join up
   to where it is read (an `ON` sees its own prefix, the rest the whole
   join): two of them with the name are 42702, so a merged name is
@@ -174,8 +173,14 @@ kind the transformer doesn't take is refused with its position.
   table's. In a chain, a left join NULL-extends its right table in the rows
   before it: a later `ON` reading that table sees NULLs, so an inner join
   after it drops those rows where it reads them, and a left join keeps
-  them. `RIGHT JOIN` is taken as the first join only (its two tables
-  swapped, so the chain stays left-deep), and `FULL JOIN` not. A table takes an alias, `t [AS]
+  them. `RIGHT JOIN` keeps every row of its table against the join before
+  it, from the first item of its own join (after a comma, only its own
+  join's items, as in PostgreSQL): those items are NULL-extended together
+  where nothing matches, their own `ON`s deciding which rows they have
+  (`planner_design.md`, *Outer joins*). A `RIGHT JOIN` of a join that has
+  an outer join, `a LEFT JOIN b ON … RIGHT JOIN c ON …`, is refused (42601,
+  `a RIGHT JOIN of a join that has an outer join is not supported yet`),
+  and `FULL JOIN` too. A table takes an alias, `t [AS]
   x`. A table named twice, `t JOIN t AS x`, is read twice, once under each
   name; the planner reads it as two tables (`planner_design.md`, *Joins of
   several tables*). The front end rewrites the qualifier `x` to the table
@@ -932,8 +937,8 @@ That includes:
   `GROUP BY` of an expression, and `HAVING` of anything but the
   comparisons above;
 - `FULL JOIN`, an outer join's `ON` comparing an expression of columns,
-  more than eight tables, a `RIGHT JOIN` after the first join, an outer
-  join in parentheses or of a join in parentheses, `USING` or `NATURAL` in
+  more than eight tables, a `RIGHT JOIN` of a join that has an outer join,
+  an outer join in parentheses or of a join in parentheses, `USING` or `NATURAL` in
   parentheses or after a comma,
   `FOR UPDATE` of a join (#697), an alias of a join, an output name in `GROUP BY`;
 - `RETURNING` in a procedure; `VALUES` outside `INSERT`; `OFFSET` on a set operation, in one of

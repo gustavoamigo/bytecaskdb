@@ -1181,6 +1181,17 @@ private:
         n.op);
   }
 
+  // The tables a left outer nested loop's inner side NULL-extends, outer
+  // first: its one table, or each of a group's, inner nested loops of each
+  // other.
+  static auto inner_tables(const physical::Node& n) -> std::vector<std::uint32_t> {
+    const auto* j = std::get_if<physical::NestedLoop>(&n.op);
+    if (j == nullptr) return {inner_table(n)};
+    auto out = inner_tables(*j->outer);
+    out.push_back(inner_table(*j->inner));
+    return out;
+  }
+
   // Left outer: the inner row where its key has no NULL part, the table
   // holds it and every match conjunct holds of the pair; else the null row.
   // The outer row is never dropped.
@@ -1262,12 +1273,15 @@ private:
   // row is row<d>, as an index join's. Inside an outer loop, its cursor is
   // c<d>, so the outer one's stays in reach.
   // Left outer: m<d> says whether the inner side gave a row for the outer
-  // one, its filters the join's ON; where it gave none, or its guard's
-  // parameters hold a NULL, the outer row once more, joined to the null row.
+  // one, its filters the join's ON, set by a group's innermost loop; where it
+  // gave none, or its guard's parameters hold a NULL, the outer row once
+  // more, joined to the null row of each table of the inner side.
   void produce(const physical::NestedLoop& j, const Consume& k) {
     const auto outer_loops = loops(*j.outer);
-    const auto table = j.left_outer ? inner_table(*j.inner) : 0;
-    const auto nr = j.left_outer ? null_row(table) : std::string{};
+    std::vector<std::pair<std::uint32_t, std::string>> nulls;
+    if (j.left_outer) {
+      for (auto t : inner_tables(*j.inner)) nulls.emplace_back(t, null_row(t));
+    }
     produce(*j.outer, [&] {
       const auto d = std::to_string(rows_.size());
       auto outer_row = std::exchange(row_name_, "row" + d);
@@ -1291,9 +1305,9 @@ private:
       row_name_ = outer_row;
       cursor_ = outer_cursor;
       w_.open("if (!" + m + ")");
-      rows_.push_back({table, nr});
+      for (const auto& [t, nr] : nulls) rows_.push_back({t, nr});
       k();
-      rows_.pop_back();
+      rows_.resize(rows_.size() - nulls.size());
       w_.close();
     });
   }

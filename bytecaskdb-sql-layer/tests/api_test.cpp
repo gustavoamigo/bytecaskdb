@@ -1418,6 +1418,12 @@ TEST_CASE("embedded API: every plan the search costed returns the same rows", "[
        {i(1), i(0)}, false, 1},
       {"SELECT o.k, p.v, q.k FROM o LEFT JOIN p ON p.k = o.c JOIN o q ON q.k = p.v WHERE o.a = $1 ORDER BY 1, 2, 3", {i(2)}, true, 1},
       {"SELECT o.k, q.v FROM o JOIN o x ON x.k = o.c LEFT JOIN p q ON q.k = x.k WHERE o.a = $1", {i(1)}, false, 1},
+      // A RIGHT JOIN after the first join: its table, then a group of two NULL-extended together.
+      {"SELECT x.k, p.v, o.k FROM o x JOIN p ON p.k = x.c RIGHT JOIN o ON p.v = o.b WHERE o.a = $1", {i(1)}, false, 1},
+      {"SELECT x.k, p.v, o.k FROM o x JOIN p ON p.k = x.c AND x.a = $2 RIGHT JOIN o ON p.v = o.b WHERE o.a = $1",
+       {i(2), i(1)}, false, 1},
+      {"SELECT x.k, p.v, o.k FROM o x JOIN p ON p.k = x.c RIGHT JOIN o ON p.v = o.b AND x.k > o.k WHERE o.a = $1 ORDER BY 3, 1, 2",
+       {i(0)}, true, 1},
   };
   const std::string cross = "SELECT o.k, p.v FROM p, o WHERE p.k = $1 AND a = $2";
   CHECK(db->execute(cross, {i(1), i(2)}).rows.size() == 10);
@@ -1574,6 +1580,26 @@ TEST_CASE("embedded API: joins of three or more tables, a table with itself, and
         Grid{{i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(2), i(3), i(2)}, {i(3), i(2), i(2)}, {i(3), i(3), i(2)}});
   CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h2 RIGHT JOIN h1 ON h1.a = h2.a LEFT JOIN h3 ON h2.id = h3.k ORDER BY 1, 2, 3") ==
         Grid{{i(0), Value{}, Value{}}, {i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(2), i(3), i(3)}, {i(3), i(2), i(2)}, {i(3), i(3), i(3)}, {i(4), Value{}, Value{}}, {i(5), Value{}, Value{}}});
+  // A RIGHT JOIN after the first join keeps every row of its table against the join before it, a group of tables
+  // NULL-extended together: its own ON decides its rows, and the RIGHT JOIN's ON matches them.
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1 JOIN h2 ON h1.a = h2.a RIGHT JOIN h3 ON h2.a = h3.a ORDER BY 3, 1, 2") ==
+        Grid{{n, n, i(0)}, {i(1), i(1), i(1)}, {i(2), i(2), i(2)}, {i(2), i(3), i(2)}, {i(3), i(2), i(2)}, {i(3), i(3), i(2)}, {n, n, i(3)}, {n, n, i(7)}});
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1 JOIN h2 ON h1.a = h2.a AND h2.c > 100 RIGHT JOIN h3 ON h2.a = h3.a ORDER BY 3, 1, 2") ==
+        Grid{{n, n, i(0)}, {n, n, i(1)}, {i(2), i(2), i(2)}, {i(3), i(2), i(2)}, {n, n, i(3)}, {n, n, i(7)}});
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1 JOIN h2 ON h1.a = h2.a RIGHT JOIN h3 ON h2.a = h3.a WHERE h1.id IS NULL ORDER BY 3") ==
+        Grid{{n, n, i(0)}, {n, n, i(3)}, {n, n, i(7)}});
+  CHECK(rows("SELECT h1.id, h2.id, h3.k, x.id FROM h1 JOIN h2 ON h1.a = h2.a RIGHT JOIN h3 ON h2.a = h3.a LEFT JOIN h1 x ON x.id = h1.id "
+             "ORDER BY 3, 1, 2") ==
+        Grid{{n, n, i(0), n}, {i(1), i(1), i(1), i(1)}, {i(2), i(2), i(2), i(2)}, {i(2), i(3), i(2), i(2)}, {i(3), i(2), i(2), i(3)},
+             {i(3), i(3), i(2), i(3)}, {n, n, i(3), n}, {n, n, i(7), n}});
+  // After a comma, its group is the join's own items: the comma's are joined to its rows.
+  CHECK(rows("SELECT h1.id, h2.id, h3.k FROM h1, h2 RIGHT JOIN h3 ON h2.id = h3.k WHERE h1.id < 2 ORDER BY 1, 3, 2") ==
+        Grid{{i(0), i(0), i(0)}, {i(0), i(1), i(1)}, {i(0), i(2), i(2)}, {i(0), i(3), i(3)}, {i(0), n, i(7)},
+             {i(1), i(0), i(0)}, {i(1), i(1), i(1)}, {i(1), i(2), i(2)}, {i(1), i(3), i(3)}, {i(1), n, i(7)}});
+  // Its USING column is its right table's, the one it keeps.
+  CHECK(rows("SELECT a, h1.id, h2.id, h3.k FROM h1 JOIN h2 USING (a) RIGHT JOIN h3 USING (a) ORDER BY 4, 2, 3") ==
+        Grid{{i(4), n, n, i(0)}, {i(1), i(1), i(1), i(1)}, {i(2), i(2), i(2), i(2)}, {i(2), i(2), i(3), i(2)}, {i(2), i(3), i(2), i(2)},
+             {i(2), i(3), i(3), i(2)}, {n, n, n, i(3)}, {i(7), n, n, i(7)}});
   CHECK(rows("SELECT h1.a, count(h2.id), count(h3.k), count(*) FROM h1 LEFT JOIN h2 ON h1.a = h2.a LEFT JOIN h3 ON h2.a = h3.a GROUP BY h1.a ORDER BY 1") ==
         Grid{{i(1), i(1), i(1), i(1)}, {i(2), i(4), i(4), i(4)}, {i(3), i(0), i(0), i(1)}, {i(5), i(0), i(0), i(1)}, {Value{}, i(0), i(0), i(1)}});
   // a table joined with itself
@@ -1628,7 +1654,8 @@ TEST_CASE("embedded API: joins of three or more tables, a table with itself, and
   CHECK(state("SELECT 1 FROM h1 x, h2 x") == "42712");
   CHECK(state("SELECT 1 FROM h1 JOIN h2 ON h1.a = h3.a JOIN h3 ON h2.a = h3.a") == "42P01");
   // What the layer does not take yet is refused, never answered wrongly.
-  CHECK(state("SELECT 1 FROM h1 x JOIN h2 y ON x.a = y.a RIGHT JOIN h3 z ON y.a = z.a") == "42601");
+  CHECK(state("SELECT 1 FROM h1 x LEFT JOIN h2 y ON x.a = y.a RIGHT JOIN h3 z ON y.a = z.a") == "42601");
+  CHECK(state("SELECT 1 FROM h1 x RIGHT JOIN h2 y ON x.a = y.a RIGHT JOIN h3 z ON y.a = z.a") == "42601");
   // USING and NATURAL after the first join read the columns of the join before them, as PostgreSQL 17's.
   CHECK(rows("SELECT * FROM h1 NATURAL JOIN h2 NATURAL JOIN h3 ORDER BY a, id") ==
         Grid{{i(1), i(1), i(10), i(100), i(1)}, {i(2), i(2), i(20), i(200), i(2)}, {i(2), i(3), n, n, i(2)}});

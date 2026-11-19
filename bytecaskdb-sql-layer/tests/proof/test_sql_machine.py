@@ -2065,6 +2065,10 @@ def test_joins_of_several_tables_with_themselves_and_on_any_comparison(dsn):
             "SELECT t0.c0, t1.c3, t2.c5 FROM t0 JOIN t1 ON t0.c1 = t1.c1 LEFT JOIN t2 ON t1.c1 = t2.c1 ORDER BY 1, 2, 3",
             "SELECT t0.c0, t1.c3, t2.c5 FROM t0 LEFT JOIN t1 ON t0.c0 = t1.c3 JOIN t2 ON t2.c5 = t1.c3 ORDER BY 1",
             "SELECT t0.c1, COUNT(t1.c3), COUNT(t2.c5), COUNT(*) FROM t0 LEFT JOIN t1 ON t0.c1 = t1.c1 LEFT JOIN t2 ON t1.c1 = t2.c1 GROUP BY t0.c1 ORDER BY 1",
+            # A RIGHT JOIN after the first join: its table's rows against the join before it, NULL-extended together.
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 JOIN t1 ON t0.c1 = t1.c1 RIGHT JOIN t2 ON t1.c1 = t2.c1 ORDER BY 3, 1, 2",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0 JOIN t1 ON t0.c1 < t1.c1 RIGHT JOIN t2 ON t1.c1 = t2.c1 AND t0.c2 IS NOT NULL ORDER BY 3, 1, 2",
+            "SELECT t0.c0, t1.c3, t2.c5 FROM t0, t1 RIGHT JOIN t2 ON t1.c1 = t2.c1 ORDER BY 1, 3, 2",
             # A table with itself, under two aliases, on its key, a column, a comparison or USING.
             "SELECT x.c0, y.c0 FROM t0 x JOIN t0 y ON x.c0 = y.c0 ORDER BY 1",
             "SELECT x.c0, y.c0 FROM t0 x JOIN t0 y ON x.c1 = y.c1 ORDER BY 1, 2",

@@ -1537,6 +1537,7 @@ void join_items(const PgQuery__Node* n, std::int32_t pos, std::vector<FromItem>&
   } else {
     auto item = from_item(r->range_var);
     item.kind = kind;
+    item.join_from = first;
     item.natural = j->is_natural;
     for (std::size_t k = 0; k < j->n_using_clause; ++k) item.using_columns.push_back(str(j->using_clause[k]));
     if (j->join_using_alias != nullptr) {

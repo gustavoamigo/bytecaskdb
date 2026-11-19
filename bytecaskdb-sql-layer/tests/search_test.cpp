@@ -1615,6 +1615,34 @@ TEST_CASE("search: a chain of left joins is planned in FROM order, each right ta
   (void)plan;
 }
 
+TEST_CASE("search: a RIGHT JOIN after the first join reads its table first, then its group, each by its own scan",
+          "[sql][search][join][outer]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"u", {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateTableDdl{"w", {Fixture::col("j", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"j"}});
+  const auto& cat = f.cat();
+  // t and u, the group, are read under each row of w, u by its own scan though its key is reached: a row of
+  // NULLs for each of the two where the group has no row for w's.
+  const std::string sql = "SELECT t.id, u.k, w.j FROM t JOIN u ON u.k = t.qty RIGHT JOIN w ON w.v = u.v";
+  auto b = bound::bind(ast::parse(sql), cat);
+  auto all = generate_alternatives(std::move(b), cat, sql, [](const Table&) -> std::optional<std::uint64_t> { return 1000; });
+  REQUIRE_FALSE(all.empty());
+  for (const auto& g : all) {
+    INFO(g.source);
+    CHECK(occurrences(g.source, "bc_null_row(") == 2);
+    CHECK(g.source.find("bc_get(") == std::string::npos);  // no lookup by key inside the group
+    CHECK(g.source.find("bc_hash") == std::string::npos);
+    CHECK(g.source.find("COL_6_0") < g.source.find("COL_1_0"));  // w first
+    CHECK(g.source.find("COL_1_0") < g.source.find("COL_4_0"));  // then t, then u
+    // The match is set once, at the group's innermost loop.
+    CHECK(occurrences(g.source, " = true;") == 1);
+  }
+  // A key of the group's first table by a parameter is the scan of its prefix, read under each row of w.
+  auto keyed = plan_sql(cat, "SELECT t.id, u.k, w.j FROM t JOIN u ON u.k = t.qty AND t.id = $1 RIGHT JOIN w ON w.v = u.v");
+  CHECK(occurrences(keyed.source, "bc_null_row(") == 2);
+}
+
 TEST_CASE("search: a predicate over the columns of two tables filters the pairs where the last of them is read",
           "[sql][search][join]") {
   sql_test::Fixture f;
