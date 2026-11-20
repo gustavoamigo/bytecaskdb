@@ -1,0 +1,67 @@
+# A type name's qualifier (docs/catalog_design.md, *Stages of schemas*,
+# before stage 1). The layer has no schemas yet: pg_catalog's types are
+# accepted qualified, any other qualifier is refused as PostgreSQL 17 does.
+
+- name: a type qualified by pg_catalog is that type
+  features: [pg:qualified-type-name]
+  setup:
+    - CREATE TABLE qtn (k pg_catalog.int4 PRIMARY KEY, v pg_catalog.varchar(3))
+  steps:
+    - sql: INSERT INTO qtn VALUES (1::pg_catalog.int8, 'abc')
+      rowcount: 1
+    - sql: SELECT k, CAST(v AS pg_catalog.text) FROM qtn
+      expected: [[1, "abc"]]
+    - sql: INSERT INTO qtn VALUES (2, 'abcd')
+      error: "22001"
+  teardown:
+    - DROP TABLE qtn
+
+- name: a type qualified by another schema is refused, never read as its last name
+  features: [pg:qualified-type-name]
+  steps:
+    - sql: CREATE TABLE qtn_bad (a foo.int4)
+      error: "3F000"
+    - sql: CREATE TABLE qtn_bad (a public.int4)
+      error: "42704"
+    - sql: CREATE TABLE qtn_bad (a foo.int4[])
+      error: "3F000"
+    - sql: SELECT 1::foo.int4
+      error: "3F000"
+    - sql: SELECT CAST(1 AS public.int4)
+      error: "42704"
+    - sql: SELECT 1::information_schema.int4
+      error: "42704"
+    - sql: SELECT 1::a.b.int4
+      error: "0A000"
+    - sql: SELECT 1::a.b.c.int4
+      error: "42601"
+    - sql: CREATE DOMAIN qtn_d AS foo.int4
+      error: "3F000"
+    - sql: SELECT 1 FROM qtn_bad
+      error: "42P01"
+
+- name: a procedure's argument type is refused as a column's is
+  features: [pg:qualified-type-name]
+  steps:
+    - sql: "CREATE PROCEDURE qtn_arg(a public.int4) LANGUAGE plpgsql AS $$ BEGIN END $$"
+      error: "42704"
+    - sql: "CREATE PROCEDURE qtn_arg(a pg_catalog.integer) LANGUAGE plpgsql AS $$ BEGIN END $$"
+      error: "42704"
+    - sql: "CREATE PROCEDURE qtn_arg(a pg_catalog.int8) LANGUAGE plpgsql AS $$ BEGIN END $$"
+    - sql: DROP PROCEDURE qtn_arg(pg_catalog.int8)
+
+- name: CREATE TABLE IF NOT EXISTS of a name in use skips a qualified type, as PostgreSQL does
+  features: [pg:qualified-type-name, pg:if-not-exists]
+  setup:
+    - CREATE TABLE qtn_ine (a INTEGER)
+  steps:
+    - sql: CREATE TABLE IF NOT EXISTS qtn_ine (a foo.int4)
+    - sql: CREATE TABLE IF NOT EXISTS qtn_ine (a public.int4)
+    - sql: CREATE TABLE IF NOT EXISTS qtn_ine2 (a foo.int4)
+      error: "3F000"
+    - sql: CREATE TABLE IF NOT EXISTS qtn_ine2 (a public.int4)
+      error: "42704"
+    - sql: SELECT 1 FROM qtn_ine2
+      error: "42P01"
+  teardown:
+    - DROP TABLE qtn_ine

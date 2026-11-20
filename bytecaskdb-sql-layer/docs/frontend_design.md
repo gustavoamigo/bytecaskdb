@@ -1006,6 +1006,31 @@ usable yet.
   `nextval`, `currval`, `setval` and `SERIAL`, and every other form of
   `CREATE TYPE`.
 
+**Type names.** A type in a column definition, a cast, `CREATE DOMAIN`, a
+procedure's argument or a procedure's variable is named alone or qualified
+by `pg_catalog.` (`pg_catalog.int4`, as libpg_query spells `INTEGER`). The
+layer has no schemas yet, so any other qualifier is refused as PostgreSQL
+17 refuses it (`check_type_schema` in `sql/parser.cppm`): `public.`,
+`information_schema.` and `pg_toast.`, schemas PostgreSQL always has, are
+42704 `type "public.int4" does not exist`; any other schema is 3F000
+`schema "foo" does not exist`, before an array's brackets are refused;
+three parts are 0A000 `cross-database references are not implemented`
+(*Known differences*), four or more 42601 `improper qualified name (too
+many dotted names)`. `pg_catalog.` before a spelling the grammar turns
+into a type (`integer`, `int`, `smallint`, `bigint`, `boolean`, `real`,
+`float`, `double`, `decimal`, `dec`, `character`), quoted or not, is 42704
+`type "pg_catalog.integer" does not exist`, as no type of pg_catalog has
+that name. A `CREATE PROCEDURE` argument's type is named without quotes
+(`type public.int4 does not exist`), as PostgreSQL names it there. A
+procedure's variable is checked at its call, as the rest of its
+declaration is (*Known differences*); an integer `FOR` loop's own
+variable, which libpg_query writes as `pg_catalog."integer"`, is `int4`.
+`CREATE TABLE IF NOT EXISTS` of a name in use skips the statement before
+it reads the definition, as PostgreSQL does, so the parser keeps a
+definition's refusal (`CreateTable::refusal`) for the binder to raise only
+when the name is free. Stage 1b of schemas widens this
+(`catalog_design.md`, *Name resolution with schemas*).
+
 **NUMERIC without a precision.** `NUMERIC`, `DECIMAL` and `DEC` without a
 precision declare a column of any digits, stored as PostgreSQL's
 `numeric_out` text, the scale kept (`types_design.md`, *NUMERIC without a
@@ -1764,6 +1789,16 @@ implemented (`functional_testing_design.md`).
   after ISO 8601's `T` (`'T12:00'`, 22007, for `TIME` too). Tracked in
   #866.
 
+- **A type name of three parts is refused** (0A000 `cross-database
+  references are not implemented`), the current database's too:
+  PostgreSQL accepts `postgres.pg_catalog.int4` in the database
+  `postgres` (owner decision Q5 (a), `catalog_design.md`, *Name
+  resolution with schemas*).
+- **A procedure variable's type is read at the call.** A qualifier
+  PostgreSQL refuses in a `DECLARE` (`x foo.int4`, `x pg_catalog.integer`)
+  is refused by the layer's first `CALL` of the procedure, with
+  PostgreSQL's SQLSTATE and message; PostgreSQL refuses the `CREATE
+  PROCEDURE`.
 - **A table needs columns.** The layer refuses `CREATE TABLE t ()` and a
   `CREATE TABLE AS` of a query of no columns (0A000); PostgreSQL accepts a
   table of no columns.

@@ -2071,3 +2071,5 @@ pg:where-current-of:
   description: UPDATE and DELETE ... WHERE CURRENT OF a cursor, and the cursors it refuses
 pg:name-type:
   description: the NAME type, an identifier of at most 63 bytes
+pg:qualified-type-name:
+  description: a type name qualified by a schema; only pg_catalog holds types while the layer has no schemas

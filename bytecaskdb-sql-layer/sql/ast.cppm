@@ -284,6 +284,9 @@ struct CreateTable {
   std::vector<ForeignKeyAst> foreign_keys;  // every FOREIGN KEY, columns' and the table's, in order
   std::vector<CheckAst> checks;  // every CHECK, columns' and the table's, in order
   bool if_not_exists{false};     // IF NOT EXISTS: a relation of the name skips the statement
+  // IF NOT EXISTS only: why the definition is refused, raised when no
+  // relation has the name (the definition is then not read).
+  std::optional<SqlError> refusal;
 };
 
 struct IndexColumnAst {
