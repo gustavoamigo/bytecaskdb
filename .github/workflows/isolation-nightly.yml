@@ -2,7 +2,9 @@
 # Nightly isolation check: tests/elle/isolation_history.cpp records concurrent
 # list-append transaction histories, and scripts/run_isolation_check.py checks
 # them with Elle (elle-cli) and a direct commit-sequence cross-check. See
-# docs/isolation_checking_design.md.
+# docs/isolation_checking_design.md. The same check through the SQL layer is
+# sql-layer-isolation-nightly.yml, a workflow of its own so that a PR to one
+# side does not run the other's jobs.
 #
 # ci.yml only compiles the generator on every push/PR. The timed run lives
 # here, on a schedule plus manual dispatch, and on every update of a PR that

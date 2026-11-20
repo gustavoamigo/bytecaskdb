@@ -19,12 +19,20 @@ Each round runs the three configurations from one seed:
     blind      every statement in autocommit. Must fail: the cross-check or
                Elle has to find a lost append.
 
+The range workload (`sql_layer_tprocc elle --workload range`) runs scans and
+deletes over fixed ranges of keys, which Elle has no model for, and is
+checked here by range_check, which needs no commit order. Its invariant is
+that a range that held a key keeps one: guarded must keep it every round,
+unguarded and blind must each break it at least once over the run. In all
+three every read must agree with the writes that committed around it, and
+the final read with what committed.
+
 Usage:
     python3 bytecaskdb-sql-layer/scripts/sql_isolation_check.py \\
         --binary build/linux/x86_64/releasedbg/sql_layer_tprocc [--elle-jar elle-cli.jar] \\
-        [--rounds N] [--txns N] [--threads N] [--seed S] [--out DIR]
+        [--workloads point,range] [--rounds N] [--txns N] [--threads N] [--seed S] [--out DIR]
 
-Without --elle-jar only the cross-check runs.
+Without --elle-jar the point workload runs only the cross-check.
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ import random
 import shutil
 import subprocess
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
@@ -48,16 +57,140 @@ def lost_appends(problems: list[str]) -> list[str]:
     return [p for p in problems if "missing from final read" in p or "is not a prefix" in p]
 
 
+def record(args: argparse.Namespace, workload: str, config: str, seed: int, round_dir: Path) -> Path:
+    """Runs sql_layer_tprocc elle once and returns the history's path."""
+    history_path = round_dir / f"{workload}-{config}.json"
+    db = round_dir / f"db-{workload}-{config}"
+    subprocess.run([str(args.binary), "elle", "--dir", str(db), "--config", config, "--workload", workload,
+                    "--threads", str(args.threads), "--txns", str(args.txns), "--seed", str(seed), "--out",
+                    str(history_path)], check=True)
+    shutil.rmtree(db, ignore_errors=True)
+    return history_path
+
+
+def range_check(doc: dict) -> tuple[list[str], list[str]]:
+    """Checks a range history with no commit order.
+
+    Every key is born once, initial or inserted fresh, and dies at most once,
+    so each read can be held to the writes that completed before its
+    transaction began and to those it could not yet have seen. Returns
+    (violations, broken): violations are reads or a final state no
+    interleaving of the committed writes explains, a failure in every
+    configuration; broken are the reads and final ranges where a range that
+    held a key is empty, the invariant only serializable histories keep.
+    """
+    buckets = doc["buckets"]
+    txns = doc["txns"]
+    blind = doc["config"] == "blind"
+    initial = {k for b in buckets for k in b["initial"]}
+    # Per key: the insert that could have made it (applied or unknown), and
+    # the deletes that did or may have removed it.
+    inserts: dict[int, dict] = {}
+    deletes: dict[int, list[dict]] = defaultdict(list)
+    never: set[int] = set()  # keys whose only insert did not take effect
+    for t in txns:
+        if t["insert"] is not None:
+            if t["insert_applied"] is False:
+                never.add(t["insert"])
+            else:
+                inserts[t["insert"]] = t
+        if t["delete"] is not None and t["delete_applied"] is not False:
+            deletes[t["delete"]].append(t)
+
+    def bucket_of(k: int) -> int | None:
+        for i, b in enumerate(buckets):
+            if b["lo"] <= k <= b["hi"]:
+                return i
+        return None
+
+    def surely_live(k: int, after: int, before: int) -> bool:
+        """Born by a write that completed before `after`, and no delete of it
+        had begun by `before`."""
+        born = k in initial or (k in inserts and inserts[k]["insert_applied"] is True and inserts[k]["end"] < after)
+        return born and not any(d["start"] < before for d in deletes[k])
+
+    violations: list[str] = []
+    broken: list[str] = []
+    for t in txns:
+        # A transaction's scan is committed when it committed; a blind scan
+        # is its own committed statement.
+        if t["scan"] is None or not (t["type"] == "ok" or blind):
+            continue
+        # The scan reads a state taken between these two times: from the
+        # transaction's start (its snapshot is taken at or after it), or the
+        # blind statement's own call, to the scan's return.
+        after = t["scan_start"] if blind else t["start"]
+        before = t["scan_end"]
+        b = t["bucket"]
+        seen = set(t["scan"])
+        for k in seen:
+            if bucket_of(k) != b:
+                violations.append(f"txn at {t['start']}: scan of range {b} returned {k}, outside it")
+            elif k in never or (k not in initial and k not in inserts):
+                violations.append(f"txn at {t['start']}: scan of range {b} returned {k}, never committed")
+            elif any(d["end"] < after and d["delete_applied"] is True for d in deletes[k]):
+                violations.append(f"txn at {t['start']}: scan of range {b} returned {k}, deleted before it began")
+            elif k in inserts and inserts[k]["start"] > before:
+                violations.append(f"txn at {t['start']}: scan of range {b} returned {k}, inserted after it ended")
+        for k in sorted(initial | inserts.keys()):
+            if bucket_of(k) == b and k not in seen and surely_live(k, after, before):
+                violations.append(f"txn at {t['start']}: scan of range {b} missed {k}, committed before it began")
+        if not seen - {t["insert"]}:
+            broken.append(f"txn at {t['start']}: range {b} held no key")
+
+    final = set(doc["final"])
+    for k in sorted(initial | inserts.keys() | never | final):
+        if k in never:
+            if k in final:
+                violations.append(f"final read: {k} is there, its insert did not take effect")
+            continue
+        born = k in initial or k in inserts
+        if not born:
+            violations.append(f"final read: {k} is there, never inserted")
+            continue
+        unknown = (k in inserts and inserts[k]["insert_applied"] is None) or any(
+            d["delete_applied"] is None for d in deletes[k])
+        if unknown:
+            continue
+        applied = sum(1 for d in deletes[k] if d["delete_applied"] is True)
+        expected = 1 - applied
+        if expected not in (0, 1):
+            violations.append(f"key {k}: deleted {applied} times")
+        elif (k in final) != (expected == 1):
+            violations.append(f"final read: {k} is {'there' if k in final else 'missing'}, "
+                              f"the committed writes leave it {'live' if expected else 'deleted'}")
+    for i, b in enumerate(buckets):
+        if not any(b["lo"] <= k <= b["hi"] for k in final):
+            broken.append(f"final read: range {i} holds no key")
+    return violations, broken
+
+
+def check_range_round(args: argparse.Namespace, seed: int, round_dir: Path) -> set[str]:
+    """Returns the configurations whose history broke the range invariant."""
+    broke: set[str] = set()
+    for config in ric.CONFIGS:
+        doc = json.loads(record(args, "range", config, seed, round_dir).read_text())
+        violations, broken = range_check(doc)
+        print(f"  range {config}: {len(doc['txns'])} txns, {len(violations)} violations, "
+              f"{len(broken)} empty ranges seen")
+        for v in violations[:10]:
+            print(f"    {v}")
+        for v in broken[:3]:
+            print(f"    {v}")
+        if violations:
+            raise ric.CheckFailed(f"range {config}: reads or final state no committed writes explain")
+        if config == "guarded" and broken:
+            raise ric.CheckFailed("range guarded: a range that held a key lost it")
+        if broken:
+            broke.add(config)
+    return broke
+
+
 def check_round(args: argparse.Namespace, seed: int, round_dir: Path) -> bool:
     """Returns whether the unguarded history showed write skew."""
     skew = False
     for config in ric.CONFIGS:
-        history_path = round_dir / f"{config}.json"
-        db = round_dir / f"db-{config}"
-        subprocess.run([str(args.binary), "elle", "--dir", str(db), "--config", config, "--threads",
-                        str(args.threads), "--txns", str(args.txns), "--seed", str(seed), "--out",
-                        str(history_path)], check=True)
-        shutil.rmtree(db, ignore_errors=True)
+        history_path = record(args, "point", config, seed, round_dir)
         problems = ric.cross_check(json.loads(history_path.read_text()), require_sequence=False)
         print(f"  {config}: cross-check {'clean' if not problems else f'{len(problems)} violations'}")
         for p in problems[:3 if config == "blind" else 10]:
@@ -103,19 +236,33 @@ def main() -> int:
     parser.add_argument("--txns", type=int, default=5_000)
     parser.add_argument("--threads", type=int, default=16)
     parser.add_argument("--out", type=Path, default=Path("sql_isolation_check"))
+    parser.add_argument("--workloads", default="point,range",
+                        help="comma-separated: point (list-append, Elle), range (scans and deletes)")
     args = parser.parse_args()
+    workloads = args.workloads.split(",")
+    if not workloads or set(workloads) - {"point", "range"}:
+        parser.error("--workloads takes point, range or both")
     seed = args.seed if args.seed is not None else random.randrange(1 << 31)
     print(f"seed {seed}")
     skew = False
+    broke: set[str] = set()
     try:
         for r in range(args.rounds):
             round_dir = args.out / f"round-{r}"
             shutil.rmtree(round_dir, ignore_errors=True)
             round_dir.mkdir(parents=True)
             print(f"round {r} (seed {seed + r})")
-            skew |= check_round(args, seed + r, round_dir)
-        if args.elle_jar and not skew:
+            if "point" in workloads:
+                skew |= check_round(args, seed + r, round_dir)
+            if "range" in workloads:
+                broke |= check_range_round(args, seed + r, round_dir)
+        if "point" in workloads and args.elle_jar and not skew:
             raise ric.CheckFailed("unguarded: no write skew over the run; the check cannot see what the guards prevent")
+        if "range" in workloads:
+            for config in ("unguarded", "blind"):
+                if config not in broke:
+                    raise ric.CheckFailed(f"range {config}: no range lost its keys over the run; "
+                                          "the check cannot see what the guards prevent")
     except ric.CheckFailed as e:
         print(f"FAILED: {e}")
         return 1

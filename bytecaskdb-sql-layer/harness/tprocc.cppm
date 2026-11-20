@@ -20,6 +20,7 @@ module;
 #include <exception>
 #include <format>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -155,11 +156,16 @@ void dump_sql(Database& db, std::ostream& out);
 [[nodiscard]] auto format_report(const PhaseReport& r) -> std::string;
 [[nodiscard]] auto json_report(const PhaseReport& r) -> std::string;
 
-// A list-append history through SQL, in the engine harness's JSON format
-// (docs/isolation_checking_design.md), for scripts/sql_isolation_check.py.
+// A history through SQL for scripts/sql_isolation_check.py
+// (docs/testing_design.md, *The TPROC-C harness*). Point is list-append, in
+// the engine harness's JSON format (docs/isolation_checking_design.md); Range
+// is scans and deletes over fixed ranges, whose invariant is that a range
+// that held a key keeps one.
 enum class ElleConfig : std::uint8_t { Guarded, Unguarded, Blind };
+enum class ElleWorkload : std::uint8_t { Point, Range };
 struct ElleOptions {
   ElleConfig config{ElleConfig::Guarded};
+  ElleWorkload workload{ElleWorkload::Point};
   std::size_t threads{8};
   std::uint64_t txns{2'000};  // in all, across the threads
   std::uint64_t seed{1};
@@ -1139,9 +1145,211 @@ auto mops_json(const std::vector<Mop>& mops, bool completed) -> std::string {
 constexpr std::int64_t kActiveKeys = 8;
 constexpr std::int64_t kAppendsPerKey = 64;
 
+// The range workload (docs/testing_design.md, *The TPROC-C harness*): 32
+// keys split once, from the seed, into ranges of 2 to 7 keys. Range b owns
+// the keys [b * kRangeSpan, (b + 1) * kRangeSpan); its first keys exist at
+// the start, and an insert takes a fresh key from kRangeFresh up, never
+// taken before, so no insert collides with another.
+constexpr std::int64_t kRangeKeys = 32;
+constexpr std::int64_t kRangeSpan = std::int64_t{1} << 24;
+constexpr std::int64_t kRangeFresh = 1'024;
+
+struct RangeBucket {
+  std::int64_t lo{0};
+  std::int64_t hi{0};
+  std::vector<std::int64_t> initial;
+};
+
+// A write's outcome as the history reports it: applied, not applied, or
+// unknown (the statement or the commit carrying it may or may not have
+// taken effect).
+enum class Applied : std::uint8_t { No, Yes, Unknown };
+
+struct RangeTxn {
+  std::uint64_t process{0};
+  std::string type;  // ok, fail, info
+  std::int64_t start{0};
+  std::int64_t end{0};
+  std::size_t bucket{0};
+  std::optional<std::int64_t> inserted;
+  Applied insert_applied{Applied::No};
+  std::optional<std::vector<std::int64_t>> scan;  // set once the scan returned
+  std::int64_t scan_start{0};                     // the scan statement's call and return
+  std::int64_t scan_end{0};
+  std::optional<std::int64_t> deleted;
+  Applied delete_applied{Applied::No};
+};
+
+auto applied_json(Applied a) -> std::string_view {
+  switch (a) {
+    case Applied::No: return "false";
+    case Applied::Yes: return "true";
+    case Applied::Unknown: return "null";
+  }
+  return "null";
+}
+
+auto keys_json(const std::vector<std::int64_t>& keys) -> std::string { return "[" + list_text(keys) + "]"; }
+
+auto range_buckets(std::uint64_t seed) -> std::vector<RangeBucket> {
+  Rng rng{seed};
+  std::vector<RangeBucket> out;
+  for (auto left = kRangeKeys; left > 0;) {
+    auto n = uniform(rng, 2, std::min<std::int64_t>(7, left));
+    if (left - n == 1) n += n < 7 ? 1 : -1;  // never leave a range of one key
+    RangeBucket b;
+    b.lo = std::ssize(out) * kRangeSpan;
+    b.hi = b.lo + kRangeSpan - 1;
+    for (std::int64_t i = 0; i < n; ++i) b.initial.push_back(b.lo + i);
+    out.push_back(std::move(b));
+    left -= n;
+  }
+  return out;
+}
+
+auto int_keys(const Rows& rows) -> std::vector<std::int64_t> {
+  std::vector<std::int64_t> out;
+  out.reserve(rows.rows.size());
+  for (const auto& r : rows.rows) out.push_back(i64(r.at(0)));
+  std::ranges::sort(out);
+  return out;
+}
+
+// A transaction scans one range and, when it saw two or more keys, deletes
+// one of them; a quarter of them insert a fresh key into the range first.
+// Two transactions that each delete a key of a two-key range, having read
+// the other's, are write skew: with nothing guarding the scan both commit
+// and the range is empty.
+auto elle_range_history(Database& db, const ElleOptions& opts) -> std::string {
+  if (!std::in_range<std::int64_t>(opts.txns) || static_cast<std::int64_t>(opts.txns) >= kRangeSpan - kRangeFresh) {
+    throw std::invalid_argument("--txns is too large for the range workload");
+  }
+  (void)db.execute("CREATE TABLE elle_r (k BIGINT PRIMARY KEY)");
+  const auto buckets = range_buckets(opts.seed);
+  const auto& ins = db.prepare("INSERT INTO elle_r (k) VALUES ($1)");
+  {
+    Loader l{db, 2'000};
+    for (const auto& b : buckets) {
+      for (auto k : b.initial) l.insert(ins, {k});
+    }
+    l.flush();
+  }
+  const auto& scan = db.prepare("SELECT k FROM elle_r WHERE k BETWEEN $1 AND $2");
+  const auto& lock = db.prepare("SELECT k FROM elle_r WHERE k BETWEEN $1 AND $2 FOR UPDATE");
+  const auto& del = db.prepare("DELETE FROM elle_r WHERE k = $1");
+
+  std::atomic<std::int64_t> next_fresh{kRangeFresh};
+  std::atomic<std::int64_t> remaining{static_cast<std::int64_t>(opts.txns)};
+  const auto start = Clock::now();
+  auto now_ns = [&] { return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count(); };
+  const auto blind = opts.config == ElleConfig::Blind;
+
+  std::vector<std::vector<RangeTxn>> logs(opts.threads);
+  std::vector<std::exception_ptr> errors(opts.threads);
+  {
+    std::vector<std::jthread> pool;
+    for (std::size_t t = 0; t < opts.threads; ++t) {
+      pool.emplace_back([&, t] {
+        try {
+          Rng rng{opts.seed * 7'919 + t};
+          auto process = static_cast<std::uint64_t>(t);
+          while (remaining.fetch_sub(1) > 0) {
+            RangeTxn r;
+            r.process = process;
+            r.bucket = static_cast<std::size_t>(uniform(rng, 0, std::ssize(buckets) - 1));
+            const auto& b = buckets[r.bucket];
+            if (uniform(rng, 1, 4) == 1) r.inserted = b.lo + next_fresh.fetch_add(1);
+            r.start = now_ns();
+            r.type = "ok";
+            // The write a blind statement in flight carries, when it fails.
+            Applied* in_flight = nullptr;
+            try {
+              std::optional<Transaction> txn;
+              if (!blind) txn.emplace(db.begin());
+              auto exec = [&](const Statement& s, std::vector<Value> p) {
+                return txn ? txn->execute(s, p) : db.execute(s, p);
+              };
+              if (r.inserted) {
+                in_flight = &r.insert_applied;
+                auto n = exec(ins, {*r.inserted}).affected;
+                r.insert_applied = n == 1 ? Applied::Yes : Applied::No;
+              }
+              in_flight = nullptr;
+              r.scan_start = now_ns();
+              r.scan = int_keys(exec(opts.config == ElleConfig::Guarded ? lock : scan, {b.lo, b.hi}));
+              r.scan_end = now_ns();
+              std::int64_t deleted_rows = 0;
+              if (r.scan->size() >= 2) {
+                r.deleted = r.scan->at(static_cast<std::size_t>(uniform(rng, 0, std::ssize(*r.scan) - 1)));
+                in_flight = &r.delete_applied;
+                deleted_rows = exec(del, {*r.deleted}).affected;
+                r.delete_applied = deleted_rows == 1 ? Applied::Yes : Applied::No;
+              }
+              in_flight = nullptr;
+              if (txn && txn->commit() != CommitOutcome::Committed) r.type = "fail";
+            } catch (const SerializationFailure&) {
+              r.type = blind ? "info" : "fail";
+            } catch (const ExecError& e) {
+              // In autocommit, a statement that conflicted on every retry:
+              // the statements before it committed.
+              if (!blind || !e.conflict()) throw;
+              r.type = "info";
+            } catch (const TransactionResolutionUnknown&) {
+              r.type = "info";
+            }
+            r.end = now_ns();
+            if (blind) {
+              if (r.type == "info" && in_flight != nullptr) *in_flight = Applied::Unknown;
+            } else if (r.type == "fail") {
+              r.insert_applied = Applied::No;
+              r.delete_applied = Applied::No;
+            } else if (r.type == "info") {
+              if (r.inserted) r.insert_applied = Applied::Unknown;
+              if (r.deleted) r.delete_applied = Applied::Unknown;
+            }
+            logs[t].push_back(std::move(r));
+            if (logs[t].back().type == "info") process += opts.threads;
+          }
+        } catch (...) {
+          errors[t] = std::current_exception();
+        }
+      });
+    }
+  }
+  for (const auto& e : errors) {
+    if (e) std::rethrow_exception(e);
+  }
+  // The final read of every key, after the clients.
+  const auto final_keys = int_keys(db.execute("SELECT k FROM elle_r"));
+
+  std::vector<RangeTxn> all;
+  for (auto& l : logs) std::ranges::move(l, std::back_inserter(all));
+  std::ranges::sort(all, {}, &RangeTxn::start);
+  std::string out = std::format(R"({{"workload":"range","config":"{}","buckets":[)",
+                                opts.config == ElleConfig::Guarded     ? "guarded"
+                                : opts.config == ElleConfig::Unguarded ? "unguarded"
+                                                                       : "blind");
+  for (std::size_t i = 0; i < buckets.size(); ++i) {
+    const auto& b = buckets[i];
+    out += std::format(R"({}{{"lo":{},"hi":{},"initial":{}}})", i ? "," : "", b.lo, b.hi, keys_json(b.initial));
+  }
+  out += "],\n\"txns\":[\n";
+  for (std::size_t i = 0; i < all.size(); ++i) {
+    const auto& r = all[i];
+    out += std::format(
+        R"({{"process":{},"type":"{}","start":{},"end":{},"bucket":{},"insert":{},"insert_applied":{},"scan":{},"scan_start":{},"scan_end":{},"delete":{},"delete_applied":{}}}{})",
+        r.process, r.type, r.start, r.end, r.bucket, r.inserted ? std::to_string(*r.inserted) : "null",
+        applied_json(r.insert_applied), r.scan ? keys_json(*r.scan) : "null", r.scan_start, r.scan_end,
+        r.deleted ? std::to_string(*r.deleted) : "null", applied_json(r.delete_applied),
+        i + 1 == all.size() ? "\n" : ",\n");
+  }
+  return out + "],\n\"final\":" + keys_json(final_keys) + "}\n";
+}
+
 }  // namespace
 
 auto elle_history(Database& db, const ElleOptions& opts) -> std::string {
+  if (opts.workload == ElleWorkload::Range) return elle_range_history(db, opts);
   (void)db.execute("CREATE TABLE elle (k BIGINT PRIMARY KEY, v VARCHAR(2048) NOT NULL)");
   // Every key a run can reach exists before the clients start, so every
   // read returns a row (and FOR UPDATE has a row to guard).
