@@ -281,7 +281,11 @@ nothing more. After startup, an invalid message length or type is `FATAL`.
 2. **The parameters.**
    - `user` is required, and any name is accepted: every session is the
      bootstrap superuser, whatever it names (`frontend_design.md`, *Roles
-     and privileges*).
+     and privileges*). It is what `CURRENT_USER`, `CURRENT_ROLE`, `USER`
+     and `SESSION_USER` return, cut to 63 bytes (`frontend_design.md`,
+     *Session functions*): the server passes it as the `user` of each
+     statement's `ExecutionOptions` and each block's `TransactionOptions`.
+   - The served name is `CURRENT_CATALOG` (`DatabaseOptions::name`).
    - `database` must be the served name, else `FATAL 3D000`
      (`invalid_catalog_name`).
    - `application_name` is kept and reported back.
@@ -695,6 +699,7 @@ Each `SqlType` has an OID, a length and a modifier, as `pg_type` and
 | `TEXT` | 25 | -1 | -1 |
 | `VARCHAR(n)` | 1043 | -1 | n + 4 |
 | `CHAR(n)` | 1042 | -1 | n + 4 |
+| `NAME` | 19 | 64 | -1 |
 | `DECIMAL(p, s)` | 1700 | -1 | ((p << 16) \| s) + 4 |
 | `numeric`, unconstrained (a `SUM`) | 1700 | -1 | -1 |
 | `TIMESTAMP` | 1114 | 8 | -1 |

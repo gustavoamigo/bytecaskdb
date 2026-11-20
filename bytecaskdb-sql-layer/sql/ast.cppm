@@ -127,8 +127,12 @@ struct Expr {
   // string)), its operands in `args`.
   std::string func;
   // Clock: `func` is the SQL name (current_date, localtime, …) and `constant`
-  // the precision written after it, -1 for none; `column` is "now" for now(),
-  // the name of its output column, "" for the others, named by `func`.
+  // the precision written after it, -1 for none; `column` is the call's name
+  // for now(), current_database() and current_schema(), the name of its
+  // output column, "" for the others, named by `func`. A
+  // session function (current_user, current_role, user, session_user,
+  // current_catalog, current_schema) is a Clock too, of no precision: a
+  // value read when the statement runs.
 };
 
 // One conjunct of a WHERE clause: two expressions compared; or, as a

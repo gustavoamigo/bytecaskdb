@@ -230,6 +230,33 @@ TEST_CASE("catalog: a clock default trails its column's entry, and only a column
   refused([](Column& c) { c.default_value = std::int64_t{1}; });
 }
 
+TEST_CASE("catalog: a session function's default is a NAME's, taken by a string column only", "[sql][catalog][name]") {
+  auto t = rich_table();
+  t.checks.clear();
+  auto& c = t.columns.at(2);  // a variable column, in the unique index
+  c.sql = SqlType{SqlKind::Name};
+  c.default_value = std::monostate{};
+  std::vector<ColumnDef> defs;
+  for (const auto& col : t.columns) defs.emplace_back(col.id, col.sql, col.nullable);
+  t.layout = make_layout(defs);
+  for (auto fn : {ClockDefault::Fn::CurrentUser, ClockDefault::Fn::SessionUser, ClockDefault::Fn::CurrentCatalog,
+                  ClockDefault::Fn::CurrentSchema}) {
+    c.clock_default = ClockDefault{fn, 6};
+    auto u = parse_table(serialize_table(t));
+    CHECK(u.columns.at(2).sql == SqlType{SqlKind::Name});
+    CHECK(*u.columns.at(2).clock_default == ClockDefault{fn, 6});
+  }
+  // The clock to a NAME is no assignment PostgreSQL has: refused at load.
+  c.clock_default = ClockDefault{ClockDefault::Fn::CurrentDate, 6};
+  CHECK_THROWS_AS(parse_table(serialize_table(t)), std::runtime_error);
+  // A session function to a TIMESTAMP neither.
+  auto v = rich_table();
+  v.checks.clear();
+  v.columns.back().default_value = std::monostate{};
+  v.columns.back().clock_default = ClockDefault{ClockDefault::Fn::CurrentUser, 6};
+  CHECK_THROWS_AS(parse_table(serialize_table(v)), std::runtime_error);
+}
+
 TEST_CASE("catalog: CHECK constraints are named as PostgreSQL names them and survive a reopen", "[sql][catalog]") {
   sql_test::TempDir dir{"catalog_check"};
   auto db = DB::open(dir.path());

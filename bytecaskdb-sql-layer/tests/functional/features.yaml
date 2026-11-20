@@ -2067,3 +2067,5 @@ pg:cursor-lifetime:
   description: a cursor's scope, name and error behaviour in a transaction block
 pg:where-current-of:
   description: UPDATE and DELETE ... WHERE CURRENT OF a cursor, and the cursors it refuses
+pg:name-type:
+  description: the NAME type, an identifier of at most 63 bytes

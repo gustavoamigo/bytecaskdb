@@ -513,7 +513,15 @@ struct TransactionOptions {
   // statement ends. A statement that would take it past is BC_E_LIMIT
   // (SQLSTATE 54000), and aborts the transaction.
   std::uint64_t max_bytes{64u << 20};
+  // The session's user: what CURRENT_USER, CURRENT_ROLE, USER and
+  // SESSION_USER return in the transaction's statements, cut to a NAME's 63
+  // bytes. Empty for the bootstrap superuser's name, kBootstrapUser. Every
+  // session is that superuser whatever it is named: no privilege is checked.
+  std::string user{};
 };
+
+// The name CURRENT_USER returns for a session that names no user.
+inline constexpr std::string_view kBootstrapUser = "bytecask";
 
 // A flag another thread sets to cancel the statement running with it
 // (ExecutionOptions::cancel). Not copyable: a statement reads it by address
@@ -544,10 +552,22 @@ private:
 struct ExecutionOptions {
   std::chrono::steady_clock::time_point deadline{};  // the clock's epoch: none
   const CancelFlag* cancel{nullptr};
+  // The session's user, as TransactionOptions::user, for a statement run
+  // outside a transaction; borrowed for the call. Empty for kBootstrapUser.
+  std::string_view user{};
 };
 
 class Database;
 class Cursor;
+
+// What a run's clock and session functions read: the statement's or its
+// transaction's time, the session's user (empty for kBootstrapUser) and the
+// database's name. Internal to the API: built by Database::reading.
+struct Reading {
+  std::int64_t now_us;
+  std::string_view user;
+  std::string_view database;
+};
 
 // Whether a cursor outlives the transaction that opened it.
 enum class Holdability : std::uint8_t {
@@ -694,6 +714,7 @@ struct TxnHandle {
   bc_txn* txn{nullptr};
   std::atomic<TxnState> state{TxnState::Ended};  // close() ends it from another thread
   std::int64_t started_us{0};  // the transaction's time: what CURRENT_DATE, LOCALTIME and LOCALTIMESTAMP read in it
+  std::string user;            // TransactionOptions::user: what CURRENT_USER reads in it
   std::vector<std::shared_ptr<CursorState>> cursors;  // open; closed before the snapshot is released
   std::uint64_t cursors_opened{0};
   std::vector<Savepoint> savepoints;  // oldest first, one per runtime mark
@@ -1187,6 +1208,10 @@ struct DatabaseOptions {
   // it; nothing waits. Reserved in steps of 1 MiB per statement, so it can
   // refuse up to 1 MiB per statement in progress early. 0: no cap.
   std::uint64_t max_memory_bytes{0};
+  // The database's name: what CURRENT_CATALOG returns, cut to a NAME's 63
+  // bytes. Empty for the directory's last component, as the server's
+  // default name.
+  std::string name{};
 };
 
 // Every call may be made from any thread, concurrently with any other but
@@ -1461,9 +1486,9 @@ private:
   auto run_auto(bc_ctx* cx, const std::function<std::shared_ptr<const Compiled>()>& plan,
                 const std::vector<Value>& params, std::int64_t now_us, const ExecutionOptions& opts) -> Rows;
   // Runs `c`, bound at the transaction's pin, as a statement of `txn` on
-  // `cx`, its writes added to it. `now_us` is the transaction's time.
+  // `cx`, its writes added to it. `r` is the transaction's reading.
   // `window` runs it windowed and records where it stopped.
-  auto run_txn(bc_ctx* cx, const Compiled& c, const std::vector<Value>& params, bc_txn* txn, std::int64_t now_us,
+  auto run_txn(bc_ctx* cx, const Compiled& c, const std::vector<Value>& params, bc_txn* txn, const Reading& r,
                const ExecutionOptions& opts, WindowRows* window = nullptr, RowWindow range = {}) -> Rows;
   // The statement budget with a call's deadline and cancel flag.
   [[nodiscard]] auto budget_for(const ExecutionOptions& opts) const noexcept -> bc_budget;
@@ -1474,12 +1499,16 @@ private:
   // The same on a hold cursor's own view, in a context of the pool.
   auto run_held(const CursorState& cursor, RowWindow range, WindowRows& out, const ExecutionOptions& opts) -> Rows;
   [[nodiscard]] auto clock_now() const -> std::int64_t { return clock_(); }
+  [[nodiscard]] auto reading(std::int64_t now_us, std::string_view user) const -> Reading {
+    return {now_us, user, name_};
+  }
   // Throws ParamError for parameters the plan does not take, and ExecError
   // BC_C_RANGE for a value outside its parameter's SQL type.
   static void check_params(const Compiled& c, const std::vector<Value>& params);
-  // What the plan's parameters are bound to: the caller's, then the
-  // statement's constants, with the time's slots filled from `now_us`.
-  static auto plan_params(const Compiled& c, const std::vector<Value>& params, std::int64_t now_us) -> std::vector<Value>;
+  // What the plan's parameters are bound to: the caller's, a NAME's cut to
+  // its 63 bytes, then the statement's constants, with the time's and the
+  // session's slots filled from `r`.
+  static auto plan_params(const Compiled& c, const std::vector<Value>& params, const Reading& r) -> std::vector<Value>;
   static auto results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows;
   static auto padded(const std::vector<SqlType>& types, std::vector<Value> values) -> std::vector<Value>;
   // CREATE TABLE AS's query, of a constant whose folding threw `error`:
@@ -1525,6 +1554,8 @@ private:
   std::mutex contexts_mu_;  // guards idle_; taken only to take or return one
   std::vector<bc_ctx*> idle_;
   std::atomic<std::uint64_t> compilations_{0};
+  // DatabaseOptions::name, cut to a NAME: what CURRENT_CATALOG returns.
+  std::string name_;
   // The time of CURRENT_DATE and its kin, microseconds since the Unix epoch: the system clock unless a test sets it.
   std::function<std::int64_t()> clock_{[] {
     return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -1543,6 +1574,12 @@ namespace bytecask::sql {
 namespace {
 
 constexpr std::uint32_t kMaxRetries = 3;
+
+// A session's or database's name as a NAME holds it: its first 63 bytes.
+auto name_of(std::string_view s) -> std::string {
+  auto cut = name_prefix(std::as_bytes(std::span{s.data(), s.size()}));
+  return std::string{s.substr(0, cut.size())};
+}
 
 }  // namespace
 
@@ -1819,6 +1856,13 @@ auto Database::open(const std::filesystem::path& dir, DatabaseOptions opts) -> s
   }
   if (opts.statement_memory_bytes == 0) throw std::invalid_argument("statement_memory_bytes is at least 1");
   std::unique_ptr<Database> d{new Database};
+  if (opts.name.empty()) {
+    // The directory's last component, a trailing '/' or a '.' notwithstanding.
+    auto named = std::filesystem::absolute(dir).lexically_normal();
+    if (!named.has_filename()) named = named.parent_path();
+    opts.name = named.filename().string();
+  }
+  d->name_ = name_of(opts.name);
   d->sync_commits_ = opts.sync == SyncMode::AtEveryCommit;
   d->budget_ = {.max_reads = 0, .max_bytes = opts.statement_memory_bytes, .deadline_ns = 0, .cancel = nullptr};
   d->life_ = std::make_shared<DatabaseLife>();
@@ -2347,6 +2391,7 @@ auto notice_type_name(SqlKind k) -> std::string_view {
     case SqlKind::Text: return "text";
     case SqlKind::Varchar: return "pg_catalog.varchar";
     case SqlKind::Char: return "pg_catalog.bpchar";
+    case SqlKind::Name: return "name";
     case SqlKind::Bytea: return "bytea";
     case SqlKind::Date: return "date";
     case SqlKind::Time: return "pg_catalog.time";
@@ -2614,7 +2659,21 @@ void Database::check_params(const Compiled& c, const std::vector<Value>& params)
 // The time as a value of each clock slot's type: the day, the time of day, or
 // the instant, in UTC, rounded to the slot's fractional digits as PostgreSQL
 // rounds a time or timestamp typmod.
-static auto clock_value(const bound::ClockSlot& k, std::int64_t now_us) -> Value {
+static auto clock_value(const bound::ClockSlot& k, const Reading& r) -> Value {
+  auto text = [](std::string_view v) {
+    auto b = std::as_bytes(std::span{v.data(), v.size()});
+    return Value{Bytes(b.begin(), b.end())};
+  };
+  switch (k.kind) {
+    case bound::ClockSlot::Kind::User: return text(r.user.empty() ? name_of(kBootstrapUser) : name_of(r.user));
+    case bound::ClockSlot::Kind::Catalog: return text(r.database);
+    case bound::ClockSlot::Kind::Schema: return text("public");  // the one schema, until schemas exist
+    case bound::ClockSlot::Kind::Date:
+    case bound::ClockSlot::Kind::Time:
+    case bound::ClockSlot::Kind::Timestamp:
+    case bound::ClockSlot::Kind::TimestampTz: break;
+  }
+  auto now_us = r.now_us;
   constexpr std::int64_t kDay = 86'400'000'000;
   auto day = now_us >= 0 ? now_us / kDay : -((-now_us + kDay - 1) / kDay);
   if (k.kind == bound::ClockSlot::Kind::Date) return Value{day};
@@ -2626,8 +2685,14 @@ static auto clock_value(const bound::ClockSlot& k, std::int64_t now_us) -> Value
   return Value{rounded};
 }
 
-auto Database::plan_params(const Compiled& c, const std::vector<Value>& params, std::int64_t now_us) -> std::vector<Value> {
+auto Database::plan_params(const Compiled& c, const std::vector<Value>& params, const Reading& r) -> std::vector<Value> {
   auto out = params;
+  // A parameter typed name is cut to its 63 bytes, as PostgreSQL's namein
+  // reads one: a key or a comparison sees what a NAME column stores.
+  for (std::size_t i = 0; i < params.size() && i < c.params.size(); ++i) {
+    auto* b = std::get_if<Bytes>(&out[i]);
+    if (b != nullptr && c.params[i].type.kind == SqlKind::Name) b->resize(name_prefix(*b).size());
+  }
   // A parameter compared with a REAL is typed real, as PostgreSQL types it:
   // rounded once to single precision, as the column's values were, so a
   // filter compares the float of the value given (check_params refused one
@@ -2637,7 +2702,7 @@ auto Database::plan_params(const Compiled& c, const std::vector<Value>& params, 
     if (d != nullptr && c.param_sql[i] && c.param_sql[i]->kind == SqlKind::Real) *d = float_rounding(*d);
   }
   out.insert(out.end(), c.fixed.begin(), c.fixed.end());
-  for (const auto& k : c.clocks) out[params.size() + k.slot] = clock_value(k, now_us);
+  for (const auto& k : c.clocks) out[params.size() + k.slot] = clock_value(k, r);
   return out;
 }
 
@@ -2658,7 +2723,7 @@ auto Database::run_auto(bc_ctx* cx, const std::function<std::shared_ptr<const Co
   auto budget = budget_for(opts);
   auto c = plan();
   check_params(*c, params);
-  bp.values = plan_params(*c, params, now_us);
+  bp.values = plan_params(*c, params, reading(now_us, opts.user));
   auto r = bc_execute(cx, c->code->fn(), &c->ref, &bp, budget, sync_commits_, kMaxRetries);
   // bc_ctx_run checks the plan against the catalog it pinned. A DDL that
   // raced the run since the plan was taken makes a plan it changed
@@ -2668,7 +2733,7 @@ auto Database::run_auto(bc_ctx* cx, const std::function<std::shared_ptr<const Co
     bc_ctx_reset(cx);
     c = plan();
     check_params(*c, params);
-    bp.values = plan_params(*c, params, now_us);
+    bp.values = plan_params(*c, params, reading(now_us, opts.user));
     r = bc_execute(cx, c->code->fn(), &c->ref, &bp, budget, sync_commits_, kMaxRetries);
   }
   if (r == BC_CONFLICT) {
@@ -2681,9 +2746,9 @@ auto Database::run_auto(bc_ctx* cx, const std::function<std::shared_ptr<const Co
 }
 
 auto Database::run_txn(bc_ctx* cx, const Compiled& c, const std::vector<Value>& params, bc_txn* txn,
-                       std::int64_t now_us, const ExecutionOptions& opts, WindowRows* window, RowWindow range) -> Rows {
+                       const Reading& r, const ExecutionOptions& opts, WindowRows* window, RowWindow range) -> Rows {
   check_params(c, params);
-  bc_params bp{plan_params(c, params, now_us)};
+  bc_params bp{plan_params(c, params, r)};
   bc_ctx_begin_txn(cx, txn, &bp, budget_for(opts));
   if (window != nullptr) bc_ctx_window(cx, range.skip, range.limit);
   bc_ctx_run(cx, c.code->fn(), &c.ref);
@@ -2913,7 +2978,7 @@ auto Database::run_procedure(const CompiledProcedure& p, const Procedure& def, c
     std::vector<Value> params;
     for (auto v : gen.stmts[k].param_vars) params.push_back(px.slots.values.at(v));
     check_params(c, params);
-    bp.values = plan_params(c, params, h.started_us);
+    bp.values = plan_params(c, params, reading(h.started_us, h.user));
     bc_ctx_begin_txn(sx, h.txn, &bp, budget);
 #ifdef BYTECASK_SQL_TESTING
     if (after_txn_pin_) after_txn_pin_();
@@ -3027,6 +3092,7 @@ Transaction::Transaction(Database& db, TransactionOptions opts)
     throw;
   }
   h_->started_us = db.clock_now();
+  h_->user = name_of(opts.user.empty() ? kBootstrapUser : opts.user);
   h_->max_bytes = opts.max_bytes;
   h_->state.store(TxnState::Open);
 }
@@ -3304,11 +3370,11 @@ auto Transaction::run_locked(const Target& t, const std::vector<Value>& params, 
     auto plan = plan_for(t, parse);
     const auto& c = plan.get();
     if (positioned != nullptr) {
-      return db_->run_txn(h_->cx, c, with_cursor_key(c, *positioned, params), h_->txn, h_->started_us, opts, window,
+      return db_->run_txn(h_->cx, c, with_cursor_key(c, *positioned, params), h_->txn, db_->reading(h_->started_us, h_->user), opts, window,
                           range);
     }
     if (c.key_params != 0) throw ParamError("WHERE CURRENT OF needs a cursor: use execute_current_of");
-    return db_->run_txn(h_->cx, c, params, h_->txn, h_->started_us, opts, window, range);
+    return db_->run_txn(h_->cx, c, params, h_->txn, db_->reading(h_->started_us, h_->user), opts, window, range);
   });
 }
 
@@ -3489,7 +3555,7 @@ auto Transaction::create_table_as(const Target& t, const ast::CreateTableAs& cta
   Database::check_params(c, params);
   ddl.columns = ctas_columns(ctas, c.columns, c.column_types);
   if (ctas.with_data) {
-    auto rows = db_->run_txn(h.cx, c, params, h.txn, h.started_us, opts);
+    auto rows = db_->run_txn(h.cx, c, params, h.txn, db_->reading(h.started_us, h.user), opts);
     ddl.rows.reserve(rows.rows.size());
     for (auto& r : rows.rows) ddl.rows.push_back(ctas_row(ddl.columns, std::move(r)));
   }
@@ -3734,7 +3800,7 @@ auto Transaction::open_locked(const Target& t, const std::vector<Value>& params,
     }
     const auto& c = plan.get();
     Database::check_params(c, params);
-    state->values = Database::plan_params(c, params, h_->started_us);
+    state->values = Database::plan_params(c, params, db_->reading(h_->started_us, h_->user));
     state->compiled = plan;
     auto fail_from_txn = [&] {
       std::string message;
@@ -4278,7 +4344,7 @@ auto Database::alternatives_for_testing(std::string_view sql, const std::vector<
     link(c);
     auto* cx = acquire_context();
     try {
-      bc_params bp{plan_params(c, params, clock_now())};
+      bc_params bp{plan_params(c, params, reading(clock_now(), {}))};
       auto r = bc_execute(cx, c.code->fn(), &c.ref, &bp, budget_, sync_commits_, kMaxRetries);
       if (r == BC_CONFLICT) throw ExecError::conflicted("conflict: a guard failed on every attempt");
       if (r == BC_FAILED) throw_context_error(cx);

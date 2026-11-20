@@ -1032,6 +1032,24 @@ PostgreSQL refuses it (42804). Refused (0A000) until it has an order and arithme
 to it, and it assigned to a column of another type; a subquery of it; a
 domain or procedure argument of it.
 
+**NAME.** `NAME` declares a column of PostgreSQL's identifier type
+(`types_design.md`, *NAME*): text of at most 63 bytes, a longer value cut
+at a character boundary wherever it is written or read as a `name` (a
+literal or a `$n` beside a `NAME` column, `'…'::name`, `$1::name`, a
+`DEFAULT` literal). It is a string in every rule the dialect has for
+`TEXT`: compared (a key, `UNIQUE` and index column too), ordered, grouped,
+`DISTINCT`, `LIKE`, `||` and the string functions (giving `text`), `COUNT`,
+and assigned to and from the other string types. A `NAME`, `TEXT` or
+`VARCHAR` value cast to `text` or `varchar` of no length, or a `NAME` to
+`name`, keeps its bytes; a constant or `$n` is cast as any is. Its results are `name` (OID 19), and
+a `$n` compared with it is typed `name`. Its errors are PostgreSQL's: no
+operator with a number (42883), no `SUM` or `AVG` (42883). `CASE`,
+`COALESCE` and a set operation resolve a `NAME` with another string type
+as PostgreSQL does, the first's type winning, so a `TEXT` first is
+`text`; where the result would be a `name` made of another string's
+values (`COALESCE(name_col, text_col)`, `SELECT name_col UNION SELECT
+text_col`), which PostgreSQL cuts to 63 bytes, it is refused (0A000).
+
 **Refused**, with a message and the node's position: everything not above.
 That includes:
 - a `NUMERIC` column without a precision compared, ordered, grouped,
@@ -1077,7 +1095,11 @@ That includes:
   `||` of a boolean, float or date value, `LENGTH`, `CONCAT`,
   `REPLACE`, the regular-expression `SUBSTRING`, `bytea` string functions
   (#671);
-- a cast of anything but a constant or a parameter; a cast of a
+- a `CASE`, `COALESCE` or set operation whose result is a `NAME` made of
+  another string type's values (0A000, *NAME*); `MIN` and `MAX` of a
+  `NAME`, as of every string type;
+- a cast of anything but a constant, a parameter, or a string value to
+  `text` or `varchar` of no length (a `NAME` to `name`); a cast of a
   parameter to `DECIMAL`, `VARCHAR(n)` or `CHAR(n)`, to a type another use
   of it does not give it, or, in `VALUES`, `SET` or a `WHERE`, to other
   than its column's type; a cast parameter inside an expression in `SET`,
@@ -1202,7 +1224,8 @@ are one instant.
   - a `TIMESTAMP` or `TIMESTAMPTZ` takes either timestamp.
 
   A type with no such cast is 42804. A date to a timestamp, which is
-  midnight, is refused. A column's `DEFAULT` of the clock is the same
+  midnight, is refused, and so is the time to a `TEXT`, `VARCHAR` or
+  `NAME` column, which PostgreSQL assigns by the I/O cast (42601). A column's `DEFAULT` of the clock is the same
   assignment, made where the `INSERT` leaves the column out or writes
   `DEFAULT` (`catalog_design.md`, *What a table records*).
 - **Compared in a `WHERE`.** A column compared with the time, on either
@@ -1234,8 +1257,52 @@ are one instant.
   but a column (a constant, a parameter or the time:
   `CURRENT_DATE > DATE '2020-01-01'`, `$1 < CURRENT_DATE`), in a
   procedure's statement (0A000 at the first call,
-  `procedures_design.md`), `ADD COLUMN` with a `DEFAULT` of the clock, and
-  `USER` and the other SQL value functions.
+  `procedures_design.md`), and `ADD COLUMN` with a `DEFAULT` of the clock.
+
+### Session functions
+
+`CURRENT_USER`, `CURRENT_ROLE`, `USER`, `SESSION_USER`, `CURRENT_CATALOG`
+and `CURRENT_SCHEMA`, the standard's niladic forms (no parentheses, as in
+PostgreSQL), are `name` values (`types_design.md`, *NAME*), named by
+the word, as PostgreSQL names them. `current_database()` and
+`current_schema()`, PostgreSQL's call forms, are `CURRENT_CATALOG` and
+`CURRENT_SCHEMA`, named by the call.
+- **What they return.** Every session is the bootstrap superuser
+  (*Roles and privileges*), so the four user functions return the same
+  name: the session's user. Over the wire that is the startup packet's
+  `user`, as `session_authorization` reports it; in the embedded API it is
+  `ExecutionOptions::user` for a statement outside a transaction and
+  `TransactionOptions::user` in one, and `bytecask` (`kBootstrapUser`)
+  where none is given. `CURRENT_CATALOG` is the database's name
+  (`DatabaseOptions::name`, the server's `--database`, by default the
+  directory's last component), PostgreSQL's `current_database()`.
+  `CURRENT_SCHEMA` is `public`, the one schema, until schemas exist; then
+  it is the first schema of the search path. A name past 63 bytes is cut,
+  as a `NAME` is.
+- **Bound per run.** Each use is a slot among the statement's constants,
+  as the time is (`bound::ClockSlot`, kinds `User`, `Catalog`, `Schema`),
+  filled by `Database::plan_params` on every run, so one cached plan
+  serves every session and user. The placeholder is an empty string.
+- **Where they go.** In a select list, in value expressions (`||`, the
+  string functions, `CASE`, `COALESCE`, a comparison as a value), cast to
+  `text` or `name`, assigned in `VALUES` and `SET`, and compared in a
+  `WHERE` with a column, on either side: a string column compares with
+  them as text, any other is 42883 (`operator does not exist: integer =
+  name`).
+- **As a column's `DEFAULT`.** A `ClockDefault` of the session function
+  (`catalog_design.md`), filled where the `INSERT` leaves the column out
+  or writes `DEFAULT`, as the clock's, in a transaction or a server block
+  too. A `NAME`, `TEXT`, `VARCHAR(n)` or `CHAR(n)` column takes one, by
+  PostgreSQL's assignment cast; a value too long for a `VARCHAR(n)` is
+  22001 when the row is written. Any other type is 42804 (`column "a" is
+  of type integer but default expression is of type name`).
+- **Refused,** each with 0A000 where PostgreSQL runs it: compared in a
+  `WHERE` or `ON` with anything but a column (`WHERE CURRENT_USER = 'x'`:
+  the planner plans no conjunct that compares no column); in a `CHECK`
+  constraint, in a procedure's expression or statement (at the first
+  call), in the select list of an aggregated query; `ADD COLUMN` with
+  such a `DEFAULT`; `SET ROLE` and `SET SESSION AUTHORIZATION` (as every
+  `SET` the layer lacks). `SYSTEM_USER` is not taken (42601).
 
 ### Expressions over columns
 

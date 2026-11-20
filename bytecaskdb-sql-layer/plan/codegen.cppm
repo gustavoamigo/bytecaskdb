@@ -1809,6 +1809,7 @@ private:
       case SqlKind::Text:
       case SqlKind::Varchar:
       case SqlKind::Char:
+      case SqlKind::Name:
       case SqlKind::Bytea:
       case SqlKind::Date:
       case SqlKind::Time:

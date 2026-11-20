@@ -24,6 +24,7 @@ bind error with the position of the type name.
 | `BOOLEAN` | `bool` | 0 or 1. |
 | `BYTEA` | `bytes` | The bytes. |
 | `TEXT`, `VARCHAR(n)` | `bytes` | UTF-8. Compared as bytes (binary collation). `n` counts code points and is a catalog property, checked on assignment. |
+| `NAME` | `bytes` | UTF-8 of at most 63 bytes, a longer value cut at a character boundary, tag `SqlKind::Name` (17). Keyed and compared as `TEXT` (*NAME*). |
 | `CHAR(n)`, `CHARACTER(n)` (`CHAR` is `CHAR(1)`) | `bytes` | UTF-8 without its trailing spaces, tag `SqlKind::Char` (16). `n` counts code points and is a catalog property. A result returns it padded with spaces to `n` code points (*CHAR(n)*). |
 | `DECIMAL(p, s)`, `NUMERIC(p, s)`, p ≤ 18 | `i64` | The value times 10^s, exactly. `p` and `s` are catalog properties of the column. `s` defaults to 0. |
 | `NUMERIC`, `DECIMAL`, `DEC` without a precision | `num` (`PhysType::Num`) | PostgreSQL's text of the value (`numeric_out`): every digit and the scale it was written with (1.50 stays 1.50, 1.5e1 is 15.0), `NaN`, `Infinity`, `-Infinity`, in a row's variable region as bytes are. Tag `SqlKind::Numeric` (14). A column's type only (*NUMERIC without a precision*). |
@@ -165,7 +166,38 @@ Refused with a message, each for a reason:
   different type.
 - **A `CHAR` of no length** (`bpchar`), which PostgreSQL leaves unbounded.
 
-**Text is valid UTF-8.** The row builder refuses a `TEXT`, `VARCHAR` or `CHAR` value
+## NAME
+
+PostgreSQL's `name`: an identifier string of at most `NAMEDATALEN - 1`,
+63, bytes (`kNameBytes`). PostgreSQL's `namein` cuts a longer value to its
+first 63 bytes, fewer when the cut would split a character, and so does
+the layer (`name_prefix`, in `codec/row_codec.cppm`), in each place a
+value becomes a `name`:
+- **Written.** `RowWriter::set_bytes` cuts every value stored in a `NAME`
+  column, as it cuts a `CHAR(n)`'s spaces: a literal, a `$n`, another
+  column's value through `INSERT … SELECT` or `SET`, a `DEFAULT`. The
+  row builder checks it is UTF-8 first (22021), never its length.
+- **Read as a `name`.** A literal compared with a `NAME` column, or cast
+  `'…'::name`, is read by `from_text`, which cuts it, and a typed string
+  constant cast to `name` (`'…'::text::name`) is cut by `cast_typed`; a `$n` typed `name`
+  (compared with a `NAME` column, or `$1::name`) is cut by
+  `Database::plan_params` before the plan runs. So a key built from either
+  is the key a stored row has, and a `NAME` is a primary key, `UNIQUE` or
+  index column as `TEXT` is.
+- **Not cut.** A `TEXT` value compared with a `NAME` stays whole, as
+  PostgreSQL's `name = text` compares it: a 70-byte text equals no
+  `NAME`.
+
+It compares, sorts, groups and keys bytewise, as `TEXT` does: PostgreSQL's
+`name` has the `C` collation, the layer's one collation. Results are `name`,
+OID 19, length 64. Every rule the binder has for `TEXT` and `VARCHAR`
+(`is_string`) holds for it, with PostgreSQL's union resolution where it
+meets another string type (`frontend_design.md`, *NAME*). The session
+functions are `name` values (`frontend_design.md`, *Session functions*).
+Appended as tag 17, so a catalog that holds one is closed to an earlier
+build.
+
+**Text is valid UTF-8.** The row builder refuses a `TEXT`, `VARCHAR`, `CHAR` or `NAME` value
 that is not well-formed UTF-8, or holds a NUL, when it is written
 (`BC_C_RANGE`, 22021), as it refuses any value outside its type; the
 compiler never emits a validity check. A key value that is not UTF-8 is

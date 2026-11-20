@@ -751,6 +751,7 @@ int main(int argc, char** argv) {
     pthread_sigmask(SIG_BLOCK, &stop_signals, nullptr);
     ::signal(SIGPIPE, SIG_IGN);
 
+    db_opts.name = cfg.database;  // what CURRENT_CATALOG returns
     auto db = bytecask::sql::Database::open(dir, db_opts);
     auto listener_fd = listen_on(host, port);
 

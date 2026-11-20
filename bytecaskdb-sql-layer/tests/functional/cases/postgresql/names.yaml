@@ -1,0 +1,105 @@
+# The NAME type and the session functions (docs/types_design.md, *NAME*;
+# docs/frontend_design.md, *Session functions*). The suite connects as user
+# "functional" to the database "functional"; every session is the bootstrap
+# superuser, whatever it names, and the one schema is public.
+
+- name: a NAME column cuts a value to 63 bytes and compares, orders and keys as text
+  features: [pg:name-type]
+  ordered: true
+  setup:
+    - CREATE TABLE nm (k NAME PRIMARY KEY, v INTEGER, s TEXT)
+  steps:
+    - sql: INSERT INTO nm VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+      rowcount: 1
+    - sql: INSERT INTO nm VALUES ($1, 2, 'x')
+      params: ["éééééééééééééééééééééééééééééééééééééééé"]
+      rowcount: 1
+    - sql: INSERT INTO nm VALUES ('bob', 3, 'bob')
+      rowcount: 1
+    - sql: SELECT k, v FROM nm ORDER BY k
+      expected: [["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1], ["bob", 3], ["ééééééééééééééééééééééééééééééé", 2]]
+    # The key holds the cut value.
+    - sql: INSERT INTO nm VALUES ($1, 4, 'x')
+      params: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaazz"]
+      error: "23505"
+    # A literal or a parameter compared with it is a NAME, cut; a TEXT is not.
+    - sql: SELECT v FROM nm WHERE k = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab'
+      expected: [[1]]
+    - sql: SELECT v FROM nm WHERE k = $1
+      params: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac"]
+      expected: [[1]]
+    - sql: SELECT v FROM nm WHERE k = s
+      expected: [[3]]
+    - sql: SELECT k || '!', upper(k) FROM nm WHERE k LIKE 'b%'
+      expected: [["bob!", "BOB"]]
+    - sql: SELECT k, COUNT(*) FROM nm GROUP BY k ORDER BY k DESC
+      expected: [["ééééééééééééééééééééééééééééééé", 1], ["bob", 1], ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1]]
+    - sql: SELECT DISTINCT v FROM nm WHERE k > 'b' ORDER BY v
+      expected: [[2], [3]]
+    - sql: SELECT 'xyz'::name, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name::text, k::text FROM nm WHERE v = 3
+      expected: [["xyz", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bob"]]
+    # A typed string cast to name is cut too.
+    - sql: SELECT octet_length('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::text::name), ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::varchar)::name = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+      expected: [[63, true]]
+    - sql: UPDATE nm SET k = $1 WHERE v = 3
+      params: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaq"]
+      error: "23505"
+  teardown:
+    - DROP TABLE nm
+
+- name: what a NAME refuses as PostgreSQL does
+  features: [pg:name-type]
+  setup:
+    - CREATE TABLE nr (k NAME, v INTEGER)
+  steps:
+    - sql: SELECT v FROM nr WHERE k = 1
+      error: "42883"
+    - sql: SELECT k + 1 FROM nr
+      error: "42883"
+    - sql: SELECT SUM(k) FROM nr
+      error: "42883"
+  teardown:
+    - DROP TABLE nr
+
+- name: CURRENT_USER, CURRENT_ROLE, USER, SESSION_USER, CURRENT_CATALOG and CURRENT_SCHEMA
+  features: [F321, pg:name-type]
+  steps:
+    - sql: SELECT CURRENT_USER, CURRENT_ROLE, USER, SESSION_USER, CURRENT_CATALOG, CURRENT_SCHEMA
+      expected: [["functional", "functional", "functional", "functional", "functional", "public"]]
+    - sql: SELECT CURRENT_USER || '!', CURRENT_USER = 'functional', CURRENT_CATALOG::text
+      expected: [["functional!", true, "functional"]]
+    # current_database() and current_schema() are calls PostgreSQL names by the call.
+    - sql: SELECT current_database(), current_schema()
+      expected: [["functional", "public"]]
+    # Bare words only: the standard's niladic forms take no parentheses.
+    - sql: SELECT CURRENT_USER()
+      error: "42601"
+
+- name: a session function as a column DEFAULT, read when the row is inserted, in a transaction too
+  features: [E141-07, F321, pg:name-type]
+  ordered: true
+  setup:
+    - CREATE TABLE sd (id INTEGER PRIMARY KEY, u NAME DEFAULT CURRENT_USER, s TEXT DEFAULT SESSION_USER, c NAME DEFAULT CURRENT_CATALOG, sc VARCHAR(10) DEFAULT CURRENT_SCHEMA)
+  steps:
+    - sql: INSERT INTO sd (id) VALUES (1)
+      rowcount: 1
+    - sql: BEGIN
+    - sql: INSERT INTO sd (id) VALUES (2)
+      rowcount: 1
+    - sql: INSERT INTO sd VALUES (3, DEFAULT, DEFAULT, DEFAULT, DEFAULT)
+      rowcount: 1
+    - sql: COMMIT
+    - sql: SELECT id, u, s, c, sc FROM sd ORDER BY id
+      expected: [[1, "functional", "functional", "functional", "public"], [2, "functional", "functional", "functional", "public"], [3, "functional", "functional", "functional", "public"]]
+    - sql: SELECT id FROM sd WHERE u = CURRENT_USER AND id >= 2 ORDER BY id
+      expected: [[2], [3]]
+    - sql: UPDATE sd SET s = CURRENT_ROLE WHERE id = 1
+      rowcount: 1
+    - sql: CREATE TABLE sx (a INTEGER DEFAULT CURRENT_USER)
+      error: "42804"
+    - sql: CREATE TABLE sx (a VARCHAR(3) DEFAULT CURRENT_CATALOG, b INTEGER)
+    - sql: INSERT INTO sx (b) VALUES (1)
+      error: "22001"
+  teardown:
+    - DROP TABLE IF EXISTS sx
+    - DROP TABLE sd

@@ -89,7 +89,25 @@ enum class SqlKind : std::uint8_t {
   // and padded to n when a result is returned. Appended; a catalog that
   // holds it is closed to an earlier build.
   Char,
+  // NAME: PostgreSQL's identifier type, text of at most kNameBytes bytes,
+  // cut there at a character boundary when longer (name_prefix), as
+  // PostgreSQL's namein cuts it; stored, keyed and compared as TEXT.
+  // Appended; a catalog that holds it is closed to an earlier build.
+  Name,
 };
+
+// NAMEDATALEN - 1: the most bytes a NAME holds.
+inline constexpr std::size_t kNameBytes = 63;
+
+// The NAME of a UTF-8 text: its first kNameBytes bytes, fewer when the last
+// character would be cut (PostgreSQL's namein, pg_mbcliplen).
+[[nodiscard]] constexpr auto name_prefix(BytesView v) -> BytesView {
+  if (v.size() <= kNameBytes) return v;
+  auto n = kNameBytes;
+  // Back off the continuation bytes (10xxxxxx) of the character at the cut.
+  while (n > 0 && (std::to_integer<unsigned>(v[n]) & 0xC0u) == 0x80u) --n;
+  return v.first(n);
+}
 
 // DECIMAL(p, s) is a scaled i64: p of at most 18 digits fits.
 inline constexpr std::uint8_t kMaxDecimalPrecision = 18;
@@ -448,7 +466,8 @@ auto phys_type(SqlType t) -> PhysType {
     case SqlKind::Bytea:
     case SqlKind::Text:
     case SqlKind::Varchar:
-    case SqlKind::Char: return PhysType::Bytes;
+    case SqlKind::Char:
+    case SqlKind::Name: return PhysType::Bytes;
     case SqlKind::Numeric: return PhysType::Num;
   }
   return PhysType::Bytes;
@@ -471,6 +490,7 @@ auto fixed_width(SqlType t) -> std::uint32_t {
     case SqlKind::Text:
     case SqlKind::Varchar:
     case SqlKind::Char:
+    case SqlKind::Name:
     case SqlKind::Numeric: return 0;
   }
   return 0;
@@ -584,6 +604,8 @@ auto RowWriter::set_bytes(std::uint32_t col_id, BytesView v) -> bool {
   if (layout_->columns[*i].sql.kind == SqlKind::Char) {
     while (!v.empty() && v.back() == std::byte{' '}) v = v.first(v.size() - 1);
   }
+  // A NAME holds kNameBytes at most: every value stored passes here too.
+  if (layout_->columns[*i].sql.kind == SqlKind::Name) v = name_prefix(v);
   var_[*i].assign(v.begin(), v.end());
   return true;
 }
