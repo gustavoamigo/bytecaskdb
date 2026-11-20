@@ -440,7 +440,9 @@ u16 ncols { str name }       ; the view's columns, as created
 - **`ndeps` makes `DROP` RESTRICT.** `DROP TABLE` and `DROP VIEW` look for a
   view whose list holds the object, and refuse it (2BP01). A view reads
   through the views it names, so the list holds what the query names
-  directly, subqueries included, not what those read in turn.
+  directly, a subquery's in any position included, not what those read in
+  turn. It is what binding the query resolved (*Views resolve against what
+  they were created against*, rule 1), not a second walk of its text.
 - **Format 1 is the first.** A build reads views of format 1 and refuses a
   later one, as it refuses a later table record. A build from before views
   refuses a database holding one: the view's name entry names no table or
@@ -675,7 +677,8 @@ not built. Four choices made here keep it open:
 Status: **design, approved by the owner on 2026-11-20** (#713, option 1),
 with every recommendation under *Open questions for the owner*: Q1 (a),
 Q2 (a), Q3 (a), Q4 (a), Q5 (a), Q6 (a), Q7 (a), Q8 (a), Q9 (b). Built:
-the first fix before stage 1 (qualified type names); no stage is built yet. This section covers what
+both fixes before stage 1 (qualified type names; a view's dependencies
+from the binder's resolution); no stage is built yet. This section covers what
 `CREATE SCHEMA` and `DROP SCHEMA` do, how a schema-qualified name resolves,
 the schema record and the change to the name entries' keys, what an older
 build does with a database that holds a schema, `WITH CHECK OPTION` (which
@@ -962,14 +965,32 @@ CASCADE drops the view with them). Load checks that each entry's object is
 in `depends_on`. A view written before stage 1 (format 1) has no map: its
 names resolve in `public`, the only schema its path held.
 
-Today `depends_on` comes from `ViewExpander::relations`
-(`binder.cppm:5588-5599`), a second walk that resolves names with
-`cat_.table(name)` on its own and, through `each_subquery`
-(`binder.cppm:5376-5381`), misses a subquery in `ORDER BY`: `CREATE VIEW v
-AS SELECT a FROM t ORDER BY (SELECT max(b) FROM u)` lets `DROP TABLE u`
-succeed, and `v` then fails with 42P01. That bug exists today; it is fixed
-on its own before stage 1 (*Stages*), by building `depends_on` from the
-binder's resolution (rule 1), with a GitHub issue opened for it.
+**Rule 1 is built** (before stage 1, *Stages*; #870). `depends_on` came
+from `ViewExpander::relations`, a second walk that resolved names with
+`cat_.table(name)` on its own and, through `each_subquery`, missed a
+subquery in `ORDER BY`: `CREATE VIEW v AS SELECT a FROM t ORDER BY (SELECT
+max(b) FROM u)` let `DROP TABLE u` succeed, and `v` then failed. Now it is
+the record of what binding the view's query resolved, in two parts, since
+views are expanded before the binder runs:
+- **Tables: the binder.** `Binder::resolved_relations()` lists each table
+  the binder resolved by name in a `FROM`, in every position of the query
+  (a subquery's in a select list, `WHERE`, `ORDER BY`, an arm of a set
+  operation). A `FROM` item a view's body brought in by its merge is the
+  view's read, not the query's: the expander marks each such item
+  `ast::FromItem::of_view` (the body's subqueries' and a grouped view's
+  derived query's too, a subquery shared by two places kept one), and the
+  binder does not record it.
+- **Views: the expander.** A view is resolved where the expander expands
+  it; it records the views it expands in the query being created itself
+  (depth 0), not those it expands inside another view's body.
+
+`each_subquery` now also visits `ORDER BY`, so a view read by a subquery in
+`ORDER BY` is expanded where it was passed to the binder unexpanded and
+refused. `GROUP BY` and `HAVING` take no subquery yet and the dialect has
+no `WITH` query (`frontend_design.md`, *Subqueries*: refused, 42601), so a view of one is refused at
+`CREATE VIEW`: no view is created without what it reads. When those are
+built, the binder resolves their relations as any other's and they enter
+the record with no change here.
 
 Only relations enter the map today. Views cannot name a sequence or a
 domain yet (no `nextval`, and a domain is not a usable column type,
@@ -1281,7 +1302,7 @@ makes it. Rows are named by their first words.
 | "A DDL never waits for another" | **Widened** to `CREATE SCHEMA` with elements in autocommit: a conflict at its internal commit is 40001 with nothing written, not retried. Test: stage 2's "two `CREATE SCHEMA` with elements race; the loser writes nothing". |
 | "A catalog the build cannot decode is refused at open" | **Widened** to the schema record, both name entry forms, the new formats, and a name that is empty or holds a NUL byte. Tests: stage 1b's `catalog_test` refusals. |
 | "CREATE VIEW stores the view in the catalog" | **Widened**: the namespace is per schema, so one name may be a table in `public` and a view in `s`. Tests: stage 1b's functional cases. |
-| "A table or view that a view reads cannot be dropped" | **Widened** by stage 5: `DROP SCHEMA … CASCADE` drops the views that read what it drops. DROP TABLE and DROP VIEW stay RESTRICT only. Before stage 1: the guarantee now also holds for a table read only by an `ORDER BY` subquery (a fix of a broken guarantee; test "catalog: a view's ORDER BY subquery's table cannot be dropped"). |
+| "A table or view that a view reads cannot be dropped" | **Widened** by stage 5: `DROP SCHEMA … CASCADE` drops the views that read what it drops. DROP TABLE and DROP VIEW stay RESTRICT only. Before stage 1, **fixed** (built): the guarantee now also holds for a table read only by an `ORDER BY` subquery. Test: "embedded API: a view's dependencies are every relation its query reads, a subquery's in any position". |
 | "`Database::open` of a database written by an SQL-layer build from before #780" | Unchanged in substance: a database holding a record this build wrote, any schema included, is refused by a build from before stage 1b. Proved by the older build's own "catalog: a damaged or foreign-format record is refused" and by this build's test that every record and ACL it writes is in the new format. |
 | "A DDL statement given to a `Transaction`" | **Widened** to `CREATE SCHEMA` and `DROP SCHEMA`; a `CREATE SCHEMA`'s elements are steps of the transaction; `DROP SCHEMA` of what an open cursor reads is 55006. Tests: stage 1b and 5's `api_txn_ddl_test` cases. |
 | New, stage 1b | **Added**: qualified names resolve to that schema's object or fail with PG 17's SQLSTATE (3F000, 42P01, 42704, 42883, 42501, 0A000, 42601); an unqualified name resolves in `public`; `CREATE SCHEMA`/`DROP SCHEMA` errors (42P06, 42939, 3F000, 2BP01). Tests: "schemas: a qualified name resolves to that schema's object or fails with PostgreSQL's SQLSTATE", "schemas: CREATE and DROP SCHEMA errors are PostgreSQL's", `tests/functional/cases/postgresql/schemas.yaml`. |
@@ -1318,11 +1339,17 @@ crash).
   qualifier is checked, as PG 17 does. Test as in the CONTRACT table, the
   embedded API test of a procedure variable, and
   `tests/functional/cases/postgresql/qualified_type_names.yaml`.
-- **A view's dependencies from the binder's own resolution** (*Views
-  resolve against what they were created against*, rule 1), which closes
-  the `ORDER BY` subquery gap. A GitHub issue records the bug. Tests: a
-  view with a subquery in each position (target, `WHERE`, `GROUP BY`,
-  `HAVING`, `ORDER BY`, a CTE) blocks `DROP TABLE` of what it reads.
+- **A view's dependencies from the binder's own resolution. Built**
+  (*Views resolve against what they were created against*, rule 1), which
+  closes the `ORDER BY` subquery gap (#870). Test: "embedded API: a view's
+  dependencies are every relation its query reads, a subquery's in any
+  position": a view with a subquery in the select list, `WHERE` (scalar,
+  `IN`, `EXISTS`), `ORDER BY` (of a table, and of a view), and a set
+  operation's arm blocks `DROP TABLE` or `DROP VIEW` of what it reads, as
+  PG 17's 2BP01, through a reopen, and names the view that reads the
+  relation itself; a subquery in `GROUP BY` or `HAVING` and a `WITH` query
+  are refused at `CREATE VIEW` (42601). Also
+  `tests/functional/cases/postgresql/views.yaml`.
 
 **Stage 1a: lookups keyed by (schema, name), schema 0 only.** No change in
 behaviour. A `QualifiedName` type (schema id and name) replaces the bare

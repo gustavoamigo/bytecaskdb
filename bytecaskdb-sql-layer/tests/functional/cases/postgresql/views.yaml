@@ -237,6 +237,45 @@
   teardown:
     - DROP TABLE vw5
 
+- name: a table a view reads only in a subquery, in any position, is not dropped while the view exists
+  features: [F031-16]
+  ordered: true
+  setup:
+    - CREATE TABLE vw33 (a INTEGER, b INTEGER)
+    - CREATE TABLE vw33_s (a INTEGER, b INTEGER)
+    - CREATE TABLE vw33_w (a INTEGER, b INTEGER)
+    - CREATE TABLE vw33_o (a INTEGER, b INTEGER)
+    - CREATE TABLE vw33_q (a INTEGER, b INTEGER)
+    - INSERT INTO vw33 VALUES (1, 2), (3, 4)
+    - INSERT INTO vw33_q VALUES (5, 6)
+    - CREATE VIEW vw33_select AS SELECT a, (SELECT max(b) FROM vw33_s) AS m FROM vw33
+    - CREATE VIEW vw33_where AS SELECT a FROM vw33 WHERE a IN (SELECT a FROM vw33_w)
+    - CREATE VIEW vw33_order AS SELECT a FROM vw33 ORDER BY (SELECT max(b) FROM vw33_o)
+    - CREATE VIEW vw33_qv AS SELECT a, b FROM vw33_q WHERE a > 0
+    - CREATE VIEW vw33_order_view AS SELECT a FROM vw33 ORDER BY (SELECT max(a) FROM vw33_qv)
+  steps:
+    - sql: DROP TABLE vw33_s
+      error: "2BP01"
+    - sql: DROP TABLE vw33_w
+      error: "2BP01"
+    - sql: DROP TABLE vw33_o
+      error: "2BP01"
+    - sql: DROP VIEW vw33_qv
+      error: "2BP01"
+    - sql: SELECT a FROM vw33_order_view
+      expected: [[1], [3]]
+    - sql: DROP VIEW vw33_order
+    - sql: DROP TABLE vw33_o
+  teardown:
+    - DROP VIEW vw33_order_view
+    - DROP VIEW vw33_qv
+    - DROP VIEW vw33_where
+    - DROP VIEW vw33_select
+    - DROP TABLE vw33_q
+    - DROP TABLE vw33_w
+    - DROP TABLE vw33_s
+    - DROP TABLE vw33
+
 - name: a view of a table that is not there, a column that is not there, or a parameter
   features: [F031-02]
   setup:
