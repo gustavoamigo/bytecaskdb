@@ -94,6 +94,11 @@ enum class SqlKind : std::uint8_t {
   // PostgreSQL's namein cuts it; stored, keyed and compared as TEXT.
   // Appended; a catalog that holds it is closed to an earlier build.
   Name,
+  // TIME WITH TIME ZONE: a time of day and a UTC offset, packed in one i64
+  // whose integer order is PostgreSQL's timetz_cmp (timetz_pack, in the
+  // catalog module). Appended; a catalog that holds it is closed to an
+  // earlier build.
+  TimeTz,
 };
 
 // NAMEDATALEN - 1: the most bytes a NAME holds.
@@ -459,7 +464,8 @@ auto phys_type(SqlType t) -> PhysType {
     case SqlKind::Timestamp:
     case SqlKind::TimestampTz:
     case SqlKind::Date:
-    case SqlKind::Time: return PhysType::I64;
+    case SqlKind::Time:
+    case SqlKind::TimeTz: return PhysType::I64;
     case SqlKind::Real:
     case SqlKind::Double: return PhysType::F64;
     case SqlKind::Boolean: return PhysType::Bool;
@@ -485,7 +491,8 @@ auto fixed_width(SqlType t) -> std::uint32_t {
     case SqlKind::Double:
     case SqlKind::Timestamp:
     case SqlKind::TimestampTz:
-    case SqlKind::Time: return 8;
+    case SqlKind::Time:
+    case SqlKind::TimeTz: return 8;
     case SqlKind::Bytea:
     case SqlKind::Text:
     case SqlKind::Varchar:

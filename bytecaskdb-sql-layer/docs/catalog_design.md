@@ -34,7 +34,7 @@ time to the stored value (a `DECIMAL(p, s)` default is stored scaled).
 parsing of those types isn't built for defaults.
 
 **A default of the clock** (`CURRENT_DATE`, `CURRENT_TIMESTAMP` and
-`now()`, `LOCALTIME`, `LOCALTIMESTAMP`, with a precision) is a
+`now()`, `LOCALTIME`, `LOCALTIMESTAMP`, `CURRENT_TIME`, with a precision) is a
 `ClockDefault`: its function and precision. They are two `u8`s that trail
 the column's entry, written only for one, so a record without one is
 unchanged, and an older build refuses one with them (trailing bytes). The
@@ -46,15 +46,17 @@ column's stored constant default stays null, since the binder, not
   *The time*).
 - **Which types take one.** A column takes one only where PostgreSQL's
   assignment cast exists and the reading gives its value
-  (`clock_assignable`): a `DATE` any of them but `LOCALTIME`, a `TIME`
-  `LOCALTIME` or a timestamp's time, a `TIMESTAMP` or `TIMESTAMPTZ` either
-  timestamp. A date to a timestamp, which is midnight and not the reading,
-  is refused.
+  (`clock_assignable`): a `DATE` `CURRENT_DATE` or a timestamp's date, a
+  `TIME` any of them but `CURRENT_DATE`, a `TIME WITH TIME ZONE`
+  `CURRENT_TIME`, `LOCALTIME` or `CURRENT_TIMESTAMP` at offset 0, a
+  `TIMESTAMP` or `TIMESTAMPTZ` either timestamp. A date to a timestamp,
+  which is midnight and not the reading, is refused.
 - **`ADD COLUMN`.** It is refused with one: plans compiled before it fill a
   new column from the stored default.
 - **A session function** (`CURRENT_USER`, `CURRENT_ROLE` and `USER`, all
   `CurrentUser`; `SESSION_USER`; `CURRENT_CATALOG`; `CURRENT_SCHEMA`) is a
-  `ClockDefault` too, functions 5 to 8 after the clock's 1 to 4, its
+  `ClockDefault` too, functions 5 to 8 after the clock's 1 to 4
+  (`CURRENT_TIME`, added later, is 9), its
   precision unused. Its value is a `name`, so a `NAME`, `TEXT`,
   `VARCHAR(n)` or `CHAR(n)` column takes one and no other; load refuses
   one on another type, as it refuses the clock's (`frontend_design.md`,

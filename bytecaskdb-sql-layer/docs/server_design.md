@@ -703,8 +703,10 @@ Each `SqlType` has an OID, a length and a modifier, as `pg_type` and
 | `DECIMAL(p, s)` | 1700 | -1 | ((p << 16) \| s) + 4 |
 | `numeric`, unconstrained (a `SUM`) | 1700 | -1 | -1 |
 | `TIMESTAMP` | 1114 | 8 | -1 |
+| `TIMESTAMPTZ` | 1184 | 8 | -1 |
 | `DATE` | 1082 | 4 | -1 |
 | `TIME` | 1083 | 8 | -1 |
+| `TIME WITH TIME ZONE` | 1266 | 12 | -1 |
 
 A result column's type is the one the compiler gives it
 (`Compiled::column_types`), so the server only reports it:

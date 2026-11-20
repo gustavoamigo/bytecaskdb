@@ -13,10 +13,12 @@
 #include <chrono>
 #include <functional>
 #include <future>
+#include <limits>
 #include <map>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -255,6 +257,73 @@ TEST_CASE("catalog: a session function's default is a NAME's, taken by a string 
   v.columns.back().default_value = std::monostate{};
   v.columns.back().clock_default = ClockDefault{ClockDefault::Fn::CurrentUser, 6};
   CHECK_THROWS_AS(parse_table(serialize_table(v)), std::runtime_error);
+}
+
+TEST_CASE("catalog: a TIME WITH TIME ZONE column and its CURRENT_TIME default round-trip", "[sql][catalog][timetz]") {
+  auto t = rich_table();
+  t.checks.clear();
+  auto& c = t.columns.back();
+  c.sql = SqlType{SqlKind::TimeTz};
+  c.default_value = std::monostate{};
+  std::vector<ColumnDef> defs;
+  for (const auto& col : t.columns) defs.emplace_back(col.id, col.sql, col.nullable);
+  t.layout = make_layout(defs);
+  for (auto fn : {ClockDefault::Fn::CurrentTime, ClockDefault::Fn::LocalTime, ClockDefault::Fn::CurrentTimestamp}) {
+    c.clock_default = ClockDefault{fn, 0};
+    auto u = parse_table(serialize_table(t));
+    CHECK(u.columns.back().sql == SqlType{SqlKind::TimeTz});
+    CHECK(*u.columns.back().clock_default == ClockDefault{fn, 0});
+  }
+  // No assignment cast from a date or a timestamp: refused at load.
+  for (auto fn : {ClockDefault::Fn::CurrentDate, ClockDefault::Fn::LocalTimestamp}) {
+    c.clock_default = ClockDefault{fn, 6};
+    CHECK_THROWS_AS(parse_table(serialize_table(t)), std::runtime_error);
+  }
+  // CURRENT_TIME to a TIME drops the offset; to a DATE it has no cast.
+  CHECK(clock_assignable(ClockDefault::Fn::CurrentTime, SqlKind::Time));
+  CHECK_FALSE(clock_assignable(ClockDefault::Fn::CurrentTime, SqlKind::Date));
+  CHECK_FALSE(clock_assignable(ClockDefault::Fn::CurrentTime, SqlKind::TimestampTz));
+}
+
+TEST_CASE("catalog: a TIME WITH TIME ZONE's integer order is PostgreSQL's timetz_cmp", "[sql][catalog][timetz]") {
+  // timetz_cmp: the UTC time (time + zone, zone seconds west), then the zone.
+  auto pg_cmp = [](TimeTz a, TimeTz b) {
+    auto ua = a.time - a.offset * 1'000'000;
+    auto ub = b.time - b.offset * 1'000'000;
+    if (ua != ub) return ua < ub ? -1 : 1;
+    if (a.offset != b.offset) return -a.offset < -b.offset ? -1 : 1;
+    return 0;
+  };
+  std::mt19937_64 rng{29};
+  std::uniform_int_distribution<std::int64_t> time{0, kMicrosPerDay};
+  std::uniform_int_distribution<std::int64_t> offset{-kMaxTimeTzOffset, kMaxTimeTzOffset};
+  std::vector<TimeTz> values{{0, -kMaxTimeTzOffset}, {0, kMaxTimeTzOffset}, {kMicrosPerDay, -kMaxTimeTzOffset},
+                             {kMicrosPerDay, kMaxTimeTzOffset}, {43'200'000'000, 3600}, {39'600'000'000, 0}};
+  for (int n = 0; n < 2000; ++n) {
+    // Some share a UTC time, to reach the tie on the zone.
+    auto o = offset(rng);
+    auto t = n % 3 == 0 ? std::clamp<std::int64_t>(values.back().time - values.back().offset * 1'000'000 + o * 1'000'000, 0, kMicrosPerDay)
+                        : time(rng);
+    values.push_back({t, n % 5 == 0 ? std::int64_t{(o / 900) * 900} : o});
+  }
+  for (std::size_t i = 0; i + 1 < values.size(); ++i) {
+    auto a = values[i];
+    auto b = values[i + 1];
+    auto pa = timetz_pack(a);
+    auto pb = timetz_pack(b);
+    INFO(a.time << " " << a.offset << " vs " << b.time << " " << b.offset);
+    CHECK((pa < pb ? -1 : pa > pb ? 1 : 0) == pg_cmp(a, b));
+    CHECK(timetz_valid(pa));
+    CHECK(timetz_unpack(pa).time == a.time);
+    CHECK(timetz_unpack(pa).offset == a.offset);
+  }
+  CHECK_FALSE(timetz_valid(timetz_pack({kMicrosPerDay + 1, 0})));
+  CHECK_FALSE(timetz_valid(timetz_pack({-1, 0})));
+  CHECK_FALSE(timetz_valid(std::numeric_limits<std::int64_t>::max()));
+  CHECK_FALSE(timetz_valid(std::numeric_limits<std::int64_t>::min()));
+  // A zone field past the offsets (kTimeTzZones > 2 * kMaxTimeTzOffset + 1).
+  CHECK_FALSE(timetz_valid(2 * kMaxTimeTzOffset + 1));
+  CHECK(out_of_range(SqlType{SqlKind::TimeTz}, std::int64_t{2 * kMaxTimeTzOffset + 1}) == "time out of range");
 }
 
 TEST_CASE("catalog: CHECK constraints are named as PostgreSQL names them and survive a reopen", "[sql][catalog]") {

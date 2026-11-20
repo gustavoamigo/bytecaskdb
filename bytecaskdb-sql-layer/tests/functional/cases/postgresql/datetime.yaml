@@ -419,3 +419,117 @@
       error: "42804"
     - sql: CREATE TABLE cdh (a BOOLEAN DEFAULT now())
       error: "42804"
+
+- name: TIME WITH TIME ZONE column keeps its time and offset, ordered as timetz
+  features: [pg:timetz]
+  ordered: true
+  setup:
+    - CREATE TABLE ttz (t TIME WITH TIME ZONE PRIMARY KEY, n INTEGER)
+  steps:
+    - sql: INSERT INTO ttz VALUES ($1, $2)
+      params: ["12:00+01", 1]
+      rowcount: 1
+    - sql: INSERT INTO ttz VALUES ($1, $2)
+      params: ["11:00", 2]
+      rowcount: 1
+    - sql: INSERT INTO ttz VALUES ($1, $2)
+      params: ["10:30:00.5-00:30", 3]
+      rowcount: 1
+    - sql: INSERT INTO ttz VALUES ($1, $2)
+      params: ["24:00:00-15:59:59", 4]
+      rowcount: 1
+    - sql: INSERT INTO ttz VALUES ($1, $2)
+      params: ["00:00:00+15:59:59", 5]
+      rowcount: 1
+    # The UTC time first, then the offset, east before west: 12:00+01 sorts before 11:00+00.
+    - sql: SELECT t, n FROM ttz ORDER BY t
+      expected:
+        - ["00:00:00+15:59:59", 5]
+        - ["12:00:00+01", 1]
+        - ["11:00:00+00", 2]
+        - ["10:30:00.5-00:30", 3]
+        - ["24:00:00-15:59:59", 4]
+    - sql: SELECT n FROM ttz WHERE t = $1
+      params: ["11:00:00Z"]
+      expected: [[2]]
+    - sql: SELECT n FROM ttz WHERE t > $1 ORDER BY t
+      params: ["11:00+00"]
+      expected: [[3], [4]]
+    - sql: SELECT n FROM ttz WHERE t <= TIME '11:00' ORDER BY n
+      expected: [[1], [2], [5]]
+    - sql: SELECT min(t), max(t) FROM ttz
+      expected: [["00:00:00+15:59:59", "24:00:00-15:59:59"]]
+    # Equal only with the same offset as well.
+    - sql: INSERT INTO ttz VALUES ($1, $2)
+      params: ["12:00:00+01:00", 6]
+      error: "23505"
+    - sql: INSERT INTO ttz VALUES ($1, $2)
+      params: ["11:00+00:01", 6]
+      rowcount: 1
+    - sql: INSERT INTO ttz VALUES ($1, $2)
+      params: ["12:00+16", 7]
+      error: "22009"
+    - sql: INSERT INTO ttz VALUES ($1, $2)
+      params: ["24:00:01", 7]
+      error: "22008"
+    - sql: INSERT INTO ttz VALUES ($1, $2)
+      params: ["not a time", 7]
+      error: "22007"
+  teardown:
+    - DROP TABLE ttz
+
+- name: casts between timetz, time, timestamptz and text
+  features: [pg:timetz]
+  steps:
+    - sql: SELECT TIMETZ '12:34:56.789+05:30', CAST('12:00' AS TIME WITH TIME ZONE), TIMETZ '2026-10-27 12:00-02'
+      expected: [["12:34:56.789+05:30", "12:00:00+00", "12:00:00-02"]]
+    - sql: SELECT CAST(TIMETZ '12:34:56.5-03:30' AS TIME), CAST(TIME '01:02' AS TIMETZ)
+      expected: [["12:34:56.5", "01:02:00+00"]]
+    - sql: SELECT CAST(TIMESTAMPTZ '2026-10-27 10:00:00+02' AS TIME WITH TIME ZONE), CAST(TIMETZ '12:00+05' AS TEXT)
+      expected: [["08:00:00+00", "12:00:00+05"]]
+    - sql: SELECT TIMETZ '12:00+01' = TIMETZ '11:00+00', TIMETZ '12:00+01' < TIMETZ '11:00+00', TIMETZ '12:00+00' = TIME '12:00'
+      expected: [[f, t, t]]
+    - sql: SELECT CAST(TIMETZ '12:00+01' AS TIMESTAMP)
+      error: "42846"
+    - sql: SELECT CAST(TIMESTAMP '2026-10-27 10:00:00' AS TIMETZ)
+      error: "42846"
+    - sql: SELECT TIMETZ '12:00' = DATE '2026-10-27'
+      error: "42883"
+    - sql: SELECT TIMETZ '12:00' - TIMETZ '11:00'
+      error: "42883"
+    - sql: SELECT TIMETZ '12:00' + '1 hour'
+      error: "42725"
+
+- name: CURRENT_TIME, and a TIME WITH TIME ZONE DEFAULT of the clock
+  features: [F051-07, E141-07]
+  setup:
+    - CREATE TABLE ctz (id INTEGER PRIMARY KEY, a TIMETZ DEFAULT CURRENT_TIME, b TIME WITH TIME ZONE DEFAULT LOCALTIME, c TIMETZ DEFAULT CURRENT_TIMESTAMP, d TIME DEFAULT CURRENT_TIME)
+  steps:
+    # One transaction reads the clock once: CURRENT_TIME is its time of day at UTC.
+    - sql: BEGIN
+    - sql: INSERT INTO ctz (id) VALUES (1)
+      rowcount: 1
+    - sql: INSERT INTO ctz VALUES (2, CURRENT_TIME, LOCALTIME, CURRENT_TIMESTAMP, CURRENT_TIME)
+      rowcount: 1
+    - sql: SELECT id, a = CURRENT_TIME, b = CURRENT_TIME, c = LOCALTIME, d = LOCALTIME FROM ctz ORDER BY id
+      expected: [[1, t, t, t, t], [2, t, t, t, t]]
+    - sql: SELECT id FROM ctz WHERE a <= CURRENT_TIME AND b < TIMETZ '24:00:00+00' ORDER BY id
+      expected: [[1], [2]]
+    - sql: COMMIT
+    - sql: CREATE TABLE ctz2 (a TIMETZ DEFAULT CURRENT_DATE)
+      error: "42804"
+    - sql: CREATE TABLE ctz2 (a DATE DEFAULT CURRENT_TIME)
+      error: "42804"
+  teardown:
+    - ROLLBACK
+    - DROP TABLE ctz
+
+- name: TIME WITH TIME ZONE plus or minus an interval
+  features: [pg:timetz]
+  # the layer has no INTERVAL type yet: refused (42601)
+  unimplemented: true
+  steps:
+    - sql: SELECT TIMETZ '12:00+01' - '1 hour'
+      expected: [["11:00:00+01"]]
+    - sql: SELECT TIMETZ '12:00+01' + TIME '01:30'
+      expected: [["13:30:00+01"]]

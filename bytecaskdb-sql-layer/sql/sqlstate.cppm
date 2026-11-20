@@ -58,6 +58,7 @@ inline constexpr SqlState kInvalidTextRepresentation{"22P02"};
 inline constexpr SqlState kStringDataRightTruncation{"22001"};
 inline constexpr SqlState kInvalidDatetimeFormat{"22007"};
 inline constexpr SqlState kDatetimeFieldOverflow{"22008"};
+inline constexpr SqlState kInvalidTimeZoneDisplacement{"22009"};
 inline constexpr SqlState kCharacterNotInRepertoire{"22021"};
 inline constexpr SqlState kInvalidParameterValue{"22023"};
 inline constexpr SqlState kInvalidEscapeSequence{"22025"};
@@ -79,7 +80,7 @@ inline constexpr SqlState kObjectInUse{"55006"};
                  kDatatypeMismatch, kUndefinedFunction, kAmbiguousFunction, kUndefinedColumn, kUndefinedTable, kUndefinedObject,
                  kDuplicateColumn, kDuplicateTable, kDuplicateObject, kAmbiguousColumn, kDuplicateAlias, kIndeterminateDatatype, kWrongObjectType, kInvalidColumnReference, kInvalidForeignKey, kDependentObjectsStillExist, kUndefinedParameter, kDuplicateFunction, kInvalidFunctionDefinition, kNullValueNotAllowed, kNoDataFound, kTooManyRows,
                  kInvalidTextRepresentation, kStringDataRightTruncation, kInvalidDatetimeFormat,
-                 kDatetimeFieldOverflow, kCharacterNotInRepertoire, kInvalidParameterValue, kInvalidEscapeSequence, kSubstringError, kCannotCoerce,
+                 kDatetimeFieldOverflow, kInvalidTimeZoneDisplacement, kCharacterNotInRepertoire, kInvalidParameterValue, kInvalidEscapeSequence, kSubstringError, kCannotCoerce,
                  kInvalidRowCountInLimit, kInvalidRowCountInOffset, kReservedName, kInvalidGrantOperation,
                  kInvalidSavepointSpecification, kReadOnlySqlTransaction, kObjectInUse}) {
     if (s.view() == code) return s;

@@ -181,6 +181,39 @@ using Datum = std::variant<std::monostate, std::int64_t, double, bool, Bytes>;
 // TIME is microseconds since midnight, in [0, kMicrosPerDay]: 24:00:00 is a
 // TIME, as in PostgreSQL.
 inline constexpr std::int64_t kMicrosPerDay = 86'400'000'000;
+// TIME WITH TIME ZONE is a TIME and a UTC offset in seconds east of UTC,
+// within PostgreSQL's bound of +-15:59:59. Its value is one i64,
+//   (time - offset seconds) * kTimeTzZones + (kMaxTimeTzOffset - offset),
+// the UTC time first, then the offset, highest first: so integer order is
+// PostgreSQL's timetz_cmp (the UTC time, then its zone, seconds west), and
+// two values are equal only when both their time and their offset are.
+// The value is never more than 2^55 in magnitude.
+inline constexpr std::int64_t kMaxTimeTzOffset = 15 * 3600 + 59 * 60 + 59;
+inline constexpr std::int64_t kTimeTzZones = std::int64_t{1} << 17;  // > 2 * kMaxTimeTzOffset + 1
+struct TimeTz {
+  std::int64_t time;    // microseconds since midnight, 0 to kMicrosPerDay
+  std::int64_t offset;  // seconds east of UTC, within kMaxTimeTzOffset
+};
+[[nodiscard]] constexpr auto timetz_pack(TimeTz t) -> std::int64_t {
+  return (t.time - t.offset * 1'000'000) * kTimeTzZones + (kMaxTimeTzOffset - t.offset);
+}
+[[nodiscard]] constexpr auto timetz_unpack(std::int64_t v) -> TimeTz {
+  auto zone = v % kTimeTzZones;
+  if (zone < 0) zone += kTimeTzZones;
+  auto utc = (v - zone) / kTimeTzZones;
+  auto offset = kMaxTimeTzOffset - zone;
+  return {utc + offset * 1'000'000, offset};
+}
+// Whether v is a value timetz_pack writes.
+[[nodiscard]] constexpr auto timetz_valid(std::int64_t v) -> bool {
+  constexpr auto kLimit = (kMicrosPerDay + kMaxTimeTzOffset * 1'000'000 + 1) * kTimeTzZones;
+  if (v <= -kLimit || v >= kLimit) return false;
+  auto t = timetz_unpack(v);
+  return t.time >= 0 && t.time <= kMicrosPerDay && t.offset >= -kMaxTimeTzOffset && t.offset <= kMaxTimeTzOffset;
+}
+static_assert(timetz_unpack(timetz_pack({kMicrosPerDay, -kMaxTimeTzOffset})).offset == -kMaxTimeTzOffset);
+static_assert(timetz_unpack(timetz_pack({0, kMaxTimeTzOffset})).time == 0);
+static_assert(timetz_pack({12 * 3'600'000'000LL, 3600}) < timetz_pack({11 * 3'600'000'000LL, 0}));
 // PostgreSQL's DATE and TIMESTAMP ranges, in this layer's epoch (1970-01-01):
 // days in [kMinDate, kEndDate), from 4714-11-24 BC to 5874898-01-01; and
 // microseconds from kMinTimestamp (4714-11-24 BC 00:00). PostgreSQL's
@@ -250,38 +283,47 @@ struct RangeMessage {
 [[nodiscard]] auto set_datum(RowWriter& w, std::uint32_t col_id, const Datum& d) -> bool;
 
 // A DEFAULT of the clock (CURRENT_DATE, CURRENT_TIMESTAMP and now(),
-// LOCALTIME, LOCALTIMESTAMP), its precision 0 to 6, or of a session function
-// (CURRENT_USER, CURRENT_ROLE and USER; SESSION_USER; CURRENT_CATALOG;
-// CURRENT_SCHEMA), a NAME, its precision unused. Each statement reads the
-// clock and the session once; the binder gives a row that leaves the column
-// out, or sets it to DEFAULT, that reading, so the column's stored default
-// stays NULL.
+// LOCALTIME, LOCALTIMESTAMP, CURRENT_TIME), its precision 0 to 6, or of a
+// session function (CURRENT_USER, CURRENT_ROLE and USER; SESSION_USER;
+// CURRENT_CATALOG; CURRENT_SCHEMA), a NAME, its precision unused. Each
+// statement reads the clock and the session once; the binder gives a row
+// that leaves the column out, or sets it to DEFAULT, that reading, so the
+// column's stored default stays NULL.
 struct ClockDefault {
   enum class Fn : std::uint8_t {
     CurrentDate = 1, CurrentTimestamp, LocalTime, LocalTimestamp,
     CurrentUser, SessionUser, CurrentCatalog, CurrentSchema,
+    CurrentTime,
   };
-  static constexpr std::uint8_t kLastFn = static_cast<std::uint8_t>(Fn::CurrentSchema);
+  static constexpr std::uint8_t kLastFn = static_cast<std::uint8_t>(Fn::CurrentTime);
   Fn fn{Fn::CurrentDate};
   std::uint8_t precision{6};
 
   friend auto operator==(const ClockDefault&, const ClockDefault&) -> bool = default;
 };
 
+// Whether `fn` is a session function, a NAME, not the clock.
+[[nodiscard]] constexpr auto is_session_fn(ClockDefault::Fn fn) -> bool {
+  using F = ClockDefault::Fn;
+  return fn == F::CurrentUser || fn == F::SessionUser || fn == F::CurrentCatalog || fn == F::CurrentSchema;
+}
+
 // Whether a column of `kind` takes `fn`'s value by PostgreSQL's assignment
 // cast, and the layer computes it from the statement's reading: a date the
-// date of any of them but LOCALTIME; a time LOCALTIME's or a timestamp's
-// time; a timestamp either timestamp. (A date to a timestamp is midnight,
-// not the reading: not taken.) A session function's NAME goes to a string
-// column of any kind.
+// date of a timestamp's; a time the time of any reading but CURRENT_DATE; a
+// time with time zone CURRENT_TIME's, LOCALTIME's at the session's zone or
+// CURRENT_TIMESTAMP's; a timestamp either timestamp. (A date to a timestamp
+// is midnight, not the reading: not taken.) A session function's NAME goes
+// to a string column of any kind.
 [[nodiscard]] constexpr auto clock_assignable(ClockDefault::Fn fn, SqlKind kind) -> bool {
   using F = ClockDefault::Fn;
-  if (fn >= F::CurrentUser) {
+  if (is_session_fn(fn)) {
     return kind == SqlKind::Text || kind == SqlKind::Varchar || kind == SqlKind::Char || kind == SqlKind::Name;
   }
   switch (kind) {
-    case SqlKind::Date: return fn != F::LocalTime;
+    case SqlKind::Date: return fn == F::CurrentDate || fn == F::CurrentTimestamp || fn == F::LocalTimestamp;
     case SqlKind::Time: return fn != F::CurrentDate;
+    case SqlKind::TimeTz: return fn == F::CurrentTime || fn == F::LocalTime || fn == F::CurrentTimestamp;
     case SqlKind::Timestamp:
     case SqlKind::TimestampTz: return fn == F::CurrentTimestamp || fn == F::LocalTimestamp;
     case SqlKind::SmallInt:
@@ -1368,7 +1410,8 @@ auto sql_type_valid(SqlType t) -> bool {
     case SqlKind::Timestamp:
     case SqlKind::TimestampTz:
     case SqlKind::Date:
-    case SqlKind::Time: return t.length == 0 && t.precision == 0 && t.scale == 0;
+    case SqlKind::Time:
+    case SqlKind::TimeTz: return t.length == 0 && t.precision == 0 && t.scale == 0;
     // A column's has no modifier; AVG's result, which carries its sum's
     // scale, is never a column's type.
     case SqlKind::Numeric: return t.length == 0 && t.precision == 0 && t.scale == 0;
@@ -1397,6 +1440,7 @@ auto sql_type_name(SqlType t) -> std::string {
     case SqlKind::TimestampTz: return "timestamptz";
     case SqlKind::Date: return "date";
     case SqlKind::Time: return "time";
+    case SqlKind::TimeTz: return "timetz";
     case SqlKind::Numeric: return "numeric";
   }
   return "?";
@@ -1458,6 +1502,7 @@ auto compared_type(SqlType t) -> ComparedType {
     case SqlKind::TimestampTz:
     case SqlKind::Date:
     case SqlKind::Time:
+    case SqlKind::TimeTz:
     case SqlKind::Numeric: return same(t);
   }
   return same(t);
@@ -1479,6 +1524,9 @@ auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string> {
     }
     case SqlKind::Time:
       if (v < 0 || v > kMicrosPerDay) return "time out of range";
+      break;
+    case SqlKind::TimeTz:
+      if (!timetz_valid(v)) return "time out of range";
       break;
     case SqlKind::Date:
       if (v < kMinDate || v >= kEndDate) return "date out of range";

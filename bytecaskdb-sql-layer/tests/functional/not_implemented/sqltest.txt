@@ -59,8 +59,6 @@ e121_10_01_07  # not PostgreSQL: FETCH ... INTO: not PostgreSQL syntax (owner de
 e121_10_01_08  # not PostgreSQL: FETCH ... INTO: not PostgreSQL syntax (owner decision 2026-10-28); PostgreSQL 17 gives 42601, "syntax error at or near "OPEN""
 e141_07_03_01  # not PostgreSQL: CURRENT_PATH; PostgreSQL 17 gives 0A000, "cannot use column reference in DEFAULT expression"
 e141_07_08_01  # not PostgreSQL: SYSTEM_USER is text in PostgreSQL, which refuses it as the DEFAULT of an INT column; PostgreSQL 17 gives 42804, "column "a" is of type integer but default expression is of type text"
-e141_07_10_01  # TIME WITH TIME ZONE: the layer has no WITH TIME ZONE types
-e141_07_12_01  # TIME WITH TIME ZONE: the layer has no WITH TIME ZONE types
 e152_01_01_01  # ISOLATION LEVEL SERIALIZABLE: transactions run at snapshot isolation; the serializable guards are not built
 e152_01_01_02  # ISOLATION LEVEL SERIALIZABLE: transactions run at snapshot isolation; the serializable guards are not built
 f031_03_03_09  # not PostgreSQL: `GRANT UNDER ON TABLE_F031_03_03_09 TO ROLE_F031_03_03_09`; PostgreSQL 17 gives 42601, "unrecognized privilege type "under""
@@ -122,8 +120,6 @@ f031_19_10_19  # not PostgreSQL: `REVOKE ALL PRIVILEGES ON SPECIFIC STATIC METHO
 f031_19_10_20  # not PostgreSQL: `REVOKE ALL PRIVILEGES ON STATIC METHOD BAR FOR BAZ FROM ROLE_F031_19_10_20`; PostgreSQL 17 gives 42601, "syntax error at or near "METHOD""
 f031_19_10_21  # not PostgreSQL: `REVOKE ALL PRIVILEGES ON STATIC METHOD BAR FROM ROLE_F031_19_10_21`; PostgreSQL 17 gives 42601, "syntax error at or near "METHOD""
 f051_05_07_02  # not PostgreSQL: there is no cast from time to timestamp (42846, which the layer gives); PostgreSQL 17 gives 42846, "cannot cast type time without time zone to timestamp without time zone"
-f051_07_01_01  # CURRENT_TIME is time with time zone: the layer has no WITH TIME ZONE types (#491)
-f051_07_01_02  # CURRENT_TIME is time with time zone: the layer has no WITH TIME ZONE types (#491)
 f261_01_01_01  # not PostgreSQL: WHEN with a list of values; PostgreSQL 17 gives 42601, "syntax error at or near ",""
 f261_01_01_02  # not PostgreSQL: WHEN with a list of values; PostgreSQL 17 gives 42601, "syntax error at or near ",""
 f261_01_01_03  # not PostgreSQL: WHEN with a list of values; PostgreSQL 17 gives 42601, "syntax error at or near ",""

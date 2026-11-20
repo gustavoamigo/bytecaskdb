@@ -2059,6 +2059,8 @@ pg:bytea:
   description: the BYTEA type
 pg:timestamptz:
   description: the TIMESTAMP WITH TIME ZONE type (timestamptz), in UTC
+pg:timetz:
+  description: the TIME WITH TIME ZONE type (timetz), a time of day and its UTC offset
 pg:char:
   description: the CHAR(n) type, blank-padded
 pg:fetch-move:

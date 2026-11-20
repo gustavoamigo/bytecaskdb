@@ -63,6 +63,7 @@ auto type_info(SqlType t) -> TypeInfo {
     case SqlKind::TimestampTz: return {1184, 8, -1};
     case SqlKind::Date: return {1082, 4, -1};
     case SqlKind::Time: return {1083, 8, -1};
+    case SqlKind::TimeTz: return {1266, 12, -1};
     case SqlKind::Numeric: return {1700, -1, -1};
   }
   return {25, -1, -1};

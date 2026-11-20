@@ -1813,6 +1813,7 @@ private:
       case SqlKind::Bytea:
       case SqlKind::Date:
       case SqlKind::Time:
+      case SqlKind::TimeTz:
       case SqlKind::Timestamp:
       case SqlKind::TimestampTz: throw std::logic_error{"physical plan: - or abs of other than an integer or a DECIMAL"};
     }
