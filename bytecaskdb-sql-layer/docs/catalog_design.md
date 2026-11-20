@@ -670,6 +670,889 @@ not built. Four choices made here keep it open:
 4. **Append-only serialization**, so the record can grow per-version
    fields without migrating the records already written.
 
+## Schemas
+
+Status: **design, approved by the owner on 2026-11-20** (#713, option 1),
+with every recommendation under *Open questions for the owner*: Q1 (a),
+Q2 (a), Q3 (a), Q4 (a), Q5 (a), Q6 (a), Q7 (a), Q8 (a), Q9 (b). Nothing here
+is built yet. This section covers what
+`CREATE SCHEMA` and `DROP SCHEMA` do, how a schema-qualified name resolves,
+the schema record and the change to the name entries' keys, what an older
+build does with a database that holds a schema, `WITH CHECK OPTION` (which
+sqltest's F311-04 needs), and the stages that build it. Behaviour observed
+on PostgreSQL 17.12 is cited as "PG 17". Line numbers are those of branch
+`gustavoamigo/sql-txn-ddl-ctas-implicit`.
+
+**The design in one paragraph.** A schema is a catalog record with an id
+from the one counter, a name entry in a namespace of its own, and an ACL
+record that exists as long as the schema does. Every name entry of a
+relation, procedure or type outside `public` carries its schema's id in its
+key; `public` is schema 0, implicit, never written, and holds every object
+that exists today, so no existing key moves and nothing is migrated. Every
+record this build writes is in a next format that names its schema; the
+records written before it still read, as objects of `public`. A build from
+before stage 1 refuses any database holding a record this build wrote, a
+schema included, as `bytecaskdb-sql-layer/CONTRACT.md` already says of a
+database a later build writes. A session's `search_path` is fixed at
+`public`. A view stores, for each unqualified relation name of its query,
+the schema that name resolved to when it was created, and resolves through
+that map at every use, never through a path.
+
+### What the sqltest cases need
+
+The 8 F311 cases (`tests/functional/suites/sqltest/standards/2016/F/F311-0{1..5}.tests.yml`)
+fail at the parser today and are listed in
+`tests/functional/not_implemented/sqltest.txt:139-146`. sqltest has no
+expected results: a case passes when every step succeeds
+(`tests/functional/loaders/sqltest.py:5-7`).
+
+| Case | Statement | Needs |
+|---|---|---|
+| f311_01_01_01 | `CREATE SCHEMA S` | stage 1b |
+| f311_02_01_01 | `CREATE SCHEMA S CREATE TABLE T (A INT)` | stage 2 |
+| f311_03_01_01 | `CREATE TABLE T1 (A INTEGER)`; `CREATE SCHEMA S CREATE VIEW V AS SELECT A FROM T1` | stage 2: `T1` resolves to `public` |
+| f311_04_01_01..03 | as 03, with `WITH CASCADED CHECK OPTION`, `WITH CHECK OPTION`, `WITH LOCAL CHECK OPTION` | stages 2 and 3 |
+| f311_05_01_01, 02 | `CREATE TABLE T`; `CREATE ROLE R`; `CREATE SCHEMA S GRANT SELECT ON [TABLE] T TO R` | stage 2 |
+
+No case needs stage 4 (schema privileges) or stage 5 (`DROP SCHEMA …
+CASCADE`); building them now is the owner's call (Q9).
+
+### Schema semantics
+
+**A schema is a namespace of relations, procedures and types.** Tables,
+views, indexes and sequences share one namespace per schema, as relations
+do in PostgreSQL; procedures have one per schema, and types (domains, shell
+types, and the row type of each table and view) one per schema. Roles stay
+global, as in PostgreSQL. Two objects of one name in two schemas are two
+objects. Names fold case as other names do: `CREATE SCHEMA "DZ_Up"` then
+`DROP SCHEMA dz_up` is 3F000 (PG 17).
+
+**Schema 0, `public`.** Every object that exists today is in it, and an
+unqualified `CREATE` puts the object there. It is implicit, as the
+bootstrap role is: no record, no name entry.
+
+**System schema names.** `pg_catalog` and `information_schema` exist in
+PG 17; the layer holds no object in either.
+- `CREATE SCHEMA [IF NOT EXISTS] name` checks, in PG 17's order: a name
+  starting `pg_` is 42939 "unacceptable schema name "pg_x"", DETAIL "The
+  prefix "pg_" is reserved for system schemas.", with or without `IF NOT
+  EXISTS` (`pg_catalog` included); then `public` and `information_schema`
+  are taken, though no name entry holds them: 42P06, or with `IF NOT
+  EXISTS` the NOTICE below and nothing written; then the name entry (PG 17,
+  each).
+- `DROP SCHEMA pg_catalog`, `IF EXISTS` included, is 2BP01 "cannot drop
+  schema pg_catalog because it is required by the database system"
+  (PG 17). `DROP SCHEMA information_schema` is 0A000: PG 17's is 2BP01
+  listing its ~100 objects, which the layer does not hold (*Differences*).
+- Creating in a system schema: a table, view, index or sequence in
+  `pg_catalog` is 42501 `permission denied to create "pg_catalog.x"`,
+  DETAIL "System catalog modifications are currently disallowed." (PG 17).
+  A domain, type or procedure in `pg_catalog`, and any object in
+  `information_schema` or `pg_temp`, is 0A000: PG 17 creates them (as
+  superuser; `pg_temp.x` a temporary table), the layer has no such
+  schema to write in (*Differences*).
+
+**`CREATE SCHEMA [IF NOT EXISTS] name [AUTHORIZATION role] [element …]`**
+and `CREATE SCHEMA AUTHORIZATION role [element …]`, which names the schema
+after the role (PG 17).
+- A taken name is 42P06 `schema "s" already exists`. `IF NOT EXISTS` on a
+  taken name writes nothing and gives NOTICE 42P06 `schema "s" already
+  exists, skipping`, decided twice as `CREATE TABLE IF NOT EXISTS` is
+  (*DDL*).
+- `IF NOT EXISTS` with elements is 0A000 "CREATE SCHEMA IF NOT EXISTS
+  cannot include schema elements" (PG 17 raises it in its grammar; the
+  parser maps libpg_query's message to 0A000, not 42601).
+- `AUTHORIZATION role`: the role must exist (42704, PG 17);
+  `CURRENT_USER`, `CURRENT_ROLE` and `SESSION_USER` name the bootstrap role.
+  The schema records the role as its owner (*Schema owner and
+  privileges*).
+- The catalog itself refuses an empty name or one holding a NUL byte, for
+  a schema and for every other object, in each DDL's `next_version` and at
+  decode (*Schema catalog record and name entry keys*).
+
+**Schema elements.** PG 17's grammar takes `CREATE TABLE`, `CREATE VIEW`,
+`CREATE INDEX`, `CREATE SEQUENCE`, `CREATE TRIGGER` and `GRANT` as elements;
+`CREATE FUNCTION`, `CREATE DOMAIN`, `CREATE TYPE`, `CREATE TABLE … AS` and
+`REVOKE` are 42601 there, and so here, since the layer's parser is PG's.
+`CREATE TEMP TABLE` as an element is 42P16 "cannot create temporary
+relation in non-temporary schema" (PG 17). `CREATE TRIGGER` is 0A000: the
+layer has no triggers. The rest follow PG 17:
+- **Order.** Elements run grouped by kind, sequences, then tables, then
+  views, then indexes, then grants, each group in written order (PG 17's
+  `transformCreateSchemaStmtElements`; observed: an index written before
+  its table works, a view over a later-written view is 42P01).
+- **Where each element's object goes.** An unqualified `CREATE TABLE`,
+  `VIEW`, `SEQUENCE` or index's table is in the new schema; one qualified
+  with the new schema is accepted; one qualified with another is 42P15
+  "CREATE specifies a schema (a) different from the one being created
+  (b)" (PG 17). An index is in its table's schema, so `CREATE INDEX i ON t`
+  as an element indexes `s.t`, never `public.t` (PG 17: with `public.dz_b`
+  present, `CREATE SCHEMA dz_e1 CREATE INDEX dz_i ON dz_b(a) CREATE TABLE
+  dz_b(a int)` put `dz_i` on `dz_e1.dz_b`).
+- **What an element reads.** Names an element reads (a view's query, a
+  `GRANT`'s objects) resolve with the path (the new schema, `public`): the
+  first schema holding a relation of the name, of any kind, wins, else
+  42P01 (PG 17; *The path*).
+- **One statement.** The schema and every element commit together or not
+  at all; a failing element writes nothing, schema included (PG 17).
+
+**`DROP SCHEMA [IF EXISTS] name [, …] [RESTRICT | CASCADE]`**
+- A missing schema is 3F000 `schema "s" does not exist`, and the statement
+  drops nothing even when other names exist; with `IF EXISTS`, NOTICE 00000
+  `schema "s" does not exist, skipping` per missing name (PG 17).
+- **RESTRICT**, the default: a schema that holds any object is 2BP01
+  "cannot drop schema s because other objects depend on it" (with more
+  than one schema named, "cannot drop desired object(s) because other
+  objects depend on them"), HINT "Use DROP ... CASCADE to drop the
+  dependent objects too." (PG 17). Its DETAIL, as PG 17 writes it:
+  - one line per table, view, sequence, domain, shell type and procedure
+    of the schema: `table s.t depends on schema s`; a domain and a shell
+    type are both `type s.d`, a procedure `function s.p(integer)` with its
+    argument types;
+  - no line for an index, a row type, a constraint, or a sequence a column
+    owns;
+  - a view in another schema that reads one of them is listed as
+    depending on what it reads, not on the schema: `view v depends on view
+    s.v` (or `on table s.t`);
+  - a name is unqualified when its schema is on the session's path
+    (`view v`, not `view public.v`);
+  - past 100 lines, the rest is one line, `and N other objects (see
+    server log for list)`.
+- **CASCADE** (stage 5) drops, in one batch: every table, view, index,
+  sequence, procedure, domain and shell type of the schema; every view in
+  any schema that reads one of them, and the views that read those, to the
+  end of the chain; and the ACL record of each, the schema's included.
+  NOTICE "drop cascades to N other objects" (or "drop cascades to table
+  s.t" for one), DETAIL one `drop cascades to …` line per object the
+  RESTRICT form lists, with the same naming and the same 100-line cap
+  (PG 17: `DROP SCHEMA dz_r CASCADE` dropped `dz_r.x` and the view
+  `public.dz_rv` over it). A procedure elsewhere whose body names a dropped
+  table is not dropped: its body is not a dependency, as a PL/pgSQL body
+  is not in PG 17 (`procedures_design.md`, *Catalog record*).
+- **In use.** In a transaction, a `DROP SCHEMA` that would drop a table
+  or index an open cursor or bound portal of the transaction reads is
+  55006 `cannot DROP TABLE "t" because it is being used by active queries
+  in this session`, as `Transaction::check_in_use`
+  (`api/database.cppm:3315-3360`) gives for `DROP TABLE`. RESTRICT reports
+  2BP01 first, since a schema holding the table is not empty; CASCADE
+  checks each table and index of its closure (PG 17: a cursor over
+  `dz_cu.t`, then `DROP SCHEMA dz_cu CASCADE`, gave its NOTICE, then this
+  55006; without CASCADE, 2BP01).
+- `DROP SCHEMA public` is 0A000 (*Differences from PostgreSQL 17*).
+
+**`CURRENT_SCHEMA`** and `current_schema()` return `public`, the first
+schema of the path (PR 28 builds it; if this lands first, stage 1b does).
+`current_schemas(false)` is `{public}` and `current_schemas(true)`
+`{pg_catalog,public}` (PG 17).
+
+### Name resolution with schemas
+
+**Qualified names are accepted everywhere a name is resolved**: a `FROM`
+relation, `INSERT INTO`, `UPDATE`, `DELETE`, `CREATE TABLE`, `CREATE VIEW`,
+`CREATE SEQUENCE`, `CREATE DOMAIN`, `CREATE TYPE`, `CREATE PROCEDURE`,
+`CALL`, `ALTER TABLE`, `CREATE INDEX … ON s.t`, every `DROP`, `GRANT` and
+`REVOKE`, a column's type, and a column reference `s.t.c`. Each refusal
+the parser has today (`sql/parser.cppm:86`, `:840`, `:865`, `:910`,
+`:919`, `:924`, `:934`, `:947`, `:1000`, `:1667`, `:1908`, `:185`) goes.
+An index's own name in `CREATE INDEX` takes no qualifier: 42601, as in
+PG 17. A function name keeps today's rule: `pg_catalog.` only. A name of
+four parts or more is 42601 "improper qualified name (too many dotted
+names): a.b.c.d" (PG 17).
+
+**A type name is resolved whole.** Today the parser keeps a type name's
+last part (`parser.cppm:120`), so `CREATE TABLE t (a foo.int4)` is
+accepted as `int4` where PG 17 gives 3F000. That is a bug today, fixed on
+its own before stage 1 (*Stages*): a qualifier other than `pg_catalog.` is
+refused. Stage 1b then widens it: `s.d` names the domain or shell type `d`
+of `s` (which is not a column's type yet, *Domains, shell types and
+sequences*). `pg_catalog.int4` and the other built-in types stay accepted;
+`public.int4` is 42704 `type "public.int4" does not exist` (PG 17).
+
+**The path.** An unqualified name resolves against a path of schemas. The
+first schema that holds a relation of the name, of any kind (table, view,
+index, sequence), wins, and the caller then checks the kind (42809, as
+today), as PG 17's `RangeVarGetRelid` does; a lookup never skips an index
+or sequence `s.x` to reach `public.x`.
+
+| Where | Path |
+|---|---|
+| A session, embedded or wire | `public` |
+| An element of `CREATE SCHEMA s` | `s`, `public` |
+| A view's query, at every use | none: its stored map (below) |
+| A procedure's body, at each call | the caller's, as PG 17 resolves a PL/pgSQL body's names when it runs |
+
+Built-in functions and types are `pg_catalog`'s and are found before the
+path, as in PG 17. The layer has no relation in `pg_catalog`, so the path
+holds every relation it can name.
+
+**Errors, as PG 17 gives them** (each observed). A name in a message is
+written as PG 17 writes it: some forms qualify it, others do not.
+
+| Statement | Missing schema | Missing object in an existing schema |
+|---|---|---|
+| `SELECT … FROM s.t`, `INSERT INTO`, `UPDATE`, `DELETE` `s.t` | 42P01 `relation "s.t" does not exist` | 42P01 `relation "s.t" does not exist` |
+| `CREATE TABLE`, `VIEW`, `SEQUENCE`, `DOMAIN`, `TYPE`, `PROCEDURE` `s.x` | 3F000 `schema "s" does not exist` | (none) |
+| `DROP TABLE`, `VIEW`, `SEQUENCE` `s.x` | 3F000 | 42P01 `table "x" does not exist` (`view "x"`, `sequence "x"`), unqualified; `DROP TABLE s.t, s.x` names `x` alone |
+| `DROP INDEX s.x` | 3F000 | 42704 `index "x" does not exist` |
+| `DROP TYPE`, `DROP DOMAIN` `s.x` | 3F000 | 42704 `type "s.x" does not exist` |
+| `DROP PROCEDURE s.p()` | 3F000 | 42883 `procedure s.p() does not exist` |
+| `CALL s.p()` | 3F000 | 42883 `procedure s.p() does not exist`, HINT "No procedure matches the given name and argument types. You might need to add explicit type casts." |
+| `ALTER TABLE s.x`, `CREATE INDEX ON s.x`, `GRANT … ON s.x` | 3F000 | 42P01 `relation "s.x" does not exist` |
+| A column type or a cast `s.d` (`1::s.d`) | 3F000 | 42704 `type "s.d" does not exist` |
+| `DROP … IF EXISTS s.x` | NOTICE `schema "s" does not exist, skipping` | its notice, as today (`table "x" does not exist, skipping`) |
+| `db.s.t`, a relation | 0A000 `cross-database references are not implemented: "db.s.t"` | |
+| `db.s.t.c`, a column | 0A000 `cross-database references are not implemented: db.s.t.c` | |
+
+**`FROM` and column references.** Two relations of one name in two schemas
+may appear in one `FROM` unaliased (`FROM s.t, public.t`); `t.c` over them
+is 42P09 `table reference "t" is ambiguous`, and `s.t.c` or `public.t.c`
+picks one. The same name twice from one schema stays 42712. A qualified
+column reference that matches no entry is 42P01 in PG 17's three forms:
+- `x.t.c` with no relation `x.t` in `FROM`: "missing FROM-clause entry for
+  table "t"";
+- the relation is in `FROM` under an alias: "invalid reference to
+  FROM-clause entry for table "t"", HINT "Perhaps you meant to reference
+  the table alias "x".";
+- `public.t.c` when `FROM` holds only `s.t`: the same message, DETAIL
+  "There is an entry for table "t", but it cannot be referenced from this
+  part of the query.".
+
+`UPDATE s.t SET s.t.a = …` is 42703 `column "s" of relation "t" does not
+exist` (PG 17).
+
+What changes in the parser and binder for this:
+- `ast::FromItem` carries its schema (a `QualifiedName`, *Stage 1a*).
+- `resolve_aliases`' duplicate check (`parser.cppm:1406-1450`) keys an
+  unaliased item on (schema, name), so `FROM s.t, public.t` passes where
+  today it is 42712.
+- Alias erasure stays suppressed whenever two items share a relation name
+  in any schema: today's `names.tables[i] == names.tables[j]` compares bare
+  names, and stays bare.
+- A qualifier `requalify` rewrites carries the schema, so two `t` items
+  from two schemas never collapse onto one name. Test: `FROM s.t x,
+  public.t y WHERE x.c = y.c`.
+- The binder's range-entry key for an unaliased relation becomes its
+  (schema, name).
+
+**Views resolve against what they were created against.** A view is stored
+as text and bound again at every use (*Views*), so with a path of more than
+one schema a later object could change what an unqualified name means: a
+view created as an element of `CREATE SCHEMA s` over `public.t1` would read
+`s.t1` once one is created. PG 17 binds the view once and keeps the object.
+The layer keeps it too:
+1. **The binder records what it resolved.** While it binds `CREATE VIEW`,
+   the binder records each relation it resolves, in every position of the
+   query (subqueries in targets, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`,
+   CTE bodies), as it resolves it. `depends_on` and the map below are both
+   built from that one record, not from a second walk of the AST.
+2. **The view stores a map** from each unqualified relation name its query
+   reads (a CTE's name excluded) to the schema that name resolved to:
+   `u16 nnames { u8 kind, str name, u32 schema }` in its record (format 2,
+   below), kind 1 for a relation. A qualified name needs no entry.
+3. **At each use an unqualified relation name resolves through the map,
+   never through a path.** A name the map lacks is an internal error
+   (XX000, "view v has no stored resolution for t"), never a search: it
+   can only arise from a damaged record or a binder bug, and an error is
+   preferred to a guess.
+
+The map gives the object of the creation: the entry names the schema the
+name resolved to then, and that schema's object is still there, since it
+is in `depends_on` and a view's dependencies cannot be dropped (RESTRICT;
+CASCADE drops the view with them). Load checks that each entry's object is
+in `depends_on`. A view written before stage 1 (format 1) has no map: its
+names resolve in `public`, the only schema its path held.
+
+Today `depends_on` comes from `ViewExpander::relations`
+(`binder.cppm:5588-5599`), a second walk that resolves names with
+`cat_.table(name)` on its own and, through `each_subquery`
+(`binder.cppm:5376-5381`), misses a subquery in `ORDER BY`: `CREATE VIEW v
+AS SELECT a FROM t ORDER BY (SELECT max(b) FROM u)` lets `DROP TABLE u`
+succeed, and `v` then fails with 42P01. That bug exists today; it is fixed
+on its own before stage 1 (*Stages*), by building `depends_on` from the
+binder's resolution (rule 1), with a GitHub issue opened for it.
+
+Only relations enter the map today. Views cannot name a sequence or a
+domain yet (no `nextval`, and a domain is not a usable column type,
+`frontend_design.md:1004-1007`); when either is built, a view's reference
+to a type or sequence must enter the map under its own kind, and a
+column default's too (*Risks*).
+
+### Schema catalog record and name entry keys
+
+New keys under namespace `0x01` (*Storage*); `0D` and `0E` are free today:
+
+| Key | Value |
+|---|---|
+| `01 0D <id:4>` | The schema record. |
+| `01 0E <name>` | Schema name entry: kind 8 and id (4, big-endian). Schemas have a namespace of their own. |
+| `01 09 <id:4>` | The schema's ACL record, written with the schema and deleted with it (*Schema owner and privileges*). |
+
+**The schema record**, little-endian as the others:
+
+```
+u16 format                   ; kSchemaRecordFormat, 1
+u32 id, str name
+u32 owner                    ; a role id, or kBootstrapRole
+```
+
+Its id comes from the one counter, so a schema dropped and created again is
+another schema. `public` has no record and is id 0, which the counter never
+gives.
+
+**A name entry outside `public` carries its schema.** A name entry key is
+today the sub-prefix and the name's bytes, with no terminator
+(`name_entry_key`, `catalog.cppm:1649`). Outside `public` it gains a
+marker byte `00` and the schema id:
+
+```
+01 03 <name>                 ; a relation in public: unchanged
+01 03 00 <schema:4> <name>   ; a relation in schema `schema` (big-endian)
+01 06 [00 <schema:4>] <name> ; a procedure
+01 0B [00 <schema:4>] <name> ; a type
+01 08 <name>                 ; a role: unchanged, roles are global
+```
+
+The two forms cannot collide because no name is empty or holds a NUL
+byte, and from stage 1b the catalog itself enforces that: every DDL's
+`next_version` refuses such a name (42602 `invalid name`, reachable only
+through the `Catalog` API, since libpg_query's input is a C string and its
+grammar refuses a zero-length identifier), and load refuses one in a record
+or a name entry as corruption. Today nothing in the catalog checks it:
+`name_entry_key` copies bytes raw and record decode takes any bytes, and
+`utf8_code_points` (`catalog.cppm:206`) checks TEXT and VARCHAR values,
+never a name. Every existing key is the first form, so no key moves and
+nothing is migrated. An index's entry is under its table's schema.
+
+**Every record this build writes names its schema.** Each record kind gets
+a next format that appends its fields; this build writes only that format,
+for an object in `public` too, and reads the earlier one as an object of
+`public`:
+
+| Record | Read | Written |
+|---|---|---|
+| Table (`01 02`) | 7, 8 | 8: format 7 and `u32 schema`. The row and key formats stay format 7's. |
+| View (`01 04`) | 1, 2 | 2: format 1, `u32 schema`, `u8 check_option` (0 none, 1 local, 2 cascaded), `u16 nnames { u8 kind, str name, u32 schema }`. |
+| Procedure (`01 05`), type (`01 0A`), sequence (`01 0C`) | 1, 2 | 2: format 1 and `u32 schema`. |
+| ACL (`01 09`) | 1, 2 | 2: format 1 with `u8 is_default` after the object id; `is_default` 1 holds no entry and means the owner's default (PG's null `nspacl`), and only a schema's record may hold no entry. |
+
+A record changes format only when a DDL writes it (an `ALTER TABLE`
+rewrites its table's record); nothing is rewritten at open. A later format
+of any of these kinds extends the one above: the schema is always there,
+so no kind needs two variants again. View format 2 is defined once, in
+stage 1b, with every field: `check_option` other than 0 is refused at load
+until stage 3 builds it.
+
+So the name entry and the record each name the schema, as each names the
+object's name today, and load checks that they agree. The in-memory
+lookups (`names_`, `procedure_names_`, `type_names_`, `catalog.cppm:744`,
+`:2368`) are keyed by (schema id, name), built from the records as
+`rebuild_lookups` builds them today; a record decodes alone, so a
+round-trip test needs no name entry.
+
+**Load checks** refuse as corruption, as for the other records:
+- a schema record under another id's key, cut short, with trailing bytes,
+  or of a later format;
+- a schema without its name entry or its ACL record, a name entry without
+  its schema, two schemas of one name, a schema named `public` or
+  `information_schema` or starting `pg_`, or an owner that is no role;
+- a schema ID that another object also has: schema ids join the id set
+  `use()` checks for uniqueness;
+- an empty name, or one holding a NUL byte, in any record or name entry;
+- a name entry with the `00` marker shorter than 5 bytes, of schema 0, or
+  of a schema that does not exist;
+- a record whose schema disagrees with its name entry's, or names a
+  missing schema; a format-7 (or format-1) record whose name entry carries
+  a schema; an index whose name entry is not in its table's schema;
+- a view whose `check_option` is above 2; whose map names a schema twice
+  for one name, a missing schema, or an object not in its `depends_on`;
+- an ACL record of format 1 for a schema, of format 2 with `is_default`
+  set and entries, with no entry for any object but a schema, or with a
+  privilege its object's kind does not take.
+
+### How an older build reacts to a database with schemas
+
+`bytecaskdb-sql-layer/CONTRACT.md`'s row on earlier builds ("`Database::open`
+of a database written by an SQL-layer build from before #780 …") already
+says "A database this build writes cannot be opened by a build from before
+it". This design keeps that and nothing more:
+- **A record this build wrote is refused** by a build from before stage
+  1b: its format is later ("written by a later SQL-layer build",
+  `catalog.cppm:1787` and the parsers after it).
+- **A database holding any schema is refused**, an empty one included:
+  every schema has an ACL record, of format 2, which `parse_acl` refuses
+  the same way (`catalog.cppm:1931-1937`). So an older build never sees a
+  database where a schema exists and it can act without knowing it (a
+  `DROP ROLE` of the schema's owner, which its 2BP01 check,
+  `catalog.cppm:2915-2920`, knows only through ACLs, and which would leave
+  this build refusing the database for an owner that is no role).
+- **A database whose every record predates stage 1b opens** in the older
+  build as before: this build moves no key and rewrites nothing it does
+  not change.
+
+### Schema owner and privileges
+
+What #653's first step stores; nothing is enforced (#653).
+- **Owner.** The record holds the owner: the `AUTHORIZATION` role, or
+  `kBootstrapRole`. Objects have no owner in the layer, so one created in a
+  schema `AUTHORIZATION r` has none, where PG 17 makes `r` its owner.
+  `DROP ROLE` of a schema's owner is 2BP01 "role "r" cannot be dropped
+  because some objects depend on it", DETAIL `owner of schema s` (PG 17).
+- **The schema's ACL record** is written by `CREATE SCHEMA` with
+  `is_default` set and no entry (PG's null `nspacl`, the owner's `USAGE`
+  and `CREATE`), and deleted only by `DROP SCHEMA`. The first `GRANT` or
+  `REVOKE` on the schema writes the default out (`r=UC/r`) and applies
+  itself, as PG 17's `aclchk` does; a `REVOKE` that empties it keeps the
+  record with no entry (PG 17: `REVOKE ALL ON SCHEMA dz_o FROM dz_r` left
+  `{postgres=U/dz_r}`, no entry of the owner). An owner's own entries give
+  `DROP ROLE` no `privileges for schema s` line; another grantee's do, as
+  today for tables.
+- **`GRANT` and `REVOKE` `{USAGE | CREATE | ALL} ON SCHEMA s`** (stage 4)
+  edit that record, the column `kWholeObject`, as a sequence's are.
+  `USAGE` is today's bit 256; `CREATE` is a new bit, 512. Another privilege
+  is 0LP01 "invalid privilege type SELECT for schema"; a missing schema
+  3F000 (PG 17). A schema takes no column privileges. On `public` both are
+  0A000 (*Differences*).
+- **`GRANT … ON ALL TABLES IN SCHEMA s [, …]`** (stage 4) grants on every
+  table and view of each schema named at the time, as one `GrantDdl` of
+  those objects (PG 17 accepts it; it writes no default for later tables,
+  and covers no sequence). `IN SCHEMA public` is accepted; only `ON SCHEMA
+  public` is 0A000. `ON ALL SEQUENCES`, `ALL FUNCTIONS`, `ALL PROCEDURES`
+  and `ALL ROUTINES IN SCHEMA` stay 0A000.
+- **`DROP SCHEMA`** deletes the schema's ACL record with it, and CASCADE
+  each dropped object's.
+- `GrantDdl::Target` (`catalog.cppm:595`) gains `Schema`.
+
+### Schema DDL batches and transactional DDL
+
+Each statement goes through `Catalog::next_version`, so it bumps the
+catalog version, guards it, and every plan binds again after it, as after
+any DDL (*Compatibility*). There is no new durability site: each is one
+`WritePlan` and one `apply_batch` with `sync=true`
+(`transaction_design.md`, *Crash atomicity*).
+
+| Statement | Batch |
+|---|---|
+| `CREATE SCHEMA s` | Schema record, schema name entry (`ensure_absent`), its ACL record, counters. One id. |
+| `CREATE SCHEMA s` with elements | The above and each element's batch, as one transaction's commit (below). |
+| `DROP SCHEMA s` | Schema record, name entry and ACL record deleted. |
+| `DROP SCHEMA s CASCADE` | The above, and each dropped object's batch as its own `DROP` writes it (`del_range` per table and index). |
+
+**Transactional DDL applies unchanged.** `CREATE SCHEMA` and `DROP SCHEMA`
+are DDL of the `Ddl` variant (`catalog.cppm:608`) like the others: in a
+transaction each is a step bound against the transaction's catalog (rule
+A), later statements see it, and the commit publishes it with the
+transaction's writes or nothing. A skipped `IF [NOT] EXISTS` is not a DDL
+of the transaction. `Transaction::check_in_use` gains `DropSchemaDdl`
+(*DROP SCHEMA*, "In use"). Two transactions that each create `s` conflict
+at the second commit (40001), as any two DDL commits do: a DDL never waits
+for another (`transaction_design.md:477-502`), where PG 17 waits and then
+raises 23505 or 42P06 (*Differences*).
+
+**`CREATE SCHEMA` with elements is one transaction.** Each element must be
+bound against the catalog the previous one made (a view over a table
+created in the same statement), so the statement cannot be bound up front
+against the live catalog, as `execute_ddl` binds a DDL today
+(`api/database.cppm:2427-2437`). The API runs it as the steps of a
+transaction: in a transaction, as steps of that one (`step_ddl`,
+`:3382-3460`); in autocommit, as steps of an internal embedded
+`Transaction` that it commits at the end, with the default
+`TransactionOptions::max_bytes` (64 MiB), which the catalog's estimate of
+what the elements add counts against (54000 past it, nothing written). The
+first step creates the schema, then each element in PG 17's order, each
+bound with the path (`s`, `public`). Transactional DDL already composes
+several `step_ddl` calls into one commit, so this adds no mechanism.
+
+It is not retried. Autocommit DDL is not retried today: `Database::run_ddl`
+turns `DdlInProgress` into 40001 at once (`api/database.cppm:2437-2447`),
+and the CONTRACT row "A DDL never waits for another …" says the caller may
+retry. A `CREATE SCHEMA` with elements whose internal transaction loses at
+commit to another DDL is 40001 the same way, with nothing written; the
+caller reruns it. (The one internal retry loop that reruns from the start,
+`Database::call`, `:2989-3006`, is for procedures and stays theirs.)
+
+**A view created as an element stores its own text.** A view's
+`definition` is the whole statement (`parser.cppm:1968`), which the binder
+parses again at two sites and requires to be a `CREATE VIEW`
+(`into_base_table`, `binder.cppm:5635-5636`, and `binder.cppm:5840`). An
+element has no statement of its own, so the parser cuts one: the element's
+byte range of the client's text, from its first token to the token before
+the next element's first token (or the statement's end), found with
+`pg_query_scan` (already used, `parser.cppm:1827`). The slice is kept only
+if it parses alone to a single `CREATE VIEW` whose tree equals the
+element's, locations aside; otherwise the statement is 0A000 "CREATE VIEW
+as a schema element whose text cannot be cut out". The stored definition is
+then an ordinary `CREATE VIEW`: both parse sites work unchanged, the text is
+the client's (nothing is deparsed), each view stores only its own text, and
+no view depends on its sibling elements' syntax. A routing helper is
+therefore not needed; a test covers `INSERT` through an element view.
+
+### WITH CHECK OPTION
+
+F311-04 creates views `WITH [CASCADED | LOCAL] CHECK OPTION`, refused today
+(42601, `parser.cppm:1146`). Built here because the cases need it, and
+minimally: `INSERT` is the only write through a view the layer has
+(`UPDATE` and `DELETE` of a view are 0A000, #678).
+- **Stored** as the view record's `check_option` (format 2). `WITH CHECK
+  OPTION` alone is `CASCADED`, as in PG 17. The other ways PG 17 sets it,
+  `CREATE VIEW v WITH (check_option=local)`, `ALTER VIEW v SET
+  (check_option=…)` and `CREATE OR REPLACE VIEW` (which can drop it), stay
+  42601 as view options and `OR REPLACE` are today
+  (`frontend_design.md:862`), the element forms included (*Differences*).
+- **Created only on a view `INSERT` could write through.** The layer's
+  rule for that (`ViewExpander::into_base_table`, `binder.cppm:5611`:
+  one table or view, no `DISTINCT`, `GROUP BY`, `HAVING`, set operation,
+  `LIMIT`, `OFFSET` or aggregate, down to the table) is checked at
+  `CREATE VIEW`, through the same predicate (`not_updatable`), so a view
+  is never created that `INSERT` then refuses. `CREATE VIEW` also requires
+  at least one updatable column, as PG 17 does when it checks a check
+  option: a view whose columns are all expressions is refused, one with
+  some computed columns is accepted (PG 17). A refusal is 0A000 "WITH
+  CHECK OPTION is supported only on automatically updatable views", HINT
+  the reason for the first view of the chain that fails ("Views containing
+  DISTINCT are not automatically updatable.", "Views that have no
+  updatable columns are not automatically updatable.", PG 17). The reason
+  is the HINT here, where `INSERT`'s 55000 puts it in DETAIL and gives the
+  trigger HINT (`with_notes(why, "To enable inserting…")`), as PG 17 does.
+- **A subquery in a checked `WHERE` is 0A000 at `CREATE VIEW`**, for the
+  reason a `CHECK` constraint's is (*CHECK constraints*). It covers every
+  `WHERE` the new view would check: its own, and under `CASCADED` those of
+  the views below it. PG 17 accepts and enforces it (*Differences*).
+- **Which views are checked.** Walking from the view written down to the
+  table, a view's `WHERE` is checked if it has a check option or a view
+  above it is `CASCADED`; `CASCADED` makes every view below it checked.
+  So `LOCAL` checks its own `WHERE` and those below that have their own
+  option, and a view with no option over one that has one still enforces
+  that one (PG 17: `LOCAL` over a view with no option passed a row its
+  `WHERE` refuses; a view with no option over `dz_cv1` gave 44000 naming
+  `dz_cv1`).
+- **Evaluated after the row is written, before it is returned.** The
+  binder maps each checked `WHERE` to the table's columns through the
+  views, as it maps the inserted columns, and the generated plan evaluates
+  them over the row after `bc_insert`, innermost view first, and before
+  the row's `RETURNING` output is emitted, so no row outside the view is
+  streamed ahead of the error. A result that is false or NULL raises a new
+  constraint code, `BC_C_CHECK_OPTION`, with the view's id; the API
+  reports 44000 `new row violates check option for view "v"`, DETAIL
+  `Failing row contains (…)`: the whole base-table row in the table's
+  column order, defaults filled and NULL written `null`, the hidden row id
+  of a table without a primary key left out (PG 17 gave `(-7, null, 0)`
+  for a view showing two of three columns). After `bc_insert`, because
+  PG 17 checks after the row and its index entries: a row that is both a
+  duplicate and outside the view is 23505 (PG 17), and a `CHECK`
+  constraint (23514) and `NOT NULL` (23502) come first too. The
+  statement's error undoes its writes, as any error does. Foreign keys are
+  not enforced yet; when #657 enforces them, 44000 must still come before
+  23503 (PG 17: a row both outside the view and violating a foreign key
+  gave 44000).
+- **Its cost** is one evaluation of each checked `WHERE` per row written
+  through the view.
+- #678 must apply the same checks when it builds `UPDATE` of a view (PG 17
+  checks an `UPDATE` that moves a row out).
+
+### Differences from PostgreSQL 17
+
+Each was observed on PG 17.12 unless it says otherwise.
+
+| PG 17 | The layer | Why |
+|---|---|---|
+| `search_path` is `"$user", public`, settable with `SET`, shown by `SHOW` | Fixed `public`; `SET search_path`, `SHOW` and `RESET` stay 0A000 (`server/pg_session.cppm:401-428`) | Q1. A path per session would key the shared plan cache by path. `$user` resolves to nothing while no schema has the session user's name. |
+| `DROP SCHEMA public` drops it when empty, or with CASCADE (PG 17's documentation; not run here, to leave the server's `public` alone) | 0A000 | Q2. `public` is implicit; dropping it needs state that says so. |
+| `DROP SCHEMA information_schema` is 2BP01, DETAIL ~100 objects | 0A000 | The layer holds no object there to list. |
+| `GRANT`/`REVOKE … ON SCHEMA public` change its stored ACL (`{pg_database_owner=UC/…,=U/…}`, observed; the grant itself not run here) | 0A000 | Its default ACL is not stored, and nothing is enforced (#653). |
+| `CREATE DOMAIN`, `TYPE` or `PROCEDURE` in `pg_catalog`, and any `CREATE` in `information_schema`, succeed for a superuser; `CREATE TABLE pg_temp.x` makes a temporary table | 0A000 | The layer has no such schema to write in, nor temporary tables. A relation in `pg_catalog` is 42501 in both. |
+| `postgres.s.t` reads `s.t` when `postgres` is the current database | 0A000 for every three-part name | Q5. An error, never another database's object. |
+| `CREATE TRIGGER` as an element | 0A000 | No triggers. |
+| Objects created under `AUTHORIZATION r` are owned by `r` | No owner | Objects have no owner in the layer. |
+| Two sessions' `CREATE SCHEMA s` race: the second waits, then 23505 or 42P06 | The second to commit is 40001 | A DDL never waits for another (`transaction_design.md:477-502`). |
+| `pg_namespace`, `pg_class`, `information_schema.schemata` answer | 42P01 (`information_schema.x`, `pg_catalog.x`) | No catalog views (`pg_session.cppm:449`); an error, not a wrong answer. psql's `\dn` fails as `\dt` does today. |
+| `DROP SCHEMA … CASCADE` lists dropped objects in its order | The same objects; the DETAIL lines may be in another order | A notice, not a result. |
+| `WITH CHECK OPTION` with a subquery in a checked `WHERE` is accepted and enforced | 0A000 at `CREATE VIEW` | As for a `CHECK` constraint's subquery. |
+| `WITH (check_option=…)`, `ALTER VIEW … SET (check_option=…)`, `CREATE OR REPLACE VIEW` | 42601, as view options and `OR REPLACE` are today | Not built; the reloption form would set the same record field. |
+| `WITH CHECK OPTION` also checks `UPDATE` through the view | `UPDATE` of a view is 0A000 (#678) | Not built. |
+
+### Guarantees and CONTRACT rows
+
+`bytecaskdb-sql-layer/CONTRACT.md`; each change is named in the PR that
+makes it. Rows are named by their first words.
+
+| Row | Change |
+|---|---|
+| "Each DDL statement is atomic" | **Widened** to `CREATE SCHEMA` (with its elements, as one statement) and `DROP SCHEMA`. Tests: stage 1b and 2's reopen and commit-hook tests. |
+| "A DDL never waits for another" | **Widened** to `CREATE SCHEMA` with elements in autocommit: a conflict at its internal commit is 40001 with nothing written, not retried. Test: stage 2's "two `CREATE SCHEMA` with elements race; the loser writes nothing". |
+| "A catalog the build cannot decode is refused at open" | **Widened** to the schema record, both name entry forms, the new formats, and a name that is empty or holds a NUL byte. Tests: stage 1b's `catalog_test` refusals. |
+| "CREATE VIEW stores the view in the catalog" | **Widened**: the namespace is per schema, so one name may be a table in `public` and a view in `s`. Tests: stage 1b's functional cases. |
+| "A table or view that a view reads cannot be dropped" | **Widened** by stage 5: `DROP SCHEMA … CASCADE` drops the views that read what it drops. DROP TABLE and DROP VIEW stay RESTRICT only. Before stage 1: the guarantee now also holds for a table read only by an `ORDER BY` subquery (a fix of a broken guarantee; test "catalog: a view's ORDER BY subquery's table cannot be dropped"). |
+| "`Database::open` of a database written by an SQL-layer build from before #780" | Unchanged in substance: a database holding a record this build wrote, any schema included, is refused by a build from before stage 1b. Proved by the older build's own "catalog: a damaged or foreign-format record is refused" and by this build's test that every record and ACL it writes is in the new format. |
+| "A DDL statement given to a `Transaction`" | **Widened** to `CREATE SCHEMA` and `DROP SCHEMA`; a `CREATE SCHEMA`'s elements are steps of the transaction; `DROP SCHEMA` of what an open cursor reads is 55006. Tests: stage 1b and 5's `api_txn_ddl_test` cases. |
+| New, stage 1b | **Added**: qualified names resolve to that schema's object or fail with PG 17's SQLSTATE (3F000, 42P01, 42704, 42883, 42501, 0A000, 42601); an unqualified name resolves in `public`; `CREATE SCHEMA`/`DROP SCHEMA` errors (42P06, 42939, 3F000, 2BP01). Tests: "schemas: a qualified name resolves to that schema's object or fails with PostgreSQL's SQLSTATE", "schemas: CREATE and DROP SCHEMA errors are PostgreSQL's", `tests/functional/cases/postgresql/schemas.yaml`. |
+| New, before stage 1 | **Narrowed**: a type name qualified by anything but `pg_catalog.` is refused (3F000, or 42704 for `public.`), where its last part was read alone. Test: "parser: a qualified type name other than pg_catalog's is refused". |
+| New, stage 2 | **Added**: a view resolves each unqualified name to the object it was created against, whatever is created later. Tests: stage 2's shadowing test, through a reopen. |
+| New, stage 3 | **Added**: a row written through a view with a check option that its checked `WHERE`s do not hold true is 44000 and writes nothing. Tests: stage 3's cases. |
+| New, stage 4 (if built, Q9) | **Added**: schema privileges are stored and survive a reopen; not enforced (#653). Tests: stage 4's reopen and refusal tests. |
+
+The layer's `README.md` drops "schemas" from what is not built
+(`README.md:53`) once stage 2 ships, and `frontend_design.md` loses each
+refusal a stage removes (`:861-863`, `:994-995`).
+
+### Stages of schemas
+
+Each stage is one PR on the previous, with its tests, docs and contract
+rows, built in the order below. None adds an engine durability site
+(`fdatasync`, rename, unlink, a hint file), so `tests/CLAUDE.md`'s fault
+sweeps do not apply; each new record kind gets the catalog's load-refusal
+tests and a reopen test, as views, roles and types did
+(`tests/catalog_test.cpp:263`, `:1020`, `:1133`, `:1315`, `:1483`, `:1648`,
+`:592`), and each new DDL a crash at the commit hook
+(`set_commit_hook_for_testing`, as `api_test.cpp:4531` holds a CTAS
+crash).
+
+**Before stage 1: two fixes of today's bugs, each its own PR.**
+- **Qualified type names.** `parser.cppm:120` keeps a type name's last
+  part; refuse any qualifier but `pg_catalog.` (3F000 `schema "foo" does
+  not exist`, `public.int4` 42704), as PG 17. Test as in the CONTRACT
+  table.
+- **A view's dependencies from the binder's own resolution** (*Views
+  resolve against what they were created against*, rule 1), which closes
+  the `ORDER BY` subquery gap. A GitHub issue records the bug. Tests: a
+  view with a subquery in each position (target, `WHERE`, `GROUP BY`,
+  `HAVING`, `ORDER BY`, a CTE) blocks `DROP TABLE` of what it reads.
+
+**Stage 1a: lookups keyed by (schema, name), schema 0 only.** No change in
+behaviour. A `QualifiedName` type (schema id and name) replaces the bare
+`std::string` of every relation, procedure and type reference: in each
+`Ddl` struct (`DropTableDdl`, `CreateIndexDdl`, `AddColumnDdl`, …), in
+`ast::FromItem` and the other AST relation references (~25 in
+`sql/ast.cppm`), and in the catalog's lookup API, which has no overload by
+name alone. A bare string no longer converts, so every site fails to
+compile until it says which schema (binder 18/13, `plan/search.cppm` 28,
+`api/database.cppm` 5, `catalog.cppm` 6 `.table(`/`.view(` calls).
+Comparisons done on names rather than through lookups are changed to
+compare `QualifiedName`s, each listed in the PR:
+- the foreign key self-reference test `f.table == s.table`
+  (`binder.cppm:6686`), which would otherwise take `CREATE TABLE s.t (…
+  REFERENCES t)` as a self-reference when `t` is `public.t`;
+- `relation_taken` (`api/database.cppm`, CTAS);
+- the load check `cat.table(t.name)` for a type's row-type name;
+- the names `check_in_use` reads from `DropTableDdl`, `CreateIndexDdl`,
+  `AddColumnDdl` and `DropIndexDdl`.
+Tests: the whole suite, unchanged.
+
+**Stage 1b: the schema record and qualified names.** f311_01_01_01.
+- Catalog: the record, its ACL record, both name entry forms, the record
+  formats of *Schema catalog record and name entry keys* (view format 2
+  with all its fields), the name check, the load checks.
+- Parser and binder: qualified names everywhere (*Name resolution with
+  schemas*), the parser's `FROM` changes, the path `public`, `s.d` type
+  names, `CREATE SCHEMA` without elements (with elements 0A000 until
+  stage 2), the system schema names, `AUTHORIZATION`, `DROP SCHEMA [IF
+  EXISTS] list [RESTRICT]` (CASCADE 0A000 until stage 5), `DROP ROLE` of
+  an owner, `CURRENT_SCHEMA` if PR 28 has not landed, the view map (rule 2
+  and 3; every view this build writes stores one). SQLSTATEs 3F000, 42P06,
+  42P09, 42602 and 42501 join `sql/sqlstate.cppm` where missing.
+- Tests: `catalog_test`: the schema record cut at every byte, a later
+  format, trailing bytes, under another id's key, a missing, extra or
+  mistyped schema name entry, a schema without its ACL record, a `00`
+  entry too short, of schema 0 or of a missing schema, a record whose
+  schema disagrees with its entry, a format-7 table whose entry carries a
+  schema, an index entry outside its table's schema, a schema id another
+  object has, an empty name and a NUL in a name (record and entry), a view
+  map naming an object outside `depends_on`, each refused; a format-7
+  table, format-1 view and format-1 ACL still read, as objects of
+  `public`; every record and ACL this build writes is of the new format;
+  every schema DDL survives a reopen; a DDL the engine refuses (a
+  follower) leaves nothing; a crash at the commit hook of `CREATE SCHEMA`
+  and of `CREATE TABLE s.t` leaves neither after reopen, and one after
+  the hook leaves both; a `Catalog` DDL with an empty or NUL name is
+  refused. `api_txn_ddl_test`: `CREATE SCHEMA` in a transaction is
+  invisible to others until commit and gone after rollback; two
+  transactions creating one schema, 40001; a schema dropped in a
+  transaction that then creates a table in it is 3F000. Plan cache: a
+  statement prepared on `t` keeps reading `public.t` after `CREATE TABLE
+  s.t`. A view whose stored map lacks a name its query reads (a forged
+  record that passes load) is XX000 at use, with a mutation that restores
+  a path fallback and must fail it. An allocation-fault sweep over a
+  transaction of `CREATE SCHEMA` and `CREATE TABLE s.t` (as
+  `api_rebind_test.cpp:666`). Functional cases: each error of the tables
+  above, the system schema names, `FROM s.t x, public.t y WHERE x.c =
+  y.c`, 42P09, 42712, the three 42P01 forms, `DROP SCHEMA` lists, the
+  RESTRICT DETAIL rules (several kinds, a view in `public` over a view of
+  the schema, more than 100 objects, two schemas named), a quoted name.
+  `test_sql_machine` gains schema DDL in its model.
+
+**Stage 2: schema elements.** f311_02_01_01, f311_03_01_01,
+f311_05_01_01 and 02.
+- Elements run as a transaction's steps, in PG 17's order, with the path
+  (`s`, `public`); 42P15 joins `sql/sqlstate.cppm`; `IF NOT EXISTS` with
+  elements 0A000; the element forms refused (42601, 42P16, 0A000); a view
+  element's text cut from the statement.
+- Tests: a failing element (each kind) leaves no schema and no element, in
+  autocommit and in a transaction; a crash at the commit hook leaves none
+  after reopen; an index or view written before its table works; a view
+  over a later-written view is 42P01; a view created against `public.t1`
+  as an element still reads `public.t1` after `s.t1` is created, through
+  a reopen, with `public.t1` read from a subquery in each position too;
+  `INSERT` through an element view; an element view whose text cannot be
+  cut out is 0A000 (`SELECT a AS create …`, whose slice fails the
+  tree check); a statement prepared through a view rebinds after `CREATE
+  SCHEMA`; two `CREATE SCHEMA` with elements race and the loser is 40001
+  with nothing written. An allocation-fault sweep over `CREATE SCHEMA`
+  with elements in autocommit, the new internal-transaction path.
+
+**Stage 3: `WITH [LOCAL | CASCADED] CHECK OPTION`.** f311_04_01_01..03.
+- The view record's `check_option` (values 1 and 2 accepted at load from
+  here), the creation check, the plan's checks after `bc_insert` and before
+  `RETURNING`, `BC_C_CHECK_OPTION` in the plan API
+  (`docs/plan_api_design.md`), 44000 joins `sql/sqlstate.cppm`.
+- Tests: each case of *WITH CHECK OPTION* against PG 17 (a violating row,
+  a NULL, CASCADED and LOCAL over views with and without an option, the
+  innermost failing view named, the `Failing row` DETAIL with a hidden and
+  a defaulted column, 23505, 23514 and 23502 before 44000, `INSERT …
+  SELECT`, `INSERT … RETURNING` that emits nothing before the error, a
+  `$n` parameter, the 0A000 and its HINT per refusal, a view of only
+  computed columns, a subquery in a checked `WHERE` below a `CASCADED`
+  view); `INSERT … ON CONFLICT` into a view stays 0A000
+  (`binder.cppm:5612`); the record with an option round-trips, is refused
+  cut and with an option value of 3, and survives a reopen.
+
+**Stage 4: schema privileges** (Q9 recommends deferring it to an issue
+with #653; until then `GRANT`/`REVOKE … ON SCHEMA` and `ON ALL TABLES IN
+SCHEMA` stay 0A000, and the ACL record holds only the default). `GRANT`/`REVOKE … ON SCHEMA`, `ON ALL
+TABLES IN SCHEMA`, `DROP ROLE` of a grantee 2BP01. Tests: each error of
+*Schema owner and privileges* against PG 17; the first `GRANT` writes the
+default out; a `REVOKE` that empties the ACL keeps the record; the ACL
+survives a reopen and is refused with a privilege a schema does not take;
+`DROP SCHEMA` takes it.
+
+**Stage 5: `DROP SCHEMA … CASCADE`** (Q9). The closure over `depends_on`,
+the in-use check, the notices, one batch. Tests: a schema of a table, an
+index, a view, a sequence, a domain, a shell type and a procedure, with a
+view in `public` over its table and a view over that view, all dropped
+with their ACLs and rows (no key under any dropped prefix), and nothing
+else; the NOTICE and RESTRICT's DETAIL list the objects PG 17 lists, which
+exclude indexes; an open cursor over a table of the schema makes it 55006
+in a transaction; a crash at the commit hook leaves all of them after
+reopen; in a transaction, rollback restores them. An allocation-fault
+sweep over a `DROP SCHEMA … CASCADE` of several kinds.
+
+**Recorded and hand-written cases.** The PG 17 oracle records each case in
+its own schema with `search_path` set to it alone
+(`bytecaskdb-sql-layer/tests/functional/record.py:124-130`), so a case
+that names `public` reads PG's real `public`, not the case's. Cases that
+name `public` (`FROM s.t, public.t`, a view element over `public.t1`, the
+`DROP SCHEMA` DETAIL with a view in `public`) are hand-written, each with
+the PG 17 probe that gave its expectation in a comment; every other case
+is recorded. A case that creates a schema gives it a unique name and drops
+it in `teardown`.
+
+### Open questions for the owner
+
+Each has a recommendation; the design above assumes it. Implementation
+choices that were questions before (where the schema id lives, a view
+element's text, stage order) are decided above.
+- **Q1. `search_path`.** (a) Fixed `public` (and the element path).
+  (b) `SET`/`SHOW`/`RESET search_path` per session: the shared plan cache
+  keys by path, `CURRENT_SCHEMA` follows it, a path of no existing schema
+  makes `CREATE` 3F000 "no schema has been selected to create in" (PG 17).
+  (c) (b) with `"$user"`. **Recommended: (a) for these stages, (b) as a
+  follow-up issue**; views already store their resolution, so (b) changes
+  no record.
+- **Q2. `DROP SCHEMA public`.** (a) 0A000. (b) A real, droppable `public`:
+  a record written for it, and a marker once it is dropped, which every
+  existing database would have to gain. **Recommended: (a).**
+- **Q3. CASCADE beyond schemas.** (a) `DROP SCHEMA … CASCADE` only (stage
+  5). (b) Also `DROP TABLE`/`VIEW … CASCADE`, which share the closure.
+  (c) No CASCADE: 0A000. **Recommended: (a)**, (b) as a follow-up issue.
+- **Q4. `AUTHORIZATION`.** (a) Accept and store the owner (stage 1b).
+  (b) Check that the role exists but store nothing; `DROP ROLE` of it then
+  succeeds, a listed difference. (c) 0A000 until objects have owners.
+  **Recommended: (a)**: one `u32`, and `DROP ROLE` keeps PG 17's 2BP01;
+  Q7(a) removes the older-build hazard it would otherwise carry.
+- **Q5. Three-part names.** (a) 0A000 always. (b) Accept the current
+  database's name (the wire's startup `database`; the embedded API has
+  none). **Recommended: (a).**
+- **Q6. Must a build from before schemas keep opening a public-only
+  database this build has written?** (a) No: this build writes every
+  record in its new format, so an older build refuses a database once
+  this build has written any record to it; one this build only read still
+  opens. (b) Yes: write a record in its new format only for an object
+  outside `public`, keep two encodings per kind and a load check that an
+  object has only the one its schema calls for, and prove the older-build
+  rows with a fixture written by an older binary. **Recommended: (a)**:
+  the CONTRACT already promises only that "A database this build writes
+  cannot be opened by a build from before it", and (b) doubles every
+  record kind for a property nobody is promised.
+- **Q7. A schema in an older build.** A build from before stage 1b ignores
+  `01 0D`/`01 0E`, so it would open a database whose schemas are empty and
+  ungranted, and could then `DROP ROLE` a schema's owner, leaving a
+  database this build refuses for an owner that is no role. (a) Every
+  schema has an ACL record, of a format the older build refuses, so it
+  refuses any database holding a schema. (b) Q4(b): store no owner, so
+  there is nothing to break. (c) Have this build accept a missing owner
+  with a fallback. **Recommended: (a)**: the ACL record is the schema's
+  own (PG's `nspacl`), it needs no key outside the ACL namespace, and the
+  older build gives its "later build" refusal.
+- **Q8. Refusing keys under an unknown `0x01` sub-prefix.** `Catalog::load`
+  ignores them today (`catalog.cppm:2155-2350`), so a record kind a later
+  build adds would be ignored, not refused, by this one. Refusing them
+  narrows what opens, and protects future builds, not schemas. (a) A
+  separate PR, before or after these stages, with its own "Narrowed"
+  CONTRACT entry: it spells out the known set exactly (the counters under
+  `01 01` are read by key, not scanned, so a third counter `01 01 03` is
+  refused like an unknown sub-prefix), a test that a fixture with only
+  counters and every current sub-prefix still opens, and one refusal test
+  per unknown byte. (b) Bundle it into stage 1b. (c) Leave it.
+  **Recommended: (a).**
+- **Q9. Scope: stages 4 and 5.** No F311 case needs either. Stage 4 stores
+  privileges nothing enforces (#653); stage 5 is the layer's first CASCADE
+  closure, with a batch bounded only by the schema's size. (a) Build both
+  now, after stage 3. (b) Build stage 5 now, stage 4 as an issue with
+  #653. (c) Both as issues: `GRANT … ON SCHEMA` and `DROP SCHEMA …
+  CASCADE` stay 0A000. **Recommended: (b)**: `DROP SCHEMA … CASCADE` is
+  how schemas are normally dropped (the oracle's own teardown uses it),
+  while stored, unenforced privileges can wait for #653, which needs
+  them; the ACL record exists from stage 1b either way.
+
+### Risks of schemas
+
+- **A lookup that forgets the schema** resolves in `public` silently, a
+  wrong object. Stage 1a removes every name-only lookup and every bare
+  name in a `Ddl` or AST reference, so a missed site does not compile;
+  name comparisons outside lookups are listed and changed there.
+- **The PG 17 oracle runs each case in its own schema** (*Recorded and
+  hand-written cases*): a case that names `public` cannot be recorded
+  faithfully and is hand-written.
+- **Views bound at each use.** The map holds only if the binder records
+  every relation it resolves, in every position; the stage 2 shadowing
+  test reads `public.t1` from each position, and a name the map lacks is
+  an error, never a search.
+- **Type and sequence names bound at each use.** Only relations enter a
+  view's map. When domains become column types, a cast to `::s.d` is
+  allowed in a view, or `nextval('seq')` is built (`frontend_design.md:1006`),
+  an unqualified type or sequence name in a view or a column default would
+  resolve against the path at each use, where PG 17 binds the object at
+  creation. Each must enter the stored resolution when it lands.
+- **Relation names `pg_…` in `public`.** PG 17 searches `pg_catalog`
+  first, so `SELECT * FROM pg_class` reads its catalog even with a
+  `public.pg_class`; the layer reads the user's table. This is true today
+  and unchanged here; a follow-up issue tracks it.
+- **A large `DROP SCHEMA … CASCADE`** is one commit: `del_range` is one
+  append, but the engine removes each key from its key directory by
+  reading it back (`docs/bytecask_design.md:49`), so its latency grows
+  with the rows and index entries of every table it drops, together. It
+  holds the catalog's DDL slot for that time, so every other DDL fails
+  with 40001 while it runs.
+
+### Out of scope for schemas
+
+`SET search_path` (Q1), `ALTER SCHEMA … RENAME` and `OWNER TO`, `ALTER …
+SET SCHEMA`, catalog views (`pg_namespace`, `information_schema`),
+temporary schemas (`pg_temp`), privilege enforcement (#653), `DROP TABLE`
+and `DROP VIEW … CASCADE` (Q3), `UPDATE` and `DELETE` through a view with
+a check option (#678), the view-option and `OR REPLACE` forms of a check
+option, `CREATE TRIGGER` elements, schema-qualified operators and
+functions other than `pg_catalog.`'s, refusing unknown `0x01`
+sub-prefixes (Q8).
+
 ## Tests
 
 `tests/catalog_test.cpp`: the record round-trips; a record cut at every

@@ -1166,6 +1166,446 @@ Made with stage 4. *DDL during an open transaction* keeps what still holds of au
 
 Other documents: catalog_design.md (*DDL*: the namespace `01` invariant and its exceptions, and that a version number identifies only a published catalog; *Compatibility*: the rebind after each DDL and the rule, from stage 0), server_design.md (*A session*, *Simple query*, *Extended query*; item 6 of *What it uses from the embedded API*), session_design.md (*Prepared statements and portals*), cursor_design.md (*Cursors and savepoints*; the 55006 rule with portals and DROP INDEX; cursors holding a `TxnPlan`), CONTRACT.md as listed per stage, and README.md per stage.
 
+## Serializable isolation
+
+Status: **design, approved by the owner on 2026-11-20** with every recommendation under *Owner's questions on serializable isolation*: question 1 (a), 2 (a), 3 (a), 4 (a), 5 (a); question 6 is decided by stage 1's writer-p99 numbers as recommended there. Nothing in this section is built yet. It replaces the *serializable* item under *Isolation*, **Later**, and the "Serializable" half of the *Later* table's "Serializable and read committed" row, once stage 1 ships (*Edits to this document once serializable isolation is built*).
+
+The owner's decision (2026-11-20): SERIALIZABLE is real serializability. Snapshot isolation is never run under the SERIALIZABLE name. The two standing rules apply: do what PostgreSQL does, and never wait. Behaviour observed on PostgreSQL 17.12 is cited as "PG 17"; the probes are cases 1 to 15 and A to D of the fact-gathering run, and the review probes (p1.sql, s1.py to s4.py), kept with the design PR. Code citations are to branch `gustavoamigo/sql-txn-ddl-ctas-implicit`; they are re-checked before the design PR.
+
+The design in one paragraph: a SERIALIZABLE transaction records what it reads, as point keys and key ranges, in a *read set*. The runtime's read calls record it, so every access path is covered without the compiler's help. At commit, a transaction that writes submits its read set as `ensure_unchanged` and `ensure_range_unchanged` guards in the same `WritePlan` as its writes, with one guard on the catalog version. The engine then proves the transaction serializable against every other write (engine `CONTRACT.md`, *Isolation is what the plan guards*). A transaction that writes nothing submits no read guards. It is serialized at its snapshot, which is already consistent. A failed check is 40001 at COMMIT, with nothing written. Nothing new is stored: the read set lives in memory and ends with the transaction.
+
+### Serializable semantics: what a SERIALIZABLE transaction guarantees
+
+- **One serial order.** Take the committed SERIALIZABLE transactions. Each one that wrote is placed at its commit's sequence; each one that wrote nothing is placed at its snapshot's sequence, after the writes it saw. Every such transaction returned the rows, errors and counts it would have returned had all its statements run alone at that point, against every write committed before it. Its writes are the ones that run would have made. The point lies inside the transaction's lifetime (the snapshot is taken at the first statement, and the commit's sequence is assigned before `commit()` returns), so the order respects real time: strict serializability, as the engine states it for guarded plans. SERIALIZABLE runs only on the engine that orders the writes, never on a follower (*Followers*), so this holds wherever SERIALIZABLE runs.
+- **Against every other write.** A SERIALIZABLE transaction is checked against every concurrent commit, whatever that commit's level, autocommit statements and DDL included. PG 17 protects a SERIALIZABLE transaction only against other SERIALIZABLE ones (case C: write skew with a READ COMMITTED transaction commits both). Here the SERIALIZABLE side fails. Transactions at other levels keep snapshot isolation, so a history of them alone can still show write skew, as in PG 17.
+- **A conflict is 40001 at COMMIT.** The commit throws `SerializationFailure`, SQLSTATE 40001, with nothing written, and the transaction ends (`CONTRACT.md`, the 40001 row). The message is chosen on the failure path only (commit step 5):
+  - a key the transaction wrote that changed since its snapshot: "could not serialize access due to concurrent update", no DETAIL and no hint, as PG 17 reports it at SERIALIZABLE (case 11; review probe s4);
+  - otherwise: "could not serialize access due to read/write dependencies among transactions", with PG 17's hint "The transaction might succeed if retried.";
+  - a key the transaction inserted that a concurrent commit took: today's 23505 (*Commit and conflicts*).
+- **An autocommit statement at SERIALIZABLE** is a one-statement SERIALIZABLE transaction. On a conflict it is retried on a fresh snapshot up to three times, as today, each attempt with an empty read set. Nothing between its attempts is the caller's logic, so the retry is invisible. PG 17 does not retry (case 8). Here the statement fails only after its last retry.
+- **What is not promised.** A transaction is not told about a conflict before COMMIT (PG 17 often reports it at the statement: cases 2, 4, 8, 12). A SERIALIZABLE writer that PG 17 would commit may fail here, and a reader PG 17 would cancel commits here (*Differences from PostgreSQL 17 for serializable isolation*). A history PG 17 would refuse is never committed here: one of its transactions fails, though not always the one PG 17 picks.
+
+### Choosing the level: SET, SHOW, BEGIN and the embedded API
+
+**Embedded API.**
+- `TransactionOptions::isolation`, of `enum class Isolation { Snapshot, Serializable }`, defaults to `Snapshot`. `Database::begin` takes it.
+- `TransactionOptions::read_only`, public, defaults to false. A read-only transaction refuses every write, `FOR UPDATE` guard, DDL and `CALL` that writes with 25006, "cannot execute … in a read-only transaction", in the runtime itself, not only in the server. A read-only SERIALIZABLE transaction records nothing (*Read-only serializable transactions*).
+- `ExecutionOptions::isolation`, with the same default, applies to the autocommit statement it is given to.
+- `Transaction::set_isolation(Isolation)` and `Transaction::set_read_only(bool)` are accepted until the transaction's first statement, with no savepoint open. After that they throw with PG 17's 25001 texts, so the server's checks are made before them, never in their place. `set_read_only(true)` later, or under a savepoint, is the server's own business (*The server*): the transaction keeps recording.
+- `Snapshot` keeps its name. It is what READ UNCOMMITTED, READ COMMITTED and REPEATABLE READ run today, and it is not called one of them. A real READ COMMITTED would add a value later.
+- On a follower, `Database::begin` with `Serializable`, and an autocommit statement with it, are 0A000 (*Followers*).
+
+**The server** (`server_design.md`, *Transaction modes*). Each item below matches PG 17 as observed:
+- `BEGIN` / `START TRANSACTION … ISOLATION LEVEL SERIALIZABLE` and `SET [LOCAL | SESSION] TRANSACTION ISOLATION LEVEL SERIALIZABLE` are accepted. The 0A000 at pg_session.cppm:324-325 goes, along with its comment at :304-309.
+- **25001, the isolation level.** A *change* of level is refused after a query ("SET TRANSACTION ISOLATION LEVEL must be called before any query") and inside a savepoint ("SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction"); an unchanged level is accepted in both places. These rules exist today in `SetTransaction` (pg_session.cppm:1180-1186). **They are added to `BEGIN` of an implicit block** (`Control::Begin`, :1138-1150, which today moves `implicit_` into `txn_` and sets the level unchecked): `SELECT 1; BEGIN ISOLATION LEVEL SERIALIZABLE; …` in one simple Query is 25001 "…must be called before any query", as PG 17 reports it.
+- **25001, DEFERRABLE.** `SET TRANSACTION [NOT] DEFERRABLE` inside a savepoint is 25001 "SET TRANSACTION [NOT] DEFERRABLE cannot be called within a subtransaction", even before any query. After a query it is 25001 "SET TRANSACTION [NOT] DEFERRABLE must be called before any query" **even when the value is unchanged**, unlike the isolation level. Today both are accepted and ignored.
+- Outside a block, `SET TRANSACTION …` is WARNING 25P01, "SET TRANSACTION can only be used in transaction blocks", and changes nothing.
+- `READ ONLY`, `READ WRITE` and `[NOT] DEFERRABLE` combine with it. DEFERRABLE never waits (*Read-only serializable transactions*).
+- **The session defaults.** `default_transaction_isolation`, `default_transaction_read_only` and `default_transaction_deferrable` are kept by the session:
+  - set by `SET [SESSION | LOCAL] <name> {= | TO} <value>`, by `SET SESSION CHARACTERISTICS AS TRANSACTION <modes>` (ISOLATION LEVEL, READ ONLY | READ WRITE, [NOT] DEFERRABLE, each setting its default), and by `RESET <name>` and `SET <name> TO DEFAULT`, which restore `read committed`, `off` and `off`;
+  - `RESET ALL` resets the three (and nothing else changes: `client_encoding` is always UTF8);
+  - applied to each later `BEGIN` without that mode, to implicit blocks, and to autocommit statements. `default_transaction_read_only = on` makes a later block and an autocommit write 25006, as in PG 17;
+  - **transactional, as PG 17's GUCs are.** A SET of a default inside a block changes later blocks only; `SHOW transaction_isolation` in the open block is unchanged. The pending value is kept with the block and with each savepoint: ROLLBACK, the ROLLBACK of a failed block, and ROLLBACK TO restore the value from before; COMMIT and RELEASE keep it. Without this, a rolled-back `SET default_transaction_isolation = 'read committed'` would drop the session from SERIALIZABLE to snapshot isolation;
+  - `SET LOCAL <name> …` outside a block is WARNING 25P01 "SET LOCAL can only be used in transaction blocks" and changes nothing; inside one it lasts to the block's end.
+- **Values.** Matched case-insensitively against `serializable`, `repeatable read`, `read committed` and `read uncommitted` (booleans for the other two). A two-word value must be quoted: `SET default_transaction_isolation = repeatable read`, unquoted, is 42601, syntax error at "read". A one-word value may be an identifier. The SET classifier today strips quotes before it splits words (pg_session.cppm:411-422); the new parameters are parsed quote-aware. Any other value is 22023, `invalid value for parameter "default_transaction_isolation": "bogus"`, hint "Available values: serializable, repeatable read, read committed, read uncommitted."
+- **`transaction_isolation`.** `SET [SESSION | LOCAL] transaction_isolation = '…'` inside a block sets the block's level, under the 25001 rules above. Outside a block it is taken and changes nothing (PG 17 prints `SET`). `RESET transaction_isolation` and `SET transaction_isolation TO DEFAULT` are 0A000, `parameter "transaction_isolation" cannot be reset`; inside a block that error aborts it, as any error does.
+- **SHOW.** `SHOW transaction_isolation`, `transaction_read_only`, `transaction_deferrable`, `default_transaction_isolation`, `default_transaction_read_only` and `default_transaction_deferrable` return PG 17's values. Outside a block `SHOW transaction_isolation` reports the session default, not `read committed`. The levels below SERIALIZABLE still run snapshot isolation; `SHOW` reports the level the client chose, not the mechanism.
+- `SET`, `SHOW` and `RESET` of any other parameter stay 0A000, except `client_encoding`. The session field `isolation_` (pg_session.cppm:1848) gains a `Serializable` value. The server passes it to `begin` and to autocommit runs.
+- **Read-only at top level.** `BEGIN … READ ONLY`, or `SET TRANSACTION READ ONLY` before the block's first query with no savepoint open, reaches the transaction as `read_only` (`TransactionOptions::read_only` or `Transaction::set_read_only`). A `READ ONLY` set any other way (after a query, or inside a savepoint, where RELEASE and ROLLBACK TO restore READ WRITE: pg_session.cppm:1106-1124) is enforced by the server's 25006 as today, and the transaction keeps recording.
+
+### Mechanism: the transaction's read set
+
+**Recorded by the runtime, not emitted by the compiler.** The *Isolation* sketch had codegen emit `bc_guard_unchanged` and `bc_guard_range` at every read site. This design moves the recording into the runtime's read calls instead:
+- **No read can be missed.** A plan reads data only through `bc_get`, `bc_exists`, the cursor calls and `bc_count_range` (`plan_api_design.md`, *Model*). If those calls record, no access path and no future operator can forget to.
+- **Only the runtime knows where a cursor stopped.** A `LIMIT`, `EXISTS` or `MIN`/`MAX` closes its cursor early, and codegen does not know the last key it read (*What a read records for phantoms*). Guarding whole ranges from the compiler would add false positives.
+- **Plans stay one per text.** The plan cache, the golden files and the transaction's plan map need no isolation key, and a prepared statement runs at whatever level its transaction has.
+- **The recording is runtime-internal.** Its calls are not plan-visible, and a hand-written plan gets it too.
+
+The sketch's other claim, "a plan's guards are the only text that differs between levels", goes with it. No plan text changes except the codegen header's fixed `isolation: snapshot` (codegen.cppm:3410), which goes since a plan has no level. The choice point's count (codegen.cppm:1085-1113) keeps calling `bc_count_range`, and records like any count. Its range is the first branch's own scan range, which that branch records anyway when it runs, so it adds few false positives.
+
+**One recording reader.** Every data read in the runtime goes through one internal reader that records: it alone holds the context's snapshot and overlay view for reading, and the commit takes the snapshot from it by one release call. A read path that bypasses it does not compile. Each recording site is also protected by a committed mutation (*Stages*, stage 1).
+
+**The switch.** `bc_txn_new` takes the level and the read-only flag. An autocommit context is given the level by `bc_ctx_set_isolation` before `bc_ctx_run`. With `Snapshot`, or a read-only transaction, each read call pays one predictable branch and records nothing. With `Serializable`, each read call records into the read set. A read is recorded whether or not the statement later succeeds (*Read sets across savepoints, failed statements and cursors*).
+
+**Where the read set lives.**
+- In a transaction, on `bc_txn`. It is never cut back by a mark (below).
+- In autocommit, on the context. `bc_ctx_begin` clears it, so each attempt of `bc_execute`'s retry (plan_api.cpp:3976-3987) starts empty and submits only its own reads.
+- An autocommit run whose plan writes no table (`bc_schema_ref::n_written == 0`, bc_plan.h:132) records nothing. The runtime refuses a write to a table the plan's reference does not list as written (`declared_object`, plan_api.cpp:1387-1397), and `bc_ctx_commit` submits nothing for a run without writes (:3253-3261), so its reads could never be submitted: it is serialized at its snapshot.
+- `bc_txn_repin` (plan_api.cpp:3366-3373) returns false when the read set is not empty, so a read made at the old snapshot is never guarded against the new one. Its callers (database.cppm:3270, 3405, 4073) repin only before the first statement has run, when it is always empty; a test asserts that.
+
+**What each read records.**
+
+| Read | Records |
+|---|---|
+| `bc_get`, `bc_exists` (PointGet, COUNT(*) of a point, IndexJoin and NestedLoop inner probes, correlated subqueries) | the key, as a point. A key found absent is recorded the same way: `ensure_unchanged` holds for a key absent at both times and fails for one inserted since. A probe that reads nothing (a NULL key part, a key that does not fit: codegen.cppm:1236-1239) records nothing, since its result depends on no data. |
+| `bc_scan_open` … `bc_scan_next` … close, table or index, either direction | the range the cursor covered (below) on the scanned object's keyspace |
+| `bc_scan_row` on an index (fetching the row) | the row's primary key, as a point. An index range does not see an `UPDATE` of a column the index does not hold, since `bc_update` rewrites only the entries whose columns changed (plan_api.cpp:6486 on). A covering read (codegen.cppm:1590-1606) fetches nothing and records nothing more. |
+| `bc_count_range` (CountRange, KeyAggregates' COUNT(*), the choice point's count) | its `[lo, hi)`. A count stopped at its limit records the whole range as well: a superset is safe, and the engine's count does not name the key it stopped at. |
+| `bc_insert_on_conflict` that skips a row | the arbiter key it found taken, as a point. At SERIALIZABLE the skip is a read, which PG 17 also treats as one: "DO NOTHING skip, then skew" commits at REPEATABLE READ and is 40001 at SERIALIZABLE. This overrides, at SERIALIZABLE only, the owner's 2026-11-19 decision not to guard skipped rows (owner's question 1). |
+| Runtime-internal reads: `pk_free`, `unique_free` (plan_api.cpp:2848, 2919), the old row of `bc_update`, `bc_delete` and `bc_insert_or_existing`, the walk of `bc_del_range` | the key as a point, or the unique prefix or deleted range as a range. Most are written keys that the engine's write-write check already covers. They are recorded anyway: an insert later deleted by the same transaction writes nothing at commit, but its `pk_free` still observed the key free, and the transaction acted on that. The commit drops the points it writes (*Mechanism: the serializable commit*). |
+
+Other paths that read data, outside a plan's read calls:
+- `bc_txn_rows`, the backfill's `RowSource` (plan_api.cpp:3716; database.cppm:3430), reads a table's rows for CREATE INDEX and CTAS in a transaction. It is covered by the backfill's `GuardRange` (plan_api.cpp:3745-3758), which every transaction keeps, and by the catalog-version guard of `commit_ddl`.
+- `Database::row_counts` (database.cppm:1991-1999) counts rows on its own snapshot for the planner. It changes only the plan chosen, never a result, so it records nothing.
+
+Foreign keys are not enforced (`CONTRACT.md`, :243), so there are no foreign-key reads. Procedures, subqueries, joins, aggregates, cursors and CTAS reach the data only through these calls, so they need nothing of their own.
+
+**What a read records for phantoms.** A range covers every key a scan's answer depends on, the absent ones included.
+- A cursor that ran to its end records its whole `[lo, hi)` (or its prefix range for `BC_SCAN_PREFIX`). A range that held no key is recorded all the same, and that is the empty-range phantom: PG 17 case 6, where each transaction counts an empty range and inserts into the other's, is 40001 at the second commit.
+- A forward cursor closed early, after key `k`, records `[lo, k⁺)`. A reverse cursor records `[k, hi)`. `k⁺` is `k` followed by a zero byte. If that would pass `max_key_bytes` (engine `CONTRACT.md`, :73), `k⁺` is `key_successor(k)` (key_codec.cppm:387): the successor of `k`'s longest prefix that does not end in 0xFF, the shortest key above every key that starts with `k`. It is never empty and never past the object's keyspace end, because every key starts with the object's storage-id prefix, which `k` cannot exceed. A point read has no `hi` and needs none. Each choice is a superset.
+- A cursor that returned no key before it closed records nothing.
+- MIN and MAX read past NULL entries to their first value, and those entries are inside the recorded range.
+
+What a range does not cover is any key outside it. The guard is a key range, never the whole table, so scans of disjoint ranges do not conflict. PG 17 does conflict on them (case 6b, a false positive from coarse locks).
+
+**Recording never fails after data was read.** A read that is lost from the read set while the transaction goes on is a silent anomaly: under a savepoint, ROLLBACK TO takes a failed transaction back to open, and its commit would miss the guard. So each recording is reserved before the read returns anything:
+- A point, and a count's range, are recorded (charged and inserted) before the read is made. A charge or allocation that fails fails the call with 54000 or `BC_E_MEMORY` before it has read anything, so nothing depends on the missing entry.
+- A cursor's range is reserved at `bc_scan_open`: its interval node (a node handle, allocated then), and buffers for both bounds, at most `max_key_bytes` each, charged then. When the cursor closes, runs out, or its statement ends, whichever comes first (an error path included), the reserved entry is filled in and merged, which allocates and charges nothing, and the unused part of the charge is released. A failed reservation fails `bc_scan_open` before any key is read.
+- A merge only frees: it erases swallowed points and joined intervals.
+
+**The read set's shape.** The transaction keeps two sorted structures:
+- **points**: a set of keys;
+- **ranges**: an interval set, keyed by `lo`, that merges overlapping and adjacent intervals as they are added. A merge covers exactly the union, never a gap between ranges.
+
+A point inside a recorded range is not kept, and a range that swallows points drops them. Two effects follow:
+- Repeated reads, such as a correlated subquery run per row, nested-loop probes of one key, or a cursor's FETCH replaying its plan from the start (`cursor_design.md`, *Replay*), add nothing after the first time.
+- A transaction's read set grows only with the distinct keys and ranges it read, not with the number of times it read them.
+
+The read set is not part of a statement's pending effects, and the savepoint marks do not record its length or its charge (*Read-set memory and the 54000 bound*).
+
+### Mechanism: the serializable commit
+
+`bc_txn_commit` (plan_api.cpp:3892-3961) builds the `WritePlan` as today: range tombstones, then point writes, then `txn->guards`, then the record guards of written tables. A SERIALIZABLE transaction adds the following. Autocommit's `bc_ctx_commit` (:3246-3293) applies the same steps 1, 2, 4 and 5, with the context's Put, Del and DelRange effects as the final writes and the context's read set.
+
+1. **A transaction whose final writes are empty and that ran no DDL drops its read set** and commits as today: "final writes" is the final overlay (`ov.empty()`), not what its statements did, so a transaction that inserted a key and deleted it again wrote nothing and is a reader placed at its snapshot. With no `FOR UPDATE` guards either it commits nothing; with them it submits a guard-only plan for them alone (*Read-only serializable transactions*). The emptiness test stays `ov.empty() && none_of(guards, counts)` (:3917-3921).
+2. **Otherwise every read range becomes `ensure_range_unchanged`, and every read point becomes `ensure_unchanged`.** The exceptions:
+   - A point the final writes put or delete is skipped, since the engine checks every written key against the snapshot.
+   - A point on which a hand-written `bc_guard_present` or `bc_guard_absent` (plan_api.cpp:6639-6650) already sits is submitted as the one-key range `[k, k⁺)` instead. The engine refuses two different preconditions on one key with `std::logic_error` (engine `docs/transaction_design.md`, :131), and a one-key range guard has `ensure_unchanged`'s meaning. Generated plans never call these two; only hand-written plans need this. `FOR UPDATE`'s `ensure_unchanged` on a read point needs nothing: the engine allows repeating the same guard.
+   - Empty ranges are dropped, as `bc_guard_range` drops them (plan_api.cpp:6630-6637).
+3. **The unique-check prune is unchanged.** `guard_counts` (plan_api.cpp:3569-3571) still drops a unique check's `GuardUniqueRange` whose value the final writes no longer hold, at every level (#537). At SERIALIZABLE the `unique_free` lookup is also in the read set as a range, which step 2 never drops, so a concurrent commit that took the value is a conflict whenever the transaction writes anything.
+4. **The catalog version is guarded.** Every SERIALIZABLE writer adds `ensure_unchanged(catalog_version_key())`, as `commit_ddl` already does for a transaction with DDL (plan_api.cpp:3861). Every published DDL moves it, so a writer placed at its commit never read a table, index, view, procedure, type or sequence whose definition changed since its pin. This covers what a list of objects would miss: `objects_read` names only the tables and indexes a plan touches (codegen.cppm:261; bc_plan.h:131), not the views, procedures and types it was bound through, and is empty for a plan folded to no read (`WHERE false`). A concurrent `CREATE OR REPLACE VIEW v`, a replaced procedure, or a DROP of a table a folded plan named, all commit before this writer, and the writer had used the old definition. It is one point guard per commit. The cost is that any concurrent DDL fails every overlapping SERIALIZABLE writer (owner's question 2; *Differences*).
+5. **On `BC_CONFLICT`** the claim and lock check of *Commit and conflicts* runs unchanged.
+   - A taken insert claim with no changed lock before it is 23505. Anything else is 40001.
+   - A read is not a lock. A transaction that read a key absent and then inserted it, raced by a commit that took the key, gets 23505. PG 17 gives 23505 when the other transaction inserted the key without reading it first, at any level, and 40001 only when both read it absent before inserting (review probes s2, s3). The layer's rule therefore matches PG 17 when the other inserted blindly, and differs when both read first; there PG 17 reports 40001 at the INSERT and the layer 23505 at COMMIT. Owner's question 3 offers the alternative.
+   - When the claims and locks decide nothing, the failure path probes the final overlay's point writes against the snapshot, which the engine leaves usable on a conflict (engine `CONTRACT.md`, :141). A written key changed since the snapshot gives "concurrent update" with no hint; otherwise the read/write message with its hint. This runs only after a conflict, and costs nothing on the success path. The engine does not report which guard failed, so the message cannot name a key, and PG 17 names none either.
+   - The outcome's code is fixed before the message is built, as today.
+
+The read set is copied into the `WritePlan` while it is still held, and each entry, plan slot included, was already counted against the bound from the call that recorded it (*Read-set memory and the 54000 bound*). The commit therefore never fails for memory its statements did not reserve, as *Limits* already promises.
+
+### Read-only serializable transactions
+
+A SERIALIZABLE transaction that wrote nothing is serialized at its snapshot, and needs no guard:
+- Every SERIALIZABLE writer validates its whole read set, and the catalog version, at its commit's sequence. So at any sequence `s`, the committed SERIALIZABLE writers up to `s` have run as if one at a time, in sequence order.
+- A snapshot at `s` holds exactly their effects. A transaction that only reads it is consistent with running after the last of them and before the next.
+
+**PG 17's read-only anomaly** (Fekete et al.; case 4) is caught on the writer's side:
+- T2 reads `ctl`. T1 bumps `ctl` and commits. T3 reads the new `ctl` and finds no receipts. T2 then inserts a receipt for the old `ctl`.
+- In that order (T3 reads the receipts before T2 commits), PG 17 and this design agree: T3 commits, and T2 fails. PG 17 refuses T2's INSERT ("…pivot, during write") or its COMMIT ("…pivot, during commit attempt"); here T2 fails at COMMIT on its guard of `ctl`.
+- If T2 commits before T3 reads the receipts, PG 17 commits T2 and cancels T3 at its SELECT, 40001 "Canceled on conflict out to pivot …, during read", even when T3 is declared READ ONLY (review probe s1). Here T2 fails at COMMIT and T3 commits. Both outcomes are serializable; a different transaction is refused, at a different point (*Differences*).
+
+Consequences:
+- **Readers never fail here.** A read-only SERIALIZABLE transaction commits whatever was committed since its snapshot (cases 3 and 14 commit in PG 17 too). PG 17 sometimes cancels a reader, as above.
+- **Read-only costs only memory, unless declared.** The read set of a transaction that turns out not to write is still recorded until COMMIT, because a later statement could write. A transaction declared read-only before its first statement (`TransactionOptions::read_only`; the server's top-level READ ONLY, *Choosing the level*) records nothing: the runtime refuses its writes with 25006, so its reads can never be submitted. A READ ONLY that can be lifted again (inside a savepoint), or one set after reads were made, does not stop recording: a write before it, or after RELEASE, would commit with reads unguarded.
+- **DEFERRABLE never waits.** PG 17's `SERIALIZABLE READ ONLY DEFERRABLE` waits for a snapshot that no concurrent transaction can invalidate. Every snapshot here is such a snapshot, so DEFERRABLE is taken and nothing waits.
+
+**Followers.** SERIALIZABLE is refused on a follower with 0A000 "cannot use serializable mode in a hot standby", hint "You can use REPEATABLE READ instead.", as PG 17 refuses it on a hot standby (from PG's source and documentation; not run, as no standby is available). The refusal is made at `Database::begin`, at a server `BEGIN` or `SET` naming the level, and again at the statement that takes the snapshot, since the mode can change in between. Reason: a follower's snapshot lags the leader, so a read-only transaction there that began after a leader commit returned may not see it. That is serializable but not strict, and the row promises strict. Owner's question 5 keeps the alternative.
+
+The claim that read-only transactions need no guard is not covered by any check today. Stage 1 adds an Elle run that mixes read-only transactions into the serializable run (*Stages of serializable isolation*).
+
+### Read sets across savepoints, failed statements and cursors
+
+**ROLLBACK TO keeps the reads.** PG 17 keeps the reads of a rolled-back subtransaction (cases 5 and D: a read inside a savepoint, ROLLBACK TO, then skew, is still 40001 at commit). The client saw those rows and may have decided on them. The read set is therefore not cut back at a mark: `bc_txn_rollback_to` truncates `txn->guards`, claims and locks as today, and leaves the read set and its charge alone. RELEASE changes nothing in it.
+
+**A failed statement's reads are kept.** A failed statement discards its pending effects (*Statements inside a transaction*), but its reads are already in the read set, since they are recorded before they are made. The error itself, and any rows sent before it, depended on them. After an abort without marks the transaction can only roll back, so this matters only with savepoints.
+
+**A no-DDL 40001 still ends the transaction.** The serializable check runs at COMMIT, so there is no statement-level 40001 to recover with ROLLBACK TO. PG 17's statement-level 40001 is recoverable that way ("40001 at a statement, then ROLLBACK TO s; SELECT 1; COMMIT" commits). This is listed under the differences.
+
+**Cursors inside the transaction.** A FETCH replays the plan on the pinned snapshot and overlay (`cursor_design.md`, *Replay*). Its reads are recorded like any statement's, while the transaction is open, so a replay that reads other keys than the first run (a plan calling `random()`, below) records those too. The read set's merging keeps identical replays from growing it. A cursor's reads go to the transaction that declared it. A cursor reading through a pin reads the pinned overlay; its recorded keys are still keys of the snapshot's keyspace, and the engine checks them against the transaction's one snapshot.
+
+**WITH HOLD is refused in a SERIALIZABLE transaction that is not read-only**, with 0A000. A hold cursor is replayed lazily after COMMIT on a clone of the snapshot (`cursor_design.md`, *WITH HOLD*), and fetches after COMMIT belong to no transaction, so their reads could not join the commit's check. PG 17 accepts it and runs the query to completion at COMMIT (case 9). In a read-only SERIALIZABLE transaction, or a declared READ ONLY one, WITH HOLD is accepted: the transaction is placed at its snapshot, and the cursor reads that snapshot. Lifting the refusal is a follow-up issue (owner's question 4). Running the query once at DECLARE to record its reads is not enough on its own: a plan that calls `bc_random` (codegen.cppm:1677-1680; `random(lo, hi)` is drawn anew at each evaluation, frontend_design.md:438-440) can read other keys at a later replay. `cursor_design.md`:205's "Randomness … None in a plan" is stale for the same reason, which affects ordinary cursor replay too; that is its own follow-up issue.
+
+### Serializable transactions with DDL
+
+- **Rule A stands.** A SERIALIZABLE transaction binds against its pin and its own DDL, like any other.
+- **A transaction with DDL commits through `commit_ddl`,** which guards `catalog_version_key` (plan_api.cpp:3853-3861). Its read set is added the same way. A backfill's `GuardRange` (plan_api.cpp:3745-3758) is kept as it is: it is a read of the rows the backfill copied. Both DDL row scans emit it (catalog.cppm:1162-1164).
+- **The doom rule** (*Catalog snapshots and isolation levels with DDL*) is unchanged.
+- **CREATE TABLE AS in a transaction** reads through the same calls, so its source query's reads are recorded. PG 17 commits case 10 (read a count, concurrent insert, CREATE TABLE, INSERT…SELECT, COMMIT). Here, if the concurrent insert lands inside a range the transaction read, its commit is 40001: the single-edge false positive below.
+- **Autocommit CREATE TABLE AS at SERIALIZABLE** runs as a one-statement SERIALIZABLE transaction through the transactional CTAS path, so its query's reads are guarded by `commit_ddl`, and it is retried on 40001 as autocommit statements are. Today's autocommit CTAS (database.cppm:2525-2575) reads on one snapshot (`run_auto`) and commits on a later pin (`run_ddl`), with nothing tying the two. At `Snapshot` that path stays.
+- **Other autocommit DDL** is not affected by a session's level: it reads no data except through a backfill, whose guard it already has.
+
+### Read-set memory and the 54000 bound
+
+**Charging.** The read set is held to a bound of its own kind, by a conservative size function in the style of `effect_bytes` (algebra/runtime.cppm):
+- each point: its buffer, the set's node and the plan slot it will take at commit;
+- each range: both bounds, the node and the slot;
+- an open cursor's reservation (*Recording never fails after data was read*) until its close.
+
+**Which bound.**
+- In a transaction, `TransactionOptions::max_bytes`, beside the transaction's other holdings, in a counter of its own, `read_bytes`, that `txn_holds` and the memory cap's reservation include. `read_bytes` is not saved in `TxnMark` and not restored by `txn_restore` or `txn_abort` (plan_api.cpp:1597-1610, 1852-1877), since the reads it counts are not removed. Charged to `held`, a loop of SAVEPOINT, read, ROLLBACK TO would grow the read set while its charge dropped back each time, and the commit's copy could pass both `max_bytes` and the memory cap.
+- In autocommit, the statement's budget, `bc_budget::max_bytes` (`Options::statement_memory_bytes`), as the statement's write set is (*Plan safety*, CONTRACT.md:63).
+
+This is a memory charge only. Recording does no record read and charges no work to the statement's read budget.
+
+**Size.** A point on a 20-byte key is estimated at about 300 B, so about 200 000 distinct point reads would fill the default 64 MiB. Stage 1 measures the figure with `bc_txn_plan_bytes_for_testing` and states the measured value in place of the estimate. A scan costs one range however many rows it reads. Index scans that fetch rows, and join probes, cost one point per distinct row.
+
+**The bound.** The read call that would take the read set past its bound fails its statement with `BC_E_LIMIT`, SQLSTATE 54000, before it reads. Its message names SERIALIZABLE and the bound. As with any failed statement, the transaction aborts. The reads recorded before it stay, so a ROLLBACK TO does not make room among them; it frees only writes. A declared read-only transaction, and an autocommit plan that writes no table, record nothing and never reach it.
+
+**No coarsening.** The design does not turn many point reads on one table into a whole-table range when they grow. PG 17 promotes predicate locks to the relation (`max_pred_locks_per_relation`), but here a whole-table guard costs O(table) at every commit that carries it, possibly inside the engine's writer section (*Read-guard cost at commit and the writer critical section*). That would make one transaction's memory saving every writer's latency. A transaction whose reads do not fit fails with 54000, which is predictable. Coarsening when the bound would be reached is a follow-up issue if a workload hits 54000.
+
+**Range merging is a superset only by construction.** Two ranges merge only when they overlap or touch, so merging never adds a key no scan covered, and never adds a false positive.
+
+### Read-guard cost at commit and the writer critical section
+
+What the engine does with the guards (engine_state.cpp:105-219, 256-321):
+- **A point guard** costs two key-directory lookups: one on the head, one on the snapshot.
+- **A range guard** costs a walk of the head's keys in the range and a walk of the snapshot's, one lookup per key: linear in the keys it covers (bytecask_design.md:150).
+- **Outside the lock.** `prepare_validation` answers both on the caller's thread, outside `write_mu_`, but only for a plan with writes, no range delete, and range guards that are all exact prefix ranges (`is_prefix_range`).
+- **Inside the lock.** Any other plan is checked inside the serial section, as is any plan whose `RecentWrites` probe says a key may have been written since. An index range scan's `[lo, hi)` is rarely a prefix range, so a SERIALIZABLE writer that scanned an index range is checked in the section. That costs O(keys in its ranges) while every other writer waits.
+
+**What this means:**
+- Point reads are cheap.
+- The read set bounds the *number* of ranges, not the keys they cover. Merged ranges can cover a whole index, and statement budgets bound each statement, not the transaction. So one SERIALIZABLE writer that scanned index ranges can hold every writer, snapshot-isolation writers that never opted in included, for a walk of O(keys covered) at its commit. That runs against predictable latency (principle 3).
+- A full scan's range is a table prefix, and it is checked outside the lock unless that table was written since the snapshot.
+
+**Measured before the server exposes it.** Stage 1 adds a writer-latency benchmark: snapshot-isolation writers' p99 alone, and alongside concurrent SERIALIZABLE writers that scanned index ranges of 100, 10 000 and 1 000 000 keys. Owner's question 6 decides, with those numbers, what lands before stage 2 lets any client turn SERIALIZABLE on with `SET`:
+- **(a) A range guard inside one registered prefix**, prepared outside the lock by probing that prefix's hash, as exact prefix ranges are today. The section then walks the range only when the table was written since. This is stage 3.
+- **(b) A bound on what a transaction's in-section ranges may cover:** the keys its cursors stepped over, which they already count, capped per transaction, with 54000 past it.
+- **(c) Sublinear range checks.** A range is unchanged since `s` exactly when no key in it carries a sequence above `s` and its key count equals the snapshot's. With a per-node maximum sequence in the key directory, the check is O(log n). This needs a key-directory design of its own, with `map_bench` and the tests in `tests/CLAUDE.md`. It is a follow-up issue, not a stage.
+
+**Per-read cost in the layer:**
+- At snapshot isolation, one branch per read call. Stage 1's PR shows `sql_layer_bench` before and after, to show that this costs nothing measurable.
+- At SERIALIZABLE, one ordered-set insert per distinct point read: a key copy and O(log n) comparisons. One interval insert per cursor close, into a node reserved at its open.
+
+### Engine guarantees serializable isolation rests on
+
+These are quoted from the engine's `CONTRACT.md`. No engine row changes.
+- **Isolation (:142):** "A key it read and does not write takes part in the check only under `ensure_unchanged`, a range only under `ensure_range_unchanged`: guarded, the plan is strict serializable against every other write: there is one order of all writes that every outcome agrees with, and a write that returned before another began comes first in it; unguarded, it has snapshot isolation." Proved by `scripts/run_isolation_check.py`, nightly, including the range workload, under vacuum, `fdatasync` faults and SIGKILL.
+- **No trace on conflict (:141):** "When a guard, a range guard or the check on the plan's own write set fails, the call returns `nullopt`: nothing is appended, nothing becomes visible, and the plan's snapshot stays usable." So a failed SERIALIZABLE commit writes nothing, and commit step 5's probe can read the snapshot.
+- **Guard-only plans (:144):** "A guard-only plan commits nothing. Its guards are checked like any plan's." This is used only for `FOR UPDATE` guards, since read-only transactions submit no read guards.
+- **Range bounds (:59)** must satisfy `from < to`, or the call throws `std::invalid_argument`. The commit drops empty ranges. **Key size (:73):** `max_key_bytes` applies to every guard bound, which is why `k⁺` falls back as described above.
+- **Followers (:224):** `apply_batch` throws `DbFollowerMode`. SERIALIZABLE is refused on a follower before it gets there.
+- **Semantics** (engine `docs/transaction_design.md`, :230; bytecask_design.md:143, :377):
+  - guards compare sequences, so ABA is caught;
+  - a key absent at both times is unchanged;
+  - a key vacuum relocated is unchanged;
+  - a key inserted and deleted since the snapshot is not a change for a range. That is safe: the transaction's answer for that range is the same at both points.
+- **One precondition per key; repeating the same guard is allowed** (engine `docs/transaction_design.md`, :131): handled by step 2 of the commit.
+
+The engine's `docs/transaction_design.md`:242 still says `ensure_range_unchanged` and phantoms are not part of the isolation check, which contradicts :240 and `CONTRACT.md`:142. It is fixed in a separate small change (follow-up issue).
+
+### Differences from PostgreSQL 17 for serializable isolation
+
+Each row was observed on PG 17.12 except where it says otherwise.
+
+| PG 17 (SERIALIZABLE, SSI) | This layer | Why |
+|---|---|---|
+| A single read-write anti-dependency commits: T reads k1, another commits k1, T writes k2 (cases A, B). Likewise T inserts a unique value and deletes it, a concurrent insert of it waits for T, and both commit (review probe s4). | T's commit is 40001 when T writes anything (in the insert-then-delete case, anything else); nothing waits. | A changed read set is a conflict: no dependency graph is kept. Guard-at-commit refuses every writer whose reads changed: a superset of PG's dangerous structures, never a subset. |
+| SERIALIZABLE is protected only against other SERIALIZABLE transactions; write skew against a READ COMMITTED one commits both (case C). | The SERIALIZABLE side is 40001. | The engine checks guards against every write. |
+| Conflicts surface at the statement where PG detects them ("…during write", cases 2, 4, 8; ON CONFLICT case 12) and are recoverable by ROLLBACK TO a savepoint. | At COMMIT only, and a no-DDL 40001 ends the transaction. | Never wait, and no shared conflict state: the check is the commit's. |
+| A reader, READ ONLY included, can be cancelled at a SELECT once a pivot has committed: "Canceled on conflict out to pivot …, during read" (review probe s1). | Readers never fail. The pivot writer fails at its COMMIT instead, so PG commits it and cancels the reader where this layer does the reverse. | Read-only transactions are placed at their snapshot; only writers are validated. |
+| A failed transaction's DETAIL names a reason code ("Canceled on identification as a pivot, …", "…during read"). | No DETAIL. The message and the hint are PG's. | The engine reports that a guard failed, not which. |
+| Concurrent DDL: CREATE INDEX on a table a SERIALIZABLE writer read runs, and both commit; ACCESS EXCLUSIVE DDL on it (ADD COLUMN, DROP, CREATE OR REPLACE VIEW of a view it read) waits for the writer; DDL on objects it did not use runs, and both commit (review probe s2). | Any DDL committed between a SERIALIZABLE writer's pin and its commit makes the writer's COMMIT 40001; the DDL never waits. | One guard on the catalog version (commit step 4) covers every catalog object; a per-object list can miss one. Owner's question 2. |
+| Disjoint range reads on a small table conflict (case 6b): page- and relation-level predicate locks. | They commit. | Guards are exact key ranges. |
+| Many fine-grained predicate locks are promoted to a relation lock (`max_pred_locks_per_relation`, `max_pred_locks_per_transaction` 64). | No promotion. A read set past its bound is 54000. | A whole-table guard costs O(table) at commit. |
+| `READ ONLY DEFERRABLE` may wait for a safe snapshot. | Never waits; every snapshot is safe. | Writers validate at their commit sequence. |
+| Concurrent insert of a key both transactions read absent first: the second INSERT is 40001 ("pivot, during write"). When the other inserted without reading it, at any level: 23505 (review probes s2, s3). | 23505 at the second commit in both cases. | *Commit and conflicts*' rule; it matches PG when the other inserted blindly. Owner's question 3. |
+| An autocommit statement at SERIALIZABLE that conflicts is 40001 (case 8). | Retried up to three times, then reported. | Autocommit's existing retry; nothing of the caller's runs between attempts. |
+| `DECLARE … WITH HOLD` in a SERIALIZABLE transaction is accepted; its query runs to completion at COMMIT (case 9). | 0A000 in a SERIALIZABLE transaction that is not read-only; accepted in a read-only one. | Fetches after COMMIT belong to no transaction, so their reads could not join the commit's check. Owner's question 4. |
+| `ON CONFLICT DO NOTHING` over a row a concurrent transaction deleted inserts the row. | At SERIALIZABLE, a transaction's commit is 40001, and an autocommit statement's retry inserts the row. At other levels the row is skipped, as today. | The skip is a read at SERIALIZABLE. Owner's question 1. |
+
+### Guarantees and CONTRACT rows serializable isolation changes
+
+`bytecaskdb-sql-layer/CONTRACT.md`, *Transaction isolation* and neighbouring sections. Each change is named in its stage's PR. Every row names tests that `scripts/check_contract_tests.py` can find; the Elle runs are named by the backticked path `bytecaskdb-sql-layer/scripts/sql_isolation_check.py`.
+
+- **Added** (stage 1): a SERIALIZABLE row.
+  - It states the serial order of *Serializable semantics*: a writer at its commit, a reader at its snapshot, real-time order kept, checked against every concurrent write and DDL.
+  - It states that a conflict is 40001 at COMMIT with nothing written, and the two messages.
+  - It states that SERIALIZABLE is 0A000 on a follower.
+  - Proved by the stage 1 tests and the Elle configurations of stages 0 and 1.
+- **Added** (stage 1): "read absent, then insert, raced" is 23505 at commit, at SERIALIZABLE too; PG 17's 40001 when both read first is listed as a known difference.
+- **Added** (stage 1): `TransactionOptions::read_only`: 25006 for each write, guard and DDL, in the runtime.
+- **Extended** (*Plan safety*, :63): the memory row's list of what is charged gains an autocommit statement's read set; the transaction bound gains the read set, which ROLLBACK TO does not release. A read set past its bound is 54000 at the read, never at COMMIT.
+- **Unchanged** (:269): "Statements the compiler generates run under snapshot isolation" stays true at SERIALIZABLE, which is stronger: one snapshot per statement or transaction, write-write conflicts caught.
+- **Removed** (:270): "Serializable conflict detection only with hand-written guards …; generated statements emit none beyond the unique checks'". The SERIALIZABLE row replaces it. Hand-written guards stay valid, and the FOR UPDATE row is unchanged.
+- **Fixed** (:273, stage 0): "Isolation against concurrent histories of many statements is not checked by any tool yet: none" is stale. `bytecaskdb-sql-layer/scripts/sql_isolation_check.py` exists. The row becomes what the tool checks, naming the nightly job.
+- **Narrowed** (the 23505 row, :186): "A unique value a later statement moved or deleted away … guards nothing, and a transaction whose final writes hold no entry under that value commits" holds at `Isolation::Snapshot`. At SERIALIZABLE the unique check's lookup is a read like any other, so a transaction that writes something else gets 40001 when a racing commit took the value.
+- **Narrowed** (the ON CONFLICT DO NOTHING row, :238): at SERIALIZABLE a skipped row's arbiter key is a read, so a concurrent change to it is 40001 at a transaction's commit, and an autocommit retry. The owner's 2026-11-19 decision holds below SERIALIZABLE (owner's question 1).
+- **Extended** (the savepoint row, :184): at SERIALIZABLE, ROLLBACK TO does not undo reads, which still take part in the commit's check, as in PG 17.
+- **Narrowed** (the cursor row, :189): `DECLARE … WITH HOLD` in a SERIALIZABLE transaction that is not read-only is 0A000.
+- **Added** (stage 2, server rows): BEGIN, START TRANSACTION and SET TRANSACTION take ISOLATION LEVEL SERIALIZABLE; the 25001 rules, including BEGIN of an implicit block and DEFERRABLE's two; SET, RESET, SET TO DEFAULT, RESET ALL and SHOW of the three defaults and `transaction_isolation`, `transaction_read_only`, `transaction_deferrable`, and SET SESSION CHARACTERISTICS, with their SQLSTATEs; the defaults are transactional (undone by ROLLBACK and ROLLBACK TO).
+- **Unchanged:** the engine's `CONTRACT.md`. No engine row changes unless stage 3 is taken. Stage 3 changes mechanism only: the guarantee stays *Isolation is what the plan guards*, and `bytecask_design.md` describes the new preparation.
+
+### Stages of serializable isolation
+
+Each stage is one PR that ships on its own. Each updates `bytecaskdb-sql-layer/README.md` (:15 "Snapshot isolation by default" stays true; :64's refusal list loses SERIALIZABLE in stage 2), names its contract changes, and says what it still refuses. No stage changes durability: nothing new is written to disk, and no sync, rename or unlink is added. So no fault sweep over a durability site and no crash test are owed. The commit with guards under `fdatasync` faults and SIGKILL is the engine's, proved by its nightly Elle run. Stages 0 to 2 leave the engine untouched, so `engine_bench` does not apply. Stage 1's PR shows `sql_layer_bench` before and after.
+
+**Stage 0: the SQL isolation check runs nightly, and covers ranges.**
+- Add `--workload range` to `sql_layer_tprocc elle` (harness/main.cpp:171-183, tprocc.cppm:1088-1250): the engine range workload's shape, through SQL, with the same invariant: a range that held a key keeps one (engine `docs/isolation_checking_design.md`, *Range workload*). A transaction runs `SELECT k FROM elle_r WHERE k BETWEEN $1 AND $2`, then deletes one row when it saw two or more, and sometimes inserts first. Under the existing `unguarded` configuration it must break the invariant at least once over the run.
+- The existing `unguarded` configuration (`ElleConfig::Unguarded`, tprocc.cppm:160) already requires write skew as its only anomaly, at least once over the run (`bytecaskdb-sql-layer/scripts/sql_isolation_check.py`:16-18, 52-118), so it shows the checker can see what SERIALIZABLE must prevent. No new configuration.
+- Run `bytecaskdb-sql-layer/scripts/sql_isolation_check.py` in `.github/workflows/isolation-nightly.yml` with a short budget: guarded, unguarded and blind, each over the point and range workloads.
+- Contract: :273 fixed.
+- Docs: `testing_design.md`, *The TPROC-C harness*.
+- No behaviour change.
+
+**Stage 1: SERIALIZABLE transactions and autocommit statements in the embedded API.**
+- **Code:**
+  - `Isolation`, `TransactionOptions::isolation` and `::read_only`, `ExecutionOptions::isolation`, `Transaction::set_isolation` and `::set_read_only`; 25006 in the runtime for a read-only transaction;
+  - the runtime's level switch (`bc_txn_new`, `bc_ctx_set_isolation`), the recording reader, and the read set with its reservations and its `read_bytes` charge;
+  - recording in every read call of the table above;
+  - the commit's steps 1, 2, 4 and 5 in `bc_txn_commit`, `commit_ddl` and `bc_ctx_commit`;
+  - ROLLBACK TO and failed statements keeping reads; `bc_ctx_begin` clearing an autocommit read set; `bc_txn_repin` refusing a non-empty one;
+  - autocommit CTAS at SERIALIZABLE through the transactional path;
+  - WITH HOLD refused with 0A000 in a SERIALIZABLE transaction that is not read-only;
+  - SERIALIZABLE refused on a follower.
+  - The codegen header's fixed `isolation: snapshot` goes; the golden files are regenerated for it.
+- **Tests** (`api_serializable_test.cpp`, "serializable: …"). The interleavings are forced with two handles on one thread, which never wait, and with `bc_ctx_before_commit_for_testing`:
+  - write skew (case 1): the second commit is 40001 with nothing written, and the same at `Snapshot` commits both (case 1b);
+  - the empty-range phantom (case 6) is 40001; disjoint ranges (case 6b) commit;
+  - equality reads on an index, cross updates (case 15); MIN and MAX then cross inserts; COUNT(*) of a point and of a range; EXISTS; LIMIT stopping early, where an insert past the stop point commits and one before it is 40001, forward and reverse;
+  - `k⁺` at `max_key_bytes`, and a key ending in 0xFF bytes, falling back to `key_successor`;
+  - an index scan that fetches rows, raced by an update of a column the index does not hold: 40001; the same through a covering read commits;
+  - a join probe, and a correlated subquery, whose probed key a concurrent commit inserts: 40001; the probe repeated a thousand times charges one point;
+  - a procedure whose body reads, called in a SERIALIZABLE transaction, then skew: 40001;
+  - the read-only anomaly in both orders (case 4; review probe s1): T2 is 40001, T3 commits; read-only transactions whose reads changed commit (cases 3, 14);
+  - a single anti-dependency (cases A, B) is 40001, the documented difference;
+  - a read inside a savepoint, ROLLBACK TO, then skew is 40001 (cases 5, D); a failed statement's reads stay;
+  - SAVEPOINT, read, ROLLBACK TO in a loop: 54000 at a read, never at COMMIT, with `read_bytes` never restored;
+  - ON CONFLICT DO NOTHING: skip then skew is 40001; a concurrently deleted arbiter row makes an autocommit retry insert the row;
+  - a unique value inserted then deleted by a transaction that also writes another key, raced by a commit that took the value: 40001 at SERIALIZABLE, commits at `Snapshot`; the same transaction with no other write commits (a reader);
+  - insert-then-delete of one key and nothing else: no read guard submitted, commits;
+  - concurrent DDL: ADD COLUMN on a table only read, CREATE OR REPLACE VIEW of a view read, a replaced procedure called, a DROP of a table a `WHERE false` plan named, then a write elsewhere: 40001 each; the same transactions read-only commit;
+  - a transaction with DDL and write skew, committing through `commit_ddl`: 40001;
+  - CREATE TABLE AS in a transaction and in autocommit, raced by an insert into its source range (case 10): 40001 in a transaction, a retry in autocommit;
+  - a hand-written `bc_guard_present` on a read key commits without `std::logic_error`;
+  - an autocommit statement that conflicts once commits on retry, submitting exactly one attempt's guards; one that always conflicts reports 40001 after its last attempt;
+  - an autocommit SELECT reading more than the statement budget's worth of points succeeds (it records nothing); a declared read-only transaction doing the same succeeds, and its INSERT is 25006;
+  - `bc_txn_repin` with a non-empty read set returns false;
+  - SERIALIZABLE on a follower: 0A000 at `begin`, at the snapshot-taking statement after a demotion, and for an autocommit statement;
+  - 54000 at the read that passes the bound, and COMMIT never fails for memory;
+  - a cursor's FETCH replays add nothing to the read set;
+  - the two 40001 messages (a written key changed: "concurrent update", no hint; otherwise read/write with hint) and 23505 for a taken insert claim;
+  - a randomized model test of the read set (interval merge, adjacency, points swallowed by ranges, dedupe) against a naive list of keys and ranges.
+- **Mutations:** one patch per recording site, and per reservation, under `bytecaskdb-sql-layer/tests/serializable_mutations/`, each with a `Guarded-by:` header naming the test it must fail, checked by `scripts/check_guarded_by.py` and run in CI (`tests/CLAUDE.md`, *Mutation sets*). Also: a mutation that saves `read_bytes` in `TxnMark`, one that drops the catalog-version guard, and one that skips `bc_ctx_begin`'s clear.
+- **Faults:**
+  - an allocation-failure sweep over a SERIALIZABLE transaction's statements and commit, reaching each read-set transition (new point, new range, merge, swallow, reservation fill), under a savepoint: inject `BC_E_MEMORY` and 54000 at each recording site, ROLLBACK TO, then cause skew; the transaction must never commit;
+  - a read failure injected under each recording call: the statement fails and nothing is recorded as "absent".
+- **Proof:** `sql_layer_tprocc elle --config serializable`, the stage 0 workloads at `Isolation::Serializable` with no `FOR UPDATE`, must be strict-serializable. Its run is in the PR, and it joins the nightly job. It has three runs:
+  - the point workload;
+  - the range workload, which must keep its invariant;
+  - a run with a third of the transactions read-only, which must stay strict-serializable. This is the check of *Read-only serializable transactions*.
+- **Bench:**
+  - `sql_layer_bench` before and after at the default level: the cost of the branch;
+  - new SERIALIZABLE rows: a point-read transaction of ten reads and one write; an index-range transaction reading 100 and 10 000 rows, then writing one; a read-only full scan;
+  - TPROC-C at SERIALIZABLE against REPEATABLE READ with `FOR UPDATE`: throughput and the 40001 rate;
+  - writer p99 at snapshot isolation, alone and alongside SERIALIZABLE index-range writers (*Read-guard cost at commit*). Its numbers decide owner's question 6.
+  None of these is claimed as an improvement.
+- **Contract:** the SERIALIZABLE, 23505-race and `read_only` rows added; :63 extended; :270 removed; :186, :238 narrowed; :184 extended; :189 narrowed.
+- **Docs:** this section's *Edits*; `plan_api_design.md`:1151-1158 and the example at :1222-1250 (recording, not emitted guards); `CONTRACT.md`.
+
+**Stage 2: the server.** Lands after whatever owner's question 6 decides must precede it.
+- **Code:**
+  - ISOLATION LEVEL SERIALIZABLE in BEGIN, START TRANSACTION and SET TRANSACTION;
+  - the 25001 check in BEGIN of an implicit block; DEFERRABLE's two 25001s;
+  - the three transactional session defaults, SET SESSION CHARACTERISTICS, SET/RESET/SET TO DEFAULT/RESET ALL/SHOW as listed, with quote-aware value parsing;
+  - top-level READ ONLY passed to the transaction;
+  - SERIALIZABLE refused on a follower.
+- **Tests:**
+  - wire tests over simple and extended Query for each SQLSTATE and value under *Choosing the level*, including: `SELECT 1; BEGIN ISOLATION LEVEL SERIALIZABLE` in one simple Query (25001); DEFERRABLE in a savepoint and after a query with an unchanged value (25001 each); a SET of a default undone by ROLLBACK, by the ROLLBACK of a failed block and by ROLLBACK TO, and kept by COMMIT and RELEASE; `SET LOCAL` outside a block (25P01); an unquoted two-word value (42601); `RESET transaction_isolation` (0A000); `RESET ALL`; SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY then a write (25006);
+  - `BEGIN ISOLATION LEVEL SERIALIZABLE; SAVEPOINT s; SET TRANSACTION READ ONLY; SELECT …; RELEASE s; INSERT …` raced by skew: 40001 at COMMIT (the read inside the window was recorded);
+  - the write-skew and phantom cases over two connections, comparing outcomes with PG 17 where they agree, and asserting the documented differences;
+  - the proof machine gains `BEGIN ISOLATION LEVEL SERIALIZABLE` rules, compared with PG 17 SERIALIZABLE on one connection, where results agree;
+  - the functional suite: transactions.yaml:107-124 loses `unimplemented`; not_implemented/sqltest.txt:70-71 loses e152_01_01_01 and _02; the conformance table is refreshed from a `--conformance` run.
+- **Contract:** server rows added.
+- **Docs:**
+  - `server_design.md`: the transaction-modes text at :371-389, and SET/SHOW;
+  - `README.md`:64.
+
+**Stage 3 (owner's question 6): range guards inside one registered prefix are prepared outside the engine's writer section.**
+- **Code:** `WritePlan::prepare_validation` accepts a range guard whose bounds share a registered prefix length, and probes that prefix's hash, as it does for exact prefix ranges.
+- **Tests:**
+  - an engine test that plans checked this way commit and conflict exactly as when checked in the section, in the pattern of "checked puts: plans checked by their descents commit and conflict exactly as when checked in a pass of their own";
+  - the engine's Elle range workload rerun;
+  - a mutation that skips the probe fails a test (`tests/CLAUDE.md`).
+- **Bench:** `python3 scripts/run_engine_bench.py` before and after, and stage 1's writer-p99 benchmark before and after, as the evidence the benchmarking rule asks for.
+- **Docs:** `bytecask_design.md`, the validation section (:1764-1773).
+- **Contract:** none changes.
+
+### Owner's questions on serializable isolation
+
+1. **ON CONFLICT DO NOTHING at SERIALIZABLE.** This overrides the owner's 2026-11-19 decision not to guard skipped rows, at SERIALIZABLE only.
+   - (a) A skipped row's arbiter key is a read at SERIALIZABLE (this design): PG 17's outcome ("DO NOTHING skip, then skew" is 40001; a concurrently deleted arbiter row is inserted by the autocommit retry).
+   - (b) Keep the 2026-11-19 rule at every level: a SERIALIZABLE transaction would commit a skip that a serial order contradicts.
+
+   **Recommendation: (a).** (b) relaxes SERIALIZABLE.
+2. **Concurrent DDL against SERIALIZABLE writers.**
+   - (a) One guard on the catalog version (this design): any DDL committed during a writer's life fails it at COMMIT. Covers every catalog object, including views, procedures, types and folded plans.
+   - (b) Guard the catalog records of every object the binder resolved: tables, indexes, views, procedures, types, sequences, including those a plan folds away. Fewer false positives (a CREATE INDEX elsewhere fails nothing), but a dependency the list forgets is a silent anomaly, and CREATE INDEX would still change the read table's record unless that is redesigned.
+
+   **Recommendation: (a)**, with (b) as a follow-up issue if a workload's DDL rate shows the aborts.
+3. **"Read absent, then insert", raced.**
+   - (a) 23505, the existing rule (this design): matches PG 17 when the other transaction inserted blindly; differs when both read first, where PG 17 gives 40001.
+   - (b) 40001 when the taken key or unique prefix lies inside a read the transaction's statements recorded (not the insert's own `pk_free`/`unique_free`): matches PG 17 when both read first, keeps client retry loops working there, and differs when the other inserted blindly.
+
+   **Recommendation: (a).** Neither matches PG 17 in every case, since PG's split depends on whether the *other* transaction read the key, which the layer cannot know; (a) keeps one rule at every level, and 23505 is a correct outcome either way.
+4. **WITH HOLD in a SERIALIZABLE writer.**
+   - (a) Refuse with 0A000 (this design), and open an issue.
+   - (b) Run the query once at DECLARE, recording reads, and refuse WITH HOLD for a plan whose replay is not proven deterministic (`random()`), or check every post-commit replay's reads against the frozen read set and fail the FETCH outside it.
+   - (c) Materialize at COMMIT as PG 17 does. That keeps rows in memory, and a 54000 would land at COMMIT.
+
+   **Recommendation: (a)** until a workload asks for it. The refusal is a gap, marked in the functional suite.
+5. **SERIALIZABLE on a follower.**
+   - (a) Refuse with 0A000 "cannot use serializable mode in a hot standby", hint "You can use REPEATABLE READ instead.", as PG 17 does (this design).
+   - (b) Allow read-only SERIALIZABLE transactions there, and narrow the SERIALIZABLE row: strict on the leader, serializable as of the applied sequence on a follower.
+
+   **Recommendation: (a).** It is PG 17's behaviour, and it keeps one guarantee, strict serializability, wherever SERIALIZABLE runs.
+6. **The writer-section cost of SERIALIZABLE range writers.** Decided with stage 1's writer-p99 numbers, before stage 2 ships:
+   - (a) Stage 3 (prefix-range preparation outside the section) lands before stage 2.
+   - (b) A per-transaction cap on the keys its in-section ranges may cover, 54000 past it, lands with stage 2.
+   - (c) Neither, if the numbers show no measurable effect on snapshot-isolation writers at the sizes benchmarked; stage 3 becomes an issue.
+
+   **Recommendation:** none until the numbers exist. If they show a measurable p99 effect, (a); (b) if (a) does not bound it.
+
+### Risks and scope of serializable isolation
+
+**Risks**
+- **A read path that bypasses the recording** would be a silent anomaly. Mitigations:
+  - one recording reader holds the snapshot, so a bypass does not compile;
+  - one committed mutation per recording site, run in CI;
+  - the Elle runs, point, range and read-only, run nightly.
+- **The read-only argument** rests on every SERIALIZABLE writer validating at its commit sequence, catalog included. Stage 1's read-only Elle run is its check. If it fails, the fallback is to submit read-only transactions' read sets as guard-only plans.
+- **False positives.** Every changed read fails a writer, and any concurrent DDL fails overlapping writers, so abort rates exceed PG 17's under contention. TPROC-C's numbers at SERIALIZABLE are reported in stage 1. A workload that needs fewer aborts uses REPEATABLE READ with `FOR UPDATE`, as today.
+- **Commit latency in the writer section,** O(keys in non-prefix ranges), for every writer while a SERIALIZABLE range writer commits. Measured in stage 1; owner's question 6.
+- **Memory.** About 200 000 distinct point reads (estimate; measured in stage 1) fill the default `max_bytes`. Index scans that fetch many rows and large join probes reach it first. The failure is a clean 54000 at a read.
+- **The successor key at `max_key_bytes`** falls back to a wider range. That is a superset, and only a false positive.
+
+**Out of scope**
+- SSI-style dependency tracking (rw-edges, pivots, SIREAD locks). It would need shared conflict state across transactions, outside the data files, to avoid the single-edge false positive. Not taken.
+- Statement-time 40001 and its ROLLBACK TO recovery.
+- READ COMMITTED as a snapshot per statement, which stays under *Later*.
+- WITH HOLD in a SERIALIZABLE writer, coarsening, sublinear range checks, and token transactions.
+- Engine changes, except stage 3 if taken.
+
+**Follow-up issues**, opened when the design is approved:
+- sublinear range guards in the key directory;
+- stage 3, if question 6 does not schedule it;
+- coarsening of point reads when the bound would be reached;
+- WITH HOLD in a SERIALIZABLE writer (question 4), naming the `random()` replay hazard;
+- the stale "Randomness … None in a plan" row at `cursor_design.md`:205, which affects ordinary cursor replay;
+- per-object catalog guards (question 2), if DDL aborts show;
+- the stale line at engine `docs/transaction_design.md`:242.
+
+### Edits to this document once serializable isolation is built
+
+Made with stage 1 unless noted.
+- *Isolation*: the **Later** item "serializable" is replaced by a pointer here. The sentence "A plan's guards are the only text that differs between levels" goes. The first bullet becomes "Snapshot isolation by default".
+- *Limits*, **Buffer size**: the read set joins "its overlay, its guards, claims and locks", with the note that ROLLBACK TO does not release it; an autocommit statement's read set is charged to its statement budget.
+- *Savepoints*: ROLLBACK TO keeps a SERIALIZABLE transaction's reads.
+- *Commit and conflicts*: at SERIALIZABLE, the read set and the catalog-version guard join the plan; the 40001 message rule; the unique-check prune is unchanged.
+- *Known differences from PostgreSQL*: the ON CONFLICT DO NOTHING row (owner decision 2026-11-19) says it holds below SERIALIZABLE.
+- *Tests*: a "Serializable" item names stage 1's and stage 2's tests and the mutation set. **Concurrency** names the range workload and the serializable configuration.
+- *Later*: "Serializable and read committed" becomes "Read committed".
+- The status line of this section becomes **built**, naming the PRs (stage 2).
+
 ## Later
 
 Not built. Each gets an issue when it is picked up.
