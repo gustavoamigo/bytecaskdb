@@ -35,6 +35,9 @@
 
 import bytecask.sql.tests.fixture;
 
+using bytecask::sql::kPublicSchema;
+using bytecask::sql::QualifiedName;
+
 using namespace sql_test;
 using bytecask::sql::Bytes;
 using bytecask::sql::BytesView;
@@ -50,14 +53,14 @@ constexpr std::uint32_t kW = 4, kWA = 6, kWB = 7;
 constexpr std::uint32_t kId = 0, kA = 1, kB = 2, kC = 3;
 
 void create_w(Fixture& f) {
-  f.ddl(bytecask::sql::CreateTableDdl{"w",
+  f.ddl(bytecask::sql::CreateTableDdl{{kPublicSchema, "w"},
                                       {Fixture::col("id", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
                                        Fixture::col("b", PhysType::Bytes, true), Fixture::col("c", PhysType::I64, false)},
                                       {"id"}});
-  f.ddl(bytecask::sql::CreateIndexDdl{"w_a", "w", {{"a"}}});
-  f.ddl(bytecask::sql::CreateIndexDdl{"w_b", "w", {{"b"}}, true});
-  REQUIRE(f.cat().table("w")->id == kW);
-  REQUIRE(f.cat().index("w_b").second->id == kWB);
+  f.ddl(bytecask::sql::CreateIndexDdl{"w_a", {kPublicSchema, "w"}, {{"a"}}});
+  f.ddl(bytecask::sql::CreateIndexDdl{"w_b", {kPublicSchema, "w"}, {{"b"}}, true});
+  REQUIRE(f.cat().table({kPublicSchema, "w"})->id == kW);
+  REQUIRE(f.cat().index({kPublicSchema, "w_b"}).second->id == kWB);
 }
 
 // INSERT INTO w VALUES ($1, $2, $3, $4)
@@ -570,7 +573,7 @@ TEST_CASE("transactions: a transaction no statement was added to can be pinned a
   CHECK(v == f.cat().version());
   CHECK_FALSE(bc_txn_repin(txn.p));  // the context still reads its snapshot
   bc_ctx_reset(f.cx);  // the statement did not run: nothing was added
-  f.ddl(bytecask::sql::CreateIndexDdl{"w_c", "w", {{"c"}}});
+  f.ddl(bytecask::sql::CreateIndexDdl{"w_c", {kPublicSchema, "w"}, {{"c"}}});
   CHECK(bc_txn_repin(txn.p));
   REQUIRE(stmt(f, txn.p, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("a"), std::int64_t{1}}).error == BC_OK);
   CHECK(bc_txn_catalog_version(txn.p) == v + 1);  // the live catalog, with w_c
@@ -1207,14 +1210,14 @@ auto create_in(bc_txn* txn, const std::string& name) -> std::uint32_t {
   std::vector<bytecask::sql::Catalog::DdlOp> ops;
   auto backfill = false;
   bytecask::sql::CreateTableDdl create;
-  create.name = name;
+  create.name = {kPublicSchema, name};
   create.columns = {Fixture::col("id", PhysType::I64, false)};
   create.pk = {"id"};
   auto rows = bc_txn_rows(txn);
   auto next = cat->next_version(create, *rows, ops, backfill, std::size_t{1} << 20);
   rows.reset();  // its hold on the overlay, before the DDL writes to it
   REQUIRE(next != nullptr);
-  const auto id = next->table(name)->id;
+  const auto id = next->table({kPublicSchema, name})->id;
   REQUIRE(bc_txn_ddl(txn, next, ops, backfill));
   CHECK(bc_txn_has_ddl(txn));
   return id;

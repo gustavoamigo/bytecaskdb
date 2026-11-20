@@ -678,7 +678,8 @@ Status: **design, approved by the owner on 2026-11-20** (#713, option 1),
 with every recommendation under *Open questions for the owner*: Q1 (a),
 Q2 (a), Q3 (a), Q4 (a), Q5 (a), Q6 (a), Q7 (a), Q8 (a), Q9 (b). Built:
 both fixes before stage 1 (qualified type names; a view's dependencies
-from the binder's resolution); no stage is built yet. This section covers what
+from the binder's resolution) and stage 1a (lookups keyed by (schema,
+name), schema 0 only); stages 1b to 5 are not built. This section covers what
 `CREATE SCHEMA` and `DROP SCHEMA` do, how a schema-qualified name resolves,
 the schema record and the change to the name entries' keys, what an older
 build does with a database that holds a schema, `WITH CHECK OPTION` (which
@@ -1351,7 +1352,7 @@ crash).
   are refused at `CREATE VIEW` (42601). Also
   `tests/functional/cases/postgresql/views.yaml`.
 
-**Stage 1a: lookups keyed by (schema, name), schema 0 only.** No change in
+**Stage 1a: lookups keyed by (schema, name), schema 0 only. Built.** No change in
 behaviour. A `QualifiedName` type (schema id and name) replaces the bare
 `std::string` of every relation, procedure and type reference: in each
 `Ddl` struct (`DropTableDdl`, `CreateIndexDdl`, `AddColumnDdl`, …), in
@@ -1370,6 +1371,27 @@ compare `QualifiedName`s, each listed in the PR:
 - the names `check_in_use` reads from `DropTableDdl`, `CreateIndexDdl`,
   `AddColumnDdl` and `DropIndexDdl`.
 Tests: the whole suite, unchanged.
+
+As built: `QualifiedName` is `sql/names.cppm`, an aggregate of `schema` and
+`name` with no constructor from a string, and `kPublicSchema` (0). The
+parser gives every name it reads `kPublicSchema` (`in_public`), since it
+still refuses a qualifier. The catalog's `names_`, `procedure_names_` and
+`type_names_` are keyed by `QualifiedName`, built from the records in
+`public`, since no record holds a schema until stage 1b; an index's own
+name in `CreateIndexDdl` stays a string and is looked up in its table's
+schema. `next_version` refuses a DDL that names any schema but `public`
+(3F000), which only the `Catalog` API can build, rather than write it to
+`public`. Name comparisons that stay bare, as the design says: alias
+erasure in `resolve_aliases`, a column reference's qualifier, and the
+binder's range-entry keys (stage 1b changes the last two). The embedded
+API's `Database::call`, `Transaction::call`, `Transaction::procedure` and
+`table_rows` still take a name as written and resolve it in `public`, the
+session's path; stage 1b decides how they name a schema. Other comparisons
+changed beyond the four above: an updatable view's base table is checked
+by identity (`base == cat.table(name)`) rather than by name; the
+procedure-variable check of a PL/pgSQL body keeps its scope as
+`QualifiedName`s. Test: "catalog: lookups are keyed by (schema, name), and
+a DDL naming a schema but public is refused".
 
 **Stage 1b: the schema record and qualified names.** f311_01_01_01.
 - Catalog: the record, its ACL record, both name entry forms, the record

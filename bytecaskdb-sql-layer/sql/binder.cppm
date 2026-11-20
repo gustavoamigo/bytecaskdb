@@ -2232,7 +2232,7 @@ void check_foreign_key(const CreateTableDdl& t, const ast::ForeignKeyAst& f, con
   }
   auto refs = f.ref_columns;
   if (refs.empty()) {
-    if (ref.pk.empty()) throw SqlError{"there is no primary key for referenced table \"" + f.table + "\"", f.pos, kUndefinedObject};
+    if (ref.pk.empty()) throw SqlError{"there is no primary key for referenced table \"" + f.table.name + "\"", f.pos, kUndefinedObject};
     refs = ref.pk;
   } else {
     for (const auto& c : refs) {
@@ -2249,7 +2249,7 @@ void check_foreign_key(const CreateTableDdl& t, const ast::ForeignKeyAst& f, con
     return key.size() == refs.size() && std::ranges::all_of(refs, [&](const auto& c) { return std::ranges::contains(key, c); });
   };
   if (!same_set(ref.pk) && std::ranges::none_of(ref.unique, same_set)) {
-    throw SqlError{"there is no unique constraint matching given keys for referenced table \"" + f.table + "\"", f.pos,
+    throw SqlError{"there is no unique constraint matching given keys for referenced table \"" + f.table.name + "\"", f.pos,
                    kInvalidForeignKey};
   }
   for (std::size_t i = 0; i < refs.size(); ++i) {
@@ -2260,7 +2260,7 @@ void check_foreign_key(const CreateTableDdl& t, const ast::ForeignKeyAst& f, con
     if (!references_type(*type_of(own, f.columns[i]), *type_of(ref.columns, refs[i]))) {
       auto name = f.name;
       if (name.empty()) {
-        name = t.name;
+        name = t.name.name;
         for (const auto& c : f.columns) name += "_" + c;
         name += "_fkey";
       }
@@ -3395,20 +3395,20 @@ public:
   }
 
   // The table an UPDATE or DELETE writes; a view is refused (#678).
-  auto updated_table(const std::string& name, std::int32_t pos) const -> const Table* {
+  auto updated_table(const QualifiedName& name, std::int32_t pos) const -> const Table* {
     if (cat_.table(name) == nullptr && cat_.view(name) != nullptr) {
-      throw SqlError{"\"" + name + "\" is a view: UPDATE and DELETE through a view are not supported yet (#678)", pos,
+      throw SqlError{"\"" + name.name + "\" is a view: UPDATE and DELETE through a view are not supported yet (#678)", pos,
                      kFeatureNotSupported};
     }
     return table(name, pos);
   }
 
-  auto table(const std::string& name, std::int32_t pos) const -> const Table* {
+  auto table(const QualifiedName& name, std::int32_t pos) const -> const Table* {
     const auto* t = cat_.table(name);
     if (t == nullptr && cat_.view(name) != nullptr) {
-      throw SqlError{"\"" + name + "\" is a view, not a table", pos, kFeatureNotSupported};
+      throw SqlError{"\"" + name.name + "\" is a view, not a table", pos, kFeatureNotSupported};
     }
-    if (t == nullptr) throw SqlError{"relation \"" + name + "\" does not exist", pos, kUndefinedTable};
+    if (t == nullptr) throw SqlError{"relation \"" + name.name + "\" does not exist", pos, kUndefinedTable};
     return t;
   }
 
@@ -4455,7 +4455,7 @@ public:
     auto t = std::make_unique<Table>();
     t->id = Table::kDerivedBase + bytecask::sql::narrow<std::uint32_t>(derived_.size());
     if (!Table::derived(t->id)) not_yet("a statement of so many derived relations", pos);
-    t->name = item.table;
+    t->name = item.table.name;
     for (std::size_t i = 0; i < outs.size(); ++i) {
       const auto& e = outs[i].expr;
       if (e.type.kind == SqlKind::Numeric) {
@@ -5892,7 +5892,7 @@ private:
     // Each view of the chain down to the table, its own definition as
     // written, as PostgreSQL rewrites them one at a time: its shape, then the
     // columns filled, each mapped to its relation's, which must differ.
-    std::string table;
+    QualifiedName table{};
     for (const auto* at = &v; at != nullptr;) {
       auto parsed = ast::parse(at->definition);
       const auto& q = std::get<ast::CreateView>(parsed).query;
@@ -5933,7 +5933,7 @@ private:
     // RETURNING reads the view's body, merged down to the table.
     const auto& item = b.select.from.at(0);
     const auto* base = cat_.table(item.table);
-    if (base == nullptr || base->name != table) throw std::logic_error{"an updatable view's body reads another table"};
+    if (base == nullptr || base != cat_.table(table)) throw std::logic_error{"an updatable view's body reads another table"};
     auto visible = relation_columns(table);
     auto base_name = [&](const std::string& column) {
       auto at = std::ranges::find(item.column_aliases, column);
@@ -5978,7 +5978,7 @@ private:
   }
 
   // A table's or view's columns, in order; a table's hidden row id is none.
-  auto relation_columns(const std::string& name) const -> std::vector<std::string> {
+  auto relation_columns(const QualifiedName& name) const -> std::vector<std::string> {
     if (const auto* w = cat_.view(name)) return w->columns;
     std::vector<std::string> out;
     for (const auto& c : cat_.table(name)->columns) {
@@ -6079,7 +6079,7 @@ private:
 
   // Whether a view is named in the SET values or WHERE, subqueries included;
   // if so they are rewritten in place.
-  auto rewrite(const std::string& table, std::vector<ast::Assignment>& set, std::vector<ast::Compare>& where) -> bool {
+  auto rewrite(const QualifiedName& table, std::vector<ast::Assignment>& set, std::vector<ast::Compare>& where) -> bool {
     auto found = false;
     ast::FromItem written;
     written.table = table;
@@ -6168,7 +6168,7 @@ private:
   // cuts rows (DISTINCT, LIMIT).
   void merge_one(ast::Select& s, const ViewBody& v) {
     const auto& view = v.select;
-    const auto& name = s.from[0].table;
+    const auto& name = s.from[0].table.name;  // unaliased: what a column is qualified by
     if (view.set) not_yet("reading a view defined with a set operation", s.from[0].pos);
     auto grouped = aggregated(view);
     if (view.distinct || view.limit || view.offset != 0) not_yet("a view defined with DISTINCT, LIMIT or OFFSET", s.from[0].pos);
@@ -6344,8 +6344,8 @@ private:
   };
   void merge_two(ast::Select& s, const View* left, const View* right) {
     const auto& join = s.from[1];
-    Side sides[2]{{s.from[0].table, left != nullptr ? &body(*left) : nullptr, cat_.table(s.from[0].table)},
-                  {join.table, right != nullptr ? &body(*right) : nullptr, cat_.table(join.table)}};
+    Side sides[2]{{s.from[0].table.name, left != nullptr ? &body(*left) : nullptr, cat_.table(s.from[0].table)},
+                  {join.table.name, right != nullptr ? &body(*right) : nullptr, cat_.table(join.table)}};
     for (auto i = 0; i < 2; ++i) {
       if (sides[i].view == nullptr && sides[i].table == nullptr) {
         throw SqlError{"relation \"" + sides[i].name + "\" does not exist", s.from[static_cast<std::size_t>(i)].pos, kUndefinedTable};
@@ -6407,7 +6407,7 @@ private:
         throw SqlError{"column \"" + ref.column + "\" does not exist", ref.pos, kUndefinedColumn};
       }
       auto item = ast::clone(side.view->select.targets[static_cast<std::size_t>(at - side.view->names.begin())]);
-      qualify(item, side.view->select.from[0].table);
+      qualify(item, side.view->select.from[0].table.name);
       return item;
     };
     std::vector<ast::Expr> targets;
@@ -6437,7 +6437,7 @@ private:
       if (!merged_view(side)) continue;
       for (const auto& c : side.view->select.where) {
         s.where.push_back(ast::clone(c));
-        qualify(s.where.back(), side.view->select.from[0].table);
+        qualify(s.where.back(), side.view->select.from[0].table.name);
       }
     }
     for (std::size_t i = 0; i < 2; ++i) {
@@ -6555,7 +6555,7 @@ private:
     if (c.subquery) names(*c.subquery);
   }
 
-  auto has_column(const std::string& relation, const std::string& name) const -> bool {
+  auto has_column(const QualifiedName& relation, const std::string& name) const -> bool {
     if (const auto* t = cat_.table(relation)) return t->column(name) != nullptr;
     if (const auto* v = cat_.view(relation)) return std::ranges::find(v->columns, name) != v->columns.end();
     return false;
@@ -6618,7 +6618,7 @@ private:
 
   const Table& frame_;
   const Catalog& cat_;
-  std::set<std::string> scope_;
+  std::set<QualifiedName> scope_;  // the relations a statement names
   std::vector<std::uint32_t> vars_;  // $k+1's variable
 };
 
@@ -6660,7 +6660,7 @@ auto assignable(SqlType from, SqlType to) -> bool {
 
 auto call_arguments(const ast::Call& call, const Procedure& proc) -> std::vector<Datum> {
   if (call.args.size() != proc.args.size()) {
-    throw SqlError{"procedure " + call.procedure + " takes " + std::to_string(proc.args.size()) + " arguments, not " +
+    throw SqlError{"procedure " + call.procedure.name + " takes " + std::to_string(proc.args.size()) + " arguments, not " +
                        std::to_string(call.args.size()),
                    call.pos, kUndefinedFunction};
   }
@@ -6903,14 +6903,14 @@ auto bind(const ast::Statement& stmt, const Catalog& cat, std::span<const SqlTyp
   auto own = param_count(target);
   std::uint32_t key_params = 0;
   std::uint32_t positioned_table = 0;
-  auto positioned = [&](const std::string& table, const std::string& cursor, std::int32_t pos) {
+  auto positioned = [&](const QualifiedName& table, const std::string& cursor, std::int32_t pos) {
     if (cursor.empty()) return;
     const auto* t = cat.table(table);
     if (t == nullptr) {
       if (cat.view(table) != nullptr) {
-        throw SqlError{"\"" + table + "\" is a view: UPDATE and DELETE through a view are not supported yet (#678)", pos, kFeatureNotSupported};
+        throw SqlError{"\"" + table.name + "\" is a view: UPDATE and DELETE through a view are not supported yet (#678)", pos, kFeatureNotSupported};
       }
-      throw SqlError{"relation \"" + table + "\" does not exist", pos, kUndefinedTable};
+      throw SqlError{"relation \"" + table.name + "\" does not exist", pos, kUndefinedTable};
     }
     key_params = bytecask::sql::narrow<std::uint32_t>(t->pk_col_ids.size());
     positioned_table = t->storage_id();
@@ -6941,7 +6941,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat, std::span<const SqlTyp
             // Bound over the table as it will be, to refuse what a write could not
             // evaluate; the text is what the catalog keeps.
             Table scratch;
-            scratch.name = s.table;
+            scratch.name = s.table.name;
             for (const auto& c : out.columns) {
               scratch.columns.push_back({scratch.next_col_id++, c.name, c.sql, phys_type(c.sql), c.nullable, c.default_value});
             }
@@ -6952,7 +6952,8 @@ auto bind(const ast::Statement& stmt, const Catalog& cat, std::span<const SqlTyp
             }
           }
           for (const auto& f : s.foreign_keys) {
-            // A table may reference itself, by the keys it is created with.
+            // A table may reference itself, by the keys it is created with:
+            // the same (schema, name), never the name alone.
             check_foreign_key(out, f, f.table == s.table ? referenced_keys(out) : referenced_keys(*b.table(f.table, f.pos)));
           }
           return {Ddl{std::move(out)}, s.pos};

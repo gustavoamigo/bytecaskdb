@@ -343,7 +343,7 @@ NB_MODULE(bytecask_sql, m) {
           "_engine_rows",
           [](sql::Database& db, std::string_view table) {
             auto cat = db.catalog();  // held: t points into it
-            const auto* t = cat->table(table);
+            const auto* t = cat->table(sql::QualifiedName{sql::kPublicSchema, std::string{table}});  // the session's path
             if (t == nullptr) throw std::invalid_argument("relation \"" + std::string{table} + "\" does not exist");
             auto snap = db.engine_for_testing().snapshot();
             nb::list rows;

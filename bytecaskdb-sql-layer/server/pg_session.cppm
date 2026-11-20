@@ -1792,13 +1792,13 @@ private:
     // The procedure as the block's catalog has it, in a block.
     std::shared_ptr<const Procedure> def;
     if (auto* b = block()) {
-      def = b->procedure(c.call->procedure);
+      def = b->procedure(c.call->procedure.name);  // the embedded API resolves a name in public
     } else {
       auto cat = db_.catalog();
       if (const auto* d = cat->procedure(c.call->procedure)) def = {cat, d};
     }
     if (def == nullptr) {
-      throw ast::SqlError{"procedure " + c.call->procedure + " does not exist", c.call->pos, kUndefinedFunction};
+      throw ast::SqlError{"procedure " + c.call->procedure.name + " does not exist", c.call->pos, kUndefinedFunction};
     }
     auto args = bound::call_arguments(*c.call, *def);
     auto opts = run_options();

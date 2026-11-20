@@ -32,6 +32,9 @@
 
 import bytecask.sql.tests.fixture;
 
+using bytecask::sql::kPublicSchema;
+using bytecask::sql::QualifiedName;
+
 using namespace sql_test;
 using bytecask::sql::Bytes;
 using bytecask::sql::kKeyEntryBytes;
@@ -503,11 +506,11 @@ TEST_CASE("sort key: bc_sort_key_col keys a DOUBLE PRECISION column as float8 an
           "[sql][algebra][sort_key][structures]") {
   Fixture f;
   using bytecask::sql::CreateTableDdl;
-  f.ddl(CreateTableDdl{"m",
+  f.ddl(CreateTableDdl{{kPublicSchema, "m"},
                        {Fixture::col("id", PhysType::I64, false), Fixture::col("d", PhysType::F64, true),
                         Fixture::col("b", PhysType::Bool, true)},
                        {"id"}});
-  const auto m = std::int64_t{f.cat().table("m")->id};
+  const auto m = std::int64_t{f.cat().table({kPublicSchema, "m"})->id};
   const auto negative_nan = std::bit_cast<double>(std::uint64_t{0xFFF8'0000'0000'0000});
   for (const auto& [id, d, b] : std::vector<std::tuple<std::int64_t, bc_value, bc_value>>{
            {1, f64(-0.0), boolean(true)},

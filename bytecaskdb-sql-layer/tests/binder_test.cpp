@@ -485,8 +485,8 @@ TEST_CASE("binder: SELECT DISTINCT is a GROUP BY of the selected columns", "[sql
   const auto& agg = get<logical::Aggregate>(b);
   CHECK(agg.grouped);
   REQUIRE(agg.group_by.size() == 2);
-  CHECK(agg.group_by[0].col.col == f.cat().table("t")->column("qty")->id);
-  CHECK(agg.group_by[1].col.col == f.cat().table("t")->column("name")->id);
+  CHECK(agg.group_by[0].col.col == f.cat().table({kPublicSchema, "t"})->column("qty")->id);
+  CHECK(agg.group_by[1].col.col == f.cat().table({kPublicSchema, "t"})->column("name")->id);
   CHECK(agg.aggs.size() == 2);
   CHECK(find<logical::Sort>(root(b)) != nullptr);
   CHECK(find<logical::Limit>(root(b)) != nullptr);
@@ -518,8 +518,8 @@ TEST_CASE("binder: JOIN USING and NATURAL JOIN compare their columns by =, each 
     }
     return "bound";
   };
-  const auto* l = cat.table("l");
-  const auto* r = cat.table("r");
+  const auto* l = cat.table({kPublicSchema, "l"});
+  const auto* r = cat.table({kPublicSchema, "r"});
   auto equals = [&](std::string_view sql) {
     auto b = bind_sql(cat, sql);
     std::vector<std::string> out;
@@ -560,8 +560,8 @@ TEST_CASE("binder: LEFT and RIGHT JOIN are a left outer join, ON its predicate, 
     f.ddl(std::get<Ddl>(bind_sql(f.cat(), ddl).stmt));
   }
   const auto& cat = f.cat();
-  const auto* l = cat.table("l");
-  const auto* r = cat.table("r");
+  const auto* l = cat.table({kPublicSchema, "l"});
+  const auto* r = cat.table({kPublicSchema, "r"});
   auto table_of = [](const logical::Node& n) { return std::get<logical::Get>(n.op).table->id; };
   for (auto sql : {"SELECT l.k, r.j FROM l LEFT JOIN r ON l.a = r.a AND r.j > 1 WHERE l.k < 5",
                    "SELECT l.k, r.j FROM r RIGHT JOIN l ON l.a = r.a AND r.j > 1 WHERE l.k < 5"}) {
@@ -590,8 +590,8 @@ TEST_CASE("binder: FULL JOIN is a UNION ALL of a left outer join and an anti-joi
     f.ddl(std::get<Ddl>(bind_sql(f.cat(), ddl).stmt));
   }
   const auto& cat = f.cat();
-  const auto* l = cat.table("l");
-  const auto* r = cat.table("r");
+  const auto* l = cat.table({kPublicSchema, "l"});
+  const auto* r = cat.table({kPublicSchema, "r"});
   auto table_of = [](const logical::Node& n) { return std::get<logical::Get>(n.op).table->id; };
   auto b = bind_sql(cat, "SELECT l.k, r.j FROM l FULL JOIN r ON l.a = r.a AND r.j > 1 WHERE l.k < 5 OR r.j < 5");
   const auto& set = std::get<logical::SetOp>(root(b).op);
@@ -627,7 +627,7 @@ TEST_CASE("binder: FULL JOIN is a UNION ALL of a left outer join and an anti-joi
   auto hidden_key = bind_sql(cat, "SELECT n.a FROM n FULL JOIN r ON n.a = r.a");
   const auto& anti = find<logical::Filter>(*std::get<logical::SetOp>(root(hidden_key).op).right)->conjuncts;
   REQUIRE(anti.size() == 1);
-  CHECK(cat.table("n")->column(anti[0].args.at(0).col.col)->hidden);
+  CHECK(cat.table({kPublicSchema, "n"})->column(anti[0].args.at(0).col.col)->hidden);
 
   // ORDER BY a selected item is its column; any other key is a hidden
   // column of both arms, after the returned ones. A LIMIT is the root's.
@@ -748,7 +748,7 @@ TEST_CASE("binder: a correlated subquery takes each outer column as an argument 
     }
     return "bound";
   };
-  const auto* t = cat.table("t");
+  const auto* t = cat.table({kPublicSchema, "t"});
   const auto qty = logical::column_of(t->id, *t->column("qty")).col;
   const auto id = logical::column_of(t->id, *t->column("id")).col;
   // e061_13_01_01: k = qty compares k with a parameter the outer row sets,
@@ -1073,7 +1073,7 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
     CHECK_FALSE(s.columns[1].desc);
   }
   CHECK(std::get<DropTableDdl>(std::get<Ddl>(bind_sql(cat, "DROP TABLE IF EXISTS t").stmt)).if_exists);
-  CHECK(std::get<DropIndexDdl>(std::get<Ddl>(bind_sql(cat, "DROP INDEX t_by_name").stmt)).name == "t_by_name");
+  CHECK(std::get<DropIndexDdl>(std::get<Ddl>(bind_sql(cat, "DROP INDEX t_by_name").stmt)).name == QualifiedName{kPublicSchema, "t_by_name"});
   {
     auto b = bind_sql(cat, "ALTER TABLE t ADD COLUMN z INTEGER NOT NULL DEFAULT 3");
     auto& s = std::get<AddColumnDdl>(std::get<Ddl>(b.stmt));
@@ -1268,7 +1268,7 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
     CHECK(std::get<logical::Get>(bound_join.right->op).table->name == "u");
     const auto& targets = get<logical::Project>(b).exprs;
     REQUIRE(targets.size() == 2);
-    CHECK(targets[1].expr.col.table == cat.table("u")->id);
+    CHECK(targets[1].expr.col.table == cat.table({kPublicSchema, "u"})->id);
     // The WHERE is one Filter above the join; pushdown moves each conjunct
     // onto the table it reads.
     CHECK(get<logical::Filter>(b).conjuncts.size() == 2);
@@ -1323,12 +1323,12 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
     logical::rewrite(root(b));
     const auto& on = get<logical::Join>(b).predicate;
     REQUIRE(on.size() == 1);  // pushed down onto the join: it reads both tables
-    CHECK(on[0].args[0].col.table == cat.table("u")->id);
+    CHECK(on[0].args[0].col.table == cat.table({kPublicSchema, "u"})->id);
     CHECK(on[0].args[0].col.col == 1u);  // u.qty
     CHECK(on[0].args[1].col.col == 0u);  // t.id
     const auto& a = get<logical::Aggregate>(b).aggs.at(0).expr;
     CHECK(a.distinct);
-    CHECK(a.args.at(0).col.table == cat.table("u")->id);
+    CHECK(a.args.at(0).col.table == cat.table({kPublicSchema, "u"})->id);
   }
   CHECK(rejected(cat, "SELECT id FROM t, u WHERE id = k AND qty = id").first ==
         "column reference \"qty\" is ambiguous");
@@ -1344,8 +1344,8 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
     const auto& on = get<logical::Join>(b).predicate;
     REQUIRE(on.size() == 1);
     CHECK(on[0].op == ast::Compare::Op::Lt);
-    CHECK(on[0].args[0].col.table == cat.table("t")->id);
-    CHECK(on[0].args[1].col.table == cat.table("u")->id);
+    CHECK(on[0].args[0].col.table == cat.table({kPublicSchema, "t"})->id);
+    CHECK(on[0].args[1].col.table == cat.table({kPublicSchema, "u"})->id);
   }
   CHECK(rejected(cat, "SELECT id FROM t, u WHERE name = k").first == "operator does not exist: bytea = bigint");
   CHECK(rejected(cat, "SELECT id FROM t, u WHERE k > name").first == "operator does not exist: bigint > bytea");
@@ -1356,7 +1356,7 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
   {
     // A range refusal names the table of the column the parameter is compared with.
     auto b = bind_sql(cat, "SELECT name FROM t, u WHERE id = $1 AND k = $2");
-    CHECK(b.param_table == std::vector<std::uint32_t>{cat.table("t")->id, cat.table("u")->id});
+    CHECK(b.param_table == std::vector<std::uint32_t>{cat.table({kPublicSchema, "t"})->id, cat.table({kPublicSchema, "u"})->id});
   }
   //                       0         1         2
   //                       0123456789012345678901234567890
@@ -1699,7 +1699,7 @@ TEST_CASE("binder: a chain of joins is a left-deep tree, each ON bound against t
     const auto& top = get<logical::Join>(b);
     CHECK(top.left_outer);
     REQUIRE(top.predicate.size() == 1);
-    CHECK(top.predicate[0].args[0].col.table == cat.table("u")->id);
+    CHECK(top.predicate[0].args[0].col.table == cat.table({kPublicSchema, "u"})->id);
     CHECK(top.predicate[0].args[0].col.nullable);  // read from a row the first join may have NULL-extended
     CHECK_FALSE(top.predicate[0].args[1].col.nullable);  // w's own row
     const auto& first = std::get<logical::Join>(top.left->op);
@@ -1722,7 +1722,7 @@ TEST_CASE("binder: a chain of joins is a left-deep tree, each ON bound against t
     REQUIRE(first.predicate.size() == 1);
     REQUIRE(get<logical::Filter>(b).conjuncts.size() == 1);
     const auto& later = get<logical::Filter>(b).conjuncts[0];
-    CHECK(later.args[0].col.table == cat.table("t")->id);
+    CHECK(later.args[0].col.table == cat.table({kPublicSchema, "t"})->id);
     CHECK(later.args[0].col.nullable);  // t.id, a primary key, read from a row the RIGHT JOIN may NULL-extend
     CHECK_FALSE(later.args[1].col.nullable);
   }
@@ -1761,7 +1761,7 @@ TEST_CASE("binder: a chain of joins is a left-deep tree, each ON bound against t
     CHECK(selected[0].expr.col.nullable);
     const auto& where = std::get<logical::Filter>(std::get<logical::Project>(root(b).op).input->op);
     REQUIRE(where.conjuncts.size() == 1);
-    CHECK(where.conjuncts[0].args[0].col.table == cat.table("w")->id);
+    CHECK(where.conjuncts[0].args[0].col.table == cat.table({kPublicSchema, "w"})->id);
   }
   {
     // After a comma, the group is the RIGHT JOIN's own join: the comma's item is joined to its rows by no ON.
@@ -1784,11 +1784,11 @@ TEST_CASE("binder: a chain of joins is a left-deep tree, each ON bound against t
     auto b = bind_sql(cat, "SELECT qty FROM t JOIN u USING (qty) JOIN w USING (qty)");
     const auto& on = get<logical::Filter>(b).conjuncts;
     REQUIRE(on.size() == 2);
-    CHECK(on[0].args[0].col.table == cat.table("t")->id);
-    CHECK(on[0].args[1].col.table == cat.table("u")->id);
-    CHECK(on[1].args[0].col.table == cat.table("t")->id);
-    CHECK(on[1].args[1].col.table == cat.table("w")->id);
-    CHECK(get<logical::Project>(b).exprs[0].expr.col.table == cat.table("t")->id);
+    CHECK(on[0].args[0].col.table == cat.table({kPublicSchema, "t"})->id);
+    CHECK(on[0].args[1].col.table == cat.table({kPublicSchema, "u"})->id);
+    CHECK(on[1].args[0].col.table == cat.table({kPublicSchema, "t"})->id);
+    CHECK(on[1].args[1].col.table == cat.table({kPublicSchema, "w"})->id);
+    CHECK(get<logical::Project>(b).exprs[0].expr.col.table == cat.table({kPublicSchema, "t"})->id);
     // SELECT * gives qty once, first, then each table's other columns.
     std::vector<std::string> names;
     for (const auto& o : get<logical::Project>(bind_sql(cat, "SELECT * FROM t JOIN u USING (qty) JOIN w USING (qty)")).exprs) {
@@ -1861,7 +1861,7 @@ TEST_CASE("binder: an ON in parentheses or after a comma reads its own join's ta
 TEST_CASE("binder: a table read twice is two instances of it, named as the query names them", "[sql][binder][join]") {
   sql_test::Fixture f;
   const auto& cat = f.cat();
-  const auto id = cat.table("t")->id;
+  const auto id = cat.table({kPublicSchema, "t"})->id;
   auto b = bind_sql(cat, "SELECT x.id, y.qty FROM t x JOIN t y ON x.id = y.qty");
   const auto& join = get<logical::Join>(b);
   const auto& left = *std::get<logical::Get>(join.left->op).table;
@@ -2059,7 +2059,7 @@ TEST_CASE("binder: a grouped view joined with a table is a derived relation, its
           "[sql][binder][view]") {
   sql_test::Fixture f;
   auto view = [&](std::string_view sql) { f.ddl(std::get<Ddl>(bind_sql(f.cat(), sql).stmt)); };
-  f.ddl(CreateTableDdl{"u", {sql_test::Fixture::col("id", PhysType::I64, false), sql_test::Fixture::col("qty", PhysType::I64, true)}, {"id"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"}, {sql_test::Fixture::col("id", PhysType::I64, false), sql_test::Fixture::col("qty", PhysType::I64, true)}, {"id"}});
   view("CREATE VIEW h AS SELECT qty, COUNT(*) AS n FROM t GROUP BY qty");
   view("CREATE VIEW p AS SELECT id, qty FROM u");
   view("CREATE VIEW hh AS SELECT n, COUNT(*) AS m FROM h GROUP BY n");
@@ -2090,7 +2090,7 @@ TEST_CASE("binder: a grouped view joined with a table is a derived relation, its
     const auto* g = std::get_if<logical::Get>(&j.left->op);
     REQUIRE(g != nullptr);
     CHECK(g->table->id >= Table::kInstanceBase);
-    CHECK(g->table->source == cat.table("t")->id);
+    CHECK(g->table->source == cat.table({kPublicSchema, "t"})->id);
     CHECK(std::get_if<logical::Derived>(&j.right->op) != nullptr);
   }
   CHECK(state("SELECT * FROM h NATURAL JOIN u") == "bound");

@@ -240,7 +240,7 @@ namespace {
 void seed_wide(Database& db, std::int64_t rows) {
   db.execute("CREATE TABLE wide (id BIGINT PRIMARY KEY, n BIGINT NOT NULL, pad VARCHAR(100) NOT NULL)");
   auto cat = db.live_catalog_for_testing().current();
-  const auto* t = cat->table("wide");
+  const auto* t = cat->table({kPublicSchema, "wide"});
   REQUIRE(t != nullptr);
   const auto part = cat->key_layout(t->id)->parts[0];
   const auto pad = sql_test::bytes(std::string(64, 'p'));
@@ -939,7 +939,7 @@ TEST_CASE("embedded API: a DDL whose commit may have reached the engine is 08007
     // Whichever way it went, it went whole: the index is there or not, the
     // rows as they were. A failure that was not 08007 wrote nothing.
     auto db = Database::open(dir.path());
-    auto has_index = db->catalog()->index("acct_bal").second != nullptr;
+    auto has_index = db->catalog()->index({kPublicSchema, "acct_bal"}).second != nullptr;
     if (outcome == "ran") CHECK(has_index);
     if (outcome == "failed") CHECK_FALSE(has_index);
     for (std::int64_t i = 0; i < 8; ++i) CHECK(balance(*db, i) == i);
@@ -982,9 +982,9 @@ TEST_CASE("embedded API: a DDL that finds another in progress is 40001 at once",
   db->execute("CREATE INDEX acct_bal ON acct (bal)");
   db->live_catalog_for_testing().set_commit_hook_for_testing({});
   CHECK(second == "40001");
-  CHECK(db->catalog()->table("other") == nullptr);
+  CHECK(db->catalog()->table({kPublicSchema, "other"}) == nullptr);
   db->execute("CREATE TABLE other (id BIGINT PRIMARY KEY)");  // retried, it runs
-  CHECK(db->catalog()->table("other") != nullptr);
+  CHECK(db->catalog()->table({kPublicSchema, "other"}) != nullptr);
 }
 
 TEST_CASE("embedded API: a DDL racing a transaction's first statement re-pins it, not 40001", "[sql][api][txn]") {
@@ -1021,8 +1021,8 @@ TEST_CASE("embedded API: a key a transaction inserted that a concurrent commit t
   db->execute("CREATE TABLE person (id BIGINT PRIMARY KEY, email VARCHAR(32))");
   db->execute("CREATE UNIQUE INDEX person_email ON person (email)");
   auto cat = db->catalog();
-  auto acct_id = cat->table("acct")->id;
-  auto email_id = cat->index("person_email").second->id;
+  auto acct_id = cat->table({kPublicSchema, "acct"})->id;
+  auto email_id = cat->index({kPublicSchema, "person_email"}).second->id;
   auto duplicate = [](Transaction& t) -> std::optional<ConstraintDetail> {
     try {
       (void)t.commit();
@@ -1234,9 +1234,9 @@ TEST_CASE("embedded API: CREATE TABLE AS given to a transaction commits with its
   auto t = db->begin();
   t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{10}});
   CHECK(t.execute("CREATE TABLE copy AS SELECT id FROM acct").affected == 1);
-  CHECK(db->catalog()->table("copy") == nullptr);
+  CHECK(db->catalog()->table({kPublicSchema, "copy"}) == nullptr);
   t.rollback();
-  CHECK(db->catalog()->table("copy") == nullptr);
+  CHECK(db->catalog()->table({kPublicSchema, "copy"}) == nullptr);
   CHECK(balance(*db, 1) == std::nullopt);
   // SELECT … INTO is CREATE TABLE AS too.
   auto u = db->begin();

@@ -80,16 +80,21 @@ auto str(const PgQuery__Node* n) -> std::string {
   return n->string->sval;
 }
 
+// An unqualified name of a relation, procedure or type: of public, the one
+// schema of a session's path (docs/catalog_design.md, *Name resolution with
+// schemas*). A qualified name is refused until stage 1b.
+auto in_public(std::string name) -> QualifiedName { return QualifiedName{kPublicSchema, std::move(name)}; }
+
 // A FROM item's table; its alias, if any, is read by select().
-auto from_relation(const PgQuery__RangeVar* rv) -> std::string {
+auto from_relation(const PgQuery__RangeVar* rv) -> QualifiedName {
   if (rv == nullptr) reject("expected a table", -1);
   if (!empty(rv->schemaname)) {
     reject("schema-qualified names are not supported", rv->location);
   }
-  return rv->relname;
+  return in_public(rv->relname);
 }
 
-auto relation(const PgQuery__RangeVar* rv) -> std::string {
+auto relation(const PgQuery__RangeVar* rv) -> QualifiedName {
   auto name = from_relation(rv);
   if (rv->alias != nullptr) reject("table aliases are not supported", rv->location);
   return name;
@@ -179,7 +184,7 @@ auto call_clock(std::string_view name) -> const char* {
   return nullptr;
 }
 auto literal(const PgQuery__Node* n) -> Literal;
-auto object_name(const PgQuery__Node* n, std::int32_t pos) -> std::string;
+auto object_name(const PgQuery__Node* n, std::int32_t pos) -> QualifiedName;
 // `into_taken`: the statement's INTO, which its caller reads (SELECT … INTO);
 // an INTO anywhere else is refused. `nested`: a subquery's, whose
 // qualifiers may name the query around it (resolve_aliases).
@@ -816,7 +821,7 @@ auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos, std::string_vi
   // second (42P16), so two column-level ones are not a composite key.
   auto primary_keys = 0;
   auto at_most_one = [&](std::int32_t location) {
-    if (primary_keys > 1) reject("multiple primary keys for table \"" + t.table + "\" are not allowed", location,
+    if (primary_keys > 1) reject("multiple primary keys for table \"" + t.table.name + "\" are not allowed", location,
                                   kInvalidTableDefinition);
   };
   auto elements = [&] {
@@ -906,7 +911,7 @@ auto drop_procedure(const PgQuery__DropStmt* s, std::int32_t pos) -> DropProcedu
   if (obj->node_case != PG_QUERY__NODE__NODE_OBJECT_WITH_ARGS) reject("expected a procedure", pos);
   const auto* o = obj->object_with_args;
   if (o->n_objname != 1) reject("schema-qualified names are not supported", pos);
-  DropProcedure out{str(o->objname[0]), std::nullopt, s->missing_ok != 0, pos};
+  DropProcedure out{in_public(str(o->objname[0])), std::nullopt, s->missing_ok != 0, pos};
   if (o->args_unspecified) return out;
   out.arg_types.emplace();
   for (std::size_t i = 0; i < o->n_objargs; ++i) {
@@ -932,7 +937,7 @@ auto drop(const PgQuery__DropStmt* s, std::int32_t pos) -> Statement {
   if (obj->node_case != PG_QUERY__NODE__NODE_LIST || obj->list->n_items != 1) {
     reject("schema-qualified names are not supported", pos);
   }
-  auto name = str(obj->list->items[0]);
+  auto name = in_public(str(obj->list->items[0]));
   if (s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_TABLE) return DropTable{name, s->missing_ok != 0, pos};
   if (s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_INDEX) return DropIndex{name, s->missing_ok != 0, pos};
   if (s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_VIEW) return DropView{name, s->missing_ok != 0, pos};
@@ -972,18 +977,18 @@ auto drop_role(const PgQuery__DropRoleStmt* s, std::int32_t pos) -> DropRole {
 
 // One name a DROP or a GRANT lists: a relation's RangeVar, a type's TypeName
 // or a list of one String. A qualified one is refused.
-auto object_name(const PgQuery__Node* n, std::int32_t pos) -> std::string {
+auto object_name(const PgQuery__Node* n, std::int32_t pos) -> QualifiedName {
   if (n->node_case == PG_QUERY__NODE__NODE_RANGE_VAR) {
     const auto* rv = n->range_var;
     if (!empty(rv->schemaname) || !empty(rv->catalogname)) reject("schema-qualified names are not supported", rv->location);
-    return rv->relname;
+    return in_public(rv->relname);
   }
   if (n->node_case == PG_QUERY__NODE__NODE_TYPE_NAME) {
     const auto* tn = n->type_name;
     if (tn->n_names != 1 || tn->n_typmods != 0 || tn->n_array_bounds != 0) reject("a type is named by one name", tn->location);
-    return str(tn->names[0]);
+    return in_public(str(tn->names[0]));
   }
-  if (n->node_case == PG_QUERY__NODE__NODE_LIST && n->list->n_items == 1) return str(n->list->items[0]);
+  if (n->node_case == PG_QUERY__NODE__NODE_LIST && n->list->n_items == 1) return in_public(str(n->list->items[0]));
   reject("schema-qualified names are not supported", pos);
 }
 
@@ -993,7 +998,7 @@ auto create_domain(const PgQuery__CreateDomainStmt* s, std::int32_t pos) -> Crea
   if (s->n_constraints != 0 || s->coll_clause != nullptr) {
     reject("a domain's DEFAULT, NOT NULL, CHECK and COLLATE are not supported yet", pos);
   }
-  return CreateDomain{str(s->domainname[0]), type_ast(s->type_name, "", pos), pos};
+  return CreateDomain{in_public(str(s->domainname[0])), type_ast(s->type_name, "", pos), pos};
 }
 
 // CREATE SEQUENCE [IF NOT EXISTS] name, with no option yet.
@@ -1002,7 +1007,7 @@ auto create_sequence(const PgQuery__CreateSeqStmt* s, std::int32_t pos) -> Creat
   if (!empty(rv->schemaname) || !empty(rv->catalogname)) reject("schema-qualified names are not supported", rv->location);
   if (!empty(rv->relpersistence) && rv->relpersistence[0] != 'p') reject("CREATE TEMPORARY SEQUENCE is not supported", pos);
   if (s->n_options != 0 || s->for_identity) reject("a sequence's options are not supported yet", pos);
-  return CreateSequence{rv->relname, s->if_not_exists != 0, pos};
+  return CreateSequence{in_public(rv->relname), s->if_not_exists != 0, pos};
 }
 
 // CREATE TYPE name, the shell type; any other CREATE TYPE, and the other
@@ -1013,7 +1018,7 @@ auto create_type(const PgQuery__DefineStmt* s, std::int32_t pos) -> CreateType {
     reject("only CREATE TYPE name, a shell type, is supported", pos);
   }
   if (s->n_defnames != 1) reject("schema-qualified names are not supported", pos);
-  return CreateType{str(s->defnames[0]), pos};
+  return CreateType{in_public(str(s->defnames[0])), pos};
 }
 
 // GRANT and REVOKE of privileges ON [TABLE] names TO or FROM roles or
@@ -1066,7 +1071,7 @@ auto create_procedure(const PgQuery__CreateFunctionStmt* s, std::int32_t pos, co
     -> CreateProcedure {
   if (!s->is_procedure) reject("CREATE FUNCTION is not supported yet: only procedures are", pos, kFeatureNotSupported);
   if (s->n_funcname != 1) reject("schema-qualified names are not supported", pos);
-  CreateProcedure out{str(s->funcname[0]), s->replace != 0, {}, pos, {}};
+  CreateProcedure out{in_public(str(s->funcname[0])), s->replace != 0, {}, pos, {}};
   for (std::size_t i = 0; i < s->n_parameters; ++i) {
     if (s->parameters[i]->node_case != PG_QUERY__NODE__NODE_FUNCTION_PARAMETER) reject("expected an argument", pos);
     const auto* p = s->parameters[i]->function_parameter;
@@ -1474,7 +1479,7 @@ void check_on_scope(const Select& sel, const Names& n) {
 void resolve_aliases(Select& sel, bool nested) {
   Names names;
   for (const auto& item : sel.from) {
-    names.tables.push_back(item.table);
+    names.tables.push_back(item.table.name);  // bare: alias erasure compares names alone
     names.aliases.push_back(item.alias);
     if (!item.using_alias.empty()) names.joins.push_back(item.using_alias);
   }
@@ -1604,7 +1609,7 @@ auto from_item(const PgQuery__RangeVar* rv) -> FromItem {
   FromItem item;
   item.table = from_relation(rv);
   item.alias = table_alias(rv);
-  item.written = item.alias.empty() ? item.table : item.alias;
+  item.written = item.alias.empty() ? item.table.name : item.alias;
   item.column_aliases = table_column_aliases(rv);
   item.pos = rv->location;
   return item;
@@ -1975,7 +1980,7 @@ auto parse_call(std::string_view sql) -> std::optional<Call> {
   auto pos = res.tree->stmts[0]->stmt_location;
   if (f == nullptr || f->n_funcname != 1) reject("schema-qualified names are not supported", pos);
   if (f->func_variadic) reject("VARIADIC is not supported", f->location, kFeatureNotSupported);
-  Call out{str(f->funcname[0]), {}, pos};
+  Call out{in_public(str(f->funcname[0])), {}, pos};
   for (std::size_t i = 0; i < f->n_args; ++i) {
     if (f->args[i]->node_case == PG_QUERY__NODE__NODE_NAMED_ARG_EXPR) {
       reject("named arguments are not supported", f->location, kFeatureNotSupported);

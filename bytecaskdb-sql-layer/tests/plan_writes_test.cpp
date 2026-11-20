@@ -31,6 +31,9 @@
 
 import bytecask.sql.tests.fixture;
 
+using bytecask::sql::kPublicSchema;
+using bytecask::sql::QualifiedName;
+
 using namespace sql_test;
 using bytecask::sql::Bytes;
 using bytecask::sql::BytesView;
@@ -47,15 +50,15 @@ constexpr std::uint32_t kW = 4, kWA = 6, kWB = 7, kWCA = 8;
 constexpr std::uint32_t kId = 0, kA = 1, kB = 2, kC = 3;
 
 void create_w(Fixture& f) {
-  f.ddl(bytecask::sql::CreateTableDdl{"w",
+  f.ddl(bytecask::sql::CreateTableDdl{{kPublicSchema, "w"},
                                       {Fixture::col("id", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
                                        Fixture::col("b", PhysType::Bytes, true), Fixture::col("c", PhysType::I64, false)},
                                       {"id"}});
-  f.ddl(bytecask::sql::CreateIndexDdl{"w_a", "w", {{"a"}}});
-  f.ddl(bytecask::sql::CreateIndexDdl{"w_b", "w", {{"b", true}}, true});
-  f.ddl(bytecask::sql::CreateIndexDdl{"w_ca", "w", {{"c"}, {"a", true}}, true});
-  REQUIRE(f.cat().table("w")->id == kW);
-  REQUIRE(f.cat().index("w_ca").second->id == kWCA);
+  f.ddl(bytecask::sql::CreateIndexDdl{"w_a", {kPublicSchema, "w"}, {{"a"}}});
+  f.ddl(bytecask::sql::CreateIndexDdl{"w_b", {kPublicSchema, "w"}, {{"b", true}}, true});
+  f.ddl(bytecask::sql::CreateIndexDdl{"w_ca", {kPublicSchema, "w"}, {{"c"}, {"a", true}}, true});
+  REQUIRE(f.cat().table({kPublicSchema, "w"})->id == kW);
+  REQUIRE(f.cat().index({kPublicSchema, "w_ca"}).second->id == kWCA);
 }
 
 int g_runs = 0;
@@ -349,15 +352,15 @@ TEST_CASE("plan writes: a NOT NULL column null at bc_row_end is BC_C_NOT_NULL, n
   // NOT NULL DEFAULT 7: a row whose d is NULL at bc_row_end is refused, so
   // nothing is written; a plan that does not name the column writes the
   // default.
-  f.ddl(bytecask::sql::AddColumnDdl{"w", {"d", {bytecask::sql::SqlKind::BigInt}, false, std::int64_t{7}}});
-  g_col_d = f.cat().table("w")->column("d")->id;
+  f.ddl(bytecask::sql::AddColumnDdl{{kPublicSchema, "w"}, {"d", {bytecask::sql::SqlKind::BigInt}, false, std::int64_t{7}}});
+  g_col_d = f.cat().table({kPublicSchema, "w"})->column("d")->id;
   refused(insert_with_d, {std::int64_t{4}, std::int64_t{0}, bc_value{}}, not_null_on(kW), "\"d\"");
   REQUIRE(run(f, insert_w, {std::int64_t{5}, std::int64_t{5}, bytes("z"), std::int64_t{0}}) == BC_COMMITTED);
   Bytes key, row;
   bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kW);
   bytecask::sql::key_put_i64(key, 5, {PhysType::I64});
   REQUIRE(f.db->get({}, key, row));
-  const auto& w = *f.cat().table("w");
+  const auto& w = *f.cat().table({kPublicSchema, "w"});
   CHECK(bytecask::sql::row_column(row, *w.layout.find(g_col_d)).i64() == 7);
   CHECK(run(f, insert_with_d, {std::int64_t{6}, std::int64_t{0}, std::int64_t{8}}) == BC_COMMITTED);
   CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 4);
@@ -401,10 +404,10 @@ TEST_CASE("plan writes: an index created after the plan was compiled is maintain
     return bc_execute(f.cx, plan, &ref, &ps, {}, false, 3);
   };
   REQUIRE(exec(insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("a"), std::int64_t{7}}) == BC_COMMITTED);
-  f.ddl(bytecask::sql::CreateIndexDdl{"w_c", "w", {{"c", true}}});
-  f.ddl(bytecask::sql::CreateIndexDdl{"w_bu", "w", {{"b"}, {"c"}}, true});
-  const auto w_c = f.cat().index("w_c").second->id;
-  const auto w_bu = f.cat().index("w_bu").second->id;
+  f.ddl(bytecask::sql::CreateIndexDdl{"w_c", {kPublicSchema, "w"}, {{"c", true}}});
+  f.ddl(bytecask::sql::CreateIndexDdl{"w_bu", {kPublicSchema, "w"}, {{"b"}, {"c"}}, true});
+  const auto w_c = f.cat().index({kPublicSchema, "w_c"}).second->id;
+  const auto w_bu = f.cat().index({kPublicSchema, "w_bu"}).second->id;
   CHECK(exec(insert_w, {std::int64_t{2}, std::int64_t{2}, bytes("b"), std::int64_t{7}}) == BC_COMMITTED);
   CHECK(exec(update_w, {std::int64_t{1}, std::int64_t{3}, std::int64_t{1}, bytes("c"), std::int64_t{8}}) ==
         BC_COMMITTED);
@@ -414,7 +417,7 @@ TEST_CASE("plan writes: an index created after the plan was compiled is maintain
   // writes.
   CHECK(exec(insert_w, {std::int64_t{9}, std::int64_t{9}, bytes("b"), std::int64_t{9}}) == BC_FAILED);
   CHECK(bc_error_detail(f.cx) == unique_on(kWB));
-  f.ddl(bytecask::sql::DropIndexDdl{"w_b"});
+  f.ddl(bytecask::sql::DropIndexDdl{{kPublicSchema, "w_b"}});
   CHECK(exec(insert_w, {std::int64_t{9}, std::int64_t{9}, bytes("b"), std::int64_t{7}}) == BC_FAILED);
   CHECK(bc_error_detail(f.cx) == unique_on(w_bu));
   CHECK(exec(delete_w, {std::int64_t{2}}) == BC_COMMITTED);
@@ -498,8 +501,8 @@ TEST_CASE("plan writes: the reads each read and write is charged", "[sql][algebr
   CHECK(run(f, del_all_t, {}, {.max_reads = kN + 2, .max_bytes = 0, .deadline_ns = 0}) == BC_COMMITTED);
   CHECK(count_entries(*f.db, bytecask::sql::kNsRow, 1) == 0);
   CHECK(count_entries(*f.db, bytecask::sql::kNsIndex, 3) == 0);
-  f.ddl(bytecask::sql::CreateTableDdl{"plain", {Fixture::col("k", PhysType::I64, false)}, {"k"}});
-  g_plain = f.cat().table("plain")->id;
+  f.ddl(bytecask::sql::CreateTableDdl{{kPublicSchema, "plain"}, {Fixture::col("k", PhysType::I64, false)}, {"k"}});
+  g_plain = f.cat().table({kPublicSchema, "plain"})->id;
   for (std::int64_t i = 1; i <= kN; ++i) REQUIRE(run(f, insert_plain, {i}) == BC_COMMITTED);
   CHECK(run(f, del_all_plain, {}, {.max_reads = 1, .max_bytes = 0, .deadline_ns = 0}) == BC_COMMITTED);  // 0 reads; 0 means no budget
   CHECK(count_entries(*f.db, bytecask::sql::kNsRow, g_plain) == 0);
@@ -851,7 +854,7 @@ TEST_CASE("plan writes: concurrent read-then-write of one row loses no update", 
   bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, 1);
   bytecask::sql::key_put_i64(key, 1, {PhysType::I64});
   REQUIRE(f.db->get({}, key, row));
-  const auto& t = *f.cat().table("t");
+  const auto& t = *f.cat().table({kPublicSchema, "t"});
   CHECK(bytecask::sql::row_column(row, *t.layout.find(2)).i64() == kInitial - kThreads * kEach);  // no lost update
   CHECK(g_concurrent_runs > kThreads * kEach);  // some executions conflicted and were retried
 }
@@ -924,7 +927,7 @@ TEST_CASE("plan writes: a row written by one run is refused to a later run of th
   bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kW);
   bytecask::sql::key_put_i64(key, 1, {PhysType::I64});
   REQUIRE(f.db->get({}, key, row));
-  const auto& w = *f.cat().table("w");
+  const auto& w = *f.cat().table({kPublicSchema, "w"});
   CHECK(bytecask::sql::row_column(row, *w.layout.find(kA)).i64() == 1);
   CHECK(count_entries(*f.db, bytecask::sql::kNsIndex, kWA) == 1);
   // A duplicate key across two runs is still a duplicate.
@@ -1127,12 +1130,12 @@ TEST_CASE("plan writes: every unique key over the arbiter's columns is an arbite
   };
   SECTION("a unique index beside another over the same columns") {
     // w_ac (a, c) beside w_ca (c, a DESC): naming w_ca arbitrates both.
-    f.ddl(bytecask::sql::CreateIndexDdl{"w_ac", "w", {{"a"}, {"c"}}, true});
+    f.ddl(bytecask::sql::CreateIndexDdl{"w_ac", {kPublicSchema, "w"}, {{"a"}, {"c"}}, true});
     race(kWCA, {std::int64_t{1}, std::int64_t{1}, bytes("a"), std::int64_t{0}},
          {std::int64_t{2}, std::int64_t{1}, bytes("b"), std::int64_t{0}});
   }
   SECTION("the primary key beside a unique index over its column") {
-    f.ddl(bytecask::sql::CreateIndexDdl{"w_id", "w", {{"id"}}, true});
+    f.ddl(bytecask::sql::CreateIndexDdl{"w_id", {kPublicSchema, "w"}, {{"id"}}, true});
     race(kW, {std::int64_t{1}, std::int64_t{1}, bytes("a"), std::int64_t{0}},
          {std::int64_t{1}, std::int64_t{2}, bytes("b"), std::int64_t{1}});
   }
