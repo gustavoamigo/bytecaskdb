@@ -831,6 +831,13 @@ public:
   // every written key refuses an id both draw. Thread-safe. Throws
   // std::length_error past INT64_MAX, and as the engine's reads throw.
   [[nodiscard]] auto next_row_id(const Table& t) -> std::int64_t;
+  // CREATE TABLE AS writes its n rows under row ids 1..n itself, before
+  // its table is published (in a transaction's overlay, or in its batch):
+  // for `ddl`, one, the next id `next`'s table hands out is past n. An id
+  // counter outlives a rolled-back table of the same id, so it may be
+  // behind. Does nothing for any other DDL. Thread-safe; throws as
+  // next_row_id does.
+  void reserve_row_ids(const Catalog& next, const Ddl& ddl);
 
   // Test seam: called during every commit after the generation counter
   // turns odd and before the batch reaches the engine, under the DDL lock.
@@ -859,6 +866,8 @@ private:
   // first insert. Held only to find and advance an entry, and to seed one.
   std::mutex row_ids_mu_;
   std::map<std::uint32_t, std::int64_t> row_ids_;
+  // Under row_ids_mu_: `t`'s entry, seeded from the engine if it has none.
+  auto seeded_row_id_locked(const Table& t) -> std::map<std::uint32_t, std::int64_t>::iterator;
 };
 
 // The key of the catalog version counter, which every DDL that changes the
@@ -3234,6 +3243,24 @@ auto LiveCatalog::next_row_id(const Table& t) -> std::int64_t {
   constexpr auto kLast = std::numeric_limits<std::int64_t>::max();  // never handed out: next would overflow
   auto used_up = [&] { return std::length_error("table " + t.name + " has used every row id"); };
   std::lock_guard<std::mutex> lock{row_ids_mu_};
+  auto it = seeded_row_id_locked(t);
+  if (it->second == kLast) throw used_up();
+  return it->second++;
+}
+
+void LiveCatalog::reserve_row_ids(const Catalog& next, const Ddl& ddl) {
+  const auto* ct = std::get_if<CreateTableDdl>(&ddl);
+  if (ct == nullptr || ct->rows.empty()) return;
+  const auto* t = next.table(ct->name);
+  if (t == nullptr) throw std::logic_error("CREATE TABLE AS of no table");
+  std::lock_guard<std::mutex> lock{row_ids_mu_};
+  auto it = seeded_row_id_locked(*t);
+  it->second = std::max<std::int64_t>(it->second, std::ssize(ct->rows) + 1);
+}
+
+auto LiveCatalog::seeded_row_id_locked(const Table& t) -> std::map<std::uint32_t, std::int64_t>::iterator {
+  constexpr auto kLast = std::numeric_limits<std::int64_t>::max();
+  auto used_up = [&] { return std::length_error("table " + t.name + " has used every row id"); };
   auto it = row_ids_.find(t.id);
   if (it == row_ids_.end()) {
     // Seeded from the engine's latest state, not a statement's snapshot: no
@@ -3250,8 +3277,7 @@ auto LiveCatalog::next_row_id(const Table& t) -> std::int64_t {
     }
     it = row_ids_.emplace(t.id, next).first;
   }
-  if (it->second == kLast) throw used_up();
-  return it->second++;
+  return it;
 }
 
 auto LiveCatalog::pin() const -> Pinned {
@@ -3288,6 +3314,7 @@ auto LiveCatalog::prepare(const Ddl& ddl) -> Prepared {
   Prepared p{base, nullptr, nullptr, false};
   p.next = base->next_version(ddl, SnapshotRows{snap}, ops, p.backfill, backfill_limit_);
   if (!p.next) return p;
+  reserve_row_ids(*p.next, ddl);
   try {
     p.plan = std::make_unique<WritePlan>(std::move(snap));
     // Each op's bytes are freed once the plan holds its copy, so a backfill

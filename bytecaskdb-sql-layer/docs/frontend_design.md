@@ -921,11 +921,13 @@ written:
   42701; then the query runs, autocommit, and its rows and the table are
   one DDL: the table's record and every row in one batch
   (`catalog_design.md`, *CREATE TABLE AS*). A concurrent DDL that takes the
-  name first makes it 42P07, or the NOTICE.
+  name first makes it 42P07, or the NOTICE. In a transaction the query
+  runs as its statement, through its view, and the table and rows are a
+  DDL of the transaction (`transaction_design.md`, stage 4).
 - **Tag:** `SELECT n`, the rows written; `CREATE TABLE AS` for `WITH NO
   DATA` (the query is not run) and for an `IF NOT EXISTS` skip. A read-only
   block refuses it as `SELECT INTO` or `CREATE TABLE AS`, as written
-  (25006). It is DDL: not inside a transaction (0A000).
+  (25006).
 - **Refused (0A000):** `TEMP`, `UNLOGGED`, `WITH (…)`, `USING`,
   `TABLESPACE`, `CREATE MATERIALIZED VIEW` and `CREATE TABLE … AS EXECUTE`;
   a result column of a `NUMERIC` of no declared precision (an `AVG`, a
@@ -1661,13 +1663,12 @@ implemented (`functional_testing_design.md`).
   the column type, not yet the conversion of a query's values to it), takes `SELECT … INTO` in a set operation's first
   arm, and creates the table of `WITH NO DATA` over a query whose constant
   raises an error; the layer refuses each (0A000).
-- **DDL is transactional in a `Transaction` and a `BEGIN` block, not in
-  an implicit block.** A `Transaction`, and over the wire a `BEGIN` block,
-  runs DDL as a step of the transaction, published at its commit
-  (`transaction_design.md`, *Transactional DDL*). Over the wire, a DDL in
-  an extended-query block of several statements, and `CREATE TABLE AS` or
-  `SELECT … INTO` in any transaction, are refused (0A000); PostgreSQL runs
-  both.
+- **Transactional DDL never waits.** A `Transaction`, and over the wire
+  a `BEGIN` block or an extended-query block of several statements, runs
+  DDL, `CREATE TABLE AS` and `SELECT … INTO` included, as a step of the
+  transaction, published at its commit, as PostgreSQL does; where
+  PostgreSQL makes one transaction wait for another's DDL, the second to
+  commit fails with 40001 (`transaction_design.md`, *Transactional DDL*).
 - **A set operation cannot be ordered, and its arms are plain.** PostgreSQL
   sorts the combined rows with `ORDER BY` and combines queries that group,
   aggregate or select `DISTINCT`. Here a set operation streams its arms

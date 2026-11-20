@@ -502,15 +502,9 @@ wrote a table the DDL changed.
   and may be retried. The one wait left is a statement's pin: it waits for
   the instant between a DDL's batch reaching the engine and the new catalog
   taking effect, never while the DDL writes or syncs.
-- A DDL statement given to `Transaction::execute` is a step of the
-  transaction (*Transactional DDL*, stage 2): later statements see it,
-  COMMIT publishes it with the transaction's writes or nothing, and
-  ROLLBACK undoes it. CREATE TABLE AS and SELECT … INTO are refused there
-  with `FeatureNotSupported` (SQLSTATE 0A000; Python's
-  `bytecask_sql.FeatureNotSupported`, a `SqlError`) before anything runs,
-  and the transaction aborts (stage 4). The server runs DDL in a BEGIN
-  block the same way (stage 3); in an implicit block of several statements
-  it is 0A000 until stage 4.
+- A DDL statement given to `Transaction::execute`, CREATE TABLE AS and
+  SELECT … INTO included, is a statement of the transaction, and so is one
+  in a server block, explicit or implicit: *Transactional DDL*.
 
 PostgreSQL makes the DDL wait for the open transaction's locks; see *Known
 differences*.
@@ -656,6 +650,13 @@ for their shape.
   `BEGIN` / statements / `COMMIT` / `ROLLBACK` rules, compared with
   PostgreSQL's REPEATABLE READ on one connection, aborted transactions and
   25P02 included.
+- **Transactional DDL** (*Stages of transactional DDL*): stage 0's
+  `api_rebind_test.cpp` ("rebind: …"); stages 1, 2 and 4's
+  `api_txn_ddl_test.cpp` ("txn DDL: …", the allocation-fault sweep
+  included) and `transaction_test.cpp`; stages 3 and 4's wire tests in
+  `tests/server/test_wire.py`, the proof machine's
+  `test_ddl_inside_begin_agrees_with_postgresql`, and the functional cases
+  under `pg:transactional-ddl`.
 - **Concurrency:** Elle through SQL (`testing_design.md`, *The TPROC-C
   harness*): the harness's transactions as histories, checked as snapshot isolation, and
   as serializable where `FOR UPDATE` guards the reads that decide a write.
@@ -673,7 +674,6 @@ reason.
 | `INSERT … ON CONFLICT DO UPDATE` whose conflicting row a concurrent transaction updates or deletes waits, then gets 40001. | Both write. The second to commit gets 40001 at `commit()`; in autocommit the statement is retried and updates the row as committed, or inserts where it was deleted. | The same outcome, reported at commit; no retry inside the statement (owner decision, as for `DO NOTHING`). |
 | `INSERT … ON CONFLICT DO NOTHING` whose conflicting row a concurrent transaction deletes and commits waits for it, then inserts the row. | The row is skipped, as the statement's snapshot holds its key, and the commit succeeds. | Owner decision (2026-11-19), not the rule *never wait*: a guard per skipped row would make the commit a conflict and an autocommit retry insert the row; it was not taken. |
 | `SELECT … FOR UPDATE` locks the rows: other writers wait. | It guards them: the guarding transaction gets 40001 at commit if a writer of those rows committed first. A writer is never held back. | A guard, not a lock. |
-| DDL waits for the locks of open transactions on its table. | DDL commits at once. An open transaction that wrote the table gets 40001 at commit. | DDL never waits. |
 | A DDL in a transaction waits for open transactions' locks on its table; readers and writers queue behind an uncommitted DDL's lock. | Nothing waits. The second to commit fails: at commit, or at its next statement for a transaction that ran DDL. | Never wait. |
 | Two DDL transactions on unrelated objects both commit, and their other statements run. | Once one commits, the other's next statement, whatever it is, is 40001, and so is its commit. GRANT and CREATE ROLE count as DDL. | One catalog version key. |
 | A transaction that began before another session's DDL committed runs its own DDL, on any object, in READ COMMITTED and REPEATABLE READ. | Its DDL is 40001 unless it is the transaction's first statement. | A catalog consistent with the snapshot. |
@@ -686,7 +686,7 @@ reason.
 
 ## Transactional DDL
 
-Status: **design, approved by the owner on 2026-11-19. Stages 0 to 3 are built (DDL runs in an embedded `Transaction` and in a server BEGIN block); stage 4 is not (CREATE TABLE AS in a transaction, and DDL in an implicit block, are still refused).** Where building a stage found the design incomplete against the code, the stage's entry says what was done instead (*Stage 0 as built* to *Stage 3 as built*). The owner's answers are recorded in *Owner's decisions on transactional DDL*. Stage 0 comes first, and edits *DDL during an open transaction* (stage 0's *Docs*). Once transactional DDL is built, this section replaces *DDL during an open transaction*, and the edits listed under *Edits to this document once transactional DDL is built* are made.
+Status: **built** (design approved by the owner on 2026-11-19; stages 0 to 4). Every DDL statement, CREATE TABLE AS included, runs in an embedded `Transaction`, in a server BEGIN block and in an extended pipeline's implicit block. Where building a stage found the design incomplete against the code, the stage's entry says what was done instead (*Stage 0 as built* to *Stage 4 as built*). The owner's answers are recorded in *Owner's decisions on transactional DDL*. Stage 0 comes first, and edits *DDL during an open transaction* (stage 0's *Docs*). Once transactional DDL is built, this section replaces *DDL during an open transaction*, and the edits listed under *Edits to this document once transactional DDL is built* are made.
 
 This section applies the two standing rules: do what PostgreSQL does, and never wait. Behaviour observed on PostgreSQL 17.12 is cited as "PG 17".
 
@@ -918,7 +918,7 @@ From stage 0, inside a block every message goes through the block's transaction,
 - A record fixed in a block outlives it. Run after COMMIT in autocommit, it is 0A000 when its result columns differ at the live catalog (exception 3).
 - Stage 3 changes no routing: stage 2 makes the transaction's `refit`, `execute` and `procedure` read `txn->catalog`.
 
-`refuse_ddl_beside_others` stays until stage 4. In an implicit block, Executes before one Sync and a Simple Query sent inside that pipeline, DDL is still 0A000 until then. A Simple Query of several statements is refused today (0A000, pg_session.cppm:1412), so it forms no block.
+From stage 4, a DDL in an implicit block, by an Execute before one Sync or by a Simple Query sent inside that pipeline, runs in the block's transaction as in an explicit one. A Simple Query of several statements is still refused (0A000), so it forms no block.
 
 ### Differences from PostgreSQL for transactional DDL
 
@@ -1099,6 +1099,13 @@ Each stage is one PR that ships on its own. Each says what it still refuses, upd
 - Contract: wire row :208 is widened again.
 - Tests: CREATE TABLE AS in a block, rolled back and committed; an extended pipeline with DDL and DML that fails half way writes nothing, with the DDL sent by Execute and by a Simple Query inside the pipeline.
 
+**Stage 4 as built.** The smallest changes to the design above that the code needed; the guarantees are the ones stated.
+- **The query is compiled privately, under a key of its own.** `Transaction` compiles CREATE TABLE AS's query against the transaction's catalog through the rule's path (`plan_for`, with its re-pin and exception 1), never from the shared cache: the cached statement's query plan may be the stand-in of a constant that raises an error, which must never run. It is kept in the plan map under `"\x02"` and the text, since the text's own key holds its parse, a CREATE TABLE AS. It runs as a statement of the transaction (`run_txn`), so it reads the transaction's view and its own tables; its rows then go through `Catalog::next_version` and `bc_txn_ddl` as any DDL's backfill, bounded by `max_bytes` and the 1 GiB batch.
+- **Its order of errors is autocommit's:** a taken name (42P07, or the notice of IF NOT EXISTS, with no DDL of the transaction) before the query is planned; then the query's errors, a constant's folding error at run, and 0A000 for WITH NO DATA of such a query.
+- **Its parameters are the statement's in a block too.** PG 17 analyses CREATE TABLE AS's query at Parse, in a block as outside one, and takes `$n` there. A block's `refit` of the text binds the query against the block's catalog for its parameters, so a binder error is the Parse's, as outside a block; a constant's folding error is left to Execute, and its record lists the parameters of a stand-in with that constant NULL, compiled at the block's catalog and never kept or run, as the autocommit statement's are.
+- **Row ids past the rows it writes.** CREATE TABLE AS writes its rows under row ids 1 to n itself. `LiveCatalog::next_row_id` keeps a counter per table id that outlives a rolled-back table of that id (*Mechanism: the transaction's private catalog*, "Hidden row ids"), and a counter seeded from the engine for an unpublished table starts at 1: an insert after a CREATE TABLE AS in its transaction, or after an autocommit one under an id a rolled-back transaction had drawn row ids for, drew an id the table already held, and was 23505. The design missed this, and the autocommit case reached it from stage 2. `LiveCatalog::reserve_row_ids` moves the table's counter past n once the DDL's next catalog is built, in `LiveCatalog::prepare` and in the transaction's step; ids are drawn, never returned, so a DDL that then fails leaves a gap.
+- **Tests:** "txn DDL: CREATE TABLE AS …" and "txn DDL: rows inserted into a CREATE TABLE AS table take row ids past its own" (`tests/api_txn_ddl_test.cpp`), `test_ddl_in_an_implicit_block_is_one_transaction_with_its_statements` and `test_create_table_as_in_a_begin_block_is_a_statement_of_the_block` (`tests/server/test_wire.py`; both also pass against PG 17), and the functional case "CREATE TABLE AS in a transaction reads its writes, and ROLLBACK undoes it". The stage lists no allocation-fault sweep: its step is stage 2's, which the sweep covers.
+
 ### Decisions the standing rules settle
 
 These follow from "never wait", "do what PostgreSQL does" and CONTRACT.md:185, and are not open:
@@ -1148,6 +1155,8 @@ Opened when the design is approved, as the repository's rules ask for deferred w
 
 ### Edits to this document once transactional DDL is built
 
+Made with stage 4. *DDL during an open transaction* keeps what still holds of autocommit DDL against open transactions, and points here for DDL inside one. Stages 0 to 4 are PRs stacked on the design's, #856.
+
 - The status line names transactional DDL as built and links the PRs.
 - *DDL during an open transaction* is replaced by this section's semantics; the paragraph "A DDL statement given to `Transaction::execute` is refused …" goes.
 - *Savepoints*, "What does not change" (reworded by stage 0): add that a transaction that ran DDL is 40001 at its next statement once another DDL commits, recoverable by ROLLBACK TO, and that a mark carries the catalog.
@@ -1169,4 +1178,3 @@ Not built. Each gets an issue when it is picked up.
 | Sequences and auto-increment | A runtime service at commit, outside the plan (`docs/plan_api_design.md`, *Deferred*). TPROC-C's ids come from rows it reads and updates. |
 | Deadlines turned into budgets | The budget is per statement already; a transaction deadline divides into it. |
 | Bulk load | A transaction mode that flushes its log in batches, as `MariaDBTxn`'s bulk-copy mode does, into a keyspace no one else reads yet. |
-| Transactional DDL | DDL statements writing into the transaction's log, with the catalog read through the view. |

@@ -246,6 +246,39 @@
     - DROP TABLE w
     - DROP TABLE t
 
+- name: CREATE TABLE AS in a transaction reads its writes, and ROLLBACK undoes it
+  features: [pg:transactional-ddl, pg:select-into]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [2, 20]
+      rowcount: 1
+    - sql: CREATE TABLE ct AS SELECT id, v FROM t WHERE v > $1
+      params: [5]
+      rowcount: 2
+    - sql: SELECT id, v FROM ct WHERE id >= $1
+      params: [0]
+      expected: [[1, 10], [2, 20]]
+    - sql: ROLLBACK
+    - sql: SELECT id FROM ct WHERE id >= $1
+      params: [0]
+      error: "42P01"
+    - sql: BEGIN
+    - sql: SELECT id INTO ct FROM t WHERE id >= $1
+      params: [0]
+      rowcount: 1
+    - sql: COMMIT
+    - sql: SELECT id FROM ct WHERE id >= $1
+      params: [0]
+      expected: [[1]]
+  teardown:
+    - ROLLBACK
+    - DROP TABLE ct
+    - DROP TABLE t
+
 - name: a failed statement leaves the transaction aborted
   features: [E151-02]
   setup:

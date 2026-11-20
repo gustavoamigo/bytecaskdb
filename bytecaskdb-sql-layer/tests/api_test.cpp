@@ -1389,7 +1389,7 @@ TEST_CASE("embedded API: sqlstate reports PostgreSQL's SQLSTATE for each error",
   CHECK(state([&] { (void)db->table_rows("nope"); }) == "42P01");
   CHECK(state([&] { (void)db->execute("SELECT n FROM s WHERE k = $1", {}); }) == "08P01");
   auto txn = db->begin();
-  CHECK(state([&] { (void)txn.execute("CREATE TABLE u AS SELECT k FROM s"); }) == "0A000");
+  CHECK(state([&] { (void)txn.execute("CREATE TABLE u AS SELECT 1.5"); }) == "0A000");
   CHECK(state([&] { (void)txn.execute("SELECT n FROM s WHERE k = $1", {i(1)}); }) == "25P02");
   CHECK(sqlstate(SerializationFailure{"x"}) == "40001");
   CHECK(sqlstate(ExecError::conflicted("x")) == "40001");
@@ -4467,10 +4467,11 @@ TEST_CASE("embedded API: CREATE TABLE AS and SELECT … INTO make a table of a q
     CHECK(state(*db, "CREATE TABLE c8 AS SELECT AVG(a) FROM src") == "0A000");
     CHECK(state(*db, "CREATE TABLE c8 AS SELECT") == "0A000");
     CHECK(db->catalog()->table("c8") == nullptr);
-    // DDL: never in a transaction.
+    // In a transaction too (tests/api_txn_ddl_test.cpp): rolled back, nothing.
     auto txn = db->begin();
-    CHECK_THROWS_AS(txn.execute("SELECT 1 INTO c8"), FeatureNotSupported);
+    CHECK(txn.execute("SELECT 1 AS x INTO c8").affected == 1);
     txn.rollback();
+    CHECK(db->catalog()->table("c8") == nullptr);
     db->close();
   }
   {

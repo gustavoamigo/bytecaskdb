@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// Stage 2 of transactional DDL (docs/transaction_design.md, *Stages of
+// Stages 2 and 4 of transactional DDL (docs/transaction_design.md, *Stages of
 // transactional DDL*): DDL in an embedded Transaction. Later statements see
 // it; ROLLBACK, an abort or a ROLLBACK TO before it undoes it; COMMIT
 // publishes it with the transaction's writes, or nothing; other sessions see
@@ -937,4 +937,172 @@ TEST_CASE("txn DDL: an allocation failure in a DDL step, a compile after it, ROL
     }
     if (commit) CHECK(failed > 0);
   }
+}
+
+// Stage 4: CREATE TABLE AS in a transaction.
+
+TEST_CASE("txn DDL: CREATE TABLE AS reads the transaction's view; ROLLBACK leaves nothing, COMMIT the table and rows",
+          "[sql][api][txn][ddl][ctas]") {
+  sql_test::TempDir dir{"txn_ddl_ctas"};
+  auto db = open(dir);
+  const auto version = db->catalog()->version();
+  for (const auto commit : {false, true}) {
+    INFO((commit ? "COMMIT" : "ROLLBACK"));
+    auto t = db->begin();
+    (void)t.execute("INSERT INTO t VALUES (2, 20)");
+    (void)t.execute("CREATE TABLE x (k BIGINT PRIMARY KEY, b BIGINT)");
+    (void)t.execute("INSERT INTO x VALUES (3, 30)");
+    // Its query reads the transaction's own rows and its own table.
+    auto out = t.execute("CREATE TABLE c AS SELECT k, a FROM t UNION ALL SELECT k, b FROM x");
+    CHECK(out.affected == 3);
+    CHECK(t.execute("SELECT k, a FROM c ORDER BY k").rows == Grid{{i(1), i(10)}, {i(2), i(20)}, {i(3), i(30)}});
+    (void)t.execute("SELECT k * 2 AS d INTO s FROM c WHERE k > 1");
+    CHECK(t.execute("SELECT d FROM s ORDER BY d").rows == Grid{{i(4)}, {i(6)}});
+    out = t.execute("CREATE TABLE e AS SELECT k FROM c WITH NO DATA");
+    CHECK(out.affected == -1);
+    CHECK(t.execute("SELECT k FROM e").rows.empty());
+    // Another session sees nothing of it.
+    CHECK(state([&] { (void)db->execute("SELECT k FROM c"); }) == "42P01");
+    CHECK(db->catalog()->version() == version);
+    if (commit) {
+      CHECK(t.commit() == CommitOutcome::Committed);
+    } else {
+      t.rollback();
+      CHECK(db->catalog()->table("c") == nullptr);
+      CHECK(db->catalog()->table("s") == nullptr);
+    }
+  }
+  CHECK(db->execute("SELECT k, a FROM c ORDER BY k").rows == Grid{{i(1), i(10)}, {i(2), i(20)}, {i(3), i(30)}});
+  CHECK(db->execute("SELECT d FROM s ORDER BY d").rows == Grid{{i(4)}, {i(6)}});
+  CHECK(db->execute("SELECT k FROM e").rows.empty());
+  // A table, a CREATE TABLE AS, a SELECT … INTO and a WITH NO DATA: four DDL.
+  CHECK(db->catalog()->version() == version + 4);
+}
+
+TEST_CASE("txn DDL: CREATE TABLE AS of a taken name is 42P07, or skipped with IF NOT EXISTS, before its query runs",
+          "[sql][api][txn][ddl][ctas]") {
+  sql_test::TempDir dir{"txn_ddl_ctas_dup"};
+  auto db = open(dir);
+  {
+    auto t = db->begin();
+    (void)t.execute("CREATE TABLE x (k BIGINT PRIMARY KEY)");
+    // The name is looked for first, as PostgreSQL does: the query's 1/0 never runs.
+    CHECK(state([&] { (void)t.execute("CREATE TABLE x AS SELECT 1/0 AS v"); }) == "42P07");
+    CHECK(t.is_aborted());
+  }
+  {
+    auto t = db->begin();
+    (void)t.execute("CREATE TABLE x (k BIGINT PRIMARY KEY)");
+    auto out = t.execute("CREATE TABLE IF NOT EXISTS x AS SELECT 1/0 AS v");
+    REQUIRE(out.notices.size() == 1);
+    CHECK(out.notices[0].sqlstate == "42P07");
+    CHECK(state([&] { (void)t.execute("CREATE TABLE y AS SELECT 1/0 AS v"); }) == "22012");
+    CHECK(t.is_aborted());
+  }
+  {
+    auto t = db->begin();
+    CHECK(state([&] { (void)t.execute("CREATE TABLE y AS SELECT 1/0 AS v WITH NO DATA"); }) == "0A000");
+  }
+  {
+    // A skipped IF NOT EXISTS is no DDL of the transaction: another DDL does not doom it.
+    auto t = db->begin();
+    (void)t.execute("CREATE TABLE IF NOT EXISTS t AS SELECT 1 AS v");
+    (void)db->execute("CREATE TABLE other (k BIGINT PRIMARY KEY)");
+    CHECK(t.execute("SELECT a FROM t").rows == Grid{{i(10)}});
+    CHECK(t.commit() == CommitOutcome::Committed);
+  }
+}
+
+TEST_CASE("txn DDL: CREATE TABLE AS takes parameters, prepared in the transaction or held",
+          "[sql][api][txn][ddl][ctas]") {
+  sql_test::TempDir dir{"txn_ddl_ctas_params"};
+  auto db = open(dir);
+  auto t = db->begin();
+  (void)t.execute("CREATE TABLE x (k BIGINT PRIMARY KEY)");
+  (void)t.execute("INSERT INTO x VALUES (5)");
+  // Prepared against the transaction's catalog: its query names its own table.
+  auto p = t.prepare("CREATE TABLE c AS SELECT k FROM x WHERE k > $1");
+  CHECK(p.record().ddl);
+  REQUIRE(p.record().params.size() == 1);
+  CHECK(t.execute(p.sql(), p.check(), {i(1)}).affected == 1);
+  CHECK(t.execute("SELECT k FROM c").rows == Grid{{i(5)}});
+  // A held Statement, prepared in autocommit.
+  const auto& held = db->prepare("CREATE TABLE h AS SELECT a FROM t WHERE k = $1");
+  CHECK(t.execute(held, {i(1)}).affected == 1);
+  CHECK(t.execute("SELECT a FROM h").rows == Grid{{i(10)}});
+  // A binder error of its query is the statement's when it is prepared.
+  CHECK(state([&] { (void)t.prepare("CREATE TABLE d AS SELECT nope FROM x"); }) == "42703");
+  CHECK(t.is_aborted());
+  // A constant that fails to fold: the parameters are still the statement's,
+  // read from a stand-in that never runs. The run folds the query itself.
+  auto u = db->begin();
+  (void)u.execute("CREATE TABLE y (k BIGINT PRIMARY KEY)");
+  auto f = u.prepare("CREATE TABLE z AS SELECT 1/0 AS v, k FROM y WHERE k > $1");
+  CHECK(f.record().ddl);
+  CHECK(f.record().params.size() == 1);
+  CHECK(u.refit(f.sql(), f.check()).params.size() == 1);
+  CHECK(state([&] { (void)u.execute(f.sql(), f.check(), {i(1)}); }) == "22012");
+  CHECK(u.is_aborted());
+}
+
+TEST_CASE("txn DDL: rows inserted into a CREATE TABLE AS table take row ids past its own",
+          "[sql][api][txn][ddl][ctas]") {
+  sql_test::TempDir dir{"txn_ddl_ctas_ids"};
+  auto db = open(dir);
+  (void)db->execute("INSERT INTO t VALUES (2, 20)");
+  {
+    auto t = db->begin();
+    (void)t.execute("CREATE TABLE c AS SELECT a FROM t");
+    (void)t.execute("INSERT INTO c VALUES (30)");
+    CHECK(t.execute("SELECT a FROM c ORDER BY a").rows == Grid{{i(10)}, {i(20)}, {i(30)}});
+    CHECK(t.commit() == CommitOutcome::Committed);
+  }
+  (void)db->execute("INSERT INTO c VALUES (40)");
+  CHECK(db->execute("SELECT a FROM c ORDER BY a").rows == Grid{{i(10)}, {i(20)}, {i(30)}, {i(40)}});
+  // A rolled-back table drew row ids under the id the next table takes: a
+  // CREATE TABLE AS of that id, autocommit or not, writes its own ids, and
+  // an insert draws past them.
+  for (const auto in_txn : {false, true}) {
+    INFO((in_txn ? "in a transaction" : "autocommit"));
+    const auto name = std::string{in_txn ? "d2" : "d1"};
+    {
+      auto r = db->begin();
+      (void)r.execute("CREATE TABLE gone (v BIGINT)");
+      (void)r.execute("INSERT INTO gone VALUES (1)");
+      r.rollback();
+    }
+    if (!in_txn) (void)db->execute("CREATE TABLE " + name + " AS SELECT k FROM t");
+    auto t = db->begin();
+    if (in_txn) (void)t.execute("CREATE TABLE " + name + " AS SELECT k FROM t");
+    (void)t.execute("INSERT INTO " + name + " VALUES (3)");
+    CHECK(t.commit() == CommitOutcome::Committed);
+    CHECK(db->execute("SELECT k FROM " + name + " ORDER BY k").rows == Grid{{i(1)}, {i(2)}, {i(3)}});
+  }
+}
+
+TEST_CASE("txn DDL: ROLLBACK TO undoes a CREATE TABLE AS; max_bytes bounds its rows", "[sql][api][txn][ddl][ctas]") {
+  sql_test::TempDir dir{"txn_ddl_ctas_marks"};
+  auto db = open(dir);
+  {
+    auto fill = db->begin();
+    for (std::int64_t k = 2; k <= 2000; ++k) (void)fill.execute("INSERT INTO t VALUES ($1, $1)", {i(k)});
+    CHECK(fill.commit() == CommitOutcome::Committed);
+  }
+  {
+    auto t = db->begin();
+    t.savepoint("s");
+    (void)t.execute("CREATE TABLE c AS SELECT k FROM t");
+    t.rollback_to("s");
+    CHECK(state([&] { (void)t.execute("SELECT k FROM c"); }) == "42P01");
+    t.rollback_to("s");
+    (void)t.execute("CREATE TABLE c AS SELECT k FROM t WHERE k < 3");
+    CHECK(t.commit() == CommitOutcome::Committed);
+    CHECK(db->execute("SELECT k FROM c ORDER BY k").rows == Grid{{i(1)}, {i(2)}});
+  }
+  // The rows the query returns fit; the table they make does not.
+  auto t = db->begin(TransactionOptions{32u << 10});
+  const auto why = message([&] { (void)t.execute("CREATE TABLE big AS SELECT k, a FROM t"); });
+  INFO(why);
+  CHECK(why.ends_with("run the DDL outside a transaction"));
+  CHECK(t.is_aborted());
 }

@@ -551,7 +551,7 @@ rollback closed is forgotten when next named.
 | Disconnect, `Terminate`, shutdown | Rolled back with the transaction; hold cursors closed by the session. A suspended run, in phase 10, is freed, not resumed. |
 | The memory cap (`max_memory_bytes`) | A cursor's copy of its transaction's writes counts from `DECLARE`, which is `53200` past the cap; a hold cursor's counts until it closes, past the commit (`plan_api_design.md`, *A cursor's copy is reserved too*). The snapshot's tree nodes and data files are not counted. |
 | Statement timeout, `CancelRequest` | Apply to the `FETCH` running, and to `UPDATE`/`DELETE ... WHERE CURRENT OF`: `Cursor::fetch`, `execute_window` and `execute_current_of` take `ExecutionOptions`, as `execute` does. The cursor is closed with the failed statement. A cancel between FETCHes is a no-op, as for any idle session. |
-| DDL on a table a cursor reads | In a block: DDL is `0A000` (`server_design.md`). In autocommit, DDL commits and a lazy cursor cannot exist outside a block. A hold cursor holds its snapshot and the catalog pinned at `DECLARE`, so a later DDL changes nothing for it. So no case arises, and the pinned catalog already keeps the layout stable. |
+| DDL on a table a cursor reads | In a block: a DDL on a table an open cursor or a bound SELECT portal of the block reads, or a DROP INDEX of an index one scans, is `55006` and aborts the transaction (*Cursors and savepoints*). In autocommit, DDL commits and a lazy cursor cannot exist outside a block. A hold cursor holds its snapshot and the catalog pinned at `DECLARE`, so a later DDL changes nothing for it. |
 | `DROP TABLE` by another session | The cursor's snapshot still reads the table's rows; the cursor is unaffected. |
 
 Limits (numbers are decision 8, #724):

@@ -190,9 +190,8 @@ public:
 };
 
 // A statement the layer does not support where it was given: SQLSTATE
-// 0A000. A DDL statement given to a transaction is one: DDL is its own
-// atomic operation. A statement the planner can't plan is another, its
-// message starting "no plan:". Thrown before anything runs; in a
+// 0A000. A statement the planner can't plan is one, its message starting
+// "no plan:". Thrown before anything runs; in a
 // transaction it aborts the transaction, as every error does in PostgreSQL.
 using FeatureNotSupported = ast::FeatureNotSupported;
 
@@ -890,8 +889,9 @@ public:
   // with the transaction's writes, or nothing; a rollback, an abort, or a
   // rollback_to() a savepoint taken before it undoes it. Other sessions see
   // nothing of it until then, and never wait for it. It is bound against
-  // the transaction's catalog. CREATE TABLE AS and SELECT … INTO are refused
-  // (0A000). Its errors are the ones it has outside a transaction, and:
+  // the transaction's catalog. CREATE TABLE AS and SELECT … INTO are DDL of
+  // it too: their query reads the transaction's view, and their rows join
+  // its writes. Its errors are the ones it has outside a transaction, and:
   // DdlRefused 25006 on a follower; DdlRefused 55006 for a DROP TABLE,
   // CREATE INDEX or ALTER TABLE of a table an open cursor of the transaction
   // reads, or a DROP INDEX of an index one scans; SerializationFailure
@@ -1092,6 +1092,10 @@ private:
     const Statement* held{nullptr};
     const StatementRecord* given{nullptr};
     bool cursor_query{false};  // the keyed twin a cursor reads
+    // CREATE TABLE AS's query, of the statement `sql` (and `held`, `given`)
+    // names: always compiled privately, under its own key, and its result
+    // columns are the table's, which no record fixes.
+    bool ctas_query{false};
     // A text no one has prepared may be prepared in the shared cache at a
     // live pin; Transaction::prepare puts nothing there.
     bool share{true};
@@ -1113,7 +1117,19 @@ private:
   auto parse_of(const Target& t) -> std::shared_ptr<const ast::Statement>;
   // Runs a DDL as a step of the transaction (docs/transaction_design.md,
   // *Mechanism: the transaction's private catalog*).
-  auto run_ddl(const ast::Statement& st, const std::vector<Value>& params) -> Rows;
+  auto run_ddl(const Target& t, const ast::Statement& st, const std::vector<Value>& params,
+               const ExecutionOptions& opts) -> Rows;
+  // A bound DDL as a step of the transaction at its catalog `cat`: whether
+  // it changed anything (IF [NOT] EXISTS may skip it).
+  auto step_ddl(const Ddl& ddl, const Catalog& cat) -> bool;
+  // CREATE TABLE AS's query of `t`, a CREATE TABLE AS or SELECT … INTO
+  // text: its target, and its parse, which depends on no catalog.
+  static auto ctas_target(const Target& t) -> Target;
+  auto ctas_query_parse(const Target& t, const ast::CreateTableAs& ctas) -> std::shared_ptr<const ast::Statement>;
+  // Runs CREATE TABLE AS's query in the transaction, its table and rows a
+  // DDL of it (docs/transaction_design.md, stage 4).
+  auto create_table_as(const Target& t, const ast::CreateTableAs& ctas, const std::vector<Value>& params,
+                       const ExecutionOptions& opts) -> Rows;
   // 55006 for a DDL on what an open cursor of the transaction reads.
   void check_in_use(const Ddl& ddl, const Catalog& cat) const;
   // 40001 for a transaction that has run DDL once another DDL has published.
@@ -1467,9 +1483,11 @@ private:
   static auto results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows;
   static auto padded(const std::vector<SqlType>& types, std::vector<Value> values) -> std::vector<Value>;
   // CREATE TABLE AS's query, of a constant whose folding threw `error`:
-  // compiled with each such constant NULL (bound::null_failing_constant),
-  // for the statement's parameters. Null where no stand-in compiles.
-  auto stand_in(const Statement& query, const ast::SqlError& error) -> std::shared_ptr<const Compiled>;
+  // compiled at `cat` with each such constant NULL
+  // (bound::null_failing_constant), for the statement's parameters only: it
+  // never runs. Null where no stand-in compiles.
+  auto stand_in(const ast::Statement& query, std::string_view sql, const Catalog& cat, std::span<const SqlType> fixed,
+                const ast::SqlError& error) -> std::shared_ptr<const Compiled>;
   // Commits a DDL; whether it changed the catalog (false: IF [NOT] EXISTS
   // skipped it). Throws the API's errors for the catalog's failures.
   auto run_ddl(const Ddl& ddl) -> bool;
@@ -1981,15 +1999,14 @@ auto Database::row_counts() const -> RowCounts {
   };
 }
 
-auto Database::stand_in(const Statement& query, const ast::SqlError& error) -> std::shared_ptr<const Compiled> {
-  auto copy = std::make_unique<Statement>();
-  copy->sql_ = query.sql_;
-  copy->ast_ = ast::clone(std::get<ast::Select>(query.ast_));
+auto Database::stand_in(const ast::Statement& query, std::string_view sql, const Catalog& cat,
+                        std::span<const SqlType> fixed, const ast::SqlError& error) -> std::shared_ptr<const Compiled> {
+  ast::Statement copy = ast::clone(std::get<ast::Select>(query));
   auto pos = error.pos();
   for (int tries = 0; tries < 64; ++tries) {  // a constant at a time: each has its own position
-    if (!bound::null_failing_constant(std::get<ast::Select>(copy->ast_), pos)) return nullptr;
+    if (!bound::null_failing_constant(std::get<ast::Select>(copy), pos)) return nullptr;
     try {
-      return build(*copy);
+      return build_at(copy, sql, cat, fixed);
     } catch (const ast::SqlError& e) {
       if (!e.sqlstate().starts_with("22") || e.at_analysis()) return nullptr;
       pos = e.pos();
@@ -2253,7 +2270,7 @@ auto Database::prepare_locked(std::string_view sql, bool cursor_query) -> const 
       // for, is thrown now.
       if (!e.sqlstate().starts_with("22") || e.at_analysis()) throw;
       s->query_error_ = std::current_exception();
-      q->compiled_ = stand_in(*q, e);
+      q->compiled_ = stand_in(q->ast_, q->sql_, *live_->current(), {}, e);
       if (!q->compiled_) throw;
     }
     s->query_ = std::move(q);
@@ -2436,6 +2453,13 @@ auto Database::run_ddl(const Ddl& ddl) -> bool {
 
 namespace {
 
+// Whether a relation of the catalog has the name: a table, view, index or
+// sequence, which CREATE TABLE AS looks for before it plans its query.
+auto relation_taken(const Catalog& cat, const std::string& name) -> bool {
+  return cat.table(name) != nullptr || cat.view(name) != nullptr || cat.index(name).first != nullptr ||
+         cat.sequence(name) != nullptr;
+}
+
 // The table CREATE TABLE AS makes of a query's result columns, in
 // PostgreSQL's order of refusals: more names than columns (42601), then a
 // name twice (42701). A column of no type a table holds yet is refused
@@ -2508,14 +2532,10 @@ auto Database::create_table_as(const Statement& stmt, const std::vector<Value>& 
   ddl.if_not_exists = ctas.if_not_exists;
   // As PostgreSQL: a relation of the name is found before the query is
   // planned, and IF NOT EXISTS then skips the statement.
-  {
-    auto cat = live_->current();
-    if (cat->table(ctas.table) != nullptr || cat->view(ctas.table) != nullptr || cat->index(ctas.table).first != nullptr ||
-        cat->sequence(ctas.table) != nullptr) {
-      if (!ctas.if_not_exists) throw DdlRefused("relation \"" + ctas.table + "\" already exists", kDuplicateTable);
-      out.notices.push_back(skipped(Ddl{ddl}));
-      return out;
-    }
+  if (relation_taken(*live_->current(), ctas.table)) {
+    if (!ctas.if_not_exists) throw DdlRefused("relation \"" + ctas.table + "\" already exists", kDuplicateTable);
+    out.notices.push_back(skipped(Ddl{ddl}));
+    return out;
   }
   if (stmt.query_error_) {
     // PostgreSQL does not plan the query of WITH NO DATA, so creates the
@@ -3070,6 +3090,7 @@ auto with_cursor_key(const Compiled& stmt, const CursorState& cursor, const std:
 auto Database::shared_txn_plan(const Transaction::Target& t, const std::string& key,
                                const std::optional<std::vector<SqlType>>& fixed, const Published& at)
     -> std::optional<PlanRef> {
+  if (t.ctas_query) return std::nullopt;  // never the shared one: its stand-in may never run
   if (t.held != nullptr && !t.cursor_query) {
     auto c = t.held->compiled();
     if (c->plan->catalog_version == at.version()) return PlanRef{c};
@@ -3094,11 +3115,16 @@ auto Database::txn_plan(TxnHandle& h, const Transaction::Target& t, const TxnCat
   // The shared plan only at the transaction's published catalog: one that
   // has run DDL compiles every statement privately.
   const auto published = tc.published();
-  auto key = t.cursor_query ? "\x01" + std::string{t.sql} : std::string{t.sql};
+  // CREATE TABLE AS's query under a key of its own: the text's is its parse's.
+  auto key = t.cursor_query ? "\x01" + std::string{t.sql}
+             : t.ctas_query ? "\x02" + std::string{t.sql}
+                            : std::string{t.sql};
   // The types the run fixed: a held statement's or the caller's record's;
   // none for a run by text, which infers them.
   std::optional<std::vector<SqlType>> fixed;
-  if (t.held != nullptr) {
+  if (t.held != nullptr && t.ctas_query) {
+    fixed = caller_types(*t.held->query_->compiled());
+  } else if (t.held != nullptr) {
     fixed = caller_types(*t.held->compiled());
   } else if (t.given != nullptr) {
     fixed = types_of(t.given->params);
@@ -3205,7 +3231,9 @@ auto Transaction::plan_for(const Target& t, const std::shared_ptr<const ast::Sta
   std::optional<std::vector<ResultColumn>> columns;
   std::uint64_t fixed_at = 0;
   bool fixed_private = false;
-  if (t.held != nullptr) {
+  if (t.ctas_query) {
+    // Its columns are the new table's: no record fixes them.
+  } else if (t.held != nullptr) {
     auto c = t.held->compiled();
     columns = result_columns_of(*c);
     fixed_at = c->plan->catalog_version;
@@ -3271,7 +3299,7 @@ auto Transaction::run_locked(const Target& t, const std::vector<Value>& params, 
     auto parse = parse_of(t);
     if (!is_dml(*parse)) {
       if (positioned != nullptr || window != nullptr) throw std::invalid_argument("a DDL returns no rows and names no cursor");
-      return run_ddl(*parse, params);
+      return run_ddl(t, *parse, params, opts);
     }
     auto plan = plan_for(t, parse);
     const auto& c = plan.get();
@@ -3335,12 +3363,27 @@ void Transaction::check_in_use(const Ddl& ddl, const Catalog& cat) const {
   }
 }
 
-auto Transaction::run_ddl(const ast::Statement& st, const std::vector<Value>& params) -> Rows {
+auto Transaction::ctas_target(const Target& t) -> Target {
+  auto q = t;
+  q.ctas_query = true;
+  q.share = false;
+  return q;
+}
+
+auto Transaction::ctas_query_parse(const Target& t, const ast::CreateTableAs& ctas)
+    -> std::shared_ptr<const ast::Statement> {
+  // The statement's own query, which lives until close(), as the transaction may not.
+  const auto* s = t.held != nullptr ? t.held : db_->cached_statement(t.sql);
+  if (s != nullptr && s->query_) return std::shared_ptr<const ast::Statement>{std::shared_ptr<const void>{}, &s->query_->ast_};
+  if (auto it = h_->plans.find("\x02" + std::string{t.sql}); it != h_->plans.end()) return it->second->parse_;
+  return std::make_shared<ast::Statement>(ast::clone(ctas.query));
+}
+
+auto Transaction::run_ddl(const Target& t, const ast::Statement& st, const std::vector<Value>& params,
+                          const ExecutionOptions& opts) -> Rows {
   auto& h = *h_;
-  if (std::holds_alternative<ast::CreateTableAs>(st)) {
-    throw FeatureNotSupported("CREATE TABLE AS inside a transaction is not supported: run it outside one");
-  }
-  if (!params.empty()) throw ParamError("DDL takes no parameters");
+  const auto* ctas = std::get_if<ast::CreateTableAs>(&st);
+  if (!params.empty() && ctas == nullptr) throw ParamError("DDL takes no parameters");
   // As PostgreSQL refuses DDL on a standby: a transaction's DDL reaches the
   // engine only at its commit, which a follower would refuse.
   if (db_->db_->mode() == bytecask::Mode::Follower) {
@@ -3365,9 +3408,19 @@ auto Transaction::run_ddl(const ast::Statement& st, const std::vector<Value>& pa
     }
     throw_serialization_failure(kCatalogChanged);
   }
+  if (ctas != nullptr) return create_table_as(t, *ctas, params, opts);
   auto bound = bound::bind(st, *cat);
   const auto& ddl = std::get<Ddl>(bound.stmt);
   check_in_use(ddl, *cat);
+  Rows out;
+  const auto changed = step_ddl(ddl, *cat);
+  out.notices = skip_notices(ddl, *cat, changed);
+  out.affected = 0;
+  return out;
+}
+
+auto Transaction::step_ddl(const Ddl& ddl, const Catalog& cat) -> bool {
+  auto& h = *h_;
   std::vector<Catalog::DdlOp> ops;
   auto backfill = false;
   std::shared_ptr<const Catalog> next;
@@ -3377,7 +3430,7 @@ auto Transaction::run_ddl(const ast::Statement& st, const std::vector<Value>& pa
     const auto rows = bc_txn_rows(h.txn);
     const auto limit = static_cast<std::size_t>(std::min<std::uint64_t>(h.max_bytes, db_->live_->backfill_limit()));
     try {
-      next = cat->next_version(ddl, *rows, ops, backfill, limit);
+      next = cat.next_version(ddl, *rows, ops, backfill, limit);
     } catch (const BackfillTooLarge& e) {
       throw ExecError("backfill of table \"" + e.table() + "\" does not fit the transaction's bound of " +
                           std::to_string(limit) + " bytes: run the DDL outside a transaction",
@@ -3386,11 +3439,10 @@ auto Transaction::run_ddl(const ast::Statement& st, const std::vector<Value>& pa
       throw ExecError(e.what(), BC_E_CONSTRAINT, e.detail().encode());
     }
   }
-  Rows out;
-  out.notices = skip_notices(ddl, *cat, next != nullptr);
-  out.affected = 0;
   // A DDL IF [NOT] EXISTS skipped is no DDL of the transaction: nothing changes.
-  if (!next) return out;
+  if (!next) return false;
+  // CREATE TABLE AS's rows take their ids themselves: an insert draws past them.
+  db_->live_->reserve_row_ids(*next, ddl);
   if (!bc_txn_ddl(h.txn, std::move(next), ops, backfill)) {
     std::string message;
     try {
@@ -3401,6 +3453,49 @@ auto Transaction::run_ddl(const ast::Statement& st, const std::vector<Value>& pa
   }
   // The private plans were for the catalog the DDL replaced.
   h.clear_plans();
+  return true;
+}
+
+auto Transaction::create_table_as(const Target& t, const ast::CreateTableAs& ctas, const std::vector<Value>& params,
+                                  const ExecutionOptions& opts) -> Rows {
+  auto& h = *h_;
+  const auto cat = bc_txn_catalog(h.txn);
+  Rows out;
+  CreateTableDdl ddl;
+  ddl.name = ctas.table;
+  ddl.if_not_exists = ctas.if_not_exists;
+  // As PostgreSQL: a relation of the name is found before the query is
+  // planned, and IF NOT EXISTS then skips the statement.
+  if (relation_taken(*cat, ctas.table)) {
+    if (!ctas.if_not_exists) throw DdlRefused("relation \"" + ctas.table + "\" already exists", kDuplicateTable);
+    out.notices.push_back(skipped(Ddl{ddl}));
+    return out;
+  }
+  // The query, compiled privately against the transaction's catalog and run
+  // through its view: its own writes and tables included.
+  const auto q = ctas_target(t);
+  PlanRef plan;
+  try {
+    plan = plan_for(q, ctas_query_parse(t, ctas));
+  } catch (const ast::SqlError& e) {
+    // A data exception of folding a constant: PostgreSQL does not plan the
+    // query of WITH NO DATA, as the autocommit statement says.
+    if (e.sqlstate().starts_with("22") && !e.at_analysis() && !ctas.with_data) {
+      throw FeatureNotSupported(std::string{"WITH NO DATA of a query whose constant raises an error is not supported"});
+    }
+    throw;
+  }
+  const auto& c = plan.get();
+  Database::check_params(c, params);
+  ddl.columns = ctas_columns(ctas, c.columns, c.column_types);
+  if (ctas.with_data) {
+    auto rows = db_->run_txn(h.cx, c, params, h.txn, h.started_us, opts);
+    ddl.rows.reserve(rows.rows.size());
+    for (auto& r : rows.rows) ddl.rows.push_back(ctas_row(ddl.columns, std::move(r)));
+  }
+  const auto n = std::ssize(ddl.rows);
+  if (!step_ddl(Ddl{std::move(ddl)}, *cat)) throw std::logic_error("CREATE TABLE AS of a free name changed nothing");
+  out.affected = ctas.with_data ? n : -1;
   return out;
 }
 
@@ -3412,7 +3507,28 @@ auto Transaction::refit_locked(const Target& t, std::shared_ptr<const PortalRead
       const auto* s = t.held != nullptr ? t.held : db_->cached_statement(t.sql);
       StatementRecord out;
       out.ddl = true;
-      out.command = s != nullptr ? s->command() : Statement::command_of(ast::parse(t.sql));
+      auto parse = s != nullptr ? nullptr : std::make_shared<ast::Statement>(ast::parse(t.sql));
+      const auto& st = s != nullptr ? s->ast_ : *parse;
+      out.command = Statement::command_of(st);
+      if (const auto* ctas = std::get_if<ast::CreateTableAs>(&st)) {
+        // Its query is bound now, against the transaction's catalog, as
+        // PostgreSQL analyses it at Parse: its parameters are the statement's.
+        const auto query = ctas_query_parse(t, *ctas);
+        try {
+          out.params = caller_params(plan_for(ctas_target(t), query).get());
+        } catch (const ast::SqlError& e) {
+          // A constant's data exception is the statement's when it runs. Its
+          // parameters are still the statement's: a stand-in with that
+          // constant NULL gives them, compiled at the transaction's catalog
+          // and never kept, so the run folds the real query again.
+          if (!e.sqlstate().starts_with("22") || e.at_analysis()) throw;
+          std::vector<SqlType> fixed;
+          if (t.held != nullptr) fixed = caller_types(*t.held->query_->compiled());
+          const auto c = db_->stand_in(*query, t.sql, *bc_txn_catalog(h_->txn), fixed, e);
+          if (!c) throw;
+          out.params = caller_params(*c);
+        }
+      }
       return out;
     }
     const auto& c = plan.get();

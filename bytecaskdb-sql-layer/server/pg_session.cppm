@@ -1463,7 +1463,6 @@ private:
           // result is the columns its catalog gives, never 0A000.
           auto record = describe_text(c.sql);
           if (!record.params.empty()) throw SessionError("there is no parameter $1", "42P02");
-          if (implicit_ && record.ddl) refuse_ddl_beside_others();
           enter_statement(record.command);
           auto opts = run_options();
           const auto none = ResultCheck::none();
@@ -1728,7 +1727,6 @@ private:
     } else if (in_block_) {
       rows = txn_->execute(p.sql, check, portal.params, run_options());
     } else if (implicit_) {
-      if (record.ddl) refuse_ddl_beside_others();
       rows = implicit_->execute(p.sql, check, portal.params, run_options());
     } else {
       auto flush_after = false;
@@ -1744,7 +1742,6 @@ private:
           break;
         case Lookahead::Other:
           // Two or more: PostgreSQL's implicit transaction, committed at Sync.
-          if (record.ddl) refuse_ddl_beside_others();
           implicit_.emplace(db_.begin());
           txn_started_ = std::chrono::steady_clock::now();
           start_modes();
@@ -1814,10 +1811,6 @@ private:
                          "25006");
     }
     block_used_ = true;
-  }
-
-  [[noreturn]] static void refuse_ddl_beside_others() {
-    throw SessionError("DDL in a block of several statements is not supported: send it alone", "0A000");
   }
 
   void close_msg(Body& body) {
