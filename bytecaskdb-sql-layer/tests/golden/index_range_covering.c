@@ -1,5 +1,5 @@
 // SELECT id FROM t WHERE name >= $1 AND name < $2
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: IDX_3 t_by_name, PART_3_0 t_by_name.id
 #include "bc_plan.h"
 enum { IDX_3 = 3, PART_3_0 = 1 };

@@ -1,0 +1,19 @@
+bc_exists records the key it tests.
+Expected: caught.
+Guarded-by: "serializable: reads of every shape are guarded: index equality\, MIN and MAX\, COUNT(*)\, EXISTS"
+
+diff --git a/bytecaskdb-sql-layer/algebra/plan_api.cpp b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+index 66fc395..b3e83cd 100644
+--- a/bytecaskdb-sql-layer/algebra/plan_api.cpp
++++ b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+@@ -5622,7 +5622,9 @@ bool bc_exists(bc_ctx* cx, bc_view key) {
+   BC_GUARD_BEGIN
+   auto k = cx->resolve(key);
+   if (!k) return false;
+-  return read_contains(cx, *k).value_or(false);
++  auto rec = cx->record_point(BytesView{});
++  if (!rec || !cx->charge()) return false;
++  return view_contains(cx, *rec, *k);
+   BC_GUARD_END(cx)
+   return {};
+ }

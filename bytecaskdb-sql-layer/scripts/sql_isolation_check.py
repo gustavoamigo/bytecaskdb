@@ -18,11 +18,22 @@ Each round runs the three configurations from one seed:
                only write skew (G2-item), and must at least once over the run.
     blind      every statement in autocommit. Must fail: the cross-check or
                Elle has to find a lost append.
+    serializable
+               every transaction at Isolation::Serializable, plain reads, no
+               FOR UPDATE (docs/transaction_design.md, *Serializable
+               isolation*). Must pass the cross-check and be valid under
+               strict-serializable.
+    serializable-ro
+               the same with a third of the transactions read-only, begun
+               READ ONLY: they record nothing and are placed at their
+               snapshot (*Read-only serializable transactions*). Must be
+               valid under strict-serializable.
 
 The range workload (`sql_layer_tprocc elle --workload range`) runs scans and
 deletes over fixed ranges of keys, which Elle has no model for, and is
 checked here by range_check, which needs no commit order. Its invariant is
-that a range that held a key keeps one: guarded must keep it every round,
+that a range that held a key keeps one: guarded, serializable and
+serializable-ro must keep it every round,
 unguarded and blind must each break it at least once over the run. In all
 three every read must agree with the writes that committed around it, and
 the final read with what committed.
@@ -57,11 +68,18 @@ def lost_appends(problems: list[str]) -> list[str]:
     return [p for p in problems if "missing from final read" in p or "is not a prefix" in p]
 
 
+CONFIGS = ric.CONFIGS + ("serializable", "serializable-ro")
+# The configurations that must be strict-serializable and keep the range
+# invariant.
+SERIAL = ("guarded", "serializable", "serializable-ro")
+
+
 def record(args: argparse.Namespace, workload: str, config: str, seed: int, round_dir: Path) -> Path:
     """Runs sql_layer_tprocc elle once and returns the history's path."""
     history_path = round_dir / f"{workload}-{config}.json"
     db = round_dir / f"db-{workload}-{config}"
-    subprocess.run([str(args.binary), "elle", "--dir", str(db), "--config", config, "--workload", workload,
+    flags = ["--config", "serializable", "--read-only-third", "yes"] if config == "serializable-ro" else ["--config", config]
+    subprocess.run([str(args.binary), "elle", "--dir", str(db), *flags, "--workload", workload,
                     "--threads", str(args.threads), "--txns", str(args.txns), "--seed", str(seed), "--out",
                     str(history_path)], check=True)
     shutil.rmtree(db, ignore_errors=True)
@@ -168,7 +186,7 @@ def range_check(doc: dict) -> tuple[list[str], list[str]]:
 def check_range_round(args: argparse.Namespace, seed: int, round_dir: Path) -> set[str]:
     """Returns the configurations whose history broke the range invariant."""
     broke: set[str] = set()
-    for config in ric.CONFIGS:
+    for config in CONFIGS:
         doc = json.loads(record(args, "range", config, seed, round_dir).read_text())
         violations, broken = range_check(doc)
         print(f"  range {config}: {len(doc['txns'])} txns, {len(violations)} violations, "
@@ -179,8 +197,8 @@ def check_range_round(args: argparse.Namespace, seed: int, round_dir: Path) -> s
             print(f"    {v}")
         if violations:
             raise ric.CheckFailed(f"range {config}: reads or final state no committed writes explain")
-        if config == "guarded" and broken:
-            raise ric.CheckFailed("range guarded: a range that held a key lost it")
+        if config in SERIAL and broken:
+            raise ric.CheckFailed(f"range {config}: a range that held a key lost it")
         if broken:
             broke.add(config)
     return broke
@@ -189,7 +207,7 @@ def check_range_round(args: argparse.Namespace, seed: int, round_dir: Path) -> s
 def check_round(args: argparse.Namespace, seed: int, round_dir: Path) -> bool:
     """Returns whether the unguarded history showed write skew."""
     skew = False
-    for config in ric.CONFIGS:
+    for config in CONFIGS:
         history_path = record(args, "point", config, seed, round_dir)
         problems = ric.cross_check(json.loads(history_path.read_text()), require_sequence=False)
         print(f"  {config}: cross-check {'clean' if not problems else f'{len(problems)} violations'}")
@@ -199,11 +217,11 @@ def check_round(args: argparse.Namespace, seed: int, round_dir: Path) -> bool:
             raise ric.CheckFailed(f"{config}: cross-check failed")
         elle_found = None
         if args.elle_jar:
-            if config == "guarded":
-                a = ric.run_elle(args.elle_jar, history_path, "strict-serializable", round_dir / "elle-guarded")
-                print(f"  guarded: strict-serializable {ric.describe(a)}")
+            if config in SERIAL:
+                a = ric.run_elle(args.elle_jar, history_path, "strict-serializable", round_dir / f"elle-{config}")
+                print(f"  {config}: strict-serializable {ric.describe(a)}")
                 if a.get("valid?") is not True:
-                    raise ric.CheckFailed("guarded: not strict-serializable")
+                    raise ric.CheckFailed(f"{config}: not strict-serializable")
             elif config == "unguarded":
                 a = ric.run_elle(args.elle_jar, history_path, "snapshot-isolation", round_dir / "elle-unguarded-si")
                 print(f"  unguarded: snapshot-isolation {ric.describe(a)}")

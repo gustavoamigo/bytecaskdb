@@ -1,5 +1,5 @@
 // SELECT i_price, i_name, i_data FROM item WHERE i_id = $1
-// isolation: snapshot   schema: catalog v13
+// schema: catalog v13
 // objects: TBL_20 item, COL_20_2 item.i_name, COL_20_3 item.i_price, COL_20_4 item.i_data
 #include "bc_plan.h"
 enum { TBL_20 = 20, COL_20_2 = 2, COL_20_3 = 3, COL_20_4 = 4 };

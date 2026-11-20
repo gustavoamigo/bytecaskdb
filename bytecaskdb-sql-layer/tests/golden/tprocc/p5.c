@@ -1,5 +1,5 @@
 // SELECT count(c_id) FROM customer WHERE c_last = $1 AND c_d_id = $2 AND c_w_id = $3
-// isolation: snapshot   schema: catalog v13
+// schema: catalog v13
 // objects: IDX_10 customer_i2
 #include "bc_plan.h"
 enum { IDX_10 = 10 };

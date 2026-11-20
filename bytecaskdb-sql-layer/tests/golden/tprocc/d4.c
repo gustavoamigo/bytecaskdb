@@ -1,5 +1,5 @@
 // UPDATE orders SET o_carrier_id = $1 WHERE o_id = $2 AND o_d_id = $3 AND o_w_id = $4
-// isolation: snapshot   schema: catalog v13
+// schema: catalog v13
 // objects: TBL_15 orders, COL_15_4 orders.o_carrier_id
 #include "bc_plan.h"
 enum { TBL_15 = 15, COL_15_4 = 4 };

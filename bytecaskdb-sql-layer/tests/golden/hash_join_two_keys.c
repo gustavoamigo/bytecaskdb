@@ -1,5 +1,5 @@
 // SELECT t.id, p.b FROM t, p WHERE t.name = $1 AND p.b = t.qty AND p.v = t.qty
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_1 t, IDX_3 t_by_name, COL_1_0 t.id, COL_1_2 t.qty, TBL_4 p, COL_4_1 p.b, COL_4_2 p.v
 #include "bc_plan.h"
 enum { TBL_1 = 1, IDX_3 = 3, COL_1_0 = 0, COL_1_2 = 2, TBL_4 = 4, COL_4_1 = 1, COL_4_2 = 2 };

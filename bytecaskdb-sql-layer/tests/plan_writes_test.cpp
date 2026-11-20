@@ -1107,7 +1107,7 @@ TEST_CASE("plan writes: every unique key over the arbiter's columns is an arbite
     auto pb = params(std::move(theirs));
     // A transaction's commit tells a duplicate (BC_FAILED, BC_C_UNIQUE)
     // from a conflict.
-    auto* txn = bc_txn_new(&f.bdb, &f.bcat, 64u << 20);
+    auto* txn = bc_txn_new(&f.bdb, &f.bcat, 64u << 20, BC_ISOLATION_SNAPSHOT, false);
     REQUIRE(txn != nullptr);
     bc_ctx_begin_txn(f.cx, txn, &pa, {});
     CHECK(bc_execute(other, insert_w, &ref, &pb, {}, false, 0) == BC_COMMITTED);

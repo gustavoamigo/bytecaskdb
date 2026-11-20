@@ -1,0 +1,17 @@
+bc_count_range records its whole range.
+Expected: caught.
+Guarded-by: "serializable: bc_count_range guards its whole range\, an empty one included"
+
+diff --git a/bytecaskdb-sql-layer/algebra/plan_api.cpp b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+index 66fc395..dcfa510 100644
+--- a/bytecaskdb-sql-layer/algebra/plan_api.cpp
++++ b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+@@ -6019,7 +6019,7 @@ int64_t bc_count_range(bc_ctx* cx, uint32_t table_or_index, bc_view lo, bc_view
+   if (std::is_gteq(bytes_cmp(range->lo, range->hi))) return 0;
+   // The whole range, even when the count stops at its limit: a superset,
+   // since the engine's count does not name the key it stopped at.
+-  auto rec = cx->record_range(range->lo, range->hi);
++  auto rec = cx->record_range(range->lo, range->lo);
+   if (!rec) return 0;
+   auto lim = static_cast<std::size_t>(limit);
+   if (cx->overlay == nullptr || !cx->overlay->meets(range->lo, range->hi)) {

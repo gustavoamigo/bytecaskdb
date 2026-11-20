@@ -1,5 +1,5 @@
 // SELECT o_id, EXTRACT(YEAR FROM o_entry_d), EXTRACT(SECOND FROM o_entry_d), EXTRACT(ISODOW FROM o_entry_d) FROM orders WHERE o_w_id = $1 AND o_d_id = $2 AND o_id = $3
-// isolation: snapshot   schema: catalog v13
+// schema: catalog v13
 // objects: TBL_15 orders, COL_15_0 orders.o_id, COL_15_7 orders.o_entry_d
 #include "bc_plan.h"
 enum { TBL_15 = 15, COL_15_0 = 0, COL_15_7 = 7 };

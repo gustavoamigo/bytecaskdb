@@ -120,6 +120,11 @@ struct RunOptions {
   // Stop each thread after this many transactions, measured or not; 0 runs
   // for the duration. The smoke test sets it.
   std::uint64_t txns_per_thread{0};
+  // Serializable runs every transaction at Isolation::Serializable, and
+  // New-Order's district read without FOR UPDATE: the read set guards it
+  // (docs/transaction_design.md, stage 1's TPROC-C bench). Snapshot runs
+  // REPEATABLE READ's snapshot isolation with FOR UPDATE.
+  Isolation isolation{Isolation::Snapshot};
 };
 
 inline constexpr int kMaxAttempts = 10;
@@ -160,11 +165,17 @@ void dump_sql(Database& db, std::ostream& out);
 // (docs/testing_design.md, *The TPROC-C harness*). Point is list-append, in
 // the engine harness's JSON format (docs/isolation_checking_design.md); Range
 // is scans and deletes over fixed ranges, whose invariant is that a range
-// that held a key keeps one.
-enum class ElleConfig : std::uint8_t { Guarded, Unguarded, Blind };
+// that held a key keeps one. Serializable runs every transaction at
+// Isolation::Serializable with plain reads, no FOR UPDATE
+// (docs/transaction_design.md, *Stages of serializable isolation*, stage 1).
+enum class ElleConfig : std::uint8_t { Guarded, Unguarded, Blind, Serializable };
 enum class ElleWorkload : std::uint8_t { Point, Range };
 struct ElleOptions {
   ElleConfig config{ElleConfig::Guarded};
+  // Serializable: every third transaction only reads, begun read-only, so
+  // it records nothing and is placed at its snapshot (*Read-only
+  // serializable transactions*).
+  bool read_only_third{false};
   ElleWorkload workload{ElleWorkload::Point};
   std::size_t threads{8};
   std::uint64_t txns{2'000};  // in all, across the threads
@@ -459,7 +470,7 @@ constexpr std::array<std::int64_t, kKinds> kWeights{45, 43, 4, 4, 4};
 // The statements of docs/frontend_design.md, prepared once and shared by
 // every thread.
 struct Statements {
-  explicit Statements(Database& db)
+  explicit Statements(Database& db, Isolation level = Isolation::Snapshot)
       : p1{db.prepare("UPDATE warehouse SET w_ytd = w_ytd + $1 WHERE w_id = $2")},
         p2{db.prepare("SELECT w_street_1, w_street_2, w_city, w_state, w_zip, w_name FROM warehouse WHERE w_id = $1")},
         p3{db.prepare("UPDATE district SET d_ytd = d_ytd + $1 WHERE d_w_id = $2 AND d_id = $3")},
@@ -489,7 +500,9 @@ struct Statements {
                       "WHERE ol_o_id = $1 AND ol_d_id = $2 AND ol_w_id = $3")},
         n1{db.prepare("SELECT c_discount, c_last, c_credit, w_tax FROM customer, warehouse WHERE w_id = $1 "
                       "AND c_w_id = $1 AND c_d_id = $2 AND c_id = $3")},
-        n2{db.prepare("SELECT d_next_o_id, d_tax FROM district WHERE d_id = $1 AND d_w_id = $2 FOR UPDATE")},
+        n2{db.prepare(level == Isolation::Serializable
+                          ? "SELECT d_next_o_id, d_tax FROM district WHERE d_id = $1 AND d_w_id = $2"
+                          : "SELECT d_next_o_id, d_tax FROM district WHERE d_id = $1 AND d_w_id = $2 FOR UPDATE")},
         n3{db.prepare("UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_id = $1 AND d_w_id = $2")},
         n4{db.prepare("SELECT i_price, i_name, i_data FROM item WHERE i_id = $1")},
         n5{db.prepare("SELECT s_quantity, s_data, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, "
@@ -693,6 +706,7 @@ void stock_level(const Statements& s, Transaction& t, const StockLevelInput& in)
 
 struct Worker {
   const Statements& s;
+  Isolation isolation;
   std::int64_t warehouses;
   Scale scale;
   std::uint64_t run;
@@ -782,7 +796,7 @@ struct Worker {
     auto rolled_back = false;
     for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
       try {
-        auto t = db.begin();
+        auto t = db.begin({.isolation = isolation});
         switch (k) {
           case Kind::Payment: payment(s, t, pay); break;
           case Kind::OrderStatus: order_status(s, t, os); break;
@@ -840,7 +854,7 @@ void run(Database& db, const RunOptions& opts, const std::function<void(const Ph
   for (auto threads : opts.threads) {
     if (threads == 0 || threads > kMaxThreads) throw std::invalid_argument("threads must be 1 to 256");
   }
-  const Statements s{db};
+  const Statements s{db, opts.isolation};
   // The warehouses and the scale, from what the load wrote.
   auto count = [&](std::string_view sql, std::vector<Value> p) { return i64(db.execute(sql, p).rows.at(0).at(0)); };
   const auto warehouses = count("SELECT count(w_id) FROM warehouse WHERE w_id >= $1", {std::int64_t{1}});
@@ -878,7 +892,7 @@ void run(Database& db, const RunOptions& opts, const std::function<void(const Ph
     std::vector<Worker> workers;
     workers.reserve(threads);
     for (std::size_t t = 0; t < threads; ++t) {
-      workers.push_back(Worker{s, warehouses, scale, r.run, t, Rng{opts.seed * 1'000'003 + t}, 0, {}, 0});
+      workers.push_back(Worker{s, opts.isolation, warehouses, scale, r.run, t, Rng{opts.seed * 1'000'003 + t}, 0, {}, 0});
       workers.back().stock_level_d = uniform(workers.back().rng, 1, kDistricts);
     }
     std::vector<std::exception_ptr> errors(threads);
@@ -1220,6 +1234,25 @@ auto int_keys(const Rows& rows) -> std::vector<std::int64_t> {
 // Two transactions that each delete a key of a two-key range, having read
 // the other's, are write skew: with nothing guarding the scan both commit
 // and the range is empty.
+auto config_name(ElleConfig c) -> std::string_view {
+  switch (c) {
+    case ElleConfig::Guarded: return "guarded";
+    case ElleConfig::Unguarded: return "unguarded";
+    case ElleConfig::Blind: return "blind";
+    case ElleConfig::Serializable: return "serializable";
+  }
+  return "serializable";
+}
+
+// A transaction of the configuration: Serializable's at that level, a
+// reader's read-only.
+auto txn_options(ElleConfig c, bool reader) -> TransactionOptions {
+  TransactionOptions o;
+  if (c == ElleConfig::Serializable) o.isolation = Isolation::Serializable;
+  o.read_only = reader;
+  return o;
+}
+
 auto elle_range_history(Database& db, const ElleOptions& opts) -> std::string {
   if (!std::in_range<std::int64_t>(opts.txns) || static_cast<std::int64_t>(opts.txns) >= kRangeSpan - kRangeFresh) {
     throw std::invalid_argument("--txns is too large for the range workload");
@@ -1258,14 +1291,15 @@ auto elle_range_history(Database& db, const ElleOptions& opts) -> std::string {
             r.process = process;
             r.bucket = static_cast<std::size_t>(uniform(rng, 0, std::ssize(buckets) - 1));
             const auto& b = buckets[r.bucket];
-            if (uniform(rng, 1, 4) == 1) r.inserted = b.lo + next_fresh.fetch_add(1);
+            const auto reader = opts.read_only_third && uniform(rng, 0, 2) == 0;
+            if (!reader && uniform(rng, 1, 4) == 1) r.inserted = b.lo + next_fresh.fetch_add(1);
             r.start = now_ns();
             r.type = "ok";
             // The write a blind statement in flight carries, when it fails.
             Applied* in_flight = nullptr;
             try {
               std::optional<Transaction> txn;
-              if (!blind) txn.emplace(db.begin());
+              if (!blind) txn.emplace(db.begin(txn_options(opts.config, reader)));
               auto exec = [&](const Statement& s, std::vector<Value> p) {
                 return txn ? txn->execute(s, p) : db.execute(s, p);
               };
@@ -1279,7 +1313,7 @@ auto elle_range_history(Database& db, const ElleOptions& opts) -> std::string {
               r.scan = int_keys(exec(opts.config == ElleConfig::Guarded ? lock : scan, {b.lo, b.hi}));
               r.scan_end = now_ns();
               std::int64_t deleted_rows = 0;
-              if (r.scan->size() >= 2) {
+              if (!reader && r.scan->size() >= 2) {
                 r.deleted = r.scan->at(static_cast<std::size_t>(uniform(rng, 0, std::ssize(*r.scan) - 1)));
                 in_flight = &r.delete_applied;
                 deleted_rows = exec(del, {*r.deleted}).affected;
@@ -1325,10 +1359,7 @@ auto elle_range_history(Database& db, const ElleOptions& opts) -> std::string {
   std::vector<RangeTxn> all;
   for (auto& l : logs) std::ranges::move(l, std::back_inserter(all));
   std::ranges::sort(all, {}, &RangeTxn::start);
-  std::string out = std::format(R"({{"workload":"range","config":"{}","buckets":[)",
-                                opts.config == ElleConfig::Guarded     ? "guarded"
-                                : opts.config == ElleConfig::Unguarded ? "unguarded"
-                                                                       : "blind");
+  std::string out = std::format(R"({{"workload":"range","config":"{}","buckets":[)", config_name(opts.config));
   for (std::size_t i = 0; i < buckets.size(); ++i) {
     const auto& b = buckets[i];
     out += std::format(R"({}{{"lo":{},"hi":{},"initial":{}}})", i ? "," : "", b.lo, b.hi, keys_json(b.initial));
@@ -1387,12 +1418,13 @@ auto elle_history(Database& db, const ElleOptions& opts) -> std::string {
           auto process = static_cast<std::uint64_t>(t);
           while (remaining.fetch_sub(1) > 0) {
             std::vector<Mop> mops(static_cast<std::size_t>(uniform(rng, 1, 4)));
+            const auto reader = opts.read_only_third && uniform(rng, 0, 2) == 0;
             {
               std::lock_guard<std::mutex> g{mu};
               for (auto& m : mops) {
                 auto slot = static_cast<std::size_t>(uniform(rng, 0, kActiveKeys - 1));
                 m.key = active[slot];
-                m.append = uniform(rng, 0, 1) == 1;
+                m.append = !reader && uniform(rng, 0, 1) == 1;
                 if (m.append) {
                   m.element = next_element.fetch_add(1);
                   if (++appends[slot] == kAppendsPerKey) {
@@ -1407,7 +1439,7 @@ auto elle_history(Database& db, const ElleOptions& opts) -> std::string {
             std::string outcome = "ok";
             try {
               std::optional<Transaction> txn;
-              if (opts.config != ElleConfig::Blind) txn.emplace(db.begin());
+              if (opts.config != ElleConfig::Blind) txn.emplace(db.begin(txn_options(opts.config, reader)));
               auto exec = [&](const Statement& s, std::vector<Value> p) {
                 return txn ? txn->execute(s, p) : db.execute(s, p);
               };

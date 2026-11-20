@@ -1,0 +1,17 @@
+A unique check (and ON CONFLICT's index arbiter probe) records its prefix range.
+Expected: caught.
+Guarded-by: "serializable: a unique value a transaction freed again is a read: 40001 when it writes anything else"
+
+diff --git a/bytecaskdb-sql-layer/algebra/plan_api.cpp b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+index 66fc395..1b168bb 100644
+--- a/bytecaskdb-sql-layer/algebra/plan_api.cpp
++++ b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+@@ -3248,7 +3248,7 @@ void lock_row(bc_ctx* cx, BytesView pk, BytesView row) {
+ // earlier statement deleted it is no claim.
+ [[nodiscard]] auto prefix_taken(bc_ctx* cx, BytesView prefix, BytesView end, bool& claim) -> std::optional<bool> {
+   claim = true;
+-  auto rec = cx->record_range(prefix, end);
++  auto rec = cx->record_range(prefix, prefix);
+   if (!rec) return std::nullopt;
+   const auto& base = cx->view(*rec);
+   if (cx->overlay != nullptr && cx->overlay->meets(prefix, end)) {

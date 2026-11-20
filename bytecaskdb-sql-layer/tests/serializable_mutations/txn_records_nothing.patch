@@ -1,0 +1,17 @@
+A SERIALIZABLE transaction's statements record into its read set (the level switch).
+Expected: caught.
+Guarded-by: "serializable: a procedure's reads are its transaction's"
+
+diff --git a/bytecaskdb-sql-layer/algebra/plan_api.cpp b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+index 66fc395..4b145ce 100644
+--- a/bytecaskdb-sql-layer/algebra/plan_api.cpp
++++ b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+@@ -3632,7 +3632,7 @@ void bc_ctx_begin_txn(bc_ctx* cx, bc_txn* txn, const bc_params* params, bc_budge
+   cx->overlay = txn->overlay.get();
+   // Its reads join the transaction's read set: those of a procedure's
+   // statements too, which run without bc_ctx_run.
+-  cx->read_set = txn->records() ? &txn->reads : nullptr;
++  cx->read_set = nullptr;
+   BC_GUARD_END(cx)
+ }
+ 

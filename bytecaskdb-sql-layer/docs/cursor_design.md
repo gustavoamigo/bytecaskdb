@@ -451,6 +451,12 @@ transaction's snapshot and overlay as they are at `COMMIT`. Decided
 (2026-10-28): it is **lazy**. It holds the snapshot, never a materialised
 result.
 
+In a SERIALIZABLE transaction that is not read-only it is refused with
+0A000: its fetches after `COMMIT` belong to no transaction, so their reads
+could not join the commit's check (`transaction_design.md`, *Read sets
+across savepoints, failed statements and cursors*). A read-only one is
+placed at its snapshot, which the cursor reads, and takes it.
+
 - **Hold the snapshot (decided).** The cursor keeps what `DECLARE` pinned: the
   snapshot, the overlay copy of the transaction's writes at `DECLARE`
   (phase 2's shared copy-on-write overlay, which survives the commit), the

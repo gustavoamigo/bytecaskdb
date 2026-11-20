@@ -1,0 +1,17 @@
+bc_get and bc_insert_or_existing record the key they read (read_record).
+Expected: caught.
+Guarded-by: "serializable: one changed read fails a writer: a single anti-dependency\, PostgreSQL commits it (cases A\, B)"
+
+diff --git a/bytecaskdb-sql-layer/algebra/plan_api.cpp b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+index 66fc395..d24b085 100644
+--- a/bytecaskdb-sql-layer/algebra/plan_api.cpp
++++ b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+@@ -2443,7 +2443,7 @@ void leave_entry(bc_ctx* cx, Cursor& c) noexcept {
+ // transaction sees it.
+ auto read_record(bc_ctx* cx, BytesView key, bool* found) -> bc_view {
+   if (found != nullptr) *found = false;
+-  auto rec = cx->record_point(key);  // found absent or present, the key is read
++  auto rec = cx->record_point(BytesView{});  // found absent or present, the key is read
+   if (!rec || !cx->charge()) return {};
+   Bytes out;
+   if (!view_get(cx, *rec, key, out)) return {};

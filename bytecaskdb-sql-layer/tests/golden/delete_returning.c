@@ -1,5 +1,5 @@
 // DELETE FROM t WHERE id = $1 RETURNING name
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_1 t, COL_1_1 t.name
 #include "bc_plan.h"
 enum { TBL_1 = 1, COL_1_1 = 1 };

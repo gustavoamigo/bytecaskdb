@@ -1,5 +1,5 @@
 // SELECT o_id, o_carrier_id, o_entry_d FROM orders WHERE o_d_id = $1 AND o_w_id = $2 AND o_c_id = $3 ORDER BY o_id DESC LIMIT 1
-// isolation: snapshot   schema: catalog v13
+// schema: catalog v13
 // objects: IDX_17 orders_i2, COL_15_0 orders.o_id, COL_15_4 orders.o_carrier_id, COL_15_7 orders.o_entry_d
 #include "bc_plan.h"
 enum { IDX_17 = 17, COL_15_0 = 0, COL_15_4 = 4, COL_15_7 = 7 };

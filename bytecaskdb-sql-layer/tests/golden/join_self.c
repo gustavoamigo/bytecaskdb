@@ -1,5 +1,5 @@
 // SELECT x.id, y.id FROM t x JOIN t y ON y.id = x.qty WHERE x.name = $1
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: IDX_3 t_by_name, COL_1073741824_0 x.id, COL_1073741824_2 x.qty, TBL_1073741825 y, COL_1073741825_0 y.id
 #include "bc_plan.h"
 enum { IDX_3 = 3, COL_1073741824_0 = 0, COL_1073741824_2 = 2, TBL_1073741825 = 1, COL_1073741825_0 = 0 };

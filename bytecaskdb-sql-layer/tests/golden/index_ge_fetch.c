@@ -1,5 +1,5 @@
 // SELECT id, qty FROM t WHERE name >= $1
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: IDX_3 t_by_name, COL_1_0 t.id, COL_1_2 t.qty
 #include "bc_plan.h"
 enum { IDX_3 = 3, COL_1_0 = 0, COL_1_2 = 2 };

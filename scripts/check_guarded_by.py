@@ -14,11 +14,13 @@ own, so an OR whose one side is a typo fails too. The binary lists the
 matches (`--list-tests`), so the spec is matched by Catch2 itself.
 
 A patch that touches bytecaskdb-mariadb-plugin/ names a test of the plugin's
-binary (mariadb_proof_tests); every other patch names one of bytecask_tests.
-Pass the binary and the scope it serves. A soak or chaos patch the rig
+binary (mariadb_proof_tests); a SQL layer patch
+(bytecaskdb-sql-layer/tests/serializable_mutations/) one of sql_layer_tests;
+every other patch names one of bytecask_tests. Pass the binary and the scope
+it serves. A soak or chaos patch the rig
 itself judges, with no Guarded-by header, is not checked here.
 
-Usage: scripts/check_guarded_by.py --scope engine|plugin <test binary> [root]
+Usage: scripts/check_guarded_by.py --scope engine|plugin|sql <test binary> [root]
 """
 
 import argparse
@@ -29,6 +31,7 @@ import sys
 
 DIRS = ("tests/soak_mutations", "tests/chaos_mutations",
         "tests/durability_mutations")
+SQL_DIRS = ("bytecaskdb-sql-layer/tests/serializable_mutations",)
 HEADER = re.compile(r'^Guarded-by:\s*"(.*)"\s*$')
 PLUGIN = "bytecaskdb-mariadb-plugin/"
 
@@ -75,17 +78,17 @@ def matches(binary: str, spec: str) -> list[str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scope", choices=("engine", "plugin"), required=True)
+    ap.add_argument("--scope", choices=("engine", "plugin", "sql"), required=True)
     ap.add_argument("binary")
     ap.add_argument("root", nargs="?", default=".")
     args = ap.parse_args()
 
     root = pathlib.Path(args.root)
     failures = checked = 0
-    for d in DIRS:
+    for d in SQL_DIRS if args.scope == "sql" else DIRS:
         for patch in sorted((root / d).glob("*.patch")):
             text = patch.read_text()
-            if is_plugin_patch(text) != (args.scope == "plugin"):
+            if args.scope != "sql" and is_plugin_patch(text) != (args.scope == "plugin"):
                 continue
             for spec in specs_of(text):
                 for frag in fragments(spec):

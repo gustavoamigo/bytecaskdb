@@ -1,0 +1,16 @@
+bc_ctx_begin clears an autocommit execution's read set, so a retry submits only its own reads.
+Expected: caught.
+Guarded-by: "serializable: an autocommit retry submits only its own attempt's reads"
+
+diff --git a/bytecaskdb-sql-layer/algebra/plan_api.cpp b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+index 66fc395..2d5ca03 100644
+--- a/bytecaskdb-sql-layer/algebra/plan_api.cpp
++++ b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+@@ -1753,7 +1753,6 @@ struct bc_ctx {
+     write_held = 0;
+     clear_write_slots(written_tables);
+     reads = 0;
+-    own_reads.clear();  // a new execution, or a retry's attempt, starts with an empty read set
+     rw_conflict = false;
+   }
+ 

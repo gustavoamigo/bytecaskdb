@@ -1,5 +1,5 @@
 // SELECT a, b, max(w) FROM p WHERE a = $1 GROUP BY a, b LIMIT 2
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_4 p, COL_4_0 p.a, COL_4_1 p.b, COL_4_3 p.w
 #include "bc_plan.h"
 enum { TBL_4 = 4, COL_4_0 = 0, COL_4_1 = 1, COL_4_3 = 3 };

@@ -1,0 +1,17 @@
+A SERIALIZABLE writer guards the catalog version (commit step 4).
+Expected: caught.
+Guarded-by: "serializable: any DDL committed during a writer fails it; a reader commits"
+
+diff --git a/bytecaskdb-sql-layer/algebra/plan_api.cpp b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+index 66fc395..88c46e4 100644
+--- a/bytecaskdb-sql-layer/algebra/plan_api.cpp
++++ b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+@@ -4502,7 +4502,7 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
+     // since its snapshot, makes the commit a conflict.
+     for (auto id : txn->written) plan.ensure_unchanged(bytecask::sql::table_record_key(id));
+     // SERIALIZABLE (step 4): every object it was bound through is as it was.
+-    if (serial) plan.ensure_unchanged(bytecask::sql::catalog_version_key());
++
+     r = submit(out, *txn->db, std::move(plan), sync);
+     if (r == BC_CONFLICT) r = conflict_or_duplicate(out, *txn->db, txn->claims, txn->locks, txn->overlay.get());
+   }

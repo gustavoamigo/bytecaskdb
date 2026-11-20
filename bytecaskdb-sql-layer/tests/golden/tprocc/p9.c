@@ -1,5 +1,5 @@
 // UPDATE customer SET c_balance = $1, c_data = $2 WHERE c_w_id = $3 AND c_d_id = $4 AND c_id = $5
-// isolation: snapshot   schema: catalog v13
+// schema: catalog v13
 // objects: TBL_8 customer, COL_8_16 customer.c_balance, COL_8_20 customer.c_data
 #include "bc_plan.h"
 enum { TBL_8 = 8, COL_8_16 = 16, COL_8_20 = 20 };

@@ -1,5 +1,5 @@
 // SELECT count(*), min(b), max(b) FROM p WHERE a = $1
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_4 p, PART_4_1 p.b
 #include "bc_plan.h"
 enum { TBL_4 = 4, PART_4_1 = 1 };

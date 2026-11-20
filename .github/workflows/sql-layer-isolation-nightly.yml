@@ -2,11 +2,14 @@
 # The SQL layer's isolation check (bytecaskdb-sql-layer/docs/testing_design.md,
 # *The TPROC-C harness*): sql_layer_tprocc elle records the point
 # (list-append) and range (scans and deletes) workloads through SQL, guarded,
-# unguarded and blind, and bytecaskdb-sql-layer/scripts/sql_isolation_check.py
-# checks them with Elle and the range check. A short budget: guarded must be
+# unguarded, blind and serializable (a third read-only in a second run), and
+# bytecaskdb-sql-layer/scripts/sql_isolation_check.py checks them with Elle and
+# the range check. A short budget: guarded and serializable must be
 # strict-serializable and keep the range invariant; unguarded must show write
 # skew and an emptied range, and blind a lost update and an emptied range, at
-# least once over the run.
+# least once over the run. Then SERIALIZABLE's mutation set
+# (bytecaskdb-sql-layer/scripts/serializable_mutation_check.sh): each patch
+# must fail the test its Guarded-by header names.
 #
 # Its own workflow, apart from the engine's isolation-nightly.yml, so that a PR
 # changing one side runs only its own check. It runs nightly, on manual
@@ -33,6 +36,8 @@ on:
       - "bytecaskdb-sql-layer/harness/**"
       - "bytecaskdb-sql-layer/scripts/sql_isolation_check.py"
       - "bytecaskdb-sql-layer/scripts/test_sql_isolation_check.py"
+      - "bytecaskdb-sql-layer/scripts/serializable_mutation_check.sh"
+      - "bytecaskdb-sql-layer/tests/serializable_mutations/**"
       - ".github/workflows/sql-layer-isolation-nightly.yml"
 
 permissions:
@@ -47,7 +52,7 @@ env:
 jobs:
   sql-isolation:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     container:
       image: fedora:43
     env:
@@ -55,6 +60,10 @@ jobs:
       XMAKE_ROOT: "y"
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The mutations apply by three-way merge, which needs the blobs
+          # they were made against (scripts/mutation_patch.sh).
+          fetch-depth: 0
 
       - name: Install dependencies
         run: |
@@ -120,6 +129,13 @@ jobs:
           ARGS="$ARGS --txns 5000 --threads 16 --out $RUNNER_TEMP/sql-isolation"
           if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
           python3 bytecaskdb-sql-layer/scripts/sql_isolation_check.py $ARGS
+
+      - name: SERIALIZABLE's mutations each fail their test
+        env:
+          SQL_LAYER_TESTS: build/linux/x86_64/releasedbg/sql_layer_tests
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          bytecaskdb-sql-layer/scripts/serializable_mutation_check.sh
 
       - name: Upload histories and Elle output
         if: failure()

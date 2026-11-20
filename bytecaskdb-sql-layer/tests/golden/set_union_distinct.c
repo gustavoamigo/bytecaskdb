@@ -1,5 +1,5 @@
 // SELECT qty FROM t UNION SELECT s FROM r
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_1 t, COL_1_2 t.qty, TBL_7 r, COL_7_1 r.s
 #include "bc_plan.h"
 enum { TBL_1 = 1, COL_1_2 = 2, TBL_7 = 7, COL_7_1 = 1 };

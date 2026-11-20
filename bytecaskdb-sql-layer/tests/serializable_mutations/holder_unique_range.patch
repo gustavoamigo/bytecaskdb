@@ -1,0 +1,17 @@
+ON CONFLICT DO UPDATE's holder() records the unique arbiter's prefix range.
+Expected: caught.
+Guarded-by: "serializable: ON CONFLICT DO UPDATE's probe is a read of the arbiter key; a range DELETE's rows are read"
+
+diff --git a/bytecaskdb-sql-layer/algebra/plan_api.cpp b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+index 66fc395..6c615cc 100644
+--- a/bytecaskdb-sql-layer/algebra/plan_api.cpp
++++ b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+@@ -6997,7 +6997,7 @@ void insert_row(bc_ctx* cx, NewRow& n, std::span<const std::uint32_t> arbiters)
+     auto prefix = n.entries[i].prefix();
+     if (cx->unique_written.contains({ix.id, Bytes(prefix.begin(), prefix.end())})) return twice();
+     auto end = bytecask::sql::key_successor(prefix);
+-    auto rec = cx->record_range(prefix, end);
++    auto rec = cx->record_range(prefix, prefix);
+     if (!rec || !cx->charge()) return false;
+     ViewEntries entries{cx->view(*rec), cx->overlay, prefix, end, false};
+     if (!entries.next(cx)) {

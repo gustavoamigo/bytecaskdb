@@ -1,5 +1,5 @@
 // SELECT t.id FROM t, p WHERE t.name = $1 AND p.w = $2 ORDER BY p.v
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: IDX_3 t_by_name, COL_1_0 t.id, IDX_6 p_w, COL_4_2 p.v
 #include "bc_plan.h"
 enum { IDX_3 = 3, COL_1_0 = 0, IDX_6 = 6, COL_4_2 = 2 };

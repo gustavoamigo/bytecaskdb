@@ -1,5 +1,5 @@
 // SELECT SUM(ol_amount) FROM order_line WHERE ol_o_id = $1 AND ol_d_id = $2 AND ol_w_id = $3
-// isolation: snapshot   schema: catalog v13
+// schema: catalog v13
 // objects: TBL_18 order_line, COL_18_6 order_line.ol_amount
 #include "bc_plan.h"
 enum { TBL_18 = 18, COL_18_6 = 6 };

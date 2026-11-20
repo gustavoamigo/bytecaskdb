@@ -6,7 +6,9 @@
 //
 //   sql_layer_tprocc load --dir D [--warehouses W] [--seed N] [--sql-out FILE]
 //   sql_layer_tprocc run  --dir D [--threads 1,16,48] [--warmup S] [--duration S] [--seed N] [--json FILE]
-//   sql_layer_tprocc elle --dir D --config guarded|unguarded|blind [--workload point|range] [--threads N] [--txns N]
+//                         [--isolation snapshot|serializable]
+//   sql_layer_tprocc elle --dir D --config guarded|unguarded|blind|serializable [--read-only-third yes]
+//                         [--workload point|range] [--threads N] [--txns N]
 //                         [--seed N] --out FILE
 //   sql_layer_tprocc check --dir D
 //   sql_layer_tprocc next-run --dir D
@@ -120,6 +122,10 @@ auto run_main(int argc, char** argv) -> int {
     opts.warmup = std::chrono::seconds{number<std::int64_t>(f, "warmup", "10")};
     opts.duration = std::chrono::seconds{number<std::int64_t>(f, "duration", "60")};
     opts.seed = number<std::uint64_t>(f, "seed", "1");
+    const auto isolation = get(f, "isolation", "snapshot");
+    opts.isolation = isolation == "snapshot"       ? bytecask::sql::Isolation::Snapshot
+                     : isolation == "serializable" ? bytecask::sql::Isolation::Serializable
+                                                   : throw std::invalid_argument("--isolation is snapshot or serializable");
     std::optional<std::ofstream> json;
     if (f.contains("json")) json = output(f.at("json"), std::ios::app);
     auto db = bytecask::sql::Database::open(dir);
@@ -172,10 +178,15 @@ auto run_main(int argc, char** argv) -> int {
   if (cmd == "elle") {
     const auto config = get(f, "config", "");
     tprocc::ElleOptions opts;
-    opts.config = config == "guarded"     ? tprocc::ElleConfig::Guarded
-                  : config == "unguarded" ? tprocc::ElleConfig::Unguarded
-                  : config == "blind"     ? tprocc::ElleConfig::Blind
-                                          : throw std::invalid_argument("--config is guarded, unguarded or blind");
+    opts.config = config == "guarded"        ? tprocc::ElleConfig::Guarded
+                  : config == "unguarded"    ? tprocc::ElleConfig::Unguarded
+                  : config == "blind"        ? tprocc::ElleConfig::Blind
+                  : config == "serializable" ? tprocc::ElleConfig::Serializable
+                                             : throw std::invalid_argument("--config is guarded, unguarded, blind or serializable");
+    opts.read_only_third = get(f, "read-only-third", "no") == "yes";
+    if (opts.read_only_third && opts.config != tprocc::ElleConfig::Serializable) {
+      throw std::invalid_argument("--read-only-third yes goes with --config serializable");
+    }
     const auto workload = get(f, "workload", "point");
     opts.workload = workload == "point"   ? tprocc::ElleWorkload::Point
                     : workload == "range" ? tprocc::ElleWorkload::Range

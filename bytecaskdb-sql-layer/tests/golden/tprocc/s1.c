@@ -1,5 +1,5 @@
 // SELECT d_next_o_id FROM district WHERE d_w_id = $1 AND d_id = $2
-// isolation: snapshot   schema: catalog v13
+// schema: catalog v13
 // objects: TBL_6 district, COL_6_4 district.d_next_o_id
 #include "bc_plan.h"
 enum { TBL_6 = 6, COL_6_4 = 4 };

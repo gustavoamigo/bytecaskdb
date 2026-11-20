@@ -1,5 +1,5 @@
 // SELECT COUNT(DISTINCT s_i_id) FROM order_line, stock WHERE ol_w_id = $1 AND ol_d_id = $2 AND ol_o_id < $3 AND ol_o_id >= $3 - 20 AND s_w_id = $1 AND s_i_id = ol_i_id AND s_quantity < $4
-// isolation: snapshot   schema: catalog v13
+// schema: catalog v13
 // objects: TBL_18 order_line, COL_18_4 order_line.ol_i_id, TBL_22 stock, COL_22_0 stock.s_i_id, COL_22_2 stock.s_quantity
 #include "bc_plan.h"
 enum { TBL_18 = 18, COL_18_4 = 4, TBL_22 = 22, COL_22_0 = 0, COL_22_2 = 2 };

@@ -1,5 +1,5 @@
 // SELECT t.id, p.v, r.s FROM t LEFT JOIN p ON p.a = t.qty AND p.b = $1 LEFT JOIN r ON r.id = p.w WHERE t.name = $2
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: IDX_3 t_by_name, COL_1_0 t.id, COL_1_2 t.qty, TBL_4 p, COL_4_2 p.v, COL_4_3 p.w, TBL_7 r, COL_7_1 r.s
 #include "bc_plan.h"
 enum { IDX_3 = 3, COL_1_0 = 0, COL_1_2 = 2, TBL_4 = 4, COL_4_2 = 2, COL_4_3 = 3, TBL_7 = 7, COL_7_1 = 1 };

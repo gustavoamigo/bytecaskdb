@@ -1,5 +1,5 @@
 // SELECT c_data FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3
-// isolation: snapshot   schema: catalog v13
+// schema: catalog v13
 // objects: TBL_8 customer, COL_8_20 customer.c_data
 #include "bc_plan.h"
 enum { TBL_8 = 8, COL_8_20 = 20 };

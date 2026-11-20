@@ -1,0 +1,17 @@
+bc_scan_open reserves the range its cursor reads.
+Expected: caught.
+Guarded-by: "serializable: an empty range read is guarded against a phantom; disjoint ranges commit"
+
+diff --git a/bytecaskdb-sql-layer/algebra/plan_api.cpp b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+index 66fc395..f6c30e1 100644
+--- a/bytecaskdb-sql-layer/algebra/plan_api.cpp
++++ b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+@@ -5653,7 +5653,7 @@ bc_cursor bc_scan_open(bc_ctx* cx, uint32_t table_or_index, bc_view lo, bc_view
+   auto end = bytecask::sql::key_successor(c.prefix);
+   BytesView rlo = std::is_lt(bytes_cmp(c.lo, c.prefix)) ? BytesView{c.prefix} : BytesView{c.lo};
+   BytesView rhi = !c.hi.empty() && std::is_lt(bytes_cmp(c.hi, end)) ? BytesView{c.hi} : BytesView{end};
+-  c.recorded = cx->record_scan(c, rlo, rhi);
++  c.recorded = cx->record_scan(c, rlo, rlo);
+   if (!c.recorded) return {};
+   c.held = cursor_bytes(c);
+   auto gen = c.gen;

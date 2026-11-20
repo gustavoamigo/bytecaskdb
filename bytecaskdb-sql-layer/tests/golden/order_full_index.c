@@ -1,5 +1,5 @@
 // SELECT id, d FROM r WHERE id >= $1 ORDER BY d DESC LIMIT 3
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: IDX_10 r_d, COL_7_0 r.id, COL_7_2 r.d
 #include "bc_plan.h"
 enum { IDX_10 = 10, COL_7_0 = 0, COL_7_2 = 2 };

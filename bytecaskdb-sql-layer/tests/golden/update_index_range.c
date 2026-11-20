@@ -1,5 +1,5 @@
 // UPDATE p SET v = v + $2 WHERE w < $1
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_4 p, IDX_6 p_w, COL_4_2 p.v
 #include "bc_plan.h"
 enum { TBL_4 = 4, IDX_6 = 6, COL_4_2 = 2 };

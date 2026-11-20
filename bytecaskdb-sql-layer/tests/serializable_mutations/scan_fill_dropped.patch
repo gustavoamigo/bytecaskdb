@@ -1,0 +1,19 @@
+A cursor's reservation is filled into the read set when it ends.
+Expected: caught.
+Guarded-by: "serializable: write skew is 40001 at the second commit with nothing written; at Snapshot both commit"
+
+diff --git a/bytecaskdb-sql-layer/algebra/plan_api.cpp b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+index 66fc395..f2014f2 100644
+--- a/bytecaskdb-sql-layer/algebra/plan_api.cpp
++++ b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+@@ -2160,9 +2160,7 @@ void bc_ctx::finish_scan(Cursor& c) noexcept {
+   std::swap(nh.key(), *lo);
+   std::swap(nh.mapped(), *hi);
+   count_transition(ReadSetTransition::Fill);
+-  const auto before = read_set->bytes;
+-  read_set->add_range(std::move(nh));
+-  read_release(before + r->charge - read_set->bytes);
++  read_release(r->charge);
+ }
+ 
+ void txn_detach(bc_txn* txn, bc_ctx* cx, bool abandoned) noexcept {

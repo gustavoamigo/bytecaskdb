@@ -1,5 +1,5 @@
 // SELECT p.v FROM r, p WHERE r.id = $1 AND p.a = $2 AND p.w = r.s ORDER BY p.v NULLS FIRST LIMIT 5
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_7 r, COL_7_1 r.s, TBL_4 p, COL_4_2 p.v, COL_4_3 p.w
 #include "bc_plan.h"
 enum { TBL_7 = 7, COL_7_1 = 1, TBL_4 = 4, COL_4_2 = 2, COL_4_3 = 3 };

@@ -1,5 +1,5 @@
 // SELECT id FROM t WHERE name >= $1 FOR UPDATE
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_1 t, IDX_3 t_by_name, COL_1_0 t.id
 #include "bc_plan.h"
 enum { TBL_1 = 1, IDX_3 = 3, COL_1_0 = 0 };

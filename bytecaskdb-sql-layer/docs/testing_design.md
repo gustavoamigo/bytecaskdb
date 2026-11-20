@@ -564,7 +564,7 @@ through SQL runs nightly, below.
 **Elle through SQL.** `elle` records a history through SQL, and
 `scripts/sql_isolation_check.py` checks it. It has two workloads,
 `--workload point` (the default) and `--workload range`, each in the
-three configurations below; the script runs both (`--workloads point,range`).
+configurations below; the script runs both (`--workloads point,range`).
 The point workload is list-append, in the engine harness's history format
 (`docs/isolation_checking_design.md`), checked with the engine's tooling:
 `run_elle` and `cross_check` from `scripts/run_isolation_check.py`.
@@ -587,6 +587,15 @@ The point workload is list-append, in the engine harness's history format
   read the final value does not extend), or else by Elle. Elle runs on it
   only when the cross-check found none: the history is large and invalid,
   and Elle's search and plots of it take tens of minutes.
+- `serializable` (`--config serializable`): every transaction at
+  `Isolation::Serializable`, with plain reads and no `FOR UPDATE`
+  (`transaction_design.md`, *Serializable isolation*). It must be valid
+  under `strict-serializable`. The script runs it twice: as is, and with
+  `--read-only-third yes`, where a third of the transactions only read and
+  are begun read-only, so they record nothing and are placed at their
+  snapshot; that run (`serializable-ro` in the script) must be valid under
+  `strict-serializable` too, the check of *Read-only serializable
+  transactions*.
 - A completed `commit()` is `:ok`, a `SerializationFailure` `:fail`, and
   `TransactionResolutionUnknown` `:info`. In `blind`, a statement that
   conflicted on every retry is `:info`: the statements before it committed.
@@ -621,6 +630,10 @@ commit reports no sequence to replay, so the script checks it itself
   an empty range, and no commit order is needed to say so.
 - `guarded` scans with `FOR UPDATE`, so a concurrent delete of a key it saw
   is 40001 at its commit. It must keep the invariant every round.
+- `serializable` scans plainly at `Isolation::Serializable`, whose read set
+  guards the scanned range; with `--read-only-third yes` a third of the
+  transactions only scan, read-only. Both must keep the invariant every
+  round.
 - `unguarded` scans plainly, and `blind` runs each statement in
   autocommit. Each must break the invariant at least once over the run: a
   committed scan that saw none of its range's keys but its own insert, or
@@ -639,7 +652,8 @@ commit reports no sequence to replay, so the script checks it itself
 
 **Nightly.** `.github/workflows/sql-layer-isolation-nightly.yml`, its own workflow so that a pull request to the engine or to the layer runs only its own isolation check:
 a `releasedbg` build, two rounds of 5,000 transactions on 16 threads, over
-both workloads and all three configurations, with Elle. It also runs on a
+both workloads and every configuration, with Elle; then SERIALIZABLE's
+mutation set (`scripts/serializable_mutation_check.sh`). It also runs on a
 pull request that changes the harness or the script. A local run of the
 same budget takes under a minute.
 
@@ -648,7 +662,8 @@ Commands:
 ```sh
 xmake f -m releasedbg --sql_layer=y && xmake build sql_layer_tprocc
 sql_layer_tprocc load --dir /tmp/tprocc --warehouses 48
-sql_layer_tprocc run --dir /tmp/tprocc --threads 1,16,48 --duration 300 --warmup 60
+sql_layer_tprocc run --dir /tmp/tprocc --threads 1,16,48 --duration 300 --warmup 60 \
+  [--isolation serializable]   # New-Order's district read without FOR UPDATE
 python3 bytecaskdb-sql-layer/scripts/sql_isolation_check.py \
   --binary build/linux/x86_64/releasedbg/sql_layer_tprocc --elle-jar elle-cli.jar --rounds 4 \
   [--workloads point,range]

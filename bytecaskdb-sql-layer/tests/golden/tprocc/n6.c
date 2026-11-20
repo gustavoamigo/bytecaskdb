@@ -1,5 +1,5 @@
 // UPDATE stock SET s_quantity = $1 WHERE s_i_id = $2 AND s_w_id = $3
-// isolation: snapshot   schema: catalog v13
+// schema: catalog v13
 // objects: TBL_22 stock, COL_22_2 stock.s_quantity
 #include "bc_plan.h"
 enum { TBL_22 = 22, COL_22_2 = 2 };

@@ -1,0 +1,32 @@
+ROLLBACK TO keeps the read set's charge: a mark does not restore read_bytes.
+Expected: caught.
+Guarded-by: "serializable: ROLLBACK TO keeps the reads made since the savepoint\, and so does a failed statement"
+
+diff --git a/bytecaskdb-sql-layer/algebra/plan_api.cpp b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+index 66fc395..ac5dc21 100644
+--- a/bytecaskdb-sql-layer/algebra/plan_api.cpp
++++ b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+@@ -1780,6 +1780,7 @@ struct TxnMark {
+   // statement, or a re-pin after it, has not seen.
+   std::shared_ptr<const Catalog> catalog;
+   bool backfill;
++  std::uint64_t read_bytes{0};
+ };
+ 
+ // A transaction (docs/transaction_design.md): the snapshot and catalog
+@@ -2200,6 +2201,7 @@ void txn_restore(bc_txn* txn, const TxnMark& m) noexcept {
+   txn->locks.erase(txn->locks.begin() + static_cast<std::ptrdiff_t>(m.locks), txn->locks.end());
+   txn->written.erase(txn->written.begin() + static_cast<std::ptrdiff_t>(m.written), txn->written.end());
+   txn->held = m.held;
++  txn->read_bytes = m.read_bytes;
+   txn->recount_marks();
+   txn_trim_reservation(txn);
+ }
+@@ -4335,6 +4337,7 @@ uint32_t bc_txn_savepoint(bc_txn* txn) {
+   txn->marks.push_back(TxnMark{txn->overlay, txn->guards.size(), txn->claims.size(), txn->locks.size(),
+                                txn->written.size(), txn->held, txn->has_ddl() ? txn->catalog : nullptr,
+                                txn->backfill});
++  txn->marks.back().read_bytes = txn->read_bytes;
+   return static_cast<std::uint32_t>(txn->marks.size());
+   BC_GUARD_END(txn)
+   return 0;  // nothing was pushed: the transaction is as it was

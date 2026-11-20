@@ -1,5 +1,5 @@
 // SELECT o_c_id FROM orders WHERE o_id = $1 AND o_d_id = $2 AND o_w_id = $3
-// isolation: snapshot   schema: catalog v13
+// schema: catalog v13
 // objects: TBL_15 orders, COL_15_3 orders.o_c_id
 #include "bc_plan.h"
 enum { TBL_15 = 15, COL_15_3 = 3 };
