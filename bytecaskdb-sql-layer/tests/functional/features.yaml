@@ -2072,4 +2072,6 @@ pg:where-current-of:
 pg:name-type:
   description: the NAME type, an identifier of at most 63 bytes
 pg:qualified-type-name:
-  description: a type name qualified by a schema; only pg_catalog holds types while the layer has no schemas
+  description: a type name qualified by a schema; only pg_catalog holds types the layer can use
+pg:schemas:
+  description: CREATE SCHEMA and DROP SCHEMA, and names qualified by a schema, resolved as PostgreSQL 17 resolves them with search_path public

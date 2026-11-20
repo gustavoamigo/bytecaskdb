@@ -678,8 +678,10 @@ Status: **design, approved by the owner on 2026-11-20** (#713, option 1),
 with every recommendation under *Open questions for the owner*: Q1 (a),
 Q2 (a), Q3 (a), Q4 (a), Q5 (a), Q6 (a), Q7 (a), Q8 (a), Q9 (b). Built:
 both fixes before stage 1 (qualified type names; a view's dependencies
-from the binder's resolution) and stage 1a (lookups keyed by (schema,
-name), schema 0 only); stages 1b to 5 are not built. This section covers what
+from the binder's resolution), stage 1a (lookups keyed by (schema, name))
+and stage 1b (the schema record, `CREATE SCHEMA` and `DROP SCHEMA` without
+elements or `CASCADE`, qualified names; *Stages of schemas* says what was
+adapted); stages 2 to 5 are not built. This section covers what
 `CREATE SCHEMA` and `DROP SCHEMA` do, how a schema-qualified name resolves,
 the schema record and the change to the name entries' keys, what an older
 build does with a database that holds a schema, `WITH CHECK OPTION` (which
@@ -1306,7 +1308,7 @@ makes it. Rows are named by their first words.
 | "A table or view that a view reads cannot be dropped" | **Widened** by stage 5: `DROP SCHEMA … CASCADE` drops the views that read what it drops. DROP TABLE and DROP VIEW stay RESTRICT only. Before stage 1, **fixed** (built): the guarantee now also holds for a table read only by an `ORDER BY` subquery. Test: "embedded API: a view's dependencies are every relation its query reads, a subquery's in any position". |
 | "`Database::open` of a database written by an SQL-layer build from before #780" | Unchanged in substance: a database holding a record this build wrote, any schema included, is refused by a build from before stage 1b. Proved by the older build's own "catalog: a damaged or foreign-format record is refused" and by this build's test that every record and ACL it writes is in the new format. |
 | "A DDL statement given to a `Transaction`" | **Widened** to `CREATE SCHEMA` and `DROP SCHEMA`; a `CREATE SCHEMA`'s elements are steps of the transaction; `DROP SCHEMA` of what an open cursor reads is 55006. Tests: stage 1b and 5's `api_txn_ddl_test` cases. |
-| New, stage 1b | **Added**: qualified names resolve to that schema's object or fail with PG 17's SQLSTATE (3F000, 42P01, 42704, 42883, 42501, 0A000, 42601); an unqualified name resolves in `public`; `CREATE SCHEMA`/`DROP SCHEMA` errors (42P06, 42939, 3F000, 2BP01). Tests: "schemas: a qualified name resolves to that schema's object or fails with PostgreSQL's SQLSTATE", "schemas: CREATE and DROP SCHEMA errors are PostgreSQL's", `tests/functional/cases/postgresql/schemas.yaml`. |
+| New, stage 1b | **Added**: qualified names resolve to that schema's object or fail with PG 17's SQLSTATE (3F000, 42P01, 42704, 42883, 42501, 0A000, 42601); an unqualified name resolves in `public`; `CREATE SCHEMA`/`DROP SCHEMA` errors (42P06, 42939, 3F000, 2BP01). Tests (as built): "schemas: CREATE and DROP SCHEMA errors are PostgreSQL's", "schemas: messages name a missing object as s.x, and DROP SCHEMA and DROP ROLE list as PostgreSQL 17 does", "schemas: a schema is a record, a name entry and an ACL record, and its objects are its own through a reopen", "catalog: lookups are keyed by (schema, name), and a DDL creating in a schema that does not exist is refused", `tests/functional/cases/postgresql/schemas.yaml`, sqltest f311_01_01_01; the row in `CONTRACT.md` names the rest. |
 | New, before stage 1 | **Narrowed**: a type name qualified by anything but `pg_catalog.` is refused (3F000, or 42704 for `public.`), where its last part was read alone. Test: "parser: a qualified type name other than pg_catalog's is refused". |
 | New, stage 2 | **Added**: a view resolves each unqualified name to the object it was created against, whatever is created later. Tests: stage 2's shadowing test, through a reopen. |
 | New, stage 3 | **Added**: a row written through a view with a check option that its checked `WHERE`s do not hold true is 44000 and writes nothing. Tests: stage 3's cases. |
@@ -1434,6 +1436,89 @@ a DDL naming a schema but public is refused".
   RESTRICT DETAIL rules (several kinds, a view in `public` over a view of
   the schema, more than 100 objects, two schemas named), a quoted name.
   `test_sql_machine` gains schema DDL in its model.
+
+As built, with what the code made different:
+- **The parser keeps a schema's name, the binder resolves it.** The
+  parser cannot know a schema's id, and a prepared statement is bound
+  again after every DDL, so a schema dropped and created again is another
+  id. Every AST name is an `ast::ObjectName` (the schema as written, "" for
+  none, and the name; `sql/ast.cppm`), and the binder turns it into a
+  `QualifiedName` where it looks it up: `bound::lookup_name` for a read (a
+  schema that does not exist is `kMissingSchema`, where nothing is, so a
+  read is 42P01 naming `s.t`), `created_name` for a `CREATE` (3F000, or
+  the system schema refusals), `dropped_name` for a `DROP` (3F000, or under
+  `IF EXISTS` a `SkippedDdl`, a DDL that changes nothing and gives
+  PostgreSQL's NOTICE `schema "s" does not exist, skipping`). The rule that
+  a site does not compile until it says which schema still holds: an
+  `ObjectName` does not convert to a `QualifiedName`.
+- **System schemas are ids no record has**: `pg_catalog`,
+  `information_schema` and `pg_toast` resolve to `kPgCatalogSchema` and its
+  neighbours (`sql/names.cppm`), above every object and role id. A lookup
+  there finds nothing; the catalog refuses a `CREATE` there (3F000) behind
+  the binder's own refusals. `pg_temp` is no schema, as in a PostgreSQL
+  session that has made no temporary object: a read of `pg_temp.x` is
+  42P01, a `DROP` 3F000, a `CREATE` 0A000.
+- **A user schema's type** (`s.d`, a column's type or a cast) is kept by
+  the parser (`ColumnDefAst::type_schema`, `Expr::cast_schema`) and refused
+  by the binder: 3F000 when the schema does not exist, 42704 when it holds
+  no type of the name, 0A000 when it does (a domain is no usable type yet).
+- **Only a `CREATE`'s schema is checked by `next_version`**; a `DROP`,
+  `ALTER` or `GRANT` naming a schema that does not exist finds nothing, as
+  a lookup does (42P01, 42704, 42883).
+- **A qualified column reference** (`s.t.c`, `s.t.*`) is resolved by the
+  parser against its query's own `FROM` (`resolve_schema_qualifier`): it
+  names the unaliased item of table `t` and schema `s`, an unqualified
+  item being public's (the path), and then reads as `t.c`. PostgreSQL's
+  three 42P01 forms otherwise. In a subquery, one that names no unaliased
+  item of the subquery's own `FROM` is 0A000 before any 42P01 form:
+  PostgreSQL looks for it in the queries around, and reads it there when
+  one has the item, even past an item of the same table name in the
+  subquery (the functional case is marked unimplemented). Four parts are
+  0A000 (`db.s.t.c`) and five 42601.
+- **Not built: one table name from two schemas, neither aliased, in one
+  `FROM`** (`FROM s.t, public.t`). The binder tells `FROM` items apart by
+  name, so the parser refuses it, 0A000, where PostgreSQL reads both and
+  gives 42P09 for an unqualified `t.c`; an alias on either works, and the
+  functional case is marked unimplemented. `FROM t, public.t`, one table
+  twice, stays 42712 as in PostgreSQL.
+- **The view map.** `Binder::resolved_names` (each table a `FROM` resolved
+  by an unqualified name, with the schema it was found in) and the
+  expander's views read at depth 0 by an unqualified name make the stored
+  names, from the one resolution that makes `depends_on`. At each use
+  `view_definition` parses the view and gives each unqualified `FROM` name
+  its stored schema (`stored_names`); a name the record lacks is XX000
+  `view v has no stored resolution for t`. A view of format 1 has none and
+  reads its names in public (`View::public_names`). The mutation
+  `tests/schema_mutations/view_names_path_fallback.patch` restores a path
+  fallback, and the XX000 test catches it.
+- **The embedded API names a procedure's schema**:
+  `Database::call` and `Transaction::call` take a `QualifiedName` (a bare
+  name is public's), and `Transaction::procedure(schema, name)` resolves a
+  schema as SQL writes it against the transaction's catalog (3F000).
+  `CALL s.p()` over the wire uses them. `table_rows` still names a table
+  of public.
+- **`DdlRefused` carries a DETAIL and a HINT** (`with_notes`), which the
+  server sends: `DROP SCHEMA`'s RESTRICT list and HINT, `CREATE SCHEMA
+  pg_x`'s DETAIL, `DROP ROLE`'s `owner of schema s`, a line for each
+  schema the role owns. As PostgreSQL 17 writes them, a schema's name in
+  `DROP SCHEMA`'s message and DETAIL is bare (`cannot drop schema R Q`,
+  `depends on schema R Q`) while a relation's is quoted, and past 100
+  lines the DETAIL ends `and 1 other object` or `and N other objects`.
+- **A missing object's name is written as PostgreSQL writes it**
+  (`Catalog::written`): `s.x` for a schema other than public, bare in
+  public, in `DROP TYPE`/`DROP DOMAIN`'s error and IF EXISTS NOTICE,
+  `GRANT`/`REVOKE`'s, and `DROP PROCEDURE`'s, which reads `procedure
+  s.p(integer, text) does not exist`, or `could not find a procedure named
+  "s.p"` with no argument list. PostgreSQL keeps a written `public.` too
+  (`type "public.d"`); a resolved name no longer carries it, so the layer
+  writes `type "d"` there.
+- **Tests**, beyond the unit tests the list above names: the
+  `test_sql_machine` rule `schema_of_its_own` (a schema of its own on
+  PostgreSQL, named after the oracle's, since the oracle's `search_path`
+  is not public), and `tests/functional/cases/postgresql/schemas.yaml`.
+  The RESTRICT DETAIL past 100 objects is tested at 101 and 102. Not built
+  from the list: an allocation-fault sweep that runs here (the sweep is
+  written; it runs where allocation faults are built in).
 
 **Stage 2: schema elements.** f311_02_01_01, f311_03_01_01,
 f311_05_01_01 and 02.

@@ -28,6 +28,20 @@ export import bytecask.sql.names;
 
 export namespace bytecask::sql::ast {
 
+// A relation's, procedure's or type's name as written: its schema, "" when
+// unqualified, and its name, each folded as PostgreSQL folds them. The
+// binder resolves it against its catalog to a QualifiedName
+// (docs/catalog_design.md, *Name resolution with schemas*): the parser
+// never knows a schema's id, which a later statement may change.
+struct ObjectName {
+  std::string schema;
+  std::string name;
+
+  // As PostgreSQL writes a name in the messages that qualify it: "s.t", or "t".
+  [[nodiscard]] auto written() const -> std::string { return schema.empty() ? name : schema + "." + name; }
+  friend auto operator==(const ObjectName&, const ObjectName&) -> bool = default;
+};
+
 // A failure to parse, or a form outside the prototype's scope. Carries the
 // SQLSTATE PostgreSQL reports for the same fault; 42601 (syntax_error) is the
 // default, for a syntax error and for a form the layer does not support yet.
@@ -108,6 +122,9 @@ struct Expr {
   std::unique_ptr<Expr> lhs, rhs;  // Add, Sub, Mul, Div, Compare; Plus, Neg, IsNull, Not and Cast: rhs
   std::int32_t pos{-1};
   std::string table;          // Column, Star: the table it is qualified by, "" for none
+  // Column, Star: the schema `table` is qualified by (s.t.c), "" for none.
+  // The parser resolves it against the FROM items and clears it.
+  std::string schema;
   std::int64_t constant{0};   // Const: an integer literal (Add and Sub's right operand only)
   Fn fn{Fn::Count};           // Aggregate
   bool distinct{false};       // Aggregate: of DISTINCT values
@@ -116,6 +133,7 @@ struct Expr {
   Literal literal{};          // Literal
   ValueCompare cmp{ValueCompare::Eq};  // Compare
   std::string cast_type;               // Cast: libpg_query's last type name, as a column's
+  std::string cast_schema;             // Cast: a user schema qualifying it (ColumnDefAst::type_schema)
   std::vector<std::int32_t> cast_typmods;
   std::shared_ptr<const Select> subquery;  // Subquery
   std::string alias;  // a select-list item's AS name, "" for none
@@ -171,6 +189,7 @@ struct Compare {
   if (e.lhs) out.lhs = std::make_unique<Expr>(clone(*e.lhs));
   if (e.rhs) out.rhs = std::make_unique<Expr>(clone(*e.rhs));
   out.table = e.table;
+  out.schema = e.schema;
   out.constant = e.constant;
   out.fn = e.fn;
   out.distinct = e.distinct;
@@ -180,6 +199,7 @@ struct Compare {
   out.cmp = e.cmp;
   out.cast_type = e.cast_type;
   out.cast_typmods = e.cast_typmods;
+  out.cast_schema = e.cast_schema;
   out.subquery = e.subquery;  // never changed once parsed: shared
   for (const auto& a : e.args) out.args.push_back(clone(a));
   out.func = e.func;
@@ -219,10 +239,10 @@ struct OrderItem {
   auto both = [](const std::unique_ptr<Expr>& x, const std::unique_ptr<Expr>& y) {
     return x == nullptr ? y == nullptr : y != nullptr && same_expr(*x, *y);
   };
-  return a.kind == b.kind && a.column == b.column && a.param == b.param && a.table == b.table &&
+  return a.kind == b.kind && a.column == b.column && a.param == b.param && a.table == b.table && a.schema == b.schema &&
          a.constant == b.constant && a.fn == b.fn && a.distinct == b.distinct && a.star == b.star && a.negated == b.negated &&
          a.literal.kind == b.literal.kind && a.literal.text == b.literal.text && a.literal.b == b.literal.b &&
-         a.cmp == b.cmp && a.cast_type == b.cast_type && a.cast_typmods == b.cast_typmods && a.subquery == b.subquery &&
+         a.cmp == b.cmp && a.cast_type == b.cast_type && a.cast_schema == b.cast_schema && a.cast_typmods == b.cast_typmods && a.subquery == b.subquery &&
          a.func == b.func && both(a.lhs, b.lhs) && both(a.rhs, b.rhs) &&
          std::ranges::equal(a.args, b.args, same_expr);
 }
@@ -234,7 +254,7 @@ struct OrderItem {
 struct ForeignKeyAst {
   std::string name;
   std::vector<std::string> columns;
-  QualifiedName table;
+  ObjectName table;
   std::vector<std::string> ref_columns;
   std::int32_t pos{-1};
 };
@@ -266,6 +286,31 @@ struct ColumnDefAst {
   // localtime or localtimestamp, and its precision, -1 for none written.
   std::string default_clock;
   std::int64_t default_clock_precision{-1};
+  // The user schema `type` is qualified by (s.d), "" for none or
+  // pg_catalog: the parser cannot tell a missing schema (3F000) from a
+  // missing type (42704), so the binder raises QualifiedTypeName for it.
+  std::string type_schema;
+};
+
+// A type qualified by a user schema, raised where the type is read and
+// resolved against the catalog by the binder's entry points into 3F000 or
+// 42704 (docs/catalog_design.md, *Name resolution with schemas*): no domain
+// or shell type is a usable type yet, so a qualified one is always refused.
+class QualifiedTypeName : public SqlError {
+public:
+  QualifiedTypeName(std::string schema, std::string name, std::int32_t pos)
+      : SqlError{"schema \"" + schema + "\" does not exist", pos, kInvalidSchemaName},
+        schema_{std::move(schema)},
+        name_{std::move(name)} {}
+  QualifiedTypeName(const QualifiedTypeName&) = default;
+  QualifiedTypeName& operator=(const QualifiedTypeName&) = default;
+  ~QualifiedTypeName() override;  // out of line: anchors the vtable (-Wweak-vtables)
+  [[nodiscard]] auto schema() const -> const std::string& { return schema_; }
+  [[nodiscard]] auto name() const -> const std::string& { return name_; }
+
+private:
+  std::string schema_;
+  std::string name_;
 };
 
 // A UNIQUE constraint of CREATE TABLE, on a column or on the table, in the
@@ -277,7 +322,7 @@ struct UniqueAst {
 };
 
 struct CreateTable {
-  QualifiedName table;
+  ObjectName table;
   std::vector<ColumnDefAst> columns;
   std::vector<std::string> pk;  // a table-level PRIMARY KEY (…)
   std::int32_t pos{-1};
@@ -297,27 +342,27 @@ struct IndexColumnAst {
 
 struct CreateIndex {
   std::string index;
-  QualifiedName table;  // the index's own name is in its table's schema
+  ObjectName table;  // the index's own name is in its table's schema
   std::vector<IndexColumnAst> columns;
   bool unique{false};
   std::int32_t pos{-1};
 };
 
 struct DropTable {
-  QualifiedName table;
+  ObjectName table;
   bool if_exists{false};
   std::int32_t pos{-1};
 };
 
 struct DropIndex {
-  QualifiedName index;
+  ObjectName index;
   bool if_exists{false};
   std::int32_t pos{-1};
 };
 
 // ALTER TABLE … ADD COLUMN, the one ALTER TABLE form in scope.
 struct AddColumn {
-  QualifiedName table;
+  ObjectName table;
   ColumnDefAst column;
   std::int32_t pos{-1};
 };
@@ -329,7 +374,7 @@ struct Assignment {
 };
 
 struct Insert {
-  QualifiedName table;
+  ObjectName table;
   std::vector<std::string> columns;  // empty: every column, in order
   std::vector<std::vector<Expr>> rows;  // VALUES' rows, each of one length; none with a query
   std::int32_t pos{-1};
@@ -361,7 +406,7 @@ enum class JoinKind { Inner, Left, Right, Full };
 // columns the two sides share by =, each named alone as one column;
 // `using_alias` names them too: USING (…) AS alias.
 struct FromItem {
-  QualifiedName table;
+  ObjectName table;
   // The name the query gives the item. The parser has rewritten every
   // qualifier that names an alias to its table, so the alias stays only for a
   // query that names one table twice, where it tells the two apart.
@@ -474,7 +519,7 @@ struct SetOperation {
 }
 
 struct Update {
-  QualifiedName table;
+  ObjectName table;
   std::vector<Assignment> set;
   std::vector<Compare> where;
   std::int32_t pos{-1};
@@ -483,7 +528,7 @@ struct Update {
 };
 
 struct Delete {
-  QualifiedName table;
+  ObjectName table;
   std::vector<Compare> where;
   std::int32_t pos{-1};
   std::string current_of;  // WHERE CURRENT OF name: the cursor, and `where` is empty
@@ -493,7 +538,7 @@ struct Delete {
 // CREATE VIEW name [(columns)] AS query. `query` is the SELECT as written;
 // the catalog stores the statement's text and parses it again at each use.
 struct CreateView {
-  QualifiedName view;
+  ObjectName view;
   std::vector<std::string> columns;  // the view's column names, empty: the query's own
   Select query;
   std::int32_t pos{-1};
@@ -507,7 +552,7 @@ struct CreateView {
 struct CreateTableAs {
   enum class Form { CreateTableAs, SelectInto };
   Form form{Form::CreateTableAs};
-  QualifiedName table;
+  ObjectName table;
   std::vector<std::string> columns;  // the table's column names, empty: the query's own
   Select query;
   bool with_data{true};
@@ -516,7 +561,7 @@ struct CreateTableAs {
 };
 
 struct DropView {
-  QualifiedName view;
+  ObjectName view;
   bool if_exists{false};
   std::int32_t pos{-1};
 };
@@ -532,7 +577,7 @@ struct ProcedureArgAst {
 };
 
 struct CreateProcedure {
-  QualifiedName procedure;
+  ObjectName procedure;
   bool replace{false};
   std::vector<ProcedureArgAst> args;
   std::int32_t pos{-1};
@@ -543,7 +588,7 @@ struct CreateProcedure {
 // when no list was written, and holds each type's name and modifiers
 // otherwise (a ColumnDefAst with no name).
 struct DropProcedure {
-  QualifiedName procedure;
+  ObjectName procedure;
   std::optional<std::vector<ColumnDefAst>> arg_types;
   bool if_exists{false};
   std::int32_t pos{-1};
@@ -575,21 +620,21 @@ struct PrivilegeAst {
 // CREATE DOMAIN name [AS] type, with no constraint, DEFAULT or COLLATE yet.
 // Stored, and granted on; not yet a column's type.
 struct CreateDomain {
-  QualifiedName domain;
+  ObjectName domain;
   ColumnDefAst base;  // its type, as a column's
   std::int32_t pos{-1};
 };
 
 // CREATE TYPE name: a shell type, which nothing can use, as in PostgreSQL.
 struct CreateType {
-  QualifiedName type;
+  ObjectName type;
   std::int32_t pos{-1};
 };
 
 // CREATE SEQUENCE [IF NOT EXISTS] name, with no option yet. Stored, and
 // granted on; nextval and the rest are not built.
 struct CreateSequence {
-  QualifiedName sequence;
+  ObjectName sequence;
   bool if_not_exists{false};
   std::int32_t pos{-1};
 };
@@ -599,7 +644,7 @@ struct CreateSequence {
 struct DropTypeOrSequence {
   enum class Kind { Domain, Type, Sequence };
   Kind kind{Kind::Domain};
-  QualifiedName name;
+  ObjectName name;
   bool if_exists{false};
   std::int32_t pos{-1};
 };
@@ -610,15 +655,37 @@ struct Grant {
   bool grant{true};                      // false: REVOKE
   bool grant_option{false};              // GRANT … WITH GRANT OPTION, REVOKE GRANT OPTION FOR …
   std::vector<PrivilegeAst> privileges;  // empty: ALL PRIVILEGES
-  std::vector<QualifiedName> objects;
+  std::vector<ObjectName> objects;
   std::vector<std::string> grantees;     // "" is PUBLIC
   std::optional<std::string> grantor;    // GRANTED BY a role named; nullopt for none or the current user
   std::int32_t pos{-1};
 };
 
+// CREATE SCHEMA [IF NOT EXISTS] name [AUTHORIZATION role], or CREATE SCHEMA
+// AUTHORIZATION role, which names the schema after the role
+// (docs/catalog_design.md, *Schema semantics*). Elements are refused by the
+// parser until stage 2 builds them.
+struct CreateSchema {
+  std::string name;
+  // AUTHORIZATION's role: nullopt for none, "" for CURRENT_USER, CURRENT_ROLE
+  // or SESSION_USER, the bootstrap role every session is.
+  std::optional<std::string> authorization;
+  bool if_not_exists{false};
+  std::int32_t pos{-1};
+};
+
+// DROP SCHEMA [IF EXISTS] name [, …] [RESTRICT]. CASCADE is refused by the
+// parser until stage 5 builds it.
+struct DropSchema {
+  std::vector<std::string> names;
+  bool if_exists{false};
+  std::int32_t pos{-1};
+};
+
 using Statement = std::variant<CreateTable, CreateIndex, DropTable, DropIndex, AddColumn, CreateView, DropView,
                                CreateProcedure, DropProcedure, CreateRole, DropRole, Grant, CreateDomain, CreateType,
-                               CreateSequence, DropTypeOrSequence, CreateTableAs, Insert, Select, Update, Delete>;
+                               CreateSequence, DropTypeOrSequence, CreateTableAs, CreateSchema, DropSchema, Insert,
+                               Select, Update, Delete>;
 
 // Cursor statements (docs/cursor_design.md). They are not a Statement: they
 // name a session's cursor and carry no plan, so the session runs them, as it
@@ -668,7 +735,7 @@ struct SavepointStatement {
 // it runs BEGIN. Each argument is an expression of constants, bound against
 // the procedure's argument types when it runs.
 struct Call {
-  QualifiedName procedure;
+  ObjectName procedure;
   std::vector<Expr> args;
   std::int32_t pos{-1};
 };
@@ -679,5 +746,6 @@ namespace bytecask::sql::ast {
 
 SqlError::~SqlError() = default;
 FeatureNotSupported::~FeatureNotSupported() = default;
+QualifiedTypeName::~QualifiedTypeName() = default;
 
 }  // namespace bytecask::sql::ast

@@ -140,7 +140,7 @@ jobs:
       # SERIALIZABLE's mutations (bytecaskdb-sql-layer/tests/serializable_mutations/)
       # are run nightly by sql-layer-isolation-nightly.yml; here, that each
       # one's Guarded-by spec selects a test (#463).
-      - name: Every serializable mutation's Guarded-by spec selects a test
+      - name: Every serializable and schema mutation's Guarded-by spec selects a test
         run: python3 scripts/check_guarded_by.py --scope sql build/linux/x86_64/release/sql_layer_tests
 
       # The layer against PostgreSQL 17 (docs/testing_design.md): a fixed

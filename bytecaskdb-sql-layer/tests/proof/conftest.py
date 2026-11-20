@@ -64,6 +64,8 @@ class Oracle:
     def close(self) -> None:
         with self.conn.cursor() as cur:
             cur.execute(f"DROP SCHEMA {self.schema} CASCADE")
+            # A schema of the machine's own (test_sql_machine's schema rule).
+            cur.execute(f"DROP SCHEMA IF EXISTS {self.schema}_s CASCADE")
         self.conn.close()
 
 

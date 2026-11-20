@@ -864,8 +864,10 @@ EXISTS] name`:
   42701, more names than columns 42601.
 - **Created** by binding its query as a use would, so its errors are
   PostgreSQL's (42P01, 42703, …). It takes no parameter (42P02). Refused
-  (42601): `OR REPLACE`, `TEMPORARY`, options, `WITH [CASCADED | LOCAL]
-  CHECK OPTION` and a schema-qualified name.
+  (42601): `OR REPLACE`, `TEMPORARY`, options and `WITH [CASCADED | LOCAL]
+  CHECK OPTION`. Each unqualified relation name of its query is stored
+  with the schema it resolved to, and read there at every use
+  (*Schemas*).
 - **`INSERT` through a view** writes to its table, as PostgreSQL's
   automatically updatable views do (`ViewExpander::into_base_table`). The
   view, and each view it reads down to the table, must select from one
@@ -1002,10 +1004,11 @@ and `REVOKE` on tables and views (#653, its first step):
   kind, 0LP01 for a privilege the kind does not take.
 - **Refused (42601):** `CREATE ROLE`'s options and `CREATE USER`, since the
   layer has no logins or role attributes. Also refused: `GRANT` on other
-  kinds of objects (functions, procedures, schemas, …), `ON TABLE` of a
-  sequence, `ON ALL TABLES IN SCHEMA`, role membership (`GRANT role TO
+  kinds of objects (functions, procedures, …), `ON TABLE` of a
+  sequence, role membership (`GRANT role TO
   role`), `ALTER DEFAULT PRIVILEGES`, and `CURRENT_USER`, `CURRENT_ROLE` or
-  `SESSION_USER` as a grantee.
+  `SESSION_USER` as a grantee. `ON SCHEMA` and `ON ALL … IN SCHEMA` are
+  0A000 (*Schemas*).
 
 **Domains, shell types and sequences**: `CREATE DOMAIN name [AS] type`,
 `CREATE TYPE name` (a shell type), `CREATE SEQUENCE [IF NOT EXISTS] name`,
@@ -1017,14 +1020,43 @@ usable yet.
   `nextval`, `currval`, `setval` and `SERIAL`, and every other form of
   `CREATE TYPE`.
 
+**Schemas** (`catalog_design.md`, *Schemas*, stage 1b): `CREATE SCHEMA
+[IF NOT EXISTS] name [AUTHORIZATION role]`, `CREATE SCHEMA AUTHORIZATION
+role`, and `DROP SCHEMA [IF EXISTS] name [, …] [RESTRICT]`, with
+PostgreSQL 17's errors: 42P06 for a taken name (`public` and
+`information_schema` too; `IF NOT EXISTS` gives the NOTICE), 42939 for a
+`pg_` name, 42704 for a missing role, 3F000 for a missing schema (the
+statement drops nothing), 2BP01 for `pg_catalog` and for a schema holding
+any object, with PostgreSQL's DETAIL and HINT. A schema's owner is the
+`AUTHORIZATION` role, or the bootstrap role; `DROP ROLE` of an owner is
+2BP01. A relation, procedure or type is named alone (in `public`, the one
+schema of the path) or `schema.name`, everywhere a name is resolved; a
+column `s.t.c`. A missing schema is 42P01 where a statement reads
+(`relation "s.t" does not exist`), 3F000 where it creates or drops, and the
+`IF EXISTS` NOTICE `schema "s" does not exist, skipping`. A relation in
+`pg_catalog` is 42501.
+- Refused (0A000): `CREATE SCHEMA` with elements (stage 2), `IF NOT EXISTS`
+  with elements (as PostgreSQL), `DROP SCHEMA … CASCADE` (stage 5), `DROP
+  SCHEMA public` and `information_schema`, a domain, type or procedure in
+  `pg_catalog` and anything in `information_schema` or `pg_temp`,
+  `CREATE SCHEMA AUTHORIZATION CURRENT_USER` without a name, a name of
+  three parts (a database), a schema-qualified column in a subquery that
+  names no unaliased item of the subquery's own `FROM` (PostgreSQL may
+  read it in the query around), and one table name from two schemas in one `FROM` with
+  neither aliased, `GRANT`/`REVOKE … ON SCHEMA` and `ON ALL … IN SCHEMA`
+  (#873), and `SET`, `SHOW` and `RESET search_path` (#871).
+
 **Type names.** A type in a column definition, a cast, `CREATE DOMAIN`, a
 procedure's argument or a procedure's variable is named alone or qualified
-by `pg_catalog.` (`pg_catalog.int4`, as libpg_query spells `INTEGER`). The
-layer has no schemas yet, so any other qualifier is refused as PostgreSQL
-17 refuses it (`check_type_schema` in `sql/parser.cppm`): `public.`,
-`information_schema.` and `pg_toast.`, schemas PostgreSQL always has, are
-42704 `type "public.int4" does not exist`; any other schema is 3F000
-`schema "foo" does not exist`, before an array's brackets are refused;
+by `pg_catalog.` (`pg_catalog.int4`, as libpg_query spells `INTEGER`). No
+other schema holds a type the layer can use, so any other qualifier is
+refused as PostgreSQL 17 refuses it (`type_schema` in `sql/parser.cppm`,
+then the binder): `public.`, `information_schema.` and `pg_toast.`,
+schemas PostgreSQL always has, are 42704 `type "public.int4" does not
+exist`; a user schema's is 42704 `type "s.d" does not exist` (0A000 when
+`s.d` is a domain or shell type, which no column takes yet), and a schema
+that does not exist 3F000 `schema "foo" does not exist`, before an array's
+brackets are refused;
 three parts are 0A000 `cross-database references are not implemented`
 (*Known differences*), four or more 42601 `improper qualified name (too
 many dotted names)`. `pg_catalog.` before a spelling the grammar turns
@@ -1039,8 +1071,8 @@ variable, which libpg_query writes as `pg_catalog."integer"`, is `int4`.
 `CREATE TABLE IF NOT EXISTS` of a name in use skips the statement before
 it reads the definition, as PostgreSQL does, so the parser keeps a
 definition's refusal (`CreateTable::refusal`) for the binder to raise only
-when the name is free. Stage 1b of schemas widens this
-(`catalog_design.md`, *Name resolution with schemas*).
+when the name is free (`catalog_design.md`, *Name resolution with
+schemas*).
 
 **NUMERIC without a precision.** `NUMERIC`, `DECIMAL` and `DEC` without a
 precision declare a column of any digits, stored as PostgreSQL's
@@ -1805,6 +1837,11 @@ implemented (`functional_testing_design.md`).
   PostgreSQL accepts `postgres.pg_catalog.int4` in the database
   `postgres` (owner decision Q5 (a), `catalog_design.md`, *Name
   resolution with schemas*).
+- **Schemas are partial** (`catalog_design.md`, *Stages of schemas*):
+  `CREATE SCHEMA` with elements (stage 2), `DROP SCHEMA … CASCADE` (stage
+  5), privileges on a schema (#873), `SET search_path` (#871), and one
+  table name from two schemas in one `FROM` with neither aliased, which
+  PostgreSQL reads (an alias on either works here).
 - **A procedure variable's type is read at the call.** A qualifier
   PostgreSQL refuses in a `DECLARE` (`x foo.int4`, `x pg_catalog.integer`)
   is refused by the layer's first `CALL` of the procedure, with

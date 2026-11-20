@@ -1043,6 +1043,33 @@ class SqlMachine(Sides, RuleBasedStateMachine):
     def drop_table(self, data):
         self.drop(data.draw(st.sampled_from(TABLE_NAMES), label="name"), data.draw(st.booleans(), label="if exists"))
 
+    @precondition(lambda self: self.txn is None)
+    @rule(data=st.data())
+    def schema_of_its_own(self, data):
+        """CREATE SCHEMA, a table in it of a name public may hold too, its
+        rows read by a qualified name, DROP SCHEMA refused while it holds the
+        table (docs/catalog_design.md, *Schemas*, stage 1b). Outside the
+        model: PostgreSQL's schema is named after the oracle's own, whose
+        search_path is not public."""
+        name = data.draw(st.sampled_from(TABLE_NAMES), label="table")
+        pg = f"{self.pg.schema}_s"
+
+        def run(sql: str, params=()):
+            return self.both(sql, params, pg_sql=sql.replace("ms", pg))
+
+        assert run("CREATE SCHEMA ms").error is None
+        assert run("CREATE SCHEMA ms").sqlstate == "42P06"
+        assert run(f"CREATE TABLE ms.{name} (k INTEGER PRIMARY KEY, v INTEGER)").error is None
+        keys = data.draw(st.lists(st.integers(-50, 50), unique=True, max_size=4), label="keys")
+        for k in keys:
+            assert run(f"INSERT INTO ms.{name} VALUES ($1, $2)", (k, k * 2)).error is None
+        run(f"SELECT ms.{name}.k, v FROM ms.{name} ORDER BY k")
+        run(f"SELECT x.v FROM ms.{name} x WHERE x.k > $1 ORDER BY x.v", (0,))
+        assert run("DROP SCHEMA ms").sqlstate == "2BP01"
+        assert run(f"DROP TABLE ms.{name}").error is None
+        assert run("DROP SCHEMA ms").error is None
+        assert run(f"SELECT k FROM ms.{name}").sqlstate == "42P01"
+
     @precondition(lambda self: self.txn is None and self.wire is not None)
     @rule(data=st.data())
     def select_star_across_add_column(self, data):

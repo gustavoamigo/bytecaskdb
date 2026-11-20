@@ -15,7 +15,7 @@ matches (`--list-tests`), so the spec is matched by Catch2 itself.
 
 A patch that touches bytecaskdb-mariadb-plugin/ names a test of the plugin's
 binary (mariadb_proof_tests); a SQL layer patch
-(bytecaskdb-sql-layer/tests/serializable_mutations/) one of sql_layer_tests;
+(bytecaskdb-sql-layer/tests/serializable_mutations/, schema_mutations/) one of sql_layer_tests;
 every other patch names one of bytecask_tests. Pass the binary and the scope
 it serves. A soak or chaos patch the rig
 itself judges, with no Guarded-by header, is not checked here.
@@ -31,7 +31,7 @@ import sys
 
 DIRS = ("tests/soak_mutations", "tests/chaos_mutations",
         "tests/durability_mutations")
-SQL_DIRS = ("bytecaskdb-sql-layer/tests/serializable_mutations",)
+SQL_DIRS = ("bytecaskdb-sql-layer/tests/serializable_mutations", "bytecaskdb-sql-layer/tests/schema_mutations")
 HEADER = re.compile(r'^Guarded-by:\s*"(.*)"\s*$')
 PLUGIN = "bytecaskdb-mariadb-plugin/"
 

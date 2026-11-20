@@ -1,0 +1,327 @@
+# Schemas, stage 1b (docs/catalog_design.md, *Schemas*): CREATE SCHEMA and
+# DROP SCHEMA without elements or CASCADE, and qualified names. Hand-written:
+# the oracle records each case in a schema of its own with search_path set to
+# it, so a case naming public would read PostgreSQL's real public. Each
+# expectation was checked against PostgreSQL 17 with search_path public.
+
+- name: a table in a schema is another table than public's of its name
+  features: [F311-01, pg:schemas]
+  setup:
+    - CREATE SCHEMA sch_a
+    - CREATE TABLE sch_t (k INTEGER PRIMARY KEY, v TEXT)
+    - CREATE TABLE sch_a.sch_t (k INTEGER PRIMARY KEY, w INTEGER)
+  steps:
+    - sql: INSERT INTO sch_t VALUES (1, 'public')
+      rowcount: 1
+    - sql: INSERT INTO sch_a.sch_t VALUES (1, 10), (2, 20)
+      rowcount: 2
+    - sql: SELECT k, v FROM sch_t
+      expected: [[1, "public"]]
+    - sql: SELECT k, v FROM public.sch_t
+      expected: [[1, "public"]]
+    - sql: SELECT k, w FROM sch_a.sch_t ORDER BY k
+      expected: [[1, 10], [2, 20]]
+      ordered: true
+    - sql: SELECT sch_a.sch_t.w FROM sch_a.sch_t WHERE sch_a.sch_t.k = 2
+      expected: [[20]]
+    - sql: SELECT x.v, y.w FROM sch_t x, sch_a.sch_t y WHERE x.k = y.k
+      expected: [["public", 10]]
+    - sql: UPDATE sch_a.sch_t SET w = w + 1 WHERE sch_a.sch_t.k = 1 RETURNING sch_a.sch_t.w
+      expected: [[11]]
+    - sql: DELETE FROM sch_a.sch_t WHERE k = 2
+      rowcount: 1
+    - sql: SELECT count(*) FROM sch_a.sch_t
+      expected: [[1]]
+  teardown:
+    - DROP TABLE sch_a.sch_t
+    - DROP TABLE sch_t
+    - DROP SCHEMA sch_a
+
+- name: every kind of object is created, used and dropped in a schema
+  features: [F311-01, pg:schemas]
+  setup:
+    - CREATE SCHEMA sch_k
+    - CREATE TABLE sch_k.t (a INTEGER)
+  steps:
+    - sql: CREATE INDEX sch_k_i ON sch_k.t (a)
+    - sql: CREATE VIEW sch_k.v AS SELECT a FROM sch_k.t
+    - sql: CREATE SEQUENCE sch_k.sq
+    - sql: CREATE DOMAIN sch_k.d AS INTEGER
+    - sql: CREATE TYPE sch_k.sh
+    - sql: "CREATE PROCEDURE sch_k.p(INOUT x INTEGER) LANGUAGE plpgsql AS $$ BEGIN x := x + 1; END $$"
+    - sql: ALTER TABLE sch_k.t ADD COLUMN b INTEGER
+    - sql: INSERT INTO sch_k.v VALUES (3)
+      rowcount: 1
+    - sql: SELECT a, b FROM sch_k.t
+      expected: [[3, null]]
+    - sql: GRANT SELECT ON sch_k.t TO PUBLIC
+    - sql: DROP INDEX sch_k_i
+      error: "42704"
+    - sql: DROP INDEX sch_k.sch_k_i
+    - sql: DROP PROCEDURE sch_k.p(INTEGER)
+    - sql: DROP TYPE sch_k.sh
+    - sql: DROP DOMAIN sch_k.d
+    - sql: DROP SEQUENCE sch_k.sq
+    - sql: DROP VIEW sch_k.v
+    - sql: DROP TABLE sch_k.t
+    - sql: DROP SCHEMA sch_k
+    - sql: SELECT 1 FROM sch_k.t
+      error: "42P01"
+
+- name: CREATE SCHEMA and DROP SCHEMA errors are PostgreSQL's
+  features: [F311-01, pg:schemas]
+  steps:
+    - sql: CREATE SCHEMA sch_e
+    - sql: CREATE SCHEMA sch_e
+      error: "42P06"
+    - sql: CREATE SCHEMA IF NOT EXISTS sch_e
+    - sql: CREATE SCHEMA public
+      error: "42P06"
+    - sql: CREATE SCHEMA IF NOT EXISTS information_schema
+    - sql: CREATE SCHEMA pg_sch
+      error: "42939"
+    - sql: CREATE SCHEMA IF NOT EXISTS pg_catalog
+      error: "42939"
+    - sql: CREATE SCHEMA sch_r AUTHORIZATION sch_nobody
+      error: "42704"
+    - sql: CREATE SCHEMA sch_r AUTHORIZATION PUBLIC
+      error: "42704"
+    - sql: CREATE SCHEMA IF NOT EXISTS sch_r CREATE TABLE t (a INTEGER)
+      error: "0A000"
+    - sql: DROP SCHEMA sch_missing
+      error: "3F000"
+    - sql: DROP SCHEMA sch_e, sch_missing
+      error: "3F000"
+    - sql: DROP SCHEMA IF EXISTS sch_missing, sch_missing2
+    - sql: DROP SCHEMA pg_catalog
+      error: "2BP01"
+    - sql: DROP SCHEMA IF EXISTS pg_catalog
+      error: "2BP01"
+    - sql: CREATE TABLE sch_e.t (a INTEGER)
+    - sql: DROP SCHEMA sch_e
+      error: "2BP01"
+    - sql: DROP SCHEMA sch_e RESTRICT
+      error: "2BP01"
+    - sql: DROP SCHEMA sch_e, sch_e
+      error: "2BP01"
+    - sql: DROP TABLE sch_e.t
+    - sql: DROP SCHEMA sch_e
+    - sql: DROP SCHEMA sch_e
+      error: "3F000"
+
+- name: a schema's name folds as other names do, and a quoted one keeps its case
+  features: [F311-01, pg:schemas]
+  steps:
+    - sql: CREATE SCHEMA "Sch_Up"
+    - sql: DROP SCHEMA sch_up
+      error: "3F000"
+    - sql: CREATE TABLE "Sch_Up".t (a INTEGER)
+    - sql: SELECT a FROM "Sch_Up".t
+      expected: []
+    - sql: DROP TABLE "Sch_Up".t
+    - sql: DROP SCHEMA "Sch_Up"
+
+- name: a schema's owner is a role, which cannot be dropped while it owns one
+  features: [F311-01, pg:schemas]
+  steps:
+    - sql: CREATE ROLE sch_owner
+    - sql: CREATE SCHEMA sch_o AUTHORIZATION sch_owner
+    - sql: CREATE SCHEMA AUTHORIZATION sch_owner
+    - sql: CREATE SCHEMA sch_cu AUTHORIZATION CURRENT_USER
+    - sql: DROP ROLE sch_owner
+      error: "2BP01"
+    - sql: DROP SCHEMA sch_o, sch_owner, sch_cu
+    - sql: DROP ROLE sch_owner
+
+- name: a qualified name of a missing schema or object fails with PostgreSQL's SQLSTATE
+  features: [pg:schemas]
+  setup:
+    - CREATE SCHEMA sch_m
+  steps:
+    - sql: SELECT * FROM sch_nope.t
+      error: "42P01"
+    - sql: SELECT * FROM sch_m.nope
+      error: "42P01"
+    - sql: INSERT INTO sch_nope.t VALUES (1)
+      error: "42P01"
+    - sql: CREATE TABLE sch_nope.t (a INTEGER)
+      error: "3F000"
+    - sql: CREATE VIEW sch_nope.v AS SELECT 1 AS a
+      error: "3F000"
+    - sql: CREATE SEQUENCE sch_nope.s
+      error: "3F000"
+    - sql: CREATE DOMAIN sch_nope.d AS INTEGER
+      error: "3F000"
+    - sql: "CREATE PROCEDURE sch_nope.p() LANGUAGE plpgsql AS $$ BEGIN END $$"
+      error: "3F000"
+    - sql: DROP TABLE sch_nope.t
+      error: "3F000"
+    - sql: DROP TABLE IF EXISTS sch_nope.t
+    - sql: DROP TABLE sch_m.nope
+      error: "42P01"
+    - sql: DROP VIEW sch_m.nope
+      error: "42P01"
+    - sql: DROP SEQUENCE sch_m.nope
+      error: "42P01"
+    - sql: DROP INDEX sch_m.nope
+      error: "42704"
+    - sql: DROP TYPE sch_m.nope
+      error: "42704"
+    - sql: DROP DOMAIN sch_nope.nope
+      error: "3F000"
+    - sql: DROP PROCEDURE sch_m.nope()
+      error: "42883"
+    - sql: ALTER TABLE sch_m.nope ADD COLUMN b INTEGER
+      error: "42P01"
+    - sql: CREATE INDEX sch_i ON sch_m.nope (a)
+      error: "42P01"
+    - sql: GRANT SELECT ON sch_m.nope TO PUBLIC
+      error: "42P01"
+    - sql: CREATE TABLE sch_ty (a sch_m.d)
+      error: "42704"
+    - sql: CREATE TABLE sch_ty (a sch_nope.d)
+      error: "3F000"
+    - sql: SELECT 1::sch_m.d
+      error: "42704"
+    - sql: SELECT * FROM db.sch_m.t
+      error: "0A000"
+    - sql: SELECT * FROM a.b.c.d
+      error: "42601"
+    - sql: SELECT db.sch_m.t.a FROM sch_m.t
+      error: "0A000"
+    - sql: CREATE TABLE pg_catalog.sch_t (a INTEGER)
+      error: "42501"
+    - sql: CREATE VIEW pg_catalog.sch_v AS SELECT 1 AS a
+      error: "42501"
+    - sql: SELECT * FROM pg_catalog.sch_nope
+      error: "42P01"
+    - sql: DROP TABLE pg_catalog.sch_nope
+      error: "42P01"
+  teardown:
+    - DROP SCHEMA sch_m
+
+- name: a qualified column names its FROM item, or fails in PostgreSQL's three 42P01 forms
+  features: [pg:schemas]
+  setup:
+    - CREATE SCHEMA sch_c
+    - CREATE TABLE sch_c.t (c INTEGER)
+    - CREATE TABLE sch_ct (c INTEGER)
+    - INSERT INTO sch_c.t VALUES (1)
+    - INSERT INTO sch_ct VALUES (2)
+  steps:
+    - sql: SELECT x.c, y.c FROM sch_c.t x, sch_ct y WHERE x.c < y.c
+      expected: [[1, 2]]
+    - sql: SELECT sch_c.t.c FROM sch_c.t
+      expected: [[1]]
+    - sql: SELECT public.sch_ct.c FROM sch_ct
+      expected: [[2]]
+    - sql: SELECT sch_c.sch_ct.c FROM sch_ct
+      error: "42P01"
+    - sql: SELECT public.sch_ct.c FROM sch_ct AS q
+      error: "42P01"
+    - sql: SELECT sch_c.nope.c FROM sch_c.t
+      error: "42P01"
+    - sql: SELECT a.b.c.d.e FROM sch_ct
+      error: "42601"
+    - sql: SELECT * FROM sch_ct, public.sch_ct
+      error: "42712"
+    - sql: SELECT * FROM sch_c.t x, sch_c.t x
+      error: "42712"
+  teardown:
+    - DROP TABLE sch_ct
+    - DROP TABLE sch_c.t
+    - DROP SCHEMA sch_c
+
+- name: the same table name from two schemas unaliased in one FROM
+  features: [pg:schemas]
+  unimplemented: true  # 0A000: the binder tells FROM items apart by name alone (an alias works)
+  setup:
+    - CREATE SCHEMA sch_d
+    - CREATE TABLE sch_d.t (c INTEGER)
+    - CREATE TABLE sch_dt (c INTEGER)
+  steps:
+    - sql: SELECT * FROM sch_d.t, public.sch_dt
+      expected: []
+    - sql: CREATE TABLE sch_d.sch_dt (c INTEGER)
+    - sql: SELECT * FROM sch_d.sch_dt, public.sch_dt
+      expected: []
+    - sql: SELECT sch_dt.c FROM sch_d.sch_dt, public.sch_dt
+      error: "42P09"
+  teardown:
+    - DROP TABLE sch_d.sch_dt
+    - DROP TABLE sch_dt
+    - DROP TABLE sch_d.t
+    - DROP SCHEMA sch_d
+
+- name: a qualified column in a subquery names the enclosing query's item past one of the same table name
+  features: [pg:schemas]
+  unimplemented: true  # 0A000: a schema-qualified column of the query around a subquery is not supported yet
+  setup:
+    - CREATE SCHEMA sch_o
+    - CREATE TABLE sch_o.sch_ot (a INTEGER)
+    - CREATE TABLE sch_ot (a INTEGER)
+    - INSERT INTO sch_o.sch_ot VALUES (1), (2)
+    - INSERT INTO sch_ot VALUES (2), (3)
+  steps:
+    - sql: SELECT a FROM sch_o.sch_ot WHERE EXISTS (SELECT 1 FROM sch_ot WHERE sch_ot.a = sch_o.sch_ot.a)
+      expected: [[2]]
+    - sql: SELECT a FROM sch_ot WHERE EXISTS (SELECT 1 FROM sch_o.sch_ot WHERE sch_o.sch_ot.a = public.sch_ot.a)
+      expected: [[2]]
+  teardown:
+    - DROP TABLE sch_ot
+    - DROP TABLE sch_o.sch_ot
+    - DROP SCHEMA sch_o
+
+- name: DROP SCHEMA RESTRICT refuses a schema holding any object, and a view elsewhere reading one
+  features: [pg:schemas]
+  setup:
+    - CREATE SCHEMA sch_v
+    - CREATE TABLE sch_v.t (a INTEGER)
+    - CREATE VIEW sch_v.v AS SELECT a FROM sch_v.t
+    - CREATE VIEW sch_pv AS SELECT a FROM sch_v.v
+  steps:
+    - sql: DROP SCHEMA sch_v
+      error: "2BP01"
+    - sql: DROP VIEW sch_v.v
+      error: "2BP01"
+    - sql: DROP TABLE sch_v.t
+      error: "2BP01"
+    - sql: SELECT a FROM sch_pv
+      expected: []
+    - sql: DROP VIEW sch_pv
+    - sql: DROP VIEW sch_v.v
+    - sql: DROP TABLE sch_v.t
+    - sql: DROP SCHEMA sch_v
+
+- name: a schema and its objects survive a restart
+  features: [F311-01, pg:schemas]
+  steps:
+    - sql: CREATE SCHEMA sch_s
+    - sql: CREATE TABLE sch_s.t (a INTEGER)
+    - sql: CREATE VIEW sch_s.v AS SELECT a FROM sch_s.t
+    - sql: INSERT INTO sch_s.t VALUES (7)
+      rowcount: 1
+    - restart: true
+    - sql: SELECT a FROM sch_s.v
+      expected: [[7]]
+    - sql: CREATE SCHEMA sch_s
+      error: "42P06"
+    - sql: DROP VIEW sch_s.v
+    - sql: DROP TABLE sch_s.t
+    - sql: DROP SCHEMA sch_s
+
+- name: a schema created in a transaction block is gone after ROLLBACK
+  features: [F311-01, pg:schemas]
+  steps:
+    - sql: BEGIN
+    - sql: CREATE SCHEMA sch_x
+    - sql: CREATE TABLE sch_x.t (a INTEGER)
+    - sql: INSERT INTO sch_x.t VALUES (1)
+      rowcount: 1
+    - sql: SELECT a FROM sch_x.t
+      expected: [[1]]
+    - sql: ROLLBACK
+    - sql: SELECT a FROM sch_x.t
+      error: "42P01"
+    - sql: DROP SCHEMA sch_x
+      error: "3F000"

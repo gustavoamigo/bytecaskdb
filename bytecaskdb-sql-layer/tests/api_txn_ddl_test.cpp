@@ -1106,3 +1106,212 @@ TEST_CASE("txn DDL: ROLLBACK TO undoes a CREATE TABLE AS; max_bytes bounds its r
   CHECK(why.ends_with("run the DDL outside a transaction"));
   CHECK(t.is_aborted());
 }
+
+// docs/catalog_design.md, *Schema DDL batches and transactional DDL*: CREATE
+// SCHEMA and DROP SCHEMA are steps of a transaction like any DDL.
+
+TEST_CASE("txn DDL: CREATE SCHEMA is invisible to others until COMMIT, gone after ROLLBACK; two creating one, 40001",
+          "[sql][api][txn][ddl][schemas]") {
+  sql_test::TempDir dir{"txn_ddl_schema"};
+  auto db = open(dir);
+  for (const auto commit : {false, true}) {
+    INFO((commit ? "COMMIT" : "ROLLBACK"));
+    auto t = db->begin();
+    (void)t.execute("CREATE SCHEMA s");
+    (void)t.execute("CREATE TABLE s.t (k BIGINT PRIMARY KEY)");
+    (void)t.execute("INSERT INTO s.t VALUES (7)");
+    CHECK(t.execute("SELECT k FROM s.t").rows == Grid{{i(7)}});
+    CHECK(t.execute("SELECT k FROM t").rows == Grid{{i(1)}});  // public's t, still
+    CHECK(state([&] { (void)db->execute("SELECT k FROM s.t"); }) == "42P01");
+    CHECK(db->catalog()->schema("s") == nullptr);
+    if (commit) {
+      CHECK(t.commit() == CommitOutcome::Committed);
+    } else {
+      t.rollback();
+      CHECK(db->catalog()->schema("s") == nullptr);
+    }
+  }
+  CHECK(db->execute("SELECT k FROM s.t").rows == Grid{{i(7)}});
+  // Two transactions create one schema: the second to commit is 40001 and
+  // writes nothing.
+  auto t1 = db->begin();
+  auto t2 = db->begin();
+  (void)t1.execute("CREATE SCHEMA u");
+  (void)t2.execute("CREATE SCHEMA u");
+  CHECK(t1.commit() == CommitOutcome::Committed);
+  CHECK(state([&] { (void)t2.commit(); }) == "40001");
+  CHECK(db->catalog()->schema("u") != nullptr);
+  // A schema dropped in a transaction, then a table created in it: 3F000.
+  auto t3 = db->begin();
+  (void)t3.execute("DROP SCHEMA u");
+  CHECK(state([&] { (void)t3.execute("CREATE TABLE u.t (k BIGINT PRIMARY KEY)"); }) == "3F000");
+  t3.rollback();
+  // In a transaction, CALL names a procedure of a schema the transaction created.
+  auto t4 = db->begin();
+  (void)t4.execute("CREATE SCHEMA w");
+  (void)t4.execute("CREATE PROCEDURE w.p(INOUT x BIGINT) LANGUAGE plpgsql AS $$ BEGIN x := x + 1; END $$");
+  auto def = t4.procedure("w", "p");
+  REQUIRE(def != nullptr);
+  CHECK(t4.call(QualifiedName{def->schema, "p"}, {i(41)}).rows == Grid{{i(42)}});
+  CHECK(t4.procedure("p") == nullptr);  // public has none of the name
+  CHECK(state([&] { (void)t4.procedure("nope", "p"); }) == "3F000");
+  t4.rollback();
+}
+
+TEST_CASE("schemas: a statement prepared on t keeps reading public's t after CREATE TABLE s.t",
+          "[sql][api][schemas]") {
+  sql_test::TempDir dir{"schemas_plan_cache"};
+  auto db = open(dir);
+  const auto& st = db->prepare("SELECT a FROM t");
+  CHECK(db->execute(st, {}).rows == Grid{{i(10)}});
+  (void)db->execute("CREATE SCHEMA s");
+  (void)db->execute("CREATE TABLE s.t (k BIGINT PRIMARY KEY, a BIGINT)");
+  (void)db->execute("INSERT INTO s.t VALUES (1, 99)");
+  CHECK(db->execute(st, {}).rows == Grid{{i(10)}});
+  CHECK(db->execute("SELECT a FROM t").rows == Grid{{i(10)}});
+  CHECK(db->execute("SELECT a FROM s.t").rows == Grid{{i(99)}});
+  // A view created over an unqualified t stores public's, and reads it after
+  // a reopen whatever s holds.
+  (void)db->execute("CREATE VIEW s.v AS SELECT a FROM t");
+  CHECK(db->catalog()->view({db->catalog()->schema("s")->id, "v"})->names ==
+        std::vector<ViewName>{{ViewName::Kind::Relation, "t", kPublicSchema}});
+  db->close();
+  db = Database::open(dir.path());
+  CHECK(db->execute("SELECT a FROM s.v").rows == Grid{{i(10)}});
+}
+
+TEST_CASE("schemas: messages name a missing object as s.x, and DROP SCHEMA and DROP ROLE list as PostgreSQL 17 does",
+          "[sql][api][schemas]") {
+  sql_test::TempDir dir{"schemas_messages"};
+  auto db = open(dir);
+  auto notice = [&](const char* sql) { return db->execute(sql).notices.at(0).message; };
+  auto detail = [&](const char* sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const std::exception& e) {
+      return std::string{error_detail(e)};
+    }
+    return "ran";
+  };
+  (void)db->execute("CREATE SCHEMA q");
+  (void)db->execute("CREATE ROLE r");
+  // Every expectation as PostgreSQL 17 gives it.
+  CHECK(notice("DROP DOMAIN IF EXISTS q.nod") == "type \"q.nod\" does not exist, skipping");
+  CHECK(notice("DROP TYPE IF EXISTS q.nod") == "type \"q.nod\" does not exist, skipping");
+  CHECK(notice("DROP PROCEDURE IF EXISTS q.p2()") == "procedure q.p2() does not exist, skipping");
+  CHECK(notice("DROP PROCEDURE IF EXISTS q.p2(INTEGER)") == "procedure q.p2(pg_catalog.int4) does not exist, skipping");
+  CHECK(message([&] { (void)db->execute("DROP TYPE q.nod"); }) == "type \"q.nod\" does not exist");
+  CHECK(message([&] { (void)db->execute("GRANT USAGE ON TYPE q.nod TO r"); }) == "type \"q.nod\" does not exist");
+  CHECK(message([&] { (void)db->execute("REVOKE USAGE ON DOMAIN q.nod FROM r"); }) == "type \"q.nod\" does not exist");
+  CHECK(message([&] { (void)db->execute("GRANT SELECT ON q.nt TO r"); }) == "relation \"q.nt\" does not exist");
+  CHECK(message([&] { (void)db->execute("GRANT USAGE ON SEQUENCE q.ns TO r"); }) == "relation \"q.ns\" does not exist");
+  CHECK(message([&] { (void)db->execute("DROP PROCEDURE q.nop()"); }) == "procedure q.nop() does not exist");
+  CHECK(message([&] { (void)db->execute("DROP PROCEDURE q.nop(INT, TEXT)"); }) ==
+        "procedure q.nop(integer, text) does not exist");
+  CHECK(message([&] { (void)db->execute("DROP PROCEDURE q.nop"); }) == "could not find a procedure named \"q.nop\"");
+  CHECK(message([&] { (void)db->execute("DROP PROCEDURE nop(INT)"); }) == "procedure nop(integer) does not exist");
+  CHECK(state([&] { (void)db->execute("DROP PROCEDURE q.nop()"); }) == "42883");
+  // A schema's name is bare in DROP SCHEMA's message and DETAIL; a relation's is quoted.
+  (void)db->execute("CREATE SCHEMA \"R Q\"");
+  (void)db->execute("CREATE TABLE \"R Q\".\"T x\" (a INTEGER)");
+  CHECK(message([&] { (void)db->execute("DROP SCHEMA \"R Q\""); }) ==
+        "cannot drop schema R Q because other objects depend on it");
+  CHECK(detail("DROP SCHEMA \"R Q\"") == "table \"R Q\".\"T x\" depends on schema R Q");
+  (void)db->execute("DROP TABLE \"R Q\".\"T x\"");
+  // RESTRICT reports 100 objects, then how many more: "object" for one.
+  (void)db->execute("CREATE SCHEMA big");
+  std::string expected;
+  for (int k = 1; k <= 101; ++k) {
+    (void)db->execute("CREATE TABLE big.t" + std::to_string(k) + " (a INTEGER)");
+    if (k <= 100) expected += (k == 1 ? "" : "\n") + ("table big.t" + std::to_string(k) + " depends on schema big");
+  }
+  CHECK(detail("DROP SCHEMA big") == expected + "\nand 1 other object (see server log for list)");
+  (void)db->execute("CREATE TABLE big.t102 (a INTEGER)");
+  CHECK(detail("DROP SCHEMA big") == expected + "\nand 2 other objects (see server log for list)");
+  // DROP ROLE lists every schema the role owns.
+  (void)db->execute("CREATE ROLE r4");
+  (void)db->execute("CREATE SCHEMA s4a AUTHORIZATION r4");
+  (void)db->execute("CREATE SCHEMA s4b AUTHORIZATION r4");
+  CHECK(state([&] { (void)db->execute("DROP ROLE r4"); }) == "2BP01");
+  CHECK(detail("DROP ROLE r4") == "owner of schema s4a\nowner of schema s4b");
+  // Privileges on a schema are not built (#873).
+  for (const auto* sql : {"GRANT USAGE ON SCHEMA q TO PUBLIC", "REVOKE USAGE ON SCHEMA q FROM PUBLIC",
+                          "GRANT SELECT ON ALL TABLES IN SCHEMA q TO r", "REVOKE SELECT ON ALL TABLES IN SCHEMA q FROM r"}) {
+    CHECK(state([&] { (void)db->execute(sql); }) == "0A000");
+  }
+  // A qualified column in a subquery that names no item of the subquery's
+  // FROM may name the enclosing query's (PostgreSQL reads it there): 0A000,
+  // never the 42P01 an item of the same table name would give.
+  (void)db->execute("CREATE TABLE q.t (a BIGINT)");
+  CHECK(state([&] { (void)db->execute("SELECT a FROM q.t WHERE EXISTS (SELECT 1 FROM t WHERE t.a = q.t.a)"); }) == "0A000");
+  CHECK(state([&] { (void)db->execute("SELECT a FROM t WHERE EXISTS (SELECT 1 FROM q.t WHERE q.t.a = public.t.a)"); }) ==
+        "0A000");
+  CHECK(state([&] { (void)db->execute("SELECT a FROM t WHERE EXISTS (SELECT 1 FROM q.t WHERE q.t.a = t.a)"); }) == "ok");
+}
+
+TEST_CASE("schemas: a view whose stored names lack one its query reads is XX000 at use, never a search",
+          "[sql][api][schemas]") {
+  sql_test::TempDir dir{"schemas_view_map"};
+  {
+    auto db = open(dir);
+    (void)db->execute("CREATE TABLE u (k BIGINT PRIMARY KEY)");
+    (void)db->execute("CREATE VIEW v AS SELECT a FROM t");
+    db->close();
+  }
+  // Forged: the record names u, which the view depends on, but not t, which
+  // its query reads. It passes load (u is in its dependencies).
+  {
+    auto engine = bytecask::DB::open(dir.path());
+    LiveCatalog live{engine};
+    auto view = *live.current()->view({kPublicSchema, "v"});
+    view.names = {{ViewName::Kind::Relation, "u", kPublicSchema}};
+    view.depends_on.push_back(live.current()->table({kPublicSchema, "u"})->id);
+    engine.put({}, view_record_key(view.id), serialize_view(view));
+    engine.close();
+  }
+  auto db = Database::open(dir.path());
+  try {
+    (void)db->execute("SELECT a FROM v");
+    FAIL("ran");
+  } catch (const std::exception& e) {
+    CHECK(std::string{sqlstate(e)} == "XX000");
+    CHECK(std::string{e.what()} == "view v has no stored resolution for t");
+  }
+}
+
+TEST_CASE("schemas: an allocation failure in a transaction of CREATE SCHEMA and CREATE TABLE s.t commits all or nothing",
+          "[sql][api][txn][ddl][schemas][alloc]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
+  sql_test::TempDir dir{"schemas_alloc"};
+  auto db = open(dir);
+  auto failed = 0;
+  for (long nth = 1;; ++nth) {
+    REQUIRE(nth < 200000);
+    std::string outcome = "ok";
+    bool fired = false;
+    {
+      auto t = db->begin();
+      bytecask::testing::ScopedAllocFaults faults{nth, false};
+      outcome = state([&] {
+        (void)t.execute("CREATE SCHEMA s");
+        (void)t.execute("CREATE TABLE s.t (k BIGINT PRIMARY KEY)");
+        (void)t.execute("INSERT INTO s.t VALUES (1)");
+        (void)t.commit();
+      });
+      fired = faults.report().fired;
+    }
+    INFO("allocation " << nth << ": " << outcome);
+    const auto cat = db->catalog();
+    const auto* s = cat->schema("s");
+    CHECK((s != nullptr) == (outcome == "ok"));
+    if (s != nullptr) {
+      REQUIRE(cat->table({s->id, "t"}) != nullptr);
+      CHECK(db->execute("SELECT k FROM s.t").rows == Grid{{i(1)}});
+      (void)db->execute("DROP TABLE s.t");
+      (void)db->execute("DROP SCHEMA s");
+    }
+    if (!fired) break;
+    ++failed;
+  }
+  CHECK(failed > 0);
+}

@@ -3,8 +3,9 @@
 #
 # Applies, reverts or checks one mutation patch (tests/soak_mutations/,
 # tests/chaos_mutations/, tests/durability_mutations/,
-# bytecaskdb-sql-layer/tests/serializable_mutations/) by three-way merge, so a
-# patch keeps applying when lines near its target change. Used by
+# bytecaskdb-sql-layer/tests/serializable_mutations/, schema_mutations/) by
+# three-way merge, so a patch keeps applying when lines near its target
+# change. Used by
 # soak_mutation_check.sh, chaos_mutation_check.sh,
 # serializable_mutation_check.sh and ci.yml.
 #
