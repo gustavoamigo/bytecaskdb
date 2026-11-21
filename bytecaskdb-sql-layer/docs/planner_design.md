@@ -878,6 +878,50 @@ inner join's plan would end with no rows. Probed by key, the right side is
 looked up only when no part is NULL and the key fits: a NULL, or a left
 value too long for any key, is a miss, and the left row goes on.
 
+### FULL JOIN
+
+`a FULL JOIN b ON p` as the whole `FROM` is bound (`Binder::full_join`) as
+a `UNION ALL` of two arms, each a `SELECT` of the statement's select list
+and `WHERE`:
+
+- the left arm, `a LEFT JOIN b ON p`: every pair `p` makes and every row
+  of `a` it makes none for, `b` NULL-extended;
+- the right arm, an anti-join, `a RIGHT JOIN b ON p` under `a`'s primary key
+  `IS NULL`: the rows of `b` it pairs with no row of `a`, `a` NULL-extended.
+  The probe is the `ON` alone. A row's primary key is never NULL (a table
+  declared without one has its hidden row id), so the conjunct holds of
+  the NULL-extended rows and of no pair.
+
+Each arm is an outer join planned as *Outer joins* says, so each side is
+read once by its arm's outer loop and probed by the other's. The `WHERE`
+sits above each arm's join with the anti-join's conjunct, so it filters
+the rows after NULL-extension: pushdown moves a conjunct on the preserved
+side below the join, as it does for any outer join, which keeps the same
+rows. A `USING` column is the left table's in the left arm and the right
+table's in the right, the side that has a row, which is PostgreSQL's
+`COALESCE`; the arms' types resolve as a set operation's.
+
+The rest is a set operation's (*Set operations*): the arms stream, `LIMIT`
+is the set operation's, and an `ORDER BY` key the select list has orders
+by that column. Any other key is a hidden column (`logical::SetOp::hidden`):
+appended to both arms' select lists, held in the sorter's payload like the
+others and never emitted, so the plan's result columns are the statement's.
+Rows come left arm first, without an order of their own.
+
+The `ON` is checked as PostgreSQL plans a full join, by a merge or hash join
+only: one of its conjuncts that reads columns is an equality of an expression of each
+side, or none reads a column (`ON TRUE`); else 0A000. Each `NOT` is pushed
+down first, as PostgreSQL's `negate_clause` does: `NOT (a <> b)` is `a = b`,
+and `NOT (x OR y)` is `NOT x AND NOT y`. A bare `$n` `ORDER BY` key orders
+nothing; it stays an `ORDER BY` item of both arms, where it is bound as a
+plain query binds one, so the statement declares the parameter. Not in this cut
+(42601): a `FULL JOIN` in a chain, in parentheses or after a comma (#712),
+which needs a set operation as a join's side; an aggregate, `GROUP BY` or
+`DISTINCT` over it, which the set operation's sink does not feed; an
+`OFFSET`, which a set operation does not count; `INSERT … SELECT` of it,
+one as an arm of a set operation, and a grouped view as either side.
+`FOR UPDATE` is 0A000, as in PostgreSQL.
+
 ### Subqueries
 
 An uncorrelated subquery is a statement of its own, run once before the
@@ -1062,7 +1106,10 @@ give pair by pair (`frontend_design.md`, *Set operations*); the rewrites
 treat each arm as a statement. The search plans each arm alone and keeps its
 cheapest plan, as it does a subquery's (`physical::SetPlan`: a tree whose
 leaves are arm plans whose root is an `Emit`); an arm that is not a plain
-`SELECT` (a group, an aggregate, `DISTINCT`) is refused by the binder.
+`SELECT` (a group, an aggregate, `DISTINCT`) is refused by the binder. An
+arm's uncorrelated subqueries are the statement's: they run once before
+the arms, and an arm's `IN (SELECT …)` tests the statement's set by its
+index, which the plan checker reads from the statement's plan, not the arm's.
 
 Codegen prints one function. Each arm is a block of it, its pipeline as
 alone with every result row going to a sink instead of `bc_emit_*`, and
@@ -1109,7 +1156,8 @@ their directions and NULL placements (NULLS LAST for `ASC` and FIRST for
 `DESC` unless the statement says), and the payload, a sort key of all the
 columns, each ascending. After the arms a loop over the sorter reads each
 payload back part by part with `bc_sort_key_part_*` (`plan_api_design.md`)
-and emits the row. The payload is a second key rather than the sorter's key
+and emits the row, less a `FULL JOIN`'s hidden `ORDER BY` columns
+(*FULL JOIN*). The payload is a second key rather than the sorter's key
 because the sorter's key has the `ORDER BY`'s directions, which the
 decoders do not read. A `DOUBLE` column is two parts in the payload, the
 value and a flag for a negative zero, since the key holds `-0.0` as `0.0`;
@@ -1748,7 +1796,7 @@ Each slice was one PR, or a few, with its tests.
 
 The rest of the dialect stays in #534: aliases of a join and of columns,
 expressions, correlated subqueries beyond *Subqueries*' slice,
-`FULL JOIN`, `FOR UPDATE` on joins, and `EXPLAIN`. The serializable guards,
+`FULL JOIN` but as the whole `FROM` (*FULL JOIN*), `FOR UPDATE` on joins, and `EXPLAIN`. The serializable guards,
 the plan cache and procedures (#495) keep their own designs.
 
 ## Decisions

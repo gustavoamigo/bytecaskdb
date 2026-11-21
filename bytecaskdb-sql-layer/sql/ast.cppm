@@ -329,9 +329,10 @@ struct SetOperation;
 struct Select;
 
 // How a FROM item joins the ones before it: LEFT keeps every row of the
-// items before it, RIGHT every row of the item, each joined to NULLs where
-// no row of the other matches.
-enum class JoinKind { Inner, Left, Right };
+// items before it, RIGHT every row of the item, FULL both, each joined to
+// NULLs where no row of the other matches. FULL is only the whole FROM of
+// two tables (the parser).
+enum class JoinKind { Inner, Left, Right, Full };
 
 // A FROM item: a table or view, and how it joins the items before it. A
 // comma is an inner join with no ON. USING (…) or NATURAL compare the
@@ -419,6 +420,7 @@ struct SetOperation {
   out.quantified = c.quantified;
   out.all = c.all;
   out.ne = c.ne;
+  out.truth = c.truth;
   return out;
 }
 

@@ -2011,6 +2011,47 @@ def test_left_and_right_join_null_extend_the_rows_nothing_matches(dsn):
         m.teardown()
 
 
+def test_full_join_keeps_the_rows_of_both_sides(dsn):
+    """FULL JOIN as the whole FROM: every pair its ON makes, then each row
+    of either side it makes none for, NULL-extended; WHERE filters the
+    joined rows after the NULL-extension; a USING column alone is the side's
+    that has a row; ORDER BY a column it does not select; NOT (a <> b) is
+    a = b; the WHERE's IN and NOT IN of a subquery; an ON PostgreSQL cannot
+    merge or hash is 0A000."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT), Column("c1", o.INTEGER), Column("c2", o.TEXT)], ["c0"]))
+        m.create(Table("t1", [Column("c3", o.BIGINT), Column("c1", o.INTEGER), Column("c2", o.TEXT)], ["c3"]))
+        m.create(Table("t2", [Column("c1", o.INTEGER), Column("c4", o.TEXT)], ["c4"]))
+        for row in ({"c0": 1, "c1": 1, "c2": "x"}, {"c0": 2, "c1": 2, "c2": "y"}, {"c0": 3, "c1": None, "c2": "z"},
+                    {"c0": 4, "c1": 4, "c2": None}):
+            assert m.insert("t0", row, all_columns=True).error is None
+        for row in ({"c3": 10, "c1": 1, "c2": "x"}, {"c3": 11, "c1": 2, "c2": "n"}, {"c3": 12, "c1": 5, "c2": "z"},
+                    {"c3": 13, "c1": 1, "c2": "x"}, {"c3": 14, "c1": None, "c2": None}):
+            assert m.insert("t1", row, all_columns=True).error is None
+        for row in ({"c1": 2, "c4": "p"}, {"c1": None, "c4": "q"}, {"c1": 7, "c4": "r"}):
+            assert m.insert("t2", row, all_columns=True).error is None
+        for sql in ("SELECT t0.c0, t1.c3 FROM t0 FULL JOIN t1 ON t0.c1 = t1.c1 ORDER BY t0.c0, t1.c3",
+                    "SELECT t0.c0, t1.c3 FROM t0 FULL OUTER JOIN t1 ON t0.c1 = t1.c1 AND t1.c2 = 'x' ORDER BY t0.c0, t1.c3",
+                    "SELECT t0.c0, t1.c3 FROM t0 FULL JOIN t1 ON t0.c1 = t1.c1 AND t0.c2 = t1.c2 ORDER BY t0.c0, t1.c3",
+                    "SELECT t0.c0, t1.c3 FROM t0 FULL JOIN t1 ON t0.c1 = t1.c1 WHERE t0.c0 IS NULL OR t1.c3 IS NULL ORDER BY 1, 2",
+                    "SELECT t0.c0, t1.c3 FROM t0 FULL JOIN t1 ON t0.c1 = t1.c1 WHERE t1.c2 = 'x' OR t0.c0 > 2 ORDER BY 1, 2",
+                    "SELECT c1, t0.c0, t1.c3 FROM t0 FULL JOIN t1 USING (c1) ORDER BY c1, t0.c0, t1.c3",
+                    "SELECT t0.c0, t1.c3 FROM t0 FULL JOIN t1 ON TRUE ORDER BY t0.c0, t1.c3",
+                    "SELECT t0.c0, t1.c3 FROM t0 FULL JOIN t1 ON FALSE ORDER BY t0.c0, t1.c3",
+                    "SELECT t0.c0 FROM t0 FULL JOIN t1 ON t0.c1 = t1.c1 ORDER BY t1.c2 DESC, t0.c0 NULLS FIRST LIMIT 4",
+                    "SELECT t2.c4, t0.c0 FROM t2 FULL JOIN t0 ON t2.c1 = t0.c1 ORDER BY t2.c4, t0.c0",
+                    "SELECT t0.c0, t2.c4 FROM t0 FULL JOIN t2 ON t2.c1 = t0.c1 ORDER BY t2.c4, t0.c0",
+                    "SELECT t0.c0, t1.c3 FROM t0 FULL JOIN t1 ON NOT (t0.c1 <> t1.c1) ORDER BY 1, 2",
+                    "SELECT t0.c0, t1.c3 FROM t0 FULL JOIN t1 ON t0.c1 = t1.c1 WHERE t0.c1 IN (SELECT c1 FROM t2) ORDER BY 1, 2",
+                    "SELECT t0.c0, t1.c3 FROM t0 FULL JOIN t1 ON t0.c1 = t1.c1 WHERE t1.c1 NOT IN (SELECT c1 FROM t2) ORDER BY 1, 2",
+                    "SELECT t0.c0 FROM t0 FULL JOIN t1 ON t0.c1 < t1.c1"):
+            m.both(sql)
+        m.check()
+    finally:
+        m.teardown()
+
+
 def test_joins_of_several_tables_with_themselves_and_on_any_comparison(dsn):
     """Three or more tables, a table joined with itself under two aliases,
     and ON by any comparison or by a predicate over both sides, inner and

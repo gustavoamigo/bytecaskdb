@@ -4198,6 +4198,9 @@ public:
       return set_operation(s);
     }
     if (s.from.empty()) return select_without_from(s, assign);
+    if (std::ranges::any_of(s.from, [](const ast::FromItem& f) { return f.kind == ast::JoinKind::Full; })) {
+      return full_join(s, assign.has_value());
+    }
     auto rels = relations(s);
     joins_ = {};
     // Join k's USING or NATURAL equalities.
@@ -4409,6 +4412,162 @@ public:
     rows = limited(std::move(rows), s);
     for (auto t : nulled) nullable_above_join(*rows, t);
     return rows;
+  }
+
+  // FROM a FULL JOIN b ON …, the whole FROM (docs/planner_design.md, *FULL
+  // JOIN*): UNION ALL of two plans, each a SELECT of the statement's list
+  // and WHERE. The left arm is a LEFT JOIN b, every row of a. The right arm,
+  // an anti-join, is a RIGHT JOIN b under a's primary key IS NULL: the rows
+  // of b the ON pairs with no row of a, NULL-extended. A table's primary key,
+  // its hidden row id for one declared without, is never NULL in a row, so
+  // that conjunct holds exactly of the NULL-extended rows. The WHERE is
+  // above each arm's join, after the NULL-extension. An ORDER BY key the
+  // select list has is its column; any other is a trailing column of both
+  // arms the statement does not return (logical::SetOp::hidden).
+  auto full_join(const ast::Select& s, bool assigned) -> logical::NodePtr {
+    // The parser takes a FULL JOIN only as the whole FROM, of two tables (#712).
+    if (s.from.size() != 2) throw std::logic_error{"binder: a FULL JOIN of other than two tables"};
+    for (const auto& f : s.from) {
+      if (f.derived) not_yet("a grouped view in a FULL JOIN", f.pos);
+    }
+    auto aggregate = [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Aggregate; };
+    if (!s.group_by.empty() || !s.having.empty() || s.distinct || std::ranges::any_of(s.targets, aggregate) ||
+        std::ranges::any_of(s.order_by, [&](const ast::OrderItem& o) { return aggregate(o.expr); })) {
+      not_yet("an aggregate, GROUP BY or DISTINCT over a FULL JOIN", s.pos);
+    }
+    if (s.for_update) {
+      throw SqlError{"FOR UPDATE cannot be applied to the nullable side of an outer join", s.pos, kFeatureNotSupported};
+    }
+    if (assigned) not_yet("INSERT … SELECT of a FULL JOIN", s.pos);
+    if (in_set_arm_) not_yet("a FULL JOIN in an arm of a set operation (UNION, INTERSECT, EXCEPT)", s.pos);
+    if (s.offset != 0) not_yet("OFFSET over a FULL JOIN", s.pos);
+    auto arm = ast::clone(s);
+    arm.order_by.clear();
+    arm.limit.reset();
+    arm.limit_written = false;
+    arm.row_key = false;
+    // Each ORDER BY key: a select-list item written alike, or a hidden
+    // column appended to both arms. A constant orders nothing; a bare $n
+    // stays an ORDER BY item of the arms, which sorts on nothing but binds
+    // the parameter as a plain query's ORDER BY does (order_key).
+    struct Key {
+      bool hidden;
+      std::size_t at;
+      const ast::OrderItem* item;
+    };
+    std::vector<Key> keys;
+    auto stars = std::ranges::any_of(s.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Star; });
+    std::size_t hidden = 0;
+    for (const auto& o : s.order_by) {
+      if (o.expr.kind == ast::Expr::Kind::Param) arm.order_by.push_back(ast::clone(o));
+      if (is_constant(o.expr) || o.expr.kind == ast::Expr::Kind::Param) continue;
+      auto same = stars ? s.targets.end()
+                        : std::ranges::find_if(s.targets, [&](const ast::Expr& t) { return ast::same_expr(t, o.expr); });
+      if (same != s.targets.end()) {
+        keys.push_back({false, static_cast<std::size_t>(same - s.targets.begin()), &o});
+        continue;
+      }
+      auto key = ast::clone(o.expr);
+      key.alias = "?order?";
+      arm.targets.push_back(std::move(key));
+      keys.push_back({true, hidden++, &o});
+    }
+    auto left_arm = ast::clone(arm);
+    left_arm.from[1].kind = ast::JoinKind::Left;
+    auto right_arm = std::move(arm);
+    right_arm.from[1].kind = ast::JoinKind::Right;
+    // The arms are a set operation's in the plan: what they cannot hold is
+    // refused as there.
+    auto was = std::exchange(in_set_arm_, true);
+    auto left = select(left_arm);
+    auto right = select(right_arm);
+    in_set_arm_ = was;
+    full_join_on(*left, s.from[1].pos);
+    anti_join(*right);
+    const auto& lo = outputs_of(*left);
+    const auto& ro = outputs_of(*right);
+    if (lo.size() != ro.size() || lo.size() < hidden) throw std::logic_error{"binder: FULL JOIN arms of other columns"};
+    const auto visible = lo.size() - hidden;
+    logical::SetOp out;
+    out.kind = ast::SetOperation::Kind::Union;
+    out.all = true;
+    for (std::size_t i = 0; i < lo.size(); ++i) {
+      auto type = set_type(lo[i].expr.type, ro[i].expr.type, false, false, "FULL JOIN", s.pos);
+      (i < visible ? out.outputs : out.hidden).push_back({logical::param(0, type), lo[i].name});
+    }
+    for (const auto& k : keys) {
+      const auto& o = *k.item;
+      out.order.push_back({k.hidden ? visible + k.at : k.at, o.desc, o.nulls_first.value_or(o.desc)});
+    }
+    out.left = std::move(left);
+    out.right = std::move(right);
+    auto rows = logical::node(std::move(out));
+    if (s.limit) rows = logical::node(logical::Limit{std::move(rows), *s.limit});
+    return rows;
+  }
+
+  // The Join of a FULL JOIN's arm, under its Project and WHERE.
+  static auto arm_join(logical::Node& n) -> logical::Join& {
+    auto* at = &n;
+    while (!std::holds_alternative<logical::Join>(at->op)) {
+      auto* in = logical::input_of(*at);
+      if (in == nullptr || !*in) throw std::logic_error{"binder: a FULL JOIN arm with no join"};
+      at = in->get();
+    }
+    return std::get<logical::Join>(at->op);
+  }
+
+  // A FULL JOIN's ON, as PostgreSQL plans one: by a merge or hash join,
+  // so a conjunct that reads columns is an equality of an expression of
+  // each side, or one such equality is among them; else 0A000.
+  static void full_join_on(logical::Node& left_arm, std::int32_t pos) {
+    const auto& j = arm_join(left_arm);
+    auto tables = [](const logical::Expr& e) {
+      std::vector<logical::ColumnRef> cols;
+      logical::columns_of(e, cols);
+      std::vector<std::uint32_t> out;
+      for (const auto& c : cols) {
+        if (!std::ranges::contains(out, c.table)) out.push_back(c.table);
+      }
+      return out;
+    };
+    // An equality of the two sides, as PostgreSQL finds one after pushing
+    // each NOT down (negate_clause): NOT (a <> b), the parser's NOT (NOT
+    // (a = b)), is a = b, and NOT (x OR y) is NOT x AND NOT y.
+    std::function<bool(const logical::Expr&, bool)> joins = [&](const logical::Expr& c, bool negated) {
+      using K = logical::Expr::Kind;
+      if (c.kind == K::Not && c.args.size() == 1) return joins(c.args[0], !negated);
+      if ((c.kind == K::And && !negated) || (c.kind == K::Or && negated)) {
+        return std::ranges::any_of(c.args, [&](const logical::Expr& a) { return joins(a, negated); });
+      }
+      if (negated || c.kind != K::Compare || c.op != logical::Op::Eq || c.args.size() != 2) return false;
+      auto l = tables(c.args[0]);
+      auto r = tables(c.args[1]);
+      return l.size() == 1 && r.size() == 1 && l[0] != r[0];
+    };
+    auto reads = [&](const logical::Expr& c) { return !tables(c).empty(); };
+    if (std::ranges::any_of(j.predicate, [&](const logical::Expr& c) { return joins(c, false); }) || std::ranges::none_of(j.predicate, reads)) return;
+    throw SqlError{"FULL JOIN is only supported with merge-joinable or hash-joinable join conditions", pos,
+                   kFeatureNotSupported};
+  }
+
+  // The right arm's anti-join: its rows whose left table, NULL-extended,
+  // has a NULL primary key, a conjunct above the join with the WHERE's.
+  static void anti_join(logical::Node& right_arm) {
+    auto& j = arm_join(right_arm);
+    const auto* get = std::get_if<logical::Get>(&j.right->op);
+    if (get == nullptr || get->table->pk_col_ids.empty()) throw std::logic_error{"binder: a FULL JOIN of no table"};
+    const auto& t = *get->table;
+    auto key = logical::column_of(t.id, *t.column(t.pk_col_ids[0]));
+    key.col.nullable = true;
+    auto unmatched = logical::predicate_of(logical::Expr::Kind::IsNull, {std::move(key)});
+    auto* p = std::get_if<logical::Project>(&right_arm.op);
+    if (p == nullptr) throw std::logic_error{"binder: a FULL JOIN arm that is not a Project"};
+    if (auto* f = std::get_if<logical::Filter>(&p->input->op)) {
+      f->conjuncts.push_back(std::move(unmatched));
+      return;
+    }
+    p->input = logical::node(logical::Filter{std::move(p->input), {std::move(unmatched)}});
   }
 
   // An ORDER BY key of a query that is not aggregated, an expression of its

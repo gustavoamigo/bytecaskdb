@@ -179,8 +179,25 @@ kind the transformer doesn't take is refused with its position.
   where nothing matches, their own `ON`s deciding which rows they have
   (`planner_design.md`, *Outer joins*). A `RIGHT JOIN` of a join that has
   an outer join, `a LEFT JOIN b ON … RIGHT JOIN c ON …`, is refused (42601,
-  `a RIGHT JOIN of a join that has an outer join is not supported yet`),
-  and `FULL JOIN` too. A table takes an alias, `t [AS]
+  `a RIGHT JOIN of a join that has an outer join is not supported yet`).
+  `FULL [OUTER] JOIN` keeps the rows of both sides, each NULL-extended
+  where the `ON` matches none, `WHERE` filtering the joined rows after the
+  NULL-extension; a `USING` column named alone is the side's that has a
+  row, `COALESCE(l.c, r.c)`. It is the whole `FROM`, of two tables (or
+  views a query merges, or one view of such a join): one in a chain, in
+  parentheses or after a comma is refused (42601, `a FULL JOIN that is not
+  the whole FROM of two tables is not supported yet`, #712), and so is an
+  aggregate, `GROUP BY`, `HAVING` or `DISTINCT` above it, an `OFFSET`, `INSERT
+  … SELECT` of it, one in an arm of a set operation and a grouped view as
+  either side (42601, `a grouped view in a FULL JOIN is not supported
+  yet`). As PostgreSQL, its `ON` must be merge- or hash-joinable: a
+  conjunct that reads columns is an equality of an expression of each
+  side, or one such equality is among them, each `NOT` pushed down first
+  as PostgreSQL does, so `NOT (a <> b)` is `a = b` (else 0A000, `FULL JOIN
+  is only supported with merge-joinable or hash-joinable join
+  conditions`), and `FOR UPDATE` over it is 0A000,
+  `FOR UPDATE cannot be applied to the nullable side of an outer join`
+  (`planner_design.md`, *FULL JOIN*). A table takes an alias, `t [AS]
   x`. A table named twice, `t JOIN t AS x`, is read twice, once under each
   name; the planner reads it as two tables (`planner_design.md`, *Joins of
   several tables*). The front end rewrites the qualifier `x` to the table
@@ -936,7 +953,9 @@ That includes:
   every key of, an aggregate of `DISTINCT` values of an expression (0A000),
   `GROUP BY` of an expression, and `HAVING` of anything but the
   comparisons above;
-- `FULL JOIN`, an outer join's `ON` comparing an expression of columns,
+- a `FULL JOIN` that is not the whole `FROM` of two tables (#712), or under
+  an aggregate, `GROUP BY`, `DISTINCT`, `OFFSET`, `INSERT … SELECT` or a set
+  operation, or of a grouped view, an outer join's `ON` comparing an expression of columns,
   more than eight tables, a `RIGHT JOIN` of a join that has an outer join,
   an outer join in parentheses or of a join in parentheses, `USING` or `NATURAL` in
   parentheses or after a comma,
