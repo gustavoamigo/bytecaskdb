@@ -236,6 +236,50 @@ TEST_CASE("parser: ORDER BY a position names the select-list column; a set opera
   CHECK(sqlstate_of("SELECT * FROM t ORDER BY 1") == "42601");        // a position after *: not yet
 }
 
+TEST_CASE("parser: ORDER BY an output name orders by its item, never the input column it hides", "[sql][parser]") {
+  // The output name qty is the input column id, as PostgreSQL resolves it.
+  auto s = std::get<Select>(parse("SELECT qty + 1 AS id, id AS qty FROM t ORDER BY qty DESC"));
+  REQUIRE(s.order_by.size() == 1);
+  CHECK(s.order_by[0].column == "id");
+  // An output name of an expression is refused, not read as the input column of its name.
+  for (const auto* sql : {"SELECT qty + 1 AS qty FROM t ORDER BY qty", "SELECT -qty AS qty FROM t ORDER BY qty DESC",
+                          "SELECT count(*) AS id FROM t ORDER BY id"}) {
+    try {
+      (void)parse(sql);
+      FAIL(sql);
+    } catch (const SqlError& e) {
+      CHECK(std::string{e.sqlstate()} == "42601");
+      CHECK(std::string{e.what()}.find("ORDER BY an output name of an expression") != std::string::npos);
+    }
+  }
+  // A qualified name is the input column, as in PostgreSQL.
+  auto q = std::get<Select>(parse("SELECT qty + 1 AS qty FROM t ORDER BY t.qty"));
+  CHECK(q.order_by[0].column == "qty");
+  // A position names its item, whatever another item's output name is.
+  for (const auto* sql : {"SELECT qty, -id AS qty FROM t ORDER BY 1", "SELECT qty AS id, id AS qty FROM t ORDER BY 1"}) {
+    auto p = std::get<Select>(parse(sql));
+    CHECK(p.order_by[0].column == "qty");
+  }
+  CHECK(std::get<Select>(parse("SELECT qty AS id, id AS qty FROM t ORDER BY 2")).order_by[0].column == "id");
+  // An unaliased column's name is an output name too; two different items of
+  // one name are ambiguous (42702), one column twice is not.
+  auto sqlstate_of = [](const char* sql) {
+    try {
+      (void)parse(sql);
+    } catch (const SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"parsed"};
+  };
+  CHECK(sqlstate_of("SELECT id AS qty, qty FROM t ORDER BY qty") == "42702");
+  CHECK(sqlstate_of("SELECT qty AS x, id AS x FROM t ORDER BY x") == "42702");
+  CHECK(sqlstate_of("SELECT id, count(*) AS id FROM t GROUP BY id ORDER BY id") == "42702");
+  CHECK(sqlstate_of("SELECT -qty AS x, -qty AS x FROM t ORDER BY x") == "42601");  // expressions: not yet
+  auto twice = std::get<Select>(parse("SELECT qty AS x, t.qty AS x FROM t ORDER BY x"));
+  CHECK(twice.order_by[0].column == "qty");
+  CHECK(twice.order_by[0].table == "t");
+}
+
 TEST_CASE("parser: COUNT, ORDER BY, LIMIT and column + parameter", "[sql][parser]") {
   auto s = std::get<Select>(parse("SELECT count(*), count(qty) FROM t WHERE name = $1 ORDER BY name DESC, id LIMIT 3"));
   REQUIRE(s.targets.size() == 2);
