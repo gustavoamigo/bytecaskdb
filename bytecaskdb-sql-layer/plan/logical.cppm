@@ -270,6 +270,21 @@ struct Insert {
   std::vector<Output> returning;  // RETURNING's: a row of these per row written, over the row as written
 };
 
+// INSERT … SELECT: each row the input gives, a SELECT's rows (a Project
+// under any Sort and Limit), written as one row of the table: its i-th
+// column into columns[i], each of a type the binder checked it assigns to;
+// `fixed` sets a column left out to a parameter (a DEFAULT of the clock),
+// and the rest keep the default bc_row_begin writes. `checks` and
+// `returning` are as Insert's.
+struct InsertFrom {
+  NodePtr input;
+  const Table* table{nullptr};
+  std::vector<ColumnRef> columns;
+  std::vector<std::pair<ColumnRef, Expr>> fixed;
+  std::vector<Expr> checks;
+  std::vector<Output> returning;
+};
+
 // Each row the input gives, written: its set columns from expressions of
 // the row as read.
 struct Update {
@@ -310,7 +325,7 @@ struct SetOp {
 };
 
 struct Node {
-  std::variant<Get, Empty, OneRow, Filter, Project, Join, Aggregate, Sort, Limit, SetOp, Insert, Update, Delete> op;
+  std::variant<Get, Empty, OneRow, Filter, Project, Join, Aggregate, Sort, Limit, SetOp, Insert, InsertFrom, Update, Delete> op;
   // The columns something above reads from this operator's rows: set by
   // projection pruning, empty before it.
   std::vector<ColumnRef> output;

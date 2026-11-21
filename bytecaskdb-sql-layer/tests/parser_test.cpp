@@ -794,3 +794,17 @@ TEST_CASE("parser: CREATE TABLE AS and SELECT … INTO read as one statement, re
   // INTO in a subquery stays refused.
   CHECK(state("SELECT (SELECT 1 INTO t)") == "42601");
 }
+
+TEST_CASE("parser: INSERT … SELECT reads a query in place of VALUES", "[sql][parser][insert]") {
+  auto s = std::get<Insert>(parse("INSERT INTO t (a, b) SELECT x, $1 FROM u WHERE y = $2 RETURNING a"));
+  CHECK(s.rows.empty());
+  CHECK(s.columns == std::vector<std::string>{"a", "b"});
+  REQUIRE(s.query);
+  REQUIRE(s.query->targets.size() == 2);
+  CHECK(s.query->from[0].table == "u");
+  CHECK(s.returning.size() == 1);
+  auto u = std::get<Insert>(parse("INSERT INTO t SELECT x FROM u UNION SELECT 1"));
+  REQUIRE(u.query);
+  CHECK(u.query->set != nullptr);
+  CHECK(!std::get<Insert>(parse("INSERT INTO t VALUES (1)")).query);
+}

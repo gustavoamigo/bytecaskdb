@@ -74,7 +74,7 @@ compute, not how.
 | `Aggregate(input, group_by, aggs)` | `COUNT`, `COUNT(DISTINCT)`, `SUM`, `MIN`, `MAX`, `AVG`; no `group_by` means one row |
 | `Sort(input, keys)` | each key with its direction and its NULL placement |
 | `Limit(input, n)` | the first n rows |
-| `Insert`, `Update`, `Delete` | writes, over the rows their input gives |
+| `Insert`, `InsertFrom`, `Update`, `Delete` | writes, over the rows their input gives |
 
 Each expression carries its SQL type, which the binder resolves. The
 dialect's expressions are columns, parameters, integer constants, `+ - * /`,
@@ -109,8 +109,9 @@ errors it raises.
   never keys one.
 - Every `WHERE` conjunct, a join's `ON` among them, is in one `Filter`
   above the tables, in the order written. Pushdown moves it.
-- `UPDATE` and `DELETE` are over `Filter? → Get`; `INSERT` is one row of
-  parameters.
+- `UPDATE` and `DELETE` are over `Filter? → Get`; `INSERT … VALUES` is
+  rows of parameters, and `INSERT … SELECT` an `InsertFrom` over its
+  query's `SELECT` (*INSERT … SELECT*).
 - A `Sort` key takes `NULLS FIRST` or `NULLS LAST` as written, else
   PostgreSQL's default for its direction: `ASC NULLS LAST`, `DESC NULLS
   FIRST`.
@@ -953,6 +954,47 @@ next one runs.
 and a `LIMIT` on one. An arm that groups, aggregates or is `DISTINCT` (#682);
 `FOR UPDATE`; a literal of no type meeting another type; `DECIMAL` of two
 scales, or with an integer; an integer with `REAL`; `DATE` with `TIMESTAMP`.
+
+### INSERT … SELECT
+
+`INSERT … SELECT` is a `logical::InsertFrom` over the query, a `SELECT`
+whose root is a `Project` (under a `Sort` and a `Limit`): the binder bound
+its select list as the values of the columns written (`frontend_design.md`,
+*INSERT … SELECT*), and `columns[i]` is the column its i-th output fills.
+The rewrites treat the query as a `SELECT`; pruning keeps what its
+`Project` reads. The search plans the query as it plans a `SELECT`, every
+alternative of it, and puts a `physical::InsertFrom` over each plan's
+`Emit`. A query whose plan ends in another sink (`GroupEmit`, `Aggregate`,
+`CountRange`, `KeyAggregates`) or that is a set operation is refused by
+the binder (#682), and an `InsertFrom` over no `Emit` is a broken plan
+(`physical::check`). Each of its columns carries its declared `SqlType`
+and the `SqlType` of the `Project` output that fills it, and
+`physical::check` proves the pair assigns by the binder's rule, not only
+by `PhysType`: the `Emit` target gives the value as its type says, and the
+value is held as the column is, at its scale and of its kind or family, or
+is a float or an integer into a float. A `DECIMAL` of another scale, a
+`DATE` into an integer column or a `TIMESTAMP` into a `TIMESTAMPTZ` one,
+each an `I64` on both sides, is a broken plan, should the binder ever let
+one through.
+
+Codegen prints the query's pipeline with the `Emit`'s rows going to a sink,
+as a set operation's arm does: each row, in hand, is written in a block of
+its own as `INSERT … VALUES` writes one (`bc_row_begin`, a column set per
+output, the `CHECK`s, `bc_insert`, `RETURNING` over the row written), then
+counted in `inserted`, a counter of its own beside a `LIMIT`'s `n`. A NULL
+output is set with `bc_row_set_null`, so a column with a default is
+written NULL, as PostgreSQL writes it; an integer output into a `DOUBLE`
+or `REAL` column is converted with `bc_i64_to_f64`, the one conversion
+the plan makes. A miss in a single-row query skips the rest in an `if`, as
+in an arm. The count is emitted after the query: 0 for an empty query, a
+`LIMIT 0` (which prints no pipeline) or a NULL parameter a key needs.
+
+The scans read the snapshot the statement began on and the writes go to
+the transaction's batch, so the query never reads a row the statement
+wrote: `INSERT INTO t SELECT * FROM t` doubles `t` once. A row that fails
+(a key, a `CHECK`, a value out of its column's range) raises a sticky
+error, so the rows after it are not written and the statement writes
+nothing.
 
 ### Expressions over columns
 

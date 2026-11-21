@@ -505,3 +505,147 @@
   teardown:
     - ROLLBACK
     - DROP TABLE upt
+
+- name: INSERT … SELECT writes a query's rows into the leading columns or a column list
+  features: [E101-01]
+  setup:
+    - CREATE TABLE src (a INTEGER PRIMARY KEY, b BIGINT, c VARCHAR(10))
+    - INSERT INTO src VALUES (1, 10, 'one'), (2, NULL, 'two'), (3, 30, NULL)
+    - CREATE TABLE dst (k INTEGER, v BIGINT DEFAULT 9, s TEXT, f DOUBLE PRECISION)
+  steps:
+    - sql: INSERT INTO dst SELECT a, b FROM src WHERE a <= $1
+      params: [2]
+      rowcount: 2
+    # A column left out takes its default; a NULL given is NULL.
+    - sql: INSERT INTO dst (s, k) SELECT c, a FROM src WHERE a = 3
+      rowcount: 1
+    # An integer into a DOUBLE PRECISION column is converted.
+    - sql: INSERT INTO dst (k, f) SELECT a + 10, b FROM src ORDER BY a LIMIT 2
+      rowcount: 2
+    - sql: INSERT INTO dst (k) SELECT x.a FROM src x JOIN src y ON x.b = y.b
+      rowcount: 2
+    - sql: SELECT k, v, s, f FROM dst
+      expected:
+        - [1, 10, null, null]
+        - [2, null, null, null]
+        - [3, 9, null, null]
+        - [11, 9, null, 10]
+        - [12, 9, null, null]
+        - [1, 9, null, null]
+        - [3, 9, null, null]
+    # No row, LIMIT 0 and a WHERE that is never true write nothing.
+    - sql: INSERT INTO dst (k) SELECT a FROM src WHERE a > 100
+      rowcount: 0
+    - sql: INSERT INTO dst (k) SELECT a FROM src LIMIT 0
+      rowcount: 0
+    - sql: INSERT INTO dst (k) SELECT a FROM src WHERE FALSE
+      rowcount: 0
+    - sql: INSERT INTO dst (k) SELECT a FROM src WHERE a = 2 RETURNING k, v
+      expected: [[2, 9]]
+  teardown:
+    - DROP TABLE dst
+    - DROP TABLE src
+
+- name: INSERT … SELECT from its own table reads the rows there when it began
+  features: [E101-01]
+  setup:
+    - CREATE TABLE t (a INTEGER, b TEXT)
+    - INSERT INTO t VALUES (1, 'x'), (2, 'y')
+  steps:
+    - sql: INSERT INTO t SELECT * FROM t
+      rowcount: 2
+    - sql: INSERT INTO t SELECT * FROM t
+      rowcount: 4
+    - sql: SELECT a, COUNT(*) FROM t GROUP BY a
+      expected: [[1, 4], [2, 4]]
+  teardown:
+    - DROP TABLE t
+
+- name: a literal of no type, NULL and a parameter in INSERT … SELECT take their column's type
+  features: [E101-01]
+  setup:
+    - CREATE TABLE dst (k INTEGER DEFAULT 7, v BIGINT DEFAULT 9, s TEXT, n VARCHAR(3))
+  steps:
+    - sql: INSERT INTO dst (k, v, s, n) SELECT '5', NULL, $1, 'ab'
+      params: ["p"]
+      rowcount: 1
+    - sql: SELECT k, v, s, n FROM dst
+      expected: [[5, null, "p", "ab"]]
+    - sql: INSERT INTO dst (k) SELECT 'x'
+      error: "22P02"
+    - sql: INSERT INTO dst (n) SELECT 'abcd'
+      error: "22001"
+  teardown:
+    - DROP TABLE dst
+
+- name: INSERT … SELECT is refused as PostgreSQL refuses it, and writes nothing
+  features: [E101-01]
+  setup:
+    - CREATE TABLE src (a INTEGER PRIMARY KEY, b BIGINT, c VARCHAR(10))
+    - INSERT INTO src VALUES (1, 10, 'one'), (2, 3000000000, 'two')
+    - CREATE TABLE dst (k INTEGER PRIMARY KEY, n VARCHAR(3), d DATE)
+    - INSERT INTO dst VALUES (2, NULL, NULL)
+  steps:
+    - sql: INSERT INTO dst (k) SELECT a, b FROM src
+      error: "42601"
+    - sql: INSERT INTO dst (k, n) SELECT a FROM src
+      error: "42601"
+    - sql: INSERT INTO dst (k, k) SELECT a, a FROM src
+      error: "42701"
+    - sql: INSERT INTO dst (zz) SELECT a FROM src
+      error: "42703"
+    - sql: INSERT INTO dst (k) SELECT c FROM src
+      error: "42804"
+    - sql: INSERT INTO dst (d) SELECT a FROM src
+      error: "42804"
+    - sql: INSERT INTO dst (k, n) SELECT a + 10, c || 'xx' FROM src
+      error: "22001"
+    - sql: INSERT INTO dst (k) SELECT b FROM src
+      error: "22003"
+    - sql: INSERT INTO dst (k) SELECT a FROM src
+      error: "23505"
+    - sql: SELECT k FROM dst
+      expected: [[2]]
+  teardown:
+    - DROP TABLE dst
+    - DROP TABLE src
+
+- name: INSERT … SELECT of an aggregated, grouped, DISTINCT or set operation query
+  features: [E101-01]
+  # INSERT … SELECT of an aggregated, grouped or DISTINCT query is not supported yet (0A000, #682)
+  unimplemented: true
+  setup:
+    - CREATE TABLE src (a INTEGER PRIMARY KEY, b INTEGER)
+    - INSERT INTO src VALUES (1, 10), (2, 10), (3, 20)
+    - CREATE TABLE dst (k BIGINT, v INTEGER)
+  steps:
+    - sql: INSERT INTO dst SELECT COUNT(*) FROM src
+      rowcount: 1
+    - sql: INSERT INTO dst SELECT COUNT(*), b FROM src GROUP BY b
+      rowcount: 2
+    - sql: INSERT INTO dst (v) SELECT DISTINCT b FROM src
+      rowcount: 2
+    - sql: INSERT INTO dst (v) SELECT a FROM src UNION SELECT b FROM src
+      rowcount: 5
+    - sql: SELECT COUNT(*) FROM dst
+      expected: [[10]]
+  teardown:
+    - DROP TABLE dst
+    - DROP TABLE src
+
+- name: INSERT … SELECT with an assignment cast PostgreSQL makes
+  features: [E101-01]
+  # INSERT … SELECT of an integer value into column "s" of type text is not supported yet (0A000, #824)
+  unimplemented: true
+  setup:
+    - CREATE TABLE src (a INTEGER PRIMARY KEY, d DOUBLE PRECISION)
+    - INSERT INTO src VALUES (1, 2.5), (2, 3.5)
+    - CREATE TABLE dst (s TEXT, k INTEGER, m NUMERIC(5, 2))
+  steps:
+    - sql: INSERT INTO dst (s, k, m) SELECT a, d, a FROM src
+      rowcount: 2
+    - sql: SELECT s, k, m FROM dst
+      expected: [["1", 2, "1.00"], ["2", 4, "2.00"]]
+  teardown:
+    - DROP TABLE dst
+    - DROP TABLE src

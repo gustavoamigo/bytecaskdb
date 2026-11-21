@@ -177,6 +177,38 @@ TEST_CASE("physical: check refuses what codegen can't print", "[sql][physical]")
   refused(plan(node(physical::Update{get({p(0)}), 1, {{kD, d_minus}}})), "other than an integer");
   refused(plan(node(physical::Update{get({p(0)}), 1, {{kId, logical::column(kD, SqlType{SqlKind::Double})}}})),
           "of another type");
+  // INSERT … SELECT checks each value's SQL type against its column's
+  // declared one, not only how both are held: a DECIMAL of another scale, a
+  // DATE into an integer or TIMESTAMP into TIMESTAMPTZ (all I64) never reach
+  // codegen.
+  auto insert_from = [](SqlType declared, SqlType value, logical::ColumnRef from = kV) {
+    auto to = kV;
+    to.type = phys_type(declared);
+    from.type = phys_type(value);
+    return plan(node(physical::InsertFrom{emit(get({p(0)}), {from}), 1, {{to, declared, value}}, {}, {}, {}}));
+  };
+  const SqlType dec2{SqlKind::Decimal, 0, 10, 2};
+  const SqlType dec3{SqlKind::Decimal, 0, 10, 3};
+  CHECK(refusal(insert_from(SqlType{SqlKind::Integer}, SqlType{SqlKind::BigInt})).empty());
+  CHECK(refusal(insert_from(dec2, SqlType{SqlKind::Decimal, 0, 6, 2})).empty());
+  CHECK(refusal(insert_from(SqlType{SqlKind::Double}, SqlType{SqlKind::Integer})).empty());
+  CHECK(refusal(insert_from(SqlType{SqlKind::Real}, SqlType{SqlKind::Double}, kD)).empty());
+  CHECK(refusal(insert_from(SqlType{SqlKind::Varchar, 5}, SqlType{SqlKind::Text}, kB)).empty());
+  const auto no_convert = "of a type it does not convert to";
+  refused(insert_from(dec3, dec2), no_convert);
+  refused(insert_from(SqlType{SqlKind::Integer}, dec2), no_convert);
+  refused(insert_from(SqlType{SqlKind::BigInt}, SqlType{SqlKind::Date}), no_convert);
+  refused(insert_from(SqlType{SqlKind::TimestampTz}, SqlType{SqlKind::Timestamp}), no_convert);
+  refused(insert_from(SqlType{SqlKind::Double}, dec2), no_convert);
+  refused(insert_from(SqlType{SqlKind::Char, 3}, SqlType{SqlKind::Text}, kB), no_convert);
+  // A target held otherwise than its stated type says, or a column than its
+  // declared type says.
+  auto stated = insert_from(SqlType{SqlKind::BigInt}, SqlType{SqlKind::BigInt});
+  std::get<physical::InsertFrom>(stated.root->op).columns[0].value = SqlType{SqlKind::Text};
+  refused(stated, "of another type than it states");
+  auto held = insert_from(SqlType{SqlKind::BigInt}, SqlType{SqlKind::BigInt});
+  std::get<physical::InsertFrom>(held.root->op).columns[0].column.type = PhysType::F64;
+  refused(held, "held as another type than it is declared");
   refused(plan(node(physical::Delete{get({}), 1})), "no key part");
   auto no_constants = plan(node(physical::Delete{get({p(0)}), 1}));
   no_constants.constants.clear();
