@@ -49,8 +49,6 @@ e081_09_01_01  # not PostgreSQL: `GRANT USAGE ON TABLE TABLE_E081_09_01_011 TO R
 e081_09_01_02  # not PostgreSQL: `GRANT USAGE ON TABLE_E081_09_01_021 TO ROLE_E081_09_01_02`; PostgreSQL 17 gives 42P01, "relation "table_e081_09_01_021" does not exist"
 e081_10_01_01  # not PostgreSQL: `GRANT EXECUTE ON TABLE TABLE_E081_10_01_011 TO ROLE_E081_10_01_01`; PostgreSQL 17 gives 42P01, "relation "table_e081_10_01_011" does not exist"
 e081_10_01_02  # not PostgreSQL: `GRANT EXECUTE ON TABLE_E081_10_01_021 TO ROLE_E081_10_01_02`; PostgreSQL 17 gives 42P01, "relation "table_e081_10_01_021" does not exist"
-e111_01_01  # SELECT … INTO table is CREATE TABLE AS in PostgreSQL: not built (#714)
-e111_01_02  # SELECT … INTO table is CREATE TABLE AS in PostgreSQL: not built (#714)
 e121_03_01_01  # ORDER BY takes columns: an expression (A + 5) is refused, in a cursor or not (a dialect gap, not a cursor one)
 e121_04_01_01  # not PostgreSQL: OPEN c: not PostgreSQL syntax (owner decision 2026-10-28); PostgreSQL 17 gives 42601, "syntax error at or near "OPEN""
 e121_06_01_01  # not PostgreSQL: WHERE CURRENT OF on a cursor never fetched is 24000 in PostgreSQL (owner decision 2026-10-28, #722); PostgreSQL 17 gives 24000, "cursor "cur_e121_06_01_01" is not positioned on a row"

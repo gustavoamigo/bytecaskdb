@@ -2051,6 +2051,8 @@ pg:if-exists:
   description: DROP TABLE IF EXISTS
 pg:if-not-exists:
   description: CREATE TABLE IF NOT EXISTS
+pg:select-into:
+  description: SELECT ... INTO a new table, PostgreSQL's form of CREATE TABLE AS
 pg:text-type:
   description: the TEXT type
 pg:bytea:

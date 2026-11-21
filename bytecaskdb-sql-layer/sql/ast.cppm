@@ -37,10 +37,18 @@ public:
   ~SqlError() override;  // out of line: anchors the vtable (-Wweak-vtables)
   [[nodiscard]] auto pos() const noexcept -> std::int32_t { return pos_; }
   [[nodiscard]] auto sqlstate() const noexcept -> std::string_view { return sqlstate_.view(); }
+  // Whether PostgreSQL raises it as it analyses the statement, before it
+  // looks for a table the statement creates or plans the statement: an
+  // unknown literal's input function rejecting the text ('abc'::int, DATE
+  // '2020-13-01'). A data exception that is not raises as the constant is
+  // folded, when the statement is planned (1/0).
+  [[nodiscard]] auto at_analysis() const noexcept -> bool { return at_analysis_; }
+  void mark_at_analysis() noexcept { at_analysis_ = true; }
 
 private:
   std::int32_t pos_;
   SqlState sqlstate_;
+  bool at_analysis_{false};
 };
 
 // A statement the layer does not support where it was given, the API's
@@ -107,7 +115,8 @@ struct Expr {
   // string)), its operands in `args`.
   std::string func;
   // Clock: `func` is the SQL name (current_date, localtime, …) and `constant`
-  // the precision written after it, -1 for none.
+  // the precision written after it, -1 for none; `column` is "now" for now(),
+  // the name of its output column, "" for the others, named by `func`.
 };
 
 // One conjunct of a WHERE clause: two expressions compared; or, as a
@@ -402,6 +411,21 @@ struct CreateView {
   std::string definition;  // the statement's text, set by parse()
 };
 
+// CREATE TABLE name [(columns)] AS query [WITH [NO] DATA], or SELECT … INTO
+// name: a table of the query's columns, holding its rows (none for WITH NO
+// DATA), created as one DDL. `form` is what was written, which names the
+// statement in its errors and tag. `query` is the SELECT without its INTO.
+struct CreateTableAs {
+  enum class Form { CreateTableAs, SelectInto };
+  Form form{Form::CreateTableAs};
+  std::string table;
+  std::vector<std::string> columns;  // the table's column names, empty: the query's own
+  Select query;
+  bool with_data{true};
+  bool if_not_exists{false};  // IF NOT EXISTS: a relation of the name skips the statement
+  std::int32_t pos{-1};
+};
+
 struct DropView {
   std::string view;
   bool if_exists{false};
@@ -505,7 +529,7 @@ struct Grant {
 
 using Statement = std::variant<CreateTable, CreateIndex, DropTable, DropIndex, AddColumn, CreateView, DropView,
                                CreateProcedure, DropProcedure, CreateRole, DropRole, Grant, CreateDomain, CreateType,
-                               CreateSequence, DropTypeOrSequence, Insert, Select, Update, Delete>;
+                               CreateSequence, DropTypeOrSequence, CreateTableAs, Insert, Select, Update, Delete>;
 
 // Cursor statements (docs/cursor_design.md). They are not a Statement: they
 // name a session's cursor and carry no plan, so the session runs them, as it

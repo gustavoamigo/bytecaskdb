@@ -113,6 +113,13 @@ struct Bound {
 // Throws ast::SqlError with a message and the position of the offending node.
 [[nodiscard]] auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound;
 
+// CREATE TABLE AS's query, its parameters wanted although folding one of its
+// constants raised a data exception at `pos` (docs/frontend_design.md, *The
+// dialect*): that constant expression, a select-list item or a GROUP BY,
+// WHERE, ON or HAVING operand of `s` itself, replaced by NULL. Whether one
+// was; a constant in a set operation's arm or a subquery is not looked for.
+[[nodiscard]] auto null_failing_constant(ast::Select& s, std::int32_t pos) -> bool;
+
 // A procedure's body (docs/procedures_design.md, *Compilation pipeline*).
 // `frame` is a table that is no catalog's: its columns are the procedure's
 // variables, each column's id its slot.
@@ -793,10 +800,13 @@ auto arithmetic(const Constant& x, const Constant& y, Arith op, std::int32_t pos
   return {out, type, false, {}, pos};
 }
 
-// A range check's message as a SqlError, with its SQLSTATE.
-[[noreturn]] void out_of_type(const std::string& why, std::int32_t pos) {
-  throw SqlError{why, pos, known_sqlstate(range_sqlstate(why)).value_or(kNumericValueOutOfRange)};
+// A range check's SQLSTATE.
+auto range_state(const std::string& why) -> SqlState {
+  return known_sqlstate(range_sqlstate(why)).value_or(kNumericValueOutOfRange);
 }
+
+// A range check's message as a SqlError, with its SQLSTATE.
+[[noreturn]] void out_of_type(const std::string& why, std::int32_t pos) { throw SqlError{why, pos, range_state(why)}; }
 
 auto is_number(SqlType t) -> bool { return is_integer(t) || t.kind == SqlKind::Decimal; }
 auto is_float(SqlType t) -> bool { return t.kind == SqlKind::Real || t.kind == SqlKind::Double; }
@@ -810,17 +820,33 @@ auto bytes_of(std::string_view t) -> Bytes {
   return {b.begin(), b.end()};
 }
 
+// An input function's error reading unknown literal k: raised as
+// PostgreSQL analyses the statement (SqlError::at_analysis), before it
+// plans it.
+[[noreturn]] void literal_input_error(const Constant& k, const std::string& why, SqlState state) {
+  SqlError err{why, k.pos, state};
+  err.mark_at_analysis();
+  throw err;
+}
+
 // Text read as a value of type t, as t's input function reads it, the
 // range checked: what an unknown literal is where it meets t. `assigned`
 // rounds a DECIMAL finer than its scale, as a cast or an assignment does.
+// Of an unknown literal, an error is the analysis's; of a typed string
+// (k.unknown false), the cast's, raised as the constant is folded.
 auto read_as(const Constant& k, SqlType t, bool assigned) -> Datum {
   Datum d;
   try {
     d = from_text(k.text, t, assigned);
   } catch (const TextError& e) {
-    throw SqlError{e.what(), k.pos, known_sqlstate(e.sqlstate()).value_or(kInvalidTextRepresentation)};
+    auto state = known_sqlstate(e.sqlstate()).value_or(kInvalidTextRepresentation);
+    if (k.unknown) literal_input_error(k, e.what(), state);
+    throw SqlError{e.what(), k.pos, state};
   }
-  if (auto why = out_of_range(t, d)) out_of_type(*why, k.pos);
+  if (auto why = out_of_range(t, d)) {
+    if (k.unknown) literal_input_error(k, *why, range_state(*why));
+    out_of_type(*why, k.pos);
+  }
   return d;
 }
 
@@ -843,7 +869,7 @@ auto resolved(const Constant& k, SqlType t) -> Constant {
                         e_at + 1 + (body[e_at + 1] == '+' || body[e_at + 1] == '-') < body.size());
     if (points > 1 || mantissa == "." || mantissa.empty() || !exponent_ok ||
         !std::ranges::all_of(mantissa, [&](char ch) { return digit(ch) || ch == '.'; })) {
-      throw SqlError{"invalid input syntax for type numeric: \"" + k.text + "\"", k.pos, kInvalidTextRepresentation};
+      literal_input_error(k, "invalid input syntax for type numeric: \"" + k.text + "\"", kInvalidTextRepresentation);
     }
     auto c = numeric_constant(text, k.pos);
     return c;
@@ -1051,7 +1077,7 @@ auto cast_typed(const Constant& arg, SqlType t, std::int32_t pos) -> Constant {
   if (to == TypeClass::String) return result(bytes_of(text_of(arg)));
   if (from == TypeClass::String) {
     const auto& b = std::get<Bytes>(arg.value);
-    Constant text{std::monostate{}, SqlType{K::Text}, true, std::string(b.size(), '\0'), pos};
+    Constant text{std::monostate{}, SqlType{K::Text}, false, std::string(b.size(), '\0'), pos};  // typed: the cast's error
     std::ranges::transform(b, text.text.begin(), [](std::byte x) { return static_cast<char>(x); });
     return result(read_as(text, t, true));
   }
@@ -1071,7 +1097,7 @@ auto cast_typed(const Constant& arg, SqlType t, std::int32_t pos) -> Constant {
   // To a DECIMAL: through its text, as the input function reads it, rounded
   // to the scale; a float at its type's digits, as float8_numeric does.
   if (is_float(arg.type) && !std::isfinite(std::get<double>(arg.value))) not_yet("NaN or Infinity as a numeric", pos);
-  Constant text{std::monostate{}, SqlType{K::Text}, true, text_of(arg), pos};
+  Constant text{std::monostate{}, SqlType{K::Text}, false, text_of(arg), pos};  // typed: the cast's error
   return result(read_as(text, t, true));
 }
 
@@ -1602,14 +1628,14 @@ auto coerce_value(const Constant& k, const Column& c, bool assigned, std::string
         try {
           (void)from_text(k.text, c.sql, true);
         } catch (const TextError&) {
-          throw SqlError{e.what(), k.pos, known_sqlstate(e.sqlstate()).value_or(kInvalidTextRepresentation)};
+          literal_input_error(k, e.what(), known_sqlstate(e.sqlstate()).value_or(kInvalidTextRepresentation));
         }
         inexact();
       }
-      throw SqlError{e.what(), k.pos, known_sqlstate(e.sqlstate()).value_or(kInvalidTextRepresentation)};
+      literal_input_error(k, e.what(), known_sqlstate(e.sqlstate()).value_or(kInvalidTextRepresentation));
     }
     if (!assigned) {
-      if (auto why = out_of_range(compared_type(c.sql).range, d)) out_of_type(*why, k.pos);
+      if (auto why = out_of_range(compared_type(c.sql).range, d)) literal_input_error(k, *why, range_state(*why));
     }
     return d;
   }
@@ -1958,7 +1984,7 @@ public:
     // or range-check it, as the API replaces it on every run (ClockSlot).
     auto expr = fixed(std::int64_t{0}, type);
     clocks_.push_back({expr.param - own_params_, kind, precision});
-    return {std::move(expr), e.func};
+    return {std::move(expr), e.column.empty() ? e.func : e.column};
   }
   // The statement's reading of the clock as a column of `target`'s type
   // takes it (clock_assignable): a parameter the API fills on each run, as
@@ -2543,6 +2569,17 @@ public:
       known.push_back(peer->type);
     }
     auto type = union_type(known, what, e.pos);
+    // A VARCHAR(n) or CHAR(n) of every branch of a CASE or COALESCE keeps
+    // its length, as PostgreSQL's exprTypmod does, when none is a literal or
+    // a $n and a CASE has an ELSE (its default NULL has no length).
+    // (union_type keeps a lone CHAR(n), NULLIF's first argument's included.)
+    auto lengthed = [](SqlType t) { return t.kind == SqlKind::Varchar || t.kind == SqlKind::Char; };
+    if (e.kind != K::NullIf && (e.kind != K::Case || e.rhs) && !known.empty() && lengthed(known.front()) &&
+        std::ranges::none_of(results, [](const ast::Expr* r) { return r->kind == K::Param; }) &&
+        std::ranges::none_of(parts, [](const Part& p) { return p.constant && p.constant->unknown; }) &&
+        std::ranges::all_of(known, [&](SqlType t) { return t == known.front(); })) {
+      type = known.front();
+    }
     if (type.kind == SqlKind::Decimal) {  // an unknown literal may be written at a finer scale
       auto scale = decimal_scale(type);
       for (const auto& p : parts) {
@@ -5263,6 +5300,9 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
                            s.column.pos};
           }
           return {Ddl{AddColumnDdl{s.table, std::move(spec)}}, s.pos};
+        } else if constexpr (std::is_same_v<T, ast::CreateTableAs>) {
+          // The API binds the query alone and creates the table from its rows.
+          throw std::logic_error("CREATE TABLE AS is bound through its query");
         } else if constexpr (std::is_same_v<T, ast::Insert>) {
           const auto* t = b.table(s.table, s.pos);
           logical::Insert out{t, {}, {}};
@@ -5352,6 +5392,39 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
   out.key_table = key_params != 0 ? positioned_table : b.key_table();
   out.key_params = key_params;
   return out;
+}
+
+namespace {
+
+auto has_pos(const ast::Expr& e, std::int32_t pos) -> bool {
+  return e.pos == pos || (e.lhs && has_pos(*e.lhs, pos)) || (e.rhs && has_pos(*e.rhs, pos)) ||
+         std::ranges::any_of(e.args, [&](const ast::Expr& a) { return has_pos(a, pos); });
+}
+
+// The largest constant expression in e holding the node at `pos`, made NULL.
+auto null_constant_at(ast::Expr& e, std::int32_t pos) -> bool {
+  if (is_constant(e)) {
+    if (!has_pos(e, pos)) return false;
+    ast::Expr null{ast::Expr::Kind::Literal, {}, 0, nullptr, nullptr, e.pos};
+    null.alias = std::move(e.alias);
+    e = std::move(null);
+    return true;
+  }
+  return (e.lhs && null_constant_at(*e.lhs, pos)) || (e.rhs && null_constant_at(*e.rhs, pos)) ||
+         std::ranges::any_of(e.args, [&](ast::Expr& a) { return null_constant_at(a, pos); });
+}
+
+auto null_constant_at(ast::Compare& c, std::int32_t pos) -> bool {
+  return null_constant_at(c.lhs, pos) || null_constant_at(c.rhs, pos) ||
+         std::ranges::any_of(c.args, [&](ast::Compare& a) { return null_constant_at(a, pos); });
+}
+
+}  // namespace
+
+auto null_failing_constant(ast::Select& s, std::int32_t pos) -> bool {
+  if (pos < 0 || s.set) return false;
+  auto in = [&](auto& list) { return std::ranges::any_of(list, [&](auto& x) { return null_constant_at(x, pos); }); };
+  return in(s.targets) || in(s.group_by) || in(s.where) || in(s.having);
 }
 
 }  // namespace bytecask::sql::bound

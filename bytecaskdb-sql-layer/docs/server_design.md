@@ -366,7 +366,8 @@ exposes as calls, not as statements.
   COMMITTED | REPEATABLE READ`, `READ ONLY`, `READ WRITE` and `[NOT]
   DEFERRABLE`, in any order, with or without commas. The session keeps them,
   not the API: a block that is `READ ONLY` refuses any statement but a
-  `SELECT` with `25006`, which aborts the block, as in PostgreSQL (a
+  `SELECT` with `25006`, naming the command (`SELECT INTO` for a `SELECT …
+  INTO`), which aborts the block, as in PostgreSQL (a
   `SELECT … FOR UPDATE` is not told apart and is taken). The isolation levels
   change nothing: every transaction reads one snapshot, which is what
   `REPEATABLE READ` asks and more than the other two do. `SERIALIZABLE` is
@@ -408,7 +409,10 @@ statement the session runs at `Execute`.
   - `SELECT n`, where n is the row count;
   - `INSERT 0 n`, `UPDATE n` and `DELETE n`, where n is `Rows::affected`;
   - for DDL, its command words: `CREATE TABLE`, `CREATE INDEX`,
-    `DROP TABLE` and so on.
+    `DROP TABLE` and so on;
+  - for `CREATE TABLE AS` and `SELECT … INTO`, PostgreSQL's: `SELECT n`
+    for the n rows written, `CREATE TABLE AS` when its query did not run
+    (`WITH NO DATA`, or an `IF NOT EXISTS` skip). No `RowDescription`.
 
 ## Simple query
 

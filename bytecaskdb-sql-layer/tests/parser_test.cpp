@@ -747,3 +747,50 @@ TEST_CASE("parser: TRUE, FALSE or NULL as a WHERE or ON conjunct; a number is 42
     }
   }
 }
+
+TEST_CASE("parser: CREATE TABLE AS and SELECT … INTO read as one statement, refusing what the layer has not built",
+          "[sql][parser][ctas]") {
+  {
+    auto s = std::get<CreateTableAs>(parse("CREATE TABLE IF NOT EXISTS t (x, y) AS SELECT a, b FROM u WITH NO DATA"));
+    CHECK(s.form == CreateTableAs::Form::CreateTableAs);
+    CHECK(s.table == "t");
+    CHECK(s.columns == std::vector<std::string>{"x", "y"});
+    CHECK(s.if_not_exists);
+    CHECK_FALSE(s.with_data);
+    REQUIRE(s.query.from.size() == 1);
+    CHECK(s.query.from[0].table == "u");
+  }
+  {
+    auto s = std::get<CreateTableAs>(parse("SELECT a INTO t FROM u WHERE a = 1"));
+    CHECK(s.form == CreateTableAs::Form::SelectInto);
+    CHECK(s.table == "t");
+    CHECK(s.with_data);
+    CHECK(s.query.where.size() == 1);
+    CHECK(std::holds_alternative<CreateTableAs>(parse("SELECT a INTO TABLE t FROM u")));
+  }
+  // A set operation as CREATE TABLE AS's query.
+  CHECK(std::get<CreateTableAs>(parse("CREATE TABLE t AS SELECT 1 UNION SELECT 2")).query.set != nullptr);
+  auto state = [](std::string_view sql) -> std::string {
+    try {
+      (void)parse(sql);
+    } catch (const SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return "parsed";
+  };
+  CHECK(state("CREATE TEMP TABLE t AS SELECT 1") == "0A000");
+  CHECK(state("CREATE UNLOGGED TABLE t AS SELECT 1") == "0A000");
+  CHECK(state("SELECT 1 INTO TEMP t") == "0A000");
+  CHECK(state("CREATE TABLE t WITH (fillfactor = 50) AS SELECT 1") == "0A000");
+  CHECK(state("CREATE TABLE t USING heap AS SELECT 1") == "0A000");
+  CHECK(state("CREATE TABLE t ON COMMIT DROP AS SELECT 1") == "42P16");  // PostgreSQL's: ON COMMIT needs TEMP
+  CHECK(state("CREATE MATERIALIZED VIEW m AS SELECT 1") == "0A000");
+  CHECK(state("CREATE TABLE t AS EXECUTE p") == "0A000");
+  // INTO in a set operation: the first arm's is PostgreSQL's statement's, a
+  // gap here; any other arm's is PostgreSQL's error.
+  CHECK(state("SELECT 1 INTO t UNION SELECT 2") == "0A000");
+  CHECK(state("SELECT 1 UNION SELECT 2 INTO t") == "42601");
+  CHECK(rejected_at("SELECT 1 UNION SELECT 2 INTO t") == 29);
+  // INTO in a subquery stays refused.
+  CHECK(state("SELECT (SELECT 1 INTO t)") == "42601");
+}
