@@ -11,8 +11,9 @@
 // (docs/transaction_design.md, *Stages of serializable isolation*, stage
 // 1): a transaction's time at Serializable and at Snapshot, and the p99 of
 // snapshot-isolation writers alone and alongside Serializable writers that
-// scanned index ranges, which the engine checks in its writer section
-// (*Read-guard cost at commit and the writer critical section*). Not part
+// scanned index ranges, which the engine checks before its writer section
+// unless the index was written since (*Read-guard cost at commit and the
+// writer critical section*), with Snapshot range writers as the control. Not part
 // of CI. The published
 // numbers were taken in releasedbg (-O3 -march=native, no LTO):
 //   xmake f -m releasedbg --sql_layer=y && xmake build sql_layer_bench && xmake run sql_layer_bench
@@ -354,9 +355,11 @@ void serializable_rows() {
     // Writer p99: four snapshot-isolation writers, each an autocommit UPDATE
     // of a row of its own, alone and alongside two Serializable writers
     // that read an index range of n keys (covering: one range guard) and
-    // write a row of their own.
+    // write a row of their own. The same two writers at Snapshot, which
+    // submit no range guard, are the control: what is left of the effect
+    // there is the two extra threads' work, not the commit's check.
     std::printf("\nwriter latency, snapshot-isolation autocommit UPDATE, 4 threads, us (p50 / p99 / p99.9, txns):\n");
-    auto scenario = [&](const char* name, std::int64_t n) {
+    auto scenario = [&](const char* name, std::int64_t n, Isolation level = Isolation::Serializable) {
       std::atomic<bool> stop{false};
       std::vector<std::vector<double>> lat(4);
       std::atomic<std::uint64_t> ser_done{0}, ser_failed{0};
@@ -377,7 +380,7 @@ void serializable_rows() {
             std::mt19937_64 r{100 + t};
             while (!stop.load()) {
               try {
-                auto x = db->begin({.max_bytes = std::uint64_t{1} << 30, .isolation = Isolation::Serializable});
+                auto x = db->begin({.max_bytes = std::uint64_t{1} << 30, .isolation = level});
                 const auto lo = n >= kRows ? 0 : static_cast<std::int64_t>(r() % static_cast<std::uint64_t>(kRows - n));
                 (void)x.execute(covering, {lo, lo + n - 1});
                 (void)x.execute(bump, {static_cast<std::int64_t>(50'000 + t * 1000 + r() % 1000)});
@@ -396,7 +399,7 @@ void serializable_rows() {
       for (auto& l : lat) all.insert(all.end(), l.begin(), l.end());
       std::printf("  %-44s %8.1f %8.1f %9.1f %8zu", name, percentile(all, 0.5), percentile(all, 0.99),
                   percentile(all, 0.999), all.size());
-      if (n > 0) std::printf("   serializable: %llu committed, %llu 40001", static_cast<unsigned long long>(ser_done.load()),
+      if (n > 0) std::printf("   range writers: %llu committed, %llu 40001", static_cast<unsigned long long>(ser_done.load()),
                              static_cast<unsigned long long>(ser_failed.load()));
       std::printf("\n");
     };
@@ -404,6 +407,7 @@ void serializable_rows() {
     scenario("with 2 Serializable writers, ranges of 100", 100);
     scenario("with 2 Serializable writers, ranges of 10000", 10'000);
     scenario("with 2 Serializable writers, ranges of 1000000", kRows);
+    scenario("with 2 Snapshot writers, ranges of 10000", 10'000, Isolation::Snapshot);
     scenario("alone, again", 0);
     db->close();
   }

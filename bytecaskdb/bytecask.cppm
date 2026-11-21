@@ -2334,9 +2334,10 @@ private:
   // before it joins a batch, and notes what the answer read (checks_), so
   // the section can use the answer unless RecentWrites shows one of those
   // keys written since or the head was reset. A plan with nothing to check
-  // holds without a check. A plan with no writes or a range delete, a range
-  // guard that is not over one prefix, or an answer other than "holds" is
-  // left for the section to validate. An answer that read something has the
+  // holds without a check. A range guard is probed by a prefix every key in
+  // its range starts with (probe_prefix_length). A plan with no writes or a
+  // range delete, a range guard whose keys share no prefix, or an answer
+  // other than "holds" is left for the section to validate. An answer that read something has the
   // table allocated here, outside the lock.
   void prepare_validation(const EngineState &p, std::uint64_t generation,
                           RecentWrites &recent);

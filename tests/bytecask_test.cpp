@@ -17,6 +17,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <array>
 #include <format>
@@ -30,6 +31,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <ranges>
 #include <set>
@@ -40,6 +42,7 @@
 #include <thread>
 #include <latch>
 #include <tuple>
+#include <utility>
 #include <vector>
 #include <fcntl.h>
 #include <sys/resource.h>
@@ -15430,8 +15433,73 @@ TEST_CASE("prepared validation: a database of plain puts never allocates "
   CHECK(db.test_recent_writes().has_table());
 }
 
-TEST_CASE("prepared validation: only a range guard over one prefix is "
-          "prepared", "[bytecask][prepared_validation]") {
+// The longest prefix every key in [from, to) shares, against its definition:
+// L is sound when `to` is at most the successor of from's first L bytes, the
+// smallest key above every key with that prefix (none for a prefix of 0xFF
+// bytes alone, which every key from `from` on starts with).
+TEST_CASE("prepared validation: a range guard's prefix is the longest every "
+          "key in its range shares", "[bytecask][prepared_validation]") {
+  using bytecask::Bytes;
+  const auto successor = [](Bytes p) -> std::optional<Bytes> {
+    while (!p.empty() && p.back() == std::byte{0xFF}) p.pop_back();
+    if (p.empty()) return std::nullopt;
+    p.back() = static_cast<std::byte>(std::to_integer<unsigned>(p.back()) + 1);
+    return p;
+  };
+  const auto model = [&](const Bytes &from, const Bytes &to) {
+    std::size_t longest = 0;
+    for (std::size_t len = 1; len <= from.size(); ++len) {
+      const auto succ = successor(Bytes{from.begin(), from.begin() +
+                                                          static_cast<std::ptrdiff_t>(len)});
+      if (!succ || std::ranges::lexicographical_compare(*succ, to) == false)
+        longest = len;
+    }
+    return longest;
+  };
+  constexpr std::array<unsigned, 6> kAlphabet{0x00, 0x01, 0x02, 0x7F, 0xFE, 0xFF};
+  std::mt19937_64 rng{42};
+  const auto key = [&] {
+    Bytes k(1 + rng() % 5);
+    for (auto &b : k) b = static_cast<std::byte>(kAlphabet[rng() % kAlphabet.size()]);
+    return k;
+  };
+  int shared = 0;
+  int past_common = 0;
+  for (int i = 0; i < 200'000; ++i) {
+    auto from = key();
+    auto to = key();
+    // Often a near neighbour, so the bounds share bytes.
+    if (rng() % 2 == 0) {
+      to = from;
+      to.resize(1 + rng() % (to.size() + 1), std::byte{0x00});
+      if (!to.empty() && rng() % 2 == 0)
+        to.back() = static_cast<std::byte>(kAlphabet[rng() % kAlphabet.size()]);
+    }
+    if (!std::ranges::lexicographical_compare(from, to)) continue;
+    const auto got = bytecask::range_prefix_length(from, to);
+    REQUIRE(got == model(from, to));
+    const auto common = static_cast<std::size_t>(
+        std::ranges::mismatch(from, to).in1 - from.begin());
+    shared += got > 0;
+    past_common += got > common;
+  }
+  CHECK(shared > 1000);
+  CHECK(past_common > 1000);  // the successor case is reached
+
+  // Which length is probed: its own when the range is a prefix range or the
+  // length is registered, else the longest registered one below it, else
+  // its own (registered by the section).
+  using L = std::vector<std::uint32_t>;
+  CHECK(bytecask::probe_prefix_length(7, false, L{}) == 7);
+  CHECK(bytecask::probe_prefix_length(7, false, L{3, 9}) == 3);
+  CHECK(bytecask::probe_prefix_length(7, false, L{3, 5, 9}) == 5);
+  CHECK(bytecask::probe_prefix_length(7, false, L{5, 7}) == 7);
+  CHECK(bytecask::probe_prefix_length(7, false, L{9}) == 7);
+  CHECK(bytecask::probe_prefix_length(7, true, L{3, 5}) == 7);
+}
+
+TEST_CASE("prepared validation: a range guard is prepared when every key in "
+          "its range shares a prefix", "[bytecask][prepared_validation]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
   (void)db.put({.sync = false}, to_bytes("p1/0"), to_bytes("v"));
@@ -15445,12 +15513,23 @@ TEST_CASE("prepared validation: only a range guard over one prefix is "
     }
     return validation_stat(db, "prepared") - before;
   };
-  CHECK(run("p1/", "p10") == 1);                         // a prefix
-  CHECK(run(std::string{"a\xFF"}, "b") == 1);            // trailing 0xFF
-  CHECK(run(std::string{"\xFF\xFF"}, std::string{"\xFF\xFF\x01"}) == 0);  // all 0xFF
-  CHECK(run("p1/", "p2") == 0);                          // shorter `to`
-  CHECK(run("p1/", "q10") == 0);                         // another first byte
-  CHECK(run("p1/", "p1:") == 0);                         // last byte not +1
+  const auto registered = [&] {
+    bytecask::RecentWrites::Lengths lengths{};
+    const auto n = db.test_recent_writes().lengths(lengths);
+    return std::vector<std::uint32_t>(lengths.begin(),
+                                      lengths.begin() + static_cast<std::ptrdiff_t>(n));
+  };
+  // A new length is registered by the first guard's section, which checks
+  // it; the second is prepared.
+  CHECK(run("p1/", "p10") == 1);                 // a prefix: "p1/"
+  CHECK(registered() == std::vector<std::uint32_t>{3});
+  CHECK(run("p1/a5", "p1/a7") == 2);             // inside "p1/a": 3 registered
+  CHECK(run("p1/", "p2") == 1);                  // inside "p1", none shorter
+  CHECK(run(std::string{"a\xFF"}, "b") == 2);    // inside "a\xFF" (2)
+  CHECK(run(std::string{"\xFF\xFF"}, std::string{"\xFF\xFF\x01"}) == 2);
+  CHECK(run("p1/", "p1:") == 2);                 // inside "p1"
+  CHECK(registered() == std::vector<std::uint32_t>{3, 2});
+  CHECK(run("p1/", "q10") == 0);                 // no byte shared
   CHECK(db.test_prepared_disagreements_ == 0);
 }
 
@@ -15516,6 +15595,24 @@ TEST_CASE("prepared validation: a guard whose key is written between "
     }));
     CHECK(validation_stat(db, "prepared") == prepared);
   }
+  SECTION("a range guard inside a prefix, a key in its range inserted") {
+    // Not a prefix range: probed by the prefix its keys share, "p1/".
+    {
+      bytecask::WritePlan first{db.snapshot()};
+      first.ensure_range_unchanged(to_bytes("p2/0"), to_bytes("p2/5"));
+      first.put(to_bytes("y"), to_bytes("v"));
+      REQUIRE(db.apply_batch({.sync = false}, std::move(first)));
+    }
+    std::int64_t prepared = 0;
+    bytecask::WritePlan plan{db.snapshot()};
+    plan.ensure_range_unchanged(to_bytes("p1/0"), to_bytes("p1/5"));
+    plan.put(to_bytes("x"), to_bytes("mine"));
+    CHECK_FALSE(commit_after(db, std::move(plan), [&] {
+      (void)db.put({.sync = false}, to_bytes("p1/3"), to_bytes("theirs"));
+      prepared = validation_stat(db, "prepared");
+    }));
+    CHECK(validation_stat(db, "prepared") == prepared);
+  }
   SECTION("ensure_present, the key removed by a range delete") {
     bytecask::WritePlan plan;
     plan.ensure_present(to_bytes("p1/0"));
@@ -15529,6 +15626,43 @@ TEST_CASE("prepared validation: a guard whose key is written between "
   CHECK(validation_stat(db, "in_section") > in_section);
   CHECK(db.test_prepared_disagreements_ == 0);
   CHECK_FALSE(get_val(db, to_bytes("x")).has_value());
+}
+
+// A write under a range guard's prefix but outside its range sends the plan
+// to the section, which finds the range unchanged; a write under another
+// prefix leaves the prepared answer standing.
+TEST_CASE("prepared validation: a range guard inside a prefix is checked "
+          "again only when its prefix was written",
+          "[bytecask][prepared_validation][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  (void)db.put({.sync = false}, to_bytes("p1/2"), to_bytes("v"));
+  allocate_recent_writes(db);
+  {
+    // Registers the length 3 ("p1/").
+    bytecask::WritePlan first{db.snapshot()};
+    first.ensure_range_unchanged(to_bytes("p1/0"), to_bytes("p1/5"));
+    first.put(to_bytes("y"), to_bytes("v"));
+    REQUIRE(db.apply_batch({.sync = false}, std::move(first)));
+  }
+  const auto commit = [&](const std::string &written) {
+    bytecask::WritePlan plan{db.snapshot()};
+    plan.ensure_range_unchanged(to_bytes("p1/0"), to_bytes("p1/5"));
+    plan.put(to_bytes("x"), to_bytes(written));
+    std::int64_t prepared = 0;
+    std::int64_t in_section = 0;
+    const auto r = commit_after(db, std::move(plan), [&] {
+      (void)db.put({.sync = false}, to_bytes(written), to_bytes("theirs"));
+      prepared = validation_stat(db, "prepared");
+      in_section = validation_stat(db, "in_section");
+    });
+    REQUIRE(r.has_value());
+    return std::pair{validation_stat(db, "prepared") - prepared,
+                     validation_stat(db, "in_section") - in_section};
+  };
+  CHECK(commit("p1/9") == std::pair<std::int64_t, std::int64_t>{0, 1});
+  CHECK(commit("p2/3") == std::pair<std::int64_t, std::int64_t>{1, 0});
+  CHECK(db.test_prepared_disagreements_ == 0);
 }
 
 // Ingest runs as a barrier, whose head reset raises head_generation_: a plan
@@ -15878,6 +16012,101 @@ TEST_CASE("prepared validation: groups of guarded plans commit and conflict "
   std::map<std::string, std::string> expected;
   for (const auto &[k, vs] : model) expected[k] = vs.first;
   CHECK(collect_kv(db) == expected);
+}
+
+// Plans whose range guards lie inside one prefix, prepared before the
+// section, must commit and conflict exactly as the same plans checked in the
+// section. One seeded workload runs on two databases, one preparing and one
+// not, in groups whose earlier slots write into later slots' ranges, with
+// plain writes and held snapshots between; every outcome and the final
+// contents must match, and the preparing database must have used prepared
+// answers for such plans and sent others back to the section.
+TEST_CASE("prepared validation: range guards inside one prefix commit and "
+          "conflict exactly as when checked in the section",
+          "[model][prepared_validation][concurrency]") {
+  const auto seed = GENERATE(1u, 2u, 3u);
+  CAPTURE(seed);
+  TempDir td;
+  auto a = bytecask::DB::open(td.path / "a");
+  auto b = bytecask::DB::open(td.path / "b");
+  b.test_no_prepared_validation_ = true;
+  std::mt19937_64 rng{seed};
+  // Index-like keys: a 3-byte prefix per "index", then a fixed-width value.
+  const auto key = [&](std::uint64_t value) {
+    return std::format("i{}/{:04d}", rng() % 4, value);
+  };
+  const auto value = [&] { return std::string(1 + rng() % 30, 'v'); };
+  const auto both_put = [&](const std::string &k) {
+    const auto v = value();
+    REQUIRE(a.put({.sync = false}, to_bytes(k), to_bytes(v)).sequence ==
+            b.put({.sync = false}, to_bytes(k), to_bytes(v)).sequence);
+  };
+  for (int i = 0; i < 200; ++i) both_put(key(rng() % 400));
+
+  std::vector<std::pair<bytecask::Snapshot, bytecask::Snapshot>> snaps;
+  int commits = 0;
+  int conflicts = 0;
+  const auto prepared_before = validation_stat(a, "prepared");
+  for (int round = 0; round < 600; ++round) {
+    if (rng() % 8 == 0) {
+      both_put(key(rng() % 400));
+      continue;
+    }
+    while (snaps.size() < 6) snaps.emplace_back(a.snapshot(), b.snapshot());
+    const auto n = 1 + rng() % 4;
+    std::vector<bytecask::WritePlan> pa;
+    std::vector<bytecask::WritePlan> pb;
+    for (std::size_t p = 0; p < n; ++p) {
+      const auto i = rng() % snaps.size();
+      auto pair = std::move(snaps[i]);
+      snaps.erase(snaps.begin() + static_cast<std::ptrdiff_t>(i));
+      pa.emplace_back(std::move(pair.first));
+      pb.emplace_back(std::move(pair.second));
+      // A range of 1 to 120 values inside one prefix: its bounds share the
+      // prefix and as many of the value's digits as they happen to.
+      const auto ranges = 1 + rng() % 2;
+      for (std::size_t r = 0; r < ranges; ++r) {
+        const auto prefix = std::format("i{}/", rng() % 4);
+        const auto lo = rng() % 400;
+        const auto hi = lo + 1 + rng() % 120;
+        const auto from = std::format("{}{:04d}", prefix, lo);
+        const auto to = std::format("{}{:04d}", prefix, hi);
+        pa.back().ensure_range_unchanged(to_bytes(from), to_bytes(to));
+        pb.back().ensure_range_unchanged(to_bytes(from), to_bytes(to));
+      }
+      const auto writes = 1 + rng() % 2;
+      for (std::size_t w = 0; w < writes; ++w) {
+        const auto k = key(rng() % 400);
+        if (rng() % 4 == 0) {
+          pa.back().del(to_bytes(k));
+          pb.back().del(to_bytes(k));
+        } else {
+          const auto v = value();
+          pa.back().put(to_bytes(k), to_bytes(v));
+          pb.back().put(to_bytes(k), to_bytes(v));
+        }
+      }
+    }
+    const auto ra = commit_as_group(a, std::move(pa));
+    const auto rb = commit_as_group(b, std::move(pb));
+    for (std::size_t p = 0; p < n; ++p) {
+      REQUIRE(ra[p].has_value() == rb[p].has_value());
+      if (ra[p]) {
+        REQUIRE(ra[p]->sequence == rb[p]->sequence);
+        ++commits;
+      } else {
+        ++conflicts;
+      }
+    }
+  }
+  snaps.clear();
+  CHECK(commits > 300);
+  CHECK(conflicts > 100);
+  CHECK(validation_stat(a, "prepared") - prepared_before > 200);
+  CHECK(validation_stat(a, "in_section") > 100);
+  CHECK(validation_stat(b, "prepared") == 0);
+  CHECK(a.test_prepared_disagreements_ == 0);
+  CHECK(collect_kv(a) == collect_kv(b));
 }
 #endif  // __EMSCRIPTEN__
 
