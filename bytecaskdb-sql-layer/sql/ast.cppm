@@ -187,6 +187,10 @@ struct ColumnDefAst {
   std::vector<std::string> unique;
   std::vector<ForeignKeyAst> references;  // each REFERENCES on the column
   std::vector<CheckAst> checks;    // each CHECK on the column
+  // DEFAULT of the clock: current_date, current_timestamp (now() too),
+  // localtime or localtimestamp, and its precision, -1 for none written.
+  std::string default_clock;
+  std::int64_t default_clock_precision{-1};
 };
 
 // A UNIQUE constraint of CREATE TABLE, on a column or on the table, in the

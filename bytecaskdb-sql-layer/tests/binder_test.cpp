@@ -916,6 +916,19 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
         "DEFAULT is not a constant of type bigint");
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v TIMESTAMP DEFAULT 0)").first ==
         "a DEFAULT for type timestamp is not supported yet");
+  // A DEFAULT of the clock, of a type that takes it by assignment.
+  {
+    auto b = bind_sql(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, d DATE DEFAULT now(), t TIME DEFAULT LOCALTIMESTAMP(9))");
+    const auto& ddl = std::get<CreateTableDdl>(std::get<Ddl>(b.stmt));
+    CHECK(ddl.columns[1].clock_default == ClockDefault{ClockDefault::Fn::CurrentTimestamp, 6});
+    CHECK(ddl.columns[2].clock_default == ClockDefault{ClockDefault::Fn::LocalTimestamp, 6});  // past 6 is 6
+  }
+  CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v INTEGER DEFAULT CURRENT_DATE)").first ==
+        "column \"v\" is of type integer but default expression is of type date");
+  CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v TIMESTAMP DEFAULT CURRENT_DATE)").first ==
+        "the clock's date assigned to a timestamp without time zone column is not supported yet");
+  CHECK(rejected(cat, "ALTER TABLE t ADD COLUMN d DATE DEFAULT CURRENT_DATE").first ==
+        "ADD COLUMN … DEFAULT of the clock is not supported yet");
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v NUMERIC)").first.starts_with("NUMERIC needs a precision"));
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v NUMERIC(19, 2))").first.starts_with("NUMERIC(19, 2)"));
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v TIMESTAMPTZ DEFAULT 0)").first ==

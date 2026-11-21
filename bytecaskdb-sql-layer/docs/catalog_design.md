@@ -28,11 +28,30 @@ share this one only if it adopted the layer's formats (#488).
 | layouts | Each layout generation: its object id, its generation number, `bitmap_bytes`, and its offset table (column id → byte offset or variable slot). The last is current. Each table has one until `REBUILD` exists, which appends one (#503). |
 
 A default is a constant of the column's physical type, or none (null).
-DDL accepts integer, decimal, string and boolean literals, folded at
-bind time to the stored value (a `DECIMAL(p, s)` default is stored scaled);
-`TIMESTAMP`, `DATE` and `TIME` defaults, and expressions such as
-`CURRENT_TIMESTAMP`, are refused: a plan cannot see the clock, and literal
-parsing of those types isn't built.
+DDL accepts integer, decimal, string and boolean literals, folded at bind
+time to the stored value (a `DECIMAL(p, s)` default is stored scaled).
+`TIMESTAMP`, `DATE` and `TIME` literal defaults are refused, since literal
+parsing of those types isn't built for defaults.
+
+**A default of the clock** (`CURRENT_DATE`, `CURRENT_TIMESTAMP` and
+`now()`, `LOCALTIME`, `LOCALTIMESTAMP`, with a precision) is a
+`ClockDefault`: its function and precision. They are two `u8`s that trail
+the column's entry, written only for one, so a record without one is
+unchanged, and an older build refuses one with them (trailing bytes). The
+column's stored constant default stays null, since the binder, not
+`bc_row_begin`, fills the column.
+- **How it is filled.** The binder gives an `INSERT` that leaves the column
+  out, and a `DEFAULT` written in `VALUES` or `SET`, the statement's
+  reading of the clock, a slot the API fills each run (`frontend_design.md`,
+  *The time*).
+- **Which types take one.** A column takes one only where PostgreSQL's
+  assignment cast exists and the reading gives its value
+  (`clock_assignable`): a `DATE` any of them but `LOCALTIME`, a `TIME`
+  `LOCALTIME` or a timestamp's time, a `TIMESTAMP` or `TIMESTAMPTZ` either
+  timestamp. A date to a timestamp, which is midnight and not the reading,
+  is refused.
+- **`ADD COLUMN`.** It is refused with one: plans compiled before it fill a
+  new column from the stored default.
 
 ## Serialization
 

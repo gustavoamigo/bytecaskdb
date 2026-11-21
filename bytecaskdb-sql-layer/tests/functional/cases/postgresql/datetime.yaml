@@ -333,3 +333,40 @@
       expected: [[t]]
     - sql: SELECT TIMESTAMPTZ '0001-01-01 00:00:00+00 BC'
       expected: [["0001-01-01 00:00:00+00 BC"]]
+
+- name: a DEFAULT of the clock is the statement's reading
+  features: [E141-07, F051-05]
+  setup:
+    - CREATE TABLE cdf (id INTEGER PRIMARY KEY, d DATE DEFAULT CURRENT_DATE, ts TIMESTAMP DEFAULT LOCALTIMESTAMP, tz TIMESTAMPTZ DEFAULT now(), t TIME DEFAULT LOCALTIME, d2 DATE DEFAULT CURRENT_TIMESTAMP)
+  steps:
+    # One transaction reads the clock once: every default and every clock in it agree.
+    - sql: BEGIN
+    - sql: INSERT INTO cdf (id) VALUES (1)
+      rowcount: 1
+    - sql: INSERT INTO cdf VALUES (2, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT)
+      rowcount: 1
+    - sql: INSERT INTO cdf VALUES (3, CURRENT_DATE, LOCALTIMESTAMP, CURRENT_TIMESTAMP, LOCALTIME, now())
+      rowcount: 1
+    - sql: SELECT id, d = CURRENT_DATE, ts = LOCALTIMESTAMP, tz = CURRENT_TIMESTAMP, t = LOCALTIME, d2 = CURRENT_DATE FROM cdf
+      expected: [[1, t, t, t, t, t], [2, t, t, t, t, t], [3, t, t, t, t, t]]
+    - sql: UPDATE cdf SET d = NULL WHERE id = 1
+      rowcount: 1
+    - sql: UPDATE cdf SET d = DEFAULT WHERE id = 1
+      rowcount: 1
+    - sql: SELECT id FROM cdf WHERE d IS NULL
+      expected: []
+    - sql: COMMIT
+  teardown:
+    - ROLLBACK
+    - DROP TABLE cdf
+
+- name: a DEFAULT of the clock of another type
+  features: [E141-07]
+  steps:
+    # A date column takes a timestamp's date, a time column a timestamp's time.
+    - sql: CREATE TABLE cdg (a DATE DEFAULT LOCALTIMESTAMP, b TIME DEFAULT CURRENT_TIMESTAMP(0), c TIMESTAMPTZ DEFAULT LOCALTIMESTAMP)
+    - sql: DROP TABLE cdg
+    - sql: CREATE TABLE cdh (a INTEGER DEFAULT CURRENT_DATE)
+      error: "42804"
+    - sql: CREATE TABLE cdh (a BOOLEAN DEFAULT now())
+      error: "42804"

@@ -1748,10 +1748,50 @@ auto param_count(const ast::Statement& stmt) -> std::uint32_t {
   return n;
 }
 
+// A clock function by its SQL name, and the type it gives.
+auto clock_fn(const std::string& name, std::int32_t pos) -> ClockDefault::Fn {
+  using F = ClockDefault::Fn;
+  if (name == "current_date") return F::CurrentDate;
+  if (name == "current_timestamp") return F::CurrentTimestamp;
+  if (name == "localtime") return F::LocalTime;
+  if (name == "localtimestamp") return F::LocalTimestamp;
+  not_yet("CURRENT_TIME: TIME WITH TIME ZONE, which the layer lacks; LOCALTIME is supported", pos);
+}
+
+auto clock_type(ClockDefault::Fn fn) -> SqlType {
+  using F = ClockDefault::Fn;
+  switch (fn) {
+    case F::CurrentDate: return SqlType{SqlKind::Date};
+    case F::CurrentTimestamp: return SqlType{SqlKind::TimestampTz};
+    case F::LocalTime: return SqlType{SqlKind::Time};
+    case F::LocalTimestamp: return SqlType{SqlKind::Timestamp};
+  }
+  return SqlType{SqlKind::Timestamp};
+}
+
+// The clock's reading assigned to a column of `t`, as PostgreSQL's
+// assignment cast gives it (clock_assignable): 42804 for a type with no such
+// cast, refused for one it has that the layer does not compute (a date to a
+// timestamp, which is midnight). A precision past 6 is 6, as PostgreSQL
+// takes it, with a warning.
+auto clock_default(const std::string& name, std::int64_t precision, SqlType t, const std::string& column,
+                   std::int32_t pos) -> ClockDefault {
+  auto fn = clock_fn(name, pos);
+  if (!clock_assignable(fn, t.kind)) {
+    auto temporal = type_class(t.kind) == TypeClass::Temporal || t.kind == SqlKind::Text || t.kind == SqlKind::Varchar;
+    if (temporal) not_yet("the clock's " + pg_type_name(clock_type(fn)) + " assigned to a " + pg_type_name(t) + " column", pos);
+    throw SqlError{"column \"" + column + "\" is of type " + pg_type_name(t) + " but default expression is of type " +
+                       pg_type_name(clock_type(fn)),
+                   pos, kDatatypeMismatch};
+  }
+  return {fn, static_cast<std::uint8_t>(precision < 0 || precision > 6 ? 6 : precision)};
+}
+
 auto column_spec(const ast::ColumnDefAst& c) -> ColumnSpec {
   auto t = sql_type(c);
-  return ColumnSpec{c.name, t, !c.not_null && !c.primary_key,
-                    c.default_value ? fold_default(*c.default_value, t) : Datum{}};
+  ColumnSpec out{c.name, t, !c.not_null && !c.primary_key, c.default_value ? fold_default(*c.default_value, t) : Datum{}, {}};
+  if (!c.default_clock.empty()) out.clock_default = clock_default(c.default_clock, c.default_clock_precision, t, c.name, c.pos);
+  return out;
 }
 
 // The keys a FOREIGN KEY may reference: a table's columns, its primary
@@ -1892,6 +1932,19 @@ public:
     auto expr = fixed(std::int64_t{0}, type);
     clocks_.push_back({expr.param - own_params_, kind, precision});
     return {std::move(expr), e.func};
+  }
+  // The statement's reading of the clock as a column of `target`'s type
+  // takes it (clock_assignable): a parameter the API fills on each run, as
+  // it fills a clock in a select list.
+  auto clock_reading(ClockDefault d, const Column& target) -> logical::Expr {
+    using Kind = ClockSlot::Kind;
+    auto kind = target.sql.kind == SqlKind::Date          ? Kind::Date
+                : target.sql.kind == SqlKind::Time        ? Kind::Time
+                : target.sql.kind == SqlKind::TimestampTz ? Kind::TimestampTz
+                                                          : Kind::Timestamp;
+    auto expr = fixed(std::int64_t{0}, target.sql);
+    clocks_.push_back({expr.param - own_params_, kind, d.precision});
+    return expr;
   }
   [[nodiscard]] auto take_clocks() -> std::vector<ClockSlot> { return std::move(clocks_); }
   [[nodiscard]] auto is_fixed(std::uint32_t n) const -> bool { return n >= own_params_; }
@@ -3013,9 +3066,14 @@ public:
       case ast::Expr::Kind::And:
       case ast::Expr::Kind::Or: not_yet("IS NULL, AND, OR and NOT of other than constants as a value", e.pos);
       case ast::Expr::Kind::Cast: not_yet("a cast of other than a constant", e.pos);
-      case ast::Expr::Kind::Clock: not_yet("CURRENT_DATE, LOCALTIME and LOCALTIMESTAMP assigned to a column", e.pos);
+      case ast::Expr::Kind::Clock: {
+        auto d = clock_default(e.func, e.constant, target.sql, target.name, e.pos);
+        return clock_reading(d, target);
+      }
       case ast::Expr::Kind::Subquery: not_yet("a subquery assigned to a column", e.pos);
-      case ast::Expr::Kind::Default: return fixed(target.default_value, target.sql);
+      case ast::Expr::Kind::Default:
+        if (target.clock_default) return clock_reading(*target.clock_default, target);
+        return fixed(target.default_value, target.sql);
       case ast::Expr::Kind::Case:
       case ast::Expr::Kind::Coalesce:
       case ast::Expr::Kind::NullIf: not_yet("CASE, COALESCE and NULLIF of other than constants", e.pos);
@@ -4937,6 +4995,8 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           if (!s.column.unique.empty()) not_yet("ADD COLUMN … UNIQUE", s.column.pos);
           if (!s.column.references.empty()) not_yet("ADD COLUMN … REFERENCES", s.column.pos);
           if (!s.column.checks.empty()) not_yet("ADD COLUMN … CHECK", s.column.pos);
+          // Plans compiled before it fill a new column with its stored default.
+          if (!s.column.default_clock.empty()) not_yet("ADD COLUMN … DEFAULT of the clock", s.column.pos);
           auto spec = column_spec(s.column);
           if (!spec.nullable && std::holds_alternative<std::monostate>(spec.default_value)) {
             throw SqlError{"column \"" + s.column.name + "\" is NOT NULL and needs a DEFAULT for the existing rows",
@@ -4971,7 +5031,8 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
               throw SqlError{"column \"" + targets[i]->name + "\" specified more than once", s.pos, kDuplicateColumn};
             }
           }
-          // Each row is written as one INSERT of it would be, in order.
+          // Each row is written as one INSERT of it would be, in order. A
+          // column left out with a clock default takes the statement's reading.
           for (const auto& values : s.rows) {
             auto& row = out.rows.emplace_back(t->columns.size());
             for (std::size_t i = 0; i < targets.size(); ++i) {
@@ -4980,6 +5041,10 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
               if (row[at]->kind != logical::Expr::Kind::Param) {
                 throw SqlError{"INSERT values must be parameters or constants", values[i].pos};
               }
+            }
+            for (std::size_t at = 0; at < t->columns.size(); ++at) {
+              const auto& c = t->columns[at];
+              if (!row[at] && c.clock_default) row[at] = b.clock_reading(*c.clock_default, c);
             }
           }
           // A column left out takes its default. One that is NOT NULL with no

@@ -180,7 +180,8 @@ TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql]
   CHECK_THROWS_AS(parse("CREATE INDEX u ON t (name NULLS LAST)"), SqlError);
   CHECK_THROWS_AS(parse("CREATE INDEX CONCURRENTLY u ON t (name)"), SqlError);
   CHECK_THROWS_AS(parse("CREATE UNIQUE INDEX u ON t (name) NULLS NOT DISTINCT"), SqlError);
-  CHECK_THROWS_AS(parse("CREATE TABLE u (k BIGINT DEFAULT now())"), SqlError);
+  CHECK_THROWS_AS(parse("CREATE TABLE u (k BIGINT DEFAULT length('x'))"), SqlError);
+  CHECK(std::get<CreateTable>(parse("CREATE TABLE u (k TIMESTAMP DEFAULT now())")).columns[0].default_clock == "current_timestamp");
   //                    0         1         2         3         4
   //                    01234567890123456789012345678901234567890123456789
   CHECK(rejected_at("SELECT id FROM t WHERE id = $1 LIMIT -1") == 37);

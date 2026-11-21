@@ -664,7 +664,17 @@ auto column_def(const PgQuery__ColumnDef* cd, int& primary_keys, std::string_vie
     } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_NOTNULL) {
       col.not_null = true;
     } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_DEFAULT) {
-      col.default_value = literal(c->raw_expr);
+      const auto* d = c->raw_expr;
+      auto now = d->node_case == PG_QUERY__NODE__NODE_FUNC_CALL && d->func_call->n_args == 0 &&
+                 str(d->func_call->funcname[d->func_call->n_funcname - 1]) == "now";
+      if (d->node_case == PG_QUERY__NODE__NODE_SQLVALUE_FUNCTION || now) {
+        auto e = expr(d);
+        if (e.kind != Expr::Kind::Clock) reject("DEFAULT takes a constant or the clock", e.pos);
+        col.default_clock = e.func;
+        col.default_clock_precision = e.constant;
+      } else {
+        col.default_value = literal(d);
+      }
     } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_UNIQUE) {
       plain_unique(c);
       col.unique.emplace_back(c->conname);

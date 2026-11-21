@@ -681,10 +681,21 @@ are one instant.
 - **With a time zone.** `CURRENT_TIMESTAMP[(p)]` and `now()` are `timestamp
   with time zone`, as in PostgreSQL: the same instant as `LOCALTIMESTAMP`,
   written with `+00`.
+- **Assigned, and as a column's `DEFAULT`.** `VALUES` and `SET` assign
+  the time to a column by PostgreSQL's assignment cast:
+  - a `DATE` takes the date of `CURRENT_DATE` or of a timestamp;
+  - a `TIME` takes `LOCALTIME` or a timestamp's time, at the precision;
+  - a `TIMESTAMP` or `TIMESTAMPTZ` takes either timestamp.
+
+  A type with no such cast is 42804. A date to a timestamp, which is
+  midnight, is refused. A column's `DEFAULT` of the clock is the same
+  assignment, made where the `INSERT` leaves the column out or writes
+  `DEFAULT` (`catalog_design.md`, *What a table records*).
 - **Refused.** `CURRENT_TIME` is `time with time zone`, a type the layer
-  lacks: refused with 42601, not read as `LOCALTIME`. Also
-  refused: the time as an assigned value, in a `WHERE`, or inside an
-  aggregated select list; `USER` and the other SQL value functions.
+  lacks: refused with 42601, not read as `LOCALTIME`. Also refused: the
+  time in a `WHERE` or inside an aggregated select list, `ADD COLUMN` with
+  a `DEFAULT` of the clock, and `USER` and the other SQL value
+  functions.
 
 ### Expressions over columns
 

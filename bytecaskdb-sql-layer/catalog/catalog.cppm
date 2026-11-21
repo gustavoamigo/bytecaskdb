@@ -234,6 +234,46 @@ struct RangeMessage {
 // a type mismatch.
 [[nodiscard]] auto set_datum(RowWriter& w, std::uint32_t col_id, const Datum& d) -> bool;
 
+// A DEFAULT of the clock (CURRENT_DATE, CURRENT_TIMESTAMP and now(),
+// LOCALTIME, LOCALTIMESTAMP), its precision 0 to 6. Each statement reads the
+// clock once; the binder gives a row that leaves the column out, or sets it
+// to DEFAULT, that reading, so the column's stored default stays NULL.
+struct ClockDefault {
+  enum class Fn : std::uint8_t { CurrentDate = 1, CurrentTimestamp, LocalTime, LocalTimestamp };
+  Fn fn{Fn::CurrentDate};
+  std::uint8_t precision{6};
+
+  friend auto operator==(const ClockDefault&, const ClockDefault&) -> bool = default;
+};
+
+// Whether a column of `kind` takes `fn`'s value by PostgreSQL's assignment
+// cast, and the layer computes it from the statement's reading: a date the
+// date of any of them but LOCALTIME; a time LOCALTIME's or a timestamp's
+// time; a timestamp either timestamp. (A date to a timestamp is midnight,
+// not the reading: not taken.)
+[[nodiscard]] constexpr auto clock_assignable(ClockDefault::Fn fn, SqlKind kind) -> bool {
+  using F = ClockDefault::Fn;
+  switch (kind) {
+    case SqlKind::Date: return fn != F::LocalTime;
+    case SqlKind::Time: return fn != F::CurrentDate;
+    case SqlKind::Timestamp:
+    case SqlKind::TimestampTz: return fn == F::CurrentTimestamp || fn == F::LocalTimestamp;
+    case SqlKind::SmallInt:
+    case SqlKind::Integer:
+    case SqlKind::BigInt:
+    case SqlKind::Real:
+    case SqlKind::Double:
+    case SqlKind::Decimal:
+    case SqlKind::Numeric:
+    case SqlKind::Boolean:
+    case SqlKind::Text:
+    case SqlKind::Varchar:
+    case SqlKind::Char:
+    case SqlKind::Bytea: return false;
+  }
+  return false;
+}
+
 struct Column {
   std::uint32_t id;  // permanent; never reused
   std::string name;
@@ -245,6 +285,7 @@ struct Column {
   // a BIGINT the runtime fills (LiveCatalog::next_row_id). No name resolves
   // to it, and no statement names, sets or returns it.
   bool hidden{false};
+  std::optional<ClockDefault> clock_default;  // default_value is then NULL
 };
 
 struct IndexPart {
@@ -386,6 +427,7 @@ struct ColumnSpec {
   SqlType sql;
   bool nullable{true};
   Datum default_value{};
+  std::optional<ClockDefault> clock_default;
 };
 
 struct IndexColumnSpec {
@@ -1046,6 +1088,10 @@ void check_column_spec(const ColumnSpec& c) {
   if (!datum_fits(c.default_value, phys_type(c.sql))) {
     throw DdlRefused("default of column " + c.name + " is not of its type", kDatatypeMismatch);
   }
+  if (c.clock_default && (!clock_assignable(c.clock_default->fn, c.sql.kind) || c.clock_default->precision > 6 ||
+                          !std::holds_alternative<std::monostate>(c.default_value))) {
+    throw DdlRefused("default of column " + c.name + " is not of its type", kDatatypeMismatch);
+  }
 }
 
 }  // namespace
@@ -1483,6 +1529,10 @@ auto serialize_table(const Table& t) -> Bytes {
       e.u8(c.nullable ? 1 : 0);
       write_datum(e, c.default_value);
       e.u8(c.hidden ? 1 : 0);
+      if (c.clock_default) {
+        e.u8(static_cast<std::uint8_t>(c.clock_default->fn));
+        e.u8(c.clock_default->precision);
+      }
     });
   }
   w.u16(t.pk_col_ids.size());
@@ -1704,6 +1754,15 @@ auto parse_table(BytesView in) -> Table {
     auto nullable = e.u8();
     c.default_value = read_datum(e);
     auto hidden = e.u8();
+    // A clock default's function and precision trail the entry, written only for one.
+    if (!e.at_end()) {
+      auto fn = e.u8();
+      auto precision = e.u8();
+      if (fn < 1 || fn > 4 || precision > 6 || !std::holds_alternative<std::monostate>(c.default_value)) {
+        corrupt("column " + c.name + " of table " + t.name + " has a bad clock default");
+      }
+      c.clock_default = ClockDefault{static_cast<ClockDefault::Fn>(fn), precision};
+    }
     e.expect_end("column entry of table " + t.name);
     if (!sql_type_valid(c.sql)) corrupt("column " + c.name + " of table " + t.name + " has an invalid type");
     if (nullable > 1) corrupt("column " + c.name + " of table " + t.name + " has a bad nullable flag");
@@ -1712,6 +1771,9 @@ auto parse_table(BytesView in) -> Table {
     c.nullable = nullable == 1;
     c.hidden = hidden == 1;
     if (!datum_fits(c.default_value, c.type)) corrupt("default of column " + c.name + " is not of its type");
+    if (c.clock_default && !clock_assignable(c.clock_default->fn, c.sql.kind)) {
+      corrupt("clock default of column " + c.name + " is not of its type");
+    }
     if (c.id >= t.next_col_id || t.column(c.id) != nullptr || (!c.hidden && t.column(c.name) != nullptr)) {
       corrupt("table " + t.name + " has a column id or name twice, or past next_col_id");
     }
@@ -2186,6 +2248,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       auto cname = std::string{spec.name};
       auto in_pk = std::ranges::any_of(ct->pk, [&](const std::string& p) { return std::string{p} == cname; });
       Column c{t.next_col_id++, cname, spec.sql, phys_type(spec.sql), spec.nullable && !in_pk, spec.default_value};
+      c.clock_default = spec.clock_default;
       defs.emplace_back(c.id, c.sql, c.nullable);
       t.columns.push_back(std::move(c));
     }
