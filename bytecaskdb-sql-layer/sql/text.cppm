@@ -119,6 +119,62 @@ inline auto ascii_case(std::string s, bool upper) -> std::string {
   return s;
 }
 
+// EXTRACT's fields, PostgreSQL's date_part units. The values are bc_plan.h's
+// bc_date_field codes, which the plan API checks against these.
+enum class DateField : std::uint8_t {
+  Microseconds = 1,
+  Milliseconds,
+  Second,
+  Minute,
+  Hour,
+  Day,
+  Month,
+  Quarter,
+  Week,
+  Year,
+  IsoYear,
+  Decade,
+  Century,
+  Millennium,
+  Dow,
+  IsoDow,
+  Doy,
+  Julian,
+  Epoch,
+  Timezone,
+  TimezoneHour,
+  TimezoneMinute,
+};
+
+// A unit's name as PostgreSQL's date_part reads it, already lower-cased:
+// matched on its first ten characters, as its token tables are. A reserved
+// word other than epoch ("now", "infinity") names no unit any type has.
+struct DateUnit {
+  enum class Kind : std::uint8_t { Field, Reserved, Unknown };
+  Kind kind;
+  DateField field;
+};
+[[nodiscard]] auto date_unit(std::string_view lowered) -> DateUnit;
+
+// Whether PostgreSQL 17's EXTRACT takes `f` from a value of `source`, one
+// of DATE, TIME, TIMESTAMP and TIMESTAMPTZ.
+[[nodiscard]] auto date_field_of(DateField f, SqlKind source) -> bool;
+
+// Whether the layer computes it: date_field_of less EPOCH and JULIAN of a
+// timestamp, whose values pass the 18 digits of the layer's numeric or are
+// fractions of a day.
+[[nodiscard]] auto date_field_built(DateField f, SqlKind source) -> bool;
+
+// The scale of EXTRACT's numeric: 6 for SECOND, and EPOCH of other than a
+// DATE; 3 for MILLISECONDS; 0 for the rest.
+[[nodiscard]] auto date_field_scale(DateField f, SqlKind source) -> std::uint8_t;
+
+// EXTRACT(f FROM v), v not NULL and of `source`, as the scaled value of
+// date_field_scale: the proleptic Gregorian calendar, a year before 1 AD
+// counted as PostgreSQL counts it (1 BC is -1), a TIMESTAMPTZ in UTC, the
+// layer's one time zone. `f` is one date_field_built takes.
+[[nodiscard]] auto extract_field(DateField f, SqlKind source, std::int64_t v) -> std::int64_t;
+
 }  // namespace bytecask::sql
 
 namespace bytecask::sql {
@@ -699,6 +755,139 @@ auto text_bytes(std::string_view s) -> Bytes {
 }
 
 }  // namespace
+
+auto date_unit(std::string_view lowered) -> DateUnit {
+  using F = DateField;
+  // PostgreSQL's deltatktbl, then the units and reserved words of its
+  // datetktbl; a longer name is matched on its first TOKMAXLEN (10)
+  // characters.
+  static constexpr std::array<std::pair<std::string_view, F>, 68> kUnits{{
+      {"c", F::Century},          {"cent", F::Century},          {"centuries", F::Century},
+      {"century", F::Century},    {"d", F::Day},                 {"day", F::Day},
+      {"days", F::Day},           {"dec", F::Decade},            {"decade", F::Decade},
+      {"decades", F::Decade},     {"decs", F::Decade},           {"h", F::Hour},
+      {"hour", F::Hour},          {"hours", F::Hour},            {"hr", F::Hour},
+      {"hrs", F::Hour},           {"m", F::Minute},              {"microsecon", F::Microseconds},
+      {"mil", F::Millennium},     {"millennia", F::Millennium},  {"millennium", F::Millennium},
+      {"millisecon", F::Milliseconds}, {"mils", F::Millennium},  {"min", F::Minute},
+      {"mins", F::Minute},        {"minute", F::Minute},         {"minutes", F::Minute},
+      {"mon", F::Month},          {"mons", F::Month},            {"month", F::Month},
+      {"months", F::Month},       {"ms", F::Milliseconds},       {"msec", F::Milliseconds},
+      {"msecond", F::Milliseconds}, {"mseconds", F::Milliseconds}, {"msecs", F::Milliseconds},
+      {"qtr", F::Quarter},        {"quarter", F::Quarter},       {"s", F::Second},
+      {"sec", F::Second},         {"second", F::Second},         {"seconds", F::Second},
+      {"secs", F::Second},        {"timezone", F::Timezone},     {"timezone_h", F::TimezoneHour},
+      {"timezone_m", F::TimezoneMinute}, {"us", F::Microseconds}, {"usec", F::Microseconds},
+      {"usecond", F::Microseconds}, {"useconds", F::Microseconds}, {"usecs", F::Microseconds},
+      {"w", F::Week},             {"week", F::Week},
+      {"weeks", F::Week},         {"y", F::Year},                {"year", F::Year},
+      {"years", F::Year},         {"yr", F::Year},               {"yrs", F::Year},
+      {"dow", F::Dow},            {"doy", F::Doy},               {"isodow", F::IsoDow},
+      {"isoyear", F::IsoYear},    {"j", F::Julian},              {"jd", F::Julian},
+      {"julian", F::Julian},      {"mm", F::Minute},             {"epoch", F::Epoch},
+  }};
+  static constexpr std::array<std::string_view, 7> kReserved{"-infinity", "infinity", "now",     "today",
+                                                             "tomorrow",  "yesterday", "allballs"};
+  auto name = lowered.substr(0, 10);
+  for (const auto& [unit, field] : kUnits) {
+    if (unit == name) return {DateUnit::Kind::Field, field};
+  }
+  if (std::ranges::find(kReserved, name) != kReserved.end()) return {DateUnit::Kind::Reserved, F::Epoch};
+  return {DateUnit::Kind::Unknown, F::Epoch};
+}
+
+auto date_field_of(DateField f, SqlKind source) -> bool {
+  using F = DateField;
+  auto timestamp = source == SqlKind::Timestamp || source == SqlKind::TimestampTz;
+  switch (f) {
+    case F::Microseconds:
+    case F::Milliseconds:
+    case F::Second:
+    case F::Minute:
+    case F::Hour: return timestamp || source == SqlKind::Time;
+    case F::Epoch: return true;
+    case F::Day:
+    case F::Month:
+    case F::Quarter:
+    case F::Week:
+    case F::Year:
+    case F::IsoYear:
+    case F::Decade:
+    case F::Century:
+    case F::Millennium:
+    case F::Dow:
+    case F::IsoDow:
+    case F::Doy:
+    case F::Julian: return timestamp || source == SqlKind::Date;
+    case F::Timezone:
+    case F::TimezoneHour:
+    case F::TimezoneMinute: return source == SqlKind::TimestampTz;
+  }
+  return false;
+}
+
+auto date_field_built(DateField f, SqlKind source) -> bool {
+  auto timestamp = source == SqlKind::Timestamp || source == SqlKind::TimestampTz;
+  return date_field_of(f, source) && !(timestamp && (f == DateField::Epoch || f == DateField::Julian));
+}
+
+auto date_field_scale(DateField f, SqlKind source) -> std::uint8_t {
+  if (f == DateField::Second || (f == DateField::Epoch && source != SqlKind::Date)) return 6;
+  return f == DateField::Milliseconds ? 3 : 0;
+}
+
+auto extract_field(DateField f, SqlKind source, std::int64_t v) -> std::int64_t {
+  using F = DateField;
+  constexpr auto kPerDay = kSecondsPerDay * kMicrosPerSecond;
+  constexpr auto kPerMinute = 60 * kMicrosPerSecond;
+  std::int64_t days = 0;  // since 1970-01-01
+  std::int64_t time = 0;  // microseconds since midnight
+  if (source == SqlKind::Date) {
+    days = v;
+  } else if (source == SqlKind::Time) {
+    time = v;
+  } else {
+    days = floor_div(v, kPerDay);
+    time = v - days * kPerDay;
+  }
+  auto year = [&] { return civil_from_days(days).year; };  // astronomical: 0 is 1 BC
+  auto dow = [&] { return days + 4 - floor_div(days + 4, 7) * 7; };  // 1970-01-01 was a Thursday, 0 is Sunday
+  auto iso_dow = [&] { return dow() == 0 ? std::int64_t{7} : dow(); };
+  // The ISO week's year is the year of its Thursday; week 1 holds the
+  // year's first Thursday.
+  auto thursday = [&] { return days - iso_dow() + 4; };
+  auto bc = [](std::int64_t y) { return y > 0 ? y : y - 1; };
+  switch (f) {
+    case F::Microseconds:
+    case F::Milliseconds:
+    case F::Second: return time % kPerMinute;  // the same microseconds, at scales 0, 3 and 6
+    case F::Minute: return time / kPerMinute % 60;
+    case F::Hour: return time / (60 * kPerMinute);
+    case F::Day: return civil_from_days(days).day;
+    case F::Month: return civil_from_days(days).month;
+    case F::Quarter: return (civil_from_days(days).month - 1) / 3 + 1;
+    case F::Week: {
+      auto th = thursday();
+      return (th - days_from_civil(civil_from_days(th).year, 1, 1)) / 7 + 1;
+    }
+    case F::Year: return bc(year());
+    case F::IsoYear: return bc(civil_from_days(thursday()).year);
+    // PostgreSQL's: decade 0 is 9 BC to 1 BC, century and millennium 1
+    // start in 1 AD, and before that they count down from -1.
+    case F::Decade: return year() >= 0 ? year() / 10 : -((8 - (year() - 1)) / 10);
+    case F::Century: return year() > 0 ? (year() + 99) / 100 : -((99 - (year() - 1)) / 100);
+    case F::Millennium: return year() > 0 ? (year() + 999) / 1000 : -((999 - (year() - 1)) / 1000);
+    case F::Dow: return dow();
+    case F::IsoDow: return iso_dow();
+    case F::Doy: return days - days_from_civil(year(), 1, 1) + 1;
+    case F::Julian: return days + 2'440'588;  // the Julian Day of 1970-01-01
+    case F::Epoch: return source == SqlKind::Date ? days * kSecondsPerDay : v;
+    case F::Timezone:
+    case F::TimezoneHour:
+    case F::TimezoneMinute: return 0;  // UTC
+  }
+  return 0;
+}
 
 auto to_text(const Datum& v, SqlType t) -> std::string {
   return std::visit(

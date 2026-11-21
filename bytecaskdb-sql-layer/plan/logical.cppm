@@ -64,12 +64,12 @@ struct ColumnRef {
 // a BOOLEAN, NULL where SQL's logic says unknown, over operands of any
 // value expression. Case and Coalesce are values of a select list only:
 // every branch is of the expression's type, or a numeric of a finer scale
-// below it, which the evaluator brings up. Concat, Substr and TextFn, built
+// below it, which the evaluator brings up. Concat, Substr, TextFn and Extract, built
 // at run time, are values of a select list (and of a procedure's
 // expressions) only.
 struct Expr {
   enum class Kind { Column, Param, Const, Add, Sub, Mul, Div, Compare, Aggregate, And, Or, Not, IsNull, Like, Truth, InSet, Case, Coalesce,
-                    Concat, Substr, Random, Mod, Neg, Abs, TextFn };
+                    Concat, Substr, Random, Mod, Neg, Abs, TextFn, Extract };
   enum class Fn { Count, Sum, Min, Max, Avg };
   // TextFn's function: PostgreSQL's of the same name, over UTF-8 text.
   enum class Text { Upper, Lower, CharLength, OctetLength, Btrim, Ltrim, Rtrim, Position };
@@ -78,7 +78,8 @@ struct Expr {
   ColumnRef col{};              // Column
   std::uint32_t param{0};       // Param: zero-based ($1 is 0)
   std::int64_t constant{0};     // Const: in its type's representation, a DECIMAL's scaled; a BOOLEAN's 0 or 1;
-                                // Like: the escape's code point, -1 for none; InSet: its subquery
+                                // Like: the escape's code point, -1 for none; InSet: its subquery;
+                                // Extract: the field, a DateField (bc_plan.h's bc_date_field)
   Op op{Op::Eq};                // Compare
   Fn fn{Fn::Count};             // Aggregate
   Text text{Text::Upper};       // TextFn
@@ -93,7 +94,8 @@ struct Expr {
                                 // text); Substr: the text, the start, and the count if given (INTEGERs);
                                 // Random: its two bounds, both included; Mod: two, of the result's type and scale;
                                 // Neg, Abs: one, of the result's type; TextFn: the text, then the trim's
-                                // characters if given, or POSITION's needle
+                                // characters if given, or POSITION's needle; Extract: one, a DATE, TIME,
+                                // TIMESTAMP or TIMESTAMPTZ
 
   [[nodiscard]] auto phys() const -> PhysType { return phys_type(type); }
 

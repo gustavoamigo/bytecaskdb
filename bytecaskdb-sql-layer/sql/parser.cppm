@@ -232,11 +232,12 @@ auto expr(const PgQuery__Node* n) -> Expr {
   if (n->node_case == PG_QUERY__NODE__NODE_FUNC_CALL) {
     const auto* f = n->func_call;
     auto name = str(f->funcname[f->n_funcname - 1]);
-    // PostgreSQL's grammar spells TRIM, POSITION, SUBSTRING and OVERLAY as
-    // calls of these, their operands in the function's order.
+    // PostgreSQL's grammar spells TRIM, POSITION, SUBSTRING, OVERLAY and
+    // EXTRACT as calls of these, their operands in the function's order
+    // (EXTRACT's unit a string constant first).
     static constexpr std::array kStringFunctions{"upper",        "lower",         "substring", "btrim",  "ltrim",  "rtrim",
                                                  "position",     "char_length",   "character_length", "octet_length", "overlay",
-                                                 "to_timestamp", "substr", "random", "abs"};
+                                                 "to_timestamp", "substr", "random", "abs", "extract"};
     if (std::ranges::find(kStringFunctions, name) != kStringFunctions.end() &&
         (f->n_funcname == 1 || (f->n_funcname == 2 && str(f->funcname[0]) == "pg_catalog"))) {
       if (f->agg_star || f->agg_distinct || f->n_agg_order != 0 || f->agg_filter != nullptr || f->over != nullptr ||

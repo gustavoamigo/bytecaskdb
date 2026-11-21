@@ -4711,6 +4711,30 @@ int64_t bc_random(bc_ctx* cx, int64_t lo, int64_t hi) {
   return {};
 }
 
+// The codes bc_plan.h gives EXTRACT's fields are the binder's DateField.
+static_assert(static_cast<uint32_t>(bytecask::sql::DateField::Microseconds) == BC_FIELD_MICROSECONDS);
+static_assert(static_cast<uint32_t>(bytecask::sql::DateField::Year) == BC_FIELD_YEAR);
+static_assert(static_cast<uint32_t>(bytecask::sql::DateField::Julian) == BC_FIELD_JULIAN);
+static_assert(static_cast<uint32_t>(bytecask::sql::DateField::TimezoneMinute) == BC_FIELD_TIMEZONE_MINUTE);
+
+int64_t bc_extract(bc_ctx* cx, int64_t v, uint32_t field, uint32_t source) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return 0;
+  auto kind = source == BC_SOURCE_DATE        ? SqlKind::Date
+              : source == BC_SOURCE_TIME      ? SqlKind::Time
+              : source == BC_SOURCE_TIMESTAMP ? SqlKind::Timestamp
+                                              : SqlKind::TimestampTz;
+  auto f = static_cast<bytecask::sql::DateField>(field);
+  if (source < BC_SOURCE_DATE || source > BC_SOURCE_TIMESTAMPTZ || field < BC_FIELD_MICROSECONDS ||
+      field > BC_FIELD_TIMEZONE_MINUTE || !bytecask::sql::date_field_built(f, kind)) {
+    cx->fail(BC_E_HANDLE, "bc_extract: a field its source has no value for");
+    return 0;
+  }
+  return bytecask::sql::extract_field(f, kind, v);
+  BC_GUARD_END(cx)
+  return {};
+}
+
 bc_view bc_sort_key_part_bytes(bc_ctx* cx, bc_view key, uint32_t part) {
   BC_GUARD_BEGIN
   auto v = sort_part_value<Bytes>(cx, key, part, PhysType::Bytes, Bytes{},

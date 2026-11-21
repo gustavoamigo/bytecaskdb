@@ -301,6 +301,20 @@ int64_t bc_position(bc_ctx *, bc_view s, bc_view needle);
    equal to upper bound" (22023). Not repeatable: each thread draws from its
    own generator, seeded at random. */
 int64_t bc_random(bc_ctx *, int64_t lo, int64_t hi);
+/* PostgreSQL 17's EXTRACT(field FROM v) of a value not NULL: v a DATE, TIME
+   or TIMESTAMP (a TIMESTAMPTZ in UTC) as `source` says, the result a
+   DECIMAL's scaled value, at scale 6 for SECOND and for EPOCH of a TIME,
+   3 for MILLISECONDS, 0 otherwise. A field the source has no such value
+   for (HOUR of a DATE), EPOCH or JULIAN of a timestamp (not built) or a
+   code outside the enums is BC_E_HANDLE. */
+enum bc_date_field {
+  BC_FIELD_MICROSECONDS = 1, BC_FIELD_MILLISECONDS, BC_FIELD_SECOND, BC_FIELD_MINUTE, BC_FIELD_HOUR,
+  BC_FIELD_DAY, BC_FIELD_MONTH, BC_FIELD_QUARTER, BC_FIELD_WEEK, BC_FIELD_YEAR, BC_FIELD_ISOYEAR,
+  BC_FIELD_DECADE, BC_FIELD_CENTURY, BC_FIELD_MILLENNIUM, BC_FIELD_DOW, BC_FIELD_ISODOW, BC_FIELD_DOY,
+  BC_FIELD_JULIAN, BC_FIELD_EPOCH, BC_FIELD_TIMEZONE, BC_FIELD_TIMEZONE_HOUR, BC_FIELD_TIMEZONE_MINUTE
+};
+enum bc_date_source { BC_SOURCE_DATE = 1, BC_SOURCE_TIME, BC_SOURCE_TIMESTAMP, BC_SOURCE_TIMESTAMPTZ };
+int64_t bc_extract(bc_ctx *, int64_t v, uint32_t field, uint32_t source);
 bool    bc_like(bc_ctx *, bc_view text, bc_view pattern, int32_t escape);  /* PostgreSQL's LIKE of UTF-8 text:
                                                    _ one character, % any run, the escape (a code point, -1 for
                                                    none) quoting the next; an escape it reaches at the pattern's
