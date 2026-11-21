@@ -350,19 +350,31 @@ template <typename T>
   return std::make_unique<Node>(Node{std::move(op), {}});
 }
 
-// An uncorrelated subquery: a SELECT the statement runs once, before its
-// own plan, on its snapshot, its rows of one column folded as `kind` says
+// A subquery: a SELECT whose rows of one column are folded as `kind` says
 // into the hidden parameters from `param` on (bc_sub_kind in bc_plan.h).
 // Value: its one row's value, NULL for none, a second row 21000. Exists:
 // a BOOLEAN. Bounds: its largest and smallest non-NULL values, then two
 // BOOLEANs, NULL if a row was NULL else FALSE, and whether it gave a row.
 // Set: its non-NULL values, which InSet tests, then those two BOOLEANs.
+// Uncorrelated (no `args`), it runs once, before the statement's own plan,
+// on its snapshot. Correlated, it reads columns of the outer query's one
+// table, each a hidden parameter of its own (an Arg): it runs again for
+// each outer row that reaches the conjunct testing it, those parameters
+// set from that row first (docs/planner_design.md, *Subqueries*).
 struct Subquery {
   enum class Kind { Value, Exists, Bounds, Set };
+  struct Arg {
+    ColumnRef col;  // the outer row's column
+    std::uint32_t param{0};
+  };
   NodePtr plan;
   Kind kind{Kind::Value};
   SqlType type{};  // its column's; Exists: none it reads
   std::uint32_t param{0};
+  std::vector<Arg> args;
+  [[nodiscard]] auto correlated() const -> bool { return !args.empty(); }
+  // How many hidden parameters it sets from `param` on.
+  [[nodiscard]] static auto params(Kind k) -> std::uint32_t { return k == Kind::Bounds ? 4u : k == Kind::Set ? 2u : 1u; }
 };
 
 // The operator below n, or null for a leaf (Get, Empty, OneRow, Insert,

@@ -2094,9 +2094,11 @@ public:
 
   // A subquery's SELECT, bound as any is, then listed to run before the
   // statement's plan (logical::Subquery), its values in hidden parameters
-  // after the constants': its index and first parameter. Uncorrelated, one
-  // level deep, not FOR UPDATE; of one column, but for EXISTS, whose rows
-  // are counted and taken one at most.
+  // after the constants': its index and first parameter. One level deep,
+  // not FOR UPDATE; of one column, but for EXISTS, whose rows are counted
+  // and taken one at most. A correlated one (correlation, below) takes
+  // each outer column it reads as a hidden parameter of its own, an
+  // argument set from the outer row before each run.
   struct BoundSubquery {
     std::uint32_t index;
     std::uint32_t param;
@@ -2106,13 +2108,16 @@ public:
   auto subquery(const ast::Select& q, logical::Subquery::Kind kind, std::int32_t pos) -> BoundSubquery {
     if (depth_ > 0) not_yet("a subquery inside a subquery", pos);
     if (q.for_update) not_yet("FOR UPDATE in a subquery", pos);
-    if (correlated(q)) not_yet("a correlated subquery, one that reads a column of the query around it", pos);
+    if (correlated(q)) correlation(q, kind, pos);
     auto using_columns = std::move(using_);
     auto using_alias = std::move(using_alias_);
     auto scope = std::move(scope_);
     ++depth_;
     auto root = select(q);
     --depth_;
+    std::vector<logical::Subquery::Arg> args;
+    if (correlating_) args = std::move(correlating_->args);
+    correlating_.reset();
     using_ = std::move(using_columns);
     using_alias_ = std::move(using_alias);
     scope_ = std::move(scope);
@@ -2153,8 +2158,102 @@ public:
         break;
     }
     auto index = bytecask::sql::narrow<std::uint32_t>(subqueries_.size());
-    subqueries_.push_back({std::move(root), kind, type, first});
+    subqueries_.push_back({std::move(root), kind, type, first, std::move(args)});
     return {index, first, type, name};
+  }
+
+  // A correlated subquery, as far as the layer runs one (docs/frontend_design.md,
+  // *Subqueries*): IN, NOT IN, EXISTS, ANY or ALL, a conjunct of the WHERE
+  // of a query of one table, itself of one table, each outer column it reads
+  // compared with a column of its own in its WHERE. Anything else is refused
+  // here, before it is bound (#836). Sets correlating_, which compare()
+  // reads.
+  void correlation(const ast::Select& q, logical::Subquery::Kind kind, std::int32_t pos) {
+    if (kind == logical::Subquery::Kind::Value) not_yet("a correlated scalar subquery", pos);
+    if (scope_.size() != 1) not_yet("a correlated subquery in a query of a join", pos);
+    if (!in_where_) not_yet("a correlated subquery outside a WHERE", pos);
+    // An arm's plan is printed apart from the statement's subqueries.
+    if (in_set_arm_) not_yet("a correlated subquery in an arm of a set operation (UNION, INTERSECT, EXCEPT)", pos);
+    if (Table::derived(scope_[0]->id)) not_yet("a correlated subquery in a query of a grouped view", pos);
+    if (q.set) not_yet("a correlated subquery of a set operation (UNION, INTERSECT, EXCEPT)", pos);
+    if (q.from.size() != 1) not_yet(q.from.empty() ? "a correlated subquery without FROM" : "a correlated subquery of a join", pos);
+    if (q.from[0].derived) not_yet("a correlated subquery of a grouped view", pos);
+    auto outer = [&](const ast::Expr& e) { return outer_ref(q, scope_, e); };
+    std::function<void(const ast::Expr&, const char*)> none = [&](const ast::Expr& e, const char* where) {
+      if (e.kind == ast::Expr::Kind::Column && outer(e)) {
+        not_yet(std::string{"a column of the query around a subquery "} + where, e.pos);
+      }
+      if (e.lhs) none(*e.lhs, where);
+      if (e.rhs) none(*e.rhs, where);
+      for (const auto& a : e.args) none(a, where);
+    };
+    constexpr auto kElsewhere = "other than compared with a column of the subquery";
+    std::function<void(const ast::Compare&)> conjunct = [&](const ast::Compare& c) {
+      using K = ast::Compare::Kind;
+      switch (c.kind) {
+        case K::And:
+        case K::Or:
+        case K::Not:
+          for (const auto& a : c.args) conjunct(a);
+          return;
+        case K::Compare: {
+          auto column = [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Column; };
+          auto lo = column(c.lhs) && outer(c.lhs);
+          auto ro = column(c.rhs) && outer(c.rhs);
+          if ((lo && column(c.rhs) && !ro) || (ro && column(c.lhs) && !lo)) return;
+          none(c.lhs, kElsewhere);
+          none(c.rhs, kElsewhere);
+          return;
+        }
+        case K::IsNull:
+        case K::Like:
+        case K::Exists:
+        case K::Quantified:
+        case K::Const:
+          none(c.lhs, kElsewhere);
+          none(c.rhs, kElsewhere);
+          return;
+      }
+    };
+    for (const auto& c : q.where) conjunct(c);
+    for (const auto& e : q.targets) none(e, "in its select list");
+    for (const auto& e : q.group_by) none(e, "in its GROUP BY");
+    for (const auto& o : q.order_by) none(o.expr, "in its ORDER BY");
+    std::function<void(const ast::Compare&)> having = [&](const ast::Compare& c) {
+      none(c.lhs, "in its HAVING");
+      none(c.rhs, "in its HAVING");
+      for (const auto& a : c.args) having(a);
+    };
+    for (const auto& c : q.having) having(c);
+    correlating_ = Correlation{&q, scope_, {}};
+  }
+
+  // A column of the outer query the correlated subquery being bound
+  // compares with its column c, as a hidden parameter: one per column and
+  // type, NULL until an outer row sets it. Of a type a comparison of the
+  // two takes (comparable), as a subquery's value compared with a column
+  // is: an integer wider than c's key part is a filter, never a key bound.
+  auto outer_param(const ast::Expr& ref, const Column& c, std::int32_t pos) -> logical::Expr {
+    const auto* t = correlating_->outer[0];
+    const auto* oc = column(*t, ref);
+    if (oc->sql.kind == SqlKind::Char || c.sql.kind == SqlKind::Char) {
+      not_yet("a correlated subquery comparing a CHAR(n) column", pos);
+    }
+    if (!compares(oc->sql, c)) {
+      not_yet("comparing " + c.name + " (" + sql_type_name(c.sql) + ") with the outer column " + oc->name + " (" +
+                  sql_type_name(oc->sql) + ") in a correlated subquery",
+              pos);
+    }
+    auto as = subquery_param_type(oc->sql, c);
+    auto col = logical::column_of(t->id, *oc).col;
+    auto& args = correlating_->args;
+    auto it = std::ranges::find_if(args, [&](const logical::Subquery::Arg& a) {
+      return a.col == col && fixed_sql_.at(a.param - own_params_) == as;
+    });
+    if (it != args.end()) return logical::param(it->param, as);
+    auto p = fixed(Datum{}, as).param;
+    args.push_back({col, p});
+    return logical::param(p, as);
   }
 
   // The select list of a bound SELECT: its Project's or its Aggregate's,
@@ -2168,33 +2267,30 @@ public:
     return outputs_of(**in);
   }
 
-  // Whether the subquery names a column of the query around it: qualified
-  // by one of its tables, or unqualified, of none of the subquery's own
-  // tables but of one of the outer's.
-  auto correlated(const ast::Select& q) const -> bool {
-    if (q.set) return correlated(q.set->left) || correlated(q.set->right);
-    std::vector<const Table*> own;
-    for (const auto& item : q.from) {
-      if (item.derived) continue;  // its columns are its aliases
-      if (const auto* t = cat_.table(item.table)) own.push_back(t);
+  // Whether column reference e of subquery q names a column of the query
+  // around it, whose relations are `outer`: qualified by one of their names
+  // and none of q's, or unqualified, of none of q's own relations but of
+  // one of `outer`'s.
+  auto outer_ref(const ast::Select& q, std::span<const Table* const> outer, const ast::Expr& e) const -> bool {
+    if (!e.table.empty()) {
+      if (std::ranges::any_of(q.from, [&](const ast::FromItem& item) { return e.table == item.name(); })) return false;
+      return std::ranges::any_of(outer, [&](const Table* t) { return t->name == e.table; });
     }
-    auto derived_has = [&](const std::string& column) {
-      return std::ranges::any_of(q.from, [&](const ast::FromItem& item) {
-        return item.derived != nullptr && std::ranges::contains(item.column_aliases, column);
-      });
-    };
-    auto outer_names = [&](const ast::Expr& e) {
-      if (!e.table.empty()) {
-        if (std::ranges::any_of(q.from, [&](const ast::FromItem& item) { return e.table == item.name(); })) return false;
-        return std::ranges::any_of(scope_, [&](const Table* t) { return t->name == e.table; });
-      }
-      if (std::ranges::any_of(own, [&](const Table* t) { return t->column(e.column) != nullptr; }) || derived_has(e.column)) {
+    for (const auto& item : q.from) {
+      if (item.derived) {  // its columns are its aliases
+        if (std::ranges::contains(item.column_aliases, e.column)) return false;
+      } else if (const auto* t = cat_.table(item.table); t != nullptr && t->column(e.column) != nullptr) {
         return false;
       }
-      return std::ranges::any_of(scope_, [&](const Table* t) { return t->column(e.column) != nullptr; });
-    };
+    }
+    return std::ranges::any_of(outer, [&](const Table* t) { return t->column(e.column) != nullptr; });
+  }
+
+  // Whether the subquery names a column of the query around it.
+  auto correlated(const ast::Select& q) const -> bool {
+    if (q.set) return correlated(q.set->left) || correlated(q.set->right);
     std::function<bool(const ast::Expr&)> in_expr = [&](const ast::Expr& e) {
-      if (e.kind == ast::Expr::Kind::Column && outer_names(e)) return true;
+      if (e.kind == ast::Expr::Kind::Column && outer_ref(q, scope_, e)) return true;
       return (e.lhs && in_expr(*e.lhs)) || (e.rhs && in_expr(*e.rhs)) || std::ranges::any_of(e.args, in_expr);
     };
     std::function<bool(const ast::Compare&)> in_compare = [&](const ast::Compare& c) {
@@ -2219,11 +2315,14 @@ public:
     return wider ? sub : c.sql;
   }
 
+  [[nodiscard]] static auto compares(SqlType sub, const Column& c) -> bool {
+    return (is_integer(sub) && is_integer(c.sql)) ||
+           (sub.kind == SqlKind::Decimal && c.sql.kind == SqlKind::Decimal && sub.scale == c.sql.scale) ||
+           (is_string(sub) && is_string(c.sql)) || (!is_integer(sub) && sub.kind != SqlKind::Decimal && sub.kind == c.sql.kind);
+  }
+
   static void comparable(SqlType sub, const Column& c, std::int32_t pos) {
-    auto ok = (is_integer(sub) && is_integer(c.sql)) ||
-              (sub.kind == SqlKind::Decimal && c.sql.kind == SqlKind::Decimal && sub.scale == c.sql.scale) ||
-              (is_string(sub) && is_string(c.sql)) || (!is_integer(sub) && sub.kind != SqlKind::Decimal && sub.kind == c.sql.kind);
-    if (!ok) {
+    if (!compares(sub, c)) {
       not_yet("comparing " + c.name + " (" + sql_type_name(c.sql) + ") with a subquery of " + sql_type_name(sub), pos);
     }
   }
@@ -3357,9 +3456,11 @@ public:
 
   auto where(const Table& t, const std::vector<ast::Compare>& in) -> std::vector<logical::Expr> {
     std::vector<logical::Expr> out;
+    auto was = std::exchange(in_where_, true);
     for (const auto* w : top_level(in)) {
       out.push_back(predicate(*w, [&](const ast::Expr& e) { return std::pair{t.id, column(t, e)}; }));
     }
+    in_where_ = was;
     return out;
   }
 
@@ -3547,6 +3648,26 @@ public:
         rhs->kind == ast::Expr::Kind::Column) {
       std::swap(col, rhs);
       op = mirrored(op);
+    }
+    // In a correlated subquery, its column against a column of the query
+    // around it: the outer one is a parameter the outer row sets
+    // (correlation). Checked as two columns are, in the order written.
+    if (correlating_ && col->kind == ast::Expr::Kind::Column && rhs->kind == ast::Expr::Kind::Column) {
+      const auto& q = *correlating_->query;
+      auto lo = outer_ref(q, correlating_->outer, *col);
+      if (lo || outer_ref(q, correlating_->outer, *rhs)) {
+        const auto* outer_table = correlating_->outer[0];
+        auto type_of = [&](const ast::Expr& e, bool is_outer) {
+          return is_outer ? column(*outer_table, e)->sql : resolve(e).second->sql;
+        };
+        no_operator(type_of(*col, lo), written_op(w, op), type_of(*rhs, !lo), w.pos);
+        if (lo) {
+          std::swap(col, rhs);
+          op = mirrored(op);
+        }
+        auto [table, c] = resolve(*col);
+        return logical::compare(op, logical::column_of(table, *c), outer_param(*rhs, *c, w.pos));
+      }
     }
     if (col->kind == ast::Expr::Kind::Column && param_cast(*rhs)) rhs = uncast_param(rhs, *resolve(*col).second);
     // A column of one relation against a column of another, inside AND, OR or
@@ -4245,7 +4366,9 @@ public:
     if (q.for_update) throw SqlError{"FOR UPDATE is not allowed with UNION/INTERSECT/EXCEPT", q.pos, kFeatureNotSupported};
     if (q.offset != 0) not_yet("OFFSET in an arm of a set operation", q.pos);
     Arm arm;
+    auto was = std::exchange(in_set_arm_, true);
     arm.node = select(q);
+    in_set_arm_ = was;
     const logical::Node* n = arm.node.get();
     while (!std::holds_alternative<logical::Project>(n->op)) {
       const auto* in = logical::input_of(*n);
@@ -4709,6 +4832,16 @@ private:
   std::vector<logical::Subquery> subqueries_;  // in the order bound; InSet names one by its index
   int depth_{0};                               // inside a subquery: one more is refused
   std::vector<const Table*> scope_;            // the tables of the query being bound
+  // The correlated subquery being bound (correlation): its query, the outer
+  // query's tables, and the arguments it has taken so far.
+  struct Correlation {
+    const ast::Select* query;
+    std::vector<const Table*> outer;
+    std::vector<logical::Subquery::Arg> args;
+  };
+  std::optional<Correlation> correlating_;
+  bool in_where_{false};  // binding a one-table query's WHERE (where)
+  bool in_set_arm_{false};  // binding an arm of a set operation (set_arm)
   // What a HAVING parameter compared with COUNT or SUM is typed by: no
   // column of a table, kept where a parameter's first use points.
   std::deque<Column> synthetic_;
@@ -4906,7 +5039,7 @@ public:
       for (const auto& a : u->set) out.set.push_back({a.column, ast::clone(a.value), a.pos});
       for (const auto& c : u->where) out.where.push_back(ast::clone(c));
       out.returning = cloned(u->returning);
-      if (!rewrite(out.set, out.where)) return std::nullopt;
+      if (!rewrite(out.table, out.set, out.where)) return std::nullopt;
       return std::optional<ast::Statement>{std::in_place, std::in_place_type<ast::Update>, std::move(out)};
     }
     if (const auto* d = std::get_if<ast::Delete>(&stmt)) {
@@ -4914,7 +5047,7 @@ public:
       for (const auto& c : d->where) out.where.push_back(ast::clone(c));
       out.returning = cloned(d->returning);
       std::vector<ast::Assignment> none;
-      if (!rewrite(none, out.where)) return std::nullopt;
+      if (!rewrite(out.table, none, out.where)) return std::nullopt;
       return std::optional<ast::Statement>{std::in_place, std::in_place_type<ast::Delete>, std::move(out)};
     }
     return std::nullopt;
@@ -5119,6 +5252,50 @@ private:
     return scratch.expand_stars(q, scratch.relations(q)).size();
   }
 
+  // A correlated subquery where a view is read, around it or in it: the
+  // view's merge does not rewrite the references that cross the subquery's
+  // edge (#836). Correlated: it names a column of a relation of `outer`,
+  // the FROM around it, qualified by its name and none of the subquery's,
+  // or unqualified, of none of the subquery's relations.
+  void refuse_correlated(const std::vector<ast::FromItem>& outer, const ast::Select& q) const {
+    if (q.set) {
+      refuse_correlated(outer, q.set->left);
+      refuse_correlated(outer, q.set->right);
+      return;
+    }
+    auto columns_of = [&](const ast::FromItem& item) -> std::vector<std::string> {
+      if (item.derived) return item.column_aliases;
+      if (cat_.table(item.table) == nullptr && cat_.view(item.table) == nullptr) return {};
+      return relation_columns(item.table);
+    };
+    auto has = [&](const std::vector<ast::FromItem>& from, const std::string& column) {
+      return std::ranges::any_of(from, [&](const ast::FromItem& item) { return std::ranges::contains(columns_of(item), column); });
+    };
+    auto named = [](const std::vector<ast::FromItem>& from, const std::string& name) {
+      return std::ranges::any_of(from, [&](const ast::FromItem& item) { return item.name() == name; });
+    };
+    auto outer_ref = [&](const ast::Expr& e) {
+      if (!e.table.empty()) return !named(q.from, e.table) && named(outer, e.table);
+      return !has(q.from, e.column) && has(outer, e.column);
+    };
+    std::function<void(const ast::Expr&)> expr = [&](const ast::Expr& e) {
+      if (e.kind == ast::Expr::Kind::Column && outer_ref(e)) not_yet("a correlated subquery where a view is read", e.pos);
+      if (e.lhs) expr(*e.lhs);
+      if (e.rhs) expr(*e.rhs);
+      for (const auto& a : e.args) expr(a);
+    };
+    std::function<void(const ast::Compare&)> compare = [&](const ast::Compare& c) {
+      expr(c.lhs);
+      expr(c.rhs);
+      for (const auto& a : c.args) compare(a);
+    };
+    for (const auto& e : q.targets) expr(e);
+    for (const auto& e : q.group_by) expr(e);
+    for (const auto& o : q.order_by) expr(o.expr);
+    for (const auto& c : q.where) compare(c);
+    for (const auto& c : q.having) compare(c);
+  }
+
   // A FROM item that names a view still to expand: not one already read
   // as a derived relation.
   [[nodiscard]] auto names_view(const ast::FromItem& item) const -> bool {
@@ -5134,10 +5311,14 @@ private:
 
   // Whether a view is named in the SET values or WHERE, subqueries included;
   // if so they are rewritten in place.
-  auto rewrite(std::vector<ast::Assignment>& set, std::vector<ast::Compare>& where) -> bool {
+  auto rewrite(const std::string& table, std::vector<ast::Assignment>& set, std::vector<ast::Compare>& where) -> bool {
     auto found = false;
+    ast::FromItem written;
+    written.table = table;
+    const std::vector<ast::FromItem> outer{written};
     auto expand_slot = [&](std::shared_ptr<const ast::Select>& q) {
       if (!mentions(*q)) return;
+      refuse_correlated(outer, *q);
       q = std::make_shared<const ast::Select>(expand(*q));
       found = true;
     };
@@ -5183,11 +5364,13 @@ private:
       }
       return s;
     }
+    auto views = std::ranges::count_if(s.from, [&](const ast::FromItem& item) { return names_view(item); });
     auto expand_slot = [&](std::shared_ptr<const ast::Select>& q) {
-      if (mentions(*q)) q = std::make_shared<const ast::Select>(expand(*q));
+      auto inner = mentions(*q);
+      if (views > 0 || inner) refuse_correlated(s.from, *q);
+      if (inner) q = std::make_shared<const ast::Select>(expand(*q));
     };
     each_subquery(s, expand_slot);
-    auto views = std::ranges::count_if(s.from, [&](const ast::FromItem& item) { return names_view(item); });
     if (views == 0) return s;
     if (std::ranges::any_of(s.from, [](const ast::FromItem& item) { return !item.alias.empty(); })) {
       not_yet("a view in a query that names a table twice", s.from[0].pos);
@@ -5740,6 +5923,9 @@ auto bind_procedure_statement(const std::string& sql, const Table& frame, const 
   VariableRewriter vars{frame, cat};
   vars.statement(stmt);
   ProcedureStatement out{bound::bind(stmt, cat), vars.params()};
+  if (std::ranges::any_of(out.bound.subqueries, [](const logical::Subquery& s) { return s.correlated(); })) {
+    not_yet("a correlated subquery in a procedure's statement", -1);
+  }
   // A variable is its parameter's value as it is: of the type the statement
   // takes it as, or refused (no conversion is built).
   for (std::size_t k = 0; k < out.param_vars.size(); ++k) {

@@ -522,17 +522,62 @@ public:
 
   explicit Gen(Writer& w) : w_{w} {}
 
-  // Each subquery first, once, on the statement's snapshot: it sets the
-  // parameters the rest reads (bc_sub_kind).
+  // Each uncorrelated subquery first, once, on the statement's snapshot: it
+  // sets the parameters the rest reads (bc_sub_kind). A correlated one runs
+  // at its conjunct (run_correlated).
   void subqueries() {
     const auto& subs = w_.p().subs;
     for (std::size_t i = 0; i < subs.size(); ++i) {
-      auto n = std::to_string(i);
-      w_.line("bc_sub_begin(cx, " + n + ", " + sub_kind(subs[i].kind) + ", " + type_code(subs[i]) + ", " +
-              std::to_string(subs[i].param) + ");");
-      w_.line(w_.sub(i) + "(cx);");
-      w_.line("bc_sub_end(cx);");
+      if (!subs[i].args.empty()) continue;
+      run(i);
     }
+  }
+
+  void run(std::size_t i) {
+    const auto& s = w_.p().subs[i];
+    w_.line("bc_sub_begin(cx, " + std::to_string(i) + ", " + sub_kind(s.kind) + ", " + type_code(s) + ", " +
+            std::to_string(s.param) + ");");
+    w_.line(w_.sub(i) + "(cx);");
+    w_.line("bc_sub_end(cx);");
+  }
+
+  // The correlated subqueries conjunct c tests: those whose parameters it
+  // reads, or whose set its InSet does.
+  auto correlated_in(const Expr& c) const -> std::vector<std::size_t> {
+    const auto& subs = w_.p().subs;
+    std::vector<std::size_t> out;
+    std::function<void(const Expr&)> walk = [&](const Expr& e) {
+      for (std::size_t i = 0; i < subs.size(); ++i) {
+        if (subs[i].args.empty() || std::ranges::contains(out, i)) continue;
+        auto set = e.kind == Expr::Kind::InSet && std::cmp_equal(e.constant, i);
+        auto first = subs[i].param;
+        auto read = e.kind == Expr::Kind::Param && e.param >= first && e.param < first + logical::Subquery::params(subs[i].kind);
+        if (set || read) out.push_back(i);
+      }
+      for (const auto& a : e.args) walk(a);
+    };
+    walk(c);
+    std::ranges::sort(out);
+    return out;
+  }
+
+  // Runs correlated subquery i for the row in hand: each argument set from
+  // the row's column, then the run, which sets its parameters and set.
+  void run_correlated(std::size_t i) {
+    for (const auto& a : w_.p().subs[i].args) {
+      auto p = std::to_string(a.param);
+      auto set = "bc_sub_arg_" + suffix(a.col.type) + "(cx, " + p + ", " + read_col(a.col) + ");";
+      if (!a.col.nullable) {
+        w_.line(set);
+        continue;
+      }
+      w_.open("if (" + col_null(a.col) + ")");
+      w_.line("bc_sub_arg_null(cx, " + p + ");");
+      w_.otherwise();
+      w_.line(set);
+      w_.close();
+    }
+    run(i);
   }
 
   void plan(const physical::Node& root) {
@@ -1431,13 +1476,34 @@ private:
       });
       return;
     }
+    // A conjunct that tests a correlated subquery comes after the others,
+    // so a row they reject runs none, its runs printed before it. Over a
+    // one-row aggregate's row (`hit_`) a run is for a row that is there
+    // and has passed the conjuncts before.
+    std::vector<const Expr*> plain;
+    std::vector<std::pair<const Expr*, std::vector<std::size_t>>> correlated;
+    for (const auto& c : f.conjuncts) {
+      auto runs = correlated_in(c);
+      if (runs.empty()) {
+        plain.push_back(&c);
+      } else {
+        correlated.emplace_back(&c, std::move(runs));
+      }
+    }
     produce(*f.input, [&] {
-      for (const auto& c : f.conjuncts) {
+      auto test = [&](const Expr& c) {
         if (hit_) {
           *hit_ += " && !(" + fails(c) + ")";
         } else {
           miss(fails(c));
         }
+      };
+      for (const auto* c : plain) test(*c);
+      for (const auto& [c, runs] : correlated) {
+        if (hit_) w_.open("if (" + *hit_ + ")");
+        for (auto i : runs) run_correlated(i);
+        if (hit_) w_.close();
+        test(*c);
       }
       k();
     });
@@ -3358,7 +3424,7 @@ void attach_subqueries(physical::Plan& p, bound::Bound& b, const Catalog& cat, c
     for (const auto& c : sp.constants) {
       if (std::ranges::none_of(p.constants, [&](const auto& d) { return d.name == c.name; })) p.constants.push_back(c);
     }
-    p.subs.push_back({std::make_shared<const physical::Plan>(std::move(sp)), s.kind, s.type, s.param});
+    p.subs.push_back({std::make_shared<const physical::Plan>(std::move(sp)), s.kind, s.type, s.param, s.args});
   }
 }
 

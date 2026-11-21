@@ -1413,11 +1413,13 @@ class SqlMachine(Sides, RuleBasedStateMachine):
     @precondition(lambda self: len(self.tables) >= 1)
     @rule(data=st.data())
     def subquery(self, data):
-        # A's rows by an uncorrelated subquery over b, a itself or another
-        # table: IN, NOT IN, op ANY or ALL, = or < of a scalar MIN, EXISTS or
-        # NOT EXISTS, its rows narrowed now and then by a parameter or IS
-        # [NOT] NULL. Of columns the layer compares, never a float, which
-        # no filter takes.
+        # A's rows by a subquery over b, a itself or another table: IN, NOT
+        # IN, op ANY or ALL, = or < of a scalar MIN, EXISTS or NOT EXISTS, its
+        # rows narrowed now and then by a parameter or IS [NOT] NULL, or
+        # correlated: a column of b compared with a column of a's row, b
+        # read under an alias where it is a (no scalar form, which the layer
+        # refuses correlated). Of columns the layer compares, never a float,
+        # which no filter takes.
         a = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="outer")]
         b = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="inner")]
         def comparable(x: o.Type, y: o.Type) -> bool:
@@ -1432,9 +1434,19 @@ class SqlMachine(Sides, RuleBasedStateMachine):
         ca, cb = data.draw(st.sampled_from(pairs), label="columns")
         ty = b.column(cb).type
         params, types, pg_params = [], [], []
-        where = data.draw(st.sampled_from(["", "not null", "null", "param"]), label="inner where")
+        where = data.draw(st.sampled_from(["", "not null", "null", "param", "correlated"]), label="inner where")
         inner_where, pg_inner_where = "", ""
-        if where == "not null":
+        inner_name = b.name
+        if where == "correlated":
+            ka, kb = data.draw(st.sampled_from(pairs), label="correlated columns")
+            kind = b.column(kb).type.kind
+            op = data.draw(st.sampled_from(["=", "<>", "<", ">="] if kind in ("int", "decimal", "text") else ["="]),
+                           label="correlated op")
+            if a.name == b.name:
+                inner_name = f"{b.name} AS x"
+            own = "x" if a.name == b.name else b.name
+            inner_where = pg_inner_where = f" WHERE {own}.{kb} {op} {a.name}.{ka}"
+        elif where == "not null":
             inner_where = pg_inner_where = f" WHERE {cb} IS NOT NULL"
         elif where == "null":
             inner_where = pg_inner_where = f" WHERE {cb} IS NULL"
@@ -1445,9 +1457,10 @@ class SqlMachine(Sides, RuleBasedStateMachine):
             pg_inner_where = " WHERE " + compared(b, cb, op, v, 1, True)
             params.append(param_value(v))
             types.append(ty)
-        form = data.draw(st.sampled_from(["in", "not in", "any", "all", "scalar", "exists", "not exists"]), label="form")
+        forms = ["in", "not in", "any", "all", "exists", "not exists"] + ([] if where == "correlated" else ["scalar"])
+        form = data.draw(st.sampled_from(forms), label="form")
         def text(w):
-            inner = f"SELECT {cb} FROM {b.name}{w}"
+            inner = f"SELECT {cb} FROM {inner_name}{w}"
             if form == "in":
                 return f"{ca} IN ({inner})"
             if form == "not in":
@@ -2107,6 +2120,43 @@ def test_uncorrelated_subqueries_agree_with_postgresql(dsn):
             assert m.both(sql).error is None, sql
         assert m.both("SELECT c0 FROM t0 WHERE c1 = (SELECT c4 FROM t1)").error == "21000"
         assert m.both("UPDATE t0 SET c1 = 0 WHERE c0 IN (SELECT c3 FROM t1)").error is None
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_correlated_subqueries_agree_with_postgresql(dsn):
+    """A correlated IN, NOT IN, ANY, ALL and EXISTS, an outer row's NULL
+    among them; one that reads the outer table again under an alias, the
+    outer one named by its own name; one that aggregates, groups, orders
+    and limits; and an UPDATE and a DELETE whose subquery reads the table
+    they write, each run seeing none of the statement's own writes."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER), Column("c1", o.INTEGER), Column("c2", o.TEXT)], ["c0"]))
+        m.create(Table("t1", [Column("c3", o.BIGINT), Column("c4", o.BIGINT), Column("c5", o.TEXT)], ["c3"]))
+        for row in ({"c0": 1, "c1": 2, "c2": "a"}, {"c0": 2, "c1": 20, "c2": "b"}, {"c0": 3, "c1": None, "c2": None},
+                    {"c0": 4, "c1": 1, "c2": "b"}, {"c0": 5, "c1": 5, "c2": "e"}):
+            assert m.insert("t0", row, all_columns=True).error is None
+        for row in ({"c3": 1, "c4": 20, "c5": "b"}, {"c3": 2, "c4": None, "c5": None}, {"c3": 3, "c4": 5, "c5": "e"},
+                    {"c3": 4, "c4": 5, "c5": "b"}):
+            assert m.insert("t1", row, all_columns=True).error is None
+        for sql in ("SELECT c0 FROM t0 WHERE c1 IN (SELECT c4 FROM t1 WHERE t1.c5 = t0.c2) ORDER BY c0",
+                    "SELECT c0 FROM t0 WHERE c1 NOT IN (SELECT c4 FROM t1 WHERE t1.c3 <= t0.c0) ORDER BY c0",
+                    "SELECT c0 FROM t0 WHERE c1 >= ALL (SELECT c4 FROM t1 WHERE c3 < t0.c1) ORDER BY c0",
+                    "SELECT c0 FROM t0 WHERE c1 < ANY (SELECT c4 FROM t1 WHERE c5 = t0.c2 OR c3 = t0.c0) ORDER BY c0",
+                    "SELECT c0 FROM t0 WHERE NOT EXISTS (SELECT 1 FROM t1 WHERE t1.c5 = t0.c2) ORDER BY c0",
+                    "SELECT c0 FROM t0 WHERE EXISTS (SELECT 1 FROM t0 AS x WHERE x.c0 = t0.c1) ORDER BY c0",
+                    "SELECT c0 FROM t0 WHERE c1 IN (SELECT x.c0 FROM t0 x WHERE x.c2 = t0.c2) ORDER BY c0",
+                    "SELECT c0 FROM t0 WHERE c1 IN (SELECT SUM(x.c0) FROM t0 x WHERE x.c2 = t0.c2) ORDER BY c0",
+                    "SELECT c0 FROM t0 WHERE c1 IN (SELECT COUNT(*) FROM t1 WHERE c3 <= t0.c0) ORDER BY c0",
+                    "SELECT c0 FROM t0 WHERE c1 IN (SELECT MAX(c4) FROM t1 WHERE c3 <= t0.c0 GROUP BY c5) ORDER BY c0",
+                    "SELECT c0 FROM t0 WHERE c1 IN (SELECT c4 FROM t1 WHERE c3 >= t0.c0 ORDER BY c4 LIMIT 1) ORDER BY c0"):
+            assert m.both(sql).error is None, sql
+        assert m.both("UPDATE t0 SET c1 = 1 WHERE NOT EXISTS (SELECT 1 FROM t0 x WHERE x.c1 = t0.c0)").error is None
+        assert m.both("SELECT c0, c1 FROM t0 ORDER BY c0").error is None
+        assert m.both("DELETE FROM t0 WHERE EXISTS (SELECT 1 FROM t0 x WHERE x.c0 = t0.c1 AND x.c0 <> t0.c0)").error is None
+        assert m.both("SELECT c0, c1 FROM t0 ORDER BY c0").error is None
         m.check()
     finally:
         m.teardown()
