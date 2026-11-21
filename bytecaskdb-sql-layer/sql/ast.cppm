@@ -251,6 +251,7 @@ struct Insert {
   std::vector<std::string> columns;  // empty: every column, in order
   std::vector<std::vector<Expr>> rows;  // VALUES' rows, each of one length
   std::int32_t pos{-1};
+  std::vector<Expr> returning;  // RETURNING's list, empty for none
 };
 
 struct OrderItem {
@@ -377,6 +378,7 @@ struct Update {
   std::vector<Compare> where;
   std::int32_t pos{-1};
   std::string current_of;  // WHERE CURRENT OF name: the cursor, and `where` is empty
+  std::vector<Expr> returning;  // RETURNING's list, empty for none
 };
 
 struct Delete {
@@ -384,6 +386,7 @@ struct Delete {
   std::vector<Compare> where;
   std::int32_t pos{-1};
   std::string current_of;  // WHERE CURRENT OF name: the cursor, and `where` is empty
+  std::vector<Expr> returning;  // RETURNING's list, empty for none
 };
 
 // CREATE VIEW name [(columns)] AS query. `query` is the SELECT as written;

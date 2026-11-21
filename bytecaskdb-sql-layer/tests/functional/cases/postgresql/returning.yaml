@@ -2,7 +2,6 @@
 
 - name: INSERT RETURNING returns the row inserted
   features: [pg:returning]
-  unimplemented: true
   setup:
     - CREATE TABLE r (id INTEGER PRIMARY KEY, v INTEGER)
   steps:
@@ -14,7 +13,6 @@
 
 - name: UPDATE RETURNING returns each row as updated
   features: [pg:returning]
-  unimplemented: true
   setup:
     - CREATE TABLE r2 (id INTEGER PRIMARY KEY, v INTEGER)
   steps:
@@ -31,7 +29,6 @@
 
 - name: DELETE RETURNING returns each row as it was
   features: [pg:returning]
-  unimplemented: true
   setup:
     - CREATE TABLE r3 (id INTEGER PRIMARY KEY, v INTEGER)
   steps:

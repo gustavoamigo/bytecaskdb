@@ -3260,6 +3260,47 @@ TEST_CASE("embedded API: ILIKE folds ASCII letters, and LIKE's ESCAPE may be a p
   CHECK(state("SELECT id FROM t WHERE id ILIKE 'a'") == "42883");
 }
 
+TEST_CASE("embedded API: RETURNING gives a row per row written, as inserted, updated or deleted", "[sql][api]") {
+  sql_test::TempDir dir{"api_returning"};
+  auto db = Database::open(dir.path());
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  (void)db->execute("CREATE TABLE r (id INTEGER PRIMARY KEY, v INTEGER, s TEXT DEFAULT 'd')");
+  auto ins = db->execute("INSERT INTO r VALUES ($1, $2), (2, NULL) RETURNING *", {i(1), i(10)});
+  CHECK(ins.columns == std::vector<std::string>{"id", "v", "s"});
+  CHECK(ins.affected == 2);
+  CHECK(ins.rows == Grid{{i(1), i(10), text("d")}, {i(2), Value{}, text("d")}});
+  // An UPDATE's values are the row as updated, a moved key included.
+  auto upd = db->execute("UPDATE r SET v = v + 1, id = id + 10 WHERE id = 1 RETURNING id AS k, v * 2, upper(s)");
+  CHECK(upd.columns == std::vector<std::string>{"k", "?column?", "upper"});
+  CHECK(upd.rows == Grid{{i(11), i(22), text("D")}});
+  // A DELETE's are the row as it was; no row written is no row returned.
+  CHECK(db->execute("DELETE FROM r WHERE id = 2 RETURNING s, v").rows == Grid{{text("d"), Value{}}});
+  auto none = db->execute("DELETE FROM r WHERE id = 99 RETURNING id");
+  CHECK(none.rows.empty());
+  CHECK(none.affected == 0);
+  CHECK(db->execute("SELECT id FROM r").rows == Grid{{i(11)}});
+  CHECK(state("INSERT INTO r VALUES (5, 1) RETURNING count(*)") == "42803");
+  CHECK(state("INSERT INTO r VALUES (5, 1) RETURNING nope") == "42703");
+  CHECK(db->execute("SELECT id FROM r").rows == Grid{{i(11)}});  // the refused statements wrote nothing
+  // In a transaction the rows come back before the commit.
+  auto txn = db->begin();
+  CHECK(txn.execute("INSERT INTO r VALUES (6, 6) RETURNING v").rows == Grid{{i(6)}});
+  txn.rollback();
+  CHECK(db->execute("SELECT id FROM r").rows == Grid{{i(11)}});
+  // A procedure's statement with RETURNING is refused when the procedure is first planned.
+  (void)db->execute("CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN DELETE FROM r WHERE id = 11 RETURNING id; END $$");
+  CHECK(state("CALL p()") == "0A000");
+  CHECK(db->execute("SELECT id FROM r").rows == Grid{{i(11)}});
+}
+
 TEST_CASE("embedded API: a procedure builds text from its variables, as TPROC-C's Payment does", "[sql][api][procedure]") {
   sql_test::TempDir dir{"api_procedure_strings"};
   auto db = Database::open(dir.path());

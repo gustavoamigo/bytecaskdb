@@ -1680,13 +1680,16 @@ auto param_count(const ast::Statement& stmt) -> std::uint32_t {
           for (const auto& row : s.rows) {
             for (const auto& e : row) params_in(e, n);
           }
+          for (const auto& e : s.returning) params_in(e, n);
         } else if constexpr (std::is_same_v<T, ast::Select>) {
           n = select_param_count(s);
         } else if constexpr (std::is_same_v<T, ast::Update>) {
           for (const auto& a : s.set) params_in(a.value, n);
           conjuncts(s.where);
+          for (const auto& e : s.returning) params_in(e, n);
         } else if constexpr (std::is_same_v<T, ast::Delete>) {
           conjuncts(s.where);
+          for (const auto& e : s.returning) params_in(e, n);
         }
       },
       stmt);
@@ -3566,20 +3569,6 @@ public:
     };
     std::vector<logical::Output> targets;
     for (const auto& e : list) {
-      if (e.kind == ast::Expr::Kind::Clock) {
-        if (aggregated) not_yet("the time in the select list of an aggregated query", e.pos);
-        targets.push_back(clock(e));
-        continue;
-      }
-      if (is_constant(e) || e.kind == ast::Expr::Kind::Subquery) {
-        if (aggregated) {
-          not_yet(std::string{e.kind == ast::Expr::Kind::Subquery ? "a subquery" : "a constant"} +
-                      " in the select list of an aggregated query",
-                  e.pos);
-        }
-        targets.push_back(e.kind == ast::Expr::Kind::Subquery ? subquery_output(e) : constant_output(e));
-        continue;
-      }
       if (e.kind == ast::Expr::Kind::Aggregate) {
         if (e.column.empty()) {
           targets.push_back(aggregate(nullptr, 0, e));
@@ -3589,18 +3578,19 @@ public:
         }
         continue;
       }
-      if (e.kind != ast::Expr::Kind::Column) {
-        if (aggregated) not_yet("an expression in the select list of an aggregated query", e.pos);
-        auto name = e.kind == ast::Expr::Kind::Case                       ? std::string{"case"}
-                    : e.kind == ast::Expr::Kind::Coalesce                 ? std::string{"coalesce"}
-                    : e.kind == ast::Expr::Kind::NullIf                   ? std::string{"nullif"}
-                    : e.kind == ast::Expr::Kind::Func && e.func != "||" ? e.func
-                                                                          : std::string{"?column?"};
-        targets.push_back({value(e, resolve), name});
+      if (!aggregated) {
+        targets.push_back(plain_output(e, resolve));
         continue;
       }
+      if (e.kind == ast::Expr::Kind::Clock) not_yet("the time in the select list of an aggregated query", e.pos);
+      if (is_constant(e) || e.kind == ast::Expr::Kind::Subquery) {
+        not_yet(std::string{e.kind == ast::Expr::Kind::Subquery ? "a subquery" : "a constant"} +
+                    " in the select list of an aggregated query",
+                e.pos);
+      }
+      if (e.kind != ast::Expr::Kind::Column) not_yet("an expression in the select list of an aggregated query", e.pos);
       auto [t, c] = resolve(e);
-      targets.push_back({aggregated ? grouped(*t, *c, e.pos) : logical::column_of(t->id, *c), c->name});
+      targets.push_back({grouped(*t, *c, e.pos), c->name});
     }
     named(list, targets);
     if (s.row_key && row_key_allowed_ && !joined && !aggregated) {
@@ -3811,6 +3801,46 @@ public:
           }
         },
         n.op);
+  }
+
+  // A select-list item of no aggregated query, named as PostgreSQL names
+  // it: a column by its name, a CASE, COALESCE or NULLIF by the word, a
+  // function by its own, any other expression ?column?.
+  auto plain_output(const ast::Expr& e, const Resolve& resolve) -> logical::Output {
+    if (e.kind == ast::Expr::Kind::Clock) return clock(e);
+    if (e.kind == ast::Expr::Kind::Subquery) return subquery_output(e);
+    if (is_constant(e)) return constant_output(e);
+    if (e.kind != ast::Expr::Kind::Column) {
+      auto name = e.kind == ast::Expr::Kind::Case                       ? std::string{"case"}
+                  : e.kind == ast::Expr::Kind::Coalesce                 ? std::string{"coalesce"}
+                  : e.kind == ast::Expr::Kind::NullIf                   ? std::string{"nullif"}
+                  : e.kind == ast::Expr::Kind::Func && e.func != "||" ? e.func
+                                                                        : std::string{"?column?"};
+      return {value(e, resolve), name};
+    }
+    auto [t, c] = resolve(e);
+    return {logical::column_of(t->id, *c), c->name};
+  }
+
+  // RETURNING's list over the row `t` wrote: a column of the row as
+  // inserted or updated, or as it was before a DELETE (the plan binds the
+  // one row it has in hand); * is every column. No aggregate (42803).
+  auto returning(const Table& t, const std::vector<ast::Expr>& list) -> std::vector<logical::Output> {
+    if (list.empty()) return {};
+    ast::Select s;
+    for (const auto& e : list) {
+      if (e.kind == ast::Expr::Kind::Aggregate) {
+        throw SqlError{"aggregate functions are not allowed in RETURNING", e.pos, kGroupingError};
+      }
+      s.targets.push_back(ast::clone(e));
+      s.targets.back().alias = e.alias;
+    }
+    auto expanded = expand_stars(s, {&t});
+    Resolve resolve = [&](const ast::Expr& e) -> std::pair<const Table*, const Column*> { return {&t, column(t, e)}; };
+    std::vector<logical::Output> out;
+    for (const auto& e : expanded) out.push_back(plain_output(e, resolve));
+    named(expanded, out);
+    return out;
   }
 
   // A select-list item's AS name is its output column's.
@@ -4246,6 +4276,16 @@ public:
 
   [[nodiscard]] auto used() const -> const std::vector<std::uint32_t>& { return used_; }
 
+  // A list of expressions copied, each with its AS name.
+  static auto cloned(const std::vector<ast::Expr>& list) -> std::vector<ast::Expr> {
+    std::vector<ast::Expr> out;
+    for (const auto& e : list) {
+      out.push_back(ast::clone(e));
+      out.back().alias = e.alias;
+    }
+    return out;
+  }
+
   // The statement with its views expanded; nullopt where it reads none.
   [[nodiscard]] auto statement(const ast::Statement& stmt) -> std::optional<ast::Statement> {
     if (const auto* s = std::get_if<ast::Select>(&stmt)) {
@@ -4256,12 +4296,14 @@ public:
       ast::Update out{u->table, {}, {}, u->pos, u->current_of};
       for (const auto& a : u->set) out.set.push_back({a.column, ast::clone(a.value), a.pos});
       for (const auto& c : u->where) out.where.push_back(ast::clone(c));
+      out.returning = cloned(u->returning);
       if (!rewrite(out.set, out.where)) return std::nullopt;
       return std::optional<ast::Statement>{std::in_place, std::in_place_type<ast::Update>, std::move(out)};
     }
     if (const auto* d = std::get_if<ast::Delete>(&stmt)) {
       ast::Delete out{d->table, {}, d->pos, d->current_of};
       for (const auto& c : d->where) out.where.push_back(ast::clone(c));
+      out.returning = cloned(d->returning);
       std::vector<ast::Assignment> none;
       if (!rewrite(none, out.where)) return std::nullopt;
       return std::optional<ast::Statement>{std::in_place, std::in_place_type<ast::Delete>, std::move(out)};
@@ -4658,11 +4700,13 @@ public:
             names(st);
             select(st);
           } else if constexpr (std::is_same_v<T, ast::Insert>) {
+            if (!st.returning.empty()) not_yet("RETURNING in a procedure", st.pos);
             for (auto& row : st.rows) {
               for (auto& v : row) names(v);
               for (auto& v : row) expr(v);
             }
           } else if constexpr (std::is_same_v<T, ast::Update>) {
+            if (!st.returning.empty()) not_yet("RETURNING in a procedure", st.pos);
             scope_.insert(st.table);
             for (auto& a : st.set) names(a.value);
             for (auto& c : st.where) names(c);
@@ -4670,6 +4714,7 @@ public:
             for (auto& c : st.where) compare(c);
             if (!st.current_of.empty()) not_yet("WHERE CURRENT OF in a procedure", st.pos);
           } else if constexpr (std::is_same_v<T, ast::Delete>) {
+            if (!st.returning.empty()) not_yet("RETURNING in a procedure", st.pos);
             scope_.insert(st.table);
             for (auto& c : st.where) names(c);
             for (auto& c : st.where) compare(c);
@@ -5050,6 +5095,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           // default, a primary key column among them, is refused when the
           // row is built (BC_C_NOT_NULL), as a NULL given for it is.
           out.checks = b.checks(*t);
+          out.returning = b.returning(*t, s.returning);
           return {logical::node(std::move(out)), s.pos};
         } else if constexpr (std::is_same_v<T, ast::Select>) {
           return {b.select(s), s.pos};
@@ -5072,12 +5118,13 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           }
           b.set_scope({t});
           auto rows = Binder::rows(*t, s.current_of.empty() ? b.where(*t, s.where) : b.current_of(*t, own, s.pos));
-          return {logical::node(logical::Update{std::move(rows), t, std::move(set), b.checks(*t)}), s.pos};
+          return {logical::node(logical::Update{std::move(rows), t, std::move(set), b.checks(*t), b.returning(*t, s.returning)}),
+                  s.pos};
         } else {
           const auto* t = b.table(s.table, s.pos);
           b.set_scope({t});
           auto rows = Binder::rows(*t, s.current_of.empty() ? b.where(*t, s.where) : b.current_of(*t, own, s.pos));
-          return {logical::node(logical::Delete{std::move(rows), t}), s.pos};
+          return {logical::node(logical::Delete{std::move(rows), t, b.returning(*t, s.returning)}), s.pos};
         }
       },
       target);

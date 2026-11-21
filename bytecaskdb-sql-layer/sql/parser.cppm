@@ -999,8 +999,20 @@ auto alter_table(const PgQuery__AlterTableStmt* s, std::int32_t pos, std::string
   return AddColumn{relation(s->relation), column_def(cmd->def->column_def, primary_keys, sql), pos};
 }
 
+// RETURNING's list: its expressions, each with its AS name, as a select
+// list's are read.
+auto returning_list(PgQuery__Node** list, std::size_t n) -> std::vector<Expr> {
+  std::vector<Expr> out;
+  for (std::size_t i = 0; i < n; ++i) {
+    const auto* rt = list[i]->res_target;
+    out.push_back(expr(rt->val));
+    if (!empty(rt->name)) out.back().alias = rt->name;
+  }
+  return out;
+}
+
 auto insert(const PgQuery__InsertStmt* s, std::int32_t pos) -> Insert {
-  if (s->on_conflict_clause != nullptr || s->n_returning_list != 0 || s->with_clause != nullptr) {
+  if (s->on_conflict_clause != nullptr || s->with_clause != nullptr) {
     reject("INSERT option not supported", s->relation->location);
   }
   Insert ins{relation(s->relation), {}, {}, pos};
@@ -1015,6 +1027,7 @@ auto insert(const PgQuery__InsertStmt* s, std::int32_t pos) -> Insert {
       reject("VALUES lists must all be the same length", values.empty() ? pos : values.front().pos);
     }
   }
+  ins.returning = returning_list(s->returning_list, s->n_returning_list);
   return ins;
 }
 
@@ -1358,7 +1371,7 @@ auto current_of(const PgQuery__Node* where_clause) -> std::optional<std::string>
 }
 
 auto update(const PgQuery__UpdateStmt* s, std::int32_t pos) -> Update {
-  if (s->n_from_clause != 0 || s->n_returning_list != 0 || s->with_clause != nullptr) {
+  if (s->n_from_clause != 0 || s->with_clause != nullptr) {
     reject("UPDATE option not supported", s->relation->location);
   }
   Update u{relation(s->relation), {}, {}, pos, {}};
@@ -1372,11 +1385,12 @@ auto update(const PgQuery__UpdateStmt* s, std::int32_t pos) -> Update {
   } else {
     where(s->where_clause, u.where);
   }
+  u.returning = returning_list(s->returning_list, s->n_returning_list);
   return u;
 }
 
 auto del(const PgQuery__DeleteStmt* s, std::int32_t pos) -> Delete {
-  if (s->n_using_clause != 0 || s->n_returning_list != 0 || s->with_clause != nullptr) {
+  if (s->n_using_clause != 0 || s->with_clause != nullptr) {
     reject("DELETE option not supported", s->relation->location);
   }
   Delete d{relation(s->relation), {}, pos, {}};
@@ -1385,6 +1399,7 @@ auto del(const PgQuery__DeleteStmt* s, std::int32_t pos) -> Delete {
   } else {
     where(s->where_clause, d.where);
   }
+  d.returning = returning_list(s->returning_list, s->n_returning_list);
   return d;
 }
 

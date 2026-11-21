@@ -267,6 +267,7 @@ struct Insert {
   const Table* table{nullptr};
   std::vector<std::vector<std::optional<Expr>>> rows;  // VALUES' rows, written in order
   std::vector<Expr> checks;
+  std::vector<Output> returning;  // RETURNING's: a row of these per row written, over the row as written
 };
 
 // Each row the input gives, written: its set columns from expressions of
@@ -276,11 +277,13 @@ struct Update {
   const Table* table{nullptr};
   std::vector<std::pair<ColumnRef, Expr>> set;
   std::vector<Expr> checks;  // as Insert's, over the row as it will be written
+  std::vector<Output> returning;  // as Insert's, over the row as updated
 };
 
 struct Delete {
   NodePtr input;
   const Table* table{nullptr};
+  std::vector<Output> returning;  // as Insert's, over the row as it was
 };
 
 // UNION, INTERSECT or EXCEPT of two queries' rows, each a Project (under a

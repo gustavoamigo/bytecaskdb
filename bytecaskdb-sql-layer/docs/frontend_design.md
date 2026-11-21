@@ -59,6 +59,17 @@ kind the transformer doesn't take is refused with its position.
   that fails writes none of them. Rows of different lengths are 42601, as
   in PostgreSQL. The plan writes each row in a block of its own, so a
   statement's plan grows with its rows.
+- `RETURNING` of an `INSERT`, `UPDATE` or `DELETE`: a result row per row
+  written, its list bound as a select list over the one table (`*`,
+  columns, constants, parameters, expressions, each named as a select
+  list names it). An `INSERT`'s and an `UPDATE`'s values are of the row as
+  written (defaults, a moved key and `SET`'s values included), a
+  `DELETE`'s of the row as it was. The plan evaluates the list after the
+  write, over the row it has in hand (`nr`, or `old` for a `DELETE`), and
+  emits it; the statement still reports its count, so the tag is `INSERT 0
+  n`, `UPDATE n` or `DELETE n` after the rows. An aggregate is 42803, as in
+  PostgreSQL. Refused (0A000): `RETURNING` in a procedure's statement, and
+  `RETURNING … INTO` with it.
 - `SELECT` targets: columns, `*` and `table.*` (below), constants (*Literals*), `COUNT(*)`,
   `COUNT(col)`, `COUNT(DISTINCT col)`, `SUM(col)`, `MIN(col)`, `MAX(col)` and
   `AVG(col)`, several of them in any order; a constant not beside an
@@ -587,7 +598,7 @@ That includes:
   `NATURAL` after the first join, a join in parentheses or among commas,
   `FOR UPDATE` of a join (#697), an alias of a join, an output name in `GROUP BY` or in `ORDER BY` of
   other than a column;
-- `RETURNING`; `VALUES` outside `INSERT`; `OFFSET` on a set operation, in one of
+- `RETURNING` in a procedure; `VALUES` outside `INSERT`; `OFFSET` on a set operation, in one of
   its arms or in a view;
 - `CASE` or `COALESCE` of a float beside another number, a `BETWEEN` or
   `IN` as a value, `GREATEST` and `LEAST`, `CASE` outside the plain select

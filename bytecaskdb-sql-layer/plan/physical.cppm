@@ -368,6 +368,7 @@ struct Insert {
   std::uint32_t table{0};
   std::vector<std::vector<std::pair<ColumnRef, Expr>>> rows;  // each row's columns, written in order
   std::vector<Expr> checks;  // logical::Insert's, evaluated over each row as written
+  std::vector<Expr> returning;  // RETURNING's: one result row per row written, over the row as written
 };
 
 // UPDATE and DELETE write each row their input gives, read from the
@@ -377,11 +378,13 @@ struct Update {
   std::uint32_t table{0};
   std::vector<std::pair<ColumnRef, Expr>> set;
   std::vector<Expr> checks;  // logical::Update's
+  std::vector<Expr> returning;  // as Insert's, over the row as updated
 };
 
 struct Delete {
   NodePtr input;
   std::uint32_t table{0};
+  std::vector<Expr> returning;  // as Insert's, over the row as it was
 };
 
 struct Node {
@@ -619,6 +622,21 @@ private:
   void reads(const Expr& e) const {
     if (e.kind == Expr::Kind::Column) read(e.col);
     for (const auto& a : e.args) reads(a);
+  }
+
+  // RETURNING's expressions: values over columns of the table written, the
+  // row in hand when it is written.
+  void returned(std::uint32_t table, const std::vector<Expr>& list) const {
+    if (!list.empty() && p_.result.size() != list.size()) broken("a RETURNING list that is not the plan's result");
+    for (const auto& e : list) {
+      value(e);
+      params(e);
+      std::vector<ColumnRef> cols;
+      logical::columns_of(e, cols);
+      if (std::ranges::any_of(cols, [&](const ColumnRef& c) { return c.table != table; })) {
+        broken("a RETURNING column of another table than the one written");
+      }
+    }
   }
 
   // A result column's expression: what codegen's eval prints, each operator
@@ -1353,7 +1371,9 @@ private:
               for (const auto& [col, e] : row) params(e);
             }
             for (const auto& c : op.checks) params(c);
+            returned(op.table, op.returning);
           } else if constexpr (std::is_same_v<T, Update>) {
+            returned(op.table, op.returning);
             if (op.set.empty()) broken("an update that sets no column");
             for (const auto& c : op.checks) params(c);
             for (const auto& [col, e] : op.set) {
@@ -1366,6 +1386,7 @@ private:
             }
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Delete>) {
+            returned(op.table, op.returning);
             node(*op.input, &n);
           }
         },
