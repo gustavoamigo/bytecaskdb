@@ -106,10 +106,8 @@ e141_07_10_01  # TIME WITH TIME ZONE: the layer has no WITH TIME ZONE types
 e141_07_11_01  # TIMESTAMP WITH TIME ZONE is supported; a DEFAULT of a clock is not (#701)
 e141_07_12_01  # TIME WITH TIME ZONE: the layer has no WITH TIME ZONE types
 e141_07_13_01  # TIMESTAMP WITH TIME ZONE is supported; a DEFAULT of a clock is not (#701)
-e152_01_01_01  # SET LOCAL TRANSACTION, and ISOLATION LEVEL SERIALIZABLE: transactions run at snapshot isolation; the serializable guards are not built
+e152_01_01_01  # ISOLATION LEVEL SERIALIZABLE: transactions run at snapshot isolation; the serializable guards are not built
 e152_01_01_02  # ISOLATION LEVEL SERIALIZABLE: transactions run at snapshot isolation; the serializable guards are not built
-e152_02_01_01  # SET LOCAL TRANSACTION is refused; PostgreSQL takes it as SET TRANSACTION
-e152_02_01_02  # SET LOCAL TRANSACTION is refused; PostgreSQL takes it as SET TRANSACTION
 f031_03_01_01  # CREATE ROLE and GRANT: roles are not built (#653)
 f031_03_01_02  # CREATE ROLE and GRANT: roles are not built (#653)
 f031_03_01_03  # CREATE ROLE and GRANT: roles are not built (#653)

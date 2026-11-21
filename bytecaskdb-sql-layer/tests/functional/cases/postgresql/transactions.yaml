@@ -256,6 +256,31 @@
     - ROLLBACK
     - DROP TABLE t
 
+- name: SET LOCAL TRANSACTION and SET SESSION TRANSACTION are SET TRANSACTION
+  features: [E152-01, E152-02]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY)
+  steps:
+    - sql: START TRANSACTION
+    - sql: SET LOCAL TRANSACTION READ ONLY
+    - sql: INSERT INTO t VALUES (1)
+      error: "25006"
+    - sql: ROLLBACK
+    - sql: START TRANSACTION
+    - sql: SET SESSION TRANSACTION READ ONLY
+    - sql: SET LOCAL TRANSACTION READ WRITE, ISOLATION LEVEL REPEATABLE READ
+    - sql: INSERT INTO t VALUES (1)
+      rowcount: 1
+    - sql: COMMIT
+    # The mode lasted only for its block.
+    - sql: INSERT INTO t VALUES (2)
+      rowcount: 1
+    - sql: SELECT id FROM t
+      expected: [[1], [2]]
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
 - name: SET TRANSACTION takes an isolation level the snapshot already gives, with modes
   features: [E152-01, E152-02]
   steps:

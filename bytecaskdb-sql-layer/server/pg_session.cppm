@@ -373,6 +373,12 @@ auto classify(std::string_view text, const char* several_state, std::string_view
     auto modes = transaction_modes(sql, 2);
     return {Classified::Kind::Control, Control::SetTransaction, {}, {}, modes};
   }
+  // SET LOCAL TRANSACTION and SET SESSION TRANSACTION are SET TRANSACTION in
+  // PostgreSQL: either way the modes last only for the block that is open.
+  if (w == "SET" && words.size() > 2 && (words[1] == "LOCAL" || words[1] == "SESSION") && words[2] == "TRANSACTION") {
+    auto modes = transaction_modes(sql, 3);
+    return {Classified::Kind::Control, Control::SetTransaction, {}, {}, modes};
+  }
   if (w == "SET") {
     // SET [SESSION] client_encoding {TO | =} 'UTF8': the server speaks UTF8,
     // so only the encodings client_encoding() takes are.

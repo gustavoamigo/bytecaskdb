@@ -372,8 +372,9 @@ exposes as calls, not as statements.
   would prevent it are not built. `SET TRANSACTION` outside a block is
   `WARNING 25P01`; an isolation level, or `READ WRITE` after `READ ONLY`,
   once the block has run a statement is `25001`. `SET LOCAL TRANSACTION`
-  (the standard's spelling, not PostgreSQL's) and `SET SESSION
-  CHARACTERISTICS` are `0A000`.
+  and `SET SESSION TRANSACTION` are `SET TRANSACTION`, as in PostgreSQL:
+  the modes last for the open block either way. `SET SESSION
+  CHARACTERISTICS AS TRANSACTION` is `0A000`.
 - **`COMMIT`** calls `commit()`. `Committed` gives the tag `COMMIT`. A
   transaction that was aborted is rolled back instead (`RolledBack`), with
   the tag `ROLLBACK`, as PostgreSQL's `COMMIT` does. Errors:
