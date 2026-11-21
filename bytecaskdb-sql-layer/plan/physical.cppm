@@ -654,6 +654,12 @@ private:
         operands(2, 2);
         if (e.args[0].phys() != PhysType::I64 || e.args[1].phys() != PhysType::I64) broken("random of other than integers");
         break;
+      case Expr::Kind::TextFn:
+        operands(1, 2);
+        for (const auto& a : e.args) {
+          if (a.phys() != PhysType::Bytes) broken("a string function of other than text");
+        }
+        break;
       case Expr::Kind::Substr:
         operands(2, 3);
         if (e.args[0].phys() != PhysType::Bytes || e.args[1].phys() != PhysType::I64 ||
@@ -761,6 +767,7 @@ private:
       case Expr::Kind::Coalesce:
       case Expr::Kind::Concat:
       case Expr::Kind::Substr:
+      case Expr::Kind::TextFn:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
       case Expr::Kind::Abs:

@@ -44,6 +44,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <map>
 #include <set>
 #include <system_error>
@@ -61,6 +62,7 @@
 // bc_db, bc_catalog and bc_params, which bc_plan.h leaves opaque, and the
 // catalog and codecs through it.
 import bytecask.sql.runtime;
+import bytecask.sql.text;
 
 using bytecask::sql::Bytes;
 using bytecask::sql::BytesView;
@@ -4593,6 +4595,64 @@ bc_view bc_substr(bc_ctx* cx, bc_view s, int64_t from, int64_t count) {
     ++pos;
   }
   return cx->arena_view(text->subspan(start, std::min(at, text->size()) - start));
+  BC_GUARD_END(cx)
+  return {};
+}
+
+namespace {
+
+// Text as the characters the text module's functions take, and back as a
+// view the statement holds. std::byte aliases as char.
+auto chars(BytesView b) -> std::string_view { return {reinterpret_cast<const char*>(b.data()), b.size()}; }
+
+auto text_view(bc_ctx* cx, std::string_view s) -> bc_view { return cx->arena_view(std::as_bytes(std::span{s})); }
+
+}  // namespace
+
+bc_view bc_text_case(bc_ctx* cx, bc_view s, bool upper) {
+  BC_GUARD_BEGIN
+  auto text = cx->resolve(s);
+  if (!text) return {};
+  return text_view(cx, bytecask::sql::ascii_case(std::string{chars(*text)}, upper));
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_view bc_trim(bc_ctx* cx, bc_view s, bc_view set, uint32_t how) {
+  BC_GUARD_BEGIN
+  auto text = cx->resolve(s);
+  if (!text) return {};
+  std::string_view chosen{" "};
+  if ((how & BC_TRIM_SPACES) == 0) {
+    auto given = cx->resolve(set);
+    if (!given) return {};
+    chosen = chars(*given);
+  }
+  return text_view(cx, bytecask::sql::trimmed(chars(*text), chosen, (how & BC_TRIM_LEADING) != 0, (how & BC_TRIM_TRAILING) != 0));
+  BC_GUARD_END(cx)
+  return {};
+}
+
+int64_t bc_char_length(bc_ctx* cx, bc_view s) {
+  BC_GUARD_BEGIN
+  auto text = cx->resolve(s);
+  return text ? bytecask::sql::char_count(chars(*text)) : 0;
+  BC_GUARD_END(cx)
+  return {};
+}
+
+int64_t bc_octet_length(bc_ctx* cx, bc_view s) {
+  BC_GUARD_BEGIN
+  auto text = cx->resolve(s);
+  return text ? std::ssize(*text) : 0;
+  BC_GUARD_END(cx)
+  return {};
+}
+
+int64_t bc_position(bc_ctx* cx, bc_view s, bc_view needle) {
+  BC_GUARD_BEGIN
+  auto v = cx->resolve2(s, needle);
+  return v ? bytecask::sql::position_of(chars(v->second), chars(v->first)) : 0;
   BC_GUARD_END(cx)
   return {};
 }

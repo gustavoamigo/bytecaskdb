@@ -901,7 +901,6 @@ auto compare_constants(Constant x, Constant y, ast::ValueCompare op, std::int32_
 
 auto text_of(const Constant& c) -> std::string;
 
-
 // A date, time or timestamp cast to another type, as PostgreSQL casts it:
 // to text; to its own type; a timestamp or timestamptz to a date or a time
 // (read in UTC); a date to a timestamp or timestamptz; a timestamp to a
@@ -1203,28 +1202,7 @@ auto fold_nullif(const ast::Expr& e) -> Constant {
   return a;
 }
 
-// String functions and ||. Text is UTF-8 and counted in characters, as
-// PostgreSQL's is; UPPER and LOWER fold ASCII only, the layer's one
-// collation being COLLATE "C".
-
-auto utf8_width(std::string_view s, std::size_t i) -> std::size_t {
-  auto b = static_cast<unsigned char>(s[i]);
-  auto w = b < 0xC0 ? 1U : b < 0xE0 ? 2U : b < 0xF0 ? 3U : 4U;  // a stray continuation byte is a character of its own
-  return std::min<std::size_t>(w, s.size() - i);
-}
-
-auto char_count(std::string_view s) -> std::int64_t {
-  std::int64_t n = 0;
-  for (std::size_t i = 0; i < s.size(); i += utf8_width(s, i)) ++n;
-  return n;
-}
-
-// The byte offset of the character `n` characters in; s.size() past the end.
-auto char_offset(std::string_view s, std::int64_t n) -> std::size_t {
-  std::size_t i = 0;
-  while (n-- > 0 && i < s.size()) i += utf8_width(s, i);
-  return i;
-}
+// String functions and ||, over the text module's character helpers.
 
 [[noreturn]] void substring_error(std::int32_t pos) {
   throw SqlError{"negative substring length not allowed", pos, kSubstringError};
@@ -1257,41 +1235,6 @@ auto overlay_of(std::string_view s, std::string_view replacement, std::int32_t s
   if (!std::in_range<std::int32_t>(resume)) throw SqlError{"integer out of range", pos, kNumericValueOutOfRange};
   return substring_of(s, 1, start - 1, pos) + std::string{replacement} +
          substring_of(s, static_cast<std::int32_t>(resume), std::nullopt, pos);
-}
-
-// 1-based character position of the first `needle` in `s`, 0 if none; an
-// empty needle is found at 1.
-auto position_of(std::string_view needle, std::string_view s) -> std::int64_t {
-  auto at = s.find(needle);
-  return at == std::string_view::npos ? 0 : char_count(s.substr(0, at)) + 1;
-}
-
-// s without the characters of `set` from the front, the back, or both.
-auto trimmed(std::string_view s, std::string_view set, bool front, bool back) -> std::string {
-  auto in_set = [&](std::string_view ch) {
-    for (std::size_t i = 0; i < set.size(); i += utf8_width(set, i)) {
-      if (set.substr(i, utf8_width(set, i)) == ch) return true;
-    }
-    return false;
-  };
-  std::size_t b = 0;
-  std::size_t e = s.size();
-  while (front && b < e && in_set(s.substr(b, utf8_width(s, b)))) b += utf8_width(s, b);
-  while (back && e > b) {
-    auto i = e - 1;
-    while (i > b && (static_cast<unsigned char>(s[i]) & 0xC0) == 0x80) --i;
-    if (!in_set(s.substr(i, e - i))) break;
-    e = i;
-  }
-  return std::string{s.substr(b, e - b)};
-}
-
-auto ascii_case(std::string s, bool upper) -> std::string {
-  for (auto& ch : s) {
-    if (upper && ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 'a' + 'A');
-    if (!upper && ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
-  }
-  return s;
 }
 
 [[noreturn]] void no_function(const std::string& name, const std::vector<Constant>& args, std::int32_t pos) {
@@ -1703,6 +1646,7 @@ void params_in(const ast::Expr& e, std::uint32_t& n) {
   if (e.kind == ast::Expr::Kind::Param) n = std::max(n, e.param + 1);
   if (e.lhs) params_in(*e.lhs, n);
   if (e.rhs) params_in(*e.rhs, n);
+  for (const auto& a : e.args) params_in(a, n);  // a function's, CASE's, COALESCE's
 }
 
 void params_in(const ast::Compare& c, std::uint32_t& n) {
@@ -2389,6 +2333,38 @@ public:
       }
       return out;
     }
+    // The string functions of a value only run time gives: each argument
+    // text, as a $n is taken to be.
+    using Text = logical::Expr::Text;
+    static const std::array<std::pair<std::string_view, Text>, 9> kTextFunctions{{{"upper", Text::Upper},
+                                                                                 {"lower", Text::Lower},
+                                                                                 {"char_length", Text::CharLength},
+                                                                                 {"character_length", Text::CharLength},
+                                                                                 {"octet_length", Text::OctetLength},
+                                                                                 {"btrim", Text::Btrim},
+                                                                                 {"ltrim", Text::Ltrim},
+                                                                                 {"rtrim", Text::Rtrim},
+                                                                                 {"position", Text::Position}}};
+    if (auto f = std::ranges::find(kTextFunctions, e.func, &std::pair<std::string_view, Text>::first); f != kTextFunctions.end()) {
+      auto two = f->second == Text::Position;
+      auto trim = f->second == Text::Btrim || f->second == Text::Ltrim || f->second == Text::Rtrim;
+      auto lo = two ? 2U : 1U;
+      auto hi = two || trim ? 2U : 1U;
+      std::vector<logical::Expr> args;
+      for (const auto& a : e.args) args.push_back(arg(a, SqlType{SqlKind::Text}));
+      if (args.size() < lo || args.size() > hi || !std::ranges::all_of(args, [&](const logical::Expr& a) { return texty(a.type); })) {
+        std::string types;
+        for (const auto& a : args) types += (types.empty() ? "" : ", ") + pg_type_name(a.type);
+        // POSITION is grammar for pg_catalog.position, which PostgreSQL names so.
+        throw SqlError{"function " + std::string{two ? "pg_catalog." : ""} + e.func + "(" + types + ") does not exist", e.pos,
+                       kUndefinedFunction};
+      }
+      auto counts = f->second == Text::CharLength || f->second == Text::OctetLength || two;
+      auto out = logical::expr(logical::Expr::Kind::TextFn, SqlType{counts ? SqlKind::Integer : SqlKind::Text});
+      out.text = f->second;
+      out.args = std::move(args);
+      return out;
+    }
     if (e.func == "random") {
       // PostgreSQL 17's random(min, max) of integers, both bounds included.
       if (e.args.size() != 2) not_yet("random() other than random(min, max) of integers", e.pos);
@@ -2818,7 +2794,6 @@ public:
     }
     throw SqlError{"column \"" + e.column + "\" does not exist", e.pos, kUndefinedColumn};
   }
-
 
   // Gives parameter $n+1 a type from one use with `col`, which sets its
   // physical type and its SQL type. Every use must agree on both, whatever

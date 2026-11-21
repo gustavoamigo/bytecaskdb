@@ -64,13 +64,15 @@ struct ColumnRef {
 // a BOOLEAN, NULL where SQL's logic says unknown, over operands of any
 // value expression. Case and Coalesce are values of a select list only:
 // every branch is of the expression's type, or a numeric of a finer scale
-// below it, which the evaluator brings up. Concat and Substr, text built
+// below it, which the evaluator brings up. Concat, Substr and TextFn, built
 // at run time, are values of a select list (and of a procedure's
 // expressions) only.
 struct Expr {
   enum class Kind { Column, Param, Const, Add, Sub, Mul, Div, Compare, Aggregate, And, Or, Not, IsNull, Like, Truth, InSet, Case, Coalesce,
-                    Concat, Substr, Random, Mod, Neg, Abs };
+                    Concat, Substr, Random, Mod, Neg, Abs, TextFn };
   enum class Fn { Count, Sum, Min, Max, Avg };
+  // TextFn's function: PostgreSQL's of the same name, over UTF-8 text.
+  enum class Text { Upper, Lower, CharLength, OctetLength, Btrim, Ltrim, Rtrim, Position };
   Kind kind{Kind::Param};
   SqlType type{};
   ColumnRef col{};              // Column
@@ -79,6 +81,7 @@ struct Expr {
                                 // Like: the escape's code point, -1 for none; InSet: its subquery
   Op op{Op::Eq};                // Compare
   Fn fn{Fn::Count};             // Aggregate
+  Text text{Text::Upper};       // TextFn
   bool distinct{false};         // Aggregate: COUNT(DISTINCT arg)
   std::vector<Expr> args;       // Add, Sub, Mul, Div, Compare: two; Aggregate: none (COUNT(*)) or its argument;
                                 // And, Or: two or more; Not: one; IsNull: its column, or in a select list its
@@ -88,7 +91,8 @@ struct Expr {
                                 // Coalesce: two or more; Concat: two, text or an integer or DECIMAL (its
                                 // text); Substr: the text, the start, and the count if given (INTEGERs);
                                 // Random: its two bounds, both included; Mod: two, of the result's type and scale;
-                                // Neg, Abs: one, of the result's type
+                                // Neg, Abs: one, of the result's type; TextFn: the text, then the trim's
+                                // characters if given, or POSITION's needle
 
   [[nodiscard]] auto phys() const -> PhysType { return phys_type(type); }
 

@@ -177,13 +177,17 @@ kind the transformer doesn't take is refused with its position.
   goes away: *Expressions over columns*). Float branches of constants are
   refused. The output column is named `case`, `coalesce` or `nullif`.
 - **`||` and the string functions** fold constants. Of a column, a
-  parameter or a procedure's variable, `||` and `SUBSTRING` (and `substr`,
-  its call form) are select-list values built per row
-  (`Expr::Kind::Concat`, `Substr`; `bc_concat`, `bc_number_text`,
-  `bc_substr`): `||` of text with text, or with an integer or a `DECIMAL`
-  through its text as PostgreSQL prints it (`12.50`); `SUBSTRING(s FROM a
-  [FOR n])` in characters, as below. A `$n` beside `||` is `text`, as a
-  start or count `integer`. The other functions of non-constants are
+  parameter or a procedure's variable, `||`, `SUBSTRING` (and `substr`,
+  its call form), `UPPER`, `LOWER`, `TRIM`, `POSITION`, `CHAR_LENGTH`,
+  `CHARACTER_LENGTH` and `OCTET_LENGTH` are select-list values built per
+  row (`Expr::Kind::Concat`, `Substr`, `TextFn`; `bc_concat`,
+  `bc_number_text`, `bc_substr`, `bc_text_case`, `bc_trim`,
+  `bc_char_length`, `bc_octet_length`, `bc_position`): `||` of text with
+  text, or with an integer or a `DECIMAL` through its text as PostgreSQL
+  prints it (`12.50`); the others as below, the constant folds and the
+  plan API sharing one implementation (`sql/text.cppm`). A `$n` beside `||`
+  or as a string function's argument is `text`, as a start or count
+  `integer`. `OVERLAY` of non-constants, and any of them in a `WHERE`, are
   refused (42601, #671). The parser reads PostgreSQL's
   spellings as the calls the grammar makes of them: `TRIM([LEADING |
   TRAILING | BOTH] [chars FROM] s)` is `ltrim`, `rtrim` or `btrim` (spaces
@@ -586,8 +590,8 @@ That includes:
 - the quotient of a numeric other than constants, arithmetic and
   comparison of `REAL` and `DOUBLE PRECISION` as values, an expression in
   `ORDER BY`, `GROUP BY`, `SET` or an aggregated select list (#685, #686);
-- the string functions but `||` and `SUBSTRING` of columns and
-  parameters, `||` of a boolean, float or date value, `LENGTH`, `CONCAT`,
+- `OVERLAY` of columns and parameters, a string function in a `WHERE`,
+  `||` of a boolean, float or date value, `LENGTH`, `CONCAT`,
   `REPLACE`, the regular-expression `SUBSTRING`, `bytea` string functions
   (#671);
 - a cast of anything but a constant (a parameter beside a column of the

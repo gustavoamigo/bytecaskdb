@@ -9,6 +9,7 @@
 // (docs/frontend_design.md, *Literals*). Pure functions: no I/O, no state.
 
 module;
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <charconv>
@@ -58,6 +59,65 @@ private:
 // long) is left to the layer's range check, which reports it as PostgreSQL
 // does. Throws TextError.
 [[nodiscard]] auto from_text(std::string_view text, SqlType t, bool assigned_only) -> Datum;
+
+// Text functions of UTF-8 text, counted in characters as PostgreSQL's
+// are, shared by the binder's constant folds and the plan API's runtime
+// (bc_plan.h). UPPER and LOWER fold ASCII only, the layer's one collation
+// being COLLATE "C".
+
+inline auto utf8_width(std::string_view s, std::size_t i) -> std::size_t {
+  auto b = static_cast<unsigned char>(s[i]);
+  auto w = b < 0xC0 ? 1U : b < 0xE0 ? 2U : b < 0xF0 ? 3U : 4U;  // a stray continuation byte is a character of its own
+  return std::min<std::size_t>(w, s.size() - i);
+}
+
+inline auto char_count(std::string_view s) -> std::int64_t {
+  std::int64_t n = 0;
+  for (std::size_t i = 0; i < s.size(); i += utf8_width(s, i)) ++n;
+  return n;
+}
+
+// The byte offset of the character `n` characters in; s.size() past the end.
+inline auto char_offset(std::string_view s, std::int64_t n) -> std::size_t {
+  std::size_t i = 0;
+  while (n-- > 0 && i < s.size()) i += utf8_width(s, i);
+  return i;
+}
+
+// 1-based character position of the first `needle` in `s`, 0 if none; an
+// empty needle is found at 1.
+inline auto position_of(std::string_view needle, std::string_view s) -> std::int64_t {
+  auto at = s.find(needle);
+  return at == std::string_view::npos ? 0 : char_count(s.substr(0, at)) + 1;
+}
+
+// s without the characters of `set` from the front, the back, or both.
+inline auto trimmed(std::string_view s, std::string_view set, bool front, bool back) -> std::string {
+  auto in_set = [&](std::string_view ch) {
+    for (std::size_t i = 0; i < set.size(); i += utf8_width(set, i)) {
+      if (set.substr(i, utf8_width(set, i)) == ch) return true;
+    }
+    return false;
+  };
+  std::size_t b = 0;
+  std::size_t e = s.size();
+  while (front && b < e && in_set(s.substr(b, utf8_width(s, b)))) b += utf8_width(s, b);
+  while (back && e > b) {
+    auto i = e - 1;
+    while (i > b && (static_cast<unsigned char>(s[i]) & 0xC0) == 0x80) --i;
+    if (!in_set(s.substr(i, e - i))) break;
+    e = i;
+  }
+  return std::string{s.substr(b, e - b)};
+}
+
+inline auto ascii_case(std::string s, bool upper) -> std::string {
+  for (auto& ch : s) {
+    if (upper && ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 'a' + 'A');
+    if (!upper && ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+  }
+  return s;
+}
 
 }  // namespace bytecask::sql
 

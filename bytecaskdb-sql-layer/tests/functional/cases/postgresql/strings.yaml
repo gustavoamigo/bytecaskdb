@@ -188,8 +188,6 @@
 
 - name: UPPER and LOWER
   features: [E021-08]
-  # UPPER and LOWER of a column (#667)
-  unimplemented: true
   ordered: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR(20))
@@ -226,8 +224,6 @@
 
 - name: CHARACTER_LENGTH and OCTET_LENGTH
   features: [E021-04, E021-05]
-  # CHARACTER_LENGTH and OCTET_LENGTH of a column (#667)
-  unimplemented: true
   ordered: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR(20))
@@ -279,8 +275,6 @@
 
 - name: TRIM of spaces
   features: [E021-09]
-  # TRIM of a column (#667)
-  unimplemented: true
   ordered: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR(20))
@@ -311,8 +305,6 @@
 
 - name: POSITION of a substring
   features: [E021-11]
-  # POSITION of a column (#667)
-  unimplemented: true
   ordered: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR(20))
