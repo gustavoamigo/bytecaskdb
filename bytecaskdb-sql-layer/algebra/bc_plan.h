@@ -180,12 +180,14 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
    - each statement is bc_ctx_begin_txn, bc_ctx_run, bc_txn_add, then
      bc_ctx_reset. A statement refused before it ran with BC_E_LAYOUT and
      BC_L_INCOMPATIBLE did nothing, and may instead be reset and begun again;
-   - after any other failed statement, the transaction is only freed;
+   - after any other failed statement, the transaction is only freed, or
+     rolled back to a mark (bc_txn_rollback_to);
    - bc_txn_commit with no statement open, once.
 
    A statement that fails, or that takes what the transaction holds past
    max_bytes (BC_E_LIMIT), aborts the transaction at bc_txn_add: it releases
-   its snapshot and pin at once (bc_txn_catalog_version is then 0). An abort
+   its snapshot and pin at once (bc_txn_catalog_version is then 0), unless
+   a savepoint's mark keeps them (below). An abort
    and bc_txn_free detach the context, which keeps its error and its
    finished statement's results. bc_txn_commit touches no context and
    reports through the transaction (bc_txn_error, BC_E_UNKNOWN when the
@@ -231,8 +233,29 @@ typedef struct bc_hold bc_hold;
 bc_hold *bc_txn_hold(bc_txn *, bc_overlay *);
 void    bc_txn_hold_free(bc_hold *);
 void    bc_ctx_begin_hold(bc_ctx *, const bc_hold *, const bc_params *, bc_budget);
+/* Savepoints (docs/transaction_design.md, *Savepoints*). A mark is the
+   transaction as it stands between statements, with no context attached:
+   its overlay, shared copy-on-write as a pin's, and its guards, claims,
+   locks and tables. bc_txn_savepoint pushes one and returns its depth, 1
+   for the oldest; 0 when refused (an aborted or ended transaction, a
+   statement open) or out of memory, the transaction unchanged and
+   bc_txn_error saying why. It charges nothing: the first write after it
+   clones the overlay, and the copy the mark keeps counts against max_bytes
+   from that statement on, as a pin's does (BC_E_LIMIT at the call that
+   would pass it). An abort of a transaction with marks keeps its snapshot,
+   catalog and marks, and goes back to its newest mark.
+   bc_txn_rollback_to puts the transaction back as it stood at mark `depth`,
+   which stays, and drops the marks above it; it takes an aborted
+   transaction back to open. bc_txn_release drops mark `depth` and those
+   above it, keeping the writes since; it needs an open transaction. Both
+   leave the pins and the snapshot alone, return false for a mark that
+   does not exist or a statement open, changing nothing, and allocate
+   nothing. */
+uint32_t bc_txn_savepoint(bc_txn *);
+bool    bc_txn_rollback_to(bc_txn *, uint32_t depth);
+bool    bc_txn_release(bc_txn *, uint32_t depth);
 enum bc_commit_result bc_txn_commit(bc_txn *, bool sync);
-enum bc_error_code bc_txn_error(const bc_txn *);  /* of the last bc_txn_commit */
+enum bc_error_code bc_txn_error(const bc_txn *);  /* of the last bc_txn_commit, bc_txn_savepoint, bc_txn_rollback_to or bc_txn_release */
 const char *bc_txn_error_message(const bc_txn *);
 uint32_t bc_txn_error_detail(const bc_txn *);
 

@@ -65,8 +65,6 @@
 
 - name: a SAVEPOINT and ROLLBACK TO it
   features: [pg:savepoint]
-  # SAVEPOINT is not supported
-  unimplemented: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
   steps:
@@ -89,8 +87,6 @@
 
 - name: RELEASE SAVEPOINT keeps the work
   features: [pg:savepoint]
-  # SAVEPOINT is not supported
-  unimplemented: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
   steps:
@@ -300,7 +296,9 @@
     - sql: BEGIN
     - sql: SELECT id FROM t
       expected: []
+    # The block's own level (READ COMMITTED) changes nothing and is taken, as in PostgreSQL.
     - sql: SET TRANSACTION ISOLATION LEVEL READ COMMITTED
+    - sql: SET TRANSACTION ISOLATION LEVEL REPEATABLE READ
       error: "25001"
     - sql: ROLLBACK
   teardown:

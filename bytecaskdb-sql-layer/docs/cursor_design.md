@@ -5,8 +5,9 @@ for #663, sqltest E121). Phases 1 (the replay runner, #717), 2 (pinned state,
 #718), 3 (`DECLARE`, `FETCH` forward, `MOVE`, `CLOSE` in a transaction
 block, #719), 4 (`WITH HOLD` by holding the snapshot, `DECLARE` outside a
 block, #720), 5 (every `FETCH` direction, `SCROLL` and `NO SCROLL`, #721) and
-6 (`UPDATE` and `DELETE … WHERE CURRENT OF`, #722) are built; nothing else
-is. The owner's direction: a cursor is
+6 (`UPDATE` and `DELETE … WHERE CURRENT OF`, #722) are built, and so are
+cursors under `SAVEPOINT` and `ROLLBACK TO` (#727, *Cursors and savepoints*);
+nothing else is. The owner's direction: a cursor is
 evaluated lazily; holding the whole result in memory is not the design. The
 first phases build a **replay cursor** (the snapshot and a position; each
 `FETCH` re-runs the plan to its position, with no checkpoint or other
@@ -1036,10 +1037,22 @@ Still open:
    bound and the result cache size of earlier drafts are gone: cursors take
    no cap of their own, and the cache is parked. (Phase 7.)
 
+## Cursors and savepoints
+
+PostgreSQL's rule (owner decision for #727): `ROLLBACK TO` closes the
+cursors declared after the savepoint, hold cursors too; cursors declared
+before it stay open where they stand, a `FETCH` or `MOVE` since not undone,
+and a `CLOSE` since not undone either. A cursor whose own fetch aborted the
+transaction stays closed and *failed* (`Cursor::is_failed`): after the
+rollback, `FETCH` or `MOVE` on it is 55000, "portal "c" cannot be run", as
+in PostgreSQL, and `CLOSE` forgets it. A rollback past its declaration
+forgets it instead. While the transaction is aborted, cursors are kept open
+for the rollback and a fetch is 25P02. The mechanism, a count of cursors
+opened at each savepoint, is in `transaction_design.md`, *Savepoints*.
+
 ## Deferred
 
 - `FETCH LAST` and `BACKWARD` by a reverse run, without replay: #725.
-- Cursors under user `SAVEPOINT` / `ROLLBACK TO`: #727.
 - Spilling a cursor's sort or hash to disk: part of the layer-wide spill
   design (`planner_design.md`, *Memory*), not cursor-specific.
 - `pg_cursors` and `SHOW` wait on the system catalogs (#496).

@@ -1242,3 +1242,67 @@ TEST_CASE("cursor: a fetch and a window take ExecutionOptions: a set flag or a p
     txn.rollback();
   }
 }
+
+// #727, PostgreSQL's rule: a rollback to a savepoint closes the cursors
+// opened since it; those opened before stay open where they stand, but for
+// one whose own fetch failed.
+TEST_CASE("cursor: rollback_to closes the cursors opened since the savepoint; those before keep their place",
+          "[sql][api][txn][cursor][savepoint]") {
+  sql_test::TempDir dir{"api_cursor_savepoint"};
+  auto db = populated(dir);
+  auto txn = db->begin();
+  const auto& scan = db->prepare("SELECT id FROM t ORDER BY id");
+  auto before = txn.open_cursor(scan, {});
+  CHECK(before.fetch(2).rows.size() == 2);
+  txn.savepoint("s");
+  auto since = txn.open_cursor(scan, {});
+  auto held = txn.open_cursor(scan, {}, Holdability::Hold);
+  CHECK(before.fetch(1).rows == RowVec{{std::int64_t{3}}});  // a fetch is not undone
+  insert(txn, 100);
+  SECTION("after a successful statement") {}
+  SECTION("after a failed one") {
+    CHECK_THROWS_AS(txn.execute("INSERT INTO t VALUES ($1, $2, $3)", {std::int64_t{1}, sql_test::bytes("x"), std::int64_t{1}}),
+                    ExecError);
+    REQUIRE(txn.is_aborted());
+    CHECK(before.is_open());  // kept for the rollback
+    CHECK_THROWS_AS(before.fetch(1), TransactionAborted);
+  }
+  txn.rollback_to("s");
+  CHECK_FALSE(since.is_open());
+  CHECK_FALSE(held.is_open());
+  CHECK_FALSE(since.is_failed());
+  CHECK(before.is_open());
+  CHECK(before.position() == 3);
+  CHECK(before.fetch(1).rows == RowVec{{std::int64_t{4}}});
+  CHECK(txn.commit() == CommitOutcome::Committed);
+  CHECK(db->execute("SELECT id FROM t WHERE id = $1", {std::int64_t{100}}).rows.empty());
+}
+
+TEST_CASE("cursor: a cursor whose own fetch failed stays closed after rollback_to, failed, until closed",
+          "[sql][api][txn][cursor][savepoint]") {
+  sql_test::TempDir dir{"api_cursor_savepoint_failed"};
+  auto db = populated(dir);
+  auto txn = db->begin();
+  auto bad = txn.open_cursor(db->prepare("SELECT 100 / (qty - qty) FROM t"), {});
+  auto good = txn.open_cursor(db->prepare("SELECT id FROM t ORDER BY id"), {});
+  txn.savepoint("s");
+  CHECK_THROWS_AS(bad.fetch(1), ExecError);
+  CHECK(txn.is_aborted());
+  CHECK(bad.is_failed());
+  CHECK_FALSE(bad.is_open());
+  txn.rollback_to("s");
+  CHECK(bad.is_failed());  // declared before the savepoint: it cannot be run
+  CHECK_THROWS_AS(bad.fetch(1), std::logic_error);
+  CHECK(good.fetch(1).rows == RowVec{{std::int64_t{1}}});
+  bad.close();
+  CHECK_FALSE(bad.is_failed());
+  // One declared after the savepoint is forgotten by the rollback.
+  txn.savepoint("t");
+  auto later = txn.open_cursor(db->prepare("SELECT 100 / (qty - qty) FROM t"), {});
+  CHECK_THROWS_AS(later.fetch(1), ExecError);
+  CHECK(later.is_failed());
+  txn.rollback_to("t");
+  CHECK_FALSE(later.is_failed());
+  CHECK(good.fetch(1).rows == RowVec{{std::int64_t{2}}});
+  CHECK(txn.commit() == CommitOutcome::Committed);
+}

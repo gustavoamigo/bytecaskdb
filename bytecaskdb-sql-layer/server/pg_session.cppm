@@ -156,12 +156,19 @@ SessionError::~SessionError() = default;
 
 // SetEncoding is SET client_encoding, the one SET taken: libpq's
 // PQsetClientEncoding sends it, and pgtcl's pg_connect calls that.
-enum class Control { Begin, Commit, Rollback, SetEncoding, SetTransaction };
+// Savepoint, RollbackTo and Release are SAVEPOINT, ROLLBACK TO SAVEPOINT and
+// RELEASE SAVEPOINT, on the explicit block's transaction.
+enum class Control { Begin, Commit, Rollback, SetEncoding, SetTransaction, Savepoint, RollbackTo, Release };
 
-// SET TRANSACTION's modes. SERIALIZABLE is refused when the statement is read,
-// so an isolation level that gets here is one the snapshot already gives.
+// The isolation levels a block may name. SERIALIZABLE is refused when the
+// statement is read, so a level here is one the snapshot already gives; the
+// session keeps it only to tell, as PostgreSQL does, whether a SET TRANSACTION
+// changes it.
+enum class IsolationLevel { ReadUncommitted, ReadCommitted, RepeatableRead };
+
+// SET TRANSACTION's modes.
 struct TransactionModes {
-  bool isolation{false};           // an ISOLATION LEVEL was given
+  std::optional<IsolationLevel> isolation;  // an ISOLATION LEVEL was given
   std::optional<bool> read_only;   // READ ONLY (true) or READ WRITE (false)
 };
 
@@ -179,6 +186,7 @@ struct Classified {
   TransactionModes modes;  // SetTransaction
   std::optional<ast::CursorStatement> cursor;  // Cursor: DECLARE, FETCH, MOVE or CLOSE
   std::optional<ast::Call> call;               // Call
+  std::string name;                            // Savepoint, RollbackTo and Release: the savepoint's, folded
 };
 
 // HammerDB's monitor reads its transaction count with this query alone,
@@ -315,10 +323,15 @@ auto transaction_modes(std::string_view sql, std::size_t first) -> TransactionMo
       if (at(2) == "SERIALIZABLE") {
         throw SessionError("ISOLATION LEVEL SERIALIZABLE is not supported: transactions run at snapshot isolation", "0A000");
       }
-      auto level = (at(2) == "REPEATABLE" && at(3) == "READ") ||
-                   (at(2) == "READ" && (at(3) == "COMMITTED" || at(3) == "UNCOMMITTED"));
-      if (!level) throw SessionError("syntax error at or near \"" + std::string{at(2)} + "\"", "42601");
-      modes.isolation = true;
+      if (at(2) == "REPEATABLE" && at(3) == "READ") {
+        modes.isolation = IsolationLevel::RepeatableRead;
+      } else if (at(2) == "READ" && at(3) == "COMMITTED") {
+        modes.isolation = IsolationLevel::ReadCommitted;
+      } else if (at(2) == "READ" && at(3) == "UNCOMMITTED") {
+        modes.isolation = IsolationLevel::ReadUncommitted;
+      } else {
+        throw SessionError("syntax error at or near \"" + std::string{at(2)} + "\"", "42601");
+      }
       i += 4;
     } else if (at(0) == "READ" && (at(1) == "ONLY" || at(1) == "WRITE")) {
       modes.read_only = at(1) == "ONLY";
@@ -364,6 +377,21 @@ auto classify(std::string_view text, const char* several_state, std::string_view
   if (w == "COMMIT" || w == "END") {
     only(1);
     return {Classified::Kind::Control, Control::Commit, {}, {}};
+  }
+  // SAVEPOINT name, RELEASE [SAVEPOINT] name, ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] name:
+  // read by PostgreSQL's grammar, which folds the name.
+  auto rollback_to = w == "ROLLBACK" && words.size() > 1 &&
+                     (words[1] == "TO" || (words.size() > 2 && (words[1] == "WORK" || words[1] == "TRANSACTION") && words[2] == "TO"));
+  if (w == "SAVEPOINT" || w == "RELEASE" || rollback_to) {
+    auto sp = ast::parse_savepoint(sql);
+    if (!sp) throw SessionError("syntax error at or near \"" + w + "\"", "42601");
+    using Kind = ast::SavepointStatement::Kind;
+    auto control = sp->kind == Kind::Savepoint ? Control::Savepoint : sp->kind == Kind::Release ? Control::Release : Control::RollbackTo;
+    Classified c;
+    c.kind = Classified::Kind::Control;
+    c.control = control;
+    c.name = std::move(sp->name);
+    return c;
   }
   if (w == "ROLLBACK" || w == "ABORT") {
     only(1);
@@ -421,7 +449,7 @@ auto classify(std::string_view text, const char* several_state, std::string_view
     out.kind = Classified::Kind::Stats;
     return out;
   }
-  for (const auto* word : {"SET", "SHOW", "RESET", "PREPARE", "EXECUTE", "DEALLOCATE", "SAVEPOINT", "RELEASE", "COPY",
+  for (const auto* word : {"SET", "SHOW", "RESET", "PREPARE", "EXECUTE", "DEALLOCATE", "COPY",
                            "DISCARD", "LISTEN", "UNLISTEN", "NOTIFY", "LOCK"}) {
     if (w == word) throw SessionError(w + " is not supported", "0A000");
   }
@@ -509,6 +537,7 @@ struct Prepared {
   Control control{Control::Begin};
   std::string encoding;            // SetEncoding
   TransactionModes modes;          // SetTransaction
+  std::string name;                // Savepoint, RollbackTo, Release
   const Statement* stmt{nullptr};  // Sql, and a DECLARE's query: from Database::prepare, valid until close
   std::optional<ast::CursorStatement> cursor;  // Cursor
 };
@@ -716,6 +745,7 @@ public:
     close_cursors();  // a hold cursor releases its snapshot with the session
     if (txn_) txn_->rollback();
     txn_.reset();
+    savepoints_.clear();
     if (implicit_) implicit_->rollback();
     implicit_.reset();
     portals_.clear();
@@ -1017,9 +1047,11 @@ private:
 
   // An error inside a block: an explicit one fails (E) until COMMIT or
   // ROLLBACK, whatever raised it; an implicit one is rolled back.
+  // The explicit block's transaction is aborted, not ended: with
+  // savepoints it keeps its snapshot for a ROLLBACK TO.
   void fail_block() noexcept {
     if (in_block_) {
-      if (txn_) txn_->rollback();
+      if (txn_) txn_->fail();
       failed_ = true;
     }
     if (implicit_) {
@@ -1053,9 +1085,13 @@ private:
     });
   }
 
-  // Forgets the cursors a rollback or abort closed.
+  // Forgets the cursors a rollback or abort closed. A cursor whose own
+  // fetch failed is kept, for 55000, until it is closed or the block ends.
   void forget_closed_cursors() noexcept {
-    std::erase_if(cursors_, [](const auto& entry) { return !entry.second.cursor.is_open(); });
+    std::erase_if(cursors_, [](const auto& entry) {
+      const auto& c = entry.second.cursor;
+      return !c.is_open() && !c.is_failed();
+    });
   }
 
   // The session's end, by a disconnect, Terminate or the server's shutdown:
@@ -1065,10 +1101,52 @@ private:
     cursors_.clear();
   }
 
-  // BEGIN, COMMIT, ROLLBACK, SET TRANSACTION or SET client_encoding; returns the command tag.
+  // The newest of the block's savepoints named `name`, if any: the
+  // transaction's own list decides, and reports 3B001, when there is none.
+  [[nodiscard]] auto find_savepoint(const std::string& name) const -> std::optional<std::size_t> {
+    for (auto i = savepoints_.size(); i > 0; --i) {
+      if (savepoints_[i - 1].name == name) return i - 1;
+    }
+    return std::nullopt;
+  }
+
+  // SAVEPOINT, ROLLBACK TO and RELEASE are for an explicit block, as in PostgreSQL.
+  void require_block(const char* what) const {
+    if (!in_block_) throw SessionError(std::string{what} + " can only be used in transaction blocks", "25P01");
+  }
+
+  // BEGIN, COMMIT, ROLLBACK, SET TRANSACTION, SET client_encoding, SAVEPOINT,
+  // ROLLBACK TO or RELEASE; returns the command tag.
   // Ending a block drops every portal: a caller holds none across it.
-  auto run_control(Control c, const std::string& encoding, TransactionModes modes) -> std::string {
+  auto run_control(Control c, const std::string& encoding, TransactionModes modes, const std::string& savepoint)
+      -> std::string {
     switch (c) {
+      case Control::Savepoint:
+        refuse_if_failed();
+        require_block("SAVEPOINT");
+        txn_->savepoint(savepoint);
+        savepoints_.push_back({savepoint, read_only_});
+        return "SAVEPOINT";
+      case Control::Release: {
+        refuse_if_failed();
+        require_block("RELEASE SAVEPOINT");
+        txn_->release(savepoint);  // 3B001 for a name it has not
+        auto k = find_savepoint(savepoint).value_or(0);
+        // PostgreSQL ends each released subtransaction, which restores its read-only mode.
+        read_only_ = savepoints_.at(k).read_only;
+        savepoints_.erase(savepoints_.begin() + static_cast<std::ptrdiff_t>(k), savepoints_.end());
+        return "RELEASE";
+      }
+      case Control::RollbackTo: {
+        require_block("ROLLBACK TO SAVEPOINT");  // in a failed block too: this is what ends the failure
+        txn_->rollback_to(savepoint);
+        auto k = find_savepoint(savepoint).value_or(0);
+        read_only_ = savepoints_.at(k).read_only;
+        savepoints_.erase(savepoints_.begin() + static_cast<std::ptrdiff_t>(k + 1), savepoints_.end());
+        failed_ = false;
+        forget_closed_cursors();
+        return "ROLLBACK";
+      }
       case Control::Begin:
         if (in_block_) {
           refuse_if_failed();
@@ -1083,12 +1161,15 @@ private:
           txn_started_ = std::chrono::steady_clock::now();
           start_modes();
         }
+        savepoints_.clear();
         in_block_ = true;
         failed_ = false;
         if (modes.read_only) read_only_ = *modes.read_only;
+        if (modes.isolation) isolation_ = *modes.isolation;
         return "BEGIN";
       case Control::Commit: {
         end_transaction();
+        savepoints_.clear();
         std::optional<Transaction> t;
         if (in_block_) {
           in_block_ = false;
@@ -1113,15 +1194,25 @@ private:
           warning("25P01", "SET TRANSACTION can only be used in transaction blocks");
           return "SET";
         }
-        if (modes.isolation && block_used_) {
-          throw SessionError("SET TRANSACTION ISOLATION LEVEL must be called before any query", "25001");
+        // As PostgreSQL's check_transaction_isolation: only a change of level is refused.
+        if (modes.isolation && *modes.isolation != isolation_) {
+          if (block_used_) {
+            throw SessionError("SET TRANSACTION ISOLATION LEVEL must be called before any query", "25001");
+          }
+          if (!savepoints_.empty()) {
+            throw SessionError("SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction", "25001");
+          }
         }
         if (modes.read_only) {
+          if (!*modes.read_only && read_only_ && !savepoints_.empty()) {
+            throw SessionError("cannot set transaction read-write mode inside a read-only transaction", "25001");
+          }
           if (!*modes.read_only && read_only_ && block_used_) {
             throw SessionError("transaction read-write mode must be set before any query", "25001");
           }
           read_only_ = *modes.read_only;
         }
+        if (modes.isolation) isolation_ = *modes.isolation;
         return "SET";
       case Control::SetEncoding:
         refuse_if_failed();
@@ -1133,6 +1224,7 @@ private:
         return "SET";
       case Control::Rollback:
         end_transaction();
+        savepoints_.clear();
         if (in_block_) {
           if (txn_) txn_->rollback();
           txn_.reset();
@@ -1175,10 +1267,12 @@ private:
     return &stmt;
   }
 
-  auto find_cursor(const std::string& name) -> SessionCursor& {
+  // A cursor whose fetch failed cannot be run (55000) but can be closed: `to_close`.
+  auto find_cursor(const std::string& name, bool to_close = false) -> SessionCursor& {
     forget_closed_cursors();
     auto it = cursors_.find(name);
     if (it == cursors_.end()) throw SessionError("cursor \"" + name + "\" does not exist", "34000");
+    if (!to_close && it->second.cursor.is_failed()) throw SessionError("portal \"" + name + "\" cannot be run", "55000");
     return it->second;
   }
 
@@ -1261,7 +1355,7 @@ private:
         cursors_.clear();
         out.tag = "CLOSE CURSOR ALL";
       } else {
-        auto& cursor = find_cursor(x.name);
+        auto& cursor = find_cursor(x.name, true);
         cursor.cursor.close();
         cursors_.erase(x.name);
         out.tag = "CLOSE CURSOR";
@@ -1329,7 +1423,7 @@ private:
           complete(reply.tag);
           break;
         }
-        case Classified::Kind::Control: complete(run_control(c.control, c.encoding, c.modes)); break;
+        case Classified::Kind::Control: complete(run_control(c.control, c.encoding, c.modes, c.name)); break;
         case Classified::Kind::Stats: reply_stats(true); break;
         case Classified::Kind::Call: run_call(c); break;
         case Classified::Kind::Stat: {
@@ -1423,7 +1517,7 @@ private:
     if (c.kind == Classified::Kind::Call || c.kind == Classified::Kind::Stat) {
       throw SessionError("this statement runs as a simple Query, not as a prepared statement", "0A000");
     }
-    Prepared p{c.kind, c.control, c.encoding, c.modes, nullptr, std::move(c.cursor)};
+    Prepared p{c.kind, c.control, c.encoding, c.modes, c.name, nullptr, std::move(c.cursor)};
     if (c.kind == Classified::Kind::Stats) refuse_if_failed();
     if (c.kind == Classified::Kind::Cursor) {
       refuse_if_failed();
@@ -1586,8 +1680,8 @@ private:
       return true;
     }
     if (p.kind == Classified::Kind::Control) {
-      auto [control, encoding, modes] = std::tuple{p.control, p.encoding, p.modes};  // run_control may drop the portal
-      complete(run_control(control, encoding, modes));
+      auto [control, encoding, modes, savepoint] = std::tuple{p.control, p.encoding, p.modes, p.name};  // run_control may drop the portal
+      complete(run_control(control, encoding, modes, savepoint));
       return true;
     }
     if (p.kind == Classified::Kind::Stats) {
@@ -1646,9 +1740,11 @@ private:
     complete(command_tag(stmt.command(), rows));
   }
 
-  // A new transaction starts with PostgreSQL's defaults: read write, no query yet.
+  // A new transaction starts with PostgreSQL's defaults: read write, READ
+  // COMMITTED, no query yet.
   void start_modes() {
     read_only_ = false;
+    isolation_ = IsolationLevel::ReadCommitted;
     block_used_ = false;
   }
 
@@ -1717,7 +1813,15 @@ private:
   std::map<std::string, Prepared> statements_;
   std::map<std::string, Portal> portals_;
   std::map<std::string, SessionCursor> cursors_;  // the block's cursors; they share the portals' namespace
+  // The explicit block's savepoints, oldest first, each with the read-only
+  // mode it was taken in: PostgreSQL's subtransaction restores it when it ends.
+  struct SessionSavepoint {
+    std::string name;
+    bool read_only{false};
+  };
+  std::vector<SessionSavepoint> savepoints_;
   bool read_only_{false};   // SET TRANSACTION READ ONLY, for the block that is open
+  IsolationLevel isolation_{IsolationLevel::ReadCommitted};  // the open block's named level
   bool block_used_{false};  // the open block has run a statement
   std::optional<Transaction> txn_;       // the explicit block's, from BEGIN
   std::optional<Transaction> implicit_;  // an extended block of several statements, outside BEGIN

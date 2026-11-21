@@ -1008,3 +1008,113 @@ TEST_CASE("transactions: an allocation failure in a statement or the commit is B
   CHECK(!got.contains(3));
   check_indexes_exact(f);
 }
+
+// Savepoints (docs/transaction_design.md, *Savepoints*): a mark restores the
+// overlay, guards, claims and locks of its moment; an abort with marks keeps
+// the snapshot and goes back to the newest; release keeps the writes.
+TEST_CASE("transactions: a rollback to a mark undoes the statements since it, and the mark stays", "[sql][txn]") {
+  Fixture f;
+  create_w(f);
+  TxnPtr txn{f};
+  auto row = [](std::int64_t id, const char* b) {
+    return std::vector<bc_value>{id, id, bytes(b), id};
+  };
+  REQUIRE(stmt(f, txn.p, insert_w, row(1, "a")).error == BC_OK);
+  CHECK(bc_txn_savepoint(txn.p) == 1);
+  REQUIRE(stmt(f, txn.p, insert_w, row(2, "b")).error == BC_OK);
+  CHECK(bc_txn_savepoint(txn.p) == 2);
+  REQUIRE(stmt(f, txn.p, delete_w, {std::int64_t{1}}).error == BC_OK);
+  CHECK(stmt(f, txn.p, exists_w, {std::int64_t{1}}).affected == 0);
+  CHECK(bc_txn_rollback_to(txn.p, 1));
+  CHECK(stmt(f, txn.p, exists_w, {std::int64_t{1}}).affected == 1);
+  CHECK(stmt(f, txn.p, exists_w, {std::int64_t{2}}).affected == 0);
+  CHECK_FALSE(bc_txn_rollback_to(txn.p, 2));  // the marks above went
+  CHECK(bc_txn_error(txn.p) == BC_E_HANDLE);
+  // The mark stays: b, which the rolled back statement had claimed, is free.
+  REQUIRE(stmt(f, txn.p, insert_w, row(3, "b")).error == BC_OK);
+  CHECK(bc_txn_rollback_to(txn.p, 1));
+  REQUIRE(stmt(f, txn.p, insert_w, row(4, "d")).error == BC_OK);
+  CHECK(commit(f, txn.p) == BC_COMMITTED);
+  auto got = stored(f);
+  CHECK(got.size() == 2);
+  CHECK(got.contains(1));
+  CHECK(got.contains(4));
+  check_indexes_exact(f);
+}
+
+TEST_CASE("transactions: an abort with a mark keeps the snapshot, and a rollback to the mark reopens it",
+          "[sql][txn]") {
+  Fixture f;
+  create_w(f);
+  TxnPtr txn{f};
+  auto row = [](std::int64_t id, const char* b) {
+    return std::vector<bc_value>{id, bc_value{}, bytes(b), id};
+  };
+  REQUIRE(stmt(f, txn.p, insert_w, row(1, "x")).error == BC_OK);
+  auto v = bc_txn_catalog_version(txn.p);
+  REQUIRE(bc_txn_savepoint(txn.p) == 1);
+  REQUIRE(stmt(f, txn.p, insert_w, row(2, "y")).error == BC_OK);
+  CHECK(stmt(f, txn.p, insert_w, row(3, "x")).error == BC_E_CONSTRAINT);  // aborts
+  CHECK(bc_txn_catalog_version(txn.p) == v);                              // the mark keeps the pin
+  CHECK(stmt(f, txn.p, exists_w, {std::int64_t{1}}).error == BC_E_HANDLE);
+  CHECK(bc_txn_savepoint(txn.p) == 0);  // refused while aborted, changing nothing
+  CHECK_FALSE(bc_txn_release(txn.p, 1));
+  // A row committed since the snapshot stays unseen after the rollback: same snapshot.
+  REQUIRE(autocommit(f, insert_w, {std::int64_t{9}, bc_value{}, bc_value{}, std::int64_t{9}}) == BC_COMMITTED);
+  CHECK(bc_txn_rollback_to(txn.p, 1));
+  CHECK(stmt(f, txn.p, exists_w, {std::int64_t{9}}).affected == 0);
+  CHECK(stmt(f, txn.p, exists_w, {std::int64_t{2}}).affected == 0);
+  REQUIRE(stmt(f, txn.p, insert_w, row(3, "z")).error == BC_OK);
+  CHECK(commit(f, txn.p) == BC_COMMITTED);
+  auto got = stored(f);
+  CHECK(got.size() == 3);  // 1, 3, and 9 from the autocommit
+  CHECK_FALSE(got.contains(2));
+  check_indexes_exact(f);
+}
+
+TEST_CASE("transactions: a release keeps the writes since the mark and drops the marks from it up", "[sql][txn]") {
+  Fixture f;
+  create_w(f);
+  TxnPtr txn{f};
+  REQUIRE(bc_txn_savepoint(txn.p) == 1);
+  REQUIRE(stmt(f, txn.p, insert_w, {std::int64_t{1}, bc_value{}, bc_value{}, std::int64_t{1}}).error == BC_OK);
+  REQUIRE(bc_txn_savepoint(txn.p) == 2);
+  REQUIRE(stmt(f, txn.p, insert_w, {std::int64_t{2}, bc_value{}, bc_value{}, std::int64_t{2}}).error == BC_OK);
+  CHECK(bc_txn_release(txn.p, 1));
+  CHECK_FALSE(bc_txn_rollback_to(txn.p, 1));  // no mark is left
+  CHECK(bc_txn_savepoint(txn.p) == 1);
+  CHECK(commit(f, txn.p) == BC_COMMITTED);
+  CHECK(stored(f).size() == 2);
+}
+
+TEST_CASE("transactions: the copy a mark keeps is charged at the first write after it, never at the mark",
+          "[sql][txn]") {
+  Fixture f;
+  create_w(f);
+  // A bound the overlay fits in once, not twice.
+  TxnPtr txn{f, 65536};
+  auto big = [](std::int64_t id) {
+    return std::vector<bc_value>{id, id, bytes(std::string(200, 'x') + std::to_string(id)), id};
+  };
+  // How many such rows a transaction of this bound holds.
+  auto fit = std::int64_t{0};
+  {
+    TxnPtr probe{f, 65536};
+    while (stmt(f, probe.p, insert_w, big(fit)).error == BC_OK) ++fit;
+  }
+  REQUIRE(fit >= 5);
+  // Past half of it: a second copy cannot fit, one more row can.
+  const auto n = fit * 4 / 5;
+  for (std::int64_t i = 0; i < n; ++i) REQUIRE(stmt(f, txn.p, insert_w, big(i)).error == BC_OK);
+  // Each mark charges nothing: many of them, with no write between, all fit.
+  for (std::uint32_t i = 1; i <= 100; ++i) REQUIRE(bc_txn_savepoint(txn.p) == i);
+  // A write would keep a copy of the overlay for the marks: past the bound,
+  // the statement fails at its call, and the transaction goes back to the newest mark.
+  CHECK(stmt(f, txn.p, insert_w, big(1000)).error == BC_E_LIMIT);
+  CHECK(bc_txn_rollback_to(txn.p, 1));
+  CHECK(bc_txn_release(txn.p, 1));
+  // Without the marks, the same write fits.
+  CHECK(stmt(f, txn.p, insert_w, big(1000)).error == BC_OK);
+  CHECK(commit(f, txn.p) == BC_COMMITTED);
+  CHECK(stored(f).size() == static_cast<std::size_t>(n) + 1);
+}

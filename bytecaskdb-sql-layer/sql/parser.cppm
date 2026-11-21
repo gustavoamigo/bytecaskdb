@@ -52,6 +52,10 @@ export namespace bytecask::sql::ast {
 // does, and for a named or VARIADIC argument.
 [[nodiscard]] auto parse_call(std::string_view sql) -> std::optional<Call>;
 
+// Parses a SAVEPOINT, ROLLBACK TO or RELEASE; nullopt for any other
+// statement. Throws SqlError as parse() does.
+[[nodiscard]] auto parse_savepoint(std::string_view sql) -> std::optional<SavepointStatement>;
+
 }  // namespace bytecask::sql::ast
 
 namespace bytecask::sql::ast {
@@ -1904,6 +1908,27 @@ auto parse_call(std::string_view sql) -> std::optional<Call> {
     out.args.push_back(expr(f->args[i]));
   }
   return out;
+}
+
+auto parse_savepoint(std::string_view sql) -> std::optional<SavepointStatement> {
+  std::string text{sql};
+  ParseResources res;
+  res.raw = pg_query_parse_protobuf(text.c_str());
+  if (res.raw.error != nullptr) {
+    reject(res.raw.error->message, res.raw.error->cursorpos > 0 ? res.raw.error->cursorpos - 1 : -1);
+  }
+  res.tree = pg_query__parse_result__unpack(nullptr, res.raw.parse_tree.len,
+                                            reinterpret_cast<const std::uint8_t*>(res.raw.parse_tree.data));
+  if (res.tree == nullptr) reject("unreadable parse tree", -1);
+  if (res.tree->n_stmts != 1) return std::nullopt;
+  const auto* n = res.tree->stmts[0]->stmt;
+  if (n->node_case != PG_QUERY__NODE__NODE_TRANSACTION_STMT) return std::nullopt;
+  const auto* t = n->transaction_stmt;
+  using Kind = SavepointStatement::Kind;
+  if (t->kind == PG_QUERY__TRANSACTION_STMT_KIND__TRANS_STMT_SAVEPOINT) return SavepointStatement{Kind::Savepoint, t->savepoint_name};
+  if (t->kind == PG_QUERY__TRANSACTION_STMT_KIND__TRANS_STMT_ROLLBACK_TO) return SavepointStatement{Kind::RollbackTo, t->savepoint_name};
+  if (t->kind == PG_QUERY__TRANSACTION_STMT_KIND__TRANS_STMT_RELEASE) return SavepointStatement{Kind::Release, t->savepoint_name};
+  return std::nullopt;
 }
 
 auto parse(std::string_view sql) -> Statement {

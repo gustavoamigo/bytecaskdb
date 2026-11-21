@@ -641,6 +641,15 @@ struct CloseCursor {
 
 using CursorStatement = std::variant<DeclareCursor, FetchCursor, CloseCursor>;
 
+// SAVEPOINT name, ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] name or
+// RELEASE [SAVEPOINT] name (docs/transaction_design.md, *Savepoints*). Not a
+// Statement: the session runs it on the block's transaction, as it runs
+// BEGIN. The name as PostgreSQL reads it: folded to lower case unless quoted.
+struct SavepointStatement {
+  enum class Kind : std::uint8_t { Savepoint, RollbackTo, Release } kind{Kind::Savepoint};
+  std::string name;
+};
+
 // CALL name(arg, …) (docs/procedures_design.md, *Wire protocol for CALL*).
 // Not a Statement: the session runs it through the embedded API's call, as
 // it runs BEGIN. Each argument is an expression of constants, bound against

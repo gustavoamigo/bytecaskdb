@@ -479,6 +479,11 @@ struct CursorState {
   // or for a query that is no simple scan.
   std::optional<std::vector<Value>> key;
   bool aborted{false};  // closed by its transaction's abort
+  // Its own fetch failed (docs/cursor_design.md, *Cursors and savepoints*):
+  // closed, and kept in its transaction's list so that a rollback to a
+  // savepoint taken before it can tell it from a cursor never declared.
+  std::atomic<bool> failed{false};
+  std::uint64_t seq{0};  // its transaction's count of cursors opened before it
   // The compiled plan the cursor was opened on, held so that a recompile
   // cannot change the plan or its order.
   std::shared_ptr<const Statement::Compiled> compiled;
@@ -511,6 +516,14 @@ struct CursorState {
   void close() noexcept;
 };
 
+// A savepoint of a transaction: its name, and how many cursors the
+// transaction had opened when it was taken. The runtime's mark of the same
+// depth holds the rest.
+struct Savepoint {
+  std::string name;
+  std::uint64_t cursors{0};
+};
+
 // A transaction's resources, on the heap so that a moved Transaction keeps
 // them where the Database's list of open transactions finds them.
 struct TxnHandle {
@@ -519,6 +532,8 @@ struct TxnHandle {
   std::atomic<TxnState> state{TxnState::Ended};  // close() ends it from another thread
   std::int64_t started_us{0};  // the transaction's time: what CURRENT_DATE, LOCALTIME and LOCALTIMESTAMP read in it
   std::vector<std::shared_ptr<CursorState>> cursors;  // open; closed before the snapshot is released
+  std::uint64_t cursors_opened{0};
+  std::vector<Savepoint> savepoints;  // oldest first, one per runtime mark
 
   // The transaction committed: its hold cursors outlive it, the others close.
   void commit_cursors() noexcept {
@@ -535,14 +550,23 @@ struct TxnHandle {
   void release() noexcept {
     for (const auto& c : cursors) c->close();
     cursors.clear();
+    savepoints.clear();
     bc_ctx_free(cx);
     bc_txn_free(txn);  // a transaction not committed writes nothing
     cx = nullptr;
     txn = nullptr;
   }
   // Aborted: what it held is freed now, the snapshot that keeps disk blocks
-  // first. Only the state is left, for rollback() or commit() to end.
+  // first. Only the state is left, for rollback() or commit() to end. A
+  // transaction with savepoints keeps its snapshot, its cursors and its
+  // marks instead, for rollback_to(): the context is reset, which the
+  // runtime's abort, if the statement got that far, leaves at the newest mark.
   void abort() noexcept {
+    if (!savepoints.empty()) {
+      bc_ctx_reset(cx);
+      state.store(TxnState::Aborted);
+      return;
+    }
     for (const auto& c : cursors) c->aborted = true;
     release();
     state.store(TxnState::Aborted);
@@ -623,6 +647,11 @@ public:
   // After the last row: a forward fetch returns none.
   [[nodiscard]] auto at_end() const noexcept -> bool { return s_ && s_->after_end(); }
   [[nodiscard]] auto is_open() const noexcept -> bool { return s_ && s_->live.load(); }
+  // Its own fetch failed, and it is closed: in a transaction rolled back to a
+  // savepoint since, it cannot be run (PostgreSQL's 55000), until it is
+  // closed or the transaction ends. A rollback to a savepoint taken before
+  // it was opened forgets it.
+  [[nodiscard]] auto is_failed() const noexcept -> bool { return s_ && s_->failed.load(); }
   // Releases what it pins; the transaction goes on. Once closed, does nothing.
   void close() noexcept;
 
@@ -724,6 +753,39 @@ public:
   [[nodiscard]] auto commit() -> CommitOutcome;
   // Ends the transaction; nothing it wrote is kept. Once ended, does nothing.
   void rollback() noexcept;
+  // Savepoints (docs/transaction_design.md, *Savepoints*), as PostgreSQL's
+  // SAVEPOINT, ROLLBACK TO SAVEPOINT and RELEASE SAVEPOINT. Names are matched
+  // exactly (the caller folds case), and a name taken again hides the older
+  // one until it is released or rolled back past.
+  //
+  // savepoint() marks the transaction as it stands. It runs nothing, takes
+  // no snapshot and charges nothing to TransactionOptions::max_bytes; the
+  // first statement after it that writes keeps a copy of the transaction's
+  // writes for it, charged to that bound from then on. As execute, it throws
+  // TransactionAborted in an aborted transaction.
+  //
+  // rollback_to() undoes every statement since the savepoint, which stays:
+  // their writes, guards and claims go, the snapshot stays. It takes an
+  // aborted transaction back to open, as it does a healthy one: a failed
+  // statement after a savepoint aborts the transaction but keeps its
+  // snapshot, cursors and savepoints for this call. The cursors opened since
+  // the savepoint close; those opened before it stay open where they stand,
+  // their fetches not undone, but for one whose own fetch failed, which stays
+  // closed (Cursor::is_failed). Savepoints taken since go.
+  //
+  // release() forgets the savepoint and those taken since, keeping their
+  // statements' writes; TransactionAborted in an aborted transaction.
+  //
+  // A name no savepoint has is ast::SqlError 3B001, and aborts the
+  // transaction, as any failed statement does. Each throws DbClosed after the
+  // database closed and std::logic_error once the transaction has ended.
+  void savepoint(std::string_view name);
+  void rollback_to(std::string_view name);
+  void release(std::string_view name);
+  // Aborts the transaction, as a failed statement would, for an error the
+  // caller raised itself: every later call is TransactionAborted until
+  // commit(), rollback() or a rollback_to(). Does nothing unless open.
+  void fail() noexcept;
   [[nodiscard]] auto is_open() const noexcept -> bool { return h_ && h_->state.load() != TxnState::Ended; }
   [[nodiscard]] auto is_aborted() const noexcept -> bool { return h_ && h_->state.load() == TxnState::Aborted; }
 
@@ -733,6 +795,9 @@ private:
   // Under life_->mu, shared: refuses a call on a closed database or an
   // ended or aborted transaction.
   void check_usable() const;
+  // The newest savepoint named `name`; ast::SqlError 3B001, the transaction
+  // aborted, if there is none.
+  auto find_savepoint(std::string_view name) -> std::size_t;
   auto run_locked(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts,
                   WindowRows* window = nullptr, RowWindow range = {}, const CursorState* positioned = nullptr) -> Rows;
   // Under life_->mu, shared: forgets and frees it, and counts it committed or
@@ -2475,7 +2540,9 @@ auto Transaction::open_cursor(const Statement& stmt, const std::vector<Value>& p
     state->db = db_;
     state->h = h_.get();
     state->scrolling = scrolling;
+    state->seq = h_->cursors_opened;
     h_->cursors.push_back(state);
+    ++h_->cursors_opened;
     // The cursor reads the query's twin that also reads the table's key,
     // when it is a simple scan of one table (docs/cursor_design.md, *WHERE
     // CURRENT OF*). A query the planner cannot plan with the key keeps its
@@ -2666,6 +2733,7 @@ void require_live(const CursorState& s) {
   if (s.life->closed || s.life->closing.load()) throw DbClosed();
   if (!s.live.load()) {
     if (s.aborted) throw TransactionAborted();
+    if (s.failed.load()) throw std::logic_error("the cursor's fetch failed: it cannot be run");
     throw std::logic_error("the cursor is closed");
   }
 }
@@ -2684,10 +2752,14 @@ auto Cursor::describe() const -> Rows {
 auto Cursor::fetch(CursorMove move, const ExecutionOptions& opts) -> Rows {
   if (!s_) throw std::logic_error("the cursor was moved from");
   std::shared_lock<std::shared_mutex> lock{s_->life->mu};
+  // An aborted transaction with savepoints keeps its cursors open, for a
+  // rollback to one: until then they fetch nothing.
+  if (s_->h != nullptr && s_->h->state.load() == TxnState::Aborted && !s_->life->closed) throw TransactionAborted();
   require_live(*s_);
   auto& st = *s_;
   if (st.scrolling == Scrolling::ForwardOnly && refused_when_forward_only(move, st)) throw CursorForwardOnly();
   auto* h = st.h;
+  const auto was_plain = !st.holdable();
   // A hold cursor reads its own view, in a context of the pool: nothing of the
   // transaction is read, so it works before and after the transaction ends.
   auto run = [&](RowWindow w) {
@@ -2722,13 +2794,13 @@ auto Cursor::fetch(CursorMove move, const ExecutionOptions& opts) -> Rows {
     }
     return rows;
   } catch (...) {
-    if (st.holdable()) {
-      // A failed fetch closes this cursor and no other.
-      if (h != nullptr) std::erase(h->cursors, s_);
-      st.close();
-    } else {
-      h->abort();  // closes this cursor, with the transaction's others
-    }
+    // A failed fetch closes this cursor, which stays in its transaction's
+    // list, failed, for rollback_to.
+    if (h != nullptr) st.failed.store(true);
+    st.close();
+    // A hold cursor's closes no other; any other's aborts the transaction
+    // (which closes the others too, unless it has savepoints).
+    if (was_plain && h != nullptr) h->abort();
     throw;
   }
 }
@@ -2736,7 +2808,10 @@ auto Cursor::fetch(CursorMove move, const ExecutionOptions& opts) -> Rows {
 void Cursor::close() noexcept {
   if (!s_) return;
   std::shared_lock<std::shared_mutex> lock{s_->life->mu};
-  if (!s_->live.load()) return;  // closed already, with its transaction or the database
+  if (!s_->live.load()) {  // closed already, with its transaction or the database, or by its failed fetch
+    s_->failed.store(false);
+    return;
+  }
   if (s_->h != nullptr) std::erase(s_->h->cursors, s_);
   s_->close();
 }
@@ -2781,6 +2856,82 @@ auto Transaction::execute(std::string_view sql, const std::vector<Value>& params
     throw;
   }
   return run_locked(*stmt, params, opts);
+}
+
+auto Transaction::find_savepoint(std::string_view name) -> std::size_t {
+  const auto& sp = h_->savepoints;
+  for (auto i = sp.size(); i > 0; --i) {
+    if (sp[i - 1].name == name) return i - 1;
+  }
+  if (h_->state.load() == TxnState::Open) h_->abort();
+  throw ast::SqlError{"savepoint \"" + std::string{name} + "\" does not exist", -1, kInvalidSavepointSpecification};
+}
+
+void Transaction::savepoint(std::string_view name) {
+  if (!h_) throw std::logic_error("the transaction has ended");
+  std::shared_lock<std::shared_mutex> lock{life_->mu};
+  check_usable();
+  try {
+    // Room first, so that nothing after the runtime's mark can fail.
+    Savepoint sp{std::string{name}, h_->cursors_opened};
+    h_->savepoints.reserve(h_->savepoints.size() + 1);
+    if (bc_txn_savepoint(h_->txn) == 0) {
+      std::string message;
+      try {
+        message = bc_txn_error_message(h_->txn);
+      } catch (const std::bad_alloc&) {  // NOLINT(bugprone-empty-catch): the message is dropped, not the outcome
+      }
+      throw_error(bc_txn_error(h_->txn), bc_txn_error_detail(h_->txn), message);
+    }
+    h_->savepoints.push_back(std::move(sp));
+  } catch (...) {
+    h_->abort();  // as a failed statement: SAVEPOINT that fails aborts in PostgreSQL too
+    throw;
+  }
+}
+
+void Transaction::rollback_to(std::string_view name) {
+  if (!h_) throw std::logic_error("the transaction has ended");
+  std::shared_lock<std::shared_mutex> lock{life_->mu};
+  if (life_->closed || life_->closing.load()) throw DbClosed();
+  if (h_->state.load() == TxnState::Ended) throw std::logic_error("the transaction has ended");
+  // Not check_usable: an aborted transaction is what this is for.
+  auto k = find_savepoint(name);
+  bc_ctx_reset(h_->cx);  // no statement is open between calls; a reset one aborted the runtime's already
+  // Never refused: the mark exists (one per savepoint) and no statement is open.
+  if (!bc_txn_rollback_to(h_->txn, static_cast<std::uint32_t>(k + 1))) {
+    h_->abort();
+    throw std::logic_error("the runtime refused a rollback to a live savepoint");
+  }
+  // The cursors opened since the savepoint close, a failed one with them:
+  // forgotten, as if never opened. Those opened before stay as they are.
+  const auto since = h_->savepoints[k].cursors;
+  std::erase_if(h_->cursors, [since](const auto& c) {
+    if (c->seq < since) return false;
+    c->failed.store(false);
+    c->close();
+    return true;
+  });
+  h_->savepoints.erase(h_->savepoints.begin() + static_cast<std::ptrdiff_t>(k + 1), h_->savepoints.end());
+  h_->state.store(TxnState::Open);
+}
+
+void Transaction::release(std::string_view name) {
+  if (!h_) throw std::logic_error("the transaction has ended");
+  std::shared_lock<std::shared_mutex> lock{life_->mu};
+  check_usable();
+  auto k = find_savepoint(name);
+  if (!bc_txn_release(h_->txn, static_cast<std::uint32_t>(k + 1))) {
+    h_->abort();
+    throw std::logic_error("the runtime refused to release a live savepoint");
+  }
+  h_->savepoints.erase(h_->savepoints.begin() + static_cast<std::ptrdiff_t>(k), h_->savepoints.end());
+}
+
+void Transaction::fail() noexcept {
+  if (!h_) return;
+  std::shared_lock<std::shared_mutex> lock{life_->mu};
+  if (h_->state.load() == TxnState::Open) h_->abort();
 }
 
 auto Transaction::commit() -> CommitOutcome {

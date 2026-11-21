@@ -2260,3 +2260,138 @@ def test_extended_cursor_in_a_failed_block(server):
     assert status(out) == "I"
     out = run(c, "FETCH c")
     assert states(out) == ["34000"]
+
+
+# ---------------------------------------------------------------- savepoints
+
+
+def test_savepoints_over_simple_and_extended_query(server):
+    """SAVEPOINT, ROLLBACK TO and RELEASE, as PostgreSQL 17 answers them, sent
+    as simple Queries and as Parse/Bind/Execute (docs/transaction_design.md,
+    *Savepoints*)."""
+    c = connect(server)
+    table(c)
+    for via in ("simple", "extended"):
+        def say(sql):
+            if via == "simple":
+                c.send(query(sql))
+                return c.until_ready()
+            return run(c, sql)
+
+        # Outside a block: 25P01, an error.
+        for sql, what in (("SAVEPOINT s", "SAVEPOINT"), ("RELEASE s", "RELEASE SAVEPOINT"),
+                          ("ROLLBACK TO s", "ROLLBACK TO SAVEPOINT")):
+            out = say(sql)
+            assert states(out) == ["25P01"] and status(out) == "I", (via, sql)
+            assert fields(next(b for k, b in out if k == b"E"))["M"] == what + " can only be used in transaction blocks"
+        assert tags(say("BEGIN")) == ["BEGIN"]
+        assert tags(say("INSERT INTO t VALUES (1, 1)")) == ["INSERT 0 1"]
+        assert tags(say("SAVEPOINT a")) == ["SAVEPOINT"]
+        assert tags(say("INSERT INTO t VALUES (2, 2)")) == ["INSERT 0 1"]
+        out = say("ROLLBACK TO SAVEPOINT a")
+        assert tags(out) == ["ROLLBACK"] and status(out) == "T"
+        assert keys(c) == ["1"]
+        # A failed statement fails the block; ROLLBACK TO the savepoint ends that.
+        out = say("INSERT INTO t VALUES (1, 1)")
+        assert states(out) == ["23505"] and status(out) == "E"
+        for sql in ("SAVEPOINT b", "RELEASE a", "SELECT k FROM t"):
+            assert states(say(sql)) == ["25P02"], (via, sql)
+        out = say("ROLLBACK TO nope")
+        assert states(out) == ["3B001"] and status(out) == "E"
+        out = say('ROLLBACK WORK TO "a"')
+        assert tags(out) == ["ROLLBACK"] and status(out) == "T"
+        assert tags(say("SAVEPOINT b")) == ["SAVEPOINT"]
+        assert tags(say("INSERT INTO t VALUES (3, 3)")) == ["INSERT 0 1"]
+        assert tags(say("RELEASE SAVEPOINT b")) == ["RELEASE"]
+        # An unknown name in a healthy block fails it, as in PostgreSQL.
+        out = say("RELEASE b")
+        assert states(out) == ["3B001"] and status(out) == "E"
+        assert tags(say("ROLLBACK TO a")) == ["ROLLBACK"]
+        assert tags(say("INSERT INTO t VALUES (2, 2)")) == ["INSERT 0 1"]
+        out = say("COMMIT")
+        assert tags(out) == ["COMMIT"] and status(out) == "I"
+        assert keys(c) == ["1", "2"]
+        c.send(query("DELETE FROM t"))
+        c.until_ready()
+
+
+def test_savepoints_and_the_transaction_modes(server):
+    c = connect(server)
+    table(c)
+
+    def say(sql):
+        c.send(query(sql))
+        return c.until_ready()
+
+    # Only a change of level is refused, as PostgreSQL's check_transaction_isolation does:
+    # the block's own level (READ COMMITTED by default) is taken in a subtransaction
+    # and after a query.
+    say("BEGIN")
+    say("SAVEPOINT s")
+    assert tags(say("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")) == ["SET"]
+    out = say("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+    assert states(out) == ["25001"]
+    assert fields(next(b for k, b in out if k == b"E"))["M"] == (
+        "SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction")
+    say("ROLLBACK")
+    say("BEGIN ISOLATION LEVEL REPEATABLE READ")
+    say("SAVEPOINT s")
+    assert tags(say("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")) == ["SET"]
+    assert states(say("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")) == ["25001"]
+    say("ROLLBACK")
+    say("BEGIN")
+    say("SELECT 1")
+    assert tags(say("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")) == ["SET"]
+    out = say("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")
+    assert states(out) == ["25001"]
+    assert fields(next(b for k, b in out if k == b"E"))["M"] == (
+        "SET TRANSACTION ISOLATION LEVEL must be called before any query")
+    say("ROLLBACK")
+    # READ WRITE inside a savepoint of a read-only block is 25001, as in PostgreSQL 17.
+    say("BEGIN READ ONLY")
+    say("SAVEPOINT s")
+    out = say("SET TRANSACTION READ WRITE")
+    assert states(out) == ["25001"]
+    assert fields(next(b for k, b in out if k == b"E"))["M"] == (
+        "cannot set transaction read-write mode inside a read-only transaction")
+    say("ROLLBACK")
+    # READ ONLY set after a savepoint is undone by ROLLBACK TO and by RELEASE.
+    for end in ("ROLLBACK TO s", "RELEASE s"):
+        say("BEGIN")
+        say("SAVEPOINT s")
+        assert tags(say("SET TRANSACTION READ ONLY")) == ["SET"]
+        assert states(say("INSERT INTO t VALUES (1, 1)")) == ["25006"]
+        say("ROLLBACK TO s")
+        assert tags(say("SET TRANSACTION READ ONLY")) == ["SET"]
+        assert states(say(end)) == []
+        assert tags(say("INSERT INTO t VALUES (1, 1)")) == ["INSERT 0 1"], end
+        say("ROLLBACK")
+
+
+def test_rollback_to_closes_the_cursors_declared_after_the_savepoint(server):
+    c = connect(server)
+    cursor_table(c)
+
+    def say(sql):
+        c.send(query(sql))
+        return c.until_ready()
+
+    say("BEGIN")
+    say("DECLARE before CURSOR FOR SELECT k FROM t ORDER BY k")
+    say("DECLARE bad CURSOR FOR SELECT 1 / (k - k) FROM t")
+    say("SAVEPOINT s")
+    say("DECLARE after CURSOR FOR SELECT k FROM t ORDER BY k")
+    assert data(say("FETCH before")) == [["1"]]
+    out = say("FETCH bad")
+    assert states(out) == ["22012"] and status(out) == "E"
+    assert tags(say("ROLLBACK TO s")) == ["ROLLBACK"]
+    assert data(say("FETCH before")) == [["2"]]  # where it stood
+    assert states(say("FETCH after")) == ["34000"]  # an error: it fails the block again
+    say("ROLLBACK TO s")
+    out = say("FETCH bad")
+    assert states(out) == ["55000"] and status(out) == "E"
+    assert fields(next(b for k, b in out if k == b"E"))["M"] == 'portal "bad" cannot be run'
+    say("ROLLBACK TO s")
+    assert tags(say("CLOSE bad")) == ["CLOSE CURSOR"]
+    assert states(say("FETCH bad")) == ["34000"]
+    say("ROLLBACK")
