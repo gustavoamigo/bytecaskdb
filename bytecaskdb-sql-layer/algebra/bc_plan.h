@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
    Copyright (c) 2026 Gustavo Amigo
 
-   bc_plan.h — the plan API of docs/plan_api_design.md (revision 15). A plan is
+   bc_plan.h — the plan API of docs/plan_api_design.md (revision 16). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
    and bc_params are opaque here and built by the runtime
@@ -133,7 +133,9 @@ typedef struct {
   const uint8_t    *result_types;    uint32_t n_result;           /* bc_type codes */
 } bc_schema_ref;
 
-enum bc_type { BC_T_I64 = 1, BC_T_F64 = 2, BC_T_BOOL = 3, BC_T_BYTES = 4 };
+/* BC_T_NUM: PostgreSQL's numeric as its text (numeric_out), a view as BYTES
+   is; a result or a subquery column, never a key's part. */
+enum bc_type { BC_T_I64 = 1, BC_T_F64 = 2, BC_T_BOOL = 3, BC_T_BYTES = 4, BC_T_NUM = 5 };
 
 /* Runtime: creating, running and committing. Called by the server, never by a plan. */
 bc_ctx *bc_ctx_new(bc_db *db, const bc_catalog *cat);
@@ -242,6 +244,7 @@ void     bc_emit_i64(bc_ctx *, int64_t);
 void     bc_emit_f64(bc_ctx *, double);
 void     bc_emit_bool(bc_ctx *, bool);
 void     bc_emit_bytes(bc_ctx *, bc_view);
+void     bc_emit_num(bc_ctx *, bc_view);              /* a BC_T_NUM column: numeric text, as bc_num_quotient's */
 void     bc_emit_null(bc_ctx *);
 void     bc_emit_col(bc_ctx *, bc_view row, uint32_t col);                /* the column, NULL as NULL */
 void     bc_emit_key_part(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);   /* not a DOUBLE part: BC_E_HANDLE */
@@ -289,6 +292,11 @@ bool    bc_bytes_prefix(bc_ctx *, bc_view prefix, bc_view);
    0 for none and 1 for an empty needle. */
 bc_view bc_concat(bc_ctx *, bc_view a, bc_view b);
 bc_view bc_number_text(bc_ctx *, int64_t v, uint32_t scale);
+/* PostgreSQL's AVG of an integer or a DECIMAL, as numeric text (BC_T_NUM):
+   numeric_div of sum (a total at `scale`) by count, at the scale
+   select_div_scale chooses, rounded half away from zero. count < 1 or a
+   scale past 18 is BC_E_HANDLE. */
+bc_view bc_num_quotient(bc_ctx *, int64_t sum, int64_t count, uint32_t scale);
 bc_view bc_substr(bc_ctx *, bc_view s, int64_t from, int64_t count);
 bc_view bc_text_case(bc_ctx *, bc_view s, bool upper);
 enum bc_trim_how { BC_TRIM_LEADING = 1, BC_TRIM_TRAILING = 2, BC_TRIM_SPACES = 4 };

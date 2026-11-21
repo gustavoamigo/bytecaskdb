@@ -470,10 +470,8 @@ The physical plan's operators:
 The plan also lists the parameters a NULL of which ends it before it reads
 (`null_checks`), the `$n ± k` values computed before anything is read, and
 its result columns as PostgreSQL names and types them. The plan's own
-columns for a result column are `physical::plan_columns` of its SQL type,
-the one place they are derived: a `NUMERIC` (an `AVG`) is two `I64`, its
-sum and its count, which the API divides; any other is one column of its
-physical type.
+column for a result column is the physical type of its SQL type, one
+each: a `NUMERIC` (an `AVG`) is `Num`, its numeric text.
 
 **`check()`** enforces what the types can't express. A failure is a
 compiler bug, a `std::logic_error`, never a plan. It checks each
@@ -1509,13 +1507,21 @@ keys.
 
 **AVG** of an integer or DECIMAL is PostgreSQL's `numeric`: `numeric_div` of the sum by the count
 at the scale `select_div_scale` chooses, 16 significant digits or more,
-rounded half away from zero, which can pass 64 bits. So the plan emits the
-sum and the count, two `I64` columns for one result column
-(`plan_columns`), and the API divides them as PostgreSQL does
-(`average_text`). Its type is a kind of its own, `SqlKind::Numeric`,
-PostgreSQL's numeric of no declared precision, which no column has; a
-result row carries its value as its text, and every reader of `Rows` (the
-Python binding, `pg_text`, the harness) decides by the kind. Its sum is an
+rounded half away from zero, which can pass 64 bits. So the plan divides
+the group's sum slot by its count slot into the quotient's text
+(`bc_num_quotient`, `average_text`) and emits it as one column of
+`PhysType::Num` (`BC_T_NUM`): PostgreSQL's `numeric_out` text, held as
+bytes are. A plan carries a `Num` as a value, through a Sort, a
+materialization and a set operation's ORDER BY sorter (whose payload holds
+it as bytes), and emits it; it never keys, hashes, compares or deduplicates
+one. Codegen throws `std::logic_error` at exactly those sites: an index or
+covering-scan key part, a subquery's IN set, a hash join's key, a sort key
+part (ORDER BY, GROUP BY, DISTINCT), a set operation's ORDER BY key or its
+dedupe group key, a comparison, and a procedure variable. Its SQL type
+is a kind of its own, `SqlKind::Numeric`, PostgreSQL's numeric of no
+declared precision, which no column has; a result row carries its value as
+its text, and every reader of `Rows` (the Python binding, `pg_text`, the
+harness) decides by the kind. Its sum is an
 integer sum, as `SUM`'s, with its 64-bit limit (`frontend_design.md`,
 *Known differences*).
 
@@ -1818,8 +1824,9 @@ plan of two loops are planned.
 - **The harness** (`sql_layer_tprocc`, 2 warehouses, 4 threads, 30 s): the
   consistency conditions hold after the run and in `check`, and its
   statements' plans are the golden ones.
-- **`AVG`**: `average_text` against PostgreSQL's digits, and through the
-  API and the server's text.
+- **`AVG`**: `average_text` against PostgreSQL's digits, `bc_num_quotient`
+  and `bc_emit_num` through the plan API (one `BC_T_NUM` column), and
+  through the API and the server's text.
 
 ## Slices
 

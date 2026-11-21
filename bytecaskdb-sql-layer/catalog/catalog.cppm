@@ -1056,6 +1056,7 @@ auto put_part_from_row(const Table& t, std::uint32_t col_id, KeyPart part, Bytes
     case PhysType::F64: key_put_f64(out, v.f64(), part); return true;
     case PhysType::Bool: key_put_bool(out, v.boolean(), part); return true;
     case PhysType::Bytes: key_put_bytes(out, v.bytes, part); return true;
+    case PhysType::Num: throw std::logic_error("a key part that is a NUMERIC");
   }
   return false;
 }
@@ -1467,7 +1468,8 @@ auto datum_fits(const Datum& d, PhysType t) -> bool {
                                !std::holds_alternative<Bytes>(d);
     case PhysType::F64: return std::holds_alternative<std::monostate>(d) || std::holds_alternative<double>(d);
     case PhysType::Bool: return std::holds_alternative<std::monostate>(d) || std::holds_alternative<bool>(d);
-    case PhysType::Bytes: return std::holds_alternative<std::monostate>(d) || std::holds_alternative<Bytes>(d);
+    case PhysType::Bytes:
+    case PhysType::Num: return std::holds_alternative<std::monostate>(d) || std::holds_alternative<Bytes>(d);
   }
   return false;
 }

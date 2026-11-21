@@ -281,7 +281,8 @@ auto decode_row(const RowLayout& layout, BytesView row) -> std::expected<std::ve
       case PhysType::I64: out.emplace_back(v.i64()); break;
       case PhysType::F64: out.emplace_back(v.f64()); break;
       case PhysType::Bool: out.emplace_back(v.boolean()); break;
-      case PhysType::Bytes: out.emplace_back(Bytes(v.bytes.begin(), v.bytes.end())); break;
+      case PhysType::Bytes:
+      case PhysType::Num: out.emplace_back(Bytes(v.bytes.begin(), v.bytes.end())); break;
     }
   }
   return out;
@@ -322,6 +323,7 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_emit_f64", fn_addr(bc_emit_f64)},
       {"bc_emit_bool", fn_addr(bc_emit_bool)},
       {"bc_emit_bytes", fn_addr(bc_emit_bytes)},
+      {"bc_emit_num", fn_addr(bc_emit_num)},
       {"bc_emit_null", fn_addr(bc_emit_null)},
       {"bc_emit_col", fn_addr(bc_emit_col)},
       {"bc_emit_key_part", fn_addr(bc_emit_key_part)},
@@ -347,6 +349,7 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_bytes_prefix", fn_addr(bc_bytes_prefix)},
       {"bc_concat", fn_addr(bc_concat)},
       {"bc_number_text", fn_addr(bc_number_text)},
+      {"bc_num_quotient", fn_addr(bc_num_quotient)},
       {"bc_substr", fn_addr(bc_substr)},
       {"bc_text_case", fn_addr(bc_text_case)},
       {"bc_trim", fn_addr(bc_trim)},

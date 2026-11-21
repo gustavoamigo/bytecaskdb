@@ -11,7 +11,6 @@ void plan(bc_ctx *cx) {
       bc_emit_i64(cx, 0);
       bc_emit_null(cx);
       bc_emit_null(cx);
-      bc_emit_null(cx);
       bc_emit_end(cx);
     }
     return;
@@ -48,10 +47,8 @@ void plan(bc_ctx *cx) {
     }
     if (!xs0_2) {
       bc_emit_null(cx);
-      bc_emit_null(cx);
     } else {
-      bc_emit_i64(cx, x0_2);
-      bc_emit_i64(cx, xc0_2);
+      bc_emit_num(cx, bc_num_quotient(cx, x0_2, xc0_2, 0));
     }
     bc_emit_end(cx);
   }

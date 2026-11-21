@@ -239,6 +239,7 @@ void print_record_bytes(const Catalog& cat) {
           (void)rw.set_bytes(c.id, std::as_bytes(std::span{s}));
           break;
         }
+        case PhysType::Num: break;  // no column is a NUMERIC of no precision
       }
     }
     Bytes row, key;

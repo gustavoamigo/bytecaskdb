@@ -602,9 +602,9 @@ in any order, on any columns, and of predicates over them.
 - `AVG` over an integer or `DECIMAL` column is `numeric`: PostgreSQL's
   `numeric_div` of the sum by the count, at the scale its
   `select_div_scale` chooses (at least 16 significant digits), rounded
-  half away from zero. Its digits can pass 64 bits, so the plan emits the
-  sum and the count and the API divides them (`average_text`); a result
-  row carries the value as its text. NULL over no rows.
+  half away from zero. Its digits can pass 64 bits, so the plan divides
+  them into the quotient's text (`bc_num_quotient`) and a result row
+  carries the value as that text. NULL over no rows.
 - `MIN` and `MAX` are of the column's type, and NULL over no rows. They
   take a numeric or temporal column.
   - Of a `TEXT`, `VARCHAR` or `BYTEA` column they are refused (#534).
@@ -647,7 +647,8 @@ and with a constant selected or `DISTINCT ON`, it is not taken yet.
   it where both are integers of scale 0 (SMALLINT, INTEGER, BIGINT, a
   DECIMAL of scale 0), which compare exactly; any other pair is refused, as
   two uses of one `$n` are (*Known differences*). `HAVING` on `AVG` is
-  refused (42601): its quotient is no type a plan holds. `HAVING` on `SUM`,
+  refused (42601): its quotient is numeric text, which a plan does not
+  compare. `HAVING` on `SUM`,
   `MIN` or `MAX` of a `DOUBLE PRECISION` column compares a `double
   precision`, in float8 order.
 - `AVG`'s result is PostgreSQL's numeric of no declared precision, a SQL
@@ -774,8 +775,8 @@ EXISTS] name`:
   as `logical::Derived` (`planner_design.md`, *Derived relations*). Refused
   (42601): a `GROUP BY` or `DISTINCT` of a column held other than as an
   integer or a boolean (text, bytea, a float) (#833), a view column that is
-  an `AVG` of an integer or `DECIMAL` (PostgreSQL's `numeric`, two plan
-  columns), and a view that itself reads one.
+  an `AVG` of an integer or `DECIMAL` (PostgreSQL's `numeric`, numeric
+  text the plan never keys or compares), and a view that itself reads one.
 - **A grouped view joined with a table** is a derived relation too
   (`ViewExpander::merge_two`, `derived_item`): `SELECT a FROM v JOIN t
   USING (a)`, whatever the query selects. The binder binds it as above; a

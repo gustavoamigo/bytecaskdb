@@ -30,6 +30,7 @@
 #include "tests/alloc_faults.h"
 
 import bytecask.sql.api;
+import bytecask.sql.text;
 import bytecask.sql.tests.util;
 
 using namespace bytecask::sql;
