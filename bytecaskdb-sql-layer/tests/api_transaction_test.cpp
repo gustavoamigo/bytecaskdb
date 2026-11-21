@@ -1359,6 +1359,135 @@ auto text_of(const Value& v) -> std::string {
 
 }  // namespace
 
+TEST_CASE("text: numeric_in reads a number as PostgreSQL's numeric_in, numeric_out writes it back", "[sql][api][numeric]") {
+  // The scale is kept, as numeric_out keeps it; an exponent moves it.
+  CHECK(numeric_in("1.50") == "1.50");
+  CHECK(numeric_in(" 1e2 ") == "100");
+  CHECK(numeric_in("1.50e1") == "15.0");
+  CHECK(numeric_in("0.0001e4") == "1");
+  CHECK(numeric_in("+.5e-3") == "0.0005");
+  CHECK(numeric_in("00012.3400") == "12.3400");
+  CHECK(numeric_in("5.") == "5");
+  CHECK(numeric_in("-0") == "0");
+  CHECK(numeric_in("-0.00") == "0.00");
+  CHECK(numeric_in("1_000.000_5") == "1000.0005");
+  CHECK(numeric_in("1e1_0") == "10000000000");
+  CHECK(numeric_in("123456789012345678901234567890.123") == "123456789012345678901234567890.123");
+  // Integers in hex, octal and binary, of any size, as PostgreSQL 16 reads them.
+  CHECK(numeric_in("0x1F") == "31");
+  CHECK(numeric_in("-0X_1f") == "-31");
+  CHECK(numeric_in("0o17") == "15");
+  CHECK(numeric_in("0b101") == "5");
+  CHECK(numeric_in("-0x0") == "0");
+  CHECK(numeric_in("0x8000000000000000000000") == "154742504910672534362390528");
+  // NaN takes no sign; the infinities do.
+  CHECK(numeric_in("nan ") == "NaN");
+  CHECK(numeric_in("  -Infinity") == "-Infinity");
+  CHECK(numeric_in("+inf") == "Infinity");
+  // numeric's format: 131072 digits before the point, 16383 after.
+  CHECK(numeric_in("1e131071").size() == 131072);
+  CHECK(numeric_in("1e-16383").size() == 16385);
+  auto refused = [](std::string_view text) -> std::string {
+    try {
+      (void)numeric_in(text);
+    } catch (const TextError& e) {
+      return std::string{e.sqlstate()} + " " + e.what();
+    }
+    return "accepted";
+  };
+  for (auto bad : {"", "   ", "abc", ".", "1e", "1_", "_1", "1__0", "1._5", "1_.5", "1e+_5", "+NaN", "infinityx", "0x", "0x1F_",
+                   "0x1.5", "00x1", "5 5"}) {
+    CHECK(refused(bad) == "22P02 invalid input syntax for type numeric: \"" + std::string{bad} + "\"");
+  }
+  for (auto past : {"1e131072", "1e-16384", "0.0e-16383", "1.5e-16383", "0e1073741824", "1e-1073741822"}) {
+    CHECK(refused(past) == "22003 value overflows numeric format");
+  }
+}
+
+TEST_CASE("embedded API: a NUMERIC column stores its value as numeric_out writes it", "[sql][api][numeric]") {
+  sql_test::TempDir dir{"api_numeric"};
+  auto db = open_db(dir);
+  db->execute("CREATE TABLE n (k BIGINT PRIMARY KEY, v NUMERIC, w DECIMAL DEFAULT 1.50, x DEC)");
+  // A literal of any digits, a string, a parameter's text: each spelling
+  // stored as numeric_out writes it, the scale kept.
+  db->execute("INSERT INTO n VALUES (1, 123456789012345678901234567890.10, '  2e3 ', -0.00)");
+  db->execute("INSERT INTO n (k, v) VALUES ($1, $2)", {std::int64_t{2}, sql_test::bytes("0x1F")});
+  db->execute("INSERT INTO n (k, v, x) SELECT 3, v, w FROM n WHERE k = 1");
+  db->execute("UPDATE n SET x = $1 WHERE k = 2", {sql_test::bytes("NaN")});
+  db->execute("ALTER TABLE n ADD COLUMN y NUMERIC NOT NULL DEFAULT 1e1");
+  auto r = db->execute("SELECT k, v, w, x, y FROM n WHERE k >= $1 ORDER BY k", {std::int64_t{1}});
+  REQUIRE(r.rows.size() == 3);
+  CHECK(r.types[1].kind == SqlKind::Numeric);
+  CHECK(text_of(r.rows[0][1]) == "123456789012345678901234567890.10");
+  CHECK(text_of(r.rows[0][2]) == "2000");
+  CHECK(text_of(r.rows[0][3]) == "0.00");
+  CHECK(text_of(r.rows[1][1]) == "31");
+  CHECK(text_of(r.rows[1][2]) == "1.50");  // its DEFAULT
+  CHECK(text_of(r.rows[1][3]) == "NaN");
+  CHECK(text_of(r.rows[2][1]) == "123456789012345678901234567890.10");
+  CHECK(text_of(r.rows[2][3]) == "2000");
+  CHECK(text_of(r.rows[2][4]) == "10");  // ADD COLUMN's DEFAULT
+  auto ret = db->execute("UPDATE n SET v = $1 WHERE k = 2 RETURNING v", {sql_test::bytes(" -1.250 ")});
+  REQUIRE(ret.rows.size() == 1);
+  CHECK(text_of(ret.rows[0][0]) == "-1.250");
+  // A view's column, IS NULL and COUNT carry it.
+  db->execute("CREATE VIEW nv AS SELECT k, v FROM n");
+  CHECK(text_of(db->execute("SELECT v FROM nv WHERE k = 2").rows.at(0).at(0)) == "-1.250");
+  CHECK(std::get<std::int64_t>(db->execute("SELECT count(v) FROM n WHERE v IS NOT NULL").rows.at(0).at(0)) == 3);
+
+  auto state = [&](std::string_view sql, std::vector<Value> params = {}) -> std::string {
+    try {
+      (void)db->execute(sql, std::move(params));
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "00000";
+  };
+  // Text that is no number, or past numeric's format: numeric_in's errors.
+  CHECK(state("INSERT INTO n (k, v) VALUES (4, 'abc')") == "22P02");
+  CHECK(state("INSERT INTO n (k, v) VALUES ($1, $2)", {std::int64_t{4}, sql_test::bytes("1.5.")}) == "22P02");
+  CHECK(state("INSERT INTO n (k, v) VALUES ($1, $2)", {std::int64_t{4}, sql_test::bytes("1e200000")}) == "22003");
+  CHECK(state("INSERT INTO n (k, v) VALUES (4, TRUE)") == "42804");
+  CHECK(state("CREATE TABLE m (k BIGINT PRIMARY KEY, v NUMERIC DEFAULT 'x')") == "22P02");
+  CHECK(state("CREATE TABLE m (k BIGINT PRIMARY KEY, v NUMERIC DEFAULT TRUE)") == "42804");
+  CHECK(state("ALTER TABLE n ADD COLUMN z NUMERIC DEFAULT FALSE") == "42804");
+  // Bytes that are not UTF-8: 22021, as a TEXT column, before numeric_in.
+  CHECK(state("INSERT INTO n (k, v) VALUES ($1, $2)", {std::int64_t{4}, sql_test::bytes("\xff" "1")}) == "22021");
+  // Compared with a value of no number type: no such operator (42883); a
+  // string literal that is no number: 22P02. Both before the 0A000.
+  CHECK(state("SELECT k FROM n WHERE v = TRUE") == "42883");
+  CHECK(state("SELECT k FROM n WHERE v = DATE '2020-01-01'") == "42883");
+  CHECK(state("SELECT k FROM n WHERE v = 'x'") == "22P02");
+  CHECK(state("SELECT k FROM n WHERE v = '1.5'") == "0A000");
+  // Not a key, not compared, ordered, grouped, computed, aggregated or cast yet.
+  CHECK(state("CREATE TABLE m (v NUMERIC PRIMARY KEY)") == "0A000");
+  CHECK(state("CREATE TABLE m (k BIGINT PRIMARY KEY, v NUMERIC UNIQUE)") == "0A000");
+  CHECK(state("CREATE INDEX n_v ON n (v)") == "0A000");
+  CHECK(state("CREATE TABLE m (k BIGINT PRIMARY KEY, v NUMERIC REFERENCES n (k))") == "0A000");
+  CHECK(state("SELECT k FROM n WHERE v = 1.5") == "0A000");
+  CHECK(state("SELECT k FROM n WHERE v = $1", {sql_test::bytes("1.5")}) == "0A000");
+  CHECK(state("SELECT k FROM n WHERE v = x") == "0A000");
+  CHECK(state("SELECT v FROM n ORDER BY v") == "0A000");
+  CHECK(state("SELECT DISTINCT v FROM n") == "0A000");
+  CHECK(state("SELECT v FROM n GROUP BY v") == "0A000");
+  CHECK(state("SELECT v + 1 FROM n") == "0A000");
+  CHECK(state("SELECT sum(v) FROM n") == "0A000");
+  CHECK(state("SELECT v::text FROM n") == "0A000");
+  CHECK(state("SELECT v FROM n UNION SELECT x FROM n") == "0A000");
+  CHECK(state("SELECT CAST('1.5' AS NUMERIC)") == "0A000");
+  CHECK(state("SELECT $1::numeric", {sql_test::bytes("1.5")}) == "0A000");
+  CHECK(state("UPDATE n SET v = k") == "0A000");
+
+  // The catalog keeps the type, and the rows their text, across a reopen.
+  db->close();
+  auto again = Database::open(dir.path());
+  auto kept = again->execute("SELECT v, w FROM n WHERE k = 1");
+  REQUIRE(kept.rows.size() == 1);
+  CHECK(kept.types[0].kind == SqlKind::Numeric);
+  CHECK(text_of(kept.rows[0][0]) == "123456789012345678901234567890.10");
+  CHECK(text_of(kept.rows[0][1]) == "2000");
+}
+
 TEST_CASE("embedded API: AVG is PostgreSQL's numeric quotient, at the scale its division takes", "[sql][api][group]") {
   // numeric_div's scale: 16 significant digits at least, more for a quotient
   // under 1, the argument's scale at least; rounded half away from zero.

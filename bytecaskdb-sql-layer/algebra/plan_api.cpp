@@ -2517,7 +2517,8 @@ auto declared(bc_ctx* cx, std::uint32_t table, std::uint32_t col, std::optional<
     auto it = std::ranges::lower_bound(cols, std::pair{table, col}, {},
                                        [](const ColSlot& s) { return std::pair{s.table, s.col}; });
     if (it != cols.end() && it->table == table && it->col == col) {
-      if (type && it->type != *type) {
+      // A NUMERIC is read and set as its text, as bytes are.
+      if (type && it->type != *type && !(*type == PhysType::Bytes && it->type == PhysType::Num)) {
         cx->fail(BC_E_HANDLE, "column " + std::to_string(col) + " of table " + std::to_string(table) + " is not " +
                                   type_name(*type));
         return nullptr;
@@ -5164,6 +5165,30 @@ bc_row bc_row_from(bc_ctx* cx, uint32_t table, bc_view old) {
   return {};
 }
 
+extern "C++" {
+namespace {
+
+// A NUMERIC column's value: text as numeric_in reads it, stored as
+// numeric_out writes it, so the column holds that form whatever spelling
+// (1e2, 0x1F, " 1.50 ") a parameter or a view came in. Text that is no
+// number is BC_C_RANGE, with numeric_in's message (22P02 or 22003); bytes
+// that are not UTF-8 are refused first (22021), so that message quotes text.
+void set_num(bc_ctx* cx, const SetTarget& at, std::uint32_t col, BytesView text) {
+  if (!in_range(cx, at, col, text)) return;  // not UTF-8: 22021, as a TEXT column
+  std::string canonical;
+  try {
+    canonical = bytecask::sql::numeric_in(chars(text));
+  } catch (const bytecask::sql::TextError& e) {
+    cx->raise(BC_C_RANGE, at.builder->table, e.what());
+    return;
+  }
+  auto b = std::as_bytes(std::span{canonical.data(), canonical.size()});
+  if (!at.builder->writer.set_bytes(col, BytesView{b})) cx->fail(BC_L_ROW, "column is not in the row's layout");
+}
+
+}  // namespace
+}  // extern "C++"
+
 void bc_row_set_i64(bc_ctx* cx, bc_row r, uint32_t col, int64_t v) {
   BC_GUARD_BEGIN
   set_column(cx, r, col, PhysType::I64, v, [&](RowWriter& w) { return w.set_i64(col, v); });
@@ -5186,6 +5211,10 @@ void bc_row_set_bytes(bc_ctx* cx, bc_row r, uint32_t col, bc_view v) {
   BC_GUARD_BEGIN
   auto bytes = cx->resolve(v);
   if (!bytes) return;
+  if (auto at = set_target(cx, r, col, PhysType::Bytes); at && at->slot->type == PhysType::Num) {
+    set_num(cx, *at, col, *bytes);
+    return;
+  }
   set_column(cx, r, col, PhysType::Bytes, *bytes, [&](RowWriter& w) { return w.set_bytes(col, *bytes); });
   BC_GUARD_END(cx)
 }
@@ -5208,6 +5237,10 @@ void bc_row_set_param(bc_ctx* cx, bc_row r, uint32_t col, uint32_t i) {
   if (!at) return;
   if (!bytecask::sql::datum_fits(*d, at->slot->type)) {
     cx->fail(BC_E_HANDLE, "parameter $" + std::to_string(i + 1) + " is not " + type_name(at->slot->type));
+    return;
+  }
+  if (const auto* text = std::get_if<Bytes>(d); text != nullptr && at->slot->type == PhysType::Num) {
+    set_num(cx, *at, col, *text);
     return;
   }
   if (!in_range(cx, *at, col, *d)) return;

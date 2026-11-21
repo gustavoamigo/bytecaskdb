@@ -557,7 +557,7 @@ auto assigns(SqlType from, SqlType to) -> bool {
     if (k == SqlKind::Text || k == SqlKind::Varchar) return 2;
     return 0;
   };
-  if (from.kind == SqlKind::Numeric) return false;
+  if (from.kind == SqlKind::Numeric || to.kind == SqlKind::Numeric) return from.kind == to.kind;  // its text, carried
   if (is_float(to)) return is_float(from) || family(from.kind) == 1;
   if (to.kind == SqlKind::Char) return from == to;
   if (phys_type(from) != phys_type(to) || decimal_scale(from) != decimal_scale(to)) return false;

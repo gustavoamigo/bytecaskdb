@@ -1834,6 +1834,36 @@ def test_like_agrees_with_postgresql_on_utf8_and_escapes(dsn):
         m.teardown()
 
 
+def test_a_numeric_column_keeps_every_digit_and_the_scale_as_postgresql(dsn):
+    """NUMERIC (DEC, DECIMAL) without a precision: a value of any digits,
+    read as numeric_in reads it from a literal, a string or a parameter (a
+    str or a decimal.Decimal), and returned as numeric_out writes it, the
+    scale kept (1.50 is not 1.5); not a key, not compared yet (0A000)."""
+    m = keyless_machine(dsn)()
+    try:
+        ddl = "CREATE TABLE n0 (k BIGINT PRIMARY KEY, v NUMERIC, w DEC DEFAULT 1.50)"
+        assert m.both(ddl).error is None
+        rows = [(1, "1.50"), (2, " 1e3 "), (3, "0x1F"), (4, None), (5, decimal.Decimal("-0.00")),
+                (6, decimal.Decimal("123456789012345678901234567890.123")), (7, decimal.Decimal("1E+2")), (8, "NaN")]
+        for k, v in rows:
+            assert m.both("INSERT INTO n0 (k, v) VALUES ($1, $2)", [k, v]).error is None, (k, v)
+        assert m.both("INSERT INTO n0 VALUES (9, 98765432109876543210.0100, '-Infinity')").error is None
+        assert m.both("UPDATE n0 SET w = v WHERE k = 1").error is None
+        for k, v, state in [(10, "abc", "22P02"), (10, "1e200000", "22003")]:
+            assert m.layer("INSERT INTO n0 (k, v) VALUES ($1, $2)", [k, v]).sqlstate == state
+        # Every digit and the scale: compared as text, which Decimal's == is not.
+        sql = "SELECT k, v, w FROM n0 ORDER BY k"
+        layer = [[None if x is None else str(x) for x in row] for row in m.db.execute(sql, [])["rows"]]
+        pg = [[None if x is None else str(x) for x in row] for row in o.run_pg(m.pg.conn, sql).rows]
+        assert layer == pg
+        assert layer[0] == ["1", "1.50", "1.50"] and layer[4] == ["5", "0.00", "1.50"]
+        for refused in ("SELECT k FROM n0 WHERE v = 1.5", "SELECT v FROM n0 ORDER BY v", "CREATE INDEX n0_v ON n0 (v)"):
+            assert m.layer(refused).sqlstate == "0A000", refused
+        assert o.run_pg(m.pg.conn, "DROP TABLE n0").error is None
+    finally:
+        m.teardown()
+
+
 def test_a_table_without_a_primary_key_keeps_duplicates_across_a_reopen(dsn):
     """Row ids after a reopen start past the rows the data holds: an insert
     then adds a row, never collides with one (23505) or replaces it."""
@@ -2483,8 +2513,8 @@ def test_every_range_message_maps_to_its_sqlstate(tmp_path):
     db = bytecask_sql.open(str(tmp_path))
     try:
         db.execute("CREATE TABLE r (k BIGINT PRIMARY KEY, s SMALLINT, i INTEGER, f REAL, d NUMERIC(4, 2), "
-                   "v VARCHAR(2), x TEXT, dt DATE, ts TIMESTAMP, tm TIME, c CHAR(2))")
-        cols = ["s", "i", "f", "d", "v", "x", "dt", "ts", "tm", "c"]
+                   "v VARCHAR(2), x TEXT, dt DATE, ts TIMESTAMP, tm TIME, c CHAR(2), n NUMERIC)")
+        cols = ["s", "i", "f", "d", "v", "x", "dt", "ts", "tm", "c", "n"]
         cases = [
             ("s", 2**15, "22003"),
             ("i", 2**31, "22003"),
@@ -2498,6 +2528,9 @@ def test_every_range_message_maps_to_its_sqlstate(tmp_path):
             ("dt", -2_440_589, "22008"),
             ("ts", -210_866_803_200_000_001, "22008"),
             ("tm", 86_400_000_001, "22008"),
+            ("n", "1.5x", "22P02"),
+            ("n", "1e200000", "22003"),
+            ("n", b"\xff1", "22021"),  # not UTF-8: refused before numeric_in quotes it
         ]
         messages = bytecask_sql._range_messages()
         seen = set()

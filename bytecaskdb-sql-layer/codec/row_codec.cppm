@@ -75,10 +75,10 @@ enum class SqlKind : std::uint8_t {
   Timestamp,
   Date,
   Time,
-  // PostgreSQL's numeric of no declared precision, of any digits: AVG's
-  // result. No column is declared one, so no record holds it; a result row
-  // carries its value as its text (Rows), and its scale is the scale of
-  // the integer sum it divides.
+  // PostgreSQL's numeric of no declared precision, of any digits: a column
+  // declared NUMERIC without a precision (scale 0 in the catalog), and AVG's
+  // result, whose scale is that of the integer sum it divides. Its value is
+  // its numeric_out text (PhysType::Num), in a row and in a result (Rows).
   Numeric,
   // TIMESTAMP WITH TIME ZONE: the same instant as Timestamp (microseconds
   // since 1970-01-01 00:00:00 UTC), told apart by this tag. Appended, so no

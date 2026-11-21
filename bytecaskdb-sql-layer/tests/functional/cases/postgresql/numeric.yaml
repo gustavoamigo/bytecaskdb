@@ -339,3 +339,45 @@
       error: "42883"
   teardown:
     - DROP TABLE sg
+
+- name: a NUMERIC column without a precision keeps every digit and the scale
+  features: [E011-03]
+  setup:
+    - CREATE TABLE nn (id INTEGER PRIMARY KEY, v NUMERIC, w DECIMAL DEFAULT 1.50, x DEC)
+  steps:
+    - sql: INSERT INTO nn VALUES (1, 123456789012345678901234567890.10, '  2e3 ', -0.00)
+      rowcount: 1
+    - sql: INSERT INTO nn (id, v) VALUES ($1, $2)
+      params: [2, "1.50e1"]
+      rowcount: 1
+    - sql: INSERT INTO nn (id, v, x) SELECT 3, v, w FROM nn WHERE id = 1
+      rowcount: 1
+    - sql: UPDATE nn SET x = 'NaN' WHERE id = 2 RETURNING x
+      expected: [["NaN"]]
+    - sql: SELECT id, v, w, x FROM nn WHERE v IS NOT NULL ORDER BY id
+      expected:
+        - [1, "123456789012345678901234567890.10", "2000", "0.00"]
+        - [2, "15.0", "1.50", "NaN"]
+        - [3, "123456789012345678901234567890.10", "1.50", "2000"]
+    - sql: INSERT INTO nn (id, v) VALUES (4, 'abc')
+      error: "22P02"
+    - sql: INSERT INTO nn (id, v) VALUES (4, '1e200000')
+      error: "22003"
+  teardown:
+    - DROP TABLE nn
+
+- name: a NUMERIC column without a precision compared and ordered
+  features: [E011-03]
+  # stored as its text, a NUMERIC is not compared, ordered or computed yet (0A000)
+  unimplemented: true
+  setup:
+    - CREATE TABLE nc (id INTEGER PRIMARY KEY, v NUMERIC)
+  steps:
+    - sql: INSERT INTO nc VALUES (1, 1.50), (2, 1.5), (3, 10)
+      rowcount: 3
+    - sql: SELECT id FROM nc WHERE v = 1.5 ORDER BY id
+      expected: [[1], [2]]
+    - sql: SELECT v + 1 FROM nc ORDER BY v DESC
+      expected: [["11"], ["2.50"], ["2.5"]]
+  teardown:
+    - DROP TABLE nc

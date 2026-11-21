@@ -223,7 +223,11 @@ auto sql_type(const ast::ColumnDefAst& c) -> SqlType {
   }
   if (c.type == "numeric") {
     auto limits = "precision 1 to " + std::to_string(kMaxDecimalPrecision) + " (it is stored in 64 bits), scale 0 to precision";
-    if (c.typmods.empty() || c.typmods.size() > 2) throw SqlError{"NUMERIC needs a precision: " + limits, c.pos};
+    // Without one it is a column's type alone (column_type) yet.
+    if (c.typmods.empty()) {
+      throw SqlError{"NUMERIC without a precision other than as a column's type is not supported yet", c.pos, kFeatureNotSupported};
+    }
+    if (c.typmods.size() > 2) throw SqlError{"NUMERIC takes a precision and a scale: " + limits, c.pos};
     auto p = c.typmods[0];
     auto sc = c.typmods.size() == 2 ? c.typmods[1] : 0;
     SqlType t{SqlKind::Decimal, 0, field(p), field(sc)};
@@ -241,6 +245,27 @@ auto sql_type(const ast::ColumnDefAst& c) -> SqlType {
     return t;
   }
   throw SqlError{"type " + c.type + " is not supported", c.pos};
+}
+
+// A number's text as a NUMERIC stores it (numeric_in): its error, at pos,
+// the statement's.
+auto numeric_bytes(std::string_view text, std::int32_t pos) -> Bytes {
+  try {
+    auto out = numeric_in(text);
+    auto b = std::as_bytes(std::span{out.data(), out.size()});
+    return {b.begin(), b.end()};
+  } catch (const TextError& e) {
+    throw SqlError{e.what(), pos, known_sqlstate(e.sqlstate()).value_or(kInvalidTextRepresentation)};
+  }
+}
+
+// A column definition's type: sql_type's, and NUMERIC (DEC, DECIMAL)
+// without a precision, which only a column is declared as: a value of any
+// digits, stored as its text (docs/types_design.md). A cast to it, a
+// domain or a procedure argument of it still needs a precision.
+auto column_type(const ast::ColumnDefAst& c) -> SqlType {
+  if (c.type == "numeric" && c.typmods.empty()) return SqlType{SqlKind::Numeric};
+  return sql_type(c);
 }
 
 // Why a literal is not a DECIMAL value: not of the form [-]digits[.digits],
@@ -291,7 +316,7 @@ auto parse_number(const ast::Literal& l, SqlType t) -> double {
 }
 
 // A DEFAULT constant folded to the column's stored value.
-auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
+auto fold_default(const ast::Literal& l, SqlType t, std::string_view column) -> Datum {
   using K = ast::Literal::Kind;
   auto bad = [&] [[noreturn]] { throw SqlError{"DEFAULT is not a constant of type " + sql_type_name(t), l.pos}; };
   if (l.kind == K::Null) return std::monostate{};
@@ -329,11 +354,20 @@ auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
       }
       return Bytes(b.begin(), b.end());
     }
+    case SqlKind::Numeric: {
+      // Its numeric_out text, as an INSERT stores it.
+      if (l.kind == K::Bool) {
+        throw SqlError{"column \"" + std::string{column} +
+                           "\" is of type numeric but default expression is of type boolean",
+                       l.pos, kDatatypeMismatch};
+      }
+      if (l.kind != K::Integer && l.kind != K::Number && l.kind != K::String) bad();
+      return numeric_bytes(l.text, l.pos);
+    }
     case SqlKind::Timestamp:
     case SqlKind::TimestampTz:
     case SqlKind::Date:
     case SqlKind::Time:
-    case SqlKind::Numeric:
       throw SqlError{"a DEFAULT for type " + sql_type_name(t) + " is not supported yet", l.pos};
   }
   bad();
@@ -395,7 +429,7 @@ auto exact_number(const Column& c) -> bool {
     case SqlKind::TimestampTz:
     case SqlKind::Date:
     case SqlKind::Time:
-    case SqlKind::Numeric: return false;  // no column has it
+    case SqlKind::Numeric: return false;  // its text: no int64_t arithmetic
   }
   return false;
 }
@@ -457,6 +491,13 @@ auto pg_type_name(SqlType t) -> std::string {
 // a feature it lacks (0A000).
 [[noreturn]] void not_supported(const std::string& what, std::int32_t pos) {
   throw SqlError{what + " is not supported yet", pos, kFeatureNotSupported};
+}
+
+// What a NUMERIC of no precision does not do yet: compare, order, group,
+// compute, aggregate or cast (0A000). It is stored as its text, and
+// byte equality is not numeric equality (1.5 = 1.50).
+[[noreturn]] void refuse_numeric(const std::string& what, std::int32_t pos) {
+  throw SqlError{what + " (NUMERIC without a precision) is not supported yet", pos, kFeatureNotSupported};
 }
 
 auto integer_constant(std::int64_t v, std::int32_t pos) -> Constant {
@@ -1674,6 +1715,22 @@ auto coerce_value(const Constant& k, const Column& c, bool assigned, std::string
   auto inexact = [&] [[noreturn]] {
     not_yet("comparing " + c.name + " (" + sql_type_name(c.sql) + ") with a constant its type does not hold exactly", k.pos);
   };
+  // A NUMERIC is its text: 1.5 = 1.50 is not a byte equality, so it is not
+  // compared with a number yet. A string literal is read first, so text that
+  // is no number is 22P02 as in PostgreSQL; a boolean, temporal or string
+  // constant falls through to PostgreSQL's 42883 (no such operator).
+  if (c.sql.kind == SqlKind::Numeric && !assigned) {
+    if (k.unknown && !std::holds_alternative<std::monostate>(k.value)) {
+      try {
+        (void)from_text(k.text, c.sql, true);
+      } catch (const TextError& e) {
+        literal_input_error(k, e.what(), known_sqlstate(e.sqlstate()).value_or(kInvalidTextRepresentation));
+      }
+    }
+    if (k.unknown || type_class(k.type.kind) == TypeClass::Number) {
+      refuse_numeric("a NUMERIC column compared or computed with a constant", k.pos);
+    }
+  }
   if (k.unknown) {
     if (std::holds_alternative<std::monostate>(k.value)) return std::monostate{};
     Datum d;
@@ -1707,6 +1764,13 @@ auto coerce_value(const Constant& k, const Column& c, bool assigned, std::string
                    k.pos, *refusal};
   }
   if (std::holds_alternative<std::monostate>(k.value)) return std::monostate{};
+  if (c.sql.kind == SqlKind::Numeric) {
+    // An integer or numeric constant: its text, the scale it is written
+    // with kept, as numeric_out writes it. A float's is a cast, later.
+    if (!is_number(k.type)) refuse_numeric("a " + pg_type_name(k.type) + " constant assigned to a NUMERIC column", k.pos);
+    auto [v, scale] = scaled(k);
+    return bytes_of(to_text(Datum{v}, numeric_type(scale)));
+  }
   if (k.type.kind == SqlKind::Boolean) {
     auto b = std::get<bool>(k.value);
     if (c.sql.kind == SqlKind::Boolean) return b;
@@ -1903,8 +1967,8 @@ auto clock_default(const std::string& name, std::int64_t precision, SqlType t, c
 }
 
 auto column_spec(const ast::ColumnDefAst& c) -> ColumnSpec {
-  auto t = sql_type(c);
-  ColumnSpec out{c.name, t, !c.not_null && !c.primary_key, c.default_value ? fold_default(*c.default_value, t) : Datum{}, {}};
+  auto t = column_type(c);
+  ColumnSpec out{c.name, t, !c.not_null && !c.primary_key, c.default_value ? fold_default(*c.default_value, t, c.name) : Datum{}, {}};
   if (!c.default_clock.empty()) out.clock_default = clock_default(c.default_clock, c.default_clock_precision, t, c.name, c.pos);
   return out;
 }
@@ -1999,6 +2063,10 @@ void check_foreign_key(const CreateTableDdl& t, const ast::ForeignKeyAst& f, con
                    kInvalidForeignKey};
   }
   for (std::size_t i = 0; i < refs.size(); ++i) {
+    if (type_of(own, f.columns[i])->kind == SqlKind::Numeric) {
+      throw SqlError{"NUMERIC column \"" + f.columns[i] + "\" without a precision in a foreign key is not supported yet", f.pos,
+                     kFeatureNotSupported};
+    }
     if (!references_type(*type_of(own, f.columns[i]), *type_of(ref.columns, refs[i]))) {
       auto name = f.name;
       if (name.empty()) {
@@ -2135,7 +2203,9 @@ public:
       const auto& outs = outputs_of(*root);
       if (outs.size() != 1) throw SqlError{"subquery must return only one column", pos};
       type = outs[0].expr.type;
-      if (type.kind == SqlKind::Numeric) not_yet("a subquery of AVG", pos);
+      // AVG's or a NUMERIC column's: compared or matched where a subquery
+      // stands, which a NUMERIC is not yet.
+      if (type.kind == SqlKind::Numeric) refuse_numeric("a subquery of a NUMERIC value", pos);
       name = outs[0].name;
     }
     // Its parameters, NULL until it runs: its value or values, then its flags.
@@ -2238,6 +2308,7 @@ public:
     if (oc->sql.kind == SqlKind::Char || c.sql.kind == SqlKind::Char) {
       not_yet("a correlated subquery comparing a CHAR(n) column", pos);
     }
+    numeric_compared(oc->sql, c.sql, pos);
     if (!compares(oc->sql, c)) {
       not_yet("comparing " + c.name + " (" + sql_type_name(c.sql) + ") with the outer column " + oc->name + " (" +
                   sql_type_name(oc->sql) + ") in a correlated subquery",
@@ -2321,6 +2392,7 @@ public:
   }
 
   static void comparable(SqlType sub, const Column& c, std::int32_t pos) {
+    if (type_class(sub.kind) == type_class(c.sql.kind)) numeric_compared(sub, c.sql, pos);
     if (!compares(sub, c)) {
       not_yet("comparing " + c.name + " (" + sql_type_name(c.sql) + ") with a subquery of " + sql_type_name(sub), pos);
     }
@@ -2498,7 +2570,11 @@ public:
         // $n::T types $n as T, as PostgreSQL types an untyped $n by its
         // cast; a cast of anything else that is not a constant is not
         // taken yet.
-        if (!param_cast(e)) not_yet("a cast of other than a constant or a parameter", e.pos);
+        if (!param_cast(e)) {
+          if (e.rhs->kind == K::Column && resolve(*e.rhs).second->sql.kind == SqlKind::Numeric) refuse_numeric("a cast of a NUMERIC", e.pos);
+          not_yet("a cast of other than a constant or a parameter", e.pos);
+        }
+        if (e.cast_type == "numeric" && e.cast_typmods.empty()) refuse_numeric("a cast of a parameter to NUMERIC", e.pos);
         if (modified_cast(e)) not_yet("a cast of a parameter to DECIMAL, VARCHAR(n) or CHAR(n)", e.pos);
         auto as = cast_type(e);
         const auto& col =
@@ -2533,6 +2609,10 @@ public:
       if (type_class(type.kind) == TypeClass::String) {
         type = SqlType{SqlKind::Text};
       } else if (type_class(type.kind) == TypeClass::Number) {
+        // NUMERICs alone are carried as their text; with another number the
+        // result is computed, a cast, which is not built yet.
+        if (type.kind == SqlKind::Numeric && t.kind == SqlKind::Numeric) continue;
+        if (type.kind == SqlKind::Numeric || t.kind == SqlKind::Numeric) refuse_numeric(what + " of a NUMERIC and another number", pos);
         if (!(is_number(type) || is_float(type)) || !(is_number(t) || is_float(t))) not_yet(what + " of a numeric of no scale", pos);
         if (is_float(type) != is_float(t)) not_yet(what + " of a floating-point value and another number", pos);
         if (is_float(t)) {
@@ -2568,6 +2648,7 @@ public:
     auto plus = e.kind == ast::Expr::Kind::Plus;
     if (e.rhs->kind == ast::Expr::Kind::Param) not_yet(std::string{"unary "} + (plus ? "+" : "-") + " of a parameter", e.pos);
     auto v = value(*e.rhs, resolve);
+    if (v.type.kind == SqlKind::Numeric) refuse_numeric(std::string{"unary "} + (plus ? "+" : "-") + " of a NUMERIC", e.pos);
     if (!is_number(v.type) && !is_float(v.type)) {
       throw SqlError{std::string{"operator does not exist: "} + (plus ? "+ " : "- ") + pg_type_name(v.type), e.pos,
                      kUndefinedFunction};
@@ -2593,6 +2674,7 @@ public:
     };
     if (e.func == "%") {
       auto [a, b] = operands(e.args[0], e.args[1], resolve, Use::Operand);
+      numeric_computed(a.type, b.type, e.pos);
       if (!is_number(a.type) || !is_number(b.type)) {
         throw SqlError{"operator does not exist: " + pg_type_name(a.type) + " % " + pg_type_name(b.type), e.pos, kUndefinedFunction};
       }
@@ -2605,6 +2687,7 @@ public:
       if (e.args.size() != 1) throw SqlError{"function abs takes one argument", e.pos, kUndefinedFunction};
       if (e.args[0].kind == ast::Expr::Kind::Param) not_yet("abs of a parameter", e.pos);
       auto v = value(e.args[0], resolve);
+      if (v.type.kind == SqlKind::Numeric) refuse_numeric("abs of a NUMERIC", e.pos);
       if (!is_number(v.type) && !is_float(v.type)) {
         throw SqlError{"function abs(" + pg_type_name(v.type) + ") does not exist", e.pos, kUndefinedFunction};
       }
@@ -2630,6 +2713,7 @@ public:
       auto a = arg(e.args[0], SqlType{SqlKind::Text});
       auto b = arg(e.args[1], SqlType{SqlKind::Text});
       for (const auto* x : {&a, &b}) {
+        if (x->type.kind == SqlKind::Numeric) refuse_numeric("|| of a NUMERIC", e.pos);
         if (!texty(x->type) && !exact(x->type)) not_yet("|| of a " + pg_type_name(x->type) + " value", e.pos);
       }
       if (!texty(a.type) && !texty(b.type)) {
@@ -2899,6 +2983,7 @@ public:
       auto days = *arith_type(op, l.type, r.type);
       return logical::binary(logical::Expr::Kind::Sub, std::move(l), std::move(r), days);
     }
+    numeric_computed(l.type, r.type, e.pos);
     for (const auto* x : {&l, &r}) {
       if (is_float(x->type)) not_yet("arithmetic of REAL and DOUBLE PRECISION", e.pos);
       if (!is_number(x->type)) {
@@ -2930,6 +3015,7 @@ public:
                          pg_type_name(r.type),
                      e.pos, kUndefinedFunction};
     }
+    numeric_compared(l.type, r.type, e.pos);
     if (is_float(l.type) || is_float(r.type)) not_yet("a comparison of REAL and DOUBLE PRECISION as a value", e.pos);
     if (type_class(l.type.kind) == TypeClass::Temporal && l.type.kind != r.type.kind) {
       not_yet("a comparison of different date and time types as a value", e.pos);
@@ -3198,6 +3284,7 @@ public:
     // A CHAR(n) compares without its trailing spaces: a parameter would need
     // them cut at run time, as a constant is cut here.
     if (col.sql.kind == SqlKind::Char && use != Use::Assigned) not_yet("a parameter compared with a CHAR(n) column", pos);
+    if (col.sql.kind == SqlKind::Numeric && use != Use::Assigned) refuse_numeric("a parameter compared or computed with a NUMERIC", pos);
     if (params_.size() <= n) params_.resize(n + 1);
     auto& p = params_[n];
     // PostgreSQL's code only for two comparisons. It types a $n by its first
@@ -3276,7 +3363,7 @@ public:
       case SqlKind::TimestampTz:
       case SqlKind::Date: return {!sum, kUndefinedFunction};
       case SqlKind::Time: return {!sum, kSyntaxError};
-      case SqlKind::Numeric: return {false, kSyntaxError};  // no column has it, nor an argument the binder takes
+      case SqlKind::Numeric: return {false, kFeatureNotSupported};  // a column's text: refuse_numeric
     }
     std::unreachable();
   }
@@ -3360,6 +3447,9 @@ public:
     }
     if (!arg) return {std::move(agg), "count"};
     const auto t = arg->type;
+    if (t.kind == SqlKind::Numeric && (e.fn != Fn::Count || agg.distinct)) {
+      refuse_numeric(std::string{aggregate_name(e.fn)} + (agg.distinct ? " of DISTINCT values" : "") + " of a NUMERIC", e.pos);
+    }
     if (auto s = aggregate_support(e.fn, t); !s.supported) {
       auto of = arg->kind == logical::Expr::Kind::Column ? " column" : " value";
       throw SqlError{std::string{aggregate_name(e.fn)} + " of a " + sql_type_name(t) + of + " is not supported", e.pos,
@@ -3412,6 +3502,11 @@ public:
   // An expression whose type is fixed by its target (an assigned column).
   auto value(const Table& t, const ast::Expr& e, const Column& target) -> logical::Expr {
     auto want = target.type;
+    // A number literal assigned to a NUMERIC: read as written, of any digits.
+    if (target.sql.kind == SqlKind::Numeric && e.kind == ast::Expr::Kind::Literal &&
+        (e.literal.kind == ast::Literal::Kind::Integer || e.literal.kind == ast::Literal::Kind::Number)) {
+      return fixed(numeric_bytes(e.literal.text, e.pos), target.sql);
+    }
     if (is_constant(e)) {
       // Out of the column's type, it is refused here, before anything runs,
       // as PostgreSQL's planner folds its assignment cast: so of several the
@@ -3429,6 +3524,10 @@ public:
         return logical::param(e.param, target.sql);
       case ast::Expr::Kind::Column: {
         const auto* c = column(t, e);
+        if ((c->sql.kind == SqlKind::Numeric) != (target.sql.kind == SqlKind::Numeric) &&
+            !type_refusal(c->sql.kind, target.sql.kind, true)) {
+          refuse_numeric("assigning a column of type " + pg_type_name(c->sql) + " to one of type " + pg_type_name(target.sql), e.pos);
+        }
         if (c->type != want) {
           throw SqlError{"column \"" + c->name + "\" is " + type_name(c->type), e.pos,
                          type_refusal(c->sql.kind, target.sql.kind, true).value_or(kSyntaxError)};
@@ -3443,6 +3542,7 @@ public:
           throw SqlError{std::string{"only column "} + op + " parameter and column " + op + " integer are supported", e.pos};
         }
         const auto* c = column(t, *e.lhs);
+        if (c->sql.kind == SqlKind::Numeric || target.sql.kind == SqlKind::Numeric) refuse_numeric(std::string{"operator "} + op + " of a NUMERIC", e.pos);
         // On integers and DECIMAL, of the assigned column's type: the
         // operator's result type is then the column's, and the row
         // builder's range check on the stored value is the one PostgreSQL's
@@ -3658,6 +3758,7 @@ public:
   // VARCHAR(n) or CHAR(n), whose casts round, cut or pad to the modifier.
   static auto uncast_param(const ast::Expr* e, const Column& c) -> const ast::Expr* {
     if (!param_cast(*e)) return e;
+    if (c.sql.kind == SqlKind::Numeric && e->cast_type == "numeric" && e->cast_typmods.empty()) return e->rhs.get();
     if (modified_cast(*e) || cast_type(*e).kind != c.sql.kind) not_yet("a cast of a parameter to other than its column's type", e->pos);
     return e->rhs.get();
   }
@@ -3869,10 +3970,15 @@ public:
     auto number = [&](SqlType t) { return integral(t) || floating(t); };
     auto a = lc.sql;
     auto b = rc.sql;
+    if (a.kind == SqlKind::Numeric || b.kind == SqlKind::Numeric) {
+      no_operator(a, written_op(w, op), b, w.pos);
+      numeric_compared(a, b, w.pos);
+    }
     if ((compared_type(a).identity == compared_type(b).identity && !bpchar_pair(a, b)) || (number(a) && number(b))) {
       return logical::compare(op, logical::column_of(table, lc), logical::column_of(table, rc));
     }
     no_operator(a, written_op(w, op), b, w.pos);
+    numeric_compared(a, b, w.pos);
     not_yet("comparing " + lc.name + " (" + sql_type_name(a) + ") with " + rc.name + " (" + sql_type_name(b) + ")", w.pos);
   }
 
@@ -3884,6 +3990,20 @@ public:
     if (type_class(a.kind) == type_class(b.kind) && time(a) == time(b)) return;
     throw SqlError{"operator does not exist: " + pg_type_name(a) + " " + std::string{written} + " " + pg_type_name(b), pos,
                    kUndefinedFunction};
+  }
+
+  // Arithmetic of a NUMERIC with a number: not yet (refuse_numeric). With
+  // another class PostgreSQL has no operator, 42883, the caller's.
+  static void numeric_computed(SqlType a, SqlType b, std::int32_t pos) {
+    if ((a.kind == SqlKind::Numeric || b.kind == SqlKind::Numeric) && type_class(a.kind) == type_class(b.kind)) {
+      refuse_numeric("arithmetic of a NUMERIC", pos);
+    }
+  }
+
+  // A NUMERIC compared: not yet (refuse_numeric), once PostgreSQL has the
+  // operator (no_operator before it).
+  static void numeric_compared(SqlType a, SqlType b, std::int32_t pos) {
+    if (a.kind == SqlKind::Numeric || b.kind == SqlKind::Numeric) refuse_numeric("a comparison of a NUMERIC column", pos);
   }
 
   // A CHAR(n) with a VARCHAR: PostgreSQL compares the two as bpchar, the
@@ -3901,6 +4021,7 @@ public:
   static auto joined_compare(ast::Compare::Op op, std::string_view written, std::uint32_t l, const Column& lc,
                              std::uint32_t r, const Column& rc, std::int32_t pos) -> logical::Expr {
     no_operator(lc.sql, written, rc.sql, pos);
+    numeric_compared(lc.sql, rc.sql, pos);
     if (bpchar_pair(lc.sql, rc.sql)) {
       not_yet("comparing " + lc.name + " (" + sql_type_name(lc.sql) + ") with " + rc.name + " (" + sql_type_name(rc.sql) + ")", pos);
     }
@@ -4308,6 +4429,7 @@ public:
     std::vector<logical::Expr> group_by;
     for (const auto& e : distinct_groups ? list : s.group_by) {
       auto [t, c] = resolve(e);
+      if (c->sql.kind == SqlKind::Numeric) refuse_numeric(std::string{distinct_groups ? "DISTINCT" : "GROUP BY"} + " of a NUMERIC column", e.pos);
       // A derived relation's groups are keyed by values the plan holds in
       // locals: integers and booleans (#833).
       if (Table::derived(t->id) && c->type != PhysType::I64 && c->type != PhysType::Bool) {
@@ -4376,6 +4498,7 @@ public:
     for (const auto& o : s.order_by) {
       if (o.expr.kind == ast::Expr::Kind::Column) {
         auto [t, c] = resolve(o.expr);
+        if (c->sql.kind == SqlKind::Numeric) refuse_numeric("ORDER BY a NUMERIC column", o.pos);
         auto key = aggregated ? grouped(*t, *c, o.pos) : logical::column_of(t->id, *c);
         keys.push_back({std::move(key), o.desc, o.nulls_first.value_or(o.desc)});
         continue;
@@ -4596,6 +4719,7 @@ public:
     }
     auto key = plain_output(e, resolve).expr;
     if (key.kind == logical::Expr::Kind::Param || key.kind == logical::Expr::Kind::Const) return std::nullopt;
+    if (key.type.kind == SqlKind::Numeric) refuse_numeric("ORDER BY a NUMERIC value", e.pos);
     return key;
   }
 
@@ -4672,10 +4796,17 @@ public:
       Arm arm;
       for (std::size_t i = 0; i < lo.size(); ++i) {
         auto type = set_type(lo[i].expr.type, ro[i].expr.type, l.untyped[i], r.untyped[i], what, q.pos);
+        // UNION ALL only carries a NUMERIC; the others compare its rows.
+        if (type.kind == SqlKind::Numeric && (op.kind != ast::SetOperation::Kind::Union || !op.all)) {
+          refuse_numeric(what + " of a NUMERIC column", q.pos);
+        }
         out.outputs.push_back({logical::param(0, type), lo[i].name});
         arm.untyped.push_back(l.untyped[i] && r.untyped[i]);
       }
-      for (const auto& o : q.order_by) out.order.push_back(set_order(o, out.outputs));
+      for (const auto& o : q.order_by) {
+        out.order.push_back(set_order(o, out.outputs));
+        if (out.outputs[out.order.back().column].expr.type.kind == SqlKind::Numeric) refuse_numeric("ORDER BY a NUMERIC column", o.pos);
+      }
       out.left = std::move(l.node);
       out.right = std::move(r.node);
       arm.node = logical::node(std::move(out));
@@ -4716,6 +4847,9 @@ public:
       -> SqlType {
     if (a == b) return a;
     auto refuse = [&] [[noreturn]] (const std::string& why) { not_yet(what + " of " + why, pos); };
+    if ((a.kind == SqlKind::Numeric || b.kind == SqlKind::Numeric) && type_class(a.kind) == type_class(b.kind)) {
+      refuse_numeric(what + " of " + pg_type_name(a) + " and " + pg_type_name(b), pos);
+    }
     if (a_untyped || b_untyped) refuse("a literal of no type and a column of another type");
     if (type_class(a.kind) != type_class(b.kind)) {
       throw SqlError{what + " types " + pg_type_name(a) + " and " + pg_type_name(b) + " cannot be matched", pos,
@@ -4810,11 +4944,15 @@ public:
   // it makes is not taken yet (0A000, #824).
   static void assigns_to(SqlType from, const Column& c, std::int32_t pos) {
     const auto to = c.sql;
+    if (from.kind == SqlKind::Numeric && to.kind == SqlKind::Numeric) return;  // its text, as it is stored
     if (from.kind != SqlKind::Numeric && assignable(from, to) && (to.kind != SqlKind::Char || from == to)) return;
     if (is_float(to) && (is_float(from) || is_integer(from))) return;
     if (auto refusal = type_refusal(from.kind, to.kind, true)) {
       throw SqlError{"column \"" + c.name + "\" is of type " + pg_type_name(to) + " but expression is of type " + pg_type_name(from),
                      pos, *refusal};
+    }
+    if (from.kind == SqlKind::Numeric || to.kind == SqlKind::Numeric) {
+      refuse_numeric("INSERT … SELECT of a " + pg_type_name(from) + " value into column \"" + c.name + "\" of type " + pg_type_name(to), pos);
     }
     const auto from_name = pg_type_name(from);
     const std::string article = from_name.find_first_of("aeiou") == 0 ? "an " : "a ";

@@ -562,7 +562,8 @@
 
 - name: CREATE TABLE AS of a NUMERIC of no precision
   features: [T172]
-  # a NUMERIC of no declared precision is not a column type yet (0A000)
+  # a NUMERIC column of no precision exists, but CREATE TABLE AS does not
+  # convert a query's numeric values to its text yet (0A000)
   unimplemented: true
   steps:
     - sql: CREATE TABLE ctn AS SELECT 1.5 AS x

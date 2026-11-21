@@ -1266,7 +1266,9 @@ auto sql_type_valid(SqlType t) -> bool {
     case SqlKind::TimestampTz:
     case SqlKind::Date:
     case SqlKind::Time: return t.length == 0 && t.precision == 0 && t.scale == 0;
-    case SqlKind::Numeric: return false;  // AVG's result: no column is declared one
+    // A column's has no modifier; AVG's result, which carries its sum's
+    // scale, is never a column's type.
+    case SqlKind::Numeric: return t.length == 0 && t.precision == 0 && t.scale == 0;
   }
   return false;  // a kind no build knows
 }
@@ -1405,7 +1407,11 @@ auto out_of_range(SqlType t, double v) -> std::optional<std::string> {
 }
 
 auto out_of_range(SqlType t, BytesView v) -> std::optional<std::string> {
-  if (t.kind != SqlKind::Text && t.kind != SqlKind::Varchar && t.kind != SqlKind::Char) return std::nullopt;
+  // A NUMERIC's text is read as UTF-8 first, as PostgreSQL checks a
+  // parameter's encoding before numeric_in reads it.
+  if (t.kind != SqlKind::Text && t.kind != SqlKind::Varchar && t.kind != SqlKind::Char && t.kind != SqlKind::Numeric) {
+    return std::nullopt;
+  }
   auto n = utf8_code_points(v);
   if (!n) return "invalid byte sequence for encoding \"UTF8\"";
   if (t.kind == SqlKind::Varchar && *n > t.length) {
@@ -1428,6 +1434,8 @@ constexpr RangeMessage kRangeMessages[] = {
     {"value out of range: overflow", "22003"},   // REAL
     {"value out of range: underflow", "22003"},  // REAL
     {"numeric field overflow", "22003"},         // DECIMAL(p, s)
+    {"value overflows numeric format", "22003"},  // NUMERIC: numeric_in
+    {"invalid input syntax for type numeric", "22P02"},  // NUMERIC: numeric_in
     {"value too long for type character varying", "22001"},
     {"value too long for type character(", "22001"},
     {"invalid byte sequence for encoding", "22021"},  // TEXT, VARCHAR
@@ -1557,10 +1565,16 @@ auto name_entry_key(std::string_view name) -> Bytes {
 namespace {
 
 // A CHAR(n) is stored without its trailing spaces, which a key built from a
-// parameter would keep: it is not a key or index column yet.
-void refuse_char_key(const Column& c) {
+// parameter would keep: it is not a key or index column yet. A NUMERIC of no
+// precision has no order-preserving key form yet.
+void refuse_key_type(const Column& c) {
   if (c.sql.kind == SqlKind::Char) {
     throw DdlRefused("CHAR(n) column \"" + c.name + "\" as a primary key, unique or index column is not supported yet; use VARCHAR(n)",
+                     kFeatureNotSupported);
+  }
+  if (c.sql.kind == SqlKind::Numeric) {
+    throw DdlRefused("NUMERIC column \"" + c.name + "\" without a precision as a primary key, unique or index column is not "
+                     "supported yet; declare NUMERIC(p, s)",
                      kFeatureNotSupported);
   }
 }
@@ -2495,7 +2509,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       t.columns.push_back(std::move(c));
     }
     for (const auto& p : ct->pk) {
-      refuse_char_key(*t.column(p));
+      refuse_key_type(*t.column(p));
       t.pk_col_ids.push_back(t.column(p)->id);
     }
     if (ct->pk.empty()) {
@@ -2521,7 +2535,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       if (taken(ix.name)) throw DdlRefused("relation \"" + ix.name + "\" already exists", kDuplicateTable);
       ix.unique = true;
       for (const auto& c : u.columns) {
-        refuse_char_key(*t.column(c));
+        refuse_key_type(*t.column(c));
         ix.parts.push_back({t.column(c)->id, false});
       }
       ix.id = reserve_ids(next->next_id_, 1);
@@ -2591,7 +2605,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       if (std::ranges::find(ix.parts, col->id, &IndexPart::col_id) != ix.parts.end()) {
         throw DdlRefused("column \"" + col->name + "\" appears twice in the index", kDuplicateColumn);
       }
-      refuse_char_key(*col);
+      refuse_key_type(*col);
       ix.parts.push_back({col->id, c.desc});
     }
     ix.id = reserve_ids(next->next_id_, 1);

@@ -67,6 +67,15 @@ private:
 // text (PhysType::Num, bc_num_quotient).
 [[nodiscard]] auto average_text(std::int64_t sum, std::int64_t count, std::uint8_t scale) -> std::string;
 
+// Text as PostgreSQL's numeric_in reads it, written back as numeric_out
+// writes it: the form a NUMERIC column stores (PhysType::Num). Every
+// digit and the scale are kept ("1.50" stays 1.50, "1.5e1" is 15.0); NaN
+// and the infinities are their names; 0x, 0o and 0b integers and _
+// between digits are read as PostgreSQL 16 reads them. Throws TextError:
+// 22P02 for text that is not a number, 22003 past numeric's format (more
+// than 131072 digits before the point or 16383 after it).
+[[nodiscard]] auto numeric_in(std::string_view text) -> std::string;
+
 // Text functions of UTF-8 text, counted in characters as PostgreSQL's
 // are, shared by the binder's constant folds and the plan API's runtime
 // (bc_plan.h). UPPER and LOWER fold ASCII only, the layer's one collation
@@ -955,7 +964,7 @@ auto from_text(std::string_view text, SqlType t, bool assigned_only) -> Datum {
     case SqlKind::TimestampTz: return timestamptz_from(text);
     case SqlKind::Date: return date_from(text);
     case SqlKind::Time: return time_from(text);
-    case SqlKind::Numeric: break;  // no parameter has it: HAVING on AVG is refused
+    case SqlKind::Numeric: return text_bytes(numeric_in(text));  // its numeric_out text
   }
   return text_bytes(text);
 }
@@ -1013,6 +1022,172 @@ auto average_text(std::int64_t sum, std::int64_t count, std::uint8_t scale) -> s
   auto text = whole + (frac_digits > 0 ? "." + digits.substr(digits.size() - frac_digits) : "");
   auto zero = std::ranges::all_of(digits, [](char c) { return c == '0'; });
   return (sum < 0 && !zero ? "-" : "") + text;
+}
+
+namespace {
+
+// numeric's format: base-10000 digits of weight at most 32767, so 131072
+// decimal digits before the point, and a display scale of at most 16383.
+constexpr std::int64_t kNumericMaxWholeDigits = 131072;
+constexpr std::int64_t kNumericMaxScale = 16383;
+// numeric_in refuses an exponent past this before it looks further.
+constexpr std::int64_t kNumericMaxExponent = std::numeric_limits<std::int32_t>::max() / 2;
+
+[[noreturn]] void numeric_overflow() { throw TextError("value overflows numeric format", "22003"); }
+
+auto is_digit_in(char c, int base) -> bool {
+  if (base == 16) return std::isxdigit(static_cast<unsigned char>(c)) != 0;
+  return c >= '0' && c < static_cast<char>('0' + base);
+}
+
+// A 0x, 0o or 0b integer's digits (after the prefix, _ between them) as
+// decimal digits, without leading zeros. 9 decimal digits a limb, the
+// lowest first.
+auto non_decimal_digits(std::string_view s, int base, std::string_view text, std::size_t& at) -> std::string {
+  std::vector<std::uint32_t> limbs{0};
+  constexpr std::uint64_t kLimb = 1'000'000'000;
+  auto any = false;
+  while (at < s.size()) {
+    auto c = s[at];
+    if (c == '_') {
+      ++at;
+      if (at >= s.size() || !is_digit_in(s[at], base)) bad_text("numeric", text);
+      continue;
+    }
+    if (!is_digit_in(c, base)) break;
+    auto d = static_cast<std::uint64_t>(std::isdigit(static_cast<unsigned char>(c)) != 0
+                                            ? c - '0'
+                                            : std::tolower(static_cast<unsigned char>(c)) - 'a' + 10);
+    std::uint64_t carry = d;
+    for (auto& l : limbs) {
+      auto x = std::uint64_t{l} * static_cast<std::uint64_t>(base) + carry;
+      l = static_cast<std::uint32_t>(x % kLimb);
+      carry = x / kLimb;
+    }
+    if (carry != 0) limbs.push_back(static_cast<std::uint32_t>(carry));
+    if (std::ssize(limbs) * 9 > kNumericMaxWholeDigits + 9) numeric_overflow();
+    any = true;
+    ++at;
+  }
+  if (!any) bad_text("numeric", text);
+  auto out = std::to_string(limbs.back());
+  for (auto i = limbs.size() - 1; i-- > 0;) {
+    auto part = std::to_string(limbs[i]);
+    out += std::string(9 - part.size(), '0') + part;
+  }
+  return out;
+}
+
+}  // namespace
+
+auto numeric_in(std::string_view text) -> std::string {
+  auto s = text;
+  while (!s.empty() && is_space(s.front())) s.remove_prefix(1);
+  auto rest_is_space = [&](std::size_t from) {
+    if (!std::ranges::all_of(s.substr(from), is_space)) bad_text("numeric", text);
+  };
+  std::size_t at = 0;
+  auto negative = false;
+  if (at < s.size() && (s[at] == '+' || s[at] == '-')) negative = s[at++] == '-';
+  // NaN, Infinity and inf, as float8in spells them: NaN takes no sign.
+  if (at >= s.size() || (s[at] != '.' && std::isdigit(static_cast<unsigned char>(s[at])) == 0)) {
+    auto starts = [&](std::size_t from, std::string_view word) {
+      return s.size() - from >= word.size() && iequals(s.substr(from, word.size()), word);
+    };
+    if (starts(0, "nan")) {
+      rest_is_space(3);
+      return "NaN";
+    }
+    auto len = starts(at, "infinity") ? std::size_t{8} : starts(at, "inf") ? std::size_t{3} : std::size_t{0};
+    if (len == 0) bad_text("numeric", text);
+    rest_is_space(at + len);
+    return negative ? "-Infinity" : "Infinity";
+  }
+  // 0x, 0o and 0b: an integer, scale 0.
+  if (s[at] == '0' && at + 1 < s.size()) {
+    auto p = std::tolower(static_cast<unsigned char>(s[at + 1]));
+    auto base = p == 'x' ? 16 : p == 'o' ? 8 : p == 'b' ? 2 : 10;
+    if (base != 10) {
+      at += 2;
+      auto digits = non_decimal_digits(s, base, text, at);
+      rest_is_space(at);
+      while (digits.size() > 1 && digits.front() == '0') digits.erase(0, 1);
+      if (std::ssize(digits) > kNumericMaxWholeDigits) numeric_overflow();
+      return (negative && digits != "0" ? "-" : "") + digits;
+    }
+  }
+  // [digits][.digits][e[+-]digits], _ between digits, as set_var_from_str.
+  std::string digits;
+  std::int64_t whole = 0;  // digits before the point
+  std::int64_t scale = 0;  // digits after it
+  auto point = false;
+  if (s[at] == '.') {
+    point = true;
+    ++at;
+  }
+  if (at >= s.size() || std::isdigit(static_cast<unsigned char>(s[at])) == 0) bad_text("numeric", text);
+  while (at < s.size()) {
+    auto c = s[at];
+    if (std::isdigit(static_cast<unsigned char>(c)) != 0) {
+      digits.push_back(c);
+      ++(point ? scale : whole);
+      ++at;
+    } else if (c == '.') {
+      if (point) bad_text("numeric", text);
+      point = true;
+      ++at;
+      if (at < s.size() && s[at] == '_') bad_text("numeric", text);
+    } else if (c == '_') {
+      ++at;
+      if (at >= s.size() || std::isdigit(static_cast<unsigned char>(s[at])) == 0) bad_text("numeric", text);
+    } else {
+      break;
+    }
+  }
+  if (at < s.size() && (s[at] == 'e' || s[at] == 'E')) {
+    ++at;
+    auto neg_exp = false;
+    if (at < s.size() && (s[at] == '+' || s[at] == '-')) neg_exp = s[at++] == '-';
+    if (at >= s.size() || std::isdigit(static_cast<unsigned char>(s[at])) == 0) bad_text("numeric", text);
+    std::int64_t exp = 0;
+    while (at < s.size()) {
+      auto c = s[at];
+      if (std::isdigit(static_cast<unsigned char>(c)) != 0) {
+        exp = exp * 10 + (c - '0');
+        if (exp > kNumericMaxExponent) numeric_overflow();
+        ++at;
+      } else if (c == '_') {
+        ++at;
+        if (at >= s.size() || std::isdigit(static_cast<unsigned char>(s[at])) == 0) bad_text("numeric", text);
+      } else {
+        break;
+      }
+    }
+    if (neg_exp) exp = -exp;
+    whole += exp;
+    scale = std::max<std::int64_t>(0, scale - exp);
+  }
+  rest_is_space(at);
+  if (scale > kNumericMaxScale) numeric_overflow();
+  // The digits sit at places whole-1 down to whole-size; the text runs from
+  // the larger of whole-1 and 0 down to -scale, every place below the
+  // last digit a zero (scale never cuts a digit: see above).
+  auto first = digits.find_first_not_of('0');
+  auto zero = first == std::string::npos;
+  if (!zero && whole - static_cast<std::int64_t>(first) > kNumericMaxWholeDigits) numeric_overflow();
+  auto place_digit = [&](std::int64_t place) -> char {
+    auto i = whole - 1 - place;
+    return i >= 0 && i < std::ssize(digits) ? digits[static_cast<std::size_t>(i)] : '0';
+  };
+  std::string out;
+  if (negative && !zero) out.push_back('-');
+  auto top = zero ? 0 : std::max<std::int64_t>(0, whole - 1 - static_cast<std::int64_t>(first));
+  for (auto place = top; place >= 0; --place) out.push_back(place_digit(place));
+  if (scale > 0) {
+    out.push_back('.');
+    for (std::int64_t place = -1; place >= -scale; --place) out.push_back(place_digit(place));
+  }
+  return out;
 }
 
 }  // namespace bytecask::sql
