@@ -378,12 +378,14 @@ the layer has no `create_manifest` for vacuum to pause for. Both are #496's.
 ## Prepared statements and portals
 
 Named prepared statements and portals are part of the session, as the
-protocol defines them, and portals still end with their transaction. The
-compiled plans they name come from `Database::prepare`'s cache, which is
-shared by every session and keyed by statement text. #549 bounds that
-cache. With sessions it should be a reference-counted handle a session
-holds, so the cache can evict a plan no session uses while a session's
-named statement keeps its own.
+protocol defines them, and portals still end with their transaction. A
+named statement holds its text and its record (parameter types, result
+columns, command, version), not a plan: each use resolves the text where it
+runs, through the open block's transaction or in autocommit, where the
+plan comes from `Database::prepare`'s cache, which is shared by every
+session and keyed by statement text (server_design.md, *Extended query*).
+#549 bounds that cache; holding no plan, a named statement keeps nothing
+the cache may evict.
 
 ## TLS and authentication
 

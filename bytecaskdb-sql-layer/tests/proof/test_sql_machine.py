@@ -1038,6 +1038,49 @@ class SqlMachine(Sides, RuleBasedStateMachine):
     def drop_table(self, data):
         self.drop(data.draw(st.sampled_from(TABLE_NAMES), label="name"), data.draw(st.booleans(), label="if exists"))
 
+    @precondition(lambda self: self.txn is None and self.wire is not None)
+    @rule(data=st.data())
+    def select_star_across_add_column(self, data):
+        """A SELECT * across ADD COLUMN (docs/transaction_design.md, *Stages of
+        transactional DDL*, stage 0): by Simple Query it returns the new
+        column; a statement prepared before is 0A000 "cached plan must not
+        change result type". On a table of its own, outside the model."""
+        import psycopg
+
+        default = data.draw(st.none() | st.integers(-5, 5), label="default")
+        for sql in ("DROP TABLE IF EXISTS star", "CREATE TABLE star (k INTEGER PRIMARY KEY, a INTEGER)",
+                    "INSERT INTO star VALUES (1, 10)"):
+            assert self.both(sql).error is None, sql
+        sides = {"postgres": self.pg.conn, "server": self.wire}
+
+        self.star_statements = getattr(self, "star_statements", 0) + 1
+        name = f"star{self.star_statements}".encode()
+
+        def outcome(r):
+            if r.status != psycopg.pq.ExecStatus.TUPLES_OK:
+                return r.error_field(psycopg.pq.DiagnosticField.SQLSTATE).decode()
+            return ([r.fname(j).decode() for j in range(r.nfields)],
+                    [[r.get_value(i, j) for j in range(r.nfields)] for i in range(r.ntuples)])
+
+        def prepared(conn):
+            return outcome(conn.pgconn.exec_prepared(name, []))
+
+        def simple(conn):
+            return outcome(conn.pgconn.exec_(b"SELECT * FROM star"))
+
+        for conn in sides.values():
+            assert conn.pgconn.prepare(name, b"SELECT * FROM star").status == psycopg.pq.ExecStatus.COMMAND_OK
+        before = {k: prepared(c) for k, c in sides.items()}
+        assert before["postgres"] == before["server"], before
+        add = "ALTER TABLE star ADD COLUMN b INTEGER" + ("" if default is None else f" DEFAULT {default}")
+        assert self.both(add).error is None
+        by_text = {k: simple(c) for k, c in sides.items()}
+        assert by_text["postgres"] == by_text["server"], by_text
+        assert by_text["server"][0] == ["k", "a", "b"]
+        after = {k: prepared(c) for k, c in sides.items()}
+        assert after == {"postgres": "0A000", "server": "0A000"}, after
+        assert self.both("DROP TABLE star").error is None
+
     def insert_row(self, data):
         missing = [n for n in TABLE_NAMES if n not in self.tables]
         if missing and data.draw(st.integers(0, 9), label="missing table?") == 0:

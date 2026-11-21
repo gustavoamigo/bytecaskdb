@@ -462,18 +462,52 @@ against the pinned version on every execution (`docs/plan_api_design.md`,
   indexes: the runtime writes the entries of every index the pinned version
   has.
 
-So adding a column invalidates nothing: no plan names the new column, and
-rows that plans compiled before it write get its default from
-`bc_row_begin`. The binder keeps that true for statement text too: an
+So adding a column leaves a plan compatible: no plan names the new column,
+and rows that plans compiled before it write get its default from
+`bc_row_begin`. Adding an index does too: a write plan compiled before it
+maintains it. Dropping an index invalidates the plans that scan it.
+Dropping a table invalidates every plan on it. An incompatible plan is
+`BC_E_LAYOUT` and does not run.
+
+Compatibility is what the runtime checks, for a DDL that races a run. It
+does not decide when the embedded API binds a statement again: **a cached
+plan bound at a catalog version behind the live one is bound again at its
+next run, after any DDL**, GRANT and CREATE ROLE included
+(docs/transaction_design.md, *Stages of transactional DDL*, stage 0). The
+version comparison is the trigger, so a plan whose tables gained a column
+binds again even though it stays compatible: `*`, `t.*` and NATURAL expand
+again, USING resolves again, and a name a new column makes ambiguous is
+42702, as PostgreSQL binds a statement against its latest catalog. An
 `INSERT` without a column list fills the leading columns and gives the rest
-their defaults, as PostgreSQL does, so the same text binds the same way
-before and after the column is added. Adding an index invalidates nothing
-either: a write plan compiled before it maintains it, and a read plan does
-not use it until it is recompiled for another reason. Dropping an index
-invalidates the plans that scan it. Dropping a table invalidates every plan
-on it, and recompiling one fails at bind. An incompatible plan is
-`BC_E_LAYOUT` and does not run; the embedded API recompiles it from its
-text and runs it again.
+their defaults, as PostgreSQL does, so it binds to the same plan after an
+ADD COLUMN. A `*` over a view gives the view's recorded columns; a view
+whose own `*` would now give other columns is refused when read (0A000),
+where PostgreSQL keeps the columns of its CREATE VIEW.
+
+The result type follows PostgreSQL 17. A statement run by text binds with
+inferred parameter types and returns the live catalog's columns. A held
+`Statement` keeps the parameter types and result columns it fixed: it binds
+again with its own types, a type that no longer fits is the binder's error,
+and other result columns are 0A000 "cached plan must not change result
+type". A rebind whose parameter types and result columns are unchanged
+swaps the new plan into the `Statement`; otherwise the new plan goes into a
+new `Statement` that replaces it in the cache, the old one valid for its
+holders until `close()`, and a run or a prepare of the text then uses the
+new one. A caller's record (`ResultCheck`, the server's from Parse) binds
+the same way against the record: the cache's plan when its parameter types
+are the record's, else a plan for that run alone.
+
+The cost is one compile per cached text after each DDL, of any object, and
+not again until the next. Two runs pay per call instead: a held `Statement`
+whose rebind keeps failing binds once per call until it is prepared again,
+and a record whose types differ from the cache's binds a one-shot plan per
+call. A replaced `Statement` stays in memory until `close()`; #549 bounds
+them with the cache.
+
+A transaction binds only against the catalog it pinned
+(docs/transaction_design.md, *A transaction binds only against its own
+catalog*): it runs the shared plan only when that plan was bound at exactly
+its pin, and otherwise compiles the statement privately at the pin.
 
 ## DDL
 
@@ -595,8 +629,9 @@ on its table is a conflict. `tests/plan_writes_test.cpp`: `bc_insert`,
 `bc_update`, `bc_delete` and `bc_del_range` keep every index exact,
 unique, `DESC` and nullable parts included, and an index created after a
 plan was compiled is maintained by it. `tests/api_test.cpp`: through SQL,
-`ADD COLUMN` and `CREATE INDEX` keep every cached plan, a drop refuses at
-recompile; unique indexes and ranges on `DESC` parts, nullable and not.
+every cached plan binds again once after any DDL, `ADD COLUMN` and
+`CREATE INDEX` included, and a statement over a dropped table is the
+binder's error when it binds again; unique indexes and ranges on `DESC` parts, nullable and not.
 `tests/tcc_test.cpp`: a unique insert raced by another commit conflicts,
 and its retry raises the duplicate. `tests/tprocc_test.cpp`: the
 nine TPROC-C tables and their indexes, created by SQL DDL, reopened and

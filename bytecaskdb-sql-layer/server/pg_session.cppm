@@ -538,7 +538,11 @@ struct Prepared {
   std::string encoding;            // SetEncoding
   TransactionModes modes;          // SetTransaction
   std::string name;                // Savepoint, RollbackTo, Release
-  const Statement* stmt{nullptr};  // Sql, and a DECLARE's query: from Database::prepare, valid until close
+  // Sql, and a DECLARE's query: its text, and the record Parse fixed
+  // (docs/server_design.md, *Extended query*). Each use resolves the text
+  // where it runs: through the open block, or in autocommit.
+  std::string sql;
+  std::optional<StatementRecord> record;
   std::optional<ast::CursorStatement> cursor;  // Cursor
 };
 
@@ -1257,14 +1261,39 @@ private:
     if (d.binary) throw SessionError("DECLARE BINARY CURSOR is not supported: binary results are not", "0A000");
   }
 
-  // The statement a cursor statement prepares: a DECLARE's query, else none.
-  auto prepare_cursor(const ast::CursorStatement& c) -> const Statement* {
+  // The open block's transaction, explicit or implicit; null outside one.
+  auto block() -> Transaction* {
+    if (in_block_ && txn_) return &*txn_;
+    if (implicit_) return &*implicit_;
+    return nullptr;
+  }
+
+  // The record of a text run by itself: bound against the block's catalog in
+  // a block, the live one outside (docs/server_design.md, *A session*).
+  auto describe_text(const std::string& sql) -> StatementRecord {
+    auto* b = block();
+    return b != nullptr ? b->refit(sql, ResultCheck::none()) : db_.refit(sql, ResultCheck::none());
+  }
+
+  // A Parsed statement checked where it runs, against the record Parse fixed.
+  void refit_given(const Prepared& p) {
+    if (!p.record || p.kind != Classified::Kind::Sql) return;
+    auto* b = block();
+    if (b != nullptr) {
+      (void)b->refit(p.sql, ResultCheck::given(*p.record));
+    } else {
+      (void)db_.refit(p.sql, ResultCheck::given(*p.record));
+    }
+  }
+
+  // The record of a cursor statement's query: a DECLARE's, else none.
+  auto prepare_cursor(const ast::CursorStatement& c) -> std::optional<StatementRecord> {
     const auto* d = std::get_if<ast::DeclareCursor>(&c);
-    if (d == nullptr) return nullptr;
+    if (d == nullptr) return std::nullopt;
     check_declare(*d);
-    const auto& stmt = db_.prepare(d->query);
-    if (stmt.command() != Command::Select) throw SessionError("a cursor needs a SELECT", "42601");
-    return &stmt;
+    auto record = describe_text(d->query);
+    if (record.ddl || record.command != Command::Select) throw SessionError("a cursor needs a SELECT", "42601");
+    return record;
   }
 
   // A cursor whose fetch failed cannot be run (55000) but can be closed: `to_close`.
@@ -1279,13 +1308,15 @@ private:
   // The cursor a DECLARE opens: in the block's transaction, or, outside one,
   // in a transaction of its own that commits at once. Outside a block it is
   // always a hold cursor, taken on the snapshot of that moment.
-  auto declare_cursor(const ast::DeclareCursor& d, const Statement& stmt, const std::vector<Value>& params) -> Cursor {
+  // A DECLARE runs its query by text.
+  auto declare_cursor(const ast::DeclareCursor& d, const std::vector<Value>& params) -> Cursor {
     auto kind = d.hold || !in_block_ ? Holdability::Hold : Holdability::Plain;
     auto scrolling = d.scroll == ast::DeclareCursor::Scroll::NoScroll ? Scrolling::ForwardOnly : Scrolling::Any;
-    if (in_block_) return txn_->open_cursor(stmt, params, kind, scrolling);
-    if (implicit_) return implicit_->open_cursor(stmt, params, kind, scrolling);
+    const auto none = ResultCheck::none();
+    if (in_block_) return txn_->open_cursor(d.query, none, params, kind, scrolling);
+    if (implicit_) return implicit_->open_cursor(d.query, none, params, kind, scrolling);
     auto t = db_.begin();
-    auto cursor = t.open_cursor(stmt, params, kind, scrolling);
+    auto cursor = t.open_cursor(d.query, none, params, kind, scrolling);
     (void)t.commit();
     return cursor;
   }
@@ -1293,21 +1324,22 @@ private:
   // UPDATE or DELETE ... WHERE CURRENT OF c, on the row c stands on (docs/cursor_design.md,
   // *WHERE CURRENT OF*). Outside a block it is a statement of its own, as
   // every statement is; the cursor there is a hold cursor.
-  auto run_positioned(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts) -> Rows {
-    const auto name = std::string{stmt.current_of()};
+  auto run_positioned(const std::string& sql, const StatementRecord& record, const ResultCheck& check,
+                      const std::vector<Value>& params, const ExecutionOptions& opts) -> Rows {
+    const auto& name = record.current_of;
     auto& cursor = find_cursor(name);
     try {
-      if (in_block_) return txn_->execute_current_of(stmt, params, cursor.cursor, opts);
-      if (implicit_) return implicit_->execute_current_of(stmt, params, cursor.cursor, opts);
+      if (in_block_) return txn_->execute_current_of(sql, check, params, cursor.cursor, opts);
+      if (implicit_) return implicit_->execute_current_of(sql, check, params, cursor.cursor, opts);
       auto t = db_.begin();
-      auto rows = t.execute_current_of(stmt, params, cursor.cursor, opts);
+      auto rows = t.execute_current_of(sql, check, params, cursor.cursor, opts);
       (void)t.commit();
       return rows;
     } catch (const CurrentOfRefused& e) {
       using Why = CurrentOfRefused::Why;
       auto what = e.why() == Why::NotOnRow  ? "is not positioned on a row"
                   : e.why() == Why::Held    ? "is held from a previous transaction"
-                                            : "is not a simply updatable scan of table \"" + std::string{stmt.current_of_table()} + "\"";
+                                            : "is not a simply updatable scan of table \"" + record.current_of_table + "\"";
       throw SessionError("cursor \"" + name + "\" " + what, "24000");
     }
   }
@@ -1325,8 +1357,7 @@ private:
 
   // DECLARE, FETCH, MOVE or CLOSE inside the block. A failure here fails the
   // block through the caller, which closes the cursors with the transaction.
-  auto run_cursor(const ast::CursorStatement& c, const Statement* stmt, const std::vector<Value>& params)
-      -> CursorReply {
+  auto run_cursor(const ast::CursorStatement& c, const std::vector<Value>& params) -> CursorReply {
     refuse_if_failed();
     CursorReply out;
     if (const auto* d = std::get_if<ast::DeclareCursor>(&c)) {
@@ -1335,8 +1366,8 @@ private:
       if (cursors_.contains(d->name) || portals_.contains(d->name)) {
         throw SessionError("cursor \"" + d->name + "\" already exists", "42P03");
       }
-      enter_statement(*stmt);
-      cursors_.emplace(d->name, SessionCursor{declare_cursor(*d, *stmt, params), d->hold || !in_block_});
+      enter_statement(Command::Select);
+      cursors_.emplace(d->name, SessionCursor{declare_cursor(*d, params), d->hold || !in_block_});
       out.tag = "DECLARE CURSOR";
     } else if (const auto* f = std::get_if<ast::FetchCursor>(&c)) {
       auto& cursor = find_cursor(f->name);
@@ -1413,9 +1444,9 @@ private:
       switch (c.kind) {
         case Classified::Kind::Empty: simple_reply('I'); break;
         case Classified::Kind::Cursor: {
-          const auto* stmt = prepare_cursor(*c.cursor);
-          if (stmt != nullptr && !stmt->params().empty()) throw SessionError("there is no parameter $1", "42P02");
-          auto reply = run_cursor(*c.cursor, stmt, {});
+          auto record = prepare_cursor(*c.cursor);
+          if (record && !record->params.empty()) throw SessionError("there is no parameter $1", "42P02");
+          auto reply = run_cursor(*c.cursor, {});
           if (reply.returns_rows) {
             row_description(result_columns(reply.rows));
             data_rows(reply.rows);
@@ -1443,23 +1474,26 @@ private:
         case Classified::Kind::Sql: {
           last_text_ = c.sql;
           refuse_sql_if_failed(c.sql);
-          const auto& stmt = db_.prepare(c.sql);
-          if (!stmt.params().empty()) throw SessionError("there is no parameter $1", "42P02");
-          if (implicit_ && stmt.is_ddl()) refuse_ddl_beside_others();
-          enter_statement(stmt);
+          // By text, always (docs/server_design.md, *Simple query*): its
+          // result is the columns its catalog gives, never 0A000.
+          auto record = describe_text(c.sql);
+          if (!record.params.empty()) throw SessionError("there is no parameter $1", "42P02");
+          if (implicit_ && record.ddl) refuse_ddl_beside_others();
+          enter_statement(record.command);
           auto opts = run_options();
-          auto rows = !stmt.current_of().empty() ? run_positioned(stmt, {}, opts)
-                      : in_block_                ? txn_->execute(stmt, {}, opts)
-                      : implicit_                ? implicit_->execute(stmt, {}, opts)
-                                                 : db_.execute(stmt, {}, opts);
-          if (returns_rows(stmt)) {
+          const auto none = ResultCheck::none();
+          auto rows = !record.current_of.empty() ? run_positioned(c.sql, record, none, {}, opts)
+                      : in_block_                ? txn_->execute(c.sql, none, {}, opts)
+                      : implicit_                ? implicit_->execute(c.sql, none, {}, opts)
+                                                 : db_.execute(c.sql, none, {}, opts);
+          if (returns_rows(record)) {
             std::vector<ResultColumn> cols;
             for (std::size_t i = 0; i < rows.columns.size(); ++i) cols.push_back({rows.columns[i], rows.types.at(i)});
             row_description(cols);
             data_rows(rows);
           }
           notices(rows);
-          complete(command_tag(stmt.command(), rows));
+          complete(command_tag(record.command, rows));
           break;
         }
       }
@@ -1517,18 +1551,19 @@ private:
     if (c.kind == Classified::Kind::Call || c.kind == Classified::Kind::Stat) {
       throw SessionError("this statement runs as a simple Query, not as a prepared statement", "0A000");
     }
-    Prepared p{c.kind, c.control, c.encoding, c.modes, c.name, nullptr, std::move(c.cursor)};
+    Prepared p{c.kind, c.control, c.encoding, c.modes, c.name, {}, std::nullopt, std::move(c.cursor)};
     if (c.kind == Classified::Kind::Stats) refuse_if_failed();
     if (c.kind == Classified::Kind::Cursor) {
       refuse_if_failed();
-      p.stmt = prepare_cursor(*p.cursor);
-      if (p.stmt != nullptr) db_.refit(*p.stmt);
+      p.record = prepare_cursor(*p.cursor);
+      if (const auto* d = std::get_if<ast::DeclareCursor>(&*p.cursor)) p.sql = d->query;
     }
     if (c.kind == Classified::Kind::Sql) {
       last_text_ = c.sql;
       refuse_sql_if_failed(c.sql);
-      p.stmt = &db_.prepare(c.sql);
-      db_.refit(*p.stmt);  // a cached plan a DDL since made stale describes the old types
+      // The record is fixed here: against the block's catalog in a block.
+      p.sql = c.sql;
+      p.record = describe_text(c.sql);
     }
     statements_[name] = p;
     simple_reply('1');
@@ -1554,8 +1589,8 @@ private:
     for (std::int16_t i = 0; i < formats; ++i) {
       if (body.i16() != 0) throw SessionError("binary format is not supported", "0A000");
     }
-    if (p.stmt != nullptr) db_.refit(*p.stmt);  // a DDL since Parse
-    auto infos = p.stmt != nullptr ? p.stmt->params() : std::vector<ParamInfo>{};
+    refit_given(p);  // binds where it runs, with the types Parse fixed
+    auto infos = p.record ? p.record->params : std::vector<ParamInfo>{};
     auto n = body.i16();
     if (n < 0 || static_cast<std::size_t>(n) != infos.size()) {
       throw SessionError("bind message supplies " + std::to_string(n) + " parameters, but prepared statement \"" +
@@ -1587,8 +1622,8 @@ private:
   }
 
   // A SELECT, or a write with RETURNING: its rows are described and sent.
-  static auto returns_rows(const Statement& stmt) -> bool {
-    return stmt.command() == Command::Select || !stmt.columns().empty();
+  static auto returns_rows(const StatementRecord& r) -> bool {
+    return !r.ddl && (r.command == Command::Select || !r.columns.empty());
   }
 
   void describe_result(const Prepared& p) {
@@ -1607,8 +1642,8 @@ private:
       }
       return;
     }
-    if (p.stmt != nullptr && returns_rows(*p.stmt)) {
-      row_description(p.stmt->columns());
+    if (p.record && returns_rows(*p.record)) {
+      row_description(p.record->columns);
     } else {
       no_data();
     }
@@ -1619,15 +1654,17 @@ private:
     auto name = std::string{body.cstr()};
     if (what == 'S') {
       const auto& p = find_statement(name);
-      if (p.stmt != nullptr) db_.refit(*p.stmt);
-      auto infos = p.stmt != nullptr ? p.stmt->params() : std::vector<ParamInfo>{};
+      refit_given(p);
+      auto infos = p.record ? p.record->params : std::vector<ParamInfo>{};
       out_.begin('t');
       out_.i16(static_cast<std::int16_t>(infos.size()));
       for (const auto& i : infos) out_.i32(type_info(i.type).oid);
       out_.end();
       describe_result(p);
     } else if (what == 'P') {
-      describe_result(find_portal(name).prepared);
+      const auto& p = find_portal(name).prepared;
+      refit_given(p);
+      describe_result(p);
     } else {
       throw SessionError("invalid DESCRIBE message subtype", "08P01");
     }
@@ -1689,22 +1726,24 @@ private:
       return true;
     }
     if (p.kind == Classified::Kind::Cursor) {
-      last_text_ = p.stmt != nullptr ? p.stmt->sql() : std::string{};
-      auto reply = run_cursor(*p.cursor, p.stmt, portal.params);
+      last_text_ = p.sql;
+      auto reply = run_cursor(*p.cursor, portal.params);
       if (reply.returns_rows) data_rows(reply.rows);
       complete(reply.tag);
       return true;
     }
-    last_text_ = p.stmt->sql();
+    last_text_ = p.sql;
     refuse_if_failed();
     Rows rows;
-    enter_statement(*p.stmt);
-    if (!p.stmt->current_of().empty()) {
-      rows = run_positioned(*p.stmt, portal.params, run_options());
+    const auto& record = *p.record;
+    const auto check = ResultCheck::given(record);
+    enter_statement(record.command);
+    if (!record.current_of.empty()) {
+      rows = run_positioned(p.sql, record, check, portal.params, run_options());
     } else if (in_block_) {
-      rows = txn_->execute(*p.stmt, portal.params, run_options());
+      rows = txn_->execute(p.sql, check, portal.params, run_options());
     } else if (implicit_) {
-      rows = implicit_->execute(*p.stmt, portal.params, run_options());
+      rows = implicit_->execute(p.sql, check, portal.params, run_options());
     } else {
       auto flush_after = false;
       switch (lookahead(flush_after)) {
@@ -1715,29 +1754,29 @@ private:
         case Lookahead::Sync:
           // The block's one statement, as PQexecParams sends it: autocommit,
           // with its conflict retry, as a simple Query runs it.
-          rows = db_.execute(*p.stmt, portal.params, run_options());
+          rows = db_.execute(p.sql, check, portal.params, run_options());
           break;
         case Lookahead::Other:
           // Two or more: PostgreSQL's implicit transaction, committed at Sync.
-          if (p.stmt->is_ddl()) refuse_ddl_beside_others();
+          if (record.ddl) refuse_ddl_beside_others();
           implicit_.emplace(db_.begin());
           txn_started_ = std::chrono::steady_clock::now();
           start_modes();
           block_used_ = true;
-          rows = implicit_->execute(*p.stmt, portal.params, run_options());
-          reply(*p.stmt, rows);
+          rows = implicit_->execute(p.sql, check, portal.params, run_options());
+          reply(record, rows);
           if (flush_after) flush();
           return true;
       }
     }
-    reply(*p.stmt, rows);
+    reply(record, rows);
     return true;
   }
 
-  void reply(const Statement& stmt, const Rows& rows) {
+  void reply(const StatementRecord& record, const Rows& rows) {
     data_rows(rows);
     notices(rows);
-    complete(command_tag(stmt.command(), rows));
+    complete(command_tag(record.command, rows));
   }
 
   // A new transaction starts with PostgreSQL's defaults: read write, READ
@@ -1759,8 +1798,14 @@ private:
     refuse_if_failed();
     if ((in_block_ || implicit_) && read_only_) throw SessionError("cannot execute CALL in a read-only transaction", "25006");
     if (in_block_ || implicit_) block_used_ = true;
-    auto cat = db_.catalog();
-    const auto* def = cat->procedure(c.call->procedure);
+    // The procedure as the block's catalog has it, in a block.
+    std::shared_ptr<const Procedure> def;
+    if (auto* b = block()) {
+      def = b->procedure(c.call->procedure);
+    } else {
+      auto cat = db_.catalog();
+      if (const auto* d = cat->procedure(c.call->procedure)) def = {cat, d};
+    }
     if (def == nullptr) {
       throw ast::SqlError{"procedure " + c.call->procedure + " does not exist", c.call->pos, kUndefinedFunction};
     }
@@ -1776,10 +1821,10 @@ private:
     complete("CALL");
   }
 
-  void enter_statement(const Statement& stmt) {
+  void enter_statement(Command command) {
     if (!in_block_ && !implicit_) return;
-    if (read_only_ && stmt.command() != Command::Select) {
-      throw SessionError("cannot execute " + std::string{command_name(stmt.command())} + " in a read-only transaction",
+    if (read_only_ && command != Command::Select) {
+      throw SessionError("cannot execute " + std::string{command_name(command)} + " in a read-only transaction",
                          "25006");
     }
     block_used_ = true;

@@ -316,8 +316,11 @@ nothing more. After startup, an invalid message length or type is `FATAL`.
 A session holds:
 - the block status (*The block status*, below);
 - the open `Transaction`, if any;
-- the named statements, each a `const Statement&` from `Database::prepare`,
-  which is valid until close;
+- the named statements, each its text and its record (parameter types,
+  result columns, command, and the catalog version that fixed them), not a
+  `Statement`, so nothing a statement holds dies with a block. Each use
+  resolves the text where it runs: through the open block's transaction,
+  or in autocommit, which takes the cache's plan;
 - the named portals;
 - the unnamed statement and the unnamed portal;
 - the block's named cursors (*Cursor statements*).
@@ -443,6 +446,12 @@ $1". A
 failed statement gets `ErrorResponse`; then, as after every `Query`, the
 server sends `ReadyForQuery`.
 
+A `Query` runs its statement by text (`ResultCheck::none`): through the
+block's `Transaction` in a block, `Database::execute(sql)` outside one. It
+returns the columns of its catalog, the block's or the live one, and is
+never 0A000 for a change of result type (docs/transaction_design.md, *A
+transaction binds only against its own catalog*).
+
 A `Query` that arrives after `Execute`s outside `BEGIN`, before their
 `Sync`, joins their implicit transaction, as in PostgreSQL: it runs in it,
 and the transaction commits when the `Query` ends. An error in the `Query`
@@ -534,7 +543,13 @@ the server adds:
 - **`Parse`** (name, text, parameter OIDs). (name, text, parameter OIDs).
   - The name must be free: a used name is `42P05`, and the unnamed
     statement is replaced.
-  - The text goes to `Database::prepare`.
+  - The text is described where it runs: by the block's
+    `Transaction::refit(text, none)` in a block, and by
+    `Database::refit(text, none)` outside one. Its record (parameter types,
+    columns, command, version) is the named statement's. In a block it is
+    bound against the block's catalog: with the pin behind the live catalog
+    any binder error at Parse is 40001, and with the pin live a typo is
+    42P01, as before.
   - The OIDs the client gives are not used: each parameter's text is read
     as the type the layer inferred, so text that type does not accept is
     `22P02`. libpq sends 0s, and psycopg sends an OID per Python type
@@ -542,6 +557,14 @@ the server adds:
     the text has to fit.
   - The reply is `ParseComplete`.
 - **`Bind`** (portal, statement, formats, values, result formats).
+  - The statement's text is bound again where it runs with the record's
+    parameter types (`refit(text, ResultCheck::given(record))`): a type
+    that no longer fits is the binder's error (40001 at a stale pin), and
+    result columns other than the record's are 0A000, "cached plan must not
+    change result type", or 40001 in a block pinned before the record's
+    version. `ParameterDescription`, the parameter count and each value's
+    text input come from the record, as PostgreSQL keeps the types it
+    fixed at Parse.
   - Every format must be text, else `0A000`.
   - The value count must be the statement's parameter count, else `08P01`.
   - A length of -1 is NULL; any other value is read by `pg_text` as its
@@ -556,9 +579,19 @@ the server adds:
   - the type's OID, length and modifier;
   - format 0.
 
-  The column types are known before the statement runs (*What it uses from the embedded API*, 2).
+  The column types are known before the statement runs (*What it uses from the embedded API*, 2): both
+  Describes check the record where they run, as Bind does, and describe
+  the record.
 - **`Execute`** runs the portal and sends its rows and `CommandComplete`. A
-  row limit above 0 is `0A000`; libpq sends 0.
+  row limit above 0 is `0A000`; libpq sends 0. It runs the text with the
+  record as `ResultCheck::given`: in the block's transaction in a block,
+  else in autocommit.
+- **In a block**, BEGIN's, or an extended pipeline's once its first
+  `Execute` has begun it, every Parse, Bind, Describe, Execute, DECLARE
+  (by text) and CALL (the block's `Transaction::procedure`) goes through
+  the block's transaction, and so binds only against its catalog. A
+  record fixed in a block outlives it: run after COMMIT in autocommit, it
+  is 0A000 when its columns differ at the live catalog.
 - **`Sync`** replies with `ReadyForQuery`.
 - **`Close`** drops a statement or portal and replies with `CloseComplete`.
   **`Flush`** writes the buffer.
@@ -814,14 +847,15 @@ binder and compiler already keep:
 
 5. `Database::stats()`: the engine's `DB::stats()`, under the shared lock
    every call takes (*Reading the counters*).
-6. `Database::refit(stmt)`: recompiles a cached plan that the live catalog
-   no longer fits, as its next run would, and runs nothing. A statement
-   prepared before a `DROP TABLE` and `CREATE TABLE` of other types still
-   describes its old plan until it runs. The server refits at `Parse`,
-   `Bind` and `Describe`, so `ParameterDescription`, the parameters' text
-   and `RowDescription` follow the catalog. A DDL between `Bind` and
-   `Execute` is caught by the run, which recompiles and checks the
-   parameters against the new plan.
+6. `Database::refit(text, check)` and `Transaction::refit(text, check)`:
+   the `StatementRecord` of the text's run, under a `ResultCheck`, against
+   the live catalog or the transaction's; they run nothing. The server
+   takes the record at `Parse` with `none`, and checks it at `Bind` and
+   `Describe` with `given`, which binds the text with the record's
+   parameter types and is 0A000 for other columns. A DDL between `Bind`
+   and `Execute` is caught by the run, which checks the record again.
+   `Transaction::procedure(name)` gives `CALL` in a block the procedure of
+   the block's catalog.
 
 `DdlRefused` carries the SQLSTATE PostgreSQL gives the same refusal, for (4).
 

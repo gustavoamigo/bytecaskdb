@@ -601,7 +601,7 @@ TEST_CASE("embedded API: a transaction may outlive its database, and close() rac
   CHECK_FALSE(u.is_open());
 }
 
-TEST_CASE("embedded API: a statement that no longer fits the catalog a transaction pinned is 40001",
+TEST_CASE("embedded API: a transaction reads a table dropped and created again after its pin as at the pin",
           "[sql][api][txn]") {
   sql_test::TempDir dir{"api_txn"};
   auto db = open_db(dir);
@@ -611,13 +611,16 @@ TEST_CASE("embedded API: a statement that no longer fits the catalog a transacti
   db->execute("DROP TABLE acct");
   db->execute("CREATE TABLE acct (id BIGINT PRIMARY KEY, bal BIGINT NOT NULL)");
   db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{7}});
-  CHECK(balance(*db, 1) == 7);  // the shared statement, recompiled for the live catalog
-  // The pinned catalog is older than the statement's plan: the transaction
-  // fails as its commit would, and ends; the statement is not recompiled
-  // back for it.
-  CHECK_THROWS_AS(t.execute("SELECT bal FROM acct WHERE id = $1", {std::int64_t{1}}), SerializationFailure);
-  CHECK_FALSE(t.is_open());
+  CHECK(balance(*db, 1) == 7);  // the shared statement, bound again at the live catalog
+  // The transaction binds only against the catalog it pinned: its snapshot
+  // holds the old table's rows, and it reads them. The shared plan, bound
+  // at the live catalog, is not run; a private one is compiled at the pin.
   auto compiled = db->compilations();
+  CHECK(txn_balance(t, 1) == 100);
+  CHECK(db->compilations() == compiled + 1);
+  CHECK(t.private_plans_for_testing() == 1);
+  CHECK(t.commit() == CommitOutcome::Committed);  // it only read
+  compiled = db->compilations();
   auto u = db->begin();
   CHECK(txn_balance(u, 1) == 7);
   CHECK(u.commit() == CommitOutcome::Committed);

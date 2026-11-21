@@ -2395,3 +2395,173 @@ def test_rollback_to_closes_the_cursors_declared_after_the_savepoint(server):
     assert tags(say("CLOSE bad")) == ["CLOSE CURSOR"]
     assert states(say("FETCH bad")) == ["34000"]
     say("ROLLBACK")
+
+
+# ------------------------------------------- plans bound again after a DDL
+
+
+def q(c: Client, sql: str) -> list[tuple[bytes, bytes]]:
+    c.send(query(sql))
+    return c.until_ready()
+
+
+def columns(messages) -> list[str]:
+    return [name for name, _ in row_description(next(b for k, b in messages if k == b"T"))]
+
+
+def test_a_simple_query_returns_the_new_column_and_a_prepared_statement_is_0a000(server):
+    """docs/transaction_design.md, *A transaction binds only against its own
+    catalog*: by text a statement returns its catalog's columns; a statement
+    Parsed before a DDL that changed them, named or unnamed, described or
+    not, and a bound portal are 0A000, as in PostgreSQL 17."""
+    c = connect(server)
+    q(c, "CREATE TABLE r (k INTEGER PRIMARY KEY, a INTEGER)")
+    q(c, "INSERT INTO r VALUES (1, 10)")
+    c.send(parse("SELECT * FROM r", "named"), describe("S", "named"), SYNC)
+    assert states(c.until_ready()) == []
+    c.send(parse("SELECT * FROM r", "never"), SYNC)
+    c.until_ready()
+    c.send(parse("SELECT * FROM r"), bind([], portal="p"), FLUSH)
+    c.send(SYNC)
+    c.until_ready()
+    other = connect(server)
+    assert states(q(other, "ALTER TABLE r ADD COLUMN b INTEGER")) == []
+    # By text: the new column, never 0A000.
+    out = q(c, "SELECT * FROM r")
+    assert states(out) == [] and columns(out) == ["k", "a", "b"]
+    for name in ("named", "never"):
+        c.send(bind([], name), execute(), SYNC)
+        assert states(c.until_ready()) == ["0A000"]
+        c.send(describe("S", name), SYNC)
+        assert states(c.until_ready()) == ["0A000"]
+    c.send(parse("SELECT * FROM r", "fresh"), bind([], "fresh"), execute(), SYNC)
+    out = c.until_ready()
+    assert states(out) == [] and data(out) == [["1", "10", None]]
+
+
+def test_parse_in_a_block_binds_against_the_block_s_catalog(server):
+    """A Parse in a block fixes the columns of the block's pin, and a Bind
+    after COMMIT, in autocommit, is 0A000 when they differ at the live
+    catalog. A name created after the pin is 40001 at Parse, and fails the
+    block; its retry runs."""
+    c, other = connect(server), connect(server)
+    q(c, "CREATE TABLE r (k INTEGER PRIMARY KEY, a INTEGER)")
+    q(c, "INSERT INTO r VALUES (1, 10)")
+    q(c, "BEGIN")
+    assert data(q(c, "SELECT k FROM r")) == [["1"]]  # pins the block's catalog
+    assert states(q(other, "ALTER TABLE r ADD COLUMN b INTEGER DEFAULT 7")) == []
+    c.send(parse("SELECT * FROM r", "in_block"), describe("S", "in_block"), bind([], "in_block"), execute(), SYNC)
+    out = c.until_ready()
+    assert states(out) == [] and columns(out) == ["k", "a"] and data(out) == [["1", "10"]]
+    out = q(c, "SELECT * FROM r")
+    assert columns(out) == ["k", "a"]
+    assert status(q(c, "COMMIT")) == "I"
+    c.send(bind([], "in_block"), execute(), SYNC)
+    assert states(c.until_ready()) == ["0A000"]
+    # A name created after the block's pin.
+    q(c, "BEGIN")
+    q(c, "SELECT k FROM r")
+    assert states(q(other, "CREATE TABLE z (k INTEGER PRIMARY KEY)")) == []
+    c.send(parse("SELECT k FROM z", "z"), SYNC)
+    out = c.until_ready()
+    assert states(out) == ["40001"] and status(out) == "E"
+    q(c, "ROLLBACK")
+    q(c, "BEGIN")
+    c.send(parse("SELECT k FROM z", "z"), bind([], "z"), execute(), SYNC)
+    out = c.until_ready()
+    assert states(out) == [] and status(out) == "T"
+    q(c, "COMMIT")
+
+
+def test_a_portal_bound_in_a_block_before_a_ddl_runs_at_the_pin(server):
+    c, other = connect(server), connect(server)
+    q(c, "CREATE TABLE r (k INTEGER PRIMARY KEY, a INTEGER)")
+    q(c, "INSERT INTO r VALUES (1, 10)")
+    q(c, "BEGIN")
+    c.send(parse("SELECT * FROM r", "s"), bind([], "s", "p"), SYNC)
+    assert states(c.until_ready()) == []
+    assert states(q(other, "ALTER TABLE r ADD COLUMN b INTEGER")) == []
+    assert states(q(other, "INSERT INTO r VALUES (2, 20, 2)")) == []
+    c.send(describe("P", "p"), execute("p"), SYNC)
+    out = c.until_ready()
+    assert states(out) == [] and columns(out) == ["k", "a"] and data(out) == [["1", "10"]]
+    q(c, "COMMIT")
+
+
+def test_a_parsed_statement_keeps_its_parameter_types(server):
+    """$1 fixed as int4 at Parse: a Bind after the column became a DATE is
+    42883, as PostgreSQL's revalidation reports it, while a Simple Query of
+    the text binds afresh."""
+    c = connect(server)
+    q(c, "CREATE TABLE r (a INTEGER PRIMARY KEY)")
+    c.send(parse("SELECT 1 FROM r WHERE a = $1", "s"), SYNC)
+    c.until_ready()
+    q(c, "DROP TABLE r")
+    q(c, "CREATE TABLE r (a DATE PRIMARY KEY)")
+    c.send(bind(["7"], "s"), execute(), SYNC)
+    assert states(c.until_ready()) == ["42883"]
+    c.send(describe("S", "s"), SYNC)
+    assert states(c.until_ready()) == ["42883"]
+    out = run(c, "SELECT 1 FROM r WHERE a = $1", ["2026-01-01"])
+    assert states(out) == []
+
+
+def test_an_implicit_block_binds_against_the_catalog_of_its_first_execute(server):
+    c, other = connect(server), connect(server)
+    q(c, "CREATE TABLE r (k INTEGER PRIMARY KEY, a INTEGER)")
+    q(c, "INSERT INTO r VALUES (1, 10)")
+    # Two Executes before one Sync: PostgreSQL's implicit block, begun by the first.
+    c.send(parse("SELECT k FROM r"), bind([]), execute(), FLUSH)
+    assert kinds([c.message() for _ in range(4)]) == b"12DC"
+    assert states(q(other, "ALTER TABLE r ADD COLUMN b INTEGER")) == []
+    c.send(parse("SELECT * FROM r"), bind([]), describe("P"), execute(), SYNC)
+    out = c.until_ready()
+    assert states(out) == [] and columns(out) == ["k", "a"] and data(out) == [["1", "10"]]
+    out = q(c, "SELECT * FROM r")
+    assert columns(out) == ["k", "a", "b"]
+
+
+def test_a_ddl_parsed_in_a_block_and_never_executed_leaves_it_open(server):
+    """docs/transaction_design.md, stage 0's tests: Parse of a DDL in a block
+    is no error and the block stays open; executing a Parsed CREATE TABLE AS
+    there is 0A000 (DDL in a transaction is not built yet)."""
+    c = connect(server)
+    q(c, "CREATE TABLE r (k INTEGER PRIMARY KEY, a INTEGER)")
+    q(c, "BEGIN")
+    q(c, "SELECT 1")
+    c.send(parse("CREATE TABLE r2 (k INTEGER PRIMARY KEY)", "ddl"), SYNC)
+    out = c.until_ready()
+    assert states(out) == [] and status(out) == "T"
+    c.send(parse("ALTER TABLE r ADD COLUMN b INTEGER", "alter"), parse("DROP TABLE r", "drop"), SYNC)
+    out = c.until_ready()
+    assert states(out) == [] and status(out) == "T"
+    c.send(parse("CREATE TABLE r3 AS SELECT k FROM r", "ctas"), SYNC)
+    out = c.until_ready()
+    assert states(out) == [] and status(out) == "T"
+    c.send(bind([], "ctas"), execute(), SYNC)
+    out = c.until_ready()
+    assert states(out) == ["0A000"] and status(out) == "E"
+    q(c, "ROLLBACK")
+    assert columns(q(c, "SELECT * FROM r")) == ["k", "a"]
+
+
+def test_a_parsed_int4_parameter_assigned_to_a_column_now_bigint_is_range_checked_as_int4(server):
+    """PostgreSQL's Bind reads the value as the type fixed at Parse: 22003
+    for 5000000000 sent for an int4 $n, whatever column it is assigned to."""
+    c = connect(server)
+    q(c, "CREATE TABLE r (k INTEGER PRIMARY KEY, a INTEGER)")
+    c.send(parse("INSERT INTO r VALUES ($1, $2)", "ins"), parse("UPDATE r SET a = $1 WHERE k = 1", "upd"), SYNC)
+    c.until_ready()
+    q(c, "DROP TABLE r")
+    q(c, "CREATE TABLE r (k BIGINT PRIMARY KEY, a BIGINT)")
+    q(c, "INSERT INTO r VALUES (1, 1)")
+    c.send(bind(["5000000000", "7"], "ins"), execute(), SYNC)
+    assert states(c.until_ready()) == ["22003"]
+    c.send(bind(["5000000000"], "upd"), execute(), SYNC)
+    assert states(c.until_ready()) == ["22003"]
+    q(c, "BEGIN")
+    c.send(bind(["6000000000", "7"], "ins"), execute(), SYNC)
+    out = c.until_ready()
+    assert states(out) == ["22003"] and status(out) == "E"
+    q(c, "ROLLBACK")
+    assert data(q(c, "SELECT k, a FROM r")) == [["1", "1"]]
