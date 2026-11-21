@@ -572,14 +572,15 @@ auto wider_integer(SqlType x, SqlType y) -> SqlType {
   return SqlType{rank(x.kind) >= rank(y.kind) ? x.kind : y.kind};
 }
 
-// The type of x op y for integers and DECIMALs as PostgreSQL's operators type
-// it, the one place the layer resolves it, for a constant and for columns
-// alike: the wider integer of two integers; with a numeric, + and - at the
-// finer scale and * at the sum of the scales. A numeric quotient's scale
-// depends on the operands' values (select_div_scale), so it has no type
-// here: nullopt.
+// The type of x op y for integers, DECIMALs and DATE - DATE as PostgreSQL's
+// operators type it, the one place the layer resolves it, for a constant and
+// for columns alike: the wider integer of two integers; DATE - DATE an
+// INTEGER count of days; with a numeric, + and - at the finer scale and * at
+// the sum of the scales. A numeric quotient's scale depends on the operands'
+// values (select_div_scale), so it has no type here: nullopt.
 auto arith_type(Arith op, SqlType x, SqlType y) -> std::optional<SqlType> {
   if (is_integer(x) && is_integer(y)) return wider_integer(x, y);
+  if (op == Arith::Sub && x.kind == SqlKind::Date && y.kind == SqlKind::Date) return SqlType{SqlKind::Integer};
   switch (op) {
     case Arith::Add:
     case Arith::Sub: return numeric_type(std::max(decimal_scale(x), decimal_scale(y)));
@@ -587,6 +588,66 @@ auto arith_type(Arith op, SqlType x, SqlType y) -> std::optional<SqlType> {
     case Arith::Div: return std::nullopt;
   }
   return std::nullopt;
+}
+
+auto is_temporal(SqlType t) -> bool { return type_class(t.kind) == TypeClass::Temporal; }
+
+// x op y where either is a date or time type, as PostgreSQL 17 has the
+// operators over the layer's types, its implicit casts (date to timestamp,
+// time to interval) included. Returns for DATE - DATE, the one the layer
+// takes; another PostgreSQL has (date +/- integer, a timestamp's or a time's
+// difference, time scaled by a number, ...) is not supported yet (42601);
+// time + time is ambiguous there (42725); any other pair has none (42883).
+void temporal_operator(Arith op, SqlType x, SqlType y, std::int32_t pos) {
+  auto text = pg_type_name(x) + " " + std::string{arith_text(op)} + " " + pg_type_name(y);
+  auto date = [](SqlType t) { return t.kind == SqlKind::Date; };
+  auto time = [](SqlType t) { return t.kind == SqlKind::Time; };
+  auto stamp = [](SqlType t) { return t.kind == SqlKind::Timestamp || t.kind == SqlKind::TimestampTz; };
+  auto int4 = [](SqlType t) { return t.kind == SqlKind::SmallInt || t.kind == SqlKind::Integer; };  // a bigint does not narrow
+  auto number = [](SqlType t) { return type_class(t.kind) == TypeClass::Number; };
+  auto exists = false;
+  switch (op) {
+    case Arith::Add:
+      if (time(x) && time(y)) throw SqlError{"operator is not unique: " + text, pos, kAmbiguousFunction};
+      exists = (date(x) && (int4(y) || time(y))) || (date(y) && (int4(x) || time(x))) || (stamp(x) && time(y)) ||
+               (time(x) && stamp(y));
+      break;
+    case Arith::Sub:
+      if (date(x) && date(y)) return;
+      exists = (stamp(x) && (stamp(y) || date(y) || time(y))) || (date(x) && (int4(y) || stamp(y) || time(y))) ||
+               (time(x) && time(y));
+      break;
+    case Arith::Mul: exists = (time(x) && number(y)) || (number(x) && time(y)); break;
+    case Arith::Div: exists = time(x) && number(y); break;
+  }
+  if (exists) not_yet(text, pos);
+  throw SqlError{"operator does not exist: " + text, pos, kUndefinedFunction};
+}
+
+// t op unknown (or unknown op t when untyped_left), where t is a date or time
+// type and the other operand a $n, an unknown literal or NULL, as PostgreSQL
+// 17 resolves it. Returns for -, where every such type has T - T and the
+// unknown is read as t. Otherwise the operator PostgreSQL picks is not
+// supported yet (42601: time + interval, time scaled by a number, timestamp +
+// interval), or it has none it can pick: date + unknown is ambiguous (42725),
+// and date or timestamp * or /, and unknown / time, have none (42883).
+void temporal_untyped_operator(Arith op, SqlType t, bool untyped_left, std::int32_t pos) {
+  auto text = untyped_left ? "unknown " + std::string{arith_text(op)} + " " + pg_type_name(t)
+                           : pg_type_name(t) + " " + std::string{arith_text(op)} + " unknown";
+  auto date = t.kind == SqlKind::Date;
+  auto time = t.kind == SqlKind::Time;
+  auto exists = false;
+  switch (op) {
+    case Arith::Sub: return;
+    case Arith::Add:
+      if (date) throw SqlError{"operator is not unique: " + text, pos, kAmbiguousFunction};
+      exists = true;
+      break;
+    case Arith::Mul: exists = time; break;
+    case Arith::Div: exists = time && !untyped_left; break;
+  }
+  if (exists) not_yet(text, pos);
+  throw SqlError{"operator does not exist: " + text, pos, kUndefinedFunction};
 }
 
 // PostgreSQL's select_div_scale: the scale of the quotient of two numerics,
@@ -641,19 +702,30 @@ auto numeric_quotient(Scaled x, Scaled y, int scale) -> std::optional<std::int64
   return static_cast<std::int64_t>(negative ? -q : q);
 }
 
+auto resolved(const Constant& k, SqlType t) -> Constant;
+
 // x op y, of integer or numeric constants, as PostgreSQL's operators type
 // it (arith_type); the range checked as there (22003). Integer / truncates
 // toward zero; a numeric quotient has PostgreSQL's own scale (div_scale),
 // within 18 digits. A zero divisor is 22012, a NULL operand NULL (a divisor
 // of NULL first: strict operators do not run). NULL beside a number is NULL
-// of the number's type.
+// of the number's type. Of a date or time type only DATE - DATE is taken
+// (temporal_operator), an unknown literal or NULL beside the DATE read as one,
+// as PostgreSQL resolves it.
 auto arithmetic(const Constant& x, const Constant& y, Arith op, std::int32_t pos) -> Constant {
   auto text = std::string{arith_text(op)};
   auto null_untyped = [](const Constant& c) { return c.unknown && std::holds_alternative<std::monostate>(c.value); };
   if (null_untyped(x) && null_untyped(y)) not_yet("NULL " + text + " NULL", pos);
+  if ((!x.unknown && is_temporal(x.type)) || (!y.unknown && is_temporal(y.type))) {
+    if (x.unknown || y.unknown) {
+      temporal_untyped_operator(op, x.unknown ? y.type : x.type, x.unknown, pos);  // returns for - only
+      return arithmetic(x.unknown ? resolved(x, y.type) : x, y.unknown ? resolved(y, x.type) : y, op, pos);
+    }
+    temporal_operator(op, x.type, y.type, pos);  // returns for DATE - DATE only
+  }
   for (const auto* c : {&x, &y}) {
     if (c->unknown && !null_untyped(*c)) not_yet("a string literal in arithmetic", c->pos);
-    if (!c->unknown && !is_integer(c->type) && c->type.kind != SqlKind::Decimal) {
+    if (!c->unknown && !is_integer(c->type) && c->type.kind != SqlKind::Decimal && !is_temporal(c->type)) {
       throw SqlError{"operator does not exist: " + pg_type_name(x.type) + " " + text + " " + pg_type_name(y.type), pos,
                      kUndefinedFunction};
     }
@@ -2487,9 +2559,12 @@ public:
   }
 
   // The two operands of an operator. One a $n or an unknown literal takes
-  // its type from the other, which is bound first.
-  auto operands(const ast::Expr& lhs, const ast::Expr& rhs, const Resolve& resolve, Use use)
-      -> std::pair<logical::Expr, logical::Expr> {
+  // its type from the other, which is bound first; `settled_type`, when
+  // given, sees that type (and whether the untyped operand is the left one)
+  // before the untyped operand is read as it, to refuse an operator the
+  // reading would be wrong for.
+  auto operands(const ast::Expr& lhs, const ast::Expr& rhs, const Resolve& resolve, Use use,
+                const std::function<void(SqlType, bool)>& settled_type = {}) -> std::pair<logical::Expr, logical::Expr> {
     auto settled = [](const ast::Expr& x) { return x.kind != ast::Expr::Kind::Param && !is_constant(x); };
     auto peer_of = [&](const logical::Expr& bound, const ast::Expr& written) {
       Peer p{bound.type, nullptr, nullptr, use};
@@ -2503,10 +2578,12 @@ public:
     }
     if (settled(lhs)) {
       auto l = value(lhs, resolve);
+      if (settled_type) settled_type(l.type, false);
       auto r = value(rhs, resolve, peer_of(l, lhs));
       return {std::move(l), std::move(r)};
     }
     auto r = value(rhs, resolve);
+    if (settled_type) settled_type(r.type, true);
     auto l = value(lhs, resolve, peer_of(r, rhs));
     return {std::move(l), std::move(r)};
   }
@@ -2554,7 +2631,19 @@ public:
   auto arithmetic_value(const ast::Expr& e, const Resolve& resolve) -> logical::Expr {
     using K = ast::Expr::Kind;
     auto op = e.kind == K::Add ? Arith::Add : e.kind == K::Sub ? Arith::Sub : e.kind == K::Mul ? Arith::Mul : Arith::Div;
-    auto [l, r] = operands(*e.lhs, *e.rhs, resolve, Use::Operand);
+    auto untyped = [&](const ast::Expr& x) { return x.kind == K::Param || (is_constant(x) && fold(x).unknown); };
+    // Decided before a $n or an unknown literal is read as the date or time
+    // type beside it, which PostgreSQL does only for -: a literal that does
+    // not parse as that type must not answer 22007 for an operator refused.
+    auto untyped_beside_temporal = [&](SqlType t, bool untyped_left) {
+      if (is_temporal(t) && untyped(untyped_left ? *e.lhs : *e.rhs)) temporal_untyped_operator(op, t, untyped_left, e.pos);
+    };
+    auto [l, r] = operands(*e.lhs, *e.rhs, resolve, Use::Operand, untyped_beside_temporal);
+    if (is_temporal(l.type) || is_temporal(r.type)) {
+      temporal_operator(op, l.type, r.type, e.pos);  // returns for DATE - DATE only
+      auto days = *arith_type(op, l.type, r.type);
+      return logical::binary(logical::Expr::Kind::Sub, std::move(l), std::move(r), days);
+    }
     for (const auto* x : {&l, &r}) {
       if (is_float(x->type)) not_yet("arithmetic of REAL and DOUBLE PRECISION", e.pos);
       if (!is_number(x->type)) {

@@ -84,8 +84,6 @@
 
 - name: the difference of two DATEs
   features: [F051-01]
-  # only columns, constants and aggregates can be selected
-  unimplemented: true
   ordered: true
   setup:
     - CREATE TABLE dt (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)
@@ -104,6 +102,34 @@
       expected: [[1, 297], [2, 58], [3, -9498]]
   teardown:
     - DROP TABLE dt
+
+- name: the difference of DATEs before 1970 and at the ends of the type
+  features: [F051-01]
+  ordered: true
+  setup:
+    - CREATE TABLE dd (id INTEGER PRIMARY KEY, d DATE)
+  steps:
+    - sql: INSERT INTO dd VALUES ($1, $2)
+      params: [1, "1969-12-31"]
+      rowcount: 1
+    - sql: INSERT INTO dd VALUES ($1, $2)
+      params: [2, "4714-11-24 BC"]
+      rowcount: 1
+    - sql: INSERT INTO dd VALUES ($1, $2)
+      params: [3, "5874897-12-31"]
+      rowcount: 1
+    - sql: INSERT INTO dd VALUES ($1, $2)
+      params: [4, null]
+      rowcount: 1
+    - sql: SELECT id, d - $1, $2 - d FROM dd WHERE id >= $3 ORDER BY id
+      params: ["1970-01-01", "5874897-12-31", 0]
+      expected: [[1, -1, 2145042906], [2, -2440588, 2147483493], [3, 2145042905, 0], [4, null, null]]
+    - sql: SELECT DATE '5874897-12-31' - DATE '4714-11-24 BC', DATE '1969-12-31' - '1970-01-01'
+      expected: [[2147483493, -1]]
+    - sql: SELECT d + d FROM dd
+      error: "42883"
+  teardown:
+    - DROP TABLE dd
 
 - name: CAST of a string to a DATE
   features: [F051-05]

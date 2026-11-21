@@ -732,6 +732,9 @@ PostgreSQL's code only for a statement PostgreSQL also refuses with it:
 | a column assigned from a column of a type PostgreSQL has no assignment cast from (a number to or from a boolean, a string to a number, ...) | `42804` |
 | one `$n` compared with two columns no operator relates (a string and a number, a boolean and anything else, ...) | `42883` |
 | `SUM` or `MIN` of a type PostgreSQL has no such aggregate for | `42883` |
+| an arithmetic operator PostgreSQL has none of for its operands' types (`date + date`, `integer - date`) | `42883` |
+| an arithmetic operator PostgreSQL has none of for a date or time type beside an operand of type unknown (`date * unknown`, `unknown / time`) | `42883` |
+| `time + time`, and `date + unknown`, which PostgreSQL finds ambiguous | `42725` |
 | a `$n` no use gives a type | `42P18` |
 | a column reference both joined tables have | `42702` |
 | a column listed twice in an `INSERT` | `42701` |

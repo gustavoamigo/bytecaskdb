@@ -1198,6 +1198,11 @@ TEST_CASE("binder: each refusal carries PostgreSQL's SQLSTATE", "[sql][binder][s
   CHECK(state("SELECT sum(name) FROM t WHERE id = $1") == "42883");
   CHECK(state("SELECT min(name) FROM t WHERE id = $1") == "42883");
   CHECK(state("SELECT sum(s) FROM u WHERE k = $1") == "42883");
+  // An arithmetic operator PostgreSQL has none of: 42883; time + time, ambiguous there: 42725.
+  CHECK(state("SELECT ts + ts FROM u") == "42883");
+  CHECK(state("SELECT DATE '2026-01-01' + DATE '2026-01-01'") == "42883");
+  CHECK(state("SELECT tm + tm FROM u") == "42725");
+  CHECK(state("SELECT TIME '10:00' + TIME '10:00'") == "42725");
   CHECK(state("SELECT sum(ts) FROM u WHERE k = $1") == "42883");
 
   // PostgreSQL runs these: the layer refuses a form it does not support, and
