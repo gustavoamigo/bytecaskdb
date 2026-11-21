@@ -83,8 +83,8 @@ enum class ValueCompare { Eq, Ne, Lt, Le, Gt, Ge };
 // literal (an integer within BIGINT after + or - is a Const), a sum,
 // difference, product or quotient of two, unary + or - of one, a comparison of two, IS [NOT]
 // NULL of one, AND, OR or NOT of boolean expressions, a cast of
-// one (DATE '…' and '…'::date alike), an aggregate: COUNT(*),
-// COUNT([DISTINCT] column), SUM, MIN, MAX or AVG of a column; or a scalar
+// one (DATE '…' and '…'::date alike), an aggregate: COUNT(*), or
+// COUNT, SUM, MIN, MAX or AVG of an expression, [DISTINCT]; or a scalar
 // subquery, (SELECT …), the value of its one row; CASE (searched, or simple
 // on `lhs`), COALESCE and NULLIF; a string function or ||; or, in a select list only,
 // * or `table`.*, which the binder expands to columns.
@@ -92,14 +92,15 @@ struct Expr {
   enum class Kind { Column, Param, Const, Literal, Add, Sub, Mul, Div, Star, Plus, Neg, Compare, IsNull, Not, And, Or, Cast, Aggregate, Subquery, Case, Coalesce, NullIf, Func, Clock, Default };
   enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind;
-  std::string column;       // Column; Aggregate's argument, "" for COUNT(*)
+  std::string column;       // Column
   std::uint32_t param{0};   // Param: zero-based ($1 is 0)
   std::unique_ptr<Expr> lhs, rhs;  // Add, Sub, Mul, Div, Compare; Plus, Neg, IsNull, Not and Cast: rhs
   std::int32_t pos{-1};
-  std::string table;          // Column, Aggregate, Star: the table it is qualified by, "" for none
+  std::string table;          // Column, Star: the table it is qualified by, "" for none
   std::int64_t constant{0};   // Const: an integer literal (Add and Sub's right operand only)
   Fn fn{Fn::Count};           // Aggregate
-  bool distinct{false};       // Aggregate: COUNT(DISTINCT column)
+  bool distinct{false};       // Aggregate: of DISTINCT values
+  bool star{false};           // Aggregate: COUNT(*), no argument; any other has its one in `args`
   bool negated{false};        // IsNull: IS NOT NULL
   Literal literal{};          // Literal
   ValueCompare cmp{ValueCompare::Eq};  // Compare
@@ -109,7 +110,7 @@ struct Expr {
   std::string alias;  // a select-list item's AS name, "" for none
   // And, Or: two or more operands. Case: WHEN, THEN, WHEN, THEN … in order, `lhs` the simple form's operand
   // and `rhs` its ELSE, each none where absent. Coalesce: its arguments.
-  // NullIf: `lhs` and `rhs`.
+  // NullIf: `lhs` and `rhs`. Aggregate: its argument, none for COUNT(*).
   std::vector<Expr> args;
   // Func: a string function, abs, % or ||, `func` its name as PostgreSQL resolves it
   // (btrim for TRIM(BOTH …), position(string, substring) for POSITION(sub IN
@@ -155,6 +156,7 @@ struct Compare {
   out.constant = e.constant;
   out.fn = e.fn;
   out.distinct = e.distinct;
+  out.star = e.star;
   out.negated = e.negated;
   out.literal = e.literal;
   out.cmp = e.cmp;
@@ -200,7 +202,7 @@ struct OrderItem {
     return x == nullptr ? y == nullptr : y != nullptr && same_expr(*x, *y);
   };
   return a.kind == b.kind && a.column == b.column && a.param == b.param && a.table == b.table &&
-         a.constant == b.constant && a.fn == b.fn && a.distinct == b.distinct && a.negated == b.negated &&
+         a.constant == b.constant && a.fn == b.fn && a.distinct == b.distinct && a.star == b.star && a.negated == b.negated &&
          a.literal.kind == b.literal.kind && a.literal.text == b.literal.text && a.literal.b == b.literal.b &&
          a.cmp == b.cmp && a.cast_type == b.cast_type && a.cast_typmods == b.cast_typmods && a.subquery == b.subquery &&
          a.func == b.func && both(a.lhs, b.lhs) && both(a.rhs, b.rhs) &&

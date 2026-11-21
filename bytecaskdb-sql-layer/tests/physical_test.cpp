@@ -325,6 +325,18 @@ TEST_CASE("physical: a DOUBLE column is never read from a key, wherever codegen 
   count_d.args.push_back(col(kD, SqlKind::Double));
   CHECK(refusal(plan(node(physical::Aggregate{node(scan({p(0)}, {})), count_d, true}))).empty());
   refused(plan(node(physical::Aggregate{covering(), count_d, true})), "DOUBLE column read from a key");
+  // An expression as the argument: one eval prints, a column of DISTINCT values only.
+  auto sum_e = logical::expr(logical::Expr::Kind::Aggregate, SqlType{SqlKind::BigInt});
+  sum_e.fn = logical::Expr::Fn::Sum;
+  sum_e.args.push_back(logical::binary(logical::Expr::Kind::Add, col(kId), col(kV), SqlType{SqlKind::BigInt}));
+  CHECK(refusal(plan(node(physical::Aggregate{node(scan({p(0)}, {})), sum_e, true}))).empty());
+  auto count_e = sum_e;
+  count_e.fn = logical::Expr::Fn::Count;
+  count_e.distinct = true;
+  refused(plan(node(physical::Aggregate{node(scan({p(0)}, {})), count_e, true})), "DISTINCT values of other than a column");
+  auto nested = sum_e;
+  nested.args[0] = count_d;
+  refused(plan(node(physical::Aggregate{node(scan({p(0)}, {})), nested, true})), "does not print");
 }
 
 TEST_CASE("physical: a sort holds the row of each of its input's loops read above it, keyed by columns in hand",

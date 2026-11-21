@@ -2399,7 +2399,9 @@ TEST_CASE("embedded API: a view is read as a table, expanded at each use, and ke
     // A constant in a view's select list, and a view of no table.
     (void)run("CREATE VIEW k AS SELECT id, 7 AS seven FROM vt");
     CHECK(run("SELECT id, seven FROM k WHERE id = 1") == Grid{{i(1), i(7)}});
-    CHECK(state(*db, "SELECT SUM(seven) FROM k") == "42601");  // an aggregate of a constant column: not supported yet
+    // An aggregate of a view column that is an expression: of its value per row.
+    const auto k_rows = std::get<std::int64_t>(run("SELECT COUNT(*) FROM k").at(0).at(0));
+    CHECK(run("SELECT SUM(seven) FROM k") == Grid{{i(7 * k_rows)}});
     (void)run("CREATE VIEW one AS SELECT 1 AS n");
     CHECK(run("SELECT n FROM one") == Grid{{i(1)}});
 
@@ -2671,6 +2673,75 @@ TEST_CASE("embedded API: SUM, AVG, MIN and MAX of a DOUBLE, and DISTINCT values,
   } catch (const ExecError& e) {
     CHECK(std::string{sqlstate(e)} == "22003");
   }
+}
+
+TEST_CASE("embedded API: an aggregate of an expression folds its value per row, as PostgreSQL's", "[sql][api][aggregate]") {
+  sql_test::TempDir dir{"api_expression_aggregates"};
+  auto db = Database::open(dir.path());
+  auto run = [&](std::string_view sql, const std::vector<Value>& params = {}) { return db->execute(sql, params).rows; };
+  auto state = [&](std::string_view sql, const std::vector<Value>& params = {}) -> std::string {
+    try {
+      (void)db->execute(sql, params);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return "ran";
+  };
+  (void)run("CREATE TABLE g (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)");
+  (void)run("CREATE INDEX g_v ON g (v)");
+  (void)run("CREATE TABLE h (id INTEGER PRIMARY KEY, gid INTEGER, w INTEGER)");
+  (void)run("INSERT INTO g VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, NULL), (5, NULL, 50)");
+  (void)run("INSERT INTO h VALUES (1, 1, 100), (2, 1, 200), (3, 3, 300)");
+  const Value null{};
+
+  // One aggregate row: the expression is NULL where an operand is, and skipped.
+  CHECK(run("SELECT SUM(v * 2) FROM g WHERE id >= $1", {i(0)}) == Grid{{i(220)}});
+  CHECK(run("SELECT COUNT(v + 1), COUNT(1), SUM(1), MIN(v - k), MAX(v * k) FROM g") == Grid{{i(4), i(5), i(5), i(9), i(60)}});
+  CHECK(run("SELECT SUM(COALESCE(v, 0)), SUM(CASE WHEN v > 15 THEN 1 ELSE 0 END) FROM g") == Grid{{i(110), i(3)}});
+  CHECK(run("SELECT SUM(v * $1) FROM g", {i(3)}) == Grid{{i(330)}});
+  // Over the one row a key finds, and over none.
+  CHECK(run("SELECT SUM(v * 2), COUNT(v * 2) FROM g WHERE id = 3") == Grid{{i(60), i(1)}});
+  CHECK(run("SELECT SUM(v * 2) FROM g WHERE id = 4") == Grid{{null}});
+  CHECK(run("SELECT COUNT(v * 2) FROM g WHERE id = 4") == Grid{{i(0)}});
+  CHECK(run("SELECT SUM(v * 2) FROM g WHERE id = 99") == Grid{{null}});
+  // Over an index's range.
+  CHECK(run("SELECT SUM(v * 2), MIN(v + 1) FROM g WHERE v > 15") == Grid{{i(200), i(21)}});
+
+  // Grouped: in each group, and in HAVING, the call the select list makes or one of its own.
+  CHECK(run("SELECT k, SUM(v * 2), COUNT(v + k), MIN(-v), MAX(v / 3) FROM g GROUP BY k ORDER BY k") ==
+        Grid{{i(1), i(60), i(2), i(-20), i(6)}, {i(2), i(60), i(1), i(-30), i(10)}, {null, i(100), i(0), i(-50), i(16)}});
+  CHECK(run("SELECT k, SUM(v * 2) FROM g GROUP BY k HAVING SUM(v * 2) > $1 ORDER BY k", {i(60)}) == Grid{{null, i(100)}});
+  CHECK(run("SELECT k FROM g GROUP BY k HAVING MAX(v * 2) < 100 ORDER BY k") == Grid{{i(1)}, {i(2)}});
+  CHECK(run("SELECT k, SUM(v) FROM g GROUP BY k HAVING MIN(v + 1) > 15 ORDER BY k") == Grid{{i(2), i(30)}, {null, i(50)}});
+  // Over a join, of both tables' columns.
+  CHECK(run("SELECT SUM(g.v * h.w) FROM g JOIN h ON g.id = h.gid") == Grid{{i(12000)}});
+  CHECK(run("SELECT g.id, SUM(h.w * 2) FROM g LEFT JOIN h ON g.id = h.gid GROUP BY g.id ORDER BY g.id") ==
+        Grid{{i(1), i(600)}, {i(2), null}, {i(3), i(600)}, {i(4), null}, {i(5), null}});
+  // Of a view column that is an expression.
+  (void)run("CREATE VIEW gv AS SELECT id, k, v * 2 AS w FROM g");
+  CHECK(run("SELECT SUM(w), SUM(w + 1) FROM gv") == Grid{{i(220), i(224)}});
+
+  // An error the argument raises is the statement's, on a row whose operands are not NULL.
+  CHECK(state("SELECT SUM(v * 100000000) FROM g") == "22003");
+  CHECK(state("SELECT k, SUM(v * $1) FROM g GROUP BY k", {i(100000000)}) == "22003");
+  CHECK(state("SELECT COUNT(v / 0) FROM g") == "22012");
+  CHECK(run("SELECT COUNT(v / 0) FROM g WHERE v IS NULL") == Grid{{i(0)}});
+  // Refused as PostgreSQL refuses them, or not taken yet.
+  CHECK(state("SELECT SUM(SUM(v)) FROM g") == "42803");
+  CHECK(state("SELECT k, MAX(v + COUNT(*)) FROM g GROUP BY k") == "42803");
+  CHECK(state("SELECT SUM($1) FROM g", {i(1)}) == "42725");
+  CHECK(state("SELECT COUNT($1) FROM g", {i(1)}) == "42P18");
+  // An untyped literal is unknown as an untyped $n is; COUNT counts it.
+  CHECK(state("SELECT SUM(NULL) FROM g") == "42725");
+  CHECK(state("SELECT AVG('1') FROM g") == "42725");
+  CHECK(state("SELECT SUM(DISTINCT NULL) FROM g") == "42725");
+  CHECK(run("SELECT COUNT(NULL), COUNT('a') FROM g") == Grid{{i(0), i(5)}});
+  CHECK(run("SELECT SUM(NULL::int) FROM g") == Grid{{Value{}}});
+  CHECK(state("SELECT SUM(DISTINCT v * 2) FROM g") == "0A000");
+  CHECK(state("SELECT COUNT(DISTINCT w) FROM gv") == "0A000");
+  CHECK(run("SELECT COUNT(DISTINCT v), SUM(DISTINCT v) FROM g") == Grid{{i(4), i(110)}});
 }
 
 TEST_CASE("embedded API: a filter on a DOUBLE or REAL compares in PostgreSQL's float8 order", "[sql][api]") {

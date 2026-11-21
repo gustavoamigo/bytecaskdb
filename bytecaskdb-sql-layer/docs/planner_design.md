@@ -503,7 +503,9 @@ refuses:
   of its input read above it, outer first, each over a row read); a column
   read above it from a loop no sorter holds; a sort key or NULL test
   outside its input's tables, an expression key's columns among them;
-- an `Aggregate` of other than `COUNT` or `SUM`;
+- an `Aggregate` of other than `COUNT` or `SUM`; an aggregate call of more
+  than one argument, of one `eval` does not print, or of `DISTINCT` values
+  of other than a column;
 - `KeyAggregates` whose outputs are other than `COUNT(*)`, or `MIN` or
   `MAX` of its one argument; whose argument is not held as `I64`; whose
   values are read by a reverse scan, from another object or prefix than the
@@ -1062,6 +1064,18 @@ the loop with an accumulator. Everything else aggregated, a lone `MIN` or
 `MAX`, a `SUM` of `DISTINCT` values or of a `DOUBLE` among it, is a
 `GroupAggregate`, one route, and where its aggregates allow it also
 answered from the keys.
+
+**The argument.** An aggregate call's argument is none (`COUNT(*)`), a
+column, or an expression of its input's columns. Codegen prints it with
+`eval` where the row is in hand, once per row and aggregate, and skips the
+row where its NULL test holds; a call of a column reads the column as
+before. The planner holds the argument's columns (`columns_of`) as it
+holds a column argument's: read by the plan, in its input's tables, kept
+above a sort's rows. Two calls alike are one aggregate, found by their
+bound expressions, a `HAVING`'s among them. `CountRange` and
+`KeyAggregates` take a column argument only, and `DISTINCT` values are
+keyed by a column's encoding, so the binder refuses `DISTINCT` of an
+expression (0A000) and `check` refuses it in a plan.
 
 **Answered from the keys.** One group of every row, no `HAVING`, whose
 outputs are each `COUNT(*)`, or `MIN` or `MAX` of one column held as

@@ -683,6 +683,17 @@ private:
     for (const auto& a : e.args) reads(a);
   }
 
+  // An aggregate call's argument: none (COUNT(*)) or one, a value codegen's
+  // eval prints, evaluated once per row; of DISTINCT values only a column,
+  // whose key the values are grouped by.
+  void argument(const Expr& a) const {
+    if (a.args.size() > 1) broken("an aggregate call of more than one argument");
+    if (a.args.empty()) return;
+    if (a.distinct && a.args[0].kind != Expr::Kind::Column) broken("an aggregate of DISTINCT values of other than a column");
+    value(a.args[0]);
+    params(a.args[0]);
+  }
+
   // RETURNING's expressions: values over columns of the table written, the
   // row in hand when it is written.
   void returned(std::uint32_t table, const std::vector<Expr>& list) const {
@@ -1381,9 +1392,10 @@ private:
             if ((op.agg.fn != Expr::Fn::Count || op.agg.distinct) && op.agg.args.empty()) {
               broken("SUM or COUNT(DISTINCT) with no argument");
             }
-            if (op.agg.fn == Expr::Fn::Sum && (op.agg.distinct || op.agg.args[0].col.type == PhysType::F64)) {
-              broken("an aggregate row of a SUM of DISTINCT values or of a DOUBLE");
+            if (op.agg.fn == Expr::Fn::Sum && (op.agg.distinct || op.agg.args[0].phys() != PhysType::I64)) {
+              broken("an aggregate row of a SUM of DISTINCT values or of other than an integer");
             }
+            argument(op.agg);
             reads(op.agg);
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, GroupAggregate>) {
@@ -1414,8 +1426,13 @@ private:
             for (const auto& a : op.aggs) {
               if (a.kind != Expr::Kind::Aggregate) broken("an aggregate that is not an aggregate call");
               if ((a.fn != Expr::Fn::Count || a.distinct) && a.args.empty()) broken("an aggregate call with no argument");
-              if (!a.args.empty() && !of_input(a.args[0].col)) broken("an aggregate's argument outside its input's tables");
-              if (!a.args.empty()) held_above(*op.input, a.args[0].col);
+              argument(a);
+              std::vector<ColumnRef> cols;
+              if (!a.args.empty()) logical::columns_of(a.args[0], cols);
+              for (const auto& c : cols) {
+                if (!of_input(c)) broken("an aggregate's argument outside its input's tables");
+                held_above(*op.input, c);
+              }
               reads(a);
             }
             node(*op.input, &n);

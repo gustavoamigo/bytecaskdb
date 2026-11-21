@@ -2119,10 +2119,7 @@ public:
       return std::ranges::any_of(scope_, [&](const Table* t) { return t->column(e.column) != nullptr; });
     };
     std::function<bool(const ast::Expr&)> in_expr = [&](const ast::Expr& e) {
-      if ((e.kind == ast::Expr::Kind::Column || (e.kind == ast::Expr::Kind::Aggregate && !e.column.empty())) &&
-          outer_names(e)) {
-        return true;
-      }
+      if (e.kind == ast::Expr::Kind::Column && outer_names(e)) return true;
       return (e.lhs && in_expr(*e.lhs)) || (e.rhs && in_expr(*e.rhs)) || std::ranges::any_of(e.args, in_expr);
     };
     std::function<bool(const ast::Compare&)> in_compare = [&](const ast::Compare& c) {
@@ -3016,7 +3013,7 @@ public:
   // order, as PostgreSQL does.
   void check_assigned(std::uint32_t n, const Column& col, std::uint32_t table) { narrow(params_[n], col.sql, table); }
 
-  // Whether the layer takes `fn` of `c`, and if not the SQLSTATE of the
+  // Whether the layer takes `fn` of a value of type `t`, and if not the SQLSTATE of the
   // refusal: 42883 where PostgreSQL has no such aggregate either, 42601 where
   // it has and the layer does not yet (SUM, AVG, MIN or MAX of a REAL, SUM or
   // AVG of a TIME column, which PostgreSQL takes as an interval; MIN or MAX
@@ -3025,11 +3022,11 @@ public:
     bool supported;
     SqlState sqlstate;
   };
-  static auto aggregate_support(ast::Expr::Fn fn, const Column& c) -> AggregateSupport {
+  static auto aggregate_support(ast::Expr::Fn fn, SqlType t) -> AggregateSupport {
     using Fn = ast::Expr::Fn;
     if (fn == Fn::Count) return {true, kSyntaxError};
     auto sum = fn == Fn::Sum || fn == Fn::Avg;
-    switch (c.sql.kind) {
+    switch (t.kind) {
       case SqlKind::SmallInt:
       case SqlKind::Integer:
       case SqlKind::BigInt:
@@ -3045,7 +3042,7 @@ public:
       case SqlKind::TimestampTz:
       case SqlKind::Date: return {!sum, kUndefinedFunction};
       case SqlKind::Time: return {!sum, kSyntaxError};
-      case SqlKind::Numeric: return {false, kSyntaxError};  // no column has it
+      case SqlKind::Numeric: return {false, kSyntaxError};  // no column has it, nor an argument the binder takes
     }
     std::unreachable();
   }
@@ -3061,20 +3058,61 @@ public:
     std::unreachable();
   }
 
-  // An aggregate call, of column c of `table`, or COUNT(*) with none. SUM,
-  // MIN, MAX and AVG take a column whose values the plan holds as int64_t:
-  // SUM and AVG an integer or DECIMAL one, as PostgreSQL sums them exactly;
-  // MIN and MAX those and the date and time types. Of a REAL or DOUBLE
-  // PRECISION column they are later, and MIN and MAX of a string or bytes
-  // column outside the MVP (docs/frontend_design.md, *Aggregates*).
+  // An aggregate call's argument, bound as a select item's expression is
+  // (plain_output): a column, or an expression of the FROM columns evaluated
+  // per row. none for COUNT(*). An aggregate inside it is 42803, as
+  // PostgreSQL refuses it; DISTINCT of other than a column is not taken yet
+  // (0A000).
+  auto aggregate_arg(const ast::Expr& e, const Resolve& resolve) -> std::optional<logical::Expr> {
+    if (e.star) return std::nullopt;
+    const auto& a = e.args.at(0);
+    std::function<const ast::Expr*(const ast::Expr&)> inner = [&](const ast::Expr& x) -> const ast::Expr* {
+      if (x.kind == ast::Expr::Kind::Aggregate) return &x;
+      for (const auto* side : {x.lhs.get(), x.rhs.get()}) {
+        if (side == nullptr) continue;
+        if (const auto* found = inner(*side)) return found;
+      }
+      for (const auto& arg : x.args) {
+        if (const auto* found = inner(arg)) return found;
+      }
+      return nullptr;
+    };
+    if (const auto* nested = inner(a)) throw SqlError{"aggregate function calls cannot be nested", nested->pos, kGroupingError};
+    // A $n nothing typed, or a NULL or quoted literal not under a cast, is of
+    // unknown type: PostgreSQL finds no one SUM or AVG of unknown, and no type
+    // for COUNT's $n (COUNT of such a literal counts it as text does).
+    const auto untyped_param = a.kind == ast::Expr::Kind::Param && (params_.size() <= a.param || !params_[a.param].first);
+    const auto untyped_literal =
+        a.kind == ast::Expr::Kind::Literal && (a.literal.kind == ast::Literal::Kind::Null || a.literal.kind == ast::Literal::Kind::String);
+    if (untyped_param || untyped_literal) {
+      if (untyped_param && e.fn == ast::Expr::Fn::Count) {
+        throw SqlError{"could not determine data type of parameter $" + std::to_string(a.param + 1), a.pos, kIndeterminateDatatype};
+      }
+      if (e.fn == ast::Expr::Fn::Sum || e.fn == ast::Expr::Fn::Avg) {
+        throw SqlError{std::string{"function "} + (e.fn == ast::Expr::Fn::Sum ? "sum" : "avg") + "(unknown) is not unique", e.pos,
+                       kAmbiguousFunction};
+      }
+    }
+    auto arg = plain_output(a, resolve).expr;
+    if (e.distinct && a.kind != ast::Expr::Kind::Column) not_supported("an aggregate of DISTINCT values of an expression", e.pos);
+    return arg;
+  }
+
+  // An aggregate call of `arg`, or COUNT(*) with none: a column, or an
+  // expression of columns, whose type decides the call's. SUM, MIN, MAX and
+  // AVG take a value the plan holds as int64_t: SUM and AVG an integer or
+  // DECIMAL one, as PostgreSQL sums them exactly; MIN and MAX those and the
+  // date and time types; and each a DOUBLE PRECISION one. Of a REAL they are
+  // later, and MIN and MAX of a string or bytes value outside the MVP
+  // (docs/frontend_design.md, *Aggregates*).
   //
   // Its result as PostgreSQL names and types it: COUNT a bigint; SUM of a
   // SMALLINT or INTEGER a bigint, of a BIGINT or DECIMAL a numeric of no
-  // declared precision (the total may take 19 digits), held at the column's
-  // scale; MIN and MAX of the column's type; AVG a numeric of no declared
-  // precision, its scale PostgreSQL's division's (the API computes it from
-  // the plan's sum and count, docs/planner_design.md, *Aggregates*).
-  static auto aggregate(const Column* c, std::uint32_t table, const ast::Expr& e) -> logical::Output {
+  // declared precision (the total may take 19 digits), held at the
+  // argument's scale; MIN and MAX of the argument's type; AVG a numeric of no
+  // declared precision, its scale PostgreSQL's division's (the API computes
+  // it from the plan's sum and count, docs/planner_design.md, *Aggregates*).
+  static auto aggregate(std::optional<logical::Expr> arg, const ast::Expr& e) -> logical::Output {
     using Fn = ast::Expr::Fn;
     auto agg = logical::expr(logical::Expr::Kind::Aggregate, SqlType{SqlKind::BigInt});
     // MIN and MAX of the distinct values are those of all of them.
@@ -3086,26 +3124,27 @@ public:
       case Fn::Max: agg.fn = logical::Expr::Fn::Max; break;
       case Fn::Avg: agg.fn = logical::Expr::Fn::Avg; break;
     }
-    if (c == nullptr) return {std::move(agg), "count"};
-    if (auto s = aggregate_support(e.fn, *c); !s.supported) {
-      throw SqlError{std::string{aggregate_name(e.fn)} + " of a " + sql_type_name(c->sql) +
-                         " column is not supported",
-                     e.pos, s.sqlstate};
+    if (!arg) return {std::move(agg), "count"};
+    const auto t = arg->type;
+    if (auto s = aggregate_support(e.fn, t); !s.supported) {
+      auto of = arg->kind == logical::Expr::Kind::Column ? " column" : " value";
+      throw SqlError{std::string{aggregate_name(e.fn)} + " of a " + sql_type_name(t) + of + " is not supported", e.pos,
+                     s.sqlstate};
     }
-    agg.args.push_back(logical::column_of(table, *c));
+    agg.args.push_back(std::move(*arg));
     switch (e.fn) {
       case Fn::Count: return {std::move(agg), "count"};
       case Fn::Sum:
-        if (c->sql.kind == SqlKind::Double) {
-          agg.type = c->sql;
-        } else if (c->sql.kind != SqlKind::SmallInt && c->sql.kind != SqlKind::Integer) {
-          agg.type = SqlType{SqlKind::Decimal, 0, 0, c->sql.scale};
+        if (t.kind == SqlKind::Double) {
+          agg.type = t;
+        } else if (t.kind != SqlKind::SmallInt && t.kind != SqlKind::Integer) {
+          agg.type = SqlType{SqlKind::Decimal, 0, 0, t.scale};
         }
         return {std::move(agg), "sum"};
-      case Fn::Min: agg.type = c->sql; return {std::move(agg), "min"};
-      case Fn::Max: agg.type = c->sql; return {std::move(agg), "max"};
+      case Fn::Min: agg.type = t; return {std::move(agg), "min"};
+      case Fn::Max: agg.type = t; return {std::move(agg), "max"};
       case Fn::Avg:
-        agg.type = c->sql.kind == SqlKind::Double ? c->sql : SqlType{SqlKind::Numeric, 0, 0, c->sql.scale};
+        agg.type = t.kind == SqlKind::Double ? t : SqlType{SqlKind::Numeric, 0, 0, t.scale};
         return {std::move(agg), "avg"};
     }
     return {std::move(agg), ""};
@@ -3849,12 +3888,7 @@ public:
     for (std::size_t i = 0; i < list.size(); ++i) {
       const auto& e = list[i];
       if (e.kind == ast::Expr::Kind::Aggregate) {
-        if (e.column.empty()) {
-          targets.push_back(aggregate(nullptr, 0, e));
-        } else {
-          auto [t, c] = resolve(e);
-          targets.push_back(aggregate(c, t->id, e));
-        }
+        targets.push_back(aggregate(aggregate_arg(e, resolve), e));
         continue;
       }
       if (!aggregated) {
@@ -4326,21 +4360,22 @@ public:
       auto sql = having_param(rhs->param, c->type, rhs->pos, *c, t->id);
       return logical::compare(op, std::move(g), logical::param(rhs->param, sql));
     }
-    logical::Output agg;
+    // The call is the plan's aggregate of the groups that the select list's
+    // alike call is (the planner finds it by its bound expression), or one of
+    // its own.
     const Column* arg = nullptr;
     std::uint32_t table_id = 0;
-    if (lhs->column.empty()) {
-      agg = aggregate(nullptr, 0, *lhs);
-    } else {
-      auto [t, c] = resolve(*lhs);
+    if (!lhs->star && lhs->args.at(0).kind == ast::Expr::Kind::Column) {
+      auto [t, c] = resolve(lhs->args[0]);
       arg = c;
       table_id = t->id;
-      agg = aggregate(c, t->id, *lhs);
     }
+    auto agg = aggregate(aggregate_arg(*lhs, resolve), *lhs);
     if (agg.expr.fn == logical::Expr::Fn::Avg) throw SqlError{"HAVING on AVG is not supported yet", lhs->pos};
-    auto phys = agg.expr.fn != logical::Expr::Fn::Count && arg->sql.kind == SqlKind::Double ? PhysType::F64 : PhysType::I64;
+    auto phys = agg.expr.fn != logical::Expr::Fn::Count && agg.expr.args[0].type.kind == SqlKind::Double ? PhysType::F64
+                                                                                                        : PhysType::I64;
     const Column* as = arg;
-    if (agg.expr.fn == logical::Expr::Fn::Count || agg.expr.fn == logical::Expr::Fn::Sum) {
+    if (agg.expr.fn == logical::Expr::Fn::Count || agg.expr.fn == logical::Expr::Fn::Sum || arg == nullptr) {
       synthetic_.push_back(Column{0, agg.name, agg.expr.type, phys, true, {}});
       as = &synthetic_.back();
     }
@@ -4525,7 +4560,7 @@ void each_subquery(S& s, F&& f) {
 using ColumnSwap = std::function<std::optional<ast::Expr>(ast::Expr&)>;
 
 void qualify(ast::Expr& e, const std::string& table) {
-  if ((e.kind == ast::Expr::Kind::Column || (e.kind == ast::Expr::Kind::Aggregate && !e.column.empty())) && e.table.empty()) {
+  if (e.kind == ast::Expr::Kind::Column && e.table.empty()) {
     e.table = table;
   }
   if (e.lhs) qualify(*e.lhs, table);
@@ -4553,28 +4588,15 @@ void qualify(ast::Compare& c, const std::string& table) {
   }
 }
 
-// Replaces each column of `e` that `swap` answers for, and the column an
-// aggregate reads, which must stay a column. A subquery is left: it reads
-// no column of the query around it.
+// Replaces each column of `e` that `swap` answers for, an aggregate's
+// argument's among them. A subquery is left: it reads no column of the
+// query around it.
 void swap_columns(ast::Expr& e, const ColumnSwap& swap) {
   if (e.kind == ast::Expr::Kind::Column) {
     if (auto repl = swap(e)) {
       repl->pos = e.pos;
       e = std::move(*repl);
     }
-    return;
-  }
-  if (e.kind == ast::Expr::Kind::Aggregate && !e.column.empty()) {
-    ast::Expr ref{ast::Expr::Kind::Column, e.column, 0, nullptr, nullptr, e.pos};
-    ref.table = e.table;
-    if (auto repl = swap(ref)) {
-      if (repl->kind != ast::Expr::Kind::Column) {
-        not_yet("an aggregate of a view column that is an expression", e.pos);
-      }
-      ref = std::move(*repl);
-    }
-    e.column = ref.column;
-    e.table = ref.table;
     return;
   }
   if (e.lhs) swap_columns(*e.lhs, swap);
