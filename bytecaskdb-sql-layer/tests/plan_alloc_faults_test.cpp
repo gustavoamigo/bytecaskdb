@@ -381,6 +381,99 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
   }
 }
 
+namespace {
+// A data error whose four lines each pass the string's inline buffer, so
+// each is an allocation of its own; and a zero divisor's.
+constexpr const char* kLongMessage = "invalid input syntax for type json, a message long enough to allocate";
+constexpr const char* kLongDetail = "Token \"nope\" is invalid, a detail long enough to allocate.";
+constexpr const char* kLongHint = "a hint long enough to allocate its own buffer";
+constexpr const char* kLongContext = "JSON data, line 1: nope, a context long enough to allocate";
+void data_error_lines(bc_ctx* cx) {
+  bc_ctx_fail_for_testing(cx, BC_E_DATA, bytecask::sql::kInvalidTextRepresentation, kLongMessage, kLongDetail,
+                          kLongHint, kLongContext);
+}
+void zero_divisor(bc_ctx* cx) {
+  bool found = false;
+  bc_view row = bc_get(cx, bc_key_params(cx, kTbl, 0, 1), &found);
+  if (found) bc_emit_count(cx, bc_div(cx, bc_col_i64(cx, row, kQtyCol), 0));
+}
+}  // namespace
+
+TEST_CASE("plan API: an allocation failure while an error's text is built keeps its code and SQLSTATE",
+          "[sql][algebra][alloc]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("operator new is the sanitizer's in this build");
+  Fixture f;
+  {
+    auto ps = params({std::int64_t{1}, bytes("n1"), std::int64_t{10}});
+    SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+    auto ref = sr.get();
+    REQUIRE(bc_execute(f.cx, insert_row, &ref, &ps, {}, false, 0) == BC_COMMITTED);
+  }
+  struct Case {
+    const char* name;
+    bc_plan_fn plan;
+    bc_error_code code;
+    std::uint32_t state;
+    std::vector<std::string> lines;  // message, DETAIL, HINT, CONTEXT
+    // Its text outgrows what the context's strings kept from an earlier
+    // run, so building it allocates, and the sweep must fail it.
+    bool text_allocates;
+  };
+  const std::vector<Case> cases{
+      {"a data error with every line", data_error_lines, BC_E_DATA, BC_SQLSTATE('2', '2', 'P', '0', '2'),
+       {kLongMessage, kLongDetail, kLongHint, kLongContext}, true},
+      {"division by zero", zero_divisor, BC_E_ARITH, BC_SQLSTATE('2', '2', '0', '1', '2'),
+       {"division by zero", "", "", ""}, false},
+  };
+  for (const auto& c : cases) {
+    INFO(c.name);
+    auto failed = 0;
+    auto kept = 0;  // failures that reached the error's text
+    for (long nth = 1;; ++nth) {
+      REQUIRE(nth < 100000);
+      auto ps = params({std::int64_t{1}});
+      SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+      auto ref = sr.get();
+      bc_ctx_begin(f.cx, &ps, {});
+      auto threw = false;
+      bytecask::testing::AllocFaultReport report;
+      {
+        bytecask::testing::ScopedAllocFaults faults{nth, false};
+        try {
+          bc_ctx_run(f.cx, c.plan, &ref);
+        } catch (...) {
+          threw = true;
+        }
+        report = faults.report();
+      }
+      INFO("allocation " << nth);
+      CHECK_FALSE(threw);
+      auto error = bc_error(f.cx);
+      std::vector<std::string> lines{bc_error_message(f.cx), bc_error_note(f.cx), bc_error_hint(f.cx),
+                                     bc_error_context(f.cx)};
+      auto detail = bc_error_detail(f.cx);
+      bc_ctx_reset(f.cx);
+      if (!report.fired) {
+        CHECK(error == c.code);
+        CHECK(detail == c.state);
+        CHECK(lines == c.lines);
+        break;
+      }
+      // Failed before the error: out of memory. Failed building its text:
+      // the error and its SQLSTATE, with every line or none.
+      CHECK((error == BC_E_MEMORY || error == c.code));
+      if (error == c.code) {
+        CHECK(detail == c.state);
+        CHECK((lines == c.lines || lines == std::vector<std::string>(4)));
+        ++kept;
+      }
+      ++failed;
+    }
+    CHECK(failed > 0);
+    if (c.text_allocates) CHECK(kept > 0);  // the sweep reached the text, not only what runs before it
+  }
+}
+
 TEST_CASE("plan API: a commit whose allocations fail is never BC_COMMITTED with an error set",
           "[sql][algebra][alloc]") {
   if (!bytecask::testing::kAllocFaultsAvailable) SKIP("operator new is the sanitizer's in this build");

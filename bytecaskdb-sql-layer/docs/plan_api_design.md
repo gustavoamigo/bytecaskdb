@@ -1,6 +1,10 @@
 # Plan API: a physical algebra for generated plans
 
-Status: **built**, revision 19 (revision 19 with `BC_C_CHECK_OPTION`,
+Status: **built**, revision 20 (revision 20 with `BC_E_DATA`, a SQLSTATE
+packed in `bc_error_detail` for `BC_E_DATA` and `BC_E_ARITH` (`BC_SQLSTATE`),
+and `bc_error_hint` and `bc_error_context`, so a runtime error carries
+PostgreSQL's SQLSTATE, DETAIL, HINT and CONTEXT (`jsonb_design.md`, stage 0);
+revision 19 with `BC_C_CHECK_OPTION`,
 `bc_raise_row` and `bc_error_note`, for `WITH CHECK OPTION`; revision 18 with
 `bc_insert_or_existing`, for `INSERT … ON CONFLICT DO UPDATE`; revision 17 with
 `bc_insert_on_conflict`, for `INSERT … ON CONFLICT DO NOTHING`; revision 16 with `BC_T_NUM`,
@@ -488,7 +492,15 @@ enum bc_error_code {
   BC_E_PATTERN,     /* bc_like reached a pattern's escape character at its end (SQLSTATE 22025) */
   BC_E_CARDINALITY, /* a BC_SUB_VALUE subquery emitted a second row (SQLSTATE 21000) */
   BC_E_READ_ONLY,   /* a write, guard or DDL in a transaction begun read-only (SQLSTATE 25006) */
+  BC_E_DATA,        /* a value a call cannot take or make: its SQLSTATE in bc_error_detail
+                       (BC_SQLSTATE), its DETAIL, HINT and CONTEXT in bc_error_note,
+                       bc_error_hint and bc_error_context */
 };
+
+/* A SQLSTATE as bc_error_detail carries it for BC_E_DATA and BC_E_ARITH:
+   PostgreSQL's MAKE_SQLSTATE, five characters of six bits each (the
+   character less '0'), the first in the lowest bits, 30 bits in all. */
+#define BC_SQLSTATE(c1, c2, c3, c4, c5) /* ... */
 
 enum bc_scan_flags {
   BC_SCAN_FORWARD = 0,
@@ -621,7 +633,10 @@ bool    bc_ctx_stopped(const bc_ctx *);
 enum bc_error_code bc_error(const bc_ctx *);
 const char *bc_error_message(const bc_ctx *);
 const char *bc_error_note(const bc_ctx *);                 /* the error's DETAIL line: bc_raise_row's failing row; "" for none */
-uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits; BC_E_LAYOUT: a bc_layout_detail */
+const char *bc_error_hint(const bc_ctx *);                 /* the error's HINT line; "" for none */
+const char *bc_error_context(const bc_ctx *);              /* the error's CONTEXT line; "" for none */
+uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits; BC_E_LAYOUT: a bc_layout_detail;
+                                                              BC_E_DATA, BC_E_ARITH: the SQLSTATE (BC_SQLSTATE), 0 for none */
 int64_t bc_ctx_affected(const bc_ctx *);                   /* what the last run's bc_emit_count recorded, or -1 */
 int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params *,
                    bc_budget, bool sync, uint32_t max_retries);               /* the retry loop */
@@ -639,7 +654,8 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
 | `bc_txn_overlay_pin`, `bc_txn_overlay_release`, `bc_ctx_use_overlay` | Runtime only. A pin shares the transaction's overlay (copy-on-write: `bc_txn_add` clones it before the first put or delete once a pin holds it) and reserves its bound against `max_bytes` until released; one that does not fit is `BC_E_LIMIT` and aborts the transaction. `bc_ctx_use_overlay`, after `bc_ctx_begin_txn`, makes the statement read the pin instead of the transaction's overlay: a read, writing nothing. Release every pin before `bc_txn_free`. `transaction_design.md`, *The transaction's view* and *Limits*; `cursor_design.md`, *What a cursor sees*. | `bc_txn_error` reports a failed pin. |
 | `bc_txn_hold`, `bc_txn_hold_free`, `bc_ctx_begin_hold` | Runtime only. A hold is what a cursor that outlives its transaction reads: a clone of the transaction's snapshot (`Snapshot::clone`), its pinned catalog and the pin's overlay. It needs nothing of the transaction after the call, so the transaction's commit may move its own snapshot into the `WritePlan`. `bc_ctx_begin_hold` begins a context that belongs to no transaction on it; the statement must be a read. A hold pins the engine's snapshot until `bc_txn_hold_free`. `cursor_design.md`, *As built (phase 4)*. | `bc_txn_error` reports a failed `bc_txn_hold`. |
 | `bc_ctx_reset` | Releases the snapshot, drops the write plan and result buffer, frees the statement's memory (the arena keeps one chunk) and its charge, and releases every handle, so every handle and view the plan held is invalid. |
-| `bc_error_detail`, `bc_ctx_affected` | The constraint kind and object id of a raised error, or for `BC_E_LAYOUT` its class: `bc_ctx_run` refusing the reference (`BC_L_INCOMPATIBLE`, the only one a recompile cures), a row used with a table or column it is not of (`BC_L_ROW`), a malformed plan or reference (`BC_L_PLAN`), or a row of a retired layout generation (`BC_L_RETIRED`). The runtime sets every `BC_E_LAYOUT` with its detail; one without cannot be compiled; the affected-row count the last run recorded. Both read by the runtime after the plan returns. |
+| `bc_error_detail`, `bc_ctx_affected` | The constraint kind and object id of a raised error, for `BC_E_DATA` and `BC_E_ARITH` its SQLSTATE packed as `BC_SQLSTATE` packs it (0, for `BC_E_ARITH` alone, is 22003), or for `BC_E_LAYOUT` its class: `bc_ctx_run` refusing the reference (`BC_L_INCOMPATIBLE`, the only one a recompile cures), a row used with a table or column it is not of (`BC_L_ROW`), a malformed plan or reference (`BC_L_PLAN`), or a row of a retired layout generation (`BC_L_RETIRED`). The runtime sets every `BC_E_LAYOUT` with its detail; one without cannot be compiled; the affected-row count the last run recorded. Both read by the runtime after the plan returns. |
+| `bc_error_note`, `bc_error_hint`, `bc_error_context` | The lines an error carries beside its message, PostgreSQL's DETAIL, HINT and CONTEXT, each `""` for none: the failing row of `bc_raise_row`, and a `BC_E_DATA` or `BC_E_ARITH` error's own. Cleared with the error by `bc_ctx_begin*`. A runtime call sets a `BC_E_DATA` or `BC_E_ARITH` error code and SQLSTATE first and its text after, so an allocation that fails while the text is built drops the message and every line, never the code or the SQLSTATE. The runtime raises the two codes only with a SQLSTATE: setting either without one does not compile inside the runtime (a `consteval` check). Read by the runtime after the plan returns. Revision 20 (`bc_error_note` 19). |
 | `bc_execute` | `begin`, `run`, `commit`; on `BC_CONFLICT`, `reset` and repeat up to `max_retries`. A `BC_E_CONSTRAINT` raised by the plan is final: no retry. Returns the commit result of the last attempt, except that a last attempt's conflict on a key it inserted, taken by a concurrent commit, is the duplicate it is: `BC_FAILED` with `BC_C_UNIQUE` on the table or index, as a retry's own check would raise (`docs/transaction_design.md`, *Commit and conflicts*). This is the only place retry lives. |
 
 **Verification runs on every execution.** `bc_ctx_run` checks the
@@ -688,10 +704,12 @@ void     bc_emit_count(bc_ctx *, int64_t affected);   /* write statements: the r
 
 The subset has no raw integer arithmetic (*The language*). These helpers
 define the cases C leaves undefined. On failure they set `BC_E_ARITH` and
-return zero. The error's message tells a zero divisor, `division by zero`
-(`bc_div`, `bc_mod`), from an overflow: SQL reports the first as SQLSTATE
-22012 and every other `BC_E_ARITH` as 22003, so that text is part of the
-helpers' contract (*Errors* in `server_design.md`).
+return zero, with the SQLSTATE in `bc_error_detail`: 22012 for a zero
+divisor, `division by zero` (`bc_div`, `bc_mod`), and 22003 for an
+overflow or a value out of range. `bc_substr`'s negative count is 22011
+and `bc_random`'s lower bound above its upper 22023. The SQLSTATE, not the
+message, is what SQL reports (*Errors* in `server_design.md`); until
+revision 20 the API matched these three messages.
 
 ```c
 int64_t bc_add(bc_ctx *, int64_t, int64_t);     /* overflow → error */

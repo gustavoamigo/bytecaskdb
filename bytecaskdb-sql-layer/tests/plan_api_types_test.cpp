@@ -19,6 +19,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -656,6 +657,96 @@ TEST_CASE("plan API: bc_ilike folds ASCII letters of literals; bc_like_escape re
   CHECK(std::string{bc_error_message(f.cx)} == "invalid escape string");
 }
 
+namespace {
+void substr_p(bc_ctx* cx) {
+  bc_emit_count(cx, bc_char_length(cx, bc_substr(cx, bc_param_bytes(cx, 0), 1, bc_param_i64(cx, 1))));
+}
+void random_p(bc_ctx* cx) { bc_emit_count(cx, bc_random(cx, bc_param_i64(cx, 0), bc_param_i64(cx, 1))); }
+// A runtime call's data error with every line (param 0 nonzero) or none,
+// then a second error that the first keeps from being recorded.
+void data_error_p(bc_ctx* cx) {
+  if (bc_param_i64(cx, 0) != 0) {
+    bc_ctx_fail_for_testing(cx, BC_E_DATA, bytecask::sql::kInvalidTextRepresentation,
+                            "invalid input syntax for type json", "Token \"x\" is invalid.", "a hint",
+                            "JSON data, line 1: x");
+  } else {
+    bc_ctx_fail_for_testing(cx, BC_E_DATA, bytecask::sql::kInvalidTextRepresentation, "m", "", "", "");
+  }
+  bc_ctx_fail_for_testing(cx, BC_E_ARITH, bytecask::sql::kDivisionByZero, "second", "d", "h", "c");
+  (void)bc_div(cx, 1, 0);
+  bc_emit_count(cx, 1);
+}
+void not_data_p(bc_ctx* cx) {
+  bc_ctx_fail_for_testing(cx, BC_E_LIMIT, bytecask::sql::kInvalidTextRepresentation, "m", "", "", "");
+}
+}  // namespace
+
+TEST_CASE("plan API: BC_SQLSTATE packs PostgreSQL's MAKE_SQLSTATE, and unpacks only a SQLSTATE", "[sql][algebra]") {
+  using bytecask::sql::unpack_sqlstate;
+  // Six bits a character less '0', the first lowest: PostgreSQL's numbers.
+  STATIC_CHECK(BC_SQLSTATE('2', '2', '0', '1', '2') == ((2u) | (2u << 6) | (0u << 12) | (1u << 18) | (2u << 24)));
+  STATIC_CHECK(BC_SQLSTATE('2', '2', 'P', '0', '2') == bytecask::sql::kInvalidTextRepresentation.packed());
+  STATIC_CHECK(BC_SQLSTATE('X', 'X', '0', '0', '0') == bytecask::sql::kInternalError.packed());
+  STATIC_CHECK(BC_SQLSTATE('5', '4', '0', '0', '1') < (1u << 30));
+  for (auto s : {bytecask::sql::kDivisionByZero, bytecask::sql::kSubstringError, bytecask::sql::kInvalidParameterValue,
+                 bytecask::sql::kNumericValueOutOfRange, bytecask::sql::kInvalidTextRepresentation,
+                 bytecask::sql::kCharacterNotInRepertoire, bytecask::sql::kInternalError}) {
+    auto back = unpack_sqlstate(s.packed());
+    REQUIRE(back.has_value());
+    CHECK(std::string_view{back->data(), back->size()} == s.view());
+  }
+  CHECK_FALSE(unpack_sqlstate(0).has_value());              // no SQLSTATE: BC_E_ARITH's 22003
+  CHECK_FALSE(unpack_sqlstate(1u << 30).has_value());       // past 30 bits
+  CHECK_FALSE(unpack_sqlstate(0x3Fu).has_value());          // 'o': no SQLSTATE character
+  CHECK_FALSE(unpack_sqlstate(BC_SQLSTATE('2', '2', '0', '0', ':')).has_value());
+}
+
+TEST_CASE("plan API: BC_E_ARITH and BC_E_DATA carry their SQLSTATE, DETAIL, HINT and CONTEXT", "[sql][algebra]") {
+  Fixture f;
+  auto empty_notes = [&] {
+    CHECK(std::string{bc_error_note(f.cx)}.empty());
+    CHECK(std::string{bc_error_hint(f.cx)}.empty());
+    CHECK(std::string{bc_error_context(f.cx)}.empty());
+  };
+  // The three errors whose SQLSTATE the API once read from their message.
+  arith_error(f, substr_p, {bytes("abc"), std::int64_t{-1}});
+  CHECK(std::string{bc_error_message(f.cx)} == "negative substring length not allowed");
+  CHECK(bc_error_detail(f.cx) == BC_SQLSTATE('2', '2', '0', '1', '1'));
+  empty_notes();
+  arith_error(f, random_p, {std::int64_t{5}, std::int64_t{1}});
+  CHECK(std::string{bc_error_message(f.cx)} == "lower bound must be less than or equal to upper bound");
+  CHECK(bc_error_detail(f.cx) == BC_SQLSTATE('2', '2', '0', '2', '3'));
+  empty_notes();
+  arith_error(f, div_p, {std::int64_t{1}, std::int64_t{0}});
+  CHECK(bc_error_detail(f.cx) == BC_SQLSTATE('2', '2', '0', '1', '2'));
+  empty_notes();
+  CHECK(value(f, substr_p, {bytes("abc"), std::int64_t{2}}) == 2);
+  CHECK(value(f, random_p, {std::int64_t{3}, std::int64_t{3}}) == 3);
+
+  // An error with every line, and one with none.
+  CHECK(run(f, data_error_p, {std::int64_t{1}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_DATA);
+  CHECK(bc_error_detail(f.cx) == BC_SQLSTATE('2', '2', 'P', '0', '2'));
+  CHECK(std::string{bc_error_message(f.cx)} == "invalid input syntax for type json");
+  CHECK(std::string{bc_error_note(f.cx)} == "Token \"x\" is invalid.");
+  CHECK(std::string{bc_error_hint(f.cx)} == "a hint");
+  CHECK(std::string{bc_error_context(f.cx)} == "JSON data, line 1: x");
+  CHECK(bc_ctx_affected(f.cx) == -1);
+  CHECK(run(f, data_error_p, {std::int64_t{0}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_DATA);
+  CHECK(std::string{bc_error_message(f.cx)} == "m");
+  empty_notes();
+  // A context's next statement starts with none of the last one's lines.
+  CHECK(value(f, add_p, {std::int64_t{2}, std::int64_t{3}}) == 5);
+  CHECK(bc_error(f.cx) == BC_OK);
+  CHECK(bc_error_detail(f.cx) == 0);
+  CHECK(std::string{bc_error_message(f.cx)}.empty());
+  empty_notes();
+  // The seam itself takes only the codes that carry a SQLSTATE.
+  CHECK(run(f, not_data_p, {}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+}
+
 TEST_CASE("plan API: the arithmetic helpers define what C leaves undefined", "[sql][algebra]") {
   Fixture f;
   CHECK(value(f, add_p, {std::int64_t{2}, std::int64_t{3}}) == 5);
@@ -666,17 +757,20 @@ TEST_CASE("plan API: the arithmetic helpers define what C leaves undefined", "[s
   arith_error(f, mul_p, {kMin, std::int64_t{-1}});
   CHECK(value(f, div_p, {std::int64_t{-7}, std::int64_t{2}}) == -3);  // truncates toward zero
   // The runtime tells a zero divisor (SQLSTATE 22012) from an overflow
-  // (22003) by this message.
+  // (22003) by the SQLSTATE in the detail, not by the message.
   arith_error(f, div_p, {std::int64_t{1}, std::int64_t{0}});
   CHECK(std::string{bc_error_message(f.cx)} == "division by zero");
+  CHECK(bc_error_detail(f.cx) == BC_SQLSTATE('2', '2', '0', '1', '2'));
   arith_error(f, div_p, {kMin, std::int64_t{-1}});
-  CHECK(std::string{bc_error_message(f.cx)} != "division by zero");
+  CHECK(std::string{bc_error_message(f.cx)} == "integer out of range");
+  CHECK(bc_error_detail(f.cx) == BC_SQLSTATE('2', '2', '0', '0', '3'));
   CHECK(value(f, div_p, {kMin, std::int64_t{1}}) == kMin);
   CHECK(value(f, mod_p, {std::int64_t{-7}, std::int64_t{2}}) == -1);  // the dividend's sign
   CHECK(value(f, mod_p, {std::int64_t{7}, std::int64_t{-2}}) == 1);
   CHECK(value(f, mod_p, {kMin, std::int64_t{-1}}) == 0);
   arith_error(f, mod_p, {std::int64_t{1}, std::int64_t{0}});
   CHECK(std::string{bc_error_message(f.cx)} == "division by zero");
+  CHECK(bc_error_detail(f.cx) == BC_SQLSTATE('2', '2', '0', '1', '2'));
   CHECK(value(f, neg_p, {std::int64_t{5}}) == -5);
   arith_error(f, neg_p, {kMin});
   CHECK(value(f, trunc_p, {-2.7}) == -2);

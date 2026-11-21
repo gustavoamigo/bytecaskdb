@@ -946,30 +946,9 @@ private:
   // ------------------------------------------------------------ replies
 
   void send_fields(char type, const char* severity, std::string_view state, std::string_view message,
-                   std::int32_t position, std::string_view detail = {}, std::string_view hint = {}) {
-    out_.begin(type);
-    out_.raw('S');
-    out_.cstr(severity);
-    out_.raw('V');
-    out_.cstr(severity);
-    out_.raw('C');
-    out_.cstr(state);
-    out_.raw('M');
-    out_.cstr(message);
-    if (!detail.empty()) {
-      out_.raw('D');
-      out_.cstr(detail);
-    }
-    if (!hint.empty()) {
-      out_.raw('H');
-      out_.cstr(hint);
-    }
-    if (position > 0) {
-      out_.raw('P');
-      out_.cstr(std::to_string(position));
-    }
-    out_.raw('\0');
-    out_.end();
+                   std::int32_t position, std::string_view detail = {}, std::string_view hint = {},
+                   std::string_view context = {}) {
+    put_error_fields(out_, type, {severity, state, message, position, detail, hint, context});
   }
 
   void error(std::string_view state, std::string_view message, std::int32_t position = 0) {
@@ -1013,7 +992,7 @@ private:
         fatal("25P04", "terminating connection due to transaction timeout");
         return;
       }
-      send_fields('E', "ERROR", sqlstate(e), e.what(), 0, error_detail(e), error_hint(e));
+      send_fields('E', "ERROR", sqlstate(e), e.what(), 0, error_detail(e), error_hint(e), error_context(e));
     }
   }
 

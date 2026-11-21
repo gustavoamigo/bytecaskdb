@@ -37,6 +37,7 @@
 #include <variant>
 #include <vector>
 
+#include "bytecaskdb-sql-layer/algebra/bc_plan.h"
 #include "include/bytecask.hpp"
 
 import bytecask.sql.api;
@@ -832,6 +833,93 @@ TEST_CASE("pg_session: the transaction defaults are kept by COMMIT and RELEASE a
   CHECK(show("default_transaction_read_only") == "off");
   CHECK(show("default_transaction_isolation") == "read committed");
   CHECK(error_codes(say("INSERT INTO one VALUES (1)")) == std::vector<std::string>{});
+  s.close();
+  db->close();
+}
+
+namespace {
+// The fields of an ErrorResponse or NoticeResponse body, by code.
+auto error_fields(std::string_view body) -> std::vector<std::pair<char, std::string>> {
+  std::vector<std::pair<char, std::string>> out;
+  pg::Body b{body};
+  for (auto code = b.byte(); code != '\0'; code = b.byte()) out.emplace_back(code, std::string{b.cstr()});
+  return out;
+}
+}  // namespace
+
+TEST_CASE("pg_session: an ErrorResponse sends D, H and W only where the error has them", "[sql][server]") {
+  using Fields = std::vector<std::pair<char, std::string>>;
+  auto sent = [](const pg::ErrorFields& f) {
+    pg::Out out;
+    put_error_fields(out, 'E', f);
+    auto raw = out.take();
+    auto msgs = parse_replies(raw);
+    REQUIRE(msgs.size() == 1);
+    CHECK(msgs[0].type == 'E');
+    return error_fields(msgs[0].body);
+  };
+  CHECK(sent({"ERROR", "22012", "division by zero"}) ==
+        Fields{{'S', "ERROR"}, {'V', "ERROR"}, {'C', "22012"}, {'M', "division by zero"}});
+  // PostgreSQL's order: D, H, P, then W.
+  CHECK(sent({"ERROR", "22P02", "invalid input syntax for type json", 8, "Token \"x\" is invalid.", "a hint",
+              "JSON data, line 1: x"}) == Fields{{'S', "ERROR"},
+                                                 {'V', "ERROR"},
+                                                 {'C', "22P02"},
+                                                 {'M', "invalid input syntax for type json"},
+                                                 {'D', "Token \"x\" is invalid."},
+                                                 {'H', "a hint"},
+                                                 {'P', "8"},
+                                                 {'W', "JSON data, line 1: x"}});
+  CHECK(sent({"ERROR", "22P02", "m", 0, "", "", "a context"}) ==
+        Fields{{'S', "ERROR"}, {'V', "ERROR"}, {'C', "22P02"}, {'M', "m"}, {'W', "a context"}});
+  // A runtime error's lines, as report() takes them from the API.
+  bytecask::sql::ExecError e{"m", BC_E_DATA, bytecask::sql::kInvalidTextRepresentation.packed(), "d", "h", "c"};
+  CHECK(sent({"ERROR", bytecask::sql::sqlstate(e), e.what(), 0, bytecask::sql::error_detail(e),
+              bytecask::sql::error_hint(e), bytecask::sql::error_context(e)}) ==
+        Fields{{'S', "ERROR"}, {'V', "ERROR"}, {'C', "22P02"}, {'M', "m"}, {'D', "d"}, {'H', "h"}, {'W', "c"}});
+}
+
+TEST_CASE("pg_session: a runtime error's DETAIL, HINT and CONTEXT reach the client as D, H and W", "[sql][server]") {
+  using Fields = std::vector<std::pair<char, std::string>>;
+  sql_test::TempDir dir{"pg_session_error_lines"};
+  auto db = bytecask::sql::Database::open(dir.path());
+  db->execute("CREATE TABLE el (k BIGINT PRIMARY KEY)");
+  pg::SessionConfig cfg{"testdb"};
+  pg::Framer f;
+  pg::Session s{*db, cfg};
+  (void)feed(s, f, startup_bytes("testdb"));
+  auto sent = [&] {
+    auto out = feed(s, f, query_msg("INSERT INTO el VALUES (1)"));
+    for (const auto& m : out) {
+      if (m.type == 'E') return error_fields(m.body);
+    }
+    return Fields{};
+  };
+  // The runtime raises the error at the statement's commit, as a call that
+  // builds its error text does: report() takes its lines from the API.
+  db->before_commit_for_testing([](bc_ctx* cx) {
+    bc_ctx_fail_for_testing(cx, BC_E_DATA, bytecask::sql::kInvalidTextRepresentation,
+                            "invalid input syntax for type json", "Token \"x\" is invalid.", "a hint",
+                            "JSON data, line 1: x");
+  });
+  CHECK(sent() == Fields{{'S', "ERROR"},
+                         {'V', "ERROR"},
+                         {'C', "22P02"},
+                         {'M', "invalid input syntax for type json"},
+                         {'D', "Token \"x\" is invalid."},
+                         {'H', "a hint"},
+                         {'W', "JSON data, line 1: x"}});
+  // Only the lines the error has.
+  db->before_commit_for_testing([](bc_ctx* cx) {
+    bc_ctx_fail_for_testing(cx, BC_E_DATA, bytecask::sql::kInvalidTextRepresentation, "m", "", "", "a context");
+  });
+  CHECK(sent() == Fields{{'S', "ERROR"}, {'V', "ERROR"}, {'C', "22P02"}, {'M', "m"}, {'W', "a context"}});
+  db->before_commit_for_testing([](bc_ctx* cx) {
+    bc_ctx_fail_for_testing(cx, BC_E_ARITH, bytecask::sql::kDivisionByZero, "division by zero", "", "", "");
+  });
+  CHECK(sent() == Fields{{'S', "ERROR"}, {'V', "ERROR"}, {'C', "22012"}, {'M', "division by zero"}});
+  db->before_commit_for_testing({});
+  CHECK(sent() == Fields{});
   s.close();
   db->close();
 }

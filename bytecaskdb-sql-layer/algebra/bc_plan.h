@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
    Copyright (c) 2026 Gustavo Amigo
 
-   bc_plan.h — the plan API of docs/plan_api_design.md (revision 19). A plan is
+   bc_plan.h — the plan API of docs/plan_api_design.md (revision 20). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
    and bc_params are opaque here and built by the runtime
@@ -46,7 +46,8 @@ enum bc_error_code {
   BC_E_LIMIT,       /* key, value or write plan over the engine's limits, or the statement over its memory budget */
   BC_E_HANDLE,      /* stale, foreign or out-of-range handle, or a table, index or column the plan's
                        bc_schema_ref does not declare, or not of the type used: a plan bug */
-  BC_E_ARITH,       /* integer overflow, division by zero, out-of-range conversion */
+  BC_E_ARITH,       /* integer overflow, division by zero, out-of-range conversion; its SQLSTATE in
+                       bc_error_detail (BC_SQLSTATE), 0 for 22003 */
   BC_E_CONSTRAINT,  /* never retried; raised by the runtime (BC_C_UNIQUE from bc_insert and bc_update,
                        BC_C_RANGE and BC_C_NOT_NULL from the row builder) or by the plan with bc_raise */
   BC_E_LAYOUT,      /* plan incompatible with the live catalog, or a row violates its layout */
@@ -58,7 +59,18 @@ enum bc_error_code {
   BC_E_CARDINALITY, /* a BC_SUB_VALUE subquery emitted a second row, or bc_insert_or_existing
                        met a row this execution wrote (SQLSTATE 21000) */
   BC_E_READ_ONLY,   /* a write, guard or DDL in a transaction begun read-only (SQLSTATE 25006) */
+  BC_E_DATA,        /* a value a call cannot take or make (SQLSTATE class 22 and others): its SQLSTATE
+                       in bc_error_detail (BC_SQLSTATE), its DETAIL, HINT and CONTEXT in bc_error_note,
+                       bc_error_hint and bc_error_context */
 };
+
+/* A SQLSTATE as bc_error_detail carries it for BC_E_DATA and BC_E_ARITH:
+   PostgreSQL's MAKE_SQLSTATE, five characters of six bits each (the
+   character less '0'), the first in the lowest bits, 30 bits in all. */
+#define BC_SQLSTATE_SIXBIT(ch) (((ch) - '0') & 0x3Fu)
+#define BC_SQLSTATE(c1, c2, c3, c4, c5)                                              \
+  (BC_SQLSTATE_SIXBIT(c1) | (BC_SQLSTATE_SIXBIT(c2) << 6) | (BC_SQLSTATE_SIXBIT(c3) << 12) | \
+   (BC_SQLSTATE_SIXBIT(c4) << 18) | (BC_SQLSTATE_SIXBIT(c5) << 24))
 
 /* The isolation a transaction or an autocommit execution runs at
    (docs/transaction_design.md, *Serializable isolation*). SNAPSHOT: its
@@ -175,7 +187,10 @@ bool    bc_ctx_stopped(const bc_ctx *);
 enum bc_error_code bc_error(const bc_ctx *);
 const char *bc_error_message(const bc_ctx *);
 const char *bc_error_note(const bc_ctx *);                 /* the error's DETAIL line: bc_raise_row's failing row; "" for none */
-uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits; BC_E_LAYOUT: a bc_layout_detail */
+const char *bc_error_hint(const bc_ctx *);                 /* the error's HINT line; "" for none */
+const char *bc_error_context(const bc_ctx *);              /* the error's CONTEXT line; "" for none */
+uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits; BC_E_LAYOUT: a bc_layout_detail;
+                                                              BC_E_DATA, BC_E_ARITH: the SQLSTATE (BC_SQLSTATE), 0 for none */
 int64_t bc_ctx_affected(const bc_ctx *);                   /* what the last run's bc_emit_count recorded, or -1 */
 int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params *,
                    bc_budget, bool sync, uint32_t max_retries);               /* the retry loop */

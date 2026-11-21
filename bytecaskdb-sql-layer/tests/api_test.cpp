@@ -12,6 +12,7 @@
 #include <cmath>
 #include <limits>
 #include <cstdint>
+#include <exception>
 #include <optional>
 #include <tuple>
 #include <utility>
@@ -25,6 +26,7 @@
 
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
 #include "include/bytecask.hpp"
+#include "tests/alloc_faults.h"
 
 import bytecask.sql.api;
 import bytecask.sql.text;
@@ -1399,6 +1401,197 @@ TEST_CASE("embedded API: sqlstate reports PostgreSQL's SQLSTATE for each error",
   CHECK(sqlstate(ExecError{"x", BC_E_IO}) == "58030");
   CHECK(sqlstate(bytecask::DbClosed{}) == "57P01");
   CHECK(sqlstate(std::runtime_error{"x"}) == "XX000");
+}
+
+TEST_CASE("embedded API: a runtime error's SQLSTATE comes from its detail, not its message, with its HINT and CONTEXT",
+          "[sql][api]") {
+  // The three errors whose SQLSTATE was once matched by their message, run
+  // on a row's values so the runtime raises them, not the binder's folding.
+  sql_test::TempDir dir{"api_error_sqlstate"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE es (k BIGINT PRIMARY KEY, z INTEGER, s TEXT)");
+  (void)db->execute("INSERT INTO es VALUES (1, 0, 'abc')");
+  auto failure = [&](std::string_view sql) -> std::optional<ExecError> {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return e;
+    }
+    return std::nullopt;
+  };
+  struct Want {
+    std::string_view sql, state, message;
+  };
+  for (auto w : {Want{"SELECT k / z FROM es", "22012", "division by zero"},
+                 Want{"SELECT k % z FROM es", "22012", "division by zero"},
+                 Want{"SELECT substring(s FROM 1 FOR z - 1) FROM es", "22011", "negative substring length not allowed"},
+                 Want{"SELECT random(k + 1, k) FROM es", "22023", "lower bound must be less than or equal to upper bound"}}) {
+    INFO(w.sql);
+    auto e = failure(w.sql);
+    REQUIRE(e.has_value());
+    CHECK(e->code() == BC_E_ARITH);
+    CHECK(sqlstate(*e) == w.state);
+    CHECK(std::string_view{e->what()} == w.message);
+    CHECK(error_detail(*e).empty());
+    CHECK(error_hint(*e).empty());
+    CHECK(error_context(*e).empty());
+  }
+  for (auto sql : {"SELECT z + 2147483647 + 1 FROM es", "SELECT -(k - 9223372036854775807 - 3) FROM es"}) {
+    INFO(sql);
+    auto e = failure(sql);
+    REQUIRE(e.has_value());
+    CHECK(sqlstate(*e) == "22003");
+  }
+  // The message alone no longer decides: the detail does, and 0 is 22003.
+  CHECK(sqlstate(ExecError{"division by zero", BC_E_ARITH}) == "22003");
+  CHECK(sqlstate(ExecError{"anything", BC_E_ARITH, kDivisionByZero.packed()}) == "22012");
+  CHECK(sqlstate(ExecError{"anything", BC_E_ARITH, kSubstringError.packed()}) == "22011");
+  CHECK(sqlstate(ExecError{"anything", BC_E_ARITH, kInvalidParameterValue.packed()}) == "22023");
+  CHECK(sqlstate(ExecError{"x", BC_E_DATA, kInvalidTextRepresentation.packed()}) == "22P02");
+  CHECK(sqlstate(ExecError{"x", BC_E_DATA}) == "22000");
+  CHECK(sqlstate(ExecError{"x", BC_E_DATA, 1u << 30}) == "22000");  // packs no SQLSTATE
+  // Another code's detail is not a SQLSTATE.
+  CHECK(sqlstate(ExecError{"x", BC_E_LIMIT, kDivisionByZero.packed()}) == "54000");
+  CHECK(ExecError{"x", BC_E_LIMIT, kDivisionByZero.packed()}.state().empty());
+  // DETAIL, HINT and CONTEXT, each where the error has one.
+  ExecError full{"invalid input syntax for type json", BC_E_DATA, kInvalidTextRepresentation.packed(),
+                 "Token \"x\" is invalid.", "a hint", "JSON data, line 1: x"};
+  CHECK(full.state() == "22P02");
+  CHECK(error_detail(full) == "Token \"x\" is invalid.");
+  CHECK(error_hint(full) == "a hint");
+  CHECK(error_context(full) == "JSON data, line 1: x");
+  ExecError hint_only{"x", BC_E_DATA, kInvalidTextRepresentation.packed(), "", "only a hint"};
+  CHECK(error_detail(hint_only).empty());
+  CHECK(error_hint(hint_only) == "only a hint");
+  CHECK(error_context(hint_only).empty());
+  CHECK(error_context(std::runtime_error{"x"}).empty());
+}
+
+namespace {
+// A data error whose four lines each pass the string's inline buffer, so
+// each is an allocation of its own.
+constexpr const char* kLongMessage = "invalid input syntax for type json, a message long enough to allocate";
+constexpr const char* kLongDetail = "Token \"nope\" is invalid, a detail long enough to allocate.";
+constexpr const char* kLongHint = "a hint long enough to allocate its own buffer, and then some more";
+constexpr const char* kLongContext = "JSON data, line 1: nope, a context long enough to allocate";
+void fail_with_every_line(bc_ctx* cx) {
+  bc_ctx_fail_for_testing(cx, BC_E_DATA, kInvalidTextRepresentation, kLongMessage, kLongDetail, kLongHint,
+                          kLongContext);
+}
+}  // namespace
+
+TEST_CASE("embedded API: a runtime error's DETAIL, HINT and CONTEXT reach ExecError through execute",
+          "[sql][api]") {
+  sql_test::TempDir dir{"api_error_lines"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE el (k BIGINT PRIMARY KEY)");
+  auto failure = [&]() -> std::optional<ExecError> {
+    try {
+      (void)db->execute("INSERT INTO el VALUES (1)");
+    } catch (const ExecError& e) {
+      return e;
+    }
+    return std::nullopt;
+  };
+  db->before_commit_for_testing(fail_with_every_line);
+  auto e = failure();
+  REQUIRE(e.has_value());
+  CHECK(e->code() == BC_E_DATA);
+  CHECK(sqlstate(*e) == "22P02");
+  CHECK(std::string_view{e->what()} == kLongMessage);
+  CHECK(error_detail(*e) == kLongDetail);
+  CHECK(error_hint(*e) == kLongHint);
+  CHECK(error_context(*e) == kLongContext);
+  // An error without the lines: each is empty.
+  db->before_commit_for_testing([](bc_ctx* cx) {
+    bc_ctx_fail_for_testing(cx, BC_E_ARITH, kDivisionByZero, "division by zero", "", "", "");
+  });
+  e = failure();
+  REQUIRE(e.has_value());
+  CHECK(sqlstate(*e) == "22012");
+  CHECK(error_detail(*e).empty());
+  CHECK(error_hint(*e).empty());
+  CHECK(error_context(*e).empty());
+  db->before_commit_for_testing({});
+  CHECK_FALSE(failure().has_value());
+  CHECK(db->execute("SELECT k FROM el").rows == Grid{{i(1)}});
+}
+
+TEST_CASE("embedded API: an allocation failure once a runtime error is raised keeps its SQLSTATE through execute",
+          "[sql][api][alloc]") {
+#ifdef BYTECASK_NO_ALLOC_FAULTS
+  SKIP("operator new is the sanitizer's in this build");
+#else
+  sql_test::TempDir dir{"api_error_lines_alloc"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE el (k BIGINT PRIMARY KEY)");
+  // The allocations counted before the runtime raised the error, in the
+  // armed run; -1 while it has not.
+  long raised_at = -1;
+  bytecask::testing::ScopedAllocFaults* armed = nullptr;
+  db->before_commit_for_testing([&](bc_ctx* cx) {
+    if (armed != nullptr) raised_at = armed->allocations();
+    fail_with_every_line(cx);
+  });
+  auto after = 0;    // failures that came after the error was raised
+  auto dropped = 0;  // of those, the ones that dropped its text
+  for (long nth = 1;; ++nth) {
+    REQUIRE(nth < 100000);
+    raised_at = -1;
+    std::exception_ptr thrown;  // held, not copied: what the test reads is read once disarmed
+    bytecask::testing::AllocFaultReport report;
+    {
+      bytecask::testing::ScopedAllocFaults faults{nth, false};
+      armed = &faults;
+      try {
+        (void)db->execute("INSERT INTO el VALUES (1)");
+      } catch (...) {
+        thrown = std::current_exception();
+      }
+      armed = nullptr;
+      report = faults.report();
+    }
+    std::string state = "ok";
+    std::string message;
+    std::string hint;
+    if (thrown) {
+      try {
+        std::rethrow_exception(thrown);
+      } catch (const ExecError& e) {
+        state = sqlstate(e);
+        message = e.what();
+        hint = error_hint(e);
+      } catch (const std::exception& e) {
+        state = sqlstate(e);
+      }
+    }
+    INFO("allocation " << nth << ": " << state << ", raised at " << raised_at);
+    if (!report.fired) {
+      CHECK(state == "22P02");
+      CHECK(message == kLongMessage);
+      CHECK(hint == kLongHint);
+      break;
+    }
+    CHECK(state != "ok");
+    // Raised before the failure: its SQLSTATE, with its lines or without.
+    if (raised_at >= 0 && nth > raised_at) {
+      ++after;
+      CHECK(state == "22P02");
+      if (message.empty()) {
+        CHECK(hint.empty());
+        ++dropped;
+      } else {
+        CHECK(message == kLongMessage);
+        CHECK(hint == kLongHint);
+      }
+    } else {
+      CHECK((state == "53200" || state == "22P02"));
+    }
+  }
+  CHECK(after > 0);
+  CHECK(dropped > 0);
+  db->before_commit_for_testing({});
+#endif
 }
 
 TEST_CASE("embedded API: refit binds a held statement again with the types it fixed", "[sql][api][server]") {
