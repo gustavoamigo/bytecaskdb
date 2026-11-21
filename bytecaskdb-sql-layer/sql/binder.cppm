@@ -58,7 +58,7 @@ struct ParamInfo {
 // the session's user, the database's name or the schema (Kind::User,
 // Catalog, Schema), so a cached plan serves every session.
 struct ClockSlot {
-  enum class Kind { Date, Time, Timestamp, TimestampTz, User, Catalog, Schema };
+  enum class Kind { Date, Time, Timestamp, TimestampTz, User, Catalog, Schema, TimeTz };
   std::uint32_t slot;  // index into Bound::fixed
   Kind kind;
   std::uint8_t precision;  // fractional digits of a time or timestamp, 0 to 6
@@ -225,6 +225,13 @@ auto sql_type(const ast::ColumnDefAst& c) -> SqlType {
   }
   if (c.type == "date") return no_mods(SqlKind::Date);
   if (c.type == "time") return no_mods(SqlKind::Time);
+  if (c.type == "timetz") {
+    // As TIMESTAMP WITH TIME ZONE: past 6 is 6, as PostgreSQL takes it.
+    if (c.typmods.size() > 1 || (c.typmods.size() == 1 && c.typmods[0] < 6)) {
+      throw SqlError{"a precision under 6 on TIME WITH TIME ZONE is not supported yet", c.pos, kFeatureNotSupported};
+    }
+    return SqlType{SqlKind::TimeTz};
+  }
   // The bounds are the catalog's (sql_type_valid); a modifier out of a
   // field's range becomes an invalid field value for it to refuse.
   auto field = [](std::int32_t v) -> std::uint8_t { return std::in_range<std::uint8_t>(v) ? static_cast<std::uint8_t>(v) : 0; };
@@ -383,6 +390,7 @@ auto fold_default(const ast::Literal& l, SqlType t, std::string_view column) -> 
     case SqlKind::TimestampTz:
     case SqlKind::Date:
     case SqlKind::Time:
+    case SqlKind::TimeTz:
       throw SqlError{"a DEFAULT for type " + sql_type_name(t) + " is not supported yet", l.pos};
   }
   bad();
@@ -405,7 +413,8 @@ constexpr auto type_class(SqlKind k) -> TypeClass {
     case SqlKind::Timestamp:
     case SqlKind::TimestampTz:
     case SqlKind::Date:
-    case SqlKind::Time: return TypeClass::Temporal;
+    case SqlKind::Time:
+    case SqlKind::TimeTz: return TypeClass::Temporal;
     case SqlKind::Boolean: return TypeClass::Boolean;
     case SqlKind::Text:
     case SqlKind::Varchar:
@@ -446,6 +455,7 @@ auto exact_number(const Column& c) -> bool {
     case SqlKind::TimestampTz:
     case SqlKind::Date:
     case SqlKind::Time:
+    case SqlKind::TimeTz:
     case SqlKind::Numeric: return false;  // its text: no int64_t arithmetic
   }
   return false;
@@ -489,6 +499,7 @@ auto pg_type_name(SqlType t) -> std::string {
     case SqlKind::Timestamp: return "timestamp without time zone";
     case SqlKind::TimestampTz: return "timestamp with time zone";
     case SqlKind::Time: return "time without time zone";
+    case SqlKind::TimeTz: return "time with time zone";
     case SqlKind::SmallInt:
     case SqlKind::Integer:
     case SqlKind::BigInt:
@@ -701,12 +712,14 @@ auto is_temporal(SqlType t) -> bool { return type_class(t.kind) == TypeClass::Te
 // operators over the layer's types, its implicit casts (date to timestamp,
 // time to interval) included. Returns for DATE - DATE, the one the layer
 // takes; another PostgreSQL has (date +/- integer, a timestamp's or a time's
-// difference, time scaled by a number, ...) is not supported yet (42601);
+// difference, time scaled by a number, date + time with time zone, time with
+// time zone +/- time, ...) is not supported yet (42601);
 // time + time is ambiguous there (42725); any other pair has none (42883).
 void temporal_operator(Arith op, SqlType x, SqlType y, std::int32_t pos) {
   auto text = pg_type_name(x) + " " + std::string{arith_text(op)} + " " + pg_type_name(y);
   auto date = [](SqlType t) { return t.kind == SqlKind::Date; };
   auto time = [](SqlType t) { return t.kind == SqlKind::Time; };
+  auto timetz = [](SqlType t) { return t.kind == SqlKind::TimeTz; };
   auto stamp = [](SqlType t) { return t.kind == SqlKind::Timestamp || t.kind == SqlKind::TimestampTz; };
   auto int4 = [](SqlType t) { return t.kind == SqlKind::SmallInt || t.kind == SqlKind::Integer; };  // a bigint does not narrow
   auto number = [](SqlType t) { return type_class(t.kind) == TypeClass::Number; };
@@ -714,13 +727,13 @@ void temporal_operator(Arith op, SqlType x, SqlType y, std::int32_t pos) {
   switch (op) {
     case Arith::Add:
       if (time(x) && time(y)) throw SqlError{"operator is not unique: " + text, pos, kAmbiguousFunction};
-      exists = (date(x) && (int4(y) || time(y))) || (date(y) && (int4(x) || time(x))) || (stamp(x) && time(y)) ||
-               (time(x) && stamp(y));
+      exists = (date(x) && (int4(y) || time(y) || timetz(y))) || (date(y) && (int4(x) || time(x) || timetz(x))) ||
+               (stamp(x) && time(y)) || (time(x) && stamp(y)) || (timetz(x) && time(y)) || (time(x) && timetz(y));
       break;
     case Arith::Sub:
       if (date(x) && date(y)) return;
       exists = (stamp(x) && (stamp(y) || date(y) || time(y))) || (date(x) && (int4(y) || stamp(y) || time(y))) ||
-               (time(x) && time(y));
+               (time(x) && time(y)) || (timetz(x) && time(y));
       break;
     case Arith::Mul: exists = (time(x) && number(y)) || (number(x) && time(y)); break;
     case Arith::Div: exists = time(x) && number(y); break;
@@ -732,20 +745,26 @@ void temporal_operator(Arith op, SqlType x, SqlType y, std::int32_t pos) {
 // t op unknown (or unknown op t when untyped_left), where t is a date or time
 // type and the other operand a $n, an unknown literal or NULL, as PostgreSQL
 // 17 resolves it. Returns for -, where every such type has T - T and the
-// unknown is read as t. Otherwise the operator PostgreSQL picks is not
-// supported yet (42601: time + interval, time scaled by a number, timestamp +
-// interval), or it has none it can pick: date + unknown is ambiguous (42725),
-// and date or timestamp * or /, and unknown / time, have none (42883).
+// unknown is read as t, but for a time with time zone, which has no T - T:
+// its - reads the unknown as an interval. Otherwise the operator PostgreSQL picks is not supported yet
+// (42601: time + interval, time scaled by a number, timestamp + interval,
+// time with time zone - interval), or it has none it can pick: date or time
+// with time zone + unknown is ambiguous (42725), and date, timestamp or time
+// with time zone * or /, and unknown / time, have none (42883).
 void temporal_untyped_operator(Arith op, SqlType t, bool untyped_left, std::int32_t pos) {
   auto text = untyped_left ? "unknown " + std::string{arith_text(op)} + " " + pg_type_name(t)
                            : pg_type_name(t) + " " + std::string{arith_text(op)} + " unknown";
   auto date = t.kind == SqlKind::Date;
   auto time = t.kind == SqlKind::Time;
+  auto timetz = t.kind == SqlKind::TimeTz;
   auto exists = false;
   switch (op) {
-    case Arith::Sub: return;
+    case Arith::Sub:
+      if (!timetz) return;
+      exists = !untyped_left;  // time with time zone - interval; unknown - time with time zone has none
+      break;
     case Arith::Add:
-      if (date) throw SqlError{"operator is not unique: " + text, pos, kAmbiguousFunction};
+      if (date || timetz) throw SqlError{"operator is not unique: " + text, pos, kAmbiguousFunction};
       exists = true;
       break;
     case Arith::Mul: exists = time; break;
@@ -991,7 +1010,8 @@ constexpr std::int64_t kMicrosPerDay = 86'400'000'000;
 // A temporal constant as a value of `to`, where the conversion loses
 // nothing (the session time zone is UTC, so a timestamp and a timestamptz
 // hold the same microseconds): the same kind; a date to a timestamp or a
-// timestamptz; a timestamp to a timestamptz and back. nullopt otherwise.
+// timestamptz; a timestamp to a timestamptz and back; a time to a time with
+// time zone, at offset 0. nullopt otherwise.
 auto exact_temporal(const Constant& k, SqlKind to) -> std::optional<Datum> {
   using K = SqlKind;
   if (std::holds_alternative<std::monostate>(k.value)) return std::nullopt;
@@ -999,6 +1019,7 @@ auto exact_temporal(const Constant& k, SqlKind to) -> std::optional<Datum> {
   if (from == to) return k.value;
   auto instant = [](K x) { return x == K::Timestamp || x == K::TimestampTz; };
   if (instant(from) && instant(to)) return k.value;
+  if (from == K::Time && to == K::TimeTz) return timetz_pack({std::get<std::int64_t>(k.value), 0});
   if (from == K::Date && instant(to)) {
     auto days = std::get<std::int64_t>(k.value);
     constexpr auto kLimit = std::numeric_limits<std::int64_t>::max() / kMicrosPerDay;
@@ -1053,8 +1074,15 @@ auto order(const Constant& x, const Constant& y, ast::ValueCompare op, std::int3
     return sign(std::get<bool>(x.value) ? 1 : 0, std::get<bool>(y.value) ? 1 : 0);
   }
   if (type_class(x.type.kind) == TypeClass::Temporal && type_class(y.type.kind) == TypeClass::Temporal) {
-    // PostgreSQL compares a date or a timestamp with a timestamptz as timestamptz.
-    auto kind = x.type.kind == SqlKind::TimestampTz || y.type.kind == SqlKind::TimestampTz ? SqlKind::TimestampTz : x.type.kind;
+    // PostgreSQL compares a date or a timestamp with a timestamptz as
+    // timestamptz, and a time with a time with time zone as the latter; a
+    // time with time zone meets no other type.
+    auto tz = [](SqlType t) { return t.kind == SqlKind::TimeTz; };
+    auto time = [](SqlType t) { return t.kind == SqlKind::Time || t.kind == SqlKind::TimeTz; };
+    if ((tz(x.type) || tz(y.type)) && !(time(x.type) && time(y.type))) refuse();
+    auto kind = x.type.kind == SqlKind::TimestampTz || y.type.kind == SqlKind::TimestampTz ? SqlKind::TimestampTz
+                : tz(x.type) || tz(y.type)                                                 ? SqlKind::TimeTz
+                                                                                           : x.type.kind;
     auto a = exact_temporal(x, kind);
     auto b = exact_temporal(y, kind);
     if (!a || !b) not_yet("comparing a " + pg_type_name(x.type) + " with a " + pg_type_name(y.type), pos);
@@ -1101,8 +1129,11 @@ auto text_of(const Constant& c) -> std::string;
 // A date, time or timestamp cast to another type, as PostgreSQL casts it:
 // to text; to its own type; a timestamp or timestamptz to a date or a time
 // (read in UTC); a date to a timestamp or timestamptz; a timestamp to a
-// timestamptz and back. A time to a date, a timestamp or a timestamptz, and
-// a date to a time, have no cast (42846).
+// timestamptz and back; a time with time zone to a time (its offset
+// dropped); a time, or a timestamptz's time in UTC, to a time with time
+// zone at offset 0. A time to a date, a timestamp or a timestamptz, a date
+// to a time, and a time with time zone to or from any other, have no cast
+// (42846).
 auto cast_temporal(const Constant& arg, SqlType t, std::int32_t pos) -> Constant {
   auto from = arg.type.kind;
   auto null = std::holds_alternative<std::monostate>(arg.value);
@@ -1115,6 +1146,20 @@ auto cast_temporal(const Constant& arg, SqlType t, std::int32_t pos) -> Constant
     auto us = std::get<std::int64_t>(arg.value);
     auto days = us >= 0 ? us / kMicrosPerDay : -((-us + kMicrosPerDay - 1) / kMicrosPerDay);
     return result(t.kind == K::Date ? days : us - days * kMicrosPerDay);
+  }
+  if (from == K::TimestampTz && t.kind == K::TimeTz) {
+    if (null) return result(std::monostate{});
+    auto us = std::get<std::int64_t>(arg.value);
+    auto days = us >= 0 ? us / kMicrosPerDay : -((-us + kMicrosPerDay - 1) / kMicrosPerDay);
+    return result(timetz_pack({us - days * kMicrosPerDay, 0}));
+  }
+  if (from == K::TimeTz && t.kind == K::Time) {
+    if (null) return result(std::monostate{});
+    return result(timetz_unpack(std::get<std::int64_t>(arg.value)).time);
+  }
+  if (from == K::Time && t.kind == K::TimeTz) {
+    if (null) return result(std::monostate{});
+    return result(*exact_temporal(arg, t.kind));
   }
   if (from == K::Date && (t.kind == K::Timestamp || t.kind == K::TimestampTz)) {
     if (null) return result(std::monostate{});
@@ -1578,6 +1623,7 @@ void extract_source(const Constant& unit, std::optional<SqlType> source, std::in
     throw SqlError{"function pg_catalog.extract(" + first + ", unknown) is not unique", pos, kAmbiguousFunction};
   }
   auto k = source->kind;
+  if (k == SqlKind::TimeTz) not_supported("EXTRACT of a time with time zone", pos);
   if (k != SqlKind::Date && k != SqlKind::Time && k != SqlKind::Timestamp && k != SqlKind::TimestampTz) {
     throw SqlError{"function pg_catalog.extract(" + first + ", " + pg_type_name(*source) + ") does not exist", pos, kUndefinedFunction};
   }
@@ -1759,6 +1805,8 @@ auto fold(const ast::Expr& e) -> Constant {
   throw SqlError{"expression not supported", e.pos};
 }
 
+auto temporal_cast(SqlKind from, SqlKind to) -> bool;
+
 // The constant as a value of column c's type: assigned to it (INSERT's
 // VALUES, SET), with PostgreSQL's assignment casts, which round a numeric
 // half away from zero and write a number or a boolean as its text; or
@@ -1839,6 +1887,22 @@ auto coerce_value(const Constant& k, const Column& c, bool assigned, std::string
     if (k.type.kind == c.sql.kind && k.type.kind != SqlKind::Real) return k.value;
     if (type_class(k.type.kind) == TypeClass::Temporal && type_class(c.sql.kind) == TypeClass::Temporal) {
       if (auto v = exact_temporal(k, c.sql.kind)) return *v;
+      // A time with time zone assigned to a time drops its offset; a
+      // timestamptz assigned to one is its UTC time at offset 0.
+      if (assigned && k.type.kind == SqlKind::TimeTz && c.sql.kind == SqlKind::Time) {
+        return timetz_unpack(std::get<std::int64_t>(k.value)).time;
+      }
+      if (assigned && k.type.kind == SqlKind::TimestampTz && c.sql.kind == SqlKind::TimeTz) {
+        return cast_temporal(k, c.sql, k.pos).value;
+      }
+      // A pair PostgreSQL has no cast for: a date and a time, a time to a
+      // date or a timestamp, a timestamp to a time with time zone.
+      if (assigned && !temporal_cast(k.type.kind, c.sql.kind)) {
+        throw SqlError{"column \"" + c.name + "\" is of type " + pg_type_name(c.sql) + " but expression is of type " +
+                           pg_type_name(k.type),
+                       k.pos, kDatatypeMismatch}
+            .with_notes("", "You will need to rewrite or cast the expression.");
+      }
     }
     if (assigned && holds_string(c.sql) && !is_float(k.type)) return bytes_of(to_text(k.value, k.type));
     not_yet("a " + pg_type_name(k.type) + " constant " + (assigned ? "assigned to " : "compared with ") + "a " +
@@ -1905,6 +1969,7 @@ auto coerce_value(const Constant& k, const Column& c, bool assigned, std::string
     case SqlKind::TimestampTz:
     case SqlKind::Date:
     case SqlKind::Time:
+    case SqlKind::TimeTz:
     case SqlKind::Numeric: break;  // refused by type_refusal
   }
   throw SqlError{"expression not supported", k.pos};
@@ -2000,7 +2065,8 @@ auto clock_fn(const std::string& name, std::int32_t pos) -> ClockDefault::Fn {
   if (name == "current_timestamp") return F::CurrentTimestamp;
   if (name == "localtime") return F::LocalTime;
   if (name == "localtimestamp") return F::LocalTimestamp;
-  not_yet("CURRENT_TIME: TIME WITH TIME ZONE, which the layer lacks; LOCALTIME is supported", pos);
+  if (name == "current_time") return F::CurrentTime;
+  not_yet(name, pos);
 }
 
 auto clock_type(ClockDefault::Fn fn) -> SqlType {
@@ -2010,6 +2076,7 @@ auto clock_type(ClockDefault::Fn fn) -> SqlType {
     case F::CurrentTimestamp: return SqlType{SqlKind::TimestampTz};
     case F::LocalTime: return SqlType{SqlKind::Time};
     case F::LocalTimestamp: return SqlType{SqlKind::Timestamp};
+    case F::CurrentTime: return SqlType{SqlKind::TimeTz};
     case F::CurrentUser:
     case F::SessionUser:
     case F::CurrentCatalog:
@@ -2018,7 +2085,6 @@ auto clock_type(ClockDefault::Fn fn) -> SqlType {
   return SqlType{SqlKind::Timestamp};
 }
 
-auto is_session_fn(ClockDefault::Fn fn) -> bool { return fn >= ClockDefault::Fn::CurrentUser; }
 
 
 // The slot a function's reading fills: a session function's by what it
@@ -2034,12 +2100,31 @@ auto clock_slot_kind(ClockDefault::Fn fn, SqlKind as) -> ClockSlot::Kind {
     case F::CurrentDate:
     case F::CurrentTimestamp:
     case F::LocalTime:
-    case F::LocalTimestamp: break;
+    case F::LocalTimestamp:
+    case F::CurrentTime: break;
   }
   return as == SqlKind::Date          ? Kind::Date
          : as == SqlKind::Time        ? Kind::Time
+         : as == SqlKind::TimeTz      ? Kind::TimeTz
          : as == SqlKind::TimestampTz ? Kind::TimestampTz
                                       : Kind::Timestamp;
+}
+
+// Whether PostgreSQL 17 has a cast from one date or time type to another:
+// between a date and a timestamp, between the two timestamps, between the
+// two times; a timestamp to a time, a timestamptz to a time with time zone.
+// None between a date and a time, from a time to a date or a timestamp, or
+// from a timestamp to a time with time zone.
+auto temporal_cast(SqlKind from, SqlKind to) -> bool {
+  using K = SqlKind;
+  auto stamp = [](K k) { return k == K::Timestamp || k == K::TimestampTz; };
+  auto time = [](K k) { return k == K::Time || k == K::TimeTz; };
+  if (from == to || (stamp(from) && stamp(to)) || (time(from) && time(to))) return true;
+  if (from == K::Date) return stamp(to);
+  if (to == K::Date) return stamp(from);
+  if (to == K::Time) return stamp(from);
+  if (to == K::TimeTz) return from == K::TimestampTz;
+  return false;
 }
 
 // A placeholder for a reading's slot, of its physical type: never the
@@ -2053,18 +2138,19 @@ auto clock_placeholder(SqlType t) -> Datum {
 // assignment cast gives it (clock_assignable): 42804 for a type with no such
 // cast, refused for one it has that the layer does not compute (a date to a
 // timestamp, which is midnight). A precision past 6 is 6, as PostgreSQL
-// takes it, with a warning.
+// takes it, with a warning. `assigned` is a value in INSERT or UPDATE, not
+// a column's DEFAULT, which PostgreSQL's 42804 message names.
 auto clock_default(const std::string& name, std::int64_t precision, SqlType t, const std::string& column,
-                   std::int32_t pos) -> ClockDefault {
+                   std::int32_t pos, bool assigned) -> ClockDefault {
   auto fn = clock_fn(name, pos);
   if (!clock_assignable(fn, t.kind)) {
-    auto temporal = !is_session_fn(fn) &&
-                    (type_class(t.kind) == TypeClass::Temporal || t.kind == SqlKind::Text || t.kind == SqlKind::Varchar ||
-                     t.kind == SqlKind::Name);
+    auto temporal = !is_session_fn(fn) && ((type_class(t.kind) == TypeClass::Temporal && temporal_cast(clock_type(fn).kind, t.kind)) ||
+                                           t.kind == SqlKind::Text || t.kind == SqlKind::Varchar || t.kind == SqlKind::Name);
     if (temporal) not_yet("the clock's " + pg_type_name(clock_type(fn)) + " assigned to a " + pg_type_name(t) + " column", pos);
-    throw SqlError{"column \"" + column + "\" is of type " + pg_type_name(t) + " but default expression is of type " +
-                       pg_type_name(clock_type(fn)),
-                   pos, kDatatypeMismatch};
+    throw SqlError{"column \"" + column + "\" is of type " + pg_type_name(t) + (assigned ? " but expression" : " but default expression") +
+                       " is of type " + pg_type_name(clock_type(fn)),
+                   pos, kDatatypeMismatch}
+        .with_notes("", "You will need to rewrite or cast the expression.");
   }
   return {fn, static_cast<std::uint8_t>(precision < 0 || precision > 6 ? 6 : precision)};
 }
@@ -2072,7 +2158,7 @@ auto clock_default(const std::string& name, std::int64_t precision, SqlType t, c
 auto column_spec(const ast::ColumnDefAst& c) -> ColumnSpec {
   auto t = column_type(c);
   ColumnSpec out{c.name, t, !c.not_null && !c.primary_key, c.default_value ? fold_default(*c.default_value, t, c.name) : Datum{}, {}};
-  if (!c.default_clock.empty()) out.clock_default = clock_default(c.default_clock, c.default_clock_precision, t, c.name, c.pos);
+  if (!c.default_clock.empty()) out.clock_default = clock_default(c.default_clock, c.default_clock_precision, t, c.name, c.pos, false);
   return out;
 }
 
@@ -2246,6 +2332,21 @@ public:
     auto expr = fixed(clock_placeholder(target.sql), target.sql);
     clocks_.push_back({expr.param - own_params_, clock_slot_kind(d.fn, target.sql.kind), d.precision});
     return expr;
+  }
+  // A clock reading of a TIME (LOCALTIME) compared with a TIME WITH TIME
+  // ZONE, `peer`: its slot read as a time with time zone instead, the same
+  // reading at offset 0, as PostgreSQL casts a time to one. False for any
+  // other pair.
+  auto clock_as_timetz(logical::Expr& x, const logical::Expr& peer) -> bool {
+    if (x.type.kind != SqlKind::Time || peer.type.kind != SqlKind::TimeTz) return false;
+    if (x.kind != logical::Expr::Kind::Param || !is_fixed(x.param)) return false;
+    auto slot = x.param - own_params_;
+    auto k = std::ranges::find_if(clocks_, [&](const ClockSlot& c) { return c.slot == slot; });
+    if (k == clocks_.end() || k->kind != ClockSlot::Kind::Time) return false;
+    k->kind = ClockSlot::Kind::TimeTz;
+    x.type = SqlType{SqlKind::TimeTz};
+    fixed_sql_.at(slot) = x.type;
+    return true;
   }
   [[nodiscard]] auto take_clocks() -> std::vector<ClockSlot> { return std::move(clocks_); }
   [[nodiscard]] auto is_fixed(std::uint32_t n) const -> bool { return n >= own_params_; }
@@ -3071,6 +3172,7 @@ public:
       case SqlKind::TimestampTz:
       case SqlKind::Date:
       case SqlKind::Time:
+      case SqlKind::TimeTz:
       case SqlKind::Numeric: break;
     }
     return 0;
@@ -3136,7 +3238,11 @@ public:
     numeric_compared(l.type, r.type, e.pos);
     if (is_float(l.type) || is_float(r.type)) not_yet("a comparison of REAL and DOUBLE PRECISION as a value", e.pos);
     if (type_class(l.type.kind) == TypeClass::Temporal && l.type.kind != r.type.kind) {
-      not_yet("a comparison of different date and time types as a value", e.pos);
+      // LOCALTIME beside a time with time zone is read as one, as PostgreSQL
+      // casts it: the same reading at the session's zone.
+      if (!(clock_as_timetz(l, r) || clock_as_timetz(r, l))) {
+        not_yet("a comparison of different date and time types as a value", e.pos);
+      }
     }
     if (is_number(l.type)) rescalable(l, r, std::max(decimal_scale(l.type), decimal_scale(r.type)), e.pos);
     using Op = ast::Compare::Op;
@@ -3517,7 +3623,8 @@ public:
       case SqlKind::Bytea: return {false, kUndefinedFunction};
       case SqlKind::Timestamp:
       case SqlKind::TimestampTz:
-      case SqlKind::Date: return {!sum, kUndefinedFunction};
+      case SqlKind::Date:
+      case SqlKind::TimeTz: return {!sum, kUndefinedFunction};
       case SqlKind::Time: return {!sum, kSyntaxError};
       case SqlKind::Numeric: return {false, kFeatureNotSupported};  // a column's text: refuse_numeric
     }
@@ -3730,7 +3837,7 @@ public:
       case ast::Expr::Kind::Or: not_yet("IS NULL, AND, OR and NOT of other than constants as a value", e.pos);
       case ast::Expr::Kind::Cast: not_yet("a cast of other than a constant or a parameter", e.pos);
       case ast::Expr::Kind::Clock: {
-        auto d = clock_default(e.func, e.constant, target.sql, target.name, e.pos);
+        auto d = clock_default(e.func, e.constant, target.sql, target.name, e.pos, true);
         return clock_reading(d, target);
       }
       case ast::Expr::Kind::Subquery: not_yet("a subquery assigned to a column", e.pos);
@@ -4020,11 +4127,12 @@ public:
 
   // The clock compared with column `c`: its reading as a parameter of the
   // column's type, which the API fills on each run, as a select list's. A
-  // date with a date, a time with a time, either timestamp with either:
-  // the session's time zone is UTC, so the instant is the local time. A
-  // date with a timestamp compares the date's midnight, which the layer does
-  // not compute yet; any other pair has no operator in PostgreSQL (42883),
-  // named in the order written.
+  // date with a date, a time with a time, either timestamp with either, a
+  // time with time zone with CURRENT_TIME or LOCALTIME: the session's time
+  // zone is UTC, so the instant is the local time. A date with a timestamp
+  // compares the date's midnight, and a time with CURRENT_TIME the time as
+  // a time with time zone, which the layer does not compute yet; any other
+  // pair has no operator in PostgreSQL (42883), named in the order written.
   auto compared_clock(const ast::Expr& clock, const Column& c, bool clock_first, const ast::Compare& w) -> logical::Expr {
     using F = ClockDefault::Fn;
     auto fn = clock_fn(clock.func, clock.pos);
@@ -4033,13 +4141,15 @@ public:
     auto stamp = [](SqlKind k) { return k == SqlKind::Timestamp || k == SqlKind::TimestampTz; };
     auto clock_stamp = fn == F::CurrentTimestamp || fn == F::LocalTimestamp;
     auto same = (c.sql.kind == SqlKind::Date && fn == F::CurrentDate) || (c.sql.kind == SqlKind::Time && fn == F::LocalTime) ||
-                (stamp(c.sql.kind) && clock_stamp);
+                (stamp(c.sql.kind) && clock_stamp) ||
+                (c.sql.kind == SqlKind::TimeTz && (fn == F::CurrentTime || fn == F::LocalTime));
     if (same) {
       auto precision = static_cast<std::uint8_t>(clock.constant < 0 || clock.constant > 6 ? 6 : clock.constant);
       return clock_reading(ClockDefault{fn, precision}, c);
     }
     auto ct = clock_type(fn);
-    if ((c.sql.kind == SqlKind::Date && clock_stamp) || (stamp(c.sql.kind) && fn == F::CurrentDate)) {
+    if ((c.sql.kind == SqlKind::Date && clock_stamp) || (stamp(c.sql.kind) && fn == F::CurrentDate) ||
+        (c.sql.kind == SqlKind::Time && fn == F::CurrentTime)) {
       not_yet("comparing " + c.name + " (" + sql_type_name(c.sql) + ") with the clock's " + pg_type_name(ct), w.pos);
     }
     auto l = clock_first ? pg_type_name(ct) : pg_type_name(c.sql);
@@ -4145,10 +4255,11 @@ public:
   }
 
   // Throws PostgreSQL's 42883 when it has no operator comparing a with b:
-  // types of two classes, or a TIME with another temporal type. Columns of
-  // one class that the layer does not compare yet are the caller's to refuse.
+  // types of two classes, or a TIME or TIME WITH TIME ZONE with a date or a
+  // timestamp. Columns of one class that the layer does not compare yet are
+  // the caller's to refuse.
   static void no_operator(SqlType a, std::string_view written, SqlType b, std::int32_t pos) {
-    auto time = [](SqlType t) { return t.kind == SqlKind::Time; };
+    auto time = [](SqlType t) { return t.kind == SqlKind::Time || t.kind == SqlKind::TimeTz; };
     if (type_class(a.kind) == type_class(b.kind) && time(a) == time(b)) return;
     throw SqlError{"operator does not exist: " + pg_type_name(a) + " " + std::string{written} + " " + pg_type_name(b), pos,
                    kUndefinedFunction};

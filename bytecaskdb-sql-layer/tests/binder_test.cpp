@@ -1130,7 +1130,10 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
         "a DEFAULT for type timestamptz is not supported yet");
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v TIMESTAMP(3) WITH TIME ZONE)").first ==
         "a precision other than 6 on TIMESTAMP WITH TIME ZONE is not supported yet");
-  CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v TIME WITH TIME ZONE)").first == "type timetz is not supported");
+  CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v TIME(3) WITH TIME ZONE)").first ==
+        "a precision under 6 on TIME WITH TIME ZONE is not supported yet");
+  CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v TIMETZ DEFAULT '12:00+01')").first ==
+        "a DEFAULT for type timetz is not supported yet");
   CHECK(rejected(cat, "ALTER TABLE t ADD COLUMN z BIGINT NOT NULL").first.find("needs a DEFAULT") != std::string::npos);
   CHECK(rejected(cat, "ALTER TABLE nope ADD COLUMN z BIGINT").first == "relation \"nope\" does not exist");
   CHECK(rejected(cat, "CREATE INDEX i ON t (nope)").first == "column \"nope\" does not exist");
@@ -1451,7 +1454,16 @@ TEST_CASE("binder: each refusal carries PostgreSQL's SQLSTATE", "[sql][binder][s
   CHECK(state("SELECT a.k FROM w a JOIN w b ON a.c = b.v OR a.k = b.k") == "42601");
   CHECK(state("SELECT k FROM w WHERE c = t AND v < t") == "bound");
   CHECK(state("CREATE TABLE u2 (k BIGINT PRIMARY KEY, v TIMESTAMPTZ)") == "bound");
-  CHECK(state("CREATE TABLE u3 (k BIGINT PRIMARY KEY, v TIME WITH TIME ZONE)") == "42601");
+  CHECK(state("CREATE TABLE u3 (k BIGINT PRIMARY KEY, v TIME WITH TIME ZONE, w TIMETZ(6), x TIME WITH TIME ZONE DEFAULT CURRENT_TIME)") ==
+        "bound");
+  CHECK(state("CREATE TABLE u4 (k BIGINT PRIMARY KEY, v TIMETZ(0))") == "0A000");
+  // The clock as a time with time zone's DEFAULT, as PostgreSQL's assignment casts take it.
+  CHECK(state("CREATE TABLE u5 (k BIGINT PRIMARY KEY, v TIMETZ DEFAULT LOCALTIME, w TIMETZ DEFAULT CURRENT_TIMESTAMP)") == "bound");
+  CHECK(state("CREATE TABLE u6 (k BIGINT PRIMARY KEY, v TIMETZ DEFAULT CURRENT_DATE)") == "42804");
+  CHECK(state("CREATE TABLE u7 (k BIGINT PRIMARY KEY, v TIMETZ DEFAULT LOCALTIMESTAMP)") == "42804");
+  CHECK(state("CREATE TABLE u8 (k BIGINT PRIMARY KEY, v DATE DEFAULT CURRENT_TIME)") == "42804");
+  CHECK(state("CREATE TABLE u9 (k BIGINT PRIMARY KEY, v TIMESTAMPTZ DEFAULT CURRENT_TIME)") == "42804");
+  CHECK(state("CREATE TABLE u10 (k BIGINT PRIMARY KEY, v TIME DEFAULT CURRENT_TIME)") == "bound");
 }
 
 TEST_CASE("binder: a set operation binds its arms alone and resolves their columns", "[sql][binder][setop]") {

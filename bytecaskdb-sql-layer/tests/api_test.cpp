@@ -3580,20 +3580,24 @@ TEST_CASE("embedded API: the time is read once per statement, and once per trans
   now = -3'600'000'000;  // 1969-12-31 23:00:00
   CHECK(first("SELECT CURRENT_DATE, LOCALTIME", *db) == std::vector<Value>{i(-1), i(kDay - 3'600'000'000)});
 
-  // CURRENT_TIMESTAMP is a timestamptz: the same instant, UTC. CURRENT_TIME,
-  // a TIME WITH TIME ZONE, is refused, not read as the zoneless one.
-  now = 1'793'095'123'456'789;  // 2026-10-27 09:12:03.456789 UTC
+  // CURRENT_TIMESTAMP is a timestamptz: the same instant, UTC. CURRENT_TIME
+  // is a TIME WITH TIME ZONE: the time of day at the session's zone, UTC,
+  // offset 0, rounded to its precision; one instant with the others.
+  now = 1'793'095'123'456'789;  // 2026-10-26 09:58:43.456789 UTC
   CHECK(first("SELECT CURRENT_TIMESTAMP, now(), CURRENT_TIMESTAMP(0), LOCALTIMESTAMP", *db) ==
         std::vector<Value>{i(now), i(now), i(now - 456'789), i(now)});
   CHECK(db->execute("SELECT now()").types.at(0).kind == SqlKind::TimestampTz);
-  for (auto sql : {"SELECT CURRENT_TIME(0)"}) {
-    try {
-      (void)db->execute(sql);
-      FAIL(sql << " must be refused");
-    } catch (const std::exception& e) {
-      CHECK(sqlstate(e) == "42601");  // a form not supported yet
-    }
-  }
+  auto day_time = now % kDay;  // 09:58:43.456789
+  CHECK(first("SELECT CURRENT_TIME, CURRENT_TIME(0), CURRENT_TIME(2), LOCALTIME", *db) ==
+        std::vector<Value>{i(timetz_pack({day_time, 0})), i(timetz_pack({day_time - 456'789, 0})),
+                           i(timetz_pack({day_time + 3'211, 0})), i(day_time)});
+  auto r = db->execute("SELECT CURRENT_TIME(0)");
+  CHECK(r.types.at(0).kind == SqlKind::TimeTz);
+  CHECK(to_text(r.rows.at(0).at(0), r.types.at(0)) == "09:58:43+00");
+  // Rounded up past the last second of the day, it is 24:00:00, as in PostgreSQL.
+  now = 20'000 * kDay + kDay - 300'000;
+  r = db->execute("SELECT CURRENT_TIME(0)");
+  CHECK(to_text(r.rows.at(0).at(0), r.types.at(0)) == "24:00:00+00");
 }
 
 TEST_CASE("embedded API: a WHERE compares a column with the clock, read on each run", "[sql][api][time]") {
@@ -3676,6 +3680,101 @@ TEST_CASE("embedded API: a WHERE compares a column with the clock, read on each 
   CHECK(call("purge").starts_with("0A000 the time (CURRENT_DATE, CURRENT_TIMESTAMP, now(), LOCALTIME, LOCALTIMESTAMP)"));
   CHECK(call("touch").starts_with("0A000 the time"));
   CHECK(ids("SELECT id FROM ev ORDER BY id") == V{1, 2});
+}
+
+TEST_CASE("embedded API: a TIME WITH TIME ZONE column keeps its time and offset, ordered as PostgreSQL's timetz", "[sql][api][timetz]") {
+  sql_test::TempDir dir{"api_timetz"};
+  constexpr std::int64_t kHour = 3'600'000'000;
+  std::int64_t now = 20'000 * 86'400'000'000LL + 9 * kHour + 123'456;  // 09:00:00.123456 UTC
+  auto text = [](Database& d, std::string_view sql, const std::vector<Value>& params = {}) {
+    std::vector<std::string> out;
+    auto r = d.execute(std::string{sql}, params);
+    for (const auto& row : r.rows) {
+      std::string line;
+      for (std::size_t c = 0; c < row.size(); ++c) line += (c == 0 ? "" : "|") + to_text(row.at(c), r.types.at(c));
+      out.push_back(line);
+    }
+    return out;
+  };
+  using S = std::vector<std::string>;
+  {
+    auto db = Database::open(dir.path());
+    db->clock_for_testing([&] { return now; });
+    (void)db->execute(
+        "CREATE TABLE tz (t TIME WITH TIME ZONE PRIMARY KEY, n INTEGER, at TIMETZ DEFAULT CURRENT_TIME(0), "
+        "lt TIMETZ DEFAULT LOCALTIME, ct TIMETZ DEFAULT CURRENT_TIMESTAMP, plain TIME DEFAULT CURRENT_TIME)");
+    (void)db->execute("CREATE INDEX tz_n ON tz (n)");
+    // Text with no offset is at the session's zone, UTC.
+    (void)db->execute("INSERT INTO tz (t, n) VALUES ('12:00+01', 1), ('11:00', 2), ('10:30:00.5-00:30', 3), "
+                      "('24:00:00-15:59:59', 4), ('00:00+15:59:59', 5)");
+    // The UTC time first, then the offset east of UTC, highest first: 12:00+01 before 11:00+00.
+    CHECK(text(*db, "SELECT t, n FROM tz ORDER BY t") ==
+          S{"00:00:00+15:59:59|5", "12:00:00+01|1", "11:00:00+00|2", "10:30:00.5-00:30|3", "24:00:00-15:59:59|4"});
+    CHECK(text(*db, "SELECT n FROM tz WHERE t > '11:00+00' ORDER BY t") == S{"3", "4"});
+    CHECK(text(*db, "SELECT n FROM tz WHERE t = '11:00:00Z'") == S{"2"});
+    // Equal only with the same offset: 12:00+01 is not 11:00+00.
+    CHECK(text(*db, "SELECT n FROM tz WHERE t = '12:00+01:00'") == S{"1"});
+    CHECK_THROWS(db->execute("INSERT INTO tz (t, n) VALUES ('12:00:00+01', 9)"));
+    (void)db->execute("INSERT INTO tz (t, n) VALUES ('11:00+00:01', 6)");  // another offset: another key
+    // A time compared with it is at offset 0.
+    CHECK(text(*db, "SELECT n FROM tz WHERE t <= TIME '11:00' ORDER BY t") == S{"5", "6", "1", "2"});
+    CHECK(text(*db, "SELECT min(t), max(t) FROM tz") == S{"00:00:00+15:59:59|24:00:00-15:59:59"});
+    // A parameter is the packed value; the defaults are the statement's reading at offset 0.
+    CHECK(text(*db, "SELECT n FROM tz WHERE t = $1", {Value{timetz_pack({10 * kHour + kHour / 2 + 500'000, -1800})}}) == S{"3"});
+    CHECK(text(*db, "SELECT at, lt, ct, plain FROM tz WHERE n = 1") ==
+          S{"09:00:00+00|09:00:00.123456+00|09:00:00.123456+00|09:00:00.123456"});
+    CHECK(text(*db, "SELECT n FROM tz WHERE lt = CURRENT_TIME AND at <= LOCALTIME ORDER BY n") == S{"1", "2", "3", "4", "5", "6"});
+    // In a select list too, LOCALTIME read as a time with time zone beside one.
+    CHECK(text(*db, "SELECT lt = LOCALTIME, CURRENT_TIME = LOCALTIME, ct = CURRENT_TIME FROM tz WHERE n = 1") == S{"t|t|t"});
+    // Casts: to a time drops the offset, a time or a timestamptz is at offset 0.
+    CHECK(text(*db, "SELECT CAST(TIMETZ '12:34:56.5-03:30' AS TIME), CAST(TIME '01:02' AS TIMETZ), "
+                    "CAST(TIMESTAMPTZ '2026-10-27 10:00:00+02' AS TIMETZ), CAST(TIMETZ '12:00+05' AS TEXT)") ==
+          S{"12:34:56.5|01:02:00+00|08:00:00+00|12:00:00+05"});
+    auto state = [&](std::string_view sql) -> std::string {
+      try {
+        (void)db->execute(sql);
+      } catch (const std::exception& e) {
+        return std::string{sqlstate(e)};
+      }
+      return "ran";
+    };
+    auto message = [&](std::string_view sql) -> std::string {
+      try {
+        (void)db->execute(sql);
+      } catch (const std::exception& e) {
+        return std::string{sqlstate(e)} + " " + e.what();
+      }
+      return "ran";
+    };
+    // Assigned, a timestamptz is its UTC time at offset 0, as PostgreSQL's assignment cast.
+    CHECK(state("INSERT INTO tz (t, n) VALUES (TIMESTAMPTZ '2020-01-01 05:00+03', 7)") == "ran");
+    CHECK(text(*db, "SELECT t FROM tz WHERE n = 7") == S{"02:00:00+00"});
+    (void)db->execute("DELETE FROM tz WHERE n = 7");
+    // A pair with no assignment cast is 42804, worded for a value, not a DEFAULT.
+    CHECK(message("INSERT INTO tz (t, n) VALUES (TIMESTAMP '2020-01-01 05:00', 8)") ==
+          "42804 column \"t\" is of type time with time zone but expression is of type timestamp without time zone");
+    CHECK(message("INSERT INTO tz (t, n) VALUES (CURRENT_DATE, 8)") ==
+          "42804 column \"t\" is of type time with time zone but expression is of type date");
+    CHECK(message("UPDATE tz SET plain = CURRENT_DATE WHERE n = 1") ==
+          "42804 column \"plain\" is of type time without time zone but expression is of type date");
+    CHECK(state("SELECT CAST(TIMETZ '12:00' AS TIMESTAMP)") == "42846");
+    CHECK(state("SELECT CAST(LOCALTIMESTAMP AS TIMETZ)") == "42601");  // a cast of the clock: not yet
+    CHECK(state("SELECT CAST(TIMESTAMP '2020-01-01' AS TIMETZ)") == "42846");
+    CHECK(state("SELECT TIMETZ '12:00+16'") == "22009");
+    CHECK(state("SELECT TIMETZ '24:00:01'") == "22008");
+    CHECK(state("SELECT TIMETZ '12:00 PST'") == "22007");  // no zone names: the layer has no time zone database
+    CHECK(state("SELECT TIMETZ '12:00' = DATE '2020-01-01'") == "42883");
+    CHECK(state("SELECT TIMETZ '12:00' - TIMETZ '11:00'") == "42883");
+    CHECK(state("SELECT TIMETZ '12:00' + '1 hour'") == "42725");
+    CHECK(state("SELECT TIMETZ '12:00' - '1 hour'") == "42601");  // an interval: not yet
+    CHECK(state("SELECT TIMETZ '12:00' + TIME '01:00'") == "42601");
+    CHECK(state("SELECT sum(t) FROM tz") == "42883");
+    CHECK(state("SELECT EXTRACT(HOUR FROM t) FROM tz") == "0A000");
+    CHECK(state("SELECT n FROM tz WHERE plain < CURRENT_TIME") == "42601");  // a time read as a timetz: not yet
+  }
+  auto db = Database::open(dir.path());
+  CHECK(text(*db, "SELECT t FROM tz WHERE n = 3") == S{"10:30:00.5-00:30"});
+  CHECK(text(*db, "SELECT n FROM tz WHERE t < '11:00+00' ORDER BY t") == S{"5", "6", "1"});
 }
 
 TEST_CASE("embedded API: a TIMESTAMP WITH TIME ZONE column keeps the instant, in UTC, across a reopen", "[sql][api][timestamptz]") {

@@ -304,6 +304,21 @@ auto timestamp_text(std::int64_t micros, bool utc = false) -> std::string {
   return date_part(c) + " " + time_part(micros - days * per_day) + (utc ? "+00" : "") + (c.year <= 0 ? " BC" : "");
 }
 
+// A UTC offset in seconds east as PostgreSQL's EncodeTimezone writes it:
+// +HH, then :MM and :SS only where they are not zero.
+auto offset_text(std::int64_t offset) -> std::string {
+  auto a = offset < 0 ? -offset : offset;
+  auto out = std::string{offset < 0 ? "-" : "+"} + pad(a / 3600, 2);
+  if (a % 3600 != 0) out += ":" + pad(a / 60 % 60, 2);
+  if (a % 60 != 0) out += ":" + pad(a % 60, 2);
+  return out;
+}
+
+auto timetz_text(std::int64_t v) -> std::string {
+  auto t = timetz_unpack(v);
+  return time_part(t.time) + offset_text(t.offset);
+}
+
 // A cursor over a datetime's text. Fields are digits; anything unexpected
 // is 22007, as PostgreSQL's datetime parser reports a form it does not read.
 struct Cursor {
@@ -459,6 +474,26 @@ auto time_from(std::string_view text) -> std::int64_t {
   auto t = read_time(c);
   if (!c.at_end()) c.fail();
   return t;
+}
+
+// A time, after an optional date PostgreSQL reads and ignores (a space
+// between them; not ISO 8601's T, which timetz_in rejects), and an
+// optional UTC offset; none is the session's time zone, UTC.
+auto timetz_from(std::string_view text) -> std::int64_t {
+  Cursor c{trim(text), text, "time with time zone"};
+  auto digits = c.s.find_first_not_of("0123456789");
+  if (digits != std::string_view::npos && digits > 0 && c.s[digits] == '-') {
+    auto [y, md] = read_date(c);
+    if (c.peek() != ' ') c.fail();
+    auto rest = c.s.substr(1);
+    c.s = {};
+    (void)finish_date(c, y, md);  // the date must be one
+    c.s = rest;
+  }
+  auto t = read_time(c);
+  auto offset = read_offset(c).value_or(0);
+  if (!c.at_end()) c.fail();
+  return timetz_pack({t, offset / kMicrosPerSecond});
 }
 
 // ---------------------------------------------------------------- numbers
@@ -929,6 +964,7 @@ auto to_text(const Datum& v, SqlType t) -> std::string {
             case SqlKind::TimestampTz: return timestamp_text(x, true);
             case SqlKind::Date: return date_text(x);
             case SqlKind::Time: return time_part(x);
+            case SqlKind::TimeTz: return timetz_text(x);
             case SqlKind::SmallInt:
             case SqlKind::Integer:
             case SqlKind::BigInt:
@@ -971,6 +1007,7 @@ auto from_text(std::string_view text, SqlType t, bool assigned_only) -> Datum {
     case SqlKind::TimestampTz: return timestamptz_from(text);
     case SqlKind::Date: return date_from(text);
     case SqlKind::Time: return time_from(text);
+    case SqlKind::TimeTz: return timetz_from(text);
     case SqlKind::Numeric: return text_bytes(numeric_in(text));  // its numeric_out text
   }
   return text_bytes(text);

@@ -2395,6 +2395,7 @@ auto notice_type_name(SqlKind k) -> std::string_view {
     case SqlKind::Bytea: return "bytea";
     case SqlKind::Date: return "date";
     case SqlKind::Time: return "pg_catalog.time";
+    case SqlKind::TimeTz: return "timetz";
     case SqlKind::Timestamp: return "pg_catalog.timestamp";
     case SqlKind::TimestampTz: return "timestamptz";
   }
@@ -2670,6 +2671,7 @@ static auto clock_value(const bound::ClockSlot& k, const Reading& r) -> Value {
     case bound::ClockSlot::Kind::Schema: return text("public");  // the one schema, until schemas exist
     case bound::ClockSlot::Kind::Date:
     case bound::ClockSlot::Kind::Time:
+    case bound::ClockSlot::Kind::TimeTz:
     case bound::ClockSlot::Kind::Timestamp:
     case bound::ClockSlot::Kind::TimestampTz: break;
   }
@@ -2677,11 +2679,14 @@ static auto clock_value(const bound::ClockSlot& k, const Reading& r) -> Value {
   constexpr std::int64_t kDay = 86'400'000'000;
   auto day = now_us >= 0 ? now_us / kDay : -((-now_us + kDay - 1) / kDay);
   if (k.kind == bound::ClockSlot::Kind::Date) return Value{day};
-  auto us = k.kind == bound::ClockSlot::Kind::Time ? now_us - day * kDay : now_us;  // Timestamp and TimestampTz: the instant
+  auto time_of_day = k.kind == bound::ClockSlot::Kind::Time || k.kind == bound::ClockSlot::Kind::TimeTz;
+  auto us = time_of_day ? now_us - day * kDay : now_us;  // Timestamp and TimestampTz: the instant
   std::int64_t unit = 1;
   for (auto i = k.precision; i < 6; ++i) unit *= 10;
   auto rounded = us - (us >= 0 ? us % unit : (unit + us % unit) % unit);
   if (us - rounded >= (unit + 1) / 2) rounded += unit;
+  // A time with time zone is at the session's zone, UTC: offset 0.
+  if (k.kind == bound::ClockSlot::Kind::TimeTz) return Value{timetz_pack({rounded, 0})};
   return Value{rounded};
 }
 

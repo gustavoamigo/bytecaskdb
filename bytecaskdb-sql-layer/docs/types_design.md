@@ -32,6 +32,7 @@ bind error with the position of the type name.
 | `TIMESTAMP WITH TIME ZONE`, `TIMESTAMPTZ` | `i64` | The same microseconds, as an instant in UTC; told apart from `TIMESTAMP` by its catalog type tag (`SqlKind::TimestampTz`, 15), not by its bytes. Keys and rows encode it as a `TIMESTAMP`. |
 | `DATE` | `i64` | Days since 1970-01-01, in PostgreSQL's range: 4714-11-24 BC to 5874897-12-31. |
 | `TIME` | `i64` | Microseconds since midnight, in [0, 86 400 000 000]: 24:00:00 included, as in PostgreSQL. |
+| `TIME WITH TIME ZONE`, `TIMETZ` (precision 6) | `i64` | A `TIME` and its UTC offset, packed so that integer order is PostgreSQL's `timetz_cmp`, tag `SqlKind::TimeTz` (18) (*TIME WITH TIME ZONE*). |
 
 `AVG` of an integer or `DECIMAL` is a `NUMERIC` of no declared precision
 too, carried in a result row as its text, since its digits can pass 64
@@ -41,7 +42,7 @@ bits (`planner_design.md`, *Aggregates*). A `SUM` of a `BIGINT` or
 Rejected, each for a reason that is not "later": `NUMERIC(p, s)` with
 p > 18 (does not fit `i64`); `CHAR(8 CHARACTERS)`
 and `CHAR(8 OCTETS)`, which are not PostgreSQL syntax;
-`TIMESTAMP(p) WITH TIME ZONE` for p other than 6, which would round on store; `TIME WITH TIME ZONE`;
+`TIMESTAMP(p) WITH TIME ZONE` for p other than 6, and `TIME(p) WITH TIME ZONE` for p under 6, which would round on store;
 `INTERVAL`, `UUID`, `JSON`, arrays, enums, composite types, `BIT`, `MONEY`,
 `SERIAL` (sequences are a runtime service, deferred in the plan API).
 
@@ -230,6 +231,52 @@ Output is UTC with the `+00` suffix. A `timestamp` read as a `timestamptz`
 (and the reverse) is therefore the same microseconds, and a `date` becomes
 midnight UTC. `AT TIME ZONE` is not built.
 
+## TIME WITH TIME ZONE
+
+PostgreSQL's `timetz`: a time of day, 00:00:00 to 24:00:00, and the UTC
+offset it was written with, within ±15:59:59 (PostgreSQL's bound, 22009
+past it). PostgreSQL stores the two side by side in 12 bytes; the layer
+packs them into one `i64` (`timetz_pack`, `catalog/catalog.cppm`):
+
+```
+(time − offset × 10^6) × 2^17 + (57599 − offset)
+```
+
+with `time` in microseconds and `offset` in seconds east of UTC. The first
+term is the UTC time; the second, below 2^17, is the offset, the most
+eastern first. So the integer order is PostgreSQL's `timetz_cmp` (the UTC
+time, then the zone in seconds west), and two values are equal only when
+both their time and their offset are: `12:00+01` and `11:00+00` are the
+same instant, and differ, `12:00+01` first, as in PostgreSQL. The value is
+within ±2^55, so a `TIME WITH TIME ZONE` is an 8-byte `i64` in a row and in
+a key, and keys, `ORDER BY`, `MIN`, `MAX`, `DISTINCT` and `GROUP BY` take
+that order with nothing added. A value `timetz_pack` cannot write (an
+embedded `$n` of another integer) is "time out of range" (22008).
+
+- **Text.** Input is a `TIME` (*Literals*' forms), optionally after a date
+  PostgreSQL reads and drops (a space between them: a date joined by ISO
+  8601's `T` is 22007, as in PostgreSQL), and an optional offset as a timestamptz
+  takes one (`Z`, `+02`, `-04:30`, `+0530`, `+hh:mm:ss`). One with none
+  is at the session's zone, UTC, offset 0. A zone name or abbreviation
+  (`PST`) is 22007: the layer has no time zone database. Output is
+  PostgreSQL's: the time, then the offset as `+hh`, with `:mm` and `:ss`
+  only where they are not zero (`12:00:00+05:30`, `24:00:00-15:59:59`). It
+  is OID 1266 on the wire, text format.
+- **Precision.** 6, the microseconds it holds; above 6 is 6. Under 6 would
+  round each value stored, which is not built (0A000, #866).
+- **Casts and comparison.** To a `TIME` drops the offset; a `TIME`, or a
+  timestamptz's UTC time, is one at offset 0, as PostgreSQL's casts read
+  it in a UTC session; a `TIME` compared with one is read so. Assigned to
+  a column, the same two casts apply (to a `TIME`, and from a
+  timestamptz). It meets no
+  date or timestamp otherwise (42846, 42883).
+- **The clock.** `CURRENT_TIME[(p)]` is one, `LOCALTIME`'s reading at
+  offset 0 (`frontend_design.md`, *The time*).
+- **Arithmetic.** PostgreSQL's operators over it all take or give an
+  `interval` or a timestamptz (`timetz ± interval`, `timetz ± time`,
+  `date + timetz`); the layer has no `interval` and refuses them (42601).
+  `SUM` and `AVG` of one are 42883, as there.
+
 ## Null
 
 SQL's three-valued logic, as PostgreSQL has it:
@@ -358,7 +405,7 @@ document fixes the set, not the signatures.
 | `OCTET_LENGTH` on bytes and text | a helper |
 | `LENGTH` (code points), `SUBSTRING` (by code point), `||`, `CONCAT` on text | helpers that walk UTF-8 in the API, not in the plan: the subset has no counted loop |
 | `SUBSTRING` by byte, `||` on `BYTEA` | the same helpers on bytes |
-| `CURRENT_TIMESTAMP`, `NOW()`, `CURRENT_DATE` | a hidden parameter the runtime binds at `bc_ctx_begin`: a plan cannot see the clock, so every call in one statement sees one instant. Built for `CURRENT_DATE`, `LOCALTIME` and `LOCALTIMESTAMP`, as a hidden parameter bound by the API at each run, not by the plan API (`frontend_design.md`, *The time*); `CURRENT_TIMESTAMP[(p)]` and `NOW()` are `TIMESTAMP WITH TIME ZONE`; `CURRENT_TIME` waits for `TIME WITH TIME ZONE` |
+| `CURRENT_TIMESTAMP`, `NOW()`, `CURRENT_DATE` | a hidden parameter the runtime binds at `bc_ctx_begin`: a plan cannot see the clock, so every call in one statement sees one instant. Built for `CURRENT_DATE`, `LOCALTIME` and `LOCALTIMESTAMP`, as a hidden parameter bound by the API at each run, not by the plan API (`frontend_design.md`, *The time*); `CURRENT_TIMESTAMP[(p)]` and `NOW()` are `TIMESTAMP WITH TIME ZONE`, `CURRENT_TIME[(p)]` `TIME WITH TIME ZONE` |
 | `EXTRACT(field FROM x)` of a date, time or timestamp | `bc_extract`: integer arithmetic on the day count or microseconds and the civil-date helper, the result a `DECIMAL`'s scaled value (built: `frontend_design.md`, *The dialect*) |
 | `DATE_TRUNC` to a day or coarser | integer arithmetic on the microsecond value and a civil-date helper |
 | `CAST` | *Casts*, above |
@@ -386,7 +433,8 @@ namespaces are `0x01` catalog, `0x02` table rows, `0x03` index entries.
 | `bytes` | Every `0x00` byte becomes `0x00 0xFF`; the part ends with `0x00 0x00`. Self-delimiting: a decoder reads to the first `0x00` not followed by `0xFF`. A string sorts before every string it is a prefix of, and the two-byte terminator keeps that true whatever the next part's first byte is: `0x00 0x00` is below `0x00 0xFF`, which is the smallest thing a longer string can continue with. |
 | `DESC` part | The part's bytes as above, marker included, with every bit inverted. Decoding inverts byte by byte before interpreting, so the part stays self-delimiting. Nulls sort last. |
 
-Integer SQL types of every width, decimals, timestamps, dates and times are
+Integer SQL types of every width, decimals, timestamps, dates and times
+(with a time zone too, packed for it: *TIME WITH TIME ZONE*) are
 `i64` parts; the order they need is the integer order of their stored value,
 which the sign flip gives at any width. Text is a `bytes` part, compared as bytes; when
 collations arrive, a text part under a non-binary collation is the collation's sort key
@@ -504,7 +552,7 @@ The header is 8 bytes. A fixed column takes its type's width
 (`fixed_width`): `BOOLEAN` 1 byte, 0 or 1 (a decoder reads any non-zero
 byte as true); `SMALLINT` and `DECIMAL(p ≤ 4)` 2; `INTEGER`, `DATE` and
 `DECIMAL(p ≤ 9)` 4; `REAL` 4, its `float`'s bits; `BIGINT`, `DECIMAL(p ≤
-18)`, `TIMESTAMP`, `TIMESTAMPTZ`, `TIME` and `DOUBLE PRECISION` 8. Integers
+18)`, `TIMESTAMP`, `TIMESTAMPTZ`, `TIME`, `TIMETZ` and `DOUBLE PRECISION` 8. Integers
 are two's complement, sign-extended on read; a `REAL` is widened to the
 `double` it was rounded from, exactly. Fixed columns are packed, with no
 padding. Variable column `k` occupies `[var_end[k−1], var_end[k])` of the

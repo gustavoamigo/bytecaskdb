@@ -375,7 +375,7 @@ kind the transformer doesn't take is refused with its position.
     as the physical check does (`date_field_built`), so a plan written by
     hand cannot reach a value the binder never asks for.
     `EXTRACT` in a `WHERE` or `GROUP BY` is refused as any expression
-    there is.
+    there is. `EXTRACT` of a `TIME WITH TIME ZONE` is not built (0A000).
 - **`CASE`, `COALESCE` and `NULLIF`** of constants fold. Of a column, a
   parameter or a subquery they are values in a select list (*Expressions
   over columns*, below). The result type is PostgreSQL's union rule: unknown
@@ -1144,7 +1144,9 @@ recompile after a DDL folds them again, to the types they meet then.
   constant's type (`1 < '2'`); two compare as text. Types PostgreSQL has no
   operator for are 42883. A timestamptz beside a timestamp or a date
   compares as timestamptz (the timestamp read as UTC, the date as midnight
-  UTC); a date beside a timestamp is not taken yet.
+  UTC); a time beside a time with time zone as a time with time zone (at
+  offset 0); a time with time zone beside a date or a timestamp is 42883;
+  a date beside a timestamp is not taken yet.
 - A cast of a string literal or `NULL`: `DATE '…'`, `'…'::date` and
   `CAST('…' AS date)` alike read the string with the type's input function,
   a `DECIMAL(p, s)` rounded to its scale and range-checked (22003), and are
@@ -1171,8 +1173,17 @@ recompile after a DDL folds them again, to the types they meet then.
   floor in UTC, so 1969-12-31 23:00 is 1969-12-31) or a time; a date to a
   timestamp or timestamptz (22008 if the instant passes 64 bits); a
   timestamp to a timestamptz and back (the same microseconds, the session
-  being UTC). A time to a date, timestamp or timestamptz, and a date to a
-  time, are 42846, as in PostgreSQL.
+  being UTC); a time with time zone to a time (its offset dropped), and a
+  time or a timestamptz to a time with time zone (the time, or the
+  timestamptz's UTC time, at offset 0). A time to a date, timestamp or
+  timestamptz, a date to a time, a time with time zone to a date or a
+  timestamp, and a date or a timestamp to a time with time zone are 42846,
+  as in PostgreSQL. A time with time zone constant assigned to a `TIME`
+  column drops its offset, and a timestamptz constant assigned to a
+  `TIME WITH TIME ZONE` column is its UTC time at offset 0, PostgreSQL's
+  assignment casts; a date or time constant assigned to a column of a
+  date or time type it has no cast to is 42804, `column "c" is of type …
+  but expression is of type …`.
 - A select-list constant is named `?column?`, a cast by its type's name
   (`date`, `int4`, `numeric`), as PostgreSQL names them.
 
@@ -1195,7 +1206,7 @@ recompile after a DDL folds them again, to the types they meet then.
 
 ### The time
 
-`CURRENT_DATE`, `LOCALTIME[(p)]`, `LOCALTIMESTAMP[(p)]`, `CURRENT_TIMESTAMP[(p)]` and `now()` are the one
+`CURRENT_DATE`, `CURRENT_TIME[(p)]`, `LOCALTIME[(p)]`, `LOCALTIMESTAMP[(p)]`, `CURRENT_TIMESTAMP[(p)]` and `now()` are the one
 constant a plan cannot fold: a plan is cached by its text, so a value
 folded at bind would be the time of the first run. The binder gives each
 use a slot among the statement's constants (`bound::ClockSlot`), marked as
@@ -1216,14 +1227,22 @@ are one instant.
   24:00:00, as there.
 - **With a time zone.** `CURRENT_TIMESTAMP[(p)]` and `now()` are `timestamp
   with time zone`, as in PostgreSQL: the same instant as `LOCALTIMESTAMP`,
-  written with `+00`.
+  written with `+00`. `CURRENT_TIME[(p)]` is `time with time zone`
+  (`types_design.md`, *TIME WITH TIME ZONE*): `LOCALTIME`'s time at offset
+  0, the session's zone, written with `+00` (`ClockSlot::Kind::TimeTz`).
 - **Assigned, and as a column's `DEFAULT`.** `VALUES` and `SET` assign
   the time to a column by PostgreSQL's assignment cast:
   - a `DATE` takes the date of `CURRENT_DATE` or of a timestamp;
-  - a `TIME` takes `LOCALTIME` or a timestamp's time, at the precision;
+  - a `TIME` takes `LOCALTIME`, `CURRENT_TIME` (its offset dropped) or a
+    timestamp's time, at the precision;
+  - a `TIME WITH TIME ZONE` takes `CURRENT_TIME`, `LOCALTIME` or
+    `CURRENT_TIMESTAMP`'s time, at offset 0;
   - a `TIMESTAMP` or `TIMESTAMPTZ` takes either timestamp.
 
-  A type with no such cast is 42804. A date to a timestamp, which is
+  A type with no such cast is 42804 (`CURRENT_TIME` to a date or a
+  timestamp, `CURRENT_DATE` or `LOCALTIMESTAMP` to a time with time zone), worded
+  as PostgreSQL words it: `but default expression is of type` for a
+  `DEFAULT`, `but expression is of type` for a value assigned. A date to a timestamp, which is
   midnight, is refused, and so is the time to a `TEXT`, `VARCHAR` or
   `NAME` column, which PostgreSQL assigns by the I/O cast (42601). A column's `DEFAULT` of the clock is the same
   assignment, made where the `INSERT` leaves the column out or writes
@@ -1233,7 +1252,9 @@ are one instant.
   `DELETE`'s or subquery's `WHERE`, is a comparison with a parameter of
   the column's type that the API fills on every run, so the plan's key
   range is the run's. The pairs are:
-  - a `DATE` with `CURRENT_DATE`, a `TIME` with `LOCALTIME`;
+  - a `DATE` with `CURRENT_DATE`, a `TIME` with `LOCALTIME`, a `TIME WITH
+    TIME ZONE` with `CURRENT_TIME` or `LOCALTIME` (read as a time with
+    time zone, as PostgreSQL casts it);
   - a `TIMESTAMP` or `TIMESTAMPTZ` with `CURRENT_TIMESTAMP`, `now()` or
     `LOCALTIMESTAMP`. PostgreSQL compares a timestamp with a timestamptz
     in the session's time zone; the layer's is UTC, so the two are the
@@ -1246,12 +1267,16 @@ are one instant.
   comparison under that `NOT` remembers it was a `<>`
   (`ast::Compare::ne`), as a typed constant's 42883 does. A `DATE` with a
   timestamp, or a timestamp with `CURRENT_DATE`, compares the date's
-  midnight and is refused (42601).
+  midnight, and a `TIME` with `CURRENT_TIME` compares the column as a time
+  with time zone: both are refused (42601).
+- **Compared in a select list.** A column or the time compared with the
+  time of its own type, as a value; `LOCALTIME` beside a time with time
+  zone is read as one (`Binder::clock_as_timetz`). Two other date and time
+  types are not compared as a value yet (42601).
 - **The placeholder.** The value a clock slot holds in the bound
   statement is 0, a placeholder: nothing folds it or checks it as the
   statement's value.
-- **Refused.** `CURRENT_TIME` is `time with time zone`, a type the layer
-  lacks: refused with 42601, not read as `LOCALTIME`. Also refused: the
+- **Refused.** The
   time inside an aggregated select list, in a value expression of a
   `WHERE` (`d < CURRENT_DATE - 1`), compared in a `WHERE` with anything
   but a column (a constant, a parameter or the time:
@@ -1361,7 +1386,12 @@ until then.
   timestamp's or a time's difference (an `interval`), `date - timestamp`,
   `time * number`. A pair PostgreSQL has no operator for is 42883 (`date +
   date`, `date * date`, `date - numeric`, `date - bigint`, `integer -
-  date`), and `time + time` is 42725, ambiguous there.
+  date`), and `time + time` is 42725, ambiguous there. A `TIME WITH TIME
+  ZONE` has no `T - T`: its `-` reads an unknown as an `interval`, refused
+  (42601) as the other interval forms are, and so are `timetz ± time` and
+  `date + timetz` (a timestamptz); `timetz + unknown` is 42725, `unknown -
+  timetz`, `timetz - timetz`, `timetz + timetz`, `timetz * number` and
+  `timetz` with a timestamp are 42883.
 - **Held within 18 digits.** A numeric operand brought to a finer scale
   (`d + i`, `d < i`) must stay inside the 18 digits a `DECIMAL` holds, by
   its type, or by its value for a constant; a `bigint` beside a `DECIMAL`
@@ -1721,6 +1751,18 @@ checks that it does.
 Gaps, not decisions: PostgreSQL runs each, and the layer refuses it until
 it is built. The functional suite marks the cases that need one as not
 implemented (`functional_testing_design.md`).
+
+- **`TIME WITH TIME ZONE` is partial.** The type, its order, keys,
+  `CURRENT_TIME` and the casts of constants are built (`types_design.md`,
+  *TIME WITH TIME ZONE*). Refused: a precision under 6
+  (`TIME(3) WITH TIME ZONE`, 0A000), which would round on store; a zone
+  name or abbreviation in its text (`'12:00 PST'`, 22007), as the layer
+  has no time zone database; its arithmetic, all of which takes or gives
+  an `interval` or a timestamptz (42601); `EXTRACT` of it (0A000); a
+  `TIME` column compared with one (42601); a timestamptz constant compared
+  with one (42601, where PostgreSQL has no operator, 42883); a bare time
+  after ISO 8601's `T` (`'T12:00'`, 22007, for `TIME` too). Tracked in
+  #866.
 
 - **A table needs columns.** The layer refuses `CREATE TABLE t ()` and a
   `CREATE TABLE AS` of a query of no columns (0A000); PostgreSQL accepts a
