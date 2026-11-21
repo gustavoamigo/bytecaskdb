@@ -4846,3 +4846,150 @@ TEST_CASE("embedded API: INSERT … ON CONFLICT DO NOTHING skips a row whose arb
   (void)db->execute("CREATE UNIQUE INDEX ocn_a ON ocn (a)");
   CHECK(affected("INSERT INTO ocn VALUES (1, 1), (1, 2) ON CONFLICT (a) DO NOTHING") == 1);
 }
+
+TEST_CASE("embedded API: a NAME column cuts a value to 63 bytes at a character boundary, keys and compares as text",
+          "[sql][api][name]") {
+  sql_test::TempDir dir{"api_name"};
+  auto state = [](Database& d, std::string_view sql, const std::vector<Value>& params = {}) -> std::string {
+    try {
+      (void)d.execute(std::string{sql}, params);
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ok";
+  };
+  auto text = [](Database& d, std::string_view sql, const std::vector<Value>& params = {}) {
+    std::vector<std::string> out;
+    auto r = d.execute(std::string{sql}, params);
+    for (const auto& row : r.rows) out.push_back(to_text(row.at(0), r.types.at(0)));
+    return out;
+  };
+  using V = std::vector<std::string>;
+  auto repeat = [](std::string_view s, int n) {
+    std::string out;
+    for (int k = 0; k < n; ++k) out += s;
+    return out;
+  };
+  const auto a70 = repeat("a", 70);
+  const auto a63 = repeat("a", 63);
+  const auto e40 = repeat("\xC3\xA9", 40);  // é: 2 bytes, cut to 31 of them (62 bytes)
+  {
+    auto db = Database::open(dir.path());
+    CHECK(state(*db, "CREATE TABLE t (k NAME PRIMARY KEY, v INTEGER, s TEXT)") == "ok");
+    CHECK(db->execute("SELECT k FROM t").types == std::vector<SqlType>{{SqlKind::Name}});
+    CHECK(state(*db, "INSERT INTO t VALUES ('" + a70 + "', 1, '" + a70 + "')") == "ok");
+    CHECK(state(*db, "INSERT INTO t VALUES ($1, 2, 'x')", {bytes(e40)}) == "ok");
+    CHECK(state(*db, "INSERT INTO t VALUES ('bob', 3, 'bob')") == "ok");
+    CHECK(text(*db, "SELECT k FROM t WHERE v = 1") == V{a63});
+    CHECK(text(*db, "SELECT k FROM t WHERE v = 2") == V{repeat("\xC3\xA9", 31)});
+    // The key is the cut value: a longer one with its 63 bytes is taken.
+    CHECK(state(*db, "INSERT INTO t VALUES ($1, 4, 'x')", {bytes(a70 + "zz")}) == "23505");
+    // A literal or a $n compared with it is a NAME, cut; a TEXT is not.
+    CHECK(text(*db, "SELECT v FROM t WHERE k = '" + a70 + "b'") == V{"1"});
+    CHECK(text(*db, "SELECT v FROM t WHERE k = $1", {bytes(a70 + "c")}) == V{"1"});
+    CHECK(text(*db, "SELECT v FROM t WHERE k = s ORDER BY v") == V{"3"});
+    // Bytewise order, GROUP BY, DISTINCT, LIKE, || and COUNT, as text.
+    CHECK(text(*db, "SELECT v FROM t WHERE v > 0 ORDER BY k") == V{"1", "3", "2"});
+    CHECK(text(*db, "SELECT k FROM t WHERE k LIKE 'b%'") == V{"bob"});
+    CHECK(text(*db, "SELECT k || '!' FROM t WHERE v = 3") == V{"bob!"});
+    CHECK(text(*db, "SELECT COUNT(DISTINCT k) FROM t") == V{"3"});
+    CHECK(text(*db, "SELECT 'x'::name::text") == V{"x"});
+    CHECK(text(*db, "SELECT k::text FROM t WHERE v = 3") == V{"bob"});
+    CHECK(text(*db, "SELECT $1::name", {bytes(a70)}) == V{a63});
+    // A typed string cast to name is cut as an unknown literal is.
+    CHECK(text(*db, "SELECT '" + a70 + "'::text::name") == V{a63});
+    CHECK(text(*db, "SELECT ('" + a70 + "'::varchar)::name") == V{a63});
+    CHECK(text(*db, "SELECT CAST(CAST('" + a70 + "' AS text) AS name) = CAST('" + a70 + "' AS name)") == V{"t"});
+    CHECK(text(*db, "SELECT DISTINCT k FROM t WHERE v = 3") == V{"bob"});
+    // PostgreSQL's errors: no operator with a number, no SUM of it.
+    CHECK(state(*db, "SELECT v FROM t WHERE k = 1") == "42883");
+    CHECK(state(*db, "SELECT SUM(k) FROM t") == "42883");
+    // A NAME from another string type, which PostgreSQL cuts: refused.
+    CHECK(state(*db, "SELECT COALESCE(k, s) FROM t") == "0A000");
+    CHECK(text(*db, "SELECT COALESCE(s, k) FROM t WHERE v = 3") == V{"bob"});
+    CHECK(state(*db, "SELECT k FROM t UNION SELECT s FROM t") == "0A000");
+    // A DEFAULT literal is cut too.
+    CHECK(state(*db, "CREATE TABLE d (n NAME DEFAULT '" + a70 + "', i INTEGER)") == "ok");
+    CHECK(state(*db, "INSERT INTO d (i) VALUES (1)") == "ok");
+    CHECK(text(*db, "SELECT n FROM d") == V{a63});
+  }
+  auto db = Database::open(dir.path());
+  CHECK(db->execute("SELECT k FROM t").types.at(0) == SqlType{SqlKind::Name});
+  CHECK(text(*db, "SELECT v FROM t WHERE k = 'bob'") == V{"3"});
+}
+
+TEST_CASE("embedded API: CURRENT_USER and its kin, CURRENT_CATALOG and CURRENT_SCHEMA are NAMEs read on each run",
+          "[sql][api][name]") {
+  sql_test::TempDir dir{"api_session_fns"};
+  auto text = [](Database& d, std::string_view sql, const ExecutionOptions& opts = {}) {
+    std::vector<std::string> out;
+    auto r = d.execute(std::string{sql}, {}, opts);
+    for (const auto& row : r.rows) {
+      for (std::size_t c = 0; c < row.size(); ++c) out.push_back(to_text(row.at(c), r.types.at(c)));
+    }
+    return out;
+  };
+  auto state = [](Database& d, std::string_view sql) -> std::string {
+    try {
+      (void)d.execute(std::string{sql}, {});
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ok";
+  };
+  using V = std::vector<std::string>;
+  DatabaseOptions o;
+  o.name = "shop";
+  auto db = Database::open(dir.path(), o);
+  const auto sql = "SELECT CURRENT_USER, CURRENT_ROLE, USER, SESSION_USER, CURRENT_CATALOG, CURRENT_SCHEMA";
+  auto r = db->execute(sql);
+  CHECK(r.columns == std::vector<std::string>{"current_user", "current_role", "user", "session_user", "current_catalog",
+                                              "current_schema"});
+  CHECK(r.types == std::vector<SqlType>(6, SqlType{SqlKind::Name}));
+  CHECK(text(*db, sql) == V{"bytecask", "bytecask", "bytecask", "bytecask", "shop", "public"});
+  // The same cached plan serves another session's user: bound per run.
+  ExecutionOptions ann;
+  ann.user = "ann";
+  CHECK(text(*db, sql, ann) == V{"ann", "ann", "ann", "ann", "shop", "public"});
+  CHECK(text(*db, "SELECT CURRENT_USER || '!', CURRENT_USER = 'bytecask'") == V{"bytecask!", "t"});
+  // A DEFAULT is the reading of the statement that inserts the row, in a
+  // transaction its user's.
+  CHECK(state(*db, "CREATE TABLE t (id INTEGER, u NAME DEFAULT CURRENT_USER, s TEXT DEFAULT SESSION_USER, "
+                   "c NAME DEFAULT CURRENT_CATALOG, sc VARCHAR(10) DEFAULT CURRENT_SCHEMA)") == "ok");
+  (void)db->execute("INSERT INTO t (id) VALUES (1)", {}, ann);
+  {
+    TransactionOptions to;
+    to.user = "bo";
+    auto txn = db->begin(to);
+    (void)txn.execute("INSERT INTO t (id) VALUES (2)", {});
+    (void)txn.execute("INSERT INTO t VALUES (3, DEFAULT, DEFAULT, DEFAULT, DEFAULT)", {});
+    CHECK(txn.commit() == CommitOutcome::Committed);
+  }
+  CHECK(text(*db, "SELECT id, u, s, c, sc FROM t ORDER BY id") ==
+        V{"1", "ann", "ann", "shop", "public", "2", "bo", "bo", "shop", "public", "3", "bo", "bo", "shop", "public"});
+  CHECK(text(*db, "SELECT id FROM t WHERE u = CURRENT_USER", ann) == V{"1"});
+  CHECK(text(*db, "SELECT id FROM t WHERE CURRENT_CATALOG = c ORDER BY id") == V{"1", "2", "3"});
+  // PostgreSQL's 42804 for a type no NAME is assigned to.
+  CHECK(state(*db, "CREATE TABLE x (a INTEGER DEFAULT CURRENT_USER)") == "42804");
+  CHECK(state(*db, "CREATE TABLE x (a DATE DEFAULT CURRENT_SCHEMA)") == "42804");
+  // A NAME too long for a VARCHAR(n) is 22001 where it is written.
+  CHECK(state(*db, "CREATE TABLE y (a VARCHAR(3) DEFAULT CURRENT_CATALOG, b INTEGER)") == "ok");
+  CHECK(state(*db, "INSERT INTO y (b) VALUES (1)") == "22001");
+  // current_database() and current_schema() are CURRENT_CATALOG and
+  // CURRENT_SCHEMA spelled as calls, named by the call.
+  CHECK(text(*db, "SELECT current_database(), pg_catalog.current_schema()") == V{"shop", "public"});
+  CHECK(state(*db, "CREATE TABLE w (id INTEGER, c NAME DEFAULT current_database())") == "ok");
+  // Refused as gaps of PostgreSQL's dialect (0A000): compared in WHERE with
+  // no column, in a CHECK, an aggregated select list, ADD COLUMN's DEFAULT.
+  CHECK(state(*db, "SELECT id FROM t WHERE CURRENT_USER = 'bytecask'") == "0A000");
+  CHECK(state(*db, "CREATE TABLE z (a NAME CHECK (a = CURRENT_USER))") == "0A000");
+  CHECK(state(*db, "SELECT COUNT(*), CURRENT_USER FROM t") == "0A000");
+  CHECK(state(*db, "ALTER TABLE t ADD COLUMN w NAME DEFAULT CURRENT_USER") == "0A000");
+  // The clock's date on a NAME column has PostgreSQL's I/O cast, not built.
+  CHECK(state(*db, "CREATE TABLE z (a NAME DEFAULT CURRENT_DATE)") == "42601");
+  // A user name past 63 bytes is cut, as a NAME.
+  ExecutionOptions longer;
+  const auto long_name = std::string(70, 'u');
+  longer.user = long_name;
+  CHECK(text(*db, "SELECT CURRENT_USER", longer) == V{std::string(63, 'u')});
+}

@@ -552,14 +552,14 @@ namespace {
 
 // Whether INSERT … SELECT writes a value of type `from` into a column
 // declared `to` as codegen prints it: held as the column is, at its scale,
-// and of its kind or family (integers; TEXT and VARCHAR), a CHAR(n) only
+// and of its kind or family (integers; TEXT, VARCHAR and NAME), a CHAR(n) only
 // from its own type; or a float or an integer into a float, which codegen
 // converts. The binder's assigns_to takes no pair outside these.
 auto assigns(SqlType from, SqlType to) -> bool {
   auto is_float = [](SqlType t) { return t.kind == SqlKind::Real || t.kind == SqlKind::Double; };
   auto family = [](SqlKind k) {
     if (k == SqlKind::SmallInt || k == SqlKind::Integer || k == SqlKind::BigInt) return 1;
-    if (k == SqlKind::Text || k == SqlKind::Varchar) return 2;
+    if (k == SqlKind::Text || k == SqlKind::Varchar || k == SqlKind::Name) return 2;  // a NAME is cut as it is stored
     return 0;
   };
   if (from.kind == SqlKind::Numeric || to.kind == SqlKind::Numeric) return from.kind == to.kind;  // its text, carried

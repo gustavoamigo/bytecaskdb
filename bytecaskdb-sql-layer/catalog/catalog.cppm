@@ -250,11 +250,18 @@ struct RangeMessage {
 [[nodiscard]] auto set_datum(RowWriter& w, std::uint32_t col_id, const Datum& d) -> bool;
 
 // A DEFAULT of the clock (CURRENT_DATE, CURRENT_TIMESTAMP and now(),
-// LOCALTIME, LOCALTIMESTAMP), its precision 0 to 6. Each statement reads the
-// clock once; the binder gives a row that leaves the column out, or sets it
-// to DEFAULT, that reading, so the column's stored default stays NULL.
+// LOCALTIME, LOCALTIMESTAMP), its precision 0 to 6, or of a session function
+// (CURRENT_USER, CURRENT_ROLE and USER; SESSION_USER; CURRENT_CATALOG;
+// CURRENT_SCHEMA), a NAME, its precision unused. Each statement reads the
+// clock and the session once; the binder gives a row that leaves the column
+// out, or sets it to DEFAULT, that reading, so the column's stored default
+// stays NULL.
 struct ClockDefault {
-  enum class Fn : std::uint8_t { CurrentDate = 1, CurrentTimestamp, LocalTime, LocalTimestamp };
+  enum class Fn : std::uint8_t {
+    CurrentDate = 1, CurrentTimestamp, LocalTime, LocalTimestamp,
+    CurrentUser, SessionUser, CurrentCatalog, CurrentSchema,
+  };
+  static constexpr std::uint8_t kLastFn = static_cast<std::uint8_t>(Fn::CurrentSchema);
   Fn fn{Fn::CurrentDate};
   std::uint8_t precision{6};
 
@@ -265,9 +272,13 @@ struct ClockDefault {
 // cast, and the layer computes it from the statement's reading: a date the
 // date of any of them but LOCALTIME; a time LOCALTIME's or a timestamp's
 // time; a timestamp either timestamp. (A date to a timestamp is midnight,
-// not the reading: not taken.)
+// not the reading: not taken.) A session function's NAME goes to a string
+// column of any kind.
 [[nodiscard]] constexpr auto clock_assignable(ClockDefault::Fn fn, SqlKind kind) -> bool {
   using F = ClockDefault::Fn;
+  if (fn >= F::CurrentUser) {
+    return kind == SqlKind::Text || kind == SqlKind::Varchar || kind == SqlKind::Char || kind == SqlKind::Name;
+  }
   switch (kind) {
     case SqlKind::Date: return fn != F::LocalTime;
     case SqlKind::Time: return fn != F::CurrentDate;
@@ -284,6 +295,7 @@ struct ClockDefault {
     case SqlKind::Text:
     case SqlKind::Varchar:
     case SqlKind::Char:
+    case SqlKind::Name:
     case SqlKind::Bytea: return false;
   }
   return false;
@@ -1352,6 +1364,7 @@ auto sql_type_valid(SqlType t) -> bool {
     case SqlKind::Boolean:
     case SqlKind::Bytea:
     case SqlKind::Text:
+    case SqlKind::Name:
     case SqlKind::Timestamp:
     case SqlKind::TimestampTz:
     case SqlKind::Date:
@@ -1376,6 +1389,7 @@ auto sql_type_name(SqlType t) -> std::string {
     case SqlKind::Text: return "text";
     case SqlKind::Varchar: return "varchar(" + std::to_string(t.length) + ")";
     case SqlKind::Char: return "char(" + std::to_string(t.length) + ")";
+    case SqlKind::Name: return "name";
     case SqlKind::Decimal:
       if (t.precision == 0) return "numeric";  // no declared precision: a SUM's result
       return "numeric(" + std::to_string(t.precision) + "," + std::to_string(t.scale) + ")";
@@ -1427,7 +1441,8 @@ auto compared_type(SqlType t) -> ComparedType {
   auto same = [](SqlType u) { return ComparedType{u, u}; };
   switch (t.kind) {
     case SqlKind::Varchar:
-    case SqlKind::Char: return same({SqlKind::Text});
+    case SqlKind::Char:
+    case SqlKind::Name: return same({SqlKind::Text});
     case SqlKind::Decimal:
       if (t.scale == 0) return same({SqlKind::BigInt});
       return {{SqlKind::Decimal, 0, 0, t.scale}, {SqlKind::BigInt}};
@@ -1480,6 +1495,7 @@ auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string> {
     case SqlKind::Text:
     case SqlKind::Varchar:
     case SqlKind::Char:
+    case SqlKind::Name:
     case SqlKind::Numeric: break;
   }
   return std::nullopt;
@@ -1499,7 +1515,9 @@ auto out_of_range(SqlType t, double v) -> std::optional<std::string> {
 auto out_of_range(SqlType t, BytesView v) -> std::optional<std::string> {
   // A NUMERIC's text is read as UTF-8 first, as PostgreSQL checks a
   // parameter's encoding before numeric_in reads it.
-  if (t.kind != SqlKind::Text && t.kind != SqlKind::Varchar && t.kind != SqlKind::Char && t.kind != SqlKind::Numeric) {
+  // A NAME's longer value is cut, not refused (name_prefix).
+  if (t.kind != SqlKind::Text && t.kind != SqlKind::Varchar && t.kind != SqlKind::Char && t.kind != SqlKind::Name &&
+      t.kind != SqlKind::Numeric) {
     return std::nullopt;
   }
   auto n = utf8_code_points(v);
@@ -2028,7 +2046,7 @@ auto parse_table(BytesView in) -> Table {
     if (!e.at_end()) {
       auto fn = e.u8();
       auto precision = e.u8();
-      if (fn < 1 || fn > 4 || precision > 6 || !std::holds_alternative<std::monostate>(c.default_value)) {
+      if (fn < 1 || fn > ClockDefault::kLastFn || precision > 6 || !std::holds_alternative<std::monostate>(c.default_value)) {
         corrupt("column " + c.name + " of table " + t.name + " has a bad clock default");
       }
       c.clock_default = ClockDefault{static_cast<ClockDefault::Fn>(fn), precision};

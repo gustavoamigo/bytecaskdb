@@ -130,6 +130,14 @@ auto type_ast(const PgQuery__TypeName* tn, std::string name, std::int32_t pos) -
 }
 
 auto expr(const PgQuery__Node* n) -> Expr;
+
+// The clock or session function a call of no arguments spells, or null.
+auto call_clock(std::string_view name) -> const char* {
+  if (name == "now") return "current_timestamp";
+  if (name == "current_database") return "current_catalog";
+  if (name == "current_schema") return "current_schema";
+  return nullptr;
+}
 auto literal(const PgQuery__Node* n) -> Literal;
 auto object_name(const PgQuery__Node* n, std::int32_t pos) -> std::string;
 // `into_taken`: the statement's INTO, which its caller reads (SELECT … INTO);
@@ -261,13 +269,16 @@ auto expr(const PgQuery__Node* n) -> Expr {
       for (std::size_t k = 0; k < f->n_args; ++k) e.args.push_back(operand(f->args[k]));
       return e;
     }
-    // now() is CURRENT_TIMESTAMP spelled as a call.
-    if (name == "now" && f->n_args == 0 && (f->n_funcname == 1 || (f->n_funcname == 2 && str(f->funcname[0]) == "pg_catalog")) &&
-        !f->agg_star && !f->agg_distinct && f->n_agg_order == 0 && f->agg_filter == nullptr && f->over == nullptr &&
-        !f->agg_within_group && !f->func_variadic) {
+    // now(), current_database() and current_schema() are CURRENT_TIMESTAMP,
+    // CURRENT_CATALOG and CURRENT_SCHEMA spelled as calls, named as
+    // PostgreSQL names the call.
+    if (auto clock = call_clock(name); clock != nullptr && f->n_args == 0 &&
+        (f->n_funcname == 1 || (f->n_funcname == 2 && str(f->funcname[0]) == "pg_catalog")) && !f->agg_star &&
+        !f->agg_distinct && f->n_agg_order == 0 && f->agg_filter == nullptr && f->over == nullptr && !f->agg_within_group &&
+        !f->func_variadic) {
       Expr e{Expr::Kind::Clock, {}, 0, nullptr, nullptr, f->location};
-      e.func = "current_timestamp";
-      e.column = "now";  // its output name, as PostgreSQL names the call
+      e.func = clock;
+      e.column = name;
       e.constant = -1;
       return e;
     }
@@ -365,13 +376,14 @@ auto expr(const PgQuery__Node* n) -> Expr {
         case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_LOCALTIME_N: return "localtime";
         case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_LOCALTIMESTAMP:
         case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_LOCALTIMESTAMP_N: return "localtimestamp";
+        // The session functions: NAMEs the API fills per run, as the clock.
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_CURRENT_ROLE: return "current_role";
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_CURRENT_USER: return "current_user";
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_USER: return "user";
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_SESSION_USER: return "session_user";
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_CURRENT_CATALOG: return "current_catalog";
+        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_CURRENT_SCHEMA: return "current_schema";
         case PG_QUERY__SQLVALUE_FUNCTION_OP__SQLVALUE_FUNCTION_OP_UNDEFINED:
-        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_CURRENT_ROLE:
-        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_CURRENT_USER:
-        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_USER:
-        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_SESSION_USER:
-        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_CURRENT_CATALOG:
-        case PG_QUERY__SQLVALUE_FUNCTION_OP__SVFOP_CURRENT_SCHEMA:
         case _PG_QUERY__SQLVALUE_FUNCTION_OP_IS_INT_SIZE: break;
       }
       reject("this SQL value function is not supported", f->location);
@@ -728,10 +740,10 @@ auto column_def(const PgQuery__ColumnDef* cd, int& primary_keys, std::string_vie
     } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_DEFAULT) {
       const auto* d = c->raw_expr;
       auto now = d->node_case == PG_QUERY__NODE__NODE_FUNC_CALL && d->func_call->n_args == 0 &&
-                 str(d->func_call->funcname[d->func_call->n_funcname - 1]) == "now";
+                 call_clock(str(d->func_call->funcname[d->func_call->n_funcname - 1])) != nullptr;
       if (d->node_case == PG_QUERY__NODE__NODE_SQLVALUE_FUNCTION || now) {
         auto e = expr(d);
-        if (e.kind != Expr::Kind::Clock) reject("DEFAULT takes a constant or the clock", e.pos);
+        if (e.kind != Expr::Kind::Clock) reject("DEFAULT takes a constant, the clock or a session function", e.pos);
         col.default_clock = e.func;
         col.default_clock_precision = e.constant;
       } else {

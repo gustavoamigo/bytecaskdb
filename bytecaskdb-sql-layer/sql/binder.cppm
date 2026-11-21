@@ -12,6 +12,7 @@
 module;
 #include <algorithm>
 #include <charconv>
+#include <cctype>
 #include <cmath>
 #include <compare>
 #include <cstddef>
@@ -53,8 +54,11 @@ struct ParamInfo {
 // A constant of the statement that is the time, not a literal: its slot among
 // `Bound::fixed` is filled with the statement's time each time it runs, not
 // when it was compiled (docs/frontend_design.md, *The time*).
+// The session functions are such constants too: their slots are filled with
+// the session's user, the database's name or the schema (Kind::User,
+// Catalog, Schema), so a cached plan serves every session.
 struct ClockSlot {
-  enum class Kind { Date, Time, Timestamp, TimestampTz };
+  enum class Kind { Date, Time, Timestamp, TimestampTz, User, Catalog, Schema };
   std::uint32_t slot;  // index into Bound::fixed
   Kind kind;
   std::uint8_t precision;  // fractional digits of a time or timestamp, 0 to 6
@@ -209,6 +213,7 @@ auto sql_type(const ast::ColumnDefAst& c) -> SqlType {
   if (c.type == "bool") return no_mods(SqlKind::Boolean);
   if (c.type == "bytea") return no_mods(SqlKind::Bytea);
   if (c.type == "text") return no_mods(SqlKind::Text);
+  if (c.type == "name") return no_mods(SqlKind::Name);
   if (c.type == "timestamp") return no_mods(SqlKind::Timestamp);
   if (c.type == "timestamptz") {
     // Precision 6 is the microseconds the type holds; a smaller one rounds
@@ -353,6 +358,7 @@ auto fold_default(const ast::Literal& l, SqlType t, std::string_view column) -> 
       return l.b;
     case SqlKind::Varchar:
     case SqlKind::Char:
+    case SqlKind::Name:
     case SqlKind::Text:
     case SqlKind::Bytea: {
       if (l.kind != K::String) bad();
@@ -360,6 +366,7 @@ auto fold_default(const ast::Literal& l, SqlType t, std::string_view column) -> 
       if (auto why = out_of_range(t, b)) {
         throw SqlError{"DEFAULT is not a " + sql_type_name(t) + ": " + *why, l.pos};
       }
+      if (t.kind == SqlKind::Name) b = name_prefix(b);
       return Bytes(b.begin(), b.end());
     }
     case SqlKind::Numeric: {
@@ -402,7 +409,8 @@ constexpr auto type_class(SqlKind k) -> TypeClass {
     case SqlKind::Boolean: return TypeClass::Boolean;
     case SqlKind::Text:
     case SqlKind::Varchar:
-    case SqlKind::Char: return TypeClass::String;
+    case SqlKind::Char:
+    case SqlKind::Name: return TypeClass::String;
     case SqlKind::Bytea: return TypeClass::Bytea;
   }
   std::unreachable();
@@ -433,6 +441,7 @@ auto exact_number(const Column& c) -> bool {
     case SqlKind::Text:
     case SqlKind::Varchar:
     case SqlKind::Char:
+    case SqlKind::Name:
     case SqlKind::Timestamp:
     case SqlKind::TimestampTz:
     case SqlKind::Date:
@@ -487,10 +496,24 @@ auto pg_type_name(SqlType t) -> std::string {
     case SqlKind::Double:
     case SqlKind::Boolean:
     case SqlKind::Text:
+    case SqlKind::Name:
     case SqlKind::Bytea:
     case SqlKind::Date: return sql_type_name(t);
   }
   return sql_type_name(t);
+}
+
+// A Clock expression as a refusal names it: the clock's family, or the
+// session function as written.
+auto is_session_name(std::string_view f) -> bool {
+  return f == "current_user" || f == "current_role" || f == "user" || f == "session_user" || f == "current_catalog" ||
+         f == "current_schema";
+}
+auto clock_words(const ast::Expr& e) -> std::string {
+  if (!is_session_name(e.func)) return "CURRENT_DATE, LOCALTIME and LOCALTIMESTAMP";
+  std::string out;
+  for (auto ch : e.func) out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+  return out;
 }
 
 // A form the layer does not take yet: 42601, where PostgreSQL runs it.
@@ -499,6 +522,24 @@ auto pg_type_name(SqlType t) -> std::string {
 // a feature it lacks (0A000).
 [[noreturn]] void not_supported(const std::string& what, std::int32_t pos) {
   throw SqlError{what + " is not supported yet", pos, kFeatureNotSupported};
+}
+
+// A Clock expression where the layer does not take it: a session function
+// is a gap of PostgreSQL's dialect (0A000), the clock keeps its 42601.
+[[noreturn]] void refuse_clock(const ast::Expr& e, const std::string& where) {
+  if (is_session_name(e.func)) not_supported(clock_words(e) + " " + where, e.pos);
+  not_yet(clock_words(e) + " " + where, e.pos);
+}
+
+// A NAME met with another string type where PostgreSQL resolves a union
+// (CASE, COALESCE, a set operation): it keeps the first's type, a VARCHAR
+// giving way to a NAME. A TEXT first is TEXT, which every string is. A
+// NAME made of another string's value would be cut to 63 bytes, which the
+// layer does not do in an expression yet: refused (0A000).
+void name_union(SqlType first, SqlType next, const std::string& what, std::int32_t pos) {
+  if (first.kind == next.kind || (first.kind != SqlKind::Name && next.kind != SqlKind::Name)) return;
+  if (first.kind == SqlKind::Text) return;
+  not_supported(what + " of " + pg_type_name(first) + " and " + pg_type_name(next) + ", a name made of another string type", pos);
 }
 
 // What a NUMERIC of no precision does not do yet: compare, order, group,
@@ -865,7 +906,8 @@ auto range_state(const std::string& why) -> SqlState {
 
 auto is_number(SqlType t) -> bool { return is_integer(t) || t.kind == SqlKind::Decimal; }
 auto is_float(SqlType t) -> bool { return t.kind == SqlKind::Real || t.kind == SqlKind::Double; }
-auto is_string(SqlType t) -> bool { return t.kind == SqlKind::Text || t.kind == SqlKind::Varchar; }
+// A NAME is one too: PostgreSQL's operators and functions take it as text.
+auto is_string(SqlType t) -> bool { return t.kind == SqlKind::Text || t.kind == SqlKind::Varchar || t.kind == SqlKind::Name; }
 // A string a column of this type takes: CHAR(n) is not is_string, whose LIKE,
 // UNION and parameter rules are TEXT's and VARCHAR's.
 auto holds_string(SqlType t) -> bool { return is_string(t) || t.kind == SqlKind::Char; }
@@ -1129,7 +1171,11 @@ auto cast_typed(const Constant& arg, SqlType t, std::int32_t pos) -> Constant {
   if (to == TypeClass::String && is_float(arg.type)) not_yet("a cast of a floating-point value to text", pos);
   auto result = [&](Datum v) -> Constant { return {std::move(v), t, false, {}, pos}; };
   if (std::holds_alternative<std::monostate>(arg.value)) return result(std::monostate{});
-  if (to == TypeClass::String) return result(bytes_of(text_of(arg)));
+  if (to == TypeClass::String) {
+    auto b = bytes_of(text_of(arg));
+    if (t.kind == K::Name) b.resize(name_prefix(b).size());  // namein's cut, from any typed string
+    return result(std::move(b));
+  }
   if (from == TypeClass::String) {
     const auto& b = std::get<Bytes>(arg.value);
     Constant text{std::monostate{}, SqlType{K::Text}, false, std::string(b.size(), '\0'), pos};  // typed: the cast's error
@@ -1256,7 +1302,10 @@ auto common_type(const std::vector<const Constant*>& parts, const std::string& w
         auto rank = [](SqlType t) { return t.kind == SqlKind::SmallInt ? 0 : t.kind == SqlKind::Integer ? 1 : 2; };
         if (rank(c->type) > rank(type)) type = c->type;
       }
-    } else if (type.kind != c->type.kind && !(is_string(type) && is_string(c->type))) {
+    } else if (type.kind != c->type.kind && is_string(type) && is_string(c->type)) {
+      name_union(first->type, c->type, what, pos);
+      type = SqlType{SqlKind::Text};
+    } else if (type.kind != c->type.kind) {
       not_yet(what + " of " + pg_type_name(type) + " and " + pg_type_name(c->type), pos);
     }
   }
@@ -1700,7 +1749,7 @@ auto fold(const ast::Expr& e) -> Constant {
     case K::Coalesce: return fold_coalesce(e);
     case K::NullIf: return fold_nullif(e);
     case K::Func: return fold_function(e);
-    case K::Clock: not_yet("CURRENT_DATE, LOCALTIME and LOCALTIMESTAMP other than as a select-list value", e.pos);
+    case K::Clock: refuse_clock(e, "other than as a select-list value");
     case K::Column:
     case K::Param:
     case K::Aggregate:
@@ -1844,6 +1893,7 @@ auto coerce_value(const Constant& k, const Column& c, bool assigned, std::string
     }
     case SqlKind::Text:
     case SqlKind::Char:
+    case SqlKind::Name:
     case SqlKind::Varchar: {
       auto t = to_text(Datum{v}, numeric_type(scale));
       auto bytes = std::as_bytes(std::span{t.data(), t.size()});
@@ -1938,9 +1988,14 @@ auto param_count(const ast::Statement& stmt) -> std::uint32_t {
   return n;
 }
 
-// A clock function by its SQL name, and the type it gives.
+// A clock or session function by its SQL name, and the type it gives.
+// CURRENT_ROLE and USER are CURRENT_USER, as in PostgreSQL.
 auto clock_fn(const std::string& name, std::int32_t pos) -> ClockDefault::Fn {
   using F = ClockDefault::Fn;
+  if (name == "current_user" || name == "current_role" || name == "user") return F::CurrentUser;
+  if (name == "session_user") return F::SessionUser;
+  if (name == "current_catalog") return F::CurrentCatalog;
+  if (name == "current_schema") return F::CurrentSchema;
   if (name == "current_date") return F::CurrentDate;
   if (name == "current_timestamp") return F::CurrentTimestamp;
   if (name == "localtime") return F::LocalTime;
@@ -1955,8 +2010,43 @@ auto clock_type(ClockDefault::Fn fn) -> SqlType {
     case F::CurrentTimestamp: return SqlType{SqlKind::TimestampTz};
     case F::LocalTime: return SqlType{SqlKind::Time};
     case F::LocalTimestamp: return SqlType{SqlKind::Timestamp};
+    case F::CurrentUser:
+    case F::SessionUser:
+    case F::CurrentCatalog:
+    case F::CurrentSchema: return SqlType{SqlKind::Name};
   }
   return SqlType{SqlKind::Timestamp};
+}
+
+auto is_session_fn(ClockDefault::Fn fn) -> bool { return fn >= ClockDefault::Fn::CurrentUser; }
+
+
+// The slot a function's reading fills: a session function's by what it
+// reads, the clock's by the type it is read as.
+auto clock_slot_kind(ClockDefault::Fn fn, SqlKind as) -> ClockSlot::Kind {
+  using Kind = ClockSlot::Kind;
+  using F = ClockDefault::Fn;
+  switch (fn) {
+    case F::CurrentUser:
+    case F::SessionUser: return Kind::User;
+    case F::CurrentCatalog: return Kind::Catalog;
+    case F::CurrentSchema: return Kind::Schema;
+    case F::CurrentDate:
+    case F::CurrentTimestamp:
+    case F::LocalTime:
+    case F::LocalTimestamp: break;
+  }
+  return as == SqlKind::Date          ? Kind::Date
+         : as == SqlKind::Time        ? Kind::Time
+         : as == SqlKind::TimestampTz ? Kind::TimestampTz
+                                      : Kind::Timestamp;
+}
+
+// A placeholder for a reading's slot, of its physical type: never the
+// statement's value (ClockSlot).
+auto clock_placeholder(SqlType t) -> Datum {
+  if (phys_type(t) == PhysType::Bytes) return Bytes{};
+  return std::int64_t{0};
 }
 
 // The clock's reading assigned to a column of `t`, as PostgreSQL's
@@ -1968,7 +2058,9 @@ auto clock_default(const std::string& name, std::int64_t precision, SqlType t, c
                    std::int32_t pos) -> ClockDefault {
   auto fn = clock_fn(name, pos);
   if (!clock_assignable(fn, t.kind)) {
-    auto temporal = type_class(t.kind) == TypeClass::Temporal || t.kind == SqlKind::Text || t.kind == SqlKind::Varchar;
+    auto temporal = !is_session_fn(fn) &&
+                    (type_class(t.kind) == TypeClass::Temporal || t.kind == SqlKind::Text || t.kind == SqlKind::Varchar ||
+                     t.kind == SqlKind::Name);
     if (temporal) not_yet("the clock's " + pg_type_name(clock_type(fn)) + " assigned to a " + pg_type_name(t) + " column", pos);
     throw SqlError{"column \"" + column + "\" is of type " + pg_type_name(t) + " but default expression is of type " +
                        pg_type_name(clock_type(fn)),
@@ -2129,42 +2221,30 @@ public:
     fixed_sql_.push_back(t);
     return logical::param(n, t);
   }
-  // CURRENT_DATE, LOCALTIME or LOCALTIMESTAMP: a constant slot the runtime
-  // fills with the statement's time on every run.
+  // CURRENT_DATE, LOCALTIME or LOCALTIMESTAMP, or a session function
+  // (CURRENT_USER, …): a constant slot the runtime fills with the
+  // statement's time, or the session's name, on every run.
   auto clock(const ast::Expr& e) -> logical::Output {
-    using Kind = ClockSlot::Kind;
-    if (e.func == "current_time") {
-      not_yet("CURRENT_TIME: TIME WITH TIME ZONE, which the layer lacks; LOCALTIME is supported", e.pos);
-    }
+    auto fn = clock_fn(e.func, e.pos);
     // PostgreSQL warns and uses 6 for a larger precision.
     auto precision = static_cast<std::uint8_t>(e.constant < 0 || e.constant > 6 ? 6 : e.constant);
-    auto kind = e.func == "current_date"        ? Kind::Date
-                : e.func == "localtime"         ? Kind::Time
-                : e.func == "current_timestamp" ? Kind::TimestampTz
-                                                : Kind::Timestamp;
-    auto type = SqlType{kind == Kind::Date   ? SqlKind::Date
-                        : kind == Kind::Time ? SqlKind::Time
-                        : kind == Kind::TimestampTz ? SqlKind::TimestampTz
-                                                    : SqlKind::Timestamp};
-    // 0 is a placeholder, never the statement's value: no rewrite may fold
-    // or range-check it, as the API replaces it on every run (ClockSlot).
-    auto expr = fixed(std::int64_t{0}, type);
-    clocks_.push_back({expr.param - own_params_, kind, precision});
+    auto type = clock_type(fn);
+    // A placeholder, never the statement's value: no rewrite may fold or
+    // range-check it, as the API replaces it on every run (ClockSlot).
+    auto expr = fixed(clock_placeholder(type), type);
+    clocks_.push_back({expr.param - own_params_, clock_slot_kind(fn, type.kind), precision});
     return {std::move(expr), e.column.empty() ? e.func : e.column};
   }
   // The statement's reading of the clock as a column of `target`'s type
   // takes it (clock_assignable): a parameter the API fills on each run, as
   // it fills a clock in a select list.
   auto clock_reading(ClockDefault d, const Column& target) -> logical::Expr {
-    using Kind = ClockSlot::Kind;
-    auto kind = target.sql.kind == SqlKind::Date          ? Kind::Date
-                : target.sql.kind == SqlKind::Time        ? Kind::Time
-                : target.sql.kind == SqlKind::TimestampTz ? Kind::TimestampTz
-                                                          : Kind::Timestamp;
-    // 0 is a placeholder, never the statement's value: no rewrite may fold
-    // or range-check it, as the API replaces it on every run (ClockSlot).
-    auto expr = fixed(std::int64_t{0}, target.sql);
-    clocks_.push_back({expr.param - own_params_, kind, d.precision});
+    // A placeholder, never the statement's value: no rewrite may fold or
+    // range-check it, as the API replaces it on every run (ClockSlot). A
+    // session function's NAME is checked as it is written into the column
+    // (a VARCHAR(n) too short is 22001), as PostgreSQL's assignment cast.
+    auto expr = fixed(clock_placeholder(target.sql), target.sql);
+    clocks_.push_back({expr.param - own_params_, clock_slot_kind(d.fn, target.sql.kind), d.precision});
     return expr;
   }
   [[nodiscard]] auto take_clocks() -> std::vector<ClockSlot> { return std::move(clocks_); }
@@ -2595,6 +2675,18 @@ public:
         // taken yet.
         if (!param_cast(e)) {
           if (e.rhs->kind == K::Column && resolve(*e.rhs).second->sql.kind == SqlKind::Numeric) refuse_numeric("a cast of a NUMERIC", e.pos);
+          // A NAME, TEXT or VARCHAR to TEXT (or VARCHAR of no length), or a
+          // NAME to NAME, keeps its bytes: a relabelling, as PostgreSQL's
+          // binary-coercible cast.
+          // VARCHAR without a length is TEXT, as everywhere in the layer.
+          if (e.cast_typmods.empty() && (e.cast_type == "text" || e.cast_type == "varchar" || e.cast_type == "name")) {
+            auto v = value(*e.rhs, resolve);
+            auto to = e.cast_type == "name" ? SqlKind::Name : SqlKind::Text;
+            if (to == SqlKind::Text ? is_string(v.type) : v.type.kind == SqlKind::Name) {
+              v.type = SqlType{to};
+              return v;
+            }
+          }
           not_yet("a cast of other than a constant or a parameter", e.pos);
         }
         if (e.cast_type == "numeric" && e.cast_typmods.empty()) refuse_numeric("a cast of a parameter to NUMERIC", e.pos);
@@ -2630,7 +2722,9 @@ public:
         throw SqlError{what + " types " + pg_type_name(type) + " and " + pg_type_name(t) + " cannot be matched", pos, kDatatypeMismatch};
       }
       if (type_class(type.kind) == TypeClass::String) {
-        type = SqlType{SqlKind::Text};
+        name_union(known.front(), t, what, pos);
+        // NAMEs alone stay a NAME, as PostgreSQL resolves them.
+        if (type.kind != SqlKind::Name || t.kind != SqlKind::Name) type = SqlType{SqlKind::Text};
       } else if (type_class(type.kind) == TypeClass::Number) {
         // NUMERICs alone are carried as their text; with another number the
         // result is computed, a cast, which is not built yet.
@@ -2683,7 +2777,7 @@ public:
   }
 
   auto function_value(const ast::Expr& e, const Resolve& resolve) -> logical::Expr {
-    auto texty = [](SqlType t) { return t.kind == SqlKind::Text || t.kind == SqlKind::Varchar || t.kind == SqlKind::Char; };
+    auto texty = [](SqlType t) { return holds_string(t); };
     auto exact = [](SqlType t) {
       return t.kind == SqlKind::SmallInt || t.kind == SqlKind::Integer || t.kind == SqlKind::BigInt || t.kind == SqlKind::Decimal;
     };
@@ -2971,6 +3065,7 @@ public:
       case SqlKind::Text:
       case SqlKind::Varchar:
       case SqlKind::Char:
+      case SqlKind::Name:
       case SqlKind::Bytea:
       case SqlKind::Timestamp:
       case SqlKind::TimestampTz:
@@ -3116,7 +3211,7 @@ public:
     switch (e.kind) {
       case K::Param: throw SqlError{"there is no parameter $" + std::to_string(e.param + 1), e.pos, kUndefinedParameter};
       case K::Subquery: not_yet("a subquery in a procedure's expression", e.pos);
-      case K::Clock: not_yet("CURRENT_DATE, LOCALTIME and LOCALTIMESTAMP in a procedure's expression", e.pos);
+      case K::Clock: refuse_clock(e, "in a procedure's expression");
       case K::Aggregate: throw SqlError{"aggregate functions are not allowed here", e.pos, kGroupingError};
       case K::Star: throw SqlError{"syntax error at or near \"*\"", e.pos};
       case K::Column:
@@ -3150,7 +3245,7 @@ public:
     switch (e.kind) {
       case K::Param: throw SqlError{"there is no parameter $" + std::to_string(e.param + 1) + " in a CHECK constraint", e.pos, kUndefinedParameter};
       case K::Subquery: not_yet("a subquery in a CHECK constraint", e.pos);
-      case K::Clock: not_yet("CURRENT_DATE, LOCALTIME and LOCALTIMESTAMP in a CHECK constraint", e.pos);
+      case K::Clock: refuse_clock(e, "in a CHECK constraint");
       case K::Aggregate: throw SqlError{"aggregate functions are not allowed in check constraints", e.pos, kGroupingError};
       case K::Star: throw SqlError{"syntax error at or near \"*\"", e.pos};
       case K::Column:
@@ -3416,7 +3511,8 @@ public:
       case SqlKind::Real: return {false, kSyntaxError};
       case SqlKind::Text:
       case SqlKind::Varchar:
-      case SqlKind::Char: return {false, sum ? kUndefinedFunction : kSyntaxError};
+      case SqlKind::Char:
+      case SqlKind::Name: return {false, sum ? kUndefinedFunction : kSyntaxError};
       case SqlKind::Boolean:
       case SqlKind::Bytea: return {false, kUndefinedFunction};
       case SqlKind::Timestamp:
@@ -3895,7 +3991,11 @@ public:
       return logical::compare(op, logical::column_of(table, *c), fixed(std::move(v), c->sql));
     }
     if (col->kind == ast::Expr::Kind::Clock || rhs->kind == ast::Expr::Kind::Clock) {
-      not_yet("comparing the time with a constant, a parameter or the time", w.pos);
+      const auto& k = col->kind == ast::Expr::Kind::Clock ? *col : *rhs;
+      if (clock_words(k).starts_with("CURRENT_DATE")) not_yet("comparing the time with a constant, a parameter or the time", w.pos);
+      // The planner plans a WHERE conjunct that compares a column; one that
+      // compares none is not built yet, so neither is this.
+      not_supported("comparing " + clock_words(k) + " in WHERE or ON with other than a column", w.pos);
     }
     if (col->kind != ast::Expr::Kind::Column || !operand(*rhs)) {
       throw SqlError{std::string{w.on ? "ON" : "WHERE"} + " must compare a column with a parameter or a constant", w.pos};
@@ -3928,6 +4028,8 @@ public:
   auto compared_clock(const ast::Expr& clock, const Column& c, bool clock_first, const ast::Compare& w) -> logical::Expr {
     using F = ClockDefault::Fn;
     auto fn = clock_fn(clock.func, clock.pos);
+    // A session function's NAME with a string column: compared as text.
+    if (is_session_fn(fn) && holds_string(c.sql)) return clock_reading(ClockDefault{fn, 0}, c);
     auto stamp = [](SqlKind k) { return k == SqlKind::Timestamp || k == SqlKind::TimestampTz; };
     auto clock_stamp = fn == F::CurrentTimestamp || fn == F::LocalTimestamp;
     auto same = (c.sql.kind == SqlKind::Date && fn == F::CurrentDate) || (c.sql.kind == SqlKind::Time && fn == F::LocalTime) ||
@@ -4529,7 +4631,10 @@ public:
         targets.push_back(plain_output(e, resolve));
         continue;
       }
-      if (e.kind == ast::Expr::Kind::Clock) not_yet("the time in the select list of an aggregated query", e.pos);
+      if (e.kind == ast::Expr::Kind::Clock) {
+        if (clock_words(e).starts_with("CURRENT_DATE")) not_yet("the time in the select list of an aggregated query", e.pos);
+        refuse_clock(e, "in the select list of an aggregated query");
+      }
       if (is_constant(e) || e.kind == ast::Expr::Kind::Subquery) {
         not_yet(std::string{e.kind == ast::Expr::Kind::Subquery ? "a subquery" : "a constant"} +
                     " in the select list of an aggregated query",
@@ -4930,7 +5035,9 @@ public:
     }
     if (a.kind == SqlKind::Decimal && b.kind == SqlKind::Decimal && a.scale == b.scale) return numeric_type(a.scale);
     if (is_string(a) && is_string(b)) {
+      name_union(a, b, what, pos);
       if (a.kind == SqlKind::Varchar && b.kind == SqlKind::Varchar) return SqlType{SqlKind::Varchar};
+      if (a.kind == SqlKind::Name && b.kind == SqlKind::Name) return SqlType{SqlKind::Name};
       return SqlType{SqlKind::Text};
     }
     refuse(pg_type_name(a) + " and " + pg_type_name(b));
@@ -5034,6 +5141,10 @@ public:
                   : e.kind == ast::Expr::Kind::NullIf                   ? std::string{"nullif"}
                   : e.kind == ast::Expr::Kind::Func && e.func != "||" && e.func != "%" ? e.func
                   : param_cast(e)                                       ? e.cast_type
+                  // x::T is named by x, as PostgreSQL names it.
+                  : e.kind == ast::Expr::Kind::Cast && e.rhs->kind == ast::Expr::Kind::Column ? e.rhs->column
+                  : e.kind == ast::Expr::Kind::Cast && e.rhs->kind == ast::Expr::Kind::Clock
+                      ? (e.rhs->column.empty() ? e.rhs->func : e.rhs->column)
                                                                         : std::string{"?column?"};
       return {value(e, resolve), name};
     }
@@ -6378,7 +6489,7 @@ auto assignable(SqlType from, SqlType to) -> bool {
   if (phys_type(from) != phys_type(to) || decimal_scale(from) != decimal_scale(to)) return false;
   auto family = [](SqlKind k) {
     if (k == SqlKind::SmallInt || k == SqlKind::Integer || k == SqlKind::BigInt) return 1;
-    if (k == SqlKind::Text || k == SqlKind::Varchar) return 2;
+    if (k == SqlKind::Text || k == SqlKind::Varchar || k == SqlKind::Name) return 2;
     return 0;
   };
   return from.kind == to.kind || (family(from.kind) != 0 && family(from.kind) == family(to.kind));
@@ -6752,6 +6863,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat, std::span<const SqlTyp
           if (!s.column.references.empty()) not_yet("ADD COLUMN … REFERENCES", s.column.pos);
           if (!s.column.checks.empty()) not_yet("ADD COLUMN … CHECK", s.column.pos);
           // Plans compiled before it fill a new column with its stored default.
+          if (is_session_name(s.column.default_clock)) not_supported("ADD COLUMN … DEFAULT of a session function", s.column.pos);
           if (!s.column.default_clock.empty()) not_yet("ADD COLUMN … DEFAULT of the clock", s.column.pos);
           auto spec = column_spec(s.column);
           if (!spec.nullable && std::holds_alternative<std::monostate>(spec.default_value)) {

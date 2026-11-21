@@ -52,6 +52,13 @@ column's stored constant default stays null, since the binder, not
   is refused.
 - **`ADD COLUMN`.** It is refused with one: plans compiled before it fill a
   new column from the stored default.
+- **A session function** (`CURRENT_USER`, `CURRENT_ROLE` and `USER`, all
+  `CurrentUser`; `SESSION_USER`; `CURRENT_CATALOG`; `CURRENT_SCHEMA`) is a
+  `ClockDefault` too, functions 5 to 8 after the clock's 1 to 4, its
+  precision unused. Its value is a `name`, so a `NAME`, `TEXT`,
+  `VARCHAR(n)` or `CHAR(n)` column takes one and no other; load refuses
+  one on another type, as it refuses the clock's (`frontend_design.md`,
+  *Session functions*).
 
 ## Serialization
 

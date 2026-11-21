@@ -23,6 +23,7 @@
 #include <random>
 #include <span>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 import bytecask.sql.row_codec;
@@ -927,4 +928,24 @@ TEST_CASE("row format: var_end entries are 2 bytes up to 64 KiB of variable data
     CHECK(row_column(row, *layout.find(2)).bytes.size() == 1);
     CHECK(row_column(row, *layout.find(0)).i64() == 7);
   }
+}
+
+TEST_CASE("row codec: a NAME is cut to 63 bytes at a character boundary, as it is stored", "[sql][codec][name]") {
+  auto b = [](std::string_view s) { return std::as_bytes(std::span{s.data(), s.size()}); };
+  CHECK(name_prefix(b("abc")).size() == 3);
+  CHECK(name_prefix(b(std::string(63, 'x'))).size() == 63);
+  CHECK(name_prefix(b(std::string(64, 'x'))).size() == 63);
+  std::string e;
+  for (int k = 0; k < 40; ++k) e += "\xC3\xA9";
+  CHECK(name_prefix(b(e)).size() == 62);  // the 32nd é would be cut in two
+  std::string f = std::string(61, 'x') + "\xE2\x82\xAC";  // € at bytes 61..63
+  CHECK(name_prefix(b(f)).size() == 61);
+  auto layout = make_layout(std::vector<ColumnDef>{ColumnDef{0, SqlType{SqlKind::Name}, true}});
+  RowWriter w{layout};
+  CHECK(w.set_bytes(0, b(std::string(70, 'n'))));
+  Bytes row;
+  REQUIRE(w.finish(row));
+  auto got = row_column(row, layout.columns.at(0));
+  REQUIRE(got.state == ColumnState::Value);
+  CHECK(got.bytes.size() == 63);
 }

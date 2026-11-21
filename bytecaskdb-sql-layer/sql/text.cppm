@@ -939,6 +939,7 @@ auto to_text(const Datum& v, SqlType t) -> std::string {
             case SqlKind::Text:
             case SqlKind::Varchar:
             case SqlKind::Char:
+            case SqlKind::Name:
             case SqlKind::Numeric: return std::to_string(x);
           }
           return std::to_string(x);
@@ -959,6 +960,12 @@ auto from_text(std::string_view text, SqlType t, bool assigned_only) -> Datum {
     case SqlKind::Text:
     case SqlKind::Char:
     case SqlKind::Varchar: return text_bytes(text);
+    case SqlKind::Name: {
+      // Cut to its 63 bytes, as namein reads it.
+      auto b = text_bytes(text);
+      b.resize(name_prefix(b).size());
+      return b;
+    }
     case SqlKind::Decimal: return decimal_from(text, t.scale, assigned_only);
     case SqlKind::Timestamp: return timestamp_from(text);
     case SqlKind::TimestampTz: return timestamptz_from(text);

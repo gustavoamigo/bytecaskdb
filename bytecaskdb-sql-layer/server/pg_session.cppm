@@ -820,13 +820,20 @@ private:
     }
   }
 
+  // A transaction of the session's user.
+  [[nodiscard]] auto txn_options() const -> TransactionOptions {
+    TransactionOptions o;
+    o.user = user_;
+    return o;
+  }
+
   // The options a statement runs with: the session's cancel flag (cleared
   // when its command's first message was taken, step()), and the earlier of
   // the statement's and its transaction's deadlines. A statement outside a
   // block is its own transaction.
   auto run_options() -> ExecutionOptions {
     auto now = std::chrono::steady_clock::now();
-    ExecutionOptions opts{.deadline = {}, .cancel = &cancel_};
+    ExecutionOptions opts{.deadline = {}, .cancel = &cancel_, .user = user_};
     txn_deadline_ = {};
     if (cfg_.statement_timeout.count() > 0) opts.deadline = now + cfg_.statement_timeout;
     if (cfg_.transaction_timeout.count() > 0) {
@@ -1004,6 +1011,7 @@ private:
     status("standard_conforming_strings", "on");
     status("is_superuser", "off");
     status("session_authorization", *user);
+    user_ = *user;
     status("application_name", application_name_);
     if (cfg_.cancels != nullptr) {
       auto key = cfg_.cancels->add(cancel_);
@@ -1139,7 +1147,7 @@ private:
           txn_ = std::move(implicit_);  // BEGIN inside an implicit block makes it explicit
           implicit_.reset();
         } else {
-          txn_.emplace(db_.begin());
+          txn_.emplace(db_.begin(txn_options()));
           txn_started_ = std::chrono::steady_clock::now();
           start_modes();
         }
@@ -1299,7 +1307,7 @@ private:
     const auto none = ResultCheck::none();
     if (in_block_) return txn_->open_cursor(d.query, none, params, kind, scrolling);
     if (implicit_) return implicit_->open_cursor(d.query, none, params, kind, scrolling);
-    auto t = db_.begin();
+    auto t = db_.begin(txn_options());
     auto cursor = t.open_cursor(d.query, none, params, kind, scrolling);
     (void)t.commit();
     return cursor;
@@ -1315,7 +1323,7 @@ private:
     try {
       if (in_block_) return txn_->execute_current_of(sql, check, params, cursor.cursor, opts);
       if (implicit_) return implicit_->execute_current_of(sql, check, params, cursor.cursor, opts);
-      auto t = db_.begin();
+      auto t = db_.begin(txn_options());
       auto rows = t.execute_current_of(sql, check, params, cursor.cursor, opts);
       (void)t.commit();
       return rows;
@@ -1742,7 +1750,7 @@ private:
           break;
         case Lookahead::Other:
           // Two or more: PostgreSQL's implicit transaction, committed at Sync.
-          implicit_.emplace(db_.begin());
+          implicit_.emplace(db_.begin(txn_options()));
           txn_started_ = std::chrono::steady_clock::now();
           start_modes();
           block_used_ = true;
@@ -1832,6 +1840,9 @@ private:
   std::deque<Input> queue_;
   Out out_;
   std::string application_name_;
+  // The startup packet's user: what CURRENT_USER and SESSION_USER return.
+  // Every session is the bootstrap superuser, whatever it names.
+  std::string user_;
   std::string encoding_{"UTF8"};  // client_encoding, as ParameterStatus reports it
   std::string last_text_;         // the statement an error's position is into
   std::map<std::string, Prepared> statements_;

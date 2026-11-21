@@ -2578,6 +2578,33 @@ def test_a_portal_bound_in_a_block_before_a_ddl_runs_at_the_pin(server):
     q(c, "COMMIT")
 
 
+def test_session_functions_are_the_startup_user_and_the_served_database_as_names(server):
+    """CURRENT_USER and SESSION_USER are the startup packet's user, CURRENT_CATALOG
+    the --database name, CURRENT_SCHEMA public; each a name (OID 19), as a NAME
+    column is."""
+    c = connect(server)
+    sql = "SELECT CURRENT_USER, SESSION_USER, CURRENT_CATALOG, CURRENT_SCHEMA"
+    c.send(parse(sql, "s"), describe("S", "s"), SYNC)
+    assert row_description(c.until_ready()[2][1]) == [("current_user", 19), ("session_user", 19),
+                                                      ("current_catalog", 19), ("current_schema", 19)]
+    assert data(run(c, sql)) == [["wire", "wire", "proof", "public"]]
+    q(c, "CREATE TABLE n (k NAME PRIMARY KEY, u NAME DEFAULT CURRENT_USER, i INTEGER)")
+    q(c, "INSERT INTO n (k, i) VALUES ('x', 1)")
+    # A $n compared with a NAME is typed name, and cut to 63 bytes.
+    c.send(parse("SELECT u FROM n WHERE k = $1", "p"), describe("S", "p"), SYNC)
+    assert struct.unpack("!hi", c.until_ready()[1][1]) == (1, 19)
+    assert data(run(c, "SELECT u FROM n WHERE k = $1", ["x"])) == [["wire"]]
+    long = "é" + "a" * 70  # 72 bytes: the cut keeps 63
+    run(c, "INSERT INTO n (k, i) VALUES ($1, 2)", [long])
+    assert data(run(c, "SELECT octet_length(k), i FROM n WHERE k = $1", [long])) == [["63", "2"]]
+    # A session-function DEFAULT inside a BEGIN block is read per row.
+    q(c, "BEGIN")
+    q(c, "INSERT INTO n (k, i) VALUES ('y', 3)")
+    assert data(run(c, "SELECT u FROM n WHERE k = $1", ["y"])) == [["wire"]]
+    q(c, "COMMIT")
+    assert data(run(c, "SELECT u, i FROM n WHERE k = $1", ["y"])) == [["wire", "3"]]
+
+
 def test_a_parsed_statement_keeps_its_parameter_types(server):
     """$1 fixed as int4 at Parse: a Bind after the column became a DATE is
     42883, as PostgreSQL's revalidation reports it, while a Simple Query of

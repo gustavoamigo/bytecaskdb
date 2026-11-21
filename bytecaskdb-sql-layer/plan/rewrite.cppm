@@ -81,6 +81,7 @@ auto exact_scale(const SqlType& t) -> std::optional<std::uint8_t> {
     case SqlKind::Text:
     case SqlKind::Varchar:
     case SqlKind::Char:
+    case SqlKind::Name:
     case SqlKind::Timestamp:
     case SqlKind::TimestampTz:
     case SqlKind::Date:
