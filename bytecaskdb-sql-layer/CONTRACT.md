@@ -4,7 +4,8 @@ What the SQL layer guarantees, and what it does not yet. *Definitions* and
 *Conditions* come first, then one table per area: each row is one
 guarantee, and its second cell names what fails if the row is broken: the
 Catch2 tests of the layer, by name; the proof tests against PostgreSQL
-(`tests/proof/`, as "proof: " and the pytest name); or none.
+(`tests/proof/`, as "proof: " and the pytest name); a check script, by its
+path; or none.
 
 The test for every sentence here: if it could change while every guarantee
 stays the same, it is mechanism and belongs in [`docs/`](docs/), not here.
@@ -273,7 +274,7 @@ to libpq clients over protocol 3.0. "wire:" names a test in
 | Serializable conflict detection only with hand-written guards (`bc_guard_unchanged`, `bc_guard_range`) over what a plan reads and does not write; generated statements emit none beyond the unique checks'. | "plan API: count_range, del_range and the guards reach the engine", "codegen: FOR UPDATE guards the key of every row it returns, read from the row" |
 | A unique index is enforced by a check of its prefix on the snapshot and a range guard over it, so a concurrent insert of the same key is a conflict, and its retry reports the duplicate. | "tcc: a unique insert raced by another commit conflicts, and its retry reports the duplicate" |
 | `BC_CONFLICT` is retried automatically, for autocommit statements only, a bounded number of times. | "tcc: a unique insert raced by another commit conflicts, and its retry reports the duplicate" |
-| Isolation against concurrent histories of many statements is not checked by any tool yet. | none |
+| Concurrent histories of many statements, recorded through the embedded API, are checked nightly (`.github/workflows/sql-layer-isolation-nightly.yml`). Transactions that read with FOR UPDATE what they do not write are strict-serializable on a list-append workload, and a range of keys they scan whole and delete from when they saw two or more never becomes empty. Plain reads are snapshot isolation, whose only anomaly is write skew. In every configuration each read agrees with the writes that committed around it, and the final state holds exactly what committed. Fixed. | `bytecaskdb-sql-layer/scripts/sql_isolation_check.py` (nightly), and its range check on hand-made histories, `bytecaskdb-sql-layer/scripts/test_sql_isolation_check.py` |
 
 ---
 

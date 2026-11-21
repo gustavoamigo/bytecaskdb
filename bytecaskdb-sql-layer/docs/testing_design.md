@@ -558,11 +558,15 @@ consistency conditions` is a Catch2 test in `sql_layer_tests`. It loads two ware
 at a tiny scale, then runs four threads for a few hundred transactions. It
 requires that every type in the mix completed at least once, that no
 error other than 40001 occurred, and that the consistency conditions hold.
-It is the only part CI runs: full runs and Elle are manual.
+It is the only part of the TPROC-C run CI runs: full runs are manual. Elle
+through SQL runs nightly, below.
 
-**Elle through SQL.** `elle` records a list-append history through SQL, in
-the engine harness's history format (`docs/isolation_checking_design.md`),
-and `scripts/sql_isolation_check.py` checks it with the engine's tooling:
+**Elle through SQL.** `elle` records a history through SQL, and
+`scripts/sql_isolation_check.py` checks it. It has two workloads,
+`--workload point` (the default) and `--workload range`, each in the
+three configurations below; the script runs both (`--workloads point,range`).
+The point workload is list-append, in the engine harness's history format
+(`docs/isolation_checking_design.md`), checked with the engine's tooling:
 `run_elle` and `cross_check` from `scripts/run_isolation_check.py`.
 - One table, `elle (k BIGINT PRIMARY KEY, v VARCHAR(2048))`. Each key holds
   its list as decimals separated by commas. Every key's row exists before
@@ -596,6 +600,49 @@ and `scripts/sql_isolation_check.py` checks it with the engine's tooling:
   other rule does apply: reads are prefixes, nothing failed is visible,
   every `:ok` append is there, and real-time visibility.
 
+**The range workload.** The engine's range workload's shape through SQL
+(`docs/isolation_checking_design.md`, *Range workload*), with its invariant:
+a range that held a key keeps one. Elle has no model for scans, and a SQL
+commit reports no sequence to replay, so the script checks it itself
+(`range_check`), with no commit order.
+- One table, `elle_r (k BIGINT PRIMARY KEY)`. 32 keys are split once, from
+  the seed, into ranges of 2 to 7 keys; range `b` owns the keys from
+  `b · 2²⁴` up, its first keys exist at the start, and an insert takes a
+  fresh key never taken before. Every key is born once and dies at most
+  once.
+- A transaction picks a range, inserts a fresh key into it a quarter of
+  the time, runs `SELECT k FROM elle_r WHERE k BETWEEN $1 AND $2` over the
+  whole range, and deletes one of the keys it saw when it saw two or more.
+  Two transactions that each delete one key of a two-key range, having read
+  the other's, are write skew: unguarded, both commit and the range is
+  empty.
+- The ranges are fixed, not drawn per transaction as in the engine's
+  workload, so the invariant is global: no serializable history ever shows
+  an empty range, and no commit order is needed to say so.
+- `guarded` scans with `FOR UPDATE`, so a concurrent delete of a key it saw
+  is 40001 at its commit. It must keep the invariant every round.
+- `unguarded` scans plainly, and `blind` runs each statement in
+  autocommit. Each must break the invariant at least once over the run: a
+  committed scan that saw none of its range's keys but its own insert, or
+  a range empty in the final read. This shows the check can see what
+  SERIALIZABLE must prevent.
+- In every configuration each committed scan (each scan, in `blind`) is
+  held to the writes around it: it shows no key outside its range, no key
+  whose insert did not take effect or began after the scan returned, none
+  deleted before its transaction began (before the scan statement, in
+  `blind`), and misses no key inserted before then whose delete had not
+  begun by the scan's return. The final read must hold exactly the keys the
+  applied writes leave live; a key with a write of unknown outcome is not
+  judged.
+- `scripts/test_sql_isolation_check.py` tests `range_check` on hand-made
+  histories.
+
+**Nightly.** `.github/workflows/sql-layer-isolation-nightly.yml`, its own workflow so that a pull request to the engine or to the layer runs only its own isolation check:
+a `releasedbg` build, two rounds of 5,000 transactions on 16 threads, over
+both workloads and all three configurations, with Elle. It also runs on a
+pull request that changes the harness or the script. A local run of the
+same budget takes under a minute.
+
 Commands:
 
 ```sh
@@ -603,5 +650,6 @@ xmake f -m releasedbg --sql_layer=y && xmake build sql_layer_tprocc
 sql_layer_tprocc load --dir /tmp/tprocc --warehouses 48
 sql_layer_tprocc run --dir /tmp/tprocc --threads 1,16,48 --duration 300 --warmup 60
 python3 bytecaskdb-sql-layer/scripts/sql_isolation_check.py \
-  --binary build/linux/x86_64/releasedbg/sql_layer_tprocc --elle-jar elle-cli.jar --rounds 4
+  --binary build/linux/x86_64/releasedbg/sql_layer_tprocc --elle-jar elle-cli.jar --rounds 4 \
+  [--workloads point,range]
 ```

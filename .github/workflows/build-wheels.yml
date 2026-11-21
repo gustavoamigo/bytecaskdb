@@ -49,6 +49,7 @@ on:
       - ".github/workflows/soak-nightly.yml"
       - ".github/workflows/sql-layer.yml"
       - ".github/workflows/sql-layer-hammerdb-nightly.yml"
+      - ".github/workflows/sql-layer-isolation-nightly.yml"
   pull_request:
     branches: [main]
     paths-ignore:
@@ -69,6 +70,7 @@ on:
       - ".github/workflows/soak-nightly.yml"
       - ".github/workflows/sql-layer.yml"
       - ".github/workflows/sql-layer-hammerdb-nightly.yml"
+      - ".github/workflows/sql-layer-isolation-nightly.yml"
   workflow_dispatch:
 
 # Required for GitHub Pages deployment.

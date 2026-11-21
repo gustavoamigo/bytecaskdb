@@ -1,0 +1,130 @@
+# SPDX-License-Identifier: MIT
+# The SQL layer's isolation check (bytecaskdb-sql-layer/docs/testing_design.md,
+# *The TPROC-C harness*): sql_layer_tprocc elle records the point
+# (list-append) and range (scans and deletes) workloads through SQL, guarded,
+# unguarded and blind, and bytecaskdb-sql-layer/scripts/sql_isolation_check.py
+# checks them with Elle and the range check. A short budget: guarded must be
+# strict-serializable and keep the range invariant; unguarded must show write
+# skew and an emptied range, and blind a lost update and an emptied range, at
+# least once over the run.
+#
+# Its own workflow, apart from the engine's isolation-nightly.yml, so that a PR
+# changing one side runs only its own check. It runs nightly, on manual
+# dispatch, and on every update of a PR that changes the harness or the check
+# itself. The run's seed is printed first; rerun with --seed to replay the
+# same workloads (thread interleaving still varies).
+
+name: SQL layer isolation nightly
+
+on:
+  schedule:
+    - cron: "40 4 * * *"
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: "Rounds (six histories each: point and range, three configurations)"
+        default: "2"
+      seed:
+        description: "Seed to replay (empty = random)"
+        default: ""
+  pull_request:
+    branches: [main]
+    paths:
+      - "bytecaskdb-sql-layer/harness/**"
+      - "bytecaskdb-sql-layer/scripts/sql_isolation_check.py"
+      - "bytecaskdb-sql-layer/scripts/test_sql_isolation_check.py"
+      - ".github/workflows/sql-layer-isolation-nightly.yml"
+
+permissions:
+  contents: read
+
+env:
+  # elle-cli publishes no releases; the jar is built from this commit and
+  # cached on it. Keep it equal to isolation-nightly.yml's, which shares the
+  # cache key.
+  ELLE_CLI_REF: 9c2a18b3719f573dab06ae05c955c9c9d5225673
+
+jobs:
+  sql-isolation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: fedora:43
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          # make and which: the libpg_query and TinyCC builds. nanobind:
+          # xmake f loads every target. graphviz: elle-cli renders the write
+          # skew unguarded is expected to show, and crashes without it.
+          dnf install -y \
+            clang llvm llvm-devel lld \
+            libcxx libcxx-devel libstdc++-static \
+            xmake make which \
+            python3-pip python3-devel \
+            git ninja-build \
+            java-21-openjdk-headless \
+            graphviz
+          pip3 install nanobind
+
+      - name: Cache elle-cli
+        id: elle-cache
+        uses: actions/cache@v4
+        with:
+          path: elle-cli.jar
+          key: elle-cli-${{ env.ELLE_CLI_REF }}
+
+      - name: Build elle-cli
+        if: steps.elle-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSLo /usr/local/bin/lein \
+            https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein
+          chmod +x /usr/local/bin/lein
+          git clone https://github.com/ligurio/elle-cli "$RUNNER_TEMP/elle-cli"
+          cd "$RUNNER_TEMP/elle-cli"
+          git checkout "$ELLE_CLI_REF"
+          lein uberjar
+          cp target/elle-cli-*-standalone.jar "$GITHUB_WORKSPACE/elle-cli.jar"
+
+      # libpg_query and TinyCC are built from source by xmake; sql-layer.yml's key.
+      - name: Cache xmake packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.xmake/packages
+          key: xmake-packages-sql-layer-fedora43-${{ hashFiles('xmake.lua', 'bytecaskdb-sql-layer/xmake.lua') }}
+
+      - name: Configure xmake
+        run: |
+          RESOURCE_DIR=$(clang --print-resource-dir)
+          xmake f --toolchain=clang \
+            --cxflags="-resource-dir=${RESOURCE_DIR}" \
+            --sql_layer=y -m releasedbg -y
+
+      - name: Build
+        run: xmake build -y sql_layer_tprocc
+
+      - name: Unit tests of the range check
+        run: python3 -m unittest bytecaskdb-sql-layer/scripts/test_sql_isolation_check.py -v
+
+      - name: Run the SQL isolation check
+        env:
+          ROUNDS: ${{ github.event.inputs.rounds || '2' }}
+          SEED: ${{ github.event.inputs.seed || '' }}
+        run: |
+          ARGS="--binary build/linux/x86_64/releasedbg/sql_layer_tprocc"
+          ARGS="$ARGS --elle-jar elle-cli.jar --workloads point,range --rounds $ROUNDS"
+          ARGS="$ARGS --txns 5000 --threads 16 --out $RUNNER_TEMP/sql-isolation"
+          if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
+          python3 bytecaskdb-sql-layer/scripts/sql_isolation_check.py $ARGS
+
+      - name: Upload histories and Elle output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sql-isolation-failure
+          path: ${{ runner.temp }}/sql-isolation
+          if-no-files-found: warn

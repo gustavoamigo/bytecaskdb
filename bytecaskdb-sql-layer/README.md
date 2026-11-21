@@ -91,10 +91,11 @@ The layer is part of the build only with `--sql_layer=y`, so building the engine
 | Proof machine: random statements against PostgreSQL 17 | `BYTECASK_SQL_ORACLE=... pytest tests/proof` (needs `bytecask_sql`) |
 | Wire protocol | `BYTECASK_SQL_SERVER=... pytest tests/server` |
 | Functional suite: fixed cases over the wire, and a conformance report | `BYTECASK_SQL_SERVER=... pytest tests/functional`, then `--conformance --results=results.json` and `tests/functional/report.py` |
-| TPROC-C in process: five transactions, consistency conditions 1–9, Elle histories | `sql_layer_tprocc` |
+| TPROC-C in process: five transactions, consistency conditions 1–9 | `sql_layer_tprocc` |
+| Isolation of concurrent transactions: point (Elle) and range histories, guarded, unguarded and blind | `scripts/sql_isolation_check.py` over `sql_layer_tprocc elle`; nightly in CI |
 | HammerDB gate | `hammerdb/run-gate.sh`; `--smoke` nightly in CI |
 
-CI is `.github/workflows/sql-layer.yml`, with the sanitizers (ASan, TSan, UBSan) on the C++ tests.
+CI is `.github/workflows/sql-layer.yml`, with the sanitizers (ASan, TSan, UBSan) on the C++ tests; the isolation check is `.github/workflows/sql-layer-isolation-nightly.yml`.
 
 ## Where things are
 

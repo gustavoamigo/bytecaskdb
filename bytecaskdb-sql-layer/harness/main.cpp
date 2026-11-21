@@ -6,7 +6,8 @@
 //
 //   sql_layer_tprocc load --dir D [--warehouses W] [--seed N] [--sql-out FILE]
 //   sql_layer_tprocc run  --dir D [--threads 1,16,48] [--warmup S] [--duration S] [--seed N] [--json FILE]
-//   sql_layer_tprocc elle --dir D --config guarded|unguarded|blind [--threads N] [--txns N] [--seed N] --out FILE
+//   sql_layer_tprocc elle --dir D --config guarded|unguarded|blind [--workload point|range] [--threads N] [--txns N]
+//                         [--seed N] --out FILE
 //   sql_layer_tprocc check --dir D
 //   sql_layer_tprocc next-run --dir D
 //   sql_layer_tprocc procs --dir D --file hammerdb/tprocc_procs.sql
@@ -175,6 +176,10 @@ auto run_main(int argc, char** argv) -> int {
                   : config == "unguarded" ? tprocc::ElleConfig::Unguarded
                   : config == "blind"     ? tprocc::ElleConfig::Blind
                                           : throw std::invalid_argument("--config is guarded, unguarded or blind");
+    const auto workload = get(f, "workload", "point");
+    opts.workload = workload == "point"   ? tprocc::ElleWorkload::Point
+                    : workload == "range" ? tprocc::ElleWorkload::Range
+                                          : throw std::invalid_argument("--workload is point or range");
     opts.threads = number<std::size_t>(f, "threads", "8");
     opts.txns = number<std::uint64_t>(f, "txns", "2000");
     opts.seed = number<std::uint64_t>(f, "seed", "1");
