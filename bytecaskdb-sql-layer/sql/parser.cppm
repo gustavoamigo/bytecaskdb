@@ -57,6 +57,10 @@ export namespace bytecask::sql::ast {
 // statement. Throws SqlError as parse() does.
 [[nodiscard]] auto parse_savepoint(std::string_view sql) -> std::optional<SavepointStatement>;
 
+// Parses a SET, RESET or SHOW of a run-time parameter; nullopt for any other
+// statement. Throws SqlError as parse() does.
+[[nodiscard]] auto parse_variable(std::string_view sql) -> std::optional<VariableStatement>;
+
 // Throws SqlError for what PostgreSQL's raw parser refuses, a syntax error,
 // and nothing else: what an aborted transaction reports before 25P02, where
 // PostgreSQL's parse analysis (42P16 for two primary keys, say) and the
@@ -2403,6 +2407,57 @@ auto parse_savepoint(std::string_view sql) -> std::optional<SavepointStatement> 
   if (t->kind == PG_QUERY__TRANSACTION_STMT_KIND__TRANS_STMT_ROLLBACK_TO) return SavepointStatement{Kind::RollbackTo, t->savepoint_name};
   if (t->kind == PG_QUERY__TRANSACTION_STMT_KIND__TRANS_STMT_RELEASE) return SavepointStatement{Kind::Release, t->savepoint_name};
   return std::nullopt;
+}
+
+auto parse_variable(std::string_view sql) -> std::optional<VariableStatement> {
+  std::string text{sql};
+  ParseResources res;
+  res.raw = pg_query_parse_protobuf(text.c_str());
+  if (res.raw.error != nullptr) {
+    reject(res.raw.error->message, res.raw.error->cursorpos > 0 ? res.raw.error->cursorpos - 1 : -1);
+  }
+  res.tree = pg_query__parse_result__unpack(nullptr, res.raw.parse_tree.len,
+                                            reinterpret_cast<const std::uint8_t*>(res.raw.parse_tree.data));
+  if (res.tree == nullptr) reject("unreadable parse tree", -1);
+  if (res.tree->n_stmts != 1) return std::nullopt;
+  const auto* n = res.tree->stmts[0]->stmt;
+  using Kind = VariableStatement::Kind;
+  if (n->node_case == PG_QUERY__NODE__NODE_VARIABLE_SHOW_STMT) {
+    return VariableStatement{Kind::Show, false, n->variable_show_stmt->name, {}};
+  }
+  if (n->node_case != PG_QUERY__NODE__NODE_VARIABLE_SET_STMT) return std::nullopt;
+  const auto* v = n->variable_set_stmt;
+  VariableStatement out{Kind::Other, v->is_local != 0, v->name, {}};
+  switch (v->kind) {
+    case PG_QUERY__VARIABLE_SET_KIND__VAR_SET_VALUE: {
+      // Each value is a constant: a string (an identifier, TRUE, FALSE and
+      // ON are read as one) or a number; anything else is a form not read.
+      for (std::size_t i = 0; i < v->n_args; ++i) {
+        const auto* a = v->args[i];
+        if (a->node_case != PG_QUERY__NODE__NODE_A_CONST || a->a_const->isnull) return out;
+        const auto* c = a->a_const;
+        switch (c->val_case) {
+          case PG_QUERY__A__CONST__VAL_IVAL: out.values.push_back(std::to_string(c->ival->ival)); break;
+          case PG_QUERY__A__CONST__VAL_FVAL: out.values.emplace_back(c->fval->fval); break;
+          case PG_QUERY__A__CONST__VAL_SVAL: out.values.emplace_back(c->sval->sval); break;
+          case PG_QUERY__A__CONST__VAL_BOOLVAL: out.values.emplace_back(c->boolval->boolval != 0 ? "true" : "false"); break;
+          case PG_QUERY__A__CONST__VAL_BSVAL:
+          case PG_QUERY__A__CONST__VAL__NOT_SET:
+          case _PG_QUERY__A__CONST__VAL__CASE_IS_INT_SIZE: return out;
+        }
+      }
+      out.kind = Kind::Set;
+      return out;
+    }
+    case PG_QUERY__VARIABLE_SET_KIND__VAR_SET_DEFAULT: out.kind = Kind::Default; return out;
+    case PG_QUERY__VARIABLE_SET_KIND__VAR_RESET: out.kind = Kind::Reset; return out;
+    case PG_QUERY__VARIABLE_SET_KIND__VAR_RESET_ALL: out.kind = Kind::ResetAll; return out;
+    case PG_QUERY__VARIABLE_SET_KIND__VAR_SET_CURRENT:
+    case PG_QUERY__VARIABLE_SET_KIND__VAR_SET_MULTI:
+    case PG_QUERY__VARIABLE_SET_KIND__VARIABLE_SET_KIND_UNDEFINED:
+    case _PG_QUERY__VARIABLE_SET_KIND_IS_INT_SIZE: return out;
+  }
+  return out;
 }
 
 void check_syntax(std::string_view sql) {

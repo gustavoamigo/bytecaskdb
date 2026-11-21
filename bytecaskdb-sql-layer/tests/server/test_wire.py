@@ -323,7 +323,7 @@ def test_simple_query_refusals_and_the_empty_query(server):
     assert states(c.until_ready()) == ["0A000"]
     c.send(query("SET search_path TO x"))
     assert states(c.until_ready()) == ["0A000"]
-    c.send(query("BEGIN ISOLATION LEVEL SERIALIZABLE"))
+    c.send(query("SHOW search_path"))
     assert states(c.until_ready()) == ["0A000"]
     c.send(query("  ;  "))
     assert kinds(c.until_ready()) == b"IZ"
@@ -2939,3 +2939,389 @@ def test_a_parsed_int4_parameter_assigned_to_a_column_now_bigint_is_range_checke
     assert states(out) == ["22003"] and status(out) == "E"
     q(c, "ROLLBACK")
     assert data(q(c, "SELECT k, a FROM r")) == [["1", "1"]]
+
+
+# ------------------------------------------------- SERIALIZABLE and the modes
+
+
+def say_both(c: Client, sql: str) -> list[list[tuple[bytes, bytes]]]:
+    """One statement as a simple Query, then as an extended one."""
+    c.send(query(sql))
+    simple = c.until_ready()
+    c.send(parse(sql), bind([]), describe("P"), execute(), SYNC)
+    return [simple, c.until_ready()]
+
+
+def error_of(messages) -> dict[str, str]:
+    return next(fields(b) for k, b in messages if k == b"E")
+
+
+def test_serializable_isolation_and_the_transaction_defaults_over_simple_and_extended_query(server):
+    """docs/transaction_design.md, *Choosing the level: SET, SHOW, BEGIN and
+    the embedded API*: each SQLSTATE and value as PostgreSQL 17 gives it."""
+    c = connect(server)
+    table(c)
+    # SHOW of each parameter outside a block: the defaults.
+    for name, value in (("transaction_isolation", "read committed"), ("transaction_read_only", "off"),
+                        ("transaction_deferrable", "off"), ("default_transaction_isolation", "read committed"),
+                        ("default_transaction_read_only", "off"), ("default_transaction_deferrable", "off")):
+        for out in say_both(c, f"SHOW {name}"):
+            assert data(out) == [[value]] and fields_tag(out) == "SHOW", (name, out)
+            assert columns(out) == [name]
+    assert data(q(c, "SHOW TRANSACTION ISOLATION LEVEL")) == [["read committed"]]
+    for out in say_both(c, "SET default_transaction_isolation = 'serializable'"):
+        assert fields_tag(out) == "SET" and states(out) == []
+    assert data(q(c, "SHOW transaction_isolation")) == [["serializable"]]
+    # Values: any case, an identifier for one word, a quoted string for two.
+    for sql in ("SET default_transaction_isolation TO 'REPEATABLE READ'", "SET default_transaction_isolation = serializable",
+                'SET default_transaction_isolation = "read committed"'):
+        assert states(q(c, sql)) == [], sql
+    out = q(c, "SET default_transaction_isolation = repeatable read")
+    assert states(out) == ["42601"] and error_of(out)["M"] == 'syntax error at or near "read"'
+    for out in say_both(c, "SET default_transaction_isolation = 'bogus'"):
+        e = error_of(out)
+        assert e["C"] == "22023" and e["M"] == 'invalid value for parameter "default_transaction_isolation": "bogus"'
+        assert e["H"] == "Available values: serializable, repeatable read, read committed, read uncommitted."
+    out = q(c, "SET default_transaction_read_only = bogus")
+    assert error_of(out)["M"] == 'parameter "default_transaction_read_only" requires a Boolean value'
+    out = q(c, "SET default_transaction_isolation = 'serializable', 'read committed'")
+    assert error_of(out)["M"] == "SET default_transaction_isolation takes only one argument"
+    # SET TO DEFAULT and RESET restore PostgreSQL's defaults.
+    assert fields_tag(q(c, "SET default_transaction_isolation TO DEFAULT")) == "SET"
+    assert data(q(c, "SHOW default_transaction_isolation")) == [["read committed"]]
+    q(c, "SET default_transaction_isolation = 'serializable'")
+    assert fields_tag(q(c, "RESET default_transaction_isolation")) == "RESET"
+    assert data(q(c, "SHOW default_transaction_isolation")) == [["read committed"]]
+    # transaction_isolation outside a block is read and changes nothing; it cannot be reset.
+    assert fields_tag(q(c, "SET transaction_isolation = 'serializable'")) == "SET"
+    assert data(q(c, "SHOW transaction_isolation")) == [["read committed"]]
+    for sql in ("RESET transaction_isolation", "SET transaction_isolation TO DEFAULT"):
+        out = q(c, sql)
+        assert states(out) == ["0A000"] and error_of(out)["M"] == 'parameter "transaction_isolation" cannot be reset'
+    q(c, "BEGIN")
+    out = q(c, "RESET transaction_isolation")
+    assert states(out) == ["0A000"] and status(out) == "E"  # it aborts the block, as any error does
+    q(c, "ROLLBACK")
+    # SET LOCAL outside a block warns and changes nothing.
+    for out in say_both(c, "SET LOCAL default_transaction_isolation = 'serializable'"):
+        assert states(out, b"N") == ["25P01"] and fields_tag(out) == "SET"
+    assert data(q(c, "SHOW default_transaction_isolation")) == [["read committed"]]
+    # SET SESSION CHARACTERISTICS sets the defaults; RESET ALL resets them.
+    q(c, "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE")
+    assert [data(q(c, f"SHOW {n}")) for n in ("transaction_isolation", "transaction_read_only", "transaction_deferrable")] == [
+        [["serializable"]], [["on"]], [["on"]]]
+    for out in say_both(c, "INSERT INTO t VALUES (1, 1)"):
+        assert states(out) == ["25006"] and error_of(out)["M"] == "cannot execute INSERT in a read-only transaction"
+    q(c, "BEGIN")
+    assert data(q(c, "SHOW transaction_read_only")) == [["on"]]
+    out = q(c, "INSERT INTO t VALUES (1, 1)")
+    assert states(out) == ["25006"] and status(out) == "E"
+    q(c, "ROLLBACK")
+    assert fields_tag(q(c, "RESET ALL")) == "RESET"
+    assert [data(q(c, f"SHOW {n}")) for n in ("default_transaction_isolation", "default_transaction_read_only",
+                                               "default_transaction_deferrable")] == [[["read committed"]], [["off"]], [["off"]]]
+    assert states(q(c, "INSERT INTO t VALUES (1, 1)")) == []
+
+
+def test_the_transaction_defaults_are_transactional(server):
+    """A SET of a default in a block is undone by ROLLBACK, by the ROLLBACK
+    of a failed block and by ROLLBACK TO, and kept by COMMIT and RELEASE;
+    SET LOCAL lasts to the block's end; the open block's level is unchanged."""
+    c = connect(server)
+
+    def default():
+        return data(q(c, "SHOW default_transaction_isolation"))[0][0]
+
+    q(c, "BEGIN")
+    q(c, "SET default_transaction_isolation = 'serializable'")
+    assert data(q(c, "SHOW transaction_isolation")) == [["read committed"]]
+    assert default() == "serializable"
+    q(c, "ROLLBACK")
+    assert default() == "read committed"
+    for end in ("ROLLBACK", "COMMIT"):
+        q(c, "BEGIN")
+        q(c, "SET default_transaction_isolation = 'serializable'")
+        assert status(q(c, "SELECT 1/0")) == "E"
+        q(c, end)
+        assert default() == "read committed", end
+    q(c, "BEGIN")
+    q(c, "SAVEPOINT s")
+    q(c, "SET default_transaction_isolation = 'serializable'")
+    q(c, "ROLLBACK TO s")
+    assert default() == "read committed"
+    q(c, "SET default_transaction_isolation = 'repeatable read'")
+    q(c, "RELEASE s")
+    assert fields_tag(q(c, "COMMIT")) == "COMMIT"
+    assert default() == "repeatable read"
+    q(c, "BEGIN")
+    q(c, "SET LOCAL default_transaction_isolation = 'serializable'")
+    assert default() == "serializable"
+    q(c, "COMMIT")
+    assert default() == "repeatable read"
+    q(c, "BEGIN")
+    q(c, "SET LOCAL default_transaction_isolation = 'serializable'")
+    q(c, "SET default_transaction_isolation = 'read uncommitted'")  # a SET overrides the block's SET LOCAL
+    q(c, "COMMIT")
+    assert default() == "read uncommitted"
+    # The default reaches the next block.
+    q(c, "SET default_transaction_isolation = 'serializable'")
+    q(c, "BEGIN")
+    assert data(q(c, "SHOW transaction_isolation")) == [["serializable"]]
+    q(c, "COMMIT")
+
+
+def test_the_25001_rules_of_isolation_read_write_and_deferrable(server):
+    c = connect(server)
+    table(c)
+
+    def refused(out, message):
+        e = error_of(out)
+        assert (e["C"], e["M"]) == ("25001", message), out
+
+    # DEFERRABLE: in a savepoint first, after a query even unchanged.
+    q(c, "BEGIN")
+    q(c, "SAVEPOINT s")
+    refused(q(c, "SET TRANSACTION NOT DEFERRABLE"), "SET TRANSACTION [NOT] DEFERRABLE cannot be called within a subtransaction")
+    q(c, "ROLLBACK")
+    q(c, "BEGIN")
+    q(c, "SELECT 1")
+    refused(q(c, "SET TRANSACTION NOT DEFERRABLE"), "SET TRANSACTION [NOT] DEFERRABLE must be called before any query")
+    q(c, "ROLLBACK")
+    q(c, "BEGIN")
+    assert fields_tag(q(c, "SET TRANSACTION DEFERRABLE")) == "SET"
+    assert data(q(c, "SHOW transaction_deferrable")) == [["on"]]
+    q(c, "ROLLBACK")
+    # The level through transaction_isolation, under the same rules as SET TRANSACTION.
+    q(c, "BEGIN")
+    assert fields_tag(q(c, "SET transaction_isolation = 'serializable'")) == "SET"
+    assert data(q(c, "SHOW transaction_isolation")) == [["serializable"]]
+    q(c, "SELECT 1")
+    assert fields_tag(q(c, "SET transaction_isolation = 'serializable'")) == "SET"  # unchanged: taken
+    refused(q(c, "SET transaction_isolation = 'read committed'"), "SET TRANSACTION ISOLATION LEVEL must be called before any query")
+    q(c, "ROLLBACK")
+    # BEGIN in a block warns, then sets its modes as SET TRANSACTION does.
+    q(c, "BEGIN ISOLATION LEVEL SERIALIZABLE")
+    q(c, "SELECT 1")
+    out = q(c, "BEGIN ISOLATION LEVEL READ COMMITTED")
+    assert states(out, b"N") == ["25001"] and states(out) == ["25001"] and status(out) == "E"
+    q(c, "ROLLBACK")
+    # BEGIN after a statement of an extended block (the design's
+    # "SELECT 1; BEGIN ISOLATION LEVEL SERIALIZABLE" in one Query, which the
+    # server refuses as several statements): 25001, and the block is rolled back.
+    c.send(parse("SELECT 1"), bind([]), execute(), parse("BEGIN ISOLATION LEVEL SERIALIZABLE"), bind([]), execute(), SYNC)
+    out = c.until_ready()
+    refused(out, "SET TRANSACTION ISOLATION LEVEL must be called before any query")
+    assert status(out) == "I"
+    c.send(parse("SELECT 1"), bind([]), execute(), parse("BEGIN DEFERRABLE"), bind([]), execute(), SYNC)
+    out = c.until_ready()
+    refused(out, "SET TRANSACTION [NOT] DEFERRABLE must be called before any query")
+    assert status(out) == "I"
+    c.send(parse("SELECT 1"), bind([]), execute(), parse("BEGIN READ ONLY"), bind([]), execute(), SYNC)
+    out = c.until_ready()
+    assert states(out) == [] and status(out) == "T"
+    assert data(q(c, "SHOW transaction_read_only")) == [["on"]]
+    assert states(q(c, "INSERT INTO t VALUES (9, 9)")) == ["25006"]
+    q(c, "ROLLBACK")
+
+
+def two_clients(server) -> tuple[Client, Client]:
+    a, b = connect(server), connect(server)
+    q(a, "CREATE TABLE doc (id INTEGER PRIMARY KEY, on_call INTEGER)")
+    q(a, "INSERT INTO doc VALUES (1, 1), (2, 1)")
+    return a, b
+
+
+def test_write_skew_between_serializable_blocks_is_40001_at_the_second_commit(server):
+    """PostgreSQL 17 gives the same 40001, message and hint (its DETAIL, a
+    reason code, is not sent)."""
+    a, b = two_clients(server)
+    for begin in ("BEGIN ISOLATION LEVEL SERIALIZABLE", "START TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+                  "BEGIN; SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"):
+        q(a, "UPDATE doc SET on_call = 1")
+        for c in (a, b):
+            for sql in begin.split("; "):
+                assert states(q(c, sql)) == [], sql
+            assert data(q(c, "SELECT count(*) FROM doc WHERE on_call = 1")) == [["2"]]
+        q(a, "UPDATE doc SET on_call = 0 WHERE id = 1")
+        q(b, "UPDATE doc SET on_call = 0 WHERE id = 2")
+        assert fields_tag(q(a, "COMMIT")) == "COMMIT"
+        out = q(b, "COMMIT")
+        e = error_of(out)
+        assert e["C"] == "40001" and status(out) == "I", begin
+        assert e["M"] == "could not serialize access due to read/write dependencies among transactions"
+        assert e["H"] == "The transaction might succeed if retried."
+        assert data(q(a, "SELECT id, on_call FROM doc ORDER BY id")) == [["1", "0"], ["2", "1"]]
+    # The same at the default level commits both: snapshot isolation.
+    q(a, "UPDATE doc SET on_call = 1")
+    for c in (a, b):
+        q(c, "BEGIN ISOLATION LEVEL REPEATABLE READ")
+        q(c, "SELECT count(*) FROM doc WHERE on_call = 1")
+    q(a, "UPDATE doc SET on_call = 0 WHERE id = 1")
+    q(b, "UPDATE doc SET on_call = 0 WHERE id = 2")
+    assert fields_tag(q(a, "COMMIT")) == "COMMIT" and fields_tag(q(b, "COMMIT")) == "COMMIT"
+
+
+def test_a_phantom_in_a_read_range_is_40001_and_disjoint_ranges_commit(server):
+    """The empty-range phantom is 40001, as in PostgreSQL 17. Disjoint
+    ranges commit here; PostgreSQL 17, whose predicate locks on a small
+    table cover pages, may fail one (a documented difference)."""
+    a, b = connect(server), connect(server)
+    q(a, "CREATE TABLE r (k INTEGER PRIMARY KEY)")
+    for (lo_a, lo_b), (ins_a, ins_b), outcome in (((1, 1), (5, 6), ["COMMIT", "40001"]),
+                                                  ((100, 200), (205, 105), ["COMMIT", "40001"]),
+                                                  ((300, 400), (301, 401), ["COMMIT", "COMMIT"])):
+        for c, lo in ((a, lo_a), (b, lo_b)):
+            q(c, "BEGIN ISOLATION LEVEL SERIALIZABLE")
+            assert data(q(c, f"SELECT k FROM r WHERE k BETWEEN {lo} AND {lo + 10}")) == []
+        q(a, f"INSERT INTO r VALUES ({ins_a})")
+        q(b, f"INSERT INTO r VALUES ({ins_b})")
+        got = []
+        for c in (a, b):
+            out = q(c, "COMMIT")
+            got.append(states(out)[0] if states(out) else fields_tag(out))
+        assert got == outcome, (lo_a, lo_b)
+
+
+def test_a_read_in_a_read_only_savepoint_is_recorded_and_fails_the_commit(server):
+    """docs/transaction_design.md, stage 2: READ ONLY set inside a savepoint
+    is the session's; the transaction keeps recording, so the read made
+    under it still fails the COMMIT on skew."""
+    a, b = two_clients(server)
+    q(a, "BEGIN ISOLATION LEVEL SERIALIZABLE")
+    q(a, "SAVEPOINT s")
+    q(a, "SET TRANSACTION READ ONLY")
+    assert data(q(a, "SELECT count(*) FROM doc WHERE on_call = 1")) == [["2"]]
+    assert states(q(a, "UPDATE doc SET on_call = 0 WHERE id = 1")) == ["25006"]
+    q(a, "ROLLBACK TO s")
+    q(a, "RELEASE s")
+    assert data(q(a, "SHOW transaction_read_only")) == [["off"]]
+    q(b, "UPDATE doc SET on_call = 0 WHERE id = 2")  # a concurrent commit changes what a read
+    assert states(q(a, "UPDATE doc SET on_call = 0 WHERE id = 1")) == []
+    out = q(a, "COMMIT")
+    assert states(out) == ["40001"] and status(out) == "I"
+    # A top-level READ ONLY reaches the transaction: it records nothing and commits.
+    q(a, "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY")
+    assert data(q(a, "SELECT count(*) FROM doc WHERE on_call = 1")) == [["1"]]
+    q(b, "UPDATE doc SET on_call = 1")
+    assert fields_tag(q(a, "COMMIT")) == "COMMIT"
+
+
+def test_serializable_and_the_modes_match_postgresql(server):
+    """The SET, SHOW, RESET and BEGIN forms above, statement by statement,
+    against PostgreSQL 17: the SQLSTATE, tag, rows and block status."""
+    import psycopg  # noqa: F401
+    from psycopg import pq
+
+    dsn = os.environ.get("BYTECASK_SQL_ORACLE")
+    if not dsn:
+        pytest.skip("BYTECASK_SQL_ORACLE is not set: no PostgreSQL to compare with")
+    script = [
+        "SHOW transaction_isolation", "SHOW default_transaction_read_only", "SET default_transaction_isolation = 'serializable'",
+        "SHOW transaction_isolation", "SET default_transaction_isolation = repeatable read",
+        "SET default_transaction_isolation = 'bogus'", "SET default_transaction_isolation TO DEFAULT",
+        "SET default_transaction_read_only = 'of'", "SET default_transaction_read_only = 'o'",
+        "SET default_transaction_read_only = 1", "SHOW default_transaction_read_only", "RESET default_transaction_read_only",
+        "SET LOCAL default_transaction_isolation = 'serializable'", "SET transaction_isolation = 'serializable'",
+        "RESET transaction_isolation", "SET transaction_deferrable = on",
+        "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE, DEFERRABLE",
+        "SHOW transaction_deferrable", "BEGIN", "SHOW transaction_isolation", "SET transaction_isolation = 'read committed'",
+        "SHOW transaction_isolation", "SET default_transaction_isolation = 'repeatable read'", "SAVEPOINT s",
+        "SET TRANSACTION DEFERRABLE", "ROLLBACK TO s", "SHOW default_transaction_isolation", "SELECT 1",
+        "SET TRANSACTION NOT DEFERRABLE", "ROLLBACK", "SHOW default_transaction_isolation",
+        "BEGIN ISOLATION LEVEL SERIALIZABLE", "SET LOCAL default_transaction_isolation = 'read committed'",
+        "SHOW default_transaction_isolation", "SELECT 1", "BEGIN ISOLATION LEVEL SERIALIZABLE", "SET transaction_read_only = on",
+        "SHOW transaction_read_only", "SET transaction_read_only = off", "ROLLBACK", "SHOW default_transaction_isolation",
+        "SET default_transaction_read_only = on", "BEGIN READ WRITE", "SHOW transaction_read_only", "ROLLBACK", "RESET ALL",
+        "SHOW default_transaction_deferrable",
+        # A mode written twice is checked value by value, in order.
+        "BEGIN", "SELECT 1", "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE ISOLATION LEVEL READ COMMITTED", "ROLLBACK",
+        "BEGIN", "SELECT 1", "SET TRANSACTION READ ONLY, READ WRITE", "ROLLBACK",
+        "BEGIN", "SAVEPOINT s", "SET TRANSACTION READ ONLY READ WRITE", "ROLLBACK",
+        "BEGIN ISOLATION LEVEL SERIALIZABLE ISOLATION LEVEL READ COMMITTED", "SHOW transaction_isolation", "ROLLBACK",
+        # A comma only between two modes: anywhere else 42601, and nothing changes.
+        "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY,", "SHOW default_transaction_read_only",
+        "SET SESSION CHARACTERISTICS AS TRANSACTION , READ ONLY", "SET TRANSACTION READ ONLY,",
+        "START TRANSACTION READ ONLY,,READ WRITE", "BEGIN ISOLATION LEVEL SERIALIZABLE,", "BEGIN WORK, READ ONLY",
+        "BEGIN ISOLATION LEVEL", "BEGIN NOT", "BEGIN read foo", "SHOW transaction_isolation",
+        # A parameter's name in any case, a quoted one too; errors name it as written.
+        'SHOW "Transaction_Isolation"', 'SET "Default_Transaction_Isolation" = serializable',
+        "SHOW default_transaction_isolation", 'SET "Default_Transaction_Isolation" = bogus',
+        'RESET "Default_Transaction_Isolation"', 'RESET "Transaction_Isolation"', 'SET "Transaction_Read_Only" = maybe',
+        'SHOW "CLIENT_ENCODING"',
+    ]
+
+    def outcome(conn, sql):
+        r = conn.exec_(sql.encode())
+        st = r.error_field(pq.DiagnosticField.SQLSTATE)
+        rows = [[r.get_value(i, j) for j in range(r.nfields)] for i in range(r.ntuples)]
+        names = [r.fname(j) for j in range(r.nfields)]
+        message = r.error_field(pq.DiagnosticField.MESSAGE_PRIMARY)
+        return (st.decode() if st else (r.command_status or b"").decode(), message, names, rows, conn.transaction_status)
+
+    pg = pq.PGconn.connect(dsn.encode())
+    ours = pq.PGconn.connect(server.dsn().encode())
+    try:
+        for sql in script:
+            assert outcome(ours, sql) == outcome(pg, sql), sql
+    finally:
+        pg.exec_(b"ROLLBACK")
+        pg.exec_(b"RESET ALL")
+        pg.finish()
+        ours.finish()
+
+
+def test_a_set_first_in_an_extended_query_block_runs_in_that_block(server):
+    """A SET of a default, SET SESSION CHARACTERISTICS or SET TRANSACTION
+    first of several statements before Sync runs in the implicit block, as
+    PostgreSQL 17's does: the block runs with the defaults it found, and a
+    failure of the block undoes the SET."""
+    c = connect(server)
+    table(c)
+
+    def pipeline(*sqls):
+        msgs = []
+        for sql in sqls:
+            msgs += [parse(sql), bind([]), execute()]
+        c.send(*msgs, SYNC)
+        return c.until_ready()
+
+    def show(name):
+        return data(q(c, f"SHOW {name}"))[0][0]
+
+    q(c, "SET default_transaction_read_only = on")
+    out = pipeline("SET default_transaction_read_only = off", "INSERT INTO t VALUES (1, 1)")
+    assert states(out) == ["25006"] and status(out) == "I"
+    assert show("default_transaction_read_only") == "on"  # undone with the block
+    for first in ("RESET default_transaction_read_only", "RESET ALL"):
+        assert states(pipeline(first, "INSERT INTO t VALUES (1, 1)")) == ["25006"], first
+        assert show("default_transaction_read_only") == "on", first
+    q(c, "RESET ALL")
+    assert data(q(c, "SELECT count(*) FROM t")) == [["0"]]
+    # The block keeps the level it began with; the SET lasts once it commits.
+    out = pipeline("SET default_transaction_isolation = 'serializable'", "SHOW transaction_isolation")
+    assert states(out) == [] and data(out) == [["read committed"]]
+    assert show("default_transaction_isolation") == "serializable"
+    q(c, "RESET ALL")
+    assert states(pipeline("SET default_transaction_isolation = 'serializable'", "SELECT 1/0")) == ["22012"]
+    assert show("default_transaction_isolation") == "read committed"
+    out = pipeline("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY", "INSERT INTO t VALUES (2, 2)")
+    assert states(out) == [] and show("default_transaction_read_only") == "on"
+    # BEGIN after it makes the block explicit with the modes it began with.
+    out = pipeline("SET default_transaction_read_only = off", "BEGIN", "SELECT 1")
+    assert states(out) == [] and status(out) == "T"
+    assert show("transaction_read_only") == "on"
+    q(c, "ROLLBACK")
+    assert show("default_transaction_read_only") == "on"
+    q(c, "RESET ALL")
+    # SET TRANSACTION and SET transaction_read_only apply to the block they start.
+    for first in ("SET TRANSACTION READ ONLY", "SET transaction_read_only = on"):
+        out = pipeline(first, "INSERT INTO t VALUES (3, 3)")
+        assert states(out) == ["25006"], first
+    # SET LOCAL lasts to the block's end.
+    out = pipeline("SET LOCAL default_transaction_read_only = on", "SHOW default_transaction_read_only")
+    assert data(out) == [["on"]] and show("default_transaction_read_only") == "off"
+    # Alone before Sync, a SET runs by itself, as before.
+    assert states(pipeline("SET default_transaction_read_only = on")) == []
+    assert show("default_transaction_read_only") == "on"
+    q(c, "RESET ALL")
+    assert data(q(c, "SELECT k FROM t ORDER BY k")) == [["2"]]

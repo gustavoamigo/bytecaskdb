@@ -326,9 +326,16 @@ NB_MODULE(bytecask_sql, m) {
   nb::class_<sql::Database>(m, "Database")
       .def(
           "begin",
-          [](sql::Database& db, std::uint64_t max_bytes) { return db.begin({.max_bytes = max_bytes}); },
-          "max_bytes"_a = sql::TransactionOptions{}.max_bytes, nb::keep_alive<0, 1>(),
-          "Opens a transaction; its snapshot is taken at its first statement.")
+          [](sql::Database& db, std::uint64_t max_bytes, std::string_view isolation) {
+            if (isolation != "snapshot" && isolation != "serializable") {
+              throw std::invalid_argument("isolation is 'snapshot' or 'serializable'");
+            }
+            auto level = isolation == "serializable" ? sql::Isolation::Serializable : sql::Isolation::Snapshot;
+            return db.begin({.max_bytes = max_bytes, .isolation = level});
+          },
+          "max_bytes"_a = sql::TransactionOptions{}.max_bytes, "isolation"_a = "snapshot", nb::keep_alive<0, 1>(),
+          "Opens a transaction at 'snapshot' or 'serializable' isolation; its snapshot is taken at its first "
+          "statement.")
       .def("execute", &execute, "sql"_a, "params"_a = nb::tuple(),
            "Runs one statement: a dict of columns, rows (tuples) and affected.")
       .def("close", &sql::Database::close, "Closes the engine; a later call raises Closed, a second close() nothing.")

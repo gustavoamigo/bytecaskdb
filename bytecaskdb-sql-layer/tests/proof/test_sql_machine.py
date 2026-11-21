@@ -21,7 +21,9 @@ its own writes, then COMMIT or ROLLBACK; PostgreSQL runs it in a real
 REPEATABLE READ transaction on its connection. A statement that fails
 aborts both: every statement after it is 25P02, and COMMIT rolls back. The
 tables are compared while no transaction is open; DDL and the reopen run
-only then.
+only then. A transaction may also begin at SERIALIZABLE on all three sides
+(the embedded Isolation::Serializable, BEGIN ISOLATION LEVEL SERIALIZABLE
+over the wire and on PostgreSQL), with the same results on one connection.
 
 Slice 1 of the front end (#492): NUMERIC columns, CREATE INDEX, SELECT by
 an equality prefix and a range of any key, with ORDER BY and LIMIT, COUNT,
@@ -942,16 +944,19 @@ class SqlMachine(Sides, RuleBasedStateMachine):
         self.grouped([a_name, b_name], where, group, aggs, having, order,
                      data.draw(st.none() | st.sampled_from([0, 2]), label="limit"), links=links)
 
-    def begin(self) -> None:
+    def begin(self, serializable: bool = False) -> None:
         # PostgreSQL's REPEATABLE READ, like the layer's, takes its snapshot
         # at the first statement, not at BEGIN. The DDL a transaction runs
         # (docs/transaction_design.md, *Transactional DDL*) changes the model
-        # only if it commits.
+        # only if it commits. SERIALIZABLE on one connection, where nothing
+        # commits in between, gives the same results on all three sides
+        # (docs/transaction_design.md, *Stages of serializable isolation*).
         self.tables_at_begin = copy.deepcopy(self.tables)
-        self.txn = self.db.begin()
-        assert o.run_pg(self.pg.conn, "BEGIN ISOLATION LEVEL REPEATABLE READ").error is None
+        self.txn = self.db.begin(isolation="serializable" if serializable else "snapshot")
+        level = "SERIALIZABLE" if serializable else "REPEATABLE READ"
+        assert o.run_pg(self.pg.conn, f"BEGIN ISOLATION LEVEL {level}").error is None
         if self.wire is not None:
-            assert o.run_wire(self.wire, "BEGIN").error is None
+            assert o.run_wire(self.wire, "BEGIN ISOLATION LEVEL SERIALIZABLE" if serializable else "BEGIN").error is None
 
     def commit(self) -> str:
         """COMMIT on both; returns the outcome, as PostgreSQL's command tag says it.
@@ -1589,6 +1594,11 @@ class SqlMachine(Sides, RuleBasedStateMachine):
     @rule()
     def begin_transaction(self):
         self.begin()
+
+    @precondition(lambda self: self.tables and self.txn is None)
+    @rule()
+    def begin_serializable_transaction(self):
+        self.begin(serializable=True)
 
     @precondition(lambda self: self.txn is not None)
     @rule()

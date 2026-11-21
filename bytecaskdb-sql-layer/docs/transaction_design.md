@@ -476,8 +476,9 @@ before its cleanup.
   transaction also writes is already covered, and the extra guard is
   harmless.
 
-- **SERIALIZABLE** (`Isolation::Serializable`, embedded API; the server
-  still refuses it until stage 2): the runtime records every key and range
+- **SERIALIZABLE** (`Isolation::Serializable` in the embedded API;
+  `ISOLATION LEVEL SERIALIZABLE` and `default_transaction_isolation` over
+  the wire, `server_design.md`, *Transaction modes*): the runtime records every key and range
   a statement reads, and a commit that writes submits them as guards, so it
   is strict serializable against every other write. See *Serializable
   isolation*.
@@ -683,7 +684,13 @@ for their shape.
   `scripts/check_guarded_by.py --scope sql`, each patch run by
   `scripts/serializable_mutation_check.sh` nightly, and checked to still
   apply by `ci.yml` on every pull request); `transaction_test.cpp`'s read
-  failure test, at both levels.
+  failure test, at both levels. Stage 2: `pg_session_test.cpp` (write skew
+  between two sessions, a follower's 0A000, the transactional defaults),
+  `test_wire.py`'s serializable and run-time-parameter tests (each
+  SQLSTATE of *Choosing the level* over simple and extended query, write
+  skew and phantoms over two connections, a read under a savepoint's READ
+  ONLY, and the forms compared with PostgreSQL 17), and the proof
+  machine's `begin_serializable_transaction` rule.
 - **Concurrency:** Elle through SQL (`testing_design.md`, *The TPROC-C
   harness*): the harness's transactions as histories, checked as snapshot isolation, and
   as serializable where `FOR UPDATE` guards the reads that decide a write;
@@ -1198,7 +1205,7 @@ Other documents: catalog_design.md (*DDL*: the namespace `01` invariant and its 
 
 ## Serializable isolation
 
-Status: **design approved by the owner on 2026-11-20** with every recommendation under *Owner's questions on serializable isolation*: question 1 (a), 2 (a), 3 (a), 4 (a), 5 (a); question 6 is decided by stage 1's writer-p99 numbers as recommended there. **Stages 0 and 1 are built**: the SQL isolation check runs nightly over the point and range workloads, and SERIALIZABLE transactions and autocommit statements run in the embedded API (`Isolation::Serializable`), checked nightly by the `serializable` Elle configuration. *Stage 1 as built* says where the code differed from this design. **Stage 3 is built** (question 6 (a), decided by stage 1's numbers): a range guard inside one registered prefix is prepared outside the engine's writer section; *Stage 3 as built* has its numbers. The server still refuses SERIALIZABLE until stage 2. Stage 1 made its edits to the rest of this document (*Edits to this document once serializable isolation is built*).
+Status: **built.** The design was approved by the owner on 2026-11-20 with every recommendation under *Owner's questions on serializable isolation*: question 1 (a), 2 (a), 3 (a), 4 (a), 5 (a); question 6 was decided (a) by stage 1's writer-p99 numbers. Stage 0 (branch `gustavoamigo/sql-serializable-isolation-check`): the SQL isolation check runs nightly over the point and range workloads. Stage 1 (`gustavoamigo/sql-serializable-embedded`): SERIALIZABLE transactions and autocommit statements run in the embedded API (`Isolation::Serializable`), checked nightly by the `serializable` Elle configuration. Stage 3 (`gustavoamigo/engine-prefix-range-guard-prepare`): a range guard inside one registered prefix is prepared outside the engine's writer section. Stage 2 (`gustavoamigo/sql-serializable-server`): the server runs SERIALIZABLE blocks and keeps the transaction defaults. *Stage 1 as built*, *Stage 2 as built* and *Stage 3 as built* say where the code differed from this design. Every edit of *Edits to this document once serializable isolation is built* is made.
 
 The owner's decision (2026-11-20): SERIALIZABLE is real serializability. Snapshot isolation is never run under the SERIALIZABLE name. The two standing rules apply: do what PostgreSQL does, and never wait. Behaviour observed on PostgreSQL 17.12 is cited as "PG 17"; the probes are cases 1 to 15 and A to D of the fact-gathering run, and the review probes (p1.sql, s1.py to s4.py), kept with the design PR. Code citations are to branch `gustavoamigo/sql-txn-ddl-ctas-implicit`; they are re-checked before the design PR.
 
@@ -1585,6 +1592,21 @@ Each stage is one PR that ships on its own. Each updates `bytecaskdb-sql-layer/R
   - `server_design.md`: the transaction-modes text at :371-389, and SET/SHOW;
   - `README.md`:64.
 
+**Stage 2 as built.** Where the code differed from the design above, the design's intent was kept:
+- **Question 6 first.** Stage 3 landed before this stage, as question 6 (a) asks. Its numbers (*Stage 3 as built*) show the snapshot writers' remaining p99 beside two range-reading writers matching a control whose range reads submit no guard, so the range checks no longer measurably affect other writers at the sizes benchmarked; (b), a per-transaction cap on in-section range keys, is not built.
+- **`SELECT 1; BEGIN ISOLATION LEVEL SERIALIZABLE` in one simple Query** cannot be sent: the server refuses several statements in one Query (0A000). The 25001 of BEGIN after a query is tested in its other form, the same statements as an extended-query pipeline before one Sync, where PostgreSQL 17 gives the same 25001 and leaves the session idle (I): the modes are checked before the implicit block becomes explicit, so a refusal rolls it back.
+- **BEGIN inside a block** warns 25001, as before, and then sets its modes as SET TRANSACTION does, as PostgreSQL's BEGIN does: a change of level after a query fails the block.
+- **SET, SHOW and RESET** are read by libpg_query (`ast::parse_variable`), so values are quote-aware and a syntax error is PostgreSQL's 42601 with its position. `SHOW TRANSACTION ISOLATION LEVEL` is `SHOW transaction_isolation`, as in PostgreSQL. `SHOW client_encoding` is answered too.
+- **transaction_read_only and transaction_deferrable** take SET in a block as transaction_isolation does (each the SET TRANSACTION of its mode), and their RESET is 0A000, as PostgreSQL's.
+- **An extended pipeline's implicit block** is no transaction block to PostgreSQL: SET TRANSACTION and SET LOCAL in it warn 25P01 and still apply until Sync, as here. PostgreSQL's unnamed transaction starts with the pipeline's first message, the layer's implicit block at its second statement; so that the two agree, a SET, SET LOCAL or RESET of a mode or default, RESET ALL, SET TRANSACTION or SET SESSION CHARACTERISTICS sent first of several statements opens the implicit block before it runs. The block then runs with the defaults it found (a read-only default turned off by the pipeline's first statement still refuses its INSERT with 25006, as PostgreSQL does), and a failure of the block undoes the SET (`server_design.md`, *Extended query*).
+- **The mode list** is read as PostgreSQL's transaction_mode_list: a comma only between two modes (else 42601 at the comma or at the end of input), and each occurrence of a mode keeps its own value, checked in order, so `SET TRANSACTION READ ONLY, READ WRITE` after a query is 25001 as in PostgreSQL. A parameter's name in SET, SHOW and RESET matches in any case, a quoted one too, as PostgreSQL's lookup does.
+- **A BEGIN the engine refuses** (SERIALIZABLE on a follower) leaves a failed block with no `Transaction`: ROLLBACK TO in it is 3B001, as it is for any name the block has no savepoint for, and every other statement but COMMIT and ROLLBACK is 25P02.
+- **default_transaction_read_only outside a block.** A statement outside a block then runs in a read-only `Transaction` of its own, so the runtime refuses its write with PostgreSQL's 25006 text, a SELECT … FOR UPDATE and a procedure's writing statement included. A DECLARE outside a block, a hold cursor in a transaction of its own, opens it read-only unless it is FOR UPDATE, so its WITH HOLD is not refused at SERIALIZABLE.
+- **CALL in a read-only block.** Where READ ONLY reached the transaction, a CALL runs and its body's first write is refused, as in PostgreSQL; where only the session keeps it (set after a query or under a savepoint) a CALL is still refused, as before.
+- **On a follower** SERIALIZABLE is refused by the embedded API, at BEGIN (which fails the block, as PostgreSQL's BEGIN ISOLATION LEVEL SERIALIZABLE does on a hot standby), at SET TRANSACTION, and for a statement outside a block. A default of serializable is refused at BEGIN, where PostgreSQL refuses the block's first query. The server has no follower mode yet; `pg_session_test.cpp` sets one on the engine.
+- **Tests.** Wire: `test_serializable_isolation_and_the_transaction_defaults_over_simple_and_extended_query`, `test_the_transaction_defaults_are_transactional`, `test_the_25001_rules_of_isolation_read_write_and_deferrable`, `test_write_skew_between_serializable_blocks_is_40001_at_the_second_commit`, `test_a_phantom_in_a_read_range_is_40001_and_disjoint_ranges_commit`, `test_a_read_in_a_read_only_savepoint_is_recorded_and_fails_the_commit`, `test_a_set_first_in_an_extended_query_block_runs_in_that_block`, and `test_serializable_and_the_modes_match_postgresql` (with `BYTECASK_SQL_ORACLE`). `pg_session_test.cpp`: "pg_session: write skew between two SERIALIZABLE sessions …", "… on a follower is 0A000 …", "the transaction defaults are kept by COMMIT and RELEASE and undone by ROLLBACK and ROLLBACK TO". The proof machine's `begin_serializable_transaction` rule begins at SERIALIZABLE on all three sides. The functional suite's E152-01 case and sqltest's e152_01_01_01 and _02 pass: 623 of sqltest's 743 tests, every one PostgreSQL 17 accepts.
+- No mutation set or fault sweep is added: the stage touches no durability site and no recording site; the session passes the level to the API, whose recording sites stage 1's mutations cover.
+
 **Stage 3 (owner's question 6): range guards inside one registered prefix are prepared outside the engine's writer section.**
 - **Code:** `WritePlan::prepare_validation` accepts a range guard whose bounds share a registered prefix length, and probes that prefix's hash, as it does for exact prefix ranges.
 - **Tests:**
@@ -1696,7 +1718,7 @@ No `engine_bench` workload submits a range guard, so none runs the new preparati
 
 ### Edits to this document once serializable isolation is built
 
-Made with stage 1 unless noted; all but the last are made.
+Made with stage 1 unless noted; all are made, the last with stage 2.
 - *Isolation*: the **Later** item "serializable" is replaced by a pointer here. The sentence "A plan's guards are the only text that differs between levels" goes. The first bullet becomes "Snapshot isolation by default".
 - *Limits*, **Buffer size**: the read set joins "its overlay, its guards, claims and locks", with the note that ROLLBACK TO does not release it; an autocommit statement's read set is charged to its statement budget.
 - *Savepoints*: ROLLBACK TO keeps a SERIALIZABLE transaction's reads.

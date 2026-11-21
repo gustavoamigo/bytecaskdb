@@ -144,14 +144,17 @@ constexpr std::size_t kFlushAt = 64u << 10;
 // An error the session raises itself, with its SQLSTATE.
 class SessionError : public std::runtime_error {
 public:
-  SessionError(const std::string& what, const char* sqlstate) : std::runtime_error{what}, sqlstate_{sqlstate} {}
+  SessionError(const std::string& what, const char* sqlstate, std::string hint = {})
+      : std::runtime_error{what}, sqlstate_{sqlstate}, hint_{std::move(hint)} {}
   SessionError(const SessionError&) = default;
   SessionError& operator=(const SessionError&) = default;
   ~SessionError() override;  // out of line: anchors the vtable (-Wweak-vtables)
   [[nodiscard]] auto sqlstate() const noexcept -> const char* { return sqlstate_; }
+  [[nodiscard]] auto hint() const noexcept -> std::string_view { return hint_; }
 
 private:
   const char* sqlstate_;
+  std::string hint_;
 };
 SessionError::~SessionError() = default;
 
@@ -159,18 +162,85 @@ SessionError::~SessionError() = default;
 // PQsetClientEncoding sends it, and pgtcl's pg_connect calls that.
 // Savepoint, RollbackTo and Release are SAVEPOINT, ROLLBACK TO SAVEPOINT and
 // RELEASE SAVEPOINT, on the explicit block's transaction.
-enum class Control { Begin, Commit, Rollback, SetEncoding, SetTransaction, Savepoint, RollbackTo, Release };
+// SetVariable is a SET or RESET of a run-time parameter the session keeps
+// (docs/server_design.md, *Run-time parameters*), RESET ALL included;
+// SetCharacteristics is SET SESSION CHARACTERISTICS AS TRANSACTION.
+enum class Control {
+  Begin, Commit, Rollback, SetEncoding, SetTransaction, SetCharacteristics, SetVariable, Savepoint, RollbackTo, Release
+};
 
-// The isolation levels a block may name. SERIALIZABLE is refused when the
-// statement is read, so a level here is one the snapshot already gives; the
-// session keeps it only to tell, as PostgreSQL does, whether a SET TRANSACTION
-// changes it.
-enum class IsolationLevel { ReadUncommitted, ReadCommitted, RepeatableRead };
+// The isolation levels a block may name, as SHOW reports them. Serializable
+// runs the embedded API's Isolation::Serializable; the other three run its
+// snapshot isolation, which is what REPEATABLE READ asks and more than the
+// other two do: the session keeps them to report them, and to tell, as
+// PostgreSQL does, whether a SET TRANSACTION changes the level.
+enum class IsolationLevel { ReadUncommitted, ReadCommitted, RepeatableRead, Serializable };
 
-// SET TRANSACTION's modes.
+auto isolation_name(IsolationLevel level) -> std::string_view {
+  switch (level) {
+    case IsolationLevel::ReadUncommitted: return "read uncommitted";
+    case IsolationLevel::ReadCommitted: return "read committed";
+    case IsolationLevel::RepeatableRead: return "repeatable read";
+    case IsolationLevel::Serializable: return "serializable";
+  }
+  return "read committed";
+}
+
+auto api_isolation(IsolationLevel level) -> Isolation {
+  return level == IsolationLevel::Serializable ? Isolation::Serializable : Isolation::Snapshot;
+}
+
+// SET TRANSACTION's modes, and the order they were written in: PostgreSQL
+// checks each as it comes.
+// The last of each mode is what a BEGIN outside a block starts with; each
+// entry of `order` holds its own value, for a mode written more than once.
 struct TransactionModes {
+  enum class Mode : std::uint8_t { Isolation, ReadOnly, Deferrable };
+  struct Entry {
+    Mode mode{Mode::Isolation};
+    IsolationLevel level{IsolationLevel::ReadCommitted};  // Isolation
+    bool on{false};  // ReadOnly: READ ONLY; Deferrable: DEFERRABLE
+  };
   std::optional<IsolationLevel> isolation;  // an ISOLATION LEVEL was given
   std::optional<bool> read_only;   // READ ONLY (true) or READ WRITE (false)
+  std::optional<bool> deferrable;  // DEFERRABLE (true) or NOT DEFERRABLE (false)
+  std::vector<Entry> order;
+  void add_isolation(IsolationLevel level) {
+    isolation = level;
+    order.push_back({Mode::Isolation, level, false});
+  }
+  void add_flag(Mode mode, bool on) {
+    (mode == Mode::ReadOnly ? read_only : deferrable) = on;
+    order.push_back({mode, IsolationLevel::ReadCommitted, on});
+  }
+};
+
+// A run-time parameter of the session (docs/server_design.md, *Run-time
+// parameters*), transactional as PostgreSQL's are: `session` is what SET and
+// RESET leave, `local` what SET LOCAL leaves until the block ends.
+template <typename T>
+struct Setting {
+  T session;
+  std::optional<T> local;
+  [[nodiscard]] auto value() const -> T { return local.value_or(session); }
+  void set(T v) {
+    session = v;
+    local.reset();  // a SET overrides a SET LOCAL of the same block
+  }
+};
+
+// default_transaction_isolation, default_transaction_read_only and
+// default_transaction_deferrable: what a block or an autocommit statement
+// starts with when its BEGIN names no mode.
+struct TransactionDefaults {
+  Setting<IsolationLevel> isolation{IsolationLevel::ReadCommitted, {}};
+  Setting<bool> read_only{false, {}};
+  Setting<bool> deferrable{false, {}};
+  void end_block() {
+    isolation.local.reset();
+    read_only.local.reset();
+    deferrable.local.reset();
+  }
 };
 
 // A statement's text as the session takes it: nothing, a transaction
@@ -180,11 +250,13 @@ struct Classified {
   // monitor sends (docs/procedures_design.md, *Wire protocol for CALL*).
   // Stats: the one query of pg_stat_bytecask (docs/server_design.md, *Reading
   // the counters*).
-  enum class Kind { Empty, Control, Sql, Cursor, Call, Stat, Stats } kind{Kind::Empty};
+  // Show: SHOW of a run-time parameter the session keeps.
+  enum class Kind { Empty, Control, Sql, Cursor, Call, Stat, Stats, Show } kind{Kind::Empty};
   Control control{Control::Begin};
   std::string sql;       // Sql: the one statement, without its trailing ';'
   std::string encoding;  // SetEncoding: PostgreSQL's name for it
-  TransactionModes modes;  // SetTransaction
+  TransactionModes modes;  // SetTransaction, SetCharacteristics and Begin
+  std::optional<ast::VariableStatement> variable;  // SetVariable and Show
   std::optional<ast::CursorStatement> cursor;  // Cursor: DECLARE, FETCH, MOVE or CLOSE
   std::optional<ast::Call> call;               // Call
   std::string name;                            // Savepoint, RollbackTo and Release: the savepoint's, folded
@@ -302,51 +374,155 @@ auto client_encoding(std::string_view value) -> std::optional<std::string_view> 
                      "22023");
 }
 
-// The mode list of SET TRANSACTION, BEGIN and START TRANSACTION: ISOLATION LEVEL …, READ ONLY, READ WRITE,
-// [NOT] DEFERRABLE, with or without commas. The snapshot every transaction
-// reads is stronger than READ UNCOMMITTED, READ COMMITTED and REPEATABLE READ,
-// so those are taken and change nothing; SERIALIZABLE is not provided (the
-// guards it needs are not built: docs/transaction_design.md, *Isolation*).
-auto transaction_modes(std::string_view sql, std::size_t first) -> TransactionModes {
-  std::string spaced;
+auto upper(std::string_view word) -> std::string {
+  std::string out;
+  for (auto c : word) out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+  return out;
+}
+
+// A statement's words as written, split at white space and at each comma,
+// a comma being a word of its own: what transaction_modes reads.
+auto mode_words(std::string_view sql) -> std::vector<std::string> {
+  std::vector<std::string> words;
+  std::string w;
+  auto flush = [&] {
+    if (!w.empty()) words.push_back(std::exchange(w, {}));
+  };
   for (auto ch : sql) {
     if (ch == ',') {
-      spaced += " ";
+      flush();
+      words.emplace_back(",");
+    } else if (std::isspace(static_cast<unsigned char>(ch)) != 0) {
+      flush();
     } else {
-      spaced.push_back(ch);
+      w.push_back(ch);
     }
   }
-  auto words = upper_words(spaced);
+  flush();
+  return words;
+}
+
+// The mode list of SET TRANSACTION, BEGIN, START TRANSACTION and SET SESSION
+// CHARACTERISTICS AS TRANSACTION, as PostgreSQL's transaction_mode_list reads
+// it: ISOLATION LEVEL …, READ ONLY, READ WRITE, [NOT] DEFERRABLE, one or
+// more, a comma allowed between two of them and nowhere else. `words` are
+// the statement's mode_words; `first` counts those before the list.
+auto transaction_modes(const std::vector<std::string>& words, std::size_t first) -> TransactionModes {
+  auto syntax_error = [&](std::size_t k) {
+    if (k >= words.size()) return SessionError("syntax error at end of input", "42601");
+    return SessionError("syntax error at or near \"" + words[k] + "\"", "42601");
+  };
   TransactionModes modes;
+  using Mode = TransactionModes::Mode;
+  auto want_item = true;  // at the start, and after a comma
   for (auto i = first; i < words.size();) {
-    auto at = [&](std::size_t k) -> std::string_view { return i + k < words.size() ? words[i + k] : std::string_view{}; };
-    if (at(0) == "ISOLATION" && at(1) == "LEVEL") {
+    auto at = [&](std::size_t k) { return i + k < words.size() ? upper(words[i + k]) : std::string{}; };
+    if (at(0) == ",") {
+      if (want_item) throw syntax_error(i);
+      want_item = true;
+      ++i;
+      continue;
+    }
+    want_item = false;
+    if (at(0) == "ISOLATION") {
+      if (at(1) != "LEVEL") throw syntax_error(i + 1);
       if (at(2) == "SERIALIZABLE") {
-        throw SessionError("ISOLATION LEVEL SERIALIZABLE is not supported: transactions run at snapshot isolation", "0A000");
+        modes.add_isolation(IsolationLevel::Serializable);
+        i += 3;
+        continue;
       }
       if (at(2) == "REPEATABLE" && at(3) == "READ") {
-        modes.isolation = IsolationLevel::RepeatableRead;
+        modes.add_isolation(IsolationLevel::RepeatableRead);
       } else if (at(2) == "READ" && at(3) == "COMMITTED") {
-        modes.isolation = IsolationLevel::ReadCommitted;
+        modes.add_isolation(IsolationLevel::ReadCommitted);
       } else if (at(2) == "READ" && at(3) == "UNCOMMITTED") {
-        modes.isolation = IsolationLevel::ReadUncommitted;
+        modes.add_isolation(IsolationLevel::ReadUncommitted);
       } else {
-        throw SessionError("syntax error at or near \"" + std::string{at(2)} + "\"", "42601");
+        throw syntax_error(at(2) == "REPEATABLE" || at(2) == "READ" ? i + 3 : i + 2);
       }
       i += 4;
-    } else if (at(0) == "READ" && (at(1) == "ONLY" || at(1) == "WRITE")) {
-      modes.read_only = at(1) == "ONLY";
+    } else if (at(0) == "READ") {
+      if (at(1) != "ONLY" && at(1) != "WRITE") throw syntax_error(i + 1);
+      modes.add_flag(Mode::ReadOnly, at(1) == "ONLY");
       i += 2;
     } else if (at(0) == "DEFERRABLE") {
+      modes.add_flag(Mode::Deferrable, true);
       i += 1;
-    } else if (at(0) == "NOT" && at(1) == "DEFERRABLE") {
+    } else if (at(0) == "NOT") {
+      if (at(1) != "DEFERRABLE") throw syntax_error(i + 1);
+      modes.add_flag(Mode::Deferrable, false);
       i += 2;
     } else {
-      throw SessionError("syntax error at or near \"" + words[i] + "\"", "42601");
+      throw syntax_error(i);
     }
   }
-  if (words.size() <= first) throw SessionError("syntax error at end of input", "42601");
+  if (want_item) throw syntax_error(words.size());
   return modes;
+}
+
+// The run-time parameters the session keeps (docs/server_design.md,
+// *Run-time parameters*): the transaction modes, their defaults, and
+// client_encoding for SHOW.
+constexpr std::string_view kTransactionIsolation = "transaction_isolation";
+constexpr std::string_view kTransactionReadOnly = "transaction_read_only";
+constexpr std::string_view kTransactionDeferrable = "transaction_deferrable";
+constexpr std::string_view kDefaultIsolation = "default_transaction_isolation";
+constexpr std::string_view kDefaultReadOnly = "default_transaction_read_only";
+constexpr std::string_view kDefaultDeferrable = "default_transaction_deferrable";
+
+// A parameter's name as PostgreSQL's lookup matches it: any case, so that a
+// quoted "Transaction_Isolation" is transaction_isolation. An error names the
+// parameter as written, as PostgreSQL's does; SHOW's column, by this name.
+auto parameter_key(std::string_view name) -> std::string {
+  std::string out;
+  for (auto c : name) out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  return out;
+}
+
+auto session_variable(const ast::VariableStatement& v) -> bool {
+  using Kind = ast::VariableStatement::Kind;
+  if (v.kind == Kind::ResetAll) return true;
+  if (v.kind == Kind::Other) return false;
+  const auto key = parameter_key(v.name);
+  for (auto name : {kTransactionIsolation, kTransactionReadOnly, kTransactionDeferrable, kDefaultIsolation,
+                    kDefaultReadOnly, kDefaultDeferrable}) {
+    if (key == name) return true;
+  }
+  return v.kind == Kind::Show && key == "client_encoding";
+}
+
+// A SET's one value, as PostgreSQL's set_config_option takes it.
+auto one_value(const ast::VariableStatement& v) -> const std::string& {
+  if (v.values.size() != 1) throw SessionError("SET " + v.name + " takes only one argument", "22023");
+  return v.values.front();
+}
+
+// An isolation level's name, matched as PostgreSQL's enum parameter matches
+// it: any case, nothing else.
+auto isolation_value(const std::string& name, const std::string& value) -> IsolationLevel {
+  std::string lower;
+  for (auto c : value) lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  for (auto level : {IsolationLevel::Serializable, IsolationLevel::RepeatableRead, IsolationLevel::ReadCommitted,
+                     IsolationLevel::ReadUncommitted}) {
+    if (lower == isolation_name(level)) return level;
+  }
+  throw SessionError("invalid value for parameter \"" + name + "\": \"" + value + "\"", "22023",
+                     "Available values: serializable, repeatable read, read committed, read uncommitted.");
+}
+
+// A Boolean, as PostgreSQL's parse_bool reads it: a prefix of true, false,
+// yes or no, on, of(f), 1 or 0, any case.
+auto bool_value(const std::string& name, const std::string& value) -> bool {
+  auto prefix_of = [&](std::string_view word, std::size_t at_least) {
+    if (value.size() < at_least || value.size() > word.size()) return false;
+    for (std::size_t i = 0; i < value.size(); ++i) {
+      if (std::tolower(static_cast<unsigned char>(value[i])) != word[i]) return false;
+    }
+    return true;
+  };
+  if (prefix_of("true", 1) || prefix_of("yes", 1) || prefix_of("on", 2) || value == "1") return true;
+  if (prefix_of("false", 1) || prefix_of("no", 1) || prefix_of("off", 2) || value == "0") return false;
+  throw SessionError("parameter \"" + name + "\" requires a Boolean value", "22023");
 }
 
 auto classify(std::string_view text, const char* several_state, std::string_view several_message) -> Classified {
@@ -365,14 +541,17 @@ auto classify(std::string_view text, const char* several_state, std::string_view
     auto extra = words.size() > n && (words[n] == "WORK" || words[n] == "TRANSACTION") ? n + 1 : n;
     if (words.size() > extra) throw SessionError(w + " with options is not supported", "0A000");
   };
-  if (w == "BEGIN") {
-    auto first = words.size() > 1 && (words[1] == "WORK" || words[1] == "TRANSACTION") ? std::size_t{2} : std::size_t{1};
-    auto modes = words.size() > first ? transaction_modes(sql, first) : TransactionModes{};
+  // The statements with a mode list are read by mode_words, a comma a word of its own.
+  const auto mw = mode_words(sql);
+  auto mode = [&](std::size_t k) { return k < mw.size() ? upper(mw[k]) : std::string{}; };
+  if (mode(0) == "BEGIN") {
+    auto first = mode(1) == "WORK" || mode(1) == "TRANSACTION" ? std::size_t{2} : std::size_t{1};
+    auto modes = mw.size() > first ? transaction_modes(mw, first) : TransactionModes{};
     return {Classified::Kind::Control, Control::Begin, {}, {}, modes};
   }
-  if (w == "START") {
-    if (words.size() < 2 || words[1] != "TRANSACTION") throw SessionError("syntax error at or near \"START\"", "42601");
-    auto modes = words.size() > 2 ? transaction_modes(sql, 2) : TransactionModes{};
+  if (mode(0) == "START") {
+    if (mode(1) != "TRANSACTION") throw SessionError("syntax error at or near \"START\"", "42601");
+    auto modes = mw.size() > 2 ? transaction_modes(mw, 2) : TransactionModes{};
     return {Classified::Kind::Control, Control::Begin, {}, {}, modes};
   }
   if (w == "COMMIT" || w == "END") {
@@ -398,15 +577,20 @@ auto classify(std::string_view text, const char* several_state, std::string_view
     only(1);
     return {Classified::Kind::Control, Control::Rollback, {}, {}};
   }
-  if (w == "SET" && words.size() > 1 && words[1] == "TRANSACTION") {
-    auto modes = transaction_modes(sql, 2);
+  if (mode(0) == "SET" && mode(1) == "TRANSACTION") {
+    auto modes = transaction_modes(mw, 2);
     return {Classified::Kind::Control, Control::SetTransaction, {}, {}, modes};
   }
   // SET LOCAL TRANSACTION and SET SESSION TRANSACTION are SET TRANSACTION in
   // PostgreSQL: either way the modes last only for the block that is open.
-  if (w == "SET" && words.size() > 2 && (words[1] == "LOCAL" || words[1] == "SESSION") && words[2] == "TRANSACTION") {
-    auto modes = transaction_modes(sql, 3);
+  if (mode(0) == "SET" && (mode(1) == "LOCAL" || mode(1) == "SESSION") && mode(2) == "TRANSACTION") {
+    auto modes = transaction_modes(mw, 3);
     return {Classified::Kind::Control, Control::SetTransaction, {}, {}, modes};
+  }
+  if (mode(0) == "SET" && mode(1) == "SESSION" && mode(2) == "CHARACTERISTICS" && mode(3) == "AS" &&
+      mode(4) == "TRANSACTION") {
+    auto modes = transaction_modes(mw, 5);
+    return {Classified::Kind::Control, Control::SetCharacteristics, {}, {}, modes};
   }
   if (w == "SET") {
     // SET [SESSION] client_encoding {TO | =} 'UTF8': the server speaks UTF8,
@@ -425,6 +609,16 @@ auto classify(std::string_view text, const char* several_state, std::string_view
       auto encoding = client_encoding(set[at + 2]);
       if (!encoding) unsupported_encoding(set[at + 2]);
       return {Classified::Kind::Control, Control::SetEncoding, {}, std::string{*encoding}};
+    }
+  }
+  if (w == "SET" || w == "SHOW" || w == "RESET") {
+    // The run-time parameters the session keeps, read by PostgreSQL's
+    // grammar; any other is refused below.
+    if (auto v = ast::parse_variable(sql); v && session_variable(*v)) {
+      out.kind = v->kind == ast::VariableStatement::Kind::Show ? Classified::Kind::Show : Classified::Kind::Control;
+      out.control = Control::SetVariable;
+      out.variable = std::move(*v);
+      return out;
     }
   }
   if (w == "CALL" || w.starts_with("CALL(")) {
@@ -508,8 +702,9 @@ struct Prepared {
   Classified::Kind kind{Classified::Kind::Empty};
   Control control{Control::Begin};
   std::string encoding;            // SetEncoding
-  TransactionModes modes;          // SetTransaction
+  TransactionModes modes;          // SetTransaction, SetCharacteristics, Begin
   std::string name;                // Savepoint, RollbackTo, Release
+  std::optional<ast::VariableStatement> variable;  // SetVariable, Show
   // Sql, and a DECLARE's query: its text, and the record Parse fixed
   // (docs/server_design.md, *Extended query*). Each use resolves the text
   // where it runs: through the open block, or in autocommit.
@@ -803,7 +998,7 @@ private:
     try {
       throw;
     } catch (const SessionError& e) {
-      error(e.sqlstate(), e.what());
+      send_fields('E', "ERROR", e.sqlstate(), e.what(), 0, {}, e.hint());
     } catch (const TextError& e) {
       error(e.sqlstate(), e.what());
     } catch (const ProtocolError& e) {
@@ -822,11 +1017,38 @@ private:
     }
   }
 
-  // A transaction of the session's user.
+  // The open block's transaction, of the session's user: its level, and its
+  // READ ONLY when BEGIN or the defaults set it.
   [[nodiscard]] auto txn_options() const -> TransactionOptions {
     TransactionOptions o;
     o.user = user_;
+    o.isolation = api_isolation(isolation_);
+    o.read_only = read_only_;
     return o;
+  }
+
+  // A transaction of its own, for a statement outside a block: the defaults'
+  // level and READ ONLY.
+  [[nodiscard]] auto autocommit_options() const -> TransactionOptions {
+    TransactionOptions o;
+    o.user = user_;
+    o.isolation = api_isolation(defaults_.isolation.value());
+    o.read_only = defaults_.read_only.value();
+    return o;
+  }
+
+  // A statement outside a block, as its own transaction at the default
+  // level. With default_transaction_read_only on, it runs in a read-only
+  // transaction of its own, whose runtime refuses a write with 25006 as
+  // PostgreSQL does; a read-only transaction never conflicts, so it needs
+  // no retry.
+  auto autocommit_execute(const std::string& sql, const ResultCheck& check, const std::vector<Value>& params,
+                          const ExecutionOptions& opts) -> Rows {
+    if (!defaults_.read_only.value()) return db_.execute(sql, check, params, opts);
+    auto t = db_.begin(autocommit_options());
+    auto rows = t.execute(sql, check, params, opts);
+    (void)t.commit();
+    return rows;
   }
 
   // The options a statement runs with: the session's cancel flag (cleared
@@ -835,7 +1057,8 @@ private:
   // block is its own transaction.
   auto run_options() -> ExecutionOptions {
     auto now = std::chrono::steady_clock::now();
-    ExecutionOptions opts{.deadline = {}, .cancel = &cancel_, .user = user_};
+    ExecutionOptions opts{
+        .deadline = {}, .cancel = &cancel_, .user = user_, .isolation = api_isolation(defaults_.isolation.value())};
     txn_deadline_ = {};
     if (cfg_.statement_timeout.count() > 0) opts.deadline = now + cfg_.statement_timeout;
     if (cfg_.transaction_timeout.count() > 0) {
@@ -1045,6 +1268,7 @@ private:
     if (implicit_) {
       implicit_->rollback();
       implicit_.reset();
+      defaults_ = defaults_at_begin_;  // its SETs are rolled back with it
     }
   }
 
@@ -1103,17 +1327,18 @@ private:
     if (!in_block_) throw SessionError(std::string{what} + " can only be used in transaction blocks", "25P01");
   }
 
-  // BEGIN, COMMIT, ROLLBACK, SET TRANSACTION, SET client_encoding, SAVEPOINT,
-  // ROLLBACK TO or RELEASE; returns the command tag.
+  // BEGIN, COMMIT, ROLLBACK, SET TRANSACTION, SET SESSION CHARACTERISTICS, a
+  // SET or RESET of a parameter, SET client_encoding, SAVEPOINT, ROLLBACK TO
+  // or RELEASE; returns the command tag.
   // Ending a block drops every portal: a caller holds none across it.
-  auto run_control(Control c, const std::string& encoding, TransactionModes modes, const std::string& savepoint)
-      -> std::string {
+  auto run_control(Control c, const std::string& encoding, const TransactionModes& modes, const std::string& savepoint,
+                   const std::optional<ast::VariableStatement>& variable) -> std::string {
     switch (c) {
       case Control::Savepoint:
         refuse_if_failed();
         require_block("SAVEPOINT");
         txn_->savepoint(savepoint);
-        savepoints_.push_back({savepoint, read_only_});
+        savepoints_.push_back({savepoint, read_only_, defaults_});
         return "SAVEPOINT";
       case Control::Release: {
         refuse_if_failed();
@@ -1129,9 +1354,13 @@ private:
       }
       case Control::RollbackTo: {
         require_block("ROLLBACK TO SAVEPOINT");  // in a failed block too: this is what ends the failure
+        // A BEGIN the engine refused leaves a failed block with no
+        // transaction, and so no savepoint.
+        if (!txn_) throw SessionError("savepoint \"" + savepoint + "\" does not exist", "3B001");
         txn_->rollback_to(savepoint);
         auto k = find_savepoint(savepoint).value_or(0);
         read_only_ = savepoints_.at(k).read_only;
+        defaults_ = savepoints_.at(k).defaults;  // a SET since the savepoint is undone, as PostgreSQL's
         savepoints_.erase(savepoints_.begin() + static_cast<std::ptrdiff_t>(k + 1), savepoints_.end());
         // As PostgreSQL's AtSubAbort_Portals: the portals bound since the savepoint go.
         std::erase_if(portals_, [&](const auto& e) { return e.second.savepoints > k; });
@@ -1143,21 +1372,34 @@ private:
         if (in_block_) {
           refuse_if_failed();
           warning("25001", "there is already a transaction in progress");
+          set_modes(modes);  // PostgreSQL sets them as SET TRANSACTION would
           return "BEGIN";
         }
         if (implicit_) {
-          txn_ = std::move(implicit_);  // BEGIN inside an implicit block makes it explicit
+          // BEGIN inside an implicit block makes it explicit. Its modes are
+          // checked first: the block has run a statement, and a refusal
+          // rolls the implicit block back, as in PostgreSQL.
+          set_modes(modes);
+          txn_ = std::move(implicit_);
           implicit_.reset();
-        } else {
-          txn_.emplace(db_.begin(txn_options()));
-          txn_started_ = std::chrono::steady_clock::now();
-          start_modes();
+          savepoints_.clear();
+          in_block_ = true;
+          failed_ = false;
+          return "BEGIN";
         }
+        start_modes();
+        if (modes.isolation) isolation_ = *modes.isolation;
+        if (modes.read_only) read_only_ = *modes.read_only;
+        if (modes.deferrable) deferrable_ = *modes.deferrable;
+        defaults_at_begin_ = defaults_;
+        txn_started_ = std::chrono::steady_clock::now();
         savepoints_.clear();
         in_block_ = true;
         failed_ = false;
-        if (modes.read_only) read_only_ = *modes.read_only;
-        if (modes.isolation) isolation_ = *modes.isolation;
+        // The block's level and READ ONLY reach the transaction. A refusal
+        // (SERIALIZABLE on a follower, 0A000) fails the block, as
+        // PostgreSQL's BEGIN does.
+        txn_.emplace(db_.begin(txn_options()));
         return "BEGIN";
       case Control::Commit: {
         end_transaction();
@@ -1167,6 +1409,7 @@ private:
           in_block_ = false;
           if (std::exchange(failed_, false)) {
             txn_.reset();
+            defaults_ = defaults_at_begin_;
             return "ROLLBACK";  // COMMIT of a failed block rolls it back
           }
           t = std::move(txn_);
@@ -1178,34 +1421,25 @@ private:
           warning("25P01", "there is no transaction in progress");
           return "COMMIT";
         }
-        return t->commit() == CommitOutcome::Committed ? "COMMIT" : "ROLLBACK";
+        return commit_block(*t) ? "COMMIT" : "ROLLBACK";
       }
       case Control::SetTransaction:
         refuse_if_failed();
-        if (!in_block_ && !implicit_) {
-          warning("25P01", "SET TRANSACTION can only be used in transaction blocks");
-          return "SET";
-        }
-        // As PostgreSQL's check_transaction_isolation: only a change of level is refused.
-        if (modes.isolation && *modes.isolation != isolation_) {
-          if (block_used_) {
-            throw SessionError("SET TRANSACTION ISOLATION LEVEL must be called before any query", "25001");
-          }
-          if (!savepoints_.empty()) {
-            throw SessionError("SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction", "25001");
-          }
-        }
-        if (modes.read_only) {
-          if (!*modes.read_only && read_only_ && !savepoints_.empty()) {
-            throw SessionError("cannot set transaction read-write mode inside a read-only transaction", "25001");
-          }
-          if (!*modes.read_only && read_only_ && block_used_) {
-            throw SessionError("transaction read-write mode must be set before any query", "25001");
-          }
-          read_only_ = *modes.read_only;
-        }
-        if (modes.isolation) isolation_ = *modes.isolation;
+        // An extended-query pipeline's implicit block is no transaction
+        // block to PostgreSQL either: it warns, and still sets the modes.
+        if (!in_block_) warning("25P01", "SET TRANSACTION can only be used in transaction blocks");
+        if (in_some_block()) set_modes(modes);
         return "SET";
+      case Control::SetCharacteristics:
+        refuse_if_failed();
+        // Each mode sets its default, transactionally, as a SET of it does.
+        if (modes.isolation) defaults_.isolation.set(*modes.isolation);
+        if (modes.read_only) defaults_.read_only.set(*modes.read_only);
+        if (modes.deferrable) defaults_.deferrable.set(*modes.deferrable);
+        return "SET";
+      case Control::SetVariable:
+        refuse_if_failed();
+        return set_variable(*variable);
       case Control::SetEncoding:
         refuse_if_failed();
         encoding_ = encoding;
@@ -1222,15 +1456,187 @@ private:
           txn_.reset();
           in_block_ = false;
           failed_ = false;
+          defaults_ = defaults_at_begin_;
         } else if (implicit_) {
           implicit_->rollback();
           implicit_.reset();
+          defaults_ = defaults_at_begin_;
         } else {
           warning("25P01", "there is no transaction in progress");
         }
         return "ROLLBACK";
     }
     return {};
+  }
+
+  // Commits a block's transaction, explicit or implicit. The block's SET
+  // LOCALs end with it; its SETs stay only if it committed, as PostgreSQL's
+  // parameters do.
+  auto commit_block(Transaction& t) -> bool {
+    auto committed = false;
+    try {
+      committed = t.commit() == CommitOutcome::Committed;
+    } catch (...) {
+      defaults_ = defaults_at_begin_;
+      throw;
+    }
+    if (committed) {
+      defaults_.end_block();
+    } else {
+      defaults_ = defaults_at_begin_;
+    }
+    return committed;
+  }
+
+  // The modes of SET TRANSACTION, or of BEGIN in a block, each checked as
+  // PostgreSQL checks it, in the order written.
+  void set_modes(const TransactionModes& modes) {
+    for (const auto& m : modes.order) {
+      switch (m.mode) {
+        case TransactionModes::Mode::Isolation: set_isolation(m.level); break;
+        case TransactionModes::Mode::ReadOnly: set_read_only(m.on); break;
+        case TransactionModes::Mode::Deferrable: set_deferrable(m.on); break;
+      }
+    }
+  }
+
+  // As PostgreSQL's check_transaction_isolation: only a change of level is
+  // refused, after a query first, then in a subtransaction. The level
+  // reaches the open block's transaction, which refuses SERIALIZABLE on a
+  // follower.
+  void set_isolation(IsolationLevel level) {
+    if (level == isolation_) return;
+    if (block_used_) throw SessionError("SET TRANSACTION ISOLATION LEVEL must be called before any query", "25001");
+    if (!savepoints_.empty()) {
+      throw SessionError("SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction", "25001");
+    }
+    if (auto* b = block()) b->set_isolation(api_isolation(level));
+    isolation_ = level;
+  }
+
+  // As PostgreSQL's check_transaction_read_only: READ WRITE in a read-only
+  // block is refused in a subtransaction first, then after a query. READ
+  // ONLY set before the block's first query, with no savepoint open, reaches
+  // the transaction (docs/transaction_design.md, *Choosing the level*); set
+  // later, the session enforces it, and RELEASE and ROLLBACK TO restore it.
+  void set_read_only(bool read_only) {
+    if (!read_only && read_only_ && !savepoints_.empty()) {
+      throw SessionError("cannot set transaction read-write mode inside a read-only transaction", "25001");
+    }
+    if (!read_only && read_only_ && block_used_) {
+      throw SessionError("transaction read-write mode must be set before any query", "25001");
+    }
+    auto* b = block();
+    if (b != nullptr && !block_used_ && savepoints_.empty() && b->read_only() != read_only) {
+      try {
+        b->set_read_only(read_only);
+      } catch (const ast::SqlError& e) {
+        // READ ONLY after what the transaction counts as a query (a Parse
+        // that pinned its catalog): the session enforces it instead.
+        if (!read_only || sqlstate(e) != "25001") throw;
+      }
+    }
+    read_only_ = read_only;
+  }
+
+  // As PostgreSQL's check_transaction_deferrable: in a subtransaction first,
+  // then after a query, even when the value is unchanged. DEFERRABLE never
+  // waits: a read-only SERIALIZABLE transaction records nothing and never
+  // fails (docs/transaction_design.md, *Read-only serializable transactions*).
+  void set_deferrable(bool deferrable) {
+    if (!savepoints_.empty()) {
+      throw SessionError("SET TRANSACTION [NOT] DEFERRABLE cannot be called within a subtransaction", "25001");
+    }
+    if (block_used_) throw SessionError("SET TRANSACTION [NOT] DEFERRABLE must be called before any query", "25001");
+    deferrable_ = deferrable;
+  }
+
+  [[nodiscard]] auto in_some_block() const -> bool { return in_block_ || implicit_.has_value(); }
+
+  // SET, SET TO DEFAULT, RESET and RESET ALL of the parameters the session
+  // keeps (docs/server_design.md, *Run-time parameters*); returns the tag.
+  auto set_variable(const ast::VariableStatement& v) -> std::string {
+    using Kind = ast::VariableStatement::Kind;
+    if (v.kind == Kind::ResetAll) {
+      defaults_.isolation.set(IsolationLevel::ReadCommitted);
+      defaults_.read_only.set(false);
+      defaults_.deferrable.set(false);
+      return "RESET";
+    }
+    const auto tag = v.kind == Kind::Reset ? "RESET" : "SET";
+    const auto block = in_some_block();
+    // PostgreSQL warns of a SET LOCAL outside an explicit block before it
+    // reads the value; in an implicit block it still lasts to the block's end.
+    if (v.local && !in_block_) warning("25P01", "SET LOCAL can only be used in transaction blocks");
+    const auto given = v.kind == Kind::Set;
+    const auto key = parameter_key(v.name);
+    if (key == kTransactionIsolation || key == kTransactionReadOnly || key == kTransactionDeferrable) {
+      if (!given) throw SessionError("parameter \"" + v.name + "\" cannot be reset", "0A000");
+      const auto& value = one_value(v);
+      // Outside a block the value is read and changes nothing, as in PostgreSQL.
+      if (key == kTransactionIsolation) {
+        auto level = isolation_value(v.name, value);
+        if (block) set_isolation(level);
+      } else if (key == kTransactionReadOnly) {
+        auto on = bool_value(v.name, value);
+        if (block) set_read_only(on);
+      } else {
+        auto on = bool_value(v.name, value);
+        if (block) set_deferrable(on);
+      }
+      return tag;
+    }
+    auto apply = [&](auto& setting, auto value) {
+      if (!v.local) {
+        setting.set(value);
+      } else if (block) {
+        setting.local = value;
+      }
+    };
+    if (key == kDefaultIsolation) {
+      apply(defaults_.isolation, given ? isolation_value(v.name, one_value(v)) : IsolationLevel::ReadCommitted);
+    } else if (key == kDefaultReadOnly) {
+      apply(defaults_.read_only, given && bool_value(v.name, one_value(v)));
+    } else {
+      apply(defaults_.deferrable, given && bool_value(v.name, one_value(v)));
+    }
+    return tag;
+  }
+
+  // SHOW of a parameter the session keeps: a row of its value, as text,
+  // under its name. In a block the transaction modes are the block's;
+  // outside one, the defaults a block would start with.
+  void reply_show(const ast::VariableStatement& v, bool describe_it) {
+    refuse_if_failed();
+    const auto block = in_some_block();
+    const auto key = parameter_key(v.name);
+    auto on_off = [](bool b) -> std::string { return b ? "on" : "off"; };
+    std::string value;
+    if (key == kTransactionIsolation) {
+      value = isolation_name(block ? isolation_ : defaults_.isolation.value());
+    } else if (key == kTransactionReadOnly) {
+      value = on_off(block ? read_only_ : defaults_.read_only.value());
+    } else if (key == kTransactionDeferrable) {
+      value = on_off(block ? deferrable_ : defaults_.deferrable.value());
+    } else if (key == kDefaultIsolation) {
+      value = isolation_name(defaults_.isolation.value());
+    } else if (key == kDefaultReadOnly) {
+      value = on_off(defaults_.read_only.value());
+    } else if (key == kDefaultDeferrable) {
+      value = on_off(defaults_.deferrable.value());
+    } else {
+      value = encoding_;  // client_encoding
+    }
+    if (describe_it) row_description(show_columns(v));
+    Rows rows{.columns = {key}, .types = {SqlType{SqlKind::Text}}};
+    auto bytes = std::as_bytes(std::span{value});
+    rows.rows.push_back({Bytes(bytes.begin(), bytes.end())});
+    data_rows(rows);
+    complete("SHOW");
+  }
+
+  static auto show_columns(const ast::VariableStatement& v) -> std::vector<ResultColumn> {
+    return {{parameter_key(v.name), SqlType{SqlKind::Text}}};
   }
 
   // ------------------------------------------------------------ cursors
@@ -1309,7 +1715,11 @@ private:
     const auto none = ResultCheck::none();
     if (in_block_) return txn_->open_cursor(d.query, none, params, kind, scrolling);
     if (implicit_) return implicit_->open_cursor(d.query, none, params, kind, scrolling);
-    auto t = db_.begin(txn_options());
+    // Its own transaction writes nothing but a FOR UPDATE's guards, so it is
+    // read-only otherwise: a hold cursor at SERIALIZABLE is taken then.
+    auto o = autocommit_options();
+    o.read_only = o.read_only || !d.for_update;
+    auto t = db_.begin(o);
     auto cursor = t.open_cursor(d.query, none, params, kind, scrolling);
     (void)t.commit();
     return cursor;
@@ -1325,7 +1735,7 @@ private:
     try {
       if (in_block_) return txn_->execute_current_of(sql, check, params, cursor.cursor, opts);
       if (implicit_) return implicit_->execute_current_of(sql, check, params, cursor.cursor, opts);
-      auto t = db_.begin(txn_options());
+      auto t = db_.begin(autocommit_options());
       auto rows = t.execute_current_of(sql, check, params, cursor.cursor, opts);
       (void)t.commit();
       return rows;
@@ -1449,7 +1859,8 @@ private:
           complete(reply.tag);
           break;
         }
-        case Classified::Kind::Control: complete(run_control(c.control, c.encoding, c.modes, c.name)); break;
+        case Classified::Kind::Control: complete(run_control(c.control, c.encoding, c.modes, c.name, c.variable)); break;
+        case Classified::Kind::Show: reply_show(*c.variable, true); break;
         case Classified::Kind::Stats: reply_stats(true); break;
         case Classified::Kind::Call: run_call(c); break;
         case Classified::Kind::Stat: {
@@ -1479,7 +1890,7 @@ private:
           auto rows = !record.current_of.empty() ? run_positioned(c.sql, record, none, {}, opts)
                       : in_block_                ? txn_->execute(c.sql, none, {}, opts)
                       : implicit_                ? implicit_->execute(c.sql, none, {}, opts)
-                                                 : db_.execute(c.sql, none, {}, opts);
+                                                 : autocommit_execute(c.sql, none, {}, opts);
           if (returns_rows(record)) {
             std::vector<ResultColumn> cols;
             for (std::size_t i = 0; i < rows.columns.size(); ++i) cols.push_back({rows.columns[i], rows.types.at(i)});
@@ -1494,7 +1905,7 @@ private:
       if (implicit_) {
         auto t = std::move(*implicit_);
         implicit_.reset();
-        (void)t.commit();
+        (void)commit_block(t);
       }
     } catch (...) {
       report(last_text_);
@@ -1513,7 +1924,7 @@ private:
       auto t = std::move(*implicit_);
       implicit_.reset();
       try {
-        (void)t.commit();
+        (void)commit_block(t);
       } catch (...) {
         report({});
       }
@@ -1545,7 +1956,7 @@ private:
     if (c.kind == Classified::Kind::Call || c.kind == Classified::Kind::Stat) {
       throw SessionError("this statement runs as a simple Query, not as a prepared statement", "0A000");
     }
-    Prepared p{c.kind, c.control, c.encoding, c.modes, c.name, {}, std::nullopt, std::move(c.cursor)};
+    Prepared p{c.kind, c.control, c.encoding, c.modes, c.name, std::move(c.variable), {}, std::nullopt, std::move(c.cursor)};
     if (c.kind == Classified::Kind::Stats) refuse_if_failed();
     if (c.kind == Classified::Kind::Cursor) {
       refuse_if_failed();
@@ -1623,6 +2034,10 @@ private:
   void describe_result(const Prepared& p) {
     if (p.kind == Classified::Kind::Stats) {
       row_description(stats_columns());
+      return;
+    }
+    if (p.kind == Classified::Kind::Show) {
+      row_description(show_columns(*p.variable));
       return;
     }
     if (p.kind == Classified::Kind::Cursor) {
@@ -1711,8 +2126,26 @@ private:
       return true;
     }
     if (p.kind == Classified::Kind::Control) {
-      auto [control, encoding, modes, savepoint] = std::tuple{p.control, p.encoding, p.modes, p.name};  // run_control may drop the portal
-      complete(run_control(control, encoding, modes, savepoint));
+      // Copied: run_control may drop the portal.
+      auto [control, encoding, modes, savepoint, variable] = std::tuple{p.control, p.encoding, p.modes, p.name, p.variable};
+      auto flush_after = false;
+      if (!in_some_block() && opens_implicit_block(control)) {
+        // A SET of a transaction mode or default, first of two or more
+        // statements, runs in the implicit block as PostgreSQL's does: the
+        // block's modes are the defaults it found, and a failure undoes it.
+        switch (lookahead(flush_after)) {
+          case Lookahead::Wait: return false;
+          case Lookahead::Ended: return true;
+          case Lookahead::Sync: break;
+          case Lookahead::Other: start_implicit(); break;
+        }
+      }
+      complete(run_control(control, encoding, modes, savepoint, variable));
+      if (flush_after) flush();
+      return true;
+    }
+    if (p.kind == Classified::Kind::Show) {
+      reply_show(*p.variable, false);
       return true;
     }
     if (p.kind == Classified::Kind::Stats) {
@@ -1748,13 +2181,10 @@ private:
         case Lookahead::Sync:
           // The block's one statement, as PQexecParams sends it: autocommit,
           // with its conflict retry, as a simple Query runs it.
-          rows = db_.execute(p.sql, check, portal.params, run_options());
+          rows = autocommit_execute(p.sql, check, portal.params, run_options());
           break;
         case Lookahead::Other:
-          // Two or more: PostgreSQL's implicit transaction, committed at Sync.
-          implicit_.emplace(db_.begin(txn_options()));
-          txn_started_ = std::chrono::steady_clock::now();
-          start_modes();
+          start_implicit();
           block_used_ = true;
           rows = implicit_->execute(p.sql, check, portal.params, run_options());
           reply(record, rows);
@@ -1766,17 +2196,47 @@ private:
     return true;
   }
 
+  // Two or more statements before Sync: PostgreSQL's implicit transaction,
+  // started by the first and committed at Sync.
+  void start_implicit() {
+    start_modes();
+    defaults_at_begin_ = defaults_;
+    implicit_.emplace(db_.begin(txn_options()));
+    txn_started_ = std::chrono::steady_clock::now();
+  }
+
+  // The controls that read or change what a block runs with: as the first
+  // of an extended-query block, they start it. BEGIN starts its own; COMMIT,
+  // ROLLBACK and the savepoints act on an explicit block; client_encoding is
+  // not transactional here.
+  static auto opens_implicit_block(Control c) -> bool {
+    switch (c) {
+      case Control::SetTransaction:
+      case Control::SetCharacteristics:
+      case Control::SetVariable: return true;
+      case Control::Begin:
+      case Control::Commit:
+      case Control::Rollback:
+      case Control::Savepoint:
+      case Control::Release:
+      case Control::RollbackTo:
+      case Control::SetEncoding: return false;
+    }
+    return false;
+  }
+
   void reply(const StatementRecord& record, const Rows& rows) {
     data_rows(rows);
     notices(rows);
     complete(command_tag(record.command, rows));
   }
 
-  // A new transaction starts with PostgreSQL's defaults: read write, READ
-  // COMMITTED, no query yet.
+  // A new block starts with the session's defaults (PostgreSQL's: READ
+  // COMMITTED, read write, not deferrable, unless SET), no query yet.
   void start_modes() {
-    read_only_ = false;
-    isolation_ = IsolationLevel::ReadCommitted;
+    read_only_ = defaults_.read_only.value();
+    isolation_ = defaults_.isolation.value();
+    deferrable_ = defaults_.deferrable.value();
     block_used_ = false;
   }
 
@@ -1789,7 +2249,11 @@ private:
     last_text_ = c.sql;
     if (in_block_ && failed_) (void)ast::parse_call(c.sql);  // a syntax error reports that, not 25P02
     refuse_if_failed();
-    if ((in_block_ || implicit_) && read_only_) throw SessionError("cannot execute CALL in a read-only transaction", "25006");
+    // A block READ ONLY only in the session refuses every CALL; one whose
+    // transaction is read-only refuses the body's first write, as PostgreSQL does.
+    if (auto* b = block(); b != nullptr && read_only_ && !b->read_only()) {
+      throw SessionError("cannot execute CALL in a read-only transaction", "25006");
+    }
     if (in_block_ || implicit_) block_used_ = true;
     // The procedure as the block's catalog has it, in a block; its schema
     // as written, public for none (docs/catalog_design.md, *The path*).
@@ -1810,9 +2274,18 @@ private:
     auto args = bound::call_arguments(*c.call, *def);
     auto opts = run_options();
     auto at = QualifiedName{def->schema, def->name};
-    auto rows = in_block_  ? txn_->call(at, args, opts)
-                : implicit_ ? implicit_->call(at, args, opts)
-                            : db_.call(at, args, opts);
+    Rows rows;
+    if (in_block_) {
+      rows = txn_->call(at, args, opts);
+    } else if (implicit_) {
+      rows = implicit_->call(at, args, opts);
+    } else if (defaults_.read_only.value()) {
+      auto t = db_.begin(autocommit_options());  // read-only: it never conflicts
+      rows = t.call(at, args, opts);
+      (void)t.commit();
+    } else {
+      rows = db_.call(at, args, opts);
+    }
     if (!rows.columns.empty()) {
       row_description(result_columns(rows));
       data_rows(rows);
@@ -1858,13 +2331,18 @@ private:
   std::map<std::string, SessionCursor> cursors_;  // the block's cursors; they share the portals' namespace
   // The explicit block's savepoints, oldest first, each with the read-only
   // mode it was taken in: PostgreSQL's subtransaction restores it when it ends.
+  // The parameters' values when it was taken, which ROLLBACK TO restores.
   struct SessionSavepoint {
     std::string name;
     bool read_only{false};
+    TransactionDefaults defaults;
   };
   std::vector<SessionSavepoint> savepoints_;
   bool read_only_{false};   // SET TRANSACTION READ ONLY, for the block that is open
   IsolationLevel isolation_{IsolationLevel::ReadCommitted};  // the open block's named level
+  bool deferrable_{false};  // the open block's DEFERRABLE
+  TransactionDefaults defaults_;           // the session's
+  TransactionDefaults defaults_at_begin_;  // as the open block found them: its ROLLBACK restores them
   bool block_used_{false};  // the open block has run a statement
   std::optional<Transaction> txn_;       // the explicit block's, from BEGIN
   std::optional<Transaction> implicit_;  // an extended block of several statements, outside BEGIN

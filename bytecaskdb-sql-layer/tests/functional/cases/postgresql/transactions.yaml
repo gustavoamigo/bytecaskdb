@@ -106,8 +106,6 @@
 
 - name: SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
   features: [E152-01]
-  # snapshot isolation only: the serializable guards are not built (0A000)
-  unimplemented: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
   steps:
