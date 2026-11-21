@@ -132,6 +132,19 @@ Namespace `0x01`, as the plugin's catalog is:
 | `01 0A <id:4>` | A type record: a domain or a shell type (*Domains, shell types and sequences*). |
 | `01 0B <name>` | Type name entry: kind 7 and id. Domains and shell types share this namespace, and a table's or view's name counts in it, as its row type does in PostgreSQL. |
 | `01 0C <id:4>` | A sequence record. Its name entry is `01 03`, kind 6: sequences are relations, with no row type. |
+| `01 0D <id:4>` | The schema record (*Schemas*). |
+| `01 0E <name>` | Schema name entry: kind 8 and id (4, big-endian). Schemas have a namespace of their own (*Schemas*). |
+
+**Every key under `0x01` is one of this table's.** The counters are read by
+key, so under `01 01` only `01 01 01` and `01 01 02` may exist; the other
+sub-prefixes are `02` to `0E`, every one in between known. Any other key (`01`
+itself, a sub-prefix `00` or `0F` to `FF`, a third counter `01 01 03`, or a
+counter's key with bytes after it) is refused at load as written by a later
+build, naming its first bytes, so a record kind or counter a later build adds
+is never ignored by this one. Five `Snapshot::count_keys` ranges check it,
+at most two record reads each, whatever the catalog holds. A new record kind
+takes the next sub-prefix and moves `kSubLast`; a new counter moves
+`kCounterLast`.
 
 **The counters are 8 bytes**, and the next id at most one past
 `kMaxObjectId`; any other value is refused at load. **One id counter** gives every table, index and layout its id, so an id
@@ -683,7 +696,9 @@ and stage 1b (the schema record, `CREATE SCHEMA` and `DROP SCHEMA` without
 elements or `CASCADE`, qualified names; *Stages of schemas* says what was
 adapted), stage 2 (`CREATE SCHEMA` with elements), stage 3 (`WITH
 CHECK OPTION`) and stage 5 (`DROP SCHEMA … CASCADE`); stage 4 (schema
-privileges) is deferred to #873, as Q9 (b) has it. This section covers what
+privileges) is deferred to #873, as Q9 (b) has it. Q8 (a) is built in its
+own PR: a key under an unknown `0x01` sub-prefix, or a third counter, is
+refused at load (*Storage*). This section covers what
 `CREATE SCHEMA` and `DROP SCHEMA` do, how a schema-qualified name resolves,
 the schema record and the change to the name entries' keys, what an older
 build does with a database that holds a schema, `WITH CHECK OPTION` (which
@@ -1005,7 +1020,7 @@ column default's too (*Risks*).
 
 ### Schema catalog record and name entry keys
 
-New keys under namespace `0x01` (*Storage*); `0D` and `0E` are free today:
+Keys under namespace `0x01` (*Storage*):
 
 | Key | Value |
 |---|---|
@@ -1356,6 +1371,7 @@ makes it. Rows are named by their first words.
 | "`Database::open` of a database written by an SQL-layer build from before #780" | Unchanged in substance: a database holding a record this build wrote, any schema included, is refused by a build from before stage 1b. Proved by the older build's own "catalog: a damaged or foreign-format record is refused" and by this build's test that every record and ACL it writes is in the new format. |
 | "A DDL statement given to a `Transaction`" | **Widened** to `CREATE SCHEMA` and `DROP SCHEMA`; a `CREATE SCHEMA`'s elements are steps of the transaction; `DROP SCHEMA … CASCADE` of what an open cursor reads is 55006 (stage 5, built). Tests: stage 1b and 5's `api_txn_ddl_test` cases. |
 | New, stage 1b | **Added**: qualified names resolve to that schema's object or fail with PG 17's SQLSTATE (3F000, 42P01, 42704, 42883, 42501, 0A000, 42601); an unqualified name resolves in `public`; `CREATE SCHEMA`/`DROP SCHEMA` errors (42P06, 42939, 3F000, 2BP01). Tests (as built): "schemas: CREATE and DROP SCHEMA errors are PostgreSQL's", "schemas: messages name a missing object as s.x, and DROP SCHEMA and DROP ROLE list as PostgreSQL 17 does", "schemas: a schema is a record, a name entry and an ACL record, and its objects are its own through a reopen", "catalog: lookups are keyed by (schema, name), and a DDL creating in a schema that does not exist is refused", `tests/functional/cases/postgresql/schemas.yaml`, sqltest f311_01_01_01; the row in `CONTRACT.md` names the rest. |
+| "A catalog the build cannot decode is refused at open", Q8 (a) | **Narrowed** (built, its own PR): a key under `0x01` outside the known set (sub-prefix `00` or `0F` to `FF`, a counter other than `01 01 01` and `01 01 02`) is refused at open, where it was ignored. Tests: "catalog: a catalog with the counters and every known sub-prefix opens", "catalog: a key under an unknown sub-prefix, or a third counter, is refused at load". |
 | New, before stage 1 | **Narrowed**: a type name qualified by anything but `pg_catalog.` is refused (3F000, or 42704 for `public.`), where its last part was read alone. Test: "parser: a qualified type name other than pg_catalog's is refused". |
 | New, stage 2 | **Added**: a view resolves each unqualified name to the object it was created against, whatever is created later. Tests: stage 2's shadowing test, through a reopen. |
 | New, stage 3 | **Added** (built): a row written through a view with a check option that its checked `WHERE`s do not hold true is 44000 and writes nothing. Tests: "embedded API: a view WITH CHECK OPTION refuses a row its checked WHEREs do not hold true of", the view record's round trip in "schemas: a record of an earlier format reads as an object of public", `tests/functional/cases/postgresql/views.yaml`, sqltest f311_04_01_01..03. |
@@ -1782,7 +1798,10 @@ element's text, stage order) are decided above.
   refused like an unknown sub-prefix), a test that a fixture with only
   counters and every current sub-prefix still opens, and one refusal test
   per unknown byte. (b) Bundle it into stage 1b. (c) Leave it.
-  **Recommended: (a).**
+  **Recommended: (a).** Built as (a): `Catalog::load` checks the key set
+  first (*Storage*); tests "catalog: a catalog with the counters and every
+  known sub-prefix opens" and "catalog: a key under an unknown sub-prefix,
+  or a third counter, is refused at load".
 - **Q9. Scope: stages 4 and 5.** No F311 case needs either. Stage 4 stores
   privileges nothing enforces (#653); stage 5 is the layer's first CASCADE
   closure, with a batch bounded only by the schema's size. (a) Build both
@@ -1831,14 +1850,16 @@ temporary schemas (`pg_temp`), privilege enforcement (#653), `DROP TABLE`
 and `DROP VIEW … CASCADE` (Q3), `UPDATE` and `DELETE` through a view with
 a check option (#678), the view-option and `OR REPLACE` forms of a check
 option, `CREATE TRIGGER` elements, schema-qualified operators and
-functions other than `pg_catalog.`'s, refusing unknown `0x01`
-sub-prefixes (Q8).
+functions other than `pg_catalog.`'s. Refusing unknown `0x01` sub-prefixes
+(Q8) is not a schema stage; it is built in a PR of its own (*Storage*).
 
 ## Tests
 
 `tests/catalog_test.cpp`: the record round-trips; a record cut at every
 byte, with a bad type code, an unknown key column or trailing bytes, and a
-format-2 record, are refused; each DDL survives a reopen; a DDL refused by
+format-2 record, are refused; a key under an unknown `0x01` sub-prefix,
+and a third counter, are refused, while the counters and every known
+sub-prefix open; each DDL survives a reopen; a DDL refused by
 the engine (a follower) leaves nothing on disk or in memory; a drop leaves
 no key under the table's or index's prefix; the name entries and the
 records agree; a reader pinned while a DDL is held mid-commit returns at once
