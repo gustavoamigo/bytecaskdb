@@ -366,8 +366,8 @@ struct GroupEmit {
 // the default bc_row_begin writes.
 struct Insert {
   std::uint32_t table{0};
-  std::vector<std::pair<ColumnRef, Expr>> values;
-  std::vector<Expr> checks;  // logical::Insert's, evaluated over the row as written
+  std::vector<std::vector<std::pair<ColumnRef, Expr>>> rows;  // each row's columns, written in order
+  std::vector<Expr> checks;  // logical::Insert's, evaluated over each row as written
 };
 
 // UPDATE and DELETE write each row their input gives, read from the
@@ -1334,8 +1334,11 @@ private:
             }
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Insert>) {
-            if (op.values.empty()) broken("an insert that sets no column");
-            for (const auto& [col, e] : op.values) params(e);
+            if (op.rows.empty()) broken("an insert of no row");
+            for (const auto& row : op.rows) {
+              if (row.empty()) broken("an insert that sets no column");
+              for (const auto& [col, e] : row) params(e);
+            }
             for (const auto& c : op.checks) params(c);
           } else if constexpr (std::is_same_v<T, Update>) {
             if (op.set.empty()) broken("an update that sets no column");

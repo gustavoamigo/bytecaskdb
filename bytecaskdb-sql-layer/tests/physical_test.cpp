@@ -169,7 +169,8 @@ TEST_CASE("physical: check refuses what codegen can't print", "[sql][physical]")
   refused(plan(node(physical::Limit{get({p(0)}), 1})), "LIMIT not under");
   CHECK(refusal(plan(emit(node(physical::Limit{get({p(0)}), 1})))).empty());
 
-  refused(plan(node(physical::Insert{1, {}})), "sets no column");
+  refused(plan(node(physical::Insert{1, {}})), "an insert of no row");
+  refused(plan(node(physical::Insert{1, {{}}})), "sets no column");
   refused(plan(node(physical::Update{get({p(0)}), 1, {}})), "sets no column");
   auto d_minus = logical::binary(logical::Expr::Kind::Sub, logical::column(kD, SqlType{SqlKind::Double}), p(1),
                                  SqlType{SqlKind::Double});
@@ -202,7 +203,7 @@ TEST_CASE("physical: a nested loop reads its inner scan once, under one outer ro
   };
   CHECK(refusal(plan(loop(get({p(0)}), counted()))).empty());
   refused(plan(loop(node(scan({p(0)}, {})), counted())), "a choice point read once per outer row");
-  refused(plan(loop(node(physical::Insert{1, {{kId, p(0)}}}), inner())), "neither one row nor a loop");
+  refused(plan(loop(node(physical::Insert{1, {{{kId, p(0)}}}}), inner())), "neither one row nor a loop");
   refused(plan(loop(get({p(0)}), get({p(1)}))), "inner side is not a scan");
   // A join conjunct reads a column of the outer side: of its point lookup,
   // or of a table it looks up by key.

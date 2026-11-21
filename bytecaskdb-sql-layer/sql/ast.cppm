@@ -242,7 +242,7 @@ struct AddColumn {
 struct Insert {
   std::string table;
   std::vector<std::string> columns;  // empty: every column, in order
-  std::vector<Expr> values;
+  std::vector<std::vector<Expr>> rows;  // VALUES' rows, each of one length
   std::int32_t pos{-1};
 };
 

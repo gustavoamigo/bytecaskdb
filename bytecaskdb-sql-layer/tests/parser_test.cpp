@@ -48,9 +48,17 @@ TEST_CASE("parser: the seven statements of the prototype", "[sql][parser]") {
     auto s = std::get<Insert>(parse("INSERT INTO t VALUES ($1, $2, $3)"));
     CHECK(s.table == "t");
     CHECK(s.columns.empty());
-    REQUIRE(s.values.size() == 3);
-    CHECK(s.values[2].kind == Expr::Kind::Param);
-    CHECK(s.values[2].param == 2);
+    REQUIRE(s.rows.size() == 1);
+    REQUIRE(s.rows[0].size() == 3);
+    CHECK(s.rows[0][2].kind == Expr::Kind::Param);
+    CHECK(s.rows[0][2].param == 2);
+  }
+  {
+    // Several VALUES rows, each of one length (42601 otherwise, as PostgreSQL).
+    auto s = std::get<Insert>(parse("INSERT INTO t VALUES ($1, $2), ($3, $4), ($5, $6)"));
+    REQUIRE(s.rows.size() == 3);
+    CHECK(s.rows[2][1].param == 5);
+    CHECK(rejected_at("INSERT INTO t VALUES ($1, $2), ($3)") == 32);
   }
   {
     auto s = std::get<Select>(parse("SELECT id, qty FROM t WHERE id = $1"));
@@ -414,7 +422,7 @@ TEST_CASE("parser: two tables, qualified columns and integer literals", "[sql][p
   auto wide = literal_of(*std::get<Update>(parse("UPDATE t SET qty = qty + 99999999999999999999 WHERE id = $1")).set[0].value.rhs);
   CHECK((wide.kind == Literal::Kind::Integer && wide.text == "99999999999999999999"));
   CHECK(literal_of(std::get<Select>(parse("SELECT id FROM t WHERE id = 1")).where[0].rhs).text == "1");
-  auto string = literal_of(std::get<Insert>(parse("INSERT INTO t VALUES ('it''s', NULL, TRUE)")).values[0]);
+  auto string = literal_of(std::get<Insert>(parse("INSERT INTO t VALUES ('it''s', NULL, TRUE)")).rows[0][0]);
   CHECK((string.kind == Literal::Kind::String && string.text == "it's"));
   // A SELECT without FROM; PostgreSQL's grammar folds - of a number into the
   // literal, and leaves unary + an operator.

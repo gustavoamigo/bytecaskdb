@@ -1684,7 +1684,9 @@ auto param_count(const ast::Statement& stmt) -> std::uint32_t {
       [&](const auto& s) {
         using T = std::decay_t<decltype(s)>;
         if constexpr (std::is_same_v<T, ast::Insert>) {
-          for (const auto& e : s.values) params_in(e, n);
+          for (const auto& row : s.rows) {
+            for (const auto& e : row) params_in(e, n);
+          }
         } else if constexpr (std::is_same_v<T, ast::Select>) {
           n = select_param_count(s);
         } else if constexpr (std::is_same_v<T, ast::Update>) {
@@ -4529,8 +4531,10 @@ public:
             names(st);
             select(st);
           } else if constexpr (std::is_same_v<T, ast::Insert>) {
-            for (auto& v : st.values) names(v);
-            for (auto& v : st.values) expr(v);
+            for (auto& row : st.rows) {
+              for (auto& v : row) names(v);
+              for (auto& v : row) expr(v);
+            }
           } else if constexpr (std::is_same_v<T, ast::Update>) {
             scope_.insert(st.table);
             for (auto& a : st.set) names(a.value);
@@ -4841,33 +4845,41 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           return {Ddl{AddColumnDdl{s.table, std::move(spec)}}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::Insert>) {
           const auto* t = b.table(s.table, s.pos);
-          logical::Insert out{t, std::vector<std::optional<logical::Expr>>(t->columns.size())};
+          logical::Insert out{t, {}, {}};
+          const auto width = s.rows.front().size();  // every row's: the parser checked
           std::vector<const Column*> targets;
           if (s.columns.empty()) {
             // As PostgreSQL: the values fill the leading columns and the rest
             // take their defaults, so a column added later changes nothing.
             // The hidden row id is no column a statement fills.
             for (const auto& c : t->columns) {
-              if (targets.size() == s.values.size()) break;
+              if (targets.size() == width) break;
               if (!c.hidden) targets.push_back(&c);
             }
-            if (s.values.size() > targets.size()) {
+            if (width > targets.size()) {
               throw SqlError{"INSERT has more expressions than target columns", s.pos};
             }
           } else {
             for (const auto& name : s.columns) targets.push_back(Binder::column(*t, name, s.pos));
           }
-          if (targets.size() != s.values.size()) {
-            throw SqlError{"INSERT has " + std::to_string(s.values.size()) + " values for " +
-                               std::to_string(targets.size()) + " columns",
+          if (targets.size() != width) {
+            throw SqlError{"INSERT has " + std::to_string(width) + " values for " + std::to_string(targets.size()) + " columns",
                            s.pos};
           }
           for (std::size_t i = 0; i < targets.size(); ++i) {
-            auto at = static_cast<std::size_t>(targets[i] - t->columns.data());
-            if (out.values[at]) throw SqlError{"column \"" + targets[i]->name + "\" specified more than once", s.pos, kDuplicateColumn};
-            out.values[at] = b.value(*t, s.values[i], *targets[i]);
-            if (out.values[at]->kind != logical::Expr::Kind::Param) {
-              throw SqlError{"INSERT values must be parameters or constants", s.values[i].pos};
+            if (std::ranges::count(targets, targets[i]) > 1) {
+              throw SqlError{"column \"" + targets[i]->name + "\" specified more than once", s.pos, kDuplicateColumn};
+            }
+          }
+          // Each row is written as one INSERT of it would be, in order.
+          for (const auto& values : s.rows) {
+            auto& row = out.rows.emplace_back(t->columns.size());
+            for (std::size_t i = 0; i < targets.size(); ++i) {
+              auto at = static_cast<std::size_t>(targets[i] - t->columns.data());
+              row[at] = b.value(*t, values[i], *targets[i]);
+              if (row[at]->kind != logical::Expr::Kind::Param) {
+                throw SqlError{"INSERT values must be parameters or constants", values[i].pos};
+              }
             }
           }
           // A column left out takes its default. One that is NOT NULL with no

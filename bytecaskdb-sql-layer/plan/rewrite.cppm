@@ -217,8 +217,10 @@ auto fold_constants(Node& n) -> bool {
         } else if constexpr (std::is_same_v<T, Update>) {
           for (auto& [col, e] : op.set) c = fold(e) || c;
         } else if constexpr (std::is_same_v<T, Insert>) {
-          for (auto& v : op.values) {
-            if (v) c = fold(*v) || c;
+          for (auto& row : op.rows) {
+            for (auto& v : row) {
+              if (v) c = fold(*v) || c;
+            }
           }
         }
         return c;

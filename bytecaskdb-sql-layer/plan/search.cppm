@@ -799,9 +799,12 @@ private:
           if constexpr (std::is_same_v<T, logical::Insert>) {
             constants(*op.table);
             physical::Insert ins{op.table->id, {}, op.checks};
-            for (std::size_t i = 0; i < op.table->columns.size(); ++i) {
-              const auto& c = op.table->columns[i];
-              if (op.values[i]) ins.values.emplace_back(logical::column_of(op.table->id, c).col, *op.values[i]);
+            for (const auto& values : op.rows) {
+              auto& row = ins.rows.emplace_back();
+              for (std::size_t i = 0; i < op.table->columns.size(); ++i) {
+                const auto& c = op.table->columns[i];
+                if (values[i]) row.emplace_back(logical::column_of(op.table->id, c).col, *values[i]);
+              }
             }
             std::vector<Finished> out;
             out.push_back({physical::node(std::move(ins)), {}, {}, 1});

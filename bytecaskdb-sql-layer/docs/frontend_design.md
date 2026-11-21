@@ -52,8 +52,13 @@ kind the transformer doesn't take is refused with its position.
   evaluates over the table's columns and constants (*Expressions over
   columns*); `NO INHERIT`, `NOT VALID`, `DEFERRABLE` and `ADD COLUMN …
   CHECK` are refused.
-- `INSERT … VALUES` of one row, with or without a column list, of
-  parameters and constants.
+- `INSERT … VALUES` of one row or several, with or without a column list,
+  of parameters, constants and `DEFAULT`. The rows are one statement: each
+  is written in order, as an `INSERT` of it alone would be (its keys,
+  `UNIQUE` and `CHECK` tested against the rows before it too), and a row
+  that fails writes none of them. Rows of different lengths are 42601, as
+  in PostgreSQL. The plan writes each row in a block of its own, so a
+  statement's plan grows with its rows.
 - `SELECT` targets: columns, `*` and `table.*` (below), constants (*Literals*), `COUNT(*)`,
   `COUNT(col)`, `COUNT(DISTINCT col)`, `SUM(col)`, `MIN(col)`, `MAX(col)` and
   `AVG(col)`, several of them in any order; a constant not beside an
@@ -509,7 +514,7 @@ That includes:
   `NATURAL` after the first join, a join in parentheses or among commas,
   `FOR UPDATE` of a join (#697), an alias of a join, an output name in `GROUP BY` or in `ORDER BY` of
   other than a column;
-- `RETURNING`, multi-row `VALUES`; `OFFSET` on a set operation, in one of
+- `RETURNING`; `VALUES` outside `INSERT`; `OFFSET` on a set operation, in one of
   its arms or in a view;
 - `CASE` or `COALESCE` of a float beside another number, a `BETWEEN` or
   `IN` as a value, `GREATEST` and `LEAST`, `CASE` outside the plain select

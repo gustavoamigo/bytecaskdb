@@ -259,7 +259,7 @@ struct Limit {
 // (23514) where one is false, and accepted where it is true or NULL.
 struct Insert {
   const Table* table{nullptr};
-  std::vector<std::optional<Expr>> values;
+  std::vector<std::vector<std::optional<Expr>>> rows;  // VALUES' rows, written in order
   std::vector<Expr> checks;
 };
 
