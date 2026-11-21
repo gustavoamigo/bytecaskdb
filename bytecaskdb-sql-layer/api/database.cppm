@@ -30,6 +30,7 @@ module;
 #include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <iterator>
 #include <algorithm>
 #include <functional>
 #include <limits>
@@ -1207,6 +1208,10 @@ private:
   // DDL of it (docs/transaction_design.md, stage 4).
   auto create_table_as(const Target& t, const ast::CreateTableAs& ctas, const std::vector<Value>& params,
                        const ExecutionOptions& opts) -> Rows;
+  // CREATE SCHEMA with elements as steps of the transaction at its catalog
+  // `cat`: the schema, then each element in PostgreSQL's order
+  // (docs/catalog_design.md, *Schema DDL batches and transactional DDL*).
+  auto create_schema_elements(const ast::Statement& st, const ast::CreateSchema& cs, const Catalog& cat) -> Rows;
   // 55006 for a DDL on what an open cursor of the transaction reads.
   void check_in_use(const Ddl& ddl, const Catalog& cat) const;
   // 40001 for a transaction that has run DDL once another DDL has published.
@@ -1586,6 +1591,10 @@ private:
   // transactions with DDL*): a one-statement Serializable transaction, so its
   // query's reads are guarded by its commit, retried on a conflict.
   auto serializable_ctas(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts) -> Rows;
+  // CREATE SCHEMA with elements, autocommit: the steps of an internal
+  // transaction it commits, not retried (docs/catalog_design.md, *Schema DDL
+  // batches and transactional DDL*).
+  auto schema_with_elements(const Statement& stmt, const ExecutionOptions& opts) -> Rows;
   // An autocommit context: one per call in flight, kept for the next.
   [[nodiscard]] auto acquire_context() -> bc_ctx*;
   void release_context(bc_ctx* cx) noexcept;
@@ -2173,6 +2182,12 @@ auto is_dml(const ast::Statement& st) -> bool {
          std::holds_alternative<ast::Update>(st) || std::holds_alternative<ast::Delete>(st);
 }
 
+// A CREATE SCHEMA with elements, which runs as a transaction's steps.
+auto has_schema_elements(const ast::Statement& st) -> bool {
+  const auto* cs = std::get_if<ast::CreateSchema>(&st);
+  return cs != nullptr && !cs->elements.empty();
+}
+
 // A private plan's charge: a constant for what a plan holds besides its
 // text, and its text, which its TinyCC code is of the order of.
 constexpr std::uint64_t kTxnPlanBytes = 16u << 10;
@@ -2450,12 +2465,16 @@ auto Database::execute(std::string_view sql, const ResultCheck& check, const std
     if (ctas != nullptr) return serializable_ctas(*ctas, params, opts);  // valid until close()
   }
   auto lock = enter();
+  const Statement* schema = nullptr;  // CREATE SCHEMA with elements, valid until close()
   try {
     Rows out;
     // By text: the cache's statement for it, whichever that is when the plan is taken.
     const auto given = check.kind == ResultCheck::Kind::Given;
     const auto& first = given ? *given_plan(sql, check.record).stmt : prepare_locked(sql);
-    if (first.is_ddl()) {
+    if (has_schema_elements(first.ast_)) {
+      if (!params.empty()) throw ParamError("DDL takes no parameters");
+      schema = &first;
+    } else if (first.is_ddl()) {
       out = execute_ddl(first, params, opts);
     } else {
       if (!first.current_of().empty()) throw ParamError("WHERE CURRENT OF needs a cursor of a transaction");
@@ -2469,18 +2488,24 @@ auto Database::execute(std::string_view sql, const ResultCheck& check, const std
         throw;
       }
     }
-    life_->committed.fetch_add(1, std::memory_order_relaxed);
-    return out;
+    if (schema == nullptr) {
+      life_->committed.fetch_add(1, std::memory_order_relaxed);
+      return out;
+    }
   } catch (...) {
     life_->rolled_back.fetch_add(1, std::memory_order_relaxed);
     throw;
   }
+  // A transaction of its own, which counts itself; its calls take the lock.
+  lock.unlock();
+  return schema_with_elements(*schema, opts);
 }
 
 auto Database::execute(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts) -> Rows {
   if (opts.isolation == Isolation::Serializable && stmt.query_ && stmt.owner_ == this) {
     return serializable_ctas(stmt, params, opts);
   }
+  if (has_schema_elements(stmt.ast_) && stmt.owner_ == this && params.empty()) return schema_with_elements(stmt, opts);
   auto lock = enter();
   try {
     auto out = execute_locked(stmt, params, opts);
@@ -2605,6 +2630,9 @@ auto Database::execute_ddl(const Statement& stmt, const std::vector<Value>& para
   if (stmt.query_) return create_table_as(stmt, params, opts);
   {
     if (!params.empty()) throw ParamError("DDL takes no parameters");
+    // Its elements are bound one at a time, each against the catalog the
+    // ones before made: schema_with_elements.
+    if (has_schema_elements(stmt.ast_)) throw std::logic_error("CREATE SCHEMA with elements runs as a transaction");
     auto before = live_->current();
     auto bound = bound::bind(stmt.ast_, *before);
     const auto& ddl = std::get<Ddl>(bound.stmt);
@@ -2629,6 +2657,15 @@ auto Database::serializable_ctas(const Statement& stmt, const std::vector<Value>
       if (attempt >= kMaxRetries) throw;
     }
   }
+}
+
+auto Database::schema_with_elements(const Statement& stmt, const ExecutionOptions& opts) -> Rows {
+  auto t = begin({.user = std::string{opts.user}});
+  auto out = t.execute(stmt, {}, opts);
+  // execute() throws where it aborts the transaction, so it is open here;
+  // a statement is never reported as done when nothing was written.
+  if (t.commit() == CommitOutcome::RolledBack) throw std::logic_error("CREATE SCHEMA's transaction was rolled back");
+  return out;
 }
 
 auto Database::run_ddl(const Ddl& ddl) -> bool {
@@ -3662,6 +3699,7 @@ auto Transaction::run_ddl(const Target& t, const ast::Statement& st, const std::
     throw_serialization_failure(kCatalogChanged);
   }
   if (ctas != nullptr) return create_table_as(t, *ctas, params, opts);
+  if (has_schema_elements(st)) return create_schema_elements(st, std::get<ast::CreateSchema>(st), *cat);
   auto bound = bound::bind(st, *cat);
   const auto& ddl = std::get<Ddl>(bound.stmt);
   check_in_use(ddl, *cat);
@@ -3669,6 +3707,36 @@ auto Transaction::run_ddl(const Target& t, const ast::Statement& st, const std::
   const auto changed = step_ddl(ddl, *cat);
   out.notices = skip_notices(ddl, *cat, changed);
   out.affected = 0;
+  return out;
+}
+
+auto Transaction::create_schema_elements(const ast::Statement& st, const ast::CreateSchema& cs, const Catalog& cat)
+    -> Rows {
+  auto& h = *h_;
+  Rows out;
+  out.affected = 0;
+  {
+    auto bound = bound::bind(st, cat);  // the schema alone
+    (void)step_ddl(std::get<Ddl>(bound.stmt), cat);
+  }
+  const auto created = bc_txn_catalog(h.txn);
+  const auto* schema = created->schema(cs.name);
+  if (schema == nullptr) throw std::logic_error("CREATE SCHEMA left no schema");
+  const auto id = schema->id;
+  // As PostgreSQL 17: an element placed in another schema is refused, in
+  // written order, before any element runs.
+  for (const auto& e : cs.elements) {
+    if (e.misplaced) throw *e.misplaced;
+  }
+  for (const auto* e : ast::run_order(cs)) {
+    const auto at = bc_txn_catalog(h.txn);
+    auto bound = bound::bind_schema_element(*e, id, *at);
+    const auto& ddl = std::get<Ddl>(bound.stmt);
+    check_in_use(ddl, *at);
+    const auto changed = step_ddl(ddl, *at);
+    auto notices = skip_notices(ddl, *at, changed);
+    std::ranges::move(notices, std::back_inserter(out.notices));
+  }
   return out;
 }
 

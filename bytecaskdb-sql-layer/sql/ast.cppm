@@ -36,6 +36,11 @@ export namespace bytecask::sql::ast {
 struct ObjectName {
   std::string schema;
   std::string name;
+  // An unqualified name a schema element reads, found by the element's path
+  // (the schema being created, then public) in the schema it names: the
+  // binder looks it up there rather than in public. Set by the binder
+  // (bind_schema_element), never by the parser; nullopt for every other name.
+  std::optional<std::uint32_t> path_schema;
 
   // As PostgreSQL writes a name in the messages that qualify it: "s.t", or "t".
   [[nodiscard]] auto written() const -> std::string { return schema.empty() ? name : schema + "." + name; }
@@ -661,10 +666,22 @@ struct Grant {
   std::int32_t pos{-1};
 };
 
-// CREATE SCHEMA [IF NOT EXISTS] name [AUTHORIZATION role], or CREATE SCHEMA
-// AUTHORIZATION role, which names the schema after the role
-// (docs/catalog_design.md, *Schema semantics*). Elements are refused by the
-// parser until stage 2 builds them.
+// One element of CREATE SCHEMA (docs/catalog_design.md, *Schema
+// semantics*). A name it creates is qualified by the new schema, as the
+// parser writes it; an index's table too. A view's `definition` is the
+// element's own text, cut from the statement.
+struct SchemaElement {
+  std::variant<CreateSequence, CreateTable, CreateView, CreateIndex, Grant> statement;
+  // 42P15: a name qualified by another schema. Raised, in written order,
+  // once the schema is created and before any element runs.
+  std::optional<SqlError> misplaced;
+  // Raised when the element runs, in its turn: a temporary relation (42P16).
+  std::optional<SqlError> refusal;
+};
+
+// CREATE SCHEMA [IF NOT EXISTS] name [AUTHORIZATION role] [element …], or
+// CREATE SCHEMA AUTHORIZATION role [element …], which names the schema after
+// the role (docs/catalog_design.md, *Schema semantics*).
 struct CreateSchema {
   std::string name;
   // AUTHORIZATION's role: nullopt for none, "" for CURRENT_USER, CURRENT_ROLE
@@ -672,7 +689,21 @@ struct CreateSchema {
   std::optional<std::string> authorization;
   bool if_not_exists{false};
   std::int32_t pos{-1};
+  std::vector<SchemaElement> elements;  // in written order; none with IF NOT EXISTS
 };
+
+// The order CREATE SCHEMA runs its elements in, PostgreSQL 17's
+// (transformCreateSchemaStmtElements): sequences, tables, views, indexes,
+// then grants, each kind in written order.
+[[nodiscard]] inline auto run_order(const CreateSchema& s) -> std::vector<const SchemaElement*> {
+  std::vector<const SchemaElement*> out;
+  for (std::size_t kind = 0; kind < std::variant_size_v<decltype(SchemaElement::statement)>; ++kind) {
+    for (const auto& e : s.elements) {
+      if (e.statement.index() == kind) out.push_back(&e);
+    }
+  }
+  return out;
+}
 
 // DROP SCHEMA [IF EXISTS] name [, …] [RESTRICT]. CASCADE is refused by the
 // parser until stage 5 builds it.

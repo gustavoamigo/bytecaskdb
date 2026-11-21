@@ -1031,32 +1031,6 @@ auto object_name(const PgQuery__Node* n, std::int32_t pos) -> ObjectName {
   reject("expected a name", pos);
 }
 
-// CREATE SCHEMA [IF NOT EXISTS] name [AUTHORIZATION role], or CREATE SCHEMA
-// AUTHORIZATION role. Elements are stage 2's (docs/catalog_design.md,
-// *Stages of schemas*); PUBLIC is no role (42704), as in PostgreSQL 17.
-auto create_schema(const PgQuery__CreateSchemaStmt* s, std::int32_t pos) -> CreateSchema {
-  if (s->n_schema_elts != 0) reject("CREATE SCHEMA with schema elements is not supported yet", pos, kFeatureNotSupported);
-  CreateSchema out{empty(s->schemaname) ? "" : s->schemaname, std::nullopt, s->if_not_exists != 0, pos};
-  if (const auto* r = s->authrole) {
-    switch (r->roletype) {
-      case PG_QUERY__ROLE_SPEC_TYPE__ROLESPEC_CSTRING: out.authorization = r->rolename; break;
-      case PG_QUERY__ROLE_SPEC_TYPE__ROLESPEC_CURRENT_ROLE:
-      case PG_QUERY__ROLE_SPEC_TYPE__ROLESPEC_CURRENT_USER:
-      case PG_QUERY__ROLE_SPEC_TYPE__ROLESPEC_SESSION_USER: out.authorization = ""; break;
-      case PG_QUERY__ROLE_SPEC_TYPE__ROLESPEC_PUBLIC: reject("role \"public\" does not exist", r->location, kUndefinedObject);
-      case PG_QUERY__ROLE_SPEC_TYPE__ROLE_SPEC_TYPE_UNDEFINED:
-      case _PG_QUERY__ROLE_SPEC_TYPE_IS_INT_SIZE: reject("expected a role", r->location);
-    }
-  }
-  // CREATE SCHEMA AUTHORIZATION CURRENT_USER names the schema after the
-  // session's user, which the bootstrap role every session is has no name for.
-  if (out.name.empty() && out.authorization && out.authorization->empty()) {
-    reject("CREATE SCHEMA AUTHORIZATION CURRENT_USER without a schema name is not supported", pos, kFeatureNotSupported);
-  }
-  if (out.name.empty()) out.name = *out.authorization;
-  return out;
-}
-
 // CREATE DOMAIN name [AS] type: no constraint, DEFAULT or COLLATE yet.
 auto create_domain(const PgQuery__CreateDomainStmt* s, std::int32_t pos) -> CreateDomain {
   if (s->n_constraints != 0 || s->coll_clause != nullptr) {
@@ -2047,6 +2021,266 @@ struct ParseResources {
   }
 };
 
+// Owns libpg_query's scan of a text, its tokens; `tree` is null when the
+// scanner refused it.
+struct TokenScan {
+  PgQueryScanResult raw{};
+  PgQuery__ScanResult* tree{nullptr};
+  explicit TokenScan(const std::string& text) : raw{pg_query_scan(text.c_str())} {
+    if (raw.error == nullptr) {
+      tree = pg_query__scan_result__unpack(nullptr, raw.pbuf.len, reinterpret_cast<const std::uint8_t*>(raw.pbuf.data));
+    }
+  }
+  TokenScan(const TokenScan&) = delete;
+  TokenScan& operator=(const TokenScan&) = delete;
+  ~TokenScan() {
+    if (tree != nullptr) pg_query__scan_result__free_unpacked(tree, nullptr);
+    pg_query_free_scan_result(raw);
+  }
+};
+
+// The byte range of each of CREATE SCHEMA's elements in its text
+// (docs/catalog_design.md, *Schema DDL batches and transactional DDL*): from
+// a CREATE or GRANT outside parentheses, past the statement's own CREATE, to
+// the last token before the next one (or the statement's end), comments and
+// a closing semicolon left out. A GRANT after WITH (WITH GRANT OPTION) and a
+// CREATE or GRANT after GRANT or a comma (GRANT CREATE ON …, a privilege)
+// start nothing. Such a token elsewhere inside an element (SELECT a AS
+// create) cuts it short; a view's cut is checked against its tree. A range
+// the scan cannot give is empty.
+auto element_ranges(const std::string& text, std::size_t count) -> std::vector<std::pair<std::size_t, std::size_t>> {
+  std::vector<std::pair<std::size_t, std::size_t>> out(count, {0, 0});
+  TokenScan scan{text};
+  if (scan.tree == nullptr) return out;
+  const std::span<PgQuery__ScanToken* const> tokens{scan.tree->tokens, scan.tree->n_tokens};
+  auto ignored = [](const PgQuery__ScanToken* t) {
+    return t->token == PG_QUERY__TOKEN__SQL_COMMENT || t->token == PG_QUERY__TOKEN__C_COMMENT ||
+           t->token == PG_QUERY__TOKEN__ASCII_59;
+  };
+  std::vector<std::size_t> starts;
+  auto depth = 0;
+  auto own = true;  // the statement's CREATE SCHEMA
+  auto previous = PG_QUERY__TOKEN__NUL;  // the last token not ignored
+  for (std::size_t i = 0; i < tokens.size(); ++i) {
+    const auto token = tokens[i]->token;
+    const auto before = std::exchange(previous, ignored(tokens[i]) ? previous : token);
+    if (token == PG_QUERY__TOKEN__ASCII_40) ++depth;
+    if (token == PG_QUERY__TOKEN__ASCII_41) --depth;
+    if (depth != 0 || (token != PG_QUERY__TOKEN__CREATE && token != PG_QUERY__TOKEN__GRANT)) continue;
+    if (before == PG_QUERY__TOKEN__WITH || before == PG_QUERY__TOKEN__GRANT || before == PG_QUERY__TOKEN__ASCII_44) continue;
+    if (std::exchange(own, false)) continue;
+    starts.push_back(i);
+  }
+  for (std::size_t k = 0; k < count && k < starts.size(); ++k) {
+    auto last = k + 1 < starts.size() ? starts[k + 1] : tokens.size();
+    while (last > starts[k] + 1 && ignored(tokens[last - 1])) --last;
+    out[k] = {static_cast<std::size_t>(tokens[starts[k]]->start), static_cast<std::size_t>(tokens[last - 1]->end)};
+  }
+  return out;
+}
+
+// The bytes of a protobuf-c message's member at `offset`: protobuf-c's
+// descriptors name members by offset into the C struct, the one way to walk
+// a tree of any message type.
+template <typename T>
+auto member_at(ProtobufCMessage* m, unsigned offset) -> T& {
+  return *reinterpret_cast<T*>(reinterpret_cast<std::byte*>(m) + offset);
+}
+
+// Every `location` in a parse tree set to 0, so two trees of one statement
+// read alike wherever its text sat.
+void zero_locations(ProtobufCMessage* m) {
+  const auto* d = m->descriptor;
+  for (const auto& f : std::span{d->fields, d->n_fields}) {
+    if (f.type == PROTOBUF_C_TYPE_INT32 && f.label != PROTOBUF_C_LABEL_REPEATED && std::string_view{f.name} == "location") {
+      member_at<std::int32_t>(m, f.offset) = 0;
+      continue;
+    }
+    if (f.type != PROTOBUF_C_TYPE_MESSAGE) continue;
+    if (f.label == PROTOBUF_C_LABEL_REPEATED) {
+      const std::span items{member_at<ProtobufCMessage**>(m, f.offset), member_at<std::size_t>(m, f.quantifier_offset)};
+      for (auto* item : items) {
+        if (item != nullptr) zero_locations(item);
+      }
+      continue;
+    }
+    if ((f.flags & PROTOBUF_C_FIELD_FLAG_ONEOF) != 0 && member_at<std::uint32_t>(m, f.quantifier_offset) != f.id) continue;
+    if (auto* sub = member_at<ProtobufCMessage*>(m, f.offset); sub != nullptr) zero_locations(sub);
+  }
+}
+
+// Every message of a parse tree, `m` first, given to `visit`.
+void each_message(ProtobufCMessage* m, const std::function<void(ProtobufCMessage*)>& visit) {
+  visit(m);
+  const auto* d = m->descriptor;
+  for (const auto& f : std::span{d->fields, d->n_fields}) {
+    if (f.type != PROTOBUF_C_TYPE_MESSAGE) continue;
+    if (f.label == PROTOBUF_C_LABEL_REPEATED) {
+      const std::span items{member_at<ProtobufCMessage**>(m, f.offset), member_at<std::size_t>(m, f.quantifier_offset)};
+      for (auto* item : items) {
+        if (item != nullptr) each_message(item, visit);
+      }
+      continue;
+    }
+    if ((f.flags & PROTOBUF_C_FIELD_FLAG_ONEOF) != 0 && member_at<std::uint32_t>(m, f.quantifier_offset) != f.id) continue;
+    if (auto* sub = member_at<ProtobufCMessage*>(m, f.offset); sub != nullptr) each_message(sub, visit);
+  }
+}
+
+// A view element's column s.t.c, s the new schema or public, where its
+// query reads t unqualified and unaliased: which schema's t that is is
+// known only when the element binds, after the parser has resolved the
+// qualifier against public alone, so it is refused (0A000) rather than read
+// against the wrong item or refused with a wrong 42P01
+// (docs/catalog_design.md, *Schema semantics*).
+void refuse_path_qualified_columns(PgQuery__Node* view, const std::string& schema, std::int32_t pos) {
+  std::vector<std::string> unqualified;
+  std::vector<std::pair<std::string, std::string>> qualified;
+  each_message(&view->base, [&](ProtobufCMessage* m) {
+    if (m->descriptor == &pg_query__range_var__descriptor) {
+      const auto* rv = reinterpret_cast<const PgQuery__RangeVar*>(m);
+      if (empty(rv->schemaname) && empty(rv->catalogname) && rv->alias == nullptr) unqualified.emplace_back(rv->relname);
+    } else if (m->descriptor == &pg_query__column_ref__descriptor) {
+      const auto* c = reinterpret_cast<const PgQuery__ColumnRef*>(m);
+      if (c->n_fields == 3 && c->fields[0]->node_case == PG_QUERY__NODE__NODE_STRING &&
+          c->fields[1]->node_case == PG_QUERY__NODE__NODE_STRING) {
+        qualified.emplace_back(c->fields[0]->string->sval, c->fields[1]->string->sval);
+      }
+    }
+  });
+  for (const auto& [s, t] : qualified) {
+    if ((s == schema || s == "public") && std::ranges::contains(unqualified, t)) {
+      reject("a schema-qualified column of a table a view element names unqualified is not supported yet", pos,
+             kFeatureNotSupported);
+    }
+  }
+}
+
+// A node's tree, locations aside, as bytes to compare.
+auto tree_bytes(PgQuery__Node* n) -> std::string {
+  zero_locations(&n->base);
+  std::string out(pg_query__node__get_packed_size(n), '\0');
+  (void)pg_query__node__pack(n, reinterpret_cast<std::uint8_t*>(out.data()));
+  return out;
+}
+
+// A CREATE VIEW element's own text: its range of the statement, kept if it
+// parses alone to one CREATE VIEW of the element's tree, locations aside,
+// so the view stores an ordinary CREATE VIEW of the client's text and
+// nothing is deparsed (docs/catalog_design.md, *Schema DDL batches and
+// transactional DDL*). Called once the element is read: it zeroes the
+// element's locations.
+auto view_element_text(PgQuery__Node* element, const std::string& text, std::pair<std::size_t, std::size_t> range,
+                       std::int32_t pos) -> std::string {
+  auto slice = text.substr(range.first, range.second - range.first);
+  ParseResources res;
+  res.raw = pg_query_parse_protobuf(slice.c_str());
+  if (res.raw.error == nullptr) {
+    res.tree = pg_query__parse_result__unpack(nullptr, res.raw.parse_tree.len,
+                                              reinterpret_cast<const std::uint8_t*>(res.raw.parse_tree.data));
+  }
+  if (res.tree == nullptr || res.tree->n_stmts != 1 ||
+      res.tree->stmts[0]->stmt->node_case != PG_QUERY__NODE__NODE_VIEW_STMT ||
+      tree_bytes(res.tree->stmts[0]->stmt) != tree_bytes(element)) {
+    reject("CREATE VIEW as a schema element whose text cannot be cut out of the statement is not supported", pos,
+           kFeatureNotSupported);
+  }
+  return slice;
+}
+
+// Whether a RangeVar names a temporary relation.
+auto temporary(const PgQuery__RangeVar* rv) -> bool { return !empty(rv->relpersistence) && rv->relpersistence[0] == 't'; }
+
+// One element of CREATE SCHEMA `schema`, read as its statement alone would
+// be, then placed in the schema (docs/catalog_design.md, *Schema
+// semantics*): a name it creates, and an index's table, unqualified is the
+// schema's; qualified by another is 42P15, raised once the schema exists.
+// A temporary relation is 42P16, raised when the element runs, as
+// PostgreSQL 17 raises both.
+auto schema_element(PgQuery__Node* n, const std::string& schema, const std::string& text,
+                    std::pair<std::size_t, std::size_t> range, std::int32_t pos) -> SchemaElement {
+  if (range.second > range.first) pos = static_cast<std::int32_t>(range.first);
+  SchemaElement out{CreateSequence{}, std::nullopt, std::nullopt};
+  auto place = [&](ObjectName& name, std::int32_t at) {
+    if (name.schema.empty()) {
+      name.schema = schema;
+    } else if (name.schema != schema && !out.misplaced) {
+      out.misplaced = SqlError{"CREATE specifies a schema (" + name.schema + ") different from the one being created (" +
+                                   schema + ")",
+                               at, kInvalidSchemaDefinition};
+    }
+  };
+  auto refuse_temporary = [&](const PgQuery__RangeVar* rv) {
+    if (temporary(rv)) {
+      out.refusal = SqlError{"cannot create temporary relation in non-temporary schema", rv->location, kInvalidTableDefinition};
+    }
+    return out.refusal.has_value();
+  };
+  if (n->node_case == PG_QUERY__NODE__NODE_CREATE_SEQ_STMT) {
+    const auto* rv = n->create_seq_stmt->sequence;
+    auto seq = refuse_temporary(rv) ? CreateSequence{from_relation(rv), false, pos} : create_sequence(n->create_seq_stmt, pos);
+    place(seq.sequence, rv->location);
+    out.statement = std::move(seq);
+  } else if (n->node_case == PG_QUERY__NODE__NODE_CREATE_STMT) {
+    const auto* rv = n->create_stmt->relation;
+    auto table = refuse_temporary(rv) ? CreateTable{from_relation(rv), {}, {}, pos} : create_table(n->create_stmt, pos, text);
+    place(table.table, rv->location);
+    out.statement = std::move(table);
+  } else if (n->node_case == PG_QUERY__NODE__NODE_VIEW_STMT) {
+    const auto* rv = n->view_stmt->view;
+    CreateView view{from_relation(rv), {}, {}, pos, {}};
+    if (!refuse_temporary(rv)) {
+      refuse_path_qualified_columns(n, schema, pos);
+      view = create_view(n->view_stmt, pos);
+      view.definition = view_element_text(n, text, range, pos);
+    }
+    place(view.view, rv->location);
+    out.statement = std::move(view);
+  } else if (n->node_case == PG_QUERY__NODE__NODE_INDEX_STMT) {
+    auto index = create_index(n->index_stmt, pos);
+    place(index.table, n->index_stmt->relation->location);
+    out.statement = std::move(index);
+  } else if (n->node_case == PG_QUERY__NODE__NODE_GRANT_STMT) {
+    // The grammar takes only GRANT: REVOKE is its syntax error.
+    out.statement = grant(n->grant_stmt, pos);
+  } else if (n->node_case == PG_QUERY__NODE__NODE_CREATE_TRIG_STMT) {
+    reject("triggers are not supported", pos, kFeatureNotSupported);
+  } else {
+    reject("CREATE SCHEMA element not supported", pos);
+  }
+  return out;
+}
+
+// CREATE SCHEMA [IF NOT EXISTS] name [AUTHORIZATION role] [element …], or
+// CREATE SCHEMA AUTHORIZATION role [element …]. PUBLIC is no role (42704),
+// as in PostgreSQL 17. IF NOT EXISTS with elements is the grammar's 0A000
+// (parse()).
+auto create_schema(const PgQuery__CreateSchemaStmt* s, std::int32_t pos, const std::string& text) -> CreateSchema {
+  CreateSchema out{empty(s->schemaname) ? "" : s->schemaname, std::nullopt, s->if_not_exists != 0, pos, {}};
+  if (const auto* r = s->authrole) {
+    switch (r->roletype) {
+      case PG_QUERY__ROLE_SPEC_TYPE__ROLESPEC_CSTRING: out.authorization = r->rolename; break;
+      case PG_QUERY__ROLE_SPEC_TYPE__ROLESPEC_CURRENT_ROLE:
+      case PG_QUERY__ROLE_SPEC_TYPE__ROLESPEC_CURRENT_USER:
+      case PG_QUERY__ROLE_SPEC_TYPE__ROLESPEC_SESSION_USER: out.authorization = ""; break;
+      case PG_QUERY__ROLE_SPEC_TYPE__ROLESPEC_PUBLIC: reject("role \"public\" does not exist", r->location, kUndefinedObject);
+      case PG_QUERY__ROLE_SPEC_TYPE__ROLE_SPEC_TYPE_UNDEFINED:
+      case _PG_QUERY__ROLE_SPEC_TYPE_IS_INT_SIZE: reject("expected a role", r->location);
+    }
+  }
+  // CREATE SCHEMA AUTHORIZATION CURRENT_USER names the schema after the
+  // session's user, which the bootstrap role every session is has no name for.
+  if (out.name.empty() && out.authorization && out.authorization->empty()) {
+    reject("CREATE SCHEMA AUTHORIZATION CURRENT_USER without a schema name is not supported", pos, kFeatureNotSupported);
+  }
+  if (out.name.empty()) out.name = *out.authorization;
+  const auto ranges = element_ranges(text, s->n_schema_elts);
+  for (std::size_t i = 0; i < s->n_schema_elts; ++i) {
+    out.elements.push_back(schema_element(s->schema_elts[i], out.name, text, ranges[i], pos));
+  }
+  return out;
+}
+
 // PostgreSQL's CURSOR_OPT_* bits in DeclareCursorStmt::options.
 constexpr std::int32_t kCursorBinary = 0x1;
 constexpr std::int32_t kCursorScroll = 0x2;
@@ -2057,22 +2291,7 @@ constexpr std::int32_t kCursorHold = 0x20;
 // CURSOR [WITH | WITHOUT HOLD]. The parse tree has no location for it, so the
 // scanner's tokens are read. The statement parsed, so the tokens are there.
 auto declare_query_start(const std::string& text) -> std::size_t {
-  struct Scan {
-    PgQueryScanResult raw{};
-    PgQuery__ScanResult* tree{nullptr};
-    Scan() = default;
-    Scan(const Scan&) = delete;
-    Scan& operator=(const Scan&) = delete;
-    ~Scan() {
-      if (tree != nullptr) pg_query__scan_result__free_unpacked(tree, nullptr);
-      pg_query_free_scan_result(raw);
-    }
-  } scan;
-  scan.raw = pg_query_scan(text.c_str());
-  if (scan.raw.error == nullptr) {
-    scan.tree = pg_query__scan_result__unpack(nullptr, scan.raw.pbuf.len,
-                                              reinterpret_cast<const std::uint8_t*>(scan.raw.pbuf.data));
-  }
+  TokenScan scan{text};
   if (scan.tree == nullptr) reject("unreadable DECLARE", -1);
   // Tokens 0 and 1 are DECLARE and the name, which may itself be spelled cursor.
   auto n = scan.tree->n_tokens;
@@ -2227,7 +2446,7 @@ auto parse(std::string_view sql) -> Statement {
     reject("CALL runs as a simple Query, not as a prepared statement", pos, kFeatureNotSupported);
   }
   if (n->node_case == PG_QUERY__NODE__NODE_CREATE_ROLE_STMT) return create_role(n->create_role_stmt, pos);
-  if (n->node_case == PG_QUERY__NODE__NODE_CREATE_SCHEMA_STMT) return create_schema(n->create_schema_stmt, pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_CREATE_SCHEMA_STMT) return create_schema(n->create_schema_stmt, pos, text);
   if (n->node_case == PG_QUERY__NODE__NODE_DROP_ROLE_STMT) return drop_role(n->drop_role_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_GRANT_STMT) return grant(n->grant_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_CREATE_DOMAIN_STMT) return create_domain(n->create_domain_stmt, pos);
