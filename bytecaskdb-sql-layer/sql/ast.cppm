@@ -127,6 +127,8 @@ struct Compare {
   Kind kind{Kind::Compare};
   std::vector<Compare> args;  // And, Or: two or more; Not: one
   std::optional<std::string> escape;  // Like: ESCAPE's string; none for the default, a backslash
+  std::optional<std::uint32_t> escape_param;  // Like: ESCAPE $n, zero-based, in place of `escape`
+  bool fold{false};  // Like: ILIKE, ASCII letters matched in either case
   std::shared_ptr<const Select> subquery;  // Exists, Quantified
   ValueCompare quantified{ValueCompare::Eq};
   bool all{false};
@@ -334,6 +336,8 @@ struct SetOperation {
   out.kind = c.kind;
   for (const auto& a : c.args) out.args.push_back(clone(a));
   out.escape = c.escape;
+  out.escape_param = c.escape_param;
+  out.fold = c.fold;
   out.subquery = c.subquery;
   out.quantified = c.quantified;
   out.all = c.all;

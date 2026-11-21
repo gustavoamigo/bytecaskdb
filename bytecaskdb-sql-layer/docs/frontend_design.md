@@ -263,13 +263,19 @@ on any columns, and of predicates over them.
   a key takes each comparison it can. A predicate (`OR`, `NOT`, `IS NULL`)
   is a filter, checked on each row a plan reads, never a key's bound
   (`planner_design.md`, *The search*).
-- **`LIKE`**: `col [NOT] LIKE pattern [ESCAPE 'c']`, of a TEXT or VARCHAR
-  column and a parameter or constant pattern, typed TEXT as PostgreSQL
-  types it; a predicate leaf, matched by `bc_like` (`plan_api_design.md`):
-  `%` any run, `_` one character, case-sensitive and bytewise (`COLLATE
-  "C"`). The escape is a backslash, `ESCAPE`'s one character, or none for
-  `ESCAPE ''`; a longer one is 22025, as is a pattern the match finds ending
-  in its escape. A number column is 42883.
+- **`LIKE`** and **`ILIKE`**: `col [NOT] [I]LIKE pattern [ESCAPE e]`, of a
+  TEXT or VARCHAR column and a parameter or constant pattern, typed TEXT as
+  PostgreSQL types it; a predicate leaf, matched by `bc_like` or `bc_ilike`
+  (`plan_api_design.md`): `%` any run, `_` one character, bytewise (`COLLATE
+  "C"`); `LIKE` is case-sensitive, `ILIKE` matches the ASCII letters of the
+  pattern's literals in either case, as `UPPER` and `LOWER` fold (`É`
+  and `é` differ). The escape is a backslash, `ESCAPE`'s one character, or
+  none for `ESCAPE ''`; a longer one is 22025, as is a pattern the match
+  finds ending in its escape. `ESCAPE $n` is a TEXT parameter, checked at
+  each row by `bc_like_escape`; a NULL one makes the predicate unknown, as
+  PostgreSQL's strict `like_escape` does. The escape is read before letters
+  fold, as `like_escape` runs before `ILIKE`'s lowering: under `ESCAPE 'A'`,
+  `A` quotes and `a` is a literal. A number column is 42883.
 - **Subqueries**, uncorrelated, in a `SELECT`'s and in an `UPDATE`'s or
   `DELETE`'s `WHERE`: `col op (SELECT …)` of one value, `[NOT] EXISTS (SELECT
   …)`, `col [NOT] IN (SELECT …)` and `col op ANY | SOME | ALL (SELECT …)`; and
@@ -286,8 +292,7 @@ on any columns, and of predicates over them.
   `id = (SELECT MAX(k) FROM u)` is a key lookup.
 - Not yet: a predicate comparing a REAL or DOUBLE column (`no plan:`, as
   any filter on one), `$n ± k` inside one, one of both tables' columns in a
-  join, in `HAVING`, `ILIKE` (its case folding is a locale's), `LIKE` of a
-  BYTEA column, `IS DISTINCT FROM`; a subquery that reads a column of the
+  join, in `HAVING`, `LIKE` of a BYTEA column, `IS DISTINCT FROM`; a subquery that reads a column of the
   query around it (correlated), one inside another, in `FROM`, `FOR UPDATE`
   in one, one of `AVG`, assigned by `SET` or `VALUES`, beside an aggregate,
   or compared with other than a column.
@@ -572,7 +577,7 @@ usable yet.
 
 **Refused**, with a message and the node's position: everything not above.
 That includes:
-- `ILIKE`, `IS DISTINCT FROM`, and a predicate in `HAVING`;
+- `IS DISTINCT FROM`, and a predicate in `HAVING`;
 - correlated and nested subqueries and the others above, derived tables;
 - `DISTINCT ON`, `DISTINCT` of a constant or over groups it does not select
   every key of, `GROUP BY` of an expression, and `HAVING` of anything but

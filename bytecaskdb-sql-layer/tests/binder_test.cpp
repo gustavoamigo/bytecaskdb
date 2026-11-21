@@ -727,7 +727,15 @@ TEST_CASE("binder: LIKE of a text column, its pattern TEXT, its escape one chara
   CHECK(state("SELECT k FROM lk WHERE v LIKE 'a' ESCAPE 'ab'") == "22025");
   CHECK(state("SELECT k FROM lk WHERE k LIKE '1%'") == "42883");
   CHECK(rejected(cat, "SELECT k FROM lk WHERE b LIKE 'a%'").first == "LIKE of a BYTEA column is not supported yet");
-  CHECK(rejected(cat, "SELECT k FROM lk WHERE v ILIKE 'a%'").first == "ILIKE is not supported: its case folding is a locale's");
+  // ILIKE is LIKE folding ASCII letters; ESCAPE $n is a TEXT parameter, checked when the plan runs.
+  CHECK(like("v ILIKE 'a%'").fold);
+  CHECK_FALSE(like("v LIKE 'a%'").fold);
+  CHECK(like("v NOT ILIKE 'a%'").kind == logical::Expr::Kind::Not);
+  CHECK(state("SELECT k FROM lk WHERE k ILIKE '1%'") == "42883");
+  auto escaped = bind_sql(cat, "SELECT k FROM lk WHERE v LIKE $1 ESCAPE $2");
+  REQUIRE(escaped.params.size() == 2);
+  CHECK(escaped.params.at(1).type == SqlType{SqlKind::Text});
+  CHECK(like("v LIKE 'a%' ESCAPE $1").args.size() == 3);
 }
 
 TEST_CASE("binder: a FOREIGN KEY is checked against the referenced table's keys, then not kept", "[sql][binder][catalog]") {

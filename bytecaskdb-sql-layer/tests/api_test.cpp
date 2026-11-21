@@ -3232,6 +3232,34 @@ TEST_CASE("embedded API: UPPER, LOWER, TRIM, POSITION and the lengths of columns
   CHECK(state("SELECT position(n in v) FROM s") == "42883");
 }
 
+TEST_CASE("embedded API: ILIKE folds ASCII letters, and LIKE's ESCAPE may be a parameter", "[sql][api]") {
+  sql_test::TempDir dir{"api_ilike"};
+  auto db = Database::open(dir.path());
+  auto state = [&](std::string_view sql, std::vector<Value> params = {}) -> std::string {
+    try {
+      (void)db->execute(sql, params);
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  auto ids = [&](std::string_view sql, std::vector<Value> params) {
+    std::vector<std::int64_t> out;
+    for (const auto& r : db->execute(sql, params).rows) out.push_back(std::get<std::int64_t>(r[0]));
+    return out;
+  };
+  using V = std::vector<std::int64_t>;
+  (void)db->execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR(20))");
+  (void)db->execute("INSERT INTO t VALUES (1, 'apple'), (2, 'Apple'), (3, 'banana'), (4, 'a_b'), (5, NULL), (6, 'a%b')");
+  CHECK(ids("SELECT id FROM t WHERE v ILIKE $1 ORDER BY id", {sql_test::bytes("APP%")}) == V{1, 2});
+  CHECK(ids("SELECT id FROM t WHERE v NOT ILIKE $1 ORDER BY id", {sql_test::bytes("a%")}) == V{3});  // NULL is neither
+  CHECK(ids("SELECT id FROM t WHERE v LIKE $1 ESCAPE $2 ORDER BY id", {sql_test::bytes("a#_b"), sql_test::bytes("#")}) == V{4});
+  CHECK(ids("SELECT id FROM t WHERE v LIKE $1 ESCAPE $2 ORDER BY id", {sql_test::bytes("a_b"), sql_test::bytes("")}) == V{4, 6});
+  CHECK(ids("SELECT id FROM t WHERE v LIKE $1 ESCAPE $2 ORDER BY id", {sql_test::bytes("a_b"), Value{}}).empty());
+  CHECK(state("SELECT id FROM t WHERE v LIKE $1 ESCAPE $2", {sql_test::bytes("a_b"), sql_test::bytes("ab")}) == "22025");
+  CHECK(state("SELECT id FROM t WHERE id ILIKE 'a'") == "42883");
+}
+
 TEST_CASE("embedded API: a procedure builds text from its variables, as TPROC-C's Payment does", "[sql][api][procedure]") {
   sql_test::TempDir dir{"api_procedure_strings"};
   auto db = Database::open(dir.path());

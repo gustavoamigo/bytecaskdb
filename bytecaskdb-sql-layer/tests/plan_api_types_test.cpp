@@ -525,6 +525,42 @@ TEST_CASE("plan API: bc_like is PostgreSQL's LIKE of UTF-8 text", "[sql][algebra
   CHECK(bc_error(f.cx) == BC_E_PATTERN);
 }
 
+namespace {
+// $1 ILIKE $2 with escape $3, the escape's text given to bc_like_escape.
+void ilike_row(bc_ctx* cx) {
+  bool m = bc_ilike(cx, bc_param_bytes(cx, 0), bc_param_bytes(cx, 1), bc_like_escape(cx, bc_param_bytes(cx, 2)));
+  bc_emit_begin(cx);
+  bc_emit_bool(cx, m);
+  bc_emit_end(cx);
+}
+}  // namespace
+
+TEST_CASE("plan API: bc_ilike folds ASCII letters of literals; bc_like_escape reads one character", "[sql][algebra]") {
+  Fixture f;
+  auto ilike = [&](std::string_view text, std::string_view pattern, std::string_view escape = "\\") -> bool {
+    INFO(text << " ILIKE " << pattern << " escape " << escape);
+    REQUIRE(run(f, ilike_row, {bytes(text), bytes(pattern), bytes(escape)}, kBoolRow) == BC_COMMITTED);
+    auto rows = f.results(kBoolRow);
+    REQUIRE(rows.size() == 1);
+    return std::get<bool>(rows[0][0]);
+  };
+  CHECK(ilike("Apple", "aPPLE"));
+  CHECK(ilike("APPLE", "a%e"));
+  CHECK_FALSE(ilike("\xc3\x89" "cole", "\xc3\xa9%"));  // É and é: not ASCII, COLLATE "C"
+  CHECK(ilike("a_b", "A#_B", "#"));
+  CHECK_FALSE(ilike("axb", "A#_B", "#"));
+  // The escape is read before letters fold, as PostgreSQL's like_escape
+  // runs before ILIKE: escape A quotes, a is a literal that matches A.
+  CHECK(ilike("a_b", "AA#_b", "A") == false);
+  CHECK(ilike("a_b", "A_b", "A") == false);  // A quotes _: the literal _, then b; "a_b" is longer
+  CHECK(ilike("_b", "A_b", "A"));
+  CHECK(ilike("Aa", "aa", "A"));
+  CHECK(ilike("a\\b", "A\\B", ""));  // '': no escape
+  REQUIRE(run(f, ilike_row, {bytes("a"), bytes("a"), bytes("ab")}, kBoolRow) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_PATTERN);
+  CHECK(std::string{bc_error_message(f.cx)} == "invalid escape string");
+}
+
 TEST_CASE("plan API: the arithmetic helpers define what C leaves undefined", "[sql][algebra]") {
   Fixture f;
   CHECK(value(f, add_p, {std::int64_t{2}, std::int64_t{3}}) == 5);

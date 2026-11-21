@@ -83,10 +83,11 @@ struct Expr {
   Fn fn{Fn::Count};             // Aggregate
   Text text{Text::Upper};       // TextFn
   bool distinct{false};         // Aggregate: COUNT(DISTINCT arg)
+  bool fold{false};             // Like: ILIKE, ASCII letters matched in either case
   std::vector<Expr> args;       // Add, Sub, Mul, Div, Compare: two; Aggregate: none (COUNT(*)) or its argument;
                                 // And, Or: two or more; Not: one; IsNull: its column, or in a select list its
                                 // operand; Like: the column and the
-                                // pattern, a parameter; Truth: its parameter; InSet: its column;
+                                // pattern, a parameter, and an ESCAPE parameter, which `constant` then is not; Truth: its parameter; InSet: its column;
                                 // Case: WHEN, THEN, WHEN, THEN … and an ELSE last if there is one (an odd count);
                                 // Coalesce: two or more; Concat: two, text or an integer or DECIMAL (its
                                 // text); Substr: the text, the start, and the count if given (INTEGERs);

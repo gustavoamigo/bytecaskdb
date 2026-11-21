@@ -1654,6 +1654,7 @@ void params_in(const ast::Compare& c, std::uint32_t& n) {
     params_in(c.lhs, n);
     if (c.kind == ast::Compare::Kind::Compare) params_in(c.rhs, n);
   }
+  if (c.escape_param) n = std::max(n, *c.escape_param + 1);
   for (const auto& a : c.args) params_in(a, n);
 }
 
@@ -3107,7 +3108,8 @@ public:
     auto [table, c] = resolve(w.lhs);
     if (!is_string(c->sql)) {
       if (c->sql.kind == SqlKind::Bytea) not_yet("LIKE of a BYTEA column", w.pos);
-      throw SqlError{"operator does not exist: " + pg_type_name(c->sql) + " ~~ unknown", w.pos, kUndefinedFunction};
+      throw SqlError{"operator does not exist: " + pg_type_name(c->sql) + (w.fold ? " ~~* unknown" : " ~~ unknown"), w.pos,
+                     kUndefinedFunction};
     }
     synthetic_.push_back(Column{0, c->name, SqlType{SqlKind::Text}, PhysType::Bytes, true, {}});
     const auto& text = synthetic_.back();
@@ -3116,7 +3118,7 @@ public:
       use_param(w.rhs.param, PhysType::Bytes, w.rhs.pos, text, table, Use::Compared);
       pattern = logical::param(w.rhs.param, text.sql);
     } else if (is_constant(w.rhs)) {
-      pattern = fixed(coerce(fold(w.rhs), text, false, "~~"), text.sql);
+      pattern = fixed(coerce(fold(w.rhs), text, false, w.fold ? "~~*" : "~~"), text.sql);
     } else {
       not_yet("LIKE of other than a parameter or a constant pattern", w.pos);
     }
@@ -3137,6 +3139,12 @@ public:
     e.args.push_back(logical::column_of(table, *c));
     e.args.push_back(std::move(pattern));
     e.constant = escape;
+    e.fold = w.fold;
+    // ESCAPE $n: text, checked as an escape when the plan runs.
+    if (w.escape_param) {
+      use_param(*w.escape_param, PhysType::Bytes, w.pos, text, table, Use::Compared);
+      e.args.push_back(logical::param(*w.escape_param, text.sql));
+    }
     return e;
   }
 
