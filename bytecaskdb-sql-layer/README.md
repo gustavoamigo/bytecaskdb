@@ -22,7 +22,7 @@ How much of each suite the layer passes, from the functional suite's conformance
 | Suite | Coverage | Tests | Checks |
 |---|---|---|---|
 | SQL:2016 Core (sqltest) | 80% | 595/743 tests | statement accepted |
-| PostgreSQL features | 94% | 352/375 cases | results |
+| PostgreSQL features | 94% | 353/376 cases | results |
 | ByteCaskDB features | 100% | 13/13 cases | results |
 | TPROC-C | 100% | 1/1 case: five transactions, then consistency conditions 1–9 | consistency conditions 1–9 |
 

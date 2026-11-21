@@ -501,7 +501,8 @@ refuses:
 - a sort with no key, over a covering scan, keeping a negative number of
   rows, or whose sorters hold other rows than its loops' (a sorter per loop
   of its input read above it, outer first, each over a row read); a column
-  read above it from a loop no sorter holds; a sort key or NULL test
+  read above it from a loop no sorter holds, a left outer lookup's match's
+  among them; a sort key or NULL test
   outside its input's tables, an expression key's columns among them;
 - an `Aggregate` of other than `COUNT` or `SUM`; an aggregate call of more
   than one argument, of one `eval` does not print, or of `DISTINCT` values
@@ -634,7 +635,7 @@ over `bc_sorter_*`, and compared with the plans in the order.
   included), and its loop keeps the `LIMIT`'s counter. `LIMIT 0` needs no order and sorts nothing.
 - A sorter holds one view per row, so there is a sorter per loop of the
   plan whose row is read above the sort, by the result or by a lookup by key
-  repeated there, each holding that loop's table's row, all fed the same
+  repeated there (its key, or a left outer one's match, *Outer joins*), each holding that loop's table's row, all fed the same
   sort key, built once per row. A sorter is stable and a top-n sorter keeps
   the earliest of equal keys, so sorters fed the same keys in the same order
   hold the rows of the same pairs, in the same order, and under `LIMIT n`
@@ -829,6 +830,13 @@ the join every column of the right table is nullable, its declaration
 aside: the binder marks it, and the plan tests the NULL. A conjunct of the
 `ON` that reads both sides and is no comparison with a key is the pair's
 match, tested after the row is read.
+
+The right side's `ON` equalities make none of its columns constant, as a
+`WHERE` equality would: a row the join NULL-extends holds NULL there. So an
+`ORDER BY` or `GROUP BY` on such a column keeps it, a sort key or a group
+key (#838). In a sorted plan the right side looked up by key after the first
+loop is looked up again above the sort (*Sorts*), its match tested there
+too: a sorter holds every loop whose columns that match reads.
 
 A NULL parameter of the right side's key matches no row: it is that side's
 guard, which skips its loop and leaves the left row NULL-extended, where an

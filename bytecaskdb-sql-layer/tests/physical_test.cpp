@@ -405,6 +405,17 @@ TEST_CASE("physical: a sort holds the row of each of its input's loops read abov
   };
   CHECK(refusal(plan(again({2}))).empty());
   refused(plan(again({1})), "a column read above a sort from a loop no sorter holds");
+  // A left outer lookup repeated above the sort reads a held row for its
+  // ON too, not only its key (#838).
+  auto outer_again = [&](std::vector<std::uint32_t> payloads) {
+    auto sorted = node(physical::Sort{two_loops(), by_id, 0, std::move(payloads), {}});
+    const logical::ColumnRef w_v{3, 1, PhysType::I64, true};
+    const auto big = SqlType{SqlKind::BigInt};
+    auto on = logical::compare(ast::Compare::Op::Eq, logical::column(w_v, big), logical::column(u_v, big));
+    return emit(node(physical::IndexJoin{std::move(sorted), 3, {p(0)}, true, {std::move(on)}}), {});
+  };
+  CHECK(refusal(plan(outer_again({2}))).empty());
+  refused(plan(outer_again({1})), "a column read above a sort from a loop no sorter holds");
   refused(plan(sort(node(physical::NestedLoop{node(scan({p(0)}, {})),
                                               node(physical::Scan{2, 4, {p(1)}, {}, false, true, false})}),
                     by_id, 0, {1, 2})),

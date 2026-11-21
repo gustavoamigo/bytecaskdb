@@ -850,6 +850,43 @@
     - DROP TABLE b
     - DROP TABLE c
 
+- name: a LEFT JOIN ordered by its right side's columns its ON compares with constants
+  features: [F041-03, F041-04]
+  # #838: the ON's equalities make no column of the right side constant, and
+  # the lookup repeated above the sort reads the left row its ON compares.
+  setup:
+    - CREATE TABLE oj1 (c0 BIGINT, c1 BIGINT, c2 INTEGER, PRIMARY KEY (c2, c0))
+    - CREATE TABLE oj3 (c0 BIGINT PRIMARY KEY, c1 TEXT)
+  steps:
+    - sql: SELECT oj1.c0 FROM oj3 LEFT JOIN oj1 ON oj1.c2 = 7 AND oj1.c0 = 5 AND oj1.c1 = oj3.c0 ORDER BY oj1.c1
+      expected: []
+    - sql: SELECT oj1.c0, oj1.c1, oj1.c2 FROM oj3 LEFT JOIN oj1 ON oj1.c2 = $1 AND oj1.c0 = $2 AND oj1.c1 = oj3.c0 ORDER BY oj1.c2 NULLS LAST, oj1.c1 NULLS FIRST LIMIT 1
+      params: [7, 5]
+      expected: []
+    - sql: INSERT INTO oj3 VALUES (0, 'z'), (1, 'y'), (2, 'x')
+      rowcount: 3
+    - sql: INSERT INTO oj1 VALUES (5, 1, 7), (6, 2, 7), (5, 3, 8)
+      rowcount: 3
+    - sql: SELECT oj1.c0 FROM oj3 LEFT JOIN oj1 ON oj1.c2 = 7 AND oj1.c0 = 5 AND oj1.c1 = oj3.c0 ORDER BY oj1.c1
+      expected: [[5], [null], [null]]
+    - sql: SELECT oj1.c0, oj1.c1, oj1.c2 FROM oj3 LEFT JOIN oj1 ON oj1.c2 = $1 AND oj1.c0 = $2 AND oj1.c1 = oj3.c0 ORDER BY oj1.c2 NULLS LAST, oj1.c1 NULLS FIRST LIMIT 1
+      params: [7, 5]
+      expected: [[5, 1, 7]]
+    - sql: SELECT oj1.c0, oj1.c1, oj1.c2 FROM oj3 LEFT JOIN oj1 ON oj1.c2 = $1 AND oj1.c0 = $2 AND oj1.c1 = oj3.c0 ORDER BY oj1.c2 NULLS LAST, oj1.c1 NULLS FIRST LIMIT 1
+      params: [8, 5]
+      expected: [[null, null, null]]
+    - sql: SELECT oj3.c0, oj1.c0 FROM oj3 LEFT JOIN oj1 ON oj1.c2 = $1 AND oj1.c0 = $2 AND oj1.c1 = oj3.c0 ORDER BY oj3.c1, oj3.c0
+      params: [7, 6]
+      expected: [[2, 6], [1, null], [0, null]]
+    - sql: SELECT oj1.c2, count(*) FROM oj3 LEFT JOIN oj1 ON oj1.c2 = $1 AND oj1.c1 = oj3.c0 GROUP BY oj1.c2 ORDER BY 1
+      params: [7]
+      expected: [[7, 2], [null, 1]]
+    - sql: SELECT oj3.c0, oj1.c0 FROM oj1 RIGHT JOIN oj3 ON oj1.c2 = 7 AND oj1.c0 = 5 AND oj1.c1 = oj3.c0 ORDER BY oj1.c1, oj3.c0 LIMIT 2
+      expected: [[1, 5], [0, null]]
+  teardown:
+    - DROP TABLE oj1
+    - DROP TABLE oj3
+
 - name: a join in parentheses
   features: [F041-05]
   # only an inner, LEFT or RIGHT join of tables, each joined to the ones before it, is supported

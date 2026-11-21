@@ -4242,3 +4242,31 @@ TEST_CASE("embedded API: INSERT … SELECT reads the snapshot its statement bega
   CHECK(db->execute("INSERT INTO k SELECT a + 2 FROM k").affected == 2);
   CHECK(db->execute("SELECT a FROM k ORDER BY a").rows == Grid{{i(1)}, {i(2)}, {i(3)}, {i(4)}});
 }
+
+TEST_CASE("embedded API: a LEFT JOIN sorted by its right side, its lookup by key repeated above the sort", "[sql][api]") {
+  // #838: the lookup repeated above the sort compares the left row's column
+  // in its ON, so a sorter holds that row; and the ON's equalities with
+  // constants leave a NULL-extended row's columns NULL, so they stay sort keys.
+  sql_test::TempDir dir{"api_left_join_sort"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE t1 (c0 BIGINT, c1 BIGINT, c2 INTEGER, PRIMARY KEY (c2, c0))");
+  (void)db->execute("CREATE TABLE t3 (c0 BIGINT PRIMARY KEY, c1 TEXT)");
+  const auto& by_right =
+      db->prepare("SELECT t1.c0, t3.c0 FROM t3 LEFT JOIN t1 ON t1.c2 = 7 AND t1.c0 = 5 AND t1.c1 = t3.c0 ORDER BY t1.c1, t3.c0");
+  const auto& first = db->prepare(
+      "SELECT t1.c0, t1.c1, t1.c2 FROM t3 LEFT JOIN t1 ON t1.c2 = $1 AND t1.c0 = $2 AND t1.c1 = t3.c0 "
+      "ORDER BY t1.c2 NULLS LAST, t1.c1 NULLS FIRST LIMIT 1");
+  const auto& by_left =
+      db->prepare("SELECT t3.c0, t1.c0 FROM t3 LEFT JOIN t1 ON t1.c2 = $1 AND t1.c0 = $2 AND t1.c1 = t3.c0 ORDER BY t3.c1, t3.c0");
+  CHECK(db->execute(by_right, {}).rows.empty());
+  CHECK(db->execute(first, {i(7), i(5)}).rows.empty());
+  CHECK(db->execute(by_left, {i(7), i(5)}).rows.empty());
+  (void)db->execute("INSERT INTO t3 VALUES (0, 'z'), (1, 'y'), (2, 'x')");
+  (void)db->execute("INSERT INTO t1 VALUES (5, 1, 7), (6, 2, 7), (5, 3, 8)");
+  CHECK(db->execute(by_right, {}).rows == Grid{{i(5), i(1)}, {kNull, i(0)}, {kNull, i(2)}});
+  CHECK(db->execute(first, {i(7), i(5)}).rows == Grid{{i(5), i(1), i(7)}});
+  CHECK(db->execute(first, {i(8), i(5)}).rows == Grid{{kNull, kNull, kNull}});
+  CHECK(db->execute(by_left, {i(7), i(6)}).rows == Grid{{i(2), i(6)}, {i(1), kNull}, {i(0), kNull}});
+  CHECK(db->execute("SELECT t1.c2, count(*) FROM t3 LEFT JOIN t1 ON t1.c2 = 7 AND t1.c1 = t3.c0 GROUP BY t1.c2 ORDER BY 1")
+            .rows == Grid{{i(7), i(2)}, {kNull, i(1)}});
+}
