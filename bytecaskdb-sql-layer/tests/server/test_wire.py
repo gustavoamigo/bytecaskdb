@@ -773,6 +773,22 @@ def test_a_ddl_that_if_exists_skips_sends_postgresqls_notice_before_its_tag(serv
     assert b"N" not in [k for k, _ in c.until_ready()]
 
 
+def test_drop_schema_cascade_sends_postgresqls_notice_with_its_detail(server):
+    # As PostgreSQL 17: one NOTICE, its DETAIL a line per object dropped, before the tag.
+    c = connect(server)
+    for sql in ("CREATE SCHEMA wire_cs", "CREATE TABLE wire_cs.t (a INTEGER)", "CREATE VIEW wire_cs_v AS SELECT a FROM wire_cs.t"):
+        c.send(query(sql))
+        assert states(c.until_ready()) == []
+    c.send(query("DROP SCHEMA wire_cs CASCADE"))
+    got = c.until_ready()
+    kinds = [k for k, _ in got]
+    assert kinds.count(b"N") == 1 and kinds.index(b"N") < kinds.index(b"C")
+    notice = fields(next(b for k, b in got if k == b"N"))
+    assert (notice["S"], notice["C"], notice["M"]) == ("NOTICE", "00000", "drop cascades to 2 other objects")
+    assert notice["D"] == "drop cascades to table wire_cs.t\ndrop cascades to view wire_cs_v"
+    assert fields_tag(got) == "DROP SCHEMA"
+
+
 def test_insert_select_answers_insert_0_n_and_takes_its_querys_parameters(server):
     c = connect(server)
     for sql in ("CREATE TABLE ins_src (id INTEGER PRIMARY KEY, v TEXT)", "INSERT INTO ins_src VALUES (1, 'a'), (2, 'b')",

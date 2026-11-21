@@ -953,24 +953,23 @@ auto drop_procedure(const PgQuery__DropStmt* s, std::int32_t pos) -> DropProcedu
   return out;
 }
 
-// DROP SCHEMA [IF EXISTS] name [, …] [RESTRICT]: CASCADE is stage 5's
-// (docs/catalog_design.md, *Stages of schemas*).
+// DROP SCHEMA [IF EXISTS] name [, …] [RESTRICT | CASCADE].
 auto drop_schema(const PgQuery__DropStmt* s, std::int32_t pos) -> DropSchema {
-  if (s->behavior == PG_QUERY__DROP_BEHAVIOR__DROP_CASCADE) {
-    reject("DROP SCHEMA … CASCADE is not supported yet", pos, kFeatureNotSupported);
-  }
-  DropSchema out{{}, s->missing_ok != 0, pos};
+  DropSchema out{{}, s->missing_ok != 0, s->behavior == PG_QUERY__DROP_BEHAVIOR__DROP_CASCADE, pos};
   for (std::size_t i = 0; i < s->n_objects; ++i) out.names.push_back(str(s->objects[i]));
   return out;
 }
 
 // DROP TABLE, INDEX, VIEW and PROCEDURE, one object each, RESTRICT (the
-// default); DROP SCHEMA of a list.
+// default); DROP SCHEMA of a list. PostgreSQL takes CASCADE on every DROP;
+// the layer only on DROP SCHEMA, so elsewhere it is a feature not built
+// (0A000, #872), not a syntax error.
 auto drop(const PgQuery__DropStmt* s, std::int32_t pos) -> Statement {
   if (s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_SCHEMA) return drop_schema(s, pos);
-  if (s->n_objects != 1 || s->behavior == PG_QUERY__DROP_BEHAVIOR__DROP_CASCADE || s->concurrent) {
-    reject("DROP takes one object, without CASCADE or CONCURRENTLY", pos);
+  if (s->behavior == PG_QUERY__DROP_BEHAVIOR__DROP_CASCADE) {
+    reject("DROP … CASCADE is not supported yet: only DROP SCHEMA takes CASCADE", pos, kFeatureNotSupported);
   }
+  if (s->n_objects != 1 || s->concurrent) reject("DROP takes one object, without CONCURRENTLY", pos);
   const auto* obj = s->objects[0];
   if (s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_PROCEDURE) return drop_procedure(s, pos);
   using K = DropTypeOrSequence::Kind;

@@ -76,11 +76,12 @@ using bytecask::DbDegraded;
 using bytecask::VacuumOptions;
 
 // What a statement reports besides its result, as PostgreSQL's NOTICE: a
-// DDL that IF EXISTS or IF NOT EXISTS skipped, with PostgreSQL's SQLSTATE
-// and text.
+// DDL that IF EXISTS or IF NOT EXISTS skipped, or what DROP SCHEMA …
+// CASCADE dropped, with PostgreSQL's SQLSTATE, text and DETAIL ("" for none).
 struct Notice {
   std::string sqlstate;
   std::string message;
+  std::string detail{};
 };
 
 struct Rows {
@@ -1588,7 +1589,7 @@ private:
                 const ast::SqlError& error) -> std::shared_ptr<const Compiled>;
   // Commits a DDL; whether it changed the catalog (false: IF [NOT] EXISTS
   // skipped it). Throws the API's errors for the catalog's failures.
-  auto run_ddl(const Ddl& ddl) -> bool;
+  auto run_ddl(const Ddl& ddl) -> LiveCatalog::Applied;
   // CREATE TABLE AS and SELECT … INTO (docs/frontend_design.md, *The
   // dialect*; docs/catalog_design.md, *CREATE TABLE AS*): the query's rows,
   // autocommit, then the table and its rows as one DDL.
@@ -2620,6 +2621,27 @@ auto skip_notices(const Ddl& ddl, const Catalog& before, bool changed) -> std::v
   return out;
 }
 
+// DROP SCHEMA … CASCADE's NOTICE of what it dropped besides the schemas,
+// from the catalog it ran against: none when the schemas held nothing.
+auto cascade_notices(const Ddl& ddl, const Catalog& base, bool changed) -> std::vector<Notice> {
+  const auto* ds = std::get_if<DropSchemaDdl>(&ddl);
+  if (ds == nullptr || !ds->cascade || !changed) return {};
+  const auto drop = base.schema_drop(*ds);
+  if (drop.objects.empty()) return {};
+  if (drop.objects.size() == 1) return {{"00000", "drop cascades to " + drop.objects.front().described}};
+  return {{"00000", "drop cascades to " + std::to_string(drop.objects.size()) + " other objects",
+           drop.detail([](const Catalog::SchemaDrop::Object& o) { return "drop cascades to " + o.described; })}};
+}
+
+// A DDL's notices, in PostgreSQL's order: what IF EXISTS skipped, then what
+// CASCADE dropped. `before` is the catalog the DDL was bound against, `base`
+// the one it ran against.
+auto ddl_notices(const Ddl& ddl, const Catalog& before, const Catalog& base, bool changed) -> std::vector<Notice> {
+  auto out = skip_notices(ddl, before, changed);
+  std::ranges::move(cascade_notices(ddl, base, changed), std::back_inserter(out));
+  return out;
+}
+
 }  // namespace
 
 auto Database::execute_locked(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts)
@@ -2650,7 +2672,19 @@ auto Database::execute_ddl(const Statement& stmt, const std::vector<Value>& para
     auto bound = bound::bind(stmt.ast_, *before);
     const auto& ddl = std::get<Ddl>(bound.stmt);
     Rows out;
-    out.notices = skip_notices(ddl, *before, run_ddl(ddl));
+    // What CASCADE drops is reported from the catalog it ran against, but
+    // worked out before the commit too: a failure after it must not report
+    // a committed DROP as failed.
+    out.notices = ddl_notices(ddl, *before, *before, true);
+    const auto applied = run_ddl(ddl);
+    if (!applied.changed) {
+      out.notices = skip_notices(ddl, *before, false);
+    } else if (applied.base != before) {
+      try {
+        out.notices = ddl_notices(ddl, *before, *applied.base, true);
+      } catch (const std::bad_alloc&) {  // NOLINT(bugprone-empty-catch): the notice is dropped, not the outcome
+      }
+    }
     out.affected = 0;
     return out;
   }
@@ -2681,9 +2715,9 @@ auto Database::schema_with_elements(const Statement& stmt, const ExecutionOption
   return out;
 }
 
-auto Database::run_ddl(const Ddl& ddl) -> bool {
+auto Database::run_ddl(const Ddl& ddl) -> LiveCatalog::Applied {
   try {
-    return live_->run(ddl).changed;
+    return live_->run(ddl);
   } catch (const ConstraintViolation& e) {
     throw ExecError(e.what(), BC_E_CONSTRAINT, e.detail().encode());
   } catch (const DdlInProgress&) {
@@ -2810,7 +2844,7 @@ auto Database::create_table_as(const Statement& stmt, const std::vector<Value>& 
   auto n = std::ssize(ddl.rows);
   bool changed = false;
   try {
-    changed = run_ddl(ddl);
+    changed = run_ddl(ddl).changed;
   } catch (const std::length_error& e) {
     throw ExecError(e.what(), BC_E_LIMIT);  // the backfill, a row or the ids over the engine's limits: 54000
   }
@@ -3663,6 +3697,22 @@ void Transaction::check_in_use(const Ddl& ddl, const Catalog& cat) const {
       throw DdlRefused("cannot DROP INDEX \"" + di->name.name + "\" because it is being used by active queries in this session",
                        kObjectInUse);
     }
+  } else if (const auto* ds = std::get_if<DropSchemaDdl>(&ddl); ds != nullptr && ds->cascade) {
+    // Each table CASCADE drops, as PostgreSQL drops it: its indexes first,
+    // each held by a cursor that scans it, then the table. schema_drop
+    // raises the DROP's own refusals of its names first. RESTRICT of a
+    // schema holding a table is 2BP01, which next_version raises.
+    for (const auto& o : cat.schema_drop(*ds).objects) {
+      const auto* t = cat.table(o.id);
+      if (t == nullptr) continue;
+      for (const auto& ix : t->indexes) {
+        if (read_by_a_cursor([id = ix.id](std::uint32_t r) { return r == id; })) {
+          throw DdlRefused("cannot DROP INDEX \"" + ix.name + "\" because it is being used by active queries in this session",
+                           kObjectInUse);
+        }
+      }
+      table_in_use("DROP TABLE", QualifiedName{t->schema, t->name});
+    }
   }
 }
 
@@ -3718,7 +3768,7 @@ auto Transaction::run_ddl(const Target& t, const ast::Statement& st, const std::
   check_in_use(ddl, *cat);
   Rows out;
   const auto changed = step_ddl(ddl, *cat);
-  out.notices = skip_notices(ddl, *cat, changed);
+  out.notices = ddl_notices(ddl, *cat, *cat, changed);
   out.affected = 0;
   return out;
 }
@@ -3747,7 +3797,7 @@ auto Transaction::create_schema_elements(const ast::Statement& st, const ast::Cr
     const auto& ddl = std::get<Ddl>(bound.stmt);
     check_in_use(ddl, *at);
     const auto changed = step_ddl(ddl, *at);
-    auto notices = skip_notices(ddl, *at, changed);
+    auto notices = ddl_notices(ddl, *at, *at, changed);
     std::ranges::move(notices, std::back_inserter(out.notices));
   }
   return out;

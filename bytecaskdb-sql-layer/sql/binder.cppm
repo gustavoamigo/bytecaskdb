@@ -7431,7 +7431,7 @@ auto bind_statement(const ast::Statement& stmt, const Catalog& cat, std::span<co
           auto owner = s.authorization && !s.authorization->empty() ? s.authorization : std::nullopt;
           return {Ddl{CreateSchemaDdl{s.name, std::move(owner), s.if_not_exists}}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::DropSchema>) {
-          return {Ddl{DropSchemaDdl{s.names, s.if_exists}}, s.pos};
+          return {Ddl{DropSchemaDdl{s.names, s.if_exists, s.cascade}}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::DropProcedure>) {
           auto name = dropped_name(s.procedure, s.if_exists, cat, s.pos);
           if (!name) return {skipped_schema(s.procedure), s.pos};

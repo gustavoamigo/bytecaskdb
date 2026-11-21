@@ -795,8 +795,10 @@ difference: the driver writes ISO.
   converted from the layer's byte offset.
 
 Warnings are `NoticeResponse` with `S` `WARNING`. A statement's notices
-(`Rows::notices`: a DDL that `IF EXISTS` or `IF NOT EXISTS` skipped) are
-`NoticeResponse` with `S` `NOTICE`, PostgreSQL's SQLSTATE and text, sent
+(`Rows::notices`: a DDL that `IF EXISTS` or `IF NOT EXISTS` skipped, and
+what `DROP SCHEMA … CASCADE` dropped) are `NoticeResponse` with `S`
+`NOTICE`, PostgreSQL's SQLSTATE and text, and `D` when the notice has a
+DETAIL (`Notice::detail`), sent
 before the statement's `CommandComplete` in both protocols.
 
 The SQLSTATE comes from one function in the API, `sqlstate(const

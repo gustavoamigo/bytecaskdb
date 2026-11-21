@@ -718,11 +718,11 @@ struct CreateSchema {
   return out;
 }
 
-// DROP SCHEMA [IF EXISTS] name [, …] [RESTRICT]. CASCADE is refused by the
-// parser until stage 5 builds it.
+// DROP SCHEMA [IF EXISTS] name [, …] [RESTRICT | CASCADE].
 struct DropSchema {
   std::vector<std::string> names;
   bool if_exists{false};
+  bool cascade{false};
   std::int32_t pos{-1};
 };
 

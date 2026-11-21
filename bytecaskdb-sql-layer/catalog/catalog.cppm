@@ -719,10 +719,12 @@ struct CreateSchemaDdl {
   std::optional<std::string> owner;
   bool if_not_exists{false};
 };
-// DROP SCHEMA … RESTRICT of each name: all or none.
+// DROP SCHEMA of each name: all or none. RESTRICT refuses a schema that
+// holds an object; `cascade` drops what Catalog::schema_drop lists with it.
 struct DropSchemaDdl {
   std::vector<std::string> names;
   bool if_exists{false};
+  bool cascade{false};
 };
 // A DROP … IF EXISTS the binder found nothing to do for, its name in a
 // schema that does not exist: it changes nothing, and `notice` is
@@ -868,6 +870,30 @@ public:
   // DROP of it 2BP01.
   [[nodiscard]] auto find_view_dependent(std::uint32_t id) const -> const View*;
 
+  // What DROP SCHEMA drops besides the schemas, as PostgreSQL 17 lists it:
+  // each table, view, sequence, domain, shell type and procedure of a named
+  // schema, in creation (id) order, each followed by the views elsewhere
+  // that read it, and the views that read those. An index goes with its
+  // table and is not listed. `depends_on` is what the object depends on, as
+  // RESTRICT's DETAIL words it.
+  struct SchemaDrop {
+    struct Object {
+      std::uint32_t id{0};
+      std::string described;   // "table s.t"
+      std::string depends_on;  // "schema s", "view s.v"
+    };
+    std::vector<std::uint32_t> schemas;  // each dropped schema, once; empty when IF EXISTS skipped them all
+    std::vector<Object> objects;
+    // PostgreSQL's DETAIL of the objects, one line each as `line` writes it,
+    // past kMaxReported cut to "and N other objects (see server log for list)".
+    [[nodiscard]] auto detail(const std::function<std::string(const Object&)>& line) const -> std::string;
+    static constexpr std::size_t kMaxReported = 100;  // PostgreSQL's MAX_REPORTED_DEPS
+  };
+  // Throws DdlRefused as the DROP does for its names: 3F000 for a missing
+  // schema (unless IF EXISTS), 2BP01 for pg_catalog, 0A000 for public and
+  // information_schema.
+  [[nodiscard]] auto schema_drop(const DropSchemaDdl& ddl) const -> SchemaDrop;
+
 private:
   friend class LiveCatalog;
 
@@ -950,9 +976,11 @@ public:
   auto apply(const Ddl& ddl) -> std::shared_ptr<const Catalog>;
   // apply, and whether the DDL changed the catalog: false when IF EXISTS or
   // IF NOT EXISTS skipped it, and `catalog` is then the version it read.
+  // `base` is the version the DDL read.
   struct Applied {
     std::shared_ptr<const Catalog> catalog;
     bool changed{false};
+    std::shared_ptr<const Catalog> base;
   };
   auto run(const Ddl& ddl) -> Applied;
 
@@ -2916,6 +2944,78 @@ auto signature_type(SqlType t) -> std::string_view {
 
 }  // namespace
 
+auto Catalog::SchemaDrop::detail(const std::function<std::string(const Object&)>& line) const -> std::string {
+  std::string out;
+  for (std::size_t i = 0; i < objects.size() && i < kMaxReported; ++i) out += (i == 0 ? "" : "\n") + line(objects[i]);
+  if (objects.size() > kMaxReported) {
+    auto more = objects.size() - kMaxReported;  // PostgreSQL's ngettext: "object" for one
+    out += "\nand " + std::to_string(more) + (more == 1 ? " other object" : " other objects") + " (see server log for list)";
+  }
+  return out;
+}
+
+auto Catalog::schema_drop(const DropSchemaDdl& ddl) const -> SchemaDrop {
+  SchemaDrop out;
+  // Every name first: a missing one drops nothing (3F000), or is skipped.
+  for (const auto& name : ddl.names) {
+    if (name == "public" || system_schema(name) != 0) continue;
+    const auto* sc = schema(name);
+    if (sc == nullptr) {
+      if (ddl.if_exists) continue;
+      throw DdlRefused("schema \"" + name + "\" does not exist", kInvalidSchemaName);
+    }
+    if (!std::ranges::contains(out.schemas, sc->id)) out.schemas.push_back(sc->id);
+  }
+  for (const auto& name : ddl.names) {
+    if (name == "pg_catalog" || name == "pg_toast") {
+      throw DdlRefused("cannot drop schema " + name + " because it is required by the database system",
+                       kDependentObjectsStillExist);
+    }
+    // public is implicit and information_schema holds nothing here
+    // (docs/catalog_design.md, *Differences from PostgreSQL 17*).
+    if (name == "public" || name == "information_schema") {
+      throw DdlRefused("DROP SCHEMA " + name + " is not supported", kFeatureNotSupported);
+    }
+  }
+  auto qualified = [&](std::uint32_t schema, const std::string& name) {
+    return (schema == kPublicSchema ? std::string{} : quoted_ident(schema_name(schema)) + ".") + quoted_ident(name);
+  };
+  auto described = [&](std::uint32_t id) -> std::string {
+    if (const auto* t = table(id)) return "table " + qualified(t->schema, t->name);
+    if (const auto* w = view(id)) return "view " + qualified(w->schema, w->name);
+    if (const auto it = sequences_.find(id); it != sequences_.end()) return "sequence " + qualified(it->second.schema, it->second.name);
+    if (const auto it = types_.find(id); it != types_.end()) return "type " + qualified(it->second.schema, it->second.name);
+    const auto& p = procedures_.at(id);
+    std::string args;
+    for (const auto& a : p.args) args += (args.empty() ? "" : ",") + std::string{signature_type(a.type)};
+    return "function " + qualified(p.schema, p.name) + "(" + args + ")";
+  };
+  std::map<std::uint32_t, std::uint32_t> held;  // object id -> its schema, of the dropped schemas
+  auto hold = [&](std::uint32_t id, std::uint32_t schema) {
+    if (std::ranges::contains(out.schemas, schema)) held.emplace(id, schema);
+  };
+  for (const auto& [id, t] : tables_) hold(id, t.schema);
+  for (const auto& [id, w] : views_) hold(id, w.schema);
+  for (const auto& [id, q] : sequences_) hold(id, q.schema);
+  for (const auto& [id, t] : types_) hold(id, t.schema);
+  for (const auto& [id, p] : procedures_) hold(id, p.schema);
+  std::set<std::uint32_t> listed;
+  std::function<void(std::uint32_t)> readers = [&](std::uint32_t id) {
+    for (const auto& [vid, w] : views_) {
+      if (held.contains(vid) || listed.contains(vid) || !std::ranges::contains(w.depends_on, id)) continue;
+      listed.insert(vid);
+      out.objects.push_back({vid, described(vid), described(id)});
+      readers(vid);
+    }
+  };
+  for (const auto& [id, schema] : held) {
+    listed.insert(id);
+    out.objects.push_back({id, described(id), "schema " + schema_name(schema)});  // bare, as PostgreSQL 17
+    readers(id);
+  }
+  return out;
+}
+
 auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<DdlOp>& ops, bool& backfill,
                            std::size_t backfill_limit) const
     -> std::shared_ptr<const Catalog> {
@@ -2964,6 +3064,50 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
     if (t == nullptr && view(name) != nullptr) throw DdlRefused("\"" + name.name + "\" is not a table", kWrongObjectType);
     if (t == nullptr) throw DdlRefused("relation \"" + name.name + "\" does not exist", kUndefinedTable);
     return *t;
+  };
+  // Each drop's batch and its change to `next`, shared by DROP of one object
+  // and DROP SCHEMA … CASCADE: the records, the name entries, the rows and
+  // index entries, and the ACL record.
+  auto drop_acl = [&](std::uint32_t id) {
+    if (acls_.contains(id)) put_op(ops, DdlOp::Kind::Del, acl_record_key(id));
+    next->acls_.erase(id);
+  };
+  auto drop_table = [&](const Table& t) {
+    put_op(ops, DdlOp::Kind::Del, table_record_key(t.id));
+    put_op(ops, DdlOp::Kind::Del, name_entry_key(QualifiedName{t.schema, t.name}));
+    auto row_keys = row_prefix(t.id);
+    put_op(ops, DdlOp::Kind::DelRange, row_keys, key_successor(row_keys));
+    for (const auto& ix : t.indexes) {
+      put_op(ops, DdlOp::Kind::Del, name_entry_key(QualifiedName{t.schema, ix.name}));
+      auto p = index_prefix(ix.id);
+      put_op(ops, DdlOp::Kind::DelRange, p, key_successor(p));
+    }
+    drop_acl(t.id);
+    next->erase_table(t.id);
+  };
+  auto drop_view = [&](const View& v) {
+    put_op(ops, DdlOp::Kind::Del, view_record_key(v.id));
+    put_op(ops, DdlOp::Kind::Del, name_entry_key(QualifiedName{v.schema, v.name}));
+    drop_acl(v.id);
+    next->views_.erase(v.id);
+  };
+  auto drop_type = [&](const TypeObject& t) {
+    put_op(ops, DdlOp::Kind::Del, type_record_key(t.id));
+    put_op(ops, DdlOp::Kind::Del, type_name_key(QualifiedName{t.schema, t.name}));
+    drop_acl(t.id);
+    next->types_.erase(t.id);
+  };
+  auto drop_sequence = [&](const Sequence& q) {
+    put_op(ops, DdlOp::Kind::Del, sequence_record_key(q.id));
+    put_op(ops, DdlOp::Kind::Del, name_entry_key(QualifiedName{q.schema, q.name}));
+    drop_acl(q.id);
+    next->sequences_.erase(q.id);
+  };
+  auto drop_procedure = [&](const Procedure& p) {
+    put_op(ops, DdlOp::Kind::Del, procedure_record_key(p.id));
+    put_op(ops, DdlOp::Kind::Del, procedure_name_key(QualifiedName{p.schema, p.name}));
+    drop_acl(p.id);
+    next->procedures_.erase(p.id);
   };
   backfill = false;
 
@@ -3179,18 +3323,7 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
                            " depends on table " + t.name,
                        kDependentObjectsStillExist);
     }
-    put_op(ops, DdlOp::Kind::Del, table_record_key(t.id));
-    put_op(ops, DdlOp::Kind::Del, name_entry_key(QualifiedName{t.schema, t.name}));
-    auto rows = row_prefix(t.id);
-    put_op(ops, DdlOp::Kind::DelRange, rows, key_successor(rows));
-    for (const auto& ix : t.indexes) {
-      put_op(ops, DdlOp::Kind::Del, name_entry_key(QualifiedName{t.schema, ix.name}));
-      auto p = index_prefix(ix.id);
-      put_op(ops, DdlOp::Kind::DelRange, p, key_successor(p));
-    }
-    if (acls_.contains(t.id)) put_op(ops, DdlOp::Kind::Del, acl_record_key(t.id));
-    next->acls_.erase(t.id);
-    next->erase_table(t.id);
+    drop_table(t);
     return finish();
   }
 
@@ -3260,11 +3393,7 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
                            dependent->name + " depends on view " + found->name,
                        kDependentObjectsStillExist);
     }
-    put_op(ops, DdlOp::Kind::Del, view_record_key(found->id));
-    put_op(ops, DdlOp::Kind::Del, name_entry_key(QualifiedName{found->schema, found->name}));
-    if (acls_.contains(found->id)) put_op(ops, DdlOp::Kind::Del, acl_record_key(found->id));
-    next->acls_.erase(found->id);
-    next->views_.erase(found->id);
+    drop_view(*found);
     return finish();
   }
 
@@ -3319,9 +3448,7 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
       for (const auto& t : *dp->arg_types) args += (args.empty() ? "" : ", ") + std::string{signature_type(t)};
       throw DdlRefused("procedure " + written(dp->name) + "(" + args + ") does not exist", kUndefinedFunction);
     }
-    put_op(ops, DdlOp::Kind::Del, procedure_record_key(found->id));
-    put_op(ops, DdlOp::Kind::Del, procedure_name_key(QualifiedName{found->schema, found->name}));
-    next->procedures_.erase(found->id);
+    drop_procedure(*found);
     return finish();
   }
 
@@ -3432,11 +3559,7 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
     if (dty->domain && found->kind != TypeObject::Kind::Domain) {
       throw DdlRefused("\"" + dty->name.name + "\" is not a domain", kWrongObjectType);
     }
-    put_op(ops, DdlOp::Kind::Del, type_record_key(found->id));
-    put_op(ops, DdlOp::Kind::Del, type_name_key(QualifiedName{found->schema, found->name}));
-    if (acls_.contains(found->id)) put_op(ops, DdlOp::Kind::Del, acl_record_key(found->id));
-    next->acls_.erase(found->id);
-    next->types_.erase(found->id);
+    drop_type(*found);
     return finish();
   }
 
@@ -3447,11 +3570,7 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
       if (ds->if_exists) return nullptr;
       throw DdlRefused("sequence \"" + ds->name.name + "\" does not exist", kUndefinedTable);
     }
-    put_op(ops, DdlOp::Kind::Del, sequence_record_key(found->id));
-    put_op(ops, DdlOp::Kind::Del, name_entry_key(QualifiedName{found->schema, found->name}));
-    if (acls_.contains(found->id)) put_op(ops, DdlOp::Kind::Del, acl_record_key(found->id));
-    next->acls_.erase(found->id);
-    next->sequences_.erase(found->id);
+    drop_sequence(*found);
     return finish();
   }
 
@@ -3484,83 +3603,33 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
   }
 
   if (const auto* dsc = std::get_if<DropSchemaDdl>(&ddl)) {
-    // Every name first: a missing one drops nothing (3F000), or is skipped.
-    std::vector<std::uint32_t> dropped;
-    for (const auto& name : dsc->names) {
-      if (name == "public" || system_schema(name) != 0) continue;
-      const auto* sc = schema(name);
-      if (sc == nullptr) {
-        if (dsc->if_exists) continue;
-        throw DdlRefused("schema \"" + name + "\" does not exist", kInvalidSchemaName);
-      }
-      if (!std::ranges::contains(dropped, sc->id)) dropped.push_back(sc->id);
-    }
-    for (const auto& name : dsc->names) {
-      if (name == "pg_catalog" || name == "pg_toast") {
-        throw DdlRefused("cannot drop schema " + name + " because it is required by the database system",
-                         kDependentObjectsStillExist);
-      }
-      // public is implicit and information_schema holds nothing here
-      // (docs/catalog_design.md, *Differences from PostgreSQL 17*).
-      if (name == "public" || name == "information_schema") {
-        throw DdlRefused("DROP SCHEMA " + name + " is not supported", kFeatureNotSupported);
-      }
-    }
-    // RESTRICT: each object of a dropped schema, in creation (id) order, and
-    // each view elsewhere that reads one, as PostgreSQL 17 lists them.
-    auto qualified = [&](std::uint32_t schema, const std::string& name) {
-      return (schema == kPublicSchema ? std::string{} : quoted_ident(schema_name(schema)) + ".") + quoted_ident(name);
-    };
-    auto described = [&](std::uint32_t id) -> std::string {
-      if (const auto* t = table(id)) return "table " + qualified(t->schema, t->name);
-      if (const auto* w = view(id)) return "view " + qualified(w->schema, w->name);
-      if (const auto it = sequences_.find(id); it != sequences_.end()) return "sequence " + qualified(it->second.schema, it->second.name);
-      if (const auto it = types_.find(id); it != types_.end()) return "type " + qualified(it->second.schema, it->second.name);
-      const auto& p = procedures_.at(id);
-      std::string args;
-      for (const auto& a : p.args) args += (args.empty() ? "" : ",") + std::string{signature_type(a.type)};
-      return "function " + qualified(p.schema, p.name) + "(" + args + ")";
-    };
-    std::map<std::uint32_t, std::uint32_t> held;  // object id -> its schema, of the dropped schemas
-    auto hold = [&](std::uint32_t id, std::uint32_t schema) {
-      if (std::ranges::contains(dropped, schema)) held.emplace(id, schema);
-    };
-    for (const auto& [id, t] : tables_) hold(id, t.schema);
-    for (const auto& [id, w] : views_) hold(id, w.schema);
-    for (const auto& [id, q] : sequences_) hold(id, q.schema);
-    for (const auto& [id, t] : types_) hold(id, t.schema);
-    for (const auto& [id, p] : procedures_) hold(id, p.schema);
-    std::vector<std::string> lines;
-    std::set<std::uint32_t> listed;
-    std::function<void(std::uint32_t)> readers = [&](std::uint32_t id) {
-      for (const auto& [vid, w] : views_) {
-        if (held.contains(vid) || listed.contains(vid) || !std::ranges::contains(w.depends_on, id)) continue;
-        listed.insert(vid);
-        lines.push_back(described(vid) + " depends on " + described(id));
-        readers(vid);
-      }
-    };
-    for (const auto& [id, schema] : held) {
-      listed.insert(id);
-      lines.push_back(described(id) + " depends on schema " + schema_name(schema));  // bare, as PostgreSQL 17
-      readers(id);
-    }
-    if (!lines.empty()) {
-      constexpr std::size_t kMaxReported = 100;  // PostgreSQL's MAX_REPORTED_DEPS
-      std::string detail;
-      for (std::size_t i = 0; i < lines.size() && i < kMaxReported; ++i) detail += (i == 0 ? "" : "\n") + lines[i];
-      if (lines.size() > kMaxReported) {
-        auto more = lines.size() - kMaxReported;  // PostgreSQL's ngettext: "object" for one
-        detail += "\nand " + std::to_string(more) + (more == 1 ? " other object" : " other objects") + " (see server log for list)";
-      }
+    const auto drop = schema_drop(*dsc);
+    if (!dsc->cascade && !drop.objects.empty()) {
       auto message = dsc->names.size() == 1
                          ? "cannot drop schema " + dsc->names.front() + " because other objects depend on it"
                          : std::string{"cannot drop desired object(s) because other objects depend on them"};
       throw DdlRefused(message, kDependentObjectsStillExist)
-          .with_notes(std::move(detail), "Use DROP ... CASCADE to drop the dependent objects too.");
+          .with_notes(drop.detail([](const SchemaDrop::Object& o) { return o.described + " depends on " + o.depends_on; }),
+                      "Use DROP ... CASCADE to drop the dependent objects too.");
     }
-    if (dropped.empty()) return nullptr;
-    for (auto id : dropped) {
+    if (drop.schemas.empty()) return nullptr;
+    // CASCADE: each object as its own DROP writes it, in one batch with the
+    // schemas. A table takes its indexes; the closure holds every view that
+    // reads a dropped relation, so no view is left reading one.
+    for (const auto& o : drop.objects) {
+      if (const auto* t = table(o.id)) {
+        drop_table(*t);
+      } else if (const auto* w = view(o.id)) {
+        drop_view(*w);
+      } else if (const auto q = sequences_.find(o.id); q != sequences_.end()) {
+        drop_sequence(q->second);
+      } else if (const auto ty = types_.find(o.id); ty != types_.end()) {
+        drop_type(ty->second);
+      } else {
+        drop_procedure(procedures_.at(o.id));
+      }
+    }
+    for (auto id : drop.schemas) {
       put_op(ops, DdlOp::Kind::Del, schema_record_key(id));
       put_op(ops, DdlOp::Kind::Del, schema_name_key(schemas_.at(id).name));
       put_op(ops, DdlOp::Kind::Del, acl_record_key(id));
@@ -3944,9 +4013,10 @@ auto LiveCatalog::run(const Ddl& ddl) -> Applied {
   if (!lock.owns_lock()) throw DdlInProgress();
   for (int attempt = 0; attempt < kDdlAttempts; ++attempt) {
     auto p = prepare(ddl);
-    if (!p.next) return {p.base, false};
+    if (!p.next) return {p.base, false, p.base};
     auto next = p.next;  // what this DDL publishes; current() may be a later DDL's once the lock is released
-    if (commit_locked(std::move(p))) return {next, true};
+    auto base = p.base;
+    if (commit_locked(std::move(p))) return {std::move(next), true, std::move(base)};
   }
   throw std::runtime_error("DDL conflicted with concurrent writes on every attempt");
 }
