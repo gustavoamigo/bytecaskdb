@@ -46,6 +46,18 @@ def suite_table(results: list[dict]) -> list[str]:
     return lines
 
 
+def ceiling(results: list[dict]) -> list[str]:
+    """The coverage of sqltest's tests PostgreSQL 17 accepts: the layer speaks its dialect."""
+    rs = [r for r in results if r["suite"] == "sqltest"]
+    accepted = [r for r in rs if not r.get("postgresql_refuses")]
+    if not rs or len(accepted) == len(rs):
+        return []
+    passed = sum(r["outcome"] == "pass" for r in accepted)
+    return ["", f"PostgreSQL 17 refuses {len(rs) - len(accepted)} of sqltest's {len(rs)} tests "
+            f"(`not PostgreSQL:` in `not_implemented/sqltest.txt`). Of the {len(accepted)} it accepts, "
+            f"the layer passes {passed} ({percent(passed, len(accepted))})."]
+
+
 def layer_state(cases: list[dict]) -> str:
     if not cases:
         return "no case"
@@ -86,7 +98,7 @@ def render(data: dict, manifest: dict[str, Feature]) -> str:
     if not data["conformance"]:
         out += ["> These results are from a gate run, which skips what is marked not implemented: "
                 "a skipped case counts as not passing. Run with `--conformance`.", ""]
-    out += suite_table(results)
+    out += suite_table(results) + ceiling(results)
     marked = [r for r in results if r["marked"] and r["outcome"] == "pass"]
     if marked:
         out += ["", "## Marked not implemented, and passing", "",

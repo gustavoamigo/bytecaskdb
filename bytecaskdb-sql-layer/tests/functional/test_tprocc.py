@@ -21,6 +21,7 @@ class TproccCase:
     id: str = "tprocc/five transactions, then the consistency conditions"
     features: tuple[str, ...] = ("layer:tprocc",)
     unimplemented: bool = False
+    postgresql_refuses: bool = False
 
 
 def pytest_generate_tests(metafunc):

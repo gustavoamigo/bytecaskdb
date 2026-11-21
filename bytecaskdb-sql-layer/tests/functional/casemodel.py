@@ -38,6 +38,8 @@ class Case:
     teardown: tuple[str, ...] = ()
     server_flags: tuple[str, ...] = ()
     unimplemented: bool = False
+    # PostgreSQL 17 refuses the case too: sqltest's tests that aren't PostgreSQL.
+    postgresql_refuses: bool = False
     # Cases of one group share a server: a file's cases.
     group: str = ""
 
