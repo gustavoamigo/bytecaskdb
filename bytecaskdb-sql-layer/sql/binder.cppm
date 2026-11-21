@@ -2109,8 +2109,7 @@ public:
     if (depth_ > 0) not_yet("a subquery inside a subquery", pos);
     if (q.for_update) not_yet("FOR UPDATE in a subquery", pos);
     if (correlated(q)) correlation(q, kind, pos);
-    auto using_columns = std::move(using_);
-    auto using_alias = std::move(using_alias_);
+    auto joins = std::move(joins_);
     auto scope = std::move(scope_);
     ++depth_;
     auto root = select(q);
@@ -2118,8 +2117,7 @@ public:
     std::vector<logical::Subquery::Arg> args;
     if (correlating_) args = std::move(correlating_->args);
     correlating_.reset();
-    using_ = std::move(using_columns);
-    using_alias_ = std::move(using_alias);
+    joins_ = std::move(joins);
     scope_ = std::move(scope);
     using K = logical::Subquery::Kind;
     SqlType type{SqlKind::Boolean};
@@ -3110,27 +3108,33 @@ public:
     return column(t, e.column, e.pos);
   }
 
-  // A column reference of a join: the relation whose name it carries, or the
-  // one that has the column; one more than one have is ambiguous (42702), but
-  // for a column of the first join's USING, which is one column: the left
-  // relation's, equal to the right's in every pair, unless a third relation
-  // has a column of the name too. The USING's alias names those columns
-  // alone.
+  // A column reference of a join: the relation whose name it carries, or,
+  // unqualified, the column of that name among the join's columns
+  // (JoinScope) of the relations in scope, a USING or NATURAL column one
+  // column; a name more than one has is ambiguous (42702). A USING's alias
+  // names that join's USING columns alone.
   auto column(std::span<const Table* const> rels, const ast::Expr& e) const -> std::pair<std::uint32_t, const Column*> {
-    auto in_using = std::ranges::contains(using_, e.column);
-    auto merged = [&]() -> std::pair<std::uint32_t, const Column*> {
-      for (std::size_t i = 2; i < rels.size(); ++i) {
-        if (rels[i]->column(e.column) != nullptr) {
-          throw SqlError{"column reference \"" + e.column + "\" is ambiguous", e.pos, kAmbiguousColumn};
+    if (const auto* level = joins_.level(rels.size())) {
+      auto at = [&](const JoinColumn& j) -> std::pair<std::uint32_t, const Column*> {
+        auto side = std::ranges::find(rels, j.table);
+        if (side == rels.end()) throw std::logic_error{"a join column of a relation out of scope"};
+        return {static_cast<std::uint32_t>(side - rels.begin()), j.col};
+      };
+      for (const auto& alias : joins_.aliases) {
+        if (alias.join >= rels.size() || e.table != alias.name) continue;
+        auto it = std::ranges::find(alias.columns, e.column, &JoinColumn::name);
+        if (it == alias.columns.end()) {
+          throw SqlError{"column " + e.table + "." + e.column + " does not exist", e.pos, kUndefinedColumn};
         }
+        return at(*it);
       }
-      return {0, rels[0]->column(e.column)};
-    };
-    if (!using_alias_.empty() && e.table == using_alias_) {
-      if (!in_using) throw SqlError{"column " + e.table + "." + e.column + " does not exist", e.pos, kUndefinedColumn};
-      return {0, rels[0]->column(e.column)};
+      if (e.table.empty()) {
+        auto named = [&](const JoinColumn& j) { return j.name == e.column; };
+        auto n = std::ranges::count_if(*level, named);
+        if (n > 1) throw SqlError{"column reference \"" + e.column + "\" is ambiguous", e.pos, kAmbiguousColumn};
+        if (n == 1) return at(*std::ranges::find_if(*level, named));
+      }
     }
-    if (e.table.empty() && in_using) return merged();
     std::optional<std::pair<std::uint32_t, const Column*>> found;
     for (std::uint32_t side = 0; side < rels.size(); ++side) {
       if (!e.table.empty() && e.table != rels[side]->name) continue;
@@ -3869,38 +3873,92 @@ public:
     return logical::compare(op, logical::column_of(l, lc), logical::column_of(r, rc));
   }
 
-  // The columns the second FROM item's USING or NATURAL joins on, in order
-  // (NATURAL: every column name both tables share, in the left table's order).
-  static auto shared_columns(const Table& left, const Table& right, const ast::FromItem& item) -> std::vector<std::string> {
-    auto names = item.using_columns;
-    if (item.natural) {
-      for (const auto& c : left.columns) {
-        if (!c.hidden && right.column(c.name) != nullptr) names.push_back(c.name);
-      }
-    }
-    return names;
-  }
+  // The join of a query's FROM items, left-deep: the columns of each
+  // prefix of two or more of them, in PostgreSQL's order. A join's USING or
+  // NATURAL columns come first, each once and named alone, then its left
+  // side's other columns, then its right table's. A USING column is its
+  // left side's, equal to the right's in every pair or the right's NULL
+  // where a LEFT JOIN extends; the right's for the first join's RIGHT JOIN,
+  // whose right table is the one it keeps. Each USING ... AS alias, with the
+  // FROM item it is on, names that join's USING columns.
+  struct JoinColumn {
+    std::string name;
+    const Table* table;
+    const Column* col;
+  };
+  struct JoinScope {
+    std::vector<std::vector<JoinColumn>> levels;  // [k]: the join of the first k + 2 relations
+    struct Alias {
+      std::string name;
+      std::size_t join;
+      std::vector<JoinColumn> columns;
+    };
+    std::vector<Alias> aliases;
 
-  // The equality of each of the USING columns or NATURAL's, in order, each
-  // column of both tables and named once.
-  auto using_conjuncts(const Table& left, const Table& right, const ast::FromItem& item) -> std::vector<logical::Expr> {
-    using_ = shared_columns(left, right, item);
-    using_alias_ = item.using_alias;
-    std::vector<logical::Expr> out;
-    for (const auto& name : using_) {
-      if (std::ranges::count(using_, name) > 1) {
-        throw SqlError{"column name \"" + name + "\" appears more than once in USING clause", item.pos, kDuplicateColumn};
+    // The columns of the join of the first `n` relations, or null for one relation.
+    [[nodiscard]] auto level(std::size_t n) const -> const std::vector<JoinColumn>* {
+      return n >= 2 && n - 2 < levels.size() ? &levels[n - 2] : nullptr;
+    }
+  };
+
+  // Binds the join of `rels`, the FROM items of `s` in their order, into
+  // joins_, and returns, for each join k, the equality of each of its USING
+  // or NATURAL columns, in order: the left side's column = the right
+  // table's. NATURAL's are every name of the left side's columns the right
+  // table has, in the left side's order. A USING name must be named once
+  // (42701) and be one column of the left side (42702, 42703) and one of
+  // the right table (42703), as in PostgreSQL.
+  auto join_scope(std::span<const Table* const> rels, const ast::Select& s) -> std::vector<std::vector<logical::Expr>> {
+    joins_ = {};
+    std::vector<std::vector<logical::Expr>> equal(rels.size());
+    std::vector<JoinColumn> left;
+    auto columns_of = [](const Table& t, std::vector<JoinColumn>& into, const std::vector<std::string>& except) {
+      for (const auto& c : t.columns) {
+        if (!c.hidden && !std::ranges::contains(except, c.name)) into.push_back({c.name, &t, &c});
       }
-      for (const auto* side : {&left, &right}) {
-        if (side->column(name) == nullptr) {
-          throw SqlError{"column \"" + name + "\" specified in USING clause does not exist in " +
-                             (side == &left ? "left" : "right") + " table",
-                         item.pos, kUndefinedColumn};
+    };
+    columns_of(*rels[0], left, {});
+    for (std::size_t k = 1; k < rels.size(); ++k) {
+      const auto& item = s.from[k];
+      const auto& right = *rels[k];
+      auto names = item.using_columns;
+      if (item.natural) {
+        for (const auto& c : left) {
+          if (right.column(c.name) != nullptr) names.push_back(c.name);
         }
       }
-      out.push_back(joined_compare(ast::Compare::Op::Eq, "=", left.id, *left.column(name), right.id, *right.column(name), item.pos));
+      std::vector<JoinColumn> next;
+      for (auto i = names.begin(); i != names.end(); ++i) {
+        const auto& name = *i;
+        if (std::find(names.begin(), i, name) != i) {
+          throw SqlError{"column name \"" + name + "\" appears more than once in USING clause", item.pos, kDuplicateColumn};
+        }
+        auto n = std::ranges::count(left, name, &JoinColumn::name);
+        if (n > 1) {
+          throw SqlError{"common column name \"" + name + "\" appears more than once in left table", item.pos, kAmbiguousColumn};
+        }
+        if (n == 0) {
+          throw SqlError{"column \"" + name + "\" specified in USING clause does not exist in left table", item.pos,
+                         kUndefinedColumn};
+        }
+        const auto* rc = right.column(name);
+        if (rc == nullptr) {
+          throw SqlError{"column \"" + name + "\" specified in USING clause does not exist in right table", item.pos,
+                         kUndefinedColumn};
+        }
+        const auto& lc = *std::ranges::find(left, name, &JoinColumn::name);
+        equal[k].push_back(joined_compare(ast::Compare::Op::Eq, "=", lc.table->id, *lc.col, right.id, *rc, item.pos));
+        next.push_back(k == 1 && item.kind == ast::JoinKind::Right ? JoinColumn{name, &right, rc} : lc);
+      }
+      if (!item.using_alias.empty()) joins_.aliases.push_back({item.using_alias, k, next});
+      for (const auto& c : left) {
+        if (!std::ranges::contains(names, c.name)) next.push_back(c);
+      }
+      columns_of(right, next, names);
+      joins_.levels.push_back(next);
+      left = std::move(next);
     }
-    return out;
+    return equal;
   }
 
   // The tables the FROM items name, each read by an instance of its own
@@ -3944,12 +4002,10 @@ public:
   // a GROUP BY. An AVG of an integer or DECIMAL, PostgreSQL's numeric, is
   // two plan columns and none a relation's: refused.
   auto derived_relation(const ast::FromItem& item, std::int32_t pos) -> const Table* {
-    auto using_columns = std::move(using_);
-    auto using_alias = std::move(using_alias_);
+    auto joins = std::move(joins_);
     auto scope = std::move(scope_);
     auto root = select(*item.derived);
-    using_ = std::move(using_columns);
-    using_alias_ = std::move(using_alias);
+    joins_ = std::move(joins);
     scope_ = std::move(scope);
     const auto& outs = outputs_of(*root);
     if (outs.size() != item.column_aliases.size()) throw std::logic_error{"a derived relation's columns are not its query's"};
@@ -4046,6 +4102,10 @@ public:
     }
     if (s.from.empty()) return select_without_from(s, assign);
     auto rels = relations(s);
+    joins_ = {};
+    // Join k's USING or NATURAL equalities.
+    std::vector<std::vector<logical::Expr>> using_equal;
+    if (rels.size() > 1) using_equal = join_scope(rels, s);
     auto starred = std::ranges::any_of(s.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Star; });
     std::vector<ast::Expr> expanded;
     if (starred) expanded = expand_stars(s, rels);
@@ -4065,13 +4125,6 @@ public:
         // prefix it would put the next table's rows outside the rows before it.
         if (s.from[k].kind == ast::JoinKind::Right && k > 1) not_yet("a RIGHT JOIN after the first join", s.from[k].pos);
       }
-      // USING and NATURAL join the first two tables.
-      auto first = using_conjuncts(*rels[0], *rels[1], s.from[1]);
-      for (std::size_t k = 2; k < n; ++k) {
-        if (s.from[k].natural || !s.from[k].using_columns.empty()) {
-          not_yet("USING or NATURAL after the first join", s.from[k].pos);
-        }
-      }
       // An outer join's ON decides its pairs and its WHERE filters them, so
       // the two stay apart; the table every row of which it keeps comes
       // first: RIGHT is LEFT of the tables swapped, and a USING column named
@@ -4089,7 +4142,7 @@ public:
       }
       for (std::size_t k = 1; k < n; ++k) {
         auto here = conjuncts(rels, s.where, static_cast<std::uint32_t>(k));
-        if (k == 1) here.insert(here.begin(), std::make_move_iterator(first.begin()), std::make_move_iterator(first.end()));
+        here.insert(here.begin(), std::make_move_iterator(using_equal[k].begin()), std::make_move_iterator(using_equal[k].end()));
         // A column of a NULL-extended relation is NULL-able in the ON of every later join.
         for (auto& e : here) {
           for (std::size_t r = 1; r < k; ++r) {
@@ -4553,8 +4606,8 @@ public:
   }
 
   // The select list with each * and `table`.* replaced by the columns it
-  // stands for, in table order, hidden ones left out. A * over a USING or
-  // NATURAL join gives the USING columns first, each once, named alone.
+  // stands for, in table order, hidden ones left out; a * over a join, the
+  // join's columns (JoinScope), each USING or NATURAL column once.
   auto expand_stars(const ast::Select& s, const std::vector<const Table*>& from) -> std::vector<ast::Expr> {
     std::vector<ast::Expr> out;
     auto column_expr = [](const Table& t, const Column& c, std::int32_t pos) {
@@ -4569,29 +4622,17 @@ public:
         continue;
       }
       if (!e.alias.empty()) throw SqlError{"syntax error at or near \"AS\"", e.pos};
-      std::vector<std::string> merged;
-      if (e.table.empty() && from.size() > 1) {
-        merged = shared_columns(*from[0], *from[1], s.from[1]);
-        // Each is the preserved table's, named by it: a third table may
-        // have a column of the name too.
-        const auto& kept = s.from[1].kind == ast::JoinKind::Right ? *from[1] : *from[0];
-        for (const auto& name : merged) {
-          ast::Expr c{ast::Expr::Kind::Column, name, 0, nullptr, nullptr, e.pos};
-          if (from.size() > 2) c.table = kept.name;
-          out.push_back(std::move(c));
-        }
+      // Each column named by its relation: another may have a column of the name too.
+      if (const auto* joined = joins_.level(from.size()); e.table.empty() && joined != nullptr) {
+        for (const auto& c : *joined) out.push_back(column_expr(*c.table, *c.col, e.pos));
+        continue;
       }
       auto any = false;
-      for (std::size_t i = 0; i < from.size(); ++i) {
-        const auto* t = from[i];
+      for (const auto* t : from) {
         if (!e.table.empty() && e.table != t->name) continue;
         any = true;
-        // The USING columns are the first two tables' alone.
-        auto joined_on = i < 2 ? &merged : nullptr;
         for (const auto& c : t->columns) {
-          if (!c.hidden && (joined_on == nullptr || std::ranges::find(*joined_on, c.name) == joined_on->end())) {
-            out.push_back(column_expr(*t, c, e.pos));
-          }
+          if (!c.hidden) out.push_back(column_expr(*t, c, e.pos));
         }
       }
       if (!any) throw SqlError{"missing FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable};
@@ -4811,8 +4852,7 @@ private:
   bool row_key_allowed_{true};
   std::uint32_t key_columns_{0};
   std::uint32_t key_table_{0};
-  std::vector<std::string> using_;  // a join's USING or NATURAL columns: one column each
-  std::string using_alias_;         // USING (…) AS alias
+  JoinScope joins_;  // the join being bound: its columns, as unqualified names see them (join_scope)
   std::vector<std::unique_ptr<Table>> instances_;  // see instance()
   // The derived relations bound (derived_relation): each table, the plan
   // of its query until select() takes it, and the table its first FROM item

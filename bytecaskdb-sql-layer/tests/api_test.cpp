@@ -1603,7 +1603,14 @@ TEST_CASE("embedded API: joins of three or more tables, a table with itself, and
   CHECK(state("SELECT 1 FROM h1 JOIN h2 ON h1.a = h3.a JOIN h3 ON h2.a = h3.a") == "42P01");
   // What the layer does not take yet is refused, never answered wrongly.
   CHECK(state("SELECT 1 FROM h1 x JOIN h2 y ON x.a = y.a RIGHT JOIN h3 z ON y.a = z.a") == "42601");
-  CHECK(state("SELECT 1 FROM h1 NATURAL JOIN h2 NATURAL JOIN h3") == "42601");
+  // USING and NATURAL after the first join read the columns of the join before them, as PostgreSQL 17's.
+  CHECK(rows("SELECT * FROM h1 NATURAL JOIN h2 NATURAL JOIN h3 ORDER BY a, id") ==
+        Grid{{i(1), i(1), i(10), i(100), i(1)}, {i(2), i(2), i(20), i(200), i(2)}, {i(2), i(3), n, n, i(2)}});
+  CHECK(rows("SELECT * FROM h1 LEFT JOIN h3 USING (a) LEFT JOIN h2 USING (id) ORDER BY id") ==
+        Grid{{i(0), i(3), i(5), n, i(4), i(50)}, {i(1), i(1), i(10), i(1), i(1), i(100)}, {i(2), i(2), i(20), i(2), i(2), i(200)},
+             {i(3), i(2), n, i(2), i(2), n}, {i(4), n, i(40), n, n, i(400)}, {i(5), i(5), i(50), n, n, n}});
+  CHECK(state("SELECT 1 FROM h1 JOIN h2 USING (id) JOIN h3 USING (a)") == "42702");  // h1.a and h2.a
+  CHECK(state("SELECT 1 FROM h1 JOIN h2 USING (id) JOIN h3 USING (k)") == "42703");
   CHECK(state("SELECT 1 FROM h1 x, h1 y, h1 z, h1 w, h1 v, h1 u, h1 t, h1 s, h1 r") == "42601");  // nine tables
   CHECK(state("SELECT 1 FROM h1 x JOIN h1 y ON x.id = y.id FOR UPDATE") == "42601");
 }

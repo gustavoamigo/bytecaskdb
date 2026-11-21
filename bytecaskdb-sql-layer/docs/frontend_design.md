@@ -101,9 +101,11 @@ kind the transformer doesn't take is refused with its position.
 - `SELECT *` and `table.*` are expanded by the binder, before it binds
   anything else, into the columns they stand for: each FROM table's in
   table order, hidden row ids left out, each named by its column's name.
-  Over a `USING` or `NATURAL` join `*` gives the `USING` columns first,
-  each once and named alone (so the preserved side's, as a column named
-  alone is), then the left table's other columns, then the right's; a
+  Over a join `*` gives the join's columns as PostgreSQL orders them: each
+  join's `USING` or `NATURAL` columns first, each once and named alone (so
+  the preserved side's, as a column named alone is), then its left side's
+  other columns, then its right table's; so over `a JOIN b USING (k) JOIN
+  c USING (j)`, `j`, then `k`, `a`'s and `b`'s others, then `c`'s. A
   `table.*` is that table's columns, `USING` ones included. The
   expansion is a select list of ordinary columns, so everything after it
   (aggregation, `DISTINCT`, `ORDER BY`) treats it as the columns written
@@ -116,18 +118,32 @@ kind the transformer doesn't take is refused with its position.
 - `FROM`: one table, or up to eight joined by a comma list, `[INNER] JOIN …
   ON`, `CROSS JOIN` or `LEFT [OUTER] JOIN … ON`, one after the other
   (`a JOIN b ON … LEFT JOIN c ON …`, each join's right side a table and its
-  left side the tables before it), and for the first join `JOIN … USING
-  (cols) [AS alias]`, `NATURAL JOIN` and `RIGHT [OUTER] JOIN`. Columns may be
+  left side the tables before it), `JOIN … USING (cols) [AS alias]` and
+  `NATURAL JOIN` at any place in the chain, and for the first join `RIGHT
+  [OUTER] JOIN`. Columns may be
   qualified by the table's name. Each `ON` sees the tables up to its own
   (a later one is 42P01). It compares columns of two tables by any of `=`,
   `<`, `<=`, `>`, `>=` and `<>`, or is a predicate (`AND`, `OR`, `NOT`, `IS
   NULL`) over columns of both, or a boolean constant (`ON TRUE` pairs every
   row; `ON FALSE` none); NULL is true of none. `USING` and `NATURAL`
-  (every column name both tables share) compare their columns by `=`, as
-  `ON` would, and name each alone as one column, the left table's, equal to
-  the right's in every pair, unless a third table has the name too (42702);
-  the `USING` alias qualifies those columns only. A name missing from a side
-  is 42703, one named twice 42701, as in PostgreSQL. `LEFT` and `RIGHT` give
+  compare their columns by `=`, as `ON` would, and name each alone as one
+  column. Their left side is the join before them, as in PostgreSQL: its
+  columns are each earlier join's `USING` columns once, then the other
+  columns of its tables (the binder's `JoinScope`, one list per prefix of
+  the chain). `NATURAL` takes every name of those columns the right table
+  has, in their order. A `USING` name must be one column of the left side:
+  one two of its tables have, not merged by an earlier `USING`, is 42702
+  (`common column name "k" appears more than once in left table`), one it
+  lacks 42703 (`… does not exist in left table`); one the right table lacks
+  is 42703, one named twice 42701, each checked name by name in
+  PostgreSQL's order. A merged column is its left side's column, equal to
+  the right's in every pair (the preserved table's for the first join's
+  `RIGHT JOIN`); a later join's `USING` compares that column with its
+  right table's. A name alone resolves against the columns of the join up
+  to where it is read (an `ON` sees its own prefix, the rest the whole
+  join): two of them with the name are 42702, so a merged name is
+  ambiguous once a later table without `USING` on it has the name too.
+  Each `USING` alias qualifies its own join's columns only. `LEFT` and `RIGHT` give
   every row of the preserved table, joined to each row of the other that
   `ON` matches, or to a row of NULLs where it matches none. `ON` decides the
   pairs and `WHERE` filters the joined rows, so `WHERE r.k IS NULL` keeps
@@ -136,8 +152,7 @@ kind the transformer doesn't take is refused with its position.
   before it: a later `ON` reading that table sees NULLs, so an inner join
   after it drops those rows where it reads them, and a left join keeps
   them. `RIGHT JOIN` is taken as the first join only (its two tables
-  swapped, so the chain stays left-deep), `USING` and `NATURAL` of the
-  first join only, and `FULL JOIN` not. A table takes an alias, `t [AS]
+  swapped, so the chain stays left-deep), and `FULL JOIN` not. A table takes an alias, `t [AS]
   x`. A table named twice, `t JOIN t AS x`, is read twice, once under each
   name; the planner reads it as two tables (`planner_design.md`, *Joins of
   several tables*). The front end rewrites the qualifier `x` to the table
@@ -145,7 +160,12 @@ kind the transformer doesn't take is refused with its position.
   binder never sees an alias, and keeps the aliases where one is, which are
   then what tell the two apart. The table's own name qualifies nothing while
   it is aliased (42P01, as PostgreSQL), nor may two `FROM` items share a name
-  (42712, `FROM t, t` among them). A select-list item takes `[AS] name`,
+  (42712, `FROM t, t` among them). A `USING (…) AS alias` is a `FROM` name
+  too: one that matches another `USING` alias, a table's alias or the name of
+  a table not aliased, earlier or later in the `FROM`, is 42712, as in
+  PostgreSQL (`resolve_aliases`). A table's name that only its alias hides is
+  free for one, and the aliases are then kept for the binder, so that the
+  qualifier names the join, not the table. A select-list item takes `[AS] name`,
   which names its output column, as an unaliased column item's name names
   its own; an unqualified `ORDER BY name` that is such a name orders by that
   item (PostgreSQL looks at output names first there, at input columns first
@@ -890,8 +910,8 @@ That includes:
   `GROUP BY` of an expression, and `HAVING` of anything but the
   comparisons above;
 - `FULL JOIN`, an outer join's `ON` comparing an expression of columns,
-  more than eight tables, a `RIGHT JOIN` after the first join, `USING` or
-  `NATURAL` after the first join, a join in parentheses or among commas,
+  more than eight tables, a `RIGHT JOIN` after the first join, a join in
+  parentheses or among commas,
   `FOR UPDATE` of a join (#697), an alias of a join, an output name in `GROUP BY`;
 - `RETURNING` in a procedure; `VALUES` outside `INSERT`; `OFFSET` on a set operation, in one of
   its arms or in a view;
