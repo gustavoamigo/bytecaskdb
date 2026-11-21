@@ -518,13 +518,66 @@ TEST_CASE("parser: a chain of joins, each with its own ON, kind and USING", "[sq
   CHECK(list.where.empty());
   // CROSS JOIN is an inner join with no condition.
   CHECK(std::get<Select>(parse("SELECT 1 FROM a CROSS JOIN b")).from.size() == 2);
-  // At most 8 tables; a join on the right of a join, a join among commas, FULL and an alias of a join are refused.
+  // At most 8 tables; FULL and an alias of a join are refused.
   CHECK(std::get<Select>(parse("SELECT 1 FROM a, b, c, d, e, f, g, h")).from.size() == 8);
   CHECK_THROWS_AS(parse("SELECT 1 FROM a, b, c, d, e, f, g, h, i"), SqlError);
-  CHECK_THROWS_AS(parse("SELECT 1 FROM a JOIN (b JOIN c ON b.k = c.k) ON a.k = b.k"), SqlError);
-  CHECK_THROWS_AS(parse("SELECT 1 FROM a, b JOIN c ON b.k = c.k"), SqlError);
   CHECK_THROWS_AS(parse("SELECT 1 FROM a FULL JOIN b ON a.k = b.k"), SqlError);
   CHECK_THROWS_AS(parse("SELECT 1 FROM (a JOIN b ON a.k = b.k) AS j"), SqlError);
+}
+
+TEST_CASE("parser: an inner join in parentheses or after a comma is flattened, each ON seeing its own join",
+          "[sql][parser][join]") {
+  // a JOIN (b JOIN c ON …) ON …: three items; the inner ON sees b and c, the outer one all three.
+  auto nested = std::get<Select>(parse("SELECT 1 FROM a JOIN (b JOIN c ON b.k = c.k) ON a.k = b.k"));
+  REQUIRE(nested.from.size() == 3);
+  CHECK(nested.from[2].table == "c");
+  REQUIRE(nested.where.size() == 2);
+  CHECK(nested.where[0].on == 2);
+  CHECK(nested.where[0].on_from == 1);
+  CHECK(nested.where[1].on == 2);
+  CHECK(nested.where[1].on_from == 0);
+  // A join after a comma sees the items from its own first one; a comma item has no ON.
+  auto list = std::get<Select>(parse("SELECT 1 FROM a, b JOIN c ON b.k = c.k AND c.id BETWEEN 1 AND 2, d"));
+  REQUIRE(list.from.size() == 4);
+  REQUIRE(list.where.size() == 2);
+  for (const auto& c : list.where) {
+    CHECK(c.on == 2);
+    CHECK(c.on_from == 1);
+  }
+  CHECK(list.where[1].args[0].on_from == 1);  // BETWEEN's own conjuncts too
+  // A LEFT JOIN before a comma keeps its kind; one after it too, its ON its own join's.
+  auto outer = std::get<Select>(parse("SELECT 1 FROM a LEFT JOIN b ON a.k = b.k, c LEFT JOIN d ON c.k = d.k"));
+  CHECK(outer.from[1].kind == JoinKind::Left);
+  CHECK(outer.from[3].kind == JoinKind::Left);
+  CHECK(outer.where[1].on_from == 2);
+  // A qualifier naming an item before the ON's own join is 42P01, with PostgreSQL's DETAIL; an alias is named.
+  for (auto [sql, entry] : std::vector<std::pair<std::string_view, std::string>>{
+           {"SELECT 1 FROM a JOIN (b JOIN c ON a.k = c.k) ON a.k = b.k", "a"},
+           {"SELECT 1 FROM a, b JOIN c ON a.k = c.k", "a"},
+           {"SELECT 1 FROM a x, b JOIN c ON x.k = c.k", "x"},
+           {"SELECT 1 FROM a x, b JOIN c ON b.k = c.k OR a.k = 1", "x"},
+           // An alias in the ON's own join hides its table's name, so the earlier item is still named.
+           {"SELECT 1 FROM a, a z JOIN c ON a.k = c.k", "a"},
+           {"SELECT 1 FROM a, b x JOIN c ON x.k = c.k JOIN a y ON y.k = a.k", "a"}}) {
+    CAPTURE(sql);
+    try {
+      (void)parse(sql);
+      FAIL("accepted");
+    } catch (const SqlError& e) {
+      CHECK(e.sqlstate() == "42P01");
+      CHECK(std::string{e.what()}.starts_with("invalid reference to FROM-clause entry for table"));
+      CHECK(e.detail() == "There is an entry for table \"" + entry + "\", but it cannot be referenced from this part of the query.");
+    }
+  }
+  // Outer joins in parentheses or of a join in parentheses, and USING or NATURAL whose left side is not every
+  // item before it, are refused.
+  for (auto sql : {"SELECT 1 FROM a JOIN (b LEFT JOIN c ON b.k = c.k) ON true",
+                   "SELECT 1 FROM a LEFT JOIN (b JOIN c ON b.k = c.k) ON true",
+                   "SELECT 1 FROM a, b JOIN c USING (k)", "SELECT 1 FROM a JOIN (b JOIN c ON b.k = c.k) USING (k)",
+                   "SELECT 1 FROM a JOIN (b NATURAL JOIN c) ON true"}) {
+    CAPTURE(sql);
+    CHECK_THROWS_AS(parse(sql), SqlError);
+  }
 }
 
 TEST_CASE("parser: a column list on a table alias is kept with the alias", "[sql][parser][join]") {

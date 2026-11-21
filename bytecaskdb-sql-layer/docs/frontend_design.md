@@ -120,9 +120,32 @@ kind the transformer doesn't take is refused with its position.
   (`a JOIN b ON … LEFT JOIN c ON …`, each join's right side a table and its
   left side the tables before it), `JOIN … USING (cols) [AS alias]` and
   `NATURAL JOIN` at any place in the chain, and for the first join `RIGHT
-  [OUTER] JOIN`. Columns may be
-  qualified by the table's name. Each `ON` sees the tables up to its own
-  (a later one is 42P01). It compares columns of two tables by any of `=`,
+  [OUTER] JOIN`. An inner join's right side may be an inner join in
+  parentheses (`a JOIN (b JOIN c ON …) ON …`), and a comma list's items
+  joins (`a LEFT JOIN b ON …, c`, `a, b JOIN c ON …`). The parser flattens
+  both into one list of FROM items (`join_items`): an inner join's rows are
+  the same whatever order its tables are joined in, and a later item's
+  join whose `ON` cannot read the items before it pairs their rows with
+  its own whatever they are, so the left-deep chain returns PostgreSQL's
+  rows. Each `ON` records the first item of its own join
+  (`Compare::on_from`: the chain's first, else the first of the
+  parenthesised join or of the comma item). Columns may be
+  qualified by the table's name. Each `ON` sees the tables of its own join,
+  up to its own: a later one is 42P01 (`missing FROM-clause entry`), one
+  before its join too (`invalid reference to FROM-clause entry for table
+  "a"`, with PostgreSQL's DETAIL `There is an entry for table "a", but it
+  cannot be referenced from this part of the query.`, naming the item's
+  alias where it has one, even when an item of the `ON`'s own join is the
+  same table under an alias, which hides its name; the parser's
+  `check_on_scope`), and a name alone
+  only such a table has 42703 with PostgreSQL's DETAIL naming it, or, for
+  several, saying so with the HINT `Try using a table-qualified name.`
+  (the binder's `column`). A `LEFT` or `RIGHT` join in parentheses or of a
+  join in parentheses would NULL-extend other rows than the chain's and is
+  refused (42601), and so is `USING` or `NATURAL` in parentheses, of a
+  join in parentheses or after a comma, whose left side is not every item
+  before it. A `RIGHT JOIN` as the first join of a comma item is a `RIGHT
+  JOIN` after the first join, refused. It compares columns of two tables by any of `=`,
   `<`, `<=`, `>`, `>=` and `<>`, or is a predicate (`AND`, `OR`, `NOT`, `IS
   NULL`) over columns of both, or a boolean constant (`ON TRUE` pairs every
   row; `ON FALSE` none); NULL is true of none. `USING` and `NATURAL`
@@ -195,8 +218,7 @@ kind the transformer doesn't take is refused with its position.
   there). The old names are gone (42703), the unnamed columns keep theirs,
   more names than columns is 42P10, a repeated name 42701. `SELECT * AS (c,
   d)` is SQL standard only, not PostgreSQL, and is a syntax error (42601).
-  An alias of a join, a join in
-  parentheses or inside a comma list, and a view in a query that names a
+  An alias of a join and a view in a query that names a
   table twice are refused. Without `FROM`, a `SELECT` returns one row of
   its items, or none under `LIMIT 0`: each is any select-list expression
   (*Expressions over columns*) of constants, parameters, subqueries and the
@@ -910,8 +932,9 @@ That includes:
   `GROUP BY` of an expression, and `HAVING` of anything but the
   comparisons above;
 - `FULL JOIN`, an outer join's `ON` comparing an expression of columns,
-  more than eight tables, a `RIGHT JOIN` after the first join, a join in
-  parentheses or among commas,
+  more than eight tables, a `RIGHT JOIN` after the first join, an outer
+  join in parentheses or of a join in parentheses, `USING` or `NATURAL` in
+  parentheses or after a comma,
   `FOR UPDATE` of a join (#697), an alias of a join, an output name in `GROUP BY`;
 - `RETURNING` in a procedure; `VALUES` outside `INSERT`; `OFFSET` on a set operation, in one of
   its arms or in a view;

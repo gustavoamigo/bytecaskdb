@@ -1500,6 +1500,32 @@ TEST_CASE("embedded API: a left outer join NULL-extends each left row no right r
 }
 
 // The rows below are PostgreSQL 16's, for the same statements on the same rows.
+TEST_CASE("embedded API: an inner join in parentheses, and joins in a comma list", "[sql][api][join]") {
+  sql_test::TempDir dir{"api_join_groups"};
+  auto db = Database::open(dir.path());
+  for (auto t : {"a", "b", "c"}) (void)db->execute(std::string{"CREATE TABLE "} + t + " (id INTEGER PRIMARY KEY, k INTEGER)");
+  (void)db->execute("INSERT INTO a VALUES (1, 1), (2, 2), (3, NULL)");
+  (void)db->execute("INSERT INTO b VALUES (1, 1), (2, 3)");
+  (void)db->execute("INSERT INTO c VALUES (1, 1), (2, 2)");
+  auto rows = [&](std::string_view sql) { return db->execute(sql).rows; };
+  const Value n{};
+  CHECK(rows("SELECT a.id, b.id, c.id FROM a JOIN (b JOIN c ON b.k = c.k) ON a.k = b.k") == Grid{{i(1), i(1), i(1)}});
+  CHECK(rows("SELECT a.id, b.id, c.id FROM a LEFT JOIN b ON a.k = b.k, c WHERE c.k = a.k ORDER BY 1") ==
+        Grid{{i(1), i(1), i(1)}, {i(2), n, i(2)}});
+  CHECK(rows("SELECT a.id, b.id, c.id FROM a, b JOIN c ON b.k = c.k ORDER BY 1") ==
+        Grid{{i(1), i(1), i(1)}, {i(2), i(1), i(1)}, {i(3), i(1), i(1)}});
+  // A LEFT JOIN after a comma extends its own left side's rows: each of a's with each of b's.
+  CHECK(rows("SELECT a.id, b.id, c.id FROM a, b LEFT JOIN c ON b.k = c.k ORDER BY 1, 2") ==
+        Grid{{i(1), i(1), i(1)}, {i(1), i(2), n}, {i(2), i(1), i(1)}, {i(2), i(2), n}, {i(3), i(1), i(1)}, {i(3), i(2), n}});
+  // The ON of the join in parentheses cannot read a (42P01), as in PostgreSQL.
+  try {
+    (void)db->execute("SELECT 1 FROM a JOIN (b JOIN c ON a.k = c.k) ON a.k = b.k");
+    FAIL("accepted");
+  } catch (const ast::SqlError& e) {
+    CHECK(e.sqlstate() == "42P01");
+  }
+}
+
 TEST_CASE("embedded API: joins of three or more tables, a table with itself, and ON by any comparison", "[sql][api][join]") {
   sql_test::TempDir dir{"api_joins"};
   auto db = Database::open(dir.path());

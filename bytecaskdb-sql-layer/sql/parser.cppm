@@ -1316,6 +1316,39 @@ auto names_hidden(const Select& sel, const Names& n) -> bool {
          std::ranges::any_of(sel.order_by, [&](const OrderItem& o) { return in_expr(o.expr); });
 }
 
+// A qualifier in an ON that names a FROM item before the ON's own join, in
+// parentheses or after a comma (Compare::on_from), is PostgreSQL's 42P01,
+// with its DETAIL naming the item. A name of no item, or of a later one, is
+// the binder's "missing FROM-clause entry"; one an alias hides, resolve_aliases'.
+void check_on_scope(const Select& sel, const Names& n) {
+  // An item of the ON's own join owns a qualifier only by its visible name: an
+  // alias there hides its table's name, so an earlier item by that name is
+  // still the invalid reference. An earlier item is matched by either name.
+  auto reaches = [&](const std::string& q, std::size_t i) { return n.visible(i) == q || n.tables[i] == q; };
+  std::function<void(const Expr&, const Compare&)> in_expr = [&](const Expr& e, const Compare& c) {
+    if (!e.table.empty()) {
+      auto own = false;
+      for (auto i = std::size_t{c.on_from}; i <= c.on && i < n.tables.size(); ++i) own = own || n.visible(i) == e.table;
+      for (std::size_t i = 0; i < c.on_from && !own; ++i) {
+        if (!reaches(e.table, i)) continue;
+        throw SqlError{"invalid reference to FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable}.with_notes(
+            "There is an entry for table \"" + n.visible(i) + "\", but it cannot be referenced from this part of the query.", "");
+      }
+    }
+    if (e.lhs) in_expr(*e.lhs, c);
+    if (e.rhs) in_expr(*e.rhs, c);
+    for (const auto& a : e.args) in_expr(a, c);
+  };
+  std::function<void(const Compare&)> in_compare = [&](const Compare& c) {
+    in_expr(c.lhs, c);
+    in_expr(c.rhs, c);
+    for (const auto& a : c.args) in_compare(a);
+  };
+  for (const auto& c : sel.where) {
+    if (c.on != 0 && c.on_from != 0) in_compare(c);
+  }
+}
+
 void resolve_aliases(Select& sel, bool nested) {
   Names names;
   for (const auto& item : sel.from) {
@@ -1347,6 +1380,7 @@ void resolve_aliases(Select& sel, bool nested) {
       if (names.visible(j) == alias || (j < i && sel.from[j].using_alias == alias)) twice(alias);
     }
   }
+  check_on_scope(sel, names);
   // Renamed columns exist only under the alias, which the binder reads.
   for (const auto& item : sel.from) names.keep = names.keep || !item.column_aliases.empty();
   if (nested && names_hidden(sel, names)) {
@@ -1447,14 +1481,30 @@ auto from_item(const PgQuery__RangeVar* rv) -> FromItem {
   FromItem item;
   item.table = from_relation(rv);
   item.alias = table_alias(rv);
+  item.written = item.alias.empty() ? item.table : item.alias;
   item.column_aliases = table_column_aliases(rv);
   item.pos = rv->location;
   return item;
 }
 
-// The items of a join tree and their ON conjuncts. Only a left-deep tree of
-// tables is taken: `a JOIN b … JOIN c …`, each join's right side a table.
-void join_items(const PgQuery__Node* n, std::int32_t pos, std::vector<FromItem>& items, std::vector<Compare>& on) {
+// Each conjunct of an ON, and what it is made of, sees the FROM items from
+// `first` on (Compare::on_from).
+void scope_on(Compare& c, std::uint32_t first) {
+  c.on_from = first;
+  for (auto& a : c.args) scope_on(a, first);
+}
+
+// The items of a join tree and their ON conjuncts, flattened in the order
+// written: `a JOIN b … JOIN c …`, each join's right side a table, or, for an
+// inner join, an inner join of tables in parentheses, `a JOIN (b JOIN c ON
+// …) ON …`, which joins the same rows in any order. Each ON sees the items of
+// its own join, from the first of its left side (the tree's first, `first`
+// for a nested tree or one after a comma) to its last. A LEFT or RIGHT join
+// in parentheses or of a join in parentheses would not, and is refused, as
+// is USING or NATURAL there or after a comma, whose left side is not every
+// item before it.
+void join_items(const PgQuery__Node* n, std::int32_t pos, std::vector<FromItem>& items, std::vector<Compare>& on,
+                std::uint32_t first, bool nested) {
   if (n != nullptr && n->node_case == PG_QUERY__NODE__NODE_RANGE_VAR) {
     items.push_back(from_item(n->range_var));
     return;
@@ -1468,36 +1518,52 @@ void join_items(const PgQuery__Node* n, std::int32_t pos, std::vector<FromItem>&
   auto kind = j->jointype == PG_QUERY__JOIN_TYPE__JOIN_LEFT    ? JoinKind::Left
               : j->jointype == PG_QUERY__JOIN_TYPE__JOIN_RIGHT ? JoinKind::Right
                                                                : JoinKind::Inner;
+  auto table = r != nullptr && r->node_case == PG_QUERY__NODE__NODE_RANGE_VAR;
+  auto join = r != nullptr && r->node_case == PG_QUERY__NODE__NODE_JOIN_EXPR;
   if ((j->jointype != PG_QUERY__JOIN_TYPE__JOIN_INNER && kind == JoinKind::Inner) || j->alias != nullptr ||
-      j->larg == nullptr || r == nullptr || r->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) {
-    reject("only an inner, LEFT or RIGHT join of tables, each joined to the ones before it, is supported", at);
+      j->larg == nullptr || !(table || join)) {
+    reject("only an inner, LEFT or RIGHT join of tables, without an alias, is supported", at);
   }
-  join_items(j->larg, pos, items, on);
-  auto item = from_item(r->range_var);
-  item.kind = kind;
-  item.natural = j->is_natural;
-  for (std::size_t k = 0; k < j->n_using_clause; ++k) item.using_columns.push_back(str(j->using_clause[k]));
-  if (j->join_using_alias != nullptr) {
-    if (j->join_using_alias->n_colnames != 0) reject("a USING alias takes no column list", at);
-    item.using_alias = j->join_using_alias->aliasname;
+  if (kind != JoinKind::Inner && (nested || join)) {
+    reject("a LEFT or RIGHT join in parentheses, or of a join in parentheses, is not supported yet", at);
   }
-  // The item is the next one: its ON conjuncts are its own.
-  where(j->quals, on, "ON", item.pos, static_cast<std::uint32_t>(items.size()));
-  items.push_back(std::move(item));
+  auto merges = j->is_natural || j->n_using_clause != 0;
+  if (merges && (first != 0 || join)) {
+    reject("USING or NATURAL in a join in parentheses, of one, or after a comma is not supported yet", at);
+  }
+  join_items(j->larg, pos, items, on, first, nested);
+  if (join) {
+    join_items(r, pos, items, on, static_cast<std::uint32_t>(items.size()), true);
+  } else {
+    auto item = from_item(r->range_var);
+    item.kind = kind;
+    item.natural = j->is_natural;
+    for (std::size_t k = 0; k < j->n_using_clause; ++k) item.using_columns.push_back(str(j->using_clause[k]));
+    if (j->join_using_alias != nullptr) {
+      if (j->join_using_alias->n_colnames != 0) reject("a USING alias takes no column list", at);
+      item.using_alias = j->join_using_alias->aliasname;
+    }
+    items.push_back(std::move(item));
+  }
+  // The ON is the last item's: of the table joined, or of the join in
+  // parentheses, which is inner and so has its ON with the WHERE's.
+  auto last = static_cast<std::uint32_t>(items.size() - 1);
+  auto written = on.size();
+  where(j->quals, on, "ON", items.back().pos, last);
+  for (auto i = written; i < on.size(); ++i) scope_on(on[i], first);
 }
 
 auto select(const PgQuery__SelectStmt* s, std::int32_t pos, bool into_taken, bool nested) -> Select {
   if (s->op != PG_QUERY__SET_OPERATION__SETOP_NONE) return set_operation(s, pos, nested);
   // No table, or tables joined: FROM a, b, c, or a [INNER] JOIN b ON … JOIN
-  // c …, whose ON conjuncts join the WHERE's.
+  // c …, or both, whose ON conjuncts join the WHERE's.
   if (s->n_values_lists != 0) reject("VALUES is supported only in INSERT", pos);
   std::vector<FromItem> items;
   std::vector<Compare> on;
   for (std::size_t i = 0; i < s->n_from_clause; ++i) {
     const auto* from = s->from_clause[i];
     if (from->node_case == PG_QUERY__NODE__NODE_JOIN_EXPR) {
-      if (s->n_from_clause != 1) reject("a join inside a list of tables is not supported", pos);
-      join_items(from, pos, items, on);
+      join_items(from, pos, items, on, static_cast<std::uint32_t>(items.size()), false);
       continue;
     }
     if (from->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) reject("SELECT reads tables", pos);
