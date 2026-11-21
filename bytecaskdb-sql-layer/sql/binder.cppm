@@ -4976,9 +4976,25 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
         } else if constexpr (std::is_same_v<T, ast::DropRole>) {
           return {Ddl{DropRoleDdl{s.roles, s.if_exists}}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::Grant>) {
-          GrantDdl out{s.grant, s.grant_option, {}, s.objects, s.grantees, s.grantor};
+          GrantDdl out{s.grant, s.grant_option, {}, s.objects, s.grantees, s.grantor, GrantDdl::Target::Table};
+          switch (s.target) {
+            case ast::Grant::Target::Table: out.target = GrantDdl::Target::Table; break;
+            case ast::Grant::Target::Sequence: out.target = GrantDdl::Target::Sequence; break;
+            case ast::Grant::Target::Domain: out.target = GrantDdl::Target::Domain; break;
+            case ast::Grant::Target::Type: out.target = GrantDdl::Target::Type; break;
+          }
           for (const auto& p : s.privileges) out.privileges.push_back({p.name, p.columns});
           return {Ddl{std::move(out)}, s.pos};
+        } else if constexpr (std::is_same_v<T, ast::CreateDomain>) {
+          return {Ddl{CreateDomainDdl{s.domain, sql_type(s.base)}}, s.pos};
+        } else if constexpr (std::is_same_v<T, ast::CreateType>) {
+          return {Ddl{CreateTypeDdl{s.type}}, s.pos};
+        } else if constexpr (std::is_same_v<T, ast::CreateSequence>) {
+          return {Ddl{CreateSequenceDdl{s.sequence, s.if_not_exists}}, s.pos};
+        } else if constexpr (std::is_same_v<T, ast::DropTypeOrSequence>) {
+          using K = ast::DropTypeOrSequence::Kind;
+          if (s.kind == K::Sequence) return {Ddl{DropSequenceDdl{s.name, s.if_exists}}, s.pos};
+          return {Ddl{DropTypeDdl{s.name, s.kind == K::Domain, s.if_exists}}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::DropProcedure>) {
           DropProcedureDdl out{s.procedure, std::nullopt, s.if_exists};
           if (s.arg_types) {

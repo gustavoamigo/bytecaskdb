@@ -449,7 +449,41 @@ struct PrivilegeAst {
 // GRANT or REVOKE of privileges on tables and views (docs/frontend_design.md,
 // *Roles and privileges*). Names are checked when the catalog applies it, in
 // PostgreSQL's order.
+// CREATE DOMAIN name [AS] type, with no constraint, DEFAULT or COLLATE yet.
+// Stored, and granted on; not yet a column's type.
+struct CreateDomain {
+  std::string domain;
+  ColumnDefAst base;  // its type, as a column's
+  std::int32_t pos{-1};
+};
+
+// CREATE TYPE name: a shell type, which nothing can use, as in PostgreSQL.
+struct CreateType {
+  std::string type;
+  std::int32_t pos{-1};
+};
+
+// CREATE SEQUENCE [IF NOT EXISTS] name, with no option yet. Stored, and
+// granted on; nextval and the rest are not built.
+struct CreateSequence {
+  std::string sequence;
+  bool if_not_exists{false};
+  std::int32_t pos{-1};
+};
+
+// DROP DOMAIN, DROP TYPE (a domain or a shell type) or DROP SEQUENCE
+// [IF EXISTS] name.
+struct DropTypeOrSequence {
+  enum class Kind { Domain, Type, Sequence };
+  Kind kind{Kind::Domain};
+  std::string name;
+  bool if_exists{false};
+  std::int32_t pos{-1};
+};
+
 struct Grant {
+  enum class Target { Table, Sequence, Domain, Type };
+  Target target{Target::Table};          // what ON names
   bool grant{true};                      // false: REVOKE
   bool grant_option{false};              // GRANT … WITH GRANT OPTION, REVOKE GRANT OPTION FOR …
   std::vector<PrivilegeAst> privileges;  // empty: ALL PRIVILEGES
@@ -460,7 +494,8 @@ struct Grant {
 };
 
 using Statement = std::variant<CreateTable, CreateIndex, DropTable, DropIndex, AddColumn, CreateView, DropView,
-                               CreateProcedure, DropProcedure, CreateRole, DropRole, Grant, Insert, Select, Update, Delete>;
+                               CreateProcedure, DropProcedure, CreateRole, DropRole, Grant, CreateDomain, CreateType,
+                               CreateSequence, DropTypeOrSequence, Insert, Select, Update, Delete>;
 
 // Cursor statements (docs/cursor_design.md). They are not a Statement: they
 // name a session's cursor and carry no plan, so the session runs them, as it
