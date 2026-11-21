@@ -1958,6 +1958,90 @@ TEST_CASE("schemas: a schema is a record, a name entry and an ACL record, and it
   db.close();
 }
 
+namespace {
+
+// The message Catalog::load refuses with, or "" when it opens.
+auto load_refusal(DB& db) -> std::string {
+  try {
+    LiveCatalog live{db};
+  } catch (const std::runtime_error& e) {
+    return e.what();
+  }
+  return {};
+}
+
+}  // namespace
+
+TEST_CASE("catalog: a catalog with the counters and every known sub-prefix opens", "[sql][catalog][schemas]") {
+  sql_test::TempDir dir{"catalog_known_subs"};
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    auto s = schema_fixture(live);
+    (void)live.apply(CreateViewDdl{{s, "v"}, "CREATE VIEW s.v AS SELECT id FROM t", {live.current()->table({kPublicSchema, "t"})->id},
+                                   {"id"}, {{ViewName::Kind::Relation, "t", kPublicSchema}}});
+    (void)live.apply(CreateSequenceDdl{{s, "sq"}});
+    (void)live.apply(CreateDomainDdl{{s, "d"}, SqlType{SqlKind::Integer}});
+    (void)live.apply(CreateProcedureDdl{{s, "p"}, "CREATE PROCEDURE s.p(a INTEGER) LANGUAGE plpgsql AS $$BEGIN END$$", false,
+                                        {{ProcedureArg::Mode::In, "a", SqlType{SqlKind::Integer}}}});
+    (void)live.apply(CreateRoleDdl{"r"});
+    // Sub-prefixes 01 (the two counters) to 0E each hold a key.
+    CHECK(count_prefix(db, Bytes{std::byte{kNsCatalog}, std::byte{0x01}}) == 2);
+    for (int sub = 0x02; sub <= 0x0E; ++sub) {
+      INFO(sub);
+      CHECK(count_prefix(db, Bytes{std::byte{kNsCatalog}, std::byte(sub)}) > 0);
+    }
+    db.close();
+  }
+  auto db = DB::open(dir.path());
+  CHECK(load_refusal(db).empty());
+}
+
+TEST_CASE("catalog: a key under an unknown sub-prefix, or a third counter, is refused at load", "[sql][catalog][schemas]") {
+  sql_test::TempDir dir{"catalog_unknown_subs"};
+  auto db = DB::open(dir.path());
+  (void)LiveCatalog{db}.apply(create_t());
+  REQUIRE(load_refusal(db).empty());
+  auto ns = std::byte{kNsCatalog};
+  auto refused = [&](const Bytes& key, std::string_view message) {
+    db.put({}, key, Bytes{std::byte{0x01}});
+    CHECK(load_refusal(db) == message);
+    (void)db.del({}, key);
+    REQUIRE(load_refusal(db).empty());
+  };
+  constexpr std::string_view kLater = " this build does not know: the database was written by a later SQL-layer build";
+  auto hex = [](int b) {
+    constexpr std::string_view kHex = "0123456789ABCDEF";
+    return std::string{kHex[static_cast<std::size_t>(b >> 4)], kHex[static_cast<std::size_t>(b & 0xF)]};
+  };
+  // Every byte but 01 to 0E as a sub-prefix, alone and with a suffix.
+  for (int sub = 0x00; sub <= 0xFF; ++sub) {
+    if (sub >= 0x01 && sub <= 0x0E) continue;
+    INFO(sub);
+    auto message = "catalog: key 01 " + hex(sub) + " is under a catalog sub-prefix" + std::string{kLater};
+    refused(Bytes{ns, std::byte(sub)}, message);
+    refused(Bytes{ns, std::byte(sub), std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01}}, message);
+  }
+  refused(Bytes{ns}, "catalog: key 01 is under a catalog sub-prefix" + std::string{kLater});
+  // Under 01 01, the two counters' keys alone: every other third byte, the
+  // sub-prefix's own key, and a counter's key with a suffix.
+  for (int c = 0x00; c <= 0xFF; ++c) {
+    if (c == 0x01 || c == 0x02) continue;
+    INFO(c);
+    refused(Bytes{ns, std::byte{0x01}, std::byte(c)}, "catalog: key 01 01 " + hex(c) + " is a catalog counter" + std::string{kLater});
+  }
+  refused(Bytes{ns, std::byte{0x01}}, "catalog: key 01 01 is a catalog counter" + std::string{kLater});
+  refused(Bytes{ns, std::byte{0x01}, std::byte{0x01}, std::byte{0x00}},
+          "catalog: key 01 01 01 00 is a catalog counter" + std::string{kLater});
+  refused(Bytes{ns, std::byte{0x01}, std::byte{0x02}, std::byte{0xFF}},
+          "catalog: key 01 01 02 FF is a catalog counter" + std::string{kLater});
+  // And after a reopen.
+  db.put({}, Bytes{ns, std::byte{0x0F}}, Bytes{std::byte{0x01}});
+  db.close();
+  auto again = DB::open(dir.path());
+  CHECK(load_refusal(again).starts_with("catalog: key 01 0F"));
+}
+
 TEST_CASE("schemas: CREATE and DROP SCHEMA errors are PostgreSQL's", "[sql][catalog][schemas]") {
   sql_test::TempDir dir{"schemas_errors"};
   auto db = DB::open(dir.path());

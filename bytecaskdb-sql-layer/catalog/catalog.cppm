@@ -1145,11 +1145,15 @@ constexpr std::byte kSubTypeName{0x0B};
 constexpr std::byte kSubSequence{0x0C};
 constexpr std::byte kSubSchema{0x0D};
 constexpr std::byte kSubSchemaName{0x0E};
+// The sub-prefixes this build knows are kSubCounter to kSubLast, every one
+// in between: a new kind takes the next byte and moves kSubLast.
+constexpr std::byte kSubLast = kSubSchemaName;
 // A name entry outside public: this byte, then the schema id, then the name.
 // No name is empty or holds a NUL byte, so the two forms never collide.
 constexpr std::byte kSchemaMarker{0x00};
 constexpr std::byte kCounterNextId{0x01};
 constexpr std::byte kCounterVersion{0x02};
+constexpr std::byte kCounterLast = kCounterVersion;
 constexpr std::uint8_t kKindTable = 1;
 constexpr std::uint8_t kKindIndex = 2;
 constexpr std::uint8_t kKindView = 3;
@@ -2462,6 +2466,43 @@ auto Table::row_id() const -> const Column* {
   return c != nullptr && c->hidden ? c : nullptr;
 }
 
+namespace {
+
+// A key of [from, to) refuses the catalog, named by its first bytes. Two
+// record reads per range at most (Snapshot::count_keys), whatever the
+// database holds.
+void refuse_keys_in(const Snapshot& snap, BytesView from, BytesView to, std::size_t shown_bytes, std::string_view what) {
+  if (snap.count_keys(from, to, 1) == 0) return;
+  auto keys = snap.keys_from({}, from);
+  auto first = Bytes{*keys.begin()};
+  auto shown = std::string{};
+  for (auto b : BytesView{first}.first(std::min(first.size(), shown_bytes))) {
+    constexpr std::string_view kHex = "0123456789ABCDEF";
+    auto v = std::to_integer<std::size_t>(b);
+    shown += shown.empty() ? "" : " ";
+    shown += kHex[v >> 4];
+    shown += kHex[v & 0xF];
+  }
+  corrupt("key " + shown + " is " + std::string{what} + " this build does not know: the database was written by a later SQL-layer build");
+}
+
+void refuse_unknown_keys(const Snapshot& snap) {
+  auto ns = std::byte{kNsCatalog};
+  auto next = [](std::byte b) { return static_cast<std::byte>(std::to_integer<std::uint8_t>(b) + 1); };
+  // The namespace's own key and sub-prefix 00.
+  refuse_keys_in(snap, Bytes{ns}, Bytes{ns, kSubCounter}, 2, "under a catalog sub-prefix");
+  // Under the counters' sub-prefix, the counters' keys alone.
+  refuse_keys_in(snap, Bytes{ns, kSubCounter}, counter_key(kCounterNextId), 4, "a catalog counter");
+  for (auto c = kCounterNextId; c <= kCounterLast; c = next(c)) {
+    auto past = c == kCounterLast ? Bytes{ns, next(kSubCounter)} : counter_key(next(c));
+    refuse_keys_in(snap, Bytes{ns, kSubCounter, c, std::byte{0}}, past, 4, "a catalog counter");
+  }
+  static_assert(std::to_integer<std::uint8_t>(kSubLast) < 0xFF);
+  refuse_keys_in(snap, Bytes{ns, next(kSubLast)}, Bytes{next(ns)}, 2, "under a catalog sub-prefix");
+}
+
+}  // namespace
+
 auto Catalog::load(const Snapshot& snap) -> Catalog {
   Catalog cat;
   Bytes v;
@@ -2475,6 +2516,10 @@ auto Catalog::load(const Snapshot& snap) -> Catalog {
   counter(kCounterNextId, cat.next_id_);
   counter(kCounterVersion, cat.version_);
   if (cat.next_id_ == 0 || cat.next_id_ > std::uint64_t{kMaxObjectId} + 1) corrupt("next object id out of range");
+  // No key outside the known set: the counters, read by key, and each
+  // sub-prefix after them. A record kind or counter of a later build is
+  // refused, never ignored.
+  refuse_unknown_keys(snap);
   // Each record kind under its sub-prefix, each under its own id's key.
   auto records = [&](std::byte sub, auto parse, auto& into, std::string_view what) {
     auto prefix = Bytes{std::byte{kNsCatalog}, sub};
