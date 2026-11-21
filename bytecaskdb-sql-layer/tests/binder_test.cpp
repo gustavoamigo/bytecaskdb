@@ -1401,8 +1401,11 @@ TEST_CASE("binder: GROUP BY, HAVING and the aggregates, as PostgreSQL binds them
     CHECK_FALSE(agg.aggs[2].expr.distinct);
     CHECK_FALSE(agg.aggs[3].expr.distinct);
   }
-  CHECK(rejected(cat, "SELECT a FROM g GROUP BY a HAVING sum(f) > $1").first ==
-        "HAVING on an aggregate of a double precision column is not supported yet");
+  // HAVING on an aggregate of a DOUBLE: its $n a double precision, as the
+  // aggregate is; COUNT's a bigint.
+  CHECK(bind_sql(cat, "SELECT a FROM g GROUP BY a HAVING sum(f) > $1").param_types == std::vector<PhysType>{PhysType::F64});
+  CHECK(bind_sql(cat, "SELECT a FROM g GROUP BY a HAVING max(f) <= $1").param_types == std::vector<PhysType>{PhysType::F64});
+  CHECK(bind_sql(cat, "SELECT a FROM g GROUP BY a HAVING count(f) > $1").param_types == std::vector<PhysType>{PhysType::I64});
   CHECK(rejected(cat, "SELECT a FROM g GROUP BY a HAVING avg(a) > $1").first == "HAVING on AVG is not supported yet");
   CHECK(rejected(cat, "SELECT a FROM g GROUP BY a + 1").first == "GROUP BY takes columns");
 }

@@ -753,9 +753,9 @@ or string column, a join on columns of two types, and an unsupported
 assigns it: PostgreSQL types a `$n` by its first use, which for `UPDATE` is
 its `WHERE` before the `SET` the layer binds first, and refuses an untyped `$n`
 assigned to two columns of different types with `42P08` whatever the types.
-The planner's "no plan" refusals are not among them: they are
-`FeatureNotSupported`, `0A000`, though PostgreSQL runs each statement
-(`planner_design.md`, *What the search refuses*). HammerDB's driver sends
+The planner plans every statement the binder takes; its "no plan"
+refusal, `FeatureNotSupported`, `0A000`, is for a logical plan the binder
+never builds (`planner_design.md`, *What the search refuses*). HammerDB's driver sends
 no statement that fails to bind.
 
 ## What it uses from the embedded API

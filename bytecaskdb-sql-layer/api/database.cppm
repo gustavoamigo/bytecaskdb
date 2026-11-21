@@ -1786,6 +1786,14 @@ static auto clock_value(const bound::ClockSlot& k, std::int64_t now_us) -> Value
 
 auto Database::plan_params(const Compiled& c, const std::vector<Value>& params, std::int64_t now_us) -> std::vector<Value> {
   auto out = params;
+  // A parameter compared with a REAL is typed real, as PostgreSQL types it:
+  // rounded once to single precision, as the column's values were, so a
+  // filter compares the float of the value given (check_params refused one
+  // that overflows).
+  for (std::size_t i = 0; i < params.size() && i < c.param_sql.size(); ++i) {
+    auto* d = std::get_if<double>(&out[i]);
+    if (d != nullptr && c.param_sql[i] && c.param_sql[i]->kind == SqlKind::Real) *d = float_rounding(*d);
+  }
   out.insert(out.end(), c.fixed.begin(), c.fixed.end());
   for (const auto& k : c.clocks) out[params.size() + k.slot] = clock_value(k, now_us);
   return out;

@@ -302,11 +302,13 @@ TEST_CASE("codegen: what the planner refuses, with its message, and what it sort
   // ORDER BY asks for it.
   CHECK(sorts("SELECT k FROM o WHERE a = $1 ORDER BY b DESC, c"));
   CHECK_FALSE(sorts("SELECT k FROM o WHERE a = $1 ORDER BY b DESC NULLS LAST, c NULLS FIRST"));
-  // A DOUBLE or REAL column takes no filter yet.
+  // A filter on a DOUBLE or REAL column compares the row's value in
+  // PostgreSQL's float8 order, NaN and -0.0 included.
   f.ddl(CreateTableDdl{"fd", {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("d", PhysType::F64, true)},
                        {"k"}});
-  CHECK(refusal("SELECT k FROM fd WHERE k = $1 AND d < $2") ==
-        "no plan: a filter on column \"d\", a REAL or DOUBLE PRECISION, is not supported yet");
+  CHECK(refusal("SELECT k FROM fd WHERE k = $1 AND d < $2") == "accepted");
+  CHECK(generate(f.cat(), "SELECT k FROM fd WHERE k = $1 AND d < $2").source.find("bc_cmp_f64(bc_col_f64(cx, row, COL_") !=
+        std::string::npos);
   // $n + k bounds a range on a key, but compared by = it is a filter: it names no key.
   f.ddl(CreateTableDdl{"ik", {{"k", {SqlKind::Integer}, false, {}}}, {"k"}});
   CHECK(refusal("SELECT k FROM ik WHERE k >= $1 + 1") == "accepted");
@@ -390,8 +392,8 @@ TEST_CASE("codegen: a join is of two point lookups, in FROM order", "[sql][codeg
   // name compared for equality: the index's next part, id, gives the order.
   auto by_id = generate(f.cat(), "SELECT v FROM t, u WHERE name = $1 AND k = qty ORDER BY id");
   CHECK(by_id.source.find("bc_scan_open(cx, IDX_3, lo, lo, BC_SCAN_PREFIX);") != std::string::npos);
-  // FROM order would leave x.f = y.f a filter on a DOUBLE PRECISION; the
-  // other order keys x by it.
+  // FROM order would leave x.f = y.f a filter of the pairs, each y row
+  // compared with every x row; the other order keys x by it, for less.
   using sql_test::Fixture;
   f.ddl(CreateTableDdl{"x", {Fixture::col("f", PhysType::F64, false), Fixture::col("c", PhysType::I64, true)}, {"f"}});
   f.ddl(CreateIndexDdl{"x_by_c", "x", {{"c"}}});
@@ -399,9 +401,10 @@ TEST_CASE("codegen: a join is of two point lookups, in FROM order", "[sql][codeg
   auto other = generate(f.cat(), "SELECT c FROM x, y WHERE c = $1 AND yk = $2 AND f = yf");
   CHECK(other.source.find("bc_scan_open(cx, TBL_9, lo, lo, BC_SCAN_PREFIX);") != std::string::npos);
   CHECK(other.source.find("bc_key_f64(cx, k0, bc_col_f64(cx, row, COL_9_1));") != std::string::npos);
-  // Both orders refused: the first one's refusal stands.
-  CHECK(refusal("SELECT c FROM x, y WHERE c = $1 AND yk = $2 AND f = yf AND yf = $3") ==
-        "no plan: a filter on column \"yf\", a REAL or DOUBLE PRECISION, is not supported yet");
+  // And a filter on y's DOUBLE beside it, in float8 order.
+  CHECK(refusal("SELECT c FROM x, y WHERE c = $1 AND yk = $2 AND f = yf AND yf = $3") == "accepted");
+  CHECK(generate(f.cat(), "SELECT c FROM x, y WHERE c = $1 AND yk = $2 AND f = yf AND yf = $3").source.find("bc_cmp_f64(") !=
+        std::string::npos);
   // A long outer value makes an inner key no row has: that outer row joins nothing.
   f.ddl(CreateTableDdl{"s", {Fixture::col("sk", PhysType::Bytes, false)}, {"sk"}});
   auto by_bytes = generate(f.cat(), "SELECT id FROM t, s WHERE name >= $1 AND sk = name");

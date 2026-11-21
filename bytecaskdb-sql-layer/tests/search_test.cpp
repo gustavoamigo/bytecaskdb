@@ -467,19 +467,15 @@ TEST_CASE("search: a table read once is filtered by the join's conjuncts, which 
   REQUIRE(joined != std::string::npos);
   CHECK(scan < joined);
   CHECK(once.source.find("bc_col_i64(cx, row, COL_", joined) != std::string::npos);
-  // A join conjunct on DOUBLE columns is a filter neither order takes: w's
-  // key is named by nothing, and the conjunct filters w read once, or u
-  // looked up per row.
-  try {
-    (void)plan_sql(cat, "SELECT w.k FROM u, w WHERE u.k = $1 AND w.a = $2 AND w.d = u.dv");
-    FAIL("planned");
-  } catch (const ast::FeatureNotSupported& e) {
-    CHECK(std::string{e.what()} ==
-          "no plan: a filter on column \"d\", a REAL or DOUBLE PRECISION, is not supported yet");
-  }
+  // A join conjunct on DOUBLE columns is a filter of the pairs, in float8
+  // order, never a hash key: w's key is named by nothing, so w is read once
+  // under u's one row, or u looked up per row of w.
+  auto doubles = plan_sql(cat, "SELECT w.k FROM u, w WHERE u.k = $1 AND w.a = $2 AND w.d = u.dv");
+  CHECK(doubles.source.find("bc_cmp_f64(") != std::string::npos);
+  CHECK(doubles.source.find("bc_hash_open") == std::string::npos);
 }
 
-TEST_CASE("search: a refusal names the failure of a plan of every table, not of one table's access",
+TEST_CASE("search: every join order is planned, a filter on a DOUBLE in any of them",
           "[sql][search]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
@@ -503,13 +499,12 @@ TEST_CASE("search: a refusal names the failure of a plan of every table, not of 
   CHECK(refused("SELECT a.k FROM a, b WHERE a.x = $1 AND b.y = $2 AND a.z = b.y ORDER BY a.z") == "accepted");
   // Keyed by a.z, b joins a, sorted by a.k.
   CHECK(refused("SELECT a.k FROM a, b WHERE b.y = $1 AND b.k = a.z AND a.x = $2 ORDER BY a.k") == "accepted");
-  // A filter on a DOUBLE in every plan of both tables, past a plan of one
-  // table that the other's fails.
+  // A filter on a DOUBLE in every plan of both tables: d probed by a.z, the
+  // filter on its row.
   f.ddl(CreateTableDdl{"d", {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::F64, true)}, {"k"}});
-  CHECK(refused("SELECT a.k FROM a, d WHERE a.x = $1 AND d.k = a.z AND d.v < $2") ==
-        "no plan: a filter on column \"v\", a REAL or DOUBLE PRECISION, is not supported yet");
+  CHECK(refused("SELECT a.k FROM a, d WHERE a.x = $1 AND d.k = a.z AND d.v < $2") == "accepted");
   // e's index takes the DOUBLE bound, and its full scan leaves it a filter:
-  // the plans by e_v are planned, past the full scan's DOUBLE filter.
+  // both are planned.
   f.ddl(CreateTableDdl{"e",
                        {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::F64, true),
                         Fixture::col("y", PhysType::I64, true)},
@@ -1615,7 +1610,7 @@ TEST_CASE("search: a predicate over the columns of two tables filters the pairs 
   // In an outer join's ON, the pair is a match: no pair, a row of NULLs.
   auto outer = plan_sql(cat, "SELECT t.id, u.k FROM t LEFT JOIN u ON u.k = t.qty AND (t.id < u.v OR u.v IS NULL)");
   CHECK(has(outer, "bc_null_row("));
-  // A predicate over a DOUBLE column is refused, as any filter on one is.
+  // A predicate over DOUBLE columns of both tables filters the pairs.
   f.ddl(CreateTableDdl{"d", {Fixture::col("k", PhysType::I64, false), Fixture::col("x", PhysType::F64, true)}, {"k"}});
   f.ddl(CreateTableDdl{"e", {Fixture::col("k", PhysType::I64, false), Fixture::col("y", PhysType::F64, true)}, {"k"}});
   auto refused = [&](std::string_view sql) {
@@ -1626,7 +1621,8 @@ TEST_CASE("search: a predicate over the columns of two tables filters the pairs 
     }
     return std::string{"accepted"};
   };
-  CHECK(refused("SELECT d.k FROM d JOIN e ON NOT (d.x = e.y)").starts_with("no plan: a filter on column"));
+  CHECK(refused("SELECT d.k FROM d JOIN e ON NOT (d.x = e.y)") == "accepted");
+  CHECK(has(plan_sql(f.cat(), "SELECT d.k FROM d JOIN e ON NOT (d.x = e.y)"), "bc_cmp_f64(bc_col_f64(cx, row, COL_"));
 }
 
 TEST_CASE("search: a table read twice has an instance for each use, and the plan names the table's ids once",

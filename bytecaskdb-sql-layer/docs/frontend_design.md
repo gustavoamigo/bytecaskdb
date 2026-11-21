@@ -292,6 +292,14 @@ on any columns, and of predicates over them.
   a key takes each comparison it can. A predicate (`OR`, `NOT`, `IS NULL`)
   is a filter, checked on each row a plan reads, never a key's bound
   (`planner_design.md`, *The search*).
+- **A REAL or DOUBLE PRECISION column compared** in a `WHERE`, an `ON`, a
+  predicate or a `HAVING` (a grouped REAL or DOUBLE PRECISION column, or
+  `SUM`, `MIN` or `MAX` of a DOUBLE PRECISION one, its `$n` a `double precision`) compares in PostgreSQL's float8
+  order: `-0.0` equals `0.0`, NaN equals NaN and is above every other
+  value, `Infinity` included. A key and a filter agree (`planner_design.md`,
+  *Filters on DOUBLE and REAL columns*). A REAL compares the float its
+  operand rounds to, as PostgreSQL types it float4: `real_col = $1` with
+  0.1 matches the row written with 0.1, and so does `real_col = '0.1'`.
 - **A boolean constant:** `TRUE`, `FALSE` or `NULL` as a conjunct of a
   `WHERE` or an `ON`, or inside its `AND`, `OR` and `NOT`
   (`ast::Compare::Kind::Const`). The binder makes it a BOOLEAN constant,
@@ -334,8 +342,7 @@ on any columns, and of predicates over them.
   integers with integers, a DECIMAL of its scale, strings with strings, any
   other type its own. A scalar one is a parameter to the plan, so
   `id = (SELECT MAX(k) FROM u)` is a key lookup.
-- Not yet: a predicate comparing a REAL or DOUBLE column (`no plan:`, as
-  any filter on one), `$n ± k` inside one, one of both tables' columns in a
+- Not yet: `$n ± k` inside one, one of both tables' columns in a
   join, in `HAVING`, `LIKE` of a BYTEA column, `IS DISTINCT FROM`, `NULL`
   under `NOT`, a string as a boolean, a constant in `HAVING`; a subquery that reads a column of the
   query around it (correlated), one inside another, in `FROM`, `FOR UPDATE`
@@ -427,9 +434,9 @@ and with a constant selected or `DISTINCT ON`, it is not taken yet.
   it where both are integers of scale 0 (SMALLINT, INTEGER, BIGINT, a
   DECIMAL of scale 0), which compare exactly; any other pair is refused, as
   two uses of one `$n` are (*Known differences*). `HAVING` on `AVG` is
-  refused (42601): its quotient is no type a plan holds. So is `HAVING` on
-  an aggregate of a `DOUBLE PRECISION` column, which needs PostgreSQL's NaN
-  and `-0.0` rules, as a comparison of one does.
+  refused (42601): its quotient is no type a plan holds. `HAVING` on `SUM`,
+  `MIN` or `MAX` of a `DOUBLE PRECISION` column compares a `double
+  precision`, in float8 order.
 - `AVG`'s result is PostgreSQL's numeric of no declared precision, a SQL
   type of its own (`SqlKind::Numeric`): no column has it, and a result row
   carries its value as its text.
@@ -958,9 +965,9 @@ search refuses*).
     the diff.
   - Every TPROC-C statement has its golden plan.
 - **Refusals.** Refusals of what the dialect leaves out are tested with
-  their message and position (`binder_test`). Each row of
-  `planner_design.md`'s *What the search refuses* is tested with its
-  message.
+  their message and position (`binder_test`). The planner's refusals of a
+  logical plan it can't use, which the binder never builds, are tested with
+  their messages (`search_test`).
 - **Against PostgreSQL.** The proof machine generates the dialect's
   statements and compares them with PostgreSQL (`testing_design.md`). It
   generates only statements the planner serves, so it never compares a
@@ -1072,21 +1079,18 @@ fail on them.
   value are 23505 on both
   (`test_one_unique_value_given_to_two_rows_is_23505`). The machine adds to
   no column a unique index holds.
-- **A filter on a DOUBLE is refused** (`planner_design.md`, *What the search refuses*): a filter on a REAL or DOUBLE
-  PRECISION column no key takes. PostgreSQL runs it. Everything else in
-  the dialect is planned: full scans, sorts and joins no key reaches
-  included.
 - **A sort, a structure of groups, or the keys a set operation tells
   duplicates apart by, past the statement's memory budget fails** with
   54000, where PostgreSQL spills it to disk (`planner_design.md`, *Memory*
   and *Set operations*).
-- **A filter on a grouped DOUBLE or REAL column in HAVING is refused**
-  (`no plan:`), as a `WHERE`'s is.
 - **A constant a column's type does not hold exactly is refused in a
   comparison** (42601): `smallint_col = 40000`, `int_col = 1.5`,
-  `dec2_col = 1.005`, a REAL compared with a number that is no float, a
+  `dec2_col = 1.005`, a REAL compared with a number that is not an integer
+  within 2^24 (even 1.5, which a float holds), a REAL constant
+  (`1.5::real`) compared with a REAL or DOUBLE PRECISION column, a
   `DECIMAL` compared with one past 18 digits at its scale. PostgreSQL
-  compares in a wider type and answers. The layer compares each column in
+  compares in a wider type and answers. The REAL cases are a gap (#822):
+  `real_col = '1.5'` and `real_col = $1` already compare. The layer compares each column in
   its own key encoding, so it would have to rewrite the comparison
   (`= 40000` is never true, `< 40000` is `IS NOT NULL`); it refuses rather
   than guess. The machine expects the refusal (`oracle.exact_literal`).

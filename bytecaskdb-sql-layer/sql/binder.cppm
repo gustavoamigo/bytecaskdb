@@ -1927,7 +1927,10 @@ public:
   // A constant's value as a parameter the API binds after the statement's
   // own. Its value is checked here or where it is written, so it has no
   // range check before the plan runs.
+  // A REAL constant is the float its text rounds to, as PostgreSQL reads a
+  // float4: a filter compares that, as the column holds it.
   auto fixed(Datum v, SqlType t) -> logical::Expr {
+    if (auto* d = std::get_if<double>(&v); d != nullptr && t.kind == SqlKind::Real) *d = float_rounding(*d);
     auto n = own_params_ + bytecask::sql::narrow<std::uint32_t>(fixed_.size());
     fixed_.push_back(std::move(v));
     fixed_types_.push_back(phys_type(t));
@@ -4095,10 +4098,10 @@ public:
   // a parameter, in either order. The parameter takes the column's type, or
   // the aggregate's: COUNT's and SUM's of a SMALLINT or INTEGER a BIGINT,
   // SUM's of a BIGINT or DECIMAL the numeric at its scale, checked as a
-  // BIGINT is (compared_type), MIN's and MAX's their column's. HAVING on AVG
-  // is not supported: its quotient is no type the plan holds. Nor is HAVING
-  // on an aggregate of a DOUBLE PRECISION column: it needs PostgreSQL's NaN
-  // and -0.0 rules, as a filter on one does.
+  // BIGINT is (compared_type), MIN's and MAX's their column's; SUM's, MIN's
+  // and MAX's of a DOUBLE PRECISION a double precision, compared in
+  // PostgreSQL's float8 order. HAVING on AVG is not supported: its quotient
+  // is no type the plan holds.
   auto having_conjunct(const ast::Compare& w, const auto& resolve, const auto& grouped) -> logical::Expr {
     if (w.kind != ast::Compare::Kind::Compare) not_yet("HAVING with AND, OR, NOT, IS NULL, <>, BETWEEN, IN or a constant", w.pos);
     const auto* lhs = &w.lhs;
@@ -4132,18 +4135,16 @@ public:
       agg = aggregate(c, t->id, *lhs);
     }
     if (agg.expr.fn == logical::Expr::Fn::Avg) throw SqlError{"HAVING on AVG is not supported yet", lhs->pos};
-    if (agg.expr.fn != logical::Expr::Fn::Count && arg->sql.kind == SqlKind::Double) {
-      throw SqlError{"HAVING on an aggregate of a double precision column is not supported yet", lhs->pos};
-    }
+    auto phys = agg.expr.fn != logical::Expr::Fn::Count && arg->sql.kind == SqlKind::Double ? PhysType::F64 : PhysType::I64;
     const Column* as = arg;
     if (agg.expr.fn == logical::Expr::Fn::Count || agg.expr.fn == logical::Expr::Fn::Sum) {
-      synthetic_.push_back(Column{0, agg.name, agg.expr.type, PhysType::I64, true, {}});
+      synthetic_.push_back(Column{0, agg.name, agg.expr.type, phys, true, {}});
       as = &synthetic_.back();
     }
     if (constant) {
       return logical::compare(op, std::move(agg.expr), fixed(coerce(fold(*rhs), *as, false, op_text(op)), as->sql));
     }
-    auto sql = having_param(rhs->param, PhysType::I64, rhs->pos, *as, table_id);
+    auto sql = having_param(rhs->param, phys, rhs->pos, *as, table_id);
     return logical::compare(op, std::move(agg.expr), logical::param(rhs->param, sql));
   }
 
