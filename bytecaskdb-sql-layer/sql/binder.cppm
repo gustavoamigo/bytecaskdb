@@ -84,7 +84,9 @@ struct Bound {
   // param_table and params hold the statement's own only.
   std::vector<Datum> fixed;
   // The entries of `fixed` that are the time (CURRENT_DATE, LOCALTIME,
-  // LOCALTIMESTAMP): their values here are placeholders.
+  // LOCALTIMESTAMP, CURRENT_TIMESTAMP): their values here are placeholders,
+  // 0, which nothing may fold or check as the statement's value: a WHERE
+  // compares a column with the reading the API puts there on each run.
   std::vector<ClockSlot> clocks;
   // Each uncorrelated subquery, run before the plan: it sets its hidden
   // parameters, among `fixed`'s, whose values there are NULL.
@@ -1949,6 +1951,8 @@ public:
                         : kind == Kind::Time ? SqlKind::Time
                         : kind == Kind::TimestampTz ? SqlKind::TimestampTz
                                                     : SqlKind::Timestamp};
+    // 0 is a placeholder, never the statement's value: no rewrite may fold
+    // or range-check it, as the API replaces it on every run (ClockSlot).
     auto expr = fixed(std::int64_t{0}, type);
     clocks_.push_back({expr.param - own_params_, kind, precision});
     return {std::move(expr), e.func};
@@ -1962,6 +1966,8 @@ public:
                 : target.sql.kind == SqlKind::Time        ? Kind::Time
                 : target.sql.kind == SqlKind::TimestampTz ? Kind::TimestampTz
                                                           : Kind::Timestamp;
+    // 0 is a placeholder, never the statement's value: no rewrite may fold
+    // or range-check it, as the API replaces it on every run (ClockSlot).
     auto expr = fixed(std::int64_t{0}, target.sql);
     clocks_.push_back({expr.param - own_params_, kind, d.precision});
     return expr;
@@ -3320,7 +3326,8 @@ public:
     const auto* col = &w.lhs;
     const auto* rhs = &w.rhs;
     auto op = w.op;
-    if ((operand(*col) || param_cast(*col) || is_constant(*col) || col->kind == ast::Expr::Kind::Subquery) &&
+    if ((operand(*col) || param_cast(*col) || is_constant(*col) || col->kind == ast::Expr::Kind::Subquery ||
+         col->kind == ast::Expr::Kind::Clock) &&
         rhs->kind == ast::Expr::Kind::Column) {
       std::swap(col, rhs);
       op = mirrored(op);
@@ -3340,11 +3347,19 @@ public:
       comparable(s.type, *c, rhs->pos);
       return logical::compare(op, logical::column_of(table, *c), logical::param(s.param, subquery_param_type(s.type, *c)));
     }
+    // The clock: the statement's reading, filled in on each run.
+    if (col->kind == ast::Expr::Kind::Column && rhs->kind == ast::Expr::Kind::Clock) {
+      auto [table, c] = resolve(*col);
+      return logical::compare(op, logical::column_of(table, *c), compared_clock(*rhs, *c, w.lhs.kind == ast::Expr::Kind::Clock, w));
+    }
     // A constant: folded to the column's type, where it holds it exactly.
     if (col->kind == ast::Expr::Kind::Column && is_constant(*rhs)) {
       auto [table, c] = resolve(*col);
-      auto v = coerce(fold(*rhs), *c, false, op_text(op));
+      auto v = coerce(fold(*rhs), *c, false, written_op(w, op));
       return logical::compare(op, logical::column_of(table, *c), fixed(std::move(v), c->sql));
+    }
+    if (col->kind == ast::Expr::Kind::Clock || rhs->kind == ast::Expr::Kind::Clock) {
+      not_yet("comparing the time with a constant, a parameter or the time", w.pos);
     }
     if (col->kind != ast::Expr::Kind::Column || !operand(*rhs)) {
       throw SqlError{std::string{w.on ? "ON" : "WHERE"} + " must compare a column with a parameter or a constant", w.pos};
@@ -3365,6 +3380,39 @@ public:
     auto kind = rhs->kind == ast::Expr::Kind::Add ? logical::Expr::Kind::Add : logical::Expr::Kind::Sub;
     auto operand = logical::binary(kind, logical::param(rhs->lhs->param, c->sql), logical::constant(k, c->sql), c->sql);
     return logical::compare(op, logical::column_of(table, *c), std::move(operand));
+  }
+
+  // The clock compared with column `c`: its reading as a parameter of the
+  // column's type, which the API fills on each run, as a select list's. A
+  // date with a date, a time with a time, either timestamp with either:
+  // the session's time zone is UTC, so the instant is the local time. A
+  // date with a timestamp compares the date's midnight, which the layer does
+  // not compute yet; any other pair has no operator in PostgreSQL (42883),
+  // named in the order written.
+  auto compared_clock(const ast::Expr& clock, const Column& c, bool clock_first, const ast::Compare& w) -> logical::Expr {
+    using F = ClockDefault::Fn;
+    auto fn = clock_fn(clock.func, clock.pos);
+    auto stamp = [](SqlKind k) { return k == SqlKind::Timestamp || k == SqlKind::TimestampTz; };
+    auto clock_stamp = fn == F::CurrentTimestamp || fn == F::LocalTimestamp;
+    auto same = (c.sql.kind == SqlKind::Date && fn == F::CurrentDate) || (c.sql.kind == SqlKind::Time && fn == F::LocalTime) ||
+                (stamp(c.sql.kind) && clock_stamp);
+    if (same) {
+      auto precision = static_cast<std::uint8_t>(clock.constant < 0 || clock.constant > 6 ? 6 : clock.constant);
+      return clock_reading(ClockDefault{fn, precision}, c);
+    }
+    auto ct = clock_type(fn);
+    if ((c.sql.kind == SqlKind::Date && clock_stamp) || (stamp(c.sql.kind) && fn == F::CurrentDate)) {
+      not_yet("comparing " + c.name + " (" + sql_type_name(c.sql) + ") with the clock's " + pg_type_name(ct), w.pos);
+    }
+    auto l = clock_first ? pg_type_name(ct) : pg_type_name(c.sql);
+    auto r = clock_first ? pg_type_name(c.sql) : pg_type_name(ct);
+    throw SqlError{"operator does not exist: " + l + " " + std::string{written_op(w, w.op)} + " " + r, w.pos, kUndefinedFunction};
+  }
+
+  // `op` as the statement wrote it, for an error: the parser writes <> as
+  // NOT (=), and PostgreSQL names <>.
+  static auto written_op(const ast::Compare& w, ast::Compare::Op op) -> std::string_view {
+    return w.ne && op == ast::Compare::Op::Eq ? "<>" : op_text(op);
   }
 
   static constexpr auto op_text(ast::Compare::Op op) -> std::string_view {

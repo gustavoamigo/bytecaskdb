@@ -2763,6 +2763,88 @@ TEST_CASE("embedded API: the time is read once per statement, and once per trans
   }
 }
 
+TEST_CASE("embedded API: a WHERE compares a column with the clock, read on each run", "[sql][api][time]") {
+  sql_test::TempDir dir{"api_clock_where"};
+  auto db = Database::open(dir.path());
+  constexpr std::int64_t kDay = 86'400'000'000;
+  std::int64_t now = 20'000 * kDay + 3'600'000'000;  // 01:00 of day 20000
+  db->clock_for_testing([&] { return now; });
+  (void)db->execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, d DATE, t TIME, ts TIMESTAMP, tz TIMESTAMPTZ)");
+  (void)db->execute("CREATE INDEX ev_d ON ev (d)");
+  for (std::int64_t k = 1; k <= 3; ++k) {
+    auto at = (19'999 + k) * kDay;  // days 20000, 20001, 20002 at midnight
+    (void)db->execute("INSERT INTO ev VALUES ($1, $2, $3, $4, $5)", {i(k), i(19'999 + k), i(k * 3'600'000'000 - 1), i(at), i(at)});
+  }
+  auto ids = [&](std::string_view sql) {
+    std::vector<std::int64_t> out;
+    for (const auto& row : db->execute(sql).rows) out.push_back(std::get<std::int64_t>(row.at(0)));
+    return out;
+  };
+  using V = std::vector<std::int64_t>;
+  CHECK(ids("SELECT id FROM ev WHERE d = CURRENT_DATE") == V{1});
+  CHECK(ids("SELECT id FROM ev WHERE CURRENT_DATE < d ORDER BY id") == V{2, 3});  // written clock first
+  CHECK(ids("SELECT id FROM ev WHERE t < LOCALTIME") == V{1});
+  CHECK(ids("SELECT id FROM ev WHERE ts <= LOCALTIMESTAMP ORDER BY id") == V{1});
+  CHECK(ids("SELECT id FROM ev WHERE tz > now() ORDER BY id") == V{2, 3});
+  // Either timestamp with either: the session's zone is UTC.
+  CHECK(ids("SELECT id FROM ev WHERE ts < CURRENT_TIMESTAMP AND tz < LOCALTIMESTAMP(0) ORDER BY id") == V{1});
+  CHECK(ids("SELECT id FROM ev WHERE d = CURRENT_DATE OR id = 3 ORDER BY id") == V{1, 3});
+  CHECK(ids("SELECT id FROM ev WHERE id IN (SELECT id FROM ev WHERE d > CURRENT_DATE) ORDER BY id") == V{2, 3});
+
+  // The cached plan reads the clock again on each run.
+  now += kDay;
+  CHECK(ids("SELECT id FROM ev WHERE d = CURRENT_DATE") == V{2});
+  CHECK(ids("SELECT id FROM ev WHERE CURRENT_DATE < d ORDER BY id") == V{3});
+  CHECK(db->execute("UPDATE ev SET t = NULL WHERE d < CURRENT_DATE").affected == 1);
+  CHECK(db->execute("DELETE FROM ev WHERE d > CURRENT_DATE").affected == 1);
+  CHECK(ids("SELECT id FROM ev ORDER BY id") == V{1, 2});
+  CHECK(ids("SELECT id FROM ev WHERE t IS NULL") == V{1});
+
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)} + " " + e.what();
+    }
+    return "ran";
+  };
+  // No operator in PostgreSQL: 42883, the types in the order written.
+  CHECK(state("SELECT id FROM ev WHERE id < CURRENT_DATE").starts_with("42883 operator does not exist: integer < date"));
+  CHECK(state("SELECT id FROM ev WHERE CURRENT_DATE = t").starts_with(
+      "42883 operator does not exist: date = time without time zone"));
+  CHECK(state("SELECT id FROM ev WHERE t < LOCALTIMESTAMP").starts_with(
+      "42883 operator does not exist: time without time zone < timestamp without time zone"));
+  // A date with a timestamp compares the date's midnight: not yet.
+  CHECK(state("SELECT id FROM ev WHERE d < CURRENT_TIMESTAMP").starts_with("42601"));
+  CHECK(state("SELECT id FROM ev WHERE ts < CURRENT_DATE").starts_with("42601"));
+  CHECK(state("SELECT id FROM ev WHERE t < CURRENT_TIME").starts_with("42601"));
+  // <> and != are written NOT (=); the error names <>, as PostgreSQL's does.
+  CHECK(state("SELECT id FROM ev WHERE id <> CURRENT_DATE").starts_with("42883 operator does not exist: integer <> date"));
+  CHECK(state("SELECT id FROM ev WHERE CURRENT_TIMESTAMP != id").starts_with(
+      "42883 operator does not exist: timestamp with time zone <> integer"));
+  CHECK(state("SELECT id FROM ev WHERE id <> DATE '2020-01-01'").starts_with("42883 operator does not exist: integer <> date"));
+  // The time compared with anything but a column is not built yet.
+  CHECK(state("SELECT id FROM ev WHERE CURRENT_DATE > DATE '2020-01-01'").starts_with(
+      "42601 comparing the time with a constant, a parameter or the time is not supported yet"));
+  CHECK(state("SELECT id FROM ev WHERE CURRENT_DATE = CURRENT_DATE").starts_with("42601 comparing the time"));
+
+  // A procedure's statements keep no clock slot: the first CALL, which
+  // binds the body, refuses the time in its WHERE.
+  (void)db->execute("CREATE PROCEDURE purge() LANGUAGE plpgsql AS $$ BEGIN DELETE FROM ev WHERE d < CURRENT_DATE; END $$");
+  (void)db->execute("CREATE PROCEDURE touch() LANGUAGE plpgsql AS $$ BEGIN UPDATE ev SET t = NULL WHERE ts < now(); END $$");
+  auto call = [&](std::string_view name) -> std::string {
+    try {
+      (void)db->call(name, {});
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)} + " " + e.what();
+    }
+    return "ran";
+  };
+  CHECK(call("purge").starts_with("0A000 the time (CURRENT_DATE, CURRENT_TIMESTAMP, now(), LOCALTIME, LOCALTIMESTAMP)"));
+  CHECK(call("touch").starts_with("0A000 the time"));
+  CHECK(ids("SELECT id FROM ev ORDER BY id") == V{1, 2});
+}
+
 TEST_CASE("embedded API: a TIMESTAMP WITH TIME ZONE column keeps the instant, in UTC, across a reopen", "[sql][api][timestamptz]") {
   sql_test::TempDir dir{"api_timestamptz"};
   auto text = [](Database& d, std::string_view sql, const std::vector<Value>& params = {}) {

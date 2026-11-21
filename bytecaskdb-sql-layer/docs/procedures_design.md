@@ -175,6 +175,14 @@ from zero, as PostgreSQL's assignment cast to `NUMERIC(p, s)` does
 (New-Order's line amount).
 Anything else is refused (42601, as the binder refuses a form not built
 yet; 0A000 for an assignment or `INTO`).
+The time (`CURRENT_DATE`, `CURRENT_TIMESTAMP`, `now()`, `LOCALTIME`,
+`LOCALTIMESTAMP`) is refused in a body: in an expression (42601) and in a
+statement (0A000), its `WHERE` included, where a client's statement
+compares a column with it (`frontend_design.md`, *The time*). A
+procedure's statements keep their constants, and nothing fills a clock
+slot among them on each call. `CREATE PROCEDURE` binds nothing, so it
+accepts such a body; the refusal comes at the first call, when the
+statement is bound (below), before the body runs.
 
 **When the body is checked.** `CREATE PROCEDURE` reads the body into the
 procedure IR, refusing a PL/pgSQL statement the layer does not run (0A000):
