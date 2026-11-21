@@ -192,8 +192,6 @@
 
 - name: TIMESTAMP rounds a seventh digit
   features: [F051-03]
-  # the layer refuses a seventh fractional digit (22007); PostgreSQL rounds to microseconds
-  unimplemented: true
   ordered: true
   setup:
     - CREATE TABLE dt (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)

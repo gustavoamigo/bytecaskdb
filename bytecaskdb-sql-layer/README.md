@@ -22,7 +22,7 @@ How much of each suite the layer passes, from the functional suite's conformance
 | Suite | Coverage | Tests | Checks |
 |---|---|---|---|
 | SQL:2016 Core (sqltest) | 70% | 523/743 tests | statement accepted |
-| PostgreSQL features | 90% | 293/327 cases | results |
+| PostgreSQL features | 90% | 294/327 cases | results |
 | ByteCaskDB features | 100% | 13/13 cases | results |
 | TPROC-C | 100% | 1/1 case: five transactions, then consistency conditions 1–9 | consistency conditions 1–9 |
 
@@ -59,7 +59,7 @@ Not built yet (each is refused, with a message):
 - `%`, a numeric quotient of columns, `REAL` and `DOUBLE PRECISION` arithmetic, unary minus of a column, an expression in `ORDER BY`, `GROUP BY`, `SET`, a `WHERE` or an aggregated select list, `CASE` over `REAL` or `DOUBLE PRECISION` beside other numbers, `GREATEST` and `LEAST`, the string functions but `||` and `SUBSTRING` of columns and parameters, `||` of a boolean, float or date, the pattern `SUBSTRING`, `EXTRACT`, `CAST` of anything but a constant or a parameter beside a column of the cast's type, a float cast to text, `CURRENT_TIME` and `CURRENT_TIMESTAMP` (WITH TIME ZONE types), the time outside the select list, date arithmetic; a numeric literal past 18 digits, and a constant compared with a column whose type does not hold it exactly (`smallint_col = 40000`);
 - a table of no columns, `ALTER TABLE … ADD CONSTRAINT` and `ADD COLUMN … CHECK`, a default that is not a constant (`DEFAULT CURRENT_DATE`), enforcing a foreign key, `ON DELETE CASCADE` and the other actions, `UNIQUE NULLS NOT DISTINCT` or `INCLUDE`, `CREATE TABLE IF NOT EXISTS` (refused with 42P07), `TRUNCATE`, an `UPDATE` of a primary-key column;
 - `SELECT` without `FROM` but of constants, a constant beside an aggregate, `EXPLAIN`, `SAVEPOINT`, sequences, serializable isolation (`SERIALIZABLE` is refused; the other levels are accepted and run at snapshot isolation), transactional DDL;
-- a comparison of two columns, comparison of a `DOUBLE PRECISION` column, `SUM`, `AVG`, `MIN` and `MAX` of a `REAL` column, an aggregate of an expression, `HAVING` on an aggregate of a `DOUBLE PRECISION` column, a timestamp with a seventh fractional digit (PostgreSQL rounds it).
+- a comparison of two columns, comparison of a `DOUBLE PRECISION` column, `SUM`, `AVG`, `MIN` and `MAX` of a `REAL` column, an aggregate of an expression, `HAVING` on an aggregate of a `DOUBLE PRECISION` column.
 
 The functional suite (`tests/functional/`) marks what a case needs but the layer lacks, so its report shows the distance to PostgreSQL; the list above is the same gap seen from the dialect.
 

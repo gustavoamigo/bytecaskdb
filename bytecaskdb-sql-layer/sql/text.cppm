@@ -232,9 +232,12 @@ auto finish_date(Cursor& c, std::int64_t year, int month_day) -> std::int64_t {
   return days_from_civil(y, month, day);
 }
 
-// HH:MM[:SS[.f…f]], up to six fraction digits, as microseconds; 24:00:00
-// only where `allow_24`.
-auto read_time(Cursor& c, bool allow_24) -> std::int64_t {
+// HH:MM[:SS[.f…f]] as microseconds, as PostgreSQL reads it: the fraction
+// of any number of digits (none too) rounded to the microsecond as
+// PostgreSQL's rint(strtod(".f…f") * 10^6) does, so to even, carrying into
+// the seconds; second 60 (a leap second) as the next minute's first; at most
+// 24:00:00 in all, which a timestamp reads as the next day's midnight.
+auto read_time(Cursor& c) -> std::int64_t {
   auto h = c.digits(1, 2);
   c.expect(':');
   auto m = c.digits(2, 2);
@@ -245,17 +248,18 @@ auto read_time(Cursor& c, bool allow_24) -> std::int64_t {
     sec = c.digits(2, 2);
     if (c.peek() == '.') {
       c.expect('.');
-      auto before = c.s.size();
-      frac = c.digits(1, 6);
-      auto n = before - c.s.size();
-      for (auto i = n; i < 6; ++i) frac *= 10;
-      if (std::isdigit(static_cast<unsigned char>(c.peek())) != 0) c.fail();  // more than six digits
+      std::string fraction = "0.";
+      while (std::isdigit(static_cast<unsigned char>(c.peek())) != 0) {
+        fraction.push_back(c.peek());
+        c.s.remove_prefix(1);
+      }
+      double f = 0;
+      (void)std::from_chars(fraction.data(), fraction.data() + fraction.size(), f);  // "0." alone reads as 0
+      frac = static_cast<std::int64_t>(std::rint(f * kMicrosPerSecond));
     }
   }
   auto total = ((h * 60 + m) * 60 + sec) * kMicrosPerSecond + frac;
-  if (m > 59 || sec > 59 || (h > 23 && !(allow_24 && h == 24 && total == 24 * 3600 * kMicrosPerSecond))) {
-    field_out_of_range(c.whole);
-  }
+  if (h > 24 || m > 59 || sec > 60 || total > 24 * 3600 * kMicrosPerSecond) field_out_of_range(c.whole);
   return total;
 }
 
@@ -300,7 +304,7 @@ auto timestamp_read(std::string_view text, bool tz) -> std::int64_t {
       // the date's era, no time
     } else {
       c.s.remove_prefix(1);
-      micros = read_time(c, false);
+      micros = read_time(c);
       if (tz) offset = read_offset(c).value_or(0);
     }
   }
@@ -320,7 +324,7 @@ auto date_from(std::string_view text) -> std::int64_t {
 
 auto time_from(std::string_view text) -> std::int64_t {
   Cursor c{trim(text), text, "time without time zone"};
-  auto t = read_time(c, true);
+  auto t = read_time(c);
   if (!c.at_end()) c.fail();
   return t;
 }
