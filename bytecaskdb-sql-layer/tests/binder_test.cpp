@@ -393,8 +393,27 @@ TEST_CASE("binder: comparisons of constants fold to a BOOLEAN; a string literal 
   CHECK(state("SELECT CAST('12345.678' AS NUMERIC(6,2))") == "22003");
   CHECK(state("SELECT CAST('x' AS INTEGER)") == "22P02");
   CHECK(state("SELECT DATE '2016-02-30'") == "22008");
-  CHECK(rejected(cat, "SELECT CAST(1 AS TEXT)").first ==
-        "a cast of other than a string literal, NULL, date, time or timestamp is not supported yet");
+  // A typed constant cast as PostgreSQL's cast functions cast it: numbers
+  // rounded (a numeric half away from zero, a float to the nearest even) and
+  // range checked, a BOOLEAN to an INTEGER and back, anything to TEXT; a pair
+  // with no cast is 42846, its NULL too.
+  CHECK(out("SELECT CAST(1 AS TEXT)") == std::tuple{std::string{"text"}, SqlType{SqlKind::Text}, Datum{sql_test::bytes("1")}});
+  CHECK(out("SELECT CAST(-2.5 AS INTEGER)") == std::tuple{std::string{"int4"}, SqlType{SqlKind::Integer}, Datum{std::int64_t{-3}}});
+  CHECK(out("SELECT CAST(CAST('2.5' AS DOUBLE PRECISION) AS BIGINT)") ==
+        std::tuple{std::string{"int8"}, SqlType{SqlKind::BigInt}, Datum{std::int64_t{2}}});
+  CHECK(out("SELECT CAST(7 AS NUMERIC(5,2))") ==
+        std::tuple{std::string{"numeric"}, SqlType{SqlKind::Decimal, 0, 5, 2}, Datum{std::int64_t{700}}});
+  CHECK(out("SELECT CAST(TRUE AS INTEGER)") == std::tuple{std::string{"int4"}, SqlType{SqlKind::Integer}, Datum{std::int64_t{1}}});
+  CHECK(out("SELECT CAST(0 AS BOOLEAN)") == std::tuple{std::string{"bool"}, SqlType{SqlKind::Boolean}, Datum{false}});
+  CHECK(state("SELECT CAST(40000 AS SMALLINT)") == "22003");
+  CHECK(state("SELECT CAST(CAST(32767 AS SMALLINT) + CAST(1 AS SMALLINT) AS INTEGER)") == "22003");
+  CHECK(state("SELECT CAST(CAST('9.3e18' AS DOUBLE PRECISION) AS BIGINT)") == "22003");
+  CHECK(state("SELECT CAST(99.99 AS NUMERIC(3,1))") == "22003");
+  CHECK(state("SELECT CAST(1 AS DATE)") == "42846");
+  CHECK(state("SELECT CAST(CAST(NULL AS INTEGER) AS DATE)") == "42846");
+  CHECK(state("SELECT CAST(CAST(5 AS BIGINT) AS BOOLEAN)") == "42846");
+  CHECK(rejected(cat, "SELECT CAST(CAST('1.5' AS DOUBLE PRECISION) AS TEXT)").first ==
+        "a cast of a floating-point value to text is not supported yet");
   // A date, time or timestamp cast to another type.
   auto text = [&](std::string_view sql) { return std::get<Bytes>(std::get<2>(out(sql))); };
   CHECK(text("SELECT CAST(CAST('2016-03-26' AS DATE) AS VARCHAR)") == sql_test::bytes("2016-03-26"));

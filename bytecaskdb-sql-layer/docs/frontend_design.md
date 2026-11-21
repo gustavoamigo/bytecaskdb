@@ -514,8 +514,8 @@ That includes:
   parameters, `||` of a boolean, float or date value, `LENGTH`, `CONCAT`,
   `REPLACE`, the regular-expression `SUBSTRING`, `bytea` string functions
   (#671);
-- a cast of anything but a string literal or `NULL`, a numeric literal of
-  more than 18 digits, a string literal in arithmetic, unary `-` of
+- a cast of anything but a constant (a parameter beside a column of the
+  cast's type excepted), a numeric literal of more than 18 digits, a string literal in arithmetic, unary `-` of
   anything but a constant, and a constant beside an aggregate.
 
 The list and its order of work are #534.
@@ -552,16 +552,31 @@ recompile after a DDL folds them again, to the types they meet then.
 - A cast of a string literal or `NULL`: `DATE '…'`, `'…'::date` and
   `CAST('…' AS date)` alike read the string with the type's input function,
   a `DECIMAL(p, s)` rounded to its scale and range-checked (22003), and are
-  of that type. A cast of anything else, and to `VARCHAR(n)` or `CHAR(n)`,
-  which PostgreSQL's cast truncates, are not taken yet.
+  of that type. A cast to `VARCHAR(n)` or `CHAR(n)`, which PostgreSQL's cast
+  truncates or pads, is not taken yet.
+- A cast of any other typed constant follows PostgreSQL's cast table
+  (`pg_cast`), and its I/O casts to and from a string:
+  - a number to any number type: an integer to a narrower integer range
+    checked (22003); a numeric to an integer rounded half away from zero, a
+    float to the nearest even (`rint`), NaN and infinity 22003; to a
+    `DECIMAL(p, s)` through its text, rounded to the scale (a float at 15
+    digits, 6 for `real`, as `float8_numeric` reads it); a float to `real`
+    22003 past its range;
+  - `boolean` to `integer` (1 or 0) and `integer` to `boolean` (non-zero is
+    true), and no other integer type either way;
+  - any type to `text` by its output function (`true`, not `t`); a float is
+    not taken yet, since the layer's float text is not PostgreSQL's;
+  - a typed string to any type by that type's input function;
+  - every other pair is 42846, a NULL of it too (`NULL::integer::date`).
+- Integer arithmetic of constants is checked against its result type's
+  range: `smallint + smallint` is a `smallint` and 22003 past 32767.
 - A cast of a date, time, timestamp or timestamptz constant: to text its
   text; to its own type itself; a timestamp or timestamptz to a date (the
   floor in UTC, so 1969-12-31 23:00 is 1969-12-31) or a time; a date to a
   timestamp or timestamptz (22008 if the instant passes 64 bits); a
   timestamp to a timestamptz and back (the same microseconds, the session
   being UTC). A time to a date, timestamp or timestamptz, and a date to a
-  time, are 42846, as in PostgreSQL. Other typed constants cast to text are not taken
-  yet.
+  time, are 42846, as in PostgreSQL.
 - A select-list constant is named `?column?`, a cast by its type's name
   (`date`, `int4`, `numeric`), as PostgreSQL names them.
 
@@ -699,6 +714,10 @@ are the runtime's, filled by `bc_row_begin` (`catalog_design.md`).
 - compared with a column, or combined with one in arithmetic: the column's
   type;
 - assigned to a column: the column's type;
+- cast, `$n::T` or `CAST($n AS T)`, and compared with a column of type `T`:
+  `T`, which is the column's, so the cast changes nothing and the parameter
+  binds as if bare. A cast to another type, or to `DECIMAL`, `VARCHAR(n)` or
+  `CHAR(n)`, whose casts round, cut or pad, is not taken yet;
 - combined only with an integer literal (`$3 - 20`, where `$3` has no
   other use): `integer`;
 - otherwise: "could not determine data type of parameter $n" (42P18).

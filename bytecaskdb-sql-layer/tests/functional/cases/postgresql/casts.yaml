@@ -2,7 +2,6 @@
 
 - name: text to integer and back
   features: [pg:cast-operator]
-  unimplemented: true
   steps:
     - sql: SELECT '42'::integer
       expected: [[42]]
@@ -13,7 +12,6 @@
 
 - name: a cast that overflows its type
   features: [pg:cast-operator, E011-01]
-  unimplemented: true
   steps:
     - sql: SELECT 40000::smallint
       error: "22003"
@@ -32,7 +30,6 @@
 
 - name: numeric rounds to its scale
   features: [pg:cast-operator, E011-03]
-  unimplemented: true
   steps:
     - sql: SELECT 1.005::numeric(4,2)
       expected: [["1.01"]]
@@ -40,3 +37,77 @@
       expected: [[3]]
     - sql: SELECT 99.99::numeric(3,1)
       error: "22003"
+
+- name: a number cast to an integer rounds as PostgreSQL's cast functions do
+  features: [pg:cast-operator, E011-01]
+  steps:
+    # A numeric rounds half away from zero; a float to the nearest even.
+    - sql: SELECT 2.5::integer, (-2.5)::integer, 2.4::smallint, 7.5::bigint
+      expected: [[3, -3, 2, 8]]
+    - sql: SELECT '2.5'::float8::integer, '3.5'::float8::integer, '-0.5'::real::integer
+      expected: [[2, 4, 0]]
+    - sql: SELECT 32767.5::smallint
+      error: "22003"
+    - sql: SELECT '9.3e18'::float8::bigint
+      error: "22003"
+    - sql: SELECT 3::numeric(5,2), 7::real, 1.25::double precision, '1.5'::float8::numeric(5,2)
+      expected: [["3.00", 7, "1.25", "1.50"]]
+
+- name: a boolean casts to an integer and back, and to text
+  features: [pg:cast-operator]
+  steps:
+    - sql: SELECT true::integer, false::integer, 0::boolean, 5::boolean, true::text
+      expected: [[1, 0, f, t, "true"]]
+    - sql: SELECT 5::bigint::boolean
+      error: "42846"
+    - sql: SELECT true::smallint
+      error: "42846"
+
+- name: a cast between types PostgreSQL has no cast for is refused
+  features: [pg:cast-operator]
+  steps:
+    - sql: SELECT 1::date
+      error: "42846"
+    - sql: SELECT NULL::integer::date
+      error: "42846"
+    - sql: SELECT DATE '2026-01-01'::integer
+      error: "42846"
+    - sql: SELECT '\x01'::bytea::integer
+      error: "42846"
+
+- name: a typed string casts by the target's input function
+  features: [pg:cast-operator]
+  steps:
+    - sql: SELECT '12'::text::integer, 'x'::text::bytea, 1.50::text
+      expected: [[12, \x78, "1.50"]]
+    - sql: SELECT 'abc'::text::integer
+      error: "22P02"
+
+- name: smallint arithmetic overflows a smallint
+  features: [pg:cast-operator, E011-01]
+  steps:
+    - sql: SELECT 32767::smallint + 1::smallint
+      error: "22003"
+    - sql: SELECT 200::smallint * 200::smallint
+      error: "22003"
+    - sql: SELECT 32767::smallint + 1
+      expected: [[32768]]
+
+- name: a parameter cast to its column's type is compared as that type
+  features: [pg:cast-operator, pg:parameters]
+  setup:
+    - CREATE TABLE pc (id INTEGER PRIMARY KEY, d DATE, n INTEGER)
+    - INSERT INTO pc VALUES (1, '2026-10-25', 5)
+    - INSERT INTO pc VALUES (2, '2026-10-26', 6)
+  steps:
+    - sql: SELECT id FROM pc WHERE $1::date = d
+      params: ['2026-10-26']
+      expected: [[2]]
+    - sql: SELECT id FROM pc WHERE n = CAST($1 AS INTEGER)
+      params: ['5']
+      expected: [[1]]
+    - sql: SELECT id FROM pc WHERE d = $1::date
+      params: ['x']
+      error: "22007"
+  teardown:
+    - DROP TABLE pc

@@ -179,7 +179,6 @@
 
 - name: integer overflow in arithmetic
   features: [E011-01, E011-04]
-  unimplemented: true
   steps:
     - sql: SELECT 2147483647 + 1
       error: "22003"

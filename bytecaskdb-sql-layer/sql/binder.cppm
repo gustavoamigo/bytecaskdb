@@ -679,7 +679,7 @@ auto arithmetic(const Constant& x, const Constant& y, Arith op, std::int32_t pos
   }();
   if (is_null(x) || is_null(y)) return {std::monostate{}, type, false, {}, pos};
   auto overflow_error = [&] {
-    return SqlError{type.kind == SqlKind::Integer ? "integer out of range" : "bigint out of range", pos, kNumericValueOutOfRange};
+    return SqlError{pg_type_name(type) + " out of range", pos, kNumericValueOutOfRange};
   };
   std::int64_t out = 0;
   if (is_integer(type)) {
@@ -695,7 +695,7 @@ auto arithmetic(const Constant& x, const Constant& y, Arith op, std::int32_t pos
         if (!overflow) out = a / b;
         break;
     }
-    if (overflow || (type.kind == SqlKind::Integer && !std::in_range<std::int32_t>(out))) throw overflow_error();
+    if (overflow || out_of_range(type, out)) throw overflow_error();
     return {out, type, false, {}, pos};
   }
   if (op == Arith::Div) {
@@ -932,18 +932,88 @@ auto cast_temporal(const Constant& arg, SqlType t, std::int32_t pos) -> Constant
   throw SqlError{"cannot cast type " + pg_type_name(arg.type) + " to " + pg_type_name(t), pos, kCannotCoerce};
 }
 
-// type 'text', '…'::type and CAST('…' AS type): a string literal read as
-// the type, as its input function reads it, a DECIMAL rounded to its scale;
-// NULL of the type. A date, time or timestamp is cast by cast_temporal. A
-// cast of anything else, and to VARCHAR(n), which PostgreSQL's cast
-// truncates, are not taken yet.
+// A number cast to an integer type, as PostgreSQL's cast functions do it: a
+// numeric rounded half away from zero, a float to the nearest even (rint);
+// out of the type's range, or a float that is NaN or infinite, is 22003.
+auto integer_of(const Constant& arg, SqlType t, std::int32_t pos) -> std::int64_t {
+  auto out_of_range_error = [&] {
+    return SqlError{pg_type_name(t) + " out of range", pos, kNumericValueOutOfRange};
+  };
+  std::int64_t v = 0;
+  if (is_integer(arg.type)) {
+    v = std::get<std::int64_t>(arg.value);
+  } else if (arg.type.kind == SqlKind::Decimal) {
+    auto scaled = std::get<std::int64_t>(arg.value);
+    auto unit = kPowersOfTen[arg.type.scale];
+    auto whole = scaled / unit;
+    auto rest = scaled % unit;
+    if (rest != 0 && 2 * (rest < 0 ? -rest : rest) >= unit) whole += scaled < 0 ? -1 : 1;
+    v = whole;
+  } else {
+    auto d = std::rint(std::get<double>(arg.value));
+    // 2^63 is the first double past int64_t; -2^63 is in range.
+    if (!std::isfinite(d) || d >= 9223372036854775808.0 || d < -9223372036854775808.0) throw out_of_range_error();
+    v = static_cast<std::int64_t>(d);
+  }
+  if (out_of_range(t, v)) throw out_of_range_error();
+  return v;
+}
+
+// A typed constant cast to t, as PostgreSQL casts it: a number to any number
+// type by pg_cast's functions; a BOOLEAN to an INTEGER and back; any type to
+// TEXT by its output function (a float, whose text differs, is not taken
+// yet); a string to any type by that type's input function. Every other pair
+// has no cast (42846), a NULL of it included.
+auto cast_typed(const Constant& arg, SqlType t, std::int32_t pos) -> Constant {
+  using K = SqlKind;
+  auto from = type_class(arg.type.kind);
+  auto to = type_class(t.kind);
+  auto exists = from == TypeClass::String || to == TypeClass::String || arg.type.kind == t.kind ||
+                (from == TypeClass::Number && to == TypeClass::Number) ||
+                (arg.type.kind == K::Boolean && t.kind == K::Integer) || (arg.type.kind == K::Integer && t.kind == K::Boolean);
+  if (!exists) throw SqlError{"cannot cast type " + pg_type_name(arg.type) + " to " + pg_type_name(t), pos, kCannotCoerce};
+  if (to == TypeClass::String && is_float(arg.type)) not_yet("a cast of a floating-point value to text", pos);
+  auto result = [&](Datum v) -> Constant { return {std::move(v), t, false, {}, pos}; };
+  if (std::holds_alternative<std::monostate>(arg.value)) return result(std::monostate{});
+  if (to == TypeClass::String) return result(bytes_of(text_of(arg)));
+  if (from == TypeClass::String) {
+    const auto& b = std::get<Bytes>(arg.value);
+    Constant text{std::monostate{}, SqlType{K::Text}, true, std::string(b.size(), '\0'), pos};
+    std::ranges::transform(b, text.text.begin(), [](std::byte x) { return static_cast<char>(x); });
+    return result(read_as(text, t, true));
+  }
+  if (arg.type.kind == K::Boolean && t.kind == K::Integer) return result(std::int64_t{std::get<bool>(arg.value) ? 1 : 0});
+  if (arg.type.kind == K::Integer && t.kind == K::Boolean) return result(std::get<std::int64_t>(arg.value) != 0);
+  if (from != TypeClass::Number) return result(arg.value);  // a BOOLEAN or a BYTEA to its own type
+  if (is_integer(t)) return result(integer_of(arg, t, pos));
+  if (is_float(t)) {
+    auto d = is_float(arg.type) ? std::get<double>(arg.value) : std::stod(text_of(arg));
+    if (t.kind == K::Real && std::isfinite(d) && (std::fabs(d) > std::numeric_limits<float>::max() ||
+                                                  (d != 0 && std::fabs(d) < std::numeric_limits<float>::denorm_min()))) {
+      throw SqlError{std::string{"value out of range: "} + (std::fabs(d) > 1 ? "overflow" : "underflow"), pos,
+                     kNumericValueOutOfRange};
+    }
+    return result(t.kind == K::Real ? static_cast<double>(static_cast<float>(d)) : d);
+  }
+  // To a DECIMAL: through its text, as the input function reads it, rounded
+  // to the scale; a float at its type's digits, as float8_numeric does.
+  if (is_float(arg.type) && !std::isfinite(std::get<double>(arg.value))) not_yet("NaN or Infinity as a numeric", pos);
+  Constant text{std::monostate{}, SqlType{K::Text}, true, text_of(arg), pos};
+  return result(read_as(text, t, true));
+}
+
+// type 'text', '…'::type and CAST(… AS type): a string literal read as the
+// type, as its input function reads it, a DECIMAL rounded to its scale;
+// NULL of the type; a typed constant cast by cast_typed, or by cast_temporal
+// for a date, time or timestamp. A cast to VARCHAR(n) or CHAR(n), which
+// PostgreSQL's cast truncates or pads, is not taken yet.
 auto cast_constant(const ast::Expr& e, const Constant& arg) -> Constant {
   auto t = sql_type(ast::ColumnDefAst{"", e.cast_type, e.cast_typmods, false, false, std::nullopt, e.pos, {}});
   if (t.kind == SqlKind::Varchar) not_yet("a cast to VARCHAR(n)", e.pos);
   if (t.kind == SqlKind::Char) not_yet("a cast to CHAR(n)", e.pos);
   auto temporal = !arg.unknown && type_class(arg.type.kind) == TypeClass::Temporal;
   if (temporal) return cast_temporal(arg, t, e.pos);
-  if (!arg.unknown) not_yet("a cast of other than a string literal, NULL, date, time or timestamp", e.pos);
+  if (!arg.unknown) return cast_typed(arg, t, e.pos);
   if (std::holds_alternative<std::monostate>(arg.value)) return {std::monostate{}, t, false, {}, e.pos};
   return {read_as(arg, t, true), t, false, {}, e.pos};
 }
@@ -3000,6 +3070,22 @@ public:
     return (e.kind == K::Add || e.kind == K::Sub) && e.lhs->kind == K::Param && e.rhs->kind == K::Const;
   }
 
+  static auto param_cast(const ast::Expr& e) -> bool {
+    return e.kind == ast::Expr::Kind::Cast && e.rhs->kind == ast::Expr::Kind::Param;
+  }
+
+  // CAST($n AS T) beside a column of type T is $n: PostgreSQL types an
+  // untyped $n by its cast, and a cast of a value to its own type changes
+  // nothing. A cast to another type is not taken yet, nor one to DECIMAL,
+  // VARCHAR(n) or CHAR(n), whose casts round, cut or pad to the modifier.
+  static auto uncast_param(const ast::Expr* e, const Column& c) -> const ast::Expr* {
+    if (!param_cast(*e)) return e;
+    auto t = sql_type(ast::ColumnDefAst{"", e->cast_type, e->cast_typmods, false, false, std::nullopt, e->pos, {}});
+    auto modified = t.kind == SqlKind::Decimal || t.kind == SqlKind::Varchar || t.kind == SqlKind::Char;
+    if (t.kind != c.sql.kind || modified) not_yet("a cast of a parameter to other than its column's type", e->pos);
+    return e->rhs.get();
+  }
+
   // One WHERE conjunct as column <op> operand, the column resolved by
   // `resolve`. In $n ± k, $n and the sum are INTEGERs, as PostgreSQL types
   // an unknown $n beside an integer literal; the column compared with them
@@ -3008,11 +3094,12 @@ public:
     const auto* col = &w.lhs;
     const auto* rhs = &w.rhs;
     auto op = w.op;
-    if ((operand(*col) || is_constant(*col) || col->kind == ast::Expr::Kind::Subquery) &&
+    if ((operand(*col) || param_cast(*col) || is_constant(*col) || col->kind == ast::Expr::Kind::Subquery) &&
         rhs->kind == ast::Expr::Kind::Column) {
       std::swap(col, rhs);
       op = mirrored(op);
     }
+    if (col->kind == ast::Expr::Kind::Column && param_cast(*rhs)) rhs = uncast_param(rhs, *resolve(*col).second);
     // A column of one relation against a column of another, inside AND, OR or
     // NOT: <> is NOT =. Two columns of one relation are not taken yet.
     if (col->kind == ast::Expr::Kind::Column && rhs->kind == ast::Expr::Kind::Column) {

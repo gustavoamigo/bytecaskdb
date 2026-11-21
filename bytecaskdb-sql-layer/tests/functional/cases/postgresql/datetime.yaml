@@ -107,8 +107,6 @@
 
 - name: CAST of a string to a DATE
   features: [F051-05]
-  # expression not supported
-  unimplemented: true
   setup:
     - CREATE TABLE dt (id INTEGER PRIMARY KEY, d DATE, ts TIMESTAMP)
   steps:
