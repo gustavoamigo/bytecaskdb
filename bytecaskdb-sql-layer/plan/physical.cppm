@@ -635,9 +635,12 @@ private:
       case Expr::Kind::Sub:
       case Expr::Kind::Mul:
       case Expr::Kind::Div:
-      case Expr::Kind::Compare: operands(2, 2); break;
+      case Expr::Kind::Compare:
+      case Expr::Kind::Mod: operands(2, 2); break;
       case Expr::Kind::IsNull:
-      case Expr::Kind::Not: operands(1, 1); break;
+      case Expr::Kind::Not:
+      case Expr::Kind::Neg:
+      case Expr::Kind::Abs: operands(1, 1); break;
       case Expr::Kind::And:
       case Expr::Kind::Or: operands(2, e.args.size()); break;
       case Expr::Kind::Coalesce: operands(2, e.args.size()); break;
@@ -758,6 +761,9 @@ private:
       case Expr::Kind::Coalesce:
       case Expr::Kind::Concat:
       case Expr::Kind::Substr:
+      case Expr::Kind::Mod:
+      case Expr::Kind::Neg:
+      case Expr::Kind::Abs:
       case Expr::Kind::Random: break;
     }
     broken("a predicate of an expression codegen does not print");

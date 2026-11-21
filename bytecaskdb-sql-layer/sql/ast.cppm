@@ -102,7 +102,7 @@ struct Expr {
   // and `rhs` its ELSE, each none where absent. Coalesce: its arguments.
   // NullIf: `lhs` and `rhs`.
   std::vector<Expr> args;
-  // Func: a string function or ||, `func` its name as PostgreSQL resolves it
+  // Func: a string function, abs, % or ||, `func` its name as PostgreSQL resolves it
   // (btrim for TRIM(BOTH …), position(string, substring) for POSITION(sub IN
   // string)), its operands in `args`.
   std::string func;

@@ -423,6 +423,15 @@ TEST_CASE("binder: comparisons of constants fold to a BOOLEAN; a string literal 
   CHECK(state("SELECT CAST(1 AS DATE)") == "42846");
   CHECK(state("SELECT CAST(CAST(NULL AS INTEGER) AS DATE)") == "42846");
   CHECK(state("SELECT CAST(CAST(5 AS BIGINT) AS BOOLEAN)") == "42846");
+  // %, unary minus and abs of constants: of the operand's type, its range checked.
+  CHECK(out("SELECT -7 % 3") == std::tuple{std::string{"?column?"}, SqlType{SqlKind::Integer}, Datum{std::int64_t{-1}}});
+  CHECK(out("SELECT -7.25 % 2.1") == std::tuple{std::string{"?column?"}, SqlType{SqlKind::Decimal, 0, 0, 2}, Datum{std::int64_t{-95}}});
+  CHECK(out("SELECT abs(CAST(-5 AS SMALLINT))") == std::tuple{std::string{"abs"}, SqlType{SqlKind::SmallInt}, Datum{std::int64_t{5}}});
+  CHECK(state("SELECT 1 % 0") == "22012");
+  CHECK(state("SELECT -CAST(-32768 AS SMALLINT)") == "22003");
+  CHECK(state("SELECT abs(CAST(-2147483648 AS INTEGER))") == "22003");
+  CHECK(state("SELECT abs(TRUE)") == "42883");
+  CHECK(state("SELECT CAST(1.5 AS DOUBLE PRECISION) % 2") == "42883");
   CHECK(rejected(cat, "SELECT CAST(CAST('1.5' AS DOUBLE PRECISION) AS TEXT)").first ==
         "a cast of a floating-point value to text is not supported yet");
   // A date, time or timestamp cast to another type.

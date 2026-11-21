@@ -139,8 +139,20 @@ kind the transformer doesn't take is refused with its position.
   A numeric quotient has PostgreSQL's scale (`select_div_scale`: at least
   16 significant digits, so `5.0 / 2` is `2.5000000000000000`), rounded half
   away from zero; one whose scale or value passes 18 digits (`1.0 / 3` is
-  twenty places) is refused (42601). `%` is refused. Of columns, they are
-  *Expressions over columns*, below.
+  twenty places) is refused (42601). Of columns, they are *Expressions over
+  columns*, below.
+- **`%`, unary `-` and `abs`** follow PostgreSQL's int and numeric
+  operators, of constants and of columns alike.
+  - `%` is the remainder of the quotient truncated toward zero, of the
+    dividend's sign: integers of the wider type, numerics at the finer scale.
+    A zero divisor is 22012, `INT64_MIN % -1` is 0, and a float has no `%`
+    (42883).
+  - Unary `-` and `abs` keep the operand's type: an integer type's least value
+    is 22003 ("smallint out of range"), a float's is IEEE, and `abs(-0.0)` is
+    0. `abs` of an unknown literal is a `double precision`, as PostgreSQL
+    resolves it.
+  - Of a parameter, both are refused, since PostgreSQL finds them ambiguous.
+  - `%` is named `?column?` in a select list, `abs` `abs`.
 - **`+`, `-`, `*`, `/`, comparisons, `IS [NOT] NULL`, `AND`, `OR` and
   `NOT` of columns** are values in a select list (*Expressions over
   columns*, below).
@@ -519,7 +531,7 @@ That includes:
 - `CASE` or `COALESCE` of a float beside another number, a `BETWEEN` or
   `IN` as a value, `GREATEST` and `LEAST`, `CASE` outside the plain select
   list (#685);
-- the quotient of a numeric other than constants, `%`, arithmetic and
+- the quotient of a numeric other than constants, arithmetic and
   comparison of `REAL` and `DOUBLE PRECISION` as values, an expression in
   `ORDER BY`, `GROUP BY`, `SET` or an aggregated select list (#685, #686);
 - the string functions but `||` and `SUBSTRING` of columns and
@@ -527,8 +539,8 @@ That includes:
   `REPLACE`, the regular-expression `SUBSTRING`, `bytea` string functions
   (#671);
 - a cast of anything but a constant (a parameter beside a column of the
-  cast's type excepted), a numeric literal of more than 18 digits, a string literal in arithmetic, unary `-` of
-  anything but a constant, and a constant beside an aggregate.
+  cast's type excepted), a numeric literal of more than 18 digits, a string literal in arithmetic, unary `-` or `abs`
+  of a parameter, and a constant beside an aggregate.
 
 The list and its order of work are #534.
 
@@ -710,7 +722,8 @@ until then.
   it: PostgreSQL's scale follows the operands' values (`select_div_scale`
   reads their leading digits), so one column's quotient has several scales
   and the layer's result type has one. `REAL` and `DOUBLE PRECISION`
-  arithmetic and comparison as a value. `%`, unary `-`, a cast, an
+  arithmetic and comparison as a value (unary `-` and `abs` of one are
+  taken). A cast, an
   aggregate inside an expression, an expression in the select list of an
   aggregated query or under `DISTINCT`, an expression in `ORDER BY`, `GROUP
   BY`, `SET` or a `WHERE`.

@@ -1371,12 +1371,61 @@ auto fold_concat(const Constant& a, const Constant& b, std::int32_t pos) -> Cons
 // A call of one of the string functions on constants. All arguments are
 // evaluated and typed first; a NULL argument then gives NULL (the functions
 // are strict).
+// x % y of constants, as PostgreSQL's int and numeric mod: the remainder of
+// the quotient truncated toward zero, of x's sign; integers of the wider
+// type, numerics at the finer scale. A zero divisor is 22012; a float has no
+// % (42883). An unknown literal takes the other side's type.
+auto fold_mod(Constant x, Constant y, std::int32_t pos) -> Constant {
+  if (x.unknown && !y.unknown) x = resolved(x, y.type);
+  if (y.unknown && !x.unknown) y = resolved(y, x.type);
+  if (x.unknown && y.unknown) not_yet("% of two string literals or NULLs", pos);
+  if (!is_number(x.type) || !is_number(y.type)) {
+    throw SqlError{"operator does not exist: " + pg_type_name(x.type) + " % " + pg_type_name(y.type), pos, kUndefinedFunction};
+  }
+  auto type = is_integer(x.type) && is_integer(y.type) ? wider_integer(x.type, y.type)
+                                                        : numeric_type(std::max(decimal_scale(x.type), decimal_scale(y.type)));
+  if (is_null(x) || is_null(y)) return {std::monostate{}, type, false, {}, pos};
+  auto a = rescale(scaled(x).v, static_cast<std::uint8_t>(decimal_scale(type) - scaled(x).scale));
+  auto b = rescale(scaled(y).v, static_cast<std::uint8_t>(decimal_scale(type) - scaled(y).scale));
+  if (!a || !b) not_yet("a numeric of more than 18 digits", pos);
+  if (*b == 0) throw SqlError{"division by zero", pos, kDivisionByZero};
+  return {*b == -1 ? std::int64_t{0} : *a % *b, type, false, {}, pos};
+}
+
+// abs(x) of a constant, as PostgreSQL's: of x's type, an integer's range
+// checked ("smallint out of range" for -32768); an unknown literal read as a
+// double precision, the type PostgreSQL resolves it to.
+auto fold_abs(Constant x, std::int32_t pos) -> Constant {
+  if (x.unknown) x = resolved(x, SqlType{SqlKind::Double});
+  if (!is_number(x.type) && !is_float(x.type)) {
+    throw SqlError{"function abs(" + pg_type_name(x.type) + ") does not exist", pos, kUndefinedFunction};
+  }
+  x.pos = pos;
+  if (is_null(x)) return x;
+  if (is_float(x.type)) {
+    auto d = std::get<double>(x.value);
+    x.value = d <= 0 ? 0.0 - d : d;  // -0.0 is 0, as fabs gives it
+    return x;
+  }
+  auto v = std::get<std::int64_t>(x.value);
+  if (v < 0 && (v == std::numeric_limits<std::int64_t>::min() || (is_integer(x.type) && out_of_range(x.type, -v)))) {
+    throw SqlError{pg_type_name(x.type) + " out of range", pos, kNumericValueOutOfRange};
+  }
+  x.value = v < 0 ? -v : v;
+  return x;
+}
+
 auto fold_function(const ast::Expr& e) -> Constant {
   std::vector<Constant> given;
   for (const auto& a : e.args) given.push_back(fold(a));
   // substr is substring's function-call form, its arguments in the same order.
   const std::string name = e.func == "substr" ? "substring" : e.func;
   if (name == "||") return fold_concat(given[0], given[1], e.pos);
+  if (name == "%") return fold_mod(given[0], given[1], e.pos);
+  if (name == "abs") {
+    if (given.size() != 1) no_function(name, given, e.pos);
+    return fold_abs(given[0], e.pos);
+  }
   auto arity = [&](std::size_t lo, std::size_t hi) {
     if (given.size() < lo || given.size() > hi) no_function(name, given, e.pos);
   };
@@ -1477,9 +1526,8 @@ auto fold(const ast::Expr& e) -> Constant {
       }
       if (e.kind == K::Plus || std::holds_alternative<std::monostate>(c.value)) return c;
       auto v = std::get<std::int64_t>(c.value);
-      if (v == std::numeric_limits<std::int64_t>::min() || (c.type.kind == SqlKind::Integer && !std::in_range<std::int32_t>(-v))) {
-        throw SqlError{c.type.kind == SqlKind::Integer ? "integer out of range" : "bigint out of range", e.pos,
-                       kNumericValueOutOfRange};
+      if (v == std::numeric_limits<std::int64_t>::min() || (is_integer(c.type) && out_of_range(c.type, -v))) {
+        throw SqlError{pg_type_name(c.type) + " out of range", e.pos, kNumericValueOutOfRange};
       }
       c.value = -v;
       c.pos = e.pos;
@@ -2062,7 +2110,7 @@ public:
         case ast::Expr::Kind::Case: return "case";
         case ast::Expr::Kind::Coalesce: return "coalesce";
         case ast::Expr::Kind::NullIf: return "nullif";
-        case ast::Expr::Kind::Func: return e.func == "||" ? "?column?" : e.func;
+        case ast::Expr::Kind::Func: return e.func == "||" || e.func == "%" ? "?column?" : e.func;  // an operator is unnamed
         case ast::Expr::Kind::Column:
         case ast::Expr::Kind::Param:
         case ast::Expr::Kind::Const:
@@ -2153,7 +2201,7 @@ public:
       case K::Aggregate: not_yet("an aggregate inside an expression", e.pos);
       case K::Star: throw SqlError{"syntax error at or near \"*\"", e.pos};
       case K::Plus:
-      case K::Neg: not_yet("unary + and - of other than a constant", e.pos);
+      case K::Neg: return sign_value(e, resolve);
       case K::Cast: not_yet("a cast of other than a constant", e.pos);
       case K::Case:
       case K::Coalesce:
@@ -2210,6 +2258,23 @@ public:
   // `||` takes text with text, or with an integer or DECIMAL through its
   // text, as PostgreSQL's anynonarray || text does; the other string
   // functions of non-constants are not built yet (#671).
+  // +x and -x of a number other than a constant: + is x; - of x's type, an
+  // integer's range checked when the plan runs. Of a parameter it is
+  // ambiguous in PostgreSQL, and not taken.
+  auto sign_value(const ast::Expr& e, const Resolve& resolve) -> logical::Expr {
+    auto plus = e.kind == ast::Expr::Kind::Plus;
+    if (e.rhs->kind == ast::Expr::Kind::Param) not_yet(std::string{"unary "} + (plus ? "+" : "-") + " of a parameter", e.pos);
+    auto v = value(*e.rhs, resolve);
+    if (!is_number(v.type) && !is_float(v.type)) {
+      throw SqlError{std::string{"operator does not exist: "} + (plus ? "+ " : "- ") + pg_type_name(v.type), e.pos,
+                     kUndefinedFunction};
+    }
+    if (plus) return v;
+    auto out = logical::expr(logical::Expr::Kind::Neg, v.type);
+    out.args.push_back(std::move(v));
+    return out;
+  }
+
   auto function_value(const ast::Expr& e, const Resolve& resolve) -> logical::Expr {
     auto texty = [](SqlType t) { return t.kind == SqlKind::Text || t.kind == SqlKind::Varchar || t.kind == SqlKind::Char; };
     auto exact = [](SqlType t) {
@@ -2223,6 +2288,27 @@ public:
       use_param(a.param, phys_type(as), a.pos, col, 0, Use::Operand);
       return logical::param(a.param, as);
     };
+    if (e.func == "%") {
+      auto [a, b] = operands(e.args[0], e.args[1], resolve, Use::Operand);
+      if (!is_number(a.type) || !is_number(b.type)) {
+        throw SqlError{"operator does not exist: " + pg_type_name(a.type) + " % " + pg_type_name(b.type), e.pos, kUndefinedFunction};
+      }
+      auto type = is_integer(a.type) && is_integer(b.type) ? wider_integer(a.type, b.type)
+                                                            : numeric_type(std::max(decimal_scale(a.type), decimal_scale(b.type)));
+      rescalable(a, b, decimal_scale(type), e.pos);
+      return logical::binary(logical::Expr::Kind::Mod, std::move(a), std::move(b), type);
+    }
+    if (e.func == "abs") {
+      if (e.args.size() != 1) throw SqlError{"function abs takes one argument", e.pos, kUndefinedFunction};
+      if (e.args[0].kind == ast::Expr::Kind::Param) not_yet("abs of a parameter", e.pos);
+      auto v = value(e.args[0], resolve);
+      if (!is_number(v.type) && !is_float(v.type)) {
+        throw SqlError{"function abs(" + pg_type_name(v.type) + ") does not exist", e.pos, kUndefinedFunction};
+      }
+      auto out = logical::expr(logical::Expr::Kind::Abs, v.type);
+      out.args.push_back(std::move(v));
+      return out;
+    }
     if (e.func == "||") {
       auto a = arg(e.args[0], SqlType{SqlKind::Text});
       auto b = arg(e.args[1], SqlType{SqlKind::Text});
