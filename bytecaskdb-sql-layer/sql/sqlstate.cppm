@@ -62,6 +62,8 @@ inline constexpr SqlState kInvalidParameterValue{"22023"};
 inline constexpr SqlState kInvalidEscapeSequence{"22025"};
 inline constexpr SqlState kSubstringError{"22011"};
 inline constexpr SqlState kCannotCoerce{"42846"};
+inline constexpr SqlState kInvalidRowCountInLimit{"2201W"};
+inline constexpr SqlState kInvalidRowCountInOffset{"2201X"};
 
 // The constant above whose code is `code`, or nullopt.
 [[nodiscard]] constexpr auto known_sqlstate(std::string_view code) noexcept -> std::optional<SqlState> {
@@ -69,7 +71,8 @@ inline constexpr SqlState kCannotCoerce{"42846"};
                  kDatatypeMismatch, kUndefinedFunction, kUndefinedColumn, kUndefinedTable, kUndefinedObject,
                  kDuplicateColumn, kDuplicateTable, kDuplicateObject, kAmbiguousColumn, kDuplicateAlias, kIndeterminateDatatype, kWrongObjectType, kInvalidColumnReference, kInvalidForeignKey, kDependentObjectsStillExist, kUndefinedParameter, kDuplicateFunction, kInvalidFunctionDefinition, kNullValueNotAllowed, kNoDataFound, kTooManyRows,
                  kInvalidTextRepresentation, kStringDataRightTruncation, kInvalidDatetimeFormat,
-                 kDatetimeFieldOverflow, kCharacterNotInRepertoire, kInvalidParameterValue, kInvalidEscapeSequence, kSubstringError, kCannotCoerce}) {
+                 kDatetimeFieldOverflow, kCharacterNotInRepertoire, kInvalidParameterValue, kInvalidEscapeSequence, kSubstringError, kCannotCoerce,
+                 kInvalidRowCountInLimit, kInvalidRowCountInOffset}) {
     if (s.view() == code) return s;
   }
   return std::nullopt;

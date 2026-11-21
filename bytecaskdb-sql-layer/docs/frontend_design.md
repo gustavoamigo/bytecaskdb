@@ -273,13 +273,19 @@ on any columns, and of predicates over them.
 - Comparing two columns of different SQL types is refused (*Known
   differences*).
 
-**`ORDER BY` and `LIMIT`.**
+**`ORDER BY`, `LIMIT` and `OFFSET`.**
 - `ORDER BY` takes a list of columns, each `ASC` or `DESC`, and `NULLS
   FIRST` or `NULLS LAST`; without them NULLs sort as PostgreSQL's
   defaults put them, last under `ASC` and first under `DESC`. Ties come
   back in any order, as PostgreSQL allows. `CREATE INDEX` takes neither.
 - `LIMIT` takes an integer literal or a parameter. `LIMIT NULL` is no
   limit, and a negative limit is refused (2201W), as in PostgreSQL.
+- `OFFSET` takes an integer literal: that many rows are skipped before
+  `LIMIT` counts, after `ORDER BY`. `OFFSET NULL` is 0, a negative one is
+  2201X. A query of one row (an aggregate without `GROUP BY`, a `SELECT`
+  without `FROM`) gives none past `OFFSET 1`. It is taken in a query, a
+  subquery and a cursor's query; on a set operation, in one of its arms and
+  in a view it is refused (42601).
 
 **Aggregates**, with PostgreSQL's results:
 - `COUNT(*)` counts rows, `COUNT(col)` non-NULL values, `COUNT(DISTINCT
@@ -503,7 +509,8 @@ That includes:
   `NATURAL` after the first join, a join in parentheses or among commas,
   `FOR UPDATE` of a join (#697), an alias of a join, an output name in `GROUP BY` or in `ORDER BY` of
   other than a column;
-- `OFFSET`, `RETURNING`, multi-row `VALUES`;
+- `RETURNING`, multi-row `VALUES`; `OFFSET` on a set operation, in one of
+  its arms or in a view;
 - `CASE` or `COALESCE` of a float beside another number, a `BETWEEN` or
   `IN` as a value, `GREATEST` and `LEAST`, `CASE` outside the plain select
   list (#685);

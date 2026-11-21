@@ -604,7 +604,7 @@ private:
           using T = std::decay_t<decltype(op)>;
           if constexpr (std::is_same_v<T, physical::Emit> || std::is_same_v<T, physical::GroupEmit>) {
             const auto* l = std::get_if<physical::Limit>(&op.input->op);
-            return l != nullptr && l->n == 0;
+            return l != nullptr && l->n <= l->offset;
           } else if constexpr (std::is_same_v<T, physical::Aggregate> || std::is_same_v<T, physical::CountRange> ||
                                std::is_same_v<T, physical::KeyAggregates>) {
             return !op.emits;
@@ -1362,17 +1362,26 @@ private:
     });
   }
 
-  // Over a loop, a counter the loop's condition checks; over a single row,
-  // the row. LIMIT 0 prints nothing (limit_zero).
+  // Over a loop, a counter the loop's condition checks, the rows before the
+  // offset counted and not passed on; over a single row, the row, which an
+  // offset drops. LIMIT 0, or an OFFSET past the LIMIT, prints nothing
+  // (limit_zero).
   void produce(const physical::Limit& l, const Consume& k) {
     if (!loops(*l.input)) {
+      if (l.offset > 0) return;
       produce(*l.input, k);
       return;
     }
     w_.line("int64_t n = 0;");
     limit_ = (base_limit_.empty() ? "" : base_limit_ + " && ") + "n < " + std::to_string(l.n);
     produce(*l.input, [&] {
-      k();
+      if (l.offset > 0) {
+        w_.open("if (n >= " + std::to_string(l.offset) + ")");
+        k();
+        w_.close();
+      } else {
+        k();
+      }
       w_.line("++n;");
     });
   }
@@ -2382,7 +2391,7 @@ private:
   static auto empty_group(const physical::GroupEmit& e) -> std::vector<std::string> {
     const auto* n = e.input.get();
     if (const auto* l = std::get_if<physical::Limit>(&n->op)) {
-      if (l->n == 0) return {};
+      if (l->n == 0 || l->offset > 0) return {};  // the one row is not emitted, or is skipped
       n = l->input.get();
     }
     const auto* g = physical::group_below(*n);
@@ -2849,7 +2858,10 @@ auto resumable_plan(const physical::Plan& p) -> bool {
   const auto* emit = std::get_if<physical::Emit>(&p.root->op);
   if (emit == nullptr) return false;
   const auto* n = emit->input.get();
-  if (const auto* l = std::get_if<physical::Limit>(&n->op)) n = l->input.get();
+  if (const auto* l = std::get_if<physical::Limit>(&n->op)) {
+    if (l->offset > 0) return false;  // a resumed run would skip the offset's rows again
+    n = l->input.get();
+  }
   for (;;) {
     if (const auto* f = std::get_if<physical::Filter>(&n->op)) {
       n = f->input.get();
