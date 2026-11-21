@@ -242,6 +242,8 @@ name used wrongly. Each runs on the layer, the server and PostgreSQL, which
 must agree, and each plan the search costed returns PostgreSQL's rows.
 Beside it, `tests/functional/cases/postgresql/joins.yaml` holds the same
 forms with PostgreSQL's recorded results, and the sqltest ids of F041.
+Each join form the layer refuses yet is a case of its own there, marked
+`unimplemented`, so the PR that builds one clears its own mark.
 
 `test_tprocc.py` runs TPROC-C's five transactions through SQL against
 PostgreSQL: a small fixture (one warehouse, two
