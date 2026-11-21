@@ -1,5 +1,5 @@
 // UPDATE warehouse SET w_ytd = w_ytd + $1 WHERE w_id = $2
-// isolation: snapshot   schema: catalog v13
+// schema: catalog v13
 // objects: TBL_4 warehouse, COL_4_1 warehouse.w_ytd
 #include "bc_plan.h"
 enum { TBL_4 = 4, COL_4_1 = 1 };

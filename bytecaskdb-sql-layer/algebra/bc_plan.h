@@ -57,7 +57,16 @@ enum bc_error_code {
   BC_E_PATTERN,     /* bc_like reached a pattern's escape character at its end (SQLSTATE 22025) */
   BC_E_CARDINALITY, /* a BC_SUB_VALUE subquery emitted a second row, or bc_insert_or_existing
                        met a row this execution wrote (SQLSTATE 21000) */
+  BC_E_READ_ONLY,   /* a write, guard or DDL in a transaction begun read-only (SQLSTATE 25006) */
 };
+
+/* The isolation a transaction or an autocommit execution runs at
+   (docs/transaction_design.md, *Serializable isolation*). SNAPSHOT: its
+   reads are fixed by its snapshot and only its writes and guards are
+   checked at commit. SERIALIZABLE: the runtime records every key and range
+   its reads cover, and a commit that writes submits them as guards, so it
+   commits only if what it read is unchanged at its commit. */
+enum bc_isolation { BC_ISOLATION_SNAPSHOT = 0, BC_ISOLATION_SERIALIZABLE = 1 };
 
 /* What a subquery's rows are folded into, from bc_sub_begin to bc_sub_end:
    parameters from `param` on, which the caller passes as NULL, and for
@@ -167,6 +176,12 @@ uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: t
 int64_t bc_ctx_affected(const bc_ctx *);                   /* what the last run's bc_emit_count recorded, or -1 */
 int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params *,
                    bc_budget, bool sync, uint32_t max_retries);               /* the retry loop */
+/* The isolation of the context's autocommit executions, from its next
+   bc_ctx_run until set again; SNAPSHOT for a new context. An execution
+   whose plan writes no table records nothing at any level: it commits
+   nothing, and is serialized at its snapshot. A context begun on a
+   transaction runs at the transaction's level instead. */
+void    bc_ctx_set_isolation(bc_ctx *, enum bc_isolation);
 
 /* Transactions (docs/transaction_design.md). Internal: the embedded API's
    Transaction is their only caller, and plans never call them. A
@@ -193,7 +208,17 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
    reports through the transaction (bc_txn_error, BC_E_UNKNOWN when the
    outcome is unknown). */
 typedef struct bc_txn bc_txn;
-bc_txn *bc_txn_new(bc_db *db, const bc_catalog *cat, uint64_t max_bytes);
+/* `read_only`: every write, guard and DDL of its statements is BC_E_READ_ONLY,
+   and at SERIALIZABLE it records nothing, since it can submit nothing. */
+bc_txn *bc_txn_new(bc_db *db, const bc_catalog *cat, uint64_t max_bytes, enum bc_isolation isolation,
+                   bool read_only);
+/* Changes the level and the read-only flag before the transaction's first
+   statement, cursor pin and savepoint, and before it has read anything:
+   false, and nothing changed, after them. */
+bool    bc_txn_set_mode(bc_txn *, enum bc_isolation isolation, bool read_only);
+/* Whether the transaction has run or is running a statement, pinned a cursor
+   or read anything: PostgreSQL's "any query" for SET TRANSACTION. */
+bool    bc_txn_queried(const bc_txn *);
 void    bc_txn_free(bc_txn *);                                                /* a transaction not committed writes nothing */
 void    bc_ctx_begin_txn(bc_ctx *, bc_txn *, const bc_params *params, bc_budget budget);
 bool    bc_txn_add(bc_ctx *);                     /* ends the statement: its writes join, or the transaction aborts */
@@ -201,7 +226,8 @@ uint64_t bc_txn_catalog_version(const bc_txn *);  /* the catalog version pinned 
                                                      it and after an abort */
 bool    bc_txn_repin(bc_txn *);                   /* before any statement was added, with no context attached:
                                                      drops the pin, so the next statement pins the live catalog
-                                                     and a new snapshot; false, changing nothing, otherwise */
+                                                     and a new snapshot; false, changing nothing, otherwise,
+                                                     and while its read set holds a read */
 /* Cursors (docs/cursor_design.md, *What a cursor sees*). A pin is the
    transaction's overlay as of the call, shared copy-on-write: the statements
    added later write to a copy and the pin never changes. The call also pins
@@ -518,8 +544,8 @@ void bc_insert(bc_ctx *, uint32_t table, bc_view row);
    `arbiter` is taken, when nothing is written and it returns false. `arbiter` is the table (its
    primary key), one of its unique indexes, or BC_ARBITER_ANY (the primary key and every unique
    index); a named one stands for every unique key over its columns, as a set. Taken: a row this execution wrote has the key, or the view holds it and this execution
-   did not vacate it. Deciding records nothing, and an arbiter key the row takes is no insert
-   claim: a concurrent commit of the key is BC_CONFLICT. A key of another unique index is checked
+   did not vacate it. Deciding takes no claim (at SERIALIZABLE each arbiter key it probes is
+   a read), and an arbiter key the row takes is no insert claim: a concurrent commit of the key is BC_CONFLICT. A key of another unique index is checked
    as bc_insert checks it (BC_C_UNIQUE). False, too, once an error is set. */
 #define BC_ARBITER_ANY UINT32_C(0xFFFFFFFF)
 bool bc_insert_on_conflict(bc_ctx *, uint32_t table, bc_view row, uint32_t arbiter);

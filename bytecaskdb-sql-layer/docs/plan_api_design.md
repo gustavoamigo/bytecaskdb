@@ -486,6 +486,7 @@ enum bc_error_code {
                        file, so its outcome is unknown, never "nothing written" (SQLSTATE 08007) */
   BC_E_PATTERN,     /* bc_like reached a pattern's escape character at its end (SQLSTATE 22025) */
   BC_E_CARDINALITY, /* a BC_SUB_VALUE subquery emitted a second row (SQLSTATE 21000) */
+  BC_E_READ_ONLY,   /* a write, guard or DDL in a transaction begun read-only (SQLSTATE 25006) */
 };
 
 enum bc_scan_flags {
@@ -1050,7 +1051,7 @@ void    bc_del_range(bc_ctx *, uint32_t table, bc_view lo, bc_view hi);
 | Function | What it does | Reads | Engine operations |
 |---|---|---|---|
 | `bc_insert` | Inserts `row`, a row of `table`'s current layout. Checks on the snapshot that its primary key is free and that, for each unique index, no entry has the row's index parts (skipped when one of them is null: nulls are distinct); a duplicate is `BC_E_CONSTRAINT` with `BC_C_UNIQUE` and the table's or the index's id. Then writes the row and one entry per index, and a range guard over each checked unique prefix for the race. | 1, plus 1 per unique index | `put` per row and entry, `ensure_range_unchanged` per unique index |
-| `bc_insert_on_conflict` | `INSERT … ON CONFLICT DO NOTHING`: `bc_insert` of `row`, unless its key under `arbiter` is taken, when it writes nothing and returns false. `arbiter` is `table` (its primary key), one of its unique indexes, or `BC_ARBITER_ANY` (both); another object is `BC_E_HANDLE`. A named one stands for every unique key over its columns, as a set, as PostgreSQL makes each matching index an arbiter. Taken, in this order: a row this execution wrote holds the primary key (skip); this execution vacated it (insert); the view holds it (skip); an arbiter index prefix this execution gave a row, or one the view holds (skip). A key with a null part is never taken. The decision records nothing. An inserted row's arbiter keys take no insert claim, so a concurrent commit of one is `BC_CONFLICT`, never `BC_C_UNIQUE`; an arbiter index keeps its range guard. The other unique keys are checked as `bc_insert` checks them. Returns false once an error is set: the plan's `bc_row_end` (NOT NULL) and `CHECK` come first, and their error is sticky. Revision 17. | as `bc_insert`, plus 1 per arbiter key it skips on | as `bc_insert`; none when it skips |
+| `bc_insert_on_conflict` | `INSERT … ON CONFLICT DO NOTHING`: `bc_insert` of `row`, unless its key under `arbiter` is taken, when it writes nothing and returns false. `arbiter` is `table` (its primary key), one of its unique indexes, or `BC_ARBITER_ANY` (both); another object is `BC_E_HANDLE`. A named one stands for every unique key over its columns, as a set, as PostgreSQL makes each matching index an arbiter. Taken, in this order: a row this execution wrote holds the primary key (skip); this execution vacated it (insert); the view holds it (skip); an arbiter index prefix this execution gave a row, or one the view holds (skip). A key with a null part is never taken. The decision takes no claim; at SERIALIZABLE each arbiter key or prefix it probes is recorded as a read (`transaction_design.md`, owner's question 1). An inserted row's arbiter keys take no insert claim, so a concurrent commit of one is `BC_CONFLICT`, never `BC_C_UNIQUE`; an arbiter index keeps its range guard. The other unique keys are checked as `bc_insert` checks them. Returns false once an error is set: the plan's `bc_row_end` (NOT NULL) and `CHECK` come first, and their error is sticky. Revision 17. | as `bc_insert`, plus 1 per arbiter key it skips on | as `bc_insert`; none when it skips |
 | `bc_insert_or_existing` | `INSERT … ON CONFLICT DO UPDATE`: as `bc_insert_on_conflict`, but where the row's key under `arbiter` is taken it sets `*existing` to the row the view holds at that key and returns false; the plan builds the new row from it (`bc_row_from`) and writes it with `bc_update`. The holder is looked for under the primary key first, then under each arbiter index in order. A key a row this execution wrote holds, or an arbiter prefix whose holder in the view is a row this execution wrote and that kept the prefix, is `BC_E_CARDINALITY` ("ON CONFLICT DO UPDATE command cannot affect row a second time"): one statement affects a row once. A primary key this execution vacated is free, and so is a unique prefix a `bc_update` of this execution took from its row (the execution records each such prefix, since the view still shows the row's old entry); the row is inserted. `*existing` is the empty view when the row is inserted or an error is set. The holder's row key is the one the commit checks, through the `bc_update` that writes it, so a concurrent change of the row is `BC_CONFLICT`. Revision 18. | as `bc_insert_on_conflict`, plus 1 for the holder's row | as `bc_insert`, or none (the plan's `bc_update` writes) |
 | `bc_update` | Replaces `old`, a stored row of `table`, with `row`. Writes the row; for each index, compares the entry `old` has with the one `row` has and, only where they differ, deletes the old and writes the new. An index none of whose columns changed encoding is not encoded at all, nor is the new primary key when its columns did not change, so an update of unindexed columns builds no index key. A unique index is checked, as for `bc_insert`, only when its prefix changed, so a row never collides with itself. A changed primary key moves the row: the old key deleted, the new one checked and written, and every entry moved, since each carries the primary key. | 1 per unique index whose prefix changed, plus 1 if the primary key changed | `put`, `del` |
 | `bc_delete` | Deletes `old`, a stored row of `table`, and its entry in every index. | 0 | `del` per row and entry |
@@ -1148,14 +1149,27 @@ void bc_raise(bc_ctx *, uint32_t constraint, uint32_t object_id);   /* a user er
 
 | Function | What it does | Engine operation |
 |---|---|---|
-| `bc_guard_unchanged` | The commit fails if `key` changed since the snapshot. Serializable plans emit one for every key they read and did not write. Keys the plan writes are checked by the engine without a guard. | `ensure_unchanged` |
+| `bc_guard_unchanged` | The commit fails if `key` changed since the snapshot. Keys the plan writes are checked by the engine without a guard. No generated plan emits it: SERIALIZABLE's reads are recorded by the runtime (below). | `ensure_unchanged` |
 | `bc_guard_row` | `bc_guard_unchanged` on the primary key of `row`, a row of `table`, encoded into the guard without the arena: what `SELECT … FOR UPDATE` emits for each row it returns, however many. | `ensure_unchanged` |
-| `bc_guard_range` | The commit fails if any key in `[lo, hi)` changed. Serializable plans emit one per range scanned; it covers phantoms. Empty bounds are the start and end of `table_or_index`, as for `bc_scan_open`; `lo >= hi` guards nothing. | `ensure_range_unchanged` |
+| `bc_guard_range` | The commit fails if any key in `[lo, hi)` changed; it covers phantoms. Empty bounds are the start and end of `table_or_index`, as for `bc_scan_open`; `lo >= hi` guards nothing. A backfill's rows are guarded this way; no generated plan emits it. | `ensure_range_unchanged` |
 | `bc_guard_present`, `bc_guard_absent` | Existence preconditions on a key the plan reads and does not write. | `ensure_present`, `ensure_absent` |
 | `bc_raise` | Sets `BC_E_CONSTRAINT` with a `bc_constraint` kind and the id of the constraint, column or index concerned, as the compiler emitted them; an unknown kind or an id of 2^24 or more is `BC_E_HANDLE`. The plan unwinds; the runtime reports it and does not retry. A `CHECK` the compiler evaluates is raised this way, with the table's id, after `bc_row_end` and before `bc_insert` or `bc_update`. | none: nothing reaches the engine |
 
-A plan under snapshot isolation emits no guards. The two plans for the same
-SQL differ only in guard calls, which is how isolation reads in the text.
+A plan has no isolation level: the same text runs at every level. At
+SERIALIZABLE the runtime's read calls record what they read
+(`docs/transaction_design.md`, *Mechanism: the transaction's read set*):
+`bc_get`, `bc_exists` and `bc_scan_row` on an index record the key read,
+a cursor the range it covered up to where it stopped (k⁺ after its last
+key, forward; that key, in reverse; its whole range when it ran out), and
+`bc_count_range`, a unique check and an `ON CONFLICT` arbiter probe their
+range or key. A transaction's commit that writes submits them as
+`ensure_unchanged` and `ensure_range_unchanged`, with a guard on the
+catalog version. The context's level is `bc_ctx_set_isolation`'s for an
+autocommit execution, and the transaction's (`bc_txn_new`,
+`bc_txn_set_mode`, refused once `bc_txn_queried` or a savepoint is open)
+for a statement of one; a transaction begun read-only
+records nothing and refuses every write, guard and DDL with
+`BC_E_READ_ONLY` (25006).
 The write plan is charged to the statement budget as it grows (*The write
 set is statement memory*), and the engine refuses one over its 1 GiB plan
 limit at commit; either is `BC_E_LIMIT`.
@@ -1219,11 +1233,11 @@ not built.
 
 ### Example
 
-Payment's customer lookup by last name, serializable:
+Payment's customer lookup by last name:
 
 ```c
 // SELECT c_id, c_first, c_balance FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_last = $3 ORDER BY c_first LIMIT 1 OFFSET (count / 2)
-// isolation: serializable   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_7 customer, IDX_12 customer_i2, COL_7_0 customer.c_id, COL_7_3 customer.c_first, COL_7_16 customer.c_balance
 #include "bc_plan.h"
 enum { TBL_7 = 7, IDX_12 = 12, COL_7_0 = 0, COL_7_3 = 3, COL_7_16 = 16 };
@@ -1240,7 +1254,6 @@ void plan(bc_ctx *cx) {
     bc_view row = bc_scan_row(cx, c);                             /* 1 read */
     bc_sorter_add(cx, s, bc_col_bytes(cx, row, COL_7_3), row);
   }
-  bc_guard_range(cx, IDX_12, prefix, bc_key_successor(cx, prefix));  /* serializable */
 
   int64_t n = bc_sorter_count(cx, s);
   if (n == 0) {
@@ -1256,7 +1269,9 @@ void plan(bc_ctx *cx) {
 ```
 
 A reader sees the index, the direction, one record read per entry plus one
-per row, the sort and its bound, the guard, and the result. The cost model
+per row, the sort and its bound, and the result. At SERIALIZABLE the
+runtime records the scan's prefix range and each row's key as it reads
+them; the text is the same. The cost model
 is on the page, and nothing on it can fault.
 
 ## Keys and rows

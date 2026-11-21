@@ -1,5 +1,5 @@
 // SELECT ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_delivery_d FROM order_line WHERE ol_o_id = $1 AND ol_d_id = $2 AND ol_w_id = $3
-// isolation: snapshot   schema: catalog v13
+// schema: catalog v13
 // objects: TBL_18 order_line, COL_18_4 order_line.ol_i_id, COL_18_5 order_line.ol_delivery_d, COL_18_6 order_line.ol_amount, COL_18_7 order_line.ol_supply_w_id, COL_18_8 order_line.ol_quantity
 #include "bc_plan.h"
 enum { TBL_18 = 18, COL_18_4 = 4, COL_18_5 = 5, COL_18_6 = 6, COL_18_7 = 7, COL_18_8 = 8 };

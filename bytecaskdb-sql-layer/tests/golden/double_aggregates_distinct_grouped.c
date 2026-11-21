@@ -1,5 +1,5 @@
 // SELECT s, sum(DISTINCT d), count(DISTINCT d) FROM r GROUP BY s
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: IDX_9 r_s_desc, COL_7_1 r.s, COL_7_2 r.d
 #include "bc_plan.h"
 enum { IDX_9 = 9, COL_7_1 = 1, COL_7_2 = 2 };

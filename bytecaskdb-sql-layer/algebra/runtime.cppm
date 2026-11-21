@@ -9,6 +9,7 @@
 
 module;
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <exception>
@@ -143,6 +144,20 @@ void bc_txn_release_plans(bc_txn* txn, std::uint64_t bytes) noexcept;
 // bc_txn_overlay_pin, the pin also reserving `extra` bytes against max_bytes
 // until released: a cursor's private plan (docs/cursor_design.md).
 bc_overlay* bc_txn_overlay_pin_reserving(bc_txn* txn, std::uint64_t extra);
+// Whether the last commit's BC_CONFLICT, the transaction's or the context's
+// autocommit execution's at SERIALIZABLE, found no key it wrote changed
+// since its snapshot: a read/write dependency, reported with its own
+// message (docs/transaction_design.md, *Mechanism: the serializable
+// commit*, step 5). False after any other outcome.
+bool bc_txn_conflict_read_write(const bc_txn* txn) noexcept;
+bool bc_ctx_conflict_read_write(const bc_ctx* cx) noexcept;
+
+// A SERIALIZABLE read set's structural transitions (tests/CLAUDE.md, *Fault
+// sweeps must reach every structural transition*): a new point, a new range,
+// a merge of ranges, a point a range swallowed, and a cursor's reservation
+// filled. Counted, process-wide, in a testing build only.
+enum class ReadSetTransition : std::uint8_t { NewPoint, NewRange, Merge, Swallow, Fill };
+inline constexpr std::size_t kReadSetTransitions = 5;
 
 #ifdef BYTECASK_SQL_TESTING
 // Test only: what bc_txn_charge_plans charged and not released, and what
@@ -155,6 +170,29 @@ std::uint64_t bc_txn_cap_holds_for_testing(const bc_txn* txn) noexcept;
 void bc_ctx_before_commit_for_testing(bc_ctx* cx, std::function<void()> hook);
 // Test only: the bytes the context's statement is charged now.
 std::uint64_t bc_ctx_held_for_testing(const bc_ctx* cx);
+// Test only: a SERIALIZABLE read set's entries, in key order, what they are
+// charged (`bytes`), and what the transaction's read set is charged to its
+// bound (`charged`: `bytes` and the open cursors' reservations). Of the
+// transaction, or of the context's autocommit execution.
+struct ReadSetContents {
+  std::vector<bytecask::sql::Bytes> points;
+  std::vector<std::pair<bytecask::sql::Bytes, bytecask::sql::Bytes>> ranges;
+  std::uint64_t bytes{0};
+  std::uint64_t charged{0};
+};
+ReadSetContents bc_txn_reads_for_testing(const bc_txn* txn);
+ReadSetContents bc_ctx_reads_for_testing(const bc_ctx* cx);
+// Test only: a fresh read set after each operation of `ops` in order, a
+// point (`hi` empty) or a range [lo, hi): the model test's subject.
+struct ReadSetOp {
+  bytecask::sql::Bytes lo, hi;
+};
+ReadSetContents read_set_apply_for_testing(std::span<const ReadSetOp> ops);
+// Test only: k⁺, the bound a forward cursor that stopped after `k` records.
+bytecask::sql::Bytes read_successor_for_testing(bytecask::sql::Bytes k);
+// Test only: the transitions above (ReadSetTransition), counted since the
+// last call with `reset`.
+std::array<std::uint64_t, kReadSetTransitions> read_set_transitions_for_testing(bool reset);
 // Test only: the capacity, in elements, of the write set's vectors (effects,
 // claims, locks, the tables written).
 std::size_t bc_ctx_write_set_slots_for_testing(const bc_ctx* cx);
@@ -180,11 +218,22 @@ export using ::bc_txn_ddl;
 export using ::bc_txn_charge_plans;
 export using ::bc_txn_release_plans;
 export using ::bc_txn_overlay_pin_reserving;
+export using ::bc_txn_conflict_read_write;
+export using ::ReadSetTransition;
+export using ::kReadSetTransitions;
+export using ::bc_ctx_conflict_read_write;
 #ifdef BYTECASK_SQL_TESTING
 export using ::bc_txn_plan_bytes_for_testing;
 export using ::bc_txn_cap_holds_for_testing;
 export using ::bc_ctx_before_commit_for_testing;
 export using ::bc_ctx_held_for_testing;
+export using ::ReadSetContents;
+export using ::ReadSetOp;
+export using ::bc_txn_reads_for_testing;
+export using ::bc_ctx_reads_for_testing;
+export using ::read_set_apply_for_testing;
+export using ::read_successor_for_testing;
+export using ::read_set_transitions_for_testing;
 export using ::bc_ctx_write_set_slots_for_testing;
 #endif
 
@@ -285,6 +334,21 @@ enum class PlanEntry : std::uint8_t { Write, KeyGuard, RangeGuard };
 // a key of `record_key` bytes.
 [[nodiscard]] constexpr auto table_bytes(std::size_t record_key) -> std::uint64_t {
   return kTableSlotBytes + plan_entry_bytes(PlanEntry::KeyGuard, record_key, 0);
+}
+// A SERIALIZABLE read set's entries (docs/transaction_design.md, *Read-set
+// memory and the 54000 bound*): a point's node in its set and a range's in
+// its map, each with its buffers and its guard's entry in the commit's
+// WritePlan. A point is charged the larger of its two guard forms: it goes
+// as a one-key range when a hand-written guard sits on its key.
+inline constexpr std::uint64_t kReadPointNodeBytes = 96;
+inline constexpr std::uint64_t kReadRangeNodeBytes = 112;
+[[nodiscard]] constexpr auto read_point_bytes(std::size_t key) -> std::uint64_t {
+  const auto as_point = plan_entry_bytes(PlanEntry::KeyGuard, key, 0);
+  const auto as_range = plan_entry_bytes(PlanEntry::RangeGuard, key, key + 1);
+  return buffer_bytes(key) + kReadPointNodeBytes + (as_point > as_range ? as_point : as_range);
+}
+[[nodiscard]] constexpr auto read_range_bytes(std::size_t lo, std::size_t hi) -> std::uint64_t {
+  return buffer_bytes(lo) + buffer_bytes(hi) + kReadRangeNodeBytes + plan_entry_bytes(PlanEntry::RangeGuard, lo, hi);
 }
 [[nodiscard]] constexpr auto claim_bytes(std::size_t key) -> std::uint64_t {
   return buffer_bytes(key) + kClaimSlotBytes;

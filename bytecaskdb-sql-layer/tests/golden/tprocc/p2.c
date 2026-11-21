@@ -1,5 +1,5 @@
 // SELECT w_street_1, w_street_2, w_city, w_state, w_zip, w_name FROM warehouse WHERE w_id = $1
-// isolation: snapshot   schema: catalog v13
+// schema: catalog v13
 // objects: TBL_4 warehouse, COL_4_3 warehouse.w_name, COL_4_4 warehouse.w_street_1, COL_4_5 warehouse.w_street_2, COL_4_6 warehouse.w_city, COL_4_7 warehouse.w_state, COL_4_8 warehouse.w_zip
 #include "bc_plan.h"
 enum { TBL_4 = 4, COL_4_3 = 3, COL_4_4 = 4, COL_4_5 = 5, COL_4_6 = 6, COL_4_7 = 7, COL_4_8 = 8 };

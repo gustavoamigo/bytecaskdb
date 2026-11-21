@@ -1,5 +1,5 @@
 // SELECT c_discount, c_last, c_credit, w_tax FROM customer, warehouse WHERE w_id = $1 AND c_w_id = $1 AND c_d_id = $2 AND c_id = $3
-// isolation: snapshot   schema: catalog v13
+// schema: catalog v13
 // objects: TBL_8 customer, COL_8_5 customer.c_last, COL_8_13 customer.c_credit, COL_8_15 customer.c_discount, TBL_4 warehouse, COL_4_2 warehouse.w_tax
 #include "bc_plan.h"
 enum { TBL_8 = 8, COL_8_5 = 5, COL_8_13 = 13, COL_8_15 = 15, TBL_4 = 4, COL_4_2 = 2 };

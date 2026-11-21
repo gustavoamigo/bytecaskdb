@@ -1,5 +1,5 @@
 // SELECT no_o_id FROM new_order WHERE no_w_id = $1 AND no_d_id = $2 ORDER BY no_o_id LIMIT 1
-// isolation: snapshot   schema: catalog v13
+// schema: catalog v13
 // objects: TBL_13 new_order, PART_13_2 new_order.no_o_id
 #include "bc_plan.h"
 enum { TBL_13 = 13, PART_13_2 = 2 };

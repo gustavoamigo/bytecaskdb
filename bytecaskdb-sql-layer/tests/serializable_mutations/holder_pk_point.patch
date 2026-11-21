@@ -1,0 +1,20 @@
+ON CONFLICT DO UPDATE's holder() records the primary key it probes. Expected: NOT caught: the
+key probed is always among the final writes (the row inserted, or the holder updated), which the
+engine checks itself.
+Expected: NOT caught.
+Guarded-by: "serializable: ON CONFLICT DO UPDATE's probe is a read of the arbiter key; a range DELETE's rows are read"
+
+diff --git a/bytecaskdb-sql-layer/algebra/plan_api.cpp b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+index 66fc395..d8676f2 100644
+--- a/bytecaskdb-sql-layer/algebra/plan_api.cpp
++++ b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+@@ -6983,7 +6983,8 @@ void insert_row(bc_ctx* cx, NewRow& n, std::span<const std::uint32_t> arbiters)
+     auto it = cx->written_rows.find(n.pk);
+     if (it != cx->written_rows.end() && it->second) return twice();
+     if (it == cx->written_rows.end()) {
+-      auto taken = read_contains(cx, n.pk);
++      std::optional<bool> taken;
++      if (auto rec = cx->record_point(BytesView{}); rec && cx->charge()) taken = view_contains(cx, *rec, n.pk);
+       if (!taken) return false;
+       if (*taken) {
+         pk = n.pk;

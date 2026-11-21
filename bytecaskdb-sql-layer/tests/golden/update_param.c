@@ -1,5 +1,5 @@
 // UPDATE t SET name = $2 WHERE id = $1
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_1 t, COL_1_1 t.name
 #include "bc_plan.h"
 enum { TBL_1 = 1, COL_1_1 = 1 };

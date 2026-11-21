@@ -1,5 +1,5 @@
 // UPDATE district SET d_ytd = d_ytd + $1 WHERE d_w_id = $2 AND d_id = $3
-// isolation: snapshot   schema: catalog v13
+// schema: catalog v13
 // objects: TBL_6 district, COL_6_2 district.d_ytd
 #include "bc_plan.h"
 enum { TBL_6 = 6, COL_6_2 = 2 };

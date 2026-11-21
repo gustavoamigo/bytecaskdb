@@ -1,5 +1,5 @@
 // SELECT sum(w) FROM p WHERE w >= $1
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: IDX_6 p_w, PART_6_3 p_w.w
 #include "bc_plan.h"
 enum { IDX_6 = 6, PART_6_3 = 0 };

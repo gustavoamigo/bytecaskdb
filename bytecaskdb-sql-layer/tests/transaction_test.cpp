@@ -13,6 +13,7 @@
 // is tested in api_test.cpp.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -128,6 +129,39 @@ void get_w(bc_ctx* cx) {
   bc_emit_end(cx);
 }
 
+// INSERT INTO w VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING, under
+// arbiter $5 (the table, or w_b): the count inserted
+void insert_w_on_conflict(bc_ctx* cx) {
+  bc_row r = bc_row_begin(cx, kW);
+  bc_row_set_param(cx, r, kId, 0);
+  bc_row_set_param(cx, r, kA, 1);
+  bc_row_set_param(cx, r, kB, 2);
+  bc_row_set_param(cx, r, kC, 3);
+  const auto arbiter = static_cast<std::uint32_t>(bc_param_i64(cx, 4));
+  bc_emit_count(cx, bc_insert_on_conflict(cx, kW, bc_row_end(cx, r), arbiter) ? 1 : 0);
+}
+
+// INSERT INTO w VALUES ($1, $2, $3, $4) ON CONFLICT DO UPDATE SET c = 0,
+// under arbiter $5: the count inserted
+void upsert_w(bc_ctx* cx) {
+  bc_row r = bc_row_begin(cx, kW);
+  bc_row_set_param(cx, r, kId, 0);
+  bc_row_set_param(cx, r, kA, 1);
+  bc_row_set_param(cx, r, kB, 2);
+  bc_row_set_param(cx, r, kC, 3);
+  const auto arbiter = static_cast<std::uint32_t>(bc_param_i64(cx, 4));
+  bc_view old = bc_empty(cx);
+  if (bc_insert_or_existing(cx, kW, bc_row_end(cx, r), arbiter, &old)) {
+    bc_emit_count(cx, 1);
+    return;
+  }
+  if (bc_error(cx) != BC_OK) return;
+  bc_row u = bc_row_from(cx, kW, old);
+  bc_row_set_i64(cx, u, kC, 0);
+  bc_update(cx, kW, old, bc_row_end(cx, u));
+  bc_emit_count(cx, 0);
+}
+
 // Whether id $1 exists, as a count
 void exists_w(bc_ctx* cx) { bc_emit_count(cx, bc_exists(cx, bc_key_params(cx, kW, 0, 1)) ? 1 : 0); }
 
@@ -217,8 +251,9 @@ auto commit(Fixture& f, bc_txn* txn) -> int {
 
 struct TxnPtr {
   bc_txn* p;
-  explicit TxnPtr(Fixture& f, std::uint64_t max_bytes = std::uint64_t{64} << 20)
-      : p{bc_txn_new(&f.bdb, &f.bcat, max_bytes)} {}
+  explicit TxnPtr(Fixture& f, std::uint64_t max_bytes = std::uint64_t{64} << 20,
+                  bc_isolation level = BC_ISOLATION_SNAPSHOT)
+      : p{bc_txn_new(&f.bdb, &f.bcat, max_bytes, level, false)} {}
   ~TxnPtr() { bc_txn_free(p); }
   TxnPtr(const TxnPtr&) = delete;
   TxnPtr& operator=(const TxnPtr&) = delete;
@@ -559,7 +594,7 @@ TEST_CASE("transactions: an aborted transaction lets go of its snapshot; a freed
   }
   // A transaction freed while a context still reads it: the context is
   // detached, and resetting it later touches nothing freed.
-  auto* txn = bc_txn_new(&f.bdb, &f.bcat, std::uint64_t{1} << 20);
+  auto* txn = bc_txn_new(&f.bdb, &f.bcat, std::uint64_t{1} << 20, BC_ISOLATION_SNAPSHOT, false);
   REQUIRE(txn != nullptr);
   auto none = params({});
   bc_ctx_begin_txn(f.cx, txn, &none, {});
@@ -652,7 +687,7 @@ TEST_CASE("transactions: a statement's results stay readable after the free that
   Fixture f;
   create_w(f);
   REQUIRE(autocommit(f, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("a"), std::int64_t{10}}) == BC_COMMITTED);
-  auto* txn = bc_txn_new(&f.bdb, &f.bcat, std::uint64_t{1} << 20);
+  auto* txn = bc_txn_new(&f.bdb, &f.bcat, std::uint64_t{1} << 20, BC_ISOLATION_SNAPSHOT, false);
   REQUIRE(txn != nullptr);
   auto none = params({});
   SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), type_codes(id_c()), f.cat().version()};
@@ -675,7 +710,7 @@ TEST_CASE("transactions: every allocation of a statement's begin failed in turn 
   create_w(f);
   for (long nth = 1;; ++nth) {
     REQUIRE(nth < 1000);
-    auto* txn = bc_txn_new(&f.bdb, &f.bcat, std::uint64_t{1} << 20);
+    auto* txn = bc_txn_new(&f.bdb, &f.bcat, std::uint64_t{1} << 20, BC_ISOLATION_SNAPSHOT, false);
     REQUIRE(txn != nullptr);
     auto none = params({});
     auto fired = false;
@@ -853,7 +888,11 @@ TEST_CASE("transactions: a statement past the buffer bound is BC_E_LIMIT and abo
   CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 0);
 }
 
-TEST_CASE("transactions: a read that fails is the statement's error, never absent", "[sql][txn][faults]") {
+TEST_CASE("transactions: a read that fails is the statement's error, never absent", "[sql][txn][faults][serializable]") {
+  // At both levels: at Serializable each read also records, and a read that
+  // fails must not be recorded, or taken, as an absent key.
+  const auto level = GENERATE(BC_ISOLATION_SNAPSHOT, BC_ISOLATION_SERIALIZABLE);
+  INFO((level == BC_ISOLATION_SERIALIZABLE ? "Serializable" : "Snapshot"));
   Fixture f;
   create_w(f);
   // Row 2's value holds a marker; its stored bytes are then damaged, so
@@ -892,7 +931,7 @@ TEST_CASE("transactions: a read that fails is the statement's error, never absen
   };
   for (const auto& c : cases) {
     INFO(c.name);
-    TxnPtr txn{f};
+    TxnPtr txn{f, std::uint64_t{64} << 20, level};
     // An earlier statement's write, so the read goes through the overlay.
     REQUIRE(stmt(f, txn.p, insert_w, {std::int64_t{7}, std::int64_t{7}, bytes("seven"), std::int64_t{7}}).error ==
             BC_OK);
@@ -902,9 +941,39 @@ TEST_CASE("transactions: a read that fails is the statement's error, never absen
   }
   // The unique check of an insert reads the damaged row's entry: it is not
   // taken as free.
-  TxnPtr txn{f};
-  REQUIRE(stmt(f, txn.p, delete_w, {std::int64_t{1}}).error == BC_OK);
-  CHECK(stmt(f, txn.p, insert_w, {std::int64_t{2}, bc_value{}, bc_value{}, std::int64_t{0}}).error == BC_E_CORRUPT);
+  {
+    TxnPtr txn{f, std::uint64_t{64} << 20, level};
+    REQUIRE(stmt(f, txn.p, delete_w, {std::int64_t{1}}).error == BC_OK);
+    CHECK(stmt(f, txn.p, insert_w, {std::int64_t{2}, bc_value{}, bc_value{}, std::int64_t{0}}).error == BC_E_CORRUPT);
+  }
+  // ON CONFLICT's arbiters over the damaged row, by its primary key and by
+  // its unique b: the row is never inserted as if the key were free. A
+  // probe that reads only the key directory finds the key taken; one that
+  // reads the record fails the statement.
+  struct Arbiter {
+    const char* name;
+    bc_plan_fn plan;
+    std::int64_t id;
+    std::uint32_t arbiter;
+  };
+  const std::vector<Arbiter> arbiters{
+      {"DO NOTHING, the primary key", insert_w_on_conflict, 2, kW},
+      {"DO NOTHING, the unique index", insert_w_on_conflict, 20, kWB},
+      {"DO UPDATE, the primary key", upsert_w, 2, kW},
+      {"DO UPDATE, the unique index", upsert_w, 20, kWB},
+  };
+  for (const auto& a : arbiters) {
+    INFO(a.name);
+    TxnPtr txn{f, std::uint64_t{64} << 20, level};
+    auto got = stmt(f, txn.p, a.plan,
+                    {a.id, bc_value{}, bytes("ZZMARKERZZ"), std::int64_t{0}, std::int64_t{a.arbiter}});
+    if (got.error == BC_OK) {
+      CHECK(got.affected == 0);  // skipped or updated: the key was taken
+    } else {
+      CHECK(got.error == BC_E_CORRUPT);
+    }
+    (void)bc_txn_commit(txn.p, false);
+  }
   // Closing writes the hint files, which reads the damaged record too.
   try {
     f.close();
@@ -1177,7 +1246,7 @@ TEST_CASE("transaction: a DDL transaction's commit that finds a DDL published si
     bytecask::sql::LiveCatalog other{*f.db};
     bc_catalog second{two_catalogs ? &other : f.live.get()};
     TxnPtr t1{f};
-    auto* t2 = bc_txn_new(&f.bdb, &second, std::uint64_t{64} << 20);
+    auto* t2 = bc_txn_new(&f.bdb, &second, std::uint64_t{64} << 20, BC_ISOLATION_SNAPSHOT, false);
     const auto x = create_in(t1.p, "x" + std::to_string(two_catalogs));
     const auto y = create_in(t2, "y" + std::to_string(two_catalogs));
     CHECK(x == y);

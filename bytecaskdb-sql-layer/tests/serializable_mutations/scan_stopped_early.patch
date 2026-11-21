@@ -1,0 +1,17 @@
+A cursor closed early records what it covered, up to k⁺ or from its last key.
+Expected: caught.
+Guarded-by: "serializable: a scan that stops early guards only what it covered\, forward and reverse"
+
+diff --git a/bytecaskdb-sql-layer/algebra/plan_api.cpp b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+index 66fc395..79eeb6b 100644
+--- a/bytecaskdb-sql-layer/algebra/plan_api.cpp
++++ b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+@@ -2132,7 +2132,7 @@ void successor_in_place(Bytes& k) {
+ void bc_ctx::finish_scan(Cursor& c) noexcept {
+   if (!c.read) return;
+   auto r = std::move(c.read);
+-  if (!r->ran_out && !r->returned) {
++  if (!r->ran_out) {
+     read_release(r->charge);  // it handed out nothing: its result depends on no key
+     return;
+   }

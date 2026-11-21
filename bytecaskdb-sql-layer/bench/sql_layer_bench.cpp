@@ -7,7 +7,13 @@
 // execution (a point read's reference and a New-Order-sized one), what one
 // column decode costs, what a nullable text column's null test and read
 // cost, and what bc_update costs when no indexed column changes; and the
-// bytes a row of each table takes as a record. Not part of CI. The published
+// bytes a row of each table takes as a record. Then the SERIALIZABLE rows
+// (docs/transaction_design.md, *Stages of serializable isolation*, stage
+// 1): a transaction's time at Serializable and at Snapshot, and the p99 of
+// snapshot-isolation writers alone and alongside Serializable writers that
+// scanned index ranges, which the engine checks in its writer section
+// (*Read-guard cost at commit and the writer critical section*). Not part
+// of CI. The published
 // numbers were taken in releasedbg (-O3 -march=native, no LTO):
 //   xmake f -m releasedbg --sql_layer=y && xmake build sql_layer_bench && xmake run sql_layer_bench
 // release adds LTO, whose link fails where llvm-ar is older than clang (it
@@ -15,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -24,6 +31,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -34,6 +42,7 @@
 import bytecask.sql.runtime;
 import bytecask.sql.parser;
 import bytecask.sql.codegen;
+import bytecask.sql.api;
 
 using namespace bytecask::sql;
 
@@ -272,6 +281,137 @@ void print_record_bytes(const Catalog& cat) {
 
 }  // namespace
 
+namespace {
+
+auto percentile(std::vector<double> v, double p) -> double {
+  if (v.empty()) return 0;
+  std::ranges::sort(v);
+  return v[static_cast<std::size_t>(p * static_cast<double>(v.size() - 1))];
+}
+
+// The SERIALIZABLE rows. kv holds 1M rows, g = k, indexed; w is what every
+// writer updates, a row each, so no two of them conflict.
+void serializable_rows() {
+  using Clock = std::chrono::steady_clock;
+  auto dir = std::filesystem::temp_directory_path() / ("sql_layer_bench_ser_" + std::to_string(std::random_device{}()));
+  std::filesystem::remove_all(dir);
+  {
+    auto db = Database::open(dir);
+    (void)db->execute("CREATE TABLE kv (k BIGINT PRIMARY KEY, g BIGINT NOT NULL, v BIGINT NOT NULL)");
+    (void)db->execute("CREATE INDEX kv_g ON kv (g)");
+    (void)db->execute("CREATE TABLE w (k BIGINT PRIMARY KEY, v BIGINT NOT NULL)");
+    constexpr std::int64_t kRows = 1'000'000;
+    {
+      const auto& ins = db->prepare("INSERT INTO kv VALUES ($1, $1, 0)");
+      for (std::int64_t k = 0; k < kRows;) {
+        auto t = db->begin({.max_bytes = std::uint64_t{1} << 30});
+        for (auto end = std::min(kRows, k + 20'000); k < end; ++k) (void)t.execute(ins, {k});
+        (void)t.commit();
+      }
+      const auto& insw = db->prepare("INSERT INTO w VALUES ($1, 0)");
+      for (std::int64_t k = 0; k < 100'000; ++k) (void)db->execute(insw, {k});
+    }
+    std::mt19937_64 rng{7};
+    const auto& point = db->prepare("SELECT v FROM kv WHERE k = $1");
+    const auto& bump = db->prepare("UPDATE w SET v = v + 1 WHERE k = $1");
+    const auto& fetch = db->prepare("SELECT v FROM kv WHERE g BETWEEN $1 AND $2");
+    const auto& covering = db->prepare("SELECT g FROM kv WHERE g BETWEEN $1 AND $2");
+    const auto& full = db->prepare("SELECT max(v) FROM kv");
+    auto key = [&](std::int64_t n) { return static_cast<std::int64_t>(rng() % static_cast<std::uint64_t>(n)); };
+    auto us_per_txn = [&](Isolation level, int iters, auto&& body) {
+      std::vector<double> runs;
+      for (int r = 0; r < 5; ++r) {
+        auto t0 = Clock::now();
+        for (int i = 0; i < iters; ++i) {
+          auto t = db->begin({.max_bytes = std::uint64_t{1} << 30, .isolation = level});
+          body(t);
+          (void)t.commit();
+        }
+        runs.push_back(std::chrono::duration<double, std::micro>(Clock::now() - t0).count() / iters);
+      }
+      return percentile(runs, 0.5);
+    };
+    std::printf("\nSERIALIZABLE transactions, us per transaction (Snapshot / Serializable):\n");
+    auto row = [&](const char* name, int iters, auto&& body) {
+      auto snap = us_per_txn(Isolation::Snapshot, iters, body);
+      auto ser = us_per_txn(Isolation::Serializable, iters, body);
+      std::printf("  %-48s %10.1f %10.1f\n", name, snap, ser);
+    };
+    row("ten point reads and one write", 2000, [&](Transaction& t) {
+      for (int k = 0; k < 10; ++k) (void)t.execute(point, {key(kRows)});
+      (void)t.execute(bump, {key(100'000)});
+    });
+    for (std::int64_t n : {100, 10'000}) {
+      const auto name = "index range of " + std::to_string(n) + " rows fetched, one write";
+      row(name.c_str(), n == 100 ? 1000 : 20, [&](Transaction& t) {
+        const auto lo = key(kRows - n);
+        (void)t.execute(fetch, {lo, lo + n - 1});
+        (void)t.execute(bump, {key(100'000)});
+      });
+    }
+    row("read-only full scan of 1M rows", 3, [&](Transaction& t) { (void)t.execute(full, {}); });
+
+    // Writer p99: four snapshot-isolation writers, each an autocommit UPDATE
+    // of a row of its own, alone and alongside two Serializable writers
+    // that read an index range of n keys (covering: one range guard) and
+    // write a row of their own.
+    std::printf("\nwriter latency, snapshot-isolation autocommit UPDATE, 4 threads, us (p50 / p99 / p99.9, txns):\n");
+    auto scenario = [&](const char* name, std::int64_t n) {
+      std::atomic<bool> stop{false};
+      std::vector<std::vector<double>> lat(4);
+      std::atomic<std::uint64_t> ser_done{0}, ser_failed{0};
+      {
+        std::vector<std::jthread> threads;
+        for (std::size_t t = 0; t < 4; ++t) {
+          threads.emplace_back([&, t] {
+            std::mt19937_64 r{t};
+            while (!stop.load()) {
+              auto t0 = Clock::now();
+              (void)db->execute(bump, {static_cast<std::int64_t>(t * 1000 + r() % 1000)});
+              lat[t].push_back(std::chrono::duration<double, std::micro>(Clock::now() - t0).count());
+            }
+          });
+        }
+        for (std::size_t t = 0; n > 0 && t < 2; ++t) {
+          threads.emplace_back([&, t] {
+            std::mt19937_64 r{100 + t};
+            while (!stop.load()) {
+              try {
+                auto x = db->begin({.max_bytes = std::uint64_t{1} << 30, .isolation = Isolation::Serializable});
+                const auto lo = n >= kRows ? 0 : static_cast<std::int64_t>(r() % static_cast<std::uint64_t>(kRows - n));
+                (void)x.execute(covering, {lo, lo + n - 1});
+                (void)x.execute(bump, {static_cast<std::int64_t>(50'000 + t * 1000 + r() % 1000)});
+                (void)x.commit();
+                ser_done.fetch_add(1);
+              } catch (const SerializationFailure&) {
+                ser_failed.fetch_add(1);
+              }
+            }
+          });
+        }
+        std::this_thread::sleep_for(std::chrono::seconds{6});
+        stop.store(true);
+      }
+      std::vector<double> all;
+      for (auto& l : lat) all.insert(all.end(), l.begin(), l.end());
+      std::printf("  %-44s %8.1f %8.1f %9.1f %8zu", name, percentile(all, 0.5), percentile(all, 0.99),
+                  percentile(all, 0.999), all.size());
+      if (n > 0) std::printf("   serializable: %llu committed, %llu 40001", static_cast<unsigned long long>(ser_done.load()),
+                             static_cast<unsigned long long>(ser_failed.load()));
+      std::printf("\n");
+    };
+    scenario("alone", 0);
+    scenario("with 2 Serializable writers, ranges of 100", 100);
+    scenario("with 2 Serializable writers, ranges of 10000", 10'000);
+    scenario("with 2 Serializable writers, ranges of 1000000", kRows);
+    scenario("alone, again", 0);
+    db->close();
+  }
+  std::filesystem::remove_all(dir);
+}
+
+}  // namespace
+
 int main() {
   auto dir = std::filesystem::temp_directory_path() / ("sql_layer_bench_" + std::to_string(std::random_device{}()));
   std::filesystem::remove_all(dir);
@@ -398,5 +538,6 @@ int main() {
     db.close();
   }
   std::filesystem::remove_all(dir);
+  serializable_rows();
   return 0;
 }

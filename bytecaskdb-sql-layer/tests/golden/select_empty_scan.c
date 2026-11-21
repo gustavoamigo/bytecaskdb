@@ -1,5 +1,5 @@
 // SELECT FROM r WHERE s = $1
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: IDX_9 r_s_desc
 #include "bc_plan.h"
 enum { IDX_9 = 9 };

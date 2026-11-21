@@ -1,5 +1,5 @@
 // SELECT FROM p WHERE a = $1 AND b = $2
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_4 p
 #include "bc_plan.h"
 enum { TBL_4 = 4 };

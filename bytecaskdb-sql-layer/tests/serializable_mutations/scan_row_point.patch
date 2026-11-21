@@ -1,0 +1,17 @@
+bc_scan_row on an index records the row it fetches.
+Expected: caught.
+Guarded-by: "serializable: an index scan that fetches rows guards each row; a covering read guards only its entries"
+
+diff --git a/bytecaskdb-sql-layer/algebra/plan_api.cpp b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+index 66fc395..f4f6c40 100644
+--- a/bytecaskdb-sql-layer/algebra/plan_api.cpp
++++ b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+@@ -5758,7 +5758,7 @@ bc_view bc_scan_row(bc_ctx* cx, bc_cursor h) {
+   key.insert(key.end(), pk.begin(), pk.end());
+   // The row is read at its key: an UPDATE of a column the index does not
+   // hold changes no entry of the range, only this key.
+-  auto rec = cx->record_point(key);
++  auto rec = cx->record_point(BytesView{});
+   if (!rec || !cx->charge()) return {};
+   if (!view_get(cx, *rec, key, c->row)) {
+     // The runtime writes every entry with its row, so this is damage.

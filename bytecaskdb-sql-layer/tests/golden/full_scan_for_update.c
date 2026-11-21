@@ -1,5 +1,5 @@
 // SELECT id FROM t WHERE qty > $1 FOR UPDATE
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_1 t, COL_1_0 t.id, COL_1_2 t.qty
 #include "bc_plan.h"
 enum { TBL_1 = 1, COL_1_0 = 0, COL_1_2 = 2 };

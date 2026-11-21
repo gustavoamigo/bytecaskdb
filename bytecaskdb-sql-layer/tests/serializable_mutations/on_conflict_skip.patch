@@ -1,0 +1,18 @@
+ON CONFLICT DO NOTHING's skip records the arbiter key it found taken.
+Expected: caught.
+Guarded-by: "serializable: ON CONFLICT DO NOTHING's skip is a read of the arbiter key"
+
+diff --git a/bytecaskdb-sql-layer/algebra/plan_api.cpp b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+index 66fc395..363fe68 100644
+--- a/bytecaskdb-sql-layer/algebra/plan_api.cpp
++++ b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+@@ -6945,7 +6945,8 @@ void insert_row(bc_ctx* cx, NewRow& n, std::span<const std::uint32_t> arbiters)
+     if (it == cx->written_rows.end()) {
+       // At SERIALIZABLE a skip is a read of the arbiter key, recorded
+       // (docs/transaction_design.md, owner's question 1).
+-      auto taken = read_contains(cx, n.pk);
++      std::optional<bool> taken;
++      if (auto rec = cx->record_point(BytesView{}); rec && cx->charge()) taken = view_contains(cx, *rec, n.pk);
+       if (!taken || *taken) return true;
+     }
+   }

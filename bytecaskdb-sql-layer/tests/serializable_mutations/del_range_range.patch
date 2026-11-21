@@ -1,0 +1,18 @@
+bc_del_range records the range whose rows it reads (a table with indexes; no SQL statement plans
+one today). Expected: NOT caught: the engine checks a planned range delete's range for changes itself.
+Expected: NOT caught.
+Guarded-by: "serializable: bc_del_range's range is checked: an insert into it is a conflict and one outside it commits"
+
+diff --git a/bytecaskdb-sql-layer/algebra/plan_api.cpp b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+index 66fc395..41583b2 100644
+--- a/bytecaskdb-sql-layer/algebra/plan_api.cpp
++++ b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+@@ -7200,7 +7200,7 @@ void bc_del_range(bc_ctx* cx, uint32_t table, bc_view lo, bc_view hi) {
+     // is charged, the one that finds the range's end too (ViewEntries).
+     // The rows are the view's: in a transaction, an earlier statement's
+     // row takes the entries that statement wrote.
+-    auto rec = cx->record_range(range->lo, range->hi);
++    auto rec = cx->record_range(range->lo, range->lo);
+     if (!rec) return;
+     ViewEntries rows{cx->view(*rec), cx->overlay, range->lo, range->hi, false};
+     while (rows.next(cx)) {

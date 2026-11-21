@@ -1,5 +1,5 @@
 // SELECT d, s FROM r UNION ALL SELECT d, s FROM r ORDER BY s DESC NULLS LAST, d
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_7 r, COL_7_1 r.s, COL_7_2 r.d
 #include "bc_plan.h"
 enum { TBL_7 = 7, COL_7_1 = 1, COL_7_2 = 2 };

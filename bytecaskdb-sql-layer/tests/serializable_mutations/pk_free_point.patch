@@ -1,0 +1,19 @@
+pk_free records the primary key it found free. Expected: NOT caught: the key is always among the
+final writes (its insert's put, or a tombstone when deleted again), which the engine checks itself;
+an insert deleted again with nothing else written is a reader.
+Expected: NOT caught.
+Guarded-by: "serializable: a written key a concurrent commit changed is the concurrent-update 40001; a taken insert is 23505"
+
+diff --git a/bytecaskdb-sql-layer/algebra/plan_api.cpp b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+index 66fc395..114be13 100644
+--- a/bytecaskdb-sql-layer/algebra/plan_api.cpp
++++ b/bytecaskdb-sql-layer/algebra/plan_api.cpp
+@@ -3199,7 +3199,7 @@ struct Entry {
+ // free only because an earlier statement deleted it conflicts with the row
+ // deleted, a 40001 in PostgreSQL as here.
+ [[nodiscard]] auto pk_free(bc_ctx* cx, const Table& t, BytesView pk) -> bool {
+-  auto rec = cx->record_point(pk);
++  auto rec = cx->record_point(BytesView{});
+   if (!rec || !cx->charge()) return false;
+   if (view_contains(cx, *rec, pk)) {
+     cx->raise(BC_C_UNIQUE, t.id);

@@ -1,5 +1,5 @@
 // SELECT name, count(*), min(qty) FROM t GROUP BY name
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_1 t, COL_1_1 t.name, COL_1_2 t.qty
 #include "bc_plan.h"
 enum { TBL_1 = 1, COL_1_1 = 1, COL_1_2 = 2 };

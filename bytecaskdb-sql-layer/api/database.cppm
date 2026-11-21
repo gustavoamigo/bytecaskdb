@@ -506,13 +506,32 @@ private:
   StatementRecord record_;
 };
 
+// The isolation a transaction or an autocommit statement runs at
+// (docs/transaction_design.md, *Isolation* and *Serializable isolation*).
+// Snapshot: its statements read one snapshot, and its commit fails only on
+// a key it wrote or guarded that changed since; what READ UNCOMMITTED, READ
+// COMMITTED and REPEATABLE READ run. Serializable: every key and range its
+// statements read is recorded, and a commit that writes fails with
+// SerializationFailure (40001), nothing written, if any of them, or the
+// catalog, changed since its snapshot; one that writes nothing is
+// serialized at its snapshot and never fails.
+enum class Isolation : std::uint8_t { Snapshot, Serializable };
+
 struct TransactionOptions {
   // The most a transaction may hold: its writes' keys and values, the
-  // structures they are kept in, its guards, claims and locks. Each
-  // statement's write set moves here from its statement budget when the
-  // statement ends. A statement that would take it past is BC_E_LIMIT
-  // (SQLSTATE 54000), and aborts the transaction.
+  // structures they are kept in, its guards, claims and locks, and at
+  // Serializable its read set. Each statement's write set moves here from
+  // its statement budget when the statement ends; a read is charged here as
+  // it is made, and a rollback to a savepoint does not release it. A
+  // statement that would take it past is BC_E_LIMIT (SQLSTATE 54000), and
+  // aborts the transaction.
   std::uint64_t max_bytes{64u << 20};
+  Isolation isolation{Isolation::Snapshot};
+  // Every write, SELECT … FOR UPDATE, DDL and CALL whose body writes is
+  // ExecError BC_E_READ_ONLY, SQLSTATE 25006 ("cannot execute INSERT in a
+  // read-only transaction"), refused before it runs. A read-only
+  // Serializable transaction records nothing: it can never write.
+  bool read_only{false};
   // The session's user: what CURRENT_USER, CURRENT_ROLE, USER and
   // SESSION_USER return in the transaction's statements, cut to a NAME's 63
   // bytes. Empty for the bootstrap superuser's name, kBootstrapUser. Every
@@ -555,6 +574,12 @@ struct ExecutionOptions {
   // The session's user, as TransactionOptions::user, for a statement run
   // outside a transaction; borrowed for the call. Empty for kBootstrapUser.
   std::string_view user{};
+  // The level of a statement run outside a transaction, a one-statement
+  // transaction at it; ignored in a transaction, which has its own. At
+  // Serializable a conflict is retried on a fresh snapshot, as at Snapshot,
+  // and is 40001 after the last retry. A statement that writes no table
+  // records nothing: it is serialized at its snapshot.
+  Isolation isolation{Isolation::Snapshot};
 };
 
 class Database;
@@ -730,6 +755,8 @@ struct TxnHandle {
   std::map<std::string, std::shared_ptr<const TxnPlan>, std::less<>> plans;
   std::uint64_t plan_charge{0};
   std::uint64_t max_bytes{0};  // TransactionOptions::max_bytes
+  Isolation isolation{Isolation::Snapshot};  // TransactionOptions::isolation, or set_isolation's
+  bool read_only{false};                     // TransactionOptions::read_only, or set_read_only's
 
   // Drops the private plans compiled for another catalog than `cat`, and
   // returns their charge: a rollback to a mark undid the DDL they followed.
@@ -1079,6 +1106,20 @@ public:
   void savepoint(std::string_view name);
   void rollback_to(std::string_view name);
   void release(std::string_view name);
+  // The level and the read-only flag (TransactionOptions), changed before
+  // the transaction's first statement, cursor or savepoint. After them, a
+  // change is ast::SqlError 25001, with PostgreSQL's texts: "SET TRANSACTION
+  // ISOLATION LEVEL must be called before any query" ("… must not be called
+  // in a subtransaction" with a savepoint open), "transaction read-write mode
+  // must be set before any query"; and "transaction read-only mode must be
+  // set before any query", where PostgreSQL would accept it (a server that
+  // takes it later enforces it itself). The same value is accepted at any
+  // time. Serializable on a follower is 0A000, as at begin(). Throws
+  // TransactionAborted in an aborted transaction.
+  void set_isolation(Isolation level);
+  void set_read_only(bool read_only);
+  [[nodiscard]] auto isolation() const noexcept -> Isolation { return h_ ? h_->isolation : Isolation::Snapshot; }
+  [[nodiscard]] auto read_only() const noexcept -> bool { return h_ && h_->read_only; }
   // Aborts the transaction, as a failed statement would, for an error the
   // caller raised itself: every later call is TransactionAborted until
   // commit(), rollback() or a rollback_to(). Does nothing unless open.
@@ -1101,6 +1142,10 @@ public:
   }
   [[nodiscard]] auto cap_holds_for_testing() const -> std::uint64_t {
     return h_ && h_->txn != nullptr ? bc_txn_cap_holds_for_testing(h_->txn) : 0;
+  }
+  // Test only: the Serializable read set, as the runtime holds it.
+  [[nodiscard]] auto read_set_for_testing() const -> ReadSetContents {
+    return h_ && h_->txn != nullptr ? bc_txn_reads_for_testing(h_->txn) : ReadSetContents{};
   }
 #endif
 
@@ -1524,6 +1569,10 @@ private:
   // dialect*; docs/catalog_design.md, *CREATE TABLE AS*): the query's rows,
   // autocommit, then the table and its rows as one DDL.
   auto create_table_as(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts) -> Rows;
+  // CREATE TABLE AS at Serializable (docs/transaction_design.md, *Serializable
+  // transactions with DDL*): a one-statement Serializable transaction, so its
+  // query's reads are guarded by its commit, retried on a conflict.
+  auto serializable_ctas(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts) -> Rows;
   // An autocommit context: one per call in flight, kept for the next.
   [[nodiscard]] auto acquire_context() -> bc_ctx*;
   void release_context(bc_ctx* cx) noexcept;
@@ -1638,6 +1687,33 @@ template <class Make>
 }
 
 constexpr std::string_view kConflict = "could not serialize access due to concurrent update";
+// A SERIALIZABLE commit that conflicted with no key it wrote changed since
+// its snapshot (docs/transaction_design.md, *Mechanism: the serializable
+// commit*, step 5), as PostgreSQL 17 words it, with kRetryHint.
+constexpr std::string_view kReadWrite = "could not serialize access due to read/write dependencies among transactions";
+constexpr std::string_view kRetryHint = "The transaction might succeed if retried.";
+
+auto runtime_isolation(Isolation level) noexcept -> bc_isolation {
+  switch (level) {
+    case Isolation::Snapshot: return BC_ISOLATION_SNAPSHOT;
+    case Isolation::Serializable: return BC_ISOLATION_SERIALIZABLE;
+  }
+  return BC_ISOLATION_SERIALIZABLE;
+}
+
+// SERIALIZABLE on a follower, as PostgreSQL refuses it on a hot standby: a
+// follower's snapshot lags the leader, so it could not be strict.
+void refuse_serializable_on_follower(Isolation level, const DB& db) {
+  if (level != Isolation::Serializable || db.mode() != bytecask::Mode::Follower) return;
+  throw ast::SqlError{"cannot use serializable mode in a hot standby", -1, kFeatureNotSupported}.with_notes(
+      "", "You can use REPEATABLE READ instead.");
+}
+
+// A statement of `command` in a read-only transaction: refused before it
+// runs, as PostgreSQL refuses it whether or not it would reach a row.
+[[noreturn]] void refuse_read_only(std::string_view command) {
+  throw ExecError("cannot execute " + std::string{command} + " in a read-only transaction", BC_E_READ_ONLY);
+}
 constexpr std::string_view kCatalogChanged =
     "could not serialize access: the catalog changed since the transaction's first statement";
 constexpr std::string_view kDdlInProgress = "could not serialize access: another DDL is in progress";
@@ -1676,6 +1752,7 @@ auto exec_sqlstate(const ExecError& e) noexcept -> std::string_view {
     case BC_E_CLOSED: return "57P01";     // admin_shutdown
     case BC_E_PATTERN: return "22025";    // invalid_escape_sequence
     case BC_E_CARDINALITY: return "21000";  // cardinality_violation
+    case BC_E_READ_ONLY: return "25006";  // read_only_sql_transaction
     case BC_E_IO:
     case BC_E_CORRUPT:
     case BC_E_DEGRADED: return "58030";   // io_error
@@ -1706,6 +1783,7 @@ auto sqlstate(const std::exception& e) noexcept -> std::string_view {
 auto error_hint(const std::exception& e) noexcept -> std::string_view {
   if (const auto* x = dynamic_cast<const ast::SqlError*>(&e)) return x->hint();
   const auto* x = dynamic_cast<const ExecError*>(&e);
+  if (x != nullptr && x->conflict() && std::string_view{x->what()} == kReadWrite) return kRetryHint;
   if (x != nullptr && !x->conflict() && x->code() == BC_E_CARDINALITY &&
       std::string_view{x->what()} == "ON CONFLICT DO UPDATE command cannot affect row a second time") {
     return "Ensure that no rows proposed for insertion within the same command have duplicate constrained values.";
@@ -2014,6 +2092,7 @@ auto Database::acquire_context() -> bc_ctx* {
 }
 
 void Database::release_context(bc_ctx* cx) noexcept {
+  bc_ctx_set_isolation(cx, BC_ISOLATION_SNAPSHOT);  // a pooled context's next caller sets its own
   std::lock_guard<std::mutex> lock{contexts_mu_};
   try {
     idle_.push_back(cx);
@@ -2335,6 +2414,15 @@ auto Database::execute(std::string_view sql, const std::vector<Value>& params, c
 
 auto Database::execute(std::string_view sql, const ResultCheck& check, const std::vector<Value>& params,
                        const ExecutionOptions& opts) -> Rows {
+  if (opts.isolation == Isolation::Serializable) {
+    const Statement* ctas = nullptr;
+    {
+      auto lock = enter();
+      const auto& s = check.kind == ResultCheck::Kind::Given ? *given_plan(sql, check.record).stmt : prepare_locked(sql);
+      if (s.query_) ctas = &s;
+    }
+    if (ctas != nullptr) return serializable_ctas(*ctas, params, opts);  // valid until close()
+  }
   auto lock = enter();
   try {
     Rows out;
@@ -2364,6 +2452,9 @@ auto Database::execute(std::string_view sql, const ResultCheck& check, const std
 }
 
 auto Database::execute(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts) -> Rows {
+  if (opts.isolation == Isolation::Serializable && stmt.query_ && stmt.owner_ == this) {
+    return serializable_ctas(stmt, params, opts);
+  }
   auto lock = enter();
   try {
     auto out = execute_locked(stmt, params, opts);
@@ -2482,6 +2573,22 @@ auto Database::execute_ddl(const Statement& stmt, const std::vector<Value>& para
     out.notices = skip_notices(ddl, *before, run_ddl(ddl));
     out.affected = 0;
     return out;
+  }
+}
+
+auto Database::serializable_ctas(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts)
+    -> Rows {
+  // Retried on a fresh snapshot as an autocommit statement is: kMaxRetries
+  // attempts in all. Each counts as its transaction.
+  for (std::uint32_t attempt = 1;; ++attempt) {
+    auto t = begin({.isolation = Isolation::Serializable, .user = std::string{opts.user}});
+    try {
+      auto out = t.execute(stmt, params, opts);
+      (void)t.commit();
+      return out;
+    } catch (const SerializationFailure&) {
+      if (attempt >= kMaxRetries) throw;
+    }
   }
 }
 
@@ -2726,9 +2833,11 @@ auto Database::run_auto(bc_ctx* cx, const std::function<std::shared_ptr<const Co
   // runs is known: the caller's, then its constants (plan_params).
   bc_params bp;
   auto budget = budget_for(opts);
+  refuse_serializable_on_follower(opts.isolation, *db_);
   auto c = plan();
   check_params(*c, params);
   bp.values = plan_params(*c, params, reading(now_us, opts.user));
+  bc_ctx_set_isolation(cx, runtime_isolation(opts.isolation));
   auto r = bc_execute(cx, c->code->fn(), &c->ref, &bp, budget, sync_commits_, kMaxRetries);
   // bc_ctx_run checks the plan against the catalog it pinned. A DDL that
   // raced the run since the plan was taken makes a plan it changed
@@ -2742,9 +2851,12 @@ auto Database::run_auto(bc_ctx* cx, const std::function<std::shared_ptr<const Co
     r = bc_execute(cx, c->code->fn(), &c->ref, &bp, budget, sync_commits_, kMaxRetries);
   }
   if (r == BC_CONFLICT) {
+    // At Serializable, PostgreSQL's words for the last attempt's conflict.
+    const std::string_view what = opts.isolation == Isolation::Serializable
+                                      ? (bc_ctx_conflict_read_write(cx) ? kReadWrite : kConflict)
+                                      : std::string_view{"conflict: a guard failed on every attempt"};
     bc_ctx_reset(cx);
-    throw_keeping_outcome("conflict: a guard failed on every attempt",
-                          [](const std::string& m) { return ExecError::conflicted(m); });
+    throw_keeping_outcome(what, [](const std::string& m) { return ExecError::conflicted(m); });
   }
   if (r == BC_FAILED) throw_context_error(cx);
   return results(cx, *c, Rows{});
@@ -2980,6 +3092,11 @@ auto Database::run_procedure(const CompiledProcedure& p, const Procedure& def, c
   // its pin. A plan the pin does not fit is a DDL since the transaction began.
   px.begin = [&](std::uint32_t k) -> bc_ctx* {
     const auto& c = *p.stmts.at(k);
+    // A procedure's statement that writes, in a read-only transaction: the
+    // CALL itself is taken, as in PostgreSQL.
+    if (h.read_only && c.ref.n_written != 0) {
+      refuse_read_only(command_name(Statement::command_of(ast::parse(gen.stmts[k].sql))));
+    }
     std::vector<Value> params;
     for (auto v : gen.stmts[k].param_vars) params.push_back(px.slots.values.at(v));
     check_params(c, params);
@@ -3060,7 +3177,7 @@ auto Database::call(std::string_view procedure, const std::vector<Value>& args, 
   // Rerun from the arguments on a conflict, as an autocommit statement is
   // retried: kMaxRetries attempts in all.
   for (std::uint32_t attempt = 1;; ++attempt) {
-    auto t = begin();
+    auto t = begin({.isolation = opts.isolation});
     try {
       Rows out;
       {
@@ -3078,13 +3195,16 @@ auto Database::call(std::string_view procedure, const std::vector<Value>& args, 
 
 auto Database::begin(TransactionOptions opts) -> Transaction {
   auto lock = enter();
+  refuse_serializable_on_follower(opts.isolation, *db_);
   return Transaction{*this, opts};
 }
 
 Transaction::Transaction(Database& db, TransactionOptions opts)
     : life_{db.life_}, db_{&db}, h_{std::make_unique<TxnHandle>()} {
   h_->cx = bc_ctx_new(&db.bdb_, &db.bcat_);
-  h_->txn = h_->cx == nullptr ? nullptr : bc_txn_new(&db.bdb_, &db.bcat_, opts.max_bytes);
+  h_->txn = h_->cx == nullptr ? nullptr
+                              : bc_txn_new(&db.bdb_, &db.bcat_, opts.max_bytes, runtime_isolation(opts.isolation),
+                                           opts.read_only);
   if (h_->txn == nullptr) {
     h_->release();
     throw std::bad_alloc();
@@ -3099,6 +3219,8 @@ Transaction::Transaction(Database& db, TransactionOptions opts)
   h_->started_us = db.clock_now();
   h_->user = name_of(opts.user.empty() ? kBootstrapUser : opts.user);
   h_->max_bytes = opts.max_bytes;
+  h_->isolation = opts.isolation;
+  h_->read_only = opts.read_only;
   h_->state.store(TxnState::Open);
 }
 
@@ -3249,6 +3371,11 @@ auto Transaction::as_statement(F&& body) -> decltype(body()) {
   const auto ddl = h_->txn != nullptr && bc_txn_has_ddl(h_->txn);
   try {
     check_doomed();
+    // The statement that takes the snapshot: the engine may have become a
+    // follower since begin().
+    if (h_->txn != nullptr && bc_txn_catalog_version(h_->txn) == 0) {
+      refuse_serializable_on_follower(h_->isolation, *db_->db_);
+    }
     return body();
   } catch (const SerializationFailure&) {
     if (ddl) {
@@ -3364,6 +3491,17 @@ auto Transaction::plan_for(const Target& t, const std::shared_ptr<const ast::Sta
   }
 }
 
+// A DML statement that writes, or a SELECT ... FOR UPDATE, in a read-only
+// transaction: refused before it runs or opens as a cursor, whether or not it
+// would reach a row, as PostgreSQL refuses it.
+namespace {
+void refuse_writes_read_only(const ast::Statement& parse) {
+  const auto* select = std::get_if<ast::Select>(&parse);
+  if (select == nullptr) refuse_read_only(command_name(Statement::command_of(parse)));
+  if (select->for_update) refuse_read_only("SELECT FOR UPDATE");
+}
+}  // namespace
+
 auto Transaction::run_locked(const Target& t, const std::vector<Value>& params, const ExecutionOptions& opts,
                              WindowRows* window, RowWindow range, const CursorState* positioned) -> Rows {
   return as_statement([&] {
@@ -3372,6 +3510,7 @@ auto Transaction::run_locked(const Target& t, const std::vector<Value>& params, 
       if (positioned != nullptr || window != nullptr) throw std::invalid_argument("a DDL returns no rows and names no cursor");
       return run_ddl(t, *parse, params, opts);
     }
+    if (h_->read_only) refuse_writes_read_only(*parse);
     auto plan = plan_for(t, parse);
     const auto& c = plan.get();
     if (positioned != nullptr) {
@@ -3457,7 +3596,7 @@ auto Transaction::run_ddl(const Target& t, const ast::Statement& st, const std::
   if (!params.empty() && ctas == nullptr) throw ParamError("DDL takes no parameters");
   // As PostgreSQL refuses DDL on a standby: a transaction's DDL reaches the
   // engine only at its commit, which a follower would refuse.
-  if (db_->db_->mode() == bytecask::Mode::Follower) {
+  if (db_->db_->mode() == bytecask::Mode::Follower || h.read_only) {
     throw DdlRefused("cannot execute " + std::string{command_name(Statement::command_of(st))} +
                          " in a read-only transaction",
                      kReadOnlySqlTransaction);
@@ -3780,8 +3919,18 @@ auto Transaction::open_cursor(std::string_view sql, const ResultCheck& check, co
 auto Transaction::open_locked(const Target& t, const std::vector<Value>& params, Holdability hold, Scrolling scrolling)
     -> Cursor {
   return as_statement([&] {
+    if (h_->read_only) refuse_writes_read_only(*parse_of(t));
     // In the transaction's list before it pins anything: whatever fails
     // after, its abort closes the cursor before the transaction is freed.
+    // A hold cursor's fetches after the commit belong to no transaction, so
+    // their reads could not join a SERIALIZABLE writer's check
+    // (docs/transaction_design.md, *Read sets across savepoints, failed
+    // statements and cursors*). A read-only one is placed at its snapshot,
+    // which the cursor reads.
+    if (hold == Holdability::Hold && h_->isolation == Isolation::Serializable && !h_->read_only) {
+      throw FeatureNotSupported(
+          "DECLARE CURSOR WITH HOLD is not supported in a SERIALIZABLE transaction that is not READ ONLY");
+    }
     auto state = std::make_shared<CursorState>();
     state->life = life_;
     state->db = db_;
@@ -4281,6 +4430,45 @@ void Transaction::release(std::string_view name) {
   h_->savepoints.erase(h_->savepoints.begin() + static_cast<std::ptrdiff_t>(k), h_->savepoints.end());
 }
 
+void Transaction::set_isolation(Isolation level) {
+  if (!h_) throw std::logic_error("the transaction has ended");
+  std::shared_lock<std::shared_mutex> lock{life_->mu};
+  check_usable();
+  if (level == h_->isolation) return;  // an unchanged level is taken anywhere, as in PostgreSQL
+  // PostgreSQL's order (check_transaction_isolation): a query first, then a
+  // subtransaction, then a hot standby.
+  auto after_query = [] {
+    return ast::SqlError{"SET TRANSACTION ISOLATION LEVEL must be called before any query", -1, kActiveSqlTransaction};
+  };
+  if (bc_txn_queried(h_->txn)) throw after_query();
+  if (!h_->savepoints.empty()) {
+    throw ast::SqlError{"SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction", -1,
+                        kActiveSqlTransaction};
+  }
+  refuse_serializable_on_follower(level, *db_->db_);
+  if (!bc_txn_set_mode(h_->txn, runtime_isolation(level), h_->read_only)) throw after_query();
+  h_->isolation = level;
+}
+
+void Transaction::set_read_only(bool read_only) {
+  if (!h_) throw std::logic_error("the transaction has ended");
+  std::shared_lock<std::shared_mutex> lock{life_->mu};
+  check_usable();
+  if (read_only == h_->read_only) return;
+  // PostgreSQL's order (check_transaction_read_only) for read-write: a
+  // subtransaction first, then a query.
+  if (!read_only && !h_->savepoints.empty()) {
+    throw ast::SqlError{"cannot set transaction read-write mode inside a read-only transaction", -1,
+                        kActiveSqlTransaction};
+  }
+  if (!bc_txn_set_mode(h_->txn, runtime_isolation(h_->isolation), read_only)) {
+    throw ast::SqlError{read_only ? "transaction read-only mode must be set before any query"
+                                  : "transaction read-write mode must be set before any query",
+                        -1, kActiveSqlTransaction};
+  }
+  h_->read_only = read_only;
+}
+
 void Transaction::fail() noexcept {
   if (!h_) return;
   std::shared_lock<std::shared_mutex> lock{life_->mu};
@@ -4304,6 +4492,7 @@ auto Transaction::commit() -> CommitOutcome {
   auto r = bc_txn_commit(h_->txn, db_->sync_commits_);
   auto code = bc_txn_error(h_->txn);
   auto detail = bc_txn_error_detail(h_->txn);
+  const auto read_write = r == BC_CONFLICT && bc_txn_conflict_read_write(h_->txn);
   std::string message;
   if (r == BC_FAILED && code != BC_E_UNKNOWN) {  // its exception's message is static
     try {
@@ -4314,7 +4503,7 @@ auto Transaction::commit() -> CommitOutcome {
   if (r == BC_COMMITTED) h_->commit_cursors();  // the hold cursors leave before the transaction is freed
   end_locked(r == BC_COMMITTED);
   lock.unlock();
-  if (r == BC_CONFLICT) throw_serialization_failure(kConflict);
+  if (r == BC_CONFLICT) throw_serialization_failure(read_write ? kReadWrite : kConflict);
   if (r == BC_FAILED) throw_error(code, detail, message);
   return CommitOutcome::Committed;
 }

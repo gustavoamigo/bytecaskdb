@@ -1117,7 +1117,7 @@ TEST_CASE("plan API: a reset keeps the write set's small slot buffers and frees 
 
   // In a transaction: bc_txn_add moves the items out, and the reset frees
   // the large slot buffers they leave.
-  auto* txn = bc_txn_new(&f.bdb, &f.bcat, 64u << 20);
+  auto* txn = bc_txn_new(&f.bdb, &f.bcat, 64u << 20, BC_ISOLATION_SNAPSHOT, false);
   REQUIRE(txn != nullptr);
   auto ps = params({});
   SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
@@ -1148,7 +1148,7 @@ struct TxnSteps {
 auto txn_set_qtys(Fixture& f, std::uint64_t max_bytes, std::vector<std::pair<std::int64_t, std::int64_t>> sets)
     -> TxnSteps {
   bc_ctx_reset(f.cx);
-  auto* txn = bc_txn_new(&f.bdb, &f.bcat, max_bytes);
+  auto* txn = bc_txn_new(&f.bdb, &f.bcat, max_bytes, BC_ISOLATION_SNAPSHOT, false);
   REQUIRE(txn != nullptr);
   SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
   auto ref = sr.get();
@@ -1248,7 +1248,7 @@ TEST_CASE("plan API: a transaction statement's write set past the room left in i
     REQUIRE(run(f, insert_plan_ok, {id, bytes("name"), id}) == BC_COMMITTED);
   }
   bc_ctx_reset(f.cx);
-  auto* txn = bc_txn_new(&f.bdb, &f.bcat, 16u << 10);
+  auto* txn = bc_txn_new(&f.bdb, &f.bcat, 16u << 10, BC_ISOLATION_SNAPSHOT, false);
   REQUIRE(txn != nullptr);
   auto ps = params({});
   SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
@@ -1280,7 +1280,7 @@ struct TxnRun {
 auto txn_set_all(Fixture& f, std::uint64_t max_bytes, std::int64_t qty, bool commit, bc_budget budget = {})
     -> TxnRun {
   bc_ctx_reset(f.cx);
-  auto* txn = bc_txn_new(&f.bdb, &f.bcat, max_bytes);
+  auto* txn = bc_txn_new(&f.bdb, &f.bcat, max_bytes, BC_ISOLATION_SNAPSHOT, false);
   REQUIRE(txn != nullptr);
   auto ps = params({qty});
   SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};

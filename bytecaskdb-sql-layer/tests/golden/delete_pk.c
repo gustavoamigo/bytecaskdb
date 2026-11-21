@@ -1,5 +1,5 @@
 // DELETE FROM t WHERE id = $1
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_1 t
 #include "bc_plan.h"
 enum { TBL_1 = 1 };

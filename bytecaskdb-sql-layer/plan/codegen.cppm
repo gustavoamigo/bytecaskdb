@@ -3410,7 +3410,7 @@ auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std
   out.constants = w.constant_values();
   if (own) {
     out.source = comment_line(sql) +
-                 comment_line("isolation: snapshot   schema: catalog v" + std::to_string(p.catalog_version)) +
+                 comment_line("schema: catalog v" + std::to_string(p.catalog_version)) +
                  comment_line("objects: " + w.legend()) + "#include \"bc_plan.h\"\n" + w.constants() + "\n" + subs +
                  "\nvoid plan(bc_ctx *cx) {\n" + w.body() + "}\n";
   }

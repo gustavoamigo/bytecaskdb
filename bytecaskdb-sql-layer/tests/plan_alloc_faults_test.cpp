@@ -445,7 +445,7 @@ TEST_CASE("plan API: an allocation failure in a pin, or in the clone the next wr
     auto failed = 0;
     for (long nth = 1;; ++nth) {
       REQUIRE(nth < 100000);
-      auto* txn = bc_txn_new(&f.bdb, &f.bcat, std::uint64_t{1} << 20);
+      auto* txn = bc_txn_new(&f.bdb, &f.bcat, std::uint64_t{1} << 20, BC_ISOLATION_SNAPSHOT, false);
       REQUIRE(txn != nullptr);
       statement(txn, 1);
       REQUIRE(bc_txn_add(f.cx));

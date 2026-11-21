@@ -1,5 +1,5 @@
 // SELECT qty, count(*) FROM t GROUP BY qty
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_1 t, COL_1_2 t.qty
 #include "bc_plan.h"
 enum { TBL_1 = 1, COL_1_2 = 2 };

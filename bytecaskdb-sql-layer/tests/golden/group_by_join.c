@@ -1,5 +1,5 @@
 // SELECT t.qty, count(*), sum(p.v) FROM t, p WHERE p.w = t.qty GROUP BY t.qty
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_1 t, COL_1_2 t.qty, TBL_4 p, COL_4_2 p.v, COL_4_3 p.w
 #include "bc_plan.h"
 enum { TBL_1 = 1, COL_1_2 = 2, TBL_4 = 4, COL_4_2 = 2, COL_4_3 = 3 };

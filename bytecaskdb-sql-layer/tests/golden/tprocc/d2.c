@@ -1,5 +1,5 @@
 // DELETE FROM new_order WHERE no_w_id = $1 AND no_d_id = $2 AND no_o_id = $3
-// isolation: snapshot   schema: catalog v13
+// schema: catalog v13
 // objects: TBL_13 new_order
 #include "bc_plan.h"
 enum { TBL_13 = 13 };

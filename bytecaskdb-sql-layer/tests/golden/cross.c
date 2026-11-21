@@ -1,5 +1,5 @@
 // SELECT s FROM r, t WHERE r.id = $1 AND name = $2
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_7 r, COL_7_1 r.s, IDX_3 t_by_name
 #include "bc_plan.h"
 enum { TBL_7 = 7, COL_7_1 = 1, IDX_3 = 3 };

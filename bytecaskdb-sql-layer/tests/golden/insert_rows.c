@@ -1,5 +1,5 @@
 // INSERT INTO t VALUES ($1, $2, $3), (4, DEFAULT, 5)
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_1 t, COL_1_0 t.id, COL_1_1 t.name, COL_1_2 t.qty
 #include "bc_plan.h"
 enum { TBL_1 = 1, COL_1_0 = 0, COL_1_1 = 1, COL_1_2 = 2 };

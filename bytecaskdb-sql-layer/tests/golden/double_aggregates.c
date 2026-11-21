@@ -1,5 +1,5 @@
 // SELECT sum(d), avg(d), min(d), max(d) FROM r
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: TBL_7 r, COL_7_2 r.d
 #include "bc_plan.h"
 enum { TBL_7 = 7, COL_7_2 = 2 };

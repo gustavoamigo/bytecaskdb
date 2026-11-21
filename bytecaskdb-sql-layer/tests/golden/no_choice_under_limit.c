@@ -1,5 +1,5 @@
 // SELECT a, b FROM p WHERE a = $1 AND w = $2 ORDER BY b LIMIT 3
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: IDX_6 p_w, PART_6_0 p_w.a, PART_6_1 p_w.b
 #include "bc_plan.h"
 enum { IDX_6 = 6, PART_6_0 = 1, PART_6_1 = 2 };

@@ -28,6 +28,7 @@
 // bytecaskdb/bytecask_hpp.cpp gives (LLVM 22's abi_tag redeclaration error).
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -101,6 +102,10 @@ using bytecask::sql::kPlanKeyGuardNodeBytes;
 using bytecask::sql::kPlanRangeGuardSlotBytes;
 using bytecask::sql::kPlanWriteSlotBytes;
 using bytecask::sql::kRangeNodeBytes;
+using bytecask::sql::kReadPointNodeBytes;
+using bytecask::sql::kReadRangeNodeBytes;
+using bytecask::sql::read_point_bytes;
+using bytecask::sql::read_range_bytes;
 using bytecask::sql::kTableSlotBytes;
 using bytecask::sql::kUniqueNodeBytes;
 using bytecask::sql::kWrittenRowNodeBytes;
@@ -549,6 +554,112 @@ private:
   }
 };
 
+#ifdef BYTECASK_SQL_TESTING
+// read_set_transitions_for_testing's counts: process-wide, constant-initialized.
+std::array<std::atomic<std::uint64_t>, kReadSetTransitions> g_read_set_transitions{};
+void count_transition(ReadSetTransition t) noexcept {
+  g_read_set_transitions.at(static_cast<std::size_t>(t)).fetch_add(1, std::memory_order_relaxed);
+}
+#else
+void count_transition(ReadSetTransition) noexcept {}
+#endif
+
+// The reads of a SERIALIZABLE transaction or autocommit execution
+// (docs/transaction_design.md, *Mechanism: the transaction's read set*): the
+// keys and key ranges its reads covered, which its commit submits as guards.
+// A point inside a range is not kept, and ranges that overlap or touch are
+// merged into their union, never across a gap, so the set grows with the
+// distinct keys and ranges read, not with how often they were read. `bytes`
+// is what its entries are charged (read_point_bytes, read_range_bytes, by
+// their buffers' capacities).
+struct ReadSet {
+  using Ranges = std::map<Bytes, Bytes, BytesLess>;  // lo -> hi: disjoint, none touching, none empty
+  using RangeNode = Ranges::node_type;
+  std::set<Bytes, BytesLess> points;
+  Ranges ranges;
+  std::uint64_t bytes{0};
+
+  [[nodiscard]] static auto cost(const RangeNode& n) -> std::uint64_t {
+    return read_range_bytes(n.key().capacity(), n.mapped().capacity());
+  }
+  [[nodiscard]] auto empty() const noexcept -> bool { return points.empty() && ranges.empty(); }
+
+  // Whether `key` is inside a range or held as a point: adding it adds nothing.
+  [[nodiscard]] auto holds(BytesView key) const -> bool {
+    auto it = ranges.upper_bound(key);
+    if (it != ranges.begin() && std::ranges::lexicographical_compare(key, std::prev(it)->second)) return true;
+    return points.contains(key);
+  }
+
+  // Adds `key`, charged read_point_bytes(key.size()) by the caller, unless
+  // it holds it already (false).
+  [[nodiscard]] auto add_point(BytesView key) -> bool {
+    if (holds(key)) return false;
+    Bytes k(key.begin(), key.end());
+    const auto n = read_point_bytes(k.capacity());
+    points.insert(std::move(k));
+    bytes += n;
+    count_transition(ReadSetTransition::NewPoint);
+    return true;
+  }
+
+  // Adds the range a node holds, merged with every range it overlaps or
+  // touches, and drops the points inside it. Allocates nothing: the node is
+  // the caller's, the ranges it merges are taken out whole, and whichever
+  // buffers hold the union's bounds are kept by swapping. So `bytes` grows
+  // by at most cost(nh) as it arrived; a merge only frees.
+  void add_range(RangeNode nh) noexcept {
+    auto lt = [](BytesView a, BytesView b) { return std::ranges::lexicographical_compare(a, b); };
+    auto it = ranges.upper_bound(BytesView{nh.key()});
+    if (it != ranges.begin() && !lt(std::prev(it)->second, nh.key())) --it;
+    count_transition(ReadSetTransition::NewRange);
+    while (it != ranges.end() && !lt(nh.mapped(), it->first)) {
+      count_transition(ReadSetTransition::Merge);
+      auto next = std::next(it);
+      auto m = ranges.extract(it);
+      bytes -= cost(m);
+      if (lt(m.key(), nh.key())) std::swap(nh.key(), m.key());
+      if (lt(nh.mapped(), m.mapped())) std::swap(nh.mapped(), m.mapped());
+      it = next;
+    }
+    for (auto p = points.lower_bound(BytesView{nh.key()}); p != points.end() && lt(*p, nh.mapped());) {
+      bytes -= read_point_bytes(p->capacity());
+      p = points.erase(p);
+      count_transition(ReadSetTransition::Swallow);
+    }
+    bytes += cost(nh);
+    ranges.insert(std::move(nh));
+  }
+
+  void clear() noexcept {
+    points.clear();
+    ranges.clear();
+    bytes = 0;
+  }
+};
+
+// A range node not in any map: what a read set's range is built in, and
+// what a cursor reserves at its open so that recording its range when it
+// ends allocates nothing.
+[[nodiscard]] auto range_node(Bytes lo, Bytes hi) -> ReadSet::RangeNode {
+  ReadSet::Ranges one;
+  one.emplace(std::move(lo), std::move(hi));
+  return one.extract(one.begin());
+}
+
+static_assert(kNodeBytesOf<Bytes> <= kReadPointNodeBytes);
+static_assert(kNodeBytesOf<std::pair<const Bytes, Bytes>> <= kReadRangeNodeBytes);
+
+// Proof that a read is in the read set, or needs not be (snapshot
+// isolation, a read-only transaction, a plan that writes nothing): what a
+// read must show to reach the snapshot (bc_ctx::view). Only bc_ctx's
+// recording calls make one, so a read that bypasses the recording does not
+// compile.
+class Recorded {
+  friend struct ::bc_ctx;
+  Recorded() noexcept {}  // NOLINT(modernize-use-equals-default): a defaulted one is never emitted (-Wunneeded-member-function)
+};
+
 // The entries a read sees through the view in [lo, hi), in key order or its
 // reverse: the snapshot's, with the overlay over them. On a key both hold the
 // overlay wins, and its tombstone hides the snapshot's entry. The snapshot's
@@ -610,6 +721,21 @@ struct Cursor {
   Bytes row_key;  // the row's key, rebuilt in place: no allocation per entry
   std::uint64_t row_step{0};  // the step `row` was fetched at; 0: none
   std::uint64_t held{0};  // what the buffers above are charged to the statement's memory budget
+  std::optional<Recorded> recorded;  // bc_scan_open's: its range is recorded, or needs not be
+  // SERIALIZABLE (docs/transaction_design.md, *What a read records for
+  // phantoms*): the range it covers, as bc_ctx::finish_scan records it when
+  // it closes, runs out or its statement ends. Reserved at its open: the
+  // node, the bounds of its whole range, and a charge for the largest range
+  // it can record, so the recording allocates and charges nothing.
+  struct Read {
+    ReadSet::RangeNode node;
+    Bytes lo, hi;  // its whole range, inside its table's or index's keys
+    Bytes last;    // the last key it handed out, with room for k⁺'s zero byte
+    std::uint64_t charge{0};
+    bool returned{false};  // it handed out a key
+    bool ran_out{false};   // it reached its range's end without an error
+  };
+  std::unique_ptr<Read> read;
 };
 
 // A view's row-ness, kept with bytes a structure copied, so a row comes back
@@ -953,11 +1079,22 @@ struct bc_ctx {
   std::uint64_t reads{0};
   std::optional<bytecask::Snapshot> snap;  // an autocommit execution's own
   // What every read goes through: the snapshot the execution reads (its own,
-  // or its transaction's) and, inside a transaction, the overlay of its
-  // earlier statements' writes, which the execution reads but never changes.
-  const bytecask::Snapshot* base{nullptr};
+  // or its transaction's: base_, reached only through view()) and, inside a
+  // transaction, the overlay of its earlier statements' writes, which the
+  // execution reads but never changes.
   const Overlay* overlay{nullptr};  // null outside a transaction
   bc_txn* txn{nullptr};
+  // The level of the context's autocommit executions (bc_ctx_set_isolation),
+  // the read set of the one in progress, and where this run records its
+  // reads (read_set): its transaction's read set, own_reads, or null when nothing is
+  // recorded (docs/transaction_design.md, *Mechanism: the transaction's read
+  // set*). Set by bc_ctx_run.
+  bc_isolation isolation{BC_ISOLATION_SNAPSHOT};
+  ReadSet own_reads;
+  ReadSet* read_set{nullptr};
+  // The last bc_ctx_commit conflicted at SERIALIZABLE with no key it wrote
+  // changed since its snapshot: a read/write dependency, not an update.
+  bool rw_conflict{false};
 #ifdef BYTECASK_SQL_TESTING
   std::function<void()> before_commit;  // bc_ctx_before_commit_for_testing
 #endif
@@ -1116,6 +1253,31 @@ struct bc_ctx {
   std::map<std::uint32_t, SubSet> sub_sets;
 
   bc_ctx(bytecask::DB* d, LiveCatalog* l) : db{d}, live{l} {}
+
+  // The snapshot the execution reads, for a read the token shows recorded.
+  [[nodiscard]] auto view(Recorded) const -> const bytecask::Snapshot& { return *base_; }
+  [[nodiscard]] auto has_view() const noexcept -> bool { return base_ != nullptr; }
+  void set_view(const bytecask::Snapshot* s) noexcept { base_ = s; }
+
+  // The recording reader (docs/transaction_design.md, *Mechanism: the
+  // transaction's read set*): each read asks for its token first, and the
+  // call records what the read will cover before it is made, charged, so a
+  // read is never lost from the read set once its result is seen. Nullopt,
+  // with BC_E_LIMIT (54000), BC_E_MEMORY or the context's error set, when it
+  // cannot be recorded: the read is not made. Defined with bc_txn.
+  [[nodiscard]] auto record_point(BytesView key) -> std::optional<Recorded>;
+  [[nodiscard]] auto record_range(BytesView lo, BytesView hi) -> std::optional<Recorded>;
+  // A cursor's range [lo, hi), reserved at its open; finish_scan records
+  // what of it the cursor covered, allocating and charging nothing.
+  [[nodiscard]] auto record_scan(Cursor& c, BytesView lo, BytesView hi) -> std::optional<Recorded>;
+  void finish_scan(Cursor& c) noexcept;
+  // Charges `n` bytes of the read set: to the transaction's bound and the
+  // memory cap in a transaction, to the statement's budget in autocommit.
+  [[nodiscard]] auto read_charge(std::uint64_t n) -> bool;
+  void read_release(std::uint64_t n) noexcept;
+  // False, with BC_E_READ_ONLY (25006), in a transaction begun read-only:
+  // what a write or guard of `command` calls first.
+  [[nodiscard]] auto writable(const char* command) -> bool;
 
   // A run that reached its window's end is unwound as a failed one is: every
   // call after the stop returns a neutral value. It is not an error.
@@ -1477,9 +1639,10 @@ struct bc_ctx {
     auto abandoned = txn != nullptr && ((!ok() && !refused_before_run) || !effects.empty());
     drop_cursors();  // iterators before the snapshot and the overlay they read
     clear_write_slots(effects);  // as the write set's other vectors at reset
-    base = nullptr;
+    base_ = nullptr;
     overlay = nullptr;
     if (txn != nullptr) txn_detach(txn, this, abandoned);
+    read_set = nullptr;
     txn = nullptr;
   }
 
@@ -1499,7 +1662,10 @@ struct bc_ctx {
     sort_keys.erase(sort_keys.begin() + static_cast<std::ptrdiff_t>(m.sort_keys), sort_keys.end());
     for (auto i = m.rows; i < rows.size(); ++i) released += rows[i].held + kRowEntryBytes;
     rows.erase(rows.begin() + static_cast<std::ptrdiff_t>(m.rows), rows.end());
-    for (auto i = m.cursors; i < cursors.size(); ++i) released += cursors[i].held + kCursorEntryBytes;
+    for (auto i = m.cursors; i < cursors.size(); ++i) {
+      finish_scan(cursors[i]);
+      released += cursors[i].held + kCursorEntryBytes;
+    }
     cursors.erase(cursors.begin() + static_cast<std::ptrdiff_t>(m.cursors), cursors.end());
     released += (hash_iters.size() - m.hash_iters) * kHashIterEntryBytes;
     hash_iters.erase(hash_iters.begin() + static_cast<std::ptrdiff_t>(m.hash_iters), hash_iters.end());
@@ -1536,6 +1702,7 @@ struct bc_ctx {
   void drop_cursors() noexcept {
     for (const auto& st : steps) leave_scope(st);
     steps.clear();
+    for (auto& c : cursors) finish_scan(c);
     cursors.clear();
   }
 
@@ -1586,7 +1753,12 @@ struct bc_ctx {
     write_held = 0;
     clear_write_slots(written_tables);
     reads = 0;
+    own_reads.clear();  // a new execution, or a retry's attempt, starts with an empty read set
+    rw_conflict = false;
   }
+
+private:
+  const bytecask::Snapshot* base_{nullptr};
 };
 
 // A savepoint's mark (docs/transaction_design.md, *Savepoints*): the
@@ -1619,6 +1791,18 @@ struct bc_txn {
   bytecask::DB* db;
   LiveCatalog* live;
   std::uint64_t max_bytes;
+  bc_isolation isolation;
+  bool read_only;
+  // SERIALIZABLE (docs/transaction_design.md, *Serializable isolation*): what
+  // its statements read, recorded as they read it, and what that is charged
+  // (read_bytes, with the reservations of the cursors open). Not part of a
+  // mark: a rollback to a savepoint keeps the reads, and their charge, since
+  // the client saw what they returned. Empty in a read-only transaction.
+  ReadSet reads;
+  std::uint64_t read_bytes{0};
+  // The commit conflicted with no key it wrote changed since its snapshot:
+  // a read/write dependency (docs/transaction_design.md, commit step 5).
+  bool rw_conflict{false};
 
   std::shared_ptr<const Catalog> pinned;
   // The catalog its statements are bound and run against: `pinned`, until
@@ -1694,8 +1878,11 @@ struct bc_txn {
   bc_memory_cap* memory{nullptr};
   std::uint64_t reserved{0};
 
-  bc_txn(bytecask::DB* d, LiveCatalog* l, std::uint64_t max, bc_memory_cap* m)
-      : db{d}, live{l}, max_bytes{max}, memory{m} {}
+  bc_txn(bytecask::DB* d, LiveCatalog* l, std::uint64_t max, bc_memory_cap* m, bc_isolation iso, bool ro)
+      : db{d}, live{l}, max_bytes{max}, isolation{iso}, read_only{ro}, memory{m} {}
+
+  // Its statements record their reads: SERIALIZABLE, not read-only.
+  [[nodiscard]] auto records() const noexcept -> bool { return isolation == BC_ISOLATION_SERIALIZABLE && !read_only; }
   ~bc_txn() { release_memory(); }
   bc_txn(const bc_txn&) = delete;
   bc_txn& operator=(const bc_txn&) = delete;
@@ -1807,7 +1994,7 @@ namespace {
 // statements were not held to.
 // The marks' overlays count as the pins' do.
 auto txn_holds(const bc_txn& t) -> std::uint64_t {
-  return t.overlay->bytes + t.held + t.pinned_bytes + t.marked_bytes + t.plan_bytes + t.catalog_bytes;
+  return t.overlay->bytes + t.held + t.pinned_bytes + t.marked_bytes + t.plan_bytes + t.catalog_bytes + t.read_bytes;
 }
 
 // What the transaction reserves of the memory cap for itself: txn_holds but
@@ -1822,6 +2009,160 @@ auto bc_ctx::txn_room(std::uint64_t bytes) -> bool {
   if (txn_holds(*txn) + txn->mark_pending() + bytes <= txn->max_bytes) return true;
   fail(BC_E_LIMIT, "the transaction's writes would pass its bound of " + std::to_string(txn->max_bytes) + " bytes");
   return false;
+}
+
+auto bc_ctx::writable(const char* command) -> bool {
+  if (txn == nullptr || !txn->read_only) return true;
+  fail(BC_E_READ_ONLY, std::string{"cannot execute "} + command + " in a read-only transaction");
+  return false;
+}
+
+auto bc_ctx::read_charge(std::uint64_t n) -> bool {
+  if (!ok()) return false;
+  if (txn != nullptr) {
+    if (txn_holds(*txn) + txn->mark_pending() + write_held + n > txn->max_bytes) {
+      fail(BC_E_LIMIT, "the SERIALIZABLE transaction's reads would pass its bound of " + std::to_string(txn->max_bytes) +
+                           " bytes");
+      return false;
+    }
+    // The transaction reserves what it holds of the memory cap (cap_holds):
+    // its read set grows between its statements' bc_txn_add, so here.
+    if (txn->memory != nullptr && cap_holds(*txn) + n > txn->reserved) {
+      const auto need = cap_holds(*txn) + n - txn->reserved;
+      const auto grant = cap_reserve(*txn->memory, need, need);
+      if (grant == 0) {
+        fail(BC_E_MEMORY, cap_message(*txn->memory));
+        return false;
+      }
+      txn->reserved += grant;
+    }
+    txn->read_bytes += n;
+    return true;
+  }
+  if (budget.max_bytes != 0 && n > budget.max_bytes - std::min(mem_used, budget.max_bytes)) {
+    fail(BC_E_LIMIT, "the SERIALIZABLE statement's reads would pass its memory budget of " +
+                         std::to_string(budget.max_bytes) + " bytes");
+    return false;
+  }
+  return take(n);
+}
+
+void bc_ctx::read_release(std::uint64_t n) noexcept {
+  if (txn != nullptr) {
+    txn->read_bytes -= std::min(n, txn->read_bytes);
+  } else {
+    release(n);
+  }
+}
+
+auto bc_ctx::record_point(BytesView key) -> std::optional<Recorded> {
+  if (!ok()) return std::nullopt;
+  if (read_set == nullptr || read_set->holds(key)) return Recorded{};
+  const auto n = read_point_bytes(key.size());
+  if (!read_charge(n)) return std::nullopt;
+  try {
+    if (!read_set->add_point(key)) read_release(n);
+  } catch (...) {
+    read_release(n);  // nothing was added; the read is not made
+    throw;
+  }
+  return Recorded{};
+}
+
+auto bc_ctx::record_range(BytesView lo, BytesView hi) -> std::optional<Recorded> {
+  if (!ok()) return std::nullopt;
+  if (read_set == nullptr || !std::ranges::lexicographical_compare(lo, hi)) return Recorded{};
+  const auto n = read_range_bytes(lo.size(), hi.size());
+  if (!read_charge(n)) return std::nullopt;
+  std::optional<ReadSet::RangeNode> node;
+  try {
+    node.emplace(range_node(Bytes(lo.begin(), lo.end()), Bytes(hi.begin(), hi.end())));
+  } catch (...) {
+    read_release(n);
+    throw;
+  }
+  const auto before = read_set->bytes;
+  read_set->add_range(std::move(*node));
+  read_release(before + n - read_set->bytes);  // what a merge freed
+  return Recorded{};
+}
+
+auto bc_ctx::record_scan(Cursor& c, BytesView lo, BytesView hi) -> std::optional<Recorded> {
+  if (!ok()) return std::nullopt;
+  if (read_set == nullptr || !std::ranges::lexicographical_compare(lo, hi)) return Recorded{};
+  // The largest range it can record: its own bounds, or one of them and a
+  // key it handed out with k⁺'s byte, no longer than the key ceiling's.
+  constexpr auto kKey = bytecask::sql::kMaxKeyBytes + 1;
+  const auto n = read_range_bytes(std::max(lo.size(), kKey), std::max(hi.size(), kKey));
+  if (!read_charge(n)) return std::nullopt;
+  try {
+    auto r = std::make_unique<Cursor::Read>();
+    r->node = range_node({}, {});
+    r->lo.assign(lo.begin(), lo.end());
+    r->hi.assign(hi.begin(), hi.end());
+    r->charge = n;
+    c.read = std::move(r);
+  } catch (...) {
+    read_release(n);
+    throw;
+  }
+  return Recorded{};
+}
+
+namespace {
+
+// k⁺ in place (docs/transaction_design.md, *What a read records for
+// phantoms*): `k` followed by a zero byte, the least key above it; past the
+// key ceiling, the successor of its longest prefix that does not end in
+// 0xFF, the least key above every key that starts with it. Never longer
+// than the key ceiling, and never past the object's keyspace, which every
+// key's storage-id prefix bounds. Allocates nothing given capacity for one
+// more byte.
+void successor_in_place(Bytes& k) {
+  if (k.size() < bytecask::sql::kMaxKeyBytes) {
+    k.push_back(std::byte{0});
+    return;
+  }
+  while (!k.empty() && k.back() == std::byte{0xFF}) k.pop_back();
+  if (!k.empty()) k.back() = static_cast<std::byte>(std::to_integer<unsigned>(k.back()) + 1);
+}
+
+}  // namespace
+
+void bc_ctx::finish_scan(Cursor& c) noexcept {
+  if (!c.read) return;
+  auto r = std::move(c.read);
+  if (!r->ran_out && !r->returned) {
+    read_release(r->charge);  // it handed out nothing: its result depends on no key
+    return;
+  }
+  // Every key of its range, those absent included (the empty-range
+  // phantom), when it ran out; else what it covered up to the last key it
+  // handed out, [lo, k⁺) forward and [k, hi) in reverse.
+  Bytes* lo = &r->lo;
+  Bytes* hi = &r->hi;
+  if (!r->ran_out) {
+    if ((c.flags & BC_SCAN_REVERSE) != 0) {
+      lo = &r->last;
+    } else {
+      successor_in_place(r->last);  // room for its byte was reserved with the key
+      hi = &r->last;
+    }
+  }
+  // Within the reservation by its construction; should a buffer have grown
+  // past it, the whole range, which the reservation counted, is recorded.
+  if (read_range_bytes(lo->capacity(), hi->capacity()) > r->charge ||
+      !std::ranges::lexicographical_compare(*lo, *hi)) {
+    lo = &r->lo;
+    hi = &r->hi;
+  }
+  auto& nh = r->node;
+  std::swap(nh.key(), *lo);
+  std::swap(nh.mapped(), *hi);
+  count_transition(ReadSetTransition::Fill);
+  const auto before = read_set->bytes;
+  read_set->add_range(std::move(nh));
+  read_release(before + r->charge - read_set->bytes);
 }
 
 void txn_detach(bc_txn* txn, bc_ctx* cx, bool abandoned) noexcept {
@@ -1888,6 +2229,8 @@ void txn_abort(bc_txn* txn) noexcept {
   txn->written = {};
   txn->held = 0;
   txn->plan_bytes = 0;  // the plans were for the pin dropped above
+  txn->reads.clear();   // it can no longer commit: no read of it is ever submitted
+  txn->read_bytes = 0;
   txn->release_memory();
 }
 
@@ -2013,7 +2356,7 @@ auto ViewEntries::next(bc_ctx* cx) -> bool {
 // Reads `key` through the view into `out`: the overlay's answer if it has
 // one, else the snapshot's. Charged by the caller. Throws what the engine
 // throws: an error is never taken as absent.
-auto view_get(const bc_ctx* cx, BytesView key, Bytes& out) -> bool {
+auto view_get(const bc_ctx* cx, Recorded rec, BytesView key, Bytes& out) -> bool {
   if (cx->overlay != nullptr) {
     if (auto hit = cx->overlay->find(key)) {
       if (*hit == nullptr) return false;
@@ -2021,14 +2364,22 @@ auto view_get(const bc_ctx* cx, BytesView key, Bytes& out) -> bool {
       return true;
     }
   }
-  return cx->base->get({}, key, out);
+  return cx->view(rec).get({}, key, out);
 }
 
-auto view_contains(const bc_ctx* cx, BytesView key) -> bool {
+auto view_contains(const bc_ctx* cx, Recorded rec, BytesView key) -> bool {
   if (cx->overlay != nullptr) {
     if (auto hit = cx->overlay->find(key)) return *hit != nullptr;
   }
-  return cx->base->contains_key({}, key);
+  return cx->view(rec).contains_key({}, key);
+}
+
+// A point read through the view, recorded first: nullopt, with the error
+// set, when it cannot be recorded or its read cannot be charged.
+auto read_contains(bc_ctx* cx, BytesView key) -> std::optional<bool> {
+  auto rec = cx->record_point(key);
+  if (!rec || !cx->charge()) return std::nullopt;
+  return view_contains(cx, *rec, key);
 }
 
 // The live keys in [lo, hi) the view holds, counted no further than
@@ -2036,10 +2387,11 @@ auto view_contains(const bc_ctx* cx, BytesView key) -> bool {
 // snapshot's keys in each deleted range, then corrected by one existence
 // check per overlay point in the range. Each count is at most two record
 // reads and each check one, all charged; the caller charged the first.
-auto view_count(bc_ctx* cx, BytesView lo, BytesView hi, std::size_t limit) -> std::size_t {
+auto view_count(bc_ctx* cx, Recorded rec, BytesView lo, BytesView hi, std::size_t limit) -> std::size_t {
   constexpr auto kAll = std::numeric_limits<std::size_t>::max();
   const auto& ov = *cx->overlay;
-  auto n = cx->base->count_keys(lo, hi, kAll);
+  const auto& base = cx->view(rec);
+  auto n = base.count_keys(lo, hi, kAll);
   auto r = ov.ranges.upper_bound(lo);
   if (r != ov.ranges.begin() && std::is_lt(bytes_cmp(lo, std::prev(r)->second))) --r;
   for (; r != ov.ranges.end() && std::is_lt(bytes_cmp(r->first, hi)); ++r) {
@@ -2047,12 +2399,12 @@ auto view_count(bc_ctx* cx, BytesView lo, BytesView hi, std::size_t limit) -> st
     auto b = std::is_lt(bytes_cmp(hi, r->second)) ? hi : BytesView{r->second};
     if (!std::is_lt(bytes_cmp(a, b))) continue;
     if (!cx->charge(2)) return 0;
-    n -= cx->base->count_keys(a, b, kAll);
+    n -= base.count_keys(a, b, kAll);
   }
   for (auto p = ov.points.lower_bound(lo); p != ov.points.end() && std::is_lt(bytes_cmp(p->first, hi)); ++p) {
     if (!cx->charge()) return 0;
     auto in_view = p->second.has_value();
-    auto in_snapshot = !ov.covered(p->first) && cx->base->contains_key({}, p->first);
+    auto in_snapshot = !ov.covered(p->first) && base.contains_key({}, p->first);
     if (in_view && !in_snapshot) ++n;
     if (!in_view && in_snapshot) --n;
   }
@@ -2068,7 +2420,7 @@ auto cursor_advance(bc_ctx* cx, Cursor& c) -> bool {
     auto end = bytecask::sql::key_successor(c.prefix);
     BytesView lo = std::is_lt(bytes_cmp(c.lo, c.prefix)) ? BytesView{c.prefix} : BytesView{c.lo};
     BytesView hi = !c.hi.empty() && std::is_lt(bytes_cmp(c.hi, end)) ? BytesView{c.hi} : BytesView{end};
-    c.entries.emplace(*cx->base, cx->overlay, lo, hi, (c.flags & BC_SCAN_REVERSE) != 0);
+    c.entries.emplace(cx->view(*c.recorded), cx->overlay, lo, hi, (c.flags & BC_SCAN_REVERSE) != 0);
   }
   return c.entries->next(cx);
 }
@@ -2091,9 +2443,10 @@ void leave_entry(bc_ctx* cx, Cursor& c) noexcept {
 // transaction sees it.
 auto read_record(bc_ctx* cx, BytesView key, bool* found) -> bc_view {
   if (found != nullptr) *found = false;
-  if (!cx->charge()) return {};
+  auto rec = cx->record_point(key);  // found absent or present, the key is read
+  if (!rec || !cx->charge()) return {};
   Bytes out;
-  if (!view_get(cx, key, out)) return {};
+  if (!view_get(cx, *rec, key, out)) return {};
   std::uint32_t table = 0;
   if (auto obj = key_object(key); obj && obj->first == bytecask::sql::kNsRow && cx->cat->table(obj->second) != nullptr) {
     table = obj->second;
@@ -2846,15 +3199,16 @@ struct Entry {
 // free only because an earlier statement deleted it conflicts with the row
 // deleted, a 40001 in PostgreSQL as here.
 [[nodiscard]] auto pk_free(bc_ctx* cx, const Table& t, BytesView pk) -> bool {
-  if (!cx->charge()) return false;
-  if (view_contains(cx, pk)) {
+  auto rec = cx->record_point(pk);
+  if (!rec || !cx->charge()) return false;
+  if (view_contains(cx, *rec, pk)) {
     cx->raise(BC_C_UNIQUE, t.id);
     return false;
   }
   // Free in the view; when the overlay decided it, ask the snapshot.
   if (cx->overlay != nullptr && cx->overlay->find(pk)) {
     if (!cx->charge()) return false;
-    if (cx->base->contains_key({}, pk)) return true;
+    if (cx->view(*rec).contains_key({}, pk)) return true;
   }
   return cx->push_claim(t.id, pk, std::nullopt);
 }
@@ -2894,18 +3248,21 @@ void lock_row(bc_ctx* cx, BytesView pk, BytesView row) {
 // earlier statement deleted it is no claim.
 [[nodiscard]] auto prefix_taken(bc_ctx* cx, BytesView prefix, BytesView end, bool& claim) -> std::optional<bool> {
   claim = true;
+  auto rec = cx->record_range(prefix, end);
+  if (!rec) return std::nullopt;
+  const auto& base = cx->view(*rec);
   if (cx->overlay != nullptr && cx->overlay->meets(prefix, end)) {
     // The overlay holds entries with this prefix, or deleted some: the
     // first entry the view holds at or after it decides, each read charged.
-    ViewEntries entries{*cx->base, cx->overlay, prefix, end, false};
+    ViewEntries entries{base, cx->overlay, prefix, end, false};
     auto taken = entries.next(cx);
     if (!cx->ok()) return std::nullopt;
     if (taken) return true;
     if (!cx->charge()) return std::nullopt;
-    claim = !holds_prefix(*cx->base, prefix);
+    claim = !holds_prefix(base, prefix);
     return false;
   }
-  return holds_prefix(*cx->base, prefix);
+  return holds_prefix(base, prefix);
 }
 
 // No entry has this unique index prefix in the view, and no earlier write
@@ -3010,6 +3367,65 @@ void refuse_f64_part(bc_ctx* cx) {
 
 }  // namespace
 
+namespace {
+
+// Commit step 2 (docs/transaction_design.md, *Mechanism: the serializable
+// commit*): every read range as ensure_range_unchanged and every read point
+// as ensure_unchanged, but a point `written` says the final writes put or
+// delete, which the engine checks already. A point a hand-written
+// bc_guard_present or bc_guard_absent sits on goes as the one-key range
+// [k, k⁺), which means the same: the engine takes one precondition per key.
+template <class Written>
+void guard_reads(bytecask::WritePlan& plan, const ReadSet& reads, std::span<const Effect> guards, Written&& written) {
+  auto hand = [](const Effect& e) { return e.kind == EffectKind::GuardPresent || e.kind == EffectKind::GuardAbsent; };
+  const auto any_hand = std::ranges::any_of(guards, hand);
+  for (const auto& [lo, hi] : reads.ranges) plan.ensure_range_unchanged(lo, hi);
+  for (const auto& k : reads.points) {
+    if (written(BytesView{k})) continue;
+    if (any_hand && std::ranges::any_of(guards, [&](const Effect& e) { return hand(e) && e.a == k; })) {
+      Bytes hi = k;
+      successor_in_place(hi);
+      plan.ensure_range_unchanged(k, hi);
+    } else {
+      plan.ensure_unchanged(k);
+    }
+  }
+}
+
+// Commit step 1: whether the final writes only delete keys the snapshot does
+// not hold, so write nothing. One lookup per tombstone, and none once a put
+// or a range is found.
+auto deletes_only_absent(const Overlay& ov, const bytecask::Snapshot& snap) -> bool {
+  if (!ov.ranges.empty()) return false;
+  if (std::ranges::any_of(ov.points, [](const auto& p) { return p.second.has_value(); })) return false;
+  return std::ranges::none_of(ov.points, [&](const auto& p) { return snap.contains_key({}, p.first); });
+}
+
+// Commit step 5: whether a key the commit wrote changed between its
+// snapshot, `before`, and the latest state: the "concurrent update" of a
+// SERIALIZABLE conflict, else a read/write dependency. Run only after a
+// conflict; `keys` visits the written keys. A probe that fails answers
+// "changed", the message of any conflict.
+template <class Keys>
+auto written_changed(const bytecask::Snapshot& before, bytecask::DB& db, Keys&& keys) noexcept -> bool {
+  try {
+    auto latest = db.snapshot();
+    auto changed = false;
+    Bytes then, now;
+    keys([&](BytesView k) {
+      if (changed) return;
+      const auto had = before.get({}, k, then);
+      const auto has = latest.get({}, k, now);
+      changed = had != has || (had && then != now);
+    });
+    return changed;
+  } catch (...) {
+    return true;
+  }
+}
+
+}  // namespace
+
 void bc_ctx_begin_frame(bc_ctx* cx, const bc_params* params, bc_budget budget) {
   BC_GUARD_BEGIN
   cx->drop_execution_state();
@@ -3083,7 +3499,7 @@ void bc_ctx_begin(bc_ctx* cx, const bc_params* params, bc_budget budget) {
   cx->pinned = std::move(p.cat);
   cx->cat = cx->pinned.get();
   cx->snap.emplace(std::move(p.snap));
-  cx->base = &*cx->snap;
+  cx->set_view(&*cx->snap);
   BC_GUARD_END(cx)
 }
 
@@ -3212,15 +3628,18 @@ void bc_ctx_begin_txn(bc_ctx* cx, bc_txn* txn, const bc_params* params, bc_budge
   // makes (verify, layouts, index maintenance) reads it.
   cx->pinned = txn->catalog;
   cx->cat = cx->pinned.get();
-  cx->base = &*txn->snap;
+  cx->set_view(&*txn->snap);
   cx->overlay = txn->overlay.get();
+  // Its reads join the transaction's read set: those of a procedure's
+  // statements too, which run without bc_ctx_run.
+  cx->read_set = txn->records() ? &txn->reads : nullptr;
   BC_GUARD_END(cx)
 }
 
 bool bc_ctx_check(bc_ctx* cx, const bc_schema_ref* checked_against) {
   BC_GUARD_BEGIN
   if (!cx->ok()) return false;
-  if (cx->base == nullptr) {
+  if (!cx->has_view()) {
     cx->fail(BC_E_HANDLE, "bc_ctx_check or bc_ctx_run without bc_ctx_begin");
     return false;
   }
@@ -3234,6 +3653,20 @@ void bc_ctx_run(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* checked_agains
   BC_GUARD_BEGIN
   cx->affected = -1;  // the count is the run's: a failed run reports none
   if (!bc_ctx_check(cx, checked_against)) return;
+  // Where its reads are recorded (docs/transaction_design.md, *Mechanism:
+  // the transaction's read set*): a SERIALIZABLE transaction's read set,
+  // unless it was begun read-only (bc_ctx_begin_txn); an autocommit
+  // execution's own, unless its plan writes no table, when its reads could
+  // never be submitted.
+  if (cx->txn != nullptr) {
+    // A read-only transaction refuses a statement that writes before it
+    // runs, whether or not it would reach a row, as PostgreSQL does.
+    if (!cx->verified.written.empty() && !cx->writable("a statement that writes")) return;
+  } else if (cx->isolation == BC_ISOLATION_SERIALIZABLE && cx->snap && !cx->verified.written.empty()) {
+    cx->read_set = &cx->own_reads;
+  } else {
+    cx->read_set = nullptr;
+  }
   // limit 0 wants no row: the plan, verified, reads nothing.
   cx->unwinding = cx->windowed && cx->window_limit == 0;
   plan(cx);
@@ -3264,9 +3697,14 @@ enum bc_commit_result bc_ctx_commit(bc_ctx* cx, bool sync) {
     cx->fail(BC_E_HANDLE, "bc_ctx_commit without a run to commit");
     return BC_FAILED;
   }
-  cx->drop_cursors();
+  cx->drop_cursors();  // a cursor's range joins the read set as it closes
+  // SERIALIZABLE: the snapshot as it was, which a conflict's message reads
+  // (commit step 5); a reference count.
+  std::optional<bytecask::Snapshot> before;
+  if (cx->read_set != nullptr) before.emplace(cx->snap->clone());
   // The plan's copies were charged with the effects they copy, and the
-  // tables' record guards with the tables (effect_bytes, table_bytes).
+  // tables' record guards with the tables (effect_bytes, table_bytes), and
+  // the read set's with its entries (read_point_bytes, read_range_bytes).
   bytecask::WritePlan plan{std::move(*cx->snap)};
   cx->snap.reset();
   for (const auto& e : cx->effects) {
@@ -3285,11 +3723,26 @@ enum bc_commit_result bc_ctx_commit(bc_ctx* cx, bool sync) {
   // changes the table's record: the commit is then a conflict, and the
   // retry pins the new catalog version, whose indexes it maintains.
   for (auto id : cx->written_tables) plan.ensure_unchanged(bytecask::sql::table_record_key(id));
-  cx->effects.clear();  // handed to the engine: a second commit has nothing to submit
+  // SERIALIZABLE (commit steps 2 and 4): what it read, unchanged at its
+  // commit, and the catalog every object it used was bound through. A key
+  // it writes is checked by the engine already, and its guard repeats that.
+  if (cx->read_set != nullptr) {
+    guard_reads(plan, *cx->read_set, cx->effects, [](BytesView) { return false; });
+    plan.ensure_unchanged(bytecask::sql::catalog_version_key());
+  }
 #ifdef BYTECASK_SQL_TESTING
   if (cx->before_commit) cx->before_commit();
 #endif
-  return submit(cx->sink(), *cx->db, std::move(plan), sync);
+  auto r = submit(cx->sink(), *cx->db, std::move(plan), sync);
+  if (r == BC_CONFLICT && before) {
+    cx->rw_conflict = !written_changed(*before, *cx->db, [&](auto&& visit) {
+      for (const auto& e : cx->effects) {
+        if (e.kind == EffectKind::Put || e.kind == EffectKind::Del) visit(BytesView{e.a});
+      }
+    });
+  }
+  cx->effects.clear();  // handed to the engine: a second commit has nothing to submit
+  return r;
   BC_GUARD_END(cx)
   return BC_FAILED;  // the guard caught a throw: never BC_COMMITTED
 }
@@ -3311,7 +3764,7 @@ void bc_ctx_reset(bc_ctx* cx) { cx->drop_execution_state(); }
 
 void bc_ctx_window(bc_ctx* cx, uint64_t skip, uint64_t limit) {
   BC_GUARD_BEGIN
-  if (cx->base == nullptr || cx->emitted != 0 || cx->windowed) {
+  if (!cx->has_view() || cx->emitted != 0 || cx->windowed) {
     cx->fail(BC_E_HANDLE, "bc_ctx_window needs a begun context that has run nothing, once");
     return;
   }
@@ -3335,6 +3788,56 @@ int64_t bc_ctx_affected(const bc_ctx* cx) { return cx->affected; }
 
 }  // extern "C"
 
+bool bc_txn_conflict_read_write(const bc_txn* txn) noexcept { return txn->rw_conflict; }
+bool bc_ctx_conflict_read_write(const bc_ctx* cx) noexcept { return cx->rw_conflict; }
+
+#ifdef BYTECASK_SQL_TESTING
+namespace {
+auto contents_of(const ReadSet& r) -> ReadSetContents {
+  ReadSetContents out;
+  out.points.assign(r.points.begin(), r.points.end());
+  for (const auto& [lo, hi] : r.ranges) out.ranges.emplace_back(lo, hi);
+  out.bytes = r.bytes;
+  out.charged = r.bytes;
+  return out;
+}
+}  // namespace
+
+ReadSetContents bc_txn_reads_for_testing(const bc_txn* txn) {
+  auto out = contents_of(txn->reads);
+  out.charged = txn->read_bytes;
+  return out;
+}
+
+ReadSetContents bc_ctx_reads_for_testing(const bc_ctx* cx) { return contents_of(cx->own_reads); }
+
+auto read_successor_for_testing(Bytes k) -> Bytes {
+  k.reserve(k.size() + 1);
+  successor_in_place(k);
+  return k;
+}
+
+auto read_set_transitions_for_testing(bool reset) -> std::array<std::uint64_t, kReadSetTransitions> {
+  std::array<std::uint64_t, kReadSetTransitions> out{};
+  for (std::size_t i = 0; i < kReadSetTransitions; ++i) {
+    out.at(i) = reset ? g_read_set_transitions.at(i).exchange(0) : g_read_set_transitions.at(i).load();
+  }
+  return out;
+}
+
+ReadSetContents read_set_apply_for_testing(std::span<const ReadSetOp> ops) {
+  ReadSet r;
+  for (const auto& op : ops) {
+    if (op.hi.empty()) {
+      (void)r.add_point(op.lo);
+    } else {
+      r.add_range(range_node(op.lo, op.hi));
+    }
+  }
+  return contents_of(r);
+}
+#endif
+
 #ifdef BYTECASK_SQL_TESTING
 void bc_ctx_before_commit_for_testing(bc_ctx* cx, std::function<void()> hook) { cx->before_commit = std::move(hook); }
 std::uint64_t bc_ctx_held_for_testing(const bc_ctx* cx) { return cx->mem_used; }
@@ -3347,13 +3850,27 @@ extern "C" {
 
 // ------------------------------------------------------------ transactions
 
-bc_txn* bc_txn_new(bc_db* db, const bc_catalog* cat, uint64_t max_bytes) {
+bc_txn* bc_txn_new(bc_db* db, const bc_catalog* cat, uint64_t max_bytes, enum bc_isolation isolation, bool read_only) {
   try {
-    return new bc_txn(db->db, cat->live, max_bytes, db->memory);
+    return new bc_txn(db->db, cat->live, max_bytes, db->memory, isolation, read_only);
   } catch (...) {
     return nullptr;
   }
 }
+
+bool bc_txn_queried(const bc_txn* txn) {
+  return txn->statements != 0 || txn->pins != 0 || txn->attached != nullptr || !txn->reads.empty();
+}
+
+bool bc_txn_set_mode(bc_txn* txn, enum bc_isolation isolation, bool read_only) {
+  // Before anything has read: a read made at one level is never judged at another.
+  if (bc_txn_queried(txn) || !txn->marks.empty() || txn->aborted || txn->done) return false;
+  txn->isolation = isolation;
+  txn->read_only = read_only;
+  return true;
+}
+
+void bc_ctx_set_isolation(bc_ctx* cx, enum bc_isolation isolation) { cx->isolation = isolation; }
 
 void bc_txn_free(bc_txn* txn) {
   if (txn == nullptr) return;
@@ -3365,7 +3882,11 @@ uint64_t bc_txn_catalog_version(const bc_txn* txn) { return txn->pinned ? txn->p
 
 bool bc_txn_repin(bc_txn* txn) {
   // A pin reads the snapshot: moving it would change what the cursor sees.
-  if (txn->statements != 0 || txn->pins != 0 || txn->aborted || txn->done || txn->attached != nullptr) return false;
+  // A read made at the old snapshot is never guarded against a new one.
+  if (txn->statements != 0 || txn->pins != 0 || txn->aborted || txn->done || txn->attached != nullptr ||
+      !txn->reads.empty()) {
+    return false;
+  }
   txn->snap.reset();
   txn->pinned.reset();
   txn->catalog.reset();
@@ -3537,7 +4058,7 @@ void bc_ctx_begin_hold(bc_ctx* cx, const bc_hold* hold, const bc_params* params,
   cx->budget = budget;
   cx->pinned = hold->pinned;
   cx->cat = cx->pinned.get();
-  cx->base = &hold->snap;
+  cx->set_view(&hold->snap);
   cx->overlay = hold->view.get();
   BC_GUARD_END(cx)
 }
@@ -3725,6 +4246,11 @@ auto bc_txn_ddl(bc_txn* txn, std::shared_ptr<const Catalog> next, std::vector<Ca
     txn->sink().clear();
     if (txn->aborted || txn->done || txn->attached != nullptr || !txn->snap || !next) {
       txn->sink().fail(BC_E_HANDLE, "bc_txn_ddl needs an open transaction with no statement open, and a catalog");
+      return false;
+    }
+    if (txn->read_only) {
+      txn->sink().fail(BC_E_READ_ONLY, "cannot execute DDL in a read-only transaction");
+      txn_abort(txn);
       return false;
     }
     // The ops of a DDL that changed the catalog guard and bump its version
@@ -3918,10 +4444,22 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
   // Guards a later statement made stale are pruned first: a transaction left
   // with none of them and no write sends the engine nothing.
   auto counts = [&](const Effect& e) { return guard_counts(e, ov); };
-  if (ov.empty() && std::ranges::none_of(txn->guards, counts)) {
+  // SERIALIZABLE (docs/transaction_design.md, *Mechanism: the serializable
+  // commit*): a transaction whose final writes are empty and that ran no DDL
+  // is a reader, serialized at its snapshot, and submits none of its reads
+  // (step 1). One that writes submits them all (step 2).
+  // Its final writes are the final overlay: at SERIALIZABLE, one that only
+  // deletes keys its snapshot does not hold (an insert deleted again) writes
+  // nothing, and is a reader too: its tombstones are dropped with its reads.
+  const auto writes = !ov.empty() && !(txn->records() && !txn->has_ddl() && deletes_only_absent(ov, *txn->snap));
+  const auto serial = txn->records() && (writes || txn->has_ddl());
+  if (!writes && std::ranges::none_of(txn->guards, counts)) {
     txn->snap.reset();
     return BC_COMMITTED;
   }
+  // The snapshot as it was, which a conflict's message reads (step 5).
+  std::optional<bytecask::Snapshot> before;
+  if (serial) before.emplace(txn->snap->clone());
   // The plan copies every write and guard while the overlay still holds
   // them, which a conflict reads back after the submit. Each copy was held
   // to max_bytes with the statement that made it (txn_holds): no check here.
@@ -3931,8 +4469,11 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
   // and the engine applies a plan's operations in order.
   bytecask::WritePlan plan{std::move(*txn->snap)};
   txn->snap.reset();
-  for (const auto& [lo, hi] : ov.ranges) plan.del_range(lo, hi);
+  for (const auto& [lo, hi] : ov.ranges) {
+    if (writes) plan.del_range(lo, hi);
+  }
   for (const auto& [key, value] : ov.points) {
+    if (!writes) break;
     if (value) {
       plan.put(key, *value);
     } else {
@@ -3952,12 +4493,25 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
       case EffectKind::DelRange: break;  // never kept as guards
     }
   }
-  if (txn->has_ddl()) return commit_ddl(txn, out, std::move(plan));
-  // As bc_ctx_commit: a DDL on a table the transaction wrote, committed
-  // since its snapshot, makes the commit a conflict.
-  for (auto id : txn->written) plan.ensure_unchanged(bytecask::sql::table_record_key(id));
-  auto r = submit(out, *txn->db, std::move(plan), sync);
-  return r == BC_CONFLICT ? conflict_or_duplicate(out, *txn->db, txn->claims, txn->locks, txn->overlay.get()) : r;
+  if (serial) guard_reads(plan, txn->reads, txn->guards, [&](BytesView k) { return ov.find(k).has_value(); });
+  auto r = BC_FAILED;
+  if (txn->has_ddl()) {
+    r = commit_ddl(txn, out, std::move(plan));  // it guards the catalog version
+  } else {
+    // As bc_ctx_commit: a DDL on a table the transaction wrote, committed
+    // since its snapshot, makes the commit a conflict.
+    for (auto id : txn->written) plan.ensure_unchanged(bytecask::sql::table_record_key(id));
+    // SERIALIZABLE (step 4): every object it was bound through is as it was.
+    if (serial) plan.ensure_unchanged(bytecask::sql::catalog_version_key());
+    r = submit(out, *txn->db, std::move(plan), sync);
+    if (r == BC_CONFLICT) r = conflict_or_duplicate(out, *txn->db, txn->claims, txn->locks, txn->overlay.get());
+  }
+  if (r == BC_CONFLICT && before) {
+    txn->rw_conflict = !written_changed(*before, *txn->db, [&](auto&& visit) {
+      for (const auto& [key, value] : ov.points) visit(BytesView{key});
+    });
+  }
+  return r;
   BC_GUARD_END(txn)
   return BC_FAILED;  // the guard caught a throw: never BC_COMMITTED
 }
@@ -5067,8 +5621,8 @@ bc_view bc_get(bc_ctx* cx, bc_view key, bool* found) {
 bool bc_exists(bc_ctx* cx, bc_view key) {
   BC_GUARD_BEGIN
   auto k = cx->resolve(key);
-  if (!k || !cx->charge()) return false;
-  return view_contains(cx, *k);
+  if (!k) return false;
+  return read_contains(cx, *k).value_or(false);
   BC_GUARD_END(cx)
   return {};
 }
@@ -5094,10 +5648,28 @@ bc_cursor bc_scan_open(bc_ctx* cx, uint32_t table_or_index, bc_view lo, bc_view 
   } else if (!hi_b->empty()) {
     c.hi.assign(hi_b->begin(), hi_b->end());
   }
+  // The range it reads, inside its table's or index's keys: reserved in the
+  // read set before it reads any of it.
+  auto end = bytecask::sql::key_successor(c.prefix);
+  BytesView rlo = std::is_lt(bytes_cmp(c.lo, c.prefix)) ? BytesView{c.prefix} : BytesView{c.lo};
+  BytesView rhi = !c.hi.empty() && std::is_lt(bytes_cmp(c.hi, end)) ? BytesView{c.hi} : BytesView{end};
+  c.recorded = cx->record_scan(c, rlo, rhi);
+  if (!c.recorded) return {};
   c.held = cursor_bytes(c);
   auto gen = c.gen;
   auto charge = kCursorEntryBytes + c.held;
-  if (cx->push_charged(cx->cursors, std::move(c), charge) == nullptr) return {};
+  // A cursor not opened read nothing: its reservation goes with it.
+  try {
+    cx->cursors.push_back(std::move(c));
+  } catch (...) {
+    cx->finish_scan(c);
+    throw;
+  }
+  if (!cx->take(charge)) {
+    cx->finish_scan(cx->cursors.back());
+    cx->cursors.pop_back();
+    return {};
+  }
   return {static_cast<std::uint32_t>(cx->cursors.size() - 1), gen};
   BC_GUARD_END(cx)
   return {};
@@ -5114,18 +5686,30 @@ bool bc_scan_next(bc_ctx* cx, bc_cursor h) {
   auto next = cursor_bytes(*c);
   if (on_entry) next += c->entries->key().size() + c->entries->value().size();
   if (!cx->rehold(c->held, next) || !on_entry) {
+    if (c->read && !on_entry && cx->ok()) c->read->ran_out = true;
     c->done = true;
+    cx->finish_scan(*c);
     return false;
   }
   auto k = c->entries->key();
   auto v = c->entries->value();
+  if (c->read) {
+    // The key it hands out, with room for k⁺'s byte: recorded as covered
+    // when it closes early (finish_scan), allocating nothing then.
+    c->read->last.reserve(k.size() + 1);
+    c->read->last.assign(k.begin(), k.end());
+    c->read->returned = true;
+  }
   c->key.assign(k.begin(), k.end());
   c->value.assign(v.begin(), v.end());
   cx->begin_step(h.i, bc_ctx::Loop::Cursor, c->scope);
   c->positioned = true;
   return cx->ok();
   BC_GUARD_END(cx)
-  if (c != nullptr) c->done = true;  // a step that threw ends the scan
+  if (c != nullptr) {
+    c->done = true;  // a step that threw ends the scan
+    cx->finish_scan(*c);
+  }
   return false;
 }
 
@@ -5172,8 +5756,11 @@ bc_view bc_scan_row(bc_ctx* cx, bc_cursor h) {
   bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, table);
   auto pk = r.rest();
   key.insert(key.end(), pk.begin(), pk.end());
-  if (!cx->charge()) return {};
-  if (!view_get(cx, key, c->row)) {
+  // The row is read at its key: an UPDATE of a column the index does not
+  // hold changes no entry of the range, only this key.
+  auto rec = cx->record_point(key);
+  if (!rec || !cx->charge()) return {};
+  if (!view_get(cx, *rec, key, c->row)) {
     // The runtime writes every entry with its row, so this is damage.
     cx->fail(BC_E_CORRUPT, "index " + c->layout->index->name + " has an entry whose row is missing");
     return {};
@@ -5192,6 +5779,7 @@ void bc_scan_close(bc_ctx* cx, bc_cursor h) {
   leave_entry(cx, *c);
   c->entries.reset();
   c->done = true;
+  cx->finish_scan(*c);
   (void)cx->rehold(c->held, cursor_bytes(*c));  // a release: it cannot fail
   BC_GUARD_END(cx)
 }
@@ -5429,11 +6017,15 @@ int64_t bc_count_range(bc_ctx* cx, uint32_t table_or_index, bc_view lo, bc_view 
   }
   if (!cx->charge(2)) return 0;  // the engine's bound: at most two record reads
   if (std::is_gteq(bytes_cmp(range->lo, range->hi))) return 0;
+  // The whole range, even when the count stops at its limit: a superset,
+  // since the engine's count does not name the key it stopped at.
+  auto rec = cx->record_range(range->lo, range->hi);
+  if (!rec) return 0;
   auto lim = static_cast<std::size_t>(limit);
   if (cx->overlay == nullptr || !cx->overlay->meets(range->lo, range->hi)) {
-    return static_cast<std::int64_t>(cx->base->count_keys(range->lo, range->hi, lim));
+    return static_cast<std::int64_t>(cx->view(*rec).count_keys(range->lo, range->hi, lim));
   }
-  return static_cast<std::int64_t>(view_count(cx, range->lo, range->hi, lim));
+  return static_cast<std::int64_t>(view_count(cx, *rec, range->lo, range->hi, lim));
   BC_GUARD_END(cx)
   return {};
 }
@@ -6343,13 +6935,19 @@ void insert_row(bc_ctx* cx, NewRow& n, std::span<const std::uint32_t> arbiters) 
 
 // Whether ON CONFLICT DO NOTHING skips the row: a key under an arbiter is
 // a row this execution wrote, or one the view holds that it did not vacate.
-// Reads, charged, and records nothing; true too once an error is set.
+// Reads, charged; at Serializable each arbiter key or prefix it probes is
+// recorded as a read; takes no claim. True too once an error is set.
 [[nodiscard]] auto conflicts(bc_ctx* cx, const NewRow& n, std::span<const std::uint32_t> arbiters) -> bool {
   const auto& t = *n.t;
   if (arbiter_covers(arbiters, t.id)) {
     auto it = cx->written_rows.find(n.pk);
     if (it != cx->written_rows.end() && it->second) return true;
-    if (it == cx->written_rows.end() && (!cx->charge() || view_contains(cx, n.pk))) return true;
+    if (it == cx->written_rows.end()) {
+      // At SERIALIZABLE a skip is a read of the arbiter key, recorded
+      // (docs/transaction_design.md, owner's question 1).
+      auto taken = read_contains(cx, n.pk);
+      if (!taken || *taken) return true;
+    }
   }
   for (std::size_t i = 0; i < t.indexes.size(); ++i) {
     const auto& ix = t.indexes[i];
@@ -6373,7 +6971,8 @@ void insert_row(bc_ctx* cx, NewRow& n, std::span<const std::uint32_t> arbiters) 
 // twice. A primary key this execution vacated is free, as conflicts() has
 // it, and so is a unique prefix its update took from the view's holder
 // (unique_vacated): no other row holds it, or unique_written would. Reads,
-// charged, and records nothing.
+// charged; at Serializable each arbiter key or range it probes is recorded
+// as a read; takes no claim.
 [[nodiscard]] auto holder(bc_ctx* cx, const NewRow& n, std::span<const std::uint32_t> arbiters, Bytes& pk) -> bool {
   const auto& t = *n.t;
   auto twice = [&] {
@@ -6384,8 +6983,9 @@ void insert_row(bc_ctx* cx, NewRow& n, std::span<const std::uint32_t> arbiters) 
     auto it = cx->written_rows.find(n.pk);
     if (it != cx->written_rows.end() && it->second) return twice();
     if (it == cx->written_rows.end()) {
-      if (!cx->charge()) return false;
-      if (view_contains(cx, n.pk)) {
+      auto taken = read_contains(cx, n.pk);
+      if (!taken) return false;
+      if (*taken) {
         pk = n.pk;
         return true;
       }
@@ -6396,8 +6996,10 @@ void insert_row(bc_ctx* cx, NewRow& n, std::span<const std::uint32_t> arbiters) 
     if (!ix.unique || !arbiter_covers(arbiters, ix.id) || n.entries[i].has_null) continue;
     auto prefix = n.entries[i].prefix();
     if (cx->unique_written.contains({ix.id, Bytes(prefix.begin(), prefix.end())})) return twice();
-    if (!cx->charge()) return false;
-    ViewEntries entries{*cx->base, cx->overlay, prefix, bytecask::sql::key_successor(prefix), false};
+    auto end = bytecask::sql::key_successor(prefix);
+    auto rec = cx->record_range(prefix, end);
+    if (!rec || !cx->charge()) return false;
+    ViewEntries entries{cx->view(*rec), cx->overlay, prefix, end, false};
     if (!entries.next(cx)) {
       if (!cx->ok()) return false;
       continue;
@@ -6430,6 +7032,7 @@ void insert_row(bc_ctx* cx, NewRow& n, std::span<const std::uint32_t> arbiters) 
 
 void bc_insert(bc_ctx* cx, uint32_t table, bc_view row) {
   BC_GUARD_BEGIN
+  if (!cx->writable("INSERT")) return;
   NewRow n{};
   if (new_row(cx, table, row, n)) insert_row(cx, n, {});
   BC_GUARD_END(cx)
@@ -6437,6 +7040,7 @@ void bc_insert(bc_ctx* cx, uint32_t table, bc_view row) {
 
 bool bc_insert_on_conflict(bc_ctx* cx, uint32_t table, bc_view row, uint32_t arbiter) {
   BC_GUARD_BEGIN
+  if (!cx->writable("INSERT")) return false;
   NewRow n{};
   if (!new_row(cx, table, row, n)) return false;
   const auto& t = *n.t;
@@ -6455,6 +7059,7 @@ bool bc_insert_on_conflict(bc_ctx* cx, uint32_t table, bc_view row, uint32_t arb
 bool bc_insert_or_existing(bc_ctx* cx, uint32_t table, bc_view row, uint32_t arbiter, bc_view* existing) {
   BC_GUARD_BEGIN
   if (existing != nullptr) *existing = {};
+  if (!cx->writable("INSERT")) return false;
   NewRow n{};
   if (!new_row(cx, table, row, n)) return false;
   const auto& t = *n.t;
@@ -6485,6 +7090,7 @@ bool bc_insert_or_existing(bc_ctx* cx, uint32_t table, bc_view row, uint32_t arb
 
 void bc_update(bc_ctx* cx, uint32_t table, bc_view old, bc_view row) {
   BC_GUARD_BEGIN
+  if (!cx->writable("UPDATE")) return;
   const auto* t = cx->table(table, true);
   if (t == nullptr) return;
   auto o = write_row(cx, *t, old, true);
@@ -6541,6 +7147,7 @@ void bc_update(bc_ctx* cx, uint32_t table, bc_view old, bc_view row) {
 
 void bc_delete(bc_ctx* cx, uint32_t table, bc_view old) {
   BC_GUARD_BEGIN
+  if (!cx->writable("DELETE")) return;
   const auto* t = cx->table(table, true);
   if (t == nullptr) return;
   auto o = write_row(cx, *t, old, true);
@@ -6559,6 +7166,7 @@ void bc_delete(bc_ctx* cx, uint32_t table, bc_view old) {
 
 void bc_del_range(bc_ctx* cx, uint32_t table, bc_view lo, bc_view hi) {
   BC_GUARD_BEGIN
+  if (!cx->writable("DELETE")) return;
   const auto* t = cx->table(table, true);
   if (t == nullptr) return;
   auto range = resolve_range(cx, table, lo, hi);
@@ -6592,7 +7200,9 @@ void bc_del_range(bc_ctx* cx, uint32_t table, bc_view lo, bc_view hi) {
     // is charged, the one that finds the range's end too (ViewEntries).
     // The rows are the view's: in a transaction, an earlier statement's
     // row takes the entries that statement wrote.
-    ViewEntries rows{*cx->base, cx->overlay, range->lo, range->hi, false};
+    auto rec = cx->record_range(range->lo, range->hi);
+    if (!rec) return;
+    ViewEntries rows{cx->view(*rec), cx->overlay, range->lo, range->hi, false};
     while (rows.next(cx)) {
       if (!current_row(cx, *t, rows.value())) return;
       for (const auto& ix : t->indexes) {
@@ -6611,12 +7221,14 @@ void bc_del_range(bc_ctx* cx, uint32_t table, bc_view lo, bc_view hi) {
 
 void bc_guard_unchanged(bc_ctx* cx, bc_view key) {
   BC_GUARD_BEGIN
+  if (!cx->writable("SELECT FOR UPDATE")) return;
   add_effect(cx, EffectKind::GuardUnchanged, key, {});
   BC_GUARD_END(cx)
 }
 
 void bc_guard_row(bc_ctx* cx, uint32_t table, bc_view row) {
   BC_GUARD_BEGIN
+  if (!cx->writable("SELECT FOR UPDATE")) return;
   // The key goes straight into the guard, not through the arena: a FOR
   // UPDATE scan guards every row it returns.
   Bytes key;
@@ -6629,6 +7241,7 @@ void bc_guard_row(bc_ctx* cx, uint32_t table, bc_view row) {
 
 void bc_guard_range(bc_ctx* cx, uint32_t table_or_index, bc_view lo, bc_view hi) {
   BC_GUARD_BEGIN
+  if (!cx->writable("SELECT FOR UPDATE")) return;
   auto range = resolve_range(cx, table_or_index, lo, hi);
   if (!range) return;
   if (std::is_gteq(bytes_cmp(range->lo, range->hi))) return;  // an empty range cannot change
@@ -6638,12 +7251,14 @@ void bc_guard_range(bc_ctx* cx, uint32_t table_or_index, bc_view lo, bc_view hi)
 
 void bc_guard_present(bc_ctx* cx, bc_view key) {
   BC_GUARD_BEGIN
+  if (!cx->writable("SELECT FOR UPDATE")) return;
   add_effect(cx, EffectKind::GuardPresent, key, {});
   BC_GUARD_END(cx)
 }
 
 void bc_guard_absent(bc_ctx* cx, bc_view key) {
   BC_GUARD_BEGIN
+  if (!cx->writable("SELECT FOR UPDATE")) return;
   add_effect(cx, EffectKind::GuardAbsent, key, {});
   BC_GUARD_END(cx)
 }

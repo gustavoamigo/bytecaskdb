@@ -1,5 +1,5 @@
 // SELECT id FROM r WHERE d >= $1
-// isolation: snapshot   schema: catalog v7
+// schema: catalog v7
 // objects: IDX_10 r_d, PART_10_0 r_d.id
 #include "bc_plan.h"
 enum { IDX_10 = 10, PART_10_0 = 1 };
