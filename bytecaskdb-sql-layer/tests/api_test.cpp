@@ -1724,7 +1724,19 @@ TEST_CASE("embedded API: joins of three or more tables, a table with itself, and
              {i(3), i(2), n, i(2), i(2), n}, {i(4), n, i(40), n, n, i(400)}, {i(5), i(5), i(50), n, n, n}});
   CHECK(state("SELECT 1 FROM h1 JOIN h2 USING (id) JOIN h3 USING (a)") == "42702");  // h1.a and h2.a
   CHECK(state("SELECT 1 FROM h1 JOIN h2 USING (id) JOIN h3 USING (k)") == "42703");
-  CHECK(state("SELECT 1 FROM h1 x, h1 y, h1 z, h1 w, h1 v, h1 u, h1 t, h1 s, h1 r") == "42601");  // nine tables
+  // Up to 32 tables, each here h1 joined on its key to the one before it; a 33rd is 0A000.
+  auto self_joined = [](int n) {
+    std::string from = "h1 t0";
+    std::string where;
+    for (auto k = 1; k < n; ++k) {
+      from += ", h1 t" + std::to_string(k);
+      where += (k == 1 ? " WHERE " : " AND ") + std::string{"t"} + std::to_string(k) + ".id = t" + std::to_string(k - 1) + ".id";
+    }
+    return "SELECT count(*) FROM " + from + where;
+  };
+  CHECK(rows(self_joined(9)) == Grid{{i(6)}});
+  CHECK(rows(self_joined(32)) == Grid{{i(6)}});
+  CHECK(state(self_joined(33)) == "0A000");
   CHECK(state("SELECT 1 FROM h1 x JOIN h1 y ON x.id = y.id FOR UPDATE") == "42601");
 }
 

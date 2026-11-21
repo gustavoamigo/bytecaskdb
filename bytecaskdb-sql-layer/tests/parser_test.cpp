@@ -168,7 +168,8 @@ TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql]
   //                    0         1         2         3
   //                    0123456789012345678901234567890123456789
   CHECK(rejected_at("SELECT id FROM t FULL JOIN u ON t.id = u.id JOIN v ON v.id = u.id") == 27);
-  CHECK(rejected_at("SELECT id FROM a, b, c, d, e, f, g, h, i WHERE id = $1") >= 0);  // nine tables
+  CHECK(rejected_at("SELECT id FROM a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, "
+                    "c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, d0, d1, d2 WHERE id = $1") == 143);  // the 33rd table
   CHECK(rejected_at("SELECT id FROM t WHERE id = B'1'") == 28);  // a bit-string literal
   CHECK(rejected_at("VALUES (1)") == 0);
   CHECK(rejected_at("SELECT id FROM t WHERE id SIMILAR TO $1") >= 0);
@@ -518,10 +519,23 @@ TEST_CASE("parser: a chain of joins, each with its own ON, kind and USING", "[sq
   CHECK(list.where.empty());
   // CROSS JOIN is an inner join with no condition.
   CHECK(std::get<Select>(parse("SELECT 1 FROM a CROSS JOIN b")).from.size() == 2);
-  // At most 8 tables; an alias of a join is refused. FULL is the whole FROM
-  // of two tables, never in a chain, in parentheses or after a comma (#712).
-  CHECK(std::get<Select>(parse("SELECT 1 FROM a, b, c, d, e, f, g, h")).from.size() == 8);
-  CHECK_THROWS_AS(parse("SELECT 1 FROM a, b, c, d, e, f, g, h, i"), SqlError);
+  // At most 32 tables, the 33rd refused as unsupported (0A000) at its
+  // position; an alias of a join is refused. FULL is the whole FROM of two
+  // tables, never in a chain, in parentheses or after a comma (#712).
+  auto tables = [](int n) {
+    std::string sql = "SELECT 1 FROM t0";
+    for (auto i = 1; i < n; ++i) sql += " JOIN t" + std::to_string(i) + " ON TRUE";
+    return sql;
+  };
+  CHECK(std::get<Select>(parse(tables(32))).from.size() == 32);
+  try {
+    (void)parse(tables(33));
+    FAIL("33 tables parsed");
+  } catch (const SqlError& e) {
+    CHECK(std::string{e.what()} == "joins of more than 32 tables are not supported");
+    CHECK(std::string{e.sqlstate()} == "0A000");
+    CHECK(e.pos() == static_cast<std::int32_t>(tables(33).rfind("t32")));
+  }
   auto full = std::get<Select>(parse("SELECT 1 FROM a FULL JOIN b ON a.k = b.k"));
   REQUIRE(full.from.size() == 2);
   CHECK(full.from[1].kind == JoinKind::Full);
