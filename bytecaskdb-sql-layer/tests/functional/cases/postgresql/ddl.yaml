@@ -38,8 +38,6 @@
 
 - name: CREATE TABLE IF NOT EXISTS of a name in use does nothing
   features: [pg:if-not-exists]
-  # the layer refuses it with 42P07; PostgreSQL skips the statement with a notice
-  unimplemented: true
   setup:
     - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
   steps:
@@ -385,3 +383,29 @@
   steps:
     - sql: CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, CONSTRAINT c CHECK (a > 0), CONSTRAINT c CHECK (a < 9))
       error: "42710"
+
+- name: CREATE TABLE IF NOT EXISTS skips before it reads the definition
+  features: [pg:if-not-exists]
+  setup:
+    - CREATE TABLE ine (id INTEGER PRIMARY KEY, v INTEGER)
+    - CREATE VIEW inev AS SELECT id FROM ine
+    - CREATE INDEX inei ON ine (v)
+  steps:
+    # The name taken by a table, a view or an index: a definition that would
+    # be refused is not read.
+    - sql: CREATE TABLE IF NOT EXISTS ine (a INTEGER, a INTEGER)
+    - sql: CREATE TABLE IF NOT EXISTS inev (a INTEGER)
+    - sql: CREATE TABLE IF NOT EXISTS inei (a INTEGER)
+    - sql: CREATE TABLE IF NOT EXISTS ine2 (a INTEGER, a INTEGER)
+      error: "42701"
+    - sql: CREATE TABLE IF NOT EXISTS ine2 (a INTEGER PRIMARY KEY, b TEXT)
+    - sql: INSERT INTO ine2 VALUES (1, 'x')
+      rowcount: 1
+    - sql: SELECT a, b FROM ine2
+      expected: [[1, x]]
+    - sql: CREATE TABLE ine2 (a INTEGER)
+      error: "42P07"
+  teardown:
+    - DROP VIEW inev
+    - DROP TABLE ine
+    - DROP TABLE ine2

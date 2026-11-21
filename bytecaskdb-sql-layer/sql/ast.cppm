@@ -205,6 +205,7 @@ struct CreateTable {
   std::vector<UniqueAst> unique;  // every UNIQUE constraint, columns' and the table's, in order
   std::vector<ForeignKeyAst> foreign_keys;  // every FOREIGN KEY, columns' and the table's, in order
   std::vector<CheckAst> checks;  // every CHECK, columns' and the table's, in order
+  bool if_not_exists{false};     // IF NOT EXISTS: a relation of the name skips the statement
 };
 
 struct IndexColumnAst {

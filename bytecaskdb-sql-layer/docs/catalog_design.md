@@ -411,7 +411,15 @@ disk and in memory, as it was.
 | `DROP PROCEDURE` | Procedure record and procedure name entry deleted. |
 | `ALTER TABLE … ADD COLUMN` | Record with the column appended at the next id and the next position of its region; the current generation's offsets do not move. With a default, every existing row rewritten with it, and `ensure_range_unchanged` over the rows. |
 
-`IF EXISTS` on the drops; nothing else. A drop deletes in O(1) appends
+`IF EXISTS` on the drops and `IF NOT EXISTS` on `CREATE TABLE`; nothing
+else. Either, when it applies, writes nothing and publishes no version:
+`LiveCatalog::run` reports the DDL unchanged, and the API turns that into
+PostgreSQL's notice (`Rows::notices`). `IF NOT EXISTS` is decided twice. The
+binder, finding the name taken by a table, view or index in the catalog it
+binds against, skips the definition unread, as PostgreSQL does, and the DDL
+carries the name alone; the apply skips again when the name is taken then.
+One the binder found taken and a DDL since has freed fails with 40001, as a
+DDL that meets another does. A drop deletes in O(1) appends
 whatever the table holds; the engine's `del_range` removes the keys from the
 key directory as it applies. A `NOT NULL` column added without a default is
 refused, as is a column whose id has no bit in the layout's bitmap (it needs

@@ -129,6 +129,33 @@ TEST_CASE("embedded API: the seven statements, then a fresh open", "[sql][api]")
   CHECK_THROWS_AS(db->execute(kCreateTable), DdlRefused);  // the table survived the reopen
 }
 
+TEST_CASE("embedded API: IF NOT EXISTS and IF EXISTS skip a DDL with PostgreSQL's notice", "[sql][api]") {
+  sql_test::TempDir dir{"api"};
+  auto db = Database::open(dir.path());
+  CHECK(db->execute("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v INTEGER)").notices.empty());
+  (void)db->execute("INSERT INTO t VALUES (1, 2)");
+  auto notice = [&](std::string_view sql) {
+    auto r = db->execute(sql);
+    REQUIRE(r.notices.size() == 1);
+    return std::pair{r.notices[0].sqlstate, r.notices[0].message};
+  };
+  // The name taken: nothing changes, the definition is not read (a column twice is no error).
+  CHECK(notice("CREATE TABLE IF NOT EXISTS t (a INTEGER, a INTEGER)") ==
+        std::pair{std::string{"42P07"}, std::string{"relation \"t\" already exists, skipping"}});
+  CHECK(db->catalog()->table("t")->columns.size() == 2);
+  CHECK(db->execute("SELECT id, v FROM t").rows.size() == 1);
+  CHECK(notice("DROP TABLE IF EXISTS nope") ==
+        std::pair{std::string{"00000"}, std::string{"table \"nope\" does not exist, skipping"}});
+  CHECK(notice("DROP INDEX IF EXISTS nope").second == "index \"nope\" does not exist, skipping");
+  CHECK(notice("DROP VIEW IF EXISTS nope").second == "view \"nope\" does not exist, skipping");
+  CHECK(notice("DROP PROCEDURE IF EXISTS nope(BIGINT, VARCHAR(3))").second ==
+        "procedure nope(pg_catalog.int8,pg_catalog.varchar) does not exist, skipping");
+  // Without IF NOT EXISTS the name taken is still 42P07.
+  CHECK_THROWS(db->execute("CREATE TABLE t (id INTEGER PRIMARY KEY)"));
+  CHECK(db->execute("DROP TABLE IF EXISTS t").notices.empty());
+  db->close();
+}
+
 TEST_CASE("embedded API: a cached write plan maintains an index created after it", "[sql][api]") {
   sql_test::TempDir dir{"api_ddl"};
   auto db = Database::open(dir.path());
