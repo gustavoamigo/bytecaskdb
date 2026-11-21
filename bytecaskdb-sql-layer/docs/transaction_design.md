@@ -508,8 +508,9 @@ wrote a table the DDL changed.
   ROLLBACK undoes it. CREATE TABLE AS and SELECT … INTO are refused there
   with `FeatureNotSupported` (SQLSTATE 0A000; Python's
   `bytecask_sql.FeatureNotSupported`, a `SqlError`) before anything runs,
-  and the transaction aborts (stage 4). The server refuses any DDL in a
-  BEGIN block with 0A000 until stage 3.
+  and the transaction aborts (stage 4). The server runs DDL in a BEGIN
+  block the same way (stage 3); in an implicit block of several statements
+  it is 0A000 until stage 4.
 
 PostgreSQL makes the DDL wait for the open transaction's locks; see *Known
 differences*.
@@ -685,7 +686,7 @@ reason.
 
 ## Transactional DDL
 
-Status: **design, approved by the owner on 2026-11-19. Stages 0, 1 and 2 are built (DDL runs in an embedded `Transaction`); stages 3 and 4 are not (the server still refuses DDL in a block).** Where building a stage found the design incomplete against the code, the stage's entry says what was done instead (*Stage 0 as built*, *Stage 1 as built*, *Stage 2 as built*). The owner's answers are recorded in *Owner's decisions on transactional DDL*. Stage 0 comes first, and edits *DDL during an open transaction* (stage 0's *Docs*). Once transactional DDL is built, this section replaces *DDL during an open transaction*, and the edits listed under *Edits to this document once transactional DDL is built* are made.
+Status: **design, approved by the owner on 2026-11-19. Stages 0 to 3 are built (DDL runs in an embedded `Transaction` and in a server BEGIN block); stage 4 is not (CREATE TABLE AS in a transaction, and DDL in an implicit block, are still refused).** Where building a stage found the design incomplete against the code, the stage's entry says what was done instead (*Stage 0 as built* to *Stage 3 as built*). The owner's answers are recorded in *Owner's decisions on transactional DDL*. Stage 0 comes first, and edits *DDL during an open transaction* (stage 0's *Docs*). Once transactional DDL is built, this section replaces *DDL during an open transaction*, and the edits listed under *Edits to this document once transactional DDL is built* are made.
 
 This section applies the two standing rules: do what PostgreSQL does, and never wait. Behaviour observed on PostgreSQL 17.12 is cited as "PG 17".
 
@@ -785,12 +786,12 @@ PostgreSQL orders DDL against everything else with locks. Most DDL takes AccessE
 
 DROP TABLE is RESTRICT: a table a view reads is 2BP01, and there is no CASCADE. A transaction that runs `DROP VIEW v; DROP TABLE t` and rolls back gets both back.
 
-**Cursors and portals.** PostgreSQL refuses a DDL on a relation that an active query of the session has open: 55006. A cursor counts, even after FETCH ALL, and so does a bound portal, since PortalStart opens its relations. The layer does the same:
+**Cursors and portals.** PostgreSQL refuses a DDL on a relation that an active query of the session has open: 55006. A cursor counts, even after FETCH ALL, and so does a bound SELECT portal, since PortalStart opens its relations; an INSERT, UPDATE or DELETE portal does not, since PostgreSQL opens its relations only while it runs. The layer does the same:
 
 - A DROP TABLE, CREATE INDEX or ALTER TABLE on a table that an open cursor or portal of the transaction reads is 55006, and aborts the transaction. This uses the objects the plan read. A DROP TABLE of a table a view depends on is 2BP01 instead, as in PG 17, which checks dependencies before `CheckTableNotInUse`; ALTER TABLE and CREATE INDEX check use first, so a duplicate column or index name with a cursor open is 55006.
 - A DROP INDEX is 55006 only when an open cursor's or portal's plan scans that index. A plan that reads the table without the index does not count, as in PG 17, where `index_drop` checks only the index's own references. The plan's schema ref already lists the indexes it scans.
 - CREATE VIEW, DROP VIEW (of a view a cursor reads too) and any DDL that touches no open plan's table run, as in PG 17.
-- The server's open portals in the block, named or unnamed, count with the transaction's cursors.
+- The server's open SELECT portals in the block, named or unnamed, count with the transaction's cursors.
 - A WITH HOLD cursor that outlived its own transaction is not counted. It reads its frozen view, as PostgreSQL's materialised one does.
 - ROLLBACK TO keeps PostgreSQL's cursor rule (#727): cursors declared since the savepoint close, whatever DDL they followed.
 
@@ -1084,6 +1085,13 @@ Each stage is one PR that ships on its own. Each says what it still refuses, upd
   - the functional case "DDL inside a transaction" (transactions.yaml:147) loses `unimplemented`, and more cases are added under `pg:transactional-ddl` (DROP rollback, ROLLBACK TO across DDL, 42P07 in a block, 25P02 after a failed DDL);
   - the proof machine gets DDL rules inside BEGIN and compares them with PostgreSQL on one connection;
   - the conformance table in README.md is refreshed from a run.
+
+**Stage 3 as built.** These are the smallest changes to the design above that the code needed; the guarantees are the ones stated.
+- **A portal holds what its plan reads, not its plan.** The server's portal holds a text and its record, and runs by text at Execute, so it has no plan for the 55006 check to read. `Transaction::bind_portal(text, check)` is `refit` that also returns a `PortalReads`, the tables and indexes the plan it would run names (its schema ref's objects read and tables written). The portal holds it; the transaction keeps a weak reference, and `check_in_use` reads the live ones beside its cursors. It holds no plan and is charged nothing. A Bind outside a block takes `Database::refit` as before: there is no transaction for a DDL to run in.
+- **Which portals count, as in PG 17.** A SELECT portal counts from its Bind until it is closed, replaced by another Bind of its name, or dropped with its transaction, whether it ran or not: PostgreSQL's PortalStart starts the executor, which opens the portal's relations, at Bind only for a PORTAL_ONE_SELECT portal. An INSERT, UPDATE or DELETE portal, with RETURNING or not, never counts: PostgreSQL opens its relations only while it runs and closes them before Execute returns, so a DROP TABLE, ALTER TABLE or CREATE INDEX on its table runs (review of this stage found the first build counting them, a refusal PostgreSQL does not make). `Transaction::bind_portal` returns no `PortalReads` for a plan that writes a table. Two PostgreSQL rules the server did not follow before decide the rest, and are built here: a ROLLBACK TO drops the portals bound since its savepoint (`AtSubAbort_Portals`; an Execute of one is then 34000), and a RELEASE hands them to the enclosing level; a Simple Query drops the unnamed portal first (`exec_simple_query`), so the unnamed portal of an earlier extended statement never makes a Simple Query's DDL 55006. A Bind of a DDL text into the unnamed portal replaces the one it held, as in PostgreSQL. PG 17 chooses a sequential scan on a small table where the layer may scan an index, so a DROP INDEX's 55006 can differ by plan, as for a cursor.
+- **An aborted transaction reports only a syntax error before 25P02.** The proof machine's DDL rules in a block found that the layer reported a CREATE TABLE with two primary keys (42P16 in PostgreSQL, which raises it in parse analysis) in an aborted transaction, where PG 17 says 25P02. Review found the layer gave that statement 42601, in a transaction or not; the parser now raises it as 42P16. `Transaction::execute(sql)` in an aborted transaction, and the server in a failed block, now check only the raw parse (`ast::check_syntax`, PostgreSQL's grammar through libpg_query) before 25P02, not the layer's own reading of the tree. A form the layer refuses but PostgreSQL's grammar takes is therefore 25P02 there, as in PostgreSQL.
+- **Not testable on one connection:** "Parse after ADD COLUMN in a block, COMMIT, then Bind in a block that pinned the base before the COMMIT" needs a block open on the connection while the DDL block commits, which one connection cannot have. Exception 2 for a record fixed after the transaction's own DDL is tested embedded, through `TxnStatement` (stage 2's tests).
+- **Tests:** `tests/server/test_wire.py` (`test_ddl_in_a_begin_block_runs_in_the_block_and_rollback_undoes_it`, `test_a_statement_parsed_after_the_block_s_ddl_keeps_its_columns_after_rollback`, `test_a_ddl_on_what_a_portal_of_the_block_reads_is_55006`, `test_savepoints_across_ddl_in_a_block`, `test_a_block_that_ran_ddl_is_40001_once_another_ddl_commits`; all but the last also pass against PG 17 unchanged), "txn DDL: a portal bound in the transaction counts for 55006 while it is held" and the aborted-transaction checks in "txn DDL: a duplicate name is 42P07 …" (`tests/api_txn_ddl_test.cpp`), the functional cases under `pg:transactional-ddl`, and the proof machine, whose CREATE TABLE, DROP TABLE and CREATE INDEX rules now run inside its transactions too (`test_ddl_inside_begin_agrees_with_postgresql` is its fixed case).
 
 **Stage 4: CREATE TABLE AS in a transaction, and DDL in implicit blocks.**
 - CREATE TABLE AS runs its query through the transaction's view and puts its rows into the overlay.

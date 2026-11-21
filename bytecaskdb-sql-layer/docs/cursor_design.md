@@ -1076,8 +1076,9 @@ VIEW, DROP VIEW and DDL on what no open cursor reads run. A hold cursor of
 an earlier transaction is not counted: it reads its own view. The overlay
 pin a cursor takes at DECLARE records the transaction's catalog of that
 moment, and a hold cursor keeps it: one over a table the transaction
-created reads it after COMMIT. The server's portals count with the cursors
-from stage 3, which runs DDL in a block.
+created reads it after COMMIT. The server's SELECT portals bound in a block count
+with the cursors (`Transaction::bind_portal`, server_design.md, *Extended
+query*).
 
 ## Deferred
 

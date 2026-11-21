@@ -146,8 +146,6 @@
 
 - name: DDL inside a transaction
   features: [pg:transactional-ddl]
-  # DDL inside a transaction is not supported: run it outside one
-  unimplemented: true
   steps:
     - sql: BEGIN
     - sql: CREATE TABLE t (id INTEGER PRIMARY KEY)
@@ -157,6 +155,95 @@
       error: "42P01"
   teardown:
     - ROLLBACK
+    - DROP TABLE t
+
+- name: a table created in a transaction is used in it and committed with its rows
+  features: [pg:transactional-ddl]
+  steps:
+    - sql: BEGIN
+    - sql: CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, a]
+      rowcount: 1
+    - sql: CREATE INDEX t_v ON t (v)
+    - sql: SELECT id FROM t WHERE v = $1
+      params: [a]
+      expected: [[1]]
+    - sql: COMMIT
+    - sql: SELECT id, v FROM t WHERE id >= $1
+      params: [0]
+      expected: [[1, a]]
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: a DROP TABLE rolled back brings the table back with its rows
+  features: [pg:transactional-ddl]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+    - INSERT INTO t VALUES (1, 10)
+  steps:
+    - sql: BEGIN
+    - sql: DROP TABLE t
+    - sql: SELECT id FROM t WHERE id >= $1
+      params: [0]
+      error: "42P01"
+    - sql: ROLLBACK
+    - sql: SELECT id, v FROM t WHERE id >= $1
+      params: [0]
+      expected: [[1, 10]]
+  teardown:
+    - ROLLBACK
+    - DROP TABLE t
+
+- name: ROLLBACK TO a savepoint undoes the DDL after it and keeps the rows before it
+  features: [pg:transactional-ddl, pg:savepoint]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)
+  steps:
+    - sql: BEGIN
+    - sql: INSERT INTO t VALUES ($1, $2)
+      params: [1, 10]
+      rowcount: 1
+    - sql: SAVEPOINT s
+    - sql: ALTER TABLE t ADD COLUMN w INTEGER DEFAULT 5
+    - sql: CREATE TABLE u (id INTEGER PRIMARY KEY)
+    - sql: SELECT id, v, w FROM t WHERE id >= $1
+      params: [0]
+      expected: [[1, 10, 5]]
+    - sql: ROLLBACK TO SAVEPOINT s
+    - sql: SELECT id FROM u WHERE id >= $1
+      params: [0]
+      error: "42P01"
+    - sql: ROLLBACK TO SAVEPOINT s
+    - sql: COMMIT
+    - sql: SELECT * FROM t WHERE id >= $1
+      params: [0]
+      expected: [[1, 10]]
+  teardown:
+    - ROLLBACK
+    - DROP TABLE u
+    - DROP TABLE t
+
+- name: a duplicate CREATE TABLE in a transaction is 42P07 and fails it
+  features: [pg:transactional-ddl]
+  setup:
+    - CREATE TABLE t (id INTEGER PRIMARY KEY)
+  steps:
+    - sql: BEGIN
+    - sql: CREATE TABLE u (id INTEGER PRIMARY KEY)
+    - sql: CREATE TABLE t (id INTEGER PRIMARY KEY)
+      error: "42P07"
+    - sql: CREATE TABLE w (id INTEGER PRIMARY KEY)
+      error: "25P02"
+    - sql: COMMIT
+    - sql: SELECT id FROM u WHERE id >= $1
+      params: [0]
+      error: "42P01"
+  teardown:
+    - ROLLBACK
+    - DROP TABLE u
+    - DROP TABLE w
     - DROP TABLE t
 
 - name: a failed statement leaves the transaction aborted

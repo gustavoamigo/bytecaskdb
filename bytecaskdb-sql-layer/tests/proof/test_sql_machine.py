@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import array
 import collections
+import copy
 import dataclasses
 import decimal
 import math
@@ -943,7 +944,10 @@ class SqlMachine(Sides, RuleBasedStateMachine):
 
     def begin(self) -> None:
         # PostgreSQL's REPEATABLE READ, like the layer's, takes its snapshot
-        # at the first statement, not at BEGIN.
+        # at the first statement, not at BEGIN. The DDL a transaction runs
+        # (docs/transaction_design.md, *Transactional DDL*) changes the model
+        # only if it commits.
+        self.tables_at_begin = copy.deepcopy(self.tables)
         self.txn = self.db.begin()
         assert o.run_pg(self.pg.conn, "BEGIN ISOLATION LEVEL REPEATABLE READ").error is None
         if self.wire is not None:
@@ -961,6 +965,8 @@ class SqlMachine(Sides, RuleBasedStateMachine):
             cur.execute("COMMIT")
             pg = cur.statusmessage
         assert layer == pg, f"COMMIT: the layer {layer}, PostgreSQL {pg}"
+        if layer != "COMMIT":
+            self.tables = self.tables_at_begin
         if self.wire is not None:
             with self.wire.cursor() as cur:
                 cur.execute("COMMIT")
@@ -970,6 +976,7 @@ class SqlMachine(Sides, RuleBasedStateMachine):
     def rollback(self) -> None:
         self.txn.rollback()
         self.txn = None
+        self.tables = self.tables_at_begin
         assert o.run_pg(self.pg.conn, "ROLLBACK").error is None
         if self.wire is not None:
             assert o.run_wire(self.wire, "ROLLBACK").error is None
@@ -987,7 +994,6 @@ class SqlMachine(Sides, RuleBasedStateMachine):
 
     # Rules ----------------------------------------------------------------
 
-    @precondition(lambda self: self.txn is None)
     @rule(data=st.data())
     def create_table(self, data):
         free = [n for n in TABLE_NAMES if n not in self.tables]
@@ -1033,7 +1039,6 @@ class SqlMachine(Sides, RuleBasedStateMachine):
             return
         self.create(t)
 
-    @precondition(lambda self: self.txn is None)
     @rule(data=st.data())
     def drop_table(self, data):
         self.drop(data.draw(st.sampled_from(TABLE_NAMES), label="name"), data.draw(st.booleans(), label="if exists"))
@@ -1126,7 +1131,7 @@ class SqlMachine(Sides, RuleBasedStateMachine):
         self.lookup(t.name, key, for_update=data.draw(st.booleans(), label="FOR UPDATE"),
                     literal=data.draw(st.integers(0, 3), label="literal key?") == 0)
 
-    @precondition(lambda self: self.tables and self.txn is None)
+    @precondition(lambda self: self.tables)
     @rule(data=st.data())
     def create_index_rule(self, data):
         t = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="table")]
@@ -1990,6 +1995,40 @@ def test_a_transaction_reads_its_writes_and_commits_them(dsn):
         m.insert("t0", {"c0": 3, "c1": "c"}, all_columns=False)
         m.insert("t0", {"c0": 4, "c1": None}, all_columns=False)
         assert m.commit() == "COMMIT"
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_ddl_inside_begin_agrees_with_postgresql(dsn):
+    """docs/transaction_design.md, stage 3: CREATE TABLE, CREATE INDEX and
+    DROP TABLE in a transaction, on the embedded layer, the server's BEGIN
+    block and PostgreSQL on one connection: later statements see them, a
+    duplicate name fails the transaction, ROLLBACK undoes them and COMMIT
+    keeps them with the rows."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT), Column("c1", o.TEXT)], ["c0"]))
+        m.insert("t0", {"c0": 1, "c1": "a"}, all_columns=False)
+        m.begin()
+        assert m.create(Table("t1", [Column("c0", o.INTEGER), Column("c1", o.TEXT)], ["c0"])).error is None
+        assert m.insert("t1", {"c0": 1, "c1": "x"}, all_columns=False).error is None
+        assert m.insert("t0", {"c0": 2, "c1": "b"}, all_columns=False).error is None
+        assert m.create_index("t0", Index("t0_ix0", [("c1", False)], unique=True)).error is None
+        assert m.lookup("t1", (1,)).rows == ((1, "x"),)
+        assert m.drop("t0", if_exists=False).error is None
+        m.rollback()
+        m.check()
+        m.begin()
+        assert m.create(Table("t1", [Column("c0", o.INTEGER)], ["c0"])).error is None
+        assert m.insert("t1", {"c0": 7}, all_columns=False).error is None
+        assert m.drop("t0", if_exists=False).error is None
+        assert m.commit() == "COMMIT"
+        m.check()
+        m.begin()
+        assert m.create(Table("t1", [Column("c0", o.INTEGER)], ["c0"])).error == "42P07"
+        assert m.create(Table("t2", [Column("c0", o.INTEGER)], ["c0"])).error == "25P02"
+        assert m.commit() == "ROLLBACK"
         m.check()
     finally:
         m.teardown()

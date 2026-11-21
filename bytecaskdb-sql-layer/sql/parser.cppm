@@ -56,6 +56,12 @@ export namespace bytecask::sql::ast {
 // statement. Throws SqlError as parse() does.
 [[nodiscard]] auto parse_savepoint(std::string_view sql) -> std::optional<SavepointStatement>;
 
+// Throws SqlError for what PostgreSQL's raw parser refuses, a syntax error,
+// and nothing else: what an aborted transaction reports before 25P02, where
+// PostgreSQL's parse analysis (42P16 for two primary keys, say) and the
+// forms the layer does not take come after it.
+void check_syntax(std::string_view sql);
+
 }  // namespace bytecask::sql::ast
 
 namespace bytecask::sql::ast {
@@ -758,7 +764,8 @@ auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos, std::string_vi
   // second (42P16), so two column-level ones are not a composite key.
   auto primary_keys = 0;
   auto at_most_one = [&](std::int32_t location) {
-    if (primary_keys > 1) reject("multiple primary keys for table \"" + t.table + "\" are not allowed", location);
+    if (primary_keys > 1) reject("multiple primary keys for table \"" + t.table + "\" are not allowed", location,
+                                  kInvalidTableDefinition);
   };
   for (std::size_t i = 0; i < s->n_table_elts; ++i) {
     const auto* el = s->table_elts[i];
@@ -1929,6 +1936,15 @@ auto parse_savepoint(std::string_view sql) -> std::optional<SavepointStatement> 
   if (t->kind == PG_QUERY__TRANSACTION_STMT_KIND__TRANS_STMT_ROLLBACK_TO) return SavepointStatement{Kind::RollbackTo, t->savepoint_name};
   if (t->kind == PG_QUERY__TRANSACTION_STMT_KIND__TRANS_STMT_RELEASE) return SavepointStatement{Kind::Release, t->savepoint_name};
   return std::nullopt;
+}
+
+void check_syntax(std::string_view sql) {
+  std::string text{sql};
+  ParseResources res;
+  res.raw = pg_query_parse_protobuf(text.c_str());
+  if (res.raw.error != nullptr) {
+    reject(res.raw.error->message, res.raw.error->cursorpos > 0 ? res.raw.error->cursorpos - 1 : -1);
+  }
 }
 
 auto parse(std::string_view sql) -> Statement {

@@ -422,10 +422,11 @@ statement the session runs at `Execute`.
   a `Query` runs it with `Database::execute`, which commits it alone. An
   `Execute` runs it in the block's implicit transaction (*Extended
   query*).
-- DDL inside a `BEGIN` block is the layer's `0A000`, refused by the session
-  before it reaches the block's `Transaction`, which runs DDL in the
-  embedded API (`transaction_design.md`, *Transactional DDL*, stage 2);
-  stage 3 lifts it.
+- DDL inside a `BEGIN` block runs through the block's `Transaction`, as a
+  statement of the block (`transaction_design.md`, *Transactional DDL*,
+  stage 3): later statements see it, `ROLLBACK` undoes it and `COMMIT`
+  publishes it with the block's writes. `CREATE TABLE AS` and `SELECT …
+  INTO` there are still `0A000` (stage 4).
 - Results: `RowDescription` (for a row-returning statement), one `DataRow`
   per row, then `CommandComplete`. The tag comes from the statement's
   command (*What it uses from the embedded API*, 3):
@@ -449,6 +450,10 @@ $1". A
 failed statement gets `ErrorResponse`; then, as after every `Query`, the
 server sends `ReadyForQuery`.
 
+A `Query` takes the unnamed portal for itself, as PostgreSQL's
+`exec_simple_query` does: an unnamed portal bound before it is gone, and an
+`Execute` of it is `34000`.
+
 A `Query` runs its statement by text (`ResultCheck::none`): through the
 block's `Transaction` in a block, `Database::execute(sql)` outside one. It
 returns the columns of its catalog, the block's or the live one, and is
@@ -459,7 +464,7 @@ A `Query` that arrives after `Execute`s outside `BEGIN`, before their
 `Sync`, joins their implicit transaction, as in PostgreSQL: it runs in it,
 and the transaction commits when the `Query` ends. An error in the `Query`
 rolls the whole block back. A DDL `Query` there is `0A000`, as a DDL beside
-other statements is.
+other statements is (until stage 4 of transactional DDL).
 
 ## Reading the counters
 
@@ -633,15 +638,40 @@ semantics. If the stream ends instead, the statement does not run: no
 A `BEGIN` inside the block makes it explicit, as PostgreSQL does: the open
 `Transaction` carries on past `Sync` until `COMMIT` or `ROLLBACK`.
 
-The server runs DDL only as its own atomic operation: it refuses DDL in a
-block of two or more statements, and in a `BEGIN` block until stage 3 of
-transactional DDL (transaction_design.md), though the embedded
-`Transaction` runs DDL.
+Outside `BEGIN` the server runs DDL only as its own atomic operation: it
+refuses DDL in an implicit block of two or more statements until stage 4 of
+transactional DDL (transaction_design.md).
 - A DDL that is its block's only statement (the next message is `Sync`)
   runs alone through `Database::execute`, as a simple `Query` does.
 - A DDL in a block of two or more is `0A000`. If it opens the block,
   nothing has run. If it comes later, the block's implicit `Transaction`
   aborts. Either way nothing in the block commits.
+
+**DDL in a `BEGIN` block.** A DDL `Execute` or `Query` in a `BEGIN` block
+runs through the block's `Transaction` (stage 3), and a `Parse` after it
+fixes its record from the transaction's private plan: at the block's base
+version, marked as fixed at a private catalog (`StatementRecord::private_catalog`).
+Such a record keeps its columns after the block ends: run where they differ,
+it is `0A000`, as PostgreSQL's revalidation is, or `40001` in a block pinned
+at that base after the live catalog moved (transaction_design.md, *Savepoints,
+cursors, portals and prepared statements across DDL*).
+
+**Portals and 55006.** A `Bind` in a block binds through
+`Transaction::bind_portal`, and a `SELECT` portal holds what its plan reads
+(`PortalReads`) until it is closed, replaced, or dropped with its
+transaction, as PostgreSQL's `PortalStart` opens a `PORTAL_ONE_SELECT`
+portal's relations at `Bind`. An `INSERT`, `UPDATE` or `DELETE` portal,
+with `RETURNING` or not, holds nothing: PostgreSQL opens its relations only
+while it runs. A `DROP
+TABLE`, `CREATE INDEX` or `ALTER TABLE` of a table a `SELECT` portal of the block
+reads, or a `DROP INDEX` of an index one scans, is `55006` "cannot … because
+it is being used by active queries in this session", as for an open cursor,
+whether the portal ran or not. As in PostgreSQL:
+- a `ROLLBACK TO` drops the portals bound since its savepoint
+  (`AtSubAbort_Portals`), and a `RELEASE` hands them to the enclosing level;
+- a simple `Query` drops the unnamed portal first, so the unnamed portal
+  never refuses a `Query`'s DDL, and a `Bind` into it replaces the portal
+  it held.
 
 The simple-query path keeps `Database::execute`: one `Query` is one
 statement, committed alone, which is PostgreSQL's implicit transaction for a
@@ -859,7 +889,9 @@ binder and compiler already keep:
    takes the record at `Parse` with `none`, and checks it at `Bind` and
    `Describe` with `given`, which binds the text with the record's
    parameter types and is 0A000 for other columns. A DDL between `Bind`
-   and `Execute` is caught by the run, which checks the record again.
+   and `Execute` is caught by the run, which checks the record again. In a
+   block, `Bind` takes `Transaction::bind_portal(text, check)`: the same
+   record, and the `PortalReads` its portal holds for 55006.
    `Transaction::procedure(name)` gives `CALL` in a block the procedure of
    the block's catalog.
 
@@ -1101,6 +1133,11 @@ The run script requires W ≥ the user count; the monitor is not a user.
   - two that succeed, committed together at `Sync`;
   - a lone DDL `Execute` run, and one beside a DML `Execute` refused with
     nothing committed;
+  - DDL in a `BEGIN` block, by `Query` and by `Execute`: seen by the
+    block, undone by `ROLLBACK` (a statement Parsed on it is `42P01` at its
+    next `Bind`) and by `ROLLBACK TO`, published by `COMMIT`; a `Parse`
+    after the block's `ADD COLUMN` is `0A000` after `ROLLBACK`; `55006` for
+    a DDL on what a portal of the block reads;
   - `Terminate` and a dropped connection rolling back an open
     transaction;
   - `COMMIT` of an aborted transaction tagged `ROLLBACK`;
