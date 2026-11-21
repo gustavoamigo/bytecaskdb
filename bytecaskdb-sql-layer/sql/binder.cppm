@@ -3916,8 +3916,8 @@ public:
   // NATURAL columns come first, each once and named alone, then its left
   // side's other columns, then its right table's. A USING column is its
   // left side's, equal to the right's in every pair or the right's NULL
-  // where a LEFT JOIN extends; the right's for the first join's RIGHT JOIN,
-  // whose right table is the one it keeps. Each USING ... AS alias, with the
+  // where a LEFT JOIN extends; the right's for a RIGHT JOIN, whose right
+  // table is the one it keeps. Each USING ... AS alias, with the
   // FROM item it is on, names that join's USING columns.
   struct JoinColumn {
     std::string name;
@@ -3986,7 +3986,7 @@ public:
         }
         const auto& lc = *std::ranges::find(left, name, &JoinColumn::name);
         equal[k].push_back(joined_compare(ast::Compare::Op::Eq, "=", lc.table->id, *lc.col, right.id, *rc, item.pos));
-        next.push_back(k == 1 && item.kind == ast::JoinKind::Right ? JoinColumn{name, &right, rc} : lc);
+        next.push_back(item.kind == ast::JoinKind::Right ? JoinColumn{name, &right, rc} : lc);
       }
       if (!item.using_alias.empty()) joins_.aliases.push_back({item.using_alias, k, next});
       for (const auto& c : left) {
@@ -4109,7 +4109,8 @@ public:
   }
 
   // A SELECT of tables: Limit? -> Project -> Sort? -> Filter? -> a tree of
-  // Joins over Gets, left-deep, each Join's right side the next FROM item;
+  // Joins over Gets, left-deep, each Join's right side the next FROM item,
+  // or a RIGHT JOIN's group (join_steps);
   // aggregated, Limit? -> Sort? -> Filter? -> Aggregate -> Filter? -> the
   // tables, the Filter above the Aggregate its HAVING. The WHERE's conjuncts,
   // an inner join's ON among them, sit in one Filter above the tables;
@@ -4129,6 +4130,64 @@ public:
     auto n = logical::kAllRows;
     if (s.limit && __builtin_add_overflow(*s.limit, s.offset, &n)) n = logical::kAllRows;
     return logical::node(logical::Limit{std::move(rows), n, s.offset});
+  }
+
+  // A step of a join's plan: the relations it reads, by FROM position, and
+  // how it joins the rows before it. An inner step reads one relation; an
+  // outer one the NULL-extended side of a left outer join, a LEFT JOIN's
+  // table or a group: the items a RIGHT JOIN's own table keeps its rows
+  // against, from[join_from] to the item before it, inner joins of each
+  // other under their ONs (`group_on`), all NULL-extended alike. `on` is the
+  // step's join's ON, or an inner step's, which joins the WHERE's.
+  struct JoinStep {
+    std::vector<std::size_t> rels;
+    bool outer{false};
+    std::size_t join{0};  // the FROM position whose ON `on` is; 0 for none
+    std::vector<logical::Expr> on;
+    std::vector<std::size_t> group_joins;  // a group's own joins, whose ONs are group_on
+    std::vector<logical::Expr> group_on;
+  };
+
+  // The order a join's relations are read in: FROM order, but for a RIGHT
+  // JOIN, whose table comes before its group, the LEFT JOIN of the two
+  // swapped. Its group's rows are the same in any order its items are joined
+  // in when they are inner joins of tables; a group that holds an outer join
+  // is not supported yet.
+  static auto join_steps(const ast::Select& s) -> std::vector<JoinStep> {
+    std::vector<JoinStep> steps;
+    steps.push_back({{0}, false, 0, {}, {}, {}});
+    for (std::size_t k = 1; k < s.from.size(); ++k) {
+      const auto& item = s.from[k];
+      if (item.kind != ast::JoinKind::Right) {
+        steps.push_back({{k}, item.kind == ast::JoinKind::Left, k, {}, {}, {}});
+        continue;
+      }
+      // The steps from[join_from] on, the tail: a comma's items before them
+      // are joined to the RIGHT JOIN's rows, its ON reading none of them.
+      auto first = std::ranges::find_if(steps, [&](const JoinStep& st) { return st.rels[0] >= item.join_from; });
+      JoinStep group{{}, true, k, {}, {}, {}};
+      for (auto st = first; st != steps.end(); ++st) {
+        if (st->outer || st->rels.size() != 1) {
+          not_yet("a RIGHT JOIN of a join that has an outer join", item.pos);
+        }
+        group.rels.push_back(st->rels[0]);
+        if (st->join != 0) group.group_joins.push_back(st->join);
+      }
+      steps.erase(first, steps.end());
+      // Its table, joined to the comma's items before the group by no ON.
+      steps.push_back({{k}, false, 0, {}, {}, {}});
+      steps.push_back(std::move(group));
+    }
+    return steps;
+  }
+
+  // Where join k's ON goes: its step's, or its group's.
+  static auto step_on(std::vector<JoinStep>& steps, std::size_t k) -> std::vector<logical::Expr>& {
+    for (auto& st : steps) {
+      if (st.join == k) return st.on;
+      if (std::ranges::contains(st.group_joins, k)) return st.group_on;
+    }
+    throw std::logic_error{"binder: a join with no step"};
   }
 
   auto select(const ast::Select& s) -> logical::NodePtr {
@@ -4151,47 +4210,48 @@ public:
     const auto n = rels.size();
     auto joined = n > 1;
     std::vector<logical::Expr> where_conjuncts;
-    // Join k's ON, for each outer join k.
-    std::vector<std::vector<logical::Expr>> on(n);
-    std::vector<bool> outer(n, false);
+    // The plan's joins, left-deep, in the order they run (join_steps): each
+    // step's relations by FROM position, joined to the rows before it.
+    std::vector<JoinStep> steps;
+    // The relations a join NULL-extends: none for an inner join.
+    std::vector<std::uint32_t> nulled;
     std::vector<std::string> written;
     for (const auto& item : s.from) written.push_back(item.written.empty() ? item.name() : item.written);
     set_scope(rels);
     if (joined) {
       if (s.for_update) throw SqlError{"FOR UPDATE on a join is not supported yet", s.pos};
-      for (std::size_t k = 1; k < n; ++k) {
-        outer[k] = s.from[k].kind != ast::JoinKind::Inner;
-        // RIGHT as the first join swaps its two tables below; after a left-deep
-        // prefix it would put the next table's rows outside the rows before it.
-        if (s.from[k].kind == ast::JoinKind::Right && k > 1) not_yet("a RIGHT JOIN after the first join", s.from[k].pos);
-      }
-      // An outer join's ON decides its pairs and its WHERE filters them, so
-      // the two stay apart; the table every row of which it keeps comes
-      // first: RIGHT is LEFT of the tables swapped, and a USING column named
-      // alone is that table's, as in PostgreSQL.
-      if (s.from[1].kind == ast::JoinKind::Right) {
-        std::swap(rels[0], rels[1]);
-        std::swap(written[0], written[1]);
-        set_scope(rels);
-      }
+      steps = join_steps(s);
       // A derived relation's rows are read only as the plan's outermost
       // loop, never as an outer join's NULL-extended side.
-      for (std::size_t k = 1; k < n; ++k) {
-        if (outer[k] && Table::derived(rels[k]->id)) {
-          not_yet("a grouped view on the NULL-extended side of an outer join", s.from[k].pos);
+      for (const auto& step : steps) {
+        if (!step.outer) continue;
+        for (auto r : step.rels) {
+          if (Table::derived(rels[r]->id)) not_yet("a grouped view on the NULL-extended side of an outer join", s.from[r].pos);
         }
       }
+      // An outer join's ON decides its pairs and its WHERE filters them, so
+      // the two stay apart; an inner join's ON is the WHERE's, but inside an
+      // outer join's group, where it decides which rows the group has.
       for (std::size_t k = 1; k < n; ++k) {
         auto here = conjuncts(rels, written, s.where, static_cast<std::uint32_t>(k));
         here.insert(here.begin(), std::make_move_iterator(using_equal[k].begin()), std::make_move_iterator(using_equal[k].end()));
         // A column of a NULL-extended relation is NULL-able in the ON of every later join.
         for (auto& e : here) {
-          for (std::size_t r = 1; r < k; ++r) {
-            if (outer[r]) mark_nullable(e, rels[r]->id);
-          }
+          for (auto t : nulled) mark_nullable(e, t);
         }
-        auto& into = outer[k] ? on[k] : where_conjuncts;
+        if (s.from[k].kind == ast::JoinKind::Left) nulled.push_back(rels[k]->id);
+        if (s.from[k].kind == ast::JoinKind::Right) {
+          for (auto r = std::size_t{s.from[k].join_from}; r < k; ++r) nulled.push_back(rels[r]->id);
+        }
+        auto& into = step_on(steps, k);
         into.insert(into.end(), std::make_move_iterator(here.begin()), std::make_move_iterator(here.end()));
+      }
+      // An inner step's ON joins the WHERE's.
+      for (auto& step : steps) {
+        if (step.outer) continue;
+        where_conjuncts.insert(where_conjuncts.end(), std::make_move_iterator(step.on.begin()),
+                               std::make_move_iterator(step.on.end()));
+        step.on.clear();
       }
       auto rest = conjuncts(rels, written, s.where, 0);
       where_conjuncts.insert(where_conjuncts.end(), std::make_move_iterator(rest.begin()), std::make_move_iterator(rest.end()));
@@ -4325,9 +4385,16 @@ public:
       if (Table::derived(t->id)) return logical::node(logical::Derived{std::move(derived_.at(t->id - Table::kDerivedBase).plan), t});
       return logical::node(logical::Get{t, !joined && s.for_update});
     };
-    auto rows = leaf(rels[0]);
-    for (std::size_t k = 1; k < n; ++k) {
-      rows = logical::node(logical::Join{std::move(rows), leaf(rels[k]), std::move(on[k]), outer[k]});
+    auto rows = leaf(rels[joined ? steps[0].rels[0] : 0]);
+    for (std::size_t i = 1; i < steps.size(); ++i) {
+      auto& step = steps[i];
+      // A group: its relations' inner joins, under the ON of each.
+      auto right = leaf(rels[step.rels[0]]);
+      for (std::size_t r = 1; r < step.rels.size(); ++r) {
+        right = logical::node(logical::Join{std::move(right), leaf(rels[step.rels[r]]), {}, false});
+      }
+      if (!step.group_on.empty()) right = logical::node(logical::Filter{std::move(right), std::move(step.group_on)});
+      rows = logical::node(logical::Join{std::move(rows), std::move(right), std::move(step.on), step.outer});
     }
     if (!where_conjuncts.empty()) rows = logical::node(logical::Filter{std::move(rows), std::move(where_conjuncts)});
     if (aggregated) {
@@ -4340,9 +4407,7 @@ public:
       rows = logical::node(logical::Project{std::move(rows), std::move(targets)});
     }
     rows = limited(std::move(rows), s);
-    for (std::size_t k = 1; k < n; ++k) {
-      if (outer[k]) nullable_above_join(*rows, rels[k]->id);
-    }
+    for (auto t : nulled) nullable_above_join(*rows, t);
     return rows;
   }
 

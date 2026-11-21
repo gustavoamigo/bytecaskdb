@@ -808,8 +808,6 @@
 
 - name: an inner join, then a RIGHT JOIN of a third table
   features: [F041-04, F041-05]
-  # a RIGHT JOIN after the first join is not supported yet
-  unimplemented: true
   setup:
     - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)
     - CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)
@@ -828,6 +826,85 @@
     - DROP TABLE a
     - DROP TABLE b
     - DROP TABLE c
+
+- name: a RIGHT JOIN after the first join, its group's own ON deciding the group's rows
+  features: [F041-04, F041-05]
+  setup:
+    - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)
+    - CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)
+    - CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER)
+    - CREATE TABLE d (id INTEGER PRIMARY KEY, k INTEGER)
+    - INSERT INTO a VALUES (1, 1)
+    - INSERT INTO a VALUES (2, 2)
+    - INSERT INTO a VALUES (3, NULL)
+    - INSERT INTO b VALUES (1, 1)
+    - INSERT INTO b VALUES (2, 3)
+    - INSERT INTO c VALUES (1, 1)
+    - INSERT INTO c VALUES (2, 2)
+    - INSERT INTO d VALUES (1, 1)
+    - INSERT INTO d VALUES (2, 2)
+  steps:
+    - sql: SELECT a.id, b.id, c.id FROM a JOIN b ON a.k = b.k AND b.id > 1 RIGHT JOIN c ON b.k = c.k ORDER BY 3
+      expected: [[null, null, 1], [null, null, 2]]
+    - sql: SELECT a.id, b.id, c.id, d.id FROM a JOIN b ON a.k = b.k RIGHT JOIN c ON b.k = c.k LEFT JOIN d ON d.k = b.k ORDER BY 3
+      expected: [[1, 1, 1, 1], [null, null, 2, null]]
+  teardown:
+    - DROP TABLE a
+    - DROP TABLE b
+    - DROP TABLE c
+    - DROP TABLE d
+
+- name: a RIGHT JOIN after a comma keeps its rows against its own join alone
+  features: [F041-04, F041-05]
+  setup:
+    - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)
+    - CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)
+    - CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER)
+    - CREATE TABLE d (id INTEGER PRIMARY KEY, k INTEGER)
+    - INSERT INTO a VALUES (1, 1)
+    - INSERT INTO a VALUES (2, 2)
+    - INSERT INTO a VALUES (3, NULL)
+    - INSERT INTO b VALUES (1, 1)
+    - INSERT INTO b VALUES (2, 3)
+    - INSERT INTO c VALUES (1, 1)
+    - INSERT INTO c VALUES (2, 2)
+    - INSERT INTO d VALUES (1, 1)
+    - INSERT INTO d VALUES (2, 2)
+  steps:
+    - sql: SELECT d.id, a.id, b.id, c.id FROM d, a JOIN b ON a.k = b.k RIGHT JOIN c ON b.k = c.k ORDER BY 1, 4
+      expected: [[1, 1, 1, 1], [1, null, null, 2], [2, 1, 1, 1], [2, null, null, 2]]
+  teardown:
+    - DROP TABLE a
+    - DROP TABLE b
+    - DROP TABLE c
+    - DROP TABLE d
+
+- name: a LEFT JOIN, then a RIGHT JOIN of a third table
+  features: [F041-04, F041-05]
+  # a RIGHT JOIN of a join that has an outer join is not supported yet
+  unimplemented: true
+  setup:
+    - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)
+    - CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)
+    - CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER)
+    - CREATE TABLE d (id INTEGER PRIMARY KEY, k INTEGER)
+    - INSERT INTO a VALUES (1, 1)
+    - INSERT INTO a VALUES (2, 2)
+    - INSERT INTO a VALUES (3, NULL)
+    - INSERT INTO b VALUES (1, 1)
+    - INSERT INTO b VALUES (2, 3)
+    - INSERT INTO c VALUES (1, 1)
+    - INSERT INTO c VALUES (2, 2)
+    - INSERT INTO d VALUES (1, 1)
+    - INSERT INTO d VALUES (2, 2)
+  steps:
+    - sql: SELECT a.id, b.id, c.id FROM a LEFT JOIN b ON a.k = b.k RIGHT JOIN c ON b.k = c.k ORDER BY 3, 1
+      expected: [[1, 1, 1], [null, null, 2]]
+  teardown:
+    - DROP TABLE a
+    - DROP TABLE b
+    - DROP TABLE c
+    - DROP TABLE d
 
 - name: FULL JOIN of two tables
   features: [F401-02]

@@ -550,6 +550,12 @@ TEST_CASE("parser: an inner join in parentheses or after a comma is flattened, e
   CHECK(outer.from[1].kind == JoinKind::Left);
   CHECK(outer.from[3].kind == JoinKind::Left);
   CHECK(outer.where[1].on_from == 2);
+  // A join's item records its join's first item: where a RIGHT JOIN's group starts.
+  auto right = std::get<Select>(parse("SELECT 1 FROM a, b JOIN c ON b.k = c.k RIGHT JOIN d ON c.k = d.k"));
+  CHECK(right.from[3].kind == JoinKind::Right);
+  CHECK(right.from[3].join_from == 1);
+  CHECK(right.from[2].join_from == 1);
+  CHECK(std::get<Select>(parse("SELECT 1 FROM a JOIN b ON a.k = b.k RIGHT JOIN c ON b.k = c.k")).from[2].join_from == 0);
   // A qualifier naming an item before the ON's own join is 42P01, with PostgreSQL's DETAIL; an alias is named.
   for (auto [sql, entry] : std::vector<std::pair<std::string_view, std::string>>{
            {"SELECT 1 FROM a JOIN (b JOIN c ON a.k = c.k) ON a.k = b.k", "a"},

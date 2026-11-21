@@ -1618,8 +1618,43 @@ TEST_CASE("binder: a chain of joins is a left-deep tree, each ON bound against t
   // The names an ON may use, and what is not taken yet.
   CHECK(rejected(cat, "SELECT t.id FROM t JOIN u ON t.qty = w.qty JOIN w ON u.qty = w.qty").first ==
         "missing FROM-clause entry for table \"w\"");
-  CHECK(rejected(cat, "SELECT t.id FROM t JOIN u ON t.qty = u.qty RIGHT JOIN w ON u.qty = w.qty").first ==
-        "a RIGHT JOIN after the first join is not supported yet");
+  CHECK(rejected(cat, "SELECT t.id FROM t LEFT JOIN u ON t.qty = u.qty RIGHT JOIN w ON u.qty = w.qty").first ==
+        "a RIGHT JOIN of a join that has an outer join is not supported yet");
+  CHECK(rejected(cat, "SELECT t.id FROM t RIGHT JOIN u ON t.qty = u.qty RIGHT JOIN w ON u.qty = w.qty").first ==
+        "a RIGHT JOIN of a join that has an outer join is not supported yet");
+  {
+    // A RIGHT JOIN after the first join: its table first, then the join before it as a group, the right side of
+    // one left outer join, its own ON inside it.
+    auto b = bind_sql(cat, "SELECT t.id FROM t JOIN u ON t.qty = u.qty RIGHT JOIN w ON u.k = w.j WHERE w.j > 1");
+    CHECK(tables_of(root(b)) == std::vector<std::string>{"w", "t", "u"});
+    const auto& top = get<logical::Join>(b);
+    CHECK(top.left_outer);
+    CHECK(std::get<logical::Get>(top.left->op).table->name == "w");
+    REQUIRE(top.predicate.size() == 1);
+    CHECK_FALSE(top.predicate[0].args[0].col.nullable);  // u.k in the ON that matches its rows reads real ones
+    const auto& group = std::get<logical::Filter>(top.right->op);
+    REQUIRE(group.conjuncts.size() == 1);  // t.qty = u.qty, the group's own
+    const auto& inner = std::get<logical::Join>(group.input->op);
+    CHECK_FALSE(inner.left_outer);
+    CHECK(inner.predicate.empty());
+    // The WHERE is above the join, every column of the group NULL-able there.
+    const auto& selected = get<logical::Project>(b).exprs;
+    CHECK(selected[0].expr.col.nullable);
+    const auto& where = std::get<logical::Filter>(std::get<logical::Project>(root(b).op).input->op);
+    REQUIRE(where.conjuncts.size() == 1);
+    CHECK(where.conjuncts[0].args[0].col.table == cat.table("w")->id);
+  }
+  {
+    // After a comma, the group is the RIGHT JOIN's own join: the comma's item is joined to its rows by no ON.
+    auto b = bind_sql(cat, "SELECT t.id FROM t, u RIGHT JOIN w ON u.qty = w.qty");
+    CHECK(tables_of(root(b)) == std::vector<std::string>{"t", "w", "u"});
+    const auto& top = get<logical::Join>(b);
+    CHECK(top.left_outer);
+    CHECK(std::get<logical::Get>(top.right->op).table->name == "u");
+    const auto& first = std::get<logical::Join>(top.left->op);
+    CHECK_FALSE(first.left_outer);
+    CHECK(first.predicate.empty());
+  }
   // A later join's USING or NATURAL reads the columns of the join before it: a name two of them have is refused.
   CHECK(rejected(cat, "SELECT t.id FROM t JOIN u ON t.qty = u.qty NATURAL JOIN w").first ==
         "common column name \"qty\" appears more than once in left table");

@@ -785,8 +785,10 @@ marks it; a key a later join builds from it keeps the mark, so a row of
 NULLs is a miss and never a key of whatever the column's bytes hold). So an
 inner join after an outer one drops the rows it NULL-extended where its `ON`
 reads them, and one before it does not. `RIGHT JOIN` is a left join of its
-two tables swapped, so it is taken only as the first join, where the swap
-keeps the chain left-deep. `USING` and `NATURAL` at any join are its
+sides swapped: as the first join, of its two tables; after it, of its table
+and a group, the items of its own join before it (*Outer joins*). Its table
+comes first in the plan's order, then the group, so the chain stays
+left-deep. `USING` and `NATURAL` at any join are its
 equalities, bound by the binder to the left side's merged column and the
 right table's: the planner sees an inner join's as `WHERE` conjuncts and an
 outer join's as its `ON`, like any.
@@ -830,6 +832,29 @@ lose the left rows it matches nothing of. Under each left row the plan sets a ma
 flag; after the right side's loop, a row nothing matched is joined to
 `bc_null_row`'s row of NULLs, every column of the right table NULL, and the
 plan goes on with it as with any other.
+
+**A group as the right side.** A `RIGHT JOIN` after the first join keeps
+its table's rows against the join before it, from the first item of its own
+join (after a comma, the comma's items are joined to its rows by no `ON`,
+since its `ON` reads none of them). The binder (`join_steps`) puts its table
+first and those items after it as one right side, a group: a left-deep tree
+of their inner joins under a `Filter` of their own `ON`s, which stay inside
+the group, since they decide which rows it has and the `RIGHT JOIN`'s `ON`
+which of them match. The search marks every rel of the group outer
+(`Rel::group`, its first rel) and reads each by its own scan, never by a
+lookup on its key (a point lookup becomes the scan of its key's prefix) nor
+hashed: the plan is a left outer `NestedLoop` whose inner side is the
+group's scans, inner nested loops of each other. The matched flag is set
+at the group's innermost loop, so a row of the table nothing matched is
+joined to a row of NULLs of each table of the group. A conjunct of the
+`RIGHT JOIN`'s `ON` filters the step of the group that reads the last of
+its tables; the group's parameters are its guard. Never probed nor
+hashed, a group costs O(|kept| × |g1| × |g2| …) rows read: each of its
+tables but a point lookup is scanned in full under each row of the kept
+table and of every group table before it, where the same joins written as
+a `LEFT JOIN` chain probe by key. Probing a group's tables is #837. A group that holds an
+outer join is not supported yet (42601), so neither is a second `RIGHT
+JOIN` over a join that has one.
 
 The join's predicate is the right side's key and filters; a conjunct on
 the left side alone is a filter of the right side's rows too, which reads
@@ -1583,7 +1608,7 @@ with uncompilable C:
   that does not compare a column of each side`,
   `a conjunct that reads no column`, `a predicate (…) that reads no column`);
   a table read twice with no instance for each use; a left outer join whose
-  right side is more than one table; more than 32 tables;
+  right side holds an outer join; more than 32 tables;
 - a result column that is not an expression of columns of the statement's
   tables; an aggregate, `GROUP BY` or `ORDER BY` column that is not a
   column of them; an output or `ORDER BY` key not grouped; a

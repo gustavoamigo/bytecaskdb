@@ -1109,14 +1109,29 @@ private:
     if (std::ranges::find(in, c.table) != in.end()) broken("a column read above a sort from a loop no sorter holds");
   }
 
+  // The scans of a left outer nested loop's inner side, outer first: one, or
+  // a group's (docs/planner_design.md, *Joins*), inner nested loops of each
+  // other, all NULL-extended where the innermost gives no row.
+  static auto group_scans(const Node& inner) -> std::vector<const Node*> {
+    const auto* j = std::get_if<NestedLoop>(&inner.op);
+    if (j == nullptr) return {&inner};
+    if (j->left_outer) broken("a nested loop whose inner side holds an outer join");
+    auto out = group_scans(*j->outer);
+    out.push_back(j->inner.get());
+    return out;
+  }
+
   // The inner side of a nested loop, one of its plans: a scan under filters
   // that each compare a column of the scan's table, read from its row, with
-  // a parameter or a column of the outer side.
+  // a parameter or a column of the outer side, or of a loop outside it
+  // (outer_): a group's scans read the rows before the group.
   // `left_outer`: the join's ON may also compare the outer side's columns
   // alone, which decides the pairs.
-  static void inner_side(const Node& inner, const std::vector<std::uint32_t>& outer, bool left_outer) {
+  void inner_side(const Node& inner, const std::vector<std::uint32_t>& outer_side, bool left_outer) const {
     const auto* sc = scan_below(inner);
     if (sc == nullptr || std::holds_alternative<Sort>(inner.op)) broken("a nested loop whose inner side is not a scan");
+    auto outer = outer_side;
+    outer.insert(outer.end(), outer_.begin(), outer_.end());
     auto of_outer = [&](const Expr& e) { return e.kind == Expr::Kind::Column && std::ranges::contains(outer, e.col.table); };
     for (const auto* in = &inner; const auto* f = std::get_if<Filter>(&in->op); in = f->input.get()) {
       for (const auto& c : f->conjuncts) {
@@ -1240,11 +1255,16 @@ private:
               if (std::holds_alternative<Choice>(op.inner->op)) broken("a choice point read once per outer row");
               outer = tables_of(*op.outer);
             }
-            for (const auto* b : branches(*op.inner)) inner_side(*b, *outer, op.left_outer);
+            // A group's scans check their own joins, the first one this one's.
+            const auto group = group_scans(*op.inner);
+            if (group.size() > 1 && !op.left_outer) broken("an inner nested loop whose inner side is a join");
+            for (const auto* b : branches(*group[0])) inner_side(*b, *outer, op.left_outer);
             // Left outer: its row of NULLs is a row, so the inner side reads rows.
-            for (const auto* b : branches(*op.inner)) {
-              if (const auto* sc = scan_below(*b); op.left_outer && sc != nullptr && sc->covering) {
-                broken("a left outer nested loop whose inner scan covers");
+            for (const auto* g : group) {
+              for (const auto* b : branches(*g)) {
+                if (const auto* sc = scan_below(*b); op.left_outer && sc != nullptr && sc->covering) {
+                  broken("a left outer nested loop whose inner scan covers");
+                }
               }
             }
             if (!op.left_outer && !op.guard.empty()) broken("an inner nested loop with a guard");

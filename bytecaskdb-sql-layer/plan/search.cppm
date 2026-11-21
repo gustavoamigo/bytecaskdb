@@ -546,6 +546,10 @@ struct Rel {
   Conjuncts where;  // its comparisons, which its access paths may take
   Conjuncts preds;  // its predicates (logical::is_predicate) and comparisons of two of its columns: filters only
   bool outer{false};  // the right side of a left outer join of it and the tables before it
+  // Outer: the first rel of that right side, a group of one or more rels read
+  // one after another in FROM order, inner joins of each other, all
+  // NULL-extended alike where the group has no row for the rows before it.
+  std::size_t group{0};
 
   [[nodiscard]] auto table() const -> const Table& {
     if (const auto* d = derived()) return *d->table;
@@ -942,6 +946,14 @@ private:
     std::vector<ColumnRef> sort_by;  // the ORDER BY's columns a sort keys on, those its expressions read too
     bool sort_by_expression{false};  // some ORDER BY key is an expression: no probe side is sorted
 
+    // Whether rel r is on the right side of a left outer join of two or
+    // more rels: each read by its own scan, never probed, so the group's
+    // match flag is the innermost scan's.
+    [[nodiscard]] auto in_group(std::size_t r) const -> bool {
+      if (!rels[r].outer) return false;
+      return rels[r].group != r || (r + 1 < rels.size() && rels[r + 1].outer && rels[r + 1].group == r);
+    }
+
     [[nodiscard]] auto index_of(std::uint32_t table) const -> std::size_t {
       for (std::size_t i = 0; i < rels.size(); ++i) {
         if (rels[i].table().id == table) return i;
@@ -1015,8 +1027,11 @@ private:
     for (auto i = split; i < right_from; ++i) left.push_back(q.rels[i].table().id);
     auto right = tables_of(q, right_from);
     if (j->left_outer) {
-      if (q.rels.size() != right_from + 1) no_plan("a left outer join whose right side is more than one table");
-      q.rels[right_from].outer = true;
+      for (auto r = right_from; r < q.rels.size(); ++r) {
+        if (q.rels[r].outer) no_plan("a left outer join whose right side holds an outer join");
+        q.rels[r].outer = true;
+        q.rels[r].group = right_from;
+      }
       q.any_outer = true;
     }
     for (const auto& c : j->predicate) {
@@ -1307,12 +1322,14 @@ private:
 
   // The predicates over several tables that `q.rels[inner]`, joined to the
   // tables of the mask `outer`, completes: those that read it and no table
-  // outside both, and an outer join's ON, by the join's own step.
+  // outside both, and an outer join's ON, by the join's own step: the first
+  // of its right side's that reads every table it reads (FROM order).
   static auto crosses(const Query& q, std::size_t inner, std::uint32_t outer) -> Conjuncts {
     Conjuncts out;
     for (const auto& x : q.cross) {
       if ((x.tables & ~(outer | (1u << inner))) != 0) continue;
-      if (x.outer ? *x.outer == inner : (x.tables >> inner & 1u) != 0) out.push_back(x.pred);
+      auto last = x.tables == 0 ? 0 : static_cast<std::size_t>(std::bit_width(x.tables)) - 1;
+      if (x.outer ? std::max(*x.outer, last) == inner : (x.tables >> inner & 1u) != 0) out.push_back(x.pred);
     }
     return out;
   }
@@ -1403,6 +1420,17 @@ private:
       if (col.table == id) out.push_back(col);
     }
     return out;
+  }
+
+  // A point lookup as the scan of its whole key's prefix: at most one entry.
+  static auto prefix_scan(Access a) -> Access {
+    const auto& g = std::get<physical::PointGet>(a.path);
+    physical::Scan sc;
+    sc.table = sc.object = g.table;
+    sc.prefix = g.key;
+    sc.for_update = g.for_update;
+    a.path = std::move(sc);
+    return a;
   }
 
   // An access path read once, under one row: the join's conjuncts `on`
@@ -1561,7 +1589,7 @@ private:
         if (driver && t == *driver) continue;
         auto on = joins(q, t, set);
         auto cross = crosses(q, t, set);
-        auto pr = probe(q, t, on, cross);
+        auto pr = q.in_group(t) ? std::nullopt : probe(q, t, on, cross);
         auto outers = best.at(set);  // copied: keep may add to the map
         for (const auto& o : outers) {
           if (pr) {
@@ -1573,15 +1601,17 @@ private:
           }
           // t by its own scan, the join's conjuncts filtering its rows: read
           // once under at most one outer row, else once per outer row. Its
-          // point lookup is the probe by parameters above.
+          // point lookup is the probe by parameters above; a group's, never
+          // probed, the scan of its key's prefix.
           for (const auto& a : out.tried[t]) {
-            if (a.one_row()) continue;
+            if (a.one_row() && !q.in_group(t)) continue;
             Candidate c = o;
             c.set = set | (1u << t);
             auto rescan = !o.one_row();
             auto filters = on;
             filters.insert(filters.end(), cross.begin(), cross.end());
-            c.steps.emplace_back(Nested{t, read_once(a.access, filters), filters, rescan});
+            auto access = a.one_row() ? prefix_scan(a.access) : a.access;
+            c.steps.emplace_back(Nested{t, read_once(std::move(access), filters), filters, rescan});
             cost(c);
             keep(best, std::move(c), full);
             // Where no key reaches t, a hash join on the join's equalities,
@@ -1776,12 +1806,13 @@ private:
     // A left outer join keeps its left rows whatever its right side's
     // parameters hold: a NULL among them is the inner side's to match
     // nothing, by the join's guard, never the plan's to end on.
-    std::map<std::size_t, std::vector<std::uint32_t>> guards;  // per outer rel
+    std::map<std::size_t, std::vector<std::uint32_t>> guards;  // per outer join, by its group's first rel
     if (q.any_outer) {
       for (std::size_t r = 0; r < q.rels.size(); ++r) {
         if (!q.rels[r].outer) continue;
-        add_params(guards[r], q.rels[r].where);
-        std::erase_if(out.null_checks, [&](std::uint32_t p) { return std::ranges::contains(guards[r], p); });
+        auto& guard = guards[q.rels[r].group];
+        add_params(guard, q.rels[r].where);
+        std::erase_if(out.null_checks, [&](std::uint32_t p) { return std::ranges::contains(guard, p); });
       }
       for (const auto& rel : q.rels) {
         if (!rel.outer) add_params(out.null_checks, rel.where);
@@ -1790,7 +1821,7 @@ private:
     // The second plan of each choice point checks and computes what it reads.
     for (const auto& ch : choices) {
       const auto rel = ch.at == 0 ? c.first : rel_of(c.steps[ch.at - 1]);
-      for (auto p : ch.other.null_checks) add_param(q.rels[rel].outer ? guards[rel] : out.null_checks, p);
+      for (auto p : ch.other.null_checks) add_param(q.rels[rel].outer ? guards[q.rels[rel].group] : out.null_checks, p);
       access_computed(out.computed, ch.other, q.rels[rel].table().id);
     }
     for (std::size_t i = 0; i < c.steps.size(); ++i) {
@@ -1816,8 +1847,18 @@ private:
           hj.held = q.rels[c.first].table().id;
         }
         out.rows = filtered(physical::node(std::move(hj)), h->filters);
+      } else if (const auto rel = std::get<Nested>(c.steps[i]).rel; q.in_group(rel)) {
+        // A group: its scans, one inside another, the inner side of one
+        // left outer nested loop whose match is a row of the innermost.
+        auto inner = leaf_at(std::get<Nested>(c.steps[i]).access, i + 1, choices, sort);
+        auto next_rel = [&] { return std::visit([](const auto& st) { return st.rel; }, c.steps[i + 1]); };
+        while (i + 1 < c.steps.size() && q.rels[next_rel()].outer && q.rels[next_rel()].group == rel) {
+          ++i;
+          inner = physical::node(physical::NestedLoop{
+              std::move(inner), leaf_at(std::get<Nested>(c.steps[i]).access, i + 1, choices, sort), false, {}});
+        }
+        out.rows = physical::node(physical::NestedLoop{std::move(out.rows), std::move(inner), true, guards[rel]});
       } else {
-        const auto rel = std::get<Nested>(c.steps[i]).rel;
         out.rows = physical::node(physical::NestedLoop{
             std::move(out.rows), leaf_at(std::get<Nested>(c.steps[i]).access, i + 1, choices, sort), q.rels[rel].outer,
             q.rels[rel].outer ? guards[rel] : std::vector<std::uint32_t>{}});

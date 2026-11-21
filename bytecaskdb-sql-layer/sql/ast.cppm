@@ -329,8 +329,8 @@ struct SetOperation;
 struct Select;
 
 // How a FROM item joins the ones before it: LEFT keeps every row of the
-// items before it, RIGHT every row of the item (two items only), each joined
-// to NULLs where no row of the other matches.
+// items before it, RIGHT every row of the item, each joined to NULLs where
+// no row of the other matches.
 enum class JoinKind { Inner, Left, Right };
 
 // A FROM item: a table or view, and how it joins the items before it. A
@@ -350,6 +350,10 @@ struct FromItem {
   std::vector<std::string> column_aliases;
   std::int32_t pos{-1};
   JoinKind kind{JoinKind::Inner};
+  // The first FROM item of the join's left side: 0, or the first item after
+  // a comma. A RIGHT JOIN keeps its item's rows against from[join_from] to
+  // the item before it, never against the items before join_from.
+  std::uint32_t join_from{0};
   std::vector<std::string> using_columns;
   bool natural{false};
   std::string using_alias;
