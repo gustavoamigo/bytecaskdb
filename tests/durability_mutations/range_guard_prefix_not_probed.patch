@@ -1,0 +1,18 @@
+A range guard that is not an exact prefix range is prepared but never
+probed: a write into its range between the plan's preparation and the
+section leaves the prepared answer standing, and the plan commits over a
+change it read (stage 3 of the SQL layer's serializable isolation).
+Guarded-by: "prepared validation: a guard whose key is written between preparing and the section is checked again,prepared validation: range guards inside one prefix commit and conflict exactly as when checked in the section"
+
+diff --git a/bytecaskdb/engine_state.cpp b/bytecaskdb/engine_state.cpp
+index 6f5a3e51..2d217a77 100644
+--- a/bytecaskdb/engine_state.cpp
++++ b/bytecaskdb/engine_state.cpp
+@@ -308,6 +308,7 @@ void WritePlan::prepare_validation(const EngineState &p,
+   for (const auto &rg : range_guards_) {
+     const auto longest = range_prefix_length(rg.from, rg.to);
+     if (longest == 0) return;
++    if (!is_prefix_range(rg.from, rg.to)) continue;
+     const auto len = probe_prefix_length(
+         longest, is_prefix_range(rg.from, rg.to),
+         std::span{registered}.first(registered_n));

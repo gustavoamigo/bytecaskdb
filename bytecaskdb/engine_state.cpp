@@ -240,7 +240,8 @@ void WritePlan::resolve_snapshot_entries() {
 
 namespace {
 // Whether [from, to) holds exactly the keys that start with `from`: `to` is
-// the smallest key above every such key. Its bytes are `from`'s with the
+// the smallest key above every such key. Such a range is probed by `from`
+// itself (probe_prefix_length). Its bytes are `from`'s with the
 // trailing 0xFF bytes dropped and the last one left raised by one.
 auto is_prefix_range(std::span<const std::byte> from,
                      std::span<const std::byte> to) -> bool {
@@ -299,15 +300,25 @@ void WritePlan::prepare_validation(const EngineState &p,
     c.held = true;
     return;
   }
+  // Each range guard is probed by a prefix all its keys share; a range
+  // whose keys share no byte is left for the section.
+  RecentWrites::Lengths registered{};
+  const auto registered_n = recent.lengths(registered);
+  c.ranges.reserve(range_guards_.size());
   for (const auto &rg : range_guards_) {
-    if (!is_prefix_range(rg.from, rg.to)) return;
+    const auto longest = range_prefix_length(rg.from, rg.to);
+    if (longest == 0) return;
+    const auto len = probe_prefix_length(
+        longest, is_prefix_range(rg.from, rg.to),
+        std::span{registered}.first(registered_n));
+    c.ranges.push_back({key_hash(std::span{rg.from}.first(len)),
+                        narrow<std::uint32_t>(len)});
   }
   std::uint64_t ignored = 0;
   if (!TransientEngineState::check_preconditions(
           p.key_dir, p.kd_ctx(), p.next_seq, *this, ignored, defer))
     return;
   c.probes.reserve(guards_.size() + writes_.size());
-  c.ranges.reserve(range_guards_.size());
   for (const auto &[key, guard] : guards_) {
     if (guard.precondition != Precondition::None)
       c.probes.push_back(key_hash(key));
@@ -316,9 +327,6 @@ void WritePlan::prepare_validation(const EngineState &p,
     for_each_point_key([&](std::span<const std::byte> key) {
       c.probes.push_back(key_hash(key));
     });
-  }
-  for (const auto &rg : range_guards_) {
-    c.ranges.push_back({key_hash(rg.from), narrow<std::uint32_t>(rg.from.size())});
   }
   // The answer read something: the table must exist for the section to
   // tell whether it still holds. Allocated here, not under the lock.

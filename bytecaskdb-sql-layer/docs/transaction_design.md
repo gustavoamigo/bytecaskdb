@@ -1198,7 +1198,7 @@ Other documents: catalog_design.md (*DDL*: the namespace `01` invariant and its 
 
 ## Serializable isolation
 
-Status: **design approved by the owner on 2026-11-20** with every recommendation under *Owner's questions on serializable isolation*: question 1 (a), 2 (a), 3 (a), 4 (a), 5 (a); question 6 is decided by stage 1's writer-p99 numbers as recommended there. **Stages 0 and 1 are built**: the SQL isolation check runs nightly over the point and range workloads, and SERIALIZABLE transactions and autocommit statements run in the embedded API (`Isolation::Serializable`), checked nightly by the `serializable` Elle configuration. *Stage 1 as built* says where the code differed from this design. The server still refuses SERIALIZABLE until stage 2. Stage 1 made its edits to the rest of this document (*Edits to this document once serializable isolation is built*).
+Status: **design approved by the owner on 2026-11-20** with every recommendation under *Owner's questions on serializable isolation*: question 1 (a), 2 (a), 3 (a), 4 (a), 5 (a); question 6 is decided by stage 1's writer-p99 numbers as recommended there. **Stages 0 and 1 are built**: the SQL isolation check runs nightly over the point and range workloads, and SERIALIZABLE transactions and autocommit statements run in the embedded API (`Isolation::Serializable`), checked nightly by the `serializable` Elle configuration. *Stage 1 as built* says where the code differed from this design. **Stage 3 is built** (question 6 (a), decided by stage 1's numbers): a range guard inside one registered prefix is prepared outside the engine's writer section; *Stage 3 as built* has its numbers. The server still refuses SERIALIZABLE until stage 2. Stage 1 made its edits to the rest of this document (*Edits to this document once serializable isolation is built*).
 
 The owner's decision (2026-11-20): SERIALIZABLE is real serializability. Snapshot isolation is never run under the SERIALIZABLE name. The two standing rules apply: do what PostgreSQL does, and never wait. Behaviour observed on PostgreSQL 17.12 is cited as "PG 17"; the probes are cases 1 to 15 and A to D of the fact-gathering run, and the review probes (p1.sql, s1.py to s4.py), kept with the design PR. Code citations are to branch `gustavoamigo/sql-txn-ddl-ctas-implicit`; they are re-checked before the design PR.
 
@@ -1389,12 +1389,12 @@ This is a memory charge only. Recording does no record read and charges no work 
 What the engine does with the guards (engine_state.cpp:105-219, 256-321):
 - **A point guard** costs two key-directory lookups: one on the head, one on the snapshot.
 - **A range guard** costs a walk of the head's keys in the range and a walk of the snapshot's, one lookup per key: linear in the keys it covers (bytecask_design.md:150).
-- **Outside the lock.** `prepare_validation` answers both on the caller's thread, outside `write_mu_`, but only for a plan with writes, no range delete, and range guards that are all exact prefix ranges (`is_prefix_range`).
-- **Inside the lock.** Any other plan is checked inside the serial section, as is any plan whose `RecentWrites` probe says a key may have been written since. An index range scan's `[lo, hi)` is rarely a prefix range, so a SERIALIZABLE writer that scanned an index range is checked in the section. That costs O(keys in its ranges) while every other writer waits.
+- **Outside the lock.** `prepare_validation` answers both on the caller's thread, outside `write_mu_`, for a plan with writes and no range delete whose range guards each lie inside one prefix. Before stage 3 that was only exact prefix ranges (`is_prefix_range`); since stage 3, any range whose keys all share a prefix: an index range's `[lo, hi)` lies inside its index's 5-byte prefix `0x03 index_id`, and a row range inside its table's.
+- **Inside the lock.** Any other plan is checked inside the serial section, as is any plan whose `RecentWrites` probe says a key under a prefix it read may have been written since. Before stage 3 every SERIALIZABLE writer that scanned an index range was checked in the section, at O(keys in its ranges) while every other writer waited; since then that walk is made in the section only when the index (or table) its range lies in was written since the writer's preparation.
 
 **What this means:**
 - Point reads are cheap.
-- The read set bounds the *number* of ranges, not the keys they cover. Merged ranges can cover a whole index, and statement budgets bound each statement, not the transaction. So one SERIALIZABLE writer that scanned index ranges can hold every writer, snapshot-isolation writers that never opted in included, for a walk of O(keys covered) at its commit. That runs against predictable latency (principle 3).
+- The read set bounds the *number* of ranges, not the keys they cover. Merged ranges can cover a whole index, and statement budgets bound each statement, not the transaction. Before stage 3, one SERIALIZABLE writer that scanned index ranges could hold every writer, snapshot-isolation writers that never opted in included, for a walk of O(keys covered) at its commit. That ran against predictable latency (principle 3). Since stage 3 it does so only while the index it read is being written between its preparation and its turn in the section.
 - A full scan's range is a table prefix, and it is checked outside the lock unless that table was written since the snapshot.
 
 **Measured before the server exposes it.** Stage 1 adds a writer-latency benchmark: snapshot-isolation writers' p99 alone, and alongside concurrent SERIALIZABLE writers that scanned index ranges of 100, 10 000 and 1 000 000 keys. Owner's question 6 decides, with those numbers, what lands before stage 2 lets any client turn SERIALIZABLE on with `SET`:
@@ -1402,7 +1402,7 @@ What the engine does with the guards (engine_state.cpp:105-219, 256-321):
 - **(b) A bound on what a transaction's in-section ranges may cover:** the keys its cursors stepped over, which they already count, capped per transaction, with 54000 past it.
 - **(c) Sublinear range checks.** A range is unchanged since `s` exactly when no key in it carries a sequence above `s` and its key count equals the snapshot's. With a per-node maximum sequence in the key directory, the check is O(log n). This needs a key-directory design of its own, with `map_bench` and the tests in `tests/CLAUDE.md`. It is a follow-up issue, not a stage.
 
-**Read-guard cost measured** (stage 1, `sql_layer_bench` in releasedbg, a 4-core machine, kv of 1M rows with an index on `g = k`; one run each, so the numbers show size, not small differences):
+**Read-guard cost measured** (stage 1, before stage 3; stage 3's numbers are in *Stage 3 as built*; `sql_layer_bench` in releasedbg, a 4-core machine, kv of 1M rows with an index on `g = k`; one run each, so the numbers show size, not small differences):
 
 | Transaction, µs | Snapshot | Serializable |
 |---|---|---|
@@ -1595,6 +1595,39 @@ Each stage is one PR that ships on its own. Each updates `bytecaskdb-sql-layer/R
 - **Docs:** `bytecask_design.md`, the validation section (:1764-1773).
 - **Contract:** none changes.
 
+**Stage 3 as built.** Where the code differed from the design above, the design's intent was kept:
+- **Which prefix.** A range's keys all start with the bounds' common prefix, or one byte more when `to` is the successor of `from`'s byte there (engine `range_prefix_length`). Any length up to that is sound. A length is registered by the first guard that needs it (at most 8, as before), so the engine does not register one per range: a range takes its own length when it is an exact prefix range or that length is registered, else the longest registered length below it, and registers its own only when none is (`probe_prefix_length`). An index range's own length is 5 plus the bytes its bounds' values share, so the first index range registers that, and a full scan registers 5; from then on an index range whose own length is not registered is probed by the longest registered length below it, at worst its index's prefix. The engine design's *Validation prepared before the section* has the rule.
+- **What is left in the section.** A range is walked twice when the table or index it lies in is written between the writer's preparation and its turn in the section: once at preparation, once in the section. A SERIALIZABLE writer that scanned an index range while other writers change that index's keys is still checked in the section at O(keys in its range). Question 6 (b) and the sublinear range checks of (c) remain for that case.
+- **The bench's control.** The writer-p99 benchmark gained a row: the same two range writers at Snapshot, which submit no range guard, to tell the range writers' own work on a 4-core machine from the commit's check.
+- **Tests.** Engine: `prepared validation: range guards inside one prefix commit and conflict exactly as when checked in the section` (two databases, one preparing and one not, groups whose earlier slots write into later slots' ranges), `prepared validation: a range guard's prefix is the longest every key in its range shares` (against its definition), `prepared validation: a range guard inside a prefix is checked again only when its prefix was written`, and a section of `prepared validation: a guard whose key is written between preparing and the section is checked again`. The mutation `range_guard_prefix_not_probed` (engine `tests/durability_mutations/`) leaves such a range unprobed and fails the last two. The engine's range workload (`run_isolation_check.py --workload range`, with and without `--kill`, 4 rounds each) and `sql_isolation_check.py --workloads range` (2 rounds, serializable and serializable-ro included) passed.
+
+Writer latency, the stage 1 benchmark (`sql_layer_bench`, releasedbg, the same 4-core machine as stage 1's numbers, one run each), snapshot-isolation writers (4 threads, autocommit UPDATE of a row each), µs:
+
+| | before: p50 | p99 | p99.9 | writes in 6 s | after: p50 | p99 | p99.9 | writes in 6 s |
+|---|---|---|---|---|---|---|---|---|
+| alone | 220 | 630 | 2 597 | 96 324 | 247 | 727 | 3 335 | 85 364 |
+| with 2 Serializable writers reading covering index ranges of 100 keys | 532 | 3 482 | 5 569 | 37 638 | 434 | 2 747 | 5 334 | 44 018 |
+| … of 10 000 keys | 30 431 | 56 899 | 64 014 | 872 | 264 | 3 823 | 6 129 | 65 851 |
+| … of 1 000 000 keys | 247 | 2 989 | 5 905 | 11 037 | 271 | 3 770 | 6 221 | 66 159 |
+| with 2 Snapshot writers reading ranges of 10 000 keys (control) | | | | | 288 | 4 728 | 7 990 | 44 511 |
+| alone, again | 222 | 562 | 2 344 | 97 504 | 236 | 792 | 4 143 | 86 274 |
+
+The Serializable writers committed 12 841, 375 and 5 transactions before, 13 186, 429 and 4 after, none 40001. At ranges of 10 000 keys the snapshot writers' p50 is back to their p50 alone, and their throughput rose from 872 writes to 65 851. Their p99 is still about five times its value alone, but the control, the same reads with no range guard, is as high: what is left is the two range-reading threads' work on four cores, not the commit's check. The bench measures no effect of the Serializable writers' range checks on other writers' latency at these sizes, while the index they read is not being written.
+
+`engine_bench` (`python3 scripts/run_engine_bench.py`, 50k keys, built with `BYTECASK_NO_ROCKSDB=1`; two runs of each tree, interleaved before, after, before, after; before = 9741a5b3, after = 1a1fc890), ns, real time per op:
+
+| | before | after |
+|---|---|---|
+| Put/Sync | 99 159, 131 174 | 120 998, 124 866 |
+| Del/Sync | 118 181, 115 147 | 129 368, 117 949 |
+| MixedBatch/Sync | 289 337, 322 906 | 278 711, 346 111 |
+| Put/NoSync | 4 225, 4 271 | 4 054, 4 138 |
+| Get | 220, 247 | 236, 247 |
+| CasMT/Sync, 4 threads | 203 209, 267 336 | 241 488, 206 305 |
+| PutMT/Sync, 4 threads | 198 893, 227 286 | 243 411, 206 896 |
+
+No `engine_bench` workload submits a range guard, so none runs the new preparation; every difference above lies inside the spread between two runs of the same tree. No engine-level improvement or regression is claimed.
+
 ### Owner's questions on serializable isolation
 
 1. **ON CONFLICT DO NOTHING at SERIALIZABLE.** This overrides the owner's 2026-11-19 decision not to guard skipped rows, at SERIALIZABLE only.
@@ -1630,6 +1663,8 @@ Each stage is one PR that ships on its own. Each updates `bytecaskdb-sql-layer/R
 
    **Recommendation:** none until the numbers exist. If they show a measurable p99 effect, (a); (b) if (a) does not bound it.
 
+   **Decided by stage 1's numbers: (a).** Stage 3 is built; its numbers (*Stage 3 as built*) show no remaining effect of the range checks on other writers at the sizes benchmarked while the index read is not written, so (b) is not scheduled.
+
 ### Risks and scope of serializable isolation
 
 **Risks**
@@ -1639,7 +1674,7 @@ Each stage is one PR that ships on its own. Each updates `bytecaskdb-sql-layer/R
   - the Elle runs, point, range and read-only, run nightly.
 - **The read-only argument** rests on every SERIALIZABLE writer validating at its commit sequence, catalog included. Stage 1's read-only Elle run is its check. If it fails, the fallback is to submit read-only transactions' read sets as guard-only plans.
 - **False positives.** Every changed read fails a writer, and any concurrent DDL fails overlapping writers, so abort rates exceed PG 17's under contention. TPROC-C's numbers at SERIALIZABLE are reported in stage 1. A workload that needs fewer aborts uses REPEATABLE READ with `FOR UPDATE`, as today.
-- **Commit latency in the writer section,** O(keys in non-prefix ranges), for every writer while a SERIALIZABLE range writer commits. Measured in stage 1; owner's question 6.
+- **Commit latency in the writer section,** O(keys in its ranges), for every writer while a SERIALIZABLE range writer commits. Measured in stage 1; owner's question 6. Since stage 3 only when the table or index a range lies in was written between the writer's preparation and the section.
 - **Memory.** About 192 000 distinct point reads on 20-byte keys fill the default `max_bytes`. Index scans that fetch many rows and large join probes reach it first. The failure is a clean 54000 at a read.
 - **The successor key at `max_key_bytes`** falls back to a wider range. That is a superset, and only a false positive.
 

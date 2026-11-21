@@ -365,7 +365,8 @@ export struct PreparedChecks {
   // key_hash of each key the answer read: guarded keys, and written keys
   // when writes_checked.
   std::vector<std::uint64_t> probes;
-  // Each range guard, a prefix range: its prefix's hash and length.
+  // Each range guard: the hash and length of a prefix every key in its
+  // range starts with (probe_prefix_length).
   struct Range {
     std::uint64_t hash;
     std::uint32_t len;
@@ -379,6 +380,46 @@ export struct PreparedChecks {
   std::vector<std::uint64_t> prefixes;
   std::size_t lengths{0};
 };
+
+// The longest L such that every key in [from, to) starts with from's first
+// L bytes, for from < to; 0 when the range spans keys with different first
+// bytes. That is the bounds' common prefix, or one byte more when `to` is
+// the successor of that byte (the last byte of a prefix range's `to`), and
+// then also every 0xFF byte of `from` after it.
+export [[nodiscard]] inline auto range_prefix_length(
+    std::span<const std::byte> from, std::span<const std::byte> to) noexcept
+    -> std::size_t {
+  const auto c = static_cast<std::size_t>(
+      std::ranges::mismatch(from, to).in1 - from.begin());
+  if (c == from.size() || c == to.size()) return c;
+  if (to.size() != c + 1 || std::to_integer<unsigned>(to[c]) !=
+                                std::to_integer<unsigned>(from[c]) + 1)
+    return c;
+  auto n = c + 1;
+  while (n < from.size() && from[n] == std::byte{0xFF}) ++n;
+  return n;
+}
+
+// The prefix length a range guard is probed by, given `longest`, its
+// range_prefix_length (above 0), and the lengths RecentWrites has
+// registered. Any length up to `longest` is sound, since every key in the
+// range has that prefix; a longer one makes fewer false alarms, a new one
+// costs every writer one more hash per key and one of the few slots. So: a
+// range of exactly the keys that start with `from` (`exact`) is probed by
+// that prefix, as is a range whose longest length is registered already;
+// another range takes the longest registered length below its own, and
+// registers its own only when none is.
+export [[nodiscard]] inline auto probe_prefix_length(
+    std::size_t longest, bool exact,
+    std::span<const std::uint32_t> registered) noexcept -> std::size_t {
+  if (exact || std::ranges::find(registered, longest) != registered.end())
+    return longest;
+  std::size_t best = 0;
+  for (const auto len : registered) {
+    if (len < longest) best = std::max<std::size_t>(best, len);
+  }
+  return best != 0 ? best : longest;
+}
 
 // A key's hash for RecentWrites.
 export [[nodiscard]] inline auto key_hash(std::span<const std::byte> key) noexcept
@@ -396,8 +437,9 @@ export [[nodiscard]] inline auto key_hash(std::span<const std::byte> key) noexce
 // no key (a range delete, an ingested slice, resume()'s replay) raise a
 // floor instead: an answer prepared below it is not used.
 //
-// Range guards over a prefix are probed by the prefix: a writer records its
-// key's prefix at every prefix length a range guard has used. A length is
+// A range guard is probed by a prefix every key in its range starts with
+// (probe_prefix_length): a writer records its key's prefix at every prefix
+// length a range guard has used. A length is
 // registered the first time a guard needs it, and trusted only for answers
 // prepared after that, since writes before it did not record it.
 //
