@@ -668,8 +668,26 @@ EXISTS] name`:
   PostgreSQL's (42P01, 42703, …). It takes no parameter (42P02). Refused
   (42601): `OR REPLACE`, `TEMPORARY`, options, `WITH [CASCADED | LOCAL]
   CHECK OPTION` and a schema-qualified name.
-- **Read-only.** `INSERT`, `UPDATE` and `DELETE` of a view are refused
-  (0A000), as is any DDL written against it as a table.
+- **`INSERT` through a view** writes to its table, as PostgreSQL's
+  automatically updatable views do (`ViewExpander::into_base_table`). The
+  view, and each view it reads down to the table, must select from one
+  table or view, with no `DISTINCT`, `GROUP BY`, `HAVING`, set operation,
+  `LIMIT`, `OFFSET` or aggregate (a `LIMIT ALL`, `LIMIT NULL` or `OFFSET 0`
+  that limits nothing counts, as in PostgreSQL): otherwise 55000, "cannot insert into view",
+  with PostgreSQL's DETAIL and HINT naming the first view of the chain that
+  fails. A `FROM` alias and its column names are read through. With no
+  column list the row fills the view's first columns, as many as it has
+  (more is 42601). Each column filled must be a column of the table: one
+  that is an expression is 0A000 with PostgreSQL's DETAIL, and two view
+  columns of one table column are 42601 ("multiple assignments to same
+  column"). The table's defaults fill the columns left out; the view's
+  `WHERE` is not checked (there is no `WITH CHECK OPTION`). `VALUES`, its
+  subqueries and `INSERT … SELECT` read views as any query does.
+  `RETURNING` gives the view's columns over the row written, `*` included.
+  A view of views is checked a view at a time, from the outermost, so an
+  error names the view PostgreSQL's does.
+- **`UPDATE` and `DELETE` of a view are refused** (0A000, #678), as is any
+  DDL written against it as a table.
 - **Dropped with `RESTRICT`**, the default and only form: a table or view
   another view reads cannot be dropped (2BP01). `DROP VIEW` of a table is
   42809, as `DROP TABLE` of a view.
@@ -1348,12 +1366,12 @@ implemented (`functional_testing_design.md`).
   into a structure of keys and holds no typed row, so the first waits for
   an object in the plan API that does (#681), and the second for the same
   streaming at a grouped query's emit (#682).
-- **Views are read-only, and a query over a grouped view is limited.**
-  PostgreSQL writes through a simple view, checks the rows written with
-  `WITH CHECK OPTION`, replaces a view with `CREATE OR REPLACE VIEW`, and
-  aggregates, joins and selects `DISTINCT` over any view, which it runs as
-  a subquery in `FROM`. Here a view's query is merged into the
-  statement, so these wait for updatable views and derived tables.
+- **Views take `INSERT` only, and a query over a grouped view is limited.**
+  PostgreSQL updates and deletes through a simple view (#678), checks the
+  rows written with `WITH CHECK OPTION`, replaces a view with `CREATE OR
+  REPLACE VIEW`, and aggregates, joins and selects `DISTINCT` over any view,
+  which it runs as a subquery in `FROM`. Here a view's query is merged into
+  the statement, so these wait for updatable views and derived tables.
 
 ## Decisions
 

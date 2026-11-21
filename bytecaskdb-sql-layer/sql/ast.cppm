@@ -17,6 +17,7 @@ module;
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -45,11 +46,20 @@ public:
   // folded, when the statement is planned (1/0).
   [[nodiscard]] auto at_analysis() const noexcept -> bool { return at_analysis_; }
   void mark_at_analysis() noexcept { at_analysis_ = true; }
+  // PostgreSQL's DETAIL and HINT for the error, empty where it has none.
+  // Shared, so copying the error cannot throw.
+  [[nodiscard]] auto detail() const noexcept -> std::string_view { return notes_ ? std::string_view{notes_->first} : ""; }
+  [[nodiscard]] auto hint() const noexcept -> std::string_view { return notes_ ? std::string_view{notes_->second} : ""; }
+  [[nodiscard]] auto with_notes(std::string detail, std::string hint) && -> SqlError&& {
+    notes_ = std::make_shared<const std::pair<std::string, std::string>>(std::move(detail), std::move(hint));
+    return std::move(*this);
+  }
 
 private:
   std::int32_t pos_;
   SqlState sqlstate_;
   bool at_analysis_{false};
+  std::shared_ptr<const std::pair<std::string, std::string>> notes_;
 };
 
 // A statement the layer does not support where it was given, the API's
@@ -350,6 +360,9 @@ struct Select {
   std::vector<OrderItem> order_by;
   std::optional<std::int64_t> limit;  // nullopt: none, LIMIT ALL or LIMIT NULL
   std::int64_t offset{0};             // OFFSET n: the rows skipped before LIMIT counts
+  // LIMIT, FETCH or OFFSET was written, even one that limits nothing (LIMIT
+  // ALL, LIMIT NULL, OFFSET 0): PostgreSQL will not write through such a view.
+  bool limit_written{false};
   std::int32_t pos{-1};
   bool for_update{false};  // FOR UPDATE: a guard on each row returned, never a lock
   std::vector<Expr> group_by;  // GROUP BY's columns, as written
@@ -402,6 +415,7 @@ struct SetOperation {
   out.order_by = clone(s.order_by);
   out.limit = s.limit;
   out.offset = s.offset;
+  out.limit_written = s.limit_written;
   out.pos = s.pos;
   out.for_update = s.for_update;
   for (const auto& e : s.group_by) out.group_by.push_back(clone(e));

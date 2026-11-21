@@ -1089,7 +1089,7 @@ auto create_view(const PgQuery__ViewStmt* s, std::int32_t pos) -> CreateView {
   }
   if (s->with_check_option == PG_QUERY__VIEW_CHECK_OPTION__LOCAL_CHECK_OPTION ||
       s->with_check_option == PG_QUERY__VIEW_CHECK_OPTION__CASCADED_CHECK_OPTION) {
-    reject("WITH CHECK OPTION is not supported: views are not updatable", s->view->location);
+    reject("WITH CHECK OPTION is not supported", s->view->location);
   }
   if (s->query == nullptr || s->query->node_case != PG_QUERY__NODE__NODE_SELECT_STMT) {
     reject("a view is defined by a SELECT", pos);
@@ -1317,6 +1317,7 @@ auto set_operation(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   Select sel;
   sel.pos = pos;
   sel.limit = limit(s);
+  sel.limit_written = s->limit_count != nullptr;
   sel.order_by = order_items(s, pos);
   sel.set = std::make_shared<const SetOperation>(SetOperation{kind, s->all != 0, select(s->larg, pos), select(s->rarg, pos)});
   return sel;
@@ -1400,6 +1401,7 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos, bool into_taken) -> 
   sel.from = std::move(items);
   sel.limit = limit(s);
   sel.offset = offset(s);
+  sel.limit_written = s->limit_count != nullptr || s->limit_offset != nullptr;
   sel.pos = pos;
   sel.distinct = distinct;
   if (s->n_locking_clause == 1) {
