@@ -18,6 +18,7 @@
 #include <memory>
 #include <new>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1563,6 +1564,250 @@ TEST_CASE("schemas: an allocation failure in CREATE SCHEMA with elements in auto
     } else {
       CHECK(cat->schemas().empty());
     }
+    if (!fired) break;
+    ++failed;
+  }
+  CHECK(failed > 0);
+}
+
+namespace {
+
+// Every key the engine holds: what a DROP that leaves nothing behind must
+// restore exactly.
+auto all_keys(Database& db) -> std::set<Bytes> {
+  std::set<Bytes> out;
+  auto snap = db.engine_for_testing().snapshot();
+  for_each_in_prefix(snap, Bytes{}, [&](BytesView k, BytesView) { out.emplace(k.begin(), k.end()); });
+  return out;
+}
+
+// A schema s of every kind of object DROP SCHEMA … CASCADE drops, each with
+// an ACL where it takes one, and two views in public over its view.
+void make_cascade_schema(Database& db) {
+  for (const auto* sql : {"CREATE SCHEMA s", "CREATE TABLE s.x (k BIGINT PRIMARY KEY, b BIGINT)",
+                          "INSERT INTO s.x VALUES (1, 10), (2, 20)", "CREATE INDEX xb ON s.x (b)",
+                          "CREATE VIEW s.v AS SELECT k FROM s.x", "CREATE SEQUENCE s.q", "CREATE DOMAIN s.d AS INTEGER",
+                          "CREATE TYPE s.sh", "CREATE PROCEDURE s.p(a INTEGER, b TEXT) LANGUAGE plpgsql AS $$ BEGIN NULL; END $$",
+                          "GRANT SELECT ON s.x TO r", "GRANT SELECT ON s.v TO r", "GRANT USAGE ON SEQUENCE s.q TO r",
+                          "GRANT USAGE ON DOMAIN s.d TO r", "CREATE VIEW pv AS SELECT k FROM s.v",
+                          "CREATE VIEW pv2 AS SELECT k FROM pv"}) {
+    (void)db.execute(sql);
+  }
+}
+
+// Whether every object make_cascade_schema makes is there, or none is.
+auto cascade_schema_state(Database& db) -> std::string {
+  const auto cat = db.catalog();
+  const auto* s = cat->schema("s");
+  if (s == nullptr) {
+    auto none = cat->view({kPublicSchema, "pv"}) == nullptr && cat->view({kPublicSchema, "pv2"}) == nullptr;
+    return none ? "none" : "views left";
+  }
+  auto all = cat->table({s->id, "x"}) != nullptr && cat->index({s->id, "xb"}).second != nullptr &&
+             cat->view({s->id, "v"}) != nullptr && cat->sequence({s->id, "q"}) != nullptr &&
+             cat->type({s->id, "d"}) != nullptr && cat->type({s->id, "sh"}) != nullptr &&
+             cat->procedure({s->id, "p"}) != nullptr && cat->view({kPublicSchema, "pv"}) != nullptr &&
+             cat->view({kPublicSchema, "pv2"}) != nullptr;
+  if (!all) return "partial";
+  return db.execute("SELECT k FROM pv2 ORDER BY k").rows == Grid{{i(1)}, {i(2)}} ? "all" : "rows lost";
+}
+
+}  // namespace
+
+TEST_CASE("schemas: DROP SCHEMA … CASCADE drops every object of the schema and the views that read them, and nothing else",
+          "[sql][api][schemas]") {
+  sql_test::TempDir dir{"schemas_cascade"};
+  auto db = open(dir);
+  (void)db->execute("CREATE ROLE r");
+  (void)db->execute("CREATE TABLE keep (k BIGINT PRIMARY KEY)");
+  (void)db->execute("CREATE VIEW keepv AS SELECT k FROM t");
+  (void)db->execute("GRANT SELECT ON t TO r");
+  const auto before = all_keys(*db);
+  make_cascade_schema(*db);
+  // A procedure elsewhere whose body names a dropped table is not dropped:
+  // its body is no dependency, as a PL/pgSQL body is not in PostgreSQL 17.
+  (void)db->execute("CREATE PROCEDURE pp() LANGUAGE plpgsql AS $$ BEGIN INSERT INTO s.x VALUES (3, 30); END $$");
+  REQUIRE(cascade_schema_state(*db) == "all");
+
+  // RESTRICT lists what CASCADE drops, as PostgreSQL 17 lists it: no index.
+  std::string restrict_detail;
+  try {
+    (void)db->execute("DROP SCHEMA s RESTRICT");
+    FAIL("ran");
+  } catch (const std::exception& e) {
+    CHECK(std::string{sqlstate(e)} == "2BP01");
+    restrict_detail = std::string{error_detail(e)};
+  }
+  CHECK(restrict_detail ==
+        "table s.x depends on schema s\nview s.v depends on schema s\nview pv depends on view s.v\n"
+        "view pv2 depends on view pv\nsequence s.q depends on schema s\ntype s.d depends on schema s\n"
+        "type s.sh depends on schema s\nfunction s.p(integer,text) depends on schema s");
+
+  const auto out = db->execute("DROP SCHEMA s CASCADE");
+  REQUIRE(out.notices.size() == 1);
+  CHECK(out.notices[0].sqlstate == "00000");
+  CHECK(out.notices[0].message == "drop cascades to 8 other objects");
+  CHECK(out.notices[0].detail ==
+        "drop cascades to table s.x\ndrop cascades to view s.v\ndrop cascades to view pv\n"
+        "drop cascades to view pv2\ndrop cascades to sequence s.q\ndrop cascades to type s.d\n"
+        "drop cascades to type s.sh\ndrop cascades to function s.p(integer,text)");
+  CHECK(cascade_schema_state(*db) == "none");
+  CHECK(state([&] { (void)db->execute("SELECT k FROM pv"); }) == "42P01");
+  // The rest stands: the public tables, the view over one, the role, the
+  // procedure (which now fails when called, as in PostgreSQL 17).
+  CHECK(db->execute("SELECT k FROM keepv").rows == Grid{{i(1)}});
+  CHECK(db->catalog()->role("r") != nullptr);
+  CHECK(state([&] { (void)db->call("pp", {}); }) == "42P01");
+  (void)db->execute("DROP PROCEDURE pp");
+  // No key under any dropped object's prefix, no record, entry or ACL left:
+  // the engine holds exactly the keys it held before the schema.
+  CHECK(all_keys(*db) == before);
+
+  // The same through a reopen: nothing comes back.
+  db->close();
+  db = Database::open(dir.path());
+  CHECK(cascade_schema_state(*db) == "none");
+  CHECK(all_keys(*db) == before);
+}
+
+TEST_CASE("schemas: DROP SCHEMA … CASCADE gives PostgreSQL 17's NOTICE for one object, for none, and after IF EXISTS",
+          "[sql][api][schemas]") {
+  sql_test::TempDir dir{"schemas_cascade_notice"};
+  auto db = open(dir);
+  // Every expectation as PostgreSQL 17 gives it.
+  (void)db->execute("CREATE SCHEMA a");
+  CHECK(db->execute("DROP SCHEMA a CASCADE").notices.empty());  // an empty schema: no NOTICE
+  (void)db->execute("CREATE SCHEMA a");
+  (void)db->execute("CREATE TABLE a.t (k BIGINT)");
+  auto one = db->execute("DROP SCHEMA a CASCADE");
+  REQUIRE(one.notices.size() == 1);
+  CHECK(one.notices[0].message == "drop cascades to table a.t");
+  CHECK(one.notices[0].detail.empty());
+  // Two schemas, a missing one skipped first; a view in one over the
+  // other's table is the schema's object, not a reader.
+  (void)db->execute("CREATE SCHEMA a");
+  (void)db->execute("CREATE TABLE a.t (k BIGINT)");
+  (void)db->execute("CREATE SCHEMA b");
+  (void)db->execute("CREATE VIEW b.w AS SELECT k FROM a.t");
+  auto two = db->execute("DROP SCHEMA IF EXISTS a, nope, b CASCADE");
+  REQUIRE(two.notices.size() == 2);
+  CHECK(two.notices[0].message == "schema \"nope\" does not exist, skipping");
+  CHECK(two.notices[1].message == "drop cascades to 2 other objects");
+  CHECK(two.notices[1].detail == "drop cascades to table a.t\ndrop cascades to view b.w");
+  CHECK(db->catalog()->schemas().empty());
+  // A missing name without IF EXISTS drops nothing; the system schemas are refused as RESTRICT refuses them.
+  (void)db->execute("CREATE SCHEMA a");
+  (void)db->execute("CREATE TABLE a.t (k BIGINT)");
+  CHECK(state([&] { (void)db->execute("DROP SCHEMA a, nope CASCADE"); }) == "3F000");
+  CHECK(state([&] { (void)db->execute("DROP SCHEMA a, pg_catalog CASCADE"); }) == "2BP01");
+  CHECK(state([&] { (void)db->execute("DROP SCHEMA a, public CASCADE"); }) == "0A000");
+  CHECK(db->catalog()->schema("a") != nullptr);
+  // Past 100 objects the DETAIL ends with how many more, the count in the message is all of them.
+  for (int k = 1; k <= 101; ++k) (void)db->execute("CREATE TABLE a.t" + std::to_string(k) + " (a INTEGER)");
+  auto big = db->execute("DROP SCHEMA a CASCADE");
+  REQUIRE(big.notices.size() == 1);
+  CHECK(big.notices[0].message == "drop cascades to 102 other objects");
+  CHECK(big.notices[0].detail.starts_with("drop cascades to table a.t\ndrop cascades to table a.t1\n"));
+  CHECK(big.notices[0].detail.ends_with("\ndrop cascades to table a.t99\nand 2 other objects (see server log for list)"));
+  // DROP TABLE and DROP VIEW … CASCADE stay refused, by the parser, as a feature
+  // not built (#872).
+  CHECK(state([&] { (void)db->execute("DROP TABLE t CASCADE"); }) == "0A000");
+  CHECK(state([&] { (void)db->execute("DROP VIEW v CASCADE"); }) == "0A000");
+}
+
+TEST_CASE("schemas: DROP SCHEMA … CASCADE in a transaction: rolled back it restores all, and an open cursor makes it 55006",
+          "[sql][api][txn][ddl][schemas][cursor]") {
+  sql_test::TempDir dir{"schemas_cascade_txn"};
+  auto db = open(dir);
+  (void)db->execute("CREATE ROLE r");
+  make_cascade_schema(*db);
+  const auto keys = all_keys(*db);
+  {
+    auto t = db->begin();
+    auto out = t.execute("DROP SCHEMA s CASCADE");
+    CHECK(out.notices.at(0).message == "drop cascades to 8 other objects");
+    // The transaction sees it gone; others see it all until the commit.
+    CHECK(state([&] { (void)t.execute("SELECT k FROM pv2"); }) == "42P01");
+    CHECK(cascade_schema_state(*db) == "all");
+    t.rollback();
+  }
+  CHECK(cascade_schema_state(*db) == "all");
+  CHECK(all_keys(*db) == keys);
+  constexpr auto kInUse = " because it is being used by active queries in this session";
+  {
+    // As PostgreSQL 17: a cursor over a table of the schema is 55006 under
+    // CASCADE, and RESTRICT is 2BP01 first.
+    auto t = db->begin();
+    auto cursor = t.open_cursor("SELECT k FROM s.x", ResultCheck::none(), {});
+    CHECK(message([&] { (void)t.execute("DROP SCHEMA s CASCADE"); }) == std::string{"cannot DROP TABLE \"x\""} + kInUse);
+    CHECK(t.is_aborted());
+  }
+  {
+    auto t = db->begin();
+    auto cursor = t.open_cursor("SELECT k FROM pv2", ResultCheck::none(), {});  // through the views
+    CHECK(state([&] { (void)t.execute("DROP SCHEMA s"); }) == "2BP01");
+  }
+  {
+    auto t = db->begin();
+    auto cursor = t.open_cursor("SELECT k FROM pv2", ResultCheck::none(), {});
+    CHECK(state([&] { (void)t.execute("DROP SCHEMA s CASCADE"); }) == "55006");
+  }
+  {
+    // A cursor that scans the index holds the index, named as PostgreSQL 17 names it.
+    for (std::int64_t k = 3; k <= 500; ++k) (void)db->execute("INSERT INTO s.x VALUES ($1, $1)", {i(k)});
+    REQUIRE(db->prepare("SELECT k FROM s.x WHERE b = $1").plan_source().find("IDX_") != std::string::npos);
+    auto t = db->begin();
+    auto cursor = t.open_cursor("SELECT k FROM s.x WHERE b = $1", ResultCheck::none(), {i(10)});
+    CHECK(message([&] { (void)t.execute("DROP SCHEMA s CASCADE"); }) == std::string{"cannot DROP INDEX \"xb\""} + kInUse);
+  }
+  {
+    // None for a cursor over a table the drop leaves; committed, it is gone for all.
+    auto t = db->begin();
+    auto cursor = t.open_cursor("SELECT k FROM t", ResultCheck::none(), {});
+    (void)t.execute("DROP SCHEMA s CASCADE");
+    CHECK(cursor.fetch(10).rows == Grid{{i(1)}});
+    CHECK(t.commit() == CommitOutcome::Committed);
+  }
+  CHECK(cascade_schema_state(*db) == "none");
+}
+
+TEST_CASE("schemas: a crash at the commit hook of DROP SCHEMA … CASCADE leaves every object after reopen",
+          "[sql][api][schemas]") {
+  sql_test::TempDir dir{"schemas_cascade_crash"};
+  {
+    auto db = open(dir);
+    (void)db->execute("CREATE ROLE r");
+    make_cascade_schema(*db);
+    db->live_catalog_for_testing().set_commit_hook_for_testing([] { throw std::runtime_error{"crash"}; });
+    CHECK_THROWS(db->execute("DROP SCHEMA s CASCADE"));
+    db->live_catalog_for_testing().set_commit_hook_for_testing({});
+    db->close();
+  }
+  auto db = Database::open(dir.path());
+  CHECK(cascade_schema_state(*db) == "all");
+  (void)db->execute("DROP SCHEMA s CASCADE");
+  CHECK(cascade_schema_state(*db) == "none");
+}
+
+TEST_CASE("schemas: an allocation failure in DROP SCHEMA … CASCADE drops all or nothing",
+          "[sql][api][schemas][alloc]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
+  sql_test::TempDir dir{"schemas_cascade_alloc"};
+  auto db = open(dir);
+  (void)db->execute("CREATE ROLE r");
+  auto failed = 0;
+  for (long nth = 1;; ++nth) {
+    REQUIRE(nth < 200000);
+    if (db->catalog()->schema("s") == nullptr) make_cascade_schema(*db);
+    std::string outcome = "ok";
+    bool fired = false;
+    {
+      bytecask::testing::ScopedAllocFaults faults{nth, false};
+      outcome = state([&] { (void)db->execute("DROP SCHEMA s CASCADE"); });
+      fired = faults.report().fired;
+    }
+    INFO("allocation " << nth << ": " << outcome);
+    CHECK(cascade_schema_state(*db) == (outcome == "ok" ? "none" : "all"));
     if (!fired) break;
     ++failed;
   }

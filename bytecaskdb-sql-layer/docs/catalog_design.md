@@ -681,8 +681,9 @@ both fixes before stage 1 (qualified type names; a view's dependencies
 from the binder's resolution), stage 1a (lookups keyed by (schema, name))
 and stage 1b (the schema record, `CREATE SCHEMA` and `DROP SCHEMA` without
 elements or `CASCADE`, qualified names; *Stages of schemas* says what was
-adapted), stage 2 (`CREATE SCHEMA` with elements) and stage 3 (`WITH
-CHECK OPTION`); stages 4 and 5 are not built. This section covers what
+adapted), stage 2 (`CREATE SCHEMA` with elements), stage 3 (`WITH
+CHECK OPTION`) and stage 5 (`DROP SCHEMA … CASCADE`); stage 4 (schema
+privileges) is deferred to #873, as Q9 (b) has it. This section covers what
 `CREATE SCHEMA` and `DROP SCHEMA` do, how a schema-qualified name resolves,
 the schema record and the change to the name entries' keys, what an older
 build does with a database that holds a schema, `WITH CHECK OPTION` (which
@@ -722,7 +723,7 @@ expected results: a case passes when every step succeeds
 | f311_05_01_01, 02 | `CREATE TABLE T`; `CREATE ROLE R`; `CREATE SCHEMA S GRANT SELECT ON [TABLE] T TO R` | stage 2 |
 
 No case needs stage 4 (schema privileges) or stage 5 (`DROP SCHEMA …
-CASCADE`); building them now is the owner's call (Q9).
+CASCADE`); the owner chose to build stage 5 and defer stage 4 (Q9 (b)).
 
 ### Schema semantics
 
@@ -825,7 +826,7 @@ layer has no triggers. The rest follow PG 17:
     (`view v`, not `view public.v`);
   - past 100 lines, the rest is one line, `and N other objects (see
     server log for list)`.
-- **CASCADE** (stage 5) drops, in one batch: every table, view, index,
+- **CASCADE** (stage 5, built) drops, in one batch: every table, view, index,
   sequence, procedure, domain and shell type of the schema; every view in
   any schema that reads one of them, and the views that read those, to the
   end of the chain; and the ACL record of each, the schema's included.
@@ -1330,7 +1331,9 @@ Each was observed on PG 17.12 unless it says otherwise.
 | Objects created under `AUTHORIZATION r` are owned by `r` | No owner | Objects have no owner in the layer. |
 | Two sessions' `CREATE SCHEMA s` race: the second waits, then 23505 or 42P06 | The second to commit is 40001 | A DDL never waits for another (`transaction_design.md:477-502`). |
 | `pg_namespace`, `pg_class`, `information_schema.schemata` answer | 42P01 (`information_schema.x`, `pg_catalog.x`) | No catalog views (`pg_session.cppm:449`); an error, not a wrong answer. psql's `\dn` fails as `\dt` does today. |
-| `DROP SCHEMA … CASCADE` lists dropped objects in its order | The same objects; the DETAIL lines may be in another order | A notice, not a result. |
+| `DROP SCHEMA … CASCADE` lists dropped objects in its order | The same objects; the DETAIL lines may be in another order (with several schemas named, PG 17 listed the later schema's first) | A notice, not a result. |
+| `DROP SCHEMA … CASCADE` that is 55006 sends its NOTICE first | The 55006 alone | The NOTICE is a statement's result, which an error replaces. |
+| A cursor reading a table by its primary key makes `DROP SCHEMA … CASCADE` 55006 `cannot DROP INDEX "t_pkey"` | 55006 `cannot DROP TABLE "t"` | The primary key is the table's own key, not an index. |
 | `WITH CHECK OPTION` with a subquery in a checked `WHERE` is accepted and enforced | 0A000 at `CREATE VIEW` | As for a `CHECK` constraint's subquery. |
 | `WITH CHECK OPTION` with `LIKE` in a checked `WHERE` is accepted and enforced | 0A000 at `CREATE VIEW` | A checked `WHERE` is evaluated as a value, which has no `LIKE` yet. |
 | `WITH CHECK OPTION` with a comparison of a `REAL` or `DOUBLE PRECISION` in a checked `WHERE` is accepted and enforced | 42601 at `CREATE VIEW` | A checked `WHERE` is evaluated as a value, which compares no floating-point value yet; the same view without the option is created. |
@@ -1345,13 +1348,13 @@ makes it. Rows are named by their first words.
 
 | Row | Change |
 |---|---|
-| "Each DDL statement is atomic" | **Widened** to `CREATE SCHEMA` (with its elements, as one statement) and `DROP SCHEMA`. Tests: stage 1b and 2's reopen and commit-hook tests. |
+| "Each DDL statement is atomic" | **Widened** to `CREATE SCHEMA` (with its elements, as one statement) and `DROP SCHEMA`, with all `CASCADE` drops (stage 5). Tests: stage 1b and 2's reopen and commit-hook tests. |
 | "A DDL never waits for another" | **Widened** to `CREATE SCHEMA` with elements in autocommit: a conflict at its internal commit is 40001 with nothing written, not retried. Test: stage 2's "two `CREATE SCHEMA` with elements race; the loser writes nothing". |
 | "A catalog the build cannot decode is refused at open" | **Widened** to the schema record, both name entry forms, the new formats, and a name that is empty or holds a NUL byte. Tests: stage 1b's `catalog_test` refusals. |
 | "CREATE VIEW stores the view in the catalog" | **Widened**: the namespace is per schema, so one name may be a table in `public` and a view in `s`. Tests: stage 1b's functional cases. |
-| "A table or view that a view reads cannot be dropped" | **Widened** by stage 5: `DROP SCHEMA … CASCADE` drops the views that read what it drops. DROP TABLE and DROP VIEW stay RESTRICT only. Before stage 1, **fixed** (built): the guarantee now also holds for a table read only by an `ORDER BY` subquery. Test: "embedded API: a view's dependencies are every relation its query reads, a subquery's in any position". |
+| "A table or view that a view reads cannot be dropped" | **Widened** by stage 5 (built): `DROP SCHEMA … CASCADE` drops the views that read what it drops. DROP TABLE and DROP VIEW stay RESTRICT only. Before stage 1, **fixed** (built): the guarantee now also holds for a table read only by an `ORDER BY` subquery. Test: "embedded API: a view's dependencies are every relation its query reads, a subquery's in any position". |
 | "`Database::open` of a database written by an SQL-layer build from before #780" | Unchanged in substance: a database holding a record this build wrote, any schema included, is refused by a build from before stage 1b. Proved by the older build's own "catalog: a damaged or foreign-format record is refused" and by this build's test that every record and ACL it writes is in the new format. |
-| "A DDL statement given to a `Transaction`" | **Widened** to `CREATE SCHEMA` and `DROP SCHEMA`; a `CREATE SCHEMA`'s elements are steps of the transaction; `DROP SCHEMA` of what an open cursor reads is 55006. Tests: stage 1b and 5's `api_txn_ddl_test` cases. |
+| "A DDL statement given to a `Transaction`" | **Widened** to `CREATE SCHEMA` and `DROP SCHEMA`; a `CREATE SCHEMA`'s elements are steps of the transaction; `DROP SCHEMA … CASCADE` of what an open cursor reads is 55006 (stage 5, built). Tests: stage 1b and 5's `api_txn_ddl_test` cases. |
 | New, stage 1b | **Added**: qualified names resolve to that schema's object or fail with PG 17's SQLSTATE (3F000, 42P01, 42704, 42883, 42501, 0A000, 42601); an unqualified name resolves in `public`; `CREATE SCHEMA`/`DROP SCHEMA` errors (42P06, 42939, 3F000, 2BP01). Tests (as built): "schemas: CREATE and DROP SCHEMA errors are PostgreSQL's", "schemas: messages name a missing object as s.x, and DROP SCHEMA and DROP ROLE list as PostgreSQL 17 does", "schemas: a schema is a record, a name entry and an ACL record, and its objects are its own through a reopen", "catalog: lookups are keyed by (schema, name), and a DDL creating in a schema that does not exist is refused", `tests/functional/cases/postgresql/schemas.yaml`, sqltest f311_01_01_01; the row in `CONTRACT.md` names the rest. |
 | New, before stage 1 | **Narrowed**: a type name qualified by anything but `pg_catalog.` is refused (3F000, or 42704 for `public.`), where its last part was read alone. Test: "parser: a qualified type name other than pg_catalog's is refused". |
 | New, stage 2 | **Added**: a view resolves each unqualified name to the object it was created against, whatever is created later. Tests: stage 2's shadowing test, through a reopen. |
@@ -1663,7 +1666,7 @@ default out; a `REVOKE` that empties the ACL keeps the record; the ACL
 survives a reopen and is refused with a privilege a schema does not take;
 `DROP SCHEMA` takes it.
 
-**Stage 5: `DROP SCHEMA … CASCADE`** (Q9). The closure over `depends_on`,
+**Stage 5: `DROP SCHEMA … CASCADE`. Built** (Q9 (b)). The closure over `depends_on`,
 the in-use check, the notices, one batch. Tests: a schema of a table, an
 index, a view, a sequence, a domain, a shell type and a procedure, with a
 view in `public` over its table and a view over that view, all dropped
@@ -1673,6 +1676,44 @@ exclude indexes; an open cursor over a table of the schema makes it 55006
 in a transaction; a crash at the commit hook leaves all of them after
 reopen; in a transaction, rollback restores them. An allocation-fault
 sweep over a `DROP SCHEMA … CASCADE` of several kinds.
+
+As built (stage 5), with what the code made different:
+- **One closure, three users.** `Catalog::schema_drop` checks the names
+  (3F000, the system schemas) and lists the objects in PostgreSQL 17's
+  order: each object of a named schema by id, each followed by the views
+  elsewhere that read it, depth first. RESTRICT's DETAIL, CASCADE's
+  NOTICE and the in-use check all read that one list, so what is
+  reported is what is dropped. `next_version` drops each listed object
+  through the same code as its own `DROP` (`drop_table` takes the
+  table's indexes, rows and index entries), then the schemas.
+- **The NOTICE carries a DETAIL.** `Notice` gains `detail`, which the
+  server sends as `D`. In autocommit the NOTICE is worked out before the
+  commit and again only if the DDL ran against a newer catalog than it
+  was bound against (`LiveCatalog::Applied::base`), so an allocation
+  failure after the commit cannot report a committed `DROP` as failed.
+- **In use.** In a transaction, CASCADE checks each table of the list:
+  an index an open cursor or portal scans is 55006 `cannot DROP INDEX
+  "i"`, then a table one reads `cannot DROP TABLE "t"`, as PostgreSQL 17
+  checks a table's indexes before the table. The layer's primary key is
+  the table's own key, not an index, so a cursor that reads by it names
+  the table where PostgreSQL names `t_pkey` (*Differences*). The NOTICE
+  is not sent with the 55006 (*Differences*).
+- **`DROP TABLE` and `DROP VIEW … CASCADE`** stay refused by the parser,
+  as a feature not built: 0A000, `DROP … CASCADE is not supported yet:
+  only DROP SCHEMA takes CASCADE` (#872), as is CASCADE on every other
+  `DROP`. They were 42601 before stage 5.
+- **Tests**: "schemas: DROP SCHEMA … CASCADE drops every object of the
+  schema and the views that read them, and nothing else" (the engine's
+  key set after the drop is exactly the one before the schema, through a
+  reopen), "… gives PostgreSQL 17's NOTICE for one object, for none, and
+  after IF EXISTS" (and past 100 objects), "… in a transaction: rolled
+  back it restores all, and an open cursor makes it 55006", "a crash at
+  the commit hook of DROP SCHEMA … CASCADE leaves every object after
+  reopen", "an allocation failure in DROP SCHEMA … CASCADE drops all or
+  nothing", the parser's, the wire's
+  `test_drop_schema_cascade_sends_postgresqls_notice_with_its_detail`,
+  and the stage 5 cases of
+  `tests/functional/cases/postgresql/schemas.yaml`.
 
 **Recorded and hand-written cases.** The PG 17 oracle records each case in
 its own schema with `search_path` set to it alone

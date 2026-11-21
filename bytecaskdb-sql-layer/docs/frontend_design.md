@@ -899,7 +899,9 @@ EXISTS] name`:
   against what they were created against*). The error names one view that
   reads the object itself, in the message: PostgreSQL's names each
   dependent in a DETAIL, with a HINT. `DROP VIEW` of a table is
-  42809, as `DROP TABLE` of a view.
+  42809, as `DROP TABLE` of a view. Refused (0A000, #872): `CASCADE` on
+  `DROP TABLE`, `DROP VIEW` or any `DROP` but `DROP SCHEMA`, which
+  PostgreSQL takes; a `DROP` of a list or `CONCURRENTLY` is 42601.
 - **A plan through a view is rebuilt after any DDL**, since the runtime
   checks the tables a plan reads and not the views it came through
   (`Statement`'s plan records them, `bound::Bound::views`).
@@ -1025,12 +1027,16 @@ usable yet.
 
 **Schemas** (`catalog_design.md`, *Schemas*, stage 1b): `CREATE SCHEMA
 [IF NOT EXISTS] name [AUTHORIZATION role]`, `CREATE SCHEMA AUTHORIZATION
-role`, and `DROP SCHEMA [IF EXISTS] name [, …] [RESTRICT]`, with
+role`, and `DROP SCHEMA [IF EXISTS] name [, …] [RESTRICT | CASCADE]`, with
 PostgreSQL 17's errors: 42P06 for a taken name (`public` and
 `information_schema` too; `IF NOT EXISTS` gives the NOTICE), 42939 for a
 `pg_` name, 42704 for a missing role, 3F000 for a missing schema (the
 statement drops nothing), 2BP01 for `pg_catalog` and for a schema holding
-any object, with PostgreSQL's DETAIL and HINT. A schema's owner is the
+any object under RESTRICT, with PostgreSQL's DETAIL and HINT. `CASCADE`
+(stage 5) drops every object of the schemas and every view that reads
+one, in one batch, with PostgreSQL 17's NOTICE `drop cascades to …`; in
+a transaction, one that would drop a table an open cursor reads is
+55006. A schema's owner is the
 `AUTHORIZATION` role, or the bootstrap role; `DROP ROLE` of an owner is
 2BP01. A relation, procedure or type is named alone (in `public`, the one
 schema of the path) or `schema.name`, everywhere a name is resolved; a
@@ -1052,7 +1058,6 @@ column `s.t.c`. A missing schema is 42P01 where a statement reads
   column `s.t.c` in a view element (`s` the new schema or `public`) whose
   query names `t` unqualified and unaliased, which PostgreSQL reads in the
   schema the path finds `t` in (qualifying the `FROM` item works), `DROP
-  SCHEMA … CASCADE` (stage 5), `DROP
   SCHEMA public` and `information_schema`, a domain, type or procedure in
   `pg_catalog` and anything in `information_schema` or `pg_temp`,
   `CREATE SCHEMA AUTHORIZATION CURRENT_USER` without a name, a name of
@@ -1854,7 +1859,7 @@ implemented (`functional_testing_design.md`).
   `postgres` (owner decision Q5 (a), `catalog_design.md`, *Name
   resolution with schemas*).
 - **Schemas are partial** (`catalog_design.md`, *Stages of schemas*):
-  `DROP SCHEMA … CASCADE` (stage 5), a view element whose text holds a
+  a view element whose text holds a
   `CREATE` or `GRANT` outside parentheses, `CREATE TRIGGER` as an
   element, privileges on a schema (#873), `SET search_path` (#871), and one
   table name from two schemas in one `FROM` with neither aliased, which

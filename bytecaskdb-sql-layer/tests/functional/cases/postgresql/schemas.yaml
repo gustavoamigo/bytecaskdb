@@ -1,5 +1,6 @@
-# Schemas, stage 1b (docs/catalog_design.md, *Schemas*): CREATE SCHEMA and
-# DROP SCHEMA without elements or CASCADE, and qualified names. Hand-written:
+# Schemas (docs/catalog_design.md, *Schemas*): CREATE SCHEMA, with and
+# without elements, DROP SCHEMA, RESTRICT and CASCADE (stage 5), and
+# qualified names. Hand-written:
 # the oracle records each case in a schema of its own with search_path set to
 # it, so a case naming public would read PostgreSQL's real public. Each
 # expectation was checked against PostgreSQL 17 with search_path public.
@@ -409,3 +410,75 @@
     - DROP VIEW sch_eq.v
     - DROP TABLE sch_eq.t
     - DROP SCHEMA sch_eq
+
+# Stage 5: DROP SCHEMA … CASCADE.
+- name: DROP SCHEMA CASCADE drops every object of the schema and the views elsewhere that read them
+  features: [pg:schemas]
+  # PostgreSQL 17, search_path public: NOTICE "drop cascades to 8 other
+  # objects", one DETAIL line for each object but the index.
+  setup:
+    - CREATE SCHEMA sch_cd
+    - CREATE TABLE sch_cd.t (a INTEGER PRIMARY KEY, b INTEGER)
+    - CREATE INDEX sch_cd_i ON sch_cd.t (b)
+    - CREATE VIEW sch_cd.v AS SELECT a FROM sch_cd.t
+    - CREATE SEQUENCE sch_cd.q
+    - CREATE DOMAIN sch_cd.d AS INTEGER
+    - CREATE TYPE sch_cd.sh
+    - "CREATE PROCEDURE sch_cd.p(x INTEGER) LANGUAGE plpgsql AS $$ BEGIN NULL; END $$"
+    - CREATE VIEW sch_cdv AS SELECT a FROM sch_cd.v
+    - CREATE VIEW sch_cdv2 AS SELECT a FROM sch_cdv
+    - CREATE TABLE sch_cd_keep (a INTEGER)
+  steps:
+    - sql: INSERT INTO sch_cd.t VALUES (1, 10)
+      rowcount: 1
+    - sql: DROP SCHEMA sch_cd RESTRICT
+      error: "2BP01"
+    - sql: DROP SCHEMA sch_cd CASCADE
+    - sql: SELECT a FROM sch_cdv2
+      error: "42P01"
+    - sql: SELECT a FROM sch_cdv
+      error: "42P01"
+    - sql: SELECT a FROM sch_cd.t
+      error: "42P01"
+    - sql: DROP INDEX sch_cd.sch_cd_i
+      error: "3F000"
+    - sql: SELECT a FROM sch_cd_keep
+      expected: []
+    - sql: CREATE SCHEMA sch_cd
+    - sql: CREATE TABLE sch_cd.t (a INTEGER)
+    - sql: SELECT a FROM sch_cd.t
+      expected: []
+    - sql: DROP SCHEMA IF EXISTS sch_cd_missing, sch_cd CASCADE
+    - sql: DROP SCHEMA sch_cd CASCADE
+      error: "3F000"
+  teardown:
+    - DROP TABLE sch_cd_keep
+
+- name: DROP SCHEMA CASCADE drops nothing when a name is missing, and is undone by ROLLBACK
+  features: [pg:schemas]
+  setup:
+    - CREATE SCHEMA sch_cr
+    - CREATE TABLE sch_cr.t (a INTEGER)
+    - INSERT INTO sch_cr.t VALUES (5)
+  steps:
+    - sql: DROP SCHEMA sch_cr, sch_cr_missing CASCADE
+      error: "3F000"
+    - sql: DROP SCHEMA sch_cr, pg_catalog CASCADE
+      error: "2BP01"
+    - sql: SELECT a FROM sch_cr.t
+      expected: [[5]]
+    - sql: BEGIN
+    - sql: DROP SCHEMA sch_cr CASCADE
+    - sql: SELECT a FROM sch_cr.t
+      error: "42P01"
+    - sql: ROLLBACK
+    - sql: SELECT a FROM sch_cr.t
+      expected: [[5]]
+    - sql: BEGIN
+    - sql: DROP SCHEMA sch_cr CASCADE
+    - sql: COMMIT
+    - restart: true
+    - sql: SELECT a FROM sch_cr.t
+      error: "42P01"
+    - sql: DROP SCHEMA sch_cr
+      error: "3F000"

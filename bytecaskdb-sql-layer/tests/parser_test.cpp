@@ -395,6 +395,17 @@ TEST_CASE("parser: CREATE VIEW and DROP VIEW", "[sql][parser][view]") {
   CHECK_THROWS_AS(parse("DROP VIEW v CASCADE"), SqlError);
 }
 
+TEST_CASE("parser: DROP SCHEMA takes a list, IF EXISTS, and RESTRICT or CASCADE", "[sql][parser][schemas]") {
+  const auto plain = std::get<DropSchema>(parse("DROP SCHEMA a, \"B c\""));
+  CHECK(plain.names == std::vector<std::string>{"a", "B c"});
+  CHECK_FALSE(plain.if_exists);
+  CHECK_FALSE(plain.cascade);
+  CHECK_FALSE(std::get<DropSchema>(parse("DROP SCHEMA a RESTRICT")).cascade);
+  const auto cascade = std::get<DropSchema>(parse("DROP SCHEMA IF EXISTS a CASCADE"));
+  CHECK(cascade.if_exists);
+  CHECK(cascade.cascade);
+}
+
 TEST_CASE("parser: UNION, INTERSECT and EXCEPT, their ALL and precedence", "[sql][parser][setop]") {
   using Kind = SetOperation::Kind;
   auto top = [](std::string_view sql) { return std::get<Select>(parse(sql)); };

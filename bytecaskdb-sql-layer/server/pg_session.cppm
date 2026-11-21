@@ -785,7 +785,7 @@ private:
   // A statement's notices (Rows::notices), each a NoticeResponse before its
   // CommandComplete, as PostgreSQL sends them.
   void notices(const Rows& rows) {
-    for (const auto& n : rows.notices) send_fields('N', "NOTICE", n.sqlstate, n.message, 0);
+    for (const auto& n : rows.notices) send_fields('N', "NOTICE", n.sqlstate, n.message, 0, n.detail);
   }
 
   // The session ends after it: nothing more is read or run, and any open
