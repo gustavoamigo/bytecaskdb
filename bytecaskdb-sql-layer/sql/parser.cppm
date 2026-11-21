@@ -1272,23 +1272,28 @@ auto insert(const PgQuery__InsertStmt* s, std::int32_t pos) -> Insert {
   return ins;
 }
 
-// CREATE VIEW name [(columns)] AS SELECT …: not OR REPLACE, TEMPORARY, view
-// options or a CHECK OPTION, which need updatable views.
+// CREATE VIEW name [(columns)] AS SELECT … [WITH [LOCAL | CASCADED] CHECK
+// OPTION]: not OR REPLACE, TEMPORARY or view options (WITH (check_option=…)
+// among them).
 auto create_view(const PgQuery__ViewStmt* s, std::int32_t pos) -> CreateView {
   auto name = from_relation(s->view);
   if (s->replace || s->n_options != 0 || (!empty(s->view->relpersistence) && s->view->relpersistence[0] != 'p')) {
     reject("CREATE VIEW takes no OR REPLACE, TEMPORARY or options", s->view->location);
-  }
-  if (s->with_check_option == PG_QUERY__VIEW_CHECK_OPTION__LOCAL_CHECK_OPTION ||
-      s->with_check_option == PG_QUERY__VIEW_CHECK_OPTION__CASCADED_CHECK_OPTION) {
-    reject("WITH CHECK OPTION is not supported", s->view->location);
   }
   if (s->query == nullptr || s->query->node_case != PG_QUERY__NODE__NODE_SELECT_STMT) {
     reject("a view is defined by a SELECT", pos);
   }
   std::vector<std::string> columns;
   for (std::size_t i = 0; i < s->n_aliases; ++i) columns.push_back(str(s->aliases[i]));
-  return CreateView{std::move(name), std::move(columns), select(s->query->select_stmt, pos), pos};
+  CreateView out{std::move(name), std::move(columns), select(s->query->select_stmt, pos), pos, {}, CheckOption::None};
+  switch (s->with_check_option) {
+    case PG_QUERY__VIEW_CHECK_OPTION__LOCAL_CHECK_OPTION: out.check_option = CheckOption::Local; break;
+    case PG_QUERY__VIEW_CHECK_OPTION__CASCADED_CHECK_OPTION: out.check_option = CheckOption::Cascaded; break;
+    case PG_QUERY__VIEW_CHECK_OPTION__NO_CHECK_OPTION:
+    case PG_QUERY__VIEW_CHECK_OPTION__VIEW_CHECK_OPTION_UNDEFINED: break;
+    case _PG_QUERY__VIEW_CHECK_OPTION_IS_INT_SIZE: reject("an unknown check option", s->view->location);
+  }
+  return out;
 }
 
 // LIMIT's or OFFSET's count: an integer constant, or NULL (none), as is

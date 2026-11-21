@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
    Copyright (c) 2026 Gustavo Amigo
 
-   bc_plan.h — the plan API of docs/plan_api_design.md (revision 18). A plan is
+   bc_plan.h — the plan API of docs/plan_api_design.md (revision 19). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
    and bc_params are opaque here and built by the runtime
@@ -96,6 +96,8 @@ enum bc_constraint {   /* the detail of BC_E_CONSTRAINT; the compiler emits the 
   BC_C_UNIQUE = 1, BC_C_NOT_NULL, BC_C_CHECK, BC_C_FOREIGN_KEY,
   BC_C_RANGE,          /* a value outside its declared type: SMALLINT, INTEGER, REAL, TEXT and
                           VARCHAR(n) (UTF-8, n code points), DECIMAL(p, s), DATE, TIMESTAMP, TIME */
+  BC_C_CHECK_OPTION,   /* a row written through a view WITH CHECK OPTION that a checked WHERE does not hold
+                          true of; the object id is the view's (bc_raise_row) */
 };
 
 enum bc_layout_detail {  /* the detail of BC_E_LAYOUT; every BC_E_LAYOUT carries one */
@@ -172,6 +174,7 @@ uint64_t bc_ctx_emitted(const bc_ctx *);
 bool    bc_ctx_stopped(const bc_ctx *);
 enum bc_error_code bc_error(const bc_ctx *);
 const char *bc_error_message(const bc_ctx *);
+const char *bc_error_note(const bc_ctx *);                 /* the error's DETAIL line: bc_raise_row's failing row; "" for none */
 uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits; BC_E_LAYOUT: a bc_layout_detail */
 int64_t bc_ctx_affected(const bc_ctx *);                   /* what the last run's bc_emit_count recorded, or -1 */
 int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params *,
@@ -567,6 +570,9 @@ void bc_guard_range(bc_ctx *, uint32_t table_or_index, bc_view lo, bc_view hi);
 void bc_guard_present(bc_ctx *, bc_view key);
 void bc_guard_absent(bc_ctx *, bc_view key);
 void bc_raise(bc_ctx *, uint32_t constraint, uint32_t object_id);   /* a user error: unwinds, never retried */
+void bc_raise_row(bc_ctx *, uint32_t constraint, uint32_t object_id, uint32_t table, bc_view row);
+                                                                    /* bc_raise, naming `row`, a built row of `table`,
+                                                                       in bc_error_note */
 
 #ifdef __cplusplus
 }

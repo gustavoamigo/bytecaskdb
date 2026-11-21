@@ -864,8 +864,9 @@ EXISTS] name`:
   42701, more names than columns 42601.
 - **Created** by binding its query as a use would, so its errors are
   PostgreSQL's (42P01, 42703, …). It takes no parameter (42P02). Refused
-  (42601): `OR REPLACE`, `TEMPORARY`, options and `WITH [CASCADED | LOCAL]
-  CHECK OPTION`. Each unqualified relation name of its query is stored
+  (42601): `OR REPLACE`, `TEMPORARY` and options (`WITH (check_option=…)`
+  among them). `WITH [CASCADED | LOCAL] CHECK OPTION` is taken
+  (docs/catalog_design.md, *WITH CHECK OPTION*). Each unqualified relation name of its query is stored
   with the schema it resolved to, and read there at every use
   (*Schemas*).
 - **`INSERT` through a view** writes to its table, as PostgreSQL's
@@ -880,8 +881,10 @@ EXISTS] name`:
   (more is 42601). Each column filled must be a column of the table: one
   that is an expression is 0A000 with PostgreSQL's DETAIL, and two view
   columns of one table column are 42601 ("multiple assignments to same
-  column"). The table's defaults fill the columns left out; the view's
-  `WHERE` is not checked (there is no `WITH CHECK OPTION`). `VALUES`, its
+  column"). The table's defaults fill the columns left out. A view's
+  `WHERE` is checked only where a check option asks: the row written is
+  then refused (44000) where a checked `WHERE` is false or NULL
+  (docs/catalog_design.md, *WITH CHECK OPTION*). `VALUES`, its
   subqueries and `INSERT … SELECT` read views as any query does.
   `RETURNING` gives the view's columns over the row written, `*` included.
   A view of views is checked a view at a time, from the outermost, so an
@@ -1883,7 +1886,7 @@ implemented (`functional_testing_design.md`).
   streaming at a grouped query's emit (#682).
 - **Views take `INSERT` only, and a query over a grouped view is limited.**
   PostgreSQL updates and deletes through a simple view (#678), checks the
-  rows written with `WITH CHECK OPTION`, replaces a view with `CREATE OR
+  rows an `UPDATE` writes with `WITH CHECK OPTION`, replaces a view with `CREATE OR
   REPLACE VIEW`, and joins any view, or reads one with `DISTINCT`, `LIMIT`
   or a set operation, as a subquery in `FROM`. Here a view's query is
   merged into the statement, and only a grouped view that a query

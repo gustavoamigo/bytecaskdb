@@ -1,6 +1,7 @@
 # Plan API: a physical algebra for generated plans
 
-Status: **built**, revision 18 (revision 18 with
+Status: **built**, revision 19 (revision 19 with `BC_C_CHECK_OPTION`,
+`bc_raise_row` and `bc_error_note`, for `WITH CHECK OPTION`; revision 18 with
 `bc_insert_or_existing`, for `INSERT … ON CONFLICT DO UPDATE`; revision 17 with
 `bc_insert_on_conflict`, for `INSERT … ON CONFLICT DO NOTHING`; revision 16 with `BC_T_NUM`,
 `bc_num_quotient` and `bc_emit_num`, so an `AVG` of an integer or a
@@ -505,6 +506,8 @@ enum bc_constraint {   /* the detail of BC_E_CONSTRAINT; the compiler emits the 
   BC_C_UNIQUE = 1, BC_C_NOT_NULL, BC_C_CHECK, BC_C_FOREIGN_KEY,
   BC_C_RANGE,          /* a value outside its declared type: SMALLINT, INTEGER, REAL, TEXT and
                           VARCHAR(n) (UTF-8, n code points), DECIMAL(p, s), DATE, TIMESTAMP, TIME */
+  BC_C_CHECK_OPTION,   /* a row written through a view WITH CHECK OPTION that a checked WHERE does not hold
+                          true of; the object id is the view's (bc_raise_row) */
 };
 
 enum bc_layout_detail {  /* the detail of BC_E_LAYOUT; every BC_E_LAYOUT carries one */
@@ -617,6 +620,7 @@ uint64_t bc_ctx_emitted(const bc_ctx *);
 bool    bc_ctx_stopped(const bc_ctx *);
 enum bc_error_code bc_error(const bc_ctx *);
 const char *bc_error_message(const bc_ctx *);
+const char *bc_error_note(const bc_ctx *);                 /* the error's DETAIL line: bc_raise_row's failing row; "" for none */
 uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits; BC_E_LAYOUT: a bc_layout_detail */
 int64_t bc_ctx_affected(const bc_ctx *);                   /* what the last run's bc_emit_count recorded, or -1 */
 int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params *,
@@ -1145,6 +1149,7 @@ void bc_guard_range(bc_ctx *, uint32_t table_or_index, bc_view lo, bc_view hi);
 void bc_guard_present(bc_ctx *, bc_view key);
 void bc_guard_absent(bc_ctx *, bc_view key);
 void bc_raise(bc_ctx *, uint32_t constraint, uint32_t object_id);   /* a user error: unwinds, never retried */
+void bc_raise_row(bc_ctx *, uint32_t constraint, uint32_t object_id, uint32_t table, bc_view row);
 ```
 
 | Function | What it does | Engine operation |
@@ -1154,6 +1159,7 @@ void bc_raise(bc_ctx *, uint32_t constraint, uint32_t object_id);   /* a user er
 | `bc_guard_range` | The commit fails if any key in `[lo, hi)` changed; it covers phantoms. Empty bounds are the start and end of `table_or_index`, as for `bc_scan_open`; `lo >= hi` guards nothing. A backfill's rows are guarded this way; no generated plan emits it. | `ensure_range_unchanged` |
 | `bc_guard_present`, `bc_guard_absent` | Existence preconditions on a key the plan reads and does not write. | `ensure_present`, `ensure_absent` |
 | `bc_raise` | Sets `BC_E_CONSTRAINT` with a `bc_constraint` kind and the id of the constraint, column or index concerned, as the compiler emitted them; an unknown kind or an id of 2^24 or more is `BC_E_HANDLE`. The plan unwinds; the runtime reports it and does not retry. A `CHECK` the compiler evaluates is raised this way, with the table's id, after `bc_row_end` and before `bc_insert` or `bc_update`. | none: nothing reaches the engine |
+| `bc_raise_row` | `bc_raise`, naming `row`, a built row of `table` (another table's row is `BC_E_LAYOUT`): `bc_error_note` is then PostgreSQL's DETAIL for it, `Failing row contains (…).`, each column a statement can name in the table's order as its text output cut to 64 bytes (before a UTF-8 sequence it would split, then `...`), NULL as `null`. With `BC_C_CHECK_OPTION` the message is PostgreSQL's, `new row violates check option for view "v"`, the view named by `object_id` in the pinned catalog. A check option's `WHERE` (`docs/catalog_design.md`, *WITH CHECK OPTION*) is raised this way, with the view's id, after `bc_insert` and before the row's `RETURNING` output. Revision 19. | none: nothing reaches the engine |
 
 A plan has no isolation level: the same text runs at every level. At
 SERIALIZABLE the runtime's read calls record what they read

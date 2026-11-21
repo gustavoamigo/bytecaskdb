@@ -285,6 +285,51 @@ TEST_CASE("plan API: a raised constraint error is final: no retry, nothing commi
 }
 
 namespace {
+// bc_raise_row(kind $1, id $2) of a row of t (id 5, name NULL, qty 7), built
+// as a row of table $3.
+void raise_row_p(bc_ctx* cx) {
+  auto table = static_cast<uint32_t>(bc_param_i64(cx, 2));
+  bc_row rb = bc_row_begin(cx, table);
+  bc_row_set_i64(cx, rb, kIdCol, 5);
+  if (table == kTbl) {
+    bc_row_set_null(cx, rb, kNameCol);
+    bc_row_set_i64(cx, rb, kQtyCol, 7);
+  }
+  bc_raise_row(cx, static_cast<uint32_t>(bc_param_i64(cx, 0)), static_cast<uint32_t>(bc_param_i64(cx, 1)), kTbl,
+               bc_row_end(cx, rb));
+}
+}  // namespace
+
+TEST_CASE("plan API: bc_raise_row raises with the failing row as the note, and refuses a bad kind, id or row", "[sql][algebra]") {
+  Fixture f;
+  auto raise_row = [&](std::int64_t kind, std::int64_t id, std::int64_t table) {
+    return run(f, raise_row_p, {kind, id, table});
+  };
+  CHECK(raise_row(BC_C_CHECK_OPTION, 9, kTbl) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);
+  CHECK(bc_error_detail(f.cx) == ((std::uint32_t{BC_C_CHECK_OPTION} << 24) | 9u));
+  CHECK(std::string{bc_error_note(f.cx)} == "Failing row contains (5, null, 7).");
+  // The note is cleared by the next execution.
+  CHECK(run(f, scan_all_forward, {}, kI64Row) == BC_COMMITTED);
+  CHECK(std::string{bc_error_note(f.cx)}.empty());
+  // An unknown kind or an id of 2^24 or more is a plan bug, with no note.
+  CHECK(raise_row(0, 9, kTbl) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(std::string{bc_error_note(f.cx)}.empty());
+  CHECK(raise_row(256, 9, kTbl) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(raise_row(BC_C_CHECK_OPTION, 0x0100'0000, kTbl) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(std::string{bc_error_note(f.cx)}.empty());
+  // A row of another table.
+  f.ddl(bytecask::sql::CreateTableDdl{{kPublicSchema, "o"}, {Fixture::col("k", PhysType::I64, false)}, {"k"}});
+  auto other = f.cat().table({kPublicSchema, "o"})->id;
+  CHECK(raise_row(BC_C_CHECK_OPTION, 9, other) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(std::string{bc_error_note(f.cx)}.empty());
+}
+
+namespace {
 void create_m(Fixture& f) {
   f.ddl(bytecask::sql::CreateTableDdl{
       {kPublicSchema, "m"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("x", PhysType::F64, true), Fixture::col("b", PhysType::Bool, true)},

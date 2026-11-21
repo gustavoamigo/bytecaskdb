@@ -377,10 +377,14 @@ TEST_CASE("parser: CREATE VIEW and DROP VIEW", "[sql][parser][view]") {
   CHECK(std::get<CreateView>(parse("CREATE VIEW v AS SELECT 1")).columns.empty());
   CHECK(std::get<DropView>(parse("DROP VIEW v")).view == ObjectName{"", "v"});
   CHECK(std::get<DropView>(parse("DROP VIEW IF EXISTS v")).if_exists);
-  // Updatable views, and what only a stored definition could change, are not supported.
-  CHECK_THROWS_AS(parse("CREATE VIEW v AS SELECT a FROM t WITH CHECK OPTION"), SqlError);
-  CHECK_THROWS_AS(parse("CREATE VIEW v AS SELECT a FROM t WITH LOCAL CHECK OPTION"), SqlError);
-  CHECK_THROWS_AS(parse("CREATE VIEW v AS SELECT a FROM t WITH CASCADED CHECK OPTION"), SqlError);
+  // WITH CHECK OPTION alone is CASCADED, as in PostgreSQL.
+  CHECK(v.check_option == CheckOption::None);
+  CHECK(std::get<CreateView>(parse("CREATE VIEW v AS SELECT a FROM t WITH CHECK OPTION")).check_option == CheckOption::Cascaded);
+  CHECK(std::get<CreateView>(parse("CREATE VIEW v AS SELECT a FROM t WITH LOCAL CHECK OPTION")).check_option == CheckOption::Local);
+  CHECK(std::get<CreateView>(parse("CREATE VIEW v AS SELECT a FROM t WITH CASCADED CHECK OPTION")).check_option ==
+        CheckOption::Cascaded);
+  // What only a stored definition could change, and the option as a view option, are not supported.
+  CHECK_THROWS_AS(parse("CREATE VIEW v WITH (check_option = local) AS SELECT a FROM t"), SqlError);
   CHECK_THROWS_AS(parse("CREATE OR REPLACE VIEW v AS SELECT a FROM t"), SqlError);
   CHECK_THROWS_AS(parse("CREATE TEMPORARY VIEW v AS SELECT a FROM t"), SqlError);
   CHECK_THROWS_AS(parse("CREATE VIEW v WITH (security_barrier) AS SELECT a FROM t"), SqlError);

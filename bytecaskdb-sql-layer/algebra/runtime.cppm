@@ -591,6 +591,7 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_guard_present", fn_addr(bc_guard_present)},
       {"bc_guard_absent", fn_addr(bc_guard_absent)},
       {"bc_raise", fn_addr(bc_raise)},
+      {"bc_raise_row", fn_addr(bc_raise_row)},
   };
   return kSymbols;
 }

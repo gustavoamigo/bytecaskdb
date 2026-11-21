@@ -393,6 +393,7 @@ struct Insert {
   // ON CONFLICT DO UPDATE's: a SET list per row, as Update's `set`, over the
   // row that holds the key; its count is then the rows inserted or updated.
   std::vector<std::vector<std::pair<ColumnRef, Expr>>> update;
+  std::vector<logical::ViewCheck> view_checks;  // logical::Insert's, over each row once written
 };
 
 // INSERT … SELECT: each row its input, an Emit, gives, written as a row of
@@ -418,6 +419,7 @@ struct InsertFrom {
   std::vector<Expr> checks;
   std::vector<Expr> returning;
   std::optional<std::uint32_t> arbiter;
+  std::vector<logical::ViewCheck> view_checks;
 };
 
 // UPDATE and DELETE write each row their input gives, read from the
@@ -735,6 +737,17 @@ private:
           (e.args[0].kind != Expr::Kind::Column || e.args[0].col.type != PhysType::I64 || col.type != PhysType::I64)) {
         broken("column + or - parameter on a type other than an integer");
       }
+    }
+  }
+
+  // A check option's conjuncts: BOOLEAN values, as codegen's eval prints
+  // them, of a view's id; never with ON CONFLICT, which a view refuses.
+  void view_checks(const std::vector<logical::ViewCheck>& list, const std::optional<std::uint32_t>& arbiter) const {
+    if (!list.empty() && arbiter) broken("a check option on an insert with an arbiter");
+    for (const auto& c : list) {
+      if (c.view == 0 || c.where.type.kind != SqlKind::Boolean) broken("a check option that is no view's BOOLEAN");
+      value(c.where);
+      params(c.where);
     }
   }
 
@@ -1566,6 +1579,7 @@ private:
               for (const auto& [col, e] : row) params(e);
             }
             for (const auto& c : op.checks) params(c);
+            view_checks(op.view_checks, op.arbiter);
             returned(op.table, op.returning);
             if (!op.update.empty()) {
               if (!op.arbiter) broken("an insert's update with no arbiter");
@@ -1601,6 +1615,7 @@ private:
               param(x.param);
             }
             for (const auto& c : op.checks) params(c);
+            view_checks(op.view_checks, op.arbiter);
             returned(op.table, op.returning);
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Update>) {

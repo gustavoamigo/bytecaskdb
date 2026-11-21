@@ -126,8 +126,5 @@ f261_01_01_03  # not PostgreSQL: WHEN with a list of values; PostgreSQL 17 gives
 f261_01_01_04  # not PostgreSQL: WHEN with a list of values; PostgreSQL 17 gives 42601, "syntax error at or near ",""
 f261_01_01_05  # not PostgreSQL: WHEN with a list of values; PostgreSQL 17 gives 42601, "syntax error at or near ",""
 f261_01_01_06  # not PostgreSQL: WHEN with a list of values; PostgreSQL 17 gives 42601, "syntax error at or near ",""
-f311_04_01_01  # WITH CHECK OPTION is refused until schemas stage 3 (docs/catalog_design.md, *Stages of schemas*)
-f311_04_01_02  # WITH CHECK OPTION is refused until schemas stage 3 (docs/catalog_design.md, *Stages of schemas*)
-f311_04_01_03  # WITH CHECK OPTION is refused until schemas stage 3 (docs/catalog_design.md, *Stages of schemas*)
 s011_01_02  # not PostgreSQL: CREATE TYPE name AS <data type> (PostgreSQL has CREATE DOMAIN); PostgreSQL 17 gives 42601, "syntax error at or near "INT""
 s011_02_01  # not PostgreSQL: CREATE TYPE name AS <data type> (PostgreSQL has CREATE DOMAIN); PostgreSQL 17 gives 42601, "syntax error at or near "INT""
