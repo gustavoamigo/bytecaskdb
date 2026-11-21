@@ -2075,3 +2075,7 @@ pg:qualified-type-name:
   description: a type name qualified by a schema; only pg_catalog holds types the layer can use
 pg:schemas:
   description: CREATE SCHEMA and DROP SCHEMA, and names qualified by a schema, resolved as PostgreSQL 17 resolves them with search_path public
+pg:jsonb:
+  description: the jsonb type, its input and output text, and its operators, functions and aggregates (docs/jsonb_design.md)
+pg:json:
+  description: the json type, its input text kept verbatim (docs/jsonb_design.md, stage 1c)

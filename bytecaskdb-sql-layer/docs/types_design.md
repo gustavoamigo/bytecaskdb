@@ -2,13 +2,13 @@
 
 Status: **built** (#490; declared widths in rows and keys, #780): the codec is `bytecaskdb-sql-layer/codec/`, with
 its property tests in `tests/codec_test.cpp`. This covers how SQL values
-map onto the plan API's four physical types (`plan_api_design.md`), what
+map onto the plan API's physical types (`plan_api_design.md`), what
 nulls, comparisons and arithmetic mean, which functions the compiler may
 call, and the two on-disk formats: the key encoding and the row format,
 which the MariaDB plugin would share (*What the plugin adopts*). Nothing in
 the engine changes for it.
 
-The plan API deals in `i64`, `f64`, `bool` and `bytes`, and `num`, a NUMERIC's text held as bytes are. Everything SQL knows
+The plan API deals in `i64`, `f64`, `bool` and `bytes`, and `num`, a NUMERIC's text held as bytes are, and `jsonb`, a jsonb value behind its own handle (*jsonb*). Everything SQL knows
 beyond those four is a rule the compiler applies: a scale, an epoch, a range
 check, a collation. Those rules live here.
 
@@ -35,6 +35,7 @@ qualified by `pg_catalog.`; the parser refuses any other qualifier
 | `DATE` | `i64` | Days since 1970-01-01, in PostgreSQL's range: 4714-11-24 BC to 5874897-12-31. |
 | `TIME` | `i64` | Microseconds since midnight, in [0, 86 400 000 000]: 24:00:00 included, as in PostgreSQL. |
 | `TIME WITH TIME ZONE`, `TIMETZ` (precision 6) | `i64` | A `TIME` and its UTC offset, packed so that integer order is PostgreSQL's `timetz_cmp`, tag `SqlKind::TimeTz` (18) (*TIME WITH TIME ZONE*). |
+| `jsonb` | `jsonb` (`PhysType::Jsonb`, a `bc_jsonb` in a plan) | The value in its binary layout (`jsonb_design.md`, *Binary layout of a jsonb value*): the format byte 0xF8, then one node, in a row's variable region. Tag `SqlKind::Jsonb` (19). Never a key part (*jsonb*). |
 
 `AVG` of an integer or `DECIMAL` is a `NUMERIC` of no declared precision
 too, carried in a result row as its text, since its digits can pass 64
@@ -45,7 +46,7 @@ Rejected, each for a reason that is not "later": `NUMERIC(p, s)` with
 p > 18 (does not fit `i64`); `CHAR(8 CHARACTERS)`
 and `CHAR(8 OCTETS)`, which are not PostgreSQL syntax;
 `TIMESTAMP(p) WITH TIME ZONE` for p other than 6, and `TIME(p) WITH TIME ZONE` for p under 6, which would round on store;
-`INTERVAL`, `UUID`, `JSON`, arrays, enums, composite types, `BIT`, `MONEY`,
+`INTERVAL`, `UUID`, arrays, enums, composite types, `BIT`, `MONEY`,
 `SERIAL` (sequences are a runtime service, deferred in the plan API).
 
 ### NUMERIC without a precision
@@ -124,6 +125,37 @@ compiler's plans run, so the plan API does not check a key value again where
 it is built (`bc_key_*`). `NOT NULL` is checked when the row ends, after these, so a row
 holding both reports the range, as PostgreSQL does. A `VARCHAR(n)` value
 whose excess is only spaces is refused, where PostgreSQL truncates it.
+
+### jsonb
+
+A column declared `jsonb` holds any JSON value PostgreSQL 17's `jsonb_in`
+accepts, in the binary layout `jsonb_design.md` describes, and returns
+`jsonb_out`'s text byte for byte. Everything about the type, its input
+grammar, normalisation, output, layout, limits and stages, is in
+`jsonb_design.md`; this section says where it meets the codec. Stage 1 is
+built: the column, its text in and out, casts with text, `DEFAULT`, `IS
+[NOT] NULL`, `COUNT`, `CASE` and `COALESCE`. `json` is stage 1c and refused
+(0A000).
+
+- **Physical type.** `PhysType::Jsonb` (6), `BC_T_JSONB` in the plan API,
+  a variable column (`is_fixed` is false), never a key part (`keyable` is
+  false). Every predicate on `PhysType` is an exhaustive switch, so a type
+  added later cannot fall through one.
+- **Row.** The stored value, format byte and node, in the variable region,
+  as bytes are. `bc_row_set_param` reads a parameter's text with the parser
+  (22P02 and the rest, as `BC_E_DATA`), and `bc_row_set_jsonb` writes a
+  node after the full check of the layout; `bc_col_jsonb` checks the
+  format byte and hands the node out as a `bc_jsonb`. A row never holds the
+  text.
+- **Catalog.** A default is held in memory as the stored value the rows
+  take, and written to the table record as its canonical text, parsed again
+  at load; text that does not parse, or is not canonical, is a damaged
+  catalog (`catalog_design.md`).
+- **Keys.** None yet: a jsonb primary key, `UNIQUE` or index column is
+  0A000 (`refuse_key_type`). Its key form is stage 2's sort key
+  (`jsonb_design.md`, *jsonb as a sort key and group key*).
+- **Edges.** A result, a parameter, a constant and Python's value are the
+  canonical text; the binary form never leaves the layer.
 
 ## CHAR(n)
 

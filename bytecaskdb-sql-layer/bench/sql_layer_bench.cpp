@@ -249,7 +249,8 @@ void print_record_bytes(const Catalog& cat) {
           (void)rw.set_bytes(c.id, std::as_bytes(std::span{s}));
           break;
         }
-        case PhysType::Num: break;  // no column is a NUMERIC of no precision
+        case PhysType::Num:
+        case PhysType::Jsonb: break;  // no bench column is a NUMERIC of no precision or a jsonb
       }
     }
     Bytes row, key;

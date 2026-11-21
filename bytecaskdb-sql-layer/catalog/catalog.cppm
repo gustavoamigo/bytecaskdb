@@ -58,6 +58,7 @@ export import bytecask.sql.key_codec;
 export import bytecask.sql.sqlstate;
 export import bytecask.sql.names;
 export import bytecask.sql.row_codec;
+import bytecask.sql.jsonb;
 
 export namespace bytecask::sql {
 
@@ -350,7 +351,8 @@ struct ClockDefault {
     case SqlKind::Varchar:
     case SqlKind::Char:
     case SqlKind::Name:
-    case SqlKind::Bytea: return false;
+    case SqlKind::Bytea:
+    case SqlKind::Jsonb: return false;
   }
   return false;
 }
@@ -1346,6 +1348,7 @@ auto put_part_from_row(const Table& t, std::uint32_t col_id, KeyPart part, Bytes
     case PhysType::Bool: key_put_bool(out, v.boolean(), part); return true;
     case PhysType::Bytes: key_put_bytes(out, v.bytes, part); return true;
     case PhysType::Num: throw std::logic_error("a key part that is a NUMERIC");
+    case PhysType::Jsonb: throw std::logic_error("a key part that is a jsonb");
   }
   return false;
 }
@@ -1451,9 +1454,17 @@ auto reserve_ids(std::uint64_t& next_id, std::uint32_t n) -> std::uint32_t {
   return static_cast<std::uint32_t>(first);
 }
 
+// A jsonb column's default, as the catalog holds it in memory: a stored
+// value (its format byte and node) that passes the full check. Any other
+// column's: true.
+auto jsonb_default_valid(SqlType t, const Datum& d) -> bool {
+  const auto* b = std::get_if<Bytes>(&d);
+  return t.kind != SqlKind::Jsonb || b == nullptr || jsonb::check_value(*b, {}).ok();
+}
+
 void check_column_spec(const ColumnSpec& c) {
   if (!sql_type_valid(c.sql)) throw DdlRefused("column " + c.name + " has an invalid type");
-  if (!datum_fits(c.default_value, phys_type(c.sql))) {
+  if (!datum_fits(c.default_value, phys_type(c.sql)) || !jsonb_default_valid(c.sql, c.default_value)) {
     throw DdlRefused("default of column " + c.name + " is not of its type", kDatatypeMismatch);
   }
   if (c.clock_default && (!clock_assignable(c.clock_default->fn, c.sql.kind) || c.clock_default->precision > 6 ||
@@ -1571,6 +1582,7 @@ auto sql_type_valid(SqlType t) -> bool {
     // A column's has no modifier; AVG's result, which carries its sum's
     // scale, is never a column's type.
     case SqlKind::Numeric: return t.length == 0 && t.precision == 0 && t.scale == 0;
+    case SqlKind::Jsonb: return t.length == 0 && t.precision == 0 && t.scale == 0;
   }
   return false;  // a kind no build knows
 }
@@ -1598,6 +1610,7 @@ auto sql_type_name(SqlType t) -> std::string {
     case SqlKind::Time: return "time";
     case SqlKind::TimeTz: return "timetz";
     case SqlKind::Numeric: return "numeric";
+    case SqlKind::Jsonb: return "jsonb";
   }
   return "?";
 }
@@ -1659,7 +1672,8 @@ auto compared_type(SqlType t) -> ComparedType {
     case SqlKind::Date:
     case SqlKind::Time:
     case SqlKind::TimeTz:
-    case SqlKind::Numeric: return same(t);
+    case SqlKind::Numeric:
+    case SqlKind::Jsonb: return same(t);
   }
   return same(t);
 }
@@ -1700,7 +1714,8 @@ auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string> {
     case SqlKind::Varchar:
     case SqlKind::Char:
     case SqlKind::Name:
-    case SqlKind::Numeric: break;
+    case SqlKind::Numeric:
+    case SqlKind::Jsonb: break;
   }
   return std::nullopt;
 }
@@ -1789,7 +1804,8 @@ auto datum_fits(const Datum& d, PhysType t) -> bool {
     case PhysType::F64: return std::holds_alternative<std::monostate>(d) || std::holds_alternative<double>(d);
     case PhysType::Bool: return std::holds_alternative<std::monostate>(d) || std::holds_alternative<bool>(d);
     case PhysType::Bytes:
-    case PhysType::Num: return std::holds_alternative<std::monostate>(d) || std::holds_alternative<Bytes>(d);
+    case PhysType::Num:
+    case PhysType::Jsonb: return std::holds_alternative<std::monostate>(d) || std::holds_alternative<Bytes>(d);
   }
   return false;
 }
@@ -1907,6 +1923,12 @@ void refuse_key_type(const Column& c) {
                      "supported yet; declare NUMERIC(p, s)",
                      kFeatureNotSupported);
   }
+  // jsonb's key form is stage 2's sort key, and its key columns the next
+  // phase's (docs/jsonb_design.md, *jsonb as a key, unique or index column*).
+  if (c.sql.kind == SqlKind::Jsonb) {
+    throw DdlRefused("jsonb column \"" + c.name + "\" as a primary key, unique or index column is not supported yet",
+                     kFeatureNotSupported);
+  }
 }
 
 void write_layout(RecordWriter& w, std::uint32_t layout_id, const RowLayout& l) {
@@ -1953,6 +1975,39 @@ auto read_layout(RecordReader& r, const Table& t) -> std::pair<std::uint32_t, Ro
 
 }  // namespace
 
+namespace {
+
+// A column's default as its record holds it: a jsonb's is its canonical text,
+// so the record never holds the binary layout (docs/jsonb_design.md, *One
+// form for a jsonb value at each boundary*).
+auto stored_default(const Column& c) -> Datum {
+  const auto* b = std::get_if<Bytes>(&c.default_value);
+  if (c.sql.kind != SqlKind::Jsonb || b == nullptr) return c.default_value;
+  std::string text;
+  if (auto r = jsonb::value_text(*b, text); !r.ok()) {
+    throw std::logic_error("default of jsonb column " + c.name + " does not decode: " + r.corrupt);
+  }
+  auto t = std::as_bytes(std::span{text.data(), text.size()});
+  return Bytes(t.begin(), t.end());
+}
+
+// A jsonb default read from its record: its canonical text, parsed into the
+// value the rows use. Text that does not parse, or is not canonical, is a
+// damaged catalog.
+auto loaded_jsonb_default(const Datum& d, const std::string& column) -> Datum {
+  const auto* b = std::get_if<Bytes>(&d);
+  if (b == nullptr) return d;
+  std::string_view text{reinterpret_cast<const char*>(b->data()), b->size()};
+  Bytes value;
+  std::string again;
+  if (!jsonb::parse_value(text, value).ok() || !jsonb::value_text(value, again).ok() || again != text) {
+    corrupt("default of jsonb column " + column + " is not a jsonb value's canonical text");
+  }
+  return value;
+}
+
+}  // namespace
+
 auto serialize_table(const Table& t) -> Bytes {
   RecordWriter w;
   w.u16(Catalog::kRecordFormat);
@@ -1970,7 +2025,7 @@ auto serialize_table(const Table& t) -> Bytes {
       e.u8(c.sql.precision);
       e.u8(c.sql.scale);
       e.u8(c.nullable ? 1 : 0);
-      write_datum(e, c.default_value);
+      write_datum(e, stored_default(c));
       e.u8(c.hidden ? 1 : 0);
       if (c.clock_default) {
         e.u8(static_cast<std::uint8_t>(c.clock_default->fn));
@@ -2351,6 +2406,7 @@ auto parse_table(BytesView in) -> Table {
     c.nullable = nullable == 1;
     c.hidden = hidden == 1;
     if (!datum_fits(c.default_value, c.type)) corrupt("default of column " + c.name + " is not of its type");
+    if (c.sql.kind == SqlKind::Jsonb) c.default_value = loaded_jsonb_default(c.default_value, c.name);
     if (c.clock_default && !clock_assignable(c.clock_default->fn, c.sql.kind)) {
       corrupt("clock default of column " + c.name + " is not of its type");
     }
@@ -2973,6 +3029,7 @@ auto signature_type(SqlType t) -> std::string_view {
     case SqlKind::Boolean: return "boolean";
     case SqlKind::Decimal:
     case SqlKind::Numeric: return "numeric";
+    case SqlKind::Jsonb: return "jsonb";
     case SqlKind::Text: return "text";
     case SqlKind::Varchar: return "character varying";
     case SqlKind::Char: return "character";

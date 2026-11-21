@@ -87,7 +87,8 @@ auto exact_scale(const SqlType& t) -> std::optional<std::uint8_t> {
     case SqlKind::Date:
     case SqlKind::Time:
     case SqlKind::TimeTz:
-    case SqlKind::Numeric: return std::nullopt;
+    case SqlKind::Numeric:
+    case SqlKind::Jsonb: return std::nullopt;
   }
   return std::nullopt;
 }
@@ -186,6 +187,7 @@ auto fold(Expr& e) -> bool {
     case Kind::Substr:
     case Kind::TextFn:
     case Kind::Extract:
+    case Kind::JsonbCast:
     case Kind::Mod:
     case Kind::Neg:
     case Kind::Abs:

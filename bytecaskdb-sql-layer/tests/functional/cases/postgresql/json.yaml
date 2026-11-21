@@ -1,0 +1,21 @@
+# json (docs/jsonb_design.md, stage 1c): recorded from PostgreSQL 17, unimplemented until the stage lands.
+
+- name: "json keeps its input text verbatim after validating it"
+  features: [pg:json]
+  # the json type is stage 1c of docs/jsonb_design.md (0A000)
+  unimplemented: true
+  steps:
+    - sql: "SELECT '{\"b\": 1,  \"a\": 2, \"a\": 3}'::json, '\"\\ud83d\"'::json, '1e1000000'::json"
+      expected: [["{\"b\": 1,  \"a\": 2, \"a\": 3}", "\"\\ud83d\"", "1e1000000"]]
+    - sql: "SELECT '[1,'::json"
+      error: "22P02"
+    - sql: "SELECT '{\"b\":1,\"a\":2}'::json::jsonb, '{\"b\":1}'::jsonb::json"
+      expected: [["{\"a\": 2, \"b\": 1}", "{\"b\": 1}"]]
+
+- name: "json has no equality or order"
+  features: [pg:json]
+  # the json type is stage 1c of docs/jsonb_design.md (0A000)
+  unimplemented: true
+  steps:
+    - sql: "SELECT '1'::json = '1'::json"
+      error: "42883"

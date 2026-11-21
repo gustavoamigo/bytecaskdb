@@ -93,6 +93,11 @@ inline constexpr SqlState kInsufficientPrivilege{"42501"};
 inline constexpr SqlState kInvalidSchemaDefinition{"42P15"};
 inline constexpr SqlState kWithCheckOptionViolation{"44000"};
 inline constexpr SqlState kInternalError{"XX000"};
+// jsonb's (sql/jsonb.cppm): \u0000, a value past PostgreSQL's size bounds,
+// one nested past the depth bound.
+inline constexpr SqlState kUntranslatableCharacter{"22P05"};
+inline constexpr SqlState kProgramLimitExceeded{"54000"};
+inline constexpr SqlState kStatementTooComplex{"54001"};
 
 // The five characters `packed` holds (SqlState::packed), or nullopt for 0,
 // for bits past the 30 it uses, and for a character outside 0-9 and A-Z,
@@ -117,7 +122,8 @@ inline constexpr SqlState kInternalError{"XX000"};
                  kDatetimeFieldOverflow, kInvalidTimeZoneDisplacement, kCharacterNotInRepertoire, kInvalidParameterValue, kInvalidEscapeSequence, kSubstringError, kCannotCoerce,
                  kInvalidRowCountInLimit, kInvalidRowCountInOffset, kReservedName, kInvalidGrantOperation,
                  kInvalidSavepointSpecification, kReadOnlySqlTransaction, kActiveSqlTransaction, kObjectInUse, kInvalidSchemaName,
-                 kDuplicateSchema, kInvalidName, kInsufficientPrivilege, kInvalidSchemaDefinition, kWithCheckOptionViolation, kInternalError}) {
+                 kDuplicateSchema, kInvalidName, kInsufficientPrivilege, kInvalidSchemaDefinition, kWithCheckOptionViolation, kInternalError,
+                 kUntranslatableCharacter, kProgramLimitExceeded, kStatementTooComplex}) {
     if (s.view() == code) return s;
   }
   return std::nullopt;

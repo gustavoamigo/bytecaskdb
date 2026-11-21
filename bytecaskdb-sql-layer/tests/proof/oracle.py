@@ -314,6 +314,17 @@ def pg_params(sql: str, params, placeholder: str = "s") -> tuple[str, dict | Non
 
 
 FLOAT4_OID = 700
+BC_E_DATA = 16  # bc_plan.h's bc_error_code: a value a call cannot take or make
+
+
+def jsonb_as_text(conn):
+    """Loads jsonb as its text on `conn`, the form the layer returns and the
+    model keeps (docs/jsonb_design.md, *One form for a jsonb value at each
+    boundary*), where psycopg would load a Python value. Returns conn."""
+    from psycopg.types.string import TextLoader
+
+    conn.adapters.register_loader("jsonb", TextLoader)
+    return conn
 
 
 def from_pg(v, type_oid: int = 0):
@@ -338,10 +349,11 @@ def run_layer(db, sql: str, params=()) -> Outcome:
         # A constraint violation is an outcome to compare, and so is a SQL
         # error a plan raises as PostgreSQL's executor does: a scalar
         # subquery of more than one row, a LIKE pattern ending in its escape.
+        # A data error (BC_E_DATA: text jsonb_in does not read) is one too.
         # Any other failure of a plan that ran (corrupt, I/O, a handle, a
         # layout, a limit, memory, a conflict) is the layer failing: the test
         # fails on it.
-        if e.constraint is None and e.sqlstate in (SQLSTATE["cardinality"], "22025"):
+        if e.constraint is None and (e.sqlstate in (SQLSTATE["cardinality"], "22025") or e.code == BC_E_DATA):
             return Outcome(error=e.sqlstate, detail=str(e), sqlstate=e.sqlstate)
         if e.constraint is None:
             raise

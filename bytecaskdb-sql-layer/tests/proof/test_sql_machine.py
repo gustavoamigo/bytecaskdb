@@ -347,7 +347,7 @@ class Sides:
         import psycopg
 
         self.wire_server = server
-        self.wire = psycopg.connect(server.dsn(), autocommit=True, prepare_threshold=None)
+        self.wire = o.jsonb_as_text(psycopg.connect(server.dsn(), autocommit=True, prepare_threshold=None))
 
     def stop_wire(self) -> None:
         if self.wire is not None:
@@ -1945,6 +1945,44 @@ def test_a_numeric_column_keeps_every_digit_and_the_scale_as_postgresql(dsn):
         for refused in ("SELECT k FROM n0 WHERE v = 1.5", "SELECT v FROM n0 ORDER BY v", "CREATE INDEX n0_v ON n0 (v)"):
             assert m.layer(refused).sqlstate == "0A000", refused
         assert o.run_pg(m.pg.conn, "DROP TABLE n0").error is None
+    finally:
+        m.teardown()
+
+
+def test_a_jsonb_column_returns_postgresqls_text_on_both_targets(dsn):
+    """jsonb (docs/jsonb_design.md, stage 1): a value read as jsonb_in reads
+    it, from a literal, a parameter or a cast of text, normalised (the last
+    duplicate key, keys shorter first, numbers with their scale) and returned
+    as jsonb_out's text, the edge form the model keeps; embedded and over the
+    wire alike. Not compared, ordered or a key yet (0A000)."""
+    m = keyless_machine(dsn)()
+    try:
+        ddl = "CREATE TABLE j0 (k BIGINT PRIMARY KEY, v jsonb, w jsonb DEFAULT '{\"d\": [1.0]}'::jsonb, s TEXT)"
+        assert m.both(ddl).error is None
+        rows = [(1, '{"b": 1, "a": [1, 2.50, null], "a": {"x": "\\u00e9"}}'), (2, None), (3, "  -0.0 "),
+                (4, '"tab\\there"'), (5, '[[], {}, true, false, null, 1e2, 123456789012345678901234567890.10]')]
+        for k, v in rows:
+            assert m.both("INSERT INTO j0 (k, v) VALUES ($1, $2)", [k, v]).error is None, (k, v)
+        assert m.both("INSERT INTO j0 (k, v, s) VALUES (6, '{\"z\": 1, \"aa\": 2, \"b\": 3}', '[1,  2]')").error is None
+        assert m.both("SELECT s::jsonb FROM j0 WHERE k = 6").error is None
+        assert m.both("UPDATE j0 SET v = w WHERE k = 2").error is None
+        for k, v, state in [(10, "[1,", "22P02"), (10, '"\\u0000"', "22P05"), (10, "1e131072", "22003")]:
+            assert m.layer("INSERT INTO j0 (k, v) VALUES ($1, $2)", [k, v]).sqlstate == state, v
+        # The text, compared as text: psycopg would load PostgreSQL's jsonb as Python values.
+        sql = "SELECT k, v::text, w::text FROM j0 ORDER BY k"
+        layer = [list(row) for row in m.db.execute(sql, [])["rows"]]
+        pg = [list(row) for row in o.run_pg(m.pg.conn, sql).rows]
+        assert layer == pg
+        assert layer[0][1] == '{"a": {"x": "\u00e9"}, "b": 1}' and layer[2][1] == "0.0"
+        # A jsonb result is its text, a str, as its cast to text; so is a
+        # column's default in the catalog.
+        assert [list(row) for row in m.db.execute("SELECT k, v, w FROM j0 ORDER BY k", [])["rows"]] == layer
+        (table,) = [t for t in m.db.catalog() if t["name"] == "j0"]
+        defaults = {c["name"]: c["default"] for c in table["columns"]}
+        assert defaults["w"] == '{"d": [1.0]}' and defaults["v"] is None
+        for refused in ("SELECT k FROM j0 WHERE v = '{}'", "SELECT v FROM j0 ORDER BY v", "CREATE INDEX j0_v ON j0 (v)"):
+            assert m.layer(refused).sqlstate == "0A000", refused
+        assert o.run_pg(m.pg.conn, "DROP TABLE j0").error is None
     finally:
         m.teardown()
 

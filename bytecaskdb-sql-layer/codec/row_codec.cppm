@@ -99,7 +99,12 @@ enum class SqlKind : std::uint8_t {
   // catalog module). Appended; a catalog that holds it is closed to an
   // earlier build.
   TimeTz,
+  // jsonb (docs/jsonb_design.md): any JSON value, stored in its binary
+  // layout (PhysType::Jsonb). Appended; a catalog that holds it is closed to
+  // an earlier build, which reads the kind as an invalid type.
+  Jsonb,
 };
+static_assert(static_cast<int>(SqlKind::Jsonb) == 19);
 
 // NAMEDATALEN - 1: the most bytes a NAME holds.
 inline constexpr std::size_t kNameBytes = 63;
@@ -198,6 +203,8 @@ struct ColumnDef {
 // the fixed region would outgrow the header's 16-bit var_table: the layout
 // needs a REBUILD.
 [[nodiscard]] auto append_columns(RowLayout& layout, std::span<const ColumnDef> cols) -> bool;
+// Whether t is a PhysType this build knows: false for a damaged code.
+[[nodiscard]] auto phys_type_known(PhysType t) -> bool;
 // Whether a layout keeps the format's invariants: a bitmap of 1 to 32,767
 // bytes, every column id below its ceiling, fixed columns inside the fixed
 // region in position order and none overlapping another, slots below nvar
@@ -392,7 +399,8 @@ auto widen(PhysType type, std::uint64_t raw, std::uint32_t width) -> std::uint64
       return raw;
     case PhysType::Bool: return raw != 0 ? 1 : 0;  // any non-zero byte is true
     case PhysType::Bytes:
-    case PhysType::Num: return 0;
+    case PhysType::Num:
+    case PhysType::Jsonb: return 0;
   }
   return 0;
 }
@@ -475,6 +483,7 @@ auto phys_type(SqlType t) -> PhysType {
     case SqlKind::Char:
     case SqlKind::Name: return PhysType::Bytes;
     case SqlKind::Numeric: return PhysType::Num;
+    case SqlKind::Jsonb: return PhysType::Jsonb;
   }
   return PhysType::Bytes;
 }
@@ -498,7 +507,8 @@ auto fixed_width(SqlType t) -> std::uint32_t {
     case SqlKind::Varchar:
     case SqlKind::Char:
     case SqlKind::Name:
-    case SqlKind::Numeric: return 0;
+    case SqlKind::Numeric:
+    case SqlKind::Jsonb: return 0;
   }
   return 0;
 }
@@ -519,6 +529,7 @@ auto plain_sql_type(PhysType t) -> SqlType {
     case PhysType::Bool: return {SqlKind::Boolean};
     case PhysType::Bytes: return {SqlKind::Bytea};
     case PhysType::Num: return {SqlKind::Numeric};
+    case PhysType::Jsonb: return {SqlKind::Jsonb};
   }
   return {SqlKind::Bytea};
 }
@@ -603,7 +614,7 @@ auto RowWriter::set_bool(std::uint32_t col_id, bool v) -> bool {
 }
 
 auto RowWriter::set_bytes(std::uint32_t col_id, BytesView v) -> bool {
-  // A NUMERIC is its text, held as bytes are.
+  // A NUMERIC is its text, held as bytes are; a jsonb its stored value.
   auto i = index_of(col_id, std::nullopt);
   if (!i || is_fixed(layout_->columns[*i].type)) return false;
   present_[*i] = true;
@@ -707,6 +718,18 @@ auto RowWriter::finish(Bytes& out, std::size_t max_bytes) const -> bool {
   return true;
 }
 
+auto phys_type_known(PhysType t) -> bool {
+  switch (t) {
+    case PhysType::I64:
+    case PhysType::F64:
+    case PhysType::Bool:
+    case PhysType::Bytes:
+    case PhysType::Num:
+    case PhysType::Jsonb: return true;
+  }
+  return false;  // a code no build knows: a damaged record
+}
+
 auto layout_valid(const RowLayout& l) -> bool {
   if (l.bitmap_bytes == 0 || l.bitmap_bytes > kMaxBitmapBytes) return false;
   if (l.fixed_start != kRowHeaderBytes + l.bitmap_bytes || l.fixed_end < l.fixed_start) return false;
@@ -716,9 +739,8 @@ auto layout_valid(const RowLayout& l) -> bool {
   std::vector<bool> slot_used(l.nvar, false);
   for (const auto& c : l.columns) {
     if (c.col_id >= l.id_ceiling()) return false;
-    // A type code no build knows (a damaged record) is out of the enum's range.
-    auto code = static_cast<int>(c.type);
-    if (code < static_cast<int>(PhysType::I64) || code > static_cast<int>(PhysType::Num)) return false;
+    // A type code no build knows (a damaged record) is none of the enum's.
+    if (!phys_type_known(c.type)) return false;
     if (is_fixed(c.type)) continue;  // fixed_columns_valid
     if (c.width != 0 || c.pos >= l.nvar || slot_used[c.pos]) return false;
     slot_used[c.pos] = true;

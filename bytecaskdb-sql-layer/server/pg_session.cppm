@@ -979,11 +979,12 @@ private:
     } catch (const SessionError& e) {
       send_fields('E', "ERROR", e.sqlstate(), e.what(), 0, {}, e.hint());
     } catch (const TextError& e) {
-      error(e.sqlstate(), e.what());
+      send_fields('E', "ERROR", e.sqlstate(), e.what(), 0, e.detail(), {}, e.context());
     } catch (const ProtocolError& e) {
       error("08P01", e.what());
     } catch (const ast::SqlError& e) {
-      send_fields('E', "ERROR", sqlstate(e), e.what(), e.pos() < 0 ? 0 : char_position(text, e.pos()), e.detail(), e.hint());
+      send_fields('E', "ERROR", sqlstate(e), e.what(), e.pos() < 0 ? 0 : char_position(text, e.pos()), e.detail(), e.hint(),
+                  e.context());
     } catch (const std::exception& e) {
       // A statement stopped by its transaction's deadline ends the session,
       // as PostgreSQL's transaction_timeout does; otherwise 57014 is a

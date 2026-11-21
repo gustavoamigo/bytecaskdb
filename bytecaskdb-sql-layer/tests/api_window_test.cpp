@@ -80,6 +80,7 @@ auto params_for(const Statement& s) -> std::vector<Value> {
       case PhysType::Bool: out.emplace_back(n % 2 == 0); break;
       case PhysType::Bytes: out.emplace_back(sql_test::bytes(n % 2 == 0 ? "n2" : "n4")); break;
       case PhysType::Num: FAIL("no parameter is a NUMERIC"); break;
+      case PhysType::Jsonb: FAIL("no parameter is a jsonb"); break;
     }
   }
   return out;

@@ -71,6 +71,7 @@ struct Fixture {
       case bytecask::sql::PhysType::Bool: kind = SqlKind::Boolean; break;
       case bytecask::sql::PhysType::Bytes: kind = SqlKind::Bytea; break;
       case bytecask::sql::PhysType::Num: kind = SqlKind::Numeric; break;
+      case bytecask::sql::PhysType::Jsonb: kind = SqlKind::Jsonb; break;
     }
     return {std::move(name), {kind}, nullable, {}};
   }

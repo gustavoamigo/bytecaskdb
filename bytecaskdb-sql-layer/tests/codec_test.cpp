@@ -337,6 +337,7 @@ TEST_CASE("key codec: malformed keys are reported, not over-read", "[sql][codec]
       case PhysType::Bool: key_put_bool(k, true, part); break;
       case PhysType::Bytes: key_put_bytes(k, Bytes{std::byte{1}, std::byte{0}, std::byte{2}}, part); break;
       case PhysType::Num: FAIL("no key part is a NUMERIC"); break;
+      case PhysType::Jsonb: FAIL("no key part is a jsonb"); break;
     }
     for (std::size_t n = 0; n < k.size(); ++n) {
       KeyReader r{BytesView{k}.first(n)};
@@ -879,7 +880,8 @@ TEST_CASE("row format: fixed columns take their declared widths and hold their t
           break;
         }
         case PhysType::Bytes:
-        case PhysType::Num: break;
+        case PhysType::Num:
+        case PhysType::Jsonb: break;
       }
     }
     Bytes row;
