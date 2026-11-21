@@ -882,6 +882,12 @@ first, between `bc_sub_begin` and `bc_sub_end`, which fold what it emits
 into its parameters and set (`plan_api_design.md`, *Subqueries*); then its
 computed values, NULL checks and pipeline run as without one.
 
+The plan API can run a subquery again, after setting arguments in
+parameters of its own (`bc_sub_arg_*`), and releases what each run sorted,
+hashed or grouped at its `bc_sub_end`, so one run per outer row holds one
+run's worth: the runtime half of a correlated subquery. The planner does
+not use it yet.
+
 Not planned yet: a correlated subquery, one inside another, one in `FROM`
 (a derived table, but the grouped view of *Derived relations*), and `IN
 (SELECT …)` as a semi-join that probes the outer table's key per value,

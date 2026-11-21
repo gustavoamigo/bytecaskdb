@@ -413,7 +413,8 @@ in any order, on any columns, and of predicates over them.
   but for `EXISTS` (42601 otherwise), of a type the column compares with:
   integers with integers, a DECIMAL of its scale, strings with strings, any
   other type its own. A scalar one is a parameter to the plan, so
-  `id = (SELECT MAX(k) FROM u)` is a key lookup.
+  `id = (SELECT MAX(k) FROM u)` is a key lookup. A `$n` only a subquery
+  names is one of the statement's parameters, as any `$n`.
 - Not yet: `$n ± k` inside one, one of both tables' columns in a
   join, in `HAVING`, `LIKE` of a BYTEA column, `IS DISTINCT FROM`, `NULL`
   under `NOT`, a string as a boolean, a constant in `HAVING`; a subquery that reads a column of the

@@ -1797,10 +1797,13 @@ auto coerce(const Constant& k, const Column& c, bool assigned, std::string_view 
   return d;
 }
 
-// The largest $n the statement names: its own parameters, which come
-// before the constants' (Binder::fixed).
+auto select_param_count(const ast::Select& s) -> std::uint32_t;
+
+// The largest $n the statement names, its subqueries' included: its own
+// parameters, which come before the constants' (Binder::fixed).
 void params_in(const ast::Expr& e, std::uint32_t& n) {
   if (e.kind == ast::Expr::Kind::Param) n = std::max(n, e.param + 1);
+  if (e.subquery) n = std::max(n, select_param_count(*e.subquery));
   if (e.lhs) params_in(*e.lhs, n);
   if (e.rhs) params_in(*e.rhs, n);
   for (const auto& a : e.args) params_in(a, n);  // a function's, CASE's, COALESCE's
@@ -1811,6 +1814,11 @@ void params_in(const ast::Compare& c, std::uint32_t& n) {
     params_in(c.lhs, n);
     if (c.kind == ast::Compare::Kind::Compare) params_in(c.rhs, n);
   }
+  if (c.kind == ast::Compare::Kind::Quantified || c.kind == ast::Compare::Kind::Like) {
+    params_in(c.lhs, n);
+    params_in(c.rhs, n);
+  }
+  if (c.subquery) n = std::max(n, select_param_count(*c.subquery));
   if (c.escape_param) n = std::max(n, *c.escape_param + 1);
   for (const auto& a : c.args) params_in(a, n);
 }

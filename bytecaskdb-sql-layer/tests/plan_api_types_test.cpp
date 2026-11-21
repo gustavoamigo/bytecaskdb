@@ -1380,3 +1380,196 @@ TEST_CASE("plan API: a subquery's rows fold into the parameters and the set its 
   CHECK(run(f, sub_wrong_type, {kNull}, kSubRow) == BC_FAILED);
   CHECK(bc_error(f.cx) != BC_OK);
 }
+
+namespace {
+// A subquery run three times, its argument $2 set to 1, 2 and 3 before each
+// run, its value $3 that times $1; then a BC_SUB_SET run with 3 and again
+// with 4. The count: the three values in base 100, then whether the set
+// holds 3 and 4.
+void sub_rerun(bc_ctx* cx) {
+  int64_t out = 0;
+  for (int64_t k = 1; k <= 3; ++k) {
+    bc_sub_arg_i64(cx, 1, k);
+    bc_sub_begin(cx, 0, BC_SUB_VALUE, BC_T_I64, 2);
+    bc_emit_begin(cx);
+    bc_emit_i64(cx, bc_param_i64(cx, 1) * bc_param_i64(cx, 0));
+    bc_emit_end(cx);
+    bc_sub_end(cx);
+    out = out * 100 + bc_param_i64(cx, 2);
+  }
+  for (int64_t k = 3; k <= 4; ++k) {
+    bc_sub_arg_i64(cx, 1, k);
+    bc_sub_begin(cx, 1, BC_SUB_SET, BC_T_I64, 3);
+    bc_emit_begin(cx);
+    bc_emit_i64(cx, bc_param_i64(cx, 1));
+    bc_emit_end(cx);
+    bc_sub_end(cx);
+  }
+  out = out * 100 + (bc_sub_has_i64(cx, 1, 3) ? 10 : 0) + (bc_sub_has_i64(cx, 1, 4) ? 1 : 0);
+  bc_emit_count(cx, out);
+}
+
+std::vector<std::uint64_t> held_after_sub;  // NOLINT: the plans are captureless
+bc_sorter sub_sorter{};                      // NOLINT: likewise
+
+// For each of five entries of an outer sorter, a BC_SUB_SET subquery whose
+// argument $1 is the entry's number, which opens a sorter, a hash table and
+// an aggregate and fills each with ten entries of the bytes $5, then emits
+// ten values from the argument on. What the context holds after each run.
+void sub_releases(bc_ctx* cx) {
+  bc_sorter outer = bc_sorter_open(cx, 0);
+  for (int i = 0; i < 5; ++i) bc_sorter_add(cx, outer, bc_param_bytes(cx, 4), bc_param_bytes(cx, 4));
+  int64_t k = 0;
+  bc_view payload{};
+  while (bc_sorter_next(cx, outer, &payload)) {
+    bc_sub_arg_i64(cx, 0, k++);
+    bc_sub_begin(cx, 0, BC_SUB_SET, BC_T_I64, 1);
+    bc_sorter s = bc_sorter_open(cx, 0);
+    bc_hash h = bc_hash_open(cx);
+    bc_agg a = bc_agg_open(cx, 1);
+    for (int64_t j = 0; j < 10; ++j) {
+      bc_sorter_add(cx, s, bc_param_bytes(cx, 4), payload);
+      bc_hash_put(cx, h, bc_param_bytes(cx, 4), payload);
+      bc_agg_count(cx, bc_agg_group(cx, a, payload), 0);
+      bc_emit_begin(cx);
+      bc_emit_i64(cx, bc_param_i64(cx, 0) + j);
+      bc_emit_end(cx);
+    }
+    sub_sorter = s;
+    bc_sub_end(cx);
+    held_after_sub.push_back(bc_ctx_held_for_testing(cx));
+  }
+  bc_emit_count(cx, bc_sub_has_i64(cx, 0, 4) && bc_sub_has_i64(cx, 0, 13) && !bc_sub_has_i64(cx, 0, 3) ? 1 : 0);
+}
+
+// The sorter a subquery opened, read after it ended.
+void sub_sorter_after_end(bc_ctx* cx) {
+  bc_sub_begin(cx, 0, BC_SUB_EXISTS, BC_T_BOOL, 0);
+  sub_sorter = bc_sorter_open(cx, 0);
+  bc_sub_end(cx);
+  bc_emit_count(cx, bc_sorter_count(cx, sub_sorter));
+}
+
+// The views of parameters set by bc_sub_arg_bytes and by a subquery, by
+// mode $3: 0 reads only live ones; 1 reads an argument's view after the
+// argument is set again; 2 reads a subquery's value's view after it runs
+// again. The count: 1 if the live views read the bytes $1.
+void sub_arg_views(bc_ctx* cx) {
+  auto mode = bc_param_i64(cx, 2);
+  bc_sub_arg_bytes(cx, 1, bc_param_bytes(cx, 0));
+  bc_view v = bc_param_bytes(cx, 1);
+  bc_sub_arg_bytes(cx, 1, v);  // from a view of itself: copied first
+  bc_view w = bc_param_bytes(cx, 1);
+  bool same = bc_bytes_eq(cx, w, bc_param_bytes(cx, 0));
+  if (mode == 1) same = bc_bytes_eq(cx, v, w);
+  for (int run = 0; run < 2; ++run) {
+    bc_sub_begin(cx, 0, BC_SUB_VALUE, BC_T_BYTES, 3);
+    bc_emit_begin(cx);
+    bc_emit_bytes(cx, bc_param_bytes(cx, 0));
+    bc_emit_end(cx);
+    bc_sub_end(cx);
+    if (run == 0) v = bc_param_bytes(cx, 3);
+  }
+  same = same && bc_bytes_eq(cx, bc_param_bytes(cx, 3), bc_param_bytes(cx, 0));
+  if (mode == 2) same = bc_bytes_eq(cx, v, w);
+  bc_emit_count(cx, same ? 1 : 0);
+}
+
+// What the context holds as the bytes $1 are set as argument $2, set again,
+// then set to NULL.
+void sub_arg_held(bc_ctx* cx) {
+  bc_view v = bc_param_bytes(cx, 0);
+  held_after_sub.push_back(bc_ctx_held_for_testing(cx));
+  bc_sub_arg_bytes(cx, 1, v);
+  held_after_sub.push_back(bc_ctx_held_for_testing(cx));
+  bc_sub_arg_bytes(cx, 1, v);
+  held_after_sub.push_back(bc_ctx_held_for_testing(cx));
+  bc_sub_arg_null(cx, 1);
+  held_after_sub.push_back(bc_ctx_held_for_testing(cx));
+}
+
+// A subquery whose value parameter $1 the caller gave.
+void sub_out_given(bc_ctx* cx) {
+  bc_sub_begin(cx, 0, BC_SUB_VALUE, BC_T_I64, 0);
+  bc_emit_begin(cx);
+  bc_emit_i64(cx, 1);
+  bc_emit_end(cx);
+  bc_sub_end(cx);
+  bc_emit_count(cx, bc_param_i64(cx, 0));
+}
+
+// bc_sub_arg_i64 on parameter $1, which the caller gave, or past the last.
+void sub_arg_given(bc_ctx* cx) { bc_sub_arg_i64(cx, 0, 1); }
+void sub_arg_past(bc_ctx* cx) { bc_sub_arg_null(cx, 1); }
+
+// A subquery begun on an outer sorter's entry that moves that sorter on.
+void sub_moves_outer(bc_ctx* cx) {
+  bc_sorter outer = bc_sorter_open(cx, 0);
+  bc_sorter_add(cx, outer, bc_param_bytes(cx, 0), bc_param_bytes(cx, 0));
+  bc_sorter_add(cx, outer, bc_param_bytes(cx, 0), bc_param_bytes(cx, 0));
+  bc_view p{};
+  (void)bc_sorter_next(cx, outer, &p);
+  bc_sub_begin(cx, 0, BC_SUB_EXISTS, BC_T_BOOL, 1);
+  (void)bc_sorter_next(cx, outer, &p);
+  bc_sub_end(cx);
+}
+}  // namespace
+
+TEST_CASE("plan API: a subquery runs again with new arguments, its set and parameters replaced", "[sql][algebra]") {
+  Fixture f;
+  CHECK(value(f, sub_rerun, {std::int64_t{5}, kNull, kNull, kNull, kNull}) == 510'15'01);
+}
+
+TEST_CASE("plan API: bc_sub_end releases what the subquery made, so a run per outer row holds one run's worth",
+          "[sql][algebra]") {
+  Fixture f;
+  held_after_sub.clear();
+  CHECK(value(f, sub_releases, {kNull, kNull, kNull, kNull, bc_value{Bytes(100, std::byte{'x'})}}) == 1);
+  REQUIRE(held_after_sub.size() == 5);
+  for (auto h : held_after_sub) CHECK(h == held_after_sub[0]);
+  // What it opened is gone with it: its handles are stale.
+  CHECK(run(f, sub_sorter_after_end, {kNull}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  // A loop outside it that moves inside it is a plan bug.
+  CHECK(run(f, sub_moves_outer, {bc_value{Bytes(3, std::byte{'a'})}, kNull}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+}
+
+TEST_CASE("plan API: bc_sub_arg_* sets only a parameter the caller passed as NULL, and its old views go stale",
+          "[sql][algebra]") {
+  Fixture f;
+  const bc_value abc = Bytes{std::byte{'a'}, std::byte{'b'}, std::byte{'c'}};
+  CHECK(value(f, sub_arg_views, {abc, kNull, std::int64_t{0}, kNull}) == 1);
+  for (std::int64_t mode : {1, 2}) {
+    INFO("mode " << mode);
+    CHECK(run(f, sub_arg_views, {abc, kNull, mode, kNull}) == BC_FAILED);
+    CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  }
+  CHECK(run(f, sub_arg_given, {std::int64_t{7}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(run(f, sub_arg_past, {kNull}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  // Nor does a subquery set its value into a parameter the caller gave.
+  CHECK(run(f, sub_out_given, {std::int64_t{7}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+}
+
+TEST_CASE("plan API: a parameter bc_sub_arg_* sets is charged its bytes, one value at a time", "[sql][algebra]") {
+  Fixture f;
+  constexpr std::uint64_t kSize = 1 << 20;
+  const bc_value big = Bytes(kSize, std::byte{'x'});
+  held_after_sub.clear();
+  REQUIRE(run(f, sub_arg_held, {big, kNull}) == BC_COMMITTED);
+  REQUIRE(held_after_sub.size() == 4);
+  CHECK(held_after_sub[1] == held_after_sub[0] + kSize);
+  CHECK(held_after_sub[2] == held_after_sub[1]);
+  CHECK(held_after_sub[3] == held_after_sub[0]);
+  // A budget with room for the rest but not the argument refuses it.
+  auto ps = params({big, kNull});
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+  auto ref = sr.get();
+  const bc_budget tight{.max_reads = 0, .max_bytes = held_after_sub[0] + kSize / 2, .deadline_ns = 0};
+  held_after_sub.clear();
+  CHECK(bc_execute(f.cx, sub_arg_held, &ref, &ps, tight, false, 0) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LIMIT);
+}

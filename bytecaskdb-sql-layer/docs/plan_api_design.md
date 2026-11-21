@@ -1,6 +1,8 @@
 # Plan API: a physical algebra for generated plans
 
-Status: **built**, revision 14 (revision 14 with `bc_concat`, `bc_number_text` and
+Status: **built**, revision 15 (revision 15 with `bc_sub_arg_*`, so a
+subquery runs again with arguments, and `bc_sub_end` releasing what its run
+made; revision 14 with `bc_concat`, `bc_number_text` and
 `bc_substr`, for `||` and `SUBSTRING` of columns, and `algebra/bc_proc.h` for
 procedures; revision 13 with the sort-key decoders,
 `bc_sort_key_part_*`, for a set operation's `ORDER BY`; revision 11 with `bc_sub_*` and
@@ -1056,7 +1058,9 @@ later gets calls of its own, decided by the same rule.
 A plan runs each uncorrelated subquery of its statement first, as a
 function of its own, and what that function emits between `bc_sub_begin`
 and `bc_sub_end` is folded, never a result row (`planner_design.md`,
-*Subqueries*):
+*Subqueries*). A subquery can run again, with arguments the plan sets
+first in parameters of its own (`bc_sub_arg_*`): the shape a correlated
+subquery needs, one run per outer row:
 
 ```c
 enum bc_sub_kind { BC_SUB_VALUE = 0, BC_SUB_EXISTS = 1, BC_SUB_BOUNDS = 2, BC_SUB_SET = 3 };
@@ -1066,18 +1070,24 @@ bool bc_sub_has_i64(bc_ctx *, uint32_t sub, int64_t);
 bool bc_sub_has_f64(bc_ctx *, uint32_t sub, double);
 bool bc_sub_has_bool(bc_ctx *, uint32_t sub, bool);
 bool bc_sub_has_bytes(bc_ctx *, uint32_t sub, bc_view);
+void bc_sub_arg_null(bc_ctx *, uint32_t i);
+void bc_sub_arg_i64(bc_ctx *, uint32_t i, int64_t);
+void bc_sub_arg_f64(bc_ctx *, uint32_t i, double);
+void bc_sub_arg_bool(bc_ctx *, uint32_t i, bool);
+void bc_sub_arg_bytes(bc_ctx *, uint32_t i, bc_view);  /* copied */
 ```
 
 | Function | What it does |
 |---|---|
-| `bc_sub_begin` | Starts subquery `sub`: until `bc_sub_end`, each row emitted is one column of `type`, folded as `kind` says, or, for `BC_SUB_EXISTS`, a row of any columns, counted. One at a time; `sub` is each id once per run. Its parameters, from `param` on, are ones the caller passes as NULL. |
-| `bc_sub_end` | Sets its parameters, which every `bc_param_*` reads from then on until reset. `BC_SUB_VALUE`: its row's value, NULL for none; a second row fails the plan with `BC_E_CARDINALITY`. `BC_SUB_EXISTS`: a BOOL, whether a row came. `BC_SUB_BOUNDS`: the largest non-NULL value, then the smallest (NULL for none), then NULL if a row was NULL else FALSE, then whether a row came. `BC_SUB_SET`: the last two. |
-| `bc_sub_has_*` | Whether a `BC_SUB_SET` subquery's non-NULL values hold the value, as PostgreSQL's `=` compares: bytes bytewise, a DOUBLE's -0.0 equal to 0.0 and NaN to NaN. The set is charged and lives until reset; a `sub` not run is `BC_E_HANDLE`. |
+| `bc_sub_begin` | Starts subquery `sub`: until `bc_sub_end`, each row emitted is one column of `type`, folded as `kind` says, or, for `BC_SUB_EXISTS`, a row of any columns, counted. One at a time. Its parameters, from `param` on, must be ones the caller passed as NULL, so `bc_sub_end` never overwrites a value the caller gave; one that is not is `BC_E_HANDLE`, before the run starts. An id run before runs again: its set starts empty and what the last run's set was charged is released. |
+| `bc_sub_end` | Sets its parameters, which every `bc_param_*` reads from then on until reset. `BC_SUB_VALUE`: its row's value, NULL for none; a second row fails the plan with `BC_E_CARDINALITY`. `BC_SUB_EXISTS`: a BOOL, whether a row came. `BC_SUB_BOUNDS`: the largest non-NULL value, then the smallest (NULL for none), then NULL if a row was NULL else FALSE, then whether a row came. `BC_SUB_SET`: the last two. Then it releases what the run made, as the end of a loop's step does: the handles (views, keys, rows, cursors, probes) and copies made since `bc_sub_begin`, and the sorters, hash tables and aggregates opened since, with their charge; a handle of one is stale. A subquery that sorts, hashes or groups therefore holds one run's worth however often it runs. A loop outside the subquery that moved on inside it is `BC_E_HANDLE`. |
+| `bc_sub_has_*` | Whether a `BC_SUB_SET` subquery's non-NULL values hold the value, as PostgreSQL's `=` compares: bytes bytewise, a DOUBLE's -0.0 equal to 0.0 and NaN to NaN. The set is charged and lives until reset or until `sub` runs again; a `sub` not run is `BC_E_HANDLE`. |
+| `bc_sub_arg_*` | Sets parameter `i` to the value, for the subquery's next run to read with `bc_param_*`, until it is set again. `i` must be a parameter the caller passed as NULL: a value the caller gave is never overwritten, and another `i` is `BC_E_HANDLE`. Bytes are copied and charged; the parameter is charged its current value only, so setting it again releases the old one. Each write of a parameter, by `bc_sub_arg_*` or by `bc_sub_end`, makes a `bc_param_bytes` view of its old value stale: reading it is `BC_E_HANDLE`, never a dangling read. |
 
 Values order as the layer compares them: integers and BOOLs numerically,
 bytes bytewise (`COLLATE "C"`), DOUBLEs with NaN above every other value.
 A misuse, a subquery begun inside another, a row begun when one starts or
-ends, an unknown kind or type, parameters past the ones given, is
+ends, an unknown kind or type, parameters past the ones given or ones the caller gave, is
 `BC_E_HANDLE`, a plan bug.
 
 ### Guards and raised errors
