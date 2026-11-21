@@ -785,8 +785,6 @@
 
 - name: a RIGHT JOIN, then an inner join of a third table
   features: [F041-04, F041-05]
-  # a RIGHT JOIN of more than two tables is not supported yet
-  unimplemented: true
   setup:
     - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)
     - CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)
@@ -808,7 +806,7 @@
 
 - name: an inner join, then a RIGHT JOIN of a third table
   features: [F041-04, F041-05]
-  # a RIGHT JOIN of more than two tables is not supported yet
+  # a RIGHT JOIN after the first join is not supported yet
   unimplemented: true
   setup:
     - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)

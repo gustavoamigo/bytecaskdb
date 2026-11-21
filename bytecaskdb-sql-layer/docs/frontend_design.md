@@ -111,8 +111,9 @@ kind the transformer doesn't take is refused with its position.
   table's. In a chain, a left join NULL-extends its right table in the rows
   before it: a later `ON` reading that table sees NULLs, so an inner join
   after it drops those rows where it reads them, and a left join keeps
-  them. `RIGHT JOIN` is taken of two tables only, `USING` and `NATURAL` of
-  the first join only, and `FULL JOIN` not. A table takes an alias, `t [AS]
+  them. `RIGHT JOIN` is taken as the first join only (its two tables
+  swapped, so the chain stays left-deep), `USING` and `NATURAL` of the
+  first join only, and `FULL JOIN` not. A table takes an alias, `t [AS]
   x`. A table named twice, `t JOIN t AS x`, is read twice, once under each
   name; the planner reads it as two tables (`planner_design.md`, *Joins of
   several tables*). The front end rewrites the qualifier `x` to the table
@@ -628,7 +629,7 @@ That includes:
   every key of, `GROUP BY` of an expression, and `HAVING` of anything but
   the comparisons above;
 - `FULL JOIN`, an outer join's `ON` comparing an expression of columns,
-  more than eight tables, a `RIGHT JOIN` of more than two, `USING` or
+  more than eight tables, a `RIGHT JOIN` after the first join, `USING` or
   `NATURAL` after the first join, a join in parentheses or among commas,
   `FOR UPDATE` of a join (#697), an alias of a join, an output name in `GROUP BY` or in `ORDER BY` of
   other than a column;
