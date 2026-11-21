@@ -422,11 +422,12 @@ statement the session runs at `Execute`.
   a `Query` runs it with `Database::execute`, which commits it alone. An
   `Execute` runs it in the block's implicit transaction (*Extended
   query*).
-- DDL inside a `BEGIN` block runs through the block's `Transaction`, as a
-  statement of the block (`transaction_design.md`, *Transactional DDL*,
-  stage 3): later statements see it, `ROLLBACK` undoes it and `COMMIT`
-  publishes it with the block's writes. `CREATE TABLE AS` and `SELECT …
-  INTO` there are still `0A000` (stage 4).
+- DDL inside a block, `BEGIN`'s or an extended pipeline's implicit one,
+  runs through the block's `Transaction`, as a statement of the block
+  (`transaction_design.md`, *Transactional DDL*, stages 3 and 4): later
+  statements see it, `ROLLBACK` undoes it and `COMMIT` publishes it with
+  the block's writes. So do `CREATE TABLE AS` and `SELECT … INTO`, whose
+  query reads the block's writes.
 - Results: `RowDescription` (for a row-returning statement), one `DataRow`
   per row, then `CommandComplete`. The tag comes from the statement's
   command (*What it uses from the embedded API*, 3):
@@ -463,8 +464,8 @@ transaction binds only against its own catalog*).
 A `Query` that arrives after `Execute`s outside `BEGIN`, before their
 `Sync`, joins their implicit transaction, as in PostgreSQL: it runs in it,
 and the transaction commits when the `Query` ends. An error in the `Query`
-rolls the whole block back. A DDL `Query` there is `0A000`, as a DDL beside
-other statements is (until stage 4 of transactional DDL).
+rolls the whole block back. A DDL `Query` there is a statement of the
+block too (stage 4 of transactional DDL).
 
 ## Reading the counters
 
@@ -638,14 +639,14 @@ semantics. If the stream ends instead, the statement does not run: no
 A `BEGIN` inside the block makes it explicit, as PostgreSQL does: the open
 `Transaction` carries on past `Sync` until `COMMIT` or `ROLLBACK`.
 
-Outside `BEGIN` the server runs DDL only as its own atomic operation: it
-refuses DDL in an implicit block of two or more statements until stage 4 of
-transactional DDL (transaction_design.md).
+Outside `BEGIN` a DDL runs as any other statement does (stage 4 of
+transactional DDL, transaction_design.md):
 - A DDL that is its block's only statement (the next message is `Sync`)
-  runs alone through `Database::execute`, as a simple `Query` does.
-- A DDL in a block of two or more is `0A000`. If it opens the block,
-  nothing has run. If it comes later, the block's implicit `Transaction`
-  aborts. Either way nothing in the block commits.
+  runs alone through `Database::execute`, as a simple `Query` does, with
+  autocommit DDL's retry.
+- A DDL in a block of two or more runs in the block's implicit
+  `Transaction`, and commits with the block's other statements at `Sync`,
+  or nothing of the block does.
 
 **DDL in a `BEGIN` block.** A DDL `Execute` or `Query` in a `BEGIN` block
 runs through the block's `Transaction` (stage 3), and a `Parse` after it
@@ -1131,8 +1132,9 @@ The run script requires W ≥ the user count; the monitor is not a user.
   - two `Execute`s before `Sync` outside `BEGIN`, the second failing:
     neither is committed;
   - two that succeed, committed together at `Sync`;
-  - a lone DDL `Execute` run, and one beside a DML `Execute` refused with
-    nothing committed;
+  - a lone DDL `Execute` run, and one beside DML `Execute`s, by `Execute`
+    or by a `Query` inside the pipeline, committed with them at `Sync`, or
+    nothing committed if one of them fails;
   - DDL in a `BEGIN` block, by `Query` and by `Execute`: seen by the
     block, undone by `ROLLBACK` (a statement Parsed on it is `42P01` at its
     next `Bind`) and by `ROLLBACK TO`, published by `COMMIT`; a `Parse`
@@ -1186,8 +1188,6 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 
 ## Known differences from PostgreSQL
 
-- A DDL in an extended-query block with other statements is `0A000`, and
-  so is one followed by a `Flush` with nothing after it yet.
 - Parameter OIDs from the client are not used.
 - Binary format, for parameters and results, is `0A000`.
 - A compared or added `DECIMAL` parameter finer than its column's scale, and `NaN`,
@@ -1239,8 +1239,8 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 8. Outside `BEGIN`, a block of one `Execute` autocommits through
    `Database::execute`, with its retry. A block of two or more is one
    implicit `Transaction`, committed at `Sync`, as in PostgreSQL. A DDL
-   runs only as a block's one statement, and is `0A000` beside others. The
-   session owns the block status (coordinator review).
+   there was `0A000` beside others until stage 4 of transactional DDL,
+   which runs it in the block's `Transaction`. The session owns the block status (coordinator review).
 9. The HammerDB smoke runs nightly, as a scheduled workflow, not per PR
    (owner, 2026-10-22).
 10. The gate reports ByteCaskDB's NOPM and TPM only. PostgreSQL 17 runs the

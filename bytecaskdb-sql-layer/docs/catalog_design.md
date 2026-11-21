@@ -613,9 +613,17 @@ commit at `LiveCatalog`'s commit hook, where a reader sees no row key in the
 engine, and throws there to stand for a crash, then reopens). The rows are the
 query's snapshot: a write committed after the query ran and before the DDL
 commits is not in them, as in any transaction whose writes (here, a new
-table's keys alone) conflict with nothing. The table's first `INSERT`
-seeds its row ids from the engine, so it draws n + 1 (*Tables without a
-primary key*).
+table's keys alone) conflict with nothing. Once the DDL's next catalog is
+built, `LiveCatalog::reserve_row_ids` moves the table's row id counter past
+n, so its first `INSERT` draws n + 1 or later (*Tables without a primary
+key*): seeding from the engine alone is not enough, since a transaction's
+table is unpublished until its commit and a counter outlives a rolled-back
+table of the same id.
+
+In a transaction (`transaction_design.md`, stage 4) the query runs as a
+statement of the transaction, through its view, and the table and its rows
+are a DDL of it: they go into the transaction's overlay, bounded by its
+`max_bytes` as a backfill is, and are published with its commit.
 
 Two limits bound the rows, and the statement's memory budget comes first:
 the query's result is gathered under `statement_memory_bytes` (64 MiB by

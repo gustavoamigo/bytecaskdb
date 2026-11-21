@@ -563,7 +563,7 @@ def test_a_query_inside_an_extended_block_joins_its_transaction_and_commits_it(s
     assert keys(c) == ["1"]
     # The Query fails: the Execute before it is rolled back with it.
     for failing, state in (("SELECT k FROM t WHERE v SIMILAR TO 'a%'", "42601"),
-                           ("CREATE TABLE w (k BIGINT PRIMARY KEY)", "0A000")):
+                           ("CREATE TABLE t (k BIGINT PRIMARY KEY)", "42P07")):
         c.send(parse(insert), bind(["2", "2"]), execute(), query(failing))
         out = c.until_ready()
         assert states(out) == [state] and status(out) == "I", failing
@@ -618,21 +618,111 @@ def test_a_bad_message_length_is_fatal_and_nothing_after_it_runs(server):
     assert keys(connect(server)) == []
 
 
-def test_ddl_runs_alone_and_is_refused_beside_another_statement(server):
+def test_ddl_in_an_implicit_block_is_one_transaction_with_its_statements(server):
+    """docs/transaction_design.md, stage 4: Executes before one Sync, and a
+    Simple Query sent inside that pipeline, form one transaction with their
+    DDL, as PostgreSQL's implicit block does: all of it commits, or none."""
     c = connect(server)
     table(c)
     c.send(parse("CREATE TABLE u (k BIGINT PRIMARY KEY)"), bind([]), execute(), SYNC)
     out = c.until_ready()
     assert [b for k, b in out if k == b"C"] == [b"CREATE TABLE\0"]
+    # DDL by Execute, beside DML before and after it: committed together at Sync.
+    c.send(parse("INSERT INTO t VALUES ($1, $2)"), bind(["1", "1"]), execute(),
+           parse("CREATE TABLE w (k BIGINT PRIMARY KEY)"), bind([]), execute(),
+           parse("INSERT INTO w VALUES ($1)"), bind(["7"]), execute(), SYNC)
+    out = c.until_ready()
+    assert states(out) == [] and status(out) == "I"
+    assert keys(c) == ["1"]
+    assert data(q(c, "SELECT k FROM w")) == [["7"]]
+    # It fails half way: neither the DDL nor the rows around it are written.
+    c.send(parse("CREATE TABLE w2 (k BIGINT PRIMARY KEY)"), bind([]), execute(),
+           parse("INSERT INTO w2 VALUES ($1)"), bind(["1"]), execute(),
+           parse("INSERT INTO t VALUES ($1, $2)"), bind(["2", "2"]), execute(),
+           parse("INSERT INTO t VALUES ($1, $2)"), bind(["1", "1"]), execute(), SYNC)
+    out = c.until_ready()
+    assert states(out) == ["23505"] and status(out) == "I"
+    assert keys(c) == ["1"]
+    assert states(q(c, "SELECT k FROM w2")) == ["42P01"]
+    # DDL by a Simple Query inside the pipeline: it joins the block, which
+    # commits when the Query ends; a failing one writes nothing of the block.
+    c.send(parse("INSERT INTO t VALUES ($1, $2)"), bind(["2", "2"]), execute(),
+           query("CREATE TABLE w3 AS SELECT k FROM t"))
+    out = c.until_ready()
+    assert states(out) == [] and status(out) == "I"
+    c.send(SYNC)
+    c.until_ready()
+    assert data(q(c, "SELECT k FROM w3 ORDER BY k")) == [["1"], ["2"]]
     c.send(parse("INSERT INTO t VALUES ($1, $2)"), bind(["3", "3"]), execute(),
-           parse("CREATE TABLE w (k BIGINT PRIMARY KEY)"), bind([]), execute(), SYNC)
+           query("CREATE TABLE w4 AS SELECT k / 0 AS z FROM t"))
+    out = c.until_ready()
+    assert states(out) == ["22012"] and status(out) == "I"
+    c.send(SYNC)
+    c.until_ready()
+    assert keys(c) == ["1", "2"]
+    assert states(q(c, "SELECT z FROM w4")) == ["42P01"]
+
+
+def test_create_table_as_in_a_begin_block_is_a_statement_of_the_block(server):
+    """docs/transaction_design.md, stage 4: CREATE TABLE AS in a block reads
+    the block's own writes and tables; ROLLBACK undoes it, COMMIT publishes
+    the table and its rows. Its query's parameters are the statement's, by
+    Execute as by PQexecParams."""
+    c, other = connect(server), connect(server)
+    table(c)
+    q(c, "INSERT INTO t VALUES (1, 10)")
+    for end in ("ROLLBACK", "COMMIT"):
+        q(c, "BEGIN")
+        q(c, "INSERT INTO t VALUES (2, 20)")
+        q(c, "CREATE TABLE src (k INTEGER PRIMARY KEY)")
+        q(c, "INSERT INTO src VALUES (3)")
+        out = q(c, "CREATE TABLE copied AS SELECT k FROM t UNION ALL SELECT k FROM src")
+        assert states(out) == [] and fields_tag(out) == "SELECT 3", end
+        c.send(parse("CREATE TABLE picked AS SELECT k, v FROM t WHERE v > $1"), bind(["15"]), execute(), SYNC)
+        out = c.until_ready()
+        assert states(out) == [] and fields_tag(out) == "SELECT 1" and status(out) == "T", end
+        assert data(q(c, "SELECT k FROM copied ORDER BY k")) == [["1"], ["2"], ["3"]]
+        assert states(q(other, "SELECT k FROM copied")) == ["42P01"]  # uncommitted: not seen
+        assert status(q(c, end)) == "I"
+    assert data(q(other, "SELECT k FROM copied ORDER BY k")) == [["1"], ["2"], ["3"]]
+    assert data(q(other, "SELECT k, v FROM picked")) == [["2", "20"]]
+    # A taken name is 42P07 and fails the block.
+    q(c, "BEGIN")
+    out = q(c, "CREATE TABLE copied AS SELECT 1 AS k")
+    assert states(out) == ["42P07"] and status(out) == "E"
+    q(c, "ROLLBACK")
+
+
+def test_create_table_as_whose_constant_fails_to_fold_lists_its_parameters_in_a_block(server):
+    """CONTRACT, the CREATE TABLE AS row: its parameters are the statement's
+    whether or not a constant fails to fold, in a BEGIN block and in an
+    implicit block as outside one. Describe lists int4; Bind takes the
+    parameter, and Execute is the folding error, 22012, as in PostgreSQL 17."""
+    c = connect(server)
+    sql = "CREATE TABLE {} AS SELECT 1/0 AS z, $1::int AS y"
+    for block, name in (("none", "fold_a"), ("begin", "fold_b"), ("implicit", "fold_c")):
+        if block == "begin":
+            assert status(q(c, "BEGIN")) == "T"
+        head = parse("SELECT 1") + bind([]) + execute() if block == "implicit" else b""
+        c.send(head + parse(sql.format(name), name) + describe("S", name) + bind(["3"], name) + execute() + SYNC)
+        out = c.until_ready()
+        described = next(b for k, b in out if k == b"t")
+        assert struct.unpack("!hi", described) == (1, 23), block
+        assert states(out) == ["22012"], block
+        if block == "begin":
+            assert status(out) == "E"
+            q(c, "ROLLBACK")
+        assert states(q(c, f"SELECT * FROM {name}")) == ["42P01"], block
+    # WITH NO DATA of such a query: a Bind of no parameters is PostgreSQL's
+    # 08P01; with its parameter, the layer's refusal.
+    q(c, "BEGIN")
+    c.send(parse(sql.format("fold_d") + " WITH NO DATA", "n") + bind([], "n") + SYNC)
+    assert states(c.until_ready()) == ["08P01"]
+    q(c, "ROLLBACK")
+    q(c, "BEGIN")
+    c.send(parse(sql.format("fold_d") + " WITH NO DATA", "m") + bind(["3"], "m") + execute() + SYNC)
     assert states(c.until_ready()) == ["0A000"]
-    assert keys(c) == []
-    c.send(parse("CREATE TABLE w (k BIGINT PRIMARY KEY)"), bind([]), execute(),
-           parse("INSERT INTO t VALUES ($1, $2)"), bind(["3", "3"]), execute(), SYNC)
-    assert states(c.until_ready()) == ["0A000"]
-    c.send(query("DROP TABLE w"))
-    assert states(c.until_ready()) == ["42P01"]  # never created
+    q(c, "ROLLBACK")
 
 
 def test_create_and_drop_procedure_have_their_command_tags(server):
@@ -2523,8 +2613,8 @@ def test_an_implicit_block_binds_against_the_catalog_of_its_first_execute(server
 
 def test_a_ddl_parsed_in_a_block_and_never_executed_leaves_it_open(server):
     """docs/transaction_design.md, stage 0's tests: Parse of a DDL in a block
-    is no error and the block stays open; executing a Parsed CREATE TABLE AS
-    there is 0A000 (CREATE TABLE AS in a transaction is stage 4)."""
+    is no error and the block stays open; a Parsed CREATE TABLE AS executed
+    there runs in the block (stage 4), and ROLLBACK undoes it."""
     c = connect(server)
     q(c, "CREATE TABLE r (k INTEGER PRIMARY KEY, a INTEGER)")
     q(c, "BEGIN")
@@ -2540,9 +2630,10 @@ def test_a_ddl_parsed_in_a_block_and_never_executed_leaves_it_open(server):
     assert states(out) == [] and status(out) == "T"
     c.send(bind([], "ctas"), execute(), SYNC)
     out = c.until_ready()
-    assert states(out) == ["0A000"] and status(out) == "E"
+    assert states(out) == [] and fields_tag(out) == "SELECT 0" and status(out) == "T"
     q(c, "ROLLBACK")
     assert columns(q(c, "SELECT * FROM r")) == ["k", "a"]
+    assert states(q(c, "SELECT k FROM r3")) == ["42P01"]
 
 
 def test_ddl_in_a_begin_block_runs_in_the_block_and_rollback_undoes_it(server):

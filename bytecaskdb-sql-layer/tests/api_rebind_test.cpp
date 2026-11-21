@@ -612,14 +612,14 @@ TEST_CASE("rebind: the shared cache serves a transaction only at exactly its pin
   CHECK(names(t.execute("SELECT k FROM t WHERE a = 10")) == Names{"k"});
   CHECK(db->cached_plans() == cached);
   CHECK(names(db->prepare("SELECT * FROM t").columns()) == Names{"k", "a", "b"});
-  // A DDL text Described in T and never run leaves T open; a DDL run is
-  // 0A000, CREATE TABLE AS too.
+  // A DDL text Described in T and never run leaves T open; a DDL run at a
+  // pin behind the live catalog is 40001, CREATE TABLE AS too.
   auto record = t.refit("CREATE TABLE nope (k BIGINT PRIMARY KEY)", ResultCheck::none());
   CHECK(record.ddl);
   CHECK(record.command == Command::CreateTable);
   CHECK(t.is_open());
   CHECK_FALSE(t.is_aborted());
-  CHECK(state([&] { (void)t.execute("CREATE TABLE nope AS SELECT k FROM t"); }) == "0A000");
+  CHECK(state([&] { (void)t.execute("CREATE TABLE nope AS SELECT k FROM t"); }) == "40001");
 }
 
 TEST_CASE("rebind: cursors hold their plan, private or shared", "[sql][api][rebind][txn][cursor]") {
