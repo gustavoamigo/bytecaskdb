@@ -774,6 +774,19 @@ struct SavepointStatement {
   std::string name;
 };
 
+// SET, RESET or SHOW of a run-time parameter (docs/server_design.md,
+// *Run-time parameters*). Not a Statement: the session keeps its parameters.
+// Set: SET [SESSION | LOCAL] name {TO | =} values; Default: SET name TO
+// DEFAULT; Reset: RESET name; ResetAll: RESET ALL; Show: SHOW name, "all"
+// for SHOW ALL; Other: a form of SET the session does not read (SET name
+// FROM CURRENT, SET TIME ZONE INTERVAL …, SET TRANSACTION).
+struct VariableStatement {
+  enum class Kind : std::uint8_t { Set, Default, Reset, ResetAll, Show, Other } kind{Kind::Other};
+  bool local{false};
+  std::string name;                 // as PostgreSQL reads it: folded unless quoted
+  std::vector<std::string> values;  // Set: each value as text, an identifier folded
+};
+
 // CALL name(arg, …) (docs/procedures_design.md, *Wire protocol for CALL*).
 // Not a Statement: the session runs it through the embedded API's call, as
 // it runs BEGIN. Each argument is an expression of constants, bound against

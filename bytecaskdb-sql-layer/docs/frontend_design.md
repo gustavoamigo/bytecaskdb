@@ -1877,6 +1877,14 @@ implemented (`functional_testing_design.md`).
   the column type, not yet the conversion of a query's values to it), takes `SELECT … INTO` in a set operation's first
   arm, and creates the table of `WITH NO DATA` over a query whose constant
   raises an error; the layer refuses each (0A000).
+- **Run-time parameters are the transaction modes only.** `SET`, `SHOW`
+  and `RESET` are read by PostgreSQL's grammar (`ast::parse_variable`, a
+  syntax error PostgreSQL's 42601), and the server keeps
+  `transaction_isolation`, `transaction_read_only`,
+  `transaction_deferrable`, their three `default_transaction_…` defaults
+  and `client_encoding` (`server_design.md`, *Run-time parameters*). Any
+  other parameter (`search_path`, #871, `TIME ZONE`, …), `SHOW ALL` and
+  `SET … FROM CURRENT` are refused (0A000); PostgreSQL sets them.
 - **Transactional DDL never waits.** A `Transaction`, and over the wire
   a `BEGIN` block or an extended-query block of several statements, runs
   DDL, `CREATE TABLE AS` and `SELECT … INTO` included, as a step of the

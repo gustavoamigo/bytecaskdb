@@ -34,8 +34,9 @@ In:
 
 Out, each refused with a stated error rather than half-supported: SSL and
 GSSAPI encryption, every authentication method but trust, binary format,
-`COPY`, the function-call protocol, `SET` (but `SET
-client_encoding` to UTF8) and `SHOW`, SQL
+`COPY`, the function-call protocol, `SET`, `SHOW` and `RESET` of any
+parameter but the transaction modes' and `client_encoding`'s (*Run-time
+parameters*), SQL
 `PREPARE`/`EXECUTE`/`DEALLOCATE`, `Execute` with a row limit, several
 statements in one `Query`, and the system catalogs (`pg_catalog`,
 `information_schema`). `pg_stat_bytecask` is no catalog: the session answers
@@ -372,25 +373,56 @@ exposes as calls, not as statements.
   `BEGIN` and `START TRANSACTION` take modes, and `SET TRANSACTION` sets
   them for the open block (*Transaction modes*). The isolation is the
   layer's (`transaction_design.md`).
-- **Transaction modes** are `ISOLATION LEVEL READ UNCOMMITTED | READ
-  COMMITTED | REPEATABLE READ`, `READ ONLY`, `READ WRITE` and `[NOT]
-  DEFERRABLE`, in any order, with or without commas. The session keeps them,
-  not the API: a block that is `READ ONLY` refuses any statement but a
-  `SELECT` with `25006`, naming the command (`SELECT INTO` for a `SELECT …
-  INTO`), which aborts the block, as in PostgreSQL (a
-  `SELECT … FOR UPDATE` is not told apart and is taken). The isolation levels
-  change nothing: every transaction reads one snapshot, which is what
-  `REPEATABLE READ` asks and more than the other two do. `SERIALIZABLE` is
-  `0A000`, because snapshot isolation allows write skew and the guards that
-  would prevent it are not built. `SET TRANSACTION` outside a block is
-  `WARNING 25P01`; once the block has run a statement, an isolation level
-  other than the block's own (`READ COMMITTED` unless `BEGIN` or an earlier
-  `SET TRANSACTION` named another), or `READ WRITE` after `READ ONLY`, is
-  `25001`. The block's own level is taken, as PostgreSQL's
-  `check_transaction_isolation` takes any level that does not change it. `SET LOCAL TRANSACTION`
-  and `SET SESSION TRANSACTION` are `SET TRANSACTION`, as in PostgreSQL:
-  the modes last for the open block either way. `SET SESSION
-  CHARACTERISTICS AS TRANSACTION` is `0A000`.
+- **Transaction modes** are `ISOLATION LEVEL SERIALIZABLE | REPEATABLE
+  READ | READ COMMITTED | READ UNCOMMITTED`, `READ ONLY`, `READ WRITE` and
+  `[NOT] DEFERRABLE`, in any order, a comma allowed between two modes and
+  nowhere else (else `42601`, as PostgreSQL's grammar gives it), each
+  occurrence with its own value checked in the order written, as
+  PostgreSQL 17 checks it
+  (`transaction_design.md`, *Choosing the level: SET, SHOW, BEGIN and the
+  embedded API*). A block that names none takes the session's defaults
+  (*Run-time parameters*).
+  - **The level.** `SERIALIZABLE` runs the block's `Transaction` at
+    `Isolation::Serializable`: its reads are checked at `COMMIT`, which is
+    `40001` when one changed (`transaction_design.md`, *Serializable
+    isolation*). The other three run at snapshot isolation, which is what
+    `REPEATABLE READ` asks and more than the other two do; `SHOW
+    transaction_isolation` reports the level named, not the mechanism.
+    `BEGIN` passes the level to `Database::begin`, and `SET TRANSACTION`
+    to `Transaction::set_isolation`. A change of level after the block's
+    first statement is `25001` "SET TRANSACTION ISOLATION LEVEL must be
+    called before any query", and with a savepoint open "… must not be
+    called in a subtransaction"; the block's own level is taken anywhere.
+    On a follower `SERIALIZABLE` is the API's `0A000`, "cannot use
+    serializable mode in a hot standby", hint "You can use REPEATABLE READ
+    instead.": at `BEGIN`, which fails the block (`E`), as PostgreSQL's
+    does, at `SET TRANSACTION`, and for a statement outside a block.
+  - **`READ ONLY`.** A block that is read-only refuses any statement but a
+    `SELECT` with `25006`, naming the command (`SELECT INTO` for a
+    `SELECT … INTO`), which aborts the block, as in PostgreSQL. Set by
+    `BEGIN`, or by `SET TRANSACTION` before the block's first statement with
+    no savepoint open, it reaches the transaction
+    (`TransactionOptions::read_only`, `Transaction::set_read_only`): its
+    runtime then refuses a `SELECT … FOR UPDATE` too, and a procedure's
+    statement that writes, and a `SERIALIZABLE` one records nothing. Set
+    later, the session keeps it (a `SELECT … FOR UPDATE` is not told apart
+    and is taken; a `CALL` is refused); `RELEASE` and `ROLLBACK TO`
+    restore the mode the savepoint was taken in, and the transaction keeps
+    recording what it reads. `READ WRITE` in a read-only block is `25001`,
+    with a savepoint open first, then after a statement.
+  - **`DEFERRABLE`** is kept for `SHOW` and never waits: a read-only
+    `SERIALIZABLE` transaction records nothing and never fails. In a
+    savepoint it is `25001` "SET TRANSACTION [NOT] DEFERRABLE cannot be
+    called within a subtransaction", and after a statement "… must be
+    called before any query", the same value too.
+  - `SET TRANSACTION` outside a block is `WARNING 25P01` and changes
+    nothing; in an extended pipeline's implicit block it warns and sets the
+    modes, as PostgreSQL's unnamed transaction does. `SET LOCAL
+    TRANSACTION` and `SET SESSION TRANSACTION` are `SET TRANSACTION`, as in
+    PostgreSQL. `BEGIN` inside a block warns `25001` and then sets its
+    modes under the same rules; `BEGIN` after a statement of an implicit
+    block checks them before the block becomes explicit, so a refusal
+    rolls the implicit block back.
 - **`COMMIT`** calls `commit()`. `Committed` gives the tag `COMMIT`. A
   transaction that was aborted is rolled back instead (`RolledBack`), with
   the tag `ROLLBACK`, as PostgreSQL's `COMMIT` does. Errors:
@@ -414,9 +446,62 @@ exposes as calls, not as statements.
   of input where PostgreSQL, given the trailing `;`, names the `;`.
 
 - **`SET [SESSION] client_encoding {TO | =} 'UTF8'`**, or another encoding
-  startup takes, is the one `SET` taken: the tag is `SET`, with a
-  `ParameterStatus` for `client_encoding`. Another encoding is `22023`, and
-  every other `SET` is `0A000`.
+  startup takes: the tag is `SET`, with a `ParameterStatus` for
+  `client_encoding`. Another encoding is `22023`.
+- **`SET`, `RESET` and `SHOW` of the transaction modes and their
+  defaults** (*Run-time parameters*), and `SET SESSION CHARACTERISTICS AS
+  TRANSACTION`. Every other `SET`, `SHOW` and `RESET` is `0A000`.
+
+### Run-time parameters
+
+The session keeps six of PostgreSQL's parameters, as PostgreSQL 17 does
+(`transaction_design.md`, *Choosing the level*): `transaction_isolation`,
+`transaction_read_only` and `transaction_deferrable`, the open block's
+modes, and `default_transaction_isolation`, `default_transaction_read_only`
+and `default_transaction_deferrable`, what a later block, an implicit block
+and a statement outside a block start with. `SET`, `SHOW` and `RESET` are
+read by PostgreSQL's grammar (`ast::parse_variable`), so a value is quoted
+or not as PostgreSQL takes it: a two-word level unquoted is `42601`. A
+parameter's name matches in any case, a quoted `"Transaction_Isolation"`
+too, as PostgreSQL's lookup does; an error names it as written, and `SHOW`'s
+column by its lower-case name.
+
+- **Values.** A level is matched in any case against `serializable`,
+  `repeatable read`, `read committed` and `read uncommitted`; anything else
+  is `22023` `invalid value for parameter "…": "…"`, hint "Available
+  values: serializable, repeatable read, read committed, read
+  uncommitted.". A Boolean is read as PostgreSQL's `parse_bool` reads it (a
+  prefix of `true`, `false`, `yes` or `no`, `on`, `off` from `of`, `1`,
+  `0`); anything else is `22023` `parameter "…" requires a Boolean
+  value`. Two values are `22023` "SET … takes only one argument".
+- **The defaults.** `SET [SESSION] name {= | TO} value`, `SET name TO
+  DEFAULT`, `RESET name`, `RESET ALL` (which resets the three) and `SET
+  SESSION CHARACTERISTICS AS TRANSACTION modes` (each mode its default)
+  set them. They are transactional, as PostgreSQL's parameters are: a
+  `SET` inside a block changes later blocks only; `ROLLBACK`, the
+  `ROLLBACK` or `COMMIT` of a failed block, a `COMMIT` that fails, and
+  `ROLLBACK TO` restore the values from before; `COMMIT` and `RELEASE`
+  keep them. `SET LOCAL name …` lasts to the block's end; a later `SET`
+  of the same name in the block replaces it. Outside a block `SET LOCAL`
+  is `WARNING 25P01` "SET LOCAL can only be used in transaction blocks",
+  then its value is read, and nothing changes. With
+  `default_transaction_read_only` on, a statement outside a block runs in
+  a read-only transaction of its own (`TransactionOptions::read_only`), so
+  a write is `25006` from the runtime, as PostgreSQL refuses it; a `CALL`
+  too, whose body's first write is refused. A `DECLARE` outside a block
+  opens its hold cursor in a read-only transaction unless it is `FOR
+  UPDATE`, so a hold cursor taken at `SERIALIZABLE` is not refused.
+- **The block's modes.** `SET [LOCAL | SESSION] transaction_isolation`,
+  `transaction_read_only` or `transaction_deferrable` inside a block is
+  `SET TRANSACTION` of that mode, under its rules. Outside a block the
+  value is read and nothing changes (PostgreSQL answers `SET`). `RESET` or
+  `SET … TO DEFAULT` of one is `0A000` `parameter "…" cannot be reset`.
+- **`SHOW`** of the six returns one text row named by the parameter, the
+  tag `SHOW`; over the extended protocol `Describe` gives its
+  `RowDescription`. In a block the three modes are the block's; outside one,
+  the defaults. `SHOW client_encoding` returns the session's encoding. `SHOW
+  ALL` and every other name are `0A000`. In a failed block `SHOW` is
+  `25P02`.
 
 The extended protocol accepts these words too: `Parse` of `BEGIN` makes a
 statement the session runs at `Execute`.
@@ -642,6 +727,15 @@ semantics. If the stream ends instead, the statement does not run: no
 
 A `BEGIN` inside the block makes it explicit, as PostgreSQL does: the open
 `Transaction` carries on past `Sync` until `COMMIT` or `ROLLBACK`.
+
+A control statement that reads or changes what the block runs with (a
+`SET`, `SET LOCAL` or `RESET` of a transaction mode or default, `RESET
+ALL`, `SET TRANSACTION`, `SET SESSION CHARACTERISTICS`) is read ahead of
+too: first of two or more statements, it opens the block's `Transaction`
+before it runs, with the defaults as they were, so a `SET` of a default
+reaches only later blocks and the block's failure undoes it. Alone before
+`Sync`, it runs by itself. Other control statements (`BEGIN`, `COMMIT`,
+`ROLLBACK`, the savepoints, `SET client_encoding`) open nothing.
 
 Outside `BEGIN` a DDL runs as any other statement does (stage 4 of
 transactional DDL, transaction_design.md):
@@ -1178,8 +1272,18 @@ The run script requires W ≥ the user count; the monitor is not a user.
   and a transaction and a hold cursor across a vacuum.
 - **`tests/pg_session_test.cpp`** (`sql_layer_tests "[sql][server]"`):
   sessions moving across worker threads while keeping message order (under
-  ThreadSanitizer in CI), `Execute` lookahead parking, pipeline fairness, and
-  a session held back past `max_unsent_bytes` until its replies are taken.
+  ThreadSanitizer in CI), `Execute` lookahead parking, pipeline fairness, a
+  session held back past `max_unsent_bytes` until its replies are taken,
+  write skew between two `SERIALIZABLE` sessions (40001), `SERIALIZABLE` on
+  a follower (0A000), and the transaction defaults across `COMMIT`,
+  `ROLLBACK`, `RELEASE` and `ROLLBACK TO`.
+- **`SERIALIZABLE` and the run-time parameters over the wire**
+  (`test_wire.py`): each SQLSTATE, message and value of *Transaction
+  modes* and *Run-time parameters* over simple and extended query; write
+  skew and the range phantom over two connections (40001), disjoint ranges
+  committing; a read under a savepoint's `READ ONLY` failing the commit;
+  and, with `BYTECASK_SQL_ORACLE` set, the forms statement by statement
+  against PostgreSQL 17.
 - **HammerDB smoke, nightly.** A scheduled workflow,
   `.github/workflows/sql-layer-hammerdb-nightly.yml`, runs `run-gate.sh --smoke`: two warehouses, two
   users, no ramp-up and a one-minute window, against the server and against
@@ -1205,7 +1309,28 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 - A form the layer does not support is `42601`, not PostgreSQL's code for running it.
 - `pg_stat_bytecask` is not a relation: only `select * from pg_stat_bytecask` reads it, and PostgreSQL has no such view.
 - `Execute` with a row limit, several statements in one `Query`, SQL
-  `PREPARE`, `SET`, `SHOW` and `COPY` are refused.
+  `PREPARE`, `COPY`, and `SET`, `SHOW` and `RESET` of parameters other than
+  the transaction modes, their defaults and `client_encoding` are refused.
+- An extended-query pipeline outside `BEGIN` becomes a block at its second
+  statement (*Extended query*); PostgreSQL's unnamed transaction starts
+  with its first message. The two agree for every first statement whose
+  effect depends on the block: a `SET`, `SET LOCAL` or `RESET` of a
+  transaction mode or default, `RESET ALL`, `SET TRANSACTION` and `SET
+  SESSION CHARACTERISTICS` first of several statements start the block
+  before they run, so the block runs with the defaults it found, a `SET
+  LOCAL` or `SET TRANSACTION` lasts until `Sync`, and a failure of the
+  block undoes the `SET`. A `SET client_encoding` there runs by itself.
+- A `SERIALIZABLE` commit's `40001` carries PostgreSQL's message and hint,
+  not its DETAIL (a reason code such as "Canceled on identification as a
+  pivot, during commit attempt."). Which transactions fail differs from
+  PostgreSQL's where its predicate locks are coarser or finer than the
+  layer's read set (`transaction_design.md`, *Differences from PostgreSQL
+  17 for serializable isolation*): two transactions that read and write
+  disjoint ranges of a small table both commit here, where PostgreSQL may
+  fail one.
+- With `default_transaction_isolation` set to `serializable` on a follower,
+  `BEGIN` is `0A000`; PostgreSQL refuses the block's first query, with
+  another hint.
 - `CALL` is taken as a simple `Query` only, its arguments constants, and is
   refused in a `READ ONLY` block (`procedures_design.md`, *Wire protocol
   for `CALL`*). `pg_stat_database` answers one query, the transaction

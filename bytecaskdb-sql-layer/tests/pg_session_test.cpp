@@ -17,6 +17,10 @@
 // - A cancel-only session (past --max-connections) refuses a startup with
 //   53300 and takes a CancelRequest.
 // - An idle timeout's timer that fires before its deadline ends nothing.
+// - SERIALIZABLE over the wire: write skew between two sessions is 40001 at
+//   the second COMMIT, and a follower refuses it with 0A000; the transaction
+//   defaults are transactional and reach BEGIN, SHOW and autocommit
+//   statements (docs/transaction_design.md, *Choosing the level*).
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -32,6 +36,8 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include "include/bytecask.hpp"
 
 import bytecask.sql.api;
 import bytecask.sql.pg_session;
@@ -647,5 +653,185 @@ TEST_CASE("pg_session: an idle timeout's timer that fires before its deadline en
   CHECK(error_codes(parse_replies(unsent)) == std::vector<std::string>{"25P03"});
 
   pool.shutdown();
+  db->close();
+}
+
+namespace {
+
+// The status byte of the last ReadyForQuery.
+auto ready_status(const std::vector<ParsedReply>& msgs) -> char {
+  char st = '?';
+  for (const auto& m : msgs) {
+    if (m.type == 'Z' && !m.body.empty()) st = m.body[0];
+  }
+  return st;
+}
+
+// Each DataRow's first column, as text.
+auto first_values(const std::vector<ParsedReply>& msgs) -> std::vector<std::string> {
+  std::vector<std::string> out;
+  for (const auto& m : msgs) {
+    if (m.type != 'D') continue;
+    pg::Body b{m.body};
+    (void)b.i16();
+    auto len = b.i32();
+    out.emplace_back(len < 0 ? "NULL" : std::string{b.bytes(static_cast<std::size_t>(len))});
+  }
+  return out;
+}
+
+// An ErrorResponse's field, by its code letter, of the first error.
+auto error_field(const std::vector<ParsedReply>& msgs, char code) -> std::string {
+  for (const auto& m : msgs) {
+    if (m.type != 'E') continue;
+    for (std::size_t pos = 0; pos < m.body.size() && m.body[pos] != '\0';) {
+      auto end = m.body.find('\0', pos + 1);
+      if (m.body[pos] == code) return m.body.substr(pos + 1, end - pos - 1);
+      pos = end + 1;
+    }
+  }
+  return {};
+}
+
+}  // namespace
+
+TEST_CASE("pg_session: write skew between two SERIALIZABLE sessions is 40001 at the second COMMIT, nothing written",
+          "[sql][server][serializable]") {
+  sql_test::TempDir dir{"pg_session_ser_skew"};
+  auto db = bytecask::sql::Database::open(dir.path());
+  db->execute("CREATE TABLE doc (id BIGINT PRIMARY KEY, on_call BIGINT)");
+  db->execute("INSERT INTO doc VALUES (1, 1), (2, 1)");
+  pg::SessionConfig cfg{"testdb"};
+  for (const auto* begin : {"BEGIN ISOLATION LEVEL SERIALIZABLE", "SET default_transaction_isolation = 'serializable'"}) {
+    db->execute("UPDATE doc SET on_call = 1");
+    pg::Framer fa;
+    pg::Framer fb;
+    pg::Session a{*db, cfg};
+    pg::Session b{*db, cfg};
+    (void)feed(a, fa, startup_bytes("testdb"));
+    (void)feed(b, fb, startup_bytes("testdb"));
+    auto say = [](pg::Session& s, pg::Framer& f, std::string_view sql) { return feed(s, f, query_msg(sql)); };
+    auto by_default = std::string_view{begin}.starts_with("SET");
+    for (auto* side : {&a, &b}) {
+      auto& f = side == &a ? fa : fb;
+      CHECK(error_codes(say(*side, f, begin)) == std::vector<std::string>{});
+      if (by_default) (void)say(*side, f, "BEGIN");
+      CHECK(first_values(say(*side, f, "SHOW transaction_isolation")) == std::vector<std::string>{"serializable"});
+      CHECK(first_values(say(*side, f, "SELECT count(*) FROM doc WHERE on_call = 1")) == std::vector<std::string>{"2"});
+    }
+    CHECK(error_codes(say(a, fa, "UPDATE doc SET on_call = 0 WHERE id = 1")) == std::vector<std::string>{});
+    CHECK(error_codes(say(b, fb, "UPDATE doc SET on_call = 0 WHERE id = 2")) == std::vector<std::string>{});
+    CHECK(error_codes(say(a, fa, "COMMIT")) == std::vector<std::string>{});
+    auto out = say(b, fb, "COMMIT");
+    CHECK(error_codes(out) == std::vector<std::string>{"40001"});
+    CHECK(error_field(out, 'M') == "could not serialize access due to read/write dependencies among transactions");
+    CHECK(error_field(out, 'H') == "The transaction might succeed if retried.");
+    CHECK(ready_status(out) == 'I');
+    auto rows = db->execute("SELECT on_call FROM doc ORDER BY id");
+    REQUIRE(rows.rows.size() == 2);
+    CHECK(rows.rows[0][0] == bytecask::sql::Value{std::int64_t{0}});
+    CHECK(rows.rows[1][0] == bytecask::sql::Value{std::int64_t{1}});
+    a.close();
+    b.close();
+  }
+  db->close();
+}
+
+TEST_CASE("pg_session: SERIALIZABLE on a follower is 0A000 at BEGIN, which fails the block, and in autocommit",
+          "[sql][server][serializable]") {
+  sql_test::TempDir dir{"pg_session_ser_follower"};
+  auto db = bytecask::sql::Database::open(dir.path());
+  db->execute("CREATE TABLE one (id BIGINT PRIMARY KEY)");
+  db->engine_for_testing().set_mode(bytecask::Mode::Follower);
+  pg::SessionConfig cfg{"testdb"};
+  pg::Framer framer;
+  pg::Session s{*db, cfg};
+  (void)feed(s, framer, startup_bytes("testdb"));
+  auto say = [&](std::string_view sql) { return feed(s, framer, query_msg(sql)); };
+  auto out = say("BEGIN ISOLATION LEVEL SERIALIZABLE");
+  CHECK(error_codes(out) == std::vector<std::string>{"0A000"});
+  CHECK(error_field(out, 'M') == "cannot use serializable mode in a hot standby");
+  CHECK(error_field(out, 'H') == "You can use REPEATABLE READ instead.");
+  CHECK(ready_status(out) == 'E');
+  CHECK(error_codes(say("ROLLBACK")) == std::vector<std::string>{});
+  // The failed block holds no transaction: ROLLBACK TO finds no savepoint,
+  // and SAVEPOINT and a query are 25P02.
+  (void)say("BEGIN ISOLATION LEVEL SERIALIZABLE");
+  out = say("ROLLBACK TO s");
+  CHECK(error_codes(out) == std::vector<std::string>{"3B001"});
+  CHECK(error_field(out, 'M') == "savepoint \"s\" does not exist");
+  CHECK(ready_status(out) == 'E');
+  CHECK(error_codes(say("SAVEPOINT s")) == std::vector<std::string>{"25P02"});
+  CHECK(error_codes(say("SELECT id FROM one")) == std::vector<std::string>{"25P02"});
+  CHECK(error_codes(say("ROLLBACK")) == std::vector<std::string>{});
+  // SET TRANSACTION in a block, before its first query.
+  (void)say("BEGIN");
+  CHECK(error_codes(say("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")) == std::vector<std::string>{"0A000"});
+  (void)say("ROLLBACK");
+  // The default reaches an autocommit statement.
+  CHECK(error_codes(say("SET default_transaction_isolation = 'serializable'")) == std::vector<std::string>{});
+  CHECK(error_codes(say("SELECT id FROM one")) == std::vector<std::string>{"0A000"});
+  // REPEATABLE READ reads there.
+  CHECK(error_codes(say("BEGIN ISOLATION LEVEL REPEATABLE READ")) == std::vector<std::string>{});
+  out = say("SELECT id FROM one");
+  CHECK(error_codes(out) == std::vector<std::string>{});
+  CHECK(ready_status(out) == 'T');
+  (void)say("COMMIT");
+  s.close();
+  db->close();
+}
+
+TEST_CASE("pg_session: the transaction defaults are kept by COMMIT and RELEASE and undone by ROLLBACK and ROLLBACK TO",
+          "[sql][server][serializable]") {
+  sql_test::TempDir dir{"pg_session_defaults"};
+  auto db = bytecask::sql::Database::open(dir.path());
+  db->execute("CREATE TABLE one (id BIGINT PRIMARY KEY)");
+  pg::SessionConfig cfg{"testdb"};
+  pg::Framer framer;
+  pg::Session s{*db, cfg};
+  (void)feed(s, framer, startup_bytes("testdb"));
+  auto say = [&](std::string_view sql) { return feed(s, framer, query_msg(sql)); };
+  auto show = [&](std::string_view name) {
+    auto v = first_values(say("SHOW " + std::string{name}));
+    return v.empty() ? std::string{} : v.front();
+  };
+  CHECK(show("default_transaction_isolation") == "read committed");
+  (void)say("BEGIN");
+  (void)say("SET default_transaction_isolation = 'serializable'");
+  CHECK(show("transaction_isolation") == "read committed");  // the open block's level is unchanged
+  (void)say("ROLLBACK");
+  CHECK(show("default_transaction_isolation") == "read committed");
+  (void)say("BEGIN");
+  (void)say("SET default_transaction_isolation = 'serializable'");
+  (void)say("SELECT 1/0");  // the block fails: its COMMIT rolls it back
+  CHECK(first_values(say("COMMIT")).empty());
+  CHECK(show("default_transaction_isolation") == "read committed");
+  (void)say("BEGIN");
+  (void)say("SAVEPOINT s");
+  (void)say("SET default_transaction_isolation = 'serializable'");
+  (void)say("ROLLBACK TO s");
+  CHECK(show("default_transaction_isolation") == "read committed");
+  (void)say("SET default_transaction_isolation = 'serializable'");
+  (void)say("RELEASE s");
+  (void)say("COMMIT");
+  CHECK(show("default_transaction_isolation") == "serializable");
+  CHECK(show("transaction_isolation") == "serializable");  // outside a block: the default
+  (void)say("BEGIN");
+  CHECK(show("transaction_isolation") == "serializable");
+  (void)say("SET LOCAL default_transaction_isolation = 'repeatable read'");
+  CHECK(show("default_transaction_isolation") == "repeatable read");
+  (void)say("COMMIT");
+  CHECK(show("default_transaction_isolation") == "serializable");
+  // READ ONLY by default: a block and an autocommit write are 25006.
+  (void)say("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY");
+  CHECK(error_codes(say("INSERT INTO one VALUES (1)")) == std::vector<std::string>{"25006"});
+  (void)say("BEGIN");
+  CHECK(error_codes(say("INSERT INTO one VALUES (1)")) == std::vector<std::string>{"25006"});
+  (void)say("ROLLBACK");
+  CHECK(error_codes(say("RESET ALL")) == std::vector<std::string>{});
+  CHECK(show("default_transaction_read_only") == "off");
+  CHECK(show("default_transaction_isolation") == "read committed");
+  CHECK(error_codes(say("INSERT INTO one VALUES (1)")) == std::vector<std::string>{});
+  s.close();
   db->close();
 }

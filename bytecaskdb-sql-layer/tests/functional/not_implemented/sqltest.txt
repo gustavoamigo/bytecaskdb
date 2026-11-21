@@ -59,8 +59,6 @@ e121_10_01_07  # not PostgreSQL: FETCH ... INTO: not PostgreSQL syntax (owner de
 e121_10_01_08  # not PostgreSQL: FETCH ... INTO: not PostgreSQL syntax (owner decision 2026-10-28); PostgreSQL 17 gives 42601, "syntax error at or near "OPEN""
 e141_07_03_01  # not PostgreSQL: CURRENT_PATH; PostgreSQL 17 gives 0A000, "cannot use column reference in DEFAULT expression"
 e141_07_08_01  # not PostgreSQL: SYSTEM_USER is text in PostgreSQL, which refuses it as the DEFAULT of an INT column; PostgreSQL 17 gives 42804, "column "a" is of type integer but default expression is of type text"
-e152_01_01_01  # ISOLATION LEVEL SERIALIZABLE: transactions run at snapshot isolation; the serializable guards are not built
-e152_01_01_02  # ISOLATION LEVEL SERIALIZABLE: transactions run at snapshot isolation; the serializable guards are not built
 f031_03_03_09  # not PostgreSQL: `GRANT UNDER ON TABLE_F031_03_03_09 TO ROLE_F031_03_03_09`; PostgreSQL 17 gives 42601, "unrecognized privilege type "under""
 f031_03_04_01  # not PostgreSQL: `GRANT EXECUTE ON TABLE_F031_03_04_01 TO ROLE_F031_03_04_01`; PostgreSQL 17 gives 42P01, "relation "table_f031_03_04_01" does not exist"
 f031_03_04_02  # not PostgreSQL: `GRANT USAGE ON TABLE_F031_03_04_02 TO ROLE_F031_03_04_02`; PostgreSQL 17 gives 42P01, "relation "table_f031_03_04_02" does not exist"
