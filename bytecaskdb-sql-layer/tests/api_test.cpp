@@ -2505,7 +2505,7 @@ TEST_CASE("embedded API: a view is read as a table, expanded at each use, and ke
     CHECK(run("SELECT n, COUNT(*) FROM g GROUP BY n ORDER BY n") == Grid{{i(1), i(3)}, {i(2), i(1)}});
     // A derived relation has no primary key: a column it does not group is 42803, as PostgreSQL's.
     CHECK(state(*db, "SELECT a, n FROM g GROUP BY a") == "42803");
-    CHECK(state(*db, "SELECT a FROM g JOIN vu ON g.a = vu.id") == "42601");
+    CHECK(run("SELECT a FROM g JOIN vu ON g.a = vu.id").empty());  // a grouped view joined with a table
     // The statement's LIMIT and OFFSET count the relation's rows above, never the view's groups.
     CHECK(run("SELECT COUNT(*) FROM g LIMIT 1") == Grid{{i(4)}});
     CHECK(run("SELECT DISTINCT n FROM g ORDER BY n LIMIT 1") == Grid{{i(1)}});
@@ -2526,6 +2526,32 @@ TEST_CASE("embedded API: a view is read as a table, expanded at each use, and ke
     CHECK(run("SELECT n, s FROM gg ORDER BY n") == Grid{{i(1), i(2 + 3 + 4)}, {i(2), i(1)}});
     CHECK(state(*db, "SELECT SUM(s) FROM gg") == "42601");
     for (auto v : {"gg", "c1", "c2", "c3", "c4"}) (void)run(std::string{"DROP VIEW "} + v);
+
+    // A grouped view joined with a table: its groups are the join's outer rows, USING and
+    // NATURAL included, and the table may be the one the view reads.
+    auto sorted = [&](std::string_view sql) {
+      auto rows = run(sql);
+      std::ranges::sort(rows);
+      return rows;
+    };
+    CHECK(sorted("SELECT g.n, vu.c FROM g JOIN vu ON vu.id = g.lo") == Grid{{i(1), i(200)}, {i(1), i(300)}, {i(1), i(400)}});
+    CHECK(sorted("SELECT vu.c, g.a FROM vu, g WHERE vu.id = g.lo AND g.a > 20") == Grid{{i(300), i(30)}, {i(400), i(40)}});
+    (void)run("CREATE VIEW gu AS SELECT id, COUNT(*) AS m FROM vt GROUP BY id");
+    CHECK(sorted("SELECT * FROM gu JOIN vu USING (id)") == Grid{{i(2), i(1), i(200)}, {i(3), i(1), i(300)}, {i(4), i(1), i(400)}});
+    CHECK(sorted("SELECT id, c FROM vu NATURAL JOIN gu WHERE c < 400") == Grid{{i(2), i(200)}, {i(3), i(300)}});
+    CHECK(sorted("SELECT lo, c FROM g LEFT JOIN vu ON vu.id = g.lo") ==
+          Grid{{i(1), Value{}}, {i(2), i(200)}, {i(3), i(300)}, {i(4), i(400)}});
+    CHECK(sorted("SELECT c, lo FROM vu RIGHT JOIN g ON vu.id = g.lo WHERE g.n = 2") == Grid{{Value{}, i(1)}});
+    CHECK(sorted("SELECT g.n, vt.b FROM g JOIN vt ON vt.a = g.a WHERE g.n = 2") == Grid{{i(2), text("x")}, {i(2), text("x")}});
+    CHECK(run("SELECT c FROM g JOIN vu ON vu.id = g.lo LIMIT 2").size() == 2);
+    CHECK(run("SELECT c FROM g JOIN vu ON vu.id = g.lo LIMIT 2 OFFSET 2").size() == 1);
+    // Refused: the view on an outer join's NULL-extended side, an aggregate over the join, and
+    // ORDER BY, whose sort would hold the view's rows.
+    CHECK(state(*db, "SELECT c FROM vu LEFT JOIN g ON vu.id = g.lo") == "42601");
+    CHECK(state(*db, "SELECT COUNT(*) FROM g JOIN vu ON vu.id = g.lo") == "42601");
+    CHECK(state(*db, "SELECT c FROM g JOIN vu ON vu.id = g.lo ORDER BY c") == "0A000");
+    CHECK(state(*db, "SELECT * FROM g JOIN gu ON g.lo = gu.id") == "42601");
+    (void)run("DROP VIEW gu");
 
     // A view that cuts rows (DISTINCT, LIMIT) is created, and not read yet.
     (void)run("CREATE VIEW d AS SELECT DISTINCT a FROM vt");

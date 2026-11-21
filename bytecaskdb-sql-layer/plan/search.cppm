@@ -44,6 +44,7 @@ module;
 #include <functional>
 #include <iterator>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -439,8 +440,18 @@ auto in_key(const Table& t, const Path& p, std::uint32_t col) -> bool {
 
 // One table's rows by one access path. Its cost and rows follow from the
 // entries its range reaches (access_cost, access_rows).
+// A derived relation's rows (docs/planner_design.md, *Derived relations*),
+// as an access path: its query's groups, each bound to locals, the plan's
+// outermost loop. Built as a physical::Derived with no input, a placeholder
+// the plan of its query takes once the statement's plan is chosen
+// (Search::with_derived).
+struct DerivedRows {
+  std::uint32_t table{0};
+  std::vector<ColumnRef> columns;
+};
+
 struct Access {
-  std::variant<physical::PointGet, physical::Scan, physical::NullSplitScan> path;
+  std::variant<physical::PointGet, physical::Scan, physical::NullSplitScan, DerivedRows> path;
   Conjuncts filters;                       // the conjuncts the path does not express
   std::vector<std::uint32_t> null_checks;  // the parameters the WHERE compares, as the path checks them
   double entries{1};                       // as the cost model estimates them; 1 for a point lookup
@@ -527,14 +538,27 @@ struct Cross {
   std::optional<std::size_t> outer;
 };
 
-// A table of the statement and the conjuncts on it.
+// A table of the statement, or a derived relation, and the conjuncts on it.
+// A derived relation is read only as the plan's first loop: never a join's
+// inner side, nor an outer join's right side.
 struct Rel {
-  const logical::Get* get{nullptr};
+  std::variant<const logical::Get*, const logical::Derived*> source;
   Conjuncts where;  // its comparisons, which its access paths may take
   Conjuncts preds;  // its predicates (logical::is_predicate) and comparisons of two of its columns: filters only
   bool outer{false};  // the right side of a left outer join of it and the tables before it
 
-  [[nodiscard]] auto table() const -> const Table& { return *get->table; }
+  [[nodiscard]] auto table() const -> const Table& {
+    if (const auto* d = derived()) return *d->table;
+    return *std::get<const logical::Get*>(source)->table;
+  }
+  [[nodiscard]] auto derived() const -> const logical::Derived* {
+    const auto* d = std::get_if<const logical::Derived*>(&source);
+    return d != nullptr ? *d : nullptr;
+  }
+  [[nodiscard]] auto for_update() const -> bool {
+    const auto* g = std::get_if<const logical::Get*>(&source);
+    return g != nullptr && (*g)->for_update;
+  }
 };
 
 // The conjuncts of rel's WHERE not in `used`, then its predicates, as
@@ -744,12 +768,15 @@ auto select_parts(const logical::Node& root) -> SelectParts {
   return s;
 }
 
-// A plan finished but for what every plan of the statement shares.
+// A plan finished but for what every plan of the statement shares. `rows`
+// is the cost model's estimate of the rows, or groups, it gives: what a
+// derived relation over it is costed by.
 struct Finished {
   physical::NodePtr root;
   std::vector<std::uint32_t> null_checks;
   std::vector<physical::Computed> computed;
   double cost{0};
+  double rows{1};
 };
 
 class Search {
@@ -864,6 +891,7 @@ private:
   // which the catalog does not hold: by id.
   void note_tables(const logical::Node& n) {
     if (const auto* g = std::get_if<logical::Get>(&n.op)) tables_.emplace(g->table->id, g->table);
+    if (const auto* d = std::get_if<logical::Derived>(&n.op)) tables_.emplace(d->table->id, d->table);
     if (const auto* e = std::get_if<logical::Empty>(&n.op)) {
       for (const auto* t : e->tables) tables_.emplace(t->id, t);
     }
@@ -931,6 +959,7 @@ private:
   void flatten(const logical::Node& n, Query& q) {
     if (const auto* f = std::get_if<logical::Filter>(&n.op)) {
       const auto* g = std::get_if<logical::Get>(&f->input->op);
+      const auto* d = std::get_if<logical::Derived>(&f->input->op);
       if (const auto* j = std::get_if<logical::Join>(&f->input->op); j != nullptr && j->left_outer) {
         for (const auto& c : f->conjuncts) {
           q.post.push_back(c);
@@ -938,7 +967,7 @@ private:
         flatten(*f->input, q);
         return;
       }
-      if (g == nullptr) {
+      if (g == nullptr && d == nullptr) {
         // What pushdown leaves above a Join reads no column.
         for (const auto& c : f->conjuncts) {
           std::vector<ColumnRef> cols;
@@ -947,8 +976,9 @@ private:
         }
         no_plan("a Filter over " + with_article(op_name(*f->input)) + " where the search plans a table");
       }
-      const auto& t = *g->table;
+      const auto& t = g != nullptr ? *g->table : *d->table;
       Rel rel{g, {}, {}};
+      if (d != nullptr) rel.source = d;
       for (const auto& c : f->conjuncts) {
         if (logical::is_predicate(c) || columns_compared(c)) {
           rel.preds.push_back(c);
@@ -969,6 +999,10 @@ private:
     }
     if (const auto* g = std::get_if<logical::Get>(&n.op)) {
       add_rel(q, {g, {}});
+      return;
+    }
+    if (const auto* d = std::get_if<logical::Derived>(&n.op)) {
+      add_rel(q, {d, {}});
       return;
     }
     const auto* j = std::get_if<logical::Join>(&n.op);
@@ -1047,6 +1081,20 @@ private:
     }
   }
 
+  // The derived relation among the query's rels, by position: at most one,
+  // and with an outer join the first.
+  static auto derived_rel(const Query& q) -> std::optional<std::size_t> {
+    std::optional<std::size_t> out;
+    for (std::size_t i = 0; i < q.rels.size(); ++i) {
+      if (q.rels[i].derived() == nullptr) continue;
+      if (out) no_plan("a join of two derived relations");
+      if (q.any_outer && i != 0) no_plan("a derived relation after the first table of an outer join");
+      if (q.rels[i].outer) no_plan("a derived relation on the NULL-extended side of an outer join");
+      out = i;
+    }
+    return out;
+  }
+
   static void add_rel(Query& q, Rel r) {
     if (q.index_of(r.table().id) != q.rels.size()) no_plan("a table read twice without an instance for each use");
     // Sets of tables are bit masks.
@@ -1120,8 +1168,21 @@ private:
     const auto& t = rel.table();
     const auto& where = rel.where;
     const auto n = table_rows(t);
-    auto for_update = rel.get->for_update;
+    auto for_update = rel.for_update();
     std::vector<Tried> out;
+    if (rel.derived() != nullptr) {
+      // Its groups, as many as its query's plan estimates, in no order: every
+      // conjunct on it a filter.
+      Access a;
+      std::vector<ColumnRef> columns;
+      for (const auto& c : t.columns) columns.push_back(logical::column_of(t.id, c).col);
+      a.path = DerivedRows{t.id, std::move(columns)};
+      a.filters = residual(rel, {});
+      a.entries = a.max_entries = derived_groups_.at(t.id);
+      a.ordered = ordered.empty();
+      out.push_back({std::move(a)});
+      return out;
+    }
     auto positions = [&](const std::vector<const Expr*>& used) {
       std::vector<std::size_t> at;
       for (const auto* e : used) at.push_back(static_cast<std::size_t>(e - where.data()));
@@ -1470,10 +1531,13 @@ private:
     std::map<std::uint32_t, std::vector<Candidate>> best;
     Searched out;
     out.tried.assign(n, {});
+    // A derived relation is the first loop of every plan.
+    const auto driver = derived_rel(q);
     for (std::size_t i = 0; i < n; ++i) {
       // An outer join's right side reads rows: where it matches nothing its
       // row is bc_null_row's, never an entry's key.
       out.tried[i] = accesses(q.rels[i], ordered, read_set(q, i, used), may_cover && !q.rels[i].outer, grouping);
+      if (driver && i != *driver) continue;
       for (const auto& a : out.tried[i]) {
         Candidate c;
         c.first = i;
@@ -1494,6 +1558,7 @@ private:
       for (const auto& [set, t] : extend) {
         // With an outer join, the tables in FROM order: each joined to those before it.
         if (q.any_outer && set != (1u << t) - 1) continue;
+        if (driver && t == *driver) continue;
         auto on = joins(q, t, set);
         auto cross = crosses(q, t, set);
         auto pr = probe(q, t, on, cross);
@@ -1524,6 +1589,8 @@ private:
             // reading t once costs less.
             if (q.any_outer || pr || o.one_row()) continue;
             for (auto build_inner : {true, false}) {
+              // A derived relation's groups are never held.
+              if (!build_inner && driver) continue;
               if (auto h = hash_join(o, t, a, on, cross, build_inner)) keep(best, cost_of(std::move(*h)), full);
             }
           }
@@ -1569,7 +1636,16 @@ private:
 
   // An access path's rows, under its filters.
   static auto leaf(const Access& a) -> physical::NodePtr {
-    return filtered(std::visit([](const auto& p) { return physical::node(p); }, a.path), a.filters);
+    auto rows = std::visit(
+        [](const auto& p) {
+          if constexpr (std::is_same_v<std::decay_t<decltype(p)>, DerivedRows>) {
+            return physical::node(physical::Derived{nullptr, p.table, p.columns});
+          } else {
+            return physical::node(p);
+          }
+        },
+        a.path);
+    return filtered(std::move(rows), a.filters);
   }
 
   // The ORDER BY a plan sorts its rows by, when it does not give it: each
@@ -1804,6 +1880,14 @@ private:
   static auto groups_of(double rows, std::size_t keys) -> double {
     if (keys == 0) return 1;
     return std::max(rows * std::pow(kEqSelectivity, static_cast<double>(keys)), 1.0);
+  }
+
+  // The rows, or groups, a finished plan gives, as the cost model estimates
+  // them: its groups kept by its HAVING, or its rows, at most its LIMIT's.
+  static auto finished_rows(const Sink& s, const Measured& m) -> double {
+    auto rows = s.group.on ? groups_of(m.rows, s.group.keys) * s.group.kept : m.rows;
+    if (s.limit) rows = std::min(rows, static_cast<double>(*s.limit));
+    return std::max(rows, 1.0);
   }
 
   static auto finished_cost(const Sink& s, const Measured& m) -> double {
@@ -2080,7 +2164,7 @@ private:
     auto choices = choose(q, c, sink, searched.tried, needs, sort);
     auto b = build(q, c, choices, sort);
     auto cost = finished_cost(sink, measure(c)) + kCountCost * static_cast<double>(choices.size());
-    return Finished{wrap(std::move(b.rows)), std::move(b.null_checks), std::move(b.computed), cost};
+    return Finished{wrap(std::move(b.rows)), std::move(b.null_checks), std::move(b.computed), cost, finished_rows(sink, measure(c))};
   }
 
   // The parameters `from`'s rows test for NULL and the values it computes,
@@ -2109,16 +2193,17 @@ private:
     const auto& built = h.build_inner ? h.access : c.access;
     auto b = build(q, c, {}, sort);
     auto cost = finished_cost(sink, measure(c));
+    const auto rows_out = finished_rows(sink, measure(c));
     const auto past = hash_past(q, c, h);
     const auto known = past == 0 || built.max_entries <= 1;
     if (!avoiding || (known && built.max_entries < static_cast<double>(past))) {
-      return Finished{wrap(std::move(b.rows)), std::move(b.null_checks), std::move(b.computed), cost};
+      return Finished{wrap(std::move(b.rows)), std::move(b.null_checks), std::move(b.computed), cost, rows_out};
     }
     if (known) return std::nullopt;
     auto ob = build(avoiding->query, avoiding->plan, {}, avoiding->sort);
     merge_params(b, ob);
     auto rows = choice(built, static_cast<std::int64_t>(past), std::move(b.rows), std::move(ob.rows));
-    return Finished{wrap(std::move(rows)), std::move(b.null_checks), std::move(b.computed), cost + kCountCost};
+    return Finished{wrap(std::move(rows)), std::move(b.null_checks), std::move(b.computed), cost + kCountCost, rows_out};
   }
 
   // The rows an UPDATE or DELETE writes: each row whole, by a point lookup or
@@ -2260,12 +2345,15 @@ private:
   auto select(const logical::Node& root) -> std::vector<Finished> {
     if (grouped(root) || derived_below(root) != nullptr) return group_select(root);
     auto s = select_parts(root);
+    if (const auto* d = derived_of(*s.source); d != nullptr && !derived_pick_) return with_derived(root, *d);
     result(s);
     if (const auto* e = std::get_if<logical::Empty>(&s.source->op)) return nothing(s, *e);
     if (std::holds_alternative<logical::OneRow>(s.source->op)) return one_row(s);
     Query q;
     flatten(*s.source, q);
-    for (const auto& rel : q.rels) constants(rel.table());
+    for (const auto& rel : q.rels) {
+      if (rel.derived() == nullptr) constants(rel.table());  // a derived relation's are its query's
+    }
     Tables tables = tables_of(q, 0);
     check_columns(s, tables);
     // LIMIT 0 returns no row, in any order.
@@ -2283,7 +2371,13 @@ private:
     SortSpec sort{{}, kept(s.limit)};
     for (const auto& o : ordered) sort.keys.push_back(o.part());
     const auto* agg = s.aggregate != nullptr ? &s.aggregate->aggs[0].expr : nullptr;
-    auto for_update = std::ranges::any_of(q.rels, [](const Rel& r) { return r.get->for_update; });
+    const auto driver = derived_rel(q);
+    if (driver) {
+      // A sorter holds rows, and a derived relation's are locals (#834).
+      if (!ordered.empty()) no_plan("an ORDER BY over a join of a derived relation, whose rows no sorter holds");
+      if (agg != nullptr) no_plan("an aggregate over a join of a derived relation");
+    }
+    auto for_update = std::ranges::any_of(q.rels, [](const Rel& r) { return r.for_update(); });
     // FOR UPDATE reads each row, whose key it guards; COUNT(DISTINCT) keys
     // each value from its row.
     auto distinct = agg != nullptr && agg->distinct;
@@ -2346,7 +2440,117 @@ private:
       });
       if (f) out.push_back(std::move(*f));
     }
+    if (driver) return derived_filled(*q.rels[*driver].derived(), std::move(out));
     return out;
+  }
+
+  // The derived relation a SELECT's source reads, or null.
+  static auto derived_of(const logical::Node& n) -> const logical::Derived* {
+    if (const auto* d = std::get_if<logical::Derived>(&n.op)) return d;
+    if (const auto* f = std::get_if<logical::Filter>(&n.op)) return derived_of(*f->input);
+    if (const auto* j = std::get_if<logical::Join>(&n.op)) {
+      const auto* d = derived_of(*j->left);
+      return d != nullptr ? d : derived_of(*j->right);
+    }
+    return nullptr;
+  }
+
+  // A SELECT of a join of a derived relation (docs/planner_design.md,
+  // *Derived relations*): searched once per plan of the relation's query
+  // it takes, every one when the search returns them all and else the
+  // cheapest, each search costing the relation's rows by that plan's
+  // estimate of its groups (derived_groups_).
+  auto with_derived(const logical::Node& root, const logical::Derived& d) -> std::vector<Finished> {
+    auto inner = derived_plans(d);
+    std::vector<std::size_t> picks(inner.size());
+    std::iota(picks.begin(), picks.end(), std::size_t{0});
+    std::ranges::stable_sort(picks, {}, [&](std::size_t k) { return inner[k].cost; });
+    if (!all_) picks.resize(1);
+    std::vector<Finished> out;
+    for (auto k : picks) {
+      derived_pick_ = k;
+      derived_groups_[d.table->id] = inner[k].rows;
+      result_.clear();
+      for (auto& f : select(root)) out.push_back(std::move(f));
+    }
+    derived_pick_.reset();
+    return out;
+  }
+
+  // Each plan's placeholders of the derived relation's rows (DerivedRows)
+  // given the plan of its query derived_pick_ names, a copy each, its
+  // parameters, $n ± k and cost the plan's too. One hash join per plan
+  // (physical::check): a plan whose query's plan holds one keeps no hash
+  // join of its own.
+  auto derived_filled(const logical::Derived& d, std::vector<Finished> plans) -> std::vector<Finished> {
+    std::vector<Finished> out;
+    for (auto& f : plans) {
+      auto hashes = false;
+      auto inner_cost = 0.0;
+      fill_derived(f.root, [&] {
+        auto inner = std::move(derived_plans(d).at(*derived_pick_));
+        hashes = hashes || has_hash(*inner.root);
+        inner_cost = inner.cost;
+        for (auto p : inner.null_checks) add_param(f.null_checks, p);
+        for (const auto& v : inner.computed) {
+          if (std::ranges::find(f.computed, v) == f.computed.end()) f.computed.push_back(v);
+        }
+        return std::move(inner.root);
+      });
+      if (hashes && has_hash(*f.root, true)) continue;
+      f.cost += inner_cost;
+      out.push_back(std::move(f));
+    }
+    return out;
+  }
+
+  // Each child of a physical node.
+  template <typename F>
+  static void each_child(physical::Node& n, const F& f) {
+    std::visit(
+        [&](auto& op) {
+          using T = std::decay_t<decltype(op)>;
+          if constexpr (requires { op.input; }) {
+            if constexpr (std::is_same_v<decltype(op.input), physical::NodePtr>) {
+              if (op.input) f(op.input);
+            }
+          }
+          if constexpr (std::is_same_v<T, physical::IndexJoin>) f(op.outer);
+          if constexpr (std::is_same_v<T, physical::NestedLoop>) {
+            f(op.outer);
+            f(op.inner);
+          }
+          if constexpr (std::is_same_v<T, physical::HashJoin>) {
+            f(op.build);
+            f(op.probe);
+          }
+          if constexpr (std::is_same_v<T, physical::Choice>) {
+            f(op.below);
+            f(op.at_or_above);
+          }
+        },
+        n.op);
+  }
+
+  // Each placeholder of a derived relation's rows under n, a Derived with no
+  // input, replaced by make()'s plan.
+  template <typename Make>
+  static void fill_derived(physical::NodePtr& n, const Make& make) {
+    if (const auto* d = std::get_if<physical::Derived>(&n->op); d != nullptr && !d->input) {
+      n = make();
+      return;
+    }
+    each_child(*n, [&](physical::NodePtr& c) { fill_derived(c, make); });
+  }
+
+  // Whether a plan holds a hash join; with `outside_derived`, one outside
+  // its derived relations' queries.
+  static auto has_hash(physical::Node& n, bool outside_derived = false) -> bool {
+    if (std::holds_alternative<physical::HashJoin>(n.op)) return true;
+    if (outside_derived && std::holds_alternative<physical::Derived>(n.op)) return false;
+    auto found = false;
+    each_child(n, [&](physical::NodePtr& c) { found = found || has_hash(*c, outside_derived); });
+    return found;
   }
 
   // ------------------------------------------------------------- GROUP BY
@@ -2560,6 +2764,7 @@ private:
     }
     Query q;
     flatten(*source, q);
+    if (derived_rel(q)) no_plan("an aggregate over a join of a derived relation");
     for (const auto& rel : q.rels) constants(rel.table());
     const Tables tables = tables_of(q, 0);
     auto of_tables = [&](const ColumnRef& c) { return std::ranges::find(tables, c.table) != tables.end(); };
@@ -2688,7 +2893,8 @@ private:
       merge_params(b, sb);
       auto rows = choice(c.access, static_cast<std::int64_t>(past), branch(std::move(b.rows), false, in),
                          branch(std::move(sb.rows), true, nullptr));
-      out.push_back({rooted(std::move(rows)), std::move(b.null_checks), std::move(b.computed), cost + kCountCost});
+      out.push_back({rooted(std::move(rows)), std::move(b.null_checks), std::move(b.computed), cost + kCountCost,
+                     finished_rows(sink, measure(c))});
     }
     return out;
   }
@@ -2716,6 +2922,17 @@ private:
         no_plan("a conjunct on a derived relation other than a comparison of its column with a parameter or a column");
       }
     }
+    auto out = derived_plans(d);
+    if (!where.empty()) {
+      for (auto& f : out) f.root = physical::node(physical::Filter{std::move(f.root), where});
+    }
+    return out;
+  }
+
+  // The plans of a derived relation's query, each a physical::Derived (see
+  // derived_rows), in the order the search gives them, which is the same at
+  // each call.
+  auto derived_plans(const logical::Derived& d) -> std::vector<Finished> {
     tables_.emplace(d.table->id, d.table);
     Search sub{cat_, counts_, memory_, all_, never_null_};
     sub.note_tables(*d.plan);
@@ -2737,8 +2954,7 @@ private:
       const auto may_be_null = [&](std::uint32_t p) { return !std::ranges::contains(never_null_, p); };
       if (g->keys.empty() && (std::ranges::any_of(f.null_checks, may_be_null) || one_row(*g->input))) continue;
       auto rows = physical::node(physical::Derived{std::move(f.root), d.table->id, columns});
-      if (!where.empty()) rows = physical::node(physical::Filter{std::move(rows), where});
-      out.push_back({std::move(rows), std::move(f.null_checks), std::move(f.computed), f.cost});
+      out.push_back({std::move(rows), std::move(f.null_checks), std::move(f.computed), f.cost, f.rows});
     }
     if (out.empty()) no_plan("a derived relation of one group whose query's plan may end before it reads a row");
     return out;
@@ -2814,6 +3030,10 @@ private:
   std::uint64_t memory_;  // the statement's memory budget, 0 for none
   bool all_;
   const std::vector<std::uint32_t>& never_null_;  // parameters never NULL: constants that are not
+  // A join of a derived relation (with_derived): the plan of its query the
+  // search is under, and by table its groups as that plan estimates them.
+  std::optional<std::size_t> derived_pick_;
+  std::map<std::uint32_t, double> derived_groups_;
   std::map<std::uint32_t, double> rows_;
   std::vector<Catalog::PlanConstant> constants_;
   std::map<std::uint32_t, const Table*> tables_;  // by id, the statement's, instances among them

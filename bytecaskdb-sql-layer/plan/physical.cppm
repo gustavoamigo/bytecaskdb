@@ -374,7 +374,8 @@ struct GroupEmit {
 // its i-th output columns[i], a column of `table` (Table::derived). Nothing
 // is read or held: for each group the query gives, its outputs are bound to
 // locals and the plan above runs on them, inside the query's loop over its
-// groups. The query's choice points are the plan's.
+// groups: a grouped aggregate, or a join whose outer side it is, then an
+// Emit. The query's choice points are the plan's.
 struct Derived {
   NodePtr input;
   std::uint32_t table{0};
@@ -1007,6 +1008,7 @@ private:
     if (const auto* f = std::get_if<Filter>(&n.op)) return loops(*f->input);
     if (const auto* l = std::get_if<Limit>(&n.op)) return loops(*l->input);
     if (const auto* c = std::get_if<Choice>(&n.op)) return loops(*c->below);
+    if (const auto* d = std::get_if<Derived>(&n.op)) return {d->table};
     if (const auto* j = std::get_if<IndexJoin>(&n.op)) return loops(*j->outer);
     if (const auto* j = std::get_if<NestedLoop>(&n.op)) {
       auto out = loops(*j->outer);
@@ -1193,6 +1195,7 @@ private:
             }
           } else if constexpr (std::is_same_v<T, IndexJoin>) {
             if (op.inner_key.empty()) broken("a join whose inner key has no part");
+            if (Table::derived(op.inner)) broken("a derived relation looked up by key");
             if (!op.left_outer && !op.match.empty()) broken("an inner index join with match conjuncts");
             for (const auto& e : op.inner_key) {
               if (op.left_outer) {
@@ -1256,6 +1259,7 @@ private:
               broken("a hash join whose build side is not one loop over the table it holds");
             }
             if (std::ranges::find(covering_, op.held) != covering_.end()) broken("a hash join that holds a covering scan's entry");
+            if (Table::derived(op.held)) broken("a hash join that holds a derived relation's rows");
             auto probed = tables_of(*op.probe);
             if (std::ranges::find(probed, op.held) != probed.end()) broken("a hash join that holds a table its probe side reads");
             for (const auto& k : op.keys) {
@@ -1406,7 +1410,6 @@ private:
             if (op.offset < 0 || op.offset > op.n) broken("a LIMIT whose OFFSET is negative or past it");
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Emit>) {
-            if (of_derived(*op.input)) broken("rows emitted from a derived relation, which only a grouped aggregate reads");
             for (const auto& t : op.targets) {
               if (const auto* c = std::get_if<ColumnRef>(&t)) {
                 read(*c);

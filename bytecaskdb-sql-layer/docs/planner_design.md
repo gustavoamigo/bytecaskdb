@@ -926,13 +926,34 @@ the relation is a table: its `WHERE` is a `Filter` over the leaf, and its
   (NULL until the subquery runs) may. The
   outer `WHERE` compares the relation's columns with parameters, constants
   or each other, or is a predicate; `$n ± k` there is refused.
+- **A join of it.** A grouped view joined with a table is a relation of
+  the join (`Rel` is a `Get` or a `Derived`), read only as the plan's
+  first loop: every candidate starts from it (`derived_rel`), by its one
+  access path (`DerivedRows`, every conjunct on it a filter), and each
+  table after it is looked up by key, scanned per group, or hashed, the
+  hash table built on the table, never on the groups. An outer join keeps
+  it on the left, in FROM order; the binder refuses it on the
+  NULL-extended side, and the search refuses a second one. Its entries are
+  its query's estimate of its groups (`Finished::rows`: the rows its plan
+  reads, grouped by the cost model's 1/10 per key, kept by its `HAVING`).
+  The statement is searched once per plan of the view's query it takes
+  (`with_derived`): the cheapest, or every one when the search returns
+  them all, each costed by that plan's estimate and its cost. The plans
+  are built with a placeholder, a `physical::Derived` with no input, which
+  then takes a copy of the query's plan, its NULL checks and `$n ± k`
+  (`derived_filled`); a plan of one hash join only (`check`), so where the
+  query's plan holds one the statement's plans that do are dropped.
+  `ORDER BY` over the join, whose sorters would hold the view's rows, is
+  `no plan` (#834); an aggregate over it the binder refuses (#835).
 - **The physical plan.** `Derived(input, table, columns)`: `input` is the
   view query's plan, a `GroupEmit` whose i-th output is `columns[i]`. Its
   choice points are the plan's, counted, checked and overridden as any
   (`choices`, `override_thresholds`). `check` holds its columns to its
   outputs, each of the output's physical type, never a `NUMERIC`, and keeps
-  it under a grouped aggregate alone: no `Emit`, one-row `Aggregate` or row
-  `Sort` reads it, and no structure of groups holds a row of it. A
+  no row of it anywhere: no one-row `Aggregate` or row `Sort` reads it, no
+  structure of groups or hash table holds it, and no `IndexJoin` looks it
+  up; an `Emit` and a join's outer side read its locals, a loop of
+  `loops()`. A
   structure keys its groups by a column of it held as `I64` or `BOOLEAN`
   (0 or 1 in a slot), never one read from a held row; the binder refuses
   the other types (#833).
@@ -941,10 +962,13 @@ the relation is a table: its `WHERE` is a `Filter` over the leaf, and its
   `d<i>_v<j>` and `d<i>_n<j>` (its NULL), and the plan above runs on them
   inside `do { … } while (0)`: a filter's miss is `continue`, which leaves
   it for the next group wherever the view gives it (in its loop over its
-  groups, in its input's loop, or after it). A column read, a `NULL` test
-  and a sort key part of the relation read the locals. The statement's
-  `LIMIT` counts the outer groups, never the view's: `limit_` is cleared
-  around the view's plan. Nothing is held per row of the relation; the
+  groups, in its input's loop, or after it). A column read, a `NULL` test,
+  a sort key part, a hash or index key and an `Emit`'s column of the
+  relation read the locals. The statement's `LIMIT` counts the outer
+  groups or rows, never the view's: `limit_` is cleared around the view's
+  plan, and the plan above runs for a group only while the `LIMIT` is not
+  met, so a join's lookup by key per group, which no loop of its own
+  stops, emits no row past it. Nothing is held per row of the relation; the
   outer structure of groups is charged to the budget as any.
 
 ```c
