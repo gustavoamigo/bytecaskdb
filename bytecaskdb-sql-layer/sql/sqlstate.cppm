@@ -70,6 +70,8 @@ inline constexpr SqlState kInvalidRowCountInOffset{"2201X"};
 inline constexpr SqlState kInvalidTableDefinition{"42P16"};
 inline constexpr SqlState kObjectNotInPrerequisiteState{"55000"};
 inline constexpr SqlState kInvalidSavepointSpecification{"3B001"};
+inline constexpr SqlState kReadOnlySqlTransaction{"25006"};
+inline constexpr SqlState kObjectInUse{"55006"};
 
 // The constant above whose code is `code`, or nullopt.
 [[nodiscard]] constexpr auto known_sqlstate(std::string_view code) noexcept -> std::optional<SqlState> {
@@ -79,7 +81,7 @@ inline constexpr SqlState kInvalidSavepointSpecification{"3B001"};
                  kInvalidTextRepresentation, kStringDataRightTruncation, kInvalidDatetimeFormat,
                  kDatetimeFieldOverflow, kCharacterNotInRepertoire, kInvalidParameterValue, kInvalidEscapeSequence, kSubstringError, kCannotCoerce,
                  kInvalidRowCountInLimit, kInvalidRowCountInOffset, kReservedName, kInvalidGrantOperation,
-                 kInvalidSavepointSpecification}) {
+                 kInvalidSavepointSpecification, kReadOnlySqlTransaction, kObjectInUse}) {
     if (s.view() == code) return s;
   }
   return std::nullopt;

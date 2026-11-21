@@ -1118,3 +1118,97 @@ TEST_CASE("transactions: the copy a mark keeps is charged at the first write aft
   CHECK(commit(f, txn.p) == BC_COMMITTED);
   CHECK(stored(f).size() == static_cast<std::size_t>(n) + 1);
 }
+
+namespace {
+
+// The table a test plan writes: a transaction's private table, whose id is
+// known only once its DDL ran.
+std::uint32_t g_private_table = 0;
+
+// INSERT INTO <g_private_table> VALUES ($1)
+void insert_private(bc_ctx* cx) {
+  bc_row r = bc_row_begin(cx, g_private_table);
+  bc_row_set_param(cx, r, 0, 0);
+  bc_insert(cx, g_private_table, bc_row_end(cx, r));
+}
+
+// CREATE TABLE <name> (id BIGINT PRIMARY KEY) as a step of `txn`; the table's id.
+auto create_in(bc_txn* txn, const std::string& name) -> std::uint32_t {
+  auto cat = bc_txn_catalog(txn);
+  std::vector<bytecask::sql::Catalog::DdlOp> ops;
+  auto backfill = false;
+  bytecask::sql::CreateTableDdl create;
+  create.name = name;
+  create.columns = {Fixture::col("id", PhysType::I64, false)};
+  create.pk = {"id"};
+  auto rows = bc_txn_rows(txn);
+  auto next = cat->next_version(create, *rows, ops, backfill, std::size_t{1} << 20);
+  rows.reset();  // its hold on the overlay, before the DDL writes to it
+  REQUIRE(next != nullptr);
+  const auto id = next->table(name)->id;
+  REQUIRE(bc_txn_ddl(txn, next, ops, backfill));
+  CHECK(bc_txn_has_ddl(txn));
+  return id;
+}
+
+// A statement of `txn` on its own catalog, a private table's included.
+auto run_in(Fixture& f, bc_txn* txn, bc_plan_fn plan, std::vector<bc_value> p) -> int {
+  auto ps = params(std::move(p));
+  auto cat = bc_txn_catalog(txn);
+  SchemaRef sr{all_objects(*cat), all_tables(*cat), all_cols(*cat), {}, cat->version()};
+  auto ref = sr.get();
+  bc_ctx_begin_txn(f.cx, txn, &ps, {});
+  bc_ctx_run(f.cx, plan, &ref);
+  (void)bc_txn_add(f.cx);
+  auto error = static_cast<int>(bc_error(f.cx));
+  bc_ctx_reset(f.cx);
+  return error;
+}
+
+}  // namespace
+
+TEST_CASE("transaction: a DDL transaction's commit that finds a DDL published since is a conflict, never a duplicate",
+          "[sql][txn][ddl]") {
+  Fixture f;
+  // Two transactions take the same private id, each on its own LiveCatalog
+  // of the one database or on the same one, and insert the same key under it.
+  for (const auto two_catalogs : {false, true}) {
+    INFO((two_catalogs ? "two LiveCatalogs" : "one LiveCatalog"));
+    bytecask::sql::LiveCatalog other{*f.db};
+    bc_catalog second{two_catalogs ? &other : f.live.get()};
+    TxnPtr t1{f};
+    auto* t2 = bc_txn_new(&f.bdb, &second, std::uint64_t{64} << 20);
+    const auto x = create_in(t1.p, "x" + std::to_string(two_catalogs));
+    const auto y = create_in(t2, "y" + std::to_string(two_catalogs));
+    CHECK(x == y);
+    g_private_table = x;
+    CHECK(run_in(f, t1.p, insert_private, {std::int64_t{1}}) == BC_OK);
+    CHECK(run_in(f, t2, insert_private, {std::int64_t{1}}) == BC_OK);
+    CHECK(commit(f, t1.p) == BC_COMMITTED);
+    CHECK(commit(f, t2) == BC_CONFLICT);
+    bc_txn_free(t2);
+    CHECK(count_entries(*f.db, bytecask::sql::kNsRow, x) == 1);
+  }
+}
+
+TEST_CASE("transaction: a DDL's rows source is the transaction's snapshot with its own writes over it",
+          "[sql][txn][ddl]") {
+  Fixture f;
+  create_w(f);
+  for (std::int64_t id = 1; id <= 5; ++id) {
+    REQUIRE(autocommit(f, insert_w, {id, std::int64_t{id}, std::monostate{}, std::int64_t{0}}) == BC_COMMITTED);
+  }
+  TxnPtr txn{f};
+  CHECK(stmt(f, txn.p, delete_w, {std::int64_t{2}}).error == BC_OK);
+  CHECK(stmt(f, txn.p, insert_w, {std::int64_t{7}, std::int64_t{7}, std::monostate{}, std::int64_t{0}}).error == BC_OK);
+  CHECK(stmt(f, txn.p, del_range_w, {std::int64_t{4}, std::int64_t{5}}).error == BC_OK);
+  CHECK(stmt(f, txn.p, insert_w, {std::int64_t{0}, std::int64_t{0}, std::monostate{}, std::int64_t{0}}).error == BC_OK);
+  // In key order: the snapshot's rows the transaction left, and its own.
+  auto rows = bc_txn_rows(txn.p);
+  std::vector<std::int64_t> ids;
+  rows->scan(bytecask::sql::row_prefix(kW), [&](BytesView key, BytesView) {
+    bytecask::sql::KeyReader r{key, bytecask::sql::row_prefix(kW).size()};
+    ids.push_back(*r.read_i64(bytecask::sql::KeyPart{PhysType::I64}));
+  });
+  CHECK(ids == std::vector<std::int64_t>{0, 1, 3, 5, 7});
+}

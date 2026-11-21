@@ -458,37 +458,6 @@ auto classify(std::string_view text, const char* several_state, std::string_view
   return out;
 }
 
-auto command_name(Command c) -> std::string_view {
-  switch (c) {
-    case Command::Select: return "SELECT";
-    case Command::Insert: return "INSERT";
-    case Command::Update: return "UPDATE";
-    case Command::Delete: return "DELETE";
-    case Command::CreateTable: return "CREATE TABLE";
-    case Command::CreateTableAs: return "CREATE TABLE AS";
-    case Command::SelectInto: return "SELECT INTO";
-    case Command::CreateIndex: return "CREATE INDEX";
-    case Command::DropTable: return "DROP TABLE";
-    case Command::DropIndex: return "DROP INDEX";
-    case Command::AlterTable: return "ALTER TABLE";
-    case Command::CreateView: return "CREATE VIEW";
-    case Command::DropView: return "DROP VIEW";
-    case Command::CreateProcedure: return "CREATE PROCEDURE";
-    case Command::DropProcedure: return "DROP PROCEDURE";
-    case Command::CreateRole: return "CREATE ROLE";
-    case Command::DropRole: return "DROP ROLE";
-    case Command::Grant: return "GRANT";
-    case Command::Revoke: return "REVOKE";
-    case Command::CreateDomain: return "CREATE DOMAIN";
-    case Command::CreateType: return "CREATE TYPE";
-    case Command::CreateSequence: return "CREATE SEQUENCE";
-    case Command::DropDomain: return "DROP DOMAIN";
-    case Command::DropType: return "DROP TYPE";
-    case Command::DropSequence: return "DROP SEQUENCE";
-  }
-  return {};
-}
-
 auto command_tag(Command c, const Rows& r) -> std::string {
   switch (c) {
     case Command::Select: return "SELECT " + std::to_string(r.rows.size());
@@ -1480,6 +1449,7 @@ private:
           if (!record.params.empty()) throw SessionError("there is no parameter $1", "42P02");
           if (implicit_ && record.ddl) refuse_ddl_beside_others();
           enter_statement(record.command);
+          if (in_block_ && record.ddl) refuse_ddl_in_block();
           auto opts = run_options();
           const auto none = ResultCheck::none();
           auto rows = !record.current_of.empty() ? run_positioned(c.sql, record, none, {}, opts)
@@ -1741,8 +1711,10 @@ private:
     if (!record.current_of.empty()) {
       rows = run_positioned(p.sql, record, check, portal.params, run_options());
     } else if (in_block_) {
+      if (record.ddl) refuse_ddl_in_block();
       rows = txn_->execute(p.sql, check, portal.params, run_options());
     } else if (implicit_) {
+      if (record.ddl) refuse_ddl_beside_others();
       rows = implicit_->execute(p.sql, check, portal.params, run_options());
     } else {
       auto flush_after = false;
@@ -1832,6 +1804,13 @@ private:
 
   [[noreturn]] static void refuse_ddl_beside_others() {
     throw SessionError("DDL in a block of several statements is not supported: send it alone", "0A000");
+  }
+
+  // The embedded Transaction runs DDL (docs/transaction_design.md, stage 2);
+  // a BEGIN block does not yet (stage 3): its portals and named statements
+  // across the block's DDL are not built.
+  [[noreturn]] static void refuse_ddl_in_block() {
+    throw SessionError("DDL inside a transaction is not supported: run it outside one", "0A000");
   }
 
   void close_msg(Body& body) {

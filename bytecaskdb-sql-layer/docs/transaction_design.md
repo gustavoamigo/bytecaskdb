@@ -287,8 +287,17 @@ O(statement) (#850).
 
 **What does not change.** A statement that fails with 40001 under the rule's
 exceptions 1 and 2 (*A transaction binds only against its own catalog*)
-ends the transaction, savepoints or not. A ROLLBACK TO keeps the
-transaction's private plans: a mark does not record them.
+ends a transaction that has run no DDL, savepoints or not. A ROLLBACK TO
+keeps the transaction's private plans for the catalog it returns to: a
+mark does not record them.
+
+**With DDL (stage 2).** A mark carries the transaction's catalog, so ROLLBACK
+TO undoes the DDL since the savepoint as it undoes the writes, and an
+abort with marks goes back to the newest mark's catalog. A transaction
+that has run DDL is 40001 at its next statement once another DDL commits
+(*Catalog snapshots and isolation levels with DDL*); that 40001 aborts it,
+as a failed statement does, and ROLLBACK TO a mark taken before its first
+DDL lets it go on.
 
 ## Commit and conflicts
 
@@ -493,11 +502,14 @@ wrote a table the DDL changed.
   and may be retried. The one wait left is a statement's pin: it waits for
   the instant between a DDL's batch reaching the engine and the new catalog
   taking effect, never while the DDL writes or syncs.
-- A DDL statement given to `Transaction::execute` is refused with
-  `FeatureNotSupported` (SQLSTATE 0A000; Python's
-  `bytecask_sql.FeatureNotSupported`, a `SqlError`) before anything runs, and the transaction aborts, as any error aborts one in
-  PostgreSQL. DDL stays its own atomic operation. Transactional DDL
-  is later.
+- A DDL statement given to `Transaction::execute` is a step of the
+  transaction (*Transactional DDL*, stage 2): later statements see it,
+  COMMIT publishes it with the transaction's writes or nothing, and
+  ROLLBACK undoes it. CREATE TABLE AS and SELECT … INTO are refused there
+  with `FeatureNotSupported` (SQLSTATE 0A000; Python's
+  `bytecask_sql.FeatureNotSupported`, a `SqlError`) before anything runs,
+  and the transaction aborts (stage 4). The server refuses any DDL in a
+  BEGIN block with 0A000 until stage 3.
 
 PostgreSQL makes the DDL wait for the open transaction's locks; see *Known
 differences*.
@@ -661,14 +673,19 @@ reason.
 | `INSERT … ON CONFLICT DO NOTHING` whose conflicting row a concurrent transaction deletes and commits waits for it, then inserts the row. | The row is skipped, as the statement's snapshot holds its key, and the commit succeeds. | Owner decision (2026-11-19), not the rule *never wait*: a guard per skipped row would make the commit a conflict and an autocommit retry insert the row; it was not taken. |
 | `SELECT … FOR UPDATE` locks the rows: other writers wait. | It guards them: the guarding transaction gets 40001 at commit if a writer of those rows committed first. A writer is never held back. | A guard, not a lock. |
 | DDL waits for the locks of open transactions on its table. | DDL commits at once. An open transaction that wrote the table gets 40001 at commit. | DDL never waits. |
+| A DDL in a transaction waits for open transactions' locks on its table; readers and writers queue behind an uncommitted DDL's lock. | Nothing waits. The second to commit fails: at commit, or at its next statement for a transaction that ran DDL. | Never wait. |
+| Two DDL transactions on unrelated objects both commit, and their other statements run. | Once one commits, the other's next statement, whatever it is, is 40001, and so is its commit. GRANT and CREATE ROLE count as DDL. | One catalog version key. |
+| A transaction that began before another session's DDL committed runs its own DDL, on any object, in READ COMMITTED and REPEATABLE READ. | Its DDL is 40001 unless it is the transaction's first statement. | A catalog consistent with the snapshot. |
+| T2's CREATE of a name T1 created waits for T1's lock, then is 23505 once T1 commits. | No wait. The second to commit is 40001, at its next statement or at commit; its retry's CREATE is 42P07. | Every conflict between two DDL is 40001; owner's decision 1. |
+| DDL in a transaction is bounded only by disk. | Its backfill and writes are bounded by `TransactionOptions::max_bytes` (default 64 MiB), and never past 1 GiB: 54000. Autocommit DDL keeps its 1 GiB bound. | The transaction is held in memory until commit. |
 | REPEATABLE READ: catalog lookups read the latest committed catalog, so a later CREATE TABLE is visible and empty, a later ADD COLUMN shows its default on old rows, a later TRUNCATE or rewrite shows 0 rows. READ COMMITTED: each statement takes the latest catalog and a new snapshot. | Every level reads the catalog of its first statement (*A transaction binds only against its own catalog*). A statement whose binding fails at the pin after the catalog moved, such as one naming an object created later, is 40001. A table dropped later is still read; a column added later is not seen; a view or table dropped and created again is read as at the pin. | A catalog consistent with the snapshot; one snapshot per transaction (*Isolation*). |
-| A 40001 in a transaction is recoverable: ROLLBACK TO a savepoint, then COMMIT. | The rule's 40001s (exceptions 1 and 2) end the transaction, savepoints or not (CONTRACT.md, the 40001 row). | A no-DDL transaction's 40001 ends it. |
-| A statement Parsed in a transaction fixes the latest catalog's result columns, and runs after COMMIT with them. | One Parsed in a transaction whose pin was behind fixes the pin's columns; run after COMMIT in autocommit, it is 0A000 when they differ at the live catalog (exception 3). | A transaction binds only against its own catalog. |
+| A 40001 in a transaction is recoverable: ROLLBACK TO a savepoint, then COMMIT. | A doomed DDL transaction's 40001 is recoverable the same way. A no-DDL transaction's 40001, the rule's exceptions 1 and 2 included, ends the transaction, savepoints or not (CONTRACT.md, the 40001 row). | A no-DDL transaction's 40001 ends it. |
+| A statement Parsed in a transaction fixes the latest catalog's result columns, and runs after COMMIT with them. | One Parsed in a transaction whose pin was behind fixes the pin's columns; run after COMMIT in autocommit, it is 0A000 when they differ at the live catalog (exception 3). So is a `TxnStatement`. | A transaction binds only against its own catalog. |
 | On a standby, `SELECT … FOR UPDATE` is refused at the statement (25006). | On a follower it runs, and a transaction that used it fails at commit with the engine's refusal of writes, as its writes would; in autocommit it reads as the `SELECT` does. | Its guards are checked by the engine at commit, which a follower refuses. |
 
 ## Transactional DDL
 
-Status: **design, approved by the owner on 2026-11-19. Stages 0 and 1 are built; stages 2 to 4 are not.** Where building a stage found the design incomplete against the code, the stage's entry says what was done instead (*Stage 0 as built*, *Stage 1 as built*). The owner's answers are recorded in *Owner's decisions on transactional DDL*. Stage 0 comes first, and edits *DDL during an open transaction* (stage 0's *Docs*). Once transactional DDL is built, this section replaces *DDL during an open transaction*, and the edits listed under *Edits to this document once transactional DDL is built* are made.
+Status: **design, approved by the owner on 2026-11-19. Stages 0, 1 and 2 are built (DDL runs in an embedded `Transaction`); stages 3 and 4 are not (the server still refuses DDL in a block).** Where building a stage found the design incomplete against the code, the stage's entry says what was done instead (*Stage 0 as built*, *Stage 1 as built*, *Stage 2 as built*). The owner's answers are recorded in *Owner's decisions on transactional DDL*. Stage 0 comes first, and edits *DDL during an open transaction* (stage 0's *Docs*). Once transactional DDL is built, this section replaces *DDL during an open transaction*, and the edits listed under *Edits to this document once transactional DDL is built* are made.
 
 This section applies the two standing rules: do what PostgreSQL does, and never wait. Behaviour observed on PostgreSQL 17.12 is cited as "PG 17".
 
@@ -770,7 +787,7 @@ DROP TABLE is RESTRICT: a table a view reads is 2BP01, and there is no CASCADE. 
 
 **Cursors and portals.** PostgreSQL refuses a DDL on a relation that an active query of the session has open: 55006. A cursor counts, even after FETCH ALL, and so does a bound portal, since PortalStart opens its relations. The layer does the same:
 
-- A DROP TABLE, CREATE INDEX or ALTER TABLE on a table that an open cursor or portal of the transaction reads is 55006, and aborts the transaction. This uses the objects the plan read.
+- A DROP TABLE, CREATE INDEX or ALTER TABLE on a table that an open cursor or portal of the transaction reads is 55006, and aborts the transaction. This uses the objects the plan read. A DROP TABLE of a table a view depends on is 2BP01 instead, as in PG 17, which checks dependencies before `CheckTableNotInUse`; ALTER TABLE and CREATE INDEX check use first, so a duplicate column or index name with a cursor open is 55006.
 - A DROP INDEX is 55006 only when an open cursor's or portal's plan scans that index. A plan that reads the table without the index does not count, as in PG 17, where `index_drop` checks only the index's own references. The plan's schema ref already lists the indexes it scans.
 - CREATE VIEW, DROP VIEW (of a view a cursor reads too) and any DDL that touches no open plan's table run, as in PG 17.
 - The server's open portals in the block, named or unnamed, count with the transaction's cursors.
@@ -845,7 +862,7 @@ Stage 0 builds all of this for the pinned catalog; stage 2 points it at `txn->ca
   The fixed parameter types are inputs to the bind; a type that no longer fits gives the binder's error. When the plan's result columns differ from the check's, the check's version and private mark decide: later than the transaction's pin, 40001 (exception 2); otherwise 0A000 (exception 3). In autocommit no version is later than the live catalog, so it is 0A000.
 - **`Transaction::refit(sql or stmt, check)`** gives `params()`, `columns()`, `command()`, the version of the plan the transaction will run and its private mark, under the check. Before the transaction's first statement it pins first, as that statement would.
 - **`Transaction::prepare(sql)` (stage 2)** returns a `TxnStatement`, a value that holds the text and its record (result columns, parameter types, version and private mark) from `refit(sql, none)`, as the server's named statement does. It holds no plan and no `Statement`. A parse the transaction makes for a text not in the shared cache stays with the transaction, so `Transaction::prepare` puts nothing in the shared cache. A run passes the text and the record as `ResultCheck::given` to the `execute` forms that take a check, so the text resolves by the rule wherever it runs. A `TxnStatement` outlives its transaction: run in another transaction or in autocommit, it resolves its text there. A text naming a table the transaction created and did not commit is therefore 42P01 there, as it is for another session's `prepare` or `execute` of the text.
-- **Published and private catalogs are distinct types (stage 2).** `LiveCatalog` hands out a `Published` catalog; a transaction's DDL makes a `TxnCatalog`. A version number identifies only a published catalog: two open transactions can both hold a private base+1 with different contents. Every site keyed by version takes a `Published` only: `fitting_plan`'s comparison with the live catalog, `procedure_plan` (:2226), and the rule's exact-version test. `build(const Published&)` returns the shared `Compiled`; `build_private` takes either type and returns a `TxnPlan`. Under the rule a transaction that has run DDL uses no shared plan, so no version-keyed site ever sees a private catalog.
+- **Published and private catalogs are distinct types (stage 2).** A transaction's catalog is a `TxnCatalog`: the published catalog it pinned and its own. A version number identifies only a published catalog: two open transactions can both hold a private base+1 with different contents. A `Published` is made only from a `TxnCatalog` whose catalog is still its pin, and the transaction's sites keyed by version (the rule's exact-version test, the shared procedure map) take a `Published` only. Autocommit's (`fitting_plan`'s comparison with the live catalog, `procedure_plan`) read the live catalog, which is published. The shared `Compiled` is built only there; a transaction's private compile returns a `TxnPlan` (*Stage 2 as built*). Under the rule a transaction that has run DDL uses no shared plan, so no version-keyed site ever sees a private catalog.
 
 ### Mechanism: committing and publishing a transaction's catalog changes
 
@@ -1019,7 +1036,7 @@ Each stage is one PR that ships on its own. Each says what it still refuses, upd
   - ROLLBACK TO across CREATE INDEX: an INSERT prepared after the CREATE INDEX, run again after a ROLLBACK TO that undid the index, writes no entries for it, and the commit holds none;
   - a duplicate name is 42P07 and aborts; a skipped `IF NOT EXISTS` does not make the transaction one that ran DDL (another DDL committing does not doom it);
   - DDL in a READ ONLY transaction and on a follower is 25006 at the statement;
-  - 55006, with each of the four messages, for DDL on a table an open cursor reads; none for an unrelated table, for CREATE VIEW, or for DROP INDEX of an index the cursor does not scan; 55006 for DROP INDEX of one it scans; a WITH HOLD cursor from an earlier transaction is not counted;
+  - 55006, with each of the four messages, for DDL on a table an open cursor reads; none for an unrelated table, for CREATE VIEW, or for DROP INDEX of an index the cursor does not scan; 55006 for DROP INDEX of one it scans; 2BP01 for DROP TABLE of a table a view depends on; a WITH HOLD cursor from an earlier transaction is not counted;
   - a WITH HOLD cursor over a table created in the transaction, then COMMIT, then FETCH; a cursor over a name dropped and re-created in the transaction reads the new table;
   - a statement compiled before an in-transaction CREATE INDEX maintains the new index after it;
   - `SELECT *` run by text before and after an in-transaction ADD COLUMN returns the new column the second time, and after COMMIT in another session; a statement held from before is 0A000 and aborts the transaction;
@@ -1036,6 +1053,20 @@ Each stage is one PR that ships on its own. Each says what it still refuses, upd
   - an allocation-failure sweep over a DDL step in a transaction (the clone, each overlay write, the backfill, the charge), over a private compile after it, over ROLLBACK TO across a DDL, and over the commit, in `plan_alloc_faults_test`'s shape. It asserts that a failed step leaves the transaction aborted, its catalog and charge unchanged, and that ROLLBACK TO restores them.
 
   The commit goes through `LiveCatalog::commit` unchanged, so no durability site changes and tests/CLAUDE.md asks for no mutation patch. If review finds a new durability site after all, it gets a row in `docs/correctness_validation.md` and a mutation.
+
+**Stage 2 as built.** These are the smallest changes to the design above that the code needed; the guarantees are the ones stated.
+- **`Published` and `TxnCatalog`** are types of the database module, not of the catalog module: `Catalog` stays one type. `Database::TxnCatalog` holds a transaction's base (the published catalog it pinned) and its catalog. Its `published()` makes a `Database::Published`, whose constructor only `TxnCatalog` can call, and only while the two catalogs are one. The transaction's version-keyed sites, `shared_txn_plan` (the exact-version test against the shared cache and a held statement) and `shared_procedure` (the shared procedure map), take a `Published`, so passing them a private catalog's version does not compile, and a transaction that has run DDL never reaches them. Autocommit's version-keyed sites (`fitting_plan`, `procedure_plan`) read `live_->current()`, which is always published, so they take no new type. The tests that another session's description and plans are unchanged after a transaction's private catalog (*Tests* above) cover the guard.
+- **The runtime's calls:** `bc_txn_catalog` (the transaction's catalog, pinned first), `bc_txn_has_ddl`, `bc_txn_current_catalog` (without pinning, for ROLLBACK TO), `bc_txn_rows` (the backfill's `RowSource`: a two-pointer merge of the snapshot and the overlay, one prefix at a time) and `bc_txn_ddl`. A DDL counts as a statement of the transaction, so the statement after it is not a first statement and never re-pins.
+- **A mark taken before the transaction's first DDL records no catalog**, and stands for the pinned one: a mark may be taken before the first statement pins, and the first statement may re-pin after it. Only a private catalog, which exists only after a DDL, is recorded.
+- **The plan map across ROLLBACK TO:** the handle drops the private plans compiled for another catalog than the one restored (`drop_plans_not_for`), returning their charge; a DDL clears the map.
+- **The backfill's bound** is thrown as `BackfillTooLarge` (a `std::length_error`), so the transaction can tell it from the catalog's other length errors; in a transaction it is `ExecError` `BC_E_LIMIT`, "… does not fit the transaction's bound of N bytes: run the DDL outside a transaction", N the smaller of `max_bytes` and the engine's batch limit. What the DDL adds past `max_bytes` (its writes, its guards, the catalog's charge) is `BC_E_LIMIT` from `bc_txn_ddl`, with the same advice.
+- **The commit** (`commit_ddl`) builds the plan as any transaction's, without the catalog-record guards and with one `ensure_unchanged` on the version key, and calls `LiveCatalog::commit` with `Prepared{base = pinned, next = catalog}`. A false return is classified by one read of the version at the head (`LiveCatalog::head_version`), which covers both of its causes: a DDL published since (`current() != base`) moved the version, and an engine conflict with an unmoved version is classified as any transaction's (`conflict_or_duplicate`). `DdlInProgress` is 40001.
+- **The doomed check** runs at the start of every statement (`as_statement`), SAVEPOINT and RELEASE included. A `SerializationFailure` in a transaction that had run DDL when the statement started aborts it; one that had run none ends it, as before.
+- **The 55006 rule** reads each open cursor's schema ref (`objects_read`, `tables_written`); a table's own indexes count as the table. It skips a DROP TABLE that a view depends on, which the catalog refuses with 2BP01. The server's portals count from stage 3, which runs DDL in a block.
+- **The private mark** is `StatementRecord::private_catalog`, and a private plan's record carries its transaction's base version (`TxnPlan::version_`). `Transaction::prepare` puts nothing in the shared cache: it opts out of stage 0's prepare of an unknown text at a live pin.
+- **25006** is tested on a follower; the embedded API has no READ ONLY transaction, and a READ ONLY block's 25006 is the server's, checked before the block's DDL refusal (`wire: test_ddl_in_a_begin_block_is_refused_and_fails_the_block`).
+- **Tests** are in `tests/api_txn_ddl_test.cpp` ("txn DDL: …"), and the runtime's in `tests/transaction_test.cpp`: the commit classification with two `LiveCatalog`s on one database, and the transaction's rows source. The allocation-failure sweep covers CREATE INDEX and ADD COLUMN … DEFAULT (the clone, the overlay writes, the backfill, the charge), a private compile after a DDL, ROLLBACK TO across a DDL (it allocates nothing) and the commit (whole or nothing).
+- **`sql_layer_bench`, before (stage 1) and after (stage 2), releasedbg, one run each:** `bc_ctx_run` of an empty plan 18.6 / 18.8 ns; point read, verify and map ids 39.8 / 39.4 ns; New-Order, verify and map ids 865.0 / 895.8 ns; `bc_col_i64` + `bc_add` 25.1 / 24.9 ns; nullable VARCHAR column 36.2 / 38.1 ns; Payment's `bc_update` 869.1 / 865.0 ns. Within the run-to-run variation stage 0 measured (about 15%): taking `cx->cat` from `txn->catalog` costs statements without DDL nothing the bench shows.
 
 **Stage 3: DDL in a server BEGIN block.**
 - Stage 3 lifts stage 2's 0A000 for explicit blocks. Routing is stage 0's; a Parse after the block's DDL fixes its record from the `TxnPlan`, at the block's base version, with the private mark.
@@ -1091,7 +1122,7 @@ Opened when the design is approved, as the repository's rules ask for deferred w
 
 **Risks**
 - **A private plan leaking into the shared cache** would run one transaction's catalog for everyone. A move-only `Compiled`, `TxnPlan` and `set_compiled`'s signature make this a compile error, and stage 0 tests that another session's description is unchanged; stage 2 tests it again for a private catalog.
-- **A private catalog reaching a version-keyed cache** would accept a plan built for other contents. `Published` and `TxnCatalog` are distinct types, and the version-keyed sites take `Published`.
+- **A private catalog reaching a version-keyed cache** would accept a plan built for other contents. `Published` and `TxnCatalog` are distinct types, and the transaction's version-keyed sites take `Published` (as built in the database module: *Stage 2 as built*).
 - **The namespace `01` invariant** lets a transaction drop the `EnsureAbsent` guards. A future catalog write that does not bump the version would break it; `nextval` is the known candidate. It is stated in catalog_design.md and asserted in `bc_txn_ddl`. Autocommit DDL keeps its guards, so it does not rely on the invariant.
 - **Compile cost.** In autocommit, one recompile per cached text after each DDL, any DDL, GRANT included, and one bind per call for a held `Statement` whose rebind keeps failing and for a server record whose types differ from the cache's; stage 0's PR shows `sql_layer_bench` before and after. In a transaction, a private compile per distinct text whose shared plan is not at its pin: every text when the pin is behind, and, with a live pin, each text no autocommit run has bound again since the last DDL. A text run only in transactions compiles privately in each of them after a DDL until an autocommit run rebinds it. After its own DDL, a transaction compiles each distinct statement privately, again after each DDL or ROLLBACK TO that changes its catalog; one that alternates DDL and DML across many texts pays a TCC compile per pair. All of it is bounded by the statements run, and private plans are charged to `max_bytes`.
 - **Cost of DDL with savepoints.** A savepoint before each DDL keeps one catalog clone per mark, O(catalog) each. This is charged to `max_bytes`, so it fails with 54000, not out of memory.

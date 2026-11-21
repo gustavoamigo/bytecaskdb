@@ -132,6 +132,21 @@ public:
   ~DdlInProgress() override;  // out of line: anchors the vtable (-Wweak-vtables)
 };
 
+// A backfill that passed the bytes it may gather (Catalog::next_version's
+// backfill_limit): the engine's 1 GiB batch in autocommit, the transaction's
+// bound in a transaction. Its table is the one being rewritten or indexed.
+class BackfillTooLarge : public std::length_error {
+public:
+  BackfillTooLarge(const std::string& what, std::string table) : std::length_error{what}, table_{std::move(table)} {}
+  BackfillTooLarge(const BackfillTooLarge&) = default;
+  BackfillTooLarge& operator=(const BackfillTooLarge&) = default;
+  ~BackfillTooLarge() override;  // out of line: anchors the vtable (-Wweak-vtables)
+  [[nodiscard]] auto table() const noexcept -> const std::string& { return table_; }
+
+private:
+  std::string table_;
+};
+
 // A commit whose batch failed and left the engine degraded, after the batch
 // may have reached the data file: whether it took effect is unknown, never
 // "nothing written". SQLSTATE 08007 at the API.
@@ -697,6 +712,22 @@ public:
   [[nodiscard]] auto next_version(const Ddl& ddl, const RowSource& rows, std::vector<DdlOp>& ops, bool& backfill,
                                   std::size_t backfill_limit) const -> std::shared_ptr<const Catalog>;
 
+  // What a copy of this catalog holds, as a transaction charges it to its
+  // bound (docs/transaction_design.md, *Mechanism: the transaction's private
+  // catalog*): kEstimateBase, then per table, column, index and other object
+  // its constant, plus the bytes of every name and definition. An estimate,
+  // not a measure: the constants are generous.
+  [[nodiscard]] auto estimated_bytes() const noexcept -> std::uint64_t;
+  static constexpr std::uint64_t kEstimateBase = 1024;
+  static constexpr std::uint64_t kEstimateTable = 1024;
+  static constexpr std::uint64_t kEstimateColumn = 256;
+  static constexpr std::uint64_t kEstimateIndex = 256;
+  static constexpr std::uint64_t kEstimateObject = 256;  // a view, procedure, role, type, sequence or ACL
+
+  // A view that depends on the table or view `id`, if any: what makes
+  // DROP of it 2BP01.
+  [[nodiscard]] auto find_view_dependent(std::uint32_t id) const -> const View*;
+
 private:
   friend class LiveCatalog;
 
@@ -705,7 +736,6 @@ private:
   void put_table(Table t);
   void erase_table(std::uint32_t id);
   void rebuild_lookups();
-  [[nodiscard]] auto find_view_dependent(std::uint32_t id) const -> const View*;
 
   std::uint64_t next_id_{1};
   std::uint64_t version_{0};
@@ -782,6 +812,14 @@ public:
 
   static constexpr int kDdlAttempts = 3;
 
+  // The catalog version the engine holds now, read from its latest state:
+  // what a commit that conflicted reads to tell a DDL published since from
+  // a duplicate key. Throws as the engine's reads throw.
+  [[nodiscard]] auto head_version() const -> std::uint64_t;
+  // The bytes a backfill may gather: the engine's 1 GiB batch, unless a
+  // test set less.
+  [[nodiscard]] auto backfill_limit() const noexcept -> std::size_t { return backfill_limit_; }
+
   // The next row id of `t`, a table whose primary key is its hidden row id:
   // one past every id it has handed out, which starts one past the
   // greatest id the engine holds for the table (from 1 for none). Ids are
@@ -823,6 +861,9 @@ private:
   std::map<std::uint32_t, std::int64_t> row_ids_;
 };
 
+// The key of the catalog version counter, which every DDL that changes the
+// catalog writes, and which a transaction with DDL guards at its commit.
+[[nodiscard]] auto catalog_version_key() -> Bytes;
 // The catalog record's key and a table's row-key range: for tests and tools.
 [[nodiscard]] auto table_record_key(std::uint32_t table_id) -> Bytes;
 [[nodiscard]] auto view_record_key(std::uint32_t view_id) -> Bytes;
@@ -1123,9 +1164,10 @@ public:
   void charge(std::size_t bytes) {
     used_ += bytes;
     if (used_ > limit_) {
-      throw std::length_error("backfill of table \"" + table_ +
-                              "\" does not fit the engine's 1 GiB batch; create indexes and columns with defaults "
-                              "before loading the table (#505)");
+      throw BackfillTooLarge("backfill of table \"" + table_ +
+                                 "\" does not fit the engine's 1 GiB batch; create indexes and columns with defaults "
+                                 "before loading the table (#505)",
+                             table_);
     }
   }
 
@@ -1214,6 +1256,7 @@ void SnapshotRows::scan(BytesView prefix, const std::function<void(BytesView, By
   for_each_in_prefix(snap_, prefix, visit);
 }
 DdlInProgress::~DdlInProgress() = default;
+BackfillTooLarge::~BackfillTooLarge() = default;
 CommitOutcomeUnknown::~CommitOutcomeUnknown() = default;
 auto CommitOutcomeUnknown::what() const noexcept -> const char* {
   return "the commit's outcome is unknown: it failed after its batch may have reached the data file";
@@ -2359,6 +2402,23 @@ void Catalog::rebuild_lookups() {
   }
 }
 
+auto Catalog::estimated_bytes() const noexcept -> std::uint64_t {
+  auto out = kEstimateBase;
+  for (const auto& [id, t] : tables_) {
+    out += kEstimateTable + t.name.size();
+    for (const auto& c : t.columns) out += kEstimateColumn + c.name.size();
+    for (const auto& ix : t.indexes) out += kEstimateIndex + ix.name.size();
+    for (const auto& ch : t.checks) out += kEstimateObject + ch.name.size() + ch.expr.size();
+  }
+  for (const auto& [id, v] : views_) out += kEstimateObject + v.name.size() + v.definition.size();
+  for (const auto& [id, p] : procedures_) out += kEstimateObject + p.name.size() + p.definition.size();
+  for (const auto& [id, r] : roles_) out += kEstimateObject + r.name.size();
+  for (const auto& [id, t] : types_) out += kEstimateObject + t.name.size();
+  for (const auto& [id, s] : sequences_) out += kEstimateObject + s.name.size();
+  for (const auto& [id, acl] : acls_) out += kEstimateObject + acl.size() * sizeof(AclEntry);
+  return out;
+}
+
 auto Catalog::table(std::string_view name) const -> const Table* {
   auto it = names_.find(name);
   if (it == names_.end()) return nullptr;
@@ -3165,6 +3225,10 @@ LiveCatalog::LiveCatalog(DB& db) : db_{db} {
 }
 
 auto LiveCatalog::current() const -> std::shared_ptr<const Catalog> { return current_.load(); }
+
+auto LiveCatalog::head_version() const -> std::uint64_t { return snapshot_version(db_.snapshot()); }
+
+auto catalog_version_key() -> Bytes { return counter_key(kCounterVersion); }
 
 auto LiveCatalog::next_row_id(const Table& t) -> std::int64_t {
   constexpr auto kLast = std::numeric_limits<std::int64_t>::max();  // never handed out: next would overflow

@@ -422,7 +422,10 @@ statement the session runs at `Execute`.
   a `Query` runs it with `Database::execute`, which commits it alone. An
   `Execute` runs it in the block's implicit transaction (*Extended
   query*).
-- DDL inside a transaction is the layer's `0A000`.
+- DDL inside a `BEGIN` block is the layer's `0A000`, refused by the session
+  before it reaches the block's `Transaction`, which runs DDL in the
+  embedded API (`transaction_design.md`, *Transactional DDL*, stage 2);
+  stage 3 lifts it.
 - Results: `RowDescription` (for a row-returning statement), one `DataRow`
   per row, then `CommandComplete`. The tag comes from the statement's
   command (*What it uses from the embedded API*, 3):
@@ -630,8 +633,10 @@ semantics. If the stream ends instead, the statement does not run: no
 A `BEGIN` inside the block makes it explicit, as PostgreSQL does: the open
 `Transaction` carries on past `Sync` until `COMMIT` or `ROLLBACK`.
 
-DDL is its own atomic operation in the layer and cannot run in a
-`Transaction`.
+The server runs DDL only as its own atomic operation: it refuses DDL in a
+block of two or more statements, and in a `BEGIN` block until stage 3 of
+transactional DDL (transaction_design.md), though the embedded
+`Transaction` runs DDL.
 - A DDL that is its block's only statement (the next message is `Sync`)
   runs alone through `Database::execute`, as a simple `Query` does.
 - A DDL in a block of two or more is `0A000`. If it opens the block,
