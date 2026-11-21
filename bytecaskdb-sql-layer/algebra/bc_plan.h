@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
    Copyright (c) 2026 Gustavo Amigo
 
-   bc_plan.h — the plan API of docs/plan_api_design.md (revision 16). A plan is
+   bc_plan.h — the plan API of docs/plan_api_design.md (revision 17). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
    and bc_params are opaque here and built by the runtime
@@ -490,6 +490,15 @@ bool      bc_agg_null(bc_ctx *, bc_group, uint32_t slot);   /* no value folded i
 
 /* Writes: rows, with every index entry the runtime derives from them */
 void bc_insert(bc_ctx *, uint32_t table, bc_view row);
+/* INSERT … ON CONFLICT DO NOTHING: the row, inserted as bc_insert inserts it, unless its key under
+   `arbiter` is taken, when nothing is written and it returns false. `arbiter` is the table (its
+   primary key), one of its unique indexes, or BC_ARBITER_ANY (the primary key and every unique
+   index); a named one stands for every unique key over its columns, as a set. Taken: a row this execution wrote has the key, or the view holds it and this execution
+   did not vacate it. Deciding records nothing, and an arbiter key the row takes is no insert
+   claim: a concurrent commit of the key is BC_CONFLICT. A key of another unique index is checked
+   as bc_insert checks it (BC_C_UNIQUE). False, too, once an error is set. */
+#define BC_ARBITER_ANY UINT32_C(0xFFFFFFFF)
+bool bc_insert_on_conflict(bc_ctx *, uint32_t table, bc_view row, uint32_t arbiter);
 void bc_update(bc_ctx *, uint32_t table, bc_view old, bc_view row);
 void bc_delete(bc_ctx *, uint32_t table, bc_view old);
 void bc_del_range(bc_ctx *, uint32_t table, bc_view lo, bc_view hi);

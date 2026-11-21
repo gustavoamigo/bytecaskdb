@@ -322,6 +322,13 @@ struct Insert {
   std::vector<Expr> returning;  // RETURNING's list, empty for none
   // INSERT … SELECT: the query whose rows are written, in place of VALUES.
   std::shared_ptr<const Select> query;
+  // ON CONFLICT DO NOTHING: the columns its target names, empty for a
+  // conflict on any unique constraint.
+  struct OnConflict {
+    std::vector<std::string> columns;
+    std::int32_t pos{-1};
+  };
+  std::optional<OnConflict> on_conflict;
 };
 
 

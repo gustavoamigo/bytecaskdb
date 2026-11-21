@@ -4609,3 +4609,71 @@ TEST_CASE("embedded API: a LEFT JOIN sorted by its right side, its lookup by key
   CHECK(db->execute("SELECT t1.c2, count(*) FROM t3 LEFT JOIN t1 ON t1.c2 = 7 AND t1.c1 = t3.c0 GROUP BY t1.c2 ORDER BY 1")
             .rows == Grid{{i(7), i(2)}, {kNull, i(1)}});
 }
+
+TEST_CASE("embedded API: INSERT … ON CONFLICT DO NOTHING skips a row whose arbiter key is taken", "[sql][api]") {
+  sql_test::TempDir dir{"api_on_conflict"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE oc (id INTEGER PRIMARY KEY, v INTEGER UNIQUE, w INTEGER NOT NULL, CHECK (w > 0))");
+  (void)db->execute("INSERT INTO oc VALUES ($1, $2, $3)", {i(1), i(10), i(1)});
+  auto affected = [&](const std::string& sql) { return db->execute(sql).affected; };
+  auto state = [&](const std::string& sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  // No target: any unique key.
+  CHECK(affected("INSERT INTO oc VALUES (1, 11, 1) ON CONFLICT DO NOTHING") == 0);
+  CHECK(affected("INSERT INTO oc VALUES (2, 10, 1) ON CONFLICT DO NOTHING") == 0);
+  // A target names the arbiter, as a set of columns; another key's duplicate is 23505.
+  CHECK(affected("INSERT INTO oc VALUES (1, 11, 1) ON CONFLICT (id) DO NOTHING") == 0);
+  CHECK(affected("INSERT INTO oc VALUES (2, 10, 1) ON CONFLICT (v) DO NOTHING") == 0);
+  CHECK(affected("INSERT INTO oc VALUES (1, 10, 1) ON CONFLICT (id, id) DO NOTHING") == 0);
+  CHECK(state("INSERT INTO oc VALUES (2, 10, 1) ON CONFLICT (id) DO NOTHING") == "23505");
+  CHECK(state("INSERT INTO oc VALUES (1, 11, 1) ON CONFLICT (v) DO NOTHING") == "23505");
+  // NOT NULL and CHECK come first.
+  CHECK(state("INSERT INTO oc VALUES (1, 10, NULL) ON CONFLICT DO NOTHING") == "23502");
+  CHECK(state("INSERT INTO oc VALUES (1, 10, -1) ON CONFLICT DO NOTHING") == "23514");
+  // The count and RETURNING are the rows written; a later row of the
+  // statement skips on an earlier one's key.
+  auto r = db->execute("INSERT INTO oc VALUES (5, 50, 1), (5, 51, 1), (6, 50, 1) ON CONFLICT DO NOTHING RETURNING id, v");
+  CHECK(r.affected == 1);
+  CHECK(r.rows == Grid{{i(5), i(50)}});
+  CHECK(affected("INSERT INTO oc SELECT id + 100, v, w FROM oc ON CONFLICT (v) DO NOTHING") == 0);
+  CHECK(affected("INSERT INTO oc SELECT id + 100, v + 100, w FROM oc ON CONFLICT DO NOTHING") == 2);
+  CHECK(ids(db->execute("SELECT id FROM oc ORDER BY id")) == std::vector<std::int64_t>{1, 5, 101, 105});
+  // Parameters, through a cached plan.
+  for (auto v : {std::int64_t{7}, std::int64_t{7}}) {
+    (void)db->execute("INSERT INTO oc VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", {i(v), i(v), i(1)});
+  }
+  CHECK(db->execute("INSERT INTO oc VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", {i(7), i(70), i(1)}).affected == 0);
+  // Refused: no constraint matches (42P10), an unknown column (42703), and
+  // the forms not built yet (0A000).
+  CHECK(state("INSERT INTO oc VALUES (1, 10, 1) ON CONFLICT (w) DO NOTHING") == "42P10");
+  CHECK(state("INSERT INTO oc VALUES (1, 10, 1) ON CONFLICT (id, v) DO NOTHING") == "42P10");
+  CHECK(state("INSERT INTO oc VALUES (1, 10, 1) ON CONFLICT (zz) DO NOTHING") == "42703");
+  CHECK(state("INSERT INTO oc VALUES (1, 10, 1) ON CONFLICT ON CONSTRAINT oc_pkey DO NOTHING") == "0A000");
+  CHECK(state("INSERT INTO oc VALUES (1, 10, 1) ON CONFLICT (id) WHERE id > 0 DO NOTHING") == "0A000");
+  CHECK(state("INSERT INTO oc VALUES (1, 10, 1) ON CONFLICT ((id + 1)) DO NOTHING") == "0A000");
+  CHECK(state("INSERT INTO oc VALUES (1, 10, 1) ON CONFLICT (id) DO UPDATE SET v = 1") == "0A000");
+  (void)db->execute("CREATE VIEW ocv AS SELECT id, v, w FROM oc");
+  CHECK(state("INSERT INTO ocv VALUES (1, 10, 1) ON CONFLICT DO NOTHING") == "0A000");
+  (void)db->execute("CREATE PROCEDURE ocp() LANGUAGE plpgsql AS $$ BEGIN INSERT INTO oc VALUES (1, 10, 1) ON CONFLICT DO "
+                    "NOTHING; END $$");
+  try {
+    (void)db->call("ocp", {});
+    FAIL("ON CONFLICT ran in a procedure");
+  } catch (const std::exception& e) {
+    CHECK(sqlstate(e) == "0A000");
+  }
+  // A table without a primary key: its unique index is the only arbiter.
+  (void)db->execute("CREATE TABLE ocn (a INTEGER, b INTEGER)");
+  CHECK(affected("INSERT INTO ocn VALUES (1, 1) ON CONFLICT DO NOTHING") == 1);
+  CHECK(affected("INSERT INTO ocn VALUES (1, 1) ON CONFLICT DO NOTHING") == 1);
+  CHECK(state("INSERT INTO ocn VALUES (1, 1) ON CONFLICT (a) DO NOTHING") == "42P10");
+  (void)db->execute("DELETE FROM ocn WHERE b = 1");
+  (void)db->execute("CREATE UNIQUE INDEX ocn_a ON ocn (a)");
+  CHECK(affected("INSERT INTO ocn VALUES (1, 1), (1, 2) ON CONFLICT (a) DO NOTHING") == 1);
+}

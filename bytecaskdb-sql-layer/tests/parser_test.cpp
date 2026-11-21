@@ -930,3 +930,30 @@ TEST_CASE("parser: INSERT … SELECT reads a query in place of VALUES", "[sql][p
   CHECK(u.query->set != nullptr);
   CHECK(!std::get<Insert>(parse("INSERT INTO t VALUES (1)")).query);
 }
+
+TEST_CASE("parser: ON CONFLICT DO NOTHING keeps its target's columns; the other forms are 0A000 or 42P10", "[sql][parser]") {
+  auto any = std::get<Insert>(parse("INSERT INTO t VALUES ($1) ON CONFLICT DO NOTHING"));
+  REQUIRE(any.on_conflict);
+  CHECK(any.on_conflict->columns.empty());
+  auto cols = std::get<Insert>(parse("INSERT INTO t SELECT a, b FROM u ON CONFLICT (b, a) DO NOTHING"));
+  REQUIRE(cols.on_conflict);
+  CHECK(cols.on_conflict->columns == std::vector<std::string>{"b", "a"});
+  CHECK_FALSE(std::get<Insert>(parse("INSERT INTO t VALUES ($1)")).on_conflict);
+  auto state = [](std::string_view s) -> std::string {
+    try {
+      (void)parse(s);
+    } catch (const SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return "accepted";
+  };
+  CHECK(state("INSERT INTO t VALUES (1) ON CONFLICT (a) DO UPDATE SET b = 1") == "0A000");
+  CHECK(state("INSERT INTO t VALUES (1) ON CONFLICT ON CONSTRAINT t_pkey DO NOTHING") == "0A000");
+  CHECK(state("INSERT INTO t VALUES (1) ON CONFLICT (a) WHERE a > 0 DO NOTHING") == "0A000");
+  CHECK(state("INSERT INTO t VALUES (1) ON CONFLICT ((a + 1)) DO NOTHING") == "0A000");
+  CHECK(state("INSERT INTO t VALUES (1) ON CONFLICT (a COLLATE \"C\") DO NOTHING") == "0A000");
+  // An ordering on a target column is PostgreSQL's 42P10.
+  CHECK(state("INSERT INTO t VALUES (1) ON CONFLICT (a DESC) DO NOTHING") == "42P10");
+  CHECK(state("INSERT INTO t VALUES (1) ON CONFLICT (a ASC) DO NOTHING") == "42P10");
+  CHECK(state("INSERT INTO t VALUES (1) ON CONFLICT (a NULLS FIRST) DO NOTHING") == "42P10");
+}

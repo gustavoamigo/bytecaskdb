@@ -276,19 +276,26 @@ struct Limit {
 // `checks` are the table's CHECK constraints over the row as written, each
 // a BOOLEAN over the table's columns and constants: the row is refused
 // (23514) where one is false, and accepted where it is true or NULL.
+//
+// `arbiter` is ON CONFLICT DO NOTHING's: a row whose key under it is taken
+// is skipped (bc_insert_on_conflict). The table's id (its primary key), a
+// unique index's, or kAnyArbiter.
+inline constexpr std::uint32_t kAnyArbiter = 0xFFFFFFFF;  // BC_ARBITER_ANY
+
 struct Insert {
   const Table* table{nullptr};
   std::vector<std::vector<std::optional<Expr>>> rows;  // VALUES' rows, written in order
   std::vector<Expr> checks;
   std::vector<Output> returning;  // RETURNING's: a row of these per row written, over the row as written
+  std::optional<std::uint32_t> arbiter;
 };
 
 // INSERT … SELECT: each row the input gives, a SELECT's rows (a Project
 // under any Sort and Limit), written as one row of the table: its i-th
 // column into columns[i], each of a type the binder checked it assigns to;
 // `fixed` sets a column left out to a parameter (a DEFAULT of the clock),
-// and the rest keep the default bc_row_begin writes. `checks` and
-// `returning` are as Insert's.
+// and the rest keep the default bc_row_begin writes. `checks`,
+// `returning` and `arbiter` are as Insert's.
 struct InsertFrom {
   NodePtr input;
   const Table* table{nullptr};
@@ -296,6 +303,7 @@ struct InsertFrom {
   std::vector<std::pair<ColumnRef, Expr>> fixed;
   std::vector<Expr> checks;
   std::vector<Output> returning;
+  std::optional<std::uint32_t> arbiter;
 };
 
 // Each row the input gives, written: its set columns from expressions of
