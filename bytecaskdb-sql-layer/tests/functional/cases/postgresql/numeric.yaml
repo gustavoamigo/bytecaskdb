@@ -60,10 +60,8 @@
   teardown:
     - DROP TABLE n
 
-- name: two columns of the same type compared
+- name: an integer column at least a DOUBLE column of its row
   features: [E011-05]
-  # WHERE must compare a column with a parameter or a constant
-  unimplemented: true
   setup:
     - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
   steps:
@@ -84,8 +82,6 @@
 
 - name: an integer column compared with a DOUBLE column
   features: [E011-06]
-  # WHERE must compare a column with a parameter or a constant
-  unimplemented: true
   setup:
     - CREATE TABLE n (id INTEGER PRIMARY KEY, i INTEGER, f DOUBLE PRECISION, d DECIMAL(6,2))
   steps:

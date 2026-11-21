@@ -277,8 +277,8 @@ kind the transformer doesn't take is refused with its position.
   grammar allows it nowhere else.
 
 **`WHERE`** is a conjunction (`AND`) of comparisons (`=`, `<`, `<=`, `>`,
-`>=`) of a column with a parameter, a constant or `$n ± k`, in any order,
-on any columns, and of predicates over them.
+`>=`) of a column with a parameter, a constant, `$n ± k` or another column,
+in any order, on any columns, and of predicates over them.
 - A comparison with NULL is not true, so it rejects the row, as in SQL's
   three-valued logic.
 - **Predicates:** `AND`, `OR` and `NOT` of comparisons and of `col IS [NOT]
@@ -300,6 +300,19 @@ on any columns, and of predicates over them.
   *Filters on DOUBLE and REAL columns*). A REAL compares the float its
   operand rounds to, as PostgreSQL types it float4: `real_col = $1` with
   0.1 matches the row written with 0.1, and so does `real_col = '0.1'`.
+- **Two columns of one table compared** (`WHERE i > f`, in an `ON`, an
+  `UPDATE` or a `DELETE`, under `AND`, `OR` and `NOT`) filter its rows; they
+  never bound a key (`planner_design.md`, *The pipeline*). The pair is of
+  one compared type (`VARCHAR` or `CHAR(n)` with `TEXT`, a `DECIMAL` of
+  scale 0 with a `BIGINT`), two integers of any width, two floats, or an
+  integer with a `REAL` or `DOUBLE PRECISION`, compared as float8 as
+  PostgreSQL casts the integer: a `BIGINT` past 2^53 rounds, NaN is above
+  every number. Not yet (42601): a `DECIMAL` with another scale or another
+  number (the comparison does not rescale), a `CHAR(n)` with a `VARCHAR`
+  (PostgreSQL compares those as bpchar, both sides' trailing spaces
+  ignored), a `DATE` with a timestamp of either kind, a `TIMESTAMP` with
+  a `TIMESTAMPTZ`. A pair PostgreSQL has no operator for is its 42883,
+  `operator does not exist: text = integer`, the operator as written.
 - **A boolean constant:** `TRUE`, `FALSE` or `NULL` as a conjunct of a
   `WHERE` or an `ON`, or inside its `AND`, `OR` and `NOT`
   (`ast::Compare::Kind::Const`). The binder makes it a BOOLEAN constant,
@@ -348,8 +361,10 @@ on any columns, and of predicates over them.
   query around it (correlated), one inside another, in `FROM`, `FOR UPDATE`
   in one, one of `AVG`, assigned by `SET` or `VALUES`, beside an aggregate,
   or compared with other than a column.
-- Comparing two columns of different SQL types is refused (*Known
-  differences*).
+- Comparing two columns of different SQL types in a join is refused
+  (42601, *Known differences*), but for a pair PostgreSQL has no operator
+  for, which is its 42883 as for two columns of one table (see above), in
+  an `ON`, a `WHERE`, `USING` or `NATURAL`.
 
 **`ORDER BY`, `LIMIT` and `OFFSET`.**
 - `ORDER BY` takes a list of columns, each `ASC` or `DESC`, and `NULLS
@@ -997,9 +1012,14 @@ fail on them.
   22001; checked on 16.15). A DEFAULT that is not UTF-8 never reaches
   either: PostgreSQL refuses the statement's text (22021). The machine's
   defaults stay inside their types.
-- **Comparing columns of different SQL types is refused,** in a `WHERE` and
-  in a join; PostgreSQL casts one to the other's. One key encoding serves
-  each comparison. TPROC-C compares columns of one type only.
+- **Comparing columns of two tables of different SQL types is refused,**
+  in a `WHERE` and in a join, where PostgreSQL casts one to the other's
+  (42601; a pair PostgreSQL has no operator for is its 42883). One key
+  encoding serves each join comparison. A `CHAR(n)` with a `VARCHAR` is
+  refused too, in a join and in one table: PostgreSQL compares the two as
+  bpchar. Two columns of one table compare across the numeric types above
+  (*`WHERE`*); joining them is #823. TPROC-C compares columns of one type
+  only.
 - **A parameter used with columns of two SQL types is refused** (*Binding*).
   `WHERE a = $1 AND b = $1`, with `a DOUBLE PRECISION` and `b REAL`,
   `INTEGER` and `BIGINT`, or `DECIMAL`s of two scales, is refused, and so

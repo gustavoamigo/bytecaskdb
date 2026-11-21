@@ -157,18 +157,17 @@ TEST_CASE("search: a shape it does not plan is refused with no plan, never a var
   auto two_columns = project(filter(get(t), {logical::compare(Op::Eq, col(t, "id"), p(0)),
                                              logical::compare(Op::Eq, col(t, "qty"), col(t, "id"))}),
                              {col(t, "id")});
-  CHECK(refusal(f.cat(), std::move(two_columns), 1) == "no plan: a conjunct on t compares two columns outside a join");
+  CHECK(refusal(f.cat(), std::move(two_columns), 1) == "accepted");  // a filter of t's rows
   // A column of another table outside the join's predicate: it is not on
   // either side of a join, so never usable on t's Filter.
   auto stray = project(filter(get(t), {logical::compare(Op::Eq, col(t, "id"), p(0)),
                                        logical::compare(Op::Eq, col(t, "qty"), col(u, "k"))}),
                        {col(t, "id")});
   CHECK(refusal(f.cat(), std::move(stray), 1, false) == "no plan: a conjunct on t compares two columns outside a join");
-  // A join conjunct whose columns are both of one side.
+  // A join conjunct whose columns are both of one side: a filter of that side's rows.
   auto one_side = project(logical::node(logical::Join{get(t), get(u), {logical::compare(Op::Eq, col(t, "qty"), col(t, "id"))}}),
                           {col(u, "v")});
-  CHECK(refusal(f.cat(), std::move(one_side), 0, false) ==
-        "no plan: a join conjunct that does not compare a column of each side");
+  CHECK(refusal(f.cat(), std::move(one_side), 0, false) == "accepted");
   // A result column of a table the statement does not read.
   auto foreign = project(filter(get(t), {logical::compare(Op::Eq, col(t, "id"), p(0))}), {col(u, "v")});
   CHECK(refusal(f.cat(), std::move(foreign), 1) ==

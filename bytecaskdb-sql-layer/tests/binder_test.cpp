@@ -195,7 +195,9 @@ TEST_CASE("binder: anything outside the scope is rejected with a message and pos
   CHECK(rejected(cat, "SELECT CAST('a' AS CHAR(5))").first.find("CHAR(n)") != std::string::npos);
   // No primary key: the catalog gives the table a row id.
   CHECK(std::get<CreateTableDdl>(std::get<Ddl>(bind_sql(cat, "CREATE TABLE u (k BIGINT)").stmt)).pk.empty());
-  CHECK(rejected(cat, "SELECT id FROM t WHERE id = qty").first == "WHERE must compare a column with a parameter or a constant");
+  CHECK(rejected(cat, "SELECT id FROM t WHERE id = $1 + qty").first == "WHERE must compare a column with a parameter or a constant");
+  // Two columns of one table PostgreSQL has no operator for: its message, the operator as written.
+  CHECK(rejected(cat, "SELECT id FROM t WHERE name <> qty").first == "operator does not exist: bytea <> bigint");
 }
 
 TEST_CASE("binder: an assigned constant out of its column's type is refused, the first in column order", "[sql][binder]") {
@@ -687,8 +689,7 @@ TEST_CASE("binder: OR, NOT, IS NULL, <>, BETWEEN and IN are predicates over comp
   CHECK(conjuncts("qty = (SELECT MAX(qty) FROM t)") == V{"CMP"});
   CHECK(conjuncts("id = $1 AND NOT (qty = 1 OR name IS NULL)") == V{"CMP", "NOT(OR(CMP,ISNULL))"});
   // Each comparison in a tree is a WHERE's: typed, folded, refused alike.
-  CHECK(rejected(cat, "SELECT id FROM t WHERE qty = 1 OR qty = id").first ==
-        "WHERE must compare a column with a parameter or a constant");
+  CHECK(conjuncts("qty = 1 OR qty = id") == V{"OR(CMP,CMP)"});
   CHECK(rejected(cat, "SELECT id FROM t WHERE qty = $1 + 1 OR id = 2").first ==
         "$n + k and $n - k inside AND, OR or NOT is not supported yet");
   CHECK(rejected(cat, "SELECT id FROM t WHERE 1 IS NULL").first == "IS NULL of other than a column is not supported yet");
@@ -1128,8 +1129,11 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
   }
   CHECK(rejected(cat, "SELECT id FROM t, u WHERE id = k AND qty = id").first ==
         "column reference \"qty\" is ambiguous");
-  CHECK(rejected(cat, "SELECT id FROM t, u WHERE t.id = t.qty").first ==
-        "comparing two columns of one table is not supported yet");
+  {
+    // Two columns of one table: a comparison of the two, a filter of its rows.
+    auto b = bind_sql(cat, "SELECT id FROM t, u WHERE t.id = t.qty");
+    CHECK(std::holds_alternative<logical::NodePtr>(b.stmt));
+  }
   {
     // Any comparison of a column of each table joins them, as = does.
     auto b = bind_sql(cat, "SELECT id FROM t, u WHERE id < k");
@@ -1140,8 +1144,8 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
     CHECK(on[0].args[0].col.table == cat.table("t")->id);
     CHECK(on[0].args[1].col.table == cat.table("u")->id);
   }
-  CHECK(rejected(cat, "SELECT id FROM t, u WHERE name = k").first ==
-        "comparing name (bytea) with k (bigint) is not supported: a join compares columns of one type");
+  CHECK(rejected(cat, "SELECT id FROM t, u WHERE name = k").first == "operator does not exist: bytea = bigint");
+  CHECK(rejected(cat, "SELECT id FROM t, u WHERE k > name").first == "operator does not exist: bigint > bytea");
   CHECK(rejected(cat, "SELECT u.qty, count(*) FROM t, u WHERE id = k").first ==
         "column \"u.qty\" must appear in the GROUP BY clause or be used in an aggregate function");
   CHECK(rejected(cat, "SELECT id FROM t JOIN u ON id = $1 + k WHERE k = $2").first ==
@@ -1164,6 +1168,7 @@ TEST_CASE("binder: each refusal carries PostgreSQL's SQLSTATE", "[sql][binder][s
                                "CREATE TABLE u (k BIGINT PRIMARY KEY, qty BIGINT, d NUMERIC(10, 2), dbl DOUBLE PRECISION, "
                                "s TEXT, ok BOOLEAN, tm TIME, ts TIMESTAMP)")
                         .stmt));
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE w (k BIGINT PRIMARY KEY, v VARCHAR(4), c CHAR(4), t TEXT)").stmt));
   const auto& cat = f.cat();
   auto state = [&](std::string_view sql) -> std::string {
     try {
@@ -1223,7 +1228,28 @@ TEST_CASE("binder: each refusal carries PostgreSQL's SQLSTATE", "[sql][binder][s
   CHECK(state("SELECT min(s) FROM u WHERE k = $1") == "42601");
   CHECK(state("SELECT sum(tm) FROM u WHERE k = $1") == "42601");  // an interval sum there
   CHECK(state("SELEC 1") == "42601");
-  CHECK(state("SELECT id FROM t WHERE id = qty") == "42601");
+  // Two columns of one table: of one compared type, two numbers of no
+  // DECIMAL, or an integer with a DOUBLE; DECIMAL with another number, not
+  // yet; a pair PostgreSQL has no operator for, 42883.
+  CHECK(state("SELECT id FROM t WHERE id = qty") == "bound");
+  CHECK(state("SELECT k FROM u WHERE qty < dbl") == "bound");
+  CHECK(state("SELECT k FROM u WHERE dbl <> k") == "bound");
+  CHECK(state("SELECT k FROM u WHERE d = qty") == "42601");
+  CHECK(state("SELECT k FROM u WHERE ts = s") == "42883");
+  CHECK(state("SELECT k FROM u WHERE ts > tm") == "42883");
+  CHECK(state("SELECT k FROM u WHERE ok = qty OR k = $1") == "42883");
+  // The same pairs across two tables, in a WHERE, an ON or USING: 42883 too;
+  // two numbers of different types joined, which PostgreSQL relates, not yet (#823).
+  CHECK(state("SELECT a.k FROM u a JOIN w b ON a.s = b.k") == "42883");
+  CHECK(state("SELECT a.k FROM u a, u b WHERE a.ts <> b.s") == "42883");
+  CHECK(state("SELECT a.k FROM u a JOIN u b ON a.ts > b.tm OR a.k = b.k") == "42883");
+  CHECK(state("SELECT k FROM t JOIN u USING (qty)") == "bound");
+  CHECK(state("SELECT a.k FROM u a JOIN u b ON a.qty = b.dbl") == "42601");
+  // A CHAR(n) with a VARCHAR, which PostgreSQL compares as bpchar: not yet, of one table or joined.
+  CHECK(state("SELECT k FROM w WHERE v = c") == "42601");
+  CHECK(state("SELECT a.k FROM w a JOIN w b ON a.v = b.c") == "42601");
+  CHECK(state("SELECT a.k FROM w a JOIN w b ON a.c = b.v OR a.k = b.k") == "42601");
+  CHECK(state("SELECT k FROM w WHERE c = t AND v < t") == "bound");
   CHECK(state("CREATE TABLE u2 (k BIGINT PRIMARY KEY, v TIMESTAMPTZ)") == "bound");
   CHECK(state("CREATE TABLE u3 (k BIGINT PRIMARY KEY, v TIME WITH TIME ZONE)") == "42601");
 }
