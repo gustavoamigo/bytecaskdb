@@ -1096,6 +1096,198 @@ auto create_p(std::string name = "p", bool replace = false, std::string body = "
 
 }  // namespace
 
+namespace {
+auto grant(std::vector<std::string> objects, std::vector<std::string> grantees, std::vector<GrantDdl::Privilege> privileges = {},
+           bool option = false) -> GrantDdl {
+  return GrantDdl{true, option, std::move(privileges), std::move(objects), std::move(grantees), std::nullopt};
+}
+auto revoke(std::vector<std::string> objects, std::vector<std::string> grantees, std::vector<GrantDdl::Privilege> privileges = {},
+            bool option_only = false) -> GrantDdl {
+  return GrantDdl{false, option_only, std::move(privileges), std::move(objects), std::move(grantees), std::nullopt};
+}
+auto refused_state(LiveCatalog& live, const Ddl& ddl) -> std::string {
+  try {
+    (void)live.apply(ddl);
+  } catch (const DdlRefused& e) {
+    return std::string{e.sqlstate()};
+  }
+  return {};
+}
+}  // namespace
+
+TEST_CASE("catalog: roles and privileges are records of their own, survive a reopen, and go with their objects",
+          "[sql][catalog][roles]") {
+  sql_test::TempDir dir{"catalog_roles"};
+  namespace pv = privilege;
+  std::uint32_t t_id = 0, r1 = 0, r2 = 0;
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    (void)live.apply(create_t());
+    t_id = live.current()->table("t")->id;
+    (void)live.apply(CreateRoleDdl{"r1"});
+    (void)live.apply(CreateRoleDdl{"r2"});
+    r1 = live.current()->role("r1")->id;
+    r2 = live.current()->role("r2")->id;
+    CHECK(r2 > r1);
+    CHECK(r1 > t_id);  // one id counter
+    // A namespace of its own: a role and a table may share a name.
+    (void)live.apply(CreateRoleDdl{"t"});
+    CHECK(refused_state(live, CreateRoleDdl{"r1"}) == "42710");
+    CHECK(refused_state(live, CreateRoleDdl{"public"}) == "42939");
+    CHECK(refused_state(live, CreateRoleDdl{"pg_x"}) == "42939");
+    // PostgreSQL's order: the object, the grantees, the grantor, the privileges, their columns.
+    CHECK(refused_state(live, grant({"nope"}, {"nope"})) == "42P01");
+    CHECK(refused_state(live, grant({"t"}, {"nope"}, {{"usage", {}}})) == "42704");
+    auto by_other = grant({"t"}, {"r1"});
+    by_other.grantor = "r2";
+    CHECK(refused_state(live, by_other) == "0A000");
+    by_other.grantor = "nope";
+    CHECK(refused_state(live, by_other) == "42704");
+    CHECK(refused_state(live, grant({"t"}, {"r1"}, {{"usage", {}}})) == "0LP01");
+    CHECK(refused_state(live, grant({"t"}, {"r1"}, {{"under", {}}})) == "42601");
+    CHECK(refused_state(live, grant({"t"}, {"r1"}, {{"delete", {"qty"}}})) == "0LP01");
+    CHECK(refused_state(live, grant({"t"}, {"r1"}, {{"select", {"nope"}}})) == "42703");
+    CHECK(refused_state(live, grant({"t"}, {"r1", ""}, {}, true)) == "0LP01");  // a grant option to PUBLIC
+    CHECK(live.current()->acl(t_id).empty());  // nothing of a refused one
+    // ALL on the table; SELECT and UPDATE of one column, with the grant option; PUBLIC.
+    (void)live.apply(grant({"t"}, {"r1", ""}, {{"all", {}}}));
+    (void)live.apply(grant({"t", "t"}, {"r2"}, {{"select", {"qty"}}, {"update", {"qty", "name"}}}, true));
+    auto acl = live.current()->acl(t_id);
+    auto qty = live.current()->table("t")->column("qty")->id;
+    auto name = live.current()->table("t")->column("name")->id;
+    CHECK(std::vector<AclEntry>(acl.begin(), acl.end()) ==
+          std::vector<AclEntry>{{r2, name, pv::kUpdate, pv::kUpdate, kBootstrapRole},
+                                {r2, qty, pv::kSelect | pv::kUpdate, pv::kSelect | pv::kUpdate, kBootstrapRole},
+                                {kPublic, kWholeObject, pv::kAll, 0, kBootstrapRole},
+                                {r1, kWholeObject, pv::kAll, 0, kBootstrapRole}});
+    // A role that holds a privilege is not dropped (2BP01), nor any of a list with it.
+    CHECK(refused_state(live, DropRoleDdl{{"r1"}}) == "2BP01");
+    CHECK(refused_state(live, DropRoleDdl{{"t", "r2"}}) == "2BP01");
+    CHECK(live.current()->role("t") != nullptr);
+    // REVOKE GRANT OPTION FOR keeps the privilege; a table-level REVOKE takes it from every column.
+    (void)live.apply(revoke({"t"}, {"r2"}, {{"update", {"qty"}}}, true));
+    (void)live.apply(revoke({"t"}, {"r2"}, {{"update", {}}}));
+    (void)live.apply(revoke({"t"}, {""}, {{"all", {}}}));
+    acl = live.current()->acl(t_id);
+    CHECK(std::vector<AclEntry>(acl.begin(), acl.end()) ==
+          std::vector<AclEntry>{{r2, qty, pv::kSelect, pv::kSelect, kBootstrapRole},
+                                {r1, kWholeObject, pv::kAll, 0, kBootstrapRole}});
+    CHECK(refused_state(live, DropRoleDdl{{"nope"}}).empty() == false);
+    CHECK(refused_state(live, DropRoleDdl{{"nope"}, true}).empty());
+    db.close();
+  }
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    auto cat = live.current();
+    REQUIRE(cat->role("r1") != nullptr);
+    CHECK(cat->role("r1")->id == r1);
+    CHECK(cat->roles().size() == 3);
+    CHECK(cat->acl(t_id).size() == 2);
+    // A drop takes the object's privileges with it, and frees the role.
+    (void)live.apply(DropTableDdl{"t"});
+    CHECK(live.current()->acls().empty());
+    CHECK(!db.snapshot().contains_key({}, acl_record_key(t_id)));
+    (void)live.apply(DropRoleDdl{{"r1", "r2", "t"}});
+    CHECK(live.current()->roles().empty());
+    CHECK(!db.snapshot().contains_key({}, role_name_key("r1")));
+    db.close();
+  }
+}
+
+TEST_CASE("catalog: a role's record and name entry, and a privileges record, must agree at load; a damaged one is refused",
+          "[sql][catalog][roles]") {
+  sql_test::TempDir dir{"catalog_roles_damage"};
+  std::uint32_t t_id = 0, r_id = 0;
+  Bytes role_record, role_entry, acl;
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    (void)live.apply(create_t());
+    (void)live.apply(CreateRoleDdl{"r"});
+    (void)live.apply(grant({"t"}, {"r"}, {{"select", {"qty"}}, {"insert", {}}}, true));
+    (void)live.apply(grant({"t"}, {""}, {{"select", {"qty"}}, {"insert", {}}}));
+    t_id = live.current()->table("t")->id;
+    r_id = live.current()->role("r")->id;
+    REQUIRE(db.snapshot().get({}, role_record_key(r_id), role_record));
+    REQUIRE(db.snapshot().get({}, role_name_key("r"), role_entry));
+    REQUIRE(db.snapshot().get({}, acl_record_key(t_id), acl));
+    db.close();
+  }
+  auto put = [&](const Bytes& key, const Bytes& value) {
+    auto db = DB::open(dir.path());
+    db.put({}, key, value);
+    db.close();
+  };
+  auto restore = [&] {
+    put(role_record_key(r_id), role_record);
+    put(role_name_key("r"), role_entry);
+    put(acl_record_key(t_id), acl);
+  };
+  auto refused_with = [&](const Bytes& key, const Bytes& value) {
+    put(key, value);
+    {
+      auto db = DB::open(dir.path());
+      CHECK_THROWS_AS(LiveCatalog{db}, std::runtime_error);
+      (void)db.del({}, key);
+      db.close();
+    }
+    restore();
+  };
+  for (const auto& [key, record] : {std::pair{role_record_key(r_id), role_record}, std::pair{acl_record_key(t_id), acl}}) {
+    INFO("record size " << record.size());
+    for (std::size_t n = 0; n < record.size(); ++n) {
+      refused_with(key, Bytes(record.begin(), record.begin() + static_cast<std::ptrdiff_t>(n)));
+    }
+    auto later = record;
+    later[1] = std::byte{2};
+    refused_with(key, later);
+    auto longer = record;
+    longer.push_back(std::byte{0});
+    refused_with(key, longer);
+  }
+  refused_with(role_record_key(r_id + 1), role_record);  // under another id's key
+  refused_with(acl_record_key(t_id + 100), acl);        // of no table or view
+  // The privileges record, little-endian: u16 format, u32 object, u32 n, then
+  // entries of 16 bytes, (column, grantee) sorted: the column's SELECT of PUBLIC's and r's,
+  // then the table's INSERT of PUBLIC's and r's.
+  constexpr std::size_t kFirst = 2 + 4 + 4;
+  auto entry = [&](std::size_t i, std::size_t field) { return kFirst + 16 * i + field; };
+  auto changed = [&](Bytes r, std::size_t at, std::byte b) {
+    r[at] = b;
+    return r;
+  };
+  REQUIRE(acl.size() == kFirst + 16 * 4);
+  refused_with(acl_record_key(t_id), changed(acl, entry(0, 0), std::byte{0x7F}));     // a grantee that is no role
+  refused_with(acl_record_key(t_id), changed(acl, entry(0, 4), std::byte{0x7F}));     // a column the table lacks
+  refused_with(acl_record_key(t_id), changed(acl, entry(0, 8), std::byte{0x08}));     // DELETE of a column
+  refused_with(acl_record_key(t_id), changed(acl, entry(1, 8), std::byte{0}));        // no privilege
+  refused_with(acl_record_key(t_id), changed(acl, entry(1, 10), std::byte{0x04}));    // an option it lacks
+  {
+    auto swapped = acl;
+    std::swap_ranges(swapped.begin() + static_cast<std::ptrdiff_t>(entry(1, 0)),
+                     swapped.begin() + static_cast<std::ptrdiff_t>(entry(2, 0)),
+                     swapped.begin() + static_cast<std::ptrdiff_t>(entry(2, 0)));
+    refused_with(acl_record_key(t_id), swapped);  // out of order
+  }
+  // A role with no name entry; an entry of another kind; an entry with no record.
+  {
+    auto db = DB::open(dir.path());
+    (void)db.del({}, role_name_key("r"));
+    CHECK_THROWS_AS(LiveCatalog{db}, std::runtime_error);
+    db.close();
+  }
+  restore();
+  refused_with(role_name_key("r"), changed(role_entry, 0, std::byte{4}));
+  refused_with(role_name_key("s"), role_entry);
+  // Intact, it loads.
+  auto db = DB::open(dir.path());
+  LiveCatalog live{db};
+  CHECK(live.current()->acl(t_id).size() == 4);
+  db.close();
+}
+
 TEST_CASE("catalog: a procedure is a record and a name entry of its own namespace, survives a reopen, and is replaced or dropped",
           "[sql][catalog][procedure]") {
   sql_test::TempDir dir{"catalog_procedure"};

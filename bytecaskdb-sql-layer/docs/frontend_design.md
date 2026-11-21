@@ -514,6 +514,42 @@ AS …` and `DROP PROCEDURE [IF EXISTS] name [(argtype, …)]`
 - **`DROP PROCEDURE`'s list** is read as libpg_query gives it: the types,
   without those marked `OUT`.
 
+**Roles and privileges**, `CREATE ROLE`, `DROP ROLE [IF EXISTS]`, `GRANT`
+and `REVOKE` on tables and views (#653, its first step):
+- **No logins, and no enforcement yet.** Authentication is outside the
+  layer, and every session is the bootstrap superuser (#653's default
+  resolver), so a grant is recorded and nothing is denied, as PostgreSQL
+  denies a superuser nothing. The resolver that names a session's role and
+  the `Authorizer` that checks privileges (42501) are #653's next step.
+- **`CREATE ROLE name`**, with no option. `public`, `none` and names
+  starting `pg_` are reserved (42939), a name in use is 42710. Roles have
+  a namespace of their own.
+- **`GRANT` and `REVOKE`** of `SELECT`, `INSERT`, `UPDATE`, `DELETE`,
+  `TRUNCATE`, `REFERENCES`, `TRIGGER` and `MAINTAIN`, or `ALL
+  [PRIVILEGES]`, on `[TABLE]` tables and views, to or from roles and
+  `PUBLIC`, with column lists (`SELECT`, `INSERT`, `UPDATE`, `REFERENCES`),
+  `WITH GRANT OPTION`, `REVOKE GRANT OPTION FOR`, `GRANTED BY` the current
+  user, and `CASCADE` or `RESTRICT`. The latter two are alike: every grant's
+  grantor is the superuser, so no grant depends on another. Repeating one
+  changes nothing.
+- **PostgreSQL's semantics.** A table-level `REVOKE` takes the privilege
+  from every column too, and a column-level one takes it from that column
+  only. A grant option goes to roles only, not to `PUBLIC` (0LP01).
+- **PostgreSQL's order of errors.** The objects come first: a missing one
+  is 42P01, an index 42809. Then the grantees: a missing role is 42704,
+  and a grantor that is another role is 0A000. Then the privileges: an
+  unrecognized one is 42601, and one of another kind of object, or one a
+  column lacks, is 0LP01. Then the columns: 42703.
+- **`DROP ROLE`** of a role that holds a privilege is 2BP01, so is any role
+  of a list with one, and nothing is dropped. A missing role is 42704; with
+  `IF EXISTS`, a NOTICE per missing name. A drop of a table or view takes
+  its privileges with it.
+- **Refused (42601):** `CREATE ROLE`'s options and `CREATE USER`, since the
+  layer has no logins or role attributes. Also refused: `GRANT` on any
+  other kind of object, `ON ALL TABLES IN SCHEMA`, role membership (`GRANT
+  role TO role`), `ALTER DEFAULT PRIVILEGES`, and `CURRENT_USER`,
+  `CURRENT_ROLE` or `SESSION_USER` as a grantee.
+
 **Refused**, with a message and the node's position: everything not above.
 That includes:
 - `ILIKE`, `IS DISTINCT FROM`, and a predicate in `HAVING`;

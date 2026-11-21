@@ -278,7 +278,9 @@ nothing more. After startup, an invalid message length or type is `FATAL`.
      `_pq_.` options), as PostgreSQL answers it, and startup goes on at 3.0.
    - Any other version is `FATAL 0A000`.
 2. **The parameters.**
-   - `user` is required, and any name is accepted: there are no roles.
+   - `user` is required, and any name is accepted: every session is the
+     bootstrap superuser, whatever it names (`frontend_design.md`, *Roles
+     and privileges*).
    - `database` must be the served name, else `FATAL 3D000`
      (`invalid_catalog_name`).
    - `application_name` is kept and reported back.

@@ -4913,6 +4913,14 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
             out.args.push_back({mode, a.def.name, sql_type(a.def)});
           }
           return {Ddl{std::move(out)}, s.pos};
+        } else if constexpr (std::is_same_v<T, ast::CreateRole>) {
+          return {Ddl{CreateRoleDdl{s.role}}, s.pos};
+        } else if constexpr (std::is_same_v<T, ast::DropRole>) {
+          return {Ddl{DropRoleDdl{s.roles, s.if_exists}}, s.pos};
+        } else if constexpr (std::is_same_v<T, ast::Grant>) {
+          GrantDdl out{s.grant, s.grant_option, {}, s.objects, s.grantees, s.grantor};
+          for (const auto& p : s.privileges) out.privileges.push_back({p.name, p.columns});
+          return {Ddl{std::move(out)}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::DropProcedure>) {
           DropProcedureDdl out{s.procedure, std::nullopt, s.if_exists};
           if (s.arg_types) {

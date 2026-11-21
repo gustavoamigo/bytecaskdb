@@ -230,6 +230,10 @@ enum class Command {
   DropView,
   CreateProcedure,
   DropProcedure,
+  CreateRole,
+  DropRole,
+  Grant,
+  Revoke,
 };
 
 // A result column: its name and SQL type, as a client is told them before
@@ -1274,6 +1278,12 @@ auto Statement::command() const -> Command {
           return Command::CreateProcedure;
         } else if constexpr (std::is_same_v<T, ast::DropProcedure>) {
           return Command::DropProcedure;
+        } else if constexpr (std::is_same_v<T, ast::CreateRole>) {
+          return Command::CreateRole;
+        } else if constexpr (std::is_same_v<T, ast::DropRole>) {
+          return Command::DropRole;
+        } else if constexpr (std::is_same_v<T, ast::Grant>) {
+          return st.grant ? Command::Grant : Command::Revoke;
         } else {
           static_assert(std::is_same_v<T, ast::AddColumn>);
           return Command::AlterTable;
@@ -1614,6 +1624,8 @@ auto skipped(const Ddl& ddl) -> Notice {
           return {"00000", "index \"" + d.name + "\" does not exist, skipping"};
         } else if constexpr (std::is_same_v<T, DropViewDdl>) {
           return {"00000", "view \"" + d.name + "\" does not exist, skipping"};
+        } else if constexpr (std::is_same_v<T, DropRoleDdl>) {
+          return {"00000", "role \"" + d.names.front() + "\" does not exist, skipping"};
         } else if constexpr (std::is_same_v<T, DropProcedureDdl>) {
           std::string args;
           for (const auto& t : d.arg_types.value_or(std::vector<SqlType>{})) {
@@ -1627,6 +1639,22 @@ auto skipped(const Ddl& ddl) -> Notice {
       ddl);
 }
 
+// A DDL's notices: one per name DROP ROLE IF EXISTS skips, which the
+// catalog it was bound against lacks; otherwise, when IF [NOT] EXISTS left
+// the catalog unchanged, the one skipped() gives.
+auto skip_notices(const Ddl& ddl, const Catalog& before, bool changed) -> std::vector<Notice> {
+  std::vector<Notice> out;
+  if (const auto* dr = std::get_if<DropRoleDdl>(&ddl)) {
+    if (!dr->if_exists) return out;
+    for (const auto& name : dr->names) {
+      if (before.role(name) == nullptr) out.push_back({"00000", "role \"" + name + "\" does not exist, skipping"});
+    }
+    return out;
+  }
+  if (!changed) out.push_back(skipped(ddl));
+  return out;
+}
+
 }  // namespace
 
 auto Database::execute_locked(const Statement& stmt, const std::vector<Value>& params, const ExecutionOptions& opts)
@@ -1635,12 +1663,12 @@ auto Database::execute_locked(const Statement& stmt, const std::vector<Value>& p
   if (!stmt.current_of().empty()) throw ParamError("WHERE CURRENT OF needs a cursor of a transaction");
   if (stmt.is_ddl()) {
     if (!params.empty()) throw ParamError("DDL takes no parameters");
-    auto bound = bound::bind(stmt.ast_, *live_->current());
+    auto before = live_->current();
+    auto bound = bound::bind(stmt.ast_, *before);
     const auto& ddl = std::get<Ddl>(bound.stmt);
     Rows out;
     try {
-      // No new catalog: IF EXISTS or IF NOT EXISTS skipped the statement.
-      if (!live_->run(ddl).changed) out.notices.push_back(skipped(ddl));
+      out.notices = skip_notices(ddl, *before, live_->run(ddl).changed);
     } catch (const ConstraintViolation& e) {
       throw ExecError(e.what(), BC_E_CONSTRAINT, e.detail().encode());
     } catch (const DdlInProgress&) {

@@ -1,0 +1,77 @@
+# Roles and privileges on tables and views (docs/frontend_design.md, *Roles
+# and privileges*). Every session is the bootstrap superuser, so a grant is
+# recorded and nothing is denied: what a case checks is what each statement
+# accepts and refuses, as PostgreSQL does.
+
+- name: GRANT and REVOKE on tables, views and columns, to roles and PUBLIC
+  features: [E081-01, E081-05, E081-08, F031-03, F031-19]
+  setup:
+    - CREATE TABLE gr (a INTEGER PRIMARY KEY, b INTEGER)
+    - CREATE VIEW grv AS SELECT a FROM gr
+    - CREATE ROLE gr1
+    - CREATE ROLE gr2
+  steps:
+    - sql: GRANT SELECT ON gr TO gr1
+    - sql: GRANT ALL PRIVILEGES ON TABLE gr, grv TO gr1, PUBLIC
+    - sql: GRANT INSERT ON gr TO gr1 WITH GRANT OPTION
+    # A grant option goes to roles only.
+    - sql: GRANT ALL PRIVILEGES ON TABLE gr TO PUBLIC WITH GRANT OPTION
+      error: "0LP01"
+    - sql: GRANT SELECT (a), UPDATE (a, b) ON gr TO gr2
+    - sql: GRANT ALL (a) ON grv TO gr2 GRANTED BY CURRENT_USER
+    - sql: REVOKE GRANT OPTION FOR DELETE ON gr FROM gr1
+    - sql: REVOKE UPDATE (b) ON gr FROM gr2 CASCADE
+    - sql: REVOKE ALL ON gr, grv FROM gr1, gr2, PUBLIC RESTRICT
+    # Nothing left: the roles can go.
+    - sql: DROP ROLE gr1, gr2
+  teardown:
+    - DROP VIEW grv
+    - DROP TABLE gr
+    - DROP ROLE IF EXISTS gr1
+    - DROP ROLE IF EXISTS gr2
+
+- name: what GRANT, REVOKE and the role statements refuse
+  features: [E081-01, F031-03, F031-19]
+  setup:
+    - CREATE TABLE gs (a INTEGER PRIMARY KEY, b INTEGER)
+    - CREATE INDEX gs_b ON gs (b)
+    - CREATE ROLE gs1
+    - CREATE ROLE gs2
+  steps:
+    - sql: CREATE ROLE gs1
+      error: "42710"
+    - sql: CREATE ROLE pg_gs
+      error: "42939"
+    - sql: GRANT SELECT ON nope TO gs1
+      error: "42P01"
+    - sql: GRANT SELECT ON gs_b TO gs1
+      error: "42809"
+    - sql: GRANT SELECT ON gs TO nope
+      error: "42704"
+    - sql: GRANT SELECT ON gs TO gs1 GRANTED BY gs2
+      error: "0A000"
+    - sql: GRANT SELECT ON gs TO gs1 GRANTED BY nope
+      error: "42704"
+    - sql: GRANT USAGE ON gs TO gs1
+      error: "0LP01"
+    - sql: GRANT under ON gs TO gs1
+      error: "42601"
+    - sql: GRANT DELETE (a) ON gs TO gs1
+      error: "0LP01"
+    - sql: GRANT SELECT (nope) ON gs TO gs1
+      error: "42703"
+    - sql: REVOKE SELECT ON gs FROM nope
+      error: "42704"
+    # A role that holds a privilege is not dropped.
+    - sql: GRANT SELECT ON gs TO gs2
+    - sql: DROP ROLE gs1, gs2
+      error: "2BP01"
+    - sql: DROP ROLE nope
+      error: "42704"
+    - sql: REVOKE SELECT ON gs FROM gs2
+    - sql: DROP ROLE IF EXISTS gs1, nope
+    - sql: DROP ROLE gs2
+  teardown:
+    - DROP TABLE gs
+    - DROP ROLE IF EXISTS gs1
+    - DROP ROLE IF EXISTS gs2

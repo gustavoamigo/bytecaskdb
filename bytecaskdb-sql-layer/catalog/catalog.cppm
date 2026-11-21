@@ -336,6 +336,45 @@ struct Procedure {
   std::vector<ProcedureArg> args;
 };
 
+// A role (CREATE ROLE): a name in a namespace of its own, an id from the one
+// counter. The bootstrap superuser every session is (#653's default
+// resolver) is implicit: never written, no name, id kBootstrapRole.
+struct Role {
+  std::uint32_t id{0};
+  std::string name;
+};
+
+// PostgreSQL's table privileges, its ACL letters arwdDxtm, as bits.
+namespace privilege {
+inline constexpr std::uint16_t kSelect = 1, kInsert = 2, kUpdate = 4, kDelete = 8, kTruncate = 16, kReferences = 32,
+                               kTrigger = 64, kMaintain = 128;
+inline constexpr std::uint16_t kAll = 255;
+// The privileges a column takes.
+inline constexpr std::uint16_t kColumns = kSelect | kInsert | kUpdate | kReferences;
+}  // namespace privilege
+
+// The grantee PUBLIC, and the bootstrap superuser: never an object id, which
+// stays at or below 2^24 - 1.
+inline constexpr std::uint32_t kPublic = 0;
+inline constexpr std::uint32_t kBootstrapRole = 0x01000000;
+// An ACL entry of the whole table or view, not of one of its columns.
+inline constexpr std::uint32_t kWholeObject = 0xFFFFFFFF;
+
+// One grantee's privileges on a table or view, or on one of its columns (a
+// table's column id; a view's column position), and which of them it may
+// grant on. `grantor` is kBootstrapRole: every session is the superuser, so
+// a grant acts as the owner's. An object's entries are sorted by (column,
+// grantee), one each, every one with a privilege.
+struct AclEntry {
+  std::uint32_t grantee{kPublic};
+  std::uint32_t column{kWholeObject};
+  std::uint16_t privileges{0};
+  std::uint16_t grant_options{0};
+  std::uint32_t grantor{kBootstrapRole};
+
+  friend auto operator==(const AclEntry&, const AclEntry&) -> bool = default;
+};
+
 // Whether `written`, a type a DROP PROCEDURE's argument list names, is
 // `declared`, an argument's type: the same kind, whatever the modifiers, as
 // PostgreSQL ignores an argument's modifier. VARCHAR is TEXT, since the
@@ -432,8 +471,30 @@ struct DropProcedureDdl {
   std::optional<std::vector<SqlType>> arg_types;
   bool if_exists{false};
 };
+struct CreateRoleDdl {
+  std::string name;
+};
+struct DropRoleDdl {
+  std::vector<std::string> names;
+  bool if_exists{false};
+};
+// GRANT or REVOKE, as written: the catalog resolves and checks every name,
+// in PostgreSQL's order (the objects, the grantees and the grantor, the
+// privileges, their columns).
+struct GrantDdl {
+  struct Privilege {
+    std::string name;  // "select", …, or "all"
+    std::vector<std::string> columns;
+  };
+  bool grant{true};
+  bool grant_option{false};
+  std::vector<Privilege> privileges;  // empty: ALL
+  std::vector<std::string> objects;
+  std::vector<std::string> grantees;  // "" is PUBLIC
+  std::optional<std::string> grantor;
+};
 using Ddl = std::variant<CreateTableDdl, CreateIndexDdl, DropTableDdl, DropIndexDdl, AddColumnDdl, CreateViewDdl,
-                         DropViewDdl, CreateProcedureDdl, DropProcedureDdl>;
+                         DropViewDdl, CreateProcedureDdl, DropProcedureDdl, CreateRoleDdl, DropRoleDdl, GrantDdl>;
 
 class Catalog {
 public:
@@ -460,6 +521,11 @@ public:
   [[nodiscard]] auto view(std::uint32_t id) const -> const View*;
   [[nodiscard]] auto procedures() const -> const std::map<std::uint32_t, Procedure>& { return procedures_; }
   [[nodiscard]] auto procedure(std::string_view name) const -> const Procedure*;
+  [[nodiscard]] auto roles() const -> const std::map<std::uint32_t, Role>& { return roles_; }
+  [[nodiscard]] auto role(std::string_view name) const -> const Role*;
+  // A table's or view's ACL, by its id: empty when nothing is granted on it.
+  [[nodiscard]] auto acls() const -> const std::map<std::uint32_t, std::vector<AclEntry>>& { return acls_; }
+  [[nodiscard]] auto acl(std::uint32_t object) const -> std::span<const AclEntry>;
   // An index by name, with its table.
   [[nodiscard]] auto index(std::string_view name) const -> std::pair<const Table*, const Index*>;
   // A table or an index: both draw ids from one counter.
@@ -520,6 +586,9 @@ private:
   std::map<std::string, std::uint32_t, std::less<>> names_;  // table, index or view name -> id
   std::map<std::uint32_t, Procedure> procedures_;
   std::map<std::string, std::uint32_t, std::less<>> procedure_names_;  // a namespace of their own
+  std::map<std::uint32_t, Role> roles_;
+  std::map<std::string, std::uint32_t, std::less<>> role_names_;  // a namespace of their own
+  std::map<std::uint32_t, std::vector<AclEntry>> acls_;           // object id -> its ACL, never empty
   std::map<std::uint32_t, KeyLayout> key_layouts_;
 };
 
@@ -628,6 +697,9 @@ private:
 [[nodiscard]] auto view_record_key(std::uint32_t view_id) -> Bytes;
 [[nodiscard]] auto procedure_record_key(std::uint32_t procedure_id) -> Bytes;
 [[nodiscard]] auto procedure_name_key(std::string_view name) -> Bytes;
+[[nodiscard]] auto role_record_key(std::uint32_t role_id) -> Bytes;
+[[nodiscard]] auto role_name_key(std::string_view name) -> Bytes;
+[[nodiscard]] auto acl_record_key(std::uint32_t object_id) -> Bytes;
 [[nodiscard]] auto name_entry_key(std::string_view name) -> Bytes;
 // Every row key of a table starts with its row prefix: kNsRow, the table id.
 [[nodiscard]] auto row_prefix(std::uint32_t table_id) -> Bytes;
@@ -651,6 +723,12 @@ void for_each_row(const Snapshot& snap, std::uint32_t table_id, Visit&& visit) {
 [[nodiscard]] auto parse_view(BytesView record) -> View;
 [[nodiscard]] auto serialize_procedure(const Procedure& p) -> Bytes;
 [[nodiscard]] auto parse_procedure(BytesView record) -> Procedure;
+[[nodiscard]] auto serialize_role(const Role& r) -> Bytes;
+[[nodiscard]] auto parse_role(BytesView record) -> Role;
+[[nodiscard]] auto serialize_acl(std::uint32_t object, const std::vector<AclEntry>& acl) -> Bytes;
+// The object id and its entries, checked sorted, one per (column, grantee),
+// each with a privilege and no grant option it lacks.
+[[nodiscard]] auto parse_acl(BytesView record) -> std::pair<std::uint32_t, std::vector<AclEntry>>;
 
 // Encodes the primary key of `t` from a row: kNsRow, the table id, the parts.
 [[nodiscard]] auto encode_pk_from_row(const Table& t, BytesView row, Bytes& out) -> bool;
@@ -672,6 +750,9 @@ constexpr std::byte kSubName{0x03};
 constexpr std::byte kSubView{0x04};
 constexpr std::byte kSubProcedure{0x05};
 constexpr std::byte kSubProcedureName{0x06};
+constexpr std::byte kSubRole{0x07};
+constexpr std::byte kSubRoleName{0x08};
+constexpr std::byte kSubAcl{0x09};
 constexpr std::byte kCounterNextId{0x01};
 constexpr std::byte kCounterVersion{0x02};
 constexpr std::uint8_t kKindTable = 1;
@@ -680,6 +761,9 @@ constexpr std::uint8_t kKindView = 3;
 constexpr std::uint16_t kViewRecordFormat = 1;
 constexpr std::uint8_t kKindProcedure = 4;
 constexpr std::uint16_t kProcedureRecordFormat = 1;
+constexpr std::uint8_t kKindRole = 5;
+constexpr std::uint16_t kRoleRecordFormat = 1;
+constexpr std::uint16_t kAclRecordFormat = 1;
 
 using DdlOp = Catalog::DdlOp;
 
@@ -1294,6 +1378,26 @@ auto procedure_name_key(std::string_view name) -> Bytes {
   return k;
 }
 
+auto role_record_key(std::uint32_t id) -> Bytes {
+  auto k = Bytes{std::byte{kNsCatalog}, kSubRole};
+  auto idb = be_bytes(id, 4);
+  k.insert(k.end(), idb.begin(), idb.end());
+  return k;
+}
+
+auto role_name_key(std::string_view name) -> Bytes {
+  Bytes k{std::byte{kNsCatalog}, kSubRoleName};
+  for (auto c : name) k.push_back(static_cast<std::byte>(c));
+  return k;
+}
+
+auto acl_record_key(std::uint32_t object) -> Bytes {
+  auto k = Bytes{std::byte{kNsCatalog}, kSubAcl};
+  auto idb = be_bytes(object, 4);
+  k.insert(k.end(), idb.begin(), idb.end());
+  return k;
+}
+
 auto same_argument_type(SqlType written, SqlType declared) -> bool {
   auto text = [](SqlKind k) { return k == SqlKind::Varchar ? SqlKind::Text : k; };
   return text(written.kind) == text(declared.kind);
@@ -1462,6 +1566,78 @@ auto serialize_procedure(const Procedure& p) -> Bytes {
     w.u8(a.type.scale);
   }
   return w.bytes();
+}
+
+// A role record: u16 format, u32 id, str name.
+auto serialize_role(const Role& role) -> Bytes {
+  RecordWriter w;
+  w.u16(kRoleRecordFormat);
+  w.u32(role.id);
+  w.str(role.name);
+  return w.bytes();
+}
+
+auto parse_role(BytesView in) -> Role {
+  RecordReader r{in};
+  auto format = r.u16();
+  if (format != kRoleRecordFormat) {
+    throw std::runtime_error("catalog role record format " + std::to_string(format) + " is not " +
+                             std::to_string(kRoleRecordFormat) + ": the database was written by a later SQL-layer build");
+  }
+  Role role;
+  role.id = r.u32();
+  role.name = r.str();
+  r.expect_end("record of role " + role.name);
+  if (role.name.empty()) corrupt("a role has no name");
+  return role;
+}
+
+// An ACL record: u16 format, u32 object id, u32 n { u32 grantee, u32 column,
+// u16 privileges, u16 grant options, u32 grantor }.
+auto serialize_acl(std::uint32_t object, const std::vector<AclEntry>& acl) -> Bytes {
+  RecordWriter w;
+  w.u16(kAclRecordFormat);
+  w.u32(object);
+  w.u32(static_cast<std::uint32_t>(acl.size()));
+  for (const auto& e : acl) {
+    w.u32(e.grantee);
+    w.u32(e.column);
+    w.u16(e.privileges);
+    w.u16(e.grant_options);
+    w.u32(e.grantor);
+  }
+  return w.bytes();
+}
+
+auto parse_acl(BytesView in) -> std::pair<std::uint32_t, std::vector<AclEntry>> {
+  RecordReader r{in};
+  auto format = r.u16();
+  if (format != kAclRecordFormat) {
+    throw std::runtime_error("catalog privileges record format " + std::to_string(format) + " is not " +
+                             std::to_string(kAclRecordFormat) + ": the database was written by a later SQL-layer build");
+  }
+  auto object = r.u32();
+  auto n = r.u32();
+  std::vector<AclEntry> acl;
+  for (std::uint32_t i = 0; i < n; ++i) {
+    AclEntry e;
+    e.grantee = r.u32();
+    e.column = r.u32();
+    e.privileges = r.u16();
+    e.grant_options = r.u16();
+    e.grantor = r.u32();
+    auto allowed = e.column == kWholeObject ? privilege::kAll : privilege::kColumns;
+    if (e.privileges == 0 || (e.privileges & ~allowed) != 0 || (e.grant_options & ~e.privileges) != 0) {
+      corrupt("privileges of object " + std::to_string(object) + " hold an invalid entry");
+    }
+    if (!acl.empty() && std::tuple{acl.back().column, acl.back().grantee} >= std::tuple{e.column, e.grantee}) {
+      corrupt("privileges of object " + std::to_string(object) + " are not sorted, or repeat an entry");
+    }
+    acl.push_back(e);
+  }
+  r.expect_end("privileges record of object " + std::to_string(object));
+  if (acl.empty()) corrupt("privileges record of object " + std::to_string(object) + " is empty");
+  return {object, std::move(acl)};
 }
 
 auto parse_procedure(BytesView in) -> Procedure {
@@ -1684,6 +1860,24 @@ auto Catalog::load(const Snapshot& snap) -> Catalog {
     }
     cat.procedures_.emplace(parsed.id, std::move(parsed));
   }
+  auto roles = Bytes{std::byte{kNsCatalog}, kSubRole};
+  for (const auto& e : snap.iter_from({}, roles)) {
+    if (!has_prefix(e.key, roles)) break;
+    auto parsed = parse_role(e.value);
+    if (e.key.size() != roles.size() + 4 || be_value(e.key.subspan(roles.size())) != parsed.id) {
+      corrupt("record of role " + parsed.name + " is under another id's key");
+    }
+    cat.roles_.emplace(parsed.id, std::move(parsed));
+  }
+  auto acls = Bytes{std::byte{kNsCatalog}, kSubAcl};
+  for (const auto& e : snap.iter_from({}, acls)) {
+    if (!has_prefix(e.key, acls)) break;
+    auto [object, acl] = parse_acl(e.value);
+    if (e.key.size() != acls.size() + 4 || be_value(e.key.subspan(acls.size())) != object) {
+      corrupt("privileges of object " + std::to_string(object) + " are under another id's key");
+    }
+    cat.acls_.emplace(object, std::move(acl));
+  }
   cat.rebuild_lookups();
 
   // Every id below the counter and used once; every name entry names its
@@ -1735,6 +1929,36 @@ auto Catalog::load(const Snapshot& snap) -> Catalog {
     ++procedure_entries;
   }
   if (procedure_entries != cat.procedures_.size()) corrupt("a procedure has no name entry");
+  for (const auto& [id, r] : cat.roles_) use(id);
+  std::size_t role_entries = 0;
+  auto role_names = Bytes{std::byte{kNsCatalog}, kSubRoleName};
+  for (const auto& e : snap.iter_from({}, role_names)) {
+    if (!has_prefix(e.key, role_names)) break;
+    auto name = as_string(e.key.subspan(role_names.size()));
+    auto it = cat.role_names_.find(name);
+    if (it == cat.role_names_.end() || e.value.size() != 5 || std::to_integer<std::uint8_t>(e.value[0]) != kKindRole ||
+        be_value(e.value.subspan(1)) != it->second) {
+      corrupt("role name entry " + name + " does not match the records");
+    }
+    ++role_entries;
+  }
+  if (role_entries != cat.roles_.size()) corrupt("a role has no name entry");
+  // Each ACL is of a table or view, its columns that object's, its grantees
+  // PUBLIC or a role, its grantor the bootstrap superuser or a role.
+  for (const auto& [object, acl] : cat.acls_) {
+    const auto* t = cat.table(object);
+    const auto* v = cat.view(object);
+    if (t == nullptr && v == nullptr) corrupt("privileges of object " + std::to_string(object) + ", no table or view");
+    for (const auto& e : acl) {
+      auto column_ok = e.column == kWholeObject || (t != nullptr ? t->column(e.column) != nullptr && !t->column(e.column)->hidden
+                                                                  : e.column < v->columns.size());
+      auto grantee_ok = e.grantee == kPublic || cat.roles_.contains(e.grantee);
+      auto grantor_ok = e.grantor == kBootstrapRole || cat.roles_.contains(e.grantor);
+      if (!column_ok || !grantee_ok || !grantor_ok) {
+        corrupt("privileges of object " + std::to_string(object) + " name a missing column or role");
+      }
+    }
+  }
   return cat;
 }
 
@@ -1745,6 +1969,8 @@ auto Catalog::clone() const -> Catalog {
   c.tables_ = tables_;
   c.views_ = views_;
   c.procedures_ = procedures_;
+  c.roles_ = roles_;
+  c.acls_ = acls_;
   c.rebuild_lookups();
   return c;
 }
@@ -1761,6 +1987,10 @@ void Catalog::rebuild_lookups() {
   procedure_names_.clear();
   for (const auto& [id, p] : procedures_) {
     if (!procedure_names_.emplace(p.name, id).second) corrupt("procedure name " + p.name + " is used twice");
+  }
+  role_names_.clear();
+  for (const auto& [id, r] : roles_) {
+    if (!role_names_.emplace(r.name, id).second) corrupt("role name " + r.name + " is used twice");
   }
   key_layouts_.clear();
   auto name_taken = [&](const std::string& n) {
@@ -1814,6 +2044,16 @@ auto Catalog::view(std::uint32_t id) const -> const View* {
 auto Catalog::procedure(std::string_view name) const -> const Procedure* {
   auto it = procedure_names_.find(name);
   return it == procedure_names_.end() ? nullptr : &procedures_.at(it->second);
+}
+
+auto Catalog::role(std::string_view name) const -> const Role* {
+  auto it = role_names_.find(name);
+  return it == role_names_.end() ? nullptr : &roles_.at(it->second);
+}
+
+auto Catalog::acl(std::uint32_t object) const -> std::span<const AclEntry> {
+  auto it = acls_.find(object);
+  return it == acls_.end() ? std::span<const AclEntry>{} : std::span<const AclEntry>{it->second};
 }
 
 auto Catalog::find_view_dependent(std::uint32_t id) const -> const View* {
@@ -2077,6 +2317,8 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       auto p = index_prefix(ix.id);
       put_op(ops, DdlOp::Kind::DelRange, p, key_successor(p));
     }
+    if (acls_.contains(t.id)) put_op(ops, DdlOp::Kind::Del, acl_record_key(t.id));
+    next->acls_.erase(t.id);
     next->erase_table(t.id);
     return finish();
   }
@@ -2136,6 +2378,8 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     }
     put_op(ops, DdlOp::Kind::Del, view_record_key(found->id));
     put_op(ops, DdlOp::Kind::Del, name_entry_key(found->name));
+    if (acls_.contains(found->id)) put_op(ops, DdlOp::Kind::Del, acl_record_key(found->id));
+    next->acls_.erase(found->id);
     next->views_.erase(found->id);
     return finish();
   }
@@ -2188,6 +2432,171 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     put_op(ops, DdlOp::Kind::Del, procedure_record_key(found->id));
     put_op(ops, DdlOp::Kind::Del, procedure_name_key(found->name));
     next->procedures_.erase(found->id);
+    return finish();
+  }
+
+  if (const auto* cr = std::get_if<CreateRoleDdl>(&ddl)) {
+    // PostgreSQL reserves PUBLIC, NONE and the pg_ prefix.
+    if (cr->name == "public" || cr->name == "none" || cr->name.starts_with("pg_")) {
+      throw DdlRefused("role name \"" + cr->name + "\" is reserved", kReservedName);
+    }
+    if (role(cr->name) != nullptr) throw DdlRefused("role \"" + cr->name + "\" already exists", kDuplicateObject);
+    Role r{reserve_ids(next->next_id_, 1), cr->name};
+    put_op(ops, DdlOp::Kind::EnsureAbsent, role_name_key(r.name));
+    put_op(ops, DdlOp::Kind::Put, role_name_key(r.name), name_value(kKindRole, r.id));
+    put_op(ops, DdlOp::Kind::Put, role_record_key(r.id), serialize_role(r));
+    next->roles_.emplace(r.id, std::move(r));
+    return finish();
+  }
+
+  if (const auto* dr = std::get_if<DropRoleDdl>(&ddl)) {
+    auto dropped = false;
+    for (const auto& name : dr->names) {
+      const auto* r = next->role(name);
+      if (r == nullptr) {
+        // A name dropped earlier in the list is no longer there either.
+        if (dr->if_exists || role(name) != nullptr) continue;
+        throw DdlRefused("role \"" + name + "\" does not exist", kUndefinedObject);
+      }
+      for (const auto& [object, acl] : next->acls_) {
+        if (std::ranges::any_of(acl, [&](const AclEntry& e) { return e.grantee == r->id || e.grantor == r->id; })) {
+          throw DdlRefused("role \"" + name + "\" cannot be dropped because some objects depend on it",
+                           kDependentObjectsStillExist);
+        }
+      }
+      put_op(ops, DdlOp::Kind::Del, role_record_key(r->id));
+      put_op(ops, DdlOp::Kind::Del, role_name_key(r->name));
+      next->roles_.erase(r->id);
+      next->rebuild_lookups();
+      dropped = true;
+    }
+    if (!dropped) return nullptr;
+    return finish();
+  }
+
+  if (const auto* g = std::get_if<GrantDdl>(&ddl)) {
+    // The objects, a table or a view each.
+    std::vector<std::uint32_t> objects;
+    for (const auto& name : g->objects) {
+      if (const auto* t = table(name)) {
+        objects.push_back(t->id);
+      } else if (const auto* v = view(name)) {
+        objects.push_back(v->id);
+      } else if (index(name).first != nullptr) {
+        throw DdlRefused("\"" + name + "\" is an index", kWrongObjectType);
+      } else {
+        throw DdlRefused("relation \"" + name + "\" does not exist", kUndefinedTable);
+      }
+    }
+    auto role_id = [&](const std::string& name) {
+      const auto* r = role(name);
+      if (r == nullptr) throw DdlRefused("role \"" + name + "\" does not exist", kUndefinedObject);
+      return r->id;
+    };
+    std::vector<std::uint32_t> grantees;
+    for (const auto& name : g->grantees) {
+      if (name.empty() && g->grant && g->grant_option) {
+        throw DdlRefused("grant options can only be granted to roles", kInvalidGrantOperation);
+      }
+      grantees.push_back(name.empty() ? kPublic : role_id(name));
+    }
+    // Every session is the bootstrap superuser: a grantor named is another role.
+    if (g->grantor) {
+      (void)role_id(*g->grantor);
+      throw DdlRefused("grantor must be current user", kFeatureNotSupported);
+    }
+    // The privileges: on the whole object, and per column name.
+    auto bit = [](const std::string& name, bool column) -> std::uint16_t {
+      using namespace privilege;
+      static constexpr std::array<std::pair<std::string_view, std::uint16_t>, 8> kNames{
+          {{"select", kSelect}, {"insert", kInsert}, {"update", kUpdate}, {"delete", kDelete},
+           {"truncate", kTruncate}, {"references", kReferences}, {"trigger", kTrigger}, {"maintain", kMaintain}}};
+      if (name == "all") return column ? kColumns : kAll;
+      auto upper = [&] {
+        std::string u;
+        for (auto c : name) u.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+        return u;
+      };
+      for (const auto& [n, b] : kNames) {
+        if (n != name) continue;
+        if (column && (b & kColumns) == 0) throw DdlRefused("invalid privilege type " + upper() + " for column", kInvalidGrantOperation);
+        return b;
+      }
+      static constexpr std::array<std::string_view, 8> kOtherObjects{"usage", "execute", "create", "connect",
+                                                                     "temporary", "temp", "set", "alter system"};
+      if (std::ranges::find(kOtherObjects, name) != kOtherObjects.end()) {
+        throw DdlRefused("invalid privilege type " + upper() + " for " + (column ? "column" : "table"),
+                         kInvalidGrantOperation);
+      }
+      throw DdlRefused("unrecognized privilege type \"" + name + "\"", kSyntaxError);
+    };
+    std::uint16_t whole = 0;
+    std::vector<std::pair<std::string, std::uint16_t>> by_column;
+    if (g->privileges.empty()) whole = privilege::kAll;
+    for (const auto& p : g->privileges) {
+      if (p.columns.empty()) {
+        whole |= bit(p.name, false);
+      } else {
+        auto b = bit(p.name, true);
+        for (const auto& c : p.columns) by_column.emplace_back(c, b);
+      }
+    }
+    for (auto object : objects) {
+      const auto* t = table(object);
+      const auto* v = view(object);
+      // A column's id: a table's column id; a view's position.
+      auto column_id = [&](const std::string& name) -> std::uint32_t {
+        if (t != nullptr) {
+          if (const auto* c = t->column(name); c != nullptr && !c->hidden) return c->id;
+        } else if (auto it = std::ranges::find(v->columns, name); it != v->columns.end()) {
+          return static_cast<std::uint32_t>(it - v->columns.begin());
+        }
+        throw DdlRefused("column \"" + name + "\" of relation \"" + (t != nullptr ? t->name : v->name) + "\" does not exist",
+                         kUndefinedColumn);
+      };
+      std::vector<std::pair<std::uint32_t, std::uint16_t>> columns;
+      for (const auto& [name, b] : by_column) columns.emplace_back(column_id(name), b);
+      auto current = next->acl(object);
+      std::vector<AclEntry> acl(current.begin(), current.end());
+      auto entry = [&](std::uint32_t column, std::uint32_t grantee) -> AclEntry& {
+        auto key = std::tuple{column, grantee};
+        auto it = std::ranges::find_if(acl, [&](const AclEntry& e) { return std::tuple{e.column, e.grantee} >= key; });
+        if (it == acl.end() || std::tuple{it->column, it->grantee} != key) it = acl.insert(it, AclEntry{grantee, column, 0, 0, kBootstrapRole});
+        return *it;
+      };
+      // REVOKE takes the privilege, or only its grant option; a table-level
+      // REVOKE takes it from every column too, as PostgreSQL's does.
+      auto take = [&](AclEntry& e, std::uint16_t b) {
+        e.grant_options &= static_cast<std::uint16_t>(~b);
+        if (!g->grant_option) e.privileges &= static_cast<std::uint16_t>(~b);
+      };
+      for (auto grantee : grantees) {
+        if (g->grant) {
+          auto give = [&](AclEntry& e, std::uint16_t b) {
+            e.privileges |= b;
+            if (g->grant_option) e.grant_options |= b;
+          };
+          if (whole != 0) give(entry(kWholeObject, grantee), whole);
+          for (const auto& [c, b] : columns) give(entry(c, grantee), b);
+        } else {
+          for (auto& e : acl) {
+            if (e.grantee == grantee) take(e, whole & (e.column == kWholeObject ? privilege::kAll : privilege::kColumns));
+          }
+          for (const auto& [c, b] : columns) {
+            for (auto& e : acl) {
+              if (e.grantee == grantee && e.column == c) take(e, b);
+            }
+          }
+        }
+      }
+      std::erase_if(acl, [](const AclEntry& e) { return e.privileges == 0; });
+      if (acl.empty()) {
+        if (next->acls_.erase(object) > 0) put_op(ops, DdlOp::Kind::Del, acl_record_key(object));
+      } else {
+        put_op(ops, DdlOp::Kind::Put, acl_record_key(object), serialize_acl(object, acl));
+        next->acls_.insert_or_assign(object, std::move(acl));
+      }
+    }
     return finish();
   }
 
